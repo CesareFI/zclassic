@@ -269,6 +269,28 @@ static void zwork_publish_run(struct zcl_command_reply *reply,
                    "the publication continuation exceeded its output bound", false, true);
 }
 
+static bool zwork_publish_default_datadir(
+    const char *task_hex, char datadir[ZWORK_PATH_MAX])
+{
+    char task_datadir[ZWORK_PATH_MAX];
+    return zwork_task_path(task_datadir, task_hex, "/zbuild") &&
+        platform_directory_canonical_real(
+            task_datadir, datadir, ZWORK_PATH_MAX);
+}
+
+/* A compact continuation may use the existing task-local default. Probe its
+ * owner before opening the ledger; omission of a redundant locator grants
+ * no one-shot mutation authority. Explicit locators were already probed. */
+static bool zwork_publish_forward_default(
+    const struct zcl_command_request *request, const char *proof_datadir,
+    bool path_ok, const char *datadir, struct zcl_command_reply *reply)
+{
+    if (!path_ok || (proof_datadir && proof_datadir[0])) return false;
+    return zcl_native_forward_live_command(
+        request, datadir, "zcode_work_publish",
+        "LIVE_WORK_PUBLISH_FAILED", "publish", "zcode.work.publish", reply);
+}
+
 void zcl_native_handle_zcode_work_publish(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
@@ -300,7 +322,12 @@ void zcl_native_handle_zcode_work_publish(
         return;
     bool path_ok = proof_datadir && proof_datadir[0]
         ? platform_directory_canonical_real(proof_datadir, datadir, sizeof(datadir))
-        : zwork_task_path(datadir, entry->task_root_hex, "/zbuild");
+        : zwork_publish_default_datadir(entry->task_root_hex, datadir);
+    if (zwork_publish_forward_default(
+            request, proof_datadir, path_ok, datadir, reply)) {
+        vcs_zcode_task_index_free(index);
+        return;
+    }
     enum vcs_devloop_publication_phase phase = 0;
     if (!path_ok || !zwork_publish_verify(workspace, datadir, entry,
                                           job_root, &phase)) {

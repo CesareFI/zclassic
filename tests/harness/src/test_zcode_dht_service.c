@@ -183,7 +183,8 @@ static bool signed_nodes(const char *dir, uint64_t generation,
 
 static bool resign_wire(const char *dir, const uint8_t transcript[32],
                         uint8_t *wire, size_t len) {
-  if (len < VCS_ZCODE_DHT_MSG_SIGNATURE_BYTES)
+  if (len < VCS_ZCODE_DHT_MSG_SIGNATURE_BYTES ||
+      len > VCS_ZCODE_DHT_MAX_FRAME_BYTES)
     return false;
   uint8_t seed[32], pub[32], secret[32], node_id[32];
   struct vcs_zcode_dht_delegation delegation;
@@ -191,7 +192,7 @@ static bool resign_wire(const char *dir, const uint8_t transcript[32],
     return false;
   ed25519_keypair(pub, secret, seed);
   uint8_t preimage[sizeof(VCS_ZCODE_DHT_MSG_SIGNATURE_DOMAIN) + 32 +
-                   VCS_ZCODE_DHT_NODES_MAX_WIRE_BYTES];
+                   VCS_ZCODE_DHT_MAX_FRAME_BYTES];
   size_t unsigned_len = len - VCS_ZCODE_DHT_MSG_SIGNATURE_BYTES, off = 0;
   memcpy(preimage + off, VCS_ZCODE_DHT_MSG_SIGNATURE_DOMAIN,
          sizeof(VCS_ZCODE_DHT_MSG_SIGNATURE_DOMAIN));
@@ -5154,8 +5155,140 @@ _test_next:;
   return failures;
 }
 
+static bool record_storage_policy(
+    void *ctx, enum vcs_zcode_sovereignty_action action,
+    const struct vcs_zcode_sovereignty_subject *subject)
+{
+  const enum vcs_zcode_sovereignty_action *denied = ctx;
+  return subject &&
+         (action != *denied ||
+          strcmp(subject->service_type, "zclassic23.fastobj") != 0);
+}
+
+static int test_signed_record_storage_denial(
+    enum vcs_zcode_sovereignty_action denied)
+{
+  int failures = 0;
+  TEST("zcode dht: signed storage denial preserves package route") {
+    char adir[1024];
+    char bdir[1024];
+    ASSERT(test_mkdtemp(adir, sizeof(adir), "zcl_dht_deny_a") != NULL);
+    ASSERT(test_mkdtemp(bdir, sizeof(bdir), "zcl_dht_deny_b") != NULL);
+    uint8_t genesis[32], anoise[32], bnoise[32], transcript[32], root[32];
+    memset(genesis, 0x11, 32);
+    memset(anoise, 0x22, 32);
+    memset(bnoise, 0x33, 32);
+    memset(transcript, 0x55, 32);
+    memset(root, 0x74, 32);
+    ASSERT(fixture_identity(adir, 0x61, genesis, anoise));
+    ASSERT(fixture_identity(bdir, 0x62, genesis, bnoise));
+    struct vcs_zcode_dht_service_params params = {
+        .datadir = bdir, .transport_enabled = true,
+        .now = {.wall_unix = 1000, .monotonic_s = 1000},
+        .chain_verify = chain_ok, .policy_decide = record_storage_policy,
+        .policy_ctx = &denied};
+    memcpy(params.network_genesis, genesis, 32);
+    memcpy(params.local_noise_static, bnoise, 32);
+    struct vcs_zcode_dht_service *a = fixture_service(adir, genesis, anoise);
+    struct vcs_zcode_dht_service *b = vcs_zcode_dht_service_create(&params);
+    ASSERT(a != NULL && b != NULL);
+    struct vcs_zcode_dht_session as = {
+        .established = true, .generation = 42, .connection_serial = 1};
+    struct vcs_zcode_dht_session bs = as;
+    bs.connection_serial = 2;
+    memcpy(as.remote_static, bnoise, 32);
+    memcpy(bs.remote_static, anoise, 32);
+    memcpy(as.transcript_hash, transcript, 32);
+    memcpy(bs.transcript_hash, transcript, 32);
+    ASSERT(vcs_zcode_dht_service_session_open(a, 2, &as, test_time(1001)));
+    ASSERT(vcs_zcode_dht_service_session_open(b, 1, &bs, test_time(1001)));
+    ASSERT(pump(a, b, 2, 1, 1001, NULL, NULL));
+    ASSERT(pump(b, a, 1, 2, 1001, NULL, NULL));
+    ASSERT(pump(a, b, 2, 1, 1001, NULL, NULL));
+
+    struct vcs_zcode_dht_record record;
+    ASSERT(fixture_provider_record_named(
+        adir, genesis, "zclassic23.fastobj", root, &record));
+    uint64_t operation = 0, peer = 0;
+    ASSERT(vcs_zcode_dht_service_record_store_begin(
+        a, 2, &record, test_time(1002), &operation));
+    uint8_t wire[VCS_ZCODE_DHT_MAX_FRAME_BYTES];
+    size_t len = 0;
+    ASSERT(vcs_zcode_dht_service_next_outbound(
+        a, 0, &peer, wire, sizeof(wire), &len));
+    ASSERT_EQ(peer, 2);
+    ASSERT(len > VCS_ZCODE_DHT_MSG_SIGNATURE_BYTES && len <= sizeof(wire));
+    enum vcs_zcode_dht_reject_reason reason;
+    wire[len - 1] ^= 1;
+    ASSERT(!vcs_zcode_dht_service_handle_frame(
+        b, 1, wire, len, test_time(1002), &reason));
+    ASSERT_EQ(reason, VCS_ZCODE_DHT_REJECT_SIGNATURE);
+    ASSERT_EQ(drain(b), 0);
+    wire[len - 1] ^= 1;
+    /* An authentic envelope cannot launder an invalid inner signature. */
+    size_t inner_last = len - VCS_ZCODE_DHT_MSG_SIGNATURE_BYTES - 1;
+    wire[inner_last] ^= 1;
+    ASSERT(resign_wire(adir, transcript, wire, len));
+    ASSERT(!vcs_zcode_dht_service_handle_frame(
+        b, 1, wire, len, test_time(1002), &reason));
+    ASSERT_EQ(reason, VCS_ZCODE_DHT_REJECT_SIGNATURE);
+    ASSERT_EQ(drain(b), 0);
+    wire[inner_last] ^= 1;
+    ASSERT(resign_wire(adir, transcript, wire, len));
+    bool admitted = vcs_zcode_dht_service_handle_frame(
+        b, 1, wire, len, test_time(1002), &reason);
+    printf("storage denial action=%d frame_bytes=%zu handled=%d reason=%s\n",
+           denied, len, admitted, vcs_zcode_dht_reject_reason_string(reason));
+    ASSERT(admitted);
+    ASSERT(pump(b, a, 1, 2, 1002, NULL, NULL));
+    struct vcs_zcode_dht_record_operation_result result;
+    ASSERT(vcs_zcode_dht_service_record_operation_poll(
+        a, operation, test_time(1002), &result));
+    ASSERT_EQ(result.state, VCS_ZCODE_DHT_RECORD_OPERATION_REJECTED);
+    ASSERT_EQ(result.store_status, VCS_ZCODE_DHT_STORE_REJECTED);
+    struct vcs_zcode_dht_record_selector selector = {
+        .kind = VCS_ZCODE_DHT_RECORD_PROVIDER};
+    snprintf(selector.namespace_name, sizeof(selector.namespace_name),
+             "zclassic23.fastobj");
+    memcpy(selector.root, root, 32);
+    struct vcs_zcode_dht_record local[1];
+    ASSERT_EQ(vcs_zcode_dht_service_record_local_query(
+                  b, 1002, &selector, local, 1), 0);
+
+    /* The same authenticated connection must still carry allowed objects. */
+    ASSERT(fixture_provider_record_named(
+        adir, genesis, "zclassic23.package", root, &record));
+    ASSERT(vcs_zcode_dht_service_record_store_begin(
+        a, 2, &record, test_time(1003), &operation));
+    ASSERT(pump(a, b, 2, 1, 1003, NULL, NULL));
+    ASSERT(pump(b, a, 1, 2, 1003, NULL, NULL));
+    ASSERT(vcs_zcode_dht_service_record_operation_poll(
+        a, operation, test_time(1003), &result));
+    ASSERT_EQ(result.state, VCS_ZCODE_DHT_RECORD_OPERATION_COMPLETE);
+    ASSERT_EQ(result.store_status, VCS_ZCODE_DHT_STORE_STORED);
+    snprintf(selector.namespace_name, sizeof(selector.namespace_name),
+             "zclassic23.package");
+    ASSERT_EQ(vcs_zcode_dht_service_record_local_query(
+                  b, 1003, &selector, local, 1), 1);
+    ASSERT(memcmp(local[0].signature, record.signature,
+                  sizeof(record.signature)) == 0);
+    struct vcs_zcode_dht_provider_route route;
+    ASSERT(vcs_zcode_dht_service_provider_route(b, 1003, &selector, &route));
+    ASSERT_EQ(route.authenticated_count, 1);
+    vcs_zcode_dht_service_free(a, test_time(1003));
+    vcs_zcode_dht_service_free(b, test_time(1003));
+    cleanup_fixture(adir);
+    cleanup_fixture(bdir);
+    PASS();
+  }
+_test_next:;
+  return failures;
+}
+
 int test_zcode_dht_service(void) {
   int failures = test_disabled_diagnostics();
+  failures += test_signed_record_storage_denial(VCS_ZCODE_SOVEREIGNTY_STORE);
+  failures += test_signed_record_storage_denial(VCS_ZCODE_SOVEREIGNTY_INDEX);
   failures += test_own_delegation_expired_names_blocker();
   failures += test_session_evicts_expired_cached_delegation();
   failures += test_exact_noise_delegation_view();

@@ -564,6 +564,57 @@ static bool reply_store_result(
   return true;
 }
 
+static bool handle_store_record(
+    struct vcs_zcode_dht_service *service, struct service_peer *peer,
+    const struct vcs_zcode_dht_msg_store_record *request,
+    struct vcs_zcode_dht_time now,
+    enum vcs_zcode_dht_reject_reason *rejected_out)
+{
+  if (!vcs_zcode_dht_records_policy_allows(
+          service, VCS_ZCODE_SOVEREIGNTY_DISCOVER,
+          &request->record)) {
+    if (rejected_out)
+      *rejected_out = VCS_ZCODE_DHT_REJECT_UNAUTHORIZED;
+    return false;
+  }
+  if (peer->record_admissions >=
+      VCS_ZCODE_DHT_SERVICE_MAX_RECORDS_PER_PEER)
+    return false;
+  peer->record_admissions++;
+  /* The authenticated record can be valid even when this receiver has
+   * not opted into storing or indexing its namespace. Return the existing
+   * signed refusal without admitting it or blaming the peer. Reserved
+   * authority records retain their separate fail-closed scope rejection. */
+  bool storage_allowed = vcs_zcode_dht_records_policy_allows(
+      service, VCS_ZCODE_SOVEREIGNTY_STORE, &request->record) &&
+      vcs_zcode_dht_records_policy_allows(
+          service, VCS_ZCODE_SOVEREIGNTY_INDEX, &request->record);
+  if (request->record.kind != VCS_ZCODE_DHT_RECORD_AGENT_SCOPE &&
+      !storage_allowed)
+    return reply_store_result(service, peer, request,
+                                VCS_ZCODE_DHT_STORE_REJECTED);
+  enum vcs_zcode_dht_record_store_result admitted =
+      vcs_zcode_dht_service_record_admit(service, &request->record, now);
+  enum vcs_zcode_dht_store_status status = store_status(admitted);
+  if (status == VCS_ZCODE_DHT_STORE_REJECTED) {
+    if (rejected_out)
+      *rejected_out = admitted == VCS_ZCODE_DHT_RECORD_STORE_STALE
+                          ? VCS_ZCODE_DHT_REJECT_REPLAY
+                          : admitted == VCS_ZCODE_DHT_RECORD_STORE_EXPIRED
+                                ? VCS_ZCODE_DHT_REJECT_EXPIRED
+                                : admitted ==
+                                          VCS_ZCODE_DHT_RECORD_STORE_INVALID
+                                      ? VCS_ZCODE_DHT_REJECT_POISONED
+                                      : admitted ==
+                                                VCS_ZCODE_DHT_RECORD_STORE_SCOPE
+                                            ? VCS_ZCODE_DHT_REJECT_UNAUTHORIZED
+                                            : VCS_ZCODE_DHT_REJECT_CAP;
+    return false;
+  }
+  service->store_record_received++;
+  return reply_store_result(service, peer, request, status);
+}
+
 bool vcs_zcode_dht_service_records_handle(
     struct vcs_zcode_dht_service *service, struct service_peer *peer,
     struct service_query *query, const struct vcs_zcode_dht_msg *message,
@@ -576,40 +627,9 @@ bool vcs_zcode_dht_service_records_handle(
     service->find_record_received++;
     return reply_records(service, peer, &message->find_record, now.wall_unix);
   }
-  if (message->kind == VCS_ZCODE_DHT_MSG_STORE_RECORD) {
-    if (!vcs_zcode_dht_records_policy_allows(
-            service, VCS_ZCODE_SOVEREIGNTY_DISCOVER,
-            &message->store_record.record)) {
-      if (rejected_out)
-        *rejected_out = VCS_ZCODE_DHT_REJECT_UNAUTHORIZED;
-      return false;
-    }
-    if (peer->record_admissions >=
-        VCS_ZCODE_DHT_SERVICE_MAX_RECORDS_PER_PEER)
-      return false;
-    peer->record_admissions++;
-    enum vcs_zcode_dht_record_store_result admitted =
-        vcs_zcode_dht_service_record_admit(service,
-                                           &message->store_record.record, now);
-    enum vcs_zcode_dht_store_status status = store_status(admitted);
-    if (status == VCS_ZCODE_DHT_STORE_REJECTED) {
-      if (rejected_out)
-        *rejected_out = admitted == VCS_ZCODE_DHT_RECORD_STORE_STALE
-                            ? VCS_ZCODE_DHT_REJECT_REPLAY
-                            : admitted == VCS_ZCODE_DHT_RECORD_STORE_EXPIRED
-                                  ? VCS_ZCODE_DHT_REJECT_EXPIRED
-                                  : admitted ==
-                                            VCS_ZCODE_DHT_RECORD_STORE_INVALID
-                                        ? VCS_ZCODE_DHT_REJECT_POISONED
-                                        : admitted ==
-                                                  VCS_ZCODE_DHT_RECORD_STORE_SCOPE
-                                              ? VCS_ZCODE_DHT_REJECT_UNAUTHORIZED
-                                              : VCS_ZCODE_DHT_REJECT_CAP;
-      return false;
-    }
-    service->store_record_received++;
-    return reply_store_result(service, peer, &message->store_record, status);
-  }
+  if (message->kind == VCS_ZCODE_DHT_MSG_STORE_RECORD)
+    return handle_store_record(service, peer, &message->store_record, now,
+                                 rejected_out);
   if (!query)
     return false;
   struct service_record_operation *operation =

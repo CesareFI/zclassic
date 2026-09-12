@@ -432,15 +432,33 @@ static bool zwork_accept_details_json(
 static bool zwork_accept_next_json(struct zcl_command_reply *reply,
                                    const char *workspace,
                                    const char *datadir, const char *work_id,
-                                   const char *job_hex)
+                                   const char *job_hex, const char *task_hex)
 {
     struct json_value next_input;
     json_init(&next_input); json_set_object(&next_input);
     bool ok = json_push_kv_str(&next_input, "workspace", workspace) &&
         json_push_kv_str(&next_input, "work", work_id) &&
         json_push_kv_str(&next_input, "datadir", datadir) &&
-        json_push_kv_str(&next_input, "job_root", job_hex) &&
-        zwork_add_next(
+        json_push_kv_str(&next_input, "job_root", job_hex);
+    /* Preserve the explicit locator whenever the complete escaped input and
+     * its terminator fit. Only the exact task-derived default is redundant;
+     * a custom ledger must never be silently redirected to that default. */
+    if (ok && json_write(&next_input, NULL, 0) >=
+                  sizeof(reply->next[0].input_json)) {
+        char task_datadir[ZWORK_PATH_MAX], canonical[ZWORK_PATH_MAX];
+        ok = zwork_task_path(task_datadir, task_hex, "/zbuild") &&
+            platform_directory_canonical_real(
+                task_datadir, canonical, sizeof(canonical)) &&
+            strcmp(canonical, datadir) == 0;
+        if (ok) {
+            json_free(&next_input);
+            json_init(&next_input); json_set_object(&next_input);
+            ok = json_push_kv_str(&next_input, "workspace", workspace) &&
+                json_push_kv_str(&next_input, "work", work_id) &&
+                json_push_kv_str(&next_input, "job_root", job_hex);
+        }
+    }
+    ok = ok && zwork_add_next(
             reply, "zcode.work.publish", &next_input,
             "advance the accepted exact source through its existing publication job");
     json_free(&next_input);
@@ -488,7 +506,8 @@ static void zwork_accept_accepted(
         zwork_accept_details_json(reply, workspace,
                                   retained_candidate_workspace, &hex,
                                   &expert, details) &&
-        zwork_accept_next_json(reply, workspace, datadir, work_id, hex.job);
+        zwork_accept_next_json(reply, workspace, datadir, work_id, hex.job,
+                                entry->task_root_hex);
     json_free(&expert);
     if (!ok)
         zwork_fail(reply, "ACCEPT_OUTPUT_FAILED", "render",

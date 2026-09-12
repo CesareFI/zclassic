@@ -70,6 +70,46 @@ if grep -q 'dht_wait_sync_live[^|]*DHT_DD_B' <<<"$overlay"; then
     fail "dht_wait_sync_live was pointed at node B; it accepts catch-up states"
 fi
 pass "shared catch-up helper not repurposed for the build-worker node"
+for mapping in 'peer_a="$CJ_PEER_ADDR_B:$B_PORT"' \
+               'peer_b="$CJ_PEER_ADDR_A:$A_PORT"' \
+               '"$A_HTTPS" "$peer_a"' '"$B_HTTPS" "$peer_b"'; do
+    grep -qF "$mapping" <<<"$overlay" ||
+        fail "two-host overlay lost a valid static launch target: $mapping"
+done
+pass "two-host overlay declares both static peer targets"
+
+# Two-host latecomer C shares the requester's IP. Preserve the native
+# same-IP rule by making the bootstrap peer and later route switch explicit.
+# These are control-flow assertions only; the actual two-host run must still
+# prove synchronization, publisher exit, and exact survivor-only delivery.
+boot_c="$(awk '/^cj_boot_c\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$JOURNEY")"
+survival="$(awk '/^cj_journey_publisher_disappears\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$JOURNEY")"
+stop_a="$(awk '/^cj_stop_publisher\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$JOURNEY")"
+grep -qF 'bootstrap="127.0.0.1:$A_PORT"' <<<"$boot_c" ||
+    fail "two-host latecomer lost its explicit requester bootstrap"
+grep -qF '"$C_HTTPS" "$bootstrap"' <<<"$boot_c" ||
+    fail "latecomer spawn ignores its declared bootstrap route"
+grep -qF 'intervention=latecomer-bootstrap-via-requester' <<<"$boot_c" ||
+    fail "latecomer bootstrap intervention is no longer recorded"
+grep -qF 'node A still answers RPC after its disappearance' <<<"$stop_a" ||
+    fail "publisher exit lost its RPC-down assertion"
+
+survival_line() { printf '%s\n' "$survival" | grep -nF -- "$1" | head -1 | cut -d: -f1; }
+delegate_c="$(survival_line 'del_c="$(cj_c zcode network delegate' || true)"
+empty_c="$(survival_line '    cj_require_latecomer_empty' || true)"
+stop_publisher="$(survival_line '        cj_stop_publisher' || true)"
+restart_c="$(survival_line 'dht_spawn DHT_PGID_C' || true)"
+if [ -z "$delegate_c" ] || [ -z "$empty_c" ] || [ -z "$stop_publisher" ] || [ -z "$restart_c" ]; then
+    fail "latecomer phase ordering check lost a required operation"
+elif [ "$delegate_c" -ge "$empty_c" ] || [ "$empty_c" -ge "$stop_publisher" ] || [ "$stop_publisher" -ge "$restart_c" ]; then
+    fail "two-host publisher must exit after delegation and before survivor redial"
+else
+    pass "two-host latecomer changes peer only after anchored delegation and publisher exit"
+fi
+grep -qF 'intervention=latecomer-restart-toward-survivor-after-requester-exit' <<<"$survival" ||
+    fail "latecomer route-switch intervention is no longer recorded"
+grep -qF '[ "$CJ_TWOHOST" = 1 ] || cj_stop_publisher' <<<"$survival" ||
+    fail "other topologies lost their publisher-stop operation"
 
 [ "$FAIL" -eq 0 ] || exit 1
 printf 'commons-journey-ordering: OK\n'

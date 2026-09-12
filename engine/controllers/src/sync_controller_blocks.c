@@ -314,9 +314,12 @@ static bool node_db_sync_connect_block_local(struct node_db *ndb,
         LOG_FAIL("sync", "connect_block_local: invalid args (ndb=%p, blk=%p, pindex=%p)",
                  (void *)ndb, (void *)blk, (void *)pindex);
 
-    /* Batch mode: start transaction if not already in one */
+    /* Reserve the writer before the canonical-conflict read. A deferred
+     * transaction can retain a stale WAL snapshot if another handle writes
+     * between that read and the insert; retrying the insert cannot refresh
+     * that snapshot. Keep reservation and rollback in the existing lifecycle. */
     if (!ndb->sync_in_batch) {
-        if (!node_db_begin(ndb))
+        if (!node_db_begin_immediate(ndb))
             LOG_FAIL("sync", "connect_block_local: BEGIN failed");
         ndb->sync_in_batch = true;
         ndb->sync_pending_blocks = 0;

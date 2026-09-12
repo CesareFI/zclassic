@@ -19,6 +19,7 @@
 #include "models/database.h"
 #include "platform/directory_compat.h"
 #include "platform/environment_compat.h"
+#include "platform/state_root.h"
 #include "platform/time_compat.h"
 #include "services/build_fabric_service.h"
 #include "services/build_fabric_worker.h"
@@ -3138,13 +3139,204 @@ static int zpd_test_work_start_package_bounds(void)
     return failures;
 }
 
+static void zpd_report_work_accept(const struct zcl_command_reply *reply)
+{
+    if (reply->status != ZCL_COMMAND_STATUS_PASSED)
+        fprintf(stderr, "work accept refused: code=%s message=%s\n",
+                reply->error.code, reply->error.message);
+}
+
+static int zpd_assert_work_envelopes(struct json_value *input,
+    const struct json_value *expected_data, const char *absolute_root,
+    const char *zbuild_datadir, const char *action_id)
+{
+    int failures = 0;
+    /* The real journey reached EVIDENCE_READY but its detailed show
+     * could not serialize. Checking the data object alone misses invalid
+     * continuations and the complete command envelope. Exercise both
+     * public read leaves through that boundary and retain proof identity. */
+    {
+    ASSERT(json_push_kv_str(input, "datadir", zbuild_datadir));
+    const char *paths[] = { "zcode.work.show", "zcode.work.status" };
+    const struct zcl_command_registry *registry =
+        zcl_command_catalog();
+    struct zcl_command_context context = {
+        .registry = registry,
+        .granted_capabilities = ~(uint64_t)0,
+        .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        const struct zcl_command_spec *spec =
+            zcl_command_registry_find(registry, paths[i], NULL);
+        ASSERT(spec != NULL);
+        struct {
+            char rendered[ZCL_COMMAND_LIST_BUDGET + 1u];
+            unsigned char fence[16];
+        } bounded;
+        memset(&bounded, 0xa5, sizeof(bounded));
+        char *rendered = bounded.rendered;
+        enum zcl_command_exit rendered_exit = ZCL_COMMAND_EXIT_OK;
+        size_t rendered_bytes = zcl_command_registry_execute_json(
+            registry, spec, &context, input, false, spec->path,
+            "normal", 0, 0, NULL, rendered, sizeof(bounded.rendered),
+            &rendered_exit);
+        ASSERT(rendered_bytes > 0u &&
+               rendered_bytes <= ZCL_COMMAND_LIST_BUDGET);
+        printf("work envelope: path=%s data_bytes=%zu bytes=%zu capacity=%zu leaf_budget=%d exit=%d\n",
+               paths[i], json_write(expected_data, NULL, 0), rendered_bytes,
+               sizeof(bounded.rendered), spec->budget_bytes, (int)rendered_exit);
+        ASSERT(rendered[rendered_bytes] == '\0');
+        for (size_t j = 0; j < sizeof(bounded.fence); ++j)
+            ASSERT(bounded.fence[j] == 0xa5);
+        ASSERT(rendered_exit == ZCL_COMMAND_EXIT_OK);
+        struct json_value envelope;
+        json_init(&envelope);
+        ASSERT(json_read(&envelope, rendered, rendered_bytes));
+        ASSERT(json_get_bool(json_get(&envelope, "ok")));
+        const struct json_value *data = json_get(&envelope, "data");
+        ASSERT(data != NULL);
+        printf("work serialized data: path=%s bytes=%zu\n",
+               paths[i], json_write(data, NULL, 0));
+        ASSERT_STR_EQ(json_get_str(json_get(data, "state")),
+                      "EVIDENCE_READY");
+        ASSERT(json_get_bool(json_get(data, "confirmation_ready")));
+        ASSERT_STR_EQ(
+            json_get_str(json_get(data, "confirmation_identity")),
+            json_get_str(json_get(expected_data,
+                                  "confirmation_identity")));
+        const struct json_value *next =
+            json_at(json_get(&envelope, "next"), 0);
+        ASSERT(next != NULL);
+        ASSERT_STR_EQ(json_get_str(json_get(next, "command")),
+                      "app.presentation.release-confirm");
+        const struct json_value *next_input = json_get(next, "input");
+        ASSERT(next_input != NULL);
+        ASSERT_STR_EQ(json_get_str(json_get(next_input, "workspace")),
+                      absolute_root);
+        ASSERT_STR_EQ(json_get_str(json_get(next_input, "datadir")),
+                      zbuild_datadir);
+        ASSERT_STR_EQ(json_get_str(json_get(next_input, "work")),
+                      json_get_str(json_get(input, "work")));
+        const struct json_value *expert = json_get(data, "expert");
+        ASSERT(expert != NULL);
+        ASSERT_STR_EQ(json_get_str(json_get(expert,
+                                            "proof_action_root")),
+                      action_id);
+        json_free(&envelope);
+    }
+    }
+_test_next:
+    return failures == 0;
+}
+
+/* Omission is permitted only for the exact task-derived default when adding
+ * its explicit spelling would exceed the existing complete input budget. */
+static bool zpd_compact_default_continuation(
+    const struct json_value *next, const char *datadir, const char *task_hex)
+{
+    struct json_value expanded;
+    json_init(&expanded);
+    char wire[1024], expected[4400], canonical[4400];
+    size_t compact = json_write(next, wire, sizeof(wire));
+#if defined(_WIN32)
+    char state[4400];
+    int n = platform_state_root(state, sizeof(state))
+        ? snprintf(expected, sizeof(expected), "%s/zcode-workspaces/%.64s/zbuild",
+                   state, task_hex) : -1;
+#else
+    int n = snprintf(expected, sizeof(expected),
+                     "/tmp/zclassic23-zcode-workspaces/%lu/%.64s/zbuild",
+                     (unsigned long)getuid(), task_hex);
+#endif
+    bool ok = json_get(next, "datadir") == NULL &&
+        compact > 0 && compact < sizeof(((struct zcl_command_next *)0)->input_json) &&
+        n > 0 && (size_t)n < sizeof(expected) &&
+        platform_directory_canonical_real(expected, canonical, sizeof(canonical)) &&
+        strcmp(canonical, datadir) == 0 &&
+        json_read(&expanded, wire, compact) &&
+        json_push_kv_str(&expanded, "datadir", datadir);
+    size_t complete = ok ? json_write(&expanded, NULL, 0) : 0;
+    ok = ok && complete >= sizeof(((struct zcl_command_next *)0)->input_json);
+    printf("work continuation compact=%zu explicit=%zu capacity=%zu exact_default=%d\n",
+           compact, complete, sizeof(((struct zcl_command_next *)0)->input_json), ok);
+    json_free(&expanded);
+    return ok;
+}
+
+static bool zpd_explicit_publication_next(
+    const struct zcl_command_reply *reply, const char *datadir,
+    const char *work, const char *job)
+{
+    struct json_value next;
+    json_init(&next);
+    bool parsed = reply->next_count == 1 &&
+        strcmp(reply->next[0].command, "zcode.work.publish") == 0 &&
+        json_read(&next, reply->next[0].input_json,
+                  strlen(reply->next[0].input_json));
+    const char *actual_datadir = json_get_str(json_get(&next, "datadir"));
+    const char *actual_work = json_get_str(json_get(&next, "work"));
+    const char *actual_job = json_get_str(json_get(&next, "job_root"));
+    bool ok = parsed && actual_datadir && actual_work && actual_job &&
+        strcmp(actual_datadir, datadir) == 0 && strcmp(actual_work, work) == 0 &&
+        strcmp(actual_job, job) == 0;
+    json_free(&next);
+    return ok;
+}
+
+static bool zpd_custom_ledger_continuation(
+    const struct json_value *accept_input, const char *default_datadir,
+    const char *custom, const char *job, bool fits)
+{
+    char canonical[4400];
+    bool copied = zcl_tree_copy(default_datadir, custom, 0, NULL, NULL).ok;
+    bool prepared = copied && platform_directory_canonical_real(
+        custom, canonical, sizeof(canonical));
+    struct json_value input;
+    json_init(&input); json_copy(&input, accept_input);
+    struct json_value *selected_datadir =
+        (struct json_value *)json_get(&input, "datadir");
+    prepared = prepared && selected_datadir && selected_datadir->type == JSON_STR;
+    if (prepared) json_set_str(selected_datadir, canonical);
+    struct zcl_command_request request = {.input = &input};
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.zcode_custom_continuation.v1");
+    if (prepared) zcl_native_handle_zcode_work_accept(&request, &reply);
+    bool ok;
+    if (fits)
+        ok = prepared && reply.status == ZCL_COMMAND_STATUS_PASSED &&
+            zpd_explicit_publication_next(&reply, canonical,
+                json_get_str(json_get(accept_input, "work")), job);
+    else
+        ok = prepared && reply.status == ZCL_COMMAND_STATUS_FAILED &&
+            strcmp(reply.error.code, "ACCEPT_OUTPUT_FAILED") == 0 &&
+            reply.next_count == 0;
+    printf("work continuation custom fits=%d preserved_or_refused=%d code=%s\n",
+           fits, ok, reply.error.code);
+    zcl_command_reply_free(&reply); json_free(&input);
+    bool removed = zcl_tree_remove(custom).ok;
+    return ok && removed;
+}
+
+static bool zpd_custom_ledger_cases(
+    const struct json_value *accept_input, const char *datadir, const char *job)
+{
+    char short_dir[256], long_dir[256];
+    (void)snprintf(short_dir, sizeof(short_dir), "test-tmp/zpd-custom-%ld",
+                   (long)getpid());
+    (void)snprintf(long_dir, sizeof(long_dir),
+        "test-tmp/zpd-custom-ledger-must-remain-explicit-and-must-never-silently-resolve-to-task-default-when-complete-continuation-exceeds-the-fixed-bound-preserving-exact-work-job-source-and-custody-owner-%ld",
+        (long)getpid());
+    return zpd_custom_ledger_continuation(accept_input, datadir, short_dir, job, true) &&
+        zpd_custom_ledger_continuation(accept_input, datadir, long_dir, job, false);
+}
+
 static __attribute__((unused)) int zpd_test_work_start(void)
 {
     int failures = 0;
     TEST("zcode work start: goal and profile compose existing task owners") {
         char root[256];
         (void)snprintf(root, sizeof(root),
-                       "test-tmp/zcode-work-start-%ld", (long)getpid());
+                       "test-tmp/zcode-work-start-independent-qualification-with-proof-roots-and-confirmation-continuation-source-and-artifact-identities-remain-visible-after-worker-acceptance-with-a-long-valid-workspace-with-complete-proof-fields-%ld", (long)getpid());
         ASSERT(zpd_fixture(root, false));
         char absolute_root[4400];
         ASSERT(platform_directory_canonical_real(
@@ -3772,9 +3964,6 @@ static __attribute__((unused)) int zpd_test_work_start(void)
         ASSERT(build_output_root && strlen(build_output_root) == 64);
         ASSERT(strcmp(proof_action_root, saved_action_id) == 0);
         ASSERT(json_write(&reply.data, NULL, 0) < 4096u);
-        zcl_command_reply_free(&reply);
-        json_free(&input);
-
         char zbuild_datadir[4400];
         (void)snprintf(zbuild_datadir, sizeof(zbuild_datadir), "%s",
                        saved_candidate_workspace);
@@ -3783,6 +3972,11 @@ static __attribute__((unused)) int zpd_test_work_start(void)
         (void)snprintf(attempt_dir,
                        (size_t)(zbuild_datadir + sizeof(zbuild_datadir) -
                                 attempt_dir), "/zbuild");
+        ASSERT(zpd_assert_work_envelopes(&input, &reply.data, absolute_root,
+                                         zbuild_datadir, saved_action_id));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
         json_init(&input); json_set_object(&input);
         ASSERT(json_push_kv_str(&input, "workspace", root));
         ASSERT(json_push_kv_str(&input, "datadir", zbuild_datadir));
@@ -4041,6 +4235,7 @@ static __attribute__((unused)) int zpd_test_work_start(void)
         ASSERT(json_push_kv_bool(&input, "details", true));
         zcl_command_reply_init(&reply, "zcl.zcode_work_accept_test.v1");
         zcl_native_handle_zcode_work_accept(&request, &reply);
+        zpd_report_work_accept(&reply);
         ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
         ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
                       "PROVEN") == 0);
@@ -4099,9 +4294,8 @@ static __attribute__((unused)) int zpd_test_work_start(void)
         ASSERT(strcmp(json_get_str(json_get(
                           &publication_next, "workspace")),
                       resolved_authority_workspace) == 0);
-        ASSERT(strcmp(json_get_str(json_get(
-                          &publication_next, "datadir")),
-                      zbuild_datadir) == 0);
+        ASSERT(zpd_compact_default_continuation(
+            &publication_next, zbuild_datadir, saved_task_root));
         ASSERT(strcmp(json_get_str(json_get(
                           &publication_next, "job_root")),
                       publication_job_hex) == 0);
@@ -4178,9 +4372,8 @@ static __attribute__((unused)) int zpd_test_work_start(void)
         ASSERT(strcmp(json_get_str(json_get(
                           &guided_publication_next, "job_root")),
                       publication_job_hex) == 0);
-        ASSERT(strcmp(json_get_str(json_get(
-                          &guided_publication_next, "datadir")),
-                      zbuild_datadir) == 0);
+        ASSERT(zpd_compact_default_continuation(
+            &guided_publication_next, zbuild_datadir, saved_task_root));
         ASSERT(json_get(&guided_publication_next, "task_root") == NULL);
         ASSERT(json_get(&guided_publication_next,
                         "candidate_root") == NULL);
@@ -4281,6 +4474,8 @@ static __attribute__((unused)) int zpd_test_work_start(void)
         ASSERT(zpd_publication_rpc_roundtrip(
             &accepted_next, &guided_publication_next, zbuild_db, publication_job_hex));
 #endif
+        ASSERT(zpd_custom_ledger_cases(
+            &accepted_next, zbuild_datadir, publication_job_hex));
         {
             const struct zcl_command_registry *registry = zcl_command_catalog();
             const struct zcl_command_spec *spec =
@@ -5059,9 +5254,9 @@ static int zpd_test_commons_join_front_doors(void)
                == 0);
         {
             static const char datadir[] =
-                "/tmp/z23 commons'$(touch SHOULD_NOT_EXIST)\nsecond line";
+                "/unused/z23 commons'$(touch SHOULD_NOT_EXIST)\nsecond line";
             static const char expected[] =
-                "z23 join -datadir='/tmp/z23 commons'\\''$(touch "
+                "z23 join -datadir='/unused/z23 commons'\\''$(touch "
                 "SHOULD_NOT_EXIST)\nsecond line'";
             struct json_value input;
             json_init(&input);

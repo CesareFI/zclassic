@@ -3297,6 +3297,123 @@ static void check_state_write_does_not_wait_behind_catchup(int *failures)
         (*failures)++;
 }
 
+struct sqlite_projection_interleave {
+    struct node_db *competitor;
+    int calls;
+    bool wrote;
+    int rc;
+};
+
+static struct sqlite_projection_interleave *sqlite_projection_probe;
+
+static bool sqlite_projection_competing_write(void *record, void *ctx)
+{
+    (void)record;
+    (void)ctx;
+    struct sqlite_projection_interleave *probe = sqlite_projection_probe;
+    if (!probe)
+        return false;
+    probe->calls++;
+    probe->wrote = node_db_state_set_int(probe->competitor,
+                                         "qualification.interleaved_write", 1);
+    probe->rc = sqlite3_extended_errcode(probe->competitor->db);
+    return true;
+}
+
+/* Exercise the real projection transaction and ActiveRecord lifecycle. The
+ * second WAL handle writes after the canonical-conflict SELECT established
+ * a snapshot, but before the INSERT. Extended result codes expose 517 rather
+ * than spending the normal retry budget repeating the same stale snapshot.
+ * This is projection persistence evidence, not consensus validation. */
+static bool sqlite_projection_check_rows(struct node_db *primary,
+    const struct block *block, const struct block_index *index, bool connected,
+    bool *transaction_closed, bool *recovered)
+{
+    *transaction_closed = sqlite3_get_autocommit(primary->db) &&
+                          !primary->sync_in_batch && primary->sync_pending_blocks == 0;
+    int expected_rows = connected ? 2 : 1;
+    bool ok = db_block_count(primary) == expected_rows && *transaction_closed;
+    *recovered = connected || node_db_sync_connect_block(primary, block, index);
+    struct db_block found;
+    return ok && *recovered && db_block_count(primary) == 2 &&
+           db_block_find_by_height(primary, 1, &found) &&
+           memcmp(found.hash, index->phashBlock->data, 32) == 0;
+}
+
+static bool sqlite_projection_reserved(const struct sqlite_projection_interleave *probe,
+                                        bool connected)
+{
+    return connected && probe->calls == 1 && !probe->wrote &&
+           (probe->rc & 0xff) == SQLITE_BUSY;
+}
+
+static int check_sqlite_projection_writer_reservation(void)
+{
+    char path_template[1024];
+    char *dir = test_mkdtemp(path_template, sizeof(path_template), "projection-interleave");
+    char path[1024];
+    struct node_db primary = {0}, competitor = {0};
+    bool ok = dir != NULL;
+    if (ok) {
+        snprintf(path, sizeof(path), "%s/node.db", dir);
+        ok = node_db_open(&primary, path);
+    }
+    struct db_block seed = {0};
+    uint8_t solution[1] = {0};
+    seed.solution = solution;
+    seed.solution_len = sizeof(solution);
+    memset(seed.hash, 0x71, sizeof(seed.hash));
+    memset(seed.merkle_root, 0x72, sizeof(seed.merkle_root));
+    seed.time = 1700000000;
+    seed.bits = 0x1d00ffff;
+    seed.status = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA;
+    /* Initialize production hooks before saving their complete table. */
+    if (ok)
+        ok = db_block_save(&primary, &seed);
+    if (ok)
+        ok = node_db_sync_open_private_db_like(&primary, &competitor);
+    struct ar_callbacks *callbacks = db_block_callbacks();
+    struct ar_callbacks saved = *callbacks;
+    struct sqlite_projection_interleave probe = { .competitor = &competitor };
+    bool connected = false, transaction_closed = false, recovered = false;
+    int projection_rc = SQLITE_OK;
+    if (ok) {
+        ok = sqlite3_busy_timeout(competitor.db, 0) == SQLITE_OK &&
+             sqlite3_extended_result_codes(primary.db, 1) == SQLITE_OK &&
+             ar_register_before_save(callbacks, sqlite_projection_competing_write);
+    }
+    struct block block = {0};
+    block.header.nVersion = 4;
+    block.header.nTime = 1700000001;
+    block.header.nBits = 0x1d00ffff;
+    memcpy(block.header.nSolution, solution, sizeof(solution));
+    block.header.nSolutionSize = sizeof(solution);
+    memcpy(block.header.hashPrevBlock.data, seed.hash, 32);
+    memset(block.header.hashMerkleRoot.data, 0x73, 32);
+    struct uint256 hash;
+    memset(hash.data, 0x74, sizeof(hash.data));
+    struct block_index index = { .phashBlock = &hash, .nHeight = 1,
+                                .nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA };
+    if (ok) {
+        sqlite_projection_probe = &probe;
+        connected = node_db_sync_connect_block(&primary, &block, &index);
+        projection_rc = primary.last_sqlite_rc;
+    }
+    *callbacks = saved;
+    sqlite_projection_probe = NULL;
+    if (ok)
+        ok = sqlite_projection_check_rows(&primary, &block, &index, connected,
+                                           &transaction_closed, &recovered);
+    printf("SQLite projection writer reservation: connected=%d rc=%d competing_write=%d competing_rc=%d callbacks=%d transaction_closed=%d recovered=%d\n",
+           connected, projection_rc, probe.wrote, probe.rc, probe.calls,
+           transaction_closed, recovered);
+    ok = ok && sqlite_projection_reserved(&probe, connected);
+    if (competitor.open) node_db_close(&competitor);
+    if (primary.open) node_db_close(&primary);
+    cleanup_temp_db_dir(dir);
+    return ok ? 0 : 1;
+}
+
 int test_sqlite(void) {
     int failures = 0;
 
@@ -3542,6 +3659,7 @@ int test_sqlite(void) {
      * evidence, the UTXO mirror, the fleet board, peer persistence — was
      * refused with "database is locked" while reads carried on normally. */
     failures += check_sqlite_53_cached_readers_release_the_snap();
+    failures += check_sqlite_projection_writer_reservation();
 
     return failures;
 }

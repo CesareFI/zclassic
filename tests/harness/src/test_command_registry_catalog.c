@@ -2829,6 +2829,109 @@ static int test_board_list_budget_pages(void)
     return failures;
 }
 
+/* Serializer qualification only: the real work handler and proof identities
+ * are exercised separately by test_zcode_package_dev. Keep its causal fixture
+ * unchanged while testing escaped input and the complete configured ceiling. */
+static char work_envelope_padding[ZCL_COMMAND_LIST_BUDGET + 1u];
+
+static void work_envelope_echo(const struct zcl_command_request *request,
+                               struct zcl_command_reply *reply)
+{
+    if (!json_push_kv_str(&reply->data, "echo",
+                         json_get_str(json_get(request->input, "workspace"))) ||
+        !json_push_kv_str(&reply->data, "padding", work_envelope_padding)) {
+        zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED,
+                              ZCL_COMMAND_EXIT_INTERNAL, "TEST_ALLOCATION",
+                              "serialize", false, false,
+                              "work envelope fixture allocation failed", "");
+        return;
+    }
+    reply->status = ZCL_COMMAND_STATUS_PASSED;
+    reply->exit_code = ZCL_COMMAND_EXIT_OK;
+}
+
+static int test_work_envelope_ceiling(void)
+{
+    int failures = 0;
+    TEST("work aliases: escaped full envelopes fit or refuse at their ceiling") {
+        const struct zcl_command_registry *catalog = zcl_command_catalog();
+        const char *paths[] = { "zcode.work.show", "zcode.work.status" };
+        static const char escaped[] = "quote\" backslash\\ newline\n tab\t";
+        for (size_t alias = 0; alias < sizeof(paths) / sizeof(paths[0]); ++alias) {
+            const struct zcl_command_spec *real = find_spec(catalog, paths[alias]);
+            ASSERT(real != NULL);
+            ASSERT_EQ(real->budget_bytes, ZCL_COMMAND_LIST_BUDGET);
+            struct zcl_command_spec spec = *real;
+            spec.handler = work_envelope_echo;
+            struct zcl_command_registry registry = { .commands = &spec, .count = 1 };
+            struct zcl_command_context context = {
+                .registry = &registry,
+                .granted_capabilities = ~(uint64_t)0,
+                .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+            };
+            struct json_value input;
+            json_init(&input);
+            json_set_object(&input);
+            ASSERT(json_push_kv_str(&input, "workspace", escaped));
+            ASSERT(json_push_kv_str(&input, "work", "serializer-fixture"));
+            ASSERT(json_push_kv_bool(&input, "details", true));
+            size_t input_bytes = json_write(&input, NULL, 0);
+            bool saw_exact_limit = false, saw_refusal = false;
+            for (size_t padding = ZCL_COMMAND_LIST_BUDGET - 1024u;
+                 padding <= ZCL_COMMAND_LIST_BUDGET; ++padding) {
+                memset(work_envelope_padding, 'x', padding);
+                work_envelope_padding[padding] = '\0';
+                struct {
+                    char bytes[ZCL_COMMAND_LIST_BUDGET + 1u];
+                    unsigned char fence[16];
+                } output;
+                memset(&output, 0xa5, sizeof(output));
+                enum zcl_command_exit rc = ZCL_COMMAND_EXIT_INTERNAL;
+                size_t n = zcl_command_registry_execute_json(
+                    &registry, &spec, &context, &input, false, spec.path,
+                    "normal", 0, 0, NULL, output.bytes, sizeof(output.bytes), &rc);
+                ASSERT(n > 0u && n <= ZCL_COMMAND_LIST_BUDGET);
+                ASSERT(output.bytes[n] == '\0');
+                for (size_t j = 0; j < sizeof(output.fence); ++j)
+                    ASSERT(output.fence[j] == 0xa5);
+                struct json_value envelope;
+                json_init(&envelope);
+                ASSERT(json_read(&envelope, output.bytes, n));
+                ASSERT_EQ(json_write(&envelope, NULL, 0), n);
+                if (rc == ZCL_COMMAND_EXIT_OK) {
+                    ASSERT(json_get_bool(json_get(&envelope, "ok")));
+                    ASSERT_STR_EQ(json_get_str(json_get(&envelope, "command")),
+                                  paths[alias]);
+                    const struct json_value *data = json_get(&envelope, "data");
+                    ASSERT(data != NULL);
+                    ASSERT_STR_EQ(json_get_str(json_get(data, "echo")), escaped);
+                    ASSERT_STR_EQ(json_get_str(json_get(data, "padding")),
+                                  work_envelope_padding);
+                    saw_exact_limit |= n == ZCL_COMMAND_LIST_BUDGET;
+                } else {
+                    ASSERT_EQ(rc, ZCL_COMMAND_EXIT_INTERNAL);
+                    ASSERT(!json_get_bool(json_get(&envelope, "ok")));
+                    ASSERT_STR_EQ(json_get_str(json_get(
+                                      json_get(&envelope, "error"), "code")),
+                                  "RESPONSE_BUDGET_EXCEEDED");
+                    saw_refusal = true;
+                }
+                ASSERT_EQ(json_write(&input, NULL, 0), input_bytes);
+                ASSERT_STR_EQ(json_get_str(json_get(&input, "workspace")), escaped);
+                json_free(&envelope);
+            }
+            ASSERT(saw_exact_limit);
+            ASSERT(saw_refusal);
+            printf("work serializer ceiling: path=%s limit=%d capacity=%zu exact=1 refused=1 escaped=1\n",
+                   paths[alias], spec.budget_bytes,
+                   (size_t)ZCL_COMMAND_LIST_BUDGET + 1u);
+            json_free(&input);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_response_budget_views(void)
 {
     int failures = 0;
@@ -4494,6 +4597,7 @@ int test_command_registry_catalog(void)
     failures += test_dev_branch_leaves();
     failures += test_board_list_budget_pages();
     failures += test_response_budget_views();
+    failures += test_work_envelope_ceiling();
     failures += test_typo_stays_branch();
     failures += test_ops_selftest_registry();
     failures += test_ops_dash_dashboards_ported();

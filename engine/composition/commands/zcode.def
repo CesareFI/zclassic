@@ -691,6 +691,10 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_zcode_work_map)
 
+/* Detailed work results include the exact proof roots and the confirmation
+ * continuation as well as the human summary. Their complete result envelope
+ * exceeds RESULT_BUDGET even when the data object alone fits. Both aliases
+ * use the same bounded allowance; evidence and acceptance rules stay intact. */
 ZCL_COMMAND_READY_READ(
     "zcode.work.status", "zcode.work", "", "Show one human-first work status",
     "Rebuilds task and candidate state, then read-only re-verifies the exact "
@@ -701,7 +705,7 @@ ZCL_COMMAND_READY_READ(
     "human decision; accepted work resumes its existing idempotent acceptance "
     "to recover the exact publication continuation. Status itself performs no "
     "acceptance, source edit or publication.",
-    ZCL_COMMAND_RESULT_BUDGET,
+    ZCL_COMMAND_LIST_BUDGET,
     "zcode,work,status,human,evidence,latest",
     "zcl.zcode_work_status.input.v1", "zcl.zcode_work_status.v1",
     "workspace,work,datadir,details", "",
@@ -718,7 +722,7 @@ ZCL_COMMAND_READY_READ(
     "A discoverable alias for work status. It returns the same read-only proof "
     "facts and conversational confirmation identity; no display alias becomes "
     "authority and no window is launched.",
-    ZCL_COMMAND_RESULT_BUDGET,
+    ZCL_COMMAND_LIST_BUDGET,
     "zcode,work,show,human,evidence,result,latest",
     "zcl.zcode_work_status.input.v1", "zcl.zcode_work_status.v1",
     "workspace,work,datadir,details", "",

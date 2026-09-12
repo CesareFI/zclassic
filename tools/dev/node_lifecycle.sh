@@ -64,6 +64,9 @@ esac
 # through the same fail-closed ownership rules. Argument quoting goes
 # through printf %q so JSON --input payloads survive ssh re-joining.
 DHT_SSH="${DHT_SSH:-ssh}"
+# Enabled only by the Linux two-host acceptance. Remote native workers must
+# inherit the receiving host's scheduler admission and resource scope.
+DHT_REMOTE_DEVBUILD=0
 DHT_SCP="${DHT_SCP:-scp}"
 declare -A DHT_REMOTE_HOST=()   # rpc port -> ssh destination
 declare -A DHT_REMOTE_DIR=()    # rpc port -> remote base dir (bin/, datadirs)
@@ -182,8 +185,10 @@ dht_kill_group() {
         done
         dht_node_exec "$rpc" kill -KILL "-$pgid" 2>/dev/null || true
         unset "DHT_OWNED_PGIDS[$pgid]" "DHT_PGID_RPC[$pgid]"
-        ! dht_node_exec "$rpc" kill -0 "-$pgid" 2>/dev/null
-        return
+        if dht_node_exec "$rpc" kill -0 "-$pgid" 2>/dev/null; then
+            return 1
+        fi
+        return 0
     fi
     kill -"$sig" "-$pgid" 2>/dev/null || true
     for i in $(seq 1 50); do
@@ -322,6 +327,66 @@ dht_native() {
 }
 dht_status() { dht_native "$1" "$2" zcode network status; }
 
+dht_remote_scheduled_pid() {
+    local rpc="$1" dd="$2"; shift 2
+    # This is fixture startup, not a remote job executor. The only scheduled
+    # process is the native node, whose compiler children inherit its scope.
+    dht_node_exec "$rpc" bash -c '
+        set -eu
+        dd=$1; limit=$2; shift 2
+        mkdir -p "$dd-worker/.zvcs"
+        cd "$dd-worker"
+        pidfile="$dd/scheduled-node.pid"
+        rm -f "$pidfile"
+        setsid "$HOME/.local/bin/devbuild" --wait --project z23 \
+            setsid bash -c '\''
+                pidfile=$1; shift
+                printf "%s\n" "$$" > "$pidfile"
+                exec "$@"
+            '\'' scheduled-node "$pidfile" "$@" \
+            >>"$dd/node.log" 2>&1 </dev/null &
+        launcher=$!
+        end=$((SECONDS + limit))
+        while [ "$SECONDS" -lt "$end" ]; do
+            if [ -s "$pidfile" ]; then cat "$pidfile"; exit 0; fi
+            kill -0 "$launcher" 2>/dev/null || { wait "$launcher"; exit 1; }
+            sleep 0.2
+        done
+        kill -TERM -- "-$launcher" 2>/dev/null || true
+        if [ -s "$pidfile" ]; then
+            pid=$(cat "$pidfile")
+            case "$pid" in ""|*[!0-9]*) ;; *) kill -TERM -- "-$pid" 2>/dev/null || true ;; esac
+        fi
+        printf "remote scheduler admission timed out\n" >&2
+        exit 75
+    ' remote-scheduled-node "$dd" "$DHT_WAIT" "$@"
+}
+
+dht_record_started_arguments() {
+    # /proc observations belong to the opt-in Linux two-host lane.
+    [ "$DHT_REMOTE_DEVBUILD" = 1 ] || return 0
+    local dd="$1" rpc="$2" pid="$3" expected
+    expected="$(sha256sum "$NODE_BIN" | awk '{print $1}')"
+    dht_node_exec "$rpc" bash -c '
+        set -eu
+        dd=$1; pid=$2; expected=$3
+        for attempt in $(seq 1 50); do
+            if tr "\0" "\n" < "/proc/$pid/cmdline" | grep -q "^-datadir="; then
+                actual=$(sha256sum "/proc/$pid/exe" | awk '\''{print $1}'\'')
+                [ "$actual" = "$expected" ] || exit 75
+                {
+                    printf "started_utc=%s pid=%s\n" "$(date -u +%FT%TZ)" "$pid"
+                    sha256sum "/proc/$pid/exe"
+                    tr "\0" "\n" < "/proc/$pid/cmdline"
+                } >> "$dd/observed-start-arguments.txt"
+                exit 0
+            fi
+            sleep 0.1
+        done
+        exit 75
+    ' observe-start "$dd" "$pid" "$expected" || dht_die "could not verify started node image and arguments"
+}
+
 dht_spawn() {
     local out_name="$1" dd="$2" p2p="$3" rpc="$4" fs="$5" https="$6"
     shift 6
@@ -343,7 +408,7 @@ dht_spawn() {
         # credential directory must already hold wallet-passphrase.
         local cmd=(env
             "CREDENTIALS_DIRECTORY=${DHT_REMOTE_DIR[$rpc]}/cred"
-            setsid "${DHT_REMOTE_DIR[$rpc]}/bin/zclassic23"
+            "${DHT_REMOTE_DIR[$rpc]}/bin/zclassic23"
             "-datadir=$dd" -regtest "-port=$p2p" "-rpcport=$rpc"
             "-fsport=$fs" "-httpsport=$https")
         cmd+=("${args[@]}" "-packagehost=$DHT_PACKAGEHOST" -noisetransport)
@@ -353,13 +418,49 @@ dht_spawn() {
             cmd+=("-paramsdir=${DHT_REMOTE_DIR[$rpc]}/no-zk-params")
         cmd+=(-operator-lane=dev -wallet-no-phrase-backup
               -nobgvalidation -nolegacyimport -showmetrics=0)
-        pid="$("$DHT_SSH" -o BatchMode=yes "${DHT_REMOTE_HOST[$rpc]}" -- \
-            "$(printf '%q ' "${cmd[@]}")>>$(printf '%q' "$dd/node.log") 2>&1 </dev/null & echo \$!" </dev/null)" ||
-            dht_die "remote spawn on ${DHT_REMOTE_HOST[$rpc]} failed"
+        if [ "$DHT_REMOTE_DEVBUILD" = 1 ]; then
+            pid="$(dht_remote_scheduled_pid "$rpc" "$dd" "${cmd[@]}")" ||
+                dht_die "scheduled remote spawn failed"
+        else
+            pid="$("$DHT_SSH" -o BatchMode=yes "${DHT_REMOTE_HOST[$rpc]}" -- \
+                "setsid $(printf '%q ' "${cmd[@]}")>>$(printf '%q' "$dd/node.log") 2>&1 </dev/null & echo \$!" </dev/null)" ||
+                dht_die "remote spawn on ${DHT_REMOTE_HOST[$rpc]} failed"
+        fi
         case "$pid" in ''|*[!0-9]*) dht_die "remote spawn returned no pid: $pid" ;; esac
         DHT_OWNED_PGIDS[$pid]=1
         DHT_PGID_RPC[$pid]="$rpc"
+        if [ "$DHT_REMOTE_DEVBUILD" = 1 ]; then
+            local expected_exe
+            expected_exe="$(openssl dgst -sha3-256 "$NODE_BIN" | awk '{print $NF}')"
+            dht_node_exec "$rpc" bash -c '
+                set -eu
+                pid=$1; dd=$2; expected=$3; limit=$4
+                # Startup PID publication precedes exec. Preserve that raw
+                # sample, then require the actual frozen image before a receipt.
+                openssl dgst -sha3-256 "/proc/$pid/exe" >> "$dd/scheduled-starts.raw.txt" 2>&1 || true
+                end=$((SECONDS + limit))
+                actual=""
+                while [ "$SECONDS" -lt "$end" ]; do
+                    kill -0 "$pid" 2>/dev/null || exit 1
+                    actual=$(openssl dgst -sha3-256 "/proc/$pid/exe" 2>/dev/null | awk '\''{print $NF}'\'' || true)
+                    [ "$actual" != "$expected" ] || break
+                    sleep 0.1
+                done
+                [ "$actual" = "$expected" ] || exit 75
+                cg=$(awk -F: '\''$1 == "0" { print $3 }'\'' "/proc/$pid/cgroup")
+                case "$cg" in */development.slice/*) ;; *) exit 75 ;; esac
+                {
+                    printf "pid=%s cgroup=%s\n" "$pid" "$cg"
+                    printf "mapped_binary_sha3=%s\n" "$actual"
+                    grep "^Cpus_allowed_list:" "/proc/$pid/status"
+                    printf "memory.max="; cat "/sys/fs/cgroup$cg/memory.max"
+                    printf "cpu.max="; cat "/sys/fs/cgroup$cg/cpu.max"
+                } >> "$dd/scheduled-starts.txt"
+            ' verify-scheduled-node "$pid" "$dd" "$expected_exe" "$DHT_WAIT" ||
+                dht_die "remote worker did not inherit its scheduled scope"
+        fi
         printf -v "$out_name" '%s' "$pid"
+        dht_record_started_arguments "$dd" "$rpc" "$pid"
         return 0
     fi
     dht_process_group_exec "$NODE_BIN" -datadir="$dd" -regtest -port="$p2p" \
@@ -372,6 +473,7 @@ dht_spawn() {
     pid="$!"
     dht_register_owned_group "$pid"
     printf -v "$out_name" '%s' "$pid"
+    dht_record_started_arguments "$dd" "$rpc" "$pid"
 }
 
 dht_spawn_owned_command() {
@@ -453,12 +555,23 @@ dht_wait_height() {
 # even though the local submission path accepted the batch.  Mine in groups
 # of five with a wall-clock step so the second node validates the same chain.
 dht_mine_to_address() {
-    local count="$1" address="$2" chunk
+    local count="$1" address="$2" chunk reply rpc_exit decode_exit
     while [ "$count" -gt 0 ]; do
         chunk=5
         [ "$count" -lt "$chunk" ] && chunk="$count"
-        dht_rpc "$DHT_MINE_DD" "$DHT_MINE_RPC" generatetoaddress "$chunk" \
-            "\"$address\"" | dht_result >/dev/null
+        rpc_exit=0; decode_exit=0
+        reply="$(dht_rpc "$DHT_MINE_DD" "$DHT_MINE_RPC" generatetoaddress \
+                    "$chunk" "\"$address\"")" || rpc_exit=$?
+        printf '%s' "$reply" | dht_result >/dev/null || decode_exit=$?
+        if [ "$rpc_exit" -ne 0 ] || [ "$decode_exit" -ne 0 ]; then
+            if [ -n "$DHT_WORK" ]; then
+                printf '%s\n' "$reply" >"$DHT_WORK/funding-rpc-failure.json"
+            fi
+            printf 'funding RPC failed: remaining=%s chunk=%s rpc_exit=%s decoder_exit=%s response=%s\n' \
+                "$count" "$chunk" "$rpc_exit" "$decode_exit" "${reply:0:4096}" >&2
+            [ "$rpc_exit" -eq 0 ] || return "$rpc_exit"
+            return "$decode_exit"
+        fi
         count=$((count - chunk))
         [ "$count" -eq 0 ] || sleep 1
     done
