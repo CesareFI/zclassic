@@ -82,12 +82,25 @@ void boot_install_bundle_clear(const char *datadir) { (void)datadir; }
 
 bool boot_maybe_auto_install_consensus_bundle(struct node_db *ndb,
                                               struct main_state *ms,
-                                              const char *datadir)
+                                              const char *datadir,
+                                              bool trust_existing_block_files)
 {
     (void)ndb;
     (void)ms;
     (void)datadir;
+    (void)trust_existing_block_files;
     return false;
+}
+
+size_t boot_post_install_drop_borrowed_have_data(
+    struct main_state *ms, const char *datadir, int32_t installed_height,
+    bool trust_existing_block_files)
+{
+    (void)ms;
+    (void)datadir;
+    (void)installed_height;
+    (void)trust_existing_block_files;
+    return 0;
 }
 
 void boot_post_install_fold_span_check(struct main_state *ms,
@@ -468,11 +481,58 @@ void boot_post_install_fold_span_check(struct main_state *ms,
                  installed_height, resume_target, first_missing);
 }
 
+/* Post-install borrowed-have-data drop — contract in
+ * config/consensus_state_install_runtime.h. The boot after a header-seed
+ * import loads <datadir>/block_index.bin VERBATIM through the block-index
+ * ladder (the header-only clamp lives only in RAM on the first-boot import
+ * path, and the checkpoint_bundle_install_ready arm-and-respawn can pre-empt
+ * every shutdown save), so the map can carry the bundle PUBLISHER's HAVE_DATA
+ * + (nFile, nDataPos) for bodies this node never wrote — measured live as a
+ * ~1.3M calls/s read_block_pread storm on absent blk files that wedged a
+ * supervised tick child. Drop each claim whose blk file is absent/unreadable
+ * HERE — post-install, before the staged pipeline starts — mirroring the
+ * -load-snapshot-at-own-height gate (boot_refold_staged.c), then retract the
+ * active-chain tip to the installed height so P2P fills the gap bottom-up. */
+size_t boot_post_install_drop_borrowed_have_data(
+    struct main_state *ms, const char *datadir, int32_t installed_height,
+    bool trust_existing_block_files)
+{
+    if (!ms || !datadir || installed_height < 0)
+        return 0;
+    size_t dropped = boot_snapshot_drop_bodiless_have_data_above_seed(
+        ms, datadir, (int)installed_height, trust_existing_block_files);
+    if (dropped == 0)
+        return 0;
+    /* Mirror the snapshot path's retraction: with the borrowed span cleared,
+     * an active tip left at the top of that span would aim the P2P download
+     * window at the gap TOP; the staged fold needs the connectable bottom
+     * (installed_height+1) next. Publishes no finalized authority — the
+     * staged pipeline re-publishes the served tip as it folds forward. */
+    struct block_index *seed_bi =
+        active_chain_at(&ms->chain_active, (int)installed_height);
+    if (seed_bi && active_chain_move_window_tip(&ms->chain_active, seed_bi)) {
+        LOG_INFO(ICB_SUBSYS,
+                 "post-install: dropped %zu borrowed have-data claim(s) "
+                 "(blocks-less bundle) — retracted the active-chain tip to "
+                 "the installed height h=%d so P2P fills the gap bottom-up",
+                 dropped, (int)installed_height);
+    } else {
+        LOG_WARN(ICB_SUBSYS,
+                 "post-install: dropped %zu borrowed have-data claim(s) but "
+                 "the active-tip retract to h=%d failed (seed slot %s) — "
+                 "download may still target the gap top",
+                 dropped, (int)installed_height,
+                 seed_bi ? "present" : "NULL");
+    }
+    return dropped;
+}
+
 /* ── The 1b + 1c orchestrator ──────────────────────────────────────────────── */
 
 bool boot_maybe_auto_install_consensus_bundle(struct node_db *ndb,
                                               struct main_state *ms,
-                                              const char *datadir)
+                                              const char *datadir,
+                                              bool trust_existing_block_files)
 {
     if (!datadir || !datadir[0])
         return false;
@@ -570,10 +630,15 @@ bool boot_maybe_auto_install_consensus_bundle(struct node_db *ndb,
         }
     }
 
-    /* Post-install "catch the tail" check — see boot_post_install_fold_span_
-     * check's contract above / in the header for the full rationale. */
-    if (installed)
+    /* Post-install repair wiring — first drop any borrowed HAVE_DATA claims
+     * the verbatim ladder load admitted (boot_post_install_drop_borrowed_
+     * have_data), then the "catch the tail" check (see boot_post_install_fold_
+     * span_check's contract above / in the header for the full rationale). */
+    if (installed) {
+        (void)boot_post_install_drop_borrowed_have_data(
+            ms, datadir, installed_height, trust_existing_block_files);
         boot_post_install_fold_span_check(ms, installed_height);
+    }
 
     return installed;
 }
@@ -722,7 +787,8 @@ void boot_select_state_source(struct node_db *ndb, struct main_state *ms,
      * SUPERSEDES the transparent-only from-anchor reset (which leaves shielded
      * state empty → the anchor_backfill_gap wedge). */
     out->auto_installed_bundle =
-        boot_maybe_auto_install_consensus_bundle(ndb, ms, ctx->datadir);
+        boot_maybe_auto_install_consensus_bundle(ndb, ms, ctx->datadir,
+                                                 !ctx->no_legacy_auto_import);
 
     /* A1 — consume the sticky escalator's armed refold (bumps its bounded,
      * fsync-durable attempt budget) unless a complete install already fired. */

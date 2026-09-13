@@ -99,7 +99,11 @@ struct zcl_result consensus_state_install_from_bundle(
  * and installs the first present UNLESS the sovereign-install marker already
  * exists (never re-install over already-sovereign state). Returns true iff a
  * bundle was FULLY installed this boot — the caller then suppresses the
- * transparent-only from-anchor path (a complete install supersedes it). When a
+ * transparent-only from-anchor path (a complete install supersedes it). After
+ * a successful install, borrowed HAVE_DATA claims whose blk files are absent
+ * on this node are dropped via boot_post_install_drop_borrowed_have_data()
+ * (trust_existing_block_files has the same meaning as in the
+ * -load-snapshot-at-own-height gate: pass !ctx->no_legacy_auto_import). When a
  * successful install leaves a body gap in the (installed_height, header_tip]
  * fold span, the named blocker refold.body_gap is raised via
  * boot_refold_body_span_contiguous() so the reducer's body-fetch fills it
@@ -107,7 +111,8 @@ struct zcl_result consensus_state_install_from_bundle(
  * that fails the authority, returns false and boot proceeds unchanged. */
 bool boot_maybe_auto_install_consensus_bundle(struct node_db *ndb,
                                               struct main_state *ms,
-                                              const char *datadir);
+                                              const char *datadir,
+                                              bool trust_existing_block_files);
 
 /* Autodetect a complete-state bundle under <datadir>/bundles/. Returns a
  * malloc'd absolute path (caller free()s) to the chosen *.sqlite, or NULL when:
@@ -138,6 +143,29 @@ char *boot_autodetect_consensus_bundle(const char *datadir);
  * fails the boot — a detected gap only logs + raises the blocker. */
 void boot_post_install_fold_span_check(struct main_state *ms,
                                        int32_t installed_height);
+
+/* Post-install borrowed-have-data drop — the call-site wiring around
+ * boot_snapshot_drop_bodiless_have_data_above_seed() (impl in
+ * engine/composition/src/boot_refold_staged.c, contract in config/boot.h),
+ * reused here (impl in engine/composition/src/boot_auto_install_bundle.c)
+ * after a successful complete-state install (1b/1c above). The boot after a
+ * header-seed import loads <datadir>/block_index.bin VERBATIM through the
+ * block-index ladder (the header-only clamp lives only in RAM on the
+ * first-boot import path, and an arm-and-respawn can pre-empt every shutdown
+ * save), so the map can carry the bundle PUBLISHER's HAVE_DATA +
+ * (nFile, nDataPos) for bodies this node never wrote; left in place, every
+ * have-data-gated walker (pv_lookahead, the have-data window extender,
+ * catchup) read-storms blk files absent on this node and the staged pipeline
+ * wedges. Drops each claim whose blk file is absent/unreadable HERE —
+ * post-install, before the staged pipeline starts — mirroring the
+ * -load-snapshot-at-own-height gate, then retracts the active-chain tip to
+ * installed_height so P2P fills the gap bottom-up. trust_existing_block_files
+ * selects the cheap stat() keep (a legacy-import datadir's own blk files) vs
+ * the strict read-back-and-hash-bind keep. Returns the number of dropped
+ * claims; a safe no-op (0) when ms/datadir are NULL or installed_height < 0. */
+size_t boot_post_install_drop_borrowed_have_data(
+    struct main_state *ms, const char *datadir, int32_t installed_height,
+    bool trust_existing_block_files);
 
 /* Clear a stale "<bundle_path>.failed" never-stuck marker after that bundle
  * installed successfully (wired at both install success branches in

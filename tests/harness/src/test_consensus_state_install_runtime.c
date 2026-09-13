@@ -30,6 +30,12 @@
  *       NAMED blocker refold.body_gap at the first missing height rather than
  *       letting the fold walk silently into a hole; ms==NULL / negative
  *       installed_height are safe no-ops.
+ *   (d2) boot_post_install_drop_borrowed_have_data — the post-install wiring
+ *       that drops HAVE_DATA claims borrowed from the bundle publisher's
+ *       blk-file layout (absent on this node) before the staged pipeline
+ *       starts: every non-seed claim is floored to header-only, the seed
+ *       block is protected, the active tip retracts to the installed height,
+ *       and NULL/negative guards are safe no-ops.
  */
 
 #include "test/test_core.h"
@@ -425,6 +431,135 @@ static int case_post_install_fold_span_check(void)
     return failures;
 }
 
+/* (d2) boot_post_install_drop_borrowed_have_data — the post-install wiring
+ * that drops HAVE_DATA claims borrowed from the bundle PUBLISHER's blk-file
+ * layout (the verbatim ladder load of a swarm-served block_index.bin) before
+ * the staged pipeline starts, then retracts the active tip to the installed
+ * height. Fixture mirrors the measured cold-sync defect: rows carry
+ * HAVE_DATA + (nFile=49, nDataPos) but this node's blocks/ holds no such
+ * file. */
+static bool csir_install_borrowed(struct main_state *ms, int height,
+                                  struct block_index *prev,
+                                  struct block_index **out)
+{
+    struct uint256 h;
+    csir_hash_for(height, &h);
+    struct block_index *bi =
+        chainstate_insert_block_index((struct chainstate *)ms, &h);
+    if (!bi)
+        return false;
+    bi->nHeight = height;
+    bi->nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA;
+    bi->nFile = 49;                 /* the publisher's blk-file layout */
+    bi->nDataPos = 47565546u + (unsigned int)height;
+    bi->nTx = 2;
+    bi->pprev = prev;
+    *out = bi;
+    return active_chain_install_tip_slot(&ms->chain_active, bi);
+}
+
+static bool csir_is_header_only(const struct block_index *bi)
+{
+    return bi &&
+           !(bi->nStatus & BLOCK_HAVE_DATA) &&
+           (bi->nStatus & BLOCK_VALID_MASK) == BLOCK_VALID_TREE &&
+           bi->nFile == -1 &&
+           bi->nDataPos == 0 &&
+           bi->nTx == 0;
+}
+
+/* The three no-op guards (NULL ms, NULL datadir, negative installed height)
+ * as one bool so the case body stays under the complexity cap. */
+static bool csir_drop_guards_pass(struct main_state *ms)
+{
+    return boot_post_install_drop_borrowed_have_data(
+               NULL, "/nonexistent", 10, false) == 0 &&
+           boot_post_install_drop_borrowed_have_data(
+               ms, NULL, 10, false) == 0 &&
+           boot_post_install_drop_borrowed_have_data(
+               ms, "/nonexistent", -1, false) == 0;
+}
+
+/* Install the 5-entry publisher-layout chain [inst-1 .. inst+3], pprev-linked
+ * and tip-slot installed ascending. out[0]=below-seed, out[1]=seed,
+ * out[2..4]=above-seed. */
+static bool csir_seed_borrowed_chain(struct main_state *ms, int inst,
+                                     struct block_index *out[5])
+{
+    struct block_index *prev = NULL;
+    for (int i = 0; i < 5; i++) {
+        if (!csir_install_borrowed(ms, inst - 1 + i, prev, &out[i]))
+            return false;
+        prev = out[i];
+    }
+    return true;
+}
+
+static bool csir_all_four_cleared(size_t dropped, struct block_index *const c[5])
+{
+    return dropped == 4 && csir_is_header_only(c[0]) &&
+           csir_is_header_only(c[2]) && csir_is_header_only(c[3]) &&
+           csir_is_header_only(c[4]);
+}
+
+static bool csir_seed_still_protected(const struct block_index *seed)
+{
+    return seed && (seed->nStatus & BLOCK_HAVE_DATA) &&
+           (seed->nStatus & BLOCK_VALID_MASK) == BLOCK_VALID_SCRIPTS &&
+           seed->nFile == 49;
+}
+
+static int case_post_install_drop_borrowed_have_data(void)
+{
+    int failures = 0;
+
+    /* Guards: NULL state/datadir and a negative installed height are safe
+     * no-ops (0 dropped, no crash). */
+    {
+        struct main_state ms;
+        main_state_init(&ms);
+        CSIR_CHECK("drop-borrowed: NULL/negative guards return 0",
+                   csir_drop_guards_pass(&ms));
+        main_state_free(&ms);
+    }
+
+    /* Borrowed coordinates with absent blk files: every non-seed claim is
+     * cleared to header-only, the seed block is protected, and the active
+     * tip retracts to the installed height. */
+    {
+        char dir[256];
+        test_make_tmpdir(dir, sizeof(dir), "post_install_drop", "borrowed");
+        char blocks[512];
+        int bn = snprintf(blocks, sizeof(blocks), "%s/blocks", dir);
+        CSIR_CHECK("drop-borrowed: blocks dir created",
+                   bn > 0 && (size_t)bn < sizeof(blocks) &&
+                   mkdir(blocks, 0755) == 0);
+
+        struct main_state ms;
+        main_state_init(&ms);
+        const int inst = CSIR_INSTALLED_H;
+        struct block_index *c[5] = {0};
+        bool seeded = csir_seed_borrowed_chain(&ms, inst, c);
+        CSIR_CHECK("drop-borrowed: publisher-layout chain installed",
+                   seeded && active_chain_height(&ms.chain_active) == inst + 3);
+
+        size_t dropped = boot_post_install_drop_borrowed_have_data(
+            &ms, dir, inst, /*trust_existing_block_files=*/false);
+
+        CSIR_CHECK("drop-borrowed: all non-seed borrowed claims dropped",
+                   csir_all_four_cleared(dropped, c));
+        CSIR_CHECK("drop-borrowed: seed block protected",
+                   csir_seed_still_protected(c[1]));
+        CSIR_CHECK("drop-borrowed: active tip retracted to installed height",
+                   active_chain_height(&ms.chain_active) == inst);
+
+        main_state_free(&ms);
+        test_rm_rf_recursive(dir);
+    }
+
+    return failures;
+}
+
 /* ── (e) Deferral / retry — the fresh-boot install-timing seam ─────────────── */
 
 /* Install a temporary SHA3 checkpoint override at `height` whose block_hash is
@@ -763,6 +898,7 @@ int test_consensus_state_install_runtime(void)
     failures += case_runtime_returns();
     failures += case_durable_request();
     failures += case_post_install_fold_span_check();
+    failures += case_post_install_drop_borrowed_have_data();
     failures += case_checkpoint_header_ready();
     failures += case_checkpoint_header_frontier_restore();
     failures += case_retry_condition();

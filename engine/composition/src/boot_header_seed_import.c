@@ -158,6 +158,20 @@ bool boot_header_seed_import_maybe(const char *datadir, struct main_state *ms)
                  "entries) — pindex_best_header publish may lag", count);
     }
 
+    /* Persist the clamped map NOW. The on-disk artifact is otherwise still
+     * the seeder's original bytes, and the NEXT boot's block-index ladder
+     * (rung "flat") loads <datadir>/block_index.bin VERBATIM — the header-only
+     * clamp above lives only in RAM on this import path. A self-respawn before
+     * any shutdown save (the checkpoint_bundle_install_ready arm-and-respawn)
+     * would then re-admit the seeder's HAVE_DATA + (nFile, nDataPos) as this
+     * node's own warm cache, and every have-data-gated walker read-storms blk
+     * files this node never wrote (measured: ~1.3M pread/s on an absent
+     * blk00049.dat, wedging a supervised tick child). Saving here makes the
+     * clamp durable before the artifact can serve as the next boot's flat
+     * cache; the save re-encodes the hash-bound anchor header (the checkpoint
+     * solution the install binds) from the in-memory map. */
+    save_block_index_flat(datadir, ms);
+
     /* Checkpoint-ownership check: does the imported chain own the baked
      * checkpoint block hash? This is the exact precondition the bundle install
      * defers on (consensus_state_checkpoint_header_ready). If the artifact does

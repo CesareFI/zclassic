@@ -874,6 +874,19 @@ bool boot_ratify_seam_check_and_stamp(
     struct sqlite3 *pdb, int32_t height, const uint8_t coins_sha3[32],
     uint64_t count, struct boot_ratify_result *out);
 
+/* Blocks-less state-source repair (impl in boot_refold_staged.c). Drops every
+ * borrowed HAVE_DATA claim whose referenced blk file is absent on THIS node
+ * (or, when trust_existing_block_files is false, that does not read back and
+ * hash-bind to the index entry): resets (nFile=-1, nDataPos=0), clears
+ * BLOCK_HAVE_DATA, and floors validity at BLOCK_VALID_TREE so the body is
+ * re-fetched + re-indexed via P2P. Applies to all heights except the seed
+ * block itself. Returns the number of blocks dropped. Called by the
+ * -load-snapshot-at-own-height reset and by the consensus-bundle install
+ * wiring (boot_post_install_drop_borrowed_have_data). */
+size_t boot_snapshot_drop_bodiless_have_data_above_seed(
+    struct main_state *ms, const char *datadir, int seed_h,
+    bool trust_existing_block_files);
+
 #ifdef ZCL_TESTING
 /* Unit surface for the exact production lane/owner gate. `authorization` is
  * accepted only when it is exactly "1". */

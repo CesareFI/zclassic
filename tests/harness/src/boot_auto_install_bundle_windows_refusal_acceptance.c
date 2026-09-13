@@ -34,7 +34,8 @@ int main(void)
         boot_install_bundle_pending(root_utf8) ||
         boot_install_bundle_consume(root_utf8, out, sizeof(out)) || out[0] ||
         boot_autodetect_consensus_bundle(root_utf8) != NULL ||
-        boot_maybe_auto_install_consensus_bundle(NULL, NULL, root_utf8))
+        boot_maybe_auto_install_consensus_bundle(NULL, NULL, root_utf8,
+                                                 false))
         return 4;
     boot_install_bundle_clear(root_utf8);
     boot_auto_install_clear_failed_marker(failed_utf8);

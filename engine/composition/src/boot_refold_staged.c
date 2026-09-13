@@ -101,7 +101,7 @@ void boot_refold_staged_init(bool refold_staged)
  * the P2P download window follows active_chain_height(), so without the
  * retraction the node floods the TOP of the gap (header-tip successors) and
  * never fetches the connectable bottom (seed_h+1) the staged fold needs next. */
-static size_t boot_snapshot_drop_bodiless_have_data_above_seed(
+size_t boot_snapshot_drop_bodiless_have_data_above_seed(
     struct main_state *ms, const char *datadir, int seed_h,
     bool trust_existing_block_files)
 {
@@ -187,8 +187,8 @@ static size_t boot_snapshot_drop_bodiless_have_data_above_seed(
 
     if (cleared > 0)
         fprintf(stderr,
-                "[boot] -load-snapshot-at-own-height: blocks-less bundle — "
-                "dropped borrowed have-data on %zu block(s) around seed h=%d "
+                "[boot] blocks-less state source: dropped borrowed have-data "
+                "on %zu block(s) around seed h=%d "
                 "(below+above; no trusted body on disk; %zu kept with real "
                 "bodies; %zu hash-verified; %zu rejected by hash/read check; "
                 "seed block protected; trust_existing_block_files=%s); "
