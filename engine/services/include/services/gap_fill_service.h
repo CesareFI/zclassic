@@ -61,6 +61,7 @@ struct gap_fill_stats {
     uint64_t timeout_sweeps;
     uint64_t timeouts_requeued;
     uint64_t dispatch_wakes;
+    uint64_t kick_latch_skips; /* waits skipped by a latched kick event */
     int      last_tip_h;
     int      last_best_h;
     int      last_window_lo;
@@ -135,5 +136,13 @@ void gap_fill_kick(void);
  * and timeout sweeps; connman owns peer enumeration and getdata writes. This
  * bridges those two without exposing peer internals to the service. */
 void gap_fill_set_dispatch_wake(gap_fill_dispatch_wake_fn fn, void *ctx);
+
+#ifdef ZCL_TESTING
+/* Test seam for the kick latch: drive and observe the worker's wait state
+ * without starting the thread. */
+void gap_fill_test_set_running(bool running);
+bool gap_fill_test_kick_pending(void);
+void gap_fill_test_await_kick_or_tick(void);
+#endif
 
 #endif /* ZCL_GAP_FILL_SERVICE_H */

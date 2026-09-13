@@ -34,6 +34,35 @@ static struct log_throttle g_readfail_throttle  = LOG_THROTTLE_INIT;
 /* Same, for a DANGLING position (foreign writer, torn import): every sweep. */
 static struct log_throttle g_locate_fail_throttle = LOG_THROTTLE_INIT;
 
+/* Durable body-completion hook (see disk_block_io.h). Set once at boot,
+ * cleared at shutdown; read on the persist thread under the same lock. */
+static pthread_mutex_t g_have_data_hook_lock = PTHREAD_MUTEX_INITIALIZER;
+static disk_block_have_data_hook_fn g_have_data_hook;
+static void *g_have_data_hook_ctx;
+
+void disk_block_io_set_have_data_hook(disk_block_have_data_hook_fn fn,
+                                      void *ctx)
+{
+    pthread_mutex_lock(&g_have_data_hook_lock);
+    g_have_data_hook = fn;
+    g_have_data_hook_ctx = ctx;
+    pthread_mutex_unlock(&g_have_data_hook_lock);
+}
+
+static void disk_block_io_fire_have_data_hook(void)
+{
+    disk_block_have_data_hook_fn fn;
+    void *ctx;
+
+    pthread_mutex_lock(&g_have_data_hook_lock);
+    fn = g_have_data_hook;
+    ctx = g_have_data_hook_ctx;
+    pthread_mutex_unlock(&g_have_data_hook_lock);
+
+    if (fn)
+        fn(ctx);
+}
+
 /* A missing directory is always invalid. Do not infer pointer lifetime from
  * path bytes: POSIX permits every non-NUL byte inside a path component except
  * '/', and inspecting a pointer after its lifetime ended is already undefined
@@ -899,5 +928,6 @@ bool block_index_set_have_data_verified(struct block_index *pindex,
 
     block_index_disk_pos_store(pindex, pos->nFile, pos->nPos);
     block_index_status_fetch_or(pindex, BLOCK_HAVE_DATA);
+    disk_block_io_fire_have_data_hook();
     return true;
 }

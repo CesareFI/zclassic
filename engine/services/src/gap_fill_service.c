@@ -54,6 +54,7 @@ struct gap_fill_state {
     struct download_manager *dm;
     gap_fill_dispatch_wake_fn wake_dispatch;
     void                   *wake_dispatch_ctx;
+    bool                   kick_pending; /* under mu: latched kick event */
 
     struct gap_fill_stats  stats;
     _Atomic supervisor_child_id supervisor_id;
@@ -618,6 +619,25 @@ static void gap_fill_burst_heartbeat(void *ctx)
     gap_fill_supervisor_heartbeat();
 }
 
+/* Sleep until kicked or GAPFILL_TICK_SECS elapsed. A kick is an EVENT
+ * with a latch, not an edge: one arriving mid-pass (outside this wait)
+ * is consumed here and skips the sleep entirely, so a durable body
+ * completion can never be lost to the timer. */
+static void gap_fill_await_kick_or_tick(void)
+{
+    pthread_mutex_lock(&g_gf.mu);
+    if (!atomic_load(&g_gf.stop_requested) && !g_gf.kick_pending) {
+        struct timespec until;
+        platform_time_realtime_timespec(&until);
+        until.tv_sec += GAPFILL_TICK_SECS;
+        pthread_cond_timedwait(&g_gf.cv, &g_gf.mu, &until);
+    } else if (g_gf.kick_pending && !atomic_load(&g_gf.stop_requested)) {
+        g_gf.stats.kick_latch_skips++;
+    }
+    g_gf.kick_pending = false;
+    pthread_mutex_unlock(&g_gf.mu);
+}
+
 static void *gap_fill_thread_main(void *arg)
 {
     (void)arg;
@@ -660,28 +680,22 @@ static void *gap_fill_thread_main(void *arg)
         if (do_persist)
             gap_fill_persist_coverage();
 
-        /* Sleep until kicked or GAPFILL_TICK_SECS elapsed. */
-        pthread_mutex_lock(&g_gf.mu);
-        if (!atomic_load(&g_gf.stop_requested)) {
-            struct timespec until;
-            platform_time_realtime_timespec(&until);
-            until.tv_sec += GAPFILL_TICK_SECS;
-            pthread_cond_timedwait(&g_gf.cv, &g_gf.mu, &until);
-        }
-        pthread_mutex_unlock(&g_gf.mu);
+        gap_fill_await_kick_or_tick();
     }
     struct gap_fill_stats st;
     gap_fill_get_stats(&st);
     printf("[gap-fill] service stopped (passes=%llu enqueued=%llu "
            "idle=%llu corrupt=%llu timeout_sweeps=%llu "
-           "timeouts_requeued=%llu dispatch_wakes=%llu)\n",
+           "timeouts_requeued=%llu dispatch_wakes=%llu "
+           "kick_latch_skips=%llu)\n",
            (unsigned long long)st.passes,
            (unsigned long long)st.blocks_enqueued,
            (unsigned long long)st.passes_idle,
            (unsigned long long)st.passes_corrupt_walk,
            (unsigned long long)st.timeout_sweeps,
            (unsigned long long)st.timeouts_requeued,
-           (unsigned long long)st.dispatch_wakes);
+           (unsigned long long)st.dispatch_wakes,
+           (unsigned long long)st.kick_latch_skips);
     return NULL;
 }
 
@@ -780,9 +794,37 @@ void gap_fill_kick(void)
 {
     if (!atomic_load(&g_gf.running)) return;
     pthread_mutex_lock(&g_gf.mu);
+    g_gf.kick_pending = true;
     pthread_cond_broadcast(&g_gf.cv);
     pthread_mutex_unlock(&g_gf.mu);
 }
+
+#ifdef ZCL_TESTING
+/* Test seam: drive and observe the kick latch without the worker thread.
+ * Setting running also clears a stale latch so each case starts clean. */
+void gap_fill_test_set_running(bool running)
+{
+    atomic_store(&g_gf.running, running);
+    atomic_store(&g_gf.stop_requested, false);
+    pthread_mutex_lock(&g_gf.mu);
+    g_gf.kick_pending = false;
+    pthread_mutex_unlock(&g_gf.mu);
+}
+
+bool gap_fill_test_kick_pending(void)
+{
+    pthread_mutex_lock(&g_gf.mu);
+    bool pending = g_gf.kick_pending;
+    pthread_mutex_unlock(&g_gf.mu);
+    return pending;
+}
+
+/* The worker's real wait block, exposed so a test can time the skip. */
+void gap_fill_test_await_kick_or_tick(void)
+{
+    gap_fill_await_kick_or_tick();
+}
+#endif
 
 void gap_fill_set_dispatch_wake(gap_fill_dispatch_wake_fn fn, void *ctx)
 {

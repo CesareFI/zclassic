@@ -27,6 +27,7 @@
 #include "jobs/header_probe_poll.h"
 #include "services/legacy_mirror_sync_service.h"
 #include "services/gap_fill_service.h"
+#include "storage/disk_block_io.h"
 #include "services/zclassicd_oracle_service.h"
 #include "services/rolling_anchor_service.h"
 #include "services/segment_sealer_service.h"
@@ -157,18 +158,28 @@ static void boot_gap_fill_dispatch_wake(void *ctx)
     connman_wake_message_handler((struct connman *)ctx);
 }
 
+/* Durable body completion (history or tip) is a refill event: kick the
+ * worker so its next pass runs now instead of after GAPFILL_TICK_SECS. */
+static void boot_gap_fill_have_data_kick(void *ctx)
+{
+    (void)ctx;
+    gap_fill_kick();
+}
+
 bool boot_gap_fill_start(void *ctx)
 {
     struct boot_svc_ctx *svc = ctx;
     if (!svc)
         return false;
     gap_fill_set_dispatch_wake(boot_gap_fill_dispatch_wake, svc->connman);
+    disk_block_io_set_have_data_hook(boot_gap_fill_have_data_kick, NULL);
     struct zcl_result gr = gap_fill_start(svc->state, msg_get_download_mgr());
     if (gr.ok) {
         printf("[gap-fill] background gap-fill service started\n");
         return true;
     }
     gap_fill_set_dispatch_wake(NULL, NULL);
+    disk_block_io_set_have_data_hook(NULL, NULL);
     fprintf(stderr, "WARNING: gap_fill_start failed: %s:%d code=%d %s\n",
             gr.source_file, gr.source_line, gr.code, gr.message);
     return false;

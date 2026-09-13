@@ -1110,6 +1110,26 @@ int t_process_block_node_db_access_is_runtime_owned(void)
         ASSERT(read_entire_file(path, &buf) == 0);
         ASSERT(strstr(buf, "process_block_set_gap_fill_kick(NULL, NULL)") != NULL);
         ASSERT(strstr(buf, "process_block_set_tip_publication_hooks(NULL, NULL, NULL)") != NULL);
+        ASSERT(strstr(buf, "disk_block_io_set_have_data_hook(NULL, NULL)") != NULL);
+        free(buf);
+        buf = NULL;
+
+        /* The durable body-completion seam wakes the same worker through a
+         * storage-side hook; storage never names gap_fill. */
+        ASSERT(repo_path(path, sizeof(path),
+                         "engine/composition/src/boot_runtime_sync_services.c") == 0);
+        ASSERT(read_entire_file(path, &buf) == 0);
+        ASSERT(strstr(buf, "disk_block_io_set_have_data_hook(boot_gap_fill_have_data_kick, NULL)") != NULL);
+        ASSERT(strstr(buf, "gap_fill_kick") != NULL);
+        free(buf);
+        buf = NULL;
+
+        ASSERT(repo_path(path, sizeof(path),
+                         "engine/modules/storage/src/disk_block_io.c") == 0);
+        ASSERT(read_entire_file(path, &buf) == 0);
+        ASSERT(strstr(buf, "disk_block_io_set_have_data_hook") != NULL);
+        ASSERT(strstr(buf, "disk_block_io_fire_have_data_hook") != NULL);
+        ASSERT(strstr(buf, "gap_fill") == NULL);
         free(buf);
         buf = NULL;
 

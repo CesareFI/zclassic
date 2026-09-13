@@ -1130,6 +1130,35 @@ static int test_gap_fill_timeout_wakes_dispatcher(void)
     return failures;
 }
 
+static int test_gap_fill_kick_latch_skips_wait(void)
+{
+    int failures = 0;
+    TEST("gap_fill kick latch: a mid-pass kick is never lost to the timer") {
+        /* The regression: a durable body completion lands while the worker
+         * is mid-pass (not inside pthread_cond_timedwait). Without a latch
+         * the broadcast is lost and refill waits out the whole 5 s tick. */
+        gap_fill_test_set_running(true);
+        gap_fill_kick();
+        ASSERT(gap_fill_test_kick_pending());
+
+        struct gap_fill_stats st_before, st_after;
+        gap_fill_get_stats(&st_before);
+        gap_fill_test_await_kick_or_tick();
+        gap_fill_get_stats(&st_after);
+        ASSERT(st_after.kick_latch_skips == st_before.kick_latch_skips + 1);
+        ASSERT(!gap_fill_test_kick_pending());
+
+        /* A kick while the service is down stays a no-op and never
+         * latches a stale wakeup into the next run. */
+        gap_fill_test_set_running(false);
+        gap_fill_kick();
+        ASSERT(!gap_fill_test_kick_pending());
+
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_gap_fill_queued_idle_wakes_dispatcher(void)
 {
     int failures = 0;
@@ -1960,6 +1989,7 @@ int test_download(void)
     failures += test_dl_diagnostics();
     failures += test_gap_fill_timeout_sweep();
     failures += test_gap_fill_timeout_wakes_dispatcher();
+    failures += test_gap_fill_kick_latch_skips_wait();
     failures += test_gap_fill_queued_idle_wakes_dispatcher();
     failures += test_dl_many_insertions();
     failures += test_dl_ibd_windows();

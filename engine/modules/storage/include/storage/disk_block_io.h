@@ -176,6 +176,14 @@ bool block_index_set_have_data_verified(struct block_index *pindex,
                                         const struct disk_block_pos *pos,
                                         const char *datadir);
 
+/* Optional hook fired after an index entry is newly marked BLOCK_HAVE_DATA
+ * (the durable body-completion seam). Boot wires this to the gap-fill
+ * refill worker so a completed history body wakes the next refill pass
+ * instead of waiting out the tick. Storage never names its consumer. */
+typedef void (*disk_block_have_data_hook_fn)(void *ctx);
+void disk_block_io_set_have_data_hook(disk_block_have_data_hook_fn fn,
+                                      void *ctx);
+
 /* Hash-targeted self-heal for a stale/torn (nFile,nDataPos): scan the
  * entry's current blk file for a record whose block hash equals
  * *pindex->phashBlock and, on a hit, re-store the fresh position through

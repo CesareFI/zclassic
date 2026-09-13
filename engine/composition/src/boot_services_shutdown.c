@@ -36,6 +36,7 @@
 #include "storage/txdb.h"
 #include "storage/coins_view_sqlite.h"
 #include "storage/progress_store.h"
+#include "storage/disk_block_io.h"
 #include "storage/block_index_projection.h"
 #include "coins/utxo_commitment.h"
 #include "coins/coins_view.h"
@@ -432,6 +433,7 @@ void app_shutdown_svc(struct boot_svc_ctx *svc)
 
     atomic_store(svc->running, false);
     process_block_set_gap_fill_kick(NULL, NULL);
+    disk_block_io_set_have_data_hook(NULL, NULL);
     process_block_set_mempool_restore_hook(NULL, NULL);
     process_block_set_tip_publication_hooks(NULL, NULL, NULL);
     g_shutdown_requested = 1;

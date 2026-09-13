@@ -1333,7 +1333,7 @@ Z23_FLAG("ZCL_LEGACY_CHAINSTATE", "env_test", "-", "-",
 Z23_FLAG("ZCL_LEGACY_DATADIR", "env_test", "-", "-",
           "undocumented; first use tests/harness/src/test_block_log_legacy.c:43")
 Z23_FLAG("ZCL_LEGACY_ORACLE_MODE", "env_runtime", "-", "-",
-          "undocumented; first use engine/composition/src/boot_runtime_sync_services.c:118")
+          "undocumented; first use engine/composition/src/boot_runtime_sync_services.c:119")
 Z23_FLAG("ZCL_LEVELDB_NO_VERIFY_CHECKSUMS", "env_runtime", "-", "-",
           "undocumented; first use engine/modules/storage/src/dbwrapper.c:97")
 Z23_FLAG("ZCL_LIB_MODULES", "env_build", "-", "-",
@@ -2456,7 +2456,7 @@ Z23_FLAG("ZCL_UTXO_LADDER_LEAF_STORE", "env_test", "-", "-",
 Z23_FLAG("ZCL_UTXO_LADDER_OBSERVE_ONLY", "env_runtime", "-", "-",
           "undocumented; first use engine/jobs/src/utxo_root_ladder_tripwire.c:104")
 Z23_FLAG("ZCL_UTXO_MIRROR_MODE", "env_runtime", "-", "-",
-          "undocumented; first use engine/composition/src/boot_runtime_sync_services.c:298")
+          "undocumented; first use engine/composition/src/boot_runtime_sync_services.c:309")
 Z23_FLAG("ZCL_UTXO_MIRROR_TICK_SECONDS", "env_runtime", "-", "-",
           "undocumented; first use engine/services/src/utxo_mirror_sync_service.c:682")
 Z23_FLAG("ZCL_VCS_SHA1_ROOT", "env_build", "-", "-",
