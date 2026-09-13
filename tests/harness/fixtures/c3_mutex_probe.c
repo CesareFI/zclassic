@@ -1,6 +1,7 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0 */
+/* purpose: Record selected-mutex wait and hold times in isolated benchmark processes. */
 #define _GNU_SOURCE
-#include "dev/c3_mutex_probe.h"
+#include "../../../tools/dev/c3_mutex_probe.h"
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <stdio.h>

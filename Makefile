@@ -14249,16 +14249,16 @@ c3-speed-bench: $(BIN_DIR)/c3-mutex-probe.so
 	LD_PRELOAD="$(abspath $(BIN_DIR)/c3-mutex-probe.so)" C3_REQUIRE_MUTEX_PROBE=1 C3_ENFORCE_SPEED_CONTRACT=1 \
 	  $(MAKE) --no-print-directory t-fast-exact ONLY=download_speed_contract
 c3-mutex-probe: $(BIN_DIR)/c3-mutex-probe.so
-$(BIN_DIR)/c3-mutex-probe.so: tools/c3_mutex_probe.c tools/dev/c3_mutex_probe.h
+$(BIN_DIR)/c3-mutex-probe.so: tests/harness/fixtures/c3_mutex_probe.c tools/dev/c3_mutex_probe.h
 	@mkdir -p $(dir $@)
 	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic -fPIC -shared \
-	  -o $@ tools/c3_mutex_probe.c -ldl -pthread
+	  -o $@ tests/harness/fixtures/c3_mutex_probe.c -ldl -pthread
 
 .PHONY: c3-tip-seam
 c3-tip-seam: $(BIN_DIR)/c3-tip-seam-probe.o
 	$(MAKE) --no-print-directory t-fast-exact ONLY=tip_finalize_stage,tip_finalize_post_step \
 	  T_FAST_EXACT_ARGS=--jobs=1 \
 	  C3_TIP_LINK='$(abspath $(BIN_DIR)/c3-tip-seam-probe.o) -Xlinker --wrap=progress_store_tx_lock -Xlinker --wrap=progress_store_tx_unlock -Xlinker --wrap=tip_finalize_reconcile_visible_cursor_body -Xlinker --wrap=tip_finalize_run_post_finalize -Xlinker --wrap=test_tip_finalize_stage -Xlinker --wrap=test_tip_finalize_post_step'
-$(BIN_DIR)/c3-tip-seam-probe.o: tools/c3_tip_seam_probe.c
+$(BIN_DIR)/c3-tip-seam-probe.o: tests/harness/fixtures/c3_tip_seam_probe.c
 	@mkdir -p $(dir $@)
 	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic -c $< -o $@

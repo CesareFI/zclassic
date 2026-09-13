@@ -1,4 +1,5 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0 */
+/* purpose: Measure finalization seams in registered isolated test groups. */
 #define _POSIX_C_SOURCE 200809L
 #include <stdatomic.h>
 #include <stdint.h>

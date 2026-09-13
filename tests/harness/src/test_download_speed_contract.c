@@ -17,10 +17,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#ifdef __linux__
-#include <linux/perf_event.h>
-#include <sys/syscall.h>
-#endif
 
 enum { SPEED_BATCH = 1024, SPEED_SAMPLES = 5, SPEED_LIMIT = 65536 };
 static const struct c3_mutex_probe_api *speed_probe;
@@ -55,18 +51,8 @@ static unsigned long speed_frequency(void)
 
 static int speed_cycles_open(void)
 {
-#ifdef __linux__
-    struct perf_event_attr attr = {0};
-    attr.size = sizeof(attr);
-    attr.type = PERF_TYPE_HARDWARE;
-    attr.config = PERF_COUNT_HW_CPU_CYCLES;
-    attr.exclude_kernel = 1;
-    attr.exclude_hv = 1;
-    return (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
-#else
     errno = ENOTSUP;
     return -1;
-#endif
 }
 
 static int speed_compare(const void *a, const void *b)

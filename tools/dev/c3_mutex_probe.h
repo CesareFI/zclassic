@@ -1,4 +1,6 @@
-/* Copyright 2026 Rhett Creighton - Apache License 2.0 */
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * purpose: Define the isolated benchmark mutex-sample interface.
+ */
 #ifndef ZCL_C3_MUTEX_PROBE_H
 #define ZCL_C3_MUTEX_PROBE_H
 #include <pthread.h>

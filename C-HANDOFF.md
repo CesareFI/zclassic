@@ -104,13 +104,18 @@ not validated or persisted bodies. The previous live receiver measured
 
 ## Tools and source
 
-- `tests/harness/src/test_download_speed_contract.c`: scaling, hardware cycles,
+- `tests/harness/src/test_download_speed_contract.c`: scaling, thread CPU time,
   frequency, command contention and isolated queue-work fixture.
 - `tests/harness/src/test_download.c`: optional larger enqueue witness,
   registered as `download_enqueue_profile`.
-- `tools/c3_mutex_probe.c`: bounded, selected-mutex wait/hold/unlock recorder.
+- `tests/harness/fixtures/c3_mutex_probe.c`: bounded, selected-mutex wait/hold/unlock recorder.
 - [`C3_SPEED_BASELINE.md`](docs/experiments/C3_SPEED_BASELINE.md): machine-readable
   baseline rows, including CPU frequency, cycles and measurement scope.
+
+The portable registered benchmark reports hardware cycles as unavailable
+(`cycles: null`, `cycles_errno: ENOTSUP`). Historical hardware-counter results
+above remain unchanged. The benchmark does not open privileged kernel counters;
+thread CPU time, wall time, CPU frequency and mutex samples remain measured.
 
 The receiver evidence bundle is rooted at
 `85fc8942fbc6910ba61691c1fa7585869cc8bb3de14ed57a5db1987ff31c4305`.
