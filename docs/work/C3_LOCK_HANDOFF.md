@@ -88,6 +88,10 @@ B owns independent correctness/concurrency qualification. Its registered test
 uses 32,768 queued forward items, 2,048 duplicate forwards, and 20 rounds; it
 also verifies fresh history admission, zero duplicate inserts, exact membership,
 the 65,536 cap, promotion, and receipt accounting.
+The integrated source SHA-256 is
+`ea46aaa0e945df8a4e722b81ee041bc7d0d97c14b366b14f8be4507ca697c18d`;
+it differs from B's original source only by extracting the round loop into a
+helper to satisfy the repository's complexity cap.
 
 C owns independent performance reproduction. Its source bundle root is
 `e2755da6c709625fc945ff9f6471df71fcc5700d3682a98b0bc21f8c9edc95fa`
