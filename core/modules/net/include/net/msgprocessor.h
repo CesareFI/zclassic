@@ -168,6 +168,9 @@ typedef bool (*msg_utxo_sha3_compute_fn)(uint8_t out[32],
 struct msg_block_intake_stats {
     uint64_t enqueued;
     uint64_t dropped;
+    /* Re-deliveries of a hash already waiting in the ring; the clone is
+     * freed and no slot is consumed (see msg_processor_enqueue_p2p_block). */
+    uint64_t duplicates;
     uint64_t processed;
     uint64_t accepted;
     uint64_t rejected;

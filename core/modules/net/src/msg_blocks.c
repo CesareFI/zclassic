@@ -384,6 +384,7 @@ bool msg_block_validation_is_retryable(const struct validation_state *state)
     static const char *const retryable_reasons[] = {
         "block-not-finalized-by-reducer",
         "p2p-block-queued-for-reducer",
+        "p2p-block-already-queued",
         "p2p-block-staged-for-reducer",
         "p2p-block-header-missing",
         "header-admit-inbox-full",
@@ -424,6 +425,8 @@ static uint64_t msg_block_retryable_log_key(
         return 1;
     if (strcmp(state->reject_reason, "p2p-block-queued-for-reducer") == 0)
         return 2;
+    if (strcmp(state->reject_reason, "p2p-block-already-queued") == 0)
+        return 4;
     return 3;
 }
 

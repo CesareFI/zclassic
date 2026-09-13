@@ -259,6 +259,7 @@ struct msg_block_intake {
     struct msg_processor *mp;
     _Atomic uint64_t enqueued;
     _Atomic uint64_t dropped;
+    _Atomic uint64_t duplicates;
     _Atomic uint64_t processed;
     _Atomic uint64_t accepted;
     _Atomic uint64_t rejected;
@@ -605,6 +606,22 @@ bool msg_processor_enqueue_p2p_block(struct msg_processor *mp,
         validation_state_error(out, "p2p-block-intake-stopped");
         return true;
     }
+    /* Timeout reassignment and grace deliveries re-send a body already
+     * waiting in this ring. Without this check each duplicate consumed a
+     * fresh slot until a first-seen body hit the full arm below and was
+     * destroyed — intake starvation by duplicates. A duplicate already
+     * owns a slot: free the clone, count it, report already-queued. */
+    for (size_t i = 0; i < in->depth; i++) {
+        size_t idx = (in->head + i) % MSG_BLOCK_INTAKE_CAP;
+        if (uint256_eq(&in->queue[idx].hash, hash)) {
+            pthread_mutex_unlock(&in->mu);
+            msg_block_intake_item_free(&item);
+            atomic_fetch_add_explicit(&in->duplicates, 1,
+                                      memory_order_relaxed);
+            validation_state_error(out, "p2p-block-already-queued");
+            return true;
+        }
+    }
     if (in->depth >= MSG_BLOCK_INTAKE_CAP) {
         pthread_mutex_unlock(&in->mu);
         msg_block_intake_item_free(&item);
@@ -695,6 +712,8 @@ void msg_processor_get_block_intake_stats(
                                          memory_order_relaxed);
     out->dropped = atomic_load_explicit(&in->dropped,
                                         memory_order_relaxed);
+    out->duplicates = atomic_load_explicit(&in->duplicates,
+                                           memory_order_relaxed);
     out->processed = atomic_load_explicit(&in->processed,
                                           memory_order_relaxed);
     out->accepted = atomic_load_explicit(&in->accepted,

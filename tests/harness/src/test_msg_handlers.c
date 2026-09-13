@@ -866,12 +866,28 @@ static int test_msg_block_intake_full_stays_retryable(void)
         struct msg_block_intake_stats stats;
         msg_processor_get_block_intake_stats(&mp, &stats);
         ASSERT(stats.capacity > 0);
+        /* Fill with DISTINCT hashes: re-deliveries of a hash already in the
+         * ring reuse that slot (p2p-block-already-queued) and must never
+         * reach the full arm — that starvation mode has its own regression
+         * below. The full arm is only for first-seen bodies. */
         for (uint64_t i = 0; i <= stats.capacity && !saw_full; i++) {
+            struct block other;
+            block_init(&other);
+            other.header.nVersion = 4;
+            other.header.nTime = 1700000002u;
+            other.header.nBits = 0x1f00ffffu;
+            memset(&other.header.nNonce, 0, sizeof(other.header.nNonce));
+            other.header.nNonce.data[0] = 10;
+            uint64_t tag = i + 1;
+            memcpy(&other.header.nNonce.data[8], &tag, sizeof(tag));
+            struct uint256 other_hash;
+            block_get_hash(&other, &other_hash);
             validation_state_init(&state);
-            ASSERT(msg_processor_enqueue_p2p_block(&mp, &blk, &hash,
+            ASSERT(msg_processor_enqueue_p2p_block(&mp, &other, &other_hash,
                                                    89, &state));
             saw_full = strcmp(state.reject_reason,
                               "p2p-block-intake-full") == 0;
+            block_free(&other);
         }
 
         ASSERT(saw_full);
@@ -882,6 +898,101 @@ static int test_msg_block_intake_full_stays_retryable(void)
         ASSERT(stats.current_depth <= stats.capacity);
         ASSERT(stats.dropped > 0);
         ASSERT(stats.enqueued > 0);
+        ASSERT(stats.duplicates == 0);
+
+        atomic_store_explicit(&submit_ctx.release, 1,
+                              memory_order_release);
+        msg_processor_stop_block_intake(&mp);
+        block_free(&blk);
+        main_state_free(&ms);
+        test_msg_sync_to_idle();
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_msg_block_intake_duplicate_reuses_slot(void)
+{
+    int failures = 0;
+    TEST("msg_handlers: duplicate block body reuses its intake slot") {
+        test_msg_sync_to_blocks_download();
+        ASSERT(sync_get_state() == SYNC_BLOCKS_DOWNLOAD);
+
+        struct block blk;
+        block_init(&blk);
+        blk.header.nVersion = 4;
+        blk.header.nTime = 1700000002u;
+        blk.header.nBits = 0x1f00ffffu;
+        blk.header.nNonce.data[0] = 10;
+
+        struct uint256 hash;
+        block_get_hash(&blk, &hash);
+
+        struct main_state ms;
+        main_state_init(&ms);
+        struct async_block_submit_ctx submit_ctx = {0};
+        struct msg_processor mp;
+        memset(&mp, 0, sizeof(mp));
+        mp.main_state = &ms;
+        mp.params = chain_params_get();
+        mp.block_submit = submit_async_blocking_pending;
+        mp.block_submit_ctx = &submit_ctx;
+
+        struct validation_state state;
+        struct msg_block_intake_stats stats;
+
+        /* Timeout reassignment / grace deliveries re-send a body that is
+         * already queued. Every re-delivery must reuse the existing slot:
+         * capacity+1 copies of one hash consume at most two slots (one in
+         * the ring, one being submitted by the worker) so a first-seen
+         * body is still admitted — the pre-fix duplicate-starvation mode
+         * filled all slots with one hash and destroyed the new body.
+         *
+         * The worker may dequeue the first copy before the second arrives,
+         * so one re-delivery can legitimately take a fresh slot; assert
+         * only the accounting invariants that hold either way. */
+        validation_state_init(&state);
+        ASSERT(msg_processor_enqueue_p2p_block(&mp, &blk, &hash,
+                                               89, &state));
+        msg_processor_get_block_intake_stats(&mp, &stats);
+        const uint64_t capacity = stats.capacity;
+        ASSERT(capacity > 0);
+        for (uint64_t i = 0; i < capacity; i++) {
+            validation_state_init(&state);
+            ASSERT(msg_processor_enqueue_p2p_block(&mp, &blk, &hash,
+                                                   89, &state));
+            ASSERT(strcmp(state.reject_reason,
+                          "p2p-block-queued-for-reducer") == 0 ||
+                   strcmp(state.reject_reason,
+                          "p2p-block-already-queued") == 0);
+            ASSERT(msg_block_validation_is_retryable(&state));
+        }
+        msg_processor_get_block_intake_stats(&mp, &stats);
+        ASSERT(stats.enqueued + stats.duplicates == capacity + 1);
+        ASSERT(stats.enqueued <= 2);
+        ASSERT(stats.duplicates >= capacity - 1);
+        ASSERT(stats.current_depth <= 1);
+        ASSERT(stats.dropped == 0);
+
+        /* The ring is nearly empty: a first-seen body is admitted
+         * immediately, not dropped as full. */
+        struct block other;
+        block_init(&other);
+        other.header.nVersion = 4;
+        other.header.nTime = 1700000002u;
+        other.header.nBits = 0x1f00ffffu;
+        other.header.nNonce.data[0] = 11;
+        struct uint256 other_hash;
+        block_get_hash(&other, &other_hash);
+        validation_state_init(&state);
+        ASSERT(msg_processor_enqueue_p2p_block(&mp, &other, &other_hash,
+                                               89, &state));
+        ASSERT(strcmp(state.reject_reason,
+                      "p2p-block-queued-for-reducer") == 0);
+        msg_processor_get_block_intake_stats(&mp, &stats);
+        ASSERT(stats.enqueued <= 3);
+        ASSERT(stats.dropped == 0);
+        block_free(&other);
 
         atomic_store_explicit(&submit_ctx.release, 1,
                               memory_order_release);
@@ -1076,6 +1187,7 @@ int test_msg_handlers(void)
     failures += test_process_block_msg_no_score_during_shutdown();
     failures += test_process_block_msg_queues_reducer_during_catchup();
     failures += test_msg_block_intake_full_stays_retryable();
+    failures += test_msg_block_intake_duplicate_reuses_slot();
     failures += test_msg_process_messages_yields_after_bounded_batch();
     failures += test_swarm_utxo_sha3_verify_passed_is_quiet();
     failures += test_swarm_utxo_sha3_verify_mismatch_is_not_silent();

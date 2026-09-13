@@ -140,3 +140,7 @@ later lane flips it HARD.
 - 2026-09-13T19:26:15Z — REASON: re-seal to include the newly tracked download_qset.c/.h from the C3 qset split; same tree content
   old ROOT: 52cb6823b358e979e5db21caf7a0332d2bb70f1e2edd1dc9c1d36f7dc184ec84
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-13T20:51:17Z — REASON: slice3: dedup P2P block intake ring by hash before slot alloc (1024-slot starvation)
+  old ROOT: cd9b049fca58ade90a06d989285ad0ee63f8f7f1b66ed6ac91935a4aed4e5fab
+  by: owner unseal ritual (make core-unseal)

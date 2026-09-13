@@ -37,6 +37,7 @@ static bool block_payload_submit_accepted(
     if (validation_state_is_valid(state))
         return true;
     return strcmp(state->reject_reason, "p2p-block-queued-for-reducer") == 0 ||
+           strcmp(state->reject_reason, "p2p-block-already-queued") == 0 ||
            strcmp(state->reject_reason, "p2p-block-staged-for-reducer") == 0;
 }
 
