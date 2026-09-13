@@ -88,6 +88,7 @@ struct dl_in_flight {
  * continues through it). */
 struct dl_queued_key {
     struct uint256 hash;
+    enum dl_work_class work_class;
     uint8_t        state;
 };
 

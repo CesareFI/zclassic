@@ -128,3 +128,15 @@ later lane flips it HARD.
 - 2026-09-11T00:45:19Z — REASON: Move the getheaders serve budget and deferred replay into core/modules/net/src/msg_getheaders_defer.c so msg_headers.c returns under its shrink-only 2370-line baseline (landing seq 4 failed check-file-size-ceiling at 2506); pure move, no behaviour change; two refute rounds already passed on the logic; owner authority grant 2026-09-10 22:4xZ
   old ROOT: 2213de3b6c315a9e909389540be2319917c6d5a75c8186afdd04ad141b049fb4
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-13T18:51:41Z — REASON: C3: eliminate O(batch*queue) duplicate-forward scan while preserving exact download policy and accounting
+  old ROOT: 190e3ac75aed53b58b4cc19b6c82bb720fca826bea5080ff075f5e00cc39df1b
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-13T19:25:23Z — REASON: C3 repair follow-through: move the download qset membership set into core/modules/net/src/download_qset.c so the shrink-only file-size and complexity ratchets stay satisfied; no behavior change
+  old ROOT: d65d7f3bcfb45cfdf21d683e48997ee2a695fa8c119e677891a53b1a0ff3e01d
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-13T19:26:15Z — REASON: re-seal to include the newly tracked download_qset.c/.h from the C3 qset split; same tree content
+  old ROOT: 52cb6823b358e979e5db21caf7a0332d2bb70f1e2edd1dc9c1d36f7dc184ec84
+  by: owner unseal ritual (make core-unseal)
