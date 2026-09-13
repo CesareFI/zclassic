@@ -10,6 +10,7 @@
 #include "net/connman.h"
 #include "net/https_server.h"
 #include "net/msgprocessor.h"
+#include "net/tip_watchdog.h"
 #include "net/netaddr.h"
 #include "platform/time_compat.h"
 #include "sync/sync_planner.h"
@@ -187,7 +188,13 @@ static void sync_monitor_observe_provable_tip(void)
         return;
     }
     int current = reducer_frontier_provable_tip_cached();
-    if (current != atomic_load(&g_last_observed_provable_tip)) {
+    int previous = atomic_load(&g_last_observed_provable_tip);
+    if (current != previous) {
+        /* Reducer H* can advance without legacy block-connected events.
+         * Feed only verified forward progress to network backpressure;
+         * unchanged tips and rewinds must not disguise a body stall. */
+        if (current > previous)
+            tip_watchdog_note_tip_advance(current);
         /* A decrease is progress too: it is an authoritative reorg/rewind and
          * resets the stall clock while the reducer establishes the new branch.
          * Publish the observation marker last so another reader that sees it

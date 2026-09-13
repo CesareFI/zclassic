@@ -11,6 +11,7 @@
 #include "jobs/reducer_frontier.h"
 #include "net/download.h"
 #include "net/protocol.h"
+#include "net/tip_watchdog.h"
 #include "platform/clock.h"
 #include "services/sync_monitor.h"
 #include "util/blocker.h"
@@ -135,6 +136,51 @@ int test_sync_watchdog_conditions(void)
 {
     printf("\n=== sync watchdog condition tests ===\n");
     int failures = 0;
+
+    {
+        /* C3: verified reducer progress must reach the network backpressure
+         * clock even without a legacy block-connected event. Queue pressure
+         * and controlled time are inputs; never force the sync FSM. */
+        struct fake_clock clock;
+        fake_clock_install(&clock, 9000);
+        reducer_frontier_provable_tip_reset();
+        sync_monitor_init();
+        tip_watchdog_test_reset();
+        tip_watchdog_test_set_now_ns(1000000000LL);
+        tip_watchdog_init();
+        reducer_frontier_provable_tip_set(100);
+        (void)sync_monitor_tip_advance_age();
+        tip_watchdog_test_set_queue_bytes(DOWNLOAD_QUEUE_HIGH_WATER + 1);
+        tip_watchdog_test_set_now_ns(62000000000LL);
+        reducer_frontier_provable_tip_set(101);
+        (void)sync_monitor_tip_advance_age();
+        SYNC_WATCHDOG_CHECK(
+            "verified Hstar advance prevents false body backpressure",
+            !tip_watchdog_tick());
+
+        /* Controls: observing an unchanged frontier or a rewind must not
+         * manufacture forward progress to suppress genuine backpressure. */
+        tip_watchdog_test_reset();
+        tip_watchdog_test_set_now_ns(1000000000LL);
+        tip_watchdog_init();
+        tip_watchdog_test_set_queue_bytes(DOWNLOAD_QUEUE_HIGH_WATER + 1);
+        tip_watchdog_test_set_now_ns(62000000000LL);
+        (void)sync_monitor_tip_advance_age();
+        SYNC_WATCHDOG_CHECK("unchanged Hstar retains stall protection",
+                            tip_watchdog_tick());
+        tip_watchdog_test_reset();
+        tip_watchdog_test_set_now_ns(1000000000LL);
+        tip_watchdog_init();
+        tip_watchdog_test_set_queue_bytes(DOWNLOAD_QUEUE_HIGH_WATER + 1);
+        tip_watchdog_test_set_now_ns(62000000000LL);
+        reducer_frontier_provable_tip_set(99);
+        (void)sync_monitor_tip_advance_age();
+        SYNC_WATCHDOG_CHECK("rewind does not count as forward body progress",
+                            tip_watchdog_tick());
+        tip_watchdog_test_reset();
+        cleanup_sync_watchdog();
+        reducer_frontier_provable_tip_reset();
+    }
 
     {
         struct fake_clock clock;
