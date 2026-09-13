@@ -4091,7 +4091,8 @@ agent-velocity:
 t:
 	@mkdir -p "$(BUILD_DIR)"
 	@$(CHECKOUT_LOCK_TOOL) foreground "$(CHECKOUT_LOCK)" -- \
-	  $(MAKE) --no-print-directory t-locked ONLY='$(ONLY)'
+	  $(MAKE) --no-print-directory t-locked ONLY='$(ONLY)' \
+	    BUILD_SOURCE_RECORD='$(BUILD_SOURCE_RECORD)'
 
 t-locked: $(TEST_PARALLEL_REL_CANDIDATE) dev-package-verifier-ensure
 	$(ZCL_TEST_STACK_SETUP) && $(LINKED_TEST_ENV) $(TEST_PARALLEL_REL_ACTIVE) --only=$(ONLY)
@@ -4100,10 +4101,17 @@ t-locked: $(TEST_PARALLEL_REL_CANDIDATE) dev-package-verifier-ensure
 # a cached, stable (toolchain+flags-keyed) per-file epoch and links a non-LTO harness; use strict `make t`
 # before push/release or when chasing optimizer-dependent behavior.
 # Checkout-locked around prerequisite construction and execution.
+# The recursive invocations below freeze this parse's BUILD_SOURCE_RECORD on
+# the command line (the provenance guard above accepts exactly that shape), so
+# the locked inner parse stops paying a second full source capture while it
+# holds the checkout lock. Recipe-time verify-record and the epoch lease's
+# finish verification still compare that frozen record against the tree, so an
+# edit landing between the two parses fails the build instead of hiding.
 t-fast:
 	@mkdir -p "$(BUILD_DIR)"
 	@$(CHECKOUT_LOCK_TOOL) foreground "$(CHECKOUT_LOCK)" -- \
-	  $(MAKE) --no-print-directory t-fast-locked ONLY='$(ONLY)'
+	  $(MAKE) --no-print-directory t-fast-locked ONLY='$(ONLY)' \
+	    BUILD_SOURCE_RECORD='$(BUILD_SOURCE_RECORD)'
 
 t-fast-locked: $(TEST_PARALLEL_FAST_CANDIDATE) dev-package-verifier-ensure \
 	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint
@@ -4116,7 +4124,8 @@ t-fast-exact:
 	@mkdir -p "$(BUILD_DIR)"
 	@$(CHECKOUT_LOCK_TOOL) foreground "$(CHECKOUT_LOCK)" -- \
 	  $(MAKE) --no-print-directory t-fast-exact-locked \
-	    EXACT_ONLY_MATCHED='$(EXACT_ONLY_MATCHED)'
+	    EXACT_ONLY_MATCHED='$(EXACT_ONLY_MATCHED)' \
+	    BUILD_SOURCE_RECORD='$(BUILD_SOURCE_RECORD)'
 
 t-fast-exact-locked: $(TEST_PARALLEL_FAST_CANDIDATE) dev-package-verifier-ensure \
 	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint
