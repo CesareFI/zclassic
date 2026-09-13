@@ -19,7 +19,57 @@ PUBLISH_TOOL="$SELF_DIR/publish-build-alias.sh"
 OBJECT_TOOL="$SELF_DIR/compile-epoch-object.sh"
 SESSION_TOOL="$SELF_DIR/build-epoch-session.sh"
 IDENTITY_TOOL="$SELF_DIR/build-epoch-open-file-identity.sh"
-CC_COMMAND="${CC:-cc}"
+
+# Select real, verified compiler drivers for the probe pair. This selftest
+# compiles actual C and fingerprints an actual C++ toolchain, so both sides
+# must demonstrably work before anything runs. That is not cosmetic: this
+# host's plain `cc` is gcc-14 without cc1plus (it cannot preprocess C++, so
+# the C++ fingerprint probe died), while `gcc` resolves to gcc-13 (it rejects
+# a literal -std=c23, so the payload compile died), and BOTH failures stayed
+# invisible behind the integrity wrapper's warm cache until a fresh worktree
+# ran the probes cold. An explicit CC/CXX from the environment is honored but
+# verified, and a broken explicit driver refuses instead of silently falling
+# through. Candidates are probed in order; a candidate that works is used.
+c_driver_works()
+{
+    printf 'int zcl_epoch_driver_probe(void) { return 0; }\n' \
+        > "$WORK/driver-probe.c"
+    "$@" -std=c23 -c -o "$WORK/driver-probe.o" "$WORK/driver-probe.c" \
+        >/dev/null 2>&1
+}
+
+cxx_driver_works()
+{
+    printf 'int zcl_epoch_driver_probe(void) { return 0; }\n' \
+        | "$@" -x c++ -E - >/dev/null 2>&1
+}
+
+select_driver_pair()
+{
+    local kind="$1" explicit="$2" worked=0
+    shift 2
+    if [ -n "$explicit" ]; then
+        # shellcheck disable=SC2068
+        if "$kind" $explicit; then
+            worked=1
+        else
+            fail "explicit ${kind%_works} driver does not work: $explicit"
+        fi
+    fi
+    if [ "$worked" -eq 0 ]; then
+        local candidate
+        for candidate in "$@"; do
+            # shellcheck disable=SC2068
+            if "$kind" $candidate; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+        fail "no working ${kind%_works} driver found (tried: $*)"
+    fi
+    printf '%s\n' "$explicit"
+}
+
 case "${1:-}" in
     '') COMPILER_ID_ONLY=0 ;;
     --compiler-id-only) COMPILER_ID_ONLY=1 ;;
@@ -138,6 +188,10 @@ build_candidate()
 [ -x "$SESSION_TOOL" ] || fail 'session tool is not executable'
 [ -f "$IDENTITY_TOOL" ] || fail 'open-file identity helper is missing'
 command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum is unavailable'
+CC_COMMAND="$(select_driver_pair c_driver_works "${CC:-}" \
+    "$ROOT/build/bin/zcc cc" cc gcc clang)"
+CXX_COMMAND="$(select_driver_pair cxx_driver_works "${CXX:-}" \
+    g++ c++ clang++)"
 
 phase process-start-token
 bash -s -- "$SELF_DIR" <<'TOKEN_TEST' || fail 'process start-token function contract'
@@ -205,7 +259,7 @@ fi
 exec 9<&-
 
 phase compiler-id-and-env-sensitivity
-COMPILER_ID="$($KEY_TOOL compiler-id "$CC_COMMAND" "$CC_COMMAND")" ||
+COMPILER_ID="$($KEY_TOOL compiler-id "$CC_COMMAND" "$CXX_COMMAND")" ||
     fail 'compiler fingerprint failed'
 [[ "$COMPILER_ID" =~ ^[0-9a-f]{64}$ ]] || fail 'invalid compiler fingerprint'
 
@@ -223,15 +277,27 @@ for ((i = 0; i < ${#portable_cc_argv[@]}; i++)); do
 done
 printf -v PORTABLE_CC_COMMAND '%s ' "${portable_cc_argv[@]}"
 PORTABLE_CC_COMMAND="${PORTABLE_CC_COMMAND% }"
+# Same absolute-argv resolution for the C++ side, so a relative `g++` locator
+# is an intentional input on both sides of the pair.
+read -r -a portable_cxx_argv <<< "$CXX_COMMAND"
+for ((i = 0; i < ${#portable_cxx_argv[@]}; i++)); do
+    case "${portable_cxx_argv[i]}" in -*) continue ;; esac
+    resolved="$(command -v -- "${portable_cxx_argv[i]}" 2>/dev/null || true)"
+    if [ -n "$resolved" ] && [ -f "$resolved" ]; then
+        portable_cxx_argv[i]="$(readlink -f -- "$resolved")"
+    fi
+done
+printf -v PORTABLE_CXX_COMMAND '%s ' "${portable_cxx_argv[@]}"
+PORTABLE_CXX_COMMAND="${PORTABLE_CXX_COMMAND% }"
 mkdir -p "$WORK/probe-one" "$WORK/probe with spaces" "$WORK/sdk-one" "$WORK/sdk-two"
 CWD_COMPILER_ID="$(cd "$WORK/probe-one" &&
-    "$KEY_TOOL" compiler-id "$PORTABLE_CC_COMMAND" "$PORTABLE_CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$PORTABLE_CC_COMMAND" "$PORTABLE_CXX_COMMAND")"
 SPACE_COMPILER_ID="$(cd "$WORK/probe with spaces" &&
-    "$KEY_TOOL" compiler-id "$PORTABLE_CC_COMMAND" "$PORTABLE_CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$PORTABLE_CC_COMMAND" "$PORTABLE_CXX_COMMAND")"
 [ "$CWD_COMPILER_ID" = "$SPACE_COMPILER_ID" ] ||
     fail 'incidental C/C++ compilation directories changed compiler identity'
 ARGV_COMPILER_ID="$(cd "$WORK/probe-one" &&
-    "$KEY_TOOL" compiler-id "$PORTABLE_CC_COMMAND -DEPOCH_ARGV_PROBE=1" "$PORTABLE_CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$PORTABLE_CC_COMMAND -DEPOCH_ARGV_PROBE=1" "$PORTABLE_CXX_COMMAND")"
 [ "$ARGV_COMPILER_ID" != "$CWD_COMPILER_ID" ] ||
     fail 'explicit compiler argv disappeared during directory normalization'
 # Clang's explicit constant overrides may equal the first cwd, while the
@@ -244,9 +310,9 @@ case "$("${portable_cc_argv[@]}" --version 2>/dev/null)" in
             "-Xclang -fdebug-compilation-dir -Xclang $WORK/probe-one -Xclang -fcoverage-compilation-dir=$WORK/probe-one"; do
             explicit_cc="$PORTABLE_CC_COMMAND $explicit_dirs"
             EXPLICIT_ONE_ID="$(cd "$WORK/probe-one" &&
-                "$KEY_TOOL" compiler-id "$explicit_cc" "$explicit_cc")"
+                "$KEY_TOOL" compiler-id "$explicit_cc" "$PORTABLE_CXX_COMMAND")"
             EXPLICIT_TWO_ID="$(cd "$WORK/probe with spaces" &&
-                "$KEY_TOOL" compiler-id "$explicit_cc" "$explicit_cc")"
+                "$KEY_TOOL" compiler-id "$explicit_cc" "$PORTABLE_CXX_COMMAND")"
             [ "$EXPLICIT_ONE_ID" = "$EXPLICIT_TWO_ID" ] ||
                 fail 'identical explicit Clang directories changed identity across cwd'
             [ "$EXPLICIT_ONE_ID" != "$CWD_COMPILER_ID" ] ||
@@ -255,9 +321,9 @@ case "$("${portable_cc_argv[@]}" --version 2>/dev/null)" in
         ;;
 esac
 SDK_ONE_ID="$(SDKROOT="$WORK/sdk-one" \
-    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 SDK_TWO_ID="$(SDKROOT="$WORK/sdk-two" \
-    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 [ "$SDK_ONE_ID" != "$SDK_TWO_ID" ] ||
     fail 'SDK selection disappeared during directory normalization'
 
@@ -265,12 +331,12 @@ phase compiler-id-and-env-sensitivity
 mkdir -p "$WORK/env-include"
 printf '#define EPOCH_ENV_PROBE 1\n' > "$WORK/env-include/probe.h"
 ENV_COMPILER_ID="$(CPATH="$WORK/env-include" \
-    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 [ "$ENV_COMPILER_ID" != "$COMPILER_ID" ] ||
     fail 'CPATH was omitted from compiler fingerprint'
 printf '#define EPOCH_ENV_PROBE 2\n' > "$WORK/env-include/probe.h"
 ENV_MUTATED_COMPILER_ID="$(CPATH="$WORK/env-include" \
-    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 [ "$ENV_MUTATED_COMPILER_ID" != "$ENV_COMPILER_ID" ] ||
     fail 'compiler include-root mutation was omitted from fingerprint'
 
@@ -283,23 +349,23 @@ SYSTEM_MTIME="$WORK/system-include/mtime.reference"
 printf '#define EPOCH_SYSTEM_PROBE 1\n' > "$SYSTEM_HEADER"
 touch -r "$SYSTEM_HEADER" "$SYSTEM_MTIME"
 SYSTEM_COMPILER_ID="$(C_INCLUDE_PATH="$WORK/system-include" \
-    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 printf '#define EPOCH_SYSTEM_PROBE 2\n' > "$SYSTEM_HEADER"
 SYSTEM_MUTATED_COMPILER_ID="$(C_INCLUDE_PATH="$WORK/system-include" \
-    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 [ "$SYSTEM_MUTATED_COMPILER_ID" != "$SYSTEM_COMPILER_ID" ] ||
     fail 'system include-root mutation was omitted from compiler fingerprint'
 printf '#define EPOCH_SYSTEM_PROBE 1\n' > "$SYSTEM_HEADER"
 touch -r "$SYSTEM_MTIME" "$SYSTEM_HEADER"
 SYSTEM_REVERTED_COMPILER_ID="$(C_INCLUDE_PATH="$WORK/system-include" \
-    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 [ "$SYSTEM_REVERTED_COMPILER_ID" != "$SYSTEM_COMPILER_ID" ] ||
     fail 'system include-root edit/revert ABA was omitted from compiler fingerprint'
 mkdir -p "$WORK/cyclic-include/nested"
 printf '#define EPOCH_CYCLE_PROBE 1\n' > "$WORK/cyclic-include/probe.h"
 ln -s .. "$WORK/cyclic-include/nested/parent"
 CYCLIC_COMPILER_ID="$(CPATH="$WORK/cyclic-include" \
-    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")" ||
+    "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")" ||
     fail 'compiler fingerprint rejected a safely detected include-root cycle'
 [[ "$CYCLIC_COMPILER_ID" =~ ^[0-9a-f]{64}$ ]] ||
     fail 'cyclic include-root produced an invalid compiler fingerprint'
@@ -313,23 +379,29 @@ printf '#define EPOCH_LINK_PROBE 1\n' > "$LINK_TARGET"
 ln -s "$LINK_TARGET" "$WORK/link-include/first link.h"
 ln -s "$LINK_TARGET" "$WORK/link-include/second.h"
 ln -s "$WORK/missing/target.h" "$WORK/link-include/dangling.h"
-LINK_ID="$(CPATH="$WORK/link-include" "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+LINK_ID="$(CPATH="$WORK/link-include" "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 printf '#define EPOCH_LINK_PROBE 2\n' > "$LINK_TARGET"
-LINK_EDIT_ID="$(CPATH="$WORK/link-include" "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+LINK_EDIT_ID="$(CPATH="$WORK/link-include" "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 [ "$LINK_ID" != "$LINK_EDIT_ID" ] || fail 'linked target mutation was omitted'
 cp "$LINK_TARGET" "$WORK/other-target.h"
 rm "$WORK/link-include/first link.h"
 ln -s "$WORK/other-target.h" "$WORK/link-include/first link.h"
-LINK_RETARGET_ID="$(CPATH="$WORK/link-include" "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CC_COMMAND")"
+LINK_RETARGET_ID="$(CPATH="$WORK/link-include" "$KEY_TOOL" compiler-id "$CC_COMMAND" "$CXX_COMMAND")"
 [ "$LINK_EDIT_ID" != "$LINK_RETARGET_ID" ] || fail 'link retarget was omitted'
 
 # Same-path tool replacement must never hit an argv/environment-only memo.
-ID_WRAPPER="$WORK/identity-compiler"
-printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$CC_COMMAND" > "$ID_WRAPPER"
-chmod +x "$ID_WRAPPER"
-WRAPPER_ID="$("$KEY_TOOL" compiler-id "$ID_WRAPPER" "$ID_WRAPPER")"
-printf '# same driver behavior, different wrapper bytes\n' >> "$ID_WRAPPER"
-WRAPPER_EDIT_ID="$("$KEY_TOOL" compiler-id "$ID_WRAPPER" "$ID_WRAPPER")"
+# Wrap BOTH sides' selected drivers, not one wrapper doubled as C and C++: a
+# single wrapper reused as the C++ driver only works when that one binary can
+# preprocess C++, which is exactly the host-to-host property driver selection
+# exists to avoid assuming.
+ID_CC_WRAPPER="$WORK/identity-cc"
+ID_CXX_WRAPPER="$WORK/identity-cxx"
+printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$CC_COMMAND" > "$ID_CC_WRAPPER"
+printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$CXX_COMMAND" > "$ID_CXX_WRAPPER"
+chmod +x "$ID_CC_WRAPPER" "$ID_CXX_WRAPPER"
+WRAPPER_ID="$("$KEY_TOOL" compiler-id "$ID_CC_WRAPPER" "$ID_CXX_WRAPPER")"
+printf '# same driver behavior, different wrapper bytes\n' >> "$ID_CC_WRAPPER"
+WRAPPER_EDIT_ID="$("$KEY_TOOL" compiler-id "$ID_CC_WRAPPER" "$ID_CXX_WRAPPER")"
 [ "$WRAPPER_ID" != "$WRAPPER_EDIT_ID" ] || fail 'same-path tool mutation was omitted'
 if "$KEY_TOOL" compiler-id 'cc; printf unsafe' "$CC_COMMAND" \
         >/dev/null 2>&1; then
@@ -554,7 +626,7 @@ start_session()
     STATE_FILE="$STATE" "$SESSION_TOOL" acquire "$SESSION_MAIN" "$lease" \
         "$root" "$WORK/candidates" 5 "$source_id" 1 "$mutation" \
         "$COMPILER_ID" "$EPOCH_MAIN" "$PROFILE" "$COMPILE_FLAGS" \
-        "$LINK_FLAGS" "$CC_COMMAND" "$CC_COMMAND" "$$" "$VERIFY" \
+        "$LINK_FLAGS" "$CC_COMMAND" "$CXX_COMMAND" "$$" "$VERIFY" \
         >/dev/null
     [ -d "$WORK/candidates/epochs/$EPOCH_MAIN" ] ||
         fail 'session published a dangling candidate epoch pointer'
@@ -572,7 +644,7 @@ finish_session()
     STATE_FILE="$STATE" "$SESSION_TOOL" verify "$SESSION_MAIN" "$lease" \
         "$root" "$WORK/candidates" 5 "$source_id" 1 "$mutation" \
         "$COMPILER_ID" "$EPOCH_MAIN" "$PROFILE" "$COMPILE_FLAGS" \
-        "$LINK_FLAGS" "$CC_COMMAND" "$CC_COMMAND" "$$" "$VERIFY" \
+        "$LINK_FLAGS" "$CC_COMMAND" "$CXX_COMMAND" "$$" "$VERIFY" \
         >/dev/null
 }
 
@@ -790,7 +862,7 @@ STATE_FILE="$STATE" "$SESSION_TOOL" acquire \
     "$GC_ROOT/epochs/$EPOCH_MAIN/.leases/current" \
     "$GC_ROOT" "$GC_CANDIDATES" 1 "$SOURCE_A" 1 "$MUTATION_A2" \
     "$COMPILER_ID" "$EPOCH_MAIN" "$PROFILE" "$COMPILE_FLAGS" \
-    "$LINK_FLAGS" "$CC_COMMAND" "$CC_COMMAND" "$$" "$VERIFY" >/dev/null
+    "$LINK_FLAGS" "$CC_COMMAND" "$CXX_COMMAND" "$$" "$VERIFY" >/dev/null
 [ -d "$GC_ROOT/epochs/$GC_LIVE" ] &&
 [ -d "$GC_CANDIDATES/epochs/$GC_LIVE" ] ||
     fail 'epoch GC removed a live leased epoch'
@@ -822,7 +894,7 @@ STATE_FILE="$STATE" "$SESSION_TOOL" recover \
     "$QUARANTINE_ROOT" "$QUARANTINE_CANDIDATES" 2 \
     "$SOURCE_A" 1 "$MUTATION_A2" "$COMPILER_ID" "$EPOCH_MAIN" \
     "$PROFILE" "$COMPILE_FLAGS" "$LINK_FLAGS" "$CC_COMMAND" \
-    "$CC_COMMAND" "$$" "$VERIFY" >/dev/null
+    "$CXX_COMMAND" "$$" "$VERIFY" >/dev/null
 [ ! -e "$QUARANTINE_EPOCH_DIR/poisoned.o" ] &&
 [ ! -e "$QUARANTINE_CANDIDATE_DIR/stale" ] &&
 [ ! -e "$QUARANTINE_EPOCH_DIR/.unverified" ] ||
@@ -968,7 +1040,7 @@ run_make_recovery()
             TEST_FAST_LEASE="$MAKE_RECOVERY_LEASE" \
             BUILD_EPOCH_RECOVERY_READY="$MAKE_RECOVERY_READY" \
             BUILD_EPOCH_SESSION_TOOL="$MAKE_RECOVERY_SESSION_TOOL" \
-            CC="$CC_COMMAND" CXX="$CC_COMMAND" epoch-recovery-probe
+            CC="$CC_COMMAND" CXX="$CXX_COMMAND" epoch-recovery-probe
     ) > "$log" 2>&1
 }
 
@@ -1065,7 +1137,7 @@ expect_generation_symlink_refused()
         "$session" "$lease" "$object_root" "$candidate_root" 2 \
         "$SOURCE_A" 1 "$MUTATION_A2" "$COMPILER_ID" "$EPOCH_MAIN" \
         "$PROFILE" "$COMPILE_FLAGS" "$LINK_FLAGS" "$CC_COMMAND" \
-        "$CC_COMMAND" "$$" "$VERIFY" >"$log" 2>&1; then
+        "$CXX_COMMAND" "$$" "$VERIFY" >"$log" 2>&1; then
         fail "symlinked $surface epoch generation was accepted"
     fi
     grep -Fq "$surface epoch generation is not a regular directory" "$log" ||
@@ -1095,7 +1167,7 @@ expect_verify_root_symlink_refused()
         "$session" "$lease" "$object_root" - 2 \
         "$SOURCE_A" 1 "$MUTATION_A2" "$COMPILER_ID" "$EPOCH_MAIN" \
         "$PROFILE" "$COMPILE_FLAGS" "$LINK_FLAGS" "$CC_COMMAND" \
-        "$CC_COMMAND" "$$" "$VERIFY" >"$log" 2>&1; then
+        "$CXX_COMMAND" "$$" "$VERIFY" >"$log" 2>&1; then
         fail 'symlinked verify object root was accepted'
     fi
     grep -Fq 'object root is not a regular directory' "$log" ||
@@ -1112,7 +1184,7 @@ publish()
 {
     STATE_FILE="$STATE" "$PUBLISH_TOOL" "$1" "$STABLE" "$5" "$2" 1 "$3" "$4" \
         "$COMPILER_ID" "$PROFILE" "$COMPILE_FLAGS" "$LINK_FLAGS" \
-        "$CC_COMMAND" "$CC_COMMAND" "$VERIFY" \
+        "$CC_COMMAND" "$CXX_COMMAND" "$VERIFY" \
         >/dev/null
 }
 
@@ -1146,7 +1218,7 @@ STATE_FILE="$STATE" BLOCK_SOURCE="$SOURCE_A" \
     BLOCK_TIMEOUT_S="$SELFTEST_STEP_TIMEOUT" \
     "$PUBLISH_TOOL" "$CANDIDATE_A2" "$STABLE" "$SESSION_MAIN" "$SOURCE_A" 1 \
         "$MUTATION_A2" "$EPOCH_MAIN" "$COMPILER_ID" "$PROFILE" \
-        "$COMPILE_FLAGS" "$LINK_FLAGS" "$CC_COMMAND" "$CC_COMMAND" \
+        "$COMPILE_FLAGS" "$LINK_FLAGS" "$CC_COMMAND" "$CXX_COMMAND" \
         "$VERIFY" > /dev/null 2> "$STALE_LOG" &
 STALE_PID=$!
 CHILD_PIDS+=("$STALE_PID")
@@ -1172,7 +1244,7 @@ fi
     STATE_FILE="$STATE" "$PUBLISH_TOOL" "$CANDIDATE_B2" "$STABLE" \
         "$SESSION_B" "$SOURCE_B" 1 "$MUTATION_B" "$EPOCH_MAIN" \
         "$COMPILER_ID" "$PROFILE" "$COMPILE_FLAGS" "$LINK_FLAGS" \
-        "$CC_COMMAND" "$CC_COMMAND" "$VERIFY" >/dev/null
+        "$CC_COMMAND" "$CXX_COMMAND" "$VERIFY" >/dev/null
 ) &
 CURRENT_PID=$!
 CHILD_PIDS+=("$CURRENT_PID")

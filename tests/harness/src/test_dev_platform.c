@@ -3968,6 +3968,47 @@ static int test_template_generator_concurrency(void)
  * behind the parse-time speedup: the identity, mutation, and inventory
  * digests cannot move when the helper takes over, and shadow mode must
  * agree on a tree that also carries a live untracked file and a symlink. */
+/* The build-epoch integrity gate must pass from a COLD cache on any host:
+ * this regression pins the driver-discovery repair after a host whose plain
+ * `cc` lacked cc1plus (and whose `gcc` rejected -std=c23) failed every cold
+ * probe run behind a warm-cache mask. The test forces a private empty cache
+ * directory, so the wrapper's cached verdict path is unreachable and the
+ * compiler probes run for real every time. */
+static int test_cold_epoch_integrity_gate(void)
+{
+    int failures = 0;
+    TEST("dev platform: build-epoch integrity passes from a cold cache") {
+        pid_t child = fork();
+        ASSERT(child >= 0);
+        if (child == 0) {
+            execlp("bash", "bash", "-c",
+                   "set -eu\n"
+                   "origin=\"$(pwd -P)\"\n"
+                   "scratch=\"$(mktemp -d "
+                   "${TMPDIR:-/tmp}/zcl-cold-epoch.XXXXXX)\"\n"
+                   "cleanup() {\n"
+                   "  cd \"$origin\"\n"
+                   "  rm -rf \"$scratch\"\n"
+                   "}\n"
+                   "trap cleanup EXIT HUP INT TERM\n"
+                   "ZCL_BUILD_EPOCH_CACHE_DIR=\"$scratch/cache\" \\\n"
+                   "  tools/dev/build-epoch-integrity-cached.sh \\\n"
+                   "  >\"$scratch/out.log\" 2>&1\n"
+                   "grep -Fq 'build-epoch-selftest: PASS' \"$scratch/out.log\"\n"
+                   "grep -Fq 'make-depfile-scope-selftest: PASS' "
+                   "\"$scratch/out.log\"\n",
+                   (char *)NULL);
+            _exit(127);
+        }
+        int status = 0;
+        ASSERT(waitpid(child, &status, 0) == child);
+        ASSERT(WIFEXITED(status));
+        ASSERT(WEXITSTATUS(status) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_native_identity_tokens_match_oracle(void)
 {
     int failures = 0;
@@ -4120,6 +4161,7 @@ static int test_dev_platform_platform_arm(void)
     failures += test_template_generator_concurrency();
     failures += test_ephemeral_fixture_leaves_source_identity();
     failures += test_native_identity_tokens_match_oracle();
+    failures += test_cold_epoch_integrity_gate();
     failures += test_menu_and_search();
     failures += test_change_classification();
     failures += test_change_plan_closure();

@@ -238,7 +238,7 @@ Z23_FLAG("ZCL_BLOCK_SCAN_WORKERS", "env_runtime", "-", "-",
 Z23_FLAG("ZCL_BODY_HISTORY_BACKFILL_MODE", "env_runtime", "-", "-",
           "undocumented; first use engine/services/src/body_backfill_service.c:76")
 Z23_FLAG("ZCL_BOOTSTRAP_CC", "env_build", "cc", "-",
-          "undocumented; first use tools/dev/source-identity-batch-bootstrap.sh:67")
+          "undocumented; first use tools/dev/source-identity-batch-bootstrap.sh:73")
 Z23_FLAG("ZCL_BRIEF", "env_runtime", "-", "-",
           "first use engine/entry/main_cli_modes.c:2616; documented at docs/NATIVE_COMMAND_INTERFACE.md:1032: ZCL_BRIEF=1 remains only as a compatibility formatting option for raw")
 Z23_FLAG("ZCL_BUILD_BENCH_FAKE", "env_build", "-", "-",
@@ -252,9 +252,9 @@ Z23_FLAG("ZCL_BUILD_EPOCH_DIAG_DIR", "env_build", "-", "-",
 Z23_FLAG("ZCL_BUILD_EPOCH_LOCK_TIMEOUT", "env_build", "120", "-",
           "undocumented; first use tools/dev/build-epoch-lock-wait.sh:55")
 Z23_FLAG("ZCL_BUILD_EPOCH_SELFTEST_STEP_TIMEOUT", "env_build", "120", "-",
-          "undocumented; first use tools/dev/build-epoch-selftest.sh:67")
+          "undocumented; first use tools/dev/build-epoch-selftest.sh:117")
 Z23_FLAG("ZCL_BUILD_EPOCH_SELFTEST_TIMEOUT", "env_build", "600", "-",
-          "undocumented; first use tools/dev/build-epoch-selftest.sh:64")
+          "undocumented; first use tools/dev/build-epoch-selftest.sh:114")
 Z23_FLAG("ZCL_BYTE_ORDER_BASELINE", "env_build", "-", "-",
           "undocumented; first use tools/lint/lintc/gate_byte_order_codec_single_report.c:333")
 Z23_FLAG("ZCL_BYTE_ORDER_COVERAGE", "env_build", "1", "-",
@@ -2204,9 +2204,9 @@ Z23_FLAG("ZCL_SOURCE_IDENTITY_BATCH_DISABLE", "env_build", "0", "-",
 Z23_FLAG("ZCL_SOURCE_IDENTITY_BATCH_SHADOW", "env_build", "0", "-",
           "undocumented; first use tools/dev/source-identity.sh:657")
 Z23_FLAG("ZCL_SOURCE_IDENTITY_CAPTURE_ATTEMPTS", "env_build", "4", "-",
-          "undocumented; first use tools/dev/source-identity.sh:1317")
+          "undocumented; first use tools/dev/source-identity.sh:1320")
 Z23_FLAG("ZCL_SOURCE_IDENTITY_FORCE_PORTABLE", "env_build", "0", "-",
-          "undocumented; first use tools/dev/source-identity.sh:802")
+          "undocumented; first use tools/dev/source-identity.sh:730")
 Z23_FLAG("ZCL_SOURCE_IDENTITY_LIB_SOURCED", "env_build", "-", "-",
           "undocumented; first use tools/scripts/source_identity_lib.sh:97")
 Z23_FLAG("ZCL_SOURCE_IDENTITY_POST_RESCAN", "env_build", "0", "-",

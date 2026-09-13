@@ -29,12 +29,18 @@ sha256_stream()
     fi
 }
 
+# Hash a NAMED file by argv, never by redirecting it through stdin mode: the
+# source-identity selftest's race injector interposes stdin-mode sha256sum and
+# fires on preimage markers. The helper's own sources legitimately contain
+# those marker bytes (it emits them), so a stdin-mode hash of its inputs would
+# arm the injector at bootstrap time, before any capture guard window opens.
+# argv-mode invocations pass straight through the interposer.
 sha256_file()
 {
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum < "$1" | awk '{print $1}'
+        sha256sum -- "$1" | awk '{print $1}'
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 < "$1" | awk '{print $1}'
+        shasum -a 256 -- "$1" | awk '{print $1}'
     else
         return 1
     fi

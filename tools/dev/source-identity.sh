@@ -726,7 +726,8 @@ capture_batched()
             fail_racy "regular-file hash batch was incomplete"
     fi
 
-    if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+    if [ -n "$SOURCE_IDENTITY_BATCH" ] &&
+        [ "${ZCL_SOURCE_IDENTITY_FORCE_PORTABLE:-0}" != 1 ]; then
         write_gitlink_sidecar
         native="$("$SOURCE_IDENTITY_BATCH" token identity \
             "$WORK/native-identity-preimage" "$WORK/gitlink-sidecar" \
@@ -822,7 +823,8 @@ capture()
 mutation_token()
 {
     local native legacy
-    if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+    if [ -n "$SOURCE_IDENTITY_BATCH" ] &&
+        [ "${ZCL_SOURCE_IDENTITY_FORCE_PORTABLE:-0}" != 1 ]; then
         write_gitlink_sidecar
         native="$("$SOURCE_IDENTITY_BATCH" token mutation \
             "$WORK/native-mutation-preimage" "$WORK/gitlink-sidecar" \
@@ -940,7 +942,8 @@ write_gitlink_sidecar()
 inventory_token()
 {
     local path native legacy
-    if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+    if [ -n "$SOURCE_IDENTITY_BATCH" ] &&
+        [ "${ZCL_SOURCE_IDENTITY_FORCE_PORTABLE:-0}" != 1 ]; then
         write_gitlink_sidecar
         native="$("$SOURCE_IDENTITY_BATCH" token inventory \
             "$WORK/native-inventory-preimage" "$WORK/gitlink-sidecar" \
