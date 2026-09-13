@@ -245,8 +245,24 @@ static int bb_enqueue_range(struct main_state *ms, struct download_manager *dm,
     size_t n = body_history_census_probe_window(fill_lo, fill_hi, bb_probe,
                                                 &pc, classes, hashes, cap);
     zcl_mutex_unlock(&ms->cs_main);
-    int enqueued = bb_try_enqueue(dm, classes, hashes, n, fill_lo, tip_h,
-                                  mode, why, wake, wake_ctx);
+    /* The hole-directed probe is fresh evidence too. Without folding it,
+     * repaired bodies leave lowest_missing pinned to an already-held window
+     * until the descending census returns. Keep its cursor unchanged. */
+    struct body_history_pass_result res;
+    struct body_history_verdict verdict;
+    body_history_global_lock();
+    bool folded = body_history_census_fold(body_history_global_census(),
+                                           body_coverage_global_map(),
+                                           body_history_global_measured(),
+                                           fill_lo, classes, n, &res);
+    bool evaluated = folded && body_history_evaluate(
+        body_coverage_global_map(), body_history_global_measured(),
+        0, (int64_t)tip_h, &verdict);
+    body_history_global_unlock();
+    body_history_publish(evaluated ? &verdict : NULL);
+    int enqueued = evaluated
+        ? bb_try_enqueue(dm, classes, hashes, n, fill_lo, tip_h,
+                          mode, why, wake, wake_ctx) : 0;
     free(classes);
     free(hashes);
     return enqueued;

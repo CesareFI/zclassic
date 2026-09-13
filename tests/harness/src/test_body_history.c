@@ -40,6 +40,8 @@
 #include "sync/sync_planner.h"
 #include "net/download.h"
 #include "net/net.h"
+#include "services/body_backfill_service.h"
+#include "validation/main_state.h"
 #include "platform/time_compat.h"
 #include "json/json.h"
 #include "core/uint256.h"
@@ -48,6 +50,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 /* ── A synthetic chain the probe can read ───────────────────────── */
 
@@ -1356,9 +1359,387 @@ static int test_bh_lowest_missing_fill_when_cursor_is_at_tip(void)
     return failures;
 }
 
+/* Exact terminal inputs from independent C3 run 20260913T030922Z-2269407.
+ * H* reaching a checkpoint-bootstrapped peer tip does not supply the absent
+ * historical bodies. This is a refusal witness, not a full-node C3 PASS. */
+static int test_bh_c3_checkpoint_terminal_witness(void)
+{
+    int failures = 0;
+    TEST("C3 equal durable tip with missing checkpoint prefix stays nonterminal") {
+        const int tip = 3248094;
+        const int checkpoint = 3056758;
+        struct body_coverage_map held, measured;
+        struct body_history_verdict verdict;
+        struct sync_tip_state_evaluation eval;
+        body_coverage_init(&held);
+        body_coverage_init(&measured);
+        ASSERT(body_coverage_insert(&held, 0, 0));
+        ASSERT(body_coverage_insert(&held, checkpoint + 1, tip));
+        ASSERT(body_coverage_insert(&measured, 0, tip));
+        ASSERT(body_history_evaluate(&held, &measured, 0, tip, &verdict));
+        ASSERT(verdict.status == BODY_HISTORY_INCOMPLETE);
+        ASSERT(verdict.held_count == 191337);
+        ASSERT(verdict.missing_count == checkpoint);
+        ASSERT(verdict.lowest_missing == 1);
+        ASSERT(verdict.unmeasured_count == 0);
+        syncsvc_plan_periodic_tip_state(&eval, SYNC_BLOCKS_DOWNLOAD, true,
+                                       tip, tip, tip, tip, 1, 0, 0, 0,
+                                       verdict.status);
+        ASSERT(eval.target_height == tip);
+        ASSERT(eval.served_gap == 0 && eval.local_gap == 0);
+        ASSERT(!eval.should_set_at_tip);
+
+        /* Only the controlled unit fixture gains its missing coverage here;
+         * no running node state or production completeness predicate changes. */
+        ASSERT(body_coverage_insert(&held, 1, checkpoint));
+        ASSERT(body_history_evaluate(&held, &measured, 0, tip, &verdict));
+        ASSERT(verdict.status == BODY_HISTORY_COMPLETE);
+        ASSERT(verdict.missing_count == 0);
+        syncsvc_plan_periodic_tip_state(&eval, SYNC_BLOCKS_DOWNLOAD, true,
+                                       tip, tip, tip, tip, 1, 0, 0, 0,
+                                       verdict.status);
+        ASSERT(eval.should_set_at_tip);
+        body_coverage_free(&held);
+        body_coverage_free(&measured);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool bh_service_chain(struct main_state *ms, int tip, int missing_hi)
+{
+    struct block_index *previous = NULL;
+    for (int h = 0; h <= tip; h++) {
+        struct uint256 hash;
+        bh_fake_hash(&hash, h);
+        struct block_index *bi = chainstate_insert_block_index(
+            (struct chainstate *)ms, &hash);
+        if (!bi)
+            return false;
+        bi->nHeight = h;
+        bi->pprev = previous;
+        bi->nStatus = BLOCK_VALID_SCRIPTS;
+        if (h == 0 || h > missing_hi)
+            bi->nStatus |= BLOCK_HAVE_DATA;
+        previous = bi;
+    }
+    return active_chain_move_window_tip(&ms->chain_active, previous);
+}
+
+static int test_bh_service_separates_receipt_from_accounting(void)
+{
+    int failures = 0;
+    TEST("backfill distinguishes scheduled received and body-accounted work") {
+        struct main_state *ms = calloc(1, sizeof(*ms));
+        ASSERT(ms);
+        main_state_init(ms);
+        ASSERT(bh_service_chain(ms, 100, 1));
+        struct download_manager dm;
+        dl_init(&dm);
+        body_history_reset();
+        ASSERT(body_backfill_pass(ms, &dm, false, false, NULL, NULL) == 1);
+        uint64_t requested = 0, received = 0, queued = 0;
+        dl_get_stats(&dm, &requested, &received, NULL, NULL, &queued);
+        ASSERT(queued == 1 && requested == 0 && received == 0);
+        struct uint256 hash;
+        bh_fake_hash(&hash, 1);
+        struct uint256 assigned;
+        ASSERT(dl_assign_to_peer(&dm, 7, &assigned, 1) == 1);
+        ASSERT(uint256_eq(&assigned, &hash));
+        ASSERT(dl_mark_received(&dm, &hash) == 7);
+        ASSERT(body_backfill_pass(ms, &dm, false, true, NULL, NULL) == 0);
+        struct body_history_verdict v;
+        ASSERT(body_history_get_verdict(&v));
+        ASSERT(v.status == BODY_HISTORY_INCOMPLETE && v.lowest_missing == 1);
+        dl_get_stats(&dm, &requested, &received, NULL, NULL, &queued);
+        ASSERT(requested == 1 && received == 1);
+        printf("[C3 history control] requested=1 received=1 missing=1 until body accounting\n");
+
+        /* Unit input standing for the existing verified persistence boundary;
+         * this test does not claim a receipt validates or writes a body. */
+        active_chain_at(&ms->chain_active, 1)->nStatus |= BLOCK_HAVE_DATA;
+        ASSERT(body_backfill_pass(ms, &dm, false, true, NULL, NULL) == 0);
+        ASSERT(body_history_get_verdict(&v));
+        ASSERT(v.status == BODY_HISTORY_COMPLETE && v.missing_count == 0);
+        dl_free(&dm);
+        main_state_free(ms);
+        free(ms);
+        body_history_reset();
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_bh_service_advances_after_lowest_window_fills(void)
+{
+    int failures = 0;
+    TEST("real backfill service advances beyond a durably accounted lowest window") {
+        const int window = BODY_HISTORY_CENSUS_BUDGET;
+        const int tip = window * 8;
+        struct main_state *ms = calloc(1, sizeof(*ms));
+        ASSERT(ms);
+        main_state_init(ms);
+        ASSERT(bh_service_chain(ms, tip, window + 64));
+        struct download_manager dm;
+        dl_init(&dm);
+        body_history_reset();
+        for (int pass = 0; pass < 10 && !body_history_window_fully_measured(); pass++)
+            ASSERT(body_backfill_pass(ms, &dm, false, true, NULL, NULL) == 0);
+        struct body_history_verdict v;
+        ASSERT(body_history_get_verdict(&v));
+        ASSERT(v.lowest_missing == 1 && v.unmeasured_count == 0);
+
+        /* Recorded HAVE_DATA is the post-persistence input, not a receipt.
+         * The old published coverage deliberately remains stale. */
+        for (int h = 1; h <= window; h++)
+            active_chain_at(&ms->chain_active, h)->nStatus |= BLOCK_HAVE_DATA;
+        body_history_global_lock();
+        body_history_global_census()->cursor = tip;
+        body_history_global_census()->cursor_valid = true;
+        body_history_global_unlock();
+        int64_t started_us = platform_time_monotonic_us();
+        clock_t cpu_start = clock();
+        int first = body_backfill_pass(ms, &dm, false, false, NULL, NULL);
+        int second = body_backfill_pass(ms, &dm, false, false, NULL, NULL);
+        int64_t first_work_us = platform_time_monotonic_us() - started_us;
+        clock_t cpu_end = clock();
+        body_history_global_lock();
+        int64_t cursor_after = body_history_global_census()->cursor;
+        body_history_global_unlock();
+        printf("[C3 window mechanics] cursor-before=%d cursor-after=%lld two-pass-wall-us=%lld cpu-us=%.0f\n",
+               tip, (long long)cursor_after, (long long)first_work_us,
+               cpu_start == (clock_t)-1 || cpu_end == (clock_t)-1 ? -1.0 :
+               1000000.0 * (double)(cpu_end - cpu_start) / CLOCKS_PER_SEC);
+        uint64_t queued = 0;
+        dl_get_stats(&dm, NULL, NULL, NULL, NULL, &queued);
+        bool next_window_queued = false;
+        for (size_t i = 0; i < dm.queue_len; i++)
+            if (dm.queue_heights[i] == window + 1)
+                next_window_queued = true;
+        printf("[C3 history witness] first=%d second=%d queued=%llu next4097=%d\n",
+               first, second, (unsigned long long)queued, next_window_queued);
+        printf("[C3 history latency] next-window-observed-us=%lld\n",
+               (long long)(next_window_queued ? first_work_us : -1));
+        ASSERT(queued <= BODY_HISTORY_ENQUEUE_MAX * 2);
+        ASSERT(next_window_queued);
+        ASSERT(body_history_get_verdict(&v));
+        ASSERT(v.lowest_missing == window + 1);
+        ASSERT(!body_history_verdict_is_proven(&v));
+        int duplicate = body_backfill_pass(ms, &dm, false, false, NULL, NULL);
+        ASSERT(duplicate == 0);
+        size_t received = 0;
+        const int batches = (64 + DL_MAX_HISTORY_PER_PEER - 1) /
+                            DL_MAX_HISTORY_PER_PEER;
+        for (int batch = 0; batch < batches && received < 64; batch++) {
+            struct uint256 assigned[DL_MAX_HISTORY_IN_FLIGHT];
+            size_t n = dl_assign_to_peer(&dm, 7, assigned, DL_MAX_HISTORY_IN_FLIGHT);
+            ASSERT(n > 0 && n <= DL_MAX_HISTORY_PER_PEER);
+            for (size_t i = 0; i < n; i++) {
+                ASSERT(dl_mark_received(&dm, &assigned[i]) == 7);
+                struct block_index *bi = block_map_find(&ms->map_block_index,
+                                                        &assigned[i]);
+                ASSERT(bi && bi->nHeight > window);
+                bi->nStatus |= BLOCK_HAVE_DATA;
+                received++;
+            }
+        }
+        ASSERT(received == 64);
+        ASSERT(body_backfill_pass(ms, &dm, false, false, NULL, NULL) == 0);
+        ASSERT(body_history_get_verdict(&v));
+        ASSERT(body_history_verdict_is_proven(&v));
+        printf("[C3 history latency] controlled-accounting-complete-us=%lld\n",
+               (long long)(platform_time_monotonic_us() - started_us));
+        dl_free(&dm);
+        main_state_free(ms);
+        free(ms);
+        body_history_reset();
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int bh_elapsed_compare(const void *a, const void *b)
+{
+    int64_t left = *(const int64_t *)a;
+    int64_t right = *(const int64_t *)b;
+    return (left > right) - (left < right);
+}
+
+static int test_bh_service_full_queue_is_bounded(void)
+{
+    int failures = 0;
+    TEST("full queue backpressure keeps census live without growing downloads") {
+        struct main_state *ms = calloc(1, sizeof(*ms));
+        ASSERT(ms);
+        main_state_init(ms);
+        ASSERT(bh_service_chain(ms, 1000, 500));
+        struct download_manager dm;
+        dl_init(&dm);
+        body_history_reset();
+        for (int h = 1; h <= 300; h++) {
+            struct uint256 hash;
+            int32_t height = h;
+            bh_fake_hash(&hash, h);
+            ASSERT(dl_queue_blocks_class(&dm, &hash, &height, 1,
+                                         DL_WORK_HISTORY) == 1);
+        }
+        size_t initial_cap = dm.queue_cap;
+        int64_t elapsed[20];
+        for (int sample = 0; sample < 20; sample++) {
+            int64_t begin = platform_time_monotonic_us();
+            ASSERT(body_backfill_pass(ms, &dm, false, false, NULL, NULL) == 0);
+            elapsed[sample] = platform_time_monotonic_us() - begin;
+            ASSERT(dm.queue_len == 300 && dm.queue_cap == initial_cap);
+            struct body_history_verdict v;
+            ASSERT(body_history_get_verdict(&v));
+            ASSERT(v.status == BODY_HISTORY_INCOMPLETE && v.missing_count == 500);
+        }
+        qsort(elapsed, 20, sizeof(elapsed[0]), bh_elapsed_compare);
+        printf("[C3 backpressure latency] n=20 service-completion-us p50=%lld p95=%lld queue=300 capacity=%zu\n",
+               (long long)elapsed[9], (long long)elapsed[18], initial_cap);
+        dl_free(&dm);
+        main_state_free(ms);
+        free(ms);
+        body_history_reset();
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_bh_service_boundary(int accounted, int remaining)
+{
+    int failures = 0;
+    TEST("hole-directed refresh crosses arbitrary windows without duplicate receipts") {
+        const int tip = BODY_HISTORY_CENSUS_BUDGET * 8 + 17;
+        struct main_state *ms = calloc(1, sizeof(*ms));
+        ASSERT(ms);
+        main_state_init(ms);
+        ASSERT(bh_service_chain(ms, tip, accounted + remaining));
+        struct download_manager dm;
+        dl_init(&dm);
+        body_history_reset();
+        (void)body_backfill_catch_up(ms, &dm, false, NULL, NULL, NULL, NULL);
+        ASSERT(body_history_window_fully_measured());
+        for (int h = 1; h <= accounted; h++)
+            active_chain_at(&ms->chain_active, h)->nStatus |= BLOCK_HAVE_DATA;
+        body_history_global_lock();
+        body_history_global_census()->cursor = tip;
+        body_history_global_unlock();
+        /* Each hole probe consumes at most the existing census budget.
+         * Allow one probe per accounted window, then one opportunity to
+         * enqueue the newly exposed hole; never increase the service cap. */
+        const int passes = (accounted + BODY_HISTORY_CENSUS_BUDGET - 1) /
+                           BODY_HISTORY_CENSUS_BUDGET + 1;
+        for (int pass = 0; pass < passes; pass++)
+            (void)body_backfill_pass(ms, &dm, false, false, NULL, NULL);
+        struct body_history_verdict v;
+        ASSERT(body_history_get_verdict(&v));
+        printf("[C3 boundary] accounted=%d remaining=%d lowest=%lld queued=%zu\n",
+               accounted, remaining, (long long)v.lowest_missing, dm.queue_len);
+        ASSERT(v.lowest_missing == accounted + 1);
+        ASSERT(dm.queue_len == (size_t)remaining);
+        ASSERT(body_backfill_pass(ms, &dm, false, false, NULL, NULL) == 0);
+        size_t received = 0;
+        const int batches = (remaining + DL_MAX_HISTORY_PER_PEER - 1) /
+                            DL_MAX_HISTORY_PER_PEER;
+        for (int batch = 0; batch < batches && received < (size_t)remaining; batch++) {
+            struct uint256 hashes[DL_MAX_HISTORY_IN_FLIGHT];
+            size_t n = dl_assign_to_peer(&dm, 7, hashes, DL_MAX_HISTORY_IN_FLIGHT);
+            ASSERT(n > 0 && n <= DL_MAX_HISTORY_PER_PEER);
+            for (size_t i = 0; i < n; i++) {
+                ASSERT(dl_mark_received(&dm, &hashes[i]) == 7);
+                ASSERT(dl_mark_received(&dm, &hashes[i]) == UINT32_MAX);
+                struct block_index *bi = block_map_find(&ms->map_block_index, &hashes[i]);
+                ASSERT(bi && bi->nHeight > accounted);
+                bi->nStatus |= BLOCK_HAVE_DATA;
+                received++;
+            }
+        }
+        ASSERT(received == (size_t)remaining);
+        ASSERT(body_backfill_pass(ms, &dm, false, false, NULL, NULL) == 0);
+        ASSERT(body_history_get_verdict(&v));
+        ASSERT(body_history_verdict_is_proven(&v));
+        uint64_t total_received = 0;
+        dl_get_stats(&dm, NULL, &total_received, NULL, NULL, NULL);
+        ASSERT(total_received == (uint64_t)remaining);
+        dl_free(&dm);
+        main_state_free(ms);
+        free(ms);
+        body_history_reset();
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+struct bh_abort_fixture { int heartbeats; };
+static bool bh_abort_after_slice(void *ctx)
+{
+    return ((struct bh_abort_fixture *)ctx)->heartbeats > 0;
+}
+static void bh_abort_heartbeat(void *ctx)
+{
+    ((struct bh_abort_fixture *)ctx)->heartbeats++;
+}
+
+static int test_bh_service_abort_resume_rewind(void)
+{
+    int failures = 0;
+    TEST("real census abort resumes without queues or false completion and handles rewind") {
+        struct main_state *ms = calloc(1, sizeof(*ms));
+        ASSERT(ms);
+        main_state_init(ms);
+        ASSERT(bh_service_chain(ms, 16384, 1));
+        struct download_manager dm;
+        dl_init(&dm);
+        body_history_reset();
+        struct bh_abort_fixture abort = {0};
+        ASSERT(body_backfill_catch_up(ms, &dm, false, bh_abort_after_slice,
+                                      &abort, bh_abort_heartbeat, &abort) == 1);
+        ASSERT(abort.heartbeats == 1 && dm.queue_len == 0);
+        struct body_history_verdict v;
+        ASSERT(body_history_get_verdict(&v));
+        ASSERT(v.status == BODY_HISTORY_UNKNOWN && !body_history_verdict_is_proven(&v));
+        ASSERT(body_backfill_catch_up(ms, &dm, false, bh_abort_after_slice,
+                                      &abort, bh_abort_heartbeat, &abort) == 0);
+        ASSERT(dm.queue_len == 0);
+        /* Resume is a real burst invocation; no forced completion flag. */
+        ASSERT(body_backfill_catch_up(ms, &dm, false, NULL, NULL, NULL, NULL) > 0);
+        ASSERT(body_history_get_verdict(&v));
+        ASSERT(v.status == BODY_HISTORY_INCOMPLETE && v.missing_count == 1);
+        /* Rewind changes the unit chain input. A fresh service pass must
+         * evaluate the shortened scope and retain its actual hole. */
+        ASSERT(active_chain_move_window_tip(&ms->chain_active,
+                                            active_chain_at(&ms->chain_active, 17)));
+        ASSERT(body_backfill_pass(ms, &dm, true, false, NULL, NULL) == 0);
+        ASSERT(body_history_get_verdict(&v));
+        ASSERT(v.window_hi == 17 && v.missing_count == 1);
+        ASSERT(!body_history_verdict_is_proven(&v) && dm.queue_len == 0);
+        /* Restarted measurement never imports a cached complete verdict. */
+        body_history_reset();
+        ASSERT(!body_history_get_verdict(&v) || !body_history_verdict_is_proven(&v));
+        ASSERT(body_backfill_pass(ms, &dm, false, false, NULL, NULL) == 1);
+        ASSERT(body_backfill_pass(ms, &dm, false, false, NULL, NULL) == 0);
+        ASSERT(dm.queue_len == 1);
+        dl_free(&dm);
+        main_state_free(ms);
+        free(ms);
+        body_history_reset();
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_body_history(void)
 {
     int failures = 0;
+    failures += test_bh_service_abort_resume_rewind();
+    failures += test_bh_service_boundary(4095, 2);
+    failures += test_bh_service_boundary(4096, 2);
+    failures += test_bh_service_boundary(8192, 17);
+    failures += test_bh_service_full_queue_is_bounded();
+    failures += test_bh_service_separates_receipt_from_accounting();
+    failures += test_bh_service_advances_after_lowest_window_fills();
+    failures += test_bh_c3_checkpoint_terminal_witness();
     failures += test_bh_a_verdict_expires_when_the_index_goes_bad();
     failures += test_bh_census_descends_under_a_moving_tip();
     failures += test_bh_restored_cursor_survives_the_first_pass();
