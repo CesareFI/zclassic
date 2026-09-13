@@ -623,7 +623,7 @@ capture_portable()
 # canonical preimage byte-for-byte identical while removing that process storm.
 capture_batched()
 {
-    local path target digest record emitted mode raw_mode
+    local path target digest record emitted mode raw_mode native legacy
     local path_i=0 existing_i=0 regular_i=0 hash_i=0 batch_start=0
     local batch_size=128
     local -a paths=() types=() existing_paths=() existing_modes=()
@@ -726,6 +726,32 @@ capture_batched()
             fail_racy "regular-file hash batch was incomplete"
     fi
 
+    if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+        write_gitlink_sidecar
+        native="$("$SOURCE_IDENTITY_BATCH" token identity \
+            "$WORK/native-identity-preimage" "$WORK/gitlink-sidecar" \
+            "$WORK/hashes" < "$WORK/source-paths")" ||
+            fail_racy "source changed while assembling native identity preimage"
+        if [ "${ZCL_SOURCE_IDENTITY_BATCH_SHADOW:-0}" = 1 ]; then
+            legacy="$(identity_preimage_loop)" ||
+                fail "legacy identity preimage failed under shadow"
+            [ "$native" = "$legacy" ] ||
+                fail "native and legacy identity tokens differ"
+        fi
+        printf '%s\n' "$native"
+        return 0
+    fi
+    identity_preimage_loop
+}
+
+# The shell half of capture_batched: consumes the classification, mode, and
+# digest batches this process already collected. Kept as the portable
+# fallback and as the shadow oracle for the native token identity pass; it
+# sees the caller's locals through bash's dynamic scoping.
+identity_preimage_loop()
+{
+    local path digest mode raw_mode
+    local path_i=0 existing_i=0 regular_i=0
     {
         printf 'zcl.dev_source_identity.v2\0'
         for ((path_i = 0; path_i < ${#paths[@]}; path_i++)); do
@@ -794,6 +820,29 @@ capture()
 # an edit/revert (ABA) visible between pre-build capture and post-link verify.
 # It is never baked as a release/source identifier.
 mutation_token()
+{
+    local native legacy
+    if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+        write_gitlink_sidecar
+        native="$("$SOURCE_IDENTITY_BATCH" token mutation \
+            "$WORK/native-mutation-preimage" "$WORK/gitlink-sidecar" \
+            < "$WORK/source-paths")" ||
+            fail_racy "source changed while collecting native mutation token"
+        mv -f -- "$WORK/native-mutation-preimage.record" \
+            "$WORK/mutation-record" ||
+            fail "could not publish native mutation record"
+        if [ "${ZCL_SOURCE_IDENTITY_BATCH_SHADOW:-0}" = 1 ]; then
+            legacy="$(mutation_token_legacy)"
+            [ "$native" = "$legacy" ] ||
+                fail "native and legacy mutation tokens differ"
+        fi
+        printf '%s\n' "$native"
+        return 0
+    fi
+    mutation_token_legacy
+}
+
+mutation_token_legacy()
 {
     local path record path_i=0 existing_i=0 batch_start=0
     local batch_size=128
@@ -870,7 +919,45 @@ mutation_token()
 # path set; this guard lets capture-record detect a new untracked file, newly
 # selected ignored archive, or submodule inventory change that appeared after
 # that set was collected.
+#
+# Both token builders have a native fast path through the source-identity-batch
+# helper: the per-path shell loops were the dominant cost of every Make parse
+# (two full token passes per capture-record, and capture-record itself runs in
+# both the outer and the checkout-locked inner parse of every focused test
+# goal). The helper consumes the same $WORK/source-paths order and the same
+# GITLINK_STATE membership and emits byte-identical preimages; shadow mode
+# computes both and refuses on any digest difference.
+write_gitlink_sidecar()
+{
+    local path
+    : > "$WORK/gitlink-sidecar"
+    for path in "${!GITLINK_STATE[@]}"; do
+        printf '%s\0%s\0' "$path" "${GITLINK_STATE[$path]}" \
+            >> "$WORK/gitlink-sidecar"
+    done
+}
+
 inventory_token()
+{
+    local path native legacy
+    if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+        write_gitlink_sidecar
+        native="$("$SOURCE_IDENTITY_BATCH" token inventory \
+            "$WORK/native-inventory-preimage" "$WORK/gitlink-sidecar" \
+            < "$WORK/source-paths")" ||
+            fail "native inventory token failed on the captured path set"
+        if [ "${ZCL_SOURCE_IDENTITY_BATCH_SHADOW:-0}" = 1 ]; then
+            legacy="$(inventory_token_legacy)"
+            [ "$native" = "$legacy" ] ||
+                fail "native and legacy inventory tokens differ"
+        fi
+        printf '%s\n' "$native"
+        return 0
+    fi
+    inventory_token_legacy
+}
+
+inventory_token_legacy()
 {
     local path
     {

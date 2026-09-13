@@ -3963,6 +3963,58 @@ static int test_template_generator_concurrency(void)
 #define DP_EPHEMERAL_FIXTURE_REL \
     "engine/services/src/_dev_platform_source_identity_fixture_tmp.c"
 
+/* The native source-identity-batch token passes must emit byte-identical
+ * preimages to the portable shell oracle. This is the exactness contract
+ * behind the parse-time speedup: the identity, mutation, and inventory
+ * digests cannot move when the helper takes over, and shadow mode must
+ * agree on a tree that also carries a live untracked file and a symlink. */
+static int test_native_identity_tokens_match_oracle(void)
+{
+    int failures = 0;
+    TEST("dev platform: native identity tokens match the portable oracle") {
+        pid_t child = fork();
+        ASSERT(child >= 0);
+        if (child == 0) {
+            execlp("bash", "bash", "-c",
+                   "set -eu\n"
+                   "origin=\"$(pwd -P)\"\n"
+                   "scratch=\"$(mktemp -d "
+                   "${TMPDIR:-/tmp}/zcl-identity-native.XXXXXX)\"\n"
+                   "tree=\"$scratch/tree\"\n"
+                   "cleanup() {\n"
+                   "  cd \"$origin\"\n"
+                   "  git worktree remove --force \"$tree\" "
+                   ">/dev/null 2>&1 || :\n"
+                   "  rm -rf \"$scratch\"\n"
+                   "}\n"
+                   "trap cleanup EXIT HUP INT TERM\n"
+                   "git worktree add --detach \"$tree\" HEAD >/dev/null\n"
+                   "cd \"$tree\"\n"
+                   "printf 'int zcl_native_oracle_probe(void) { return 7; }\\n' "
+                   "> engine/services/src/native_oracle_probe_tmp.c\n"
+                   "ln -s Makefile native_oracle_link_tmp\n"
+                   "native=\"$(tools/dev/source-identity.sh capture-record)\"\n"
+                   "portable=\"$(ZCL_SOURCE_IDENTITY_BATCH_DISABLE=1 "
+                   "tools/dev/source-identity.sh capture-record)\"\n"
+                   "[ \"$native\" = \"$portable\" ] || {\n"
+                   "  echo \"native and portable capture records differ:\" "
+                   "\"$native\" vs \"$portable\" >&2\n"
+                   "  exit 1\n"
+                   "}\n"
+                   "ZCL_SOURCE_IDENTITY_BATCH_SHADOW=1 "
+                   "tools/dev/source-identity.sh capture-record >/dev/null\n",
+                   (char *)NULL);
+            _exit(127);
+        }
+        int status = 0;
+        ASSERT(waitpid(child, &status, 0) == child);
+        ASSERT(WIFEXITED(status));
+        ASSERT(WEXITSTATUS(status) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_ephemeral_fixture_leaves_source_identity(void)
 {
     int failures = 0;
@@ -4067,6 +4119,7 @@ static int test_dev_platform_platform_arm(void)
     failures += test_hotfork_descriptor_boundary();
     failures += test_template_generator_concurrency();
     failures += test_ephemeral_fixture_leaves_source_identity();
+    failures += test_native_identity_tokens_match_oracle();
     failures += test_menu_and_search();
     failures += test_change_classification();
     failures += test_change_plan_closure();

@@ -2204,9 +2204,9 @@ Z23_FLAG("ZCL_SOURCE_IDENTITY_BATCH_DISABLE", "env_build", "0", "-",
 Z23_FLAG("ZCL_SOURCE_IDENTITY_BATCH_SHADOW", "env_build", "0", "-",
           "undocumented; first use tools/dev/source-identity.sh:657")
 Z23_FLAG("ZCL_SOURCE_IDENTITY_CAPTURE_ATTEMPTS", "env_build", "4", "-",
-          "undocumented; first use tools/dev/source-identity.sh:1230")
+          "undocumented; first use tools/dev/source-identity.sh:1317")
 Z23_FLAG("ZCL_SOURCE_IDENTITY_FORCE_PORTABLE", "env_build", "0", "-",
-          "undocumented; first use tools/dev/source-identity.sh:776")
+          "undocumented; first use tools/dev/source-identity.sh:802")
 Z23_FLAG("ZCL_SOURCE_IDENTITY_LIB_SOURCED", "env_build", "-", "-",
           "undocumented; first use tools/scripts/source_identity_lib.sh:97")
 Z23_FLAG("ZCL_SOURCE_IDENTITY_POST_RESCAN", "env_build", "0", "-",
