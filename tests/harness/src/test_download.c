@@ -13,6 +13,125 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdlib.h>
+#include <time.h>
+#include <dlfcn.h>
+#include "../../../tools/dev/c3_mutex_probe.h"
+
+static struct c3_mutex_sample dl_profile_last;
+
+static int dl_profile_compare(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static int dl_profile_duplicate_batch(struct download_manager *dm,
+                                      const struct uint256 *hashes,
+                                      const int32_t *heights, size_t count,
+                                      enum dl_work_class work_class)
+{
+    dl_profile_last = (struct c3_mutex_sample){0};
+    size_t before = dm->queue_len;
+    size_t slots = dm->qset_slots;
+    const struct c3_mutex_probe_api *probe = dlsym(RTLD_DEFAULT, "c3_mutex_probe_v1");
+    if (getenv("C3_REQUIRE_MUTEX_PROBE") && !probe) {
+        fputs("required C3 mutex probe is absent\n", stderr);
+        return 1;
+    }
+    if (probe) probe->begin(&dm->cs);
+    int64_t begin = platform_time_monotonic_us();
+    clock_t cpu_begin = clock();
+    size_t added = dl_queue_blocks_class(dm, hashes, heights, count, work_class);
+    clock_t cpu_end = clock();
+    int64_t elapsed = platform_time_monotonic_us() - begin;
+    struct c3_mutex_sample sample = {0};
+    if (probe) {
+        size_t measured = probe->read(&sample, 1);
+        probe->begin(NULL);
+        if (measured != 1) {
+            fprintf(stderr, "expected one enqueue lock, observed %zu\n", measured);
+            return 1;
+        }
+    }
+    dl_profile_last = sample;
+    printf("{\"schema\":\"c3.duplicate_enqueue.v1\",\"queued\":%zu,"
+           "\"duplicate_batch\":%zu,\"class\":\"%s\",\"added\":%zu,\"elapsed_us\":%lld,"
+           "\"cpu_us\":%.0f,\"qset_before\":%zu,\"qset_after\":%zu,"
+           "\"mutex_measured\":%s,\"wait_ns\":%llu,\"hold_ns\":%llu,"
+           "\"unlock_ns\":%llu,\"first_seen_enqueues_per_second\":%.3f}\n", before, count,
+           work_class == DL_WORK_FORWARD ? "forward" : "history",
+           added, (long long)elapsed,
+           cpu_begin == (clock_t)-1 || cpu_end == (clock_t)-1 ? -1.0 :
+           1000000.0 * (double)(cpu_end - cpu_begin) / CLOCKS_PER_SEC,
+           slots, dm->qset_slots, probe ? "true" : "false",
+           (unsigned long long)sample.wait_ns, (unsigned long long)sample.hold_ns,
+           (unsigned long long)sample.unlock_ns,
+           elapsed > 0 ? 1000000.0 * (double)added / (double)elapsed : 0.0);
+    if (added != (before ? 0 : count) || dm->queue_len != (before ? before : count)) {
+        fprintf(stderr, "duplicate enqueue changed queue: before=%zu after=%zu added=%zu\n",
+                before, dm->queue_len, added);
+        return 1;
+    }
+    return 0;
+}
+
+int test_download_enqueue_profile(void)
+{
+    const size_t sizes[] = {0, 1024, 8192, 65536};
+    struct uint256 *hashes = calloc(65536, sizeof(*hashes));
+    int32_t *heights = calloc(65536, sizeof(*heights));
+    if (!hashes || !heights) {
+        perror("download enqueue profile allocation");
+        free(hashes); free(heights);
+        return 1;
+    }
+    for (size_t i = 0; i < 65536; i++) {
+        heights[i] = (int32_t)i + 1;
+        memcpy(hashes[i].data, &heights[i], sizeof(heights[i]));
+    }
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        const size_t batches[] = {256, sizes[i] ? sizes[i] : 65536};
+        for (size_t b = 0; b < 2; b++) {
+            for (unsigned path = 0; path < 2; path++) {
+                uint64_t waits[5], holds[5], unlocks[5];
+                for (unsigned repeat = 0; repeat < 5; repeat++) {
+                    struct download_manager dm;
+                    dl_init(&dm);
+                    if (sizes[i] && dl_queue_blocks(&dm, hashes, heights, sizes[i]) != sizes[i]) {
+                        fputs("download enqueue profile seed failed\n", stderr);
+                        failures++;
+                    } else {
+                        failures += dl_profile_duplicate_batch(&dm, hashes, heights,
+                            batches[b], path ? DL_WORK_HISTORY : DL_WORK_FORWARD);
+                    }
+                    dl_free(&dm);
+                    waits[repeat] = dl_profile_last.wait_ns;
+                    holds[repeat] = dl_profile_last.hold_ns;
+                    unlocks[repeat] = dl_profile_last.unlock_ns;
+                }
+                if (dlsym(RTLD_DEFAULT, "c3_mutex_probe_v1")) {
+                    qsort(waits, 5, sizeof(*waits), dl_profile_compare);
+                    qsort(holds, 5, sizeof(*holds), dl_profile_compare);
+                    qsort(unlocks, 5, sizeof(*unlocks), dl_profile_compare);
+                    printf("{\"schema\":\"c3.enqueue_mutex_summary.v1\",\"queued\":%zu,"
+                           "\"batch\":%zu,\"class\":\"%s\",\"samples\":5,"
+                           "\"duplicate_pct\":%u,\"wait_ns_p50\":%llu,\"wait_ns_p95\":%llu,"
+                           "\"wait_ns_max\":%llu,\"hold_ns_p50\":%llu,\"hold_ns_p95\":%llu,"
+                           "\"hold_ns_max\":%llu,\"unlock_ns_p50\":%llu,\"unlock_ns_max\":%llu}\n",
+                           sizes[i], batches[b], path ? "history" : "forward", sizes[i] ? 100 : 0,
+                           (unsigned long long)waits[2], (unsigned long long)waits[4],
+                           (unsigned long long)waits[4], (unsigned long long)holds[2],
+                           (unsigned long long)holds[4], (unsigned long long)holds[4],
+                           (unsigned long long)unlocks[2], (unsigned long long)unlocks[4]);
+                }
+            }
+        }
+    }
+    free(hashes); free(heights);
+    return failures;
+}
 
 /* Helper: make a uint256 from a single byte value */
 static struct uint256 make_hash(uint8_t v)

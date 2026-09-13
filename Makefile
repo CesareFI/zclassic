@@ -250,7 +250,7 @@ ZCL_GUI_APP_GOALS := $(foreach a,$(GUI_APPS),$(a) $(a)-selftest $(a)-clean \
 # Its standalone compile must not recurse into the readiness check it serves.
 ZCL_TOR_PROVENANCE_GOALS := build/bin/z23-tor-provenance \
 	tools/tor-provenance z23-tor-provenance
-ZCL_HOTSWAP_LOOP_GOALS := hotswap-try hotswap-apply hotswap \
+ZCL_HOTSWAP_LOOP_GOALS := hotswap-try hotswap-apply hotswap c3-mutex-probe c3-speed-bench c3-tip-seam build/bin/c3-mutex-probe.so \
 	$(ZCL_TOR_PROVENANCE_GOALS) \
 	presentation-lib presentation-demo presentation-relaunch \
 	presentation-desktop-install presentation-portability \
@@ -1400,7 +1400,7 @@ TOR_MISSING_ARCHIVES := $(filter-out $(wildcard $(TOR_ARCHIVE_PATHS)),$(TOR_ARCH
 # point: a goal nobody thought about gets REAL Tor. An allow list would mean
 # every unlisted goal silently links the stub, which is the exact
 # default-permit shape this change exists to delete.
-ZCL_TOR_SKIP_GOALS := clean distclean clean-% help tor-full tor-ready \
+ZCL_TOR_SKIP_GOALS := clean distclean clean-% help tor-full tor-ready c3-mutex-probe c3-speed-bench c3-tip-seam build/bin/c3-mutex-probe.so \
 	vendor vendor-force vendor-ready vendor-provenance worktree-prime \
 	worktree-prime-selftest install-hooks setup \
 	check-% lint lint-% %-selftest docs docs-% $(ZCL_WINDOWS_LAUNCHER_GOALS) \
@@ -2951,7 +2951,7 @@ ZCL_TEST_WINDOWS_COMPAT_FLAGS = $(if $(ZCL_HOST_WINDOWS),-include test/windows_c
 TEST_FAST_CFLAGS = $(filter-out -O3 $(ZCL_LTO_FLAG) -Werror,$(CACHED_CFLAGS)) -O1 -g -DZCL_TESTING \
 	-Wno-deprecated-declarations -Wno-format-truncation $(ZCL_WARN_MAYBE_UNINITIALIZED) \
 	$(ZCL_TEST_WINDOWS_COMPAT_FLAGS)
-TEST_FAST_LDFLAGS = $(filter-out $(ZCL_LTO_FLAG),$(LDFLAGS)) $(ZCL_DEV_LINKER)
+TEST_FAST_LDFLAGS = $(filter-out $(ZCL_LTO_FLAG),$(LDFLAGS)) $(ZCL_DEV_LINKER) $(C3_TIP_LINK)
 TEST_FAST_EPOCH_COMPILE_FLAGS := $(strip $(TEST_FAST_CFLAGS) $(ZCL_EPOCH_DEPFILE_ID))
 TEST_FAST_EPOCH_LINK_FLAGS := $(strip $(TEST_FAST_LDFLAGS) $(TOR_LIBS) $(LIBS) $(GTK_LIBS) $(WEBKIT_LIBS) cxx=$(CXX))
 ifneq ($(filter test-fast,$(ZCL_EPOCH_PROFILES)),)
@@ -14242,3 +14242,23 @@ build-bench-selftest:
 .PHONY: params-verify
 params-verify:
 	@tools/scripts/zcash_params.sh verify $(PARAMSDIR)
+
+# Selected-mutex instrumentation is confined to the explicit Linux test target.
+.PHONY: c3-mutex-probe c3-speed-bench
+c3-speed-bench: $(BIN_DIR)/c3-mutex-probe.so
+	LD_PRELOAD="$(abspath $(BIN_DIR)/c3-mutex-probe.so)" C3_REQUIRE_MUTEX_PROBE=1 C3_ENFORCE_SPEED_CONTRACT=1 \
+	  $(MAKE) --no-print-directory t-fast-exact ONLY=download_speed_contract
+c3-mutex-probe: $(BIN_DIR)/c3-mutex-probe.so
+$(BIN_DIR)/c3-mutex-probe.so: tools/c3_mutex_probe.c tools/dev/c3_mutex_probe.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic -fPIC -shared \
+	  -o $@ tools/c3_mutex_probe.c -ldl -pthread
+
+.PHONY: c3-tip-seam
+c3-tip-seam: $(BIN_DIR)/c3-tip-seam-probe.o
+	$(MAKE) --no-print-directory t-fast-exact ONLY=tip_finalize_stage,tip_finalize_post_step \
+	  T_FAST_EXACT_ARGS=--jobs=1 \
+	  C3_TIP_LINK='$(abspath $(BIN_DIR)/c3-tip-seam-probe.o) -Xlinker --wrap=progress_store_tx_lock -Xlinker --wrap=progress_store_tx_unlock -Xlinker --wrap=tip_finalize_reconcile_visible_cursor_body -Xlinker --wrap=tip_finalize_run_post_finalize -Xlinker --wrap=test_tip_finalize_stage -Xlinker --wrap=test_tip_finalize_post_step'
+$(BIN_DIR)/c3-tip-seam-probe.o: tools/c3_tip_seam_probe.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic -c $< -o $@
