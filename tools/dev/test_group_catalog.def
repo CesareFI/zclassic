@@ -1323,6 +1323,17 @@ ZCL_TEST_GROUP(watcher_lease)
  * launch/cancel cycle that leaves neither descriptors nor children behind.
  * Windows asserts the named platform refusal. */
 ZCL_TEST_GROUP(resident_launch)
+/* Product acceptance contract for the resident-launch CONSUMER, driven
+ * against C's landed app.invoke.package slice: installs REAL packages
+ * (C's shipped ztasks from its repo bytes, plus a parking candidate)
+ * through the production zcode lifecycle and drives the six product
+ * stages (production accepted-artifact record, verified launch, fd-3
+ * frame protocol, observable result, bounded cancel/reap, rollback).
+ * Stages a–e assert C's bounded one-shot invocation semantics; stage f
+ * (serving-generation supersession + atomic rollback) stays RED naming
+ * the wiring C has not landed yet. resident_launch covers the platform
+ * seam. */
+ZCL_TEST_GROUP(resident_launch_contract)
 /* astro lane: platform/modules/astro's exact fixed-grid arithmetic and the birth chart
  * built on it. The determinism cases are the point — a chart another node
  * recomputes must match bit for bit, so the group asserts that property by

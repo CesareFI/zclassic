@@ -2907,6 +2907,37 @@ HOTSWAP_ROLLBACK_FIXTURE_SOS = \
 	$(BUILD_DIR)/hotswap/zcl_rollback_fixture_a.so \
 	$(BUILD_DIR)/hotswap/zcl_rollback_fixture_b.so
 
+# ── Resident-launch CONTRACT fixture children ─────────────────────────────
+# test_resident_launch_contract.c must launch REAL ELF images: the pinned
+# descriptor resident_launch hands to fexecve is O_CLOEXEC, and exec'ing a
+# shebang script through it re-opens /dev/fd/N for the interpreter AFTER
+# exec closed it (ENOENT on Linux). ONE fixture source, two link outputs:
+# the protocol-speaking reference child (frames argv[1] on fd 3 under the
+# Z23_RESIDENT_NONCE handoff, or parks on "sleep" as the cancel target) and
+# the RLC_FIXTURE_BROKEN candidate that exits without framing, so the
+# rollback stage's two versions differ in both content and behavior. Built
+# only where the test's deep stages run (a POSIX spawn exists); Windows
+# asserts the named platform refusal instead.
+RESIDENT_CONTRACT_FIXTURE_SRC = tests/harness/fixtures/resident_launch_contract_child.c
+ifeq ($(ZCL_HOST_WINDOWS),)
+RESIDENT_CONTRACT_FIXTURE_BINS = \
+	$(BUILD_DIR)/fixtures/rlc_child_v1$(ZCL_HOST_EXEEXT) \
+	$(BUILD_DIR)/fixtures/rlc_child_broken$(ZCL_HOST_EXEEXT)
+else
+RESIDENT_CONTRACT_FIXTURE_BINS =
+endif
+
+$(BUILD_DIR)/fixtures/rlc_child_v1$(ZCL_HOST_EXEEXT): $(RESIDENT_CONTRACT_FIXTURE_SRC)
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_FAST_CFLAGS) -Iplatform/modules/platform/include \
+	  -o $@ $(RESIDENT_CONTRACT_FIXTURE_SRC)
+
+$(BUILD_DIR)/fixtures/rlc_child_broken$(ZCL_HOST_EXEEXT): $(RESIDENT_CONTRACT_FIXTURE_SRC)
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_FAST_CFLAGS) -DRLC_FIXTURE_BROKEN \
+	  -Iplatform/modules/platform/include \
+	  -o $@ $(RESIDENT_CONTRACT_FIXTURE_SRC)
+
 TEST_SRCS = $(call zcl_filter_ephemeral_sources,\
 	$(wildcard tests/harness/src/*.c))
 TEST_DEV_EXECUTOR_SRCS = tools/dev/devloop_cycle.c tools/dev/dev_failure_store.c \
@@ -3410,6 +3441,17 @@ $(TEST_PARALLEL_BIN): | $(HOTSWAP_ROLLBACK_FIXTURE_SOS)
 $(TEST_PARALLEL_FAST_BIN): | $(HOTSWAP_ROLLBACK_FIXTURE_SOS)
 $(TEST_PARALLEL_REL_CANDIDATE): | $(HOTSWAP_ROLLBACK_FIXTURE_SOS)
 $(TEST_PARALLEL_FAST_CANDIDATE): | $(HOTSWAP_ROLLBACK_FIXTURE_SOS)
+endif
+
+# Same contract for the resident_launch_contract group's fixture children:
+# the group's reference launches exec these images, so a missing fixture is a
+# broken build, never a skip.
+ifeq ($(ZCL_HOST_WINDOWS),)
+$(BIN_DIR)/test_zcl: | $(RESIDENT_CONTRACT_FIXTURE_BINS)
+$(TEST_PARALLEL_BIN): | $(RESIDENT_CONTRACT_FIXTURE_BINS)
+$(TEST_PARALLEL_FAST_BIN): | $(RESIDENT_CONTRACT_FIXTURE_BINS)
+$(TEST_PARALLEL_REL_CANDIDATE): | $(RESIDENT_CONTRACT_FIXTURE_BINS)
+$(TEST_PARALLEL_FAST_CANDIDATE): | $(RESIDENT_CONTRACT_FIXTURE_BINS)
 endif
 
 # test_engine's end-to-end case runs $(ENGINE_UNIT_BIN) as a subprocess (same

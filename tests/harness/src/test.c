@@ -1667,6 +1667,8 @@ int main(int argc, char **argv)
       failures += test_watcher_lease(); }
     { extern int test_resident_launch(void);
       failures += test_resident_launch(); }
+    { extern int test_resident_launch_contract(void);
+      failures += test_resident_launch_contract(); }
     failures += test_hw_bench();
     { extern int test_storage_pacing(void);
       failures += test_storage_pacing(); }
