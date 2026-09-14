@@ -1330,9 +1330,11 @@ ZCL_TEST_GROUP(resident_launch)
  * stages (production accepted-artifact record, verified launch, fd-3
  * frame protocol, observable result, bounded cancel/reap, rollback).
  * Stages a–e assert C's bounded one-shot invocation semantics; stage f
- * (serving-generation supersession + atomic rollback) stays RED naming
- * the wiring C has not landed yet. resident_launch covers the platform
- * seam. */
+ * is the born-RED acceptance TRAP for C's coming serving-generation
+ * supersession + atomic-rollback landing (nine named checks f1–f9:
+ * serving record, activate, READY-before-switch, atomic switch, stale
+ * refusal, pending supersession, failure containment, EXACT-A rollback,
+ * restart persistence). resident_launch covers the platform seam. */
 ZCL_TEST_GROUP(resident_launch_contract)
 /* astro lane: platform/modules/astro's exact fixed-grid arithmetic and the birth chart
  * built on it. The determinism cases are the point — a chart another node

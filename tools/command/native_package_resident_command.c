@@ -1,5 +1,5 @@
-/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
-/* Purpose: explicitly execute one exact installed resident app invocation. */
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
+ * purpose: explicitly execute one exact installed resident app invocation. */
 #include "command/native_command.h"
 #include "base/hex.h"
 #include "base/safe_alloc.h"

@@ -1,5 +1,5 @@
-/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
-/* Purpose: installed app snapshot lifetime around the existing resident seam. */
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
+ * purpose: installed app snapshot lifetime around the existing resident seam. */
 #include "services/package_resident.h"
 #include "platform/os_proc.h"
 #include "base/hex.h"

@@ -22,11 +22,17 @@
  *   d. the child's result is observable through the product reply;
  *   e. cancel/reap works (an unresponsive resident is refused inside the
  *      consumer's own bound and leaves no child behind);
- *   f. rollback restores the prior accepted version after a failed
- *      candidate — NOT WIRED in C's slice: the leaf is one bounded explicit
- *      invocation with no product-held serving-generation record, so there
- *      is nothing to supersede or atomically restore. Stage f stays RED and
- *      names that missing wiring (see the stage f block below).
+ *   f. serving-generation supersession and atomic rollback — NOT WIRED
+ *      in C's slice. Stage f is the independent acceptance TRAP for C's
+ *      coming implementation (the fixed finish line, born-RED today):
+ *      N serving as an authoritative product-state record → N+1 READY
+ *      through the fd3 gate BEFORE any switch → atomic switch with no
+ *      double-serving window → a late/stale N invocation refused → rapid
+ *      N+2 supersession of a pending N+1 → forced-candidate-failure
+ *      containment → EXACT-A rollback (same 64-hex digest) → restart
+ *      persistence. Every trap check FAILS today naming the missing
+ *      product behavior; the invocation contract it drives is the
+ *      stage-f block of the ADAPTER SEAM below.
  *
  * Stage 0 is NOT the contract: it validates this file's reference child
  * fixture through the platform seam alone, speaking exactly the wire of C's
@@ -102,7 +108,49 @@
  *                record: every invocation names its exact receipt. Rollback
  *                today is the OPERATOR explicitly invoking a prior accepted
  *                receipt (next_action says so); serving-generation
- *                supersession and atomic rollback are NOT WIRED (stage f). */
+ *                supersession and atomic rollback are NOT WIRED (stage f).
+ *
+ *   stage f serving-generation contract — THE FIXED FINISH LINE C codes
+ *   against (NOT implemented today; every trap check in rlc_stage_f_trap
+ *   is born-RED naming the missing piece). Deliberately small: no new
+ *   lifecycle, no new state machine — ONE small serving record.
+ *   serving record: per (datadir, app) the consumer owns one product-state
+ *     record {package_root, receipt_id, artifact_sha3, program,
+ *     generation}: the authoritative serving generation. The zcode
+ *     lifecycle remains the install authority; this record only names
+ *     which installed receipt currently SERVES.
+ *   input keys (serving mode; the one-shot keys above still apply where
+ *     an action binds exact bytes):
+ *     app (string "publisher/package": the serving identity),
+ *     action (string):
+ *       "invoke"   (default; run the serving record — no receipt keys),
+ *       "accept"   (admit the named receipt as the pending candidate:
+ *                  verify + snapshot + spawn + nonce-bound READY + one
+ *                  bounded probe frame through the fd3 gate BEFORE any
+ *                  switch; serving is untouched; a second accept retires
+ *                  the first pending candidate, cancelling and reaping
+ *                  it),
+ *       "activate" (atomically switch serving to the pending candidate
+ *                  after re-proving it through the same gate; exactly one
+ *                  serving generation exists at every instant — no
+ *                  double-serving window),
+ *       "rollback" (restore the exact prior accepted generation: same
+ *                  64-hex artifact digest, never equivalent bytes, never
+ *                  a pathname).
+ *   reply data (serving mode adds): generation (int), serving_sha3,
+ *     serving_receipt_id; accept adds pending_sha3, pending_receipt_id,
+ *     candidate_nonce, candidate_start_token (the staleness binding) and
+ *     superseded_sha3 (when a pending candidate was retired); activate
+ *     adds switched_from_sha3.
+ *   staleness: a result or invocation bound to a superseded generation
+ *     (nonce + start_token + generation) is refused by name and cannot
+ *     regain authority after a switch.
+ *   failure evidence: a refused activation, a stale-generation refusal,
+ *     or a failed serving invocation names the still-accepted serving
+ *     64-hex digest in error.evidence.
+ *   persistence: the record lives in product state (the datadir), never
+ *     in process memory — after a consumer restart the same authoritative
+ *     generation must still serve. */
 #define RLC_LEAF "app.invoke.package"
 
 #define RLC_CHECK(name, expr) do {                                        \
@@ -699,6 +747,162 @@ static void rlc_call_package(struct rlc_call *c,
     (void)json_push_kv_bool(&c->input, "accept_execution", true);
 }
 
+/* ── stage-f trap fixtures ──────────────────────────────────────────────── */
+
+/* One installed generation binding, hex-encoded for the serving-mode
+ * calls: the identity the stage-f trap threads through accept/activate/
+ * rollback. */
+struct rlc_binding {
+    uint8_t root[32];
+    uint8_t receipt[32];
+    char root_hex[65];
+    char receipt_hex[65];
+    char sha3[65];
+};
+
+static void rlc_binding_fill(struct rlc_binding *out, const uint8_t root[32],
+                             const uint8_t receipt[32], const char sha3[65])
+{
+    memcpy(out->root, root, 32);
+    memcpy(out->receipt, receipt, 32);
+    zcl_hex_encode(root, 32, out->root_hex);
+    zcl_hex_encode(receipt, 32, out->receipt_hex);
+    (void)snprintf(out->sha3, sizeof(out->sha3), "%s", sha3);
+}
+
+/* Splice `replacement` over the first occurrence of `needle` in the
+ * slurped `text` (NUL-terminated, `len` content bytes). Returns a new
+ * malloc'd string, NULL when the needle is absent or allocation fails. */
+static char *rlc_splice_text(const char *text, size_t len,
+                             const char *needle, const char *replacement)
+{
+    const char *hit = strstr(text, needle);
+    if (!hit)
+        return NULL;
+    size_t head = (size_t)(hit - text);
+    size_t nlen = strlen(needle);
+    size_t rlen = strlen(replacement);
+    size_t out_len = len - nlen + rlen;
+    char *out = malloc(out_len + 1u);
+    if (!out)
+        return NULL;
+    memcpy(out, text, head);
+    memcpy(out + head, replacement, rlen);
+    memcpy(out + head + rlen, hit + nlen, len - head - nlen);
+    out[out_len] = '\0';
+    return out;
+}
+
+/* One edited ztasks generation (different program bytes → a different
+ * artifact digest) to play N+1 / N+2 / B against N in the stage-f trap:
+ * the REAL package files with the empty-list render line patched,
+ * published as a higher semver and installed by its exact root. */
+static bool rlc_install_ztasks_variant(const char *base, const char *zcode,
+                                       const char *semver, uint64_t sequence,
+                                       const char *list_line,
+                                       struct rlc_binding *out)
+{
+    const char *const paths[] = {
+        "LICENSE", "README.md", "app/main.c", "include/ztasks/ztasks.h",
+        "src/ztasks.c", "tests/test_ztasks.c",
+    };
+    struct rlc_file files[6];
+    char *patched = NULL;
+    for (size_t i = 0; i < 6; i++) {
+        char path[512];
+        (void)snprintf(path, sizeof(path), "%s/%s", RLC_ZTASKS_DIR,
+                       paths[i]);
+        files[i].path = paths[i];
+        files[i].content = rlc_slurp(path, &files[i].len);
+        if (!files[i].content) {
+            for (size_t j = 0; j < i; j++)
+                free((void *)files[j].content);
+            return false;
+        }
+        if (strcmp(paths[i], "app/main.c") == 0) {
+            patched = rlc_splice_text(files[i].content, files[i].len,
+                                      "No tasks yet.", list_line);
+            if (!patched) {
+                for (size_t j = 0; j <= i; j++)
+                    free((void *)files[j].content);
+                return false;
+            }
+            files[i].content = patched;
+            files[i].len = strlen(patched);
+        }
+    }
+    uint8_t root[32], receipt[32];
+    char sha3[65];
+    bool ok = rlc_publish(zcode, "ztasks/ztasks", semver, sequence, files, 6,
+                          "include/ztasks/ztasks.h", "src/ztasks.c",
+                          "tests/test_ztasks.c", "include", "app/main.c",
+                          root);
+    for (size_t i = 0; i < 6; i++)
+        free((void *)files[i].content);
+    if (!ok)
+        return false;
+    char root_hex[65];
+    zcl_hex_encode(root, 32, root_hex);
+    /* Plan by the exact 64-hex root (identity), never by name: the name
+     * selects the highest semver, which is not the generation under test. */
+    if (!rlc_install(base, root_hex, root, RLC_ZTASKS_PROGRAM, receipt,
+                     sha3))
+        return false;
+    rlc_binding_fill(out, root, receipt, sha3);
+    return true;
+}
+
+/* Force a serving generation's failure the hostile way: same-length
+ * corruption of the installed program bytes, so the receipt-bound
+ * re-hash (never a pathname, never equivalent bytes) is what refuses.
+ * The fixture datadir is test-owned. */
+static bool rlc_corrupt_installed(const char *base, const char *root_hex,
+                                  const char *program)
+{
+    char path[4500];
+    (void)snprintf(path, sizeof(path), "%s/zcode/installed/%s/%s", base,
+                   root_hex, program);
+    FILE *f = fopen(path, "r+b");
+    if (!f)
+        return false;
+    unsigned char garbage[64];
+    memset(garbage, 0xA5, sizeof(garbage));
+    bool ok = fwrite(garbage, 1, sizeof(garbage), f) == sizeof(garbage);
+    if (fclose(f) != 0)
+        ok = false;
+    return ok;
+}
+
+#define RLC_APP "ztasks/ztasks"
+
+/* One serving-mode invocation of the stage-f contract (see the ADAPTER
+ * SEAM stage-f block): app + action select the serving-record operation;
+ * the receipt triple + program are present only where the action binds
+ * exact bytes (accept, or a stale named invoke). */
+static void rlc_call_serving(struct rlc_call *c,
+                             const struct zcl_command_spec *spec,
+                             const char *datadir, const char *app,
+                             const char *action, const char *root_hex,
+                             const char *receipt_hex, const char *sha3_hex,
+                             const char *program, const char *input_text)
+{
+    rlc_begin(c, spec);
+    (void)json_push_kv_str(&c->input, "datadir", datadir);
+    (void)json_push_kv_str(&c->input, "app", app);
+    (void)json_push_kv_str(&c->input, "action", action);
+    if (root_hex)
+        (void)json_push_kv_str(&c->input, "package_root", root_hex);
+    if (receipt_hex)
+        (void)json_push_kv_str(&c->input, "receipt_id", receipt_hex);
+    if (sha3_hex)
+        (void)json_push_kv_str(&c->input, "artifact_sha3", sha3_hex);
+    if (program)
+        (void)json_push_kv_str(&c->input, "program", program);
+    (void)json_push_kv_str(&c->input, "input_text", input_text);
+    (void)json_push_kv_bool(&c->input, "accept_execution", true);
+}
+
+
 /* ── stage 0: reference-child fixture self-check (platform seam only) ─────
  * Green today: proves the fixture above speaks the exact wire bytes of the
  * landed consumer (READY gate, one nonce-bound run frame round-trip,
@@ -869,72 +1073,18 @@ static int rlc_stage_run(const struct zcl_command_spec *spec,
     return failures;
 }
 
-/* ── stage f: rollback restores the prior accepted version ───────────────
- * NOT WIRED in C's slice, and this stage stays RED until it is. C's leaf is
- * ONE bounded explicit invocation: the operator names the exact package,
- * receipt and digest every time. There is no product-held serving
- * generation, so after a failed candidate there is nothing the product can
- * supersede or atomically restore — rollback today is the OPERATOR
- * explicitly invoking a prior accepted receipt (the reply's next_action
- * says exactly that). Per C's own warning, re-invoking a prior root is NOT
- * atomic rollback proof, so this stage does not accept one: the two RED
- * checks below name the missing wiring, and the one green check is labeled
- * for exactly what it is — a failed candidate changing no installed
- * receipt. */
-static int rlc_stage_rollback(const struct zcl_command_spec *spec,
-                              const char *datadir, const char *root_hex,
-                              const char *receipt_hex, const char *sha3_hex,
-                              const struct rlc_call *failed_candidate)
+/* ── stage f labeled greens: exactly what C's one-shot slice proves ──────
+ * C's bounded invocation never mutates package state, so a failed
+ * candidate leaves every installed receipt bit-identical — proven by
+ * re-deriving the accepted artifact from the installed receipt and by an
+ * EXPLICIT re-invocation naming the same receipt. Labeled for exactly
+ * what it is: operator re-invocation, NOT rollback proof (C's own
+ * warning: rerunning a prior root is not atomic rollback proof). */
+static int rlc_stage_f_labeled(const struct zcl_command_spec *spec,
+                               const char *datadir, const char *root_hex,
+                               const char *receipt_hex, const char *sha3_hex)
 {
     int failures = 0;
-    if (!rlc_have_leaf(spec, "f: rollback to the prior accepted version"))
-        return 1;
-
-    /* RED — missing wiring #1: no serving-generation record. The product
-     * cannot run "the currently accepted version" because it holds no
-     * accepted-version record at all: an invocation that names no exact
-     * package/receipt/program is refused by the leaf's own input rule.
-     * When supersession lands, an invocation naming only the app must
-     * serve the product-held current accepted record. */
-    struct rlc_call current;
-    rlc_begin(&current, spec);
-    (void)json_push_kv_str(&current.input, "datadir", datadir);
-    (void)json_push_kv_bool(&current.input, "accept_execution", true);
-    bool ran_current = rlc_invoke(&current);
-    printf("resident_launch_contract: MISSING WIRING (stage f, red by "
-           "contract): serving-generation supersession — the consumer holds "
-           "no accepted-version record; it binds only an explicitly named "
-           "receipt, so 'run the current accepted version' is refused "
-           "(code=%s). Rollback today = the operator explicitly invokes a "
-           "prior accepted receipt.\n",
-           ran_current ? current.reply.error.code : "<validator>");
-    RLC_CHECK("stage f: the product serves its held current accepted "
-              "version without re-naming the receipt (serving-generation "
-              "supersession — NOT WIRED)",
-              ran_current && rlc_ok(&current));
-    rlc_end(&current);
-
-    /* RED — missing wiring #2: atomic rollback evidence. A failed
-     * candidate's refusal cannot name the still-accepted prior digest:
-     * with no generation record there is no "prior" for the evidence to
-     * reference. */
-    printf("resident_launch_contract: MISSING WIRING (stage f, red by "
-           "contract): atomic rollback — a failed candidate's evidence does "
-           "not name the prior accepted digest, and no product state was "
-           "superseded or restored; rerunning a prior root by hand is not "
-           "atomic rollback proof (C's own warning).\n");
-    RLC_CHECK("stage f: a failed candidate is refused naming the "
-              "still-accepted version (atomic rollback evidence — NOT "
-              "WIRED)",
-              failed_candidate && !rlc_ok(failed_candidate) &&
-              strstr(failed_candidate->reply.error.evidence, sha3_hex) !=
-                  NULL);
-
-    /* GREEN, labeled for exactly what it is: C's bounded invocation never
-     * mutates package state, so the failed candidate left the ztasks
-     * install bit-identical — proven by re-deriving the accepted artifact
-     * from the installed receipt and by an EXPLICIT re-invocation naming
-     * the same receipt. This is not rollback: nothing rolled. */
     uint8_t root_bin[32], receipt_bin[32];
     bool bound = zcl_hex_decode_lower(root_hex, root_bin, 32) &&
                  zcl_hex_decode_lower(receipt_hex, receipt_bin, 32);
@@ -960,6 +1110,290 @@ static int rlc_stage_rollback(const struct zcl_command_spec *spec,
     rlc_end(&again);
     return failures;
 }
+
+/* ── stage f TRAP: the serving-generation acceptance sequence ────────────
+ * The independent finish line for C's coming implementation, born-RED
+ * today: every check drives the product leaf handler under the stage-f
+ * contract of the ADAPTER SEAM and FAILS with a message naming the
+ * missing product behavior. The sequence is the owner directive of
+ * 2026-09-15:
+ *   f1 N accepted as pending candidate (serving record as product state)
+ *   f2 N activated → the authoritative serving generation
+ *   f3 N+1 becomes READY through the fd3 gate BEFORE any switch
+ *   f4 atomic switch N → N+1 (no double-serving window observable)
+ *   f5 a late/stale N invocation after the switch cannot regain authority
+ *   f6 rapid N+2 supersedes a pending N+1 (obsolete candidate reaped)
+ *   f7 forced candidate failure leaves the serving generation untouched,
+ *      evidence naming its digest
+ *   f8 rollback: A serving → B accepted → B activated → forced B failure
+ *      → EXACT A restored (same 64-hex digest) → A produces a valid result
+ *   f9 restart: the same authoritative generation still serves (the
+ *      record lives in product state, never process memory)
+ * n, n1, n2, b are the installed ztasks generations 0.2.0/0.3.0/0.4.0/
+ * 0.5.0; parker is the candidate that passes READY then never answers. */
+static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
+                            const char *datadir,
+                            const struct rlc_binding *n,
+                            const struct rlc_binding *n1,
+                            const struct rlc_binding *n2,
+                            const struct rlc_binding *b,
+                            const struct rlc_binding *parker)
+{
+    int failures = 0;
+    if (!rlc_have_leaf(spec, "f: serving-generation supersession + atomic "
+                       "rollback"))
+        return 1;
+    bool ran;
+
+    /* f1 — accept N as the pending candidate. */
+    struct rlc_call acc_n;
+    rlc_call_serving(&acc_n, spec, datadir, RLC_APP, "accept",
+                     n->root_hex, n->receipt_hex, n->sha3,
+                     RLC_ZTASKS_PROGRAM, "list");
+    ran = rlc_invoke(&acc_n);
+    printf("resident_launch_contract: TRAP f1 born-RED — serving generation "
+           "record absent: '" RLC_LEAF "' declares no app/action keys, so "
+           "the consumer owns no per-app authoritative serving record in "
+           "product state\n");
+    RLC_CHECK("stage f trap 1: accept admits N as the pending candidate "
+              "through the fd3 READY+probe gate and records it (MISSING: "
+              "serving generation record)",
+              ran && rlc_ok(&acc_n) &&
+              strcmp(rlc_str(&acc_n, "pending_sha3"), n->sha3) == 0 &&
+              strcmp(rlc_str(&acc_n, "pending_receipt_id"),
+                     n->receipt_hex) == 0 &&
+              rlc_hex64(rlc_str(&acc_n, "candidate_nonce")) &&
+              rlc_int(&acc_n, "candidate_start_token") > 0 &&
+              rlc_int(&acc_n, "generation") >= 0);
+    rlc_end(&acc_n);
+
+    /* f2 — activate N: the authoritative serving generation answers. */
+    struct rlc_call act_n, inv_n;
+    rlc_call_serving(&act_n, spec, datadir, RLC_APP, "activate",
+                     NULL, NULL, NULL, NULL, "list");
+    ran = rlc_invoke(&act_n);
+    rlc_call_serving(&inv_n, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_inv_n = rlc_invoke(&inv_n);
+    printf("resident_launch_contract: TRAP f2 born-RED — authoritative "
+           "activation unwired: no atomic 'activate' action exists, so no "
+           "installed receipt can become the serving generation\n");
+    RLC_CHECK("stage f trap 2: activate installs N as the authoritative "
+              "serving generation and a serving invoke answers N's exact "
+              "digest (MISSING: authoritative serving record + activate)",
+              ran && rlc_ok(&act_n) &&
+              strcmp(rlc_str(&act_n, "serving_sha3"), n->sha3) == 0 &&
+              strcmp(rlc_str(&act_n, "serving_receipt_id"),
+                     n->receipt_hex) == 0 &&
+              rlc_int(&act_n, "generation") == 1 &&
+              ran_inv_n && rlc_ok(&inv_n) &&
+              strcmp(rlc_str(&inv_n, "artifact_sha3"), n->sha3) == 0 &&
+              strcmp(rlc_str(&inv_n, "result"), "No tasks yet.\n") == 0);
+    rlc_end(&act_n);
+    rlc_end(&inv_n);
+
+    /* f3 — N+1 becomes READY through the fd3 gate BEFORE any switch. */
+    struct rlc_call acc_n1, inv_pre;
+    rlc_call_serving(&acc_n1, spec, datadir, RLC_APP, "accept",
+                     n1->root_hex, n1->receipt_hex, n1->sha3,
+                     RLC_ZTASKS_PROGRAM, "list");
+    ran = rlc_invoke(&acc_n1);
+    rlc_call_serving(&inv_pre, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_pre = rlc_invoke(&inv_pre);
+    printf("resident_launch_contract: TRAP f3 born-RED — candidate "
+           "acceptance unwired: no pending-candidate state exists in which "
+           "N+1 can pass the fd3 READY gate while N keeps serving\n");
+    RLC_CHECK("stage f trap 3: N+1 becomes READY through the fd3 gate "
+              "BEFORE any switch — accepted as pending while the serving "
+              "invoke still answers N (MISSING: candidate acceptance "
+              "before switch)",
+              ran && rlc_ok(&acc_n1) &&
+              strcmp(rlc_str(&acc_n1, "pending_sha3"), n1->sha3) == 0 &&
+              rlc_hex64(rlc_str(&acc_n1, "candidate_nonce")) &&
+              rlc_int(&acc_n1, "candidate_start_token") > 0 &&
+              ran_pre && rlc_ok(&inv_pre) &&
+              strcmp(rlc_str(&inv_pre, "artifact_sha3"), n->sha3) == 0 &&
+              strcmp(rlc_str(&inv_pre, "result"), "No tasks yet.\n") == 0);
+    rlc_end(&acc_n1);
+    rlc_end(&inv_pre);
+
+    /* f4 — atomic switch N → N+1: one transition, no double-serving
+     * window, the old resident cancelled/reaped. */
+    struct rlc_call act_n1, inv_n1;
+    rlc_call_serving(&act_n1, spec, datadir, RLC_APP, "activate",
+                     NULL, NULL, NULL, NULL, "list");
+    ran = rlc_invoke(&act_n1);
+    rlc_call_serving(&inv_n1, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_inv_n1 = rlc_invoke(&inv_n1);
+    printf("resident_launch_contract: TRAP f4 born-RED — atomic serving "
+           "switch unwired: no single-transition activate with from/to "
+           "digests exists, so a double-serving window cannot be "
+           "excluded\n");
+    RLC_CHECK("stage f trap 4: the switch N → N+1 is atomic — one "
+              "transition naming both digests, generation +1, the old "
+              "resident reaped, and only N+1 answers afterwards (MISSING: "
+              "atomic switch)",
+              ran && rlc_ok(&act_n1) &&
+              strcmp(rlc_str(&act_n1, "switched_from_sha3"), n->sha3) == 0 &&
+              strcmp(rlc_str(&act_n1, "serving_sha3"), n1->sha3) == 0 &&
+              rlc_int(&act_n1, "generation") == 2 &&
+              rlc_no_children() &&
+              ran_inv_n1 && rlc_ok(&inv_n1) &&
+              strcmp(rlc_str(&inv_n1, "artifact_sha3"), n1->sha3) == 0 &&
+              strcmp(rlc_str(&inv_n1, "result"),
+                     "No tasks yet (0.3.0).\n") == 0);
+    rlc_end(&act_n1);
+    rlc_end(&inv_n1);
+
+    /* f5 — a late/stale N invocation after the switch cannot regain
+     * authority: refused by name under the nonce + start_token +
+     * generation binding, evidence naming the authoritative digest. */
+    struct rlc_call stale, inv_post;
+    rlc_call_serving(&stale, spec, datadir, RLC_APP, "invoke",
+                     n->root_hex, n->receipt_hex, n->sha3,
+                     RLC_ZTASKS_PROGRAM, "list");
+    ran = rlc_invoke(&stale);
+    rlc_call_serving(&inv_post, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_post = rlc_invoke(&inv_post);
+    printf("resident_launch_contract: TRAP f5 born-RED — stale result "
+           "authority refusal unwired: no nonce+start_token+generation "
+           "binding rejects an invocation bound to a superseded "
+           "generation\n");
+    RLC_CHECK("stage f trap 5: a late/stale N invocation after the switch "
+              "is refused and cannot regain authority — evidence names the "
+              "authoritative serving digest, which keeps serving "
+              "(MISSING: stale authority refusal)",
+              ran && !rlc_ok(&stale) &&
+              strstr(stale.reply.error.evidence, n1->sha3) != NULL &&
+              ran_post && rlc_ok(&inv_post) &&
+              strcmp(rlc_str(&inv_post, "artifact_sha3"), n1->sha3) == 0);
+    rlc_end(&stale);
+    rlc_end(&inv_post);
+
+    /* f6 — rapid N+2 supersedes a pending N+1: the obsolete candidate is
+     * cancelled/reaped (no leak), N+2 becomes pending, serving untouched. */
+    struct rlc_call acc_x, acc_y;
+    rlc_call_serving(&acc_x, spec, datadir, RLC_APP, "accept",
+                     n->root_hex, n->receipt_hex, n->sha3,
+                     RLC_ZTASKS_PROGRAM, "list");
+    bool ran_x = rlc_invoke(&acc_x);
+    rlc_call_serving(&acc_y, spec, datadir, RLC_APP, "accept",
+                     n2->root_hex, n2->receipt_hex, n2->sha3,
+                     RLC_ZTASKS_PROGRAM, "list");
+    ran = rlc_invoke(&acc_y);
+    printf("resident_launch_contract: TRAP f6 born-RED — pending candidate "
+           "supersession unwired: a second accept cannot retire the first "
+           "pending candidate, so an obsolete candidate would leak\n");
+    RLC_CHECK("stage f trap 6: rapid N+2 supersedes a pending N+1 cleanly — "
+              "the obsolete candidate is cancelled/reaped, the reply names "
+              "the supersession, and nothing leaks (MISSING: pending "
+              "supersession)",
+              ran_x && rlc_ok(&acc_x) &&
+              ran && rlc_ok(&acc_y) &&
+              strcmp(rlc_str(&acc_y, "pending_sha3"), n2->sha3) == 0 &&
+              strcmp(rlc_str(&acc_y, "superseded_sha3"), n->sha3) == 0 &&
+              rlc_no_children());
+    rlc_end(&acc_x);
+    rlc_end(&acc_y);
+
+    /* f7 — forced candidate failure containment: the parker passes READY
+     * then never answers the probe, so activation is refused, the serving
+     * generation is untouched, and the evidence names its digest. */
+    struct rlc_call act_bad, inv_keep;
+    rlc_call_serving(&act_bad, spec, datadir, RLC_APP, "activate",
+                     parker->root_hex, parker->receipt_hex, parker->sha3,
+                     RLC_PARKER_PROGRAM, "list");
+    ran = rlc_invoke(&act_bad);
+    rlc_call_serving(&inv_keep, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_keep = rlc_invoke(&inv_keep);
+    printf("resident_launch_contract: TRAP f7 born-RED — candidate failure "
+           "containment unwired: a failed activation has no still-accepted "
+           "serving digest to name and no untouched generation to "
+           "preserve\n");
+    RLC_CHECK("stage f trap 7: a forced candidate failure leaves the "
+              "serving generation untouched and the refusal names its "
+              "still-accepted 64-hex digest (MISSING: failure containment "
+              "+ evidence)",
+              ran && !rlc_ok(&act_bad) &&
+              strstr(act_bad.reply.error.evidence, n2->sha3) != NULL &&
+              ran_keep && rlc_ok(&inv_keep) &&
+              strcmp(rlc_str(&inv_keep, "artifact_sha3"), n2->sha3) == 0 &&
+              strcmp(rlc_str(&inv_keep, "result"),
+                     "No tasks yet (0.4.0).\n") == 0);
+    rlc_end(&act_bad);
+    rlc_end(&inv_keep);
+
+    /* f8 — rollback: A (n2) serving → B accepted → B activated → forced B
+     * failure (same-length corruption of the installed bytes) → EXACT A
+     * restored: the same 64-hex digest, never equivalent bytes, never a
+     * pathname — and A produces a valid result. */
+    struct rlc_call acc_b, act_b, inv_broken, roll, inv_a;
+    rlc_call_serving(&acc_b, spec, datadir, RLC_APP, "accept",
+                     b->root_hex, b->receipt_hex, b->sha3,
+                     RLC_ZTASKS_PROGRAM, "list");
+    bool ran_acc_b = rlc_invoke(&acc_b);
+    rlc_call_serving(&act_b, spec, datadir, RLC_APP, "activate",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_act_b = rlc_invoke(&act_b);
+    bool corrupted = rlc_corrupt_installed(datadir, b->root_hex,
+                                           RLC_ZTASKS_PROGRAM);
+    rlc_call_serving(&inv_broken, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_broken = rlc_invoke(&inv_broken);
+    rlc_call_serving(&roll, spec, datadir, RLC_APP, "rollback",
+                     NULL, NULL, NULL, NULL, "list");
+    ran = rlc_invoke(&roll);
+    rlc_call_serving(&inv_a, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_a = rlc_invoke(&inv_a);
+    printf("resident_launch_contract: TRAP f8 born-RED — atomic rollback "
+           "unwired: with no prior-generation record there is no EXACT A "
+           "to restore (same 64-hex digest, never equivalent bytes, never "
+           "a pathname)\n");
+    RLC_CHECK("stage f trap 8: A serving → B accepted → B activated → "
+              "forced B failure → EXACT A restored (same 64-hex digest) "
+              "→ A produces a valid result (MISSING: atomic rollback)",
+              ran_acc_b && rlc_ok(&acc_b) &&
+              ran_act_b && rlc_ok(&act_b) && corrupted &&
+              ran_broken && !rlc_ok(&inv_broken) &&
+              ran && rlc_ok(&roll) &&
+              strcmp(rlc_str(&roll, "serving_sha3"), n2->sha3) == 0 &&
+              ran_a && rlc_ok(&inv_a) &&
+              strcmp(rlc_str(&inv_a, "artifact_sha3"), n2->sha3) == 0 &&
+              strcmp(rlc_str(&inv_a, "result"),
+                     "No tasks yet (0.4.0).\n") == 0);
+    rlc_end(&acc_b);
+    rlc_end(&act_b);
+    rlc_end(&inv_broken);
+    rlc_end(&roll);
+    rlc_end(&inv_a);
+
+    /* f9 — restart persistence: the handler carries no cross-call process
+     * state, so a serving invoke after a consumer restart can only answer
+     * from a record that lives in product state (the datadir). */
+    struct rlc_call inv_restart;
+    rlc_call_serving(&inv_restart, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    ran = rlc_invoke(&inv_restart);
+    printf("resident_launch_contract: TRAP f9 born-RED — serving record "
+           "persistence unwired: the authoritative generation must live in "
+           "product state (the datadir), not process memory, so a "
+           "restarted consumer finds the same serving generation\n");
+    RLC_CHECK("stage f trap 9: after a consumer restart the same "
+              "authoritative serving generation still serves (MISSING: "
+              "product-state persistence of the serving record)",
+              ran && rlc_ok(&inv_restart) &&
+              strcmp(rlc_str(&inv_restart, "artifact_sha3"), n2->sha3) == 0 &&
+              strcmp(rlc_str(&inv_restart, "result"),
+                     "No tasks yet (0.4.0).\n") == 0);
+    rlc_end(&inv_restart);
+    return failures;
+}
+
 
 #endif /* !defined(_WIN32) */
 
@@ -1066,10 +1500,42 @@ int test_resident_launch_contract(void)
                   "carry no data.pid by design)",
                   ran_park && rlc_no_children());
 
-        failures += rlc_stage_rollback(spec, base, ztasks_root_hex,
-                                       ztasks_receipt_hex, ztasks_sha3,
-                                       ran_park ? &park : NULL);
+        failures += rlc_stage_f_labeled(spec, base, ztasks_root_hex,
+                                        ztasks_receipt_hex, ztasks_sha3);
         rlc_end(&park);
+
+        /* The trap's generation ladder: three edited ztasks generations
+         * (distinct program bytes → distinct artifact digests) installed
+         * through the same real lifecycle, playing N+1 / N+2 / B against
+         * N (0.2.0). Installed AFTER the labeled greens so stage e's
+         * world is untouched; the trap itself is born-RED today. */
+        struct rlc_binding n1, n2, b;
+        bool variants =
+            rlc_install_ztasks_variant(base, zcode, "0.3.0", 3,
+                                       "No tasks yet (0.3.0).", &n1) &&
+            rlc_install_ztasks_variant(base, zcode, "0.4.0", 4,
+                                       "No tasks yet (0.4.0).", &n2) &&
+            rlc_install_ztasks_variant(base, zcode, "0.5.0", 5,
+                                       "No tasks yet (0.5.0).", &b);
+        RLC_CHECK("stage f setup: three edited ztasks generations (N+1, "
+                  "N+2, B) install through the real lifecycle with "
+                  "distinct artifact digests",
+                  variants &&
+                  strcmp(n1.sha3, ztasks_sha3) != 0 &&
+                  strcmp(n2.sha3, n1.sha3) != 0 &&
+                  strcmp(b.sha3, n2.sha3) != 0);
+        if (variants) {
+            struct rlc_binding n, pkb;
+            rlc_binding_fill(&n, ztasks_root, ztasks_receipt, ztasks_sha3);
+            rlc_binding_fill(&pkb, parker_root, parker_receipt, parker_sha3);
+            failures += rlc_stage_f_trap(spec, base, &n, &n1, &n2, &b,
+                                         &pkb);
+        } else {
+            printf("resident_launch_contract: generation variants failed "
+                   "to install — the stage-f trap is blocked (counted "
+                   "above)\n");
+            failures += 9;
+        }
     } else {
         printf("resident_launch_contract: fixture install failed — stages "
                "b–f blocked (1 counted failure above)\n");

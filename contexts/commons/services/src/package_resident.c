@@ -1,5 +1,5 @@
-/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
-/* Purpose: accepted-package receipt to exact resident artifact identity. */
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
+ * purpose: accepted-package receipt to exact resident artifact identity. */
 #include "services/package_resident.h"
 
 #include "base/hex.h"

@@ -1,5 +1,5 @@
-/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
-/* Purpose: bind an explicitly selected installed program to resident_launch. */
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
+ * purpose: bind an explicitly selected installed program to resident_launch. */
 #ifndef ZCL_SERVICES_PACKAGE_RESIDENT_H
 #define ZCL_SERVICES_PACKAGE_RESIDENT_H
 
