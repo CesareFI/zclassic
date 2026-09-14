@@ -216,6 +216,7 @@ static bool rpc_downloadstats(const struct json_value *params, bool help,
         "  { \"requested\", \"received\", \"timed_out\", "
         "\"in_flight\", \"queued\", \"oldest_in_flight_age_seconds\", "
         "\"overdue_in_flight\", \"queue_peer_avoid_count\", "
+        "\"requeue_suppressed_pending\", "
         "\"dispatch_wakes\", "
         "\"message_send_calls\", \"message_process_calls\", "
         "\"last_assign_result\", "

@@ -274,6 +274,70 @@ static int test_dl_queue_dedup(void)
     return failures;
 }
 
+static int test_dl_received_pending_staging(void)
+{
+    int failures = 0;
+    TEST("received-but-unstaged block is not re-queued or re-requested") {
+        struct download_manager dm;
+        dl_init(&dm);
+
+        struct uint256 h1 = make_hash(41);
+        struct uint256 h2 = make_hash(42);
+        int32_t h1_height = 700;
+        int32_t h2_height = 701;
+
+        /* Normal path: requested, body arrives, slot settles. The hash is
+         * now in NO HAVE_DATA filter's reach until the intake worker
+         * persists it — the duplicate-download hole. */
+        ASSERT(dl_mark_requested(&dm, &h1, h1_height, 1));
+        ASSERT(dl_mark_received(&dm, &h1) == 1);
+        ASSERT(!dl_is_in_flight(&dm, &h1));
+
+        /* A producer pass in the arrival->staging window must not
+         * re-queue the hash ... */
+        ASSERT(dl_queue_blocks(&dm, &h1, &h1_height, 1) == 0);
+        ASSERT(dm.queue_len == 0);
+        ASSERT(dm.total_requeue_suppressed_pending == 1);
+
+        /* ... the priority queue path must not either ... */
+        dl_queue_priority(&dm, &h1, h1_height);
+        ASSERT(dm.queue_len == 0);
+        ASSERT(dm.total_requeue_suppressed_pending == 2);
+
+        /* ... and the direct at-tip request path must refuse it too. */
+        ASSERT(!dl_mark_requested(&dm, &h1, h1_height, 2));
+        ASSERT(dm.total_requeue_suppressed_pending == 3);
+        ASSERT(!dl_is_in_flight(&dm, &h1));
+
+        /* A control hash whose body never arrived queues normally. */
+        ASSERT(dl_queue_blocks(&dm, &h2, &h2_height, 1) == 1);
+
+        /* TTL lapse: a never-staged body must become re-requestable
+         * (fail-open). Age the tombstone past the window instead of
+         * sleeping. */
+        for (size_t i = 0; i < dm.num_slots; i++) {
+            if (!dm.slots[i].active && uint256_eq(&dm.slots[i].hash, &h1)) {
+                dm.slots[i].received_time =
+                    (int64_t)platform_time_wall_time_t() -
+                    DL_RECEIVED_PENDING_SECS - 1;
+            }
+        }
+        ASSERT(dl_queue_blocks(&dm, &h1, &h1_height, 1) == 1);
+        ASSERT(dl_mark_requested(&dm, &h1, h1_height, 2));
+        ASSERT(dl_is_in_flight(&dm, &h1));
+
+        /* Activation cleared the stale tombstone timestamp. */
+        for (size_t i = 0; i < dm.num_slots; i++) {
+            if (dm.slots[i].active && uint256_eq(&dm.slots[i].hash, &h1))
+                ASSERT(dm.slots[i].received_time == 0);
+        }
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_dl_assign_to_peer(void)
 {
     int failures = 0;
@@ -1969,6 +2033,7 @@ int test_download(void)
     failures += test_dl_mark_requested();
     failures += test_dl_mark_received();
     failures += test_dl_queue_dedup();
+    failures += test_dl_received_pending_staging();
     failures += test_dl_assign_to_peer();
     failures += test_dl_assignment_generation_parking();
     failures += test_dl_assignment_parking_is_per_peer();

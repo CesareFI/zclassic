@@ -35,6 +35,13 @@
 #define DL_REQUEST_TIMEOUT_SECS   30     /* reassign after this many seconds (at tip) */
 #define DL_REQUEST_TIMEOUT_SECS_IBD 45   /* reassign after this many seconds (during IBD) */
 #define DL_STALL_TIMEOUT_SECS     120    /* disconnect peer after this */
+#define DL_RECEIVED_PENDING_SECS  60     /* a received-but-not-yet-staged body
+                                          * keeps dedup'ing queue/request
+                                          * producers for this long after
+                                          * arrival (BLOCK_HAVE_DATA lags the
+                                          * wire by the intake-worker persist);
+                                          * fail-open afterwards so a dropped
+                                          * body becomes re-requestable */
 #define DL_WINDOW_SIZE            512    /* blocks to request per batch */
 #define DL_MAX_TRACKED_PEERS      512    /* above connman's <=200 live peers;
                                           * leaves churn/cache headroom */
@@ -79,6 +86,13 @@ struct dl_in_flight {
     int32_t        height;          /* -1 if unknown */
     uint32_t       peer_id;
     int64_t        request_time;    /* seconds since epoch */
+    int64_t        received_time;   /* epoch seconds of body arrival; nonzero
+                                     * only on an inactive slot whose settle
+                                     * was dl_mark_received — a bounded
+                                     * tombstone that keeps dedup'ing queue
+                                     * producers until BLOCK_HAVE_DATA is
+                                     * observable (DL_RECEIVED_PENDING_SECS).
+                                     * Zeroed whenever a slot is activated. */
     enum dl_work_class work_class;
     bool           active;          /* true if slot in use */
 };
@@ -183,6 +197,10 @@ struct dl_diagnostics {
     uint64_t capacity_generation;
     uint64_t total_orphaned;    /* requests settled without a body:
                                  * disconnect-requeue + backpressure drain */
+    uint64_t requeue_suppressed_pending; /* received-not-staged tombstone
+                                 * suppressions (queue + direct-request
+                                 * paths); watch this fall as the duplicate
+                                 * body rate falls */
     int64_t  accounting_drift;  /* requested - received - timed_out -
                                  * orphaned - in_flight; 0 unless a settle
                                  * path leaked (each leaked request once
@@ -251,6 +269,11 @@ struct download_manager {
     uint64_t total_queue_evicted;   /* high-height entries displaced at cap */
     uint64_t total_queue_rejected;  /* pushes refused at cap (not lower
                                      * than the current tail) */
+    uint64_t total_requeue_suppressed_pending; /* producer passes refused
+                                     * because the body had arrived but was
+                                     * not yet staged (received-pending
+                                     * tombstone). Diagnostic only — not part
+                                     * of the settle identity above. */
 
     /* Last assignment attempt telemetry. These fields let the agent
      * distinguish "message pump never tried" from "tried but peer/global
@@ -302,14 +325,18 @@ void dl_free(struct download_manager *dm);
 bool dl_is_in_flight(struct download_manager *dm, const struct uint256 *hash);
 
 /* Mark a block as requested from a specific peer.
- * Returns false if already in-flight or table full. */
+ * Returns false if already in-flight, received-pending-staging, or table
+ * full. */
 bool dl_mark_requested(struct download_manager *dm,
                        const struct uint256 *hash, int32_t height,
                        uint32_t peer_id);
 
 /* Mark a block as received (remove from in-flight).
  * Returns the peer_id that requested it, or UINT32_MAX if not found. Peer id
- * zero is valid and must never be collapsed into the not-found result. */
+ * zero is valid and must never be collapsed into the not-found result.
+ * A successful settle leaves a bounded received-pending tombstone on the
+ * slot so queue/request producers keep dedup'ing the hash until
+ * BLOCK_HAVE_DATA is observable (see DL_RECEIVED_PENDING_SECS). */
 uint32_t dl_mark_received(struct download_manager *dm,
                           const struct uint256 *hash);
 

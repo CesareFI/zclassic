@@ -144,3 +144,7 @@ later lane flips it HARD.
 - 2026-09-13T20:51:17Z — REASON: slice3: dedup P2P block intake ring by hash before slot alloc (1024-slot starvation)
   old ROOT: cd9b049fca58ade90a06d989285ad0ee63f8f7f1b66ed6ac91935a4aed4e5fab
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-14T02:25:42Z — REASON: ACTIVE1 dl received-pending tombstone in core/modules/net download accounting (already reviewed+tested f6705235fd)
+  old ROOT: a13489b1ee0f1a5d4fcbfb0f1d05e497c81ce3fb616782580daa305eb1ecc9ab
+  by: owner unseal ritual (make core-unseal)

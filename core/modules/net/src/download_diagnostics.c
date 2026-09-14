@@ -78,6 +78,7 @@ void dl_get_diagnostics(struct download_manager *dm,
     out->queue_generation = dm->queue_generation;
     out->capacity_generation = dm->capacity_generation;
     out->total_orphaned = dm->total_orphaned;
+    out->requeue_suppressed_pending = dm->total_requeue_suppressed_pending;
     out->accounting_drift = (int64_t)dm->total_requested -
                             (int64_t)dm->total_received -
                             (int64_t)dm->total_timed_out -

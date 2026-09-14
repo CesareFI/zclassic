@@ -68,6 +68,8 @@ void download_stats_push_json(struct json_value *obj,
         const struct dl_diagnostics *diag = &s->diag;
 
         json_push_kv_int(obj, "orphaned", (int64_t)diag->total_orphaned);
+        json_push_kv_int(obj, "requeue_suppressed_pending",
+                         (int64_t)diag->requeue_suppressed_pending);
         json_push_kv_int(obj, "accounting_drift", diag->accounting_drift);
         json_push_kv_int(obj, "request_timeout_seconds",
                          (int64_t)diag->request_timeout_seconds);

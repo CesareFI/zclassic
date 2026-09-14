@@ -417,7 +417,11 @@ static struct dl_peer_stats *dl_find_peer(struct download_manager *dm,
 /* Find slot for hash (open addressing with linear probe).
  * Handles gaps from deletions: inactive slots are NOT probe-chain
  * terminators because dl_mark_received clears slots without
- * rehashing. We must scan through inactive slots to find matches. */
+ * rehashing. We must scan through inactive slots to find matches.
+ * Returns the slot carrying the hash whether it is live (active) or a
+ * received-pending tombstone — callers apply their own active/tombstone
+ * policy (see dl_slot_blocks_requeue). With find_empty, returns the first
+ * reusable slot when no slot carries the hash. */
 static struct dl_in_flight *find_slot(struct download_manager *dm,
                                        const struct uint256 *hash,
                                        bool find_empty)
@@ -434,12 +438,37 @@ static struct dl_in_flight *find_slot(struct download_manager *dm,
             /* Check if this slot was NEVER used (zero hash = virgin) */
             if (uint256_is_null(&s->hash))
                 break; /* end of probe chain */
+            if (uint256_eq(&s->hash, hash))
+                return s; /* received-pending tombstone match */
             continue; /* skip gap from deletion, keep probing */
         }
         if (uint256_eq(&s->hash, hash))
             return s;
     }
     return find_empty ? first_empty : NULL;
+}
+
+/* Should this hash's slot block a fresh queue/request? True while the slot
+ * is live (in-flight) OR while it is a fresh received-pending tombstone:
+ * the body arrived but the intake worker has not persisted it yet, so
+ * BLOCK_HAVE_DATA is not observable and every producer pass filtering on
+ * HAVE_DATA alone would re-request the same block (measured on a cold
+ * loopback sync: ~52% of block wire traffic was such duplicates).
+ * Fail-open: once DL_RECEIVED_PENDING_SECS lapses the hash becomes
+ * re-requestable again, so a terminally-dropped body (retryable reject,
+ * activation skip, snapshot defer) is never permanently suppressed.
+ * Caller holds dm->cs. Counts tombstone (not in-flight) suppressions. */
+static bool dl_slot_blocks_requeue(struct download_manager *dm,
+                                   const struct dl_in_flight *s,
+                                   int64_t now)
+{
+    if (s->active)
+        return true;
+    if (s->received_time == 0 ||
+        now - s->received_time >= DL_RECEIVED_PENDING_SECS)
+        return false;
+    dm->total_requeue_suppressed_pending++;
+    return true;
 }
 
 /* Rehash into a table of given size (must be power of 2). */
@@ -503,6 +532,16 @@ bool dl_mark_requested(struct download_manager *dm,
         return false;
     }
 
+    /* Received-pending tombstone: the body arrived but is not staged yet,
+     * so BLOCK_HAVE_DATA cannot have filtered this request. Refuse to
+     * re-request inside the bounded window (fail-open after it lapses). */
+    if (existing &&
+        dl_slot_blocks_requeue(dm, existing,
+                               (int64_t)platform_time_wall_time_t())) {
+        zcl_mutex_unlock(&dm->cs);
+        return false;
+    }
+
     /* Check global limit (dynamic: aggressive during IBD) */
     if (dm->num_active >= dl_get_max_in_flight_total()) {
         zcl_mutex_unlock(&dm->cs);
@@ -536,6 +575,7 @@ bool dl_mark_requested(struct download_manager *dm,
     slot->height = height;
     slot->peer_id = peer_id;
     slot->request_time = (int64_t)platform_time_wall_time_t();
+    slot->received_time = 0; /* activation clears any stale tombstone */
     slot->work_class = DL_WORK_FORWARD;
     slot->active = true;
     dm->num_active++;
@@ -567,7 +607,12 @@ uint32_t dl_mark_received(struct download_manager *dm,
 
     s->active = false;
     /* Don't zero the hash — find_slot needs it to detect "was used" vs "never used"
-     * for proper probe chain handling after deletions. */
+     * for proper probe chain handling after deletions. The hash bits plus
+     * received_time now double as the received-pending tombstone: the body
+     * is on its way through the intake worker but BLOCK_HAVE_DATA is not
+     * observable yet, so queue/request producers must keep dedup'ing this
+     * hash (bounded by DL_RECEIVED_PENDING_SECS, fail-open). */
+    s->received_time = (int64_t)platform_time_wall_time_t();
     dm->num_active--;
     dm->total_received++;
     dl_generation_advance(&dm->capacity_generation);
@@ -877,9 +922,13 @@ size_t dl_queue_blocks_class(struct download_manager *dm,
         return 0;
     }
     dl_qset_reserve_n(dm, count);
+    const int64_t now_q = (int64_t)platform_time_wall_time_t();
     for (size_t i = 0; i < count; i++) {
         struct dl_in_flight *s = find_slot(dm, &hashes[i], false);
-        if (s && s->active) continue;
+        /* Skip live (in-flight) hashes and received-pending tombstones:
+         * the body is already on its way onto disk, so re-queueing it
+         * here is what produced the duplicate-download traffic. */
+        if (s && dl_slot_blocks_requeue(dm, s, now_q)) continue;
         const struct dl_queued_key *queued = dl_qset_find(dm, &hashes[i]);
         if (queued) {
             if (work_class == DL_WORK_FORWARD &&
@@ -1000,9 +1049,10 @@ void dl_queue_priority(struct download_manager *dm,
     zcl_mutex_lock(&dm->cs);
     bool changed = false;
 
-    /* Skip if already in-flight */
+    /* Skip if already in-flight or received-pending-staging */
     struct dl_in_flight *s = find_slot(dm, hash, false);
-    if (s && s->active) {
+    if (s && dl_slot_blocks_requeue(dm, s,
+                                    (int64_t)platform_time_wall_time_t())) {
         zcl_mutex_unlock(&dm->cs);
         return;
     }
@@ -1337,6 +1387,8 @@ size_t dl_assign_to_peer(struct download_manager *dm,
                 slot->height = height;
                 slot->peer_id = peer_id;
                 slot->request_time = now;
+                slot->received_time = 0; /* activation clears any stale
+                                          * tombstone */
                 slot->work_class = work_class;
                 slot->active = true;
                 dm->num_active++;
@@ -1394,6 +1446,8 @@ size_t dl_assign_to_peer(struct download_manager *dm,
             slot->height = height;
             slot->peer_id = peer_id;
             slot->request_time = now;
+            slot->received_time = 0; /* activation clears any stale
+                                      * tombstone */
             slot->work_class = work_class;
             slot->active = true;
             dm->num_active++;
