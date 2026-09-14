@@ -260,13 +260,39 @@ static bool resident_reproof_mapped(pid_t pid, struct resident_launch *launch,
     struct platform_positioned_file mapped;
     struct platform_positioned_file_snapshot mapped_snapshot;
     platform_positioned_file_init(&mapped);
-    if (!platform_positioned_file_open(&mapped, exe_path)) return true;
+    /* LINUX PORT: /proc/<pid>/exe is a kernel-managed magic link, so the
+     * no-follow content-path open always refuses it with ELOOP and the
+     * re-proof silently never ran (the receipt could never carry
+     * "proc_exe_triple" on Linux). This is a fixed, compiled-in kernel
+     * location — the open_resolved trusted-location contract applies. */
+    if (!platform_positioned_file_open_resolved(&mapped, exe_path)) return true;
     bool proved =
         platform_positioned_file_snapshot(&mapped, &mapped_snapshot);
+    if (!proved) {
+        platform_positioned_file_close(&mapped);
+        return true; /* child gone: skip, the first proof holds */
+    }
+    /* Compare inode IDENTITY fields, never timestamps: multigrain-ctime
+     * kernels (>=6.6) make same-jiffy metadata indistinguishable, and a
+     * same-UID writer can bump ctime post-exec with chmod/unlink without
+     * ever touching the mapped bytes (the kernel refuses those writes
+     * with ETXTBSY). The binding proof is identity plus a content digest
+     * re-hash — exactly what the kernel mapped, since the executing inode
+     * is write-locked. */
+    bool identity_differs =
+        mapped_snapshot.volume != launch->pinned_snapshot.volume ||
+        mapped_snapshot.file_low != launch->pinned_snapshot.file_low ||
+        mapped_snapshot.file_high != launch->pinned_snapshot.file_high ||
+        mapped_snapshot.size != launch->pinned_snapshot.size;
+    unsigned char mapped_digest[32];
+    char mapped_hex[RESIDENT_LAUNCH_DIGEST_HEX + 1] = {0};
+    bool hashed = !identity_differs &&
+        resident_sha3_positioned(&mapped, mapped_digest);
     platform_positioned_file_close(&mapped);
-    if (!proved) return true; /* child gone: skip, the first proof holds */
-    if (!platform_positioned_file_snapshot_equal(&launch->pinned_snapshot,
-                                                 &mapped_snapshot)) {
+    if (hashed)
+        zcl_hex_encode(mapped_digest, sizeof(mapped_digest), mapped_hex);
+    if (identity_differs ||
+        (hashed && strcmp(mapped_hex, launch->accepted.image_sha3_hex) != 0)) {
         (void)kill(pid, SIGKILL);
         int status = 0;
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
@@ -362,6 +388,31 @@ static bool resident_spawn_linux(struct resident_launch *launch,
         errno = EINVAL;
         resident_fail(error, error_size,
                       "resident launch: pinned image descriptor is gone");
+        return false;
+    }
+    /* Re-prove the pinned BYTES before fork. The positioned-file triple
+     * alone cannot do this on multigrain-timestamp kernels (>=6.6): a
+     * same-jiffy, same-size content swap between prepare and spawn leaves
+     * mtime/ctime indistinguishable, so a metadata check can wave the
+     * wrong bytes through. The content digest has no such granularity,
+     * and refusing here means no process ever exists for a swapped image
+     * (stronger than a post-spawn kill). Metadata-only changes — rename,
+     * unlink, chmod — do not alter the pinned bytes and do not refuse:
+     * fexecve still maps exactly the accepted inode. */
+    unsigned char preflight_digest[32];
+    char preflight_hex[RESIDENT_LAUNCH_DIGEST_HEX + 1] = {0};
+    if (!resident_sha3_positioned(file, preflight_digest)) {
+        errno = EIO;
+        resident_fail(error, error_size,
+                      "resident launch: pinned image re-read failed");
+        return false;
+    }
+    zcl_hex_encode(preflight_digest, sizeof(preflight_digest), preflight_hex);
+    if (strcmp(preflight_hex, launch->accepted.image_sha3_hex) != 0) {
+        errno = ESTALE;
+        resident_fail(error, error_size,
+                      "resident launch: image bytes changed after prepare;"
+                      " refusing before fork");
         return false;
     }
     int ipc[2] = {-1, -1}, status_pipe[2] = {-1, -1};

@@ -3,7 +3,9 @@
  * Injectable RNG — implementation. See platform/rng.h for design. */
 
 #ifndef _WIN32
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE  /* getrandom on glibc */
+#endif
 #endif
 
 #include "platform/rng.h"

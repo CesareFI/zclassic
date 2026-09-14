@@ -250,6 +250,17 @@ static int rl_cycle_checks(void)
               strcmp(receipt.mapped_proof, "proc_exe_triple") == 0 ||
               strcmp(receipt.mapped_proof, "cdhash_suspended") == 0) &&
              receipt.start_token > 0);
+#if defined(__linux__)
+    /* Regression: the post-exec re-proof must actually RUN. The no-follow
+     * content-path open on /proc/<pid>/exe always refused the kernel magic
+     * link with ELOOP, so this proof silently never executed on Linux and
+     * the receipt could never carry "proc_exe_triple" — the fallback name
+     * "fexecve_inode" here means the second proof was skipped, not that it
+     * passed. */
+    RL_CHECK("the /proc/<pid>/exe re-proof ran and named itself on the"
+             " receipt",
+             strcmp(receipt.mapped_proof, "proc_exe_triple") == 0);
+#endif
 
     int fds_steady = rl_open_fd_count();
     struct resident_launch candidate;
@@ -277,6 +288,112 @@ static int rl_cycle_checks(void)
     return failures;
 }
 
+/* Stream `in` into the already-open `out`, recording the byte count. */
+static bool rl_copy_stream(FILE *in, FILE *out, size_t *size_out)
+{
+    unsigned char buf[4096];
+    size_t total = 0;
+    for (;;) {
+        size_t got = fread(buf, 1, sizeof(buf), in);
+        if (got > 0 && fwrite(buf, 1, got, out) != got) return false;
+        total += got;
+        if (got < sizeof(buf)) {
+            *size_out = total;
+            return !ferror(in);
+        }
+    }
+}
+
+/* Copy `src` to `dst`, append `pad` zero bytes (trailing bytes past the
+ * ELF's own layout do not change how it executes), and record the original
+ * byte count so the caller can flip a byte inside the padding: that yields
+ * a same-inode, same-size, different-bytes image that still runs. */
+static bool rl_copy_padded(const char *src, const char *dst, size_t pad,
+                           size_t *plain_size_out)
+{
+    FILE *in = fopen(src, "rb");
+    if (!in) return false;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { (void)fclose(in); return false; }
+    bool ok = rl_copy_stream(in, out, plain_size_out);
+    unsigned char zeros[512] = {0};
+    size_t left = pad;
+    while (ok && left > 0) {
+        size_t chunk = left < sizeof(zeros) ? left : sizeof(zeros);
+        if (fwrite(zeros, 1, chunk, out) != chunk) { ok = false; break; }
+        left -= chunk;
+    }
+    if (fclose(out) != 0) ok = false;
+    (void)fclose(in);
+    if (ok && chmod(dst, 0755) != 0) ok = false;
+    return ok;
+}
+
+/* Overwrite one byte IN PLACE at `offset`: same inode, same size, changed
+ * content — exactly the swap a metadata-only check cannot reliably see on
+ * a multigrain-timestamp kernel. */
+static bool rl_flip_byte(const char *path, size_t offset)
+{
+    FILE *f = fopen(path, "r+b");
+    if (!f) return false;
+    bool ok = fseek(f, (long)offset, SEEK_SET) == 0 && fputc('X', f) == 'X';
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+/* Regression: a same-size, same-inode content swap between prepare and
+ * spawn must refuse BEFORE fork — ESTALE, a named byte change, and no
+ * child. Between prepare and spawn there was previously no content proof
+ * at all, and a metadata triple cannot see a same-jiffy swap on
+ * multigrain-timestamp kernels (>=6.6): the wrong bytes were exec'd. The
+ * flipped byte sits in zero padding appended past the ELF layout, so the
+ * swapped image is still perfectly executable — if the refusal ever
+ * regresses, spawn visibly succeeds instead of failing for an unrelated
+ * exec reason. */
+static int rl_swap_refusal_checks(const char *dir)
+{
+    int failures = 0;
+    char error[RESIDENT_LAUNCH_ERROR_MAX];
+    char image[512];
+    (void)snprintf(image, sizeof(image), "%s/padded-true", dir);
+    size_t plain_size = 0;
+    RL_CHECK("stage a padded executable image",
+             rl_copy_padded("/bin/true", image, 4096, &plain_size));
+    struct resident_launch_accepted accepted;
+    RL_CHECK("capture the padded image acceptance record",
+             rl_accept_of(image, &accepted));
+    int fds_before = rl_open_fd_count();
+    struct resident_launch swap;
+    resident_launch_init(&swap);
+    error[0] = '\0';
+    RL_CHECK("prepare accepts the padded image",
+             resident_launch_prepare(&swap, image, &accepted, error,
+                                     sizeof(error)));
+    RL_CHECK("swap same-size bytes in place after prepare",
+             rl_flip_byte(image, plain_size + 100));
+    struct resident_receipt receipt;
+    memset(&receipt, 0, sizeof(receipt));
+    char *const argv[] = {"true", NULL};
+    char *const envp[] = {NULL};
+    error[0] = '\0';
+    bool spawned = resident_launch_spawn(&swap, argv, envp, &receipt, error,
+                                         sizeof(error));
+    RL_CHECK("spawn refuses a same-size content swap before fork",
+             !spawned && errno == ESTALE && !swap.spawned && swap.pid == 0 &&
+             strstr(error, "bytes changed") != NULL);
+    if (spawned) {
+        /* Unfixed launchers exec the wrong bytes here: reap the child so
+         * the regression leaves no process behind. */
+        char cleanup_error[RESIDENT_LAUNCH_ERROR_MAX];
+        (void)resident_launch_cancel(&swap, 300, cleanup_error,
+                                     sizeof(cleanup_error));
+    }
+    resident_launch_close(&swap);
+    RL_CHECK("the pre-fork refusal leaked no descriptors",
+             rl_open_fd_count() == fds_before);
+    return failures;
+}
+
 int test_resident_launch(void)
 {
     int failures = 0;
@@ -290,6 +407,7 @@ int test_resident_launch(void)
              rl_accept_of(fixture, &accepted));
     failures += rl_refusal_checks(fixture, &accepted);
     failures += rl_codec_checks(fixture, &accepted);
+    failures += rl_swap_refusal_checks(dir);
     failures += rl_cycle_checks();
     test_rm_rf(dir);
     printf("resident_launch: %s (%d failure(s))\n",
