@@ -10,6 +10,7 @@
 #include "conditions/reducer_drive_watchdog.h"
 #include "conditions/condition_registry.h"
 #include "framework/condition.h"
+#include "jobs/catchup_cadence.h" /* catchup_cadence_active_cached (R1 gate) */
 #include "jobs/utxo_apply_stage.h"
 #include "json/json.h"
 #include "platform/time_compat.h"
@@ -274,13 +275,35 @@ void register_reducer_drive_watchdog(void)
                                       reducer_drive_stuck_escape);
 }
 
+/* R2 quiescent-skip total (extracted so reducer_drive_dump_state_json stays
+ * under its cyclomatic-complexity pin). */
+static bool dump_drain_quiescent_json(struct json_value *out,
+                                      const struct reducer_drain_exit_stats *des,
+                                      bool ok)
+{
+    return ok && json_push_kv_int(out, "drain_quiescent_skips_total",
+                                  (int64_t)des->quiescent_skips_total);
+}
+
+/* R1 catch-up round-cadence telemetry beside the flush totals (same
+ * complexity-pin extraction). */
+static bool dump_fsync_cadence_json(struct json_value *out, bool ok)
+{
+    uint64_t cadence_deferred = 0;
+    reducer_body_fsync_cadence_snapshot(&cadence_deferred);
+    ok = ok && json_push_kv_int(out, "fsync_cadence_deferred_total",
+                                (int64_t)cadence_deferred);
+    ok = ok && json_push_kv_bool(out, "fsync_cadence_gate_open",
+                                 catchup_cadence_active_cached());
+    return ok;
+}
+
 bool reducer_drive_dump_state_json(struct json_value *out, const char *key)
 {
     (void)key;
     if (!out)
         return false;
     json_set_object(out);
-
     const char *label = reducer_drive_label();
     bool ok = true;
     ok = ok && json_push_kv_bool(out, "active", reducer_drive_active());
@@ -375,11 +398,17 @@ bool reducer_drive_dump_state_json(struct json_value *out, const char *key)
             json_push_kv_int(&one, "us", (int64_t)des.stage_us_total[i]);
             json_push_kv_int(&one, "calls", (int64_t)des.stage_calls[i]);
             json_push_kv_int(&one, "adv", (int64_t)des.stage_advances[i]);
+            /* R2 quiescent-round consumer skips (reducer_drain.c memo):
+             * drains skipped because the round started on the exact converged
+             * cursor vector with nothing advanced earlier in the round. */
+            json_push_kv_int(&one, "skips",
+                             (int64_t)des.stage_quiescent_skips[i]);
             ok = ok && json_push_kv(&totals, n, &one);
             json_free(&one);
         }
         ok = ok && json_push_kv(out, "drain_stage_totals", &totals);
         json_free(&totals);
+        ok = dump_drain_quiescent_json(out, &des, ok);
     }
 
     /* Outer-batch transaction accounting (core/modules/sync/src/stage_batch.c).
@@ -419,13 +448,16 @@ bool reducer_drive_dump_state_json(struct json_value *out, const char *key)
         reducer_body_fsync_scope_snapshot(&scope_depth, &event_log_deferred);
         ok = ok && json_push_kv_int(out, "fsync_last_flush_us", last_flush_us);
         ok = ok && json_push_kv_int(out, "fsync_flush_us_ewma", flush_us_ewma);
-        /* One flush == one durability barrier for one committing batch, so
-         * this count divided by blocks folded over the same interval IS the
-         * "barriers per block" figure. */
+        /* One flush == one durability barrier actually paid — during live
+         * catch-up the pre-commit hook runs at a ROUND cadence (R1, see
+         * reducer_body_fsync.c), so over an interval
+         * d(flush_count) + d(fsync_cadence_deferred_total) == committing
+         * batches, and flush_count / blocks folded is "barriers per block". */
         ok = ok && json_push_kv_int(out, "fsync_flush_count",
                                     (int64_t)flush_count);
         ok = ok && json_push_kv_int(out, "fsync_flush_us_total",
                                     (int64_t)flush_us_total);
+        ok = dump_fsync_cadence_json(out, ok);
         ok = ok && json_push_kv_int(out, "fsync_scope_depth",
                                     (int64_t)scope_depth);
         ok = ok && json_push_kv_bool(out, "event_log_deferred",

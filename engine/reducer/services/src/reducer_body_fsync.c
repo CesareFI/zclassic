@@ -27,9 +27,15 @@
  *     / event_log callers (import, tests, at-tip) keep their immediate per-op
  *     fdatasync.
  *
- * Durability is unchanged — only the fsync cadence drops from ~3/block to
- * ~1/batch. At tip the batch is a single block, so the artifacts are synced at
+ * Durability at tip is unchanged — only the fsync cadence drops from ~3/block
+ * to ~1/batch. At tip the batch is a single block, so the artifacts are synced at
  * that block's own drain COMMIT: identical durability, one extra deferred hop.
+ * During a LIVE CATCH-UP (peers connected, gap over threshold) the cadence
+ * drops further — one flush per ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL commits
+ * (default 8, about one per drain round) — restoring the strict per-commit
+ * regime the instant the gate closes. The mechanism, the bounded crash window
+ * it accepts, and the recovery that covers the window are documented in the
+ * "R1: catch-up ROUND cadence" block comment below.
  *
  * TIMING (drive+fsync telemetry gap 2): the flush above is bracketed with a
  * GetTimeMicros() pair so an IO stall INSIDE it (ext4 jbd2 journal-commit
@@ -47,6 +53,7 @@
 #include "services/reducer_ingest_service.h"
 
 #include "core/utiltime.h"       /* GetTimeMicros */
+#include "jobs/catchup_cadence.h" /* catchup_cadence_active_cached (R1 gate) */
 #include "storage/disk_block_io.h"
 #include "storage/event_log.h"
 #include "storage/event_log_singleton.h"
@@ -54,6 +61,7 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>              /* getenv, strtol */
 
 static _Atomic bool g_body_fsync_hook_registered = false;
 static _Atomic unsigned g_body_fsync_scope_depth = 0;
@@ -73,6 +81,85 @@ static _Atomic int64_t g_fsync_flush_us_ewma;
  * flush here is exactly one barrier for one committing batch. */
 static _Atomic uint64_t g_fsync_flush_count;
 static _Atomic uint64_t g_fsync_flush_us_total;
+
+/* ── R1: catch-up ROUND cadence ───────────────────────────────────────────
+ * During a live catch-up (the same peers+gap gate the catch-up drain-batch /
+ * tick overrides use — catchup_cadence_active_cached(), lock-free), the
+ * pre-commit hook pays the body+event_log fdatasync once per
+ * ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL commits (default 8, clamp [1,64] — about
+ * one per drain ROUND of eight stages) instead of once per batch COMMIT.
+ * Measured against a 2026-09-14 cold-sync stopwatch: 5600 commits paid 5600
+ * flushes for ~40-56 s of fsync_flush_us_total, ~3.5 flushes per drain round;
+ * the interval demotes that to ~1 flush per round. Only the CADENCE changes:
+ *
+ *   - every flush that DOES run keeps the exact veto verdict (a false return
+ *     still rolls the batch back), and the EWMA/total/count telemetry keeps
+ *     counting real flushes only (batch_fsync_slow is untouched);
+ *   - every batched-scope EXIT still does its final flush, so the tail of an
+ *     un-flushed run is bounded by the scope (one kick / one supervisor tick);
+ *   - the moment the gate closes (gap under threshold — converging / at tip,
+ *     or no peers) the hook flushes EVERY commit again: the strict
+ *     bodies-before-commit regime plus the exit flush is the whole at-tip
+ *     behavior, byte-for-byte unchanged. The mint fold and the synchronous
+ *     ingest path never see the gate open (offline / no gap), so they keep
+ *     the strict regime too.
+ *
+ * Crash-ordering window (progress.kv is synchronous=OFF during IBD/catch-up,
+ * so a batch COMMIT becomes durable only at the next WAL checkpoint): with
+ * the demotion, up to INTERVAL-1 consecutive committed batches (bounded by
+ * one round, and further bounded by every scope exit's final flush) can have
+ * their cursor / *_log rows checkpointed durable while their blk*.dat bytes
+ * sit only in page cache. A power loss inside that window leaves durable
+ * HAVE_DATA / stage-cursor claims whose body bytes were never synced. The
+ * window is BOUNDED (one round) and RECOVERABLE with existing machinery: any
+ * later read of a lost body fails closed — body_persist's step requeues it
+ * (requeue_body_for_refetch clears BLOCK_HAVE_DATA, emits the status event,
+ * and the normal !HAVE_DATA sync path re-downloads the body), the boot-time
+ * scan re-derives HAVE_DATA from physical blk content when the contiguous
+ * frontier lags, and the drop-bodiless gate (fb3a6c4142 lineage) clears
+ * borrowed/byte-less claims. Today the same demotion is already accepted for
+ * the whole cursor side: synchronous=OFF means lost commits replay from the
+ * last checkpoint — R1 only lets the body side lag by the same bounded
+ * amount, never more.
+ *
+ * The two load-bearing assertions are pinned by deterministic kill -9 fault
+ * injection (tests/harness/src/test_reducer_body_fsync_crash.c, group
+ * reducer_body_fsync_crash), which SIGKILLs a child mid-scope, after
+ * cadence-demoted commits and before the next round flush:
+ *
+ *   (a) the durable frontier never precedes its data — after the kill the
+ *       reopened store's durable cursor never exceeds the count of intact
+ *       body records on disk (bodies are written AND fflushed before their
+ *       batch COMMIT, always, so no committed cursor can reference bytes
+ *       that never reached the kernel). When the demoted tail is then
+ *       truncated away (emulating the power loss a kill -9 cannot produce),
+ *       the bounded lag is observed (cursor ahead by at most INTERVAL-1
+ *       commits) and repaired by re-writing the missing bodies — the same
+ *       fail-closed body read the real requeue/rescan machinery keys on;
+ *
+ *   (b) no acknowledged write is lost — every commit the round flush
+ *       covered (the only commits ever acknowledged durable while the gate
+ *       is open) is fully durable after the crash: cursor row and body
+ *       bytes both present. In both cycles the resumed datadir reaches a
+ *       final durable state byte-identical to an uninterrupted golden run. */
+static _Atomic uint64_t g_cadence_commits;
+static _Atomic uint64_t g_cadence_deferred_total;
+
+#define CATCHUP_FSYNC_COMMIT_INTERVAL_DEFAULT 8
+
+static int catchup_fsync_commit_interval(void)
+{
+    const char *v = getenv("ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL");
+    if (!v || !v[0])
+        return CATCHUP_FSYNC_COMMIT_INTERVAL_DEFAULT;
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v)
+        return CATCHUP_FSYNC_COMMIT_INTERVAL_DEFAULT;
+    if (n < 1) n = 1;
+    if (n > 64) n = 64;
+    return (int)n;
+}
 
 #ifdef ZCL_TESTING
 #include <time.h>
@@ -94,11 +181,26 @@ void reducer_body_fsync_test_reset(void)
     atomic_store(&g_fsync_flush_us_ewma, 0);
     atomic_store(&g_fsync_flush_count, 0u);
     atomic_store(&g_fsync_flush_us_total, 0u);
+    atomic_store(&g_cadence_commits, 0u);
+    atomic_store(&g_cadence_deferred_total, 0u);
 }
 #endif
 
 static bool reducer_batched_durability_precommit(void)
 {
+    /* R1 round cadence (see the block comment above): while the live catch-up
+     * gate is open, skip the flush on all but every INTERVAL-th commit. The
+     * skip is a verdict of TRUE (no flush ran, nothing to veto) — the commit
+     * proceeds; the deferred bytes are covered by the interval flush, every
+     * scope exit's final flush, and the strict regime the moment the gate
+     * closes. Telemetry keeps counting only flushes that genuinely run. */
+    if (catchup_cadence_active_cached()) {
+        uint64_t n = atomic_fetch_add(&g_cadence_commits, 1u) + 1u;
+        if (n % (uint64_t)catchup_fsync_commit_interval() != 0) {
+            atomic_fetch_add(&g_cadence_deferred_total, 1u);
+            return true;
+        }
+    }
     int64_t t0 = GetTimeMicros();
 #ifdef ZCL_TESTING
     int64_t inj = atomic_load(&g_test_inject_delay_us);
@@ -150,6 +252,12 @@ void reducer_body_fsync_totals_snapshot(uint64_t *flush_count,
         *flush_count = atomic_load(&g_fsync_flush_count);
     if (flush_us_total)
         *flush_us_total = atomic_load(&g_fsync_flush_us_total);
+}
+
+void reducer_body_fsync_cadence_snapshot(uint64_t *deferred_total)
+{
+    if (deferred_total)
+        *deferred_total = atomic_load(&g_cadence_deferred_total);
 }
 
 void reducer_body_fsync_scope_snapshot(unsigned *depth,

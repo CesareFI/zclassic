@@ -5,14 +5,18 @@
  * SYMPTOM: the reducer drive's batched pre-commit durability flush
  *   (reducer_batched_durability_precommit, engine/reducer/services/src/reducer_body_fsync.c
  *   — fdatasyncs deferred block bodies + flushes the event_log ONCE per stage
- *   batch COMMIT, and can VETO the commit on failure) is timed at
+ *   batch COMMIT at steady tip / mint, and at a ROUND cadence during live
+ *   catch-up (R1: every ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL-th commit while the
+ *   catchup gate is open, plus every scope exit; veto semantics unchanged for
+ *   every flush that runs) is timed at
  *   the call site so a genuine IO stall inside it (ext4 jbd2 journal-commit
  *   wait, a slow/contended disk) is never invisible behind "the fold is
  *   slow" with no attributable cause. This Condition watches the EWMA of
  *   that flush's own wall-clock duration (alpha = 1/16, the same integer-EWMA
  *   shape as platform/modules/util/src/stage.c's step_us_ewma) against a GENEROUS
  *   env-tunable budget, so a real IO regression becomes a named fact instead
- *   of a mystery slow drain.
+ *   of a mystery slow drain. Only REAL flushes advance the counters/EWMA — a
+ *   catch-up commit whose flush is cadence-deferred never samples.
  * REMEDY: OBSERVATIONAL ONLY. There is no safe automated action against slow
  *   disk IO, and the veto-on-failed-flush durability contract is FROZEN —
  *   this Condition only times it, never changes it. The remedy names a

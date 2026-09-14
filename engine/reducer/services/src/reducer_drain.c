@@ -278,6 +278,10 @@ static _Atomic uint64_t g_drain_rounds_total;
 static _Atomic uint64_t g_drain_stage_us_total[REDUCER_DRAIN_NUM_STAGES];
 static _Atomic uint64_t g_drain_stage_calls[REDUCER_DRAIN_NUM_STAGES];
 static _Atomic uint64_t g_drain_stage_advances[REDUCER_DRAIN_NUM_STAGES];
+/* R2 quiescent-round consumer skip counters (see the block comment at
+ * reducer_drain_all_stages below); same single-writer/atomic contract. */
+static _Atomic uint64_t g_quiescent_skips[REDUCER_DRAIN_NUM_STAGES];
+static _Atomic uint64_t g_quiescent_skips_total;
 
 const char *reducer_drain_stage_name(int idx)
 {
@@ -300,7 +304,9 @@ void reducer_drain_exit_stats_snapshot(struct reducer_drain_exit_stats *out)
         out->stage_us_total[i] = atomic_load(&g_drain_stage_us_total[i]);
         out->stage_calls[i]    = atomic_load(&g_drain_stage_calls[i]);
         out->stage_advances[i] = atomic_load(&g_drain_stage_advances[i]);
+        out->stage_quiescent_skips[i] = atomic_load(&g_quiescent_skips[i]);
     }
+    out->quiescent_skips_total = atomic_load(&g_quiescent_skips_total);
 }
 
 #ifdef ZCL_TESTING
@@ -311,14 +317,71 @@ void reducer_drain_exit_stats_reset_for_testing(void)
     atomic_store(&g_drain_last_round_advances, 0);
     atomic_store(&g_drain_last_elapsed_us, 0);
     atomic_store(&g_drain_rounds_total, 0u);
+    atomic_store(&g_quiescent_skips_total, 0u);
     for (int i = 0; i < REDUCER_DRAIN_NUM_STAGES; i++) {
         atomic_store(&g_drain_last_stage_us[i], 0);
         atomic_store(&g_drain_stage_us_total[i], 0u);
         atomic_store(&g_drain_stage_calls[i], 0u);
         atomic_store(&g_drain_stage_advances[i], 0u);
+        atomic_store(&g_quiescent_skips[i], 0u);
     }
+    /* The quiescent memo (g_converged_vector/g_converged_valid, defined at
+     * reducer_drain_all_stages below) is plain single-writer state; clear it
+     * here too so no test group inherits another's converged vector. */
+    reducer_drain_quiescent_memo_reset_for_testing();
 }
 #endif
+
+/* ── R2: quiescent-round consumer skip ─────────────────────────────────────
+ * A drain round that finds no work pays one BEGIN IMMEDIATE + ROLLBACK pair
+ * per stage (stage_batch_begin/end) — eight empty write-lock transactions to
+ * discover convergence, ~57% of all opened batches on a 2026-09-14 cold-sync
+ * stopwatch (7524/13124, and batch_empty_total == one converged round per
+ * kick). The skip below removes that overhead for the six CONSUMER stages
+ * with zero semantic change, using the one signal that is complete by
+ * construction for them: the eight in-memory stage cursors. A consumer stage
+ * (everything except header_admit and body_fetch) creates durable work for
+ * itself ONLY when an upstream stage's cursor moves (its step's first gate is
+ * the durable upstream cursor/frontier read); the two PRODUCER stages take
+ * external input that no cursor movement witnesses (header_admit: the header
+ * inbox / fresh block_index entries; body_fetch: bodies arriving on disk), so
+ * they always re-probe.
+ *
+ * Memo: after any round whose total advance is zero, record the cursor
+ * vector. While a later round starts with that EXACT vector still intact AND
+ * nothing has advanced earlier in the round, each consumer's drain is skipped
+ * and counted. Any cursor write anywhere (a commit, a repair rewind, the
+ * ingest path's inline drains) changes the vector and re-arms a full probe;
+ * a producer advancing mid-round re-arms every downstream consumer for that
+ * round. Non-cursor exceptional work (reorg unwind/rewind detection, repair
+ * rows, rearm timers) can outlive the memo by at most one probe: a reorg
+ * arrives WITH new headers (header_admit is always probed, its advance
+ * invalidates the vector), and the staged-sync supervisor drains every stage
+ * unconditionally each tick whenever the synchronous drive is not active —
+ * the memo can delay such work by one tick, never starve it. Single-writer
+ * (every caller reaches reducer_drain_core under the chain activation mutex,
+ * or serially from a test); the skip counters are atomic for the dumpstate
+ * thread, matching the drain-exit telemetry contract above. */
+static uint64_t g_converged_vector[REDUCER_DRAIN_NUM_STAGES];
+static bool     g_converged_valid;
+
+#ifdef ZCL_TESTING
+/* Clear the quiescent memo so no test group inherits another's converged
+ * vector (single-writer state, no atomics — test isolation only). */
+void reducer_drain_quiescent_memo_reset_for_testing(void)
+{
+    memset(g_converged_vector, 0, sizeof(g_converged_vector));
+    g_converged_valid = false;
+}
+#endif
+
+/* Producer stages take input no stage cursor witnesses (header inbox, bodies
+ * landing on disk) and must always re-probe; consumers gate on the durable
+ * upstream cursor and are skippable under the quiescent memo. */
+static bool reducer_drain_stage_is_producer(int idx)
+{
+    return idx == 0 || idx == 2;  /* header_admit, body_fetch */
+}
 
 /* Drain the eight stage step bodies once, in pipeline order — the SAME
  * *_stage_drain functions the per-stage supervisor children tick
@@ -331,7 +394,27 @@ static int reducer_drain_all_stages(int max_steps_per_stage,
 {
     int total = 0;
     atomic_fetch_add(&g_drain_rounds_total, 1u);
+    /* R2: does this round start on the exact cursor vector the pipeline last
+     * converged on? Computed once, before any stage drains. */
+    bool quiescent = g_converged_valid;
+    if (quiescent) {
+        for (int i = 0; i < REDUCER_DRAIN_NUM_STAGES; i++) {
+            if (g_drain_stages[i].cursor() != g_converged_vector[i]) {
+                quiescent = false;
+                break;
+            }
+        }
+    }
+    bool advanced_this_round = false;
     for (int i = 0; i < REDUCER_DRAIN_NUM_STAGES; i++) {
+        if (quiescent && !advanced_this_round &&
+            !reducer_drain_stage_is_producer(i)) {
+            atomic_fetch_add(&g_quiescent_skips[i], 1u);
+            atomic_fetch_add(&g_quiescent_skips_total, 1u);
+            if (adv_per_stage)
+                adv_per_stage[i] = 0;
+            continue;
+        }
         int64_t started_us = GetTimeMicros();
         int a = g_drain_stages[i].drain(max_steps_per_stage);
         int64_t elapsed_us = GetTimeMicros() - started_us;
@@ -342,11 +425,21 @@ static int reducer_drain_all_stages(int max_steps_per_stage,
         atomic_fetch_add(&g_drain_stage_us_total[i],
                          elapsed_us > 0 ? (uint64_t)elapsed_us : 0u);
         atomic_fetch_add(&g_drain_stage_calls[i], 1u);
-        if (a > 0)
+        if (a > 0) {
             atomic_fetch_add(&g_drain_stage_advances[i], (uint64_t)a);
+            advanced_this_round = true;
+        }
         if (adv_per_stage)
             adv_per_stage[i] = a;
         total += a;
+    }
+    /* R2: (re)record the quiescent vector after a genuinely no-advance round.
+     * Productive rounds leave the stale vector in place — the round-start
+     * comparison above simply mismatches until the next convergence. */
+    if (total == 0) {
+        for (int i = 0; i < REDUCER_DRAIN_NUM_STAGES; i++)
+            g_converged_vector[i] = g_drain_stages[i].cursor();
+        g_converged_valid = true;
     }
     return total;
 }

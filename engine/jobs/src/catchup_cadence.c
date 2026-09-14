@@ -44,6 +44,10 @@ static int catchup_gap_threshold(void)
 static _Atomic int64_t g_test_log_head_override = -1;
 #endif
 
+/* Cached verdict of the last catchup_cadence_active() evaluation — see the
+ * store site for who consumes it and why it is lock-free. */
+static _Atomic bool g_active_cache = false;
+
 /* log_head — the same definition sync_rate_below_floor.c's sr_read_log_head()
  * uses: tip_finalize_stage_cursor() (lock-free), the terminal/durable
  * reducer cursor. -1 = unavailable. */
@@ -64,23 +68,38 @@ bool catchup_cadence_active(void)
      * this exact gap computation (see that file's header comment for the
      * LOCK-ORDER LAW compliance note) — zero new lock surface added here.
      * Never touches progress_store, coins_kv, or any reducer-drive lock. */
+    bool active;
     struct connman *cm = sync_monitor_connman();
-    if (!cm || connman_get_node_count(cm) == 0)
-        return false;
+    if (!cm || connman_get_node_count(cm) == 0) {
+        active = false;
+    } else {
+        int network_tip = connman_max_peer_height(cm);
+        int64_t log_head = cc_read_log_head();
+        int64_t gap = (network_tip > 0 && log_head >= 0)
+                          ? (int64_t)network_tip - log_head
+                          : -1;
+        active = gap >= (int64_t)catchup_gap_threshold();
+    }
+    /* Publish the verdict for the ONE caller that may not evaluate this gate
+     * itself: the batched pre-commit durability hook
+     * (engine/reducer/services/src/reducer_body_fsync.c) fires under
+     * progress_store_tx_lock, where evaluating the gate would newly nest the
+     * connman read under the reducer-drive lock. The hook instead reads the
+     * CACHED verdict (catchup_cadence_active_cached) — a plain atomic load,
+     * zero lock surface. Every existing caller of this function (supervisor
+     * tick, kick/drain entry) already re-evaluates at least once per catch-up
+     * scope, so the cache can never be stale by more than one scope; a closed
+     * gate restores the strict per-commit flush on the very next commit, and
+     * the fail-safe default (never evaluated -> false) is the strict regime. */
+    atomic_store_explicit(&g_active_cache, active, memory_order_release);
+    return active;
+}
 
-    int network_tip = connman_max_peer_height(cm);
-    if (network_tip <= 0)
-        return false;
-
-    int64_t log_head = cc_read_log_head();
-    if (log_head < 0)
-        return false;  /* unusable cursor sentinel */
-
-    int64_t gap = (int64_t)network_tip - log_head;
-    if (gap < 0)
-        return false;  /* at or ahead of the best-known peer height */
-
-    return gap >= (int64_t)catchup_gap_threshold();
+/* See the store site above: the lock-free cached verdict, refreshed by every
+ * catchup_cadence_active() call. Default false = strict per-commit regime. */
+bool catchup_cadence_active_cached(void)
+{
+    return atomic_load_explicit(&g_active_cache, memory_order_acquire);
 }
 
 /* One-time INFO so the operator can see the accelerated cadence is armed,
@@ -131,5 +150,10 @@ void catchup_cadence_test_set_log_head_override(int64_t v)
 void catchup_cadence_test_reset(void)
 {
     atomic_store(&g_test_log_head_override, -1);
+    /* Also drop the cached gate verdict: a test that drove the gate open via
+     * this override must not leak a stale "catch-up active" into the next
+     * group's precommit-flush cadence (engine/reducer/services/src/
+     * reducer_body_fsync.c reads the cache on every stage-batch COMMIT). */
+    atomic_store_explicit(&g_active_cache, false, memory_order_release);
 }
 #endif

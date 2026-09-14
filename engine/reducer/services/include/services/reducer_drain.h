@@ -101,6 +101,12 @@ struct reducer_drain_exit_stats {
     uint64_t stage_us_total[REDUCER_DRAIN_NUM_STAGES];
     uint64_t stage_calls[REDUCER_DRAIN_NUM_STAGES];
     uint64_t stage_advances[REDUCER_DRAIN_NUM_STAGES];
+    /* R2 quiescent-round consumer skips (reducer_drain.c "quiescent-round
+     * consumer skip"): times a consumer stage's drain was skipped because the
+     * round started on the exact converged cursor vector with no earlier
+     * advance. Monotonic since process start, same contract as above. */
+    uint64_t quiescent_skips_total;
+    uint64_t stage_quiescent_skips[REDUCER_DRAIN_NUM_STAGES];
 };
 void reducer_drain_exit_stats_snapshot(struct reducer_drain_exit_stats *out);
 
@@ -141,6 +147,8 @@ void reducer_publish_fully_applied_at_tip(
 #ifdef ZCL_TESTING
 /* Zero every drain-exit counter (test isolation only — process-global). */
 void reducer_drain_exit_stats_reset_for_testing(void);
+/* Clear the R2 quiescent memo (converged cursor vector) — test isolation. */
+void reducer_drain_quiescent_memo_reset_for_testing(void);
 #endif
 
 #endif /* ZCL_SERVICES_REDUCER_DRAIN_H */

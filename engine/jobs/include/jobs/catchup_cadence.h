@@ -97,6 +97,15 @@
  * is inert. */
 bool catchup_cadence_active(void);
 
+/* Lock-free cached verdict of the most recent catchup_cadence_active() call
+ * (every existing caller re-evaluates at least once per catch-up scope, so
+ * staleness is bounded by one scope). Exists for exactly one consumer: the
+ * batched pre-commit durability flush (engine/reducer/services/src/
+ * reducer_body_fsync.c) fires under progress_store_tx_lock and must NOT newly
+ * nest the connman read under that lock — it reads this plain atomic instead.
+ * Default false (never evaluated) = strict per-commit durability regime. */
+bool catchup_cadence_active_cached(void);
+
 /* Per-stage drain batch. Returns `normal_batch` UNCHANGED when inactive;
  * when active, returns ZCL_CATCHUP_DRAIN_BATCH (default 2000, clamped). */
 int catchup_cadence_drain_batch(int normal_batch);

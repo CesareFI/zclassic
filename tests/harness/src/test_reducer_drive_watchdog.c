@@ -19,19 +19,25 @@
 #include "conditions/batch_fsync_slow.h"
 #include "conditions/reducer_drive_watchdog.h"
 #include "framework/condition.h"
+#include "jobs/catchup_cadence.h"
 #include "json/json.h"
+#include "net/connman.h"
+#include "net/protocol.h"
 #include "platform/clock.h"
 #include "services/reducer_drain.h"
 #include "services/reducer_ingest_service.h"
 #include "services/sticky_escalator.h"
+#include "services/sync_monitor.h"
 #include "storage/coins_kv.h"
 #include "storage/progress_store.h"
 #include "util/blocker.h"
 #include "util/reducer_drive_guard.h"
+#include "util/sync.h"
 
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -105,6 +111,93 @@ static void rdw_cleanup(void)
     reducer_drive_watchdog_test_reset();
     sticky_escalator_test_reset();
     clock_reset_default();
+}
+
+/* (g) R1 catch-up round cadence: while the live catch-up gate is
+ * open (peers connected AND network-tip gap >= ZCL_CATCHUP_GAP_THRESHOLD
+ * — the same gate the catch-up drain-batch/tick overrides use), the
+ * batched pre-commit durability hook pays the body+event_log fdatasync
+ * once per ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL commits (default 8, i.e.
+ * about one per drain ROUND) instead of once per batch COMMIT. Every
+ * flush that DOES run keeps its exact veto verdict, and closing the gate
+ * (converged / at-tip) restores the strict per-commit regime on the very
+ * next commit. The connman/peer fixture mirrors test_catchup_cadence.c
+ * (real struct connman via sync_monitor_set_context; log_head driven by
+ * the catchup_cadence test override). GetTimeMicros() is unfrozen here
+ * (case f restored the real clock). Extracted from
+ * test_reducer_drive_watchdog so the harness body stays under its
+ * cyclomatic-complexity pin; returns this case's failure count. */
+static int rdw_test_r1_cadence(void)
+{
+    int failures = 0;
+    {
+        reducer_body_fsync_test_reset();
+
+        struct connman cm;
+        memset(&cm, 0, sizeof(cm));
+        zcl_mutex_init(&cm.manager.cs_nodes);
+        struct p2p_node peer;
+        memset(&peer, 0, sizeof(peer));
+        peer.id = 1;
+        peer.starting_height = 100000;
+        peer.state = PEER_ACTIVE;
+        peer.services = NODE_NETWORK;
+        struct p2p_node *peers[1] = { &peer };
+        cm.manager.nodes = peers;
+        cm.manager.num_nodes = 1;
+        sync_monitor_set_context(&cm, NULL, NULL);
+        catchup_cadence_test_set_log_head_override(0); /* gap = 100000 */
+        RDW_CHECK("R1 cadence: catch-up gate opens (peers + gap >= threshold)",
+                  catchup_cadence_active());
+
+        uint64_t fc0 = 0, ft0 = 0, fc1 = 0, ft1 = 0;
+        reducer_body_fsync_totals_snapshot(&fc0, &ft0);
+        bool all_true = true;
+        for (int i = 0; i < 8; i++)
+            all_true = all_true && reducer_body_fsync_test_trigger_precommit();
+        reducer_body_fsync_totals_snapshot(&fc1, &ft1);
+        RDW_CHECK("R1 cadence: no commit is vetoed while the gate is open",
+                  all_true);
+        RDW_CHECK("R1 cadence: eight catch-up commits pay at most two "
+                  "durability flushes (round cadence, default interval 8)",
+                  fc1 - fc0 <= 2);
+
+        /* Gate closes (gap shrinks under the threshold) -> the strict
+         * per-commit regime is restored on the very next commits. */
+        catchup_cadence_test_set_log_head_override(99600); /* gap 400 < 500 */
+        RDW_CHECK("R1 cadence: gate closes as the gap shrinks",
+                  !catchup_cadence_active());
+        fc0 = fc1;
+        all_true = true;
+        for (int i = 0; i < 2; i++)
+            all_true = all_true && reducer_body_fsync_test_trigger_precommit();
+        reducer_body_fsync_totals_snapshot(&fc1, &ft1);
+        RDW_CHECK("R1 cadence: strict per-commit regime restored at "
+                  "convergence (2 commits, 2 flushes)",
+                  all_true && fc1 - fc0 == 2);
+
+        /* The interval knob is honored (and clamped): 3 -> 6 commits pay
+         * exactly 2 flushes. */
+        catchup_cadence_test_set_log_head_override(0);
+        (void)catchup_cadence_active();
+        setenv("ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL", "3", 1);
+        reducer_body_fsync_test_reset();
+        reducer_body_fsync_totals_snapshot(&fc0, &ft0);
+        all_true = true;
+        for (int i = 0; i < 6; i++)
+            all_true = all_true && reducer_body_fsync_test_trigger_precommit();
+        reducer_body_fsync_totals_snapshot(&fc1, &ft1);
+        RDW_CHECK("R1 cadence: ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL=3 honored "
+                  "(6 commits, 2 flushes)",
+                  all_true && fc1 - fc0 == 2);
+        unsetenv("ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL");
+
+        catchup_cadence_test_reset();
+        sync_monitor_set_context(NULL, NULL, NULL);
+        (void)catchup_cadence_active();  /* re-refresh the gate: closed */
+        reducer_body_fsync_test_reset();
+    }
+    return failures;
 }
 
 int test_reducer_drive_watchdog(void);
@@ -446,6 +539,9 @@ int test_reducer_drive_watchdog(void)
         condition_engine_reset_for_testing();
         blocker_reset_for_testing();
     }
+
+    /* ---- (g) R1 catch-up round cadence — see rdw_test_r1_cadence above. ---- */
+    failures += rdw_test_r1_cadence();
 
     rdw_cleanup();
 

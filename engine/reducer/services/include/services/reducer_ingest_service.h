@@ -91,6 +91,15 @@ void reducer_body_fsync_timing_snapshot(int64_t *last_flush_us,
 void reducer_body_fsync_totals_snapshot(uint64_t *flush_count,
                                         uint64_t *flush_us_total);
 
+/* R1 round-cadence accounting: how many pre-commit hook invocations skipped
+ * the durability flush because the live catch-up gate was open and the commit
+ * count had not reached ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL (default 8). The
+ * flush totals above count only flushes that genuinely ran, so over any
+ * interval d(flush_count) + d(deferred_total) == the pre-commit hook
+ * invocations (committed batches) in that interval. Monotonic; difference two
+ * snapshots for an interval. Lock-free atomic read, no allocation. */
+void reducer_body_fsync_cadence_snapshot(uint64_t *deferred_total);
+
 /* Live batching-state snapshot. `depth` is the global nest count and
  * `event_log_deferred` proves the CURRENT singleton handle is actually armed
  * (not merely that an outer scope once entered before the handle existed).

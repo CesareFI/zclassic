@@ -204,6 +204,45 @@ static bool sd_no_stage_spin_blocker(void)
     return true;
 }
 
+/* R2 (quiescent-round batch skip): once the pipeline has converged, a further
+ * reducer_kick must discover "no work" WITHOUT re-opening one empty
+ * BEGIN IMMEDIATE/ROLLBACK write transaction per stage — eight per converged
+ * drain round, the measured ~57% `batch_empty_total` term (stage_batch.c's
+ * transaction accounting). Two kicks back-to-back: the first SETTLES any
+ * residue (and lets the drain record the quiescent cursor vector); the second
+ * must open at most the two PRODUCER stages' probe batches — header_admit and
+ * body_fetch have network/inbox inputs that can arrive without any
+ * stage-cursor movement, so they always re-probe; the six consumer stages are
+ * skipped while the exact cursor vector they converged on is unchanged. BASE
+ * behavior: all eight stages open an empty batch every converged round
+ * (opened delta 8). Extracted so the harness body stays under its
+ * cyclomatic-complexity pin; returns this check's failure count. */
+static int sd_quiescent_rekick_check(bool stages_ok, struct main_state *ms,
+                                     const struct chain_params *cp,
+                                     const char *netdir)
+{
+    int failures = 0;
+    if (!stages_ok || active_chain_height(&ms->chain_active) != 2)
+        return 0;
+    struct chain_activation_controller qctl;
+    activation_controller_init(&qctl, ms, NULL, cp, netdir);
+    (void)reducer_kick(&qctl);   /* settle + record the quiescent vector */
+    struct stage_batch_stats q0, q1;
+    stage_batch_stats_snapshot(&q0);
+    int qadv = reducer_kick(&qctl);
+    stage_batch_stats_snapshot(&q1);
+    SD_CHECK("quiescent re-kick advances nothing", qadv == 0);
+    SD_CHECK("quiescent re-kick opens at most the two producer batches "
+             "(no eight empty BEGIN/ROLLBACK pairs)",
+             q1.opened - q0.opened <= 2);
+    SD_CHECK("quiescent re-kick commits nothing",
+             q1.committed == q0.committed);
+    SD_CHECK("quiescent re-kick: empty rollbacks bounded by producers",
+             q1.empty - q0.empty <= 2);
+    activation_controller_destroy(&qctl);
+    return failures;
+}
+
 int test_reducer_step_drain_harness(void);
 int test_reducer_step_drain_harness(void)
 {
@@ -625,6 +664,10 @@ int test_reducer_step_drain_harness(void)
                  "(stages=[)",
                  strstr(last_line, "stages=[") != NULL);
     }
+
+    /* ── R2 (quiescent-round batch skip) — see sd_quiescent_rekick_check
+     * above. ──────────────────────────────────────────────────────────── */
+    failures += sd_quiescent_rekick_check(stages_ok, &ms, cp, netdir);
 
     /* ── teardown ──────────────────────────────────────────────────────── */
     tip_finalize_stage_shutdown();

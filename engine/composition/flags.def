@@ -178,7 +178,7 @@ Z23_FLAG("ZCL_ASAN_ADX_MAKEFILE", "env_build", "Makefile", "-",
 Z23_FLAG("ZCL_BASELINE_LINT_GATES", "env_build", "-", "-",
           "undocumented; first use tools/dev/agent-baseline.sh:90")
 Z23_FLAG("ZCL_BATCH_FSYNC_SLOW_EWMA_US", "env_runtime", "-", "-",
-          "undocumented; first use engine/conditions/src/batch_fsync_slow.c:68")
+          "undocumented; first use engine/conditions/src/batch_fsync_slow.c:72")
 Z23_FLAG("ZCL_BENCH_BUDGET_MS", "env_runtime", "-", "-",
           "undocumented; first use engine/entry/main_cli_modes.c:627")
 Z23_FLAG("ZCL_BENCH_COMMIT", "env_runtime", "-", "-",
@@ -267,6 +267,8 @@ Z23_FLAG("ZCL_BYTE_ORDER_SCAN_ROOTS", "env_build", "-", "-",
           "undocumented; first use tools/lint/lintc/gate_byte_order_codec_single_report.c:328")
 Z23_FLAG("ZCL_C23_MAX_GLIBC", "env_build", "GLIBC_2.38", "-",
           "undocumented; first use tools/scripts/check_c23_node_binary.sh:139")
+Z23_FLAG("ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL", "env_runtime", "8", "-",
+          "undocumented; first use engine/reducer/services/src/reducer_body_fsync.c:152")
 Z23_FLAG("ZCL_C3_ARTIFACT_ROOT", "env_build", "-", "-",
           "undocumented; first use tools/scripts/cold_start_to_tip_probe.sh:87")
 Z23_FLAG("ZCL_C3_BLOCK_INDEX", "env_build", "-", "-",
@@ -778,7 +780,7 @@ Z23_FLAG("ZCL_DRIFT_ROTATE_BYTES", "env_build", "52428800", "-",
 Z23_FLAG("ZCL_DRIFT_UNIT", "env_build", "zclassic23", "-",
           "undocumented; first use tools/scripts/build_drift_probe.sh:74")
 Z23_FLAG("ZCL_DRIVE_WATCHDOG_SEC", "env_runtime", "-", "-",
-          "undocumented; first use engine/reducer/conditions/src/reducer_drive_watchdog.c:86")
+          "undocumented; first use engine/reducer/conditions/src/reducer_drive_watchdog.c:87")
 Z23_FLAG("ZCL_DRY_RUN", "env_runtime", "-", "-",
           "undocumented; first use engine/services/src/recovery_policy.c:108")
 Z23_FLAG("ZCL_DUMPER_BLOCKING_BASELINE", "env_build", "-", "-",
