@@ -24,6 +24,7 @@
 #include "models/block.h"
 #include "primitives/block.h"
 #include "storage/disk_block_io.h"
+#include "storage/node_db_runtime.h"
 #include "util/log_macros.h"
 #include "util/safe_alloc.h"
 #include "validation/main_state.h"
@@ -249,11 +250,26 @@ void block_header_to_json(const struct block_index *bi,
     json_push_kv_int(result, "height", bi->nHeight);
     json_push_kv_int(result, "version", bi->nVersion);
 
-    uint256_get_hex(&bi->hashMerkleRoot, hex);
+    /* Slim flat-cache entries carry no merkle root or nonce (zero-filled on
+     * load). Hydrate from the durable header authority — the same port the
+     * P2P header-serve path uses — so the RPC never renders zeros for a
+     * block the node can prove. The port hash-binds its bytes to phashBlock;
+     * when no authority answers, fall back to the index values as before. */
+    struct uint256 merkle_root = bi->hashMerkleRoot;
+    struct uint256 nonce = bi->nNonce;
+    if (uint256_is_null(&merkle_root)) {
+        struct block_header hdr;
+        if (node_db_runtime_load_header_by_hash_height(
+                bi->nHeight, bi->phashBlock->data, &hdr)) {
+            merkle_root = hdr.hashMerkleRoot;
+            nonce = hdr.nNonce;
+        }
+    }
+    uint256_get_hex(&merkle_root, hex);
     json_push_kv_str(result, "merkleroot", hex);
 
     json_push_kv_int(result, "time", (int64_t)bi->nTime);
-    uint256_get_hex(&bi->nNonce, hex);
+    uint256_get_hex(&nonce, hex);
     json_push_kv_str(result, "nonce", hex);
 
     char bits_hex[9];

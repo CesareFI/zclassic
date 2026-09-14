@@ -29,6 +29,7 @@
 #include "rpc/server.h"
 #include "storage/coins_kv.h"
 #include "storage/disk_block_io.h"
+#include "storage/node_db_runtime.h"
 #include "storage/progress_store.h"
 #include "support/cleanse.h"
 #include "util/safe_alloc.h"
@@ -126,6 +127,57 @@ static struct block_index *rpc_safety_insert_block(struct main_state *ms,
     bi->pprev = prev;
     return bi;
 }
+
+/* A real serialized header is the durable authority's storage form: the
+ * stub port below serves exactly these bytes (as node.db would), and the
+ * test's expectations are independently deserialized from the same bytes —
+ * never hardcoded hex literals. */
+static uint8_t rpc_safety_hdr_bytes[256];
+static size_t rpc_safety_hdr_len;
+static bool rpc_safety_hdr_seeded;
+
+static void rpc_safety_seed_known_header(void)
+{
+    if (rpc_safety_hdr_seeded)
+        return;
+    struct block_header hdr;
+    block_header_init(&hdr);
+    for (size_t i = 0; i < 32; i++) {
+        hdr.hashMerkleRoot.data[i] = (uint8_t)(0xa1 + i);
+        hdr.nNonce.data[i] = (uint8_t)(0x41 + i);
+    }
+    hdr.nTime = 1500000000;
+    hdr.nBits = 0x1c7397b0;
+    struct byte_stream w;
+    stream_init(&w, sizeof(rpc_safety_hdr_bytes));
+    if (block_header_serialize(&hdr, &w) &&
+        w.size <= sizeof(rpc_safety_hdr_bytes)) {
+        memcpy(rpc_safety_hdr_bytes, w.data, w.size);
+        rpc_safety_hdr_len = w.size;
+    }
+    stream_free(&w);
+    rpc_safety_hdr_seeded = true;
+}
+
+static bool rpc_safety_stub_load_header(int height, const uint8_t hash[32],
+                                        struct block_header *out)
+{
+    (void)height;
+    (void)hash;
+    if (!out)
+        return false;
+    rpc_safety_seed_known_header();
+    if (rpc_safety_hdr_len == 0)
+        return false;
+    struct byte_stream r;
+    stream_init_from_data(&r, rpc_safety_hdr_bytes, rpc_safety_hdr_len);
+    block_header_init(out);
+    return block_header_deserialize(out, &r);
+}
+
+static const struct node_db_runtime_port rpc_safety_header_port = {
+    .load_header_by_hash_height = rpc_safety_stub_load_header,
+};
 
 static bool rpc_safety_build_chain(struct main_state *ms,
                                    struct block_index **out,
@@ -895,6 +947,49 @@ int test_rpc_safety(void)
         ok = ok && header_height && json_get_int(header_height) == 1;
         json_free(&result);
         json_free(&params);
+
+        /* Slim-flat condition: fixture index entries carry zero merkle/nonce
+         * (like a warm boot from the flat cache); with a durable header
+         * authority registered, getblockheader must hydrate both fields
+         * through the runtime port instead of rendering zeros. Expectations
+         * are deserialized from the same serialized header bytes the stub
+         * authority serves — no hardcoded hex. The same call also pins the
+         * era-bits difficulty against legacy zclassicd's rendered value. */
+        rpc_safety_seed_known_header();
+        struct block_header want_hdr;
+        block_header_init(&want_hdr);
+        struct byte_stream hr;
+        stream_init_from_data(&hr, rpc_safety_hdr_bytes, rpc_safety_hdr_len);
+        ok = ok && block_header_deserialize(&want_hdr, &hr);
+        char want_merkle[65];
+        char want_nonce[65];
+        uint256_get_hex(&want_hdr.hashMerkleRoot, want_merkle);
+        uint256_get_hex(&want_hdr.nNonce, want_nonce);
+        if (blocks[1])
+            blocks[1]->nBits = 0x1c7397b0;
+        node_db_runtime_port_set(&rpc_safety_header_port);
+        init_single_str_param(&params, hstar_hex);
+        json_init(&result);
+        ok = ok && rpc_table_execute(&tbl, "getblockheader", &params,
+                                     &result);
+        const struct json_value *got_merkle = json_get(&result, "merkleroot");
+        const struct json_value *got_nonce = json_get(&result, "nonce");
+        const struct json_value *got_diff = json_get(&result, "difficulty");
+        ok = ok && got_merkle && got_merkle->type == JSON_STR &&
+             strcmp(json_get_str(got_merkle), want_merkle) == 0;
+        ok = ok && got_nonce && got_nonce->type == JSON_STR &&
+             strcmp(json_get_str(got_nonce), want_nonce) == 0;
+        /* legacy zclassicd renders 1161125.834138388 for bits 0x1c7397b0
+         * (oracle h=500000); allow 1e-9 relative for double formatting. */
+        const double want_diff = 1161125.834138388;
+        double diff_got = got_diff ? json_get_real(got_diff) : 0.0;
+        double diff_rel = (diff_got - want_diff) / want_diff;
+        if (diff_rel < 0) diff_rel = -diff_rel;
+        ok = ok && got_diff && got_diff->type == JSON_REAL &&
+             diff_rel < 1e-9;
+        json_free(&result);
+        json_free(&params);
+        node_db_runtime_port_set(NULL);
 
         init_single_str_param(&params, active_hex);
         json_init(&result);
