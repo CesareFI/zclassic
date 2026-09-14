@@ -594,3 +594,17 @@ int64_t platform_positioned_file_read(
 }
 
 #endif
+
+intptr_t platform_positioned_file_native_fd(
+    const struct platform_positioned_file *file)
+{
+    /* A read-only VIEW of the pinned descriptor, so a caller can prove or
+     * execute the exact inode this handle already identity-bound (fcntl
+     * code-directory queries, fexecve). Ownership stays with the handle:
+     * closing the returned descriptor double-closes once _close runs, so
+     * callers must treat it as borrowed. -1 means "not open". */
+    if (!file || file->native == (uintptr_t)-1 ||
+        file->native == UINTPTR_MAX)
+        return -1;
+    return (intptr_t)file->native;
+}

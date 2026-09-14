@@ -3320,11 +3320,19 @@ static bool zpd_custom_ledger_continuation(
 static bool zpd_custom_ledger_cases(
     const struct json_value *accept_input, const char *datadir, const char *job)
 {
+    /* Both custom dirs are FIXED-LENGTH absolute /tmp paths, like the
+     * work-start workspace above: the fits/refuse expectations sit on
+     * opposite sides of the continuation's 512-byte capacity, and any
+     * checkout-relative dir made the shorter side's budget depend on the
+     * checkout depth — which is unbounded in a land-loop proof generation
+     * (its worktree root carries the 81-char commit-pair tag). A short
+     * custom dir (~20 bytes) and a long one (~200 bytes) pin both sides
+     * from every depth. */
     char short_dir[256], long_dir[256];
-    (void)snprintf(short_dir, sizeof(short_dir), "test-tmp/zpd-custom-%ld",
+    (void)snprintf(short_dir, sizeof(short_dir), "/tmp/zpd-custom-short-%ld",
                    (long)getpid());
     (void)snprintf(long_dir, sizeof(long_dir),
-        "test-tmp/zpd-custom-ledger-must-remain-explicit-and-must-never-silently-resolve-to-task-default-when-complete-continuation-exceeds-the-fixed-bound-preserving-exact-work-job-source-and-custody-owner-%ld",
+        "/tmp/zpd-custom-ledger-must-remain-explicit-and-must-never-silently-resolve-to-task-default-when-complete-continuation-exceeds-the-fixed-bound-preserving-exact-work-job-source-and-custody-owner-%ld",
         (long)getpid());
     return zpd_custom_ledger_continuation(accept_input, datadir, short_dir, job, true) &&
         zpd_custom_ledger_continuation(accept_input, datadir, long_dir, job, false);
@@ -3334,9 +3342,35 @@ static __attribute__((unused)) int zpd_test_work_start(void)
 {
     int failures = 0;
     TEST("zcode work start: goal and profile compose existing task owners") {
-        char root[256];
-        (void)snprintf(root, sizeof(root),
-                       "test-tmp/zcode-work-start-independent-qualification-with-proof-roots-and-confirmation-continuation-source-and-artifact-identities-remain-visible-after-worker-acceptance-with-a-long-valid-workspace-with-complete-proof-fields-%ld", (long)getpid());
+        char root[512];
+        /* The workspace path is a FIXED-LENGTH absolute /tmp path, not a
+         * path under the checkout. The continuation's 512-byte compaction
+         * boundary is tuned against this workspace's length, so a relative
+         * root made the whole family checkout-depth-dependent: the same
+         * tree passed from a ~45-char checkout and failed deterministically
+         * from shallower ones (compact=509, explicit datadir retained) —
+         * and no relative padding could fix it, because the custom-ledger
+         * cases share these fields and sit on the OTHER side of the same
+         * bound. A constant-length workspace (277 bytes, like this test
+         * family's own /tmp/zclassic23-zcode-workspaces roots) pins every
+         * boundary from any checkout depth. */
+        /* 274 bytes total ("/tmp/" + 130 + "/" + 130 + "-" + pid), split
+         * across two components so no filename part approaches NAME_MAX.
+         * Measured anchors: explicit continuation = workspace + 243 (must
+         * reach 512 to trigger default-datadir omission), compact =
+         * workspace + 121 (must stay under 512 once omitted), custom
+         * continuation = workspace + custom + 134 — 274 sits inside every
+         * margin from any checkout depth. */
+        char ws_a[131], ws_b[131];
+        memset(ws_a, 'w', sizeof(ws_a) - 1); ws_a[sizeof(ws_a) - 1] = '\0';
+        memset(ws_b, 'w', sizeof(ws_b) - 1); ws_b[sizeof(ws_b) - 1] = '\0';
+        (void)snprintf(root, sizeof(root), "/tmp/%s/%s-%ld", ws_a, ws_b,
+                       (long)getpid());
+        {   /* directory_create is one level; zpd_fixture must create root itself */
+            char parent[300];
+            (void)snprintf(parent, sizeof(parent), "/tmp/%s", ws_a);
+            ASSERT(platform_directory_ensure(parent, 0700));
+        }
         ASSERT(zpd_fixture(root, false));
         char absolute_root[4400];
         ASSERT(platform_directory_canonical_real(

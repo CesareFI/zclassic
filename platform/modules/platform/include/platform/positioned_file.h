@@ -100,4 +100,11 @@ int64_t platform_positioned_file_read(
     const struct platform_positioned_file *file, void *data, size_t size,
     uint64_t offset);
 
+/* A BORROWED view of the pinned descriptor (POSIX: the open fd; Windows:
+ * the file HANDLE cast to intptr_t), for callers that must fcntl/fexecve
+ * the exact inode this handle already identity-bound. Never close it: the
+ * handle owns it. -1 means "not open". */
+intptr_t platform_positioned_file_native_fd(
+    const struct platform_positioned_file *file);
+
 #endif

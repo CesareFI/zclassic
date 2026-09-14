@@ -113,6 +113,8 @@ ZCL_MODULE_CAPABILITY("platform/modules/platform/src/safe_root_read.c", CAP_DYNL
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/state_root.c", CAP_FS_READ|CAP_PRIVILEGE, "Validates the Windows identity and ACL of the selected state root.")
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/temp_directory.c", CAP_FS_READ, "")
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/toolchain.c", CAP_NONE, "")
+ZCL_MODULE_CAPABILITY("platform/modules/platform/src/resident_launch.c", CAP_NONE, "refuses by name: no descriptor-bound execution primitive exists on Windows, and a pathname exec would be a TOCTOU hole rather than an exact launch")
+ZCL_MODULE_CAPABILITY("platform/modules/platform/src/resident_launch_mac.c", CAP_NONE, "")
 ZCL_MODULE_CAPABILITY("platform/modules/platform/src/watcher_lease.c", CAP_CLOCK|CAP_FS_READ|CAP_FS_WRITE|CAP_PRIVILEGE|CAP_PROCESS, "Supervises the Windows watcher process with job, handle, and deadline controls.")
 ZCL_MODULE_CAPABILITY("contexts/explorer/modules/presentation/src/presentation.c", CAP_CLOCK|CAP_DYNLOAD, "Resolves the selected native presentation backend and grades frame timing.")
 ZCL_MODULE_CAPABILITY("engine/modules/rpc/src/async_rpc_queue.c", CAP_CLOCK, "")

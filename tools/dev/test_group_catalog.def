@@ -1316,6 +1316,13 @@ ZCL_TEST_GROUP(replay_receipt_root)
 ZCL_TEST_GROUP(directory_watcher)
 ZCL_TEST_GROUP(watcher_record)
 ZCL_TEST_GROUP(watcher_lease)
+/* Exact resident-launch seam: the launcher half of the app-run path. Proves
+ * acceptance-record refusal before any process exists, the mapped-image
+ * receipt (Linux fexecve/proc triple, macOS suspended CodeDirectory), the
+ * nonce-authenticated IPC frame codec with stale-launch rejection, and a
+ * launch/cancel cycle that leaves neither descriptors nor children behind.
+ * Windows asserts the named platform refusal. */
+ZCL_TEST_GROUP(resident_launch)
 /* astro lane: platform/modules/astro's exact fixed-grid arithmetic and the birth chart
  * built on it. The determinism cases are the point — a chart another node
  * recomputes must match bit for bit, so the group asserts that property by
