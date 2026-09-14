@@ -271,7 +271,11 @@ dir_bytes() {
 }
 
 free_bytes() {
-    df -PB1 -- "$GC_HOME" 2>/dev/null | awk 'NR==2{print $4}'
+    # -Pk, not GNU's -B1: macOS df has no -B, its usage error (exit 64) under
+    # set -e + pipefail killed the whole sweep from the driver's unguarded
+    # FREE_AT_START call before the first category ever ran. POSIX -Pk gives
+    # 1 KiB blocks on every host; scale back to bytes here.
+    df -Pk -- "$GC_HOME" 2>/dev/null | awk 'NR==2{print $4 * 1024}'
 }
 
 now_epoch() { date +%s; }
@@ -308,12 +312,26 @@ log_line() {
 }
 
 # Per-category running totals, reported at the end and used by the caller to
-# answer "bytes per category" without re-reading the log.
-declare -A CAT_BYTES CAT_COUNT
+# answer "bytes per category" without re-reading the log. NOT an associative
+# array: macOS still ships bash 3.2, which rejects `declare -A`, and this
+# script must run under the stock shell of every host it sweeps. One
+# "category bytes count" row per call, aggregated by cat_totals() below.
+CAT_RESULTS=""
 add_result() {
     local cat="$1" bytes="${2:-0}" n="${3:-1}"
-    CAT_BYTES[$cat]=$(( ${CAT_BYTES[$cat]:-0} + bytes ))
-    CAT_COUNT[$cat]=$(( ${CAT_COUNT[$cat]:-0} + n ))
+    CAT_RESULTS="$CAT_RESULTS$cat $bytes $n
+"
+}
+
+# The summary's per-category table: one "category count bytes" row per known
+# category in the fixed display order, aggregated from CAT_RESULTS. awk (not
+# bash arrays) does the summing so the arithmetic itself is not a bash-4
+# feature either.
+cat_totals() {
+    printf '%s' "$CAT_RESULTS" | awk '
+        BEGIN { n = split("ccache zcc z23p tmp tmplitter journal binbak testtmp orphan deadexec worktree units scratch quarantine", o, " ") }
+        { b[$1] += $2; c[$1] += $3 }
+        END { for (i = 1; i <= n; i++) printf "%s %d %d\n", o[i], c[o[i]] + 0, b[o[i]] + 0 }'
 }
 
 say() { printf '%s\n' "$*"; }
@@ -539,7 +557,15 @@ sweep_zcc() {
         # swallowed by this script's own signal handling.
         local budget="${ZCL_HOST_GC_ZCC_BUDGET_S:-900}"
         local trim_out held_mb freed_mb rc=0
-        trim_out="$(timeout --foreground "$budget" "$bin" --zcc-trim "$cap_mb" 2>&1)" || rc=$?
+        # `timeout` is GNU coreutils; a stock macOS box has none, and "trim
+        # FAILED (timeout: command not found)" would report a trim that never
+        # ran. Without a timeout binary the trim runs unbudgeted instead —
+        # the budget is a guard against slow disks, not a precondition.
+        if command -v timeout >/dev/null 2>&1; then
+            trim_out="$(timeout --foreground "$budget" "$bin" --zcc-trim "$cap_mb" 2>&1)" || rc=$?
+        else
+            trim_out="$("$bin" --zcc-trim "$cap_mb" 2>&1)" || rc=$?
+        fi
         if [ "$rc" -eq 124 ]; then
             say "zcc: trim gave up after ${budget}s (cache left untouched; raise ZCL_HOST_GC_ZCC_BUDGET_S on a box whose walk is slower) — ${budget}s of the unit's TimeoutStartSec were spent"
             log_line "zcc-trim-timeout" "$dir" 0 "bin=$bin cap=${cap_mb}MB budget=${budget}s"
@@ -667,7 +693,7 @@ z23p_sweep_pool() {
             # --force is safe ONLY because detached+clean was just proven by
             # git above; it is here to defeat the read-only test scratch that
             # makes a provably dead worktree undeletable.
-            chmod -R u+w -- "$wt" 2>/dev/null || true
+            chmod -R u+w "$wt" 2>/dev/null || true
             if git -C "$GC_REPO" worktree remove --force -- "$wt" 2>/dev/null; then
                 removed=$(( removed + 1 ))
                 add_result z23p "$bytes" 1
@@ -775,7 +801,7 @@ sweep_tmp() {
         refuse_if_protected "$wt" || continue
         bytes="$(dir_bytes "$wt")"
         if [ "$APPLY" = 1 ]; then
-            chmod -R u+w -- "$wt" 2>/dev/null || true
+            chmod -R u+w "$wt" 2>/dev/null || true
             if git -C "$GC_REPO" worktree remove --force -- "$wt" 2>/dev/null; then
                 removed=$(( removed + 1 )); add_result tmp "$bytes" 1
                 log_line "tmp-remove" "$wt" "$bytes" "detached+clean"
@@ -837,7 +863,7 @@ sweep_tmplitter() {
         refuse_if_protected "$entry" || continue
         bytes="$(dir_bytes "$entry")"
         if [ "$APPLY" = 1 ]; then
-            chmod -R u+w -- "$entry" 2>/dev/null || true
+            chmod -R u+w "$entry" 2>/dev/null || true
             if rm -rf -- "$entry" 2>/dev/null; then
                 removed=$(( removed + 1 )); add_result tmplitter "$bytes" 1
                 log_line "tmplitter-remove" "$entry" "$bytes" "unregistered fixture"
@@ -941,9 +967,20 @@ sweep_units() {
 # candidate regardless of its own patch-equivalence — sorted by mtime, not
 # by name, because train names are not lexically ordered by recency.
 newest_train_dir() {
-    local root="$1"
-    find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
-        | sort -rn | head -1 | cut -d' ' -f2-
+    local root="$1" d age newest="" newest_age=""
+    # Portable mtime pick. GNU find's -printf does not exist on macOS, and an
+    # empty answer here would leave the NEWEST train unprotected — the one
+    # running pipeline stage this sweep must never touch — so age_secs, which
+    # already speaks Darwin stat, ranks the candidates instead: smallest age
+    # is the most recently modified directory.
+    for d in "$root"/*; do
+        [ -d "$d" ] || continue
+        age="$(age_secs "$d")"
+        if [ -z "$newest_age" ] || [ "$age" -lt "$newest_age" ]; then
+            newest="$d"; newest_age="$age"
+        fi
+    done
+    printf '%s' "$newest"
 }
 
 sweep_trains_landed() {
@@ -1126,7 +1163,7 @@ sweep_testtmp() {
             bytes="$(dir_bytes "$d")"
             if [ "$APPLY" = 1 ]; then
                 refuse_if_protected "$d" || continue
-                chmod -R u+w -- "$d" 2>/dev/null || true
+                chmod -R u+w "$d" 2>/dev/null || true
                 rm -rf -- "$d" 2>/dev/null || { log_line "testtmp-failed" "$d" 0 "rm refused"; continue; }
             fi
             log_line "testtmp-remove" "$d" "$bytes" "stale scratch"
@@ -1478,11 +1515,11 @@ sweep_zcc
 
 hdr "summary"
 TOTAL=0
-for cat in ccache zcc z23p tmp tmplitter journal binbak testtmp orphan deadexec worktree units scratch quarantine; do
-    b="${CAT_BYTES[$cat]:-0}"; c="${CAT_COUNT[$cat]:-0}"
+while read -r cat c b; do
+    [ -n "$cat" ] || continue
     TOTAL=$(( TOTAL + b ))
     printf '  %-10s %6s item(s)  %10s\n' "$cat" "$c" "$(human "$b")"
-done
+done <<< "$(cat_totals)"
 printf '  %-10s %6s           %10s\n' "TOTAL" "" "$(human "$TOTAL")"
 FREE_AT_END="$(free_bytes)"
 say ""

@@ -12,7 +12,11 @@ set -euo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOSTGC="$SELF_DIR/host_gc.sh"
 mkdir -p -- "${TMPDIR:-./test-tmp}"
-WORK="$(cd "${TMPDIR:-./test-tmp}" && pwd)/host_gc_selftest.$$"
+# pwd -P, not pwd: on macOS TMPDIR usually sits behind a symlink (/tmp ->
+# /private/tmp, /var -> /private/var), and git registers worktree paths
+# physically — a logical WORK path makes every `case "$wt" in "$pool"/*`
+# filter in host_gc.sh see zero worktrees on a Mac and pass on a Linux box.
+WORK="$(cd "${TMPDIR:-./test-tmp}" && pwd -P)/host_gc_selftest.$$"
 mkdir -p -- "$WORK"
 FAIL=0
 
@@ -56,7 +60,7 @@ printf '"classes":[{"class":"z23p","bytes_reclaimed":7},'
 printf '{"class":"z23p-ram","bytes_reclaimed":40953}],'
 printf '"totals":{"registered":2,"bytes_reclaimed":40960},"refusals":[]}}\n'
 STUBEOF
-chmod +x -- "$Z23_STUB"
+chmod +x "$Z23_STUB"
 : > "$Z23_STUB_CALLS"
 
 # A real git repo stands in for GC_REPO so `git cherry`, `worktree add` and
@@ -117,7 +121,10 @@ assert_not_contains() {
 [ -x "$HOSTGC" ] || { echo "host_gc_selftest: $HOSTGC is not executable" >&2; exit 2; }
 
 # ---------------------------------------------------------------- tmplitter
-touch_old() { touch -d '3 days ago' -- "$1"; }
+# A fixed 2000-01-01 stamp, not `touch -d '3 days ago'`: GNU touch's -d does
+# not exist on macOS, and every age floor this selftest exercises is set to 0
+# by run_hostgc, so any old timestamp satisfies each check portably.
+touch_old() { touch -t 200001010000 -- "$1"; }
 mkdir -p -- "$TMP_FX/orphan-fixture"
 touch_old "$TMP_FX/orphan-fixture"
 mkdir -p -- "$TMP_FX/claude-keepme"   # matches the standing exemption prefix
@@ -177,7 +184,7 @@ assert_contains "$out" "$RAM_FX" "z23p apply names the tmpfs pool it swept"
 assert_contains "$new_log" "z23p-ram" "z23p apply logs one z23p-ram row"
 assert_contains "$new_log" "40960" \
     "the z23p-ram row carries bytes_reclaimed straight from the report's totals"
-calls="$(wc -l < "$Z23_STUB_CALLS")"
+calls="$(wc -l < "$Z23_STUB_CALLS" | tr -d '[:space:]')"
 [ "$calls" = 1 ] || fail "z23p apply invoked the native sweep $calls time(s), expected exactly 1"
 
 # No binary anywhere: the sweep must still LOOK at the tmpfs pool, using
@@ -214,14 +221,14 @@ printf 'x' >> "$ZCC_STUB_COUNT_FILE"
 cap="${2:-0}"
 echo "zcc: 42 MB held, ${cap} MB ceiling, 7 MB freed"
 STUBEOF
-chmod +x -- "$ZCC_STUB_OK"
+chmod +x "$ZCC_STUB_OK"
 
 ZCC_STUB_GARBAGE="$WORK/zcc-stub-garbage"
 cat > "$ZCC_STUB_GARBAGE" <<'STUBEOF'
 #!/usr/bin/env bash
 echo "not a trim report"
 STUBEOF
-chmod +x -- "$ZCC_STUB_GARBAGE"
+chmod +x "$ZCC_STUB_GARBAGE"
 
 DU_SHADOW_DIR="$WORK/du-shadow"
 mkdir -p -- "$DU_SHADOW_DIR"
@@ -232,17 +239,50 @@ cat > "$DU_SHADOW_DIR/du" <<DUEOF
 printf 'du-called %s\n' "\$*" >> "$DU_CALL_LOG"
 printf '0\t%s\n' "\${*: -1}"
 DUEOF
-chmod +x -- "$DU_SHADOW_DIR/du"
+chmod +x "$DU_SHADOW_DIR/du"
+
+# A stand-in for GNU `timeout` on a box that ships none (stock macOS has no
+# coreutils). Its directory is APPENDED to PATH below, so a real GNU timeout
+# always wins where one exists and this stub only serves boxes that would
+# otherwise have no budget mechanism to assert against at all. It implements
+# exactly the form host_gc.sh uses — timeout --foreground SECS CMD... —
+# exiting 124 when the budget expires and the child's own status otherwise,
+# the two outcomes the assertions distinguish.
+TIMEOUT_STUB_DIR="$WORK/timeout-stub"
+mkdir -p -- "$TIMEOUT_STUB_DIR"
+cat > "$TIMEOUT_STUB_DIR/timeout" <<'TIMEOUTEOF'
+#!/usr/bin/env bash
+# Poll, do not orphan a watcher: a `( sleep N && kill ) &` watcher holds this
+# stub's captured stdout pipe open after its subshell dies, and the caller's
+# command substitution then blocks for the whole budget.
+secs="$2"
+shift 2
+"$@" &
+child=$!
+t=0
+while kill -0 "$child" 2>/dev/null; do
+    if [ "$t" -ge "$secs" ]; then
+        kill -TERM "$child" 2>/dev/null
+        wait "$child" 2>/dev/null
+        exit 124
+    fi
+    sleep 1
+    t=$(( t + 1 ))
+done
+wait "$child"
+exit $?
+TIMEOUTEOF
+chmod +x "$TIMEOUT_STUB_DIR/timeout"
 
 ZCC_STUB_COUNT="$WORK/zcc-stub-count"
 : > "$ZCC_STUB_COUNT"
 out="$(ZCL_HOST_GC_ZCC_BIN="$ZCC_STUB_OK" ZCC_STUB_COUNT_FILE="$ZCC_STUB_COUNT" \
-    PATH="$DU_SHADOW_DIR:$PATH" run_hostgc zcc apply)"
+    PATH="$DU_SHADOW_DIR:$PATH:$TIMEOUT_STUB_DIR" run_hostgc zcc apply)"
 log="$(cat -- "$STATE_FX/host_gc.log" 2>/dev/null || true)"
 assert_contains "$out" "reclaimed 7" \
     "zcc apply reports the freed amount straight from the evictor's report line"
 assert_contains "$log" "zcc-trim" "zcc apply logs a zcc-trim row"
-calls="$(wc -c < "$ZCC_STUB_COUNT")"
+calls="$(wc -c < "$ZCC_STUB_COUNT" | tr -d '[:space:]')"
 [ "$calls" = 1 ] || fail "zcc apply invoked the evictor $calls time(s), expected exactly 1"
 if [ -s "$DU_CALL_LOG" ]; then
     fail "zcc apply called du, which the one-walk invariant forbids: $(cat -- "$DU_CALL_LOG")"
@@ -258,11 +298,11 @@ fi
 : > "$ZCC_STUB_COUNT"
 out="$(ZCL_HOST_GC_ZCC_BIN="$ZCC_STUB_OK" ZCC_STUB_COUNT_FILE="$ZCC_STUB_COUNT" \
     ZCL_HOST_GC_CACHE_FREEZE_GB=1000000 \
-    PATH="$DU_SHADOW_DIR:$PATH" run_hostgc zcc apply)"
+    PATH="$DU_SHADOW_DIR:$PATH:$TIMEOUT_STUB_DIR" run_hostgc zcc apply)"
 assert_contains "$out" "FREEZE active" "zcc apply under a cache freeze says so"
 assert_contains "$out" "reclaimed 7" \
     "zcc apply under a cache freeze still reports the evictor's freed amount"
-calls="$(wc -c < "$ZCC_STUB_COUNT")"
+calls="$(wc -c < "$ZCC_STUB_COUNT" | tr -d '[:space:]')"
 [ "$calls" = 1 ] || fail "zcc apply under a freeze invoked the evictor $calls time(s), expected exactly 1"
 if [ -s "$DU_CALL_LOG" ]; then
     fail "zcc apply under a cache freeze called du, which the one-walk invariant forbids: $(cat -- "$DU_CALL_LOG")"
@@ -273,7 +313,7 @@ fi
 # A stub that prints garbage must fail loudly (zcc-trim-failed), never a
 # silent 0-freed success row.
 : > "$DU_CALL_LOG"
-out="$(ZCL_HOST_GC_ZCC_BIN="$ZCC_STUB_GARBAGE" PATH="$DU_SHADOW_DIR:$PATH" \
+out="$(ZCL_HOST_GC_ZCC_BIN="$ZCC_STUB_GARBAGE" PATH="$DU_SHADOW_DIR:$PATH:$TIMEOUT_STUB_DIR" \
     run_hostgc zcc apply)"
 log="$(cat -- "$STATE_FX/host_gc.log" 2>/dev/null || true)"
 assert_contains "$log" "zcc-trim-failed" \
@@ -292,13 +332,13 @@ cat > "$ZCC_STUB_SLOW" <<'STUBEOF'
 sleep 5
 echo "zcc: 42 MB held, 0 MB ceiling, 0 MB freed"
 STUBEOF
-chmod +x -- "$ZCC_STUB_SLOW"
+chmod +x "$ZCC_STUB_SLOW"
 
 : > "$DU_CALL_LOG"
 log_lines_before="$(wc -l < "$STATE_FX/host_gc.log" 2>/dev/null || echo 0)"
 set +e
 out="$(ZCL_HOST_GC_ZCC_BIN="$ZCC_STUB_SLOW" ZCL_HOST_GC_ZCC_BUDGET_S=1 \
-    PATH="$DU_SHADOW_DIR:$PATH" run_hostgc zcc apply)"
+    PATH="$DU_SHADOW_DIR:$PATH:$TIMEOUT_STUB_DIR" run_hostgc zcc apply)"
 rc_zcc=$?
 set -e
 # Only the log rows THIS call appended — the fixture's log file accumulates
