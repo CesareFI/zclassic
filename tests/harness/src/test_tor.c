@@ -755,6 +755,42 @@ static int test_dynhost_reassembly_cap(void)
     return failures;
 }
 
+/* The C5 remote buyer path weak-imports dynhost_client_fetch_ex from the
+ * vendored Tor archive; core has declared tor_integration_fetch_onion_post
+ * since fc42ddd333, so any parent pin at or beyond the POST client commit
+ * MUST ship the symbol. A full embedded-Tor link that resolves
+ * dynhost_client_fetch but NOT dynhost_client_fetch_ex means the vendor
+ * pin moved backwards under a core that sells the POST path — exactly the
+ * dead buyer path that shipped when a resident-launch commit reverted the
+ * pin (2026-09-14). Fail LOUD on that mismatch; skip only on stub builds
+ * where no dynhost client is linked at all (Darwin, offline default). */
+static int test_dynhost_post_client_pin(void)
+{
+    extern int dynhost_client_fetch(const char *, uint16_t, const char *,
+        void (*)(int, const uint8_t *, size_t, void *), void *, int)
+        __attribute__((weak));
+    extern int dynhost_client_fetch_ex(const char *, uint16_t, const char *,
+        const char *, const uint8_t *, size_t,
+        void (*)(int, const uint8_t *, size_t, void *), void *, int)
+        __attribute__((weak));
+
+    int failures = 0;
+    printf("test_dynhost_post_client_pin: ");
+
+    if (!dynhost_client_fetch && !dynhost_client_fetch_ex) {
+        printf("SKIP (stub Tor build: vendored dynhost not linked)\n");
+        return 0;
+    }
+    if (dynhost_client_fetch && !dynhost_client_fetch_ex) {
+        printf("FAIL (full Tor link without dynhost_client_fetch_ex — "
+               "vendor pin behind the POST client commit; remotebuy is "
+               "stub-dead)\n");
+        return 1;
+    }
+    printf("OK\n");
+    return failures;
+}
+
 /* ── log level and log rotation ──────────────────────────────────────
  *
  * A field box carried a 1,319 MB tor.log FULL of "[info]" lines under a
@@ -908,6 +944,9 @@ int test_tor(void)
 
     /* dynhost reassembly admission cap (vendored handlers under test) */
     failures += test_dynhost_reassembly_cap();
+
+    /* vendor pin must ship the POST client core already sells */
+    failures += test_dynhost_post_client_pin();
 
     printf("Tor integration: %d failures\n", failures);
     return failures;
