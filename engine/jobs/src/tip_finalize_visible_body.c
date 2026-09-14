@@ -41,6 +41,14 @@ void tip_finalize_visible_body_reset(void)
     uint256_set_null(&g_last_mempool_reconcile_hash);
 }
 
+void tip_finalize_visible_body_note_reconciled(int32_t height,
+                                               const struct uint256 *hash)
+{
+    if (!hash) return;
+    g_last_mempool_reconcile_height = height;
+    g_last_mempool_reconcile_hash = *hash;
+}
+
 /* A header-only lookahead can advance the cursor before the successor body
  * arrives. Reconcile the newly visible body once per process identity. If
  * served-tip authority still trails it, finish publication; otherwise run

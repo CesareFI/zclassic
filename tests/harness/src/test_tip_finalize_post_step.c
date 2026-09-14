@@ -19,7 +19,10 @@
  * The missing-body branch used to skip ALL six effects silently; it now logs
  * a WARN. The negative cases pin the skip behaviour: no side effect may run
  * when the body is absent (HAVE_DATA clear) or unreadable (HAVE_DATA set,
- * file missing). */
+ * file missing). The final two probes pin the visible-body reconcile dedup:
+ * a successful post-finalize stamps the one-shot (height, hash) pair so the
+ * late-visible pass is a no-op, while the body-unreadable skip leaves no
+ * stamp so a late-arriving body stays eligible for exactly one reconcile. */
 
 #include "test/test_core.h"
 #include "util/util.h"
@@ -30,9 +33,13 @@
 #include "config/runtime.h"
 #include "controllers/blockchain_controller.h"
 #include "platform/private_directory.h"
+#include "util/stage.h"
+#include "validation/chainstate.h"
+#include "validation/main_state.h"
 #include "validation/process_block.h" /* g_body_pull_active */
 
 #include <errno.h>
+#include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -45,6 +52,17 @@ extern bool tip_finalize_run_mempool_reconcile(struct block_index *pindex_new);
 extern bool tip_finalize_run_wallet_reconcile(struct block_index *pindex_new);
 extern bool tip_finalize_run_wallet_mempool_reconcile(
     struct block_index *pindex_new);
+
+/* The visible-body dedup seam (engine/jobs/src/tip_finalize_visible_body.c)
+ * and the served-tip observe pair it consults. A successful post-finalize
+ * must stamp the same one-shot reconcile pair so the late-visible pass for
+ * the same (height, hash) is a no-op; the probes below pin that contract. */
+extern bool tip_finalize_reconcile_visible_cursor_body(
+    struct sqlite3 *db, struct stage *stage, struct main_state *ms);
+extern void tip_finalize_visible_body_reset(void);
+extern void tip_finalize_observe_reset_last_height(void);
+extern void tip_finalize_observe_update_last_advance(int height,
+                                                     const uint8_t hash[32]);
 
 static uint64_t tp_mmr_leaves(void)
 {
@@ -145,6 +163,122 @@ static bool tp_pool_add(const struct transaction *tx)
     return ok;
 }
 
+static job_result_t tp_vb_dummy_step(struct stage_step_ctx *c)
+{
+    (void)c;
+    return JOB_IDLE;
+}
+
+/* Seed the durable rows the visible-body gate consults: utxo_apply_log
+ * ok=1 at heights 1 and 2 (the body-visibility witness) plus the
+ * stage_cursor table the probe stage persists its cursor to. */
+static bool tp_vb_seed_db(sqlite3 *db)
+{
+    if (!db) return false;
+    char *err = NULL;
+    bool ok = sqlite3_exec(db,
+        "CREATE TABLE IF NOT EXISTS utxo_apply_log ("
+        "  height INTEGER PRIMARY KEY, status TEXT NOT NULL,"
+        "  ok INTEGER NOT NULL, spent_count INTEGER NOT NULL,"
+        "  added_count INTEGER NOT NULL);"
+        "INSERT OR REPLACE INTO utxo_apply_log"
+        "(height, status, ok, spent_count, added_count)"
+        " VALUES(1, 'verified', 1, 1, 2);"
+        "INSERT OR REPLACE INTO utxo_apply_log"
+        "(height, status, ok, spent_count, added_count)"
+        " VALUES(2, 'verified', 1, 1, 2);",
+        NULL, NULL, &err) == SQLITE_OK;
+    if (err) sqlite3_free(err);
+    return ok && stage_table_ensure(db);
+}
+
+/* Dedup probe (born-red on the pre-fix tree): a successful post-finalize
+ * must stamp the visible-body one-shot reconcile pair for (height, hash),
+ * so the late-visible pass over the SAME block is a no-op — zero repeated
+ * wallet/mempool effects, zero MMR/MMB growth. Without the stamp this
+ * probe re-runs the full idempotent reconcile: it returns true and
+ * consumes the re-armed state, failing every assertion below. */
+static int tp_vb_dedup_probe(struct wallet *w,
+                             const struct transaction *spend_tx,
+                             struct block_index *bi,
+                             stage_t *vb_stage, sqlite3 *vbdb,
+                             struct main_state *vb_ms)
+{
+    int failures = 0;
+    w->sapling_notes[0].spent = false;
+    w->best_block_height = 0;
+    TP_CHECK("dedup: probe starts with confirmed tx re-armed in pool",
+             tx_mempool_exists(&g_tp_pool, &spend_tx->hash));
+    uint64_t mmr0 = tp_mmr_leaves();
+    uint64_t mmb0 = tp_mmb_leaves();
+    tip_finalize_observe_reset_last_height();
+    tip_finalize_observe_update_last_advance(bi->nHeight,
+                                             bi->phashBlock->data);
+    TP_CHECK("dedup: probe cursor at block height",
+             stage_set_cursor(vb_stage, vbdb, (uint64_t)bi->nHeight) &&
+             stage_cursor(vb_stage) == (uint64_t)bi->nHeight);
+    TP_CHECK("dedup: visible-body pass is a no-op after post-finalize",
+             !tip_finalize_reconcile_visible_cursor_body(vbdb, vb_stage,
+                                                         vb_ms));
+    TP_CHECK("dedup: re-armed pool entry untouched",
+             tx_mempool_exists(&g_tp_pool, &spend_tx->hash));
+    TP_CHECK("dedup: re-armed note untouched",
+             w->sapling_notes[0].spent == false);
+    TP_CHECK("dedup: re-armed wallet height untouched",
+             w->best_block_height == 0);
+    TP_CHECK("dedup: MMR unchanged by the no-op pass",
+             tp_mmr_leaves() == mmr0);
+    TP_CHECK("dedup: MMB unchanged by the no-op pass",
+             tp_mmb_leaves() == mmb0);
+    return failures;
+}
+
+/* Late-body probe: the body-unreadable skip must NOT stamp the dedup
+ * pair, so when the height-2 body finally lands the visible-body pass
+ * stays eligible and runs the full reconcile exactly once. */
+static int tp_vb_late_body_probe(struct wallet *w,
+                                 const struct transaction *spend_tx2,
+                                 struct block_index *bi2,
+                                 struct disk_block_pos *pos2,
+                                 const char *netdir,
+                                 stage_t *vb_stage, sqlite3 *vbdb,
+                                 struct main_state *vb_ms)
+{
+    int failures = 0;
+    tip_finalize_run_post_finalize(bi2); /* HAVE_DATA clear: diagnosed skip */
+    TP_CHECK("late-body: height-2 body becomes readable",
+             block_index_set_have_data_verified(bi2, pos2, netdir));
+    bi2->nStatus |= BLOCK_VALID_SCRIPTS;
+    TP_CHECK("late-body: re-arm pool with height-2 spend tx",
+             tp_pool_add(spend_tx2));
+    w->best_block_height = 0;
+    tip_finalize_observe_update_last_advance(bi2->nHeight,
+                                             bi2->phashBlock->data);
+    TP_CHECK("late-body: probe cursor at block height",
+             stage_set_cursor(vb_stage, vbdb, (uint64_t)bi2->nHeight) &&
+             stage_cursor(vb_stage) == (uint64_t)bi2->nHeight);
+    TP_CHECK("late-body: visible-body reconcile runs for the late body",
+             tip_finalize_reconcile_visible_cursor_body(vbdb, vb_stage,
+                                                        vb_ms));
+    TP_CHECK("late-body: confirmed tx removed",
+             !tx_mempool_exists(&g_tp_pool, &spend_tx2->hash));
+    TP_CHECK("late-body: wallet height advanced",
+             w->best_block_height == bi2->nHeight);
+    return failures;
+}
+
+static void tp_vb_fixture_teardown(stage_t *vb_stage, sqlite3 *vbdb,
+                                   struct main_state *vb_ms, bool vb_ms_live,
+                                   struct block *blk2, bool blk2_built)
+{
+    tip_finalize_visible_body_reset();
+    tip_finalize_observe_reset_last_height();
+    if (vb_stage) stage_destroy(vb_stage);
+    if (vbdb) sqlite3_close(vbdb);
+    if (vb_ms_live) main_state_free(vb_ms);
+    if (blk2_built) block_free(blk2);
+}
+
 int test_tip_finalize_post_step(void);
 int test_tip_finalize_post_step(void)
 {
@@ -166,6 +300,14 @@ int test_tip_finalize_post_step(void)
 
     uint8_t nf_marker[32];
     memset(nf_marker, 0x5a, sizeof(nf_marker));
+
+    /* Visible-body dedup fixture state (set up below, freed at out_early). */
+    struct block blk2;
+    bool blk2_built = false;
+    struct main_state vb_ms;
+    bool vb_ms_live = false;
+    sqlite3 *vbdb = NULL;
+    stage_t *vb_stage = NULL;
 
     struct block blk;
     bool built = tp_build_block(&blk, nf_marker);
@@ -220,6 +362,63 @@ int test_tip_finalize_post_step(void)
     rt.wallet = w;
     rt.mempool = &g_tp_pool;
     app_runtime_set_current(&rt);
+
+    /* ── Visible-body dedup fixture ──
+     * A second block at height 2 (distinct nTime ⇒ distinct hash) whose
+     * body is withheld until the late-body case, a three-block active-chain
+     * window, the durable utxo_apply witness rows, and a probe stage whose
+     * cursor drives tip_finalize_reconcile_visible_cursor_body. */
+    uint8_t nf_marker2[32];
+    memset(nf_marker2, 0x6b, sizeof(nf_marker2));
+    blk2_built = tp_build_block(&blk2, nf_marker2);
+    blk2.header.nTime = blk.header.nTime + 1; /* distinct header ⇒ hash */
+    /* Distinct spend input: blk's spend tx is still pool-resident when the
+     * late-body probe arms blk2's, and identical prevouts would correctly
+     * reject as a mempool double-spend. */
+    memset(blk2.vtx[1].vin[0].prevout.hash.data, 0x88, 32);
+    transaction_compute_hash(&blk2.vtx[1]);
+    TP_CHECK("dedup fixture: second block built", blk2_built);
+    struct block_index bi0;
+    block_index_init(&bi0);
+    memset(bi0.hashBlock.data, 0xa0, 32);
+    bi0.phashBlock = &bi0.hashBlock;
+    bi0.nHeight = 0;
+    bi0.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_SCRIPTS;
+    arith_uint256_set_u64(&bi0.nChainWork, 1);
+    struct block_index bi2;
+    block_index_init(&bi2);
+    struct disk_block_pos pos2;
+    disk_block_pos_init(&pos2);
+    TP_CHECK("dedup fixture: second body written to disk",
+             blk2_built &&
+             write_block_to_disk(&blk2, &pos2, netdir, cp->pchMessageStart));
+    block_get_hash(&blk2, &bi2.hashBlock);
+    bi2.phashBlock = &bi2.hashBlock;
+    bi2.nHeight = 2;
+    bi2.nTime = blk2.header.nTime;
+    bi2.nBits = blk2.header.nBits;
+    arith_uint256_set_u64(&bi2.nChainWork, 3);
+    bi2.pprev = &bi;
+    bi.pprev = &bi0;
+    bi.nStatus |= BLOCK_VALID_SCRIPTS; /* visible-body precondition */
+    arith_uint256_set_u64(&bi.nChainWork, 2);
+    memset(&vb_ms, 0, sizeof(vb_ms));
+    main_state_init(&vb_ms);
+    vb_ms_live = true;
+    TP_CHECK("dedup fixture: active-chain window installed",
+             active_chain_move_window_tip(&vb_ms.chain_active, &bi2));
+    TP_CHECK("dedup fixture: window resolves height 1",
+             active_chain_at(&vb_ms.chain_active, 1) == &bi);
+    TP_CHECK("dedup fixture: window resolves height 2",
+             active_chain_at(&vb_ms.chain_active, 2) == &bi2);
+    char vbdb_path[600];
+    snprintf(vbdb_path, sizeof(vbdb_path), "%s/vb.sqlite", netdir);
+    TP_CHECK("dedup fixture: probe db open",
+             sqlite3_open(vbdb_path, &vbdb) == SQLITE_OK);
+    TP_CHECK("dedup fixture: probe db seeded", tp_vb_seed_db(vbdb));
+    vb_stage = stage_create("tf_vb_probe", tp_vb_dummy_step, NULL);
+    TP_CHECK("dedup fixture: probe stage created", vb_stage != NULL);
+    tip_finalize_visible_body_reset();
 
     uint64_t mmr0 = tp_mmr_leaves();
     uint64_t mmb0 = tp_mmb_leaves();
@@ -344,12 +543,21 @@ int test_tip_finalize_post_step(void)
     TP_CHECK("NULL pindex: no crash, MMR unchanged",
              tp_mmr_leaves() == mmr0);
 
+    /* Visible-body dedup + late-body eligibility probes (rationale at the
+     * helpers; the dedup probe is born-red on the pre-fix tree). */
+    failures += tp_vb_dedup_probe(w, &blk.vtx[1], &bi,
+                                  vb_stage, vbdb, &vb_ms);
+    failures += tp_vb_late_body_probe(w, &blk2.vtx[1], &bi2, &pos2, netdir,
+                                      vb_stage, vbdb, &vb_ms);
+
     app_runtime_set_current(NULL);
     tx_mempool_free(&g_tp_pool);
     wallet_free(w); /* frees sapling_notes */
     free(w);
 
 out_early:
+    tp_vb_fixture_teardown(vb_stage, vbdb, &vb_ms, vb_ms_live,
+                           &blk2, blk2_built);
     block_free(&blk);
     SetDataDir("");
     ClearDataDirCache();

@@ -744,7 +744,7 @@ Z23_FLAG("ZCL_DEV_WATCH_STATE_DIR", "env_build", "-", "-",
 Z23_FLAG("ZCL_DISABLE_BOOT_DB_MAINT", "env_runtime", "-", "-",
           "first use engine/services/src/db_maintenance.c:337; documented at docs/CAPABILITY_INVENTORY.jsonl:1200: {'record':'capability','header':'engine/services/include/services/db_maintenance.h','in...")
 Z23_FLAG("ZCL_DISABLE_SHA3_WINDOW_TRIPWIRE", "env_runtime", "-", "-",
-          "undocumented; first use engine/jobs/src/tip_finalize_post_step.c:119")
+          "undocumented; first use engine/jobs/src/tip_finalize_post_step.c:120")
 Z23_FLAG("ZCL_DISABLE_UTXO_LADDER_TRIPWIRE", "env_runtime", "-", "-",
           "undocumented; first use engine/jobs/src/utxo_root_ladder_tripwire.c:164")
 Z23_FLAG("ZCL_DISCARD_GATE_FILE_FLOOR", "env_build", "1", "-",

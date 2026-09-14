@@ -12,6 +12,7 @@
  */
 
 #include "tip_finalize_post_step.h"
+#include "tip_finalize_visible_body.h"  /* visible-body reconcile dedup stamp */
 #include "jobs/catchup_cadence.h"      /* live catch-up boundary-fold defer */
 #include "jobs/stage_helpers.h"
 #include "utxo_root_ladder_tripwire.h"   /* OBSERVE-ONLY golden ladder caller */
@@ -598,4 +599,14 @@ void tip_finalize_run_post_finalize(struct block_index *pindex_new)
     utxo_root_ladder_tripwire_at_boundary(pindex_new->nHeight);
 
     stage_release_block_view(&owned, &handle, borrowed);
+
+    /* Every effect the late-visible reconcile would replay for this exact
+     * (height, hash) just ran above. Stamp the visible-body one-shot dedup
+     * pair so its next pass over this block is a no-op instead of a second
+     * identical reconcile (the duplicate per-block wallet/mempool pass
+     * measured during catch-up fold-forward). The body-unreadable early
+     * return above deliberately does NOT stamp: a late-arriving body stays
+     * eligible for the visible-body retry. */
+    tip_finalize_visible_body_note_reconciled(pindex_new->nHeight,
+                                              pindex_new->phashBlock);
 }
