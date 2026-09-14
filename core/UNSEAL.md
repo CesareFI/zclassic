@@ -152,3 +152,7 @@ later lane flips it HARD.
 - 2026-09-14T10:53:01Z — REASON: c5-dynhost-post-client
   old ROOT: fffed5da03d6bce0933d89209fc4ba2ad7077b9c1d94452f0d173ca426014017
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-14T21:14:03Z — REASON: difficulty_from_bits used Bitcoin's -29 shift base instead of ZClassic powLimit compact exponent 0x1f; historical-block RPC/explorer difficulty rendered 256^2 off (min-diff bits 0x1f07ffff showed 65536.0, legacy 1.0). Display-only math (RPC/explorer/netsplit ratios), not a consensus predicate. Owner unseal grant 2026-09-14 in reply to explicit request.
+  old ROOT: 4bf80625c80f0352d8bfb38bee64ff0a94c73045272f64f528fd53f5be6474c9
+  by: owner unseal ritual (make core-unseal)

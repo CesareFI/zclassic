@@ -38,12 +38,12 @@
 #       pair — the sealed core's identity, mirrored into
 #       hotswap/core_seal_root.h. FROZEN: SECTION/TREE are additive and
 #       do not enter this preimage.
-cb14e87b2bf37c213ac1df0b22b53305d7563e97a4110966cd2def1aeabd41b4  core/UNSEAL.md
+54ed1bc7a81953713b27761bf8a8a7be8cb6bb5764b51bd0731b9c411154491c  core/UNSEAL.md
 0154dee8b452e80f28e6d9c915483ab19cf93ee834518edc355885204dad4119  core/chainparams/include/chain/chainparams.h
 76417939b54d9b0d0b2309c66b90fd20a510de3492bb6f97a11f4198292aa01f  core/chainparams/include/chain/chainparamsbase.h
 d7a369b7b352bec129c14bb6cbea95d6907f1ac99f2616bac5b4d50ea503dbe6  core/chainparams/include/chain/checkpoints.h
 70a619096c7c98fb5bbb315b44916b4641ab50e4938b99e5be0e8a1e0b1306d7  core/chainparams/include/chain/equihash.h
-b26d0eeb2d74adef629479a9006a23954f057a795d970f2dd5b71a816ff75fa9  core/chainparams/include/chain/pow.h
+231e550a1dda11aaeca9778910a9960c1c76a98d602fbb0cee5f9a598f028b4c  core/chainparams/include/chain/pow.h
 3235d5e1c2e14b9533c7016628e5ff89ee6e45456e7ff9b569afb0feb2f15fcc  core/chainparams/include/chain/subsidy.h
 82311af8a8d47504e1a9c7142bed3af04beb806d8b1e38cdde52ff0ce7891311  core/chainparams/src/chainparams.c
 3a5d6b4243f758fdd4024614000e2d5ca30695abfc60f62db13c9a90791fa2da  core/chainparams/src/chainparamsbase.c
@@ -592,10 +592,10 @@ e84a4566fb4a01985ccbec9a4d3136a278422e1efe4f00cb8d0cf01480531064  core/params/in
 5ed0e4562789e7ea0bd9ff1238a27172669074b3d26201195aafffe1f863558e  core/params/module.cfg
 4d62b9a9b8824925e2f7efebca536ff924a96c7464067472cb07b9dd57e356dc  core/params/src/params.c
 9907071da9b95e13d236ac70fe8fa95612c7873ff9a88102d988c83ba8492b89  core/params/src/upgrades.c
-SECTION  554  4  1e9b659b1fecc13abebf673380d33785845c58046a1871765259a45279b8c7ee  core
-SECTION  12  16  8681e4e8469b454c43c9d715d1111a7702a3b9bc8527f8119234a18e030ec183  core/chainparams
-SECTION  6  24  1e5945d164d76144d16dcf3160716e529396441eef1b21a1687c7455aa89e6a8  core/chainparams/include
-SECTION  6  30  30a039b47f4f9e8eebe5efe28f0a4ba77b2d9f14f383db19b46c024eec2296ed  core/chainparams/include/chain
+SECTION  554  4  fb9de2dcd47de7d13c14959f51cee739ff80f8bc131eb1ca3f4086ae6eea2c4c  core
+SECTION  12  16  a8356ff45987ae1e23c2d1d27a0b7a7cedcc5cda1b61a8834fb546bf96b07a5b  core/chainparams
+SECTION  6  24  1b1c787cdbac21acfdd34d1e5a0e5f89d3cc8633c4b4770e92011a78593986a7  core/chainparams/include
+SECTION  6  30  4689dafb36641ea075c5b99f684887f9bf73af39fc092d15519380dd8f037fa4  core/chainparams/include/chain
 SECTION  6  20  6b2a586c73fc46a7ab3c7092d9d4ae08b16bda273d3e64b86e538894fdb5140c  core/chainparams/src
 SECTION  36  14  fee86f21ef5f8cec3ea433e07970a8e273fc0898924aa094186334f09df1f017  core/consensus
 SECTION  17  22  9559692f7fa69fb22ef84266cbf87183f16208aa1a9e6ed3ee9178545d0cc295  core/consensus/include
@@ -672,5 +672,5 @@ SECTION  7  11  9b023bcd18300a51052f45e69609bb741b2832e3ce6e6a02fd21a12ea94647c0
 SECTION  4  19  e07dc0f2326862830b48105e02648f8d76dfeee9a859b7c56679c461e2cca7f1  core/params/include
 SECTION  4  29  5680a2f2d804163e77f94854ee18838480d785b74b297265f2f8a77db9d02242  core/params/include/consensus
 SECTION  2  15  8fdd673c41b8758e48c6fb225c15d7bbdf79f6816066a1d0c793d4bee2c5f6b1  core/params/src
-TREE  11e2ba05a89c79d4ce1defc1771dc9235a375672994cd141c70e962e8d085012
-ROOT  4bf80625c80f0352d8bfb38bee64ff0a94c73045272f64f528fd53f5be6474c9
+TREE  53b3132f394a2bdb719853007f31b02550b49658698dbaa1bf0972364ff3d6fd
+ROOT  c3090fae6b449bd80dc449c365caa0d452a626402d0deb8c8a77c66f6eafcdf7

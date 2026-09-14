@@ -1307,14 +1307,35 @@ int test_explorer(void)
     {
         double d0 = explorer_difficulty_from_bits(0);
         bool ok = (d0 == 1.0);
-        /* Current live-chain bits observed at h=3112518. Legacy zclassicd
-         * reports difficulty 150.5924424103772 for this compact target. */
-        double live = explorer_difficulty_from_bits(0x1e0d997f);
-        double d1 = explorer_difficulty_from_bits(0x1f07ffff);
-        ok = ok && (d1 > 0.0) &&
-             (live > 150.5924 && live < 150.5925);
-        if (ok) printf("OK (bits=0 -> %.1f, bits=0x1f07ffff -> %.4f, live -> %.4f)\n",
-                       d0, d1, live);
+        /* Legacy zclassicd (oracle getblock) rendered difficulty across
+         * representative eras and compact-exponent boundaries; exponent
+         * 0x1e is the only point where a wrong -29 shift base agrees. */
+        static const struct {
+            uint32_t bits;
+            double legacy;
+        } vec[] = {
+            {0x1f07ffff, 1.0},               /* h=0: powLimit baseline */
+            {0x1f0191fb, 5.094765176324254}, /* h=100 slow-start */
+            {0x1d066f71, 81470.25532490012}, /* h=100000 */
+            {0x1d00872c, 992939.3374176396}, /* h=400000 */
+            {0x1c7397b0, 1161125.834138388}, /* h=500000, exp 0x1c */
+            {0x1e2cbbe4, 45.78169816392217}, /* h=1000000 */
+            {0x1e1b6556, 74.75572319253386}, /* h=2000000 */
+            {0x1e08c956, 233.0852369622979}, /* h=3000000 */
+            {0x1e0d997f, 150.5924424103772}, /* live chain h=3112518 */
+            {0x2007ffff, 0.00390625},        /* above-powLimit exp edge */
+        };
+        for (size_t i = 0; ok && i < sizeof(vec) / sizeof(vec[0]); i++) {
+            double got = explorer_difficulty_from_bits(vec[i].bits);
+            double rel = (got - vec[i].legacy) / vec[i].legacy;
+            if (rel < 0) rel = -rel;
+            ok = rel < 1e-9;
+            if (!ok)
+                printf("(bits=0x%08x got %.9g legacy %.9g) ",
+                       vec[i].bits, got, vec[i].legacy);
+        }
+        if (ok) printf("OK (bits=0 -> %.1f, 9 legacy era vectors within 1e-9)\n",
+                       d0);
         else { printf("FAIL\n"); failures++; }
     }
 
