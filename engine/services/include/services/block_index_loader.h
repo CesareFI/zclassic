@@ -67,6 +67,17 @@ void save_block_index_flat(const char *datadir, struct main_state *ms);
  * (tools/scripts/check_no_block_index_flat_baseline.txt) does not need a
  * new row for that file. Defined next to save_block_index_flat itself. */
 void boot_persist_block_index(const char *datadir, struct main_state *ms);
+
+/* Boot scan flat-save gate: refresh the flat cache ONLY when the boot
+ * actually mutated the in-memory index — the block-file scan's marked count
+ * or the stale-HAVE_DATA clear step's cleared count is nonzero. A skipped
+ * save costs a rescan next boot, never correctness; a mutation that is NOT
+ * saved is a real bug, so any nonzero mutation count saves. Defined next to
+ * save_block_index_flat so the demoted-store consumer set (Program H0
+ * baseline) stays frozen. */
+void save_block_index_flat_if_mutated(const char *datadir,
+                                      struct main_state *ms,
+                                      int marked, int cleared);
 struct zcl_result save_block_index_flat_identity(
     const char *datadir, struct main_state *ms,
     struct block_index_flat_identity *out);

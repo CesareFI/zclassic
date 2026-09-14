@@ -233,6 +233,15 @@ void boot_persist_block_index(const char *datadir, struct main_state *ms)
     save_block_index_flat(datadir, ms);
 }
 
+/* Boot scan flat-save gate: see block_index_loader.h. */
+void save_block_index_flat_if_mutated(const char *datadir,
+                                      struct main_state *ms,
+                                      int marked, int cleared)
+{
+    if ((marked > 0 || cleared > 0) && ms->map_block_index.size > 1000)
+        save_block_index_flat(datadir, ms);
+}
+
 struct zcl_result load_block_index_flat(const char *datadir, struct main_state *ms)
 {
     /* Identity is authority for bounded projection startup. Invalidate it

@@ -796,6 +796,25 @@ static int case_retry_condition(void)
     checkpoint_bundle_install_ready_test_reset();
     checkpoint_bundle_install_ready_test_suppress_restart(true);
 
+    /* Registered-cadence pin: both cold-sync arm-path conditions poll at 5s
+     * (the detect is ms-class — one ancestor walk, an indexed read, a
+     * repair-row probe, a bundles/ dir scan), so the arm is not held behind
+     * a 15s/10s detect cadence; backoff/attempts/witness are untouched. */
+    condition_engine_reset_for_testing();
+    register_checkpoint_bundle_install_ready();
+    register_checkpoint_header_solution_repair();
+    struct condition_runtime_snapshot snap;
+    CSIR_CHECK("cond: registered checkpoint_bundle_install_ready poll_secs==5",
+               condition_engine_get_registered_snapshot(
+                   "checkpoint_bundle_install_ready", &snap) &&
+                   snap.poll_secs == 5);
+    CSIR_CHECK("cond: registered checkpoint_header_solution_repair "
+               "poll_secs==5 (sibling owns solution fetch when the IBD "
+               "capture path does not fire)",
+               condition_engine_get_registered_snapshot(
+                   "checkpoint_header_solution_repair", &snap) &&
+                   snap.poll_secs == 5);
+
     struct main_state ms;
     main_state_init(&ms);
     /* Header chain owns the checkpoint block (ready). */

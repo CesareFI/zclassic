@@ -6,6 +6,7 @@
 #include "primitives/block.h"
 #include "core/serialize.h"
 #include "config/boot_internal.h"
+#include "services/block_index_loader.h"
 #include "validation/chainstate.h"
 #include "validation/main_state.h"
 #include <errno.h>
@@ -1062,6 +1063,134 @@ _test_next:
     return failures;
 }
 
+/* ── Boot scan flat-save gate ─────────────────────────────
+ * Regression for the redundant boot-time flat save (~8s on a 3M-entry
+ * index): boot's post-scan save_block_index_flat is a cache refresh over
+ * durable stores and must run ONLY when the boot actually mutated the
+ * in-memory index — the scan's marked count, or the stale-HAVE_DATA clear
+ * step's cleared count handed in by the caller. A 0/0 boot must NOT rewrite
+ * block_index.bin; any nonzero mutation count MUST save (a mutation that is
+ * not saved is a real bug — when in doubt, save). */
+
+/* Fill ms with n synthetic index entries (distinct hashes; none on disk). */
+static bool seed_index_entries(struct main_state *ms, int n)
+{
+    for (int i = 0; i < n; i++) {
+        struct uint256 h;
+        memset(h.data, 0, sizeof(h.data));
+        h.data[0] = (unsigned char)(i & 0xFF);
+        h.data[1] = (unsigned char)((i >> 8) & 0xFF);
+        h.data[2] = (unsigned char)((i >> 16) & 0xFF);
+        h.data[31] = 0x9b;
+        if (!chainstate_insert_block_index((struct chainstate *)ms, &h))
+            return false;
+    }
+    return true;
+}
+
+static bool flat_save_exists(const char *datadir)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/block_index.bin", datadir);
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static void make_gate_dir(char *buf, size_t len, int tag)
+{
+    snprintf(buf, len, "./test-tmp/%d_disk_io_gate%d", (int)getpid(), tag);
+    mkdir("./test-tmp", 0755);
+    mkdir(buf, 0755);
+    char blocks[512];
+    snprintf(blocks, sizeof(blocks), "%s/blocks", buf);
+    mkdir(blocks, 0755);
+}
+
+static int test_flat_save_gate_skips_when_quiet(void)
+{
+    int failures = 0;
+    char tmpdir[256];
+    make_gate_dir(tmpdir, sizeof(tmpdir), 1);
+
+    /* marked==0 && cleared==0 (nothing on disk to mark, nothing cleared):
+     * the flat cache must NOT be rewritten. */
+    TEST("boot scan flat-save gate: 0 marked + 0 cleared skips the save") {
+        struct main_state ms;
+        main_state_init(&ms);
+        ASSERT(seed_index_entries(&ms, 1100));
+        int marked = scan_block_files_mark_data(&ms, tmpdir, NULL);
+        ASSERT(marked == 0);
+        save_block_index_flat_if_mutated(tmpdir, &ms, marked, 0);
+        ASSERT(!flat_save_exists(tmpdir));
+        main_state_free(&ms);
+        printf("OK\n");
+    }
+_test_next:
+    cleanup_test_dir(tmpdir);
+    return failures;
+}
+
+static int test_flat_save_gate_saves_on_cleared(void)
+{
+    int failures = 0;
+    char tmpdir[256];
+    make_gate_dir(tmpdir, sizeof(tmpdir), 2);
+
+    /* cleared>0 (the stale-HAVE_DATA clear step ran): the mutation MUST be
+     * persisted even when the scan itself marked nothing. */
+    TEST("boot scan flat-save gate: cleared > 0 saves") {
+        struct main_state ms;
+        main_state_init(&ms);
+        ASSERT(seed_index_entries(&ms, 1100));
+        int marked = scan_block_files_mark_data(&ms, tmpdir, NULL);
+        ASSERT(marked == 0);
+        save_block_index_flat_if_mutated(tmpdir, &ms, marked, 3);
+        ASSERT(flat_save_exists(tmpdir));
+        main_state_free(&ms);
+        printf("OK\n");
+    }
+_test_next:
+    cleanup_test_dir(tmpdir);
+    return failures;
+}
+
+static int test_flat_save_gate_saves_on_marked(void)
+{
+    int failures = 0;
+    char tmpdir[256];
+    make_gate_dir(tmpdir, sizeof(tmpdir), 3);
+
+    /* marked>0 (a real on-disk block matched an index entry): MUST save. */
+    TEST("boot scan flat-save gate: marked > 0 saves") {
+        struct block b;
+        build_test_block(&b, 777777);
+        struct disk_block_pos pb;
+        disk_block_pos_init(&pb);
+        bool ok = write_block_to_disk(&b, &pb, tmpdir, TEST_MSG_START);
+        struct uint256 hash_b;
+        block_get_hash(&b, &hash_b);
+        block_free(&b);
+        ASSERT(ok);
+
+        struct main_state ms;
+        main_state_init(&ms);
+        ASSERT(seed_index_entries(&ms, 1100));
+        struct block_index *bi = chainstate_insert_block_index(
+            (struct chainstate *)&ms, &hash_b);
+        ASSERT(bi != NULL);
+        int marked = scan_block_files_mark_data(&ms, tmpdir, NULL);
+        ASSERT(marked > 0);
+        save_block_index_flat_if_mutated(tmpdir, &ms, marked, 0);
+        ASSERT(bi->nStatus & BLOCK_HAVE_DATA);
+        ASSERT(flat_save_exists(tmpdir));
+        main_state_free(&ms);
+        printf("OK\n");
+    }
+_test_next:
+    cleanup_test_dir(tmpdir);
+    return failures;
+}
+
 /* ── Entry point ─────────────────────────────────────────── */
 
 int test_disk_block_io(void)
@@ -1084,5 +1213,8 @@ int test_disk_block_io(void)
     failures += test_scan_duplicate_keeps_earliest_copy();
     failures += test_position_repair_from_local_copy();
     failures += test_block_pos_filename_datadir_contract();
+    failures += test_flat_save_gate_skips_when_quiet();
+    failures += test_flat_save_gate_saves_on_cleared();
+    failures += test_flat_save_gate_saves_on_marked();
     return failures;
 }

@@ -208,7 +208,7 @@ static bool witness_checkpoint_bundle_install_ready(int64_t target_at_detect)
 static struct condition c_checkpoint_bundle_install_ready = {
     .name = CBIR_NAME,
     .severity = COND_WARN,
-    .poll_secs = 15,
+    .poll_secs = 5,
     .backoff_secs = 30,
     .max_attempts = 3,
     .detect = detect_checkpoint_bundle_install_ready,

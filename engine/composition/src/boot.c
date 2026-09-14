@@ -2777,19 +2777,18 @@ static void boot_step_execute_utxo_recovery(struct app_context *ctx,
     }
 }
 
-/* Clear stale HAVE_DATA above tip — targeted, not full scan. */
-static void boot_step_clear_stale_have_data(int scan_max_have_data_h)
+/* Clear stale HAVE_DATA above tip — targeted; returns the cleared count. */
+static int boot_step_clear_stale_have_data(int scan_max_have_data_h)
 {
-    /* Clear stale HAVE_DATA above tip — targeted, not full scan.
-     * Only needed if max HAVE_DATA height > chain tip (from the
+    /* Only needed if max HAVE_DATA height > chain tip (from the
      * single-pass scan above). Skip when block index has 1M+ entries
      * — that means it was loaded from zclassicd's LDB with correct
      * nFile/nDataPos, and clearing HAVE_DATA would force re-download
      * of 3M blocks that are already on disk. */
+    int cleared = 0;
     int tip_h = active_chain_height(&g_state.chain_active);
     if (scan_max_have_data_h > tip_h && tip_h > 0 &&
         g_state.map_block_index.size < 1000000) {
-        int cleared = 0;
         size_t ci = 0;
         struct block_index *cp;
         while (block_map_next(&g_state.map_block_index, &ci, NULL, &cp)) {
@@ -2803,6 +2802,7 @@ static void boot_step_clear_stale_have_data(int scan_max_have_data_h)
             printf("Cleared stale HAVE_DATA from %d blocks above tip %d\n",
                    cleared, tip_h);
     }
+    return cleared;
 }
 
 /* Does the loaded index still need an on-disk block-file scan? */
@@ -2818,10 +2818,11 @@ static bool boot_scan_block_files_needed(const struct boot_index_scan *sc)
                 sc->best_header->nHeight);
 }
 
-/* Mark on-disk block data, then run the legacy post-scan anchor ladder. */
+/* Mark on-disk block data (flat save gated on mutation), then the ladder. */
 static void boot_step_scan_block_files(struct app_context *ctx,
                                        const struct chain_params *params,
-                                       const struct boot_index_scan *sc)
+                                       const struct boot_index_scan *sc,
+                                       int cleared)
 {
     if (!boot_scan_block_files_needed(sc))
         return;
@@ -2836,12 +2837,11 @@ static void boot_step_scan_block_files(struct app_context *ctx,
     }
     if (!have_block_files)
         return;
-    scan_block_files_mark_data(
+    int marked = scan_block_files_mark_data(
         &g_state, ctx->datadir,
         g_state.map_block_index.size < 1000 ? params : NULL);
     fflush(stdout);
-    if (g_state.map_block_index.size > 1000)
-        save_block_index_flat(ctx->datadir, &g_state);
+    save_block_index_flat_if_mutated(ctx->datadir, &g_state, marked, cleared);
     /* Wave 2: on canonical datadirs the post-scan anchor ladder
      * below is GUESSWORK over caches (node_state anchor, mirror
      * MAX(height), "most work scanned") that manufactured wedges;
@@ -2901,8 +2901,8 @@ static bool boot_seq_reconcile_chain_state(struct app_context *ctx,
     /* Validate coins/chain agreement and execute recovery */
     t_reconcile_sub = boot_submark("blkidx.repair_relink", t_reconcile_sub);
     boot_step_execute_utxo_recovery(ctx, s->params);
-    boot_step_clear_stale_have_data(scan.max_have_data_h);
-    boot_step_scan_block_files(ctx, s->params, &scan);
+    int stale_cleared = boot_step_clear_stale_have_data(scan.max_have_data_h);
+    boot_step_scan_block_files(ctx, s->params, &scan, stale_cleared);
     (void)boot_submark("blkidx.validate_recover", t_reconcile_sub);
     boot_topmark("block_index_reconcile", t_reconcile_blockindex);
     return true;

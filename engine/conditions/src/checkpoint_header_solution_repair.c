@@ -340,7 +340,7 @@ static bool witness_checkpoint_header_solution_repair(int64_t target_at_detect)
 static struct condition c_checkpoint_header_solution_repair = {
     .name = CHSR_NAME,
     .severity = COND_WARN,
-    .poll_secs = 10,
+    .poll_secs = 5,
     .backoff_secs = 30,
     .max_attempts = 5,
     /* Continue-with-cooldown: the solution can be un-available purely because
