@@ -251,6 +251,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--selftest" ]; then
     _st_check "dead serving peer -> fixture_absent 2" \
         "$(stopwatch_skip_classify 'serving peer not reachable: 127.0.0.1:39070' 1 1)" \
         "fixture_absent 2"
+    _st_check "handshake-incompatible file peer -> fixture_incompatible 1" \
+        "$(stopwatch_skip_classify 'file_peer fixture incompatible: 127.0.0.1:39072 accepted TCP but failed the authenticated X25519/HKDF file-service handshake' 1 1)" \
+        "fixture_incompatible 1"
     _st_check "absent binary -> config_error 1" \
         "$(stopwatch_skip_classify 'node binary absent/not executable: /nope' 1 1)" \
         "config_error 1"

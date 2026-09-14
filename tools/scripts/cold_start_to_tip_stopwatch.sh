@@ -66,7 +66,12 @@
 #                        stall failure class), or the node process died, or a
 #                        harness/setup error.
 #   2  SKIP           — prerequisite absent (binary not built / no peer stated
-#                        / peer unreachable). Not a verdict on C3 either way.
+#                        / peer unreachable) or the stated file peer failed the
+#                        PRE-FLIGHT fixture-compatibility probe (it accepted
+#                        TCP but could not complete the authenticated
+#                        X25519/HKDF file-service handshake — an ENVIRONMENT
+#                        failure, never a product stall, so never exit 4).
+#                        Not a verdict on C3 either way.
 #                        A peer that accepts the TCP connection and closes it
 #                        immediately is NOT a SKIP — it is labelled
 #                        peer_prechecks[].classification=accept_close, warned
@@ -119,6 +124,19 @@ PEER_CONFIG="${ZCL_CS_PEER:-}"
 declare -a PEERS=()
 declare -a PEER_PRECHECKS=()
 FILE_PEER="${ZCL_CS_FILE_PEER:-}"
+# The PRE-FLIGHT fixture-compatibility probe (tools/fs_handshake_probe.c,
+# `make fs-handshake-probe`). Before the wiped node is launched, the harness
+# performs the CLIENT half of the exact authenticated X25519/HKDF
+# file-service handshake the node's RLS directory fetch performs against the
+# stated file peer. A fixture whose binary predates that handshake passes a
+# bare TCP connect but fails this probe in seconds — measured 2026-09, that
+# stale-fixture shape burned the full 600s budget per scheduled run for ~3
+# weeks because the only signal was the node's own boot log line
+# "directory: handshake failed ... — skipping seed"
+# (core/modules/net/src/rom_fetch_directory.c:134). When the probe binary is
+# absent the harness degrades to the legacy bare-TCP-connect check and says
+# so in file_peer_precheck, never silently.
+FS_HANDSHAKE_PROBE="${ZCL_CS_FS_HANDSHAKE_PROBE:-$REPO_ROOT/build/bin/fs_handshake_probe}"
 HEADER_SOURCE="${ZCL_CS_HEADER_SOURCE:-}"
 BUNDLE_PATH="${ZCL_CS_BUNDLE_PATH:-}"
 BUDGET="${ZCL_CS_BUDGET_SECS:-600}"     # 10-minute MVP C3 target
@@ -133,6 +151,12 @@ FRONTIER_BUSY_TIMEOUT_SECS="${ZCL_CS_FRONTIER_BUSY_TIMEOUT_SECS:-120}"
 # (see peer_precheck below). Per-peer rows are recorded beside it in proof.json;
 # neither form changes the verdict.
 PEER_PRECHECK="unknown"
+# Classification of the file peer's pre-flight probe (see
+# classify_file_peer_probe / the FS_HANDSHAKE_PROBE note above). Recorded in
+# proof.json; like PEER_PRECHECK it never converts a verdict by itself — the
+# handshake_failed skip below is the verdict-changing path, and it names its
+# reason.
+FILE_PEER_PRECHECK="unknown"
 # Bounded number of supervised self-respawns this harness will FOLLOW before
 # calling it a runaway (see the respawn-seam handling in the main loop). A
 # clean self-exit carrying a self_respawn_* exit-reason breadcrumb is the node
@@ -1467,6 +1491,49 @@ classify_peer_precheck() {
     esac
 }
 
+# classify_file_peer_probe <probe-rc> — pure mapping from the
+# fs_handshake_probe exit code to one token. Kept separate from the probe
+# invocation so its precedence is unit-testable (see --selftest).
+#   handshake_ok     (rc 0)   the peer completed the authenticated
+#                  X25519/HKDF file-service handshake — a compatible fixture.
+#   unreachable      (rc 3, or the outer timeout backstop rc 124) TCP connect
+#                  failed/refused/timed out — same class the legacy bare
+#                  connect check reported.
+#   handshake_failed (rc 4)   the peer accepted TCP but could not complete
+#                  the handshake: a pre-d1db47aee7 fixture binary, a
+#                  non-file-service listener, or a silent peer. This is the
+#                  stale-fixture shape that used to burn the whole budget.
+#   probe_error      (anything else) the probe itself malfunctioned — the
+#                  harness falls back to the legacy bare connect check and
+#                  records this token; never read as a fixture verdict.
+classify_file_peer_probe() {
+    case "${1:-}" in
+        0)     printf 'handshake_ok' ;;
+        3|124) printf 'unreachable' ;;
+        4)     printf 'handshake_failed' ;;
+        *)     printf 'probe_error' ;;
+    esac
+}
+
+# file_peer_probe_action <classification> — the harness's response to one
+# file-peer probe classification, as a pure token (unit-tested in
+# --selftest; the FILE_PEER block below dispatches on it).
+#   continue          the fixture is compatible — the run proceeds.
+#   skip_unreachable  SKIP "file-service peer not reachable" (fixture_absent).
+#   skip_incompatible SKIP "file_peer fixture incompatible"
+#                     (fixture_incompatible) — the FAST named non-pass for
+#                     the stale-fixture shape that used to burn 600s a run.
+#   fallback_tcp      the probe itself malfunctioned — degrade to the legacy
+#                     bare connect check, loudly.
+file_peer_probe_action() {
+    case "${1:-}" in
+        handshake_ok)     printf 'continue' ;;
+        unreachable)      printf 'skip_unreachable' ;;
+        handshake_failed) printf 'skip_incompatible' ;;
+        *)                printf 'fallback_tcp' ;;
+    esac
+}
+
 # peer_precheck <host> <port> — connect and observe WITHOUT sending a byte.
 #
 # This exists because a bare "did TCP connect succeed" test is only a valid
@@ -1612,6 +1679,49 @@ if [ "$SELFTEST" = "1" ]; then
     st_ps_check "peer waited out passive probe then closed -> protocol_idle_close" protocol_idle_close "$(classify_peer_precheck 13)"
     st_ps_check "peer closed at accept, zero bytes -> accept_close" accept_close "$(classify_peer_precheck 12)"
     st_ps_check "unknown probe rc -> unreachable (never silently held_open)" unreachable "$(classify_peer_precheck 77)"
+
+    # File-peer PRE-FLIGHT probe classification + action. The headline
+    # regression this fixes: a serving fixture whose binary predated the
+    # authenticated X25519/HKDF file-service handshake (d1db47aee7) passed
+    # the old bare TCP-connect precheck, and every scheduled run then burned
+    # the full 600s budget — the wiped node could only log "directory:
+    # handshake failed ... — skipping seed" and fall back to from-genesis
+    # IBD. Probe rc 4 must now be a FAST named skip, never a measurement.
+    st_ps_check "file probe rc 0 -> handshake_ok" handshake_ok "$(classify_file_peer_probe 0)"
+    st_ps_check "file probe rc 3 (connect refused/timed out) -> unreachable" unreachable "$(classify_file_peer_probe 3)"
+    st_ps_check "file probe outer timeout backstop -> unreachable" unreachable "$(classify_file_peer_probe 124)"
+    st_ps_check "file probe rc 4 (accepted TCP, handshake failed — the stale fixture) -> handshake_failed" handshake_failed "$(classify_file_peer_probe 4)"
+    st_ps_check "file probe usage/unexpected rc -> probe_error (never silently a fixture verdict)" probe_error "$(classify_file_peer_probe 2)"
+    st_ps_check "compatible fixture -> the run proceeds" continue "$(file_peer_probe_action handshake_ok)"
+    st_ps_check "unreachable file peer -> named skip (fixture_absent class)" skip_unreachable "$(file_peer_probe_action unreachable)"
+    st_ps_check "incompatible file peer -> FAST named skip (fixture_incompatible class), never a 600s run" skip_incompatible "$(file_peer_probe_action handshake_failed)"
+    st_ps_check "probe malfunction -> loud legacy fallback" fallback_tcp "$(file_peer_probe_action probe_error)"
+
+    # The probe is PRE-FLIGHT by construction: its invocation (and therefore
+    # every one of its skip paths) must sit BEFORE the node launch in this
+    # file, so an incompatible fixture can never cost the measurement budget.
+    st_probe_line="$(grep -nF 'timeout 15 "$FS_HANDSHAKE_PROBE" "$file_peer_host" "$file_peer_port"' "${BASH_SOURCE[0]}" | head -n1 | cut -d: -f1)"
+    st_launch_line="$(grep -cE '^launch_node$' "${BASH_SOURCE[0]}")"
+    st_first_launch="$(grep -nE '^launch_node$' "${BASH_SOURCE[0]}" | head -n1 | cut -d: -f1)"
+    st_ps_check "the wiped node is launched exactly once from the top level (respawns go through launch_node())" 1 "$st_launch_line"
+    if [ -n "$st_probe_line" ] && [ -n "$st_first_launch" ] && \
+       [ "$st_probe_line" -lt "$st_first_launch" ]; then
+        st_order=ok
+    else
+        st_order=bad
+    fi
+    st_ps_check "the file-peer probe runs BEFORE the wiped node launches (pre-flight, not post-mortem)" ok "$st_order"
+
+    # The incompatible-fixture skip reason must carry the exact match
+    # substring the shared skip-class table keys on, so the collector and
+    # judge classify it fixture_incompatible (threshold 1 — never
+    # self-heals) rather than letting it drift to unclassified.
+    st_cls_match="$(sed -n 's/^STOPWATCH_SKIP_CLASS("fixture_incompatible",[ ]*[0-9][0-9]*,[ ]*"\(.*\)")[ ]*$/\1/p' \
+        "$REPO_ROOT/engine/services/include/services/stopwatch_skip_classes.def" | head -n1)"
+    st_ps_check "the shared skip-class table knows fixture_incompatible" \
+        "file_peer fixture incompatible" "$st_cls_match"
+    grep -qF "$st_cls_match" "${BASH_SOURCE[0]}"
+    st_check "this harness's skip reason carries the table's match substring" 0 $?
 
     # Multi-peer input is one ordered set: comma lists and repeated flags feed
     # the same helper, and exact duplicates cannot spend extra outbound slots.
@@ -2427,6 +2537,7 @@ write_artifact() {
         printf '  "peer_precheck": %s,\n' "$(json_string "$PEER_PRECHECK")"
         printf '  "peer_prechecks": [%s],\n' "$(peer_prechecks_json)"
         printf '  "file_peer": %s,\n' "$(json_string "$FILE_PEER")"
+        printf '  "file_peer_precheck": %s,\n' "$(json_string "$FILE_PEER_PRECHECK")"
         printf '  "header_source": %s,\n' "$(json_string "$HEADER_SOURCE")"
         printf '  "staged_bundle": %s,\n' "$(json_string "$BUNDLE_PATH")"
         printf '  "node_bin": %s,\n' "$(json_string "$NODE_BIN")"
@@ -2568,9 +2679,60 @@ if [ -n "$FILE_PEER" ]; then
     [ -n "$file_peer_host" ] && [ -n "$file_peer_port" ] && \
         [ "$file_peer_host" != "$file_peer_port" ] \
         || skip "invalid file-service peer address: $FILE_PEER"
-    if ! timeout 3 bash -c \
-        "exec 3<>/dev/tcp/$file_peer_host/$file_peer_port" 2>/dev/null; then
-        skip "file-service peer not reachable: $FILE_PEER"
+    # ── PRE-FLIGHT fixture-compatibility probe ────────────────────────────
+    # A bare TCP connect only proves SOMETHING listens. The measured defect
+    # this replaces: the serving fixture's binary predated the authenticated
+    # X25519/HKDF file-service handshake (d1db47aee7), passed the connect
+    # check, and every scheduled run then burned the full budget — the wiped
+    # node's boot could only log "directory: handshake failed ... — skipping
+    # seed" and fall back to from-genesis IBD, a measurement that can never
+    # pass. The probe (tools/fs_handshake_probe.c) performs the CLIENT half
+    # of the exact handshake the node's RLS directory fetch performs, so an
+    # incompatible fixture is named here in seconds. Bounded (5s budget +
+    # 15s backstop) and read-only against the peer (pubkey + key-
+    # confirmation exchange only, no frame ever requested).
+    if [ -x "$FS_HANDSHAKE_PROBE" ]; then
+        file_peer_probe_rc=0
+        timeout 15 "$FS_HANDSHAKE_PROBE" "$file_peer_host" "$file_peer_port" \
+            5000 >/dev/null 2>&1 || file_peer_probe_rc=$?
+        FILE_PEER_PRECHECK="$(classify_file_peer_probe "$file_peer_probe_rc")"
+        case "$(file_peer_probe_action "$FILE_PEER_PRECHECK")" in
+            continue)
+                echo "cold-start-wipe-stopwatch: file_peer=$FILE_PEER file_peer_precheck=handshake_ok"
+                ;;
+            skip_unreachable)
+                skip "file-service peer not reachable: $FILE_PEER"
+                ;;
+            skip_incompatible)
+                # ENVIRONMENT/fixture failure, NOT a product stall: the node
+                # under test never launched, so exit 2 (SKIP) with a named
+                # reason — the fixture_incompatible class in the shared skip
+                # table — never exit 4 (stalled-named, a claim about the
+                # node's own progress).
+                skip "file_peer fixture incompatible: $FILE_PEER accepted TCP but failed the authenticated X25519/HKDF file-service handshake — the serving fixture binary predates the file-service handshake (d1db47aee7) or the port is not a file service at all. Rebuild/restart the fixture peer before spending another stopwatch run; this cannot self-heal."
+                ;;
+            *)
+                # probe_error: the probe itself malfunctioned. That is not
+                # evidence about the fixture, so degrade to the legacy bare
+                # connect check, loudly, and record which check ran.
+                echo "cold-start-wipe-stopwatch: WARNING fs_handshake_probe rc=$file_peer_probe_rc — falling back to bare TCP connect precheck" >&2
+                FILE_PEER_PRECHECK="probe_error"
+                if ! timeout 3 bash -c \
+                    "exec 3<>/dev/tcp/$file_peer_host/$file_peer_port" 2>/dev/null; then
+                    skip "file-service peer not reachable: $FILE_PEER"
+                fi
+                ;;
+        esac
+    else
+        # Probe binary absent (never built on this host): the legacy bare
+        # connect check, recorded honestly. `make fs-handshake-probe` (a
+        # dependency of the mvp-coldstart-to-tip-stopwatch target) builds it.
+        echo "cold-start-wipe-stopwatch: WARNING $FS_HANDSHAKE_PROBE absent — file-peer precheck is a bare TCP connect only; build the probe for the fixture-compatibility check" >&2
+        FILE_PEER_PRECHECK="tcp_connect_only"
+        if ! timeout 3 bash -c \
+            "exec 3<>/dev/tcp/$file_peer_host/$file_peer_port" 2>/dev/null; then
+            skip "file-service peer not reachable: $FILE_PEER"
+        fi
     fi
 fi
 [ -z "$HEADER_SOURCE" ] || [ -d "$HEADER_SOURCE" ] \

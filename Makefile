@@ -7099,6 +7099,40 @@ $(BIN_DIR)/rom_bundle_sha3: tools/rom_bundle_sha3.c \
 	    -D_POSIX_C_SOURCE=200809L $(ZCL_PLATFORM_CPPFLAGS) \
 	    -o $@ $^ -lm
 
+# fs_handshake_probe: the C3 stopwatch's PRE-FLIGHT fixture-compatibility
+# probe (tools/scripts/cold_start_to_tip_stopwatch.sh). Performs the CLIENT
+# half of the exact authenticated X25519/HKDF file-service handshake the
+# wiped node's RLS directory fetch performs (fs_handshake_until,
+# core/modules/net/src/file_service_handshake.c) against the stated file
+# peer, so a fixture whose binary predates that handshake fails the run in
+# seconds (exit 4) instead of after the full budget — the measured defect
+# was a stale fixture passing the old bare-TCP-connect precheck and every
+# run burning 600s on a boot that could only log "directory: handshake
+# failed ... — skipping seed". Read-only against the peer (pubkey +
+# key-confirmation exchange only, no frame requested). Links the node's own
+# handshake TU and crypto, nothing from the frame codec.
+.PHONY: fs-handshake-probe
+fs-handshake-probe: $(BIN_DIR)/fs_handshake_probe
+$(BIN_DIR)/fs_handshake_probe: tools/fs_handshake_probe.c \
+		core/modules/net/src/file_service_handshake.c \
+		core/modules/crypto/src/curve25519.c core/modules/crypto/src/hkdf_sha3.c \
+		core/modules/crypto/src/hmac_sha3.c core/modules/crypto/src/x25519_safe.c \
+		core/modules/crypto/src/random_secret.c core/modules/core/src/random.c \
+		platform/modules/platform/src/rng.c platform/modules/platform/src/clock.c \
+		platform/modules/sha3/src/sha3.c core/modules/crypto/src/keccak_x4.c \
+		core/modules/crypto/src/simd_dispatch.c \
+		platform/modules/base/src/cleanse.c platform/modules/base/src/log_level.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic \
+	    $(ZCL_WARN_STRINGOP_OVERFLOW) \
+	    -Icore/modules/net/include -Icore/modules/crypto/include -Icore/modules/core/include \
+	    -Icore/math/include \
+	    -Iplatform/modules/sha3/include -Iplatform/modules/platform/include \
+	    -Iplatform/modules/base/include -Iplatform/modules/util/include \
+	    -Iplatform/modules/support/include -Ivendor/include \
+	    -D_POSIX_C_SOURCE=200809L $(ZCL_PLATFORM_CPPFLAGS) \
+	    -o $@ $^ -lpthread -lm
+
 # rom-bundle-replicate: copy a verified consensus-state bundle + its replay
 # receipt + a producing-binary hash record to a second directory, verified
 # byte-identical by SHA3 (tools/scripts/rom-bundle-replicate.sh). Point a
@@ -8895,8 +8929,17 @@ mvp-coldstart-to-tip-local: zclassic23 zcl-rpc
 # with no -fileservice peer"), and does a from-genesis IBD instead of the
 # bundle-then-fold path the ledger's numbers came from. Measured here
 # 2026-07-30: without it, H* pinned at 0 for the whole 600 s budget.
+#
+# fs-handshake-probe is a hard dependency: the harness runs it as the
+# PRE-FLIGHT fixture-compatibility check on --file-peer before launching the
+# wiped node, so a fixture whose binary predates the authenticated
+# X25519/HKDF file-service handshake fails the run in seconds (named skip
+# class fixture_incompatible) instead of after the full budget. Measured
+# 2026-09: a stale fixture passed the old bare-TCP-connect precheck and
+# every scheduled run burned 600s on a boot that could only log
+# "directory: handshake failed ... — skipping seed".
 .PHONY: mvp-coldstart-to-tip-stopwatch
-mvp-coldstart-to-tip-stopwatch: zclassic23
+mvp-coldstart-to-tip-stopwatch: zclassic23 fs-handshake-probe
 	@bash -c 'set -uo pipefail; \
 	 echo "══ MVP C3 STOPWATCH (real): wiped datadir -> checkpoint/fold -> peer tip, real wall-clock ══"; \
 	 if ! bash tools/scripts/cold_start_to_tip_stopwatch.sh --selftest >/dev/null 2>&1; then \

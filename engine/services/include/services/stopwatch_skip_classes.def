@@ -101,6 +101,18 @@ STOPWATCH_SKIP_CLASS("fixture_absent", 2, "is not a live process")
 STOPWATCH_SKIP_CLASS("fixture_absent", 2, "client RPC not reachable")
 STOPWATCH_SKIP_CLASS("fixture_absent", 2, "client not AT TIP before the cut")
 
+/* ── fixture_incompatible: the fixture ANSWERED but cannot serve this node.
+ * Measured 2026-09: the C3 serving fixture's binary predated the
+ * authenticated X25519/HKDF file-service handshake (d1db47aee7). It passed
+ * the stopwatch's bare TCP-connect file-peer precheck, the wiped node's boot
+ * logged "directory: handshake failed ... — skipping seed" and fell back to
+ * from-genesis IBD, and every scheduled run burned the full 600s budget for
+ * ~3 weeks — the longest silent failure the pre-flight probe
+ * (tools/fs_handshake_probe.c) now names in seconds. A stale binary produces
+ * the identical failure until someone rebuilds it: never self-heals, so
+ * threshold 1, same rule as config_error. */
+STOPWATCH_SKIP_CLASS("fixture_incompatible", 1, "file_peer fixture incompatible")
+
 /* ── harness_misuse: exit 2 without any artifact at all. The harnesses' argv
  * loops `exit 2` on an unknown flag WITHOUT calling skip(), so no proof.json
  * and no reason are written — yet the collector still records verdict=skip.
