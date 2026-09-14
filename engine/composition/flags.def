@@ -1770,7 +1770,7 @@ Z23_FLAG("ZCL_PV_PARALLEL_MIN_SHIELDED", "env_runtime", "-", "-",
 Z23_FLAG("ZCL_PV_TRACE", "env_runtime", "-", "-",
           "undocumented; first use engine/jobs/src/proof_validate_trace.c:44")
 Z23_FLAG("ZCL_PV_WORKERS", "env_runtime", "-", "-",
-          "first use engine/jobs/src/pv_lookahead.c:300; documented at docs/CAPABILITY_INVENTORY.jsonl:927: {'record':'capability','header':'engine/jobs/include/jobs/pv_lookahead.h','include_toke...")
+          "first use engine/jobs/src/pv_lookahead.c:434; documented at docs/CAPABILITY_INVENTORY.jsonl:927: {'record':'capability','header':'engine/jobs/include/jobs/pv_lookahead.h','include_toke...")
 Z23_FLAG("ZCL_QUALITY_LOG_KEEP", "env_build", "8", "-",
           "first use tools/scripts/quality_log_retention.sh:13; documented at docs/AGENT_API.md:1414: with ZCL_QUALITY_LOG_KEEP / ZCL_QUALITY_LOG_MAX_BYTES.")
 Z23_FLAG("ZCL_QUALITY_LOG_MAX_BYTES", "env_build", "1073741824", "-",

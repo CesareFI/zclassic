@@ -71,6 +71,16 @@ struct pv_lookahead_verdict {
  * exact-key cache bounded to only a few hundred KiB. */
 #define PV_LOOKAHEAD_WINDOW 2048
 
+/* Per-height read-failure budget for HAVE_DATA-but-unreadable ("bodiless")
+ * coordinates: a height whose body read fails in this many consecutive
+ * logical sweeps is treated as bodiless and skipped with zero further preads
+ * — an ordinary cache miss the serial drive's authoritative reader diagnoses
+ * — until a reset trigger fires: a successful read, HAVE_DATA clearing
+ * (body_persist's refetch requeue IS that signal; the pool has no other body
+ * generation to observe), or a pool reset/rewind. Genuine !HAVE_DATA status
+ * gaps are unaffected: they never pread and re-sweep forever. */
+#define PVLA_BODILESS_STRIKE_CAP 4
+
 /* Start the pool: min(cores-2, 8) workers (>=1), env ZCL_PV_WORKERS override
  * (clamped 1..16). `reader`/`reader_user` NULL selects the production pread
  * path (deliberately bypassing block_parse_cache so lookahead reads never
@@ -97,15 +107,19 @@ bool pv_lookahead_take(int height, const struct uint256 *block_hash,
                        struct pv_lookahead_verdict *out);
 
 /* Telemetry: consume-time hits/misses (counted only while running) and the
- * number of currently populated slots (tests use it to await warm-up). */
+ * number of currently populated slots (tests use it to await warm-up).
+ * pv_lookahead_bodiless_skipped_total counts heights strike-capped as
+ * bodiless since pool start (one LOG_WARN each, with height/file/pos). */
 uint64_t pv_lookahead_hit_total(void);
 uint64_t pv_lookahead_miss_total(void);
 uint64_t pv_lookahead_populated(void);
+uint64_t pv_lookahead_bodiless_skipped_total(void);
 
 /* See CLAUDE.md "Adding state introspection". Reentrant-safe. Reports the
  * pool's running flag, worker count, window, queue depth (warmed-not-consumed
  * verdicts), cache hits/misses/hit_rate, verdicts_produced, pre-verify
- * throughput (blk/s), and supervisor liveness-tree membership. */
+ * throughput (blk/s), bodiless_skipped_total, and supervisor liveness-tree
+ * membership. */
 struct json_value;
 bool pv_lookahead_dump_state_json(struct json_value *out, const char *key);
 

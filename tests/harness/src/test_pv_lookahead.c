@@ -11,7 +11,11 @@
  * totals. Poisoned-proof, wrong-hash cache-miss, all-miss fallback, and the
  * internal-error-never-cached TL-2 hold are each pinned the same way. One leg
  * runs the REAL verifier (sapling params + ed25519 joinsplit check) instead of
- * the injected one. */
+ * the injected one. Scenario 7 pins the bodiless-HAVE_DATA storm bound:
+ * read attempts over an all-HAVE_DATA unreadable window must quiesce to zero
+ * after the per-sweep strike budget lapses, transient failures under the cap
+ * must still heal, and the reset triggers (successful read, HAVE_DATA clear)
+ * must re-admit a capped height. */
 
 #include "test/test_core.h"
 #include "test/block_fixtures.h"
@@ -35,6 +39,7 @@
 #include "validation/main_state.h"
 
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -495,6 +500,204 @@ static bool la_results_identical(const struct la_result *a,
     return true;
 }
 
+/* ── 7) bodiless HAVE_DATA read-retry storm bound ──────────────────────────
+ *
+ * The block index can carry BLOCK_HAVE_DATA for blk files absent on disk.
+ * Every such height must converge to QUIET: a bounded per-height retry
+ * budget (per logical sweep, not per worker attempt), then zero preads — an
+ * ordinary cache miss the serial drive's authoritative reader diagnoses.
+ * These scenarios pin storm→quiescence (counting dead reader, 1 worker),
+ * transient-failure healing under the cap, and the reset triggers. */
+
+/* Minimal pool fixture: 8-height all-HAVE_DATA chain, stage initialized at
+ * cursor 0, no drain — the workers sweep the window freely. */
+struct la_pool_fixture {
+    char dir[256];
+    struct main_state ms;
+    struct la_chain sc;
+    bool ok;
+    bool stage_up;
+};
+
+static void la_pool_fixture_init(struct la_pool_fixture *fx, const char *tag,
+                                 int n)
+{
+    memset(fx, 0, sizeof(*fx));
+    test_make_tmpdir(fx->dir, sizeof(fx->dir), "pv_lookahead", tag);
+    fx->ok = progress_store_open(fx->dir);
+    active_chain_init(&fx->ms.chain_active);
+    fx->ok = fx->ok && la_chain_build(&fx->sc, n, false);
+    if (!fx->ok)
+        return;
+    active_chain_move_window_tip(&fx->ms.chain_active, &fx->sc.blocks[n - 1]);
+    fx->ok = la_seed_script_validate(progress_store_db(), &fx->sc) &&
+             la_seed_stage_cursor(progress_store_db(), "proof_validate", 0) &&
+             proof_validate_stage_init(&fx->ms);
+    fx->stage_up = fx->ok;
+}
+
+static void la_pool_fixture_destroy(struct la_pool_fixture *fx)
+{
+    if (fx->stage_up)
+        proof_validate_stage_shutdown();   /* stops the pool first */
+    la_chain_free(&fx->sc);
+    active_chain_free(&fx->ms.chain_active);
+    progress_store_close();
+    test_cleanup_tmpdir(fx->dir);
+}
+
+/* Counting never-reader: every body-read attempt is counted, none succeeds. */
+struct la_counting_dead {
+    _Atomic uint64_t attempts;
+};
+
+static bool la_reader_counting_dead(struct block *out,
+                                    const struct block_index *bi,
+                                    const char *datadir, void *user)
+{
+    (void)out; (void)bi; (void)datadir;
+    struct la_counting_dead *cd = user;
+    atomic_fetch_add(&cd->attempts, 1);
+    return false;
+}
+
+/* 7a primary born-red: one worker, 8 bodiless HAVE_DATA heights. Read
+ * attempts over the window must go to ZERO once the retry budget lapses
+ * (pre-fix: ~60+ reads per 0.4 s and climbing), and the lifetime total must
+ * stay bounded by heights x per-sweep strike budget. */
+static int la_test_bodiless_storm(void)
+{
+    int failures = 0;
+    /* Deterministic sweep cadence: a single worker owns every claim. */
+    setenv("ZCL_PV_WORKERS", "1", 1);
+    struct la_pool_fixture fx;
+    la_pool_fixture_init(&fx, "storm", 8);
+    struct la_counting_dead cd = { 0 };
+    bool started = fx.ok &&
+        pv_lookahead_start(&fx.ms, fx.dir, la_reader_counting_dead, &cd,
+                           la_verifier, &fx.sc);
+    PVLA_CHECK("storm: pool starts on an all-HAVE_DATA bodiless window",
+               started);
+    if (started) {
+        platform_sleep_ms(1000);
+        uint64_t c1 = atomic_load(&cd.attempts);
+        platform_sleep_ms(400);
+        uint64_t c2 = atomic_load(&cd.attempts);
+        PVLA_CHECK("storm: read attempts go to ZERO after the budget lapses",
+                   c2 == c1);
+        PVLA_CHECK("storm: attempts bounded by heights x strike budget",
+                   c2 > 0 &&
+                   c2 <= (uint64_t)(8 * PVLA_BODILESS_STRIKE_CAP));
+        PVLA_CHECK("storm: every bodiless height warned + counted once",
+                   pv_lookahead_bodiless_skipped_total() == 8);
+    }
+    la_pool_fixture_destroy(&fx);
+    return failures;
+}
+
+/* Fail the first k attempts at each height, then delegate to la_reader. */
+struct la_flaky {
+    struct la_chain *sc;
+    int k;
+    _Atomic int seen[64];
+};
+
+static bool la_reader_flaky(struct block *out, const struct block_index *bi,
+                            const char *datadir, void *user)
+{
+    struct la_flaky *fl = user;
+    if (!fl || !fl->sc || !bi || bi->nHeight < 0 || bi->nHeight >= 64)
+        return false;
+    if (atomic_fetch_add(&fl->seen[bi->nHeight], 1) < fl->k)
+        return false;
+    return la_reader(out, bi, datadir, fl->sc);
+}
+
+/* Born-green: a reader that fails K < cap times per height then succeeds
+ * must still heal — the transient failures never trip the cap and every
+ * height populates. */
+static int la_test_bodiless_heal(void)
+{
+    int failures = 0;
+    setenv("ZCL_PV_WORKERS", "1", 1);
+    struct la_pool_fixture fx;
+    la_pool_fixture_init(&fx, "heal", 8);
+    struct la_flaky fl = { .sc = &fx.sc,
+                           .k = PVLA_BODILESS_STRIKE_CAP - 1,
+                           .seen = { 0 } };
+    bool started = fx.ok &&
+        pv_lookahead_start(&fx.ms, fx.dir, la_reader_flaky, &fl,
+                           la_verifier, &fx.sc);
+    PVLA_CHECK("heal: pool starts with a transient-failure reader", started);
+    if (started) {
+        PVLA_CHECK("heal: K < cap failures still populate every height",
+                   la_wait_populated(8, 10000));
+        PVLA_CHECK("heal: no height ever tripped the bodiless cap",
+                   pv_lookahead_bodiless_skipped_total() == 0);
+    }
+    la_pool_fixture_destroy(&fx);
+    return failures;
+}
+
+/* Gated counting reader: closed — count + fail; open — delegate. */
+struct la_gated {
+    struct la_chain *sc;
+    _Atomic uint64_t attempts;
+    _Atomic bool open;
+};
+
+static bool la_reader_gated(struct block *out, const struct block_index *bi,
+                            const char *datadir, void *user)
+{
+    struct la_gated *g = user;
+    atomic_fetch_add(&g->attempts, 1);
+    if (!atomic_load(&g->open))
+        return false;
+    return la_reader(out, bi, datadir, g->sc);
+}
+
+/* Reset semantics. Cap all 8 heights (attempts quiesce), then:
+ *  - the bodies becoming readable WITHOUT a status flip must NOT heal a
+ *    capped height (fail-closed: an unreadable-then-readable body is still
+ *    only re-read after the drive's HAVE_DATA clear);
+ *  - clearing HAVE_DATA resets the strikes and drops the height into the
+ *    cheap no-pread status-gap path;
+ *  - re-setting HAVE_DATA (refetch complete) heals it fully. */
+static int la_test_bodiless_reset(void)
+{
+    int failures = 0;
+    setenv("ZCL_PV_WORKERS", "1", 1);
+    struct la_pool_fixture fx;
+    la_pool_fixture_init(&fx, "reset", 8);
+    struct la_gated g = { .sc = &fx.sc, .attempts = 0, .open = false };
+    bool started = fx.ok &&
+        pv_lookahead_start(&fx.ms, fx.dir, la_reader_gated, &g,
+                           la_verifier, &fx.sc);
+    PVLA_CHECK("reset: pool starts behind a closed gate", started);
+    if (started) {
+        platform_sleep_ms(1000);   /* strike budget lapses; storm quiesces */
+        uint64_t c1 = atomic_load(&g.attempts);
+        PVLA_CHECK("reset: all 8 heights capped as bodiless",
+                   pv_lookahead_bodiless_skipped_total() == 8);
+        atomic_store(&g.open, true);
+        platform_sleep_ms(400);
+        PVLA_CHECK("reset: no re-read without a HAVE_DATA flip (fail-closed)",
+                   atomic_load(&g.attempts) == c1 &&
+                   pv_lookahead_populated() == 0);
+        for (int i = 0; i < 8; i++)
+            block_index_status_clear_bits(&fx.sc.blocks[i], BLOCK_HAVE_DATA);
+        platform_sleep_ms(300);
+        PVLA_CHECK("reset: HAVE_DATA clear re-enters the cheap status gap",
+                   atomic_load(&g.attempts) == c1);
+        for (int i = 0; i < 8; i++)
+            block_index_status_fetch_or(&fx.sc.blocks[i], BLOCK_HAVE_DATA);
+        PVLA_CHECK("reset: refetched heights heal and populate",
+                   la_wait_populated(8, 10000));
+    }
+    la_pool_fixture_destroy(&fx);
+    return failures;
+}
+
 /* ── the tests ───────────────────────────────────────────────────────────── */
 
 static bool la_params_available(void)
@@ -688,6 +891,12 @@ int test_pv_lookahead(void)
         PVLA_CHECK("internal: h0 was a hit, h1 was an inline miss",
                    pooled.hits >= 1 && pooled.misses >= 1);
     }
+
+    /* 7) Bodiless HAVE_DATA storm bound (own functions: this one's branch
+     * count is pinned by the shrink-only complexity ratchet). */
+    failures += la_test_bodiless_storm();
+    failures += la_test_bodiless_heal();
+    failures += la_test_bodiless_reset();
 
     printf("pv_lookahead tests: %s\n", failures ? "FAILED" : "PASSED");
     return failures;
