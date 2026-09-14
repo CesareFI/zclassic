@@ -497,6 +497,34 @@ static bool db_mig_seed_v81_board_schema(sqlite3 *raw)
         "room TEXT NOT NULL DEFAULT '' CHECK(length(room)<=32))");
     ok = ok && db_mig_exec_raw(raw,
         "CREATE UNIQUE INDEX idx_fleet_board_seq ON fleet_board_posts(seq)");
+    /* A real v81 database also carries the v40 store_purchases table; the
+     * seed must too, because the v83 seller_onion step now runs above the
+     * v82 rebuild this fixture exists to prove. Seeded in its exact
+     * pre-v83 shape (order_id-only uniqueness, no seller_onion) so the v83
+     * ALTER + index swap runs against the same bytes a real v81 node
+     * holds. */
+    ok = ok && db_mig_exec_raw(raw,
+        "CREATE TABLE store_purchases("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "order_id INTEGER NOT NULL,"
+        "product_id INTEGER NOT NULL,"
+        "product_name TEXT NOT NULL DEFAULT '',"
+        "token_id TEXT NOT NULL DEFAULT '',"
+        "payment_addr TEXT NOT NULL,"
+        "customer_addr TEXT NOT NULL DEFAULT '',"
+        "memo TEXT NOT NULL,"
+        "amount_zatoshi INTEGER NOT NULL,"
+        "content_hash BLOB "
+        "  CHECK(content_hash IS NULL OR length(content_hash)=32),"
+        "output_path TEXT NOT NULL DEFAULT '',"
+        "operation_id TEXT NOT NULL DEFAULT '',"
+        "stage INTEGER NOT NULL,"
+        "last_error TEXT NOT NULL DEFAULT '',"
+        "created_at INTEGER NOT NULL,"
+        "updated_at INTEGER NOT NULL)");
+    ok = ok && db_mig_exec_raw(raw,
+        "CREATE UNIQUE INDEX idx_store_purchases_order "
+        "ON store_purchases(order_id)");
     return ok;
 }
 

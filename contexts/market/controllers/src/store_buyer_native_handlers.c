@@ -242,6 +242,70 @@ void zcl_native_handle_store_order(
     reply->error.mutated = true;
 }
 
+/* ── app.store.remotebuy ────────────────────────────────────────────── */
+
+void zcl_native_handle_store_remotebuy(
+    const struct zcl_command_request *request, struct zcl_command_reply *reply)
+{
+    const struct json_value *in = request->input;
+    const char *seller = json_get_str(json_get(in, "seller_onion"));
+    int64_t product_id = json_get_int_or(in, "product_id", 0);
+    const char *addr = json_get_str(json_get(in, "customer_address"));
+    const char *out_path = json_get_str(json_get(in, "output_path"));
+    const char *pay_kind = json_get_str(json_get(in, "payment_kind"));
+
+    if (!seller || !seller[0]) {
+        sbn_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+                 "MISSING_SELLER_ONION", "normalize",
+                 "seller_onion is required — the v3 onion address of the "
+                 "store you are buying from", "seller_onion");
+        return;
+    }
+    if (product_id <= 0) {
+        sbn_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+                 "INVALID_PRODUCT_ID", "normalize",
+                 "product_id must be a positive integer", "product_id");
+        return;
+    }
+    if (!addr || !addr[0]) {
+        sbn_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+                 "MISSING_CUSTOMER_ADDRESS", "normalize",
+                 "customer_address is required — it is where the merchant "
+                 "mints the access token that unlocks the file",
+                 "customer_address");
+        return;
+    }
+
+    struct rpc_arg_builder p;
+    rpc_arg_builder_init(&p);
+    rpc_arg_builder_push_str(&p, seller);
+    rpc_arg_builder_push_int(&p, product_id);
+    rpc_arg_builder_push_str(&p, addr);
+    /* Positional RPC: payment_kind sits in slot 5, so an absent output_path
+     * still has to occupy slot 4 when a kind was given. */
+    if ((out_path && out_path[0]) || (pay_kind && pay_kind[0]))
+        rpc_arg_builder_push_str(&p, out_path ? out_path : "");
+    if (pay_kind && pay_kind[0])
+        rpc_arg_builder_push_str(&p, pay_kind);
+    char *params = rpc_arg_builder_to_json(&p);
+    if (!params) {
+        sbn_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INTERNAL,
+                 "ARG_BUILD_FAILED", "normalize",
+                 "could not encode the storebuy_remote_order parameters",
+                 "app.store.remotebuy");
+        return;
+    }
+    struct json_value doc;
+    json_init(&doc);
+    bool ok = sbn_call(reply, "storebuy_remote_order", params, &doc);
+    free(params);
+    if (!ok)
+        return;
+    sbn_merge(&reply->data, &doc);
+    json_free(&doc);
+    reply->error.mutated = true;
+}
+
 /* ── app.store.pay ──────────────────────────────────────────────────── */
 
 /* Deterministic, non-secret plan token binding a plan preview to the exact

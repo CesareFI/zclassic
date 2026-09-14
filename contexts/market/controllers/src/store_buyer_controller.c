@@ -73,6 +73,7 @@ static void sbc_push_purchase(struct json_value *into,
     (void)json_push_kv_str(into, "payment_address", p->payment_addr);
     (void)json_push_kv_str(into, "customer_address", p->customer_addr);
     (void)json_push_kv_str(into, "memo", p->memo);
+    (void)json_push_kv_str(into, "seller_onion", p->seller_onion);
     (void)json_push_kv_int(into, "amount_zatoshi", p->amount_zatoshi);
     (void)json_push_kv_str(into, "stage", store_purchase_stage_name(p->stage));
     (void)json_push_kv_bool(into, "has_file", p->has_content_hash);
@@ -183,6 +184,68 @@ static bool rpc_storebuy_order(const struct json_value *params, bool help,
     sbc_ok(result);
     (void)json_push_kv_int(result, "purchase_id", placed.purchase_id);
     (void)json_push_kv_int(result, "order_id", placed.order_id);
+    (void)json_push_kv_str(result, "payment_address", placed.payment_addr);
+    (void)json_push_kv_str(result, "memo", placed.memo);
+    (void)json_push_kv_int(result, "amount_zatoshi", placed.amount_zatoshi);
+    return true;
+}
+
+/* ── storebuy_remote_order ──────────────────────────────────────────── */
+
+static bool rpc_storebuy_remote_order(const struct json_value *params,
+                                      bool help, struct json_value *result)
+{
+    if (help || !params || json_size(params) < 3) {
+        json_set_str(result,
+            "storebuy_remote_order \"seller_onion\" product_id "
+            "\"customer_address\" [\"output_path\"] [\"payment_kind\"]\n"
+            "\nPlace an order on ANOTHER node's store, reached over Tor\n"
+            "through the seller's onion service. The product page, the\n"
+            "order POST and (via storebuy_status / storebuy_collect, which\n"
+            "route by the purchase's recorded seller) the status poll and\n"
+            "the gated download all ride the onion fetch, so the merchant's\n"
+            "CSRF check, proof-of-work gate, pending-order caps and onion\n"
+            "rate limits all apply exactly as they do to a browser.\n"
+            "\nArguments:\n"
+            "1. seller_onion     (string) the seller's v3 onion address\n"
+            "2. product_id       (numeric) an active product on that store\n"
+            "3. customer_address (string) transparent address the merchant\n"
+            "                    mints access tokens to\n"
+            "4. output_path      (string, optional) where the purchased file\n"
+            "                    will be written when it is collected\n"
+            "5. payment_kind     (string, optional) \"shielded\" (default) or\n"
+            "                    \"transparent\"\n"
+            "\nResult: {ok, purchase_id, order_id, seller_onion,\n"
+            "         payment_address, memo, amount_zatoshi}\n");
+        return help;
+    }
+    const char *datadir = sbc_datadir();
+    if (!datadir)
+        return sbc_refuse(result, STORE_BUYER_ERR_DB, "no data directory wired");
+
+    const char *seller = json_get_str(json_at(params, 0));
+    int64_t product_id = json_get_int(json_at(params, 1));
+    const char *addr = json_get_str(json_at(params, 2));
+    const char *out_path = json_size(params) >= 4
+                               ? json_get_str(json_at(params, 3)) : NULL;
+    const char *kind = json_size(params) >= 5
+                           ? json_get_str(json_at(params, 4)) : NULL;
+    bool transparent = kind && strcmp(kind, "transparent") == 0;
+    if (!seller || !seller[0])
+        return sbc_refuse(result, STORE_BUYER_ERR_ARGS,
+                          "seller_onion is required");
+
+    struct store_buyer_order placed;
+    struct zcl_result r =
+        store_buyer_remote_order(datadir, seller, product_id, addr, out_path,
+                                 transparent, &placed);
+    if (!r.ok)
+        return sbc_refuse(result, r.code, r.message);
+
+    sbc_ok(result);
+    (void)json_push_kv_int(result, "purchase_id", placed.purchase_id);
+    (void)json_push_kv_int(result, "order_id", placed.order_id);
+    (void)json_push_kv_str(result, "seller_onion", seller);
     (void)json_push_kv_str(result, "payment_address", placed.payment_addr);
     (void)json_push_kv_str(result, "memo", placed.memo);
     (void)json_push_kv_int(result, "amount_zatoshi", placed.amount_zatoshi);
@@ -474,6 +537,7 @@ void register_store_buyer_rpc_commands(struct rpc_table *t)
     struct rpc_command cmds[] = {
         { "store", "storebuy_catalog", rpc_storebuy_catalog, true },
         { "store", "storebuy_order",   rpc_storebuy_order,   false },
+        { "store", "storebuy_remote_order", rpc_storebuy_remote_order, false },
         { "store", "storebuy_pay",     rpc_storebuy_pay,     false },
         { "store", "storebuy_status",  rpc_storebuy_status,  true },
         { "store", "storebuy_collect", rpc_storebuy_collect, false },

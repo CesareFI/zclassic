@@ -32,6 +32,19 @@ static bool fleet_board_posts_v81_scope_present(struct node_db *ndb)
                "scope", &type, NULL, NULL, NULL, NULL) == SQLITE_OK;
 }
 
+/* True once store_purchases already carries the v83 `seller_onion` column.
+ * Same re-migration guard as fleet_board_posts_v81_scope_present(): a
+ * database that reached v83 and is later re-migrated from a schema_version
+ * stamped back below 83 must not re-run the ADD COLUMN. */
+static bool store_purchases_v83_seller_onion_present(struct node_db *ndb)
+{
+    const char *type = NULL;
+    return ndb && ndb->open &&
+           sqlite3_table_column_metadata(
+               ndb->db, NULL, "store_purchases",
+               "seller_onion", &type, NULL, NULL, NULL, NULL) == SQLITE_OK;
+}
+
 /* v82 step 1: rebuild `fleet_board_posts` with `kind` widened to admit 1..64,
  * far past today's 8 known kinds (through `agents`), so a future kind never
  * forces another one-way table rebuild. The C layer stays the real gate: rows
@@ -122,6 +135,47 @@ static int db_migrate_step_82(struct node_db *ndb, int *current_ver,
     if (db_migrate_v82_agents_kind(ndb) < 0) return -1;
     DB_MIGRATE_PERSIST_VERSION_FLOOR(ndb, 82, floor_ver);
     *current_ver = 82;
+    (*applied)++;
+    return 0;
+}
+
+/* v83: the buyer-side store purchase records WHICH merchant it is owed by.
+ * seller_onion is empty for this node's own store (every pre-v83 row) and
+ * carries the seller's v3 onion address for a remote purchase placed over
+ * Tor (the C5 onion buy). Merchant order ids are per-merchant sequences —
+ * two sellers hand out the same id — so the idempotence uniqueness moves
+ * from order_id alone to (seller_onion, order_id); the constant default
+ * backfills every existing row into the local seller's scope. ADD COLUMN
+ * plus an index swap is enough: no CHECK widening, no table rebuild. A
+ * database already carrying the column skips the swap entirely (see
+ * store_purchases_v83_seller_onion_present() above).
+ *
+ * Wraps its own `current_ver < 83` check, same reasoning as
+ * db_migrate_step_82 above — and keeps the caller under its pinned
+ * cyclomatic complexity. */
+static int db_migrate_step_83(struct node_db *ndb, int *current_ver,
+                              int *floor_ver, int *applied)
+{
+    if (*current_ver >= 83) return 0;
+    if (!store_purchases_v83_seller_onion_present(ndb)) {
+        if (!node_db_exec(ndb,
+                "ALTER TABLE store_purchases ADD COLUMN seller_onion TEXT "
+                "NOT NULL DEFAULT '' CHECK(length(seller_onion)<=62)"))
+            LOG_ERR("db", "migrate v83: store_purchases seller_onion failed");
+        if (!node_db_exec(ndb,
+                "DROP INDEX IF EXISTS idx_store_purchases_order"))
+            LOG_ERR("db", "migrate v83: store_purchases index drop failed");
+        if (!node_db_exec(ndb,
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_store_purchases_order "
+                "ON store_purchases(seller_onion,order_id)"))
+            LOG_ERR("db", "migrate v83: store_purchases index failed");
+    }
+    if (!node_db_exec(ndb,
+            "INSERT OR IGNORE INTO schema_migrations(version) "
+            "VALUES('083')"))
+        LOG_ERR("db", "migrate v83: migration stamp failed");
+    DB_MIGRATE_PERSIST_VERSION_FLOOR(ndb, 83, *floor_ver);
+    *current_ver = 83;
     (*applied)++;
     return 0;
 }
@@ -764,6 +818,7 @@ int node_db_migrate_features_v67_up(struct node_db *ndb, int *version,
     }
     (void)db_migrate_step_81(ndb, &current_ver, &floor_ver, &applied);
     (void)db_migrate_step_82(ndb, &current_ver, &applied, floor_ver);
+    (void)db_migrate_step_83(ndb, &current_ver, &floor_ver, &applied);
     *version = current_ver;
     *floor = floor_ver;
     return applied;

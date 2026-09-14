@@ -148,3 +148,7 @@ later lane flips it HARD.
 - 2026-09-14T02:25:42Z — REASON: ACTIVE1 dl received-pending tombstone in core/modules/net download accounting (already reviewed+tested f6705235fd)
   old ROOT: a13489b1ee0f1a5d4fcbfb0f1d05e497c81ce3fb616782580daa305eb1ecc9ab
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-14T10:53:01Z — REASON: c5-dynhost-post-client
+  old ROOT: fffed5da03d6bce0933d89209fc4ba2ad7077b9c1d94452f0d173ca426014017
+  by: owner unseal ritual (make core-unseal)

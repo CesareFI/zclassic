@@ -24,6 +24,13 @@
  * can answer with fits here too. Heap, not stack — it is 96 KiB. */
 enum { SB_RESP_MAX = 96 * 1024 };
 
+/* Budget for one blocking onion fetch (product JSON, product page, order
+ * POST, order-status poll, gated collect). A first fetch to a freshly
+ * published onion service can wait out a full rendezvous-circuit build,
+ * which comfortably exceeds the 60s fetch default; two minutes matches the
+ * operator-facing patience of the market onion delivery path. */
+enum { SB_ONION_TIMEOUT_SECS = 120 };
+
 /* Failure literal carrying one store_buyer_status as the result code and its
  * canonical one-line explanation as the message. */
 #define SB_FAIL(st) ZCL_ERR((int)(st), "%s", store_buyer_status_message(st))

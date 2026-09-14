@@ -225,6 +225,18 @@ int tor_integration_fetch_onion(const char *onion_address,
                                  void *ctx,
                                  int timeout_secs);
 
+/* POST variant of tor_integration_fetch_onion: same queueing, threading
+ * and callback contract, carrying an explicit bounded request body (the
+ * dynhost client refuses a body over 16 KiB). The store order form rides
+ * this; the GET entry points are unchanged wrappers. */
+int tor_integration_fetch_onion_post(const char *onion_address,
+                                      const char *path,
+                                      const uint8_t *body,
+                                      size_t body_len,
+                                      tor_fetch_callback_fn callback,
+                                      void *ctx,
+                                      int timeout_secs);
+
 /* Thread-safe result structure for blocking callers. */
 struct onion_fetch_result {
     _Atomic int complete;   /* 0=pending, 1=done, -1=error */
@@ -239,5 +251,14 @@ int tor_integration_fetch_onion_blocking(const char *onion_address,
                                           const char *path,
                                           struct onion_fetch_result *result,
                                           int timeout_secs);
+
+/* Blocking variant of tor_integration_fetch_onion_post: same result
+ * contract as tor_integration_fetch_onion_blocking. */
+int tor_integration_fetch_onion_post_blocking(const char *onion_address,
+                                               const char *path,
+                                               const uint8_t *body,
+                                               size_t body_len,
+                                               struct onion_fetch_result *result,
+                                               int timeout_secs);
 
 #endif

@@ -2362,6 +2362,9 @@ void zcl_native_handle_store_catalog(
 void zcl_native_handle_store_order(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+void zcl_native_handle_store_remotebuy(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
 void zcl_native_handle_store_pay(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);

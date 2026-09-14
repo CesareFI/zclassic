@@ -74,17 +74,17 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 881 |
+| Registry entries (branches + leaves) | 882 |
 | Top-level roots | 14 |
 | Branches | 198 |
-| Leaves (dispatchable command paths) | 683 |
-| … `ready` (live handler in this build) | 606 |
+| Leaves (dispatchable command paths) | 684 |
+| … `ready` (live handler in this build) | 607 |
 | … `compat` (metadata only, names a fallback) | 47 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 46 |
-| Leaves with `effect=mutate` | 246 |
+| Leaves with `effect=mutate` | 247 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 128 |
+| Leaves requiring **owner** authority | 129 |
 
 Per source file:
 
@@ -94,7 +94,7 @@ Per source file:
 | `engine/composition/commands/core.def` | 122 | 29 | 93 |
 | `engine/composition/commands/apps.def` | 16 | 3 | 13 |
 | `engine/composition/commands/app_features.def` | 75 | 20 | 55 |
-| `engine/composition/commands/store.def` | 18 | 0 | 18 |
+| `engine/composition/commands/store.def` | 19 | 0 | 19 |
 | `engine/composition/commands/ops.def` | 59 | 11 | 48 |
 | `engine/composition/commands/dev.def` | 109 | 22 | 87 |
 | `engine/composition/commands/code.def` | 33 | 4 | 29 |
@@ -556,6 +556,7 @@ represented by its children's sections.
 | `app store products` | ready | read / read / operator · fast/low | `datadir` | `zcl.app_store_products.v1` | `z23 app store products` | List the store's active products |
 | `app store catalog` | ready | read / read / operator · fast/low | none | `zcl.store_catalog.v1` | `z23 app store catalog` | List what the store sells |
 | `app store order` | ready | mutate / app-write / **owner** · foreground/moderate | `product_id`, `customer_address`, `output_path`, `payment_kind` | `zcl.store_order.v1` | `z23 app store order --input='{"product_id":1,"customer_address":"t1...","output_path":"/tmp/bought.bin"}'` | Place an order for a product |
+| `app store remotebuy` | ready | mutate / app-write / **owner** · foreground/moderate | **`seller_onion`**, **`product_id`**, **`customer_address`**, `output_path`, `payment_kind` | `zcl.store_remotebuy.v1` | `z23 app store remotebuy --input='{"seller_onion":"abc...xyz.onion","product_id":1,"customer_address":"t1...","output_path":"/tmp/bought.bin"}'` | Place an order on another node's store, over Tor |
 | `app store pay` | ready | mutate / wallet / **owner**, plan-commit · foreground/high | `purchase_id`, `from_address`, `confirm` | `zcl.store_pay.v1` | `z23 app store pay --input='{"purchase_id":1,"from_address":"t1...","confirm":true}'` | Pay a placed order |
 | `app store purchases` | ready | read / read / operator · fast/low | **`purchase_id`** | `zcl.store_purchases.v1` | `z23 app store purchases` | Show purchases and what is still owed |
 | `app store collect` | ready | mutate / app-write / **owner** · foreground/moderate | **`purchase_id`**, `output_path` | `zcl.store_collect.v1` | `z23 app store collect --input='{"purchase_id":1,"output_path":"/tmp/bought.bin"}'` | Download a purchase you paid for |

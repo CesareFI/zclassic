@@ -61,6 +61,36 @@ ZCL_COMMAND_READY_COMMAND(
     zcl_native_handle_store_order)
 
 ZCL_COMMAND_READY_COMMAND(
+    "app.store.remotebuy", "app.store", "",
+    "Place an order on another node's store, over Tor",
+    "The placed order's purchase id, merchant order id, one-time payment "
+    "address, the memo that binds a payment to it, and the amount owed — "
+    "for a store served by ANOTHER node's onion service. The product page, "
+    "the order POST, and (via app.store.purchases / app.store.collect, "
+    "which route by the purchase's recorded seller) the status poll and "
+    "the gated download all ride the embedded-Tor onion fetch, so the "
+    "merchant's CSRF token, proof-of-work puzzle, pending-order caps and "
+    "onion rate limits all apply exactly as they do to a Tor Browser user. "
+    "Requires -tor; payment itself is the unchanged local storebuy pay "
+    "step. Placing the same order twice returns the existing purchase "
+    "rather than a second obligation.", 0,
+    "store,order,buy,purchase,onion,tor,remote",
+    "zcl.store_remotebuy.input.v1", "zcl.store_remotebuy.v1",
+    "seller_onion,product_id,customer_address,output_path,payment_kind",
+    "seller_onion,product_id,customer_address",
+    "z23 app store remotebuy --input='{\"seller_onion\":\"abc...xyz.onion\","
+    "\"product_id\":1,\"customer_address\":\"t1...\","
+    "\"output_path\":\"/tmp/bought.bin\"}'",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_store_remotebuy)
+
+ZCL_COMMAND_READY_COMMAND(
     "app.store.pay", "app.store", "", "Pay a placed order",
     "Plan/commit shielded payment for one purchase: without confirm, a "
     "non-mutating plan naming the purchase, amount and funding address plus "

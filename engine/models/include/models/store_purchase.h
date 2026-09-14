@@ -18,8 +18,15 @@
  *   content_hash                — verify the bytes before writing them
  *   output_path                 — where the verified bytes land
  *   stage/last_error            — where we got to, and why we stopped
+ *   seller_onion                — which merchant serves this purchase
+ *                                 ("" = this node's own store); merchant
+ *                                 order ids are per-merchant, so the seller
+ *                                 scopes every re-poll and the row's
+ *                                 uniqueness
  *
- * Schema lives in migration v40 (database_migrate_features_v30_up.c).
+ * Schema lives in migration v40 (database_migrate_features_v30_up.c); the
+ * seller_onion column and the (seller_onion, order_id) uniqueness arrive in
+ * v83 (database_migrate_features_v67_up.c).
  * App-layer only: never read by consensus, safe to drop and re-create. */
 
 #ifndef ZCL_DB_MODEL_STORE_PURCHASE_H
@@ -39,7 +46,10 @@ enum {
     STORE_PURCHASE_MEMO_MAX = 63,
     STORE_PURCHASE_PATH_MAX = 511,
     STORE_PURCHASE_OPID_MAX = 127,
-    STORE_PURCHASE_ERROR_MAX = 191
+    STORE_PURCHASE_ERROR_MAX = 191,
+    /* 56 base32 chars + ".onion" — a v3 onion service address. Empty means
+     * the merchant is this node's own store (the original local buyer). */
+    STORE_PURCHASE_ONION_MAX = 62
 };
 
 /* Stage ladder. Monotonic in the happy path; FAILED is terminal-until-retried
@@ -70,6 +80,7 @@ struct db_store_purchase {
     char operation_id[STORE_PURCHASE_OPID_MAX + 1];
     int stage;
     char last_error[STORE_PURCHASE_ERROR_MAX + 1];
+    char seller_onion[STORE_PURCHASE_ONION_MAX + 1];
     int64_t created_at;
     int64_t updated_at;
 };
@@ -92,9 +103,18 @@ bool db_store_purchase_save(struct node_db *ndb, struct db_store_purchase *p);
 bool db_store_purchase_find(struct node_db *ndb, int64_t id,
                             struct db_store_purchase *out);
 
-/* One purchase by the MERCHANT order id it tracks. order_id is UNIQUE, so
- * this is what makes "start the same order twice" idempotent instead of
- * minting a second buyer row for one payment obligation. */
+/* One purchase by the MERCHANT order id it tracks, scoped to one seller:
+ * (seller_onion, order_id) is UNIQUE — merchant order ids are per-merchant
+ * sequences, so two different sellers legitimately hand out the same id —
+ * and this is what makes "start the same order twice" idempotent instead of
+ * minting a second buyer row for one payment obligation. An empty
+ * seller_onion addresses this node's own store. */
+bool db_store_purchase_find_by_order_seller(struct node_db *ndb,
+                                            const char *seller_onion,
+                                            int64_t order_id,
+                                            struct db_store_purchase *out);
+
+/* Back-compat wrapper: the local store's purchase (empty seller_onion). */
 bool db_store_purchase_find_by_order(struct node_db *ndb, int64_t order_id,
                                      struct db_store_purchase *out);
 

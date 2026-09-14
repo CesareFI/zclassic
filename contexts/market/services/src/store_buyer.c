@@ -16,8 +16,10 @@
 #include "controllers/store_controller.h" // shape-layer-ok:buyer-is-a-store-client
 #include "chain/chainparams.h"
 #include "encoding/utilstrencodings.h"
+#include "json/json.h"
 #include "models/store.h"
 #include "net/puzzle.h"
+#include "net/tor_integration.h" // shape-layer-ok:remote-buyer-rides-the-onion-fetch
 #include "util/safe_alloc.h"
 
 #include <stdio.h>
@@ -207,7 +209,7 @@ static bool sb_scrape_attr(const char *page, const char *attr,
     p += strlen(needle);
     end = strchr(p, '\'');
     if (!end)
-        return false;
+        return false; // raw-return-ok:pure bounded page parser; caller reports the journey failure
     len = (size_t)(end - p);
     if (len >= out_size)
         return false;
@@ -216,8 +218,8 @@ static bool sb_scrape_attr(const char *page, const char *attr,
     return true;
 }
 
-/* Fetch the product page once and take from it BOTH things the order form
- * carries: the CSRF token and the live proof-of-work challenge. One fetch,
+/* Take from an already-fetched product page BOTH things the order form
+ * carries: the CSRF token and the live proof-of-work challenge. One page,
  * because each render issues a fresh challenge — reading the two from
  * different pages would submit a nonce for a seed the server has moved past.
  *
@@ -230,6 +232,47 @@ static bool sb_scrape_attr(const char *page, const char *attr,
  * Note what is deliberately NOT done here: the difficulty ramp is not reset
  * and the gate is not bypassed. A scripted buyer pays the same admission
  * cost as a browser, which is the point of the gate. */
+static bool sb_solve_order_form_page(const char *page,
+                                     char *csrf, size_t csrf_max,
+                                     char *pow_ts, size_t ts_max,
+                                     char *pow_nonce, size_t nonce_max)
+{
+    char seed_hex[65], token_hex[65], ts_str[32], bits_str[16];
+    uint8_t seed[32], token[32];
+    uint64_t nonce = 0;
+    int64_t ts;
+    int bits;
+
+    if (!sb_scrape_attr(page, "name='csrf_token' value",
+                        csrf, csrf_max) ||
+        !sb_scrape_attr(page, "data-pow-seed",
+                        seed_hex, sizeof(seed_hex)) ||
+        !sb_scrape_attr(page, "data-pow-token",
+                        token_hex, sizeof(token_hex)) ||
+        !sb_scrape_attr(page, "data-pow-ts",
+                        ts_str, sizeof(ts_str)) ||
+        !sb_scrape_attr(page, "data-pow-bits",
+                        bits_str, sizeof(bits_str)))
+        return false;
+    if (strlen(seed_hex) != 64 || strlen(token_hex) != 64)
+        return false;
+    if (ParseHex(seed_hex, seed, sizeof(seed)) != sizeof(seed) ||
+        ParseHex(token_hex, token, sizeof(token)) != sizeof(token))
+        return false;
+
+    ts = strtoll(ts_str, NULL, 10);
+    bits = (int)strtol(bits_str, NULL, 10);
+    if (bits <= 0)
+        return false;
+    if (!puzzle_solve_random(seed, token, ts, bits, &nonce))
+        return false; // raw-return-ok:bounded PoW solve failure propagates to the command error body
+
+    (void)snprintf(pow_ts, ts_max, "%lld", (long long)ts);
+    (void)snprintf(pow_nonce, nonce_max, "%llu", (unsigned long long)nonce);
+    return true;
+}
+
+/* Fetch the product page from THIS node's store and solve its order form. */
 static bool sb_solve_order_form(const char *datadir, int64_t product_id,
                                 char *csrf, size_t csrf_max,
                                 char *pow_ts, size_t ts_max,
@@ -237,11 +280,6 @@ static bool sb_solve_order_form(const char *datadir, int64_t product_id,
 {
     uint8_t *page;
     char path[64];
-    char seed_hex[65], token_hex[65], ts_str[32], bits_str[16];
-    uint8_t seed[32], token[32];
-    uint64_t nonce = 0;
-    int64_t ts;
-    int bits;
     size_t n;
     bool ok = false;
 
@@ -256,33 +294,8 @@ static bool sb_solve_order_form(const char *datadir, int64_t product_id,
         goto out;
     page[(n < SB_RESP_MAX) ? n : (SB_RESP_MAX - 1)] = '\0';
 
-    if (!sb_scrape_attr((const char *)page, "name='csrf_token' value",
-                        csrf, csrf_max) ||
-        !sb_scrape_attr((const char *)page, "data-pow-seed",
-                        seed_hex, sizeof(seed_hex)) ||
-        !sb_scrape_attr((const char *)page, "data-pow-token",
-                        token_hex, sizeof(token_hex)) ||
-        !sb_scrape_attr((const char *)page, "data-pow-ts",
-                        ts_str, sizeof(ts_str)) ||
-        !sb_scrape_attr((const char *)page, "data-pow-bits",
-                        bits_str, sizeof(bits_str)))
-        goto out;
-    if (strlen(seed_hex) != 64 || strlen(token_hex) != 64)
-        goto out;
-    if (ParseHex(seed_hex, seed, sizeof(seed)) != sizeof(seed) ||
-        ParseHex(token_hex, token, sizeof(token)) != sizeof(token))
-        goto out;
-
-    ts = strtoll(ts_str, NULL, 10);
-    bits = (int)strtol(bits_str, NULL, 10);
-    if (bits <= 0)
-        goto out;
-    if (!puzzle_solve_random(seed, token, ts, bits, &nonce))
-        goto out;
-
-    (void)snprintf(pow_ts, ts_max, "%lld", (long long)ts);
-    (void)snprintf(pow_nonce, nonce_max, "%llu", (unsigned long long)nonce);
-    ok = true;
+    ok = sb_solve_order_form_page((const char *)page, csrf, csrf_max,
+                                  pow_ts, ts_max, pow_nonce, nonce_max);
 out:
     free(page);
     return ok;
@@ -425,6 +438,352 @@ struct zcl_result store_buyer_order(const char *datadir, int64_t product_id,
         return SB_FAILF(STORE_BUYER_ERR_DB,
                         "created merchant order %lld but could not record "
                         "the buyer purchase row", (long long)order_id);
+
+    out->purchase_id = purchase.id;
+    out->order_id = order_id;
+    (void)snprintf(out->payment_addr, sizeof(out->payment_addr), "%s",
+                   purchase.payment_addr);
+    (void)snprintf(out->memo, sizeof(out->memo), "%s", purchase.memo);
+    out->amount_zatoshi = purchase.amount_zatoshi;
+    r = ZCL_OK;
+    return r;
+}
+
+/* ── remote order: the same buyer, across Tor ───────────────────────── */
+
+/* Validate and normalize a seller onion address into "…56 base32….onion"
+ * form. Strict on purpose: this string scopes the purchase row's
+ * uniqueness and every later poll/collect fetch, so a malformed seller is
+ * refused here rather than parked on a durable row. */
+static bool sb_normalize_seller_onion(const char *in, char *out, size_t out_size)
+{
+    static const char alph[] = "abcdefghijklmnopqrstuvwxyz234567";
+    size_t len;
+
+    if (!in || !out || out_size < 63)
+        return false;
+    len = strlen(in);
+    if (len == 62 && strcmp(in + 56, ".onion") == 0)
+        len = 56;
+    if (len != 56)
+        return false;
+    for (size_t i = 0; i < 56; i++) {
+        if (!strchr(alph, in[i]))
+            return false; // raw-return-ok:pure bounded onion-address validator
+    }
+    (void)snprintf(out, out_size, "%.56s.onion", in);
+    return true;
+}
+
+/* One blocking GET against the seller's onion service. Returns the HTTP
+ * status (200, 404, …) with the response body owned by res->body (caller
+ * frees), or 0 when no response arrived at all (Tor down, timeout, fetch
+ * refused). The blocking layer hands back the body even for error
+ * statuses, so the caller can name the merchant's refusal. */
+static int sb_onion_get(const char *seller_onion, const char *path,
+                        struct onion_fetch_result *res)
+{
+    memset(res, 0, sizeof(*res));
+    (void)tor_integration_fetch_onion_blocking(seller_onion, path, res,
+                                               SB_ONION_TIMEOUT_SECS);
+    if (res->status < 100 || res->status > 599) {
+        free(res->body);
+        res->body = NULL;
+        res->body_len = 0;
+        return 0;
+    }
+    return res->status;
+}
+
+/* Scrape the first <div class='addr'>…</div> AFTER `marker` out of a store
+ * page. On the payment page the marker is "Send exactly", and the first
+ * address div after it is the one-time payment address; anchoring on the
+ * marker keeps a stray address elsewhere in the chrome from being picked. */
+static bool sb_scrape_addr_after(const char *page, const char *marker,
+                                 char *out, size_t out_size)
+{
+    const char *p, *end;
+    size_t len;
+
+    p = page ? strstr(page, marker) : NULL;
+    if (!p)
+        return false;
+    p = strstr(p, "class='addr'>");
+    if (!p)
+        return false;
+    p += strlen("class='addr'>");
+    end = strchr(p, '<');
+    if (!end)
+        return false; // raw-return-ok:pure bounded page parser; caller reports the journey failure
+    len = (size_t)(end - p);
+    if (len == 0 || len >= out_size)
+        return false;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return true;
+}
+
+/* Parse the product detail JSON twin (/store/products/<id>.json): the
+ * remote buyer's price, access token and content hash — everything the
+ * local buyer reads from the products table. Refuses a document whose id
+ * is not the product that was asked for. */
+static bool sb_parse_product_json(const char *text, int64_t want_id,
+                                  char *name, size_t name_max,
+                                  char *token_id, size_t token_max,
+                                  int64_t *price_zatoshi,
+                                  bool *has_content_hash,
+                                  uint8_t content_hash[32])
+{
+    struct json_value doc;
+    const char *hash_hex;
+    const char *s;
+
+    if (!text || !json_read(&doc, text, strlen(text)))
+        return false;
+    if (json_get_int(json_get(&doc, "id")) != want_id) {
+        json_free(&doc);
+        return false;
+    }
+    s = json_get_str(json_get(&doc, "name"));
+    (void)snprintf(name, name_max, "%s", s ? s : "");
+    s = json_get_str(json_get(&doc, "token_id"));
+    (void)snprintf(token_id, token_max, "%s", s ? s : "");
+    *price_zatoshi = json_get_int(json_get(&doc, "price_zatoshi"));
+    *has_content_hash = false;
+    hash_hex = json_get_str(json_get(&doc, "content_hash"));
+    if (json_get_bool(json_get(&doc, "has_content")) && hash_hex &&
+        strlen(hash_hex) == 64 &&
+        ParseHex(hash_hex, content_hash, 32) == 32)
+        *has_content_hash = true;
+    json_free(&doc);
+    return *price_zatoshi > 0;
+}
+
+/* Step 1 of a remote order: the product detail JSON twin — price, token and
+ * content hash, the remote answer to the local buyer's products-table
+ * precheck. A 404 is an unknown product; no answer at all names the
+ * transport. */
+static struct zcl_result sb_remote_product_info(const char *seller,
+                                                int64_t product_id,
+                                                char *name, size_t name_size,
+                                                char *token_id,
+                                                size_t token_id_size,
+                                                int64_t *price_zatoshi,
+                                                bool *has_content_hash,
+                                                uint8_t content_hash[32])
+{
+    struct onion_fetch_result res;
+    char path[128];
+    (void)snprintf(path, sizeof(path), "/store/products/%lld.json",
+                   (long long)product_id);
+    int status = sb_onion_get(seller, path, &res);
+    if (status == 0)
+        return SB_FAILF(STORE_BUYER_ERR_ORDER_CREATE_FAILED,
+                        "no answer from %s — is this node running -tor, and "
+                        "is the seller's store reachable?", seller);
+    if (status != 200 || !res.body) {
+        free(res.body);
+        return SB_FAILF(STORE_BUYER_ERR_UNKNOWN_PRODUCT,
+                        "product %lld is not on sale at %s (HTTP %d)",
+                        (long long)product_id, seller, status);
+    }
+    bool parsed = sb_parse_product_json((const char *)res.body, product_id,
+                                        name, name_size, token_id,
+                                        token_id_size, price_zatoshi,
+                                        has_content_hash, content_hash);
+    free(res.body);
+    if (!parsed)
+        return SB_FAILF(STORE_BUYER_ERR_UNKNOWN_PRODUCT,
+                        "the store at %s did not describe product %lld",
+                        seller, (long long)product_id);
+    return ZCL_OK;
+}
+
+/* Step 2: the product page yields a CSRF token + live proof-of-work, solved
+ * with the same primitive the merchant verifies — the scripted buyer pays
+ * the same admission cost as a browser. */
+static struct zcl_result sb_remote_order_form(const char *seller,
+                                              int64_t product_id,
+                                              char *csrf, size_t csrf_size,
+                                              char *pow_ts, size_t pow_ts_size,
+                                              char *pow_nonce,
+                                              size_t pow_nonce_size)
+{
+    struct onion_fetch_result res;
+    char path[128];
+    (void)snprintf(path, sizeof(path), "/store/product/%lld",
+                   (long long)product_id);
+    int status = sb_onion_get(seller, path, &res);
+    bool solved = status == 200 && res.body &&
+        sb_solve_order_form_page((const char *)res.body, csrf, csrf_size,
+                                 pow_ts, pow_ts_size,
+                                 pow_nonce, pow_nonce_size);
+    free(res.body);
+    if (!solved)
+        return SB_FAILF(STORE_BUYER_ERR_ORDER_CREATE_FAILED,
+                        "could not obtain a CSRF token and a solved "
+                        "proof-of-work for product %lld at %s (HTTP %d)",
+                        (long long)product_id, seller, status);
+    return ZCL_OK;
+}
+
+/* Step 3: the order POST itself — the wire gap this service exists to close.
+ * The merchant's CSRF check, PoW gate, pending-pool caps and onion
+ * front-door rate limits all see an ordinary browser-shaped order. */
+static struct zcl_result sb_remote_post_order(const char *seller,
+                                              int64_t product_id,
+                                              const char *customer_addr,
+                                              bool transparent,
+                                              const char *csrf,
+                                              const char *pow_ts,
+                                              const char *pow_nonce,
+                                              int64_t *order_id,
+                                              char *payment_addr,
+                                              size_t payment_addr_size)
+{
+    struct onion_fetch_result res;
+    char body[512];
+    (void)snprintf(body, sizeof(body),
+                   "product_id=%lld&customer_addr=%s&csrf_token=%s"
+                   "&pow_ts=%s&pow_nonce=%s&payment_kind=%s",
+                   (long long)product_id, customer_addr, csrf, pow_ts,
+                   pow_nonce, transparent ? "transparent" : "shielded");
+    memset(&res, 0, sizeof(res));
+    (void)tor_integration_fetch_onion_post_blocking(seller, "/store/orders",
+                                                    (const uint8_t *)body,
+                                                    strlen(body), &res,
+                                                    SB_ONION_TIMEOUT_SECS);
+    bool placed = res.status == 200 && res.body &&
+        sb_scrape_order_id((const char *)res.body, order_id) &&
+        sb_scrape_addr_after((const char *)res.body, "Send exactly",
+                             payment_addr, payment_addr_size);
+    if (!placed) {
+        char head[64];
+        (void)snprintf(head, sizeof(head), "%.40s",
+                       res.body ? (const char *)res.body : "(no response)");
+        int status = res.status;
+        free(res.body);
+        return SB_FAILF(STORE_BUYER_ERR_ORDER_CREATE_FAILED,
+                        "the store at %s refused product %lld (HTTP %d): %s",
+                        seller, (long long)product_id, status, head);
+    }
+    free(res.body);
+    return ZCL_OK;
+}
+
+/* Step 4: record the buyer's side, scoped to THIS seller: merchant order ids
+ * are per-merchant, so (seller_onion, order_id) is the idempotence key — a
+ * second order for the same merchant order id updates the existing row
+ * rather than minting a second obligation. */
+static struct zcl_result sb_remote_record_purchase(const char *datadir,
+                                                   const char *seller,
+                                                   int64_t product_id,
+                                                   int64_t order_id,
+                                                   const char *name,
+                                                   const char *token_id,
+                                                   const char *payment_addr,
+                                                   const char *customer_addr,
+                                                   const char *output_path,
+                                                   int64_t price_zatoshi,
+                                                   bool has_content_hash,
+                                                   const uint8_t *content_hash,
+                                                   struct db_store_purchase *purchase)
+{
+    struct node_db ndb;
+    struct zcl_result r =
+        sb_open_db(datadir, &ndb, "store_buyer.remote_order_record");
+    if (!r.ok)
+        return r;
+    if (!db_store_purchase_find_by_order_seller(&ndb, seller, order_id,
+                                                purchase))
+        memset(purchase, 0, sizeof(*purchase));
+
+    purchase->order_id = order_id;
+    purchase->product_id = product_id;
+    (void)snprintf(purchase->product_name, sizeof(purchase->product_name),
+                   "%s", name);
+    (void)snprintf(purchase->token_id, sizeof(purchase->token_id), "%s",
+                   token_id);
+    (void)snprintf(purchase->payment_addr, sizeof(purchase->payment_addr),
+                   "%s", payment_addr);
+    (void)snprintf(purchase->customer_addr, sizeof(purchase->customer_addr),
+                   "%s", customer_addr);
+    (void)snprintf(purchase->memo, sizeof(purchase->memo), "ZCL23ORDER:%lld",
+                   (long long)order_id);
+    purchase->amount_zatoshi = price_zatoshi;
+    purchase->has_content_hash = has_content_hash;
+    if (has_content_hash)
+        memcpy(purchase->content_hash, content_hash,
+               sizeof(purchase->content_hash));
+    if (output_path && output_path[0])
+        (void)snprintf(purchase->output_path, sizeof(purchase->output_path),
+                       "%s", output_path);
+    (void)snprintf(purchase->seller_onion, sizeof(purchase->seller_onion),
+                   "%s", seller);
+    if (purchase->id == 0)
+        purchase->stage = STORE_PURCHASE_CREATED;
+    purchase->last_error[0] = '\0';
+
+    bool saved = db_store_purchase_save(&ndb, purchase);
+    node_db_close(&ndb);
+    if (!saved)
+        return SB_FAILF(STORE_BUYER_ERR_DB,
+                        "created merchant order %lld at %s but could not "
+                        "record the buyer purchase row",
+                        (long long)order_id, seller);
+    return ZCL_OK;
+}
+
+struct zcl_result store_buyer_remote_order(const char *datadir,
+                                           const char *seller_onion,
+                                           int64_t product_id,
+                                           const char *customer_addr,
+                                           const char *output_path,
+                                           bool transparent,
+                                           struct store_buyer_order *out)
+{
+    struct db_store_purchase purchase;
+    char seller[STORE_PURCHASE_ONION_MAX + 1];
+    char csrf[80] = "", pow_ts[32] = "", pow_nonce[32] = "";
+    char name[STORE_PURCHASE_NAME_MAX + 1];
+    char token_id[STORE_PURCHASE_TOKEN_MAX + 1];
+    char payment_addr[STORE_PURCHASE_ADDR_MAX + 1];
+    uint8_t content_hash[32];
+    int64_t price_zatoshi = 0;
+    bool has_content_hash = false;
+    int64_t order_id = 0;
+    struct zcl_result r;
+
+    if (!datadir || !seller_onion || product_id <= 0 || !customer_addr ||
+        !customer_addr[0] || !out)
+        return SB_FAIL(STORE_BUYER_ERR_ARGS);
+    memset(out, 0, sizeof(*out));
+    if (!sb_normalize_seller_onion(seller_onion, seller, sizeof(seller)))
+        return SB_FAILF(STORE_BUYER_ERR_ARGS,
+                        "seller_onion must be a v3 onion address (56 base32 "
+                        "characters, optional .onion suffix)");
+
+    r = sb_remote_product_info(seller, product_id, name, sizeof(name),
+                               token_id, sizeof(token_id), &price_zatoshi,
+                               &has_content_hash, content_hash);
+    if (!r.ok)
+        return r;
+    r = sb_remote_order_form(seller, product_id, csrf, sizeof(csrf),
+                             pow_ts, sizeof(pow_ts),
+                             pow_nonce, sizeof(pow_nonce));
+    if (!r.ok)
+        return r;
+    r = sb_remote_post_order(seller, product_id, customer_addr, transparent,
+                             csrf, pow_ts, pow_nonce, &order_id,
+                             payment_addr, sizeof(payment_addr));
+    if (!r.ok)
+        return r;
+    r = sb_remote_record_purchase(datadir, seller, product_id, order_id, name,
+                                  token_id, payment_addr, customer_addr,
+                                  output_path, price_zatoshi, has_content_hash,
+                                  content_hash, &purchase);
+    if (!r.ok)
+        return r;
 
     out->purchase_id = purchase.id;
     out->order_id = order_id;

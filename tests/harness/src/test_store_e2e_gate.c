@@ -21,6 +21,7 @@
 #include "models/store_blob.h"
 #include "models/wallet_tx.h"
 #include "crypto/sha3.h"
+#include "net/onion_service.h"
 
 /* For the SHIELDED gate (test_store_e2e_shielded): a real Sapling output
  * built by the production payer path, ivk-decrypted by a merchant wallet. */
@@ -299,6 +300,99 @@ static bool p11_5_seed_confirmed_note(struct node_db *ndb,
     return db_sapling_note_save(ndb, &note);
 }
 
+/* C5 onion wire dispatch: the SAME order-create POST, driven through
+ * onion_service_handle_request — the exact dispatch the embedded-Tor wire
+ * hits (dynhost webserver → dynhost_bridge → STORE mount), so the hermetic
+ * gate covers what the two-node onion acceptance then proves over real
+ * circuits. The defense layers must fire through the wire path exactly as
+ * in-process: a bogus CSRF is refused BEFORE any mint, and a real CSRF +
+ * fresh PoW mints a second order through the onion front door (the
+ * ratelimit tier admits two POSTs — 20 rps is not a gate under test here).
+ *
+ * pow_ts/pow_nonce are the gate's already-spent pair — fine for the bogus
+ * CSRF probe, which is refused before the PoW is ever checked. On success
+ * `summaries` holds the merchant's recent orders (two: the in-process mint
+ * plus the onion-wire mint). Extracted from test_store_e2e_gate to keep the
+ * gate under its pinned cyclomatic complexity; it wraps its own *ok gate
+ * (same reasoning as the db_migrate_step_N helpers) so the caller carries
+ * no branch for the call at all. */
+static void p11_5_onion_dispatch_gate(bool *ok,
+                                      const char **fail_step,
+                                      const char *datadir,
+                                      const char *dbpath,
+                                      const char *pow_ts,
+                                      const char *pow_nonce,
+                                      struct db_store_order_summary *summaries,
+                                      size_t summaries_cap)
+{
+    char csrf[64] = "";
+    char fresh_pow_ts[32] = "", fresh_pow_nonce[32] = "";
+    char body[256];
+    uint8_t resp[16384];
+    struct node_db ndb;
+    size_t n;
+    bool gate_ok = true;
+
+    if (!*ok)
+        return;
+
+    /* onion_service_start no-ops when the context is already wired (another
+     * group may have left it bound to a static datadir), so stop first:
+     * this gate must drive THIS datadir's store, not whichever datadir an
+     * earlier group happened to wire. Then note onion_service_start borrows
+     * the datadir pointer; it outlives this block, and onion_service_stop
+     * below returns the global context to unwired before any other test
+     * runs. */
+    onion_service_stop();
+    onion_service_start(datadir);
+
+    *fail_step = "onion dispatch refuses bad csrf";
+    snprintf(body, sizeof(body),
+             "product_id=1&customer_addr=t1YRBXKYLhrb4X8sTkBeRysAzBTMMHpUXrn"
+             "&csrf_token=bogus&pow_ts=%s&pow_nonce=%s",
+             pow_ts, pow_nonce);
+    n = onion_service_handle_request("POST", "/store/orders",
+                                     (const uint8_t *)body, strlen(body),
+                                     resp, sizeof(resp));
+    gate_ok = n > 0;
+    gate_ok = gate_ok && strstr((char *)resp, "400 Bad Request") != NULL;
+    gate_ok = gate_ok && strstr((char *)resp, "Invalid CSRF token") != NULL;
+
+    if (gate_ok) *fail_step = "onion dispatch order form";
+    gate_ok = gate_ok && p11_5_fetch_csrf_token(datadir, 1, csrf, sizeof(csrf));
+    gate_ok = gate_ok && p11_5_solve_store_pow(datadir, 1, fresh_pow_ts,
+                                     sizeof(fresh_pow_ts), fresh_pow_nonce,
+                                     sizeof(fresh_pow_nonce));
+    if (gate_ok) {
+        *fail_step = "onion dispatch mints the order";
+        snprintf(body, sizeof(body),
+                 "product_id=1&customer_addr=t1YRBXKYLhrb4X8sTkBeRysAzBTMMHpUXrn"
+                 "&csrf_token=%s&pow_ts=%s&pow_nonce=%s",
+                 csrf, fresh_pow_ts, fresh_pow_nonce);
+        n = onion_service_handle_request("POST", "/store/orders",
+                                         (const uint8_t *)body, strlen(body),
+                                         resp, sizeof(resp));
+        gate_ok = n > 0;
+        gate_ok = gate_ok && strstr((char *)resp, "HTTP/1.1 200 OK") != NULL;
+        gate_ok = gate_ok && strstr((char *)resp, "Order #") != NULL;
+    }
+
+    onion_service_stop();
+
+    if (gate_ok) {
+        *fail_step = "onion order persisted";
+        memset(&ndb, 0, sizeof(ndb));
+        gate_ok = node_db_open(&ndb, dbpath);
+        if (gate_ok) {
+            int order_count =
+                db_store_order_list_recent(&ndb, summaries, summaries_cap);
+            gate_ok = order_count == 2;
+            node_db_close(&ndb);
+        }
+    }
+    *ok = gate_ok;
+}
+
 int test_store_e2e_gate(void)
 {
     int failures = 0;
@@ -481,6 +575,13 @@ int test_store_e2e_gate(void)
             ok = ok && strstr((char *)resp, "403 Forbidden") != NULL;
             ok = ok && strstr((char *)resp, "Access Denied") != NULL;
         }
+
+        /* C5 onion wire dispatch, extracted: see p11_5_onion_dispatch_gate
+         * above — it wraps its own *ok gate, so this call adds no branch to
+         * the gate's pinned cyclomatic complexity. */
+        p11_5_onion_dispatch_gate(&ok, &fail_step, datadir, dbpath,
+                                  pow_ts, pow_nonce, summaries,
+                                  sizeof(summaries) / sizeof(summaries[0]));
 
         if (ok) {
             printf("OK (order=%lld payment=%s balance=10)\n",

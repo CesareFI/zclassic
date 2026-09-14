@@ -120,6 +120,35 @@ struct zcl_result store_buyer_order(const char *datadir, int64_t product_id,
                                     bool transparent,
                                     struct store_buyer_order *out);
 
+/* ── place an order on a REMOTE store, over Tor ─────────────────────── */
+
+/* The remote twin of store_buyer_order, for a store served by ANOTHER
+ * node's onion service. `seller_onion` is the seller's v3 onion address
+ * (56 base32 chars, with or without the ".onion" suffix). Every store
+ * exchange rides the embedded-Tor fetch client instead of the in-process
+ * handler: the product detail JSON twin (price, token, content hash), the
+ * product page (CSRF token + live proof-of-work challenge, solved with the
+ * same puzzle_solve_random a browser's JavaScript answers), and the order
+ * POST itself — so the merchant's CSRF check, PoW gate, pending-pool caps
+ * and onion front-door rate limits all apply exactly as they do to a Tor
+ * Browser user.
+ *
+ * The buyer row is recorded with seller_onion set, and that field is what
+ * routes every later step: store_buyer_refresh polls the merchant's order
+ * page over Tor and store_buyer_collect fetches the gated bytes over Tor.
+ * Payment itself is unchanged — a local wallet spend carrying the order
+ * memo, which the merchant reconciles exactly as for a browser buyer.
+ *
+ * Requires the node's embedded Tor to be running (-tor); on a stub build
+ * or with Tor down the fetch refuses by name. */
+struct zcl_result store_buyer_remote_order(const char *datadir,
+                                           const char *seller_onion,
+                                           int64_t product_id,
+                                           const char *customer_addr,
+                                           const char *output_path,
+                                           bool transparent,
+                                           struct store_buyer_order *out);
+
 /* ── pay ────────────────────────────────────────────────────────────── */
 
 struct store_buyer_payment {
@@ -176,7 +205,9 @@ struct store_buyer_state {
 
 /* Re-read a purchase against the merchant's current view and advance the
  * stage when the merchant has credited the order. Idempotent; safe to call
- * on any stage; never clears a recorded failure reason. */
+ * on any stage; never clears a recorded failure reason. A purchase whose
+ * seller_onion names a remote store is re-read from that merchant's order
+ * page over Tor instead of the local database. */
 struct zcl_result store_buyer_refresh(const char *datadir,
                                       int64_t purchase_id,
                                       struct store_buyer_state *out);
@@ -197,7 +228,9 @@ struct store_buyer_delivery {
 
 /* Fetch the purchased bytes through the real token gate, verify their
  * SHA3-256 against the product's content hash, and only then write them to
- * `output_path` (or the path recorded at order time when NULL).
+ * `output_path` (or the path recorded at order time when NULL). For a
+ * remote purchase (seller_onion set) the token gate is the seller's onion
+ * service, reached through the embedded-Tor fetch client.
  *
  * The write is atomic-by-rename via a sibling temporary file, and a hash
  * mismatch leaves NOTHING behind: no temporary, no partial, no stale

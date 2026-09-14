@@ -93,6 +93,9 @@ ZCL_CAPABILITY_SYMBOL("connect", CAP_NETWORK, "")
 ZCL_CAPABILITY_SYMBOL("dynhost_client_fetch", CAP_NETWORK,
     "Z23 embedded Tor host: performs a request over the onion "
     "transport.")
+ZCL_CAPABILITY_SYMBOL("dynhost_client_fetch_ex", CAP_NETWORK,
+    "Z23 embedded Tor host: performs an explicit-method request with a "
+    "bounded body over the onion transport.")
 ZCL_CAPABILITY_SYMBOL("dynhost_get_global_service", CAP_NETWORK,
     "Hands back the process wide onion service handle.")
 ZCL_CAPABILITY_SYMBOL("dynhost_stream_close", CAP_NETWORK,

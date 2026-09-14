@@ -18,6 +18,11 @@ extern int dynhost_client_fetch(const char *, uint16_t, const char *,
     void (*)(int, const uint8_t *, size_t, void *), void *, int)
     ZCL_WEAK_IMPORT;
 
+extern int dynhost_client_fetch_ex(const char *, uint16_t, const char *,
+    const char *, const uint8_t *, size_t,
+    void (*)(int, const uint8_t *, size_t, void *), void *, int)
+    ZCL_WEAK_IMPORT;
+
 int tor_integration_fetch_onion(const char *onion_address,
                                 const char *path,
                                 tor_fetch_callback_fn callback,
@@ -30,6 +35,25 @@ int tor_integration_fetch_onion(const char *onion_address,
         LOG_ERR("tor", "fetch_onion called but Tor not running");
 
     return dynhost_client_fetch(onion_address, 80, path,
+        (void (*)(int, const uint8_t *, size_t, void *))callback,
+        ctx, timeout_secs);
+}
+
+int tor_integration_fetch_onion_post(const char *onion_address,
+                                     const char *path,
+                                     const uint8_t *body,
+                                     size_t body_len,
+                                     tor_fetch_callback_fn callback,
+                                     void *ctx,
+                                     int timeout_secs)
+{
+    if (!dynhost_client_fetch_ex)
+        LOG_ERR("tor", "dynhost_client_fetch_ex not linked (stub build)");
+    if (!tor_integration_is_enabled())
+        LOG_ERR("tor", "fetch_onion_post called but Tor not running");
+
+    return dynhost_client_fetch_ex(onion_address, 80, path, "POST",
+        body, body_len,
         (void (*)(int, const uint8_t *, size_t, void *))callback,
         ctx, timeout_secs);
 }
@@ -81,10 +105,13 @@ static void blocking_fetch_cb(int status, const uint8_t *body,
     blocking_fetch_release(ctx);
 }
 
-int tor_integration_fetch_onion_blocking(const char *onion_address,
-                                         const char *path,
-                                         struct onion_fetch_result *result,
-                                         int timeout_secs)
+static int fetch_onion_blocking_ex(const char *onion_address,
+                                   const char *path,
+                                   bool use_post,
+                                   const uint8_t *req_body,
+                                   size_t req_body_len,
+                                   struct onion_fetch_result *result,
+                                   int timeout_secs)
 {
     if (!result)
         LOG_ERR("tor", "fetch_onion_blocking called with NULL result");
@@ -98,9 +125,14 @@ int tor_integration_fetch_onion_blocking(const char *onion_address,
     atomic_init(&ctx->refs, 2);
     atomic_init(&ctx->complete, 0);
 
-    int rc = tor_integration_fetch_onion(onion_address, path,
-                                         blocking_fetch_cb, ctx,
-                                         timeout_secs);
+    int rc = use_post
+        ? tor_integration_fetch_onion_post(onion_address, path,
+                                           req_body, req_body_len,
+                                           blocking_fetch_cb, ctx,
+                                           timeout_secs)
+        : tor_integration_fetch_onion(onion_address, path,
+                                      blocking_fetch_cb, ctx,
+                                      timeout_secs);
     if (rc < 0) {
         /* Dispatch failed: release both waiter and never-called callback. */
         blocking_fetch_release(ctx);
@@ -129,4 +161,24 @@ int tor_integration_fetch_onion_blocking(const char *onion_address,
     atomic_store(&result->complete, -1);
     LOG_ERR("tor", "fetch_onion_blocking timed out after %ds for %s%s",
             timeout_secs > 0 ? timeout_secs : 60, onion_address, path);
+}
+
+int tor_integration_fetch_onion_blocking(const char *onion_address,
+                                         const char *path,
+                                         struct onion_fetch_result *result,
+                                         int timeout_secs)
+{
+    return fetch_onion_blocking_ex(onion_address, path, false, NULL, 0,
+                                   result, timeout_secs);
+}
+
+int tor_integration_fetch_onion_post_blocking(const char *onion_address,
+                                              const char *path,
+                                              const uint8_t *body,
+                                              size_t body_len,
+                                              struct onion_fetch_result *result,
+                                              int timeout_secs)
+{
+    return fetch_onion_blocking_ex(onion_address, path, true, body, body_len,
+                                   result, timeout_secs);
 }

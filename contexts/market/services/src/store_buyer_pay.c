@@ -18,6 +18,7 @@
 #include "config/runtime.h"
 #include "crypto/sha3.h"
 #include "models/store.h"
+#include "net/tor_integration.h" // shape-layer-ok:remote-buyer-rides-the-onion-fetch
 #include "platform/private_file.h"
 #include "sapling/sapling_prover.h"
 #include "util/safe_alloc.h"
@@ -277,6 +278,102 @@ struct zcl_result store_buyer_fail(const char *datadir, int64_t purchase_id,
 
 /* ── poll ───────────────────────────────────────────────────────────── */
 
+/* Read the merchant's order-page status div back onto the store order
+ * status vocabulary. The strings are store_order_status_text()'s — the
+ * exact rendering a browser reads — scoped to the <div class='status …'>
+ * element so a phrase elsewhere in the page chrome cannot impersonate a
+ * verdict. Returns -1 when the page carries no recognizable status. */
+static int sb_remote_order_status(const char *page)
+{
+    const char *p = page ? strstr(page, "class='status ") : NULL;
+    const char *end;
+
+    if (!p)
+        return -1;
+    p = strchr(p, '>');
+    if (!p)
+        return -1;
+    p++;
+    end = strchr(p, '<');
+    if (!end)
+        return -1;
+    if ((size_t)(end - p) == strlen("Pending Payment") &&
+        memcmp(p, "Pending Payment", (size_t)(end - p)) == 0)
+        return STORE_ORDER_PENDING;
+    if ((size_t)(end - p) == strlen("Payment Received") &&
+        memcmp(p, "Payment Received", (size_t)(end - p)) == 0)
+        return STORE_ORDER_PAID;
+    if ((size_t)(end - p) == strlen("Tokens Sent") &&
+        memcmp(p, "Tokens Sent", (size_t)(end - p)) == 0)
+        return STORE_ORDER_SENT;
+    if ((size_t)(end - p) > 0 && memcmp(p, "Mint Failed", 11) == 0)
+        return STORE_ORDER_FAILED;
+    return -1;
+}
+
+/* The remote twin of the local re-read below: the merchant's view comes
+ * from ITS order page over Tor, not from a local orders table that does
+ * not exist for a stranger's store. The stage-advance rule is identical:
+ * PAID only on the merchant's own "Tokens Sent", never on our opinion of
+ * the payment, and a recorded failure reason is never cleared. */
+static struct zcl_result sb_remote_refresh(struct node_db *ndb,
+                                           struct db_store_purchase *purchase,
+                                           struct store_buyer_state *out)
+{
+    struct onion_fetch_result res;
+    char path[128];
+    int status;
+
+    (void)snprintf(path, sizeof(path), "/store/orders/%lld",
+                   (long long)purchase->order_id);
+    memset(&res, 0, sizeof(res));
+    (void)tor_integration_fetch_onion_blocking(purchase->seller_onion, path,
+                                               &res, SB_ONION_TIMEOUT_SECS);
+    /* The merchant's chain tip is not ours to report; a remote poll cannot
+     * measure confirmation depth against its own view of the chain. */
+    out->tip_height = 0;
+    if (res.status == 404) {
+        free(res.body);
+        out->merchant_order_found = false;
+        out->purchase = *purchase;
+        return ZCL_OK;
+    }
+    if (res.status != 200 || !res.body) {
+        free(res.body);
+        return SB_FAILF(STORE_BUYER_ERR_DELIVERY_FAILED,
+                        "the store at %s did not answer the status poll for "
+                        "order %lld (HTTP %d) — is this node running -tor?",
+                        purchase->seller_onion,
+                        (long long)purchase->order_id, res.status);
+    }
+    status = sb_remote_order_status((const char *)res.body);
+    free(res.body);
+    if (status < 0)
+        return SB_FAILF(STORE_BUYER_ERR_DELIVERY_FAILED,
+                        "the order page at %s for order %lld carried no "
+                        "recognisable status", purchase->seller_onion,
+                        (long long)purchase->order_id);
+
+    out->merchant_order_found = true;
+    out->merchant_order_status = status;
+    /* The merchant's own verdict, not a local chain observation: PAID/SENT
+     * on its order page means its reconcile credited this order, so the
+     * full order amount is what it confirms. Nothing else is claimed. */
+    out->confirmed_zatoshi =
+        (status == STORE_ORDER_PAID || status == STORE_ORDER_SENT)
+            ? purchase->amount_zatoshi : 0;
+
+    if (purchase->stage != STORE_PURCHASE_DELIVERED &&
+        status == STORE_ORDER_SENT &&
+        purchase->stage != STORE_PURCHASE_PAID) {
+        purchase->stage = STORE_PURCHASE_PAID;
+        (void)db_store_purchase_save(ndb, purchase);
+    }
+    out->purchase = *purchase;
+    out->ready_to_collect = (purchase->stage == STORE_PURCHASE_PAID);
+    return ZCL_OK;
+}
+
 struct zcl_result store_buyer_refresh(const char *datadir,
                                       int64_t purchase_id,
                                       struct store_buyer_state *out)
@@ -294,6 +391,14 @@ struct zcl_result store_buyer_refresh(const char *datadir,
         return r;
     r = sb_load_purchase(&ndb, purchase_id, &purchase);
     if (!r.ok) {
+        node_db_close(&ndb);
+        return r;
+    }
+
+    /* A purchase from ANOTHER node's store has no local merchant row to
+     * re-read; its merchant lives behind the recorded onion address. */
+    if (purchase.seller_onion[0]) {
+        r = sb_remote_refresh(&ndb, &purchase, out);
         node_db_close(&ndb);
         return r;
     }
@@ -438,6 +543,86 @@ static bool sb_write_atomic(const char *path, const uint8_t *data, size_t len)
     return true;
 }
 
+/* Fetches the token-gated payload for a paid purchase: over Tor from the
+ * seller's onion service when the purchase is remote, or in-process from
+ * this node's own store handler when it is local. On success *resp_out owns
+ * exactly one heap buffer the caller frees, and *body_out + *body_len_out
+ * name the payload inside it (the dynhost client strips headers, so for a
+ * remote fetch the buffer IS the body). */
+static struct zcl_result sb_collect_fetch(const char *datadir,
+                                          const struct db_store_purchase *purchase,
+                                          int64_t purchase_id,
+                                          uint8_t **resp_out,
+                                          const uint8_t **body_out,
+                                          size_t *body_len_out)
+{
+    char path[512];
+    (void)snprintf(path, sizeof(path), "/store/access?addr=%s&token=%s",
+                   purchase->customer_addr, purchase->token_id);
+
+    if (purchase->seller_onion[0]) {
+        /* Remote collect: the same token gate, served by the seller's
+         * onion service. The dynhost client answers with headers already
+         * stripped, so the body IS the payload; ownership of res.body
+         * moves into *resp_out so every exit frees exactly one buffer. */
+        struct onion_fetch_result res;
+        memset(&res, 0, sizeof(res));
+        (void)tor_integration_fetch_onion_blocking(purchase->seller_onion,
+                                                   path, &res,
+                                                   SB_ONION_TIMEOUT_SECS);
+        if (!res.body || res.status != 200 || res.body_len == 0) {
+            int got_status = res.status;
+            free(res.body);
+            LOG_WARN(SB_TAG, "collect: remote token gate did not serve "
+                     "purchase %lld from %s (HTTP %d)",
+                     (long long)purchase_id, purchase->seller_onion,
+                     got_status);
+            return SB_FAILF(STORE_BUYER_ERR_DELIVERY_FAILED,
+                            "the token gate at %s did not serve purchase "
+                            "%lld (HTTP %d; token=%s addr=%s)",
+                            purchase->seller_onion, (long long)purchase_id,
+                            got_status, purchase->token_id,
+                            purchase->customer_addr);
+        }
+        *resp_out = res.body;
+        *body_out = res.body;
+        *body_len_out = res.body_len;
+        return ZCL_OK;
+    }
+
+    uint8_t *resp = zcl_malloc(SB_RESP_MAX, "store_buyer_collect_resp");
+    if (!resp)
+        return SB_FAILF(STORE_BUYER_ERR_INTERNAL,
+                        "could not allocate the %d-byte response buffer",
+                        (int)SB_RESP_MAX);
+
+    size_t n = store_handle_request("GET", path, NULL, 0, resp, SB_RESP_MAX,
+                                    datadir);
+    if (n == 0 || !strstr((const char *)resp, "HTTP/1.1 200 OK")) {
+        free(resp);
+        LOG_WARN(SB_TAG, "collect: token gate did not serve purchase %lld "
+                 "(token=%s addr=%s)", (long long)purchase_id,
+                 purchase->token_id, purchase->customer_addr);
+        return SB_FAILF(STORE_BUYER_ERR_DELIVERY_FAILED,
+                        "the token gate did not serve purchase %lld "
+                        "(token=%s addr=%s)", (long long)purchase_id,
+                        purchase->token_id, purchase->customer_addr);
+    }
+
+    const uint8_t *body = sb_http_body(resp, n, body_len_out);
+    if (!body || *body_len_out == 0) {
+        free(resp);
+        LOG_WARN(SB_TAG, "collect: purchase %lld got a response with no body",
+                 (long long)purchase_id);
+        return SB_FAILF(STORE_BUYER_ERR_DELIVERY_FAILED,
+                        "the store answered purchase %lld with no body",
+                        (long long)purchase_id);
+    }
+    *resp_out = resp;
+    *body_out = body;
+    return ZCL_OK;
+}
+
 struct zcl_result store_buyer_collect(const char *datadir,
                                       int64_t purchase_id,
                                       const char *output_path,
@@ -448,10 +633,8 @@ struct zcl_result store_buyer_collect(const char *datadir,
     struct zcl_result r;
     uint8_t *resp = NULL;
     uint8_t got[32];
-    const uint8_t *body;
+    const uint8_t *body = NULL;
     size_t body_len = 0;
-    size_t n;
-    char path[512];
     char target[STORE_PURCHASE_PATH_MAX + 1];
     const char *want_path;
 
@@ -511,35 +694,10 @@ struct zcl_result store_buyer_collect(const char *datadir,
                         (long long)purchase_id);
     }
 
-    resp = zcl_malloc(SB_RESP_MAX, "store_buyer_collect_resp");
-    if (!resp)
-        return SB_FAILF(STORE_BUYER_ERR_INTERNAL,
-                        "could not allocate the %d-byte response buffer",
-                        (int)SB_RESP_MAX);
-
-    (void)snprintf(path, sizeof(path), "/store/access?addr=%s&token=%s",
-                   purchase.customer_addr, purchase.token_id);
-    n = store_handle_request("GET", path, NULL, 0, resp, SB_RESP_MAX, datadir);
-    if (n == 0 || !strstr((const char *)resp, "HTTP/1.1 200 OK")) {
-        free(resp);
-        LOG_WARN(SB_TAG, "collect: token gate did not serve purchase %lld "
-                 "(token=%s addr=%s)", (long long)purchase_id,
-                 purchase.token_id, purchase.customer_addr);
-        return SB_FAILF(STORE_BUYER_ERR_DELIVERY_FAILED,
-                        "the token gate did not serve purchase %lld "
-                        "(token=%s addr=%s)", (long long)purchase_id,
-                        purchase.token_id, purchase.customer_addr);
-    }
-
-    body = sb_http_body(resp, n, &body_len);
-    if (!body || body_len == 0) {
-        free(resp);
-        LOG_WARN(SB_TAG, "collect: purchase %lld got a response with no body",
-                 (long long)purchase_id);
-        return SB_FAILF(STORE_BUYER_ERR_DELIVERY_FAILED,
-                        "the store answered purchase %lld with no body",
-                        (long long)purchase_id);
-    }
+    r = sb_collect_fetch(datadir, &purchase, purchase_id, &resp, &body,
+                         &body_len);
+    if (!r.ok)
+        return r;
 
     /* Verify BEFORE writing. The hash is the product's content hash recorded
      * when the order was placed, so this also catches a merchant that swapped

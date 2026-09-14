@@ -25,6 +25,7 @@ static bool store_purchase_before_validate(void *record, void *ctx)
     model_trim_ascii(p->customer_addr);
     model_trim_ascii(p->memo);
     model_trim_ascii(p->operation_id);
+    model_trim_ascii(p->seller_onion);
     return true;
 }
 
@@ -81,6 +82,13 @@ bool db_store_purchase_validate(const struct db_store_purchase *p,
         strlen(p->last_error) <= STORE_PURCHASE_ERROR_MAX,
         "last_error", "exceeds max length 191");
     validates_custom(errors,
+        strlen(p->seller_onion) <= STORE_PURCHASE_ONION_MAX,
+        "seller_onion", "exceeds max length 62");
+    validates_custom(errors,
+        model_string_is_printable(p->seller_onion) ||
+            p->seller_onion[0] == '\0',
+        "seller_onion", "contains non-printable characters");
+    validates_custom(errors,
         model_string_is_printable(p->payment_addr),
         "payment_addr", "contains non-printable characters");
     validates_custom(errors,
@@ -97,7 +105,7 @@ bool db_store_purchase_validate(const struct db_store_purchase *p,
 }
 
 /* Bind the columns shared by the INSERT and the UPDATE, in the order both
- * statements list them (1..14). Keeping one binder means an added column
+ * statements list them (1..15). Keeping one binder means an added column
  * cannot be bound in the insert and forgotten in the update. */
 static void store_purchase_bind_common(sqlite3_stmt *s,
                                        const struct db_store_purchase *p)
@@ -119,6 +127,7 @@ static void store_purchase_bind_common(sqlite3_stmt *s,
     AR_BIND_INT(s, 12, p->stage);
     AR_BIND_TEXT(s, 13, p->last_error);
     AR_BIND_INT(s, 14, p->updated_at);
+    AR_BIND_TEXT(s, 15, p->seller_onion);
 }
 
 bool db_store_purchase_save(struct node_db *ndb, struct db_store_purchase *p)
@@ -144,19 +153,20 @@ bool db_store_purchase_save(struct node_db *ndb, struct db_store_purchase *p)
             "order_id=?,product_id=?,product_name=?,token_id=?,"
             "payment_addr=?,customer_addr=?,memo=?,amount_zatoshi=?,"
             "content_hash=?,output_path=?,operation_id=?,stage=?,"
-            "last_error=?,updated_at=? WHERE id=?");
+            "last_error=?,updated_at=?,seller_onion=? WHERE id=?");
         store_purchase_bind_common(s, p);
-        AR_BIND_INT(s, 15, p->id);
+        AR_BIND_INT(s, 16, p->id);
         AR_FINALIZE_STEP_DONE(s, ok);
     } else {
         AR_PREPARE_BOOL(ndb, s,
             "INSERT INTO store_purchases "
             "(order_id,product_id,product_name,token_id,payment_addr,"
             "customer_addr,memo,amount_zatoshi,content_hash,output_path,"
-            "operation_id,stage,last_error,updated_at,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+            "operation_id,stage,last_error,updated_at,seller_onion,"
+            "created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         store_purchase_bind_common(s, p);
-        AR_BIND_INT(s, 15, p->created_at);
+        AR_BIND_INT(s, 16, p->created_at);
         AR_FINALIZE_STEP_DONE(s, ok);
         if (ok)
             p->id = sqlite3_last_insert_rowid(ndb->db);
@@ -170,7 +180,7 @@ bool db_store_purchase_save(struct node_db *ndb, struct db_store_purchase *p)
 #define STORE_PURCHASE_COLUMNS \
     "id,order_id,product_id,product_name,token_id,payment_addr," \
     "customer_addr,memo,amount_zatoshi,content_hash,output_path," \
-    "operation_id,stage,last_error,created_at,updated_at"
+    "operation_id,stage,last_error,created_at,updated_at,seller_onion"
 
 static void store_purchase_read_row(sqlite3_stmt *s,
                                     struct db_store_purchase *out)
@@ -202,6 +212,7 @@ static void store_purchase_read_row(sqlite3_stmt *s,
     AR_READ_STR(s, 13, out->last_error, sizeof(out->last_error));
     out->created_at = AR_COL_INT(s, 14);
     out->updated_at = AR_COL_INT(s, 15);
+    AR_READ_STR(s, 16, out->seller_onion, sizeof(out->seller_onion));
 }
 
 bool db_store_purchase_find(struct node_db *ndb, int64_t id,
@@ -224,18 +235,21 @@ bool db_store_purchase_find(struct node_db *ndb, int64_t id,
     return true;
 }
 
-bool db_store_purchase_find_by_order(struct node_db *ndb, int64_t order_id,
-                                     struct db_store_purchase *out)
+bool db_store_purchase_find_by_order_seller(struct node_db *ndb,
+                                            const char *seller_onion,
+                                            int64_t order_id,
+                                            struct db_store_purchase *out)
 {
     sqlite3_stmt *s = NULL;
 
-    if (!ndb || !ndb->open || !out || order_id <= 0)
+    if (!ndb || !ndb->open || !out || !seller_onion || order_id <= 0)
         return false;
     memset(out, 0, sizeof(*out));
     AR_PREPARE_BOOL(ndb, s,
         "SELECT " STORE_PURCHASE_COLUMNS
-        " FROM store_purchases WHERE order_id=?");
-    AR_BIND_INT(s, 1, order_id);
+        " FROM store_purchases WHERE seller_onion=? AND order_id=?");
+    AR_BIND_TEXT(s, 1, seller_onion);
+    AR_BIND_INT(s, 2, order_id);
     if (!AR_STEP_ROW(s)) {
         AR_FINALIZE(s);
         return false;
@@ -243,6 +257,12 @@ bool db_store_purchase_find_by_order(struct node_db *ndb, int64_t order_id,
     store_purchase_read_row(s, out);
     AR_FINALIZE(s);
     return true;
+}
+
+bool db_store_purchase_find_by_order(struct node_db *ndb, int64_t order_id,
+                                     struct db_store_purchase *out)
+{
+    return db_store_purchase_find_by_order_seller(ndb, "", order_id, out);
 }
 
 int db_store_purchase_list(struct node_db *ndb, struct db_store_purchase *out,
