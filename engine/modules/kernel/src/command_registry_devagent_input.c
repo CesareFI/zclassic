@@ -174,6 +174,7 @@ static bool devagent_scoped_bool(const char *path, const char *key,
         /* ops.host.gc's `--apply`: the one switch that turns the host
          * sweep from a classification report into a removal. */
         { "ops.host.gc", "apply" },
+        { "app.invoke.package", "accept_execution" },
     };
     if (!path)
         return false;

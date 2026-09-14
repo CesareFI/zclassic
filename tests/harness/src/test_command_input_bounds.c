@@ -955,6 +955,39 @@ static int t_moved_required_discovery(void)
     return failures;
 }
 
+/* Shape admission is separate from the handler's exact execution grant.
+ * A string "true" must never substitute for JSON boolean true. */
+static int t_resident_execution_grant(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), "app.invoke.package", NULL);
+    CIB_CHECK("resident package leaf resolves", spec != NULL);
+    if (!spec) return failures;
+    const char *wires[] = {"{\"accept_execution\":true}",
+                          "{\"accept_execution\":false}",
+                          "{\"accept_execution\":\"true\"}",
+                          "{\"accept_execution\":1}"};
+    for (size_t i = 0; i < sizeof(wires) / sizeof(wires[0]); ++i) {
+        struct json_value input;
+        json_init(&input);
+        char why[192] = {0};
+        bool parsed = json_read(&input, wires[i], strlen(wires[i]));
+        bool admitted = parsed && zcl_command_registry_input_validate(
+            spec, &input, why, sizeof(why));
+        CIB_CHECK("resident execution grant admits only boolean shape",
+                  parsed && admitted == (i < 2));
+        if (i < 2 && parsed) {
+            struct zcl_command_spec unrelated = *spec;
+            unrelated.path = "app.invoke.unrelated";
+            CIB_CHECK("resident boolean rule does not widen another leaf",
+                      !zcl_command_registry_input_validate(
+                          &unrelated, &input, why, sizeof(why)));
+        }
+        json_free(&input);
+    }
+    return failures;
+}
 int test_command_input_bounds(void)
 {
     printf("\n=== command_input_bounds: per-key input length rules ===\n");
@@ -974,6 +1007,7 @@ int test_command_input_bounds(void)
     failures += t_moved_line_bounds();
     failures += t_moved_max_lines_bounds();
     failures += t_moved_required_discovery();
+    failures += t_resident_execution_grant();
     printf("=== command_input_bounds complete: %d failure(s) ===\n", failures);
     return failures;
 }

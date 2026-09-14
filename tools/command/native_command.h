@@ -591,6 +591,8 @@ void zcl_native_handle_presentation_code_change(
     const struct zcl_command_request *request, struct zcl_command_reply *reply);
 void zcl_native_handle_presentation_development(
     const struct zcl_command_request *request, struct zcl_command_reply *reply);
+void zcl_native_handle_package_resident(
+    const struct zcl_command_request *request, struct zcl_command_reply *reply);
 void zcl_native_handle_presentation_reproduction(
     const struct zcl_command_request *request, struct zcl_command_reply *reply);
 void zcl_native_handle_presentation_publication_confirm(

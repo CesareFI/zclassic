@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "name": "ztasks/ztasks",
+  "semver": "0.2.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [],
+  "programs": ["app/main.c"],
+  "files": ["LICENSE", "README.md", "app/main.c", "include/ztasks/ztasks.h", "src/ztasks.c", "tests/test_ztasks.c", "zcode-package.json"]
+}

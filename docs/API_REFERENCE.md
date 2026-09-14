@@ -74,15 +74,15 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 882 |
+| Registry entries (branches + leaves) | 883 |
 | Top-level roots | 14 |
 | Branches | 198 |
-| Leaves (dispatchable command paths) | 684 |
-| … `ready` (live handler in this build) | 607 |
+| Leaves (dispatchable command paths) | 685 |
+| … `ready` (live handler in this build) | 608 |
 | … `compat` (metadata only, names a fallback) | 47 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 46 |
-| Leaves with `effect=mutate` | 247 |
+| Leaves with `effect=mutate` | 248 |
 | Leaves with `effect=destructive` | 6 |
 | Leaves requiring **owner** authority | 129 |
 
@@ -92,7 +92,7 @@ Per source file:
 |---|---|---|---|
 | `engine/composition/commands/root.def` | 10 | 5 | 5 |
 | `engine/composition/commands/core.def` | 122 | 29 | 93 |
-| `engine/composition/commands/apps.def` | 16 | 3 | 13 |
+| `engine/composition/commands/apps.def` | 17 | 3 | 14 |
 | `engine/composition/commands/app_features.def` | 75 | 20 | 55 |
 | `engine/composition/commands/store.def` | 19 | 0 | 19 |
 | `engine/composition/commands/ops.def` | 59 | 11 | 48 |
@@ -454,6 +454,12 @@ represented by its children's sections.
 | `app transaction-types command` | ready | read / read / public · instant/tiny | **`path`** | `zcl.transaction_command.v1` | `z23 app transaction-types command core.wallet.transaction.send` | Reverse-map one native command to every transaction workflow it can serve |
 | `app transaction-types wire` | ready | read / read / public · instant/tiny | none | `zcl.transaction_wire_catalog.v1` | `z23 app transaction-types wire` | List every consensus transaction wire era and script-processing bucket |
 | `app transaction-types micro-lab` | ready | read / read / public · instant/tiny | **`slot`** | `zcl.transaction_micro_lab.v1` | `z23 app transaction-types micro-lab --slot=1` | Inspect the checked 100-transaction micro-lab campaign or one numbered slot |
+
+#### `app.invoke` — Invoke a manifest-owned App route
+
+| Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
+|---|---|---|---|---|---|---|
+| `app invoke package` | ready | mutate / app-write / operator · background/low | `datadir`, `package_root`, `receipt_id`, `artifact_sha3`, `program`, `input_text`, `accept_execution` | `zcl.package_resident.v1` | `z23 app invoke package --input=-` | Run an explicitly accepted installed resident app |
 
 #### `app.service` — Token-gated services declared in the service catalog
 
