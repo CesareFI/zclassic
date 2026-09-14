@@ -29,21 +29,51 @@
  *
  * Isolation
  * ---------
- * Uses p2p_port = 18033 → bootstrap SocksPort 29999 (127.0.0.1), so
- * a concurrently-running production node on 8033/19999 does not
- * collide.  Datadir is a test_make_tmpdir() fixture under ./test-tmp/ and is
+ * Picks an ephemeral free loopback port (p2p_port → SocksPort = p2p_port +
+ * 11966), so no concurrently-running node — production 8033/19999, a soak
+ * lane, or a sibling proof on this shared host — can collide.
+ * Datadir is a test_make_tmpdir() fixture under ./test-tmp/ and is
  * `rm -rf`'d on exit, pass or fail.  The tor_integration static
  * state is process-local; stopping at end restores the same initial
  * state that `test_tor_initial_state` observed at boot.
  */
 
+#include "platform/socket_compat.h"
 #include "platform/time_compat.h"
 #include "test/test_core.h"
 #include "net/tor_integration.h"
+#include <stdint.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <time.h>
+
+/* Bind port 0 on loopback and return the assigned port. Same idiom as
+ * test_acme_cert_reload.c. Returns 0 when no port could be observed; the
+ * caller then fails closed on tor_integration_start with an unusable port. */
+static uint16_t onion_free_port(void)
+{
+    platform_socket_t fd = platform_socket_open(AF_INET, SOCK_STREAM, 0,
+                                                true, false);
+    if (fd == PLATFORM_SOCKET_INVALID)
+        return 0;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0);
+    uint16_t port = 0;
+    if (platform_socket_bind(fd, (struct sockaddr *)&addr,
+                             sizeof(addr)) == 0) {
+        size_t len = sizeof(addr);
+        if (platform_socket_local_address(fd, (struct sockaddr *)&addr,
+                                          &len) == 0)
+            port = ntohs(addr.sin_port);
+    }
+    platform_socket_close(fd);
+    return port;
+}
 
 /* Recursively remove a directory tree (rm -rf).  Local copy to avoid
  * leaking a `remove_tree` symbol across translation units — test_tor.c
@@ -128,9 +158,15 @@ int test_onion_bootstrap(void)
      * external-handler branch is exercised. */
     tor_integration_set_handler(p11_noop_handler, NULL);
 
-    /* p2p_port=18033 → bootstrap SocksPort 29999; avoids collision
-     * with the systemctl-running node (default 8033 → 19999). */
-    const uint16_t p2p_port = 18033;
+    /* Pick an actually-free loopback port instead of a fixed one. The
+     * original fixed 18033 → SocksPort 29999 collided the moment a soak or
+     * test lane on this shared host also used 18033: tor refused to bind,
+     * and this gate reported UNOBSERVED (addr=NULL) for reasons that had
+     * nothing to do with Tor reachability. An ephemeral port can still be
+     * grabbed between the probe and tor's bind, but that race is rare and
+     * self-evident, while a fixed port collides with every peer lane that
+     * copies the same "safe" constant. */
+    const uint16_t p2p_port = onion_free_port();
 
     if (!tor_integration_start(datadir, p2p_port)) {
         printf("FAIL (tor_integration_start returned false)\n");
