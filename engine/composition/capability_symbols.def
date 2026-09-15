@@ -1836,3 +1836,6 @@ ZCL_CAPABILITY_SYMBOL("wcsncmp", CAP_HARMLESS, "Compares caller-owned text.")
 ZCL_CAPABILITY_SYMBOL("wcspbrk", CAP_HARMLESS, "Searches caller-owned text.")
 ZCL_CAPABILITY_SYMBOL("wcsrchr", CAP_HARMLESS, "Searches caller-owned text.")
 ZCL_CAPABILITY_SYMBOL("wcstombs", CAP_HARMLESS, "Text conversion.")
+
+ZCL_CAPABILITY_SYMBOL("fclonefileat", CAP_FS_WRITE, "Clones the pinned Darwin file into an owned destination directory.")
+ZCL_CAPABILITY_SYMBOL("renamex_np", CAP_FS_WRITE, "Darwin atomic pathname rename with no-replace flags.")
