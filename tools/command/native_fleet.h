@@ -47,4 +47,21 @@ void zcl_native_handle_fleet_roles_check(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 
+/* fleet.mcp.* — the thin remote-MCP adapter over mail, queue, board and
+ * receipts (tools/command/native_fleet_mcp.c). Brief/send/evidence compose
+ * sibling leaves in-process; the grant leaf mints and revokes the
+ * adapter's own scoped bearer grants. */
+void zcl_native_handle_fleet_mcp_brief(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_fleet_mcp_send(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_fleet_mcp_evidence(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_fleet_mcp_grant(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+
 #endif /* ZCL_NATIVE_FLEET_H */
