@@ -428,7 +428,7 @@ ZCL_MODULE_CAPABILITY("contexts/commons/services/src/task_editor.c", CAP_FS_WRIT
 ZCL_MODULE_CAPABILITY("contexts/commons/services/src/task_editor_window.c", CAP_FS_WRITE, "reports native task display and save failures without discarding drafts")
 ZCL_MODULE_CAPABILITY("contexts/commons/services/src/task_list.c", CAP_FS_WRITE, "reports failed durable task list actions")
 ZCL_MODULE_CAPABILITY("contexts/commons/services/src/task_list_window.c", CAP_FS_WRITE, "reports native task list display and save failures")
-ZCL_MODULE_CAPABILITY("contexts/commons/services/src/task_update.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PROCESS|CAP_CLOCK, "runs an explicitly permitted confined preview over copied task values and commits compatible program selection")
+ZCL_MODULE_CAPABILITY("contexts/commons/services/src/task_update.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PROCESS, "runs an explicitly permitted confined preview over copied task values and commits compatible program selection")
 ZCL_MODULE_CAPABILITY("tools/command/native_task_document_command.c", CAP_FS_READ|CAP_FS_WRITE, "locates the confined verifier and reports native task editor failures")
 ZCL_MODULE_CAPABILITY("contexts/commons/models/src/task_document.c", CAP_FS_READ|CAP_FS_WRITE, "commits canonical user task contents and undo in the isolated application store")
 ZCL_MODULE_CAPABILITY("contexts/commons/services/src/package_resident.c", CAP_FS_WRITE, "reads accepted artifact records through the local package store")
