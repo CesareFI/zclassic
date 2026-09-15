@@ -84,11 +84,14 @@ static struct zcl_result tlw_run(struct task_list_window *window)
     return window->display;
 }
 
-struct zcl_result task_list_window_run(struct task_editor *editor)
+static struct zcl_result tlw_journey(struct task_editor *editor, struct task_update *update)
 {
     if (!editor) return ZCL_ERR(-1, "task-list: durable editor owner required");
     struct task_list_window window = { .display = ZCL_OK };
     task_list_init(&window.list, editor);
+    window.list.update = update;
+    window.list.updates = update && update->candidate.package_root[0];
+    if (window.list.updates) window.list.focus = 0;
     for (;;) {
         ZCL_CHECK(tlw_run(&window));
         if (!window.list.open_editor) return ZCL_OK;
@@ -102,4 +105,19 @@ struct zcl_result task_list_window_run(struct task_editor *editor)
         window.list.selected_id = editor->selected_id;
         task_list_refresh(&window.list);
     }
+}
+
+struct zcl_result task_list_window_run_update(struct task_editor *editor, struct task_update *update)
+{
+    struct zcl_result result = tlw_journey(editor, update);
+    if (update) {
+        struct zcl_result finished = task_update_finish(update);
+        if (result.ok && !finished.ok) result = finished;
+    }
+    return result;
+}
+
+struct zcl_result task_list_window_run(struct task_editor *editor)
+{
+    return task_list_window_run_update(editor, NULL);
 }

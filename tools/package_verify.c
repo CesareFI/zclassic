@@ -133,6 +133,7 @@ static int pv_main_windows(void)
 
 #include "base/hex.h"
 #include "util/clientversion.h"
+#include "util/thread_qos.h"
 #include "config/c23_commons_build_profile.h"
 #include "base/serialize_le.h"
 #include "crypto/sha3.h"
@@ -581,6 +582,42 @@ struct pv_run {
     char stderr_buf[PV_STDERR_CAP];
 };
 
+/* Only the fixed preview mode uses these controls. This verifier is a fresh,
+ * single-threaded process. Control files are outside the candidate's grants. */
+static const char *g_pv_preview_control;
+static pid_t g_pv_preview_owner;
+static uint64_t g_pv_preview_pid, g_pv_preview_token;
+
+static bool pv_preview_cancelled(void)
+{
+    if (!g_pv_preview_control) return false;
+    char path[4200];
+    (void)snprintf(path, sizeof(path), "%s/cancel", g_pv_preview_control);
+    return getppid() != g_pv_preview_owner || access(path, F_OK) == 0;
+}
+
+static bool pv_preview_finished_late(int64_t deadline)
+{
+    return g_pv_preview_control && clock_now_monotonic_ns() >= deadline;
+}
+
+/* Publish the kernel identity before allowing any candidate instruction. If
+ * this supervisor dies before release, pipe EOF keeps the child inert. */
+static bool pv_preview_release(pid_t pid, int release_fd)
+{
+    g_pv_preview_pid = (uint64_t)pid;
+    if (!os_proc_pid_start_token((uint64_t)pid, &g_pv_preview_token)) return false;
+    char path[4200], record[128];
+    (void)snprintf(path, sizeof(path), "%s/child", g_pv_preview_control);
+    int length = snprintf(record, sizeof(record), "%llu %llu\n",
+        (unsigned long long)g_pv_preview_pid, (unsigned long long)g_pv_preview_token);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0400);
+    if (fd < 0) return false;
+    bool ok = write(fd, record, (size_t)length) == length && fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    return ok && write(release_fd, "R", 1) == 1;
+}
+
 /* One line naming a process-accounting outcome, or NULL when the run had
  * none. Callers print this INSTEAD of a build-failure line so a wedge and a
  * real defect never share a message (or, at the zbuild entry points, an exit
@@ -831,6 +868,7 @@ static void pv_run_child_wait_loop(pid_t pid, int out_pipe[2], int err_pipe[2],
         int peeked = waitid(P_PID, (id_t)pid, &si,
                             WEXITED | WNOHANG | WNOWAIT);
         if (peeked == 0 && si.si_pid == pid) {
+            r->timed_out = pv_preview_finished_late(deadline);
             kill(-pid, SIGKILL);           /* nothing outlives the action */
             (void)wait4(pid, status, 0, usage);
             *reaped = true;
@@ -859,7 +897,7 @@ static void pv_run_child_wait_loop(pid_t pid, int out_pipe[2], int err_pipe[2],
                 return;
             }
         }
-        if (clock_now_monotonic_ns() >= deadline) {
+        if (pv_preview_cancelled() || clock_now_monotonic_ns() >= deadline) {
             /* Kill the GROUP, not just the direct child: a descendant that
              * outlived its parent would otherwise survive the deadline. */
             kill(-pid, SIGKILL);
@@ -999,7 +1037,9 @@ static _Noreturn void pv_run_child_exec(const char *const argv[],
     if (!os_sandbox_no_new_privs())
         _exit(PV_CHILD_SANDBOX_FAIL);
     if (confined) {
-        struct zcl_result lr = os_sandbox_package_restrict(rules, n_rules);
+        struct zcl_result lr = g_pv_preview_control
+            ? os_sandbox_package_leaf_restrict(rules, n_rules)
+            : os_sandbox_package_restrict(rules, n_rules);
         if (!zcl_result_is_ok(lr)) {
             fprintf(stderr, "confinement: %s\n", lr.message);
             _exit(PV_CHILD_SANDBOX_FAIL);
@@ -1018,6 +1058,39 @@ static _Noreturn void pv_run_child_exec(const char *const argv[],
  * the Linux seccomp deny-set, then execvp. The parent enforces the wall-clock
  * deadline with SIGKILL. env_pairs is a NULL-terminated flat array of
  * "NAME=value" strings applied in the child (or NULL). */
+static void pv_pipe_close(int descriptors[2])
+{
+    if (descriptors[0] >= 0) close(descriptors[0]);
+    if (descriptors[1] >= 0) close(descriptors[1]);
+}
+
+static bool pv_run_pipes(int out[2], int err[2], int release[2])
+{
+    bool opened = pipe(out) == 0 && pipe(err) == 0;
+    if (opened && g_pv_preview_control) opened = pipe(release) == 0;
+    if (!opened) { pv_pipe_close(out); pv_pipe_close(err); pv_pipe_close(release); }
+    return opened;
+}
+
+static void pv_preview_child_gate(int descriptors[2])
+{
+    if (!g_pv_preview_control) return;
+    close(descriptors[1]);
+    char release = 0;
+    ssize_t got;
+    do { got = read(descriptors[0], &release, 1); } while (got < 0 && errno == EINTR);
+    close(descriptors[0]);
+    if (got != 1 || release != 'R') _exit(PV_CHILD_EXEC_FAIL);
+}
+
+static void pv_preview_parent_gate(pid_t pid, int descriptors[2])
+{
+    if (!g_pv_preview_control) return;
+    close(descriptors[0]);
+    if (!pv_preview_release(pid, descriptors[1])) (void)kill(pid, SIGKILL);
+    close(descriptors[1]);
+}
+
 static struct pv_run pv_run_child(const char *const argv[],
                                   const char *cwd,
                                   const struct os_sandbox_rlimits *limits,
@@ -1052,15 +1125,17 @@ static struct pv_run pv_run_child(const char *const argv[],
         return r;
     int out_pipe[2] = { -1, -1 };
     int err_pipe[2] = { -1, -1 };
-    if (pipe(out_pipe) != 0 || pipe(err_pipe) != 0)
-        return r;
+    int release_pipe[2] = { -1, -1 };
+    if (!pv_run_pipes(out_pipe, err_pipe, release_pipe)) return r;
     pid_t pid = fork();
     if (pid < 0) {
         close(out_pipe[0]); close(out_pipe[1]);
         close(err_pipe[0]); close(err_pipe[1]);
+        pv_pipe_close(release_pipe);
         return r;
     }
     if (pid == 0) {
+        pv_preview_child_gate(release_pipe);
         /* Child: single-threaded standalone CLI, so the pre-exec calls in
          * pv_run_child_exec are safe here (no other thread holds a lock). */
         pv_run_child_exec(argv, cwd, limits, confined, rules, n_rules,
@@ -1070,6 +1145,7 @@ static struct pv_run pv_run_child(const char *const argv[],
      * runs first. EACCES here means the child already exec'd — it set the
      * group itself before doing so, which is the outcome we wanted. */
     (void)setpgid(pid, pid);
+    pv_preview_parent_gate(pid, release_pipe);
     close(out_pipe[1]);
     close(err_pipe[1]);
     /* Nonblocking read ends: the poll loop drains without hanging. */
@@ -1077,8 +1153,8 @@ static struct pv_run pv_run_child(const char *const argv[],
     (void)fcntl(err_pipe[0], F_SETFL, O_NONBLOCK);
     r.launched = true;
 
-    int64_t deadline =
-        clock_now_monotonic_ns() + (int64_t)timeout_ms * INT64_C(1000000);
+    int64_t deadline = (g_pv_preview_control ? perf_started_ns : clock_now_monotonic_ns()) +
+        (int64_t)timeout_ms * INT64_C(1000000);
     size_t out_len = 0, err_len = 0;
     int status = 0;
     bool reaped = false;
@@ -3883,6 +3959,100 @@ static int pv_zbuild_fuzz_mode(int argc, char **argv)
 /* argv[0] carries one of the fixed-ABI zbuild/zbuild-test/zbuild-fuzz mode
  * flags, or is the normal/candidate attestation-mode invocation. PV_CONTINUE
  * when none of the fixed-ABI flags are present. */
+/* A preview is one leaf process with read-only input and three precreated
+ * output files. It has no grant for the working application's directory. */
+struct pv_app_preview {
+    char directory[4096], image[4096], paths[5][4200];
+    const char *nonce;
+};
+
+static bool pv_app_preview_args(int argc, char **argv)
+{
+    if (argc != 6 || strncmp(argv[1], "--app-preview=", 14) != 0 ||
+        strncmp(argv[2], "--image=", 8) != 0 || strncmp(argv[3], "--nonce=", 8) != 0 ||
+        strcmp(argv[4], "--require-full-isolation") != 0 ||
+        strcmp(argv[5], "--accept-execution") != 0) return false;
+    return strlen(argv[3] + 8) == 64 && strspn(argv[3] + 8, "0123456789abcdef") == 64;
+}
+
+static bool pv_app_preview_private(const char *path, bool directory)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0 || st.st_uid != geteuid() || (st.st_mode & 077) != 0) return false;
+    return directory ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode) && st.st_nlink == 1;
+}
+
+static bool pv_app_preview_paths(char **argv, struct pv_app_preview *preview)
+{
+    if (!realpath(argv[1] + 14, preview->directory) || !realpath(argv[2] + 8, preview->image) ||
+        !pv_zbuild_test_native_executable(preview->image) ||
+        !pv_app_preview_private(preview->directory, true)) return false;
+    preview->nonce = argv[3] + 8;
+    static const char *const names[] = { "state", "undo", "state.out", "undo.out", "view" };
+    for (size_t i = 0; i < 5; ++i) {
+        (void)snprintf(preview->paths[i], sizeof(preview->paths[i]), "%s/%s", preview->directory, names[i]);
+        if (!pv_app_preview_private(preview->paths[i], false)) return false;
+    }
+    return true;
+}
+
+static size_t pv_app_preview_grants(const struct pv_app_preview *preview,
+                                     struct os_sandbox_path_rule *rules, size_t capacity)
+{
+    size_t count = pv_child_grants(preview->paths[0], preview->image, NULL, 0, rules, capacity);
+    if (!count) return 0;
+    rules[1].allow_write = false;
+    rules[1].allow_create = false;
+    for (size_t i = 1; i < 5; ++i)
+        rules[count++] = (struct os_sandbox_path_rule){ .path = preview->paths[i],
+            .allow_read = true, .allow_write = i >= 2 };
+    return count;
+}
+
+static bool pv_app_preview_ready(const struct pv_run *run, const char *nonce)
+{
+    char ready[80];
+    (void)snprintf(ready, sizeof(ready), "READY %s\n", nonce);
+    return run->launched && run->exited && !run->exit_code && !run->timed_out &&
+        !run->sandbox_fail && !run->stdout_truncated && run->stdout_len == strlen(ready) &&
+        strcmp(run->stdout_buf, ready) == 0;
+}
+
+static int pv_app_preview_mode(int argc, char **argv)
+{
+    if (!pv_app_preview_args(argc, argv)) {
+        fprintf(stderr, "task-preview: exact arguments and execution permission required\n"); return 2;
+    }
+    struct pv_app_preview preview;
+    if (!pv_app_preview_paths(argv, &preview)) {
+        fprintf(stderr, "task-preview: private files and native executable required\n"); return 3;
+    }
+    if (os_sandbox_package_confinement() == OS_SANDBOX_PACKAGE_CONFINEMENT_NONE) {
+        fprintf(stderr, "task-preview: confinement unavailable\n"); return 4;
+    }
+    struct os_sandbox_path_rule rules[PV_CHILD_GRANT_BASE_CAP + 4u];
+    size_t count = pv_app_preview_grants(&preview, rules, sizeof(rules) / sizeof(rules[0]));
+    if (!count) { fprintf(stderr, "task-preview: filesystem grants unavailable\n"); return 5; }
+    const struct os_sandbox_rlimits limits = {
+        .as_bytes = UINT64_C(64) * 1024u * 1024u, .cpu_seconds = 3,
+        .nproc = 1, .fsize_bytes = 8192, .nofile = 32, .core_bytes = 0 };
+    const char *const child[] = { preview.image, "--app-preview", preview.nonce,
+        preview.paths[0], preview.paths[1], preview.paths[2], preview.paths[3], preview.paths[4], NULL };
+    g_pv_preview_control = preview.directory;
+    g_pv_preview_owner = getppid();
+    (void)zcl_thread_qos_background();
+    struct pv_run run = pv_run_child(child, preview.directory, &limits, true,
+                                    rules, count, NULL, 4100);
+    if (!pv_app_preview_ready(&run, preview.nonce)) {
+        fprintf(stderr, "task-preview: refused exit=%d signal=%d timeout=%d: %s\n",
+            run.exit_code, run.term_signal, run.timed_out, run.stderr_buf);
+        return 5;
+    }
+    printf("app-preview-ok %llu %llu %s\n", (unsigned long long)g_pv_preview_pid,
+           (unsigned long long)g_pv_preview_token, preview.nonce);
+    return 0;
+}
+
 static int pv_main_dispatch_fixed_modes(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--source-record") == 0) {
@@ -3890,6 +4060,8 @@ static int pv_main_dispatch_fixed_modes(int argc, char **argv)
                zcl_build_source_mutation_sha256());
         return 0;
     }
+    if (argc > 1 && strncmp(argv[1], "--app-preview=", 14) == 0)
+        return pv_app_preview_mode(argc, argv);
     for (int i = 1; i < argc; i++)
         if (strncmp(argv[i], "--zbuild-fuzz-input=", 20) == 0)
             return pv_zbuild_fuzz_mode(argc, argv);

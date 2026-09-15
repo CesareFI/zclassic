@@ -117,6 +117,12 @@ const char *os_sandbox_package_confinement_name(
  * install immediately afterward; Seatbelt installs both halves atomically. */
 struct zcl_result os_sandbox_package_restrict(
     const struct os_sandbox_path_rule *rules, size_t n_rules);
+/* Preview programs are single-process values-to-view computations. In addition
+ * to package confinement, prohibit creating children. The supervisor must retain
+ * and reap the exact child: Darwin does not prohibit changing process groups.
+ * Apply only in the fresh verifier child before exec. */
+struct zcl_result os_sandbox_package_leaf_restrict(
+    const struct os_sandbox_path_rule *rules, size_t n_rules);
 
 /* The metrics thread's steady-state RSS-sample path, named here (not as a
  * bare string literal in engine/composition/src/boot.c or any other non-platform/modules/platform

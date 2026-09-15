@@ -148,65 +148,15 @@ static bool seatbelt_add_rule(struct seatbelt_profile_builder *builder,
     }
     return true;
 }
-#endif
-
-struct zcl_result os_sandbox_package_restrict(
-    const struct os_sandbox_path_rule *rules, size_t n_rules)
+static bool seatbelt_finish_profile(struct seatbelt_profile_builder *builder,
+                                    const char *suffix, bool leaf)
 {
-#if defined(__APPLE__)
-    static const char prefix[] =
-        "(version 1)(deny default)"
-        "(deny file-map-executable process-info* nvram* "
-        "dynamic-code-generation mach-priv-host-port)"
-        "(import \"system.sb\")"
-        "(allow process-info* (target self))"
-        "(allow file-read-metadata)"
-        "(allow process-fork)(allow signal (target self))"
-        "(allow sysctl-read)"
-        "(allow file-read* (literal \"/\"))";
-    /* system.sb admits three narrow networking conveniences. A generic deny
-     * loses to those more-specific filters, so revoke each at equal-or-higher
-     * specificity as well as denying the remaining network operation set. */
-    static const char suffix[] =
-        "(deny network*)"
-        "(deny network-outbound"
-        " (literal \"/private/var/run/syslog\")"
-        " (control-name \"com.apple.netsrc\")"
-        " (control-name \"com.apple.network.statistics\"))"
-        "(deny system-socket"
-        " (require-all (socket-domain AF_SYSTEM) (socket-protocol 2))"
-        " (socket-domain AF_ROUTE))";
-    if (!rules || n_rules == 0 || n_rules > 128u)
-        return ZCL_ERR(OS_SANDBOX_ERR_INVALID_ARG,
-                       "Seatbelt wants 1..128 path rules");
-    size_t capacity = sizeof(prefix) + sizeof(suffix) + 1u;
-    for (size_t i = 0; i < n_rules; ++i) {
-        if (!rules[i].path || rules[i].path[0] != '/')
-            return ZCL_ERR(OS_SANDBOX_ERR_INVALID_ARG,
-                           "Seatbelt rule %zu is not absolute", i);
-        size_t path_length = strlen(rules[i].path);
-        if (path_length > 4095u || path_length > (SIZE_MAX - capacity) / 6u)
-            return ZCL_ERR(OS_SANDBOX_ERR_TOO_MANY_RULES,
-                           "Seatbelt profile size overflow");
-        capacity += path_length * 6u + 192u;
-    }
-    char *profile = zcl_malloc(capacity, "seatbelt-package-profile");
-    if (!profile)
-        return ZCL_ERR(OS_SANDBOX_ERR_SEATBELT,
-                       "Seatbelt profile allocation failed");
-    struct seatbelt_profile_builder builder = {
-        .text = profile, .length = 0, .capacity = capacity,
-    };
-    profile[0] = '\0';
-    bool built = seatbelt_append(&builder, prefix);
-    for (size_t i = 0; built && i < n_rules; ++i)
-        built = seatbelt_add_rule(&builder, &rules[i]);
-    built = built && seatbelt_append(&builder, suffix);
-    if (!built) {
-        free(profile);
-        return ZCL_ERR(OS_SANDBOX_ERR_SEATBELT,
-                       "Seatbelt profile construction failed");
-    }
+    return seatbelt_append(builder, suffix) &&
+        (!leaf || seatbelt_append(builder, "(deny process-fork)"));
+}
+
+static struct zcl_result seatbelt_apply_profile(char *profile)
+{
     /* Vendored Tor also exports a function named sandbox_init. A direct link
      * would therefore bind by executable symbol order, not by authority, and
      * can call Tor's logger-dependent initializer in this freshly forked
@@ -248,12 +198,86 @@ struct zcl_result os_sandbox_package_restrict(
     seatbelt_free_error(error);
     (void)dlclose(library);
     return ZCL_OK;
+}
+#endif
+
+static struct zcl_result package_restrict(
+    const struct os_sandbox_path_rule *rules, size_t n_rules, bool leaf)
+{
+#if defined(__APPLE__)
+    static const char prefix[] =
+        "(version 1)(deny default)"
+        "(deny file-map-executable process-info* nvram* "
+        "dynamic-code-generation mach-priv-host-port)"
+        "(import \"system.sb\")"
+        "(allow process-info* (target self))"
+        "(allow file-read-metadata)"
+        "(allow process-fork)(allow signal (target self))"
+        "(allow sysctl-read)"
+        "(allow file-read* (literal \"/\"))";
+    /* system.sb admits three narrow networking conveniences. A generic deny
+     * loses to those more-specific filters, so revoke each at equal-or-higher
+     * specificity as well as denying the remaining network operation set. */
+    static const char suffix[] =
+        "(deny network*)"
+        "(deny network-outbound"
+        " (literal \"/private/var/run/syslog\")"
+        " (control-name \"com.apple.netsrc\")"
+        " (control-name \"com.apple.network.statistics\"))"
+        "(deny system-socket"
+        " (require-all (socket-domain AF_SYSTEM) (socket-protocol 2))"
+        " (socket-domain AF_ROUTE))";
+    if (!rules || n_rules == 0 || n_rules > 128u)
+        return ZCL_ERR(OS_SANDBOX_ERR_INVALID_ARG,
+                       "Seatbelt wants 1..128 path rules");
+    size_t capacity = sizeof(prefix) + sizeof(suffix) + 64u;
+    for (size_t i = 0; i < n_rules; ++i) {
+        if (!rules[i].path || rules[i].path[0] != '/')
+            return ZCL_ERR(OS_SANDBOX_ERR_INVALID_ARG,
+                           "Seatbelt rule %zu is not absolute", i);
+        size_t path_length = strlen(rules[i].path);
+        if (path_length > 4095u || path_length > (SIZE_MAX - capacity) / 6u)
+            return ZCL_ERR(OS_SANDBOX_ERR_TOO_MANY_RULES,
+                           "Seatbelt profile size overflow");
+        capacity += path_length * 6u + 192u;
+    }
+    char *profile = zcl_malloc(capacity, "seatbelt-package-profile");
+    if (!profile)
+        return ZCL_ERR(OS_SANDBOX_ERR_SEATBELT,
+                       "Seatbelt profile allocation failed");
+    struct seatbelt_profile_builder builder = {
+        .text = profile, .length = 0, .capacity = capacity,
+    };
+    profile[0] = '\0';
+    bool built = seatbelt_append(&builder, prefix);
+    for (size_t i = 0; built && i < n_rules; ++i)
+        built = seatbelt_add_rule(&builder, &rules[i]);
+    built = built && seatbelt_finish_profile(&builder, suffix, leaf);
+    if (!built) {
+        free(profile);
+        return ZCL_ERR(OS_SANDBOX_ERR_SEATBELT,
+                       "Seatbelt profile construction failed");
+    }
+    return seatbelt_apply_profile(profile);
 #else
     (void)rules;
     (void)n_rules;
+    (void)leaf;
     return ZCL_ERR(OS_SANDBOX_ERR_CONFINEMENT_UNAVAILABLE,
                    "package confinement is unavailable");
 #endif
+}
+
+struct zcl_result os_sandbox_package_restrict(
+    const struct os_sandbox_path_rule *rules, size_t n_rules)
+{
+    return package_restrict(rules, n_rules, false);
+}
+
+struct zcl_result os_sandbox_package_leaf_restrict(
+    const struct os_sandbox_path_rule *rules, size_t n_rules)
+{
+    return package_restrict(rules, n_rules, true);
 }
 
 const char *os_sandbox_fs_grant_at(size_t i, bool *readable, bool *writable)

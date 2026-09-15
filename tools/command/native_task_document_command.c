@@ -5,10 +5,12 @@
 #include "services/task_editor.h"
 #include "services/task_list.h"
 #include "platform/private_directory.h"
+#include "platform/os_proc.h"
 #include "platform/time_compat.h"
 #include "util/log_macros.h"
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static const char *ntd_string(const struct json_value *input, const char *key)
 {
@@ -27,7 +29,8 @@ static bool ntd_integer(const struct json_value *input, const char *key, uint64_
 static struct zcl_result ntd_open(const struct json_value *input,
     struct package_resident_store *store)
 {
-    static const char *const keys[] = { "datadir", "app", "action", "title" };
+    static const char *const keys[] = { "datadir", "app", "action", "title",
+        "preview_root", "preview_receipt", "preview_program" };
     for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); ++i) {
         const struct json_value *value = json_get(input, keys[i]);
         if (value && value->type != JSON_STR)
@@ -48,13 +51,57 @@ static struct zcl_result ntd_open(const struct json_value *input,
     return package_resident_store_open_app(store, directory, app);
 }
 
+static struct zcl_result ntd_candidate(const struct json_value *input,
+    struct package_resident_identity *candidate)
+{
+    const char *root = ntd_string(input, "preview_root");
+    const char *receipt = ntd_string(input, "preview_receipt");
+    const char *program = ntd_string(input, "preview_program");
+    if (root || receipt || program) {
+        if (!root || !receipt || !program || strlen(root) != 64 || strlen(receipt) != 64 ||
+            strlen(program) >= sizeof(candidate->program))
+            return ZCL_ERR(-1, "tasks: select an exact installed preview program and receipt");
+        (void)snprintf(candidate->package_root, sizeof(candidate->package_root), "%s", root);
+        (void)snprintf(candidate->receipt_id, sizeof(candidate->receipt_id), "%s", receipt);
+        (void)snprintf(candidate->program, sizeof(candidate->program), "%s", program);
+    }
+    return ZCL_OK;
+}
+
+static struct zcl_result ntd_task_window(const struct json_value *input,
+    struct package_resident_store *store, struct task_editor *editor)
+{
+    struct package_resident_identity candidate = {0};
+    ZCL_CHECK(ntd_candidate(input, &candidate));
+    char executable[4096], verifier[4096];
+    if (!os_proc_exe_path(executable, sizeof(executable)))
+        return ZCL_ERR(-1, "tasks: cannot find the application executable");
+    char *slash = strrchr(executable, '/');
+    if (!slash) return ZCL_ERR(-1, "tasks: cannot find the verifier directory");
+    *slash = 0;
+    const char *names[] = { "zclassic23-package-verify-dev", "zclassic23-package-verify" };
+    bool found = false;
+    for (unsigned i = 0; i < 2 && !found; ++i) {
+        int n = snprintf(verifier, sizeof(verifier), "%s/%s", executable, names[i]);
+        found = n > 0 && (size_t)n < sizeof(verifier) && access(verifier, X_OK) == 0;
+    }
+    if (!found && !candidate.package_root[0]) return task_list_window_run(editor);
+    if (!found) return ZCL_ERR(-1, "tasks: install the confined package verifier before previewing");
+    struct task_update update;
+    ZCL_CHECK(task_update_open(&update, editor->directory, editor->app, verifier, &candidate));
+    struct package_resident_record record;
+    ZCL_CHECK(package_resident_record_read(store, &record));
+    if (record.current.package_root[0]) ZCL_CHECK(task_update_refresh(&update));
+    return task_list_window_run_update(editor, &update);
+}
+
 static struct zcl_result ntd_editor(const struct json_value *input,
     struct package_resident_store *store, bool new_task, struct task_document *row)
 {
     struct task_editor editor = {0};
     ZCL_CHECK(task_editor_open(&editor, ntd_string(input, "datadir"), store->app));
     if (!new_task && !json_get(input, "task_id")) {
-        ZCL_CHECK(task_list_window_run(&editor));
+        ZCL_CHECK(ntd_task_window(input, store, &editor));
         *row = editor.saved;
         return ZCL_OK;
     }

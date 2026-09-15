@@ -52,6 +52,15 @@
 #include "platform/resident_launch.h"
 #include "services/package_lifecycle.h"
 #include "services/package_resident.h"
+#include "services/task_update.h"
+#include "services/task_list.h"
+#include "presentation/model_render.h"
+#include "../../../contexts/explorer/modules/presentation/src/presentation_focus_internal.h"
+#include "platform/os_proc.h"
+#include "platform/time_compat.h"
+#if !defined(_WIN32)
+#include <sched.h>
+#endif
 #include "sha3/sha3.h"
 #include "vcs/package_build.h"
 #include "vcs/package_manifest.h"
@@ -857,6 +866,247 @@ static bool rlc_install_ztasks_variant(const char *base, const char *zcode,
  * corruption of the installed program bytes, so the receipt-bound
  * re-hash (never a pathname, never equivalent bytes) is what refuses.
  * The fixture datadir is test-owned. */
+/* Real installed programs, real confined preview, and the same native actions
+ * as the window. No desktop or synthetic compatibility callback required. */
+static bool rlc_task_wait(struct task_update *update)
+{
+    int64_t deadline = platform_time_monotonic_us() + INT64_C(15000000);
+    while (update->pending && platform_time_monotonic_us() < deadline) {
+        bool changed = false;
+        if (!task_update_poll(update, &changed).ok) return false;
+        (void)sched_yield();
+    }
+    return !update->pending;
+}
+
+static struct package_resident_identity rlc_task_identity(const struct rlc_binding *binding)
+{
+    struct package_resident_identity identity = { .configuration_generation = 1 };
+    (void)snprintf(identity.package_root, sizeof(identity.package_root), "%s", binding->root_hex);
+    (void)snprintf(identity.receipt_id, sizeof(identity.receipt_id), "%s", binding->receipt_hex);
+    (void)snprintf(identity.artifact_sha3, sizeof(identity.artifact_sha3), "%s", binding->sha3);
+    (void)snprintf(identity.program, sizeof(identity.program), "%s", RLC_ZTASKS_PROGRAM);
+    return identity;
+}
+
+static bool rlc_task_equal(const struct task_document *a, const struct task_document *b)
+{
+    unsigned char x[TA_PAYLOAD], y[TA_PAYLOAD];
+    uint32_t nx, ny;
+    if (a->can_undo != b->can_undo || !ta_state_encode(&a->state, x, &nx) ||
+        !ta_state_encode(&b->state, y, &ny) || nx != ny || memcmp(x, y, nx)) return false;
+    return ta_state_encode(&a->undo, x, &nx) && ta_state_encode(&b->undo, y, &ny) &&
+        nx == ny && memcmp(x, y, nx) == 0;
+}
+
+static bool rlc_task_try_keep(struct task_update *update)
+{
+    return task_update_try(update, true, false).ok && rlc_task_wait(update) &&
+        task_update_keep(update).ok && rlc_task_wait(update);
+}
+
+static int rlc_task_typing(struct task_editor *editor)
+{
+    int failures = 0;
+    int64_t before = platform_time_monotonic_us();
+    struct zcl_result typed = ZCL_OK;
+    const char *text = "Typing while preview runs";
+    for (size_t i = 0; text[i] && typed.ok; ++i)
+        typed = task_editor_type(editor, (uint8_t)text[i], false);
+    struct zcl_present_model_v1 model;
+    struct zcl_result rendered = task_editor_model(editor, &model);
+    struct zcl_present_model_bitmap_v1 frame = {0};
+    char error[256];
+    bool pixels = rendered.ok && zcl_present_model_render_editor_v1(&model, &frame, error, sizeof(error));
+    int64_t elapsed = platform_time_monotonic_us() - before;
+    RLC_CHECK("task updates: typing reaches real frame while preview runs", typed.ok && pixels && elapsed < 50000);
+    printf("task updates: input_to_frame_us=%lld\n", (long long)elapsed);
+    zcl_present_model_bitmap_free_v1(&frame);
+    return failures;
+}
+
+static int rlc_task_focus(struct task_list *list)
+{
+    int failures = 0;
+    struct zcl_present_model_v1 model;
+    struct zcl_present_model_bitmap_v1 first = {0}, next = {0};
+    char error[256];
+    bool rendered = task_list_model(list, &model).ok &&
+        zcl_present_model_render_list_v1(&model, &first, error, sizeof(error)) &&
+        zcl_present_model_render_list_v1(&model, &next, error, sizeof(error));
+    RLC_CHECK("task updates: render actual permission page", rendered);
+    if (rendered) {
+        struct zcl_present_window_v1 page = { .pixels = first.pixels, .width = first.width, .height = first.height };
+        zcl_present_draw_action_focus_internal(&page, first.pixels, first.width, first.height, 4, list->focus);
+        struct zcl_present_input_v1 tab = { .key = ZCL_PRESENT_INPUT_TAB };
+        uint32_t action = UINT32_MAX;
+        bool moved = task_list_input(list, &tab, &list->focus, &action);
+        zcl_present_draw_action_focus_internal(&page, next.pixels, next.width, next.height, 4, list->focus);
+        RLC_CHECK("task updates: Tab changes visible native focus", moved && list->focus == 1 &&
+            memcmp(first.pixels, next.pixels, ZCL_PRESENT_MODEL_BITMAP_BYTES) != 0);
+    }
+    zcl_present_model_bitmap_free_v1(&first);
+    zcl_present_model_bitmap_free_v1(&next);
+    return failures;
+}
+
+static int rlc_task_panel(struct task_update *update, struct task_editor *editor)
+{
+    int failures = 0;
+    struct task_list list;
+    task_list_init(&list, editor);
+    list.update = update;
+    list.menu = true;
+    RLC_CHECK("task updates: native menu opens Updates", task_list_action(&list, 3).ok && list.updates);
+    RLC_CHECK("task updates: Try asks permission without execution", task_list_action(&list, 0).ok && list.permission == 1 && !update->pending);
+    struct zcl_present_model_v1 model;
+    RLC_CHECK("task updates: permission is visible", task_list_model(&list, &model).ok &&
+        strstr(model.title, "Allow") && strcmp(model.actions[0].label, "Allow preview") == 0);
+    failures += rlc_task_focus(&list);
+    RLC_CHECK("task updates: cancel permission keeps code inert", task_list_action(&list, 1).ok && !list.permission && !update->pending);
+    RLC_CHECK("task updates: explicit Allow starts isolated execution", task_list_action(&list, 0).ok &&
+        task_list_action(&list, 0).ok && update->pending);
+    failures += rlc_task_typing(editor);
+    RLC_CHECK("task updates: preview completes separately", rlc_task_wait(update));
+    RLC_CHECK("task updates: discard never changes live contents", task_list_action(&list, 1).ok && !update->ready);
+    return failures;
+}
+
+struct rlc_task_session {
+    const char *base, *verifier;
+    struct package_resident_store *store;
+    struct task_document *document, *expected;
+    struct task_update *update;
+    const struct rlc_binding *n, *n1, *n2, *broken;
+};
+
+static int rlc_task_edits(const struct rlc_task_session *session)
+{
+    int failures = 0;
+    session->update->candidate = rlc_task_identity(session->n1);
+    RLC_CHECK("task journey: edit before preview", task_document_apply(session->store, session->document->state.revision,
+        TASK_DOCUMENT_EDIT, session->document->state.tasks[0].id, "Edited before preview", session->document).ok);
+    RLC_CHECK("task journey: isolated preview completes", task_update_try(session->update, true, false).ok && rlc_task_wait(session->update));
+    RLC_CHECK("task journey: edit while preview exists", task_document_apply(session->store, session->document->state.revision,
+        TASK_DOCUMENT_EDIT, session->document->state.tasks[0].id, "Newer edit must survive", session->document).ok);
+    *session->expected = *session->document;
+    RLC_CHECK("task journey: stale Keep refuses clearly", task_update_keep(session->update).ok &&
+        !rlc_task_wait(session->update) && session->update->phase == TASK_UPDATE_FAILED);
+    RLC_CHECK("task journey: stale preview never imports old data", task_document_read(session->store, session->document).ok && rlc_task_equal(session->document, session->expected));
+    RLC_CHECK("task journey: fresh preview then Keep", rlc_task_try_keep(session->update));
+    return failures;
+}
+
+static int rlc_task_return(const struct rlc_task_session *session)
+{
+    int failures = 0;
+    RLC_CHECK("task journey: close", task_update_finish(session->update).ok && package_resident_store_close(session->store).ok);
+    RLC_CHECK("task journey: reopen exact data plus undo", package_resident_store_open_app(session->store, session->base, "contract/task-journey").ok &&
+        task_document_read(session->store, session->document).ok && rlc_task_equal(session->document, session->expected) &&
+        task_update_open(session->update, session->base, session->store->app, session->verifier, NULL).ok && task_update_refresh(session->update).ok && rlc_task_wait(session->update));
+    RLC_CHECK("task journey: prior program understands CURRENT data before Go back", task_update_try(session->update, true, true).ok && rlc_task_wait(session->update));
+    struct package_resident_record record;
+    RLC_CHECK("task journey: exact prior artifact restored without restoring old data", package_resident_record_read(session->store, &record).ok &&
+        strcmp(record.current.artifact_sha3, session->n->sha3) == 0 && task_document_read(session->store, session->document).ok && rlc_task_equal(session->document, session->expected));
+    return failures;
+}
+
+static int rlc_task_failed_program(const struct rlc_task_session *session)
+{
+    int failures = 0;
+    struct package_resident_record before, after;
+    session->update->candidate = rlc_task_identity(session->broken);
+    (void)snprintf(session->update->candidate.program,
+        sizeof(session->update->candidate.program), "%s", RLC_PARKER_PROGRAM);
+    bool read = package_resident_record_read(session->store, &before).ok;
+    RLC_CHECK("task journey: incompatible preview fails after confined execution",
+        task_update_try(session->update, true, false).ok &&
+        !rlc_task_wait(session->update) && session->update->phase == TASK_UPDATE_FAILED &&
+        strstr(session->update->message, "compatibility"));
+    RLC_CHECK("task journey: failed program leaves current program, tasks and undo intact",
+        read && package_resident_record_read(session->store, &after).ok &&
+        package_resident_identity_equal(&before.current, &after.current) &&
+        task_document_read(session->store, session->document).ok &&
+        rlc_task_equal(session->document, session->expected));
+    return failures;
+}
+
+static int rlc_task_failures(const struct rlc_task_session *session)
+{
+    int failures = 0;
+    struct package_resident_record record;
+    session->update->candidate = rlc_task_identity(session->n1);
+    RLC_CHECK("task journey: cancellation preserves data", task_update_try(session->update, true, false).ok);
+    task_update_cancel(session->update);
+    (void)rlc_task_wait(session->update);
+    RLC_CHECK("task journey: cancelled preview cannot Keep", !session->update->pending && !session->update->ready &&
+        !task_update_keep(session->update).ok && task_document_read(session->store, session->document).ok && rlc_task_equal(session->document, session->expected));
+    session->update->candidate.artifact_sha3[0] = session->update->candidate.artifact_sha3[0] == '0' ? '1' : '0';
+    RLC_CHECK("task journey: changed artifact fails without changing program", task_update_try(session->update, true, false).ok &&
+        !rlc_task_wait(session->update) && package_resident_record_read(session->store, &record).ok && strcmp(record.current.artifact_sha3, session->n->sha3) == 0);
+    session->update->candidate = rlc_task_identity(session->n1);
+    RLC_CHECK("task journey: N to N+1", rlc_task_try_keep(session->update));
+    session->update->candidate = rlc_task_identity(session->n2);
+    RLC_CHECK("task journey: N+1 to N+2", rlc_task_try_keep(session->update));
+    RLC_CHECK("task journey: newer version retains exact data and undo", task_document_read(session->store, session->document).ok && rlc_task_equal(session->document, session->expected));
+    return failures;
+}
+
+static int rlc_task_cycles(const struct rlc_task_session *session)
+{
+    int failures = 0;
+    int64_t maximum_us = 0;
+    bool cycles_passed = true;
+    for (unsigned cycle = 0; cycle < 20 && cycles_passed; ++cycle) {
+        cycles_passed = task_update_try(session->update, true, true).ok && rlc_task_wait(session->update) &&
+            task_document_read(session->store, session->document).ok && rlc_task_equal(session->document, session->expected);
+        if (session->update->elapsed_us > maximum_us) maximum_us = session->update->elapsed_us;
+    }
+    RLC_CHECK("task journey: 20 confined compatibility checks and exact returns", cycles_passed);
+    printf("task journey: return maximum_us=%lld real_gui=OPEN\n", (long long)maximum_us);
+    RLC_CHECK("task journey: undo survives all program changes", task_document_apply(session->store, session->document->state.revision,
+        TASK_DOCUMENT_UNDO, 0, NULL, session->document).ok && strcmp(session->document->state.tasks[0].title, "Edited before preview") == 0);
+    return failures;
+}
+
+static int rlc_task_journey(const char *base, const struct rlc_binding *n,
+                            const struct rlc_binding *n1, const struct rlc_binding *n2,
+                            const struct rlc_binding *broken)
+{
+    int failures = 0;
+    size_t fd_before = 0, fd_after = 0;
+    bool counted = os_proc_open_fd_count(&fd_before);
+    char verifier[4096];
+    if (!realpath("build/bin/zclassic23-package-verify-dev", verifier)) return 1;
+    struct package_resident_store store = {0};
+    struct task_document document = {0}, expected = {0};
+    struct package_resident_identity first = rlc_task_identity(n);
+    struct task_update update = {0};
+    bool opened = package_resident_store_open_app(&store, base, "contract/task-journey").ok &&
+        task_document_apply(&store, 0, TASK_DOCUMENT_ADD, 0, "Keep this exact task", &document).ok &&
+        task_update_open(&update, base, store.app, verifier, &first).ok;
+    RLC_CHECK("task journey: durable task and update owner open", opened);
+    if (!opened) { (void)package_resident_store_close(&store); return failures; }
+    RLC_CHECK("task journey: no execution without permission", !task_update_try(&update, false, false).ok && !update.pending);
+    RLC_CHECK("task journey: first program preview and Keep", rlc_task_try_keep(&update));
+    struct task_editor editor;
+    if (task_editor_open(&editor, base, store.app).ok) {
+        failures += rlc_task_panel(&update, &editor);
+        RLC_CHECK("task updates: close saves typed draft durably", task_editor_finish(&editor).ok &&
+            task_document_read(&store, &document).ok);
+    } else ++failures;
+    const struct rlc_task_session session = { base, verifier, &store, &document, &expected, &update, n, n1, n2, broken };
+    failures += rlc_task_edits(&session);
+    failures += rlc_task_return(&session);
+    failures += rlc_task_failed_program(&session);
+    failures += rlc_task_failures(&session);
+    failures += rlc_task_cycles(&session);
+    (void)task_update_finish(&update);
+    (void)package_resident_store_close(&store);
+    RLC_CHECK("task journey: descriptor count unchanged", counted && os_proc_open_fd_count(&fd_after) && fd_before == fd_after);
+    return failures;
+}
+
 static bool rlc_corrupt_installed(const char *base, const char *root_hex,
                                   const char *program)
 {
@@ -1838,6 +2088,9 @@ int test_resident_launch_contract(void)
         if (variants) {
             struct rlc_binding n;
             rlc_binding_fill(&n, ztasks_root, ztasks_receipt, ztasks_sha3);
+            struct rlc_binding broken;
+            rlc_binding_fill(&broken, parker_root, parker_receipt, parker_sha3);
+            failures += rlc_task_journey(base, &n, &n1, &n2, &broken);
             failures += rlc_stage_f_trap(spec, base, &n, &n1, &n2, &b);
             failures += rlc_stage_f_process_crashes(spec, base, &n, &n1, &n2);
         } else {

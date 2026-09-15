@@ -73,3 +73,40 @@ understands the data. Confined preview execution and its user-facing acceptance
 flow are still pending. The existing unguarded resident APIs remain for stateless
 consumers; data-bearing apps must use the checked path. Real Mac desktop
 acceptance is also still open.
+
+## Try, Keep, and Go back
+
+The native task list's **More / Undo → Updates** page owns the complete update
+journey. An AI or local operator selects an exact installed package root,
+receipt, and program through `app.tasks`'s `preview_root`, `preview_receipt`,
+and `preview_program` inputs. Merely opening that page does not run the
+candidate: **Try update → Allow preview** grants execution for that action.
+
+The existing package verifier runs the candidate in a separate, confined
+process with copies of the current canonical tasks and durable undo. It has
+no filesystem grant for the working app's database, no network, and no child
+creation. The task list and editor continue to run while the preview works.
+**Keep** changes the accepted program only after a transaction checks that
+both tasks and undo still match the preview's observation. A newer edit
+refuses the stale preview and asks for a fresh one. Preview output never
+replaces live data.
+
+**Go back** runs the previous exact program against copies of *current* tasks
+and undo, then checks the same observation before switching. It does not
+restore an old data snapshot. Missing artifacts, incompatible codecs, failed
+execution, and intervening edits leave the working program and data intact.
+A completed Keep survives closing and reopening; reopening renders current
+data with the previously accepted program.
+
+The preview ABI is a bounded values-to-view computation. The verifier owns
+process supervision and isolation; the resident record owns exact program
+selection; the task adapter owns canonical data compatibility; and the native
+host owns input, durable saves, and undo. Downloaded function pointers never
+enter the GUI process. These lifecycle pieces can be reused by other apps.
+ABI v1 accepts presentation changes that round-trip the existing canonical
+state exactly. Data migrations require a separate compatibility contract and
+are refused here.
+
+Headless acceptance uses real installed package variants and the same update
+owner and native actions. **Real Mac desktop interaction remains OPEN** until
+an authorized desktop session is available.

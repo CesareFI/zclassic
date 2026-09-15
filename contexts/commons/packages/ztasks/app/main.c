@@ -57,6 +57,49 @@ static bool task_render(const struct ta_state *state, char out[TA_PAYLOAD])
     return true;
 }
 
+/* Preview authority is supplied by the host: these are isolated files, never
+ * the live database. Decode and re-encode both current contents and undo. */
+static bool task_preview_state(const char *input, const char *output,
+                               struct ta_state *state)
+{
+    unsigned char bytes[TA_PAYLOAD + 1u], canonical[TA_PAYLOAD];
+    FILE *file = fopen(input, "rb");
+    if (!file) { fprintf(stderr, "ztasks: preview input unavailable\n"); return false; }
+    size_t size = fread(bytes, 1, sizeof(bytes), file);
+    bool read_ok = !ferror(file) && size <= TA_PAYLOAD;
+    if (fclose(file) != 0) read_ok = false;
+    uint32_t length = 0;
+    if (!read_ok || !ta_state_decode(bytes, (uint32_t)size, state) ||
+        !ta_state_encode(state, canonical, &length)) {
+        fprintf(stderr, "ztasks: preview data is incompatible\n"); return false;
+    }
+    file = fopen(output, "wb");
+    if (!file) { fprintf(stderr, "ztasks: preview output unavailable\n"); return false; }
+    bool written = fwrite(canonical, 1, length, file) == length;
+    if (fclose(file) != 0) written = false;
+    if (!written) fprintf(stderr, "ztasks: preview output incomplete\n");
+    return written;
+}
+
+static int task_preview(char **argv)
+{
+    if (strlen(argv[2]) != 64 || strspn(argv[2], "0123456789abcdef") != 64) {
+        fprintf(stderr, "ztasks: preview nonce invalid\n"); return 2;
+    }
+    struct ta_state state, undo;
+    char view[TA_PAYLOAD];
+    if (!task_preview_state(argv[3], argv[5], &state) ||
+        !task_preview_state(argv[4], argv[6], &undo) || !task_render(&state, view)) return 3;
+    FILE *file = fopen(argv[7], "wb");
+    if (!file) { fprintf(stderr, "ztasks: preview view unavailable\n"); return 3; }
+    size_t size = strlen(view);
+    bool written = fwrite(view, 1, size, file) == size;
+    if (fclose(file) != 0) written = false;
+    if (!written) { fprintf(stderr, "ztasks: preview view incomplete\n"); return 3; }
+    printf("READY %s\n", argv[2]);
+    return 0;
+}
+
 static bool task_apply(struct ta_state *state, const char *input, const char *nonce)
 {
     if (strncmp(input, "add ", 4) == 0 && ta_title_valid(input + 4) && state->count < TA_MAX_TASKS) {
@@ -144,6 +187,8 @@ int main(int argc, char **argv)
     }
     if (argc == 3 && strcmp(argv[1], "--resident") == 0)
         return task_resident(argv[2]);
+    if (argc == 8 && strcmp(argv[1], "--app-preview") == 0)
+        return task_preview(argv);
 #else
     (void)argc; (void)argv;
 #endif

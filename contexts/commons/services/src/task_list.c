@@ -73,6 +73,10 @@ static struct zcl_result tl_menu(struct task_list *list, uint32_t action)
     }
     if (action == 1) return tl_write(list, TASK_DOCUMENT_DELETE);
     if (action == 2) return tl_write(list, TASK_DOCUMENT_UNDO);
+    if (list->update) {
+        list->updates = true; list->repaint = true; list->focus = 0; list->first = 0;
+        return ZCL_OK;
+    }
     return tl_edit(list, false);
 }
 
@@ -80,6 +84,7 @@ struct zcl_result task_list_action(struct task_list *list, uint32_t action)
 {
     if (!list || !list->editor) return ZCL_ERR(-1, "task-list: durable editor required");
     if (action >= 4) return tl_failure(list, ZCL_ERR(-1, "Unknown task action."));
+    if (list->updates && list->update) return task_update_panel_action(list, action);
     if (list->menu) return tl_menu(list, action);
     if (action == 3) {
         list->menu = true;
@@ -103,6 +108,15 @@ struct zcl_result task_list_poll(struct task_list *list)
         if (result.ok) list->notice[0] = '\0';
     }
     if (!result.ok) return tl_failure(list, result);
+    if (list->update) {
+        bool updated = false;
+        result = task_update_poll(list->update, &updated);
+        list->repaint |= updated;
+        if (!result.ok) return tl_failure(list, result);
+        if (list->update->active_valid && !list->update->pending &&
+            list->update->active_revision != list->editor->saved.state.revision)
+            return task_update_refresh(list->update);
+    }
     return ZCL_OK;
 }
 
@@ -153,7 +167,7 @@ static bool tl_activate_key(const struct task_list *list,
     const struct zcl_present_input_v1 *input, uint32_t *action)
 {
     if (list->focus != UINT32_MAX) return false; // raw-return-ok:content-not-focused
-    if (input->key == ZCL_PRESENT_INPUT_ENTER) *action = list->menu ? 3 : 1;
+    if (input->key == ZCL_PRESENT_INPUT_ENTER) *action = list->updates ? 0 : list->menu ? 3 : 1;
     else if (input->key == ZCL_PRESENT_INPUT_TEXT && input->character == ' ')
         *action = list->menu ? 3 : 2;
     else return false; // raw-return-ok:unhandled-local-input
@@ -175,6 +189,8 @@ bool task_list_input(void *context, const struct zcl_present_input_v1 *input,
         return false;
     }
     list->focus = *focus;
+    if (list->updates && list->update)
+        return task_update_panel_input(list, input, focus, action);
     bool consumed = true;
     if (input->key == ZCL_PRESENT_INPUT_TAB) {
         uint32_t index = list->focus == UINT32_MAX ? 0 : list->focus + 1;
@@ -205,7 +221,24 @@ static void tl_model_rows(const struct task_list *list, struct zcl_present_model
         (void)snprintf(item->id, sizeof(item->id), "task-%llu", (unsigned long long)task->id);
         (void)snprintf(item->label, sizeof(item->label), "%s", task->done ? "Completed" : "Open");
         (void)snprintf(item->value, sizeof(item->value), "%s", task->title);
+        task_update_row(list, i, item);
     }
+}
+
+static void tl_model_actions(const struct task_list *list, struct zcl_present_model_v1 *model)
+{
+    model->action_count = 4;
+    const char *const normal[] = {"New task", "Edit", "Complete", "More / Undo"};
+    const char *const menu[] = {"Back", "Delete", "Undo", "Edit"};
+    for (unsigned i = 0; i < 4; ++i) {
+        model->actions[i] = (struct zcl_present_model_action_v1){ .kind = ZCL_PRESENT_ACTION_SELECT };
+        (void)snprintf(model->actions[i].id, sizeof(model->actions[i].id), "action-%u", i);
+        (void)snprintf(model->actions[i].label, sizeof(model->actions[i].label), "%s", list->menu ? menu[i] : normal[i]);
+    }
+    if (!list->menu && list->selected_id && list->editor->saved.state.tasks[list->selected].done)
+        (void)snprintf(model->actions[2].label, sizeof(model->actions[2].label), "Reopen");
+    if (list->menu && list->update)
+        (void)snprintf(model->actions[3].label, sizeof(model->actions[3].label), "Updates");
 }
 
 struct zcl_result task_list_model(const struct task_list *list, struct zcl_present_model_v1 *model)
@@ -224,15 +257,7 @@ struct zcl_result task_list_model(const struct task_list *list, struct zcl_prese
     } else if (!count && list->editor->status == TASK_EDITOR_SAVED)
         (void)snprintf(model->summary, sizeof(model->summary), "Saved. No tasks yet - choose New task.");
     tl_model_rows(list, model);
-    model->action_count = 4;
-    const char *const normal[] = {"New task", "Edit", "Complete", "More / Undo"};
-    const char *const menu[] = {"Back", "Delete", "Undo", "Edit"};
-    for (unsigned i = 0; i < 4; ++i) {
-        model->actions[i] = (struct zcl_present_model_action_v1){ .kind = ZCL_PRESENT_ACTION_SELECT };
-        (void)snprintf(model->actions[i].id, sizeof(model->actions[i].id), "action-%u", i);
-        (void)snprintf(model->actions[i].label, sizeof(model->actions[i].label), "%s", list->menu ? menu[i] : normal[i]);
-    }
-    if (!list->menu && list->selected_id && list->editor->saved.state.tasks[list->selected].done)
-        (void)snprintf(model->actions[2].label, sizeof(model->actions[2].label), "Reopen");
+    tl_model_actions(list, model);
+    if (list->updates && list->update) task_update_panel_model(list, model);
     return ZCL_OK;
 }
