@@ -15,6 +15,7 @@
 #include <string.h>
 #if !defined(_WIN32)
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define TD_CHECK(label, expression) do { \
@@ -99,6 +100,222 @@ static int td_isolation(struct package_resident_store *store, const char *direct
         memcmp(&row, &before, sizeof(row)) == 0);
     return failures;
 }
+/* Simulated codec evidence: these tests prove transaction admission, not
+ * confinement or compatibility of an arbitrary downloaded program. */
+struct td_transition {
+    struct task_document_checkpoint checkpoint;
+    struct package_resident_identity target;
+    unsigned checks;
+};
+
+static struct package_resident_identity td_program(char digit)
+{
+    struct package_resident_identity identity = { .configuration_generation = 1 };
+    memset(identity.package_root, digit, 64);
+    memset(identity.receipt_id, digit, 64);
+    memset(identity.artifact_sha3, digit, 64);
+    (void)snprintf(identity.program, sizeof(identity.program), "bin/ztasks");
+    return identity;
+}
+
+static struct zcl_result td_guard(void *context, struct package_resident_store *store,
+    const struct package_resident_identity *target)
+{
+    struct td_transition *transition = context;
+    ++transition->checks;
+    if (!package_resident_identity_equal(target, &transition->target))
+        return ZCL_ERR(-1, "task-preview: compatibility observation names another program");
+    return task_document_check_current(store, &transition->checkpoint);
+}
+
+static bool td_pending(struct package_resident_store *store,
+    const struct package_resident_identity *identity, struct package_resident_record *row)
+{
+    return package_resident_record_begin(store, row->generation, row).ok &&
+        package_resident_record_accept(store, row->revision, row->generation,
+            identity, identity->artifact_sha3, 1, row).ok;
+}
+
+static struct zcl_result td_switch(struct package_resident_store *store,
+    struct package_resident_record *row, struct td_transition *transition, bool rollback)
+{
+    const struct package_resident_guard guard = { transition, td_guard };
+    if (rollback)
+        return package_resident_record_rollback_checked(store, row->revision, row->generation,
+            transition->target.artifact_sha3, 3, &guard, row);
+    return package_resident_record_activate_checked(store, row->revision, row->generation,
+        transition->target.artifact_sha3, 2, &guard, row);
+}
+
+static int td_stale_preview(struct package_resident_store *store,
+    struct package_resident_record *program, struct td_transition *transition)
+{
+    int failures = 0;
+    struct task_document edited;
+    TD_CHECK("edit during preview remains durable", task_document_apply(store, 1,
+        TASK_DOCUMENT_EDIT, 1, "Edited while preview ran", &edited).ok);
+    struct package_resident_record before = *program;
+    TD_CHECK("stale preview preserves caller result", !td_switch(store, program, transition, false).ok &&
+        memcmp(program, &before, sizeof(before)) == 0);
+    TD_CHECK("stale preview releases transaction", sqlite3_get_autocommit(store->db));
+    struct package_resident_record observed;
+    TD_CHECK("stale preview preserves working program", package_resident_record_read(store, &observed).ok &&
+        package_resident_identity_equal(&observed.current, &before.current) && observed.generation == before.generation);
+    TD_CHECK("refresh preview uses current edits", task_document_capture(store, &transition->checkpoint).ok &&
+        strcmp(transition->checkpoint.document.state.tasks[0].title, "Edited while preview ran") == 0);
+    sqlite3_commit_hook(store->db, td_refuse_commit, NULL);
+    TD_CHECK("failed activation COMMIT preserves caller result", !td_switch(store, program, transition, false).ok &&
+        memcmp(program, &before, sizeof(before)) == 0);
+    sqlite3_commit_hook(store->db, NULL, NULL);
+    TD_CHECK("failed activation preserves working program", package_resident_record_read(store, &observed).ok &&
+        package_resident_identity_equal(&observed.current, &before.current) && observed.generation == before.generation);
+    TD_CHECK("fresh compatible preview switches program", td_switch(store, program, transition, false).ok &&
+        package_resident_identity_equal(&program->current, &transition->target));
+    TD_CHECK("activation preserves current edits", task_document_read(store, &edited).ok &&
+        edited.state.revision == 2 && strcmp(edited.state.tasks[0].title, "Edited while preview ran") == 0);
+    return failures;
+}
+
+static int td_return_current(struct package_resident_store *store,
+    struct package_resident_record *program, struct td_transition *transition)
+{
+    int failures = 0;
+    transition->target = program->previous;
+    TD_CHECK("capture return compatibility input", task_document_capture(store, &transition->checkpoint).ok);
+    struct task_document edited;
+    TD_CHECK("new-program edit remains durable", task_document_apply(store, 2,
+        TASK_DOCUMENT_ADD, 0, "Created in new program", &edited).ok);
+    TD_CHECK("reserve return without restoring old data", package_resident_record_begin(store,
+        program->generation, program).ok);
+    TD_CHECK("stale return refuses", !td_switch(store, program, transition, true).ok);
+    TD_CHECK("refresh return uses current data", task_document_capture(store, &transition->checkpoint).ok);
+    struct package_resident_identity exact = transition->target;
+    transition->target = td_program('f');
+    TD_CHECK("wrong program compatibility refuses", !td_switch(store, program, transition, true).ok);
+    transition->target = exact;
+    TD_CHECK("checked return preserves newer data and undo", td_switch(store, program, transition, true).ok &&
+        package_resident_identity_equal(&program->current, &exact) && task_document_read(store, &edited).ok &&
+        edited.state.count == 2 && edited.state.revision == 3 &&
+        strcmp(edited.state.tasks[1].title, "Created in new program") == 0 && edited.can_undo);
+    TD_CHECK("undo after return preserves durable history", task_document_apply(store, 3,
+        TASK_DOCUMENT_UNDO, 0, NULL, &edited).ok && edited.state.count == 1 && edited.state.revision == 4);
+    return failures;
+}
+
+static void td_interrupt_switch(void *context, int operation,
+    const char *database, const char *table, sqlite3_int64 row)
+{
+    (void)context; (void)operation; (void)database; (void)row;
+    if (strcmp(table, "resident_serving") == 0) _exit(71);
+}
+
+static bool td_crash_switch(const char *directory, bool rollback, bool before_commit)
+{
+    pid_t child = fork();
+    if (child < 0) { perror("task-preview: fork"); return false; }
+    if (child == 0) {
+        struct package_resident_store store = {0};
+        struct package_resident_record program;
+        struct td_transition transition = {0};
+        if (!package_resident_store_open_app(&store, directory, "local/updates").ok ||
+            !package_resident_record_read(&store, &program).ok ||
+            !task_document_capture(&store, &transition.checkpoint).ok) _exit(70);
+        transition.target = rollback ? program.previous : program.pending;
+        if (before_commit) sqlite3_update_hook(store.db, td_interrupt_switch, NULL);
+        if (!td_switch(&store, &program, &transition, rollback).ok) _exit(70);
+        _exit(72);
+    }
+    int status = 0;
+    return waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+        WEXITSTATUS(status) == (before_commit ? 71 : 72);
+}
+
+static int td_interruptions(struct package_resident_store *store, const char *directory,
+    struct package_resident_record *program)
+{
+    int failures = 0;
+    struct package_resident_identity next = td_program('c');
+    TD_CHECK("reserve interrupted upgrade", td_pending(store, &next, program));
+    struct package_resident_identity prior = program->current;
+    TD_CHECK("close before interruption experiment", package_resident_store_close(store).ok);
+    TD_CHECK("interrupt upgrade after write before COMMIT", td_crash_switch(directory, false, true));
+    TD_CHECK("restart after interrupted upgrade", package_resident_store_open_app(store, directory, "local/updates").ok &&
+        package_resident_record_read(store, program).ok && package_resident_identity_equal(&program->current, &prior));
+    TD_CHECK("close after interrupted upgrade", package_resident_store_close(store).ok);
+    TD_CHECK("exit immediately after upgrade COMMIT", td_crash_switch(directory, false, false));
+    TD_CHECK("restart sees committed upgrade", package_resident_store_open_app(store, directory, "local/updates").ok &&
+        package_resident_record_read(store, program).ok && package_resident_identity_equal(&program->current, &next));
+    TD_CHECK("reserve interrupted rollback", package_resident_record_begin(store, program->generation, program).ok);
+    TD_CHECK("close before rollback interruption", package_resident_store_close(store).ok);
+    TD_CHECK("interrupt rollback after write before COMMIT", td_crash_switch(directory, true, true));
+    TD_CHECK("restart sees retained working program", package_resident_store_open_app(store, directory, "local/updates").ok &&
+        package_resident_record_read(store, program).ok && package_resident_identity_equal(&program->current, &next));
+    TD_CHECK("close after interrupted rollback", package_resident_store_close(store).ok);
+    TD_CHECK("exit immediately after rollback COMMIT", td_crash_switch(directory, true, false));
+    struct task_document data;
+    TD_CHECK("restart sees exact prior program and latest data", package_resident_store_open_app(store, directory, "local/updates").ok &&
+        package_resident_record_read(store, program).ok && package_resident_identity_equal(&program->current, &prior) &&
+        task_document_read(store, &data).ok && data.state.revision == 4 && data.state.count == 1 &&
+        strcmp(data.state.tasks[0].title, "Edited while preview ran") == 0);
+    return failures;
+}
+
+static int td_switch_cycles(struct package_resident_store *store,
+    struct package_resident_record *program)
+{
+    int failures = 0;
+    int64_t maximum = 0;
+    struct td_transition transition = {0};
+    bool cycles_passed = true;
+    for (unsigned cycle = 0; cycles_passed && cycle < 20; ++cycle) {
+        int64_t began = platform_time_monotonic_us();
+        transition.target = program->previous;
+        cycles_passed = task_document_capture(store, &transition.checkpoint).ok &&
+            package_resident_record_begin(store, program->generation, program).ok &&
+            td_switch(store, program, &transition, true).ok &&
+            package_resident_identity_equal(&program->current, &transition.target);
+        int64_t elapsed = platform_time_monotonic_us() - began;
+        if (elapsed > maximum) maximum = elapsed;
+    }
+    TD_CHECK("twenty checked program returns preserve latest data", cycles_passed &&
+        transition.checkpoint.document.state.revision == 4 &&
+        strcmp(transition.checkpoint.document.state.tasks[0].title, "Edited while preview ran") == 0);
+    printf("task_document: checked_switch_cycles=20 max_us=%lld scope=transaction-only\n", (long long)maximum);
+    return failures;
+}
+
+static int td_update_admission(const char *directory)
+{
+    int failures = 0;
+    struct package_resident_store store = {0};
+    TD_CHECK("open managed-data fixture", package_resident_store_open_app(&store, directory, "local/updates").ok);
+    struct task_document data;
+    struct package_resident_record program = {0};
+    struct td_transition transition = { .target = td_program('a') };
+    TD_CHECK("create data before first program", task_document_apply(&store, 0,
+        TASK_DOCUMENT_ADD, 0, "Before preview", &data).ok);
+    TD_CHECK("capture initial data", task_document_capture(&store, &transition.checkpoint).ok);
+    TD_CHECK("check outside transaction refuses", !task_document_check_current(&store, &transition.checkpoint).ok);
+    TD_CHECK("reserve first program", td_pending(&store, &transition.target, &program));
+    TD_CHECK("missing compatibility guard refuses", !package_resident_record_activate_checked(&store,
+        program.revision, program.generation, transition.target.artifact_sha3, 2, NULL, &program).ok);
+    TD_CHECK("activate first checked program", td_switch(&store, &program, &transition, false).ok && transition.checks == 1);
+    transition.target = td_program('b');
+    TD_CHECK("reserve changed program", td_pending(&store, &transition.target, &program));
+    failures += td_stale_preview(&store, &program, &transition);
+    failures += td_return_current(&store, &program, &transition);
+    TD_CHECK("close managed-data fixture", package_resident_store_close(&store).ok);
+    TD_CHECK("restart managed-data fixture", package_resident_store_open_app(&store, directory, "local/updates").ok);
+    TD_CHECK("restart keeps returned program and latest data", package_resident_record_read(&store, &program).ok &&
+        package_resident_identity_equal(&program.current, &transition.target) && task_document_read(&store, &data).ok &&
+        data.state.count == 1 && data.state.revision == 4 &&
+        strcmp(data.state.tasks[0].title, "Edited while preview ran") == 0);
+    failures += td_interruptions(&store, directory, &program);
+    failures += td_switch_cycles(&store, &program);
+    TD_CHECK("close restarted managed-data fixture", package_resident_store_close(&store).ok);
+    return failures;
+}
+
 #define TE_CHECK(label, expression) do { \
     bool passed = (expression); \
     printf("task_editor: %s... %s\n", label, passed ? "OK" : "FAIL"); \
@@ -416,6 +633,7 @@ int test_task_document(void)
     failures += td_actions(&store, &row);
     failures += td_restart(&store, directory, &row);
     failures += td_failures(&store, &row);
+    failures += td_update_admission(directory);
     failures += td_editor_acceptance(directory);
     failures += td_isolation(&store, directory);
     TD_CHECK("final close", package_resident_store_close(&store).ok);

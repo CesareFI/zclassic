@@ -50,3 +50,26 @@ Real macOS desktop interaction remains OPEN pending desktop access. App update
 preview, acceptance and rollback compatibility are not yet qualified by this
 task editor. Package reproduction alone does not establish GUI interaction or
 grant permission to install or execute an application.
+
+### Program changes and user data
+
+The host stores task data independently of the current and previous program
+identities. Returning to a previous program must preserve the current document,
+including its durable undo history. It must never restore the data that existed
+when that program was last used.
+
+For host integration, `task_document_capture` observes the app name, canonical
+current state and undo state. After a confined candidate has demonstrated that
+it understands those exact bytes, use the checked resident activation or
+rollback API with a trusted host guard. The guard binds the candidate's complete
+identity and calls `task_document_check_current` inside the resident switch's
+write transaction. An intervening edit refuses the switch and asks for a fresh
+preview. The transaction contains no candidate execution or worker wait, so
+slow preview work happens before it and does not hold the data lock.
+
+These APIs supply atomic admission, not compatibility or execution permission.
+A schema number, a checkpoint, or a matching digest does not prove a candidate
+understands the data. Confined preview execution and its user-facing acceptance
+flow are still pending. The existing unguarded resident APIs remain for stateless
+consumers; data-bearing apps must use the checked path. Real Mac desktop
+acceptance is also still open.

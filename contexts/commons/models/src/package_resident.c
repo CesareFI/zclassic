@@ -568,17 +568,36 @@ static struct zcl_result pr_named_switch(struct package_resident_store *store,
     return pr_finish(store, result);
 }
 
+static struct zcl_result pr_switch_checked(struct package_resident_store *store,
+    int64_t ticket, int64_t generation, const char *nonce, uint64_t start_token,
+    bool rollback, const struct package_resident_guard *guard,
+    struct package_resident_record *out)
+{
+    if (!out || !pr_proof_valid(nonce, start_token))
+        return ZCL_ERR(-1, "resident-switch: output and fresh completed proof required");
+    struct package_resident_record row;
+    ZCL_CHECK(pr_named_begin(store, ticket, generation, &row));
+    if (rollback && !pr_identity_valid(&row.previous))
+        return pr_finish(store, ZCL_ERR(-1, "resident-rollback: no exact previous acceptance"));
+    if (!rollback && (row.pending_ticket != ticket || row.pending_generation != generation))
+        return pr_finish(store, ZCL_ERR(-1, "resident-pending-superseded: no matching accepted candidate"));
+    const struct package_resident_identity *target = rollback ? &row.previous : &row.pending;
+    if (guard) {
+        struct zcl_result checked = guard->check(guard->context, store, target);
+        if (!checked.ok) return pr_finish(store, checked);
+    }
+    struct zcl_result result = pr_named_switch(store, target, nonce, start_token, &row);
+    if (result.ok) *out = row;
+    return result;
+}
+
 struct zcl_result package_resident_record_activate(
     struct package_resident_store *store, int64_t ticket,
     int64_t expected_generation, const char *nonce, uint64_t start_token,
     struct package_resident_record *out)
 {
-    if (!pr_proof_valid(nonce, start_token))
-        return ZCL_ERR(-1, "resident-activate: fresh completed proof required");
-    ZCL_CHECK(pr_named_begin(store, ticket, expected_generation, out));
-    if (out->pending_ticket != ticket || out->pending_generation != expected_generation)
-        return pr_finish(store, ZCL_ERR(-1, "resident-pending-superseded: no matching accepted candidate"));
-    return pr_named_switch(store, &out->pending, nonce, start_token, out);
+    return pr_switch_checked(store, ticket, expected_generation, nonce,
+        start_token, false, NULL, out);
 }
 
 struct zcl_result package_resident_record_rollback(
@@ -586,10 +605,28 @@ struct zcl_result package_resident_record_rollback(
     int64_t expected_generation, const char *nonce, uint64_t start_token,
     struct package_resident_record *out)
 {
-    if (!pr_proof_valid(nonce, start_token))
-        return ZCL_ERR(-1, "resident-rollback: fresh completed proof required");
-    ZCL_CHECK(pr_named_begin(store, ticket, expected_generation, out));
-    if (!pr_identity_valid(&out->previous))
-        return pr_finish(store, ZCL_ERR(-1, "resident-rollback: no exact previous acceptance"));
-    return pr_named_switch(store, &out->previous, nonce, start_token, out);
+    return pr_switch_checked(store, ticket, expected_generation, nonce,
+        start_token, true, NULL, out);
+}
+
+struct zcl_result package_resident_record_activate_checked(
+    struct package_resident_store *store, int64_t ticket,
+    int64_t expected_generation, const char *nonce, uint64_t start_token,
+    const struct package_resident_guard *guard, struct package_resident_record *out)
+{
+    if (!guard || !guard->check)
+        return ZCL_ERR(-1, "resident-activate: current-data compatibility guard required");
+    return pr_switch_checked(store, ticket, expected_generation, nonce,
+        start_token, false, guard, out);
+}
+
+struct zcl_result package_resident_record_rollback_checked(
+    struct package_resident_store *store, int64_t ticket,
+    int64_t expected_generation, const char *nonce, uint64_t start_token,
+    const struct package_resident_guard *guard, struct package_resident_record *out)
+{
+    if (!guard || !guard->check)
+        return ZCL_ERR(-1, "resident-rollback: current-data compatibility guard required");
+    return pr_switch_checked(store, ticket, expected_generation, nonce,
+        start_token, true, guard, out);
 }

@@ -41,6 +41,16 @@ struct package_resident_record {
  * Process descriptors and PIDs are deliberately not restart authority. */
 struct package_resident_store { sqlite3 *db; char app[256]; };
 
+/* Trusted host precondition, never a callback supplied by downloaded code.
+ * Runs under the same write transaction as the program switch. It must only
+ * read through this store: no worker wait, nested transaction or external I/O.
+ * A refusal rolls back the switch; it never restores a user-data snapshot. */
+struct package_resident_guard {
+    void *context;
+    struct zcl_result (*check)(void *context, struct package_resident_store *store,
+        const struct package_resident_identity *target);
+};
+
 struct zcl_result package_resident_store_open(
     struct package_resident_store *store, const char *datadir);
 struct zcl_result package_resident_store_close(struct package_resident_store *store);
@@ -70,4 +80,12 @@ struct zcl_result package_resident_record_rollback(
     struct package_resident_store *store, int64_t ticket,
     int64_t expected_generation, const char *nonce, uint64_t start_token,
     struct package_resident_record *out);
+struct zcl_result package_resident_record_activate_checked(
+    struct package_resident_store *store, int64_t ticket,
+    int64_t expected_generation, const char *nonce, uint64_t start_token,
+    const struct package_resident_guard *guard, struct package_resident_record *out);
+struct zcl_result package_resident_record_rollback_checked(
+    struct package_resident_store *store, int64_t ticket,
+    int64_t expected_generation, const char *nonce, uint64_t start_token,
+    const struct package_resident_guard *guard, struct package_resident_record *out);
 #endif

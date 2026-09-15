@@ -6,6 +6,7 @@
 #include "util/ar_step_readonly.h"
 #include "util/log_macros.h"
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
 DEFINE_MODEL_CALLBACKS(task_document)
@@ -168,4 +169,42 @@ struct zcl_result task_document_apply(struct package_resident_store *store,
     }
     if (result.ok) *out = row;
     return result;
+}
+
+struct zcl_result task_document_capture(struct package_resident_store *store,
+    struct task_document_checkpoint *out)
+{
+    if (!out) return ZCL_ERR(-1, "task-preview: checkpoint output required");
+    struct task_document_checkpoint checkpoint = {0};
+    ZCL_CHECK(task_document_read(store, &checkpoint.document));
+    (void)snprintf(checkpoint.app, sizeof(checkpoint.app), "%s", store->app);
+    *out = checkpoint;
+    return ZCL_OK;
+}
+
+static bool td_state_equal(const struct ta_state *a, const struct ta_state *b)
+{
+    unsigned char first[TA_PAYLOAD], second[TA_PAYLOAD];
+    uint32_t first_length, second_length;
+    return ta_state_encode(a, first, &first_length) &&
+        ta_state_encode(b, second, &second_length) && first_length == second_length &&
+        memcmp(first, second, first_length) == 0;
+}
+
+struct zcl_result task_document_check_current(struct package_resident_store *store,
+    const struct task_document_checkpoint *checkpoint)
+{
+    if (!store || !store->db || !checkpoint || sqlite3_get_autocommit(store->db))
+        return ZCL_ERR(-1, "task-preview: current-data check requires the program-switch transaction");
+    if (!memchr(checkpoint->app, 0, sizeof(checkpoint->app)) ||
+        strcmp(store->app, checkpoint->app) != 0)
+        return ZCL_ERR(-1, "task-preview: checkpoint belongs to another app");
+    struct task_document current;
+    ZCL_CHECK(task_document_read(store, &current));
+    const struct task_document *expected = &checkpoint->document;
+    if (!td_state_equal(&current.state, &expected->state) ||
+        current.can_undo != expected->can_undo ||
+        (current.can_undo && !td_state_equal(&current.undo, &expected->undo)))
+        return ZCL_ERR(-1, "task-preview-stale: your tasks changed; preview the current data before switching programs");
+    return ZCL_OK;
 }
