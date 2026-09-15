@@ -168,7 +168,8 @@ ZCL_COMMAND_BRANCH("app.invoke", "app", "Invoke a manifest-owned App route",
 ZCL_COMMAND_READY_COMMAND(
     "app.tasks", "app", "", "Save and reopen your local tasks",
     "Lists, adds, edits, completes, reopens, deletes or undoes task contents in "
-    "an isolated private app database. Headless changes require expected_revision "
+    "an isolated private app database. Omit datadir to use private per-user app storage; "
+    "an explicit datadir opens your existing task data. Headless changes require expected_revision "
     "from the last read; stale writes refuse. Actions open and new show a native "
     "task editor with background saving; open shows the task list or selects task_id. "
     "Closing saves the latest valid draft and a failed save keeps it open. "
@@ -180,7 +181,7 @@ ZCL_COMMAND_READY_COMMAND(
     "current tasks and undo. Previously kept programs may render current task copies.", 0,
     "tasks,edit,save,undo", "zcl.task_document.input.v1", "zcl.task_document.v1",
     "datadir,app,action,expected_revision,task_id,title,preview_root,preview_receipt,preview_program", "action,datadir",
-    "z23 app tasks open /absolute/private/tasks",
+    "z23 app tasks open",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
     ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,

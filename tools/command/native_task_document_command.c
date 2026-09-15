@@ -5,6 +5,8 @@
 #include "services/task_editor.h"
 #include "services/task_list.h"
 #include "platform/private_directory.h"
+#include "platform/state_root.h"
+#include "platform/path_compat.h"
 #include "platform/os_proc.h"
 #include "platform/time_compat.h"
 #include "util/log_macros.h"
@@ -27,7 +29,7 @@ static bool ntd_integer(const struct json_value *input, const char *key, uint64_
 }
 
 static struct zcl_result ntd_open(const struct json_value *input,
-    struct package_resident_store *store)
+    struct package_resident_store *store, char directory[4096])
 {
     static const char *const keys[] = { "datadir", "app", "action", "title",
         "preview_root", "preview_receipt", "preview_program" };
@@ -36,11 +38,16 @@ static struct zcl_result ntd_open(const struct json_value *input,
         if (value && value->type != JSON_STR)
             return ZCL_ERR(-1, "tasks: %s must be text", keys[i]);
     }
-    const char *directory = ntd_string(input, "datadir");
+    const char *selected = ntd_string(input, "datadir");
     const char *app = ntd_string(input, "app");
     if (!app) app = "local/tasks";
-    if (!directory || directory[0] != '/')
-        return ZCL_ERR(-1, "tasks: choose an absolute private data directory");
+    if (selected) {
+        if (!platform_path_is_absolute(selected) || strlen(selected) >= 4096)
+            return ZCL_ERR(-1, "tasks: choose an absolute private data directory");
+        (void)snprintf(directory, 4096, "%s", selected);
+    } else if (!platform_application_state_root(directory, 4096)) {
+        return ZCL_ERR(-1, "tasks: default private storage could not be opened; choose an absolute datadir");
+    }
     char package_directory[4096];
     int n = snprintf(package_directory, sizeof(package_directory), "%s/zcode", directory);
     if (n < 0 || (size_t)n >= sizeof(package_directory))
@@ -96,10 +103,10 @@ static struct zcl_result ntd_task_window(const struct json_value *input,
 }
 
 static struct zcl_result ntd_editor(const struct json_value *input,
-    struct package_resident_store *store, bool new_task, struct task_document *row)
+    struct package_resident_store *store, const char *directory, bool new_task, struct task_document *row)
 {
     struct task_editor editor = {0};
-    ZCL_CHECK(task_editor_open(&editor, ntd_string(input, "datadir"), store->app));
+    ZCL_CHECK(task_editor_open(&editor, directory, store->app));
     if (!new_task && !json_get(input, "task_id")) {
         ZCL_CHECK(ntd_task_window(input, store, &editor));
         *row = editor.saved;
@@ -119,12 +126,12 @@ static struct zcl_result ntd_editor(const struct json_value *input,
 }
 
 static struct zcl_result ntd_change(const struct json_value *input,
-    struct package_resident_store *store, struct task_document *row)
+    struct package_resident_store *store, const char *directory, struct task_document *row)
 {
     const char *action = ntd_string(input, "action");
     if (!action || strcmp(action, "list") == 0) return task_document_read(store, row);
     if (strcmp(action, "open") == 0 || strcmp(action, "new") == 0)
-        return ntd_editor(input, store, strcmp(action, "new") == 0, row);
+        return ntd_editor(input, store, directory, strcmp(action, "new") == 0, row);
     static const char *const actions[] = { "add", "edit", "complete", "reopen", "delete", "undo" };
     size_t selected = 0;
     while (selected < sizeof(actions)/sizeof(actions[0]) && strcmp(action, actions[selected]) != 0)
@@ -142,10 +149,11 @@ static struct zcl_result ntd_change(const struct json_value *input,
 }
 
 static bool ntd_render(struct json_value *data, const struct task_document *row,
-                        int64_t elapsed)
+                        int64_t elapsed, const char *directory)
 {
     json_set_object(data);
-    if (!json_push_kv_str(data, "save_state", "Saved") ||
+    if (!json_push_kv_str(data, "data_directory", directory) ||
+        !json_push_kv_str(data, "save_state", "Saved") ||
         !json_push_kv_int(data, "revision", (int64_t)row->state.revision) ||
         !json_push_kv_bool(data, "can_undo", row->can_undo) ||
         !json_push_kv_int(data, "storage_us", elapsed)) return false;
@@ -172,11 +180,12 @@ void zcl_native_handle_task_document(const struct zcl_command_request *request,
     int64_t began = platform_time_monotonic_us();
     struct package_resident_store store = {0};
     struct task_document row;
-    struct zcl_result result = ntd_open(request->input, &store);
-    if (result.ok) result = ntd_change(request->input, &store, &row);
+    char directory[4096];
+    struct zcl_result result = ntd_open(request->input, &store, directory);
+    if (result.ok) result = ntd_change(request->input, &store, directory, &row);
     struct zcl_result closed = package_resident_store_close(&store);
     if (result.ok && !closed.ok) result = closed;
-    if (result.ok && !ntd_render(&reply->data, &row, platform_time_monotonic_us() - began))
+    if (result.ok && !ntd_render(&reply->data, &row, platform_time_monotonic_us() - began, directory))
         result = ZCL_ERR(-1, "tasks: contents committed but confirmation allocation failed; reopen to inspect");
     if (!result.ok) {
         LOG_ERROR("app.tasks", "%s", result.message);

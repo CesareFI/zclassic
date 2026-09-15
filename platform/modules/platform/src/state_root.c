@@ -1,7 +1,8 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
- * Purpose: Resolve and create the owner-private development state root. */
+ * Purpose: Resolve and create owner-private development and application roots. */
 #include "platform/state_root.h"
 #include "platform/private_directory.h"
+#include "platform/path_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,7 +100,7 @@ static bool state_root_base_from_known_folder(char base[32768])
     return n > 1;
 }
 
-static bool state_root_resolve(char *out, size_t cap, bool create)
+static bool state_root_resolve(char *out, size_t cap, bool create, bool application)
 {
     char base[32768], z23[32768];
     wchar_t env_base[32768];
@@ -114,11 +115,12 @@ static bool state_root_resolve(char *out, size_t cap, bool create)
     } else if (!state_root_base_from_known_folder(base)) {
         return false;
     }
+    if (application && !platform_path_is_absolute(base)) return false;
     if (!state_root_join(z23, sizeof(z23), base, "z23") ||
         !(create ? state_root_ensure_private(z23)
                   : state_root_directory_existing(z23)))
         return false;
-    return state_root_join(out, cap, z23, "dev") &&
+    return state_root_join(out, cap, z23, application ? "apps" : "dev") &&
            (create ? state_root_ensure_private(out)
                    : state_root_directory_existing(out));
 }
@@ -152,18 +154,26 @@ static bool ensure_parent(const char *path, bool create)
     }
     return true;
 }
-static bool state_root_resolve(char *out, size_t cap, bool create)
+static bool state_root_posix_base(char base[4096])
 {
-    const char *xdg=getenv("XDG_STATE_HOME"), *home=getenv("HOME");
-    char base[4096], z23[4096]; int n;
-    if (xdg&&xdg[0]) n=snprintf(base,sizeof(base),"%s",xdg);
-    else if (home&&home[0]) { n=snprintf(base,sizeof(base),"%s/.local/state",home); }
+    const char *xdg = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
+    int n;
+    if (xdg && xdg[0]) n = snprintf(base, 4096, "%s", xdg);
+    else if (home && home[0]) n = snprintf(base, 4096, "%s/.local/state", home);
     else return false;
-    if(n<=0||(size_t)n>=sizeof(base)||!ensure_parent(base, create)||
+    return n > 0 && n < 4096;
+}
+
+static bool state_root_resolve(char *out, size_t cap, bool create, bool application)
+{
+    char base[4096], z23[4096];
+    if (!state_root_posix_base(base)) return false;
+    if (application && !platform_path_is_absolute(base)) return false;
+    if(!ensure_parent(base, create)||
        !state_root_join(z23,sizeof(z23),base,"z23")||
        !(create ? platform_private_directory_ensure(z23)
                 : state_root_directory_existing(z23))) return false;
-    return state_root_join(out,cap,z23,"dev")&&
+    return state_root_join(out,cap,z23,application ? "apps" : "dev")&&
            (create ? platform_private_directory_ensure(out)
                    : state_root_directory_existing(out));
 }
@@ -172,10 +182,15 @@ static bool state_root_resolve(char *out, size_t cap, bool create)
 
 bool platform_state_root(char *out, size_t cap)
 {
-    return state_root_resolve(out, cap, true);
+    return state_root_resolve(out, cap, true, false);
 }
 
 bool platform_state_root_existing(char *out, size_t cap)
 {
-    return state_root_resolve(out, cap, false);
+    return state_root_resolve(out, cap, false, false);
+}
+
+bool platform_application_state_root(char *out, size_t cap)
+{
+    return state_root_resolve(out, cap, true, true);
 }

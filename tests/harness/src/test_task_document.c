@@ -1,7 +1,13 @@
 /* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
  * purpose: prove task contents survive restart, undo and failed commits. */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
 #include "test/test_core.h"
 #include "models/task_document.h"
+#include "config/command_catalog.h"
+#include "platform/state_root.h"
+#include "platform/path_compat.h"
 #include "services/task_editor.h"
 #include "services/task_list.h"
 #include "platform/time_compat.h"
@@ -23,6 +29,81 @@
     printf("task_document: %s... %s\n", label, ok ? "OK" : "FAIL"); \
     if (!ok) ++failures; \
 } while (0)
+
+static bool td_default_call(const char *body, bool success, int64_t revision, const char *title)
+{
+    struct json_value input = {0};
+    const struct zcl_command_spec *spec = zcl_command_registry_find(zcl_command_catalog(), "app.tasks", NULL);
+    struct zcl_command_request request = { .spec = spec, .input = &input };
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.task_document.v1");
+    char error[256];
+    bool ok = spec && json_read(&input, body, strlen(body)) &&
+        zcl_command_registry_input_validate(spec, &input, error, sizeof(error));
+    if (ok) spec->handler(&request, &reply);
+    ok = ok && ((reply.exit_code == 0) == success);
+    if (ok && success) {
+        const struct json_value *tasks = json_get(&reply.data, "tasks");
+        const char *saved = json_get_str(json_get(&reply.data, "save_state"));
+        const char *actual = json_get_str(json_get(json_at(tasks, 0), "title"));
+        ok = saved && strcmp(saved, "Saved") == 0 &&
+            json_get_int(json_get(&reply.data, "revision")) == revision &&
+            (title ? actual && strcmp(title, actual) == 0 : json_size(tasks) == 0);
+    }
+    zcl_command_reply_free(&reply);
+    json_free(&input);
+    return ok;
+}
+
+static int td_default_storage(const char *directory)
+{
+    int failures = 0;
+    const char *prior = getenv("XDG_STATE_HOME");
+    char *saved = prior ? strdup(prior) : NULL;
+    if (prior && !saved) { perror("task_document: preserve state root"); return 1; }
+    char base[4096], path[4096], root[4096];
+    if (!platform_path_identity(root, sizeof(root), directory)) {
+        free(saved); fprintf(stderr, "task_document: fixture identity unavailable\n"); return 1;
+    }
+    (void)snprintf(base, sizeof(base), "%s/default-storage", root);
+    if (setenv("XDG_STATE_HOME", base, 1) != 0) { free(saved); perror("task_document: isolate state root"); return 1; }
+    TD_CHECK("first launch needs no storage setup", td_default_call("{}", true, 0, NULL));
+    TD_CHECK("first task saves without a datadir", td_default_call(
+        "{\"action\":\"add\",\"expected_revision\":0,\"title\":\"First task\"}", true, 1, "First task"));
+    TD_CHECK("edit saved in default storage", td_default_call(
+        "{\"action\":\"edit\",\"expected_revision\":1,\"task_id\":1,\"title\":\"Exact edited contents!\"}", true, 2, "Exact edited contents!"));
+    TD_CHECK("reopen uses the same durable contents", td_default_call("{}", true, 2, "Exact edited contents!"));
+    TD_CHECK("default storage still refuses stale writes", td_default_call(
+        "{\"action\":\"edit\",\"expected_revision\":1,\"task_id\":1,\"title\":\"Old edit\"}", false, 0, NULL));
+    TD_CHECK("explicit relative directory never falls back", td_default_call(
+        "{\"datadir\":\"relative\"}", false, 0, NULL));
+    TD_CHECK("delete in default storage", td_default_call(
+        "{\"action\":\"delete\",\"expected_revision\":2,\"task_id\":1}", true, 3, NULL));
+    TD_CHECK("undo survives reopening default storage", td_default_call(
+        "{\"action\":\"undo\",\"expected_revision\":3}", true, 4, "Exact edited contents!"));
+    TD_CHECK("undo result survives another reopen", td_default_call("{}", true, 4, "Exact edited contents!"));
+    struct stat info;
+    bool resolved = platform_application_state_root(root, sizeof(root));
+    TD_CHECK("default directory is owner private", resolved && stat(root, &info) == 0 && (info.st_mode & 077) == 0);
+    (void)snprintf(path, sizeof(path), "%s/z23/dev", base);
+    TD_CHECK("first task does not create developer state", access(path, F_OK) != 0);
+    (void)snprintf(path, sizeof(path), "%s/z23/apps/zcode/resident.db", base);
+    TD_CHECK("default fixture database removed", unlink(path) == 0);
+    (void)snprintf(path, sizeof(path), "%s/z23/apps/zcode", base);
+    TD_CHECK("default fixture package directory removed", rmdir(path) == 0);
+    (void)snprintf(path, sizeof(path), "%s/z23/apps", base);
+    TD_CHECK("default fixture app directory removed", rmdir(path) == 0);
+    TD_CHECK("symlinked default root refuses", symlink(directory, path) == 0 && !platform_application_state_root(root, sizeof(root)));
+    TD_CHECK("fixture link removed", unlink(path) == 0);
+    (void)snprintf(path, sizeof(path), "%s/z23", base);
+    TD_CHECK("default fixture parents removed", rmdir(path) == 0 && rmdir(base) == 0);
+    TD_CHECK("relative default base refuses", setenv("XDG_STATE_HOME", "relative-state", 1) == 0 &&
+        !platform_application_state_root(root, sizeof(root)));
+    int restored = saved ? setenv("XDG_STATE_HOME", saved, 1) : unsetenv("XDG_STATE_HOME");
+    TD_CHECK("caller state root restored", restored == 0);
+    free(saved);
+    return failures;
+}
 
 static int td_refuse_commit(void *context) { (void)context; return 1; }
 
@@ -630,6 +711,7 @@ int test_task_document(void)
     struct task_document row = {0};
     struct zcl_result opened = package_resident_store_open_app(&store, directory, "local/tasks");
     if (!opened.ok) { fprintf(stderr, "task_document: open: %s\n", opened.message); return 1; }
+    failures += td_default_storage(directory);
     failures += td_actions(&store, &row);
     failures += td_restart(&store, directory, &row);
     failures += td_failures(&store, &row);
