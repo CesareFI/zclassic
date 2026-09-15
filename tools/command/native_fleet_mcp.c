@@ -598,28 +598,34 @@ static bool fmc_push_distinct(struct json_value *arr, const char *s,
     return true;
 }
 
-/* Receiver ack cursor from the mail leaf's cursor.<agent> file. Sanitized
- * to the mail leaf's own alphabet so a `to` name can never escape the mail
- * dir. Returns -1 when the receiver never acked (nothing acknowledged). */
+/* Keep only the mail leaf's cursor alphabet so a `to` name can never
+ * escape the mail dir. False when nothing survives. */
+static bool fmc_clean_agent(const char *agent, char *out, size_t cap)
+{
+    size_t i, o = 0;
+    if (!agent || !out || cap == 0)
+        return false;
+    for (i = 0; agent[i] && o + 1 < cap; i++) {
+        char c = agent[i];
+        if (isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-')
+            out[o++] = c;
+    }
+    out[o] = '\0';
+    return o > 0;
+}
+
+/* Receiver ack cursor from the mail leaf's cursor.<agent> file. Returns -1
+ * when the receiver never acked (nothing acknowledged). */
 static long long fmc_ack_cursor(const char *agent)
 {
     char root[4096], path[4096 + 64];
     char clean[FMC_NAME_MAX + 1];
-    size_t i, o = 0;
     FILE *f;
     char buf[32];
     char *end = NULL;
     long long v;
     int n;
-    if (!agent || !agent[0])
-        return -1;
-    for (i = 0; agent[i] && o < sizeof(clean) - 1; i++) {
-        char c = agent[i];
-        if (isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-')
-            clean[o++] = c;
-    }
-    clean[o] = '\0';
-    if (clean[0] == '\0')
+    if (!fmc_clean_agent(agent, clean, sizeof(clean)))
         return -1;
     if (!platform_state_root(root, sizeof(root)))
         return -1;
@@ -669,6 +675,83 @@ struct fmc_mail_view {
     long long count;
 };
 
+/* One parsed mail row. String pointers borrow the sibling reply and are
+ * valid until the sub call ends. */
+struct fmc_row {
+    long long seq;
+    const char *from;
+    const char *to;
+    const char *kind;
+    const char *body;
+    const char *ref;
+};
+
+static const char *fmc_row_field(const struct json_value *r, const char *key)
+{
+    const struct json_value *v = json_get(r, key);
+    if (!v || v->type != JSON_STR)
+        return "";
+    return json_get_str(v) ? json_get_str(v) : "";
+}
+
+static bool fmc_row_parse(const struct json_value *r, struct fmc_row *v)
+{
+    const struct json_value *s;
+    if (!r || r->type != JSON_OBJ || !v)
+        return false;
+    s = json_get(r, "seq");
+    if (!s || s->type != JSON_INT)
+        return false;
+    v->seq = (long long)json_get_int(s);
+    v->from = fmc_row_field(r, "from");
+    v->to = fmc_row_field(r, "to");
+    v->kind = fmc_row_field(r, "kind");
+    v->body = fmc_row_field(r, "body");
+    v->ref = fmc_row_field(r, "ref");
+    return true;
+}
+
+/* Roster plus directives-as-work. */
+static void fmc_row_tally(struct json_value *agents, struct json_value *work,
+                          const struct fmc_row *v)
+{
+    if (v->from[0])
+        (void)fmc_push_distinct(agents, v->from, FMC_LIST_CAP);
+    if (v->to[0] && strcmp(v->to, "*") != 0)
+        (void)fmc_push_distinct(agents, v->to, FMC_LIST_CAP);
+    if (strcmp(v->kind, "directive") == 0 && v->body[0]) {
+        char w[128];
+        int wlen = snprintf(w, sizeof(w), "directive %s->%s %.64s", v->from,
+                            v->to, v->ref);
+        if (wlen > 0 && (size_t)wlen < sizeof(w))
+            (void)fmc_push_distinct(work, w, FMC_LIST_CAP);
+    }
+}
+
+/* One bounded change row. delivered is established (the row is in pull);
+ * acknowledged iff the receiver's cursor covers it; completed is resolved
+ * later against queue outcomes and board results. */
+static void fmc_row_change(struct json_value *changes, const struct fmc_row *v)
+{
+    struct json_value item;
+    char lead[FMC_LEAD_MAX + 1];
+    long long ack = fmc_ack_cursor(v->to);
+    const char *state = (ack >= 0 && v->seq <= ack) ? "acknowledged"
+                                                    : "delivered";
+    json_init(&item);
+    json_set_object(&item);
+    fmc_lead(v->body, lead, sizeof(lead));
+    if (json_push_kv_int(&item, "seq", v->seq) &&
+        json_push_kv_str(&item, "from", v->from) &&
+        json_push_kv_str(&item, "to", v->to) &&
+        json_push_kv_str(&item, "kind", v->kind) &&
+        json_push_kv_str(&item, "ref", v->ref) &&
+        json_push_kv_str(&item, "lead", lead) &&
+        json_push_kv_str(&item, "state", state))
+        (void)json_push_back(changes, &item);
+    json_free(&item);
+}
+
 static long long fmc_brief_mail(const struct zcl_command_request *req,
                                 struct json_value *agents,
                                 struct json_value *work,
@@ -716,62 +799,13 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
     /* Newest-first walk from the tail: changes[] carries the latest rows
      * above `since`, each with its lifecycle state. */
     for (i = n; i > 0; i--) {
-        const struct json_value *r = json_at(rows, i - 1);
-        const struct json_value *v;
-        const char *from, *to, *kind, *body, *ref;
-        long long seq;
-        struct json_value item;
-        char lead[FMC_LEAD_MAX + 1];
-        long long ack;
-        const char *state;
-        if (!r || r->type != JSON_OBJ)
+        struct fmc_row v;
+        if (!fmc_row_parse(json_at(rows, i - 1), &v))
             continue;
-        v = json_get(r, "seq");
-        if (!v || v->type != JSON_INT)
+        fmc_row_tally(agents, work, &v);
+        if (v.seq <= since || shown >= changes_cap)
             continue;
-        seq = (long long)json_get_int(v);
-        v = json_get(r, "from");
-        from = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-        v = json_get(r, "to");
-        to = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-        v = json_get(r, "kind");
-        kind = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-        v = json_get(r, "body");
-        body = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-        v = json_get(r, "ref");
-        ref = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-        if (from && from[0])
-            (void)fmc_push_distinct(agents, from, FMC_LIST_CAP);
-        if (to && to[0] && strcmp(to, "*") != 0)
-            (void)fmc_push_distinct(agents, to, FMC_LIST_CAP);
-        if (kind && strcmp(kind, "directive") == 0 && body && body[0]) {
-            char w[128];
-            int wlen = snprintf(w, sizeof(w), "directive %s->%s %.64s", from,
-                                to, ref ? ref : "");
-            if (wlen > 0 && (size_t)wlen < sizeof(w))
-                (void)fmc_push_distinct(work, w, FMC_LIST_CAP);
-        }
-        if (seq <= since)
-            continue;
-        if (shown >= changes_cap)
-            continue;
-        /* delivered is established (the row is in pull); acknowledged iff
-         * the receiver's cursor covers it; completed is resolved later
-         * against queue outcomes and board results. */
-        ack = fmc_ack_cursor(to);
-        state = (ack >= 0 && seq <= ack) ? "acknowledged" : "delivered";
-        json_init(&item);
-        json_set_object(&item);
-        fmc_lead(body, lead, sizeof(lead));
-        if (json_push_kv_int(&item, "seq", seq) &&
-            json_push_kv_str(&item, "from", from ? from : "") &&
-            json_push_kv_str(&item, "to", to ? to : "") &&
-            json_push_kv_str(&item, "kind", kind ? kind : "") &&
-            json_push_kv_str(&item, "ref", ref ? ref : "") &&
-            json_push_kv_str(&item, "lead", lead) &&
-            json_push_kv_str(&item, "state", state))
-            (void)json_push_back(changes, &item);
-        json_free(&item);
+        fmc_row_change(changes, &v);
         shown++;
     }
     fmc_sub_end(&sub);
@@ -795,18 +829,88 @@ static void fmc_queue_row_name(const struct json_value *r,
         (void)fmc_push_distinct(list, name, FMC_LIST_CAP);
 }
 
-/* ── brief: queue section ────────────────────────────────────────────────
- *
- * Running/queued names become work + candidates; non-pass outcomes become
- * blockers; pool numbers become capacity. Completed-by-ref matching reads
- * the outcomes array for name==ref with a pass-like verdict. */
-
 struct fmc_queue_view {
     long long queued;
     long long running;
     long long pool_total;
     long long pool_free;
 };
+
+/* One non-pass outcome row as a bounded blocker string. Pass-like rows
+ * are not blockers and stay silent here. */
+static void fmc_queue_outcome_row(const struct json_value *r,
+                                  struct json_value *blockers)
+{
+    const struct json_value *v;
+    const char *verdict, *name;
+    long long rc;
+    char b[160];
+    int wlen;
+    struct json_value item;
+    if (!r || r->type != JSON_OBJ || !blockers)
+        return;
+    v = json_get(r, "verdict");
+    verdict = (v && v->type == JSON_STR) ? json_get_str(v) : "";
+    v = json_get(r, "rc");
+    rc = (v && v->type == JSON_INT) ? (long long)json_get_int(v) : -1;
+    if (!verdict[0] || fmc_verdict_pass(verdict, rc))
+        return;
+    v = json_get(r, "name");
+    name = (v && v->type == JSON_STR) ? json_get_str(v) : "?";
+    wlen = snprintf(b, sizeof(b), "outcome %s %s rc=%lld", name, verdict,
+                    rc);
+    if (wlen <= 0 || (size_t)wlen >= sizeof(b))
+        return;
+    if (json_size(blockers) >= FMC_BLOCKER_CAP)
+        return;
+    json_init(&item);
+    json_set_str(&item, b);
+    (void)json_push_back(blockers, &item);
+    json_free(&item);
+}
+
+/* Non-pass outcomes become blockers; the whole array is retained for
+ * completed-by-ref matching after the sub reply is freed. */
+static void fmc_queue_outcomes(struct fmc_sub *sub,
+                               struct json_value *blockers,
+                               struct json_value *outcomes_keep)
+{
+    const struct json_value *arr;
+    size_t n, i;
+    if (!sub || !blockers || !outcomes_keep)
+        return;
+    arr = json_get(&sub->reply.data, "outcomes");
+    if (!arr || arr->type != JSON_ARR)
+        return;
+    /* Bounded by the sibling's own cap. */
+    json_copy(outcomes_keep, arr);
+    n = json_size(arr);
+    for (i = 0; i < n && i < FMC_BLOCKER_CAP * 4; i++)
+        fmc_queue_outcome_row(json_at(arr, i), blockers);
+}
+
+/* Pool numbers become capacity. */
+static void fmc_queue_pool(struct fmc_sub *sub, struct fmc_queue_view *view)
+{
+    const struct json_value *pool, *v;
+    if (!sub || !view)
+        return;
+    pool = json_get(&sub->reply.data, "pool");
+    if (!pool || pool->type != JSON_OBJ)
+        return;
+    v = json_get(pool, "total");
+    if (v && v->type == JSON_INT)
+        view->pool_total = (long long)json_get_int(v);
+    v = json_get(pool, "free");
+    if (v && v->type == JSON_INT)
+        view->pool_free = (long long)json_get_int(v);
+}
+
+/* ── brief: queue section ────────────────────────────────────────────────
+ *
+ * Running/queued names become work + candidates; non-pass outcomes become
+ * blockers; pool numbers become capacity. Completed-by-ref matching reads
+ * the outcomes array for name==ref with a pass-like verdict. */
 
 static void fmc_brief_queue(const struct zcl_command_request *req,
                             struct json_value *work,
@@ -861,63 +965,34 @@ static void fmc_brief_queue(const struct zcl_command_request *req,
             fmc_queue_row_name(json_at(arr, i), work);
         }
     }
-    arr = json_get(&sub.reply.data, "outcomes");
-    if (arr && arr->type == JSON_ARR) {
-        /* Retained for completed-by-ref matching after the sub reply is
-         * freed: copy the whole array, bounded by the sibling's own cap. */
-        json_copy(outcomes_keep, arr);
-        n = json_size(arr);
-        for (i = 0; i < n && i < FMC_BLOCKER_CAP * 4; i++) {
-            const struct json_value *r = json_at(arr, i);
-            const struct json_value *v;
-            const char *verdict, *name;
-            long long rc;
-            char b[160];
-            int wlen;
-            if (!r || r->type != JSON_OBJ)
-                continue;
-            v = json_get(r, "verdict");
-            verdict = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-            v = json_get(r, "rc");
-            rc = (v && v->type == JSON_INT) ? (long long)json_get_int(v)
-                                            : -1;
-            if (!verdict || fmc_verdict_pass(verdict, rc))
-                continue;
-            v = json_get(r, "name");
-            name = (v && v->type == JSON_STR) ? json_get_str(v) : "?";
-            wlen = snprintf(b, sizeof(b), "outcome %s %s rc=%lld",
-                            name ? name : "?", verdict ? verdict : "?",
-                            rc);
-            if (wlen <= 0 || (size_t)wlen >= sizeof(b))
-                continue;
-            {
-                struct json_value item;
-                json_init(&item);
-                json_set_str(&item, b);
-                if (json_size(blockers) < FMC_BLOCKER_CAP)
-                    (void)json_push_back(blockers, &item);
-                json_free(&item);
-            }
-        }
-    }
-    {
-        const struct json_value *pool = json_get(&sub.reply.data, "pool");
-        const struct json_value *v;
-        if (pool && pool->type == JSON_OBJ) {
-            v = json_get(pool, "total");
-            if (v && v->type == JSON_INT)
-                view->pool_total = (long long)json_get_int(v);
-            v = json_get(pool, "free");
-            if (v && v->type == JSON_INT)
-                view->pool_free = (long long)json_get_int(v);
-        }
-    }
+    fmc_queue_outcomes(&sub, blockers, outcomes_keep);
+    fmc_queue_pool(&sub, view);
     fmc_sub_end(&sub);
 }
 
-/* True when a retained queue outcome completes ref (name match, pass-like).
- * The matching outcome's evidence pointer (name/verdict) is returned for
- * the changes[] upgrade. */
+/* One retained outcome row: true when it names ref with a pass-like
+ * verdict. */
+static bool fmc_outcome_row_matches(const struct json_value *r,
+                                    const char *ref)
+{
+    const struct json_value *v;
+    const char *name, *verdict;
+    long long rc;
+    if (!r || r->type != JSON_OBJ || !ref || !ref[0])
+        return false;
+    v = json_get(r, "name");
+    name = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
+    if (!name || strcmp(name, ref) != 0)
+        return false;
+    v = json_get(r, "verdict");
+    verdict = (v && v->type == JSON_STR) ? json_get_str(v) : "";
+    v = json_get(r, "rc");
+    rc = (v && v->type == JSON_INT) ? (long long)json_get_int(v) : -1;
+    return fmc_verdict_pass(verdict, rc);
+}
+
+/* True when a retained queue outcome completes ref (name match, pass-like)
+ * for the changes[] upgrade. */
 static bool fmc_outcome_completes(const struct json_value *outcomes,
                                   const char *ref)
 {
@@ -926,24 +1001,33 @@ static bool fmc_outcome_completes(const struct json_value *outcomes,
         return false;
     n = json_size(outcomes);
     for (i = 0; i < n; i++) {
-        const struct json_value *r = json_at(outcomes, i);
-        const struct json_value *v;
-        const char *name, *verdict;
-        long long rc;
-        if (!r || r->type != JSON_OBJ)
-            continue;
-        v = json_get(r, "name");
-        name = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
-        if (!name || strcmp(name, ref) != 0)
-            continue;
-        v = json_get(r, "verdict");
-        verdict = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-        v = json_get(r, "rc");
-        rc = (v && v->type == JSON_INT) ? (long long)json_get_int(v) : -1;
-        if (fmc_verdict_pass(verdict, rc))
+        if (fmc_outcome_row_matches(json_at(outcomes, i), ref))
             return true;
     }
     return false;
+}
+
+/* One open problem/need as a bounded blocker string. */
+static void fmc_board_blocker(struct json_value *blockers, const char *kind,
+                              const char *text, const char *ref)
+{
+    char b[192];
+    char lead[FMC_LEAD_MAX + 1];
+    int wlen;
+    struct json_value item;
+    if (!blockers || !kind)
+        return;
+    fmc_lead(text ? text : "", lead, sizeof(lead));
+    wlen = snprintf(b, sizeof(b), "board %s %.96s %.64s", kind, lead,
+                    ref ? ref : "");
+    if (wlen <= 0 || (size_t)wlen >= sizeof(b))
+        return;
+    if (json_size(blockers) >= FMC_BLOCKER_CAP)
+        return;
+    json_init(&item);
+    json_set_str(&item, b);
+    (void)json_push_back(blockers, &item);
+    json_free(&item);
 }
 
 /* One board post's agent/kind/text/ref into the brief lists. Open problems
@@ -955,40 +1039,64 @@ static void fmc_board_post_lists(const struct json_value *post,
                                  struct json_value *blockers,
                                  struct json_value *candidates)
 {
-    const struct json_value *v;
-    const char *agent, *kind, *text, *ref;
-    char b[192];
-    int wlen;
+    const char *agent, *kind, *ref;
     if (!post || post->type != JSON_OBJ)
         return;
-    v = json_get(post, "agent");
-    agent = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-    v = json_get(post, "kind");
-    kind = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-    v = json_get(post, "text");
-    text = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-    v = json_get(post, "ref");
-    ref = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-    if (agent && agent[0])
+    agent = fmc_row_field(post, "agent");
+    if (agent[0])
         (void)fmc_push_distinct(agents, agent, FMC_LIST_CAP);
-    if (!kind || !kind[0])
+    kind = fmc_row_field(post, "kind");
+    ref = fmc_row_field(post, "ref");
+    if (!kind[0])
         return;
-    if (strcmp(kind, "problem") == 0 || strcmp(kind, "need") == 0) {
-        char lead[FMC_LEAD_MAX + 1];
-        fmc_lead(text ? text : "", lead, sizeof(lead));
-        wlen = snprintf(b, sizeof(b), "board %s %.96s %.64s", kind,
-                        lead, ref ? ref : "");
-        if (wlen > 0 && (size_t)wlen < sizeof(b)) {
-            struct json_value item;
-            json_init(&item);
-            json_set_str(&item, b);
-            if (json_size(blockers) < FMC_BLOCKER_CAP)
-                (void)json_push_back(blockers, &item);
-            json_free(&item);
-        }
-    } else if (strcmp(kind, "claim") == 0 || strcmp(kind, "result") == 0) {
-        if (ref && ref[0])
+    if (strcmp(kind, "problem") == 0 || strcmp(kind, "need") == 0)
+        fmc_board_blocker(blockers, kind, fmc_row_field(post, "text"),
+                          ref);
+    else if (strcmp(kind, "claim") == 0 || strcmp(kind, "result") == 0) {
+        if (ref[0])
             (void)fmc_push_distinct(candidates, ref, FMC_LIST_CAP);
+    }
+}
+
+/* Name a board sibling refusal in missing[] terms. A node that answered
+ * with method-not-found predates the board RPC (generation skew, never an
+ * unreachable node); anything else is the sibling's own refusal. */
+static const char *fmc_board_refusal(const struct fmc_sub *sub)
+{
+    if (!sub)
+        return "sibling_refused";
+    if (sub->reply.error.code[0] &&
+        strstr(sub->reply.error.code, "NODE_UNAVAILABLE"))
+        return "node_unavailable";
+    if (sub->reply.error.code[0] &&
+        strstr(sub->reply.error.code, "METHOD_NOT_FOUND"))
+        return "node_predates_board_rpc";
+    return "sibling_refused";
+}
+
+/* Walk open posts into the brief lists, collecting post ids as evidence
+ * references. */
+static void fmc_board_posts_walk(const struct json_value *posts,
+                                 struct json_value *agents,
+                                 struct json_value *blockers,
+                                 struct json_value *candidates,
+                                 struct json_value *post_ids)
+{
+    size_t n, i;
+    if (!posts || posts->type != JSON_ARR)
+        return;
+    n = json_size(posts);
+    for (i = 0; i < n; i++) {
+        const struct json_value *post = json_at(posts, i);
+        const struct json_value *v;
+        const char *id;
+        fmc_board_post_lists(post, agents, blockers, candidates);
+        if (!post || post->type != JSON_OBJ)
+            continue;
+        v = json_get(post, "id");
+        id = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
+        if (id && id[0])
+            (void)fmc_push_distinct(post_ids, id, FMC_LIST_CAP);
     }
 }
 
@@ -1007,7 +1115,6 @@ static void fmc_brief_board(const struct zcl_command_request *req,
 {
     struct fmc_sub sub;
     const struct json_value *posts;
-    size_t n, i;
     int64_t t0, t1;
     fmc_sub_begin(&sub, "zcl.fleet_board_list.v1", req, "fleet.board.list");
     if (!sub.valid) {
@@ -1025,35 +1132,13 @@ static void fmc_brief_board(const struct zcl_command_request *req,
     t1 = clock_now_wall_ms();
     sub.ran = true;
     if (!fmc_sub_ok(&sub)) {
-        const char *code = "sibling_refused";
-        if (sub.reply.error.code[0] &&
-            strstr(sub.reply.error.code, "NODE_UNAVAILABLE"))
-            code = "node_unavailable";
-        else if (sub.reply.error.code[0] &&
-                 strstr(sub.reply.error.code, "METHOD_NOT_FOUND"))
-            code = "node_predates_board_rpc";
-        fmc_note_missing(missing, "fleet.board", code, t1 - t0);
+        fmc_note_missing(missing, "fleet.board",
+                         fmc_board_refusal(&sub), t1 - t0);
         fmc_sub_end(&sub);
         return;
     }
     posts = json_get(&sub.reply.data, "posts");
-    if (!posts || posts->type != JSON_ARR) {
-        fmc_sub_end(&sub);
-        return;
-    }
-    n = json_size(posts);
-    for (i = 0; i < n; i++) {
-        const struct json_value *post = json_at(posts, i);
-        const struct json_value *v;
-        const char *id;
-        fmc_board_post_lists(post, agents, blockers, candidates);
-        if (!post || post->type != JSON_OBJ)
-            continue;
-        v = json_get(post, "id");
-        id = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
-        if (id && id[0])
-            (void)fmc_push_distinct(post_ids, id, FMC_LIST_CAP);
-    }
+    fmc_board_posts_walk(posts, agents, blockers, candidates, post_ids);
     fmc_sub_end(&sub);
 }
 
@@ -1236,6 +1321,39 @@ static void fmc_do_brief(const struct zcl_command_request *req,
  * posts nothing. Per-item outcomes; the batch fails outright only on bad
  * batch input or a bad grant. */
 
+/* Encode one mail-post input object. Escaped fields keep caller quotes
+ * from breaking the JSON seam; the mail sibling still runs its own
+ * refusal scanners. False when any budget runs out. */
+static bool fmc_post_input(char *input, size_t cap, const char *to,
+                           const char *body, const char *ref,
+                           const char *from)
+{
+    char eto[128], ebody[4096], eref[256], efrom[128];
+    int n;
+    if (!input || cap == 0 || !to || !body)
+        return false;
+    if (!fmc_escape(to, eto, sizeof(eto)))
+        return false;
+    if (!fmc_escape(body, ebody, sizeof(ebody)))
+        return false;
+    if (!fmc_escape(ref ? ref : "", eref, sizeof(eref)))
+        return false;
+    if (from && from[0]) {
+        if (!fmc_escape(from, efrom, sizeof(efrom)))
+            return false;
+        n = snprintf(input, cap,
+                     "{\"action\":\"post\",\"to\":\"%s\",\"kind\":\"directive\","
+                     "\"body\":\"%s\",\"ref\":\"%s\",\"from\":\"%s\"}",
+                     eto, ebody, eref, efrom);
+    } else {
+        n = snprintf(input, cap,
+                     "{\"action\":\"post\",\"to\":\"%s\",\"kind\":\"directive\","
+                     "\"body\":\"%s\",\"ref\":\"%s\"}",
+                     eto, ebody, eref);
+    }
+    return n > 0 && (size_t)n < cap;
+}
+
 /* Post one directive through the mail sibling. Returns the accepted seq,
  * or -1 with `why` (caller buffer) naming the sibling's refusal. The code
  * is copied out before the sub reply is freed: it never points at it. */
@@ -1246,36 +1364,13 @@ static long long fmc_post_directive(const struct zcl_command_request *req,
 {
     struct fmc_sub sub;
     char input[FMC_INPUT_CAP];
-    char eto[128], ebody[4096], eref[256], efrom[128];
-    int n;
     long long seq;
     if (why && why_cap > 0)
         (void)snprintf(why, why_cap, "sibling_refused");
-    if (!fmc_escape(to, eto, sizeof(eto)) ||
-        !fmc_escape(body, ebody, sizeof(ebody)) ||
-        !fmc_escape(ref ? ref : "", eref, sizeof(eref)))
+    if (!fmc_post_input(input, sizeof(input), to, body, ref, from))
         return -1;
     fmc_sub_begin(&sub, "zcl.agent_mail.v1", req, "dev.agent.mail");
     if (!sub.valid) {
-        fmc_sub_end(&sub);
-        return -1;
-    }
-    if (from && from[0]) {
-        if (!fmc_escape(from, efrom, sizeof(efrom))) {
-            fmc_sub_end(&sub);
-            return -1;
-        }
-        n = snprintf(input, sizeof(input),
-                     "{\"action\":\"post\",\"to\":\"%s\",\"kind\":\"directive\","
-                     "\"body\":\"%s\",\"ref\":\"%s\",\"from\":\"%s\"}",
-                     eto, ebody, eref, efrom);
-    } else {
-        n = snprintf(input, sizeof(input),
-                     "{\"action\":\"post\",\"to\":\"%s\",\"kind\":\"directive\","
-                     "\"body\":\"%s\",\"ref\":\"%s\"}",
-                     eto, ebody, eref);
-    }
-    if (n <= 0 || (size_t)n >= sizeof(input)) {
         fmc_sub_end(&sub);
         return -1;
     }
@@ -1301,6 +1396,107 @@ static long long fmc_post_directive(const struct zcl_command_request *req,
     return seq;
 }
 
+/* One item's fields with bounds and alphabets checked. The mail sibling
+ * re-scans the body for secrets and paths; this gate only bounds shape. */
+struct fmc_item_fields {
+    const char *to;
+    const char *body;
+    const char *ref;
+    const char *key;
+};
+
+static const char *fmc_item_str(const struct json_value *it, const char *k)
+{
+    const struct json_value *v = json_get(it, k);
+    if (!v || v->type != JSON_STR)
+        return NULL;
+    return json_get_str(v);
+}
+
+static bool fmc_item_shape_ok(const struct fmc_item_fields *f,
+                              const char *from)
+{
+    if (!fmc_is_token(f->to, FMC_NAME_MAX, true))
+        return false;
+    if (!f->body || !f->body[0] || strlen(f->body) > FMC_BODY_MAX)
+        return false;
+    if (!fmc_is_token(f->key, FMC_KEY_MAX, false))
+        return false;
+    if (strlen(f->ref) > FMC_REF_MAX)
+        return false;
+    if (from && (strlen(from) > FMC_NAME_MAX ||
+                 !fmc_is_token(from, FMC_NAME_MAX, false)))
+        return false;
+    return true;
+}
+
+static bool fmc_send_item_fields(const struct json_value *it,
+                                 const char *from,
+                                 struct fmc_item_fields *f)
+{
+    const char *ref;
+    if (!it || it->type != JSON_OBJ || !f)
+        return false;
+    f->to = fmc_item_str(it, "to");
+    f->body = fmc_item_str(it, "body");
+    f->key = fmc_item_str(it, "idempotency_key");
+    ref = fmc_item_str(it, "ref");
+    f->ref = ref ? ref : "";
+    return fmc_item_shape_ok(f, from);
+}
+
+/* One refused item result. */
+static void fmc_send_item_refused(struct json_value *items, size_t index,
+                                  const char *to, const char *error)
+{
+    struct json_value item;
+    json_init(&item);
+    json_set_object(&item);
+    (void)json_push_kv_int(&item, "index", (long long)index);
+    (void)json_push_kv_str(&item, "state", "refused");
+    (void)json_push_kv_str(&item, "error", error ? error : "BAD_INPUT");
+    (void)json_push_kv_str(&item, "to", to ? to : "");
+    (void)json_push_back(items, &item);
+    json_free(&item);
+}
+
+/* One accepted item result, after recording key->seq for reconcile. */
+static void fmc_send_item_accept(struct json_value *items, size_t index,
+                                 const struct fmc_item_fields *f,
+                                 long long seq, bool duplicate,
+                                 const char *sent_path)
+{
+    struct json_value item;
+    char sent_line[4096];
+    int n;
+    json_init(&item);
+    json_set_object(&item);
+    (void)json_push_kv_int(&item, "index", (long long)index);
+    (void)json_push_kv_str(&item, "to", f->to);
+    n = snprintf(sent_line, sizeof(sent_line),
+                 "{\"key\":\"%s\",\"to\":\"%s\",\"seq\":%lld,\"state\":"
+                 "\"queued\"}\n",
+                 f->key, f->to, seq);
+    if (!duplicate && (n <= 0 || (size_t)n >= sizeof(sent_line) ||
+                       !fmc_append_line(sent_path, sent_line, (size_t)n))) {
+        /* The mail row exists but the receipt did not persist: report the
+         * seq honestly and let the caller's retry reconcile by key on a
+         * best-effort basis. Never claim a duplicate that is not one. */
+        LOG_ERROR(FMC_LOG, "send: sent.jsonl append failed (to=%s seq=%lld)",
+                  f->to, seq);
+        (void)json_push_kv_str(&item, "state", "queued");
+        (void)json_push_kv_int(&item, "seq", seq);
+        (void)json_push_kv_bool(&item, "duplicate", false);
+        (void)json_push_kv_str(&item, "warning", "SENT_RECORD_LOST");
+    } else {
+        (void)json_push_kv_str(&item, "state", "queued");
+        (void)json_push_kv_int(&item, "seq", seq);
+        (void)json_push_kv_bool(&item, "duplicate", duplicate);
+    }
+    (void)json_push_back(items, &item);
+    json_free(&item);
+}
+
 /* One send item: validate, reconcile idempotency, post, record. Emits its
  * result object onto items[]. */
 static void fmc_send_item(const struct zcl_command_request *req,
@@ -1308,86 +1504,29 @@ static void fmc_send_item(const struct zcl_command_request *req,
                           const char *from, const char *sent_path,
                           struct json_value *items)
 {
-    struct json_value item;
-    const struct json_value *v;
-    const char *to, *body, *ref, *key;
+    struct fmc_item_fields f;
     long long seq;
     char why[64];
-    char sent_line[4096];
-    int n;
-    json_init(&item);
-    json_set_object(&item);
-    (void)json_push_kv_int(&item, "index", (long long)index);
-    if (!it || it->type != JSON_OBJ) {
-        (void)json_push_kv_str(&item, "state", "refused");
-        (void)json_push_kv_str(&item, "error", "BAD_INPUT");
-        (void)json_push_back(items, &item);
-        json_free(&item);
+    if (!fmc_send_item_fields(it, from, &f)) {
+        const char *to =
+            (it && it->type == JSON_OBJ) ? fmc_item_str(it, "to") : NULL;
+        fmc_send_item_refused(items, index, to, "BAD_INPUT");
         return;
     }
-    v = json_get(it, "to");
-    to = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
-    v = json_get(it, "body");
-    body = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
-    v = json_get(it, "ref");
-    ref = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-    v = json_get(it, "idempotency_key");
-    key = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
-    if (!to || !fmc_is_token(to, FMC_NAME_MAX, true) ||
-        !body || body[0] == '\0' || strlen(body) > FMC_BODY_MAX || !key ||
-        !fmc_is_token(key, FMC_KEY_MAX, false) || !ref ||
-        strlen(ref) > FMC_REF_MAX ||
-        (from && (strlen(from) > FMC_NAME_MAX ||
-                  !fmc_is_token(from, FMC_NAME_MAX, false)))) {
-        (void)json_push_kv_str(&item, "state", "refused");
-        (void)json_push_kv_str(&item, "error", "BAD_INPUT");
-        (void)json_push_kv_str(&item, "to", to ? to : "");
-        (void)json_push_back(items, &item);
-        json_free(&item);
-        return;
-    }
-    (void)json_push_kv_str(&item, "to", to);
-    if (fmc_sent_find(sent_path, key, &seq)) {
-        /* Reconcile: same key, same accept, no second row. */
-        (void)json_push_kv_str(&item, "state", "queued");
-        (void)json_push_kv_int(&item, "seq", seq);
-        (void)json_push_kv_bool(&item, "duplicate", true);
-        (void)json_push_back(items, &item);
-        json_free(&item);
+    /* Reconcile: same key, same accept, no second row. */
+    if (fmc_sent_find(sent_path, f.key, &seq)) {
+        fmc_send_item_accept(items, index, &f, seq, true, sent_path);
         return;
     }
     why[0] = '\0';
-    seq = fmc_post_directive(req, to, body, ref, from, why, sizeof(why));
+    seq = fmc_post_directive(req, f.to, f.body, f.ref, from, why,
+                             sizeof(why));
     if (seq < 0) {
-        (void)json_push_kv_str(&item, "state", "refused");
-        (void)json_push_kv_str(&item, "error",
-                               why[0] ? why : "POST_FAILED");
-        (void)json_push_back(items, &item);
-        json_free(&item);
+        fmc_send_item_refused(items, index, f.to,
+                              why[0] ? why : "POST_FAILED");
         return;
     }
-    n = snprintf(sent_line, sizeof(sent_line),
-                 "{\"key\":\"%s\",\"to\":\"%s\",\"seq\":%lld,\"state\":"
-                 "\"queued\"}\n",
-                 key, to, seq);
-    if (n > 0 && (size_t)n < sizeof(sent_line) &&
-        fmc_append_line(sent_path, sent_line, (size_t)n)) {
-        (void)json_push_kv_str(&item, "state", "queued");
-        (void)json_push_kv_int(&item, "seq", seq);
-        (void)json_push_kv_bool(&item, "duplicate", false);
-    } else {
-        /* The mail row exists but the receipt did not persist: report the
-         * seq honestly and let the caller's retry reconcile by key on a
-         * best-effort basis. Never claim a duplicate that is not one. */
-        LOG_ERROR(FMC_LOG, "send: sent.jsonl append failed (to=%s seq=%lld)",
-                  to, seq);
-        (void)json_push_kv_str(&item, "state", "queued");
-        (void)json_push_kv_int(&item, "seq", seq);
-        (void)json_push_kv_bool(&item, "duplicate", false);
-        (void)json_push_kv_str(&item, "warning", "SENT_RECORD_LOST");
-    }
-    (void)json_push_back(items, &item);
-    json_free(&item);
+    fmc_send_item_accept(items, index, &f, seq, false, sent_path);
 }
 
 static void fmc_do_send(const struct zcl_command_request *req,
@@ -1644,32 +1783,76 @@ static void fmc_do_evidence(const struct zcl_command_request *req,
  * row (the store is append-only; the last row for an id wins). The id is
  * returned exactly once at mint and never echoed by any other verb. */
 
+/* One closed-vocabulary scope word. Table-driven so adding a verb cannot
+ * widen the set by accident. */
+static bool fmc_scope_word_ok(const char *word, size_t len)
+{
+    static const char *const names[] = {"brief", "send", "evidence"};
+    size_t i;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strlen(names[i]) == len && strncmp(names[i], word, len) == 0)
+            return true;
+    }
+    return false;
+}
+
 static bool fmc_scopes_valid(const char *scopes)
 {
-    /* Closed vocabulary, whole tokens only: brief, send, evidence. */
     const char *p;
     if (!scopes || !scopes[0] || strlen(scopes) >= 64)
         return false;
     for (p = scopes; *p;) {
+        const char *w;
+        size_t len = 0;
         while (*p == ',' || *p == ' ')
             p++;
         if (*p == '\0')
             break;
-        if (strncmp(p, "brief", 5) == 0 &&
-            (p[5] == '\0' || p[5] == ',' || p[5] == ' ')) {
-            p += 5;
-            continue;
+        w = p;
+        while (*p && *p != ',' && *p != ' ') {
+            p++;
+            len++;
         }
-        if (strncmp(p, "send", 4) == 0 &&
-            (p[4] == '\0' || p[4] == ',' || p[4] == ' ')) {
-            p += 4;
-            continue;
+        if (len == 0 || !fmc_scope_word_ok(w, len))
+            return false;
+    }
+    return true;
+}
+
+/* Mint inputs with bounds checked. Fills scopes/label/ttl; fails the
+ * reply on the first bad field. */
+struct fmc_mint_in {
+    const char *scopes;
+    const char *label;
+    long long ttl;
+};
+
+static bool fmc_grant_inputs(const struct zcl_command_request *req,
+                             struct zcl_command_reply *reply,
+                             struct fmc_mint_in *in)
+{
+    long long tmp;
+    in->scopes = fmc_str(req, "scopes");
+    if (!in->scopes || !fmc_scopes_valid(in->scopes)) {
+        fmc_fail(reply, "BAD_INPUT",
+                 "scopes is a subset of brief,send,evidence",
+                 "closed scope vocabulary");
+        return false;
+    }
+    in->ttl = 0;
+    if (fmc_int(req, "ttl_seconds", &tmp)) {
+        if (tmp < 0 || tmp > FMC_GRANT_TTL_MAX) {
+            fmc_fail(reply, "BAD_INPUT", "ttl_seconds is 0..2592000",
+                     "grant lifetime bound");
+            return false;
         }
-        if (strncmp(p, "evidence", 8) == 0 &&
-            (p[8] == '\0' || p[8] == ',' || p[8] == ' ')) {
-            p += 8;
-            continue;
-        }
+        in->ttl = tmp;
+    }
+    in->label = fmc_str(req, "label");
+    if (in->label && (strlen(in->label) > FMC_NAME_MAX ||
+                      !fmc_is_token(in->label, FMC_NAME_MAX, false))) {
+        fmc_fail(reply, "BAD_INPUT", "label is a short token",
+                 "label bound");
         return false;
     }
     return true;
@@ -1678,10 +1861,7 @@ static bool fmc_scopes_valid(const char *scopes)
 static void fmc_grant_mint(const struct zcl_command_request *req,
                            struct zcl_command_reply *reply)
 {
-    const char *scopes;
-    const char *label;
-    long long ttl = 0;
-    long long tmp;
+    struct fmc_mint_in in;
     time_t now;
     long long expires;
     uint8_t raw[16];
@@ -1689,28 +1869,8 @@ static void fmc_grant_mint(const struct zcl_command_request *req,
     char mcpdir[4096], path[4096 + 32];
     char line[512];
     int n;
-    scopes = fmc_str(req, "scopes");
-    if (!scopes || !fmc_scopes_valid(scopes)) {
-        fmc_fail(reply, "BAD_INPUT",
-                 "scopes is a subset of brief,send,evidence",
-                 "closed scope vocabulary");
+    if (!fmc_grant_inputs(req, reply, &in))
         return;
-    }
-    if (fmc_int(req, "ttl_seconds", &tmp)) {
-        if (tmp < 0 || tmp > FMC_GRANT_TTL_MAX) {
-            fmc_fail(reply, "BAD_INPUT", "ttl_seconds is 0..2592000",
-                     "grant lifetime bound");
-            return;
-        }
-        ttl = tmp;
-    }
-    label = fmc_str(req, "label");
-    if (label && (strlen(label) > FMC_NAME_MAX ||
-                  !fmc_is_token(label, FMC_NAME_MAX, false))) {
-        fmc_fail(reply, "BAD_INPUT", "label is a short token",
-                 "label bound");
-        return;
-    }
     if (!zcl_random_secret_bytes(raw, sizeof(raw), "fleet.mcp.grant")) {
         fmc_fail(reply, "GRANT_MINT_FAILED",
                  "the CSPRNG did not yield grant material",
@@ -1731,12 +1891,12 @@ static void fmc_grant_mint(const struct zcl_command_request *req,
         return;
     }
     now = platform_time_wall_time_t();
-    expires = ttl == 0 ? 0 : (long long)now + ttl;
+    expires = in.ttl == 0 ? 0 : (long long)now + in.ttl;
     n = snprintf(line, sizeof(line),
                  "{\"id\":\"%s\",\"scopes\":\"%s\",\"created\":%lld,"
                  "\"expires\":%lld,\"revoked\":\"0\",\"label\":\"%s\"}\n",
-                 id, scopes, (long long)now, expires,
-                 label ? label : "");
+                 id, in.scopes, (long long)now, expires,
+                 in.label ? in.label : "");
     if (n <= 0 || (size_t)n >= sizeof(line)) {
         fmc_fail(reply, "GRANT_MINT_FAILED", "grant row exceeds its bound",
                  "row budget");
@@ -1749,7 +1909,7 @@ static void fmc_grant_mint(const struct zcl_command_request *req,
     }
     (void)json_push_kv_str(&reply->data, "leaf", FMC_GRANT_LEAF);
     (void)json_push_kv_str(&reply->data, "id", id);
-    (void)json_push_kv_str(&reply->data, "scopes", scopes);
+    (void)json_push_kv_str(&reply->data, "scopes", in.scopes);
     (void)json_push_kv_int(&reply->data, "expires", expires);
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;

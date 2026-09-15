@@ -392,12 +392,9 @@ static char *fmx_no_node(const char *method, const char *params_json)
     return NULL;
 }
 
-int test_fleet_mcp(void);
-int test_fleet_mcp(void)
+static int fmx_t_register(void)
 {
     int failures = 0;
-
-    node_rpc_client_set_test_hook(fmx_no_node);
 
     TEST("mcp: all four leaves are registered with declared keys") {
         const struct zcl_command_spec *spec =
@@ -420,6 +417,15 @@ int test_fleet_mcp(void)
         PASS();
     }
 
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_brief_empty(void)
+{
+    int failures = 0;
+
     TEST("mcp: brief on an empty root reports shape and honest absence") {
         struct fmx_call b;
         fmx_isolate("brief_empty");
@@ -441,87 +447,161 @@ int test_fleet_mcp(void)
         PASS();
     }
 
-    TEST("mcp: mint, send, brief-changes and evidence-by-ref") {
-        struct fmx_call s, b, e;
-        struct json_value items, item;
-        const struct json_value *out, *row;
-        char gid[64];
-        long long seq;
-        fmx_isolate("send_flow");
-        ASSERT(fmx_mint("brief,send,evidence", gid, sizeof(gid)));
-        json_init(&items);
-        json_set_array(&items);
-        fmx_item(&item, "field-agent", "sweep the north fence line",
-                 "fence-sweep", "key-fence-1");
-        (void)json_push_back(&items, &item);
-        json_free(&item);
-        ASSERT(fmx_send(&s, gid, &items));
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+/* One minted grant plus one accepted directive through the real leaves.
+ * Plain checks (no ASSERT: the macro's goto cannot cross functions), so
+ * callers assert once on the outcome. */
+struct fmx_accept {
+    char gid[64];
+    long long seq;
+    bool duplicate;
+    bool ok;
+};
+
+static struct fmx_accept fmx_probe(void)
+{
+    struct fmx_call s;
+    struct json_value items, item;
+    struct fmx_accept a;
+    const struct json_value *out, *row, *v;
+    memset(&a, 0, sizeof(a));
+    a.seq = -1;
+    if (!fmx_mint("brief,send,evidence", a.gid, sizeof(a.gid)))
+        return a;
+    json_init(&items);
+    json_set_array(&items);
+    fmx_item(&item, "field-agent", "sweep the north fence line",
+             "fence-sweep", "key-fence-1");
+    (void)json_push_back(&items, &item);
+    json_free(&item);
+    if (!fmx_send(&s, a.gid, &items)) {
         json_free(&items);
-        ASSERT(fmx_ok(&s));
-        out = fmx_arr(&s, "items");
-        ASSERT(out != NULL);
-        ASSERT_EQ((long long)json_size(out), 1);
-        row = json_at(out, 0);
-        ASSERT(row != NULL && row->type == JSON_OBJ);
-        {
-            const struct json_value *v = json_get(row, "state");
-            ASSERT(v && v->type == JSON_STR &&
-                   strcmp(json_get_str(v), "queued") == 0);
-        }
-        {
-            const struct json_value *v = json_get(row, "seq");
-            ASSERT(v && v->type == JSON_INT);
-            seq = json_get_int(v);
-            ASSERT(seq >= 1);
-        }
-        {
-            const struct json_value *v = json_get(row, "duplicate");
-            ASSERT(v && v->type == JSON_BOOL && !json_get_bool(v));
-        }
+        return a;
+    }
+    json_free(&items);
+    if (!fmx_ok(&s)) {
         fmx_end(&s);
-        /* The brief carries the directive as a delivered change lead. */
-        fmx_brief(&b, gid, 0);
+        return a;
+    }
+    out = fmx_arr(&s, "items");
+    row = out ? json_at(out, 0) : NULL;
+    v = row ? json_get(row, "duplicate") : NULL;
+    a.duplicate = v && v->type == JSON_BOOL && json_get_bool(v);
+    v = row ? json_get(row, "seq") : NULL;
+    if (v && v->type == JSON_INT)
+        a.seq = json_get_int(v);
+    v = row ? json_get(row, "state") : NULL;
+    a.ok = v && v->type == JSON_STR && strcmp(json_get_str(v), "queued") == 0;
+    fmx_end(&s);
+    return a;
+}
+
+/* The single change row a fresh probe leaves behind: delivered, with a
+ * lead (not the body) and its ref. */
+static bool fmx_check_delivered(const struct json_value *changes)
+{
+    const struct json_value *ch, *v;
+    if (!changes || changes->type != JSON_ARR || json_size(changes) != 1)
+        return false;
+    ch = json_at(changes, 0);
+    if (!ch || ch->type != JSON_OBJ)
+        return false;
+    v = json_get(ch, "state");
+    if (!v || v->type != JSON_STR ||
+        strcmp(json_get_str(v), "delivered") != 0)
+        return false;
+    v = json_get(ch, "lead");
+    if (!v || v->type != JSON_STR ||
+        strstr(json_get_str(v), "north fence") == NULL)
+        return false;
+    v = json_get(ch, "ref");
+    if (!v || v->type != JSON_STR ||
+        strcmp(json_get_str(v), "fence-sweep") != 0)
+        return false;
+    return true;
+}
+
+/* The bounded evidence object carries the whole row body. */
+static bool fmx_check_body(const struct fmx_call *e, const char *want)
+{
+    const struct json_value *obj, *v;
+    if (!e || !want)
+        return false;
+    obj = json_get(&e->reply.data, "object");
+    if (!obj || obj->type != JSON_OBJ)
+        return false;
+    v = json_get(obj, "body");
+    if (!v || v->type != JSON_STR)
+        return false;
+    return strcmp(json_get_str(v), want) == 0;
+}
+
+static int fmx_t_send_flow(void)
+{
+    int failures = 0;
+
+    TEST("mcp: mint and send accept one directive") {
+        struct fmx_accept a;
+        fmx_isolate("send_flow");
+        a = fmx_probe();
+        ASSERT(a.ok);
+        ASSERT(a.seq >= 1);
+        ASSERT(!a.duplicate);
+        ASSERT(a.gid[0] != '\0');
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_brief_changes(void)
+{
+    int failures = 0;
+
+    TEST("mcp: brief carries the directive as a delivered lead") {
+        struct fmx_call b;
+        struct fmx_accept a;
+        fmx_isolate("brief_changes");
+        a = fmx_probe();
+        ASSERT(a.ok);
+        fmx_brief(&b, a.gid, 0);
         ASSERT(fmx_run(&b, zcl_native_handle_fleet_mcp_brief));
         ASSERT(fmx_ok(&b));
-        {
-            const struct json_value *changes = fmx_arr(&b, "changes");
-            const struct json_value *ch = NULL;
-            ASSERT(changes != NULL);
-            ASSERT_EQ((long long)json_size(changes), 1);
-            ch = json_at(changes, 0);
-            ASSERT(ch != NULL && ch->type == JSON_OBJ);
-            {
-                const struct json_value *v = json_get(ch, "state");
-                ASSERT(v && v->type == JSON_STR &&
-                       strcmp(json_get_str(v), "delivered") == 0);
-            }
-            {
-                /* Leads, not bodies: the full text stays one call away. */
-                const struct json_value *v = json_get(ch, "lead");
-                ASSERT(v && v->type == JSON_STR &&
-                       strstr(json_get_str(v), "north fence") != NULL);
-                v = json_get(ch, "ref");
-                ASSERT(v && v->type == JSON_STR &&
-                       strcmp(json_get_str(v), "fence-sweep") == 0);
-            }
-        }
+        ASSERT(fmx_check_delivered(fmx_arr(&b, "changes")));
         fmx_end(&b);
-        /* Evidence by exact ref returns the whole bounded row. */
-        fmx_evidence(&e, gid, "mail", "fence-sweep");
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_evidence(void)
+{
+    int failures = 0;
+
+    TEST("mcp: evidence by exact ref returns the bounded row") {
+        struct fmx_call e;
+        struct fmx_accept a;
+        fmx_isolate("evidence");
+        a = fmx_probe();
+        ASSERT(a.ok);
+        fmx_evidence(&e, a.gid, "mail", "fence-sweep");
         ASSERT(fmx_run(&e, zcl_native_handle_fleet_mcp_evidence));
         ASSERT(fmx_ok(&e));
-        {
-            const struct json_value *obj = json_get(&e.reply.data, "object");
-            const struct json_value *v;
-            ASSERT(obj != NULL && obj->type == JSON_OBJ);
-            v = json_get(obj, "body");
-            ASSERT(v && v->type == JSON_STR &&
-                   strcmp(json_get_str(v), "sweep the north fence line") ==
-                       0);
-        }
+        ASSERT(fmx_check_body(&e, "sweep the north fence line"));
         fmx_end(&e);
         /* Unknown refs are typed refusals, not empty objects. */
-        fmx_evidence(&e, gid, "mail", "no-such-ref");
+        fmx_evidence(&e, a.gid, "mail", "no-such-ref");
         ASSERT(fmx_run(&e, zcl_native_handle_fleet_mcp_evidence));
         ASSERT(!fmx_ok(&e));
         ASSERT_STR_EQ(e.reply.error.code, "EVIDENCE_NOT_FOUND");
@@ -529,6 +609,15 @@ int test_fleet_mcp(void)
         fmx_restore();
         PASS();
     }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_duplicate(void)
+{
+    int failures = 0;
 
     TEST("mcp: duplicate delivery reconciles, never re-posts") {
         struct fmx_call s;
@@ -601,6 +690,15 @@ int test_fleet_mcp(void)
         PASS();
     }
 
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_lifecycle(void)
+{
+    int failures = 0;
+
     TEST("mcp: acknowledged and completed are distinct observed states") {
         struct fmx_call s, b;
         struct json_value items, item;
@@ -657,6 +755,15 @@ int test_fleet_mcp(void)
         fmx_restore();
         PASS();
     }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_grants(void)
+{
+    int failures = 0;
 
     TEST("mcp: revoked, unknown, expired and scoped grants fail closed") {
         struct fmx_call c;
@@ -722,6 +829,15 @@ int test_fleet_mcp(void)
         PASS();
     }
 
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_board_absent(void)
+{
+    int failures = 0;
+
     TEST("mcp: board evidence without a node is unavailable, not empty") {
         struct fmx_call e;
         char gid[64];
@@ -737,6 +853,28 @@ int test_fleet_mcp(void)
     }
 
 _test_next:;
+    fmx_restore();
+    return failures;
+}
+
+int test_fleet_mcp(void);
+int test_fleet_mcp(void)
+{
+    int failures = 0;
+
+    node_rpc_client_set_test_hook(fmx_no_node);
+    failures += fmx_t_register();
+    failures += fmx_t_brief_empty();
+    failures += fmx_t_send_flow();
+    failures += fmx_t_brief_changes();
+    failures += fmx_t_evidence();
+    failures += fmx_t_duplicate();
+    failures += fmx_t_lifecycle();
+    failures += fmx_t_grants();
+    failures += fmx_t_board_absent();
+
+    /* No ASSERT lives in this function, so no goto needs the label: the
+     * hook is always cleared on the single fall-through path. */
     node_rpc_client_set_test_hook(NULL);
     fmx_restore();
     if (failures == 0)
