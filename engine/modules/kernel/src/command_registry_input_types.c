@@ -307,7 +307,6 @@ static bool cr_match_fleet_steer(const char *path, const char *key,
         *type_ok = value->children[j].type == JSON_OBJ;
     return true;
 }
-}
 
 static bool cr_match_path_special(const struct zcl_command_spec *spec,
                                   const char *key,
