@@ -529,28 +529,21 @@ static int canonical_mode(char out[8], const struct stat *metadata, char kind,
 }
 
 /* Mirror GNU stat --printf='%y' or '%z': local time, untrimmed nanoseconds,
- * numeric +HHMM offset. tm_gmtoff is not portable C, so derive the offset
- * from mktime's local reinterpretation of the same broken-down time. */
+ * and the timezone offset belonging to that broken-down local time. */
 static int format_time(char out[80], const struct timespec *when)
 {
     struct tm broken;
     time_t seconds = when->tv_sec;
     if (localtime_r(&seconds, &broken) == nullptr)
         return -1;
-    struct tm local_copy = broken;
-    time_t local_seconds = mktime(&local_copy);
-    if (local_seconds == (time_t)-1)
+    char offset[8];
+    if (strftime(offset, sizeof(offset), "%z", &broken) != 5)
         return -1;
-    long offset = (long)(local_seconds - seconds);
-    char sign = offset < 0 ? '-' : '+';
-    unsigned long magnitude = offset < 0 ? (unsigned long)(-(offset + 1)) + 1u
-                                         : (unsigned long)offset;
     int length = snprintf(out, 80,
-                          "%04d-%02d-%02d %02d:%02d:%02d.%09ld %c%02lu%02lu",
+                          "%04d-%02d-%02d %02d:%02d:%02d.%09ld %s",
                           broken.tm_year + 1900, broken.tm_mon + 1,
                           broken.tm_mday, broken.tm_hour, broken.tm_min,
-                          broken.tm_sec, when->tv_nsec, sign,
-                          magnitude / 3600u, (magnitude % 3600u) / 60u);
+                          broken.tm_sec, when->tv_nsec, offset);
     return length > 0 && length < 80 ? 0 : -1;
 }
 

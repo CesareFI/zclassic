@@ -85,6 +85,19 @@ sandbox_legacy="$(ZCL_SOURCE_IDENTITY_BATCH_DISABLE=1 \
 [ "$sandbox_native" = "$sandbox_legacy" ] ||
     fail 'adversarial-path native and portable records differ'
 
+# Mutation records must match too, including nonzero timezone offsets.
+# Fixed POSIX zones keep this independent of the host timezone database.
+for zone in UTC0 PST8PDT IST-5:30; do
+    mutation_native="$(TZ="$zone" ZCL_SOURCE_IDENTITY_BATCH_SHADOW=1 \
+        "$SOURCE_IDENTITY" capture-record)" ||
+        fail "native mutation parity failed in $zone"
+    mutation_legacy="$(TZ="$zone" ZCL_SOURCE_IDENTITY_FORCE_PORTABLE=1 \
+        "$SOURCE_IDENTITY" capture-record)" ||
+        fail "portable mutation capture failed in $zone"
+    [ "$mutation_native" = "$mutation_legacy" ] ||
+        fail "mutation records differ in $zone"
+done
+
 cd "$ROOT"
 native="$(ZCL_SOURCE_IDENTITY_BATCH_SHADOW=1 \
     "$SOURCE_IDENTITY" capture)" || fail 'whole-tree native capture failed'
