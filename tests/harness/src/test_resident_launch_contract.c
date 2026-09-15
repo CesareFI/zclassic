@@ -39,6 +39,9 @@
  * shipped ztasks child, so the bytes the consumer exchanges are proven
  * bytes, not guesses.
  */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
 #include "test/test_core.h"
 
 #include "base/hex.h"
