@@ -3,6 +3,7 @@
 
 #include "platform/os_sandbox.h"
 #include <sys/syscall.h>
+#include <stdio.h>
 
 enum os_sandbox_package_confinement
 os_sandbox_package_confinement(void)

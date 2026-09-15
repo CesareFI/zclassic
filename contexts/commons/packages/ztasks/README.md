@@ -46,10 +46,10 @@ available for automation and headless use.
 `tests/harness/src/test_task_document.c` exercises persistence, failed commits,
 busy storage, newer typing during a save, native form/list pixels, keyboard focus,
 list navigation during a save, deletion/undo, restart and conflicting writers.
-Real macOS desktop interaction remains OPEN pending desktop access. App update
-preview, acceptance and rollback compatibility are not yet qualified by this
-task editor. Package reproduction alone does not establish GUI interaction or
-grant permission to install or execute an application.
+Real macOS desktop interaction remains OPEN pending desktop access. The update
+journey below adds confined execution and checked program selection. Package
+reproduction alone does not establish GUI interaction or grant permission to
+install or execute an application.
 
 ### Program changes and user data
 
@@ -69,10 +69,10 @@ slow preview work happens before it and does not hold the data lock.
 
 These APIs supply atomic admission, not compatibility or execution permission.
 A schema number, a checkpoint, or a matching digest does not prove a candidate
-understands the data. Confined preview execution and its user-facing acceptance
-flow are still pending. The existing unguarded resident APIs remain for stateless
-consumers; data-bearing apps must use the checked path. Real Mac desktop
-acceptance is also still open.
+understands the data. The task update owner below supplies the bounded preview
+and canonical round-trip checks. The existing unguarded resident APIs remain
+for stateless consumers; data-bearing apps must use the checked path. Real Mac
+desktop acceptance remains open.
 
 ## Try, Keep, and Go back
 

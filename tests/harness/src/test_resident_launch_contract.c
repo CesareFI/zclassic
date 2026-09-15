@@ -936,7 +936,7 @@ static int rlc_task_focus(struct task_list *list)
         zcl_present_model_render_list_v1(&model, &next, error, sizeof(error));
     RLC_CHECK("task updates: render actual permission page", rendered);
     if (rendered) {
-        struct zcl_present_window_v1 page = { .pixels = first.pixels, .width = first.width, .height = first.height };
+        struct zcl_present_window_v1 page = { .pixels = first.pixels, .width = first.width, .height = first.height, .pixel_format = ZCL_PRESENT_RGB8 };
         zcl_present_draw_action_focus_internal(&page, first.pixels, first.width, first.height, 4, list->focus);
         struct zcl_present_input_v1 tab = { .key = ZCL_PRESENT_INPUT_TAB };
         uint32_t action = UINT32_MAX;
