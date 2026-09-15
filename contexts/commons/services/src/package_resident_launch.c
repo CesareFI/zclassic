@@ -176,6 +176,28 @@ struct zcl_result package_resident_prepare(struct package_resident *app,
 #endif
 }
 
+struct zcl_result package_resident_prepare_reuse(struct package_resident *app,
+    const struct package_resident_artifact *artifact)
+{
+    if (!app || !artifact || app->launch.spawned || !app->snapshot_image[0] ||
+        strcmp(app->launch.accepted.image_sha3_hex, artifact->accepted.image_sha3_hex) != 0 ||
+        app->launch.accepted.image_size != artifact->accepted.image_size)
+        return ZCL_ERR(-1, "resident-reuse: idle independent snapshot of the exact artifact required");
+    struct resident_launch_accepted accepted = app->launch.accepted;
+    resident_launch_close(&app->launch);
+    char error[RESIDENT_LAUNCH_ERROR_MAX] = {0};
+    if (!resident_startup_begin(&app->startup, RESIDENT_STARTUP_PLATFORM_MS,
+            RESIDENT_STARTUP_PROTOCOL_MS, error, sizeof(error)) ||
+        !resident_launch_prepare(&app->launch, app->snapshot_image, &accepted, error, sizeof(error))) {
+        struct zcl_result cleanup = package_resident_close(app);
+        if (!cleanup.ok) return cleanup;
+        return ZCL_ERR(-1, "resident-reuse: independent snapshot verification failed: %s", error);
+    }
+    app->artifact = *artifact;
+    memset(&app->receipt, 0, sizeof(app->receipt));
+    return ZCL_OK;
+}
+
 static bool pr_receipt_process_valid(const struct package_resident *app)
 {
     const struct resident_receipt *r = &app->receipt;

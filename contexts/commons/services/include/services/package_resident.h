@@ -41,6 +41,10 @@ struct package_resident {
 void package_resident_init(struct package_resident *app);
 struct zcl_result package_resident_prepare(struct package_resident *app,
     const struct package_resident_artifact *artifact);
+/* Rehash a retained independent snapshot and issue a fresh launch nonce and
+ * deadline. The caller must freshly verify the installed artifact first. */
+struct zcl_result package_resident_prepare_reuse(struct package_resident *app,
+    const struct package_resident_artifact *artifact);
 struct zcl_result package_resident_start(struct package_resident *app);
 struct zcl_result package_resident_close(struct package_resident *app);
 

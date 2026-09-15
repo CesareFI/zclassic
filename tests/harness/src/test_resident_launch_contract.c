@@ -877,6 +877,8 @@ static bool rlc_task_wait(struct task_update *update)
     while (update->pending && platform_time_monotonic_us() < deadline) {
         bool changed = false;
         if (!task_update_poll(update, &changed).ok) return false;
+        if (update->pending && (update->phase == TASK_UPDATE_KEPT ||
+            update->phase == TASK_UPDATE_READY || strstr(update->message, "restored"))) return false;
         (void)sched_yield();
     }
     return !update->pending;
@@ -1064,11 +1066,48 @@ static int rlc_task_cycles(const struct rlc_task_session *session)
         cycles_passed = task_update_try(session->update, true, true).ok && rlc_task_wait(session->update) &&
             task_document_read(session->store, session->document).ok && rlc_task_equal(session->document, session->expected);
         if (session->update->elapsed_us > maximum_us) maximum_us = session->update->elapsed_us;
+        printf("task return cycle=%u total_us=%lld helper_startup_us=%lld confined_us=%lld", cycle,
+            (long long)session->update->elapsed_us, (long long)session->update->helper_startup_us,
+            (long long)session->update->confined_us);
+        for (unsigned step = 0; step < TASK_UPDATE_STEP_COUNT; ++step)
+            printf(" step%u_us=%lld", step, (long long)session->update->step_us[step]);
+        putchar('\n');
+
     }
     RLC_CHECK("task journey: 20 confined compatibility checks and exact returns", cycles_passed);
     printf("task journey: return maximum_us=%lld real_gui=OPEN\n", (long long)maximum_us);
     RLC_CHECK("task journey: undo survives all program changes", task_document_apply(session->store, session->document->state.revision,
         TASK_DOCUMENT_UNDO, 0, NULL, session->document).ok && strcmp(session->document->state.tasks[0].title, "Edited before preview") == 0);
+    return failures;
+}
+
+static int rlc_task_snapshot_reuse(const char *base, const struct rlc_binding *binding)
+{
+    int failures = 0;
+    uint8_t root[32], receipt[32];
+    struct package_resident_artifact artifact;
+    struct package_resident image;
+    package_resident_init(&image);
+    bool prepared = zcl_hex_decode_lower(binding->root_hex, root, 32) &&
+        zcl_hex_decode_lower(binding->receipt_hex, receipt, 32) &&
+        package_resident_artifact_read(base, root, receipt, RLC_ZTASKS_PROGRAM, &artifact).ok &&
+        package_resident_prepare(&image, &artifact).ok;
+    RLC_CHECK("task return: independent snapshot prepared", prepared);
+    if (prepared) {
+        uint64_t inode = image.launch.accepted.image_low;
+        char nonce[65];
+        (void)snprintf(nonce, sizeof(nonce), "%s", image.launch.nonce);
+        RLC_CHECK("task return: retained bytes reverified with fresh nonce", package_resident_prepare_reuse(&image, &artifact).ok &&
+            image.launch.accepted.image_low == inode && strcmp(nonce, image.launch.nonce) != 0);
+        FILE *file = chmod(image.snapshot_image, 0700) == 0 ? fopen(image.snapshot_image, "r+b") : NULL;
+        bool corrupted = file && fputc('X', file) != EOF;
+        if (file && fclose(file) != 0) corrupted = false;
+        RLC_CHECK("task return: changed retained snapshot refuses", corrupted &&
+            !package_resident_prepare_reuse(&image, &artifact).ok);
+        RLC_CHECK("task return: snapshot failure leaves installed artifact intact",
+            package_resident_artifact_read(base, root, receipt, RLC_ZTASKS_PROGRAM, &artifact).ok);
+    }
+    RLC_CHECK("task return: retained snapshot released", package_resident_close(&image).ok);
     return failures;
 }
 
@@ -1104,6 +1143,7 @@ static int rlc_task_journey(const char *base, const struct rlc_binding *n,
     failures += rlc_task_failed_program(&session);
     failures += rlc_task_failures(&session);
     failures += rlc_task_cycles(&session);
+    failures += rlc_task_snapshot_reuse(base, n);
     (void)task_update_finish(&update);
     (void)package_resident_store_close(&store);
     RLC_CHECK("task journey: descriptor count unchanged", counted && os_proc_open_fd_count(&fd_after) && fd_before == fd_after);

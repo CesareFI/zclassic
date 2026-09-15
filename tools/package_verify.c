@@ -4020,6 +4020,7 @@ static bool pv_app_preview_ready(const struct pv_run *run, const char *nonce)
 
 static int pv_app_preview_mode(int argc, char **argv)
 {
+    int64_t entered_us = clock_now_monotonic_ns() / 1000;
     if (!pv_app_preview_args(argc, argv)) {
         fprintf(stderr, "task-preview: exact arguments and execution permission required\n"); return 2;
     }
@@ -4048,8 +4049,9 @@ static int pv_app_preview_mode(int argc, char **argv)
             run.exit_code, run.term_signal, run.timed_out, run.stderr_buf);
         return 5;
     }
-    printf("app-preview-ok %llu %llu %s\n", (unsigned long long)g_pv_preview_pid,
-           (unsigned long long)g_pv_preview_token, preview.nonce);
+    printf("app-preview-ok %llu %llu %s %lld %llu\n", (unsigned long long)g_pv_preview_pid,
+           (unsigned long long)g_pv_preview_token, preview.nonce,
+           (long long)entered_us, (unsigned long long)g_pv_perf.child_wall_us);
     return 0;
 }
 

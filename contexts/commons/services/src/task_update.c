@@ -24,6 +24,11 @@
 #endif
 
 /* One joined, finite worker per owner. No background service or detached job. */
+struct task_update_images {
+    struct package_resident slots[2];
+    unsigned next;
+};
+
 // supervisor-ok:window-owned-bounded-preview
 struct task_update_job {
     pthread_t thread;
@@ -36,8 +41,59 @@ struct task_update_job {
     uint64_t token;
     char view[4096];
     struct zcl_result result;
-    int64_t elapsed_us;
+    int64_t elapsed_us, step_started_us, helper_startup_us, confined_us;
+    atomic_uint step;
+    int64_t step_us[TASK_UPDATE_STEP_COUNT];
+    struct task_update_images *images;
 };
+
+static struct zcl_result tu_image(struct task_update_job *job,
+    const struct package_resident_artifact *artifact, struct package_resident **out)
+{
+    for (unsigned i = 0; i < 2; ++i) {
+        struct package_resident *image = &job->images->slots[i];
+        if (image->snapshot_image[0] &&
+            strcmp(image->artifact.accepted.image_sha3_hex, artifact->accepted.image_sha3_hex) == 0) {
+            *out = image;
+            return package_resident_prepare_reuse(image, artifact);
+        }
+    }
+    *out = &job->images->slots[job->images->next++ % 2u];
+    ZCL_CHECK(package_resident_close(*out));
+    package_resident_init(*out);
+    return package_resident_prepare(*out, artifact);
+}
+
+/* Only the worker writes timings. The UI reads the published stage, then
+ * receives the completed timing values after the worker's release store. */
+static void tu_stage(struct task_update_job *job, enum task_update_step step)
+{
+    int64_t now = platform_time_monotonic_us();
+    unsigned previous = atomic_load_explicit(&job->step, memory_order_relaxed);
+    if (previous < TASK_UPDATE_STEP_COUNT)
+        job->step_us[previous] += now - job->step_started_us;
+    job->step_started_us = now;
+    atomic_store_explicit(&job->step, (unsigned)step, memory_order_release);
+}
+
+static struct zcl_result tu_progress(struct task_update *update,
+    const struct task_update_job *job, bool *changed)
+{
+    if (!job || atomic_load_explicit(&job->cancelled, memory_order_relaxed)) return ZCL_OK;
+    unsigned step = atomic_load_explicit(&job->step, memory_order_acquire);
+    if (step > TASK_UPDATE_STEP_COUNT || step == (unsigned)update->step) return ZCL_OK;
+    static const char *const messages[] = {
+        "Opening saved task data...", "Verifying the installed program...",
+        "Copying current tasks and undo...", "Preparing the isolated program...",
+        "Preparing private preview data...", "Running the confined preview...",
+        "Checking current-data compatibility...", "Releasing the preview process...",
+        "Saving program selection...", "Finishing update..."
+    };
+    update->step = (enum task_update_step)step;
+    (void)snprintf(update->message, sizeof(update->message), "%s", messages[step]);
+    *changed = true;
+    return ZCL_OK;
+}
 
 static struct zcl_result tu_failure(struct task_update *update, struct zcl_result result)
 {
@@ -210,6 +266,7 @@ static struct zcl_result tu_stop_orphan(struct task_update_job *job)
 
 static struct zcl_result tu_execute(struct task_update_job *job, struct package_resident *image)
 {
+    tu_stage(job, TASK_UPDATE_INPUTS);
     ZCL_CHECK(tu_inputs(job));
     char directory[256], locator[256], nonce[80], reply[256];
     (void)snprintf(directory, sizeof(directory), "--app-preview=%s", job->scratch);
@@ -219,17 +276,23 @@ static struct zcl_result tu_execute(struct task_update_job *job, struct package_
     const char *const argv[] = { job->verifier, directory, locator, nonce,
         "--require-full-isolation", "--accept-execution", NULL };
     bool cancelled = false;
+    tu_stage(job, TASK_UPDATE_EXECUTE);
     int rc = zcl_spawn_capture_cancelable(argv, reply, sizeof(reply), 10000,
         tu_cancel_probe, job, &cancelled);
     ZCL_CHECK(tu_stop_orphan(job));
     if (atomic_load_explicit(&job->cancelled, memory_order_relaxed))
         return ZCL_ERR(-1, "Preview cancelled. Working version and data retained.");
-    unsigned long long pid = 0, token = 0;
+    unsigned long long pid = 0, token = 0, confined_us = 0;
+    long long entered_us = 0;
     char returned_nonce[65], trailing;
-    if (rc != 0 || sscanf(reply, "app-preview-ok %llu %llu %64s %c", &pid, &token, returned_nonce, &trailing) != 3 ||
-        !pid || !token || token > INT64_MAX || strcmp(returned_nonce, job->nonce) != 0)
+    if (rc != 0 || sscanf(reply, "app-preview-ok %llu %llu %64s %lld %llu %c", &pid, &token, returned_nonce, &entered_us, &confined_us, &trailing) != 5 ||
+        !pid || !token || token > INT64_MAX || strcmp(returned_nonce, job->nonce) != 0 ||
+        entered_us < job->step_started_us || entered_us > platform_time_monotonic_us() || confined_us > UINT64_C(10000000))
         return ZCL_ERR(-1, "Program did not demonstrate compatibility with current tasks and undo. Working version retained.");
     job->token = (uint64_t)token;
+    job->helper_startup_us = entered_us - job->step_started_us;
+    job->confined_us = (int64_t)confined_us;
+    tu_stage(job, TASK_UPDATE_COMPATIBILITY);
     return tu_compatible(job);
 }
 #else
@@ -254,6 +317,7 @@ static struct zcl_result tu_switch(struct task_update_job *job, struct package_r
 {
     if (atomic_load_explicit(&job->cancelled, memory_order_relaxed))
         return ZCL_ERR(-1, "Update cancelled. Working version retained.");
+    tu_stage(job, TASK_UPDATE_COMMIT);
     struct package_resident_guard guard = { .context = job, .check = tu_guard };
     if (job->go_back)
         return package_resident_record_rollback_checked(store, job->record.revision,
@@ -271,23 +335,25 @@ static struct zcl_result tu_probe(struct task_update_job *job, struct package_re
     if (!zcl_hex_decode_lower(job->target.package_root, root, 32) ||
         !zcl_hex_decode_lower(job->target.receipt_id, receipt, 32))
         return ZCL_ERR(-1, "No exact program is available for this action.");
+    tu_stage(job, TASK_UPDATE_VERIFY);
     struct package_resident_artifact artifact;
     ZCL_CHECK(package_resident_artifact_read(job->directory, root, receipt, job->target.program, &artifact));
     if (job->target.artifact_sha3[0] && strcmp(job->target.artifact_sha3, artifact.accepted.image_sha3_hex) != 0)
         return ZCL_ERR(-1, "Installed program differs from the accepted version.");
     (void)snprintf(job->target.artifact_sha3, sizeof(job->target.artifact_sha3), "%s", artifact.accepted.image_sha3_hex);
     if (!job->target.configuration_generation) job->target.configuration_generation = 1;
+    tu_stage(job, TASK_UPDATE_DATA);
     ZCL_CHECK(task_document_capture(store, &job->checkpoint));
     if (!job->refresh) ZCL_CHECK(package_resident_record_begin(store, job->record.generation, &job->record));
-    struct package_resident image;
-    package_resident_init(&image);
-    struct zcl_result result = package_resident_prepare(&image, &artifact);
-    if (result.ok) result = tu_execute(job, &image);
-    struct zcl_result closed = package_resident_close(&image);
+    struct package_resident *image = NULL;
+    tu_stage(job, TASK_UPDATE_SNAPSHOT);
+    struct zcl_result result = tu_image(job, &artifact, &image);
+    if (result.ok) result = tu_execute(job, image);
+    tu_stage(job, TASK_UPDATE_CLEANUP);
     tu_remove(job);
-    if (result.ok && !closed.ok) result = closed;
     if (!result.ok || job->refresh) return result;
     if (job->go_back) return tu_switch(job, store);
+    tu_stage(job, TASK_UPDATE_COMMIT);
     return package_resident_record_accept(store, job->record.revision, job->record.generation,
         &job->target, job->nonce, job->token, &job->record);
 }
@@ -297,11 +363,13 @@ static void *tu_work(void *context)
     struct task_update_job *job = context;
     (void)zcl_thread_qos_background();
     int64_t began = platform_time_monotonic_us();
+    job->step_started_us = began;
     struct package_resident_store store = {0};
     job->result = package_resident_store_open_app(&store, job->directory, job->app);
     if (job->result.ok) job->result = job->keep ? tu_switch(job, &store) : tu_probe(job, &store);
     struct zcl_result closed = package_resident_store_close(&store);
     if (job->result.ok && !closed.ok) job->result = closed;
+    tu_stage(job, TASK_UPDATE_STEP_COUNT);
     job->elapsed_us = platform_time_monotonic_us() - began;
     atomic_store_explicit(&job->completed, true, memory_order_release);
     return NULL;
@@ -309,6 +377,10 @@ static void *tu_work(void *context)
 
 static struct zcl_result tu_start(struct task_update *update, struct task_update_job *job)
 {
+    atomic_init(&job->step, TASK_UPDATE_STORAGE);
+    memset(job->step_us, 0, sizeof(job->step_us));
+    job->helper_startup_us = job->confined_us = 0;
+    update->step = TASK_UPDATE_STORAGE;
     atomic_init(&job->completed, false);
     atomic_init(&job->cancelled, false);
     // thread-supervision-ok:bounded-one-shot owner joins verifier and durable transition
@@ -339,12 +411,18 @@ struct zcl_result task_update_open(struct task_update *update, const char *direc
 static struct zcl_result tu_new(struct task_update *update, bool go_back, bool refresh)
 {
     if (update->pending) return tu_failure(update, ZCL_ERR(-1, "A preview or update is still running."));
+    if (!update->images) {
+        update->images = zcl_calloc(1, sizeof(*update->images), "task.preview.images");
+        if (!update->images) return tu_failure(update, ZCL_ERR(-1, "Preview image allocation failed."));
+        for (unsigned i = 0; i < 2; ++i) package_resident_init(&update->images->slots[i]);
+    }
     struct task_update_job *job = zcl_calloc(1, sizeof(*job), "task.preview");
     if (!job) return tu_failure(update, ZCL_ERR(-1, "Preview allocation failed."));
     (void)snprintf(job->directory, sizeof(job->directory), "%s", update->directory);
     (void)snprintf(job->app, sizeof(job->app), "%s", update->app);
     (void)snprintf(job->verifier, sizeof(job->verifier), "%s", update->verifier);
     job->target = update->candidate;
+    job->images = update->images;
     job->go_back = go_back;
     job->refresh = refresh;
     if (!refresh) { free(update->ready); update->ready = NULL; update->preview[0] = 0; }
@@ -393,12 +471,15 @@ struct zcl_result task_update_poll(struct task_update *update, bool *changed)
     if (!update || !changed) return ZCL_ERR(-1, "Task update owner and changed output required.");
     *changed = false;
     struct task_update_job *job = update->pending;
-    if (!job || !atomic_load_explicit(&job->completed, memory_order_acquire)) return ZCL_OK;
+    if (!job || !atomic_load_explicit(&job->completed, memory_order_acquire)) return tu_progress(update, job, changed);
     int rc = pthread_join(job->thread, NULL);
     if (rc) return tu_failure(update, ZCL_ERR(rc, "Preview worker release failed."));
     update->pending = NULL;
     *changed = true;
     update->elapsed_us = job->elapsed_us;
+    update->helper_startup_us = job->helper_startup_us;
+    update->confined_us = job->confined_us;
+    memcpy(update->step_us, job->step_us, sizeof(update->step_us));
     struct zcl_result result = job->result;
     if (result.ok && (job->keep || job->go_back || job->refresh)) {
         (void)snprintf(update->active, sizeof(update->active), "%s", job->view);
@@ -431,5 +512,13 @@ struct zcl_result task_update_finish(struct task_update *update)
         free(update->pending);
         update->pending = NULL;
     }
-    return ZCL_OK;
+    struct zcl_result result = ZCL_OK;
+    if (update->images) {
+        for (unsigned i = 0; i < 2; ++i) {
+            struct zcl_result closed = package_resident_close(&update->images->slots[i]);
+            if (!closed.ok) result = closed;
+        }
+        if (result.ok) { free(update->images); update->images = NULL; }
+    }
+    return result;
 }
