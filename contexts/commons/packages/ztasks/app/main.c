@@ -8,6 +8,9 @@
 #if !defined(_WIN32)
 #include <signal.h>
 #include <unistd.h>
+#include <time.h>
+
+static struct timespec task_entry_time;
 
 /* Public resident_launch v1 wire, not a second launcher. Package sources
  * deliberately have no dependency on node/platform implementation headers.
@@ -114,6 +117,14 @@ static int task_resident(const char *nonce)
         fprintf(stderr, "ztasks: SIGPIPE setup failed\n"); return 2;
     }
     (void)alarm(30);
+    const char *startup = getenv("Z23_RESIDENT_STARTUP_V2");
+    if (startup && strcmp(startup, "1") == 0) {
+        char entry[64];
+        uint64_t ns = (uint64_t)task_entry_time.tv_sec * UINT64_C(1000000000) +
+                      (uint64_t)task_entry_time.tv_nsec;
+        (void)snprintf(entry, sizeof(entry), "ENTRY %llu", (unsigned long long)ns);
+        if (!task_reply(nonce, entry)) return 3;
+    }
     if (!task_reply(nonce, "READY")) return 3;
     struct ta_state state = {0};
     for (unsigned request = 0; request < 64; ++request) {
@@ -128,6 +139,9 @@ static int task_resident(const char *nonce)
 int main(int argc, char **argv)
 {
 #if !defined(_WIN32)
+    if (clock_gettime(CLOCK_MONOTONIC, &task_entry_time) != 0) {
+        fprintf(stderr, "ztasks: startup clock failed\n"); return 2;
+    }
     if (argc == 3 && strcmp(argv[1], "--resident") == 0)
         return task_resident(argv[2]);
 #else

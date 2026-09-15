@@ -244,7 +244,36 @@ bool resident_launch_prepare(struct resident_launch *launch,
 #endif
 }
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+/* Bind the pinned descriptor to the accepted bytes again before execution. */
+bool resident_launch_revalidate(struct resident_launch *launch,
+                                char *error, size_t error_size)
+{
+    struct platform_positioned_file *file =
+        (struct platform_positioned_file *)(void *)launch->pinned_native;
+    struct platform_positioned_file_snapshot before, after;
+    unsigned char digest[32];
+    char hex[65];
+    if (!platform_positioned_file_snapshot(file, &before) ||
+        !platform_positioned_file_snapshot_equal(&before, &launch->pinned_snapshot) ||
+        !resident_sha3_positioned(file, digest) ||
+        !platform_positioned_file_snapshot(file, &after) ||
+        !platform_positioned_file_snapshot_equal(&before, &after)) {
+        errno = ESTALE;
+        resident_fail(error, error_size, "resident launch: pinned bytes changed after prepare");
+        return false;
+    }
+    zcl_hex_encode(digest, sizeof digest, hex);
+    if (strcmp(hex, launch->accepted.image_sha3_hex) != 0) {
+        errno = ESTALE;
+        resident_fail(error, error_size, "resident launch: pinned bytes changed from accepted hash");
+        return false;
+    }
+    return true;
+}
+#endif
+
+#if !defined(_WIN32) && !defined(__APPLE__)
 /* Second, independent mapped-image proof where the platform offers one.
  * Upgrades the receipt's proof name on success; refuses (killing the
  * child) only when a READABLE /proc/<pid>/exe triple disagrees — a
@@ -468,7 +497,7 @@ static bool resident_spawn_linux(struct resident_launch *launch,
                    "fexecve_inode");
     return resident_reproof_mapped(pid, launch, receipt, error, error_size);
 }
-#endif /* !defined(_WIN32) */
+#endif /* !defined(_WIN32) && !defined(__APPLE__) */
 
 bool resident_launch_spawn(struct resident_launch *launch,
                            char *const argv[], char *const envp[],
@@ -722,6 +751,150 @@ bool resident_result_read(struct resident_launch *launch,
             &deadline, false, error, error_size)) return false;
     *header = wire;
     return true;
+#endif
+}
+
+#if !defined(_WIN32)
+static bool resident_startup_expired(const char *phase, char *error, size_t error_size)
+{
+    errno = ETIMEDOUT;
+    resident_fail(error, error_size, "resident launch: %s startup budget expired", phase);
+    return false;
+}
+
+static bool resident_startup_frame(struct resident_launch *launch,
+    const struct resident_result_deadline *deadline, char payload[64],
+    uint32_t *length, char *error, size_t error_size)
+{
+    struct resident_result_header wire;
+    int fd = (int)launch->ipc_native;
+    if (!resident_result_fragment(fd, &wire, sizeof(wire), deadline, true, error, error_size) ||
+        !resident_result_validate(launch, &wire, payload, 63, error, error_size) ||
+        !resident_result_fragment(fd, payload, wire.payload_len, deadline, false, error, error_size) ||
+        !resident_result_live(deadline, error, error_size)) return false;
+    payload[wire.payload_len] = 0;
+    *length = wire.payload_len;
+    return true;
+}
+
+static bool resident_startup_entry(const char *payload, uint32_t length, uint64_t *entry)
+{
+    if (length < 7 || memcmp(payload, "ENTRY ", 6) != 0) return false;
+    uint64_t value = 0;
+    for (uint32_t i = 6; i < length; ++i) {
+        unsigned char digit = (unsigned char)payload[i];
+        if (digit < '0' || digit > '9' || value > ((uint64_t)INT64_MAX - (digit - '0')) / 10u)
+            return false;
+        value = value * 10u + (digit - '0');
+    }
+    *entry = value;
+    return value != 0;
+}
+
+static bool resident_startup_first_byte(struct resident_launch *launch,
+    struct resident_startup *startup, char *error, size_t error_size)
+{
+    struct resident_result_deadline platform = {
+        .end_ns = startup->platform_end_ns, .timeout_ms = startup->platform_ms
+    };
+    int fd = (int)launch->ipc_native;
+    for (;;) {
+        if (!resident_startup_check(startup, error, error_size)) return false;
+        unsigned char byte;
+        ssize_t got = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (got > 0) {
+            if (!resident_result_now(&startup->entry_observed_ns, error, error_size)) return false;
+            return startup->entry_observed_ns < startup->platform_end_ns ||
+                resident_startup_expired("platform-entry", error, error_size);
+        }
+        if (got < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!resident_result_wait(fd, &platform, error, error_size)) return false;
+            continue;
+        }
+        errno = ECONNRESET;
+        resident_fail(error, error_size, "resident launch: child closed before startup entry");
+        return false;
+    }
+}
+#endif
+
+bool resident_startup_begin(struct resident_startup *startup,
+    uint32_t platform_ms, uint32_t protocol_ms, char *error, size_t error_size)
+{
+#if defined(_WIN32)
+    (void)startup; (void)platform_ms; (void)protocol_ms;
+    errno = ENOTSUP;
+    resident_fail(error, error_size, "%s", RESIDENT_WIN_REFUSAL);
+    return false;
+#else
+    if (!startup || !platform_ms || !protocol_ms) {
+        errno = EINVAL;
+        resident_fail(error, error_size, "resident launch: nonzero startup phase budgets required");
+        return false;
+    }
+    memset(startup, 0, sizeof(*startup));
+    if (!resident_result_now(&startup->began_ns, error, error_size)) return false;
+    startup->platform_ms = platform_ms;
+    startup->protocol_ms = protocol_ms;
+    startup->platform_end_ns = startup->began_ns + (uint64_t)platform_ms * UINT64_C(1000000);
+    startup->total_end_ns = startup->platform_end_ns + (uint64_t)protocol_ms * UINT64_C(1000000);
+    return true;
+#endif
+}
+
+bool resident_startup_check(const struct resident_startup *startup,
+    char *error, size_t error_size)
+{
+#if defined(_WIN32)
+    (void)startup;
+    errno = ENOTSUP;
+    resident_fail(error, error_size, "%s", RESIDENT_WIN_REFUSAL);
+    return false;
+#else
+    uint64_t now;
+    if (!startup || !startup->platform_ms || !startup->protocol_ms) {
+        errno = EINVAL;
+        resident_fail(error, error_size, "resident launch: startup budget was not initialized");
+        return false;
+    }
+    if (!resident_result_now(&now, error, error_size)) return false;
+    return now < startup->platform_end_ns || resident_startup_expired("platform-entry", error, error_size);
+#endif
+}
+
+bool resident_startup_read(struct resident_launch *launch,
+    struct resident_startup *startup, char *error, size_t error_size)
+{
+#if defined(_WIN32)
+    (void)launch; (void)startup;
+    errno = ENOTSUP;
+    resident_fail(error, error_size, "%s", RESIDENT_WIN_REFUSAL);
+    return false;
+#else
+    if (!launch || !startup || launch->ipc_native == (uintptr_t)-1 || startup->entry_observed_ns) {
+        errno = EINVAL;
+        resident_fail(error, error_size, "resident launch: unused startup budget and live channel required");
+        return false;
+    }
+    if (!resident_startup_first_byte(launch, startup, error, error_size)) return false;
+    uint64_t end = startup->entry_observed_ns + (uint64_t)startup->protocol_ms * UINT64_C(1000000);
+    struct resident_result_deadline protocol = {
+        .end_ns = end < startup->total_end_ns ? end : startup->total_end_ns,
+        .timeout_ms = startup->protocol_ms
+    };
+    char payload[64];
+    uint32_t length;
+    if (!resident_startup_frame(launch, &protocol, payload, &length, error, error_size)) return false;
+    if (resident_startup_entry(payload, length, &startup->child_entry_ns)) {
+        if (!resident_startup_frame(launch, &protocol, payload, &length, error, error_size)) return false;
+    }
+    if (length != 5 || memcmp(payload, "READY", 5) != 0) {
+        errno = EBADMSG;
+        resident_fail(error, error_size, "resident launch: expected one ENTRY then READY, or legacy READY");
+        return false;
+    }
+    if (!resident_result_now(&startup->ready_ns, error, error_size)) return false;
+    return startup->ready_ns < protocol.end_ns || resident_startup_expired("READY protocol", error, error_size);
 #endif
 }
 

@@ -7,6 +7,9 @@
 #include "platform/resident_launch.h"
 
 #if defined(__APPLE__)
+bool resident_launch_revalidate(struct resident_launch *launch,
+                                char *error, size_t error_size);
+
 /* Suspended posix_spawn of the pinned image's locator path, CodeDirectory
  * proof that the MAPPED process equals the PINNED descriptor, kill-before-
  * first-instruction on mismatch, SIGCONT resume on match. The path is a

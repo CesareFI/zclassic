@@ -159,6 +159,13 @@ struct zcl_result package_resident_prepare(struct package_resident *app,
     app->artifact = *artifact;
     struct resident_launch_accepted snapshot = {0};
     char error[RESIDENT_LAUNCH_ERROR_MAX] = {0};
+    if (!app->startup.platform_ms) {
+        if (!resident_startup_begin(&app->startup, RESIDENT_STARTUP_PLATFORM_MS,
+                RESIDENT_STARTUP_PROTOCOL_MS, error, sizeof(error)))
+            return ZCL_ERR(-1, "resident-startup-budget: %s", error);
+    }
+    if (!resident_startup_check(&app->startup, error, sizeof(error)))
+        return ZCL_ERR(-1, "resident-startup-budget: %s", error);
     if (!pr_snapshot(app, &snapshot) ||
         !resident_launch_prepare(&app->launch, app->snapshot_image, &snapshot, error, sizeof(error))) {
         struct zcl_result cleanup = package_resident_close(app);
@@ -201,7 +208,9 @@ struct zcl_result package_resident_start(struct package_resident *app)
         return ZCL_ERR(-1, "resident-start: prepared unused app required");
     char error[RESIDENT_LAUNCH_ERROR_MAX] = {0};
     char *argv[] = {app->snapshot_image, "--resident", app->launch.nonce, NULL};
-    char *env[] = {NULL};
+    char *env[] = {"Z23_RESIDENT_STARTUP_V2=1", NULL};
+    if (!resident_startup_check(&app->startup, error, sizeof(error)))
+        return ZCL_ERR(-1, "resident-startup-budget: %s", error);
     if (!resident_launch_spawn(&app->launch, argv, env, &app->receipt, error, sizeof(error)))
         return ZCL_ERR(-1, "resident-spawn-refused: %s", error);
     if (!pr_receipt_process_valid(app) || !pr_receipt_image_valid(app)) {

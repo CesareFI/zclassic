@@ -32,6 +32,12 @@
 /* The one descriptor the resident child receives: the IPC socket, dup2'd to
  * this fixed number before exec so an app never has to discover it. */
 #define RESIDENT_LAUNCH_CHILD_FD 3
+#if defined(__APPLE__)
+#define RESIDENT_STARTUP_PLATFORM_MS 4000u
+#else
+#define RESIDENT_STARTUP_PLATFORM_MS 2000u
+#endif
+#define RESIDENT_STARTUP_PROTOCOL_MS 100u
 
 /* What the caller must already hold from acceptance time: the artifact's
  * SHA3-256 content root and the positioned-file identity triple captured
@@ -76,6 +82,22 @@ struct resident_launch {
     uint64_t start_token;
     bool spawned;
 };
+
+/* Parent monotonic authority. The first observed IPC byte starts the tight
+ * protocol phase, including ENTRY/READY framing; child timestamps never
+ * extend a deadline. Legacy children may send READY without ENTRY. */
+struct resident_startup {
+    uint64_t began_ns, platform_end_ns, total_end_ns;
+    uint64_t entry_observed_ns, child_entry_ns, ready_ns;
+    uint32_t platform_ms, protocol_ms;
+};
+
+bool resident_startup_begin(struct resident_startup *startup,
+    uint32_t platform_ms, uint32_t protocol_ms, char *error, size_t error_size);
+bool resident_startup_check(const struct resident_startup *startup,
+    char *error, size_t error_size);
+bool resident_startup_read(struct resident_launch *launch,
+    struct resident_startup *startup, char *error, size_t error_size);
 
 void resident_launch_init(struct resident_launch *launch);
 /* Opens, hashes and identity-checks the image against `accepted`. No fd is

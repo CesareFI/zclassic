@@ -33,6 +33,7 @@ struct package_resident {
     struct package_resident_artifact artifact;
     struct resident_launch launch;
     struct resident_receipt receipt;
+    struct resident_startup startup;
     char snapshot_directory[128];
     char snapshot_image[160];
 };

@@ -20,15 +20,45 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <time.h>
+#include <poll.h>
 
 static int rlf_target = -1, rlf_writer = -1;
 static const unsigned char *rlf_wire;
 static size_t rlf_offset, rlf_sizes[3], rlf_piece;
 static unsigned rlf_eagain;
 static bool rlf_send_failed;
+static bool rlf_virtual_time;
+static uint64_t rlf_now_ns, rlf_advance_ns;
+static unsigned rlf_recv_count, rlf_advance_recv;
+static bool rlf_interrupt_poll;
+
+static int rlf_clock_gettime(clockid_t clock, struct timespec *value)
+{
+    if (!rlf_virtual_time) return clock_gettime(clock, value);
+    value->tv_sec = (time_t)(rlf_now_ns / UINT64_C(1000000000));
+    value->tv_nsec = (long)(rlf_now_ns % UINT64_C(1000000000));
+    return 0;
+}
+
+static int rlf_poll(struct pollfd *fds, nfds_t count, int timeout)
+{
+    if (!rlf_virtual_time) return poll(fds, count, timeout);
+    if (rlf_interrupt_poll) {
+        rlf_interrupt_poll = false;
+        rlf_now_ns += UINT64_C(100000000);
+        errno = EINTR;
+        return -1;
+    }
+    int ready = poll(fds, count, 0);
+    if (ready == 0 && timeout > 0) rlf_now_ns += (uint64_t)timeout * UINT64_C(1000000);
+    return ready;
+}
 
 static ssize_t rlf_recv(int fd, void *data, size_t size, int flags)
 {
+    if (rlf_virtual_time && ++rlf_recv_count == rlf_advance_recv)
+        rlf_now_ns += rlf_advance_ns;
     ssize_t got = recv(fd, data, size, flags);
     int saved = errno;
     if (fd == rlf_target && got < 0 && (saved == EAGAIN || saved == EWOULDBLOCK)) {
@@ -47,6 +77,9 @@ static ssize_t rlf_recv(int fd, void *data, size_t size, int flags)
 /* A second test-only instantiation of actual source, with private symbol names.
  * Normal production TU and its API remain entirely unchanged. */
 #define resident_launch_revalidate rlf_launch_revalidate
+#define resident_startup_begin rlf_startup_begin
+#define resident_startup_check rlf_startup_check
+#define resident_startup_read rlf_startup_read
 #define resident_launch_init rlf_launch_init
 #define resident_launch_prepare rlf_launch_prepare
 #define resident_launch_spawn rlf_launch_spawn
@@ -55,12 +88,19 @@ static ssize_t rlf_recv(int fd, void *data, size_t size, int flags)
 #define resident_launch_close rlf_launch_close
 #include "platform/resident_launch.h"
 #define recv rlf_recv
+#define clock_gettime rlf_clock_gettime
+#define poll rlf_poll
 #ifndef RLF_SOURCE
 #error "RLF_SOURCE must identify the actual shared resident_launch.c"
 #endif
 #include RLF_SOURCE
 #undef recv
+#undef clock_gettime
+#undef poll
 #undef resident_launch_revalidate
+#undef resident_startup_begin
+#undef resident_startup_check
+#undef resident_startup_read
 #undef resident_launch_init
 #undef resident_launch_prepare
 #undef resident_launch_spawn
@@ -167,10 +207,127 @@ static int rlf_boundaries(void)
     return failures;
 }
 
+static size_t rlf_startup_wire(unsigned char *bytes, const char *text, bool stale)
+{
+    struct resident_result_header header = {0};
+    memcpy(header.magic, "z23-res-run-v1", sizeof("z23-res-run-v1"));
+    memset(header.nonce, stale ? 'b' : 'a', 64);
+    header.payload_len = (uint32_t)strlen(text);
+    memcpy(bytes, &header, sizeof(header));
+    memcpy(bytes + sizeof(header), text, header.payload_len);
+    return sizeof(header) + header.payload_len;
+}
+
+struct rlf_startup_case {
+    const char *name, *first, *second;
+    uint32_t elapsed_ms, advance_ms;
+    unsigned advance_recv;
+    bool split, stale, pass;
+    int error_number;
+    unsigned flags; /* 1: silent; 2: EOF; 4: stale second; 8: withhold; 16: EINTR */
+};
+
+static bool rlf_startup_setup(const struct rlf_startup_case *test,
+                              const int peer[2], unsigned char bytes[320])
+{
+    size_t length = rlf_startup_wire(bytes, test->first, test->stale);
+    if (test->second) length += rlf_startup_wire(bytes + length, test->second, (test->flags & 4u) != 0);
+    size_t initial = (test->flags & 1u) ? 0 : (test->flags & 8u) ? 1 : test->split ? 3 : length;
+    bool setup = send(peer[1], bytes, initial, MSG_NOSIGNAL) == (ssize_t)initial;
+    if (test->flags & 2u) setup = setup && shutdown(peer[1], SHUT_WR) == 0;
+    rlf_target = peer[0]; rlf_writer = peer[1]; rlf_wire = bytes; rlf_offset = initial;
+    rlf_piece = 0; rlf_eagain = 0; rlf_send_failed = false;
+    memset(rlf_sizes, 0, sizeof(rlf_sizes));
+    if (test->split) {
+        rlf_sizes[0] = sizeof(struct resident_result_header) - initial;
+        rlf_sizes[1] = length - sizeof(struct resident_result_header);
+    }
+    rlf_virtual_time = true; rlf_now_ns = UINT64_C(10000000000);
+    rlf_interrupt_poll = (test->flags & 16u) != 0;
+    rlf_recv_count = 0; rlf_advance_recv = test->advance_recv;
+    rlf_advance_ns = (uint64_t)test->advance_ms * UINT64_C(1000000);
+    return setup;
+}
+
+static bool rlf_startup_assert(const struct rlf_startup_case *test,
+    struct resident_launch *launch, struct resident_startup *startup,
+    bool accepted, int observed_errno, uint64_t total)
+{
+    if (accepted != test->pass || startup->total_end_ns != total) return false;
+    if (!accepted && observed_errno != test->error_number) return false;
+    if (accepted && (startup->ready_ns >= total ||
+        startup->ready_ns - startup->entry_observed_ns >= UINT64_C(100000000) ||
+        startup->child_entry_ns != (test->second ? 123u : 0u))) return false;
+    /* Success and partial failure both consume the observed entry boundary. */
+    if (startup->entry_observed_ns) {
+        char error[RESIDENT_LAUNCH_ERROR_MAX] = {0};
+        return !rlf_startup_read(launch, startup, error, sizeof(error)) && errno == EINVAL;
+    }
+    return true;
+}
+
+static int rlf_startup_case_run(const struct rlf_startup_case *test)
+{
+    int peer[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, peer) != 0) { perror("startup socketpair"); return 1; }
+    unsigned char bytes[320];
+    bool setup = rlf_startup_setup(test, peer, bytes);
+    struct resident_launch launch;
+    rlf_launch_init(&launch);
+    launch.ipc_native = (uintptr_t)peer[0];
+    memset(launch.nonce, 'a', 64); launch.nonce[64] = 0;
+    struct resident_startup startup = {0};
+    char error[RESIDENT_LAUNCH_ERROR_MAX] = {0};
+    setup = setup && rlf_startup_begin(&startup, 4000, 100, error, sizeof(error));
+    uint64_t total = startup.total_end_ns;
+    rlf_now_ns += (uint64_t)test->elapsed_ms * UINT64_C(1000000);
+    bool accepted = setup && rlf_startup_read(&launch, &startup, error, sizeof(error));
+    int observed_errno = errno;
+    bool passed = setup && !rlf_send_failed &&
+        rlf_startup_assert(test, &launch, &startup, accepted, observed_errno, total);
+    printf("resident_startup %s: %s accepted=%d errno=%d total_unchanged=%d\n",
+        test->name, passed ? "GREEN" : "RED", accepted, observed_errno, startup.total_end_ns == total);
+    rlf_virtual_time = false; rlf_target = -1; rlf_writer = -1;
+    bool closed_read = close(peer[0]) == 0;
+    bool closed_write = close(peer[1]) == 0;
+    return passed && closed_read && closed_write ? 0 : 1;
+}
+
+static int rlf_startup_cases(void)
+{
+    const struct rlf_startup_case tests[] = {
+        {"legacy_ready", "READY", NULL, 0, 0, 0, false, false, true, 0, 0},
+        {"entry_ready", "ENTRY 123", "READY", 0, 0, 0, false, false, true, 0, 0},
+        {"fragmented_entry_ready", "ENTRY 123", "READY", 0, 0, 0, true, false, true, 0, 0},
+        {"loader_tail_3126ms", "ENTRY 123", "READY", 3126, 0, 0, false, false, true, 0, 0},
+        {"prepare_exhausted", "READY", NULL, 4000, 0, 0, false, false, false, ETIMEDOUT, 0},
+        {"late_buffered_entry", "READY", NULL, 3999, 2, 1, false, false, false, ETIMEDOUT, 0},
+        {"legacy_protocol_late", "READY", NULL, 0, 101, 2, false, false, false, ETIMEDOUT, 0},
+        {"ready_late_after_entry", "ENTRY 123", "READY", 0, 101, 4, false, false, false, ETIMEDOUT, 0},
+        {"fragment_trickle", "ENTRY 123", "READY", 0, 101, 3, true, false, false, ETIMEDOUT, 0},
+        {"total_boundary", "ENTRY 123", "READY", 3999, 102, 4, false, false, false, ETIMEDOUT, 0},
+        {"duplicate_entry", "ENTRY 123", "ENTRY 123", 0, 0, 0, false, false, false, EBADMSG, 0},
+        {"malformed_entry", "ENTRY 12x", "READY", 0, 0, 0, false, false, false, EBADMSG, 0},
+        {"overflow_entry", "ENTRY 18446744073709551615", "READY", 0, 0, 0, false, false, false, EBADMSG, 0},
+        {"stale_entry", "ENTRY 123", "READY", 0, 0, 0, false, true, false, ESTALE, 0},
+        {"silent_platform_timeout", "READY", NULL, 0, 0, 0, false, false, false, ETIMEDOUT, 1},
+        {"EOF_before_entry", "READY", NULL, 0, 0, 0, false, false, false, ECONNRESET, 3},
+        {"EOF_after_entry", "ENTRY 123", NULL, 0, 0, 0, false, false, false, ECONNRESET, 2},
+        {"stale_ready_after_entry", "ENTRY 123", "READY", 0, 0, 0, false, false, false, ESTALE, 4},
+        {"exact_100ms_after_final_recv", "READY", NULL, 0, 100, 3, false, false, false, ETIMEDOUT, 0},
+        {"partial_reentry_refused", "READY", NULL, 0, 0, 0, false, false, false, ETIMEDOUT, 8},
+        {"EINTR_does_not_renew", "ENTRY 123", "READY", 0, 0, 0, true, false, false, ETIMEDOUT, 16}
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i)
+        failures += rlf_startup_case_run(&tests[i]);
+    return failures;
+}
+
 int resident_result_fragments_run(void)
 {
     int failures = rlf_case(false) + rlf_case(true);
-    return failures + rlf_boundaries();
+    return failures + rlf_boundaries() + rlf_startup_cases();
 }
 #ifdef RLF_STANDALONE
 int main(void) { return resident_result_fragments_run(); }

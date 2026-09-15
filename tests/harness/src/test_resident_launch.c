@@ -223,20 +223,31 @@ static int rl_codec_checks(const char *fixture,
 static int rl_cycle_checks(void)
 {
     int failures = 0;
+#if defined(__APPLE__)
+    const char *sleeper_path = "build/fixtures/rlc_child_v1";
+#else
+    const char *sleeper_path = "/bin/sleep";
+#endif
     char error[RESIDENT_LAUNCH_ERROR_MAX];
     struct resident_launch_accepted sleeper;
     RL_CHECK("capture sleeper acceptance record",
-             rl_accept_of("/bin/sleep", &sleeper));
+             rl_accept_of(sleeper_path, &sleeper));
     int fds_before = rl_open_fd_count();
     struct resident_launch serving;
     resident_launch_init(&serving);
     error[0] = '\0';
     RL_CHECK("prepare the serving launch",
-             resident_launch_prepare(&serving, "/bin/sleep", &sleeper, error,
+             resident_launch_prepare(&serving, sleeper_path, &sleeper, error,
                                      sizeof(error)));
     struct resident_receipt receipt;
     memset(&receipt, 0, sizeof(receipt));
+#if defined(__APPLE__)
+    /* The native thin fixture is within the Darwin launch contract;
+     * the system sleep executable may be a universal Mach-O. */
+    char *const argv[] = {"rlc_child_v1", "--resident", serving.nonce, "park", NULL};
+#else
     char *const argv[] = {"sleep", "30", NULL};
+#endif
     char *const envp[] = {NULL};
     bool spawned_serving = resident_launch_spawn(
         &serving, argv, envp, &receipt, error, sizeof(error));
@@ -269,7 +280,7 @@ static int rl_cycle_checks(void)
     resident_launch_init(&candidate);
     error[0] = '\0';
     RL_CHECK("failed candidate is refused before any process exists",
-             !resident_launch_prepare(&candidate, "/bin/sleep",
+             !resident_launch_prepare(&candidate, sleeper_path,
                                       &bad_candidate, error, sizeof(error)) &&
              errno == ESTALE);
     resident_launch_close(&candidate);
@@ -357,8 +368,13 @@ static int rl_swap_refusal_checks(const char *dir)
     char image[512];
     (void)snprintf(image, sizeof(image), "%s/padded-true", dir);
     size_t plain_size = 0;
+#if defined(__APPLE__)
+    const char *image_source = "build/fixtures/rlc_child_v1";
+#else
+    const char *image_source = "/bin/true";
+#endif
     RL_CHECK("stage a padded executable image",
-             rl_copy_padded("/bin/true", image, 4096, &plain_size));
+             rl_copy_padded(image_source, image, 4096, &plain_size));
     struct resident_launch_accepted accepted;
     RL_CHECK("capture the padded image acceptance record",
              rl_accept_of(image, &accepted));

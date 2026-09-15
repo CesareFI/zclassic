@@ -55,6 +55,7 @@ struct npr_plan {
 };
 struct npr_observation {
     struct resident_receipt receipt;
+    struct resident_startup startup;
     char output[4097];
     uint64_t began, verified, observed, activated;
 };
@@ -299,8 +300,7 @@ static struct zcl_result npr_exchange(struct package_resident *app,
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0)
         return ZCL_ERR(-1, "resident IPC nonblocking setup failed");
-    if (!resident_result_read(&app->launch, &header, output, 4096, 2000, error, sizeof(error)) ||
-        header.payload_len != 5 || memcmp(output, "READY", 5) != 0)
+    if (!resident_startup_read(&app->launch, &app->startup, error, sizeof(error)))
         return ZCL_ERR(-1, "resident READY refused: %s", error);
     struct { struct resident_result_header header; char text[1024]; } frame = {0};
     memcpy(frame.header.magic, "z23-res-run-v1", sizeof("z23-res-run-v1"));
@@ -342,13 +342,17 @@ static struct zcl_result npr_run(struct npr_plan *plan, struct npr_observation *
     struct package_resident *app = zcl_calloc(1, sizeof(*app), "package.resident");
     if (!app) return ZCL_ERR(-1, "resident app allocation failed");
     package_resident_init(app);
-    struct zcl_result result = npr_artifact(plan, app);
+    char error[RESIDENT_LAUNCH_ERROR_MAX] = {0};
+    struct zcl_result result = resident_startup_begin(&app->startup,
+        RESIDENT_STARTUP_PLATFORM_MS, RESIDENT_STARTUP_PROTOCOL_MS, error, sizeof(error))
+        ? npr_artifact(plan, app) : ZCL_ERR(-1, "resident-startup-budget: %s", error);
     seen->verified = npr_now();
     if (result.ok) result = package_resident_prepare(app, &app->artifact);
     if (result.ok) result = package_resident_start(app);
     if (result.ok) result = npr_exchange(app, plan->text, seen->output);
     seen->observed = npr_now();
     seen->receipt = app->receipt;
+    seen->startup = app->startup;
     struct zcl_result closed = package_resident_close(app);
     if (!closed.ok) result = closed;
     free(app);
@@ -399,7 +403,14 @@ static bool npr_render_named(struct json_value *data, const struct npr_plan *pla
 
 static bool npr_render_times(struct json_value *data, const struct npr_observation *seen)
 {
-    return json_push_kv_int(data, "verification_us", (int64_t)(seen->verified - seen->began)) &&
+    return json_push_kv_int(data, "startup_began_ns", (int64_t)seen->startup.began_ns) &&
+        json_push_kv_int(data, "startup_total_deadline_ns", (int64_t)seen->startup.total_end_ns) &&
+        json_push_kv_int(data, "entry_observed_ns", (int64_t)seen->startup.entry_observed_ns) &&
+        json_push_kv_int(data, "child_entry_ns", (int64_t)seen->startup.child_entry_ns) &&
+        json_push_kv_int(data, "ready_ns", (int64_t)seen->startup.ready_ns) &&
+        json_push_kv_int(data, "platform_launch_budget_ms", seen->startup.platform_ms) &&
+        json_push_kv_int(data, "ready_protocol_budget_ms", seen->startup.protocol_ms) &&
+        json_push_kv_int(data, "verification_us", (int64_t)(seen->verified - seen->began)) &&
         json_push_kv_int(data, "first_result_us", (int64_t)(seen->observed - seen->began)) &&
         json_push_kv_int(data, "activation_us", (int64_t)(seen->activated - seen->began)) &&
         json_push_kv_int(data, "completed_us", (int64_t)(npr_now() - seen->began)) &&

@@ -244,6 +244,7 @@ bool resident_spawn_darwin(struct resident_launch *launch,
         return false;
     }
     struct stat executable_stat;
+    if (!resident_launch_revalidate(launch, error, error_size)) return false;
     if (fstat(exec_fd, &executable_stat) != 0) {
         rl_mac_fail(error, error_size, "pinned descriptor fstat failed");
         return false;
@@ -260,12 +261,14 @@ bool resident_spawn_darwin(struct resident_launch *launch,
     signature.fs_file_start = 0;
     signature.fs_blob_start = (void *)(uintptr_t)signature_offset;
     signature.fs_blob_size = signature_size;
+    signature.fs_fsignatures_size = sizeof(signature);
     if (fcntl(exec_fd, F_ADDFILESIGS_INFO, &signature) != 0) {
         rl_mac_fail(error, error_size,
                     "descriptor CodeDirectory query failed");
         return false;
     }
     char locator[PATH_MAX];
+    if (!resident_launch_revalidate(launch, error, error_size)) return false;
     if (fcntl(exec_fd, F_GETPATH, locator) != 0) {
         rl_mac_fail(error, error_size, "locator path query failed");
         return false;
@@ -284,7 +287,13 @@ bool resident_spawn_darwin(struct resident_launch *launch,
         return false;
     }
     close(ipc[1]);
-    if (!rl_mac_attest(pid, signature.fs_cdhash, error, error_size)) {
+    if (!resident_launch_revalidate(launch, error, error_size)) {
+        rl_mac_reap_suspended(pid);
+        close(ipc[0]);
+        return false;
+    }
+    if (!rl_mac_attest(pid, (const unsigned char *)signature.fs_cdhash,
+                       error, error_size)) {
         close(ipc[0]);
         return false;
     }
