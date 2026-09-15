@@ -136,6 +136,17 @@ QB_COLUMN(fleet_board_posts, received_at)
 QB_COLUMN(fleet_board_posts, scope)
 QB_COLUMN(fleet_board_posts, room)
 
+/* Task contents belong to the user, independently of the serving program. */
+QB_TABLE(task_documents)
+QB_COLUMN(task_documents, app)
+QB_COLUMN(task_documents, payload)
+QB_COLUMN(task_documents, undo)
+#ifdef QB_SCHEMA_STATEMENT
+QB_SCHEMA_STATEMENT(task_documents_create,
+    "CREATE TABLE IF NOT EXISTS task_documents("
+    "app TEXT PRIMARY KEY NOT NULL,payload BLOB NOT NULL,undo BLOB NOT NULL)")
+#endif
+
 /* resident_serving — isolated Commons acceptance projection. */
 QB_TABLE(resident_serving)
 QB_COLUMN(resident_serving, id)

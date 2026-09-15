@@ -424,6 +424,7 @@ ZCL_MODULE_CAPABILITY("contexts/commons/services/src/package_lifecycle_reproduce
 ZCL_MODULE_CAPABILITY("contexts/commons/services/src/package_lifecycle_store.c", CAP_FS_WRITE|CAP_FS_READ, "")
 ZCL_MODULE_CAPABILITY("contexts/commons/services/src/package_local.c", CAP_FS_WRITE, "verifies signed source into a private nonhosting store")
 ZCL_MODULE_CAPABILITY("contexts/commons/models/src/package_resident.c", CAP_FS_READ|CAP_FS_WRITE|CAP_CLOCK, "persists exact serving generation and prior acceptance in an isolated SQLite store; the bounded SQLite busy wait is the clock reach")
+ZCL_MODULE_CAPABILITY("contexts/commons/models/src/task_document.c", CAP_FS_READ|CAP_FS_WRITE, "commits canonical user task contents and undo in the isolated application store")
 ZCL_MODULE_CAPABILITY("contexts/commons/services/src/package_resident.c", CAP_FS_WRITE, "reads accepted artifact records through the local package store")
 ZCL_MODULE_CAPABILITY("contexts/commons/services/src/package_resident_launch.c", CAP_FS_READ|CAP_FS_WRITE, "materializes and owns the exact private launch snapshot")
 ZCL_MODULE_CAPABILITY("tools/command/native_package_resident_command.c", CAP_FS_WRITE|CAP_NETWORK, "owns local resident invocation and exchanges bounded frames over inherited IPC")
@@ -1275,3 +1276,5 @@ ZCL_MODULE_CAPABILITY("tools/mind/mind_resident.c", CAP_FS_READ|CAP_FS_WRITE, ""
 ZCL_MODULE_CAPABILITY("tools/mind/mind_state.c", CAP_FS_READ|CAP_FS_WRITE, "")
 ZCL_MODULE_CAPABILITY("tools/package_verify.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PROCESS|CAP_CLOCK|CAP_WALLET|CAP_RANDOM, "the standalone ZCODE package build/attestation verifier: forks a confined child to reproduce a build, and signs the resulting attestation with secp256k1_ecdsa_sign over the verifier's own key material")
 ZCL_MODULE_CAPABILITY("tools/rebuild_recent.c", CAP_PRIVILEGE, "the io_uring-backed recent-object rebuild tool: hand-rolls io_uring_setup(2)/io_uring_enter(2) via syscall() because glibc does not wrap them")
+
+ZCL_MODULE_CAPABILITY("contexts/commons/packages/ztasks/src/ztasks.c", CAP_FS_WRITE, "reports rejected task state to the caller diagnostic stream")

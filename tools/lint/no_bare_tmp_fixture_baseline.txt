@@ -120,6 +120,7 @@ tests/harness/src/test_syncdiag_agent_ops_build_and_liveness.c 1
 tests/harness/src/test_syncdiag_agent_status.c 1
 tests/harness/src/test_syncdiag_network_bootstrap_and_reachability.c 2
 tests/harness/src/test_syncdiag_operator.c 2
+tests/harness/src/test_task_document.c 1
 tests/harness/src/test_test_png_writer.c 7
 tests/harness/src/test_tip_agreement_watch.c 3
 tests/harness/src/test_tor.c 2

@@ -74,15 +74,15 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 883 |
+| Registry entries (branches + leaves) | 884 |
 | Top-level roots | 14 |
 | Branches | 198 |
-| Leaves (dispatchable command paths) | 685 |
-| … `ready` (live handler in this build) | 608 |
+| Leaves (dispatchable command paths) | 686 |
+| … `ready` (live handler in this build) | 609 |
 | … `compat` (metadata only, names a fallback) | 47 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 46 |
-| Leaves with `effect=mutate` | 248 |
+| Leaves with `effect=mutate` | 249 |
 | Leaves with `effect=destructive` | 6 |
 | Leaves requiring **owner** authority | 129 |
 
@@ -92,7 +92,7 @@ Per source file:
 |---|---|---|---|
 | `engine/composition/commands/root.def` | 10 | 5 | 5 |
 | `engine/composition/commands/core.def` | 122 | 29 | 93 |
-| `engine/composition/commands/apps.def` | 17 | 3 | 14 |
+| `engine/composition/commands/apps.def` | 18 | 3 | 15 |
 | `engine/composition/commands/app_features.def` | 75 | 20 | 55 |
 | `engine/composition/commands/store.def` | 19 | 0 | 19 |
 | `engine/composition/commands/ops.def` | 59 | 11 | 48 |
@@ -443,6 +443,7 @@ represented by its children's sections.
 | `app list` | ready | read / read / public · fast/low | none | `zcl.app_index.v1` | `z23 app list` | List installed App manifests |
 | `app inspect` | ready | read / read / public · fast/low | **`app_id`** | `zcl.app_manifest_summary.v1` | `z23 app inspect social` | Inspect one App manifest and bindings |
 | `app protocols` (aliases: `appprotocols`) | compat → `z23 appprotocols` | read / read / public · fast/low | none | `zcl.app_protocols.v1` | `z23 app protocols` | List App protocol contracts — *native adapter is not executable yet; use the compatibility target* |
+| `app tasks` | ready | mutate / app-write / operator · background/low | `datadir`, `app`, `action`, `expected_revision`, `task_id`, `title` | `zcl.task_document.v1` | `z23 app tasks --input=-` | Save and reopen your local tasks |
 
 #### `app.transaction-types` — Discover every semantic ZCL transaction shape and its safe workflow
 

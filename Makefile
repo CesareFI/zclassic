@@ -733,6 +733,8 @@ zcl_filter_ephemeral_sources = $(filter-out $(call zcl_ephemeral_sources,$(1)),$
 APP_SRCS = $(call zcl_filter_ephemeral_sources,\
 	$(foreach a,$(APP_AUTHORITIES),\
 		$(foreach d,$(APP_DIRS),$(wildcard $(a)/$(d)/src/*.c))))
+# The task host and resident artifact use the same canonical state codec.
+APP_SRCS += contexts/commons/packages/ztasks/src/ztasks.c
 
 # The one-writer chain-state authority is physically isolated.  Conditions,
 # jobs, and services may support it, but every reducer-owned translation unit

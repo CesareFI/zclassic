@@ -1,6 +1,6 @@
 /* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
 /* Purpose: bounded reusable task state and canonical schema, without host authority. */
-#include "ztasks/ztasks.h"
+#include "../include/ztasks/ztasks.h"
 #include <stdio.h>
 #include <string.h>
 static bool state_refuse(const char *why) { fprintf(stderr,"ztasks: %s\n",why); return false; }

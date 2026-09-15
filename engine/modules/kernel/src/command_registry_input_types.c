@@ -274,13 +274,29 @@ static bool cr_match_presentation(const char *path, const char *key,
     return false;
 }
 
+static bool cr_match_tasks(const char *path, const char *key,
+                            const struct json_value *value, bool *type_ok)
+{
+    if (strcmp(path, "app.tasks") != 0) return false;
+    if (strcmp(key, "expected_revision") == 0) {
+        *type_ok = cr_int_range(value, 0, INT64_MAX);
+        return true;
+    }
+    if (strcmp(key, "task_id") == 0) {
+        *type_ok = cr_int_range(value, 1, INT64_MAX);
+        return true;
+    }
+    return false;
+}
+
 static bool cr_match_path_special(const struct zcl_command_spec *spec,
                                   const char *key,
                                   const struct json_value *value,
                                   bool *type_ok)
 {
     const char *path = spec && spec->path ? spec->path : "";
-    if (cr_match_presentation(path, key, value, type_ok))
+    if (cr_match_presentation(path, key, value, type_ok) ||
+        cr_match_tasks(path, key, value, type_ok))
         return true;
     if (strcmp(key, "maximum_bytes") == 0) {
         int64_t maximum = strcmp(path, "zcode.package.fetch") == 0
