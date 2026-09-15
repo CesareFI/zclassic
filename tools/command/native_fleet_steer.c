@@ -41,9 +41,12 @@
  * owner. Bearer ids are 128-bit CSPRNG hex via zcl_random_secret_bytes.
  *
  * IDEMPOTENCY. send items carry a caller-chosen idempotency_key. The first
- * accept appends the mail row and records key->seq in <state>/steer/sent.jsonl;
- * a retry with the same key returns the recorded accept with duplicate:true
- * and appends nothing. Retries reconcile; they never duplicate work.
+ * accept appends the mail row and records key->seq plus a payload digest in
+ * <state>/steer/sent.jsonl; a retry with the same key AND the same payload
+ * returns the recorded accept with duplicate:true and appends nothing.
+ * Retries reconcile; they never duplicate work. A different payload under an
+ * already-recorded key is refused per-item as IDEMPOTENCY_CONFLICT: the key
+ * names one exact delivery, never two.
  *
  * STATES. queued (send accepted into the outbox), delivered (visible in
  * pull), acknowledged (seq at or below the receiver's mail ack cursor),
@@ -449,7 +452,37 @@ static const char *fmc_grant_check(const char *grant, const char *scope)
 
 /* ── idempotency store ─────────────────────────────────────────────────── */
 
-static bool fmc_sent_find(const char *path, const char *key, long long *seq)
+/* Payload digest: FNV-1a/64 over to, body, ref, from with NUL separators.
+ * An equality check for reconcile, not a security boundary (the grant is
+ * the boundary); fixed-size hex keeps sent.jsonl lines flat and greppable. */
+static void fmc_payload_sum(const char *to, const char *body,
+                            const char *ref, const char *from,
+                            char out[17])
+{
+    uint64_t h = 1469598103934665603ULL;
+    const char *parts[4];
+    size_t i;
+    parts[0] = to ? to : "";
+    parts[1] = body ? body : "";
+    parts[2] = ref ? ref : "";
+    parts[3] = from ? from : "";
+    for (i = 0; i < 4; i++) {
+        const unsigned char *p = (const unsigned char *)parts[i];
+        while (*p) {
+            h ^= (uint64_t)*p++;
+            h *= 1099511628211ULL;
+        }
+        h ^= 0ULL;
+        h *= 1099511628211ULL;
+    }
+    snprintf(out, 17, "%016llx", (unsigned long long)h);
+}
+
+/* Find the recorded accept for key. On hit, seq takes the delivery identity
+ * and sum takes the recorded payload digest ("" when the row predates
+ * digests, which the caller treats as unverifiable, never as a match). */
+static bool fmc_sent_find(const char *path, const char *key, long long *seq,
+                          char sum[17])
 {
     FILE *f;
     char line[FMC_LINE_CAP];
@@ -457,7 +490,7 @@ static bool fmc_sent_find(const char *path, const char *key, long long *seq)
     bool found = false;
     const char *p;
     char *end = NULL;
-    if (!path || !key || !seq)
+    if (!path || !key || !seq || !sum)
         return false;
     f = fopen(path, "rb");
     if (!f)
@@ -475,6 +508,13 @@ static bool fmc_sent_find(const char *path, const char *key, long long *seq)
         s = strtoll(p + 6, &end, 10);
         if (end == p + 6 || s < 0)
             continue;
+        p = strstr(line, "\"sum\":\"");
+        if (p && strlen(p + 7) >= 16) {
+            memcpy(sum, p + 7, 16);
+            sum[16] = '\0';
+        } else {
+            sum[0] = '\0';
+        }
         *seq = s;
         found = true;
     }
@@ -1467,23 +1507,26 @@ static void fmc_send_item_refused(struct json_value *items, size_t index,
     json_free(&item);
 }
 
-/* One accepted item result, after recording key->seq for reconcile. */
+/* One accepted item result, after recording key->seq plus the payload
+ * digest for reconcile. */
 static void fmc_send_item_accept(struct json_value *items, size_t index,
                                  const struct fmc_item_fields *f,
                                  long long seq, bool duplicate,
-                                 const char *sent_path)
+                                 const char *sent_path, const char *from)
 {
     struct json_value item;
     char sent_line[4096];
+    char sum[17];
     int n;
     json_init(&item);
     json_set_object(&item);
     (void)json_push_kv_int(&item, "index", (long long)index);
     (void)json_push_kv_str(&item, "to", f->to);
+    fmc_payload_sum(f->to, f->body, f->ref, from, sum);
     n = snprintf(sent_line, sizeof(sent_line),
                  "{\"key\":\"%s\",\"to\":\"%s\",\"seq\":%lld,\"state\":"
-                 "\"queued\"}\n",
-                 f->key, f->to, seq);
+                 "\"queued\",\"sum\":\"%s\"}\n",
+                 f->key, f->to, seq, sum);
     if (!duplicate && (n <= 0 || (size_t)n >= sizeof(sent_line) ||
                        !fmc_append_line(sent_path, sent_line, (size_t)n))) {
         /* The mail row exists but the receipt did not persist: report the
@@ -1520,10 +1563,26 @@ static void fmc_send_item(const struct zcl_command_request *req,
         fmc_send_item_refused(items, index, to, "BAD_INPUT");
         return;
     }
-    /* Reconcile: same key, same accept, no second row. */
-    if (fmc_sent_find(sent_path, f.key, &seq)) {
-        fmc_send_item_accept(items, index, &f, seq, true, sent_path);
-        return;
+    /* Reconcile: same key AND same payload returns the recorded accept
+     * with no second row. A different payload under a recorded key is
+     * refused: the key names one exact delivery. A row without a digest
+     * predates digests and is unverifiable, never a match. */
+    {
+        char recorded[17], presented[17];
+        if (fmc_sent_find(sent_path, f.key, &seq, recorded)) {
+            fmc_payload_sum(f.to, f.body, f.ref, from, presented);
+            if (recorded[0] && strcmp(recorded, presented) == 0) {
+                fmc_send_item_accept(items, index, &f, seq, true, sent_path,
+                                     from);
+                return;
+            }
+            LOG_ERROR(FMC_LOG,
+                      "send: payload conflict under key (to=%s seq=%lld)",
+                      f.to, seq);
+            fmc_send_item_refused(items, index, f.to,
+                                  "IDEMPOTENCY_CONFLICT");
+            return;
+        }
     }
     why[0] = '\0';
     seq = fmc_post_directive(req, f.to, f.body, f.ref, from, why,
@@ -1533,7 +1592,7 @@ static void fmc_send_item(const struct zcl_command_request *req,
                               why[0] ? why : "POST_FAILED");
         return;
     }
-    fmc_send_item_accept(items, index, &f, seq, false, sent_path);
+    fmc_send_item_accept(items, index, &f, seq, false, sent_path, from);
 }
 
 static void fmc_do_send(const struct zcl_command_request *req,
@@ -1590,6 +1649,29 @@ static void fmc_do_send(const struct zcl_command_request *req,
  * One bounded object by exact reference, never a log: a mail row with
  * ref==ref, a queue row/outcome with name==ref, or one board post by id. */
 
+/* Receiver acknowledgement for one mail row: the row's seq against the
+ * receiver's mail ack cursor via fmc_ack_cursor (the same read the brief's
+ * lifecycle uses). acknowledged when the cursor covers the row, delivered
+ * when the row is visible but the cursor does not cover it. */
+static void fmc_evidence_mail_ack(struct zcl_command_reply *reply,
+                                  const struct json_value *r)
+{
+    const struct json_value *v;
+    const char *to;
+    long long seq = -1, cursor;
+    v = json_get(r, "seq");
+    if (v && v->type == JSON_INT)
+        seq = (long long)json_get_int(v);
+    v = json_get(r, "to");
+    to = (v && v->type == JSON_STR) ? json_get_str(v) : "";
+    cursor = fmc_ack_cursor(to);
+    (void)json_push_kv_int(&reply->data, "ack_cursor", cursor);
+    (void)json_push_kv_str(&reply->data, "state",
+                           (cursor >= 0 && seq >= 0 && cursor >= seq)
+                               ? "acknowledged"
+                               : "delivered");
+}
+
 /* Copy one whole JSON value onto the reply under "object". The sources are
  * already bounded by their own leaves (mail bodies <= 4KiB, one post). */
 static void fmc_emit_object(struct zcl_command_reply *reply,
@@ -1642,6 +1724,7 @@ static void fmc_evidence_mail(const struct zcl_command_request *req,
             rref = (v && v->type == JSON_STR) ? json_get_str(v) : "";
             if (rref && strcmp(rref, ref) == 0) {
                 fmc_emit_object(reply, "mail", r);
+                fmc_evidence_mail_ack(reply, r);
                 fmc_sub_end(&sub);
                 return;
             }

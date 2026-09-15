@@ -7661,6 +7661,31 @@ $(BIN_DIR)/fleet-board-bridge: tools/fleet_board_bridge.c \
 	    -Iplatform/modules/json/include -Iplatform/modules/platform/include \
 	    -Iplatform/modules/util/include -o $@ $(filter %.c,$^) -lm
 
+# Loopback Streamable-HTTP front for the fleet steering verbs. G1 binds
+# 127.0.0.1 only and carries no credentials; TLS termination and OAuth live
+# in front of it on the host path. Each tool call fork/execs the TESTED node
+# binary with --input JSON, so the gateway adds no store and mints nothing.
+FLEET_GATEWAY_BIN = $(BIN_DIR)/z23-fleet-gateway
+.PHONY: fleet-gateway
+fleet-gateway: $(FLEET_GATEWAY_BIN)
+$(FLEET_GATEWAY_BIN): tools/fleet_gateway.c \
+    platform/modules/json/src/json.c platform/modules/base/src/safe_alloc.c \
+    platform/modules/base/src/log_level.c \
+    platform/modules/json/include/json/json.h \
+    platform/modules/base/include/base/safe_alloc.h \
+    platform/modules/base/include/base/log_level.h \
+    platform/modules/base/include/base/format_attribute.h \
+    platform/modules/base/include/base/utc_tm.h \
+    platform/modules/base/include/base/stdio_lock.h \
+    platform/modules/base/include/base/log_macros.h \
+    platform/modules/util/include/util/log_macros.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic \
+	    -D_POSIX_C_SOURCE=200809L $(ZCL_PLATFORM_CPPFLAGS) \
+	    -Iplatform/modules/base/include \
+	    -Iplatform/modules/json/include \
+	    -Iplatform/modules/util/include -o $@ $(filter %.c,$^) -lm
+
 # Strict line-protocol adapter over the maintained retrieval evaluator. The
 # historical runner supplies two sealed rank lists per reviewed task; this
 # helper calls zcl_retrieval_evaluate once per ranker so metric math has one
