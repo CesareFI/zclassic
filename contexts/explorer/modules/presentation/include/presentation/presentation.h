@@ -245,6 +245,23 @@ bool zcl_present_window_run_pages_form_actions_v1(
     struct zcl_present_window_event_v1 *event,
     char *error, size_t error_cap);
 
+/* Trusted local owner hook, never part of a serialized visual document. It
+ * must return promptly: observe drafts, enqueue work and consume completions;
+ * do not perform database writes here. The owner may replace the borrowed
+ * page's pixels while retaining the validated geometry and form layout.
+ * Called before edited text is blitted and while the window is idle. */
+struct zcl_present_window_live_form_v1 {
+    void *context;
+    void (*update)(void *context,
+        const struct zcl_present_window_event_v1 *event,
+        bool close_requested, bool *redraw, bool *allow_close);
+};
+bool zcl_present_window_run_live_form_v1(
+    const struct zcl_present_window_pages_v1 *pages,
+    struct zcl_present_window_form_v1 *form,
+    const struct zcl_present_window_live_form_v1 *live,
+    char *error, size_t error_cap);
+
 /* Direct bounded 2D selection over the same safe Cancel/Submit action row.
  * Mouse clicks inside the fixed canvas and keyboard arrows move only the one
  * editable normalized point; Enter advances to harmless Cancel. */

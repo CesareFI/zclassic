@@ -43,6 +43,12 @@ bool zcl_present_model_render_v1(const struct zcl_present_model_v1 *model,
                                  struct zcl_present_model_bitmap_v1 *bitmap,
                                  char *error, size_t error_cap);
 
+/* Local data editing retains full form validation, including its correlation
+ * root, but omits the technical kind/root header from the user's view.
+ * Approval and confirmation views continue to use the ordinary renderer. */
+bool zcl_present_model_render_editor_v1(const struct zcl_present_model_v1 *model,
+    struct zcl_present_model_bitmap_v1 *bitmap, char *error, size_t error_cap);
+
 /* A bounded model may need more than one fixed native viewport. Pagination is
  * derived only from item kinds and the fixed software layout, so every
  * renderer/backend sees the same page count and page pixels. Page zero is the

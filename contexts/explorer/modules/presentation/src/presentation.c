@@ -44,15 +44,15 @@ int present_x11_clipboard_write_target(
 #define RGFW_IMPLEMENTATION
 #define RGFW_NO_API
 #define RGFW_NO_IOKIT
-#if defined(__APPLE__) && defined(__clang__)
-/* RGFW has two legacy numeric `_MSC_VER` probes. Do not define that macro on
- * Apple: current SDK headers use its presence to select actual MSVC syntax. */
+#if defined(__clang__)
+/* RGFW has legacy numeric `_MSC_VER` probes. Never manufacture this compiler
+ * identity: Apple and MinGW system headers use its presence to select MSVC
+ * declarations and intrinsics, even when its value is zero. */
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wundef"
-#elif !defined(_MSC_VER)
-/* RGFW probes the MSVC version numerically instead of with defined(). */
-#define _MSC_VER 0
-#define ZCL_PRESENT_UNDEF_MSC_VER
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wundef"
 #endif
 #if defined(__linux__)
 #define RGFW_USE_XDL
@@ -70,11 +70,10 @@ int present_x11_clipboard_write_target(
 #define XDL_NO_XRANDR
 #endif
 #include "../../../../../vendor/rgfw/RGFW.h"
-#if defined(__APPLE__) && defined(__clang__)
+#if defined(__clang__)
 #pragma clang diagnostic pop
-#elif defined(ZCL_PRESENT_UNDEF_MSC_VER)
-#undef _MSC_VER
-#undef ZCL_PRESENT_UNDEF_MSC_VER
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
 #endif
 
 bool zcl_present_bitmap_encode_bmp_v1(
@@ -668,6 +667,29 @@ static bool present_redraw(
     return true;
 }
 
+static void present_live_pump(
+    const struct zcl_present_window_live_form_v1 *live,
+    RGFW_window *window, const struct zcl_present_window_v1 *page,
+    RGFW_surface **surface, uint8_t **scaled_pixels,
+    struct zcl_present_window_form_v1 *form, uint32_t focus,
+    bool required_invalid, struct zcl_present_window_event_v1 *event,
+    bool paint)
+{
+    if (!live) return;
+    bool redraw = false, close = false;
+    live->update(live->context, event, RGFW_window_shouldClose(window),
+                 &redraw, &close);
+    if (redraw) RGFW_window_setName(window, page->title ? page->title : "ZClassic23");
+    if (redraw && paint)
+        (void)present_redraw(window, page, surface, scaled_pixels, 2u,
+            focus, form, NULL, NULL, UINT32_MAX, required_invalid);
+    RGFW_window_setShouldClose(window, close);
+    if (!close) {
+        event->outcome = ZCL_PRESENT_WINDOW_DISMISSED;
+        event->action_index = UINT32_MAX;
+    }
+}
+
 static bool present_show_copy_feedback(
     RGFW_window *window, const struct zcl_present_window_v1 *page,
     const struct zcl_present_window_copy_v1 *copy,
@@ -730,6 +752,18 @@ static bool present_show_copy_feedback(
     return true;
 }
 
+static bool present_form_geometry(
+    const struct zcl_present_window_pages_v1 *pages,
+    const struct zcl_present_window_form_v1 *form, uint32_t action_count,
+    char *error, size_t error_cap)
+{
+    return !form || (zcl_present_window_form_validate_v1(form, error, error_cap) &&
+        action_count == 2u && pages->page_count == 1u &&
+        pages->pages[0].pixel_format == ZCL_PRESENT_RGB8 &&
+        pages->pages[0].width == ZCL_PRESENT_MODEL_BITMAP_WIDTH &&
+        pages->pages[0].height == ZCL_PRESENT_MODEL_BITMAP_HEIGHT);
+}
+
 static bool present_run_pages_actions(
     const struct zcl_present_window_pages_v1 *pages,
     uint32_t action_count,
@@ -741,6 +775,7 @@ static bool present_run_pages_actions(
     const struct zcl_present_window_copy_v1 *copy,
     zcl_present_window_ready_fn ready,
     void *ready_context,
+    const struct zcl_present_window_live_form_v1 *live,
     struct zcl_present_window_event_v1 *result,
     char *error, size_t error_cap)
 {
@@ -768,14 +803,12 @@ static bool present_run_pages_actions(
     if ((form && canvas) || ((form || canvas) && hovers))
         return present_error(error, error_cap,
                              "presentation controls are mutually exclusive");
-    if (form && (!zcl_present_window_form_validate_v1(
-                     form, error, error_cap) ||
-                 action_count != 2u || pages->page_count != 1u ||
-                 pages->pages[0].pixel_format != ZCL_PRESENT_RGB8 ||
-                 pages->pages[0].width != ZCL_PRESENT_MODEL_BITMAP_WIDTH ||
-                 pages->pages[0].height != ZCL_PRESENT_MODEL_BITMAP_HEIGHT))
+    if (!present_form_geometry(pages, form, action_count, error, error_cap))
         return present_error(error, error_cap,
                              "presentation form geometry/actions are invalid");
+    if (live && (!live->update || !form))
+        return present_error(error, error_cap,
+                             "presentation live form owner is invalid");
     if (canvas && (!zcl_present_window_canvas_validate_v1(
                        canvas, error, error_cap) ||
                    action_count != 2u || pages->page_count != 1u ||
@@ -1132,6 +1165,9 @@ static bool present_run_pages_actions(
                     required_invalid = false;
                 }
                 if (changed) {
+                    present_live_pump(live, window, request, &surface,
+                        &scaled_pixels, form, focused_control, required_invalid,
+                        result, false);
                     (void)present_redraw(
                         window, request, &surface, &scaled_pixels,
                         action_count, focused_control, form, canvas,
@@ -1224,7 +1260,9 @@ static bool present_run_pages_actions(
                 RGFW_window_setShouldClose(window, RGFW_TRUE);
             }
         }
-        if (!saw_event) RGFW_waitForEvent(100);
+        present_live_pump(live, window, request, &surface, &scaled_pixels,
+            form, focused_control, required_invalid, result, true);
+        if (!saw_event && !RGFW_window_shouldClose(window)) RGFW_waitForEvent(100);
     }
     RGFW_surface_free(surface);
     free(scaled_pixels);
@@ -1244,7 +1282,7 @@ bool zcl_present_window_run_pages_actions_v1(
 {
     return present_run_pages_actions(
         pages, action_count, NULL, NULL, NULL, false, 0u, NULL,
-        ready, ready_context,
+        ready, ready_context, NULL,
         result, error, error_cap);
 }
 
@@ -1259,8 +1297,21 @@ bool zcl_present_window_run_pages_form_actions_v1(
 {
     return present_run_pages_actions(
         pages, action_count, form, NULL, NULL, false, 0u, NULL,
-        ready, ready_context,
+        ready, ready_context, NULL,
         result, error, error_cap);
+}
+
+bool zcl_present_window_run_live_form_v1(
+    const struct zcl_present_window_pages_v1 *pages,
+    struct zcl_present_window_form_v1 *form,
+    const struct zcl_present_window_live_form_v1 *live,
+    char *error, size_t error_cap)
+{
+    if (!live || !live->update)
+        return present_error(error, error_cap, "presentation live form owner is required");
+    struct zcl_present_window_event_v1 event;
+    return present_run_pages_actions(pages, 2u, form, NULL, NULL, false,
+        0u, NULL, NULL, NULL, live, &event, error, error_cap);
 }
 
 bool zcl_present_window_run_pages_canvas_actions_v1(
@@ -1274,7 +1325,7 @@ bool zcl_present_window_run_pages_canvas_actions_v1(
 {
     return present_run_pages_actions(
         pages, action_count, NULL, canvas, NULL, false, 0u, NULL, ready,
-        ready_context, result, error, error_cap);
+        ready_context, NULL, result, error, error_cap);
 }
 
 bool zcl_present_window_run_actions_v1(
@@ -1319,7 +1370,7 @@ bool zcl_present_window_run_hover_v1(
     struct zcl_present_window_event_v1 event;
     return present_run_pages_actions(
         &pages, 0, NULL, NULL, hover, false, 0u, NULL, NULL, NULL,
-        &event, error, error_cap);
+        NULL, &event, error, error_cap);
 }
 
 bool zcl_present_window_run_pages_first_hover_v1(
@@ -1330,7 +1381,7 @@ bool zcl_present_window_run_pages_first_hover_v1(
     struct zcl_present_window_event_v1 event;
     return present_run_pages_actions(
         pages, 0, NULL, NULL, hover, true, 0u, NULL, NULL, NULL,
-        &event, error, error_cap);
+        NULL, &event, error, error_cap);
 }
 
 bool zcl_present_window_run_pages_hover_v1(
@@ -1342,7 +1393,7 @@ bool zcl_present_window_run_pages_hover_v1(
     return present_run_pages_actions(
         pages, 0, NULL, NULL, hovers, false, initial_page, NULL,
         NULL, NULL,
-        &event, error, error_cap);
+        NULL, &event, error, error_cap);
 }
 
 bool zcl_present_window_run_pages_hover_copy_v1(
@@ -1354,5 +1405,5 @@ bool zcl_present_window_run_pages_hover_copy_v1(
     struct zcl_present_window_event_v1 event;
     return present_run_pages_actions(
         pages, 0, NULL, NULL, hovers, false, initial_page, copy,
-        NULL, NULL, &event, error, error_cap);
+        NULL, NULL, NULL, &event, error, error_cap);
 }

@@ -923,7 +923,7 @@ contexts/explorer/modules/presentation/src/presentation.c:present_clipboard_writ
 contexts/explorer/modules/presentation/src/presentation.c:present_hover_draw:16
 contexts/explorer/modules/presentation/src/presentation.c:present_hover_validate:18
 contexts/explorer/modules/presentation/src/presentation.c:present_replace_surface:30
-contexts/explorer/modules/presentation/src/presentation.c:present_run_pages_actions:195
+contexts/explorer/modules/presentation/src/presentation.c:present_run_pages_actions:193
 contexts/explorer/modules/presentation/src/presentation.c:present_show_copy_feedback:17
 contexts/explorer/modules/presentation/src/presentation.c:zcl_present_window_validate_v1:25
 contexts/explorer/modules/presentation/src/presentation_canvas_select.c:zcl_present_window_canvas_point_at_v1:20

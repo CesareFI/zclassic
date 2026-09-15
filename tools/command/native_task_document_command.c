@@ -2,6 +2,7 @@
  * purpose: local task contents with durable confirmation and revision checks. */
 #include "command/native_command.h"
 #include "models/task_document.h"
+#include "services/task_editor.h"
 #include "platform/private_directory.h"
 #include "platform/time_compat.h"
 #include "util/log_macros.h"
@@ -46,11 +47,31 @@ static struct zcl_result ntd_open(const struct json_value *input,
     return package_resident_store_open_app(store, directory, app);
 }
 
+static struct zcl_result ntd_editor(const struct json_value *input,
+    struct package_resident_store *store, bool new_task, struct task_document *row)
+{
+    struct task_editor editor = {0};
+    ZCL_CHECK(task_editor_open(&editor, ntd_string(input, "datadir"), store->app));
+    uint64_t id = 0;
+    if (!new_task) {
+        if (json_get(input, "task_id")) {
+            if (!ntd_integer(input, "task_id", &id))
+                return ZCL_ERR(-1, "tasks: choose a task ID");
+        } else if (editor.saved.state.count) id = editor.saved.state.tasks[0].id;
+    }
+    ZCL_CHECK(task_editor_select(&editor, id));
+    struct zcl_result result = task_editor_window_run(&editor);
+    if (result.ok) *row = editor.saved;
+    return result;
+}
+
 static struct zcl_result ntd_change(const struct json_value *input,
     struct package_resident_store *store, struct task_document *row)
 {
     const char *action = ntd_string(input, "action");
     if (!action || strcmp(action, "list") == 0) return task_document_read(store, row);
+    if (strcmp(action, "open") == 0 || strcmp(action, "new") == 0)
+        return ntd_editor(input, store, strcmp(action, "new") == 0, row);
     static const char *const actions[] = { "add", "edit", "complete", "reopen", "delete", "undo" };
     size_t selected = 0;
     while (selected < sizeof(actions)/sizeof(actions[0]) && strcmp(action, actions[selected]) != 0)
