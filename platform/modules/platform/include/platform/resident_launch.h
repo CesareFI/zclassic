@@ -99,7 +99,10 @@ bool resident_launch_cancel(struct resident_launch *launch,
                             uint32_t timeout_ms,
                             char *error, size_t error_size);
 /* Reads one result frame and accepts it only under the current nonce;
- * stale or malformed frames are refused by name in `error`. */
+ * stale or malformed frames are refused by name in `error`. A single absolute
+ * monotonic timeout covers the complete header and payload, including partial
+ * reads, EAGAIN and EINTR; fragments never renew it. timeout_ms == 0 drains
+ * only immediately available bytes and refuses an incomplete frame. */
 bool resident_result_read(struct resident_launch *launch,
                           struct resident_result_header *header,
                           void *payload, size_t payload_cap,

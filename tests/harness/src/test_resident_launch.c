@@ -410,6 +410,8 @@ int test_resident_launch(void)
     failures += rl_swap_refusal_checks(dir);
     failures += rl_cycle_checks();
     test_rm_rf(dir);
+    { extern int resident_result_fragments_run(void);
+      failures += resident_result_fragments_run(); }
     printf("resident_launch: %s (%d failure(s))\n",
            failures ? "FAIL" : "PASS", failures);
     return failures;

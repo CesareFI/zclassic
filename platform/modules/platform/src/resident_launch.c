@@ -29,6 +29,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -598,6 +599,94 @@ static bool resident_result_validate(const struct resident_launch *launch,
 }
 #endif
 
+#if !defined(_WIN32)
+/* One absolute deadline covers every fragment of one result frame. */
+struct resident_result_deadline {
+    uint64_t end_ns;
+    uint32_t timeout_ms;
+};
+
+static bool resident_result_now(uint64_t *now, char *error, size_t error_size)
+{
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
+        resident_fail(error, error_size, "resident launch: result clock failed: %s", strerror(errno));
+        return false;
+    }
+    *now = (uint64_t)value.tv_sec * UINT64_C(1000000000) + (uint64_t)value.tv_nsec;
+    return true;
+}
+
+static bool resident_result_timeout(const struct resident_result_deadline *deadline,
+                                    char *error, size_t error_size)
+{
+    errno = ETIMEDOUT;
+    resident_fail(error, error_size, "resident launch: result timed out after %u ms",
+                  (unsigned)deadline->timeout_ms);
+    return false;
+}
+
+static bool resident_result_wait(int fd, const struct resident_result_deadline *deadline,
+                                 char *error, size_t error_size)
+{
+    for (;;) {
+        uint64_t now;
+        if (!resident_result_now(&now, error, error_size)) return false;
+        if (deadline->timeout_ms && now >= deadline->end_ns)
+            return resident_result_timeout(deadline, error, error_size);
+        uint64_t remaining = now < deadline->end_ns ? deadline->end_ns - now : 0;
+        uint64_t ms = remaining / UINT64_C(1000000) + (remaining % UINT64_C(1000000) != 0);
+        int wait_ms = ms > INT_MAX ? INT_MAX : (int)ms;
+        struct pollfd waiter = {.fd = fd, .events = POLLIN};
+        int ready = poll(&waiter, 1, wait_ms);
+        if (ready > 0) return true; /* recv distinguishes data, EOF and socket errors. */
+        if (ready == 0) {
+            if (!deadline->timeout_ms) return resident_result_timeout(deadline, error, error_size);
+            continue; /* A capped poll interval may end before a long deadline. */
+        }
+        if (errno == EINTR && deadline->timeout_ms) continue;
+        if (errno == EINTR) return resident_result_timeout(deadline, error, error_size);
+        resident_fail(error, error_size, "resident launch: result poll failed: %s", strerror(errno));
+        return false;
+    }
+}
+
+static bool resident_result_live(const struct resident_result_deadline *deadline,
+                                 char *error, size_t error_size)
+{
+    if (!deadline->timeout_ms) return true; /* Zero retains nonblocking drain semantics. */
+    uint64_t now;
+    if (!resident_result_now(&now, error, error_size)) return false;
+    return now < deadline->end_ns || resident_result_timeout(deadline, error, error_size);
+}
+
+static bool resident_result_fragment(int fd, void *data, size_t size,
+    const struct resident_result_deadline *deadline, bool header,
+    char *error, size_t error_size)
+{
+    unsigned char *bytes = data;
+    size_t done = 0;
+    while (done < size) {
+        if (!resident_result_live(deadline, error, error_size)) return false;
+        /* MSG_DONTWAIT also bounds readers whose caller did not set O_NONBLOCK. */
+        ssize_t got = recv(fd, bytes + done, size - done, MSG_DONTWAIT);
+        if (got > 0) { done += (size_t)got; continue; }
+        if (got < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!deadline->timeout_ms) return resident_result_timeout(deadline, error, error_size);
+            if (!resident_result_wait(fd, deadline, error, error_size)) return false;
+            continue;
+        }
+        errno = ECONNRESET;
+        resident_fail(error, error_size, "%s",
+            header && got == 0 ? "resident launch: resident closed the channel" :
+            header ? "resident launch: truncated result header" :
+                     "resident launch: truncated result payload");
+        return false;
+    }
+    return true;
+}
+#endif
+
 bool resident_result_read(struct resident_launch *launch,
                           struct resident_result_header *header,
                           void *payload, size_t payload_cap,
@@ -617,46 +706,20 @@ bool resident_result_read(struct resident_launch *launch,
                       "resident launch: result read needs a live launch");
         return false;
     }
+    uint64_t now;
+    if (!resident_result_now(&now, error, error_size)) return false;
+    struct resident_result_deadline deadline = {
+        .end_ns = now + (uint64_t)timeout_ms * UINT64_C(1000000),
+        .timeout_ms = timeout_ms
+    };
     int fd = (int)launch->ipc_native;
-    struct pollfd waiter = {.fd = fd, .events = POLLIN, .revents = 0};
-    int ready;
-    do {
-        ready = poll(&waiter, 1, (int)timeout_ms);
-    } while (ready < 0 && errno == EINTR);
-    if (ready == 0) {
-        errno = ETIMEDOUT;
-        resident_fail(error, error_size,
-                      "resident launch: result timed out after %u ms",
-                      (unsigned)timeout_ms);
-        return false;
-    }
-    if (ready < 0) {
-        resident_fail(error, error_size,
-                      "resident launch: result poll failed: %s",
-                      strerror(errno));
-        return false;
-    }
     struct resident_result_header wire;
-    bool peer_closed = false;
-    if (!resident_io_exact(fd, &wire, sizeof(wire), false, &peer_closed)) {
-        errno = ECONNRESET;
-        resident_fail(error, error_size, "%s",
-                      peer_closed
-                          ? "resident launch: resident closed the channel"
-                          : "resident launch: truncated result header");
-        return false;
-    }
+    if (!resident_result_fragment(fd, &wire, sizeof(wire), &deadline, true,
+                                   error, error_size)) return false;
     if (!resident_result_validate(launch, &wire, payload, payload_cap,
-                                  error, error_size))
-        return false;
-    if (wire.payload_len &&
-        !resident_io_exact(fd, payload, wire.payload_len, false,
-                           &peer_closed)) {
-        errno = ECONNRESET;
-        resident_fail(error, error_size,
-                      "resident launch: truncated result payload");
-        return false;
-    }
+                                  error, error_size)) return false;
+    if (wire.payload_len && !resident_result_fragment(fd, payload, wire.payload_len,
+            &deadline, false, error, error_size)) return false;
     *header = wire;
     return true;
 #endif
