@@ -249,6 +249,8 @@ bool platform_private_directory_publish_no_clobber(
 #if defined(__linux__)
     return renameat2(AT_FDCWD, staging, AT_FDCWD, destination,
                      RENAME_NOREPLACE) == 0;
+#elif defined(__APPLE__)
+    return renamex_np(staging, destination, RENAME_EXCL) == 0;
 #else
     struct stat st;
     if (lstat(destination, &st) == 0 || errno != ENOENT) {

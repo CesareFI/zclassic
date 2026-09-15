@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "ztasks/ztasks",
-  "semver": "0.2.0",
+  "semver": "0.2.1",
   "language": "c23",
   "license": "Apache-2.0",
   "include_dir": "include",

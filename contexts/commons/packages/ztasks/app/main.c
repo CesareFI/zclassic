@@ -1,5 +1,5 @@
-/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
-/* Purpose: task-list program; resident mode uses Z23's existing fd3 wire. */
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
+ * purpose: task-list program; resident mode uses Z23's existing fd3 wire. */
 #include "ztasks/ztasks.h"
 #include <errno.h>
 #include <stdio.h>
@@ -44,7 +44,7 @@ static bool task_render(const struct ta_state *state, char out[TA_PAYLOAD])
     for (uint32_t i = 0; i < state->count; ++i) {
         int n = snprintf(out + used, TA_PAYLOAD - used, "%llu [%s] %s\n",
             (unsigned long long)state->tasks[i].id,
-            state->tasks[i].done ? "DONE" : "TODO", state->tasks[i].title);
+            state->tasks[i].done ? "DONE" : "OPEN", state->tasks[i].title);
         if (n < 0 || (size_t)n >= TA_PAYLOAD - used) {
             fprintf(stderr, "ztasks: rendered task list exceeds bound\n"); return false;
         }
@@ -52,6 +52,57 @@ static bool task_render(const struct ta_state *state, char out[TA_PAYLOAD])
     }
     if (!used) (void)snprintf(out, TA_PAYLOAD, "No tasks yet.\n");
     return true;
+}
+
+static bool task_apply(struct ta_state *state, const char *input, const char *nonce)
+{
+    if (strncmp(input, "add ", 4) == 0 && ta_title_valid(input + 4) && state->count < TA_MAX_TASKS) {
+        struct ta_task *task = &state->tasks[state->count];
+        task->id = (uint64_t)state->count + 1u;
+        (void)snprintf(task->title, sizeof(task->title), "%s", input + 4);
+        state->count++;
+        state->revision++;
+        state->last_write++;
+    } else if (strcmp(input, "list") != 0) {
+        fprintf(stderr, "ztasks: use add TITLE or list\n"); return false;
+    }
+    unsigned char canonical[TA_PAYLOAD];
+    char view[TA_PAYLOAD];
+    uint32_t length = 0;
+    struct ta_state checked;
+    if (!ta_state_encode(state, canonical, &length) ||
+        !ta_state_decode(canonical, length, &checked) ||
+        !task_render(&checked, view) || !task_reply(nonce, view)) {
+        fprintf(stderr, "ztasks: state or rendered result refused\n"); return false;
+    }
+    return true;
+}
+
+/* Negative means one request completed; otherwise return the process code. */
+static int task_request(struct ta_state *state, const char *nonce)
+{
+    struct task_frame frame = {0};
+    /* STOP is the seam's 81-byte nonce-bound command. All other input
+     * is a normal 88-byte resident frame carrying a bounded text command. */
+    if (!task_io(&frame, 81, false)) return 3;
+    if (memcmp(frame.nonce, nonce, sizeof(frame.nonce)) != 0) {
+        fprintf(stderr, "ztasks: stale input nonce\n"); return 4;
+    }
+    if (memcmp(frame.magic, "z23-res-stop-v1", sizeof("z23-res-stop-v1")) == 0)
+        return 0;
+    if (memcmp(frame.magic, "z23-res-run-v1", sizeof("z23-res-run-v1")) != 0 ||
+        !task_io((unsigned char *)&frame + 81, sizeof(frame) - 81, false) ||
+        frame.payload_len > TA_PAYLOAD) {
+        fprintf(stderr, "ztasks: invalid resident input frame\n"); return 4;
+    }
+    char input[TA_TITLE + 5u] = {0};
+    if (frame.payload_len >= sizeof(input) ||
+        !task_io(input, frame.payload_len, false) ||
+        memchr(input, 0, frame.payload_len) != NULL) {
+        fprintf(stderr, "ztasks: bounded text command required\n"); return 5;
+    }
+    if (!task_apply(state, input, nonce)) return 5;
+    return -1;
 }
 
 static int task_resident(const char *nonce)
@@ -66,45 +117,8 @@ static int task_resident(const char *nonce)
     if (!task_reply(nonce, "READY")) return 3;
     struct ta_state state = {0};
     for (unsigned request = 0; request < 64; ++request) {
-        struct task_frame frame = {0};
-        /* STOP is the seam's 81-byte nonce-bound command. All other input
-         * is a normal 88-byte resident frame carrying a bounded text command. */
-        if (!task_io(&frame, 81, false)) return 3;
-        if (memcmp(frame.nonce, nonce, sizeof(frame.nonce)) != 0) {
-            fprintf(stderr, "ztasks: stale input nonce\n"); return 4;
-        }
-        if (memcmp(frame.magic, "z23-res-stop-v1", sizeof("z23-res-stop-v1")) == 0)
-            return 0;
-        if (memcmp(frame.magic, "z23-res-run-v1", sizeof("z23-res-run-v1")) != 0 ||
-            !task_io((unsigned char *)&frame + 81, sizeof(frame) - 81, false) ||
-            frame.payload_len > TA_PAYLOAD) {
-            fprintf(stderr, "ztasks: invalid resident input frame\n"); return 4;
-        }
-        char input[TA_TITLE + 5u] = {0};
-        char view[TA_PAYLOAD];
-        if (frame.payload_len >= sizeof(input) ||
-            !task_io(input, frame.payload_len, false) ||
-            memchr(input, 0, frame.payload_len) != NULL) {
-            fprintf(stderr, "ztasks: bounded text command required\n"); return 5;
-        }
-        if (strncmp(input, "add ", 4) == 0 && ta_title_valid(input + 4) && state.count < TA_MAX_TASKS) {
-            struct ta_task *task = &state.tasks[state.count];
-            task->id = (uint64_t)state.count + 1u;
-            (void)snprintf(task->title, sizeof(task->title), "%s", input + 4);
-            state.count++;
-            state.revision++;
-            state.last_write++;
-        } else if (strcmp(input, "list") != 0) {
-            fprintf(stderr, "ztasks: use add TITLE or list\n"); return 5;
-        }
-        unsigned char canonical[TA_PAYLOAD];
-        uint32_t length = 0;
-        struct ta_state checked;
-        if (!ta_state_encode(&state, canonical, &length) ||
-            !ta_state_decode(canonical, length, &checked) ||
-            !task_render(&checked, view) || !task_reply(nonce, view)) {
-            fprintf(stderr, "ztasks: state or rendered result refused\n"); return 5;
-        }
+        int result = task_request(&state, nonce);
+        if (result >= 0) return result;
     }
     fprintf(stderr, "ztasks: request budget exhausted\n");
     return 6;

@@ -1,5 +1,5 @@
 /* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
- * purpose: installed app snapshot lifetime around the existing resident seam. */
+ * purpose: own installed app snapshot lifetime around the existing resident seam. */
 #include "services/package_resident.h"
 #include "platform/os_proc.h"
 #include "base/hex.h"
@@ -63,6 +63,61 @@ static bool pr_copy(int source, int target, uint64_t length)
     return true;
 }
 
+static int pr_snapshot_target(int in, int dir, bool *cloned)
+{
+#if defined(__APPLE__)
+    if (fclonefileat(in, dir, "image", CLONE_NOFOLLOW) == 0) *cloned = true;
+    else if (errno != ENOTSUP && errno != EXDEV) return -1;
+#else
+    (void)in;
+#endif
+    return openat(dir, "image", O_RDWR | O_NOFOLLOW | O_CLOEXEC |
+                    (*cloned ? 0 : O_CREAT | O_EXCL), 0600);
+}
+
+static bool pr_snapshot_hash(int target, uint64_t size, char out[65])
+{
+    struct sha3_256_ctx hash;
+    sha3_256_init(&hash);
+    for (uint64_t offset = 0; offset < size;) {
+        unsigned char bytes[4096];
+        size_t want = size - offset < sizeof(bytes) ? (size_t)(size - offset) : sizeof(bytes);
+        ssize_t n = pread(target, bytes, want, (off_t)offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        sha3_256_write(&hash, bytes, (size_t)n);
+        offset += (uint64_t)n;
+    }
+    unsigned char digest[32];
+    sha3_256_finalize(&hash, digest);
+    zcl_hex_encode(digest, sizeof(digest), out);
+    return true;
+}
+
+static bool pr_snapshot_accept(int target,
+    const struct platform_positioned_file_snapshot *before,
+    const struct package_resident *app, struct resident_launch_accepted *accepted)
+{
+    struct stat st;
+    if (fstat(target, &st) != 0 || (uint64_t)st.st_size != before->size ||
+        ((uint64_t)st.st_ino == before->file_low && (uint64_t)st.st_dev == before->volume))
+        return false;
+    if (!pr_snapshot_hash(target, before->size, accepted->image_sha3_hex)) return false;
+    if (strcmp(accepted->image_sha3_hex, app->artifact.accepted.image_sha3_hex) != 0)
+        return false;
+    accepted->image_volume = (uint64_t)st.st_dev;
+    accepted->image_low = (uint64_t)st.st_ino;
+    accepted->image_high = 0;
+    accepted->image_size = before->size;
+    return true;
+}
+
+static bool pr_snapshot_fill(int in, int target, int dir, uint64_t size, bool cloned)
+{
+    return target >= 0 && (cloned || pr_copy(in, target, size)) &&
+        fchmod(target, 0500) == 0 && fsync(target) == 0 && fsync(dir) == 0;
+}
+
 static bool pr_snapshot(struct package_resident *app,
                         struct resident_launch_accepted *accepted)
 {
@@ -82,40 +137,9 @@ static bool pr_snapshot(struct package_resident *app,
     if (dir < 0) goto done;
     (void)snprintf(app->snapshot_image, sizeof(app->snapshot_image), "%s/image", app->snapshot_directory);
     int in = (int)platform_positioned_file_native_fd(&source);
-#if defined(__APPLE__)
-    if (fclonefileat(in, dir, "image", CLONE_NOFOLLOW) == 0) cloned = true;
-    else if (errno != ENOTSUP && errno != EXDEV) goto done;
-#endif
-    target = openat(dir, "image", O_RDWR | O_NOFOLLOW | O_CLOEXEC |
-                    (cloned ? 0 : O_CREAT | O_EXCL), 0600);
-    if (target < 0 || (!cloned && !pr_copy(in, target, before.size)) ||
-        fchmod(target, 0500) != 0 || fsync(target) != 0 || fsync(dir) != 0)
-        goto done;
-    struct stat st;
-    if (fstat(target, &st) != 0 || (uint64_t)st.st_size != before.size ||
-        ((uint64_t)st.st_ino == before.file_low && (uint64_t)st.st_dev == before.volume))
-        goto done;
-    struct sha3_256_ctx hash;
-    sha3_256_init(&hash);
-    for (uint64_t offset = 0; offset < before.size;) {
-        unsigned char bytes[4096];
-        size_t want = before.size - offset < sizeof(bytes) ? (size_t)(before.size - offset) : sizeof(bytes);
-        ssize_t n = pread(target, bytes, want, (off_t)offset);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto done;
-        sha3_256_write(&hash, bytes, (size_t)n);
-        offset += (uint64_t)n;
-    }
-    unsigned char digest[32];
-    sha3_256_finalize(&hash, digest);
-    zcl_hex_encode(digest, sizeof(digest), accepted->image_sha3_hex);
-    if (strcmp(accepted->image_sha3_hex, app->artifact.accepted.image_sha3_hex) != 0)
-        goto done;
-    accepted->image_volume = (uint64_t)st.st_dev;
-    accepted->image_low = (uint64_t)st.st_ino;
-    accepted->image_high = 0;
-    accepted->image_size = before.size;
-    ok = true;
+    target = pr_snapshot_target(in, dir, &cloned);
+    if (!pr_snapshot_fill(in, target, dir, before.size, cloned)) goto done;
+    ok = pr_snapshot_accept(target, &before, app, accepted);
 done:
     platform_positioned_file_close(&source);
     if (target >= 0 && close(target) != 0) ok = false;
@@ -145,6 +169,32 @@ struct zcl_result package_resident_prepare(struct package_resident *app,
 #endif
 }
 
+static bool pr_receipt_process_valid(const struct package_resident *app)
+{
+    const struct resident_receipt *r = &app->receipt;
+    uint64_t token = 0;
+    bool proof = false;
+#if defined(__APPLE__)
+    proof = strcmp(r->mapped_proof, "cdhash_suspended") == 0;
+#elif defined(__linux__)
+    proof = strcmp(r->mapped_proof, "proc_exe_triple") == 0 ||
+            strcmp(r->mapped_proof, "fexecve_inode") == 0;
+#endif
+    return proof && r->pid && r->pid == app->launch.pid && r->start_token &&
+        r->start_token == app->launch.start_token &&
+        os_proc_pid_start_token(r->pid, &token) && token == r->start_token &&
+        memcmp(r->nonce, app->launch.nonce, sizeof(r->nonce)) == 0;
+}
+
+static bool pr_receipt_image_valid(const struct package_resident *app)
+{
+    const struct resident_receipt *r = &app->receipt;
+    const struct resident_launch_accepted *a = &app->launch.accepted;
+    return memcmp(r->image_sha3_hex, app->artifact.accepted.image_sha3_hex, sizeof(r->image_sha3_hex)) == 0 &&
+        r->image_volume == a->image_volume && r->image_low == a->image_low &&
+        r->image_high == a->image_high && r->image_size == a->image_size;
+}
+
 struct zcl_result package_resident_start(struct package_resident *app)
 {
     if (!app || app->launch.spawned || !app->snapshot_image[0])
@@ -154,23 +204,7 @@ struct zcl_result package_resident_start(struct package_resident *app)
     char *env[] = {NULL};
     if (!resident_launch_spawn(&app->launch, argv, env, &app->receipt, error, sizeof(error)))
         return ZCL_ERR(-1, "resident-spawn-refused: %s", error);
-    const struct resident_receipt *r = &app->receipt;
-    const struct resident_launch_accepted *a = &app->launch.accepted;
-    uint64_t token = 0;
-    bool proof = false;
-#if defined(__APPLE__)
-    proof = strcmp(r->mapped_proof, "cdhash_suspended") == 0;
-#elif defined(__linux__)
-    proof = strcmp(r->mapped_proof, "proc_exe_triple") == 0 ||
-            strcmp(r->mapped_proof, "fexecve_inode") == 0;
-#endif
-    if (!proof || !r->pid || r->pid != app->launch.pid || !r->start_token ||
-        r->start_token != app->launch.start_token ||
-        !os_proc_pid_start_token(r->pid, &token) || token != r->start_token ||
-        memcmp(r->nonce, app->launch.nonce, sizeof(r->nonce)) != 0 ||
-        memcmp(r->image_sha3_hex, app->artifact.accepted.image_sha3_hex, sizeof(r->image_sha3_hex)) != 0 ||
-        r->image_volume != a->image_volume || r->image_low != a->image_low ||
-        r->image_high != a->image_high || r->image_size != a->image_size) {
+    if (!pr_receipt_process_valid(app) || !pr_receipt_image_valid(app)) {
         struct zcl_result cleanup = package_resident_close(app);
         if (!cleanup.ok) return cleanup;
         return ZCL_ERR(-1, "resident-receipt-refused: accepted image, mapped proof or process identity differs");

@@ -1,5 +1,5 @@
 /* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
- * purpose: accepted-package receipt to exact resident artifact identity. */
+ * purpose: bind accepted-package receipts to exact resident artifact identity. */
 #include "services/package_resident.h"
 
 #include "base/hex.h"
@@ -73,8 +73,7 @@ static struct zcl_result pr_read_output(
             selected = &receipt->outputs[i];
     if (!selected || strncmp(output, "bin/", 4) != 0)
         return ZCL_ERR(-1, "resident-output-refused: select an exact installed program");
-    struct package_lifecycle_programs *programs =
-        zcl_calloc(1, sizeof(*programs), "resident installed programs");
+    struct package_lifecycle_programs *programs = zcl_calloc(1, sizeof(*programs), "package.resident.programs");
     if (!programs)
         return ZCL_ERR(-1, "resident-output-allocation: installed program projection");
     struct zcl_result result = package_lifecycle_installed_programs(
@@ -106,8 +105,7 @@ struct zcl_result package_resident_artifact_read(
     if (!datadir || !package_root || !receipt_id || !output ||
         strlen(output) > VCS_PACKAGE_BUILD_PATH_MAX)
         return ZCL_ERR(-1, "resident-input: exact package, receipt and program are required");
-    struct vcs_package_build_receipt *receipt =
-        zcl_calloc(1, sizeof(*receipt), "resident build receipt");
+    struct vcs_package_build_receipt *receipt = zcl_calloc(1, sizeof(*receipt), "package.resident.receipt");
     if (!receipt) return ZCL_ERR(-1, "resident-receipt-allocation");
     struct zcl_result result = pr_read_output(datadir, package_root, receipt_id,
                                             output, receipt, out);

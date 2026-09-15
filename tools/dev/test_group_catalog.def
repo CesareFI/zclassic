@@ -1336,6 +1336,8 @@ ZCL_TEST_GROUP(resident_launch)
  * refusal, pending supersession, failure containment, EXACT-A rollback,
  * restart persistence). resident_launch covers the platform seam. */
 ZCL_TEST_GROUP(resident_launch_contract)
+ZCL_TEST_GROUP(package_resident_record)
+ZCL_TEST_GROUP(package_local)
 /* astro lane: platform/modules/astro's exact fixed-grid arithmetic and the birth chart
  * built on it. The determinism cases are the point — a chart another node
  * recomputes must match bit for bit, so the group asserts that property by

@@ -988,6 +988,46 @@ static int t_resident_execution_grant(void)
     }
     return failures;
 }
+static int t_local_acceptance_boolean(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), "zcode.package.add.plan", NULL);
+    CIB_CHECK("local plan leaf resolves", spec != NULL);
+    if (!spec) return failures;
+    const char *wires[] = {"{\"local_only\":true}", "{\"local_only\":false}",
+                          "{\"local_only\":\"true\"}", "{\"local_only\":1}"};
+    for (size_t i = 0; i < sizeof(wires) / sizeof(wires[0]); ++i) {
+        struct json_value input;
+        json_init(&input);
+        bool parsed = json_read(&input, wires[i], strlen(wires[i])) &&
+            json_push_kv_str(&input, "name_or_root", "ztasks/ztasks");
+        bool admitted = parsed && zcl_command_registry_input_validate(spec, &input, NULL, 0);
+        CIB_CHECK("local-only uses one boolean contract", parsed && admitted == (i < 2));
+        json_free(&input);
+    }
+    return failures;
+}
+
+static int t_resident_binding_types(void)
+{
+    int failures = 0;
+    const char *path = "app.invoke.package";
+    CIB_CHECK("resident generation zero is a typed precondition",
+        cib_accepts_int(path, "generation", 0));
+    CIB_CHECK("resident negative generation refuses",
+        !cib_accepts_int(path, "generation", -1));
+    CIB_CHECK("resident positive start token is an integer",
+        cib_accepts_int(path, "start_token", INT64_MAX));
+    CIB_CHECK("resident zero start token refuses",
+        !cib_accepts_int(path, "start_token", 0));
+    CIB_CHECK("resident start token string refuses",
+        !cib_accepts(path, "start_token", 1, NULL, 0));
+    CIB_CHECK("resident generation string refuses",
+        !cib_accepts(path, "generation", 1, NULL, 0));
+    return failures;
+}
+
 int test_command_input_bounds(void)
 {
     printf("\n=== command_input_bounds: per-key input length rules ===\n");
@@ -1008,6 +1048,8 @@ int test_command_input_bounds(void)
     failures += t_moved_max_lines_bounds();
     failures += t_moved_required_discovery();
     failures += t_resident_execution_grant();
+    failures += t_local_acceptance_boolean();
+    failures += t_resident_binding_types();
     printf("=== command_input_bounds complete: %d failure(s) ===\n", failures);
     return failures;
 }

@@ -1335,11 +1335,11 @@ struct vcs_swarm_engine *vcs_swarm_engine_create(
     struct vcs_package_store *store, struct vcs_service_book *book,
     const char *zcode_dir, vcs_swarm_score_fn score_fn, void *score_ctx)
 {
-    struct vcs_swarm_engine *engine =
-        zcl_malloc(sizeof(*engine), "vcs_swarm_engine");
+    if (store && !vcs_package_store_network_allowed(store))
+        LOG_NULL(SWARM_LOG, "local-only package store cannot join a swarm");
+    struct vcs_swarm_engine *engine = zcl_calloc(1, sizeof(*engine), "vcs_swarm_engine");
     if (!engine)
         LOG_NULL(SWARM_LOG, "swarm engine allocation failed");
-    memset(engine, 0, sizeof(*engine));
     pthread_mutex_init(&engine->lock, NULL);
     engine->store = store;
     engine->book = book;

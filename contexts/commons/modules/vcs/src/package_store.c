@@ -15,6 +15,7 @@
 #include "crypto/sha3.h"
 #include "json/json.h"
 #include "platform/positioned_file.h"
+#include "platform/file_metadata.h"
 #include "util/util.h"
 #include "vcs/package_recipe.h"
 
@@ -471,9 +472,24 @@ bool vcs_package_store_open_global(void)
     GetDataDir(false, datadir, sizeof(datadir));
     g_global_store =
         vcs_package_store_open(datadir, vcs_package_store_quota_bytes());
+    if (g_global_store && !vcs_package_store_network_allowed(g_global_store)) {
+        vcs_package_store_close(g_global_store);
+        g_global_store = NULL;
+        LOG_ERROR(STORE_LOG, "local-only package store cannot host network content");
+    }
     bool ok = g_global_store != NULL;
     pthread_mutex_unlock(&g_global_lock);
     return ok;
+}
+
+bool vcs_package_store_network_allowed(const struct vcs_package_store *store)
+{
+    if (!store) return false;
+    char marker[STORE_PATH_MAX];
+    int n = snprintf(marker, sizeof(marker), "%s/local-only", store->root);
+    if (n < 0 || (size_t)n >= sizeof(marker)) return false;
+    struct platform_file_metadata metadata;
+    return platform_file_metadata_read(marker, &metadata) == PLATFORM_FILE_METADATA_MISSING;
 }
 
 struct vcs_package_store *vcs_package_store_global(void)

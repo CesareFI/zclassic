@@ -18,12 +18,16 @@
  * this process. */
 
 #include "base/hex.h"
+#include "base/safe_alloc.h"
 #include "command/native_command.h"
 
 #include "json/json.h"
 #include "platform/time_compat.h"
 #include "services/package_lifecycle.h"
+#include "services/package_local.h"
 #include "vcs/package_checkout.h"
+#include "vcs/package_manifest.h"
+#include "vcs/package_recipe.h"
 #include "vcs/package_reproduce.h"
 #include "vcs/package_store.h"
 
@@ -232,6 +236,48 @@ static bool za_push_steps_window(const struct zcl_command_request *request,
 
 /* ── zcode package add plan ─────────────────────────────────────────── */
 
+static uint8_t *za_local_wire(const struct json_value *input, const char *key,
+                              size_t maximum, size_t *size)
+{
+    const char *hex = za_input_str(input, key);
+    size_t length = hex ? strlen(hex) : 0;
+    *size = 0;
+    if (!length || (length & 1u) || length > maximum * 2u) return NULL;
+    uint8_t *wire = zcl_malloc(length / 2u, "package.local.source-wire");
+    if (!wire || !zcl_hex_decode_lower(hex, wire, length / 2u)) {
+        free(wire); return NULL;
+    }
+    *size = length / 2u;
+    return wire;
+}
+
+static struct zcl_result za_local_plan(const struct zcl_command_request *request,
+    const char *target, struct package_local_plan *out)
+{
+    struct package_local_source source = {0};
+    source.directory = za_input_str(request->input, "dir");
+    if (!source.directory || !source.directory[0] ||
+        !zcl_hex_decode_lower(target, source.expected_root, 32))
+        return ZCL_ERR(-1, "local-source-input: dir and exact 64-hex source root required");
+    uint8_t *release = za_local_wire(request->input, "release_hex", VCS_PACKAGE_RELEASE_MAX_WIRE_BYTES, &source.release_size);
+    uint8_t *manifest = za_local_wire(request->input, "manifest_hex", VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES, &source.manifest_size);
+    uint8_t *recipe = za_local_wire(request->input, "recipe_hex", VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES, &source.recipe_size);
+    source.release_wire = release; source.manifest_wire = manifest; source.recipe_wire = recipe;
+    struct zcl_result result = release && manifest && recipe ?
+        package_local_plan(za_input_str(request->input, "datadir"), &source, za_now(request), out) :
+        ZCL_ERR(-1, "local-source-input: bounded lowercase release, manifest and recipe hex required");
+    free(release); free(manifest); free(recipe);
+    return result;
+}
+
+static bool za_local_inputs_valid(const struct json_value *input, bool local)
+{
+    const struct json_value *flag = json_get(input, "local_only");
+    if (flag && flag->type != JSON_BOOL) return false;
+    return local || (!json_get(input, "dir") && !json_get(input, "release_hex") &&
+        !json_get(input, "manifest_hex") && !json_get(input, "recipe_hex"));
+}
+
 void zcl_native_handle_zcode_package_add_plan(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply)
@@ -253,9 +299,25 @@ void zcl_native_handle_zcode_package_add_plan(
         return;
     }
 
-    struct package_lifecycle_plan_report report;
-    struct zcl_result r = package_lifecycle_plan(datadir, target,
-                                                 za_now(request), &report);
+    const struct json_value *local_flag = json_get(request->input, "local_only");
+    bool local = local_flag && local_flag->type == JSON_BOOL && json_get_bool(local_flag);
+    if (!za_local_inputs_valid(request->input, local)) {
+        za_fail(reply, "local-source-grant", "local source inputs require local_only JSON boolean true", command);
+        return;
+    }
+    struct package_lifecycle_plan_report report = {0};
+    struct package_local_plan local_report = {0};
+    struct zcl_result r;
+    if (local) {
+        r = za_local_plan(request, target, &local_report);
+        report = local_report.lifecycle;
+        (void)json_push_kv_str(&reply->data, "datadir", local_report.datadir);
+        (void)json_push_kv_bool(&reply->data, "local_only", true);
+        (void)json_push_kv_bool(&reply->data, "publication", false);
+        za_push_hex(&reply->data, "transport_root", local_report.transport_root);
+    } else {
+        r = package_lifecycle_plan(datadir, target, za_now(request), &report);
+    }
     if (!r.ok) {
         za_fail(reply, report.rule[0] ? report.rule : "plan-failed",
                 r.message, command);

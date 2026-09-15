@@ -59,6 +59,7 @@
 #include "vcs/package_release.h"
 
 #include <errno.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -873,6 +874,25 @@ static bool rlc_corrupt_installed(const char *base, const char *root_hex,
     return ok;
 }
 
+/* Keep a valid accepted candidate's exact bytes intact while making only
+ * its isolated install locator unavailable to activation's fresh proof. */
+static bool rlc_candidate_locator(const char *base, const char *root_hex,
+                                   bool restore)
+{
+    char path[4500], held[4516];
+    int n = snprintf(path, sizeof(path), "%s/zcode/installed/%s/%s", base,
+                     root_hex, RLC_ZTASKS_PROGRAM);
+    if (n < 0 || (size_t)n >= sizeof(path)) return false;
+    n = snprintf(held, sizeof(held), "%s.f7-held", path);
+    if (n < 0 || (size_t)n >= sizeof(held)) return false;
+    const char *source = restore ? held : path;
+    const char *destination = restore ? path : held;
+    struct stat st;
+    if (lstat(destination, &st) == 0 || errno != ENOENT) return false;
+    if (lstat(source, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    return rename(source, destination) == 0;
+}
+
 #define RLC_APP "ztasks/ztasks"
 
 /* One serving-mode invocation of the stage-f contract (see the ADAPTER
@@ -1068,7 +1088,7 @@ static int rlc_stage_run(const struct zcl_command_spec *spec,
               "render (no hidden cross-invocation state)",
               ran_add && rlc_ok(&add) &&
               strcmp(rlc_str(&add, "result"),
-                     "1 [TODO] ship the consumer\n") == 0);
+                     "1 [OPEN] ship the consumer\n") == 0);
     rlc_end(&add);
     return failures;
 }
@@ -1128,16 +1148,30 @@ static int rlc_stage_f_labeled(const struct zcl_command_spec *spec,
  *      could not legitimately expect N+2 serving (sequencing correction
  *      per C review)
  *   f7 a VALID pending candidate is accepted, then its activate re-proof
- *      fails (passes READY, never answers the probe): the serving
+ *      fails after its install locator becomes unavailable: the serving
  *      generation is untouched, evidence naming its digest — a genuine
  *      reproof failure, never a refusal of a malformed identifier
- *      (correction per C review)
+ *      (correction per C review). Accept itself probes through the fd3
+ *      gate, so a candidate that never answers can never become pending;
+ *      the failure must be injected between accept and activate.
  *   f8 rollback: A serving → B accepted → B activated → forced B failure
  *      → EXACT A restored (same 64-hex digest) → A produces a valid result
  *   f9 restart: the same authoritative generation still serves (the
  *      record lives in product state, never process memory)
  * n, n1, n2, b are the installed ztasks generations 0.2.0/0.3.0/0.4.0/
- * 0.5.0; parker is the candidate that passes READY then never answers. */
+ * 0.5.0. The separate stage-e parker still proves bounded cancellation. */
+
+/* Accept the named candidate through the serving gate, leaving the call
+ * open for reply inspection; the caller ends it. */
+static bool rlc_accept(struct rlc_call *c,
+                       const struct zcl_command_spec *spec,
+                       const char *datadir, const struct rlc_binding *cand)
+{
+    rlc_call_serving(c, spec, datadir, RLC_APP, "accept",
+                     cand->root_hex, cand->receipt_hex, cand->sha3,
+                     RLC_ZTASKS_PROGRAM, "list");
+    return rlc_invoke(c) && rlc_ok(c);
+}
 
 /* f6/f7 shared plumbing, extracted to keep rlc_stage_f_trap under the
  * shrink-only cyclomatic-complexity ratchet: activate the pending
@@ -1185,13 +1219,36 @@ static bool rlc_serving_answers(const struct zcl_command_spec *spec,
     return ok;
 }
 
+static bool rlc_failed_activation_isolated(const struct zcl_command_spec *spec,
+    const char *datadir, const struct rlc_binding *n, const struct rlc_binding *n2)
+{
+    struct rlc_call acc_bad, act_bad;
+    rlc_call_serving(&acc_bad, spec, datadir, RLC_APP, "accept",
+                     n->root_hex, n->receipt_hex, n->sha3,
+                     RLC_ZTASKS_PROGRAM, "list");
+    bool ran_acc_bad = rlc_invoke(&acc_bad);
+    bool withheld = ran_acc_bad && rlc_ok(&acc_bad) &&
+                    rlc_candidate_locator(datadir, n->root_hex, false);
+    rlc_call_serving(&act_bad, spec, datadir, RLC_APP, "activate",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran = rlc_invoke(&act_bad);
+    bool restored = withheld && rlc_candidate_locator(datadir, n->root_hex, true);
+    bool ok = ran_acc_bad && rlc_ok(&acc_bad) && withheld && restored &&
+              ran && !rlc_ok(&act_bad) &&
+              strstr(act_bad.reply.error.evidence, n2->sha3) != NULL &&
+              rlc_serving_answers(spec, datadir, n2,
+                                  "No tasks yet (0.4.0).\n");
+    rlc_end(&acc_bad);
+    rlc_end(&act_bad);
+    return ok;
+}
+
 static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
                             const char *datadir,
                             const struct rlc_binding *n,
                             const struct rlc_binding *n1,
                             const struct rlc_binding *n2,
-                            const struct rlc_binding *b,
-                            const struct rlc_binding *parker)
+                            const struct rlc_binding *b)
 {
     int failures = 0;
     if (!rlc_have_leaf(spec, "f: serving-generation supersession + atomic "
@@ -1333,14 +1390,8 @@ static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
      * switch serving, so f7 may only expect N+2 serving after this
      * activate (sequencing correction per C review). */
     struct rlc_call acc_x, acc_y;
-    rlc_call_serving(&acc_x, spec, datadir, RLC_APP, "accept",
-                     n->root_hex, n->receipt_hex, n->sha3,
-                     RLC_ZTASKS_PROGRAM, "list");
-    bool ran_x = rlc_invoke(&acc_x);
-    rlc_call_serving(&acc_y, spec, datadir, RLC_APP, "accept",
-                     n2->root_hex, n2->receipt_hex, n2->sha3,
-                     RLC_ZTASKS_PROGRAM, "list");
-    ran = rlc_invoke(&acc_y);
+    bool ok_x = rlc_accept(&acc_x, spec, datadir, n);
+    bool ok_y = rlc_accept(&acc_y, spec, datadir, n2);
     printf("resident_launch_contract: TRAP f6 born-RED — pending candidate "
            "supersession unwired: a second accept cannot retire the first "
            "pending candidate, so an obsolete candidate would leak\n");
@@ -1349,8 +1400,7 @@ static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
               "the supersession, nothing leaks, and the successor then "
               "activates into serving (MISSING: pending supersession + "
               "successor activate)",
-              ran_x && rlc_ok(&acc_x) &&
-              ran && rlc_ok(&acc_y) &&
+              ok_x && ok_y &&
               strcmp(rlc_str(&acc_y, "pending_sha3"), n2->sha3) == 0 &&
               strcmp(rlc_str(&acc_y, "superseded_sha3"), n->sha3) == 0 &&
               rlc_no_children() &&
@@ -1359,21 +1409,10 @@ static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
     rlc_end(&acc_x);
     rlc_end(&acc_y);
 
-    /* f7 — forced candidate failure containment: the parker is accepted as
-     * a VALID pending candidate, then activate re-proves it through
-     * resident_launch; it passes READY then never answers the probe, so
-     * activation is refused, the serving generation is untouched, and the
-     * evidence names its digest.  (Correction per C review: force a
-     * genuine reproof failure of a valid pending candidate instead of
-     * handing activate an identifier that was never accepted.) */
-    struct rlc_call acc_bad, act_bad;
-    rlc_call_serving(&acc_bad, spec, datadir, RLC_APP, "accept",
-                     parker->root_hex, parker->receipt_hex, parker->sha3,
-                     RLC_PARKER_PROGRAM, "list");
-    bool ran_acc_bad = rlc_invoke(&acc_bad);
-    rlc_call_serving(&act_bad, spec, datadir, RLC_APP, "activate",
-                     NULL, NULL, NULL, NULL, "list");
-    ran = rlc_invoke(&act_bad);
+    /* f7 — first complete READY and the bounded probe for valid N. Keep
+     * its bytes intact but move its isolated install locator before fresh
+     * activation proof, then restore it after refusal. Accept itself must
+     * never bypass the full probe simply to manufacture a pending parker. */
     printf("resident_launch_contract: TRAP f7 born-RED — candidate failure "
            "containment unwired: a failed activation has no still-accepted "
            "serving digest to name and no untouched generation to "
@@ -1382,13 +1421,7 @@ static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
               "serving generation untouched and the refusal names its "
               "still-accepted 64-hex digest (MISSING: failure containment "
               "+ evidence)",
-              ran_acc_bad && rlc_ok(&acc_bad) &&
-              ran && !rlc_ok(&act_bad) &&
-              strstr(act_bad.reply.error.evidence, n2->sha3) != NULL &&
-              rlc_serving_answers(spec, datadir, n2,
-                                  "No tasks yet (0.4.0).\n"));
-    rlc_end(&acc_bad);
-    rlc_end(&act_bad);
+              rlc_failed_activation_isolated(spec, datadir, n, n2));
 
     /* f8 — rollback: A (n2) serving → B accepted → B activated → forced B
      * failure (same-length corruption of the installed bytes) → EXACT A
@@ -1458,7 +1491,222 @@ static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
 }
 
 
+/* Process-death injection is registered only in the forked test consumer.
+ * It never changes production code or the SQLite transaction result. */
+#define RLC_CRASH_APP "ztasks/crash-proof"
+static unsigned rlc_crash_write_target;
+static unsigned rlc_crash_writes;
+static bool rlc_crash_before_commit;
+
+static void rlc_real_update_crash(void *context, int operation,
+    const char *database, const char *table, sqlite3_int64 row)
+{
+    (void)context; (void)database; (void)row;
+    if (operation != SQLITE_UPDATE || strcmp(table, "resident_serving") != 0) return;
+    ++rlc_crash_writes;
+    if (rlc_crash_writes != rlc_crash_write_target || !rlc_crash_before_commit) return;
+    /* The consumer only publishes after READY, useful probe, cancel/reap.
+     * Refuse the injection if that real child remains owned or waitable. */
+    _exit(rlc_no_children() ? 71 : 74);
+}
+
+static int rlc_real_auto_extension(sqlite3 *db, char **error,
+                                    const sqlite3_api_routines *api)
+{
+    (void)error; (void)api;
+    const char *filename = sqlite3_db_filename(db, "main");
+    const char *leaf = filename ? strrchr(filename, '/') : NULL;
+    if (leaf && strcmp(leaf + 1, "resident.db") == 0)
+        (void)sqlite3_update_hook(db, rlc_real_update_crash, NULL);
+    return SQLITE_OK;
+}
+
+static void rlc_real_crash_child(const struct zcl_command_spec *spec,
+    const char *datadir, bool rollback, bool before_commit)
+{
+    rlc_crash_writes = 0;
+    rlc_crash_write_target = rollback ? 2u : 1u;
+    rlc_crash_before_commit = before_commit;
+    /* SQLite's documented auto-extension interface uses this signature
+     * erasure. Registration exists only in this disposable child process. */
+    if (sqlite3_auto_extension((void (*)(void))rlc_real_auto_extension) != SQLITE_OK)
+        _exit(70);
+    struct rlc_call call;
+    rlc_call_serving(&call, spec, datadir, RLC_CRASH_APP,
+                     rollback ? "rollback" : "activate",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran = rlc_invoke(&call);
+    bool complete = ran && rlc_ok(&call) && rlc_bool(&call, "child_reaped");
+    if (!complete || !rlc_no_children() || rlc_crash_writes != rlc_crash_write_target)
+        _exit(70);
+    /* The handler completed its durable commit and reaped the real native
+     * child. Exit without freeing the reply or normal process shutdown. */
+    _exit(before_commit ? 75 : 72);
+}
+
+static bool rlc_real_crash(const struct zcl_command_spec *spec,
+    const char *datadir, bool rollback, bool before_commit)
+{
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) rlc_real_crash_child(spec, datadir, rollback, before_commit);
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    return waited == pid && WIFEXITED(status) &&
+        WEXITSTATUS(status) == (before_commit ? 71 : 72);
+}
+
+struct rlc_crash_context {
+    const struct zcl_command_spec *spec;
+    const char *datadir;
+    const struct rlc_binding *n, *n1, *n2;
+    char nonce_n[65];
+    long long token_n;
+};
+
+static bool rlc_crash_accept(const struct rlc_crash_context *ctx,
+    const struct rlc_binding *binding, int64_t config)
+{
+    struct rlc_call call;
+    rlc_call_serving(&call, ctx->spec, ctx->datadir, RLC_CRASH_APP, "accept",
+        binding->root_hex, binding->receipt_hex, binding->sha3, RLC_ZTASKS_PROGRAM, "list");
+    (void)json_push_kv_int(&call.input, "configuration_generation", config);
+    bool ran = rlc_invoke(&call);
+    bool ok = ran && rlc_ok(&call) &&
+        strcmp(rlc_str(&call, "pending_sha3"), binding->sha3) == 0 &&
+        rlc_bool(&call, "child_reaped");
+    rlc_end(&call);
+    return ok;
+}
+
+static bool rlc_crash_observe(const struct rlc_crash_context *ctx,
+    const struct rlc_binding *binding, long long generation, long long config)
+{
+    struct rlc_call call;
+    rlc_call_serving(&call, ctx->spec, ctx->datadir, RLC_CRASH_APP, "invoke",
+        NULL, NULL, NULL, NULL, "list");
+    bool ran = rlc_invoke(&call);
+    bool ok = ran && rlc_ok(&call) &&
+        strcmp(rlc_str(&call, "artifact_sha3"), binding->sha3) == 0 &&
+        strcmp(rlc_str(&call, "receipt_id"), binding->receipt_hex) == 0 &&
+        strcmp(rlc_str(&call, "package_root"), binding->root_hex) == 0 &&
+        rlc_int(&call, "generation") == generation &&
+        rlc_int(&call, "configuration_generation") == config &&
+        rlc_bool(&call, "child_reaped") && rlc_str(&call, "result")[0];
+    rlc_end(&call);
+    return ok;
+}
+
+static bool rlc_crash_activate(struct rlc_crash_context *ctx, bool capture)
+{
+    struct rlc_call call;
+    rlc_call_serving(&call, ctx->spec, ctx->datadir, RLC_CRASH_APP, "activate",
+        NULL, NULL, NULL, NULL, "list");
+    bool ran = rlc_invoke(&call);
+    bool ok = ran && rlc_ok(&call) && rlc_bool(&call, "child_reaped");
+    if (ok && capture) {
+        (void)snprintf(ctx->nonce_n, sizeof(ctx->nonce_n), "%s", rlc_str(&call, "nonce"));
+        ctx->token_n = rlc_int(&call, "start_token");
+        ok = rlc_hex64(ctx->nonce_n) && ctx->token_n > 0;
+    }
+    rlc_end(&call);
+    return ok;
+}
+
+static bool rlc_crash_stale_child(const struct rlc_crash_context *ctx)
+{
+    struct rlc_call call;
+    rlc_call_serving(&call, ctx->spec, ctx->datadir, RLC_CRASH_APP, "invoke",
+        NULL, NULL, NULL, NULL, "list");
+    (void)json_push_kv_str(&call.input, "nonce", ctx->nonce_n);
+    (void)json_push_kv_int(&call.input, "start_token", ctx->token_n);
+    (void)json_push_kv_int(&call.input, "generation", 1);
+    bool ran = rlc_invoke(&call);
+    bool ok = ran && !rlc_ok(&call) &&
+        strstr(call.reply.error.evidence, ctx->n2->sha3) != NULL && rlc_no_children();
+    rlc_end(&call);
+    return ok;
+}
+
+static bool rlc_crash_fresh_process(const struct rlc_crash_context *ctx, bool stale)
+{
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        bool ok = stale ? rlc_crash_stale_child(ctx) : rlc_crash_observe(ctx, ctx->n2, 3, 3);
+        _exit(ok ? 0 : 1);
+    }
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    return waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int rlc_real_activation_crashes(struct rlc_crash_context *ctx)
+{
+    int failures = 0;
+    RLC_CHECK("real crash setup: N completes pending acceptance", rlc_crash_accept(ctx, ctx->n, 1));
+    RLC_CHECK("real crash setup: N activates with stored proof", rlc_crash_activate(ctx, true));
+    RLC_CHECK("real crash setup: exact N serves", rlc_crash_observe(ctx, ctx->n, 1, 1));
+    RLC_CHECK("real crash setup: N+1 passes READY and probe", rlc_crash_accept(ctx, ctx->n1, 2));
+    RLC_CHECK("real activation process killed inside serving write before COMMIT",
+        rlc_real_crash(ctx->spec, ctx->datadir, false, true));
+    RLC_CHECK("activation crash recovery preserves exact N configuration", rlc_crash_observe(ctx, ctx->n, 1, 1));
+    RLC_CHECK("real activation process exits after COMMIT", rlc_real_crash(ctx->spec, ctx->datadir, false, false));
+    RLC_CHECK("committed activation recovery selects exact N+1 configuration", rlc_crash_observe(ctx, ctx->n1, 2, 2));
+    return failures;
+}
+
+static int rlc_real_rollback_crashes(struct rlc_crash_context *ctx)
+{
+    int failures = 0;
+    RLC_CHECK("real N+2 passes READY and probe", rlc_crash_accept(ctx, ctx->n2, 3));
+    RLC_CHECK("real N+2 explicitly activates", rlc_crash_activate(ctx, false));
+    RLC_CHECK("fresh consumer process reconstructs exact N+2", rlc_crash_fresh_process(ctx, false));
+    RLC_CHECK("fresh consumer process permanently refuses stale N nonce/token/generation",
+        rlc_crash_fresh_process(ctx, true));
+    RLC_CHECK("stale refusal preserves exact N+2", rlc_crash_observe(ctx, ctx->n2, 3, 3));
+    RLC_CHECK("real rollback process killed inside serving write before COMMIT",
+        rlc_real_crash(ctx->spec, ctx->datadir, true, true));
+    RLC_CHECK("rollback crash recovery preserves exact N+2 configuration", rlc_crash_observe(ctx, ctx->n2, 3, 3));
+    RLC_CHECK("real rollback process exits after COMMIT", rlc_real_crash(ctx->spec, ctx->datadir, true, false));
+    RLC_CHECK("committed rollback recovers exact accepted N+1 configuration", rlc_crash_observe(ctx, ctx->n1, 4, 2));
+    return failures;
+}
+
+static int rlc_stage_f_process_crashes(const struct zcl_command_spec *spec,
+    const char *datadir, const struct rlc_binding *n,
+    const struct rlc_binding *n1, const struct rlc_binding *n2)
+{
+    struct rlc_crash_context ctx = {.spec = spec, .datadir = datadir,
+        .n = n, .n1 = n1, .n2 = n2};
+    int failures = rlc_real_activation_crashes(&ctx);
+    failures += rlc_real_rollback_crashes(&ctx);
+    return failures;
+}
+
 #endif /* !defined(_WIN32) */
+
+/* The fixture zcode datadir must satisfy the production resident-store
+ * ancestor-ownership gate: EVERY ancestor owned by us or root and
+ * non-group/world-writable (or sticky). The repo's test-tmp tree fails
+ * that gate on hosts with a group-writable parent (e.g. a 0775 ~/github),
+ * so this fixture roots its datadir in the sticky system temp directory —
+ * the same compliant ancestor shape a real datadir gets under a 0700
+ * home. The OS reaps the tree; aborted runs never pile into the repo. */
+static char *rlc_private_base(char *buf, size_t n)
+{
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !tmp[0]) tmp = "/tmp";
+    int wrote = snprintf(buf, n, "%s/zcl23-rlc-XXXXXX", tmp);
+    if (wrote < 0 || (size_t)wrote >= n || !mkdtemp(buf)) {
+        fprintf(stderr, "rlc_private_base: no compliant fixture datadir "
+                        "under the system temp directory\n");
+        abort();
+    }
+    return buf;
+}
 
 int test_resident_launch_contract(void)
 {
@@ -1504,7 +1752,7 @@ int test_resident_launch_contract(void)
      * its accepted-artifact records from; the reference ELF fixtures
      * themselves live in build/. */
     char base[256];
-    test_make_tmpdir(base, sizeof(base), "resident_launch_contract", "x");
+    rlc_private_base(base, sizeof(base));
     char zcode[4400];
     (void)snprintf(zcode, sizeof(zcode), "%s/zcode", base);
     failures += rlc_fixture_selfcheck(child, &child_acc);
@@ -1588,11 +1836,10 @@ int test_resident_launch_contract(void)
                   strcmp(n2.sha3, n1.sha3) != 0 &&
                   strcmp(b.sha3, n2.sha3) != 0);
         if (variants) {
-            struct rlc_binding n, pkb;
+            struct rlc_binding n;
             rlc_binding_fill(&n, ztasks_root, ztasks_receipt, ztasks_sha3);
-            rlc_binding_fill(&pkb, parker_root, parker_receipt, parker_sha3);
-            failures += rlc_stage_f_trap(spec, base, &n, &n1, &n2, &b,
-                                         &pkb);
+            failures += rlc_stage_f_trap(spec, base, &n, &n1, &n2, &b);
+            failures += rlc_stage_f_process_crashes(spec, base, &n, &n1, &n2);
         } else {
             printf("resident_launch_contract: generation variants failed "
                    "to install — the stage-f trap is blocked (counted "

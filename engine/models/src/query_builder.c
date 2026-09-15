@@ -51,6 +51,25 @@ static const struct qb_col_meta k_col[QB_COLUMN_COUNT] = {
 #undef QB_COLUMN
 };
 
+static const char *const k_schema[QB_SCHEMA_STATEMENT_COUNT] = {
+#define QB_TABLE(t)
+#define QB_COLUMN(t, c)
+#define QB_SCHEMA_STATEMENT(name, sql) [QB_S_##name] = sql,
+#include "models/query_schema.def"
+#undef QB_TABLE
+#undef QB_COLUMN
+#undef QB_SCHEMA_STATEMENT
+};
+
+const char *qb_schema_sql(enum qb_schema_statement statement)
+{
+    if ((unsigned)statement >= QB_SCHEMA_STATEMENT_COUNT) {
+        LOG_NULL("models", "schema statement id %d is outside the closed set",
+                 (int)statement);
+    }
+    return k_schema[statement];
+}
+
 /* ── Failure latch ───────────────────────────────────────────────────── */
 
 static void qb_fail(struct qb *q, const char *fmt, ...)

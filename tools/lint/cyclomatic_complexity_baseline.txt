@@ -842,7 +842,6 @@ contexts/commons/packages/zslug/src/zslug.c:utf8_decode:24
 contexts/commons/packages/zslug/src/zslug.c:zslug:35
 contexts/commons/packages/zslug/src/zslug.c:zslug_is_canonical:19
 contexts/commons/packages/zstr/app/main.c:main:20
-contexts/commons/packages/ztasks/app/main.c:task_resident:23
 contexts/commons/packages/ztemplate/src/ztemplate.c:ztemplate_parse:31
 contexts/commons/packages/ztemplate/src/ztemplate.c:ztemplate_render:18
 contexts/commons/packages/ztemplate/tests/test_ztemplate.c:ref_render:17
@@ -880,8 +879,6 @@ contexts/commons/services/src/package_lifecycle_reproduce.c:pkgl_run_reproduce_w
 contexts/commons/services/src/package_lifecycle_store.c:pkgl_materialize_package:28
 contexts/commons/services/src/package_lifecycle_store.c:pkgl_rm_rf:16
 contexts/commons/services/src/package_lifecycle_store.c:pkgl_verify_package:28
-contexts/commons/services/src/package_resident_launch.c:package_resident_start:20
-contexts/commons/services/src/package_resident_launch.c:pr_snapshot:31
 contexts/commons/services/src/zcode_benchmark_executor.c:exec_context_load:25
 contexts/commons/services/src/zcode_benchmark_executor.c:exec_policy_parse:24
 contexts/commons/services/src/zcode_benchmark_executor.c:exec_runner_fork:32
@@ -3121,7 +3118,7 @@ tests/harness/src/test_replay_canary_verdict.c:test_identity_is_captured_once_be
 tests/harness/src/test_rescanwitnesses_diverge_guard.c:test_rescanwitnesses_diverge_guard:27
 tests/harness/src/test_resident_launch_contract.c:rlc_fixture_selfcheck:18
 tests/harness/src/test_resident_launch_contract.c:rlc_publish:30
-tests/harness/src/test_resident_launch_contract.c:rlc_stage_f_trap:66
+tests/harness/src/test_resident_launch_contract.c:rlc_stage_f_trap:59
 tests/harness/src/test_resident_launch_contract.c:rlc_stage_run:26
 tests/harness/src/test_resident_launch_contract.c:test_resident_launch_contract:23
 tests/harness/src/test_retrieval.c:case_gold_metrics:39
@@ -3715,8 +3712,6 @@ tools/command/native_node_db_ro.c:zcl_ro_open_existing:18
 tools/command/native_offline_query.c:zcl_native_handle_core_consensus_producer_session_retire:20
 tools/command/native_offline_query.c:zcl_native_handle_core_sync_frontier_offline:18
 tools/command/native_overlay_intent_command.c:zcl_native_overlay_intent_run:37
-tools/command/native_package_resident_command.c:npr_input:16
-tools/command/native_package_resident_command.c:zcl_native_handle_package_resident:23
 tools/command/native_presentation_code_change_command.c:npc_includes:29
 tools/command/native_presentation_code_change_command.c:npc_lines:19
 tools/command/native_presentation_code_change_command.c:zcl_native_handle_presentation_code_change:23

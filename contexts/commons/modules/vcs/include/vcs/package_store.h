@@ -217,6 +217,9 @@ void vcs_package_store_close(struct vcs_package_store *store);
  * A caller that must decide whether the resident store already covers the
  * datadir it was handed compares against this rather than guessing. */
 const char *vcs_package_store_root_dir(const struct vcs_package_store *store);
+/* Local-only stores may build/install but never become hosting stores.
+ * Any privacy marker (including malformed or unreadable) denies hosting. */
+bool vcs_package_store_network_allowed(const struct vcs_package_store *store);
 
 /* Bind a pin/unpin plan token to the pin-relevant package facts observed
  * under the store's in-process lock: root, desired pin, current pin,

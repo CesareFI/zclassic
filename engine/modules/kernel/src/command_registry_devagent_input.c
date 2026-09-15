@@ -175,6 +175,7 @@ static bool devagent_scoped_bool(const char *path, const char *key,
          * sweep from a classification report into a removal. */
         { "ops.host.gc", "apply" },
         { "app.invoke.package", "accept_execution" },
+        { "zcode.package.add.plan", "local_only" },
     };
     if (!path)
         return false;
@@ -211,6 +212,19 @@ static bool devagent_host_gc_input(const char *path, const char *key,
     return false;
 }
 
+static bool devagent_resident_generation(const char *path, const char *key,
+    const struct json_value *value, bool *type_ok)
+{
+    if (!path || strcmp(path, "app.invoke.package") != 0 ||
+        (strcmp(key, "configuration_generation") != 0 && strcmp(key, "expected_generation") != 0 &&
+         strcmp(key, "generation") != 0 && strcmp(key, "start_token") != 0))
+        return false;
+    *type_ok = value->type == JSON_INT && json_get_int(value) >= 0 &&
+        (strcmp(key, "expected_generation") == 0 || strcmp(key, "generation") == 0 ||
+         json_get_int(value) > 0);
+    return true;
+}
+
 bool zcl_command_registry_devagent_input_ok(const char *path, const char *key,
                                             const struct json_value *value,
                                             bool *type_ok)
@@ -230,6 +244,8 @@ bool zcl_command_registry_devagent_input_ok(const char *path, const char *key,
     if (devagent_scoped_bool(path, key, value, type_ok))
         return true;
     if (devagent_host_gc_input(path, key, value, type_ok))
+        return true;
+    if (devagent_resident_generation(path, key, value, type_ok))
         return true;
     return false;
 }

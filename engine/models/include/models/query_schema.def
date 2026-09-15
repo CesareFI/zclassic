@@ -135,3 +135,58 @@ QB_COLUMN(fleet_board_posts, chain_hash)
 QB_COLUMN(fleet_board_posts, received_at)
 QB_COLUMN(fleet_board_posts, scope)
 QB_COLUMN(fleet_board_posts, room)
+
+/* resident_serving — isolated Commons acceptance projection. */
+QB_TABLE(resident_serving)
+QB_COLUMN(resident_serving, id)
+QB_COLUMN(resident_serving, app)
+QB_COLUMN(resident_serving, revision)
+QB_COLUMN(resident_serving, generation)
+QB_COLUMN(resident_serving, root)
+QB_COLUMN(resident_serving, receipt)
+QB_COLUMN(resident_serving, digest)
+QB_COLUMN(resident_serving, program)
+QB_COLUMN(resident_serving, config)
+QB_COLUMN(resident_serving, prior_root)
+QB_COLUMN(resident_serving, prior_receipt)
+QB_COLUMN(resident_serving, prior_digest)
+QB_COLUMN(resident_serving, prior_program)
+QB_COLUMN(resident_serving, prior_config)
+QB_COLUMN(resident_serving, pending_root)
+QB_COLUMN(resident_serving, pending_receipt)
+QB_COLUMN(resident_serving, pending_digest)
+QB_COLUMN(resident_serving, pending_program)
+QB_COLUMN(resident_serving, pending_config)
+QB_COLUMN(resident_serving, pending_ticket)
+QB_COLUMN(resident_serving, pending_generation)
+QB_COLUMN(resident_serving, pending_nonce)
+QB_COLUMN(resident_serving, pending_token)
+QB_COLUMN(resident_serving, current_nonce)
+QB_COLUMN(resident_serving, current_token)
+QB_COLUMN(resident_serving, consumed_ticket)
+
+/* Fixed schema/migration operations have no caller-supplied SQL. Keep them
+ * alongside the closed identifiers; ordinary row access uses the builder. */
+#ifdef QB_SCHEMA_STATEMENT
+QB_SCHEMA_STATEMENT(resident_create,
+    "CREATE TABLE IF NOT EXISTS resident_serving("
+    "id INTEGER PRIMARY KEY,app TEXT NOT NULL UNIQUE,revision INTEGER NOT NULL,"
+    "generation INTEGER NOT NULL,root TEXT NOT NULL,receipt TEXT NOT NULL,"
+    "digest TEXT NOT NULL,program TEXT NOT NULL,config INTEGER NOT NULL,"
+    "prior_root TEXT NOT NULL,prior_receipt TEXT NOT NULL,prior_digest TEXT NOT NULL,"
+    "prior_program TEXT NOT NULL,prior_config INTEGER NOT NULL,"
+    "pending_root TEXT NOT NULL,pending_receipt TEXT NOT NULL,pending_digest TEXT NOT NULL,"
+    "pending_program TEXT NOT NULL,pending_config INTEGER NOT NULL,pending_ticket INTEGER NOT NULL,"
+    "pending_generation INTEGER NOT NULL,pending_nonce TEXT NOT NULL,pending_token INTEGER NOT NULL,"
+    "current_nonce TEXT NOT NULL,current_token INTEGER NOT NULL,consumed_ticket INTEGER NOT NULL)")
+QB_SCHEMA_STATEMENT(resident_columns, "PRAGMA table_info(resident_serving)")
+QB_SCHEMA_STATEMENT(resident_legacy_rename,
+    "ALTER TABLE resident_serving RENAME TO resident_serving_legacy")
+QB_SCHEMA_STATEMENT(resident_legacy_copy,
+    "INSERT INTO resident_serving SELECT id,'@legacy',revision,generation,"
+        "root,receipt,digest,program,config,prior_root,prior_receipt,prior_digest,"
+        "prior_program,prior_config,'','','','',0,0,0,'',0,'',0,generation FROM resident_serving_legacy")
+QB_SCHEMA_STATEMENT(resident_legacy_drop, "DROP TABLE resident_serving_legacy")
+QB_SCHEMA_STATEMENT(resident_durable_begin,
+    "PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; BEGIN IMMEDIATE")
+#endif

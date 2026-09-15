@@ -77,6 +77,21 @@ enum qb_column {
 
 /* ── Small closed vocabularies ──────────────────────────────────────── */
 
+/* Closed, fixed schema operations. Returned SQL contains no caller input.
+ * Invalid IDs return NULL and log a diagnostic. Row mutations still require
+ * the ActiveRecord save lifecycle, including schema-copy migrations. */
+enum qb_schema_statement {
+#define QB_TABLE(t)
+#define QB_COLUMN(t, c)
+#define QB_SCHEMA_STATEMENT(name, sql) QB_S_##name,
+#include "models/query_schema.def"
+#undef QB_TABLE
+#undef QB_COLUMN
+#undef QB_SCHEMA_STATEMENT
+    QB_SCHEMA_STATEMENT_COUNT
+};
+const char *qb_schema_sql(enum qb_schema_statement statement);
+
 enum qb_op   { QB_EQ, QB_NE, QB_LT, QB_LE, QB_GT, QB_GE };
 enum qb_dir  { QB_ASC, QB_DESC };
 enum qb_agg  { QB_COUNT_STAR, QB_COUNT, QB_COUNT_DISTINCT, QB_SUM, QB_MIN, QB_MAX };

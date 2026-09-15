@@ -1,5 +1,8 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  * Purpose: hermetic preparation, capsule, and detached sealing proofs. */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
 
 #include "test/test_core.h"
 #include "base/hex.h"
@@ -5380,3 +5383,157 @@ int test_zcode_package_dev(void)
     secp256k1_context_destroy(ctx);
     return failures;
 }
+
+/* Local-only accepted source and no-clobber publication regression. */
+#include "services/package_local.h"
+#include "platform/private_directory.h"
+#include "platform/private_file.h"
+#include "platform/temp_directory.h"
+#include "vcs/package_store.h"
+#include "vcs/package_transport.h"
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <limits.h>
+#endif
+
+#define LOCAL_CHECK(label, expression) do { \
+    if (!(expression)) { \
+        fprintf(stderr, "package_local: %s failed at line %d\n", label, __LINE__); \
+        ++failures; goto cleanup; \
+    } \
+} while (0)
+
+#if !defined(_WIN32)
+static bool zpd_local_publish_preserves(const char *root)
+{
+    char staging[768], destination[768];
+    (void)snprintf(staging, sizeof(staging), "%s/publication-stage", root);
+    (void)snprintf(destination, sizeof(destination), "%s/publication-destination", root);
+    if (!platform_private_directory_create(staging) ||
+        !platform_private_directory_create(destination)) return false;
+    struct stat before, after;
+    if (lstat(destination, &before) != 0 ||
+        platform_private_directory_publish_no_clobber(staging, destination) ||
+        lstat(destination, &after) != 0 || before.st_ino != after.st_ino ||
+        before.st_dev != after.st_dev) return false;
+    if (!platform_private_directory_remove_empty(destination) ||
+        !platform_private_directory_publish_no_clobber(staging, destination)) return false;
+    return platform_private_path_absent(staging) &&
+        platform_private_directory_remove_empty(destination);
+}
+#endif
+
+int test_package_local(void)
+{
+#if defined(_WIN32)
+    printf("package_local: Windows install lifecycle unavailable\n");
+    return 0;
+#else
+    int failures = 0;
+    char root[PLATFORM_TEMP_PATH_MAX] = {0};
+    char source_dir[768], base[768], private_dir[800], public_zcode[800];
+    char unmarked_base[768], unmarked[800], sentinel[832], zcode[832], marker[864];
+    struct vcs_package_prepared prepared;
+    vcs_package_prepared_init(&prepared);
+    struct package_local_plan *plan = zcl_calloc(1, sizeof(*plan), "test.package.local");
+    struct vcs_package_store *store = NULL;
+    struct vcs_swarm_engine *engine = NULL;
+    struct vcs_package_store *public_before = vcs_package_store_global();
+    uint8_t *release_wire = NULL;
+    size_t release_size = 0;
+    secp256k1_context *ctx = NULL;
+    LOCAL_CHECK("plan allocation", plan);
+    LOCAL_CHECK("private fixture root", platform_temp_directory_create("z23-local-plan-", root, sizeof(root)));
+    char canonical[PATH_MAX];
+    LOCAL_CHECK("canonical fixture root", realpath(root, canonical) && strlen(canonical) < sizeof(root));
+    memcpy(root, canonical, strlen(canonical) + 1);
+    LOCAL_CHECK("existing empty publication destination preserved", zpd_local_publish_preserves(root));
+    (void)snprintf(source_dir, sizeof(source_dir), "%s/source", root);
+    (void)snprintf(base, sizeof(base), "%s/owner", root);
+    (void)snprintf(private_dir, sizeof(private_dir), "%s/local-apps", base);
+    (void)snprintf(public_zcode, sizeof(public_zcode), "%s/zcode", base);
+    (void)snprintf(unmarked_base, sizeof(unmarked_base), "%s/unmarked-owner", root);
+    (void)snprintf(unmarked, sizeof(unmarked), "%s/local-apps", unmarked_base);
+    (void)snprintf(sentinel, sizeof(sentinel), "%s/keep", unmarked);
+    LOCAL_CHECK("source fixture", zpd_fixture(source_dir, false));
+    LOCAL_CHECK("base fixture", platform_private_directory_create(base));
+    LOCAL_CHECK("unmarked base", platform_private_directory_create(unmarked_base));
+    LOCAL_CHECK("unrelated destination", mkdir(unmarked, 0755) == 0 && chmod(unmarked, 0755) == 0);
+    LOCAL_CHECK("unrelated sentinel", zpd_write(sentinel, "preserve me\n"));
+
+    ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    LOCAL_CHECK("signing context", ctx);
+    uint8_t secret[32] = {1}; /* Public deterministic test key; never custody. */
+    struct vcs_package_prepare_options options = {
+        .dir = source_dir, .publisher_sequence = 1,
+        .reward_address = "", .chain_id = "zclassic-main",
+    };
+    LOCAL_CHECK("test public key", zpd_pubkey(ctx, secret, options.publisher_pubkey));
+    char detail[256];
+    LOCAL_CHECK("prepare signed source", vcs_package_prepare(&options, &prepared, detail, sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+    LOCAL_CHECK("sign exact release", zpd_signature(ctx, secret, prepared.signing_digest, prepared.release.signature));
+    LOCAL_CHECK("release signature verifies", vcs_package_release_verify(&prepared.release) == VCS_PACKAGE_RELEASE_OK);
+    LOCAL_CHECK("release serialization", vcs_package_release_serialize(&prepared.release, &release_wire, &release_size) == VCS_PACKAGE_RELEASE_OK);
+    struct package_local_source source = {
+        .directory = source_dir, .release_wire = release_wire, .release_size = release_size,
+        .manifest_wire = prepared.manifest_wire, .manifest_size = prepared.manifest_wire_len,
+        .recipe_wire = prepared.recipe_wire, .recipe_size = prepared.recipe_wire_len,
+    };
+    memcpy(source.expected_root, prepared.package_root, 32);
+    source.expected_root[0] ^= 1;
+    LOCAL_CHECK("wrong exact root refused", !package_local_plan(base, &source, 1700000000, plan).ok);
+    LOCAL_CHECK("wrong root creates no destination", platform_private_path_absent(private_dir));
+    source.expected_root[0] ^= 1;
+
+    LOCAL_CHECK("unmarked destination refused", !package_local_plan(unmarked_base, &source, 1700000000, plan).ok);
+    struct stat before;
+    LOCAL_CHECK("unrelated mode preserved", stat(unmarked, &before) == 0 && (before.st_mode & 0777) == 0755);
+    (void)snprintf(zcode, sizeof(zcode), "%s/zcode", unmarked);
+    LOCAL_CHECK("unmarked destination not populated", platform_private_path_absent(zcode));
+    FILE *saved = fopen(sentinel, "rb");
+    char saved_text[32] = {0};
+    bool preserved = saved && fread(saved_text, 1, sizeof(saved_text), saved) == strlen("preserve me\n");
+    if (saved && fclose(saved) != 0) preserved = false;
+    LOCAL_CHECK("unrelated contents preserved", preserved && strcmp(saved_text, "preserve me\n") == 0);
+
+    struct zcl_result admitted = package_local_plan(base, &source, 1700000000, plan);
+    if (!admitted.ok) fprintf(stderr, "package_local admission: %s\n", admitted.message);
+    LOCAL_CHECK("local source admitted", admitted.ok);
+    LOCAL_CHECK("exact root plan", memcmp(plan->lifecycle.plan.target_root, prepared.package_root, 32) == 0);
+    LOCAL_CHECK("private destination selected", strcmp(plan->datadir, private_dir) == 0);
+    LOCAL_CHECK("public datadir untouched", platform_private_path_absent(public_zcode));
+    LOCAL_CHECK("global store unchanged", vcs_package_store_global() == public_before);
+    store = vcs_package_store_open(plan->datadir, vcs_package_store_quota_bytes());
+    LOCAL_CHECK("private store opens", store);
+    struct vcs_package_store_status status;
+    LOCAL_CHECK("source closure present", vcs_package_store_package_status(store, prepared.package_root, &status) && status.complete);
+    LOCAL_CHECK("private store cannot host", !vcs_package_store_network_allowed(store));
+    engine = vcs_swarm_engine_create(store, NULL, NULL, NULL, NULL);
+    LOCAL_CHECK("marked store swarm refused", engine == NULL);
+    vcs_package_store_close(store); store = NULL;
+    LOCAL_CHECK("repeat local plan", package_local_plan(base, &source, 1700000001, plan).ok);
+
+    /* A malformed marker must remain nonhosting and must not be rewritten
+     * into a grant by another local admission. */
+    (void)snprintf(marker, sizeof(marker), "%s/zcode/local-only", private_dir);
+    LOCAL_CHECK("malformed marker fixture", zpd_write(marker, "invalid\n"));
+    LOCAL_CHECK("malformed marker local refusal", !package_local_plan(base, &source, 1700000002, plan).ok);
+    store = vcs_package_store_open(private_dir, vcs_package_store_quota_bytes());
+    LOCAL_CHECK("malformed marker fails closed", store && !vcs_package_store_network_allowed(store));
+    engine = vcs_swarm_engine_create(store, NULL, NULL, NULL, NULL);
+    LOCAL_CHECK("malformed marker swarm refused", engine == NULL);
+cleanup:
+    if (engine) vcs_swarm_engine_free(engine);
+    vcs_package_store_close(store);
+    if (ctx) secp256k1_context_destroy(ctx);
+    free(release_wire);
+    vcs_package_prepared_free(&prepared);
+    free(plan);
+    if (root[0]) {
+        struct zcl_result removed = zcl_tree_remove(root);
+        if (!removed.ok) { fprintf(stderr, "package_local cleanup: %s\n", removed.message); ++failures; }
+    }
+    return failures;
+#endif
+}
+#undef LOCAL_CHECK

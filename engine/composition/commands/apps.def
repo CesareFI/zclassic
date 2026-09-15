@@ -170,13 +170,21 @@ ZCL_COMMAND_READY_COMMAND(
     "Binds an exact installed package receipt and artifact digest to a private "
     "launch snapshot, calls resident_launch, requires nonce-bound READY and one "
     "bounded text result over fd3, then cancels and reaps the child. Building "
-    "or installing never grants execution: accept_execution must explicitly "
-    "name these bytes. This local invocation changes no package activation, "
-    "wallet, node state or deployment. Hostile same-UID file writers are outside "
+    "or installing never grants execution: accept_execution must be JSON "
+    "boolean true for these exact bytes; strings, numbers, false and omission "
+    "grant no execution. For a named app, action=accept proves and saves a "
+    "pending candidate without changing the serving version; action=activate "
+    "reproves and atomically selects it. action=invoke uses the exact current "
+    "selection and action=rollback reproves its exact prior receipt, artifact "
+    "and configuration. Nonce, start_token and generation jointly bind stale "
+    "result preconditions. The legacy unnamed operation interface remains "
+    "isolated. expected_generation refuses stale "
+    "requests. This does not grant wallet, node or deployment authority. "
+    "Hostile same-UID file writers are outside "
     "the MVP snapshot authority boundary. No native-window claim is made.", 0,
     "package,resident,execute,accepted,application", "zcl.package_resident.input.v1",
     "zcl.package_resident.v1",
-    "datadir,package_root,receipt_id,artifact_sha3,program,input_text,accept_execution", "",
+    "datadir,app,action,package_root,receipt_id,artifact_sha3,program,input_text,accept_execution,operation,configuration_generation,expected_generation,nonce,start_token,generation", "",
     "z23 app invoke package --input=-",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,

@@ -2248,7 +2248,7 @@ ZCL_COMMAND_READY_COMMAND(
     "resolver.", 0,
     "zcode,use,package,dependency,lock,install",
     "zcl.zcode_use.input.v1", "zcl.zcode_use.v1",
-    "name_or_root,plan_id,now_unix,datadir", "",
+    "name_or_root,plan_id,now_unix,datadir,local_only,dir,release_hex,manifest_hex,recipe_hex", "",
     "z23 zcode use --input='{\"name_or_root\":\"<64hex>\"}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
@@ -4710,11 +4710,16 @@ ZCL_COMMAND_READY_COMMAND(
     "authorization. A dependency-rich step list is pageable with the "
     "shared `cursor`/`max_items` controls: a shortened reply carries a "
     "`_page` descriptor naming where to resume, and the complete list is "
-    "the concatenation of every page in order.",
+    "all pages in order. With local_only:true, explicit "
+    "datadir, dir, release_hex, manifest_hex and recipe_hex, verifies the signed "
+    "exact source into a private nonhosting child store without Commons publication. "
+    "Returns that store's datadir for a separate add commit; execution acceptance "
+    "remains a separate exact-artifact grant. Local planning may retain verified "
+    "source or partial content on refusal; public publication quota is unchanged.",
     0,
     "zcode,package,add,install,plan,dependency,lock,resolve",
     "zcl.zcode_add_plan.input.v1", "zcl.zcode_add_plan.v1",
-    "name_or_root,now_unix,datadir,cursor,max_items", "name_or_root",
+    "name_or_root,now_unix,datadir,cursor,max_items,local_only,dir,release_hex,manifest_hex,recipe_hex", "name_or_root",
     "z23 zcode package add plan --input='{\"name_or_root\":\"ringbuffer\"}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
