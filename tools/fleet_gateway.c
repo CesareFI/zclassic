@@ -737,54 +737,57 @@ static bool gw_credential(struct gw_buf *b, const struct json_value *id,
     return true;
 }
 
-static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
-                               const struct json_value *params,
-                               const char *node, const char *bearer,
-                               bool bearer_bad)
+/* Serialize the tool arguments with the single credential carried as
+ * the node-side "grant" input. False after emitting a typed error; the
+ * node is never forked on that path. */
+static bool gw_input_with_grant(struct gw_buf *b, const struct json_value *id,
+                                const struct json_value *params,
+                                const char *bearer, bool bearer_bad,
+                                struct gw_buf *input)
 {
-    const struct gw_tool *t;
-    const char *name;
-    struct gw_buf input;
-    struct gw_node_out out;
-    struct json_value env;
     struct json_value args;
-    const struct json_value *data;
-    name = gw_json_str(params, "name");
-    t = gw_tool_by_name(name);
-    if (!t) {
-        gw_rpc_error(b, id, -32602, "unknown tool");
-        return;
-    }
-    memset(&input, 0, sizeof(input));
-    gw_args_input(&input, params);
-    if (input.oom || !input.p) {
-        gw_buf_free(&input);
+    memset(input, 0, sizeof(*input));
+    gw_args_input(input, params);
+    if (input->oom || !input->p) {
+        gw_buf_free(input);
         gw_rpc_error(b, id, -32603, "arguments too large");
-        return;
+        return false;
     }
     json_init(&args);
-    if (!json_read(&args, input.p, input.len)) {
-        gw_buf_free(&input);
+    if (!json_read(&args, input->p, input->len)) {
+        gw_buf_free(input);
         json_free(&args);
         gw_rpc_error(b, id, -32602, "arguments did not parse");
-        return;
+        return false;
     }
     if (!gw_credential(b, id, bearer, bearer_bad, &args)) {
-        gw_buf_free(&input);
+        gw_buf_free(input);
         json_free(&args);
-        return;
+        return false;
     }
-    gw_buf_free(&input);
-    memset(&input, 0, sizeof(input));
-    gw_json_write(&input, &args);
+    gw_buf_free(input);
+    memset(input, 0, sizeof(*input));
+    gw_json_write(input, &args);
     json_free(&args);
-    if (input.oom || !input.p) {
-        gw_buf_free(&input);
+    if (input->oom || !input->p) {
+        gw_buf_free(input);
         gw_rpc_error(b, id, -32603, "arguments too large");
-        return;
+        return false;
     }
-    out = gw_node_call(node, t->verb, input.p);
-    gw_buf_free(&input);
+    return true;
+}
+
+/* Fork the node for one credentialed call and format its own envelope as
+ * the tool result content (a node refusal is content with isError:true,
+ * never a transport error). */
+static void gw_forward_call(struct gw_buf *b, const struct json_value *id,
+                            const struct gw_tool *t, const char *node,
+                            const char *input_text)
+{
+    struct gw_node_out out;
+    struct json_value env;
+    const struct json_value *data;
+    out = gw_node_call(node, t->verb, input_text);
     if (!out.ok) {
         gw_rpc_error(b, id, -32000, "node did not answer");
         return;
@@ -827,6 +830,26 @@ static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
     }
     gw_buf_str(b, "}}");
     json_free(&env);
+}
+
+static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
+                               const struct json_value *params,
+                               const char *node, const char *bearer,
+                               bool bearer_bad)
+{
+    const struct gw_tool *t;
+    const char *name;
+    struct gw_buf input;
+    name = gw_json_str(params, "name");
+    t = gw_tool_by_name(name);
+    if (!t) {
+        gw_rpc_error(b, id, -32602, "unknown tool");
+        return;
+    }
+    if (!gw_input_with_grant(b, id, params, bearer, bearer_bad, &input))
+        return;
+    gw_forward_call(b, id, t, node, input.p);
+    gw_buf_free(&input);
 }
 
 static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
