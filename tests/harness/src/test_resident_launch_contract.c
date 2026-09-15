@@ -1122,15 +1122,69 @@ static int rlc_stage_f_labeled(const struct zcl_command_spec *spec,
  *   f3 N+1 becomes READY through the fd3 gate BEFORE any switch
  *   f4 atomic switch N → N+1 (no double-serving window observable)
  *   f5 a late/stale N invocation after the switch cannot regain authority
- *   f6 rapid N+2 supersedes a pending N+1 (obsolete candidate reaped)
- *   f7 forced candidate failure leaves the serving generation untouched,
- *      evidence naming its digest
+ *   f6 rapid N+2 supersedes a pending N+1 (obsolete candidate reaped),
+ *      then the successor explicitly activates into serving — an accept
+ *      alone can never switch serving (f3), so without this activate f7
+ *      could not legitimately expect N+2 serving (sequencing correction
+ *      per C review)
+ *   f7 a VALID pending candidate is accepted, then its activate re-proof
+ *      fails (passes READY, never answers the probe): the serving
+ *      generation is untouched, evidence naming its digest — a genuine
+ *      reproof failure, never a refusal of a malformed identifier
+ *      (correction per C review)
  *   f8 rollback: A serving → B accepted → B activated → forced B failure
  *      → EXACT A restored (same 64-hex digest) → A produces a valid result
  *   f9 restart: the same authoritative generation still serves (the
  *      record lives in product state, never process memory)
  * n, n1, n2, b are the installed ztasks generations 0.2.0/0.3.0/0.4.0/
  * 0.5.0; parker is the candidate that passes READY then never answers. */
+
+/* f6/f7 shared plumbing, extracted to keep rlc_stage_f_trap under the
+ * shrink-only cyclomatic-complexity ratchet: activate the pending
+ * candidate, then prove the serving invoke answers the wanted exact
+ * digest and render. */
+static bool rlc_activate_pending_and_verify(const struct zcl_command_spec *spec,
+                                            const char *datadir,
+                                            const struct rlc_binding *want,
+                                            long long want_generation,
+                                            const char *want_result)
+{
+    struct rlc_call act, inv;
+    rlc_call_serving(&act, spec, datadir, RLC_APP, "activate",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_act = rlc_invoke(&act);
+    rlc_call_serving(&inv, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran_inv = rlc_invoke(&inv);
+    bool ok = ran_act && rlc_ok(&act) &&
+              strcmp(rlc_str(&act, "serving_sha3"), want->sha3) == 0 &&
+              rlc_int(&act, "generation") == want_generation &&
+              ran_inv && rlc_ok(&inv) &&
+              strcmp(rlc_str(&inv, "artifact_sha3"), want->sha3) == 0 &&
+              strcmp(rlc_str(&inv, "result"), want_result) == 0;
+    rlc_end(&act);
+    rlc_end(&inv);
+    return ok;
+}
+
+/* Prove the serving invoke still answers the wanted exact digest and
+ * render (the untouched-serving half of failure containment). */
+static bool rlc_serving_answers(const struct zcl_command_spec *spec,
+                                const char *datadir,
+                                const struct rlc_binding *want,
+                                const char *want_result)
+{
+    struct rlc_call inv;
+    rlc_call_serving(&inv, spec, datadir, RLC_APP, "invoke",
+                     NULL, NULL, NULL, NULL, "list");
+    bool ran = rlc_invoke(&inv);
+    bool ok = ran && rlc_ok(&inv) &&
+              strcmp(rlc_str(&inv, "artifact_sha3"), want->sha3) == 0 &&
+              strcmp(rlc_str(&inv, "result"), want_result) == 0;
+    rlc_end(&inv);
+    return ok;
+}
+
 static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
                             const char *datadir,
                             const struct rlc_binding *n,
@@ -1274,7 +1328,10 @@ static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
     rlc_end(&inv_post);
 
     /* f6 — rapid N+2 supersedes a pending N+1: the obsolete candidate is
-     * cancelled/reaped (no leak), N+2 becomes pending, serving untouched. */
+     * cancelled/reaped (no leak), N+2 becomes pending, serving untouched.
+     * The successor then activates explicitly: per f3 an accept can never
+     * switch serving, so f7 may only expect N+2 serving after this
+     * activate (sequencing correction per C review). */
     struct rlc_call acc_x, acc_y;
     rlc_call_serving(&acc_x, spec, datadir, RLC_APP, "accept",
                      n->root_hex, n->receipt_hex, n->sha3,
@@ -1289,27 +1346,34 @@ static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
            "pending candidate, so an obsolete candidate would leak\n");
     RLC_CHECK("stage f trap 6: rapid N+2 supersedes a pending N+1 cleanly — "
               "the obsolete candidate is cancelled/reaped, the reply names "
-              "the supersession, and nothing leaks (MISSING: pending "
-              "supersession)",
+              "the supersession, nothing leaks, and the successor then "
+              "activates into serving (MISSING: pending supersession + "
+              "successor activate)",
               ran_x && rlc_ok(&acc_x) &&
               ran && rlc_ok(&acc_y) &&
               strcmp(rlc_str(&acc_y, "pending_sha3"), n2->sha3) == 0 &&
               strcmp(rlc_str(&acc_y, "superseded_sha3"), n->sha3) == 0 &&
-              rlc_no_children());
+              rlc_no_children() &&
+              rlc_activate_pending_and_verify(spec, datadir, n2, 3,
+                                              "No tasks yet (0.4.0).\n"));
     rlc_end(&acc_x);
     rlc_end(&acc_y);
 
-    /* f7 — forced candidate failure containment: the parker passes READY
-     * then never answers the probe, so activation is refused, the serving
-     * generation is untouched, and the evidence names its digest. */
-    struct rlc_call act_bad, inv_keep;
-    rlc_call_serving(&act_bad, spec, datadir, RLC_APP, "activate",
+    /* f7 — forced candidate failure containment: the parker is accepted as
+     * a VALID pending candidate, then activate re-proves it through
+     * resident_launch; it passes READY then never answers the probe, so
+     * activation is refused, the serving generation is untouched, and the
+     * evidence names its digest.  (Correction per C review: force a
+     * genuine reproof failure of a valid pending candidate instead of
+     * handing activate an identifier that was never accepted.) */
+    struct rlc_call acc_bad, act_bad;
+    rlc_call_serving(&acc_bad, spec, datadir, RLC_APP, "accept",
                      parker->root_hex, parker->receipt_hex, parker->sha3,
                      RLC_PARKER_PROGRAM, "list");
-    ran = rlc_invoke(&act_bad);
-    rlc_call_serving(&inv_keep, spec, datadir, RLC_APP, "invoke",
+    bool ran_acc_bad = rlc_invoke(&acc_bad);
+    rlc_call_serving(&act_bad, spec, datadir, RLC_APP, "activate",
                      NULL, NULL, NULL, NULL, "list");
-    bool ran_keep = rlc_invoke(&inv_keep);
+    ran = rlc_invoke(&act_bad);
     printf("resident_launch_contract: TRAP f7 born-RED — candidate failure "
            "containment unwired: a failed activation has no still-accepted "
            "serving digest to name and no untouched generation to "
@@ -1318,14 +1382,13 @@ static int rlc_stage_f_trap(const struct zcl_command_spec *spec,
               "serving generation untouched and the refusal names its "
               "still-accepted 64-hex digest (MISSING: failure containment "
               "+ evidence)",
+              ran_acc_bad && rlc_ok(&acc_bad) &&
               ran && !rlc_ok(&act_bad) &&
               strstr(act_bad.reply.error.evidence, n2->sha3) != NULL &&
-              ran_keep && rlc_ok(&inv_keep) &&
-              strcmp(rlc_str(&inv_keep, "artifact_sha3"), n2->sha3) == 0 &&
-              strcmp(rlc_str(&inv_keep, "result"),
-                     "No tasks yet (0.4.0).\n") == 0);
+              rlc_serving_answers(spec, datadir, n2,
+                                  "No tasks yet (0.4.0).\n"));
+    rlc_end(&acc_bad);
     rlc_end(&act_bad);
-    rlc_end(&inv_keep);
 
     /* f8 — rollback: A (n2) serving → B accepted → B activated → forced B
      * failure (same-length corruption of the installed bytes) → EXACT A
