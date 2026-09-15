@@ -10,6 +10,7 @@
 
 struct task_editor_window {
     struct task_editor *editor;
+    bool *back;
     struct zcl_present_model_bitmap_v1 bitmap;
     struct zcl_present_window_v1 page;
     enum task_editor_status painted_status;
@@ -60,6 +61,7 @@ static struct zcl_result tw_paint(struct task_editor_window *window)
 {
     struct zcl_present_model_v1 model;
     ZCL_CHECK(task_editor_model(window->editor, &model));
+    if (window->back) (void)snprintf(model.actions[0].label, sizeof(model.actions[0].label), "Back to tasks");
     struct zcl_present_model_bitmap_v1 next = {0};
     char error[256];
     if (!zcl_present_model_render_editor_v1(&model, &next, error, sizeof(error)))
@@ -85,6 +87,13 @@ static void tw_action(struct task_editor *editor,
     if (!result.ok) LOG_ERROR("task-editor", "%s", result.message);
 }
 
+static void tw_back_intent(bool *back, const struct zcl_present_window_event_v1 *event, bool close_requested)
+{
+    if (!back) return;
+    if (event->outcome == ZCL_PRESENT_WINDOW_ACTION && event->action_index == 0) *back = true;
+    else if (close_requested && event->outcome != ZCL_PRESENT_WINDOW_ACTION) *back = false;
+}
+
 static void tw_update(void *opaque, const struct zcl_present_window_event_v1 *event,
     bool close_requested, bool *redraw, bool *allow_close)
 {
@@ -93,6 +102,7 @@ static void tw_update(void *opaque, const struct zcl_present_window_event_v1 *ev
     bool changed = false;
     struct zcl_result result = task_editor_poll(editor, &changed);
     if (!result.ok) LOG_ERROR("task-editor", "%s", result.message);
+    tw_back_intent(window->back, event, close_requested);
     tw_action(editor, event, close_requested);
     *allow_close = editor->closing && !editor->pending && !editor->dirty;
     *redraw = editor->status != window->painted_status ||
@@ -110,10 +120,10 @@ static void tw_update(void *opaque, const struct zcl_present_window_event_v1 *ev
     (void)snprintf(window->painted_failure, sizeof(window->painted_failure), "%s", editor->failure);
 }
 
-struct zcl_result task_editor_window_run(struct task_editor *editor)
+static struct zcl_result tw_run(struct task_editor *editor, bool *back)
 {
     if (!editor) return ZCL_ERR(-1, "task-editor: owner required");
-    struct task_editor_window window = { .editor = editor,
+    struct task_editor_window window = { .editor = editor, .back = back,
         .painted_status = editor->status, .display_result = ZCL_OK };
     ZCL_CHECK(tw_paint(&window));
     window.page = (struct zcl_present_window_v1){
@@ -134,4 +144,16 @@ struct zcl_result task_editor_window_run(struct task_editor *editor)
     if (!finished.ok) return finished;
     if (!opened) return ZCL_ERR(-1, "task-editor: native window unavailable: %s", error);
     return window.display_result;
+}
+
+struct zcl_result task_editor_window_run(struct task_editor *editor)
+{
+    return tw_run(editor, NULL);
+}
+
+struct zcl_result task_editor_window_back(struct task_editor *editor, bool *back)
+{
+    if (!back) return ZCL_ERR(-1, "task-editor: navigation output required");
+    *back = false;
+    return tw_run(editor, back);
 }

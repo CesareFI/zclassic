@@ -48,6 +48,8 @@ bool zcl_present_model_render_v1(const struct zcl_present_model_v1 *model,
  * Approval and confirmation views continue to use the ordinary renderer. */
 bool zcl_present_model_render_editor_v1(const struct zcl_present_model_v1 *model,
     struct zcl_present_model_bitmap_v1 *bitmap, char *error, size_t error_cap);
+bool zcl_present_model_render_list_v1(const struct zcl_present_model_v1 *model,
+    struct zcl_present_model_bitmap_v1 *bitmap, char *error, size_t error_cap);
 
 /* A bounded model may need more than one fixed native viewport. Pagination is
  * derived only from item kinds and the fixed software layout, so every

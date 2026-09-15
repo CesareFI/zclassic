@@ -226,6 +226,8 @@ static int32_t render_row(struct zcl_present_canvas *canvas,
                           int32_t y)
 {
     struct zcl_present_color accent = status_color(item->status);
+    if (item->flags & ZCL_PRESENT_ITEM_SELECTED)
+        zcl_present_canvas_stroke_rect(canvas, 36, y - 2, 648u, 41u, 2u, INFO);
     zcl_present_canvas_fill_rect(canvas, 42, y + 3, 4u, 31u, accent);
     text_fit(canvas, 58, y + 2, item->label, 14u, 238u, MUTED);
     text_fit(canvas, 310, y + 2, item->value, 16u, 366u, INK);
@@ -464,6 +466,14 @@ bool zcl_present_model_render_v1(const struct zcl_present_model_v1 *model,
 {
     return zcl_present_model_render_page_v1(model, 0, bitmap,
                                             error, error_cap);
+}
+
+bool zcl_present_model_render_list_v1(const struct zcl_present_model_v1 *model,
+    struct zcl_present_model_bitmap_v1 *bitmap, char *error, size_t error_cap)
+{
+    if (!model || model->kind != ZCL_PRESENT_MODEL_TABLE)
+        return render_error(error, error_cap, "local list requires a bounded table");
+    return render_page(model, 0, bitmap, error, error_cap, false);
 }
 
 void zcl_present_model_bitmap_free_v1(

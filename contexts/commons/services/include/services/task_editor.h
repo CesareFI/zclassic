@@ -35,6 +35,7 @@ struct zcl_result task_editor_request_close(struct task_editor *editor);
 struct zcl_result task_editor_model(const struct task_editor *editor,
     struct zcl_present_model_v1 *model);
 struct zcl_result task_editor_window_run(struct task_editor *editor);
+struct zcl_result task_editor_window_back(struct task_editor *editor, bool *back);
 /* Close calls this on the owner thread: finish the pending save, then commit
  * a newer draft once. Failure retains the draft and asks the host to stay open. */
 struct zcl_result task_editor_finish(struct task_editor *editor);

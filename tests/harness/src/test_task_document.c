@@ -3,6 +3,7 @@
 #include "test/test_core.h"
 #include "models/task_document.h"
 #include "services/task_editor.h"
+#include "services/task_list.h"
 #include "platform/time_compat.h"
 #include "platform/os_proc.h"
 #include "util/thread_registry.h"
@@ -225,6 +226,136 @@ static int te_busy(struct task_editor *editor, const char *directory)
         editor->status == TASK_EDITOR_SAVED);
     return failures;
 }
+static struct zcl_result tl_wait_test(struct task_list *list)
+{
+    int64_t end = platform_time_monotonic_us() + INT64_C(2000000);
+    while (list->editor->pending && platform_time_monotonic_us() < end) {
+        struct zcl_result result = task_list_poll(list);
+        if (!result.ok) return result;
+    }
+    if (list->editor->pending) return ZCL_ERR(-1, "list test: save not observed");
+    return ZCL_OK;
+}
+
+static bool tl_key_test(struct task_list *list, enum zcl_present_input_key key, bool shift)
+{
+    const struct zcl_present_input_v1 input = { .key = key, .shift = shift };
+    uint32_t action = UINT32_MAX;
+    return task_list_input(list, &input, &list->focus, &action);
+}
+
+static int tl_visual_test(struct task_list *list)
+{
+    int failures = 0;
+    struct zcl_present_model_v1 model;
+    struct zcl_present_model_bitmap_v1 selected = {0}, button = {0};
+    char error[256];
+    int64_t began = platform_time_monotonic_us();
+    TE_CHECK("list input moves selection", tl_key_test(list, ZCL_PRESENT_INPUT_DOWN, false));
+    bool rendered = task_list_model(list, &model).ok &&
+        zcl_present_model_render_list_v1(&model, &selected, error, sizeof(error));
+    printf("task_list: input_to_frame_us=%lld bitmap_bytes=%u\n",
+        (long long)(platform_time_monotonic_us() - began), ZCL_PRESENT_MODEL_BITMAP_BYTES);
+    TE_CHECK("list selected row has real rendered pixels", rendered);
+    TE_CHECK("Tab moves from content to New", tl_key_test(list, ZCL_PRESENT_INPUT_TAB, false) && list->focus == 0);
+    bool second = task_list_model(list, &model).ok &&
+        zcl_present_model_render_list_v1(&model, &button, error, sizeof(error));
+    TE_CHECK("list keyboard focus changes visible pixels", rendered && second &&
+        memcmp(selected.pixels, button.pixels, ZCL_PRESENT_MODEL_BITMAP_BYTES) != 0);
+    TE_CHECK("Shift-Tab returns focus to selected row", tl_key_test(list, ZCL_PRESENT_INPUT_TAB, true) && list->focus == UINT32_MAX);
+    zcl_present_model_bitmap_free_v1(&selected);
+    zcl_present_model_bitmap_free_v1(&button);
+    return failures;
+}
+
+static int tl_actions_test(struct task_list *list)
+{
+    int failures = 0;
+    struct task_editor *editor = list->editor;
+    uint64_t completed_id = list->selected_id;
+    TE_CHECK("complete starts asynchronous Saving", task_list_action(list, 2).ok && editor->pending && editor->status == TASK_EDITOR_SAVING);
+    TE_CHECK("navigation stays responsive during save", tl_key_test(list, ZCL_PRESENT_INPUT_DOWN, false));
+    uint64_t navigated_id = list->selected_id;
+    TE_CHECK("save retains newer navigation selection", tl_wait_test(list).ok && list->selected_id == navigated_id);
+    bool completed = false;
+    for (uint32_t i = 0; i < editor->saved.state.count; ++i)
+        if (editor->saved.state.tasks[i].id == completed_id) completed = editor->saved.state.tasks[i].done != 0;
+    TE_CHECK("completion changed only requested task", completed);
+    struct ta_state before = editor->saved.state;
+    TE_CHECK("Delete key enqueues selected task removal", tl_key_test(list, ZCL_PRESENT_INPUT_DELETE, false) && editor->pending);
+    TE_CHECK("deleted task is durable and undo available", tl_wait_test(list).ok && editor->saved.state.count == before.count - 1 && editor->saved.can_undo);
+    const struct zcl_present_input_v1 undo = { .key = ZCL_PRESENT_INPUT_TEXT, .character = 'z', .command = true };
+    uint32_t action = UINT32_MAX;
+    TE_CHECK("Cmd/Ctrl+Z enqueues durable undo", task_list_input(list, &undo, &list->focus, &action) && editor->pending);
+    TE_CHECK("undo restores exact contents with fresh revision", tl_wait_test(list).ok &&
+        editor->saved.state.count == before.count && editor->saved.state.revision > before.revision &&
+        memcmp(editor->saved.state.tasks, before.tasks, sizeof(before.tasks)) == 0);
+    TE_CHECK("More exposes deletion and durable undo", task_list_action(list, 3).ok && list->menu);
+    TE_CHECK("Back returns to main actions", task_list_action(list, 0).ok && !list->menu);
+    return failures;
+}
+
+static bool tl_populate(struct task_editor *editor)
+{
+    for (unsigned i = 0; i < 12; ++i) {
+        char title[32];
+        (void)snprintf(title, sizeof(title), "Task %02u", i + 1);
+        if (!task_editor_select(editor, 0).ok) return false;
+        for (size_t j = 0; title[j]; ++j)
+            if (!task_editor_type(editor, (uint8_t)title[j], false).ok) return false;
+        if (!task_editor_submit(editor, TASK_DOCUMENT_ADD).ok || !task_editor_finish(editor).ok) return false;
+    }
+    return true;
+}
+
+static int tl_failure_test(struct task_list *list, const char *directory)
+{
+    int failures = 0;
+    struct package_resident_store other = {0};
+    struct task_document row;
+    TE_CHECK("open independent task writer", package_resident_store_open_app(&other, directory, "local/list").ok);
+    TE_CHECK("read independent current revision", task_document_read(&other, &row).ok);
+    TE_CHECK("another window durably edits selected task", task_document_apply(&other,
+        row.state.revision, TASK_DOCUMENT_EDIT, list->selected_id, "Other window edit", &row).ok);
+    TE_CHECK("stale list can enqueue but cannot overwrite", task_list_action(list, 2).ok && !tl_wait_test(list).ok &&
+        list->editor->status == TASK_EDITOR_FAILED);
+    struct zcl_present_model_v1 model;
+    TE_CHECK("failed list action never displays Saved", task_list_model(list, &model).ok &&
+        strncmp(model.summary, "Save failed", 11) == 0);
+    struct task_document after;
+    TE_CHECK("failed list action preserves exact other-window data", task_document_read(&other, &after).ok &&
+        after.state.revision == row.state.revision &&
+        memcmp(after.state.tasks, row.state.tasks, sizeof(row.state.tasks)) == 0);
+    TE_CHECK("independent task writer closes", package_resident_store_close(&other).ok);
+    return failures;
+}
+
+static int tl_acceptance(const char *directory)
+{
+    int failures = 0;
+    struct task_editor editor = {0};
+    TE_CHECK("open empty task-list store", task_editor_open(&editor, directory, "local/list").ok);
+    struct task_list list;
+    task_list_init(&list, &editor);
+    struct zcl_present_model_v1 model;
+    char error[256];
+    TE_CHECK("empty list validates with obvious New action", task_list_model(&list, &model).ok &&
+        zcl_present_model_validate_v1(&model, error, sizeof(error)) && strcmp(model.actions[0].label, "New task") == 0);
+    TE_CHECK("create twelve durable tasks", tl_populate(&editor) && editor.saved.state.count == 12);
+    task_list_refresh(&list);
+    TE_CHECK("End scrolls selected row into viewport", tl_key_test(&list, ZCL_PRESENT_INPUT_END, false) && list.selected == 11 && list.first == 4);
+    TE_CHECK("Home restores first row and viewport", tl_key_test(&list, ZCL_PRESENT_INPUT_HOME, false) && list.selected == 0 && list.first == 0);
+    failures += tl_visual_test(&list);
+    failures += tl_actions_test(&list);
+    struct task_editor reopened = {0};
+    TE_CHECK("reopen retains exact list contents", task_editor_open(&reopened, directory, "local/list").ok &&
+        reopened.saved.state.count == editor.saved.state.count &&
+        memcmp(reopened.saved.state.tasks, editor.saved.state.tasks, sizeof(editor.saved.state.tasks)) == 0);
+    failures += tl_failure_test(&list, directory);
+    TE_CHECK("list releases its save worker", task_editor_finish(&editor).ok && !editor.pending);
+    return failures;
+}
+
 static int td_editor_acceptance(const char *directory)
 {
     int failures = 0;
@@ -235,6 +366,7 @@ static int td_editor_acceptance(const char *directory)
     struct task_editor editor = {0};
     struct zcl_result opened = task_editor_open(&editor, directory, "local/editor");
     if (!opened.ok) { fprintf(stderr, "task_editor: open: %s\n", opened.message); return 1; }
+    failures += tl_acceptance(directory);
     failures += te_drafts(&editor);
     failures += te_busy(&editor, directory);
     struct task_editor reopened = {0};

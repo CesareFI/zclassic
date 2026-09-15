@@ -256,6 +256,35 @@ struct zcl_present_window_live_form_v1 {
         const struct zcl_present_window_event_v1 *event,
         bool close_requested, bool *redraw, bool *allow_close);
 };
+enum zcl_present_input_key {
+    ZCL_PRESENT_INPUT_NONE, ZCL_PRESENT_INPUT_UP, ZCL_PRESENT_INPUT_DOWN,
+    ZCL_PRESENT_INPUT_HOME, ZCL_PRESENT_INPUT_END, ZCL_PRESENT_INPUT_PAGE_UP,
+    ZCL_PRESENT_INPUT_PAGE_DOWN, ZCL_PRESENT_INPUT_TAB, ZCL_PRESENT_INPUT_ENTER,
+    ZCL_PRESENT_INPUT_DELETE, ZCL_PRESENT_INPUT_ESCAPE, ZCL_PRESENT_INPUT_TEXT,
+    ZCL_PRESENT_INPUT_CLICK,
+};
+struct zcl_present_input_v1 {
+    enum zcl_present_input_key key;
+    uint32_t character, x, y;
+    bool shift, command;
+};
+/* Trusted local interaction owner. Input returns true when consumed. Focus
+ * UINT32_MAX belongs to the content; other values select the native action
+ * row. Action UINT32_MAX means no activation. No callback enters wire data. */
+struct zcl_present_window_live_view_v1 {
+    struct zcl_present_window_live_form_v1 owner;
+    bool (*input)(void *context, const struct zcl_present_input_v1 *input,
+                  uint32_t *focus, uint32_t *action);
+};
+bool zcl_present_window_run_live_view_v1(
+    const struct zcl_present_window_pages_v1 *pages, uint32_t action_count,
+    const struct zcl_present_window_live_view_v1 *live,
+    char *error, size_t error_cap);
+/* Same letterboxed coordinate conversion used by native buttons and lists. */
+bool zcl_present_window_source_point_v1(
+    uint32_t source_width, uint32_t source_height,
+    int32_t target_width, int32_t target_height, int32_t mouse_x, int32_t mouse_y,
+    uint32_t *source_x, uint32_t *source_y);
 bool zcl_present_window_run_live_form_v1(
     const struct zcl_present_window_pages_v1 *pages,
     struct zcl_present_window_form_v1 *form,

@@ -3,6 +3,7 @@
 #include "command/native_command.h"
 #include "models/task_document.h"
 #include "services/task_editor.h"
+#include "services/task_list.h"
 #include "platform/private_directory.h"
 #include "platform/time_compat.h"
 #include "util/log_macros.h"
@@ -52,6 +53,11 @@ static struct zcl_result ntd_editor(const struct json_value *input,
 {
     struct task_editor editor = {0};
     ZCL_CHECK(task_editor_open(&editor, ntd_string(input, "datadir"), store->app));
+    if (!new_task && !json_get(input, "task_id")) {
+        ZCL_CHECK(task_list_window_run(&editor));
+        *row = editor.saved;
+        return ZCL_OK;
+    }
     uint64_t id = 0;
     if (!new_task) {
         if (json_get(input, "task_id")) {

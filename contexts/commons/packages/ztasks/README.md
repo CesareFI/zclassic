@@ -13,16 +13,26 @@ The host supplies add/edit/complete/delete, undo, presentation and durable write
 
 ## Local task editor
 
-Choose a private directory for your task data, then open a new task or the first
-saved task with the native host:
+Choose a private directory for your task data, then open a new task or the task
+list with the native host:
 
 ```sh
-z23 app tasks --datadir="$HOME/Tasks" --action=new
-z23 app tasks --datadir="$HOME/Tasks" --action=open
+task_datadir="$HOME/Tasks"
+z23 app tasks new "$task_datadir"
+z23 app tasks open "$task_datadir"
 ```
 
-`open` also accepts `task_id` to select a saved task. The current window edits one
-task. Save keeps it open; Close saves the latest valid draft before closing.
+`open` shows the task list; `task_id` opens one saved task directly. The list
+offers New task, Edit, Complete/Reopen, and More with Delete and durable Undo.
+Arrows, Home/End and Page Up/Down move the selection and scroll it into view.
+Tab/Shift-Tab move between the list and action buttons; Enter edits the selected
+task, Space toggles completion, Delete removes it, and Cmd/Ctrl+Z undoes the last
+durable change. Cmd/Ctrl+N opens a new task. Selected rows have a visible focus
+border. The list displays eight rows at a time and retains selection while a
+save completes.
+
+Save keeps the editor open; Back to tasks saves the latest valid draft before
+returning to the list. Closing the editor window saves before exiting the app.
 Saving runs on an owned worker. Saving, Saved and Save failed describe the durable
 save state; a failed save retains the draft. Tab and Shift-Tab move focus between
 the title and actions. Titles currently use up to 95 Basic Latin characters and
@@ -31,11 +41,11 @@ the reused state codec bounds a document to 32 tasks.
 Headless `app tasks` actions are `list`, `add`, `edit`, `complete`, `reopen`,
 `delete` and `undo`. Changes require `expected_revision` from the last read;
 stale edits refuse. Undo survives restarting the host. These operations remain
-available while the task-list window and its complete/delete/undo controls are
-being built.
+available for automation and headless use.
 
 `tests/harness/src/test_task_document.c` exercises persistence, failed commits,
-busy storage, newer typing during a save, native form pixels and keyboard focus.
+busy storage, newer typing during a save, native form/list pixels, keyboard focus,
+list navigation during a save, deletion/undo, restart and conflicting writers.
 Real macOS desktop interaction remains OPEN pending desktop access. App update
 preview, acceptance and rollback compatibility are not yet qualified by this
 task editor. Package reproduction alone does not establish GUI interaction or

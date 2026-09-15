@@ -5,15 +5,21 @@
 
 #include "presentation/model_render.h"
 
-static bool present_source_point(
+static bool present_point_dimensions(uint32_t source_width, uint32_t source_height,
+    int32_t target_width, int32_t target_height, int32_t mouse_x, int32_t mouse_y)
+{
+    return source_width != 0 && source_height != 0 && target_width > 0 &&
+        target_height > 0 && mouse_x >= 0 && mouse_y >= 0;
+}
+
+bool zcl_present_window_source_point_v1(
     uint32_t source_width, uint32_t source_height,
     int32_t target_width, int32_t target_height,
     int32_t mouse_x, int32_t mouse_y,
     uint32_t *source_x, uint32_t *source_y)
 {
-    if (!source_x || !source_y || source_width == 0 || source_height == 0 ||
-        target_width <= 0 || target_height <= 0 ||
-        mouse_x < 0 || mouse_y < 0)
+    if (!source_x || !source_y || !present_point_dimensions(source_width,
+        source_height, target_width, target_height, mouse_x, mouse_y))
         return false;
     uint32_t draw_width = (uint32_t)target_width;
     uint32_t draw_height = (uint32_t)((uint64_t)draw_width * source_height /
@@ -47,7 +53,7 @@ bool zcl_present_window_action_at_v1(
         action_count > ZCL_PRESENT_WINDOW_ACTIONS_MAX)
         return false;
     uint32_t source_x = 0, source_y = 0;
-    if (!present_source_point(source_width, source_height,
+    if (!zcl_present_window_source_point_v1(source_width, source_height,
                               target_width, target_height,
                               mouse_x, mouse_y, &source_x, &source_y))
         return false;
@@ -83,7 +89,7 @@ bool zcl_present_window_hover_at_v1(
         hover->plot_right > source_width || hover->plot_bottom > source_height)
         return false;
     uint32_t source_x = 0, source_y = 0;
-    if (!present_source_point(source_width, source_height,
+    if (!zcl_present_window_source_point_v1(source_width, source_height,
                               target_width, target_height,
                               mouse_x, mouse_y, &source_x, &source_y) ||
         source_x < hover->plot_left || source_x > hover->plot_right ||
@@ -116,7 +122,7 @@ bool zcl_present_window_copy_at_v1(
         copy->right > source_width || copy->bottom > source_height)
         return false;
     uint32_t source_x = 0, source_y = 0;
-    return present_source_point(
+    return zcl_present_window_source_point_v1(
                source_width, source_height, target_width, target_height,
                mouse_x, mouse_y, &source_x, &source_y) &&
            source_x >= copy->left && source_x < copy->right &&

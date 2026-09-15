@@ -668,7 +668,7 @@ static bool present_redraw(
 }
 
 static void present_live_pump(
-    const struct zcl_present_window_live_form_v1 *live,
+    const struct zcl_present_window_live_view_v1 *live, uint32_t action_count,
     RGFW_window *window, const struct zcl_present_window_v1 *page,
     RGFW_surface **surface, uint8_t **scaled_pixels,
     struct zcl_present_window_form_v1 *form, uint32_t focus,
@@ -677,17 +677,77 @@ static void present_live_pump(
 {
     if (!live) return;
     bool redraw = false, close = false;
-    live->update(live->context, event, RGFW_window_shouldClose(window),
+    live->owner.update(live->owner.context, event, RGFW_window_shouldClose(window),
                  &redraw, &close);
     if (redraw) RGFW_window_setName(window, page->title ? page->title : "ZClassic23");
     if (redraw && paint)
-        (void)present_redraw(window, page, surface, scaled_pixels, 2u,
+        (void)present_redraw(window, page, surface, scaled_pixels, action_count,
             focus, form, NULL, NULL, UINT32_MAX, required_invalid);
     RGFW_window_setShouldClose(window, close);
     if (!close) {
         event->outcome = ZCL_PRESENT_WINDOW_DISMISSED;
         event->action_index = UINT32_MAX;
     }
+}
+
+static enum zcl_present_input_key present_live_key(RGFW_key key)
+{
+    static const struct { RGFW_key native; enum zcl_present_input_key key; } keys[] = {
+        {RGFW_up, ZCL_PRESENT_INPUT_UP}, {RGFW_down, ZCL_PRESENT_INPUT_DOWN},
+        {RGFW_home, ZCL_PRESENT_INPUT_HOME}, {RGFW_end, ZCL_PRESENT_INPUT_END},
+        {RGFW_pageUp, ZCL_PRESENT_INPUT_PAGE_UP}, {RGFW_pageDown, ZCL_PRESENT_INPUT_PAGE_DOWN},
+        {RGFW_tab, ZCL_PRESENT_INPUT_TAB}, {RGFW_return, ZCL_PRESENT_INPUT_ENTER},
+        {RGFW_delete, ZCL_PRESENT_INPUT_DELETE}, {RGFW_backSpace, ZCL_PRESENT_INPUT_DELETE},
+        {RGFW_escape, ZCL_PRESENT_INPUT_ESCAPE},
+    };
+    for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); ++i)
+        if (keys[i].native == key) return keys[i].key;
+    return ZCL_PRESENT_INPUT_TEXT;
+}
+
+static bool present_live_event(RGFW_window *window,
+    const struct zcl_present_window_v1 *page, const RGFW_event *event,
+    struct zcl_present_input_v1 *input)
+{
+    *input = (struct zcl_present_input_v1){0};
+    if (event->type == RGFW_keyPressed) {
+        input->key = present_live_key(event->key.value);
+        input->character = event->key.sym;
+        input->shift = (event->key.mod & RGFW_modShift) != 0;
+        input->command = (event->key.mod & (RGFW_modControl | RGFW_modSuper)) != 0;
+        return true;
+    }
+    if (event->type == RGFW_mouseScroll) {
+        input->key = event->scroll.y < 0 ? ZCL_PRESENT_INPUT_DOWN : ZCL_PRESENT_INPUT_UP;
+        return event->scroll.y != 0;
+    }
+    if (event->type != RGFW_mouseButtonPressed || event->button.value != RGFW_mouseLeft)
+        return false;
+    i32 width = 0, height = 0, x = 0, y = 0;
+    (void)RGFW_window_getSize(window, &width, &height);
+    input->key = ZCL_PRESENT_INPUT_CLICK;
+    return RGFW_window_getMouse(window, &x, &y) &&
+        zcl_present_window_source_point_v1(page->width, page->height,
+            width, height, x, y, &input->x, &input->y);
+}
+
+static bool present_live_input(const struct zcl_present_window_live_view_v1 *live,
+    RGFW_window *window, const struct zcl_present_window_v1 *page,
+    const RGFW_event *event, uint32_t action_count, uint32_t *focus,
+    struct zcl_present_window_event_v1 *result)
+{
+    if (!live || !live->input) return false;
+    struct zcl_present_input_v1 input;
+    if (!present_live_event(window, page, event, &input)) return false;
+    uint32_t action = UINT32_MAX;
+    bool consumed = live->input(live->owner.context, &input, focus, &action);
+    if (*focus >= action_count) *focus = UINT32_MAX;
+    if (action < action_count) {
+        result->outcome = ZCL_PRESENT_WINDOW_ACTION;
+        result->action_index = action;
+        RGFW_window_setShouldClose(window, RGFW_TRUE);
+    }
+    return consumed;
 }
 
 static bool present_show_copy_feedback(
@@ -764,6 +824,17 @@ static bool present_form_geometry(
         pages->pages[0].height == ZCL_PRESENT_MODEL_BITMAP_HEIGHT);
 }
 
+static bool present_canvas_geometry(const struct zcl_present_window_pages_v1 *pages,
+    const struct zcl_present_window_canvas_v1 *canvas, uint32_t action_count,
+    char *error, size_t error_cap)
+{
+    return !canvas || (zcl_present_window_canvas_validate_v1(canvas, error, error_cap) &&
+        action_count == 2u && pages->page_count == 1u &&
+        pages->pages[0].pixel_format == ZCL_PRESENT_RGB8 &&
+        pages->pages[0].width == ZCL_PRESENT_MODEL_BITMAP_WIDTH &&
+        pages->pages[0].height == ZCL_PRESENT_MODEL_BITMAP_HEIGHT);
+}
+
 static bool present_run_pages_actions(
     const struct zcl_present_window_pages_v1 *pages,
     uint32_t action_count,
@@ -775,7 +846,7 @@ static bool present_run_pages_actions(
     const struct zcl_present_window_copy_v1 *copy,
     zcl_present_window_ready_fn ready,
     void *ready_context,
-    const struct zcl_present_window_live_form_v1 *live,
+    const struct zcl_present_window_live_view_v1 *live,
     struct zcl_present_window_event_v1 *result,
     char *error, size_t error_cap)
 {
@@ -806,15 +877,10 @@ static bool present_run_pages_actions(
     if (!present_form_geometry(pages, form, action_count, error, error_cap))
         return present_error(error, error_cap,
                              "presentation form geometry/actions are invalid");
-    if (live && (!live->update || !form))
+    if (live && !live->owner.update)
         return present_error(error, error_cap,
                              "presentation live form owner is invalid");
-    if (canvas && (!zcl_present_window_canvas_validate_v1(
-                       canvas, error, error_cap) ||
-                   action_count != 2u || pages->page_count != 1u ||
-                   pages->pages[0].pixel_format != ZCL_PRESENT_RGB8 ||
-                   pages->pages[0].width != ZCL_PRESENT_MODEL_BITMAP_WIDTH ||
-                   pages->pages[0].height != ZCL_PRESENT_MODEL_BITMAP_HEIGHT))
+    if (!present_canvas_geometry(pages, canvas, action_count, error, error_cap))
         return present_error(error, error_cap,
                              "presentation canvas geometry/actions are invalid");
     if (hovers) {
@@ -877,7 +943,7 @@ static bool present_run_pages_actions(
     }
     RGFW_surface *surface = NULL;
     uint8_t *scaled_pixels = NULL;
-    uint32_t focused_control = 0;
+    uint32_t focused_control = live && live->input ? UINT32_MAX : 0;
     uint32_t hover_index = (hover && !hovers_first_page_only)
         ? hover->item_count - 1u : UINT32_MAX;
     bool required_invalid = false;
@@ -909,6 +975,12 @@ static bool present_run_pages_actions(
         bool saw_event = false;
         while (RGFW_window_checkEvent(window, &event)) {
             saw_event = true;
+            if (present_live_input(live, window, request, &event, action_count,
+                                   &focused_control, result)) {
+                present_live_pump(live, action_count, window, request, &surface,
+                    &scaled_pixels, form, focused_control, required_invalid, result, true);
+                continue;
+            }
             if (event.type == RGFW_windowResized) {
                 i32 resized_width = 0;
                 i32 resized_height = 0;
@@ -1165,7 +1237,7 @@ static bool present_run_pages_actions(
                     required_invalid = false;
                 }
                 if (changed) {
-                    present_live_pump(live, window, request, &surface,
+                    present_live_pump(live, action_count, window, request, &surface,
                         &scaled_pixels, form, focused_control, required_invalid,
                         result, false);
                     (void)present_redraw(
@@ -1260,7 +1332,7 @@ static bool present_run_pages_actions(
                 RGFW_window_setShouldClose(window, RGFW_TRUE);
             }
         }
-        present_live_pump(live, window, request, &surface, &scaled_pixels,
+        present_live_pump(live, action_count, window, request, &surface, &scaled_pixels,
             form, focused_control, required_invalid, result, true);
         if (!saw_event && !RGFW_window_shouldClose(window)) RGFW_waitForEvent(100);
     }
@@ -1310,7 +1382,20 @@ bool zcl_present_window_run_live_form_v1(
     if (!live || !live->update)
         return present_error(error, error_cap, "presentation live form owner is required");
     struct zcl_present_window_event_v1 event;
+    const struct zcl_present_window_live_view_v1 owner = { .owner = *live };
     return present_run_pages_actions(pages, 2u, form, NULL, NULL, false,
+        0u, NULL, NULL, NULL, &owner, &event, error, error_cap);
+}
+
+bool zcl_present_window_run_live_view_v1(
+    const struct zcl_present_window_pages_v1 *pages, uint32_t action_count,
+    const struct zcl_present_window_live_view_v1 *live,
+    char *error, size_t error_cap)
+{
+    if (!live || !live->owner.update || !live->input || !pages || pages->page_count != 1)
+        return present_error(error, error_cap, "presentation live view owner and one page required");
+    struct zcl_present_window_event_v1 event;
+    return present_run_pages_actions(pages, action_count, NULL, NULL, NULL, false,
         0u, NULL, NULL, NULL, live, &event, error, error_cap);
 }
 
