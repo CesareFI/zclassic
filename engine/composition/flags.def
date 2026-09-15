@@ -298,13 +298,13 @@ Z23_FLAG("ZCL_C3_STOPWATCH_HISTORY", "make_var", "-", "-",
 Z23_FLAG("ZCL_C3_TIP_DATADIR", "env_build", "-", "-",
           "undocumented; first use tools/scripts/cold_start_to_tip_probe.sh:77")
 Z23_FLAG("ZCL_CANARY_NO_EXACT", "env_build", "0", "-",
-          "undocumented; first use tools/scripts/replay_canary.sh:582")
+          "undocumented; first use tools/scripts/replay_canary.sh:594")
 Z23_FLAG("ZCL_CANARY_SELFTEST_BLOCK_FIFO", "env_build", "-", "-",
-          "undocumented; first use tools/scripts/replay_canary.sh:621")
+          "undocumented; first use tools/scripts/replay_canary.sh:633")
 Z23_FLAG("ZCL_CANARY_SELFTEST_DIR", "env_build", "-", "-",
           "undocumented; first use tools/scripts/replay_canary.sh:67")
 Z23_FLAG("ZCL_CANARY_SELFTEST_NODE_BIN", "env_build", "-", "-",
-          "undocumented; first use tools/scripts/replay_canary.sh:610")
+          "undocumented; first use tools/scripts/replay_canary.sh:622")
 Z23_FLAG("ZCL_CANARY_VERDICT_DIR", "env_runtime", "-", "-",
           "undocumented; first use engine/services/src/canary_sentinel_watch.c:137")
 Z23_FLAG("ZCL_CAP_CLOSURE_COVERAGE_BASELINE", "env_build", "-", "-",
@@ -1980,7 +1980,7 @@ Z23_FLAG("ZCL_RPC_MAX_TIME_SECS", "env_runtime", "30", "-",
 Z23_FLAG("ZCL_RPC_QUEUE_WAIT_MS", "env_runtime", "-", "-",
           "undocumented; first use engine/modules/rpc/src/httpserver.c:327")
 Z23_FLAG("ZCL_RPC_TIMEOUT_MS", "env_build", "120000", "-",
-          "undocumented; first use tools/scripts/replay_canary.sh:134")
+          "undocumented; first use tools/scripts/replay_canary.sh:146")
 Z23_FLAG("ZCL_RPC_TLS_CERT", "env_runtime", "-", "-",
           "undocumented; first use engine/modules/rpc/src/httpserver.c:419")
 Z23_FLAG("ZCL_RPC_TLS_KEY", "env_runtime", "-", "-",

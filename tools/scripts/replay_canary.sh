@@ -112,11 +112,23 @@ EXPECTED_SHA3="5817f0ec66738db6989cf881cf37b2148d07b978fd69e5a334855b4991ac5f85"
 #            shielded-history import interlude (stop → import → respawn)
 #            joined the anchor track: the ~45-min replay plus the import
 #            and a second boot still sit far under 2 h.
-#   genesis: floor 3600 (1 h), ceiling 28800 (8 h == the hard budget).
+#   genesis: floor 3600 (1 h), ceiling 432000 (120 h). The ceiling was
+#            28800 (8 h, "~1.3x the ~6-h expectation") until 2026-09-15,
+#            when measured full-validation throughput made that envelope
+#            unreachable on the maintainer host class: the 2026-08-22
+#            attempt died budget_exceeded at h=353,425 after 28,808 s
+#            (~12 blk/s sustained), the 2026-08-24 note below recorded
+#            33 blk/s against the ~112 blk/s the 8 h budget assumes, and
+#            the 2026-09-15 candidate run decelerated 166 -> 21 blk/s by
+#            h=288k. 3.25M blocks at 12-33 blk/s is 27-75 h; 120 h covers
+#            the slow measured box with margin, stays inside the 7-day
+#            canary freshness gate, and remains a degenerate-run guard.
+#            Owner-authorized envelope repair: the C8 gate substance
+#            (zero rejects, anchor SHA3, tip/supply equality) is unchanged.
 ANCHOR_ELAPSED_MIN=300
 ANCHOR_ELAPSED_MAX=7200
 GENESIS_ELAPSED_MIN=3600
-GENESIS_ELAPSED_MAX=28800
+GENESIS_ELAPSED_MAX=432000
 
 # The verdict probes call heavyweight read-only audit RPCs whose cost scales
 # with the UTXO set, not with the walk: getutxocommitment recomputes the
@@ -687,10 +699,11 @@ run_live() {
 
     # Default budgets: anchor 7200 s (120 min — ~45-min replay + the
     # shielded-import interlude + a second boot, 1.6x headroom); genesis
-    # 28800 s (8 h, ~1.3x the ~6-h expectation).
+    # defaults to GENESIS_ELAPSED_MAX (120 h — see the measured-throughput
+    # note at the constant; the 8 h default predated those measurements).
     local budget
     if [ -n "$BUDGET_SEC" ]; then budget="$BUDGET_SEC"
-    elif [ "$FROM" = "genesis" ]; then budget=28800
+    elif [ "$FROM" = "genesis" ]; then budget="$GENESIS_ELAPSED_MAX"
     else budget=7200; fi
 
     # Distinct port bases so a nightly + a (rare) overlapping weekly cannot
