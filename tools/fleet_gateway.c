@@ -17,8 +17,11 @@
  * port, refuses non-loopback peers with 403, serves plain HTTP. TLS
  * termination and OAuth live in front of it (host front path) and behind
  * it the node enforces every grant scope, expiry and revocation itself.
- * A bearer passed as a tool argument is carried, never minted here, and
+ * A bearer passed as a tool argument is carried (header or tool argument), never minted here, and
  * never logged. No credentials in chat, no private data made public.
+ * Every tools/call needs exactly one credential (header or "grant"
+ * argument); a call with none, or two that differ, is refused with a
+ * typed error before the node is forked.
  *
  * TOOL SURFACE (frozen with the verbs). initialize / notifications /
  * tools.list / tools.call for steer_brief, steer_send, steer_evidence.
@@ -219,7 +222,25 @@ struct gw_http {
     char *body;
     size_t body_len;
     bool bad;
+    /* Captured "Authorization: Bearer <token>" credential, NUL-terminated
+     * when auth_present. Overlong or non-token bytes set auth_bad instead;
+     * both refuse a tool call before the node is forked. */
+    char auth[96 + 1];
+    bool auth_present;
+    bool auth_bad;
 };
+
+/* Bearer [REDACTED] alphabet: grant ids are 32-hex today; OAuth bearer
+ * tokens (base64url/JWT shapes) must also pass through untouched for the
+ * node to rule on. Anything outside this set cannot be a credential. */
+static bool gw_token_char(char c)
+{
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9'))
+        return true;
+    return c == '.' || c == '_' || c == '~' || c == '+' || c == '/' ||
+           c == '-' || c == '=';
+}
 
 static bool gw_is_space(char c)
 {
@@ -251,13 +272,65 @@ static bool gw_parse_request_line(struct gw_http *h, const char *line)
     return h->method[0] && h->path[0] && h->path[0] == '/';
 }
 
-/* One header line: only Content-Length is honored. */
+/* Header-name match, case-insensitive, over the raw line. */
+static bool gw_header_is(const char *line, const char *name)
+{
+    size_t i;
+    for (i = 0; name[i]; i++) {
+        char a = line[i];
+        if (a == '\0')
+            return false;
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a - 'A' + 'a');
+        if (a != name[i])
+            return false;
+    }
+    return line[i] == ':';
+}
+
+/* Capture "Authorization: Bearer <token>". Only the exact Bearer scheme
+ * carries a credential; any other scheme leaves auth_present false so the
+ * call fails closed as unauthenticated rather than half-authenticated. */
+static void gw_parse_authorization(struct gw_http *h, const char *line)
+{
+    static const char bearer[] = "Bearer ";
+    const char *v = line + strlen("authorization:");
+    size_t n = 0;
+    if (h->auth_present || h->auth_bad)
+        return;
+    while (gw_is_space(*v))
+        v++;
+    if (strncmp(v, bearer, sizeof(bearer) - 1) != 0)
+        return;
+    v += sizeof(bearer) - 1;
+    while (v[n] && !gw_is_space(v[n])) {
+        if (n >= sizeof(h->auth) - 1 || !gw_token_char(v[n])) {
+            h->auth_bad = true;
+            return;
+        }
+        h->auth[n] = v[n];
+        n++;
+    }
+    if (n == 0) {
+        /* "Bearer " with an empty token is no credential at all. */
+        return;
+    }
+    h->auth[n] = '\0';
+    h->auth_present = true;
+}
+
+/* One header line: Content-Length sizes the body; Authorization carries
+ * the tool-call credential. Every other header is ignored. */
 static void gw_parse_header(struct gw_http *h, const char *line)
 {
     static const char *const cl = "content-length:";
     size_t k = strlen(cl), i;
     const char *v;
     unsigned long n = 0;
+    if (gw_header_is(line, "authorization")) {
+        gw_parse_authorization(h, line);
+        return;
+    }
     for (i = 0; i < k; i++) {
         char a = line[i];
         if (a == '\0')
@@ -626,15 +699,55 @@ static void gw_args_input(struct gw_buf *b, const struct json_value *params)
         gw_buf_str(b, "{}");
 }
 
+/* Fail-closed credential rule. A tool call reaches the node only with
+ * exactly one credential: the Authorization Bearer [REDACTED] the tool-argument
+ * grant. Neither may be ambiguous, and the node is never forked for an
+ * unauthenticated call — its operator authority stays local-only. Scope,
+ * expiry and revocation remain node-enforced after forwarding. */
+static bool gw_credential(struct gw_buf *b, const struct json_value *id,
+                          const char *bearer, bool bearer_bad,
+                          struct json_value *args)
+{
+    const struct json_value *g;
+    const char *arg_grant = NULL;
+    g = json_get(args, "grant");
+    if (g && g->type == JSON_STR)
+        arg_grant = json_get_str((struct json_value *)g);
+    if (arg_grant && !arg_grant[0])
+        arg_grant = NULL;
+    if (bearer_bad) {
+        gw_rpc_error(b, id, -32002, "bad grant credential");
+        return false;
+    }
+    if (!bearer && !arg_grant) {
+        gw_rpc_error(b, id, -32001, "grant required");
+        return false;
+    }
+    if (bearer && arg_grant && strcmp(bearer, arg_grant) != 0) {
+        gw_rpc_error(b, id, -32002, "conflicting grants");
+        return false;
+    }
+    if (bearer && !arg_grant) {
+        if (args->type != JSON_OBJ ||
+            !json_push_kv_str(args, "grant", bearer)) {
+            gw_rpc_error(b, id, -32602, "grant cannot be carried");
+            return false;
+        }
+    }
+    return true;
+}
+
 static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
                                const struct json_value *params,
-                               const char *node)
+                               const char *node, const char *bearer,
+                               bool bearer_bad)
 {
     const struct gw_tool *t;
     const char *name;
     struct gw_buf input;
     struct gw_node_out out;
     struct json_value env;
+    struct json_value args;
     const struct json_value *data;
     name = gw_json_str(params, "name");
     t = gw_tool_by_name(name);
@@ -644,6 +757,27 @@ static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
     }
     memset(&input, 0, sizeof(input));
     gw_args_input(&input, params);
+    if (input.oom || !input.p) {
+        gw_buf_free(&input);
+        gw_rpc_error(b, id, -32603, "arguments too large");
+        return;
+    }
+    json_init(&args);
+    if (!json_read(&args, input.p, input.len)) {
+        gw_buf_free(&input);
+        json_free(&args);
+        gw_rpc_error(b, id, -32602, "arguments did not parse");
+        return;
+    }
+    if (!gw_credential(b, id, bearer, bearer_bad, &args)) {
+        gw_buf_free(&input);
+        json_free(&args);
+        return;
+    }
+    gw_buf_free(&input);
+    memset(&input, 0, sizeof(input));
+    gw_json_write(&input, &args);
+    json_free(&args);
     if (input.oom || !input.p) {
         gw_buf_free(&input);
         gw_rpc_error(b, id, -32603, "arguments too large");
@@ -696,7 +830,8 @@ static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
 }
 
 static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
-                            const char *node)
+                            const char *node, const char *bearer,
+                            bool bearer_bad)
 {
     struct json_value req;
     const struct json_value *v;
@@ -740,7 +875,7 @@ static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
     else if (strcmp(method, "tools/list") == 0)
         gw_reply_tools_list(b, id);
     else if (strcmp(method, "tools/call") == 0)
-        gw_reply_tool_call(b, id, params, node);
+        gw_reply_tool_call(b, id, params, node, bearer, bearer_bad);
     else if (strcmp(method, "ping") == 0) {
         gw_buf_str(b, "{\"jsonrpc\":\"2.0\",\"id\":");
         gw_json_write(b, id);
@@ -790,8 +925,8 @@ static void gw_reply_json(int fd, struct gw_buf *b)
     gw_buf_free(b);
 }
 
-/* Loopback only: the G1 transport carries no credentials, so a non-local
- * peer is refused before parsing. */
+/* Loopback only: a non-local peer is refused before parsing, and a
+ * tool call without exactly one credential never reaches the node. */
 static bool gw_peer_is_loopback(int fd)
 {
     struct sockaddr_storage ss;
@@ -847,7 +982,8 @@ static void gw_serve(int fd, const struct gw_config *cfg)
         return;
     }
     if (strcmp(h.method, "POST") == 0 && strcmp(h.path, "/steer") == 0) {
-        gw_dispatch_rpc(&body, h.body ? h.body : "", cfg->node);
+        gw_dispatch_rpc(&body, h.body ? h.body : "", cfg->node,
+                        h.auth_present ? h.auth : NULL, h.auth_bad);
         free(h.body);
         if (body.len == 0 && !body.oom) {
             /* A notification: 202 with no body. */

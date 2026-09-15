@@ -15,6 +15,7 @@
 #include "test/test_core.h"
 
 #include "command/native_command.h"
+#include "config/command_catalog.h"
 #include "json/json.h"
 #include "kernel/command_registry.h"
 
@@ -196,6 +197,30 @@ static char *gw_post(const char *path, const char *json, int *status)
     int n = snprintf(req, sizeof(req),
                      "POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: "
                      "application/json\r\nContent-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n%s",
+                     path, strlen(json), json);
+    if (n <= 0 || (size_t)n >= sizeof(req))
+        return NULL;
+    return gw_exchange(req, status);
+}
+
+static char *gw_post_auth(const char *path, const char *json,
+                         const char *bearer, int *status)
+{
+    char req[GW_TEST_CAP];
+    int n;
+    if (bearer)
+        n = snprintf(req, sizeof(req),
+                     "POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                     "application/json\r\nAuthorization: Bearer %s\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n%s",
+                     path, bearer, strlen(json), json);
+    else
+        n = snprintf(req, sizeof(req),
+                     "POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                     "application/json\r\n"
+                     "Content-Length: %zu\r\n"
                      "Connection: close\r\n\r\n%s",
                      path, strlen(json), json);
     if (n <= 0 || (size_t)n >= sizeof(req))
@@ -418,10 +443,13 @@ static int gw_t_calls(void)
         char *b;
         int st = 0, sn;
         ASSERT(gw_mint(node, "brief,send,evidence", gid));
-        b = gw_post("/steer",
-                    "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\","
-                    "\"params\":{\"name\":\"steer_brief\",\"arguments\":{}}}",
-                    &st);
+        sn = snprintf(args, sizeof(args),
+                      "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/"
+                      "call\",\"params\":{\"name\":\"steer_brief\","
+                      "\"arguments\":{\"grant\":\"%s\"}}}",
+                      gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_post("/steer", args, &st);
         ASSERT(b != NULL);
         ASSERT(gw_body_has(b, "\"isError\":false"));
         ASSERT(gw_body_has(b, "agents"));
@@ -521,6 +549,8 @@ _test_next:;
     return failures;
 }
 
+static int gw_t_auth(void);
+
 int test_fleet_gateway(void);
 int test_fleet_gateway(void)
 {
@@ -555,6 +585,7 @@ int test_fleet_gateway(void)
     failures += gw_t_routes();
     failures += gw_t_handshake();
     failures += gw_t_calls();
+    failures += gw_t_auth();
     /* No ASSERT lives here; the stop always runs on fall-through. */
     gw_stop();
     if (had_xdg)
@@ -565,6 +596,85 @@ int test_fleet_gateway(void)
         printf("test_fleet_gateway: all passed\n");
     else
         printf("test_fleet_gateway: %d FAILED\n", failures);
+    return failures;
+}
+
+static int gw_t_auth(void)
+{
+    int failures = 0;
+    TEST("gateway: tool calls fail closed without exactly one grant") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char gid[64];
+        char args[512];
+        char *b;
+        int st = 0, sn;
+        ASSERT(gw_mint(node, "brief,send,evidence", gid));
+        /* No credential anywhere: refused before the node is forked. */
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":"
+                         "\"steer_brief\",\"arguments\":{}}}",
+                         NULL, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"code\":-32001"));
+        ASSERT(gw_body_has(b, "grant required"));
+        free(b);
+        /* Header credential alone: carried to the node, brief succeeds. */
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":"
+                         "\"steer_brief\",\"arguments\":{}}}",
+                         gid, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "agents"));
+        free(b);
+        /* Header and argument agreeing: accepted. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/"
+                      "call\",\"params\":{\"name\":\"steer_brief\","
+                      "\"arguments\":{\"grant\":\"%s\"}}}",
+                      gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_post_auth("/steer", args, gid, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        free(b);
+        /* Header and argument differing: refused as ambiguous. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/"
+                      "call\",\"params\":{\"name\":\"steer_brief\","
+                      "\"arguments\":{\"grant\":\"00000000000000000000000000"
+                      "00000000\"}}}");
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_post_auth("/steer", args, gid, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"code\":-32002"));
+        ASSERT(gw_body_has(b, "conflicting grants"));
+        free(b);
+        /* Non-token bytes in the header: refused, never forwarded. */
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":24,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":"
+                         "\"steer_brief\",\"arguments\":{}}}",
+                         "\",\"x\":1,//", &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"code\":-32002"));
+        ASSERT(gw_body_has(b, "bad grant credential"));
+        free(b);
+        /* Unknown header credential: the node itself refuses it. */
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":"
+                         "\"steer_brief\",\"arguments\":{}}}",
+                         "00000000000000000000000000000000", &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":true"));
+        ASSERT(gw_body_has(b, "STEER_GRANT_UNKNOWN"));
+        free(b);
+        PASS();
+    }
+_test_next:;
     return failures;
 }
 #endif /* _WIN32 */
