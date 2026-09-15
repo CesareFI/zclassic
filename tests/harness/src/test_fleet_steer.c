@@ -1,9 +1,9 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * ACCEPTANCE BAR for fleet.mcp + fleet.mcp.grant
- * (tools/command/native_fleet_mcp.c).
+ * ACCEPTANCE BAR for fleet.steer + fleet.steer.grant
+ * (tools/command/native_fleet_steer.c).
  *
- * The thin remote-MCP adapter over the existing fleet leaves: brief composes
+ * The thin remote-STEER adapter over the existing fleet leaves: brief composes
  * mail/queue/board/ledger in-process, send posts bounded directive batches
  * with idempotency keys, evidence returns one object per exact reference,
  * and the grant leaf mints/revokes scoped bearer grants.
@@ -42,10 +42,10 @@
 #include <unistd.h>
 #endif
 
-#define FMX_BRIEF_PATH "fleet.mcp.brief"
-#define FMX_SEND_PATH "fleet.mcp.send"
-#define FMX_EVIDENCE_PATH "fleet.mcp.evidence"
-#define FMX_GRANT_PATH "fleet.mcp.grant"
+#define FMX_BRIEF_PATH "fleet.steer.brief"
+#define FMX_SEND_PATH "fleet.steer.send"
+#define FMX_EVIDENCE_PATH "fleet.steer.evidence"
+#define FMX_GRANT_PATH "fleet.steer.grant"
 
 /* ── isolated state root (this group owns its own rig) ─────────────────── */
 
@@ -60,7 +60,7 @@ static char g_fmx_saved_root[4096];
 
 static void fmx_fixture_fail(const char *context)
 {
-    fprintf(stderr, "fleet_mcp fixture: %s\n", context);
+    fprintf(stderr, "fleet_steer fixture: %s\n", context);
     abort();
 }
 
@@ -103,7 +103,7 @@ static void fmx_isolate(const char *tag)
     char base[512];
     if (g_fmx_isolated)
         fmx_fixture_fail("previous state root has not been restored");
-    test_make_tmpdir(base, sizeof(base), "fleet_mcp", tag);
+    test_make_tmpdir(base, sizeof(base), "fleet_steer", tag);
     int n = snprintf(g_fmx_state, sizeof(g_fmx_state), "%s/state", base);
     if (n <= 0 || (size_t)n >= sizeof(g_fmx_state) ||
         !platform_private_directory_ensure(g_fmx_state))
@@ -221,10 +221,10 @@ static bool fmx_mint(const char *scopes, char *id_out, size_t id_cap)
     struct fmx_call g;
     const char *id;
     bool ok = false;
-    fmx_begin(&g, FMX_GRANT_PATH, "zcl.fleet_mcp_grant.v1");
+    fmx_begin(&g, FMX_GRANT_PATH, "zcl.fleet_steer_grant.v1");
     (void)json_push_kv_str(&g.input, "action", "mint");
     (void)json_push_kv_str(&g.input, "scopes", scopes);
-    if (!fmx_run(&g, zcl_native_handle_fleet_mcp_grant) || !fmx_ok(&g)) {
+    if (!fmx_run(&g, zcl_native_handle_fleet_steer_grant) || !fmx_ok(&g)) {
         fmx_end(&g);
         return false;
     }
@@ -253,16 +253,16 @@ static void fmx_item(struct json_value *item, const char *to,
 static bool fmx_send(struct fmx_call *c, const char *grant,
                      struct json_value *items)
 {
-    fmx_begin(c, FMX_SEND_PATH, "zcl.fleet_mcp_send.v1");
+    fmx_begin(c, FMX_SEND_PATH, "zcl.fleet_steer_send.v1");
     if (grant)
         (void)json_push_kv_str(&c->input, "grant", grant);
     (void)json_push_kv(&c->input, "items", items);
-    return fmx_run(c, zcl_native_handle_fleet_mcp_send);
+    return fmx_run(c, zcl_native_handle_fleet_steer_send);
 }
 
 static void fmx_brief(struct fmx_call *c, const char *grant, long long since)
 {
-    fmx_begin(c, FMX_BRIEF_PATH, "zcl.fleet_mcp_brief.v1");
+    fmx_begin(c, FMX_BRIEF_PATH, "zcl.fleet_steer_brief.v1");
     if (grant)
         (void)json_push_kv_str(&c->input, "grant", grant);
     (void)json_push_kv_int(&c->input, "since", since);
@@ -271,7 +271,7 @@ static void fmx_brief(struct fmx_call *c, const char *grant, long long since)
 static void fmx_evidence(struct fmx_call *c, const char *grant,
                          const char *type, const char *ref)
 {
-    fmx_begin(c, FMX_EVIDENCE_PATH, "zcl.fleet_mcp_evidence.v1");
+    fmx_begin(c, FMX_EVIDENCE_PATH, "zcl.fleet_steer_evidence.v1");
     if (grant)
         (void)json_push_kv_str(&c->input, "grant", grant);
     (void)json_push_kv_str(&c->input, "type", type);
@@ -360,11 +360,11 @@ static void fmx_seed_outcome(const char *name)
 static void fmx_seed_expired(const char *id)
 {
     char dir[1024], path[1200];
-    int n = snprintf(dir, sizeof(dir), "%s/z23/dev/mcp", g_fmx_state);
+    int n = snprintf(dir, sizeof(dir), "%s/z23/dev/steer", g_fmx_state);
     if (n <= 0 || (size_t)n >= sizeof(dir))
-        fmx_fixture_fail("mcp dir exceeds bound");
+        fmx_fixture_fail("steer dir exceeds bound");
     if (!platform_private_directory_ensure(dir))
-        fmx_fixture_fail("cannot create isolated mcp dir");
+        fmx_fixture_fail("cannot create isolated steer dir");
     n = snprintf(path, sizeof(path), "%s/grants.jsonl", dir);
     if (n <= 0 || (size_t)n >= sizeof(path))
         fmx_fixture_fail("grant path exceeds bound");
@@ -396,7 +396,7 @@ static int fmx_t_register(void)
 {
     int failures = 0;
 
-    TEST("mcp: all four leaves are registered with declared keys") {
+    TEST("steer: all four leaves are registered with declared keys") {
         const struct zcl_command_spec *spec =
             zcl_command_registry_find(zcl_command_catalog(), FMX_BRIEF_PATH,
                                       NULL);
@@ -426,11 +426,11 @@ static int fmx_t_brief_empty(void)
 {
     int failures = 0;
 
-    TEST("mcp: brief on an empty root reports shape and honest absence") {
+    TEST("steer: brief on an empty root reports shape and honest absence") {
         struct fmx_call b;
         fmx_isolate("brief_empty");
         fmx_brief(&b, NULL, 0);
-        ASSERT(fmx_run(&b, zcl_native_handle_fleet_mcp_brief));
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
         ASSERT(fmx_ok(&b));
         ASSERT(fmx_arr(&b, "agents") != NULL);
         ASSERT(fmx_arr(&b, "work") != NULL);
@@ -544,7 +544,7 @@ static int fmx_t_send_flow(void)
 {
     int failures = 0;
 
-    TEST("mcp: mint and send accept one directive") {
+    TEST("steer: mint and send accept one directive") {
         struct fmx_accept a;
         fmx_isolate("send_flow");
         a = fmx_probe();
@@ -565,14 +565,14 @@ static int fmx_t_brief_changes(void)
 {
     int failures = 0;
 
-    TEST("mcp: brief carries the directive as a delivered lead") {
+    TEST("steer: brief carries the directive as a delivered lead") {
         struct fmx_call b;
         struct fmx_accept a;
         fmx_isolate("brief_changes");
         a = fmx_probe();
         ASSERT(a.ok);
         fmx_brief(&b, a.gid, 0);
-        ASSERT(fmx_run(&b, zcl_native_handle_fleet_mcp_brief));
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
         ASSERT(fmx_ok(&b));
         ASSERT(fmx_check_delivered(fmx_arr(&b, "changes")));
         fmx_end(&b);
@@ -589,20 +589,20 @@ static int fmx_t_evidence(void)
 {
     int failures = 0;
 
-    TEST("mcp: evidence by exact ref returns the bounded row") {
+    TEST("steer: evidence by exact ref returns the bounded row") {
         struct fmx_call e;
         struct fmx_accept a;
         fmx_isolate("evidence");
         a = fmx_probe();
         ASSERT(a.ok);
         fmx_evidence(&e, a.gid, "mail", "fence-sweep");
-        ASSERT(fmx_run(&e, zcl_native_handle_fleet_mcp_evidence));
+        ASSERT(fmx_run(&e, zcl_native_handle_fleet_steer_evidence));
         ASSERT(fmx_ok(&e));
         ASSERT(fmx_check_body(&e, "sweep the north fence line"));
         fmx_end(&e);
         /* Unknown refs are typed refusals, not empty objects. */
         fmx_evidence(&e, a.gid, "mail", "no-such-ref");
-        ASSERT(fmx_run(&e, zcl_native_handle_fleet_mcp_evidence));
+        ASSERT(fmx_run(&e, zcl_native_handle_fleet_steer_evidence));
         ASSERT(!fmx_ok(&e));
         ASSERT_STR_EQ(e.reply.error.code, "EVIDENCE_NOT_FOUND");
         fmx_end(&e);
@@ -619,7 +619,7 @@ static int fmx_t_duplicate(void)
 {
     int failures = 0;
 
-    TEST("mcp: duplicate delivery reconciles, never re-posts") {
+    TEST("steer: duplicate delivery reconciles, never re-posts") {
         struct fmx_call s;
         struct json_value items, item;
         const struct json_value *out, *row;
@@ -699,7 +699,7 @@ static int fmx_t_lifecycle(void)
 {
     int failures = 0;
 
-    TEST("mcp: acknowledged and completed are distinct observed states") {
+    TEST("steer: acknowledged and completed are distinct observed states") {
         struct fmx_call s, b;
         struct json_value items, item;
         const struct json_value *out, *row, *v;
@@ -725,7 +725,7 @@ static int fmx_t_lifecycle(void)
         /* The receiver acks: the change upgrades to acknowledged. */
         ASSERT(fmx_ack("rover", seq));
         fmx_brief(&b, gid, 0);
-        ASSERT(fmx_run(&b, zcl_native_handle_fleet_mcp_brief));
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
         ASSERT(fmx_ok(&b));
         {
             const struct json_value *changes = fmx_arr(&b, "changes");
@@ -740,7 +740,7 @@ static int fmx_t_lifecycle(void)
         /* A pass-like queue outcome on the ref completes it. */
         fmx_seed_outcome("crater-rim");
         fmx_brief(&b, gid, 0);
-        ASSERT(fmx_run(&b, zcl_native_handle_fleet_mcp_brief));
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
         ASSERT(fmx_ok(&b));
         {
             const struct json_value *changes = fmx_arr(&b, "changes");
@@ -765,7 +765,7 @@ static int fmx_t_grants(void)
 {
     int failures = 0;
 
-    TEST("mcp: revoked, unknown, expired and scoped grants fail closed") {
+    TEST("steer: revoked, unknown, expired and scoped grants fail closed") {
         struct fmx_call c;
         struct json_value items, item;
         char gid[64], narrow[64];
@@ -774,27 +774,27 @@ static int fmx_t_grants(void)
         ASSERT(fmx_mint("send", narrow, sizeof(narrow)));
         /* Narrow scope: brief is outside it. */
         fmx_brief(&c, narrow, 0);
-        ASSERT(fmx_run(&c, zcl_native_handle_fleet_mcp_brief));
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_brief));
         ASSERT(!fmx_ok(&c));
-        ASSERT_STR_EQ(c.reply.error.code, "MCP_GRANT_SCOPE");
+        ASSERT_STR_EQ(c.reply.error.code, "STEER_GRANT_SCOPE");
         fmx_end(&c);
         /* Unknown bearer. */
         fmx_brief(&c, "0123456789abcdef0123456789abcdef", 0);
-        ASSERT(fmx_run(&c, zcl_native_handle_fleet_mcp_brief));
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_brief));
         ASSERT(!fmx_ok(&c));
-        ASSERT_STR_EQ(c.reply.error.code, "MCP_GRANT_UNKNOWN");
+        ASSERT_STR_EQ(c.reply.error.code, "STEER_GRANT_UNKNOWN");
         fmx_end(&c);
         /* Revoke: brief and send both refuse, nothing is disguised. */
-        fmx_begin(&c, FMX_GRANT_PATH, "zcl.fleet_mcp_grant.v1");
+        fmx_begin(&c, FMX_GRANT_PATH, "zcl.fleet_steer_grant.v1");
         (void)json_push_kv_str(&c.input, "action", "revoke");
         (void)json_push_kv_str(&c.input, "id", gid);
-        ASSERT(fmx_run(&c, zcl_native_handle_fleet_mcp_grant));
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_grant));
         ASSERT(fmx_ok(&c));
         fmx_end(&c);
         fmx_brief(&c, gid, 0);
-        ASSERT(fmx_run(&c, zcl_native_handle_fleet_mcp_brief));
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_brief));
         ASSERT(!fmx_ok(&c));
-        ASSERT_STR_EQ(c.reply.error.code, "MCP_GRANT_REVOKED");
+        ASSERT_STR_EQ(c.reply.error.code, "STEER_GRANT_REVOKED");
         fmx_end(&c);
         json_init(&items);
         json_set_array(&items);
@@ -804,26 +804,26 @@ static int fmx_t_grants(void)
         ASSERT(fmx_send(&c, gid, &items));
         json_free(&items);
         ASSERT(!fmx_ok(&c));
-        ASSERT_STR_EQ(c.reply.error.code, "MCP_GRANT_REVOKED");
+        ASSERT_STR_EQ(c.reply.error.code, "STEER_GRANT_REVOKED");
         fmx_end(&c);
         /* The revoked send posted nothing. */
         ASSERT_EQ(fmx_mail_count(), 0);
         /* Revoking an unknown id is a refusal, not a silent accept. */
-        fmx_begin(&c, FMX_GRANT_PATH, "zcl.fleet_mcp_grant.v1");
+        fmx_begin(&c, FMX_GRANT_PATH, "zcl.fleet_steer_grant.v1");
         (void)json_push_kv_str(&c.input, "action", "revoke");
         (void)json_push_kv_str(&c.input,
                                "id",
                                "ffffffffffffffffffffffffffffffff");
-        ASSERT(fmx_run(&c, zcl_native_handle_fleet_mcp_grant));
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_grant));
         ASSERT(!fmx_ok(&c));
-        ASSERT_STR_EQ(c.reply.error.code, "MCP_GRANT_UNKNOWN");
+        ASSERT_STR_EQ(c.reply.error.code, "STEER_GRANT_UNKNOWN");
         fmx_end(&c);
         /* Expired rows refuse even with full scope. */
         fmx_seed_expired("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         fmx_brief(&c, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0);
-        ASSERT(fmx_run(&c, zcl_native_handle_fleet_mcp_brief));
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_brief));
         ASSERT(!fmx_ok(&c));
-        ASSERT_STR_EQ(c.reply.error.code, "MCP_GRANT_EXPIRED");
+        ASSERT_STR_EQ(c.reply.error.code, "STEER_GRANT_EXPIRED");
         fmx_end(&c);
         fmx_restore();
         PASS();
@@ -838,13 +838,13 @@ static int fmx_t_board_absent(void)
 {
     int failures = 0;
 
-    TEST("mcp: board evidence without a node is unavailable, not empty") {
+    TEST("steer: board evidence without a node is unavailable, not empty") {
         struct fmx_call e;
         char gid[64];
         fmx_isolate("board_absent");
         ASSERT(fmx_mint("brief,send,evidence", gid, sizeof(gid)));
         fmx_evidence(&e, gid, "board", "deadbeef");
-        ASSERT(fmx_run(&e, zcl_native_handle_fleet_mcp_evidence));
+        ASSERT(fmx_run(&e, zcl_native_handle_fleet_steer_evidence));
         ASSERT(!fmx_ok(&e));
         ASSERT_STR_EQ(e.reply.error.code, "EVIDENCE_UNAVAILABLE");
         fmx_end(&e);
@@ -857,8 +857,8 @@ _test_next:;
     return failures;
 }
 
-int test_fleet_mcp(void);
-int test_fleet_mcp(void)
+int test_fleet_steer(void);
+int test_fleet_steer(void)
 {
     int failures = 0;
 
@@ -878,8 +878,8 @@ int test_fleet_mcp(void)
     node_rpc_client_set_test_hook(NULL);
     fmx_restore();
     if (failures == 0)
-        printf("test_fleet_mcp: all passed\n");
+        printf("test_fleet_steer: all passed\n");
     else
-        printf("test_fleet_mcp: %d FAILED\n", failures);
+        printf("test_fleet_steer: %d FAILED\n", failures);
     return failures;
 }

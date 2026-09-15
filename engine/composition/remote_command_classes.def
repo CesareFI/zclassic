@@ -1205,6 +1205,25 @@ REMOTE_COMMAND_CLASS("fleet.roles.list", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.roles.grant", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.roles.revoke", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.roles.check", REMOTE_CLASS_NEVER, "")
+/* ── remote steering briefs, directives and evidence ─────────────────────
+ * brief, evidence and send are OWNER_CAPABILITY, never open reads. A brief
+ * names this fleet's agents, live work, blockers and capacity — the same
+ * target-shape inventory that keeps fleet.machines and fleet.objectives
+ * off the wire — and send puts words in this node's outbox under the
+ * owner's own mail identity. Both cross only behind a live owner-minted
+ * steering grant that names the exact verb, carries an expiry, and
+ * revokes; the grant leaf itself is NEVER, on the fleet.roles.grant
+ * reasoning: a peer that could mint credentials would decide, in this
+ * node's own name, who this node trusts. No grant confers shell, wallet,
+ * deployment, deletion or soak authority, and each composed sibling leaf
+ * still enforces its own permissions. */
+REMOTE_COMMAND_CLASS("fleet.steer.brief", REMOTE_CLASS_OWNER_CAPABILITY,
+    "one bounded brief behind a live owner-minted grant naming brief")
+REMOTE_COMMAND_CLASS("fleet.steer.evidence", REMOTE_CLASS_OWNER_CAPABILITY,
+    "one bounded evidence object behind a live owner-minted grant naming evidence")
+REMOTE_COMMAND_CLASS("fleet.steer.send", REMOTE_CLASS_OWNER_CAPABILITY,
+    "bounded directives behind a live owner-minted grant naming send, idempotent by key")
+REMOTE_COMMAND_CLASS("fleet.steer.grant", REMOTE_CLASS_NEVER, "")
 /* ── one-paste fleet enrolment ──────────────────────────────────────────
  * All four are NEVER, and `fleet.machines` is the reason the rule exists.
  * The fleet map — which computers this owner has, what they run, how much

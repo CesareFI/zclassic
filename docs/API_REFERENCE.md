@@ -74,17 +74,17 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 884 |
+| Registry entries (branches + leaves) | 889 |
 | Top-level roots | 14 |
-| Branches | 198 |
-| Leaves (dispatchable command paths) | 686 |
-| … `ready` (live handler in this build) | 609 |
+| Branches | 199 |
+| Leaves (dispatchable command paths) | 690 |
+| … `ready` (live handler in this build) | 613 |
 | … `compat` (metadata only, names a fallback) | 47 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 46 |
-| Leaves with `effect=mutate` | 249 |
+| Leaves with `effect=mutate` | 251 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 129 |
+| Leaves requiring **owner** authority | 130 |
 
 Per source file:
 
@@ -108,7 +108,7 @@ Per source file:
 | `engine/composition/commands/story.def` | 5 | 1 | 4 |
 | `engine/composition/commands/fleet_board.def` | 11 | 3 | 8 |
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
-| `engine/composition/commands/fleet.def` | 23 | 6 | 17 |
+| `engine/composition/commands/fleet.def` | 28 | 7 | 21 |
 | `engine/composition/commands/fleet_agents.def` | 1 | 0 | 1 |
 | `engine/composition/commands/fleet_enrol.def` | 4 | 0 | 4 |
 | `engine/composition/commands/telemetry/root.def` | 6 | 2 | 4 |
@@ -443,7 +443,7 @@ represented by its children's sections.
 | `app list` | ready | read / read / public · fast/low | none | `zcl.app_index.v1` | `z23 app list` | List installed App manifests |
 | `app inspect` | ready | read / read / public · fast/low | **`app_id`** | `zcl.app_manifest_summary.v1` | `z23 app inspect social` | Inspect one App manifest and bindings |
 | `app protocols` (aliases: `appprotocols`) | compat → `z23 appprotocols` | read / read / public · fast/low | none | `zcl.app_protocols.v1` | `z23 app protocols` | List App protocol contracts — *native adapter is not executable yet; use the compatibility target* |
-| `app tasks` | ready | mutate / app-write / operator · background/low | **`datadir`**, `app`, **`action`**, `expected_revision`, `task_id`, `title`, `preview_root`, `preview_receipt`, `preview_program` | `zcl.task_document.v1` | `z23 app tasks open` | Save and reopen your local tasks |
+| `app tasks` | ready | mutate / app-write / operator · background/low | `datadir`, `app`, `action`, `expected_revision`, `task_id`, `title` | `zcl.task_document.v1` | `z23 app tasks --input=-` | Save and reopen your local tasks |
 
 #### `app.transaction-types` — Discover every semantic ZCL transaction shape and its safe workflow
 
@@ -1851,6 +1851,15 @@ represented by its children's sections.
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
 | `fleet link probe` | ready | mutate / dev-mutation / operator · maintenance/low | `mode`, `peer`, `bind`, `key`, `seconds` | `zcl.fleet_link_probe.v1` | `z23 fleet link probe --seconds=2` | Round-trip time, jitter and loss over the UDP datagram link |
+
+#### `fleet.steer` — Brief, send and evidence for remote steering
+
+| Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
+|---|---|---|---|---|---|---|
+| `fleet steer brief` | ready | read / read / operator · fast/low | `grant`, `since`, `limit` | `zcl.fleet_steer_brief.v1` | `z23 fleet steer brief` | One-call fleet brief: agents, work, blockers, capacity, candidates |
+| `fleet steer send` | ready | mutate / dev-mutation / operator · fast/low | `grant`, **`items`**, `from` | `zcl.fleet_steer_send.v1` | `z23 fleet steer send --items=[...]` | One bounded batch of directives to named fleet agents |
+| `fleet steer evidence` | ready | read / read / operator · fast/low | `grant`, **`type`**, **`ref`** | `zcl.fleet_steer_evidence.v1` | `z23 fleet steer evidence --type=mail --ref=<ref>` | One bounded evidence object by exact reference |
+| `fleet steer grant` | ready | mutate / dev-mutation / **owner** · fast/low | **`action`**, `scopes`, `ttl_seconds`, `label`, `id` | `zcl.fleet_steer_grant.v1` | `z23 fleet steer grant --action=mint --scopes=brief,send` | Mint and revoke the adapter's scoped bearer grants |
 
 
 ## Aliases

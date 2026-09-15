@@ -1,16 +1,17 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
- * purpose: fleet.mcp — the thin remote-MCP adapter over the existing
+ * purpose: fleet.steer — the thin remote-STEER adapter over the existing
  *          authenticated fleet mail, queue, board and receipt leaves.
  *
  * ── CONTRACT (this file is the whole implementation) ──────────────────────
  *
- * WHY. ChatGPT (or any remote MCP client) must steer the fleet without a
+ * WHY. ChatGPT (or any remote steering client) must steer the fleet
+ * without a
  * human relaying chat messages. This file is the smallest surface that
- * proves the connection: fleet.mcp.brief (one call: who is working on
+ * proves the connection: fleet.steer.brief (one call: who is working on
  * what, blockers, capacity, candidates, evidence refs, changes since a
- * cursor) plus fleet.mcp.send (one bounded batch of directives to named
- * agents with per-item acceptance). fleet.mcp.evidence returns one
- * bounded object by exact reference, never a log; fleet.mcp.grant mints
+ * cursor) plus fleet.steer.send (one bounded batch of directives to named
+ * agents with per-item acceptance). fleet.steer.evidence returns one
+ * bounded object by exact reference, never a log; fleet.steer.grant mints
  * and revokes the adapter's scoped bearer grants. No new scheduler, no
  * new ledger, no parallel workflow: composition only.
  *
@@ -27,20 +28,20 @@
  * AUTHORIZATION. Two paths, never mixed:
  *   - Local operator: no `grant` key. Dispatch already gated on
  *     AUTH_OPERATOR (brief/send/evidence) or AUTH_OWNER (grant mint/revoke).
- *   - Remote bearer: a `grant` key naming one row in <state>/mcp/grants.jsonl
+ *   - Remote bearer: a `grant` key naming one row in <state>/steer/grants.jsonl
  *     minted by the operator. The row carries a scope subset of
  *     brief|send|evidence, created/expires unix times (expires 0 = never),
  *     a revoked flag and a label. Expired, revoked, unknown or
- *     insufficient-scope grants fail closed with MCP_GRANT_* — writes are
+ *     insufficient-scope grants fail closed with STEER_GRANT_* — writes are
  *     never disguised as reads, and no credential is ever echoed back.
  * This adapter is NOT wallet authority (see agent_session for spend grants)
  * and NOT fleet key roles (see fleet.roles grant/revoke/check, which govern
  * fleet leaves by key fingerprint and need node delegation to mint). It
- * governs only fleet.mcp verbs; minting needs no delegation, only the
+ * governs only fleet.steer verbs; minting needs no delegation, only the
  * owner. Bearer ids are 128-bit CSPRNG hex via zcl_random_secret_bytes.
  *
  * IDEMPOTENCY. send items carry a caller-chosen idempotency_key. The first
- * accept appends the mail row and records key->seq in <state>/mcp/sent.jsonl;
+ * accept appends the mail row and records key->seq in <state>/steer/sent.jsonl;
  * a retry with the same key returns the recorded accept with duplicate:true
  * and appends nothing. Retries reconcile; they never duplicate work.
  *
@@ -50,7 +51,7 @@
  * board result references it). Four different facts; absence of evidence is
  * reported as the earlier state, never skipped ahead.
  *
- * STATE. <platform_state_root()>/mcp (0700): grants.jsonl, sent.jsonl.
+ * STATE. <platform_state_root()>/steer (0700): grants.jsonl, sent.jsonl.
  * Single O_APPEND writes; revoke rewrites grants via tmp+rename like the
  * mail ack cursor. Nothing here blocks on a peer or a model.
  *
@@ -97,9 +98,9 @@
 #define O_CLOEXEC 0
 #endif
 
-#define FMC_LEAF "fleet.mcp"
-#define FMC_GRANT_LEAF "fleet.mcp.grant"
-#define FMC_LOG "fleet.mcp"
+#define FMC_LEAF "fleet.steer"
+#define FMC_GRANT_LEAF "fleet.steer.grant"
+#define FMC_LOG "fleet.steer"
 #define FMC_DIR_MODE 0700
 
 #define FMC_SEND_MAX 8u
@@ -186,10 +187,16 @@ static bool fmc_is_token(const char *s, size_t max, bool star_ok)
 }
 
 /* JSON string escape into a bounded buffer. False when the budget runs out. */
+/* One lowercase hex digit by arithmetic: the repo's single hex codec owns
+ * digit tables, so this escaper must not carry one (hex-codec-single). */
+static char fmc_hex_digit(unsigned v)
+{
+    return (char)(v <= 9 ? ('0' + v) : ('a' + v - 10));
+}
+
 static bool fmc_escape(const char *in, char *out, size_t cap)
 {
     size_t o = 0;
-    static const char *const hexd = "0123456789abcdef";
     if (!in || !out || cap == 0)
         return false;
     for (; *in; in++) {
@@ -211,8 +218,8 @@ static bool fmc_escape(const char *in, char *out, size_t cap)
             out[o++] = 'u';
             out[o++] = '0';
             out[o++] = '0';
-            out[o++] = hexd[(c >> 4) & 0xf];
-            out[o++] = hexd[c & 0xf];
+            out[o++] = fmc_hex_digit((unsigned)((c >> 4) & 0xf));
+            out[o++] = fmc_hex_digit((unsigned)(c & 0xf));
         } else {
             if (o + 1 >= cap)
                 return false;
@@ -241,20 +248,20 @@ static void fmc_lead(const char *body, char *out, size_t cap)
     out[i] = '\0';
 }
 
-/* ── owner-private mcp dir ─────────────────────────────────────────────── */
+/* ── owner-private steer dir ─────────────────────────────────────────────── */
 
-static bool fmc_dirs(char *mcpdir, size_t cap)
+static bool fmc_dirs(char *steerdir, size_t cap)
 {
     char root[4096];
     int n;
-    if (!mcpdir || cap == 0)
+    if (!steerdir || cap == 0)
         return false;
     if (!platform_state_root(root, sizeof(root)))
         return false;
-    n = snprintf(mcpdir, cap, "%s/mcp", root);
+    n = snprintf(steerdir, cap, "%s/steer", root);
     if (n <= 0 || (size_t)n >= cap)
         return false;
-    if (!platform_private_directory_ensure(mcpdir))
+    if (!platform_private_directory_ensure(steerdir))
         return false;
     return true;
 }
@@ -413,30 +420,30 @@ static bool fmc_grant_find(const char *path, const char *id,
  * the local operator path, which dispatch already authorized. */
 static const char *fmc_grant_check(const char *grant, const char *scope)
 {
-    char mcpdir[4096], path[4096 + 32];
+    char steerdir[4096], path[4096 + 32];
     struct fmc_grant g;
     time_t now;
     int n;
     if (!grant || !grant[0])
         return NULL;
     if (!scope || !scope[0])
-        return "MCP_GRANT_SCOPE";
+        return "STEER_GRANT_SCOPE";
     if (strlen(grant) != 32)
-        return "MCP_GRANT_UNKNOWN";
-    if (!fmc_dirs(mcpdir, sizeof(mcpdir)))
-        return "MCP_GRANT_STORE";
-    n = snprintf(path, sizeof(path), "%s/grants.jsonl", mcpdir);
+        return "STEER_GRANT_UNKNOWN";
+    if (!fmc_dirs(steerdir, sizeof(steerdir)))
+        return "STEER_GRANT_STORE";
+    n = snprintf(path, sizeof(path), "%s/grants.jsonl", steerdir);
     if (n <= 0 || (size_t)n >= sizeof(path))
-        return "MCP_GRANT_STORE";
+        return "STEER_GRANT_STORE";
     if (!fmc_grant_find(path, grant, &g))
-        return "MCP_GRANT_UNKNOWN";
+        return "STEER_GRANT_UNKNOWN";
     if (g.revoked)
-        return "MCP_GRANT_REVOKED";
+        return "STEER_GRANT_REVOKED";
     now = platform_time_wall_time_t();
     if (g.expires != 0 && (long long)now >= g.expires)
-        return "MCP_GRANT_EXPIRED";
+        return "STEER_GRANT_EXPIRED";
     if (!fmc_scope_has(g.scopes, scope))
-        return "MCP_GRANT_SCOPE";
+        return "STEER_GRANT_SCOPE";
     return NULL;
 }
 
@@ -1535,7 +1542,7 @@ static void fmc_do_send(const struct zcl_command_request *req,
     const struct json_value *v;
     const struct json_value *arr;
     const char *from;
-    char mcpdir[4096], sent_path[4096 + 32];
+    char steerdir[4096], sent_path[4096 + 32];
     struct json_value items;
     size_t n, i;
     int n2;
@@ -1553,16 +1560,16 @@ static void fmc_do_send(const struct zcl_command_request *req,
         return;
     }
     from = fmc_str(req, "from");
-    if (!fmc_dirs(mcpdir, sizeof(mcpdir))) {
+    if (!fmc_dirs(steerdir, sizeof(steerdir))) {
         fmc_fail(reply, "STATE_DIR_FAILED",
                  "cannot resolve the owner-private state root",
                  "platform_state_root");
         return;
     }
-    n2 = snprintf(sent_path, sizeof(sent_path), "%s/sent.jsonl", mcpdir);
+    n2 = snprintf(sent_path, sizeof(sent_path), "%s/sent.jsonl", steerdir);
     if (n2 <= 0 || (size_t)n2 >= sizeof(sent_path)) {
         fmc_fail(reply, "STATE_DIR_FAILED", "sent path exceeds its bound",
-                 mcpdir);
+                 steerdir);
         return;
     }
     json_init(&items);
@@ -1866,28 +1873,28 @@ static void fmc_grant_mint(const struct zcl_command_request *req,
     long long expires;
     uint8_t raw[16];
     char id[33];
-    char mcpdir[4096], path[4096 + 32];
+    char steerdir[4096], path[4096 + 32];
     char line[512];
     int n;
     if (!fmc_grant_inputs(req, reply, &in))
         return;
-    if (!zcl_random_secret_bytes(raw, sizeof(raw), "fleet.mcp.grant")) {
+    if (!zcl_random_secret_bytes(raw, sizeof(raw), "fleet.steer.grant")) {
         fmc_fail(reply, "GRANT_MINT_FAILED",
                  "the CSPRNG did not yield grant material",
                  "zcl_random_secret_bytes");
         return;
     }
     zcl_hex_encode(raw, sizeof(raw), id);
-    if (!fmc_dirs(mcpdir, sizeof(mcpdir))) {
+    if (!fmc_dirs(steerdir, sizeof(steerdir))) {
         fmc_fail(reply, "STATE_DIR_FAILED",
                  "cannot resolve the owner-private state root",
                  "platform_state_root");
         return;
     }
-    n = snprintf(path, sizeof(path), "%s/grants.jsonl", mcpdir);
+    n = snprintf(path, sizeof(path), "%s/grants.jsonl", steerdir);
     if (n <= 0 || (size_t)n >= sizeof(path)) {
         fmc_fail(reply, "STATE_DIR_FAILED", "grant path exceeds its bound",
-                 mcpdir);
+                 steerdir);
         return;
     }
     now = platform_time_wall_time_t();
@@ -1919,7 +1926,7 @@ static void fmc_grant_revoke(const struct zcl_command_request *req,
                              struct zcl_command_reply *reply)
 {
     const char *id;
-    char mcpdir[4096], path[4096 + 32];
+    char steerdir[4096], path[4096 + 32];
     struct fmc_grant g;
     char line[512];
     time_t now;
@@ -1930,22 +1937,22 @@ static void fmc_grant_revoke(const struct zcl_command_request *req,
                  "id bound");
         return;
     }
-    if (!fmc_dirs(mcpdir, sizeof(mcpdir))) {
+    if (!fmc_dirs(steerdir, sizeof(steerdir))) {
         fmc_fail(reply, "STATE_DIR_FAILED",
                  "cannot resolve the owner-private state root",
                  "platform_state_root");
         return;
     }
-    n = snprintf(path, sizeof(path), "%s/grants.jsonl", mcpdir);
+    n = snprintf(path, sizeof(path), "%s/grants.jsonl", steerdir);
     if (n <= 0 || (size_t)n >= sizeof(path)) {
         fmc_fail(reply, "STATE_DIR_FAILED", "grant path exceeds its bound",
-                 mcpdir);
+                 steerdir);
         return;
     }
     /* Revoking an unknown id is refused, not silently accepted: the caller
      * must know which credential they just killed. */
     if (!fmc_grant_find(path, id, &g)) {
-        fmc_fail(reply, "MCP_GRANT_UNKNOWN", "no grant carries that id",
+        fmc_fail(reply, "STEER_GRANT_UNKNOWN", "no grant carries that id",
                  "revoke exact id");
         return;
     }
@@ -1999,40 +2006,40 @@ static void fmc_enter(const struct zcl_command_request *request,
     run(request, reply);
 }
 
-void zcl_native_handle_fleet_mcp_brief(
+void zcl_native_handle_fleet_steer_brief(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
-    fmc_enter(request, reply, "brief", "fleet.mcp.brief takes grant,since,limit",
+    fmc_enter(request, reply, "brief", "fleet.steer.brief takes grant,since,limit",
               fmc_do_brief);
 }
 
-void zcl_native_handle_fleet_mcp_send(
+void zcl_native_handle_fleet_steer_send(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
-    fmc_enter(request, reply, "send", "fleet.mcp.send takes grant,items,from",
+    fmc_enter(request, reply, "send", "fleet.steer.send takes grant,items,from",
               fmc_do_send);
 }
 
-void zcl_native_handle_fleet_mcp_evidence(
+void zcl_native_handle_fleet_steer_evidence(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
     fmc_enter(request, reply, "evidence",
-              "fleet.mcp.evidence takes grant,type,ref", fmc_do_evidence);
+              "fleet.steer.evidence takes grant,type,ref", fmc_do_evidence);
 }
 
-void zcl_native_handle_fleet_mcp_grant(
+void zcl_native_handle_fleet_steer_grant(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
     const char *action;
     if (!request || !request->input) {
-        fmc_fail(reply, "BAD_INPUT", "fleet.mcp.grant needs action",
+        fmc_fail(reply, "BAD_INPUT", "fleet.steer.grant needs action",
                  "request.input was missing");
         return;
     }
     action = fmc_str(request, "action");
     if (!action) {
         fmc_fail(reply, "BAD_INPUT",
-                 "fleet.mcp.grant needs action mint|revoke",
+                 "fleet.steer.grant needs action mint|revoke",
                  "missing action");
         return;
     }

@@ -443,22 +443,22 @@ ZCL_COMMAND_READY_COMMAND(
     ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
     zcl_native_handle_fleet_link_probe)
 
-/* ── the thin remote-MCP adapter ─────────────────────────────────────────
+/* ── the thin remote-steering adapter ────────────────────────────────────
  *
  * One briefing call and one batch of instructions per steering cycle, over
  * the leaves that already exist: dev.agent.mail, dev.agent.queue,
  * fleet.board.list/show and fleet.ledger.status are called in-process with
  * the caller's context, so each of them still enforces its own
  * permissions. No new scheduler, ledger or workflow lives here. A `grant`
- * key names an adapter bearer minted by the owner (fleet.mcp.grant);
+ * key names an adapter bearer minted by the owner (fleet.steer.grant);
  * without one the call is the local operator's own. */
 
-ZCL_COMMAND_BRANCH("fleet.mcp", "fleet",
-                   "Brief, send and evidence for remote MCP steering",
+ZCL_COMMAND_BRANCH("fleet.steer", "fleet",
+                   "Brief, send and evidence for remote steering",
                    ZCL_COMMAND_LAYER_OPS)
 
 ZCL_COMMAND_READY_READ(
-    "fleet.mcp.brief", "fleet.mcp", "",
+    "fleet.steer.brief", "fleet.steer", "",
     "One-call fleet brief: agents, work, blockers, capacity, candidates",
     "Composes agents, current work, blockers, capacity, candidate "
     "identities, evidence references and changes since `since` (a mail "
@@ -469,18 +469,18 @@ ZCL_COMMAND_READY_READ(
     "state (sibling leaves ensure their own owner-private directories, "
     "as they do for every other caller). It contacts no peer and never "
     "waits.", 65536,
-    "fleet,mcp,brief,steering,chatgpt,cursor,agents,blockers,capacity",
-    "zcl.fleet_mcp_brief.input.v1", "zcl.fleet_mcp_brief.v1",
+    "fleet,steer,brief,steering,chatgpt,cursor,agents,blockers,capacity",
+    "zcl.fleet_steer_brief.input.v1", "zcl.fleet_steer_brief.v1",
     "grant,since,limit", "",
-    "z23 fleet mcp brief",
+    "z23 fleet steer brief",
     ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
     ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
     ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
     ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
-    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_mcp_brief)
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_brief)
 
 ZCL_COMMAND_READY_COMMAND(
-    "fleet.mcp.send", "fleet.mcp", "",
+    "fleet.steer.send", "fleet.steer", "",
     "One bounded batch of directives to named fleet agents",
     "Posts 1..8 directives to named agents through dev.agent.mail, each "
     "with an idempotency_key: a retry returns the recorded accept with "
@@ -490,20 +490,20 @@ ZCL_COMMAND_READY_COMMAND(
     "only on bad batch input or a bad grant. Delivery, acknowledgement "
     "and completion are observed later through brief and evidence, never "
     "claimed here. It contacts no peer and never waits.", 65536,
-    "fleet,mcp,send,steering,chatgpt,directive,idempotent",
-    "zcl.fleet_mcp_send.input.v1", "zcl.fleet_mcp_send.v1",
+    "fleet,steer,send,steering,chatgpt,directive,idempotent",
+    "zcl.fleet_steer_send.input.v1", "zcl.fleet_steer_send.v1",
     "grant,items,from", "items",
-    "z23 fleet mcp send --items=[...]",
+    "z23 fleet steer send --items=[...]",
     ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
     ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
     ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
     ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
     ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
-    zcl_native_handle_fleet_mcp_send)
+    zcl_native_handle_fleet_steer_send)
 
 ZCL_COMMAND_READY_READ(
-    "fleet.mcp.evidence", "fleet.mcp", "",
+    "fleet.steer.evidence", "fleet.steer", "",
     "One bounded evidence object by exact reference",
     "Returns one object by exact reference (type mail|queue|board, ref "
     "exact): the mail row carrying the ref, the queue row or outcome "
@@ -511,18 +511,18 @@ ZCL_COMMAND_READY_READ(
     "repository. Unknown refs are typed refusals; a board without a "
     "local node is unavailable, never empty. It contacts no peer and "
     "never waits.", 32768,
-    "fleet,mcp,evidence,steering,chatgpt,reference",
-    "zcl.fleet_mcp_evidence.input.v1", "zcl.fleet_mcp_evidence.v1",
+    "fleet,steer,evidence,steering,chatgpt,reference",
+    "zcl.fleet_steer_evidence.input.v1", "zcl.fleet_steer_evidence.v1",
     "grant,type,ref", "type,ref",
-    "z23 fleet mcp evidence --type=mail --ref=<ref>",
+    "z23 fleet steer evidence --type=mail --ref=<ref>",
     ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
     ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
     ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
     ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
-    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_mcp_evidence)
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_evidence)
 
 ZCL_COMMAND_READY_COMMAND(
-    "fleet.mcp.grant", "fleet.mcp", "",
+    "fleet.steer.grant", "fleet.steer", "",
     "Mint and revoke the adapter's scoped bearer grants",
     "mint draws 128 CSPRNG bits for one bearer id scoped to a subset of "
     "brief,send,evidence with a bounded lifetime (ttl_seconds 0..2592000, "
@@ -531,17 +531,17 @@ ZCL_COMMAND_READY_COMMAND(
     "appends a superseding revoked row (revoking twice re-affirms); "
     "unknown ids are refused, never silently accepted. A revoked or "
     "expired grant "
-    "fails every fleet.mcp verb with MCP_GRANT_REVOKED or "
-    "MCP_GRANT_EXPIRED. This governs only fleet.mcp verbs: it is not "
+    "fails every fleet.steer verb with STEER_GRANT_REVOKED or "
+    "STEER_GRANT_EXPIRED. This governs only fleet.steer verbs: it is not "
     "wallet authority and not a fleet key role. It contacts no peer.", 0,
-    "fleet,mcp,grant,revoke,bearer,scope,expiry,chatgpt",
-    "zcl.fleet_mcp_grant.input.v1", "zcl.fleet_mcp_grant.v1",
+    "fleet,steer,grant,revoke,bearer,scope,expiry,chatgpt",
+    "zcl.fleet_steer_grant.input.v1", "zcl.fleet_steer_grant.v1",
     "action,scopes,ttl_seconds,label,id", "action",
-    "z23 fleet mcp grant --action=mint --scopes=brief,send",
+    "z23 fleet steer grant --action=mint --scopes=brief,send",
     ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
     ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
     ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
     ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
     ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_NONE,
-    zcl_native_handle_fleet_mcp_grant)
+    zcl_native_handle_fleet_steer_grant)
