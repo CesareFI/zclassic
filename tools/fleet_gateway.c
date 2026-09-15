@@ -37,12 +37,6 @@
 
 #if defined(_WIN32)
 #include <stdio.h>
-int main(void)
-{
-    fputs("z23-fleet-gateway: loopback gateway is unavailable on Windows\n",
-          stderr);
-    return 2;
-}
 #else
 
 #include "base/safe_alloc.h"
@@ -57,11 +51,10 @@ int main(void)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "platform/os_proc.h"
+
 #include <sys/socket.h>
 #include <sys/types.h>
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#endif
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -178,23 +171,17 @@ struct gw_config {
 };
 
 /* Own executable's directory: the default node binary is the sibling z23,
- * so the gateway works no matter which cwd the caller runs it from. */
+ * so the gateway works no matter which cwd the caller runs it from.
+ * The path comes from the platform seam (os_proc_exe_path), never from
+ * a raw /proc read in this leaf. */
 static bool gw_exe_dir(char *buf, size_t cap) {
-#ifdef __APPLE__
-    uint32_t n = (uint32_t)cap;
-    if (_NSGetExecutablePath(buf, &n) != 0) return false;
-#else
-    ssize_t n = readlink("/proc/self/exe", buf, cap - 1);
-    if (n < 0 || (size_t)n >= cap - 1) return false;
-    buf[n] = '\0';
-#endif
-    {
-        /* Truncate the final path component in place (no dirname():
-         * its return may alias buf, and copying overlapping %s is UB). */
-        char *slash = strrchr(buf, '/');
-        if (!slash || slash == buf) return false;
-        *slash = '\0';
-    }
+    char *slash;
+    if (!os_proc_exe_path(buf, cap)) return false;
+    /* Truncate the final path component in place (no dirname():
+     * its return may alias buf, and copying overlapping %s is UB). */
+    slash = strrchr(buf, '/');
+    if (!slash || slash == buf) return false;
+    *slash = '\0';
     return true;
 }
 
@@ -927,6 +914,15 @@ static int gw_bound_port(int fd)
 
 int main(int argc, char **argv)
 {
+#if defined(_WIN32)
+    /* POSIX only: on Windows the single main refuses (the node itself
+     * stays portable; the gateway does not claim it). */
+    (void)argc;
+    (void)argv;
+    fputs("z23-fleet-gateway: loopback gateway is unavailable on Windows\n",
+          stderr);
+    return 2;
+#else
     struct gw_config cfg;
     int fd, port;
     (void)argc;
@@ -965,5 +961,6 @@ int main(int argc, char **argv)
     }
     close(fd);
     return 0;
+#endif
 }
 #endif /* _WIN32 */
