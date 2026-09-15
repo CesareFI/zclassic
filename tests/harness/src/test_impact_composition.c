@@ -4298,7 +4298,9 @@ static bool ic_original_plan_fixture(const char *root, char local[65])
         "sed -i \"s/^BASE_GENERATION=.*/BASE_GENERATION=$$3/\" "
         "build/dev-loop/restart.env\n"
         "build/hotswap/zcl_rollback_fixture_%.so:\n"
-        "\t@mkdir -p build/hotswap; printf '%s\\n' '$*' > $@\n";
+        "\t@mkdir -p build/hotswap; printf '%s\\n' '$*' > $@\n"
+        "build/fixtures/rlc_child_%:\n"
+        "\t@mkdir -p build/fixtures; printf '%s\\n' '$*' > $@\n";
     if (!ic_write(root, ".gitignore", "build/\n.cache/\n") ||
         !ic_write(root, "sample.c", "int value = 1;\n") ||
         !ic_write(root, "Makefile", makefile) ||
@@ -4334,11 +4336,14 @@ static bool ic_original_plan_recovers_fixtures(
     static const char *const fixtures[] = {
         "build/hotswap/zcl_rollback_fixture_a.so",
         "build/hotswap/zcl_rollback_fixture_b.so",
+        "build/fixtures/rlc_child_v1",
+        "build/fixtures/rlc_child_broken",
     };
+    const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
     char path[4096], generation[4096], why[512];
     if (snprintf(generation, sizeof(generation), "%s/build/generation", root) >=
         (int)sizeof(generation)) return false;
-    for (size_t i = 0; i < 2u; i++) {
+    for (size_t i = 0; i < fixture_count; i++) {
         if (snprintf(path, sizeof(path), "%s/%s", root, fixtures[i]) >=
             (int)sizeof(path) || unlink(path) != 0)
             return false;
@@ -4349,7 +4354,7 @@ static bool ic_original_plan_recovers_fixtures(
     }
     if (!zcl_dev_proof_test_original_plan_prepare(
             root, local, log, why, sizeof(why))) return false;
-    for (size_t i = 0; i < 2u; i++) {
+    for (size_t i = 0; i < fixture_count; i++) {
         if (!zcl_dev_proof_test_generation_dependency(
                 root, generation, fixtures[i], why, sizeof(why)))
             return false;
@@ -5452,6 +5457,10 @@ static int test_ic_generation_dependencies_survive_vendor_cleanup(void)
 #if defined(__linux__)
             "build/hotswap/zcl_rollback_fixture_a.so",
             "build/hotswap/zcl_rollback_fixture_b.so",
+#endif
+#if !defined(_WIN32)
+            "build/fixtures/rlc_child_v1",
+            "build/fixtures/rlc_child_broken",
 #endif
         };
         for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i)

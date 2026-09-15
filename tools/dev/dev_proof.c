@@ -4434,7 +4434,11 @@ static bool dp_generation_dependency(const char *root, const char *generation,
                                         14) == 0
                                     ? "make build/hotswap/zcl_rollback_fixture_a.so "
                                       "build/hotswap/zcl_rollback_fixture_b.so"
-                                    : "make install-hooks";
+                                    : strncmp(dependency, "build/fixtures/",
+                                              15) == 0
+                                        ? "make build/fixtures/rlc_child_v1 "
+                                          "build/fixtures/rlc_child_broken"
+                                        : "make install-hooks";
         proof_whyf(why, why_len,
                    "proof_generation_dependency_unavailable:%s (%s)",
                    dependency, fix);
@@ -4534,6 +4538,14 @@ static bool dp_generation_dependencies(const char *root,
          * the Makefile's Linux-only prerequisites. */
         "build/hotswap/zcl_rollback_fixture_a.so",
         "build/hotswap/zcl_rollback_fixture_b.so",
+#endif
+#if !defined(_WIN32)
+        /* Same class: the resident-launch contract group execs these
+         * fixture children by name on every POSIX host (the Makefile guards
+         * the pair on ZCL_HOST_WINDOWS only), and the test dimension runs no
+         * make that could build them inside the generation. */
+        "build/fixtures/rlc_child_v1",
+        "build/fixtures/rlc_child_broken",
 #endif
     };
     if (!dp_generation_build_dirs(generation, why, why_len))
@@ -6611,6 +6623,14 @@ static bool proof_original_plan_prepare(const struct proof_paths *paths,
 #if defined(__linux__)
         "build/hotswap/zcl_rollback_fixture_a.so",
         "build/hotswap/zcl_rollback_fixture_b.so",
+#endif
+#if !defined(_WIN32)
+        /* Same class as the rollback images above: order-only test-binary
+         * prerequisites the resident-launch contract group execs by name.
+         * A cold generation has no other builder for them, and without them
+         * the group's first check fails on absence, not on behaviour. */
+        "build/fixtures/rlc_child_v1",
+        "build/fixtures/rlc_child_broken",
 #endif
         NULL,
     };
