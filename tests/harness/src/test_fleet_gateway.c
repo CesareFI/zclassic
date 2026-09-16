@@ -38,7 +38,9 @@ int test_fleet_gateway(void)
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+#include <errno.h>
 
 #define GW_TEST_BIN_DEFAULT "build/bin/z23-fleet-gateway"
 #define GW_TEST_NODE_DEFAULT "build/bin/z23"
@@ -880,6 +882,452 @@ _test_next:;
     return failures;
 }
 
+/* Worker-lifecycle regression: the authorized-task journey through the real
+ * gateway, mail, ack, queue and evidence leaves in one isolated lane.
+ * send -> queued -> brief delivered -> receiver ack -> acknowledged ->
+ * real queue outcome naming the same ref -> brief completed -> evidence
+ * returns the exact outcome row. Restart, idempotency and revoke legs
+ * follow in their own cases. No case touches the network beyond loopback,
+ * the wallet, deployment, or soak paths. */
+#define GW_LIFE_REF "gw-life-001"
+#define GW_LIFE_KEY "gw-life-key-001"
+#define GW_LIFE_TO "gw-worker"
+#define GW_LIFE_FROM "gw-chat"
+
+static char g_gw_state[512];
+static char g_life_gid[64];
+static long long g_life_seq = -1;
+
+/* tools/call envelope around a caller-built arguments object. */
+static char *gw_tool(const char *verb, const char *argsjson, int id, int *st)
+{
+    char req[4096];
+    int sn = snprintf(req, sizeof(req),
+                      "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/"
+                      "call\",\"params\":{\"name\":\"%s\",\"arguments\":%s}}",
+                      id, verb, argsjson);
+    if (sn <= 0 || (size_t)sn >= sizeof(req))
+        return NULL;
+    return gw_post("/steer", req, st);
+}
+
+/* One in-process dev.agent.queue call. True when the leaf passes. */
+struct gw_qcall {
+    struct json_value input;
+    struct zcl_command_request req;
+    struct zcl_command_reply rep;
+};
+
+static void gw_qbegin(struct gw_qcall *c, const char *action)
+{
+    json_init(&c->input);
+    json_set_object(&c->input);
+    memset(&c->req, 0, sizeof(c->req));
+    c->req.input = &c->input;
+    c->req.spec =
+        zcl_command_registry_find(zcl_command_catalog(), "dev.agent.queue",
+                                  NULL);
+    zcl_command_reply_init(&c->rep, "zcl.agent_queue.v1");
+    (void)json_push_kv_str(&c->input, "action", action);
+}
+
+static bool gw_qrun(struct gw_qcall *c)
+{
+    zcl_native_handle_dev_agent_queue(&c->req, &c->rep);
+    return c->rep.status == ZCL_COMMAND_STATUS_PASSED;
+}
+
+static void gw_qend(struct gw_qcall *c)
+{
+    zcl_command_reply_free(&c->rep);
+    json_free(&c->input);
+}
+
+static bool gw_qpost(const char *name)
+{
+    struct gw_qcall c;
+    bool ok;
+    gw_qbegin(&c, "post");
+    (void)json_push_kv_str(&c.input, "kind", "leaf");
+    (void)json_push_kv_str(&c.input, "name", name);
+    ok = gw_qrun(&c);
+    gw_qend(&c);
+    return ok;
+}
+
+static bool gw_qnext(char *state, size_t cap)
+{
+    struct gw_qcall c;
+    bool ok = false;
+    const struct json_value *v;
+    const char *s;
+    gw_qbegin(&c, "next");
+    if (gw_qrun(&c)) {
+        v = json_get(&c.rep.data, "state");
+        s = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
+        if (s && snprintf(state, cap, "%s", s) > 0)
+            ok = true;
+    }
+    gw_qend(&c);
+    return ok;
+}
+
+/* Reap and require one outcome row naming the ref with a PASS verdict. */
+static bool gw_qreap_pass(const char *name)
+{
+    struct gw_qcall c;
+    const struct json_value *rows, *r, *v;
+    const char *n, *verdict;
+    size_t i, nrows;
+    bool found = false;
+    gw_qbegin(&c, "reap");
+    if (!gw_qrun(&c)) {
+        gw_qend(&c);
+        return false;
+    }
+    rows = json_get(&c.rep.data, "outcomes");
+    if (rows && rows->type == JSON_ARR) {
+        nrows = json_size(rows);
+        for (i = 0; i < nrows; i++) {
+            r = json_at(rows, i);
+            if (!r || r->type != JSON_OBJ)
+                continue;
+            v = json_get(r, "name");
+            n = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
+            v = json_get(r, "verdict");
+            verdict = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
+            if (n && verdict && strcmp(n, name) == 0 &&
+                strcmp(verdict, "PASS") == 0)
+                found = true;
+        }
+    }
+    gw_qend(&c);
+    return found;
+}
+
+static bool gw_write_text(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    size_t len;
+    bool wrote;
+    if (!f)
+        return false;
+    len = strlen(text);
+    wrote = fwrite(text, 1, len, f) == len;
+    return fclose(f) == 0 && wrote;
+}
+
+static bool gw_mkdirp(const char *path)
+{
+    char acc[1100];
+    size_t i, n = strlen(path);
+    if (n == 0 || n >= sizeof(acc))
+        return false;
+    for (i = 1; i <= n; i++) {
+        if (path[i] != '/' && path[i] != '\0')
+            continue;
+        memcpy(acc, path, i);
+        acc[i] = '\0';
+        if (mkdir(acc, 0700) != 0 && errno != EEXIST)
+            return false;
+    }
+    return true;
+}
+
+/* Minimal fake engine-unit on PATH: writes a PASS receipt for --state-dir
+ * and exits. Same fixture pattern as the queue group's fake. */
+static const char k_gw_fake[] =
+    "#!/bin/sh\n"
+    "st=\"\"\n"
+    "prev=\"\"\n"
+    "for a in \"$@\"; do\n"
+    "  case \"$a\" in\n"
+    "    --state-dir=*) st=\"${a#--state-dir=}\";;\n"
+    "    --state-dir) prev=\"want\";;\n"
+    "    *) if [ \"$prev\" = \"want\" ]; then st=\"$a\"; prev=\"\"; fi;;\n"
+    "  esac\n"
+    "done\n"
+    "[ -n \"$st\" ] || exit 2\n"
+    "printf '{\"verdict\":\"PASS\"}\n' > \"$st/receipt.json\"\n"
+    "echo \"dispatching $st\"\n"
+    "echo \"rc=0\"\n"
+    "exit 0\n";
+
+static char g_gw_saved_path[9000];
+
+static bool gw_fake_unit(void)
+{
+    char base[512], bindir[1024], prog[1100], path[9000];
+    const char *old = getenv("PATH");
+    test_make_tmpdir(base, sizeof(base), "fleet_gateway", "life_bin");
+    if (snprintf(bindir, sizeof(bindir), "%s/bin", base) < 0)
+        return false;
+    if (mkdir(bindir, 0700) != 0)
+        return false;
+    if (snprintf(prog, sizeof(prog), "%s/zclassic23-engine-unit",
+                 bindir) < 0)
+        return false;
+    if (!gw_write_text(prog, k_gw_fake))
+        return false;
+    if (chmod(prog, 0755) != 0)
+        return false;
+    if (!old || snprintf(g_gw_saved_path, sizeof(g_gw_saved_path), "%s",
+                         old) < 0)
+        return false;
+    if (snprintf(path, sizeof(path), "%s:%s", bindir, old) < 0)
+        return false;
+    return setenv("PATH", path, 1) == 0;
+}
+
+static void gw_path_restore(void)
+{
+    if (g_gw_saved_path[0])
+        setenv("PATH", g_gw_saved_path, 1);
+}
+
+/* Warm pool worktree plus pool.txt under the isolated queue dir. */
+static bool gw_pool(char *qd, size_t qdcap)
+{
+    const char *xdg = getenv("XDG_STATE_HOME");
+    char base[512], wt[1024], warm[1100], pool[1200], line[1100];
+    FILE *f;
+    if (!xdg || snprintf(qd, qdcap, "%s/z23/dev/queue", xdg) < 0)
+        return false;
+    if (!gw_mkdirp(qd))
+        return false;
+    test_make_tmpdir(base, sizeof(base), "fleet_gateway", "life_wt");
+    if (snprintf(wt, sizeof(wt), "%s/wt", base) < 0)
+        return false;
+    if (mkdir(wt, 0700) != 0)
+        return false;
+    if (snprintf(warm, sizeof(warm), "%s/.eu-warm", wt) < 0)
+        return false;
+    if (!gw_write_text(warm, "warm\n"))
+        return false;
+    if (snprintf(pool, sizeof(pool), "%s/pool.txt", qd) < 0)
+        return false;
+    if (snprintf(line, sizeof(line), "%s\n", wt) < 0)
+        return false;
+    f = fopen(pool, "wb");
+    if (!f)
+        return false;
+    if (fwrite(line, 1, strlen(line), f) != strlen(line)) {
+        (void)fclose(f);
+        return false;
+    }
+    return fclose(f) == 0;
+}
+
+static bool gw_poll_file(const char *path)
+{
+    int i;
+    struct timespec req;
+    for (i = 0; i < 150; i++) {
+        if (access(path, R_OK) == 0)
+            return true;
+        req.tv_sec = 0;
+        req.tv_nsec = 100000000L;
+        (void)nanosleep(&req, NULL); /* real-clock: bounded wait for a detached engine-unit child outside this address space; completion arrives in kernel time and no fake-clock seam reaches it */
+    }
+    return access(path, R_OK) == 0;
+}
+
+static int gw_t_life_send_ack(void)
+{
+    int failures = 0;
+    TEST("lifecycle: send queues, brief reports delivered then acknowledged") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char args[1024];
+        char *b;
+        int st = 0, sn;
+        long long seq;
+        ASSERT(gw_mint(node, "brief,send,evidence", g_life_gid));
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"from\":\"" GW_LIFE_FROM "\","
+                      "\"items\":[{\"to\":\"" GW_LIFE_TO "\","
+                      "\"body\":\"Lifecycle probe PINEAPPLE\","
+                      "\"ref\":\"" GW_LIFE_REF "\","
+                      "\"idempotency_key\":\"" GW_LIFE_KEY "\"}]}",
+                      g_life_gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_send", args, 30, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "queued"));
+        seq = gw_body_seq(b);
+        free(b);
+        ASSERT(seq > 0);
+        g_life_seq = seq;
+        /* Delivered on pull, never ahead: no ack, no outcome yet. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"since\":%lld}", g_life_gid,
+                      seq - 1);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_brief", args, 31, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"state\\\":\\\"delivered\\\""));
+        ASSERT(!gw_body_has(b, "acknowledged"));
+        ASSERT(!gw_body_has(b, "completed"));
+        free(b);
+        /* Receiver ack through the real mail leaf. */
+        ASSERT(gw_mail_ack(GW_LIFE_TO, seq));
+        b = gw_tool("steer_brief", args, 32, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"state\\\":\\\"acknowledged\\\""));
+        ASSERT(!gw_body_has(b, "completed"));
+        free(b);
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
+static int gw_t_life_complete(void)
+{
+    int failures = 0;
+    TEST("lifecycle: real queue outcome completes the ref, evidence exact") {
+        char args[1024];
+        char qd[1100], receipt[1300], qstate[32];
+        char *b;
+        int st = 0, sn;
+        bool reaped;
+        ASSERT(g_life_seq > 0 && g_life_gid[0]);
+        ASSERT(gw_fake_unit());
+        ASSERT(gw_pool(qd, sizeof(qd)));
+        ASSERT(gw_qpost(GW_LIFE_REF));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        ASSERT_STR_EQ(qstate, "running");
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/receipt.json", qd, GW_LIFE_REF);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_file(receipt));
+        reaped = gw_qreap_pass(GW_LIFE_REF);
+        gw_path_restore();
+        ASSERT(reaped);
+        /* The outcome names the ref: brief upgrades to completed. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"since\":%lld}", g_life_gid,
+                      g_life_seq - 1);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_brief", args, 33, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"state\\\":\\\"completed\\\""));
+        free(b);
+        /* Evidence returns the exact outcome row by ref. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\""
+                      GW_LIFE_REF "\"}",
+                      g_life_gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 34, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"name\\\":\\\"" GW_LIFE_REF "\\\""));
+        ASSERT(gw_body_has(b, "\"verdict\\\":\\\"PASS\\\""));
+        free(b);
+        /* The directive row itself is still readable by ref. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"mail\",\"ref\":\""
+                      GW_LIFE_REF "\"}",
+                      g_life_gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 35, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"ref\\\":\\\"" GW_LIFE_REF "\\\""));
+        free(b);
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
+static int gw_t_life_restart(void)
+{
+    int failures = 0;
+    TEST("lifecycle: restart keeps completed, idempotent, revoke-safe") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        const char *bin = gw_bin("Z23_TEST_GATEWAY_BIN", GW_TEST_BIN_DEFAULT);
+        char args[1024];
+        char gid2[64];
+        char *b;
+        int st = 0, sn;
+        ASSERT(g_life_seq > 0 && g_life_gid[0]);
+        /* Kill and restart the gateway mid-journey: state is file-backed. */
+        gw_stop();
+        ASSERT(gw_spawn(bin, node, g_gw_state));
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"since\":%lld}", g_life_gid,
+                      g_life_seq - 1);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_brief", args, 36, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"state\\\":\\\"completed\\\""));
+        free(b);
+        /* Same key and payload: reconciled, zero duplicate work. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"from\":\"" GW_LIFE_FROM "\","
+                      "\"items\":[{\"to\":\"" GW_LIFE_TO "\","
+                      "\"body\":\"Lifecycle probe PINEAPPLE\","
+                      "\"ref\":\"" GW_LIFE_REF "\","
+                      "\"idempotency_key\":\"" GW_LIFE_KEY "\"}]}",
+                      g_life_gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_send", args, 37, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "duplicate\\\":true"));
+        free(b);
+        /* Same key, changed payload: refused, never a second row. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"from\":\"" GW_LIFE_FROM "\","
+                      "\"items\":[{\"to\":\"" GW_LIFE_TO "\","
+                      "\"body\":\"Lifecycle probe ORANGE\","
+                      "\"ref\":\"" GW_LIFE_REF "\","
+                      "\"idempotency_key\":\"" GW_LIFE_KEY "\"}]}",
+                      g_life_gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_send", args, 38, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "IDEMPOTENCY_CONFLICT"));
+        ASSERT(!gw_body_has(b, "duplicate\\\":true"));
+        free(b);
+        /* Revoke blocks new calls but does not rewrite completed evidence. */
+        {
+            char in[256], *reply;
+            sn = snprintf(in, sizeof(in),
+                          "{\"action\":\"revoke\",\"id\":\"%s\"}",
+                          g_life_gid);
+            ASSERT(sn > 0 && (size_t)sn < sizeof(in));
+            reply = gw_node_run(node, "grant", in);
+            ASSERT(reply != NULL);
+            free(reply);
+        }
+        sn = snprintf(args, sizeof(args), "{\"grant\":\"%s\"}", g_life_gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_brief", args, 39, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "STEER_GRANT_REVOKED"));
+        free(b);
+        ASSERT(gw_mint(node, "brief,send,evidence", gid2));
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\""
+                      GW_LIFE_REF "\"}",
+                      gid2);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 40, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"verdict\\\":\\\"PASS\\\""));
+        free(b);
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
 int test_fleet_gateway(void);
 int test_fleet_gateway(void)
 {
@@ -904,6 +1352,8 @@ int test_fleet_gateway(void)
     }
     if (setenv("XDG_STATE_HOME", state, 1) != 0)
         return 1;
+    if (snprintf(g_gw_state, sizeof(g_gw_state), "%s", state) < 0)
+        return 1;
     if (!gw_spawn(bin, node, state)) {
         if (had_xdg)
             setenv("XDG_STATE_HOME", saved, 1);
@@ -916,6 +1366,9 @@ int test_fleet_gateway(void)
     failures += gw_t_calls();
     failures += gw_t_auth();
     failures += gw_t_oauth();
+    failures += gw_t_life_send_ack();
+    failures += gw_t_life_complete();
+    failures += gw_t_life_restart();
     /* No ASSERT lives here; the stop always runs on fall-through. */
     gw_stop();
     if (had_xdg)
