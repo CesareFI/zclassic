@@ -1365,10 +1365,15 @@ static int rlc_stage_run(const struct zcl_command_spec *spec,
     if (ran && rlc_ok(&c))
         printf("resident_launch_contract: invocation timings "
                "verification_us=%lld first_result_us=%lld "
-               "completed_us=%lld mapped_proof=%s\n",
+               "completed_us=%lld mapped_proof=%s "
+               "artifact_sha3=%s package_root=%s receipt_id=%s "
+               "pid=%lld start_token=%lld nonce=%s\n",
                rlc_int(&c, "verification_us"),
                rlc_int(&c, "first_result_us"),
-               rlc_int(&c, "completed_us"), rlc_str(&c, "mapped_proof"));
+               rlc_int(&c, "completed_us"), rlc_str(&c, "mapped_proof"),
+               rlc_str(&c, "artifact_sha3"), root_hex, receipt_hex,
+               rlc_int(&c, "pid"), rlc_int(&c, "start_token"),
+               rlc_str(&c, "nonce"));
     rlc_end(&c);
 
     /* A second explicit one-shot: state is per-invocation by design, so

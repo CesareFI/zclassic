@@ -48,10 +48,12 @@ disappears.
 
 ## Try Tasks locally
 
-Open the task list without choosing a storage directory or running a node:
+Tasks opens without choosing a storage directory or running a node. The copyable
+walkthrough below uses an explicit private directory so trying it does not modify
+your everyday task list:
 
 ```bash
-z23 app tasks open
+z23 app tasks --input='{"action":"open","datadir":"/tmp/z23-tasks-demo"}'
 ```
 
 Choose **New task**, type, and wait for **Saved**. Close the app, run the same
@@ -60,16 +62,17 @@ Titles currently support at most 95 Basic Latin characters.
 Use Tab to move visible focus and Enter to choose an action. **More / Undo**
 contains Delete and Undo. A failed save keeps the editor open with your draft.
 
-`z23 app tasks list` reports the saved contents and `data_directory`. Default
+`z23 app tasks --input='{"action":"list","datadir":"/tmp/z23-tasks-demo"}'` reports the saved contents and `data_directory`. Default
 storage is private to your OS account, separate from node and developer state.
+Omit the directory when opening or listing your everyday tasks.
 To reopen tasks you already saved elsewhere, pass that same absolute directory:
-`z23 app tasks open /absolute/private/tasks`.
+`z23 app tasks --input='{"action":"open","datadir":"/absolute/private/tasks"}'`.
 
 An update must already be installed and verified in that app's data directory.
 Open its exact installed output with the receipt and root provided by the build:
 
 ```bash
-z23 app tasks open --preview_root=ROOT --preview_receipt=RECEIPT --preview_program=bin/ztasks
+z23 app tasks --input='{"action":"open","datadir":"/tmp/z23-tasks-demo","preview_root":"ROOT","preview_receipt":"RECEIPT","preview_program":"bin/ztasks"}'
 ```
 
 Choose **Try update**, then explicitly allow the isolated preview. Use **Tasks**
