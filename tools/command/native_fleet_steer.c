@@ -1707,8 +1707,12 @@ static void fmc_evidence_mail(const struct zcl_command_request *req,
         fmc_sub_end(&sub);
         return;
     }
+    /* A ref may own a thread (directive, then worker result rows). The
+     * latest entry is the exact result, matching the queue rule that the
+     * last terminal outcome wins; single-row threads read unchanged. */
     rows = json_get(&sub.reply.data, "rows");
     if (rows && rows->type == JSON_ARR) {
+        const struct json_value *hit = NULL;
         n = json_size(rows);
         for (i = 0; i < n; i++) {
             const struct json_value *r = json_at(rows, i);
@@ -1718,12 +1722,14 @@ static void fmc_evidence_mail(const struct zcl_command_request *req,
                 continue;
             v = json_get(r, "ref");
             rref = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-            if (rref && strcmp(rref, ref) == 0) {
-                fmc_emit_object(reply, "mail", r);
-                fmc_evidence_mail_ack(reply, r);
-                fmc_sub_end(&sub);
-                return;
-            }
+            if (rref && strcmp(rref, ref) == 0)
+                hit = r;
+        }
+        if (hit) {
+            fmc_emit_object(reply, "mail", hit);
+            fmc_evidence_mail_ack(reply, hit);
+            fmc_sub_end(&sub);
+            return;
         }
     }
     fmc_fail(reply, "EVIDENCE_NOT_FOUND", "no mail row carries that ref",

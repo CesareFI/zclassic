@@ -1405,6 +1405,77 @@ _test_next:;
 #define GW_COMPAT_TIMEOUT "gw-compat-timeout"
 #define GW_COMPAT_RANDOM "gw-compat-random"
 #define GW_COMPAT_NORC "gw-compat-norc"
+#define GW_COMPAT_RESULT "gw-compat-result"
+#define GW_COMPAT_CANCELA "gw-compat-cancela"
+#define GW_COMPAT_CANCELB "gw-compat-cancelb"
+
+/* Canonical worker-result body: flat key=value pairs carrying every
+ * field the ChatGPT side needs and none the queue outcome carries.
+ * Flat pairs keep the exact binding assertable through both escaping
+ * layers and stay scanner-safe (no slashes, IPs, key patterns, or
+ * absolute paths). Values are tokens, hex, or integers: never spaces. */
+#define GW_RESULT_BODY \
+    "ref=gw-compat-result worker=gw-worker session=sess-compat-1 " \
+    "model=muse-spark-test terminal=pass " \
+    "candidate=0123456789abcdef0123456789abcdef01234567 " \
+    "gate_evidence=gw-compat-pass tokens=1234 wall_s=5"
+
+static bool gw_mail_post(const char *to, const char *kind, const char *body,
+                         const char *ref, const char *from)
+{
+    struct json_value input;
+    struct zcl_command_request request;
+    struct zcl_command_reply reply;
+    bool ok;
+    json_init(&input);
+    json_set_object(&input);
+    memset(&request, 0, sizeof(request));
+    request.input = &input;
+    request.spec =
+        zcl_command_registry_find(zcl_command_catalog(), "dev.agent.mail",
+                                  NULL);
+    zcl_command_reply_init(&reply, "zcl.agent_mail.v1");
+    (void)json_push_kv_str(&input, "action", "post");
+    (void)json_push_kv_str(&input, "to", to);
+    (void)json_push_kv_str(&input, "kind", kind);
+    (void)json_push_kv_str(&input, "body", body);
+    (void)json_push_kv_str(&input, "ref", ref);
+    (void)json_push_kv_str(&input, "from", from);
+    zcl_native_handle_dev_agent_mail(&request, &reply);
+    ok = reply.status == ZCL_COMMAND_STATUS_PASSED;
+    zcl_command_reply_free(&reply);
+    json_free(&input);
+    return ok;
+}
+
+/* One in-process queue cancel. True when the leaf passes; state holds the
+ * reply state and ecode the refusal code (empty on success). */
+static bool gw_qcancel(const char *name, char *state, size_t cap,
+                       long long *cancelled, char *ecode, size_t ecap)
+{
+    struct gw_qcall c;
+    const struct json_value *v;
+    const char *s;
+    bool ok;
+    gw_qbegin(&c, "cancel");
+    (void)json_push_kv_str(&c.input, "name", name);
+    zcl_native_handle_dev_agent_queue(&c.req, &c.rep);
+    ok = c.rep.status == ZCL_COMMAND_STATUS_PASSED;
+    state[0] = '\0';
+    ecode[0] = '\0';
+    *cancelled = 0;
+    v = json_get(&c.rep.data, "state");
+    s = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
+    if (s)
+        (void)snprintf(state, cap, "%s", s);
+    v = json_get(&c.rep.data, "cancelled");
+    if (v && v->type == JSON_INT)
+        *cancelled = (long long)json_get_int(v);
+    if (!ok && c.rep.error.code[0])
+        (void)snprintf(ecode, ecap, "%s", c.rep.error.code);
+    gw_qend(&c);
+    return ok;
+}
 
 static bool gw_compat_send(const char *node, const char *ref, const char *key,
                            char *gid, long long *seq)
@@ -1805,6 +1876,117 @@ _test_next:;
     return failures;
 }
 
+static int gw_t_compat_result(void)
+{
+    int failures = 0;
+    TEST("compat: result row plus outcome row complete the journey") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char gid[64], args[1024], qd[1100], receipt[1300], qstate[32];
+        char verdict[128];
+        long long seq = -1, rc = -1;
+        bool found = false, ok;
+        char *b;
+        int st = 0, sn;
+        ASSERT(gw_compat_send(node, GW_COMPAT_RESULT, "gw-compat-k9", gid,
+                              &seq));
+        ASSERT(gw_fake_setup());
+        ASSERT(gw_fake_write("PASS", "0", 0));
+        ASSERT(gw_pool(qd, sizeof(qd)));
+        ASSERT(gw_qpost(GW_COMPAT_RESULT, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/receipt.json", qd,
+                      GW_COMPAT_RESULT);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
+        ok = gw_qreap_scan(GW_COMPAT_RESULT, verdict, sizeof(verdict), &rc,
+                           &found);
+        gw_path_restore();
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "PASS");
+        /* The worker posts its result row under the same ref. */
+        ASSERT(gw_mail_post(GW_LIFE_TO, "result", GW_RESULT_BODY,
+                            GW_COMPAT_RESULT, GW_LIFE_TO));
+        ASSERT(gw_brief_has(gid, seq, "\"state\\\":\\\"completed\\\""));
+        /* Evidence by ref returns the latest mail entry: the result. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"mail\",\"ref\":\"%s\"}",
+                      gid, GW_COMPAT_RESULT);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 67, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"kind\\\":\\\"result\\\""));
+        ASSERT(gw_body_has(b, "ref=gw-compat-result"));
+        ASSERT(gw_body_has(b, "worker=gw-worker"));
+        ASSERT(gw_body_has(b, "session=sess-compat-1"));
+        ASSERT(gw_body_has(b, "model=muse-spark-test"));
+        ASSERT(gw_body_has(b, "terminal=pass"));
+        ASSERT(gw_body_has(b,
+                           "candidate=0123456789abcdef0123456789abcdef"
+                           "01234567"));
+        ASSERT(gw_body_has(b, "gate_evidence=gw-compat-pass"));
+        ASSERT(gw_body_has(b, "tokens=1234"));
+        ASSERT(gw_body_has(b, "wall_s=5"));
+        free(b);
+        /* And the outcome row stays exact beside it. */
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\"%s\"}",
+                      gid, GW_COMPAT_RESULT);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 68, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"verdict\\\":\\\"PASS\\\""));
+        free(b);
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
+static int gw_t_compat_cancelq(void)
+{
+    int failures = 0;
+    TEST("compat: cancel stops queued work, refuses live rows") {
+        char qd[1100], qstate[32], qcstate[32], ecode[64];
+        long long cancelled = 0;
+        bool ok;
+        ASSERT(gw_fake_setup());
+        ASSERT(gw_fake_write("PASS", "0", 0));
+        ASSERT(gw_pool(qd, sizeof(qd)));
+        /* Cancel a queued row: later next sees an empty queue. */
+        ASSERT(gw_qpost(GW_COMPAT_CANCELA, 1));
+        ok = gw_qcancel(GW_COMPAT_CANCELA, qcstate, sizeof(qcstate),
+                        &cancelled, ecode, sizeof(ecode));
+        ASSERT(ok);
+        ASSERT_STR_EQ(qcstate, "cancelled");
+        ASSERT_EQ(cancelled, 1);
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        ASSERT_STR_EQ(qstate, "empty");
+        /* A cancelled name re-posts cleanly: no residue. */
+        ASSERT(gw_qpost(GW_COMPAT_CANCELA, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        ASSERT_STR_EQ(qstate, "running");
+        /* Cancel a running row: refused, worker owns it. */
+        ok = gw_qcancel(GW_COMPAT_CANCELB, qcstate, sizeof(qcstate),
+                        &cancelled, ecode, sizeof(ecode));
+        ASSERT(!ok);
+        ASSERT_STR_EQ(ecode, "CANCEL_NOT_FOUND");
+        ASSERT(gw_qpost(GW_COMPAT_CANCELB, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        ASSERT_STR_EQ(qstate, "running");
+        ok = gw_qcancel(GW_COMPAT_CANCELB, qcstate, sizeof(qcstate),
+                        &cancelled, ecode, sizeof(ecode));
+        ASSERT(!ok);
+        ASSERT_STR_EQ(ecode, "CANCEL_RUNNING");
+        gw_path_restore();
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
 int test_fleet_gateway(void);
 int test_fleet_gateway(void)
 {
@@ -1851,6 +2033,8 @@ int test_fleet_gateway(void)
     failures += gw_t_compat_crash();
     failures += gw_t_compat_case();
     failures += gw_t_compat_rc();
+    failures += gw_t_compat_result();
+    failures += gw_t_compat_cancelq();
     /* No ASSERT lives here; the stop always runs on fall-through. */
     gw_stop();
     if (had_xdg)

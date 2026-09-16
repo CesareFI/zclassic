@@ -11,11 +11,13 @@
  * the behavior (post/next/reap/status) and drops the shell.
  *
  * INPUT (zcl.agent_queue_input.v1)
- *   action   string, required: post | next | reap | status. Also the first
- *            positional, so `z23 dev agent queue post ...` works.
+ *   action   string, required: post | next | reap | status | cancel. Also
+ *            the first positional, so `z23 dev agent queue post ...` works.
  *   kind     post only: leaf | doc | file | fix-gate.
- *   name     post only: [A-Za-z0-9_.-]{1,64}, never "." or ".." (a name is
- *            one path segment under engine/).
+ *   name     post and cancel: [A-Za-z0-9_.-]{1,64}, never "." or ".." (a
+ *            name is one path segment under engine/). Cancel drops queued
+ *            rows with the name and refuses running names; terminal
+ *            outcomes are never rewritten.
  *   group    post only, required for kind=file: a test group name.
  *   path     post only, required for kind=doc|file: a repo-relative path
  *            (never absolute, never containing ..).
@@ -51,7 +53,8 @@
  * plus per action: post {seq, name, state:"queued"}; next {seq, name,
  * worktree, pid_or_unit, state:"running"} or {state:"no_free_worktree"} or
  * {state:"empty"}; reap {state:"reaped", outcomes:[...], requeued}; status
- * {queued, running, outcomes, pool} plus screen unless json=true.
+ * {queued, running, outcomes, pool} plus screen unless json=true; cancel
+ * {state:"cancelled", name, cancelled:N} or CANCEL_RUNNING/CANCEL_NOT_FOUND.
  *
  * PROCESS RULE. Spawn only through zcl_spawn_detached() from util/spawn.h.
  * popen(), system() and a shell command string are forbidden and gated.
@@ -1290,6 +1293,123 @@ static void dvq_unmark(const char *queuedir, const char *qpath, long long seq)
     dvq_unlock(lock);
 }
 
+/* Bounded cancel: drop queued (unclaimed) rows naming name, so a later
+ * next never launches them. Running rows belong to their worker —
+ * stopping one is the worker's own responsibility, never this action's.
+ * Terminal outcomes are history and are never rewritten, and grant
+ * revocation is unrelated: it kills credentials, not queued work. Lock,
+ * temp+rename rewrite, typed refuses; no new state system appears. */
+static void dvq_cancel_filter(struct dvq_row *rows, size_t nrows,
+                              const char *name, struct dvq_row *kept,
+                              size_t *nkept, size_t *dropped, bool *live)
+{
+    size_t i;
+    *nkept = 0;
+    *dropped = 0;
+    *live = false;
+    for (i = 0; i < nrows; i++) {
+        if (strcmp(rows[i].name, name) == 0) {
+            if (strcmp(rows[i].state, "queued") == 0) {
+                (*dropped)++;
+                continue;
+            }
+            *live = true;
+        }
+        kept[(*nkept)++] = rows[i];
+    }
+}
+
+static void dvq_cancel(const struct zcl_command_request *req,
+                       struct zcl_command_reply *reply)
+{
+    struct dvq_dirs d;
+    struct dvq_row *rows = NULL, *kept = NULL;
+    size_t nrows = 0, nkept = 0, dropped = 0;
+    bool live = false;
+    char qpath[4096];
+    const char *name;
+    int lock = -1;
+    if (!req || !req->input) {
+        dvq_fail(reply, "BAD_INPUT", "cancel",
+                 "dev.agent.queue cancel needs a name",
+                 "request.input was missing");
+        return;
+    }
+    name = dvq_str(req, "name");
+    if (!name || !dvq_name_ok(name)) {
+        dvq_fail(reply, "BAD_INPUT", "cancel",
+                 "name matches [A-Za-z0-9_.-]{1,64} and is never . or ..",
+                 "input.name missing, misspelled, or escaping");
+        return;
+    }
+    if (!dvq_dirs_make(&d)) {
+        dvq_fail(reply, "STATE_DIR_FAILED", "cancel",
+                 "cannot resolve the owner-private state root",
+                 "platform_state_root");
+        return;
+    }
+    if (snprintf(qpath, sizeof(qpath), "%s/queue.jsonl", d.queue) >=
+        (int)sizeof(qpath)) {
+        dvq_fail(reply, "QUEUE_READ_FAILED", "cancel",
+                 "the queue path does not fit its buffer",
+                 "platform_state_root too long");
+        return;
+    }
+    lock = dvq_lock(d.queue);
+    if (lock < 0) {
+        dvq_fail(reply, "QUEUE_READ_FAILED", "cancel",
+                 "cannot take the queue lock", qpath);
+        return;
+    }
+    if (!dvq_load_rows(qpath, &rows, &nrows)) {
+        dvq_unlock(lock);
+        dvq_fail(reply, "QUEUE_READ_FAILED", "cancel",
+                 "cannot read the queue file", qpath);
+        return;
+    }
+    if (nrows > 0) {
+        kept = zcl_malloc(nrows * sizeof(*kept), "devagent.queue.cancel");
+        if (!kept) {
+            free(rows);
+            dvq_unlock(lock);
+            dvq_fail(reply, "QUEUE_WRITE_FAILED", "cancel",
+                     "cannot stage the kept rows", qpath);
+            return;
+        }
+    }
+    dvq_cancel_filter(rows, nrows, name, kept, &nkept, &dropped, &live);
+    if (dropped > 0 &&
+        !dvq_rewrite_rows(d.queue, qpath, kept, nkept)) {
+        free(rows);
+        free(kept);
+        dvq_unlock(lock);
+        dvq_fail(reply, "QUEUE_WRITE_FAILED", "cancel",
+                 "cannot rewrite the queue file", qpath);
+        return;
+    }
+    free(rows);
+    free(kept);
+    dvq_unlock(lock);
+    if (dropped > 0) {
+        (void)json_push_kv_str(&reply->data, "leaf", DVQ_LEAF);
+        (void)json_push_kv_str(&reply->data, "state", "cancelled");
+        (void)json_push_kv_str(&reply->data, "name", name);
+        (void)json_push_kv_int(&reply->data, "cancelled",
+                               (long long)dropped);
+        reply->status = ZCL_COMMAND_STATUS_PASSED;
+        reply->exit_code = 0;
+        return;
+    }
+    if (live) {
+        dvq_fail(reply, "CANCEL_RUNNING", "cancel",
+                 "a running row with that name belongs to its worker",
+                 "only queued rows cancel");
+        return;
+    }
+    dvq_fail(reply, "CANCEL_NOT_FOUND", "cancel",
+             "no queued row carries that name", "nothing to stop");
+}
+
 static void dvq_next(const struct zcl_command_request *req,
                      struct zcl_command_reply *reply)
 {
@@ -2233,14 +2353,14 @@ void zcl_native_handle_dev_agent_queue(
         return;
     if (!request || !request->input) {
         dvq_fail(reply, "BAD_INPUT", "route",
-                 "dev.agent.queue needs an action: post|next|reap|status",
+                 "dev.agent.queue needs an action: post|next|reap|status|cancel",
                  "request.input was missing");
         return;
     }
     action = dvq_str(request, "action");
     if (!action) {
         dvq_fail(reply, "BAD_INPUT", "route",
-                 "dev.agent.queue needs an action: post|next|reap|status",
+                 "dev.agent.queue needs an action: post|next|reap|status|cancel",
                  "input.action missing or empty");
         return;
     }
@@ -2256,11 +2376,15 @@ void zcl_native_handle_dev_agent_queue(
         dvq_reap(request, reply);
         return;
     }
+    if (strcmp(action, "cancel") == 0) {
+        dvq_cancel(request, reply);
+        return;
+    }
     if (strcmp(action, "status") == 0) {
         dvq_status(request, reply);
         return;
     }
     dvq_fail(reply, "UNKNOWN_ACTION", "route",
-             "action is one of post|next|reap|status",
+             "action is one of post|next|reap|status|cancel",
              "input.action unknown");
 }
