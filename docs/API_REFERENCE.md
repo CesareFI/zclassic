@@ -443,7 +443,7 @@ represented by its children's sections.
 | `app list` | ready | read / read / public · fast/low | none | `zcl.app_index.v1` | `z23 app list` | List installed App manifests |
 | `app inspect` | ready | read / read / public · fast/low | **`app_id`** | `zcl.app_manifest_summary.v1` | `z23 app inspect social` | Inspect one App manifest and bindings |
 | `app protocols` (aliases: `appprotocols`) | compat → `z23 appprotocols` | read / read / public · fast/low | none | `zcl.app_protocols.v1` | `z23 app protocols` | List App protocol contracts — *native adapter is not executable yet; use the compatibility target* |
-| `app tasks` | ready | mutate / app-write / operator · background/low | **`datadir`**, `app`, **`action`**, `expected_revision`, `task_id`, `title`, `preview_root`, `preview_receipt`, `preview_program` | `zcl.task_document.v1` | `z23 app tasks open /absolute/private/tasks` | Save and reopen your local tasks |
+| `app tasks` | ready | mutate / app-write / operator · background/low | **`datadir`**, `app`, **`action`**, `expected_revision`, `task_id`, `title`, `preview_root`, `preview_receipt`, `preview_program` | `zcl.task_document.v1` | `z23 app tasks open` | Save and reopen your local tasks |
 
 #### `app.transaction-types` — Discover every semantic ZCL transaction shape and its safe workflow
 
