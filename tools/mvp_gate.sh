@@ -235,30 +235,30 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────
-# C5 — list + sell file via store. Live surface: zmarket_list answers.
-# The legacy zmarket_buy/zmarket_offer RPCs remain deliberately contained
-# stubs (they refuse; tests/harness/src/test_file_market.c pins the
-# refusal), but settlement itself SHIPPED as
-# zmarket_purchase_plan/commit/status/retrieve
-# (contexts/market/controllers/src/file_market_controller.c:512-634) and
-# is two-daemon acceptance-proven: make test-market-acceptance (clearnet)
-# and make test-market-onion-acceptance (real onion delivery). The open
-# gap for the FULL store claim is a live REMOTE buyer over the store
-# (ZSLP shop) flow: order-create is POST /store/orders, honored
-# onion-only (core/modules/net/include/net/site_routes.def), and the
-# embedded onion client is GET-only — so remote ordering needs either
-# dynhost POST support (vendor/tor, owner's fork) or a GET-encoded order
-# route beside /market/chunk (sealed core). Both are owner decisions
-# (docs/work/MARKET_ONION_DELIVERY.md item 4).
+# C5 — list + sell file via store. The remote-buyer gap closed on
+# fc42ddd333 (owner Option 2 — onion dynhost POST): the embedded onion
+# client gained dynhost_client_fetch_ex (POST with body), the seller
+# honors POST /store/orders onion-only
+# (core/modules/net/include/net/site_routes.def), and app.store.remotebuy
+# drives the full journey — order POST over Tor, shielded ZCL23ORDER memo
+# pay, seller reconcile, collect with SHA3 byte-exact. The legacy
+# zmarket_buy/zmarket_offer RPCs remain deliberately contained stubs
+# (they refuse; tests/harness/src/test_file_market.c pins the refusal).
+# The FULL claim is proven by tools/dev/store_onion_acceptance.sh (two
+# isolated regtest daemons over real Tor circuits; re-qualified
+# 2026-09-15, artifacts under build/c5-onion-acceptance/). This live
+# probe checks the running surface that proof exercises: zmarket_list
+# answers AND the serving binary exposes the ready remotebuy leaf.
 # ────────────────────────────────────────────────────────────────────
 if [[ "$NODE_UP" != 1 ]]; then
     set_v 5 "FAIL" "node unreachable" 0
 else
     ML="$(rpc zmarket_list)"
-    if printf '%s' "$ML" | grep -qE '"result":[ ]*\['; then
-        set_v 5 "BLOCKED" "zmarket_list answers; settlement shipped via zmarket_purchase_* (acceptance: make test-market-onion-acceptance) but the store flow's live remote buyer is owner-gated (order-create POST is onion-only, onion client is GET-only); proxy via make ci-mvp-gates store_e2e" 0
+    RB="$("$ZCL_NODE_BIN" discover search remotebuy 2>/dev/null || true)"
+    if printf '%s' "$ML" | grep -qE '"result":[ ]*\[' && [[ "$RB" == *app.store.remotebuy* ]]; then
+        set_v 5 "PASS" "zmarket_list answers + serving binary exposes ready app.store.remotebuy (dynhost POST path); full remote-buyer journey proven by tools/dev/store_onion_acceptance.sh" 1
     else
-        set_v 5 "BLOCKED" "zmarket_list unreachable; store live-buyer proof still needs the owner-gated remote order leg" 0
+        set_v 5 "BLOCKED" "zmarket_list or the remotebuy leaf is not live; full proof needs tools/dev/store_onion_acceptance.sh" 0
     fi
 fi
 

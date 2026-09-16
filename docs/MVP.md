@@ -85,6 +85,28 @@ journey over real circuits: seller lists a file product, buyer discovers +
 orders via POST over Tor, pays shielded with the `ZCL23ORDER:<id>` memo, the
 seller reconciles and mints access tokens, and the buyer collects the file
 over Tor with in-process SHA3 verification byte-identical to the fixture.
+**2026-09-15 re-qualification:** the same acceptance re-ran PASS against
+source `7590ef3ee0` (binary `build/bin/z23` built 23:40 UTC from a clean
+tree, sha256 `a94da881e9158631…`; seller onion
+`rlphiykbo5kaprggomxji5kse3czbamn7iyydxy5taeyj4dmtmacm4id.onion`,
+purchase=4, `paid_at=1789516611`, log
+`build/c5-onion-acceptance/run2.log`, preserved scratch
+`test-tmp/zcl23-stooni-mxZR1o` with both tor.logs naming the
+`/store/orders` POST and `/store/access` fetch). One intervening attempt
+the same evening failed before reconcile with `A did not sync the payment
+chain`; preserved at `test-tmp/zcl23-stooni-uHQvQi` (`build/
+c5-onion-acceptance/run.log`, rc=2). Forensics: all four payment blocks
+arrived and header-verified within the same second (23:50:44, nothing
+rejected — the `Sapling tree mismatch (size=1)` WARN is the code's
+documented benign path: the derived wallet tree trails a new shielded
+output and rebuilds at boot, blocks are still accepted), but reducer/
+intake finalization of those first-shielded-payment blocks took ~95 s
+against the fixture's fixed 90 s `STO_WAIT` poll, and the node converged
+unaided to the identical tip (210=210, `coins_best_h=210`). A fixture
+timeout budget vs one-off intake latency — not a store-leg regression
+(every store leg passed in that run too) and not a consensus divergence;
+the ~95 s witness-advance serialization stands as a sync-lane perf
+observation. The full journey has now passed twice on the current tree.
 The hermetic `make ci` gates remain the regression floor that keeps every ✅
 honest between operator runs.
 
