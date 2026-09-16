@@ -85,6 +85,7 @@ static bool gw_spawn(const char *bin, const char *node, const char *state)
         close(fds[1]);
         setenv("FLEET_GW_PORT", "0", 1);
         setenv("FLEET_GW_NODE", node, 1);
+        setenv("FLEET_GW_OWNER_KEY", "gw-test-owner-key", 1);
         setenv("XDG_STATE_HOME", state, 1);
         execv(bin, argv);
         _exit(127);
@@ -242,6 +243,137 @@ static char *gw_get(const char *path, int *status)
 static bool gw_body_has(const char *body, const char *needle)
 {
     return body && needle && strstr(body, needle) != NULL;
+}
+
+/* Loopback socket to the test gateway, or -1. */
+static int gw_sock_open(void)
+{
+    int fd;
+    struct sockaddr_in v4;
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    memset(&v4, 0, sizeof(v4));
+    v4.sin_family = AF_INET;
+    v4.sin_port = htons((uint16_t)g_gw_port);
+    v4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&v4, sizeof(v4)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Whole request out, whole response back (NUL-terminated), or NULL. */
+static char *gw_sock_roundtrip(int fd, const char *req)
+{
+    char *buf;
+    size_t cap = 65536, len = 0;
+    ssize_t r;
+    size_t left = strlen(req), off = 0;
+    while (left > 0) {
+        r = write(fd, req + off, left);
+        if (r <= 0) {
+            close(fd);
+            return NULL;
+        }
+        off += (size_t)r;
+        left -= (size_t)r;
+    }
+    buf = malloc(cap);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+    for (;;) {
+        if (len + 4096 >= cap)
+            break;
+        r = read(fd, buf + len, cap - len - 1);
+        if (r <= 0)
+            break;
+        len += (size_t)r;
+    }
+    close(fd);
+    if (len == 0) {
+        free(buf);
+        return NULL;
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+/* Location header out of a 302 response, or NULL. */
+static char *gw_location_of(char *resp)
+{
+    char *p, *eol, *out;
+    int st = 0;
+    if (sscanf(resp, "HTTP/1.1 %d", &st) != 1 || st != 302)
+        return NULL;
+    p = strstr(resp, "\r\nLocation:");
+    if (!p)
+        p = strstr(resp, "\r\nlocation:");
+    if (!p)
+        return NULL;
+    p = strchr(p + 2, ':') + 1;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    eol = strstr(p, "\r\n");
+    if (!eol)
+        return NULL;
+    out = malloc((size_t)(eol - p) + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, p, (size_t)(eol - p));
+    out[eol - p] = '\0';
+    return out;
+}
+
+/* POST form-encoded; returns the Location header value, or NULL. */
+static char *gw_post_location(const char *path, const char *form)
+{
+    char req[GW_TEST_CAP];
+    int n = snprintf(req, sizeof(req),
+                     "POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                     "application/x-www-form-urlencoded\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n%s",
+                     path, strlen(form), form);
+    int fd;
+    char *resp, *loc;
+    if (n <= 0 || (size_t)n >= sizeof(req))
+        return NULL;
+    fd = gw_sock_open();
+    if (fd < 0)
+        return NULL;
+    resp = gw_sock_roundtrip(fd, req);
+    if (!resp)
+        return NULL;
+    loc = gw_location_of(resp);
+    free(resp);
+    return loc;
+}
+
+/* 32-hex value by JSON key out of a body. False when absent/misshapen. */
+static bool gw_body_hex(const char *body, const char *key, char *out)
+{
+    char pat[80];
+    const char *p;
+    size_t i;
+    if (snprintf(pat, sizeof(pat), "\"%s\":\"", key) < 0)
+        return false;
+    p = body ? strstr(body, pat) : NULL;
+    if (!p)
+        return false;
+    p += strlen(pat);
+    for (i = 0; i < 32; i++) {
+        char c = p[i];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!hex)
+            return false;
+        out[i] = c;
+    }
+    out[32] = '\0';
+    return true;
 }
 
 /* Run the node CLI: <node> fleet steer <verb> --input=<json>. Captured
@@ -550,6 +682,203 @@ _test_next:;
 }
 
 static int gw_t_auth(void);
+/* RFC 7636 Appendix B vector: the gateway's S256 must reproduce it. */
+static const char *const GW_OAUTH_VERIFIER =
+    "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+static const char *const GW_OAUTH_CHALLENGE =
+    "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+static int gw_t_oauth(void)
+{
+    int failures = 0;
+    TEST("gateway: OAuth discovery, sign-in, tokens, bearer grants") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char cid[33], token[33], code[33], gid2[64];
+        char args[1024], form[2048];
+        char *b, *loc;
+        const char *cp;
+        size_t i;
+        int st = 0, sn;
+        /* Discovery documents the resource and the server. */
+        b = gw_get("/.well-known/oauth-protected-resource", &st);
+        ASSERT(b != NULL);
+        ASSERT_EQ(st, 200);
+        ASSERT(gw_body_has(b, "\"scopes_supported\""));
+        ASSERT(gw_body_has(b, "bearer_methods_supported"));
+        free(b);
+        b = gw_get("/.well-known/oauth-authorization-server", &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"token_endpoint\""));
+        ASSERT(gw_body_has(b, "code_challenge_methods_supported"));
+        free(b);
+        /* Dynamic registration, then a bad redirect refused. */
+        b = gw_post("/oauth/register",
+                    "{\"redirect_uris\":[\"https://client.test/cb\"]}", &st);
+        ASSERT(b != NULL);
+        ASSERT_EQ(st, 201);
+        ASSERT(gw_body_hex(b, "client_id", cid));
+        free(b);
+        b = gw_post("/oauth/register",
+                    "{\"redirect_uris\":[\"http://evil.test/cb\"]}", &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "invalid_redirect_uri"));
+        free(b);
+        /* Approval form for a valid request, refusal for a stranger. */
+        sn = snprintf(args, sizeof(args),
+                      "/oauth/authorize?response_type=code&client_id=%s"
+                      "&redirect_uri=https://client.test/cb"
+                      "&scope=brief%%20send&state=xyz&code_challenge=%s"
+                      "&code_challenge_method=S256",
+                      cid, GW_OAUTH_CHALLENGE);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_get(args, &st);
+        ASSERT(b != NULL);
+        ASSERT_EQ(st, 200);
+        ASSERT(gw_body_has(b, "Z23 Fleet sign-in"));
+        free(b);
+        b = gw_get("/oauth/authorize?response_type=code&client_id=0000000000"
+                   "0000000000000000000000"
+                   "&redirect_uri=https://client.test/cb&scope=brief"
+                   "&code_challenge=x&code_challenge_method=S256",
+                   &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "invalid_request"));
+        free(b);
+        /* Approval needs the owner key; the wrong key is denied. */
+        sn = snprintf(form, sizeof(form),
+                      "response_type=code&client_id=%s"
+                      "&redirect_uri=https://client.test/cb"
+                      "&scope=brief%%20send&state=xyz&code_challenge=%s"
+                      "&code_challenge_method=S256"
+                      "&owner_key=wrong&approve=1",
+                      cid, GW_OAUTH_CHALLENGE);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(form));
+        b = gw_post("/oauth/authorize", form, &st);
+        ASSERT(b != NULL);
+        ASSERT_EQ(st, 403);
+        ASSERT(gw_body_has(b, "access_denied"));
+        free(b);
+        /* Correct approval redirects with a single-use code. */
+        sn = snprintf(form, sizeof(form),
+                      "response_type=code&client_id=%s"
+                      "&redirect_uri=https://client.test/cb"
+                      "&scope=brief%%20send&state=xyz&code_challenge=%s"
+                      "&code_challenge_method=S256"
+                      "&owner_key=gw-test-owner-key&approve=1",
+                      cid, GW_OAUTH_CHALLENGE);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(form));
+        loc = gw_post_location("/oauth/authorize", form);
+        ASSERT(loc != NULL);
+        cp = strstr(loc, "code=");
+        ASSERT(cp != NULL);
+        for (i = 0; i < 32; i++)
+            code[i] = cp[5 + i];
+        code[32] = '\0';
+        ASSERT(gw_body_has(loc, "state=xyz"));
+        free(loc);
+        /* Wrong verifier refused; the RFC vector exchanges. */
+        sn = snprintf(form, sizeof(form),
+                      "grant_type=authorization_code&code=%s"
+                      "&redirect_uri=https://client.test/cb&client_id=%s"
+                      "&code_verifier=wrong",
+                      code, cid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(form));
+        b = gw_post("/oauth/token", form, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "invalid_grant"));
+        free(b);
+        sn = snprintf(form, sizeof(form),
+                      "grant_type=authorization_code&code=%s"
+                      "&redirect_uri=https://client.test/cb&client_id=%s"
+                      "&code_verifier=%s",
+                      code, cid, GW_OAUTH_VERIFIER);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(form));
+        b = gw_post("/oauth/token", form, &st);
+        ASSERT(b != NULL);
+        ASSERT_EQ(st, 200);
+        ASSERT(gw_body_hex(b, "access_token", token));
+        ASSERT(gw_body_has(b, "\"scope\":\"brief send\""));
+        free(b);
+        /* The code is single-use. */
+        b = gw_post("/oauth/token", form, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "invalid_grant"));
+        free(b);
+        /* The token is a scoped grant: bearer brief passes. */
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":\"steer_brief\","
+                         "\"arguments\":{}}}",
+                         token, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        free(b);
+        /* Unknown bearer is refused with the typed grant code. */
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":\"steer_brief\","
+                         "\"arguments\":{}}}",
+                         "00000000000000000000000000000000", &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":true"));
+        ASSERT(gw_body_has(b, "STEER_GRANT_UNKNOWN"));
+        free(b);
+        /* Header and argument must agree when both travel. */
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":\"steer_brief\","
+                         "\"arguments\":{\"grant\":"
+                         "\"00000000000000000000000000000000\"}}}",
+                         token, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"code\":-32002"));
+        ASSERT(gw_body_has(b, "conflicting grants"));
+        free(b);
+        /* Wrong scope through the bearer: the node refuses. */
+        ASSERT(gw_mint(node, "brief", gid2));
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":\"steer_send\","
+                         "\"arguments\":{\"items\":[{\"to\":\"gw-agent\","
+                         "\"body\":\"x\",\"ref\":\"r-oa\","
+                         "\"idempotency_key\":\"k-oa\"}]}}}",
+                         gid2, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "STEER_GRANT_SCOPE"));
+        free(b);
+        /* Revoked through the bearer: the node refuses. */
+        {
+            char in[256], *reply;
+            sn = snprintf(in, sizeof(in),
+                          "{\"action\":\"revoke\",\"id\":\"%s\"}", token);
+            ASSERT(sn > 0 && (size_t)sn < sizeof(in));
+            reply = gw_node_run(node, "grant", in);
+            ASSERT(reply != NULL);
+            free(reply);
+        }
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":24,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":\"steer_brief\","
+                         "\"arguments\":{}}}",
+                         token, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "STEER_GRANT_REVOKED"));
+        free(b);
+        /* No credential at all is refused before the node is forked:
+         * a remote caller can never ride local-operator authority. */
+        b = gw_post("/steer",
+                    "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/call\","
+                    "\"params\":{\"name\":\"steer_brief\",\"arguments\":{}}}",
+                    &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"code\":-32001"));
+        ASSERT(gw_body_has(b, "grant required"));
+        free(b);
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
 
 int test_fleet_gateway(void);
 int test_fleet_gateway(void)
@@ -586,6 +915,7 @@ int test_fleet_gateway(void)
     failures += gw_t_handshake();
     failures += gw_t_calls();
     failures += gw_t_auth();
+    failures += gw_t_oauth();
     /* No ASSERT lives here; the stop always runs on fall-through. */
     gw_stop();
     if (had_xdg)

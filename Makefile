@@ -7671,23 +7671,27 @@ fleet-gateway: $(FLEET_GATEWAY_BIN)
 $(FLEET_GATEWAY_BIN): tools/fleet_gateway.c \
     platform/modules/json/src/json.c platform/modules/base/src/safe_alloc.c \
     platform/modules/platform/src/os_proc.c \
-    platform/modules/base/src/log_level.c \
+    platform/modules/platform/src/clock.c \
+    platform/modules/base/src/log_level.c core/modules/crypto/src/sha256.c \
     platform/modules/json/include/json/json.h \
     platform/modules/platform/include/platform/os_proc.h \
+    platform/modules/platform/include/platform/clock.h \
     platform/modules/base/include/base/safe_alloc.h \
+    platform/modules/base/include/base/hex.h \
     platform/modules/base/include/base/log_level.h \
     platform/modules/base/include/base/format_attribute.h \
     platform/modules/base/include/base/utc_tm.h \
     platform/modules/base/include/base/stdio_lock.h \
     platform/modules/base/include/base/log_macros.h \
-    platform/modules/util/include/util/log_macros.h
+    platform/modules/util/include/util/log_macros.h \
+    core/modules/crypto/include/crypto/sha256.h
 	@mkdir -p $(dir $@)
 	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic \
 	    -D_POSIX_C_SOURCE=200809L $(ZCL_PLATFORM_CPPFLAGS) \
 	    -Iplatform/modules/base/include \
 	    -Iplatform/modules/json/include \
 	    -Iplatform/modules/util/include \
-	    -Iplatform/modules/platform/include -o $@ $(filter %.c,$^) -lm
+	    -Iplatform/modules/platform/include -Icore/modules/crypto/include -o $@ $(filter %.c,$^) -lm
 
 # Strict line-protocol adapter over the maintained retrieval evaluator. The
 # historical runner supplies two sealed rank lists per reviewed task; this
