@@ -943,13 +943,15 @@ static void gw_qend(struct gw_qcall *c)
     json_free(&c->input);
 }
 
-static bool gw_qpost(const char *name)
+static bool gw_qpost(const char *name, long long attempt)
 {
     struct gw_qcall c;
     bool ok;
     gw_qbegin(&c, "post");
     (void)json_push_kv_str(&c.input, "kind", "leaf");
     (void)json_push_kv_str(&c.input, "name", name);
+    if (attempt >= 1)
+        (void)json_push_kv_int(&c.input, "attempt", attempt);
     ok = gw_qrun(&c);
     gw_qend(&c);
     return ok;
@@ -1034,42 +1036,26 @@ static bool gw_mkdirp(const char *path)
     return true;
 }
 
-/* Minimal fake engine-unit on PATH: writes a PASS receipt for --state-dir
- * and exits. Same fixture pattern as the queue group's fake. */
-static const char k_gw_fake[] =
-    "#!/bin/sh\n"
-    "st=\"\"\n"
-    "prev=\"\"\n"
-    "for a in \"$@\"; do\n"
-    "  case \"$a\" in\n"
-    "    --state-dir=*) st=\"${a#--state-dir=}\";;\n"
-    "    --state-dir) prev=\"want\";;\n"
-    "    *) if [ \"$prev\" = \"want\" ]; then st=\"$a\"; prev=\"\"; fi;;\n"
-    "  esac\n"
-    "done\n"
-    "[ -n \"$st\" ] || exit 2\n"
-    "printf '{\"verdict\":\"PASS\"}\n' > \"$st/receipt.json\"\n"
-    "echo \"dispatching $st\"\n"
-    "echo \"rc=0\"\n"
-    "exit 0\n";
-
+/* Fake engine-unit on PATH with baked-in terminal behavior. Environment
+ * does not reliably reach the detached queue child (the systemd branch
+ * passes only selected variables), so each mode is written into the
+ * script file itself before its cycle; the child execs whatever the file
+ * holds at launch. Same fixture pattern as the queue group's fake.
+ * verdict NULL means no receipt (crash); rc NULL means no rc line. */
 static char g_gw_saved_path[9000];
+static char g_gw_fake_prog[1100];
 
-static bool gw_fake_unit(void)
+static bool gw_fake_setup(void)
 {
-    char base[512], bindir[1024], prog[1100], path[9000];
+    char base[512], bindir[1024], path[9000];
     const char *old = getenv("PATH");
     test_make_tmpdir(base, sizeof(base), "fleet_gateway", "life_bin");
     if (snprintf(bindir, sizeof(bindir), "%s/bin", base) < 0)
         return false;
     if (mkdir(bindir, 0700) != 0)
         return false;
-    if (snprintf(prog, sizeof(prog), "%s/zclassic23-engine-unit",
-                 bindir) < 0)
-        return false;
-    if (!gw_write_text(prog, k_gw_fake))
-        return false;
-    if (chmod(prog, 0755) != 0)
+    if (snprintf(g_gw_fake_prog, sizeof(g_gw_fake_prog),
+                 "%s/zclassic23-engine-unit", bindir) < 0)
         return false;
     if (!old || snprintf(g_gw_saved_path, sizeof(g_gw_saved_path), "%s",
                          old) < 0)
@@ -1077,6 +1063,52 @@ static bool gw_fake_unit(void)
     if (snprintf(path, sizeof(path), "%s:%s", bindir, old) < 0)
         return false;
     return setenv("PATH", path, 1) == 0;
+}
+
+static bool gw_fake_write(const char *verdict, const char *rc, int code)
+{
+    char text[1024], receipt[256], rcline[64];
+    int sn, w;
+    if (verdict) {
+        w = snprintf(receipt, sizeof(receipt),
+                     "printf '{\"verdict\":\"%s\"}\\n' > "
+                     "\"$st/receipt.json\"\n",
+                     verdict);
+        if (w <= 0 || (size_t)w >= sizeof(receipt))
+            return false;
+    } else {
+        receipt[0] = '\0';
+    }
+    if (rc) {
+        w = snprintf(rcline, sizeof(rcline), "echo \"rc=%s\"\n", rc);
+        if (w <= 0 || (size_t)w >= sizeof(rcline))
+            return false;
+    } else {
+        rcline[0] = '\0';
+    }
+    sn = snprintf(text, sizeof(text),
+                  "#!/bin/sh\n"
+                  "st=\"\"\n"
+                  "prev=\"\"\n"
+                  "for a in \"$@\"; do\n"
+                  "  case \"$a\" in\n"
+                  "    --state-dir=*) st=\"${a#--state-dir=}\";;\n"
+                  "    --state-dir) prev=\"want\";;\n"
+                  "    *) if [ \"$prev\" = \"want\" ]; then st=\"$a\"; "
+                  "prev=\"\"; fi;;\n"
+                  "  esac\n"
+                  "done\n"
+                  "[ -n \"$st\" ] || exit 2\n"
+                  "%s"
+                  "echo \"dispatching $st\"\n"
+                  "%s"
+                  "exit %d\n",
+                  receipt, rcline, code);
+    if (sn <= 0 || (size_t)sn >= sizeof(text))
+        return false;
+    if (!gw_write_text(g_gw_fake_prog, text))
+        return false;
+    return chmod(g_gw_fake_prog, 0755) == 0;
 }
 
 static void gw_path_restore(void)
@@ -1118,18 +1150,28 @@ static bool gw_pool(char *qd, size_t qdcap)
     return fclose(f) == 0;
 }
 
-static bool gw_poll_file(const char *path)
+/* Poll a run file for content, not mere existence: the launcher creates
+ * run.out before the child appends its rc line, so existence alone races
+ * the reap read. A NULL needle keeps the plain existence check. */
+static bool gw_poll_match(const char *path, const char *needle, int tries)
 {
     int i;
     struct timespec req;
-    for (i = 0; i < 150; i++) {
-        if (access(path, R_OK) == 0)
-            return true;
+    for (i = 0; i < tries; i++) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            char buf[8192];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            (void)fclose(f);
+            buf[n] = '\0';
+            if (!needle || gw_body_has(buf, needle))
+                return true;
+        }
         req.tv_sec = 0;
         req.tv_nsec = 100000000L;
         (void)nanosleep(&req, NULL); /* real-clock: bounded wait for a detached engine-unit child outside this address space; completion arrives in kernel time and no fake-clock seam reaches it */
     }
-    return access(path, R_OK) == 0;
+    return false;
 }
 
 static int gw_t_life_send_ack(void)
@@ -1194,15 +1236,16 @@ static int gw_t_life_complete(void)
         int st = 0, sn;
         bool reaped;
         ASSERT(g_life_seq > 0 && g_life_gid[0]);
-        ASSERT(gw_fake_unit());
+        ASSERT(gw_fake_setup());
+        ASSERT(gw_fake_write("PASS", "0", 0));
         ASSERT(gw_pool(qd, sizeof(qd)));
-        ASSERT(gw_qpost(GW_LIFE_REF));
+        ASSERT(gw_qpost(GW_LIFE_REF, 1));
         ASSERT(gw_qnext(qstate, sizeof(qstate)));
         ASSERT_STR_EQ(qstate, "running");
         sn = snprintf(receipt, sizeof(receipt),
                       "%s/../engine/%s/a1/receipt.json", qd, GW_LIFE_REF);
         ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
-        ASSERT(gw_poll_file(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
         reaped = gw_qreap_pass(GW_LIFE_REF);
         gw_path_restore();
         ASSERT(reaped);
@@ -1328,6 +1371,440 @@ _test_next:;
     return failures;
 }
 
+/* Worker-result contract (minimum a Muse worker adapter must emit; no new
+ * ledger — mail rows stay directive truth, queue outcomes stay completion
+ * evidence, joined by the exact ref):
+ *
+ * - ref: the steer_send ref IS the queue job name, byte-identical. Only an
+ *   outcome row naming the ref can complete it.
+ * - worker/session identity, candidate/diff identity, gate evidence ref,
+ *   usage and time: NOT in the outcome row (it carries only name, attempt,
+ *   verdict, rc, ts). They ride a result row — mail kind result or a board
+ *   result — carrying the same ref. "Worker says done" alone never flips
+ *   brief; only a reaped outcome row with a pass mapping does.
+ * - terminal mapping (closed): "pass"/"PASS" with rc == 0 complete and
+ *   nothing else does. Fail words, unknown or arbitrary strings, case
+ *   variants, a missing verdict, and any nonzero or missing rc stay
+ *   incomplete — rc == 0 alone is never completion evidence, and a pass
+ *   claim with a dirty exit does not complete. The adapter SHOULD still
+ *   emit lowercase verbs with honest rc values (cancelled/failed carry
+ *   nonzero rc); the predicate does not depend on that discipline.
+ * - crash (no receipt): with an rc line the row records "no-receipt" and
+ *   stays incomplete; with nothing at all no row is recorded and the
+ *   directive stays at its earlier state. Resume re-posts the same name
+ *   with attempt N+1; a completed ref is never re-driven (check
+ *   brief/evidence first).
+ *
+ * The cases below pin this contract against the real leaves so C's adapter
+ * can plug in without changing gateway semantics. */
+#define GW_COMPAT_PASS "gw-compat-pass"
+#define GW_COMPAT_FAIL "gw-compat-fail"
+#define GW_COMPAT_CANCEL "gw-compat-cancel"
+#define GW_COMPAT_CRASH "gw-compat-crash"
+#define GW_COMPAT_UPPER "gw-compat-upper"
+#define GW_COMPAT_TIMEOUT "gw-compat-timeout"
+#define GW_COMPAT_RANDOM "gw-compat-random"
+#define GW_COMPAT_NORC "gw-compat-norc"
+
+static bool gw_compat_send(const char *node, const char *ref, const char *key,
+                           char *gid, long long *seq)
+{
+    char args[1024];
+    char *b;
+    int st = 0, sn;
+    long long s;
+    bool ok = false;
+    if (!gw_mint(node, "brief,send,evidence", gid))
+        return false;
+    sn = snprintf(args, sizeof(args),
+                  "{\"grant\":\"%s\",\"from\":\"" GW_LIFE_FROM "\","
+                  "\"items\":[{\"to\":\"" GW_LIFE_TO "\","
+                  "\"body\":\"Compat probe\","
+                  "\"ref\":\"%s\","
+                  "\"idempotency_key\":\"%s\"}]}",
+                  gid, ref, key);
+    if (sn <= 0 || (size_t)sn >= sizeof(args))
+        return false;
+    b = gw_tool("steer_send", args, 60, &st);
+    if (!b)
+        return false;
+    ok = gw_body_has(b, "\"isError\":false") && gw_body_has(b, "queued");
+    s = gw_body_seq(b);
+    free(b);
+    if (!ok || s <= 0)
+        return false;
+    if (!gw_mail_ack(GW_LIFE_TO, s))
+        return false;
+    *seq = s;
+    return true;
+}
+
+static bool gw_brief_has(const char *gid, long long seq, const char *needle)
+{
+    char args[256];
+    char *b;
+    int st = 0, sn;
+    bool ok = false;
+    sn = snprintf(args, sizeof(args), "{\"grant\":\"%s\",\"since\":%lld}",
+                  gid, seq - 1);
+    if (sn <= 0 || (size_t)sn >= sizeof(args))
+        return false;
+    b = gw_tool("steer_brief", args, 61, &st);
+    if (!b)
+        return false;
+    ok = gw_body_has(b, "\"isError\":false") && gw_body_has(b, needle);
+    free(b);
+    return ok;
+}
+
+/* Verdict+rc out of one outcome row naming name. False when the row is
+ * absent or malformed. */
+static bool gw_qrow_match(const struct json_value *r, const char *name,
+                          char *verdict, size_t vcap, long long *rc)
+{
+    const struct json_value *v, *rv;
+    const char *n, *vd, *sv;
+    long long rrc;
+    if (!r || r->type != JSON_OBJ)
+        return false;
+    v = json_get(r, "name");
+    n = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
+    if (!n || strcmp(n, name) != 0)
+        return false;
+    v = json_get(r, "verdict");
+    vd = (v && v->type == JSON_STR) ? json_get_str(v) : NULL;
+    rv = json_get(r, "rc");
+    rrc = (rv && rv->type == JSON_INT) ? (long long)json_get_int(rv) : -1;
+    sv = vd ? vd : "";
+    if (snprintf(verdict, vcap, "%s", sv) <= 0)
+        return false;
+    *rc = rrc;
+    return true;
+}
+
+/* Reap and report the outcome row for one name. True when reap passes;
+ * found tells whether a row named name was recorded. */
+static bool gw_qreap_scan(const char *name, char *verdict, size_t vcap,
+                          long long *rc, bool *found)
+{
+    struct gw_qcall c;
+    const struct json_value *rows;
+    size_t i, nrows;
+    bool ok = false;
+    *found = false;
+    gw_qbegin(&c, "reap");
+    if (!gw_qrun(&c)) {
+        gw_qend(&c);
+        return false;
+    }
+    ok = true;
+    rows = json_get(&c.rep.data, "outcomes");
+    if (rows && rows->type == JSON_ARR) {
+        nrows = json_size(rows);
+        for (i = 0; i < nrows; i++) {
+            if (gw_qrow_match(json_at(rows, i), name, verdict, vcap, rc))
+                *found = true;
+        }
+    }
+    gw_qend(&c);
+    return ok;
+}
+
+static int gw_t_compat_pass(void)
+{
+    int failures = 0;
+    TEST("compat: pass outcome completes the ref with the exact row") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char gid[64], args[1024], qd[1100], receipt[1300], qstate[32];
+        char verdict[128];
+        long long seq = -1, rc = -1;
+        bool found = false, ok;
+        char *b;
+        int st = 0, sn;
+        ASSERT(gw_compat_send(node, GW_COMPAT_PASS, "gw-compat-k1", gid,
+                              &seq));
+        ASSERT(gw_fake_setup());
+        ASSERT(gw_fake_write("PASS", "0", 0));
+        ASSERT(gw_pool(qd, sizeof(qd)));
+        ASSERT(gw_qpost(GW_COMPAT_PASS, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        ASSERT_STR_EQ(qstate, "running");
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/receipt.json", qd, GW_COMPAT_PASS);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
+        ok = gw_qreap_scan(GW_COMPAT_PASS, verdict, sizeof(verdict), &rc,
+                           &found);
+        gw_path_restore();
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "PASS");
+        ASSERT_EQ(rc, 0);
+        ASSERT(gw_brief_has(gid, seq, "\"state\\\":\\\"completed\\\""));
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\"%s\"}",
+                      gid, GW_COMPAT_PASS);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 62, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"verdict\\\":\\\"PASS\\\""));
+        free(b);
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
+static int gw_t_compat_terminal(void)
+{
+    int failures = 0;
+    TEST("compat: failed and cancelled never read completed") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char fGid[64], cGid[64], qd[1100], receipt[1300], qstate[32];
+        char args[1024];
+        char verdict[128];
+        long long seq = -1, rc = -1;
+        bool found = false, ok;
+        char *b;
+        int st = 0, sn;
+        ASSERT(gw_compat_send(node, GW_COMPAT_FAIL, "gw-compat-k2", fGid,
+                              &seq));
+        ASSERT(gw_fake_setup());
+        ASSERT(gw_fake_write("failed", "1", 1));
+        ASSERT(gw_pool(qd, sizeof(qd)));
+        ASSERT(gw_qpost(GW_COMPAT_FAIL, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/receipt.json", qd, GW_COMPAT_FAIL);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
+        ok = gw_qreap_scan(GW_COMPAT_FAIL, verdict, sizeof(verdict), &rc,
+                           &found);
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "failed");
+        ASSERT_EQ(rc, 1);
+        ASSERT(gw_brief_has(fGid, seq, "\"state\\\":\\\"acknowledged\\\""));
+        ASSERT(!gw_brief_has(fGid, seq, "\"state\\\":\\\"completed\\\""));
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\"%s\"}",
+                      fGid, GW_COMPAT_FAIL);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 63, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"verdict\\\":\\\"failed\\\""));
+        free(b);
+        ASSERT(gw_fake_write("cancelled", "1", 1));
+        ASSERT(gw_compat_send(node, GW_COMPAT_CANCEL, "gw-compat-k3", cGid,
+                              &seq));
+        ASSERT(gw_qpost(GW_COMPAT_CANCEL, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/receipt.json", qd,
+                      GW_COMPAT_CANCEL);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
+        ok = gw_qreap_scan(GW_COMPAT_CANCEL, verdict, sizeof(verdict), &rc,
+                           &found);
+        gw_path_restore();
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "cancelled");
+        ASSERT_EQ(rc, 1);
+        ASSERT(gw_brief_has(cGid, seq, "\"state\\\":\\\"acknowledged\\\""));
+        ASSERT(!gw_brief_has(cGid, seq, "\"state\\\":\\\"completed\\\""));
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
+static int gw_t_compat_crash(void)
+{
+    int failures = 0;
+    TEST("compat: crash stays incomplete, resume on attempt 2 completes") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char gid[64], args[1024], qd[1100], receipt[1300], qstate[32];
+        char verdict[128];
+        long long seq = -1, rc = -1;
+        bool found = true, ok;
+        char *b;
+        int st = 0, sn;
+        ASSERT(gw_compat_send(node, GW_COMPAT_CRASH, "gw-compat-k4", gid,
+                              &seq));
+        ASSERT(gw_fake_setup());
+        ASSERT(gw_fake_write(NULL, "1", 3));
+        ASSERT(gw_pool(qd, sizeof(qd)));
+        /* Crash: rc line, no receipt, nonzero exit. */
+        ASSERT(gw_qpost(GW_COMPAT_CRASH, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/run.out", qd, GW_COMPAT_CRASH);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "rc=", 60));
+        ok = gw_qreap_scan(GW_COMPAT_CRASH, verdict, sizeof(verdict), &rc,
+                           &found);
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "no-receipt");
+        ASSERT_EQ(rc, 1);
+        ASSERT(gw_brief_has(gid, seq, "\"state\\\":\\\"acknowledged\\\""));
+        ASSERT(!gw_brief_has(gid, seq, "\"state\\\":\\\"completed\\\""));
+        /* Resume: same name, attempt 2, real receipt this time. */
+        ASSERT(gw_fake_write("PASS", "0", 0));
+        ASSERT(gw_qpost(GW_COMPAT_CRASH, 2));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a2/receipt.json", qd, GW_COMPAT_CRASH);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
+        ok = gw_qreap_scan(GW_COMPAT_CRASH, verdict, sizeof(verdict), &rc,
+                           &found);
+        gw_path_restore();
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "PASS");
+        ASSERT_EQ(rc, 0);
+        ASSERT(gw_brief_has(gid, seq, "\"state\\\":\\\"completed\\\""));
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\"%s\"}",
+                      gid, GW_COMPAT_CRASH);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 64, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"verdict\\\":\\\"PASS\\\""));
+        free(b);
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
+static int gw_t_compat_case(void)
+{
+    int failures = 0;
+    TEST("compat: case variants and unknown verdicts never complete") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char gid[64], args[1024], qd[1100], receipt[1300], qstate[32];
+        char verdict[128];
+        long long seq = -1, rc = -1;
+        bool found = false, ok;
+        char *b;
+        int st = 0, sn;
+        ASSERT(gw_fake_setup());
+        ASSERT(gw_pool(qd, sizeof(qd)));
+        /* CANCELLED with a clean rc: case alone must not complete. */
+        ASSERT(gw_compat_send(node, GW_COMPAT_UPPER, "gw-compat-k5", gid,
+                              &seq));
+        ASSERT(gw_fake_write("CANCELLED", "0", 1));
+        ASSERT(gw_qpost(GW_COMPAT_UPPER, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/receipt.json", qd, GW_COMPAT_UPPER);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
+        ok = gw_qreap_scan(GW_COMPAT_UPPER, verdict, sizeof(verdict), &rc,
+                           &found);
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "CANCELLED");
+        ASSERT_EQ(rc, 0);
+        ASSERT(gw_brief_has(gid, seq, "\"state\\\":\\\"acknowledged\\\""));
+        ASSERT(!gw_brief_has(gid, seq, "\"state\\\":\\\"completed\\\""));
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\"%s\"}",
+                      gid, GW_COMPAT_UPPER);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 65, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"verdict\\\":\\\"CANCELLED\\\""));
+        free(b);
+        /* timeout with a clean rc: unknown words never complete. */
+        ASSERT(gw_fake_write("timeout", "0", 0));
+        ASSERT(gw_compat_send(node, GW_COMPAT_TIMEOUT, "gw-compat-k6", gid,
+                              &seq));
+        ASSERT(gw_qpost(GW_COMPAT_TIMEOUT, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/receipt.json", qd,
+                      GW_COMPAT_TIMEOUT);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
+        ok = gw_qreap_scan(GW_COMPAT_TIMEOUT, verdict, sizeof(verdict), &rc,
+                           &found);
+        gw_path_restore();
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "timeout");
+        ASSERT_EQ(rc, 0);
+        ASSERT(gw_brief_has(gid, seq, "\"state\\\":\\\"acknowledged\\\""));
+        ASSERT(!gw_brief_has(gid, seq, "\"state\\\":\\\"completed\\\""));
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
+static int gw_t_compat_rc(void)
+{
+    int failures = 0;
+    TEST("compat: arbitrary verdicts and dirty pass exits never complete") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char gid[64], args[1024], qd[1100], receipt[1300], qstate[32];
+        char verdict[128];
+        long long seq = -1, rc = -1;
+        bool found = false, ok;
+        char *b;
+        int st = 0, sn;
+        ASSERT(gw_fake_setup());
+        ASSERT(gw_pool(qd, sizeof(qd)));
+        /* Arbitrary string with a clean rc: never completion evidence. */
+        ASSERT(gw_compat_send(node, GW_COMPAT_RANDOM, "gw-compat-k7", gid,
+                              &seq));
+        ASSERT(gw_fake_write("frobnicate", "0", 0));
+        ASSERT(gw_qpost(GW_COMPAT_RANDOM, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/receipt.json", qd, GW_COMPAT_RANDOM);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
+        ok = gw_qreap_scan(GW_COMPAT_RANDOM, verdict, sizeof(verdict), &rc,
+                           &found);
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "frobnicate");
+        ASSERT_EQ(rc, 0);
+        ASSERT(gw_brief_has(gid, seq, "\"state\\\":\\\"acknowledged\\\""));
+        ASSERT(!gw_brief_has(gid, seq, "\"state\\\":\\\"completed\\\""));
+        sn = snprintf(args, sizeof(args),
+                      "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\"%s\"}",
+                      gid, GW_COMPAT_RANDOM);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 66, &st);
+        ASSERT(b != NULL);
+        ASSERT(gw_body_has(b, "\"isError\":false"));
+        ASSERT(gw_body_has(b, "\"verdict\\\":\\\"frobnicate\\\""));
+        free(b);
+        /* Pass verdict with no rc line: a pass claim needs a clean exit. */
+        ASSERT(gw_fake_write("PASS", NULL, 0));
+        ASSERT(gw_compat_send(node, GW_COMPAT_NORC, "gw-compat-k8", gid,
+                              &seq));
+        ASSERT(gw_qpost(GW_COMPAT_NORC, 1));
+        ASSERT(gw_qnext(qstate, sizeof(qstate)));
+        sn = snprintf(receipt, sizeof(receipt),
+                      "%s/../engine/%s/a1/receipt.json", qd, GW_COMPAT_NORC);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(receipt));
+        ASSERT(gw_poll_match(receipt, "verdict", 150));
+        ok = gw_qreap_scan(GW_COMPAT_NORC, verdict, sizeof(verdict), &rc,
+                           &found);
+        gw_path_restore();
+        ASSERT(ok && found);
+        ASSERT_STR_EQ(verdict, "PASS");
+        ASSERT_EQ(rc, -1);
+        ASSERT(gw_brief_has(gid, seq, "\"state\\\":\\\"acknowledged\\\""));
+        ASSERT(!gw_brief_has(gid, seq, "\"state\\\":\\\"completed\\\""));
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
 int test_fleet_gateway(void);
 int test_fleet_gateway(void)
 {
@@ -1369,6 +1846,11 @@ int test_fleet_gateway(void)
     failures += gw_t_life_send_ack();
     failures += gw_t_life_complete();
     failures += gw_t_life_restart();
+    failures += gw_t_compat_pass();
+    failures += gw_t_compat_terminal();
+    failures += gw_t_compat_crash();
+    failures += gw_t_compat_case();
+    failures += gw_t_compat_rc();
     /* No ASSERT lives here; the stop always runs on fall-through. */
     gw_stop();
     if (had_xdg)

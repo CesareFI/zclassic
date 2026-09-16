@@ -50,8 +50,8 @@
  *
  * STATES. queued (send accepted into the outbox), delivered (visible in
  * pull), acknowledged (seq at or below the receiver's mail ack cursor),
- * completed (a queue outcome names the ref with a pass-like verdict, or a
- * board result references it). Four different facts; absence of evidence is
+ * completed (a queue outcome names the ref with an explicit pass verdict
+ * and rc 0). Four different facts; absence of evidence is
  * reported as the earlier state, never skipped ahead.
  *
  * STATE. <platform_state_root()>/steer (0700): grants.jsonl, sent.jsonl.
@@ -691,23 +691,19 @@ static long long fmc_ack_cursor(const char *agent)
     return v;
 }
 
-/* Pass-like queue verdicts. reap writes the receipt's own verdict string,
- * or "unknown"/"no-receipt" when none exists; only an explicit fail-like
- * word or a nonzero rc withholds completion. Documented heuristic: the
- * outcome row is always cited in evidence so the caller verifies. */
+/* Closed completion vocabulary. Only an explicit pass verdict with a
+ * clean exit completes a directive: "pass" is the long-standing explicit
+ * allowlist entry and "PASS" is what the tree's own receipt producers
+ * emit. Anything else — fail words, unknown or arbitrary strings, case
+ * variants, a missing verdict — stays incomplete no matter what rc says,
+ * and a pass claim contradicted by a nonzero exit does not complete
+ * either. rc == 0 alone is never completion evidence. The outcome row is
+ * always cited in evidence so the caller verifies. */
 static bool fmc_verdict_pass(const char *verdict, long long rc)
 {
-    if (!verdict)
+    if (!verdict || rc != 0)
         return false;
-    if (strcmp(verdict, "pass") == 0)
-        return true;
-    if (strcmp(verdict, "fail") == 0 || strcmp(verdict, "failed") == 0 ||
-        strcmp(verdict, "error") == 0 || strcmp(verdict, "unknown") == 0 ||
-        strcmp(verdict, "no-receipt") == 0)
-        return false;
-    if (strncmp(verdict, "no-", 3) == 0)
-        return false;
-    return rc == 0;
+    return strcmp(verdict, "pass") == 0 || strcmp(verdict, "PASS") == 0;
 }
 
 /* ── brief: mail section ─────────────────────────────────────────────────
@@ -957,7 +953,7 @@ static void fmc_queue_pool(struct fmc_sub *sub, struct fmc_queue_view *view)
  *
  * Running/queued names become work + candidates; non-pass outcomes become
  * blockers; pool numbers become capacity. Completed-by-ref matching reads
- * the outcomes array for name==ref with a pass-like verdict. */
+ * the outcomes array for name==ref with an explicit pass verdict. */
 
 static void fmc_brief_queue(const struct zcl_command_request *req,
                             struct json_value *work,
@@ -1017,8 +1013,8 @@ static void fmc_brief_queue(const struct zcl_command_request *req,
     fmc_sub_end(&sub);
 }
 
-/* One retained outcome row: true when it names ref with a pass-like
- * verdict. */
+/* One retained outcome row: true when it names ref with an explicit
+ * pass verdict and a clean exit. */
 static bool fmc_outcome_row_matches(const struct json_value *r,
                                     const char *ref)
 {
@@ -1038,8 +1034,8 @@ static bool fmc_outcome_row_matches(const struct json_value *r,
     return fmc_verdict_pass(verdict, rc);
 }
 
-/* True when a retained queue outcome completes ref (name match, pass-like)
- * for the changes[] upgrade. */
+/* True when a retained queue outcome completes ref (name match, explicit
+ * pass verdict, clean exit) for the changes[] upgrade. */
 static bool fmc_outcome_completes(const struct json_value *outcomes,
                                   const char *ref)
 {
@@ -1735,12 +1731,34 @@ static void fmc_evidence_mail(const struct zcl_command_request *req,
     fmc_sub_end(&sub);
 }
 
+/* One queue row by name: terminal-section matches overwrite *term so the
+ * last retained outcome wins; live rows set *live once. */
+static void fmc_evidence_queue_row(const struct json_value *r,
+                                   const char *ref, bool terminal,
+                                   const struct json_value **live,
+                                   const struct json_value **term)
+{
+    const struct json_value *v;
+    const char *name;
+    if (!r || r->type != JSON_OBJ)
+        return;
+    v = json_get(r, "name");
+    name = (v && v->type == JSON_STR) ? json_get_str(v) : "";
+    if (!name || strcmp(name, ref) != 0)
+        return;
+    if (terminal)
+        *term = r;
+    else if (!*live)
+        *live = r;
+}
+
 static void fmc_evidence_queue(const struct zcl_command_request *req,
                                struct zcl_command_reply *reply,
                                const char *ref)
 {
     struct fmc_sub sub;
     static const char *const sections[] = {"queued", "running", "outcomes"};
+    const struct json_value *live = NULL, *term = NULL;
     size_t s;
     fmc_sub_begin(&sub, "zcl.agent_queue.v1", req, "dev.agent.queue");
     if (!sub.valid) {
@@ -1762,6 +1780,10 @@ static void fmc_evidence_queue(const struct zcl_command_request *req,
         fmc_sub_end(&sub);
         return;
     }
+    /* A ref may own several rows across attempts (resume re-posts the
+     * same name). The latest terminal outcome is the exact result; a
+     * live queued or running row carries no result yet, so terminal
+     * history wins and, within it, the last retained row wins. */
     for (s = 0; s < sizeof(sections) / sizeof(sections[0]); s++) {
         const struct json_value *arr = json_get(&sub.reply.data,
                                                 sections[s]);
@@ -1769,20 +1791,20 @@ static void fmc_evidence_queue(const struct zcl_command_request *req,
         if (!arr || arr->type != JSON_ARR)
             continue;
         n = json_size(arr);
-        for (i = 0; i < n; i++) {
-            const struct json_value *r = json_at(arr, i);
-            const struct json_value *v;
-            const char *name;
-            if (!r || r->type != JSON_OBJ)
-                continue;
-            v = json_get(r, "name");
-            name = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-            if (name && strcmp(name, ref) == 0) {
-                fmc_emit_object(reply, "queue", r);
-                fmc_sub_end(&sub);
-                return;
-            }
-        }
+        for (i = 0; i < n; i++)
+            fmc_evidence_queue_row(json_at(arr, i), ref,
+                                   s == sizeof(sections) /
+                                   sizeof(sections[0]) - 1, &live, &term);
+    }
+    if (term) {
+        fmc_emit_object(reply, "queue", term);
+        fmc_sub_end(&sub);
+        return;
+    }
+    if (live) {
+        fmc_emit_object(reply, "queue", live);
+        fmc_sub_end(&sub);
+        return;
     }
     fmc_fail(reply, "EVIDENCE_NOT_FOUND",
              "no queue row or outcome carries that name", ref);
