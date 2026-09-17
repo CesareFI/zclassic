@@ -30,6 +30,8 @@ dev.agent.worker attempt    # worker sub-dispatches fixed claim inputs to dev.ag
 dev.agent.worker json       # worker sub-dispatches a fixed status+json object to dev.agent.queue; request->input never reaches the nested json key.
 dev.agent.worker body       # worker injects its own fixed result body into a private dev.agent.mail post; request->input never reaches that nested object.
 dev.agent.worker since      # dev.agent.mail reads since only on the pull branch; the worker only posts, so the read is dead here.
+fleet.steer.grant attempt   # grant revoke sub-dispatches a fixed cancel+name object to dev.agent.queue; request->input never reaches the nested attempt key.
+fleet.steer.grant json      # grant revoke sub-dispatches a fixed cancel+name object to dev.agent.queue; request->input never reaches the nested json key.
 zcode.science.fetch namespace # pointer resolver reads its private RPC selector built by fetch; request->input never reaches that helper.
 zcode.science.fetch semantic_root # pointer resolver reads its private RPC selector built by fetch; request->input never reaches that helper.
 zcode.science.fetch transport_root # provider discovery reads its private RPC selector built by fetch; request->input never reaches that helper.

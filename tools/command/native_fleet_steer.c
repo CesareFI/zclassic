@@ -41,12 +41,14 @@
  * owner. Bearer ids are 128-bit CSPRNG hex via zcl_random_secret_bytes.
  *
  * IDEMPOTENCY. send items carry a caller-chosen idempotency_key. The first
- * accept appends the mail row and records key->seq plus a payload digest in
- * <state>/steer/sent.jsonl; a retry with the same key AND the same payload
- * returns the recorded accept with duplicate:true and appends nothing.
- * Retries reconcile; they never duplicate work. A different payload under an
- * already-recorded key is refused per-item as IDEMPOTENCY_CONFLICT: the key
- * names one exact delivery, never two.
+ * accept appends the mail row and records key->seq plus a payload digest,
+ * the ref, and the grant in <state>/steer/sent.jsonl; a retry with the
+ * same key AND the same payload returns the recorded accept with
+ * duplicate:true and appends nothing. Retries reconcile; they never
+ * duplicate work. A different payload under an already-recorded key is
+ * refused per-item as IDEMPOTENCY_CONFLICT: the key names one exact
+ * delivery, never two. The recorded ref+grant let revoke cancel exactly
+ * the queued work its grant sent.
  *
  * STATES. queued (send accepted into the outbox), delivered (visible in
  * pull), acknowledged (seq at or below the receiver's mail ack cursor),
@@ -55,8 +57,16 @@
  * reported as the earlier state, never skipped ahead.
  *
  * STATE. <platform_state_root()>/steer (0700): grants.jsonl, sent.jsonl.
- * Single O_APPEND writes; revoke rewrites grants via tmp+rename like the
- * mail ack cursor. Nothing here blocks on a peer or a model.
+ * Single O_APPEND writes; revoke appends a superseding revoked row like
+ * the mail ack cursor. Nothing here blocks on a peer or a model.
+ *
+ * REVOCATION. Revoking a grant kills the credential AND cancels the
+ * queued work it sent: each accepted send row records its ref and grant,
+ * and revoke best-effort cancels the queue row under each ref sent with
+ * that grant (queued-only; running rows refuse and need the worker's own
+ * explicit authority, completed history is never rewritten). Later steer
+ * verbs on the revoked grant fail closed; completed evidence stays
+ * readable under a fresh grant.
  *
  * BOUNDS. brief changes[] default 25, max 100; agents/work/candidates 32;
  * blockers 16; body leads 160 chars; send at most 8 items, body at most
@@ -1504,25 +1514,29 @@ static void fmc_send_item_refused(struct json_value *items, size_t index,
 }
 
 /* One accepted item result, after recording key->seq plus the payload
- * digest for reconcile. */
+ * digest, the ref, and the grant for reconcile and revoke-cancel. */
 static void fmc_send_item_accept(struct json_value *items, size_t index,
                                  const struct fmc_item_fields *f,
                                  long long seq, bool duplicate,
-                                 const char *sent_path, const char *from)
+                                 const char *sent_path, const char *from,
+                                 const char *grant)
 {
     struct json_value item;
     char sent_line[4096];
     char sum[17];
+    char eref[512];
     int n;
     json_init(&item);
     json_set_object(&item);
     (void)json_push_kv_int(&item, "index", (long long)index);
     (void)json_push_kv_str(&item, "to", f->to);
     fmc_payload_sum(f->to, f->body, f->ref, from, sum);
+    if (!fmc_escape(f->ref ? f->ref : "", eref, sizeof(eref)))
+        eref[0] = '\0';
     n = snprintf(sent_line, sizeof(sent_line),
                  "{\"key\":\"%s\",\"to\":\"%s\",\"seq\":%lld,\"state\":"
-                 "\"queued\",\"sum\":\"%s\"}\n",
-                 f->key, f->to, seq, sum);
+                 "\"queued\",\"sum\":\"%s\",\"ref\":\"%s\",\"grant\":\"%s\"}\n",
+                 f->key, f->to, seq, sum, eref, grant ? grant : "");
     if (!duplicate && (n <= 0 || (size_t)n >= sizeof(sent_line) ||
                        !fmc_append_line(sent_path, sent_line, (size_t)n))) {
         /* The mail row exists but the receipt did not persist: report the
@@ -1548,7 +1562,7 @@ static void fmc_send_item_accept(struct json_value *items, size_t index,
 static void fmc_send_item(const struct zcl_command_request *req,
                           const struct json_value *it, size_t index,
                           const char *from, const char *sent_path,
-                          struct json_value *items)
+                          const char *grant, struct json_value *items)
 {
     struct fmc_item_fields f;
     long long seq;
@@ -1569,7 +1583,7 @@ static void fmc_send_item(const struct zcl_command_request *req,
             fmc_payload_sum(f.to, f.body, f.ref, from, presented);
             if (recorded[0] && strcmp(recorded, presented) == 0) {
                 fmc_send_item_accept(items, index, &f, seq, true, sent_path,
-                                     from);
+                                     from, grant);
                 return;
             }
             LOG_ERROR(FMC_LOG,
@@ -1588,7 +1602,8 @@ static void fmc_send_item(const struct zcl_command_request *req,
                               why[0] ? why : "POST_FAILED");
         return;
     }
-    fmc_send_item_accept(items, index, &f, seq, false, sent_path, from);
+    fmc_send_item_accept(items, index, &f, seq, false, sent_path, from,
+                         grant);
 }
 
 static void fmc_do_send(const struct zcl_command_request *req,
@@ -1597,6 +1612,7 @@ static void fmc_do_send(const struct zcl_command_request *req,
     const struct json_value *v;
     const struct json_value *arr;
     const char *from;
+    const char *grant;
     char steerdir[4096], sent_path[4096 + 32];
     struct json_value items;
     size_t n, i;
@@ -1615,6 +1631,7 @@ static void fmc_do_send(const struct zcl_command_request *req,
         return;
     }
     from = fmc_str(req, "from");
+    grant = fmc_str(req, "grant");
     if (!fmc_dirs(steerdir, sizeof(steerdir))) {
         fmc_fail(reply, "STATE_DIR_FAILED",
                  "cannot resolve the owner-private state root",
@@ -1630,7 +1647,8 @@ static void fmc_do_send(const struct zcl_command_request *req,
     json_init(&items);
     json_set_array(&items);
     for (i = 0; i < n; i++)
-        fmc_send_item(req, json_at(arr, i), i, from, sent_path, &items);
+        fmc_send_item(req, json_at(arr, i), i, from, sent_path, grant,
+                      &items);
     (void)json_push_kv_str(&reply->data, "leaf", FMC_LEAF);
     (void)json_push_kv(&reply->data, "items", &items);
     (void)json_push_kv_int(&reply->data, "accepted",
@@ -2033,6 +2051,107 @@ static void fmc_grant_mint(const struct zcl_command_request *req,
     reply->exit_code = 0;
 }
 
+/* True when ref already sits in the collected set. */
+static bool fmc_ref_seen(char refs[][FMC_REF_MAX + 1], size_t nrefs,
+                         const char *ref)
+{
+    size_t i;
+    for (i = 0; i < nrefs; i++) {
+        if (strcmp(refs[i], ref) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Collect the distinct non-empty refs sent under one grant. Old rows
+ * without a grant never match; rows without a ref carry nothing to
+ * cancel. Returns the ref count (0 when the store is absent). */
+static size_t fmc_revoke_refs(const char *sent_path, const char *grant_id,
+                              char refs[][FMC_REF_MAX + 1], size_t cap)
+{
+    FILE *f;
+    char line[FMC_LINE_CAP];
+    char grant[64], ref[FMC_REF_MAX + 1];
+    size_t nrefs = 0;
+    if (!sent_path || !grant_id || !refs || cap == 0)
+        return 0;
+    f = fopen(sent_path, "rb");
+    if (!f)
+        return 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (!fmc_grant_line_str(line, "grant", grant, sizeof(grant)))
+            continue;
+        if (strcmp(grant, grant_id) != 0)
+            continue;
+        if (!fmc_grant_line_str(line, "ref", ref, sizeof(ref)))
+            continue;
+        if (fmc_ref_seen(refs, nrefs, ref))
+            continue;
+        if (nrefs >= cap)
+            break;
+        (void)snprintf(refs[nrefs], sizeof(refs[nrefs]), "%s", ref);
+        nrefs++;
+    }
+    (void)fclose(f);
+    return nrefs;
+}
+
+/* Cancel one queue row by ref through the queue sibling. Returns 1 when
+ * a queued row dropped, 0 when there was nothing queued to stop
+ * (not-found, running, or a sibling refusal). Running rows belong to
+ * their worker; completed history is never rewritten. */
+static long long fmc_revoke_cancel_one(const struct zcl_command_request *req,
+                                       const char *ref)
+{
+    struct fmc_sub sub;
+    char input[512];
+    const struct json_value *v;
+    long long cancelled = 0;
+    int n;
+    n = snprintf(input, sizeof(input),
+                 "{\"action\":\"cancel\",\"name\":\"%s\"}", ref);
+    if (n <= 0 || (size_t)n >= sizeof(input))
+        return 0;
+    fmc_sub_begin(&sub, "zcl.agent_queue.v1", req, "dev.agent.queue");
+    if (!sub.valid) {
+        fmc_sub_end(&sub);
+        return 0;
+    }
+    if (!fmc_sub_input(&sub, input)) {
+        fmc_sub_end(&sub);
+        return 0;
+    }
+    zcl_native_handle_dev_agent_queue(&sub.request, &sub.reply);
+    sub.ran = true;
+    if (fmc_sub_ok(&sub)) {
+        v = json_get(&sub.reply.data, "cancelled");
+        if (v && v->type == JSON_INT)
+            cancelled = (long long)json_get_int(v);
+    } else if (sub.reply.error.code[0] &&
+               strcmp(sub.reply.error.code, "CANCEL_RUNNING") != 0 &&
+               strcmp(sub.reply.error.code, "CANCEL_NOT_FOUND") != 0) {
+        LOG_ERROR(FMC_LOG, "revoke: queue cancel refused (ref=%s code=%s)",
+                  ref, sub.reply.error.code);
+    }
+    fmc_sub_end(&sub);
+    return cancelled > 0 ? 1 : 0;
+}
+
+/* Best-effort revoke-cancel: drop every queued queue row whose ref was
+ * sent under the revoked grant. Returns rows dropped. */
+static long long fmc_revoke_cancel_queued(
+    const struct zcl_command_request *req, const char *sent_path,
+    const char *grant_id)
+{
+    char refs[64][FMC_REF_MAX + 1];
+    size_t nrefs, i;
+    long long cancelled = 0;
+    nrefs = fmc_revoke_refs(sent_path, grant_id, refs, 64);
+    for (i = 0; i < nrefs; i++)
+        cancelled += fmc_revoke_cancel_one(req, refs[i]);
+    return cancelled;
+}
+
 static void fmc_grant_revoke(const struct zcl_command_request *req,
                              struct zcl_command_reply *reply)
 {
@@ -2082,9 +2201,23 @@ static void fmc_grant_revoke(const struct zcl_command_request *req,
                  "cannot append the owner-private grant store", path);
         return;
     }
-    (void)json_push_kv_str(&reply->data, "leaf", FMC_GRANT_LEAF);
-    (void)json_push_kv_str(&reply->data, "id", id);
-    (void)json_push_kv_bool(&reply->data, "revoked", true);
+    /* The credential is dead from this append onward. Best-effort cancel
+     * the queued work it sent: queued rows drop so later stages have
+     * nothing to claim; running rows refuse here and stay the worker's
+     * own explicit-authority business; completed history is untouched. */
+    {
+        char sent_path[4096 + 32];
+        long long cancelled = 0;
+        int s;
+        s = snprintf(sent_path, sizeof(sent_path), "%s/sent.jsonl",
+                     steerdir);
+        if (s > 0 && (size_t)s < sizeof(sent_path))
+            cancelled = fmc_revoke_cancel_queued(req, sent_path, id);
+        (void)json_push_kv_str(&reply->data, "leaf", FMC_GRANT_LEAF);
+        (void)json_push_kv_str(&reply->data, "id", id);
+        (void)json_push_kv_bool(&reply->data, "revoked", true);
+        (void)json_push_kv_int(&reply->data, "cancelled", cancelled);
+    }
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
 }

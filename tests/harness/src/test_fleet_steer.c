@@ -834,6 +834,82 @@ _test_next:;
     return failures;
 }
 
+static int fmx_t_revoke_cancels_queued(void)
+{
+    int failures = 0;
+
+    TEST("steer: revoke cancels queued work and blocks later stages") {
+        struct fmx_call s, q, c, b;
+        struct json_value items, item;
+        const struct json_value *v;
+        char gid[64];
+        fmx_isolate("revoke_claim");
+        ASSERT(fmx_mint("brief,send,evidence", gid, sizeof(gid)));
+        json_init(&items);
+        json_set_array(&items);
+        fmx_item(&item, "field-agent", "revoke probe body",
+                 "revoke-claim-ref", "key-revoke-claim-1");
+        (void)json_push_back(&items, &item);
+        json_free(&item);
+        ASSERT(fmx_send(&s, gid, &items));
+        json_free(&items);
+        ASSERT(fmx_ok(&s));
+        fmx_end(&s);
+        ASSERT_EQ(fmx_mail_count(), 1);
+        /* The authenticated task/ref lands on the queue under the same
+         * ref so the worker journey can complete it. */
+        fmx_begin(&q, "dev.agent.queue", "zcl.agent_queue.v1");
+        (void)json_push_kv_str(&q.input, "action", "post");
+        (void)json_push_kv_str(&q.input, "kind", "leaf");
+        (void)json_push_kv_str(&q.input, "name", "revoke-claim-ref");
+        ASSERT(fmx_run(&q, zcl_native_handle_dev_agent_queue));
+        ASSERT(fmx_ok(&q));
+        fmx_end(&q);
+        /* Revoke: the grant dies and the queued row goes with it. */
+        fmx_begin(&c, FMX_GRANT_PATH, "zcl.fleet_steer_grant.v1");
+        (void)json_push_kv_str(&c.input, "action", "revoke");
+        (void)json_push_kv_str(&c.input, "id", gid);
+        ASSERT(fmx_run(&c, zcl_native_handle_fleet_steer_grant));
+        ASSERT(fmx_ok(&c));
+        v = json_get(&c.reply.data, "cancelled");
+        ASSERT(v && v->type == JSON_INT && json_get_int(v) == 1);
+        fmx_end(&c);
+        /* The queued row is gone: an explicit cancel finds nothing, and
+         * a later claim has nothing to adopt. Running rows still need
+         * their worker's explicit authority (CANCEL_RUNNING elsewhere). */
+        fmx_begin(&q, "dev.agent.queue", "zcl.agent_queue.v1");
+        (void)json_push_kv_str(&q.input, "action", "cancel");
+        (void)json_push_kv_str(&q.input, "name", "revoke-claim-ref");
+        ASSERT(fmx_run(&q, zcl_native_handle_dev_agent_queue));
+        ASSERT(!fmx_ok(&q));
+        ASSERT_STR_EQ(q.reply.error.code, "CANCEL_NOT_FOUND");
+        fmx_end(&q);
+        /* Later stages stay blocked on the revoked credential. */
+        json_init(&items);
+        json_set_array(&items);
+        fmx_item(&item, "field-agent", "after revoke", "",
+                 "key-revoke-claim-2");
+        (void)json_push_back(&items, &item);
+        json_free(&item);
+        ASSERT(fmx_send(&s, gid, &items));
+        json_free(&items);
+        ASSERT(!fmx_ok(&s));
+        ASSERT_STR_EQ(s.reply.error.code, "STEER_GRANT_REVOKED");
+        fmx_end(&s);
+        fmx_brief(&b, gid, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(!fmx_ok(&b));
+        ASSERT_STR_EQ(b.reply.error.code, "STEER_GRANT_REVOKED");
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
 static int fmx_t_board_absent(void)
 {
     int failures = 0;
@@ -871,6 +947,7 @@ int test_fleet_steer(void)
     failures += fmx_t_duplicate();
     failures += fmx_t_lifecycle();
     failures += fmx_t_grants();
+    failures += fmx_t_revoke_cancels_queued();
     failures += fmx_t_board_absent();
 
     /* No ASSERT lives in this function, so no goto needs the label: the

@@ -1963,7 +1963,9 @@ ZCL_COMMAND_DEV_COMMAND(
     "the outcome and a result mail row carries the flat record under the "
     "same ref. Restart adoption runs un-submitted orphans exactly once "
     "and crash-records submitted ones. Queued cancel prevents claim; "
-    "revoke is not cancel. It touches no network and never polls a "
+    "grant revoke cancels queued rows and blocks later stages, while a "
+    "running row still needs its worker's explicit authority. It touches "
+    "no network and never polls a "
     "model: only local queue files are waited on.", 16384,
     "agent,worker,resident,claim,gate,result",
     "zcl.agent_worker_input.v1", "zcl.agent_worker.v1",

@@ -1614,8 +1614,9 @@ static void dvq_claim(const struct zcl_command_request *req,
 /* Bounded cancel: drop queued (unclaimed) rows naming name, so a later
  * next never launches them. Running rows belong to their worker —
  * stopping one is the worker's own responsibility, never this action's.
- * Terminal outcomes are history and are never rewritten, and grant
- * revocation is unrelated: it kills credentials, not queued work. Lock,
+ * Terminal outcomes are history and are never rewritten. Grant revoke
+ * reaches here through the steer adapter, which cancels each queued row
+ * its grant sent; direct cancel still refuses running rows. Lock,
  * temp+rename rewrite, typed refuses; no new state system appears. */
 static void dvq_cancel_filter(struct dvq_row *rows, size_t nrows,
                               const char *name, struct dvq_row *kept,
