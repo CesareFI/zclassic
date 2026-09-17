@@ -2053,8 +2053,10 @@ ZCL_COMMAND_DEV_COMMAND(
     "mail/outbox.jsonl with a single O_APPEND write; pull reads every "
     "*.jsonl under mail/ past a cursor in (ts, from, seq) order; ack "
     "persists the cursor. Bodies over 4 KiB or mentioning a key, an onion "
-    "address, an IP, or an absolute path outside the repo are refused with "
-    "a typed error, never a crash. It touches no network and never waits.",
+    "address, an IP, ANY absolute path, or a path token climbing out with a "
+    "'..' segment are refused with a typed error, never a crash: a body "
+    "crosses hosts, so no root and no cwd is consulted and identical bytes "
+    "get one verdict everywhere. It touches no network and never waits.",
     32768,
     "agent,mail,post,pull,ack,async,cursor,fleet",
     "zcl.agent_mail_input.v1", "zcl.agent_mail.v1",
