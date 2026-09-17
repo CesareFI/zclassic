@@ -248,10 +248,31 @@ static bool mr_hex40(const char *s)
     return s[40] == '\0';
 }
 
+/* What a case does to the workspace, and the scope the run declares.
+ * `writes` is the path the TURN creates (the model's own output, measured
+ * by the post-run scope audit); `baseline` is pre-existing dirt laid down
+ * BEFORE the turn, which the executor must refuse without spending a
+ * token. NULL fields take the lane defaults. */
+struct mr_edit {
+    const char *scope;      /* NULL = "src/" */
+    const char *writes;     /* repo-relative; NULL = the turn writes nothing */
+    const char *baseline;   /* repo-relative; NULL = a clean pre-state */
+};
+
+/* One in-scope edit made by the turn: the ordinary way a run earns a
+ * non-empty diff now that baseline dirt cannot. */
+static const struct mr_edit mr_edit_in_scope = { NULL, "src/sum.c", NULL };
+/* The same gate-passing run, but the turn writes outside the scope. */
+static const struct mr_edit mr_edit_outside = { NULL, "evil.txt", NULL };
+/* The prefix trick: scope "docs/" must not admit the sibling "docsevil/". */
+static const struct mr_edit mr_edit_prefix = { "docs/", "docsevil/x", NULL };
+/* Baseline dirt: the workspace is already changed before the turn. */
+static const struct mr_edit mr_edit_baseline = { NULL, NULL, "edit.txt" };
+
 /* Fill the struct task the way A's loop would: ref, worker, workspace,
  * scope, gate, model, prompt, rundir, budgets. */
 static bool mr_task_for(const struct mr_dirs *d, struct muse_run_task *t,
-    const char *worker, const char *model,
+    const char *worker, const char *model, const char *scope,
     const struct muse_run_budgets *budgets)
 {
     memset(t, 0, sizeof(*t));
@@ -266,8 +287,8 @@ static bool mr_task_for(const struct mr_dirs *d, struct muse_run_task *t,
     if (snprintf(t->workspace, sizeof(t->workspace), "%s", d->wt) >=
         (int)sizeof(t->workspace))
         return false;
-    if (snprintf(t->scope, sizeof(t->scope), "src/") >=
-        (int)sizeof(t->scope))
+    if (snprintf(t->scope, sizeof(t->scope), "%s",
+            scope ? scope : "src/") >= (int)sizeof(t->scope))
         return false;
     if (snprintf(t->gate, sizeof(t->gate), "task_document") >=
         (int)sizeof(t->gate))
@@ -296,7 +317,7 @@ static int mr_failures_validate(void)
     struct muse_run_result r;
     char err[MUSE_RUN_ERROR_MAX];
     MR_CHECK("lane", mr_lane(&d));
-    MR_CHECK("task", mr_task_for(&d, &t, NULL, NULL, NULL));
+    MR_CHECK("task", mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
     /* Null surfaces refuse without touching anything. */
     err[0] = '\0';
     MR_CHECK("null task refuses", muse_run_task(NULL, &r, err) == 1);
@@ -310,7 +331,7 @@ static int mr_failures_validate(void)
         err[0] = '\0';
         MR_CHECK("bad worker refuses", muse_run_task(&t, &r, err) == 1);
     }
-    MR_CHECK("task", mr_task_for(&d, &t, NULL, NULL, NULL));
+    MR_CHECK("task", mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
     /* Escaping scope refuses: the turn must stay inside the workspace. */
     if (snprintf(t.scope, sizeof(t.scope), "../out") >=
         (int)sizeof(t.scope))
@@ -319,7 +340,7 @@ static int mr_failures_validate(void)
         err[0] = '\0';
         MR_CHECK("escaping scope refuses", muse_run_task(&t, &r, err) == 1);
     }
-    MR_CHECK("task", mr_task_for(&d, &t, NULL, NULL, NULL));
+    MR_CHECK("task", mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
     if (snprintf(t.workspace, sizeof(t.workspace), "/nonexistent-wt") >=
         (int)sizeof(t.workspace))
         MR_CHECK("workspace overflow", false);
@@ -423,11 +444,31 @@ static bool mr_fork_fake(enum fake_mode mode, int ev_read, int *to_fd,
     return true;
 }
 
+/* Arms the scripted turn's own write, and lays down any baseline dirt the
+ * case asked for. The write path is absolute because the fake host runs
+ * with its own working directory. */
+static bool mr_arm_edit(const struct mr_dirs *d, const struct mr_edit *edit)
+{
+    char f[8192];
+    s_fake_write_path[0] = '\0';
+    if (!edit) return true;
+    if (edit->writes &&
+        snprintf(s_fake_write_path, sizeof(s_fake_write_path), "%s/%s",
+            d->wt, edit->writes) >= (int)sizeof(s_fake_write_path))
+        return false;
+    if (!edit->baseline) return true;
+    if (snprintf(f, sizeof(f), "%s/%s", d->wt, edit->baseline) >=
+        (int)sizeof(f))
+        return false;
+    return mr_write(f, "changed\n", 0);
+}
+
 /* Runs one execute() case over the struct boundary. Worker/model NULL
- * take the lane defaults; budgets NULL takes the case defaults. */
+ * take the lane defaults; budgets NULL takes the case defaults; edit NULL
+ * leaves the workspace untouched by both the turn and the case. */
 static int mr_execute(enum fake_mode mode, struct mr_dirs *d,
     const char *gate_verdict, const char *gate_headline,
-    const char *gate_marker, bool dirty, const char *worker,
+    const char *gate_marker, const struct mr_edit *edit, const char *worker,
     const char *model, const struct muse_run_budgets *budgets,
     bool claimed, struct muse_run_result *res,
     char err[MUSE_RUN_ERROR_MAX], int *rc_out, char **evidence_out)
@@ -443,7 +484,8 @@ static int mr_execute(enum fake_mode mode, struct mr_dirs *d,
     }
     {
         struct muse_run_task t;
-        if (!mr_task_for(d, &t, worker, model, budgets)) {
+        if (!mr_task_for(d, &t, worker, model,
+                edit ? edit->scope : NULL, budgets)) {
             close(ev[0]); close(ev[1]);
             return -1;
         }
@@ -454,17 +496,9 @@ static int mr_execute(enum fake_mode mode, struct mr_dirs *d,
             close(ev[0]); close(ev[1]);
             return -1;
         }
-        if (dirty) {
-            char f[8192];
-            if (snprintf(f, sizeof(f), "%s/edit.txt", d->wt) >=
-                (int)sizeof(f)) {
-                close(ev[0]); close(ev[1]);
-                return -1;
-            }
-            if (!mr_write(f, "changed\n", 0)) {
-                close(ev[0]); close(ev[1]);
-                return -1;
-            }
+        if (!mr_arm_edit(d, edit)) {
+            close(ev[0]); close(ev[1]);
+            return -1;
         }
         if (!mr_fork_fake(mode, ev[0], &to_fd, &from_fd, &child)) {
             close(ev[0]); close(ev[1]);
@@ -475,6 +509,7 @@ static int mr_execute(enum fake_mode mode, struct mr_dirs *d,
     }
     close(ev[1]);
     s_evidence_fd = -1;
+    s_fake_write_path[0] = '\0';
     *evidence_out = read_evidence(ev[0]);
     close(ev[0]);
     if (rc_out) *rc_out = rc;
@@ -493,7 +528,7 @@ static int mr_failures_precheck(void)
     int to_fd = -1, from_fd = -1;
     char *evidence = NULL;
     MR_CHECK("lane", mr_lane(&d));
-    MR_CHECK("task", mr_task_for(&d, &t, NULL, NULL, NULL));
+    MR_CHECK("task", mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
     (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json", d.run);
     /* A receipt with a terminal verdict short-circuits: rc 0, no turn,
      * no rewrite. No queue files exist in this lane at all. */
@@ -554,7 +589,7 @@ static int mr_exec_no_runner(void)
     int rc = -1;
     memset(&r, 0, sizeof(r));
     MR_CHECK("refused run", mr_execute(FAKE_JOURNEY, &d, NULL, NULL,
-        NULL, false, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+        NULL, NULL, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
     MR_CHECK("refused rc", rc == 1 && r.rc == 1);
     {
         char receipt[8192];
@@ -610,8 +645,8 @@ static int mr_exec_no_change(void)
     int rc = -1;
     memset(&r, 0, sizeof(r));
     MR_CHECK("no-change run", mr_execute(FAKE_JOURNEY, &d,
-        mr_verdict_pass, mr_head_pass, NULL, false, NULL, NULL, NULL, false, &r, err,
-        &rc, &evidence) == 0);
+        mr_verdict_pass, mr_head_pass, NULL, NULL, NULL, NULL, NULL,
+        false, &r, err, &rc, &evidence) == 0);
     MR_CHECK("no-change rc", rc == 1 && r.rc == 1);
     {
         char receipt[8192];
@@ -647,7 +682,8 @@ static int mr_exec_failing_gate(void)
     int rc = -1;
     memset(&r, 0, sizeof(r));
     MR_CHECK("fail run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_fail,
-        mr_head_fail, NULL, true, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+        mr_head_fail, NULL, &mr_edit_in_scope, NULL, NULL, NULL, false,
+        &r, err, &rc, &evidence) == 0);
     MR_CHECK("fail rc", rc == 1 && r.rc == 1);
     {
         char receipt[8192];
@@ -693,7 +729,294 @@ static int mr_pass_facts(const struct mr_dirs *d)
         strstr(ftext, "\"verdict\":\"pass\"") &&
         strstr(ftext, "\"candidate\":\"") &&
         strstr(ftext, "\"verdict\":\"SUITE VERDICT"));
+    /* (a) The changed paths ARE the proof that the scope was respected:
+     * a measured clean pre-state, and the turn's own in-scope path named
+     * in the evidence with nothing outside. */
+    MR_CHECK("pass scope audit", ftext &&
+        strstr(ftext, "\"pre_measured\":true") &&
+        strstr(ftext, "\"pre_clean\":true") &&
+        strstr(ftext, "\"pre_count\":0") &&
+        strstr(ftext, "\"changed_measured\":true") &&
+        strstr(ftext, "\"changed_count\":1") &&
+        strstr(ftext, "\"changed\":[\"src/sum.c\"]") &&
+        strstr(ftext, "\"outside_count\":0") &&
+        strstr(ftext, "\"outside\":[]"));
     free(ftext);
+    return failures;
+}
+
+/* (b) Baseline dirt: the workspace is already changed before the turn, so
+ * pre-existing edits could satisfy the non-empty diff a pass requires.
+ * Fail closed BEFORE the model is reached: no session, no turn, no
+ * tokens, and the offending path named in the evidence. */
+static int mr_exec_baseline_dirt(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("dirt run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_pass,
+        mr_head_pass, NULL, &mr_edit_baseline, NULL, NULL, NULL, false,
+        &r, err, &rc, &evidence) == 0);
+    MR_CHECK("dirt not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("dirt refused", strcmp(r.verdict, "refused") == 0);
+    /* No session/start and no turn/start ever reached the host. */
+    MR_CHECK("dirt spends no tokens", evidence &&
+        !strstr(evidence, "turn-cmd:") &&
+        !strstr(evidence, "workspace:") && r.total_tokens == 0);
+    {
+        char facts[8192];
+        char *ftext = NULL;
+        (void)snprintf(facts, sizeof(facts), "%s/muse.json", d.run);
+        ftext = mr_read(facts);
+        MR_CHECK("dirt evidence", ftext &&
+            strstr(ftext, "\"pre_measured\":true") &&
+            strstr(ftext, "\"pre_clean\":false") &&
+            strstr(ftext, "\"pre_count\":1") &&
+            strstr(ftext, "\"pre\":[\"edit.txt\"]"));
+        free(ftext);
+    }
+    MR_CHECK("dirt reason names dirt",
+        strstr(r.reason, "dirty before the turn") != NULL);
+    free(evidence);
+    return failures;
+}
+
+/* (c) The gate still passes, but the turn wrote outside the declared
+ * scope. The approval mode alone would never catch this after the fact:
+ * only the measured output does. */
+static int mr_exec_outside_scope(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("outside run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_pass,
+        mr_head_pass, NULL, &mr_edit_outside, NULL, NULL, NULL, false,
+        &r, err, &rc, &evidence) == 0);
+    MR_CHECK("outside not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("outside failed", strcmp(r.verdict, "failed") == 0);
+    MR_CHECK("outside turned", evidence &&
+        evidence_has(evidence, "turn-cmd:"));
+    {
+        char facts[8192];
+        char *ftext = NULL;
+        (void)snprintf(facts, sizeof(facts), "%s/muse.json", d.run);
+        ftext = mr_read(facts);
+        MR_CHECK("outside path named", ftext &&
+            strstr(ftext, "\"changed_measured\":true") &&
+            strstr(ftext, "\"changed\":[\"evil.txt\"]") &&
+            strstr(ftext, "\"outside_count\":1") &&
+            strstr(ftext, "\"outside\":[\"evil.txt\"]"));
+        free(ftext);
+    }
+    MR_CHECK("outside reason names scope",
+        strstr(r.reason, "outside scope src/") != NULL);
+    free(evidence);
+    return failures;
+}
+
+/* (d) The scope-prefix trick: scope "docs/" must not admit the sibling
+ * "docsevil/x" just because the name starts the same way. */
+static int mr_exec_scope_prefix(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("prefix run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_pass,
+        mr_head_pass, NULL, &mr_edit_prefix, NULL, NULL, NULL, false,
+        &r, err, &rc, &evidence) == 0);
+    MR_CHECK("prefix not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("prefix failed", strcmp(r.verdict, "failed") == 0);
+    {
+        char facts[8192];
+        char *ftext = NULL;
+        (void)snprintf(facts, sizeof(facts), "%s/muse.json", d.run);
+        ftext = mr_read(facts);
+        MR_CHECK("prefix sibling outside", ftext &&
+            strstr(ftext, "\"outside_count\":1") &&
+            strstr(ftext, "\"outside\":[\"docsevil/x\"]") &&
+            strstr(ftext, "\"changed\":[\"docsevil/x\"]"));
+        free(ftext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* (e) UNMEASURABLE porcelain. A workspace that is a directory but not a
+ * git worktree makes `git status --porcelain` exit non-zero, so the
+ * change set cannot be measured at all. That must fail closed with a
+ * reason that says the measurement failed — never report a clean tree,
+ * and never report "nothing outside scope". */
+static int mr_exec_unmeasurable(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_task t;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    char bare[8192];
+    int ev[2], to_fd = -1, from_fd = -1;
+    pid_t child = -1;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("unmeasurable lane", mr_lane(&d));
+    /* A real directory that git knows nothing about. */
+    if (snprintf(bare, sizeof(bare), "%s/bare", d.root) >=
+        (int)sizeof(bare)) {
+        MR_CHECK("unmeasurable path", false);
+        return failures;
+    }
+    MR_CHECK("unmeasurable dir", mr_mkdir_p(bare));
+    /* A `.git` FILE must be a gitlink; garbage makes git exit non-zero
+     * and stops it walking up to any enclosing repository, so the
+     * enumeration is unmeasurable no matter where the fixture lands. */
+    {
+        char gitfile[8192];
+        if (snprintf(gitfile, sizeof(gitfile), "%s/.git", bare) >=
+            (int)sizeof(gitfile))
+            MR_CHECK("unmeasurable gitfile fit", false);
+        else
+            MR_CHECK("unmeasurable gitfile",
+                mr_write(gitfile, "not a gitfile\n", 0));
+    }
+    MR_CHECK("unmeasurable task",
+        mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
+    if (snprintf(t.workspace, sizeof(t.workspace), "%s", bare) >=
+        (int)sizeof(t.workspace)) {
+        MR_CHECK("unmeasurable workspace", false);
+        return failures;
+    }
+    if (pipe(ev) != 0) {
+        MR_CHECK("unmeasurable pipe", false);
+        return failures;
+    }
+    s_evidence_fd = ev[1];
+    if (!mr_fork_fake(FAKE_JOURNEY, ev[0], &to_fd, &from_fd, &child)) {
+        MR_CHECK("unmeasurable fork", false);
+        close(ev[0]); close(ev[1]);
+        return failures;
+    }
+    rc = muse_run_task_on_transport(&t, child, to_fd, from_fd, &r, err);
+    close(to_fd);
+    close(from_fd);
+    {
+        int status = 0;
+        (void)waitpid(child, &status, 0);
+    }
+    close(ev[1]);
+    s_evidence_fd = -1;
+    evidence = read_evidence(ev[0]);
+    close(ev[0]);
+    MR_CHECK("unmeasurable not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("unmeasurable refused", strcmp(r.verdict, "refused") == 0);
+    MR_CHECK("unmeasurable no turn", evidence &&
+        !strstr(evidence, "turn-cmd:"));
+    /* The reason must say the measurement failed, not that the tree was
+     * clean, and the counts must stay -1 rather than a measured 0. */
+    MR_CHECK("unmeasurable reason",
+        strstr(r.reason, "pre-state unmeasurable") != NULL);
+    MR_CHECK("unmeasurable not clean", r.scope_pre_measured == false &&
+        r.scope_pre_clean == false && r.scope_pre_count == -1 &&
+        r.scope_changed_count == -1 && r.scope_outside_count == -1);
+    {
+        char facts[8192];
+        char *ftext = NULL;
+        (void)snprintf(facts, sizeof(facts), "%s/muse.json", d.run);
+        ftext = mr_read(facts);
+        MR_CHECK("unmeasurable evidence", ftext &&
+            strstr(ftext, "\"pre_measured\":false") &&
+            strstr(ftext, "\"pre_count\":-1") &&
+            strstr(ftext, "\"changed_measured\":false") &&
+            strstr(ftext, "\"outside_count\":-1"));
+        free(ftext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* (e, second half) A porcelain capture that FILLS its bound. The capture
+ * helper discards the overrun and still reports git's exit status, so a
+ * full buffer is indistinguishable from a complete one and must refuse
+ * rather than audit a silently short change set. */
+static int mr_exec_unmeasurable_bound(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    char name[512];
+    char path[8192];
+    bool wrote = true;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("bound lane", mr_lane(&d));
+    /* Enough untracked rows to overrun the 256 KiB porcelain bound:
+     * ~1500 paths of ~200 bytes each. Each is listed individually
+     * because the repository root itself is tracked. */
+    memset(name, 'q', sizeof(name));
+    name[200] = '\0';
+    for (int i = 0; wrote && i < 1500; i++) {
+        if (snprintf(path, sizeof(path), "%s/%04d%s", d.wt, i, name) >=
+            (int)sizeof(path))
+            wrote = false;
+        else
+            wrote = mr_write(path, "x\n", 0);
+    }
+    MR_CHECK("bound fixture", wrote);
+    {
+        struct muse_run_task t;
+        int ev[2], to_fd = -1, from_fd = -1;
+        pid_t child = -1;
+        MR_CHECK("bound task",
+            mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
+        if (pipe(ev) != 0) {
+            MR_CHECK("bound pipe", false);
+            return failures;
+        }
+        s_evidence_fd = ev[1];
+        if (!mr_fork_fake(FAKE_JOURNEY, ev[0], &to_fd, &from_fd, &child)) {
+            MR_CHECK("bound fork", false);
+            close(ev[0]); close(ev[1]);
+            return failures;
+        }
+        rc = muse_run_task_on_transport(&t, child, to_fd, from_fd, &r,
+            err);
+        close(to_fd);
+        close(from_fd);
+        {
+            int status = 0;
+            (void)waitpid(child, &status, 0);
+        }
+        close(ev[1]);
+        s_evidence_fd = -1;
+        evidence = read_evidence(ev[0]);
+        close(ev[0]);
+    }
+    MR_CHECK("bound not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("bound unmeasurable", r.scope_pre_measured == false &&
+        r.scope_pre_count == -1 &&
+        strstr(r.reason, "pre-state unmeasurable") != NULL);
+    MR_CHECK("bound no turn", evidence &&
+        !strstr(evidence, "turn-cmd:"));
+    free(evidence);
     return failures;
 }
 
@@ -708,7 +1031,8 @@ static int mr_exec_pass(void)
     int rc = -1;
     memset(&r, 0, sizeof(r));
     MR_CHECK("pass run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_pass,
-        mr_head_pass, NULL, true, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+        mr_head_pass, NULL, &mr_edit_in_scope, NULL, NULL, NULL, false,
+        &r, err, &rc, &evidence) == 0);
     MR_CHECK("pass rc", rc == 0 && r.rc == 0);
     MR_CHECK("pass verdict", strcmp(r.verdict, "pass") == 0);
     MR_CHECK("pass terminal", strcmp(r.terminal, "completed") == 0);
@@ -738,8 +1062,8 @@ static int mr_exec_cancelled(void)
     memset(&r, 0, sizeof(r));
     MR_CHECK("cancelled run", mr_execute(FAKE_CANCELLED, &d,
         mr_verdict_pass, mr_head_pass,
-        "touch \"$0.marker\"", true, NULL, NULL, NULL, false, &r, err, &rc,
-        &evidence) == 0);
+        "touch \"$0.marker\"", &mr_edit_in_scope, NULL, NULL, NULL,
+        false, &r, err, &rc, &evidence) == 0);
     MR_CHECK("cancelled rc", rc == 1 && r.rc == 1);
     {
         char receipt[8192];
@@ -772,8 +1096,8 @@ static int mr_exec_unknown_frame(void)
     int rc = -1;
     memset(&r, 0, sizeof(r));
     MR_CHECK("unknown frame run", mr_execute(FAKE_UNKNOWN, &d,
-        mr_verdict_pass, mr_head_pass, NULL, true, NULL, NULL, NULL, false, &r, err,
-        &rc, &evidence) == 0);
+        mr_verdict_pass, mr_head_pass, NULL, &mr_edit_in_scope, NULL,
+        NULL, NULL, false, &r, err, &rc, &evidence) == 0);
     MR_CHECK("unknown frame pass", rc == 0 && r.rc == 0 &&
         strcmp(r.verdict, "pass") == 0);
     free(evidence);
@@ -791,7 +1115,7 @@ static int mr_exec_garbage(void)
     int rc = -1;
     memset(&r, 0, sizeof(r));
     MR_CHECK("garbage run", mr_execute(FAKE_GARBAGE, &d, NULL, NULL,
-        NULL, false, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+        NULL, NULL, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
     MR_CHECK("garbage refused", rc == 1 && r.rc == 1 &&
         strcmp(r.verdict, "refused") == 0);
     {
@@ -819,7 +1143,7 @@ static int mr_exec_host_exit(void)
     int rc = -1;
     memset(&r, 0, sizeof(r));
     MR_CHECK("host-exit run", mr_execute(FAKE_EXIT, &d, NULL, NULL,
-        NULL, false, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+        NULL, NULL, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
     MR_CHECK("host-exit refused", rc == 1 && r.rc == 1 &&
         strcmp(r.verdict, "refused") == 0);
     free(evidence);
@@ -842,7 +1166,7 @@ static int mr_exec_timeout(void)
     b.turn_timeout_ms = 1500;
     b.gate_timeout_ms = 60000;
     MR_CHECK("timeout run", mr_execute(FAKE_HANG, &d, NULL,
-        NULL, NULL, false, NULL, NULL, &b, false, &r, err, &rc, &evidence) == 0);
+        NULL, NULL, NULL, NULL, NULL, &b, false, &r, err, &rc, &evidence) == 0);
     MR_CHECK("timeout verdict", rc == 1 && r.rc == 1 &&
         strcmp(r.verdict, "timeout") == 0);
     MR_CHECK("timeout cancels first", evidence &&
@@ -868,7 +1192,7 @@ static int mr_exec_token_cap(void)
     b.gate_timeout_ms = 60000;
     b.max_total_tokens = 10;
     MR_CHECK("cap run", mr_execute(FAKE_JOURNEY, &d, NULL,
-        NULL, NULL, false, NULL, NULL, &b, false, &r, err, &rc, &evidence) == 0);
+        NULL, NULL, NULL, NULL, NULL, &b, false, &r, err, &rc, &evidence) == 0);
     MR_CHECK("cap refused", rc == 1 && r.rc == 1 &&
         strcmp(r.verdict, "refused") == 0);
     MR_CHECK("cap cancels first", evidence &&
@@ -890,8 +1214,8 @@ static int mr_exec_model_substitution(void)
     memset(&r, 0, sizeof(r));
     s_fake_model = "m-other";
     MR_CHECK("mismatch run", mr_execute(FAKE_JOURNEY, &d,
-        mr_verdict_pass, mr_head_pass, NULL, true, NULL, "m-want", NULL, false, &r,
-        err, &rc, &evidence) == 0);
+        mr_verdict_pass, mr_head_pass, NULL, &mr_edit_in_scope, NULL,
+        "m-want", NULL, false, &r, err, &rc, &evidence) == 0);
     MR_CHECK("mismatch proceeds", rc == 0 && r.rc == 0);
     MR_CHECK("mismatch visible",
         strcmp(r.model_requested, "m-want") == 0 &&
@@ -917,8 +1241,8 @@ static int mr_exec_claim_held(void)
     int rc = -1;
     memset(&r, 0, sizeof(r));
     MR_CHECK("claimed run", mr_execute(FAKE_JOURNEY, &d,
-        mr_verdict_pass, mr_head_pass, NULL, true, NULL, NULL,
-        NULL, true, &r, err, &rc, &evidence) == 0);
+        mr_verdict_pass, mr_head_pass, NULL, &mr_edit_in_scope, NULL,
+        NULL, NULL, true, &r, err, &rc, &evidence) == 0);
     MR_CHECK("claimed proceeds", rc == 0 && r.rc == 0 &&
         strcmp(r.verdict, "pass") == 0);
     MR_CHECK("claimed turned", evidence &&
@@ -958,7 +1282,7 @@ static int mr_claim_seed_turn(struct mr_dirs *d, const char *receipt,
         return failures;
     }
     s_evidence_fd = ev2[1];
-    if (!mr_task_for(d, &t, NULL, NULL, NULL)) {
+    if (!mr_task_for(d, &t, NULL, NULL, NULL, NULL)) {
         MR_CHECK("claimed task", false);
         close(ev2[0]); close(ev2[1]);
         return failures;
@@ -1011,12 +1335,12 @@ static int mr_exec_claim_seed(void)
     MR_CHECK("claimed seed", mr_write(receipt, seed_text, 0));
     MR_CHECK("claimed gate",
         mr_gate_script(&d, mr_verdict_pass, mr_head_pass, NULL));
-    {
-        char f[8192];
-        (void)snprintf(f, sizeof(f), "%s/edit.txt", d.wt);
-        MR_CHECK("claimed dirty", mr_write(f, "changed\n", 0));
-    }
+    /* The TURN makes the in-scope change, not the fixture: a workspace
+     * dirtied beforehand is baseline dirt and would be refused. */
+    MR_CHECK("claimed arms turn edit",
+        mr_arm_edit(&d, &mr_edit_in_scope));
     failures += mr_claim_seed_turn(&d, receipt, seed_text);
+    s_fake_write_path[0] = '\0';
     return failures;
 }
 
@@ -1036,6 +1360,12 @@ static int mr_failures_execute(void)
     failures += mr_exec_model_substitution();
     failures += mr_exec_claim_held();
     failures += mr_exec_claim_seed();
+    /* The scope audit: the permission proven by measured output. */
+    failures += mr_exec_baseline_dirt();
+    failures += mr_exec_outside_scope();
+    failures += mr_exec_scope_prefix();
+    failures += mr_exec_unmeasurable();
+    failures += mr_exec_unmeasurable_bound();
     return failures;
 }
 

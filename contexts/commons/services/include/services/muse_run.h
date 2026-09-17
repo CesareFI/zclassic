@@ -11,6 +11,27 @@
  * group, read through its own SUITE VERDICT line, plus a measured worktree
  * diff, can pass. Anything unreadable is a refusal, never a pass.
  *
+ * THE SAME LAW OVER SCOPE: THE SCOPE IS PROVEN BY MEASURED OUTPUT, not
+ * only by the approval mode. Handing the scope to the session as its
+ * single allow prefix under approval_mode "denyUnmatched" binds only the
+ * moment the model ASKS; it proves nothing about the workspace
+ * afterwards. So the run measures the change set itself, through the same
+ * `git status --porcelain` seam the diff count already uses, and every
+ * path it names must be inside the declared scope or the run fails
+ * closed. The workspace must also be clean BEFORE the turn: pre-existing
+ * dirt would otherwise satisfy the non-empty diff a pass requires, so a
+ * dirty workspace is refused before a single token is spent. `build/` is
+ * gitignored, so an already-built workspace is still clean.
+ *
+ * AN UNMEASURABLE OUTPUT IS A REFUSAL, NEVER A PASS. If either
+ * enumeration cannot be measured — the porcelain capture fails to spawn,
+ * exits non-zero, times out, fills its bound (the capture helper discards
+ * the overrun and still reports the child's exit status, so a full buffer
+ * proves nothing), or names a row the parser cannot read — the run fails
+ * closed. It is never read as "clean" or as "nothing outside scope", and
+ * the evidence records which of the two it was: a measured count, or -1
+ * with measured=false.
+ *
  * CLOSED VERDICTS (match the fleet predicate: only "pass" with rc 0
  * completes; everything else stays incomplete): pass, failed, timeout,
  * cancelled, refused. Lowercase verbs, honest rc: pass carries 0,
@@ -44,6 +65,11 @@
 #define MUSE_RUN_ID_MAX 64
 #define MUSE_RUN_VERDICT_MAX 16
 #define MUSE_RUN_REASON_MAX 256
+/* Bounded JSON array bodies for the scope audit's measured path lists:
+ * one run's change set can never write without limit. The honest total
+ * always rides beside the list, so a truncated array stays visible. */
+#define MUSE_RUN_CHANGED_LIST_MAX 4096
+#define MUSE_RUN_SCOPE_LIST_MAX 1024
 /* A brief is model input, not a ledger: bounded so one row cannot spend
  * without limit before the turn even starts. */
 #define MUSE_RUN_PROMPT_MAX (256u * 1024u)
@@ -142,6 +168,25 @@ struct muse_run_result {
     long long wall_ms;
     long long files_changed;
     bool prior_unresolved;
+    /* --- the scope audit: the permission proven by measured output -----
+     * scope_pre_clean is the workspace BEFORE the turn; false means the
+     * run refused without spending a token, because baseline dirt must
+     * never be able to count toward success. scope_changed and
+     * scope_outside are measured AFTER the turn. Each list is a bounded
+     * JSON array body (already escaped) and may hold fewer elements than
+     * its *_count, which is always the honest total. */
+    /* Whether each enumeration was MEASURED at all. False is unmeasurable
+     * and refuses; it is never the same answer as a measured clean tree,
+     * and the matching *_count stays -1 so no reader can confuse them. */
+    bool scope_pre_measured;
+    bool scope_changed_measured;
+    bool scope_pre_clean;
+    long long scope_pre_count;
+    long long scope_changed_count;
+    long long scope_outside_count;
+    char scope_pre[MUSE_RUN_SCOPE_LIST_MAX];
+    char scope_changed[MUSE_RUN_CHANGED_LIST_MAX];
+    char scope_outside[MUSE_RUN_SCOPE_LIST_MAX];
     char reason[MUSE_RUN_REASON_MAX];
 };
 
