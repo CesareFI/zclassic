@@ -2050,7 +2050,9 @@ ZCL_COMMAND_DEV_COMMAND(
     "Post, pull, and ack async agent mail without blocking",
     "One append-only, cursor-based mail primitive over the owner-private "
     "state root: post appends a row {seq, ts, from, to, kind, body, ref} to "
-    "mail/outbox.jsonl with a single O_APPEND write; pull reads every "
+    "mail/outbox.jsonl with a single O_APPEND write, plus the optional "
+    "sender_binding stamping which credential sent it, since from is a "
+    "claim and a reader that dispatches work needs more than a name; pull reads every "
     "*.jsonl under mail/ past a cursor in (ts, from, seq) order; ack "
     "persists the cursor. Bodies over 4 KiB or mentioning a key, an onion "
     "address, an IP, ANY absolute path, or a path token climbing out with a "
@@ -2060,7 +2062,8 @@ ZCL_COMMAND_DEV_COMMAND(
     32768,
     "agent,mail,post,pull,ack,async,cursor,fleet",
     "zcl.agent_mail_input.v1", "zcl.agent_mail.v1",
-    "action,to,kind,body,since,from,cursor,agent,ref,cwd", "action,cursor",
+    "action,to,kind,body,since,from,cursor,agent,ref,sender_binding,cwd",
+    "action,cursor",
     "z23 dev agent mail post --to=* --kind=note --body=hello",
     ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
     ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,

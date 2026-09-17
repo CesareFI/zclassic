@@ -30,10 +30,14 @@
  *          ref is invalid for coordinated work: one ref names one exact
  *          piece of work, and nothing can be reconciled or answered under
  *          a name that does not exist;
- *        - `from` is the label of a LIVE grant in <state>/steer/grants.jsonl
- *          carrying the "send" scope, read through the one shared helper
- *          zcl_fleet_steer_grant_label_live() so this file cannot drift
- *          from the store's own semantics;
+ *        - the row carries a sender binding, and that binding is the stamp
+ *          of a LIVE grant in <state>/steer/grants.jsonl that carries the
+ *          claimed `from` label with the "send" scope, read through the one
+ *          shared helper zcl_fleet_steer_grant_binding_live() so this file
+ *          cannot drift from the store's own semantics. `from` alone is a
+ *          claim and was believed once: any holder of any send-capable
+ *          grant could name any sender and have work dispatched under it.
+ *          A row with no binding is unattributable and refused;
  *        - the body parses as a well-formed Muse task direction (below).
  *      Anything else is refused with a typed reason and executes nothing.
  *   3. TO WORK. The directive body is written verbatim to
@@ -357,6 +361,9 @@ struct rcv_row {
     const char *kind;
     const char *body;
     const char *ref;
+    /* The stamp of the credential that sent the row, "" when unstamped.
+     * `from` is only a claim — this is what the claim is checked against. */
+    const char *sender_binding;
 };
 
 /* ── digests ───────────────────────────────────────────────────────────── */
@@ -1234,6 +1241,7 @@ static bool rcv_row_parse(const struct json_value *r, struct rcv_row *v)
     v->kind = rcv_field(r, "kind");
     v->body = rcv_field(r, "body");
     v->ref = rcv_field(r, "ref");
+    v->sender_binding = rcv_field(r, "sender_binding");
     return true;
 }
 
@@ -1744,7 +1752,9 @@ static void rcv_to_work(struct rcv_ctx *c, const struct rcv_row *v,
     rcv_install(c, v, src, d, &w, &f);
 }
 
-/* The three admission tests, in the order that refuses earliest. */
+/* The four admission tests, in the order that refuses earliest — and all
+ * of them before any queue row exists, so nothing this refuses was ever
+ * dispatched. */
 static void rcv_admit(struct rcv_ctx *c, const struct rcv_row *v,
                       const char *src)
 {
@@ -1755,7 +1765,19 @@ static void rcv_admit(struct rcv_ctx *c, const struct rcv_row *v,
                           "ref-must-match-64-name-alphabet");
         return;
     }
-    why = zcl_fleet_steer_grant_label_live(v->from, RCV_SCOPE);
+    /* A row that stamps no credential cannot be attributed to anyone, and
+     * work is dispatched on the strength of who asked. Refused, not
+     * admitted: this is the fail-closed direction. */
+    if (!v->sender_binding || !v->sender_binding[0]) {
+        rcv_answer_refuse(c, v, src, "RECEIVE_SENDER_UNBOUND",
+                          "row-carries-no-sender-binding");
+        return;
+    }
+    /* Ask the store whether the grant that stamped this row is the one
+     * carrying the name it claims. Asking only whether SOME live grant
+     * carried the name admitted any send-capable holder as any sender. */
+    why = zcl_fleet_steer_grant_binding_live(v->from, v->sender_binding,
+                                             RCV_SCOPE);
     if (why) {
         rcv_answer_refuse(c, v, src, "RECEIVE_SENDER_UNGRANTED", why);
         return;

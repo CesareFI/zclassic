@@ -41,13 +41,26 @@
  *   agent   ack only: optional name owning the cursor file (default: the same
  *           identity post uses). Sanitized to [A-Za-z0-9._-] for the file.
  *   ref     post only, optional string linking a row (default "").
+ *   sender_binding
+ *           post only, optional: 32 lowercase hex stamping WHICH credential
+ *           sent this row, written beside `from`. This leaf does not mint,
+ *           interpret or verify it — it carries it, because `from` alone is
+ *           a claim and a reader that dispatches work needs something the
+ *           sender could only have produced by holding its own credential.
+ *           fleet.steer.send derives it from the grant that carried the
+ *           request; dev.agent.receive checks it against the grant store
+ *           before admitting a directive. An absent or empty value writes
+ *           no field at all, which reads back as an unattributable row.
+ *           Never a secret: a binding is a one-way digest, never the grant
+ *           id, so it is safe in a row that crosses hosts.
  *   cwd     optional string. Accepted and ignored, so fixtures match the
  *           other leaves. NOTHING in this leaf consults it: a mail body
  *           crosses hosts, so the verdict on a body must not move with the
  *           directory the process happens to run in.
  *
  * ROW. {"seq":N,"ts":"<ISO-8601 UTC>","from":"<agent>","to":"<agent|*>",
- *        "kind":"<kind>","body":"<text>","ref":"<ref>"}
+ *        "kind":"<kind>","body":"<text>","ref":"<ref>"} plus
+ *        "sender_binding":"<32 hex>" when the poster stamped one.
  * seq is one plus the largest seq already in the outbox (1 when empty).
  * A body round-trips byte for byte, newlines included: the row writes the
  * two-character JSON escapes for newline, carriage return, tab, backspace
@@ -147,6 +160,11 @@
 #define DVM_LINE_CAP 8192
 #define DVM_ROWS_MAX 4096
 #define DVM_PATH_CAP 4096u
+/* Width of a sender binding, fixed by the grant store that mints it
+ * (ZCL_FLEET_STEER_BINDING_HEX). Stated here as a byte budget so this leaf
+ * carries the field without depending on the store that means anything by
+ * it: mail transports rows, it does not judge senders. */
+#define DVM_BINDING_HEX 32u
 
 static const char *dvm_kinds[] = {
     "need", "claim", "result", "problem", "note", "offer", "directive",
@@ -664,6 +682,8 @@ struct dvm_row {
     char kind[32];
     char body[DVM_BODY_MAX + 1];
     char ref[256];
+    /* "" when the poster stamped none; carried, never interpreted here. */
+    char sender_binding[DVM_BINDING_HEX + 1];
     char line[DVM_LINE_CAP];
 };
 
@@ -685,6 +705,11 @@ static bool dvm_parse_row(const char *line, struct dvm_row *r)
     if (!dvm_line_str(line, "body", r->body, sizeof(r->body)))
         return false;
     (void)dvm_line_str(line, "ref", r->ref, sizeof(r->ref));
+    /* Optional by design: an older row, or one from a poster that stamped
+     * nothing, keeps the empty binding. A reader that needs attribution
+     * refuses on the empty value; nothing here guesses one. */
+    (void)dvm_line_str(line, "sender_binding", r->sender_binding,
+                       sizeof(r->sender_binding));
     return true;
 }
 
@@ -720,8 +745,25 @@ static void dvm_fail(struct zcl_command_reply *reply, const char *code,
  * chain that rejects malformed input lives apart from sequencing, encoding,
  * and the platform write. */
 struct dvm_post_input {
-    const char *to, *kind, *body, *from, *ref;
+    const char *to, *kind, *body, *from, *ref, *sender_binding;
 };
+
+/* A binding is 32 lowercase hex or nothing at all. Checked for shape only:
+ * whether it is the right binding is the grant store's question, asked by
+ * the reader that admits the row, not by the leaf that carries it. */
+static bool dvm_binding_ok(const char *s)
+{
+    size_t i;
+    if (!s || !s[0])
+        return true;
+    if (strlen(s) != DVM_BINDING_HEX)
+        return false;
+    for (i = 0; s[i]; i++) {
+        if (!isxdigit((unsigned char)s[i]) || isupper((unsigned char)s[i]))
+            return false;
+    }
+    return true;
+}
 
 static const struct dvm_fail_info {
     const char *code, *message, *evidence;
@@ -738,6 +780,9 @@ static const struct dvm_fail_info {
                    "input.body too large"},
   from_bad_info = {"BAD_INPUT", "from names the sending agent",
                    "input.from has an illegal spelling"},
+  binding_bad_info = {"BAD_INPUT",
+                      "sender_binding is 32 lowercase hex, or absent",
+                      "input.sender_binding has an illegal spelling"},
   ref_big_info = {"BAD_INPUT", "ref is at most 200 bytes",
                  "input.ref too large"};
 
@@ -753,8 +798,11 @@ static void dvm_post_extract(const struct zcl_command_request *req,
     bodyv = json_get(req->input, "body");
     in->body = bodyv && bodyv->type == JSON_STR ? json_get_str(bodyv) : NULL;
     in->from = dvm_identity(req, "from");
+    in->sender_binding = dvm_str(req, "sender_binding");
     if (!in->ref)
         in->ref = "";
+    if (!in->sender_binding)
+        in->sender_binding = "";
 }
 
 /* Check to/kind, the two fields validated before body is even inspected. */
@@ -776,6 +824,7 @@ static const struct dvm_fail_info *dvm_post_check_body_from_ref(
     if (!in->from || !in->from[0] || !dvm_agent_ok(in->from))
         return &from_bad_info;
     if (strlen(in->ref) > 200) return &ref_big_info;
+    if (!dvm_binding_ok(in->sender_binding)) return &binding_bad_info;
     return NULL;
 }
 
@@ -859,6 +908,7 @@ static void dvm_post(const struct zcl_command_request *req,
     char ts[40];
     char esc_from[512], esc_to[512], esc_kind[64], esc_body[DVM_BODY_MAX * 2];
     char esc_ref[512];
+    char bind_part[DVM_BINDING_HEX + 32];
     char line[DVM_LINE_CAP];
     const char *code;
     char msg[256];
@@ -911,12 +961,20 @@ static void dvm_post(const struct zcl_command_request *req,
                  "escape budget exceeded");
         return;
     }
+    /* The binding is written only when the poster stamped one, so an
+     * unstamped row says so by carrying no field rather than by carrying
+     * an empty one that a reader could mistake for a value. Its alphabet
+     * was checked above, so it needs no escaping. */
+    bind_part[0] = '\0';
+    if (in.sender_binding[0])
+        (void)snprintf(bind_part, sizeof(bind_part),
+                       ",\"sender_binding\":\"%s\"", in.sender_binding);
     len = (size_t)snprintf(line, sizeof(line),
                            "{\"seq\":%lld,\"ts\":\"%s\",\"from\":\"%s\","
                            "\"to\":\"%s\",\"kind\":\"%s\",\"body\":\"%s\","
-                           "\"ref\":\"%s\"}\n",
+                           "\"ref\":\"%s\"%s}\n",
                            seq, ts, esc_from, esc_to, esc_kind, esc_body,
-                           esc_ref);
+                           esc_ref, bind_part);
     if (len == 0 || len >= sizeof(line)) {
         dvm_fail(reply, "BAD_INPUT", "row too large to encode",
                  "line budget exceeded");
@@ -1129,6 +1187,8 @@ static void dvm_pull_build_reply(struct zcl_command_reply *reply,
         (void)json_push_kv_str(&item, "kind", rows[i].kind);
         (void)json_push_kv_str(&item, "body", rows[i].body);
         (void)json_push_kv_str(&item, "ref", rows[i].ref);
+        (void)json_push_kv_str(&item, "sender_binding",
+                               rows[i].sender_binding);
         (void)json_push_back(&arr, &item);
         json_free(&item);
     }

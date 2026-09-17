@@ -47,6 +47,9 @@ int test_fleet_gateway(void)
  * the admitted node inside a proof generation (which has no build/bin/z23). */
 #define GW_TEST_NODE_DEFAULT "build/bin/zclassic23"
 #define GW_TEST_CAP (256u * 1024u)
+/* The one sender this rig's grants are minted under, and therefore the one
+ * name any of its sends may claim. */
+#define GW_SENDER "gw-chat"
 
 static pid_t g_gw_pid = -1;
 static int g_gw_port = -1;
@@ -442,14 +445,18 @@ static char *gw_node_run(const char *node, const char *verb, const char *in)
     return out;
 }
 
-/* Mint a steering grant through the node CLI; copies the 32-hex id out. */
+/* Mint a steering grant through the node CLI; copies the 32-hex id out.
+ * Every grant here is minted under GW_SENDER, because a grant's label is
+ * the sender it may speak as and a send that claims any other name is
+ * refused. A rig grant with no label could send as nobody. */
 static bool gw_mint(const char *node, const char *scopes, char *id_out)
 {
     char in[256];
     char *reply;
     const char *p;
     int sn = snprintf(in, sizeof(in),
-                      "{\"action\":\"mint\",\"scopes\":\"%s\"}", scopes);
+                      "{\"action\":\"mint\",\"scopes\":\"%s\","
+                      "\"label\":\"" GW_SENDER "\"}", scopes);
     if (sn <= 0 || (size_t)sn >= sizeof(in))
         return false;
     reply = gw_node_run(node, "grant", in);
@@ -596,7 +603,8 @@ static char *gw_big_send(const char *gid, size_t filler)
     n = snprintf(json, cap,
                  "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
                  "\"params\":{\"name\":\"steer_send\",\"arguments\":{"
-                 "\"grant\":\"%s\",\"items\":[{\"to\":\"field-agent\","
+                 "\"grant\":\"%s\",\"from\":\"" GW_SENDER "\","
+                 "\"items\":[{\"to\":\"field-agent\","
                  "\"ref\":\"bound-probe\",\"idempotency_key\":\"k-bound\","
                  "\"body\":\"",
                  gid);
@@ -702,7 +710,9 @@ static int gw_t_calls(void)
         sn = snprintf(args, sizeof(args),
                       "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/"
                       "call\",\"params\":{\"name\":\"steer_send\","
-                      "\"arguments\":{\"grant\":\"%s\",\"items\":[{\"to\":"
+                      "\"arguments\":{\"grant\":\"%s\",\"from\":\""
+                      GW_SENDER "\","
+                      "\"items\":[{\"to\":"
                       "\"gw-agent\",\"body\":\"probe\",\"ref\":\"gw-1\","
                       "\"idempotency_key\":\"gw-k1\"}]}}}",
                       gid);
@@ -721,7 +731,9 @@ static int gw_t_calls(void)
         sn = snprintf(args, sizeof(args),
                       "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/"
                       "call\",\"params\":{\"name\":\"steer_send\","
-                      "\"arguments\":{\"grant\":\"%s\",\"items\":[{\"to\":"
+                      "\"arguments\":{\"grant\":\"%s\",\"from\":\""
+                      GW_SENDER "\","
+                      "\"items\":[{\"to\":"
                       "\"gw-agent\",\"body\":\"changed\",\"ref\":\"gw-1\","
                       "\"idempotency_key\":\"gw-k1\"}]}}}",
                       gid);
@@ -752,7 +764,9 @@ static int gw_t_calls(void)
         sn = snprintf(args, sizeof(args),
                       "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/"
                       "call\",\"params\":{\"name\":\"steer_send\","
-                      "\"arguments\":{\"grant\":\"%s\",\"items\":[{\"to\":"
+                      "\"arguments\":{\"grant\":\"%s\",\"from\":\""
+                      GW_SENDER "\","
+                      "\"items\":[{\"to\":"
                       "\"gw-agent\",\"body\":\"probe\",\"ref\":\"gw-1\","
                       "\"idempotency_key\":\"gw-k1\"}]}}}",
                       gid);
@@ -1069,7 +1083,7 @@ _test_next:;
 #define GW_LIFE_REF "gw-life-001"
 #define GW_LIFE_KEY "gw-life-key-001"
 #define GW_LIFE_TO "gw-worker"
-#define GW_LIFE_FROM "gw-chat"
+#define GW_LIFE_FROM GW_SENDER
 
 static char g_gw_state[512];
 static char g_life_gid[64];

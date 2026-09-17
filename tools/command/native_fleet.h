@@ -5,6 +5,9 @@
 #ifndef ZCL_NATIVE_FLEET_H
 #define ZCL_NATIVE_FLEET_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 struct zcl_command_request;
 struct zcl_command_reply;
 
@@ -64,18 +67,38 @@ void zcl_native_handle_fleet_steer_grant(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 
-/* The one shared reader of <state>/steer/grants.jsonl by LABEL. Returns NULL
- * when a live (not revoked, not expired) grant carries `label` and `scope`,
- * otherwise the fail-closed STEER_GRANT_* reason for the closest matching
- * row ("STEER_GRANT_UNKNOWN" when no row carries the label at all, including
- * when there is no store yet). The store is re-read on every call, so a
- * revoke takes effect immediately. A label is a name the owner minted a
- * grant under, never a credential: this answers only "has the owner named
- * this sender", and grants no fleet.steer verb to the caller. Callers that
- * must not write anything are safe — this never creates the steer directory.
- * Implemented in tools/command/native_fleet_steer.c beside the store it
- * reads, so no second permission system can drift away from it. */
-const char *zcl_fleet_steer_grant_label_live(const char *label,
-                                             const char *scope);
+/* A sender binding: 32 lowercase hex, the public stamp of one grant.
+ * Never the grant id — the id IS the bearer secret. */
+#define ZCL_FLEET_STEER_BINDING_HEX 32
+
+/* Derive the binding a sender holding `grant_id` stamps rows with under
+ * `label`. Deterministic, one-way, and computable only by a holder of the
+ * grant id, which is why a receiver can treat it as proof that the row came
+ * from that grant. False when an argument is missing or `cap` is short. The
+ * grant id is consumed and never echoed, logged, or stored by this call. */
+bool zcl_fleet_steer_sender_binding(const char *grant_id, const char *label,
+                                    char *out, size_t cap);
+
+/* The one shared admission reader of <state>/steer/grants.jsonl. Returns
+ * NULL when a live (not revoked, not expired) grant carries `label` with
+ * `scope` AND stamps exactly `binding`, otherwise the fail-closed
+ * STEER_GRANT_* reason for the closest matching row ("STEER_GRANT_UNKNOWN"
+ * when no row carries the label at all, including when there is no store
+ * yet; "STEER_GRANT_BINDING" when a live row carries the label but did not
+ * write this stamp — someone else's credential claiming this name). The
+ * store is re-read on every call, so a revoke takes effect immediately.
+ *
+ * The LABEL alone is not authority and never was: it is a name the owner
+ * minted a grant under, and anything may write any name into a row. The
+ * binding is what ties the row to the credential that actually carried it,
+ * so an admission asks for both. An empty binding is refused here rather
+ * than treated as "not applicable": an unattributable row is refused, not
+ * admitted. Callers that must not write anything are safe — this never
+ * creates the steer directory. Implemented in
+ * tools/command/native_fleet_steer.c beside the store it reads, so no
+ * second permission system can drift away from it. */
+const char *zcl_fleet_steer_grant_binding_live(const char *label,
+                                               const char *binding,
+                                               const char *scope);
 
 #endif /* ZCL_NATIVE_FLEET_H */

@@ -61,6 +61,59 @@ static char g_rtx_saved_xdg[4096];
 static bool g_rtx_had_xdg;
 static int g_rtx_ts;
 
+/* ── who the rig's senders are ──────────────────────────────────────────
+ *
+ * A directive row carries the stamp of the credential that sent it, and
+ * the receiver admits on that stamp rather than on the name beside it. The
+ * rig therefore has to stamp rows the way a real sender does: every grant
+ * it mints is remembered here by label, and a delivery under that label
+ * carries that grant's binding.
+ *
+ * A delivery under a label the rig never minted carries RTX_FOREIGN_BINDING
+ * — a well-formed stamp belonging to nobody, which is what an outsider
+ * actually presents. It is deliberately NOT an empty stamp: an unstamped
+ * row is refused one gate earlier, and a case about an ungranted sender
+ * must reach the sender gate to be about anything. */
+#define RTX_FOREIGN_BINDING "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+struct rtx_ident {
+    char label[64];
+    char binding[ZCL_FLEET_STEER_BINDING_HEX + 1];
+};
+
+static struct rtx_ident g_rtx_ident[8];
+static size_t g_rtx_idents;
+
+/* Remember the binding `id` stamps under `label` (last mint wins). */
+static void rtx_ident_put(const char *label, const char *id)
+{
+    struct rtx_ident e;
+    size_t i;
+    memset(&e, 0, sizeof(e));
+    (void)snprintf(e.label, sizeof(e.label), "%s", label);
+    if (!zcl_fleet_steer_sender_binding(id, label, e.binding,
+                                        sizeof(e.binding)))
+        return;
+    for (i = 0; i < g_rtx_idents; i++) {
+        if (strcmp(g_rtx_ident[i].label, label) == 0) {
+            g_rtx_ident[i] = e;
+            return;
+        }
+    }
+    if (g_rtx_idents < sizeof(g_rtx_ident) / sizeof(g_rtx_ident[0]))
+        g_rtx_ident[g_rtx_idents++] = e;
+}
+
+static const char *rtx_ident_binding(const char *label)
+{
+    size_t i;
+    for (i = 0; i < g_rtx_idents; i++) {
+        if (strcmp(g_rtx_ident[i].label, label) == 0)
+            return g_rtx_ident[i].binding;
+    }
+    return RTX_FOREIGN_BINDING;
+}
+
 static void rtx_isolate(const char *tag)
 {
     char base[512];
@@ -83,6 +136,7 @@ static void rtx_isolate(const char *tag)
                        getenv("XDG_STATE_HOME"));
     setenv("XDG_STATE_HOME", g_rtx_state, 1);
     g_rtx_ts = 0;
+    g_rtx_idents = 0;
 #if !defined(_WIN32)
     (void)mkdir(g_rtx_ws, 0700);
 #endif
@@ -150,8 +204,13 @@ static bool rtx_mint(const char *label, const char *scopes, long long ttl,
     (void)json_push_kv_int(&c.input, "ttl_seconds", ttl);
     zcl_native_handle_fleet_steer_grant(&c.request, &c.reply);
     ok = rtx_ok(&c);
-    if (ok && id)
-        (void)snprintf(id, cap, "%s", rtx_reply_str(&c, "id"));
+    if (ok) {
+        /* Remember the stamp before the id goes out of scope: callers that
+         * do not want the id still deliver rows under this label. */
+        rtx_ident_put(label, rtx_reply_str(&c, "id"));
+        if (id)
+            (void)snprintf(id, cap, "%s", rtx_reply_str(&c, "id"));
+    }
     rtx_end(&c);
     return ok;
 }
@@ -173,6 +232,9 @@ static bool rtx_mint_expired(const char *label)
                   "{\"id\":\"%s\",\"scopes\":\"send\",\"created\":1,"
                   "\"expires\":2,\"revoked\":\"0\",\"label\":\"%s\"}\n",
                   "00000000000000000000000000000001", label);
+    /* Its rows stamp like any other grant's: the case is about expiry, so
+     * the stamp must not be what refuses it. */
+    rtx_ident_put(label, "00000000000000000000000000000001");
     return fclose(f) == 0;
 }
 
@@ -346,9 +408,10 @@ static void rtx_opts_ws(struct rcv_drive_opts *o, const char *workspace)
  * sits under the checkout, so the rig writes the inbox file the way a
  * transport does — which is also the only way a peer's directive ever
  * arrives. */
-static bool rtx_deliver_as(const char *stream, const char *peer,
-                           const char *to, const char *ref, const char *body,
-                           long long seq)
+static bool rtx_deliver_bound(const char *stream, const char *peer,
+                              const char *to, const char *ref,
+                              const char *body, long long seq,
+                              const char *binding)
 {
     char dir[1200], path[1400], esc[8192];
     size_t o = 0;
@@ -385,13 +448,27 @@ static bool rtx_deliver_as(const char *stream, const char *peer,
      * by (ts, from, seq), and two separately delivered rows are two rows
      * even when they carry the same stream sequence. */
     g_rtx_ts++;
+    /* An empty binding writes no field at all, which is exactly the shape
+     * of a row no credential stamped. */
     (void)fprintf(f,
                   "{\"seq\":%lld,\"ts\":\"2026-09-17T00:%02d:%02dZ\","
                   "\"from\":\"%s\",\"to\":\"%s\",\"kind\":\"directive\","
-                  "\"body\":\"%s\",\"ref\":\"%s\"}\n",
+                  "\"body\":\"%s\",\"ref\":\"%s\"",
                   seq, (int)(g_rtx_ts / 60) % 60, (int)(g_rtx_ts % 60), peer,
                   to, esc, ref);
+    if (binding && binding[0])
+        (void)fprintf(f, ",\"sender_binding\":\"%s\"", binding);
+    (void)fprintf(f, "}\n");
     return fclose(f) == 0;
+}
+
+/* One peer's row, stamped the way that peer's own credential stamps it. */
+static bool rtx_deliver_as(const char *stream, const char *peer,
+                           const char *to, const char *ref, const char *body,
+                           long long seq)
+{
+    return rtx_deliver_bound(stream, peer, to, ref, body, seq,
+                             rtx_ident_binding(peer));
 }
 
 /* The common case: one peer writing its own stream. */
@@ -584,6 +661,88 @@ int test_devagent_receive(void)
         ASSERT_EQ(rtx_answers("job-rv", "STEER_GRANT_REVOKED"), 1);
         /* Nothing was written under any refused ref. */
         ASSERT(!rtx_exists("receive/brief/job-ug.brief"));
+        rtx_restore();
+        PASS();
+    }
+
+    /* Proven live on 2026-09-17: a directive sent with one grant's bearer
+     * token while claiming another grant's label got PAST this gate and was
+     * refused only by the direction parser after it — the sender check had
+     * passed on the claimed name alone. Both halves of the close are here:
+     * a stamp that belongs to a different credential, and no stamp at all. */
+    TEST("a row stamped by another credential is not the sender it claims")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char body[4096], actor[64];
+        rtx_isolate("impersonation");
+        rtx_direction(body, sizeof(body), "hex_codec", "Do it.");
+        /* Two live send-capable identities. The victim is a real sender
+         * with real authority here; that is the point. */
+        ASSERT(rtx_mint("victim", "send", 3600, NULL, 0));
+        ASSERT(rtx_mint("actor", "send", 3600, actor, sizeof(actor)));
+        /* The actor's own stamp, under the victim's name. */
+        {
+            char stamp[ZCL_FLEET_STEER_BINDING_HEX + 1];
+            ASSERT(zcl_fleet_steer_sender_binding(actor, "actor", stamp,
+                                                  sizeof(stamp)));
+            ASSERT(rtx_deliver_bound("actor", "victim", "box-a", "job-imp",
+                                     body, 1, stamp));
+        }
+        /* A stamp lifted onto a name it was not minted for is refused the
+         * same way: the name is folded into the stamp. */
+        {
+            char stamp[ZCL_FLEET_STEER_BINDING_HEX + 1];
+            ASSERT(zcl_fleet_steer_sender_binding(actor, "victim", stamp,
+                                                  sizeof(stamp)));
+            ASSERT(rtx_deliver_bound("actor", "victim", "box-a", "job-lift",
+                                     body, 2, stamp));
+        }
+        /* The victim itself still gets through: this refuses impersonation,
+         * not the sender. */
+        ASSERT(rtx_deliver("victim", "box-a", "job-real", body, 3));
+        rtx_opts(&o, 1);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.seen, 3);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(st.refused, 2);
+        ASSERT_EQ(rtx_answers("job-imp", "RECEIVE_SENDER_UNGRANTED"), 1);
+        ASSERT_EQ(rtx_answers("job-imp", "STEER_GRANT_BINDING"), 1);
+        ASSERT_EQ(rtx_answers("job-lift", "RECEIVE_SENDER_UNGRANTED"), 1);
+        /* No queue row, no brief, nothing dispatched under the claimed
+         * name: the refusal happens before any of it exists. */
+        ASSERT_EQ(rtx_queue_count("queued", "job-imp"), 0);
+        ASSERT_EQ(rtx_queue_count("queued", "job-lift"), 0);
+        ASSERT(!rtx_exists("receive/brief/job-imp.brief"));
+        ASSERT(!rtx_exists("receive/brief/job-lift.brief"));
+        ASSERT_EQ(rtx_queue_count("queued", "job-real"), 1);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("a row no credential stamped is unattributable, and refused")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char body[4096];
+        rtx_isolate("unbound");
+        rtx_direction(body, sizeof(body), "hex_codec", "Do it.");
+        /* The sender is live, send-capable and named exactly right. The
+         * row simply proves nothing about who wrote it, and work is
+         * dispatched on the strength of who asked. */
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        ASSERT(rtx_deliver_bound("chatgpt", "chatgpt", "box-a", "job-nb",
+                                 body, 1, ""));
+        rtx_opts(&o, 1);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.seen, 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.refused, 1);
+        ASSERT_EQ(rtx_answers("job-nb", "RECEIVE_SENDER_UNBOUND"), 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-nb"), 0);
+        ASSERT(!rtx_exists("receive/brief/job-nb.brief"));
         rtx_restore();
         PASS();
     }

@@ -48,6 +48,10 @@
 #define FMX_EVIDENCE_PATH "fleet.steer.evidence"
 #define FMX_GRANT_PATH "fleet.steer.grant"
 
+/* The sender every plain fixture grant is minted under. A grant's label IS
+ * its sender identity now, so a fixture that mints one has named one. */
+#define FMX_SENDER "steer-caller"
+
 /* ── isolated state root (this group owns its own rig) ─────────────────── */
 
 static char g_fmx_state[1024];
@@ -223,8 +227,10 @@ static bool fmx_missing_has(const struct fmx_call *c, const char *source)
     return false;
 }
 
-/* Mint a grant through the real leaf; copies the id out before freeing. */
-static bool fmx_mint(const char *scopes, char *id_out, size_t id_cap)
+/* Mint a grant through the real leaf under an explicit sender label;
+ * copies the id out before freeing. */
+static bool fmx_mint_as(const char *scopes, const char *label, char *id_out,
+                        size_t id_cap)
 {
     struct fmx_call g;
     const char *id;
@@ -232,6 +238,8 @@ static bool fmx_mint(const char *scopes, char *id_out, size_t id_cap)
     fmx_begin(&g, FMX_GRANT_PATH, "zcl.fleet_steer_grant.v1");
     (void)json_push_kv_str(&g.input, "action", "mint");
     (void)json_push_kv_str(&g.input, "scopes", scopes);
+    if (label)
+        (void)json_push_kv_str(&g.input, "label", label);
     if (!fmx_run(&g, zcl_native_handle_fleet_steer_grant) || !fmx_ok(&g)) {
         fmx_end(&g);
         return false;
@@ -243,6 +251,12 @@ static bool fmx_mint(const char *scopes, char *id_out, size_t id_cap)
     }
     fmx_end(&g);
     return ok;
+}
+
+/* The ordinary fixture grant: one live credential speaking as FMX_SENDER. */
+static bool fmx_mint(const char *scopes, char *id_out, size_t id_cap)
+{
+    return fmx_mint_as(scopes, FMX_SENDER, id_out, id_cap);
 }
 
 /* One send item object. */
@@ -257,28 +271,29 @@ static void fmx_item(struct json_value *item, const char *to,
     (void)json_push_kv_str(item, "idempotency_key", key);
 }
 
-/* Send one batch through the real leaf. Caller frees items/out. */
-static bool fmx_send(struct fmx_call *c, const char *grant,
-                     struct json_value *items)
-{
-    fmx_begin(c, FMX_SEND_PATH, "zcl.fleet_steer_send.v1");
-    if (grant)
-        (void)json_push_kv_str(&c->input, "grant", grant);
-    (void)json_push_kv(&c->input, "items", items);
-    return fmx_run(c, zcl_native_handle_fleet_steer_send);
-}
-
 /* Send one batch under an explicit sender name, so a case can address a
- * reply row back at the sender the way a real recipient would. */
+ * reply row back at the sender the way a real recipient would — and so a
+ * case can claim a name its credential does not carry. A NULL `from`
+ * states no sender at all. */
 static bool fmx_send_from(struct fmx_call *c, const char *grant,
                           const char *from, struct json_value *items)
 {
     fmx_begin(c, FMX_SEND_PATH, "zcl.fleet_steer_send.v1");
     if (grant)
         (void)json_push_kv_str(&c->input, "grant", grant);
-    (void)json_push_kv_str(&c->input, "from", from);
+    if (from)
+        (void)json_push_kv_str(&c->input, "from", from);
     (void)json_push_kv(&c->input, "items", items);
     return fmx_run(c, zcl_native_handle_fleet_steer_send);
+}
+
+/* Send one batch through the real leaf, speaking as the fixture grant's own
+ * label — the honest case, which is what most cases here are about. Caller
+ * frees items/out. */
+static bool fmx_send(struct fmx_call *c, const char *grant,
+                     struct json_value *items)
+{
+    return fmx_send_from(c, grant, grant ? FMX_SENDER : NULL, items);
 }
 
 static void fmx_brief(struct fmx_call *c, const char *grant, long long since)
@@ -1325,6 +1340,228 @@ _test_next:;
     return failures;
 }
 
+/* The sender binding stamped on the mail row under `ref`, or "" when the
+ * row carries none. Read through the real mail leaf, never by parsing a
+ * path, so the field has to survive post and pull to be seen here. */
+static void fmx_row_binding(const char *ref, char *out, size_t cap)
+{
+    struct fmx_call p;
+    const struct json_value *rows;
+    out[0] = '\0';
+    fmx_begin(&p, "dev.agent.mail", "zcl.agent_mail.v1");
+    (void)json_push_kv_str(&p.input, "action", "pull");
+    (void)json_push_kv_int(&p.input, "since", 0);
+    zcl_native_handle_dev_agent_mail(&p.request, &p.reply);
+    rows = fmx_ok(&p) ? fmx_arr(&p, "rows") : NULL;
+    if (rows) {
+        size_t n = json_size(rows), i;
+        for (i = 0; i < n; i++) {
+            const struct json_value *r = json_at(rows, i);
+            const struct json_value *f = r ? json_get(r, "ref") : NULL;
+            const struct json_value *b =
+                r ? json_get(r, "sender_binding") : NULL;
+            if (!f || f->type != JSON_STR ||
+                strcmp(json_get_str(f), ref) != 0)
+                continue;
+            if (b && b->type == JSON_STR && json_get_str(b))
+                (void)snprintf(out, cap, "%s", json_get_str(b));
+        }
+    }
+    fmx_end(&p);
+}
+
+/* What one claimed send answered. `code` is the batch refusal code, or ""
+ * when the batch passed; `items` records whether per-item outcomes came
+ * back at all, which is how a case tells a batch refused outright from one
+ * that reached the items — a reconcile is an item-level answer. */
+struct fmx_claim_out {
+    char code[64];
+    bool items;
+};
+
+/* One directive under `ref`, sent with `grant` while claiming `from`. */
+static void fmx_claim(const char *grant, const char *from, const char *ref,
+                      const char *key, struct fmx_claim_out *o)
+{
+    struct fmx_call c;
+    struct json_value items, item;
+    memset(o, 0, sizeof(*o));
+    json_init(&items);
+    json_set_array(&items);
+    fmx_item(&item, "field-agent", "check the water pump", ref, key);
+    (void)json_push_back(&items, &item);
+    json_free(&item);
+    if (fmx_send_from(&c, grant, from, &items)) {
+        if (!fmx_ok(&c))
+            (void)snprintf(o->code, sizeof(o->code), "%s",
+                           c.reply.error.code);
+        o->items = fmx_arr(&c, "items") != NULL;
+    }
+    fmx_end(&c);
+    json_free(&items);
+}
+
+/* ── the sender is the credential, not the claim ────────────────────────
+ *
+ * Proven live on the public endpoint 2026-09-17: one grant labelled
+ * "impersonation-probe" successfully sent as itself, as "A", as
+ * "acceptance-20260917" and as "owner", and the receiver dispatched on the
+ * claimed name. Each case below is one of those doors, closed. */
+static int fmx_t_sender_binding(void)
+{
+    int failures = 0;
+
+    TEST("steer: a grant sends as its own label and stamps the row") {
+        struct fmx_claim_out o;
+        char gid[64], bind[80], want[80];
+        fmx_isolate("sender_own");
+        ASSERT(fmx_mint_as("send", "steer-victim", gid, sizeof(gid)));
+        fmx_claim(gid, "steer-victim", "own-a", "k-own-a", &o);
+        ASSERT_STR_EQ(o.code, "");
+        ASSERT_EQ(fmx_mail_count(), 1);
+        /* The stamp is on the row, it is this grant's own, and it is not
+         * the grant id: a mail row crosses hosts and the id is the bearer
+         * secret. */
+        fmx_row_binding("own-a", bind, sizeof(bind));
+        ASSERT_EQ((long long)strlen(bind),
+                  (long long)ZCL_FLEET_STEER_BINDING_HEX);
+        ASSERT(strcmp(bind, gid) != 0);
+        ASSERT(zcl_fleet_steer_sender_binding(gid, "steer-victim", want,
+                                              sizeof(want)));
+        ASSERT_STR_EQ(bind, want);
+        fmx_restore();
+        PASS();
+    }
+
+    TEST("steer: a grant claiming another sender is refused, not rewritten") {
+        struct fmx_claim_out o;
+        char victim[64], actor[64];
+        fmx_isolate("sender_impersonation");
+        ASSERT(fmx_mint_as("send", "steer-victim", victim, sizeof(victim)));
+        ASSERT(fmx_mint_as("send", "steer-actor", actor, sizeof(actor)));
+        /* Both identities exist. The question is never whether the victim
+         * exists — it is whether the actor may speak as it. */
+        fmx_claim(actor, "steer-victim", "imp-a", "k-imp-a", &o);
+        ASSERT_STR_EQ(o.code, "STEER_SENDER_MISMATCH");
+        ASSERT(!o.items);
+        ASSERT_EQ(fmx_mail_count(), 0);
+        /* Rewriting the claim to the credential's own name would have
+         * posted a row and told the caller nothing. The same actor sending
+         * as itself is accepted, so what was refused is the claim. */
+        fmx_claim(actor, "steer-actor", "act-a", "k-act-a", &o);
+        ASSERT_STR_EQ(o.code, "");
+        ASSERT_EQ(fmx_mail_count(), 1);
+        fmx_restore();
+        PASS();
+    }
+
+    TEST("steer: a bearer stating no sender is refused, never defaulted") {
+        struct fmx_claim_out o;
+        char gid[64];
+        fmx_isolate("sender_absent");
+        ASSERT(fmx_mint_as("send", "steer-victim", gid, sizeof(gid)));
+        fmx_claim(gid, NULL, "abs-a", "k-abs-a", &o);
+        ASSERT_STR_EQ(o.code, "STEER_SENDER_UNSTATED");
+        ASSERT(!o.items);
+        ASSERT_EQ(fmx_mail_count(), 0);
+        fmx_restore();
+        PASS();
+    }
+
+    TEST("steer: a grant minted without a label names no sender") {
+        struct fmx_claim_out o;
+        char gid[64];
+        fmx_isolate("sender_unlabelled");
+        ASSERT(fmx_mint_as("send", NULL, gid, sizeof(gid)));
+        fmx_claim(gid, "steer-victim", "unl-a", "k-unl-a", &o);
+        ASSERT_STR_EQ(o.code, "STEER_GRANT_UNLABELLED");
+        ASSERT_EQ(fmx_mail_count(), 0);
+        fmx_restore();
+        PASS();
+    }
+
+    TEST("steer: a replay under another sender is refused before reconcile") {
+        struct fmx_claim_out o;
+        char victim[64], actor[64], bind[80], want[80];
+        fmx_isolate("sender_replay");
+        ASSERT(fmx_mint_as("send", "steer-victim", victim, sizeof(victim)));
+        ASSERT(fmx_mint_as("send", "steer-actor", actor, sizeof(actor)));
+        fmx_claim(victim, "steer-victim", "rep-a", "k-rep", &o);
+        ASSERT_STR_EQ(o.code, "");
+        ASSERT_EQ(fmx_mail_count(), 1);
+        /* The same idempotency key under a different claimed sender.
+         * Reconcile would answer with the victim's recorded accept and let
+         * the actor inherit the victim's row, so the binding has to refuse
+         * before idempotency is consulted at all. */
+        fmx_claim(actor, "steer-victim", "rep-a", "k-rep", &o);
+        ASSERT_STR_EQ(o.code, "STEER_SENDER_MISMATCH");
+        /* No per-item answer means no reconcile was reached: a duplicate
+         * would have come back as an item carrying duplicate:true. */
+        ASSERT(!o.items);
+        ASSERT_EQ(fmx_mail_count(), 1);
+        /* And nothing was inherited: the one row still carries the
+         * victim's own stamp. */
+        fmx_row_binding("rep-a", bind, sizeof(bind));
+        ASSERT(zcl_fleet_steer_sender_binding(victim, "steer-victim", want,
+                                              sizeof(want)));
+        ASSERT_STR_EQ(bind, want);
+        fmx_restore();
+        PASS();
+    }
+
+    TEST("steer: revoked, wrong-scope and malformed senders keep their codes") {
+        struct fmx_claim_out o;
+        char gid[64], evidence[64];
+        fmx_isolate("sender_existing_refusals");
+        ASSERT(fmx_mint_as("send", "steer-victim", gid, sizeof(gid)));
+        /* A malformed name is malformed whatever credential carries it,
+         * and is not reported as an impersonation. */
+        fmx_claim(gid, "../../etc/passwd", "mal-a", "k-mal", &o);
+        ASSERT_STR_EQ(o.code, "BAD_INPUT");
+        ASSERT_EQ(fmx_mail_count(), 0);
+        /* Scope is authority too, and it still refuses before identity. */
+        ASSERT(fmx_mint_as("evidence", "steer-evidence-only", evidence,
+                           sizeof(evidence)));
+        fmx_claim(evidence, "steer-evidence-only", "scope-a", "k-scope", &o);
+        ASSERT_STR_EQ(o.code, "STEER_GRANT_SCOPE");
+        /* A dead credential speaks for nobody, not even for itself. */
+        {
+            struct fmx_call r;
+            fmx_begin(&r, FMX_GRANT_PATH, "zcl.fleet_steer_grant.v1");
+            (void)json_push_kv_str(&r.input, "action", "revoke");
+            (void)json_push_kv_str(&r.input, "id", gid);
+            ASSERT(fmx_run(&r, zcl_native_handle_fleet_steer_grant));
+            ASSERT(fmx_ok(&r));
+            fmx_end(&r);
+        }
+        fmx_claim(gid, "steer-victim", "rev-a", "k-rev", &o);
+        ASSERT_STR_EQ(o.code, "STEER_GRANT_REVOKED");
+        ASSERT_EQ(fmx_mail_count(), 0);
+        fmx_restore();
+        PASS();
+    }
+
+    TEST("steer: the local operator sends as itself, with no grant stamp") {
+        struct fmx_claim_out o;
+        char bind[80];
+        fmx_isolate("sender_operator");
+        /* No grant: dispatch already gated this on AUTH_OPERATOR and the
+         * sender is the operator. The row carries no grant stamp, which is
+         * exactly why a receiver will not dispatch work on it. */
+        fmx_claim(NULL, "steer-operator", "op-a", "k-op", &o);
+        ASSERT_STR_EQ(o.code, "");
+        ASSERT_EQ(fmx_mail_count(), 1);
+        fmx_row_binding("op-a", bind, sizeof(bind));
+        ASSERT_STR_EQ(bind, "");
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
 static int fmx_t_board_absent(void)
 {
     int failures = 0;
@@ -1366,6 +1603,7 @@ int test_fleet_steer(void)
     failures += fmx_t_grants();
     failures += fmx_t_revoke_cancels_queued();
     failures += fmx_t_ref_grammar();
+    failures += fmx_t_sender_binding();
     failures += fmx_t_board_absent();
 
     /* No ASSERT lives in this function, so no goto needs the label: the

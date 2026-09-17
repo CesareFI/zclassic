@@ -34,6 +34,17 @@
  *     a revoked flag and a label. Expired, revoked, unknown or
  *     insufficient-scope grants fail closed with STEER_GRANT_* — writes are
  *     never disguised as reads, and no credential is ever echoed back.
+ *
+ * SENDER IDENTITY. `from` is not caller authority. On the bearer path the
+ * sender IS the grant's label: `from` must be stated and must agree
+ * (STEER_SENDER_UNSTATED / STEER_SENDER_MISMATCH), and an unlabelled grant
+ * names no sender (STEER_GRANT_UNLABELLED). The check runs once for the
+ * whole batch BEFORE idempotency, so no reconcile can hand one party
+ * another party's row. Each posted row carries the grant's binding beside
+ * the name, and the receiver admits on that binding rather than on the
+ * name, so holding one send-capable grant no longer lets anyone speak as
+ * anyone. On the operator path the sender is the local operator and the
+ * row carries no binding.
  * This adapter is NOT wallet authority (see agent_session for spend grants)
  * and NOT fleet key roles (see fleet.roles grant/revoke/check, which govern
  * fleet leaves by key fingerprint and need node delegation to mint). It
@@ -113,6 +124,7 @@
 #include "platform/private_directory.h"
 #include "platform/state_root.h"
 #include "platform/time_compat.h"
+#include "sha3/sha3.h"
 #include "util/log_macros.h"
 
 #include <ctype.h>
@@ -453,14 +465,18 @@ static bool fmc_grant_find(const char *path, const char *id,
     return found;
 }
 
-/* Validate a presented bearer for one verb scope. NULL/empty grant means
- * the local operator path, which dispatch already authorized. */
-static const char *fmc_grant_check(const char *grant, const char *scope)
+/* Validate a presented bearer for one verb scope and hand back the row it
+ * named. NULL/empty grant means the local operator path, which dispatch
+ * already authorized; `row` is then left zeroed and the caller reads the
+ * operator identity, never a grant. */
+static const char *fmc_grant_check_row(const char *grant, const char *scope,
+                                       struct fmc_grant *row)
 {
     char steerdir[4096], path[4096 + 32];
     struct fmc_grant g;
     time_t now;
     int n;
+    memset(row, 0, sizeof(*row));
     if (!grant || !grant[0])
         return NULL;
     if (!scope || !scope[0])
@@ -481,21 +497,33 @@ static const char *fmc_grant_check(const char *grant, const char *scope)
         return "STEER_GRANT_EXPIRED";
     if (!fmc_scope_has(g.scopes, scope))
         return "STEER_GRANT_SCOPE";
+    *row = g;
     return NULL;
 }
 
-/* ── live grant lookup BY LABEL (shared admission helper) ────────────────
+/* The same check when the caller needs only the verdict. */
+static const char *fmc_grant_check(const char *grant, const char *scope)
+{
+    struct fmc_grant g;
+    return fmc_grant_check_row(grant, scope, &g);
+}
+
+/* ── live grant lookup BY BINDING (shared admission helper) ──────────────
  *
  * The resident mail receiver (tools/command/native_devagent_receive.c) has
- * to decide whether an owner-minted grant NAMES a sender. That is this
- * store's question, so it is answered here rather than duplicated there: no
- * second permission system, no second credential file, no second store.
+ * to decide whether a directive row really came from the sender it names.
+ * That is this store's question, so it is answered here rather than
+ * duplicated there: no second permission system, no second credential file,
+ * no second store.
  *
- * A label is the human name the owner minted the grant under. It is NOT a
- * credential and is never accepted in place of one: this lookup grants no
- * fleet.steer verb to anybody. It answers only "does a live grant carry
- * this label with this scope", which is the fact a receiver needs to decide
- * whether the owner has named a sender at all.
+ * WHY A BINDING AND NOT A LABEL. A label is the human name the owner minted
+ * a grant under, and a label inside a row is only a claim: anything that can
+ * write a row can write any name into it. Asking "does SOME live grant carry
+ * this label" therefore admitted any sender who held any send-capable grant
+ * to speak as any other — proven live on 2026-09-17, where one probe grant
+ * successfully claimed four different senders. The question asked here is
+ * the binding one: "did the grant that carries this label stamp this exact
+ * row", which only a holder of that grant's id can answer.
  *
  * grants.jsonl is re-read on every call, so a revoke takes effect on the
  * next check. Fail-closed: the reason of the closest matching row is
@@ -555,8 +583,50 @@ static const char *fmc_grant_row_verdict(const struct fmc_grant *g,
     return NULL;
 }
 
-const char *zcl_fleet_steer_grant_label_live(const char *label,
-                                             const char *scope)
+/* The stamp one grant writes on the rows it sends: SHA3-256 over the grant
+ * id and the label it speaks under, printed as the first 32 hex digits.
+ *
+ * It is derived from the id and is NEVER the id: the id is the bearer
+ * secret, and a mail row crosses hosts, is pulled by every reader of the
+ * maildir, and is quoted in evidence. A digest lets a receiver holding the
+ * store recompute the same value and compare, while a reader of the row
+ * learns nothing that lets it send. The label is folded in so one grant's
+ * stamp cannot be lifted onto a different name. */
+bool zcl_fleet_steer_sender_binding(const char *grant_id, const char *label,
+                                    char *out, size_t cap)
+{
+    struct sha3_256_ctx ctx;
+    unsigned char sum[SHA3_256_OUTPUT_SIZE];
+    size_t i;
+    if (!grant_id || !grant_id[0] || !label || !label[0] || !out ||
+        cap <= ZCL_FLEET_STEER_BINDING_HEX)
+        return false;
+    sha3_256_init(&ctx);
+    sha3_256_write(&ctx, (const unsigned char *)"z23.steer.sender.v1", 19u);
+    sha3_256_write(&ctx, (const unsigned char *)grant_id,
+                   strlen(grant_id) + 1u);
+    sha3_256_write(&ctx, (const unsigned char *)label, strlen(label) + 1u);
+    sha3_256_finalize(&ctx, sum);
+    for (i = 0; i < (size_t)ZCL_FLEET_STEER_BINDING_HEX / 2u; i++)
+        (void)snprintf(out + i * 2u, 3u, "%02x", sum[i]);
+    out[ZCL_FLEET_STEER_BINDING_HEX] = '\0';
+    return true;
+}
+
+/* True when this row's stamp is the one this grant writes. Compared over
+ * the full fixed width so a truncated or padded stamp can never match. */
+static bool fmc_binding_is(const struct fmc_grant *g, const char *label,
+                           const char *binding)
+{
+    char want[ZCL_FLEET_STEER_BINDING_HEX + 1];
+    if (!zcl_fleet_steer_sender_binding(g->id, label, want, sizeof(want)))
+        return false;
+    return strcmp(want, binding) == 0;
+}
+
+const char *zcl_fleet_steer_grant_binding_live(const char *label,
+                                               const char *binding,
+                                               const char *scope)
 {
     char root[4096], path[4096 + 32];
     struct fmc_grant_set set;
@@ -566,6 +636,10 @@ const char *zcl_fleet_steer_grant_label_live(const char *label,
     int n;
     if (!label || !label[0] || !scope || !scope[0])
         return "STEER_GRANT_SCOPE";
+    /* An unattributable row is refused, never admitted: without a stamp
+     * there is nothing here to check the claimed name against. */
+    if (!binding || strlen(binding) != ZCL_FLEET_STEER_BINDING_HEX)
+        return "STEER_GRANT_BINDING";
     /* Deliberately NOT fmc_dirs(): a caller answering a read-only status
      * question must not create the steer directory as a side effect. */
     if (!platform_state_root(root, sizeof(root)))
@@ -580,7 +654,12 @@ const char *zcl_fleet_steer_grant_label_live(const char *label,
         const char *row;
         if (strcmp(set.g[i].label, label) != 0)
             continue;
+        /* The label matched, so this row is at least ABOUT the claimed
+         * sender: report its liveness reason rather than a bare unknown,
+         * and only then ask whether it is the grant that stamped this row. */
         row = fmc_grant_row_verdict(&set.g[i], scope, now);
+        if (!row && !fmc_binding_is(&set.g[i], label, binding))
+            row = "STEER_GRANT_BINDING";
         if (!row)
             return NULL;
         why = row;
@@ -591,8 +670,13 @@ const char *zcl_fleet_steer_grant_label_live(const char *label,
 /* ── idempotency store ─────────────────────────────────────────────────── */
 
 /* Payload digest: FNV-1a/64 over to, body, ref, from with NUL separators.
- * An equality check for reconcile, not a security boundary (the grant is
- * the boundary); fixed-size hex keeps sent.jsonl lines flat and greppable. */
+ * An equality check for reconcile and nothing more; fixed-size hex keeps
+ * sent.jsonl lines flat and greppable. It is NOT what keeps one sender out
+ * of another's rows — the digest is reached only after the sender has been
+ * bound to its credential, and `from` is by then the grant's own label
+ * rather than a caller's claim. Folding a claim into a digest was never a
+ * boundary: two parties presenting one key simply disagreed about who they
+ * were, and the reconcile handed the second one the first one's row. */
 static void fmc_payload_sum(const char *to, const char *body,
                             const char *ref, const char *from,
                             char out[17])
@@ -1597,14 +1681,93 @@ static void fmc_do_brief(const struct zcl_command_request *req,
  * posts nothing. Per-item outcomes; the batch fails outright only on bad
  * batch input or a bad grant. */
 
+/* ── who this call is ────────────────────────────────────────────────────
+ *
+ * The sender identity is decided by the credential that carried the
+ * request, never by a field inside it. Before 2026-09-17 `from` was taken
+ * at its word: one grant could claim any name, and the receiver admitted on
+ * that name alone. The two paths now are:
+ *
+ *   Remote bearer. The sender IS the label the owner minted the grant
+ *   under. `from` must be stated and must agree with it, and a
+ *   disagreement is REFUSED (STEER_SENDER_MISMATCH) rather than quietly
+ *   rewritten: silently correcting the claim would hide an impersonation
+ *   attempt in progress, and the caller is entitled to know its claim was
+ *   rejected. An omitted `from` is refused too (STEER_SENDER_UNSTATED) and
+ *   never defaulted — a default would attribute work to whatever name the
+ *   box happens to answer to. A grant minted without a label names no
+ *   sender at all and cannot send (STEER_GRANT_UNLABELLED).
+ *
+ *   Local operator. No `grant` key; dispatch already gated the leaf on
+ *   AUTH_OPERATOR. The identity is the operator's own — the name it gave,
+ *   or the one dev.agent.mail resolves for this box — and the row carries
+ *   no grant binding, because no grant carried the request. A receiver
+ *   that requires a binding therefore refuses it: to steer a receiver the
+ *   operator mints a grant like every other sender, which is what the
+ *   receiver has always required of a named sender anyway.
+ *
+ * Either way the shape of a caller-supplied name is checked first, so
+ * garbage stays BAD_INPUT instead of being reported as an impersonation. */
+
+struct fmc_sender {
+    /* The name the row is stamped with. Empty only on the operator path
+     * with no name given, where the mail sibling resolves this box's own. */
+    char from[FMC_NAME_MAX + 1];
+    /* The grant's stamp, or "" on the operator path. */
+    char binding[ZCL_FLEET_STEER_BINDING_HEX + 1];
+};
+
+/* The name to hand the mail sibling: NULL keeps its own default, which is
+ * the operator identity and is reachable only on the operator path. */
+static const char *fmc_sender_name(const struct fmc_sender *s)
+{
+    return s->from[0] ? s->from : NULL;
+}
+
+/* Resolve the sender from the credential. NULL admits; otherwise the typed
+ * refusal code for the whole batch — an identity is a property of the call,
+ * not of one item. */
+static const char *fmc_sender_resolve(const struct zcl_command_request *req,
+                                      struct fmc_sender *s)
+{
+    const char *claimed = fmc_str(req, "from");
+    const char *grant = fmc_str(req, "grant");
+    struct fmc_grant g;
+    memset(s, 0, sizeof(*s));
+    if (claimed && claimed[0] && !fmc_is_token(claimed, FMC_NAME_MAX, false))
+        return "BAD_INPUT";
+    if (claimed)
+        (void)snprintf(s->from, sizeof(s->from), "%s", claimed);
+    if (!grant || !grant[0])
+        return NULL; /* the operator, speaking as itself */
+    /* fmc_enter already admitted this grant for the send scope; this
+     * re-read only asks the store who the holder is. */
+    if (fmc_grant_check_row(grant, "send", &g))
+        return "STEER_GRANT_UNKNOWN";
+    if (!g.label[0])
+        return "STEER_GRANT_UNLABELLED";
+    if (!s->from[0])
+        return "STEER_SENDER_UNSTATED";
+    if (strcmp(s->from, g.label) != 0)
+        return "STEER_SENDER_MISMATCH";
+    (void)snprintf(s->from, sizeof(s->from), "%s", g.label);
+    if (!zcl_fleet_steer_sender_binding(g.id, g.label, s->binding,
+                                        sizeof(s->binding)))
+        return "STEER_SENDER_UNBINDABLE";
+    return NULL;
+}
+
 /* Encode one mail-post input object. Escaped fields keep caller quotes
  * from breaking the JSON seam; the mail sibling still runs its own
- * refusal scanners. False when any budget runs out. */
+ * refusal scanners. The binding rides the row beside the name so the
+ * receiver can check who actually sent it. False when any budget runs
+ * out. */
 static bool fmc_post_input(char *input, size_t cap, const char *to,
                            const char *body, const char *ref,
-                           const char *from)
+                           const struct fmc_sender *s)
 {
     char eto[128], ebody[4096], eref[256], efrom[128];
+    const char *from = fmc_sender_name(s);
     int n;
     if (!input || cap == 0 || !to || !body)
         return false;
@@ -1614,13 +1777,14 @@ static bool fmc_post_input(char *input, size_t cap, const char *to,
         return false;
     if (!fmc_escape(ref ? ref : "", eref, sizeof(eref)))
         return false;
-    if (from && from[0]) {
+    if (from) {
         if (!fmc_escape(from, efrom, sizeof(efrom)))
             return false;
         n = snprintf(input, cap,
                      "{\"action\":\"post\",\"to\":\"%s\",\"kind\":\"directive\","
-                     "\"body\":\"%s\",\"ref\":\"%s\",\"from\":\"%s\"}",
-                     eto, ebody, eref, efrom);
+                     "\"body\":\"%s\",\"ref\":\"%s\",\"from\":\"%s\","
+                     "\"sender_binding\":\"%s\"}",
+                     eto, ebody, eref, efrom, s->binding);
     } else {
         n = snprintf(input, cap,
                      "{\"action\":\"post\",\"to\":\"%s\",\"kind\":\"directive\","
@@ -1635,7 +1799,8 @@ static bool fmc_post_input(char *input, size_t cap, const char *to,
  * is copied out before the sub reply is freed: it never points at it. */
 static long long fmc_post_directive(const struct zcl_command_request *req,
                                     const char *to, const char *body,
-                                    const char *ref, const char *from,
+                                    const char *ref,
+                                    const struct fmc_sender *s,
                                     char *why, size_t why_cap)
 {
     struct fmc_sub sub;
@@ -1643,7 +1808,7 @@ static long long fmc_post_directive(const struct zcl_command_request *req,
     long long seq;
     if (why && why_cap > 0)
         (void)snprintf(why, why_cap, "sibling_refused");
-    if (!fmc_post_input(input, sizeof(input), to, body, ref, from))
+    if (!fmc_post_input(input, sizeof(input), to, body, ref, s))
         return -1;
     fmc_sub_begin(&sub, "zcl.agent_mail.v1", req, "dev.agent.mail");
     if (!sub.valid) {
@@ -1763,6 +1928,7 @@ static void fmc_send_item_accept(struct json_value *items, size_t index,
                                  const char *sent_path, const char *from,
                                  const char *grant)
 {
+    /* `from` here is the resolved sender, never the caller's claim. */
     struct json_value item;
     char sent_line[4096];
     char sum[17];
@@ -1805,12 +1971,13 @@ static void fmc_send_item_accept(struct json_value *items, size_t index,
  * caller sums this to report `accepted` honestly. */
 static bool fmc_send_item(const struct zcl_command_request *req,
                           const struct json_value *it, size_t index,
-                          const char *from, const char *sent_path,
+                          const struct fmc_sender *s, const char *sent_path,
                           const char *grant, struct json_value *items)
 {
     struct fmc_item_fields f;
     long long seq;
     char why[64];
+    const char *from = fmc_sender_name(s);
     const char *shape_error = "BAD_INPUT";
     if (!fmc_send_item_fields(it, from, &f, &shape_error)) {
         const char *to =
@@ -1821,7 +1988,15 @@ static bool fmc_send_item(const struct zcl_command_request *req,
     /* Reconcile: same key AND same payload returns the recorded accept
      * with no second row. A different payload under a recorded key is
      * refused: the key names one exact delivery. A row without a digest
-     * predates digests and is unverifiable, never a match. */
+     * predates digests and is unverifiable, never a match.
+     *
+     * Every sender reaching this point has already been bound to its
+     * credential by fmc_sender_resolve(), which runs once for the whole
+     * batch before any of this. That order is deliberate: reconcile
+     * answers with somebody else's recorded row, so a second party
+     * presenting the same key under a different claimed name must be
+     * refused BEFORE it is consulted, or the reconcile path becomes the
+     * bypass the binding closed. */
     {
         char recorded[17], presented[17];
         if (fmc_sent_find(sent_path, f.key, &seq, recorded)) {
@@ -1840,8 +2015,7 @@ static bool fmc_send_item(const struct zcl_command_request *req,
         }
     }
     why[0] = '\0';
-    seq = fmc_post_directive(req, f.to, f.body, f.ref, from, why,
-                             sizeof(why));
+    seq = fmc_post_directive(req, f.to, f.body, f.ref, s, why, sizeof(why));
     if (seq < 0) {
         fmc_send_item_refused(items, index, f.to,
                               why[0] ? why : "POST_FAILED");
@@ -1857,8 +2031,9 @@ static void fmc_do_send(const struct zcl_command_request *req,
 {
     const struct json_value *v;
     const struct json_value *arr;
-    const char *from;
+    const char *refused;
     const char *grant;
+    struct fmc_sender sender;
     char steerdir[4096], sent_path[4096 + 32];
     struct json_value items;
     size_t n, i;
@@ -1876,7 +2051,17 @@ static void fmc_do_send(const struct zcl_command_request *req,
                  "batch bound");
         return;
     }
-    from = fmc_str(req, "from");
+    /* Identity first, before a single item is read: it decides who this
+     * call is, and every per-item answer below — including the recorded
+     * accept a reconcile would return — is attributed to the name it
+     * resolves. */
+    refused = fmc_sender_resolve(req, &sender);
+    if (refused) {
+        fmc_fail(reply, refused,
+                 "the sender is the grant's own label, stated and matching",
+                 "input.from against the presented grant");
+        return;
+    }
     grant = fmc_str(req, "grant");
     if (!fmc_dirs(steerdir, sizeof(steerdir))) {
         fmc_fail(reply, "STATE_DIR_FAILED",
@@ -1895,7 +2080,7 @@ static void fmc_do_send(const struct zcl_command_request *req,
         json_init(&items);
         json_set_array(&items);
         for (i = 0; i < n; i++) {
-            if (fmc_send_item(req, json_at(arr, i), i, from, sent_path,
+            if (fmc_send_item(req, json_at(arr, i), i, &sender, sent_path,
                               grant, &items))
                 accepted++;
         }
