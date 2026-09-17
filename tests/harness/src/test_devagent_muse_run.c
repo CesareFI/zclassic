@@ -225,9 +225,16 @@ static const char *mr_head_fail = "ALL TESTS FAILED";
 
 /* spawn_fake/close_fake live in the shared header for the adapter suite;
  * this file forks raw transports instead, so reference them to keep
- * -Wunused-function quiet without duplicating a line of harness. */
-static const void *mr_fake_lifecycle_refs[2] = {
-    (const void *)&spawn_fake, (const void *)&close_fake
+ * -Wunused-function quiet without duplicating a line of harness.
+ *
+ * Held as function pointers, not void *: ISO C does not define converting a
+ * function pointer to an object pointer, and this tree builds with
+ * -Werror=pedantic. Converting between function pointer TYPES is defined,
+ * and nothing here is ever called through the generic type, so the
+ * reference stays legal and the intent is unchanged. */
+typedef void (*mr_any_fn)(void);
+static const mr_any_fn mr_fake_lifecycle_refs[2] = {
+    (mr_any_fn)spawn_fake, (mr_any_fn)close_fake
 };
 
 static bool mr_hex40(const char *s)
