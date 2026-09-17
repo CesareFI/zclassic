@@ -43,7 +43,9 @@ int test_fleet_gateway(void)
 #include <errno.h>
 
 #define GW_TEST_BIN_DEFAULT "build/bin/z23-fleet-gateway"
-#define GW_TEST_NODE_DEFAULT "build/bin/z23"
+/* The CLI alias every node-exec group uses: a symlink to z23 in a checkout,
+ * the admitted node inside a proof generation (which has no build/bin/z23). */
+#define GW_TEST_NODE_DEFAULT "build/bin/zclassic23"
 #define GW_TEST_CAP (256u * 1024u)
 
 static pid_t g_gw_pid = -1;
@@ -114,6 +116,10 @@ static void gw_stop(void)
     g_gw_port = -1;
 }
 
+/* Head (status line + headers) of the most recent exchange, for header
+ * assertions such as the OAuth challenge. */
+static char g_gw_last_head[2048];
+
 /* One HTTP exchange over loopback. Returns the body (after the blank
  * line) malloc'd, with the status code out. NULL on transport failure. */
 static char *gw_exchange(const char *request, int *status)
@@ -124,6 +130,7 @@ static char *gw_exchange(const char *request, int *status)
     size_t cap = GW_TEST_CAP, n = 0;
     ssize_t r;
     *status = 0;
+    g_gw_last_head[0] = '\0';
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
         return NULL;
@@ -179,6 +186,8 @@ static char *gw_exchange(const char *request, int *status)
         free(buf);
         return NULL;
     }
+    snprintf(g_gw_last_head, sizeof(g_gw_last_head), "%.*s",
+             (int)(body - buf), buf);
     body += 4;
     {
         size_t blen = n - (size_t)(body - buf);
@@ -707,6 +716,12 @@ static int gw_t_oauth(void)
         ASSERT_EQ(st, 200);
         ASSERT(gw_body_has(b, "\"scopes_supported\""));
         ASSERT(gw_body_has(b, "bearer_methods_supported"));
+        free(b);
+        /* RFC 9728 path-suffixed form, which clients probe first. */
+        b = gw_get("/.well-known/oauth-protected-resource/steer", &st);
+        ASSERT(b != NULL);
+        ASSERT_EQ(st, 200);
+        ASSERT(gw_body_has(b, "/steer\""));
         free(b);
         b = gw_get("/.well-known/oauth-authorization-server", &st);
         ASSERT(b != NULL);
@@ -2067,6 +2082,17 @@ static int gw_t_auth(void)
         ASSERT(b != NULL);
         ASSERT(gw_body_has(b, "\"code\":-32001"));
         ASSERT(gw_body_has(b, "grant required"));
+        /* ...as a transport 401 challenge: the only refusal that makes a
+         * remote tool client start its OAuth sign-in. */
+        ASSERT_EQ(st, 401);
+        ASSERT(strstr(g_gw_last_head, "\r\nWWW-Authenticate: Bearer ") !=
+               NULL);
+        ASSERT(strstr(g_gw_last_head,
+                      "resource_metadata=\"http://127.0.0.1:") != NULL);
+        ASSERT(strstr(g_gw_last_head,
+                      "/.well-known/oauth-protected-resource\"") != NULL);
+        ASSERT(strstr(g_gw_last_head, "scope=\"brief send evidence\"") !=
+               NULL);
         free(b);
         /* Header credential alone: carried to the node, brief succeeds. */
         b = gw_post_auth("/steer",
@@ -2110,6 +2136,9 @@ static int gw_t_auth(void)
         ASSERT(b != NULL);
         ASSERT(gw_body_has(b, "\"code\":-32002"));
         ASSERT(gw_body_has(b, "bad grant credential"));
+        /* A malformed credential is not a sign-in prompt. */
+        ASSERT_EQ(st, 200);
+        ASSERT(strstr(g_gw_last_head, "WWW-Authenticate") == NULL);
         free(b);
         /* Unknown header credential: the node itself refuses it. */
         b = gw_post_auth("/steer",

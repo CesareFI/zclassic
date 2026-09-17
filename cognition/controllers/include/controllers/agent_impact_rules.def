@@ -3233,3 +3233,8 @@ AGENT_IMPACT_RULE("tools/command/native_dev_beta6_verify.c|tests/harness/src/tes
  * -paramsdir is configured, and the in-band accessor bootstrapstatus reads
  * to report params_served/its blocker. */
 AGENT_IMPACT_RULE("engine/composition/src/boot_beta6_bootstrap.c|engine/services/src/beta6_bootstrap_inband.c|engine/services/include/services/beta6_bootstrap.h|tests/harness/src/test_beta6_bootstrap.c", "beta6_bootstrap syncdiag_rpc make_lint_gates")
+/* The fleet steering gateway family: the loopback Streamable-HTTP gateway
+ * (OAuth + 401 challenge), its public TLS front, the exact-SHA qualify
+ * harness, and the user units it hosts under. The gateway forks the node's
+ * fleet.steer leaves per call, so a change here re-runs both groups. */
+AGENT_IMPACT_RULE("tools/fleet_gateway.c|tools/zcl_fleet_front.c|tools/scripts/qualify_fleet_gateway_front.sh|platform/deploy/fleet-gateway/*|tests/harness/src/test_fleet_gateway.c", "fleet_gateway fleet_steer make_lint_gates")

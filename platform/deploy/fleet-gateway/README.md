@@ -1,0 +1,165 @@
+<!-- Copyright 2026 Rhett Creighton. Licensed under Apache-2.0. -->
+
+# Fleet gateway hosting seam
+
+A hosted AI client (a Claude custom connector on web, desktop, or mobile)
+cannot reach a shell, an onion address, or the node's operator-private API.
+This directory is the minimal hosting seam that makes the existing
+`z23-fleet-gateway` reachable over public HTTPS without changing who
+enforces what:
+
+```text
+public HTTPS (:<front-port>) -> build/bin/zcl-fleet-front (TLS terminates,
+bytes preserved) -> loopback :<gw-port> z23-fleet-gateway (frozen /steer,
+Streamable HTTP) -> build/bin/z23 (node grant authority: scope, expiry,
+revocation per call)
+```
+
+The front is `tools/zcl_fleet_front.c`: one persistent listen socket (no
+rebind gap), fork-per-connection capped at 16 concurrent children, 64 KiB
+streaming relay buffers (memory never grows with body size), TLS 1.2 floor
+on system OpenSSL, reseeded RNG per child, SIGPIPE ignored, loopback-only
+gateway leg, and no traffic or credential logging — one startup line only.
+It is built with plain `cc` like `tools/zcl_portfwd.c`, with no Makefile
+target and no new packages.
+
+The gateway file is `tools/fleet_gateway.c` (CONTRACT header); this seam only
+hosts it. Owner minting stays in `fleet.steer.grant`, outside AI-callable
+tools. Nothing here logs a credential, grants an authority, or bypasses one.
+
+## Endpoints (after the owner deploy below)
+
+`<base>` is `https://<public-host>:<front-port>`, the value of
+`FLEET_GW_ISSUER`.
+
+| Surface | URL |
+|---|---|
+| Server URL (Streamable HTTP POST) | `<base>/steer` |
+| Protected-resource discovery (RFC 9728) | `<base>/.well-known/oauth-protected-resource` (and `…/steer`) |
+| Authorization-server discovery (RFC 8414) | `<base>/.well-known/oauth-authorization-server` |
+| Dynamic client registration (RFC 7591) | `<base>/oauth/register` |
+| Authorize (owner approval + PKCE S256) | `<base>/oauth/authorize` |
+| Token exchange (form-encoded) | `<base>/oauth/token` |
+| Readiness (loopback only, never proxied) | `http://127.0.0.1:<gw-port>/healthz` |
+
+initialize, tools/list and ping need no credential. A tools/call
+with no credential is answered `401 Unauthorized` with
+`WWW-Authenticate: Bearer … resource_metadata="<base>/.well-known/oauth-protected-resource", scope="brief send evidence"`
+around the typed `-32001` body. That transport-level 401 is what makes a
+hosted client show its **Connect** step; a 200 carrying the same error
+would reach the model as a failed call and no sign-in would start.
+
+## Connecting a Claude custom connector (owner, after deploy)
+
+Requirements (Claude Help Center, custom connectors): a plan that allows
+custom connectors (on Pro/Max the user adds their own; on Team/Enterprise
+only an Owner can); the server reachable from the public internet from
+Anthropic's egress range `160.79.104.0/21`; OAuth with DCR and PKCE S256;
+the hosted-surface redirect URI Claude documents on claude.ai (accepted:
+any `https://` redirect registered through DCR); discovery, registration and
+token answers inside 10 s.
+
+1. In Claude on the web: **Customize → Connectors → Add custom connector**.
+   Name it, set the URL to `<base>/steer`, leave the advanced OAuth fields
+   empty (DCR registers the client).
+2. A connector added there is available in the mobile apps on the same
+   account; enable it in a conversation from the tools menu.
+3. Ask Claude for the fleet brief. The first protected call shows
+   **Connect**; the approval page on `<base>` asks for the owner key
+   (`FLEET_GW_OWNER_KEY`). Only the owner types it; the page names the
+   scopes and the redirect target before approval.
+4. Claude retries the call with the issued token: `steer_brief`, then
+   `steer_send` / `steer_evidence` for the round-trip in
+   [EXTERNAL_ACCEPTANCE.md](./EXTERNAL_ACCEPTANCE.md).
+
+An issued token is a 24 h scoped steer grant with no refresh token. After
+it expires or is revoked, calls return the node's typed refusal as tool
+content; reconnect the connector to sign in again.
+
+## Owner deploy (owner-authorized; agents never run this unasked)
+
+Port 443 stays with the node front. The gateway front uses a high port, so
+it needs no capability and does not contend with it. Deployment is an
+explicit owner act and stays one:
+
+```bash
+# 0. Exact position: a clean checkout at the QUALIFIED sha (see below).
+git fetch origin main
+git rev-parse HEAD   # must equal the qualified SHA, tracked tree clean
+
+# 1. Build the exact images.
+devbuild --wait make z23 fleet-gateway
+cc -O2 -Wall -Wextra -Werror -std=c2x -o build/bin/zcl-fleet-front tools/zcl_fleet_front.c -lssl -lcrypto
+sha256sum build/bin/z23 build/bin/z23-fleet-gateway build/bin/zcl-fleet-front   # must equal the qual report
+
+# 2. Owner-private config (outside the repo; never committed, never logged).
+mkdir -p ~/.config/z23-fleet-gateway
+cat > ~/.config/z23-fleet-gateway/<gw-port>.env <<ENV
+FLEET_GW_ISSUER=https://<public-host>:<front-port>
+FLEET_GW_OWNER_KEY=<owner approval secret>
+FLEET_GW_NODE=<checkout>/build/bin/z23
+ENV
+cat > ~/.config/z23-fleet-gateway/front-<front-port>.env <<ENV
+# '*' listens on every address; the unit default binds loopback only,
+# which is right for qualification and unreachable for a hosted client.
+FRONT_HOST=*
+GW_PORT=<gw-port>
+FRONT_CERT=<path to the public certificate chain for <public-host>>
+FRONT_KEY=<path to its private key>
+ENV
+chmod 600 ~/.config/z23-fleet-gateway/*.env
+
+# 3. Install and start (user units, no sudo). Both ExecStart lines name
+#    %h/github/zclassic23; a checkout elsewhere overrides them with
+#    `systemctl --user edit <unit>`.
+mkdir -p ~/.config/systemd/user
+install -m 644 platform/deploy/fleet-gateway/'z23-fleet-gateway@.service' ~/.config/systemd/user/
+install -m 644 platform/deploy/fleet-gateway/'z23-fleet-gateway-front@.service' ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now 'z23-fleet-gateway@<gw-port>'
+systemctl --user enable --now 'z23-fleet-gateway-front@<front-port>'
+
+# 4. Allow inbound TCP/<front-port> (at least from 160.79.104.0/21).
+# 5. Verify from outside with a real (non -k) TLS client: discovery docs,
+#    and an unauthenticated tools/call answering 401 with the challenge.
+```
+
+## Qualification (before any deploy)
+
+`tools/scripts/qualify_fleet_gateway_front.sh` builds the target SHA in an
+isolated scratch worktree (never the invoking checkout), then proves,
+through a throwaway-cert TLS front on loopback: discovery, `initialize` /
+`tools.list` / `tools.call`, full OAuth DCR/PKCE/token exchange,
+`steer_brief` / `steer_send` / `steer_evidence`, missing / conflicting /
+unknown / wrong-scope / revoked credential refusals (including the 401
+challenge), restart persistence, oversize-body bounds, exact running-image
+identity, and a clean credential-log scan. The throwaway certificate proves
+the seam only; it is not acceptance by a hosted client. It qualifies the SHA
+it is given and nothing else, and must run from a clean tracked tree:
+
+```bash
+bash -c 'set -o pipefail; devbuild --wait bash tools/scripts/qualify_fleet_gateway_front.sh --sha <40-hex> 2>&1 | tee <log>; echo "HARNESS-EXIT=${PIPESTATUS[0]}"'
+```
+
+A stale candidate is never deployed: the script refuses a dirty closure, a
+SHA mismatch, and a reused node image, and the deploy step above re-checks
+HEAD and image hashes.
+
+## Bounds and refusals (what the seam guarantees by construction)
+
+- At most 16 concurrent front children; the 17th connection is refused at
+  once and waits in the kernel backlog — processes never grow with load.
+- 120 s idle budget per front connection; handshakes covered by 120 s socket
+  timeouts; stale half-close signals exit instead of spinning.
+- 64 KiB streaming relay buffers: front memory never grows with body size.
+- Gateway caps unchanged: 64 KiB headers, 1 MiB bodies, 4 MiB replies;
+  oversize bodies are refused before the node is forked.
+- Missing credential → `-32001 grant required`; two differing credentials →
+  `-32002 conflicting grants`; unknown → `STEER_GRANT_UNKNOWN`; wrong scope →
+  `STEER_GRANT_SCOPE`; revoked → `STEER_GRANT_REVOKED` — all before or by the
+  node, never by the front, and the front logs none of them.
+- `GET /steer` → 405; everything outside `/steer`, `/healthz`, `/.well-known/*`,
+  `/oauth/*` → 404. `/healthz` is loopback-only and is never proxied.
+- Revoking a grant kills the credential and best-effort cancels the queued
+  work it sent (reply carries the `cancelled` count); completed history is
+  never rewritten and stays readable under a fresh grant.
