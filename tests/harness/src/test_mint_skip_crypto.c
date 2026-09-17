@@ -1337,9 +1337,8 @@ static int msc_check_offline_drain_wiring(const char *boot_src,
  * boundary (health_stop), never the registry's global shutdown flag -- and
  * every offline one-shot starts it via boot_phase's lazy health_start(). If
  * the offline join never stops it first, its loop runs forever and the
- * plain pthread_join in thread_registry_join_all_owned hangs the process
- * silently. Pin that boot_offline_join_workers_or_exit calls health_stop()
- * before joining. */
+ * bounded registry drain reports a straggler. Pin that
+ * boot_offline_join_workers_or_exit calls health_stop() before joining. */
 static int msc_check_offline_health_sweep_stop(void)
 {
     int failures = 0;
@@ -1353,7 +1352,8 @@ static int msc_check_offline_health_sweep_stop(void)
         ? strstr(join_fn, "health_stop();")
         : NULL;
     const char *join_all_call = join_fn
-        ? strstr(join_fn, "thread_registry_join_all(2);")
+        ? strstr(join_fn,
+                 "thread_registry_join_all(OFFLINE_WORKER_DRAIN_SECONDS);")
         : NULL;
     MSC_CHECK("offline worker join stops the health sweeper before joining",
               health_stop_call && join_all_call &&

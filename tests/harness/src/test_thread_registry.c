@@ -158,24 +158,6 @@ static int t_registry_reports_straggler(void)
     return failures;
 }
 
-static int t_registry_owned_join_waits_for_straggler(void)
-{
-    int failures = 0;
-    thread_registry_reset_for_test();
-
-    TEST("thread_registry: owned join never abandons a live worker") {
-        ASSERT_EQ(thread_registry_spawn("tr-owned",
-                                        tr_stuck_worker, NULL, NULL),
-                  0);
-        ASSERT_EQ(thread_registry_join_all(0), 1);
-        thread_registry_join_all_owned();
-        ASSERT_EQ(thread_registry_live_count(), 0);
-        ASSERT_EQ(thread_registry_unreaped_count(), 0);
-        PASS();
-    } _test_next:;
-    return failures;
-}
-
 struct excluded_worker_ctx {
     _Atomic bool started;
     _Atomic bool release;
@@ -190,6 +172,41 @@ static void *tr_excluded_worker(void *arg)
         nanosleep(&ts, NULL);
     }
     return NULL;
+}
+
+static int t_registry_aggregate_join_is_bounded_and_retryable(void)
+{
+    int failures = 0;
+    thread_registry_reset_for_test();
+
+    TEST("thread_registry: aggregate timeout retains ownership for retry") {
+        struct excluded_worker_ctx ctx;
+        atomic_init(&ctx.started, false);
+        atomic_init(&ctx.release, false);
+        ASSERT_EQ(thread_registry_spawn("tr-aggregate", tr_excluded_worker,
+                                        &ctx, NULL), 0);
+        for (int i = 0; i < 100 &&
+                        !atomic_load_explicit(&ctx.started,
+                                              memory_order_acquire); i++) {
+            struct timespec pause = {
+                .tv_sec = 0,
+                .tv_nsec = 10 * 1000 * 1000,
+            };
+            nanosleep(&pause, NULL);
+        }
+        ASSERT(atomic_load_explicit(&ctx.started, memory_order_acquire));
+
+        ASSERT_EQ(thread_registry_join_all(0), 1);
+        ASSERT_EQ(thread_registry_live_count(), 1);
+        ASSERT_EQ(thread_registry_unreaped_count(), 1);
+
+        atomic_store_explicit(&ctx.release, true, memory_order_release);
+        ASSERT_EQ(thread_registry_join_all(1), 0);
+        ASSERT_EQ(thread_registry_live_count(), 0);
+        ASSERT_EQ(thread_registry_unreaped_count(), 0);
+        PASS();
+    } _test_next:;
+    return failures;
 }
 
 static int t_registry_exact_exclusion_retains_provider(void)
@@ -392,15 +409,15 @@ static int t_registry_snapshot(void)
 /* ── health-sweep join budget ────────────────────────────────────────
  *
  * boot_offline_join_workers_or_exit (engine/composition/src/boot_services_
- * shutdown.c) must call health_stop() BEFORE thread_registry_join_all(2):
+ * shutdown.c) must call health_stop() BEFORE its bounded registry drain:
  * the heartbeat sweeper (zcl_health_sweep) only obeys its own health_stop
  * lifecycle boundary, never the registry's global shutdown flag, so a join
  * that does not stop it first waits on a loop that never exits and hangs
  * the process (never idle silently on an error path). This pins the
  * invariant that ordering relies on: once health_stop() actually returns
- * (it joins the sweeper itself), a subsequent thread_registry_join_all
- * with the SAME 2s production budget reports zero stragglers -- the
- * sweeper is not still occupying a registry slot. health_set_check_
+ * (it joins the sweeper itself), a subsequent short bounded
+ * thread_registry_join_all reports zero stragglers -- the sweeper is not
+ * still occupying a registry slot. health_set_check_
  * interval_ms shortens the sweeper's own poll cadence so this stays fast
  * without an injected clock (the sweeper's nanosleep has no clock seam;
  * this is the same bounded-real-wait idiom test_heartbeat.c already uses
@@ -438,7 +455,7 @@ int test_thread_registry(void)
     failures += t_registry_snapshot();
     failures += t_registry_stress_50_threads();
     failures += t_registry_reports_straggler();
-    failures += t_registry_owned_join_waits_for_straggler();
+    failures += t_registry_aggregate_join_is_bounded_and_retryable();
     failures += t_registry_exact_exclusion_retains_provider();
     failures += t_registry_cooperative_join_is_bounded_and_retryable();
     failures += t_registry_reuses_completed_owned_rows();

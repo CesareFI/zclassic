@@ -47,6 +47,16 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
+/* Keep cooperative joins inside their enclosing stagewatch budgets even on a
+ * host (Android included) with no native timed-join primitive. The consumer
+ * drain gets 55 of its 60 seconds; the offline drain gets 12 of 15 seconds so
+ * the process adapter retains time to publish a truthful terminal receipt.
+ * The final audit should find only already-signalled provider bookkeeping and
+ * therefore keeps its existing two-second bound. */
+#define SHUTDOWN_CONSUMER_DRAIN_SECONDS 55
+#define SHUTDOWN_FINAL_DRAIN_SECONDS     2
+#define OFFLINE_WORKER_DRAIN_SECONDS    12
+
 static void shutdown_stop_frontend_services(struct boot_svc_ctx *svc)
 {
     printf("[shutdown] stopping frontend services\n");
@@ -167,7 +177,7 @@ static bool shutdown_quiesce_network_and_flush_coins(struct boot_svc_ctx *svc,
     return final_flush_ok;
 }
 
-static void shutdown_stop_runtime_and_drain_workers(struct boot_svc_ctx *svc)
+static bool shutdown_stop_runtime_and_drain_workers(struct boot_svc_ctx *svc)
 {
     printf("[shutdown] stopping runtime services\n");
     /* Signal the NAT probe worker FIRST (non-blocking): a worker sitting in
@@ -216,14 +226,14 @@ static void shutdown_stop_runtime_and_drain_workers(struct boot_svc_ctx *svc)
     boot_join_projection_backfill_service(svc);
     boot_join_catchup_service(svc);
 
-    /* Diagnostic timeout first, then retain ownership until every remaining
-     * CONSUMER exits. The DB worker/checkpointer are dependency providers for
-     * the persistence stage below, so joining them here creates a lifecycle
-     * cycle: the registry waits for zcl_db_worker, but db_service_stop() cannot
-     * signal that worker until after the final queued flush/checkpoint. Exclude
-     * those exact pthread identities (not names), drain every consumer with
-     * dependencies live, then let shutdown_persist_runtime_state() stop the DB
-     * provider and run a final all-thread ownership audit. */
+    /* The DB worker/checkpointer are dependency providers for the persistence
+     * stage below, so joining them here creates a lifecycle cycle: the registry
+     * waits for zcl_db_worker, but db_service_stop() cannot signal that worker
+     * until after the final queued flush/checkpoint. Exclude those exact
+     * pthread identities (not names) and drain every consumer under one
+     * portable aggregate deadline with dependencies live. A timeout retains
+     * every registry row and makes the caller terminate before persistence or
+     * destructive release; it never falls through to an unlimited join. */
     pthread_t db_threads[2];
     size_t db_thread_count = 0;
     if (svc->db_service) {
@@ -233,15 +243,16 @@ static void shutdown_stop_runtime_and_drain_workers(struct boot_svc_ctx *svc)
             db_threads[db_thread_count++] = svc->db_service->ckpt_thread;
     }
     int stragglers = thread_registry_join_all_except(
-        2, db_threads, db_thread_count);
+        SHUTDOWN_CONSUMER_DRAIN_SECONDS, db_threads, db_thread_count);
     if (stragglers > 0) {
         fprintf(stderr,
-                "[shutdown] %d worker(s) exceeded their join budget; "
-                "waiting with dependencies retained\n",
+                "[shutdown] %d worker(s) exceeded the bounded consumer "
+                "drain; dependencies remain owned\n",
                 stragglers);
-        thread_registry_join_all_owned_except(db_threads, db_thread_count);
+        return false;
     }
     printf("[shutdown] runtime consumers drained; DB provider retained\n");
+    return true;
 }
 
 static bool shutdown_persist_runtime_state(struct boot_svc_ctx *svc,
@@ -327,13 +338,13 @@ static bool shutdown_persist_runtime_state(struct boot_svc_ctx *svc,
     /* db_service_stop() has now signalled and joined the only intentionally
      * excluded provider threads. No registered thread may survive the final
      * durability barrier or observe the resource-release phase. */
-    int stragglers = thread_registry_join_all(2);
+    int stragglers = thread_registry_join_all(SHUTDOWN_FINAL_DRAIN_SECONDS);
     if (stragglers > 0) {
         fprintf(stderr,
                 "[shutdown] %d final worker(s) exceeded their join budget; "
-                "retaining ownership before durability\n",
+                "retaining ownership and refusing the durability marker\n",
                 stragglers);
-        thread_registry_join_all_owned();
+        ok = false;
     }
     int live_threads = thread_registry_live_count();
     int unreaped_threads = thread_registry_unreaped_count();
@@ -504,7 +515,16 @@ void app_shutdown_svc(struct boot_svc_ctx *svc)
      * not be closed while a consumer is live. A legitimate slow callback gets
      * bounded graces; a true wedge still exits loudly and unclean. */
     shutdown_stagewatch_enter("worker-drain", 60, true, true);
-    shutdown_stop_runtime_and_drain_workers(svc);
+    if (!shutdown_stop_runtime_and_drain_workers(svc)) {
+        fprintf(stderr,
+                "[shutdown] bounded worker drain failed; refusing to persist "
+                "or release dependencies\n");
+        (void)boot_shutdown_marker_remove_clean(svc->datadir);
+        (void)shutdown_stagewatch_complete_unclean();
+        fflush(stdout);
+        fflush(stderr);
+        _exit(1);
+    }
     /* Capture while state and progress.kv are still live, after every writer
      * that could move their frontier has been joined. */
     boot_fast_restart_capture_shutdown_facts(svc->state);
@@ -582,8 +602,10 @@ void app_shutdown_svc(struct boot_svc_ctx *svc)
  * arms on a root-mismatch and which replays h≈activation..tip reading g_state /
  * g_node_db WITHOUT polling that flag — are still live here. Running the
  * destructive frees while such a worker reads that state is a use-after-free.
- * Diagnose bounded-join overruns, then retain dependencies and ownership until
- * every worker actually exits. */
+ * Wait under the offline stage's own cooperative deadline. A worker that does
+ * not exit keeps its registry row and every dependency remains allocated; the
+ * current process adapter then emits the same truthful forced verdict as the
+ * stagewatch deadline instead of entering an unlimited pthread_join. */
 void boot_offline_join_workers_or_exit(const char *datadir)
 {
     (void)datadir;
@@ -592,15 +614,19 @@ void boot_offline_join_workers_or_exit(const char *datadir)
      * shutdown_stop_runtime_and_drain_workers above) -- every offline one-
      * shot (-mint-anchor, -full-fold, -coldstart-seed-oneshot) starts it via
      * boot_phase's lazy health_start(), so it must be stopped here or it
-     * loops forever and the plain pthread_join below never returns. */
+     * loops forever and the bounded registry drain below reports it. */
     health_stop();
-    int stragglers = thread_registry_join_all(2);
+    int stragglers = thread_registry_join_all(OFFLINE_WORKER_DRAIN_SECONDS);
     if (stragglers > 0) {
         fprintf(stderr,
-                "[shutdown] %d offline worker(s) exceeded join budget; "
-                "waiting with dependencies retained\n",
+                "[shutdown] %d offline worker(s) exceeded the bounded drain; "
+                "forcing the stage's truthful terminal verdict with "
+                "dependencies retained\n",
                 stragglers);
-        thread_registry_join_all_owned();
+        shutdown_stagewatch_on_alarm();
+        /* offline-worker-drain is non-critical, so the stagewatch decision is
+         * terminal. Fail closed if that contract ever changes. */
+        _exit(1);
     }
 }
 

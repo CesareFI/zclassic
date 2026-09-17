@@ -169,8 +169,10 @@ int t_boot_shutdown_persistence_order_contract(void)
             buf, "db_service_wal_checkpoint(svc->db_service)");
         char *consumer_join = strstr(
             buf, "thread_registry_join_all_except(\n"
-                 "        2, db_threads, db_thread_count)");
-        char *thread_join = strstr(buf, "thread_registry_join_all(2)");
+                 "        SHUTDOWN_CONSUMER_DRAIN_SECONDS, db_threads, "
+                 "db_thread_count)");
+        char *thread_join = strstr(
+            buf, "thread_registry_join_all(SHUTDOWN_FINAL_DRAIN_SECONDS)");
         char *marker = strstr(
             buf, "boot_shutdown_marker_write_clean(svc->datadir)");
         char *fast = strstr(buf, "shutdown_persist_fast_restart_state(svc);");
@@ -184,6 +186,7 @@ int t_boot_shutdown_persistence_order_contract(void)
         ASSERT(thread_join != NULL);
         ASSERT(marker != NULL);
         ASSERT(fast != NULL);
+        ASSERT(strstr(buf, "thread_registry_join_all_owned") == NULL);
         /* Periodic health callbacks can read node.db. Their sweeper must be
          * joined before the DB checkpoint/close begins. */
         ASSERT(health_stop < wal_checkpoint);
@@ -191,7 +194,7 @@ int t_boot_shutdown_persistence_order_contract(void)
          * above, before the DB checkpoint. Every offline one-shot
          * (-mint-anchor, -full-fold, -coldstart-seed-oneshot) starts the
          * sweeper through boot_phase's lazy health_start() and must stop it in
-         * boot_offline_join_workers_or_exit before the plain registry join:
+         * boot_offline_join_workers_or_exit before the bounded registry join:
          * the sweeper obeys its own lifecycle boundary and not the registry's
          * global shutdown flag, so an offline exit that skips this loops
          * forever and never returns. Pin both sites by the text around them,
@@ -201,7 +204,8 @@ int t_boot_shutdown_persistence_order_contract(void)
                            "    /* Stop + join the self-heal condition runner "
                            "FIRST") != NULL);
         ASSERT(strstr(buf, "health_stop();\n"
-                           "    int stragglers = thread_registry_join_all(2);")
+                           "    int stragglers = thread_registry_join_all("
+                           "OFFLINE_WORKER_DRAIN_SECONDS);")
                != NULL);
         /* Stage-owned pools must receive their stop signal before the generic
          * registry join, after their supervisor callback users are joined,

@@ -374,59 +374,6 @@ int thread_registry_join_all(int timeout_sec)
     return thread_registry_join_all_except(timeout_sec, NULL, 0);
 }
 
-void thread_registry_join_all_owned_except(const pthread_t *excluded,
-                                           size_t excluded_count)
-{
-    for (int i = 0; i < ZCL_THREAD_REGISTRY_CAP; i++) {
-        pthread_mutex_lock(&g_mu);
-        bool occupied = g_entries[i].occupied;
-        pthread_t tid = g_entries[i].tid;
-        char name[sizeof(g_entries[i].name)];
-        if (occupied) {
-            memcpy(name, g_entries[i].name, sizeof(name));
-            if (!thread_registry_tid_is_excluded(
-                    tid, excluded, excluded_count))
-                g_entries[i].registry_joining = true;
-        }
-        pthread_mutex_unlock(&g_mu);
-        if (!occupied)
-            continue;
-        if (thread_registry_tid_is_excluded(tid, excluded, excluded_count))
-            continue;
-
-        fprintf(stderr,  // obs-ok:shutdown-owner-join-progress
-                "[thread_registry] retaining ownership while joining '%s'\n",
-                name);
-        int rc;
-        do {
-            rc = pthread_join(tid, NULL);
-        } while (rc == EINTR);
-
-        if (rc != 0) {
-            fprintf(stderr,  // obs-ok:shutdown-watchdog-propagates-join-failure
-                    "[thread_registry] blocking join of '%s' failed: "
-                    "rc=%d: %s\n",
-                    name, rc, strerror(rc));
-            /* Keep the registry entry active. The caller's shutdown watchdog
-             * remains responsible for a truthful unclean process exit; we
-             * must not manufacture a successful ownership handoff. */
-            pthread_mutex_lock(&g_mu);
-            g_entries[i].registry_joining = false;
-            pthread_mutex_unlock(&g_mu);
-            continue;
-        }
-
-        pthread_mutex_lock(&g_mu);
-        memset(&g_entries[i], 0, sizeof(g_entries[i]));
-        pthread_mutex_unlock(&g_mu);
-    }
-}
-
-void thread_registry_join_all_owned(void)
-{
-    thread_registry_join_all_owned_except(NULL, 0);
-}
-
 int thread_registry_live_count(void)
 {
     int n = 0;

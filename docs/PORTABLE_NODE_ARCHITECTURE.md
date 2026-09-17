@@ -185,12 +185,14 @@ final pthread reap. Production registry consumers no longer depend on a native
 timed-join or try-join extension. The boot-background and catchup lifecycle
 owners now retain their started/owned state when a bounded join times out, so a
 caller can cancel cooperatively and retry without detaching or destroying live
-state. Process-level shutdown still invokes the registry's legacy aggregate
-`join_all_owned` barriers, and several other subsystem stop routines still use
-direct blocking joins. Those are the next bounded-shutdown inventory; they are
-not acceptable as the final Android lifecycle. The node also has process-global
-managers and scheduler instances, so a second in-process node is not presently
-supported.
+state. Aggregate registry drains now use portable completion publication under
+one fixed deadline and retain every worker/dependency owner on timeout; the
+former unlimited `join_all_owned` fallback has been removed. Several subsystem
+stop routines still use direct blocking joins, and process shutdown still
+escalates failures through a signal/`_exit` adapter. Those are the next
+bounded-shutdown and error-propagation inventory; they are not acceptable as the
+final Android lifecycle. The node also has process-global managers and scheduler
+instances, so a second in-process node is not presently supported.
 
 Android bionic does not provide glibc's `pthread_timedjoin_np`, and it also does
 not provide the cancellation mechanism used by the current Darwin emulation.
@@ -411,8 +413,9 @@ bridge pump is registry-owned, and completed registry-owned jobs are reaped
 opportunistically so a long-running node cannot exhaust the fixed table. Boot
 background and catchup-service timeout paths retain ownership and permit a
 bounded retry instead of falling through to an unlimited join.
-Signal/backtrace paths, unregistered raw thread creation, aggregate registry
-drains, and other direct blocking joins remain known blockers.
+The process-level aggregate drain now has the same bounded ownership-retaining
+contract. Signal/backtrace paths, unregistered raw thread creation, and direct
+blocking subsystem joins remain known blockers.
 
 Exit: portable headers do not select glibc-only APIs under Android macros, and
 the unsupported-runtime inventory is explicit.
@@ -482,9 +485,9 @@ chainstate, and no worker/socket use-after-free.
 - No pinned Android NDK or arm64 dependency build is present in this checkout.
 - Android lacks native timed-join/cancel mechanisms. Registry-owned workers now
   publish cooperative completion portably, and bounded service owners retain
-  ownership on timeout. Stop-error propagation must still replace the
-  process-level aggregate `join_all_owned` barriers and remaining direct
-  blocking joins.
+  ownership on timeout. Aggregate drains no longer have an unlimited fallback;
+  stop-error propagation must still replace the process-level signal/`_exit`
+  boundary and remaining direct blocking joins.
 - signal installation, backtrace/syscall diagnostics, daemon policy, and some
   `/proc` assumptions are still process/platform coupled.
 - the full node is not an independently owned `node_instance`; several global

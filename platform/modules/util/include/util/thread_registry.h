@@ -124,17 +124,6 @@ int thread_registry_join_all_except(int timeout_sec,
                                     const pthread_t *excluded,
                                     size_t excluded_count);
 
-/* Drain every still-active registered thread without abandoning ownership.
- * This is the final shutdown barrier: callers must keep every dependency
- * alive until it returns. A process-level shutdown watchdog may terminate an
- * irrecoverably stuck process, but this function never detaches a worker and
- * never reports completion while one can still access caller-owned state. */
-void thread_registry_join_all_owned(void);
-
-/* Ownership-retaining form of thread_registry_join_all_except(). */
-void thread_registry_join_all_owned_except(const pthread_t *excluded,
-                                           size_t excluded_count);
-
 /* Current count of threads whose entry function has not returned. */
 int thread_registry_live_count(void);
 

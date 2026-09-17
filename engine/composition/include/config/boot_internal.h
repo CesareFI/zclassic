@@ -653,7 +653,8 @@ void boot_offline_arm_worker_drain_stage(bool output_already_durable);
 
 /* ── engine/composition/src/boot_services_shutdown.c ──────────────────────────────────── *
  * Drain background workers before app_shutdown_offline's destructive frees;
- * dependencies remain owned until every worker has actually exited. */
+ * the drain is deadline-bounded and terminates the current process adapter
+ * without freeing dependencies if any registry owner remains. */
 void boot_offline_join_workers_or_exit(const char *datadir);
 /* Persist and close offline-mode stores after all writers are joined. Every
  * failed durability operation is logged; false forbids the clean marker. */
