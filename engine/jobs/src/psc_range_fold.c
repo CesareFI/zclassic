@@ -56,7 +56,6 @@ static void *pf_worker(void *arg)
         if (item >= sh->n_items) break;
         sh->fn(item, sh->ctx);
     }
-    thread_registry_unregister_self();
     return NULL;
 }
 

@@ -1,7 +1,3 @@
-#if !defined(_WIN32)
-#define _GNU_SOURCE  /* pthread_timedjoin_np */
-#endif
-
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
  * Fast File Service — SHA3-encrypted direct TCP transfer.
@@ -9,7 +5,6 @@
  * overhead visible to observers, wire-speed on gigabit links. */
 
 #include "platform/time_compat.h"
-#include "platform/thread_compat.h"
 #include "platform/file_sync.h"
 #include "platform/barrier.h"
 #include "net/net_runtime_port.h"
@@ -206,7 +201,7 @@ static void fs_join_thread_bounded(pthread_t thread,
     int rc;
 
     fs_join_deadline_from_now(&deadline, timeout_sec);
-    rc = platform_thread_join_until(thread, NULL, &deadline);
+    rc = thread_registry_join_until(thread, NULL, &deadline);
     if (rc == 0)
         return;
 

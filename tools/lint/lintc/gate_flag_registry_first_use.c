@@ -105,6 +105,11 @@ static int fru_open_check(const char *path, int line, const char *name,
         snprintf(reason, rcap, "file missing");
         return 1;
     }
+    /* A root-run proof can fopen a mode-000 fixture. Treat the declared
+     * permission boundary consistently with an unprivileged runner so the
+     * gate cannot certify a pointer ordinary users cannot inspect. */
+    if ((st.st_mode & (S_IRUSR | S_IRGRP | S_IROTH)) == 0)
+        return -1;
     FILE *f = fopen(path, "r");
     if (!f)
         return -1;

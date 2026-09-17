@@ -2,7 +2,7 @@
  *
  * Supervisor — implementation. See util/supervisor.h for design notes. */
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE  /* pthread_timedjoin_np */
+#define _GNU_SOURCE  /* pthread naming compatibility */
 #endif
 /*
  *
@@ -18,7 +18,6 @@
  *     workers invoke child tick and stall callbacks without holding it. */
 
 #include "platform/time_compat.h"
-#include "platform/thread_compat.h"
 #include "util/supervisor.h"
 #include "supervisor_internal.h"
 
@@ -904,7 +903,6 @@ static void *supervisor_stall_runner_main(void *arg)
     }
     stall_discard_all();
     atomic_store(&g_stall_runner_running, false);
-    thread_registry_unregister_self();
     return NULL;
 }
 
@@ -1127,7 +1125,6 @@ static void *supervisor_tick_runner_main(void *arg)
         pthread_mutex_unlock(&g_runner_wake_lock);
     }
     atomic_store(&g_runner_running, false);
-    thread_registry_unregister_self();
     return NULL;
 }
 
@@ -1158,7 +1155,6 @@ static void *supervisor_thread_main(void *arg)
         nanosleep(&req, NULL);
     }
     atomic_store(&g_thread_alive, false);
-    thread_registry_unregister_self();
     return NULL;
 }
 
@@ -1174,8 +1170,8 @@ static bool stall_runner_stop_and_join(void)
         struct timespec deadline;
         platform_time_realtime_timespec(&deadline);
         deadline.tv_sec += 2;
-        int rc = platform_thread_join_until(g_stall_runner_thread_id, NULL,
-                                             &deadline);
+        int rc = thread_registry_join_until(g_stall_runner_thread_id, NULL,
+                                            &deadline);
         if (rc == 0) {
             atomic_store(&g_stall_runner_handle_set, false);
             return true;
@@ -1288,7 +1284,7 @@ void supervisor_stop(void)
             struct timespec rdeadline;
             platform_time_realtime_timespec(&rdeadline);
             rdeadline.tv_sec += 2;
-            int rjc = platform_thread_join_until(g_runner_thread_id, NULL,
+            int rjc = thread_registry_join_until(g_runner_thread_id, NULL,
                                                  &rdeadline);
             if (rjc == 0) {
                 atomic_store(&g_runner_handle_set, false);
@@ -1319,7 +1315,7 @@ void supervisor_stop(void)
             struct timespec deadline;
             platform_time_realtime_timespec(&deadline);
             deadline.tv_sec += 2;
-            int rc = platform_thread_join_until(g_thread_id, NULL, &deadline);
+            int rc = thread_registry_join_until(g_thread_id, NULL, &deadline);
             if (rc == 0) {
                 atomic_store(&g_thread_handle_set, false);
                 break;

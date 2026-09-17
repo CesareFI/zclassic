@@ -1,4 +1,3 @@
-#define _GNU_SOURCE  /* pthread_timedjoin_np */
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  * Runtime service initialization: mempool, P2P, RPC, Tor, HTTPS,
  * mining, wallet sync, shutdown, and utility functions. */

@@ -160,8 +160,9 @@ const char *supervisor_restart_policy_name(enum supervisor_restart_policy p);
  * decide restart-vs-stall. Honesty caveat: a hard SIGSEGV takes down the whole
  * process (POSIX C has no per-thread crash recovery), so the recoverable
  * failure is an abnormal RETURN from the worker loop, not an independent
- * segfault. The respawn path additionally reaps/guards with pthread_tryjoin_np
- * so a false EXITED (caught mid-return) can never double-spawn a live thread. */
+ * segfault. The respawn path additionally waits against the registry's
+ * already-expired completion deadline, so a false EXITED (caught mid-return)
+ * can never double-spawn a live thread on any pthread platform. */
 enum supervisor_worker_state {
     SUPERVISOR_WORKER_UNKNOWN = 0,    /* never spawned / not tracked */
     SUPERVISOR_WORKER_ALIVE,          /* worker is running its loop (worker-set) */

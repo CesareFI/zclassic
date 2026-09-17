@@ -79,6 +79,7 @@ bool boot_start_offer_service(struct boot_svc_ctx *svc)
                                     SNAPSHOT_OFFER_SUPERVISOR_DEADLINE_SEC, 0);
     return boot_start_thread_service(&svc->offer_thread,
                                      &svc->offer_thread_started,
+                                     "zcl_snap_offer",
                                      build_snapshot_offer_thread, svc);
 }
 

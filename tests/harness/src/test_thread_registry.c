@@ -4,8 +4,10 @@
 
 #include "test/test_core.h"
 #include "health/heartbeat.h"
+#include "platform/time_compat.h"
 #include "util/thread_registry.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -113,7 +115,7 @@ static int t_registry_stress_50_threads(void)
         ASSERT_EQ(thread_registry_live_count(), 0);
         ASSERT_EQ(thread_registry_unreaped_count(), N);
 
-        /* Join with 10s per-thread budget. Returns the count of
+        /* Join under one aggregate 10s budget. Returns the count of
          * stragglers; expect 0 because workers poll at 10 ms. */
         int stragglers = thread_registry_join_all(10);
         ASSERT_EQ(stragglers, 0);
@@ -219,6 +221,94 @@ static int t_registry_exact_exclusion_retains_provider(void)
         /* out_tid transferred join ownership to this subsystem fixture. */
         ASSERT_EQ(pthread_join(provider, NULL), 0);
         ASSERT_EQ(thread_registry_live_count(), 0);
+        ASSERT_EQ(thread_registry_unreaped_count(), 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int t_registry_cooperative_join_is_bounded_and_retryable(void)
+{
+    int failures = 0;
+    thread_registry_reset_for_test();
+
+    TEST("thread_registry: cooperative join times out and retains ownership") {
+        struct excluded_worker_ctx ctx;
+        atomic_init(&ctx.started, false);
+        atomic_init(&ctx.release, false);
+        pthread_t worker;
+        ASSERT_EQ(thread_registry_spawn("tr-coop-join", tr_excluded_worker,
+                                        &ctx, &worker), 0);
+        for (int i = 0; i < 100 &&
+                        !atomic_load_explicit(&ctx.started,
+                                              memory_order_acquire); i++) {
+            struct timespec pause = {
+                .tv_sec = 0,
+                .tv_nsec = 10 * 1000 * 1000,
+            };
+            nanosleep(&pause, NULL);
+        }
+        ASSERT(atomic_load_explicit(&ctx.started, memory_order_acquire));
+
+        struct timespec deadline;
+        ASSERT_EQ(platform_time_realtime_timespec(&deadline), 0);
+        ASSERT_EQ(thread_registry_join_until(worker, NULL, &deadline),
+                  ETIMEDOUT);
+        ASSERT_EQ(thread_registry_live_count(), 1);
+        ASSERT_EQ(thread_registry_unreaped_count(), 1);
+
+        atomic_store_explicit(&ctx.release, true, memory_order_release);
+        ASSERT_EQ(platform_time_realtime_timespec(&deadline), 0);
+        deadline.tv_sec += 2;
+        ASSERT_EQ(thread_registry_join_until(worker, NULL, &deadline), 0);
+        ASSERT_EQ(thread_registry_live_count(), 0);
+        ASSERT_EQ(thread_registry_unreaped_count(), 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+struct registry_reap_ctx {
+    _Atomic int completed;
+};
+
+static void *tr_short_registry_owned_worker(void *arg)
+{
+    struct registry_reap_ctx *ctx = arg;
+    atomic_fetch_add_explicit(&ctx->completed, 1, memory_order_release);
+    return NULL;
+}
+
+static int t_registry_reuses_completed_owned_rows(void)
+{
+    int failures = 0;
+    thread_registry_reset_for_test();
+
+    TEST("thread_registry: completed owned rows do not exhaust capacity") {
+        struct registry_reap_ctx ctx;
+        atomic_init(&ctx.completed, 0);
+        const int jobs = ZCL_THREAD_REGISTRY_CAP + 16;
+
+        for (int i = 0; i < jobs; i++) {
+            ASSERT_EQ(thread_registry_spawn("tr-short-owned",
+                                            tr_short_registry_owned_worker,
+                                            &ctx, NULL), 0);
+            for (int wait = 0; wait < 1000 &&
+                 (atomic_load_explicit(&ctx.completed,
+                                       memory_order_acquire) <= i ||
+                  thread_registry_live_count() != 0); wait++) {
+                struct timespec pause = {
+                    .tv_sec = 0,
+                    .tv_nsec = 1000 * 1000,
+                };
+                nanosleep(&pause, NULL);
+            }
+            ASSERT(atomic_load_explicit(&ctx.completed,
+                                        memory_order_acquire) > i);
+            ASSERT_EQ(thread_registry_live_count(), 0);
+        }
+
+        ASSERT_EQ(thread_registry_join_all(2), 0);
         ASSERT_EQ(thread_registry_unreaped_count(), 0);
         PASS();
     } _test_next:;
@@ -350,6 +440,8 @@ int test_thread_registry(void)
     failures += t_registry_reports_straggler();
     failures += t_registry_owned_join_waits_for_straggler();
     failures += t_registry_exact_exclusion_retains_provider();
+    failures += t_registry_cooperative_join_is_bounded_and_retryable();
+    failures += t_registry_reuses_completed_owned_rows();
     failures += t_registry_health_sweep_joins_after_stop();
     return failures;
 }

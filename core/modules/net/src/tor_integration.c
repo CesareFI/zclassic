@@ -5,10 +5,8 @@
  * via direct C callbacks. A localhost-only SocksPort remains as a temporary
  * Tor bootstrap workaround in tor_write_torrc(). */
 
-#define _GNU_SOURCE  /* pthread_timedjoin_np */
 #define _DEFAULT_SOURCE
 #include "platform/time_compat.h"
-#include "platform/thread_compat.h"
 #include "platform/socket_compat.h"
 #include "platform/file_metadata.h"
 #include "platform/private_directory.h"
@@ -101,7 +99,7 @@ static void tor_join_thread_bounded(pthread_t thread,
     int rc;
 
     tor_join_deadline_from_now(&deadline, timeout_sec);
-    rc = platform_thread_join_until(thread, NULL, &deadline);
+    rc = thread_registry_join_until(thread, NULL, &deadline);
     if (rc == 0)
         return;
 

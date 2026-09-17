@@ -257,7 +257,6 @@ static void *backstop_thread_main(void *arg)
         };
         nanosleep(&req, NULL);
     }
-    thread_registry_unregister_self();
     return NULL;
 }
 

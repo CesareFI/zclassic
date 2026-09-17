@@ -51,6 +51,7 @@ bool boot_join_thread_bounded(pthread_t thread, const char *name,
  * through this single source instead of carrying its own pthread_create. The
  * caller owns the pthread_t and the started flag. */
 bool boot_start_thread_service(pthread_t *thread, bool *started,
+                               const char *name,
                                void *(*entry)(void *), void *arg);
 void boot_join_thread_service_named(pthread_t *thread, bool *started,
                                     const char *name, int timeout_sec);

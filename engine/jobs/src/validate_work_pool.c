@@ -39,7 +39,6 @@ static void *vwp_worker_entry(void *arg)
             pthread_cond_broadcast(&pool->cv_done);
         pthread_mutex_unlock(&pool->mu);
     }
-    thread_registry_unregister_self();
     return NULL;
 }
 

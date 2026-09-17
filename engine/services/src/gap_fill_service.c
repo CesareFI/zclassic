@@ -11,10 +11,7 @@
 
 /* Copyright 2026 Rhett Creighton - Apache License 2.0 */
 
-#define _GNU_SOURCE  /* pthread_timedjoin_np */
-
 #include "platform/time_compat.h"
-#include "platform/thread_compat.h"
 #include "services/gap_fill_service.h"
 
 #include "supervisors/domains.h"
@@ -766,7 +763,7 @@ void gap_fill_stop(void)
         struct timespec ts;
         if (platform_time_realtime_timespec(&ts) == 0) {
             ts.tv_sec += 5;
-            int rc = platform_thread_join_until(g_gf.thread, NULL, &ts);
+            int rc = thread_registry_join_until(g_gf.thread, NULL, &ts);
             if (rc != 0) {
                 LOG_WARN("gap_fill_stop", "gap_fill_stop: thread join exceeded deadline (rc=%d); retaining ownership", rc);
                 pthread_join(g_gf.thread, NULL);

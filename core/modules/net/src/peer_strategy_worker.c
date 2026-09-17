@@ -6,11 +6,9 @@
 
 // supervisor-ok:bounded-nat-probe — single joined worker, no resident service
 
-#define _GNU_SOURCE  /* pthread_timedjoin_np (platform_thread_join_until) */
 #include "net/peer_strategy_worker.h"
 
 #include "chain/chainparams.h"
-#include "platform/thread_compat.h"
 #include "platform/time_compat.h"
 #include "util/log_json.h"
 #include "util/log_macros.h"
@@ -247,7 +245,7 @@ void peer_strategy_worker_join(struct peer_strategy_worker *w)
     struct timespec deadline;
     platform_time_realtime_timespec(&deadline);
     deadline.tv_sec += PSW_JOIN_TIMEOUT_SECS;
-    int rc = platform_thread_join_until(w->tid, NULL, &deadline);
+    int rc = thread_registry_join_until(w->tid, NULL, &deadline);
     if (rc != 0) {
         /* The in-flight probe is socket-timeout bounded (~25 s worst case),
          * so this is a loud straggler note, then the unconditional join —

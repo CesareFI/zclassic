@@ -404,7 +404,6 @@ static void *pvla_worker_entry(void *arg)
     pthread_mutex_unlock(&g_mu);
     if (child != SUPERVISOR_INVALID_ID)
         supervisor_worker_exited(child);
-    thread_registry_unregister_self();
     return NULL;
 }
 

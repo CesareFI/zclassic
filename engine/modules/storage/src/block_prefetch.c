@@ -342,7 +342,6 @@ static void *bp_worker_entry(void *arg)
                  "reads cold (no correctness impact)");
         if (child != SUPERVISOR_INVALID_ID)
             supervisor_worker_exited(child);
-        thread_registry_unregister_self();
         return NULL;
     }
 
@@ -382,7 +381,6 @@ static void *bp_worker_entry(void *arg)
     free(scratch);
     if (child != SUPERVISOR_INVALID_ID)
         supervisor_worker_exited(child);
-    thread_registry_unregister_self();
     return NULL;
 }
 

@@ -654,7 +654,6 @@ static void *boot_sd_watchdog_pet_main(void *arg)
             left_us -= slice_us;
         }
     }
-    thread_registry_unregister_self();
     return NULL;
 }
 

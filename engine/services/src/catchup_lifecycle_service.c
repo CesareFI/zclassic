@@ -14,13 +14,11 @@
 // (bounded-join timeout/error) already logs it via LOG_WARN before
 // returning false, so the reason still travels with the failure.
 
-#define _GNU_SOURCE  /* pthread_timedjoin_np */
-
 /* catchup_lifecycle_service — see the header doc comment for the
  * boot_services.c origin + contract. catchup_lifecycle_join_thread_bounded/
  * catchup_lifecycle_join_deadline_from_now mirror
  * engine/composition/src/boot_background_workers.c's boot_join_thread_bounded (bounded
- * pthread_timedjoin_np, log + detach on timeout/error) — kept local
+ * cooperative join, log + retained ownership on timeout/error) — kept local
  * instead of shared so this service does not depend on a
  * engine/composition/src-internal header ("Not for use outside engine/composition/src/"). The
  * engine/composition/src original uses a raw fprintf (boot/shutdown code avoids the
@@ -32,6 +30,7 @@
 #include "services/catchup_lifecycle_service.h"
 #include "controllers/sync_controller.h" /* struct node_db_sync_catchup_job */
 #include "util/log_macros.h"
+#include "util/thread_registry.h"
 #include "util/util.h"  /* GetDataDir */
 
 #include <errno.h>
@@ -41,7 +40,6 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(__linux__)
 static void catchup_lifecycle_join_deadline_from_now(struct timespec *ts,
                                                       int timeout_sec)
 {
@@ -50,18 +48,16 @@ static void catchup_lifecycle_join_deadline_from_now(struct timespec *ts,
         timeout_sec = 0;
     ts->tv_sec += timeout_sec;
 }
-#endif
 
 static bool catchup_lifecycle_join_thread_bounded(pthread_t thread,
                                                    const char *name,
                                                    int timeout_sec)
 {
-#if defined(__linux__)
     struct timespec deadline;
     int rc;
 
     catchup_lifecycle_join_deadline_from_now(&deadline, timeout_sec);
-    rc = pthread_timedjoin_np(thread, NULL, &deadline);
+    rc = thread_registry_join_until(thread, NULL, &deadline);
     if (rc == 0)
         return true;
 
@@ -76,14 +72,6 @@ static bool catchup_lifecycle_join_thread_bounded(pthread_t thread,
     }
     pthread_join(thread, NULL);
     return false;
-#else
-    (void)timeout_sec;
-    int rc = pthread_join(thread, NULL);
-    if (rc != 0)
-        LOG_WARN("catchup_lifecycle", "%s join failed rc=%d (%s)",
-                 name ? name : "thread", rc, strerror(rc));
-    return rc == 0;
-#endif
 }
 
 bool catchup_lifecycle_start(struct node_db_sync_catchup_job *job,

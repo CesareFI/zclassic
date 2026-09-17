@@ -6,12 +6,9 @@
  * as ROOT supervisor children, so a wedged loop in lib/ or config/ is a
  * named blocker instead of a silent stop. SAFE stateless workers may also opt
  * into bounded auto-restart (Erlang/OTP) via the _restartable variant. */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE  /* pthread_tryjoin_np */
-#endif
-
 #include "util/thread_liveness.h"
 
+#include "platform/time_compat.h"
 #include "util/log_macros.h"
 #include "util/thread_registry.h"
 
@@ -77,14 +74,13 @@ static void tl_on_stall(struct liveness_contract *self)
 }
 
 /* Respawn callback invoked by the supervisor when a restartable child's worker
- * has EXITED. Reaps the dead worker (pthread_tryjoin_np, which also GUARDS
- * against a false EXITED: EBUSY ⇒ the worker is actually still alive, so we
- * abort without spawning — never double-spawn a live thread) and starts a
- * fresh worker with the same entry/arg. Returns true when it handled the death
- * (spawned, or definitively failed to and wants the attempt counted toward the
- * storm cap); false only when the worker was still alive. Runs on the
- * supervisor thread; serialized against thread_liveness_stop_* by
- * restart_lock. */
+ * has EXITED. Reaps through the registry with an already-expired completion
+ * deadline, which also GUARDS against a false EXITED: ETIMEDOUT means the
+ * worker is actually still alive, so we abort without spawning — never
+ * double-spawn a live thread. Returns true when it handled the death (spawned,
+ * or definitively failed to and wants the attempt counted toward the storm
+ * cap); false only when the worker was still alive. Runs on the supervisor
+ * thread; serialized against thread_liveness_stop_* by restart_lock. */
 static bool tl_on_respawn(struct liveness_contract *self)
 {
     if (!self) return false;
@@ -102,13 +98,13 @@ static bool tl_on_respawn(struct liveness_contract *self)
         goto out;
 
     if (atomic_load(&c->worker_tid_set)) {
-#if defined(__linux__)
-        int jr = pthread_tryjoin_np(c->worker_tid, NULL);
-#elif defined(_WIN32)
-        int jr = _pthread_tryjoin(c->worker_tid, NULL);
-#endif
-#if defined(__linux__) || defined(_WIN32)
-        if (jr == EBUSY) {
+        struct timespec deadline;
+        if (platform_time_realtime_timespec(&deadline) != 0) {
+            atomic_store(&self->worker_state, SUPERVISOR_WORKER_EXITED);
+            goto out;
+        }
+        int jr = thread_registry_join_until(c->worker_tid, NULL, &deadline);
+        if (jr == ETIMEDOUT || jr == EBUSY) {
             /* False EXITED — the worker is still terminating. Abort: do NOT
              * spawn, do NOT count. Restore EXITED (the supervisor claimed it as
              * RESTARTING) so the next sweep retries once the worker is truly
@@ -116,16 +112,16 @@ static bool tl_on_respawn(struct liveness_contract *self)
             atomic_store(&self->worker_state, SUPERVISOR_WORKER_EXITED);
             goto out;
         }
+        if (jr != 0 && jr != ESRCH && jr != EINVAL) {
+            LOG_WARN("thread_liveness",
+                     "[thread_liveness] reap of '%s' failed rc=%d; "
+                     "preserving the old worker handle",
+                     c->thread_name, jr);
+            atomic_store(&self->worker_state, SUPERVISOR_WORKER_EXITED);
+            goto out;
+        }
         /* jr == 0 (reaped) or ESRCH/EINVAL (already gone): worker is dead. */
         atomic_store(&c->worker_tid_set, false);
-#else
-        /* This restart contract requires a non-blocking join to prove the old
-         * worker is gone before creating its successor. Darwin has no such
-         * primitive, so preserve single-worker ownership and leave the child
-         * EXITED for the operator-visible blocker. */
-        atomic_store(&self->worker_state, SUPERVISOR_WORKER_EXITED);
-        goto out;
-#endif
     }
 
     pthread_t tid;

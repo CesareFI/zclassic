@@ -5,8 +5,6 @@
  * file COPYING or http://www.opensource.org/licenses/mit-license.php.
  */
 
-#define _GNU_SOURCE  /* pthread_timedjoin_np */
-
 /*
  *
  * Background Full Validation Service
@@ -634,10 +632,9 @@ void bg_validation_stop(struct bg_validation_service *svc)
      * retains ownership until the worker exits, so dependencies cannot be
      * freed live. */
     struct timespec ts;
-#if defined(__linux__)
     if (platform_time_realtime_timespec(&ts) == 0) {
         ts.tv_sec += 5;
-        int rc = pthread_timedjoin_np(svc->thread, NULL, &ts);
+        int rc = thread_registry_join_until(svc->thread, NULL, &ts);
         if (rc != 0) {
             LOG_WARN("bg_validation_stop", "bg_validation_stop: thread join exceeded deadline (rc=%d); retaining ownership", rc);
             pthread_join(svc->thread, NULL);
@@ -645,10 +642,6 @@ void bg_validation_stop(struct bg_validation_service *svc)
     } else {
         pthread_join(svc->thread, NULL);
     }
-#else
-    (void)ts;
-    pthread_join(svc->thread, NULL);
-#endif
     svc->thread_started = false;
 #ifdef ZCL_TESTING
     supervisor_child_id id = atomic_exchange(&g_bg_validation_supervisor_id,

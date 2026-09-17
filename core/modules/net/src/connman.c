@@ -4,11 +4,8 @@
  * Distributed under the MIT software license, see the accompanying
  * file COPYING or http://www.opensource.org/licenses/mit-license.php. */
 
-#define _GNU_SOURCE  /* pthread_timedjoin_np */
-
 #define _DEFAULT_SOURCE
 #include "platform/time_compat.h"
-#include "platform/thread_compat.h"
 #include "platform/socket_compat.h"
 #include "platform/private_file.h"
 #include "connman_internal.h"
@@ -2288,13 +2285,8 @@ void connman_signal_stop(struct connman *cm)
     g_stop = true;
 }
 
-/* pthread_timedjoin_np-based bounded join.
- *
- * Old implementation spawned a helper thread per join and polled a flag;
- * the global g_join_target / g_join_done state meant joins serialised,
- * timed_join leaked the helper on timeout, and 30 s per thread × 4
- * threads breached systemd's 90 s TimeoutStopSec. Linux's
- * pthread_timedjoin_np is the right tool. */
+/* Registry completion publication provides the bounded wait on every pthread
+ * platform, including Android/bionic where pthread_timedjoin_np is absent. */
 static bool timed_join(pthread_t thread, int timeout_sec)
 {
     struct timespec ts;
@@ -2303,7 +2295,7 @@ static bool timed_join(pthread_t thread, int timeout_sec)
         return true;
     }
     ts.tv_sec += timeout_sec;
-    int rc = platform_thread_join_until(thread, NULL, &ts);
+    int rc = thread_registry_join_until(thread, NULL, &ts);
     if (rc == 0)
         return true;
     /* Retain ownership after the diagnostic deadline. The stage watchdog may

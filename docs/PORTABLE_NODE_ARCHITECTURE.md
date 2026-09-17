@@ -179,16 +179,22 @@ build fails closed.
 
 `thread_registry` centralizes spawn tracking and the process-wide shutdown
 request. It records join ownership and has a fixed safety capacity of 256.
-Some bounded services still own their own stop flags or call platform join
-helpers directly. The node also has process-global managers and scheduler
-instances, so a second in-process node is not presently supported.
+Its spawn trampoline is the sole authority that publishes completion, and a
+registry condition variable now provides deadline-bounded waits before the
+final pthread reap. Production registry consumers no longer depend on a native
+timed-join or try-join extension. Some bounded services still own their own
+stop flags and several timeout paths retain legacy final blocking joins. The
+node also has process-global managers and scheduler instances, so a second
+in-process node is not presently supported.
 
 Android bionic does not provide glibc's `pthread_timedjoin_np`, and it also does
 not provide the cancellation mechanism used by the current Darwin emulation.
 `platform_thread_join_until` now selects Android before Linux and returns
 `ENOTSUP` explicitly. The host-side
-`test-android-thread-join-acceptance` target proves the preprocessing branch;
-it is not an NDK or arm64 proof. See the official
+`test-android-thread-join-acceptance` target proves the preprocessing branch,
+while `test-android-thread-registry-acceptance` compiles and executes the
+portable completion/timeout/retry path under `__ANDROID__`. These are host
+proofs, not NDK or arm64 proofs. See the official
 [bionic pthread interface](https://android.googlesource.com/platform/bionic/+/master/libc/include/pthread.h).
 
 ### Target model
@@ -391,9 +397,14 @@ evidence names any upstream/environmental gate failures separately.
   creation, direct timed joins, sockets, paths, and filesystem calls.
 - Add host-side compile fixtures for feature-selection branches.
 
-Current progress: Android timed join is explicit and compile-tested. Remaining
-direct `pthread_timedjoin_np` consumers and signal/backtrace paths are known
-blockers.
+Current progress: Android timed join is explicit and compile-tested. Registered
+production workers wait on portable completion publication; direct
+`pthread_timedjoin_np` and `pthread_tryjoin_np` consumers have been removed
+outside the platform capability shim and its tests. The former detached onion
+bridge pump is registry-owned, and completed registry-owned jobs are reaped
+opportunistically so a long-running node cannot exhaust the fixed table.
+Signal/backtrace paths, unregistered raw thread creation, and legacy final
+blocking-join fallbacks remain known blockers.
 
 Exit: portable headers do not select glibc-only APIs under Android macros, and
 the unsupported-runtime inventory is explicit.
@@ -461,9 +472,9 @@ chainstate, and no worker/socket use-after-free.
 ## Known blockers
 
 - No pinned Android NDK or arm64 dependency build is present in this checkout.
-- Android lacks the native timed-join/cancel mechanisms assumed by existing
-  shutdown code; cooperative completion is required.
-- Direct `pthread_timedjoin_np` consumers remain outside the shared helper.
+- Android lacks native timed-join/cancel mechanisms. Registry-owned workers now
+  publish cooperative completion portably, but stop-error propagation must
+  replace the remaining legacy final blocking-join fallbacks.
 - signal installation, backtrace/syscall diagnostics, daemon policy, and some
   `/proc` assumptions are still process/platform coupled.
 - the full node is not an independently owned `node_instance`; several global

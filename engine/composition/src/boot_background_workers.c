@@ -1,4 +1,3 @@
-#define _GNU_SOURCE  /* pthread_timedjoin_np */
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
  * Boot background-workers unit — long-lived helper threads spawned by
@@ -19,7 +18,6 @@
  * catchup-job helpers that stay in boot_services.c reuse it.
  */
 #include "platform/time_compat.h"
-#include "platform/thread_compat.h"
 #include "config/boot_internal.h"
 #include "config/boot_background_workers.h"
 #include "config/boot_projection_hole_scan.h"
@@ -40,6 +38,7 @@
 #include "util/path_check.h"
 #include "util/safe_alloc.h"
 #include "util/supervisor.h"
+#include "util/thread_registry.h"
 #include "util/thread_qos.h"
 #include <stdatomic.h>
 #include <time.h>
@@ -150,18 +149,17 @@ static _Atomic supervisor_child_id g_address_backfill_sup_id =
  * worker lifted into boot_snapshot_offer.c spawns/joins through the same
  * plumbing rather than carrying its own raw pthread_create. */
 bool boot_start_thread_service(pthread_t *thread,
-                                      bool *started,
-                                      void *(*entry)(void *),
-                                      void *arg)
+                               bool *started,
+                               const char *name,
+                               void *(*entry)(void *),
+                               void *arg)
 {
     if (!thread || !started || !entry || *started)
         return false;
-    /* Generic boot service starter wrapper for composition-owned helper
-     * threads. Callers own the pthread_t and join it explicitly. A
-     * thread_registry_spawn equivalent here would require a
-     * name-from-caller param; deferred to a focused follow-up.
-     * raw-pthread-ok */
-    if (pthread_create(thread, NULL, entry, arg) != 0)
+    /* The caller retains the pthread_t, while the registry trampoline
+     * publishes exact completion for portable bounded join. */
+    // supervised:composition-worker-contract-selected-by-caller
+    if (thread_registry_spawn(name, entry, arg, thread) != 0)
         return false;
     *started = true;
     return true;
@@ -183,7 +181,7 @@ bool boot_join_thread_bounded(pthread_t thread,
     int rc;
 
     boot_join_deadline_from_now(&deadline, timeout_sec);
-    rc = platform_thread_join_until(thread, NULL, &deadline);
+    rc = thread_registry_join_until(thread, NULL, &deadline);
     if (rc == 0)
         return true;
 
@@ -222,6 +220,7 @@ bool boot_start_payment_service(struct boot_svc_ctx *svc)
                                     PAYMENT_SUPERVISOR_DEADLINE_SEC, 0);
     return boot_start_thread_service(&svc->payment_thread,
                                      &svc->payment_thread_started,
+                                     "zcl_payment",
                                      payment_processor_thread, svc);
 }
 
@@ -244,6 +243,7 @@ bool boot_start_address_backfill_service(struct boot_svc_ctx *svc)
                                     ADDRESS_BACKFILL_SUPERVISOR_DEADLINE_SEC, 0);
     return boot_start_thread_service(&svc->address_backfill_thread,
                                      &svc->address_backfill_thread_started,
+                                     "zcl_addr_backfill",
                                      address_backfill_service_thread, svc);
 }
 
@@ -608,6 +608,7 @@ bool boot_start_hodl_history_service(struct boot_svc_ctx *svc)
     svc->hodl_history_thread_stop = false;
     return boot_start_thread_service(&svc->hodl_history_thread,
                                      &svc->hodl_history_thread_started,
+                                     "zcl_hodl_history",
                                      hodl_history_worker_thread, svc);
 }
 
@@ -633,6 +634,7 @@ bool boot_start_projection_backfill_service(struct boot_svc_ctx *svc)
     svc->projection_backfill_thread_stop = false;
     return boot_start_thread_service(&svc->projection_backfill_thread,
                                      &svc->projection_backfill_thread_started,
+                                     "zcl_proj_backfill",
                                      projection_backfill_service_thread, svc);
 }
 

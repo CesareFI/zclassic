@@ -719,7 +719,6 @@ static void *sapling_tree_rebuild_deferred_thread(void *arg)
     if (!sapling_tree_open_persist_lane(reducer_ndb, &persist_ndb,
                                         active_chain_height(chain))) {
         atomic_store(&g_sapling_tree_rebuilding, false);
-        thread_registry_unregister_self();
         return NULL;
     }
 
@@ -750,7 +749,6 @@ static void *sapling_tree_rebuild_deferred_thread(void *arg)
     node_db_close(&persist_ndb);
     if (datadir)
         save_block_index_flat(datadir, ms);
-    thread_registry_unregister_self();
     return NULL;
 }
 

@@ -7,6 +7,7 @@
  * connection's: it exits on fd EOF or stream terminal and frees the bridge
  * in the same frame, so there is no long-running loop to supervise, and at
  * most MAX_OUTBOUND_ONION such threads exist at once. */
+// supervisor-ok:bounded-per-connection-pump-registry-owned
 
 #if !defined(_WIN32)
 #define _DEFAULT_SOURCE
@@ -20,6 +21,7 @@
 #include "platform/socket_compat.h"
 #include "util/safe_alloc.h"
 #include "util/log_macros.h"
+#include "util/thread_registry.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -462,20 +464,16 @@ static void *onion_bridge_pump(void *arg)
 
 static bool onion_bridge_spawn_pump(struct onion_bridge *b)
 {
-    pthread_t tid;
-    /* raw-pthread-ok: per-connection pump, detached and bounded by
-     * MAX_OUTBOUND_ONION concurrent onion peers; the thread registry's
-     * NULL-tid ownership retains every entry until join_all, which a
-     * long-lived node dialing onion peers over months would eventually
-     * fill. The bridge teardown (fd EOF or stream terminal) is the
-     * liveness contract — there is nothing for a supervisor to restart. */
-    /* raw-pthread-ok: see the block above */
-    int rc = pthread_create(&tid, NULL, onion_bridge_pump, b);
+    /* Registry ownership makes every live pump visible to final shutdown.
+     * Completed registry-owned rows are opportunistically reaped at spawn, so
+     * repeated onion connections cannot consume the fixed table forever. */
+    // thread-supervision-ok:bounded-per-connection-pump-registry-owned
+    int rc = thread_registry_spawn("zcl_onion_pump", onion_bridge_pump,
+                                   b, NULL);
     if (rc != 0) {
-        LOG_FAIL("onion", "pthread_create failed for onion pump to %s: rc=%d",
+        LOG_FAIL("onion", "thread spawn failed for onion pump to %s: rc=%d",
                  b->desc, rc);
     }
-    pthread_detach(tid);
     return true;
 }
 

@@ -34,11 +34,11 @@
  *
  *   thread_registry_join_all(timeout_sec)
  *     Walks the registry, bounded-joins each entry for `timeout_sec`, and
- *     returns the count that failed to exit in time. Linux uses
- *     pthread_timedjoin_np, Windows a waitable thread handle, and Darwin a
- *     cancel-safe join waiter that leaves a timed-out target joinable.
- *     Diagnostic output names any stragglers so the operator can see which
- *     subsystem is hanging shutdown.
+ *     returns the count that failed to exit in time. Every platform waits on
+ *     completion published by the spawn trampoline, then performs the final
+ *     pthread reap only after the worker has returned. Diagnostic output
+ *     names any stragglers so the operator can see which subsystem is hanging
+ *     shutdown.
  *
  * Ownership is explicit at spawn: NULL out_tid means the registry owns the
  * join and retains a finished thread until join_all reaps it. A non-NULL
@@ -52,6 +52,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <time.h>
 
 /* Max concurrent registered threads. Sized generously above the ~50
  * currently spawned so we have headroom for swarm/parallel-sync
@@ -70,11 +71,12 @@
 /* Spawn a thread via pthread_create and record it in the registry.
  * `name` is copied; pass NULL for "unnamed". When `out_tid` is
  * non-NULL, writes the spawned thread's pthread_t into *out_tid so the
- * caller can pthread_join it from its own subsystem stop() path. The
- * A NULL `out_tid` gives join ownership to the registry: normal exit marks the
- * row finished but join_all still reaps it. A non-NULL `out_tid` gives join
- * ownership to the caller: normal exit unregisters the row and the caller's
- * stop routine must pthread_join the retained tid.
+ * caller can join it from its own subsystem stop() path. A NULL `out_tid`
+ * gives join ownership to the registry: normal exit marks the
+ * row finished; the next spawn opportunistically reaps completed
+ * registry-owned rows, and join_all reaps any remainder. A non-NULL `out_tid`
+ * gives join ownership to the caller: normal exit unregisters the row and the
+ * caller's stop routine must pthread_join the retained tid.
  *
  * Pass a non-NULL `out_tid` for bounded-lifetime services that already
  * have their own stop() routine; pass NULL for long-running daemons
@@ -94,15 +96,23 @@ bool thread_registry_shutdown_requested(void);
  * no heap allocation, no lock acquisition). */
 void thread_registry_request_shutdown(void);
 
-/* Record that the calling thread is exiting. For registry-owned threads the
- * row remains pending until join_all reaps the joinable pthread. For
- * caller-owned threads the row is removed; their stop routine retained the
- * tid and must join it. The spawn trampoline calls this automatically. */
-void thread_registry_unregister_self(void);
+/* Wait until a registered worker's trampoline publishes completion, then reap
+ * it with pthread_join(). The absolute deadline uses CLOCK_REALTIME, matching
+ * pthread_cond_timedwait(). Unlike platform-specific timed-join extensions,
+ * this works on Android/bionic without cancellation or a detached helper.
+ *
+ * Ownership is retained on timeout/error, so the caller may retry. `thread`
+ * must have been returned by thread_registry_spawn(); an already-completed
+ * caller-owned worker may no longer have a row, in which case pthread_join()
+ * only performs the final reap. */
+int thread_registry_join_until(pthread_t thread,
+                               void **result,
+                               const struct timespec *deadline);
 
-/* Bounded-join each registered thread with `timeout_sec`. Returns the number
- * that failed to join in time (0 on clean shutdown). Prints the name of every
- * straggler. */
+/* Bounded-join registered threads under one aggregate `timeout_sec` deadline.
+ * Returns the number that failed to join in time (0 on clean shutdown) and
+ * prints every straggler. The budget is shared across the sweep, so hostile or
+ * wedged workers cannot multiply shutdown latency by the 256-row capacity. */
 int thread_registry_join_all(int timeout_sec);
 
 /* Same diagnostic sweep, but leave the exact pthread_t values in `excluded`

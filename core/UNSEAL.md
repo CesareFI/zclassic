@@ -168,3 +168,15 @@ later lane flips it HARD.
 - 2026-09-17T12:16:24Z — REASON: Owner-requested behavior-preserving decomposition of header range scheduling below the complexity cap; consensus predicates and historical validity unchanged
   old ROOT: 7cf6e8300617030134f1497155d9f3ff540349944447bfc39aea478cedb27fda
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T13:08:43Z — REASON: Route network worker completion through the portable registry and retain onion pump ownership; consensus validation and chain rules are unchanged
+  old ROOT: 89464f92690309f15846a1112f4d7587165925388f1b478fae3492ba31e4cb3a
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T13:12:41Z — REASON: Record the bounded registry-owned onion pump supervision disposition; consensus validation and chain rules are unchanged
+  old ROOT: f7e8df88b2a022c708ab4829a97ff0eab50bd059328425805e9d2b0c569d6432
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T13:44:37Z — REASON: Record the transient onion pump supervisor disposition required by the portability lint; runtime and consensus behavior are unchanged
+  old ROOT: 02f3918b3ae32d06853608afc7f1fc57506ca3ef1bf842938ae8d72d319309d2
+  by: owner unseal ritual (make core-unseal)

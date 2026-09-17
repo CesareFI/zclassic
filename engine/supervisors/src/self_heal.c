@@ -134,7 +134,6 @@ static void *self_heal_worker_main(void *arg)
     }
 
     supervisor_worker_exited(id);
-    thread_registry_unregister_self();
     return NULL;
 }
 

@@ -258,6 +258,8 @@ ZCL_HOTSWAP_LOOP_GOALS := hotswap-try hotswap-apply hotswap c3-mutex-probe c3-sp
 	windows-headless-run windows-headless-run-selftest \
 	build/bin/z23-headless-run.exe \
 	new-app new-app-selftest test-windows-thread-join-acceptance \
+	test-android-thread-join-acceptance \
+	test-android-thread-registry-acceptance \
 	$(ZCL_GUI_APP_GOALS)
 ZCL_HOTSWAP_LOOP_ONLY := $(if $(strip $(MAKECMDGOALS)),$(if $(strip $(filter-out $(ZCL_HOTSWAP_LOOP_GOALS),$(MAKECMDGOALS))),,1),)
 
@@ -8300,6 +8302,30 @@ $(ANDROID_THREAD_JOIN_ACCEPTANCE_BIN): platform/modules/platform/tests/thread_jo
 	$(CC) $(ZCL_PLATFORM_CPPFLAGS) -D_GNU_SOURCE -D__ANDROID__ \
 		-std=c23 -Wall -Wextra -Werror -pedantic \
 		-Iplatform/modules/platform/include $< $(ZCL_STATIC_FLAG) -pthread -o $@
+
+# Compile and execute the registry's cooperative completion path under the
+# Android feature macro. This remains a host proof; the arm64 NDK link receipt
+# is a later architecture stage.
+ANDROID_THREAD_REGISTRY_ACCEPTANCE_BIN := $(BIN_DIR)/thread-registry-android-acceptance
+.PHONY: test-android-thread-registry-acceptance
+test-android-thread-registry-acceptance: $(ANDROID_THREAD_REGISTRY_ACCEPTANCE_BIN)
+	@$(ANDROID_THREAD_REGISTRY_ACCEPTANCE_BIN)
+
+$(ANDROID_THREAD_REGISTRY_ACCEPTANCE_BIN): platform/modules/util/tests/thread_registry_android_acceptance.c \
+		platform/modules/util/src/thread_registry.c \
+		platform/modules/util/include/util/thread_registry.h \
+		platform/modules/platform/src/clock.c \
+		platform/modules/base/src/safe_alloc.c
+	@mkdir -p $(dir $@)
+	$(CC) $(ZCL_PLATFORM_CPPFLAGS) -D_GNU_SOURCE -D__ANDROID__ \
+		-std=c23 -Wall -Wextra -Werror -pedantic \
+		-Iplatform/modules/platform/include -Iplatform/modules/util/include \
+		-Iplatform/modules/base/include \
+		platform/modules/util/tests/thread_registry_android_acceptance.c \
+		platform/modules/util/src/thread_registry.c \
+		platform/modules/platform/src/clock.c \
+		platform/modules/base/src/safe_alloc.c \
+		$(ZCL_STATIC_FLAG) -pthread -o $@
 
 # ── STICKINESS fault-injection matrix (sticky-node-plan §4 metric) ──
 #

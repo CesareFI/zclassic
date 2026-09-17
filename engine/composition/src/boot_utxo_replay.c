@@ -59,6 +59,7 @@ bool boot_start_replay_service(struct boot_svc_ctx *svc)
                                     UTXO_REPLAY_SUPERVISOR_DEADLINE_SEC, 0);
     return boot_start_thread_service(&svc->replay_thread,
                                      &svc->replay_thread_started,
+                                     "zcl_utxo_replay",
                                      background_utxo_replay, svc);
 }
 
