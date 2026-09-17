@@ -5,6 +5,7 @@
 #endif
 
 #include "services/muse_run.h"
+#include "services/muse_run_audit.h"
 #include "services/muse_session.h"
 #include "base/safe_alloc.h"
 #include "engine/engine_verdict.h"
@@ -25,12 +26,6 @@
 #define MR_TEXT_DEFAULT (64u * 1024u)
 #define MR_GATE_LOG_MAX (256u * 1024u)
 #define MR_LINE_MAX (1024u * 1024u)
-#define MR_GIT_TIMEOUT_MS 60000
-/* Bound on one porcelain capture. zcl_spawn_capture discards whatever
- * overruns its buffer and still reports the child's exit status, so a
- * capture that fills its bound is INDISTINGUISHABLE from a complete one
- * and must be treated as unmeasurable, never as a short change set. */
-#define MR_AUDIT_MAX (256u * 1024u)
 
 static const char *mr_verdict_pass = "pass";
 static const char *mr_verdict_failed = "failed";
@@ -123,27 +118,6 @@ static bool mr_append_line(const char *path, const char *line)
     ok = fprintf(f, "%s\n", line) > 0;
     if (fclose(f) != 0) ok = false;
     return ok;
-}
-
-/* JSON string escaper for evidence fields (host- and model-minted text). */
-static void mr_esc(const char *s, char *out, size_t cap)
-{
-    size_t n = 0;
-    if (!s) s = "";
-    while (*s && n + 6 < cap) {
-        unsigned char c = (unsigned char)*s++;
-        if (c == '"' || c == '\\') {
-            out[n++] = '\\';
-            out[n++] = (char)c;
-        } else if (c < 0x20) {
-            int w = snprintf(out + n, cap - n, "\\u%04x", c);
-            if (w <= 0 || (size_t)w >= cap - n) break;
-            n += (size_t)w;
-        } else {
-            out[n++] = (char)c;
-        }
-    }
-    out[n] = '\0';
 }
 
 static bool mr_copy(char *out, size_t cap, const char *v, size_t vn)
@@ -334,151 +308,7 @@ static void mr_report_short(const struct muse_run_task *t,
     (void)out;
 }
 
-/* --- measured helpers ------------------------------------------------------ */
-
-/* True when a capture filled its bound: the helper silently discards the
- * overrun, so a full buffer proves only that the measurement is unknown. */
-static bool mr_capture_truncated(const char *buf, size_t cap)
-{
-    return cap == 0 || strlen(buf) + 1 >= cap;
-}
-
-/* -1 is UNMEASURABLE and is never the same answer as 0, which is a
- * measured clean tree: a failed spawn, a non-zero git, or a capture that
- * filled its bound all refuse rather than under-report the count. */
-static long long mr_files_changed(const char *workspace)
-{
-    const char *argv[] = { "git", "-C", workspace, "status", "--porcelain",
-                           NULL };
-    char *buf = zcl_malloc(MR_AUDIT_MAX, "muse_run.git_out");
-    long long count = 0;
-    int rc;
-    if (!buf) return -1;
-    buf[0] = '\0';
-    rc = zcl_spawn_capture(argv, buf, MR_AUDIT_MAX, MR_GIT_TIMEOUT_MS);
-    if (rc != 0 || mr_capture_truncated(buf, MR_AUDIT_MAX)) {
-        free(buf);
-        return -1;
-    }
-    for (const char *p = buf; *p; p++) {
-        if (*p == '\n') count++;
-    }
-    free(buf);
-    return count;
-}
-
-/* One captured git line, trailing newline trimmed. False on any failure;
- * identity is evidence, never judgement, so failure degrades to "none". */
-static bool mr_git_line(char *out, size_t cap, const char *workspace,
-    const char *a1, const char *a2, const char *a3)
-{
-    const char *argv[] = { "git", "-C", workspace, a1, a2, a3, NULL };
-    char *buf = zcl_malloc(65536, "muse_run.git_line");
-    int rc;
-    size_t n;
-    if (!buf || !out || cap == 0) {
-        free(buf);
-        return false;
-    }
-    buf[0] = '\0';
-    rc = zcl_spawn_capture(argv, buf, 65536, MR_GIT_TIMEOUT_MS);
-    if (rc != 0) {
-        free(buf);
-        return false;
-    }
-    n = strlen(buf);
-    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] =
-        '\0';
-    if (n == 0 || n >= cap) {
-        free(buf);
-        return false;
-    }
-    memcpy(out, buf, n + 1);
-    free(buf);
-    return true;
-}
-
-static bool mr_hex40(const char *s)
-{
-    int i;
-    if (!s) return false;
-    for (i = 0; i < 40; i++) {
-        char c = s[i];
-        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-        if (!hex) return false;
-    }
-    return s[40] == '\0';
-}
-
-/* HEAD, as one 40-hex identity. False when git could not name it, and the
- * field degrades to the literal "none" so no reader mistakes an unread
- * identity for a match. An identity that is not 40 hex is unread: this is
- * an equality test later, and a partial answer would compare unequal for
- * the wrong reason. */
-static bool mr_head_at(const char *workspace, char *out, size_t cap)
-{
-    if (mr_git_line(out, cap, workspace, "rev-parse", "HEAD", NULL) &&
-        mr_hex40(out))
-        return true;
-    (void)snprintf(out, cap, "none");
-    return false;
-}
-
-/* The escapes git emits after a backslash in a C-quoted path, paired with
- * the byte each one stands for. Anything else is a row this parser did not
- * write, so it cannot claim to have read it either. */
-static const char mr_escape_from[] = "abfnrtv\\\"";
-static const char mr_escape_to[] = "\a\b\f\n\r\t\v\\\"";
-
-/* One backslash escape, resolved into *w. p points at the character AFTER
- * the backslash; returns the last character consumed, or NULL when the
- * escape is not one git emits. */
-static const char *mr_unescape(const char *p, char **w)
-{
-    const char *hit;
-    if (!*p) return NULL;
-    if (*p >= '0' && *p <= '7') {
-        int v = 0, k = 0;
-        while (k < 3 && *p >= '0' && *p <= '7') {
-            v = v * 8 + (*p - '0');
-            p++;
-            k++;
-        }
-        *(*w)++ = (char)v;
-        return p - 1;
-    }
-    hit = strchr(mr_escape_from, *p);
-    if (!hit) return NULL;
-    *(*w)++ = mr_escape_to[hit - mr_escape_from];
-    return p;
-}
-
-/* Dequote one C-quoted porcelain path in place ("a b" -> a b). False when
- * the quoting is MALFORMED — an unterminated quote, a backslash with
- * nothing after it, or an escape git never emits. A best-effort path out
- * of a broken row is a path this audit cannot claim to have measured, and
- * every caller turns that into a refusal rather than a judgement. */
-static bool mr_dequote(char *path)
-{
-    char *w;
-    size_t n = strlen(path);
-    if (n == 0) return true;
-    if (path[0] != '"') return strchr(path, '"') == NULL;
-    if (n < 2 || path[n - 1] != '"') return false;
-    path[n - 1] = '\0';
-    w = path;
-    for (const char *p = path + 1; *p; p++) {
-        if (*p != '\\') {
-            *w++ = *p;
-            continue;
-        }
-        if (!p[1]) return false;
-        p = mr_unescape(p + 1, &w);
-        if (!p) return false;
-    }
-    *w = '\0';
-    return true;
-}
+/* --- the candidate identity ---------------------------------------------- */
 
 /* Append "path hash" lines for every untracked path: the content half
  * of the change set that `git diff` never shows. */
@@ -504,12 +334,12 @@ static void mr_fold_others(const char *workspace, char *acc, size_t acc_cap,
         /* A path whose quoting will not read is not folded as a
          * best-effort guess: the identity must name what was measured or
          * name nothing, and the scope audit refuses the same row. */
-        if (!mr_dequote(line)) break;
+        if (!muse_dequote(line)) break;
         w = snprintf(acc + *used, acc_cap - *used, "?? %s ",
             path);
         if (w <= 0 || (size_t)w >= acc_cap - *used) break;
         *used += (size_t)w;
-        if (mr_git_line(h, sizeof(h), workspace, "hash-object", "--",
+        if (muse_git_line(h, sizeof(h), workspace, "hash-object", "--",
                 path)) {
             w = snprintf(acc + *used, acc_cap - *used, "%s\n", h);
         } else {
@@ -519,203 +349,6 @@ static void mr_fold_others(const char *workspace, char *acc, size_t acc_cap,
         *used += (size_t)w;
     }
     free(list);
-}
-
-/* --- the scope audit ------------------------------------------------------
- * THE MODEL PROPOSES. THE GATE DECIDES — and the SCOPE is decided here, by
- * measured output. The allow prefix handed to the session binds only the
- * moment the model asks for approval; it proves nothing about what the
- * workspace holds afterwards. So the run re-measures the change set through
- * the SAME `git status --porcelain` invocation mr_files_changed counts, and
- * judges every path it names. */
-
-/* Inside the declared scope: the path IS the scope, or it lives under it.
- * A scope naming a directory admits its contents and never a sibling whose
- * name merely starts the same way ("docs/" never admits "docsevil/x"), and
- * any path carrying ".." or a leading '/' is outside by definition. */
-static bool mr_in_scope(const char *path, const char *scope)
-{
-    size_t n;
-    if (!path || !path[0] || !scope || !scope[0]) return false;
-    if (path[0] == '/' || strstr(path, "..") != NULL) return false;
-    n = strlen(scope);
-    while (n > 0 && scope[n - 1] == '/') n--;
-    if (n == 0) return false;
-    if (strncmp(path, scope, n) != 0) return false;
-    if (path[n] == '\0') return true;
-    return path[n] == '/';
-}
-
-/* Appends one escaped element to a bounded JSON array body. False once the
- * bound is reached: one run's change set can never write without limit, and
- * the body stays valid JSON at every truncation point. */
-static bool mr_list_push(char *buf, size_t cap, size_t *used,
-    const char *path)
-{
-    char esc[1024];
-    int w;
-    if (!buf || cap == 0 || *used >= cap) return false;
-    mr_esc(path, esc, sizeof(esc));
-    w = snprintf(buf + *used, cap - *used, "%s\"%s\"",
-        *used > 0 ? "," : "", esc);
-    if (w <= 0 || (size_t)w >= cap - *used) {
-        buf[*used] = '\0';
-        return false;
-    }
-    *used += (size_t)w;
-    return true;
-}
-
-/* One measurement pass. scope NULL records the paths without judging them:
- * that is the pre-state pass, where any path at all is already a refusal. */
-struct mr_audit {
-    const char *scope;
-    char *list;
-    size_t list_cap;
-    size_t list_used;
-    char *outside;
-    size_t outside_cap;
-    size_t outside_used;
-    long long total;
-    long long outside_total;
-    /* Rows the parser could not read. Silently dropping one would hide a
-     * path, so any non-zero value makes the whole pass unmeasurable. */
-    long long unreadable;
-};
-
-static void mr_audit_init(struct mr_audit *a, const char *scope, char *list,
-    size_t list_cap, char *outside, size_t outside_cap)
-{
-    memset(a, 0, sizeof(*a));
-    a->scope = scope;
-    a->list = list;
-    a->list_cap = list_cap;
-    a->outside = outside;
-    a->outside_cap = outside_cap;
-    if (list && list_cap > 0) list[0] = '\0';
-    if (outside && outside_cap > 0) outside[0] = '\0';
-}
-
-/* One measured path: counted in full, recorded while the bound allows, and
- * judged against the scope. A row that names nothing is unreadable, never
- * an absence. */
-static void mr_audit_path(struct mr_audit *a, const char *path)
-{
-    if (!path || !path[0]) {
-        a->unreadable++;
-        return;
-    }
-    a->total++;
-    (void)mr_list_push(a->list, a->list_cap, &a->list_used, path);
-    if (!a->scope || mr_in_scope(path, a->scope)) return;
-    a->outside_total++;
-    (void)mr_list_push(a->outside, a->outside_cap, &a->outside_used, path);
-}
-
-/* Every status character porcelain v1 can print in either column. */
-static bool mr_status_char(char c)
-{
-    return c == ' ' || c == 'M' || c == 'T' || c == 'A' || c == 'D' ||
-        c == 'R' || c == 'C' || c == 'U' || c == '?' || c == '!';
-}
-
-/* The row's fixed-width prefix, exactly: two legal status characters and
- * the single space that always follows them. '?' and '!' only ever appear
- * doubled, and two blanks mean "unmodified in both columns", which this
- * seam never prints. A line that is not that shape did not come out of
- * the porcelain this audit measures, so the caller counts it unreadable
- * instead of trusting the path it appears to carry: length alone is not a
- * shape, and a blind fixed skip over a line of the wrong shape invents a
- * path out of whatever follows. */
-static bool mr_row_status_ok(const char *line)
-{
-    if (!line || strlen(line) < 4) return false;
-    if (!mr_status_char(line[0]) || !mr_status_char(line[1])) return false;
-    if (line[2] != ' ') return false;
-    if ((line[0] == '?') != (line[1] == '?')) return false;
-    if ((line[0] == '!') != (line[1] == '!')) return false;
-    return line[0] != ' ' || line[1] != ' ';
-}
-
-/* Whether the status names a second path. Rename and copy carry " -> " in
- * either column; nothing else does. */
-static bool mr_row_names_two(const char *line)
-{
-    return line[0] == 'R' || line[0] == 'C' ||
-        line[1] == 'R' || line[1] == 'C';
-}
-
-/* One porcelain row -> the path or paths it names. A rename row names two
- * paths and BOTH are judged: moving a file out of scope changes it just as
- * surely as editing it does. The shape must AGREE with the status: an
- * R/C row without its separator, or a separator on a status that cannot
- * carry one, is unreadable rather than one lucky path — either way the
- * row names something this parser did not identify, and a path it did not
- * identify is a path it did not judge. A literal " -> " inside a single
- * unquoted filename is ambiguous by the same rule and refuses too. */
-static void mr_audit_row(struct mr_audit *a, char *line)
-{
-    char *arrow;
-    bool two;
-    if (!mr_row_status_ok(line)) {
-        a->unreadable++;
-        return;
-    }
-    two = mr_row_names_two(line);
-    line += 3;
-    arrow = strstr(line, " -> ");
-    if (two != (arrow != NULL)) {
-        a->unreadable++;
-        return;
-    }
-    if (arrow) {
-        *arrow = '\0';
-        if (!mr_dequote(line)) {
-            a->unreadable++;
-            return;
-        }
-        mr_audit_path(a, line);
-        line = arrow + 4;
-    }
-    if (!mr_dequote(line)) {
-        a->unreadable++;
-        return;
-    }
-    mr_audit_path(a, line);
-}
-
-/* The measured change set, through the porcelain seam the diff count
- * already uses. False when the change set could not be MEASURED: a failed
- * allocation, a failed spawn, a non-zero or timed-out git, a capture that
- * filled its bound, or a row the parser could not read. Every one of those
- * is a refusal input. None of them may ever read as "clean" or as "nothing
- * outside scope" — a silent default there turns this whole audit from a
- * guarantee into decoration. */
-static bool mr_audit_scan(const char *workspace, struct mr_audit *a)
-{
-    /* -uall on purpose: the default collapses a wholly untracked
-     * directory to its own name, and while that is still sound for the
-     * judgement (the directory name is a prefix of everything inside it,
-     * so a collapse can never hide an out-of-scope path), the changed
-     * list IS the proof that the permission was respected. Name the
-     * files. Same seam, same binary, one flag. */
-    const char *argv[] = { "git", "-C", workspace, "status", "--porcelain",
-                           "-uall", NULL };
-    char *buf = zcl_malloc(MR_AUDIT_MAX, "muse_run.audit");
-    int rc;
-    bool ok;
-    if (!buf) return false;
-    buf[0] = '\0';
-    rc = zcl_spawn_capture(argv, buf, MR_AUDIT_MAX, MR_GIT_TIMEOUT_MS);
-    if (rc != 0 || mr_capture_truncated(buf, MR_AUDIT_MAX)) {
-        free(buf);
-        return false;
-    }
-    for (char *line = strtok(buf, "\n"); line; line = strtok(NULL, "\n"))
-        mr_audit_row(a, line);
-    ok = a->unreadable == 0;
-    free(buf);
-    return ok;
 }
 
 /* SHA-1 over the post-run change set: the tracked diff plus one
@@ -762,7 +395,7 @@ static bool mr_hash_fold(const char *tmp, char *out, size_t cap)
     (void)unlink(tmp);
     if (rc == 0) {
         hbuf[strcspn(hbuf, "\r\n")] = '\0';
-        if (mr_hex40(hbuf) && strlen(hbuf) < cap) {
+        if (muse_hex40(hbuf) && strlen(hbuf) < cap) {
             (void)snprintf(out, cap, "%s", hbuf);
             ok = true;
         }
@@ -983,8 +616,8 @@ static void mr_write_receipt(const struct muse_run_task *t,
     const struct muse_run_result *r)
 {
     char path[8192], body[4096], esc_reason[1024], esc_engine[128];
-    mr_esc(r->reason, esc_reason, sizeof(esc_reason));
-    mr_esc(r->engine, esc_engine, sizeof(esc_engine));
+    muse_json_escape(r->reason, esc_reason, sizeof(esc_reason));
+    muse_json_escape(r->engine, esc_engine, sizeof(esc_engine));
     if (snprintf(path, sizeof(path), "%s/receipt.json",
             t->rundir) >= (int)sizeof(path))
         return;
@@ -1006,12 +639,12 @@ static void mr_write_facts(const struct muse_run_task *t,
     char esc_reason[1024], esc_engine[128], esc_verdict[2048];
     char esc_model[512], esc_gate[512], esc_spawn[192];
     if (!body) return;
-    mr_esc(r->gate_spawn, esc_spawn, sizeof(esc_spawn));
-    mr_esc(r->reason, esc_reason, sizeof(esc_reason));
-    mr_esc(r->engine, esc_engine, sizeof(esc_engine));
-    mr_esc(r->gate_verdict, esc_verdict, sizeof(esc_verdict));
-    mr_esc(r->model_resolved, esc_model, sizeof(esc_model));
-    mr_esc(t->gate, esc_gate, sizeof(esc_gate));
+    muse_json_escape(r->gate_spawn, esc_spawn, sizeof(esc_spawn));
+    muse_json_escape(r->reason, esc_reason, sizeof(esc_reason));
+    muse_json_escape(r->engine, esc_engine, sizeof(esc_engine));
+    muse_json_escape(r->gate_verdict, esc_verdict, sizeof(esc_verdict));
+    muse_json_escape(r->model_resolved, esc_model, sizeof(esc_model));
+    muse_json_escape(t->gate, esc_gate, sizeof(esc_gate));
     if (snprintf(path, sizeof(path), "%s/muse.json",
             t->rundir) >= (int)sizeof(path)) {
         free(body);
@@ -1089,9 +722,9 @@ static bool mr_prestate_clean(struct mr_core *c)
 {
     const struct muse_run_task *t = c->task;
     struct muse_run_result *r = c->res;
-    struct mr_audit a;
-    mr_audit_init(&a, NULL, r->scope_pre, sizeof(r->scope_pre), NULL, 0);
-    if (!mr_audit_scan(t->workspace, &a)) {
+    struct muse_audit a;
+    muse_audit_init(&a, NULL, r->scope_pre, sizeof(r->scope_pre), NULL, 0);
+    if (!muse_audit_scan(t->workspace, &a)) {
         /* UNMEASURABLE, which is not clean: the count stays -1 so the
          * evidence can never be read as a measured empty tree. */
         r->scope_pre_measured = false;
@@ -1126,10 +759,10 @@ static bool mr_scope_clean(struct mr_core *c)
 {
     const struct muse_run_task *t = c->task;
     struct muse_run_result *r = c->res;
-    struct mr_audit a;
-    mr_audit_init(&a, t->scope, r->scope_changed, sizeof(r->scope_changed),
+    struct muse_audit a;
+    muse_audit_init(&a, t->scope, r->scope_changed, sizeof(r->scope_changed),
         r->scope_outside, sizeof(r->scope_outside));
-    if (!mr_audit_scan(t->workspace, &a)) {
+    if (!muse_audit_scan(t->workspace, &a)) {
         /* UNMEASURABLE, which is not "nothing outside scope": both counts
          * stay -1 and the verdict stays the refused this file already
          * spends on a breakdown before judgement. */
@@ -1159,7 +792,7 @@ static bool mr_scope_clean(struct mr_core *c)
  * them into one. */
 static bool mr_head_moved(const char *pinned, const char *observed)
 {
-    return mr_hex40(pinned) && mr_hex40(observed) &&
+    return muse_hex40(pinned) && muse_hex40(observed) &&
         strcmp(pinned, observed) != 0;
 }
 
@@ -1180,7 +813,7 @@ static bool mr_head_pinned(struct mr_core *c)
     const struct muse_run_task *t = c->task;
     struct muse_run_result *r = c->res;
     r->head_measured = false;
-    if (!mr_head_at(t->workspace, r->head_observed,
+    if (!muse_head_at(t->workspace, r->head_observed,
             sizeof(r->head_observed))) {
         (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
             mr_verdict_refused);
@@ -1188,7 +821,7 @@ static bool mr_head_pinned(struct mr_core *c)
             "HEAD unreadable after the turn; pinned %s", r->base);
         return false;
     }
-    if (!mr_hex40(r->base)) {
+    if (!muse_hex40(r->base)) {
         (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
             mr_verdict_refused);
         (void)snprintf(r->reason, sizeof(r->reason),
@@ -1330,7 +963,7 @@ static bool mr_pass_closed(const struct muse_run_result *r,
 static bool mr_measured_before_gate(struct mr_core *c)
 {
     struct muse_run_result *r = c->res;
-    r->files_changed = mr_files_changed(c->task->workspace);
+    r->files_changed = muse_files_changed(c->task->workspace);
     if (r->files_changed < 0) {
         (void)snprintf(r->reason, sizeof(r->reason),
             "worktree diff unmeasurable");
@@ -1458,7 +1091,7 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
      * judged two lines down — a workspace whose porcelain cannot be read
      * usually cannot name a commit either, and that breakdown deserves
      * the more specific diagnosis of the two. */
-    (void)mr_head_at(t->workspace, r->base, sizeof(r->base));
+    (void)muse_head_at(t->workspace, r->base, sizeof(r->base));
     /* The workspace must be measurably clean BEFORE the turn: baseline
      * dirt could otherwise satisfy the non-empty diff a pass requires.
      * No session, no turn, no tokens. */
@@ -1466,7 +1099,7 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
     /* An anchor that could not be read can never be compared afterwards,
      * so a run without one stops before a token is spent rather than
      * judging a change set against nothing. */
-    if (!mr_hex40(r->base)) {
+    if (!muse_hex40(r->base)) {
         (void)snprintf(r->reason, sizeof(r->reason),
             "HEAD unreadable before the turn: base %s", r->base);
         goto write;

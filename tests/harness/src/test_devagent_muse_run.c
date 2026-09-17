@@ -717,6 +717,21 @@ static int mr_pass_candidate(const struct mr_dirs *d,
     return failures;
 }
 
+/* The two measured facts a pass now also rests on, as the evidence file
+ * publishes them: the pinned commit held still, and the gate's own
+ * process exited normally with status 0. */
+static int mr_pass_measured_facts(const char *ftext)
+{
+    int failures = 0;
+    MR_CHECK("pass head evidence", ftext &&
+        strstr(ftext, "\"measured\":true"));
+    MR_CHECK("pass spawn evidence", ftext &&
+        strstr(ftext, "\"spawn\":\"exit=0\"") &&
+        strstr(ftext, "\"exit\":0") &&
+        strstr(ftext, "\"normal\":true"));
+    return failures;
+}
+
 /* The facts file a passing run leaves behind. */
 static int mr_pass_facts(const struct mr_dirs *d)
 {
@@ -729,11 +744,6 @@ static int mr_pass_facts(const struct mr_dirs *d)
         strstr(ftext, "\"verdict\":\"pass\"") &&
         strstr(ftext, "\"candidate\":\"") &&
         strstr(ftext, "\"verdict\":\"SUITE VERDICT"));
-    MR_CHECK("pass head and spawn evidence", ftext &&
-        strstr(ftext, "\"measured\":true") &&
-        strstr(ftext, "\"spawn\":\"exit=0\"") &&
-        strstr(ftext, "\"exit\":0") &&
-        strstr(ftext, "\"normal\":true"));
     /* (a) The changed paths ARE the proof that the scope was respected:
      * a measured clean pre-state, and the turn's own in-scope path named
      * in the evidence with nothing outside. */
@@ -746,6 +756,7 @@ static int mr_pass_facts(const struct mr_dirs *d)
         strstr(ftext, "\"changed\":[\"src/sum.c\"]") &&
         strstr(ftext, "\"outside_count\":0") &&
         strstr(ftext, "\"outside\":[]"));
+    failures += mr_pass_measured_facts(ftext);
     free(ftext);
     return failures;
 }
