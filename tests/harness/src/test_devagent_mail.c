@@ -475,7 +475,18 @@ static int test_mail_cwd_invariance(void)
             "a/../../b names the same place",
             /* A Windows drive path, both spellings. B's oracle claims this
              * vector in prose and has no case for it, so nothing there
-             * would notice dvm_has_drive_path() breaking. */
+             * would notice dvm_has_drive_path() breaking.
+             *
+             * KEEP THESE OFF THE TWO HOME PREFIXES, the Linux one and the
+             * macOS one. check-no-operator-paths derives its
+             * operator-identity tokens FROM the tree: a home-prefixed
+             * absolute path in any tracked file mints the account segment
+             * after that prefix as an identity, then hunts that word
+             * through every file. The first draft of this vector named a
+             * macOS-style user directory, minted the common word in it,
+             * and the gate reported 649 NEW leaks in files this lane never
+             * touched. Nothing in that output points back here, so it
+             * costs a cycle to find. Windows/Temp trips nothing. */
             "copied to C:\\Windows\\Temp\\notes.txt",
             "fetched C:/Windows/Temp/notes.txt",
         };

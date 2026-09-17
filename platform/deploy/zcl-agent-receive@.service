@@ -17,11 +17,12 @@ Description=Z23 resident mail receiver for agent identity %i (admits directives,
 # WHERE THE WORK HAPPENS. A remote sender cannot carry this box's paths — it
 # does not know them, and dev.agent.mail refuses a body naming ANY absolute
 # path, since a body crosses hosts and a sender's path means nothing here —
-# so
-# a directive names the workspace logically (`muse-workspace: receiver`) and
-# THIS box resolves it to the one workspace Z23_RECEIVE_WORKSPACE names
-# below. The receiver writes the resolved absolute path into the brief, so
-# the worker and the Muse executor still receive a real absolute path.
+# so a directive names the workspace logically (`muse-workspace: receiver`)
+# and THIS box resolves it to the one workspace the operator configured through
+# Z23_RECEIVE_WORKSPACE_FLAG below — which ships EMPTY, so a selector is
+# refused until someone chooses. The receiver writes the resolved absolute
+# path into the brief, so the worker and the Muse executor still receive a
+# real absolute path.
 #
 # WHAT IT DOES NOT DO. It does not execute anything, build anything, grade
 # anything, or spawn a process. Execution belongs to the dev.agent.worker
@@ -126,16 +127,38 @@ OOMScoreAdjust=500
 # canonicalizes it with realpath and works from the canonical form, so a
 # workspace reached through a symlinked component resolves to the one real
 # directory (and that real path is what the brief, the pin and the evidence
-# record name). A path that will not resolve at all fails closed. Override
-# it per instance without editing this file:
+# record name). A path that will not resolve at all fails closed.
+#
+# SHIPPED EMPTY, ON PURPOSE. Nobody but the operator can choose which tree
+# an agent works in, so this unit ships choosing nothing: a selector
+# directive is then refused RECEIVE_WORKSPACE_UNCONFIGURED, detail
+# `no-workspace-configured`, which an operator reading the journal can match
+# to this paragraph. That is the honest answer to "you never configured a
+# workspace". A default pointing at a checkout would instead blame whatever
+# state that tree happens to be in — RECEIVE_WORKSPACE_DIRTY about a tree
+# the operator never chose. Same-box directives that name their own
+# absolute path keep working either way: that branch never consults this
+# setting.
+#
+# THE VARIABLE HOLDS THE WHOLE FLAG, not just the path, so that empty means
+# zero arguments. Measured on this host with systemd-run, printing one line
+# per argv entry:
+#   Environment=WSFLAG=              ... $WSFLAG   -> [A] [B]
+#   Environment=WSFLAG=              ... ${WSFLAG} -> [A] [] [B]
+#   Environment=WSFLAG=--workspace=/srv/wt ... $WSFLAG -> [--workspace=/srv/wt]
+# Braced ${VAR} keeps an EMPTY ARGUMENT, which would reach the leaf as
+# `--workspace=` and fail normalize with INVALID_INPUT ("invalid type or
+# range for input key 'workspace'") — so the shipped unit would crash-loop
+# to StartLimitBurst before it could refuse anything honestly. Unquoted
+# single-dollar $VAR word-splits and drops to nothing when empty, which is
+# why the line below is written that way. Absent flag: the leaf drives
+# normally and reports workspace:"".
+#
+# Configure one instance without editing this file:
 #   systemctl --user edit zcl-agent-receive@box-a
 #   [Service]
-#   Environment=Z23_RECEIVE_WORKSPACE=%h/.z23/lanes/yourlane
-#
-# Leave it empty and the receiver is simply unconfigured: it still admits an
-# absolute same-box direction, and it refuses every selector directive with
-# RECEIVE_WORKSPACE_UNCONFIGURED instead of guessing a checkout.
-Environment=Z23_RECEIVE_WORKSPACE=%h/github/zclassic23
+#   Environment=Z23_RECEIVE_WORKSPACE_FLAG=--workspace=%h/.z23/lanes/yourlane
+Environment=Z23_RECEIVE_WORKSPACE_FLAG=
 
 # THE BINARY IS THE INSTALLED ONE, NEVER A CHECKOUT'S BUILD OUTPUT. The
 # receiver and the dev.agent.worker resident are ONE candidate: if they
@@ -161,7 +184,7 @@ Environment=Z23_RECEIVE_WORKSPACE=%h/github/zclassic23
 # restart limit is what makes the loop resident across days, and every
 # decision is re-derived from files on the next drive, so a restart between
 # beats neither loses a ref nor executes one twice.
-ExecStart=%h/.local/bin/z23-dev dev agent receive run --receiver=%i --workspace=${Z23_RECEIVE_WORKSPACE} --deadline_s=86400 --wait_ms=1000
+ExecStart=%h/.local/bin/z23-dev dev agent receive run --receiver=%i $Z23_RECEIVE_WORKSPACE_FLAG --deadline_s=86400 --wait_ms=1000
 
 # The resident handles SIGTERM cooperatively: it stops taking new work at the
 # next check, the watcher wait returns within its stop-sample slice, and the
