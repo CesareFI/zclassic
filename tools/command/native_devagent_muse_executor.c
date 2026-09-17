@@ -51,6 +51,34 @@
 
 #define MX_EVIDENCE_MAX 2047
 
+/* The header block ends at the first blank line; the prose prompt below
+ * is never parsed for direction. */
+static bool mx_header_end(const char *p, size_t len)
+{
+    return len == 0 || (len == 1 && (p[0] == '\r'));
+}
+
+/* True when this line carries "<key>: " or "<key>:\t". */
+static bool mx_key_at(const char *p, size_t len, const char *key, size_t kl)
+{
+    return len > kl + 2 && strncmp(p, key, kl) == 0 && p[kl] == ':' &&
+        (p[kl + 1] == ' ' || p[kl + 1] == '\t');
+}
+
+/* Copies one header value, trailing blanks trimmed. False when it is
+ * empty or does not fit. */
+static bool mx_header_value(const char *v, size_t vn, char *out, size_t cap)
+{
+    while (vn > 0 &&
+        (v[vn - 1] == ' ' || v[vn - 1] == '\t' ||
+            v[vn - 1] == '\r'))
+        vn--;
+    if (vn == 0 || vn >= cap) return false;
+    memcpy(out, v, vn);
+    out[vn] = '\0';
+    return true;
+}
+
 /* One "muse-key: value" header line at a line start; value trimmed of
  * trailing blanks. False when the key is absent. */
 static bool mx_header_line(const char *task, const char *key, char *out,
@@ -62,22 +90,9 @@ static bool mx_header_line(const char *task, const char *key, char *out,
     for (;;) {
         const char *eol = strchr(p, '\n');
         size_t len = eol ? (size_t)(eol - p) : strlen(p);
-        /* The header block ends at the first blank line; the prose
-         * prompt below is never parsed for direction. */
-        if (len == 0 || (len == 1 && (p[0] == '\r'))) return false;
-        if (len > kl + 2 && strncmp(p, key, kl) == 0 && p[kl] == ':' &&
-            (p[kl + 1] == ' ' || p[kl + 1] == '\t')) {
-            const char *v = p + kl + 2;
-            size_t vn = len - (kl + 2);
-            while (vn > 0 &&
-                (v[vn - 1] == ' ' || v[vn - 1] == '\t' ||
-                    v[vn - 1] == '\r'))
-                vn--;
-            if (vn == 0 || vn >= cap) return false;
-            memcpy(out, v, vn);
-            out[vn] = '\0';
-            return true;
-        }
+        if (mx_header_end(p, len)) return false;
+        if (mx_key_at(p, len, key, kl))
+            return mx_header_value(p + kl + 2, len - (kl + 2), out, cap);
         if (!eol) return false;
         p = eol + 1;
     }
@@ -103,64 +118,75 @@ static const char *mx_prompt(const char *task)
     }
 }
 
-/* Best-effort claim identity for provenance: worker/session out of
- * <rundir>/claim.json. Never blocks a run when unreadable. */
-static void mx_claim_who(const char *rundir, char *worker, size_t wcap,
-    char *session, size_t scap)
+/* Reads <rundir>/claim.json, bounded at 4 KiB. NULL when unreadable. */
+static char *mx_read_claim(const char *rundir)
 {
     char path[8192];
     FILE *f;
     char *text;
     long n;
-    const char *p;
-    if (worker && wcap > 0) worker[0] = '\0';
-    if (session && scap > 0) session[0] = '\0';
     if (!rundir ||
         snprintf(path, sizeof(path), "%s/claim.json", rundir) >=
         (int)sizeof(path))
-        return;
+        return NULL;
     f = fopen(path, "rb");
-    if (!f) return;
+    if (!f) return NULL;
     if (fseek(f, 0, SEEK_END) != 0) {
         fclose(f);
-        return;
+        return NULL;
     }
     n = ftell(f);
     if (n <= 0 || n > 4096) {
         fclose(f);
-        return;
+        return NULL;
     }
     (void)fseek(f, 0, SEEK_SET);
     text = zcl_malloc((size_t)n + 1, "devagent_muse.brief");
     if (!text) {
         fclose(f);
-        return;
+        return NULL;
     }
     if (fread(text, 1, (size_t)n, f) != (size_t)n) {
         free(text);
         fclose(f);
-        return;
+        return NULL;
     }
     text[n] = '\0';
     fclose(f);
-    p = strstr(text, "\"worker\":\"");
-    if (p && worker && wcap > 0) {
-        const char *v = p + strlen("\"worker\":\"");
+    return text;
+}
+
+/* Copies the value of one flat JSON string field. `pat` is the whole
+ * `"key":"` prefix; an absent field leaves out untouched. */
+static void mx_json_str(const char *text, const char *pat, char *out,
+    size_t cap)
+{
+    const char *p;
+    if (!out || cap == 0) return;
+    p = strstr(text, pat);
+    if (!p) return;
+    {
+        const char *v = p + strlen(pat);
         const char *q = strchr(v, '"');
-        if (q && (size_t)(q - v) < wcap) {
-            memcpy(worker, v, (size_t)(q - v));
-            worker[q - v] = '\0';
+        if (q && (size_t)(q - v) < cap) {
+            memcpy(out, v, (size_t)(q - v));
+            out[q - v] = '\0';
         }
     }
-    p = strstr(text, "\"session\":\"");
-    if (p && session && scap > 0) {
-        const char *v = p + strlen("\"session\":\"");
-        const char *q = strchr(v, '"');
-        if (q && (size_t)(q - v) < scap) {
-            memcpy(session, v, (size_t)(q - v));
-            session[q - v] = '\0';
-        }
-    }
+}
+
+/* Best-effort claim identity for provenance: worker/session out of
+ * <rundir>/claim.json. Never blocks a run when unreadable. */
+static void mx_claim_who(const char *rundir, char *worker, size_t wcap,
+    char *session, size_t scap)
+{
+    char *text;
+    if (worker && wcap > 0) worker[0] = '\0';
+    if (session && scap > 0) session[0] = '\0';
+    text = mx_read_claim(rundir);
+    if (!text) return;
+    mx_json_str(text, "\"worker\":\"", worker, wcap);
+    mx_json_str(text, "\"session\":\"", session, scap);
     free(text);
 }
 
@@ -185,97 +211,158 @@ static bool mx_refuse(struct wkr_result *res, const char *reason)
     return true;
 }
 
-bool zcl_devagent_worker_muse_executor(const struct wkr_job *job,
-    struct wkr_result *res)
+/* The direction block plus the bounds. Returns the refusal reason, or
+ * NULL when the job can be attempted. Every refusal named here happens
+ * before any host is spawned. */
+static const char *mx_direction(const struct wkr_job *job, char *workspace,
+    size_t wscap, char *scope, size_t scap, char *gate, size_t gcap,
+    char *model, size_t mcap, const char **prompt)
 {
-    char workspace[4096], scope[512], gate[128], model[160];
-    const char *prompt;
-    char cworker[64], csession[64];
-    struct muse_run_task t;
-    struct muse_run_result mres;
-    char err[MUSE_RUN_ERROR_MAX];
-    char evidence[MX_EVIDENCE_MAX + 1];
-    int devnull, saved_out, rc, w;
-    if (!job || !res) return false;
-    memset(res, 0, sizeof(*res));
     if (!mx_dir_ok(job->rundir))
-        return mx_refuse(res, "refused: rundir is not a directory");
-    if (!mx_header_line(job->task, "muse-workspace", workspace,
-            sizeof(workspace)))
-        return mx_refuse(res,
-            "refused: brief carries no muse-workspace line");
+        return "refused: rundir is not a directory";
+    if (!mx_header_line(job->task, "muse-workspace", workspace, wscap))
+        return "refused: brief carries no muse-workspace line";
     if (workspace[0] != '/' || !mx_dir_ok(workspace))
-        return mx_refuse(res,
-            "refused: muse-workspace is not an absolute directory");
-    if (!mx_header_line(job->task, "muse-scope", scope, sizeof(scope)))
-        return mx_refuse(res, "refused: brief carries no muse-scope line");
-    if (!mx_header_line(job->task, "muse-gate", gate, sizeof(gate)))
-        return mx_refuse(res, "refused: brief carries no muse-gate line");
-    prompt = mx_prompt(job->task);
-    if (!prompt)
-        return mx_refuse(res, "refused: brief carries no prompt body");
+        return "refused: muse-workspace is not an absolute directory";
+    if (!mx_header_line(job->task, "muse-scope", scope, scap))
+        return "refused: brief carries no muse-scope line";
+    if (!mx_header_line(job->task, "muse-gate", gate, gcap))
+        return "refused: brief carries no muse-gate line";
+    *prompt = mx_prompt(job->task);
+    if (!*prompt)
+        return "refused: brief carries no prompt body";
     if (job->token_cap <= 0)
-        return mx_refuse(res, "refused: token cap is not positive");
+        return "refused: token cap is not positive";
     if (job->time_cap_s < 30)
-        return mx_refuse(res, "refused: time cap too small to attempt");
-    if (!mx_header_line(job->task, "muse-model", model, sizeof(model))) {
-        if (snprintf(model, sizeof(model), "%s", job->model) >=
-            (int)sizeof(model))
-            return mx_refuse(res, "refused: model does not fit");
+        return "refused: time cap too small to attempt";
+    if (!mx_header_line(job->task, "muse-model", model, mcap)) {
+        if (snprintf(model, mcap, "%s", job->model) >= (int)mcap)
+            return "refused: model does not fit";
     }
-    mx_claim_who(job->rundir, cworker, sizeof(cworker), csession,
-        sizeof(csession));
-    memset(&t, 0, sizeof(t));
-    t.ref.seq = job->seq;
-    if (snprintf(t.ref.name, sizeof(t.ref.name), "%s", job->name) >=
-        (int)sizeof(t.ref.name))
-        return mx_refuse(res, "refused: ref name does not fit");
-    t.ref.attempt = job->attempt;
-    if (snprintf(t.worker, sizeof(t.worker), "%s", cworker) >=
-        (int)sizeof(t.worker))
-        return mx_refuse(res, "refused: worker identity does not fit");
-    if (snprintf(t.workspace, sizeof(t.workspace), "%s", workspace) >=
-        (int)sizeof(t.workspace))
-        return mx_refuse(res, "refused: workspace does not fit");
-    if (snprintf(t.scope, sizeof(t.scope), "%s", scope) >=
-        (int)sizeof(t.scope))
-        return mx_refuse(res, "refused: scope does not fit");
-    if (snprintf(t.gate, sizeof(t.gate), "%s", gate) >=
-        (int)sizeof(t.gate))
-        return mx_refuse(res, "refused: gate does not fit");
-    if (snprintf(t.model, sizeof(t.model), "%s", model) >=
-        (int)sizeof(t.model))
-        return mx_refuse(res, "refused: model does not fit");
-    t.prompt = prompt;
-    if (snprintf(t.rundir, sizeof(t.rundir), "%s", job->rundir) >=
-        (int)sizeof(t.rundir))
-        return mx_refuse(res, "refused: rundir does not fit");
+    return NULL;
+}
+
+/* Copies the job's identity and direction into the bounded task and
+ * splits its budgets. Returns the refusal reason, or NULL when it fit. */
+static const char *mx_fill_task(struct muse_run_task *t,
+    const struct wkr_job *job, const char *workspace, const char *scope,
+    const char *gate, const char *model, const char *prompt,
+    const char *cworker)
+{
+    memset(t, 0, sizeof(*t));
+    t->ref.seq = job->seq;
+    if (snprintf(t->ref.name, sizeof(t->ref.name), "%s", job->name) >=
+        (int)sizeof(t->ref.name))
+        return "refused: ref name does not fit";
+    t->ref.attempt = job->attempt;
+    if (snprintf(t->worker, sizeof(t->worker), "%s", cworker) >=
+        (int)sizeof(t->worker))
+        return "refused: worker identity does not fit";
+    if (snprintf(t->workspace, sizeof(t->workspace), "%s", workspace) >=
+        (int)sizeof(t->workspace))
+        return "refused: workspace does not fit";
+    if (snprintf(t->scope, sizeof(t->scope), "%s", scope) >=
+        (int)sizeof(t->scope))
+        return "refused: scope does not fit";
+    if (snprintf(t->gate, sizeof(t->gate), "%s", gate) >=
+        (int)sizeof(t->gate))
+        return "refused: gate does not fit";
+    if (snprintf(t->model, sizeof(t->model), "%s", model) >=
+        (int)sizeof(t->model))
+        return "refused: model does not fit";
+    t->prompt = prompt;
+    if (snprintf(t->rundir, sizeof(t->rundir), "%s", job->rundir) >=
+        (int)sizeof(t->rundir))
+        return "refused: rundir does not fit";
     /* 80/15 split of the wall cap: the turn verdict pre-empts the
      * worker's SIGKILL so a timeout reports instead of vanishing. */
-    t.budgets.turn_timeout_ms = (int64_t)(job->time_cap_s - 10) * 1000;
-    if (t.budgets.turn_timeout_ms < 5000)
-        t.budgets.turn_timeout_ms = 5000;
-    t.budgets.gate_timeout_ms = (int)(job->time_cap_s * 150);
-    if (t.budgets.gate_timeout_ms < 2000)
-        t.budgets.gate_timeout_ms = 2000;
-    t.budgets.max_total_tokens = (uint64_t)job->token_cap;
-    t.caller_holds_claim = true;
-    /* The child wrapper owns the outcome file: executor chatter must
-     * never reach the worker's streams. */
-    devnull = open("/dev/null", O_WRONLY);
-    saved_out = -1;
+    t->budgets.turn_timeout_ms = (int64_t)(job->time_cap_s - 10) * 1000;
+    if (t->budgets.turn_timeout_ms < 5000)
+        t->budgets.turn_timeout_ms = 5000;
+    t->budgets.gate_timeout_ms = (int)(job->time_cap_s * 150);
+    if (t->budgets.gate_timeout_ms < 2000)
+        t->budgets.gate_timeout_ms = 2000;
+    t->budgets.max_total_tokens = (uint64_t)job->token_cap;
+    t->caller_holds_claim = true;
+    return NULL;
+}
+
+/* Runs the task with this process's stdout pointed at /dev/null: the
+ * child wrapper owns the outcome file, so executor chatter must never
+ * reach the worker's streams. */
+static int mx_run_silent(const struct muse_run_task *t,
+    struct muse_run_result *mres, char err[MUSE_RUN_ERROR_MAX])
+{
+    int devnull = open("/dev/null", O_WRONLY);
+    int saved_out = -1;
+    int rc;
     if (devnull >= 0) {
         saved_out = dup(STDOUT_FILENO);
         (void)dup2(devnull, STDOUT_FILENO);
         close(devnull);
     }
-    memset(&mres, 0, sizeof(mres));
+    memset(mres, 0, sizeof(*mres));
     err[0] = '\0';
-    rc = muse_run_task(&t, &mres, err);
+    rc = muse_run_task(t, mres, err);
     if (saved_out >= 0) {
         (void)dup2(saved_out, STDOUT_FILENO);
         close(saved_out);
     }
+    return rc;
+}
+
+/* The provenance block the result row carries: one key=value line per
+ * recorded fact, with "-" or "none" standing in for an absent reading. */
+static void mx_evidence(struct wkr_result *res,
+    const struct muse_run_result *mres, const char *err)
+{
+    char evidence[MX_EVIDENCE_MAX + 1];
+    int w = snprintf(evidence, sizeof(evidence),
+        "ref=%lld/%s/%lld\nworker=%s\nverdict=%s\nterminal=%s\n"
+        "tokens=%llu\nfiles=%lld\nbase=%.12s\ncandidate=%s\ngate=%s\n"
+        "gate_evidence=%s\nmodel=%s\nsession=%s\nturn=%s\nwall_ms=%lld\n"
+        "reason=%s\n",
+        mres->ref.seq, mres->ref.name, mres->ref.attempt,
+        mres->worker[0] ? mres->worker : "-",
+        mres->verdict[0] ? mres->verdict : "refused",
+        mres->terminal[0] ? mres->terminal : "none",
+        (unsigned long long)mres->total_tokens, mres->files_changed,
+        mres->base[0] ? mres->base : "none",
+        mres->candidate_file[0] ? mres->candidate_file : "none",
+        mres->gate[0] ? mres->gate : "-",
+        mres->gate_evidence[0] ? mres->gate_evidence : "-",
+        mres->model_resolved[0] ? mres->model_resolved : "-",
+        mres->session[0] ? mres->session : "-",
+        mres->turn[0] ? mres->turn : "-",
+        mres->wall_ms,
+        mres->reason[0] ? mres->reason : (err[0] ? err : "-"));
+    if (w > 0)
+        (void)snprintf(res->evidence, sizeof(res->evidence), "%s",
+            evidence);
+}
+
+bool zcl_devagent_worker_muse_executor(const struct wkr_job *job,
+    struct wkr_result *res)
+{
+    char workspace[4096], scope[512], gate[128], model[160];
+    const char *prompt = NULL;
+    const char *refusal;
+    char cworker[64], csession[64];
+    struct muse_run_task t;
+    struct muse_run_result mres;
+    char err[MUSE_RUN_ERROR_MAX];
+    int rc;
+    if (!job || !res) return false;
+    memset(res, 0, sizeof(*res));
+    refusal = mx_direction(job, workspace, sizeof(workspace), scope,
+        sizeof(scope), gate, sizeof(gate), model, sizeof(model), &prompt);
+    if (refusal) return mx_refuse(res, refusal);
+    mx_claim_who(job->rundir, cworker, sizeof(cworker), csession,
+        sizeof(csession));
+    refusal = mx_fill_task(&t, job, workspace, scope, gate, model, prompt,
+        cworker);
+    if (refusal) return mx_refuse(res, refusal);
+    rc = mx_run_silent(&t, &mres, err);
     if (csession[0])
         (void)snprintf(mres.worker_session, sizeof(mres.worker_session),
             "%s", csession);
@@ -287,27 +374,6 @@ bool zcl_devagent_worker_muse_executor(const struct wkr_job *job,
             mres.candidate_file);
     res->tokens_used = (long long)mres.total_tokens;
     res->wall_ms = mres.wall_ms;
-    w = snprintf(evidence, sizeof(evidence),
-        "ref=%lld/%s/%lld\nworker=%s\nverdict=%s\nterminal=%s\n"
-        "tokens=%llu\nfiles=%lld\nbase=%.12s\ncandidate=%s\ngate=%s\n"
-        "gate_evidence=%s\nmodel=%s\nsession=%s\nturn=%s\nwall_ms=%lld\n"
-        "reason=%s\n",
-        mres.ref.seq, mres.ref.name, mres.ref.attempt,
-        mres.worker[0] ? mres.worker : "-",
-        mres.verdict[0] ? mres.verdict : "refused",
-        mres.terminal[0] ? mres.terminal : "none",
-        (unsigned long long)mres.total_tokens, mres.files_changed,
-        mres.base[0] ? mres.base : "none",
-        mres.candidate_file[0] ? mres.candidate_file : "none",
-        mres.gate[0] ? mres.gate : "-",
-        mres.gate_evidence[0] ? mres.gate_evidence : "-",
-        mres.model_resolved[0] ? mres.model_resolved : "-",
-        mres.session[0] ? mres.session : "-",
-        mres.turn[0] ? mres.turn : "-",
-        mres.wall_ms,
-        mres.reason[0] ? mres.reason : (err[0] ? err : "-"));
-    if (w > 0)
-        (void)snprintf(res->evidence, sizeof(res->evidence), "%s",
-            evidence);
+    mx_evidence(res, &mres, err);
     return true;
 }

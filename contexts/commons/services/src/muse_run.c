@@ -156,6 +156,13 @@ static bool mr_dir_ok(const char *path)
     return path && path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/* One identity character: ASCII alphanumeric plus `_`, `.` and `-`. */
+static bool mr_token_char(char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+}
+
 /* Identity token: one path segment, never "." or "..". */
 static bool mr_token_ok(const char *s)
 {
@@ -165,25 +172,17 @@ static bool mr_token_ok(const char *s)
     if (n >= MUSE_RUN_NAME_MAX) return false;
     if (strcmp(s, ".") == 0 || strcmp(s, "..") == 0) return false;
     for (size_t i = 0; i < n; i++) {
-        char c = s[i];
-        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
-        if (!ok) return false;
+        if (!mr_token_char(s[i])) return false;
     }
     return true;
 }
 
 /* --- validation ------------------------------------------------------------ */
 
-static int mr_validate(const struct muse_run_task *t,
+/* The queue row's identity: the ref triple plus the optional worker name. */
+static int mr_validate_ref(const struct muse_run_task *t,
     char err[MUSE_RUN_ERROR_MAX])
 {
-    size_t prompt_len;
-    if (!t) {
-        if (err)
-            (void)snprintf(err, MUSE_RUN_ERROR_MAX, "task is missing");
-        return -1;
-    }
     if (t->ref.seq < 0 || t->ref.attempt < 1 ||
         !mr_token_ok(t->ref.name)) {
         if (err)
@@ -196,6 +195,14 @@ static int mr_validate(const struct muse_run_task *t,
                 "worker identity is unusable");
         return -1;
     }
+    return 0;
+}
+
+/* The place the turn edits: an existing workspace and a scope that cannot
+ * escape it. */
+static int mr_validate_workspace(const struct muse_run_task *t,
+    char err[MUSE_RUN_ERROR_MAX])
+{
     if (!mr_dir_ok(t->workspace)) {
         if (err)
             (void)snprintf(err, MUSE_RUN_ERROR_MAX,
@@ -210,6 +217,15 @@ static int mr_validate(const struct muse_run_task *t,
                 "scope escapes the workspace");
         return -1;
     }
+    return 0;
+}
+
+/* The judge and the model's instruction: a named gate and a bounded
+ * prompt. */
+static int mr_validate_work(const struct muse_run_task *t,
+    char err[MUSE_RUN_ERROR_MAX])
+{
+    size_t prompt_len;
     if (!t->gate[0]) {
         if (err)
             (void)snprintf(err, MUSE_RUN_ERROR_MAX,
@@ -228,6 +244,20 @@ static int mr_validate(const struct muse_run_task *t,
                 "prompt exceeds its bound");
         return -1;
     }
+    return 0;
+}
+
+static int mr_validate(const struct muse_run_task *t,
+    char err[MUSE_RUN_ERROR_MAX])
+{
+    if (!t) {
+        if (err)
+            (void)snprintf(err, MUSE_RUN_ERROR_MAX, "task is missing");
+        return -1;
+    }
+    if (mr_validate_ref(t, err) != 0) return -1;
+    if (mr_validate_workspace(t, err) != 0) return -1;
+    if (mr_validate_work(t, err) != 0) return -1;
     if (!mr_dir_ok(t->rundir)) {
         if (err)
             (void)snprintf(err, MUSE_RUN_ERROR_MAX,
@@ -452,16 +482,75 @@ static void mr_fold_others(const char *workspace, char *acc, size_t acc_cap,
  * published as <rundir>/candidate-<hex>.diff (atomic): the named
  * artifact a gate checks for existence. file_out takes that filename
  * ("" when nothing is named). */
+/* Lays the fold down in a rundir tempfile, because the capture helper the
+ * hash goes through is text-oriented. False when it could not be written. */
+static bool mr_fold_tempfile(const char *rundir, char *tmp, size_t tmpcap,
+    const char *acc, size_t used)
+{
+    FILE *f;
+    if (snprintf(tmp, tmpcap, "%s/.candidate.in", rundir) >= (int)tmpcap)
+        return false;
+    f = fopen(tmp, "wb");
+    if (!f) return false;
+    if (used > 0 && fwrite(acc, 1, used, f) != used) {
+        fclose(f);
+        (void)unlink(tmp);
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+/* git hash-object over the fold tempfile, which is removed either way. The
+ * 40-hex token lands in out; false on any git failure. */
+static bool mr_hash_fold(const char *tmp, char *out, size_t cap)
+{
+    const char *h_argv[] = { "git", "hash-object", tmp, NULL };
+    char *hbuf = zcl_malloc(128, "muse_run.hash");
+    bool ok = false;
+    int rc;
+    if (!hbuf) {
+        (void)unlink(tmp);
+        return false;
+    }
+    hbuf[0] = '\0';
+    rc = zcl_spawn_capture(h_argv, hbuf, 128, MR_GIT_TIMEOUT_MS);
+    (void)unlink(tmp);
+    if (rc == 0) {
+        hbuf[strcspn(hbuf, "\r\n")] = '\0';
+        if (mr_hex40(hbuf) && strlen(hbuf) < cap) {
+            (void)snprintf(out, cap, "%s", hbuf);
+            ok = true;
+        }
+    }
+    free(hbuf);
+    return ok;
+}
+
+/* Publishes the fold as the named artifact. */
+static void mr_publish_candidate(const char *rundir, const char *h,
+    const char *acc, char *file_out, size_t file_cap)
+{
+    char art[8192], fname[192];
+    if (snprintf(fname, sizeof(fname), "candidate-%s.diff",
+            h) < (int)sizeof(fname) &&
+        snprintf(art, sizeof(art), "%s/%s", rundir,
+            fname) < (int)sizeof(art) &&
+        strlen(fname) < file_cap &&
+        mr_write_atomic(art, acc)) {
+        (void)snprintf(file_out, file_cap, "%s", fname);
+    }
+}
+
 static void mr_candidate(const char *workspace, const char *rundir,
     char *out, size_t cap, char *file_out, size_t file_cap)
 {
     const char *diff_argv[] = { "git", "-C", workspace, "diff", "HEAD",
                                 "--", NULL };
     char *acc = zcl_malloc(MR_GATE_LOG_MAX, "muse_run.candidate");
-    char tmp[8192], h[128];
+    char tmp[8192];
     size_t used = 0;
     int rc;
-    FILE *f;
     (void)snprintf(out, cap, "none");
     if (!acc) return;
     acc[0] = '\0';
@@ -479,58 +568,12 @@ static void mr_candidate(const char *workspace, const char *rundir,
     mr_fold_others(workspace, acc, MR_GATE_LOG_MAX, &used);
     if (used < MR_GATE_LOG_MAX) acc[used] = '\0';
     if (file_out && file_cap > 0) file_out[0] = '\0';
-    if (snprintf(tmp, sizeof(tmp), "%s/.candidate.in", rundir) >=
-        (int)sizeof(tmp)) {
+    if (!mr_fold_tempfile(rundir, tmp, sizeof(tmp), acc, used)) {
         free(acc);
         return;
     }
-    f = fopen(tmp, "wb");
-    if (!f) {
-        free(acc);
-        return;
-    }
-    if (used > 0 && fwrite(acc, 1, used, f) != used) {
-        fclose(f);
-        (void)unlink(tmp);
-        free(acc);
-        return;
-    }
-    fclose(f);
-    {
-        const char *h_argv[] = { "git", "hash-object", tmp, NULL };
-        char *hbuf = zcl_malloc(128, "muse_run.hash");
-        if (!hbuf) {
-            (void)unlink(tmp);
-            free(acc);
-            return;
-        }
-        hbuf[0] = '\0';
-        rc = zcl_spawn_capture(h_argv, hbuf, 128, MR_GIT_TIMEOUT_MS);
-        (void)unlink(tmp);
-        if (rc != 0) {
-            free(hbuf);
-            free(acc);
-            return;
-        }
-        hbuf[strcspn(hbuf, "\r\n")] = '\0';
-        if (mr_hex40(hbuf) && strlen(hbuf) < cap) {
-            (void)snprintf(h, sizeof(h), "%s", hbuf);
-            (void)snprintf(out, cap, "%s", h);
-            /* Publish the fold as the named artifact. */
-            if (file_out && file_cap > 0) {
-                char art[8192], fname[192];
-                if (snprintf(fname, sizeof(fname), "candidate-%s.diff",
-                        h) < (int)sizeof(fname) &&
-                    snprintf(art, sizeof(art), "%s/%s", rundir,
-                        fname) < (int)sizeof(art) &&
-                    strlen(fname) < file_cap &&
-                    mr_write_atomic(art, acc)) {
-                    (void)snprintf(file_out, file_cap, "%s", fname);
-                }
-            }
-        }
-        free(hbuf);
-    }
+    if (mr_hash_fold(tmp, out, cap) && file_out && file_cap > 0)
+        mr_publish_candidate(rundir, out, acc, file_out, file_cap);
     free(acc);
 }
 
@@ -688,6 +731,175 @@ struct mr_core {
     uint64_t max_tokens;
 };
 
+/* Prior admitted turn without a terminal: a fresh host cannot cancel
+ * a dead host's turn (sessionNotLoaded), so the gate still judges
+ * the final diff and this note preserves the fact. */
+static void mr_note_prior_turn(const struct muse_run_task *t,
+    struct muse_run_result *r)
+{
+    char turns[8192];
+    char *old;
+    if (snprintf(turns, sizeof(turns), "%s/muse-turn.jsonl", t->rundir) >=
+        (int)sizeof(turns))
+        return;
+    old = mr_read_file(turns, 65536);
+    if (!old) return;
+    if (strstr(old, "\"turnId\":") && !strstr(old, "\"terminal\":"))
+        r->prior_unresolved = true;
+    free(old);
+}
+
+/* session/start then turn/start. False with the host's reason recorded. */
+static bool mr_submit(struct mr_core *c, struct muse_session *s,
+    const struct muse_session_policy *policy)
+{
+    const struct muse_run_task *t = c->task;
+    struct muse_run_result *r = c->res;
+    if (!muse_session_command_id(r->start_command) ||
+        muse_session_start(s, r->start_command, t->workspace, policy,
+            r->session, r->provider, r->model_resolved) != 0) {
+        (void)snprintf(r->reason, sizeof(r->reason), "%s",
+            muse_session_last_error(s));
+        return false;
+    }
+    if (!muse_session_command_id(r->turn_command) ||
+        muse_session_turn(s, r->turn_command, r->session, t->prompt,
+            r->turn) != 0) {
+        (void)snprintf(r->reason, sizeof(r->reason), "%s",
+            muse_session_last_error(s));
+        return false;
+    }
+    return true;
+}
+
+/* Admission is durable before waiting: a restart sees this line and
+ * never mistakes the turn for unsubmitted. */
+static void mr_record_admission(const struct muse_run_task *t,
+    const struct muse_run_result *r)
+{
+    char line[1024];
+    char turns[8192];
+    (void)snprintf(line, sizeof(line),
+        "{\"sessionId\":\"%s\",\"turnId\":\"%s\",\"commandId\":\"%s\"}",
+        r->session, r->turn, r->turn_command);
+    if (snprintf(turns, sizeof(turns), "%s/muse-turn.jsonl",
+            t->rundir) < (int)sizeof(turns))
+        (void)mr_append_line(turns, line);
+}
+
+/* A bound trip stops the turn first: the timeout owns its verdict, a
+ * token trip keeps "refused" with the budget reason, and anything else
+ * reports the host error. */
+static void mr_wait_failed(struct mr_core *c, struct muse_session *s)
+{
+    struct muse_run_result *r = c->res;
+    const char *kind = muse_session_last_kind(s);
+    if (strcmp(kind, "timeout") == 0 ||
+        strcmp(kind, "tokenBudget") == 0) {
+        char cc[MUSE_COMMAND_ID_MAX];
+        if (muse_session_command_id(cc))
+            (void)muse_session_cancel(s, cc, r->session, r->turn);
+    }
+    if (strcmp(kind, "timeout") == 0) {
+        (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+            mr_verdict_timeout);
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "turn exceeded its bound");
+    } else {
+        (void)snprintf(r->reason, sizeof(r->reason), "%s",
+            muse_session_last_error(s));
+    }
+    r->wall_ms = (long long)(mr_monotonic_ms() - c->t0);
+}
+
+/* A terminal that is not "completed" settles the verdict without a gate. */
+static void mr_settle_terminal(struct mr_core *c)
+{
+    struct muse_run_result *r = c->res;
+    if (strcmp(r->terminal, "cancelled") == 0) {
+        (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+            mr_verdict_cancelled);
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "turn cancelled");
+    } else {
+        (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+            mr_verdict_failed);
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "turn did not complete");
+    }
+    r->wall_ms = (long long)(mr_monotonic_ms() - c->t0);
+}
+
+/* THE GATE DECIDES. The turn text is evidence, never a verdict input.
+ * Returns the rc the run reports and names the engine verdict. */
+static int mr_judge(struct mr_core *c, char *gate_log, size_t logcap,
+    const char **engine_name, char *engine_buf, size_t engine_cap)
+{
+    const struct muse_run_task *t = c->task;
+    struct muse_run_result *r = c->res;
+    struct engine_gate_reading gate;
+    enum engine_verdict v;
+    r->files_changed = mr_files_changed(t->workspace);
+    if (r->files_changed < 0) {
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "worktree diff unmeasurable");
+        return 1;
+    }
+    if (!mr_run_gate(t->workspace, t->gate, c->gate_timeout_ms, gate_log,
+            logcap, &r->gate_ms, &gate)) {
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "registered runner unrunnable");
+        return 1;
+    }
+    r->gate_present = gate.saw_verdict_line;
+    r->gate_ran = gate.groups_ran;
+    r->gate_failed = gate.groups_failed;
+    mr_last_verdict_line(gate_log, r->gate_verdict,
+        sizeof(r->gate_verdict));
+    (void)snprintf(r->gate_evidence, sizeof(r->gate_evidence),
+        "%s:%lld/%lld", t->gate, r->gate_ran, r->gate_failed);
+    v = engine_verdict_of(&gate, (size_t)r->files_changed, false, true);
+    *engine_name = mr_engine_short(engine_verdict_name(v), engine_buf,
+        engine_cap);
+    if (v == ENGINE_VERDICT_PASS) {
+        (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+            mr_verdict_pass);
+        (void)snprintf(r->reason, sizeof(r->reason), "gate passed");
+        return 0;
+    }
+    (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+        mr_verdict_failed);
+    (void)snprintf(r->reason, sizeof(r->reason),
+        "gate refused: %s", *engine_name);
+    return 1;
+}
+
+/* The receipt, evidence and report every exit path shares. */
+static void mr_report(struct mr_core *c, struct muse_session *s,
+    const char *engine_name, int rc)
+{
+    const struct muse_run_task *t = c->task;
+    struct muse_run_result *r = c->res;
+    (void)snprintf(r->engine, sizeof(r->engine), "%s",
+        engine_name);
+    r->rc = rc;
+    mr_candidate(t->workspace, t->rundir, r->candidate,
+        sizeof(r->candidate), r->candidate_file,
+        sizeof(r->candidate_file));
+    /* The claim-holding caller's receipt is canonical: never lay ours
+     * beside it. Evidence (muse.json, candidate artifact, admission)
+     * is still written. */
+    if (!t->caller_holds_claim)
+        mr_write_receipt(t, r);
+    mr_write_facts(t, r);
+    printf("ref=%lld/%s/%lld verdict=%s tokens=%llu files=%lld wall_ms=%lld\n",
+        t->ref.seq, t->ref.name, t->ref.attempt, r->verdict,
+        (unsigned long long)r->total_tokens, r->files_changed,
+        r->wall_ms);
+    printf("rc=%d\n", rc);
+    if (s) muse_session_close(s);
+}
+
 static int mr_finish(struct mr_core *c, struct muse_session *s,
     const char *open_err, char err[MUSE_RUN_ERROR_MAX])
 {
@@ -695,7 +907,6 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
     struct muse_run_result *r = c->res;
     struct muse_session_policy policy;
     struct muse_turn_outcome out;
-    struct engine_gate_reading gate;
     char gate_log_stack[MR_GATE_LOG_MAX];
     char *gate_log = gate_log_stack;
     const char *allow[1];
@@ -717,22 +928,7 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
             open_err && open_err[0] ? open_err : "serve host unavailable");
         goto write;
     }
-    /* Prior admitted turn without a terminal: a fresh host cannot cancel
-     * a dead host's turn (sessionNotLoaded), so the gate still judges
-     * the final diff and this note preserves the fact. */
-    {
-        char turns[8192];
-        if (snprintf(turns, sizeof(turns), "%s/muse-turn.jsonl",
-                t->rundir) < (int)sizeof(turns)) {
-            char *old = mr_read_file(turns, 65536);
-            if (old) {
-                if (strstr(old, "\"turnId\":") && !strstr(old,
-                        "\"terminal\":"))
-                    r->prior_unresolved = true;
-                free(old);
-            }
-        }
-    }
+    mr_note_prior_turn(t, r);
     /* Source half of the diff identity, taken before the turn lands. */
     mr_base_commit(t->workspace, r->base, sizeof(r->base));
     allow[0] = t->scope;
@@ -740,54 +936,11 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
     policy.model = t->model[0] ? t->model : NULL;
     policy.allow_paths = allow;
     policy.allow_path_count = 1;
-    if (!muse_session_command_id(r->start_command) ||
-        muse_session_start(s, r->start_command, t->workspace, &policy,
-            r->session, r->provider, r->model_resolved) != 0) {
-        (void)snprintf(r->reason, sizeof(r->reason), "%s",
-            muse_session_last_error(s));
-        goto write;
-    }
-    if (!muse_session_command_id(r->turn_command) ||
-        muse_session_turn(s, r->turn_command, r->session, t->prompt,
-            r->turn) != 0) {
-        (void)snprintf(r->reason, sizeof(r->reason), "%s",
-            muse_session_last_error(s));
-        goto write;
-    }
-    /* Admission is durable before waiting: a restart sees this line and
-     * never mistakes the turn for unsubmitted. */
-    {
-        char line[1024];
-        char turns[8192];
-        (void)snprintf(line, sizeof(line),
-            "{\"sessionId\":\"%s\",\"turnId\":\"%s\",\"commandId\":\"%s\"}",
-            r->session, r->turn, r->turn_command);
-        if (snprintf(turns, sizeof(turns), "%s/muse-turn.jsonl",
-                t->rundir) < (int)sizeof(turns))
-            (void)mr_append_line(turns, line);
-    }
+    if (!mr_submit(c, s, &policy)) goto write;
+    mr_record_admission(t, r);
     memset(&out, 0, sizeof(out));
     if (muse_session_wait(s, r->session, r->turn, &policy, &out) != 0) {
-        const char *kind = muse_session_last_kind(s);
-        /* A bound trip stops the turn first: the timeout owns its
-         * verdict, a token trip keeps "refused" with the budget
-         * reason, and anything else reports the host error. */
-        if (strcmp(kind, "timeout") == 0 ||
-            strcmp(kind, "tokenBudget") == 0) {
-            char cc[MUSE_COMMAND_ID_MAX];
-            if (muse_session_command_id(cc))
-                (void)muse_session_cancel(s, cc, r->session, r->turn);
-        }
-        if (strcmp(kind, "timeout") == 0) {
-            (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
-                mr_verdict_timeout);
-            (void)snprintf(r->reason, sizeof(r->reason),
-                "turn exceeded its bound");
-        } else {
-            (void)snprintf(r->reason, sizeof(r->reason), "%s",
-                muse_session_last_error(s));
-        }
-        r->wall_ms = (long long)(mr_monotonic_ms() - c->t0);
+        mr_wait_failed(c, s);
         goto write;
     }
     (void)snprintf(r->terminal, sizeof(r->terminal), "%s", out.terminal);
@@ -797,75 +950,15 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
     r->duration_ms = out.duration_ms;
     muse_turn_outcome_free(&out);
     if (strcmp(r->terminal, "completed") != 0) {
-        if (strcmp(r->terminal, "cancelled") == 0) {
-            (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
-                mr_verdict_cancelled);
-            (void)snprintf(r->reason, sizeof(r->reason),
-                "turn cancelled");
-        } else {
-            (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
-                mr_verdict_failed);
-            (void)snprintf(r->reason, sizeof(r->reason),
-                "turn did not complete");
-        }
-        r->wall_ms = (long long)(mr_monotonic_ms() - c->t0);
+        mr_settle_terminal(c);
         goto write;
     }
-    /* THE GATE DECIDES. The turn text is evidence, never a verdict input. */
-    r->files_changed = mr_files_changed(t->workspace);
-    if (r->files_changed < 0) {
-        (void)snprintf(r->reason, sizeof(r->reason),
-            "worktree diff unmeasurable");
-    } else if (!mr_run_gate(t->workspace, t->gate, c->gate_timeout_ms,
-                 gate_log, sizeof(gate_log_stack), &r->gate_ms, &gate)) {
-        (void)snprintf(r->reason, sizeof(r->reason),
-            "registered runner unrunnable");
-    } else {
-        enum engine_verdict v;
-        r->gate_present = gate.saw_verdict_line;
-        r->gate_ran = gate.groups_ran;
-        r->gate_failed = gate.groups_failed;
-        mr_last_verdict_line(gate_log, r->gate_verdict,
-            sizeof(r->gate_verdict));
-        (void)snprintf(r->gate_evidence, sizeof(r->gate_evidence),
-            "%s:%lld/%lld", t->gate, r->gate_ran, r->gate_failed);
-        v = engine_verdict_of(&gate, (size_t)r->files_changed, false,
-            true);
-        engine_name = mr_engine_short(engine_verdict_name(v), engine_buf,
-            sizeof(engine_buf));
-        if (v == ENGINE_VERDICT_PASS) {
-            (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
-                mr_verdict_pass);
-            (void)snprintf(r->reason, sizeof(r->reason), "gate passed");
-            rc = 0;
-        } else {
-            (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
-                mr_verdict_failed);
-            (void)snprintf(r->reason, sizeof(r->reason),
-                "gate refused: %s", engine_name);
-        }
-    }
+    rc = mr_judge(c, gate_log, sizeof(gate_log_stack), &engine_name,
+        engine_buf, sizeof(engine_buf));
     r->wall_ms = (long long)(mr_monotonic_ms() - c->t0);
     goto write;
 write:
-    (void)snprintf(r->engine, sizeof(r->engine), "%s",
-        engine_name);
-    r->rc = rc;
-    mr_candidate(t->workspace, t->rundir, r->candidate,
-        sizeof(r->candidate), r->candidate_file,
-        sizeof(r->candidate_file));
-    /* The claim-holding caller's receipt is canonical: never lay ours
-     * beside it. Evidence (muse.json, candidate artifact, admission)
-     * is still written. */
-    if (!t->caller_holds_claim)
-        mr_write_receipt(t, r);
-    mr_write_facts(t, r);
-    printf("ref=%lld/%s/%lld verdict=%s tokens=%llu files=%lld wall_ms=%lld\n",
-        t->ref.seq, t->ref.name, t->ref.attempt, r->verdict,
-        (unsigned long long)r->total_tokens, r->files_changed,
-        r->wall_ms);
-    printf("rc=%d\n", rc);
-    if (s) muse_session_close(s);
+    mr_report(c, s, engine_name, rc);
     (void)err;
     return rc;
 }
@@ -973,6 +1066,46 @@ static bool mr_file_header(const char *text, const char *key, char *out,
     }
 }
 
+/* The machine headers the composer always emits. The queue: header is
+ * accepted and ignored; model is optional and read separately. */
+static bool mr_parse_headers(const char *text, struct muse_run_task *t,
+    char *seq, size_t seqcap, char *attempt, size_t attcap)
+{
+    return mr_file_header(text, "seq", seq, seqcap) &&
+        mr_file_header(text, "name", t->ref.name,
+            sizeof(t->ref.name)) &&
+        mr_file_header(text, "attempt", attempt, attcap) &&
+        mr_file_header(text, "group", t->gate, sizeof(t->gate)) &&
+        mr_file_header(text, "scope", t->scope, sizeof(t->scope)) &&
+        mr_file_header(text, "worktree", t->workspace,
+            sizeof(t->workspace)) &&
+        mr_file_header(text, "rundir", t->rundir,
+            sizeof(t->rundir));
+}
+
+/* The prompt body: everything past the titled brief marker's own line.
+ * NULL with the reason named when the brief is absent or empty. */
+static const char *mr_brief_body(const char *text, const char **why)
+{
+    const char *body = strstr(text, "=== BRIEF");
+    if (!body) {
+        *why = "task has no brief";
+        return NULL;
+    }
+    body = strchr(body, '\n');
+    if (!body) {
+        *why = "task brief is empty";
+        return NULL;
+    }
+    body++;
+    while (*body == '\n' || *body == '\r') body++;
+    if (!*body) {
+        *why = "task brief is empty";
+        return NULL;
+    }
+    return body;
+}
+
 /* File layout mirrors the queue composer: machine headers, one group
  * line, then the titled brief whose body is the prompt. The queue:
  * header is accepted and ignored; worker defaults to "cli". */
@@ -982,6 +1115,7 @@ static int mr_parse_file(const char *taskpath, struct muse_run_task *t,
     char *text = mr_read_file(taskpath, MR_LINE_MAX);
     char kind[32], seq[32], attempt[32];
     const char *body;
+    const char *why = NULL;
     if (!text) {
         if (err)
             (void)snprintf(err, MUSE_RUN_ERROR_MAX,
@@ -999,16 +1133,8 @@ static int mr_parse_file(const char *taskpath, struct muse_run_task *t,
         free(text);
         return -1;
     }
-    if (!mr_file_header(text, "seq", seq, sizeof(seq)) ||
-        !mr_file_header(text, "name", t->ref.name,
-            sizeof(t->ref.name)) ||
-        !mr_file_header(text, "attempt", attempt, sizeof(attempt)) ||
-        !mr_file_header(text, "group", t->gate, sizeof(t->gate)) ||
-        !mr_file_header(text, "scope", t->scope, sizeof(t->scope)) ||
-        !mr_file_header(text, "worktree", t->workspace,
-            sizeof(t->workspace)) ||
-        !mr_file_header(text, "rundir", t->rundir,
-            sizeof(t->rundir))) {
+    if (!mr_parse_headers(text, t, seq, sizeof(seq), attempt,
+            sizeof(attempt))) {
         if (err)
             (void)snprintf(err, MUSE_RUN_ERROR_MAX,
                 "task headers incomplete");
@@ -1023,27 +1149,10 @@ static int mr_parse_file(const char *taskpath, struct muse_run_task *t,
         free(text);
         return -1;
     }
-    body = strstr(text, "=== BRIEF");
+    body = mr_brief_body(text, &why);
     if (!body) {
         if (err)
-            (void)snprintf(err, MUSE_RUN_ERROR_MAX, "task has no brief");
-        free(text);
-        return -1;
-    }
-    body = strchr(body, '\n');
-    if (!body) {
-        if (err)
-            (void)snprintf(err, MUSE_RUN_ERROR_MAX,
-                "task brief is empty");
-        free(text);
-        return -1;
-    }
-    body++;
-    while (*body == '\n' || *body == '\r') body++;
-    if (!*body) {
-        if (err)
-            (void)snprintf(err, MUSE_RUN_ERROR_MAX,
-                "task brief is empty");
+            (void)snprintf(err, MUSE_RUN_ERROR_MAX, "%s", why);
         free(text);
         return -1;
     }

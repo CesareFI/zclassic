@@ -173,6 +173,43 @@ static int ms_read_line(struct muse_session *s, char *buf, size_t cap,
     }
 }
 
+/* Copies a quoted `"..."` id token verbatim, escapes included. Advances the
+ * cursor and the write index; false when the token does not fit. */
+static bool ms_raw_id_quoted(const char **pp, char *out, size_t cap,
+    size_t *np)
+{
+    const char *p = *pp;
+    size_t n = *np;
+    if (n + 1 >= cap) return false;
+    out[n++] = *p++;
+    while (*p && *p != '"' && n + 1 < cap) {
+        if (*p == '\\' && p[1]) {
+            out[n++] = *p++;
+            if (n + 1 >= cap) return false;
+        }
+        out[n++] = *p++;
+    }
+    if (*p != '"' || n + 1 >= cap) return false;
+    out[n++] = *p++;
+    *pp = p;
+    *np = n;
+    return true;
+}
+
+/* Copies a bare numeric id token. False when there is no digit at all. */
+static bool ms_raw_id_number(const char **pp, char *out, size_t cap,
+    size_t *np)
+{
+    const char *p = *pp;
+    size_t n = *np;
+    while (((*p >= '0' && *p <= '9') || *p == '-') && n + 1 < cap)
+        out[n++] = *p++;
+    if (n == 0) return false;
+    *pp = p;
+    *np = n;
+    return true;
+}
+
 /* Copies the raw `"id":<token>` value token (number or quoted string) so a
  * server-initiated request can be answered with the identical id. */
 static bool ms_raw_id(const char *line, char *out, size_t cap)
@@ -183,21 +220,9 @@ static bool ms_raw_id(const char *line, char *out, size_t cap)
     while (*p == ' ' || *p == '\t') p++;
     size_t n = 0;
     if (*p == '"') {
-        if (n + 1 >= cap) return false;
-        out[n++] = *p++;
-        while (*p && *p != '"' && n + 1 < cap) {
-            if (*p == '\\' && p[1]) {
-                out[n++] = *p++;
-                if (n + 1 >= cap) return false;
-            }
-            out[n++] = *p++;
-        }
-        if (*p != '"' || n + 1 >= cap) return false;
-        out[n++] = *p++;
+        if (!ms_raw_id_quoted(&p, out, cap, &n)) return false;
     } else {
-        while (((*p >= '0' && *p <= '9') || *p == '-') && n + 1 < cap)
-            out[n++] = *p++;
-        if (n == 0) return false;
+        if (!ms_raw_id_number(&p, out, cap, &n)) return false;
     }
     out[n] = '\0';
     return true;
@@ -315,6 +340,30 @@ static struct muse_session *ms_alloc(pid_t child, int to_fd, int from_fd,
     return s;
 }
 
+/* Folds one handshake frame. 1 = this was the initialize ack, 0 = unrelated
+ * traffic to keep reading past, -1 = the host rejected initialize. */
+static int ms_handshake_frame(struct muse_session *s, const char *line,
+    int id)
+{
+    struct json_value v = {0};
+    bool ok = json_read(&v, line, strlen(line));
+    const struct json_value *rid = ok ? json_get(&v, "id") : NULL;
+    if (!(ok && rid && rid->type == JSON_INT &&
+            json_get_int(rid) == (int64_t)id)) {
+        json_free(&v);
+        return 0;
+    }
+    ok = json_get(&v, "result") != NULL;
+    if (!ok) {
+        const struct json_value *e = json_get(&v, "error");
+        const struct json_value *m = e ? json_get(e, "message") : NULL;
+        ms_fail(s, "error", false, "initialize: %s",
+            m ? json_get_str(m) : "rejected");
+    }
+    json_free(&v);
+    return ok ? 1 : -1;
+}
+
 /* initialize + initialized handshake. Fails with s->err set. */
 static bool ms_handshake(struct muse_session *s)
 {
@@ -338,27 +387,15 @@ static bool ms_handshake(struct muse_session *s)
             free(line);
             return false;
         }
-        struct json_value v = {0};
-        bool ok = json_read(&v, line, strlen(line));
-        const struct json_value *rid = ok ? json_get(&v, "id") : NULL;
-        if (ok && rid && rid->type == JSON_INT &&
-            json_get_int(rid) == (int64_t)id) {
-            ok = json_get(&v, "result") != NULL;
-            if (!ok) {
-                const struct json_value *e = json_get(&v, "error");
-                const struct json_value *m = e ? json_get(e, "message") : NULL;
-                ms_fail(s, "error", false, "initialize: %s",
-                    m ? json_get_str(m) : "rejected");
-            }
-            json_free(&v);
-            if (!ok) {
-                free(line);
-                return false;
-            }
+        int seen = ms_handshake_frame(s, line, id);
+        if (seen < 0) {
+            free(line);
+            return false;
+        }
+        if (seen > 0) {
             initialized = true;
             break;
         }
-        json_free(&v);
     }
     free(line);
     if (!initialized) {
@@ -493,6 +530,153 @@ static const char *ms_approval_mode(const struct muse_session_policy *policy)
     return mode && mode[0] ? mode : "denyUnmatched";
 }
 
+/* Serializes a params object and frees it either way. `ok` carries the
+ * result of the field pushes. NULL when the build failed or memory ran
+ * out, with the failure recorded. */
+static char *ms_render_params(struct muse_session *s, struct json_value *v,
+    bool ok)
+{
+    size_t need = ok ? json_write(v, NULL, 0) + 1 : 0;
+    char *text = ok && need > 0 ? zcl_malloc(need, "muse_session.params")
+                                : NULL;
+    if (!text) {
+        json_free(v);
+        ms_fail(s, "internal", false, "out of memory");
+        return NULL;
+    }
+    (void)json_write(v, text, need);
+    json_free(v);
+    return text;
+}
+
+/* Sends one request (taking ownership of its rendered params) and splits
+ * the response bearing its id. Returns the malloc'd response line — the
+ * caller frees it and json_free()s doc — or NULL with the failure
+ * recorded and doc already released. */
+static char *ms_call(struct muse_session *s, const char *method, char *text,
+    const struct json_value **result_out, struct json_value *doc)
+{
+    if (!text) return NULL;
+    int id = s->next_id++;
+    bool ok = ms_send(s, id, method, text);
+    free(text);
+    if (!ok) return NULL;
+    char *line = ms_await(s, id, ms_monotonic_ms() + s->open_timeout_ms);
+    if (!line) return NULL;
+    if (!ms_split(s, line, result_out, doc)) {
+        free(line);
+        json_free(doc);
+        return NULL;
+    }
+    return line;
+}
+
+/* The worker never selects allowAll; the rest is the closed host
+ * vocabulary. False with the policy refusal recorded. */
+static bool ms_start_mode_ok(struct muse_session *s, const char *mode)
+{
+    if (strcmp(mode, "allowAll") == 0) {
+        ms_fail(s, "policy", false,
+            "allowAll is never selected by the Z23 worker");
+        return false;
+    }
+    if (strcmp(mode, "denyUnmatched") != 0 &&
+        strcmp(mode, "onRequest") != 0 &&
+        strcmp(mode, "promptUnmatched") != 0) {
+        ms_fail(s, "policy", false, "unknown approval mode");
+        return false;
+    }
+    return true;
+}
+
+/* The workspace root rides a JSON string field, so a quote or backslash in
+ * it could never be framed: refuse rather than emit a forged field. */
+static bool ms_start_workspace_ok(struct muse_session *s,
+    const char *workspace_root, size_t ws)
+{
+    if (ws == 0 || ws >= sizeof(s->workspace) ||
+        strchr(workspace_root, '"') || strchr(workspace_root, '\\')) {
+        ms_fail(s, "policy", false, "unusable workspace root");
+        return false;
+    }
+    return true;
+}
+
+/* session/start params: the command id, the workspace root, and the
+ * approval mode the policy settled. */
+static char *ms_start_params(struct muse_session *s, const char *command_id,
+    const char *workspace_root, const char *mode)
+{
+    struct json_value params = {0};
+    json_init(&params);
+    json_set_object(&params);
+    bool ok = json_push_kv_str(&params, "commandId", command_id) &&
+        json_push_kv_str(&params, "workspaceRoot", workspace_root) &&
+        json_push_kv_str(&params, "approvalMode", mode);
+    return ms_render_params(s, &params, ok);
+}
+
+/* Copies the started session's identity out of the result and adopts the
+ * workspace. False when the host hid the session id. */
+static bool ms_start_identity(struct muse_session *s,
+    const struct json_value *result, const char *workspace_root, size_t ws,
+    char session_id[MUSE_SESSION_ID_MAX], char provider_out[64],
+    char model_out[128])
+{
+    const struct json_value *sess = json_get(result, "session");
+    const struct json_value *sid =
+        sess ? json_get(sess, "sessionId") : NULL;
+    if (!(sid && sid->type == JSON_STR && ms_copy_str(session_id,
+            MUSE_SESSION_ID_MAX, json_get_str(sid)))) {
+        ms_fail(s, "internal", false, "session/start hid the session id");
+        return false;
+    }
+    memcpy(s->workspace, workspace_root, ws + 1);
+    const struct json_value *prov =
+        sess ? json_get(sess, "providerId") : NULL;
+    const struct json_value *model = sess ? json_get(sess, "modelId")
+                                          : NULL;
+    if (provider_out)
+        (void)ms_copy_str(provider_out, 64,
+            prov && prov->type == JSON_STR ? json_get_str(prov) : "");
+    if (model_out)
+        (void)ms_copy_str(model_out, 128,
+            model && model->type == JSON_STR ? json_get_str(model) : "");
+    return true;
+}
+
+/* The authorizing task names the model; anything else keeps the host
+ * default. A rejected selection fails the start loudly. */
+static bool ms_start_set_model(struct muse_session *s,
+    const char *session_id, const char *model)
+{
+    char mc[MUSE_COMMAND_ID_MAX];
+    if (!muse_session_command_id(mc)) {
+        ms_fail(s, "internal", false, "command id unavailable");
+        return false;
+    }
+    struct json_value mp = {0};
+    json_init(&mp);
+    json_set_object(&mp);
+    bool ok = json_push_kv_str(&mp, "sessionId", session_id) &&
+        json_push_kv_str(&mp, "modelId", model) &&
+        json_push_kv_str(&mp, "commandId", mc);
+    char *mtext = ms_render_params(s, &mp, ok);
+    if (!mtext) return false;
+    int mid = s->next_id++;
+    ok = ms_send(s, mid, "session/setModel", mtext);
+    free(mtext);
+    if (ok) {
+        char *mline =
+            ms_await(s, mid, ms_monotonic_ms() + s->open_timeout_ms);
+        struct json_value mdoc = {0};
+        ok = mline && ms_split(s, mline, NULL, &mdoc);
+        free(mline);
+        json_free(&mdoc);
+    }
+    return ok;
+}
+
 int muse_session_start(struct muse_session *s, const char *command_id,
     const char *workspace_root, const struct muse_session_policy *policy,
     char session_id[MUSE_SESSION_ID_MAX],
@@ -501,123 +685,27 @@ int muse_session_start(struct muse_session *s, const char *command_id,
     if (!s || !command_id || !workspace_root || !session_id)
         return -1;
     const char *mode = ms_approval_mode(policy);
-    if (strcmp(mode, "allowAll") == 0) {
-        ms_fail(s, "policy", false,
-            "allowAll is never selected by the Z23 worker");
-        return -1;
-    }
-    if (strcmp(mode, "denyUnmatched") != 0 &&
-        strcmp(mode, "onRequest") != 0 &&
-        strcmp(mode, "promptUnmatched") != 0) {
-        ms_fail(s, "policy", false, "unknown approval mode");
-        return -1;
-    }
+    if (!ms_start_mode_ok(s, mode)) return -1;
     size_t ws = strlen(workspace_root);
-    if (ws == 0 || ws >= sizeof(s->workspace) || strchr(workspace_root, '"') ||
-        strchr(workspace_root, '\\')) {
-        ms_fail(s, "policy", false, "unusable workspace root");
-        return -1;
-    }
-    struct json_value params = {0};
-    json_init(&params);
-    json_set_object(&params);
-    bool ok = json_push_kv_str(&params, "commandId", command_id) &&
-        json_push_kv_str(&params, "workspaceRoot", workspace_root) &&
-        json_push_kv_str(&params, "approvalMode", mode);
-    size_t need = ok ? json_write(&params, NULL, 0) + 1 : 0;
-    char *text = ok && need > 0 ? zcl_malloc(need, "muse_session.params") : NULL;
-    if (!text) {
-        json_free(&params);
-        ms_fail(s, "internal", false, "out of memory");
-        return -1;
-    }
-    (void)json_write(&params, text, need);
-    json_free(&params);
-    int id = s->next_id++;
-    ok = ms_send(s, id, "session/start", text);
-    free(text);
-    if (!ok) return -1;
-    char *line = ms_await(s, id, ms_monotonic_ms() + s->open_timeout_ms);
-    if (!line) return -1;
+    if (!ms_start_workspace_ok(s, workspace_root, ws)) return -1;
+    char *text = ms_start_params(s, command_id, workspace_root, mode);
     struct json_value doc = {0};
     const struct json_value *result = NULL;
-    if (!ms_split(s, line, &result, &doc)) {
-        free(line);
-        json_free(&doc);
-        return -1;
-    }
-    const struct json_value *sess = json_get(result, "session");
-    const struct json_value *sid =
-        sess ? json_get(sess, "sessionId") : NULL;
-    ok = sid && sid->type == JSON_STR && ms_copy_str(session_id,
-        MUSE_SESSION_ID_MAX, json_get_str(sid));
-    if (ok) {
-        memcpy(s->workspace, workspace_root, ws + 1);
-        const struct json_value *prov =
-            sess ? json_get(sess, "providerId") : NULL;
-        const struct json_value *model = sess ? json_get(sess, "modelId")
-                                              : NULL;
-        if (provider_out)
-            (void)ms_copy_str(provider_out, 64,
-                prov && prov->type == JSON_STR ? json_get_str(prov) : "");
-        if (model_out)
-            (void)ms_copy_str(model_out, 128,
-                model && model->type == JSON_STR ? json_get_str(model) : "");
-    } else {
-        ms_fail(s, "internal", false, "session/start hid the session id");
-    }
+    char *line = ms_call(s, "session/start", text, &result, &doc);
+    if (!line) return -1;
+    bool ok = ms_start_identity(s, result, workspace_root, ws, session_id,
+        provider_out, model_out);
     free(line);
     json_free(&doc);
-    if (ok && policy && policy->model && policy->model[0]) {
-        /* The authorizing task names the model; anything else keeps the
-         * host default. A rejected selection fails the start loudly. */
-        char mc[MUSE_COMMAND_ID_MAX];
-        if (!muse_session_command_id(mc)) {
-            ms_fail(s, "internal", false, "command id unavailable");
-            return -1;
-        }
-        struct json_value mp = {0};
-        json_init(&mp);
-        json_set_object(&mp);
-        ok = json_push_kv_str(&mp, "sessionId", session_id) &&
-            json_push_kv_str(&mp, "modelId", policy->model) &&
-            json_push_kv_str(&mp, "commandId", mc);
-        size_t mneed = ok ? json_write(&mp, NULL, 0) + 1 : 0;
-        char *mtext = ok && mneed > 0 ? zcl_malloc(mneed, "muse_session.params") : NULL;
-        if (!mtext) {
-            json_free(&mp);
-            ms_fail(s, "internal", false, "out of memory");
-            return -1;
-        }
-        (void)json_write(&mp, mtext, mneed);
-        json_free(&mp);
-        int mid = s->next_id++;
-        ok = ms_send(s, mid, "session/setModel", mtext);
-        free(mtext);
-        if (ok) {
-            char *mline =
-                ms_await(s, mid, ms_monotonic_ms() + s->open_timeout_ms);
-            struct json_value mdoc = {0};
-            ok = mline && ms_split(s, mline, NULL, &mdoc);
-            free(mline);
-            json_free(&mdoc);
-        }
-    }
+    if (ok && policy && policy->model && policy->model[0])
+        ok = ms_start_set_model(s, session_id, policy->model);
     return ok ? 0 : -1;
 }
 
-int muse_session_turn(struct muse_session *s, const char *command_id,
-    const char *session_id, const char *prompt,
-    char turn_id[MUSE_TURN_ID_MAX])
+/* turn/start params: one text input part carrying the prompt. */
+static char *ms_turn_params(struct muse_session *s, const char *command_id,
+    const char *session_id, const char *prompt)
 {
-    if (!s || !command_id || !session_id || !prompt || !turn_id) return -1;
-    if (s->max_total_tokens > 0 && s->tokens_used >= s->max_total_tokens) {
-        ms_fail(s, "tokenBudget", false,
-            "token budget spent: %llu of %llu",
-            (unsigned long long)s->tokens_used,
-            (unsigned long long)s->max_total_tokens);
-        return -1;
-    }
     struct json_value params = {0}, input = {0}, part = {0};
     json_init(&params);
     json_init(&input);
@@ -633,30 +721,28 @@ int muse_session_turn(struct muse_session *s, const char *command_id,
         json_push_kv(&params, "input", &input);
     json_free(&part);
     json_free(&input);
-    size_t need = ok ? json_write(&params, NULL, 0) + 1 : 0;
-    char *text = ok && need > 0 ? zcl_malloc(need, "muse_session.params") : NULL;
-    if (!text) {
-        json_free(&params);
-        ms_fail(s, "internal", false, "out of memory");
+    return ms_render_params(s, &params, ok);
+}
+
+int muse_session_turn(struct muse_session *s, const char *command_id,
+    const char *session_id, const char *prompt,
+    char turn_id[MUSE_TURN_ID_MAX])
+{
+    if (!s || !command_id || !session_id || !prompt || !turn_id) return -1;
+    if (s->max_total_tokens > 0 && s->tokens_used >= s->max_total_tokens) {
+        ms_fail(s, "tokenBudget", false,
+            "token budget spent: %llu of %llu",
+            (unsigned long long)s->tokens_used,
+            (unsigned long long)s->max_total_tokens);
         return -1;
     }
-    (void)json_write(&params, text, need);
-    json_free(&params);
-    int id = s->next_id++;
-    ok = ms_send(s, id, "turn/start", text);
-    free(text);
-    if (!ok) return -1;
-    char *line = ms_await(s, id, ms_monotonic_ms() + s->open_timeout_ms);
-    if (!line) return -1;
+    char *text = ms_turn_params(s, command_id, session_id, prompt);
     struct json_value doc = {0};
     const struct json_value *result = NULL;
-    if (!ms_split(s, line, &result, &doc)) {
-        free(line);
-        json_free(&doc);
-        return -1;
-    }
+    char *line = ms_call(s, "turn/start", text, &result, &doc);
+    if (!line) return -1;
     const struct json_value *tid = json_get(result, "turnId");
-    ok = tid && tid->type == JSON_STR &&
+    bool ok = tid && tid->type == JSON_STR &&
         ms_copy_str(turn_id, MUSE_TURN_ID_MAX, json_get_str(tid));
     if (!ok)
         ms_fail(s, "internal", false, "turn/start hid the turn id");
@@ -726,13 +812,10 @@ static void ms_text_replace(struct ms_wait_state *w, const char *full)
     w->out->text[n] = '\0';
 }
 
-static bool ms_path_allowed(const struct muse_session_policy *policy,
-    const char *workspace, const char *path)
+/* Confine to the session workspace: absolute paths must sit beneath it,
+ * relative paths are read against it and must still fit. */
+static bool ms_path_confined(const char *workspace, const char *path)
 {
-    if (!policy || !path || !path[0] || !workspace || !workspace[0])
-        return false;
-    /* Confine to the session workspace first: absolute paths must sit
-     * beneath it, relative paths are read against it. */
     char absolute[MUSE_WS_MAX + 1024];
     if (path[0] == '/') {
         size_t ws = strlen(workspace);
@@ -748,23 +831,35 @@ static bool ms_path_allowed(const struct muse_session_policy *policy,
         if (n <= 0 || (size_t)n >= sizeof(absolute)) return false;
     }
     (void)absolute;
+    return true;
+}
+
+/* One authorized prefix against the workspace-relative subject. A
+ * directory prefix ("notes/") authorizes its whole subtree; a bare prefix
+ * ("notes", "src/sum.c") authorizes the node itself and its children,
+ * never a sibling that merely shares the spelling ("notes2"). */
+static bool ms_prefix_covers(const char *prefix, const char *rel)
+{
+    if (!prefix || !prefix[0]) return false;
+    while (prefix[0] == '/') prefix++;
+    size_t pl = strlen(prefix);
+    if (pl == 0 || strncmp(rel, prefix, pl) != 0) return false;
+    return prefix[pl - 1] == '/' || rel[pl] == '/' || rel[pl] == '\0';
+}
+
+static bool ms_path_allowed(const struct muse_session_policy *policy,
+    const char *workspace, const char *path)
+{
+    if (!policy || !path || !path[0] || !workspace || !workspace[0])
+        return false;
+    if (!ms_path_confined(workspace, path)) return false;
     const char *rel = path[0] == '/' ? path + strlen(workspace) +
             (path[strlen(workspace)] == '/' ? 1 : 0) : path;
     while (rel[0] == '/') rel++;
     /* Reject escapes even when a prefix would otherwise match. */
     if (strstr(rel, "..") != NULL) return false;
     for (size_t i = 0; i < policy->allow_path_count; i++) {
-        const char *prefix = policy->allow_paths[i];
-        if (!prefix || !prefix[0]) continue;
-        while (prefix[0] == '/') prefix++;
-        size_t pl = strlen(prefix);
-        if (pl == 0 || strncmp(rel, prefix, pl) != 0) continue;
-        /* A directory prefix ("notes/") authorizes its whole subtree; a
-         * bare prefix ("notes", "src/sum.c") authorizes the node itself
-         * and its children, never a sibling that merely shares the
-         * spelling ("notes2"). */
-        if (prefix[pl - 1] == '/' || rel[pl] == '/' || rel[pl] == '\0')
-            return true;
+        if (ms_prefix_covers(policy->allow_paths[i], rel)) return true;
     }
     return false;
 }
@@ -781,12 +876,19 @@ static bool ms_command_allowed(const struct muse_session_policy *policy,
     return false;
 }
 
-/* Answers one server-initiated approval/request frame. The receipt echoes the
- * request id verbatim; the decision travels as approval/decide. */
-static bool ms_answer_approval(struct ms_wait_state *w, const char *line,
-    const struct json_value *doc)
+/* The fields one approval/request frame hands the decision. */
+struct ms_approval_req {
+    const struct json_value *aid;
+    const struct json_value *subj;
+    const struct json_value *choices;
+    const struct json_value *psid;
+};
+
+/* The five fields an approval/request must carry. False with the refusal
+ * recorded when the frame is malformed. */
+static bool ms_approval_fields(struct muse_session *s,
+    const struct json_value *doc, struct ms_approval_req *f)
 {
-    struct muse_session *s = w->s;
     const struct json_value *params = json_get(doc, "params");
     const struct json_value *aid =
         params ? json_get(params, "approvalId") : NULL;
@@ -804,14 +906,32 @@ static bool ms_answer_approval(struct ms_wait_state *w, const char *line,
         ms_fail(s, "invalidParams", false, "approval/request is malformed");
         return false;
     }
+    f->aid = aid;
+    f->subj = subj;
+    f->choices = choices;
+    f->psid = psid;
+    return true;
+}
+
+/* The subject decides: a path inside the authorized scope, or a command on
+ * the authorized list. Everything else is denied. */
+static bool ms_approval_allows(struct ms_wait_state *w,
+    const struct json_value *subj)
+{
     const char *kind = subj ? json_get_str(json_get(subj, "kind")) : NULL;
     const char *path = subj ? json_get_str(json_get(subj, "path")) : NULL;
     const char *command = subj ? json_get_str(json_get(subj, "command")) : NULL;
     (void)kind;
-    bool allow = (path && path[0] &&
-            ms_path_allowed(w->policy, s->workspace, path)) ||
+    return (path && path[0] &&
+            ms_path_allowed(w->policy, w->s->workspace, path)) ||
         (command && command[0] && ms_command_allowed(w->policy, command));
-    const char *want = allow ? "approved" : "denied";
+}
+
+/* The host's own choice id for the decision we want; NULL when the host
+ * never offered it. */
+static const char *ms_approval_choice(const struct json_value *choices,
+    const char *want)
+{
     const char *choice = NULL;
     size_t n = json_size(choices);
     for (size_t i = 0; i < n && !choice; i++) {
@@ -821,42 +941,51 @@ static bool ms_answer_approval(struct ms_wait_state *w, const char *line,
         const char *cid = c ? json_get_str(json_get(c, "choiceId")) : NULL;
         if (decision && cid && strcmp(decision, want) == 0) choice = cid;
     }
-    /* Refuse to invent a decision the host did not offer. */
-    if (!choice) {
-        ms_fail(s, "policy", false, "no %s choice offered", want);
-        return false;
+    return choice;
+}
+
+/* Copies a quoted requirement token verbatim, escapes included. */
+static size_t ms_req_quoted(const char *p, char *out, size_t cap)
+{
+    size_t k = 0;
+    if (k < cap - 1) out[k++] = *p++;
+    while (*p && *p != '"' && k < cap - 2) {
+        if (*p == '\\' && p[1] && k < cap - 3)
+            out[k++] = *p++;
+        out[k++] = *p++;
     }
-    /* Requirement ids can be scalars or small objects; echo the raw token. */
-    char req_raw[1024] = {0};
+    if (*p == '"' && k < cap - 1) out[k++] = *p;
+    return k;
+}
+
+/* Copies a bare requirement token up to its field separator, trailing
+ * blanks trimmed. */
+static size_t ms_req_bare(const char *p, char *out, size_t cap)
+{
+    size_t k = 0;
+    while (*p && *p != ',' && *p != '}' && k < cap - 1) out[k++] = *p++;
+    while (k > 0 && (out[k - 1] == ' ' || out[k - 1] == '\t')) k--;
+    return k;
+}
+
+/* Requirement ids can be scalars or small objects; echo the raw token. */
+static bool ms_requirement_raw(const char *line, char *out, size_t cap)
+{
     const char *req_at = strstr(line, "\"currentRequirementId\":");
-    if (req_at) {
-        req_at += strlen("\"currentRequirementId\":");
-        size_t k = 0;
-        if (*req_at == '"') {
-            if (k < sizeof(req_raw) - 1) req_raw[k++] = *req_at++;
-            while (*req_at && *req_at != '"' && k < sizeof(req_raw) - 2) {
-                if (*req_at == '\\' && req_at[1] &&
-                    k < sizeof(req_raw) - 3)
-                    req_raw[k++] = *req_at++;
-                req_raw[k++] = *req_at++;
-            }
-            if (*req_at == '"' && k < sizeof(req_raw) - 1)
-                req_raw[k++] = *req_at;
-        } else {
-            while (*req_at && *req_at != ',' && *req_at != '}' &&
-                k < sizeof(req_raw) - 1)
-                req_raw[k++] = *req_at++;
-            while (k > 0 &&
-                (req_raw[k - 1] == ' ' || req_raw[k - 1] == '\t'))
-                k--;
-        }
-        req_raw[k] = '\0';
-    }
-    if (!req_raw[0]) {
-        ms_fail(s, "invalidParams", false,
-            "approval requirement id is unreadable");
-        return false;
-    }
+    size_t k;
+    out[0] = '\0';
+    if (!req_at) return false;
+    req_at += strlen("\"currentRequirementId\":");
+    k = *req_at == '"' ? ms_req_quoted(req_at, out, cap)
+                       : ms_req_bare(req_at, out, cap);
+    out[k] = '\0';
+    return out[0] != '\0';
+}
+
+/* Sends the approval/decide frame carrying the host's own choice. */
+static bool ms_approval_decide(struct muse_session *s, const char *aid,
+    const char *choice, const char *psid, const char *req_raw)
+{
     char dc[MUSE_COMMAND_ID_MAX];
     if (!muse_session_command_id(dc)) {
         ms_fail(s, "internal", false, "command id unavailable");
@@ -869,31 +998,62 @@ static bool ms_answer_approval(struct ms_wait_state *w, const char *line,
         "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"approval/decide\","
         "\"params\":{\"approvalId\":\"%s\",\"choiceId\":\"%s\","
         "\"commandId\":\"%s\",\"requirementId\":%s,\"sessionId\":\"%s\"}}",
-        s->next_id++, json_get_str(aid), choice, dc, req_raw,
-        json_get_str(psid));
+        s->next_id++, aid, choice, dc, req_raw, psid);
     if (m <= 0 || (size_t)m >= sizeof(frame)) {
         ms_fail(s, "internal", false, "approval decision overflow");
         return false;
     }
     /* The ids above come from the host frame; a quote inside one would break
      * framing, so refuse rather than emit a forged field. */
-    if (strchr(json_get_str(aid), '"') || strchr(choice, '"') ||
-        strchr(json_get_str(psid), '"')) {
+    if (strchr(aid, '"') || strchr(choice, '"') || strchr(psid, '"')) {
         ms_fail(s, "invalidParams", false, "approval identity is unusable");
         return false;
     }
-    if (!ms_send_raw(s, frame)) return false;
+    return ms_send_raw(s, frame);
+}
+
+/* Receipts a server-initiated request by echoing its raw id verbatim.
+ * `what` names the frame in the refusal. */
+static bool ms_ack_request(struct muse_session *s, const char *line,
+    const char *what)
+{
     char receipt[128];
     char rawid[128];
     if (!ms_raw_id(line, rawid, sizeof(rawid))) {
-        ms_fail(s, "invalidParams", false, "approval request has no id");
+        ms_fail(s, "invalidParams", false, "%s has no id", what);
         return false;
     }
-    m = snprintf(receipt, sizeof(receipt),
+    int m = snprintf(receipt, sizeof(receipt),
         "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}", rawid);
-    if (m <= 0 || (size_t)m >= sizeof(receipt) ||
-        !ms_send_raw(s, receipt))
+    return m > 0 && (size_t)m < sizeof(receipt) && ms_send_raw(s, receipt);
+}
+
+/* Answers one server-initiated approval/request frame. The receipt echoes the
+ * request id verbatim; the decision travels as approval/decide. */
+static bool ms_answer_approval(struct ms_wait_state *w, const char *line,
+    const struct json_value *doc)
+{
+    struct muse_session *s = w->s;
+    struct ms_approval_req f = {0};
+    if (!ms_approval_fields(s, doc, &f)) return false;
+    bool allow = ms_approval_allows(w, f.subj);
+    const char *want = allow ? "approved" : "denied";
+    const char *choice = ms_approval_choice(f.choices, want);
+    /* Refuse to invent a decision the host did not offer. */
+    if (!choice) {
+        ms_fail(s, "policy", false, "no %s choice offered", want);
         return false;
+    }
+    char req_raw[1024] = {0};
+    if (!ms_requirement_raw(line, req_raw, sizeof(req_raw))) {
+        ms_fail(s, "invalidParams", false,
+            "approval requirement id is unreadable");
+        return false;
+    }
+    if (!ms_approval_decide(s, json_get_str(f.aid), choice,
+            json_get_str(f.psid), req_raw))
+        return false;
+    if (!ms_ack_request(s, line, "approval request")) return false;
     if (allow) w->out->approvals_approved++;
     else w->out->approvals_denied++;
     return true;
@@ -931,17 +1091,7 @@ static bool ms_decline_input(struct ms_wait_state *w, const char *line,
         s->next_id++, dc, json_get_str(psid), json_get_str(uid));
     if (m <= 0 || (size_t)m >= sizeof(frame) || !ms_send_raw(s, frame))
         return false;
-    char receipt[128];
-    char rawid[128];
-    if (!ms_raw_id(line, rawid, sizeof(rawid))) {
-        ms_fail(s, "invalidParams", false, "user-input request has no id");
-        return false;
-    }
-    m = snprintf(receipt, sizeof(receipt),
-        "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}", rawid);
-    if (m <= 0 || (size_t)m >= sizeof(receipt) ||
-        !ms_send_raw(s, receipt))
-        return false;
+    if (!ms_ack_request(s, line, "user-input request")) return false;
     w->out->inputs_declined++;
     return true;
 }
@@ -952,6 +1102,169 @@ static uint64_t ms_u64(const struct json_value *v)
     if (v->type == JSON_INT && json_get_int(v) > 0)
         return (uint64_t)json_get_int(v);
     return 0;
+}
+
+/* A response to our own decide/cancel: surface only hard errors. */
+static bool ms_fold_response(struct muse_session *s,
+    const struct json_value *doc)
+{
+    const struct json_value *err = json_get(doc, "error");
+    if (!err) return true;
+    const struct json_value *msg = json_get(err, "message");
+    ms_fail(s, "error", false, "%s",
+        msg ? json_get_str(msg) : "serve command failed");
+    return false;
+}
+
+/* The terminal usage record is authoritative: it replaces the running
+ * counters instead of adding a second total. An empty usage object carries
+ * no reading and keeps the accumulated counters. */
+static void ms_fold_usage_terminal(struct ms_wait_state *w,
+    const struct json_value *params)
+{
+    const struct json_value *usage = json_get(params, "usage");
+    if (!(usage && usage->type == JSON_OBJ && json_size(usage) > 0)) return;
+    w->out->input_tokens = ms_u64(json_get(usage, "inputTokens"));
+    w->out->output_tokens = ms_u64(json_get(usage, "outputTokens"));
+    uint64_t total = ms_u64(json_get(usage, "totalTokens"));
+    if (total == 0)
+        total = ms_u64(json_get(params, "totalTokens"));
+    if (total == 0)
+        total = w->out->input_tokens + w->out->output_tokens;
+    w->out->total_tokens = total;
+}
+
+/* The terminal turn record: the host's own settlement plus its usage. */
+static void ms_fold_completed(struct ms_wait_state *w,
+    const struct json_value *params, const char *psid)
+{
+    const char *tid = json_get_str(json_get(params, "turnId"));
+    if (!((!tid || strcmp(tid, w->turn_id) == 0) &&
+            (!psid || strcmp(psid, w->session_id) == 0)))
+        return;
+    const char *terminal = json_get_str(json_get(params, "terminal"));
+    (void)ms_copy_str(w->out->terminal, sizeof(w->out->terminal),
+        terminal && terminal[0] ? terminal : "completed");
+    w->out->duration_ms = (int64_t)ms_u64(json_get(params, "durationMs"));
+    if (!json_get(params, "durationMs")) w->out->duration_ms = -1;
+    ms_fold_usage_terminal(w, params);
+    w->done = true;
+}
+
+/* turn/unqueued for our turn: the host dropped it before it ran. */
+static void ms_fold_unqueued(struct ms_wait_state *w,
+    const struct json_value *params)
+{
+    const char *tid = json_get_str(json_get(params, "turnId"));
+    if (tid && strcmp(tid, w->turn_id) == 0) {
+        (void)ms_copy_str(w->out->terminal, sizeof(w->out->terminal),
+            "cancelled");
+        w->done = true;
+    }
+}
+
+/* An idle session with no active turn. The terminal record follows on the
+ * stream; the wait keeps draining briefly so the receipt still folds it. */
+static void ms_fold_status(struct ms_wait_state *w,
+    const struct json_value *params, const char *psid)
+{
+    const char *st = json_get_str(json_get(params, "status"));
+    const struct json_value *active = json_get(params, "activeTurnId");
+    if (st && strcmp(st, "idle") == 0 &&
+        (!active || active->type == JSON_NULL) &&
+        (!psid || strcmp(psid, w->session_id) == 0)) {
+        if (!w->done && w->out->terminal[0] == '\0')
+            (void)ms_copy_str(w->out->terminal,
+                sizeof(w->out->terminal), "completed");
+    }
+}
+
+/* Streaming text for our turn, appended in delivery order. */
+static void ms_fold_delta(struct ms_wait_state *w,
+    const struct json_value *params)
+{
+    const char *tid = json_get_str(json_get(params, "turnId"));
+    const char *field = json_get_str(json_get(params, "field"));
+    const char *delta = json_get_str(json_get(params, "delta"));
+    if ((!tid || strcmp(tid, w->turn_id) == 0) && field &&
+        strcmp(field, "text") == 0)
+        ms_text_append(w, delta);
+}
+
+/* A completed agent message replaces the streamed text with the final one. */
+static void ms_fold_item(struct ms_wait_state *w,
+    const struct json_value *params)
+{
+    const struct json_value *item = json_get(params, "item");
+    const char *tid =
+        item ? json_get_str(json_get(item, "turnId")) : NULL;
+    const char *knd = item ? json_get_str(json_get(item, "kind")) : NULL;
+    const char *text = item ? json_get_str(json_get(item, "text")) : NULL;
+    if ((!tid || strcmp(tid, w->turn_id) == 0) && knd &&
+        strcmp(knd, "agentMessage") == 0)
+        ms_text_replace(w, text ? text : "");
+}
+
+/* A host cumulative record is authoritative and replaces the counters;
+ * otherwise the per-event deltas accumulate. */
+static void ms_fold_usage_apply(struct ms_wait_state *w,
+    const struct json_value *params)
+{
+    const struct json_value *usage = json_get(params, "usage");
+    const struct json_value *cum = json_get(params, "cumulative");
+    const struct json_value *ct = cum ? json_get(cum, "totalTokens") : NULL;
+    if (cum && ct && ct->type == JSON_INT) {
+        /* Host running total: authoritative reading. */
+        w->out->input_tokens = ms_u64(json_get(cum, "promptTokens"));
+        w->out->output_tokens = ms_u64(json_get(cum, "outputTokens"));
+        w->out->total_tokens = ms_u64(ct);
+        return;
+    }
+    w->out->input_tokens += ms_u64(json_get(usage, "inputTokens"));
+    w->out->output_tokens += ms_u64(json_get(usage, "outputTokens"));
+    uint64_t total = ms_u64(json_get(params, "totalTokens"));
+    if (total == 0)
+        total = ms_u64(json_get(usage, "inputTokens")) +
+            ms_u64(json_get(usage, "outputTokens"));
+    w->out->total_tokens += total;
+}
+
+/* One session/tokenUsage event. False only when the token cap trips. */
+static bool ms_fold_usage(struct ms_wait_state *w,
+    const struct json_value *params, const char *psid)
+{
+    struct muse_session *s = w->s;
+    const char *tid = json_get_str(json_get(params, "turnId"));
+    if (!((!tid || strcmp(tid, w->turn_id) == 0) &&
+            (!psid || strcmp(psid, w->session_id) == 0)))
+        return true;
+    const char *cursor = json_get_str(json_get(params, "viewCursor"));
+    /* Duplicate delivery: already folded, never double-count. */
+    if (ms_cursor_repeat(w, cursor)) return true;
+    ms_fold_usage_apply(w, params);
+    /* The cap means "may consume at most N": only consumption beyond N
+     * trips mid-turn; reaching exactly N completes and the next turn is
+     * refused. */
+    if (s->max_total_tokens > 0 &&
+        s->tokens_used + w->out->total_tokens > s->max_total_tokens) {
+        ms_fail(s, "tokenBudget", false, "token budget spent mid-turn");
+        return false;
+    }
+    return true;
+}
+
+/* The notifications that only record turn state or turn text. An unknown
+ * method is unrelated async traffic and is ignored. */
+static void ms_fold_stream(struct ms_wait_state *w, const char *m,
+    const struct json_value *params, const char *psid)
+{
+    if (!params) return;
+    if (strcmp(m, "turn/completed") == 0) ms_fold_completed(w, params, psid);
+    else if (strcmp(m, "turn/unqueued") == 0) ms_fold_unqueued(w, params);
+    else if (strcmp(m, "session/statusChanged") == 0)
+        ms_fold_status(w, params, psid);
+    else if (strcmp(m, "item/delta") == 0) ms_fold_delta(w, params);
+    else if (strcmp(m, "item/completed") == 0) ms_fold_item(w, params);
 }
 
 /* Folds one async frame. Returns false only for a fatal protocol/policy
@@ -970,14 +1283,7 @@ static bool ms_fold(struct ms_wait_state *w, const char *line)
                                                       : NULL;
     bool ok = true;
     if (!m) {
-        /* A response to our own decide/cancel: surface only hard errors. */
-        const struct json_value *err = json_get(&doc, "error");
-        if (err) {
-            const struct json_value *msg = json_get(err, "message");
-            ms_fail(s, "error", false, "%s",
-                msg ? json_get_str(msg) : "serve command failed");
-            ok = false;
-        }
+        ok = ms_fold_response(s, &doc);
         json_free(&doc);
         return ok;
     }
@@ -988,121 +1294,34 @@ static bool ms_fold(struct ms_wait_state *w, const char *line)
         ok = ms_answer_approval(w, line, &doc);
     } else if (strcmp(m, "userInput/request") == 0) {
         ok = ms_decline_input(w, line, &doc);
-    } else if (strcmp(m, "turn/completed") == 0 && params) {
-        const char *tid =
-            json_get_str(json_get(params, "turnId"));
-        if ((!tid || strcmp(tid, w->turn_id) == 0) &&
-            (!psid || strcmp(psid, w->session_id) == 0)) {
-            const char *terminal =
-                json_get_str(json_get(params, "terminal"));
-            (void)ms_copy_str(w->out->terminal, sizeof(w->out->terminal),
-                terminal && terminal[0] ? terminal : "completed");
-            w->out->duration_ms =
-                (int64_t)ms_u64(json_get(params, "durationMs"));
-            if (!json_get(params, "durationMs")) w->out->duration_ms = -1;
-            const struct json_value *usage = json_get(params, "usage");
-            if (usage && usage->type == JSON_OBJ && json_size(usage) > 0) {
-                /* The terminal record is authoritative: it replaces the
-                 * running counters instead of adding a second total. An
-                 * empty usage object carries no reading and keeps the
-                 * accumulated counters. */
-                w->out->input_tokens =
-                    ms_u64(json_get(usage, "inputTokens"));
-                w->out->output_tokens =
-                    ms_u64(json_get(usage, "outputTokens"));
-                uint64_t total = ms_u64(json_get(usage, "totalTokens"));
-                if (total == 0)
-                    total = ms_u64(json_get(params, "totalTokens"));
-                if (total == 0)
-                    total = w->out->input_tokens + w->out->output_tokens;
-                w->out->total_tokens = total;
-            }
-            w->done = true;
-        }
-    } else if (strcmp(m, "turn/unqueued") == 0 && params) {
-        const char *tid = json_get_str(json_get(params, "turnId"));
-        if (tid && strcmp(tid, w->turn_id) == 0) {
-            (void)ms_copy_str(w->out->terminal, sizeof(w->out->terminal),
-                "cancelled");
-            w->done = true;
-        }
-    } else if (strcmp(m, "session/statusChanged") == 0 && params) {
-        const char *st = json_get_str(json_get(params, "status"));
-        const struct json_value *active = json_get(params, "activeTurnId");
-        if (st && strcmp(st, "idle") == 0 &&
-            (!active || active->type == JSON_NULL) &&
-            (!psid || strcmp(psid, w->session_id) == 0)) {
-            /* The terminal record follows on the stream; the wait keeps
-             * draining briefly so the receipt still folds it. */
-            if (!w->done && w->out->terminal[0] == '\0')
-                (void)ms_copy_str(w->out->terminal,
-                    sizeof(w->out->terminal), "completed");
-        }
-    } else if (strcmp(m, "item/delta") == 0 && params) {
-        const char *tid = json_get_str(json_get(params, "turnId"));
-        const char *field = json_get_str(json_get(params, "field"));
-        const char *delta = json_get_str(json_get(params, "delta"));
-        if ((!tid || strcmp(tid, w->turn_id) == 0) && field &&
-            strcmp(field, "text") == 0)
-            ms_text_append(w, delta);
-    } else if (strcmp(m, "item/completed") == 0 && params) {
-        const struct json_value *item = json_get(params, "item");
-        const char *tid =
-            item ? json_get_str(json_get(item, "turnId")) : NULL;
-        const char *knd = item ? json_get_str(json_get(item, "kind")) : NULL;
-        const char *text = item ? json_get_str(json_get(item, "text")) : NULL;
-        if ((!tid || strcmp(tid, w->turn_id) == 0) && knd &&
-            strcmp(knd, "agentMessage") == 0)
-            ms_text_replace(w, text ? text : "");
     } else if (strcmp(m, "session/tokenUsage") == 0 && params) {
-        const char *tid = json_get_str(json_get(params, "turnId"));
-        if ((!tid || strcmp(tid, w->turn_id) == 0) &&
-            (!psid || strcmp(psid, w->session_id) == 0)) {
-            const char *cursor =
-                json_get_str(json_get(params, "viewCursor"));
-            if (ms_cursor_repeat(w, cursor)) {
-                /* Duplicate delivery: already folded, never double-count. */
-            } else {
-                const struct json_value *usage =
-                    json_get(params, "usage");
-                const struct json_value *cum =
-                    json_get(params, "cumulative");
-                const struct json_value *ct =
-                    cum ? json_get(cum, "totalTokens") : NULL;
-                if (cum && ct && ct->type == JSON_INT) {
-                    /* Host running total: authoritative reading. */
-                    w->out->input_tokens =
-                        ms_u64(json_get(cum, "promptTokens"));
-                    w->out->output_tokens =
-                        ms_u64(json_get(cum, "outputTokens"));
-                    w->out->total_tokens = ms_u64(ct);
-                } else {
-                    w->out->input_tokens +=
-                        ms_u64(json_get(usage, "inputTokens"));
-                    w->out->output_tokens +=
-                        ms_u64(json_get(usage, "outputTokens"));
-                    uint64_t total =
-                        ms_u64(json_get(params, "totalTokens"));
-                    if (total == 0)
-                        total = ms_u64(json_get(usage, "inputTokens")) +
-                            ms_u64(json_get(usage, "outputTokens"));
-                    w->out->total_tokens += total;
-                }
-                /* The cap means "may consume at most N": only consumption
-                 * beyond N trips mid-turn; reaching exactly N completes and
-                 * the next turn is refused. */
-                if (s->max_total_tokens > 0 &&
-                    s->tokens_used + w->out->total_tokens >
-                        s->max_total_tokens) {
-                    ms_fail(s, "tokenBudget", false,
-                        "token budget spent mid-turn");
-                    ok = false;
-                }
-            }
-        }
+        ok = ms_fold_usage(w, params, psid);
+    } else {
+        ms_fold_stream(w, m, params, psid);
     }
     json_free(&doc);
     return ok;
+}
+
+/* Drains frames until the turn settles or a bound trips. 0 when the drain
+ * ended on a settlement or the idle grace, -1 with the failure recorded. */
+static int ms_drain(struct ms_wait_state *w, char *line, int64_t deadline)
+{
+    struct muse_session *s = w->s;
+    int idle_grace = 0;
+    for (;;) {
+        int r = ms_read_line(s, line, MUSE_LINE_MAX, deadline);
+        if (r != 1) {
+            if (r == 0)
+                ms_fail(s, "timeout", true, "turn did not complete in time");
+            return -1;
+        }
+        if (!ms_fold(w, line)) return -1;
+        if (w->done) return 0;
+        /* An idle session with no terminal record yet gets a short grace so
+         * the receipt still folds the turn/completed frame. */
+        if (w->out->terminal[0] != '\0' && ++idle_grace > 64) return 0;
+    }
 }
 
 int muse_session_wait(struct muse_session *s, const char *session_id,
@@ -1129,25 +1348,7 @@ int muse_session_wait(struct muse_session *s, const char *session_id,
         .policy = policy, .out = out, .line = line, .done = false,
     };
     int64_t deadline = ms_monotonic_ms() + s->turn_timeout_ms;
-    int idle_grace = 0;
-    int rc = 0;
-    for (;;) {
-        int r = ms_read_line(s, line, MUSE_LINE_MAX, deadline);
-        if (r != 1) {
-            if (r == 0)
-                ms_fail(s, "timeout", true, "turn did not complete in time");
-            rc = -1;
-            break;
-        }
-        if (!ms_fold(&w, line)) {
-            rc = -1;
-            break;
-        }
-        if (w.done) break;
-        /* An idle session with no terminal record yet gets a short grace so
-         * the receipt still folds the turn/completed frame. */
-        if (out->terminal[0] != '\0' && ++idle_grace > 64) break;
-    }
+    int rc = ms_drain(&w, line, deadline);
     if (rc == 0 && out->terminal[0] == '\0') {
         /* Drain ended on grace without the terminal frame: report what the
          * host settled, not a fabricated completion. */

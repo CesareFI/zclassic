@@ -536,419 +536,499 @@ static int mr_failures_precheck(void)
     return failures;
 }
 
+/* No gate runner: refused, but the turn ran and was recorded. */
+static int mr_exec_no_runner(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("refused run", mr_execute(FAKE_JOURNEY, &d, NULL, NULL,
+        NULL, false, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("refused rc", rc == 1 && r.rc == 1);
+    {
+        char receipt[8192];
+        char *rtext = NULL;
+        (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
+            d.run);
+        rtext = mr_read(receipt);
+        MR_CHECK("refused receipt", rtext &&
+            strstr(rtext, "\"verdict\":\"refused\"") &&
+            strstr(rtext, "\"name\":\"u1\"") &&
+            strstr(rtext, "\"attempt\":1"));
+        free(rtext);
+    }
+    {
+        char facts[8192];
+        char *ftext = NULL;
+        (void)snprintf(facts, sizeof(facts), "%s/muse.json", d.run);
+        ftext = mr_read(facts);
+        MR_CHECK("facts carry turn+tokens", ftext &&
+            strstr(ftext, "\"turn\"") &&
+            strstr(ftext, "\"total\":15") &&
+            strstr(ftext, "\"worker\":\"w1\"") &&
+            strstr(ftext, "\"model_resolved\":\"m-test\""));
+        free(ftext);
+    }
+    {
+        char turns[8192];
+        char *ttext = NULL;
+        (void)snprintf(turns, sizeof(turns), "%s/muse-turn.jsonl",
+            d.run);
+        ttext = mr_read(turns);
+        MR_CHECK("admission recorded", ttext &&
+            strstr(ttext, "\"turnId\""));
+        free(ttext);
+    }
+    MR_CHECK("scope denied foreign paths", evidence &&
+        evidence_has(evidence, "decide:c-deny") &&
+        evidence_count(evidence, "decide:c-deny") == 2 &&
+        evidence_count(evidence, "decide:c-allow") == 0);
+    free(evidence);
+    return failures;
+}
+
+/* Gate passes but nothing changed: failed, never pass. The engine
+ * name rides the evidence, not the verdict. */
+static int mr_exec_no_change(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("no-change run", mr_execute(FAKE_JOURNEY, &d,
+        mr_verdict_pass, mr_head_pass, NULL, false, NULL, NULL, NULL, false, &r, err,
+        &rc, &evidence) == 0);
+    MR_CHECK("no-change rc", rc == 1 && r.rc == 1);
+    {
+        char receipt[8192];
+        char *rtext = NULL;
+        (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
+            d.run);
+        rtext = mr_read(receipt);
+        MR_CHECK("no-change verdict", rtext &&
+            strstr(rtext, "\"verdict\":\"failed\""));
+        free(rtext);
+    }
+    {
+        char facts[8192];
+        char *ftext = NULL;
+        (void)snprintf(facts, sizeof(facts), "%s/muse.json", d.run);
+        ftext = mr_read(facts);
+        MR_CHECK("no-change engine named", ftext &&
+            strstr(ftext, "\"engine\":\"NO-CHANGE\""));
+        free(ftext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* Completed turn, failing gate: failed. Completed is not pass. */
+static int mr_exec_failing_gate(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("fail run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_fail,
+        mr_head_fail, NULL, true, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("fail rc", rc == 1 && r.rc == 1);
+    {
+        char receipt[8192];
+        char *rtext = NULL;
+        (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
+            d.run);
+        rtext = mr_read(receipt);
+        MR_CHECK("fail verdict", rtext &&
+            strstr(rtext, "\"verdict\":\"failed\""));
+        free(rtext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* The named candidate artifact the gate checks for existence. */
+static int mr_pass_candidate(const struct mr_dirs *d,
+    const struct muse_run_result *r)
+{
+    int failures = 0;
+    char cf[8192];
+    size_t cn = strlen(r->candidate_file);
+    bool named = cn > 15 &&
+        strncmp(r->candidate_file, "candidate-", 10) == 0 &&
+        strcmp(r->candidate_file + cn - 5, ".diff") == 0;
+    MR_CHECK("pass candidate named", named);
+    (void)snprintf(cf, sizeof(cf), "%s/%s", d->run,
+        r->candidate_file);
+    MR_CHECK("pass candidate on disk",
+        named && access(cf, F_OK) == 0);
+    return failures;
+}
+
+/* The facts file a passing run leaves behind. */
+static int mr_pass_facts(const struct mr_dirs *d)
+{
+    int failures = 0;
+    char facts[8192];
+    char *ftext = NULL;
+    (void)snprintf(facts, sizeof(facts), "%s/muse.json", d->run);
+    ftext = mr_read(facts);
+    MR_CHECK("pass evidence", ftext &&
+        strstr(ftext, "\"verdict\":\"pass\"") &&
+        strstr(ftext, "\"candidate\":\"") &&
+        strstr(ftext, "\"verdict\":\"SUITE VERDICT"));
+    free(ftext);
+    return failures;
+}
+
+/* Passing gate plus a real diff: pass, rc 0, full contract. */
+static int mr_exec_pass(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("pass run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_pass,
+        mr_head_pass, NULL, true, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("pass rc", rc == 0 && r.rc == 0);
+    MR_CHECK("pass verdict", strcmp(r.verdict, "pass") == 0);
+    MR_CHECK("pass terminal", strcmp(r.terminal, "completed") == 0);
+    MR_CHECK("pass identity", mr_hex40(r.base) &&
+        mr_hex40(r.candidate) && r.session[0] &&
+        r.turn[0] && r.turn_command[0]);
+    MR_CHECK("pass gate token",
+        strcmp(r.gate_evidence, "task_document:1/0") == 0 &&
+        r.gate_present && r.gate_ran == 1 && r.gate_failed == 0);
+    failures += mr_pass_candidate(&d, &r);
+    MR_CHECK("pass tokens", r.total_tokens == 15 &&
+        r.input_tokens == 10 && r.output_tokens == 5);
+    failures += mr_pass_facts(&d);
+    free(evidence);
+    return failures;
+}
+
+/* Cancelled turn: cancelled without running the gate at all. */
+static int mr_exec_cancelled(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("cancelled run", mr_execute(FAKE_CANCELLED, &d,
+        mr_verdict_pass, mr_head_pass,
+        "touch \"$0.marker\"", true, NULL, NULL, NULL, false, &r, err, &rc,
+        &evidence) == 0);
+    MR_CHECK("cancelled rc", rc == 1 && r.rc == 1);
+    {
+        char receipt[8192];
+        char *rtext = NULL;
+        (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
+            d.run);
+        rtext = mr_read(receipt);
+        MR_CHECK("cancelled verdict", rtext &&
+            strstr(rtext, "\"verdict\":\"cancelled\""));
+        free(rtext);
+    }
+    {
+        char marker[8192];
+        (void)snprintf(marker, sizeof(marker),
+            "%s/build/bin/test_parallel.marker", d.wt);
+        MR_CHECK("gate never ran", access(marker, F_OK) != 0);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* Unknown host notification mid-turn: ignored, the turn completes. */
+static int mr_exec_unknown_frame(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("unknown frame run", mr_execute(FAKE_UNKNOWN, &d,
+        mr_verdict_pass, mr_head_pass, NULL, true, NULL, NULL, NULL, false, &r, err,
+        &rc, &evidence) == 0);
+    MR_CHECK("unknown frame pass", rc == 0 && r.rc == 0 &&
+        strcmp(r.verdict, "pass") == 0);
+    free(evidence);
+    return failures;
+}
+
+/* Malformed frame mid-turn: fail closed, refused, gate never runs. */
+static int mr_exec_garbage(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("garbage run", mr_execute(FAKE_GARBAGE, &d, NULL, NULL,
+        NULL, false, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("garbage refused", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "refused") == 0);
+    {
+        char receipt[8192];
+        char *rtext = NULL;
+        (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
+            d.run);
+        rtext = mr_read(receipt);
+        MR_CHECK("garbage receipt", rtext &&
+            strstr(rtext, "\"verdict\":\"refused\""));
+        free(rtext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* Host exits mid-turn with no terminal: refused, never pass. */
+static int mr_exec_host_exit(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("host-exit run", mr_execute(FAKE_EXIT, &d, NULL, NULL,
+        NULL, false, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("host-exit refused", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "refused") == 0);
+    free(evidence);
+    return failures;
+}
+
+/* Silent host: the turn bound trips, the turn is cancelled first,
+ * and the verdict is timeout. */
+static int mr_exec_timeout(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    struct muse_run_budgets b;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    memset(&b, 0, sizeof(b));
+    b.turn_timeout_ms = 1500;
+    b.gate_timeout_ms = 60000;
+    MR_CHECK("timeout run", mr_execute(FAKE_HANG, &d, NULL,
+        NULL, NULL, false, NULL, NULL, &b, false, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("timeout verdict", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "timeout") == 0);
+    MR_CHECK("timeout cancels first", evidence &&
+        evidence_has(evidence, "cancel:"));
+    free(evidence);
+    return failures;
+}
+
+/* Token cap below the first usage report: refused mid-turn, and
+ * the turn is cancelled first like a timeout. */
+static int mr_exec_token_cap(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    struct muse_run_budgets b;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    memset(&b, 0, sizeof(b));
+    b.turn_timeout_ms = 30000;
+    b.gate_timeout_ms = 60000;
+    b.max_total_tokens = 10;
+    MR_CHECK("cap run", mr_execute(FAKE_JOURNEY, &d, NULL,
+        NULL, NULL, false, NULL, NULL, &b, false, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("cap refused", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "refused") == 0);
+    MR_CHECK("cap cancels first", evidence &&
+        evidence_has(evidence, "cancel:"));
+    free(evidence);
+    return failures;
+}
+
+/* Model substitution: the run proceeds, both names are recorded. */
+static int mr_exec_model_substitution(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    const char *saved = s_fake_model;
+    memset(&r, 0, sizeof(r));
+    s_fake_model = "m-other";
+    MR_CHECK("mismatch run", mr_execute(FAKE_JOURNEY, &d,
+        mr_verdict_pass, mr_head_pass, NULL, true, NULL, "m-want", NULL, false, &r,
+        err, &rc, &evidence) == 0);
+    MR_CHECK("mismatch proceeds", rc == 0 && r.rc == 0);
+    MR_CHECK("mismatch visible",
+        strcmp(r.model_requested, "m-want") == 0 &&
+        strcmp(r.model_resolved, "m-other") == 0);
+    MR_CHECK("mismatch selects", evidence &&
+        evidence_has(evidence, "model:m-want"));
+    s_fake_model = saved;
+    free(evidence);
+    return failures;
+}
+
+/* Claim-held callers skip the receipt pre-check: a seeded receipt
+ * does not stop the turn, and no receipt is written beside it.
+ * The candidate artifact and muse.json still land. */
+static int mr_exec_claim_held(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    char receipt[8192], *seed = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("claimed run", mr_execute(FAKE_JOURNEY, &d,
+        mr_verdict_pass, mr_head_pass, NULL, true, NULL, NULL,
+        NULL, true, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("claimed proceeds", rc == 0 && r.rc == 0 &&
+        strcmp(r.verdict, "pass") == 0);
+    MR_CHECK("claimed turned", evidence &&
+        evidence_has(evidence, "turn-cmd:"));
+    (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
+        d.run);
+    seed = mr_read(receipt);
+    MR_CHECK("claimed writes no receipt", seed == NULL);
+    free(seed);
+    {
+        char cf[8192];
+        (void)snprintf(cf, sizeof(cf), "%s/%s", d.run,
+            r.candidate_file);
+        MR_CHECK("claimed names artifact",
+            r.candidate_file[0] && access(cf, F_OK) == 0);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* The claim-held turn itself, over a transport this case owns so the
+ * seeded receipt can be read back byte-for-byte afterwards. */
+static int mr_claim_seed_turn(struct mr_dirs *d, const char *receipt,
+    const char *seed_text)
+{
+    int failures = 0;
+    struct muse_run_result r;
+    struct muse_run_task t;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int ev2[2], to_fd = -1, from_fd = -1;
+    pid_t child = -1;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    if (pipe(ev2) != 0) {
+        MR_CHECK("claimed pipe", false);
+        return failures;
+    }
+    s_evidence_fd = ev2[1];
+    if (!mr_task_for(d, &t, NULL, NULL, NULL)) {
+        MR_CHECK("claimed task", false);
+        close(ev2[0]); close(ev2[1]);
+        return failures;
+    }
+    t.caller_holds_claim = true;
+    if (!mr_fork_fake(FAKE_JOURNEY, ev2[0], &to_fd, &from_fd, &child)) {
+        MR_CHECK("claimed fork", false);
+        close(ev2[0]); close(ev2[1]);
+        return failures;
+    }
+    err[0] = '\0';
+    rc = muse_run_task_on_transport(&t, child, to_fd, from_fd, &r, err);
+    close(to_fd);
+    close(from_fd);
+    {
+        int status = 0;
+        (void)waitpid(child, &status, 0);
+    }
+    close(ev2[1]);
+    s_evidence_fd = -1;
+    evidence = read_evidence(ev2[0]);
+    close(ev2[0]);
+    MR_CHECK("claimed seed ignored", rc == 0 &&
+        strcmp(r.verdict, "pass") == 0);
+    MR_CHECK("claimed seed turned", evidence &&
+        evidence_has(evidence, "turn-cmd:"));
+    {
+        char *rtext = mr_read(receipt);
+        MR_CHECK("claimed seed intact", rtext &&
+            strcmp(rtext, seed_text) == 0);
+        free(rtext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* Claim-held with a seeded receipt: the turn still runs and the
+ * seed is left byte-identical. */
+static int mr_exec_claim_seed(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    char receipt[8192];
+    static const char seed_text[] =
+        "{\"verdict\":\"failed\",\"seq\":7,\"name\":\"u1\","
+        "\"attempt\":1}\n";
+    MR_CHECK("claimed lane", mr_lane(&d));
+    (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
+        d.run);
+    MR_CHECK("claimed seed", mr_write(receipt, seed_text, 0));
+    MR_CHECK("claimed gate",
+        mr_gate_script(&d, mr_verdict_pass, mr_head_pass, NULL));
+    {
+        char f[8192];
+        (void)snprintf(f, sizeof(f), "%s/edit.txt", d.wt);
+        MR_CHECK("claimed dirty", mr_write(f, "changed\n", 0));
+    }
+    failures += mr_claim_seed_turn(&d, receipt, seed_text);
+    return failures;
+}
+
 static int mr_failures_execute(void)
 {
     int failures = 0;
-    /* No gate runner: refused, but the turn ran and was recorded. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("refused run", mr_execute(FAKE_JOURNEY, &d, NULL, NULL,
-            NULL, false, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
-        MR_CHECK("refused rc", rc == 1 && r.rc == 1);
-        {
-            char receipt[8192];
-            char *rtext = NULL;
-            (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
-                d.run);
-            rtext = mr_read(receipt);
-            MR_CHECK("refused receipt", rtext &&
-                strstr(rtext, "\"verdict\":\"refused\"") &&
-                strstr(rtext, "\"name\":\"u1\"") &&
-                strstr(rtext, "\"attempt\":1"));
-            free(rtext);
-        }
-        {
-            char facts[8192];
-            char *ftext = NULL;
-            (void)snprintf(facts, sizeof(facts), "%s/muse.json", d.run);
-            ftext = mr_read(facts);
-            MR_CHECK("facts carry turn+tokens", ftext &&
-                strstr(ftext, "\"turn\"") &&
-                strstr(ftext, "\"total\":15") &&
-                strstr(ftext, "\"worker\":\"w1\"") &&
-                strstr(ftext, "\"model_resolved\":\"m-test\""));
-            free(ftext);
-        }
-        {
-            char turns[8192];
-            char *ttext = NULL;
-            (void)snprintf(turns, sizeof(turns), "%s/muse-turn.jsonl",
-                d.run);
-            ttext = mr_read(turns);
-            MR_CHECK("admission recorded", ttext &&
-                strstr(ttext, "\"turnId\""));
-            free(ttext);
-        }
-        MR_CHECK("scope denied foreign paths", evidence &&
-            evidence_has(evidence, "decide:c-deny") &&
-            evidence_count(evidence, "decide:c-deny") == 2 &&
-            evidence_count(evidence, "decide:c-allow") == 0);
-        free(evidence);
-    }
-    /* Gate passes but nothing changed: failed, never pass. The engine
-     * name rides the evidence, not the verdict. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("no-change run", mr_execute(FAKE_JOURNEY, &d,
-            mr_verdict_pass, mr_head_pass, NULL, false, NULL, NULL, NULL, false, &r, err,
-            &rc, &evidence) == 0);
-        MR_CHECK("no-change rc", rc == 1 && r.rc == 1);
-        {
-            char receipt[8192];
-            char *rtext = NULL;
-            (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
-                d.run);
-            rtext = mr_read(receipt);
-            MR_CHECK("no-change verdict", rtext &&
-                strstr(rtext, "\"verdict\":\"failed\""));
-            free(rtext);
-        }
-        {
-            char facts[8192];
-            char *ftext = NULL;
-            (void)snprintf(facts, sizeof(facts), "%s/muse.json", d.run);
-            ftext = mr_read(facts);
-            MR_CHECK("no-change engine named", ftext &&
-                strstr(ftext, "\"engine\":\"NO-CHANGE\""));
-            free(ftext);
-        }
-        free(evidence);
-    }
-    /* Completed turn, failing gate: failed. Completed is not pass. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("fail run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_fail,
-            mr_head_fail, NULL, true, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
-        MR_CHECK("fail rc", rc == 1 && r.rc == 1);
-        {
-            char receipt[8192];
-            char *rtext = NULL;
-            (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
-                d.run);
-            rtext = mr_read(receipt);
-            MR_CHECK("fail verdict", rtext &&
-                strstr(rtext, "\"verdict\":\"failed\""));
-            free(rtext);
-        }
-        free(evidence);
-    }
-    /* Passing gate plus a real diff: pass, rc 0, full contract. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("pass run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_pass,
-            mr_head_pass, NULL, true, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
-        MR_CHECK("pass rc", rc == 0 && r.rc == 0);
-        MR_CHECK("pass verdict", strcmp(r.verdict, "pass") == 0);
-        MR_CHECK("pass terminal", strcmp(r.terminal, "completed") == 0);
-        MR_CHECK("pass identity", mr_hex40(r.base) &&
-            mr_hex40(r.candidate) && r.session[0] &&
-            r.turn[0] && r.turn_command[0]);
-        MR_CHECK("pass gate token",
-            strcmp(r.gate_evidence, "task_document:1/0") == 0 &&
-            r.gate_present && r.gate_ran == 1 && r.gate_failed == 0);
-        {
-            char cf[8192];
-            size_t cn = strlen(r.candidate_file);
-            bool named = cn > 15 &&
-                strncmp(r.candidate_file, "candidate-", 10) == 0 &&
-                strcmp(r.candidate_file + cn - 5, ".diff") == 0;
-            MR_CHECK("pass candidate named", named);
-            (void)snprintf(cf, sizeof(cf), "%s/%s", d.run,
-                r.candidate_file);
-            MR_CHECK("pass candidate on disk",
-                named && access(cf, F_OK) == 0);
-        }
-        MR_CHECK("pass tokens", r.total_tokens == 15 &&
-            r.input_tokens == 10 && r.output_tokens == 5);
-        {
-            char facts[8192];
-            char *ftext = NULL;
-            (void)snprintf(facts, sizeof(facts), "%s/muse.json", d.run);
-            ftext = mr_read(facts);
-            MR_CHECK("pass evidence", ftext &&
-                strstr(ftext, "\"verdict\":\"pass\"") &&
-                strstr(ftext, "\"candidate\":\"") &&
-                strstr(ftext, "\"verdict\":\"SUITE VERDICT"));
-            free(ftext);
-        }
-        free(evidence);
-    }
-    /* Cancelled turn: cancelled without running the gate at all. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("cancelled run", mr_execute(FAKE_CANCELLED, &d,
-            mr_verdict_pass, mr_head_pass,
-            "touch \"$0.marker\"", true, NULL, NULL, NULL, false, &r, err, &rc,
-            &evidence) == 0);
-        MR_CHECK("cancelled rc", rc == 1 && r.rc == 1);
-        {
-            char receipt[8192];
-            char *rtext = NULL;
-            (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
-                d.run);
-            rtext = mr_read(receipt);
-            MR_CHECK("cancelled verdict", rtext &&
-                strstr(rtext, "\"verdict\":\"cancelled\""));
-            free(rtext);
-        }
-        {
-            char marker[8192];
-            (void)snprintf(marker, sizeof(marker),
-                "%s/build/bin/test_parallel.marker", d.wt);
-            MR_CHECK("gate never ran", access(marker, F_OK) != 0);
-        }
-        free(evidence);
-    }
-    /* Unknown host notification mid-turn: ignored, the turn completes. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("unknown frame run", mr_execute(FAKE_UNKNOWN, &d,
-            mr_verdict_pass, mr_head_pass, NULL, true, NULL, NULL, NULL, false, &r, err,
-            &rc, &evidence) == 0);
-        MR_CHECK("unknown frame pass", rc == 0 && r.rc == 0 &&
-            strcmp(r.verdict, "pass") == 0);
-        free(evidence);
-    }
-    /* Malformed frame mid-turn: fail closed, refused, gate never runs. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("garbage run", mr_execute(FAKE_GARBAGE, &d, NULL, NULL,
-            NULL, false, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
-        MR_CHECK("garbage refused", rc == 1 && r.rc == 1 &&
-            strcmp(r.verdict, "refused") == 0);
-        {
-            char receipt[8192];
-            char *rtext = NULL;
-            (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
-                d.run);
-            rtext = mr_read(receipt);
-            MR_CHECK("garbage receipt", rtext &&
-                strstr(rtext, "\"verdict\":\"refused\""));
-            free(rtext);
-        }
-        free(evidence);
-    }
-    /* Host exits mid-turn with no terminal: refused, never pass. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("host-exit run", mr_execute(FAKE_EXIT, &d, NULL, NULL,
-            NULL, false, NULL, NULL, NULL, false, &r, err, &rc, &evidence) == 0);
-        MR_CHECK("host-exit refused", rc == 1 && r.rc == 1 &&
-            strcmp(r.verdict, "refused") == 0);
-        free(evidence);
-    }
-    /* Silent host: the turn bound trips, the turn is cancelled first,
-     * and the verdict is timeout. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        struct muse_run_budgets b;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        memset(&b, 0, sizeof(b));
-        b.turn_timeout_ms = 1500;
-        b.gate_timeout_ms = 60000;
-        {
-            MR_CHECK("timeout run", mr_execute(FAKE_HANG, &d, NULL,
-                NULL, NULL, false, NULL, NULL, &b, false, &r, err, &rc, &evidence) == 0);
-            MR_CHECK("timeout verdict", rc == 1 && r.rc == 1 &&
-                strcmp(r.verdict, "timeout") == 0);
-            MR_CHECK("timeout cancels first", evidence &&
-                evidence_has(evidence, "cancel:"));
-        }
-        free(evidence);
-    }
-    /* Token cap below the first usage report: refused mid-turn, and
-     * the turn is cancelled first like a timeout. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        struct muse_run_budgets b;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        memset(&b, 0, sizeof(b));
-        b.turn_timeout_ms = 30000;
-        b.gate_timeout_ms = 60000;
-        b.max_total_tokens = 10;
-        {
-            MR_CHECK("cap run", mr_execute(FAKE_JOURNEY, &d, NULL,
-                NULL, NULL, false, NULL, NULL, &b, false, &r, err, &rc, &evidence) == 0);
-            MR_CHECK("cap refused", rc == 1 && r.rc == 1 &&
-                strcmp(r.verdict, "refused") == 0);
-            MR_CHECK("cap cancels first", evidence &&
-                evidence_has(evidence, "cancel:"));
-        }
-        free(evidence);
-    }
-    /* Model substitution: the run proceeds, both names are recorded. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        int rc = -1;
-        const char *saved = s_fake_model;
-        memset(&r, 0, sizeof(r));
-        s_fake_model = "m-other";
-        {
-            MR_CHECK("mismatch run", mr_execute(FAKE_JOURNEY, &d,
-                mr_verdict_pass, mr_head_pass, NULL, true, NULL, "m-want", NULL, false, &r,
-                err, &rc, &evidence) == 0);
-            MR_CHECK("mismatch proceeds", rc == 0 && r.rc == 0);
-            MR_CHECK("mismatch visible",
-                strcmp(r.model_requested, "m-want") == 0 &&
-                strcmp(r.model_resolved, "m-other") == 0);
-            MR_CHECK("mismatch selects", evidence &&
-                evidence_has(evidence, "model:m-want"));
-        }
-        s_fake_model = saved;
-        free(evidence);
-    }
-    /* Claim-held callers skip the receipt pre-check: a seeded receipt
-     * does not stop the turn, and no receipt is written beside it.
-     * The candidate artifact and muse.json still land. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        char receipt[8192], *seed = NULL;
-        int rc = -1;
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("claimed run", mr_execute(FAKE_JOURNEY, &d,
-            mr_verdict_pass, mr_head_pass, NULL, true, NULL, NULL,
-            NULL, true, &r, err, &rc, &evidence) == 0);
-        MR_CHECK("claimed proceeds", rc == 0 && r.rc == 0 &&
-            strcmp(r.verdict, "pass") == 0);
-        MR_CHECK("claimed turned", evidence &&
-            evidence_has(evidence, "turn-cmd:"));
-        (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
-            d.run);
-        seed = mr_read(receipt);
-        MR_CHECK("claimed writes no receipt", seed == NULL);
-        free(seed);
-        {
-            char cf[8192];
-            (void)snprintf(cf, sizeof(cf), "%s/%s", d.run,
-                r.candidate_file);
-            MR_CHECK("claimed names artifact",
-                r.candidate_file[0] && access(cf, F_OK) == 0);
-        }
-        free(evidence);
-    }
-    /* Claim-held with a seeded receipt: the turn still runs and the
-     * seed is left byte-identical. */
-    {
-        struct mr_dirs d;
-        struct muse_run_result r;
-        char err[MUSE_RUN_ERROR_MAX] = {0};
-        char *evidence = NULL;
-        char receipt[8192];
-        int ev2[2], to_fd = -1, from_fd = -1;
-        pid_t child = -1;
-        int rc = -1;
-        static const char seed_text[] =
-            "{\"verdict\":\"failed\",\"seq\":7,\"name\":\"u1\","
-            "\"attempt\":1}\n";
-        memset(&r, 0, sizeof(r));
-        MR_CHECK("claimed lane", mr_lane(&d));
-        (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json",
-            d.run);
-        MR_CHECK("claimed seed", mr_write(receipt, seed_text, 0));
-        MR_CHECK("claimed gate",
-            mr_gate_script(&d, mr_verdict_pass, mr_head_pass, NULL));
-        {
-            char f[8192];
-            (void)snprintf(f, sizeof(f), "%s/edit.txt", d.wt);
-            MR_CHECK("claimed dirty", mr_write(f, "changed\n", 0));
-        }
-        if (pipe(ev2) != 0) {
-            MR_CHECK("claimed pipe", false);
-        } else {
-            struct muse_run_task t;
-            s_evidence_fd = ev2[1];
-            if (!mr_task_for(&d, &t, NULL, NULL, NULL)) {
-                MR_CHECK("claimed task", false);
-                close(ev2[0]); close(ev2[1]);
-            } else {
-                t.caller_holds_claim = true;
-                if (!mr_fork_fake(FAKE_JOURNEY, ev2[0], &to_fd,
-                        &from_fd, &child)) {
-                    MR_CHECK("claimed fork", false);
-                    close(ev2[0]); close(ev2[1]);
-                } else {
-                    err[0] = '\0';
-                    rc = muse_run_task_on_transport(&t, child, to_fd,
-                        from_fd, &r, err);
-                    close(to_fd);
-                    close(from_fd);
-                    {
-                        int status = 0;
-                        (void)waitpid(child, &status, 0);
-                    }
-                    close(ev2[1]);
-                    s_evidence_fd = -1;
-                    evidence = read_evidence(ev2[0]);
-                    close(ev2[0]);
-                    MR_CHECK("claimed seed ignored", rc == 0 &&
-                        strcmp(r.verdict, "pass") == 0);
-                    MR_CHECK("claimed seed turned", evidence &&
-                        evidence_has(evidence, "turn-cmd:"));
-                    {
-                        char *rtext = mr_read(receipt);
-                        MR_CHECK("claimed seed intact", rtext &&
-                            strcmp(rtext, seed_text) == 0);
-                        free(rtext);
-                    }
-                    free(evidence);
-                }
-            }
-        }
-    }
+    failures += mr_exec_no_runner();
+    failures += mr_exec_no_change();
+    failures += mr_exec_failing_gate();
+    failures += mr_exec_pass();
+    failures += mr_exec_cancelled();
+    failures += mr_exec_unknown_frame();
+    failures += mr_exec_garbage();
+    failures += mr_exec_host_exit();
+    failures += mr_exec_timeout();
+    failures += mr_exec_token_cap();
+    failures += mr_exec_model_substitution();
+    failures += mr_exec_claim_held();
+    failures += mr_exec_claim_seed();
     return failures;
 }
 
