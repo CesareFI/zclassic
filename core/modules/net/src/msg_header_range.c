@@ -87,11 +87,100 @@ void msg_push_getheaders_followup(struct msg_processor *mp,
     push_getheaders_from(mp, node, from);
 }
 
+static bool range_request_context_valid(const struct msg_processor *mp,
+                                        const struct p2p_node *node)
+{
+    return mp && node && mp->main_state && mp->net_mgr && mp->params;
+}
+
+static bool range_peer_is_active(const struct p2p_node *node)
+{
+    return node && !node->inbound && !node->disconnect &&
+           node->state >= PEER_ACTIVE &&
+           peer_supports_fast_sync(node->services);
+}
+
+static int range_collect_target(struct msg_processor *mp,
+                                int initial_target,
+                                int *fast_peers)
+{
+    int target = initial_target;
+    *fast_peers = 0;
+    zcl_mutex_lock(&mp->net_mgr->cs_nodes);
+    for (size_t i = 0; i < mp->net_mgr->num_nodes; i++) {
+        struct p2p_node *candidate = mp->net_mgr->nodes[i];
+        if (range_peer_is_active(candidate)) {
+            (*fast_peers)++;
+            target = hrs_include_peer_target(target,
+                                             candidate->starting_height);
+        }
+    }
+    zcl_mutex_unlock(&mp->net_mgr->cs_nodes);
+    return target;
+}
+
+static size_t range_collect_anchors(const struct checkpoint_data *cpd,
+                                    int our_height,
+                                    int target,
+                                    int32_t anchors[HRS_MAX_SPANS])
+{
+    size_t count = 0;
+    if (!cpd || !cpd->entries)
+        return 0;
+    for (int i = 0; i < cpd->nEntries && count < HRS_MAX_SPANS; i++) {
+        int height = cpd->entries[i].height;
+        if (height > our_height && height < target)
+            anchors[count++] = (int32_t)height;
+    }
+    return count;
+}
+
+static bool range_stall_was_reported(const int32_t *stalled_ids,
+                                     size_t before,
+                                     int32_t peer_id)
+{
+    for (size_t i = 0; i < before; i++) {
+        if (stalled_ids[i] == peer_id)
+            return true;
+    }
+    return false;
+}
+
+static void range_report_expired(struct header_range_scheduler *sched,
+                                 int64_t now_us)
+{
+    int32_t stalled_ids[HRS_MAX_SPANS];
+    size_t count = hrs_sweep_expired(sched, now_us, stalled_ids,
+                                     HRS_MAX_SPANS);
+    for (size_t i = 0; i < count; i++) {
+        int32_t peer_id = stalled_ids[i];
+        if (range_stall_was_reported(stalled_ids, i, peer_id))
+            continue;
+        event_emitf(EV_HEADERS_REJECTED, (uint32_t)peer_id,
+                    "header span reclaimed from slow peer %d "
+                    "(deadline missed; span reassigned, not scored)",
+                    (int)peer_id);
+    }
+}
+
+static bool range_claim_peer_span(struct header_range_scheduler *sched,
+                                  int32_t peer_id,
+                                  int64_t now_us,
+                                  int32_t *lo,
+                                  int32_t *hi)
+{
+    if (hrs_peer_span(sched, peer_id, now_us, lo, hi))
+        return true;
+    if (hrs_assign(sched, peer_id, now_us) < 0)
+        return false;
+    return hrs_peer_span(sched, peer_id, now_us, lo, hi);
+}
+
 bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
                                        struct p2p_node *node,
                                        int our_height, int64_t now_us)
 {
-    if (!mp || !node || !mp->main_state || !mp->net_mgr || !mp->params)
+    if (!range_request_context_valid(mp, node))
         return false;
     if (syncsvc_header_band_hole_open())
         return false;
@@ -105,30 +194,14 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
         target = ms->pindex_best_header->nHeight;
 
     int fast_peers = 0;
-    zcl_mutex_lock(&mp->net_mgr->cs_nodes);
-    for (size_t pi = 0; pi < mp->net_mgr->num_nodes; pi++) {
-        struct p2p_node *n = mp->net_mgr->nodes[pi];
-        if (n && !n->inbound && !n->disconnect && n->state >= PEER_ACTIVE &&
-            peer_supports_fast_sync(n->services)) {
-            fast_peers++;
-            target = hrs_include_peer_target(target, n->starting_height);
-        }
-    }
-    zcl_mutex_unlock(&mp->net_mgr->cs_nodes);
-
-    int32_t gap = (int32_t)(target - our_height);
+    target = range_collect_target(mp, target, &fast_peers);
+    int32_t gap = hrs_height_gap(target, our_height);
     if (!hrs_should_parallelize(fast_peers, gap, 2000))
         return false;
 
-    const struct checkpoint_data *cpd = &mp->params->checkpointData;
     int32_t anchors[HRS_MAX_SPANS];
-    size_t n_anchors = 0;
-    for (int i = 0; cpd && cpd->entries && i < cpd->nEntries &&
-                    n_anchors < HRS_MAX_SPANS; i++) {
-        int h = cpd->entries[i].height;
-        if (h > our_height && h < target)
-            anchors[n_anchors++] = (int32_t)h;
-    }
+    size_t n_anchors = range_collect_anchors(&mp->params->checkpointData,
+                                             our_height, target, anchors);
 
     struct header_range_scheduler *sched = header_range_scheduler_global();
     hrs_plan(sched, (int32_t)our_height, target, anchors, n_anchors);
@@ -138,31 +211,11 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
     /* Sweep globally: whichever peer ticks first releases every expired span.
      * Missing a performance deadline is reported and reassigned, never scored
      * as protocol misbehavior. */
-    int32_t stalled_ids[HRS_MAX_SPANS];
-    size_t n_stalled =
-        hrs_sweep_expired(sched, now_us, stalled_ids, HRS_MAX_SPANS);
-    for (size_t si = 0; si < n_stalled; si++) {
-        int32_t sid = stalled_ids[si];
-        bool duplicate = false;
-        for (size_t sj = 0; sj < si; sj++) {
-            if (stalled_ids[sj] == sid) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate)
-            event_emitf(EV_HEADERS_REJECTED, (uint32_t)sid,
-                        "header span reclaimed from slow peer %d "
-                        "(deadline missed; span reassigned, not scored)",
-                        (int)sid);
-    }
+    range_report_expired(sched, now_us);
 
     int32_t lo, hi;
-    if (!hrs_peer_span(sched, node->id, now_us, &lo, &hi)) {
-        if (hrs_assign(sched, node->id, now_us) < 0 ||
-            !hrs_peer_span(sched, node->id, now_us, &lo, &hi))
-            return false;
-    }
+    if (!range_claim_peer_span(sched, node->id, now_us, &lo, &hi))
+        return false;
 
     struct uint256 start_hash, stop_hash;
     if (!hrs_resolve_anchor_hash(mp, lo, our_height, &start_hash))

@@ -164,3 +164,7 @@ later lane flips it HARD.
 - 2026-09-17T10:57:51Z — REASON: Owner-requested behavior-preserving extraction of header range scheduling from the oversized legacy network handler; consensus predicates and historical validity unchanged
   old ROOT: d73606a06d52507671dbf084a9790719aee389dc6c0802787a7d6c978b21035c
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T12:16:24Z — REASON: Owner-requested behavior-preserving decomposition of header range scheduling below the complexity cap; consensus predicates and historical validity unchanged
+  old ROOT: 7cf6e8300617030134f1497155d9f3ff540349944447bfc39aea478cedb27fda
+  by: owner unseal ritual (make core-unseal)

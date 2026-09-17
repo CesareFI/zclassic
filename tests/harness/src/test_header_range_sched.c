@@ -14,7 +14,7 @@
  *      peers on the same span).
  *   4. One peer stalls -> its span is swept back into the free pool and
  *      reassigned to another peer within the deadline model; the stalling
- *      peer id is reported for demotion (caller feeds peer_scoring).
+ *      peer id is reported for diagnostics without protocol punishment.
  *   5. hrs_note_frontier completes spans as the header frontier advances
  *      and frees their peer slots.
  *   6. hrs_plan idempotency: a re-plan with identical anchors preserves an
@@ -25,7 +25,8 @@
  *   8. Cross-peer sweep demotion (regression for the net-wiring defect
  *      fixed alongside this test): hrs_sweep_expired() is GLOBAL — one
  *      peer's periodic tick can sweep a DIFFERENT peer's expired span.
- *      The net wiring (msg_try_range_parallel_getheaders in msg_headers.c)
+ *      The net wiring (msg_try_range_parallel_getheaders in
+ *      msg_header_range.c)
  *      used to check only "does the CALLING peer's own span own an
  *      expired deadline" and then throw away the sweep's stalled-owner
  *      buffer (NULL, 0) — so a healthy peer's tick silently freed another
@@ -40,6 +41,8 @@
 #include "net/download.h"
 #include "net/msg_internal.h"
 #include "services/header_range_scheduler.h"
+
+#include <limits.h>
 
 static int test_continuation_preserves_stop(void)
 {
@@ -154,6 +157,17 @@ static int test_shared_target_is_order_independent(void)
     return ok ? 0 : 1;
 }
 
+static int test_height_gap_saturates(void)
+{
+    printf("header_range_sched: hostile height gap saturates safely... ");
+    bool ok = hrs_height_gap(5000, 2000) == 3000;
+    ok = ok && hrs_height_gap(2000, 5000) == -3000;
+    ok = ok && hrs_height_gap(INT_MAX, INT_MIN) == INT32_MAX;
+    ok = ok && hrs_height_gap(INT_MIN, INT_MAX) == INT32_MIN;
+    if (ok) printf("OK\n"); else printf("FAIL\n");
+    return ok ? 0 : 1;
+}
+
 int test_header_range_sched(void)
 {
     int failures = 0;
@@ -162,6 +176,7 @@ int test_header_range_sched(void)
     failures += test_continuation_preserves_stop();
     failures += test_progress_renews_deadline();
     failures += test_shared_target_is_order_independent();
+    failures += test_height_gap_saturates();
 
     /* ── 1. Parallelize gate ─────────────────────────────────────── */
     printf("header_range_sched: should_parallelize gate... ");

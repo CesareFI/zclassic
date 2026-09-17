@@ -89,6 +89,11 @@ bool hrs_should_parallelize(int fast_peer_count, int32_t gap, int32_t batch);
  * The global plan must use the highest peer, not whichever peer ticked last. */
 int32_t hrs_include_peer_target(int32_t target, int32_t peer_height);
 
+/* Signed missing-height distance used by the parallelization gate. Peer
+ * heights are untrusted; widen before subtraction and saturate so hostile
+ * extremes cannot trigger signed overflow or implementation-defined narrowing. */
+int32_t hrs_height_gap(int target, int our_height);
+
 /* Partition (lo, hi] into disjoint contiguous spans at the supplied
  * anchor heights. `anchors` must be sorted ascending; each entry is a
  * locally-known hash boundary. lo and hi are implicit endpoints (anchors
