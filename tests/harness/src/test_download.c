@@ -285,6 +285,44 @@ static int test_dl_subsecond_delivery_updates_score(void)
     return failures;
 }
 
+static int test_dl_timeout_survives_wall_clock_rollback(void)
+{
+    int failures = 0;
+    TEST("monotonic timeout requeues after wall clock rollback") {
+        struct dl_fake_clock fake = {
+            .monotonic_us = 10000000,
+            .wall_unix = 1700000000,
+        };
+        struct platform_clock_source source = {
+            .monotonic_us = dl_fake_monotonic_us,
+            .wall_unix = dl_fake_wall_unix,
+            .user = &fake,
+        };
+        struct download_manager dm;
+        struct uint256 h = make_hash(43);
+        dl_init(&dm);
+
+        platform_clock_set_source(&source);
+        bool requested = dl_mark_requested(&dm, &h, 43, 8);
+        fake.monotonic_us +=
+            ((int64_t)dl_get_request_timeout_secs() + 1) * 1000000;
+        fake.wall_unix -= 300;
+        size_t timed_out = dl_check_timeouts(&dm, fake.wall_unix);
+        platform_clock_clear_source();
+
+        ASSERT(requested);
+        ASSERT(timed_out == 1);
+        ASSERT(!dl_is_in_flight(&dm, &h));
+        uint64_t queued = 0;
+        dl_get_stats(&dm, NULL, NULL, NULL, NULL, &queued);
+        ASSERT(queued == 1);
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    platform_clock_clear_source();
+    return failures;
+}
+
 static int test_dl_queue_dedup(void)
 {
     int failures = 0;
@@ -2125,6 +2163,7 @@ int test_download(void)
     failures += test_dl_mark_requested();
     failures += test_dl_mark_received();
     failures += test_dl_subsecond_delivery_updates_score();
+    failures += test_dl_timeout_survives_wall_clock_rollback();
     failures += test_dl_queue_dedup();
     failures += test_dl_received_pending_staging();
     failures += test_dl_assign_to_peer();

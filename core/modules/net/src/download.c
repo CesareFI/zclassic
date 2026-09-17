@@ -667,12 +667,21 @@ size_t dl_check_timeouts(struct download_manager *dm, int64_t now)
     zcl_mutex_lock(&dm->cs);
 
     size_t reassigned = 0;
+    int timeout_secs = dl_get_request_timeout_secs();
+    int64_t now_monotonic_us = platform_time_monotonic_us();
     for (size_t i = 0; i < dm->num_slots; i++) {
         struct dl_in_flight *s = &dm->slots[i];
         if (!s->active) continue;
 
         int64_t age = now - s->request_time;
-        if (age < dl_get_request_timeout_secs()) continue;
+        bool wall_expired = age >= timeout_secs;
+        bool monotonic_expired = s->request_monotonic_us > 0 &&
+            now_monotonic_us >= s->request_monotonic_us &&
+            now_monotonic_us - s->request_monotonic_us >=
+                (int64_t)timeout_secs * 1000000;
+        if (!wall_expired && !monotonic_expired) continue;
+        if (!wall_expired)
+            age = (now_monotonic_us - s->request_monotonic_us) / 1000000;
 
         /* Timed out — move back to queue for reassignment */
         event_emitf(EV_BLOCK_REQUESTED, s->peer_id,
