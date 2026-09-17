@@ -85,6 +85,10 @@ struct header_range_scheduler {
  * (regression: behaves exactly like today). */
 bool hrs_should_parallelize(int fast_peer_count, int32_t gap, int32_t batch);
 
+/* Fold one eligible peer's advertised height into the shared range target.
+ * The global plan must use the highest peer, not whichever peer ticked last. */
+int32_t hrs_include_peer_target(int32_t target, int32_t peer_height);
+
 /* Partition (lo, hi] into disjoint contiguous spans at the supplied
  * anchor heights. `anchors` must be sorted ascending; each entry is a
  * locally-known hash boundary. lo and hi are implicit endpoints (anchors

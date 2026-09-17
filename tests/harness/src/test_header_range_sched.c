@@ -142,6 +142,18 @@ static int test_progress_renews_deadline(void)
     return ok ? 0 : 1;
 }
 
+static int test_shared_target_is_order_independent(void)
+{
+    printf("header_range_sched: shared target ignores peer tick order... ");
+    int32_t a = hrs_include_peer_target(100000, 300000);
+    a = hrs_include_peer_target(a, 150000);
+    int32_t b = hrs_include_peer_target(100000, 150000);
+    b = hrs_include_peer_target(b, 300000);
+    bool ok = a == 300000 && b == 300000;
+    if (ok) printf("OK\n"); else printf("FAIL\n");
+    return ok ? 0 : 1;
+}
+
 int test_header_range_sched(void)
 {
     int failures = 0;
@@ -149,6 +161,7 @@ int test_header_range_sched(void)
     failures += test_disconnect_releases_span();
     failures += test_continuation_preserves_stop();
     failures += test_progress_renews_deadline();
+    failures += test_shared_target_is_order_independent();
 
     /* ── 1. Parallelize gate ─────────────────────────────────────── */
     printf("header_range_sched: should_parallelize gate... ");

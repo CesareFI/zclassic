@@ -39,6 +39,11 @@ bool hrs_should_parallelize(int fast_peer_count, int32_t gap, int32_t batch)
     return gap > batch;
 }
 
+int32_t hrs_include_peer_target(int32_t target, int32_t peer_height)
+{
+    return peer_height > target ? peer_height : target;
+}
+
 /* Insert `v` into a sorted-ascending, deduplicated int32 array of length
  * *n (capacity cap). No-op on a full array or a duplicate. */
 static void sorted_insert(int32_t *arr, size_t *n, size_t cap, int32_t v)

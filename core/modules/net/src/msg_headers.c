@@ -2261,8 +2261,6 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
     if (ms->pindex_best_header &&
         ms->pindex_best_header->nHeight > target)
         target = ms->pindex_best_header->nHeight;
-    int32_t gap = (int32_t)(target - our_height);
-
     /* Count connected fast-sync-capable outbound peers. */
     int fast_peers = 0;
     zcl_mutex_lock(&mp->net_mgr->cs_nodes);
@@ -2270,10 +2268,14 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
         struct p2p_node *n = mp->net_mgr->nodes[pi];
         if (n && !n->inbound && !n->disconnect &&
             n->state >= PEER_ACTIVE &&
-            peer_supports_fast_sync(n->services))
+            peer_supports_fast_sync(n->services)) {
             fast_peers++;
+            target = hrs_include_peer_target(target, n->starting_height);
+        }
     }
     zcl_mutex_unlock(&mp->net_mgr->cs_nodes);
+
+    int32_t gap = (int32_t)(target - our_height);
 
     if (!hrs_should_parallelize(fast_peers, gap, 2000))
         return false;
