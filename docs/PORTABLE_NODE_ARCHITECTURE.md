@@ -188,11 +188,16 @@ caller can cancel cooperatively and retry without detaching or destroying live
 state. Aggregate registry drains now use portable completion publication under
 one fixed deadline and retain every worker/dependency owner on timeout; the
 former unlimited `join_all_owned` fallback has been removed. Several subsystem
-stop routines still use direct blocking joins, and process shutdown still
-escalates failures through a signal/`_exit` adapter. Those are the next
-bounded-shutdown and error-propagation inventory; they are not acceptable as the
-final Android lifecycle. The node also has process-global managers and scheduler
-instances, so a second in-process node is not presently supported.
+stop routines still use direct blocking joins. The four long-running P2P
+worker handles now belong to their `connman` instance instead of process-global
+pthread variables. Their join uses one aggregate registry deadline; a failed
+worker keeps both its instance ownership bit and liveness record, and process
+shutdown exits unclean before releasing any network dependency. Process
+shutdown still escalates failures through a signal/`_exit` adapter. Those are
+the next bounded-shutdown and error-propagation inventory; they are not
+acceptable as the final Android lifecycle. The node also has process-global
+managers and scheduler instances, so a second in-process node is not presently
+supported.
 
 Android bionic does not provide glibc's `pthread_timedjoin_np`, and it also does
 not provide the cancellation mechanism used by the current Darwin emulation.
@@ -417,6 +422,11 @@ The process-level aggregate drain now has the same bounded ownership-retaining
 contract. The NAT/reachability probe owner also returns a bounded join failure
 while retaining its lifecycle bit and registry row, so shutdown refuses to
 release runtime dependencies rather than falling through to `pthread_join`.
+The same contract now covers all four `connman` workers under one aggregate
+deadline, with pthread handles moved into the owning instance. A deterministic
+closed-gate regression proves timeout retention followed by a successful
+bounded retry. The dialer cancellation token remains process-global, so this is
+an ownership milestone rather than a complete multi-instance P2P lifecycle.
 Signal/backtrace paths, unregistered raw thread creation, and other direct
 blocking subsystem joins remain known blockers.
 
@@ -494,7 +504,8 @@ chainstate, and no worker/socket use-after-free.
 - signal installation, backtrace/syscall diagnostics, daemon policy, and some
   `/proc` assumptions are still process/platform coupled.
 - the full node is not an independently owned `node_instance`; several global
-  managers prevent safe multiple create/destroy cycles.
+  managers and the P2P cancellation token prevent safe multiple create/destroy
+  cycles, although `connman` now owns its four pthread handles directly.
 - storage ports do not yet cover every chainstate-critical store.
 - Tor, SQLite, cryptographic dependencies, and all generated artifacts need a
   pinned Android build profile.

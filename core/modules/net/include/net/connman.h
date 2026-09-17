@@ -12,6 +12,7 @@
 #include "net/onion_discovery.h"
 #include "chain/chainparams.h"
 #include "util/thread_work_probe.h"
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,6 +42,10 @@
  * backstop for the genuinely impossible case (listen sockets ALONE exceeding
  * the reactor). */
 #define REACTOR_LISTEN_RESERVE 24
+
+/* Aggregate diagnostic stop budget for the four long-running P2P workers.
+ * A timeout retains ownership for a later retry; it never authorizes teardown. */
+#define CONNMAN_WORKER_JOIN_TIMEOUT_SECS 5
 
 /* Reactor admission + high-water stats, exposed for the net/connman
  * dump-state JSON (see peer_lifecycle_dump_state_json). Populated at
@@ -206,6 +211,12 @@ struct connman {
     struct net_manager manager;
     const struct chain_params *params;
     bool started;
+    /* Worker ownership belongs to this connman instance. A started bit is
+     * cleared only after its corresponding pthread has been reaped. */
+    pthread_t dns_seed_thread;
+    pthread_t socket_thread;
+    pthread_t open_thread;
+    pthread_t message_thread;
     bool dns_seed_thread_started;
     bool socket_thread_started;
     bool open_thread_started;
@@ -322,7 +333,10 @@ bool connman_init(struct connman *cm, const struct chain_params *params,
                    struct node_signals *signals);
 bool connman_start(struct connman *cm);
 void connman_signal_stop(struct connman *cm);
-void connman_join(struct connman *cm);
+/* Join every owned worker under one aggregate deadline. On timeout/error the
+ * corresponding ownership bit remains set so the caller can retry; no worker
+ * is detached and no unavailable platform-specific timed join is required. */
+bool connman_join(struct connman *cm, int timeout_sec);
 void connman_stop(struct connman *cm);
 void connman_free(struct connman *cm);
 

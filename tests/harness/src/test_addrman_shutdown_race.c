@@ -42,6 +42,7 @@
 #include "controllers/diagnostics_internal.h"
 #include "controllers/network_controller.h"
 #include "json/json.h"
+#include "util/thread_registry.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -192,6 +193,71 @@ static int test_connman_discovery_wait_is_interruptible(void)
     return failures;
 }
 
+struct connman_join_gate {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool entered;
+    bool release;
+};
+
+static void *connman_join_blocked_worker(void *arg)
+{
+    struct connman_join_gate *gate = arg;
+    pthread_mutex_lock(&gate->mu);
+    gate->entered = true;
+    pthread_cond_broadcast(&gate->cv);
+    while (!gate->release)
+        pthread_cond_wait(&gate->cv, &gate->mu);
+    pthread_mutex_unlock(&gate->mu);
+    return NULL;
+}
+
+/* The Android-safe join contract is retryable ownership, not a native timed
+ * join fallback: a timed-out worker remains attached to its connman instance
+ * and no dependency may be freed until a later bounded join reaps it. */
+static int test_connman_join_timeout_retains_instance_ownership(void)
+{
+    int failures = 0;
+    TEST("addrman_shutdown_race: connman bounded join retains ownership") {
+        struct connman_join_gate gate = {
+            .mu = PTHREAD_MUTEX_INITIALIZER,
+            .cv = PTHREAD_COND_INITIALIZER,
+            .entered = false,
+            .release = false,
+        };
+        struct connman cm;
+        memset(&cm, 0, sizeof(cm));
+
+        ASSERT(thread_registry_spawn("test_cm_join",
+                                     connman_join_blocked_worker, &gate,
+                                     &cm.message_thread) == 0);
+        cm.started = true;
+        cm.message_thread_started = true;
+
+        pthread_mutex_lock(&gate.mu);
+        while (!gate.entered)
+            pthread_cond_wait(&gate.cv, &gate.mu);
+        pthread_mutex_unlock(&gate.mu);
+
+        ASSERT(!connman_join(&cm, 0));
+        ASSERT(cm.started);
+        ASSERT(cm.message_thread_started);
+
+        pthread_mutex_lock(&gate.mu);
+        gate.release = true;
+        pthread_cond_broadcast(&gate.cv);
+        pthread_mutex_unlock(&gate.mu);
+
+        ASSERT(connman_join(&cm, 2));
+        ASSERT(!cm.started);
+        ASSERT(!cm.message_thread_started);
+        ASSERT(pthread_cond_destroy(&gate.cv) == 0);
+        ASSERT(pthread_mutex_destroy(&gate.mu) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* Production incident regression: an automatic debug bundle raced orderly
  * shutdown after connman_free(), reached addrman_diag_dump_state_json, and
  * dereferenced entries[0] after addrman_free had nulled entries.  A stale
@@ -228,6 +294,7 @@ int test_addrman_shutdown_race(void)
     failures += test_addrman_add_failclosed_on_teardown();
     failures += test_mp_handle_addr_survives_torndown_addrman();
     failures += test_connman_discovery_wait_is_interruptible();
+    failures += test_connman_join_timeout_retains_instance_ownership();
     failures += test_addrman_diagnostic_fails_closed_after_teardown();
     return failures;
 }

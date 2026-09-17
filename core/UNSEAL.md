@@ -184,3 +184,15 @@ later lane flips it HARD.
 - 2026-09-17T18:13:11Z — REASON: Owner-requested bounded Android-portable NAT probe worker join; retain ownership on timeout; consensus validation and chain rules unchanged
   old ROOT: cc5da722e351d372d3dfc1512df70500823fc5c3fec1505f7d877d22d7f8529b
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T19:00:14Z — REASON: Owner-requested Android-portable connman worker ownership and bounded cooperative shutdown; consensus validation and chain rules unchanged
+  old ROOT: 095b6379a4f4604271c7a71af91da45a55356e33abbdcb94e45f4e68bb84acd6
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T19:20:33Z — REASON: Reduce the new connman lifecycle implementation below the ratcheted legacy file-size ceiling; no behavior or consensus change
+  old ROOT: 902000fb9e959034c8d4bf85dba0a2fe78f9ed21421ec80e334fcc5ceb4cdbb5
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T19:21:29Z — REASON: Finish shrinking new connman lifecycle formatting to the fixed 3073-line ratchet; no behavior or consensus change
+  old ROOT: 2b969b7517bdf30c4000bea7ec43f8616da0f2793b74422e7b0c0727336a41db
+  by: owner unseal ritual (make core-unseal)

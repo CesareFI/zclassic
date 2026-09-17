@@ -54,10 +54,6 @@ bool g_connect_only = false;
 static struct peer_bandwidth g_peer_bw;
 static bool g_peer_bw_active = false;
 
-static pthread_t g_thread_dns_seed;
-static pthread_t g_thread_socket;
-static pthread_t g_thread_open;
-static pthread_t g_thread_message;
 /* Shared with connman_dialer.c — see connman_internal.h. */
 _Atomic bool g_stop = false;
 /* Supervisor liveness for the four P2P threads. These are root children
@@ -2223,7 +2219,7 @@ bool connman_start(struct connman *cm)
     g_stop = false;
 
     if (thread_registry_spawn("zcl_dns_seed", thread_dns_seed, cm,
-                                  &g_thread_dns_seed) != 0) {
+                                  &cm->dns_seed_thread) != 0) {
         perror("connman: thread_registry_spawn dns_seed");
         g_stop = true;
         LOG_FAIL("net", "thread_registry_spawn failed for dns_seed thread");
@@ -2232,11 +2228,12 @@ bool connman_start(struct connman *cm)
     thread_liveness_register(&g_dns_seed_liveness, "zcl_dns_seed", 0, 0);
 
     if (thread_registry_spawn("zcl_connman_sock", thread_socket_handler,
-                                  cm, &g_thread_socket) != 0) {
+                                  cm, &cm->socket_thread) != 0) {
         perror("connman: thread_registry_spawn socket");
         g_stop = true;
-        pthread_join(g_thread_dns_seed, NULL);
-        cm->dns_seed_thread_started = false;
+        if (!connman_join(cm, CONNMAN_WORKER_JOIN_TIMEOUT_SECS))
+            LOG_FAIL("net", "dns_seed thread did not stop after socket "
+                            "thread spawn failure");
         LOG_FAIL("net", "thread_registry_spawn failed for socket_handler thread");
     }
     cm->socket_thread_started = true;
@@ -2247,28 +2244,24 @@ bool connman_start(struct connman *cm)
                              /*deadline_secs=*/30, /*progress_quiet_us=*/0);
 
     if (thread_registry_spawn("zcl_connman_open", thread_open_connections,
-                                  cm, &g_thread_open) != 0) {
+                                  cm, &cm->open_thread) != 0) {
         perror("connman: thread_registry_spawn open");
         g_stop = true;
-        pthread_join(g_thread_socket, NULL);
-        pthread_join(g_thread_dns_seed, NULL);
-        cm->socket_thread_started = false;
-        cm->dns_seed_thread_started = false;
+        if (!connman_join(cm, CONNMAN_WORKER_JOIN_TIMEOUT_SECS))
+            LOG_FAIL("net", "connman workers did not stop after open thread "
+                            "spawn failure");
         LOG_FAIL("net", "thread_registry_spawn failed for open_connections thread");
     }
     cm->open_thread_started = true;
     thread_liveness_register(&g_open_liveness, "zcl_connman_open", 0, 0);
 
     if (thread_registry_spawn("zcl_connman_msg", thread_message_handler,
-                                  cm, &g_thread_message) != 0) {
+                                  cm, &cm->message_thread) != 0) {
         perror("connman: thread_registry_spawn message");
         g_stop = true;
-        pthread_join(g_thread_open, NULL);
-        pthread_join(g_thread_socket, NULL);
-        pthread_join(g_thread_dns_seed, NULL);
-        cm->open_thread_started = false;
-        cm->socket_thread_started = false;
-        cm->dns_seed_thread_started = false;
+        if (!connman_join(cm, CONNMAN_WORKER_JOIN_TIMEOUT_SECS))
+            LOG_FAIL("net", "connman workers did not stop after message "
+                            "thread spawn failure");
         LOG_FAIL("net", "thread_registry_spawn failed for message_handler thread");
     }
     cm->message_thread_started = true;
@@ -2285,70 +2278,70 @@ void connman_signal_stop(struct connman *cm)
     g_stop = true;
 }
 
-/* Registry completion publication provides the bounded wait on every pthread
- * platform, including Android/bionic where pthread_timedjoin_np is absent. */
-static bool timed_join(pthread_t thread, int timeout_sec)
+/* Registry completion makes the bounded wait portable. Clear ownership and
+ * retire liveness only after the pthread was reaped. */
+static bool connman_join_worker(pthread_t thread, bool *started,
+                                struct thread_liveness_child *liveness,
+                                const char *name, const struct timespec *deadline)
 {
-    struct timespec ts;
-    if (platform_time_realtime_timespec(&ts) != 0) {
-        pthread_join(thread, NULL);
+    if (!*started)
         return true;
+    int rc = thread_registry_join_until(thread, NULL, deadline);
+    if (rc != 0) {
+        fprintf(stderr, // obs-ok:shutdown-join-straggler-note
+                "[shutdown] connman %s worker exceeded the aggregate join "
+                "budget (rc=%d); ownership and dependencies retained\n", name, rc);
+        return false;
     }
-    ts.tv_sec += timeout_sec;
-    int rc = thread_registry_join_until(thread, NULL, &ts);
-    if (rc == 0)
-        return true;
-    /* Retain ownership after the diagnostic deadline. The stage watchdog may
-     * terminate a genuinely wedged process, but this function must never
-     * detach a worker and let its dependencies be freed underneath it. */
-    pthread_join(thread, NULL);
-    return false;
+    *started = false;
+    thread_liveness_retire(liveness);
+    return true;
 }
 
-void connman_join(struct connman *cm)
+bool connman_join(struct connman *cm, int timeout_sec)
 {
     if (!cm)
-        return;
-
-    /* Five seconds is the diagnostic join deadline. A late worker remains
-     * owned and is joined before teardown; external shutdown watchdogs remain
-     * responsible for a genuinely wedged process. */
-    if (cm->started || cm->dns_seed_thread_started || cm->socket_thread_started ||
-        cm->open_thread_started || cm->message_thread_started) {
-        if (cm->dns_seed_thread_started) {
-            if (!timed_join(g_thread_dns_seed, 5))
-                LOG_WARN("connman", "dns_seed thread join timed out");
-            cm->dns_seed_thread_started = false;
-            thread_liveness_retire(&g_dns_seed_liveness);
-        }
-        if (cm->socket_thread_started) {
-            if (!timed_join(g_thread_socket, 5))
-                LOG_WARN("connman", "socket thread join timed out");
-            cm->socket_thread_started = false;
-            thread_liveness_retire(&g_sock_liveness);
-        }
-        if (cm->open_thread_started) {
-            if (!timed_join(g_thread_open, 5))
-                LOG_WARN("connman", "open thread join timed out");
-            cm->open_thread_started = false;
-            thread_liveness_retire(&g_open_liveness);
-        }
-        if (cm->message_thread_started) {
-            if (!timed_join(g_thread_message, 5)) {
-                LOG_WARN("connman", "message thread exceeded join deadline but was retained until exit");
-            }
-            cm->message_thread_started = false;
-            thread_liveness_retire(&g_msg_liveness);
-        }
-        cm->started = false;
+        return true;
+    if (timeout_sec < 0) {
+        LOG_ERROR("connman", "negative join timeout %d", timeout_sec);
+        return false;
     }
-    printf("P2P threads stopped.\n");
+
+    struct timespec deadline;
+    if (platform_time_realtime_timespec(&deadline) != 0) {
+        LOG_ERROR("connman", "join clock unavailable; ownership retained");
+        return false;
+    }
+    deadline.tv_sec += timeout_sec;
+
+    bool joined = true;
+    joined = connman_join_worker(cm->dns_seed_thread,
+        &cm->dns_seed_thread_started, &g_dns_seed_liveness, "dns_seed", &deadline) && joined;
+    joined = connman_join_worker(cm->socket_thread,
+        &cm->socket_thread_started, &g_sock_liveness, "socket", &deadline) && joined;
+    joined = connman_join_worker(cm->open_thread,
+        &cm->open_thread_started, &g_open_liveness, "open", &deadline) && joined;
+    joined = connman_join_worker(cm->message_thread,
+        &cm->message_thread_started, &g_msg_liveness, "message", &deadline) && joined;
+
+    cm->started = cm->dns_seed_thread_started || cm->socket_thread_started ||
+                  cm->open_thread_started ||
+                  cm->message_thread_started;
+    if (joined)
+        printf("P2P threads stopped.\n");
+    return joined;
 }
 
 void connman_stop(struct connman *cm)
 {
+    if (!cm)
+        return;
     connman_signal_stop(cm);
-    connman_join(cm);
+    if (!connman_join(cm, CONNMAN_WORKER_JOIN_TIMEOUT_SECS)) {
+        LOG_ERROR("connman", "worker shutdown incomplete; bandwidth state "
+                             "retained");
+        return;
+    }
 
     /* Tear down bandwidth quotas. */
     if (g_peer_bw_active) {
@@ -2582,8 +2575,15 @@ void connman_load_addrman(struct connman *cm)
 
 void connman_free(struct connman *cm)
 {
-    if (cm->started)
+    if (!cm)
+        return;
+    if (cm->started) {
         connman_stop(cm);
+        if (cm->started) {
+            LOG_ERROR("connman", "free refused while worker ownership remains");
+            return;
+        }
+    }
     /* connman_stop() retains and joins every worker before this point, so the
      * addrman snapshot and teardown below have exclusive lifecycle ownership. */
     connman_save_addrman(cm);

@@ -119,8 +119,11 @@ static bool shutdown_flush_coins_to_sqlite(struct boot_svc_ctx *svc,
 }
 
 static bool shutdown_quiesce_network_and_flush_coins(struct boot_svc_ctx *svc,
-                                                     bool diagnostics_drained)
+                                                     bool diagnostics_drained,
+                                                     bool *workers_drained)
 {
+    if (workers_drained)
+        *workers_drained = false;
     /* Stop P2P entrypoints before flush; any in-flight reducer sees
      * g_shutdown_requested and returns before mutating coins further. */
     printf("[shutdown] stopping network services\n");
@@ -139,7 +142,15 @@ static bool shutdown_quiesce_network_and_flush_coins(struct boot_svc_ctx *svc,
     }
     /* Now join threads — safe, coins already persisted */
     printf("[shutdown] joining connman threads\n");
-    connman_join(svc->connman);
+    if (!connman_join(svc->connman,
+                      CONNMAN_WORKER_JOIN_TIMEOUT_SECS)) {
+        fprintf(stderr,
+                "[shutdown] connman workers exceeded their aggregate bounded "
+                "join; refusing to release network dependencies\n");
+        return false;
+    }
+    if (workers_drained)
+        *workers_drained = true;
     /* Revoke the globally published diagnostics/RPC handle before destroying
      * connman.  The diagnostics worker is already joined, but this makes any
      * late read fail closed instead of retaining a stale process-lifetime
@@ -515,8 +526,19 @@ void app_shutdown_svc(struct boot_svc_ctx *svc)
      * legitimate socket/message cleanup and final coins I/O, still below the
      * service manager's 300s hard stop. */
     shutdown_stagewatch_enter("network-quiesce", 120, true, true);
-    bool durability_ok =
-        shutdown_quiesce_network_and_flush_coins(svc, diagnostics_drained);
+    bool network_workers_drained = false;
+    bool durability_ok = shutdown_quiesce_network_and_flush_coins(
+        svc, diagnostics_drained, &network_workers_drained);
+    if (!network_workers_drained) {
+        fprintf(stderr,
+                "[shutdown] network workers remain owned; refusing every "
+                "subsequent persistence/release stage\n");
+        (void)boot_shutdown_marker_remove_clean(svc->datadir);
+        (void)shutdown_stagewatch_complete_unclean();
+        fflush(stdout);
+        fflush(stderr);
+        _exit(1);
+    }
     /* Consumer ownership is part of the durability barrier: dependencies may
      * not be closed while a consumer is live. A legitimate slow callback gets
      * bounded graces; a true wedge still exits loudly and unclean. */
