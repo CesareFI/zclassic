@@ -225,10 +225,49 @@ static bool devagent_resident_generation(const char *path, const char *key,
     return true;
 }
 
+/* dev.agent.worker's bounded drive and per-job caps. `--max_jobs=1` types
+ * as an integer, so the default string branch would make the leaf
+ * uninvokable from a shell while raw JSON worked. The handler owns the
+ * defaults and the tighter running contract; the transport only admits
+ * the integer shape inside the leaf's published bounds. */
+static bool devagent_worker_ints(const char *path, const char *key,
+                                 const struct json_value *value,
+                                 bool *type_ok)
+{
+    static const struct {
+        const char *key;
+        long long lo;
+        long long hi;
+    } bounds[] = {
+        { "deadline_s", 1, 3600 },
+        { "idle_start_s", 1, 30 },
+        { "idle_limit_s", 1, 600 },
+        { "max_jobs", 0, 1000 },
+        { "time_cap_s", 1, 3600 },
+        { "cpu_s", 1, 3600 },
+        { "mem_mb", 64, 8192 },
+        { "token_cap", 1, 1000000 },
+    };
+    size_t i;
+    if (!path || strcmp(path, "dev.agent.worker") != 0)
+        return false;
+    for (i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
+        if (strcmp(key, bounds[i].key) != 0)
+            continue;
+        *type_ok = value->type == JSON_INT &&
+                   json_get_int(value) >= bounds[i].lo &&
+                   json_get_int(value) <= bounds[i].hi;
+        return true;
+    }
+    return false;
+}
+
 bool zcl_command_registry_devagent_input_ok(const char *path, const char *key,
                                             const struct json_value *value,
                                             bool *type_ok)
 {
+    if (devagent_worker_ints(path, key, value, type_ok))
+        return true;
     if (devagent_ledger_add_int(path, key, value, type_ok))
         return true;
     if (devagent_bounded_positive_int(key, value, type_ok))

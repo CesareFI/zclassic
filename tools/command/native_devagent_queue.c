@@ -11,8 +11,11 @@
  * the behavior (post/next/reap/status) and drops the shell.
  *
  * INPUT (zcl.agent_queue_input.v1)
- *   action   string, required: post | next | reap | status | cancel. Also
- *            the first positional, so `z23 dev agent queue post ...` works.
+ *   action   string, required: post | next | claim | reap | status | cancel.
+ *            Also the first positional, so `z23 dev agent queue post ...`
+ *            works.
+ *   worker   claim only, required 1-48 [A-Za-z0-9_.-]: the resident worker.
+ *   session  claim only, required 1-48 [A-Za-z0-9_.-]: this worker run.
  *   kind     post only: leaf | doc | file | fix-gate.
  *   name     post and cancel: [A-Za-z0-9_.-]{1,64}, never "." or ".." (a
  *            name is one path segment under engine/). Cancel drops queued
@@ -52,9 +55,12 @@
  * OUTPUT (zcl.agent_queue.v1) on ok=true: leaf is always "dev.agent.queue",
  * plus per action: post {seq, name, state:"queued"}; next {seq, name,
  * worktree, pid_or_unit, state:"running"} or {state:"no_free_worktree"} or
- * {state:"empty"}; reap {state:"reaped", outcomes:[...], requeued}; status
- * {queued, running, outcomes, pool} plus screen unless json=true; cancel
- * {state:"cancelled", name, cancelled:N} or CANCEL_RUNNING/CANCEL_NOT_FOUND.
+ * {state:"empty"}; claim {seq, name, attempt, rundir, worker, session,
+ * state:"running"} or {state:"empty"}; reap {state:"reaped",
+ * outcomes:[...], requeued}; status {queued, running, outcomes, pool} plus
+ * screen unless json=true; cancel {state:"cancelled", name, cancelled:N}
+ * or CANCEL_RUNNING/CANCEL_NOT_FOUND. claim refuses CLAIM_COMPLETED when
+ * the closed predicate already finished the name.
  *
  * PROCESS RULE. Spawn only through zcl_spawn_detached() from util/spawn.h.
  * popen(), system() and a shell command string are forbidden and gated.
@@ -1293,6 +1299,318 @@ static void dvq_unmark(const char *queuedir, const char *qpath, long long seq)
     dvq_unlock(lock);
 }
 
+/* ── model-worker claim ──────────────────────────────────────────────────
+ * next dispatches to the flash-unit harness (worktree pool, detached
+ * spawn). A resident model worker is the other dispatch arm on the same
+ * ledger: claim takes the oldest queued row, marks it running WITHOUT a
+ * worktree or a spawn, and persists claim.json in the run dir BEFORE
+ * returning, so no model submission can precede the persisted claim. A
+ * name the closed predicate already completed is refused with
+ * CLAIM_COMPLETED: a restarted worker inspects outcomes first and never
+ * duplicates finished work. Queued cancel still prevents claim (the row
+ * is gone); running rows stay their worker's business. */
+
+/* One outcome line completes name when it names it with a pass verdict
+ * and a clean exit. Malformed lines never complete. */
+static bool dvq_outcome_line_completed(const char *line, const char *name)
+{
+    char lname[80];
+    char verdict[128];
+    long long rc = -1;
+    if (!line || !name)
+        return false;
+    if (!dvq_line_str(line, "name", lname, sizeof(lname)))
+        return false;
+    if (strcmp(lname, name) != 0)
+        return false;
+    if (!dvq_line_str(line, "verdict", verdict, sizeof(verdict)))
+        return false;
+    if (!dvq_line_int(line, "rc", &rc))
+        return false;
+    return zcl_devagent_closed_pass(verdict, rc);
+}
+
+/* True when any outcome row completes name. A missing outcomes file
+ * completes nothing. */
+static bool dvq_name_completed(const char *opath, const char *name)
+{
+    char *text;
+    char *save = NULL, *line;
+    bool done = false;
+    if (!opath || !name)
+        return false;
+    text = (char *)zcl_malloc(DVQ_FILE_CAP, "devagent.queue.claim");
+    if (!text)
+        return false;
+    if (!dvq_read_file(opath, text, DVQ_FILE_CAP, NULL)) {
+        free(text);
+        return false;
+    }
+    for (line = strtok_r(text, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        if (dvq_outcome_line_completed(line, name)) {
+            done = true;
+            break;
+        }
+    }
+    free(text);
+    return done;
+}
+
+/* rundir ends "/<name>/a<attempt>": create the name dir, then the run. */
+static bool dvq_claim_mkdir(const char *rundir)
+{
+    char namedir[4096 + 80];
+    char *slash;
+    if (!rundir)
+        return false;
+    if (snprintf(namedir, sizeof(namedir), "%s", rundir) >=
+        (int)sizeof(namedir))
+        return false;
+    slash = strrchr(namedir, '/');
+    if (!slash)
+        return false;
+    *slash = '\0';
+    return dvq_mkdir_one(namedir) && dvq_mkdir_one(rundir);
+}
+
+/* All four claim.json strings escaped for the row. */
+static bool dvq_claim_escape(const char *worker, const char *session,
+                             const char *model, const char *name,
+                             char *eworker, char *esession, char *emodel,
+                             char *ename)
+{
+    if (!dvq_escape(worker, eworker, 128) ||
+        !dvq_escape(session, esession, 128) ||
+        !dvq_escape(name, ename, 160))
+        return false;
+    if (model && model[0])
+        return dvq_escape(model, emodel, 320);
+    emodel[0] = '\0';
+    return true;
+}
+
+/* Claim identity persisted before any model submission may happen: the
+ * run dir plus claim.json naming the exact row, worker, and session with
+ * submitted:false. False when the disk refuses. */
+static bool dvq_claim_write(const char *rundir, const struct dvq_row *pick,
+                            const char *worker, const char *session,
+                            const char *model, const char *ts)
+{
+    char cpath[4096 + 96], line[2048];
+    char eworker[128], esession[128], emodel[320], ename[160];
+    int w;
+    if (!rundir || !pick || !worker || !session || !ts)
+        return false;
+    if (!dvq_claim_mkdir(rundir))
+        return false;
+    if (!dvq_claim_escape(worker, session, model, pick->name, eworker,
+                          esession, emodel, ename))
+        return false;
+    if (snprintf(cpath, sizeof(cpath), "%s/claim.json", rundir) >=
+        (int)sizeof(cpath))
+        return false;
+    w = snprintf(line, sizeof(line),
+                 "{\"name\":\"%s\",\"attempt\":%lld,\"seq\":%lld,"
+                 "\"worker\":\"%s\",\"session\":\"%s\",\"model\":\"%s\","
+                 "\"ts\":\"%s\",\"submitted\":false}\n",
+                 ename, pick->attempt, pick->seq, eworker, esession,
+                 emodel, ts);
+    if (w <= 0 || (size_t)w >= sizeof(line))
+        return false;
+    return dvq_write_file(cpath, line, (size_t)w);
+}
+
+/* One short claimant name: 1-48 of [A-Za-z0-9_.-], never . or .. . */
+static bool dvq_claim_name(const char *value, const char *which,
+                           const char *missing_evidence,
+                           struct zcl_command_reply *reply)
+{
+    char msg[96];
+    if (!value || strlen(value) == 0 || strlen(value) > 48 ||
+        !dvq_name_ok(value)) {
+        (void)snprintf(msg, sizeof(msg),
+                       "%s is 1-48 of [A-Za-z0-9_.-]", which);
+        dvq_fail(reply, "BAD_INPUT", "claim", msg, missing_evidence);
+        return false;
+    }
+    return true;
+}
+
+/* Claim inputs: the resident worker and this run, both short names so
+ * pid_or_unit ("worker:<worker>/<session>") stays inside 128 bytes. */
+static bool dvq_claim_args(const struct zcl_command_request *req,
+                           struct zcl_command_reply *reply,
+                           const char **worker, const char **session,
+                           const char **model)
+{
+    if (!req || !req->input || !worker || !session || !model) {
+        dvq_fail(reply, "BAD_INPUT", "claim",
+                 "dev.agent.queue claim needs worker and session",
+                 "request.input was missing");
+        return false;
+    }
+    *worker = dvq_str(req, "worker");
+    *session = dvq_str(req, "session");
+    if (!dvq_claim_name(*worker, "worker",
+                        "input.worker missing, misspelled, or too long",
+                        reply))
+        return false;
+    if (!dvq_claim_name(*session, "session",
+                        "input.session missing, misspelled, or too long",
+                        reply))
+        return false;
+    *model = dvq_str(req, "model");
+    if (*model && (*model)[0] && !dvq_model_ok(*model)) {
+        dvq_fail(reply, "BAD_INPUT", "claim",
+                 "model is at most 128 model-id characters",
+                 "input.model misspelled");
+        return false;
+    }
+    if (!*model)
+        *model = "";
+    return true;
+}
+
+/* Oldest unfinished row, skipping names the closed predicate already
+ * completed. Marks the pick running under the lock. Returns 1 with the
+ * pick, 0 with done_name when only finished work waits, -1 refused. */
+static int dvq_claim_take(const struct dvq_dirs *d, const char *qpath,
+                          const char *opath, const char *worker,
+                          const char *session, struct dvq_row *pick,
+                          char *done_name,
+                          struct zcl_command_reply *reply)
+{
+    struct dvq_row *rows = NULL;
+    size_t nrows = 0;
+    bool have_pick = false;
+    int lock = -1;
+    int rc = -1;
+    lock = dvq_lock(d->queue);
+    if (lock < 0) {
+        dvq_fail(reply, "QUEUE_READ_FAILED", "claim",
+                 "cannot take the queue lock", qpath);
+        return -1;
+    }
+    if (!dvq_load_rows(qpath, &rows, &nrows)) {
+        dvq_unlock(lock);
+        dvq_fail(reply, "QUEUE_READ_FAILED", "claim",
+                 "cannot read the queue file", qpath);
+        return -1;
+    }
+    for (size_t i = 0; i < nrows && !have_pick; i++) {
+        if (strcmp(rows[i].state, "queued") != 0)
+            continue;
+        if (dvq_name_completed(opath, rows[i].name)) {
+            (void)snprintf(done_name, 80, "%s", rows[i].name);
+            continue;
+        }
+        *pick = rows[i];
+        have_pick = true;
+    }
+    if (!have_pick) {
+        free(rows);
+        dvq_unlock(lock);
+        if (done_name[0]) {
+            dvq_fail(reply, "CLAIM_COMPLETED", "claim",
+                     "that name already completed under the closed predicate",
+                     done_name);
+            return -1;
+        }
+        (void)json_push_kv_str(&reply->data, "leaf", DVQ_LEAF);
+        (void)json_push_kv_str(&reply->data, "state", "empty");
+        reply->status = ZCL_COMMAND_STATUS_PASSED;
+        reply->exit_code = 0;
+        return 0;
+    }
+    pick->worktree[0] = '\0';
+    (void)snprintf(pick->pid_or_unit, sizeof(pick->pid_or_unit),
+                   "worker:%s/%s", worker, session);
+    pick->started = (long long)platform_time_wall_unix();
+    (void)snprintf(pick->state, sizeof(pick->state), "running");
+    for (size_t i = 0; i < nrows; i++) {
+        if (rows[i].seq == pick->seq) {
+            rows[i] = *pick;
+            break;
+        }
+    }
+    rc = dvq_rewrite_rows(d->queue, qpath, rows, nrows) ? 1 : -1;
+    free(rows);
+    dvq_unlock(lock);
+    if (rc < 0) {
+        dvq_fail(reply, "QUEUE_WRITE_FAILED", "claim",
+                 "cannot mark the row running", qpath);
+        return -1;
+    }
+    return 1;
+}
+
+static void dvq_claim(const struct zcl_command_request *req,
+                      struct zcl_command_reply *reply)
+{
+    struct dvq_dirs d;
+    struct dvq_row pick;
+    char qpath[4096 + 32], opath[4096 + 32], rundir[4096 + 128];
+    char done_name[80];
+    char ts[64];
+    const char *worker, *session, *model;
+    int taken;
+    done_name[0] = '\0';
+    if (!dvq_claim_args(req, reply, &worker, &session, &model))
+        return;
+    if (!dvq_dirs_make(&d)) {
+        dvq_fail(reply, "STATE_DIR_FAILED", "claim",
+                 "cannot resolve the owner-private state root",
+                 "platform_state_root");
+        return;
+    }
+    if (snprintf(qpath, sizeof(qpath), "%s/queue.jsonl", d.queue) >=
+        (int)sizeof(qpath) ||
+        snprintf(opath, sizeof(opath), "%s/outcomes.jsonl", d.queue) >=
+        (int)sizeof(opath)) {
+        dvq_fail(reply, "QUEUE_READ_FAILED", "claim",
+                 "the queue paths do not fit their buffers",
+                 "platform_state_root too long");
+        return;
+    }
+    /* Finished work is never duplicated: outcomes first, before the pick. */
+    taken = dvq_claim_take(&d, qpath, opath, worker, session, &pick,
+                           done_name, reply);
+    if (taken != 1)
+        return;
+    /* The row is durable now; everything below can fail back to queued. */
+    if (snprintf(rundir, sizeof(rundir), "%s/%s/a%lld", d.engine,
+                 pick.name, pick.attempt) >= (int)sizeof(rundir)) {
+        dvq_unmark(d.queue, qpath, pick.seq);
+        dvq_fail(reply, "DISPATCH_FAILED", "claim",
+                 "the run path does not fit its buffer",
+                 "platform_state_root too long");
+        return;
+    }
+    dvq_now_iso(ts);
+    if (!dvq_claim_write(rundir, &pick, worker, session, model, ts)) {
+        dvq_unmark(d.queue, qpath, pick.seq);
+        dvq_fail(reply, "STATE_DIR_FAILED", "claim",
+                 "cannot persist the claim identity", rundir);
+        return;
+    }
+    (void)json_push_kv_str(&reply->data, "leaf", DVQ_LEAF);
+    (void)json_push_kv_str(&reply->data, "state", "running");
+    (void)json_push_kv_str(&reply->data, "name", pick.name);
+    (void)json_push_kv_int(&reply->data, "seq", pick.seq);
+    (void)json_push_kv_int(&reply->data, "attempt", pick.attempt);
+    (void)json_push_kv_str(&reply->data, "kind", pick.kind);
+    (void)json_push_kv_str(&reply->data, "brief", pick.brief);
+    (void)json_push_kv_str(&reply->data, "group", pick.group);
+    (void)json_push_kv_str(&reply->data, "path", pick.path);
+    (void)json_push_kv_str(&reply->data, "model", pick.model);
+    (void)json_push_kv_str(&reply->data, "rundir", rundir);
+    (void)json_push_kv_str(&reply->data, "worker", worker);
+    (void)json_push_kv_str(&reply->data, "session", session);
+    reply->status = ZCL_COMMAND_STATUS_PASSED;
+    reply->exit_code = 0;
+}
+
 /* Bounded cancel: drop queued (unclaimed) rows naming name, so a later
  * next never launches them. Running rows belong to their worker —
  * stopping one is the worker's own responsibility, never this action's.
@@ -2360,7 +2678,7 @@ void zcl_native_handle_dev_agent_queue(
     action = dvq_str(request, "action");
     if (!action) {
         dvq_fail(reply, "BAD_INPUT", "route",
-                 "dev.agent.queue needs an action: post|next|reap|status|cancel",
+                 "dev.agent.queue needs an action: post|next|claim|reap|status|cancel",
                  "input.action missing or empty");
         return;
     }
@@ -2370,6 +2688,10 @@ void zcl_native_handle_dev_agent_queue(
     }
     if (strcmp(action, "next") == 0) {
         dvq_next(request, reply);
+        return;
+    }
+    if (strcmp(action, "claim") == 0) {
+        dvq_claim(request, reply);
         return;
     }
     if (strcmp(action, "reap") == 0) {
@@ -2385,6 +2707,6 @@ void zcl_native_handle_dev_agent_queue(
         return;
     }
     dvq_fail(reply, "UNKNOWN_ACTION", "route",
-             "action is one of post|next|reap|status|cancel",
+             "action is one of post|next|claim|reap|status|cancel",
              "input.action unknown");
 }

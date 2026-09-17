@@ -379,3 +379,10 @@ bool zcl_devagent_checkout_root(const char *start, char *out, size_t out_cap)
     out[0] = '\0';
     return false;
 }
+
+bool zcl_devagent_closed_pass(const char *verdict, long long rc)
+{
+    if (!verdict || rc != 0)
+        return false;
+    return strcmp(verdict, "pass") == 0 || strcmp(verdict, "PASS") == 0;
+}

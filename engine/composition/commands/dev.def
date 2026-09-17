@@ -1928,7 +1928,8 @@ ZCL_COMMAND_DEV_COMMAND(
     "It touches no network and never waits for a run.", 65536,
     "agent,queue,post,dispatch,reap,status,async,worktree,flash",
     "zcl.agent_queue_input.v1", "zcl.agent_queue.v1",
-    "action,kind,name,group,path,brief,model,attempt,json,cwd", "action",
+    "action,kind,name,group,path,brief,model,attempt,json,cwd,worker,session",
+    "action",
     "z23 dev agent queue post --kind=leaf --name=situation",
     ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
     ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
@@ -1939,6 +1940,46 @@ ZCL_COMMAND_DEV_COMMAND(
     zcl_native_handle_dev_agent_queue,
     "the unit queue is a development-lane coordination surface",
     "z23-dev dev agent queue")
+
+/* ── dev.agent.worker ──────────────────────────────────────────────────────
+ * The resident dev-only loop that consumes dev.agent.queue continuously.
+ * It claims ONE job (queue claim persists claim.json first), runs the
+ * wired executor bounded (CPU/memory/wall-clock/token caps), judges the
+ * outcome through the required gate (a model "completed" is never PASS),
+ * records receipt plus run.out for the existing reap, and posts a result
+ * mail row under the SAME ref. Restarts adopt un-submitted orphans and
+ * crash-record submitted ones without ever resubmitting. The production
+ * executor seam waits on C's muse_session; until then the leaf refuses
+ * to run a job. No consensus, wallet, deploy, or push authority. */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.agent.worker", "dev.agent", "",
+    "Consume the unit queue continuously with a bounded resident worker",
+    "One active job per worker over the owner-private state root: claim "
+    "takes the oldest unfinished row and persists the claim identity "
+    "before any model submission; the executor runs forked under "
+    "RLIMIT_CPU/RLIMIT_AS with a wall-clock watchdog; the gate writes "
+    "receipt verdict pass only for the executor's own pass/PASS with rc "
+    "0, a present candidate, evidence, and fitting tokens; reap collects "
+    "the outcome and a result mail row carries the flat record under the "
+    "same ref. Restart adoption runs un-submitted orphans exactly once "
+    "and crash-records submitted ones. Queued cancel prevents claim; "
+    "revoke is not cancel. It touches no network and never polls a "
+    "model: only local queue files are waited on.", 16384,
+    "agent,worker,resident,claim,gate,result",
+    "zcl.agent_worker_input.v1", "zcl.agent_worker.v1",
+    "action,worker,session,model,deadline_s,idle_start_s,idle_limit_s,max_jobs,time_cap_s,cpu_s,mem_mb,token_cap",
+    "action",
+    "z23 dev agent worker run --worker=resident-a --max_jobs=1",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_agent_worker,
+    "the resident worker is a development-lane coordination surface",
+    "z23-dev dev agent worker")
 
 /* ── dev.agent.mail ────────────────────────────────────────────────────────
  * Async, non-blocking agent mail. A poster appends one JSON row to the local

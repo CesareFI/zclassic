@@ -43,6 +43,85 @@ struct zcl_devagent_verdict {
 bool zcl_devagent_verdict_parse(const char *text,
                                 struct zcl_devagent_verdict *out);
 
+/* ── closed completion vocabulary ─────────────────────────────────────────
+ * Only an explicit "pass"/"PASS" verdict with a clean exit completes a
+ * queue directive: "pass" is the long-standing explicit allowlist entry and
+ * "PASS" is what the tree's own receipt producers emit. Anything else —
+ * fail words, "completed", unknown strings, case variants, a missing
+ * verdict — stays incomplete no matter what rc says, and a pass claim
+ * contradicted by a nonzero exit does not complete either. rc == 0 alone
+ * is never completion evidence. One shared predicate so the claim refusal,
+ * the worker gate, and the gateway evidence paths cannot drift apart. */
+bool zcl_devagent_closed_pass(const char *verdict, long long rc);
+
+/* ── resident dev worker ──────────────────────────────────────────────────
+ * The dev-only loop that consumes dev.agent.queue continuously. One active
+ * job per worker; the queue stays the only ledger (claim/running/outcome
+ * rows), mail carries result copies, receipts judge runs. The MODEL
+ * EXECUTION SEAM is wkr_executor_fn: the production binary wires "no
+ * executor yet" until C's muse_session drops in; tests wire fixtures. A
+ * worker terminal of "completed" is never success by itself — only the
+ * closed predicate over the gated receipt advances completion. */
+
+/* Bounded drive options. Strings are NUL-terminated on entry; over-long
+ * values are refused by the leaf before the drive starts. */
+struct wkr_drive_opts {
+    char worker[56];      /* resident worker identity, required */
+    char session[56];     /* this worker run, required */
+    char model[160];      /* model id hint for the executor, may be empty */
+    long long deadline_s; /* stop claiming after this many seconds */
+    long long idle_start_s; /* first idle wait on an empty queue */
+    long long idle_limit_s; /* stop after this much consecutive idle */
+    long long max_jobs;   /* stop after this many jobs (0 = deadline only) */
+    long long time_cap_s; /* wall clock per executor run */
+    long long cpu_s;      /* RLIMIT_CPU per executor run */
+    long long mem_mb;     /* RLIMIT_AS per executor run */
+    long long token_cap;  /* token budget handed to the executor */
+};
+
+/* One claimed unit of work. task is executor-ready text; rundir owns
+ * claim.json, receipt.json, run.out and the executor result file. */
+struct wkr_job {
+    char rundir[4096];
+    char name[80];
+    char kind[16];
+    long long attempt;
+    long long seq;
+    char task[8192];
+    char model[160];
+    long long token_cap;
+    long long time_cap_s;
+};
+
+/* Executor outcome. terminal is the executor's own word ("completed" is
+ * NOT success); candidate names the produced diff/artifact for the gate. */
+struct wkr_result {
+    char terminal[32];
+    long long rc;
+    char candidate[192];
+    char evidence[2048];
+    long long tokens_used;
+    long long wall_ms;
+};
+
+/* Model execution seam. True when the executor ran and filled res (even
+ * on executor failure); false when no executor is wired. Production
+ * C muse_session integration replaces the wired function, never the
+ * loop around it. */
+typedef bool (*wkr_executor_fn)(const struct wkr_job *job,
+                                struct wkr_result *res);
+
+/* Drive the loop until the deadline, idle limit, or job cap. Returns
+ * jobs processed (>= 0), or -1 when the worker lock or state root
+ * refuses. Single worker per queue: a second concurrent drive refuses. */
+long long zcl_devagent_worker_drive(const struct wkr_drive_opts *opts,
+                                    wkr_executor_fn exec);
+
+/* Production executor stub: wired until C's muse_session arrives. Always
+ * returns false so a job is never executed without a real executor. */
+bool zcl_devagent_worker_no_executor(const struct wkr_job *job,
+                                     struct wkr_result *res);
+
 /* ── single-line source mutation ──────────────────────────────────────────
  * One deterministic edit to one line, chosen by the first applicable rule in
  * a left-to-right scan of the line's CODE regions (string literals, character

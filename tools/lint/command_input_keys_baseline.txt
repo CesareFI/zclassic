@@ -26,6 +26,10 @@ story.why details # story why injects details=true into its private work-status 
 story.diff work # story diff injects each separately declared before/after selector as work into two private work-status requests; request->input never reaches either nested work key.
 story.diff details # story diff injects details=true into both private work-status requests so changed evidence remains root-visible; request->input never reaches either nested object.
 zcode.science.fetch kind      # pointer resolver reads its private RPC selector built by fetch; request->input never reaches that helper.
+dev.agent.worker attempt    # worker sub-dispatches fixed claim inputs to dev.agent.queue; request->input never reaches the nested attempt key.
+dev.agent.worker json       # worker sub-dispatches a fixed status+json object to dev.agent.queue; request->input never reaches the nested json key.
+dev.agent.worker body       # worker injects its own fixed result body into a private dev.agent.mail post; request->input never reaches that nested object.
+dev.agent.worker since      # dev.agent.mail reads since only on the pull branch; the worker only posts, so the read is dead here.
 zcode.science.fetch namespace # pointer resolver reads its private RPC selector built by fetch; request->input never reaches that helper.
 zcode.science.fetch semantic_root # pointer resolver reads its private RPC selector built by fetch; request->input never reaches that helper.
 zcode.science.fetch transport_root # provider discovery reads its private RPC selector built by fetch; request->input never reaches that helper.
