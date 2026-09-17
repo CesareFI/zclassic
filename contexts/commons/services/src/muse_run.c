@@ -1453,20 +1453,24 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
         goto write;
     }
     mr_note_prior_turn(t, r);
-    /* Source half of the diff identity, PINNED before the turn lands. An
-     * anchor that could not be read can never be compared afterwards, so
-     * the run stops here rather than judging an unanchored change set —
-     * and it stops before a token is spent, for the same reason baseline
-     * dirt does. */
-    if (!mr_head_at(t->workspace, r->base, sizeof(r->base))) {
-        (void)snprintf(r->reason, sizeof(r->reason),
-            "HEAD unreadable before the turn: base %s", r->base);
-        goto write;
-    }
+    /* Source half of the diff identity, PINNED before the turn lands: the
+     * anchor every post-turn measurement is taken against. Recorded here,
+     * judged two lines down — a workspace whose porcelain cannot be read
+     * usually cannot name a commit either, and that breakdown deserves
+     * the more specific diagnosis of the two. */
+    (void)mr_head_at(t->workspace, r->base, sizeof(r->base));
     /* The workspace must be measurably clean BEFORE the turn: baseline
      * dirt could otherwise satisfy the non-empty diff a pass requires.
      * No session, no turn, no tokens. */
     if (!mr_prestate_clean(c)) goto write;
+    /* An anchor that could not be read can never be compared afterwards,
+     * so a run without one stops before a token is spent rather than
+     * judging a change set against nothing. */
+    if (!mr_hex40(r->base)) {
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "HEAD unreadable before the turn: base %s", r->base);
+        goto write;
+    }
     allow[0] = t->scope;
     policy.approval_mode = "denyUnmatched";
     policy.model = t->model[0] ? t->model : NULL;

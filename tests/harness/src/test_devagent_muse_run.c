@@ -729,6 +729,11 @@ static int mr_pass_facts(const struct mr_dirs *d)
         strstr(ftext, "\"verdict\":\"pass\"") &&
         strstr(ftext, "\"candidate\":\"") &&
         strstr(ftext, "\"verdict\":\"SUITE VERDICT"));
+    MR_CHECK("pass head and spawn evidence", ftext &&
+        strstr(ftext, "\"measured\":true") &&
+        strstr(ftext, "\"spawn\":\"exit=0\"") &&
+        strstr(ftext, "\"exit\":0") &&
+        strstr(ftext, "\"normal\":true"));
     /* (a) The changed paths ARE the proof that the scope was respected:
      * a measured clean pre-state, and the turn's own in-scope path named
      * in the evidence with nothing outside. */
@@ -1000,6 +1005,471 @@ static int mr_exec_unmeasurable_bound(void)
     return failures;
 }
 
+/* The evidence file every case reads back. */
+static char *mr_read_facts(const struct mr_dirs *d, char *path, size_t cap)
+{
+    if (snprintf(path, cap, "%s/muse.json", d->run) >= (int)cap)
+        return NULL;
+    return mr_read(path);
+}
+
+/* One more file committed into the lane, so a case can have something to
+ * rename or delete that the pre-state still reads as clean. */
+static bool mr_seed_committed(const struct mr_dirs *d, const char *rel,
+    const char *text)
+{
+    char p[8192], dir[8192];
+    char *slash;
+    if (snprintf(p, sizeof(p), "%s/%s", d->wt, rel) >= (int)sizeof(p))
+        return false;
+    (void)snprintf(dir, sizeof(dir), "%s", p);
+    slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        if (!mr_mkdir_p(dir)) return false;
+    }
+    return mr_write(p, text, 0) && mr_git3(d->wt, "add", "-A", ".") &&
+        mr_git3(d->wt, "commit", "-m", "seed");
+}
+
+/* Installs a core.fsmonitor hook: the program git runs during the index
+ * refresh that every `git status` performs. That is the one deterministic
+ * place a fixture can act BETWEEN the executor's own git calls — nothing
+ * else in a run lets the workspace change underneath the audit, and a
+ * fixture that raced it from another process would prove nothing
+ * repeatably. The hook exits non-zero, which makes git fall back to
+ * scanning everything, so the porcelain it goes on to print is still the
+ * true one. Hook and marker live inside .git, where no porcelain row can
+ * ever name them. `trigger`, when given, holds the hook until that
+ * workspace-relative path exists, which is how a case acts after the turn
+ * rather than before it. */
+static bool mr_fsmonitor(const struct mr_dirs *d, const char *trigger,
+    const char *body)
+{
+    char path[8192], text[4096], guard[8192];
+    guard[0] = '\0';
+    if (trigger && snprintf(guard, sizeof(guard),
+            "if [ ! -e \"$W/%s\" ]; then exit 1; fi", trigger) >=
+        (int)sizeof(guard))
+        return false;
+    if (snprintf(path, sizeof(path), "%s/.git/mon.sh", d->wt) >=
+        (int)sizeof(path))
+        return false;
+    if (snprintf(text, sizeof(text),
+            "#!/bin/sh\nG=$(dirname \"$0\")\nW=\"$G/..\"\n%s\n"
+            "if [ -e \"$G/fired\" ]; then exit 1; fi\n: > \"$G/fired\"\n"
+            "%s\nexit 1\n", guard, body) >= (int)sizeof(text))
+        return false;
+    return mr_write(path, text, 0755) &&
+        mr_git3(d->wt, "config", "core.fsmonitor", path);
+}
+
+/* A `git` earlier on PATH than the real one, which answers only THIS
+ * workspace's `status` with rows the case chose and hands every other
+ * invocation straight through. Real git cannot be made to print a
+ * malformed row, an absolute path or a "../" path — its porcelain paths
+ * are always repo-relative and well formed — so the only way to prove
+ * the parser refuses one is to hand it one. Every group runs in its own
+ * forked process, so this PATH is private to the case that sets it, and
+ * the shim narrows on the workspace besides. */
+static bool mr_git_shim(const struct mr_dirs *d, const char *rows,
+    const char *trigger)
+{
+    char dir[8192], rowsf[8192], path[8192];
+    char *text, *newpath;
+    const char *orig = getenv("PATH");
+    bool ok;
+    if (!orig || strchr(orig, '\'')) return false;
+    if (snprintf(dir, sizeof(dir), "%s/shim", d->root) >= (int)sizeof(dir))
+        return false;
+    if (snprintf(rowsf, sizeof(rowsf), "%s/rows.txt", d->root) >=
+        (int)sizeof(rowsf))
+        return false;
+    if (snprintf(path, sizeof(path), "%s/git", dir) >= (int)sizeof(path))
+        return false;
+    if (!mr_mkdir_p(dir) || !mr_write(rowsf, rows, 0)) return false;
+    text = malloc(strlen(orig) + 32768);
+    newpath = malloc(strlen(orig) + sizeof(dir) + 2);
+    if (!text || !newpath) {
+        free(text);
+        free(newpath);
+        return false;
+    }
+    (void)sprintf(text,
+        "#!/bin/sh\nPATH='%s'\nexport PATH\n"
+        "if [ \"$1\" = \"-C\" ] && [ \"$2\" = '%s' ] && "
+        "[ \"$3\" = \"status\" ]; then\n"
+        "  if [ -e '%s/%s' ]; then cat '%s'; fi\n  exit 0\nfi\n"
+        "exec git \"$@\"\n",
+        orig, d->wt, d->wt, trigger ? trigger : ".git", rowsf);
+    (void)sprintf(newpath, "%s:%s", dir, orig);
+    ok = mr_write(path, text, 0755) && setenv("PATH", newpath, 1) == 0;
+    free(text);
+    free(newpath);
+    return ok;
+}
+
+/* Runs one case over a workspace the case itself prepared. The shared
+ * mr_execute builds its lane and runs in one step, and every case below
+ * has to get in between those two. */
+static int mr_run_prepared(struct mr_dirs *d, const char *scope,
+    const char *writes, const struct muse_run_budgets *b,
+    struct muse_run_result *r, char **evidence_out)
+{
+    struct muse_run_task t;
+    int rc;
+    if (!mr_task_for(d, &t, NULL, NULL, scope, b)) return -1;
+    s_fake_write_path[0] = '\0';
+    if (writes && snprintf(s_fake_write_path, sizeof(s_fake_write_path),
+            "%s/%s", d->wt, writes) >= (int)sizeof(s_fake_write_path))
+        return -1;
+    rc = mr_run_on_fake(&t, r, evidence_out);
+    s_fake_write_path[0] = '\0';
+    return rc;
+}
+
+/* (f) The model COMMITTED its work. HEAD advances, the porcelain goes
+ * spotless, and an audit of that tree measures nothing at all while
+ * reporting every count in order — the one shape where a clean audit is
+ * evidence of nothing. Only the pinned pre-turn HEAD catches it, and the
+ * refusal must name HEAD rather than riding the empty diff. */
+static int mr_exec_head_moved(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char *evidence = NULL;
+    char body[8192];
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("moved lane", mr_lane(&d));
+    MR_CHECK("moved gate", mr_gate_script(&d, mr_verdict_pass,
+        mr_head_pass, NULL));
+    /* A real commit carrying the SAME tree: HEAD advances and the
+     * worktree stays spotless, which is exactly what a model that commits
+     * its own work leaves behind. Built with commit-tree and update-ref
+     * because `git commit` would want the index lock the surrounding
+     * `git status` is already holding. */
+    (void)snprintf(body, sizeof(body),
+        "T=$(git --git-dir=\"$G\" rev-parse HEAD^{tree})\n"
+        "C=$(git --git-dir=\"$G\" commit-tree \"$T\" -p HEAD -m moved)\n"
+        "git --git-dir=\"$G\" update-ref HEAD \"$C\"");
+    MR_CHECK("moved hook", mr_fsmonitor(&d, NULL, body));
+    rc = mr_run_prepared(&d, NULL, NULL, NULL, &r, &evidence);
+    MR_CHECK("moved not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("moved head unmeasured", r.head_measured == false);
+    MR_CHECK("moved identities differ", mr_hex40(r.base) &&
+        mr_hex40(r.head_observed) &&
+        strcmp(r.base, r.head_observed) != 0);
+    MR_CHECK("moved reason names head",
+        strstr(r.reason, "HEAD moved during the turn") != NULL);
+    /* The gate never ran: a moved HEAD is settled before it is asked. */
+    MR_CHECK("moved gate not consulted", r.gate_normal == false &&
+        r.gate_exit == -1);
+    {
+        char facts[8192];
+        char *ftext = mr_read_facts(&d, facts, sizeof(facts));
+        MR_CHECK("moved evidence", ftext &&
+            strstr(ftext, "\"measured\":false") &&
+            strstr(ftext, "\"normal\":false") &&
+            strstr(ftext, "\"exit\":-1"));
+        free(ftext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* (g) The pre-turn HEAD could not be read at all. The pin is the anchor
+ * every later measurement is taken against, so a run without one is
+ * refused before a token is spent — never judged against nothing. */
+static int mr_exec_head_unborn(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_task t;
+    struct muse_run_result r;
+    char *evidence = NULL;
+    char ws[8192];
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("unborn lane", mr_lane(&d));
+    /* A repository with no commit yet: the porcelain is measurably
+     * clean and `rev-parse HEAD` has nothing to name. */
+    MR_CHECK("unborn workspace",
+        snprintf(ws, sizeof(ws), "%s/unborn", d.root) <
+        (int)sizeof(ws) && mr_mkdir_p(ws) && mr_git(ws, "init"));
+    MR_CHECK("unborn task", mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
+    MR_CHECK("unborn workspace fit",
+        snprintf(t.workspace, sizeof(t.workspace), "%s", ws) <
+        (int)sizeof(t.workspace));
+    rc = mr_run_on_fake(&t, &r, &evidence);
+    MR_CHECK("unborn not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("unborn refused", strcmp(r.verdict, "refused") == 0);
+    MR_CHECK("unborn no turn", evidence && !strstr(evidence, "turn-cmd:"));
+    MR_CHECK("unborn reason names head",
+        strstr(r.reason, "HEAD unreadable before the turn") != NULL);
+    MR_CHECK("unborn identities unread", strcmp(r.base, "none") == 0 &&
+        strcmp(r.head_observed, "none") == 0 &&
+        r.head_measured == false);
+    free(evidence);
+    return failures;
+}
+
+/* (h) A rename that moves an in-scope file OUT of the declared scope.
+ * Both halves of the row are judged: a file carried out of scope has been
+ * changed exactly as surely as one edited in place, and reading only the
+ * destination (or only the source) would miss half of every rename. */
+static int mr_exec_rename_out(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("rename lane", mr_lane(&d));
+    MR_CHECK("rename seed", mr_seed_committed(&d, "src/a.c", "orig\n"));
+    MR_CHECK("rename gate", mr_gate_script(&d, mr_verdict_pass,
+        mr_head_pass, NULL));
+    MR_CHECK("rename hook", mr_fsmonitor(&d, "src/turn.c",
+        "git --git-dir=\"$G\" --work-tree=\"$W\" mv src/a.c evil.c"));
+    rc = mr_run_prepared(&d, NULL, "src/turn.c", NULL, &r, &evidence);
+    MR_CHECK("rename not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("rename failed", strcmp(r.verdict, "failed") == 0);
+    {
+        char facts[8192];
+        char *ftext = mr_read_facts(&d, facts, sizeof(facts));
+        MR_CHECK("rename both halves judged", ftext &&
+            strstr(ftext, "\"changed_measured\":true") &&
+            strstr(ftext, "\"src/a.c\"") &&
+            strstr(ftext, "\"outside_count\":1") &&
+            strstr(ftext, "\"outside\":[\"evil.c\"]"));
+        free(ftext);
+    }
+    MR_CHECK("rename reason names scope",
+        strstr(r.reason, "outside scope src/") != NULL);
+    free(evidence);
+    return failures;
+}
+
+/* (i) A DELETE outside the declared scope. A deletion is an ordinary row
+ * and is judged like any other path: removing a file the scope never
+ * covered changes the workspace just as much as writing one. */
+static int mr_exec_delete_outside(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("delete lane", mr_lane(&d));
+    MR_CHECK("delete seed", mr_seed_committed(&d, "outside.txt", "o\n"));
+    MR_CHECK("delete gate", mr_gate_script(&d, mr_verdict_pass,
+        mr_head_pass, NULL));
+    MR_CHECK("delete hook", mr_fsmonitor(&d, "src/turn.c",
+        "rm -f \"$W/outside.txt\""));
+    rc = mr_run_prepared(&d, NULL, "src/turn.c", NULL, &r, &evidence);
+    MR_CHECK("delete not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("delete failed", strcmp(r.verdict, "failed") == 0);
+    {
+        char facts[8192];
+        char *ftext = mr_read_facts(&d, facts, sizeof(facts));
+        MR_CHECK("delete path named", ftext &&
+            strstr(ftext, "\"changed_measured\":true") &&
+            strstr(ftext, "\"outside_count\":1") &&
+            strstr(ftext, "\"outside\":[\"outside.txt\"]"));
+        free(ftext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* One shim-fed case: the porcelain the audit reads is exactly `rows`.
+ * `unmeasurable` says whether the rows are expected to be unreadable (the
+ * whole pass refuses as unmeasurable) or readable but out of scope. */
+static int mr_rows_case(const char *label, const char *rows,
+    bool unmeasurable, const char *outside_json)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char *evidence = NULL;
+    char facts[8192];
+    char *ftext = NULL;
+    char *saved_path = NULL;
+    const char *orig = getenv("PATH");
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    printf("muse_run: rows case %s\n", label);
+    saved_path = orig ? strdup(orig) : NULL;
+    MR_CHECK("rows lane", mr_lane(&d));
+    MR_CHECK("rows gate", mr_gate_script(&d, mr_verdict_pass,
+        mr_head_pass, NULL));
+    MR_CHECK("rows shim", saved_path && mr_git_shim(&d, rows,
+        "src/turn.c"));
+    rc = mr_run_prepared(&d, NULL, "src/turn.c", NULL, &r, &evidence);
+    /* The shim leaves this process no business standing in front of the
+     * real git, so it goes away with the case that needed it. */
+    if (saved_path) (void)setenv("PATH", saved_path, 1);
+    free(saved_path);
+    /* The gate script prints a PASSING verdict, so anything that reaches
+     * it passes: proving the refusal proves the audit refused. */
+    MR_CHECK("rows not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    if (unmeasurable) {
+        MR_CHECK("rows unmeasurable",
+            r.scope_changed_measured == false &&
+            r.scope_changed_count == -1 && r.scope_outside_count == -1 &&
+            strstr(r.reason, "change set unmeasurable") != NULL);
+    } else {
+        MR_CHECK("rows outside", r.scope_changed_measured &&
+            strcmp(r.verdict, "failed") == 0 &&
+            strstr(r.reason, "outside scope") != NULL);
+        ftext = mr_read_facts(&d, facts, sizeof(facts));
+        MR_CHECK("rows outside named", ftext && outside_json &&
+            strstr(ftext, outside_json));
+        free(ftext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* (j) Rows the parser MUST NOT read. Every one of these used to slip
+ * through a length test and a blind three-character skip, which turned
+ * whatever followed into a path the audit believed it had judged. An
+ * unreadable row is a refusal; it is never one lucky path. */
+static int mr_exec_rows_malformed(void)
+{
+    int failures = 0;
+    /* A status pair porcelain cannot print. */
+    failures += mr_rows_case("bad status pair", "XY src/turn.c\n",
+        true, NULL);
+    /* Two legal status characters, but no space where the separator
+     * always is: a blind three-character skip would have invented the
+     * path "rc/turn.c" and judged that instead. */
+    failures += mr_rows_case("no fixed separator", "MMsrc/turn.c\n",
+        true, NULL);
+    /* Unmodified in both columns, which this seam never prints. */
+    failures += mr_rows_case("two blank columns", "   src/turn.c\n",
+        true, NULL);
+    /* A rename separator on a status that cannot carry one. */
+    failures += mr_rows_case("arrow without rename",
+        "M  src/turn.c -> src/other.c\n", true, NULL);
+    /* C-quoting that does not parse: an unterminated quote, then an
+     * escape git never emits. A best-effort path out of either is a path
+     * the audit cannot claim to have measured. */
+    failures += mr_rows_case("unterminated quote", "?? \"src/turn.c\n",
+        true, NULL);
+    failures += mr_rows_case("bad escape", "?? \"src/\\qturn.c\"\n",
+        true, NULL);
+    return failures;
+}
+
+/* (k) An R row that names only one path. The status promises a source and
+ * a destination; a row that carries one of them has a half the parser
+ * never saw, and a path it never saw is a path it never judged. */
+static int mr_exec_rows_rename_bare(void)
+{
+    return mr_rows_case("rename without separator", "R  src/turn.c\n",
+        true, NULL);
+}
+
+/* (l) Regression guard on the path judgement itself: an absolute path and
+ * a "../" path are outside the declared scope by definition, whatever
+ * prefix they appear to share with it. Real git never prints either, so
+ * the rows are handed in directly. */
+static int mr_exec_rows_escaping_paths(void)
+{
+    int failures = 0;
+    failures += mr_rows_case("absolute path", "?? /etc/passwd\n", false,
+        "\"outside\":[\"/etc/passwd\"]");
+    failures += mr_rows_case("dot dot path", "?? src/../../evil\n", false,
+        "\"outside\":[\"src/../../evil\"]");
+    return failures;
+}
+
+/* (m) The gate runner EXITS NON-ZERO while its captured log carries a
+ * passing SUITE VERDICT line. The log is debris, not evidence: a runner
+ * that died mid-run has often already printed a line saying nothing
+ * failed yet. Discarding the spawn status read every such death as a
+ * pass. */
+static int mr_exec_gate_exit_nonzero(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("gate-exit run", mr_execute(FAKE_JOURNEY, &d,
+        mr_verdict_pass, mr_head_pass, "exit 7", &mr_edit_in_scope, NULL,
+        NULL, NULL, false, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("gate-exit not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("gate-exit refused", strcmp(r.verdict, "refused") == 0);
+    MR_CHECK("gate-exit status carried", r.gate_normal == false &&
+        r.gate_exit == 7);
+    MR_CHECK("gate-exit reason names outcome",
+        strstr(r.reason, "exit=7") != NULL);
+    /* The passing line was captured and still did not decide anything. */
+    MR_CHECK("gate-exit verdict line unread", r.gate_present == false &&
+        r.gate_ran == -1 && r.gate_failed == -1);
+    {
+        char facts[8192];
+        char *ftext = mr_read_facts(&d, facts, sizeof(facts));
+        MR_CHECK("gate-exit evidence", ftext &&
+            strstr(ftext, "\"spawn\":\"exit=7\"") &&
+            strstr(ftext, "\"normal\":false"));
+        free(ftext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* (n) The gate runner OVERRUNS ITS DEADLINE with passing-looking output
+ * already in the pipe. A killed process proves nothing about the suite it
+ * was still running, so the deadline is a refusal in its own right and is
+ * named as one rather than folded into an exit number. */
+static int mr_exec_gate_timeout(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    struct muse_run_budgets b;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    memset(&b, 0, sizeof(b));
+    b.turn_timeout_ms = 30000;
+    b.gate_timeout_ms = 400;
+    MR_CHECK("gate-timeout run", mr_execute(FAKE_JOURNEY, &d,
+        mr_verdict_pass, mr_head_pass, "sleep 30", &mr_edit_in_scope,
+        NULL, NULL, &b, false, &r, err, &rc, &evidence) == 0);
+    MR_CHECK("gate-timeout not pass", rc == 1 && r.rc == 1 &&
+        strcmp(r.verdict, "pass") != 0);
+    MR_CHECK("gate-timeout refused", strcmp(r.verdict, "refused") == 0);
+    MR_CHECK("gate-timeout named", r.gate_normal == false &&
+        strstr(r.reason, "timeout") != NULL);
+    MR_CHECK("gate-timeout verdict line unread", r.gate_present == false);
+    {
+        char facts[8192];
+        char *ftext = mr_read_facts(&d, facts, sizeof(facts));
+        MR_CHECK("gate-timeout evidence", ftext &&
+            strstr(ftext, "\"spawn\":\"timeout\"") &&
+            strstr(ftext, "\"normal\":false"));
+        free(ftext);
+    }
+    free(evidence);
+    return failures;
+}
+
 /* Passing gate plus a real diff: pass, rc 0, full contract. */
 static int mr_exec_pass(void)
 {
@@ -1022,6 +1492,13 @@ static int mr_exec_pass(void)
     MR_CHECK("pass gate token",
         strcmp(r.gate_evidence, "task_document:1/0") == 0 &&
         r.gate_present && r.gate_ran == 1 && r.gate_failed == 0);
+    /* The two facts a pass now also rests on: the pinned commit held
+     * still, and the gate's own process finished normally. */
+    MR_CHECK("pass head pinned", r.head_measured &&
+        mr_hex40(r.head_observed) &&
+        strcmp(r.base, r.head_observed) == 0);
+    MR_CHECK("pass gate exited normally", r.gate_normal &&
+        r.gate_exit == 0 && strcmp(r.gate_spawn, "exit=0") == 0);
     failures += mr_pass_candidate(&d, &r);
     MR_CHECK("pass tokens", r.total_tokens == 15 &&
         r.input_tokens == 10 && r.output_tokens == 5);
@@ -1346,6 +1823,19 @@ static int mr_failures_execute(void)
     failures += mr_exec_scope_prefix();
     failures += mr_exec_unmeasurable();
     failures += mr_exec_unmeasurable_bound();
+    /* The pinned pre-turn commit: a clean audit of a tree a commit has
+     * already emptied is evidence of nothing. */
+    failures += mr_exec_head_moved();
+    failures += mr_exec_head_unborn();
+    /* Rows the audit must read in full, or refuse. */
+    failures += mr_exec_rename_out();
+    failures += mr_exec_delete_outside();
+    failures += mr_exec_rows_malformed();
+    failures += mr_exec_rows_rename_bare();
+    failures += mr_exec_rows_escaping_paths();
+    /* The gate's own process, not only the log it left behind. */
+    failures += mr_exec_gate_exit_nonzero();
+    failures += mr_exec_gate_timeout();
     return failures;
 }
 
