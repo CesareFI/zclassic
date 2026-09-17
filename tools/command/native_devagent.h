@@ -122,6 +122,13 @@ long long zcl_devagent_worker_drive(const struct wkr_drive_opts *opts,
 bool zcl_devagent_worker_no_executor(const struct wkr_job *job,
                                      struct wkr_result *res);
 
+/* Production Muse executor (C): adapts one claimed job to one bounded
+ * muse_run_task and maps the structured result back. Declared here
+ * beside the seam it implements; defined in
+ * tools/command/native_devagent_muse_executor.c. */
+bool zcl_devagent_worker_muse_executor(const struct wkr_job *job,
+                                       struct wkr_result *res);
+
 /* ── single-line source mutation ──────────────────────────────────────────
  * One deterministic edit to one line, chosen by the first applicable rule in
  * a left-to-right scan of the line's CODE regions (string literals, character

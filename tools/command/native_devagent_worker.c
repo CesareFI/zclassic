@@ -1270,7 +1270,7 @@ void zcl_native_handle_dev_agent_worker(
     opts.mem_mb = wkr_leaf_int(request, "mem_mb", 1024, 64, 8192);
     opts.token_cap = wkr_leaf_int(request, "token_cap", 32000, 1, 1000000);
     jobs = zcl_devagent_worker_drive(&opts,
-                                     zcl_devagent_worker_no_executor);
+                                     zcl_devagent_worker_muse_executor);
     if (jobs < 0) {
         wkr_fail(reply, "WORKER_BUSY", "run",
                  "another worker holds this queue, or the state root refuses",
