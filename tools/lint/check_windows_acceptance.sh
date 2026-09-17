@@ -93,6 +93,7 @@ REGISTRY_REL="tools/dev/test_group_catalog.def"
 exempt_table() {
     cat <<'EXEMPT_EOF'
 platform/modules/platform/tests/test_platform.c	Not an acceptance program: it is the zclassic23/platform zcode package's own standalone test, shipped in the files list of platform/modules/platform/zcode-package.json. It carries its own AGENT_IMPACT_RULE in cognition/controllers/include/controllers/agent_impact_rules.def, which names the dev_platform and os_proc groups. Cross-linking it for Windows would say nothing the package pipeline does not already own.
+platform/modules/platform/tests/thread_join_android_acceptance.c	Android preprocessor acceptance, not a Windows program: make test-android-thread-join-acceptance compiles it with __ANDROID__ and executes it on the host to prove bionic does not select the glibc timed-join arm. The Windows branch is separately cross-linked and executed by thread_join_windows_acceptance.c.
 platform/modules/base/tests/test_base.c	Not an acceptance program: it is the zclassic23/base zcode package's own test binary. The Makefile builds and runs it as $(ZCODE_PACKAGE_BASE_TEST_BIN) and again under ASan as $(ZCODE_PACKAGE_BASE_ASAN_BIN), so it is executed natively on every run of those targets -- stronger evidence than a cross-link.
 platform/modules/base/tests/cleanse_probe.c	Not a program at all: it defines package_base_cleanse_probe() and no main(). It exists as a separate translation unit so memory_cleanse() cannot be optimised away, and it is compiled into both zcode base test binaries above.
 EXEMPT_EOF

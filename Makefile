@@ -8286,6 +8286,21 @@ $(THREAD_JOIN_ACCEPTANCE_BIN): platform/modules/platform/tests/thread_join_windo
 		-std=c23 -Wall -Wextra -Werror -pedantic \
 		-Iplatform/modules/platform/include $< $(ZCL_STATIC_FLAG) -pthread -o $@
 
+# Host-side preprocessing acceptance for the Android/bionic capability seam.
+# This proves that __ANDROID__ does not select glibc's pthread_timedjoin_np;
+# it is intentionally not described as an NDK or arm64 link proof.
+ANDROID_THREAD_JOIN_ACCEPTANCE_BIN := $(BIN_DIR)/thread-join-android-acceptance
+.PHONY: test-android-thread-join-acceptance
+test-android-thread-join-acceptance: $(ANDROID_THREAD_JOIN_ACCEPTANCE_BIN)
+	@$(ANDROID_THREAD_JOIN_ACCEPTANCE_BIN)
+
+$(ANDROID_THREAD_JOIN_ACCEPTANCE_BIN): platform/modules/platform/tests/thread_join_android_acceptance.c \
+		platform/modules/platform/include/platform/thread_compat.h
+	@mkdir -p $(dir $@)
+	$(CC) $(ZCL_PLATFORM_CPPFLAGS) -D_GNU_SOURCE -D__ANDROID__ \
+		-std=c23 -Wall -Wextra -Werror -pedantic \
+		-Iplatform/modules/platform/include $< $(ZCL_STATIC_FLAG) -pthread -o $@
+
 # ── STICKINESS fault-injection matrix (sticky-node-plan §4 metric) ──
 #
 # sticky-matrix: for each fault class, inject on a THROWAWAY /tmp datadir

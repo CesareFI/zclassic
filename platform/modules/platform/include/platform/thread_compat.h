@@ -9,11 +9,11 @@
 #ifndef ZCL_PLATFORM_THREAD_COMPAT_H
 #define ZCL_PLATFORM_THREAD_COMPAT_H
 
+#include <errno.h>
 #include <pthread.h>
 #include <time.h>
 
 #if defined(__APPLE__)
-#include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
 
@@ -58,7 +58,6 @@ static inline void platform_darwin_join_context_destroy(
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include <errno.h>
 #include <stdint.h>
 #endif
 
@@ -107,6 +106,18 @@ static inline int platform_thread_join_until(pthread_t thread,
     if (wait_result != WAIT_OBJECT_0)
         return EINVAL;
     return pthread_join(thread, result);
+#elif defined(__ANDROID__)
+    /* Android's bionic pthread API has neither pthread_timedjoin_np() nor
+     * pthread_cancel(). Do not let Android fall through the __linux__ arm:
+     * that silently assumes a glibc extension and fails at NDK compile time.
+     * Returning a typed capability error also avoids substituting an
+     * unbounded join into a shutdown path that promised a deadline. Callers
+     * must retain ownership and complete cooperative cancellation before a
+     * final pthread_join(); the registry-level contract is the next seam. */
+    (void)thread;
+    (void)result;
+    (void)deadline;
+    return ENOTSUP;
 #elif defined(__linux__)
     return pthread_timedjoin_np(thread, result, deadline);
 #elif defined(__APPLE__)
