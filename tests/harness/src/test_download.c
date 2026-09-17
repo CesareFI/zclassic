@@ -1328,6 +1328,49 @@ static void test_dl_force_blocks_download(void)
     (void)sync_set_state(SYNC_BLOCKS_DOWNLOAD, "download ibd test");
 }
 
+static int test_dl_rehash_preserves_received_pending(void)
+{
+    int failures = 0;
+    TEST("download table growth preserves received-pending dedup tombstones") {
+        test_dl_force_blocks_download();
+        ASSERT(sync_get_state() == SYNC_BLOCKS_DOWNLOAD);
+        struct download_manager dm;
+        dl_init(&dm);
+        ASSERT(dm.num_slots == 2048);
+
+        struct uint256 first = {0};
+        for (uint32_t i = 0; i < 1024; i++) {
+            struct uint256 h = {0};
+            uint32_t value = i + 1;
+            memcpy(h.data, &value, sizeof(value));
+            if (i == 0)
+                first = h;
+            ASSERT(dl_mark_requested(&dm, &h, 1000 + (int32_t)i, i + 1));
+        }
+        ASSERT(dl_mark_received(&dm, &first) == 1);
+
+        /* Restore 50% active occupancy, then the next insertion grows the
+         * table. The just-received body must remain suppressed across it. */
+        struct uint256 extra = {0};
+        uint32_t value = 1025;
+        memcpy(extra.data, &value, sizeof(value));
+        ASSERT(dl_mark_requested(&dm, &extra, 2025, 2001));
+        value = 1026;
+        memcpy(extra.data, &value, sizeof(value));
+        ASSERT(dl_mark_requested(&dm, &extra, 2026, 2002));
+        ASSERT(dm.num_slots == 4096);
+
+        int32_t first_height = 1000;
+        ASSERT(dl_queue_blocks(&dm, &first, &first_height, 1) == 0);
+        ASSERT(dm.total_requeue_suppressed_pending == 1);
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    test_dl_force_sync_idle();
+    return failures;
+}
+
 static int test_dl_ibd_windows(void)
 {
     int failures = 0;
@@ -2058,6 +2101,7 @@ int test_download(void)
     failures += test_gap_fill_queued_idle_wakes_dispatcher();
     failures += test_dl_many_insertions();
     failures += test_dl_ibd_windows();
+    failures += test_dl_rehash_preserves_received_pending();
     failures += test_dl_per_peer_limit();
     failures += test_dl_concurrent();
     failures += test_dl_byte_tracking();

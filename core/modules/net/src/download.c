@@ -471,19 +471,33 @@ static bool dl_slot_blocks_requeue(struct download_manager *dm,
     return true;
 }
 
-/* Rehash into a table of given size (must be power of 2). */
+static bool dl_slot_survives_rehash(const struct dl_in_flight *slot,
+                                    int64_t now)
+{
+    if (slot->active)
+        return true;
+    return slot->received_time != 0 &&
+           now - slot->received_time < DL_RECEIVED_PENDING_SECS;
+}
+
+/* Rehash into a table of given size (must be power of 2). Active requests and
+ * fresh received-pending tombstones both survive: dropping the latter here
+ * reopens the arrival-to-persistence duplicate-download window. Expired
+ * tombstones and ordinary probe-chain debris are deliberately compacted. */
 static void dl_rehash(struct download_manager *dm, size_t new_size)
 {
     struct dl_in_flight *new_slots = zcl_calloc(new_size, sizeof(struct dl_in_flight), "dl_slots");
     if (!new_slots) return;
 
     size_t new_mask = new_size - 1;
+    int64_t now = (int64_t)platform_time_wall_time_t();
     for (size_t i = 0; i < dm->num_slots; i++) {
-        if (!dm->slots[i].active) continue;
+        if (!dl_slot_survives_rehash(&dm->slots[i], now))
+            continue;
         size_t idx = dl_hash_slot(&dm->slots[i].hash, new_mask);
         for (size_t j = 0; j < new_size; j++) {
             struct dl_in_flight *s = &new_slots[(idx + j) & new_mask];
-            if (!s->active) {
+            if (!s->active && uint256_is_null(&s->hash)) {
                 *s = dm->slots[i];
                 break;
             }
