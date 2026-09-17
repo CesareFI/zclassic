@@ -20,6 +20,21 @@
 
 static struct c3_mutex_sample dl_profile_last;
 
+struct dl_fake_clock {
+    int64_t monotonic_us;
+    int64_t wall_unix;
+};
+
+static int64_t dl_fake_monotonic_us(void *user)
+{
+    return ((struct dl_fake_clock *)user)->monotonic_us;
+}
+
+static int64_t dl_fake_wall_unix(void *user)
+{
+    return ((struct dl_fake_clock *)user)->wall_unix;
+}
+
 static int dl_profile_compare(const void *a, const void *b)
 {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
@@ -233,6 +248,40 @@ static int test_dl_mark_received(void)
         dl_free(&dm);
         PASS();
     } _test_next:;
+    return failures;
+}
+
+static int test_dl_subsecond_delivery_updates_score(void)
+{
+    int failures = 0;
+    TEST("sub-second block delivery updates adaptive peer score") {
+        struct dl_fake_clock fake = {
+            .monotonic_us = 10000000,
+            .wall_unix = 1700000000,
+        };
+        struct platform_clock_source source = {
+            .monotonic_us = dl_fake_monotonic_us,
+            .wall_unix = dl_fake_wall_unix,
+            .user = &fake,
+        };
+        struct download_manager dm;
+        struct uint256 h = make_hash(42);
+        dl_init(&dm);
+
+        platform_clock_set_source(&source);
+        bool requested = dl_mark_requested(&dm, &h, 42, 7);
+        fake.monotonic_us += 250000; /* wall second deliberately unchanged */
+        uint32_t peer_id = dl_mark_received(&dm, &h);
+        platform_clock_clear_source();
+
+        ASSERT(requested);
+        ASSERT(peer_id == 7);
+        ASSERT(dl_peer_bandwidth_score(&dm, 7) == 255);
+        ASSERT(dm.peers[0].avg_delivery_us == 250000);
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    platform_clock_clear_source();
     return failures;
 }
 
@@ -2075,6 +2124,7 @@ int test_download(void)
     failures += test_dl_init_free();
     failures += test_dl_mark_requested();
     failures += test_dl_mark_received();
+    failures += test_dl_subsecond_delivery_updates_score();
     failures += test_dl_queue_dedup();
     failures += test_dl_received_pending_staging();
     failures += test_dl_assign_to_peer();

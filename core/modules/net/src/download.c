@@ -589,6 +589,7 @@ bool dl_mark_requested(struct download_manager *dm,
     slot->height = height;
     slot->peer_id = peer_id;
     slot->request_time = (int64_t)platform_time_wall_time_t();
+    slot->request_monotonic_us = platform_time_monotonic_us();
     slot->received_time = 0; /* activation clears any stale tombstone */
     slot->work_class = DL_WORK_FORWARD;
     slot->active = true;
@@ -617,7 +618,8 @@ uint32_t dl_mark_received(struct download_manager *dm,
     }
 
     uint32_t peer_id = s->peer_id;
-    int64_t delivery = (int64_t)platform_time_wall_time_t() - s->request_time;
+    int64_t now_monotonic_us = platform_time_monotonic_us();
+    int64_t delivery_us = now_monotonic_us - s->request_monotonic_us;
 
     s->active = false;
     /* Don't zero the hash — find_slot needs it to detect "was used" vs "never used"
@@ -635,7 +637,10 @@ uint32_t dl_mark_received(struct download_manager *dm,
     if (ps) {
         ps->blocks_received++;
         ps->last_body_received_time = (int64_t)platform_time_wall_time_t();
-        int64_t delivery_us = delivery * 1000000;
+        /* Monotonic microseconds preserve the fast-peer signal that wall
+         * seconds rounded to zero for every delivery inside one second. */
+        if (delivery_us <= 0)
+            delivery_us = 1;
         if (ps->avg_delivery_us == 0)
             ps->avg_delivery_us = delivery_us;
         else
@@ -1186,6 +1191,7 @@ size_t dl_assign_to_peer(struct download_manager *dm,
 {
     zcl_mutex_lock(&dm->cs);
     int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now_monotonic_us = platform_time_monotonic_us();
     struct dl_peer_stats *ps_assign = dl_find_peer(dm, peer_id, true);
     if (dl_assignment_peer_is_parked(dm, ps_assign, now)) {
         zcl_mutex_unlock(&dm->cs);
@@ -1401,6 +1407,7 @@ size_t dl_assign_to_peer(struct download_manager *dm,
                 slot->height = height;
                 slot->peer_id = peer_id;
                 slot->request_time = now;
+                slot->request_monotonic_us = now_monotonic_us;
                 slot->received_time = 0; /* activation clears any stale
                                           * tombstone */
                 slot->work_class = work_class;
@@ -1460,6 +1467,7 @@ size_t dl_assign_to_peer(struct download_manager *dm,
             slot->height = height;
             slot->peer_id = peer_id;
             slot->request_time = now;
+            slot->request_monotonic_us = now_monotonic_us;
             slot->received_time = 0; /* activation clears any stale
                                       * tombstone */
             slot->work_class = work_class;
