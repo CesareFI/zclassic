@@ -47,6 +47,12 @@
  * ROW. {"seq":N,"ts":"<ISO-8601 UTC>","from":"<agent>","to":"<agent|*>",
  *        "kind":"<kind>","body":"<text>","ref":"<ref>"}
  * seq is one plus the largest seq already in the outbox (1 when empty).
+ * A body round-trips byte for byte, newlines included: the row writes the
+ * two-character JSON escapes for newline, carriage return, tab, backspace
+ * and form feed, and the row reader decodes them plus any six-character
+ * u-escape below 0x80 that an older row used. Before that a newline was
+ * written as a u-escape and read back as '?', which silently destroyed
+ * every multi-line body — the machine header a reader needs most.
  *
  * PULL. Reads every *.jsonl under <state>/mail/ (the outbox plus one inbox
  * file per peer, written by whatever transport delivers them). Returns rows
@@ -379,6 +385,17 @@ static bool dvm_escape(const char *in, char *out, size_t cap)
             tmp[1] = *p;
             tmp[2] = '\0';
             rep = tmp;
+        } else if (*p == '\n' || *p == '\r' || *p == '\t' || *p == '\b' || // posix-ere-ok:json-backspace-escape
+                   *p == '\f') {
+            /* The two-character escapes, so a multi-line body survives the
+             * round trip. A newline written as a six-character u-escape came
+             * back from dvm_line_str as '?', which silently destroyed every
+             * multi-line body — the header a machine reader needs most. */
+            tmp[0] = '\\';
+            tmp[1] = *p == '\n' ? 'n' : *p == '\r' ? 'r'
+                     : *p == '\t' ? 't' : *p == '\b' ? 'b' : 'f'; // posix-ere-ok:json-backspace-escape
+            tmp[2] = '\0';
+            rep = tmp;
         } else if ((unsigned char)*p < 0x20) {
             (void)snprintf(tmp, sizeof(tmp), "\\u%04x", (unsigned)*p);
             rep = tmp;
@@ -426,7 +443,14 @@ static bool dvm_mail_dir(char *out, size_t cap)
     if (!dvm_mkdir_one(out))
         return false;
 #if !defined(_WIN32)
-    (void)chmod(out, 0700);
+    /* The mail dir must end up 0700, but only write the mode when it is
+     * actually wrong. An unconditional chmod(2) on every mail call fires an
+     * inotify attribute event on this directory, which wakes any resident
+     * loop watching it once per beat and turns a bounded idle wait into a
+     * spin. Enforcement is unchanged: a wrong or unreadable mode is fixed. */
+    struct stat dir_state;
+    if (stat(out, &dir_state) != 0 || (dir_state.st_mode & 07777) != 0700)
+        (void)chmod(out, 0700);
 #endif
     return true;
 }
@@ -539,6 +563,38 @@ static bool dvm_line_int(const char *line, const char *key, long long *out)
     return true;
 }
 
+/* One two-character JSON escape to the byte it names. An escape this table
+ * does not know keeps the character after the backslash, which is what
+ * \" and \\ already needed. */
+static char dvm_unescape_short(char c)
+{
+    switch (c) {
+    case 'n': return '\n';
+    case 'r': return '\r';
+    case 't': return '\t';
+    case 'b': return '\b'; // posix-ere-ok:json-backspace-escape
+    case 'f': return '\f';
+    default:  return c;
+    }
+}
+
+/* One \uXXXX escape (hex digits already validated) to a single byte when it
+ * names a non-NUL one below 0x80, and '?' otherwise. NUL stays '?': an
+ * embedded NUL would truncate the row's own C string and make a body read
+ * shorter than it is. */
+static char dvm_unescape_u(const char *hex)
+{
+    char digits[5];
+    unsigned long v;
+    digits[0] = hex[0];
+    digits[1] = hex[1];
+    digits[2] = hex[2];
+    digits[3] = hex[3];
+    digits[4] = '\0';
+    v = strtoul(digits, NULL, 16);
+    return (v > 0u && v < 0x80u) ? (char)v : '?';
+}
+
 static bool dvm_line_str(const char *line, const char *key, char *out,
                          size_t cap)
 {
@@ -554,16 +610,19 @@ static bool dvm_line_str(const char *line, const char *key, char *out,
         if (used + 2 > cap)
             return false;
         if (*p == '\\' && p[1]) {
-            /* Keep the common escapes exact; \uXXXX becomes '?'
-             * (ordering only needs stable bytes, not the rune). */
+            /* Decode the two-character escapes to the bytes they name, so a
+             * multi-line body reads back as the writer wrote it. A \uXXXX
+             * escape carries its own byte when it names one below 0x80 (the
+             * form older rows used for newlines and tabs) and stays '?'
+             * above that, where ordering needs only stable bytes. */
             if (p[1] == 'u' && isxdigit((unsigned char)p[2]) &&
                 isxdigit((unsigned char)p[3]) &&
                 isxdigit((unsigned char)p[4]) &&
                 isxdigit((unsigned char)p[5])) {
-                out[used++] = '?';
+                out[used++] = dvm_unescape_u(p + 2);
                 p += 6;
             } else {
-                out[used++] = p[1];
+                out[used++] = dvm_unescape_short(p[1]);
                 p += 2;
             }
         } else {
