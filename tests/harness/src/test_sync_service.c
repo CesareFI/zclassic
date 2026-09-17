@@ -385,6 +385,7 @@ static int test_sync_service_header_batch_followup(void)
         ASSERT(batch.should_warn_all_rejected);
         ASSERT(!batch.should_emit_received);
         ASSERT(!batch.should_request_more_headers);
+        ASSERT(batch.should_release_range);
         /* All-rejected batches arm the recovery probe (the call site keys
          * on bad-prevblk and applies the per-peer rate limit). */
         ASSERT(batch.should_probe_after_reject);
@@ -392,24 +393,28 @@ static int test_sync_service_header_batch_followup(void)
         syncsvc_evaluate_header_batch(&batch, 0, 0, NULL);
         ASSERT(!batch.should_warn_all_rejected);
         ASSERT(!batch.should_probe_after_reject);
+        ASSERT(batch.should_release_range);
 
         syncsvc_evaluate_header_batch(&batch, 5, 5, &tip);
         ASSERT(!batch.should_warn_all_rejected);
         ASSERT(batch.should_emit_received);
         ASSERT(!batch.should_request_more_headers);
         ASSERT(!batch.should_probe_after_reject);
+        ASSERT(batch.should_release_range);
 
         syncsvc_evaluate_header_batch(&batch, 5, 2000, &tip);
         ASSERT(!batch.should_warn_all_rejected);
         ASSERT(batch.should_emit_received);
         ASSERT(batch.should_request_more_headers);
         ASSERT(!batch.should_probe_after_reject);
+        ASSERT(!batch.should_release_range);
 
         tip.phashBlock = NULL;
         syncsvc_evaluate_header_batch(&batch, 2, 2000, &tip);
         ASSERT(batch.should_emit_received);
         ASSERT(!batch.should_request_more_headers);
         ASSERT(!batch.should_probe_after_reject);
+        ASSERT(batch.should_release_range);
         PASS();
     } _test_next:;
 
