@@ -116,6 +116,8 @@ struct wkr_sub {
     struct json_value input;
     struct zcl_command_request request;
     struct zcl_command_reply reply;
+    /* The sibling handler was INVOKED. It never means the sibling
+     * accepted: acceptance is reply.status, which wkr_sub_ok reads. */
     bool ran;
     bool valid;
 };
@@ -931,52 +933,191 @@ static void wkr_write_receipt(const struct wkr_drive_opts *opts,
     (void)wkr_write_atomic(path, text, (size_t)w);
 }
 
-/* Result mail under the SAME ref: flat scanner-safe key=value lines, no
- * absolute paths (the mail leaf refuses paths outside the checkout).
- * Best-effort: the outcome row is the record; mail is its readable
- * copy for brief/evidence. */
+/* ── result mail: the row the originating client sees ────────────────────
+ * Result mail under the SAME ref: flat scanner-safe key=value lines, which
+ * other code parses. The mail leaf refuses EVERY absolute path in a body —
+ * it consults no checkout root and no process cwd — and refuses any
+ * path-shaped token carrying a ".." segment. So nothing path-shaped may
+ * reach the body, whatever directory it names.
+ *
+ * What is GUARANTEED after a call:
+ *   - the row is emitted. No evidence field can cancel it, because
+ *     malformed evidence is exactly when the client needs the row;
+ *   - a value that fails the safe shape is replaced by WKR_MAIL_ELIDED and
+ *     the substitution is announced on its own line, so an elided field is
+ *     never read as an absent one;
+ *   - every field is individually bounded; a body that still would not fit
+ *     posts the reduced row rather than nothing;
+ *   - the leaf's reply is inspected, and a refused post is RECORDED in the
+ *     run's own outcome row (run.out) beside the rc, where the operator
+ *     and the next attempt's brief already read.
+ * What is still best-effort: DELIVERY of the row itself. The leaf may
+ * refuse on its own admission rules (a key marker, an IP), and this
+ * function neither retries nor reposts. The outcome row remains the
+ * authority for the verdict; what changed is that a lost result row is now
+ * visible there instead of silent. */
+
+#define WKR_MAIL_ELIDED "unsafe-elided"
+#define WKR_MAIL_ELIDED_LINE "elided=" WKR_MAIL_ELIDED "\n"
+
+/* One interpolated value may be carried verbatim when it is empty (an
+ * absent field stays absent) or matches zcl_devagent_name_ok — the
+ * grammar the queue already admits names under. That grammar rejects
+ * every shape the mail leaf refuses: a leading '/' (any '/' at all), a
+ * ".." segment, a '~/' prefix, a "C:\" or "C:/" drive prefix, CR/LF, and
+ * anything outside its bounded printable alphabet. It is deliberately
+ * narrower than the leaf's refusal set: a value that passes here gives
+ * the leaf no path-shaped reason to refuse the body. */
+static bool wkr_field_safe(const char *v)
+{
+    if (!v || !v[0])
+        return true;
+    return zcl_devagent_name_ok(v);
+}
+
+/* The value, or the marker in its place. Never returns NULL. */
+static const char *wkr_field_carry(const char *v, bool *elided)
+{
+    if (wkr_field_safe(v))
+        return v ? v : "";
+    if (elided)
+        *elided = true;
+    return WKR_MAIL_ELIDED;
+}
+
+/* The safe, bounded pieces of one result row. */
+struct wkr_mail_row {
+    const char *ref;
+    const char *worker;
+    const char *session;
+    const char *model;
+    const char *terminal;
+    const char *candidate;
+    const char *gate;
+    bool elided;
+};
+
+static void wkr_row_safe(struct wkr_mail_row *row,
+                         const struct wkr_drive_opts *opts,
+                         const struct wkr_job *job, const char *terminal,
+                         const char *candidate, const char *verdict)
+{
+    memset(row, 0, sizeof(*row));
+    row->ref = wkr_field_carry(job->name, &row->elided);
+    row->worker = wkr_field_carry(opts->worker, &row->elided);
+    row->session = wkr_field_carry(opts->session, &row->elided);
+    row->model = wkr_field_carry(job->model, &row->elided);
+    row->terminal = wkr_field_carry(terminal, &row->elided);
+    row->candidate = wkr_field_carry(candidate, &row->elided);
+    row->gate = wkr_field_carry(verdict, &row->elided);
+}
+
+/* Post one composed body under ref. True when the mail leaf ACCEPTED it;
+ * on anything else code is filled with the refusal the outcome row will
+ * carry. The code is COPIED: the reply it comes from does not outlive
+ * this call. */
+static bool wkr_mail_post(const char *body, const char *ref,
+                          const char *worker, char *code, size_t cap)
+{
+    struct wkr_sub sub;
+    char ebody[8192], eref[192], input[9216];
+    bool posted;
+    (void)snprintf(code, cap, "%s", "encode-failed");
+    if (!wkr_escape(body, ebody, sizeof(ebody)) ||
+        !wkr_escape(ref, eref, sizeof(eref)))
+        return false;
+    if (snprintf(input, sizeof(input),
+                 "{\"action\":\"post\",\"to\":\"*\",\"kind\":\"result\","
+                 "\"body\":\"%s\",\"ref\":\"%s\",\"from\":\"%.48s\"}",
+                 ebody, eref, worker) >= (int)sizeof(input))
+        return false;
+    wkr_sub_begin(&sub, "zcl.agent_mail.v1", "dev.agent.mail");
+    if (!sub.valid) {
+        (void)snprintf(code, cap, "%s", "mail-leaf-absent");
+        wkr_sub_end(&sub);
+        return false;
+    }
+    if (!wkr_sub_input(&sub, input)) {
+        (void)snprintf(code, cap, "%s", "post-input-unreadable");
+        wkr_sub_end(&sub);
+        return false;
+    }
+    zcl_native_handle_dev_agent_mail(&sub.request, &sub.reply);
+    /* ran means the sibling handler was invoked, never that it accepted:
+     * acceptance is the reply's own status, which wkr_sub_ok reads. */
+    sub.ran = true;
+    posted = wkr_sub_ok(&sub);
+    if (!posted)
+        (void)snprintf(code, cap, "%s",
+                       sub.reply.error.code[0] ? sub.reply.error.code
+                                               : "mail-refused");
+    wkr_sub_end(&sub);
+    return posted;
+}
+
+/* The row that always fits: the ref the client waits on, the verdict, the
+ * rc, and the marker saying the rest was dropped to get it out. Bounding
+ * every field to the shared name grammar makes the full row always fit, so
+ * this is a fail-safe, not a routine path: it is what keeps a body that
+ * somehow will not compose from cancelling the result. */
+static bool wkr_mail_reduced(const char *ref, const char *gate, long long rc,
+                             const char *postref, const char *worker,
+                             char *code, size_t cap)
+{
+    char body[512];
+    int w = snprintf(body, sizeof(body),
+                     "ref=%.64s\ngate=%.64s\nrc=%lld\nreduced=1\n", ref,
+                     gate, rc);
+    if (w <= 0 || (size_t)w >= sizeof(body)) {
+        (void)snprintf(code, cap, "%s", "reduced-compose-failed");
+        return false;
+    }
+    return wkr_mail_post(body, postref, worker, code, cap);
+}
+
+/* Record a lost result row where the operator and the next attempt's
+ * brief already read: the run's own outcome row, rc unchanged, the
+ * evidence note kept and the refusal appended to it. */
+static void wkr_mail_note_refusal(const struct wkr_job *job, long long rc,
+                                  const char *note, const char *code)
+{
+    char full[3400];
+    (void)snprintf(full, sizeof(full), "%.3000s result-mail-refused=%.64s",
+                   note ? note : "", code ? code : "mail-refused");
+    wkr_write_runout(job, rc, full);
+}
 
 static void wkr_mail_result(const struct wkr_drive_opts *opts,
                             const struct wkr_job *job, const char *terminal,
                             const char *candidate, const char *verdict,
-                            long long rc, long long tokens, long long wall_ms)
+                            long long rc, long long tokens, long long wall_ms,
+                            const char *note)
 {
-    struct wkr_sub sub;
-    char body[2048], ebody[8192], eref[192], input[9216];
+    struct wkr_mail_row row;
+    char body[2048], code[80];
+    bool posted;
     int w;
     if (!opts || !job || !terminal || !verdict)
         return;
     if (!candidate)
         candidate = "";
+    (void)snprintf(code, sizeof(code), "%s", "mail-refused");
+    wkr_row_safe(&row, opts, job, terminal, candidate, verdict);
     w = snprintf(body, sizeof(body),
-                 "ref=%s\nworker=%s\nsession=%s\nmodel=%s\nattempt=%lld\n"
-                 "terminal=%s\ncandidate=%s\ngate=%s\nrc=%lld\ntokens=%lld\n"
-                 "wall_ms=%lld\n",
-                 job->name, opts->worker, opts->session, job->model,
-                 job->attempt, terminal, candidate, verdict, rc, tokens,
-                 wall_ms);
+                 "ref=%.64s\nworker=%.64s\nsession=%.64s\nmodel=%.64s\n"
+                 "attempt=%lld\nterminal=%.64s\ncandidate=%.64s\n"
+                 "gate=%.64s\nrc=%lld\ntokens=%lld\nwall_ms=%lld\n%s",
+                 row.ref, row.worker, row.session, row.model, job->attempt,
+                 row.terminal, row.candidate, row.gate, rc, tokens, wall_ms,
+                 row.elided ? WKR_MAIL_ELIDED_LINE : "");
     if (w <= 0 || (size_t)w >= sizeof(body))
-        return;
-    if (!wkr_escape(body, ebody, sizeof(ebody)) ||
-        !wkr_escape(job->name, eref, sizeof(eref)))
-        return;
-    if (snprintf(input, sizeof(input),
-                 "{\"action\":\"post\",\"to\":\"*\",\"kind\":\"result\","
-                 "\"body\":\"%s\",\"ref\":\"%s\",\"from\":\"%.48s\"}",
-                 ebody, eref, opts->worker) >= (int)sizeof(input))
-        return;
-    wkr_sub_begin(&sub, "zcl.agent_mail.v1", "dev.agent.mail");
-    if (!sub.valid) {
-        wkr_sub_end(&sub);
-        return;
-    }
-    if (!wkr_sub_input(&sub, input)) {
-        wkr_sub_end(&sub);
-        return;
-    }
-    zcl_native_handle_dev_agent_mail(&sub.request, &sub.reply);
-    sub.ran = true;
-    wkr_sub_end(&sub);
+        posted = wkr_mail_reduced(row.ref, row.gate, rc, job->name,
+                                  opts->worker, code, sizeof(code));
+    else
+        posted = wkr_mail_post(body, job->name, opts->worker, code,
+                               sizeof(code));
+    if (!posted)
+        wkr_mail_note_refusal(job, rc, note, code);
 }
 
 /* ── run one job ─────────────────────────────────────────────────────────
@@ -996,33 +1137,34 @@ static long long wkr_run_fresh(const struct wkr_drive_opts *opts,
     if (!wkr_set_submitted(job->rundir)) {
         wkr_write_runout(job, 101, "claim-identity-unwritable");
         wkr_mail_result(opts, job, "claim-identity-unwritable", "",
-                        "no-receipt", 101, 0, 0);
+                        "no-receipt", 101, 0, 0,
+                        "claim-identity-unwritable");
         return 1;
     }
     out = wkr_spawn(opts, job, exec);
     if (out.status == 0) {
         wkr_write_runout(job, 124, "executor-time-cap");
         wkr_mail_result(opts, job, "timeout", "", "no-receipt", 124, 0,
-                        out.wall_ms);
+                        out.wall_ms, "executor-time-cap");
         return 1;
     }
     if (out.status < 0) {
         wkr_write_runout(job, 127, "executor-launch-failed");
         wkr_mail_result(opts, job, "launch-failed", "", "no-receipt", 127,
-                        0, out.wall_ms);
+                        0, out.wall_ms, "executor-launch-failed");
         return 1;
     }
     if (out.signaled || g_wkr_term) {
         wkr_write_runout(job, 130, "executor-signaled");
         wkr_mail_result(opts, job, "crashed", "", "no-receipt", 130, 0,
-                        out.wall_ms);
+                        out.wall_ms, "executor-signaled");
         return 1;
     }
     have_res = wkr_parse_result(job->rundir, &res);
     if (!have_res) {
         wkr_write_runout(job, 100, "executor-no-result");
         wkr_mail_result(opts, job, "no-result", "", "no-receipt", 100, 0,
-                        out.wall_ms);
+                        out.wall_ms, "executor-no-result");
         return 1;
     }
     res.wall_ms = out.wall_ms;
@@ -1030,7 +1172,7 @@ static long long wkr_run_fresh(const struct wkr_drive_opts *opts,
     wkr_write_runout(job, rc, res.evidence);
     wkr_write_receipt(opts, job, verdict, &res);
     wkr_mail_result(opts, job, res.terminal, res.candidate, verdict, rc,
-                    res.tokens_used, res.wall_ms);
+                    res.tokens_used, res.wall_ms, res.evidence);
     return 1;
 }
 
@@ -1047,7 +1189,8 @@ static long long wkr_run_job(const struct wkr_drive_opts *opts,
          * the loss; reap marks it incomplete. */
         wkr_write_runout(job, 99, "worker-lost-after-submit");
         wkr_mail_result(opts, job, "worker-lost-after-submit", "",
-                        "no-receipt", 99, 0, 0);
+                        "no-receipt", 99, 0, 0,
+                        "worker-lost-after-submit");
         return 1;
     }
     /* Fresh claims arrive submitted:false; adoptions with submitted==0

@@ -204,15 +204,74 @@ static bool wtx_mail_has(const char *ref, const char *needle)
     return found;
 }
 
+/* Copy the body of the result mail row under ref. False when no row
+ * under that ref exists at all. */
+static bool wtx_mail_body(const char *ref, char *out, size_t cap)
+{
+    struct wtx_call c;
+    const struct json_value *arr;
+    size_t n, i;
+    bool found = false;
+    out[0] = '\0';
+    wtx_begin(&c, "dev.agent.mail", "zcl.agent_mail.v1");
+    (void)json_push_kv_str(&c.input, "action", "pull");
+    zcl_native_handle_dev_agent_mail(&c.request, &c.reply);
+    if (wtx_ok(&c)) {
+        arr = json_get(&c.reply.data, "rows");
+        if (arr && arr->type == JSON_ARR) {
+            n = json_size(arr);
+            for (i = 0; i < n && !found; i++) {
+                const struct json_value *r = json_at(arr, i);
+                const struct json_value *v;
+                const char *rr;
+                if (!r || r->type != JSON_OBJ)
+                    continue;
+                v = json_get(r, "ref");
+                rr = (v && v->type == JSON_STR) ? json_get_str(v) : "";
+                if (strcmp(rr, ref) != 0)
+                    continue;
+                v = json_get(r, "body");
+                (void)snprintf(out, cap, "%s",
+                               (v && v->type == JSON_STR) ? json_get_str(v)
+                                                          : "");
+                found = true;
+            }
+        }
+    }
+    wtx_end(&c);
+    return found;
+}
+
+/* True when the run's own outcome row (run.out) carries needle. */
+static bool wtx_runout_has(const char *name, long long attempt,
+                           const char *needle)
+{
+    char path[4096], text[8192];
+    FILE *f;
+    size_t n;
+    (void)snprintf(path, sizeof(path),
+                   "%s/z23/dev/engine/%s/a%lld/run.out", g_wtx_state, name,
+                   attempt);
+    f = fopen(path, "rb");
+    if (!f)
+        return false;
+    n = fread(text, 1, sizeof(text) - 1, f);
+    (void)fclose(f);
+    text[n] = '\0';
+    return strstr(text, needle) != NULL;
+}
+
 /* ── TEST executor fixtures ──────────────────────────────────────────────
  * Modes: 0 guided outcome, 1 abort in child (crash), 2 sleep past the
- * wall cap (timeout). The guided outcome writes a real candidate file
- * so the gate has something to judge. */
+ * wall cap (timeout), 3 hand-written receipt carrying g_fx_cand_raw as
+ * the candidate byte for byte. The guided outcome writes a real
+ * candidate file so the gate has something to judge. */
 
 static int g_fx_mode;
 static char g_fx_terminal[32];
 static long long g_fx_rc;
 static bool g_fx_candidate;
+static char g_fx_cand_raw[512];
 
 /* The executor runs in a forked child, so the run count crosses the
  * fork through an append-only file, never through process memory. */
@@ -266,6 +325,31 @@ static bool wtx_fixture(const struct wkr_job *job, struct wkr_result *res)
         for (k = 0; k < 60; k++)
             (void)sleep(1);
     }
+    if (g_fx_mode == 3) {
+        /* The normal child path JSON-escapes the candidate, so a raw
+         * newline could never reach the worker through it. Write the
+         * receipt by hand and exit: the candidate arrives as exactly the
+         * bytes a hostile or broken executor emitted. */
+        char path[4096 + 64], line[2048];
+        FILE *f;
+        int w = snprintf(line, sizeof(line),
+                         "{\"terminal\":\"pass\",\"rc\":0,\"candidate\":"
+                         "\"%s\",\"evidence\":\"fixture receipt\","
+                         "\"tokens_used\":42,\"wall_ms\":7}\n",
+                         g_fx_cand_raw);
+        if (w <= 0 || (size_t)w >= sizeof(line))
+            _exit(126);
+        if (snprintf(path, sizeof(path), "%s/executor_result.json",
+                     job->rundir) >= (int)sizeof(path))
+            _exit(126);
+        f = fopen(path, "wb");
+        if (!f)
+            _exit(126);
+        (void)fwrite(line, 1, strlen(line), f);
+        (void)fclose(f);
+        (void)fflush(NULL);
+        _exit(0);
+    }
     memset(res, 0, sizeof(*res));
     (void)snprintf(res->terminal, sizeof(res->terminal), "%s",
                    g_fx_terminal);
@@ -305,6 +389,43 @@ static void wtx_opts(struct wkr_drive_opts *o, const char *worker,
     o->cpu_s = 30;
     o->mem_mb = 512;
     o->token_cap = 32000;
+}
+
+/* ── result-mail safety rig ──────────────────────────────────────────────
+ * The result row under the ref is the ONLY thing the originating client
+ * sees, so malformed executor evidence must never cancel it. Each case
+ * drives one job whose receipt names `cand` verbatim and copies back the
+ * body the client would read. */
+
+#define WTX_ELIDED "unsafe-elided"
+
+static bool wtx_hostile_run(const char *tag, const char *name,
+                            const char *cand, char *body, size_t cap)
+{
+    struct wkr_drive_opts o;
+    wtx_isolate(tag);
+    wtx_queue_post(name);
+    (void)remove(g_fx_count);
+    g_fx_mode = 3;
+    (void)snprintf(g_fx_cand_raw, sizeof(g_fx_cand_raw), "%s", cand);
+    wtx_opts(&o, "wtx", "s-hostile");
+    if (zcl_devagent_worker_drive(&o, wtx_fixture) != 1)
+        return false;
+    return wtx_mail_body(name, body, cap);
+}
+
+/* Every hostile candidate ends the same way: the row is posted, the
+ * candidate is the marker, the substitution is announced, and the
+ * hostile bytes are nowhere in the body. */
+static bool wtx_elided_ok(const char *body, const char *name,
+                          const char *leak)
+{
+    char refline[128];
+    (void)snprintf(refline, sizeof(refline), "ref=%s\n", name);
+    return strstr(body, refline) != NULL &&
+           strstr(body, "candidate=" WTX_ELIDED "\n") != NULL &&
+           strstr(body, "elided=" WTX_ELIDED "\n") != NULL &&
+           strstr(body, leak) == NULL;
 }
 
 static void wtx_flip_submitted(const char *name, long long attempt,
@@ -605,6 +726,133 @@ int test_devagent_worker(void)
         zcl_native_handle_dev_agent_queue(&c.request, &c.reply);
         ASSERT(!wtx_ok(&c));
         wtx_end(&c);
+        wtx_restore();
+        PASS();
+    }
+    TEST("result mail survives an absolute-path candidate")
+    {
+        char body[4096];
+        ASSERT(wtx_hostile_run("mabs", "wtx-abs", "/etc/passwd", body,
+                               sizeof(body)));
+        ASSERT(wtx_elided_ok(body, "wtx-abs", "/etc/passwd"));
+        /* The gate verdict and the rc still reach the client. */
+        ASSERT(strstr(body, "gate=gate-refused\n") != NULL);
+        ASSERT(strstr(body, "rc=1\n") != NULL);
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("result mail survives a climbing candidate")
+    {
+        char body[4096];
+        ASSERT(wtx_hostile_run("mclimb", "wtx-climb", "cand/../../out.diff",
+                               body, sizeof(body)));
+        ASSERT(wtx_elided_ok(body, "wtx-climb", ".."));
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("result mail survives a home-prefixed candidate")
+    {
+        char body[4096];
+        ASSERT(wtx_hostile_run("mhome", "wtx-home", "~/keys.diff", body,
+                               sizeof(body)));
+        ASSERT(wtx_elided_ok(body, "wtx-home", "~/"));
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("result mail survives a drive-prefixed candidate")
+    {
+        char body[4096];
+        ASSERT(wtx_hostile_run("mdrive", "wtx-drive", "C:/work/cand.diff",
+                               body, sizeof(body)));
+        ASSERT(wtx_elided_ok(body, "wtx-drive", "C:/"));
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("result mail survives a newline candidate, no forged line")
+    {
+        char body[4096];
+        /* A body-structure attack, not a path: the mail leaf admits this
+         * one, so only the safe-shape check keeps the forged key=value
+         * line out of the row other code parses. */
+        ASSERT(wtx_hostile_run("mline", "wtx-line", "cand\ninjected=1", body,
+                               sizeof(body)));
+        ASSERT(wtx_elided_ok(body, "wtx-line", "injected=1"));
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("an oversized candidate cannot cancel the row")
+    {
+        char body[4096], huge[256];
+        size_t k;
+        /* Over the grammar's bound, clean charset: a field too wide for
+         * the row is elided like any other unsafe one, so it can neither
+         * overflow the body nor take the row down with it. */
+        for (k = 0; k + 1 < sizeof(huge); k++)
+            huge[k] = 'a';
+        huge[sizeof(huge) - 1] = '\0';
+        ASSERT(wtx_hostile_run("mbig", "wtx-big", huge, body,
+                               sizeof(body)));
+        ASSERT(strstr(body, "ref=wtx-big\n") != NULL);
+        ASSERT(strstr(body, "candidate=" WTX_ELIDED "\n") != NULL);
+        ASSERT(strstr(body, "elided=" WTX_ELIDED "\n") != NULL);
+        ASSERT(strstr(body, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == NULL);
+        /* The verdict and the rc the client came for are still there. */
+        ASSERT(strstr(body, "gate=gate-refused\n") != NULL);
+        ASSERT(strstr(body, "rc=1\n") != NULL);
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("a well-formed row keeps the byte-exact format")
+    {
+        struct wkr_drive_opts o;
+        char body[4096];
+        const char *expect =
+            "ref=wtx-exact\nworker=wtx\nsession=s-exact\nmodel=\n"
+            "attempt=1\nterminal=pass\ncandidate=cand.diff\ngate=pass\n"
+            "rc=0\ntokens=42\nwall_ms=";
+        const char *tail;
+        size_t k = 0;
+        wtx_isolate("mexact");
+        wtx_queue_post("wtx-exact");
+        (void)remove(g_fx_count);
+        g_fx_mode = 0;
+        (void)snprintf(g_fx_terminal, sizeof(g_fx_terminal), "%s", "pass");
+        g_fx_rc = 0;
+        g_fx_candidate = true;
+        wtx_opts(&o, "wtx", "s-exact");
+        ASSERT_EQ(zcl_devagent_worker_drive(&o, wtx_fixture), 1);
+        ASSERT(wtx_mail_body("wtx-exact", body, sizeof(body)));
+        /* Other code parses these lines: the safe path adds nothing and
+         * moves nothing. Only wall_ms is a measured number. */
+        ASSERT(strncmp(body, expect, strlen(expect)) == 0);
+        tail = body + strlen(expect);
+        while (tail[k] >= '0' && tail[k] <= '9')
+            k++;
+        ASSERT(k > 0);
+        ASSERT_STR_EQ(tail + k, "\n");
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("a refused result post is recorded, never silent")
+    {
+        char body[4096];
+        /* A candidate the safe shape admits but the mail leaf refuses on
+         * its own admission rule. The row is lost; the loss is not. */
+        ASSERT(!wtx_hostile_run("mrefused", "wtx-refused", "privkey", body,
+                                sizeof(body)));
+        ASSERT(!wtx_mail_has("wtx-refused", "ref=wtx-refused"));
+        ASSERT(wtx_runout_has("wtx-refused", 1, "result-mail-refused="));
+        ASSERT(wtx_runout_has("wtx-refused", 1, "MAIL_REFUSED_KEY"));
+        /* The outcome row keeps its rc and its evidence. */
+        ASSERT(wtx_runout_has("wtx-refused", 1, "rc=1\n"));
+        ASSERT(wtx_runout_has("wtx-refused", 1, "fixture receipt"));
         wtx_restore();
         PASS();
     }
