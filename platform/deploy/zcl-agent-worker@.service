@@ -35,12 +35,23 @@ Description=Z23 resident unit-queue worker for agent identity %i (claims one job
 # `systemctl --user enable` refuses until the operator adds one on purpose.
 #
 # Install (the operator does this, never an agent):
+#   ln -sf /path/to/the/qualified/build/bin/z23-dev ~/.local/bin/z23-dev
 #   cp platform/deploy/zcl-agent-worker@.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user start zcl-agent-worker@resident-a
 #   systemctl --user status zcl-agent-worker@resident-a
 #   journalctl --user -u zcl-agent-worker@resident-a -f
 #   z23-dev dev agent worker status --worker=resident-a
+#
+# THE LINK STEP IS NOT OPTIONAL BOILERPLATE. ExecStart below runs
+# %h/.local/bin/z23-dev rather than a checkout's build/bin/z23-dev because
+# this unit exists to run a QUALIFIED image, and a hardcoded checkout path
+# cannot promise that: the checkout it points at can be dirty, mid-rebuild,
+# or simply behind whatever tree actually passed the gate, and the binary
+# sitting in its build directory proves nothing about what produced it. The
+# operator makes the link name a known source identity on purpose, the same
+# way this host already does for the release binary — see the ExecStart
+# comment below.
 #
 # Linger, so the worker survives logout like every other resident service:
 #   loginctl enable-linger "$USER"
@@ -133,7 +144,26 @@ OOMScoreAdjust=500
 # ceiling is 86400. --idle_limit_s=600 is likewise the maximum, so an empty
 # queue parks for ten minutes rather than the 60s default before the drive
 # ends.
-ExecStart=%h/github/zclassic23/build/bin/z23-dev dev agent worker run --worker=%i --deadline_s=3600 --idle_limit_s=600 --time_cap_s=600 --token_cap=200000 --mem_mb=1024
+#
+# THE BINARY IS THE CONTENT-ADDRESSED INSTALL LINK, NOT A CHECKOUT'S BUILD
+# OUTPUT. %h/.local/bin/z23 already works this way for the release binary on
+# this host: it is a symlink into %h/.local/lib/z23/<sha256-of-the-built-
+# binary>/z23, so the link name stays put while the target names the exact
+# bytes that produced it. %h/.local/bin/z23-dev is the same mechanism for
+# the dev binary, and the operator points it at one qualified build before
+# starting this unit (see the Install block above). A hardcoded
+# %h/github/zclassic23/build/bin/z23-dev cannot make that promise: that
+# checkout is the operator's own working tree, it is routinely dirty, and
+# its build/bin/z23-dev can be hours stale relative to whatever tree was
+# actually gated — running that path would bind every claimed job to
+# whatever happens to be sitting in a dirty checkout's build directory
+# rather than to a known source identity. %h/.local/bin is already first on
+# PATH above for exactly the same reason `muse` needs it there. ExecStart's
+# first token must stay a literal absolute path — %h is a systemd
+# specifier, not an environment variable, so systemd expands it before
+# argv[0] is ever built, while an `${VAR}`-style indirection there is
+# refused outright.
+ExecStart=%h/.local/bin/z23-dev dev agent worker run --worker=%i --deadline_s=3600 --idle_limit_s=600 --time_cap_s=600 --token_cap=200000 --mem_mb=1024
 
 # Restart=always, NOT on-failure, AND THAT IS THE WHOLE POINT. This loop
 # exits with status 0 by design — at the deadline above, at the idle limit,
@@ -166,11 +196,22 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 # Exactly the paths a drive writes: this box's owner-private dev state root
-# (queue rows, claims, run dirs, receipts, mail outbox), the checkout, whose
-# build directory holds the dev binary's own lock and telemetry files, and
-# the lane root, because the claimed workspace a row names is a lane
-# worktree and the model turn edits it. It never writes a datadir and never
-# reads one.
+# (queue rows, claims, run dirs, receipts, mail outbox, and the worker's own
+# worker.lock), the checkout, and the lane root, because the claimed
+# workspace a row names is a lane worktree and the model turn edits it. It
+# never writes a datadir and never reads one.
+#
+# CHECKED, NOT ASSUMED: the dev binary does not write beside itself.
+# tools/command/native_devagent_worker.c resolves worker.lock and every
+# other state file it touches (wkr_state_dir) through platform_state_root(),
+# which lands under the FIRST path above (%h/.local/state/z23) regardless of
+# where the binary that is running lives. Now that ExecStart runs the
+# content-addressed link under %h/.local/bin rather than the checkout's
+# build directory, nothing here needed to move: the install store at
+# %h/.local/lib/z23/<sha256>/ is deliberately left OUT of ReadWritePaths,
+# because it is never written by this drive, and it staying read-only under
+# ProtectHome's default is exactly the fail-closed behavior this file wants
+# — widening it would hide a bug rather than fix one.
 #
 # A row naming a workspace outside these paths fails on a read-only
 # filesystem instead of being written — fail-closed, and visible in the
