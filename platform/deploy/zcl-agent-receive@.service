@@ -105,7 +105,7 @@ OOMScoreAdjust=500
 # editing this file:
 #   systemctl --user edit zcl-agent-receive@box-a
 #   [Service]
-#   Environment=Z23_RECEIVE_WORKSPACE=/home/you/.z23/lanes/yourlane
+#   Environment=Z23_RECEIVE_WORKSPACE=%h/.z23/lanes/yourlane
 #
 # Leave it empty and the receiver is simply unconfigured: it still admits an
 # absolute same-box direction, and it refuses every selector directive with

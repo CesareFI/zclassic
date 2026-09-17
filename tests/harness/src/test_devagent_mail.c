@@ -689,7 +689,7 @@ int test_devagent_mail(void)
     TEST("mail: a Windows drive path is still refused") {
         struct dvx_call c;
         dvx_isolate("drive");
-        dvx_post(&c, "alice", "*", "note", "copied to C:\\Users\\rhett\\x");
+        dvx_post(&c, "alice", "*", "note", "copied to C:\\Windows\\Temp\\x");
         ASSERT(dvx_run(&c));
         ASSERT(!dvx_ok(&c));
         ASSERT(strstr(c.reply.error.code, "PATH") != NULL);
