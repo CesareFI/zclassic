@@ -276,6 +276,25 @@ size_t hrs_release_peer(struct header_range_scheduler *s, int32_t peer_id)
     return released;
 }
 
+bool hrs_note_peer_progress(struct header_range_scheduler *s, int32_t peer_id,
+                            int64_t now_us)
+{
+    if (!s || !s->inited)
+        return false;
+    bool renewed = false;
+    zcl_mutex_lock(&s->lock);
+    for (size_t i = 0; i < s->n_spans; i++) {
+        if (s->spans[i].assigned && !s->spans[i].completed &&
+            s->spans[i].peer_id == peer_id) {
+            s->spans[i].deadline_us = now_us + s->span_timeout_us;
+            renewed = true;
+            break;
+        }
+    }
+    zcl_mutex_unlock(&s->lock);
+    return renewed;
+}
+
 bool hrs_peer_span(struct header_range_scheduler *s, int32_t peer_id,
                    int64_t now_us, int32_t *out_lo, int32_t *out_hi)
 {

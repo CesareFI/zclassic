@@ -136,6 +136,11 @@ size_t hrs_sweep_expired(struct header_range_scheduler *s, int64_t now_us,
  * (normally 0 or 1). Empty replies are not protocol offences. */
 size_t hrs_release_peer(struct header_range_scheduler *s, int32_t peer_id);
 
+/* Renew the deadline for a live span after its owner delivers accepted
+ * headers. Returns true iff that peer still owns a span. */
+bool hrs_note_peer_progress(struct header_range_scheduler *s, int32_t peer_id,
+                            int64_t now_us);
+
 /* Report the live span currently held by peer_id. Returns true and fills
  * out_lo/out_hi iff the peer holds an assigned, not-yet-expired span. */
 bool hrs_peer_span(struct header_range_scheduler *s, int32_t peer_id,

@@ -58,13 +58,13 @@ static int test_continuation_preserves_stop(void)
     struct header_range_scheduler *s = header_range_scheduler_global();
     int32_t lo = cp->checkpointData.entries[0].height;
     int32_t hi = cp->checkpointData.entries[1].height;
-    int64_t now_s = 1000;
+    int64_t now_us = 1000 * 1000000LL;
     hrs_plan(s, lo, hi, NULL, 0);
-    bool ok = hrs_assign(s, node.id, now_s * 1000000) >= 0;
+    bool ok = hrs_assign(s, node.id, now_us) >= 0;
     struct uint256 stop = {0};
     struct uint256 expected = {0};
     ok = ok && checkpoints_hash_at_height(&cp->checkpointData, hi, &expected);
-    ok = ok && msg_range_continuation_stop(&mp, &node, lo, now_s, &stop);
+    ok = ok && msg_range_continuation_stop(&mp, &node, lo, now_us, &stop);
     ok = ok && uint256_eq(&stop, &expected);
 
     header_range_scheduler_reset_for_testing();
@@ -118,12 +118,37 @@ static int test_disconnect_releases_span(void)
     return ok ? 0 : 1;
 }
 
+static int test_progress_renews_deadline(void)
+{
+    printf("header_range_sched: progress renews monotonic deadline... ");
+    struct header_range_scheduler s = {0};
+    int64_t t0 = 1000 * 1000000LL;
+    hrs_init(&s, 30 * 1000000LL);
+    hrs_plan(&s, 0, 50000, NULL, 0);
+    bool ok = hrs_assign(&s, 55, t0) >= 0;
+
+    int64_t progress = t0 + 29 * 1000000LL;
+    ok = ok && hrs_note_peer_progress(&s, 55, progress);
+    int32_t stalled[1] = {0};
+    ok = ok && hrs_sweep_expired(&s, t0 + 31 * 1000000LL,
+                                 stalled, 1) == 0;
+    ok = ok && hrs_peer_span(&s, 55, t0 + 31 * 1000000LL, NULL, NULL);
+    ok = ok && hrs_sweep_expired(&s, progress + 30 * 1000000LL,
+                                 stalled, 1) == 1;
+    ok = ok && stalled[0] == 55;
+
+    hrs_reset(&s);
+    if (ok) printf("OK\n"); else printf("FAIL\n");
+    return ok ? 0 : 1;
+}
+
 int test_header_range_sched(void)
 {
     int failures = 0;
     failures += test_empty_reply_releases_span();
     failures += test_disconnect_releases_span();
     failures += test_continuation_preserves_stop();
+    failures += test_progress_renews_deadline();
 
     /* ── 1. Parallelize gate ─────────────────────────────────────── */
     printf("header_range_sched: should_parallelize gate... ");

@@ -312,11 +312,11 @@ void push_getheaders_span(struct msg_processor *mp, struct p2p_node *node,
 bool msg_range_continuation_stop(struct msg_processor *mp,
                                  struct p2p_node *node,
                                  int our_height,
-                                 int64_t now_seconds,
+                                 int64_t now_us,
                                  struct uint256 *stop_hash);
 bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
                                        struct p2p_node *node,
-                                       int our_height, int64_t now_seconds);
+                                       int our_height, int64_t now_us);
 
 /* msg_blocks.c — block handling */
 enum { GETBLOCKS_INV_LIMIT = 500 };

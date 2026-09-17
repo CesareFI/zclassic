@@ -1282,6 +1282,14 @@ static void hrs_release_terminal_response(struct p2p_node *node,
                     (unsigned long long)count);
 }
 
+static void hrs_note_response_progress(struct p2p_node *node, size_t accepted)
+{
+    if (accepted == 0)
+        return;
+    (void)hrs_note_peer_progress(header_range_scheduler_global(), node->id,
+                                 platform_time_monotonic_us());
+}
+
 size_t mp_header_range_peer_disconnected(uint32_t peer_id)
 {
     return hrs_release_peer(header_range_scheduler_global(), (int32_t)peer_id);
@@ -1545,6 +1553,7 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                                        pindex_last, sync_get_state(),
                                        bi, tip, our_height,
                                        hashes, heights, max_collect);
+        hrs_note_response_progress(node, accepted);
         hrs_release_terminal_response(node, &header_plan.batch,
                                       accepted, count);
         if (seq_count > 0 && hashes && heights) {
@@ -2200,14 +2209,14 @@ static bool hrs_resolve_anchor_hash(struct msg_processor *mp, int32_t height,
 bool msg_range_continuation_stop(struct msg_processor *mp,
                                  struct p2p_node *node,
                                  int our_height,
-                                 int64_t now_seconds,
+                                 int64_t now_us,
                                  struct uint256 *stop_hash)
 {
     int32_t hi = 0;
-    if (!mp || !node || !stop_hash || now_seconds < 0)
+    if (!mp || !node || !stop_hash || now_us < 0)
         return false;
     if (!hrs_peer_span(header_range_scheduler_global(), node->id,
-                       now_seconds * 1000000, NULL, &hi))
+                       now_us, NULL, &hi))
         return false;
     return hrs_resolve_anchor_hash(mp, hi, our_height, stop_hash);
 }
@@ -2218,9 +2227,9 @@ static void push_getheaders_followup(struct msg_processor *mp,
                                      int our_height)
 {
     struct uint256 stop_hash;
-    int64_t now_s = (int64_t)platform_time_wall_time_t();
+    int64_t now_us = platform_time_monotonic_us();
     if (from && from->phashBlock &&
-        msg_range_continuation_stop(mp, node, our_height, now_s,
+        msg_range_continuation_stop(mp, node, our_height, now_us,
                                     &stop_hash)) {
         push_getheaders_span(mp, node, from->phashBlock, &stop_hash);
         return;
@@ -2230,7 +2239,7 @@ static void push_getheaders_followup(struct msg_processor *mp,
 
 bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
                                        struct p2p_node *node,
-                                       int our_height, int64_t now_seconds)
+                                       int our_height, int64_t now_us)
 {
     if (!mp || !node || !mp->main_state || !mp->net_mgr || !mp->params)
         return false;
@@ -2285,8 +2294,6 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
 
     struct header_range_scheduler *sched = header_range_scheduler_global();
     hrs_plan(sched, (int32_t)our_height, target, anchors, n_anchors);
-
-    int64_t now_us = now_seconds * 1000000;
 
     /* Advance completions from our current header frontier so already-synced
      * spans free their peer slots before we (re)assign. */
