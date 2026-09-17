@@ -1734,6 +1734,7 @@ static void *thread_socket_handler(void *arg)
                     dl_peer_disconnected(msg_get_download_mgr(),
                                           (uint32_t)node->id);
                     mp_block_swarm_peer_disconnected((uint32_t)node->id);
+                    mp_header_range_peer_disconnected((uint32_t)node->id);
                 }
 
                 /* Force disconnect — bypass transition validator since this

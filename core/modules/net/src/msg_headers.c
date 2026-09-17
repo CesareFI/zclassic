@@ -1272,6 +1272,11 @@ static void hrs_release_empty_response(struct p2p_node *node, uint64_t count)
                     "empty header response released range span");
 }
 
+size_t mp_header_range_peer_disconnected(uint32_t peer_id)
+{
+    return hrs_release_peer(header_range_scheduler_global(), (int32_t)peer_id);
+}
+
 bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                      struct byte_stream *s)
 {

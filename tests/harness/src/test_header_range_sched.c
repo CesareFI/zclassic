@@ -37,6 +37,7 @@
  */
 
 #include "test/test_core.h"
+#include "net/download.h"
 #include "services/header_range_scheduler.h"
 
 static int test_empty_reply_releases_span(void)
@@ -64,10 +65,31 @@ static int test_empty_reply_releases_span(void)
     return ok ? 0 : 1;
 }
 
+static int test_disconnect_releases_span(void)
+{
+    printf("header_range_sched: disconnect releases span immediately... ");
+    header_range_scheduler_reset_for_testing();
+    struct header_range_scheduler *s = header_range_scheduler_global();
+    int32_t anchors[] = {50000};
+    int64_t now = 1000000;
+    hrs_plan(s, 0, 100000, anchors, 1);
+    int first = hrs_assign(s, 33, now);
+
+    bool ok = first >= 0 && hrs_peer_span(s, 33, now, NULL, NULL);
+    ok = ok && mp_header_range_peer_disconnected(33) == 1;
+    ok = ok && !hrs_peer_span(s, 33, now, NULL, NULL);
+    ok = ok && hrs_assign(s, 44, now) == first;
+    ok = ok && mp_header_range_peer_disconnected(33) == 0;
+    header_range_scheduler_reset_for_testing();
+    if (ok) printf("OK\n"); else printf("FAIL\n");
+    return ok ? 0 : 1;
+}
+
 int test_header_range_sched(void)
 {
     int failures = 0;
     failures += test_empty_reply_releases_span();
+    failures += test_disconnect_releases_span();
 
     /* ── 1. Parallelize gate ─────────────────────────────────────── */
     printf("header_range_sched: should_parallelize gate... ");
