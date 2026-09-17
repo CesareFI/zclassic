@@ -48,13 +48,33 @@
  * duplicate work. A different payload under an already-recorded key is
  * refused per-item as IDEMPOTENCY_CONFLICT: the key names one exact
  * delivery, never two. The recorded ref+grant let revoke cancel exactly
- * the queued work its grant sent.
+ * the queued work its grant sent. The reply's top-level `accepted` counts
+ * only items whose result state is not "refused" (a reconciled duplicate
+ * counts, a fresh IDEMPOTENCY_CONFLICT/BAD_INPUT/mail refusal does not) —
+ * it is never just the item-result count.
  *
- * STATES. queued (send accepted into the outbox), delivered (visible in
- * pull), acknowledged (seq at or below the receiver's mail ack cursor),
- * completed (a queue outcome names the ref with an explicit pass verdict
- * and rc 0). Four different facts; absence of evidence is
- * reported as the earlier state, never skipped ahead.
+ * STATES. queued, delivered, acknowledged, completed — four different
+ * facts; absence of evidence is reported as the earlier state, never
+ * skipped ahead. The closed vocabulary never grows.
+ *
+ * The sender's own outbox is ALWAYS inside the sender's own pull, so
+ * "visible in pull" is no evidence at all that a directive this host sent
+ * ever left this machine. So the rule splits on who wrote the row:
+ *   - A row THIS host sent through steer — its seq and recipient are
+ *     recorded in <state>/steer/sent.jsonl — is "queued" until there is
+ *     RECEIVER evidence, and never "delivered". Either of two facts
+ *     promotes it straight to "acknowledged": (a) a mail row whose `from`
+ *     is the sent row's `to` carrying the SAME ref, which is what a
+ *     transport brings back into an inbox.<peer>.jsonl file, or (b) the
+ *     local ack cursor <state>/mail/cursor.<to> covering its seq, which is
+ *     how a receiver on THIS host acks. Both are the receiver's own
+ *     writing; the sender can forge neither by posting.
+ *   - Every other row — an inbound row a transport delivered here, an
+ *     ordinary local post — reads as before: "delivered", because it
+ *     really is visible where its reader reads, and "acknowledged" once
+ *     the ack cursor covers it.
+ * "completed" is resolved for either kind from a retained queue outcome
+ * naming the ref with an explicit pass verdict and rc 0.
  *
  * STATE. <platform_state_root()>/steer (0700): grants.jsonl, sent.jsonl.
  * Single O_APPEND writes; revoke appends a superseding revoked row like
@@ -532,6 +552,49 @@ static bool fmc_sent_find(const char *path, const char *key, long long *seq,
     return found;
 }
 
+/* Read-only path of this host's send receipts. Unlike fmc_dirs this creates
+ * nothing: the brief and evidence are reads, and an absent file simply
+ * means this host has sent nothing through steer. */
+static bool fmc_sent_path_read(char *out, size_t cap)
+{
+    char root[4096];
+    int n;
+    if (!out || cap == 0)
+        return false;
+    if (!platform_state_root(root, sizeof(root)))
+        return false;
+    n = snprintf(out, cap, "%s/steer/sent.jsonl", root);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* True when THIS host sent that exact mail row through steer: one
+ * sent.jsonl receipt recording the same seq and the same recipient. The
+ * recipient is compared too because inbox.<peer>.jsonl rows carry the
+ * peer's own seq numbering, so seq alone could collide with ours. Such a
+ * row is never reported "delivered" on the strength of our own outbox. */
+static bool fmc_sent_by_us(const char *path, long long seq, const char *to)
+{
+    FILE *f;
+    char line[FMC_LINE_CAP];
+    char rto[FMC_NAME_MAX + 1];
+    long long rseq = -1;
+    bool ours = false;
+    if (!path || !path[0] || seq < 0 || !to || !to[0])
+        return false;
+    f = fopen(path, "rb");
+    if (!f)
+        return false;
+    while (!ours && fgets(line, sizeof(line), f)) {
+        if (!fmc_grant_line_int(line, "seq", &rseq) || rseq != seq)
+            continue;
+        if (!fmc_grant_line_str(line, "to", rto, sizeof(rto)))
+            continue;
+        ours = strcmp(rto, to) == 0;
+    }
+    (void)fclose(f);
+    return ours;
+}
+
 /* ── in-process sibling calls ────────────────────────────────────────────
  *
  * Each sibling validates its own input and enforces its own permissions.
@@ -781,16 +844,65 @@ static void fmc_row_tally(struct json_value *agents, struct json_value *work,
     }
 }
 
-/* One bounded change row. delivered is established (the row is in pull);
- * acknowledged iff the receiver's cursor covers it; completed is resolved
- * later against queue outcomes and board results. */
-static void fmc_row_change(struct json_value *changes, const struct fmc_row *v)
+/* True when the pulled rows carry a reply from this row's recipient under
+ * the same ref: the row a transport brings back into inbox.<peer>.jsonl,
+ * and the only proof available here that the directive left this host. A
+ * row whose `from` is our own sender name is our side of the thread, never
+ * receiver evidence — so a directive addressed to its own sender cannot
+ * promote itself. Bounded by the pull the brief already holds; nothing is
+ * accumulated. */
+static bool fmc_rows_reply_from(const struct json_value *rows,
+                                const struct fmc_row *v)
+{
+    size_t n, i;
+    if (!rows || rows->type != JSON_ARR || !v || !v->ref[0] || !v->to[0])
+        return false;
+    n = json_size(rows);
+    for (i = 0; i < n; i++) {
+        struct fmc_row r;
+        if (!fmc_row_parse(json_at(rows, i), &r))
+            continue;
+        if (strcmp(r.from, v->from) == 0)
+            continue;
+        if (strcmp(r.from, v->to) == 0 && strcmp(r.ref, v->ref) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* One row's lifecycle state, per the STATES rule at the top of this file.
+ *
+ * A row this host sent through steer is "queued" until the RECEIVER has
+ * written something: its reply under the same ref, or the local ack cursor.
+ * It is never "delivered", because the sender's own outbox is always in the
+ * sender's own pull — reporting delivery from it would claim a transport
+ * that may never have run. Any other row (inbound from a transport, an
+ * ordinary local post) is genuinely visible where its reader reads, so it
+ * stays "delivered" and upgrades on the cursor. "completed" is resolved
+ * later against queue outcomes. */
+static const char *fmc_row_state(const struct fmc_row *v,
+                                 const struct json_value *rows,
+                                 const char *sent_path)
+{
+    long long ack = fmc_ack_cursor(v->to);
+    bool acked = ack >= 0 && v->seq <= ack;
+    if (!fmc_sent_by_us(sent_path, v->seq, v->to))
+        return acked ? "acknowledged" : "delivered";
+    if (acked || fmc_rows_reply_from(rows, v))
+        return "acknowledged";
+    return "queued";
+}
+
+/* One bounded change row, carrying the state fmc_row_state resolves from
+ * receiver evidence; completed is resolved later against queue outcomes
+ * and board results. */
+static void fmc_row_change(struct json_value *changes, const struct fmc_row *v,
+                           const struct json_value *rows,
+                           const char *sent_path)
 {
     struct json_value item;
     char lead[FMC_LEAD_MAX + 1];
-    long long ack = fmc_ack_cursor(v->to);
-    const char *state = (ack >= 0 && v->seq <= ack) ? "acknowledged"
-                                                    : "delivered";
+    const char *state = fmc_row_state(v, rows, sent_path);
     json_init(&item);
     json_set_object(&item);
     fmc_lead(v->body, lead, sizeof(lead));
@@ -815,11 +927,14 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
 {
     struct fmc_sub sub;
     const struct json_value *rows;
+    char sent_path[4096 + 32];
     size_t n, i;
     long long shown = 0;
     int64_t t0, t1;
     view->cursor = -1;
     view->count = 0;
+    if (!fmc_sent_path_read(sent_path, sizeof(sent_path)))
+        sent_path[0] = '\0';
     fmc_sub_begin(&sub, "zcl.agent_mail.v1", req, "dev.agent.mail");
     if (!sub.valid) {
         fmc_note_missing(missing, "dev.agent.mail", "unknown_sibling", 0);
@@ -858,7 +973,7 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
         fmc_row_tally(agents, work, &v);
         if (v.seq <= since || shown >= changes_cap)
             continue;
-        fmc_row_change(changes, &v);
+        fmc_row_change(changes, &v, rows, sent_path);
         shown++;
     }
     fmc_sub_end(&sub);
@@ -1558,8 +1673,10 @@ static void fmc_send_item_accept(struct json_value *items, size_t index,
 }
 
 /* One send item: validate, reconcile idempotency, post, record. Emits its
- * result object onto items[]. */
-static void fmc_send_item(const struct zcl_command_request *req,
+ * result object onto items[]. Returns true iff the item's state is an
+ * accept (fresh or duplicate), false for every refused state — the
+ * caller sums this to report `accepted` honestly. */
+static bool fmc_send_item(const struct zcl_command_request *req,
                           const struct json_value *it, size_t index,
                           const char *from, const char *sent_path,
                           const char *grant, struct json_value *items)
@@ -1571,7 +1688,7 @@ static void fmc_send_item(const struct zcl_command_request *req,
         const char *to =
             (it && it->type == JSON_OBJ) ? fmc_item_str(it, "to") : NULL;
         fmc_send_item_refused(items, index, to, "BAD_INPUT");
-        return;
+        return false;
     }
     /* Reconcile: same key AND same payload returns the recorded accept
      * with no second row. A different payload under a recorded key is
@@ -1584,14 +1701,14 @@ static void fmc_send_item(const struct zcl_command_request *req,
             if (recorded[0] && strcmp(recorded, presented) == 0) {
                 fmc_send_item_accept(items, index, &f, seq, true, sent_path,
                                      from, grant);
-                return;
+                return true;
             }
             LOG_ERROR(FMC_LOG,
                       "send: payload conflict under key (to=%s seq=%lld)",
                       f.to, seq);
             fmc_send_item_refused(items, index, f.to,
                                   "IDEMPOTENCY_CONFLICT");
-            return;
+            return false;
         }
     }
     why[0] = '\0';
@@ -1600,10 +1717,11 @@ static void fmc_send_item(const struct zcl_command_request *req,
     if (seq < 0) {
         fmc_send_item_refused(items, index, f.to,
                               why[0] ? why : "POST_FAILED");
-        return;
+        return false;
     }
     fmc_send_item_accept(items, index, &f, seq, false, sent_path, from,
                          grant);
+    return true;
 }
 
 static void fmc_do_send(const struct zcl_command_request *req,
@@ -1644,15 +1762,23 @@ static void fmc_do_send(const struct zcl_command_request *req,
                  steerdir);
         return;
     }
-    json_init(&items);
-    json_set_array(&items);
-    for (i = 0; i < n; i++)
-        fmc_send_item(req, json_at(arr, i), i, from, sent_path, grant,
-                      &items);
-    (void)json_push_kv_str(&reply->data, "leaf", FMC_LEAF);
-    (void)json_push_kv(&reply->data, "items", &items);
-    (void)json_push_kv_int(&reply->data, "accepted",
-                           (long long)json_size(&items));
+    {
+        long long accepted = 0;
+        json_init(&items);
+        json_set_array(&items);
+        for (i = 0; i < n; i++) {
+            if (fmc_send_item(req, json_at(arr, i), i, from, sent_path,
+                              grant, &items))
+                accepted++;
+        }
+        (void)json_push_kv_str(&reply->data, "leaf", FMC_LEAF);
+        (void)json_push_kv(&reply->data, "items", &items);
+        /* `accepted` counts only items whose result state is not
+         * "refused" (a reconciled duplicate counts: it is the recorded
+         * accept, not a new one) — never the item-result count, which a
+         * remote client would otherwise mistake for delivery. */
+        (void)json_push_kv_int(&reply->data, "accepted", accepted);
+    }
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
     json_free(&items);
@@ -1663,27 +1789,31 @@ static void fmc_do_send(const struct zcl_command_request *req,
  * One bounded object by exact reference, never a log: a mail row with
  * ref==ref, a queue row/outcome with name==ref, or one board post by id. */
 
-/* Receiver acknowledgement for one mail row: the row's seq against the
- * receiver's mail ack cursor via fmc_ack_cursor (the same read the brief's
- * lifecycle uses). acknowledged when the cursor covers the row, delivered
- * when the row is visible but the cursor does not cover it. */
+/* Lifecycle state for one mail row, resolved by exactly the rule the
+ * brief's changes[] uses (fmc_row_state), so the two never disagree about
+ * the same row: a row this host sent through steer reads "queued" until
+ * the recipient replies under the same ref or the local ack cursor covers
+ * it, and is never called "delivered" from the sender's own outbox; any
+ * other row reads "delivered", or "acknowledged" on the cursor.
+ * `ack_cursor` still reports the receiver cursor itself so the caller can
+ * check the promotion, and an unparseable row reports the earliest state
+ * rather than guessing. `rows` is the pull this lookup already holds. */
 static void fmc_evidence_mail_ack(struct zcl_command_reply *reply,
-                                  const struct json_value *r)
+                                  const struct json_value *r,
+                                  const struct json_value *rows)
 {
-    const struct json_value *v;
-    const char *to;
-    long long seq = -1, cursor;
-    v = json_get(r, "seq");
-    if (v && v->type == JSON_INT)
-        seq = (long long)json_get_int(v);
-    v = json_get(r, "to");
-    to = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-    cursor = fmc_ack_cursor(to);
-    (void)json_push_kv_int(&reply->data, "ack_cursor", cursor);
+    struct fmc_row v;
+    char sent_path[4096 + 32];
+    if (!fmc_row_parse(r, &v)) {
+        (void)json_push_kv_int(&reply->data, "ack_cursor", -1);
+        (void)json_push_kv_str(&reply->data, "state", "queued");
+        return;
+    }
+    if (!fmc_sent_path_read(sent_path, sizeof(sent_path)))
+        sent_path[0] = '\0';
+    (void)json_push_kv_int(&reply->data, "ack_cursor", fmc_ack_cursor(v.to));
     (void)json_push_kv_str(&reply->data, "state",
-                           (cursor >= 0 && seq >= 0 && cursor >= seq)
-                               ? "acknowledged"
-                               : "delivered");
+                           fmc_row_state(&v, rows, sent_path));
 }
 
 /* Copy one whole JSON value onto the reply under "object". The sources are
@@ -1745,7 +1875,7 @@ static void fmc_evidence_mail(const struct zcl_command_request *req,
         }
         if (hit) {
             fmc_emit_object(reply, "mail", hit);
-            fmc_evidence_mail_ack(reply, hit);
+            fmc_evidence_mail_ack(reply, hit, rows);
             fmc_sub_end(&sub);
             return;
         }

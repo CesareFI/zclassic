@@ -193,6 +193,13 @@ static const struct json_value *fmx_arr(const struct fmx_call *c,
     return v && v->type == JSON_ARR ? v : NULL;
 }
 
+/* Integer reply field, or -1 when absent/wrong-typed. */
+static long long fmx_int(const struct fmx_call *c, const char *key)
+{
+    const struct json_value *v = fmx_get(c, key);
+    return v && v->type == JSON_INT ? json_get_int(v) : -1;
+}
+
 /* True when missing[] names the given source. */
 static bool fmx_missing_has(const struct fmx_call *c, const char *source)
 {
@@ -256,6 +263,19 @@ static bool fmx_send(struct fmx_call *c, const char *grant,
     fmx_begin(c, FMX_SEND_PATH, "zcl.fleet_steer_send.v1");
     if (grant)
         (void)json_push_kv_str(&c->input, "grant", grant);
+    (void)json_push_kv(&c->input, "items", items);
+    return fmx_run(c, zcl_native_handle_fleet_steer_send);
+}
+
+/* Send one batch under an explicit sender name, so a case can address a
+ * reply row back at the sender the way a real recipient would. */
+static bool fmx_send_from(struct fmx_call *c, const char *grant,
+                          const char *from, struct json_value *items)
+{
+    fmx_begin(c, FMX_SEND_PATH, "zcl.fleet_steer_send.v1");
+    if (grant)
+        (void)json_push_kv_str(&c->input, "grant", grant);
+    (void)json_push_kv_str(&c->input, "from", from);
     (void)json_push_kv(&c->input, "items", items);
     return fmx_run(c, zcl_native_handle_fleet_steer_send);
 }
@@ -353,6 +373,99 @@ static void fmx_seed_outcome(const char *name)
         fmx_fixture_fail("cannot write outcome row");
     if (fclose(f) != 0)
         fmx_fixture_fail("cannot finish outcome row");
+}
+
+/* Drop one row into <state>/mail/inbox.<peer>.jsonl — exactly what a
+ * transport does when it carries a peer's row onto this host, and the only
+ * way a row this host did not write appears in pull. The shape is the mail
+ * leaf's own row; `ts` is the caller's so pull order (ts, from, seq) stays
+ * deterministic without a sleep. */
+static void fmx_seed_inbox(const char *peer, const char *ts, long long seq,
+                           const char *from, const char *to,
+                           const char *kind, const char *body,
+                           const char *ref)
+{
+    char dir[1024], path[1200];
+    int n = snprintf(dir, sizeof(dir), "%s/z23/dev/mail", g_fmx_state);
+    if (n <= 0 || (size_t)n >= sizeof(dir))
+        fmx_fixture_fail("mail dir exceeds bound");
+    if (!platform_private_directory_ensure(dir))
+        fmx_fixture_fail("cannot create isolated mail dir");
+    n = snprintf(path, sizeof(path), "%s/inbox.%s.jsonl", dir, peer);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        fmx_fixture_fail("inbox path exceeds bound");
+    FILE *f = fopen(path, "a");
+    if (!f)
+        fmx_fixture_fail("cannot seed an inbox row");
+    if (fprintf(f,
+                "{\"seq\":%lld,\"ts\":\"%s\",\"from\":\"%s\",\"to\":\"%s\","
+                "\"kind\":\"%s\",\"body\":\"%s\",\"ref\":\"%s\"}\n",
+                seq, ts, from, to, kind, body, ref) < 0)
+        fmx_fixture_fail("cannot write an inbox row");
+    if (fclose(f) != 0)
+        fmx_fixture_fail("cannot finish an inbox row");
+}
+
+/* The state the brief reports for the change row `from` wrote under `ref`,
+ * or "" when the brief shows no such row. Matching on both fields keeps a
+ * directive and the reply that shares its ref apart. */
+static const char *fmx_change_state(const struct json_value *changes,
+                                    const char *from, const char *ref)
+{
+    size_t n, i;
+    if (!changes || changes->type != JSON_ARR)
+        return "";
+    n = json_size(changes);
+    for (i = 0; i < n; i++) {
+        const struct json_value *ch = json_at(changes, i);
+        const struct json_value *v;
+        if (!ch || ch->type != JSON_OBJ)
+            continue;
+        v = json_get(ch, "from");
+        if (!v || v->type != JSON_STR || strcmp(json_get_str(v), from) != 0)
+            continue;
+        v = json_get(ch, "ref");
+        if (!v || v->type != JSON_STR || strcmp(json_get_str(v), ref) != 0)
+            continue;
+        v = json_get(ch, "state");
+        return (v && v->type == JSON_STR && json_get_str(v)) ? json_get_str(v)
+                                                             : "";
+    }
+    return "";
+}
+
+/* One string field of the bounded evidence object. */
+static const char *fmx_obj_str(const struct fmx_call *e, const char *key)
+{
+    const struct json_value *obj = json_get(&e->reply.data, "object");
+    const struct json_value *v = obj ? json_get(obj, key) : NULL;
+    return v && v->type == JSON_STR && json_get_str(v) ? json_get_str(v) : "";
+}
+
+/* True when evidence for `ref` reports `want` AND the brief reports the
+ * same state for that very row (matched by the evidence object's own from
+ * and ref). The two surfaces must never disagree about one row. */
+static bool fmx_state_agrees(const char *gid, const char *ref,
+                             const char *want)
+{
+    struct fmx_call b, e;
+    bool ok = false;
+    fmx_brief(&b, gid, 0);
+    if (!fmx_run(&b, zcl_native_handle_fleet_steer_brief) || !fmx_ok(&b)) {
+        fmx_end(&b);
+        return false;
+    }
+    fmx_evidence(&e, gid, "mail", ref);
+    if (fmx_run(&e, zcl_native_handle_fleet_steer_evidence) && fmx_ok(&e)) {
+        const char *estate = fmx_str(&e, "state");
+        const char *bstate = fmx_change_state(fmx_arr(&b, "changes"),
+                                              fmx_obj_str(&e, "from"),
+                                              fmx_obj_str(&e, "ref"));
+        ok = strcmp(estate, want) == 0 && strcmp(bstate, want) == 0;
+    }
+    fmx_end(&e);
+    fmx_end(&b);
+    return ok;
 }
 
 /* Craft one expired grant row: expiry honors the wall clock, and no test
@@ -458,6 +571,7 @@ _test_next:;
 struct fmx_accept {
     char gid[64];
     long long seq;
+    long long accepted;
     bool duplicate;
     bool ok;
 };
@@ -494,15 +608,18 @@ static struct fmx_accept fmx_probe(void)
     v = row ? json_get(row, "seq") : NULL;
     if (v && v->type == JSON_INT)
         a.seq = json_get_int(v);
+    a.accepted = fmx_int(&s, "accepted");
     v = row ? json_get(row, "state") : NULL;
     a.ok = v && v->type == JSON_STR && strcmp(json_get_str(v), "queued") == 0;
     fmx_end(&s);
     return a;
 }
 
-/* The single change row a fresh probe leaves behind: delivered, with a
- * lead (not the body) and its ref. */
-static bool fmx_check_delivered(const struct json_value *changes)
+/* The single change row a fresh probe leaves behind: queued, with a
+ * lead (not the body) and its ref. Queued, not delivered: the probe's own
+ * outbox is always inside the probe's own pull, so nothing here says the
+ * directive reached the recipient. */
+static bool fmx_check_queued(const struct json_value *changes)
 {
     const struct json_value *ch, *v;
     if (!changes || changes->type != JSON_ARR || json_size(changes) != 1)
@@ -512,7 +629,7 @@ static bool fmx_check_delivered(const struct json_value *changes)
         return false;
     v = json_get(ch, "state");
     if (!v || v->type != JSON_STR ||
-        strcmp(json_get_str(v), "delivered") != 0)
+        strcmp(json_get_str(v), "queued") != 0)
         return false;
     v = json_get(ch, "lead");
     if (!v || v->type != JSON_STR ||
@@ -552,6 +669,9 @@ static int fmx_t_send_flow(void)
         ASSERT(a.seq >= 1);
         ASSERT(!a.duplicate);
         ASSERT(a.gid[0] != '\0');
+        /* A fresh, wholly-accepted one-item batch reports accepted=1,
+         * never the item-result count in disguise. */
+        ASSERT_EQ(a.accepted, 1);
         fmx_restore();
         PASS();
     }
@@ -565,7 +685,7 @@ static int fmx_t_brief_changes(void)
 {
     int failures = 0;
 
-    TEST("steer: brief carries the directive as a delivered lead") {
+    TEST("steer: brief carries the directive as a queued lead") {
         struct fmx_call b;
         struct fmx_accept a;
         fmx_isolate("brief_changes");
@@ -574,7 +694,7 @@ static int fmx_t_brief_changes(void)
         fmx_brief(&b, a.gid, 0);
         ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
         ASSERT(fmx_ok(&b));
-        ASSERT(fmx_check_delivered(fmx_arr(&b, "changes")));
+        ASSERT(fmx_check_queued(fmx_arr(&b, "changes")));
         fmx_end(&b);
         fmx_restore();
         PASS();
@@ -664,8 +784,65 @@ static int fmx_t_duplicate(void)
         ASSERT_EQ(seq1, seq2);
         v = json_get(row, "duplicate");
         ASSERT(v && v->type == JSON_BOOL && json_get_bool(v));
+        /* An exact duplicate is still an accept: it reports the
+         * recorded row, not a refusal. */
+        ASSERT_EQ(fmx_int(&s, "accepted"), 1);
         fmx_end(&s);
         ASSERT_EQ(fmx_mail_count(), before);
+        /* A different payload under the same key is refused, not
+         * counted as accepted. */
+        {
+            struct fmx_call conflict;
+            struct json_value citems, citem;
+            const struct json_value *crow;
+            const struct json_value *cv;
+            json_init(&citems);
+            json_set_array(&citems);
+            fmx_item(&citem, "field-agent", "check the OTHER water pump",
+                     "pump-check", "key-pump-1");
+            (void)json_push_back(&citems, &citem);
+            json_free(&citem);
+            ASSERT(fmx_send(&conflict, gid, &citems));
+            json_free(&citems);
+            ASSERT(fmx_ok(&conflict));
+            ASSERT_EQ(fmx_int(&conflict, "accepted"), 0);
+            crow = json_at(fmx_arr(&conflict, "items"), 0);
+            cv = crow ? json_get(crow, "state") : NULL;
+            ASSERT(cv && cv->type == JSON_STR &&
+                   strcmp(json_get_str(cv), "refused") == 0);
+            cv = crow ? json_get(crow, "error") : NULL;
+            ASSERT(cv && cv->type == JSON_STR &&
+                   strcmp(json_get_str(cv), "IDEMPOTENCY_CONFLICT") == 0);
+            fmx_end(&conflict);
+            ASSERT_EQ(fmx_mail_count(), before);
+        }
+        /* A batch of one good item plus one BAD_INPUT item reports
+         * accepted=1, not 2: the refused item never counts. */
+        {
+            struct fmx_call mixed;
+            struct json_value mitems, good, bad;
+            long long mail_before = fmx_mail_count();
+            json_init(&mitems);
+            json_set_array(&mitems);
+            fmx_item(&good, "field-agent", "check the generator",
+                     "generator-check", "key-generator-1");
+            (void)json_push_back(&mitems, &good);
+            json_free(&good);
+            /* No "to": fails shape validation as BAD_INPUT. */
+            json_init(&bad);
+            json_set_object(&bad);
+            (void)json_push_kv_str(&bad, "body", "bad item, no to field");
+            (void)json_push_kv_str(&bad, "ref", "bad-item");
+            (void)json_push_kv_str(&bad, "idempotency_key", "key-bad-1");
+            (void)json_push_back(&mitems, &bad);
+            json_free(&bad);
+            ASSERT(fmx_send(&mixed, gid, &mitems));
+            json_free(&mitems);
+            ASSERT(fmx_ok(&mixed));
+            ASSERT_EQ(fmx_int(&mixed, "accepted"), 1);
+            ASSERT_EQ(fmx_mail_count(), mail_before + 1);
+            fmx_end(&mixed);
+        }
         /* Oversize batches are refused whole, not truncated. */
         {
             struct fmx_call big;
@@ -752,6 +929,127 @@ static int fmx_t_lifecycle(void)
                    strcmp(json_get_str(st), "completed") == 0);
         }
         fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+/* The sender's own outbox is never delivery. A row this host sent through
+ * steer stays queued until the receiver itself has written something;
+ * rows this host did not send keep the older reading. */
+static int fmx_t_sent_needs_receiver(void)
+{
+    int failures = 0;
+
+    TEST("steer: a sent row is queued until the recipient answers") {
+        struct fmx_call s, b;
+        struct json_value items, item;
+        const struct json_value *out, *row, *v;
+        char gid[64];
+        long long seq;
+        fmx_isolate("sent_receiver");
+        ASSERT(fmx_mint("brief,send,evidence", gid, sizeof(gid)));
+        json_init(&items);
+        json_set_array(&items);
+        fmx_item(&item, "fence-crew", "sweep the north fence line",
+                 "fence-sweep", "key-sent-1");
+        (void)json_push_back(&items, &item);
+        json_free(&item);
+        ASSERT(fmx_send_from(&s, gid, "steer-caller", &items));
+        json_free(&items);
+        ASSERT(fmx_ok(&s));
+        out = fmx_arr(&s, "items");
+        row = out ? json_at(out, 0) : NULL;
+        v = row ? json_get(row, "seq") : NULL;
+        ASSERT(v && v->type == JSON_INT);
+        seq = json_get_int(v);
+        fmx_end(&s);
+        ASSERT(seq >= 1);
+        /* Nothing has carried those bytes anywhere. The row sits in this
+         * host's own outbox, which is always inside this host's own pull,
+         * so neither surface may call it delivered. */
+        ASSERT(fmx_state_agrees(gid, "fence-sweep", "queued"));
+        /* A row a transport dropped here keeps the older reading, even
+         * when the peer's own numbering collides with our seq: the
+         * receipt names a recipient, not a bare sequence number. */
+        fmx_seed_inbox("peer-host", "2026-09-16T00:00:00Z", seq, "peer-host",
+                       "other-crew", "note", "peer note", "inbound-ref");
+        fmx_brief(&b, gid, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        ASSERT_STR_EQ(fmx_change_state(fmx_arr(&b, "changes"), "peer-host",
+                                       "inbound-ref"),
+                      "delivered");
+        ASSERT_STR_EQ(fmx_change_state(fmx_arr(&b, "changes"),
+                                       "steer-caller", "fence-sweep"),
+                      "queued");
+        fmx_end(&b);
+        /* The recipient's own reply under the same ref is receiver
+         * evidence a sender cannot forge: the sent row promotes straight
+         * to acknowledged. */
+        fmx_seed_inbox("fence-crew", "2026-12-31T00:00:00Z", 9001,
+                       "fence-crew", "steer-caller", "result",
+                       "north fence swept", "fence-sweep");
+        fmx_brief(&b, gid, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        ASSERT_STR_EQ(fmx_change_state(fmx_arr(&b, "changes"),
+                                       "steer-caller", "fence-sweep"),
+                      "acknowledged");
+        /* The reply row itself was not sent from here, so it reads
+         * delivered. */
+        ASSERT_STR_EQ(fmx_change_state(fmx_arr(&b, "changes"), "fence-crew",
+                                       "fence-sweep"),
+                      "delivered");
+        fmx_end(&b);
+        /* Evidence for that ref returns the latest row under it (the
+         * reply) and agrees with the brief row for row. */
+        ASSERT(fmx_state_agrees(gid, "fence-sweep", "delivered"));
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+/* The other half of the rule: a receiver on THIS host acks by writing the
+ * mail cursor, and that promotes the same sent row. */
+static int fmx_t_sent_local_ack(void)
+{
+    int failures = 0;
+
+    TEST("steer: the local ack cursor promotes a sent row") {
+        struct fmx_call s;
+        struct json_value items, item;
+        const struct json_value *out, *row, *v;
+        char gid[64];
+        long long seq;
+        fmx_isolate("sent_local_ack");
+        ASSERT(fmx_mint("brief,send,evidence", gid, sizeof(gid)));
+        json_init(&items);
+        json_set_array(&items);
+        fmx_item(&item, "desk-crew", "check the desk log", "desk-check",
+                 "key-sent-2");
+        (void)json_push_back(&items, &item);
+        json_free(&item);
+        ASSERT(fmx_send_from(&s, gid, "steer-caller", &items));
+        json_free(&items);
+        ASSERT(fmx_ok(&s));
+        out = fmx_arr(&s, "items");
+        row = out ? json_at(out, 0) : NULL;
+        v = row ? json_get(row, "seq") : NULL;
+        ASSERT(v && v->type == JSON_INT);
+        seq = json_get_int(v);
+        fmx_end(&s);
+        ASSERT(fmx_state_agrees(gid, "desk-check", "queued"));
+        ASSERT(fmx_ack("desk-crew", seq));
+        ASSERT(fmx_state_agrees(gid, "desk-check", "acknowledged"));
         fmx_restore();
         PASS();
     }
@@ -946,6 +1244,8 @@ int test_fleet_steer(void)
     failures += fmx_t_evidence();
     failures += fmx_t_duplicate();
     failures += fmx_t_lifecycle();
+    failures += fmx_t_sent_needs_receiver();
+    failures += fmx_t_sent_local_ack();
     failures += fmx_t_grants();
     failures += fmx_t_revoke_cancels_queued();
     failures += fmx_t_board_absent();

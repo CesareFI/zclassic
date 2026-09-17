@@ -465,7 +465,10 @@ ZCL_COMMAND_READY_READ(
     "cursor; the reply carries the new `cursor`) from the existing fleet "
     "leaves, with per-source observation age and a `missing[]` list "
     "naming every source that did not answer. Message states stay "
-    "distinct: delivered, acknowledged, completed. Read-only over fleet "
+    "distinct: queued, delivered, acknowledged, completed. A directive "
+    "this host sent stays queued until the recipient replies under the "
+    "same ref or acks it locally; the sender's own outbox never counts as "
+    "delivery. Read-only over fleet "
     "state (sibling leaves ensure their own owner-private directories, "
     "as they do for every other caller). It contacts no peer and never "
     "waits.", 65536,
