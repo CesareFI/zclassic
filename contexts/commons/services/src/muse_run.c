@@ -410,47 +410,74 @@ static bool mr_hex40(const char *s)
     return s[40] == '\0';
 }
 
-/* HEAD before the turn: the source half of the diff identity. */
-static void mr_base_commit(const char *workspace, char *out, size_t cap)
+/* HEAD, as one 40-hex identity. False when git could not name it, and the
+ * field degrades to the literal "none" so no reader mistakes an unread
+ * identity for a match. An identity that is not 40 hex is unread: this is
+ * an equality test later, and a partial answer would compare unequal for
+ * the wrong reason. */
+static bool mr_head_at(const char *workspace, char *out, size_t cap)
 {
-    if (!mr_git_line(out, cap, workspace, "rev-parse", "HEAD", NULL))
-        (void)snprintf(out, cap, "none");
+    if (mr_git_line(out, cap, workspace, "rev-parse", "HEAD", NULL) &&
+        mr_hex40(out))
+        return true;
+    (void)snprintf(out, cap, "none");
+    return false;
 }
 
-/* Dequote one C-quoted porcelain path in place ("a b" -> a b, with
- * backslash escapes resolved best-effort). Returns the dequoted path. */
-static char *mr_dequote(char *path)
+/* The escapes git emits after a backslash in a C-quoted path, paired with
+ * the byte each one stands for. Anything else is a row this parser did not
+ * write, so it cannot claim to have read it either. */
+static const char mr_escape_from[] = "abfnrtv\\\"";
+static const char mr_escape_to[] = "\a\b\f\n\r\t\v\\\"";
+
+/* One backslash escape, resolved into *w. p points at the character AFTER
+ * the backslash; returns the last character consumed, or NULL when the
+ * escape is not one git emits. */
+static const char *mr_unescape(const char *p, char **w)
+{
+    const char *hit;
+    if (!*p) return NULL;
+    if (*p >= '0' && *p <= '7') {
+        int v = 0, k = 0;
+        while (k < 3 && *p >= '0' && *p <= '7') {
+            v = v * 8 + (*p - '0');
+            p++;
+            k++;
+        }
+        *(*w)++ = (char)v;
+        return p - 1;
+    }
+    hit = strchr(mr_escape_from, *p);
+    if (!hit) return NULL;
+    *(*w)++ = mr_escape_to[hit - mr_escape_from];
+    return p;
+}
+
+/* Dequote one C-quoted porcelain path in place ("a b" -> a b). False when
+ * the quoting is MALFORMED — an unterminated quote, a backslash with
+ * nothing after it, or an escape git never emits. A best-effort path out
+ * of a broken row is a path this audit cannot claim to have measured, and
+ * every caller turns that into a refusal rather than a judgement. */
+static bool mr_dequote(char *path)
 {
     char *w;
     size_t n = strlen(path);
-    if (n < 2 || path[0] != '"' || path[n - 1] != '"') return path;
+    if (n == 0) return true;
+    if (path[0] != '"') return strchr(path, '"') == NULL;
+    if (n < 2 || path[n - 1] != '"') return false;
     path[n - 1] = '\0';
     w = path;
-    for (char *p = path + 1; *p; p++) {
-        if (*p == '\\' && p[1]) {
-            p++;
-            if (*p >= '0' && *p <= '7') {
-                int v = 0, k = 0;
-                while (k < 3 && *p >= '0' && *p <= '7') {
-                    v = v * 8 + (*p - '0');
-                    p++;
-                    k++;
-                }
-                p--;
-                *w++ = (char)v;
-            } else {
-                switch (*p) {
-                case 'n': *w++ = '\n'; break;
-                case 't': *w++ = '\t'; break;
-                default: *w++ = *p; break;
-                }
-            }
-        } else {
+    for (const char *p = path + 1; *p; p++) {
+        if (*p != '\\') {
             *w++ = *p;
+            continue;
         }
+        if (!p[1]) return false;
+        p = mr_unescape(p + 1, &w);
+        if (!p) return false;
     }
     *w = '\0';
-    return path;
+    return true;
 }
 
 /* Append "path hash" lines for every untracked path: the content half
@@ -472,8 +499,13 @@ static void mr_fold_others(const char *workspace, char *acc, size_t acc_cap,
     for (char *line = strtok(list, "\n"); line;
         line = strtok(NULL, "\n")) {
         char h[128];
-        char *path = mr_dequote(line);
-        int w = snprintf(acc + *used, acc_cap - *used, "?? %s ",
+        const char *path = line;
+        int w;
+        /* A path whose quoting will not read is not folded as a
+         * best-effort guess: the identity must name what was measured or
+         * name nothing, and the scope audit refuses the same row. */
+        if (!mr_dequote(line)) break;
+        w = snprintf(acc + *used, acc_cap - *used, "?? %s ",
             path);
         if (w <= 0 || (size_t)w >= acc_cap - *used) break;
         *used += (size_t)w;
@@ -580,25 +612,76 @@ static void mr_audit_path(struct mr_audit *a, const char *path)
     (void)mr_list_push(a->outside, a->outside_cap, &a->outside_used, path);
 }
 
-/* One porcelain row -> the path or paths it names. The two status
- * characters and their separator are fixed-width. A rename row names two
+/* Every status character porcelain v1 can print in either column. */
+static bool mr_status_char(char c)
+{
+    return c == ' ' || c == 'M' || c == 'T' || c == 'A' || c == 'D' ||
+        c == 'R' || c == 'C' || c == 'U' || c == '?' || c == '!';
+}
+
+/* The row's fixed-width prefix, exactly: two legal status characters and
+ * the single space that always follows them. '?' and '!' only ever appear
+ * doubled, and two blanks mean "unmodified in both columns", which this
+ * seam never prints. A line that is not that shape did not come out of
+ * the porcelain this audit measures, so the caller counts it unreadable
+ * instead of trusting the path it appears to carry: length alone is not a
+ * shape, and a blind fixed skip over a line of the wrong shape invents a
+ * path out of whatever follows. */
+static bool mr_row_status_ok(const char *line)
+{
+    if (!line || strlen(line) < 4) return false;
+    if (!mr_status_char(line[0]) || !mr_status_char(line[1])) return false;
+    if (line[2] != ' ') return false;
+    if ((line[0] == '?') != (line[1] == '?')) return false;
+    if ((line[0] == '!') != (line[1] == '!')) return false;
+    return line[0] != ' ' || line[1] != ' ';
+}
+
+/* Whether the status names a second path. Rename and copy carry " -> " in
+ * either column; nothing else does. */
+static bool mr_row_names_two(const char *line)
+{
+    return line[0] == 'R' || line[0] == 'C' ||
+        line[1] == 'R' || line[1] == 'C';
+}
+
+/* One porcelain row -> the path or paths it names. A rename row names two
  * paths and BOTH are judged: moving a file out of scope changes it just as
- * surely as editing it does. */
+ * surely as editing it does. The shape must AGREE with the status: an
+ * R/C row without its separator, or a separator on a status that cannot
+ * carry one, is unreadable rather than one lucky path — either way the
+ * row names something this parser did not identify, and a path it did not
+ * identify is a path it did not judge. A literal " -> " inside a single
+ * unquoted filename is ambiguous by the same rule and refuses too. */
 static void mr_audit_row(struct mr_audit *a, char *line)
 {
     char *arrow;
-    if (strlen(line) < 4) {
+    bool two;
+    if (!mr_row_status_ok(line)) {
         a->unreadable++;
         return;
     }
+    two = mr_row_names_two(line);
     line += 3;
     arrow = strstr(line, " -> ");
+    if (two != (arrow != NULL)) {
+        a->unreadable++;
+        return;
+    }
     if (arrow) {
         *arrow = '\0';
-        mr_audit_path(a, mr_dequote(line));
+        if (!mr_dequote(line)) {
+            a->unreadable++;
+            return;
+        }
+        mr_audit_path(a, line);
         line = arrow + 4;
     }
-    mr_audit_path(a, mr_dequote(line));
+    if (!mr_dequote(line)) {
+        a->unreadable++;
+        return;
+    }
+    mr_audit_path(a, line);
 }
 
 /* The measured change set, through the porcelain seam the diff count
@@ -738,19 +821,105 @@ static void mr_candidate(const char *workspace, const char *rundir,
     free(acc);
 }
 
-/* Runs the named registered group through the workspace's own runner,
- * parses the machine verdict line, and reports through engine_gate_read.
- * Missing or unrunnable runner is a refusal input, never a pass. */
+/* --- the gate's own process ------------------------------------------------
+ * WHAT THE LOG SAYS IS NOT WHAT THE PROCESS DID. A runner that is killed
+ * on its deadline, or that exits non-zero, still leaves behind whatever it
+ * had already written — and the reader keeps the LAST SUITE VERDICT line
+ * it finds, which a half-finished run can easily have printed with
+ * groups_failed=0. Discarding the spawn status turns every such death into
+ * a pass. So the status is carried, not dropped, and the log is read only
+ * for a process that finished normally and successfully.
+ *
+ * What the capture seam can actually tell apart, and nothing more:
+ * a launch that never happened, a deadline this side enforced, a
+ * wait status that was never trustworthy, a complete or truncated
+ * capture, and one exit number. That number cannot separate a child
+ * killed by signal N from a child that called exit(128+N) — both arrive
+ * as 128+N — and no distinction is invented here that the seam does not
+ * support. Both are non-zero, so both refuse. */
+struct mr_spawn_outcome {
+    bool attempted;      /* the runner was found and the capture was tried */
+    bool launched;       /* the child ran at all */
+    bool exit_observed;  /* a trustworthy wait status was obtained */
+    bool timed_out;      /* this side killed it on the deadline */
+    bool complete;       /* stdout reached EOF without filling the bound */
+    int exit_code;       /* normal exit 0..255, or 128+signal; -1 unknown */
+};
+
+/* True only for the one outcome whose log may be believed. */
+static bool mr_spawn_normal(const struct mr_spawn_outcome *o)
+{
+    return o->attempted && o->launched && o->exit_observed &&
+        !o->timed_out && o->complete && o->exit_code == 0;
+}
+
+/* Names the outcome for the evidence, so a refusal says what the process
+ * did and never only that the gate "refused". */
+static void mr_spawn_outcome_name(const struct mr_spawn_outcome *o,
+    char *out, size_t cap)
+{
+    if (!o->attempted)
+        (void)snprintf(out, cap, "runner-unrunnable");
+    else if (!o->launched)
+        (void)snprintf(out, cap, "launch-failed");
+    else if (o->timed_out)
+        (void)snprintf(out, cap, "timeout");
+    else if (!o->exit_observed)
+        (void)snprintf(out, cap, "status-unobserved");
+    else if (!o->complete)
+        (void)snprintf(out, cap, "log-truncated exit=%d", o->exit_code);
+    else
+        (void)snprintf(out, cap, "exit=%d", o->exit_code);
+}
+
+/* One bounded capture with its outcome preserved. The exact-binary seam is
+ * the only capture in the tree that reports the deadline, the wait status
+ * and the completeness of the read separately; the plain capture folds all
+ * three into one int where a timeout and a clean exit 0 can look alike.
+ * It does not terminate the buffer, so that is done here. */
+static void mr_gate_capture(const char *const argv[], char *log,
+    size_t logcap, int timeout_ms, struct mr_spawn_outcome *o)
+{
+    struct zcl_spawn_binary_observation obs;
+    memset(o, 0, sizeof(*o));
+    memset(&obs, 0, sizeof(obs));
+    obs.exit_code = -1;
+    o->exit_code = -1;
+    o->attempted = true;
+    log[0] = '\0';
+    /* The rolled-up result says only that SOMETHING was wrong; the
+     * observation beside it says which thing, and that is the fact the
+     * refusal has to name. */
+    ZCL_IGNORE_RESULT(
+        zcl_spawn_capture_binary(argv, log, logcap - 1, timeout_ms, &obs),
+        "the observation below carries every outcome this refuses on");
+    log[obs.output_len < logcap ? obs.output_len : logcap - 1] = '\0';
+    o->timed_out = obs.timed_out;
+    o->exit_observed = obs.exit_observed;
+    o->complete = obs.eof && !obs.overflow;
+    o->exit_code = obs.exit_code;
+    /* A refused launch captures nothing and observes nothing; anything
+     * that reached a deadline or a wait status did run. */
+    o->launched = obs.timed_out || obs.exit_observed || obs.output_len > 0;
+}
+
+/* Runs the named registered group through the workspace's own runner and,
+ * ONLY for a normal successful exit, reports the machine verdict line
+ * through engine_gate_read. Missing or unrunnable runner, a failed launch,
+ * a deadline, an unobserved status, a truncated log and any non-zero exit
+ * are all refusal inputs, never a pass — whatever the captured log says. */
 static bool mr_run_gate(const char *workspace, const char *group,
     int timeout_ms, char *log, size_t logcap, long long *elapsed_ms,
-    struct engine_gate_reading *reading)
+    struct engine_gate_reading *reading, struct mr_spawn_outcome *o)
 {
     char runner[8192];
     const char *argv[8];
     char selector[128];
     int64_t t0;
-    int rc;
-    if (!workspace || !group || !log || !logcap || !elapsed_ms || !reading)
+    memset(o, 0, sizeof(*o));
+    o->exit_code = -1;
+    if (!workspace || !group || !log || logcap < 2 || !elapsed_ms ||
+        !reading || timeout_ms <= 0)
         return false;
     memset(reading, 0, sizeof(*reading));
     if (snprintf(runner, sizeof(runner), "%s/build/bin/test_parallel",
@@ -764,11 +933,10 @@ static bool mr_run_gate(const char *workspace, const char *group,
     argv[1] = selector;
     argv[2] = "--no-cache";
     argv[3] = NULL;
-    log[0] = '\0';
     t0 = mr_monotonic_ms();
-    rc = zcl_spawn_capture(argv, log, logcap, timeout_ms);
+    mr_gate_capture(argv, log, logcap, timeout_ms, o);
     *elapsed_ms = (long long)(mr_monotonic_ms() - t0);
-    (void)rc;
+    if (!mr_spawn_normal(o)) return false;
     return engine_gate_read(log, strlen(log), reading);
 }
 
@@ -836,8 +1004,9 @@ static void mr_write_facts(const struct muse_run_task *t,
     char path[8192];
     char *body = zcl_malloc(65536, "muse_run.facts");
     char esc_reason[1024], esc_engine[128], esc_verdict[2048];
-    char esc_model[512], esc_gate[512];
+    char esc_model[512], esc_gate[512], esc_spawn[192];
     if (!body) return;
+    mr_esc(r->gate_spawn, esc_spawn, sizeof(esc_spawn));
     mr_esc(r->reason, esc_reason, sizeof(esc_reason));
     mr_esc(r->engine, esc_engine, sizeof(esc_engine));
     mr_esc(r->gate_verdict, esc_verdict, sizeof(esc_verdict));
@@ -857,9 +1026,11 @@ static void mr_write_facts(const struct muse_run_task *t,
         "\"terminal\":\"%s\",\"verdict\":\"%s\",\"rc\":%d,"
         "\"reason\":\"%s\",\"engine\":\"%s\","
         "\"base\":\"%s\",\"candidate\":\"%s\","
+        "\"head\":{\"pinned\":\"%s\",\"observed\":\"%s\","
+        "\"measured\":%s},"
         "\"gate\":{\"name\":\"%s\",\"evidence\":\"%s\","
         "\"verdict\":\"%s\",\"present\":%s,\"ran\":%lld,\"failed\":%lld,"
-        "\"ms\":%lld},"
+        "\"ms\":%lld,\"spawn\":\"%s\",\"exit\":%d,\"normal\":%s},"
         "\"tokens\":{\"input\":%llu,\"output\":%llu,\"total\":%llu},"
         "\"duration_ms\":%lld,\"wall_ms\":%lld,\"files_changed\":%lld,"
         "\"scope_audit\":{\"pre_measured\":%s,\"pre_clean\":%s,"
@@ -875,9 +1046,12 @@ static void mr_write_facts(const struct muse_run_task *t,
         r->terminal, r->verdict, r->rc,
         esc_reason, esc_engine,
         r->base, r->candidate,
+        r->base, r->head_observed,
+        r->head_measured ? "true" : "false",
         esc_gate, r->gate_evidence,
         esc_verdict, r->gate_present ? "true" : "false",
         r->gate_ran, r->gate_failed, r->gate_ms,
+        esc_spawn, r->gate_exit, r->gate_normal ? "true" : "false",
         r->input_tokens, r->output_tokens, r->total_tokens,
         r->duration_ms, r->wall_ms, r->files_changed,
         r->scope_pre_measured ? "true" : "false",
@@ -979,6 +1153,61 @@ static bool mr_scope_clean(struct mr_core *c)
     return false;
 }
 
+/* Two identities that were both read and DISAGREE. Unreadable is a
+ * separate fact with its own refusal: "cannot tell" and "definitely
+ * different" are not the same answer, and the evidence must not blur
+ * them into one. */
+static bool mr_head_moved(const char *pinned, const char *observed)
+{
+    return mr_hex40(pinned) && mr_hex40(observed) &&
+        strcmp(pinned, observed) != 0;
+}
+
+/* AFTER the turn, BEFORE the gate. The change set audit proves the scope
+ * only while the commit it is measured against holds still: a model that
+ * COMMITS its work leaves a porcelain tree with nothing in it, so the
+ * audit measures nothing and every count reads as a spotless run. The
+ * pinned pre-turn HEAD is the only thing that catches that.
+ *
+ * Measured beside mr_scope_clean for the same reason that one is: what is
+ * judged must be the model's own output and never the gate's side
+ * effects. A moved HEAD is "failed" — the turn ran, produced something,
+ * and that something was judged and rejected. An identity that could not
+ * be read at either end is "refused": nothing was judged, because there
+ * was nothing to compare. Either way the run can never reach pass. */
+static bool mr_head_pinned(struct mr_core *c)
+{
+    const struct muse_run_task *t = c->task;
+    struct muse_run_result *r = c->res;
+    r->head_measured = false;
+    if (!mr_head_at(t->workspace, r->head_observed,
+            sizeof(r->head_observed))) {
+        (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+            mr_verdict_refused);
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "HEAD unreadable after the turn; pinned %s", r->base);
+        return false;
+    }
+    if (!mr_hex40(r->base)) {
+        (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+            mr_verdict_refused);
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "HEAD unreadable before the turn; observed %s",
+            r->head_observed);
+        return false;
+    }
+    if (mr_head_moved(r->base, r->head_observed)) {
+        (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+            mr_verdict_failed);
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "HEAD moved during the turn: pinned %s, observed %s",
+            r->base, r->head_observed);
+        return false;
+    }
+    r->head_measured = true;
+    return true;
+}
+
 /* Prior admitted turn without a terminal: a fresh host cannot cancel
  * a dead host's turn (sessionNotLoaded), so the gate still judges
  * the final diff and this note preserves the fact. */
@@ -1078,6 +1307,41 @@ static void mr_settle_terminal(struct mr_core *c)
     r->wall_ms = (long long)(mr_monotonic_ms() - c->t0);
 }
 
+/* THE CLOSED PASS PREDICATE. Every fact a pass rests on, measured, in one
+ * conjunction: the gate passed over a measured non-empty diff; the
+ * workspace was measurably clean before the turn; the change set after it
+ * was measured and holds nothing outside the declared scope; the pre-turn
+ * HEAD was pinned and had not moved when the change set was measured; and
+ * the gate's own process exited normally with status 0, so its log is
+ * evidence rather than debris. This is a predicate, not a second decision
+ * site: mr_judge below is the only place that acts on it. Nothing here may
+ * ever be defaulted — an unmeasured fact is false, never true. */
+static bool mr_pass_closed(const struct muse_run_result *r,
+    enum engine_verdict v)
+{
+    return v == ENGINE_VERDICT_PASS && r->scope_pre_measured &&
+        r->scope_pre_clean && r->scope_changed_measured &&
+        r->scope_outside_count == 0 && r->head_measured && r->gate_normal;
+}
+
+/* Everything measured before the gate is allowed to run: the diff count,
+ * the change set against the declared scope, and the pinned HEAD. Each one
+ * writes its own verdict and reason on refusal. */
+static bool mr_measured_before_gate(struct mr_core *c)
+{
+    struct muse_run_result *r = c->res;
+    r->files_changed = mr_files_changed(c->task->workspace);
+    if (r->files_changed < 0) {
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "worktree diff unmeasurable");
+        return false;
+    }
+    /* Measured before the gate runs: the change set judged here is the
+     * model's output, never the gate's own side effects. */
+    if (!mr_scope_clean(c)) return false;
+    return mr_head_pinned(c);
+}
+
 /* THE GATE DECIDES. The turn text is evidence, never a verdict input.
  * Returns the rc the run reports and names the engine verdict. */
 static int mr_judge(struct mr_core *c, char *gate_log, size_t logcap,
@@ -1086,22 +1350,22 @@ static int mr_judge(struct mr_core *c, char *gate_log, size_t logcap,
     const struct muse_run_task *t = c->task;
     struct muse_run_result *r = c->res;
     struct engine_gate_reading gate;
+    struct mr_spawn_outcome spawn;
     enum engine_verdict v;
-    r->files_changed = mr_files_changed(t->workspace);
-    if (r->files_changed < 0) {
-        (void)snprintf(r->reason, sizeof(r->reason),
-            "worktree diff unmeasurable");
-        return 1;
-    }
-    /* Measured before the gate runs: the change set judged here is the
-     * model's output, never the gate's own side effects. */
-    if (!mr_scope_clean(c)) return 1;
+    if (!mr_measured_before_gate(c)) return 1;
     if (!mr_run_gate(t->workspace, t->gate, c->gate_timeout_ms, gate_log,
-            logcap, &r->gate_ms, &gate)) {
+            logcap, &r->gate_ms, &gate, &spawn)) {
+        /* The log may well hold a passing verdict line. It is not read,
+         * because the process that wrote it did not finish normally. */
+        mr_spawn_outcome_name(&spawn, r->gate_spawn, sizeof(r->gate_spawn));
+        r->gate_exit = spawn.exit_code;
         (void)snprintf(r->reason, sizeof(r->reason),
-            "registered runner unrunnable");
+            "gate did not pass a readable verdict: %s", r->gate_spawn);
         return 1;
     }
+    mr_spawn_outcome_name(&spawn, r->gate_spawn, sizeof(r->gate_spawn));
+    r->gate_exit = spawn.exit_code;
+    r->gate_normal = true;
     r->gate_present = gate.saw_verdict_line;
     r->gate_ran = gate.groups_ran;
     r->gate_failed = gate.groups_failed;
@@ -1112,12 +1376,7 @@ static int mr_judge(struct mr_core *c, char *gate_log, size_t logcap,
     v = engine_verdict_of(&gate, (size_t)r->files_changed, false, true);
     *engine_name = mr_engine_short(engine_verdict_name(v), engine_buf,
         engine_cap);
-    /* THE CLOSED PASS, in one place: the gate passed over a measured
-     * non-empty diff, the workspace was measurably clean before the turn,
-     * and every measured changed path is inside the declared scope. */
-    if (v == ENGINE_VERDICT_PASS && r->scope_pre_measured &&
-        r->scope_pre_clean && r->scope_changed_measured &&
-        r->scope_outside_count == 0) {
+    if (mr_pass_closed(r, v)) {
         (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
             mr_verdict_pass);
         (void)snprintf(r->reason, sizeof(r->reason), "gate passed");
@@ -1179,6 +1438,10 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
     r->scope_pre_count = -1;
     r->scope_changed_count = -1;
     r->scope_outside_count = -1;
+    /* No trustworthy gate status yet, and -1 is not a measured 0. */
+    r->gate_exit = -1;
+    (void)snprintf(r->gate_spawn, sizeof(r->gate_spawn), "none");
+    (void)snprintf(r->head_observed, sizeof(r->head_observed), "none");
     (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
         mr_verdict_refused);
     (void)snprintf(r->reason, sizeof(r->reason),
@@ -1190,8 +1453,16 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
         goto write;
     }
     mr_note_prior_turn(t, r);
-    /* Source half of the diff identity, taken before the turn lands. */
-    mr_base_commit(t->workspace, r->base, sizeof(r->base));
+    /* Source half of the diff identity, PINNED before the turn lands. An
+     * anchor that could not be read can never be compared afterwards, so
+     * the run stops here rather than judging an unanchored change set —
+     * and it stops before a token is spent, for the same reason baseline
+     * dirt does. */
+    if (!mr_head_at(t->workspace, r->base, sizeof(r->base))) {
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "HEAD unreadable before the turn: base %s", r->base);
+        goto write;
+    }
     /* The workspace must be measurably clean BEFORE the turn: baseline
      * dirt could otherwise satisfy the non-empty diff a pass requires.
      * No session, no turn, no tokens. */

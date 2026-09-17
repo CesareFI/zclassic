@@ -23,6 +23,19 @@
  * dirty workspace is refused before a single token is spent. `build/` is
  * gitignored, so an already-built workspace is still clean.
  *
+ * THE PRE-TURN HEAD IS PINNED. The change-set audit only proves anything
+ * while the commit it is measured against holds still: a model that
+ * COMMITS its work leaves a clean porcelain tree, and an audit of that
+ * tree measures nothing while reporting everything in order. So HEAD is
+ * read before the turn and read again after it, before the gate runs, and
+ * a HEAD that moved — or either read that failed — fails the run closed.
+ *
+ * THE GATE'S PROCESS IS PART OF THE GATE. A runner that dies, is killed
+ * on its deadline, or exits non-zero can still leave a captured log whose
+ * last SUITE VERDICT line says everything passed. The log is only read
+ * when the process exited normally with status 0 inside its deadline, so
+ * a passing-looking log out of a failed process refuses.
+ *
  * AN UNMEASURABLE OUTPUT IS A REFUSAL, NEVER A PASS. If either
  * enumeration cannot be measured — the porcelain capture fails to spawn,
  * exits non-zero, times out, fills its bound (the capture helper discards
@@ -140,6 +153,14 @@ struct muse_run_result {
     int rc;
     /* 40-hex HEAD before the turn, or "none" when unmeasurable. */
     char base[MUSE_RUN_ID_MAX];
+    /* The same identity re-read AFTER the turn, or "none" when it could
+     * not be read. A model that COMMITS its work leaves a clean porcelain
+     * tree, so the change-set audit measures nothing at all and would see
+     * a spotless run; only these two identities catch it. head_measured
+     * is true only when both were read and agree, and an unread identity
+     * is never the same answer as a match. */
+    char head_observed[MUSE_RUN_ID_MAX];
+    bool head_measured;
     /* 40-hex SHA-1 over the post-run change set (porcelain + content
      * hashes), or "none" when unmeasurable. Empty diff hashes
      * deterministically; identity never implies judgement. */
@@ -161,6 +182,18 @@ struct muse_run_result {
     long long gate_ran;
     long long gate_failed;
     bool gate_present;
+    /* What the gate's PROCESS did, kept apart from what its log SAID. A
+     * captured log holding a passing verdict line proves nothing when the
+     * process that wrote it was killed on its deadline or exited
+     * non-zero, so the log is only ever read when gate_normal is true:
+     * an observed normal exit with status 0, inside the deadline, over a
+     * log that did not fill its bound. gate_exit is that normal exit
+     * status, or 128+signal for a signalled child, and -1 when no
+     * trustworthy status was obtained — which is never the same answer as
+     * a measured 0. gate_spawn names the outcome for the evidence. */
+    bool gate_normal;
+    int gate_exit;
+    char gate_spawn[64];
     unsigned long long input_tokens;
     unsigned long long output_tokens;
     unsigned long long total_tokens;
