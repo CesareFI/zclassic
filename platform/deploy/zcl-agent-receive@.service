@@ -15,7 +15,9 @@ Description=Z23 resident mail receiver for agent identity %i (admits directives,
 # answers under the same ref with its reason. That is the whole job.
 #
 # WHERE THE WORK HAPPENS. A remote sender cannot carry this box's paths — it
-# does not know them, and dev.agent.mail refuses a body that names one — so
+# does not know them, and dev.agent.mail refuses a body naming ANY absolute
+# path, since a body crosses hosts and a sender's path means nothing here —
+# so
 # a directive names the workspace logically (`muse-workspace: receiver`) and
 # THIS box resolves it to the one workspace Z23_RECEIVE_WORKSPACE names
 # below. The receiver writes the resolved absolute path into the brief, so
@@ -40,7 +42,17 @@ Description=Z23 resident mail receiver for agent identity %i (admits directives,
 # Deliberately NOT installable at boot: there is no [Install] section, so
 # `systemctl --user enable` refuses until the operator adds one on purpose.
 #
-# Install (the operator does this, never an agent):
+# Install (the operator does this, never an agent). Step one installs the
+# QUALIFIED image and is not optional: this unit runs ~/.local/bin/z23-dev,
+# not a checkout's build output, so that the receiver and the worker are one
+# candidate rather than two binaries that happen to share a tree. Point the
+# link at the exact binary that passed the gates:
+#   install -Dm755 build/bin/z23-dev \
+#     ~/.local/lib/z23/"$(sha256sum build/bin/z23-dev | cut -c1-64)"/z23-dev
+#   ln -sfn \
+#     ~/.local/lib/z23/"$(sha256sum build/bin/z23-dev | cut -c1-64)"/z23-dev \
+#     ~/.local/bin/z23-dev
+#   ls -l ~/.local/bin/z23-dev          # a symlink into the sha256 store
 #   cp platform/deploy/zcl-agent-receive@.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user start zcl-agent-receive@box-a
@@ -71,7 +83,18 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=%h
+# THE CWD DECIDES NOTHING, AND THAT IS NEW. It used to be load-bearing for
+# one reason only: dev.agent.mail resolved a checkout root from the process
+# working directory and allowed absolute paths under it, so the verdict on a
+# fixed directive body moved with the directory the process happened to run
+# in. That dependence is gone — a mail body crosses hosts, so every absolute
+# path in one is refused with no root and no cwd consulted — and nothing left
+# in this loop reads the cwd: the state root comes from platform_state_root(),
+# the workspace comes from the flag below, and both are absolute. The cwd is
+# therefore the filesystem root, where no relative path can resolve to
+# anything this unit may write, so a future relative path is a loud failure
+# instead of a quiet dependence on where systemd started the process.
+WorkingDirectory=/
 
 # One process that parks in a directory-watcher wait and, on each wake,
 # appends a few small files. It is neither a compile nor a scan, and it must
@@ -99,10 +122,12 @@ OOMScoreAdjust=500
 # instance at one workspace; a second workspace is a second box's business,
 # not a routing table.
 #
-# It must be an absolute path with no ".." segment, and it must be its own
-# canonical path: a symlinked component fails closed rather than resolving
-# somewhere the operator did not name. Override it per instance without
-# editing this file:
+# It must be an absolute path with no ".." segment. The receiver
+# canonicalizes it with realpath and works from the canonical form, so a
+# workspace reached through a symlinked component resolves to the one real
+# directory (and that real path is what the brief, the pin and the evidence
+# record name). A path that will not resolve at all fails closed. Override
+# it per instance without editing this file:
 #   systemctl --user edit zcl-agent-receive@box-a
 #   [Service]
 #   Environment=Z23_RECEIVE_WORKSPACE=%h/.z23/lanes/yourlane
@@ -112,11 +137,31 @@ OOMScoreAdjust=500
 # RECEIVE_WORKSPACE_UNCONFIGURED instead of guessing a checkout.
 Environment=Z23_RECEIVE_WORKSPACE=%h/github/zclassic23
 
+# THE BINARY IS THE INSTALLED ONE, NEVER A CHECKOUT'S BUILD OUTPUT. The
+# receiver and the dev.agent.worker resident are ONE candidate: if they
+# resolve their executable through different paths, or through a path whose
+# contents change under them, the pair is not running one qualified image and
+# a proof about it says nothing. A checkout's build/bin/ is exactly such a
+# path — it is a working tree, so it is dirty and rebuilt whenever someone is
+# working — so both units run the installed binary instead.
+#
+# %h/.local/bin/ is the content-addressed install this host already uses.
+# `ls -l ~/.local/bin/z23` on this box shows a symlink, not a file: it points
+# at ~/.local/lib/z23/<64 hex chars>/z23, one directory per sha256 of the
+# image, so the link NAME stays put while its TARGET names the exact bytes.
+# Replacing the image is a relink, so a restart picks up the new one and
+# nothing is ever rewritten in place under a running process. Install z23-dev
+# the same way (below).
+#
+# The first token stays a literal absolute path: %h is a systemd specifier
+# and is expanded before argv is built, while an ${VAR} as the executable is
+# refused outright.
+#
 # deadline_s bounds a single drive; Restart=on-failure plus this unit's
 # restart limit is what makes the loop resident across days, and every
 # decision is re-derived from files on the next drive, so a restart between
 # beats neither loses a ref nor executes one twice.
-ExecStart=%h/github/zclassic23/build/bin/z23-dev dev agent receive run --receiver=%i --workspace=${Z23_RECEIVE_WORKSPACE} --deadline_s=86400 --wait_ms=1000
+ExecStart=%h/.local/bin/z23-dev dev agent receive run --receiver=%i --workspace=${Z23_RECEIVE_WORKSPACE} --deadline_s=86400 --wait_ms=1000
 
 # The resident handles SIGTERM cooperatively: it stops taking new work at the
 # next check, the watcher wait returns within its stop-sample slice, and the
@@ -132,12 +177,20 @@ RestartSec=30
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# Exactly the paths a beat writes: this box's owner-private dev state root
-# (mail, grants, briefs, queue rows, answered markers) and the checkout, whose
-# build directory is where the dev binary keeps its own lock and telemetry
-# files. It never writes a datadir and never reads one.
+# Exactly the path a beat writes, and nothing else: this box's owner-private
+# dev state root, which holds mail, grants, briefs, received bodies, evidence
+# records, queue rows and answered markers. Every one of those goes through
+# platform_state_root(), so the dev binary writes nothing beside itself and
+# the install store stays read-only — the fail-closed answer for the image
+# this unit is running.
+#
+# The WORKSPACE is not here either. This loop only READS it (.git, HEAD, a
+# ref or packed-refs, and the index) to resolve a selector, pin a muse-sha
+# and check the pre-state; ProtectHome=read-only still allows every one of
+# those reads. Writing a workspace is the worker's job, under the worker's
+# own unit, which grants it there. A receiver that cannot write a checkout
+# cannot damage one. It never writes a datadir and never reads one.
 ReadWritePaths=%h/.local/state/z23
-ReadWritePaths=%h/github/zclassic23
 
 StandardOutput=journal
 StandardError=journal
