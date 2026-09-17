@@ -218,7 +218,13 @@ static bool shutdown_stop_runtime_and_drain_workers(struct boot_svc_ctx *svc)
      * makes shutdown wait on workers that have not yet been told to stop. */
     staged_sync_supervisor_shutdown_stages();
     printf("[shutdown] joining runtime workers\n");
-    peer_strategy_worker_join(&svc->nat_probe_worker);
+    if (!peer_strategy_worker_join(&svc->nat_probe_worker,
+                                   PSW_JOIN_TIMEOUT_SECS)) {
+        fprintf(stderr,
+                "[shutdown] NAT probe worker did not stop inside its bounded "
+                "join; refusing to release runtime dependencies\n");
+        return false;
+    }
     boot_join_address_backfill_service(svc);
     boot_join_hodl_history_service(svc);
     boot_join_tx_index_service(svc);

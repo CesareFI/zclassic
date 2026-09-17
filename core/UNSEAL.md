@@ -180,3 +180,7 @@ later lane flips it HARD.
 - 2026-09-17T13:44:37Z — REASON: Record the transient onion pump supervisor disposition required by the portability lint; runtime and consensus behavior are unchanged
   old ROOT: 02f3918b3ae32d06853608afc7f1fc57506ca3ef1bf842938ae8d72d319309d2
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T18:13:11Z — REASON: Owner-requested bounded Android-portable NAT probe worker join; retain ownership on timeout; consensus validation and chain rules unchanged
+  old ROOT: cc5da722e351d372d3dfc1512df70500823fc5c3fec1505f7d877d22d7f8529b
+  by: owner unseal ritual (make core-unseal)

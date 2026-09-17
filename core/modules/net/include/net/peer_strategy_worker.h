@@ -46,9 +46,8 @@
 #define PSW_RENEW_SECS         3600   /* half-life re-arm */
 #define PSW_BACKOFF_INIT_SECS  60
 #define PSW_BACKOFF_MAX_SECS   900
-/* Documented join bound: exceeds the bounded in-flight probe (every nat.c
- * network step carries a 2-3 s absolute wait budget). On expiry the join
- * logs the straggler and waits it out — ownership is never abandoned. */
+/* Production join bound: exceeds the bounded in-flight probe (every nat.c
+ * network step carries a 2-3 s absolute wait budget). */
 #define PSW_JOIN_TIMEOUT_SECS  30
 
 enum psw_state {
@@ -108,9 +107,14 @@ bool peer_strategy_worker_start(struct peer_strategy_worker *w);
  * probe still runs to its socket-timeout bound. Idempotent. */
 void peer_strategy_worker_stop(struct peer_strategy_worker *w);
 
-/* Bounded-then-logged join (PSW_JOIN_TIMEOUT_SECS), then an unconditional
- * join: the worker is never detached. Safe without a prior start. */
-void peer_strategy_worker_join(struct peer_strategy_worker *w);
+/* Join under one portable aggregate deadline. Returns false on timeout or
+ * clock/join failure and retains `started` ownership so the caller must keep
+ * every dependency alive and may retry after cooperative cancellation makes
+ * progress. Never detaches or falls through to an unlimited join. Safe without
+ * a prior start. Production passes PSW_JOIN_TIMEOUT_SECS; tests may use a
+ * shorter explicit budget to prove timeout/retry behavior. */
+bool peer_strategy_worker_join(struct peer_strategy_worker *w,
+                               int timeout_sec);
 
 /* Locked copy of the last published profile. Returns the state. */
 enum psw_state

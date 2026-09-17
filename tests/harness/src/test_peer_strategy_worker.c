@@ -15,6 +15,8 @@
  *       (the boot non-blocking property), the published result is
  *       observable through the snapshot, and stop + join reap the thread
  *       promptly from its renewal wait.
+ *   (5) a join deadline never falls through to an unlimited wait: ownership
+ *       remains explicit and a later retry reaps after the probe cooperates.
  *
  * The injected probes never touch a socket, the real clock, or the onion
  * directory; waiting on worker state uses the worker's own condvar with a
@@ -46,6 +48,7 @@ struct fake_probe {
     pthread_mutex_t *gate_mu;
     pthread_cond_t  *gate_cv;
     bool            *gate_open;
+    bool            *gate_entered;
 };
 
 static bool fake_probe(struct node_profile *profile, uint16_t port,
@@ -54,6 +57,10 @@ static bool fake_probe(struct node_profile *profile, uint16_t port,
     struct fake_probe *fp = seam_ctx;
     if (fp->gate_mu) {
         pthread_mutex_lock(fp->gate_mu);
+        if (fp->gate_entered) {
+            *fp->gate_entered = true;
+            pthread_cond_broadcast(fp->gate_cv);
+        }
         while (!*fp->gate_open)
             pthread_cond_wait(fp->gate_cv, fp->gate_mu);
         pthread_mutex_unlock(fp->gate_mu);
@@ -68,6 +75,23 @@ static bool fake_probe(struct node_profile *profile, uint16_t port,
     }
     fp->calls++;
     return fp->result;
+}
+
+static bool wait_gate_entered(pthread_mutex_t *mu, pthread_cond_t *cv,
+                              bool *entered, int timeout_sec)
+{
+    struct timespec deadline;
+    if (platform_time_realtime_timespec(&deadline) != 0)
+        return false;
+    deadline.tv_sec += timeout_sec;
+    pthread_mutex_lock(mu);
+    while (!*entered) {
+        if (pthread_cond_timedwait(cv, mu, &deadline) != 0)
+            break;
+    }
+    bool observed = *entered;
+    pthread_mutex_unlock(mu);
+    return observed;
 }
 
 static bool fake_no_regtest(void *seam_ctx)
@@ -220,10 +244,12 @@ static void t_lifecycle(int *out)
     pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t gate_cv = PTHREAD_COND_INITIALIZER;
     bool gate_open = false;
+    bool gate_entered = false;
     fp.result = true;
     fp.gate_mu = &gate_mu;
     fp.gate_cv = &gate_cv;
     fp.gate_open = &gate_open;
+    fp.gate_entered = &gate_entered;
 
     peer_strategy_worker_init(&w, 8033);
     w.probe_fn = fake_probe;
@@ -232,6 +258,8 @@ static void t_lifecycle(int *out)
 
     PSW_CHECK("start spawns the tracked worker",
               peer_strategy_worker_start(&w));
+    PSW_CHECK("injected probe reached its closed gate",
+              wait_gate_entered(&gate_mu, &gate_cv, &gate_entered, 2));
 
     /* The probe is still blocked on the closed gate. That start()
      * returned and the state is PROBING is the boot non-blocking
@@ -251,7 +279,8 @@ static void t_lifecycle(int *out)
     /* The worker is now parked in the 3600 s renewal wait; stop must wake
      * it and join must reap it well inside the documented bound. */
     peer_strategy_worker_stop(&w);
-    peer_strategy_worker_join(&w);
+    PSW_CHECK("join reaps the stopped renewal worker within its budget",
+              peer_strategy_worker_join(&w, PSW_JOIN_TIMEOUT_SECS));
     PSW_CHECK("stop+join reaped the worker from its renewal wait",
               !w.started);
     PSW_CHECK("stopped worker settles to idle",
@@ -259,8 +288,53 @@ static void t_lifecycle(int *out)
 
     /* join without a start and a double stop are both safe no-ops. */
     peer_strategy_worker_stop(&w);
-    peer_strategy_worker_join(&w);
-    PSW_CHECK("stop/join without a running worker are no-ops", true);
+    PSW_CHECK("stop/join without a running worker are no-ops",
+              peer_strategy_worker_join(&w, 0));
+
+    pthread_mutex_destroy(&gate_mu);
+    pthread_cond_destroy(&gate_cv);
+    *out += failures;
+}
+
+/* ── (5) timeout retains ownership and a later retry reaps ─── */
+
+static void t_bounded_join_retry(int *out)
+{
+    int failures = 0;
+    struct peer_strategy_worker w;
+    struct fake_probe fp = {0};
+    pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t gate_cv = PTHREAD_COND_INITIALIZER;
+    bool gate_open = false;
+    bool gate_entered = false;
+    fp.result = true;
+    fp.gate_mu = &gate_mu;
+    fp.gate_cv = &gate_cv;
+    fp.gate_open = &gate_open;
+    fp.gate_entered = &gate_entered;
+
+    peer_strategy_worker_init(&w, 8033);
+    w.probe_fn = fake_probe;
+    w.regtest_fn = fake_no_regtest;
+    w.seam_ctx = &fp;
+
+    PSW_CHECK("bounded-join fixture starts",
+              peer_strategy_worker_start(&w));
+    PSW_CHECK("bounded-join fixture is blocked inside the probe",
+              wait_gate_entered(&gate_mu, &gate_cv, &gate_entered, 2));
+    peer_strategy_worker_stop(&w);
+    PSW_CHECK("zero-budget join reports the live probe",
+              !peer_strategy_worker_join(&w, 0));
+    PSW_CHECK("timed-out join retains worker ownership", w.started);
+
+    pthread_mutex_lock(&gate_mu);
+    gate_open = true;
+    pthread_cond_broadcast(&gate_cv);
+    pthread_mutex_unlock(&gate_mu);
+
+    PSW_CHECK("retry reaps after the probe cooperates",
+              peer_strategy_worker_join(&w, 2));
+    PSW_CHECK("successful retry clears worker ownership", !w.started);
 
     pthread_mutex_destroy(&gate_mu);
     pthread_cond_destroy(&gate_cv);
@@ -274,6 +348,7 @@ int test_peer_strategy_worker(void)
     t_run_once(&failures);
     t_regtest_skip(&failures);
     t_lifecycle(&failures);
+    t_bounded_join_retry(&failures);
     printf("peer_strategy_worker: %s\n", failures ? "FAIL" : "OK");
     return failures;
 }

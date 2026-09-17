@@ -414,7 +414,10 @@ opportunistically so a long-running node cannot exhaust the fixed table. Boot
 background and catchup-service timeout paths retain ownership and permit a
 bounded retry instead of falling through to an unlimited join.
 The process-level aggregate drain now has the same bounded ownership-retaining
-contract. Signal/backtrace paths, unregistered raw thread creation, and direct
+contract. The NAT/reachability probe owner also returns a bounded join failure
+while retaining its lifecycle bit and registry row, so shutdown refuses to
+release runtime dependencies rather than falling through to `pthread_join`.
+Signal/backtrace paths, unregistered raw thread creation, and other direct
 blocking subsystem joins remain known blockers.
 
 Exit: portable headers do not select glibc-only APIs under Android macros, and

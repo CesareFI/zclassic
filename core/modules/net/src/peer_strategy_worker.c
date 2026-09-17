@@ -237,26 +237,38 @@ void peer_strategy_worker_stop(struct peer_strategy_worker *w)
     pthread_mutex_unlock(&w->mu);
 }
 
-void peer_strategy_worker_join(struct peer_strategy_worker *w)
+bool peer_strategy_worker_join(struct peer_strategy_worker *w,
+                               int timeout_sec)
 {
     if (!w || !w->started)
-        return;
+        return true;
+    if (timeout_sec < 0) {
+        LOG_ERROR("net", "nat probe worker join: negative timeout %d",
+                  timeout_sec);
+        return false;
+    }
 
     struct timespec deadline;
-    platform_time_realtime_timespec(&deadline);
-    deadline.tv_sec += PSW_JOIN_TIMEOUT_SECS;
+    if (platform_time_realtime_timespec(&deadline) != 0) {
+        LOG_ERROR("net", "nat probe worker join: realtime clock unavailable; "
+                         "ownership retained");
+        return false;
+    }
+    deadline.tv_sec += timeout_sec;
     int rc = thread_registry_join_until(w->tid, NULL, &deadline);
     if (rc != 0) {
-        /* The in-flight probe is socket-timeout bounded (~25 s worst case),
-         * so this is a loud straggler note, then the unconditional join —
-         * ownership is never abandoned. */
+        /* The in-flight production probe should finish under its socket
+         * deadlines. If it does not, retain the caller-owned lifecycle bit and
+         * registry row: shutdown must not destroy state the worker can still
+         * observe, and Android cannot rely on a native timed join fallback. */
         fprintf(stderr, // obs-ok:shutdown-join-straggler-note
                 "[shutdown] nat probe worker join did not complete within "
-                "%ds (rc=%d); waiting out the in-flight probe\n",
-                PSW_JOIN_TIMEOUT_SECS, rc);
-        pthread_join(w->tid, NULL);
+                "%ds (rc=%d); ownership and dependencies retained\n",
+                timeout_sec, rc);
+        return false;
     }
     w->started = false;
+    return true;
 }
 
 enum psw_state
