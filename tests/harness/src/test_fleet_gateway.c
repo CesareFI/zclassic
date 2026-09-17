@@ -576,6 +576,108 @@ _test_next:;
     return failures;
 }
 
+/* The kernel's single-argument limit, restated here independently of the
+ * gateway's own constant on purpose: a test that imported GW_CAP_NODE_INPUT
+ * would agree with a wrong value. Measured on Linux (MAX_ARG_STRLEN, 32
+ * pages): a 131071-byte argv string execs, 131072 is E2BIG. The node call
+ * spends 8 of those bytes on the "--input=" prefix. */
+#define GW_TEST_ARG_MAX 131071u
+#define GW_TEST_NODE_INPUT_MAX (GW_TEST_ARG_MAX - 8u)
+
+/* One steer_send whose body field is `filler` bytes of 'x'. Heap, because
+ * the point is a payload no stack buffer here should carry. */
+static char *gw_big_send(const char *gid, size_t filler)
+{
+    size_t cap = filler + 512;
+    char *json = malloc(cap);
+    int n;
+    if (!json)
+        return NULL;
+    n = snprintf(json, cap,
+                 "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"steer_send\",\"arguments\":{"
+                 "\"grant\":\"%s\",\"items\":[{\"to\":\"field-agent\","
+                 "\"ref\":\"bound-probe\",\"idempotency_key\":\"k-bound\","
+                 "\"body\":\"",
+                 gid);
+    if (n <= 0 || (size_t)n >= cap) {
+        free(json);
+        return NULL;
+    }
+    memset(json + n, 'x', filler);
+    snprintf(json + n + filler, cap - (size_t)n - filler, "\"}]}}}");
+    return json;
+}
+
+/* A node call carries its input in ONE argv string. The gateway advertises
+ * 1 MiB bodies, which is true of HTTP and was never true of the fork: an
+ * oversize call used to reach execv, die with E2BIG in the child, and come
+ * back as the opaque "node did not answer". It must now refuse before the
+ * fork, say the real number, and create nothing. */
+static int gw_t_node_input_bound(void)
+{
+    int failures = 0;
+    TEST("gateway: node input is bounded by what execv can carry, typed") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char gid[64];
+        char *json, *b;
+        int st = 0;
+        ASSERT(gw_mint(node, "brief,send,evidence", gid));
+
+        /* Comfortably below: whatever the node decides, it is the NODE that
+         * decides. The gateway must not pre-empt it, and the answer must
+         * never be the silence that E2BIG used to produce. */
+        json = gw_big_send(gid, 60u * 1024u);
+        ASSERT(json != NULL);
+        b = gw_post_auth("/steer", json, gid, &st);
+        free(json);
+        ASSERT(b != NULL);
+        ASSERT(st == 200);
+        ASSERT(!gw_body_has(b, "-32602"));
+        ASSERT(!gw_body_has(b, "node did not answer"));
+        free(b);
+
+        /* JUST below, through the real fork/exec: this is the invariant that
+         * matters — the largest input the gateway ADVERTISES as acceptable
+         * must be one this gateway can actually exec. A parser test cannot
+         * show that; only a real child can. The 1 KB of headroom covers the
+         * JSON scaffold and the grant the gateway adds to the input, so the
+         * argument built here lands within a kilobyte of the kernel's limit
+         * and still has to survive execv. */
+        json = gw_big_send(gid, GW_TEST_NODE_INPUT_MAX - 1024u);
+        ASSERT(json != NULL);
+        b = gw_post_auth("/steer", json, gid, &st);
+        free(json);
+        ASSERT(b != NULL);
+        ASSERT(st == 200);
+        ASSERT(!gw_body_has(b, "-32602"));
+        /* The node answered at all: the fork survived the near-max argv. */
+        ASSERT(!gw_body_has(b, "node did not answer"));
+        free(b);
+
+        /* Above the bound: a typed refusal carrying the real limit. */
+        json = gw_big_send(gid, GW_TEST_NODE_INPUT_MAX + 1024u);
+        ASSERT(json != NULL);
+        b = gw_post_auth("/steer", json, gid, &st);
+        free(json);
+        ASSERT(b != NULL);
+        ASSERT(st == 200);
+        ASSERT(gw_body_has(b, "-32602"));
+        ASSERT(gw_body_has(b, "at most"));
+        ASSERT(!gw_body_has(b, "node did not answer"));
+        free(b);
+
+        /* At the bound, stated as arithmetic: the argument the gateway
+         * builds is "--input=" plus the input, and that whole string must
+         * still fit in one argv slot. */
+        ASSERT(GW_TEST_NODE_INPUT_MAX + 8u == GW_TEST_ARG_MAX);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
 static int gw_t_calls(void)
 {
     int failures = 0;
@@ -2100,6 +2202,7 @@ int test_fleet_gateway(void)
     failures += gw_t_routes();
     failures += gw_t_handshake();
     failures += gw_t_calls();
+    failures += gw_t_node_input_bound();
     failures += gw_t_auth();
     failures += gw_t_oauth();
     failures += gw_t_life_send_ack();

@@ -169,25 +169,14 @@ static bool dvq_attempt(const struct zcl_command_request *req,
 /* A name is exactly one path segment under engine/<name>/: it must match
  * [A-Za-z0-9_.-]{1,64} and, like every segment dvq_path_ok accepts, it must
  * never be "." or ".." — a name of ".." would resolve the run directory one
- * level above the intended engine/ subtree. Dots inside a name stay legal. */
+ * level above the intended engine/ subtree. Dots inside a name stay legal.
+ *
+ * The grammar itself lives in zcl_devagent_name_ok so that whatever names
+ * queue work — a directive ref included — is judged by this exact rule and
+ * cannot accept work this queue would refuse. */
 static bool dvq_name_ok(const char *s)
 {
-    size_t n;
-    if (!s || !s[0])
-        return false;
-    n = strlen(s);
-    if (n > 64)
-        return false;
-    if (strcmp(s, ".") == 0 || strcmp(s, "..") == 0)
-        return false;
-    for (const char *p = s; *p; p++) {
-        bool ok = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                  (*p >= '0' && *p <= '9') || *p == '_' || *p == '.' ||
-                  *p == '-';
-        if (!ok)
-            return false;
-    }
-    return true;
+    return zcl_devagent_name_ok(s);
 }
 
 static bool dvq_kind_ok(const char *s)

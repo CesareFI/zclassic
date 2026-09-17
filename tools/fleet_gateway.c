@@ -82,6 +82,24 @@
 
 #define GW_CAP_HEADERS (64u * 1024u)
 #define GW_CAP_BODY (1024u * 1024u)
+/* A node call is one execv, and the tool input rides in ONE argv string.
+ *
+ * This bound is LINUX-SPECIFIC, not a POSIX guarantee: Linux caps a single
+ * argument at MAX_ARG_STRLEN = 32 pages = 131072 bytes including its
+ * terminator, measured on the deployment host (131071 bytes exec, 131072 is
+ * E2BIG). POSIX only promises ARG_MAX for the whole argument block and says
+ * nothing about a per-argument cap, so other kernels draw this line
+ * elsewhere. The gateway is deployed on Linux; a port must re-measure rather
+ * than inherit this number.
+ *
+ * The argument is "--input=" plus the JSON. Anything larger
+ * used to pass the 1 MiB body check, reach execv, fail with E2BIG in the
+ * child and surface as the opaque "node did not answer" — the gateway
+ * advertising a capacity it could not deliver. The HTTP body cap stays at
+ * 1 MiB for OAuth form posts; node-dispatched tool input is bounded here and
+ * refused before the fork, with the real number in the message. */
+#define GW_ARG_PREFIX "--input="
+#define GW_CAP_NODE_INPUT (131071u - (unsigned)(sizeof(GW_ARG_PREFIX) - 1u))
 #define GW_CAP_REPLY (4u * 1024u * 1024u)
 #define GW_CAP_RESP (5u * 1024u * 1024u)
 #define GW_BACKLOG 16
@@ -530,10 +548,13 @@ static struct gw_node_out gw_node_call(const char *node, const char *verb,
     struct gw_node_out out;
     int fds[2];
     pid_t pid;
-    char arg[GW_CAP_BODY + 32];
+    /* Sized to what execv can actually carry, not to the HTTP body cap: a
+     * buffer the kernel would reject can only produce a fork that dies. */
+    char arg[GW_CAP_NODE_INPUT + sizeof(GW_ARG_PREFIX) + 1];
     int n;
     memset(&out, 0, sizeof(out));
-    n = snprintf(arg, sizeof(arg), "--input=%s", input_json ? input_json : "{}");
+    n = snprintf(arg, sizeof(arg), GW_ARG_PREFIX "%s",
+                 input_json ? input_json : "{}");
     if (n <= 0 || (size_t)n >= sizeof(arg))
         return out;
     if (pipe(fds) != 0)
@@ -600,8 +621,8 @@ static const struct gw_tool gw_tools[] = {
      "Fleet situation: agents, work, blockers, capacity, candidates, evidence refs, changes since a cursor.",
      "{\"type\":\"object\",\"properties\":{\"grant\":{\"type\":\"string\"},\"since\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"}}}"},
     {"steer_send", "send",
-     "One bounded batch of directives to named agents; retries with the same idempotency keys never duplicate.",
-     "{\"type\":\"object\",\"required\":[\"items\"],\"properties\":{\"grant\":{\"type\":\"string\"},\"items\":{\"type\":\"array\",\"maxItems\":8},\"from\":{\"type\":\"string\"}}}"},
+     "One bounded batch of directives to named agents; retries with the same idempotency keys never duplicate. Every item carries a ref naming the work: 1-64 of [A-Za-z0-9_.-], never a path.",
+     "{\"type\":\"object\",\"required\":[\"items\"],\"properties\":{\"grant\":{\"type\":\"string\"},\"items\":{\"type\":\"array\",\"maxItems\":8,\"items\":{\"type\":\"object\",\"required\":[\"to\",\"body\",\"ref\",\"idempotency_key\"],\"properties\":{\"to\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"},\"ref\":{\"type\":\"string\",\"pattern\":\"^[A-Za-z0-9_.-]{1,64}$\"},\"idempotency_key\":{\"type\":\"string\"}}}},\"from\":{\"type\":\"string\"}}}"},
     {"steer_evidence", "evidence",
      "One bounded evidence object by exact reference; never a log.",
      "{\"type\":\"object\",\"required\":[\"type\",\"ref\"],\"properties\":{\"grant\":{\"type\":\"string\"},\"type\":{\"type\":\"string\"},\"ref\":{\"type\":\"string\"}}}"},
@@ -878,6 +899,16 @@ static void gw_forward_call(struct gw_buf *b, const struct json_value *id,
     struct gw_node_out out;
     struct json_value env;
     const struct json_value *data;
+    /* Refuse oversize input here, before the fork, so the caller gets a
+     * typed limit instead of a dead child reported as silence. */
+    if (input_text && strlen(input_text) > GW_CAP_NODE_INPUT) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "tool input is %zu bytes; one node call carries at most %u",
+                 strlen(input_text), (unsigned)GW_CAP_NODE_INPUT);
+        gw_rpc_error(b, id, -32602, msg);
+        return;
+    }
     out = gw_node_call(node, t->verb, input_text);
     if (!out.ok) {
         gw_rpc_error(b, id, -32000, "node did not answer");

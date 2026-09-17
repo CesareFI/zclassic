@@ -19,6 +19,7 @@
 #include "test/test_core.h"
 
 #include "command/native_command.h"
+#include "command/native_devagent.h"
 #include "command/native_fleet.h"
 #include "config/command_catalog.h"
 #include "controllers/rpc_client.h"
@@ -1208,6 +1209,122 @@ _test_next:;
     return failures;
 }
 
+/* Send one item and return the refusal code, or "" when it was accepted.
+ * Isolation and the grant belong to the caller so one root can carry the
+ * whole table. */
+static void fmx_ref_attempt(const char *gid, const char *ref, const char *key,
+                            char *out, size_t cap)
+{
+    struct fmx_call c;
+    struct json_value items, item;
+    const struct json_value *rows, *row, *v;
+    out[0] = '\0';
+    json_init(&items);
+    json_set_array(&items);
+    fmx_item(&item, "field-agent", "ref grammar probe", ref, key);
+    (void)json_push_back(&items, &item);
+    json_free(&item);
+    if (!fmx_send(&c, gid, &items)) {
+        json_free(&items);
+        snprintf(out, cap, "CALL_FAILED");
+        return;
+    }
+    json_free(&items);
+    rows = fmx_arr(&c, "items");
+    row = rows ? json_at(rows, 0) : NULL;
+    v = row ? json_get(row, "state") : NULL;
+    if (v && v->type == JSON_STR && strcmp(json_get_str(v), "refused") == 0) {
+        v = json_get(row, "error");
+        snprintf(out, cap, "%s",
+                 (v && v->type == JSON_STR) ? json_get_str(v) : "?");
+    }
+    fmx_end(&c);
+}
+
+/* The ingress ref grammar is the queue's grammar. A ref accepted here that
+ * the queue would refuse is work that can be delivered and never dispatched,
+ * which is exactly what this proves cannot happen. The hostile refs are the
+ * ones a live adversarial run actually sent at the deployed endpoint. */
+static int fmx_t_ref_grammar(void)
+{
+    int failures = 0;
+
+    TEST("steer: a ref the queue would refuse never becomes mail") {
+        static const char *hostile[] = {
+            "../../etc/passwd",   /* path-shaped: the live stress case */
+            "a/b",                /* any second segment at all */
+            "",                   /* empty names nothing */
+            ".",                  /* resolves to the run directory itself */
+            "..",                 /* resolves to its parent */
+            "has space",
+            "star*",              /* legal for a recipient, never for a ref */
+            "/absolute",
+            "back\\slash",
+            "ref;semi",
+            NULL
+        };
+        char gid[64], code[64];
+        size_t i;
+        char toolong[ZCL_DEVAGENT_NAME_MAX + 2];
+        fmx_isolate("ref_grammar");
+        ASSERT(fmx_mint("brief,send,evidence", gid, sizeof(gid)));
+
+        for (i = 0; hostile[i]; i++) {
+            char key[64];
+            snprintf(key, sizeof(key), "key-hostile-%zu", i);
+            fmx_ref_attempt(gid, hostile[i], key, code, sizeof(code));
+            /* Typed, and specifically about the ref. */
+            ASSERT(strcmp(code, "BAD_REF") == 0);
+            /* The one grammar: ingress and queue agree on every case. */
+            ASSERT(!zcl_devagent_name_ok(hostile[i]));
+        }
+
+        /* One byte over the bound is refused; exactly at the bound is not. */
+        memset(toolong, 'a', sizeof(toolong) - 1);
+        toolong[sizeof(toolong) - 1] = '\0';
+        fmx_ref_attempt(gid, toolong, "key-long", code, sizeof(code));
+        ASSERT(strcmp(code, "BAD_REF") == 0);
+        ASSERT(!zcl_devagent_name_ok(toolong));
+
+        /* Not one of them wrote a row. */
+        ASSERT_EQ(fmx_mail_count(), 0);
+
+        {
+            static const char *legal[] = {
+                "ext-181257",        /* the refs this fleet actually uses */
+                "probe-20260917",
+                "acc-20260917T183948Z",
+                "x",
+                "dot.ted",
+                "under_score",
+                NULL
+            };
+            long long expect = 0;
+            char maxlen[ZCL_DEVAGENT_NAME_MAX + 1];
+            memset(maxlen, 'b', sizeof(maxlen) - 1);
+            maxlen[sizeof(maxlen) - 1] = '\0';
+            for (i = 0; legal[i]; i++) {
+                char key[64];
+                snprintf(key, sizeof(key), "key-legal-%zu", i);
+                fmx_ref_attempt(gid, legal[i], key, code, sizeof(code));
+                ASSERT(code[0] == '\0');
+                ASSERT(zcl_devagent_name_ok(legal[i]));
+                expect++;
+                ASSERT_EQ(fmx_mail_count(), expect);
+            }
+            fmx_ref_attempt(gid, maxlen, "key-maxlen", code, sizeof(code));
+            ASSERT(code[0] == '\0');
+            ASSERT(zcl_devagent_name_ok(maxlen));
+        }
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
 static int fmx_t_board_absent(void)
 {
     int failures = 0;
@@ -1248,6 +1365,7 @@ int test_fleet_steer(void)
     failures += fmx_t_sent_local_ack();
     failures += fmx_t_grants();
     failures += fmx_t_revoke_cancels_queued();
+    failures += fmx_t_ref_grammar();
     failures += fmx_t_board_absent();
 
     /* No ASSERT lives in this function, so no goto needs the label: the

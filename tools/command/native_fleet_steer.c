@@ -1689,17 +1689,30 @@ static const char *fmc_item_str(const struct json_value *it, const char *k)
     return json_get_str(v);
 }
 
+/* `error` always receives the code the caller should report, so a refusal
+ * names which field was wrong instead of collapsing to one opaque code. */
 static bool fmc_item_shape_ok(const struct fmc_item_fields *f,
-                              const char *from)
+                              const char *from, const char **error)
 {
+    if (error)
+        *error = "BAD_INPUT";
     if (!fmc_is_token(f->to, FMC_NAME_MAX, true))
         return false;
     if (!f->body || !f->body[0] || strlen(f->body) > FMC_BODY_MAX)
         return false;
     if (!fmc_is_token(f->key, FMC_KEY_MAX, false))
         return false;
-    if (strlen(f->ref) > FMC_REF_MAX)
+    /* The ref names the queue row this directive is meant to become, so it
+     * must satisfy the queue's own grammar here, before any mail is
+     * written. Accepting a ref the queue would refuse used to produce a
+     * delivered directive that could never be dispatched — mail describing
+     * work with nowhere to go. Refused without normalizing: a ref is what
+     * the caller said it was, or it is refused. */
+    if (!zcl_devagent_name_ok(f->ref)) {
+        if (error)
+            *error = "BAD_REF";
         return false;
+    }
     if (from && (strlen(from) > FMC_NAME_MAX ||
                  !fmc_is_token(from, FMC_NAME_MAX, false)))
         return false;
@@ -1708,17 +1721,23 @@ static bool fmc_item_shape_ok(const struct fmc_item_fields *f,
 
 static bool fmc_send_item_fields(const struct json_value *it,
                                  const char *from,
-                                 struct fmc_item_fields *f)
+                                 struct fmc_item_fields *f,
+                                 const char **error)
 {
     const char *ref;
+    if (error)
+        *error = "BAD_INPUT";
     if (!it || it->type != JSON_OBJ || !f)
         return false;
     f->to = fmc_item_str(it, "to");
     f->body = fmc_item_str(it, "body");
     f->key = fmc_item_str(it, "idempotency_key");
+    /* A missing ref stays the empty string and is refused by the grammar:
+     * every directive is traceable by the ref it names, and "" names
+     * nothing. */
     ref = fmc_item_str(it, "ref");
     f->ref = ref ? ref : "";
-    return fmc_item_shape_ok(f, from);
+    return fmc_item_shape_ok(f, from, error);
 }
 
 /* One refused item result. */
@@ -1792,10 +1811,11 @@ static bool fmc_send_item(const struct zcl_command_request *req,
     struct fmc_item_fields f;
     long long seq;
     char why[64];
-    if (!fmc_send_item_fields(it, from, &f)) {
+    const char *shape_error = "BAD_INPUT";
+    if (!fmc_send_item_fields(it, from, &f, &shape_error)) {
         const char *to =
             (it && it->type == JSON_OBJ) ? fmc_item_str(it, "to") : NULL;
-        fmc_send_item_refused(items, index, to, "BAD_INPUT");
+        fmc_send_item_refused(items, index, to, shape_error);
         return false;
     }
     /* Reconcile: same key AND same payload returns the recorded accept

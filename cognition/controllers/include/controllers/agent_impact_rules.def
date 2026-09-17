@@ -3238,3 +3238,6 @@ AGENT_IMPACT_RULE("engine/composition/src/boot_beta6_bootstrap.c|engine/services
  * harness, and the user units it hosts under. The gateway forks the node's
  * fleet.steer leaves per call, so a change here re-runs both groups. */
 AGENT_IMPACT_RULE("tools/fleet_gateway.c|tools/zcl_fleet_front.c|tools/scripts/qualify_fleet_gateway_front.sh|platform/deploy/fleet-gateway/*|tests/harness/src/test_fleet_gateway.c", "fleet_gateway fleet_steer make_lint_gates")
+/* The steer leaf and its own suite: a ref accepted at ingress must satisfy
+ * the queue's grammar, so a change to either end has to run both groups. */
+AGENT_IMPACT_RULE("tools/command/native_fleet_steer.c|tests/harness/src/test_fleet_steer.c", "fleet_steer devagent_queue fleet_gateway make_lint_gates")

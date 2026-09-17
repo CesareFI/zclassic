@@ -54,6 +54,21 @@ bool zcl_devagent_verdict_parse(const char *text,
  * the worker gate, and the gateway evidence paths cannot drift apart. */
 bool zcl_devagent_closed_pass(const char *verdict, long long rc);
 
+/* ── the one directive-name grammar ───────────────────────────────────────
+ * A queue row is a directory named by its name, and a steer directive names
+ * the row it is meant to become. So both must accept exactly the same
+ * strings: [A-Za-z0-9_.-], 1..64 bytes, never "." or "..", never empty.
+ * A '/' is off the alphabet, so a path-shaped name cannot escape the run
+ * directory and cannot reach a second segment.
+ *
+ * One shared predicate because the two ends drifted once: fleet.steer.send
+ * accepted a ref that dev.agent.queue then refused with BAD_INPUT, which
+ * wrote mail describing work that could never be dispatched. Anything that
+ * names queue work validates here, so that gap cannot reopen. */
+#define ZCL_DEVAGENT_NAME_MAX 64u
+
+bool zcl_devagent_name_ok(const char *name);
+
 /* ── resident dev worker ──────────────────────────────────────────────────
  * The dev-only loop that consumes dev.agent.queue continuously. One active
  * job per worker; the queue stays the only ledger (claim/running/outcome
