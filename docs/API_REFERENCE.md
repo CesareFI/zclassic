@@ -74,15 +74,15 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 890 |
+| Registry entries (branches + leaves) | 891 |
 | Top-level roots | 14 |
 | Branches | 199 |
-| Leaves (dispatchable command paths) | 691 |
+| Leaves (dispatchable command paths) | 692 |
 | … `ready` (live handler in this build) | 613 |
-| … `compat` (metadata only, names a fallback) | 48 |
+| … `compat` (metadata only, names a fallback) | 49 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
-| … dev-gated 🔧 (`ready` only in `z23-dev`) | 47 |
-| Leaves with `effect=mutate` | 252 |
+| … dev-gated 🔧 (`ready` only in `z23-dev`) | 48 |
+| Leaves with `effect=mutate` | 253 |
 | Leaves with `effect=destructive` | 6 |
 | Leaves requiring **owner** authority | 130 |
 
@@ -96,7 +96,7 @@ Per source file:
 | `engine/composition/commands/app_features.def` | 75 | 20 | 55 |
 | `engine/composition/commands/store.def` | 19 | 0 | 19 |
 | `engine/composition/commands/ops.def` | 59 | 11 | 48 |
-| `engine/composition/commands/dev.def` | 110 | 22 | 88 |
+| `engine/composition/commands/dev.def` | 111 | 22 | 89 |
 | `engine/composition/commands/code.def` | 33 | 4 | 29 |
 | `engine/composition/commands/accounts.def` | 11 | 2 | 9 |
 | `engine/composition/commands/vault.def` | 24 | 4 | 20 |
@@ -849,6 +849,7 @@ represented by its children's sections.
 | `dev agent ticketkey` | ready | read / read / operator · fast/low | `group`, `cwd`, `tip` | `zcl.agent_ticketkey.v1` | `z23 dev agent ticketkey --group=devagent_situation` | Commuting-ticket key of one test group at one tip |
 | `dev agent queue` | compat 🔧 → `z23-dev dev agent queue` | mutate / dev-mutation / operator · fast/low | **`action`**, `kind`, `name`, `group`, `path`, `brief`, `model`, `attempt`, `json`, `cwd`, `worker`, `session` | `zcl.agent_queue.v1` | `z23 dev agent queue post --kind=leaf --name=situation` | Post, dispatch, reap, and inspect async flash-unit runs without blocking — *the unit queue is a development-lane coordination surface* |
 | `dev agent worker` | compat 🔧 → `z23-dev dev agent worker` | mutate / dev-mutation / operator · foreground/moderate | **`action`**, `worker`, `session`, `model`, `deadline_s`, `idle_start_s`, `idle_limit_s`, `max_jobs`, `time_cap_s`, `cpu_s`, `mem_mb`, `token_cap` | `zcl.agent_worker.v1` | `z23 dev agent worker run --worker=resident-a --max_jobs=1` | Consume the unit queue continuously with a bounded resident worker — *the resident worker is a development-lane coordination surface* |
+| `dev agent receive` | compat 🔧 → `z23-dev dev agent receive` | mutate / dev-mutation / operator · foreground/low | **`action`**, `receiver`, `deadline_s`, `wait_ms`, `max_beats` | `zcl.agent_receive.v1` | `z23 dev agent receive status --receiver=box-a` | Turn directives arriving in this box's agent mail into queued work — *the resident receiver is a development-lane coordination surface* |
 | `dev agent mail` | compat 🔧 → `z23-dev dev agent mail` | mutate / dev-mutation / operator · fast/low | **`action`**, `to`, `kind`, `body`, `since`, `from`, **`cursor`**, `agent`, `ref`, `cwd` | `zcl.agent_mail.v1` | `z23 dev agent mail post --to=* --kind=note --body=hello` | Post, pull, and ack async agent mail without blocking — *agent mail is a development-lane coordination surface* |
 
 #### `dev.lane` — Agent worktree with independent inodes

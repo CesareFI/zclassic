@@ -1,0 +1,116 @@
+[Unit]
+Description=Z23 resident mail receiver for agent identity %i (admits directives, queues work, runs nothing itself)
+# ONE PER BOX, and the instance name is this box's OWN mail identity — the
+# name peers address their directives to — not a checkout name. A second
+# copy is not a second worker: it refuses at once, because the loop holds
+# <state>/receive/receive.lock exclusively with flock(2) and a second drive
+# reports RECEIVE_BUSY instead of waiting.
+#
+# WHAT IT DOES. It waits on the mail directory with a directory watcher, and
+# on every wake it pulls kind=directive rows addressed to %i, admits the ones
+# an owner-minted fleet.steer grant names, writes each admitted direction to
+# a brief file under the owner-private state root, posts it to the existing
+# dev.agent.queue under the directive's own ref, and answers the sender under
+# that same ref with the queue sequence and the brief digest. A refusal
+# answers under the same ref with its reason. That is the whole job.
+#
+# WHAT IT DOES NOT DO. It does not execute anything, build anything, grade
+# anything, or spawn a process. Execution belongs to the dev.agent.worker
+# resident loop, which posts the result row under the same ref. This unit
+# runs NO node: no datadir, no P2P or RPC port, no wallet, no listener. It
+# therefore cannot touch the operator's live node or any lane's datadir.
+#
+# WHAT ADMISSION PROVES, PLAINLY. A grant of the owner's naming a sender
+# label. Nothing in the tree signs or verifies an agent-mail row today: an
+# inbox.<peer>.jsonl file's provenance is its filename plus whatever
+# transport wrote it. So "admitted" means "an owner-minted grant names this
+# sender", never "this sender was cryptographically authenticated". Signed
+# peer ingress exists only for fleet.ledger.replicate and fleet.board.post;
+# routing directives over that signed board is the future path, and until
+# then the honest threat model is: anyone who can write this box's mail
+# directory can speak as any granted label.
+#
+# Deliberately NOT installable at boot: there is no [Install] section, so
+# `systemctl --user enable` refuses until the operator adds one on purpose.
+#
+# Install (the operator does this, never an agent):
+#   cp platform/deploy/zcl-agent-receive@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start zcl-agent-receive@box-a
+#   systemctl --user status zcl-agent-receive@box-a
+#   journalctl --user -u zcl-agent-receive@box-a -f
+#   z23-dev dev agent receive status --receiver=box-a
+#
+# Grant a sender before starting it, or every directive is refused:
+#   z23 fleet steer grant --action=mint --scopes=send --label=<peer> --ttl_seconds=<seconds>
+#   z23 fleet steer grant --action=revoke --id=<id>   # effective on the next beat
+#
+# Linger, so the receiver survives logout like every other resident service:
+#   loginctl enable-linger "$USER"
+#
+# Remove completely:
+#   systemctl --user stop zcl-agent-receive@box-a
+#   rm ~/.config/systemd/user/zcl-agent-receive@.service
+#   systemctl --user daemon-reload
+#   rm -rf ~/.local/state/z23/dev/receive
+
+# A crashed receiver should come back, but one that cannot start must not
+# spin: five failures in ten minutes and systemd gives up. "Cannot start"
+# here is an honest refusal — another receiver holds the lock, the state root
+# is unwritable, or the mail directory cannot be watched — and none of those
+# is fixed by retrying.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+
+# One process that parks in a directory-watcher wait and, on each wake,
+# appends a few small files. It is neither a compile nor a scan, and it must
+# always lose to the live node and the dev lanes.
+CPUQuota=50%
+CPUWeight=10
+IOWeight=10
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+# Sized to fit under check-systemd-memory-budget beside the live node, the
+# mind and the dev lanes. A beat holds one mail pull's rows and one brief; if
+# a future direction format ever needs more, raise this on purpose and re-run
+# the budget gate rather than dropping the cap.
+MemoryHigh=256M
+MemoryMax=512M
+MemorySwapMax=128M
+TasksMax=32
+OOMScoreAdjust=500
+
+# deadline_s bounds a single drive; Restart=on-failure plus this unit's
+# restart limit is what makes the loop resident across days, and every
+# decision is re-derived from files on the next drive, so a restart between
+# beats neither loses a ref nor executes one twice.
+ExecStart=%h/github/zclassic23/build/bin/z23-dev dev agent receive run --receiver=%i --deadline_s=86400 --wait_ms=1000
+
+# The resident handles SIGTERM cooperatively: it stops taking new work at the
+# next check, the watcher wait returns within its stop-sample slice, and the
+# drive finishes the beat it is in. A ref's record cannot be torn by that —
+# the brief is installed by rename(2) and the queue row is the queue's own
+# single append.
+KillMode=control-group
+TimeoutStopSec=60
+
+Restart=on-failure
+RestartSec=30
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Exactly the paths a beat writes: this box's owner-private dev state root
+# (mail, grants, briefs, queue rows, answered markers) and the checkout, whose
+# build directory is where the dev binary keeps its own lock and telemetry
+# files. It never writes a datadir and never reads one.
+ReadWritePaths=%h/.local/state/z23
+ReadWritePaths=%h/github/zclassic23
+
+StandardOutput=journal
+StandardError=journal

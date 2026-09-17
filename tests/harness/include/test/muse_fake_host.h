@@ -10,6 +10,7 @@
 
 #include "services/muse_session.h"
 #if !defined(_WIN32)
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #endif
@@ -54,6 +55,43 @@ static void fake_note(const char *fmt, const char *a, const char *b)
         (void)write(s_evidence_fd, buf, (size_t)n);
         (void)write(s_evidence_fd, "\n", 1);
     }
+}
+
+/* One absolute path the scripted turn creates in the claimed workspace;
+ * "" writes nothing. The executor measures the workspace AFTER the turn,
+ * so a case that wants a real post-turn change must have the TURN make it:
+ * dirtying the workspace beforehand is baseline dirt, which the executor
+ * now refuses on purpose before spending a token. */
+static char s_fake_write_path[4096] = "";
+
+/* mkdir -p over the parent directories of an absolute path. */
+static void fake_mkdirs(const char *path)
+{
+    char tmp[4096];
+    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) return;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        (void)mkdir(tmp, 0755);
+        *p = '/';
+    }
+}
+
+/* The turn's own edit, laid down after the turn is accepted and before any
+ * terminal: exactly where a real model's write would land. */
+static void fake_turn_write(void)
+{
+    FILE *f;
+    if (!s_fake_write_path[0]) return;
+    fake_mkdirs(s_fake_write_path);
+    f = fopen(s_fake_write_path, "wb");
+    if (!f) {
+        fake_note("write-failed:%s", s_fake_write_path, "");
+        return;
+    }
+    (void)fputs("the turn wrote this\n", f);
+    (void)fclose(f);
+    fake_note("wrote:%s", s_fake_write_path, "");
 }
 
 static bool fake_gets(FILE *in, char *buf, size_t cap)
@@ -365,6 +403,8 @@ static void fake_main(enum fake_mode mode)
                 "\"disposition\":\"started\"}",
                 cmd, mode == FAKE_RETRY ? "turn-fixed" : cmd);
             fake_result(out, fake_id(line), res);
+            /* The turn is live now: its edit lands before any terminal. */
+            fake_turn_write();
             if (mode == FAKE_JOURNEY)
                 fake_journey_turn(in, out, sid, cmd, 0);
             else if (mode == FAKE_UNKNOWN) {

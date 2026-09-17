@@ -1,0 +1,189 @@
+[Unit]
+Description=Z23 resident unit-queue worker for agent identity %i (claims one job, runs the model turn, records the gate's verdict)
+# ONE PER BOX, and the instance name is this box's OWN worker identity — the
+# name that appears in the claim and in the result row — not a checkout name.
+# A second copy is not a second worker: it refuses at once, because the drive
+# holds worker.lock beside the queue with flock(2) non-blocking for the whole
+# drive and a second drive refuses instead of waiting.
+#
+# WHAT IT DOES. This is the EXECUTION half of the pair the receiver unit
+# already describes. zcl-agent-receive@ turns a directive into a
+# dev.agent.queue row and executes nothing; this unit consumes those rows.
+# On each drive it claims ONE job, flips the claim to submitted, forks the
+# executor, which opens a Muse session in the claimed workspace and runs one
+# bounded model turn, judges the result through the registered gate the row
+# names, writes receipt.json plus run.out for the existing reap, and posts a
+# result mail row under the SAME ref. Then it repeats. That is the whole job.
+#
+# WHAT IT DOES NOT DO. It is not a scheduler: post/next/reap/status/cancel
+# remain the only queue contract, and this unit invents no retry and no
+# requeue. It runs NO node: no datadir, no P2P or RPC port, no wallet, no
+# listener. It has no push, deploy, or wallet authority. It therefore cannot
+# touch the operator's live node or any lane's datadir.
+#
+# WHAT A PASS PROVES, PLAINLY. A model terminal of "completed" is not a pass.
+# The receipt says "pass" only when the executor's own word is pass with
+# rc 0, the candidate artifact exists, evidence is present, and the tokens
+# fit the cap — and the executor itself only says pass when the named gate
+# passed over a measured non-empty diff, the workspace was measurably clean
+# before the turn, and every measured changed path is inside the declared
+# scope. Everything else keeps its own word (failed, gate-refused, timeout,
+# crashed, no-receipt, limit-exceeded) and stays incomplete. An unmeasurable
+# measurement is a refusal, never a pass.
+#
+# Deliberately NOT installable at boot: there is no [Install] section, so
+# `systemctl --user enable` refuses until the operator adds one on purpose.
+#
+# Install (the operator does this, never an agent):
+#   cp platform/deploy/zcl-agent-worker@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start zcl-agent-worker@resident-a
+#   systemctl --user status zcl-agent-worker@resident-a
+#   journalctl --user -u zcl-agent-worker@resident-a -f
+#   z23-dev dev agent worker status --worker=resident-a
+#
+# Linger, so the worker survives logout like every other resident service:
+#   loginctl enable-linger "$USER"
+#
+# Remove completely:
+#   systemctl --user stop zcl-agent-worker@resident-a
+#   rm ~/.config/systemd/user/zcl-agent-worker@.service
+#   systemctl --user daemon-reload
+#
+# A crashed worker should come back, but one that cannot start must not
+# spin: five failures in ten minutes and systemd gives up. "Cannot start"
+# here is an honest refusal — another drive holds worker.lock, the state
+# root is unwritable, or the model host cannot be launched — and none of
+# those is fixed by retrying. The clean hourly exit below is NOT a failure
+# and does not count against this limit.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+
+# THE MODEL HOST IS FOUND ON PATH, AND A USER UNIT HAS NO LOGIN PATH.
+# The executor opens its session by fork + execvp of the BARE name "muse"
+# (contexts/commons/services/src/muse_session.c: `const char *host =
+# serve_argv0 ? serve_argv0 : "muse";` then `execvp(host, ...)`). No
+# environment variable, no task field and no CLI flag overrides that host
+# path. execvp PATH-searches, and a systemd user unit does NOT inherit the
+# login shell's PATH — it gets the manager's default, which does not
+# include %h/.local/bin. Without this line EVERY Muse turn fails at session
+# open, on a box where `muse` works perfectly in a terminal. /usr/bin is
+# here too because the executor also spawns git for its measurements.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# This unit forks a model host and, for the gate, a test runner, so it is
+# heavier than the receiver. It must still always lose to the live node and
+# the dev lanes.
+CPUQuota=200%
+CPUWeight=20
+IOWeight=20
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# The owner-approved unattended ceiling is 1G of RAM, and this is where that
+# ceiling actually holds: the cgroup bounds the worker, the model host and
+# the gate run together. Sized to fit under check-systemd-memory-budget
+# beside the live node, the mind and the dev lanes; the finite
+# MemoryMax(+MemorySwapMax) sum that gate adds up stays far below the host
+# guardrail with this unit counted.
+#
+# BE HONEST ABOUT WHAT 1G MEANS: a heavy gate group will be OOM-killed under
+# it. That is fail-closed, not silent — the parent crash-records the child,
+# reap records the ref incomplete with no receipt, and nothing ever reads as
+# a pass. Raising the ceiling is an owner decision, and it requires
+# re-running the budget gate; do not raise it here to make a job fit.
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=256M
+# The forked chain is worker -> executor -> model host, plus the gate's test
+# runner and its own workers. 32 (the receiver's value) would refuse the
+# gate run outright; 512 is a realistic ceiling for one job that still
+# cannot fork without bound.
+TasksMax=512
+OOMScoreAdjust=500
+
+# The caps the owner approved, expressed as the leaf's OWN flags so they are
+# visible in the process line and not only in a cgroup. The executor REFUSES
+# a wall cap under 30s, so 600 is well inside the admitted range (the leaf
+# bounds time_cap_s to 1..3600 and token_cap to 1..1000000).
+#
+# --token_cap=200000 IS MEASURED, NOT PREFERRED. A real turn on this host
+# was run through this seam. At a 32000 cap it refused instantly with "token
+# budget spent mid-turn"; the passing run measured input=42396,
+# output=1078, total=43474 for the most trivial possible task (create one
+# file holding one line). muse_session charges the host's CUMULATIVE total
+# as the turn's spend, and that figure includes prompt and tool context, so
+# roughly 42k is FIXED COST before the model does anything useful and any
+# ceiling near 32k sits below the floor cost of every turn. 200000 is the
+# Muse module's own default and leaves about 156k of working budget above
+# that fixed context. The wall cap and the RAM cap below are what actually
+# keep a run bounded; the token cap is not a useful bound on its own.
+#
+# --mem_mb=1024 is RLIMIT_AS on the forked executor child. The cgroup's
+# MemoryMax below is the outer bound that actually holds, because it covers
+# the whole chain — worker, executor, model host and gate run together.
+#
+# --deadline_s=3600 is the MAXIMUM the leaf admits (bounded 1..3600), and
+# the drive loop exits cleanly once that wall passes. There is NO value that
+# makes this loop run for a day, unlike the receiver, whose deadline_s
+# ceiling is 86400. --idle_limit_s=600 is likewise the maximum, so an empty
+# queue parks for ten minutes rather than the 60s default before the drive
+# ends.
+ExecStart=%h/github/zclassic23/build/bin/z23-dev dev agent worker run --worker=%i --deadline_s=3600 --idle_limit_s=600 --time_cap_s=600 --token_cap=200000 --mem_mb=1024
+
+# Restart=always, NOT on-failure, AND THAT IS THE WHOLE POINT. This loop
+# exits with status 0 by design — at the deadline above, at the idle limit,
+# or at a job cap. on-failure does not restart a process that exited 0, so
+# copying the receiver's restart policy would produce a unit that installs,
+# starts, passes a status check, and then quietly stops consuming work
+# within the hour. The clean exit is expected; the restart is what makes the
+# loop resident across days.
+#
+# A RESTART CANNOT DOUBLE-EXECUTE A REF. dev.agent.queue's claim persists
+# claim.json with submitted:false before this leaf ever sees the job, and
+# the leaf flips it to submitted:true immediately BEFORE forking the
+# executor. A restart adopts orphans by that flag: submitted:false with no
+# receipt is safe to run exactly once, while submitted:true — or a claim
+# that cannot be read — with no receipt is crash-recorded and NEVER
+# resubmitted. A finished name is refused by claim itself. So restarting
+# freely does not weaken at-most-once.
+Restart=always
+RestartSec=10
+
+# SIGTERM finishes nothing new: the drive takes no further claims, the wait
+# slices honor it, and the in-flight job's child is killed and
+# crash-recorded rather than left to look unfinished. TimeoutStopSec is
+# above the 600s job wall cap so a job in flight is not torn down before
+# the watchdog has recorded it.
+KillMode=control-group
+TimeoutStopSec=660
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Exactly the paths a drive writes: this box's owner-private dev state root
+# (queue rows, claims, run dirs, receipts, mail outbox), the checkout, whose
+# build directory holds the dev binary's own lock and telemetry files, and
+# the lane root, because the claimed workspace a row names is a lane
+# worktree and the model turn edits it. It never writes a datadir and never
+# reads one.
+#
+# A row naming a workspace outside these paths fails on a read-only
+# filesystem instead of being written — fail-closed, and visible in the
+# journal rather than silent.
+#
+# NOT PROVEN HERE: the model host's own state directory. Nothing in this
+# tree names where `muse` keeps its config or cache, so no path for it is
+# declared, and on a fresh box the first turn may fail at session open with
+# a write error. That is an operator drop-in adding one ReadWritePaths line,
+# not a reason to widen ProtectHome.
+ReadWritePaths=%h/.local/state/z23
+ReadWritePaths=%h/github/zclassic23
+ReadWritePaths=%h/.z23
+
+StandardOutput=journal
+StandardError=journal

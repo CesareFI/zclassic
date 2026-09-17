@@ -26,6 +26,11 @@
 #define MR_GATE_LOG_MAX (256u * 1024u)
 #define MR_LINE_MAX (1024u * 1024u)
 #define MR_GIT_TIMEOUT_MS 60000
+/* Bound on one porcelain capture. zcl_spawn_capture discards whatever
+ * overruns its buffer and still reports the child's exit status, so a
+ * capture that fills its bound is INDISTINGUISHABLE from a complete one
+ * and must be treated as unmeasurable, never as a short change set. */
+#define MR_AUDIT_MAX (256u * 1024u)
 
 static const char *mr_verdict_pass = "pass";
 static const char *mr_verdict_failed = "failed";
@@ -331,17 +336,27 @@ static void mr_report_short(const struct muse_run_task *t,
 
 /* --- measured helpers ------------------------------------------------------ */
 
+/* True when a capture filled its bound: the helper silently discards the
+ * overrun, so a full buffer proves only that the measurement is unknown. */
+static bool mr_capture_truncated(const char *buf, size_t cap)
+{
+    return cap == 0 || strlen(buf) + 1 >= cap;
+}
+
+/* -1 is UNMEASURABLE and is never the same answer as 0, which is a
+ * measured clean tree: a failed spawn, a non-zero git, or a capture that
+ * filled its bound all refuse rather than under-report the count. */
 static long long mr_files_changed(const char *workspace)
 {
     const char *argv[] = { "git", "-C", workspace, "status", "--porcelain",
                            NULL };
-    char *buf = zcl_malloc(MR_GATE_LOG_MAX, "muse_run.git_out");
+    char *buf = zcl_malloc(MR_AUDIT_MAX, "muse_run.git_out");
     long long count = 0;
     int rc;
     if (!buf) return -1;
     buf[0] = '\0';
-    rc = zcl_spawn_capture(argv, buf, MR_GATE_LOG_MAX, MR_GIT_TIMEOUT_MS);
-    if (rc != 0) {
+    rc = zcl_spawn_capture(argv, buf, MR_AUDIT_MAX, MR_GIT_TIMEOUT_MS);
+    if (rc != 0 || mr_capture_truncated(buf, MR_AUDIT_MAX)) {
         free(buf);
         return -1;
     }
@@ -472,6 +487,152 @@ static void mr_fold_others(const char *workspace, char *acc, size_t acc_cap,
         *used += (size_t)w;
     }
     free(list);
+}
+
+/* --- the scope audit ------------------------------------------------------
+ * THE MODEL PROPOSES. THE GATE DECIDES — and the SCOPE is decided here, by
+ * measured output. The allow prefix handed to the session binds only the
+ * moment the model asks for approval; it proves nothing about what the
+ * workspace holds afterwards. So the run re-measures the change set through
+ * the SAME `git status --porcelain` invocation mr_files_changed counts, and
+ * judges every path it names. */
+
+/* Inside the declared scope: the path IS the scope, or it lives under it.
+ * A scope naming a directory admits its contents and never a sibling whose
+ * name merely starts the same way ("docs/" never admits "docsevil/x"), and
+ * any path carrying ".." or a leading '/' is outside by definition. */
+static bool mr_in_scope(const char *path, const char *scope)
+{
+    size_t n;
+    if (!path || !path[0] || !scope || !scope[0]) return false;
+    if (path[0] == '/' || strstr(path, "..") != NULL) return false;
+    n = strlen(scope);
+    while (n > 0 && scope[n - 1] == '/') n--;
+    if (n == 0) return false;
+    if (strncmp(path, scope, n) != 0) return false;
+    if (path[n] == '\0') return true;
+    return path[n] == '/';
+}
+
+/* Appends one escaped element to a bounded JSON array body. False once the
+ * bound is reached: one run's change set can never write without limit, and
+ * the body stays valid JSON at every truncation point. */
+static bool mr_list_push(char *buf, size_t cap, size_t *used,
+    const char *path)
+{
+    char esc[1024];
+    int w;
+    if (!buf || cap == 0 || *used >= cap) return false;
+    mr_esc(path, esc, sizeof(esc));
+    w = snprintf(buf + *used, cap - *used, "%s\"%s\"",
+        *used > 0 ? "," : "", esc);
+    if (w <= 0 || (size_t)w >= cap - *used) {
+        buf[*used] = '\0';
+        return false;
+    }
+    *used += (size_t)w;
+    return true;
+}
+
+/* One measurement pass. scope NULL records the paths without judging them:
+ * that is the pre-state pass, where any path at all is already a refusal. */
+struct mr_audit {
+    const char *scope;
+    char *list;
+    size_t list_cap;
+    size_t list_used;
+    char *outside;
+    size_t outside_cap;
+    size_t outside_used;
+    long long total;
+    long long outside_total;
+    /* Rows the parser could not read. Silently dropping one would hide a
+     * path, so any non-zero value makes the whole pass unmeasurable. */
+    long long unreadable;
+};
+
+static void mr_audit_init(struct mr_audit *a, const char *scope, char *list,
+    size_t list_cap, char *outside, size_t outside_cap)
+{
+    memset(a, 0, sizeof(*a));
+    a->scope = scope;
+    a->list = list;
+    a->list_cap = list_cap;
+    a->outside = outside;
+    a->outside_cap = outside_cap;
+    if (list && list_cap > 0) list[0] = '\0';
+    if (outside && outside_cap > 0) outside[0] = '\0';
+}
+
+/* One measured path: counted in full, recorded while the bound allows, and
+ * judged against the scope. A row that names nothing is unreadable, never
+ * an absence. */
+static void mr_audit_path(struct mr_audit *a, const char *path)
+{
+    if (!path || !path[0]) {
+        a->unreadable++;
+        return;
+    }
+    a->total++;
+    (void)mr_list_push(a->list, a->list_cap, &a->list_used, path);
+    if (!a->scope || mr_in_scope(path, a->scope)) return;
+    a->outside_total++;
+    (void)mr_list_push(a->outside, a->outside_cap, &a->outside_used, path);
+}
+
+/* One porcelain row -> the path or paths it names. The two status
+ * characters and their separator are fixed-width. A rename row names two
+ * paths and BOTH are judged: moving a file out of scope changes it just as
+ * surely as editing it does. */
+static void mr_audit_row(struct mr_audit *a, char *line)
+{
+    char *arrow;
+    if (strlen(line) < 4) {
+        a->unreadable++;
+        return;
+    }
+    line += 3;
+    arrow = strstr(line, " -> ");
+    if (arrow) {
+        *arrow = '\0';
+        mr_audit_path(a, mr_dequote(line));
+        line = arrow + 4;
+    }
+    mr_audit_path(a, mr_dequote(line));
+}
+
+/* The measured change set, through the porcelain seam the diff count
+ * already uses. False when the change set could not be MEASURED: a failed
+ * allocation, a failed spawn, a non-zero or timed-out git, a capture that
+ * filled its bound, or a row the parser could not read. Every one of those
+ * is a refusal input. None of them may ever read as "clean" or as "nothing
+ * outside scope" — a silent default there turns this whole audit from a
+ * guarantee into decoration. */
+static bool mr_audit_scan(const char *workspace, struct mr_audit *a)
+{
+    /* -uall on purpose: the default collapses a wholly untracked
+     * directory to its own name, and while that is still sound for the
+     * judgement (the directory name is a prefix of everything inside it,
+     * so a collapse can never hide an out-of-scope path), the changed
+     * list IS the proof that the permission was respected. Name the
+     * files. Same seam, same binary, one flag. */
+    const char *argv[] = { "git", "-C", workspace, "status", "--porcelain",
+                           "-uall", NULL };
+    char *buf = zcl_malloc(MR_AUDIT_MAX, "muse_run.audit");
+    int rc;
+    bool ok;
+    if (!buf) return false;
+    buf[0] = '\0';
+    rc = zcl_spawn_capture(argv, buf, MR_AUDIT_MAX, MR_GIT_TIMEOUT_MS);
+    if (rc != 0 || mr_capture_truncated(buf, MR_AUDIT_MAX)) {
+        free(buf);
+        return false;
+    }
+    for (char *line = strtok(buf, "\n"); line; line = strtok(NULL, "\n"))
+        mr_audit_row(a, line);
+    ok = a->unreadable == 0;
+    free(buf);
+    return ok;
 }
 
 /* SHA-1 over the post-run change set: the tracked diff plus one
@@ -701,6 +862,10 @@ static void mr_write_facts(const struct muse_run_task *t,
         "\"ms\":%lld},"
         "\"tokens\":{\"input\":%llu,\"output\":%llu,\"total\":%llu},"
         "\"duration_ms\":%lld,\"wall_ms\":%lld,\"files_changed\":%lld,"
+        "\"scope_audit\":{\"pre_measured\":%s,\"pre_clean\":%s,"
+        "\"pre_count\":%lld,\"pre\":[%s],\"changed_measured\":%s,"
+        "\"changed_count\":%lld,\"changed\":[%s],"
+        "\"outside_count\":%lld,\"outside\":[%s]},"
         "\"prior_unresolved\":%s}",
         t->ref.seq, t->ref.name, t->ref.attempt,
         t->worker, esc_gate, t->scope,
@@ -715,6 +880,12 @@ static void mr_write_facts(const struct muse_run_task *t,
         r->gate_ran, r->gate_failed, r->gate_ms,
         r->input_tokens, r->output_tokens, r->total_tokens,
         r->duration_ms, r->wall_ms, r->files_changed,
+        r->scope_pre_measured ? "true" : "false",
+        r->scope_pre_clean ? "true" : "false",
+        r->scope_pre_count, r->scope_pre,
+        r->scope_changed_measured ? "true" : "false",
+        r->scope_changed_count, r->scope_changed,
+        r->scope_outside_count, r->scope_outside,
         r->prior_unresolved ? "true" : "false");
     (void)mr_write_atomic(path, body);
     free(body);
@@ -730,6 +901,83 @@ struct mr_core {
     int gate_timeout_ms;
     uint64_t max_tokens;
 };
+
+/* BEFORE the turn. A workspace that is already dirty can prove nothing,
+ * because its pre-existing edits would count toward the non-empty diff a
+ * pass requires. So this refuses before a single token is spent: no
+ * session, no turn, and the offending paths named in the evidence.
+ * `build/` is gitignored, so an already-built workspace is still clean.
+ * "refused" is the verb, not "failed": this file already spends "refused"
+ * on every breakdown that stops the run BEFORE judgement (no host, no
+ * submit, unmeasurable diff), and nothing was judged here either. The
+ * detail rides the evidence, never the verdict string. */
+static bool mr_prestate_clean(struct mr_core *c)
+{
+    const struct muse_run_task *t = c->task;
+    struct muse_run_result *r = c->res;
+    struct mr_audit a;
+    mr_audit_init(&a, NULL, r->scope_pre, sizeof(r->scope_pre), NULL, 0);
+    if (!mr_audit_scan(t->workspace, &a)) {
+        /* UNMEASURABLE, which is not clean: the count stays -1 so the
+         * evidence can never be read as a measured empty tree. */
+        r->scope_pre_measured = false;
+        r->scope_pre_count = -1;
+        r->scope_pre_clean = false;
+        (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+            mr_verdict_refused);
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "workspace pre-state unmeasurable: %lld unreadable row(s)",
+            a.unreadable);
+        return false;
+    }
+    r->scope_pre_measured = true;
+    r->scope_pre_count = a.total;
+    r->scope_pre_clean = a.total == 0;
+    if (r->scope_pre_clean) return true;
+    (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+        mr_verdict_refused);
+    (void)snprintf(r->reason, sizeof(r->reason),
+        "workspace dirty before the turn: %lld path(s) [%s]",
+        a.total, r->scope_pre);
+    return false;
+}
+
+/* AFTER the turn. Every measured path must be inside the declared scope.
+ * Measured BEFORE the gate is run, so what is judged is the model's own
+ * output and never the gate's side effects. The changed list is the proof
+ * that the permission was actually respected: that is the whole point.
+ * "failed" is the verb here, not "refused": the turn ran, produced output,
+ * and that output was judged and rejected. */
+static bool mr_scope_clean(struct mr_core *c)
+{
+    const struct muse_run_task *t = c->task;
+    struct muse_run_result *r = c->res;
+    struct mr_audit a;
+    mr_audit_init(&a, t->scope, r->scope_changed, sizeof(r->scope_changed),
+        r->scope_outside, sizeof(r->scope_outside));
+    if (!mr_audit_scan(t->workspace, &a)) {
+        /* UNMEASURABLE, which is not "nothing outside scope": both counts
+         * stay -1 and the verdict stays the refused this file already
+         * spends on a breakdown before judgement. */
+        r->scope_changed_measured = false;
+        r->scope_changed_count = -1;
+        r->scope_outside_count = -1;
+        (void)snprintf(r->reason, sizeof(r->reason),
+            "workspace change set unmeasurable: %lld unreadable row(s)",
+            a.unreadable);
+        return false;
+    }
+    r->scope_changed_measured = true;
+    r->scope_changed_count = a.total;
+    r->scope_outside_count = a.outside_total;
+    if (a.outside_total == 0) return true;
+    (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
+        mr_verdict_failed);
+    (void)snprintf(r->reason, sizeof(r->reason),
+        "%lld path(s) outside scope %s: [%s]", a.outside_total,
+        t->scope, r->scope_outside);
+    return false;
+}
 
 /* Prior admitted turn without a terminal: a fresh host cannot cancel
  * a dead host's turn (sessionNotLoaded), so the gate still judges
@@ -845,6 +1093,9 @@ static int mr_judge(struct mr_core *c, char *gate_log, size_t logcap,
             "worktree diff unmeasurable");
         return 1;
     }
+    /* Measured before the gate runs: the change set judged here is the
+     * model's output, never the gate's own side effects. */
+    if (!mr_scope_clean(c)) return 1;
     if (!mr_run_gate(t->workspace, t->gate, c->gate_timeout_ms, gate_log,
             logcap, &r->gate_ms, &gate)) {
         (void)snprintf(r->reason, sizeof(r->reason),
@@ -861,7 +1112,12 @@ static int mr_judge(struct mr_core *c, char *gate_log, size_t logcap,
     v = engine_verdict_of(&gate, (size_t)r->files_changed, false, true);
     *engine_name = mr_engine_short(engine_verdict_name(v), engine_buf,
         engine_cap);
-    if (v == ENGINE_VERDICT_PASS) {
+    /* THE CLOSED PASS, in one place: the gate passed over a measured
+     * non-empty diff, the workspace was measurably clean before the turn,
+     * and every measured changed path is inside the declared scope. */
+    if (v == ENGINE_VERDICT_PASS && r->scope_pre_measured &&
+        r->scope_pre_clean && r->scope_changed_measured &&
+        r->scope_outside_count == 0) {
         (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
             mr_verdict_pass);
         (void)snprintf(r->reason, sizeof(r->reason), "gate passed");
@@ -918,6 +1174,11 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
     r->files_changed = -1;
     r->gate_ran = -1;
     r->gate_failed = -1;
+    /* -1 until measured: an exit path that never reached an enumeration
+     * must not publish a zero that reads as a measured clean tree. */
+    r->scope_pre_count = -1;
+    r->scope_changed_count = -1;
+    r->scope_outside_count = -1;
     (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
         mr_verdict_refused);
     (void)snprintf(r->reason, sizeof(r->reason),
@@ -931,6 +1192,10 @@ static int mr_finish(struct mr_core *c, struct muse_session *s,
     mr_note_prior_turn(t, r);
     /* Source half of the diff identity, taken before the turn lands. */
     mr_base_commit(t->workspace, r->base, sizeof(r->base));
+    /* The workspace must be measurably clean BEFORE the turn: baseline
+     * dirt could otherwise satisfy the non-empty diff a pass requires.
+     * No session, no turn, no tokens. */
+    if (!mr_prestate_clean(c)) goto write;
     allow[0] = t->scope;
     policy.approval_mode = "denyUnmatched";
     policy.model = t->model[0] ? t->model : NULL;

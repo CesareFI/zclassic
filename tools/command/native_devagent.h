@@ -54,6 +54,21 @@ bool zcl_devagent_verdict_parse(const char *text,
  * the worker gate, and the gateway evidence paths cannot drift apart. */
 bool zcl_devagent_closed_pass(const char *verdict, long long rc);
 
+/* ── the one directive-name grammar ───────────────────────────────────────
+ * A queue row is a directory named by its name, and a steer directive names
+ * the row it is meant to become. So both must accept exactly the same
+ * strings: [A-Za-z0-9_.-], 1..64 bytes, never "." or "..", never empty.
+ * A '/' is off the alphabet, so a path-shaped name cannot escape the run
+ * directory and cannot reach a second segment.
+ *
+ * One shared predicate because the two ends drifted once: fleet.steer.send
+ * accepted a ref that dev.agent.queue then refused with BAD_INPUT, which
+ * wrote mail describing work that could never be dispatched. Anything that
+ * names queue work validates here, so that gap cannot reopen. */
+#define ZCL_DEVAGENT_NAME_MAX 64u
+
+bool zcl_devagent_name_ok(const char *name);
+
 /* ── resident dev worker ──────────────────────────────────────────────────
  * The dev-only loop that consumes dev.agent.queue continuously. One active
  * job per worker; the queue stays the only ledger (claim/running/outcome
@@ -128,6 +143,49 @@ bool zcl_devagent_worker_no_executor(const struct wkr_job *job,
  * tools/command/native_devagent_muse_executor.c. */
 bool zcl_devagent_worker_muse_executor(const struct wkr_job *job,
                                        struct wkr_result *res);
+
+/* ── resident mail receiver ───────────────────────────────────────────────
+ * The dev-only loop that turns a directive arriving in this box's agent
+ * mail into a dev.agent.queue row and answers the sender under the same
+ * ref. It never executes anything: dev.agent.worker's own resident loop
+ * runs the job and posts the result. Admission is the EXISTING fleet.steer
+ * grant store read by label (zcl_fleet_steer_grant_label_live), which means
+ * "the owner has named this sender" and NOT "this peer was authenticated" —
+ * nothing in this tree signs a peer's mail row today. */
+
+/* Bounded drive options. `receiver` is this box's mail identity. */
+struct rcv_drive_opts {
+    char receiver[56];
+    long long deadline_s; /* stop beating after this many seconds */
+    long long wait_ms;    /* idle ceiling for one mail-watch wait */
+    long long max_beats;  /* stop after this many beats (0 = deadline only) */
+};
+
+/* What one drive (or one read-only survey) observed. Counts only; no row
+ * content ever leaves the loop. */
+struct rcv_beat_stats {
+    long long beats;
+    long long seen;          /* directives addressed to this receiver */
+    long long admitted;      /* newly queued refs */
+    long long reconciled;    /* known refs whose stored brief matched */
+    long long refused;        /* typed refusals, conflicts included */
+    long long already;        /* rows this receiver had already answered */
+    long long intake_failed;  /* beats whose mail pull did not answer */
+};
+
+/* Drive the resident loop until SIGTERM, the deadline, or the beat cap.
+ * Returns beats completed (>= 0), or -1 when the singleton lock or the
+ * state root refuses. Single instance: a second concurrent drive refuses
+ * immediately and never waits. `st` may be NULL. */
+long long zcl_devagent_receive_drive(const struct rcv_drive_opts *opts,
+                                     struct rcv_beat_stats *st);
+
+/* Decide exactly what one beat would decide, and write and post nothing.
+ * This is what the status action reports; it creates no directory, no
+ * brief, no queue row, no marker and no mail. Returns beats surveyed (1),
+ * or -1 on a bad receiver name or an unresolvable state root. */
+long long zcl_devagent_receive_survey(const char *receiver,
+                                      struct rcv_beat_stats *st);
 
 /* ── single-line source mutation ──────────────────────────────────────────
  * One deterministic edit to one line, chosen by the first applicable rule in

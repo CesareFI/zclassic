@@ -1983,6 +1983,52 @@ ZCL_COMMAND_DEV_COMMAND(
     "the resident worker is a development-lane coordination surface",
     "z23-dev dev agent worker")
 
+/* ── dev.agent.receive ─────────────────────────────────────────────────────
+ * The resident receiver that removes the human from cross-box work: a
+ * directive arriving in this box's agent mail wakes the loop, is admitted
+ * against the EXISTING owner-minted fleet.steer grant store, becomes a
+ * dev.agent.queue row under its own ref, and is answered to the sender
+ * under that same ref. It executes nothing — dev.agent.worker's separate
+ * resident loop runs the job and posts the result — so a long model turn
+ * can never block intake, status, or delivery. Admission means the owner
+ * has NAMED a sender: nothing in this tree signs or verifies a peer's mail
+ * row today, so this is not authenticated delivery. */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.agent.receive", "dev.agent", "",
+    "Turn directives arriving in this box's agent mail into queued work",
+    "One beat over the owner-private state root: dev.agent.mail is pulled "
+    "in-process with since=0 and kind=directive (a positive scalar cursor "
+    "is refused once several inbox streams exist, so filtering happens in "
+    "the leaf); a row is admitted only when it is addressed to this "
+    "receiver, carries a ref matching [A-Za-z0-9_.-]{1,64}, names a sender "
+    "that a live non-revoked unexpired grant in steer/grants.jsonl labels "
+    "with the send scope, and carries a well-formed muse-workspace/"
+    "muse-scope/muse-gate direction; the body is then written to a brief "
+    "file and posted through dev.agent.queue under name=<ref>, so the "
+    "queue row is the record. A ref a queue row, run dir, or outcome "
+    "already names reconciles when the stored brief is byte-identical and "
+    "is refused as a conflict when it differs — nothing is queued twice "
+    "and nothing executes twice. An accept is posted only after the queue "
+    "accepted the row, with its seq and the brief digest; a refusal "
+    "answers under the same ref with a typed reason. run holds one flock "
+    "singleton, wakes on the mail directory watcher, and stops cleanly on "
+    "SIGTERM; status reports the same decisions and writes nothing.", 16384,
+    "agent,receive,resident,mail,directive,admission,queue,ref",
+    "zcl.agent_receive_input.v1", "zcl.agent_receive.v1",
+    "action,receiver,deadline_s,wait_ms,max_beats",
+    "action",
+    "z23 dev agent receive status --receiver=box-a",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_agent_receive,
+    "the resident receiver is a development-lane coordination surface",
+    "z23-dev dev agent receive")
+
 /* ── dev.agent.mail ────────────────────────────────────────────────────────
  * Async, non-blocking agent mail. A poster appends one JSON row to the local
  * outbox and returns; a reader re-pulls past its cursor when it wants; ack
