@@ -6,8 +6,10 @@
 
 #include "services/muse_run.h"
 #include "services/muse_session.h"
+#include "base/safe_alloc.h"
 #include "engine/engine_verdict.h"
 #include "json/json.h"
+#include "platform/clock.h"
 #include "util/spawn.h"
 
 #include <stdio.h>
@@ -44,9 +46,7 @@ static bool mr_is_terminal_verdict(const char *v)
 
 static int64_t mr_monotonic_ms(void)
 {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return clock_now_monotonic_ns() / 1000000;
 }
 
 static char *mr_read_file(const char *path, size_t cap)
@@ -65,7 +65,7 @@ static char *mr_read_file(const char *path, size_t cap)
         return NULL;
     }
     (void)fseek(f, 0, SEEK_SET);
-    buf = malloc((size_t)n + 1);
+    buf = zcl_malloc((size_t)n + 1, "muse_run.file");
     if (!buf) {
         fclose(f);
         return NULL;
@@ -305,7 +305,7 @@ static long long mr_files_changed(const char *workspace)
 {
     const char *argv[] = { "git", "-C", workspace, "status", "--porcelain",
                            NULL };
-    char *buf = malloc(MR_GATE_LOG_MAX);
+    char *buf = zcl_malloc(MR_GATE_LOG_MAX, "muse_run.git_out");
     long long count = 0;
     int rc;
     if (!buf) return -1;
@@ -328,7 +328,7 @@ static bool mr_git_line(char *out, size_t cap, const char *workspace,
     const char *a1, const char *a2, const char *a3)
 {
     const char *argv[] = { "git", "-C", workspace, a1, a2, a3, NULL };
-    char *buf = malloc(65536);
+    char *buf = zcl_malloc(65536, "muse_run.git_line");
     int rc;
     size_t n;
     if (!buf || !out || cap == 0) {
@@ -415,7 +415,7 @@ static void mr_fold_others(const char *workspace, char *acc, size_t acc_cap,
 {
     const char *argv[] = { "git", "-C", workspace, "ls-files", "--others",
                            "--exclude-standard", NULL };
-    char *list = malloc(65536);
+    char *list = zcl_malloc(65536, "muse_run.others");
     int rc;
     if (!list) return;
     list[0] = '\0';
@@ -457,7 +457,7 @@ static void mr_candidate(const char *workspace, const char *rundir,
 {
     const char *diff_argv[] = { "git", "-C", workspace, "diff", "HEAD",
                                 "--", NULL };
-    char *acc = malloc(MR_GATE_LOG_MAX);
+    char *acc = zcl_malloc(MR_GATE_LOG_MAX, "muse_run.candidate");
     char tmp[8192], h[128];
     size_t used = 0;
     int rc;
@@ -498,7 +498,7 @@ static void mr_candidate(const char *workspace, const char *rundir,
     fclose(f);
     {
         const char *h_argv[] = { "git", "hash-object", tmp, NULL };
-        char *hbuf = malloc(128);
+        char *hbuf = zcl_malloc(128, "muse_run.hash");
         if (!hbuf) {
             (void)unlink(tmp);
             free(acc);
@@ -630,7 +630,7 @@ static void mr_write_facts(const struct muse_run_task *t,
     const struct muse_run_result *r)
 {
     char path[8192];
-    char *body = malloc(65536);
+    char *body = zcl_malloc(65536, "muse_run.facts");
     char esc_reason[1024], esc_engine[128], esc_verdict[2048];
     char esc_model[512], esc_gate[512];
     if (!body) return;
@@ -1047,7 +1047,7 @@ static int mr_parse_file(const char *taskpath, struct muse_run_task *t,
         free(text);
         return -1;
     }
-    *prompt = malloc(strlen(body) + 1);
+    *prompt = zcl_malloc(strlen(body) + 1, "muse_run.prompt");
     if (!*prompt) {
         if (err)
             (void)snprintf(err, MUSE_RUN_ERROR_MAX, "out of memory");

@@ -38,6 +38,7 @@
 
 #include "command/native_devagent.h"
 #include "services/muse_run.h"
+#include "base/safe_alloc.h"
 
 #include <fcntl.h>
 #include <stdbool.h>
@@ -130,7 +131,7 @@ static void mx_claim_who(const char *rundir, char *worker, size_t wcap,
         return;
     }
     (void)fseek(f, 0, SEEK_SET);
-    text = malloc((size_t)n + 1);
+    text = zcl_malloc((size_t)n + 1, "devagent_muse.brief");
     if (!text) {
         fclose(f);
         return;

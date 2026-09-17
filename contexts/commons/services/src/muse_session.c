@@ -5,16 +5,30 @@
 #endif
 
 #include "services/muse_session.h"
+
+/* POSIX-only, the whole file: an MSP session IS a fork/execvp'd `muse serve`
+ * child with its stdio on two pipes and a poll loop over them, and mingw has
+ * none of fork, waitpid, poll or <sys/wait.h>. Guarding the body — rather
+ * than growing a second Windows arm per entry point — is the shape
+ * contexts/commons/services/src/zcode_benchmark_executor.c already uses for
+ * its own forking executor, and it keeps one definition per function so two
+ * bodies under one name can never drift apart. On Windows this compiles to
+ * an empty translation unit; there is no Muse host to adapt there. */
+#if !defined(_WIN32)
+
+#include "base/safe_alloc.h"
 #include "json/json.h"
+#include "platform/clock.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -61,16 +75,18 @@ static void ms_fail(struct muse_session *s, const char *kind,
 
 static int64_t ms_monotonic_ms(void)
 {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return clock_now_monotonic_ns() / 1000000;
 }
 
 bool muse_session_command_id(char out[MUSE_COMMAND_ID_MAX])
 {
-    struct timespec ts;
     uint8_t rnd[10];
-    if (!out || clock_gettime(CLOCK_REALTIME, &ts) != 0) return false;
+    /* The platform wall seam reports a failed CLOCK_REALTIME read as 0
+     * (platform/modules/platform/src/clock.c:43), and a genuine reading is
+     * never 0 — that is 1970-01-01T00:00:00Z. Treating 0 as the failure
+     * keeps the original refusal: no timestamp, no handle. */
+    int64_t wall_ms = clock_now_wall_ms();
+    if (!out || wall_ms <= 0) return false;
     int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
         ssize_t got = 0;
@@ -84,8 +100,7 @@ bool muse_session_command_id(char out[MUSE_COMMAND_ID_MAX])
     } else {
         return false;
     }
-    uint64_t ms = (uint64_t)ts.tv_sec * 1000u +
-        (uint64_t)ts.tv_nsec / 1000000u;
+    uint64_t ms = (uint64_t)wall_ms;
     unsigned a = (unsigned)((ms >> 32) & 0xffffffffu);
     unsigned b = (unsigned)((ms >> 16) & 0xffffu);
     unsigned c = (unsigned)(0x7000u | (ms & 0x0fffu));
@@ -123,17 +138,16 @@ static int ms_read_line(struct muse_session *s, char *buf, size_t cap,
         int64_t now = ms_monotonic_ms();
         if (now >= deadline_ms) return 0;
         int64_t wait_ms = deadline_ms - now;
-        struct timeval tv = {
-            .tv_sec = (time_t)(wait_ms / 1000),
-            .tv_usec = (suseconds_t)((wait_ms % 1000) * 1000),
+        if (wait_ms > INT_MAX) wait_ms = INT_MAX;
+        struct pollfd pfd = {
+            .fd = s->from_child,
+            .events = POLLIN,
+            .revents = 0,
         };
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(s->from_child, &rfds);
-        int r = select(s->from_child + 1, &rfds, NULL, NULL, &tv);
+        int r = poll(&pfd, 1, (int)wait_ms);
         if (r < 0) {
             if (errno == EINTR) continue;
-            ms_fail(s, "transport", true, "serve stdout select: %s",
+            ms_fail(s, "transport", true, "serve stdout poll: %s",
                 strerror(errno));
             return -1;
         }
@@ -229,12 +243,6 @@ bool muse_session_last_retryable(const struct muse_session *s)
 struct muse_session *muse_session_open(const char *serve_argv0,
     const struct muse_session_limits *limits, char err[MUSE_ERROR_MAX])
 {
-#if defined(_WIN32)
-    if (err)
-        (void)snprintf(err, MUSE_ERROR_MAX,
-            "muse serve adapter is not implemented on Windows");
-    return NULL;
-#else
     int to_child[2], from_child[2];
     if (pipe(to_child) != 0 || pipe(from_child) != 0) {
         if (err) (void)snprintf(err, MUSE_ERROR_MAX, "pipe: %s",
@@ -254,13 +262,18 @@ struct muse_session *muse_session_open(const char *serve_argv0,
         return NULL;
     }
     if (pid == 0) {
-        /* Async-signal-safe only between fork and exec. */
+        /* Async-signal-safe only between fork and exec — the same contract
+         * platform/modules/util/src/spawn.c:143 keeps in its own child arm.
+         * No shell: argv[0] goes straight to execvp(), which PATH-searches
+         * it (or uses it as-is when it holds a '/'), so a caller-supplied
+         * host path never meets shell metacharacter expansion. */
+        const char *host = serve_argv0 ? serve_argv0 : "muse";
+        const char *argv[] = { "muse", "serve", NULL };
         (void)dup2(to_child[0], STDIN_FILENO);
         (void)dup2(from_child[1], STDOUT_FILENO);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
-        execlp(serve_argv0 ? serve_argv0 : "muse", "muse", "serve",
-            (char *)NULL);
+        execvp(host, (char *const *)argv);
         _exit(127);
     }
     close(to_child[0]);
@@ -279,13 +292,12 @@ struct muse_session *muse_session_open(const char *serve_argv0,
         return NULL;
     }
     return s;
-#endif
 }
 
 static struct muse_session *ms_alloc(pid_t child, int to_fd, int from_fd,
     const struct muse_session_limits *limits)
 {
-    struct muse_session *s = calloc(1, sizeof(*s));
+    struct muse_session *s = zcl_calloc(1, sizeof(*s), "muse_session");
     if (!s) return NULL;
     s->child = child;
     s->to_child = to_fd;
@@ -311,7 +323,7 @@ static bool ms_handshake(struct muse_session *s)
             "initialize",
             "{\"clientInfo\":{\"name\":\"z23_muse_session\",\"version\":\"1\"}}"))
         return false;
-    char *line = malloc(MUSE_LINE_MAX);
+    char *line = zcl_malloc(MUSE_LINE_MAX, "muse_session.frame");
     if (!line) {
         ms_fail(s, "internal", false, "out of memory");
         return false;
@@ -376,7 +388,6 @@ struct muse_session *muse_session_attach(pid_t child, int to_fd, int from_fd,
 void muse_session_close(struct muse_session *s)
 {
     if (!s) return;
-#if !defined(_WIN32)
     if (s->to_child >= 0) {
         close(s->to_child);
         s->to_child = -1;
@@ -402,7 +413,6 @@ void muse_session_close(struct muse_session *s)
         close(s->from_child);
         s->from_child = -1;
     }
-#endif
     free(s);
 }
 
@@ -410,7 +420,7 @@ void muse_session_close(struct muse_session *s)
  * response line is returned malloc'd (caller frees) or NULL on timeout/EOF. */
 static char *ms_await(struct muse_session *s, int id, int64_t deadline_ms)
 {
-    char *line = malloc(MUSE_LINE_MAX);
+    char *line = zcl_malloc(MUSE_LINE_MAX, "muse_session.frame");
     if (!line) {
         ms_fail(s, "internal", false, "out of memory");
         return NULL;
@@ -515,7 +525,7 @@ int muse_session_start(struct muse_session *s, const char *command_id,
         json_push_kv_str(&params, "workspaceRoot", workspace_root) &&
         json_push_kv_str(&params, "approvalMode", mode);
     size_t need = ok ? json_write(&params, NULL, 0) + 1 : 0;
-    char *text = ok && need > 0 ? malloc(need) : NULL;
+    char *text = ok && need > 0 ? zcl_malloc(need, "muse_session.params") : NULL;
     if (!text) {
         json_free(&params);
         ms_fail(s, "internal", false, "out of memory");
@@ -573,7 +583,7 @@ int muse_session_start(struct muse_session *s, const char *command_id,
             json_push_kv_str(&mp, "modelId", policy->model) &&
             json_push_kv_str(&mp, "commandId", mc);
         size_t mneed = ok ? json_write(&mp, NULL, 0) + 1 : 0;
-        char *mtext = ok && mneed > 0 ? malloc(mneed) : NULL;
+        char *mtext = ok && mneed > 0 ? zcl_malloc(mneed, "muse_session.params") : NULL;
         if (!mtext) {
             json_free(&mp);
             ms_fail(s, "internal", false, "out of memory");
@@ -624,7 +634,7 @@ int muse_session_turn(struct muse_session *s, const char *command_id,
     json_free(&part);
     json_free(&input);
     size_t need = ok ? json_write(&params, NULL, 0) + 1 : 0;
-    char *text = ok && need > 0 ? malloc(need) : NULL;
+    char *text = ok && need > 0 ? zcl_malloc(need, "muse_session.params") : NULL;
     if (!text) {
         json_free(&params);
         ms_fail(s, "internal", false, "out of memory");
@@ -1101,13 +1111,13 @@ int muse_session_wait(struct muse_session *s, const char *session_id,
 {
     if (!s || !session_id || !turn_id || !out) return -1;
     memset(out, 0, sizeof(*out));
-    out->text = calloc(1, s->max_text_bytes);
+    out->text = zcl_calloc(1, s->max_text_bytes, "muse_session.text");
     if (!out->text) {
         ms_fail(s, "internal", false, "out of memory");
         return -1;
     }
     out->duration_ms = -1;
-    char *line = malloc(MUSE_LINE_MAX);
+    char *line = zcl_malloc(MUSE_LINE_MAX, "muse_session.frame");
     if (!line) {
         free(out->text);
         out->text = NULL;
@@ -1165,7 +1175,7 @@ int muse_session_cancel(struct muse_session *s, const char *command_id,
     if (ok && turn_id && turn_id[0])
         ok = json_push_kv_str(&params, "turnId", turn_id);
     size_t need = ok ? json_write(&params, NULL, 0) + 1 : 0;
-    char *text = ok && need > 0 ? malloc(need) : NULL;
+    char *text = ok && need > 0 ? zcl_malloc(need, "muse_session.params") : NULL;
     if (!text) {
         json_free(&params);
         ms_fail(s, "internal", false, "out of memory");
@@ -1195,10 +1205,7 @@ void muse_turn_outcome_free(struct muse_turn_outcome *out)
 
 pid_t muse_session_host_pid(const struct muse_session *s)
 {
-#if defined(_WIN32)
-    (void)s;
-    return -1;
-#else
     return s ? s->child : -1;
-#endif
 }
+
+#endif /* !_WIN32 */
