@@ -1932,9 +1932,8 @@ static int t_object_parent_barriers(const char *repo)
     if (failures) return failures;
     VC_CHECK("parent barriers fixture mkdir", mkdir(path, 0700) == 0);
     if (failures) return failures;
-    /* Root bypasses the permission fault; it cannot qualify this witness. */
-    VC_CHECK("parent barriers require unprivileged permission enforcement", geteuid() != 0);
-    if (failures) return failures;
+    /* platform_private_parent_flush enforces the owner's mode boundary even
+     * for a privileged service, so this witness is deterministic as root. */
     failures += t_store_init_parent_barrier(path);
     failures += t_object_shard_parent_barrier(path);
     return failures;

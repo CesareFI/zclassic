@@ -2889,7 +2889,7 @@ static int test_zd_improve_command(void)
         zcl_command_reply_free(&legacy_reply);
         json_set_str((struct json_value *)json_get(&input, "mode"), "admit");
         json_set_str((struct json_value *)json_get(
-                         &input, "fixed_input_path"), "/usr/bin/true");
+                         &input, "fixed_input_path"), base_true);
         struct zcl_command_reply detached_input_reply;
         zcl_command_reply_init(&detached_input_reply,
                                "zcl.zcode_improve.v1");
@@ -7186,12 +7186,22 @@ static bool zd_publication_store_collision(
 static bool zd_publication_store_parent(const char *dir,
     const struct vcs_zcode_publication_v1 *intent, const uint8_t signer[32])
 {
+    char store[768], held[768];
     uint8_t root[32];
     memset(root, 0xa5, sizeof(root));
-    bool restricted = chmod(dir, 0300) == 0;
+    int store_len = snprintf(store, sizeof(store), "%s/.zvcs", dir);
+    int held_len = snprintf(held, sizeof(held), "%s/.zvcs-held", dir);
+    bool paths = store_len > 0 && (size_t)store_len < sizeof(store) &&
+        held_len > 0 && (size_t)held_len < sizeof(held);
+    bool moved = paths && rename(store, held) == 0;
+    FILE *blocker = moved ? fopen(store, "wb") : NULL;
+    bool restricted = blocker != NULL && fclose(blocker) == 0;
     bool initialized = restricted && vcs_object_store_init(dir);
-    bool stored = restricted && vcs_zcode_publication_store_verified(dir, intent, signer, root);
-    bool restored = chmod(dir, 0700) == 0;
+    bool stored = restricted && vcs_zcode_publication_store_verified(
+        dir, intent, signer, root);
+    if (moved)
+        (void)unlink(store);
+    bool restored = moved && rename(held, store) == 0;
     return restricted && restored && !initialized && !stored &&
         !zcl_bytes_any_set(root, sizeof(root));
 }

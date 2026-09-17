@@ -393,7 +393,7 @@ void boot_join_catchup_service(struct boot_svc_ctx *svc)
 {
     if (!svc)
         return;
-    catchup_lifecycle_join(&svc->catchup_job, 5);
+    (void)catchup_lifecycle_join(&svc->catchup_job, 5);
 }
 
 bool boot_reap_catchup_service(struct boot_svc_ctx *svc)

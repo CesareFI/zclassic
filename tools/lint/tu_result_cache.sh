@@ -300,6 +300,14 @@ tu_cache_include_digest() {
     LC_ALL=C sort -u "$list" | tr '\n' '\0' |
         xargs -0 -r sha256sum --binary >"$sha_out" 2>"$sha_err"
     rc=$?
+    # Deterministic second selftest hook. A privileged runner can read a
+    # chmod(000) file, so inject sha256sum's real permission-refusal shape
+    # after hashing and exercise the exact classifier below instead.
+    if [ -n "${ZCL_TU_CACHE_DIGEST_SELFTEST_REFUSE:-}" ]; then
+        printf 'sha256sum: %s: Permission denied\n' \
+            "$ZCL_TU_CACHE_DIGEST_SELFTEST_REFUSE" >>"$sha_err"
+        rc=1
+    fi
     if [ "$rc" -ne 0 ]; then
         bad="$(grep -vE '^sha256sum: .*: No such file or directory$' "$sha_err" 2>/dev/null)"
         if [ -n "$bad" ]; then
@@ -322,8 +330,9 @@ tu_cache_include_digest() {
 # root (never the real repo tree, never /tmp for anything durable):
 #   (1) a path present when `find` snapshots the tree but gone by the time
 #       sha256sum reads it is DROPPED — the digest still succeeds;
-#   (2) a path that stays present but is genuinely unreadable (chmod 000)
-#       FAILS the digest loudly and NAMES the file — never silently omitted.
+#   (2) a non-ENOENT sha256sum refusal FAILS the digest loudly and NAMES the
+#       file — never silently omitted. The refusal is injected so this proof
+#       has identical semantics under root and an unprivileged account.
 tu_cache_include_digest_selftest() {
     local base d out rc
     base="$(mktemp -d)" || { echo "FAIL: mktemp failed" >&2; return 2; }
@@ -348,14 +357,13 @@ tu_cache_include_digest_selftest() {
     fi
 
     printf '#define D 1\n' > "$d/d.h"
-    chmod 000 "$d/d.h"
-    out="$(tu_cache_include_digest "$base/scratch2" "$d" 2>"$base/stderr.txt")"
+    out="$(ZCL_TU_CACHE_DIGEST_SELFTEST_REFUSE="$d/d.h" \
+        tu_cache_include_digest "$base/scratch2" "$d" 2>"$base/stderr.txt")"
     rc=$?
-    chmod 644 "$d/d.h"
     if [ "$rc" -eq 0 ]; then
-        echo "FAIL: tu_cache_include_digest_selftest — an unreadable file" >&2
-        echo "  (chmod 000, never removed) did not fail the digest; a real" >&2
-        echo "  unreadable header would be silently missing from every" >&2
+        echo "FAIL: tu_cache_include_digest_selftest — a permission refusal" >&2
+        echo "  did not fail the digest; a real unreadable header would be" >&2
+        echo "  silently missing from every" >&2
         echo "  cache key it should have busted" >&2
         rm -rf "$base"; return 2
     fi
@@ -368,7 +376,7 @@ tu_cache_include_digest_selftest() {
 
     rm -rf "$base"
     echo "  OK: tu_cache_include_digest selftest — a vanished path is dropped" \
-         "(digest still succeeds), an unreadable file fails loudly and is named"
+         "(digest still succeeds), a permission refusal fails loudly and is named"
     return 0
 }
 # Keep the newest N generations under <gate-root>, drop the rest whole. A

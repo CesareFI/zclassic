@@ -40,13 +40,15 @@
 #include <string.h>
 #include <time.h>
 
-static void catchup_lifecycle_join_deadline_from_now(struct timespec *ts,
+static bool catchup_lifecycle_join_deadline_from_now(struct timespec *ts,
                                                       int timeout_sec)
 {
-    platform_time_realtime_timespec(ts);
+    if (platform_time_realtime_timespec(ts) != 0)
+        return false;
     if (timeout_sec < 0)
         timeout_sec = 0;
     ts->tv_sec += timeout_sec;
+    return true;
 }
 
 static bool catchup_lifecycle_join_thread_bounded(pthread_t thread,
@@ -56,7 +58,12 @@ static bool catchup_lifecycle_join_thread_bounded(pthread_t thread,
     struct timespec deadline;
     int rc;
 
-    catchup_lifecycle_join_deadline_from_now(&deadline, timeout_sec);
+    if (!catchup_lifecycle_join_deadline_from_now(&deadline, timeout_sec)) {
+        LOG_WARN("catchup_lifecycle",
+                 "%s join clock failed; retaining ownership",
+                 name ? name : "thread");
+        return false;
+    }
     rc = thread_registry_join_until(thread, NULL, &deadline);
     if (rc == 0)
         return true;
@@ -70,7 +77,6 @@ static bool catchup_lifecycle_join_thread_bounded(pthread_t thread,
                  "%s join failed rc=%d (%s); retaining ownership",
                  name ? name : "thread", rc, strerror(rc));
     }
-    pthread_join(thread, NULL);
     return false;
 }
 
@@ -99,13 +105,16 @@ bool catchup_lifecycle_start(struct node_db_sync_catchup_job *job,
                                           net_dir[0] ? net_dir : datadir);
 }
 
-void catchup_lifecycle_join(struct node_db_sync_catchup_job *job,
+bool catchup_lifecycle_join(struct node_db_sync_catchup_job *job,
                             int timeout_sec)
 {
     if (!job || !job->started)
-        return;
-    catchup_lifecycle_join_thread_bounded(job->thread, "catchup", timeout_sec);
+        return true;
+    if (!catchup_lifecycle_join_thread_bounded(job->thread, "catchup",
+                                                timeout_sec))
+        return false;
     job->started = false;
+    return true;
 }
 
 bool catchup_lifecycle_reap(struct node_db_sync_catchup_job *job)

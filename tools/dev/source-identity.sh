@@ -826,7 +826,11 @@ mutation_token()
     if [ -n "$SOURCE_IDENTITY_BATCH" ] &&
         [ "${ZCL_SOURCE_IDENTITY_FORCE_PORTABLE:-0}" != 1 ]; then
         write_gitlink_sidecar
-        native="$("$SOURCE_IDENTITY_BATCH" token mutation \
+        # Mutation timestamps are identity metadata, not presentation. Keep
+        # their byte encoding independent of the caller's timezone and of
+        # whether `stat` is GNU coreutils or uutils (the latter does not honor
+        # every POSIX TZ string that libc accepts).
+        native="$(TZ=UTC0 "$SOURCE_IDENTITY_BATCH" token mutation \
             "$WORK/native-mutation-preimage" "$WORK/gitlink-sidecar" \
             < "$WORK/source-paths")" ||
             fail_racy "source changed while collecting native mutation token"
@@ -867,7 +871,7 @@ mutation_token_legacy()
     for ((batch_start = 0; batch_start < ${#existing_paths[@]};
           batch_start += batch_size)); do
         batch=("${existing_paths[@]:batch_start:batch_size}")
-        stat --printf='%d:%i:%s:%f:%y:%z\0' -- "${batch[@]}" \
+        TZ=UTC0 stat --printf='%d:%i:%s:%f:%y:%z\0' -- "${batch[@]}" \
             >> "$WORK/mutation-metadata" 2>/dev/null ||
             fail_racy "source changed while collecting mutation metadata"
     done

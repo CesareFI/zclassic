@@ -995,15 +995,6 @@ static int test_commitment_merge(void)
 
 /* ── Bandwidth-adaptive download manager tests ───────────── */
 
-static struct uint256 make_hash_fs(uint8_t v)
-{
-    struct uint256 h;
-    memset(h.data, 0, 32);
-    h.data[0] = v;
-    h.data[31] = v;
-    return h;
-}
-
 static int test_dl_bandwidth_scoring(void)
 {
     int failures = 0;
@@ -1011,17 +1002,19 @@ static int test_dl_bandwidth_scoring(void)
         struct download_manager dm;
         dl_init(&dm);
 
-        struct uint256 h1 = make_hash_fs(1);
-        struct uint256 h2 = make_hash_fs(2);
+        struct uint256 unused[1];
+
+        /* Register the peer-stat records without manufacturing an in-flight
+         * request. dl_mark_received() now accounts real monotonic delivery
+         * itself, so pairing it with the explicit deterministic sample below
+         * would count each fixture delivery twice. */
+        dl_assign_to_peer(&dm, 1, unused, 0);
+        dl_assign_to_peer(&dm, 2, unused, 0);
 
         /* Peer 1: fast (100ms delivery) */
-        dl_mark_requested(&dm, &h1, 100, 1);
-        dl_mark_received(&dm, &h1);
         dl_peer_block_received(&dm, 1, 100000); /* 100ms in us */
 
         /* Peer 2: slow (2s delivery) */
-        dl_mark_requested(&dm, &h2, 101, 2);
-        dl_mark_received(&dm, &h2);
         dl_peer_block_received(&dm, 2, 2000000); /* 2s in us */
 
         /* Fast peer should get larger window */
@@ -1044,20 +1037,13 @@ static int test_dl_adaptive_assignment(void)
         struct download_manager dm;
         dl_init(&dm);
 
-        /* Simulate: peer 1 is 4x faster than peer 2 */
-        /* Need to establish bandwidth scores first */
-        for (int i = 0; i < 10; i++) {
-            struct uint256 h = make_hash_fs((uint8_t)(100 + i));
-            dl_mark_requested(&dm, &h, i, 1);
-            dl_mark_received(&dm, &h);
-        }
+        /* Register both peer-stat records, then give each exactly one
+         * deterministic delivery sample. Real requests are already scored
+         * by dl_mark_received() and must not be double-counted here. */
+        struct uint256 unused[1];
+        dl_assign_to_peer(&dm, 1, unused, 0);
+        dl_assign_to_peer(&dm, 2, unused, 0);
         dl_peer_block_received(&dm, 1, 250000); /* 250ms avg */
-
-        for (int i = 0; i < 10; i++) {
-            struct uint256 h = make_hash_fs((uint8_t)(200 + i));
-            dl_mark_requested(&dm, &h, i, 2);
-            dl_mark_received(&dm, &h);
-        }
         dl_peer_block_received(&dm, 2, 2000000); /* 2000ms avg */
 
         /* Queue 256 blocks */

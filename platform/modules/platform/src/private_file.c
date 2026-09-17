@@ -851,7 +851,17 @@ bool platform_private_file_unlink_missing_ok(const char *p) {
   return unlink(p) == 0 || errno == ENOENT;
 }
 bool platform_private_parent_flush(const char *p) {
-  int fd = open(p, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+  struct stat st;
+  /* Make the authority check deterministic for privileged services too.
+   * open(2) lets uid 0 bypass mode bits, but a directory whose owner has
+   * deliberately removed read/search permission is not an authority this
+   * private-file API may silently reacquire.  O_NOFOLLOW also matches the
+   * Windows arm's reparse-point refusal. */
+  if (!p || lstat(p, &st) != 0 || !S_ISDIR(st.st_mode) ||
+      S_ISLNK(st.st_mode) || (st.st_mode & (S_IRUSR | S_IXUSR)) !=
+                                  (S_IRUSR | S_IXUSR))
+    return false;
+  int fd = open(p, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
   if (fd < 0)
     return false;
   bool ok = fsync(fd) == 0;

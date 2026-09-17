@@ -67,9 +67,9 @@ void boot_join_replay_service(struct boot_svc_ctx *svc)
 {
     if (!svc)
         return;
-    boot_join_thread_service_named(&svc->replay_thread,
-                                   &svc->replay_thread_started,
-                                   "utxo_replay", 5);
+    (void)boot_join_thread_service_named(&svc->replay_thread,
+                                         &svc->replay_thread_started,
+                                         "utxo_replay", 5);
 }
 
 /* ── Background UTXO replay ───────────────────────────────── */

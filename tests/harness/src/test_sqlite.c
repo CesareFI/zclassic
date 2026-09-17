@@ -2600,8 +2600,7 @@ static void check_sqlite_46_sqlite_pragma_tuning_cache_size_and_mmap(int *failur
     }
 
     /* Negative cache_size in SQLite = "abs(N) KiB". */
-    int64_t expected_cache_kib = hw_profile_sqlite_cache_kib(
-        hw_profile_ram_bytes(), 16 * 1024, 64 * 1024);
+    int64_t expected_cache_kib = node_db_recommended_cache_kib();
     ok = ok && (cache_pages == -expected_cache_kib);
     /* mmap may be silently clamped to 0 on a :memory: database
      * depending on the SQLite build, so accept either the derived

@@ -2182,7 +2182,6 @@ engine/services/src/bg_validation_proofs.c:bg_validation_verify_shielded_proofs:
 engine/services/src/bg_validation_scripts.c:bg_validation_verify_scripts_parallel:24
 engine/services/src/bg_validation_service.c:bg_validation_thread:31
 engine/services/src/bg_validation_verify_block.c:bg_validation_validate_block_proofs:27
-engine/services/src/binary_ab_fallback.c:binary_ab_promote:17
 engine/services/src/binary_ab_fallback.c:binary_ab_promote_stream:16
 engine/services/src/binary_staleness_service.c:binary_staleness_check_now:25
 engine/services/src/block_index_blocks_hydrate.c:load_block_index_from_blocks_table:64
@@ -2704,7 +2703,6 @@ tests/harness/src/test_bundle_staleness.c:test_bundle_staleness:22
 tests/harness/src/test_byte_order_codec.c:test_byte_order_codec:22
 tests/harness/src/test_canary_sentinel_watch.c:test_canary_sentinel_watch:99
 tests/harness/src/test_catalog_completeness.c:test_catalog_completeness:42
-tests/harness/src/test_catchup_lifecycle_service.c:test_catchup_lifecycle_service:28
 tests/harness/src/test_chacha20_isa_parity.c:test_chacha20_isa_parity:45
 tests/harness/src/test_chain.c:test_chain:319
 tests/harness/src/test_chain_evidence_live_advance.c:test_durable_frontier_one_row_skew_is_not_hash_mismatch:18
@@ -2797,7 +2795,6 @@ tests/harness/src/test_created_outputs_index.c:test_created_outputs_index:29
 tests/harness/src/test_crypto_perf_selftest.c:test_crypto_perf_selftest:27
 tests/harness/src/test_crypto_registry.c:test_crypto_registry:66
 tests/harness/src/test_dandelion.c:test_dandelion:55
-tests/harness/src/test_db_migration_idempotent.c:db_mig_family_same:27
 tests/harness/src/test_db_migration_idempotent.c:db_mig_snapshot_family:22
 tests/harness/src/test_db_txn.c:t_busy_snapshot_rollback_rebegin:20
 tests/harness/src/test_db_txn.c:t_failed_commit_rolls_back:19
@@ -3903,7 +3900,7 @@ tools/dev/dev_activation.c:dev_activation_read_gen_link:18
 tools/dev/dev_activation.c:dev_activation_sha256_file:16
 tools/dev/dev_activation.c:dev_derive_paths:19
 tools/dev/dev_activation.c:dev_validate_confinement:29
-tools/dev/dev_activation.c:dev_write_in_progress:23
+tools/dev/dev_activation.c:dev_write_in_progress:11
 tools/dev/dev_activation_stage.c:dev_activation_stage_candidate:39
 tools/dev/dev_activation_verify.c:dev_activation_quarantine:16
 tools/dev/dev_failure_store.c:atomic_replace_at:21

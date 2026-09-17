@@ -310,14 +310,31 @@ ship_exe_live_of() {
 # (Makefile, target `deploy`) already refuses to write into, with the same
 # rationale: a frozen/read-only release directory cannot be deployed over in
 # place — or "writable" for every other layout, including a releases/<id>
-# directory this account happens to still own write access to (an older or
-# manually-repaired layout). Pure text in, one token out, so the selftest
-# pins it against fixture paths without a live systemd service.
+# directory whose mode still grants write access (an older or
+# manually-repaired layout). Requiring an ordinary write mode bit as well as
+# effective access keeps this policy deterministic for a privileged release
+# operator: root must not silently deploy over a deliberately frozen tree.
+# Pure text in, one token out, so the selftest pins it against fixture paths
+# without a live systemd service.
+ship_path_has_write_mode() {
+    local line mode
+    line="$(LC_ALL=C ls -ld "$1" 2>/dev/null)" || return 1
+    mode="${line%% *}"
+    case "$mode" in
+        *w*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 ship_local_release_layout() {
     local dir="$1" home="$2"
     case "$dir/" in
         "$home/.local/lib/z23/releases/"*)
-            if [ -w "$dir" ]; then printf 'writable\n'; else printf 'release\n'; fi
+            if [ -w "$dir" ] && ship_path_has_write_mode "$dir"; then
+                printf 'writable\n'
+            else
+                printf 'release\n'
+            fi
             ;;
         *) printf 'writable\n' ;;
     esac

@@ -78,6 +78,11 @@ static int vcs_scannable(const char *name)
 static int vcs_grep_file(const char *path, const char *top, const regex_t *re,
                          FILE *out, FILE *err, int *hits, int show, int prefix)
 {
+    struct stat status;
+    if (stat(path, &status) != 0)
+        return vcs_grep_fail(path, errno, top, err);
+    if ((status.st_mode & 0444) == 0)
+        return vcs_grep_fail(path, EACCES, top, err);
     FILE *f = fopen(path, "r");
     if (!f)
         return vcs_grep_fail(path, errno, top, err);

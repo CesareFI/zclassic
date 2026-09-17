@@ -46,6 +46,20 @@ cleanup_generated_changed_files() {
     [ -z "$owned" ] || rm -f -- "$owned"
 }
 
+# `test -w` answers whether the current identity can write, so uid 0 reports
+# true even after chmod 0400.  The fallback contract is about the published
+# inode's mode, not root's privilege; inspect that mode explicitly so the
+# pre-push self-test means the same thing on developer and CI hosts.
+path_has_write_mode() {
+    local mode
+    mode="$(LC_ALL=C ls -ld -- "$1" 2>/dev/null)" || return 1
+    mode="${mode%% *}"
+    case "$mode" in
+        *w*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Only this process's fallback file is owned here. Hook/watcher hints are
 # caller-owned and must remain live until their caller's gate completes.
 trap cleanup_generated_changed_files EXIT
@@ -1140,7 +1154,7 @@ changed_set_selftest() {
         second="$ZCL_FAST_CHANGED_FILES_FILE"
         [ "$first" != "$second" ] ||
             fail "changed-set selftest: fallback paths were shared"
-        [ ! -w "$first" ] && [ ! -w "$second" ] ||
+        ! path_has_write_mode "$first" && ! path_has_write_mode "$second" ||
             fail "changed-set selftest: published fallback remained writable"
         [ "$(cat "$first")" = "first.c" ] &&
             [ "$(cat "$second")" = "second.c" ] ||
@@ -1494,6 +1508,10 @@ pre_push_materialize_changed_set() {
         cleanup_generated_changed_files
         fail "cannot make pushed-range changed set read-only"
     }
+    if path_has_write_mode "$tmp"; then
+        cleanup_generated_changed_files
+        fail "pushed-range changed set retained a write mode"
+    fi
     ZCL_FAST_CHANGED_FILES_FILE="$tmp"
     ZCL_FAST_CHANGED_FILES_ONLY=1
     export ZCL_FAST_CHANGED_FILES_FILE ZCL_FAST_CHANGED_FILES_ONLY

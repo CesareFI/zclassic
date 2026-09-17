@@ -665,6 +665,7 @@ TEST_PARALLEL_BIN = $(BIN_DIR)/test_parallel
 ZCLASSIC_CLI_BIN = $(BIN_DIR)/zclassic-cli
 ZCL_RPC_BIN = $(BIN_DIR)/zcl-rpc$(ZCL_HOST_EXEEXT)
 PROCESS_GROUP_EXEC_BIN = $(BIN_DIR)/process-group-exec$(ZCL_HOST_EXEEXT)
+FLEET_GATEWAY_BIN = $(BIN_DIR)/z23-fleet-gateway
 # Stable output names do not encode the compiler/sysroot that produced them.
 # The portable release therefore opts its whole-program products into a fresh
 # atomic link; otherwise a newer host-built file could pass Make's timestamp
@@ -3552,7 +3553,21 @@ $(TEST_TSAN_LINK_RSP): $(TEST_TSAN_OBJS)
 # test-parallel wrapper: fast-ci/pre-push invokes the active fast runner
 # directly, and a clean checkout must not depend on a leftover binary.
 LINKED_TEST_ENV := env -u ZCL_HOTSWAP_TEST_MODULE \
-	-u ZCL_HOTSWAP_TEST_AUTH
+	-u ZCL_HOTSWAP_TEST_AUTH \
+	Z23_TEST_NODE_BIN='$(abspath $(Z23_DEV_UNSHIPPABLE_BIN))' \
+	Z23_TEST_GATEWAY_BIN='$(abspath $(FLEET_GATEWAY_BIN))'
+LINKED_TEST_RUNTIME_DEPS := $(if $(ZCL_HOST_WINDOWS),,linked-test-runtime-ensure)
+
+# Registered gateway acceptance execs the real command implementation, but a
+# test-fast/strict parse must retain its ONE test object profile. Build the
+# unshippable node in a nested, explicitly dev-profile make instead of pulling
+# dev depfiles and epoch leases into every test invocation. The parent already
+# owns the checkout lock; the frozen source record keeps both products bound to
+# the same tree observation.
+.PHONY: linked-test-runtime-ensure
+linked-test-runtime-ensure: dev-package-verifier-ensure $(FLEET_GATEWAY_BIN)
+	@$(MAKE) --no-print-directory dev \
+	  BUILD_SOURCE_RECORD='$(BUILD_SOURCE_RECORD)'
 
 test-parallel-active:
 	@mkdir -p "$(BUILD_DIR)"
@@ -3560,7 +3575,8 @@ test-parallel-active:
 	  $(MAKE) --no-print-directory test-parallel-active-locked
 
 test-parallel-active-locked: $(TEST_PARALLEL_REL_CANDIDATE) dev-package-verifier-ensure \
-	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint
+	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint \
+	$(LINKED_TEST_RUNTIME_DEPS)
 	$(ZCL_TEST_STACK_SETUP) && $(LINKED_TEST_ENV) $(TEST_PARALLEL_REL_ACTIVE)
 
 test-parallel-fast-active:
@@ -3569,7 +3585,8 @@ test-parallel-fast-active:
 	  $(MAKE) --no-print-directory test-parallel-fast-active-locked
 
 test-parallel-fast-active-locked: $(TEST_PARALLEL_FAST_CANDIDATE) dev-package-verifier-ensure \
-	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint
+	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint \
+	$(LINKED_TEST_RUNTIME_DEPS)
 	$(ZCL_TEST_STACK_SETUP) && $(LINKED_TEST_ENV) $(TEST_PARALLEL_FAST_ACTIVE)
 
 .PHONY: test-parallel
@@ -3598,7 +3615,8 @@ test-parallel:
 
 .PHONY: test-parallel-locked
 test-parallel-locked: $(TEST_PARALLEL_REL_CANDIDATE) dev-package-verifier-ensure \
-	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint
+	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint \
+	$(LINKED_TEST_RUNTIME_DEPS)
 	$(ZCL_TEST_STACK_SETUP) && $(LINKED_TEST_ENV) $(TEST_PARALLEL_REL_ACTIVE) $(TEST_PARALLEL_ARGS)
 
 # ── prove-cold-join — the one command a stranger can run ─────────────────
@@ -4140,7 +4158,8 @@ t:
 	  $(MAKE) --no-print-directory t-locked ONLY='$(ONLY)' \
 	    BUILD_SOURCE_RECORD='$(BUILD_SOURCE_RECORD)'
 
-t-locked: $(TEST_PARALLEL_REL_CANDIDATE) dev-package-verifier-ensure
+t-locked: $(TEST_PARALLEL_REL_CANDIDATE) dev-package-verifier-ensure \
+	$(LINKED_TEST_RUNTIME_DEPS)
 	$(ZCL_TEST_STACK_SETUP) && $(LINKED_TEST_ENV) $(TEST_PARALLEL_REL_ACTIVE) --only=$(ONLY)
 
 # Hot-path variant for edit loops. It resolves the complete source inventory in
@@ -4160,7 +4179,8 @@ t-fast:
 	    BUILD_SOURCE_RECORD='$(BUILD_SOURCE_RECORD)'
 
 t-fast-locked: $(TEST_PARALLEL_FAST_CANDIDATE) dev-package-verifier-ensure \
-	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint
+	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint \
+	$(LINKED_TEST_RUNTIME_DEPS)
 	$(ZCL_TEST_STACK_SETUP) && $(LINKED_TEST_ENV) $(TEST_PARALLEL_FAST_ACTIVE) --only=$(ONLY)
 
 # Proof-facing sibling of t-fast. The human convenience target above keeps its
@@ -4174,7 +4194,8 @@ t-fast-exact:
 	    BUILD_SOURCE_RECORD='$(BUILD_SOURCE_RECORD)'
 
 t-fast-exact-locked: $(TEST_PARALLEL_FAST_CANDIDATE) dev-package-verifier-ensure \
-	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint
+	$(BIN_DIR)/z23-git-hook$(ZCL_HOST_EXEEXT) $(BIN_DIR)/z23-lint \
+	$(LINKED_TEST_RUNTIME_DEPS)
 	$(ZCL_TEST_STACK_SETUP) && \
 	  $(LINKED_TEST_ENV) $(TEST_PARALLEL_FAST_ACTIVE) --exact=$(EXACT_ONLY_MATCHED) $(T_FAST_EXACT_ARGS)
 
@@ -7667,7 +7688,6 @@ $(BIN_DIR)/fleet-board-bridge: tools/fleet_board_bridge.c \
 # 127.0.0.1 only and carries no credentials; TLS termination and OAuth live
 # in front of it on the host path. Each tool call fork/execs the TESTED node
 # binary with --input JSON, so the gateway adds no store and mints nothing.
-FLEET_GATEWAY_BIN = $(BIN_DIR)/z23-fleet-gateway
 .PHONY: fleet-gateway
 fleet-gateway: $(FLEET_GATEWAY_BIN)
 $(FLEET_GATEWAY_BIN): tools/fleet_gateway.c \

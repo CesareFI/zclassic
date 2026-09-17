@@ -87,9 +87,9 @@ void boot_join_offer_service(struct boot_svc_ctx *svc)
 {
     if (!svc)
         return;
-    boot_join_thread_service_named(&svc->offer_thread,
-                                   &svc->offer_thread_started,
-                                   "snapshot_offer", 5);
+    (void)boot_join_thread_service_named(&svc->offer_thread,
+                                         &svc->offer_thread_started,
+                                         "snapshot_offer", 5);
 }
 
 /* One-shot-checkpointed heartbeat for the snapshot-offer worker. It has no

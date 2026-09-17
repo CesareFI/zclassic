@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
  * Unit tests for the hardware profile organ (platform/modules/util/src/hw_profile.c).
@@ -76,6 +80,37 @@ static bool hwp_write_file(const char *path, const char *contents)
     fputs(contents, f);
     fclose(f);
     return true;
+}
+
+static void hwp_record_check(int *failures, const char *name, bool ok)
+{
+    printf("hw_profile: %s... %s\n", name, ok ? "OK" : "FAIL");
+    if (!ok)
+        (*failures)++;
+}
+
+static void hwp_check_reducer_affinity(int *failures)
+{
+#if defined(__linux__)
+    cpu_set_t before;
+    CPU_ZERO(&before);
+    bool have_affinity = pthread_getaffinity_np(
+        pthread_self(), sizeof(before), &before) == 0;
+    bool domain_allowed = have_affinity &&
+        (CPU_ISSET(2, &before) || CPU_ISSET(3, &before));
+    hwp_record_check(failures, "pin_reducer_thread follows the allowed CPU set",
+                     hw_profile_pin_reducer_thread(pthread_self()) ==
+                         domain_allowed);
+    if (have_affinity)
+        hwp_record_check(
+            failures, "pin_reducer_thread affinity restores",
+            pthread_setaffinity_np(pthread_self(), sizeof(before), &before) ==
+                0);
+#else
+    hwp_record_check(failures,
+                     "pin_reducer_thread refuses without Linux affinity API",
+                     !hw_profile_pin_reducer_thread(pthread_self()));
+#endif
 }
 
 /* Builds a synthetic 4-cpu, 2-domain (asymmetric L3) sysfs tree under
@@ -450,13 +485,7 @@ int test_hw_profile(void)
                       ((snap.cpus[0] == 2 && snap.cpus[1] == 3) ||
                        (snap.cpus[0] == 3 && snap.cpus[1] == 2)));
 
-#if defined(__APPLE__)
-            HWP_CHECK("pin_reducer_thread refuses where Darwin has no affinity API",
-                      !hw_profile_pin_reducer_thread(pthread_self()));
-#else
-            HWP_CHECK("pin_reducer_thread succeeds on asymmetric fixture",
-                      hw_profile_pin_reducer_thread(pthread_self()));
-#endif
+            hwp_check_reducer_affinity(&failures);
         }
 
         /* restore real topology for anything running after this test */

@@ -713,7 +713,7 @@ static int mb_peercred(void)
     /* A peer that claims an identity in its own payload changes nothing: the
      * credentials come from the kernel, not the wire. */
     struct agent_peer_cred forged = c;
-    forged.uid = 0;
+    forged.uid = c.uid == 0 ? 1 : 0;
     e.uid = getuid();
     MB_CHECK("a self-claimed uid does not satisfy the expectation",
              !agent_broker_peer_authorized(&forged, &e, why, sizeof(why)));

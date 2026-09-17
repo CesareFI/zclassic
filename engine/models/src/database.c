@@ -353,6 +353,14 @@ int64_t node_db_recommended_mmap_bytes(void)
     return hw_profile_sqlite_mmap_bytes(ram, 0, ceiling);
 }
 
+int64_t node_db_recommended_cache_kib(void)
+{
+    int64_t ram = db_effective_ram_bytes();
+    int64_t ceiling = ram > 0 && ram <= ZCL_NODE_DB_CONSTRAINED_BYTES
+        ? 16 * 1024 : ZCL_NODE_DB_CACHE_CEIL_KIB;
+    return hw_profile_sqlite_cache_kib(ram, 16 * 1024, ceiling);
+}
+
 bool node_db_apply_readonly_tuning(sqlite3 *db)
 {
     if (!db)
@@ -365,11 +373,7 @@ bool node_db_apply_readonly_tuning(sqlite3 *db)
 
 static void db_set_pragmas(sqlite3 *db)
 {
-    int64_t ram = db_effective_ram_bytes();
-    int64_t cache_ceiling = ram > 0 && ram <= ZCL_NODE_DB_CONSTRAINED_BYTES
-        ? 16 * 1024 : ZCL_NODE_DB_CACHE_CEIL_KIB;
-    int64_t cache_kib = hw_profile_sqlite_cache_kib(
-        ram, 16 * 1024, cache_ceiling);
+    int64_t cache_kib = node_db_recommended_cache_kib();
     /* The live WAL-backed node.db is concurrently read and checkpointed by
      * multiple supervised services. A mapped database page can become
      * invalid underneath sqlite3_step when the mutable file is truncated,

@@ -1025,6 +1025,9 @@ ZCL_CAPABILITY_SYMBOL("pthread_rwlock_rdlock", CAP_HARMLESS, "")
 ZCL_CAPABILITY_SYMBOL("pthread_rwlock_unlock", CAP_HARMLESS, "")
 ZCL_CAPABILITY_SYMBOL("pthread_rwlock_wrlock", CAP_HARMLESS, "")
 ZCL_CAPABILITY_SYMBOL("pthread_self", CAP_HARMLESS, "")
+ZCL_CAPABILITY_SYMBOL("pthread_getaffinity_np", CAP_HARMLESS,
+    "Reads the CPU set already assigned to a thread; it neither grants "
+    "authority nor changes scheduling policy.")
 ZCL_CAPABILITY_SYMBOL("pthread_setaffinity_np", CAP_HARMLESS,
     "Changes where this process runs, not what it may do. CAP_PRIVILEGE "
     "is about authority, and affinity is not authority.")

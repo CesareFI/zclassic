@@ -223,11 +223,7 @@ static int rl_codec_checks(const char *fixture,
 static int rl_cycle_checks(void)
 {
     int failures = 0;
-#if defined(__APPLE__)
     const char *sleeper_path = "build/fixtures/rlc_child_v1";
-#else
-    const char *sleeper_path = "/bin/sleep";
-#endif
     char error[RESIDENT_LAUNCH_ERROR_MAX];
     struct resident_launch_accepted sleeper;
     RL_CHECK("capture sleeper acceptance record",
@@ -241,13 +237,10 @@ static int rl_cycle_checks(void)
                                      sizeof(error)));
     struct resident_receipt receipt;
     memset(&receipt, 0, sizeof(receipt));
-#if defined(__APPLE__)
-    /* The native thin fixture is within the Darwin launch contract;
-     * the system sleep executable may be a universal Mach-O. */
+    /* Use the ordinary built file on every host. System utility paths may be
+     * symlinks (merged-/usr Linux) or universal Mach-O images; the resident
+     * contract intentionally refuses both ambiguous input shapes. */
     char *const argv[] = {"rlc_child_v1", "--resident", serving.nonce, "park", NULL};
-#else
-    char *const argv[] = {"sleep", "30", NULL};
-#endif
     char *const envp[] = {NULL};
     bool spawned_serving = resident_launch_spawn(
         &serving, argv, envp, &receipt, error, sizeof(error));

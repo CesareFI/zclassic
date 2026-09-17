@@ -169,16 +169,34 @@ static bool binary_ab_promote_stream(const char *slots_dir, FILE *input,
     return true;
 }
 
-bool binary_ab_promote(const char *slots_dir, const char *current_path)
+static bool binary_ab_promote_args_valid(const char *slots_dir,
+                                         const char *current_path)
 {
+    if (!slots_dir || slots_dir[0] == '\0')
+        LOG_FAIL("binary_ab", "promote: empty slots_dir");
     if (!current_path || current_path[0] == '\0')
         LOG_FAIL("binary_ab", "promote: empty current_path");
-    struct platform_positioned_file input;
-    platform_positioned_file_init(&input);
-    if (!platform_positioned_file_open(&input, current_path) ||
-        !platform_positioned_file_is_executable(&input))
+    return true;
+}
+
+static bool binary_ab_promote_open_input(struct platform_positioned_file *input,
+                                         const char *current_path)
+{
+    platform_positioned_file_init(input);
+    if (!platform_positioned_file_open(input, current_path) ||
+        !platform_positioned_file_is_executable(input))
         LOG_FAIL("binary_ab", "promote: %s is not a regular executable",
                  current_path);
+    return true;
+}
+
+bool binary_ab_promote(const char *slots_dir, const char *current_path)
+{
+    if (!binary_ab_promote_args_valid(slots_dir, current_path))
+        return false; /* raw-return-ok:callee-logs-refusal */
+    struct platform_positioned_file input;
+    if (!binary_ab_promote_open_input(&input, current_path))
+        return false; /* raw-return-ok:callee-logs-refusal */
     uint64_t size = 0;
     bool ok = platform_positioned_file_size(&input, &size);
     char requested[1024], dst[1024], parent[1024], tmp[1088];

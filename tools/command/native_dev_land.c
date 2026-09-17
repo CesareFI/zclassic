@@ -717,6 +717,21 @@ static bool dl_load_rows(const char *qpath, struct dl_row **rows_out,
     return true;
 }
 
+static bool dl_landdir_owner_mutable(const char *landdir)
+{
+#if defined(_WIN32)
+    (void)landdir;
+    return true;
+#else
+    /* Root can bypass a chmod(0500) fault. Queue persistence must honor the
+     * directory owner's declared write boundary regardless of service uid. */
+    struct stat st;
+    return lstat(landdir, &st) == 0 && S_ISDIR(st.st_mode) &&
+           !S_ISLNK(st.st_mode) &&
+           (st.st_mode & (S_IWUSR | S_IXUSR)) == (S_IWUSR | S_IXUSR);
+#endif
+}
+
 /* Whole-file rewrite under the row lock: temp file plus rename, so a
  * concurrent reader never sees a half-written queue. */
 static bool dl_rewrite_rows(const char *landdir, const char *qpath,
@@ -726,7 +741,8 @@ static bool dl_rewrite_rows(const char *landdir, const char *qpath,
     FILE *f;
     char *line;
     size_t len = 0;
-    if (!landdir || !qpath || (!rows && n > 0))
+    if (!landdir || !qpath || (!rows && n > 0) ||
+        !dl_landdir_owner_mutable(landdir))
         return false;
     if (snprintf(tmp, sizeof(tmp), "%s/queue.jsonl.tmp", landdir) >=
         (int)sizeof(tmp))
@@ -2666,6 +2682,47 @@ static bool dl_tip_checkout(const struct dl_dirs *d, struct dl_row *row,
  * and stays empty on every other path — so a caller can tell a rebase
  * that added a regeneration commit to the tip from one that did not,
  * without having to re-derive it from git. */
+static int dl_resolve_rebase_failure(
+    const struct dl_dirs *d, struct dl_row *row, char *why, size_t why_cap,
+    char *regen_note, size_t regen_note_cap)
+{
+    char buf[DL_GIT_CAP];
+    char paths[DL_GIT_CAP];
+    bool seen[DL_REGEN_N] = { false };
+    const char *unmerged_args[] = { "diff", "--name-only", "--diff-filter=U",
+                                    NULL };
+    const char *abort_args[] = { "rebase", "--abort", NULL };
+    (void)dl_git(d->wt, unmerged_args, paths, sizeof(paths),
+                 DL_GIT_TIMEOUT_MS);
+    dl_trim(paths);
+    /* A rebase can fail before producing any conflict (for example a missing
+     * committer identity or an I/O failure). Do not manufacture a content
+     * conflict when there is no path for an operator to resolve. */
+    if (!paths[0]) {
+        (void)dl_git(d->wt, abort_args, buf, sizeof(buf), DL_GIT_TIMEOUT_MS);
+        (void)snprintf(why, why_cap, "%s",
+                       "rebase failed without conflicted paths");
+        return -1;
+    }
+    (void)snprintf(why, why_cap, "%s", paths);
+    for (char *p = why; *p; p++) {
+        if (*p == '\n')
+            *p = ' ';
+    }
+    int resolved = dl_rebase_autoresolve(d, row, paths, sizeof(paths), seen,
+                                         why, why_cap);
+    if (resolved < 0) {
+        (void)dl_git(d->wt, abort_args, buf, sizeof(buf), DL_GIT_TIMEOUT_MS);
+        return -1;
+    }
+    if (resolved == 0) {
+        (void)dl_git(d->wt, abort_args, buf, sizeof(buf), DL_GIT_TIMEOUT_MS);
+        return 0;
+    }
+    dl_regen_note(seen, regen_note, regen_note_cap);
+    return 1;
+}
+
 static int dl_rebase(const struct dl_dirs *d, struct dl_row *row,
                      const char *observed_main, char *why, size_t why_cap,
                      char *regen_note, size_t regen_note_cap)
@@ -2673,9 +2730,6 @@ static int dl_rebase(const struct dl_dirs *d, struct dl_row *row,
     char buf[DL_GIT_CAP];
     bool integrated = false;
     const char *rebase_args[] = { "rebase", observed_main, NULL };
-    const char *unmerged_args[] = { "diff", "--name-only", "--diff-filter=U",
-                                    NULL };
-    const char *abort_args[] = { "rebase", "--abort", NULL };
     if (regen_note && regen_note_cap)
         regen_note[0] = '\0';
     if (!dl_tip_checkout(d, row, observed_main, &integrated, why, why_cap))
@@ -2687,38 +2741,14 @@ static int dl_rebase(const struct dl_dirs *d, struct dl_row *row,
     if (!integrated &&
         dl_git(d->wt, rebase_args, buf, sizeof(buf), DL_GIT_TIMEOUT_MS) !=
         0) {
-        char paths[DL_GIT_CAP];
-        bool seen[DL_REGEN_N] = { false };
-        int resolved;
-        (void)dl_git(d->wt, unmerged_args, paths, sizeof(paths),
-                     DL_GIT_TIMEOUT_MS);
-        dl_trim(paths);
         /* Compose the conflict message FIRST, from the original list, so
-         * the auto-resolve below is free to reuse `paths` as scratch and
+         * the resolver is free to reuse its path buffer as scratch and
          * a conflict it declines to settle still reports byte-identically
-         * to how it always has. Replacing newlines in `why` rather than
-         * in `paths` is a 1:1 substitution, so it truncates identically
-         * too. */
-        (void)snprintf(why, why_cap, "%s",
-                       paths[0] ? paths : "rebase refused the tip");
-        for (char *p = why; *p; p++) {
-            if (*p == '\n')
-                *p = ' ';
-        }
-        resolved = dl_rebase_autoresolve(d, row, paths, sizeof(paths), seen,
-                                         why, why_cap);
-        if (resolved < 0) {
-            (void)dl_git(d->wt, abort_args, buf, sizeof(buf),
-                         DL_GIT_TIMEOUT_MS);
-            return -1;
-        }
-        if (resolved > 0) {
-            dl_regen_note(seen, regen_note, regen_note_cap);
-        } else {
-            (void)dl_git(d->wt, abort_args, buf, sizeof(buf),
-                         DL_GIT_TIMEOUT_MS);
-            return 0;
-        }
+         * to how it always has. */
+        int resolved = dl_resolve_rebase_failure(
+            d, row, why, why_cap, regen_note, regen_note_cap);
+        if (resolved <= 0)
+            return resolved;
     }
     if (!dl_rev_parse(d->wt, "HEAD", row->local)) {
         (void)snprintf(why, why_cap, "the rebased head cannot be named");

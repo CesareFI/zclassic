@@ -108,6 +108,16 @@ static int cf_run_child(int (*fn)(void))
     return WEXITSTATUS(st);
 }
 
+static bool cf_child_succeeds(const char *name, int (*fn)(void))
+{
+    int result = cf_run_child(fn);
+    if (result != 0)
+        fprintf(stderr, "confine child '%s' failed: result=%d%s\n", name,
+                result, result < 0 ? " (negative value is terminating signal)"
+                                   : " (child exit code)");
+    return result == 0;
+}
+
 /* Build the node_confine profile scoped to the fixture datadir (rw) + a
  * read-only /proc/self/status grant, and enter it. Returns true on success. */
 static bool cf_enter_confine(void)
@@ -373,7 +383,8 @@ int test_confine(void)
     if (abi >= 1 && os_sandbox_seccomp_supported()) {
         /* (a) normal ops still work confined (strict profile) */
         CF_CHECK("normal ops work confined (file I/O + malloc + getrandom + "
-                 "clock + SQLite SELECT)", cf_run_child(c_confine_normal_ops) == 0);
+                 "clock + SQLite SELECT)",
+                 cf_child_succeeds("normal", c_confine_normal_ops));
         /* (b) Landlock denies an outside path (strict profile) */
         CF_CHECK("landlock: /etc/passwd open denied (EACCES) under confinement",
                  cf_run_child(c_confine_outside_path) == 0);
@@ -386,7 +397,7 @@ int test_confine(void)
          * work confined under the widened serving allow-list. */
         CF_CHECK("serving: real loopback socket/bind/listen/accept/send/recv "
                  "+ SQLite query work confined",
-                 cf_run_child(c_confine_serving_normal_ops) == 0);
+                 cf_child_succeeds("serving", c_confine_serving_normal_ops));
 
         /* (f) canaries: execve/ptrace/mount still KILL under the serving
          * profile — the socket-family widening did not loosen anything else.

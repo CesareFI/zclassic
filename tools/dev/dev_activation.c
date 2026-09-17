@@ -54,6 +54,31 @@ static const char *dev_activation_executable_name(void)
 #endif
 }
 
+#if !defined(_WIN32)
+/* Service managers often run activation with elevated authority.  Mode bits
+ * still define the owner's intended mutation boundary; uid 0 must not turn a
+ * read-only rollback or generation directory into writable state. */
+static bool dev_activation_owner_mutable_dir(const char *path)
+{
+    struct stat st;
+    return path && lstat(path, &st) == 0 && S_ISDIR(st.st_mode) &&
+           !S_ISLNK(st.st_mode) &&
+           (st.st_mode & (S_IWUSR | S_IXUSR)) == (S_IWUSR | S_IXUSR);
+}
+
+static bool dev_activation_owner_mutable_target(const char *path,
+                                                const char *parent)
+{
+    struct stat st;
+    if (!dev_activation_owner_mutable_dir(parent))
+        return false;
+    if (lstat(path, &st) == 0)
+        return S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode) &&
+               (st.st_mode & S_IWUSR) != 0;
+    return errno == ENOENT;
+}
+#endif
+
 bool dev_activation_join(char *out, size_t out_sz, const char *a, const char *b)
 {
     int n = snprintf(out, out_sz, "%s/%s", a, b);
@@ -530,6 +555,12 @@ bool dev_activation_write_build_identity(const struct dev_activation_txn *txn,
         if (!dev_activation_mkdir_p(dir))
             return false;
     }
+    if (!dev_activation_owner_mutable_target(txn->build_id_dropin, dir)) {
+        fprintf(stderr,
+                "[dev-activation] build-identity owner write authority "
+                "refused\n");
+        return false;
+    }
     FILE *f = fopen(txn->build_id_dropin, "w");
     if (!f) {
         fprintf(stderr, "[dev-activation] build-identity drop-in open: %s\n",
@@ -787,6 +818,51 @@ static bool dev_write_all(int fd, const char *bytes, size_t len)
     }
     return true;
 }
+
+static bool dev_publish_in_progress_posix(
+    const struct dev_activation_txn *txn, char *tmp,
+    const char *line, size_t line_len)
+{
+    if (!dev_activation_owner_mutable_dir(txn->gen_root)) {
+        LOG_WARN("dev-activation",
+                 "in-progress marker owner write authority refused");
+        return false;
+    }
+    int fd = mkstemp(tmp);
+    if (fd < 0) {
+        LOG_WARN("dev-activation", "in-progress marker create %s: %s",
+                 tmp, strerror(errno));
+        return false;
+    }
+    bool ok = fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 &&
+              fchmod(fd, 0644) == 0 &&
+              dev_write_all(fd, line, line_len) && fsync(fd) == 0;
+    if (close(fd) != 0)
+        ok = false;
+    if (ok && rename(tmp, txn->inprogress_path) != 0)
+        ok = false;
+    if (!ok) {
+        LOG_WARN("dev-activation", "in-progress marker publish %s: %s",
+                 txn->inprogress_path, strerror(errno));
+        (void)unlink(tmp);
+        (void)unlink(txn->inprogress_path);
+        return false;
+    }
+
+    int dfd = open(txn->gen_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    bool dir_ok = dfd >= 0;
+    if (dir_ok && fsync(dfd) != 0)
+        dir_ok = false;
+    if (dfd >= 0 && close(dfd) != 0)
+        dir_ok = false;
+    if (!dir_ok) {
+        LOG_WARN("dev-activation", "in-progress marker directory fsync: %s",
+                 strerror(errno));
+        (void)unlink(txn->inprogress_path);
+        return false;
+    }
+    return true;
+}
 #endif
 
 static bool dev_write_in_progress(struct dev_activation_txn *txn)
@@ -833,40 +909,8 @@ static bool dev_write_in_progress(struct dev_activation_txn *txn)
         return false;
     }
 #else
-    int fd = mkstemp(tmp);
-    if (fd < 0) {
-        LOG_WARN("dev-activation", "in-progress marker create %s: %s",
-                 tmp, strerror(errno));
+    if (!dev_publish_in_progress_posix(txn, tmp, line, line_len))
         return false;
-    }
-    bool ok = fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 &&
-              fchmod(fd, 0644) == 0 &&
-              dev_write_all(fd, line, line_len) &&
-              fsync(fd) == 0;
-    if (close(fd) != 0)
-        ok = false;
-    if (ok && rename(tmp, txn->inprogress_path) != 0)
-        ok = false;
-    if (!ok) {
-        LOG_WARN("dev-activation", "in-progress marker publish %s: %s",
-                 txn->inprogress_path, strerror(errno));
-        (void)unlink(tmp);
-        (void)unlink(txn->inprogress_path);
-        return false;
-    }
-
-    int dfd = open(txn->gen_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    bool dir_ok = dfd >= 0;
-    if (dir_ok && fsync(dfd) != 0)
-        dir_ok = false;
-    if (dfd >= 0 && close(dfd) != 0)
-        dir_ok = false;
-    if (!dir_ok) {
-        LOG_WARN("dev-activation", "in-progress marker directory fsync: %s",
-                 strerror(errno));
-        (void)unlink(txn->inprogress_path);
-        return false;
-    }
 #endif
     txn->activation_in_progress = true;
     return true;

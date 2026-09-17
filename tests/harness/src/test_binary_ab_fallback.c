@@ -55,6 +55,29 @@ static int ab_write_file(const char *path, const char *contents, mode_t mode)
     return chmod(path, mode);
 }
 
+static bool ab_copy_executable(const char *source, const char *destination)
+{
+    FILE *input = fopen(source, "rb");
+    FILE *output = input ? fopen(destination, "wb") : NULL;
+    bool ok = input && output;
+    unsigned char bytes[8192];
+    while (ok) {
+        size_t count = fread(bytes, 1, sizeof(bytes), input);
+        if (count > 0 && fwrite(bytes, 1, count, output) != count)
+            ok = false;
+        if (count < sizeof(bytes)) {
+            if (ferror(input))
+                ok = false;
+            break;
+        }
+    }
+    if (output && fclose(output) != 0)
+        ok = false;
+    if (input && fclose(input) != 0)
+        ok = false;
+    return ok && chmod(destination, 0755) == 0;
+}
+
 /* Reads up to sz-1 bytes of `path` into `out` (NUL-terminated). -1 on error. */
 static int ab_read_file(const char *path, char *out, size_t sz)
 {
@@ -305,10 +328,14 @@ static int test_binary_ab_fallback_platform_arm(void)
     }
     dir = resolved_dir;
 
-    char streak[PATH_MAX], cur[PATH_MAX], lastgood[PATH_MAX], buf[256];
+    char streak[PATH_MAX], cur[PATH_MAX], lastgood[PATH_MAX], native_true[PATH_MAX];
+    char buf[256];
     snprintf(streak, sizeof(streak), "%s/%s", dir, BINARY_AB_STREAK_BASENAME);
     snprintf(lastgood, sizeof(lastgood), "%s/%s", dir, BINARY_AB_LASTGOOD_BASENAME);
     snprintf(cur, sizeof(cur), "%s/current-bin", dir);
+    snprintf(native_true, sizeof(native_true), "%s/native-true", dir);
+    AB_CHECK("copy a real executable without retaining a symlink path",
+             ab_copy_executable(AB_TRUE_PATH, native_true));
 
 #if defined(__linux__)
     /* systemd ProtectSystem=strict exposes read-only ancestors as searchable
@@ -626,7 +653,7 @@ static int test_binary_ab_fallback_platform_arm(void)
         AB_CHECK("seed native launch streak",
                  ab_write_file(streak, "0\n", 0600) == 0);
         struct os_binary_slots_launch launch;
-        bool ok = os_binary_slots_prepare_launch(dir, AB_TRUE_PATH, 3, &launch);
+        bool ok = os_binary_slots_prepare_launch(dir, native_true, 3, &launch);
         AB_CHECK("prepare real native launch succeeds",
                  ok && !launch.fallback_active && launch.executable_fd >= 0);
         AB_CHECK("descriptor-bound launch succeeds or fails closed",
@@ -642,7 +669,7 @@ static int test_binary_ab_fallback_platform_arm(void)
         struct os_binary_slots_launch long_launch;
         AB_CHECK("overlong slots directory is refused",
                  !os_binary_slots_prepare_launch(
-                     too_long, AB_TRUE_PATH, 3, &long_launch));
+                     too_long, native_true, 3, &long_launch));
         AB_CHECK("overlong current path is refused",
                  !os_binary_slots_prepare_launch(dir, too_long, 3,
                                                   &long_launch));
@@ -658,23 +685,26 @@ static int test_binary_ab_fallback_platform_arm(void)
                  ab_write_file(streak, "0\n", 0600) == 0);
 #if defined(__APPLE__)
         AB_CHECK("native launcher refuses when descriptor-bound exec is unavailable",
-                 ab_run_nodectl(dir, "3", "0", AB_TRUE_PATH,
+                 ab_run_nodectl(dir, "3", "0", native_true,
                                 output, sizeof(output), &status) &&
                  status == 126);
         AB_CHECK("seed Darwin adapter threshold streak",
                  ab_write_file(streak, "3\n", 0600) == 0);
         AB_CHECK("Darwin selected last-good also fails closed",
-                 ab_run_nodectl(dir, "3", "0", AB_TRUE_PATH,
+                 ab_run_nodectl(dir, "3", "0", native_true,
                                 output, sizeof(output), &status) &&
                  status == 126);
 #else
         AB_CHECK("native launcher runs with explicit slots and no HOME",
-                 ab_run_nodectl(dir, "3", "1", AB_TRUE_PATH,
+                 ab_run_nodectl(dir, "3", "1", native_true,
                                 output, sizeof(output), &status) &&
                  status == 0);
+        char current_line[PATH_MAX + 16];
+        snprintf(current_line, sizeof(current_line), "CURRENT=%s\n",
+                 native_true);
         AB_CHECK("native launcher forwards normal environment",
                  strstr(output, "FALLBACK_ACTIVE=\n") &&
-                 strstr(output, "CURRENT=" AB_TRUE_PATH "\n") &&
+                 strstr(output, current_line) &&
                  strstr(output, "STREAK_WRITTEN=1\n"));
         AB_CHECK("native launcher forwards node argv",
                  strstr(output, "ARGV[0]=-datadir=/forwarded\n") &&
@@ -683,7 +713,7 @@ static int test_binary_ab_fallback_platform_arm(void)
         AB_CHECK("seed exact-echo control streak",
                  ab_write_file(streak, "0\n", 0600) == 0);
         AB_CHECK("test echo value zero executes rather than echoing",
-                 ab_run_nodectl(dir, "3", "0", AB_TRUE_PATH,
+                 ab_run_nodectl(dir, "3", "0", native_true,
                                 output, sizeof(output), &status) &&
                  status == 0 && output[0] == '\0');
 #endif
@@ -691,7 +721,7 @@ static int test_binary_ab_fallback_platform_arm(void)
         AB_CHECK("seed invalid-threshold control streak",
                  ab_write_file(streak, "0\n", 0600) == 0);
         AB_CHECK("native launcher rejects non-decimal threshold",
-                 ab_run_nodectl(dir, "+3", "1", AB_TRUE_PATH,
+                 ab_run_nodectl(dir, "+3", "1", native_true,
                                 output, sizeof(output), &status) &&
                  status == 64);
         AB_CHECK("invalid threshold leaves streak untouched",
@@ -702,7 +732,7 @@ static int test_binary_ab_fallback_platform_arm(void)
         AB_CHECK("seed adapter threshold streak",
                  ab_write_file(streak, "3\n", 0600) == 0);
         AB_CHECK("native launcher threshold uses fallback",
-                 ab_run_nodectl(dir, "3", "1", AB_TRUE_PATH,
+                 ab_run_nodectl(dir, "3", "1", native_true,
                                 output, sizeof(output), &status) &&
                  status == 0 && strstr(output, "FALLBACK_ACTIVE=1\n") &&
                  strstr(output, "STREAK_WRITTEN=4\n"));
@@ -718,7 +748,7 @@ static int test_binary_ab_fallback_platform_arm(void)
     }
 
     /* ── 13. cleanup temp dir ────────────────────────────────────────── */
-    unlink(streak); unlink(lastgood); unlink(cur);
+    unlink(streak); unlink(lastgood); unlink(cur); unlink(native_true);
     char lock_path[PATH_MAX];
     snprintf(lock_path, sizeof(lock_path), "%s/.binary-slots.lock", dir);
     unlink(lock_path);

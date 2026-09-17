@@ -77,6 +77,9 @@ struct db_mig_family_file {
     char name[256];
     off_t size;
     mode_t mode;
+    uint64_t uid;
+    uint64_t gid;
+    uint64_t nlink;
     struct timespec mtime;
     struct timespec ctime;
     uint8_t sha3[32];
@@ -179,6 +182,14 @@ static bool db_mig_snapshot_family(const char *dbpath,
             break;
         }
         f->mode = st.st_mode;
+#if defined(_WIN32)
+        f->uid = 0;
+        f->gid = 0;
+#else
+        f->uid = (uint64_t)st.st_uid;
+        f->gid = (uint64_t)st.st_gid;
+#endif
+        f->nlink = (uint64_t)st.st_nlink;
         f->mtime = db_mig_stat_mtime(&st);
         f->ctime = db_mig_stat_ctime(&st);
         out->count++;
@@ -191,41 +202,76 @@ static bool db_mig_snapshot_family(const char *dbpath,
     return true;
 }
 
+static bool db_mig_family_file_same(const struct db_mig_family_file *a,
+                                    const struct db_mig_family_file *b)
+{
+    return strcmp(a->name, b->name) == 0 && a->size == b->size &&
+           a->mode == b->mode && a->uid == b->uid && a->gid == b->gid &&
+           a->nlink == b->nlink && a->mtime.tv_sec == b->mtime.tv_sec &&
+           a->mtime.tv_nsec == b->mtime.tv_nsec &&
+           memcmp(a->sha3, b->sha3, sizeof(a->sha3)) == 0;
+}
+
+static bool db_mig_family_metadata_same(
+    const struct db_mig_family_snapshot *a,
+    const struct db_mig_family_snapshot *b)
+{
+    return a->count == b->count &&
+           a->dir_mtime.tv_sec == b->dir_mtime.tv_sec &&
+           a->dir_mtime.tv_nsec == b->dir_mtime.tv_nsec &&
+           a->dir_ctime.tv_sec == b->dir_ctime.tv_sec &&
+           a->dir_ctime.tv_nsec == b->dir_ctime.tv_nsec;
+}
+
 static bool db_mig_family_same(const struct db_mig_family_snapshot *a,
                                const struct db_mig_family_snapshot *b)
 {
-    if (!a || !b || a->count != b->count ||
-        a->dir_mtime.tv_sec != b->dir_mtime.tv_sec ||
-        a->dir_mtime.tv_nsec != b->dir_mtime.tv_nsec ||
-        a->dir_ctime.tv_sec != b->dir_ctime.tv_sec ||
-        a->dir_ctime.tv_nsec != b->dir_ctime.tv_nsec) {
+    if (!a || !b) {
+        fprintf(stderr, "db_mig family snapshot is absent\n");
+        return false;
+    }
+    if (!db_mig_family_metadata_same(a, b)) {
         fprintf(stderr,
                 "db_mig family metadata changed count=%zu/%zu "
                 "dir_mtime=%lld.%09ld/%lld.%09ld "
                 "dir_ctime=%lld.%09ld/%lld.%09ld\n",
-                a ? a->count : 0, b ? b->count : 0,
-                a ? (long long)a->dir_mtime.tv_sec : 0,
-                a ? a->dir_mtime.tv_nsec : 0,
-                b ? (long long)b->dir_mtime.tv_sec : 0,
-                b ? b->dir_mtime.tv_nsec : 0,
-                a ? (long long)a->dir_ctime.tv_sec : 0,
-                a ? a->dir_ctime.tv_nsec : 0,
-                b ? (long long)b->dir_ctime.tv_sec : 0,
-                b ? b->dir_ctime.tv_nsec : 0);
+                a->count, b->count,
+                (long long)a->dir_mtime.tv_sec, a->dir_mtime.tv_nsec,
+                (long long)b->dir_mtime.tv_sec, b->dir_mtime.tv_nsec,
+                (long long)a->dir_ctime.tv_sec, a->dir_ctime.tv_nsec,
+                (long long)b->dir_ctime.tv_sec, b->dir_ctime.tv_nsec);
         return false;
     }
     for (size_t i = 0; i < a->count; i++) {
         const struct db_mig_family_file *fa = &a->files[i];
         const struct db_mig_family_file *fb = &b->files[i];
-        if (strcmp(fa->name, fb->name) != 0 || fa->size != fb->size ||
-            fa->mode != fb->mode ||
-            fa->mtime.tv_sec != fb->mtime.tv_sec ||
-            fa->mtime.tv_nsec != fb->mtime.tv_nsec ||
-            fa->ctime.tv_sec != fb->ctime.tv_sec ||
-            fa->ctime.tv_nsec != fb->ctime.tv_nsec ||
-            memcmp(fa->sha3, fb->sha3, sizeof(fa->sha3)) != 0) {
-            fprintf(stderr, "db_mig family file changed: %s/%s\n",
-                    fa->name, fb->name);
+        /* SQLite's POSIX VFS opens an existing WAL with O_CREAT and performs
+         * fchown(fd, geteuid(), getegid()) when the process is privileged.
+         * Linux advances ctime even when that same-owner call changes no
+         * persistent attribute. Compare the attributes themselves instead
+         * of treating ctime as a proxy: bytes, size, mode, ownership, link
+         * count and mtime must all remain exact. */
+        if (!db_mig_family_file_same(fa, fb)) {
+            fprintf(stderr,
+                    "db_mig family file changed: %s/%s "
+                    "size=%lld/%lld mode=%lo/%lo uid=%llu/%llu "
+                    "gid=%llu/%llu nlink=%llu/%llu "
+                    "mtime=%lld.%09ld/%lld.%09ld "
+                    "ctime=%lld.%09ld/%lld.%09ld hash_equal=%d\n",
+                    fa->name, fb->name,
+                    (long long)fa->size, (long long)fb->size,
+                    (unsigned long)fa->mode, (unsigned long)fb->mode,
+                    (unsigned long long)fa->uid,
+                    (unsigned long long)fb->uid,
+                    (unsigned long long)fa->gid,
+                    (unsigned long long)fb->gid,
+                    (unsigned long long)fa->nlink,
+                    (unsigned long long)fb->nlink,
+                    (long long)fa->mtime.tv_sec, fa->mtime.tv_nsec,
+                    (long long)fb->mtime.tv_sec, fb->mtime.tv_nsec,
+                    (long long)fa->ctime.tv_sec, fa->ctime.tv_nsec,
+                    (long long)fb->ctime.tv_sec, fb->ctime.tv_nsec,
+                    memcmp(fa->sha3, fb->sha3, sizeof(fa->sha3)) == 0);
             return false;
         }
     }

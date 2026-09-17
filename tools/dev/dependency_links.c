@@ -11,6 +11,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
+
 /* The build/ subdirectories this scan treats as dependency rooms. One table,
  * read by the walk below and by zcl_dependency_build_room_path(), so a warm
  * seeder cannot come to a different conclusion about which files must own
@@ -56,15 +60,47 @@ static const char *relative_path(const struct dependency_scan *scan,
     return *relative == '/' ? relative + 1 : relative;
 }
 
+/* A privileged process can enumerate a chmod(000) directory despite the
+ * pathname's ordinary access policy.  Treat the absence of every read or
+ * search bit as a refusal before enumeration so the gate gives the same
+ * fail-closed answer under root, containers, and an unprivileged account. */
+static bool directory_mode_permits_walk(const char *path)
+{
+#if defined(_WIN32)
+    (void)path;
+    return true;
+#else
+    struct stat status;
+    if (lstat(path, &status) != 0)
+        return false;
+    if ((status.st_mode & 0444) == 0 || (status.st_mode & 0111) == 0) {
+        errno = EACCES;
+        return false;
+    }
+    return true;
+#endif
+}
+
+static bool dependency_directory_admit(struct dependency_scan *scan,
+                                       const char *path)
+{
+    if (platform_directory_probe_real(path) != PLATFORM_DIRECTORY_PROBE_OK)
+        return refuse(scan, "directory_not_real:%s",
+                      relative_path(scan, path));
+    if (directory_mode_permits_walk(path))
+        return true;
+    int walk_errno = errno;
+    return refuse(scan, "cannot walk %s: %s", path, strerror(walk_errno));
+}
+
 static bool scan_directory(struct dependency_scan *scan, const char *path,
                            unsigned depth)
 {
     if (depth > ZCL_DEPENDENCY_LINK_DEPTH_MAX)
         return refuse(scan, "traversal_depth_exceeded:%s",
                       relative_path(scan, path));
-    if (platform_directory_probe_real(path) != PLATFORM_DIRECTORY_PROBE_OK)
-        return refuse(scan, "directory_not_real:%s",
-                      relative_path(scan, path));
+    if (!dependency_directory_admit(scan, path))
+        return false;
 
     struct platform_directory_list directories = {0}, files = {0};
     if (!platform_directory_list_children_sorted(path, &directories, &files)) {

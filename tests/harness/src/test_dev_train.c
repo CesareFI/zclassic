@@ -118,6 +118,11 @@ static bool dvt_fixture_root(const char *root, const char *bare)
                           root, NULL};
     if (!dvt_git(NULL, init))
         return false;
+    const char *name[] = {"config", "user.name", "Z23 Test", NULL};
+    const char *email[] = {"config", "user.email",
+                           "z23-test@example.invalid", NULL};
+    if (!dvt_git(root, name) || !dvt_git(root, email))
+        return false;
     if (!dvt_write(root, "shared.txt", "line1\n") ||
         !dvt_write(root, "other.txt", "o\n") ||
         !dvt_write(root, "Makefile", dvt_makefile) ||

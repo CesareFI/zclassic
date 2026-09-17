@@ -165,12 +165,14 @@ bool boot_start_thread_service(pthread_t *thread,
     return true;
 }
 
-static void boot_join_deadline_from_now(struct timespec *ts, int timeout_sec)
+static bool boot_join_deadline_from_now(struct timespec *ts, int timeout_sec)
 {
-    platform_time_realtime_timespec(ts);
+    if (platform_time_realtime_timespec(ts) != 0)
+        return false;
     if (timeout_sec < 0)
         timeout_sec = 0;
     ts->tv_sec += timeout_sec;
+    return true;
 }
 
 bool boot_join_thread_bounded(pthread_t thread,
@@ -180,7 +182,12 @@ bool boot_join_thread_bounded(pthread_t thread,
     struct timespec deadline;
     int rc;
 
-    boot_join_deadline_from_now(&deadline, timeout_sec);
+    if (!boot_join_deadline_from_now(&deadline, timeout_sec)) {
+        fprintf(stderr,
+                "[shutdown] %s join clock failed; retaining ownership\n",
+                name ? name : "thread");
+        return false;
+    }
     rc = thread_registry_join_until(thread, NULL, &deadline);
     if (rc == 0)
         return true;
@@ -194,19 +201,20 @@ bool boot_join_thread_bounded(pthread_t thread,
                 "[shutdown] %s join failed rc=%d (%s); retaining ownership\n",
                 name ? name : "thread", rc, strerror(rc));
     }
-    pthread_join(thread, NULL);
     return false;
 }
 
-void boot_join_thread_service_named(pthread_t *thread,
-                                           bool *started,
-                                           const char *name,
-                                           int timeout_sec)
+bool boot_join_thread_service_named(pthread_t *thread,
+                                    bool *started,
+                                    const char *name,
+                                    int timeout_sec)
 {
     if (!thread || !started || !*started)
-        return;
-    boot_join_thread_bounded(*thread, name, timeout_sec);
+        return true;
+    if (!boot_join_thread_bounded(*thread, name, timeout_sec))
+        return false;
     *started = false;
+    return true;
 }
 
 /* ── Start/join pairs ──────────────────────────────────────── */
@@ -228,9 +236,9 @@ void boot_join_payment_service(struct boot_svc_ctx *svc)
 {
     if (!svc)
         return;
-    boot_join_thread_service_named(&svc->payment_thread,
-                                   &svc->payment_thread_started,
-                                   "payment", 5);
+    (void)boot_join_thread_service_named(&svc->payment_thread,
+                                         &svc->payment_thread_started,
+                                         "payment", 5);
 }
 
 bool boot_start_address_backfill_service(struct boot_svc_ctx *svc)
@@ -251,9 +259,9 @@ void boot_join_address_backfill_service(struct boot_svc_ctx *svc)
 {
     if (!svc)
         return;
-    boot_join_thread_service_named(&svc->address_backfill_thread,
-                                   &svc->address_backfill_thread_started,
-                                   "address_backfill", 5);
+    (void)boot_join_thread_service_named(
+        &svc->address_backfill_thread, &svc->address_backfill_thread_started,
+        "address_backfill", 5);
 }
 
 bool boot_start_tx_index_service(struct boot_svc_ctx *svc)
@@ -617,9 +625,9 @@ void boot_join_hodl_history_service(struct boot_svc_ctx *svc)
     if (!svc)
         return;
     svc->hodl_history_thread_stop = true;
-    boot_join_thread_service_named(&svc->hodl_history_thread,
-                                   &svc->hodl_history_thread_started,
-                                   "hodl_history", 5);
+    (void)boot_join_thread_service_named(&svc->hodl_history_thread,
+                                         &svc->hodl_history_thread_started,
+                                         "hodl_history", 5);
 }
 
 bool boot_start_projection_backfill_service(struct boot_svc_ctx *svc)
@@ -643,9 +651,9 @@ void boot_join_projection_backfill_service(struct boot_svc_ctx *svc)
     if (!svc)
         return;
     svc->projection_backfill_thread_stop = true;
-    boot_join_thread_service_named(&svc->projection_backfill_thread,
-                                   &svc->projection_backfill_thread_started,
-                                   "projection_backfill", 5);
+    (void)boot_join_thread_service_named(
+        &svc->projection_backfill_thread,
+        &svc->projection_backfill_thread_started, "projection_backfill", 5);
 }
 
 void boot_join_tx_index_service(struct boot_svc_ctx *svc)
@@ -654,8 +662,9 @@ void boot_join_tx_index_service(struct boot_svc_ctx *svc)
         return;
     if (!svc->tx_index_job.started)
         return;
-    boot_join_thread_bounded(svc->tx_index_job.thread, "snapshot_tx_index", 5);
-    svc->tx_index_job.started = false;
+    if (boot_join_thread_bounded(svc->tx_index_job.thread,
+                                 "snapshot_tx_index", 5))
+        svc->tx_index_job.started = false;
 }
 
 /* ── Helper threads ────────────────────────────────────────── */

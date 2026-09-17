@@ -89,6 +89,13 @@ static int tfd_note_path(struct tfd_state *st, const char *fmt, const char *p)
  * (present but unreadable, or the file is larger than the buffer). */
 static int tfd_read(const char *path, char *buf, size_t cap, size_t *outn)
 {
+    struct stat status;
+    if (stat(path, &status) != 0)
+        return errno == ENOENT ? TFD_MISSING : tfd_cannot_open(path);
+    if ((status.st_mode & 0444) == 0) {
+        errno = EACCES;
+        return tfd_cannot_open(path);
+    }
     FILE *f = fopen(path, "r");
     if (!f)
         return errno == ENOENT ? TFD_MISSING : tfd_cannot_open(path);

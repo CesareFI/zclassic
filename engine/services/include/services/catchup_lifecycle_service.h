@@ -14,7 +14,7 @@
  * boot_services.c and boot_background_workers.c keep extracting
  * node_db/chain/wallet/datadir from `svc` and pass them through, so the
  * two call sites stay thin while the lifecycle POLICY (double-start
- * guard, bounded join with detach-on-timeout, poll-only reap) lives in
+ * guard, bounded ownership-retaining join, poll-only reap) lives in
  * one place next to the job it manages.
  *
  * Kept as its own file rather than folded into node_db_catchup_service.c:
@@ -45,20 +45,18 @@ bool catchup_lifecycle_start(struct node_db_sync_catchup_job *job,
                              struct wallet *w,
                              const char *datadir);
 
-/* Bounded join for shutdown: waits up to timeout_sec for the catchup
- * thread, then detaches instead of blocking (never lets a stuck catchup
- * thread hang shutdown). No-op if the job is not started. Clears
- * job->started unconditionally on return — matches the former
- * boot_join_catchup_service contract. */
-void catchup_lifecycle_join(struct node_db_sync_catchup_job *job,
+/* Bounded join for shutdown. True means joined (or already stopped). A
+ * timeout/error returns false and leaves job->started set so the owner must
+ * retain every object the worker can reach and may retry after cancellation.
+ * No worker is detached and no unavailable platform timed-join is required. */
+bool catchup_lifecycle_join(struct node_db_sync_catchup_job *job,
                             int timeout_sec);
 
 /* Poll-style reap for the background backfill watcher: if the job is
  * running but not yet finished, no-op (returns true — "nothing to reap
  * yet"). Once finished, joins it (bounded 1s) and clears job->started.
- * Returns false only if that bounded join itself times out, leaving the
- * job thread detached and job->started still true — matches the former
- * boot_reap_catchup_service contract. */
+ * Returns false only if that bounded join itself times out/errors, retaining
+ * ownership with job->started still true. */
 bool catchup_lifecycle_reap(struct node_db_sync_catchup_job *job);
 
 #endif /* ZCL_SERVICES_CATCHUP_LIFECYCLE_SERVICE_H */

@@ -403,6 +403,14 @@ static bool hg_exists(const char *path)
     return lstat(path, &st) == 0;
 }
 
+static bool hg_pool_allows_removal(const char *path)
+{
+    struct stat st;
+    return path && lstat(path, &st) == 0 && S_ISDIR(st.st_mode) &&
+           !S_ISLNK(st.st_mode) &&
+           (st.st_mode & (S_IWUSR | S_IXUSR)) == (S_IWUSR | S_IXUSR);
+}
+
 /* Drop the administrative record of a worktree whose directory is gone.
  * Only needed after this engine finished a removal git did not. */
 static void hg_prune(const char *repo)
@@ -478,6 +486,15 @@ static void hg_act(const struct host_gc_request *req,
     cls->bytes_reclaimable += bytes;
     if (!req->apply)
         return;
+    /* uid 0 can otherwise make a read-only pool writable by authority
+     * bypass.  Honor the owner's policy before either git or the fallback
+     * tree remover mutates the namespace. */
+    if (!hg_pool_allows_removal(cls->path)) {
+        hg_refuse(report, c->path, "remove_failed:pool_not_writable");
+        cls->reapable--;
+        cls->need_review++;
+        return;
+    }
     gone = hg_reap(cls->repo, c->path) && !hg_exists(c->path);
     if (!gone)
         gone = hg_finish_removal(req, report, cls, c->path);

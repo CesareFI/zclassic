@@ -204,6 +204,13 @@ static int ntf_count_hits(const char *line)
 
 static int ntf_scan_file(const char *path, struct ntf_set *s)
 {
+    struct stat status;
+    if (stat(path, &status) != 0 || (status.st_mode & 0444) == 0) {
+        fprintf(stderr,
+                "check-no-bare-tmp-fixture: UNPROVEN — cannot read %s\n",
+                path);
+        return 2;
+    }
     FILE *f = fopen(path, "r");
     if (!f) {
         fprintf(stderr,

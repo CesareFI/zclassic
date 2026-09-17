@@ -149,6 +149,10 @@ bool node_db_open_runtime(struct node_db *ndb, const char *path,
 bool node_db_open_existing_runtime(struct node_db *ndb, const char *path,
                                    const char *reason);
 
+/* Recommended SQLite page-cache budget in KiB for the effective memory
+ * envelope (measured RAM clamped by cgroup memory.high/max). */
+int64_t node_db_recommended_cache_kib(void);
+
 /* Recommended SQLite mmap window for this process's effective memory budget.
  * The budget is the smaller of measured RAM and cgroup memory.high/max. A
  * strict <=4 GiB lane returns zero; <=8 GiB returns at most 64 MiB; larger

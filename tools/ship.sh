@@ -999,17 +999,21 @@ if [ "${1:-}" = "--selftest" ] || [ "${1:-}" = "--selftest-dev-guard" ]; then
     # clean path with no " (deleted)" text glued onto it, and its live bytes
     # must still be readable through /proc/<pid>/exe even though the
     # original on-disk pathname is now gone. Reproduces the exact failure
-    # mode confirmed live on node1 2026-09-07 by copying a real long-running
-    # binary, deleting it out from under the running copy, no compiler
-    # required. Darwin only offers the pathname fallback: test that path
+    # mode confirmed live on node1 2026-09-07 by copying the Bash executable
+    # already running this self-test, deleting it out from under the copy, no
+    # compiler required. Do not use `sleep` here: uutils and BusyBox are
+    # multicall executables whose dispatch depends on argv[0], so a copied
+    # synthetic basename exits before the executable-identity proof begins.
+    # Darwin only offers the pathname fallback: test that path
     # while it exists and its loss after unlink, without claiming a procfs
     # handle survived. Linux must still prove the stronger deleted-inode rail.
     exe_root="$test_tmp/exe"
     mkdir -p "$exe_root"
     exe_root="$(cd "$exe_root" && pwd -P)"
-    sleep_src="$(command -v sleep)"
-    cp "$sleep_src" "$exe_root/z23-selftest-exe"
-    "$exe_root/z23-selftest-exe" 20 &
+    exe_src="$BASH"
+    cp "$exe_src" "$exe_root/z23-selftest-exe"
+    "$exe_root/z23-selftest-exe" -c \
+        'trap "exit 0" TERM; while :; do sleep 1; done' &
     exe_pid=$!
     trap 'kill "$exe_pid" 2>/dev/null || true; wait "$exe_pid" 2>/dev/null || true; find "$test_tmp" -depth -delete' EXIT HUP INT TERM
     # Wait for the copy to actually be running before deleting it out from
@@ -1019,7 +1023,7 @@ if [ "${1:-}" = "--selftest" ] || [ "${1:-}" = "--selftest-dev-guard" ]; then
         sleep 0.2
     done
     [ "$(ship_exe_of "$exe_pid")" = "$exe_root/z23-selftest-exe" ]
-    src_sha="$(ship_sha256_stream < "$sleep_src")"
+    src_sha="$(ship_sha256_stream < "$exe_src")"
     live_sha="$(ship_sha256_stream < "$(ship_exe_live_of "$exe_pid")")"
     [ "$live_sha" = "$src_sha" ]
     rm -f "$exe_root/z23-selftest-exe"

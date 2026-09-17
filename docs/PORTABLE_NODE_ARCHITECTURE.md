@@ -182,10 +182,15 @@ request. It records join ownership and has a fixed safety capacity of 256.
 Its spawn trampoline is the sole authority that publishes completion, and a
 registry condition variable now provides deadline-bounded waits before the
 final pthread reap. Production registry consumers no longer depend on a native
-timed-join or try-join extension. Some bounded services still own their own
-stop flags and several timeout paths retain legacy final blocking joins. The
-node also has process-global managers and scheduler instances, so a second
-in-process node is not presently supported.
+timed-join or try-join extension. The boot-background and catchup lifecycle
+owners now retain their started/owned state when a bounded join times out, so a
+caller can cancel cooperatively and retry without detaching or destroying live
+state. Process-level shutdown still invokes the registry's legacy aggregate
+`join_all_owned` barriers, and several other subsystem stop routines still use
+direct blocking joins. Those are the next bounded-shutdown inventory; they are
+not acceptable as the final Android lifecycle. The node also has process-global
+managers and scheduler instances, so a second in-process node is not presently
+supported.
 
 Android bionic does not provide glibc's `pthread_timedjoin_np`, and it also does
 not provide the cancellation mechanism used by the current Darwin emulation.
@@ -325,6 +330,7 @@ The existing enforced ceilings are evidence, not yet Android tuning targets:
 | Header ownership spans | 128, allocation-free | `HRS_MAX_SPANS` |
 | Block intake queue | 1,024 entries | `MSG_BLOCK_INTAKE_CAP` |
 | Registered threads | 256 safety cap | `ZCL_THREAD_REGISTRY_CAP` |
+| Mutable node.db page cache | 16 MiB on effective RAM <=4 GiB; otherwise 64 MiB ceiling | `node_db_recommended_cache_kib` |
 
 These desktop defaults are too large to declare a mobile budget. Before setting
 Android defaults, a reproducible benchmark must record peak/steady RSS, thread
@@ -402,9 +408,11 @@ production workers wait on portable completion publication; direct
 `pthread_timedjoin_np` and `pthread_tryjoin_np` consumers have been removed
 outside the platform capability shim and its tests. The former detached onion
 bridge pump is registry-owned, and completed registry-owned jobs are reaped
-opportunistically so a long-running node cannot exhaust the fixed table.
-Signal/backtrace paths, unregistered raw thread creation, and legacy final
-blocking-join fallbacks remain known blockers.
+opportunistically so a long-running node cannot exhaust the fixed table. Boot
+background and catchup-service timeout paths retain ownership and permit a
+bounded retry instead of falling through to an unlimited join.
+Signal/backtrace paths, unregistered raw thread creation, aggregate registry
+drains, and other direct blocking joins remain known blockers.
 
 Exit: portable headers do not select glibc-only APIs under Android macros, and
 the unsupported-runtime inventory is explicit.
@@ -473,8 +481,10 @@ chainstate, and no worker/socket use-after-free.
 
 - No pinned Android NDK or arm64 dependency build is present in this checkout.
 - Android lacks native timed-join/cancel mechanisms. Registry-owned workers now
-  publish cooperative completion portably, but stop-error propagation must
-  replace the remaining legacy final blocking-join fallbacks.
+  publish cooperative completion portably, and bounded service owners retain
+  ownership on timeout. Stop-error propagation must still replace the
+  process-level aggregate `join_all_owned` barriers and remaining direct
+  blocking joins.
 - signal installation, backtrace/syscall diagnostics, daemon policy, and some
   `/proc` assumptions are still process/platform coupled.
 - the full node is not an independently owned `node_instance`; several global

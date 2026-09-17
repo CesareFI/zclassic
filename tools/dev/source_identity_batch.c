@@ -12,8 +12,10 @@
  *      E\0<dev>:<ino>:<size>:<mode-%x>:<mtime-%y>:<ctime-%z>\0 | D\0)
  *
  * The metadata line matches GNU stat --printf='%d:%i:%s:%f:%y:%z' exactly,
- * including the local-timezone human timestamps with untrimmed nanoseconds
- * and the lstat view (a symlink entry describes the link itself). Gitlink
+ * including UTC human timestamps with untrimmed nanoseconds and the lstat
+ * view (a symlink entry describes the link itself). The shell launcher fixes
+ * TZ=UTC0 for both this collector and its `stat` oracle so the host's ambient
+ * timezone and GNU/uutils POSIX-TZ differences cannot perturb the token. Gitlink
  * states arrive as `path\0state\0` pairs in the sidecar file; membership in
  * that file is the same test as the shell's GITLINK_STATE associative array.
  */
@@ -528,8 +530,10 @@ static int canonical_mode(char out[8], const struct stat *metadata, char kind,
     return 0;
 }
 
-/* Mirror GNU stat --printf='%y' or '%z': local time, untrimmed nanoseconds,
- * and the timezone offset belonging to that broken-down local time. */
+/* Mirror `TZ=UTC0 stat --printf='%y'` or `%z`: UTC, untrimmed nanoseconds,
+ * and the +0000 offset belonging to that broken-down time. The launcher owns
+ * the fixed TZ capability boundary; localtime_r is retained because it is the
+ * exact libc formatter whose output the external stat oracle checks. */
 static int format_time(char out[80], const struct timespec *when)
 {
     struct tm broken;

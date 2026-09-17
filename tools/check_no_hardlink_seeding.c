@@ -401,15 +401,24 @@ static bool selftest_repair_success(const char *base)
     return ok;
 }
 
-/* --repair over a read-only directory refuses loudly (non-zero); nothing is
- * silently left half-done. */
+/* --repair refuses loudly when its atomic-copy destination cannot be
+ * created; nothing is silently left half-done.  A directory at the exact
+ * temporary pathname is deterministic even for a privileged test runner,
+ * unlike chmod-based permission fixtures. */
 static bool selftest_repair_refusal(const char *base)
 {
     struct hl_pair_fixture p = {0};
-    bool ok = hl_pair_create(base, &p) && chmod(p.vendor, 0500) == 0;
+    char blocker[ZCL_DEPENDENCY_LINK_PATH_MAX] = {0};
+    bool ok = hl_pair_create(base, &p);
+    if (ok) {
+        int wrote = snprintf(blocker, sizeof(blocker), "%s.dedupe.tmp",
+                             p.peer);
+        ok = wrote > 0 && (size_t)wrote < sizeof(blocker) &&
+             platform_directory_ensure(blocker, 0700);
+    }
     if (ok)
         ok = !repair_root(base);
-    if (p.vendor[0]) (void)chmod(p.vendor, 0700);
+    if (blocker[0]) (void)rmdir(blocker);
     hl_pair_cleanup(&p);
     return ok;
 }
@@ -474,7 +483,8 @@ static int selftest_repair(void)
     }
     printf("hardlink-seeding: repair selftest PASS (dedupe leaves "
            "independent inodes with mode+mtime preserved and identical "
-           "bytes; a read-only directory refuses loudly; a .git/objects "
+           "bytes; a blocked atomic-copy destination refuses loudly; a "
+           ".git/objects "
            "hardlink outside the scan scope is never touched)\n");
     return 0;
 }

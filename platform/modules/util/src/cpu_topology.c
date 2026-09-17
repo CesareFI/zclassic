@@ -728,13 +728,28 @@ bool cpu_topology_pin_thread(pthread_t thread, int domain)
     }
 
 #if defined(__linux__)
-    cpu_set_t set;
+    cpu_set_t available, set;
+    CPU_ZERO(&available);
+    int get_rc = pthread_getaffinity_np(thread, sizeof(available), &available);
+    if (get_rc != 0) {
+        LOG_FAIL("cpu_topology",
+                 "pin_thread: pthread_getaffinity_np failed for domain %d: "
+                 "errno=%d (%s)", domain, get_rc, strerror(get_rc));
+    }
     CPU_ZERO(&set);
+    bool any = false;
     int n = g_state.domains[domain].cpu_count;
     for (int i = 0; i < n; i++) {
         int c = g_state.domains[domain].cpus[i];
-        if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
+        if (c >= 0 && c < CPU_SETSIZE && CPU_ISSET(c, &available)) {
+            CPU_SET(c, &set);
+            any = true;
+        }
     }
+    if (!any)
+        LOG_FAIL("cpu_topology",
+                 "pin_thread: domain %d has no CPU allowed for this thread",
+                 domain);
 
     int rc = pthread_setaffinity_np(thread, sizeof(set), &set);
     if (rc != 0) {

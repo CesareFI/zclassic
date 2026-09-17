@@ -863,7 +863,7 @@ static const int g_node_confine_allowed[] = {
 #ifdef __NR_faccessat2
     __NR_faccessat2,
 #endif
-    __NR_umask, __NR_fchmod, __NR_chmod, __NR_chdir,
+    __NR_umask, __NR_fchmod, __NR_fchown, __NR_chmod, __NR_chdir, /* SQLite VFS */
     /* ── scheduling / sysinfo (RSS sampling, thread affinity) ────────── */
     __NR_sched_getaffinity, __NR_sched_yield, __NR_sysinfo,
     __NR_prlimit64, __NR_getrusage, __NR_uname,
@@ -954,7 +954,7 @@ static const int g_node_confine_serving_allowed[] = {
 #ifdef __NR_faccessat2
     __NR_faccessat2,
 #endif
-    __NR_umask, __NR_fchmod, __NR_chmod, __NR_chdir,
+    __NR_umask, __NR_fchmod, __NR_fchown, __NR_chmod, __NR_chdir, /* SQLite VFS */
     __NR_sched_getaffinity, __NR_sched_yield, __NR_sysinfo,
     __NR_prlimit64, __NR_getrusage, __NR_uname,
     __NR_poll, __NR_ppoll, __NR_epoll_create1, __NR_epoll_ctl,

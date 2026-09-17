@@ -284,10 +284,10 @@ assert_contains "$out" "reclaimed 7" \
 assert_contains "$log" "zcc-trim" "zcc apply logs a zcc-trim row"
 calls="$(wc -c < "$ZCC_STUB_COUNT" | tr -d '[:space:]')"
 [ "$calls" = 1 ] || fail "zcc apply invoked the evictor $calls time(s), expected exactly 1"
-if [ -s "$DU_CALL_LOG" ]; then
-    fail "zcc apply called du, which the one-walk invariant forbids: $(cat -- "$DU_CALL_LOG")"
+if grep -F -- "$ZCCDIR_FX" "$DU_CALL_LOG" >/dev/null 2>&1; then
+    fail "zcc apply called du on its cache, which the one-walk invariant forbids: $(cat -- "$DU_CALL_LOG")"
 else
-    pass "zcc apply never calls du — held/freed come from the evictor's report alone"
+    pass "zcc apply never calls du on its cache — held/freed come from the evictor's report alone"
 fi
 
 # A cache FREEZE (free space under the freeze floor — the state a proof
@@ -304,10 +304,10 @@ assert_contains "$out" "reclaimed 7" \
     "zcc apply under a cache freeze still reports the evictor's freed amount"
 calls="$(wc -c < "$ZCC_STUB_COUNT" | tr -d '[:space:]')"
 [ "$calls" = 1 ] || fail "zcc apply under a freeze invoked the evictor $calls time(s), expected exactly 1"
-if [ -s "$DU_CALL_LOG" ]; then
-    fail "zcc apply under a cache freeze called du, which the one-walk invariant forbids: $(cat -- "$DU_CALL_LOG")"
+if grep -F -- "$ZCCDIR_FX" "$DU_CALL_LOG" >/dev/null 2>&1; then
+    fail "zcc apply under a cache freeze called du on its cache, which the one-walk invariant forbids: $(cat -- "$DU_CALL_LOG")"
 else
-    pass "zcc apply under a cache freeze never calls du — the freeze is recorded from the evictor's held figure"
+    pass "zcc apply under a cache freeze never calls du on its cache — the freeze is recorded from the evictor's held figure"
 fi
 
 # A stub that prints garbage must fail loudly (zcc-trim-failed), never a

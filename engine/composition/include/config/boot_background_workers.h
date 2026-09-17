@@ -42,7 +42,7 @@ struct boot_svc_ctx;
 
 /* Generic diagnostic-budget thread join used by both this unit and the
  * catchup-job helpers that remain in boot_services.c. A timeout is logged,
- * then ownership is retained until the thread exits. */
+ * then ownership remains retained for a later cooperative retry. */
 bool boot_join_thread_bounded(pthread_t thread, const char *name,
                               int timeout_sec);
 
@@ -53,7 +53,10 @@ bool boot_join_thread_bounded(pthread_t thread, const char *name,
 bool boot_start_thread_service(pthread_t *thread, bool *started,
                                const char *name,
                                void *(*entry)(void *), void *arg);
-void boot_join_thread_service_named(pthread_t *thread, bool *started,
+/* True for a completed join or an already-stopped service. On timeout/error,
+ * returns false and leaves *started set: the owner must retain every object
+ * the worker can still reach and may retry after cooperative cancellation. */
+bool boot_join_thread_service_named(pthread_t *thread, bool *started,
                                     const char *name, int timeout_sec);
 
 /* ── Shared background-worker supervision (Shape 5 — MONITOR) ──────────

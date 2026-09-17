@@ -362,6 +362,14 @@ struct dlx_rig {
     char tip[64];
 };
 
+static bool dlx_set_identity(const char *dir)
+{
+    const char *name[] = { "config", "user.name", "land", NULL };
+    const char *email[] = { "config", "user.email", "land@z23.invalid",
+                            NULL };
+    return dlx_git(dir, name) == 0 && dlx_git(dir, email) == 0;
+}
+
 /* A commit in the clone whose parent is origin/main, pushed nowhere. */
 static bool dlx_commit(const char *dir, const char *name, const char *body,
                        char out[64])
@@ -401,6 +409,10 @@ static bool dlx_rig_make(struct dlx_rig *rig, const char *tag)
     if (dlx_git(NULL, init_bare) != 0)
         return false;
     if (dlx_git(NULL, clone) != 0)
+        return false;
+    /* Rebase creates a new commit only after main moves.  Make that path
+     * hermetic instead of inheriting an operator's global Git identity. */
+    if (!dlx_set_identity(rig->clone))
         return false;
     /* A checkout marker set, so the leaf's checkout-root walk and its own
      * worktree bookkeeping behave the way they do in a real tree. */
@@ -882,6 +894,8 @@ static bool dlx_rig_make_docregen(struct dlx_rig *rig, const char *tag,
     if (dlx_git(NULL, init_bare) != 0)
         return false;
     if (dlx_git(NULL, clone) != 0)
+        return false;
+    if (!dlx_set_identity(rig->clone))
         return false;
     /* The plan-refresh target the regen phase's dlrg_plan_refresh() runs
      * when it observed any artifact's stat identity change: a trivial
@@ -3164,7 +3178,7 @@ int test_dev_land(void)
             dlx_begin(&c, "step");
             ASSERT(dlx_run(&c));
             ASSERT(dlx_ok(&c));
-            ASSERT(strcmp(dlx_str(&c, "state"), "started") == 0);
+            ASSERT_STR_EQ(dlx_str(&c, "state"), "started");
             dlx_end(&c);
             (void)snprintf(tag, sizeof(tag), "s%d.txt", i);
             ASSERT(dlx_git(side, branch) == 0);

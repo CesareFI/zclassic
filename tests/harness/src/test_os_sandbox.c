@@ -331,6 +331,11 @@ static int c_rlimit_fsize(void)
 
 static int c_rlimit_nproc(void)
 {
+    /* Linux exempts uid 0 from RLIMIT_NPROC. A privileged CI runner must
+     * enter the same ordinary-user policy boundary this limit protects or
+     * the fork would succeed and false-red an otherwise enforced limit. */
+    if (geteuid() == 0 && setuid(65534) != 0)
+        return 69;
     struct os_sandbox_rlimits lim = os_sandbox_session_rlimits();
     /* Isolate NPROC — leave everything else alone so this child can report. */
     lim.as_bytes = OS_SANDBOX_RLIMIT_KEEP;
