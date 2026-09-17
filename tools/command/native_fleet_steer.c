@@ -318,6 +318,7 @@ static bool fmc_append_line(const char *path, const char *line, size_t len)
 struct fmc_grant {
     char id[33];
     char scopes[64];
+    char label[FMC_NAME_MAX + 1];
     long long created;
     long long expires;
     int revoked;
@@ -419,6 +420,9 @@ static bool fmc_grant_parse(const char *line, struct fmc_grant *g)
     g->revoked = 0;
     if (fmc_grant_line_str(line, "revoked", revoked, sizeof(revoked)))
         g->revoked = strcmp(revoked, "1") == 0 ? 1 : 0;
+    /* Optional: a row minted without a label keeps the empty name, which
+     * no label lookup can ever match. */
+    (void)fmc_grant_line_str(line, "label", g->label, sizeof(g->label));
     if (strlen(g->id) != 32)
         return false;
     return true;
@@ -478,6 +482,110 @@ static const char *fmc_grant_check(const char *grant, const char *scope)
     if (!fmc_scope_has(g.scopes, scope))
         return "STEER_GRANT_SCOPE";
     return NULL;
+}
+
+/* ── live grant lookup BY LABEL (shared admission helper) ────────────────
+ *
+ * The resident mail receiver (tools/command/native_devagent_receive.c) has
+ * to decide whether an owner-minted grant NAMES a sender. That is this
+ * store's question, so it is answered here rather than duplicated there: no
+ * second permission system, no second credential file, no second store.
+ *
+ * A label is the human name the owner minted the grant under. It is NOT a
+ * credential and is never accepted in place of one: this lookup grants no
+ * fleet.steer verb to anybody. It answers only "does a live grant carry
+ * this label with this scope", which is the fact a receiver needs to decide
+ * whether the owner has named a sender at all.
+ *
+ * grants.jsonl is re-read on every call, so a revoke takes effect on the
+ * next check. Fail-closed: the reason of the closest matching row is
+ * returned when nothing admits, and an unreadable or absent store reads as
+ * "no grant names this sender". */
+
+#define FMC_LABEL_IDS 64u
+
+struct fmc_grant_set {
+    struct fmc_grant g[FMC_LABEL_IDS];
+    size_t n;
+};
+
+/* Keep the LAST row per id (later rows supersede, as fmc_grant_find does),
+ * bounded by FMC_LABEL_IDS distinct ids. */
+static void fmc_grant_set_put(struct fmc_grant_set *s,
+                              const struct fmc_grant *g)
+{
+    size_t i;
+    for (i = 0; i < s->n; i++) {
+        if (strcmp(s->g[i].id, g->id) == 0) {
+            s->g[i] = *g;
+            return;
+        }
+    }
+    if (s->n < FMC_LABEL_IDS)
+        s->g[s->n++] = *g;
+}
+
+static bool fmc_grant_set_load(const char *path, struct fmc_grant_set *s)
+{
+    FILE *f;
+    char line[FMC_LINE_CAP];
+    struct fmc_grant g;
+    s->n = 0;
+    f = fopen(path, "rb");
+    if (!f)
+        return false;
+    while (fgets(line, sizeof(line), f)) {
+        if (fmc_grant_parse(line, &g))
+            fmc_grant_set_put(s, &g);
+    }
+    (void)fclose(f);
+    return true;
+}
+
+/* One row's verdict for a label admission. NULL admits. */
+static const char *fmc_grant_row_verdict(const struct fmc_grant *g,
+                                         const char *scope, long long now)
+{
+    if (g->revoked)
+        return "STEER_GRANT_REVOKED";
+    if (g->expires != 0 && now >= g->expires)
+        return "STEER_GRANT_EXPIRED";
+    if (!fmc_scope_has(g->scopes, scope))
+        return "STEER_GRANT_SCOPE";
+    return NULL;
+}
+
+const char *zcl_fleet_steer_grant_label_live(const char *label,
+                                             const char *scope)
+{
+    char root[4096], path[4096 + 32];
+    struct fmc_grant_set set;
+    const char *why = "STEER_GRANT_UNKNOWN";
+    size_t i;
+    long long now;
+    int n;
+    if (!label || !label[0] || !scope || !scope[0])
+        return "STEER_GRANT_SCOPE";
+    /* Deliberately NOT fmc_dirs(): a caller answering a read-only status
+     * question must not create the steer directory as a side effect. */
+    if (!platform_state_root(root, sizeof(root)))
+        return "STEER_GRANT_STORE";
+    n = snprintf(path, sizeof(path), "%s/steer/grants.jsonl", root);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        return "STEER_GRANT_STORE";
+    if (!fmc_grant_set_load(path, &set))
+        return "STEER_GRANT_UNKNOWN";
+    now = (long long)platform_time_wall_time_t();
+    for (i = 0; i < set.n; i++) {
+        const char *row;
+        if (strcmp(set.g[i].label, label) != 0)
+            continue;
+        row = fmc_grant_row_verdict(&set.g[i], scope, now);
+        if (!row)
+            return NULL;
+        why = row;
+    }
+    return why;
 }
 
 /* ── idempotency store ─────────────────────────────────────────────────── */
@@ -2317,10 +2425,14 @@ static void fmc_grant_revoke(const struct zcl_command_request *req,
         return;
     }
     now = platform_time_wall_time_t();
+    /* The superseding row keeps the ORIGINAL label. Overwriting it made a
+     * revoked grant unfindable by name, so a label lookup reported the
+     * credential as unknown instead of revoked — fail-closed either way,
+     * but the caller could not tell "never granted" from "taken away". */
     m = snprintf(line, sizeof(line),
                  "{\"id\":\"%s\",\"scopes\":\"%s\",\"created\":%lld,"
-                 "\"expires\":%lld,\"revoked\":\"1\",\"label\":\"revoked\"}\n",
-                 id, g.scopes, (long long)now, g.expires);
+                 "\"expires\":%lld,\"revoked\":\"1\",\"label\":\"%s\"}\n",
+                 id, g.scopes, (long long)now, g.expires, g.label);
     if (m <= 0 || (size_t)m >= sizeof(line)) {
         fmc_fail(reply, "GRANT_MINT_FAILED", "grant row exceeds its bound",
                  "row budget");

@@ -64,4 +64,18 @@ void zcl_native_handle_fleet_steer_grant(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 
+/* The one shared reader of <state>/steer/grants.jsonl by LABEL. Returns NULL
+ * when a live (not revoked, not expired) grant carries `label` and `scope`,
+ * otherwise the fail-closed STEER_GRANT_* reason for the closest matching
+ * row ("STEER_GRANT_UNKNOWN" when no row carries the label at all, including
+ * when there is no store yet). The store is re-read on every call, so a
+ * revoke takes effect immediately. A label is a name the owner minted a
+ * grant under, never a credential: this answers only "has the owner named
+ * this sender", and grants no fleet.steer verb to the caller. Callers that
+ * must not write anything are safe — this never creates the steer directory.
+ * Implemented in tools/command/native_fleet_steer.c beside the store it
+ * reads, so no second permission system can drift away from it. */
+const char *zcl_fleet_steer_grant_label_live(const char *label,
+                                             const char *scope);
+
 #endif /* ZCL_NATIVE_FLEET_H */

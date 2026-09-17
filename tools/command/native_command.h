@@ -2561,6 +2561,13 @@ void zcl_native_handle_dev_agent_mail(
 void zcl_native_handle_dev_agent_worker(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+/* dev.agent.receive — resident mail-consuming receiver that turns a
+ * directive into a dev.agent.queue row and answers under the same ref
+ * (tools/command/native_devagent_receive.c). Same one-handler-per-file
+ * shape as the lane-discipline leaves above. */
+void zcl_native_handle_dev_agent_receive(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
 
 /* dev.train.* — stacked-lane construction (tools/command/native_dev_train_command.c).
  * One file for all four verbs: build, check, status, drop. Compiled
