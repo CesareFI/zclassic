@@ -630,7 +630,9 @@ static int gw_t_calls(void)
         ASSERT(gw_body_has(b, "IDEMPOTENCY_CONFLICT"));
         ASSERT(!gw_body_has(b, "duplicate\\\":true"));
         free(b);
-        /* Evidence before the receiver ack: delivered, not acknowledged. */
+        /* Evidence before the receiver ack: queued. The row sits in this
+         * host's own outbox, which is always in its own pull, so nothing
+         * here says the directive reached gw-agent. */
         sn = snprintf(args, sizeof(args),
                       "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/"
                       "call\",\"params\":{\"name\":\"steer_evidence\","
@@ -641,7 +643,8 @@ static int gw_t_calls(void)
         b = gw_post("/steer", args, &st);
         ASSERT(b != NULL);
         ASSERT(gw_body_has(b, "\"isError\":false"));
-        ASSERT(gw_body_has(b, "delivered"));
+        ASSERT(gw_body_has(b, "\"state\\\":\\\"queued\\\""));
+        ASSERT(!gw_body_has(b, "delivered"));
         ASSERT(!gw_body_has(b, "acknowledged"));
         free(b);
         sn = snprintf(args, sizeof(args),
@@ -955,8 +958,9 @@ _test_next:;
 
 /* Worker-lifecycle regression: the authorized-task journey through the real
  * gateway, mail, ack, queue and evidence leaves in one isolated lane.
- * send -> queued -> brief delivered -> receiver ack -> acknowledged ->
- * real queue outcome naming the same ref -> brief completed -> evidence
+ * send -> queued -> brief still queued (the sender's own outbox is not
+ * delivery) -> receiver ack -> acknowledged -> real queue outcome naming
+ * the same ref -> brief completed -> evidence
  * returns the exact outcome row. Restart, idempotency and revoke legs
  * follow in their own cases. No case touches the network beyond loopback,
  * the wallet, deployment, or soak paths. */
@@ -1248,7 +1252,7 @@ static bool gw_poll_match(const char *path, const char *needle, int tries)
 static int gw_t_life_send_ack(void)
 {
     int failures = 0;
-    TEST("lifecycle: send queues, brief reports delivered then acknowledged") {
+    TEST("lifecycle: send queues, brief holds queued until the ack") {
         const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
         char args[1024];
         char *b;
@@ -1271,7 +1275,8 @@ static int gw_t_life_send_ack(void)
         free(b);
         ASSERT(seq > 0);
         g_life_seq = seq;
-        /* Delivered on pull, never ahead: no ack, no outcome yet. */
+        /* Queued on pull, never ahead: the row is only in this host's own
+         * outbox, so no receiver has seen it. No ack, no outcome yet. */
         sn = snprintf(args, sizeof(args),
                       "{\"grant\":\"%s\",\"since\":%lld}", g_life_gid,
                       seq - 1);
@@ -1279,7 +1284,8 @@ static int gw_t_life_send_ack(void)
         b = gw_tool("steer_brief", args, 31, &st);
         ASSERT(b != NULL);
         ASSERT(gw_body_has(b, "\"isError\":false"));
-        ASSERT(gw_body_has(b, "\"state\\\":\\\"delivered\\\""));
+        ASSERT(gw_body_has(b, "\"state\\\":\\\"queued\\\""));
+        ASSERT(!gw_body_has(b, "delivered"));
         ASSERT(!gw_body_has(b, "acknowledged"));
         ASSERT(!gw_body_has(b, "completed"));
         free(b);
