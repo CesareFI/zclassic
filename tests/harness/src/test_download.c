@@ -323,6 +323,45 @@ static int test_dl_timeout_survives_wall_clock_rollback(void)
     return failures;
 }
 
+static int test_dl_received_pending_expires_across_wall_clock_rollback(void)
+{
+    int failures = 0;
+    TEST("received-pending dedup expires after wall clock rollback") {
+        struct dl_fake_clock fake = {
+            .monotonic_us = 10000000,
+            .wall_unix = 1700000000,
+        };
+        struct platform_clock_source source = {
+            .monotonic_us = dl_fake_monotonic_us,
+            .wall_unix = dl_fake_wall_unix,
+            .user = &fake,
+        };
+        struct download_manager dm;
+        struct uint256 h = make_hash(44);
+        int32_t height = 44;
+        dl_init(&dm);
+
+        platform_clock_set_source(&source);
+        bool requested = dl_mark_requested(&dm, &h, height, 9);
+        uint32_t peer_id = dl_mark_received(&dm, &h);
+        size_t suppressed = dl_queue_blocks(&dm, &h, &height, 1);
+        fake.monotonic_us +=
+            ((int64_t)DL_RECEIVED_PENDING_SECS + 1) * 1000000;
+        fake.wall_unix -= 300;
+        size_t requeued = dl_queue_blocks(&dm, &h, &height, 1);
+        platform_clock_clear_source();
+
+        ASSERT(requested);
+        ASSERT(peer_id == 9);
+        ASSERT(suppressed == 0);
+        ASSERT(requeued == 1);
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    platform_clock_clear_source();
+    return failures;
+}
+
 static int test_dl_queue_dedup(void)
 {
     int failures = 0;
@@ -2164,6 +2203,7 @@ int test_download(void)
     failures += test_dl_mark_received();
     failures += test_dl_subsecond_delivery_updates_score();
     failures += test_dl_timeout_survives_wall_clock_rollback();
+    failures += test_dl_received_pending_expires_across_wall_clock_rollback();
     failures += test_dl_queue_dedup();
     failures += test_dl_received_pending_staging();
     failures += test_dl_assign_to_peer();

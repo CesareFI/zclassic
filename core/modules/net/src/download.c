@@ -464,20 +464,30 @@ static bool dl_slot_blocks_requeue(struct download_manager *dm,
 {
     if (s->active)
         return true;
-    if (s->received_time == 0 ||
-        now - s->received_time >= DL_RECEIVED_PENDING_SECS)
+    int64_t now_monotonic_us = platform_time_monotonic_us();
+    bool wall_expired = now - s->received_time >= DL_RECEIVED_PENDING_SECS;
+    bool monotonic_expired = s->received_monotonic_us > 0 &&
+        now_monotonic_us >= s->received_monotonic_us &&
+        now_monotonic_us - s->received_monotonic_us >=
+            (int64_t)DL_RECEIVED_PENDING_SECS * 1000000;
+    if (s->received_time == 0 || wall_expired || monotonic_expired)
         return false;
     dm->total_requeue_suppressed_pending++;
     return true;
 }
 
 static bool dl_slot_survives_rehash(const struct dl_in_flight *slot,
-                                    int64_t now)
+                                    int64_t now, int64_t now_monotonic_us)
 {
     if (slot->active)
         return true;
-    return slot->received_time != 0 &&
-           now - slot->received_time < DL_RECEIVED_PENDING_SECS;
+    if (slot->received_time == 0 ||
+        now - slot->received_time >= DL_RECEIVED_PENDING_SECS)
+        return false;
+    return slot->received_monotonic_us <= 0 ||
+           now_monotonic_us < slot->received_monotonic_us ||
+           now_monotonic_us - slot->received_monotonic_us <
+               (int64_t)DL_RECEIVED_PENDING_SECS * 1000000;
 }
 
 /* Rehash into a table of given size (must be power of 2). Active requests and
@@ -491,8 +501,9 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
 
     size_t new_mask = new_size - 1;
     int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now_monotonic_us = platform_time_monotonic_us();
     for (size_t i = 0; i < dm->num_slots; i++) {
-        if (!dl_slot_survives_rehash(&dm->slots[i], now))
+        if (!dl_slot_survives_rehash(&dm->slots[i], now, now_monotonic_us))
             continue;
         size_t idx = dl_hash_slot(&dm->slots[i].hash, new_mask);
         for (size_t j = 0; j < new_size; j++) {
@@ -591,6 +602,7 @@ bool dl_mark_requested(struct download_manager *dm,
     slot->request_time = (int64_t)platform_time_wall_time_t();
     slot->request_monotonic_us = platform_time_monotonic_us();
     slot->received_time = 0; /* activation clears any stale tombstone */
+    slot->received_monotonic_us = 0;
     slot->work_class = DL_WORK_FORWARD;
     slot->active = true;
     dm->num_active++;
@@ -629,6 +641,7 @@ uint32_t dl_mark_received(struct download_manager *dm,
      * observable yet, so queue/request producers must keep dedup'ing this
      * hash (bounded by DL_RECEIVED_PENDING_SECS, fail-open). */
     s->received_time = (int64_t)platform_time_wall_time_t();
+    s->received_monotonic_us = now_monotonic_us;
     dm->num_active--;
     dm->total_received++;
     dl_generation_advance(&dm->capacity_generation);
@@ -1419,6 +1432,7 @@ size_t dl_assign_to_peer(struct download_manager *dm,
                 slot->request_monotonic_us = now_monotonic_us;
                 slot->received_time = 0; /* activation clears any stale
                                           * tombstone */
+                slot->received_monotonic_us = 0;
                 slot->work_class = work_class;
                 slot->active = true;
                 dm->num_active++;
@@ -1479,6 +1493,7 @@ size_t dl_assign_to_peer(struct download_manager *dm,
             slot->request_monotonic_us = now_monotonic_us;
             slot->received_time = 0; /* activation clears any stale
                                       * tombstone */
+            slot->received_monotonic_us = 0;
             slot->work_class = work_class;
             slot->active = true;
             dm->num_active++;

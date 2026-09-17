@@ -95,6 +95,9 @@ struct dl_in_flight {
                                      * producers until BLOCK_HAVE_DATA is
                                      * observable (DL_RECEIVED_PENDING_SECS).
                                      * Zeroed whenever a slot is activated. */
+    int64_t        received_monotonic_us; /* monotonic companion that keeps
+                                          * the fail-open bound immune to
+                                          * backward wall-clock steps */
     enum dl_work_class work_class;
     bool           active;          /* true if slot in use */
 };
