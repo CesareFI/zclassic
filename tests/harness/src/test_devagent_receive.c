@@ -1138,11 +1138,12 @@ int test_devagent_receive(void)
                         sizeof(brief)));
         ASSERT(strstr(brief, ws) != NULL);
         ASSERT(strstr(brief, link) == NULL);
-        /* A directory whose NAME merely contains dots holds no ".."
-         * segment, so the flag accepts it and the only refusal comes from
-         * the workspace not being there — the segment rule does not turn
-         * every dotted name into a traversal. */
-        (void)snprintf(dots, sizeof(dots), "%s/a..b", g_rtx_base);
+        /* A directory whose NAME merely STARTS with two dots holds no ".."
+         * segment of its own, so the flag accepts it and the only refusal
+         * comes from the workspace not being there. The coarser rule —
+         * refuse any ".." right after a slash — rejected this name at the
+         * door and never started a drive at all. */
+        (void)snprintf(dots, sizeof(dots), "%s/..hidden", g_rtx_base);
         rtx_direction_sel(body, sizeof(body), "receiver", "", "Dotted.");
         ASSERT(rtx_deliver("chatgpt", "box-a", "job-dots", body, 2));
         rtx_opts_ws(&o, dots);
