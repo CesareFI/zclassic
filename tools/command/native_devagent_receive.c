@@ -90,10 +90,16 @@
  * traversal — is refused with a typed reason, so no sender can steer this
  * receiver at a directory the operator did not configure. With no workspace
  * configured a selector directive is refused, never resolved against a cwd,
- * a $HOME or a discovered checkout. The configured workspace is
- * canonicalized (realpath) and must BE its own canonical path, so a ".."
- * segment or a symlink escape fails closed rather than silently resolving
- * elsewhere. It must exist, be a directory, and be a git checkout whose
+ * a $HOME or a discovered checkout. The configured workspace ROOT is
+ * canonicalized with realpath and the canonical path is what is recorded,
+ * pinned and written into the brief: ".." collapses and every symlinked
+ * component is followed, so a workspace below a symlink (a Mac's /tmp is
+ * /private/tmp) resolves to the one real directory instead of being
+ * refused, and a spelling that would climb out has already become
+ * wherever it actually points. A configured path carrying a ".." segment
+ * never reaches here: the operator flag refuses it as bad input. A root
+ * that will not resolve at all fails closed. It must exist, be a
+ * directory, and be a git checkout whose
  * HEAD resolves. An optional `muse-sha` must name that HEAD (full or
  * prefix) or the directive is refused — that is what lets a client pin the
  * exact image it is certifying. And the resolved workspace's pre-state must
@@ -227,7 +233,6 @@
  * replaced by an absolute path, so it is bounded by the mail body cap plus
  * one path. */
 #define RCV_BRIEF_MAX (RCV_BODY_MAX + ZCL_DEVAGENT_WS_PATH_MAX + 32u)
-#define RCV_REF_MAX 64u
 #define RCV_NAME_MAX 48u
 #define RCV_INPUT_CAP 16384u
 
@@ -277,23 +282,15 @@ static long long rcv_in_int(const struct zcl_command_request *req,
 /* ── alphabets ─────────────────────────────────────────────────────────── */
 
 /* The queue's own name alphabet, which is also the fleet ref alphabet:
- * [A-Za-z0-9_.-]{1,64}, never "." or "..". An empty ref never passes. */
+ * [A-Za-z0-9_.-]{1,64}, never "." or "..". An empty ref never passes.
+ *
+ * The grammar itself is zcl_devagent_name_ok, the one dev.agent.queue
+ * judges names by. A second copy here could drift into accepting a ref
+ * this receiver would file work under and the queue would then refuse,
+ * or into naming a per-ref file outside the run directory. */
 static bool rcv_ref_ok(const char *s)
 {
-    size_t i, n;
-    if (!s || !s[0])
-        return false;
-    n = strlen(s);
-    if (n > RCV_REF_MAX)
-        return false;
-    if (strcmp(s, ".") == 0 || strcmp(s, "..") == 0)
-        return false;
-    for (i = 0; i < n; i++) {
-        char c = s[i];
-        if (!isalnum((unsigned char)c) && c != '.' && c != '_' && c != '-')
-            return false;
-    }
-    return true;
+    return zcl_devagent_name_ok(s);
 }
 
 /* A receiver or agent name: the mail leaf's cursor alphabet, bounded. */
@@ -997,12 +994,20 @@ bool zcl_devagent_workspace_observe(const char *dir, bool scan_tracked,
     if (!dir || dir[0] != '/' || strlen(dir) >= sizeof(out->root))
         return false;
     out->directory = rcv_is_dir(dir);
-    out->canonical = out->directory && realpath(dir, real) != NULL &&
-                     strcmp(real, dir) == 0;
+    /* Canonicalize the ROOT ITSELF and then use the canonical path for
+     * everything after this line. Demanding realpath(dir) == dir instead
+     * refuses every legitimate workspace that merely sits below a symlinked
+     * component — /tmp is /private/tmp on a Mac, and a lane directory can
+     * hang off a symlinked home — which is an availability bug, not a
+     * safety property. Resolving it keeps the safety: realpath collapses
+     * ".." and follows every link, so what is recorded, compared and
+     * written into the brief is the one real directory, and a path that
+     * would climb out has already become wherever it actually points. */
+    out->resolved = out->directory && realpath(dir, real) != NULL;
     if (!rcv_copy(out->root, sizeof(out->root),
-                  out->canonical ? real : dir))
+                  out->resolved ? real : dir))
         return false;
-    if (!out->canonical)
+    if (!out->resolved)
         return true;
     out->checkout = rcv_git_dir(out->root, gitdir, sizeof(gitdir)) &&
                     rcv_head_of(gitdir, out->head, sizeof(out->head));
@@ -1515,8 +1520,11 @@ static const char *rcv_ws_resolve(struct rcv_ctx *c,
         (void)snprintf(detail, cap, "configured-workspace-absent");
         return "RECEIVE_WORKSPACE_MISSING";
     }
-    if (!w->canonical) {
-        (void)snprintf(detail, cap, "configured-workspace-not-canonical");
+    if (!w->resolved) {
+        /* The directory stats but realpath() will not resolve it: a symlink
+         * loop, or a component this receiver may not traverse. Fail closed
+         * rather than working from an unresolved spelling. */
+        (void)snprintf(detail, cap, "configured-workspace-unresolvable");
         return "RECEIVE_WORKSPACE_ESCAPE";
     }
     if (!w->checkout) {
@@ -1984,9 +1992,13 @@ static const char *rcv_lock_state(const struct rcv_paths *p)
 /* The operator's workspace flag, checked for SHAPE at the door so a typo is
  * loud at start instead of quietly refusing every selector directive later:
  * absolute, bounded, no ".." segment, no trailing slash. Existence,
- * canonicality and checkout-ness are re-derived per directive instead,
+ * resolvability and checkout-ness are re-derived per directive instead,
  * because a workspace can be moved out from under a resident. Empty is a
- * legitimate state: a receiver with no workspace refuses selectors. */
+ * legitimate state: a receiver with no workspace refuses selectors.
+ *
+ * A ".." SEGMENT is refused — ".." bounded by slashes or by the path's own
+ * ends — while a directory whose name merely contains dots ("/srv/a..b")
+ * is one segment of its own and stays legal. */
 static bool rcv_ws_flag_ok(const char *s)
 {
     size_t i, n;
@@ -1998,7 +2010,8 @@ static bool rcv_ws_flag_ok(const char *s)
     for (i = 0; i + 1 < n; i++) {
         if (s[i] != '.' || s[i + 1] != '.')
             continue;
-        if (i == 0 || s[i - 1] == '/')
+        if ((i == 0 || s[i - 1] == '/') &&
+            (s[i + 2] == '\0' || s[i + 2] == '/'))
             return false;
     }
     return true;

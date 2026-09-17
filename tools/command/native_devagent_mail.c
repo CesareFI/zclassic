@@ -41,8 +41,10 @@
  *   agent   ack only: optional name owning the cursor file (default: the same
  *           identity post uses). Sanitized to [A-Za-z0-9._-] for the file.
  *   ref     post only, optional string linking a row (default "").
- *   cwd     optional string. Accepted so fixtures match the other leaves;
- *           only used to resolve the checkout root for the path-refusal rule.
+ *   cwd     optional string. Accepted and ignored, so fixtures match the
+ *           other leaves. NOTHING in this leaf consults it: a mail body
+ *           crosses hosts, so the verdict on a body must not move with the
+ *           directory the process happens to run in.
  *
  * ROW. {"seq":N,"ts":"<ISO-8601 UTC>","from":"<agent>","to":"<agent|*>",
  *        "kind":"<kind>","body":"<text>","ref":"<ref>"}
@@ -67,17 +69,30 @@
  *
  * REFUSAL. A body longer than 4096 bytes, or one that mentions a secret key
  * (a key word or a Z.ai-shaped token: 32 hex chars, a dot, 16 alnum), an
- * onion address, an IP address, or an absolute filesystem path outside the
- * checkout, is refused with ok=false and a MAIL_REFUSED_* code naming the
- * rule — a typed error row, never a crash. Refusal words: key, onion
- * address, IP, absolute path. Repo-relative paths are allowed: a slash only
- * makes a path ABSOLUTE when it STARTS a token, so "docs/DEVELOPING.md" passes
- * and "/etc/passwd" does not. (A relative path whose own text contains a
- * secret-shaped marker such as "/tmp/" is still refused by the marker list
- * that runs before that test — a marker match, not a statement about
- * leading slashes.) An absolute path under the checkout root is allowed,
- * but a path that climbs out with a ".." segment never is, even when it
- * starts with the root.
+ * onion address, an IP address, or ANY absolute filesystem path, is refused
+ * with ok=false and a MAIL_REFUSED_* code naming the rule — a typed error
+ * row, never a crash. Refusal words: key, onion address, IP, absolute path.
+ * Repo-relative paths are allowed: a slash only makes a path ABSOLUTE when
+ * it STARTS a token, so "docs/DEVELOPING.md" passes and "/etc/passwd" does
+ * not. (A relative path whose own text contains a secret-shaped marker such
+ * as "/tmp/" is still refused by the marker list that runs before that
+ * test — a marker match, not a statement about leading slashes.)
+ *
+ * Every absolute path is refused, with no checkout root and no process cwd
+ * consulted anywhere in the rule. A mail body crosses hosts: the sender's
+ * filesystem path carries zero authority over how the receiver reads it,
+ * and there is no root that is meaningful on both ends — a path under the
+ * sender's checkout names something else, or nothing, under the receiver's.
+ * The same bytes therefore get the same verdict from every directory, on
+ * every box. Work is named by a logical selector (dev.agent.receive
+ * resolves "muse-workspace: receiver" against ITS own configuration) and by
+ * repo-relative paths.
+ *
+ * A path-shaped token carrying a ".." SEGMENT is refused the same way,
+ * absolute or not: a climbing token is an escape attempt whether or not it
+ * starts at a root, since "tests/../../../etc/passwd" names exactly what
+ * "/etc/passwd" names. A filename that merely contains dots ("a..b") holds
+ * no ".." segment and stays allowed.
  *
  * OUTPUT (zcl.agent_mail.v1). Every reply names its own `leaf`. Post returns
  * the row fields plus `cursor` (the row's seq) and `outbox`. Pull returns
@@ -95,7 +110,6 @@
 
 #include "base/hex.h"
 #include "base/safe_alloc.h"
-#include "command/native_devagent.h"
 #include "json/json.h"
 #include "platform/directory_compat.h"
 #include "platform/state_root.h"
@@ -260,20 +274,24 @@ static bool dvm_has_drive_path(const char *s)
     return false;
 }
 
+/* Where one token in a free-text body ends and the next begins. '=', '(',
+ * ',' and ';' count, so "path=/etc/passwd" and "a,/etc/passwd" both still
+ * read as an absolute token. */
+static bool dvm_delim(char c)
+{
+    return c == '\0' || c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+           c == '"' || c == '\'' || c == '=' || c == '(' || c == ')' ||
+           c == ',' || c == ';';
+}
+
 /* Does a token START at p, i.e. is p the first byte of the body or does a
  * delimiter sit just before it? This is what separates "/etc/passwd" (a
  * token that begins with a slash, so an absolute path) from the slash
  * INSIDE "docs/DEVELOPING.md" (a relative path, which is allowed and
- * always was meant to be). '=' and '(' are delimiters too, so
- * "path=/etc/passwd" is still read as an absolute token. */
+ * always was meant to be). */
 static bool dvm_token_start(const char *s, const char *p)
 {
-    char c;
-    if (p == s)
-        return true;
-    c = p[-1];
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"' ||
-           c == '\'' || c == '=' || c == '(';
+    return p == s || dvm_delim(p[-1]);
 }
 
 static bool dvm_has_abs_path(const char *s)
@@ -302,60 +320,30 @@ static bool dvm_has_abs_path(const char *s)
     return false;
 }
 
-/* Does this token (up to its whitespace/quote terminator) carry a ".."
- * segment, i.e. climb out of whatever directory it names? A bare "." or
- * "./" segment does not escape and stays allowed; "../" anywhere in the
- * token, or a token ending in "/..", does. */
-static bool dvm_token_escapes(const char *tok)
+/* Does any token in the body carry a ".." SEGMENT — ".." bounded by
+ * slashes or by the token's own edges? A climbing token is an escape
+ * attempt whether or not it starts at a root: "tests/../../../etc/passwd"
+ * names exactly the file "/etc/passwd" names, and a body that reaches a
+ * root by climbing out of a relative path has said nothing different from
+ * a body that spells the root out. A filename that merely contains dots
+ * ("a..b", "v1..v2") is one segment of its own, never a "..", and stays
+ * allowed; so does a lone "." or "./" segment, which climbs nowhere. */
+static bool dvm_has_climb(const char *s)
 {
-    for (const char *p = tok; *p; p++) {
-        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '"' ||
-            *p == '\'')
-            return false;
-        if (*p == '/' && p[1] == '.' && p[2] == '.') {
-            char e = p[3];
-            if (e == '\0' || e == '/' || e == ' ' || e == '\t' ||
-                e == '\n' || e == '"' || e == '\'')
+    const char *seg = s;
+    for (const char *p = s;; p++) {
+        if (*p == '/' || dvm_delim(*p)) {
+            if (p - seg == 2 && seg[0] == '.' && seg[1] == '.')
                 return true;
+            seg = p + 1;
         }
+        if (*p == '\0')
+            return false;
     }
-    return false;
-}
-
-/* Absolute path under the checkout root is inside the repo, not outside it —
- * but only if the token stays under the root: any ".." segment means the
- * path climbs out, and prefix-matching it as "under root" would let a body
- * like <root>/../../../etc/shadow through. */
-static bool dvm_abs_under_root(const char *body, const char *root)
-{
-    size_t rn;
-    if (!root || !root[0])
-        return false;
-    rn = strlen(root);
-    for (const char *p = body; (p = strchr(p, '/')) != NULL; p++) {
-        /* Find the start of this whitespace-delimited token. */
-        const char *start = p;
-        while (start > body && *start != ' ' && *start != '\t' &&
-               *start != '\n' && *start != '"' && *start != '\'')
-            start--;
-        if (*start == ' ' || *start == '\t' || *start == '\n' ||
-            *start == '"' || *start == '\'')
-            start++;
-        /* Fail closed: a climbing token is never "under" anything. */
-        if (dvm_token_escapes(start))
-            continue;
-        if (strncmp(start, root, rn) == 0 &&
-            (start[rn] == '/' || start[rn] == '\0' || start[rn] == '"' ||
-             start[rn] == '\'' || start[rn] == ' ' || start[rn] == '\t' ||
-             start[rn] == '\n'))
-            return true;
-    }
-    return false;
 }
 
 /* 0 = clean; else the MAIL_REFUSED_* code and a human message. */
-static const char *dvm_refuse(const char *body, const char *root,
-                              char *msg, size_t cap)
+static const char *dvm_refuse(const char *body, char *msg, size_t cap)
 {
     static const char *const keymarks[] = {
         "private key", "private-key", "privkey", "secret key", "mnemonic",
@@ -388,10 +376,18 @@ static const char *dvm_refuse(const char *body, const char *root,
                        "IPs, keys, onion addresses, or absolute paths");
         return "MAIL_REFUSED_IP";
     }
-    if (dvm_has_abs_path(body) && !dvm_abs_under_root(body, root)) {
+    if (dvm_has_abs_path(body)) {
         (void)snprintf(msg, cap, "%s",
-                       "refused: body mentions an absolute filesystem path "
-                       "outside the repo; use repo-relative paths");
+                       "refused: body mentions an absolute filesystem path; "
+                       "a mail body crosses hosts, so use repo-relative "
+                       "paths and a logical workspace selector");
+        return "MAIL_REFUSED_PATH";
+    }
+    if (dvm_has_climb(body)) {
+        (void)snprintf(msg, cap, "%s",
+                       "refused: body has a path token that climbs out with "
+                       "a '..' segment; use repo-relative paths that stay "
+                       "inside the tree");
         return "MAIL_REFUSED_PATH";
     }
     return NULL;
@@ -859,7 +855,6 @@ static void dvm_post(const struct zcl_command_request *req,
                      struct zcl_command_reply *reply, const char *maildir)
 {
     struct dvm_post_input in;
-    char root[DVM_PATH_CAP];
     char outbox[DVM_PATH_CAP];
     char ts[40];
     char esc_from[512], esc_to[512], esc_kind[64], esc_body[DVM_BODY_MAX * 2];
@@ -883,15 +878,10 @@ static void dvm_post(const struct zcl_command_request *req,
         dvm_fail(reply, invalid->code, invalid->message, invalid->evidence);
         return;
     }
-    /* Checkout root for the inside-the-repo path allowance. Unresolvable
-     * root just means every absolute path is refused. */
-    root[0] = '\0';
-    {
-        const char *cwd = dvm_str(req, "cwd");
-        (void)zcl_devagent_checkout_root(cwd && cwd[0] ? cwd : ".", root,
-                                         sizeof(root));
-    }
-    code = dvm_refuse(in.body, root[0] ? root : NULL, msg, sizeof(msg));
+    /* The refusal reads the body and nothing else. No checkout root, no
+     * process cwd, no `cwd` input: a body crosses hosts, so the same bytes
+     * must get the same verdict from every directory and on every box. */
+    code = dvm_refuse(in.body, msg, sizeof(msg));
     if (code) {
         dvm_fail(reply, code, msg, "input.body hit a refusal rule");
         return;

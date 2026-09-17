@@ -197,16 +197,20 @@ struct rcv_workspace {
     long long dirty;  /* -1 unreadable/unscanned, 0 clean, else path count */
     long long tracked; /* index entries walked */
     bool directory;   /* the asked-for path is an existing directory */
-    bool canonical;   /* realpath(dir) is dir itself: no "..", no symlink */
+    bool resolved;    /* realpath() resolved it; `root` is that canonical
+                       * path, with "." and ".." collapsed and every
+                       * symlinked component followed */
     bool checkout;    /* a git directory resolved for THIS worktree */
 };
 
 /* Observe `dir` without changing it. `scan_tracked` also walks the git
  * index for the tree id and the tracked-path pre-state; false skips that
- * walk and leaves dirty = -1 and tree = "". Returns false only on a bad
- * argument or an over-long path; an absent, non-canonical, or non-checkout
- * directory is reported through the fields, because the caller — not this
- * observer — decides what to refuse. */
+ * walk and leaves dirty = -1 and tree = "". `root` is the CANONICAL path
+ * whenever realpath() resolved it, so every caller works from the one real
+ * directory rather than from the spelling it was handed. Returns false
+ * only on a bad argument or an over-long path; an absent, unresolvable, or
+ * non-checkout directory is reported through the fields, because the
+ * caller — not this observer — decides what to refuse. */
 bool zcl_devagent_workspace_observe(const char *dir, bool scan_tracked,
                                     struct rcv_workspace *out);
 

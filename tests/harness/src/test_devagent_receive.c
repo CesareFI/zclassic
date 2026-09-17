@@ -30,6 +30,7 @@
 #include "platform/directory_watcher.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,7 +55,16 @@ static int g_rtx_ts;
 static void rtx_isolate(const char *tag)
 {
     char base[512];
+    /* realpath() writes up to PATH_MAX bytes and glibc's fortify check
+     * aborts on anything smaller, whatever the input length. */
+    char real[PATH_MAX];
     test_make_tmpdir(base, sizeof(base), "devagent_receive", tag);
+    /* Canonicalize the rig's own root. The receiver records the CANONICAL
+     * workspace path, so a tmpdir sitting below a symlinked component
+     * (/tmp is /private/tmp on a Mac) would otherwise make every
+     * path comparison below fail for a reason that is not the contract. */
+    if (realpath(base, real) != NULL)
+        (void)snprintf(base, sizeof(base), "%s", real);
     (void)snprintf(g_rtx_state, sizeof(g_rtx_state), "%s/state", base);
     (void)snprintf(g_rtx_base, sizeof(g_rtx_base), "%s", base);
     (void)snprintf(g_rtx_ws, sizeof(g_rtx_ws), "%s/ws", base);
@@ -1003,7 +1013,7 @@ int test_devagent_receive(void)
         /* The observer answers from files alone: no git, no spawn. */
         ASSERT(zcl_devagent_workspace_observe(ws, true, &w));
         ASSERT(w.directory);
-        ASSERT(w.canonical);
+        ASSERT(w.resolved);
         ASSERT(w.checkout);
         ASSERT_STR_EQ(w.head, "1111111111111111111111111111111111111111");
         ASSERT_EQ(w.dirty, 0);
@@ -1088,36 +1098,59 @@ int test_devagent_receive(void)
         PASS();
     }
 
-    TEST("a workspace that is not its own canonical path fails closed")
+    TEST("the configured root is canonicalized, and a climb never starts")
     {
         struct rcv_drive_opts o;
         struct rcv_beat_stats st;
         struct rcv_workspace w;
-        char body[4096], ws[1200], link[1200], climb[1300];
+        char body[4096], brief[8192], ws[1200], link[1200], climb[1300];
+        char dots[1300];
         rtx_isolate("escape");
         (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
         (void)snprintf(link, sizeof(link), "%s/link", g_rtx_base);
         (void)snprintf(climb, sizeof(climb), "%s/wt/../wt", g_rtx_base);
         ASSERT(rtx_checkout(ws, "3333333333333333333333333333333333333333"));
         ASSERT_EQ(symlink(ws, link), 0);
-        /* The symlink names a real checkout, and is still refused: the
-         * operator named a path, and resolving somewhere else — even
-         * somewhere valid — is not what they named. */
+        /* A configured root reached through a symlink is RESOLVED, not
+         * refused: realpath names the one real directory. Demanding that
+         * the operator's spelling already be its own canonical path
+         * refuses every workspace below a symlinked component — a Mac's
+         * /tmp is /private/tmp — which breaks availability and buys no
+         * safety, because realpath is what decides where the work lands. */
         ASSERT(zcl_devagent_workspace_observe(link, true, &w));
         ASSERT(w.directory);
-        ASSERT(!w.canonical);
-        ASSERT_EQ(w.dirty, -1);
+        ASSERT(w.resolved);
+        ASSERT_STR_EQ(w.root, ws);
+        ASSERT(w.checkout);
+        ASSERT_EQ(w.dirty, 0);
         ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
-        rtx_direction_sel(body, sizeof(body), "receiver", "", "Escape.");
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "Through it.");
         ASSERT(rtx_deliver("chatgpt", "box-a", "job-link", body, 1));
         rtx_opts_ws(&o, link);
         memset(&st, 0, sizeof(st));
         ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(st.refused, 0);
+        ASSERT_EQ(rtx_queue_count("queued", "job-link"), 1);
+        /* The brief carries the canonical path, never the link spelling,
+         * so two spellings of one workspace cannot look like two. */
+        ASSERT(rtx_read("receive/brief/job-link.brief", brief,
+                        sizeof(brief)));
+        ASSERT(strstr(brief, ws) != NULL);
+        ASSERT(strstr(brief, link) == NULL);
+        /* A directory whose NAME merely contains dots holds no ".."
+         * segment, so the flag accepts it and the only refusal comes from
+         * the workspace not being there — the segment rule does not turn
+         * every dotted name into a traversal. */
+        (void)snprintf(dots, sizeof(dots), "%s/a..b", g_rtx_base);
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "Dotted.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-dots", body, 2));
+        rtx_opts_ws(&o, dots);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
         ASSERT_EQ(st.admitted, 0);
         ASSERT_EQ(st.refused, 1);
-        ASSERT_EQ(rtx_answers("job-link", "RECEIVE_WORKSPACE_ESCAPE"), 1);
-        ASSERT_EQ(rtx_queue_count("queued", "job-link"), 0);
-        ASSERT(!rtx_exists("receive/brief/job-link.brief"));
+        ASSERT_EQ(rtx_answers("job-dots", "RECEIVE_WORKSPACE_MISSING"), 1);
         /* A ".." segment in the operator's own flag never even starts a
          * drive: a typo is loud at the door instead of silently refusing
          * every directive later. */
