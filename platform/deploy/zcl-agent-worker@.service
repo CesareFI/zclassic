@@ -107,10 +107,25 @@ TasksMax=512
 OOMScoreAdjust=500
 
 # The caps the owner approved, expressed as the leaf's OWN flags so they are
-# visible in the process line and not only in a cgroup: 600s of wall per job
-# and 32000 tokens. The executor REFUSES a wall cap under 30s, so 600 is
-# well inside the admitted range (the leaf bounds time_cap_s to 1..3600 and
-# token_cap to 1..1000000).
+# visible in the process line and not only in a cgroup. The executor REFUSES
+# a wall cap under 30s, so 600 is well inside the admitted range (the leaf
+# bounds time_cap_s to 1..3600 and token_cap to 1..1000000).
+#
+# --token_cap=200000 IS MEASURED, NOT PREFERRED. A real turn on this host
+# was run through this seam. At a 32000 cap it refused instantly with "token
+# budget spent mid-turn"; the passing run measured input=42396,
+# output=1078, total=43474 for the most trivial possible task (create one
+# file holding one line). muse_session charges the host's CUMULATIVE total
+# as the turn's spend, and that figure includes prompt and tool context, so
+# roughly 42k is FIXED COST before the model does anything useful and any
+# ceiling near 32k sits below the floor cost of every turn. 200000 is the
+# Muse module's own default and leaves about 156k of working budget above
+# that fixed context. The wall cap and the RAM cap below are what actually
+# keep a run bounded; the token cap is not a useful bound on its own.
+#
+# --mem_mb=1024 is RLIMIT_AS on the forked executor child. The cgroup's
+# MemoryMax below is the outer bound that actually holds, because it covers
+# the whole chain — worker, executor, model host and gate run together.
 #
 # --deadline_s=3600 is the MAXIMUM the leaf admits (bounded 1..3600), and
 # the drive loop exits cleanly once that wall passes. There is NO value that
@@ -118,7 +133,7 @@ OOMScoreAdjust=500
 # ceiling is 86400. --idle_limit_s=600 is likewise the maximum, so an empty
 # queue parks for ten minutes rather than the 60s default before the drive
 # ends.
-ExecStart=%h/github/zclassic23/build/bin/z23-dev dev agent worker run --worker=%i --deadline_s=3600 --idle_limit_s=600 --time_cap_s=600 --token_cap=32000
+ExecStart=%h/github/zclassic23/build/bin/z23-dev dev agent worker run --worker=%i --deadline_s=3600 --idle_limit_s=600 --time_cap_s=600 --token_cap=200000 --mem_mb=1024
 
 # Restart=always, NOT on-failure, AND THAT IS THE WHOLE POINT. This loop
 # exits with status 0 by design — at the deadline above, at the idle limit,

@@ -856,62 +856,41 @@ static int mr_exec_scope_prefix(void)
     return failures;
 }
 
-/* (e) UNMEASURABLE porcelain. A workspace that is a directory but not a
- * git worktree makes `git status --porcelain` exit non-zero, so the
- * change set cannot be measured at all. That must fail closed with a
- * reason that says the measurement failed — never report a clean tree,
- * and never report "nothing outside scope". */
-static int mr_exec_unmeasurable(void)
+/* The unmeasurable-workspace fixture: a real directory whose `.git` is a
+ * FILE holding garbage. A `.git` file must be a gitlink, so git exits
+ * non-zero AND stops walking up to any enclosing repository — the
+ * enumeration is unmeasurable wherever the fixture happens to land. */
+static bool mr_unmeasurable_ws(const struct mr_dirs *d, char *out,
+    size_t cap)
 {
-    int failures = 0;
-    struct mr_dirs d;
-    struct muse_run_task t;
-    struct muse_run_result r;
+    char gitfile[8192];
+    if (snprintf(out, cap, "%s/bare", d->root) >= (int)cap) return false;
+    if (!mr_mkdir_p(out)) return false;
+    if (snprintf(gitfile, sizeof(gitfile), "%s/.git", out) >=
+        (int)sizeof(gitfile))
+        return false;
+    return mr_write(gitfile, "not a gitfile\n", 0);
+}
+
+/* Runs one task over a transport this case owns, so the workspace can be
+ * something the shared lane helper would never build. Returns the run's
+ * rc, or -1 when the harness itself could not set the case up. */
+static int mr_run_on_fake(struct muse_run_task *t,
+    struct muse_run_result *r, char **evidence_out)
+{
     char err[MUSE_RUN_ERROR_MAX] = {0};
-    char *evidence = NULL;
-    char bare[8192];
     int ev[2], to_fd = -1, from_fd = -1;
     pid_t child = -1;
-    int rc = -1;
-    memset(&r, 0, sizeof(r));
-    MR_CHECK("unmeasurable lane", mr_lane(&d));
-    /* A real directory that git knows nothing about. */
-    if (snprintf(bare, sizeof(bare), "%s/bare", d.root) >=
-        (int)sizeof(bare)) {
-        MR_CHECK("unmeasurable path", false);
-        return failures;
-    }
-    MR_CHECK("unmeasurable dir", mr_mkdir_p(bare));
-    /* A `.git` FILE must be a gitlink; garbage makes git exit non-zero
-     * and stops it walking up to any enclosing repository, so the
-     * enumeration is unmeasurable no matter where the fixture lands. */
-    {
-        char gitfile[8192];
-        if (snprintf(gitfile, sizeof(gitfile), "%s/.git", bare) >=
-            (int)sizeof(gitfile))
-            MR_CHECK("unmeasurable gitfile fit", false);
-        else
-            MR_CHECK("unmeasurable gitfile",
-                mr_write(gitfile, "not a gitfile\n", 0));
-    }
-    MR_CHECK("unmeasurable task",
-        mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
-    if (snprintf(t.workspace, sizeof(t.workspace), "%s", bare) >=
-        (int)sizeof(t.workspace)) {
-        MR_CHECK("unmeasurable workspace", false);
-        return failures;
-    }
-    if (pipe(ev) != 0) {
-        MR_CHECK("unmeasurable pipe", false);
-        return failures;
-    }
+    int rc;
+    *evidence_out = NULL;
+    if (pipe(ev) != 0) return -1;
     s_evidence_fd = ev[1];
     if (!mr_fork_fake(FAKE_JOURNEY, ev[0], &to_fd, &from_fd, &child)) {
-        MR_CHECK("unmeasurable fork", false);
+        s_evidence_fd = -1;
         close(ev[0]); close(ev[1]);
-        return failures;
+        return -1;
     }
-    rc = muse_run_task_on_transport(&t, child, to_fd, from_fd, &r, err);
+    rc = muse_run_task_on_transport(t, child, to_fd, from_fd, r, err);
     close(to_fd);
     close(from_fd);
     {
@@ -920,8 +899,36 @@ static int mr_exec_unmeasurable(void)
     }
     close(ev[1]);
     s_evidence_fd = -1;
-    evidence = read_evidence(ev[0]);
+    *evidence_out = read_evidence(ev[0]);
     close(ev[0]);
+    return rc;
+}
+
+/* (e) UNMEASURABLE porcelain. The change set cannot be measured at all,
+ * so the run must fail closed with a reason that says the measurement
+ * failed — never reporting a clean tree, and never reporting "nothing
+ * outside scope". */
+static int mr_exec_unmeasurable(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_task t;
+    struct muse_run_result r;
+    char *evidence = NULL;
+    char bare[8192];
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("unmeasurable lane", mr_lane(&d));
+    MR_CHECK("unmeasurable workspace",
+        mr_unmeasurable_ws(&d, bare, sizeof(bare)));
+    MR_CHECK("unmeasurable task",
+        mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
+    if (snprintf(t.workspace, sizeof(t.workspace), "%s", bare) >=
+        (int)sizeof(t.workspace)) {
+        MR_CHECK("unmeasurable workspace fit", false);
+        return failures;
+    }
+    rc = mr_run_on_fake(&t, &r, &evidence);
     MR_CHECK("unmeasurable not pass", rc == 1 && r.rc == 1 &&
         strcmp(r.verdict, "pass") != 0);
     MR_CHECK("unmeasurable refused", strcmp(r.verdict, "refused") == 0);
@@ -958,8 +965,8 @@ static int mr_exec_unmeasurable_bound(void)
 {
     int failures = 0;
     struct mr_dirs d;
+    struct muse_run_task t;
     struct muse_run_result r;
-    char err[MUSE_RUN_ERROR_MAX] = {0};
     char *evidence = NULL;
     char name[512];
     char path[8192];
@@ -980,35 +987,8 @@ static int mr_exec_unmeasurable_bound(void)
             wrote = mr_write(path, "x\n", 0);
     }
     MR_CHECK("bound fixture", wrote);
-    {
-        struct muse_run_task t;
-        int ev[2], to_fd = -1, from_fd = -1;
-        pid_t child = -1;
-        MR_CHECK("bound task",
-            mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
-        if (pipe(ev) != 0) {
-            MR_CHECK("bound pipe", false);
-            return failures;
-        }
-        s_evidence_fd = ev[1];
-        if (!mr_fork_fake(FAKE_JOURNEY, ev[0], &to_fd, &from_fd, &child)) {
-            MR_CHECK("bound fork", false);
-            close(ev[0]); close(ev[1]);
-            return failures;
-        }
-        rc = muse_run_task_on_transport(&t, child, to_fd, from_fd, &r,
-            err);
-        close(to_fd);
-        close(from_fd);
-        {
-            int status = 0;
-            (void)waitpid(child, &status, 0);
-        }
-        close(ev[1]);
-        s_evidence_fd = -1;
-        evidence = read_evidence(ev[0]);
-        close(ev[0]);
-    }
+    MR_CHECK("bound task", mr_task_for(&d, &t, NULL, NULL, NULL, NULL));
+    rc = mr_run_on_fake(&t, &r, &evidence);
     MR_CHECK("bound not pass", rc == 1 && r.rc == 1 &&
         strcmp(r.verdict, "pass") != 0);
     MR_CHECK("bound unmeasurable", r.scope_pre_measured == false &&
