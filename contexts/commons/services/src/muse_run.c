@@ -709,6 +709,17 @@ struct mr_core {
     uint64_t max_tokens;
 };
 
+/* What defeated the measurement, for the evidence. A scan can also fail
+ * before it reads a single row — a failed allocation, a failed spawn, a
+ * non-zero or timed-out git, or a capture that filled its bound — and
+ * that case has no row to blame, so it says so rather than leaving the
+ * reason blank and reading like a row that was never named. */
+static const char *mr_unreadable_why(const struct muse_audit *a)
+{
+    return a->unreadable_why ? a->unreadable_why
+                             : "git did not answer the measurement";
+}
+
 /* BEFORE the turn. A workspace that is already dirty can prove nothing,
  * because its pre-existing edits would count toward the non-empty diff a
  * pass requires. So this refuses before a single token is spent: no
@@ -733,8 +744,8 @@ static bool mr_prestate_clean(struct mr_core *c)
         (void)snprintf(r->verdict, sizeof(r->verdict), "%s",
             mr_verdict_refused);
         (void)snprintf(r->reason, sizeof(r->reason),
-            "workspace pre-state unmeasurable: %lld unreadable row(s)",
-            a.unreadable);
+            "workspace pre-state unmeasurable: %lld unreadable row(s): %s",
+            a.unreadable, mr_unreadable_why(&a));
         return false;
     }
     r->scope_pre_measured = true;
@@ -770,8 +781,8 @@ static bool mr_scope_clean(struct mr_core *c)
         r->scope_changed_count = -1;
         r->scope_outside_count = -1;
         (void)snprintf(r->reason, sizeof(r->reason),
-            "workspace change set unmeasurable: %lld unreadable row(s)",
-            a.unreadable);
+            "workspace change set unmeasurable: %lld unreadable row(s): %s",
+            a.unreadable, mr_unreadable_why(&a));
         return false;
     }
     r->scope_changed_measured = true;

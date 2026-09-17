@@ -19,6 +19,15 @@
  *   a status action that writes nothing.
  */
 
+/* realpath() is declared by glibc only under _DEFAULT_SOURCE; with
+ * -D_POSIX_C_SOURCE alone the only declaration in scope is the fortify
+ * inline, which exists solely at -O2 and above. This must precede the
+ * first include: feature-test macros are read when <features.h> is first
+ * pulled in, and a definition after that silently does nothing. */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
 #include "test/test_core.h"
 
 #include "command/native_command.h"

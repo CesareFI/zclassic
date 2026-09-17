@@ -244,13 +244,25 @@ void muse_audit_init(struct muse_audit *a, const char *scope, char *list,
     if (outside && outside_cap > 0) outside[0] = '\0';
 }
 
+/* One row this parser could not read. The count is what makes the whole
+ * pass unmeasurable; the reason is what makes that refusal actionable. A
+ * measurement that can only say "I could not" and never "because" is a
+ * measurement nobody can repair, so the FIRST reason is kept — later rows
+ * are nearly always the same breakage repeated, and the first one is the
+ * one still adjacent to whatever produced it. */
+static void mr_unreadable(struct muse_audit *a, const char *why)
+{
+    a->unreadable++;
+    if (!a->unreadable_why) a->unreadable_why = why;
+}
+
 /* One measured path: counted in full, recorded while the bound allows, and
  * judged against the scope. A row that names nothing is unreadable, never
  * an absence. */
 static void mr_audit_path(struct muse_audit *a, const char *path)
 {
     if (!path || !path[0]) {
-        a->unreadable++;
+        mr_unreadable(a, "a row named an empty path");
         return;
     }
     a->total++;
@@ -267,22 +279,37 @@ static bool mr_status_char(char c)
         c == 'R' || c == 'C' || c == 'U' || c == '?' || c == '!';
 }
 
-/* The row's fixed-width prefix, exactly: two legal status characters and
- * the single space that always follows them. '?' and '!' only ever appear
- * doubled, and two blanks mean "unmodified in both columns", which this
- * seam never prints. A line that is not that shape did not come out of
- * the porcelain this audit measures, so the caller counts it unreadable
+/* Why this row's fixed-width prefix is not one this audit can read, or
+ * NULL when it reads. The prefix is exactly two legal status characters
+ * and the single space that always follows them. '?' and '!' only ever
+ * appear doubled, and two blanks mean "unmodified in both columns", which
+ * this seam never prints. A line that is not that shape did not come out
+ * of the porcelain this audit measures, so the caller counts it unreadable
  * instead of trusting the path it appears to carry: length alone is not a
  * shape, and a blind fixed skip over a line of the wrong shape invents a
- * path out of whatever follows. */
-static bool mr_row_status_ok(const char *line)
+ * path out of whatever follows.
+ *
+ * Each rejection names itself rather than collapsing into a bare false.
+ * These six are not one condition: a short line, a status byte from some
+ * other porcelain version, and a prefix that is the right length but the
+ * wrong shape are three different breakages with three different fixes,
+ * and a refusal that cannot tell them apart hands its reader nothing to
+ * act on. */
+static const char *mr_row_status_why(const char *line)
 {
-    if (!line || strlen(line) < 4) return false;
-    if (!mr_status_char(line[0]) || !mr_status_char(line[1])) return false;
-    if (line[2] != ' ') return false;
-    if ((line[0] == '?') != (line[1] == '?')) return false;
-    if ((line[0] == '!') != (line[1] == '!')) return false;
-    return line[0] != ' ' || line[1] != ' ';
+    if (!line || strlen(line) < 4)
+        return "a row too short to carry a status prefix and a path";
+    if (!mr_status_char(line[0]) || !mr_status_char(line[1]))
+        return "a status column that is not a porcelain v1 character";
+    if (line[2] != ' ')
+        return "no separating space after the two status columns";
+    if ((line[0] == '?') != (line[1] == '?'))
+        return "'?' in one status column only, never doubled";
+    if ((line[0] == '!') != (line[1] == '!'))
+        return "'!' in one status column only, never doubled";
+    if (line[0] == ' ' && line[1] == ' ')
+        return "both status columns blank, which this seam never prints";
+    return NULL;
 }
 
 /* Whether the status names a second path. Rename and copy carry " -> " in
@@ -303,30 +330,33 @@ static bool mr_row_names_two(const char *line)
  * unquoted filename is ambiguous by the same rule and refuses too. */
 static void mr_audit_row(struct muse_audit *a, char *line)
 {
+    const char *why = mr_row_status_why(line);
     char *arrow;
     bool two;
-    if (!mr_row_status_ok(line)) {
-        a->unreadable++;
+    if (why) {
+        mr_unreadable(a, why);
         return;
     }
     two = mr_row_names_two(line);
     line += 3;
     arrow = strstr(line, " -> ");
     if (two != (arrow != NULL)) {
-        a->unreadable++;
+        mr_unreadable(a, two
+            ? "a rename or copy row with no \" -> \" separator"
+            : "a \" -> \" separator on a status that never carries one");
         return;
     }
     if (arrow) {
         *arrow = '\0';
         if (!muse_dequote(line)) {
-            a->unreadable++;
+            mr_unreadable(a, "malformed quoting on a rename source path");
             return;
         }
         mr_audit_path(a, line);
         line = arrow + 4;
     }
     if (!muse_dequote(line)) {
-        a->unreadable++;
+        mr_unreadable(a, "malformed quoting on a row's path");
         return;
     }
     mr_audit_path(a, line);

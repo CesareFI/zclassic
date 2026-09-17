@@ -84,6 +84,12 @@ struct muse_audit {
     /* Rows the parser could not read. Silently dropping one would hide a
      * path, so any non-zero value makes the whole pass unmeasurable. */
     long long unreadable;
+    /* Why the FIRST unreadable row was unreadable, as a static string, or
+     * NULL while every row read. A count alone says the audit stopped but
+     * not what stopped it, and a refusal nobody can diagnose is one that
+     * gets retried instead of repaired — so the reason travels with the
+     * count into the caller's evidence. */
+    const char *unreadable_why;
 };
 
 void muse_audit_init(struct muse_audit *a, const char *scope, char *list,
