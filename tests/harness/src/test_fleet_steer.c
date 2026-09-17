@@ -193,6 +193,13 @@ static const struct json_value *fmx_arr(const struct fmx_call *c,
     return v && v->type == JSON_ARR ? v : NULL;
 }
 
+/* Integer reply field, or -1 when absent/wrong-typed. */
+static long long fmx_int(const struct fmx_call *c, const char *key)
+{
+    const struct json_value *v = fmx_get(c, key);
+    return v && v->type == JSON_INT ? json_get_int(v) : -1;
+}
+
 /* True when missing[] names the given source. */
 static bool fmx_missing_has(const struct fmx_call *c, const char *source)
 {
@@ -458,6 +465,7 @@ _test_next:;
 struct fmx_accept {
     char gid[64];
     long long seq;
+    long long accepted;
     bool duplicate;
     bool ok;
 };
@@ -494,6 +502,7 @@ static struct fmx_accept fmx_probe(void)
     v = row ? json_get(row, "seq") : NULL;
     if (v && v->type == JSON_INT)
         a.seq = json_get_int(v);
+    a.accepted = fmx_int(&s, "accepted");
     v = row ? json_get(row, "state") : NULL;
     a.ok = v && v->type == JSON_STR && strcmp(json_get_str(v), "queued") == 0;
     fmx_end(&s);
@@ -552,6 +561,9 @@ static int fmx_t_send_flow(void)
         ASSERT(a.seq >= 1);
         ASSERT(!a.duplicate);
         ASSERT(a.gid[0] != '\0');
+        /* A fresh, wholly-accepted one-item batch reports accepted=1,
+         * never the item-result count in disguise. */
+        ASSERT_EQ(a.accepted, 1);
         fmx_restore();
         PASS();
     }
@@ -664,8 +676,65 @@ static int fmx_t_duplicate(void)
         ASSERT_EQ(seq1, seq2);
         v = json_get(row, "duplicate");
         ASSERT(v && v->type == JSON_BOOL && json_get_bool(v));
+        /* An exact duplicate is still an accept: it reports the
+         * recorded row, not a refusal. */
+        ASSERT_EQ(fmx_int(&s, "accepted"), 1);
         fmx_end(&s);
         ASSERT_EQ(fmx_mail_count(), before);
+        /* A different payload under the same key is refused, not
+         * counted as accepted. */
+        {
+            struct fmx_call conflict;
+            struct json_value citems, citem;
+            const struct json_value *crow;
+            const struct json_value *cv;
+            json_init(&citems);
+            json_set_array(&citems);
+            fmx_item(&citem, "field-agent", "check the OTHER water pump",
+                     "pump-check", "key-pump-1");
+            (void)json_push_back(&citems, &citem);
+            json_free(&citem);
+            ASSERT(fmx_send(&conflict, gid, &citems));
+            json_free(&citems);
+            ASSERT(fmx_ok(&conflict));
+            ASSERT_EQ(fmx_int(&conflict, "accepted"), 0);
+            crow = json_at(fmx_arr(&conflict, "items"), 0);
+            cv = crow ? json_get(crow, "state") : NULL;
+            ASSERT(cv && cv->type == JSON_STR &&
+                   strcmp(json_get_str(cv), "refused") == 0);
+            cv = crow ? json_get(crow, "error") : NULL;
+            ASSERT(cv && cv->type == JSON_STR &&
+                   strcmp(json_get_str(cv), "IDEMPOTENCY_CONFLICT") == 0);
+            fmx_end(&conflict);
+            ASSERT_EQ(fmx_mail_count(), before);
+        }
+        /* A batch of one good item plus one BAD_INPUT item reports
+         * accepted=1, not 2: the refused item never counts. */
+        {
+            struct fmx_call mixed;
+            struct json_value mitems, good, bad;
+            long long mail_before = fmx_mail_count();
+            json_init(&mitems);
+            json_set_array(&mitems);
+            fmx_item(&good, "field-agent", "check the generator",
+                     "generator-check", "key-generator-1");
+            (void)json_push_back(&mitems, &good);
+            json_free(&good);
+            /* No "to": fails shape validation as BAD_INPUT. */
+            json_init(&bad);
+            json_set_object(&bad);
+            (void)json_push_kv_str(&bad, "body", "bad item, no to field");
+            (void)json_push_kv_str(&bad, "ref", "bad-item");
+            (void)json_push_kv_str(&bad, "idempotency_key", "key-bad-1");
+            (void)json_push_back(&mitems, &bad);
+            json_free(&bad);
+            ASSERT(fmx_send(&mixed, gid, &mitems));
+            json_free(&mitems);
+            ASSERT(fmx_ok(&mixed));
+            ASSERT_EQ(fmx_int(&mixed, "accepted"), 1);
+            ASSERT_EQ(fmx_mail_count(), mail_before + 1);
+            fmx_end(&mixed);
+        }
         /* Oversize batches are refused whole, not truncated. */
         {
             struct fmx_call big;

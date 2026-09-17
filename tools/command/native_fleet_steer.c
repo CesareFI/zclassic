@@ -48,7 +48,10 @@
  * duplicate work. A different payload under an already-recorded key is
  * refused per-item as IDEMPOTENCY_CONFLICT: the key names one exact
  * delivery, never two. The recorded ref+grant let revoke cancel exactly
- * the queued work its grant sent.
+ * the queued work its grant sent. The reply's top-level `accepted` counts
+ * only items whose result state is not "refused" (a reconciled duplicate
+ * counts, a fresh IDEMPOTENCY_CONFLICT/BAD_INPUT/mail refusal does not) —
+ * it is never just the item-result count.
  *
  * STATES. queued (send accepted into the outbox), delivered (visible in
  * pull), acknowledged (seq at or below the receiver's mail ack cursor),
@@ -1558,8 +1561,10 @@ static void fmc_send_item_accept(struct json_value *items, size_t index,
 }
 
 /* One send item: validate, reconcile idempotency, post, record. Emits its
- * result object onto items[]. */
-static void fmc_send_item(const struct zcl_command_request *req,
+ * result object onto items[]. Returns true iff the item's state is an
+ * accept (fresh or duplicate), false for every refused state — the
+ * caller sums this to report `accepted` honestly. */
+static bool fmc_send_item(const struct zcl_command_request *req,
                           const struct json_value *it, size_t index,
                           const char *from, const char *sent_path,
                           const char *grant, struct json_value *items)
@@ -1571,7 +1576,7 @@ static void fmc_send_item(const struct zcl_command_request *req,
         const char *to =
             (it && it->type == JSON_OBJ) ? fmc_item_str(it, "to") : NULL;
         fmc_send_item_refused(items, index, to, "BAD_INPUT");
-        return;
+        return false;
     }
     /* Reconcile: same key AND same payload returns the recorded accept
      * with no second row. A different payload under a recorded key is
@@ -1584,14 +1589,14 @@ static void fmc_send_item(const struct zcl_command_request *req,
             if (recorded[0] && strcmp(recorded, presented) == 0) {
                 fmc_send_item_accept(items, index, &f, seq, true, sent_path,
                                      from, grant);
-                return;
+                return true;
             }
             LOG_ERROR(FMC_LOG,
                       "send: payload conflict under key (to=%s seq=%lld)",
                       f.to, seq);
             fmc_send_item_refused(items, index, f.to,
                                   "IDEMPOTENCY_CONFLICT");
-            return;
+            return false;
         }
     }
     why[0] = '\0';
@@ -1600,10 +1605,11 @@ static void fmc_send_item(const struct zcl_command_request *req,
     if (seq < 0) {
         fmc_send_item_refused(items, index, f.to,
                               why[0] ? why : "POST_FAILED");
-        return;
+        return false;
     }
     fmc_send_item_accept(items, index, &f, seq, false, sent_path, from,
                          grant);
+    return true;
 }
 
 static void fmc_do_send(const struct zcl_command_request *req,
@@ -1644,15 +1650,23 @@ static void fmc_do_send(const struct zcl_command_request *req,
                  steerdir);
         return;
     }
-    json_init(&items);
-    json_set_array(&items);
-    for (i = 0; i < n; i++)
-        fmc_send_item(req, json_at(arr, i), i, from, sent_path, grant,
-                      &items);
-    (void)json_push_kv_str(&reply->data, "leaf", FMC_LEAF);
-    (void)json_push_kv(&reply->data, "items", &items);
-    (void)json_push_kv_int(&reply->data, "accepted",
-                           (long long)json_size(&items));
+    {
+        long long accepted = 0;
+        json_init(&items);
+        json_set_array(&items);
+        for (i = 0; i < n; i++) {
+            if (fmc_send_item(req, json_at(arr, i), i, from, sent_path,
+                              grant, &items))
+                accepted++;
+        }
+        (void)json_push_kv_str(&reply->data, "leaf", FMC_LEAF);
+        (void)json_push_kv(&reply->data, "items", &items);
+        /* `accepted` counts only items whose result state is not
+         * "refused" (a reconciled duplicate counts: it is the recorded
+         * accept, not a new one) — never the item-result count, which a
+         * remote client would otherwise mistake for delivery. */
+        (void)json_push_kv_int(&reply->data, "accepted", accepted);
+    }
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
     json_free(&items);
