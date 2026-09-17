@@ -309,6 +309,11 @@ void exec_getheaders_action(struct msg_processor *mp,
 void push_getheaders_span(struct msg_processor *mp, struct p2p_node *node,
                           const struct uint256 *start_hash,
                           const struct uint256 *stop_hash);
+bool msg_range_continuation_stop(struct msg_processor *mp,
+                                 struct p2p_node *node,
+                                 int our_height,
+                                 int64_t now_seconds,
+                                 struct uint256 *stop_hash);
 bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
                                        struct p2p_node *node,
                                        int our_height, int64_t now_seconds);

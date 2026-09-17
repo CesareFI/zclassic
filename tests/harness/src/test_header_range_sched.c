@@ -38,7 +38,40 @@
 
 #include "test/test_core.h"
 #include "net/download.h"
+#include "net/msg_internal.h"
 #include "services/header_range_scheduler.h"
+
+static int test_continuation_preserves_stop(void)
+{
+    printf("header_range_sched: continuation preserves assigned stop... ");
+    chain_params_select(CHAIN_MAIN);
+    const struct chain_params *cp = chain_params_get();
+    struct main_state ms;
+    main_state_init(&ms);
+    struct msg_processor mp = {0};
+    mp.main_state = &ms;
+    mp.params = cp;
+    struct p2p_node node = {0};
+    node.id = 71;
+
+    header_range_scheduler_reset_for_testing();
+    struct header_range_scheduler *s = header_range_scheduler_global();
+    int32_t lo = cp->checkpointData.entries[0].height;
+    int32_t hi = cp->checkpointData.entries[1].height;
+    int64_t now_s = 1000;
+    hrs_plan(s, lo, hi, NULL, 0);
+    bool ok = hrs_assign(s, node.id, now_s * 1000000) >= 0;
+    struct uint256 stop = {0};
+    struct uint256 expected = {0};
+    ok = ok && checkpoints_hash_at_height(&cp->checkpointData, hi, &expected);
+    ok = ok && msg_range_continuation_stop(&mp, &node, lo, now_s, &stop);
+    ok = ok && uint256_eq(&stop, &expected);
+
+    header_range_scheduler_reset_for_testing();
+    main_state_free(&ms);
+    if (ok) printf("OK\n"); else printf("FAIL\n");
+    return ok ? 0 : 1;
+}
 
 static int test_empty_reply_releases_span(void)
 {
@@ -90,6 +123,7 @@ int test_header_range_sched(void)
     int failures = 0;
     failures += test_empty_reply_releases_span();
     failures += test_disconnect_releases_span();
+    failures += test_continuation_preserves_stop();
 
     /* ── 1. Parallelize gate ─────────────────────────────────────── */
     printf("header_range_sched: should_parallelize gate... ");
