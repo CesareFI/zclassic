@@ -103,8 +103,8 @@ void boot_bundle_fetch_set_peer_source(boot_bundle_peer_source_fn fn,
  * db_file_service_recent() (most-recently-seen first), keep the usable rows in
  * a small static table, and register the pure provider over it. Safe and
  * silent when `ndb` is NULL/closed or the table is empty — that is a
- * first-ever boot, and the behaviour is exactly the pre-existing one. Never
- * fails boot. Call before boot_bundle_fetch_maybe(). */
+ * first-ever boot; boot selection can then defer a retry until P2P discovery.
+ * Never fails boot. Call before boot_bundle_fetch_maybe(). */
 struct node_db;
 void boot_bundle_fetch_arm_peer_seeds(struct node_db *ndb);
 
@@ -113,6 +113,20 @@ void boot_bundle_fetch_disarm_peer_seeds(void);
 
 /* How many peer-discovered seeds are currently armed. Introspection + tests. */
 size_t boot_bundle_fetch_armed_peer_seed_count(void);
+
+/* Single-threaded boot only: defer one acquisition retry when a fresh boot
+ * selected no state source and assembled zero seeds. NULL disarms. The context
+ * must outlive the P2P services. A persisted budget prevents respawn loops. */
+void boot_bundle_fetch_defer_peer_retry(const struct app_context *ctx);
+
+/* After a successful file_services save from the P2P callback: queue one
+ * retry for an eligible endpoint. No acquisition IO or seed snapshot mutation. */
+void boot_bundle_fetch_peer_saved(const char *datadir, const uint8_t ip[16],
+                                  uint16_t port);
+
+/* Main loop only, after app_init completes: consume the queued retry and
+ * request a graceful automatic respawn. Fetch and install stay on boot. */
+void boot_bundle_fetch_poll_peer_retry(void);
 
 typedef bool (*bbf_directory_fetch_fn)(const char *peer_addr, uint16_t port,
                                        char *buf, size_t cap);
@@ -207,6 +221,8 @@ bool boot_bundle_fetch_discovery_dump_state_json(struct json_value *out,
                                                  const char *key);
 
 #ifdef ZCL_TESTING
+/* Keep the harness alive while exercising the real respawn intent latch. */
+void boot_bundle_fetch_suppress_shutdown_for_test(bool suppress);
 /* Arm ONE synthetic cached peer endpoint
  * (engine/composition/src/boot_bundle_fetch_peer_seeds.c) so a test can drive the
  * "advertised ⇒ offered / did not advertise ⇒ not offered" decision without a

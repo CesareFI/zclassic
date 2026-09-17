@@ -30,6 +30,8 @@
 
 #include "config/boot.h"                       /* struct app_context */
 #include "config/boot_bundle_fetch.h"
+#include "config/boot_internal.h"
+#include "config/boot_msg_callbacks.h"
 #include "config/bundle_fetch_seeds.h"          /* ZCL_BUNDLE_FETCH_CLEARNET_SEEDS */
 #include "config/boot_consensus_bundle_marker.h"
 #include "config/consensus_state_install_runtime.h"
@@ -42,6 +44,8 @@
 #include "platform/socket_compat.h"
 #include "platform/time_compat.h"
 #include "storage/progress_store.h"
+#include "models/file_service.h"
+#include "services/chain_tip_watchdog.h"
 
 #include <fcntl.h>
 #include <stdatomic.h>
@@ -1321,6 +1325,119 @@ static void bbf_seeder_stop(struct bbf_seeder *s)
     rom_seed_reset();
 }
 
+static int case_delayed_peer_bootstrap(void)
+{
+    int failures = 0;
+    struct node_db ndb = {0};
+    struct main_state ms;
+    main_state_init(&ms);
+    struct boot_svc_ctx *svc = calloc(1, sizeof(*svc));
+    char dir[256], dbpath[512];
+    test_make_tmpdir(dir, sizeof(dir), "bbf_delayed_peer", "fresh");
+    snprintf(dbpath, sizeof(dbpath), "%s/node.db", dir);
+    struct app_context ctx = {.datadir = dir};
+    struct boot_state_source_selection selection;
+    const uint8_t loopback[16] =
+        {0,0,0,0,0,0,0,0,0,0,255,255,127,0,0,1};
+    const uint8_t invalid[16] = {0x20, 0x01, 0x0d, 0xb8};
+    const uint8_t blank[16] = {0};
+    boot_bundle_fetch_suppress_shutdown_for_test(true);
+    chain_tip_watchdog_test_reset_runtime();
+    boot_bundle_fetch_disarm_peer_seeds();
+    progress_store_close();
+    TEST("boot_bundle_fetch: fresh boot retries once after eligible P2P discovery") {
+        ASSERT(svc != NULL);
+        ASSERT(node_db_open(&ndb, dbpath));
+        ASSERT(progress_store_open(dir));
+        svc->node_db = &ndb;
+        svc->datadir = dir;
+        boot_select_state_source(&ndb, &ms, &ctx, &selection);
+        ASSERT(!selection.auto_installed_bundle);
+        ASSERT(boot_bundle_fetch_seed_count(&ctx) == 0);
+
+        ASSERT(!boot_save_file_service(blank, 18034, 8033, 1, true, svc));
+        ASSERT(boot_save_file_service(invalid, 18034, 8033, 1, true, svc));
+        boot_bundle_fetch_poll_peer_retry();
+        ASSERT(!chain_tip_watchdog_respawn_requested());
+
+        ASSERT(boot_save_file_service(loopback, 18034, 8033, 2, true, svc));
+        ASSERT(!chain_tip_watchdog_respawn_requested());
+        boot_bundle_fetch_poll_peer_retry();
+        ASSERT(chain_tip_watchdog_respawn_requested());
+        chain_tip_watchdog_test_reset_runtime();
+
+        /* The durable budget survives a simulated respawn and prevents an
+         * attacker or flapping endpoint from creating a restart loop. */
+        boot_bundle_fetch_defer_peer_retry(NULL);
+        node_db_close(&ndb);
+        progress_store_close();
+        ASSERT(node_db_open(&ndb, dbpath));
+        ASSERT(progress_store_open(dir));
+        boot_bundle_fetch_defer_peer_retry(&ctx);
+        boot_bundle_fetch_peer_saved(dir, loopback, 18034);
+        boot_bundle_fetch_poll_peer_retry();
+        ASSERT(!chain_tip_watchdog_respawn_requested());
+        boot_bundle_fetch_arm_peer_seeds(&ndb);
+        ASSERT(boot_bundle_fetch_seed_count(&ctx) == 1);
+    } _test_next:;
+    boot_bundle_fetch_defer_peer_retry(NULL);
+    boot_bundle_fetch_disarm_peer_seeds();
+    boot_bundle_fetch_suppress_shutdown_for_test(false);
+    chain_tip_watchdog_test_reset_runtime();
+    if (ndb.open)
+        node_db_close(&ndb);
+    progress_store_close();
+    free(svc);
+    main_state_free(&ms);
+    test_rm_rf_recursive(dir);
+    return failures;
+}
+
+static int case_delayed_peer_policy(void)
+{
+    int failures = 0;
+    const uint8_t loopback[16] =
+        {0,0,0,0,0,0,0,0,0,0,255,255,127,0,0,1};
+    boot_bundle_fetch_suppress_shutdown_for_test(true);
+    for (int policy = 0; policy < 5; policy++) {
+        char dir[256];
+        test_make_tmpdir(dir, sizeof(dir), "bbf_delayed_policy", "isolated");
+        struct main_state ms;
+        main_state_init(&ms);
+        struct app_context ctx = {.datadir = dir};
+        struct boot_state_source_selection selection;
+        chain_tip_watchdog_test_reset_runtime();
+        boot_bundle_fetch_disarm_peer_seeds();
+        progress_store_close();
+        TEST("boot_bundle_fetch: delayed retry preserves boot and late policy") {
+            ASSERT(progress_store_open(dir));
+            if (policy == 0)
+                ctx.no_file_sync = true;
+            else if (policy == 1)
+                ctx.testnet = true;
+            else if (policy == 2)
+                ctx.regtest = true;
+            boot_select_state_source(NULL, &ms, &ctx, &selection);
+            if (policy == 3)
+                ctx.no_file_sync = true;
+            if (policy == 4) {
+                const uint8_t digest[32] = {1};
+                ASSERT(boot_consensus_bundle_marker_write(dir, 3056758, digest));
+            }
+            boot_bundle_fetch_peer_saved(dir, loopback, 18034);
+            boot_bundle_fetch_poll_peer_retry();
+            ASSERT(!chain_tip_watchdog_respawn_requested());
+        } _test_next:;
+        boot_bundle_fetch_defer_peer_retry(NULL);
+        progress_store_close();
+        main_state_free(&ms);
+        test_rm_rf_recursive(dir);
+    }
+    boot_bundle_fetch_suppress_shutdown_for_test(false);
+    chain_tip_watchdog_test_reset_runtime();
+    return failures;
+}
+
 /* Write a <datadir>/bundles/directory.json hint for the seeder's artifact.
  * `corrupt_whole` flips one bit of the committed whole-file digest — the
  * bytes on the wire are then perfectly good but do not match what the client
@@ -1542,6 +1659,8 @@ int test_boot_bundle_fetch(void)
     int failures = 0;
     failures += case_seed_set();
     failures += case_peer_seed_offer_filter();
+    failures += case_delayed_peer_bootstrap();
+    failures += case_delayed_peer_policy();
     failures += case_peer_seed_e2e_and_verification();
     failures += case_peer_seed_stall_is_bounded();
     failures += case_gate();

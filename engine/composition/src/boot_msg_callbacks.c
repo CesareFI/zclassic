@@ -9,6 +9,7 @@
  * boot-state static. */
 
 #include "config/boot_msg_callbacks.h"
+#include "config/boot_bundle_fetch.h"
 #include "config/boot_file_market_delivery.h"
 #include "config/boot_internal.h"
 #include "config/db_service.h"
@@ -628,5 +629,10 @@ bool boot_save_file_service(const uint8_t ip[16],
     fs.p2p_port = p2p_port;
     fs.last_seen = last_seen;
     fs.is_zcl23 = is_zcl23;
-    return db_file_service_save(svc->node_db, &fs);
+    if (!db_file_service_save(svc->node_db, &fs)) {
+        LOG_WARN("boot", "file-service advertisement save failed; bootstrap retry deferred");
+        return false;
+    }
+    boot_bundle_fetch_peer_saved(svc->datadir, ip, port);
+    return true;
 }

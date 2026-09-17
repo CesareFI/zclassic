@@ -45,23 +45,25 @@
  * wastes one bounded fetch and is dropped. Nothing in this file relaxes any
  * check, and nothing in this file may ever be allowed to.
  *
- * LIMITATION, stated plainly so nobody mistakes it for a promise: the seed set
- * is assembled from what the node LEARNED IN AN EARLIER RUN, because
- * boot_bundle_fetch_maybe runs from boot_select_state_source in app_init, long
- * before app_init_services brings connman up — at that instant there are no
- * live peers to ask. A node whose very first process start has both an empty
- * datadir and an empty file_services table still has nobody to ask. Closing
- * that last step means re-running the state-source decision after the network
- * is up, which is an install-ordering change and deliberately NOT made here.
+ * First-ever startup has no saved endpoints. For that case boot selection arms
+ * one deferred retry. After P2P persists an eligible advertisement, a bounded
+ * automatic respawn returns to the existing single-threaded fetch/import/
+ * install seam. No download or install races the live reducer.
  */
 
 #include "config/boot_bundle_fetch.h"
+#include "config/boot.h"
+#include "config/consensus_state_install_runtime.h"
 
 #include "models/database.h"
 #include "models/file_service.h"
 #include "net/netaddr.h"
+#include "services/chain_tip_watchdog.h"
+#include "storage/progress_store.h"
 #include "util/log_macros.h"
+#include "util/thread_registry.h"
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -78,6 +80,101 @@
 
 static struct boot_bundle_peer_seed g_armed[BBFPS_MAX];
 static size_t g_armed_count = 0;
+
+static _Atomic(const struct app_context *) g_retry_ctx;
+static _Atomic(const struct app_context *) g_retry_pending;
+#define BBFPS_RETRY_KEY "bbf.peer_discovery_retry_used"
+#ifdef ZCL_TESTING
+static bool g_suppress_shutdown;
+void boot_bundle_fetch_suppress_shutdown_for_test(bool suppress)
+{
+    g_suppress_shutdown = suppress;
+}
+#endif
+
+static bool bbfps_host(const uint8_t ip[16], char host[64])
+{
+    if (!ip)
+        return false; /* raw-return-ok: address eligibility predicate */
+    struct net_addr a;
+    net_addr_init(&a);
+    memcpy(a.ip, ip, sizeof(a.ip));
+    return net_addr_is_valid(&a) && !net_addr_is_tor(&a) &&
+           net_addr_to_string(&a, host, 64) > 0 && host[0];
+}
+
+void boot_bundle_fetch_defer_peer_retry(const struct app_context *ctx)
+{
+    atomic_store(&g_retry_ctx, NULL);
+    atomic_store(&g_retry_pending, NULL);
+    if (!ctx || !boot_bundle_fetch_should_run(ctx->datadir, ctx) ||
+        boot_bundle_fetch_seed_count(ctx) != 0)
+        return;
+
+    sqlite3 *pdb = progress_store_db();
+    unsigned char used = 0;
+    bool found = false;
+    size_t len = 0;
+    progress_store_tx_lock();
+    bool ok = pdb && progress_meta_get(pdb, BBFPS_RETRY_KEY, &used,
+                                       sizeof(used), &len, &found);
+    progress_store_tx_unlock();
+    if (!ok || found) {
+        LOG_WARN(BBFPS_SUBSYS, "delayed bootstrap retry unavailable: %s; "
+                 "falling back to P2P IBD",
+                 !ok ? "retry budget unreadable" : "retry budget exhausted");
+        return;
+    }
+    atomic_store(&g_retry_ctx, ctx);
+    LOG_INFO(BBFPS_SUBSYS, "fast-sync source absent at fresh startup; awaiting "
+             "P2P file-service discovery for one automatic bootstrap retry");
+}
+
+void boot_bundle_fetch_peer_saved(const char *datadir, const uint8_t ip[16],
+                                  uint16_t port)
+{
+    const struct app_context *ctx = atomic_load(&g_retry_ctx);
+    char host[64] = {0};
+    if (!ctx || !datadir || strcmp(datadir, ctx->datadir) != 0 || port == 0 ||
+        !bbfps_host(ip, host) || thread_registry_shutdown_requested())
+        return;
+    if (!atomic_compare_exchange_strong(&g_retry_ctx, &ctx, NULL))
+        return;
+    LOG_INFO(BBFPS_SUBSYS, "P2P discovered file-service endpoint %s:%u; "
+             "bootstrap retry queued for the main loop", host, (unsigned)port);
+    atomic_store(&g_retry_pending, ctx);
+}
+
+void boot_bundle_fetch_poll_peer_retry(void)
+{
+    const struct app_context *ctx = atomic_exchange(&g_retry_pending, NULL);
+    if (!ctx || thread_registry_shutdown_requested())
+        return;
+    const char *datadir = ctx->datadir;
+    if (!boot_bundle_fetch_should_run(datadir, ctx) ||
+        boot_install_bundle_pending(datadir)) {
+        LOG_INFO(BBFPS_SUBSYS, "delayed bootstrap retry skipped: acquisition "
+                 "disabled or state source already staged/installed");
+        return;
+    }
+    sqlite3 *pdb = progress_store_db();
+    const unsigned char used = 1;
+    progress_store_tx_lock();
+    bool ok = pdb && progress_meta_set(pdb, BBFPS_RETRY_KEY, &used, sizeof(used));
+    progress_store_tx_unlock();
+    if (!ok) {
+        LOG_WARN(BBFPS_SUBSYS, "delayed bootstrap retry refused: could not "
+                 "persist retry budget; falling back to P2P IBD");
+        return;
+    }
+    LOG_INFO(BBFPS_SUBSYS, "retrying bootstrap acquisition after P2P discovery "
+             "via automatic graceful respawn; verification remains mandatory");
+    chain_tip_watchdog_request_respawn();
+#ifdef ZCL_TESTING
+    if (!g_suppress_shutdown)
+#endif
+    thread_registry_request_shutdown();
+}
 
 /* The registered provider: a pure copy-out of the table armed below. */
 static size_t bbfps_provide(void *ctx, struct boot_bundle_peer_seed *out,
@@ -136,16 +233,9 @@ void boot_bundle_fetch_arm_peer_seeds(struct node_db *ndb)
          * right outcome today regardless: rom_fetch's transport dials with
          * getaddrinfo() and has no SOCKS/Tor route, so an onion seed could not
          * be reached even if it were named here. */
-        struct net_addr a;
-        net_addr_init(&a);
-        memcpy(a.ip, rows[i].ip, sizeof(a.ip));
-        if (!net_addr_is_valid(&a) || net_addr_is_tor(&a)) {
-            skipped_addr++;
-            continue;
-        }
         char host[64];
         host[0] = '\0';
-        if (net_addr_to_string(&a, host, sizeof(host)) <= 0 || !host[0]) {
+        if (!bbfps_host(rows[i].ip, host)) {
             skipped_addr++;
             continue;
         }

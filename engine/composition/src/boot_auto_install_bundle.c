@@ -733,6 +733,15 @@ static void nss_classify(struct app_context *ctx,
     out->baseline_hstar = reducer_frontier_provable_tip_cached();
 }
 
+static void nss_defer_peer_retry_if_empty(
+    const struct no_state_source_facts *facts,
+    const struct app_context *ctx)
+{
+    if (facts->fetch == NO_STATE_SOURCE_FETCH_SEEDS_EMPTY &&
+        facts->bundle == NO_STATE_SOURCE_BUNDLE_NONE)
+        boot_bundle_fetch_defer_peer_retry(ctx);
+}
+
 /* ── The app_init selection seam ───────────────────────────────────────────── */
 
 void boot_select_state_source(struct node_db *ndb, struct main_state *ms,
@@ -740,6 +749,7 @@ void boot_select_state_source(struct node_db *ndb, struct main_state *ms,
                               struct boot_state_source_selection *out)
 {
     memset(out, 0, sizeof(*out));
+    boot_bundle_fetch_defer_peer_retry(NULL);
     if (!ctx)
         return;
 
@@ -820,6 +830,7 @@ void boot_select_state_source(struct node_db *ndb, struct main_state *ms,
         struct no_state_source_facts f;
         nss_classify(ctx, &f);
         no_state_source_raise(&f);
+        nss_defer_peer_retry_if_empty(&f, ctx);
     }
 
     /* Reclaim the disk abandoned downloads left in <datadir>/bundles/. Runs

@@ -31,6 +31,7 @@
  *   z23 <method> [params...]          — RPC client to running node */
 
 #include "config/boot.h"
+#include "config/boot_bundle_fetch.h"
 #include "config/boot_cold_start.h"     /* -cold-start staged driver */
 #include "config/boot_error.h"          /* pre-registry typed failure surface */
 #include "config/args.h"                /* flag ladder, -loglevel, usage text */
@@ -799,8 +800,10 @@ static void main_run_service_loop(const struct app_context *ctx,
 
     while (!g_shutdown_requested &&
            !thread_registry_shutdown_requested() &&
-           app_is_running())
+           app_is_running()) {
+        boot_bundle_fetch_poll_peer_retry();
         sleep(1);
+    }
     if (thread_registry_shutdown_requested())
         g_shutdown_requested = 1;
 
