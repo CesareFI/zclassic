@@ -70,10 +70,14 @@
  * onion address, an IP address, or an absolute filesystem path outside the
  * checkout, is refused with ok=false and a MAIL_REFUSED_* code naming the
  * rule — a typed error row, never a crash. Refusal words: key, onion
- * address, IP, absolute path. Repo-relative paths (no leading slash) are
- * always allowed; an absolute path under the checkout root is allowed, but
- * a path that climbs out with a ".." segment never is, even when it starts
- * with the root.
+ * address, IP, absolute path. Repo-relative paths are allowed: a slash only
+ * makes a path ABSOLUTE when it STARTS a token, so "docs/plan.md" passes
+ * and "/etc/passwd" does not. (A relative path whose own text contains a
+ * secret-shaped marker such as "/tmp/" is still refused by the marker list
+ * that runs before that test — a marker match, not a statement about
+ * leading slashes.) An absolute path under the checkout root is allowed,
+ * but a path that climbs out with a ".." segment never is, even when it
+ * starts with the root.
  *
  * OUTPUT (zcl.agent_mail.v1). Every reply names its own `leaf`. Post returns
  * the row fields plus `cursor` (the row's seq) and `outbox`. Pull returns
@@ -256,6 +260,22 @@ static bool dvm_has_drive_path(const char *s)
     return false;
 }
 
+/* Does a token START at p, i.e. is p the first byte of the body or does a
+ * delimiter sit just before it? This is what separates "/etc/passwd" (a
+ * token that begins with a slash, so an absolute path) from the slash
+ * INSIDE "docs/experiments/x.md" (a relative path, which is allowed and
+ * always was meant to be). '=' and '(' are delimiters too, so
+ * "path=/etc/passwd" is still read as an absolute token. */
+static bool dvm_token_start(const char *s, const char *p)
+{
+    char c;
+    if (p == s)
+        return true;
+    c = p[-1];
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"' ||
+           c == '\'' || c == '=' || c == '(';
+}
+
 static bool dvm_has_abs_path(const char *s)
 {
     static const char *const markers[] = {
@@ -268,10 +288,15 @@ static bool dvm_has_abs_path(const char *s)
     }
     if (dvm_has_drive_path(s))
         return true;
-    /* A bare absolute path: " /<alnum>" outside quotes. Repo-relative
-     * paths (tools/command/x.c) never match: they have no leading slash. */
+    /* A bare absolute path: a "/<alnum>" that STARTS a token. A slash in
+     * the middle of a token is part of a repo-relative path
+     * (tools/command/x.c) and is not an absolute path at all. The comment
+     * here used to claim that already while the loop below matched every
+     * slash it saw, which refused bodies that named nothing but relative
+     * paths — and told them to "use repo-relative paths". */
     for (const char *p = s; *p; p++) {
-        if (*p == '/' && isalnum((unsigned char)p[1]))
+        if (*p == '/' && isalnum((unsigned char)p[1]) &&
+            dvm_token_start(s, p))
             return true;
     }
     return false;

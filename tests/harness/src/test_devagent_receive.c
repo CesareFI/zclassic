@@ -46,6 +46,7 @@
 
 static char g_rtx_state[1024];
 static char g_rtx_ws[1024];
+static char g_rtx_base[1024];
 static char g_rtx_saved_xdg[4096];
 static bool g_rtx_had_xdg;
 static int g_rtx_ts;
@@ -55,6 +56,7 @@ static void rtx_isolate(const char *tag)
     char base[512];
     test_make_tmpdir(base, sizeof(base), "devagent_receive", tag);
     (void)snprintf(g_rtx_state, sizeof(g_rtx_state), "%s/state", base);
+    (void)snprintf(g_rtx_base, sizeof(g_rtx_base), "%s", base);
     (void)snprintf(g_rtx_ws, sizeof(g_rtx_ws), "%s/ws", base);
     g_rtx_had_xdg = getenv("XDG_STATE_HOME") != NULL;
     if (g_rtx_had_xdg)
@@ -176,6 +178,148 @@ static void rtx_direction(char *out, size_t cap, const char *gate,
                    "muse-workspace: %s\nmuse-scope: src/x.c\nmuse-gate: %s\n"
                    "\n%s\n",
                    g_rtx_ws, gate, prompt);
+}
+
+/* The same direction with a LOGICAL workspace value — which is all a remote
+ * sender can carry, since dev.agent.mail refuses a body naming a foreign
+ * absolute path and nothing here weakens that. `sha` is the optional HEAD
+ * pin; "" leaves the header out entirely. */
+static void rtx_direction_sel(char *out, size_t cap, const char *selector,
+                              const char *sha, const char *prompt)
+{
+    char pin[128];
+    pin[0] = '\0';
+    if (sha[0])
+        (void)snprintf(pin, sizeof(pin), "muse-sha: %s\n", sha);
+    (void)snprintf(out, cap,
+                   "muse-workspace: %s\nmuse-scope: src/x.c\n"
+                   "muse-gate: hex_codec\n%s\n%s\n",
+                   selector, pin, prompt);
+}
+
+/* ── a real-enough git checkout, built from the same bytes git writes ──── */
+
+static bool rtx_put(const char *dir, const char *rel, const char *text)
+{
+    char path[1600];
+    FILE *f;
+    size_t n = strlen(text);
+    (void)snprintf(path, sizeof(path), "%s/%s", dir, rel);
+    f = fopen(path, "wb");
+    if (!f)
+        return false;
+    if (n > 0 && fwrite(text, 1, n, f) != n) {
+        (void)fclose(f);
+        return false;
+    }
+    return fclose(f) == 0;
+}
+
+static void rtx_be32(unsigned char *p, uint32_t v)
+{
+    p[0] = (unsigned char)(v >> 24);
+    p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);
+    p[3] = (unsigned char)v;
+}
+
+/* One DIRC v2 index naming exactly one tracked path with the stat data the
+ * caller wants recorded — the same file layout git writes, so the
+ * receiver's reader is exercised, not mocked. A clean pre-state records the
+ * file's real size and mtime; a dirty one records anything else. */
+static bool rtx_index(const char *ws, const char *name, uint32_t mode,
+                      uint32_t size, uint32_t mtime)
+{
+    unsigned char buf[512];
+    char path[1600];
+    size_t nlen = strlen(name);
+    size_t esz = (62u + nlen + 8u) & ~(size_t)7u;
+    FILE *f;
+    memset(buf, 0, sizeof(buf));
+    memcpy(buf, "DIRC", 4);
+    rtx_be32(buf + 4, 2);
+    rtx_be32(buf + 8, 1);
+    rtx_be32(buf + 12 + 8, mtime);
+    rtx_be32(buf + 12 + 24, mode);
+    rtx_be32(buf + 12 + 36, size);
+    buf[12 + 60] = (unsigned char)((nlen >> 8) & 0x0F);
+    buf[12 + 61] = (unsigned char)(nlen & 0xFF);
+    memcpy(buf + 12 + 62, name, nlen);
+    (void)snprintf(path, sizeof(path), "%s/.git/index", ws);
+    f = fopen(path, "wb");
+    if (!f)
+        return false;
+    if (fwrite(buf, 1, 12u + esz + 20u, f) != 12u + esz + 20u) {
+        (void)fclose(f);
+        return false;
+    }
+    return fclose(f) == 0;
+}
+
+static bool rtx_is_dir(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool rtx_mkdirs(const char *dir)
+{
+    char path[1600];
+    (void)mkdir(dir, 0700);
+    (void)snprintf(path, sizeof(path), "%s/.git", dir);
+    (void)mkdir(path, 0700);
+    (void)snprintf(path, sizeof(path), "%s/.git/refs", dir);
+    (void)mkdir(path, 0700);
+    (void)snprintf(path, sizeof(path), "%s/.git/refs/heads", dir);
+    (void)mkdir(path, 0700);
+    (void)snprintf(path, sizeof(path), "%s/src", dir);
+    (void)mkdir(path, 0700);
+    return rtx_is_dir(path);
+}
+
+/* A checkout on `head`: a .git directory, a symbolic HEAD, its loose ref,
+ * one tracked file, and an index whose stat data matches that file. */
+static bool rtx_checkout(const char *dir, const char *head)
+{
+    char path[1600], ref[64];
+    struct stat st;
+    (void)snprintf(ref, sizeof(ref), "%s\n", head);
+    if (!rtx_mkdirs(dir) || !rtx_put(dir, ".git/HEAD", "ref: refs/heads/x\n") ||
+        !rtx_put(dir, ".git/refs/heads/x", ref) ||
+        !rtx_put(dir, "src/x.c", "int zx(void) { return 0; }\n"))
+        return false;
+    (void)snprintf(path, sizeof(path), "%s/src/x.c", dir);
+    if (lstat(path, &st) != 0)
+        return false;
+    return rtx_index(dir, "src/x.c", 0100644u, (uint32_t)st.st_size,
+                     (uint32_t)st.st_mtime);
+}
+
+/* Read one of the receiver's own files under the state root. */
+static bool rtx_read(const char *tail, char *out, size_t cap)
+{
+    char path[1600];
+    FILE *f;
+    size_t n;
+    (void)snprintf(path, sizeof(path), "%s/z23/dev/%s", g_rtx_state, tail);
+    out[0] = '\0';
+    f = fopen(path, "rb");
+    if (!f)
+        return false;
+    n = fread(out, 1, cap - 1, f);
+    out[n] = '\0';
+    return fclose(f) == 0 && n > 0;
+}
+
+/* One drive with an explicitly configured workspace. */
+static void rtx_opts_ws(struct rcv_drive_opts *o, const char *workspace)
+{
+    memset(o, 0, sizeof(*o));
+    (void)snprintf(o->receiver, sizeof(o->receiver), "box-a");
+    (void)snprintf(o->workspace, sizeof(o->workspace), "%s", workspace);
+    o->deadline_s = 30;
+    o->wait_ms = 50;
+    o->max_beats = 1;
 }
 
 /* Post one directive through the EXISTING mail leaf. A body carrying an
@@ -786,7 +930,7 @@ int test_devagent_receive(void)
         ASSERT_EQ(rtx_queue_count("running", "job-long"), 1);
         /* Status answers while the turn runs, and says so. */
         memset(&st, 0, sizeof(st));
-        ASSERT(zcl_devagent_receive_survey("box-a", &st) >= 0);
+        ASSERT(zcl_devagent_receive_survey("box-a", "", &st) >= 0);
         ASSERT_EQ(st.seen, 2);
         /* And the leaf's own status action answers too. */
         rtx_begin(&c, "dev.agent.receive", "zcl.agent_receive.v1");
@@ -834,7 +978,389 @@ int test_devagent_receive(void)
         ASSERT(!rtx_ok(&c));
         rtx_end(&c);
         memset(&st, 0, sizeof(st));
-        ASSERT(zcl_devagent_receive_survey("bad name", &st) < 0);
+        ASSERT(zcl_devagent_receive_survey("bad name", "", &st) < 0);
+        rtx_restore();
+        PASS();
+    }
+
+    /* ── receiver-side workspace resolution ───────────────────────────────
+     * A directive minted on another box cannot carry this box's paths: it
+     * does not know them, and dev.agent.mail refuses a body naming an
+     * absolute path outside the caller's own checkout. So the wire carries a
+     * selector and the RECEIVER resolves it. Every case below proves one
+     * half of that: only a known selector is honoured, and the resolution
+     * itself is fail-closed. */
+
+    TEST("a selector resolves to the configured workspace, exactly once")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        struct rcv_workspace w;
+        char body[4096], brief[8192], record[2048], ws[1200];
+        rtx_isolate("selector");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "1111111111111111111111111111111111111111"));
+        /* The observer answers from files alone: no git, no spawn. */
+        ASSERT(zcl_devagent_workspace_observe(ws, true, &w));
+        ASSERT(w.directory);
+        ASSERT(w.canonical);
+        ASSERT(w.checkout);
+        ASSERT_STR_EQ(w.head, "1111111111111111111111111111111111111111");
+        ASSERT_EQ(w.dirty, 0);
+        ASSERT_EQ(w.tracked, 1);
+        ASSERT(w.tree[0] != '\0');
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "Do it there.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-sel", body, 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(st.refused, 0);
+        ASSERT_EQ(rtx_queue_count("queued", "job-sel"), 1);
+        /* The brief the worker is handed carries the RESOLVED absolute
+         * path, so the executor needs no change at all, and muse-scope is
+         * untouched and still relative to that workspace. */
+        ASSERT(rtx_read("receive/brief/job-sel.brief", brief, sizeof(brief)));
+        ASSERT(strstr(brief, ws) != NULL);
+        ASSERT(strstr(brief, "muse-workspace: receiver") == NULL);
+        ASSERT(strstr(brief, "muse-scope: src/x.c") != NULL);
+        /* The RECEIVED bytes are kept beside it, exactly as they arrived. */
+        ASSERT(rtx_read("receive/brief/job-sel.received", record,
+                        sizeof(record)));
+        ASSERT_STR_EQ(record, body);
+        /* The record names the selector, the resolved path, and the source
+         * identity of the workspace that answered. */
+        ASSERT(rtx_read("receive/brief/job-sel.evidence", record,
+                        sizeof(record)));
+        ASSERT(strstr(record, "workspace_selector=receiver") != NULL);
+        ASSERT(strstr(record,
+                      "workspace_head=1111111111111111111111111111111111"
+                      "111111") != NULL);
+        ASSERT(strstr(record, "workspace_tree_sha3=") != NULL);
+        ASSERT(strstr(record, ws) != NULL);
+        /* The answer carries that identity and NO path of any kind: the
+         * mail leaf refuses a body naming one, and a peer has no use for
+         * this box's filesystem. The digest is what it can check. */
+        ASSERT_EQ(rtx_answers("job-sel", "workspace_selector=receiver"), 1);
+        ASSERT_EQ(rtx_answers("job-sel", "workspace_head=1111"), 1);
+        ASSERT_EQ(rtx_answers("job-sel", "workspace_sha3="), 1);
+        ASSERT_EQ(rtx_answers("job-sel", "workspace_tree_sha3="), 1);
+        ASSERT_EQ(rtx_answers("job-sel", ws), 0);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("only a known selector is honoured; anything else refuses")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char body[4096], ws[1200];
+        rtx_isolate("unknown");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "2222222222222222222222222222222222222222"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        /* A word this box does not know is not a path and never becomes
+         * one. */
+        rtx_direction_sel(body, sizeof(body), "workstation", "", "Go.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-unk", body, 1));
+        /* A selector dressed as a traversal is still just an unknown
+         * word. */
+        rtx_direction_sel(body, sizeof(body), "receiver/../../etc", "", "Go.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-trav", body, 2));
+        /* And "." is the ONE other spelling that IS honoured. */
+        rtx_direction_sel(body, sizeof(body), ".", "", "Go here.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-dot", body, 3));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(st.refused, 2);
+        ASSERT_EQ(rtx_answers("job-unk",
+                              "RECEIVE_WORKSPACE_SELECTOR_UNKNOWN"), 1);
+        ASSERT_EQ(rtx_answers("job-trav",
+                              "RECEIVE_WORKSPACE_SELECTOR_UNKNOWN"), 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-unk"), 0);
+        ASSERT_EQ(rtx_queue_count("queued", "job-trav"), 0);
+        ASSERT_EQ(rtx_queue_count("queued", "job-dot"), 1);
+        ASSERT(!rtx_exists("receive/brief/job-unk.brief"));
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("a workspace that is not its own canonical path fails closed")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        struct rcv_workspace w;
+        char body[4096], ws[1200], link[1200], climb[1300];
+        rtx_isolate("escape");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        (void)snprintf(link, sizeof(link), "%s/link", g_rtx_base);
+        (void)snprintf(climb, sizeof(climb), "%s/wt/../wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "3333333333333333333333333333333333333333"));
+        ASSERT_EQ(symlink(ws, link), 0);
+        /* The symlink names a real checkout, and is still refused: the
+         * operator named a path, and resolving somewhere else — even
+         * somewhere valid — is not what they named. */
+        ASSERT(zcl_devagent_workspace_observe(link, true, &w));
+        ASSERT(w.directory);
+        ASSERT(!w.canonical);
+        ASSERT_EQ(w.dirty, -1);
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "Escape.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-link", body, 1));
+        rtx_opts_ws(&o, link);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.refused, 1);
+        ASSERT_EQ(rtx_answers("job-link", "RECEIVE_WORKSPACE_ESCAPE"), 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-link"), 0);
+        ASSERT(!rtx_exists("receive/brief/job-link.brief"));
+        /* A ".." segment in the operator's own flag never even starts a
+         * drive: a typo is loud at the door instead of silently refusing
+         * every directive later. */
+        rtx_opts_ws(&o, climb);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), -1);
+        ASSERT_EQ(st.beats, 0);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("with no workspace configured a selector refuses, never guesses")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        struct rtx_call c;
+        char body[4096];
+        rtx_isolate("unconfigured");
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "Guess.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-nocfg", body, 1));
+        rtx_opts_ws(&o, "");
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.refused, 1);
+        ASSERT_EQ(rtx_answers("job-nocfg",
+                              "RECEIVE_WORKSPACE_UNCONFIGURED"), 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-nocfg"), 0);
+        /* No cwd, no $HOME, no discovered checkout ended up in a brief. */
+        ASSERT(!rtx_exists("receive/brief/job-nocfg.brief"));
+        /* And status says plainly which state it is in. */
+        rtx_begin(&c, "dev.agent.receive", "zcl.agent_receive.v1");
+        (void)json_push_kv_str(&c.input, "action", "status");
+        (void)json_push_kv_str(&c.input, "receiver", "box-a");
+        zcl_native_handle_dev_agent_receive(&c.request, &c.reply);
+        ASSERT(rtx_ok(&c));
+        ASSERT_STR_EQ(rtx_reply_str(&c, "workspace_state"), "unconfigured");
+        rtx_end(&c);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("a muse-sha that is not the resolved HEAD refuses; a match admits")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char body[4096], ws[1200];
+        rtx_isolate("shapin");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "4444444444444444444444444444444444444444"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        /* The client pins an image this workspace is not on. */
+        rtx_direction_sel(body, sizeof(body), "receiver",
+                          "5555555555555555555555555555555555555555",
+                          "Certify.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-wrongsha", body, 1));
+        /* And one it is, by unambiguous prefix. */
+        rtx_direction_sel(body, sizeof(body), "receiver", "444444444444",
+                          "Certify.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-rightsha", body, 2));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(st.refused, 1);
+        ASSERT_EQ(rtx_answers("job-wrongsha",
+                              "RECEIVE_WORKSPACE_SHA_MISMATCH"), 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-wrongsha"), 0);
+        ASSERT_EQ(rtx_queue_count("queued", "job-rightsha"), 1);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("a dirty resolved workspace refuses early, with the paths named")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        struct rcv_workspace w;
+        char body[4096], ws[1200];
+        rtx_isolate("dirty");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "6666666666666666666666666666666666666666"));
+        /* One tracked path now diverges from what the index recorded. */
+        ASSERT(rtx_put(ws, "src/x.c",
+                       "int zx(void) { return 1; } /* edited on the box */\n"));
+        ASSERT(zcl_devagent_workspace_observe(ws, true, &w));
+        ASSERT(w.checkout);
+        ASSERT_EQ(w.dirty, 1);
+        ASSERT_STR_EQ(w.dirty_names, "src/x.c");
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "On a mess.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-dirty", body, 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.refused, 1);
+        ASSERT_EQ(rtx_answers("job-dirty", "RECEIVE_WORKSPACE_DIRTY"), 1);
+        ASSERT_EQ(rtx_answers("job-dirty", "dirty-tracked-paths-1"), 1);
+        /* Nothing reached the queue, so no worker can start a turn on it. */
+        ASSERT_EQ(rtx_queue_count("queued", "job-dirty"), 0);
+        ASSERT(!rtx_exists("receive/brief/job-dirty.brief"));
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("a byte-identical replay reconciles and never re-resolves")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char body[4096], brief[8192], ws[1200];
+        rtx_isolate("replay");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "7777777777777777777777777777777777777777"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "Once only.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-rep", body, 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        /* Now make the workspace dirty. A receiver that re-resolved a
+         * settled ref would refuse this replay; one that reconciles from
+         * the RECEIVED bytes answers the same terminal evidence. The
+         * comparison must be against what was received, not against the
+         * rewritten brief, or the replay would read as a false conflict. */
+        ASSERT(rtx_put(ws, "src/x.c", "int zx(void) { return 2; } /* x */\n"));
+        ASSERT(rtx_deliver_as("retry", "chatgpt", "box-a", "job-rep", body, 1));
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.refused, 0);
+        ASSERT_EQ(st.reconciled, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-rep"), 1);
+        ASSERT_EQ(rtx_answers("job-rep", "state=accepted"), 2);
+        /* The replay's answer repeats the evidence the ref was decided
+         * with, not a fresh resolution. */
+        ASSERT_EQ(rtx_answers("job-rep", "workspace_selector=receiver"), 2);
+        ASSERT(rtx_read("receive/brief/job-rep.brief", brief, sizeof(brief)));
+        ASSERT(strstr(brief, ws) != NULL);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("the same ref with a different body is still a conflict")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char body[4096], other[4096], ws[1200];
+        rtx_isolate("selconflict");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "8888888888888888888888888888888888888888"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "First.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-two", body, 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        rtx_direction_sel(other, sizeof(other), "receiver", "", "Second.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-two", other, 2));
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.reconciled, 0);
+        ASSERT_EQ(st.refused, 1);
+        ASSERT_EQ(rtx_answers("job-two", "RECEIVE_REF_CONFLICT"), 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-two"), 1);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("a receiver restarted elsewhere cannot move decided work")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char body[4096], brief[8192], first[1200], second[1200];
+        rtx_isolate("remap");
+        (void)snprintf(first, sizeof(first), "%s/wt1", g_rtx_base);
+        (void)snprintf(second, sizeof(second), "%s/wt2", g_rtx_base);
+        ASSERT(rtx_checkout(first, "9999999999999999999999999999999999999999"));
+        ASSERT(rtx_checkout(second,
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "Stay put.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-map", body, 1));
+        rtx_opts_ws(&o, first);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        /* The operator restarts the receiver against a DIFFERENT workspace
+         * and the same row arrives again. The decided ref keeps the path it
+         * was decided with; nothing is queued again and nothing can run in
+         * the new workspace. */
+        ASSERT(rtx_deliver_as("retry", "chatgpt", "box-a", "job-map", body, 1));
+        rtx_opts_ws(&o, second);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.reconciled, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-map"), 1);
+        ASSERT(rtx_read("receive/brief/job-map.brief", brief, sizeof(brief)));
+        ASSERT(strstr(brief, first) != NULL);
+        ASSERT(strstr(brief, second) == NULL);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("an absolute workspace still works for the same-box case")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char body[4096], brief[8192], ws[1200];
+        rtx_isolate("absolute");
+        (void)snprintf(ws, sizeof(ws), "%s/wt", g_rtx_base);
+        ASSERT(rtx_checkout(ws, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        /* g_rtx_ws is a bare directory: no .git, no index, nothing. The
+         * same-box rule is exactly what it always was — an existing
+         * absolute directory — so this must still be admitted whether or
+         * not a workspace is configured, and the resolution machinery must
+         * not start vouching for a path the sender chose. */
+        rtx_direction(body, sizeof(body), "hex_codec", "Local as ever.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-abs", body, 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(st.refused, 0);
+        ASSERT_EQ(rtx_queue_count("queued", "job-abs"), 1);
+        ASSERT(rtx_read("receive/brief/job-abs.brief", brief, sizeof(brief)));
+        ASSERT(strstr(brief, g_rtx_ws) != NULL);
+        ASSERT(strstr(brief, ws) == NULL);
+        ASSERT_EQ(rtx_answers("job-abs", "workspace_selector=absolute"), 1);
+        /* And with nothing configured at all. */
+        rtx_direction(body, sizeof(body), "hex_codec", "Still local.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-abs2", body, 2));
+        rtx_opts_ws(&o, "");
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-abs2"), 1);
         rtx_restore();
         PASS();
     }

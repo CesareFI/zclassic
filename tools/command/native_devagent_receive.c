@@ -746,7 +746,6 @@ static bool rcv_packed_head(const char *common, const char *ref, char *out,
     char path[RCV_PATH_MAX + 32];
     char line[1024];
     FILE *f;
-    size_t rn = strlen(ref);
     bool found = false;
     if (!rcv_join(path, sizeof(path), common, "packed-refs"))
         return false;

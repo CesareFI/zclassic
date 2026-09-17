@@ -584,6 +584,121 @@ int test_devagent_mail(void)
         PASS();
     }
 
+    /* A body that names nothing but REPO-RELATIVE paths was refused as if
+     * it carried an absolute one, and told to "use repo-relative paths".
+     * The detector matched every slash it saw, so it only passed a body
+     * that ALSO carried an absolute in-root token. That is what made a
+     * cross-box directive impossible: a directive naming a workspace
+     * logically and a scope relatively has no absolute token left to
+     * satisfy the rule with. Relative is now accepted, and every absolute
+     * refusal below is unchanged. */
+    TEST("mail: a body naming only relative paths is accepted") {
+        struct dvx_call c, p;
+        const struct json_value *rows;
+        dvx_isolate("relative");
+        dvx_post(&c, "alice", "*", "note",
+                 "see docs/experiments/x.md for detail");
+        ASSERT(dvx_run(&c));
+        ASSERT(dvx_ok(&c));
+        dvx_end(&c);
+        dvx_pull(&p, 0, NULL, NULL);
+        ASSERT(dvx_run(&p));
+        ASSERT(dvx_ok(&p));
+        rows = dvx_arr(&p, "rows");
+        ASSERT(rows != NULL);
+        ASSERT_EQ((long long)rows->num_children, 1);
+        dvx_end(&p);
+        dvx_restore();
+        dvx_isolate("relative2");
+        dvx_post(&c, "alice", "*", "note", "a/b/c relative only");
+        ASSERT(dvx_run(&c));
+        ASSERT(dvx_ok(&c));
+        dvx_end(&c);
+        dvx_restore();
+        PASS();
+    }
+
+    TEST("mail: one real muse direction with a selector posts as itself") {
+        struct dvx_call c;
+        dvx_isolate("direction");
+        /* Exactly the shape a cross-box directive now has: a logical
+         * workspace, a relative scope, and a prompt naming relative paths.
+         * No absolute token anywhere, which is the entire point. */
+        dvx_post(&c, "alice", "box-a", "directive",
+                 "muse-workspace: receiver\nmuse-scope: docs/experiments/\n"
+                 "muse-gate: hex_codec\n\n"
+                 "Write docs/experiments/plan.md from tools/dev/README.md.\n");
+        ASSERT(dvx_run(&c));
+        ASSERT(dvx_ok(&c));
+        dvx_end(&c);
+        dvx_restore();
+        PASS();
+    }
+
+    TEST("mail: an absolute token after a delimiter is still refused") {
+        struct dvx_call c;
+        dvx_isolate("afterequals");
+        /* '=' delimits a token, so this slash still STARTS one. */
+        dvx_post(&c, "alice", "*", "note", "path=/etc/passwd is readable");
+        ASSERT(dvx_run(&c));
+        ASSERT(!dvx_ok(&c));
+        ASSERT(strstr(c.reply.error.code, "PATH") != NULL);
+        dvx_end(&c);
+        ASSERT(dvx_outbox_empty());
+        dvx_restore();
+        dvx_isolate("afterequals2");
+        dvx_post(&c, "alice", "*", "note", "/srv/data/x is mounted");
+        ASSERT(dvx_run(&c));
+        ASSERT(!dvx_ok(&c));
+        ASSERT(strstr(c.reply.error.code, "PATH") != NULL);
+        dvx_end(&c);
+        ASSERT(dvx_outbox_empty());
+        dvx_restore();
+        PASS();
+    }
+
+    TEST("mail: an absolute path under the root is still accepted") {
+        struct dvx_call c;
+        char root[PATH_MAX];
+        char body[PATH_MAX + 64];
+        ASSERT(zcl_devagent_checkout_root(NULL, root, sizeof(root)));
+        (void)snprintf(body, sizeof(body), "built %s/build/bin/z23 already",
+                       root);
+        dvx_isolate("inroot");
+        dvx_post(&c, "alice", "*", "note", body);
+        ASSERT(dvx_run(&c));
+        ASSERT(dvx_ok(&c));
+        dvx_end(&c);
+        dvx_restore();
+        PASS();
+    }
+
+    TEST("mail: a relative token carrying .. is still refused") {
+        struct dvx_call c;
+        dvx_isolate("reldotdot");
+        dvx_post(&c, "alice", "*", "note", "read /srv/../secret/x please");
+        ASSERT(dvx_run(&c));
+        ASSERT(!dvx_ok(&c));
+        ASSERT(strstr(c.reply.error.code, "PATH") != NULL);
+        dvx_end(&c);
+        ASSERT(dvx_outbox_empty());
+        dvx_restore();
+        PASS();
+    }
+
+    TEST("mail: a Windows drive path is still refused") {
+        struct dvx_call c;
+        dvx_isolate("drive");
+        dvx_post(&c, "alice", "*", "note", "copied to C:\\Users\\rhett\\x");
+        ASSERT(dvx_run(&c));
+        ASSERT(!dvx_ok(&c));
+        ASSERT(strstr(c.reply.error.code, "PATH") != NULL);
+        dvx_end(&c);
+        ASSERT(dvx_outbox_empty());
+        dvx_restore();
+        PASS();
+    }
+
 #if !defined(_WIN32)
     TEST("mail: ack leaves the cursor exact and no temp file behind") {
         struct dvx_call c, a;
