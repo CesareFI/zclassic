@@ -242,7 +242,7 @@ static char *gw_post_auth(const char *path, const char *json,
 
 static char *gw_get(const char *path, int *status)
 {
-    char req[512];
+    char req[4096];
     int n = snprintf(req, sizeof(req),
                      "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
                      path);
@@ -753,6 +753,62 @@ static int gw_t_oauth(void)
         ASSERT_EQ(st, 200);
         ASSERT(gw_body_has(b, "Z23 Fleet sign-in"));
         free(b);
+        /* A hosted client's real authorize URL: percent-encoded callback,
+         * scope as '+', a resource parameter, and a long state — well past
+         * the old 256-byte request-target bound, which refused the whole
+         * sign-in as a 400 before any OAuth code ran. */
+        {
+            char big[1400];
+            char hosted[33];
+            int bn;
+            /* Its own registration: the authorize step matches the exact
+             * redirect the client registered. */
+            b = gw_post("/oauth/register",
+                        "{\"redirect_uris\":[\"https://client.test/api/oauth"
+                        "/auth_callback\"]}",
+                        &st);
+            ASSERT(b != NULL);
+            ASSERT_EQ(st, 201);
+            {
+                const char *idp = strstr(b, "\"client_id\":\"");
+                ASSERT(idp != NULL);
+                memcpy(hosted, idp + 13, 32);
+                hosted[32] = '\0';
+            }
+            free(b);
+            bn = snprintf(big, sizeof(big),
+                              "/oauth/authorize?response_type=code&client_id=%s"
+                              "&redirect_uri=https%%3A%%2F%%2Fclient.test"
+                              "%%2Fapi%%2Foauth%%2Fauth_callback"
+                              "&scope=brief+send+evidence"
+                              "&state=AbC-123_x%s"
+                              "&code_challenge=%s&code_challenge_method=S256"
+                              "&resource=https%%3A%%2F%%2Ffront.test%%2Fsteer",
+                              hosted,
+                              "0123456789012345678901234567890123456789"
+                              "0123456789012345678901234567890123456789",
+                              GW_OAUTH_CHALLENGE);
+            ASSERT(bn > 256 && (size_t)bn < sizeof(big));
+            b = gw_get(big, &st);
+            ASSERT(b != NULL);
+            ASSERT_EQ(st, 200);
+            ASSERT(gw_body_has(b, "Z23 Fleet sign-in"));
+            ASSERT(gw_body_has(b, "auth_callback"));
+            free(b);
+        }
+        /* The bound still exists: a target past it is refused, not read. */
+        {
+            char over[3200];
+            size_t o = (size_t)snprintf(over, sizeof(over),
+                                        "/oauth/authorize?x=");
+            while (o < sizeof(over) - 1)
+                over[o++] = 'a';
+            over[o] = '\0';
+            b = gw_get(over, &st);
+            ASSERT(b != NULL);
+            ASSERT_EQ(st, 400);
+            free(b);
+        }
         b = gw_get("/oauth/authorize?response_type=code&client_id=0000000000"
                    "0000000000000000000000"
                    "&redirect_uri=https://client.test/cb&scope=brief"

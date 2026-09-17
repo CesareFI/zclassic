@@ -257,10 +257,19 @@ static void gw_config(struct gw_config *c)
 
 /* ── HTTP/1.1 request (headers + optional body, bounded) ──────────────── */
 
+/* The request target (path plus "?" plus query) is scanned whole into
+ * path[] before gw_split_query moves the query out, so this bound is the
+ * bound on the WHOLE target, not on the path alone. A real authorize URL
+ * carries client_id, a 43-byte S256 challenge, state, scope, an encoded
+ * redirect_uri and a resource, which passes 256 bytes easily: at that
+ * bound a hosted client's sign-in died as a 400 before any OAuth code
+ * ran. Kept well above that, and still a fixed per-connection bound. */
+#define GW_CAP_TARGET 2048
+
 struct gw_http {
     char method[16];
-    char path[256];
-    char query[1024];
+    char path[GW_CAP_TARGET];
+    char query[GW_CAP_TARGET];
     size_t content_length;
     char *body;
     size_t body_len;

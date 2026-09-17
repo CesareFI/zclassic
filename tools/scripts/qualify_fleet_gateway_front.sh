@@ -129,7 +129,17 @@ else
     git worktree add --detach "$WT" "$SHA" >&2 || fail "worktree add failed"
 fi
 # Pinned dependencies: the repo-sanctioned prime (submodule pin + vendor).
-make -C "$WT" worktree-prime >&2 || fail "worktree-prime (pinned deps) failed"
+# Prime copies vendored Tor archives from a sibling checkout when it can, and
+# a sibling whose archives predate the current pin hands over bytes bound to
+# the WRONG tor commit -- provenance then refuses, and a node linked anyway
+# would be stamped from archives this SHA never pinned. Rebuild them inside
+# the train from the pinned submodule instead of qualifying borrowed bytes.
+if ! make -C "$WT" worktree-prime >&2 || ! make -C "$WT" check-tor-provenance >&2; then
+    say "prime left Tor archives unbound to this SHA's pin; rebuilding them in the train"
+    make -C "$WT" tor-full >&2 || fail "tor-full (pinned archives) failed"
+    make -C "$WT" check-tor-provenance >&2 || fail "Tor archives still not bound to the pin"
+    make -C "$WT" worktree-prime >&2 || fail "worktree-prime (pinned deps) failed"
+fi
 say "tor pin: $(git -C "$WT" submodule status vendor/tor 2>/dev/null || echo unknown)"
 
 # ── 3. Build the exact images ─────────────────────────────────────────────
