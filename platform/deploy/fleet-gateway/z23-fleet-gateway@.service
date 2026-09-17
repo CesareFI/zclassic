@@ -1,0 +1,54 @@
+# z23-fleet-gateway@.service — loopback Streamable-HTTP front for fleet steering.
+#
+# This is a USER-LINGER service. Install to ~/.config/systemd/user/ and run
+# with `systemctl --user`, NEVER as a system unit and NEVER with sudo. The
+# instance name is the loopback port, e.g. `systemctl --user enable --now
+# z23-fleet-gateway@<gw-port>`.
+#
+# The gateway binds 127.0.0.1 ONLY, speaks plain HTTP, refuses non-loopback
+# peers with 403, and fork/execs the node binary per tools/call so every
+# grant scope, expiry and revocation is enforced by the node itself. It mints
+# nothing (owner minting stays in `fleet.steer.grant`, outside AI-callable
+# tools) and never logs credentials. See tools/fleet_gateway.c CONTRACT and
+# platform/deploy/fleet-gateway/README.md.
+#
+# Owner-private values (FLEET_GW_ISSUER, FLEET_GW_OWNER_KEY, optional
+# FLEET_GW_NODE override) live OUTSIDE the repo in
+# ~/.config/z23-fleet-gateway/<port>.env, e.g.:
+#   FLEET_GW_ISSUER=https://<public-host>:<front-port>
+#   FLEET_GW_OWNER_KEY=<owner approval secret, never shared, never logged>
+#   FLEET_GW_NODE=%h/github/zclassic23/build/bin/z23
+# The EnvironmentFile line below is dash-optional: without an owner key the
+# gateway still serves discovery but refuses OAuth approval (fail closed).
+
+[Unit]
+Description=z23 fleet gateway (loopback Streamable HTTP on 127.0.0.1:%i)
+Documentation=file:%h/github/zclassic23/platform/deploy/fleet-gateway/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Loopback only; the port is the instance name so parallel isolated
+# gateways (prod vs. qualification) never share a socket.
+Environment=FLEET_GW_BIND=127.0.0.1
+Environment=FLEET_GW_PORT=%i
+EnvironmentFile=-%h/.config/z23-fleet-gateway/%i.env
+# ExecStart must be a literal absolute path; a box whose checkout lives
+# elsewhere overrides this line AND FLEET_GW_NODE together:
+#   systemctl --user edit z23-fleet-gateway@<gw-port>
+ExecStart=%h/github/zclassic23/build/bin/z23-fleet-gateway
+# One fork per connection plus one fork/exec per tool call, all bounded by
+# the gateway's own caps (64 KiB headers, 1 MiB bodies, 4 MiB replies).
+# Bounded supervision to match: a crash loop is a symptom, not a workload.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+# The gateway owns its owner-private steer dir under the state root; keep
+# the rest of the filesystem read-only-safe default (no ProtectSystem=strict:
+# the node child it fork/execs needs its normal paths).
+
+[Install]
+WantedBy=default.target

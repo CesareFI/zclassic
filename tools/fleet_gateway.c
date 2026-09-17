@@ -4,8 +4,8 @@
  *
  * ── CONTRACT ─────────────────────────────────────────────────────────────
  *
- * WHY. ChatGPT cannot reach a shell, an onion address, or the node's
- * operator-private API. This binary is the smallest remote surface that
+ * WHY. A hosted AI client cannot reach a shell, an onion address, or the
+ * node's operator-private API. This binary is the smallest remote surface that
  * lets it steer: one HTTP endpoint speaking Streamable HTTP
  * (JSON-RPC over POST), dispatching each tool call to the TESTED node
  * binary over fork/exec with --input JSON, and returning the node's own
@@ -21,13 +21,15 @@
  * never logged. No credentials in chat, no private data made public.
  * Every tools/call needs exactly one credential (header or "grant"
  * argument); a call with none, or two that differ, is refused with a
- * typed error before the node is forked.
+ * typed error before the node is forked. A call with none is also a
+ * transport 401 carrying the RFC 9728 challenge: a hosted client starts
+ * its sign-in only on that status, never on a 200 wrapping the error.
  *
- * OAUTH (G2: ChatGPT sign-in). The same binary also speaks the OAuth
- * endpoints ChatGPT needs: RFC 9728 protected-resource discovery plus
- * RFC 8414 authorization-server discovery, RFC 7591 dynamic client
- * registration, an owner-approved authorize step (PKCE S256 only), and
- * RFC 6749 token exchange. An access token IS a scoped steer grant id:
+ * OAUTH (G2: hosted-client sign-in). The same binary also speaks the OAuth
+ * endpoints a hosted tool client needs: RFC 9728 protected-resource
+ * discovery plus RFC 8414 authorization-server discovery, RFC 7591
+ * dynamic client registration, an owner-approved authorize step (PKCE
+ * S256 only), and RFC 6749 token exchange. An access token IS a scoped steer grant id:
  * no new validation surface exists — the node enforces scope, expiry
  * and revocation per call exactly as for argument-carried grants.
  * Grant minting still happens only inside the node leaf, and only after
@@ -782,7 +784,7 @@ static void gw_args_input(struct gw_buf *b, const struct json_value *params)
  * expiry and revocation remain node-enforced after forwarding. */
 static bool gw_credential(struct gw_buf *b, const struct json_value *id,
                           const char *bearer, bool bearer_bad,
-                          struct json_value *args)
+                          struct json_value *args, bool *challenge)
 {
     const struct json_value *g;
     const char *arg_grant = NULL;
@@ -796,6 +798,10 @@ static bool gw_credential(struct gw_buf *b, const struct json_value *id,
         return false;
     }
     if (!bearer && !arg_grant) {
+        /* The one refusal a remote client can cure by signing in: the
+         * transport wraps this same typed body in a 401 OAuth challenge
+         * (gw_reply_challenge), which is what starts a client's sign-in. */
+        *challenge = true;
         gw_rpc_error(b, id, -32001, "grant required");
         return false;
     }
@@ -819,7 +825,7 @@ static bool gw_credential(struct gw_buf *b, const struct json_value *id,
 static bool gw_input_with_grant(struct gw_buf *b, const struct json_value *id,
                                 const struct json_value *params,
                                 const char *bearer, bool bearer_bad,
-                                struct gw_buf *input)
+                                struct gw_buf *input, bool *challenge)
 {
     struct json_value args;
     memset(input, 0, sizeof(*input));
@@ -836,7 +842,7 @@ static bool gw_input_with_grant(struct gw_buf *b, const struct json_value *id,
         gw_rpc_error(b, id, -32602, "arguments did not parse");
         return false;
     }
-    if (!gw_credential(b, id, bearer, bearer_bad, &args)) {
+    if (!gw_credential(b, id, bearer, bearer_bad, &args, challenge)) {
         gw_buf_free(input);
         json_free(&args);
         return false;
@@ -911,7 +917,7 @@ static void gw_forward_call(struct gw_buf *b, const struct json_value *id,
 static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
                                const struct json_value *params,
                                const char *node, const char *bearer,
-                               bool bearer_bad)
+                               bool bearer_bad, bool *challenge)
 {
     const struct gw_tool *t;
     const char *name;
@@ -922,7 +928,8 @@ static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
         gw_rpc_error(b, id, -32602, "unknown tool");
         return;
     }
-    if (!gw_input_with_grant(b, id, params, bearer, bearer_bad, &input))
+    if (!gw_input_with_grant(b, id, params, bearer, bearer_bad, &input,
+                             challenge))
         return;
     gw_forward_call(b, id, t, node, input.p);
     gw_buf_free(&input);
@@ -930,7 +937,7 @@ static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
 
 static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
                             const char *node, const char *bearer,
-                            bool bearer_bad)
+                            bool bearer_bad, bool *challenge)
 {
     struct json_value req;
     const struct json_value *v;
@@ -974,7 +981,8 @@ static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
     else if (strcmp(method, "tools/list") == 0)
         gw_reply_tools_list(b, id);
     else if (strcmp(method, "tools/call") == 0)
-        gw_reply_tool_call(b, id, params, node, bearer, bearer_bad);
+        gw_reply_tool_call(b, id, params, node, bearer, bearer_bad,
+                           challenge);
     else if (strcmp(method, "ping") == 0) {
         gw_buf_str(b, "{\"jsonrpc\":\"2.0\",\"id\":");
         gw_json_write(b, id);
@@ -1579,9 +1587,13 @@ static void gw_oauth_authorize_get(int fd, const struct gw_http *h,
         gw_oauth_error(fd, "invalid_request");
         return;
     }
-    gw_buf_str(&b, "<!doctype html><html><body><h1>Z23 Fleet sign-in</h1>"
-                   "<p>ChatGPT requests scopes: ");
+    gw_buf_str(&b, "<!doctype html><html><head><meta name=\"viewport\" "
+                   "content=\"width=device-width,initial-scale=1\">"
+                   "<title>Z23 Fleet sign-in</title></head><body>"
+                   "<h1>Z23 Fleet sign-in</h1><p>A client requests scopes: ");
     gw_html_escape(&b, az.scope);
+    gw_buf_str(&b, "</p><p>It will be redirected to: ");
+    gw_html_escape(&b, az.redirect);
     gw_buf_str(&b, "</p><form method=\"post\" action=\"/oauth/authorize\">"
                    "<input type=\"hidden\" name=\"response_type\" value=\"code\">"
                    "<input type=\"hidden\" name=\"client_id\" value=\"");
@@ -1852,8 +1864,11 @@ static bool gw_serve_oauth(int fd, const struct gw_http *h,
 {
     bool get = strcmp(h->method, "GET") == 0;
     bool post = strcmp(h->method, "POST") == 0;
+    /* RFC 9728 3.1: clients probe the path-suffixed form first. */
     if (get &&
-        strcmp(h->path, "/.well-known/oauth-protected-resource") == 0) {
+        (strcmp(h->path, "/.well-known/oauth-protected-resource") == 0 ||
+         strcmp(h->path, "/.well-known/oauth-protected-resource/steer") ==
+             0)) {
         gw_oauth_wellknown(fd, cfg, false);
         return true;
     }
@@ -1907,6 +1922,43 @@ static void gw_reply(int fd, int status, const char *ctype, const char *body,
         gw_write_all(fd, head, (size_t)hlen);
     if (body && n > 0)
         gw_write_all(fd, body, n);
+}
+
+/* 401 + RFC 6750/9728 challenge around the typed JSON-RPC refusal. A
+ * remote tool client starts OAuth only on a transport-level 401 naming the
+ * protected-resource metadata; a 200 carrying the same error is shown to
+ * the model as a failed call and no sign-in ever begins. The body is
+ * unchanged, so callers reading -32001 keep working. */
+static void gw_reply_challenge(int fd, const struct gw_config *cfg,
+                               struct gw_buf *b)
+{
+    char issuer[300];
+    struct gw_buf out;
+    memset(&out, 0, sizeof(out));
+    gw_oauth_issuer(cfg, issuer, sizeof(issuer));
+    if (!b->oom && b->p) {
+        char n[32];
+        snprintf(n, sizeof(n), "%zu", b->len);
+        gw_buf_str(&out, "HTTP/1.1 401 Unauthorized\r\n"
+                         "WWW-Authenticate: Bearer error=\"invalid_token\", "
+                         "error_description=\"grant required\", "
+                         "resource_metadata=\"");
+        gw_buf_str(&out, issuer);
+        gw_buf_str(&out, "/.well-known/oauth-protected-resource\", "
+                         "scope=\"brief send evidence\"\r\n"
+                         "Content-Type: application/json\r\n"
+                         "Content-Length: ");
+        gw_buf_str(&out, n);
+        gw_buf_str(&out, "\r\nConnection: close\r\n\r\n");
+        gw_buf_put(&out, b->p, b->len);
+    }
+    if (!out.oom && out.p)
+        gw_write_all(fd, out.p, out.len);
+    else
+        gw_reply(fd, 500, "application/json", "{\"error\":\"server_error\"}",
+                 24);
+    gw_buf_free(&out);
+    gw_buf_free(b);
 }
 
 static void gw_reply_json(int fd, struct gw_buf *b)
@@ -1983,10 +2035,14 @@ static void gw_serve(int fd, const struct gw_config *cfg)
         return;
     }
     if (strcmp(h.method, "POST") == 0 && strcmp(h.path, "/steer") == 0) {
+        bool challenge = false;
         gw_dispatch_rpc(&body, h.body ? h.body : "", cfg->node,
-                        h.auth_present ? h.auth : NULL, h.auth_bad);
+                        h.auth_present ? h.auth : NULL, h.auth_bad,
+                        &challenge);
         free(h.body);
-        if (body.len == 0 && !body.oom) {
+        if (challenge) {
+            gw_reply_challenge(fd, cfg, &body);
+        } else if (body.len == 0 && !body.oom) {
             /* A notification: 202 with no body. */
             gw_reply(fd, 202, "application/json", "", 0);
             gw_buf_free(&body);

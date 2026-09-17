@@ -1,0 +1,50 @@
+# z23-fleet-gateway-front@.service — public-TLS front for the loopback gateway.
+#
+# This is a USER-LINGER service. Install to ~/.config/systemd/user/ and run
+# with `systemctl --user`, NEVER as a system unit and NEVER with sudo. The
+# instance name is the PUBLIC listen port, e.g. `systemctl --user enable
+# --now z23-fleet-gateway-front@<front-port>`.
+#
+# The front is build/bin/zcl-fleet-front (tools/zcl_fleet_front.c): a tiny
+# project-owned TLS terminator holding one persistent listen socket — no
+# rebind gap — forking at most 16 bounded children that stream bytes both
+# ways to the loopback gateway. It terminates TLS with the operator's
+# existing certificate files, rewrites no bytes, stores nothing, and logs no
+# traffic and no credentials. Requires the gateway unit on the loopback port
+# named in the instance env file. See platform/deploy/fleet-gateway/README.md.
+#
+# Per-instance config OUTSIDE the repo in
+# ~/.config/z23-fleet-gateway/front-<port>.env, e.g.:
+#   GW_PORT=<gw-port>
+#   FRONT_CERT=%h/.zclassic-c23/ssl/fullchain.pem
+#   FRONT_KEY=%h/.zclassic-c23/ssl/privkey.pem
+#   FRONT_HOST=*           (public deploy: every address; the default
+#                          below binds loopback, which only qualification uses)
+#   GW_HOST=127.0.0.1      (optional; must stay loopback)
+# NOTE: 443 stays with the node front. This front uses
+# a HIGH port so it needs no capability and never contends with it.
+
+[Unit]
+Description=z23 fleet gateway TLS front (public :%i -> loopback gateway)
+Documentation=file:%h/github/zclassic23/platform/deploy/fleet-gateway/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=FRONT_HOST=127.0.0.1
+Environment=GW_HOST=127.0.0.1
+Environment=FRONT_PORT=%i
+EnvironmentFile=-%h/.config/z23-fleet-gateway/front-%i.env
+# Literal absolute path; a box whose checkout lives elsewhere overrides it,
+# together with the host/port variables above:
+#   systemctl --user edit z23-fleet-gateway-front@<front-port>
+ExecStart=%h/github/zclassic23/build/bin/zcl-fleet-front ${FRONT_HOST} ${FRONT_PORT} ${GW_HOST} ${GW_PORT} ${FRONT_CERT} ${FRONT_KEY}
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
