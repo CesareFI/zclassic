@@ -60,17 +60,60 @@
  * DIRECTION FORMAT. The Muse executor's machine header at the top of the
  * body, then a blank line, then the prompt:
  *
- *   muse-workspace: /abs/path/to/worktree     (absolute, existing dir)
+ *   muse-workspace: receiver | . | /abs/path  (a selector, or a local path)
  *   muse-scope: src/                          (repo-relative, no "..")
  *   muse-gate: group_name                     (a test group name)
  *   muse-model: model-id                      (optional)
  *   muse-kind: file|doc                       (optional, default file)
+ *   muse-sha: <7..40 hex>                      (optional HEAD pin)
  *
  *   <prompt>
  *
  * A malformed direction is refused here, before any row is queued, so
  * nothing is ever spawned for it. muse-scope becomes the queue row's
  * `path` and muse-gate its `group`.
+ *
+ * THE WIRE CARRIES A SELECTOR; THE RECEIVER OWNS RESOLUTION. A remote
+ * sender cannot name this box's filesystem: it does not know it, and
+ * dev.agent.mail refuses a body mentioning an absolute path outside the
+ * caller's own checkout — correctly, and that rule is NOT weakened here. So
+ * `muse-workspace` carries a LOGICAL selector, the literal word `receiver`
+ * (`.` is accepted as the same thing), and this receiver resolves it to the
+ * ONE workspace the OPERATOR named when starting the loop. The resolved
+ * ABSOLUTE path is written into the brief the queue hands the worker, so
+ * the worker and the Muse executor need no change at all, and muse-scope
+ * stays relative to that workspace. An absolute `muse-workspace` still
+ * works exactly as before for the same-box case.
+ *
+ * WHAT IS HONOURED FROM THE WIRE, AND NOTHING ELSE. One known selector.
+ * Anything else — a path-shaped word, a selector this box does not know, a
+ * traversal — is refused with a typed reason, so no sender can steer this
+ * receiver at a directory the operator did not configure. With no workspace
+ * configured a selector directive is refused, never resolved against a cwd,
+ * a $HOME or a discovered checkout. The configured workspace is
+ * canonicalized (realpath) and must BE its own canonical path, so a ".."
+ * segment or a symlink escape fails closed rather than silently resolving
+ * elsewhere. It must exist, be a directory, and be a git checkout whose
+ * HEAD resolves. An optional `muse-sha` must name that HEAD (full or
+ * prefix) or the directive is refused — that is what lets a client pin the
+ * exact image it is certifying. And the resolved workspace's pre-state must
+ * be clean: tracked paths diverging from its index refuse EARLY, here,
+ * before a queue row exists, while muse_run's own `git status` stays the
+ * authoritative gate immediately before a turn.
+ *
+ * EVERY RESOLUTION IS A FILE READ. .git (directory or gitfile), HEAD, the
+ * loose ref or packed-refs, and the DIRC index. No git, no spawn, no shell:
+ * a beat can never block on a subprocess, which is the whole reason this
+ * loop can promise intake never stalls.
+ *
+ * RECEIVED IS NOT BRIEF. Because the brief is rewritten with a resolved
+ * path, the received bytes are stored beside it (<ref>.received) and the
+ * duplicate-versus-conflict decision is taken against THOSE. Comparing a
+ * replay against the rewritten brief would report a false conflict for a
+ * byte-identical retry, which would break at-most-once by refusing honest
+ * work. A ref that is already known is answered from its stored record
+ * WITHOUT being resolved again, so a receiver restarted against a different
+ * workspace can never move decided work into it.
  *
  * SINGLE INSTANCE. <state>/receive/receive.lock (flock, non-blocking, held
  * for the whole drive), the same precedent as the worker's worker.lock. A
@@ -143,6 +186,8 @@
 #include "command/native_fleet.h"
 
 #include "base/hex.h"
+#include "base/safe_alloc.h"
+#include "base/serialize_le.h"
 #include "config/command_catalog.h"
 #include "json/json.h"
 #include "kernel/command_registry.h"
@@ -178,6 +223,10 @@
 #define RCV_SCOPE "send"
 #define RCV_ROWS_MAX 128u
 #define RCV_BODY_MAX 4097u
+/* The resolved brief is the received body with the workspace selector
+ * replaced by an absolute path, so it is bounded by the mail body cap plus
+ * one path. */
+#define RCV_BRIEF_MAX (RCV_BODY_MAX + ZCL_DEVAGENT_WS_PATH_MAX + 32u)
 #define RCV_REF_MAX 64u
 #define RCV_NAME_MAX 48u
 #define RCV_INPUT_CAP 16384u
@@ -583,16 +632,409 @@ static long long rcv_sub_int(const struct rcv_sub *s, const char *key,
     return (long long)json_get_int(v);
 }
 
+/* ── one workspace, observed from files alone ──────────────────────────────
+ * A REMOTE sender never carries a foreign absolute path, so the receiver has
+ * to answer three questions about the workspace IT chose: is this really a
+ * git checkout, which commit is it on, and was it clean before the turn.
+ * All three are answered by reading files — .git (directory or gitfile),
+ * HEAD, the loose ref or packed-refs, and the DIRC index — because this leaf
+ * spawns nothing and a beat must never wait on a subprocess.
+ */
+
+#define RCV_PATH_MAX ZCL_DEVAGENT_WS_PATH_MAX
+#define RCV_DIRTY_NAMED 3        /* offending paths carried in the record */
+#define RCV_INDEX_BYTES_MAX (64u * 1024u * 1024u)
+#define RCV_INDEX_ENTRIES_MAX 1000000u
+
+static bool rcv_copy(char *out, size_t cap, const char *s)
+{
+    int n = snprintf(out, cap, "%s", s ? s : "");
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool rcv_join(char *out, size_t cap, const char *a, const char *b)
+{
+    int n = snprintf(out, cap, "%s/%s", a, b);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* The first line of a small text file, trailing blanks and CR/LF trimmed.
+ * False when the file is absent, unreadable, or empty. */
+static bool rcv_first_line(const char *path, char *out, size_t cap)
+{
+    FILE *f;
+    size_t n;
+    if (!path || !out || cap < 2 || cap > (size_t)INT_MAX)
+        return false;
+    out[0] = '\0';
+    f = fopen(path, "rb");
+    if (!f)
+        return false;
+    if (!fgets(out, (int)cap, f)) {
+        (void)fclose(f);
+        out[0] = '\0';
+        return false;
+    }
+    (void)fclose(f);
+    n = strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' ||
+                     out[n - 1] == ' ' || out[n - 1] == '\t'))
+        out[--n] = '\0';
+    return out[0] != '\0';
+}
+
+/* `want` lowercase hex digits at s. Uppercase is deliberately NOT accepted:
+ * git writes object ids lowercase, and accepting both spellings would make
+ * two different strings name one commit. */
+static bool rcv_hex_n(const char *s, size_t want)
+{
+    size_t i;
+    if (!s)
+        return false;
+    for (i = 0; i < want; i++) {
+        char c = s[i];
+        if ((c < '0' || c > '9') && (c < 'a' || c > 'f'))
+            return false;
+    }
+    return true;
+}
+
+static bool rcv_hex40(const char *s)
+{
+    return rcv_hex_n(s, 40) && s[40] == '\0';
+}
+
+/* <ws>/.git is either the git directory itself or a "gitdir: <path>" file a
+ * linked worktree leaves behind. This answers with the git directory of
+ * THIS worktree, never a guess about a sibling. */
+static bool rcv_git_dir(const char *ws, char *out, size_t cap)
+{
+    char dot[RCV_PATH_MAX + 8];
+    char line[RCV_PATH_MAX + 16];
+    if (!rcv_join(dot, sizeof(dot), ws, ".git"))
+        return false;
+    if (rcv_is_dir(dot))
+        return rcv_copy(out, cap, dot);
+    if (!rcv_first_line(dot, line, sizeof(line)) ||
+        strncmp(line, "gitdir: ", 8) != 0 || !line[8])
+        return false;
+    if (line[8] == '/')
+        return rcv_copy(out, cap, line + 8);
+    return rcv_join(out, cap, ws, line + 8);
+}
+
+/* A linked worktree keeps its own HEAD in its admin directory and shares the
+ * repository's refs through the common directory that <admin>/commondir
+ * names. A main worktree has no commondir file and is its own common dir. */
+static bool rcv_common_dir(const char *gitdir, char *out, size_t cap)
+{
+    char path[RCV_PATH_MAX + 32];
+    char line[RCV_PATH_MAX + 16];
+    if (!rcv_join(path, sizeof(path), gitdir, "commondir") ||
+        !rcv_first_line(path, line, sizeof(line)))
+        return rcv_copy(out, cap, gitdir);
+    if (line[0] == '/')
+        return rcv_copy(out, cap, line);
+    return rcv_join(out, cap, gitdir, line);
+}
+
+/* "<40 hex> <refname>" rows. A peeled "^<hex>" row names a tag's target,
+ * not the ref, so it never matches the refname test above it. */
+static bool rcv_packed_head(const char *common, const char *ref, char *out,
+                            size_t cap)
+{
+    char path[RCV_PATH_MAX + 32];
+    char line[1024];
+    FILE *f;
+    size_t rn = strlen(ref);
+    bool found = false;
+    if (!rcv_join(path, sizeof(path), common, "packed-refs"))
+        return false;
+    f = fopen(path, "rb");
+    if (!f)
+        return false;
+    while (!found && fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = '\0';
+        if (!rcv_hex_n(line, 40) || line[40] != ' ')
+            continue;
+        if (strcmp(line + 41, ref) != 0)
+            continue;
+        line[40] = '\0';
+        found = rcv_copy(out, cap, line);
+    }
+    (void)fclose(f);
+    return found;
+}
+
+/* One ref, from the worktree's own git dir first (a per-worktree ref lives
+ * there), then the shared loose ref, then packed-refs. */
+static bool rcv_ref_head(const char *gitdir, const char *common,
+                         const char *ref, char *out, size_t cap)
+{
+    char path[RCV_PATH_MAX + 256];
+    char line[256];
+    if (rcv_join(path, sizeof(path), gitdir, ref) &&
+        rcv_first_line(path, line, sizeof(line)) && rcv_hex40(line))
+        return rcv_copy(out, cap, line);
+    if (rcv_join(path, sizeof(path), common, ref) &&
+        rcv_first_line(path, line, sizeof(line)) && rcv_hex40(line))
+        return rcv_copy(out, cap, line);
+    return rcv_packed_head(common, ref, out, cap);
+}
+
+/* The workspace's HEAD commit: a detached HEAD is the 40 hex itself, and a
+ * symbolic one is followed into its ref. No spawn, no git, no guess. */
+static bool rcv_head_of(const char *gitdir, char *out, size_t cap)
+{
+    char path[RCV_PATH_MAX + 32];
+    char common[RCV_PATH_MAX + 32];
+    char line[1024];
+    if (!rcv_join(path, sizeof(path), gitdir, "HEAD") ||
+        !rcv_first_line(path, line, sizeof(line)))
+        return false;
+    if (rcv_hex40(line))
+        return rcv_copy(out, cap, line);
+    if (strncmp(line, "ref: ", 5) != 0 || !line[5])
+        return false;
+    if (!rcv_common_dir(gitdir, common, sizeof(common)))
+        return false;
+    return rcv_ref_head(gitdir, common, line + 5, out, cap);
+}
+
+/* ── the DIRC index: the tree id and the tracked-path pre-state ────────── */
+
+/* One index entry's fields, already bounds-checked. The index is
+ * big-endian throughout and goes through base's one codec. */
+struct rcv_idx_row {
+    uint32_t mode;
+    uint32_t size;
+    uint32_t mtime;
+    int stage;
+    const unsigned char *oid; /* 20 bytes, borrowed from the mapping */
+    char name[4096];
+    size_t bytes; /* this entry's on-disk size, padded */
+};
+
+static int rcv_be16(const unsigned char *p)
+{
+    return (int)p[0] * 256 + (int)p[1];
+}
+
+/* Decode one v2/v3 entry at p with `avail` bytes left. v4's
+ * prefix-compressed names are NOT decoded here; the caller refuses that
+ * version outright rather than guessing at a partial file list. */
+static bool rcv_idx_row(const unsigned char *p, size_t avail, uint32_t ver,
+                        struct rcv_idx_row *row)
+{
+    size_t nlen, fixed;
+    int flags, ext;
+    if (avail < 64u)
+        return false;
+    flags = rcv_be16(p + 60);
+    ext = (ver >= 3u && (flags & 0x4000) != 0) ? 2 : 0;
+    fixed = 62u + (size_t)ext;
+    nlen = (size_t)(flags & 0xFFF);
+    if (nlen == 0xFFFu) {
+        const unsigned char *nul;
+        if (avail <= fixed)
+            return false;
+        nul = memchr(p + fixed, 0, avail - fixed);
+        if (!nul)
+            return false;
+        nlen = (size_t)(nul - (p + fixed));
+    }
+    if (nlen == 0 || nlen >= sizeof(row->name) || fixed + nlen + 1u > avail)
+        return false;
+    memcpy(row->name, p + fixed, nlen);
+    row->name[nlen] = '\0';
+    row->mode = zcl_read_u32_be(p + 24);
+    row->size = zcl_read_u32_be(p + 36);
+    row->mtime = zcl_read_u32_be(p + 8);
+    row->stage = (flags >> 12) & 3;
+    row->oid = p + 40;
+    row->bytes = (fixed + nlen + 8u) & ~(size_t)7u;
+    return row->bytes <= avail;
+}
+
+/* True when the worktree file still matches what the index recorded. This is
+ * git's own stat shortcut — type, size, exec bit, mtime seconds — and its
+ * limits are stated in the struct rcv_workspace contract. */
+static bool rcv_entry_clean(const char *ws, const struct rcv_idx_row *row)
+{
+    char path[RCV_PATH_MAX + sizeof(row->name) + 2u];
+    struct stat st;
+    uint32_t kind = row->mode & 0170000u;
+    if (row->stage != 0)
+        return false; /* an unmerged path is never a clean pre-state */
+    if (kind == 0160000u)
+        return true; /* a gitlink has no worktree file of its own here */
+    if (!rcv_join(path, sizeof(path), ws, row->name) || lstat(path, &st) != 0)
+        return false;
+    if (kind == 0120000u)
+        return S_ISLNK(st.st_mode) && (uint32_t)st.st_size == row->size;
+    if (!S_ISREG(st.st_mode) || (uint32_t)st.st_size != row->size)
+        return false;
+    if (((st.st_mode & 0111u) != 0u) != ((row->mode & 0111u) != 0u))
+        return false;
+    return (uint32_t)st.st_mtime == (uint32_t)row->mtime;
+}
+
+/* Fold one entry into the staged tree id: mode, path and object id only, so
+ * two boxes holding the same staged content answer the same digest. The
+ * index's stat data is deliberately NOT folded in — it differs per box. */
+static void rcv_idx_fold(struct sha3_256_ctx *tree,
+                         const struct rcv_idx_row *row)
+{
+    char head[24];
+    int n = snprintf(head, sizeof(head), "%06o ", (unsigned)(row->mode &
+                                                             0177777u));
+    if (n <= 0)
+        return;
+    sha3_256_write(tree, (const unsigned char *)head, (size_t)n);
+    sha3_256_write(tree, (const unsigned char *)row->name,
+                   strlen(row->name) + 1u);
+    sha3_256_write(tree, row->oid, 20u);
+}
+
+/* Record an offending path. Every divergence is counted; the first few are
+ * named, because a refusal that says only "dirty" cannot be acted on. */
+static void rcv_dirty_name(struct rcv_workspace *w, const char *name)
+{
+    size_t used = strlen(w->dirty_names);
+    size_t room = sizeof(w->dirty_names) - used;
+    w->dirty++;
+    if (w->dirty > RCV_DIRTY_NAMED || strlen(name) + 2u >= room)
+        return;
+    (void)snprintf(w->dirty_names + used, room, "%s%s", used ? "," : "",
+                   name);
+}
+
+/* Walk every entry: fold the tree id and compare the pre-state. False when
+ * the file desyncs at any point, which fails closed rather than reporting a
+ * clean tree off a partial read. */
+static bool rcv_idx_walk(const unsigned char *buf, size_t n, uint32_t ver,
+                         const char *ws, struct rcv_workspace *w)
+{
+    struct sha3_256_ctx tree;
+    unsigned char sum[SHA3_256_OUTPUT_SIZE];
+    uint32_t count = zcl_read_u32_be(buf + 8), i;
+    size_t off = 12u;
+    if (count > RCV_INDEX_ENTRIES_MAX)
+        return false;
+    sha3_256_init(&tree);
+    w->dirty = 0;
+    for (i = 0; i < count; i++) {
+        struct rcv_idx_row row;
+        if (off >= n || !rcv_idx_row(buf + off, n - off, ver, &row))
+            return false;
+        rcv_idx_fold(&tree, &row);
+        if (!rcv_entry_clean(ws, &row))
+            rcv_dirty_name(w, row.name);
+        off += row.bytes;
+    }
+    sha3_256_finalize(&tree, sum);
+    zcl_hex_encode(sum, sizeof(sum), w->tree);
+    w->tracked = (long long)count;
+    return true;
+}
+
+/* Read the whole index once. A v4 index is refused rather than misread: its
+ * names are prefix-compressed, and a reader that guessed would report a
+ * short file list, which here would mean calling a dirty tree clean. */
+static unsigned char *rcv_idx_load(const char *path, size_t *out_n)
+{
+    unsigned char *buf;
+    struct stat st;
+    FILE *f;
+    *out_n = 0;
+    if (stat(path, &st) != 0 || st.st_size <= 0 ||
+        (unsigned long long)st.st_size > RCV_INDEX_BYTES_MAX)
+        return NULL;
+    buf = zcl_malloc((size_t)st.st_size, "devagent_receive.git_index");
+    if (!buf)
+        return NULL;
+    f = fopen(path, "rb");
+    if (!f) {
+        free(buf);
+        return NULL;
+    }
+    *out_n = fread(buf, 1, (size_t)st.st_size, f);
+    (void)fclose(f);
+    return buf;
+}
+
+static void rcv_idx_scan(const char *gitdir, const char *ws,
+                         struct rcv_workspace *w)
+{
+    char path[RCV_PATH_MAX + 32];
+    unsigned char *buf;
+    size_t n = 0;
+    uint32_t ver;
+    if (!rcv_join(path, sizeof(path), gitdir, "index"))
+        return;
+    buf = rcv_idx_load(path, &n);
+    if (!buf)
+        return;
+    ver = (n >= 32u && memcmp(buf, "DIRC", 4) == 0) ? zcl_read_u32_be(buf + 4)
+                                                    : 0u;
+    if ((ver == 2u || ver == 3u) && !rcv_idx_walk(buf, n - 20u, ver, ws, w)) {
+        w->dirty = -1;
+        w->tree[0] = '\0';
+    }
+    free(buf);
+}
+
+bool zcl_devagent_workspace_observe(const char *dir, bool scan_tracked,
+                                    struct rcv_workspace *out)
+{
+    char gitdir[RCV_PATH_MAX + 64];
+    char real[PATH_MAX];
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    out->dirty = -1;
+    if (!dir || dir[0] != '/' || strlen(dir) >= sizeof(out->root))
+        return false;
+    out->directory = rcv_is_dir(dir);
+    out->canonical = out->directory && realpath(dir, real) != NULL &&
+                     strcmp(real, dir) == 0;
+    if (!rcv_copy(out->root, sizeof(out->root),
+                  out->canonical ? real : dir))
+        return false;
+    if (!out->canonical)
+        return true;
+    out->checkout = rcv_git_dir(out->root, gitdir, sizeof(gitdir)) &&
+                    rcv_head_of(gitdir, out->head, sizeof(out->head));
+    if (out->checkout && scan_tracked)
+        rcv_idx_scan(gitdir, out->root, out);
+    return true;
+}
+
 /* ── the Muse task direction ───────────────────────────────────────────── */
 
+/* The one logical selector a remote sender may put on the wire. "receiver"
+ * is the spelling to write; "." is accepted as the same thing, because a
+ * sender that means "wherever you are" already spells that "." everywhere
+ * else in this tree. Neither names a path, so neither can name a path on
+ * this box. */
+static bool rcv_ws_selector(const char *v)
+{
+    return v && (strcmp(v, "receiver") == 0 || strcmp(v, ".") == 0);
+}
+
 struct rcv_direction {
-    char workspace[1024];
+    char workspace[1024]; /* exactly what the wire carried */
     char scope[512];
     char gate[64];
     char model[160];
     char kind[8];
-    const char *prompt; /* borrows the pulled row's body */
-    char why[48];       /* refusal detail: a bare token, never a path */
+    char sha[65];         /* optional muse-sha pin, 7..40 lowercase hex */
+    bool selector;        /* the workspace value is a logical selector */
+    const char *prompt;   /* borrows the pulled row's body */
+    char why[64];         /* refusal detail: a bare token, never a path */
+    char code[48];        /* the typed refusal code for that detail */
 };
 
 /* Copy one header value, trimming trailing blanks and a CR. */
@@ -644,6 +1086,7 @@ static bool rcv_dir_header(const char *line, size_t len,
             {"gate", d->gate, sizeof(d->gate)},
             {"model", d->model, sizeof(d->model)},
             {"kind", d->kind, sizeof(d->kind)},
+            {"sha", d->sha, sizeof(d->sha)},
         };
         size_t i;
         for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
@@ -661,12 +1104,39 @@ static bool rcv_dir_header(const char *line, size_t len,
     return false;
 }
 
-/* The three required fields plus the two optional ones. */
+/* The workspace field's SHAPE only. Two spellings reach here and nothing
+ * else does: a logical selector, which this receiver resolves for itself
+ * once the ref is known to be new work, and an absolute path, which is the
+ * same-box case and keeps exactly the rule it always had. Resolution is
+ * deliberately NOT done here, so that a ref this receiver has already
+ * decided is never re-resolved against a changed configuration. */
+static bool rcv_dir_workspace_ok(struct rcv_direction *d)
+{
+    if (rcv_ws_selector(d->workspace)) {
+        d->selector = true;
+        return true;
+    }
+    if (d->workspace[0] == '/' && rcv_is_dir(d->workspace))
+        return true;
+    (void)snprintf(d->code, sizeof(d->code),
+                   "RECEIVE_WORKSPACE_SELECTOR_UNKNOWN");
+    (void)snprintf(d->why, sizeof(d->why),
+                   "muse-workspace-is-not-a-known-selector");
+    return false;
+}
+
+/* The three required fields plus the three optional ones. */
 static bool rcv_dir_fields_ok(struct rcv_direction *d)
 {
-    if (!d->workspace[0] || d->workspace[0] != '/' ||
-        !rcv_is_dir(d->workspace)) {
+    if (!d->workspace[0]) {
         (void)snprintf(d->why, sizeof(d->why), "muse-workspace");
+        return false;
+    }
+    if (!rcv_dir_workspace_ok(d))
+        return false;
+    if (d->sha[0] && !(strlen(d->sha) >= 7 && strlen(d->sha) <= 40 &&
+                       rcv_hex_n(d->sha, strlen(d->sha)))) {
+        (void)snprintf(d->why, sizeof(d->why), "muse-sha");
         return false;
     }
     if (!rcv_scope_ok(d->scope)) {
@@ -706,6 +1176,7 @@ static bool rcv_direction_parse(const char *body, struct rcv_direction *d)
     if (!d)
         return false;
     memset(d, 0, sizeof(*d));
+    (void)snprintf(d->code, sizeof(d->code), "RECEIVE_DIRECTION_MALFORMED");
     (void)snprintf(d->why, sizeof(d->why), "empty-body");
     if (!body || !body[0])
         return false;
@@ -816,6 +1287,10 @@ static bool rcv_outcome_names(const char *path, const char *ref)
 struct rcv_ctx {
     struct rcv_paths p;
     char receiver[RCV_NAME_MAX + 1];
+    /* The ONE workspace this receiver was started against, named by the
+     * operator. Empty means unconfigured, and a selector directive is then
+     * refused rather than resolved against a guess. */
+    char workspace[ZCL_DEVAGENT_WS_PATH_MAX];
     bool dry; /* status: decide and count, write and post nothing */
     struct rcv_beat_stats *st;
 };
@@ -906,18 +1381,26 @@ static void rcv_answer_refuse(struct rcv_ctx *c, const struct rcv_row *v,
     rcv_answer(c, v, "problem", body);
 }
 
+/* `evidence` is the scanner-safe workspace record (selector, path digest,
+ * HEAD, tree id) — empty for a ref decided before this receiver resolved
+ * workspaces. The resolved absolute path itself is deliberately absent: the
+ * mail leaf refuses a body naming a filesystem path, that rule is not
+ * weakened here, and a peer that never learns this box's paths is the whole
+ * point of receiver-side resolution. The digest is what lets a sender prove
+ * which workspace answered it. */
 static void rcv_answer_accept(struct rcv_ctx *c, const struct rcv_row *v,
                               const char *src, const struct rcv_direction *d,
-                              long long seq, const char *stage)
+                              long long seq, const char *stage,
+                              const char *evidence)
 {
-    char body[1024];
+    char body[2048];
     char sha[65];
     rcv_brief_digest(v->body, sha);
     if (snprintf(body, sizeof(body),
                  "receiver=%s\nstate=accepted\nsrc=%s\nqueue_seq=%lld\n"
-                 "stage=%s\nkind=%s\ngate=%s\nbrief_sha3=%s\n",
-                 c->receiver, src, seq, stage, d->kind, d->gate, sha) >=
-        (int)sizeof(body))
+                 "stage=%s\nkind=%s\ngate=%s\nbrief_sha3=%s\n%s",
+                 c->receiver, src, seq, stage, d->kind, d->gate, sha,
+                 evidence ? evidence : "") >= (int)sizeof(body))
         return;
     rcv_answer(c, v, "claim", body);
 }
@@ -952,65 +1435,306 @@ static long long rcv_queue_post(const char *ref, const struct rcv_direction *d,
     return seq;
 }
 
+/* ── resolution: the wire carries a selector, this box owns the path ────── */
+
+/* The optional muse-sha pin. A client that is certifying one exact image
+ * says so, and a workspace that is not on that commit is refused rather
+ * than quietly worked in. A prefix is admitted only when it actually names
+ * the resolved HEAD, which for one workspace is exactly "is a prefix". */
+static const char *rcv_ws_pin(const struct rcv_direction *d,
+                              const struct rcv_workspace *w, char *detail,
+                              size_t cap)
+{
+    if (!d->sha[0])
+        return NULL;
+    if (!w->head[0]) {
+        (void)snprintf(detail, cap, "workspace-head-unresolvable");
+        return "RECEIVE_WORKSPACE_SHA_MISMATCH";
+    }
+    if (strncmp(w->head, d->sha, strlen(d->sha)) != 0) {
+        (void)snprintf(detail, cap, "muse-sha-is-not-the-resolved-head");
+        return "RECEIVE_WORKSPACE_SHA_MISMATCH";
+    }
+    return NULL;
+}
+
+/* The pre-state requirement, on the RESOLVED workspace. muse_run runs the
+ * authoritative `git status` before it starts a turn; this is the cheap,
+ * spawn-free, EARLY refusal so a dirty box never gets as far as a queue row.
+ * An unreadable pre-state fails closed. The offending paths are named in
+ * the log and in the workspace record, never in the answer: a mail body
+ * carrying a path is refused by dev.agent.mail, so an answer naming them
+ * would be dropped and the sender would hear nothing at all. */
+static const char *rcv_ws_prestate(const struct rcv_workspace *w,
+                                   char *detail, size_t cap)
+{
+    if (w->dirty < 0) {
+        (void)snprintf(detail, cap, "workspace-pre-state-unreadable");
+        return "RECEIVE_WORKSPACE_DIRTY";
+    }
+    if (w->dirty == 0)
+        return NULL;
+    LOG_WARN(RCV_LOG,
+             "workspace pre-state is not clean: %lld tracked path(s) "
+             "diverge from the index (%s) under %s",
+             w->dirty, w->dirty_names, w->root);
+    (void)snprintf(detail, cap, "dirty-tracked-paths-%lld", w->dirty);
+    return "RECEIVE_WORKSPACE_DIRTY";
+}
+
+/* Turn the direction's workspace field into one real absolute path. NULL
+ * means admitted and `w` carries the evidence; anything else is the typed
+ * refusal code, with `detail` naming the reason in one bare token.
+ *
+ * This is the ONLY place a selector becomes a path, and it runs ONLY for a
+ * ref this receiver has not already decided — which is what keeps a
+ * configuration change from re-resolving, or re-running, settled work. */
+static const char *rcv_ws_resolve(struct rcv_ctx *c,
+                                  const struct rcv_direction *d,
+                                  struct rcv_workspace *w, char *detail,
+                                  size_t cap)
+{
+    if (!d->selector) {
+        /* The same-box case, unchanged: the sender named the path, so this
+         * receiver vouches for nothing it did not already vouch for. HEAD
+         * is read anyway — three file reads, no index walk — so that an
+         * explicit muse-sha pin still binds. */
+        (void)zcl_devagent_workspace_observe(d->workspace, false, w);
+        if (!rcv_copy(w->root, sizeof(w->root), d->workspace))
+            return "RECEIVE_WORKSPACE_INVALID";
+        return rcv_ws_pin(d, w, detail, cap);
+    }
+    if (!c->workspace[0]) {
+        (void)snprintf(detail, cap, "no-workspace-configured");
+        return "RECEIVE_WORKSPACE_UNCONFIGURED";
+    }
+    if (!zcl_devagent_workspace_observe(c->workspace, true, w)) {
+        (void)snprintf(detail, cap, "configured-workspace-unusable");
+        return "RECEIVE_WORKSPACE_INVALID";
+    }
+    if (!w->directory) {
+        (void)snprintf(detail, cap, "configured-workspace-absent");
+        return "RECEIVE_WORKSPACE_MISSING";
+    }
+    if (!w->canonical) {
+        (void)snprintf(detail, cap, "configured-workspace-not-canonical");
+        return "RECEIVE_WORKSPACE_ESCAPE";
+    }
+    if (!w->checkout) {
+        (void)snprintf(detail, cap, "configured-workspace-not-a-checkout");
+        return "RECEIVE_WORKSPACE_NOT_A_CHECKOUT";
+    }
+    {
+        const char *why = rcv_ws_pin(d, w, detail, cap);
+        return why ? why : rcv_ws_prestate(w, detail, cap);
+    }
+}
+
+/* The brief the queue hands the worker: the received text with the
+ * workspace header replaced by the RESOLVED absolute path and every other
+ * byte untouched. The worker, the executor and muse-scope therefore keep
+ * seeing exactly what they always saw. */
+static bool rcv_brief_render(const char *body, const char *resolved,
+                             char *out, size_t cap)
+{
+    static const char key[] = "muse-workspace:";
+    const char *line = body, *tail;
+    int n;
+    while (strncmp(line, key, sizeof(key) - 1) != 0) {
+        const char *nl = strchr(line, '\n');
+        if (!nl || nl == line)
+            return false; /* no workspace header in the header block */
+        line = nl + 1;
+    }
+    tail = strchr(line, '\n');
+    tail = tail ? tail + 1 : line + strlen(line);
+    n = snprintf(out, cap, "%.*smuse-workspace: %s\n%s",
+                 (int)(line - body), body, resolved, tail);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* ── the receiver's per-ref record ─────────────────────────────────────── */
+
+/* The three files one ref owns. Splitting RECEIVED from BRIEF is what keeps
+ * at-most-once honest: the brief is rewritten with a real absolute path for
+ * the executor, so a replay of the SAME row has to be compared against the
+ * received bytes or every replay would read as a conflict. */
+struct rcv_ref_files {
+    char brief[4096];
+    char received[4104];
+    char evidence[4104];
+};
+
+static bool rcv_ref_files_of(const struct rcv_ctx *c, const char *ref,
+                             struct rcv_ref_files *f)
+{
+    int a = snprintf(f->brief, sizeof(f->brief), "%s/%s.brief",
+                     c->p.briefdir, ref);
+    int b = snprintf(f->received, sizeof(f->received), "%s/%s.received",
+                     c->p.briefdir, ref);
+    int e = snprintf(f->evidence, sizeof(f->evidence), "%s/%s.evidence",
+                     c->p.briefdir, ref);
+    return a > 0 && (size_t)a < sizeof(f->brief) && b > 0 &&
+           (size_t)b < sizeof(f->received) && e > 0 &&
+           (size_t)e < sizeof(f->evidence);
+}
+
+/* What this receiver resolved, in its own words. Every line but the last is
+ * scanner-safe and is replayed verbatim into the answer; the final
+ * `workspace=` line holds the resolved absolute path and stays on this box.
+ * The tree id is the index-projected staged tree, NOT
+ * tools/dev/source-identity.sh's source_id_sha256 — that one hashes the
+ * built source set and cannot be had without a heavy call, and a beat never
+ * waits on one. */
+static bool rcv_evidence_render(const struct rcv_direction *d,
+                                const struct rcv_workspace *w,
+                                const char *brief, char *out, size_t cap)
+{
+    char wsd[65], bd[65];
+    int n;
+    rcv_brief_digest(w->root, wsd);
+    rcv_brief_digest(brief, bd);
+    n = snprintf(out, cap,
+                 "workspace_selector=%s\nworkspace_sha3=%s\n"
+                 "workspace_head=%s\nworkspace_tree_sha3=%s\n"
+                 "resolved_sha3=%s\nworkspace=%s\n",
+                 d->selector ? d->workspace : "absolute", wsd,
+                 w->head[0] ? w->head : "none", w->tree[0] ? w->tree : "none",
+                 bd, w->root);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* The scanner-safe prefix of that record: every line above `workspace=`.
+ * The fresh answer and a replay's answer are both built from it, so a
+ * reconciled ref answers the evidence it was actually decided with. */
+static void rcv_evidence_fragment(const char *record, char *out, size_t cap)
+{
+    const char *cut = strstr(record, "\nworkspace=");
+    size_t n = cut ? (size_t)(cut - record) + 1u : strlen(record);
+    out[0] = '\0';
+    if (n >= cap)
+        return;
+    memcpy(out, record, n);
+    out[n] = '\0';
+}
+
+static void rcv_evidence_replay(const char *path, char *out, size_t cap)
+{
+    char record[1024];
+    out[0] = '\0';
+    if (rcv_read_file(path, record, sizeof(record)))
+        rcv_evidence_fragment(record, out, cap);
+}
+
+/* ── idempotence and conflict ──────────────────────────────────────────── */
+
 /* The ref is already known to the queue, a run dir, or an outcome. Exactly
- * two answers: the byte-identical body reconciles against the existing
- * record and queues nothing; a different body is a conflict and executes
- * nothing. */
+ * two answers: the byte-identical RECEIVED body reconciles against the
+ * existing record and queues nothing; a different body is a conflict and
+ * executes nothing. Nothing here re-resolves a selector and nothing here
+ * rewrites a brief, so a receiver restarted against a DIFFERENT workspace
+ * cannot move settled work into it — the decided ref keeps the path it was
+ * decided with, or it is a conflict.
+ *
+ * A ref briefed before this receiver kept the received bytes has no
+ * .received file; it is compared against the brief, exactly as it always
+ * was, so an upgrade mid-flight turns no replay into a false conflict. */
 static void rcv_reconcile(struct rcv_ctx *c, const struct rcv_row *v,
                           const char *src, const struct rcv_direction *d,
-                          const struct rcv_known *k, const char *briefpath)
+                          const struct rcv_known *k,
+                          const struct rcv_ref_files *f)
 {
-    char stored[RCV_BODY_MAX];
-    if (!rcv_read_file(briefpath, stored, sizeof(stored))) {
+    char stored[RCV_BRIEF_MAX];
+    char evidence[1024];
+    const char *path = rcv_exists(f->received) ? f->received : f->brief;
+    if (!rcv_read_file(path, stored, sizeof(stored))) {
         rcv_answer_refuse(c, v, src, "RECEIVE_REF_CONFLICT",
                           "ref-claimed-without-a-brief-from-this-receiver");
         return;
     }
     if (strcmp(stored, v->body) != 0) {
         rcv_answer_refuse(c, v, src, "RECEIVE_REF_CONFLICT",
-                          "stored-brief-differs");
+                          "received-body-differs");
         return;
     }
     c->st->reconciled++;
-    rcv_answer_accept(c, v, src, d, k->seq, k->stage);
+    rcv_evidence_replay(f->evidence, evidence, sizeof(evidence));
+    rcv_answer_accept(c, v, src, d, k->seq, k->stage, evidence);
 }
 
-/* Write the brief, post the queue row, then answer — in that order, so an
- * accept can never be posted before the queue actually holds the work. */
-static void rcv_to_work(struct rcv_ctx *c, const struct rcv_row *v,
-                        const char *src, const struct rcv_direction *d)
+/* Write the received bytes, the resolved brief and the record, post the
+ * queue row, then answer — in that order, so an accept can never be posted
+ * before the queue actually holds the work, and no half state can be
+ * mistaken for a decided ref: until the queue row exists the ref is still
+ * unknown, and the next beat rewrites all three files identically. */
+static void rcv_install(struct rcv_ctx *c, const struct rcv_row *v,
+                        const char *src, const struct rcv_direction *d,
+                        const struct rcv_workspace *w,
+                        const struct rcv_ref_files *f)
 {
-    char briefpath[4096];
-    struct rcv_known k;
+    char brief[RCV_BRIEF_MAX];
+    char record[1024], evidence[1024];
     long long seq;
-    if (snprintf(briefpath, sizeof(briefpath), "%s/%s.brief", c->p.briefdir,
-                 v->ref) >= (int)sizeof(briefpath)) {
-        rcv_answer_refuse(c, v, src, "RECEIVE_STATE_UNWRITABLE",
-                          "brief-path-too-long");
+    if (!rcv_brief_render(v->body, w->root, brief, sizeof(brief)) ||
+        !rcv_evidence_render(d, w, brief, record, sizeof(record))) {
+        rcv_answer_refuse(c, v, src, "RECEIVE_WORKSPACE_INVALID",
+                          "resolved-brief-too-long");
         return;
     }
-    rcv_ref_known(c, v->ref, &k);
-    if (k.known) {
-        rcv_reconcile(c, v, src, d, &k, briefpath);
-        return;
-    }
-    if (c->dry) {
-        c->st->admitted++;
-        return;
-    }
-    if (!rcv_write_atomic(briefpath, v->body, strlen(v->body))) {
+    if (!rcv_write_atomic(f->received, v->body, strlen(v->body)) ||
+        !rcv_write_atomic(f->brief, brief, strlen(brief)) ||
+        !rcv_write_atomic(f->evidence, record, strlen(record))) {
         rcv_answer_refuse(c, v, src, "RECEIVE_STATE_UNWRITABLE",
                           "brief-store");
         return;
     }
-    seq = rcv_queue_post(v->ref, d, briefpath);
+    seq = rcv_queue_post(v->ref, d, f->brief);
     if (seq < 0) {
         rcv_answer_refuse(c, v, src, "RECEIVE_QUEUE_REFUSED",
                           "queue-post-refused");
         return;
     }
     c->st->admitted++;
-    rcv_answer_accept(c, v, src, d, seq, "queued");
+    rcv_evidence_fragment(record, evidence, sizeof(evidence));
+    LOG_INFO(RCV_LOG, "ref %s admitted: selector %s resolved to %s at %s",
+             v->ref, d->selector ? d->workspace : "absolute", w->root,
+             w->head[0] ? w->head : "an unresolved head");
+    rcv_answer_accept(c, v, src, d, seq, "queued", evidence);
+}
+
+/* Known-ref first, resolution second. That order is the at-most-once
+ * guarantee: a settled ref is answered from its stored record without the
+ * workspace being looked at, let alone resolved again. */
+static void rcv_to_work(struct rcv_ctx *c, const struct rcv_row *v,
+                        const char *src, const struct rcv_direction *d)
+{
+    struct rcv_ref_files f;
+    struct rcv_workspace w;
+    struct rcv_known k;
+    char detail[64];
+    const char *why;
+    memset(&w, 0, sizeof(w));
+    if (!rcv_ref_files_of(c, v->ref, &f)) {
+        rcv_answer_refuse(c, v, src, "RECEIVE_STATE_UNWRITABLE",
+                          "brief-path-too-long");
+        return;
+    }
+    rcv_ref_known(c, v->ref, &k);
+    if (k.known) {
+        rcv_reconcile(c, v, src, d, &k, &f);
+        return;
+    }
+    detail[0] = '\0';
+    why = rcv_ws_resolve(c, d, &w, detail, sizeof(detail));
+    if (why) {
+        rcv_answer_refuse(c, v, src, why, detail);
+        return;
+    }
+    if (c->dry) {
+        c->st->admitted++;
+        return;
+    }
+    rcv_install(c, v, src, d, &w, &f);
 }
 
 /* The three admission tests, in the order that refuses earliest. */
@@ -1030,7 +1754,7 @@ static void rcv_admit(struct rcv_ctx *c, const struct rcv_row *v,
         return;
     }
     if (!rcv_direction_parse(v->body, &d)) {
-        rcv_answer_refuse(c, v, src, "RECEIVE_DIRECTION_MALFORMED", d.why);
+        rcv_answer_refuse(c, v, src, d.code, d.why);
         return;
     }
     rcv_to_work(c, v, src, &d);
@@ -1178,6 +1902,7 @@ static long long rcv_drive_posix(const struct rcv_drive_opts *opts,
     if (lockfd < 0)
         return -1;
     (void)snprintf(c.receiver, sizeof(c.receiver), "%s", opts->receiver);
+    (void)snprintf(c.workspace, sizeof(c.workspace), "%s", opts->workspace);
     c.st = st;
     g_rcv_term = 0;
     old_term = signal(SIGTERM, rcv_on_term);
@@ -1257,11 +1982,35 @@ static const char *rcv_lock_state(const struct rcv_paths *p)
 /* ONE definition of the public entry point, above the platform split: the
  * arms differ only in how the singleton and the watch are held, and two
  * non-static bodies for one name is what check-arm-symbol-single refuses. */
+/* The operator's workspace flag, checked for SHAPE at the door so a typo is
+ * loud at start instead of quietly refusing every selector directive later:
+ * absolute, bounded, no ".." segment, no trailing slash. Existence,
+ * canonicality and checkout-ness are re-derived per directive instead,
+ * because a workspace can be moved out from under a resident. Empty is a
+ * legitimate state: a receiver with no workspace refuses selectors. */
+static bool rcv_ws_flag_ok(const char *s)
+{
+    size_t i, n;
+    if (!s || !s[0])
+        return true;
+    n = strlen(s);
+    if (s[0] != '/' || n >= ZCL_DEVAGENT_WS_PATH_MAX || s[n - 1] == '/')
+        return false;
+    for (i = 0; i + 1 < n; i++) {
+        if (s[i] != '.' || s[i + 1] != '.')
+            continue;
+        if (i == 0 || s[i - 1] == '/')
+            return false;
+    }
+    return true;
+}
+
 long long zcl_devagent_receive_drive(const struct rcv_drive_opts *opts,
                                      struct rcv_beat_stats *st)
 {
     struct rcv_beat_stats local;
-    if (!opts || !rcv_name_ok(opts->receiver))
+    if (!opts || !rcv_name_ok(opts->receiver) ||
+        !rcv_ws_flag_ok(opts->workspace))
         return -1;
     if (!st) {
         memset(&local, 0, sizeof(local));
@@ -1273,16 +2022,20 @@ long long zcl_devagent_receive_drive(const struct rcv_drive_opts *opts,
 /* ── status: facts only, writes nothing ────────────────────────────────── */
 
 long long zcl_devagent_receive_survey(const char *receiver,
+                                      const char *workspace,
                                       struct rcv_beat_stats *st)
 {
     struct rcv_ctx c;
     memset(&c, 0, sizeof(c));
-    if (!receiver || !rcv_name_ok(receiver) || !st)
+    if (!receiver || !rcv_name_ok(receiver) || !st ||
+        !rcv_ws_flag_ok(workspace))
         return -1;
     memset(st, 0, sizeof(*st));
     if (!rcv_paths_resolve(&c.p))
         return -1;
     (void)snprintf(c.receiver, sizeof(c.receiver), "%s", receiver);
+    (void)snprintf(c.workspace, sizeof(c.workspace), "%s",
+                   workspace ? workspace : "");
     c.dry = true;
     c.st = st;
     rcv_beat(&c);
@@ -1303,7 +2056,8 @@ static void rcv_push_stats(struct zcl_command_reply *reply,
     (void)json_push_kv_int(&reply->data, "intake_failed", st->intake_failed);
 }
 
-static void rcv_status(const char *receiver, struct zcl_command_reply *reply)
+static void rcv_status(const char *receiver, const char *workspace,
+                       struct zcl_command_reply *reply)
 {
     struct rcv_beat_stats st;
     struct rcv_paths p;
@@ -1313,7 +2067,7 @@ static void rcv_status(const char *receiver, struct zcl_command_reply *reply)
                  "platform_state_root");
         return;
     }
-    if (zcl_devagent_receive_survey(receiver, &st) < 0) {
+    if (zcl_devagent_receive_survey(receiver, workspace, &st) < 0) {
         rcv_fail(reply, "RECEIVE_SURVEY_FAILED", "status",
                  "cannot survey the receiver state", p.dir);
         return;
@@ -1321,6 +2075,11 @@ static void rcv_status(const char *receiver, struct zcl_command_reply *reply)
     (void)json_push_kv_str(&reply->data, "leaf", RCV_LEAF);
     (void)json_push_kv_str(&reply->data, "state", "surveyed");
     (void)json_push_kv_str(&reply->data, "receiver", receiver);
+    (void)json_push_kv_str(&reply->data, "workspace",
+                           workspace && workspace[0] ? workspace : "");
+    (void)json_push_kv_str(&reply->data, "workspace_state",
+                           workspace && workspace[0] ? "configured"
+                                                     : "unconfigured");
     (void)json_push_kv_str(&reply->data, "lock", rcv_lock_state(&p));
     (void)json_push_kv_str(&reply->data, "mail",
                            rcv_is_dir(p.maildir) ? "present" : "absent");
@@ -1331,7 +2090,8 @@ static void rcv_status(const char *receiver, struct zcl_command_reply *reply)
 }
 
 static void rcv_run(const struct zcl_command_request *request,
-                    const char *receiver, struct zcl_command_reply *reply)
+                    const char *receiver, const char *workspace,
+                    struct zcl_command_reply *reply)
 {
     struct rcv_drive_opts opts;
     struct rcv_beat_stats st;
@@ -1339,6 +2099,7 @@ static void rcv_run(const struct zcl_command_request *request,
     memset(&opts, 0, sizeof(opts));
     memset(&st, 0, sizeof(st));
     (void)snprintf(opts.receiver, sizeof(opts.receiver), "%s", receiver);
+    (void)snprintf(opts.workspace, sizeof(opts.workspace), "%s", workspace);
     opts.deadline_s = rcv_in_int(request, "deadline_s", 300, 1, 86400);
     opts.wait_ms = rcv_in_int(request, "wait_ms", 1000, 50, 60000);
     opts.max_beats = rcv_in_int(request, "max_beats", 0, 0, 1000000);
@@ -1359,6 +2120,7 @@ static void rcv_run(const struct zcl_command_request *request,
     (void)json_push_kv_str(&reply->data, "leaf", RCV_LEAF);
     (void)json_push_kv_str(&reply->data, "state", "done");
     (void)json_push_kv_str(&reply->data, "receiver", opts.receiver);
+    (void)json_push_kv_str(&reply->data, "workspace", opts.workspace);
     rcv_push_stats(reply, &st);
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
@@ -1367,7 +2129,7 @@ static void rcv_run(const struct zcl_command_request *request,
 void zcl_native_handle_dev_agent_receive(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
-    const char *action, *receiver;
+    const char *action, *receiver, *workspace;
     if (!reply)
         return;
     if (!request || !request->input) {
@@ -1385,8 +2147,17 @@ void zcl_native_handle_dev_agent_receive(
                  "input.receiver missing or misspelled");
         return;
     }
+    workspace = rcv_in_str(request, "workspace");
+    if (!rcv_ws_flag_ok(workspace)) {
+        rcv_fail(reply, "BAD_INPUT", "run",
+                 "workspace names the ONE workspace this receiver resolves "
+                 "a directive's `muse-workspace: receiver` selector to: an "
+                 "absolute path with no \"..\" segment and no trailing slash",
+                 "input.workspace is not an absolute canonical-shaped path");
+        return;
+    }
     if (strcmp(action, "status") == 0) {
-        rcv_status(receiver, reply);
+        rcv_status(receiver, workspace, reply);
         return;
     }
     if (strcmp(action, "run") != 0) {
@@ -1399,6 +2170,6 @@ void zcl_native_handle_dev_agent_receive(
              "the resident receiver needs POSIX flock and signals",
              "run the receiver on a POSIX host");
 #else
-    rcv_run(request, receiver, reply);
+    rcv_run(request, receiver, workspace, reply);
 #endif
 }

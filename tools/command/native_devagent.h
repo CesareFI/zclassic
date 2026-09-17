@@ -153,13 +153,62 @@ bool zcl_devagent_worker_muse_executor(const struct wkr_job *job,
  * "the owner has named this sender" and NOT "this peer was authenticated" —
  * nothing in this tree signs a peer's mail row today. */
 
-/* Bounded drive options. `receiver` is this box's mail identity. */
+/* Bounded drive options. `receiver` is this box's mail identity, and
+ * `workspace` is the ONE workspace this receiver was started against — the
+ * operator names it, never a sender. Empty means "no workspace configured",
+ * and a directive naming a workspace selector is then refused rather than
+ * resolved against a guess. */
 struct rcv_drive_opts {
     char receiver[56];
+    char workspace[1024];
     long long deadline_s; /* stop beating after this many seconds */
     long long wait_ms;    /* idle ceiling for one mail-watch wait */
     long long max_beats;  /* stop after this many beats (0 = deadline only) */
 };
+
+/* ── one workspace's observed identity ────────────────────────────────────
+ * What the receiver can learn about a workspace from FILES ALONE — no git
+ * spawn, no shell, so a beat can never block on a subprocess. Every field
+ * is evidence; the policy that turns it into an admission or a refusal
+ * lives in the receive leaf.
+ *
+ * `dirty` is git's own stat shortcut over the index: type, size, exec bit
+ * and mtime seconds per tracked path, plus any unmerged stage. It catches a
+ * modified, deleted or retyped tracked path without hashing a byte, and it
+ * deliberately does NOT see an untracked file, an already-staged change, or
+ * a rewrite inside the index's own second that preserves the size. That is
+ * why it is the receiver's cheap EARLY refusal and muse_run's own
+ * `git status` stays the authoritative pre-state gate. -1 means the
+ * pre-state could not be read at all, which fails closed. */
+#define ZCL_DEVAGENT_WS_PATH_MAX 1024u
+#define ZCL_DEVAGENT_WS_NAMES_MAX 256u
+
+struct rcv_workspace {
+    char root[ZCL_DEVAGENT_WS_PATH_MAX]; /* realpath of the asked-for dir */
+    char head[41];   /* HEAD commit, 40 lowercase hex, or "" when unresolved */
+    char tree[65];   /* SHA3-256 over the index's (mode, path, object id)
+                      * rows in index order — the staged tree's identity,
+                      * equal on two boxes holding the same staged content.
+                      * NOT tools/dev/source-identity.sh's source_id_sha256
+                      * and not z23-dev agentbuild's either; those hash the
+                      * built source set, this hashes the index. "" when the
+                      * index was not walked. */
+    char dirty_names[ZCL_DEVAGENT_WS_NAMES_MAX]; /* first few, comma-joined */
+    long long dirty;  /* -1 unreadable/unscanned, 0 clean, else path count */
+    long long tracked; /* index entries walked */
+    bool directory;   /* the asked-for path is an existing directory */
+    bool canonical;   /* realpath(dir) is dir itself: no "..", no symlink */
+    bool checkout;    /* a git directory resolved for THIS worktree */
+};
+
+/* Observe `dir` without changing it. `scan_tracked` also walks the git
+ * index for the tree id and the tracked-path pre-state; false skips that
+ * walk and leaves dirty = -1 and tree = "". Returns false only on a bad
+ * argument or an over-long path; an absent, non-canonical, or non-checkout
+ * directory is reported through the fields, because the caller — not this
+ * observer — decides what to refuse. */
+bool zcl_devagent_workspace_observe(const char *dir, bool scan_tracked,
+                                    struct rcv_workspace *out);
 
 /* What one drive (or one read-only survey) observed. Counts only; no row
  * content ever leaves the loop. */
@@ -182,9 +231,14 @@ long long zcl_devagent_receive_drive(const struct rcv_drive_opts *opts,
 
 /* Decide exactly what one beat would decide, and write and post nothing.
  * This is what the status action reports; it creates no directory, no
- * brief, no queue row, no marker and no mail. Returns beats surveyed (1),
- * or -1 on a bad receiver name or an unresolvable state root. */
+ * brief, no queue row, no marker and no mail. `workspace` is the same
+ * operator-named workspace the resident runs with: a survey that is not
+ * told it decides exactly as an unconfigured receiver would, because
+ * guessing the resident's configuration would make status a fiction.
+ * Returns beats surveyed (1), or -1 on a bad receiver name or an
+ * unresolvable state root. */
 long long zcl_devagent_receive_survey(const char *receiver,
+                                      const char *workspace,
                                       struct rcv_beat_stats *st);
 
 /* ── single-line source mutation ──────────────────────────────────────────

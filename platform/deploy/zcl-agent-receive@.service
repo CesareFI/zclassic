@@ -14,6 +14,13 @@ Description=Z23 resident mail receiver for agent identity %i (admits directives,
 # that same ref with the queue sequence and the brief digest. A refusal
 # answers under the same ref with its reason. That is the whole job.
 #
+# WHERE THE WORK HAPPENS. A remote sender cannot carry this box's paths — it
+# does not know them, and dev.agent.mail refuses a body that names one — so
+# a directive names the workspace logically (`muse-workspace: receiver`) and
+# THIS box resolves it to the one workspace Z23_RECEIVE_WORKSPACE names
+# below. The receiver writes the resolved absolute path into the brief, so
+# the worker and the Muse executor still receive a real absolute path.
+#
 # WHAT IT DOES NOT DO. It does not execute anything, build anything, grade
 # anything, or spawn a process. Execution belongs to the dev.agent.worker
 # resident loop, which posts the result row under the same ref. This unit
@@ -85,11 +92,31 @@ MemorySwapMax=128M
 TasksMax=32
 OOMScoreAdjust=500
 
+# THE ONE WORKSPACE THIS RECEIVER RESOLVES TO. A remote sender writes
+# `muse-workspace: receiver` — a logical selector, never a path — and this
+# box turns that into exactly this directory. The OPERATOR names it here,
+# because nothing a peer writes may ever name a local path. Point one
+# instance at one workspace; a second workspace is a second box's business,
+# not a routing table.
+#
+# It must be an absolute path with no ".." segment, and it must be its own
+# canonical path: a symlinked component fails closed rather than resolving
+# somewhere the operator did not name. Override it per instance without
+# editing this file:
+#   systemctl --user edit zcl-agent-receive@box-a
+#   [Service]
+#   Environment=Z23_RECEIVE_WORKSPACE=/home/you/.z23/lanes/yourlane
+#
+# Leave it empty and the receiver is simply unconfigured: it still admits an
+# absolute same-box direction, and it refuses every selector directive with
+# RECEIVE_WORKSPACE_UNCONFIGURED instead of guessing a checkout.
+Environment=Z23_RECEIVE_WORKSPACE=%h/github/zclassic23
+
 # deadline_s bounds a single drive; Restart=on-failure plus this unit's
 # restart limit is what makes the loop resident across days, and every
 # decision is re-derived from files on the next drive, so a restart between
 # beats neither loses a ref nor executes one twice.
-ExecStart=%h/github/zclassic23/build/bin/z23-dev dev agent receive run --receiver=%i --deadline_s=86400 --wait_ms=1000
+ExecStart=%h/github/zclassic23/build/bin/z23-dev dev agent receive run --receiver=%i --workspace=${Z23_RECEIVE_WORKSPACE} --deadline_s=86400 --wait_ms=1000
 
 # The resident handles SIGTERM cooperatively: it stops taking new work at the
 # next check, the watcher wait returns within its stop-sample slice, and the
