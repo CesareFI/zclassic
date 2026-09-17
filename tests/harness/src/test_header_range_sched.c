@@ -39,9 +39,35 @@
 #include "test/test_core.h"
 #include "services/header_range_scheduler.h"
 
+static int test_empty_reply_releases_span(void)
+{
+    printf("header_range_sched: empty reply releases span immediately... ");
+    struct header_range_scheduler s = {0};
+    int32_t anchors[] = {50000};
+    int64_t now = 1000000;
+    hrs_init(&s, 30 * 1000000);
+    hrs_plan(&s, 0, 100000, anchors, 1);
+
+    int first = hrs_assign(&s, 11, now);
+    bool ok = first >= 0;
+    ok = ok && hrs_peer_span(&s, 11, now, NULL, NULL);
+    ok = ok && hrs_release_peer(&s, 11) == 1;
+    ok = ok && !hrs_peer_span(&s, 11, now, NULL, NULL);
+    ok = ok && hrs_free_span_count(&s) == 2;
+
+    int replacement = hrs_assign(&s, 22, now);
+    ok = ok && replacement == first;
+    ok = ok && hrs_peer_span(&s, 22, now, NULL, NULL);
+    ok = ok && hrs_release_peer(&s, 11) == 0;
+    hrs_reset(&s);
+    if (ok) printf("OK\n"); else printf("FAIL\n");
+    return ok ? 0 : 1;
+}
+
 int test_header_range_sched(void)
 {
     int failures = 0;
+    failures += test_empty_reply_releases_span();
 
     /* ── 1. Parallelize gate ─────────────────────────────────────── */
     printf("header_range_sched: should_parallelize gate... ");

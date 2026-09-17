@@ -255,6 +255,27 @@ size_t hrs_sweep_expired(struct header_range_scheduler *s, int64_t now_us,
     return n;
 }
 
+size_t hrs_release_peer(struct header_range_scheduler *s, int32_t peer_id)
+{
+    if (!s || !s->inited)
+        return 0;
+
+    size_t released = 0;
+    zcl_mutex_lock(&s->lock);
+    for (size_t i = 0; i < s->n_spans; i++) {
+        if (s->spans[i].assigned && !s->spans[i].completed &&
+            s->spans[i].peer_id == peer_id) {
+            s->spans[i].assigned = false;
+            s->spans[i].peer_id = 0;
+            s->spans[i].deadline_us = 0;
+            s->stat_reassigns++;
+            released++;
+        }
+    }
+    zcl_mutex_unlock(&s->lock);
+    return released;
+}
+
 bool hrs_peer_span(struct header_range_scheduler *s, int32_t peer_id,
                    int64_t now_us, int32_t *out_lo, int32_t *out_hi)
 {

@@ -1262,6 +1262,16 @@ bool push_verified_header_announcement(struct msg_processor *mp,
     return true;
 }
 
+static void hrs_release_empty_response(struct p2p_node *node, uint64_t count)
+{
+    if (count != 0)
+        return;
+    struct header_range_scheduler *sched = header_range_scheduler_global();
+    if (hrs_release_peer(sched, node->id) > 0)
+        event_emitf(EV_HEADERS_REJECTED, (uint32_t)node->id,
+                    "empty header response released range span");
+}
+
 bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                      struct byte_stream *s)
 {
@@ -1493,6 +1503,7 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
      * and inflate total_headers_delivered (deflecting worst-peer
      * eviction onto honest peers). Only new-to-index headers count. */
     syncsvc_note_headers_received(node, newly_added);
+    hrs_release_empty_response(node, count);
 
     /* Arm/disarm the recovery-probe pending flag: an all-rejected
      * bad-prevblk batch arms it (so the periodic per-peer tick re-probes
