@@ -37,7 +37,6 @@
 #include "net/checkpoint_header_fetch.h"
 #include "net/header_serve_repair.h"
 #include "platform/time_compat.h"
-#include "services/header_range_scheduler.h"  // lib-layer-ok:net3-range-parallel-header-planner
 #include <signal.h>
 extern volatile sig_atomic_t g_shutdown_requested;
 #include <stdio.h>
@@ -1262,39 +1261,6 @@ bool push_verified_header_announcement(struct msg_processor *mp,
     return true;
 }
 
-static void push_getheaders_followup(struct msg_processor *mp,
-                                     struct p2p_node *node,
-                                     struct block_index *from,
-                                     int our_height);
-
-static void hrs_release_terminal_response(struct p2p_node *node,
-                                          const struct sync_header_batch *batch,
-                                          size_t accepted,
-                                          uint64_t count)
-{
-    if (!batch->should_release_range)
-        return;
-    struct header_range_scheduler *sched = header_range_scheduler_global();
-    if (hrs_release_peer(sched, node->id) > 0)
-        event_emitf(EV_HEADERS_REJECTED, (uint32_t)node->id,
-                    "terminal header response released range span "
-                    "accepted=%zu total=%llu", accepted,
-                    (unsigned long long)count);
-}
-
-static void hrs_note_response_progress(struct p2p_node *node, size_t accepted)
-{
-    if (accepted == 0)
-        return;
-    (void)hrs_note_peer_progress(header_range_scheduler_global(), node->id,
-                                 platform_time_monotonic_us());
-}
-
-size_t mp_header_range_peer_disconnected(uint32_t peer_id)
-{
-    return hrs_release_peer(header_range_scheduler_global(), (int32_t)peer_id);
-}
-
 bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                      struct byte_stream *s)
 {
@@ -1553,9 +1519,8 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                                        pindex_last, sync_get_state(),
                                        bi, tip, our_height,
                                        hashes, heights, max_collect);
-        hrs_note_response_progress(node, accepted);
-        hrs_release_terminal_response(node, &header_plan.batch,
-                                      accepted, count);
+        msg_header_range_note_response(node, &header_plan.batch,
+                                       accepted, count);
         if (seq_count > 0 && hashes && heights) {
             memcpy(hashes, seq_hashes, seq_count * sizeof(struct uint256));
             memcpy(heights, seq_heights, seq_count * sizeof(int32_t));
@@ -1889,8 +1854,8 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                 struct block_index *restart_tip = active_chain_tip(
                     &mp->main_state->chain_active);
                 if (restart_tip && restart_tip->phashBlock)
-                    push_getheaders_followup(mp, node, restart_tip,
-                                             follow_height);
+                    msg_push_getheaders_followup(mp, node, restart_tip,
+                                                 follow_height);
                 else
                     push_getheaders(mp, node);
             }
@@ -1920,14 +1885,14 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
              * moves), so the skip would ping-pong the identical request
              * with that peer forever. Such peers take the pindex_last
              * continuation below, which terminates at their tip. */
-            push_getheaders_followup(mp, node,
-                                     mp->main_state->pindex_best_header,
-                                     follow_height);
+            msg_push_getheaders_followup(mp, node,
+                                         mp->main_state->pindex_best_header,
+                                         follow_height);
         } else {
             /* Advance from pindex_last — the actual last header the peer
              * sent.  Using pindex_best_header caused infinite loops after
              * snapshot/LDB import when heights were scrambled. */
-            push_getheaders_followup(mp, node, pindex_last, follow_height);
+            msg_push_getheaders_followup(mp, node, pindex_last, follow_height);
         }
     }
 
@@ -2181,195 +2146,6 @@ void push_getheaders_span(struct msg_processor *mp, struct p2p_node *node,
     }
     stream_free(&s);
     block_locator_free(&loc);
-}
-
-/* Resolve a span-boundary height to a locally-known block hash: a compiled
- * checkpoint hash (held WITHOUT the intervening headers — the crux that
- * lets disjoint peers fork across a cold gap), else a block we already
- * hold at or below our frontier. Returns false when the height is neither
- * a checkpoint nor in our index (never fabricates a hash we lack). */
-static bool hrs_resolve_anchor_hash(struct msg_processor *mp, int32_t height,
-                                    int our_height, struct uint256 *out)
-{
-    if (!mp || !out)
-        return false;
-    if (checkpoints_hash_at_height(&mp->params->checkpointData, height, out))
-        return true;
-    if (height <= our_height) {
-        struct block_index *bi =
-            active_chain_at(&mp->main_state->chain_active, height);
-        if (bi && bi->phashBlock) {
-            *out = *bi->phashBlock;
-            return true;
-        }
-    }
-    return false;
-}
-
-bool msg_range_continuation_stop(struct msg_processor *mp,
-                                 struct p2p_node *node,
-                                 int our_height,
-                                 int64_t now_us,
-                                 struct uint256 *stop_hash)
-{
-    int32_t hi = 0;
-    if (!mp || !node || !stop_hash || now_us < 0)
-        return false;
-    if (!hrs_peer_span(header_range_scheduler_global(), node->id,
-                       now_us, NULL, &hi))
-        return false;
-    return hrs_resolve_anchor_hash(mp, hi, our_height, stop_hash);
-}
-
-static void push_getheaders_followup(struct msg_processor *mp,
-                                     struct p2p_node *node,
-                                     struct block_index *from,
-                                     int our_height)
-{
-    struct uint256 stop_hash;
-    int64_t now_us = platform_time_monotonic_us();
-    if (from && from->phashBlock &&
-        msg_range_continuation_stop(mp, node, our_height, now_us,
-                                    &stop_hash)) {
-        push_getheaders_span(mp, node, from->phashBlock, &stop_hash);
-        return;
-    }
-    push_getheaders_from(mp, node, from);
-}
-
-bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
-                                       struct p2p_node *node,
-                                       int our_height, int64_t now_us)
-{
-    if (!mp || !node || !mp->main_state || !mp->net_mgr || !mp->params)
-        return false;
-    /* The header-band backfill owns the getheaders anchor while a band
-     * hole is open (exec_getheaders_action drives it). Range-parallel
-     * feeds the band, never fights it: stand down entirely until the band
-     * closes. */
-    if (syncsvc_header_band_hole_open())
-        return false;
-    /* Only a fast-sync-capable outbound peer participates. Legacy peers
-     * cap batches at 160 and never learn the NODE_ZCL23 span protocol —
-     * they keep the existing single-peer path. */
-    if (node->inbound || node->state < PEER_SYNCING_HEADERS ||
-        !peer_supports_fast_sync(node->services))
-        return false;
-
-    struct main_state *ms = mp->main_state;
-    int target = node->starting_height;
-    if (ms->pindex_best_header &&
-        ms->pindex_best_header->nHeight > target)
-        target = ms->pindex_best_header->nHeight;
-    /* Count connected fast-sync-capable outbound peers. */
-    int fast_peers = 0;
-    zcl_mutex_lock(&mp->net_mgr->cs_nodes);
-    for (size_t pi = 0; pi < mp->net_mgr->num_nodes; pi++) {
-        struct p2p_node *n = mp->net_mgr->nodes[pi];
-        if (n && !n->inbound && !n->disconnect &&
-            n->state >= PEER_ACTIVE &&
-            peer_supports_fast_sync(n->services)) {
-            fast_peers++;
-            target = hrs_include_peer_target(target, n->starting_height);
-        }
-    }
-    zcl_mutex_unlock(&mp->net_mgr->cs_nodes);
-
-    int32_t gap = (int32_t)(target - our_height);
-
-    if (!hrs_should_parallelize(fast_peers, gap, 2000))
-        return false;
-
-    /* Anchors = compiled checkpoints strictly inside (our_height, target).
-     * These are the only hashes we hold without having synced the
-     * intervening headers, so they are the disjoint fork points that let N
-     * peers cover N different checkpoint intervals at once. */
-    const struct checkpoint_data *cpd = &mp->params->checkpointData;
-    int32_t anchors[HRS_MAX_SPANS];
-    size_t n_anchors = 0;
-    for (int i = 0; cpd && cpd->entries && i < cpd->nEntries &&
-                    n_anchors < HRS_MAX_SPANS; i++) {
-        int h = cpd->entries[i].height;
-        if (h > our_height && h < target)
-            anchors[n_anchors++] = (int32_t)h;
-    }
-
-    struct header_range_scheduler *sched = header_range_scheduler_global();
-    hrs_plan(sched, (int32_t)our_height, target, anchors, n_anchors);
-
-    /* Advance completions from our current header frontier so already-synced
-     * spans free their peer slots before we (re)assign. */
-    if (ms->pindex_best_header)
-        hrs_note_frontier(sched, ms->pindex_best_header->nHeight);
-
-    /* Sweep every expired span back into the free pool so a stalling peer
-     * never stalls the whole sync, and demote EVERY reported stalling
-     * owner — not just this peer. hrs_sweep_expired() is GLOBAL: it frees
-     * every expired span in the table regardless of who is calling. A
-     * "demote self, then discard the sweep's stalled-owner buffer"
-     * pattern silently drops other peers' timeouts whenever some OTHER
-     * peer's periodic tick happens to run the sweep first — by the time
-     * the actually-stalled peer gets its own turn, hrs_peer_owns_expired_
-     * span() is already false (its span was freed by someone else's
-     * sweep) and it is never demoted. Reading the whole stalled-owner
-     * buffer here means whichever peer's tick performs the sweep
-     * correctly demotes every owner it evicted, including itself. */
-    int32_t stalled_ids[HRS_MAX_SPANS];
-    size_t n_stalled = hrs_sweep_expired(sched, now_us, stalled_ids, HRS_MAX_SPANS);
-    /* The sweep above is the entire remedy, and it has already happened:
-     * every expired span is back in the free pool and will be handed to
-     * whichever peer asks next. That is a resource action — it bounds how
-     * long one span can be held — and it deprioritises a slow peer
-     * naturally, by giving its work to someone else.
-     *
-     * This used to ALSO charge PEER_OFFENCE_TIMEOUT to every swept owner.
-     * That was a punishment for being slow, not for misbehaving. The
-     * deadline is 30 seconds of wall clock for a span of up to ~2000
-     * headers, which is an assumption about the peer's disk and link, not
-     * a protocol rule: an honest node on a 7200rpm disk moving under
-     * 2 MB/s misses it routinely, and so does a fast peer whose reply we
-     * were too busy to read. Scoring it made ban-score a measure of
-     * hardware, which pushes the network toward whoever has the fastest
-     * storage — the opposite of what a full node should require.
-     *
-     * The signal is kept, not discarded: the stall is still reported, so
-     * an operator can still see which peers are slow and we can still
-     * learn where the code assumes fast storage. It just no longer counts
-     * toward a ban. */
-    for (size_t si = 0; si < n_stalled; si++) {
-        int32_t sid = stalled_ids[si];
-        bool dup = false;
-        for (size_t sj = 0; sj < si; sj++) {
-            if (stalled_ids[sj] == sid) { dup = true; break; }
-        }
-        if (dup)
-            continue;
-        event_emitf(EV_HEADERS_REJECTED, (uint32_t)sid,
-                    "header span reclaimed from slow peer %d "
-                    "(deadline missed; span reassigned, not scored)",
-                    (int)sid);
-    }
-
-    /* This peer's span: keep an existing live one, else claim a free span. */
-    int32_t lo, hi;
-    if (!hrs_peer_span(sched, node->id, now_us, &lo, &hi)) {
-        int idx = hrs_assign(sched, node->id, now_us);
-        if (idx < 0)
-            return false;   /* no free span — fall back to single-peer path */
-        if (!hrs_peer_span(sched, node->id, now_us, &lo, &hi))
-            return false;
-    }
-
-    struct uint256 start_hash, stop_hash;
-    if (!hrs_resolve_anchor_hash(mp, lo, our_height, &start_hash))
-        return false;       /* cannot anchor — fall back */
-    bool have_stop = hrs_resolve_anchor_hash(mp, hi, our_height, &stop_hash);
-
-    push_getheaders_span(mp, node, &start_hash, have_stop ? &stop_hash : NULL);
-    LOG_INFO("headers",
-             "range-parallel: peer=%d span=[%d,%d] fast_peers=%d gap=%d",
-             node->id, lo, hi, fast_peers, gap);
-    return true;
 }
 
 void exec_getheaders_action(struct msg_processor *mp,

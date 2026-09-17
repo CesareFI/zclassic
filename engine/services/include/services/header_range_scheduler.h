@@ -25,9 +25,9 @@
  *
  * This module is the pure "brain": fixed-capacity, allocation-free, and
  * thread-safe (a single mutex around the span table). The net thread wires
- * the decisions to getheaders in msg_headers.c; stall demotion reuses the
- * existing peer_scoring primitive (PEER_OFFENCE_TIMEOUT) — this module
- * never invents its own scoring or ban policy.
+ * the decisions to getheaders in msg_header_range.c. Deadline expiry releases
+ * and reports ownership so another peer can continue; it is a resource
+ * decision, not protocol misbehavior, and never adds peer ban score.
  */
 
 // one-result-type-ok:header-range-scheduler-selectors — every exported

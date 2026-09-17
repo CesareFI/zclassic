@@ -1732,11 +1732,10 @@ static void *thread_socket_handler(void *arg)
                  * dead peer's pieces sit until the 8 s BLOCK_PIECE_TIMEOUT.) */
                 {
                     dl_peer_disconnected(msg_get_download_mgr(),
-                                          (uint32_t)node->id);
+                                           (uint32_t)node->id);
                     mp_block_swarm_peer_disconnected((uint32_t)node->id);
                     mp_header_range_peer_disconnected((uint32_t)node->id);
                 }
-
                 /* Force disconnect — bypass transition validator since this
                  * is cleanup, not a normal state change. The event was
                  * already emitted (EV_TCP_DISCONNECTED above). */

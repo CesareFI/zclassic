@@ -19,6 +19,7 @@
 /* ── Forward declarations for split message handlers ──────────── */
 
 struct sync_getheaders_action;
+struct sync_header_batch;
 
 struct msg_block_acceptance {
     bool reached_peer_tip;
@@ -314,6 +315,14 @@ bool msg_range_continuation_stop(struct msg_processor *mp,
                                  int our_height,
                                  int64_t now_us,
                                  struct uint256 *stop_hash);
+void msg_header_range_note_response(struct p2p_node *node,
+                                    const struct sync_header_batch *batch,
+                                    size_t accepted,
+                                    uint64_t count);
+void msg_push_getheaders_followup(struct msg_processor *mp,
+                                  struct p2p_node *node,
+                                  struct block_index *from,
+                                  int our_height);
 bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
                                        struct p2p_node *node,
                                        int our_height, int64_t now_us);

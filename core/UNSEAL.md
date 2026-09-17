@@ -156,3 +156,11 @@ later lane flips it HARD.
 - 2026-09-14T21:14:03Z — REASON: difficulty_from_bits used Bitcoin's -29 shift base instead of ZClassic powLimit compact exponent 0x1f; historical-block RPC/explorer difficulty rendered 256^2 off (min-diff bits 0x1f07ffff showed 65536.0, legacy 1.0). Display-only math (RPC/explorer/netsplit ratios), not a consensus predicate. Owner unseal grant 2026-09-14 in reply to explicit request.
   old ROOT: 4bf80625c80f0352d8bfb38bee64ff0a94c73045272f64f528fd53f5be6474c9
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T10:38:35Z — REASON: Owner-requested integration of reviewed sync, peer reassignment, and bootstrap reliability fixes; consensus predicates and historical validity unchanged
+  old ROOT: c3090fae6b449bd80dc449c365caa0d452a626402d0deb8c8a77c66f6eafcdf7
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T10:57:51Z — REASON: Owner-requested behavior-preserving extraction of header range scheduling from the oversized legacy network handler; consensus predicates and historical validity unchanged
+  old ROOT: d73606a06d52507671dbf084a9790719aee389dc6c0802787a7d6c978b21035c
+  by: owner unseal ritual (make core-unseal)
