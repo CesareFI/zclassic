@@ -55,10 +55,9 @@ cognition/models/src/agent_session.c:agent_session_authorize_internal:38
 cognition/models/src/zcode_science.c:db_zcode_science_study_list_filtered:18
 cognition/modules/codeindex/src/codeindex.c:codeindex_build_cold_ms:19
 cognition/modules/codeindex/src/codeindex_build.c:ci_rebuild_lock_open:17
-cognition/modules/codeindex/src/codeindex_build.c:codeindex_rebuild_internal:61
-cognition/modules/codeindex/src/codeindex_build.c:collect_dir:20
+cognition/modules/codeindex/src/codeindex_build.c:codeindex_rebuild_internal:58
 cognition/modules/codeindex/src/codeindex_build.c:source_file_sha3:21
-cognition/modules/codeindex/src/codeindex_build_store.c:ci_build_store_memory:28
+cognition/modules/codeindex/src/codeindex_build_store.c:ci_build_store_memory:25
 cognition/modules/codeindex/src/codeindex_build_windows.c:codeindex_rebuild_internal:38
 cognition/modules/codeindex/src/codeindex_build_windows.c:collect_directory:20
 cognition/modules/codeindex/src/codeindex_capability.c:cap_scan_symbols:24
@@ -128,7 +127,7 @@ cognition/modules/codeindex/src/codeindex_scan.c:has_toplevel_eq:18
 cognition/modules/codeindex/src/codeindex_scan.c:scan_refs:21
 cognition/modules/codeindex/src/codeindex_scan_doc.c:capture_doc:22
 cognition/modules/codeindex/src/codeindex_scan_doc.c:ci_file_purpose:40
-cognition/modules/codeindex/src/codeindex_scan_file.c:ci_scan_file:26
+cognition/modules/codeindex/src/codeindex_scan_file.c:ci_scan_file:22
 cognition/modules/codeindex/src/codeindex_search.c:ci_store_search_text:17
 cognition/modules/codeindex/src/codeindex_search.c:codeindex_search_story:28
 cognition/modules/codeindex/src/codeindex_semantic_candidate.c:zcl_code_semantic_candidate_v1_validate:24
@@ -1447,7 +1446,6 @@ engine/composition/src/boot_bundle_fetch.c:bbf_discover_from_peers:28
 engine/composition/src/boot_bundle_fetch.c:bbf_write_directory_hint:27
 engine/composition/src/boot_bundle_fetch.c:boot_bundle_fetch_download:20
 engine/composition/src/boot_bundle_fetch.c:boot_bundle_fetch_maybe:22
-engine/composition/src/boot_bundle_fetch_peer_seeds.c:boot_bundle_fetch_arm_peer_seeds:15
 engine/composition/src/boot_bundle_fetch_probe.c:bbf_probe_directories:16
 engine/composition/src/boot_bundle_fetch_probe.c:bbf_probe_manifest:22
 engine/composition/src/boot_bundle_fetch_seeds.c:bbf_add_connect_seed:19
@@ -3900,7 +3898,6 @@ tools/dev/dev_activation.c:dev_activation_read_gen_link:18
 tools/dev/dev_activation.c:dev_activation_sha256_file:16
 tools/dev/dev_activation.c:dev_derive_paths:19
 tools/dev/dev_activation.c:dev_validate_confinement:29
-tools/dev/dev_activation.c:dev_write_in_progress:11
 tools/dev/dev_activation_stage.c:dev_activation_stage_candidate:39
 tools/dev/dev_activation_verify.c:dev_activation_quarantine:16
 tools/dev/dev_failure_store.c:atomic_replace_at:21

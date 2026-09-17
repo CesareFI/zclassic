@@ -596,8 +596,8 @@ static bool codeindex_rebuild_internal(struct codeindex *ci,
     }
 
     uint8_t built_source_stat[32], built_dep_stat[32];
-    if (!ci_build_store_memory(ci->root, build_start_ms, &store,
-                               built_source_stat, built_dep_stat) ||
+    if (!ci_build_store_memory(ci->root, build_start_ms, NULL, NULL, NULL,
+                               &store, built_source_stat, built_dep_stat) ||
         !ci_store_write_image_child(store, &stage)) {
         failure = "build or serialize Windows staging store failed";
         goto out;

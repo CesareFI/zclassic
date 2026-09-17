@@ -51,7 +51,6 @@ enum {
     MERKLE_TAG_LEAF = 0x10,
     MERKLE_TAG_NODE = 0x11,
 };
-
 enum {
     MERKLE_MAX_DEPTH    = 32,
     MERKLE_NAME_MAX     = 160,
@@ -63,16 +62,6 @@ static const char merkle_snapshot_format[] =
 static const char merkle_snapshot_name[] = "source_tree.merkle";
 static const char merkle_snapshot_seal_domain[] =
     "zcl.codeindex.source_tree.merkle.seal.v1";
-/* ── records ─────────────────────────────────────────────────────────── */
-
-struct ci_merkle {
-    struct merkle_leaf_rec *leaves;
-    uint32_t                nleaves;
-    struct merkle_node_rec *nodes; /* sorted by path; index 0 is the root ("") */
-    uint32_t                nnodes;
-    struct zcl_sha3_digest  root;
-};
-
 /* ── hashing ─────────────────────────────────────────────────────────── */
 
 static void merkle_write_u32le(struct sha3_256_ctx *sha, uint32_t v)
@@ -187,7 +176,8 @@ static bool merkle_leaf_digest(const char *root, const char *relpath,
                                struct zcl_sha3_digest *out,
                                struct zcl_sha3_digest *content_out,
                                uint64_t *out_size,
-                               struct ci_merkle_stat_key *out_key, bool *found)
+                               struct ci_merkle_stat_key *out_key, bool *found,
+                               struct ci_source_cache *source_cache)
 {
     *found = false;
     struct platform_positioned_file file;
@@ -204,7 +194,7 @@ static bool merkle_leaf_digest(const char *root, const char *relpath,
         platform_positioned_file_close(&file);
         LOG_FAIL("codeindex", "merkle stat leaf failed path=%s", relpath);
     }
-
+    size_t cache_mark = ci_source_cache_mark(source_cache);
     struct sha3_256_ctx sha;
     struct sha3_256_ctx content_sha;
     sha3_256_init(&sha);
@@ -229,6 +219,7 @@ static bool merkle_leaf_digest(const char *root, const char *relpath,
         if (got == 0) break;
         sha3_256_write(&sha, buf, (size_t)got);
         sha3_256_write(&content_sha, buf, (size_t)got);
+        ci_source_cache_append(source_cache, buf, (size_t)got);
         total += (uint64_t)got;
     }
     if (ok && (!platform_positioned_file_snapshot(&file, &after) ||
@@ -241,11 +232,13 @@ static bool merkle_leaf_digest(const char *root, const char *relpath,
                before.changed_nanoseconds != after.changed_nanoseconds))
         ok = false;
     platform_positioned_file_close(&file);
-    if (!ok)
+    if (!ok) {
+        ci_source_cache_rollback(source_cache, cache_mark);
         LOG_FAIL("codeindex", "merkle read leaf failed path=%s", relpath);
-
+    }
     sha3_256_finalize(&sha, out->bytes);
     sha3_256_finalize(&content_sha, content_out->bytes);
+    ci_source_cache_commit(source_cache, cache_mark, relpath, content_out->bytes);
     *out_size = total;
     out_key->dev = after.volume;
     out_key->ino = after.file_low;
@@ -701,11 +694,13 @@ struct merkle_build {
     /* the previous generation, or an empty one */
     struct merkle_snapshot    prev;
     bool                      use_prev;
+    uint32_t                  prev_leaf_cursor;
     uint64_t                  captured_sec; /* the second this pass began in */
     /* the frame stack */
     struct merkle_frame       frames[MERKLE_MAX_DEPTH];
     uint32_t                  depth;
     struct ci_merkle_cost     cost;
+    struct ci_source_cache   *source_cache;
 };
 
 static bool merkle_frame_push_child(struct merkle_frame *f,
@@ -884,28 +879,32 @@ static bool merkle_file_key_cb(const char *relpath,
     memset(&leaf, 0, sizeof(leaf));
     ci_cpy(leaf.path, sizeof(leaf.path), relpath);
 
-    const struct merkle_leaf_rec *prev =
-        b->use_prev ? merkle_find_leaf(b->prev.leaves, b->prev.nleaves, relpath)
-                    : NULL;
+    const struct merkle_leaf_rec *prev = b->use_prev
+        ? merkle_snapshot_next_leaf(&b->prev, &b->prev_leaf_cursor, relpath,
+                                    &b->cost.inventory_changed)
+        : NULL;
     if (b->use_prev && !prev)
         b->cost.inventory_changed = true;
     if (prev && memcmp(&prev->key, live, sizeof(*live)) == 0) {
+        ci_source_cache_mark_incomplete(b->source_cache);
         leaf.digest = prev->digest;
         leaf.content_digest = prev->content_digest;
         leaf.size = prev->size;
         leaf.key = prev->key;
+        leaf.source_key = *live;
         leaf.dirty = false;
         b->cost.leaves_reused++;
     } else {
         bool found = false;
         if (!merkle_leaf_digest(b->root, relpath, &leaf.digest,
                                 &leaf.content_digest, &leaf.size,
-                                &leaf.key, &found) || !found) {
+                                &leaf.key, &found, b->source_cache) || !found) {
             b->err = true;
             return false;
         }
         b->cost.files_read++;
         b->cost.bytes_read += leaf.size;
+        leaf.source_key = leaf.key;
         leaf.key.mtime_nsec = ci_merkle_settled_mtime_nsec(
             leaf.key.mtime_sec, leaf.key.mtime_nsec, b->captured_sec);
         /* A re-read whose digest matches the snapshot (a bare `touch`) is not
@@ -943,8 +942,9 @@ static void merkle_build_release(struct merkle_build *b)
 {
     for (uint32_t i = 0; i < MERKLE_MAX_DEPTH; i++) free(b->frames[i].kids);
     merkle_snapshot_free(&b->prev);
+    ci_source_cache_free(b->source_cache);
+    b->source_cache = NULL;
 }
-
 static struct ci_merkle *merkle_run(const char *root, bool use_snapshot,
                                     struct ci_merkle_cost *cost_out)
 {
@@ -955,7 +955,7 @@ static struct ci_merkle *merkle_run(const char *root, bool use_snapshot,
     memset(&b, 0, sizeof(b));
     b.root = root;
     b.captured_sec = use_snapshot ? ci_merkle_capture_second() : 0;
-
+    b.source_cache = ci_source_cache_new();
     if (use_snapshot) {
         bool found = false;
         if (!merkle_snapshot_load(root, &b.prev, &found)) {
@@ -1010,6 +1010,7 @@ static struct ci_merkle *merkle_run(const char *root, bool use_snapshot,
     m->nodes = b.nodes;
     m->nnodes = b.nnodes;
     m->root = root_node.digest;
+    ci_merkle_adopt_source_cache(m, &b.source_cache, b.nleaves);
     qsort(m->nodes, m->nnodes, sizeof(*m->nodes), merkle_node_cmp);
 
     b.cost.files_total = b.nleaves;
@@ -1073,14 +1074,6 @@ struct ci_merkle *ci_merkle_build_cold(const char *root,
                                        struct ci_merkle_cost *cost)
 {
     return merkle_run(root, false, cost);
-}
-
-void ci_merkle_free(struct ci_merkle *m)
-{
-    if (!m) return;
-    free(m->leaves);
-    free(m->nodes);
-    free(m);
 }
 
 /* ── queries ─────────────────────────────────────────────────────────── */
@@ -1218,7 +1211,7 @@ bool ci_merkle_hash_changed_leaf(const char *root, const char *filepath,
     memset(out, 0, sizeof(*out));
     (void)snprintf(out->path, sizeof(out->path), "%s", filepath);
     return merkle_leaf_digest(root, filepath, &out->digest,
-                              &out->content_digest, &out->size, &key, found);
+                              &out->content_digest, &out->size, &key, found, NULL);
 }
 
 int ci_merkle_child_dirs(const struct ci_merkle *m, const char *dirpath,

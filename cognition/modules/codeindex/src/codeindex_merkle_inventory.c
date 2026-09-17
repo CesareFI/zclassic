@@ -5,13 +5,32 @@
 
 #include "util/log_macros.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 struct merkle_inventory_match {
     const struct merkle_snapshot *snap;
+    uint32_t cursor;
     uint32_t seen;
     bool mismatch;
 };
+
+const struct merkle_leaf_rec *merkle_snapshot_next_leaf(
+    const struct merkle_snapshot *snapshot, uint32_t *cursor,
+    const char *path, bool *inventory_changed)
+{
+    while (*cursor < snapshot->nleaves &&
+           strcmp(snapshot->leaves[*cursor].path, path) < 0) {
+        (*cursor)++;
+        *inventory_changed = true;
+    }
+    if (*cursor >= snapshot->nleaves ||
+        strcmp(snapshot->leaves[*cursor].path, path) != 0) {
+        *inventory_changed = true;
+        return NULL;
+    }
+    return &snapshot->leaves[(*cursor)++];
+}
 
 static bool merkle_inventory_key_cb(const char *relpath,
                                     const struct ci_merkle_stat_key *live,
@@ -21,8 +40,8 @@ static bool merkle_inventory_key_cb(const char *relpath,
     if (m->mismatch)
         return false;
     m->seen++;
-    const struct merkle_leaf_rec *prev =
-        merkle_find_leaf(m->snap->leaves, m->snap->nleaves, relpath);
+    const struct merkle_leaf_rec *prev = merkle_snapshot_next_leaf(
+        m->snap, &m->cursor, relpath, &m->mismatch);
     if (!prev || memcmp(&prev->key, live, sizeof(*live)) != 0) {
         m->mismatch = true;
         return false;
@@ -49,7 +68,7 @@ bool ci_merkle_snapshot_inventory_current(const char *root,
 
     *have_snapshot = true;
     struct merkle_inventory_match match = {
-        .snap = &snap, .seen = 0, .mismatch = false,
+        .snap = &snap, .cursor = 0, .seen = 0, .mismatch = false,
     };
     bool enumerated =
         ci_enumerate_merkle_sources(root, merkle_inventory_key_cb, &match);
@@ -71,4 +90,31 @@ bool ci_merkle_snapshot_inventory_current(const char *root,
     *unchanged = true;
     merkle_snapshot_free(&snap);
     return true;
+}
+
+void ci_merkle_free(struct ci_merkle *merkle)
+{
+    if (!merkle) return;
+    free(merkle->leaves);
+    free(merkle->nodes);
+    ci_source_cache_free(merkle->source_cache);
+    free(merkle);
+}
+
+struct ci_source_cache *ci_merkle_take_source_cache(struct ci_merkle *merkle)
+{
+    if (!merkle) return NULL;
+    struct ci_source_cache *cache = merkle->source_cache;
+    merkle->source_cache = NULL;
+    return cache;
+}
+
+void ci_merkle_adopt_source_cache(struct ci_merkle *merkle,
+                                  struct ci_source_cache **cache,
+                                  size_t source_count)
+{
+    if (ci_source_cache_is_complete(*cache, source_count)) {
+        merkle->source_cache = *cache;
+        *cache = NULL;
+    }
 }

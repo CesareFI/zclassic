@@ -10,6 +10,7 @@
  * A partial build never corrupts the live store. "Recompute, never repair." */
 
 #include "codeindex_priv.h"
+#include "codeindex_merkle_internal.h"
 #include "codeindex/codeindex_build.h"
 #include "codeindex/codeindex_merkle.h"
 
@@ -30,6 +31,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 /* ── source enumeration ─────────────────────────────────────────────── */
+#if defined(_DIRENT_HAVE_D_TYPE) && \
+    (defined(__linux__) || defined(__ANDROID__))
+enum {
+    CI_DIRENT_UNKNOWN = 0,
+    CI_DIRENT_DIR = 4,
+    CI_DIRENT_REG = 8,
+};
+#define CI_HAVE_DIRENT_TYPE_HINT 1
+#endif
+
 struct strvec {
     char  **v;
     size_t  n;
@@ -101,55 +112,129 @@ static bool prune_dir(const char *name)
     return strncmp(name, "test-tmp", 8) == 0;
 }
 
-/* Recursively collect .c/.h under <root>/<reldir> into vec. Missing optional
- * roots are empty; permission, I/O, and allocation failures are hard errors. */
-static bool collect_dir(const char *root, const char *reldir,
-                        struct strvec *vec)
+enum { CI_SOURCE_DIR_MAX = 31 };
+
+static bool source_paths(const char *root, const char *reldir,
+                         const char *name, char child[CI_PATH_MAX],
+                         char full[CI_PATH_MAX])
+{
+    int cn = reldir[0]
+        ? snprintf(child, CI_PATH_MAX, "%s/%s", reldir, name)
+        : snprintf(child, CI_PATH_MAX, "%s", name);
+    if (cn <= 0 || (size_t)cn >= CI_PATH_MAX) return false;
+    int fn = snprintf(full, CI_PATH_MAX, "%s/%s", root, child);
+    return fn > 0 && (size_t)fn < CI_PATH_MAX;
+}
+
+static bool source_entry_keep(const char *name, bool is_dir, bool is_regular,
+                              struct strvec *entries)
+{
+    if (is_dir) {
+        if (prune_dir(name)) return true;
+        char key[CI_PATH_MAX];
+        int kn = snprintf(key, sizeof(key), "%s/", name);
+        if (kn <= 0 || (size_t)kn >= sizeof(key)) {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+        return sv_push(entries, key);
+    }
+    return !is_regular || !is_source_name(name) ||
+           sv_push(entries, name);
+}
+
+static bool source_entry_add(const char *root, const char *reldir,
+                             const struct dirent *entry,
+                             struct strvec *entries)
+{
+#if defined(CI_HAVE_DIRENT_TYPE_HINT)
+    if (entry->d_type == CI_DIRENT_DIR)
+        return source_entry_keep(entry->d_name, true, false, entries);
+    if (entry->d_type == CI_DIRENT_REG)
+        return source_entry_keep(entry->d_name, false, true, entries);
+    if (entry->d_type != CI_DIRENT_UNKNOWN) return true;
+#endif
+    char child[CI_PATH_MAX], full[CI_PATH_MAX];
+    if (!source_paths(root, reldir, entry->d_name, child, full)) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    struct stat st;
+    if (lstat(full, &st) != 0) return false;
+    return source_entry_keep(entry->d_name, S_ISDIR(st.st_mode),
+                             S_ISREG(st.st_mode), entries);
+}
+
+static bool source_dir_finish(DIR *dir, bool ok, int saved,
+                              struct strvec *entries)
+{
+    if (closedir(dir) != 0 && ok) { ok = false; saved = errno; }
+    if (!ok) errno = saved ? saved : EIO;
+    else qsort(entries->v, entries->n, sizeof(entries->v[0]), sv_cmp);
+    return ok;
+}
+
+/* Collect one directory's relevant direct children.  A directory carries a
+ * trailing slash in its sort key, exactly matching the full-path strcmp order
+ * documented by the Merkle builder.  Sorting one fanout at a time avoids the
+ * former O(total-files) path arena and global qsort. */
+static bool source_dir_entries(const char *root, const char *reldir,
+                               struct strvec *entries)
 {
     char full[CI_PATH_MAX];
-    if (reldir[0])
-        snprintf(full, sizeof(full), "%s/%s", root, reldir);
-    else
-        snprintf(full, sizeof(full), "%s", root);
+    int fn = reldir[0] ? snprintf(full, sizeof(full), "%s/%s", root, reldir)
+                       : snprintf(full, sizeof(full), "%s", root);
+    if (fn <= 0 || (size_t)fn >= sizeof(full)) return false;
     DIR *d = opendir(full);
     if (!d) return errno == ENOENT;
     bool ok = true;
+    int saved = 0;
     struct dirent *e;
+    errno = 0;
     while (ok && (e = readdir(d)) != NULL) {
         if (e->d_name[0] == '.') continue;
-        char child[CI_PATH_MAX];
-        int n;
-        if (reldir[0])
-            n = snprintf(child, sizeof(child), "%s/%s", reldir, e->d_name);
-        else
-            n = snprintf(child, sizeof(child), "%s", e->d_name);
-        if (n <= 0 || (size_t)n >= sizeof(child)) {
-            ok = false;
-            break;
-        }
-        char cfull[CI_PATH_MAX];
-        int cn = snprintf(cfull, sizeof(cfull), "%s/%s", root, child);
-        if (cn <= 0 || (size_t)cn >= sizeof(cfull)) {
-            ok = false;
-            break;
-        }
-        struct stat st;
-        if (lstat(cfull, &st) != 0) {
-            ok = false;
-            break;
-        }
-        if (S_ISDIR(st.st_mode)) {
-            if (prune_dir(e->d_name)) continue;
-            ok = collect_dir(root, child, vec);
-        } else if (S_ISREG(st.st_mode) && is_source_name(e->d_name)) {
-            ok = sv_push(vec, child);
-        }
+        ok = source_entry_add(root, reldir, e, entries);
+        if (!ok) saved = errno ? errno : ENOMEM;
     }
+    if (ok && errno != 0) { ok = false; saved = errno; }
+    return source_dir_finish(d, ok, saved, entries);
+}
+
+static bool source_walk_dir(const char *root, const char *reldir,
+                            unsigned depth, ci_enum_cb cb, void *user);
+
+static bool source_walk_entry(const char *root, const char *reldir,
+                              unsigned depth, char *key,
+                              ci_enum_cb cb, void *user)
+{
+    size_t key_len = strlen(key);
+    bool is_dir = key_len > 0 && key[key_len - 1] == '/';
+    if (is_dir) key[key_len - 1] = '\0';
+    char child[CI_PATH_MAX], full[CI_PATH_MAX];
+    if (!source_paths(root, reldir, key, child, full)) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    struct stat st;
+    if (lstat(full, &st) != 0) return false;
+    if (is_dir)
+        return S_ISDIR(st.st_mode) &&
+               source_walk_dir(root, child, depth + 1u, cb, user);
+    return S_ISREG(st.st_mode) && cb(child, &st, user);
+}
+
+static bool source_walk_dir(const char *root, const char *reldir,
+                            unsigned depth, ci_enum_cb cb, void *user)
+{
+    if (depth >= CI_SOURCE_DIR_MAX) { errno = ELOOP; return false; }
+    struct strvec entries = {0};
+    if (!source_dir_entries(root, reldir, &entries)) return false;
+    bool ok = true;
+    errno = 0;
+    for (size_t i = 0; i < entries.n && ok; i++)
+        ok = source_walk_entry(root, reldir, depth, entries.v[i], cb, user);
     int saved = errno;
-    if (closedir(d) != 0 && ok) {
-        ok = false;
-        saved = errno;
-    }
+    sv_free(&entries);
     if (!ok) errno = saved ? saved : EIO;
     return ok;
 }
@@ -158,38 +243,20 @@ bool ci_enumerate_sources(const char *root, ci_enum_cb cb, void *user)
 {
     if (!root || !cb) LOG_FAIL("codeindex", "null arg to enumerate");
 
-    struct strvec vec = {0};
-
-    static const char *const roots[] = {
+    const char *roots[] = {
 #define SOURCE_ROOT(name_) name_,
 #include "codeindex/source_roots.def"
 #undef SOURCE_ROOT
     };
-    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++)
-        if (!collect_dir(root, roots[i], &vec)) goto collect_failed;
-
-    qsort(vec.v, vec.n, sizeof(vec.v[0]), sv_cmp);
-
-    bool ok = true;
-    for (size_t i = 0; i < vec.n && ok; i++) {
-        /* de-dup exact repeats (a dir listed twice can't happen here, but be safe) */
-        if (i > 0 && strcmp(vec.v[i], vec.v[i - 1]) == 0) continue;
-        char full[CI_PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", root, vec.v[i]);
-        struct stat st;
-        if (lstat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
-            ok = false;
-            break;
-        }
-        if (!cb(vec.v[i], &st, user))
-            ok = false;
+    size_t root_count = sizeof(roots) / sizeof(roots[0]);
+    qsort(roots, root_count, sizeof(roots[0]), sv_cmp);
+    for (size_t i = 0; i < root_count; i++) {
+        if (i > 0 && strcmp(roots[i - 1], roots[i]) == 0) continue;
+        if (!source_walk_dir(root, roots[i], 0, cb, user))
+            LOG_FAIL("codeindex", "source enumeration failed: %s",
+                     strerror(errno));
     }
-    sv_free(&vec);
-    return ok;
-
-collect_failed:
-    sv_free(&vec);
-    LOG_FAIL("codeindex", "source enumeration failed: %s", strerror(errno));
+    return true;
 }
 
 /* ── staleness stamp: exact content-bound source-tree digest ────────── */
@@ -216,17 +283,33 @@ static void source_stat_root_init(struct sha3_256_ctx *sha)
     sha3_256_write(sha, (const unsigned char *)domain, sizeof(domain));
 }
 
+static void source_stat_root_add_key(
+    struct sha3_256_ctx *sha, const char *relpath,
+    const struct ci_merkle_stat_key *key)
+{
+    sha3_256_write(sha, (const unsigned char *)relpath, strlen(relpath) + 1);
+    sha_write_u64le(sha, key->dev);
+    sha_write_u64le(sha, key->ino);
+    sha_write_u64le(sha, key->size);
+    sha_write_u64le(sha, key->mtime_sec);
+    sha_write_u64le(sha, key->mtime_nsec);
+    sha_write_u64le(sha, key->ctime_sec);
+    sha_write_u64le(sha, key->ctime_nsec);
+}
+
 static void source_stat_root_add(struct sha3_256_ctx *sha,
                                  const char *relpath, const struct stat *st)
 {
-    sha3_256_write(sha, (const unsigned char *)relpath, strlen(relpath) + 1);
-    sha_write_u64le(sha, (uint64_t)st->st_dev);
-    sha_write_u64le(sha, (uint64_t)st->st_ino);
-    sha_write_u64le(sha, (uint64_t)st->st_size);
-    sha_write_u64le(sha, (uint64_t)st->st_mtim.tv_sec);
-    sha_write_u64le(sha, (uint64_t)st->st_mtim.tv_nsec);
-    sha_write_u64le(sha, (uint64_t)st->st_ctim.tv_sec);
-    sha_write_u64le(sha, (uint64_t)st->st_ctim.tv_nsec);
+    const struct ci_merkle_stat_key key = {
+        .dev = (uint64_t)st->st_dev,
+        .ino = (uint64_t)st->st_ino,
+        .size = (uint64_t)st->st_size,
+        .mtime_sec = (uint64_t)st->st_mtim.tv_sec,
+        .mtime_nsec = (uint64_t)st->st_mtim.tv_nsec,
+        .ctime_sec = (uint64_t)st->st_ctim.tv_sec,
+        .ctime_nsec = (uint64_t)st->st_ctim.tv_nsec,
+    };
+    source_stat_root_add_key(sha, relpath, &key);
 }
 
 static bool source_file_sha3(const char *root, const char *relpath,
@@ -686,6 +769,71 @@ static void rebuild_report(const struct ci_seed_outcome *seed, bool incremental,
         LOG_INFO("codeindex", "index: rebuilt (%lld ms)", ms);
 }
 
+/* Merkle leaves carry the same tagged content digest ci_scan_file() returns.
+ * Recompose the store's canonical exact-source root without reopening every
+ * source file after the Merkle pass has already read it. */
+static bool source_root_from_merkle_leaves(
+    const struct ci_merkle_leaf *leaves, int count, uint8_t out[32])
+{
+    if (!out || count < 0 || (count > 0 && !leaves))
+        LOG_FAIL("codeindex", "invalid Merkle leaves for source root");
+    struct sha3_256_ctx sha;
+    ci_source_root_init(&sha);
+    for (int i = 0; i < count; i++)
+        ci_source_root_add(&sha, leaves[i].path,
+                           leaves[i].content_digest.bytes);
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+static bool source_stat_root_from_merkle(const struct ci_merkle *merkle,
+                                         uint8_t out[32])
+{
+    if (!merkle || !out)
+        LOG_FAIL("codeindex", "invalid Merkle tree for source stat root");
+    struct sha3_256_ctx sha;
+    source_stat_root_init(&sha);
+    for (uint32_t i = 0; i < merkle->nleaves; i++)
+        source_stat_root_add_key(&sha, merkle->leaves[i].path,
+                                 &merkle->leaves[i].source_key);
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+static bool collect_merkle_evidence(
+    struct ci_merkle *merkle, bool patchable,
+    struct ci_merkle_leaf **current_out,
+    struct ci_merkle_leaf **changed_out, int *count_out,
+    uint8_t source_root[32], uint8_t source_stat_root[32])
+{
+    int count = ci_merkle_leaves(merkle, NULL, 0);
+    struct ci_merkle_leaf *current = NULL, *changed = NULL;
+    if (count < 0)
+        LOG_FAIL("codeindex", "count current Merkle leaves failed");
+    if (count > 0) {
+        current = zcl_calloc((size_t)count, sizeof(*current),
+                             "ci_incremental_current");
+        if (!current || ci_merkle_leaves(merkle, current, count) != count)
+            goto fail;
+        if (patchable) {
+            changed = zcl_calloc((size_t)count, sizeof(*changed),
+                                 "ci_incremental_changed");
+            if (!changed) goto fail;
+        }
+    }
+    if (!source_root_from_merkle_leaves(current, count, source_root) ||
+        !source_stat_root_from_merkle(merkle, source_stat_root))
+        goto fail;
+    *current_out = current;
+    *changed_out = changed;
+    *count_out = count;
+    return true;
+fail:
+    free(current);
+    free(changed);
+    LOG_FAIL("codeindex", "collect current Merkle evidence failed");
+}
+
 static bool codeindex_rebuild_internal(struct codeindex *ci,
                                        bool coalesce_if_fresh)
 {
@@ -707,6 +855,7 @@ static bool codeindex_rebuild_internal(struct codeindex *ci,
     int stagefd = -1;
     struct ci_store *st = NULL;
     struct ci_merkle *merkle = NULL;
+    struct ci_source_cache *source_cache = NULL;
     struct ci_merkle_leaf *changed = NULL;
     struct ci_merkle_leaf *current_leaves = NULL;
     int changed_count = 0;
@@ -772,22 +921,17 @@ static bool codeindex_rebuild_internal(struct codeindex *ci,
     /* Two ways out of a full rescan, and the live Merkle leaves are the input
      * to both: patch THIS checkout's own previous generation, or — when it has
      * none at all — seed from the nearest sibling checkout that does. */
-    int current_count = ci_merkle_leaves(merkle, NULL, 0);
+    int current_count = 0;
     bool patchable = coalesce_if_fresh &&
         rebuild_can_patch_in_place(ci, &merkle_cost, current_dep_stat);
     bool seedable = coalesce_if_fresh && !ci->store;
-    if (current_count > 0 && (patchable || seedable)) {
-        current_leaves = zcl_calloc((size_t)current_count,
-                                    sizeof(*current_leaves),
-                                    "ci_incremental_current");
-        changed = zcl_calloc((size_t)current_count, sizeof(*changed),
-                             "ci_incremental_changed");
-        if (!current_leaves || !changed ||
-            ci_merkle_leaves(merkle, current_leaves, current_count) !=
-                current_count) {
-            failure = "collect changed Merkle leaves failed";
-            goto out;
-        }
+    uint8_t expected_source_root[32];
+    uint8_t expected_source_stat_root[32];
+    if (!collect_merkle_evidence(
+            merkle, patchable, &current_leaves, &changed, &current_count,
+            expected_source_root, expected_source_stat_root)) {
+        failure = "collect current Merkle evidence failed";
+        goto out;
     }
     if (patchable && current_leaves) {
         bool inventory_same = false;
@@ -823,6 +967,8 @@ static bool codeindex_rebuild_internal(struct codeindex *ci,
 
     uint8_t built_source_stat_root[32];
     uint8_t built_dep_stat_root[32];
+    memcpy(built_source_stat_root, expected_source_stat_root,
+           sizeof(built_source_stat_root));
     if (incremental) {
         memcpy(built_dep_stat_root, current_dep_stat, 32);
         if (!adopted_spare && !ci_store_copy_image_fd(ci->store, stagefd)) {
@@ -849,12 +995,31 @@ static bool codeindex_rebuild_internal(struct codeindex *ci,
          * freshness contract is relaxed for having arrived this way. */
         memcpy(built_dep_stat_root, current_dep_stat, 32);
     } else {
-        if (!ci_build_store_memory(ci->root, build_start_ms, &st,
+        /* A cold store build needs the already-copied roots, not either
+         * complete leaf inventory.  Keeping the Merkle tree and the seeding
+         * copy alive beside the in-memory store made peak space proportional
+         * to three 500k-file inventories and drove constrained hosts into
+         * swap-backed I/O.  Release them before assembling the store; the
+         * independent final refresh below still verifies the exact source
+         * root immediately before publication. */
+        source_cache = ci_merkle_take_source_cache(merkle);
+        ci_merkle_free(merkle);
+        merkle = NULL;
+        free(changed);
+        changed = NULL;
+        free(current_leaves);
+        current_leaves = NULL;
+        if (!ci_build_store_memory(ci->root, build_start_ms,
+                                   expected_source_root,
+                                   expected_source_stat_root, source_cache,
+                                   &st,
                                    built_source_stat_root,
                                    built_dep_stat_root)) {
             failure = "source scan or staging write failed";
             goto out;
         }
+        ci_source_cache_free(source_cache);
+        source_cache = NULL;
         if (!ci_store_meta_set(st, "source_merkle_root_sha3",
                                merkle_root.digest.bytes, 32)) {
             failure = "seal source Merkle root failed";
@@ -868,6 +1033,16 @@ static bool codeindex_rebuild_internal(struct codeindex *ci,
         st = NULL;
     }
 
+    /* Incremental and seeded builds also no longer need their inventories
+     * once the staged generation has been updated.  Keep the final freshness
+     * witness phase disjoint from the build inventory in memory. */
+    ci_merkle_free(merkle);
+    merkle = NULL;
+    free(changed);
+    changed = NULL;
+    free(current_leaves);
+    current_leaves = NULL;
+
     /* Serialization can be non-trivial for a large index. Recheck only the
      * cached metadata keys at the last boundary before fsync/publication; any
      * byte change also changes inode/size/mtime/ctime on the supported local
@@ -876,10 +1051,13 @@ static bool codeindex_rebuild_internal(struct codeindex *ci,
     struct ci_merkle *final_merkle = ci_merkle_refresh(
         ci->root, &final_merkle_cost);
     struct ci_merkle_node final_merkle_root;
+    uint8_t final_source_stat_root[32];
     uint8_t final_dep_stat_root[32];
     bool final_ok = final_merkle &&
         ci_merkle_root(final_merkle, &final_merkle_root) &&
+        source_stat_root_from_merkle(final_merkle, final_source_stat_root) &&
         memcmp(merkle_root.digest.bytes, final_merkle_root.digest.bytes, 32) == 0 &&
+        memcmp(built_source_stat_root, final_source_stat_root, 32) == 0 &&
         ci_deps_stat_root_sha3(ci->root, final_dep_stat_root) &&
         memcmp(built_dep_stat_root, final_dep_stat_root, 32) == 0;
     ci_merkle_free(final_merkle);
@@ -958,6 +1136,7 @@ static bool codeindex_rebuild_internal(struct codeindex *ci,
 
 out:
     if (st) ci_store_close(st);
+    ci_source_cache_free(source_cache);
     ci_merkle_free(merkle);
     free(changed);
     free(current_leaves);

@@ -307,3 +307,37 @@ The shell SHA-256 inventory remains authoritative. These rows establish the
 native engine's shadow-mode latency and incrementality; they do not claim that
 the narrower public-C23 Merkle inventory is already a replacement for the
 shell oracle's full build-input policy.
+
+## 2026-09-17 — bounded code-index cold-build memory and I/O
+
+Host: 2 cores / 3.7 GiB RAM, constrained Hetzner filesystem, branch
+`dev/portable-node-core` during upstream integration. Command:
+`make -j2 t-fast ONLY=test_codeindex_scale`. The registered fixture generates
+50,000 and 500,000 tiny C sources in isolated `test-tmp` workspaces and keeps
+the existing 30x wall-time bound for 10x the file count.
+
+The before row is the last idle run before the bounded source-byte cache. The
+after row is the test runner's idle retry after a contended first attempt; the
+first attempt is retained as load-flaky evidence rather than presented as an
+optimization result.
+
+| implementation | 50k wall | 500k wall | 500k receipt | ratio | verdict |
+|---|---:|---:|---:|---:|---|
+| canonical streaming + `d_type` hints, before byte reuse | 4.085 s | 130.103 s | 84.232 s | 31.8x | FAIL |
+| same pipeline + bounded Merkle-to-scanner byte reuse | 3.277 s | 90.623 s | 46.470 s | 27.6x | PASS |
+
+The cache is ephemeral, cold-build-only, and capped at 96 MiB including its
+path, byte, and span capacities. It is discarded if the Merkle pass reuses any
+old leaf, exceeds the budget, cannot allocate, or does not produce the exact
+canonical source sequence; those cases retain the full file-reading fallback.
+The store scanner hashes the cached bytes again and compares that digest with
+the Merkle evidence before accepting them. The independent final Merkle
+freshness witness remains unchanged.
+
+Observed peak RSS for the after run was 587,388 KiB (`VmHWM`), versus roughly
+543–566 MiB across the preceding streaming runs. The speed result therefore
+does not claim a peak-memory reduction: it deliberately trades at most 96 MiB
+of bounded transient memory for one fewer source-content read/parse input pass.
+Further mobile work should target the in-memory SQLite staging image and
+post-receipt serialization, which now account for most of the remaining peak
+and roughly 44 seconds of the 500k wall time.

@@ -13,6 +13,7 @@ struct merkle_leaf_rec {
     struct zcl_sha3_digest content_digest;
     uint64_t               size;
     struct ci_merkle_stat_key key;
+    struct ci_merkle_stat_key source_key;
     bool                   dirty;
 };
 
@@ -32,12 +33,28 @@ struct merkle_snapshot {
     uint32_t                nnodes;
 };
 
+struct ci_merkle {
+    struct merkle_leaf_rec *leaves;
+    uint32_t                nleaves;
+    struct merkle_node_rec *nodes;
+    uint32_t                nnodes;
+    struct zcl_sha3_digest  root;
+    struct ci_source_cache *source_cache;
+};
+
 void merkle_snapshot_free(struct merkle_snapshot *s);
 bool merkle_snapshot_load(const char *root, struct merkle_snapshot *out,
                           bool *found);
 const struct merkle_leaf_rec *
 merkle_find_leaf(const struct merkle_leaf_rec *v, uint32_t n, const char *path);
+const struct merkle_leaf_rec *merkle_snapshot_next_leaf(
+    const struct merkle_snapshot *snapshot, uint32_t *cursor,
+    const char *path, bool *inventory_changed);
 const struct merkle_node_rec *
 merkle_find_node(const struct merkle_node_rec *v, uint32_t n, const char *path);
+struct ci_source_cache *ci_merkle_take_source_cache(struct ci_merkle *merkle);
+void ci_merkle_adopt_source_cache(struct ci_merkle *merkle,
+                                  struct ci_source_cache **cache,
+                                  size_t source_count);
 
 #endif /* ZCL_CODEINDEX_MERKLE_INTERNAL_H */

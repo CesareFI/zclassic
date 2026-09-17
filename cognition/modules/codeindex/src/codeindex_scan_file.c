@@ -11,6 +11,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+bool ci_scan_source_bytes(const char *relpath, const unsigned char *bytes,
+                          size_t length, ci_sym_cb on_sym, ci_ref_cb on_ref,
+                          void *user, uint8_t out_sha3[32],
+                          char purpose_out[CI_FILE_PURPOSE_MAX])
+{
+    if (purpose_out) purpose_out[0] = '\0';
+    if (!relpath || (!bytes && length > 0) || !on_sym || !on_ref)
+        LOG_FAIL("codeindex", "null arg to scan source bytes");
+    if (out_sha3) {
+        static const uint8_t tag = 0x02;
+        struct sha3_256_ctx ctx;
+        sha3_256_init(&ctx);
+        sha3_256_write(&ctx, &tag, 1);
+        if (length) sha3_256_write(&ctx, bytes, length);
+        sha3_256_finalize(&ctx, out_sha3);
+    }
+    size_t rl = strlen(relpath);
+    bool is_header = rl >= 2 && relpath[rl - 2] == '.' &&
+                     relpath[rl - 1] == 'h';
+    char group[64];
+    ci_group_for_path(relpath, group);
+    ci_scan_text((const char *)bytes, length, relpath, is_header, group,
+                 on_sym, on_ref, user, purpose_out);
+    return true;
+}
+
 bool ci_scan_file(const char *root, const char *relpath,
                   ci_sym_cb on_sym, ci_ref_cb on_ref, void *user,
                   uint8_t out_sha3[32], char purpose_out[CI_FILE_PURPOSE_MAX])
@@ -56,21 +82,10 @@ bool ci_scan_file(const char *root, const char *relpath,
         LOG_FAIL("codeindex", "source changed while scanning %s", relpath);
     }
 
-    if (out_sha3) {
-        static const uint8_t tag = 0x02;
-        struct sha3_256_ctx ctx;
-        sha3_256_init(&ctx);
-        sha3_256_write(&ctx, &tag, 1);
-        if (len) sha3_256_write(&ctx, (const unsigned char *)buf, len);
-        sha3_256_finalize(&ctx, out_sha3);
-    }
-
-    size_t rl = strlen(relpath);
-    bool is_header = rl >= 2 && relpath[rl - 2] == '.' && relpath[rl - 1] == 'h';
-    char group[64];
-    ci_group_for_path(relpath, group);
-    ci_scan_text(buf, len, relpath, is_header, group, on_sym, on_ref, user,
-                 purpose_out);
+    ci_test_note_exact_bytes((uint64_t)len);
+    bool scanned = ci_scan_source_bytes(
+        relpath, (const unsigned char *)buf, len, on_sym, on_ref, user,
+        out_sha3, purpose_out);
     free(buf);
-    return true;
+    return scanned;
 }

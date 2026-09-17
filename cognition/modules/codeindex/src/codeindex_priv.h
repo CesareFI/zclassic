@@ -56,6 +56,7 @@ typedef struct sqlite3_stmt sqlite3_stmt;
 struct ci_store;
 struct ci_merkle;
 struct ci_merkle_leaf;
+struct ci_source_cache;
 struct codeindex {
     struct ci_store *store;
     struct ci_merkle *pending_merkle;
@@ -267,9 +268,27 @@ void ci_source_root_init(struct sha3_256_ctx *sha);
 void ci_source_root_add(struct sha3_256_ctx *sha, const char *relpath,
                         const uint8_t content_sha3[32]);
 bool ci_build_store_memory(const char *root, int64_t build_start_ms,
+                           const uint8_t expected_source_root[32],
+                           const uint8_t expected_source_stat_root[32],
+                           struct ci_source_cache *source_cache,
                            struct ci_store **out_store,
                            uint8_t source_stat_out[32],
                            uint8_t dep_stat_out[32]);
+struct ci_source_cache *ci_source_cache_new(void);
+void ci_source_cache_mark_incomplete(struct ci_source_cache *cache);
+size_t ci_source_cache_mark(const struct ci_source_cache *cache);
+void ci_source_cache_append(struct ci_source_cache *cache,
+                            const unsigned char *data, size_t length);
+void ci_source_cache_rollback(struct ci_source_cache *cache, size_t mark);
+void ci_source_cache_commit(struct ci_source_cache *cache, size_t mark,
+                            const char *path, const uint8_t content_digest[32]);
+bool ci_source_cache_is_complete(const struct ci_source_cache *cache,
+                                 size_t source_count);
+bool ci_source_cache_next(struct ci_source_cache *cache, const char *path,
+                          const unsigned char **data, size_t *length,
+                          const uint8_t **content_digest);
+bool ci_source_cache_consumed(const struct ci_source_cache *cache);
+void ci_source_cache_free(struct ci_source_cache *cache);
 bool ci_build_store_incremental(const char *root, struct ci_store *store,
                                 const struct ci_merkle_leaf *changed,
                                 int changed_count,
@@ -373,6 +392,10 @@ typedef void (*ci_ref_cb)(const char *callee, const char *ref_file,
 bool ci_scan_file(const char *root, const char *relpath,
                   ci_sym_cb on_sym, ci_ref_cb on_ref, void *user,
                   uint8_t out_sha3[32], char purpose_out[CI_FILE_PURPOSE_MAX]);
+bool ci_scan_source_bytes(const char *relpath, const unsigned char *bytes,
+                          size_t length, ci_sym_cb on_sym, ci_ref_cb on_ref,
+                          void *user, uint8_t out_sha3[32],
+                          char purpose_out[CI_FILE_PURPOSE_MAX]);
 
 /* Pure text scanner (no file I/O) — the testable core. `src`/`len` is the raw
  * file text; the group is stamped into every emitted symbol. `purpose_out`
