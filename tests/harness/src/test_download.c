@@ -20,6 +20,9 @@
 
 static struct c3_mutex_sample dl_profile_last;
 
+static void test_dl_force_sync_idle(void);
+static void test_dl_force_blocks_download(void);
+
 static int dl_profile_compare(const void *a, const void *b)
 {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
@@ -335,6 +338,47 @@ static int test_dl_received_pending_staging(void)
         dl_free(&dm);
         PASS();
     } _test_next:;
+    return failures;
+}
+
+static int test_dl_received_pending_survives_rehash(void)
+{
+    int failures = 0;
+    TEST("received-pending dedup survives in-flight table growth") {
+        struct download_manager dm;
+        dl_init(&dm);
+        test_dl_force_blocks_download();
+        ASSERT(sync_get_state() == SYNC_BLOCKS_DOWNLOAD);
+
+        struct uint256 received = make_hash(201);
+        int32_t received_height = 900;
+        ASSERT(dl_mark_requested(&dm, &received, received_height, 1));
+        ASSERT(dl_mark_received(&dm, &received) == 1);
+
+        /* Fill to the 50% growth threshold. The next request rehashes the
+         * table while `received` is still inside its staging grace window. */
+        for (size_t i = 0; i < dm.num_slots / 2; i++) {
+            struct uint256 h = make_hash((uint8_t)(i + 1));
+            h.data[1] = (uint8_t)(i >> 8);
+            h.data[2] = 1;
+            ASSERT(dl_mark_requested(&dm, &h, 1000 + (int32_t)i, 2));
+        }
+        size_t old_slots = dm.num_slots;
+        struct uint256 trigger = make_hash(202);
+        trigger.data[2] = 2;
+        ASSERT(dl_mark_requested(&dm, &trigger, 3000, 2));
+        ASSERT(dm.num_slots == old_slots * 2);
+
+        ASSERT(dl_queue_blocks(&dm, &received, &received_height, 1) == 0);
+        ASSERT(dm.total_requeue_suppressed_pending == 1);
+        ASSERT(!dl_mark_requested(&dm, &received, received_height, 3));
+        ASSERT(dm.total_requeue_suppressed_pending == 2);
+
+        dl_free(&dm);
+        test_dl_force_sync_idle();
+        PASS();
+    } _test_next:;
+    test_dl_force_sync_idle();
     return failures;
 }
 
@@ -2034,6 +2078,7 @@ int test_download(void)
     failures += test_dl_mark_received();
     failures += test_dl_queue_dedup();
     failures += test_dl_received_pending_staging();
+    failures += test_dl_received_pending_survives_rehash();
     failures += test_dl_assign_to_peer();
     failures += test_dl_assignment_generation_parking();
     failures += test_dl_assignment_parking_is_per_peer();

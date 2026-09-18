@@ -478,12 +478,20 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
     if (!new_slots) return;
 
     size_t new_mask = new_size - 1;
+    int64_t now = (int64_t)platform_time_wall_time_t();
     for (size_t i = 0; i < dm->num_slots; i++) {
-        if (!dm->slots[i].active) continue;
+        const struct dl_in_flight *old = &dm->slots[i];
+        bool received_pending = !old->active && old->received_time != 0 &&
+                                now - old->received_time <
+                                    DL_RECEIVED_PENDING_SECS;
+        if (!old->active && !received_pending) continue;
         size_t idx = dl_hash_slot(&dm->slots[i].hash, new_mask);
         for (size_t j = 0; j < new_size; j++) {
             struct dl_in_flight *s = &new_slots[(idx + j) & new_mask];
-            if (!s->active) {
+            /* An inactive received-pending entry is occupied too. Reusing
+             * it here would silently discard the dedup guard whenever a
+             * later active hash collides during rehash. */
+            if (uint256_is_null(&s->hash)) {
                 *s = dm->slots[i];
                 break;
             }
