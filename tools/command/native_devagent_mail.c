@@ -158,7 +158,6 @@
 #define DVM_LEAF "dev.agent.mail"
 #define DVM_BODY_MAX 4096u
 #define DVM_LINE_CAP 8192
-#define DVM_ROWS_MAX 4096
 #define DVM_PATH_CAP 4096u
 /* Width of a sender binding, fixed by the grant store that mints it
  * (ZCL_FLEET_STEER_BINDING_HEX). Stated here as a byte budget so this leaf
@@ -684,7 +683,6 @@ struct dvm_row {
     char ref[256];
     /* "" when the poster stamped none; carried, never interpreted here. */
     char sender_binding[DVM_BINDING_HEX + 1];
-    char line[DVM_LINE_CAP];
 };
 
 static bool dvm_parse_row(const char *line, struct dvm_row *r)
@@ -1032,11 +1030,70 @@ static void dvm_post(const struct zcl_command_request *req,
 
 /* ── pull ────────────────────────────────────────────────────────────────── */
 
+/* One page is bounded twice: at most DVM_PAGE_ROWS rows, and at most
+ * DVM_PAGE_BYTES of estimated serialized row bytes (the first row of a page
+ * is always taken, whatever it costs, so a page is never empty while rows
+ * remain). A single row is at most a 4 KiB body escaped at worst six bytes
+ * per byte, so the first-row exception plus the resume token and the
+ * envelope still fits the leaf's 32 KiB response budget. */
+#define DVM_PAGE_ROWS 64u
+#define DVM_PAGE_BYTES 16384u
+#define DVM_STREAMS_MAX 16u
+#define DVM_STREAM_NAME_MAX 128u
+#define DVM_TOKEN_CAP (DVM_STREAMS_MAX * (DVM_STREAM_NAME_MAX + 24u) + 32u)
+
 struct dvm_pull_filter {
-    long long since;
+    long long since;      /* seq floor: rows at or below it are not returned */
     const char *from;
     const char *kind;
+    const char *token;    /* resume entries after "<floor>|", or NULL */
 };
+
+/* One *.jsonl stream under the mail dir, read from a byte offset. `off` is
+ * the consumed boundary: every complete line before it has been returned or
+ * filtered. A head row is loaded but not yet returned. */
+struct dvm_stream {
+    char name[DVM_STREAM_NAME_MAX + 1];
+    char path[DVM_PATH_CAP];
+    FILE *f;
+    long long off;
+    long long head_end;
+    bool has_head;
+    bool named; /* the resume token already named this stream */
+    struct dvm_row head;
+};
+
+struct dvm_pull_state {
+    struct dvm_stream *streams;
+    size_t nstreams;
+    long long cursor;  /* largest seq seen anywhere, or the floor */
+    long long skipped; /* malformed lines this page consumed */
+    char line[DVM_LINE_CAP];
+};
+
+struct dvm_page {
+    struct dvm_row *rows;
+    size_t n;
+    size_t bytes;
+    bool truncated;
+};
+
+/* A resume token is "<floor>|<name>:<offset>,..." — digits, then a bar.
+ * Anything else that is not a plain non-negative integer is bad input. */
+static bool dvm_since_token(const char *s, struct dvm_pull_filter *filter)
+{
+    char *end = NULL;
+    long long n;
+    if (!s || !isdigit((unsigned char)s[0]))
+        return false;
+    errno = 0;
+    n = strtoll(s, &end, 10);
+    if (errno != 0 || !end || *end != '|' || n < 0)
+        return false;
+    filter->since = n;
+    filter->token = end + 1;
+    return true;
+}
 
 /* Parse pull's since/from/kind filters from req into *filter (since defaults
  * to 0 whether req/input is absent or "since" is simply not given). Returns
@@ -1045,17 +1102,17 @@ static bool dvm_pull_parse_filter(const struct zcl_command_request *req,
                                   struct zcl_command_reply *reply,
                                   struct dvm_pull_filter *filter)
 {
-    filter->since = 0;
-    filter->from = NULL;
-    filter->kind = NULL;
+    const struct json_value *v;
+    memset(filter, 0, sizeof(*filter));
     if (!req || !req->input)
         return true;
-    if (json_get(req->input, "since")) {
-        if (!dvm_int(req, "since", &filter->since)) {
-            dvm_fail(reply, "BAD_INPUT", "since is a non-negative cursor",
-                     "input.since has the wrong shape");
-            return false;
-        }
+    v = json_get(req->input, "since");
+    if (v && !dvm_int(req, "since", &filter->since) &&
+        !(v->type == JSON_STR && dvm_since_token(json_get_str(v), filter))) {
+        dvm_fail(reply, "BAD_INPUT",
+                 "since is a non-negative cursor or a next_since token",
+                 "input.since has the wrong shape");
+        return false;
     }
     filter->from = dvm_str(req, "from");
     filter->kind = dvm_str(req, "kind");
@@ -1069,177 +1126,489 @@ static bool dvm_pull_parse_filter(const struct zcl_command_request *req,
     return true;
 }
 
-/* Append r into *rows (growing, capped at DVM_ROWS_MAX); silently drops the
- * row once the cap or an allocation failure is hit, matching dvm_pull's
- * original inline growth logic. */
-static void dvm_pull_row_push(struct dvm_row **rows, size_t *nrows,
-                              size_t *caprows, const struct dvm_row *r)
+/* ── streams ── */
+
+static void dvm_streams_close(struct dvm_pull_state *ps)
 {
-    if (*nrows == *caprows) {
-        size_t ncap = *caprows ? *caprows * 2 : 32;
-        if (ncap > DVM_ROWS_MAX)
-            ncap = DVM_ROWS_MAX;
-        if (*nrows >= ncap)
-            return;
-        struct dvm_row *nrows_p = (struct dvm_row *)zcl_realloc(
-            *rows, ncap * sizeof(**rows), "devagent_mail.rows");
-        if (!nrows_p)
-            return;
-        *rows = nrows_p;
-        *caprows = ncap;
+    for (size_t i = 0; i < ps->nstreams; i++) {
+        if (ps->streams[i].f)
+            (void)fclose(ps->streams[i].f);
+        ps->streams[i].f = NULL;
     }
-    if (*nrows < *caprows)
-        (*rows)[(*nrows)++] = *r;
+    free(ps->streams);
+    ps->streams = NULL;
+    ps->nstreams = 0;
 }
 
-/* Read one mail .jsonl file, raising *cursor to the max seq seen (even for
- * rows at or before the since filter) and appending every row that passes
- * the since/from/kind filters into *rows. */
-static void dvm_pull_scan_file(const char *path,
-                               const struct dvm_pull_filter *filter,
-                               long long *cursor, struct dvm_row **rows,
-                               size_t *nrows, size_t *caprows)
+static int dvm_stream_name_cmp(const void *a, const void *b)
 {
-    FILE *f = fopen(path, "r");
-    if (!f)
+    return strcmp(((const struct dvm_stream *)a)->name,
+                  ((const struct dvm_stream *)b)->name);
+}
+
+/* A mail stream is any "<name>.jsonl" regular entry; ".jsonl" alone and
+ * names shorter than one character plus the suffix are not. */
+static bool dvm_is_stream_name(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    if (strlen(name) < 7 || !dot || strcmp(dot, ".jsonl") != 0)
+        return false;
+    return strchr(name, '/') == NULL;
+}
+
+/* Why one directory entry cannot join the stream set, or NULL. The name
+ * travels inside the resume token, so it must be spellable there. */
+static const char *dvm_stream_refusal(const struct dvm_pull_state *ps,
+                                      const struct dvm_pull_filter *filter,
+                                      const char *name)
+{
+    if (!dvm_cursor_name_ok(name))
+        return "MAIL_STREAM_NAME_INVALID";
+    if (ps->nstreams >= DVM_STREAMS_MAX)
+        return "MAIL_STREAMS_TOO_MANY";
+    /* Each imported file has its own sequence space. A scalar from
+     * another stream cannot establish that this stream was consumed. */
+    if (ps->nstreams >= 1 && filter->since > 0)
+        return "MAIL_CURSOR_AMBIGUOUS";
+    return NULL;
+}
+
+static void dvm_stream_fail(struct zcl_command_reply *reply,
+                            const char *code, const char *name)
+{
+    if (strcmp(code, "MAIL_CURSOR_AMBIGUOUS") == 0) {
+        dvm_fail(reply, code,
+                 "multiple mail streams cannot resume one scalar cursor; replay with since=0",
+                 "independent mail sequence spaces");
+        (void)snprintf(reply->error.next_action,
+                       sizeof(reply->error.next_action), "%s",
+                       "z23-dev dev agent mail pull --since=0");
         return;
-    for (;;) {
-        static char buf[DVM_LINE_CAP];
-        struct dvm_row r;
-        size_t len;
-        if (!fgets(buf, sizeof(buf), f))
-            break;
-        len = strlen(buf);
-        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-            buf[--len] = '\0';
-        if (len == 0)
-            continue;
-        if (!dvm_parse_row(buf, &r))
-            continue; /* malformed line: skipped, never fatal */
-        if (r.seq > *cursor)
-            *cursor = r.seq;
-        if (r.seq <= filter->since)
-            continue;
-        if (filter->from && strcmp(r.from, filter->from) != 0)
-            continue;
-        if (filter->kind && strcmp(r.kind, filter->kind) != 0)
-            continue;
-        dvm_pull_row_push(rows, nrows, caprows, &r);
     }
-    (void)fclose(f);
+    if (strcmp(code, "MAIL_STREAMS_TOO_MANY") == 0) {
+        dvm_fail(reply, code,
+                 "more mail streams than one resume token can name", name);
+        return;
+    }
+    dvm_fail(reply, code,
+             "a mail stream name must be 1-128 of [A-Za-z0-9._-] to be "
+             "resumable",
+             name);
 }
 
-/* Walk maildir's .jsonl entries, scanning each via dvm_pull_scan_file.
- * Returns false, with a fail reply already written, on a path-length
- * overflow or an unreadable directory; true otherwise. */
-static bool dvm_pull_scan_maildir(const char *maildir,
-                                  struct zcl_command_reply *reply,
-                                  const struct dvm_pull_filter *filter,
-                                  long long *cursor, struct dvm_row **rows,
-                                  size_t *nrows, size_t *caprows)
+/* Enumerate maildir's streams, sorted by name so ties in row order break
+ * the same way on every pull. False with a fail reply already written. */
+static bool dvm_streams_list(const char *maildir,
+                             struct zcl_command_reply *reply,
+                             const struct dvm_pull_filter *filter,
+                             struct dvm_pull_state *ps)
 {
     DIR *d = opendir(maildir);
+    struct dirent *ent;
     if (!d) {
         dvm_fail(reply, "MAIL_READ_FAILED", "cannot read the mail dir",
                  maildir);
         return false;
     }
-    struct dirent *ent;
-    size_t streams = 0;
+    ps->streams = (struct dvm_stream *)zcl_calloc(
+        DVM_STREAMS_MAX, sizeof(*ps->streams), "devagent_mail.streams");
+    if (!ps->streams) {
+        (void)closedir(d);
+        dvm_fail(reply, "MAIL_READ_FAILED", "cannot allocate the stream set",
+                 maildir);
+        return false;
+    }
     while ((ent = readdir(d)) != NULL) {
-        char path[DVM_PATH_CAP];
-        const char *dot;
-        size_t namelen = strlen(ent->d_name);
-        if (namelen < 7)
+        struct dvm_stream *s;
+        const char *why;
+        if (!dvm_is_stream_name(ent->d_name))
             continue;
-        dot = strrchr(ent->d_name, '.');
-        if (!dot || strcmp(dot, ".jsonl") != 0)
-            continue;
-        if (strchr(ent->d_name, '/') != NULL)
-            continue;
-        if (strcmp(ent->d_name, ".jsonl") == 0)
-            continue;
-        /* Each imported file has its own sequence space. A scalar from
-         * another stream cannot establish that this stream was consumed. */
-        if (++streams > 1 && filter->since > 0) {
+        why = dvm_stream_refusal(ps, filter, ent->d_name);
+        if (why) {
             (void)closedir(d);
-            free(*rows);
-            *rows = NULL;
-            dvm_fail(reply, "MAIL_CURSOR_AMBIGUOUS",
-                     "multiple mail streams cannot resume one scalar cursor; replay with since=0",
-                     "independent mail sequence spaces");
-            (void)snprintf(reply->error.next_action,
-                sizeof(reply->error.next_action), "%s",
-                "z23-dev dev agent mail pull --since=0");
+            dvm_stream_fail(reply, why, ent->d_name);
             return false;
         }
+        s = &ps->streams[ps->nstreams];
         int path_length =
-            snprintf(path, sizeof(path), "%s/%s", maildir, ent->d_name);
-        if (path_length <= 0 || (size_t)path_length >= sizeof(path)) {
+            snprintf(s->path, sizeof(s->path), "%s/%s", maildir, ent->d_name);
+        if (path_length <= 0 || (size_t)path_length >= sizeof(s->path)) {
             (void)closedir(d);
-            free(*rows);
-            *rows = NULL;
             dvm_fail(reply, "MAIL_READ_FAILED", "mail path exceeds its bound",
                      maildir);
             return false;
         }
-        dvm_pull_scan_file(path, filter, cursor, rows, nrows, caprows);
+        (void)snprintf(s->name, sizeof(s->name), "%s", ent->d_name);
+        ps->nstreams++;
     }
     (void)closedir(d);
+    if (ps->nstreams > 1)
+        qsort(ps->streams, ps->nstreams, sizeof(*ps->streams),
+              dvm_stream_name_cmp);
+    return true;
+}
+
+/* ── resume token ── */
+
+/* One "<name>:<offset>" entry at p. Sets *next past the entry and its
+ * trailing comma. NULL on success, else why the entry is malformed. */
+static const char *dvm_token_entry(const char *p, char *name, size_t cap,
+                                   long long *off, const char **next)
+{
+    const char *colon = strchr(p, ':');
+    const char *comma = strchr(p, ',');
+    char *end = NULL;
+    size_t len;
+    if (!colon || (comma && comma < colon))
+        return "a resume entry is <stream>:<offset>";
+    len = (size_t)(colon - p);
+    if (len == 0 || len >= cap)
+        return "a resume entry names no stream";
+    memcpy(name, p, len);
+    name[len] = '\0';
+    if (!dvm_cursor_name_ok(name) || !isdigit((unsigned char)colon[1]))
+        return "a resume entry is <stream>:<offset>";
+    errno = 0;
+    *off = strtoll(colon + 1, &end, 10);
+    if (errno != 0 || !end || (*end != ',' && *end != '\0'))
+        return "a resume offset is a non-negative integer";
+    *next = *end == ',' ? end + 1 : end;
+    return NULL;
+}
+
+/* Apply the token's per-stream offsets. A stream the token names but the
+ * dir no longer holds is dropped; a stream the token does not name starts
+ * at its beginning. NULL on success, else why the token is malformed. */
+static const char *dvm_token_apply(const char *token,
+                                   struct dvm_pull_state *ps)
+{
+    const char *p = token;
+    size_t entries = 0;
+    while (p && *p) {
+        char name[DVM_STREAM_NAME_MAX + 1];
+        long long off = 0;
+        const char *why =
+            dvm_token_entry(p, name, sizeof(name), &off, &p);
+        if (why)
+            return why;
+        if (++entries > DVM_STREAMS_MAX)
+            return "a resume token names more streams than a pull reads";
+        for (size_t i = 0; i < ps->nstreams; i++) {
+            if (strcmp(ps->streams[i].name, name) != 0)
+                continue;
+            if (ps->streams[i].named)
+                return "a resume token names one stream twice";
+            ps->streams[i].named = true;
+            ps->streams[i].off = off;
+        }
+    }
+    return NULL;
+}
+
+/* Open one stream at its offset. An offset past the end of the file, or
+ * one that does not follow a newline, cannot be a boundary this leaf handed
+ * out, so the file was replaced or truncated: refuse, never guess. */
+static bool dvm_stream_open(struct dvm_stream *s)
+{
+    struct stat st;
+    s->f = fopen(s->path, "rb");
+    if (!s->f)
+        return s->off == 0; /* vanished since the listing: nothing to read */
+    if (fstat(fileno(s->f), &st) != 0 || s->off > (long long)st.st_size)
+        return false;
+    if (s->off > 0) {
+        if (fseek(s->f, (long)(s->off - 1), SEEK_SET) != 0 ||
+            fgetc(s->f) != '\n')
+            return false;
+    }
+    return fseek(s->f, (long)s->off, SEEK_SET) == 0;
+}
+
+enum dvm_line_kind { DVM_LINE_OK, DVM_LINE_LONG, DVM_LINE_PARTIAL,
+                     DVM_LINE_EOF };
+
+/* Read one line. A last line with no newline yet is PARTIAL: a writer may
+ * still be appending it, so it is not consumed. A line longer than the
+ * buffer is read through to its newline and reported LONG. */
+static enum dvm_line_kind dvm_read_line(FILE *f, char *buf, size_t cap)
+{
+    size_t len;
+    if (!fgets(buf, (int)cap, f))
+        return DVM_LINE_EOF;
+    len = strlen(buf);
+    if (len > 0 && buf[len - 1] == '\n')
+        return DVM_LINE_OK;
+    if (feof(f))
+        return DVM_LINE_PARTIAL;
+    for (;;) {
+        int c = fgetc(f);
+        if (c == '\n')
+            return DVM_LINE_LONG;
+        if (c == EOF)
+            return DVM_LINE_PARTIAL;
+    }
+}
+
+/* Parse one complete line into *r when it is a row this pull returns.
+ * Malformed lines count as skipped; filtered rows do not. */
+static bool dvm_row_wanted(char *buf, const struct dvm_pull_filter *filter,
+                           struct dvm_row *r, struct dvm_pull_state *ps)
+{
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+        buf[--len] = '\0';
+    if (len == 0)
+        return false;
+    if (!dvm_parse_row(buf, r)) {
+        ps->skipped++; /* malformed line: skipped, never fatal */
+        return false;
+    }
+    if (r->seq <= filter->since)
+        return false;
+    if (filter->from && strcmp(r->from, filter->from) != 0)
+        return false;
+    return !filter->kind || strcmp(r->kind, filter->kind) == 0;
+}
+
+/* Load the stream's next returnable row as its head, consuming every line
+ * before it that this pull does not return. */
+static void dvm_stream_next(struct dvm_stream *s,
+                            const struct dvm_pull_filter *filter,
+                            struct dvm_pull_state *ps)
+{
+    s->has_head = false;
+    if (!s->f)
+        return;
+    for (;;) {
+        enum dvm_line_kind k = dvm_read_line(s->f, ps->line, sizeof(ps->line));
+        long long end;
+        if (k == DVM_LINE_EOF || k == DVM_LINE_PARTIAL)
+            return;
+        end = (long long)ftell(s->f);
+        if (k == DVM_LINE_LONG) {
+            ps->skipped++;
+            s->off = end;
+            continue;
+        }
+        if (!dvm_row_wanted(ps->line, filter, &s->head, ps)) {
+            s->off = end;
+            continue;
+        }
+        s->head_end = end;
+        s->has_head = true;
+        return;
+    }
+}
+
+/* The largest seq in one whole stream, whatever the page and filters. */
+static void dvm_stream_max_seq(const struct dvm_stream *s,
+                               struct dvm_pull_state *ps)
+{
+    FILE *f = fopen(s->path, "rb");
+    struct dvm_row r;
+    if (!f)
+        return;
+    for (;;) {
+        enum dvm_line_kind k = dvm_read_line(f, ps->line, sizeof(ps->line));
+        if (k == DVM_LINE_EOF || k == DVM_LINE_PARTIAL)
+            break;
+        if (k == DVM_LINE_OK && dvm_parse_row(ps->line, &r) &&
+            r.seq > ps->cursor)
+            ps->cursor = r.seq;
+    }
+    (void)fclose(f);
+}
+
+/* ── one page ── */
+
+/* The escaped length json_write gives s, quotes included. */
+static size_t dvm_json_len(const char *s)
+{
+    size_t n = 2;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\' || c == '\b' || c == '\f' || c == '\n' ||
+            c == '\r' || c == '\t')
+            n += 2;
+        else
+            n += c < 0x20 ? 6u : 1u;
+    }
+    return n;
+}
+
+/* Serialized bytes of one row object: its strings, escaped, plus keys,
+ * punctuation and the seq digits (generously). */
+static size_t dvm_row_cost(const struct dvm_row *r)
+{
+    return 160u + dvm_json_len(r->ts) + dvm_json_len(r->from) +
+           dvm_json_len(r->to) + dvm_json_len(r->kind) +
+           dvm_json_len(r->body) + dvm_json_len(r->ref) +
+           dvm_json_len(r->sender_binding);
+}
+
+/* The stream whose head sorts first by (ts, from, seq); a tie goes to the
+ * stream whose name sorts first. NULL when every stream is drained. */
+static struct dvm_stream *dvm_pick(struct dvm_pull_state *ps)
+{
+    struct dvm_stream *best = NULL;
+    for (size_t i = 0; i < ps->nstreams; i++) {
+        struct dvm_stream *s = &ps->streams[i];
+        if (!s->has_head)
+            continue;
+        if (!best || dvm_row_cmp(&s->head, &best->head) < 0)
+            best = s;
+    }
+    return best;
+}
+
+/* Merge stream heads into one page until a bound is reached or every
+ * stream is drained. Each stream is consumed as a prefix, so a row that a
+ * transport appends later — even with an older ts — is still ahead of the
+ * token and is returned on a later page, never skipped. */
+static void dvm_pull_page(struct dvm_pull_state *ps,
+                          const struct dvm_pull_filter *filter,
+                          struct dvm_page *pg)
+{
+    for (;;) {
+        struct dvm_stream *best = dvm_pick(ps);
+        size_t cost;
+        if (!best) {
+            pg->truncated = false;
+            return;
+        }
+        cost = dvm_row_cost(&best->head);
+        if (pg->n > 0 && (pg->n >= DVM_PAGE_ROWS ||
+                          pg->bytes + cost > DVM_PAGE_BYTES)) {
+            pg->truncated = true;
+            return;
+        }
+        pg->rows[pg->n++] = best->head;
+        pg->bytes += cost;
+        best->off = best->head_end;
+        dvm_stream_next(best, filter, ps);
+    }
+}
+
+/* "<floor>|<name>:<offset>,..." over every stream, in name order. */
+static bool dvm_token_build(const struct dvm_pull_state *ps, long long floor,
+                            char *out, size_t cap)
+{
+    size_t used;
+    int n = snprintf(out, cap, "%lld|", floor);
+    if (n <= 0 || (size_t)n >= cap)
+        return false;
+    used = (size_t)n;
+    for (size_t i = 0; i < ps->nstreams; i++) {
+        n = snprintf(out + used, cap - used, "%s%s:%lld", i ? "," : "",
+                     ps->streams[i].name, ps->streams[i].off);
+        if (n <= 0 || (size_t)n >= cap - used)
+            return false;
+        used += (size_t)n;
+    }
     return true;
 }
 
 static void dvm_pull_build_reply(struct zcl_command_reply *reply,
-                                 struct dvm_row *rows, size_t nrows,
-                                 long long cursor)
+                                 const struct dvm_page *pg,
+                                 const struct dvm_pull_state *ps,
+                                 const char *token)
 {
     struct json_value arr, item;
     json_init(&arr);
     json_set_array(&arr);
-    for (size_t i = 0; i < nrows; i++) {
+    for (size_t i = 0; i < pg->n; i++) {
+        const struct dvm_row *r = &pg->rows[i];
         json_init(&item);
         json_set_object(&item);
-        (void)json_push_kv_int(&item, "seq", rows[i].seq);
-        (void)json_push_kv_str(&item, "ts", rows[i].ts);
-        (void)json_push_kv_str(&item, "from", rows[i].from);
-        (void)json_push_kv_str(&item, "to", rows[i].to);
-        (void)json_push_kv_str(&item, "kind", rows[i].kind);
-        (void)json_push_kv_str(&item, "body", rows[i].body);
-        (void)json_push_kv_str(&item, "ref", rows[i].ref);
-        (void)json_push_kv_str(&item, "sender_binding",
-                               rows[i].sender_binding);
+        (void)json_push_kv_int(&item, "seq", r->seq);
+        (void)json_push_kv_str(&item, "ts", r->ts);
+        (void)json_push_kv_str(&item, "from", r->from);
+        (void)json_push_kv_str(&item, "to", r->to);
+        (void)json_push_kv_str(&item, "kind", r->kind);
+        (void)json_push_kv_str(&item, "body", r->body);
+        (void)json_push_kv_str(&item, "ref", r->ref);
+        (void)json_push_kv_str(&item, "sender_binding", r->sender_binding);
         (void)json_push_back(&arr, &item);
         json_free(&item);
     }
     (void)json_push_kv_str(&reply->data, "leaf", DVM_LEAF);
     (void)json_push_kv(&reply->data, "rows", &arr);
     json_free(&arr);
-    free(rows);
-    (void)json_push_kv_int(&reply->data, "cursor", cursor);
-    (void)json_push_kv_int(&reply->data, "count", (long long)nrows);
+    (void)json_push_kv_int(&reply->data, "cursor", ps->cursor);
+    (void)json_push_kv_int(&reply->data, "count", (long long)pg->n);
+    (void)json_push_kv_bool(&reply->data, "truncated", pg->truncated);
+    (void)json_push_kv_str(&reply->data, "next_since", token);
+    (void)json_push_kv_int(&reply->data, "skipped", ps->skipped);
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
+}
+
+/* Position every stream at its resume offset and load its first head.
+ * False with a fail reply already written. */
+static bool dvm_streams_start(struct zcl_command_reply *reply,
+                              const struct dvm_pull_filter *filter,
+                              struct dvm_pull_state *ps)
+{
+    const char *why = filter->token ? dvm_token_apply(filter->token, ps)
+                                    : NULL;
+    if (why) {
+        dvm_fail(reply, "BAD_INPUT", why, "input.since resume token");
+        return false;
+    }
+    for (size_t i = 0; i < ps->nstreams; i++) {
+        struct dvm_stream *s = &ps->streams[i];
+        dvm_stream_max_seq(s, ps);
+        if (!dvm_stream_open(s)) {
+            dvm_fail(reply, "MAIL_CURSOR_STALE",
+                     "the resume token does not name a line boundary of "
+                     "this stream; it was replaced or truncated",
+                     s->name);
+            (void)snprintf(reply->error.next_action,
+                           sizeof(reply->error.next_action), "%s",
+                           "z23-dev dev agent mail pull --since=0");
+            return false;
+        }
+        dvm_stream_next(s, filter, ps);
+    }
+    return true;
 }
 
 static void dvm_pull(const struct zcl_command_request *req,
                      struct zcl_command_reply *reply, const char *maildir)
 {
     struct dvm_pull_filter filter;
+    struct dvm_pull_state *ps;
+    struct dvm_page pg;
+    char token[DVM_TOKEN_CAP];
     if (!dvm_pull_parse_filter(req, reply, &filter))
         return;
-
-    long long cursor = filter.since;
-    struct dvm_row *rows = NULL;
-    size_t nrows = 0, caprows = 0;
-
-    if (!dvm_pull_scan_maildir(maildir, reply, &filter, &cursor, &rows,
-                               &nrows, &caprows))
+    ps = (struct dvm_pull_state *)zcl_calloc(1, sizeof(*ps),
+                                             "devagent_mail.pull");
+    memset(&pg, 0, sizeof(pg));
+    pg.rows = (struct dvm_row *)zcl_calloc(DVM_PAGE_ROWS, sizeof(*pg.rows),
+                                           "devagent_mail.page");
+    if (!ps || !pg.rows) {
+        free(ps);
+        free(pg.rows);
+        dvm_fail(reply, "MAIL_READ_FAILED", "cannot allocate one page",
+                 maildir);
         return;
-
-    if (nrows > 1)
-        qsort(rows, nrows, sizeof(*rows), dvm_row_cmp);
-
-    dvm_pull_build_reply(reply, rows, nrows, cursor);
+    }
+    ps->cursor = filter.since;
+    if (dvm_streams_list(maildir, reply, &filter, ps) &&
+        dvm_streams_start(reply, &filter, ps)) {
+        dvm_pull_page(ps, &filter, &pg);
+        if (pg.n > 1)
+            qsort(pg.rows, pg.n, sizeof(*pg.rows), dvm_row_cmp);
+        if (dvm_token_build(ps, filter.since, token, sizeof(token)))
+            dvm_pull_build_reply(reply, &pg, ps, token);
+        else
+            dvm_fail(reply, "MAIL_READ_FAILED",
+                     "the resume token exceeds its bound", maildir);
+    }
+    dvm_streams_close(ps);
+    free(ps);
+    free(pg.rows);
 }
 
 /* ── ack ─────────────────────────────────────────────────────────────────── */
