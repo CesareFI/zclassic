@@ -419,6 +419,46 @@ static int test_dl_received_pending_survives_colliding_insert(void)
     return failures;
 }
 
+static int test_dl_expired_received_pending_compacts_before_growth(void)
+{
+    int failures = 0;
+    TEST("expired received-pending guards do not grow the in-flight table") {
+        struct download_manager dm;
+        dl_init(&dm);
+
+        size_t old_slots = dm.num_slots;
+        for (size_t i = 0; i < old_slots / 2; i++) {
+            struct uint256 h = make_hash((uint8_t)(i + 1));
+            h.data[1] = (uint8_t)(i >> 8);
+            h.data[2] = 3;
+            ASSERT(dl_mark_requested(&dm, &h, 4000 + (int32_t)i, 1));
+            ASSERT(dl_mark_received(&dm, &h) == 1);
+        }
+        ASSERT(dm.num_received_pending == old_slots / 2);
+
+        /* Age every guard beyond the fail-open window. The next insertion
+         * has a fully reusable table and must compact the stale accounting,
+         * not double the allocation based on expired occupancy. */
+        int64_t expired = (int64_t)platform_time_wall_time_t() -
+                          DL_RECEIVED_PENDING_SECS - 1;
+        for (size_t i = 0; i < dm.num_slots; i++) {
+            if (!dm.slots[i].active && dm.slots[i].received_time != 0)
+                dm.slots[i].received_time = expired;
+        }
+
+        struct uint256 trigger = make_hash(205);
+        trigger.data[2] = 4;
+        ASSERT(dl_mark_requested(&dm, &trigger, 6000, 2));
+        ASSERT(dm.num_slots == old_slots);
+        ASSERT(dm.num_received_pending == 0);
+        ASSERT(dm.num_active == 1);
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_dl_assign_to_peer(void)
 {
     int failures = 0;
@@ -2117,6 +2157,7 @@ int test_download(void)
     failures += test_dl_received_pending_staging();
     failures += test_dl_received_pending_survives_rehash();
     failures += test_dl_received_pending_survives_colliding_insert();
+    failures += test_dl_expired_received_pending_compacts_before_growth();
     failures += test_dl_assign_to_peer();
     failures += test_dl_assignment_generation_parking();
     failures += test_dl_assignment_parking_is_per_peer();

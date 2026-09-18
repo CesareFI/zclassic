@@ -515,6 +515,21 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
     dm->num_received_pending = received_pending_count;
 }
 
+/* Expired received-pending guards are reusable but remain in the occupancy
+ * counter until a slot is activated or the table is rehashed. Only scan when
+ * the recorded occupancy reaches the growth threshold. */
+static bool dl_has_expired_received_pending(const struct download_manager *dm)
+{
+    int64_t now = (int64_t)platform_time_wall_time_t();
+    for (size_t i = 0; i < dm->num_slots; i++) {
+        const struct dl_in_flight *slot = &dm->slots[i];
+        if (!slot->active && slot->received_time != 0 &&
+            now - slot->received_time >= DL_RECEIVED_PENDING_SECS)
+            return true;
+    }
+    return false;
+}
+
 /* Grow or compact hash table.
  * Grows when load factor > 50%.
  * Compacts (rehash in place) when active entries < 25% of slots
@@ -522,6 +537,12 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
 static void maybe_grow(struct download_manager *dm)
 {
     size_t occupied = dm->num_active + dm->num_received_pending;
+    if (occupied * 2 >= dm->num_slots &&
+        dm->num_received_pending > 0 &&
+        dl_has_expired_received_pending(dm)) {
+        dl_rehash(dm, dm->num_slots);
+        occupied = dm->num_active + dm->num_received_pending;
+    }
     if (occupied * 2 >= dm->num_slots) {
         dl_rehash(dm, dm->num_slots * 2);
     } else if (dm->num_slots > INITIAL_SLOTS &&

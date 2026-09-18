@@ -168,3 +168,7 @@ later lane flips it HARD.
 - 2026-09-18T14:54:33Z — REASON: Refactor received-pending slot activation after complexity gate feedback; behavior unchanged from the authorized scheduler fix
   old ROOT: db077704a65881601c8d8164ed4ee5f247daa7fc0c560ad38792ac53d58bf14b
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T15:33:24Z — REASON: Compact expired received-pending block-download guards before scheduler table growth; memory efficiency only, no consensus or validation semantics change
+  old ROOT: 835a70d676498526d9587f574365b817ce6ee3c7d6addfa7a81ed78f93f018a2
+  by: owner unseal ritual (make core-unseal)
