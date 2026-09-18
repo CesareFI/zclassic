@@ -1394,6 +1394,45 @@ int test_devagent_receive(void)
         PASS();
     }
 
+    TEST("a configured workspace that is not a checkout refuses")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        struct rcv_workspace w;
+        char body[4096], ws[1200];
+        rtx_isolate("notcheckout");
+        /* A real directory the operator pointed at by mistake: it is
+         * there, it resolves, and it holds no .git. This is the most
+         * likely of the workspace refusals in practice — a typo, or a
+         * lane directory that was removed and recreated — and it was the
+         * one with no case, so the branch could have inverted and every
+         * other workspace test would still have passed. */
+        (void)snprintf(ws, sizeof(ws), "%s/plain", g_rtx_base);
+        ASSERT_EQ(mkdir(ws, 0700), 0);
+        ASSERT(zcl_devagent_workspace_observe(ws, true, &w));
+        ASSERT(w.directory);
+        ASSERT(w.resolved);
+        ASSERT(!w.checkout);
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction_sel(body, sizeof(body), "receiver", "", "Nowhere.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-nogit", body, 1));
+        rtx_opts_ws(&o, ws);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 1);
+        ASSERT_EQ(st.admitted, 0);
+        ASSERT_EQ(st.refused, 1);
+        ASSERT_EQ(rtx_answers("job-nogit",
+                              "RECEIVE_WORKSPACE_NOT_A_CHECKOUT"), 1);
+        ASSERT_EQ(rtx_answers("job-nogit",
+                              "configured-workspace-not-a-checkout"), 1);
+        /* Nothing reached the queue and no brief was written, so no
+         * worker can start a turn against a tree with no history. */
+        ASSERT_EQ(rtx_queue_count("queued", "job-nogit"), 0);
+        ASSERT(!rtx_exists("receive/brief/job-nogit.brief"));
+        rtx_restore();
+        PASS();
+    }
+
     TEST("a dirty resolved workspace refuses early, with the paths named")
     {
         struct rcv_drive_opts o;
