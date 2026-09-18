@@ -24,6 +24,8 @@
 #include "config/command_catalog.h"
 #include "json/json.h"
 #include "kernel/command_registry.h"
+#include "platform/confined_process.h"
+#include "platform/process_lifecycle.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -462,6 +464,67 @@ static void wtx_flip_submitted(const char *name, long long attempt,
     }
 }
 
+/* ── confinement backend: platform-neutral half ──────────────────────────
+ * The caps, the outcome mapping, the result record/parse/gate, the job
+ * hand-off, the write-root and environment choices are the same code on
+ * every host; these cases pin them on Linux. The Windows-only half (the
+ * restricted job itself) is proven natively by the devagent_worker_confine
+ * Windows acceptance program. */
+
+static bool wtx_fx_failed(const struct wkr_job *job, struct wkr_result *res)
+{
+    (void)job;
+    memset(res, 0, sizeof(*res));
+    (void)snprintf(res->terminal, sizeof(res->terminal), "%s", "failed");
+    res->rc = 3;
+    (void)snprintf(res->evidence, sizeof(res->evidence), "%s",
+                   "fixture failed on purpose");
+    res->tokens_used = 5;
+    return true;
+}
+
+static bool wtx_mkfile(const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+    (void)fclose(f);
+    return true;
+}
+
+/* A temp dir that looks like a worktree: a directory holding ".git". */
+static bool wtx_worktree(const char *tag, char *out, size_t cap, bool git)
+{
+    char marker[1200];
+    test_make_tmpdir(out, cap, "devagent_worker_ws", tag);
+    if (!git)
+        return true;
+    (void)snprintf(marker, sizeof(marker), "%s/.git", out);
+    return wtx_mkfile(marker);
+}
+
+static bool wtx_env_has(const char **env, const char *needle)
+{
+    for (size_t i = 0; env[i]; i++)
+        if (strstr(env[i], needle))
+            return true;
+    return false;
+}
+
+static bool wtx_outcome_is(int status, bool signaled, bool term, long long rc,
+                           const char *terminal)
+{
+    struct wkr_spawn_out out;
+    struct wkr_outcome o;
+    memset(&out, 0, sizeof(out));
+    out.status = status;
+    out.signaled = signaled;
+    zcl_devagent_worker_outcome(&out, term, &o);
+    if (!terminal)
+        return o.gate;
+    return !o.gate && o.rc == rc && strcmp(o.terminal, terminal) == 0;
+}
+
 int test_devagent_worker(void);
 int test_devagent_worker(void)
 {
@@ -889,6 +952,231 @@ int test_devagent_worker(void)
         ASSERT(wtx_runout_has("wtx-refused", 1, "rc=1\n"));
         ASSERT(wtx_runout_has("wtx-refused", 1, "fixture receipt"));
         wtx_restore();
+        PASS();
+    }
+
+    TEST("confine: caps derive the POSIX rlimits and the Windows job caps")
+    {
+        struct wkr_drive_opts o;
+        struct wkr_caps caps;
+        wtx_opts(&o, "wtx", "s-caps");
+        ASSERT(zcl_devagent_worker_caps(&o, &caps));
+        ASSERT_EQ(caps.memory_bytes, 512ull * 1024ull * 1024ull);
+        ASSERT_EQ(caps.cpu_s, 30);
+        ASSERT_EQ(caps.wall_s, 30);
+        ASSERT_EQ(caps.active_processes, WKR_ACTIVE_PROCESS_CAP);
+        /* An uncapped field keeps POSIX's "not capped" meaning and makes
+         * the set incomplete, which a Windows launch refuses. */
+        o.mem_mb = 0;
+        ASSERT(!zcl_devagent_worker_caps(&o, &caps));
+        ASSERT_EQ(caps.memory_bytes, 0ull);
+        ASSERT_EQ(caps.cpu_s, 30);
+        o.mem_mb = 512;
+        o.cpu_s = 0;
+        ASSERT(!zcl_devagent_worker_caps(&o, &caps));
+        ASSERT(!zcl_devagent_worker_caps(NULL, &caps));
+        PASS();
+    }
+
+    TEST("confine: one outcome mapping for both backends")
+    {
+        ASSERT(wtx_outcome_is(-1, false, false, 127, "launch-failed"));
+        ASSERT(wtx_outcome_is(-1, true, true, 127, "launch-failed"));
+        ASSERT(wtx_outcome_is(0, false, false, 124, "timeout"));
+        ASSERT(wtx_outcome_is(1, true, false, 130, "crashed"));
+        ASSERT(wtx_outcome_is(1, false, true, 130, "crashed"));
+        ASSERT(wtx_outcome_is(1, false, false, 0, NULL));
+        /* An exception or fast-fail exit is the Windows death by signal;
+         * an ordinary nonzero exit (the executor's rc) is not. */
+        ASSERT(platform_confined_exit_is_crash(0xC0000005u));
+        ASSERT(platform_confined_exit_is_crash(0xC0000409u));
+        ASSERT(platform_confined_exit_is_crash(0xC00000FDu));
+        ASSERT(!platform_confined_exit_is_crash(0u));
+        ASSERT(!platform_confined_exit_is_crash(3u));
+        ASSERT(!platform_confined_exit_is_crash(125u));
+        ASSERT(!platform_confined_exit_is_crash(1816u));
+        PASS();
+    }
+
+    TEST("confine: a failing executor exit maps to the failed verdict")
+    {
+        struct wkr_job *job = calloc(1, sizeof(*job));
+        struct wkr_result res;
+        struct wkr_spawn_out out;
+        struct wkr_outcome oc;
+        char verdict[32];
+        int code;
+        ASSERT(job != NULL);
+        test_make_tmpdir(job->rundir, sizeof(job->rundir),
+                         "devagent_worker", "cfail");
+        job->token_cap = 32000;
+        code = zcl_devagent_worker_child_record(job, wtx_fx_failed);
+        ASSERT_EQ(code, 3);
+        /* The parent saw an ordinary exit: the result file is gated. */
+        memset(&out, 0, sizeof(out));
+        out.status = 1;
+        zcl_devagent_worker_outcome(&out, false, &oc);
+        ASSERT(oc.gate);
+        ASSERT(zcl_devagent_worker_parse_result(job->rundir, &res));
+        ASSERT_STR_EQ(res.terminal, "failed");
+        ASSERT_EQ(res.rc, 3);
+        ASSERT_EQ(zcl_devagent_worker_gate(job, &res, verdict,
+                                           sizeof(verdict)), 1);
+        ASSERT_STR_EQ(verdict, "failed");
+        ASSERT_EQ(zcl_devagent_worker_child_record(job, NULL), 125);
+        free(job);
+        PASS();
+    }
+
+    TEST("confine: unarmed backend refuses and runs nothing")
+    {
+        struct wkr_drive_opts o;
+        struct wkr_job *job = calloc(1, sizeof(*job));
+        struct wkr_spawn_out out;
+        struct wkr_outcome oc;
+        struct platform_process proc;
+        struct platform_confined_spec spec;
+        struct platform_confined_report rep;
+        char path[4200];
+        ASSERT(job != NULL);
+        ASSERT_EQ((int)platform_confined_probe(),
+                  (int)PLATFORM_CONFINE_MISSING_OS);
+        ASSERT_STR_EQ(platform_confine_missing_name(
+                          PLATFORM_CONFINE_MISSING_OS), "os");
+        ASSERT_STR_EQ(platform_confine_missing_name(
+                          PLATFORM_CONFINE_MISSING_LOW_INTEGRITY),
+                      "low-integrity");
+        memset(&spec, 0, sizeof(spec));
+        platform_process_init(&proc);
+        ASSERT_EQ((int)platform_confined_start(&proc, &spec),
+                  (int)PLATFORM_CONFINE_MISSING_OS);
+        ASSERT(proc.native == UINTPTR_MAX);
+        ASSERT(!platform_confined_report(&proc, &rep));
+        ASSERT(!platform_confined_release_roots(NULL, 0));
+        ASSERT_EQ((int)platform_confined_self_check(1u << 30),
+                  (int)PLATFORM_CONFINE_MISSING_OS);
+        test_make_tmpdir(job->rundir, sizeof(job->rundir),
+                         "devagent_worker", "unarmed");
+        wtx_opts(&o, "wtx", "s-unarmed");
+        out = zcl_devagent_worker_spawn_confined(&o, job, NULL);
+        ASSERT_EQ(out.status, -1);
+        zcl_devagent_worker_outcome(&out, false, &oc);
+        ASSERT_EQ(oc.rc, 127);
+        ASSERT_STR_EQ(oc.note, "executor-launch-failed");
+        /* The re-entry refuses on a host with no confined backend and
+         * leaves no result behind. */
+        ASSERT_EQ(zcl_devagent_worker_child_main(job->rundir, wtx_fixture),
+                  2);
+        (void)snprintf(path, sizeof(path), "%s/executor_result.json",
+                       job->rundir);
+        ASSERT(!zcl_devagent_worker_file_exists(path));
+        free(job);
+        PASS();
+    }
+
+    TEST("confine: the job crosses the process boundary intact")
+    {
+        struct wkr_job *a = calloc(1, sizeof(*a));
+        struct wkr_job *b = calloc(1, sizeof(*b));
+        unsigned long long mem = 0;
+        char missing[1100];
+        ASSERT(a != NULL && b != NULL);
+        test_make_tmpdir(a->rundir, sizeof(a->rundir), "devagent_worker",
+                         "jobfile");
+        (void)snprintf(a->name, sizeof(a->name), "%s", "wtx-job");
+        (void)snprintf(a->kind, sizeof(a->kind), "%s", "leaf");
+        (void)snprintf(a->model, sizeof(a->model), "%s", "m-1");
+        (void)snprintf(a->task, sizeof(a->task), "%s",
+                       "name=wtx-job\nquote=\"q\" back=\\ tab=\t\n\nprose");
+        a->attempt = 2;
+        a->seq = 7;
+        a->token_cap = 32000;
+        a->time_cap_s = 30;
+        ASSERT(zcl_devagent_worker_job_store(a, 512ull << 20));
+        ASSERT(zcl_devagent_worker_job_load(a->rundir, b, &mem));
+        ASSERT_EQ(mem, 512ull << 20);
+        ASSERT_STR_EQ(b->rundir, a->rundir);
+        ASSERT_STR_EQ(b->name, a->name);
+        ASSERT_STR_EQ(b->kind, a->kind);
+        ASSERT_STR_EQ(b->model, a->model);
+        ASSERT_STR_EQ(b->task, a->task);
+        ASSERT_EQ(b->attempt, 2);
+        ASSERT_EQ(b->seq, 7);
+        ASSERT_EQ(b->token_cap, 32000);
+        ASSERT_EQ(b->time_cap_s, 30);
+        /* No memory cap, no job: the child would have nothing to verify. */
+        ASSERT(!zcl_devagent_worker_job_store(a, 0));
+        (void)snprintf(missing, sizeof(missing), "%s/absent", a->rundir);
+        ASSERT(!zcl_devagent_worker_job_load(missing, b, &mem));
+        free(a);
+        free(b);
+        PASS();
+    }
+
+    TEST("confine: only a named worktree becomes a write root")
+    {
+        char ws[1024], bare[1024], task[3000], out[4096];
+        ASSERT(wtx_worktree("git", ws, sizeof(ws), true));
+        ASSERT(wtx_worktree("bare", bare, sizeof(bare), false));
+        (void)snprintf(task, sizeof(task),
+                       "name=n\nkind=doc\nmuse-workspace: %s  \n"
+                       "muse-scope: src/\n\nprose", ws);
+        ASSERT(zcl_devagent_worker_task_workspace(task, out, sizeof(out)));
+        ASSERT_STR_EQ(out, ws);
+        /* Not a checkout, a filesystem root, relative, climbing, after the
+         * header block, or absent: never a write root. */
+        (void)snprintf(task, sizeof(task), "muse-workspace: %s\n", bare);
+        ASSERT(!zcl_devagent_worker_task_workspace(task, out, sizeof(out)));
+        ASSERT_STR_EQ(out, "");
+        ASSERT(!zcl_devagent_worker_task_workspace("muse-workspace: /\n",
+                                                   out, sizeof(out)));
+        ASSERT(!zcl_devagent_worker_task_workspace(
+            "muse-workspace: C:\\\n", out, sizeof(out)));
+        ASSERT(!zcl_devagent_worker_task_workspace(
+            "muse-workspace: rel/dir\n", out, sizeof(out)));
+        (void)snprintf(task, sizeof(task), "muse-workspace: %s/../x\n", ws);
+        ASSERT(!zcl_devagent_worker_task_workspace(task, out, sizeof(out)));
+        (void)snprintf(task, sizeof(task), "name=n\n\nmuse-workspace: %s\n",
+                       ws);
+        ASSERT(!zcl_devagent_worker_task_workspace(task, out, sizeof(out)));
+        ASSERT(!zcl_devagent_worker_task_workspace("name=n\n", out,
+                                                   sizeof(out)));
+        ASSERT(!zcl_devagent_worker_task_workspace(NULL, out, sizeof(out)));
+        PASS();
+    }
+
+    TEST("confine: the child environment is explicit and carries no secret")
+    {
+        static char store[WKR_ENV_MAX][WKR_ENV_ENTRY_MAX];
+        const char *env[WKR_ENV_MAX + 1];
+        static char saved_path[8192];
+        const char *old_path = getenv("PATH");
+        bool had_path = old_path != NULL;
+        int n;
+        if (had_path)
+            (void)snprintf(saved_path, sizeof(saved_path), "%s", old_path);
+        setenv("ANTHROPIC_API_KEY", "wtx-secret-anthropic", 1);
+        setenv("GITHUB_TOKEN", "wtx-secret-github", 1);
+        setenv("PATH", "/usr/bin:/bin", 1);
+        n = zcl_devagent_worker_child_env("/run/dir", store, env,
+                                          WKR_ENV_MAX);
+        unsetenv("ANTHROPIC_API_KEY");
+        unsetenv("GITHUB_TOKEN");
+        if (had_path)
+            setenv("PATH", saved_path, 1);
+        else
+            unsetenv("PATH");
+        ASSERT(n >= 3);
+        ASSERT(env[n] == NULL);
+        ASSERT(wtx_env_has(env, "PATH=/usr/bin:/bin"));
+        ASSERT(wtx_env_has(env, "TEMP=/run/dir"));
+        ASSERT(wtx_env_has(env, "TMP=/run/dir"));
+        ASSERT(!wtx_env_has(env, "wtx-secret"));
+        ASSERT(!wtx_env_has(env, "ANTHROPIC"));
+        ASSERT(!wtx_env_has(env, "TOKEN"));
+        /* Too little room is an overflow, never a truncated environment. */
+        ASSERT_EQ(zcl_devagent_worker_child_env("/run/dir", store, env, 1),
+                  -1);
         PASS();
     }
 #endif /* !defined(_WIN32) */

@@ -36,6 +36,7 @@
 #include "platform/process_lifecycle.h"
 #include "platform/time_compat.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -379,7 +380,8 @@ bool zcl_devagent_worker_job_store(const struct wkr_job *job,
     char *text;
     size_t n;
     bool ok;
-    if (!job || !job->rundir[0] ||
+    if (!job || !job->rundir[0] || memory_bytes == 0 ||
+        memory_bytes > (unsigned long long)INT64_MAX ||
         snprintf(path, sizeof(path), "%s/%s", job->rundir, WKR_JOB_FILE) >=
             (int)sizeof(path))
         return false;
