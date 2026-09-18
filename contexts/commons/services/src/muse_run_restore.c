@@ -8,6 +8,7 @@
 #include "services/muse_run_restore.h"
 #include "services/muse_run_audit.h"
 #include "base/safe_alloc.h"
+#include "util/file_tree_ops.h"
 #include "util/spawn.h"
 
 #include <errno.h>
@@ -17,6 +18,18 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* The Windows CRT exposes neither flag. Its descriptors wrap non-inheritable
+ * handles unless inheritance is requested, so a zero O_CLOEXEC keeps the
+ * boundary; and the only file this opens without following is one lstat()
+ * has already proven regular, so a zero O_NOFOLLOW there loses no check.
+ * (Same zero fallback as engine/modules/engine/src/engine_secret.c.) */
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
 
 #define MRR_OTHERS_MAX 65536u
 #define MRR_PATH_MAX 8192
@@ -435,7 +448,7 @@ static const char *mrr_keep_untracked(struct mrr_state *st)
     if (snprintf(dir, sizeof(dir), "%s/candidate-%s.untracked",
             st->in->rundir, st->in->candidate) >= (int)sizeof(dir))
         return "refused: the untracked copy directory does not fit";
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+    if (!zcl_mkdir_p(dir, 0700).ok)
         return "refused: the untracked copy directory could not be made";
     for (size_t i = 0; i < st->nfiles; i++) {
         const char *why = mrr_keep_one(st, dir, &st->files[i]);

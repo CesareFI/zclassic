@@ -311,6 +311,12 @@ static int mx_run_silent(const struct muse_run_task *t,
     return rc;
 }
 
+/* The recorded value, or the stand-in for an absent reading. */
+static const char *mx_or(const char *value, const char *absent)
+{
+    return value[0] ? value : absent;
+}
+
 /* The provenance block the result row carries: one key=value line per
  * recorded fact, with "-" or "none" standing in for an absent reading. */
 static void mx_evidence(struct wkr_result *res,
@@ -324,21 +330,21 @@ static void mx_evidence(struct wkr_result *res,
         "workspace_restored=%s\nworkspace_restore=%.160s\n"
         "reason=%s\n",
         mres->ref.seq, mres->ref.name, mres->ref.attempt,
-        mres->worker[0] ? mres->worker : "-",
-        mres->verdict[0] ? mres->verdict : "refused",
-        mres->terminal[0] ? mres->terminal : "none",
+        mx_or(mres->worker, "-"),
+        mx_or(mres->verdict, "refused"),
+        mx_or(mres->terminal, "none"),
         (unsigned long long)mres->total_tokens, mres->files_changed,
-        mres->base[0] ? mres->base : "none",
-        mres->candidate_file[0] ? mres->candidate_file : "none",
-        mres->gate[0] ? mres->gate : "-",
-        mres->gate_evidence[0] ? mres->gate_evidence : "-",
-        mres->model_resolved[0] ? mres->model_resolved : "-",
-        mres->session[0] ? mres->session : "-",
-        mres->turn[0] ? mres->turn : "-",
+        mx_or(mres->base, "none"),
+        mx_or(mres->candidate_file, "none"),
+        mx_or(mres->gate, "-"),
+        mx_or(mres->gate_evidence, "-"),
+        mx_or(mres->model_resolved, "-"),
+        mx_or(mres->session, "-"),
+        mx_or(mres->turn, "-"),
         mres->wall_ms,
         mres->workspace_restored ? "true" : "false",
-        mres->workspace_restore[0] ? mres->workspace_restore : "-",
-        mres->reason[0] ? mres->reason : (err[0] ? err : "-"));
+        mx_or(mres->workspace_restore, "-"),
+        mx_or(mres->reason, mx_or(err, "-")));
     if (w > 0)
         (void)snprintf(res->evidence, sizeof(res->evidence), "%s",
             evidence);
