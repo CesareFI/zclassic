@@ -85,7 +85,31 @@
  *     really is visible where its reader reads, and "acknowledged" once
  *     the ack cursor covers it.
  * "completed" is resolved for either kind from a retained queue outcome
- * naming the ref with an explicit pass verdict and rc 0.
+ * naming the ref with an explicit pass verdict and rc 0. A change row
+ * still "queued" carries queued_age_s, and a directive this host sent
+ * with no receiver evidence past FMC_QUEUED_STALE_S (120 s) becomes the
+ * blocker "directive <ref> to <to>: no receiver evidence after N s" — the
+ * visible form of "send said QUEUED but the target never read it".
+ *
+ * WORKERS. `agents` is only the names seen in mail and on the board. The
+ * `workers` array is evidence: an identity appears only after it answered
+ * as a receiver (a body carrying receiver=) or a worker (worker=), or as
+ * this host's resident (a queue row or a receiver/worker lock file).
+ * Remote fields are the worker's own newest words and are marked
+ * self_reported; this host's load, available memory and state-root disk
+ * are measured now. state is one of
+ *   working  a running queue row, or a ref claimed (stage running|engine)
+ *            with no terminal outcome (result row or queue outcome);
+ *   blocked  the newest answer is a refusal, queued local work has no
+ *            resident worker to claim it, or the local receiver's intake
+ *            (the same mail pull) failed;
+ *   idle     evidence newer than FMC_ALIVE_WINDOW_S and nothing open;
+ *   unknown  everything else,
+ * always with a reason. A lock held or a name seen is liveness at most,
+ * never work. Unknown numbers are JSON null, never 0: capacity reports
+ * known:false and all-null numbers when the queue did not answer, and
+ * token usage comes from run receipts (queue outcomes locally, result
+ * rows remotely) or stays null.
  *
  * STATE. <platform_state_root()>/steer (0700): grants.jsonl, sent.jsonl.
  * Single O_APPEND writes; revoke appends a superseding revoked row like
@@ -100,10 +124,12 @@
  * readable under a fresh grant.
  *
  * BOUNDS. brief changes[] default 25, max 100; agents/work/candidates 32;
- * blockers 16; body leads 160 chars; send at most 8 items, body at most
- * 2048 bytes each (under mail's own 4096 ceiling and refusal scanners,
- * which still apply). Mail bodies over-long or tripping refusal rules come
- * back per-item as refused, never as a crash.
+ * blockers 16; workers 16 emitted of 64 tracked; the whole reply data is
+ * trimmed (changes first) under FMC_REPLY_SOFT_BUDGET and budget_truncated
+ * names every array that was cut; body leads 160 chars; send at most 8
+ * items, body at most 2048 bytes each (under mail's own 4096 ceiling and
+ * refusal scanners, which still apply). Mail bodies over-long or tripping
+ * refusal rules come back per-item as refused, never as a crash.
  *
  * PROCESS RULE. No spawn, no shell, no popen()/system(), no sleep, no poll
  * loop. Only in-process sibling calls and local filesystem operations.
