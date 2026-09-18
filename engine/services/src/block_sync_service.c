@@ -745,6 +745,11 @@ bool syncsvc_should_disconnect_body_dark_peer(const struct p2p_node *node,
     if (body_timed_out < SYNC_BODY_STALL_MIN_TIMEOUTS)
         return false;
 
-    /* Genuine staleness: no body for a full stall window. */
-    return (now_seconds - last_body_time) >= SYNC_BODY_STALL_TIMEOUT_SECS;
+    /* Genuine staleness: no body for a full stall window. A backward wall
+     * clock correction leaves the cursor future-dated; once the peer has
+     * also accumulated the timeout floor, fail open instead of suppressing
+     * recovery until wall time catches up. Compare before subtracting so a
+     * corrupt extreme timestamp cannot overflow the age calculation. */
+    return now_seconds < last_body_time ||
+           (now_seconds - last_body_time) >= SYNC_BODY_STALL_TIMEOUT_SECS;
 }

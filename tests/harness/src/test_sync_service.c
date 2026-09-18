@@ -735,6 +735,16 @@ static int test_sync_service_body_dark_disconnect(void)
                    &node, our_height, 5, SYNC_BODY_STALL_MIN_TIMEOUTS,
                    now - (SYNC_BODY_STALL_TIMEOUT_SECS - 1), now));
 
+        /* A backward wall-clock correction must not let a future-dated body
+         * cursor suppress recovery until the old time catches up. The
+         * timeout floor remains mandatory evidence that the peer is dark. */
+        ASSERT(syncsvc_should_disconnect_body_dark_peer(
+                   &node, our_height, 5, SYNC_BODY_STALL_MIN_TIMEOUTS,
+                   now + 3600, now));
+        ASSERT(!syncsvc_should_disconnect_body_dark_peer(
+                   &node, our_height, 5,
+                   SYNC_BODY_STALL_MIN_TIMEOUTS - 1, now + 3600, now));
+
         /* Zero/unknown cursor is never judged (defensive). */
         ASSERT(!syncsvc_should_disconnect_body_dark_peer(
                    &node, our_height, 5, SYNC_BODY_STALL_MIN_TIMEOUTS, 0, now));
