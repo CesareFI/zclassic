@@ -132,4 +132,87 @@ struct rpc_table;
  * and wiki command leaf. */
 void boot_fleet_board_register_rpc(struct rpc_table *table);
 
+/* ── FLEET-scope carriage: the "board" mesh stream service ────────────────
+ * (engine/composition/src/boot_fleet_board_fleet.c)
+ *
+ * A FLEET-scope post never rides the public INV/GET flood above. It moves
+ * between PAIRED boxes only, over the existing mesh stream primitive, the
+ * same way the fleet ledger's rows do: pull only. A box asks each paired
+ * peer for the fleet posts that peer has received since the last one it
+ * saw, and answers the same question when asked. Nothing is pushed and
+ * nothing is volunteered. A stream opens over whichever session the two
+ * boxes already share, including one the ANSWERING box dialled, so a box
+ * behind NAT that dials out can still be pulled from.
+ *
+ * Who is answered: a peer whose pairing row grants the status capability,
+ * whose delegation is still current, and whose online key holds a role
+ * granting FLEET_BOARD_FLEET_READ_LEAF here. Anybody else is refused
+ * before the store is read. What is answered: fleet-scoped, verified,
+ * unexpired posts only, bounded by FLEET_BOARD_FLEET_ANSWER_POSTS_MAX and
+ * FLEET_BOARD_FLEET_ANSWER_MAX per pull. What is kept: every pulled post
+ * goes through db_fleet_board_post_ingest, so TTL, signature, the author
+ * key's role and the store caps all still decide, and a post this box
+ * already holds is a no-op by id. Public-scope behaviour is unchanged.
+ *
+ * The cursor is the ANSWERING box's own (received_at, id) keyset, held in
+ * memory per peer: a reclaim never rewrites it, and a restart simply asks
+ * from the beginning again, which dedupe by id makes free of effect. */
+
+#define FLEET_BOARD_FLEET_SERVICE_NAME "board"
+/* The command leaf whose grant lets a peer read this box's fleet posts:
+ * the worker and observer roles already carry it (roles.def). */
+#define FLEET_BOARD_FLEET_READ_LEAF "fleet.board.list"
+#define FLEET_BOARD_FLEET_PULL_INTERVAL_S 15
+#define FLEET_BOARD_FLEET_MSG_PULL 1u
+/* type, version, u64 after_received_at, 32-byte after_id */
+#define FLEET_BOARD_FLEET_PULL_BYTES 42u
+/* One answer record: u64 received_at, 32-byte id, u32 length, post wire. */
+#define FLEET_BOARD_FLEET_RECORD_HEAD 44u
+#define FLEET_BOARD_FLEET_ANSWER_MAX (size_t)(48u * 1024u)
+#define FLEET_BOARD_FLEET_ANSWER_POSTS_MAX 32u
+#define FLEET_BOARD_FLEET_INBOX_MAX 8u
+#define FLEET_BOARD_FLEET_PEERS_MAX 64u
+
+void boot_fleet_board_fleet_wire(struct boot_svc_ctx *svc);
+void boot_fleet_board_fleet_shutdown(void);
+/* Registered once; serves both halves of every board stream. */
+bool boot_fleet_board_fleet_register_service(void);
+
+/* Counted since this process started. delegation_refused: a paired peer
+ * whose delegation is no longer current, on either half. role_refused: a
+ * paired peer whose online key holds no FLEET_BOARD_FLEET_READ_LEAF grant,
+ * refused before the store was read. inbox_full: an answer that arrived
+ * with no free commit slot (asked for again next pull). stored: fleet posts
+ * a pull added to this box's store. */
+struct boot_fleet_board_fleet_counts {
+    uint64_t delegation_refused;
+    uint64_t role_refused;
+    uint64_t inbox_full;
+    uint64_t stored;
+};
+void boot_fleet_board_fleet_counts(struct boot_fleet_board_fleet_counts *out);
+
+#ifdef ZCL_TESTING
+struct vcs_zcode_dht_delegation;
+/* Seams that drive the EXACT production callbacks over a loopback, as the
+ * fleet ledger's do. bind names the ANSWERING box's store (both halves
+ * share one process) and forgets every per-peer cursor; pull opens the
+ * asking half toward a resolved peer with the cursor held for that peer's
+ * box id; pull_paired runs the real pull lane over the pairing rows; serve
+ * runs the answering tick once; drain_into commits the inbox into the
+ * ASKING box's store and returns how many posts it newly stored.
+ * bind_authority stands in for the DHT delegation lookup, the genesis and
+ * the clock, exactly as boot_fleet_ledger_test_bind_authority does; the
+ * pairing authority itself still runs. Pass NULL to unbind. */
+void boot_fleet_board_fleet_test_bind(struct node_db *serve_db);
+bool boot_fleet_board_fleet_test_pull(const uint8_t peer_noise[32],
+                                      const uint8_t peer_box_id[32]);
+void boot_fleet_board_fleet_test_pull_paired(int64_t now);
+void boot_fleet_board_fleet_test_serve(void);
+size_t boot_fleet_board_fleet_test_drain_into(struct node_db *ndb);
+void boot_fleet_board_fleet_test_bind_authority(
+    const struct vcs_zcode_dht_delegation *peer_delegation,
+    const uint8_t network_genesis[32], int64_t now);
+#endif
+
 #endif /* ZCL_CONFIG_BOOT_FLEET_BOARD_H */

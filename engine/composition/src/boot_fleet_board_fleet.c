@@ -1,0 +1,860 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * purpose: The "board" mesh stream service — FLEET-scope board posts pulled
+ * between PAIRED peers (see config/boot_fleet_board.h). It is the fleet
+ * ledger's pull lane (boot_fleet_ledger.c) applied to the board: one
+ * registration serves both halves, the stream lane only ever copies bytes,
+ * and every verify and every store write happens on this lane's own tick
+ * with no lock held.
+ */
+
+// one-result-type-ok:closed-security-verdict — the callbacks return the
+// stream primitive's bounded refusal enum; no diagnostic text crosses the
+// wire. Failure logging happens here, with the refusal named.
+
+#include "config/boot_fleet_board.h"
+
+#include "config/boot_internal.h"
+#include "config/boot_zcode_dht.h"
+#include "config/mesh_stream.h"
+#include "config/runtime.h"
+#include "boot_mesh_status_internal.h"
+
+#include "util/fleet_role_check.h"
+#include "base/safe_alloc.h"
+#include "base/serialize_le.h"
+#include "models/fleet_board_post.h"
+#include "models/mesh_pairing.h"
+#include "platform/time_compat.h"
+#include "services/mesh_pairing_service.h"
+#include "supervisors/domains.h"
+#include "util/log_macros.h"
+#include "util/supervisor.h"
+#include "util/sync.h"
+#include "vcs/zcode_dht_identity.h"
+
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* The asking half's per-stream state: whom we asked, and what came back. */
+struct board_pull_state {
+    uint8_t peer_box_id[32];
+    size_t len;
+    uint8_t rows[FLEET_BOARD_FLEET_ANSWER_MAX];
+};
+
+/* The answering half's per-stream state: one bounded answer, read once at
+ * open. */
+struct board_serve_state {
+    size_t len;
+    size_t sent;
+    uint8_t rows[FLEET_BOARD_FLEET_ANSWER_MAX];
+};
+
+/* An answer waiting for the tick to verify and store it. */
+struct board_inbox_slot {
+    bool used;
+    uint8_t peer_box_id[32];
+    size_t len;
+    uint8_t *rows;
+};
+
+/* Where the next pull toward one peer starts: that peer's own arrival
+ * keyset for the last record this box took from it. */
+struct board_cursor {
+    bool used;
+    uint8_t peer_box_id[32];
+    int64_t received_at;
+    uint8_t id[32];
+};
+
+static zcl_mutex_t g_lock;
+static zcl_once_t g_lock_once = ZCL_ONCE_INIT;
+static struct boot_svc_ctx *g_svc; /* borrowed; set by wire() */
+static struct board_inbox_slot g_inbox[FLEET_BOARD_FLEET_INBOX_MAX];
+static struct board_cursor g_cursors[FLEET_BOARD_FLEET_PEERS_MAX];
+static struct liveness_contract g_contract;
+static supervisor_child_id g_child = SUPERVISOR_INVALID_ID;
+static int64_t g_last_pull;
+static _Atomic uint64_t g_delegation_refused;
+static _Atomic uint64_t g_role_refused;
+static _Atomic uint64_t g_inbox_full;
+static _Atomic uint64_t g_stored;
+
+#ifdef ZCL_TESTING
+/* See boot_fleet_board_fleet_test_bind / _bind_authority. */
+static struct node_db *g_test_db;
+static bool g_test_authority;
+static struct vcs_zcode_dht_delegation g_test_delegation;
+static uint8_t g_test_genesis[32];
+static int64_t g_test_now;
+#endif
+
+static void board_lock_init(void)
+{
+    zcl_mutex_init(&g_lock);
+}
+
+static void board_lock(void)
+{
+    (void)zcl_once_call(&g_lock_once, board_lock_init);
+    zcl_mutex_lock(&g_lock);
+}
+
+static void board_unlock(void)
+{
+    zcl_mutex_unlock(&g_lock);
+}
+
+/* The board store this box serves from and commits into. */
+static struct node_db *board_db(void)
+{
+    board_lock();
+    struct node_db *ndb = g_svc ? g_svc->node_db : NULL;
+#ifdef ZCL_TESTING
+    if (g_test_db)
+        ndb = g_test_db;
+#endif
+    board_unlock();
+    return ndb && ndb->open ? ndb : NULL;
+}
+
+/* ── the PULL frame ──────────────────────────────────────────────────── */
+
+static size_t pull_encode(int64_t after_received_at, const uint8_t after_id[32],
+                          uint8_t out[FLEET_BOARD_FLEET_PULL_BYTES])
+{
+    out[0] = (uint8_t)FLEET_BOARD_FLEET_MSG_PULL;
+    out[1] = 1u; /* protocol version */
+    zcl_write_u64_be(out + 2, (uint64_t)after_received_at);
+    memcpy(out + 10, after_id, 32);
+    return FLEET_BOARD_FLEET_PULL_BYTES;
+}
+
+static bool pull_decode(const uint8_t *in, size_t len, int64_t *after_out,
+                        uint8_t after_id[32])
+{
+    if (!in || len != FLEET_BOARD_FLEET_PULL_BYTES ||
+        in[0] != (uint8_t)FLEET_BOARD_FLEET_MSG_PULL || in[1] != 1u)
+        return false;
+    uint64_t after = zcl_read_u64_be(in + 2);
+    if (after > (uint64_t)INT64_MAX)
+        return false;
+    *after_out = (int64_t)after;
+    memcpy(after_id, in + 10, 32);
+    return true;
+}
+
+/* ── who may ask ─────────────────────────────────────────────────────── */
+
+/* The composition roots this decision reads, named so the test group can
+ * stand in for the DHT lookup it cannot host (boot_fleet_ledger.c has the
+ * same three, for the same reason). */
+static bool board_peer_delegation(const struct db_mesh_pairing *row,
+                                  struct vcs_zcode_dht_delegation *out)
+{
+#ifdef ZCL_TESTING
+    if (g_test_authority) {
+        if (memcmp(row->peer_noise_pubkey,
+                   g_test_delegation.noise_static_pubkey, 32) != 0)
+            return false;
+        *out = g_test_delegation;
+        return true;
+    }
+#endif
+    return boot_mesh_peer_delegation(row, out);
+}
+
+static bool board_network_genesis(uint8_t out[32])
+{
+#ifdef ZCL_TESTING
+    if (g_test_authority) {
+        memcpy(out, g_test_genesis, 32);
+        return true;
+    }
+#endif
+    return boot_zcode_dht_network_genesis(out);
+}
+
+static int64_t board_now(void)
+{
+#ifdef ZCL_TESTING
+    if (g_test_authority)
+        return g_test_now;
+#endif
+    return (int64_t)platform_time_wall_time_t();
+}
+
+/* The pairing row's own window cannot say whether the peer's master
+ * identity is still ACTIVE on chain, so that is asked separately. A
+ * refusal is counted and named, never the peer. */
+static bool board_delegation_current(
+    struct node_db *ndb, const struct db_mesh_pairing *row,
+    const struct vcs_zcode_dht_delegation *peer,
+    const uint8_t session_noise_static[32], int64_t now)
+{
+    uint8_t network_genesis[32];
+    enum mesh_pairing_reason reason = MESH_PAIRING_BAD_ARGUMENT;
+    if (board_network_genesis(network_genesis))
+        reason = mesh_pairing_service_authorize_status(
+            ndb, network_genesis, row->pairing_id, peer,
+            session_noise_static, now);
+    if (reason == MESH_PAIRING_OK)
+        return true;
+    atomic_fetch_add_explicit(&g_delegation_refused, 1, memory_order_relaxed);
+    LOG_WARN("fleet.board", "fleet pull refused: delegation %s",
+             mesh_pairing_reason_token(reason));
+    return false;
+}
+
+/* The pairing row for one Noise static: bounded, and fail-closed on an
+ * unreadable list. */
+static bool board_pairing_for_peer(struct node_db *ndb,
+                                   const uint8_t peer_noise_static[32],
+                                   struct db_mesh_pairing *out)
+{
+    struct db_mesh_pairing *rows = zcl_calloc(
+        FLEET_BOARD_FLEET_PEERS_MAX, sizeof *rows, "fleet_board_pairing");
+    if (!rows)
+        return false;
+    int count = db_mesh_pairing_list(ndb, rows, FLEET_BOARD_FLEET_PEERS_MAX);
+    bool found = false;
+    for (int i = 0; i < count && !found; i++) {
+        if (memcmp(rows[i].peer_noise_pubkey, peer_noise_static, 32) != 0)
+            continue;
+        *out = rows[i];
+        found = true;
+    }
+    free(rows);
+    return found;
+}
+
+/* A paired, current peer still reads fleet-private posts only when the
+ * key it signs with holds a role granting the board's read leaf here. */
+static bool board_peer_may_read(const uint8_t signer[32])
+{
+    char why[ZCL_FLEET_ROLE_WHY_MAX];
+    if (zcl_fleet_role_allows(signer, FLEET_BOARD_FLEET_READ_LEAF, NULL, why,
+                              sizeof why))
+        return true;
+    atomic_fetch_add_explicit(&g_role_refused, 1, memory_order_relaxed);
+    LOG_WARN("fleet.board", "fleet pull refused: %s", why);
+    return false;
+}
+
+/* Everything the answering half proves about a peer that is already
+ * through the primitive's Noise and capability gates, before any post is
+ * read. */
+static bool board_accept_authorized(const uint8_t peer_noise_static[32])
+{
+    struct node_db *ndb = app_runtime_node_db();
+    if (!ndb || !app_runtime_node_db_handle_open(ndb))
+        return false;
+    struct db_mesh_pairing row;
+    struct vcs_zcode_dht_delegation peer;
+    if (!board_pairing_for_peer(ndb, peer_noise_static, &row) ||
+        !board_peer_delegation(&row, &peer)) {
+        atomic_fetch_add_explicit(&g_delegation_refused, 1,
+                                  memory_order_relaxed);
+        LOG_WARN("fleet.board", "fleet pull refused: delegation_unresolved");
+        return false;
+    }
+    return board_delegation_current(ndb, &row, &peer, peer_noise_static,
+                                    board_now()) &&
+           board_peer_may_read(peer.online_pubkey);
+}
+
+/* ── the answer ──────────────────────────────────────────────────────── */
+
+struct board_answer {
+    uint8_t *buf;
+    size_t cap;
+    size_t len;
+    unsigned count;
+};
+
+/* Append one record, or stop the page when it would not fit: the next
+ * pull starts at exactly this row, so nothing is skipped. */
+static bool board_answer_visit(const struct db_fleet_board_post *row,
+                               void *ctx)
+{
+    struct board_answer *a = ctx;
+    const size_t head = FLEET_BOARD_FLEET_RECORD_HEAD;
+    if (a->count >= FLEET_BOARD_FLEET_ANSWER_POSTS_MAX ||
+        a->cap - a->len <= head)
+        return false;
+    uint8_t *at = a->buf + a->len;
+    size_t wire_len = 0;
+    if (fleet_board_post_encode(&row->post, at + head, a->cap - a->len - head,
+                                &wire_len) != FLEET_BOARD_OK)
+        return false;
+    zcl_write_u64_be(at, (uint64_t)row->received_at);
+    memcpy(at + 8, row->post.id, 32);
+    zcl_write_u32_be(at + 40, (uint32_t)wire_len);
+    a->len += head + wire_len;
+    a->count++;
+    return true;
+}
+
+/* ── the service callbacks ───────────────────────────────────────────── */
+
+/* An inbound OPEN. The primitive has proven the Noise session and a
+ * pairing row granting the capability; this lane proves the delegation is
+ * current and the peer holds the read role, and only then reads the page
+ * once, here, so the tick never touches the store for the answering half. */
+static enum mesh_stream_refusal board_service_open(struct mesh_stream *st,
+                                                   const uint8_t *payload,
+                                                   size_t len, uint8_t *reply,
+                                                   size_t reply_cap,
+                                                   size_t *reply_len,
+                                                   void *ctx)
+{
+    (void)ctx;
+    (void)reply;
+    (void)reply_cap;
+    if (reply_len)
+        *reply_len = 0;
+    int64_t after = 0;
+    uint8_t after_id[32];
+    if (!pull_decode(payload, len, &after, after_id))
+        return MESH_STREAM_REFUSED_MALFORMED;
+    if (!board_accept_authorized(st->peer_static))
+        return MESH_STREAM_REFUSED_PEER_UNPAIRED;
+    struct node_db *ndb = board_db();
+    if (!ndb)
+        return MESH_STREAM_REFUSED_UNAVAILABLE;
+    struct board_serve_state *s =
+        zcl_calloc(1, sizeof *s, "fleet_board_serve");
+    if (!s)
+        return MESH_STREAM_REFUSED_UNAVAILABLE;
+    struct board_answer a = { s->rows, sizeof s->rows, 0, 0 };
+    if (db_fleet_board_fleet_after(ndb, board_now(), after, after_id,
+                                   board_answer_visit, &a) < 0) {
+        free(s);
+        return MESH_STREAM_REFUSED_UNAVAILABLE;
+    }
+    s->len = a.len;
+    st->service_state = s;
+    return MESH_STREAM_OK;
+}
+
+/* The asking half receives the answer: bytes are copied and credit is
+ * given back; nothing is verified and nothing is written here. */
+static void board_service_data(struct mesh_stream *st, const uint8_t *payload,
+                               size_t len, void *ctx)
+{
+    (void)ctx;
+    if (!st->local_initiator)
+        return;
+    struct board_pull_state *p = st->service_state;
+    if (!p || !payload || len == 0)
+        return;
+    if (p->len + len > sizeof p->rows) {
+        /* More than one answer's worth: the peer is off protocol, so the
+         * stream ends rather than the buffer growing. */
+        mesh_stream_close(st, MESH_STREAM_CLOSED_BY_SERVICE, NULL, 0);
+        return;
+    }
+    memcpy(p->rows + p->len, payload, len);
+    p->len += len;
+    (void)mesh_stream_grant(st, (uint32_t)len);
+}
+
+/* The answering half's drain: one answer inside the credit it holds, then
+ * the stream is done. An empty answer closes at once, which is what makes
+ * a pull with nothing new free. */
+static void board_service_tick(struct mesh_stream *st, int64_t now, void *ctx)
+{
+    (void)now;
+    (void)ctx;
+    if (st->local_initiator)
+        return;
+    struct board_serve_state *s = st->service_state;
+    size_t remaining = s ? s->len - s->sent : 0;
+    if (remaining == 0) {
+        mesh_stream_close(st, MESH_STREAM_CLOSED_BY_SERVICE, NULL, 0);
+        return;
+    }
+    if (st->send_credit < remaining)
+        return; /* wait for the window; never split an answer */
+    if (mesh_stream_send(st, s->rows + s->sent, remaining))
+        s->sent += remaining;
+}
+
+/* Take a free inbox slot for one finished answer. Lane lock held. */
+static struct board_inbox_slot *board_inbox_claim(void)
+{
+    for (size_t i = 0; i < FLEET_BOARD_FLEET_INBOX_MAX; i++)
+        if (!g_inbox[i].used)
+            return &g_inbox[i];
+    return NULL;
+}
+
+/* The stream ended. A finished answer moves into the inbox by pointer; an
+ * answer that did not finish has no standing and is asked for again. */
+static void board_service_close(struct mesh_stream *st,
+                                enum mesh_stream_refusal reason,
+                                const uint8_t *payload, size_t len, void *ctx)
+{
+    (void)payload;
+    (void)len;
+    (void)ctx;
+    struct board_pull_state *p = st->service_state;
+    if (!st->local_initiator || !p || p->len == 0 ||
+        (reason != MESH_STREAM_CLOSED_BY_SERVICE && reason != MESH_STREAM_OK))
+        return;
+    uint8_t *rows = zcl_malloc(p->len, "fleet_board_inbox");
+    if (!rows)
+        return;
+    memcpy(rows, p->rows, p->len);
+    board_lock();
+    struct board_inbox_slot *slot = board_inbox_claim();
+    if (slot) {
+        slot->used = true;
+        memcpy(slot->peer_box_id, p->peer_box_id, 32);
+        slot->len = p->len;
+        slot->rows = rows;
+    }
+    board_unlock();
+    if (!slot) {
+        free(rows);
+        atomic_fetch_add_explicit(&g_inbox_full, 1, memory_order_relaxed);
+        LOG_WARN("fleet.board",
+                 "fleet answer deferred: inbox full (%u slots)",
+                 (unsigned)FLEET_BOARD_FLEET_INBOX_MAX);
+    }
+}
+
+static void board_service_release(struct mesh_stream *st, void *ctx)
+{
+    (void)ctx;
+    free(st->service_state);
+    st->service_state = NULL;
+}
+
+bool boot_fleet_board_fleet_register_service(void)
+{
+    struct mesh_stream_service service;
+    memset(&service, 0, sizeof(service));
+    service.name = FLEET_BOARD_FLEET_SERVICE_NAME;
+    /* The grant the fleet ledger and a mesh status read already use: a
+     * pairing record is insert-only, so demanding a new bit would leave
+     * this service dead on every pairing the fleet already committed. The
+     * read role checked in on_open is what narrows it. */
+    service.required_pairing_capability = MESH_PAIRING_CAP_STATUS_READ;
+    service.on_open = board_service_open;
+    service.on_data = board_service_data;
+    service.on_close = board_service_close;
+    service.on_tick = board_service_tick;
+    service.on_release = board_service_release;
+    return mesh_stream_service_register(&service);
+}
+
+/* ── per-peer cursors ────────────────────────────────────────────────── */
+
+/* Lane lock held. NULL when the table is full: that peer is then always
+ * asked from the beginning, which dedupe by id keeps correct. */
+static struct board_cursor *board_cursor_slot(const uint8_t box_id[32],
+                                              bool create)
+{
+    struct board_cursor *free_slot = NULL;
+    for (size_t i = 0; i < FLEET_BOARD_FLEET_PEERS_MAX; i++) {
+        if (g_cursors[i].used &&
+            memcmp(g_cursors[i].peer_box_id, box_id, 32) == 0)
+            return &g_cursors[i];
+        if (!g_cursors[i].used && !free_slot)
+            free_slot = &g_cursors[i];
+    }
+    if (!create || !free_slot)
+        return NULL;
+    memset(free_slot, 0, sizeof *free_slot);
+    free_slot->used = true;
+    memcpy(free_slot->peer_box_id, box_id, 32);
+    return free_slot;
+}
+
+static void board_cursor_read(const uint8_t box_id[32], int64_t *received_at,
+                              uint8_t id[32])
+{
+    *received_at = 0;
+    memset(id, 0, 32);
+    board_lock();
+    const struct board_cursor *c = board_cursor_slot(box_id, false);
+    if (c) {
+        *received_at = c->received_at;
+        memcpy(id, c->id, 32);
+    }
+    board_unlock();
+}
+
+/* Forward only: a cursor never moves back past a record already taken. */
+static void board_cursor_advance(const uint8_t box_id[32], int64_t received_at,
+                                 const uint8_t id[32])
+{
+    board_lock();
+    struct board_cursor *c = board_cursor_slot(box_id, true);
+    if (c && (received_at > c->received_at ||
+              (received_at == c->received_at && memcmp(id, c->id, 32) > 0))) {
+        c->received_at = received_at;
+        memcpy(c->id, id, 32);
+    }
+    board_unlock();
+}
+
+/* ── the commit, on this lane's tick ─────────────────────────────────── */
+
+struct board_record {
+    int64_t received_at;
+    uint8_t id[32];
+    const uint8_t *wire;
+    size_t wire_len;
+};
+
+/* The next framed record, or false at the end or at a frame that does not
+ * add up — the rest of such an answer cannot be read and is not guessed. */
+static bool board_record_next(const uint8_t *buf, size_t len, size_t *off,
+                              struct board_record *rec)
+{
+    const size_t head = FLEET_BOARD_FLEET_RECORD_HEAD;
+    if (*off >= len || len - *off < head)
+        return false;
+    const uint8_t *at = buf + *off;
+    uint64_t received_at = zcl_read_u64_be(at);
+    uint32_t wire_len = zcl_read_u32_be(at + 40);
+    if (received_at > (uint64_t)INT64_MAX || wire_len == 0 ||
+        wire_len > len - *off - head)
+        return false;
+    rec->received_at = (int64_t)received_at;
+    memcpy(rec->id, at + 8, 32);
+    rec->wire = at + head;
+    rec->wire_len = wire_len;
+    *off += head + wire_len;
+    return true;
+}
+
+/* A refusal that is about THIS box right now, not about the post: the
+ * cursor stays put and the next pull asks for the same record again. */
+static bool board_refusal_transient(enum fleet_board_result r)
+{
+    return r == FLEET_BOARD_ERR_BUSY || r == FLEET_BOARD_ERR_STORAGE ||
+           r == FLEET_BOARD_ERR_CAPACITY || r == FLEET_BOARD_ERR_ARGS;
+}
+
+/* Decode, prove it is the record the header named and that it is
+ * fleet-scoped, then hand it to the one ingest every post goes through. */
+static enum fleet_board_result board_record_ingest(
+    struct node_db *ndb, const struct board_record *rec,
+    struct fleet_board_post *post, int64_t now, bool *stored)
+{
+    *stored = false;
+    enum fleet_board_result r =
+        fleet_board_post_decode(rec->wire, rec->wire_len, post);
+    if (r != FLEET_BOARD_OK)
+        return r;
+    if (memcmp(post->id, rec->id, 32) != 0)
+        return FLEET_BOARD_ERR_ID;
+    if (post->scope != FLEET_BOARD_SCOPE_FLEET)
+        return FLEET_BOARD_ERR_SCOPE;
+    return db_fleet_board_post_ingest(ndb, post, now, stored);
+}
+
+static size_t board_drain_slot(struct node_db *ndb,
+                               const struct board_inbox_slot *slot,
+                               struct fleet_board_post *post, int64_t now)
+{
+    size_t off = 0;
+    size_t stored_count = 0;
+    struct board_record rec;
+    struct board_record last;
+    memset(&last, 0, sizeof last);
+    bool advanced = false;
+    while (board_record_next(slot->rows, slot->len, &off, &rec)) {
+        bool stored = false;
+        enum fleet_board_result r =
+            board_record_ingest(ndb, &rec, post, now, &stored);
+        if (board_refusal_transient(r)) {
+            LOG_WARN("fleet.board", "fleet post deferred: %s",
+                     fleet_board_result_string(r));
+            break;
+        }
+        /* An expired post is stale, not wrong; every other refusal is
+         * named. None names the post's text: that is the fleet's own. */
+        if (r != FLEET_BOARD_OK && r != FLEET_BOARD_ERR_EXPIRED)
+            LOG_WARN("fleet.board", "fleet post refused: %s",
+                     fleet_board_result_string(r));
+        if (stored)
+            stored_count++;
+        last = rec;
+        advanced = true;
+    }
+    if (advanced)
+        board_cursor_advance(slot->peer_box_id, last.received_at, last.id);
+    return stored_count;
+}
+
+static size_t board_drain_inbox(struct node_db *ndb, int64_t now)
+{
+    struct fleet_board_post *post =
+        zcl_calloc(1, sizeof *post, "fleet_board_drain");
+    if (!post)
+        return 0;
+    size_t stored = 0;
+    for (size_t i = 0; i < FLEET_BOARD_FLEET_INBOX_MAX; i++) {
+        board_lock();
+        struct board_inbox_slot slot = g_inbox[i];
+        memset(&g_inbox[i], 0, sizeof g_inbox[i]);
+        board_unlock();
+        if (!slot.used)
+            continue;
+        if (ndb)
+            stored += board_drain_slot(ndb, &slot, post, now);
+        free(slot.rows);
+    }
+    free(post);
+    atomic_fetch_add_explicit(&g_stored, stored, memory_order_relaxed);
+    return stored;
+}
+
+/* ── the pull lane ───────────────────────────────────────────────────── */
+
+struct board_live_probe {
+    uint8_t peer_static[32];
+    bool found;
+};
+
+static bool board_live_visitor(struct mesh_stream *st, void *ctx)
+{
+    struct board_live_probe *probe = ctx;
+    if (st->local_initiator && !st->ended &&
+        memcmp(st->peer_static, probe->peer_static, 32) == 0) {
+        probe->found = true;
+        return false;
+    }
+    return true;
+}
+
+/* The one PULL this protocol has, toward a peer the caller has already
+ * verified. The lane and the loopback test both enter here. */
+static bool board_open_pull(const uint8_t peer_noise[32],
+                            const uint8_t peer_box_id[32])
+{
+    struct board_pull_state *p =
+        zcl_calloc(1, sizeof *p, "fleet_board_pull");
+    if (!p)
+        return false;
+    memcpy(p->peer_box_id, peer_box_id, 32);
+    int64_t after = 0;
+    uint8_t after_id[32];
+    board_cursor_read(peer_box_id, &after, after_id);
+    uint8_t frame[FLEET_BOARD_FLEET_PULL_BYTES];
+    size_t frame_len = pull_encode(after, after_id, frame);
+    uint64_t stream_id = 0;
+    enum mesh_stream_refusal refusal =
+        mesh_stream_open(FLEET_BOARD_FLEET_SERVICE_NAME, peer_noise, 0, frame,
+                         frame_len, p, &stream_id);
+    if (refusal == MESH_STREAM_OK)
+        return true;
+    if (refusal != MESH_STREAM_REFUSED_PEER_NOT_CONNECTED)
+        LOG_WARN("fleet.board", "fleet pull not opened: %s",
+                 mesh_stream_refusal_string(refusal));
+    free(p);
+    return false;
+}
+
+/* Is this paired row a peer due a pull right now? The same questions the
+ * answering half asks, so a stale peer is neither asked nor answered. */
+static bool board_peer_due(struct node_db *ndb,
+                           const struct db_mesh_pairing *row, int64_t now,
+                           struct vcs_zcode_dht_delegation *peer)
+{
+    if (!mesh_pairing_allows(row, MESH_PAIRING_CAP_STATUS_READ, now) ||
+        !board_peer_delegation(row, peer) ||
+        !board_delegation_current(ndb, row, peer, row->peer_noise_pubkey,
+                                  now))
+        return false;
+    struct board_live_probe probe;
+    memset(&probe, 0, sizeof probe);
+    memcpy(probe.peer_static, row->peer_noise_pubkey, 32);
+    mesh_stream_visit(FLEET_BOARD_FLEET_SERVICE_NAME, board_live_visitor,
+                      &probe);
+    return !probe.found;
+}
+
+static void board_pull_paired_peers(int64_t now)
+{
+    struct node_db *ndb = app_runtime_node_db();
+    if (!ndb || !app_runtime_node_db_handle_open(ndb))
+        return;
+    struct db_mesh_pairing *rows = zcl_calloc(
+        FLEET_BOARD_FLEET_PEERS_MAX, sizeof *rows, "fleet_board_pairings");
+    if (!rows)
+        return;
+    int count = db_mesh_pairing_list(ndb, rows, FLEET_BOARD_FLEET_PEERS_MAX);
+    for (int i = 0; i < count; i++) {
+        struct vcs_zcode_dht_delegation peer;
+        if (board_peer_due(ndb, &rows[i], now, &peer))
+            (void)board_open_pull(rows[i].peer_noise_pubkey,
+                                  peer.doc.master_pubkey);
+    }
+    free(rows);
+}
+
+static void board_tick(struct liveness_contract *contract)
+{
+    (void)contract;
+    board_lock();
+    bool wired = g_svc != NULL;
+    int64_t last = g_last_pull;
+    board_unlock();
+    struct node_db *ndb = board_db();
+    if (!wired || !ndb) {
+        supervisor_progress_idle(g_child);
+        return;
+    }
+    int64_t now = (int64_t)platform_time_wall_time_t();
+    (void)board_drain_inbox(ndb, now);
+    if (now <= 0 ||
+        (last != 0 && now - last < FLEET_BOARD_FLEET_PULL_INTERVAL_S)) {
+        supervisor_progress_idle(g_child);
+        return;
+    }
+    board_lock();
+    g_last_pull = now;
+    board_unlock();
+    board_pull_paired_peers(now);
+}
+
+void boot_fleet_board_fleet_counts(struct boot_fleet_board_fleet_counts *out)
+{
+    if (!out)
+        return;
+    out->delegation_refused =
+        atomic_load_explicit(&g_delegation_refused, memory_order_relaxed);
+    out->role_refused =
+        atomic_load_explicit(&g_role_refused, memory_order_relaxed);
+    out->inbox_full =
+        atomic_load_explicit(&g_inbox_full, memory_order_relaxed);
+    out->stored = atomic_load_explicit(&g_stored, memory_order_relaxed);
+}
+
+/* ── lifecycle ───────────────────────────────────────────────────────── */
+
+/* Lane lock held. */
+static void board_forget_locked(void)
+{
+    for (size_t i = 0; i < FLEET_BOARD_FLEET_INBOX_MAX; i++)
+        free(g_inbox[i].rows);
+    memset(g_inbox, 0, sizeof g_inbox);
+    memset(g_cursors, 0, sizeof g_cursors);
+    g_last_pull = 0;
+}
+
+void boot_fleet_board_fleet_wire(struct boot_svc_ctx *svc)
+{
+    if (!svc) {
+        LOG_ERROR("fleet.board", "fleet carriage wire: no context");
+        return;
+    }
+    board_lock();
+    bool already = g_svc != NULL;
+    if (!already) {
+        g_svc = svc;
+        board_forget_locked();
+    }
+    board_unlock();
+    if (already) {
+        LOG_ERROR("fleet.board", "fleet carriage wire: already wired");
+        return;
+    }
+    if (!boot_fleet_board_fleet_register_service()) {
+        LOG_ERROR("fleet.board", "board stream service refused");
+        return;
+    }
+    liveness_contract_init(&g_contract, "fleet.board_pull");
+    g_contract.on_tick = board_tick;
+    supervisor_domains_init();
+    g_child = supervisor_register_in_domain(g_net_sup, &g_contract);
+    if (g_child == SUPERVISOR_INVALID_ID) {
+        LOG_ERROR("fleet.board", "fleet pull supervisor register failed");
+        return;
+    }
+    supervisor_set_period(g_child, 1);
+    g_contract.period_us = 1000000;
+    supervisor_set_deadline(g_child, 120);
+    supervisor_set_progress_exempt(g_child,
+                                   "paired peers may have nothing new to say");
+}
+
+void boot_fleet_board_fleet_shutdown(void)
+{
+    mesh_stream_service_unregister(FLEET_BOARD_FLEET_SERVICE_NAME);
+    board_lock();
+    supervisor_child_id child = g_child;
+    g_child = SUPERVISOR_INVALID_ID;
+    g_svc = NULL;
+    board_forget_locked();
+    board_unlock();
+    if (child != SUPERVISOR_INVALID_ID)
+        supervisor_unregister(child);
+}
+
+#ifdef ZCL_TESTING
+void boot_fleet_board_fleet_test_bind(struct node_db *serve_db)
+{
+    board_lock();
+    g_test_db = serve_db;
+    board_forget_locked();
+    board_unlock();
+}
+
+bool boot_fleet_board_fleet_test_pull(const uint8_t peer_noise[32],
+                                      const uint8_t peer_box_id[32])
+{
+    return board_open_pull(peer_noise, peer_box_id);
+}
+
+void boot_fleet_board_fleet_test_pull_paired(int64_t now)
+{
+    if (now > 0)
+        board_pull_paired_peers(now);
+}
+
+/* The answering drain, run once from inside the lane lock — which is
+ * exactly where and how the shared stream pump runs it. */
+static bool board_serve_visitor(struct mesh_stream *st, void *ctx)
+{
+    (void)ctx;
+    if (!st->local_initiator && !st->ended)
+        board_service_tick(st, board_now(), NULL);
+    return true;
+}
+
+void boot_fleet_board_fleet_test_serve(void)
+{
+    mesh_stream_visit(FLEET_BOARD_FLEET_SERVICE_NAME, board_serve_visitor,
+                      NULL);
+}
+
+size_t boot_fleet_board_fleet_test_drain_into(struct node_db *ndb)
+{
+    return ndb && ndb->open ? board_drain_inbox(ndb, board_now()) : 0;
+}
+
+void boot_fleet_board_fleet_test_bind_authority(
+    const struct vcs_zcode_dht_delegation *peer_delegation,
+    const uint8_t network_genesis[32], int64_t now)
+{
+    board_lock();
+    g_test_authority = peer_delegation && network_genesis && now > 0;
+    memset(&g_test_delegation, 0, sizeof g_test_delegation);
+    memset(g_test_genesis, 0, sizeof g_test_genesis);
+    g_test_now = 0;
+    if (g_test_authority) {
+        g_test_delegation = *peer_delegation;
+        memcpy(g_test_genesis, network_genesis, 32);
+        g_test_now = now;
+    }
+    board_unlock();
+}
+#endif

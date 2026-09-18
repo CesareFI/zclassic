@@ -647,6 +647,31 @@ int test_mesh_stream(void)
         PASS();
     }
 
+    TEST("mesh stream: the side that accepted a link opens a stream to the "
+         "peer that dialled it, so a box behind NAT can still be asked") {
+        /* b accepted the link; a dialled it. A box behind NAT is always
+         * the dialler, so every pull toward it opens on this side. */
+        mesh_loop_discard(a, a_queue, f.res_term);
+        mesh_loop_discard(b, b_queue, f.term_peer.ini);
+        mesh_stream_test_reset();
+        stream_test_counters_reset();
+        uint64_t id = 0;
+        ASSERT_EQ(mesh_stream_open(STREAM_TEST_ECHO, f.term_peer.noise_pub,
+                                   STREAM_TEST_WINDOW,
+                                   (const uint8_t *)"up", 2, NULL, &id),
+                  MESH_STREAM_OK);
+        ASSERT_EQ(id & 1u, UINT64_C(1)); /* the accepting side mints odd */
+        ASSERT_EQ(mesh_loop_pump(b, b_queue, f.term_peer.ini, &mp, a),
+                  (size_t)1);
+        ASSERT_EQ(g_opens, (size_t)1);
+        ASSERT_EQ(mesh_loop_pump(a, a_queue, f.res_term, &mp, b),
+                  (size_t)1);
+        ASSERT_EQ(g_data_frames, (size_t)1);
+        ASSERT_EQ(g_last_data_len, (size_t)5);
+        ASSERT(memcmp(g_last_data, "re:up", 5) == 0);
+        PASS();
+    }
+
 _test_next:
     mesh_stream_test_reset();
     mesh_stream_service_unregister(STREAM_TEST_ECHO);

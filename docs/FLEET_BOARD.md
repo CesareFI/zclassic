@@ -49,8 +49,21 @@ below; any node key may post to any public room, subject only to the per-key
 quota described later in this page — no operator grant is needed. A
 `fleet`-scoped post is never announced, never answered to a GET, and never
 served by the public board pages — its ids and bytes stay off the public
-flood entirely. (Replication of fleet rows between paired fleet members is a
-separate directed channel and is not part of this gossip path.)
+flood entirely.
+
+Fleet-scoped posts move between paired fleet members over the `board` mesh
+stream service instead, and nowhere else. It is pull only: each box asks
+every paired peer for the fleet posts that peer has received since the last
+one it took, and answers the same question when asked. The stream opens over
+whichever Noise session the two boxes already share, including one the
+answering box dialled, so a box behind NAT that dials out can still be pulled
+from. A box answers only a peer whose pairing grants the status capability,
+whose delegation is still current, and whose key holds a role granting
+`fleet.board.list` here (the `worker` and `observer` roles carry it). An
+answer holds at most 32 posts and 48 KiB, fleet-scoped and unexpired only.
+Every pulled post goes through the same ingest as any other, so its
+signature, TTL, author role and the store caps still decide, and a post
+already held is a no-op by id.
 
 The board rides the ordinary P2P wire (the `zpkgswm` frame every connected
 peer already exchanges) and adds no command of its own: any peer this node

@@ -14,6 +14,7 @@
 
 #include "config/boot_fleet_board.h"
 #include "config/boot_internal.h"
+#include "config/mesh_stream.h"
 #include "config/runtime.h"
 #include "util/fleet_role_check.h"
 #include "base/hex.h"
@@ -30,9 +31,15 @@
 #include "net/peer_scoring.h"
 #include "platform/time_compat.h"
 #include "util/thread_registry.h"
+#include "test/mesh_stream_fixture.h"
+#include "test/mesh_stream_loopback.h"
+#include "test/mesh_term_fixture.h"
+#include "models/mesh_pairing.h"
+#include "net/noise_transport.h"
 
 #include <stdatomic.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -2412,6 +2419,314 @@ static int test_fleet_board_reclaim_expired(void)
     } _test_next:;
     return failures;
 }
+/* ── FLEET-scope carriage over the paired mesh stream ────────────────────
+ *
+ * The "board" stream service, driven through the PRODUCTION callbacks over
+ * the shared loopback wire: two real p2p nodes on the fixture's in-process
+ * Noise pair, only the socket elided. The asking node is the one that
+ * ACCEPTED the link and the answering node is the one that DIALLED it, so
+ * every pull below is a pull from a box behind NAT over the session that
+ * box opened. The pairing authority runs for real against the fixture's
+ * node.db; only the DHT delegation lookup and the clock are stood in for,
+ * exactly as the fleet ledger group does. */
+
+/* Inside the fixture delegations' signed window (1000..4000). */
+#define FBW_NOW INT64_C(2500)
+#define FBW_PAIRED_AT INT64_C(1)
+#define FBW_PAIRING_EXPIRES INT64_C(4102444800)
+#define FBW_POSTS 40
+
+struct fbw {
+    char dir[256];
+    struct mesh_term_fixture f;
+    struct net_manager nm;
+    struct msg_processor mp;
+    struct p2p_node *asker;    /* accepted the link: the pulling box */
+    struct p2p_node *answerer; /* dialled the link: the box behind NAT */
+    struct p2p_node *nodes[2];
+    struct send_segment *ask_q;
+    struct send_segment *answer_q;
+    struct boot_svc_ctx svc;
+    struct db_service dbsvc;
+    struct app_runtime_context runtime;
+    struct node_db a; /* the answering box's board store */
+    struct node_db b; /* the asking box's board store */
+    uint8_t box_a[32];
+    uint8_t box_b[32];
+    bool fixture_open;
+    bool nodes_inited;
+    bool registered;
+};
+
+static bool g_fbw_deny_read;
+
+/* The role gate this group grades: every key may do everything, except
+ * that reading fleet posts can be switched off to prove the service asks. */
+static bool fbw_role_check(const uint8_t key[32], const char *leaf,
+                           const char *kind, char *why, size_t why_cap,
+                           void *ctx)
+{
+    (void)key;
+    (void)kind;
+    (void)ctx;
+    bool deny = g_fbw_deny_read &&
+                strcmp(leaf, FLEET_BOARD_FLEET_READ_LEAF) == 0;
+    if (deny && why && why_cap)
+        (void)snprintf(why, why_cap, "role_refused: test denies %s", leaf);
+    return !deny;
+}
+
+static bool fbw_nodes_open(struct fbw *w)
+{
+    zcl_mutex_init(&w->nm.cs_nodes);
+    zcl_mutex_init(&w->nm.cs_last_node_id);
+    w->nodes_inited = true;
+    struct net_address addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.svc.port = 18035;
+    w->asker = p2p_node_create(&w->nm, ZCL_INVALID_SOCKET, &addr,
+                               "board-ask", true);
+    w->answerer = p2p_node_create(&w->nm, ZCL_INVALID_SOCKET, &addr,
+                                  "board-answer", false);
+    if (!w->asker || !w->answerer)
+        return false;
+    w->asker->transport = w->f.term_peer.ini;
+    w->answerer->transport = w->f.res_term;
+    w->asker->state = PEER_HANDSHAKE_COMPLETE;
+    w->answerer->state = PEER_HANDSHAKE_COMPLETE;
+    w->nodes[0] = w->asker;
+    w->nodes[1] = w->answerer;
+    w->nm.nodes = w->nodes;
+    w->nm.num_nodes = 2;
+    w->ask_q = mesh_loop_sentinel(w->asker);
+    w->answer_q = mesh_loop_sentinel(w->answerer);
+    return w->ask_q && w->answer_q;
+}
+
+static bool fbw_open(struct fbw *w)
+{
+    memset(w, 0, sizeof(*w));
+    test_make_tmpdir(w->dir, sizeof(w->dir), "fleet_board", "carriage");
+    w->fixture_open = mesh_term_fixture_open(&w->f, w->dir);
+    if (!w->fixture_open || !fbw_nodes_open(w))
+        return false;
+    w->mp.net_mgr = &w->nm;
+    w->mp.params = chain_params_get();
+    w->svc.msg_processor = &w->mp;
+    w->dbsvc.node_db = &w->f.ndb; /* the pairing authority */
+    w->dbsvc.started = true;
+    w->runtime.db_service = &w->dbsvc;
+    app_runtime_set_current(&w->runtime);
+    mesh_stream_test_bind(&w->svc);
+    mesh_stream_test_reset();
+    w->registered = boot_fleet_board_fleet_register_service();
+    memset(w->box_a, 0xA1, 32);
+    memset(w->box_b, 0xB2, 32);
+    return w->mp.params && w->registered && node_db_open(&w->a, ":memory:") &&
+           node_db_open(&w->b, ":memory:");
+}
+
+static void fbw_close(struct fbw *w)
+{
+    boot_fleet_board_fleet_test_bind_authority(NULL, NULL, 0);
+    mesh_stream_test_reset();
+    boot_fleet_board_fleet_test_bind(NULL);
+    mesh_stream_service_unregister(FLEET_BOARD_FLEET_SERVICE_NAME);
+    mesh_stream_test_bind(NULL);
+    app_runtime_set_current(NULL);
+    mesh_loop_free_queue(w->asker, w->ask_q);
+    mesh_loop_free_queue(w->answerer, w->answer_q);
+    p2p_node_free(w->asker);
+    p2p_node_free(w->answerer);
+    free(w->ask_q);
+    free(w->answer_q);
+    if (w->nodes_inited) {
+        zcl_mutex_destroy(&w->nm.cs_nodes);
+        zcl_mutex_destroy(&w->nm.cs_last_node_id);
+    }
+    if (w->a.open)
+        node_db_close(&w->a);
+    if (w->b.open)
+        node_db_close(&w->b);
+    if (w->fixture_open)
+        mesh_term_fixture_close(&w->f);
+    test_rm_rf_recursive(w->dir);
+}
+
+/* Sign and store one post in `db` as if it arrived at `received_at`. */
+static bool fbw_post(struct node_db *db, uint8_t who, uint8_t scope,
+                     const char *text, int64_t created_at, uint32_t ttl,
+                     int64_t received_at, struct fleet_board_post *out)
+{
+    uint8_t seed[32], pk[32];
+    fb_test_identity(who, seed, pk);
+    fb_test_compose(out, FLEET_BOARD_KIND_NOTE, "carrier", text,
+                    (uint64_t)created_at, ttl);
+    fb_test_scope(out, scope,
+                  scope == FLEET_BOARD_SCOPE_PUBLIC ? "general" : "");
+    return fleet_board_post_sign(out, seed, pk) == FLEET_BOARD_OK &&
+           db_fleet_board_post_ingest(db, out, received_at, NULL) ==
+               FLEET_BOARD_OK;
+}
+
+/* One whole pull toward the answering box as `peer_box`: the OPEN, the
+ * answer, the close, and the commit into `into`. Returns the posts newly
+ * stored; `frames` receives how many frames the answering box sent. */
+static size_t fbw_pull(struct fbw *w, const uint8_t peer_box[32],
+                       struct node_db *into, size_t *frames)
+{
+    *frames = 0;
+    mesh_loop_discard(w->asker, w->ask_q, w->f.res_term);
+    mesh_loop_discard(w->answerer, w->answer_q, w->f.term_peer.ini);
+    mesh_stream_test_reset();
+    if (!boot_fleet_board_fleet_test_pull(w->f.resp_noise_pub, peer_box) ||
+        mesh_loop_pump(w->asker, w->ask_q, w->f.res_term, &w->mp,
+                       w->answerer) != 1)
+        return SIZE_MAX;
+    boot_fleet_board_fleet_test_serve(); /* the answer, when there is one */
+    boot_fleet_board_fleet_test_serve(); /* nothing left: close */
+    *frames = mesh_loop_pump(w->answerer, w->answer_q, w->f.term_peer.ini,
+                             &w->mp, w->asker);
+    return boot_fleet_board_fleet_test_drain_into(into);
+}
+
+/* The verdict a raw OPEN from the asking node gets, read off the wire. */
+static uint8_t fbw_raw_open_verdict(struct fbw *w, uint64_t stream_id)
+{
+    uint8_t pull[FLEET_BOARD_FLEET_PULL_BYTES];
+    memset(pull, 0, sizeof(pull));
+    pull[0] = (uint8_t)FLEET_BOARD_FLEET_MSG_PULL;
+    pull[1] = 1u;
+    uint8_t frame[MESH_LOOP_WIRE_MAX];
+    size_t frame_len = mesh_stream_test_open_frame(
+        stream_id, 4096u, FLEET_BOARD_FLEET_SERVICE_NAME, pull, sizeof(pull),
+        frame, sizeof(frame));
+    uint8_t answer[MESH_LOOP_WIRE_MAX];
+    uint8_t kind = 0;
+    bool more = false;
+    if (frame_len == 0 ||
+        !mesh_stream_frame(&w->mp, w->answerer, frame, frame_len, NULL))
+        return 0xFFu;
+    size_t answer_len = mesh_loop_take(w->answerer, w->answer_q,
+                                       w->f.term_peer.ini, answer,
+                                       sizeof(answer), &more);
+    if (!mesh_stream_test_read_header(answer, answer_len, &kind, NULL) ||
+        kind != MESH_STREAM_KIND_CLOSE)
+        return 0xFEu;
+    return answer[MESH_STREAM_FRAME_PREFIX_LEN + 1u + 8u];
+}
+
+/* Every fleet post in `posts` is held by `db`. */
+static bool fbw_holds_all(struct node_db *db,
+                          const struct fleet_board_post *posts, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (!db_fleet_board_have(db, posts[i].id))
+            return false;
+    return true;
+}
+
+static int test_fleet_board_fleet_carriage(void)
+{
+    int failures = 0;
+    static struct fbw w;
+    static struct fleet_board_post fleet[FBW_POSTS];
+    struct fleet_board_post expired, public_post, from_b;
+    struct zcl_fleet_role_checker checker = {
+        .allow = fbw_role_check, .name = "fleet-board-carriage-test" };
+    struct boot_fleet_board_fleet_counts before, after;
+    size_t frames = 0;
+    g_fbw_deny_read = false;
+    zcl_fleet_role_checker_install(&checker);
+    bool opened = fbw_open(&w);
+
+    TEST("fleet board carriage: an unpaired peer, and a paired peer without "
+         "the read role, never receive a fleet post") {
+        ASSERT(opened);
+        /* The answering box holds a live fleet post, a live public post,
+         * and a fleet post whose TTL ran out long before anyone asks. */
+        ASSERT(fbw_post(&w.a, 7, FLEET_BOARD_SCOPE_FLEET, "gone by now",
+                        1000, 60, 1000, &expired));
+        ASSERT(fbw_post(&w.a, 7, FLEET_BOARD_SCOPE_PUBLIC, "for everyone",
+                        2000, 3600, 2000, &public_post));
+        for (int i = 0; i < FBW_POSTS; i++) {
+            char text[48];
+            (void)snprintf(text, sizeof(text), "fleet note %d", i);
+            ASSERT(fbw_post(&w.a, 7, FLEET_BOARD_SCOPE_FLEET, text,
+                            2000 + i, 3600, 2100, &fleet[i]));
+        }
+        boot_fleet_board_fleet_test_bind(&w.a);
+
+        /* No pairing row: the primitive refuses the OPEN by name before
+         * the service is asked anything. The asking node accepted the
+         * link, so it mints odd stream ids. */
+        ASSERT_EQ(fbw_raw_open_verdict(&w, 1), MESH_STREAM_REFUSED_PEER_UNPAIRED);
+        ASSERT_EQ(mesh_stream_test_live_count(FLEET_BOARD_FLEET_SERVICE_NAME),
+                  (size_t)0);
+
+        /* Paired and current, but the peer's key holds no role that reads
+         * the fleet board here: refused by the service, before a row is
+         * read, and counted. */
+        ASSERT(mesh_term_pair_row(&w.f, &w.f.term_peer,
+                                  MESH_PAIRING_CAP_STATUS_READ, FBW_PAIRED_AT,
+                                  FBW_PAIRING_EXPIRES));
+        boot_fleet_board_fleet_test_bind_authority(&w.f.term_peer.delegation,
+                                                   w.f.genesis, FBW_NOW);
+        g_fbw_deny_read = true;
+        boot_fleet_board_fleet_counts(&before);
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)0);
+        ASSERT_EQ(frames, (size_t)1); /* the refusal alone */
+        boot_fleet_board_fleet_counts(&after);
+        ASSERT_EQ(after.role_refused, before.role_refused + 1);
+        ASSERT(!db_fleet_board_have(&w.b, fleet[0].id));
+        g_fbw_deny_read = false;
+        PASS();
+    }
+
+    TEST("fleet board carriage: a paired peer pulls fleet posts in bounded "
+         "pages, never an expired or public one, and a re-pull is a no-op") {
+        /* 40 live fleet posts, 32 to a page. */
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames),
+                  (size_t)FLEET_BOARD_FLEET_ANSWER_POSTS_MAX);
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames),
+                  (size_t)(FBW_POSTS - FLEET_BOARD_FLEET_ANSWER_POSTS_MAX));
+        ASSERT(fbw_holds_all(&w.b, fleet, FBW_POSTS));
+        ASSERT(!db_fleet_board_have(&w.b, expired.id));
+        ASSERT(!db_fleet_board_have(&w.b, public_post.id));
+
+        /* Everything is held: asking again moves nothing, and the answer
+         * is the CLOSE alone, with no DATA frame at all. */
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)0);
+        ASSERT_EQ(frames, (size_t)1);
+        struct db_fleet_board_post row;
+        ASSERT(db_fleet_board_post_find(&w.b, fleet[0].id, &row));
+        ASSERT_EQ(row.post.scope, FLEET_BOARD_SCOPE_FLEET);
+        PASS();
+    }
+
+    TEST("fleet board carriage: two paired stores converge") {
+        /* The other box posts, and is now the one answering. Its cursor
+         * table starts empty, so it pages through everything it holds;
+         * only the post the first box lacks is new there. */
+        ASSERT(fbw_post(&w.b, 8, FLEET_BOARD_SCOPE_FLEET, "from the other box",
+                        2200, 3600, 2200, &from_b));
+        boot_fleet_board_fleet_test_bind(&w.b);
+        ASSERT_EQ(fbw_pull(&w, w.box_b, &w.a, &frames), (size_t)1);
+        ASSERT_EQ(fbw_pull(&w, w.box_b, &w.a, &frames), (size_t)0);
+        ASSERT_EQ(fbw_pull(&w, w.box_b, &w.a, &frames), (size_t)0);
+        ASSERT_EQ(frames, (size_t)1);
+        ASSERT(db_fleet_board_have(&w.a, from_b.id));
+        ASSERT(fbw_holds_all(&w.a, fleet, FBW_POSTS));
+        ASSERT(fbw_holds_all(&w.b, fleet, FBW_POSTS));
+        ASSERT(db_fleet_board_have(&w.b, from_b.id));
+        PASS();
+    }
+    _test_next:
+    fbw_close(&w);
+    zcl_fleet_role_checker_install_permissive_for_testing();
+    return failures;
+}
+
 /* Run the PUBLIC-scope-with-the-real-gate tests together, with the
  * real gate — nothing installed — bracketing all of them, then hand the
  * permissive stub back so the rest of this file's tests keep the isolation
@@ -2469,6 +2784,7 @@ int test_fleet_board(void)
     failures += test_fleet_board_scope_codec();
     failures += test_fleet_board_scope_store();
     failures += test_fleet_board_reclaim_expired();
+    failures += test_fleet_board_fleet_carriage();
     failures += test_fleet_board_public_no_grant_needed();
     /* Leave the process as this group found it: the next group in the same
      * binary must not inherit an open gate. */

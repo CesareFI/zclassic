@@ -210,6 +210,25 @@ int db_fleet_board_ids_before(struct node_db *ndb, int64_t now,
 
 bool db_fleet_board_have(struct node_db *ndb, const uint8_t id[32]);
 
+/* One row handed to a page visitor. Return false to stop the page there;
+ * that row is then NOT counted as visited. The row is borrowed for the
+ * call only. */
+typedef bool (*db_fleet_board_row_visit)(const struct db_fleet_board_post *row,
+                                         void *ctx);
+
+/* The FLEET-scope page the paired pull service serves: every verified,
+ * still-discoverable fleet-scoped row strictly after the keyset
+ * (after_received_at, after_id), in ascending (received_at, id) order —
+ * this node's own arrival clock, which a reclaim never rewrites (seq is
+ * renumbered by a reclaim, so it cannot be a cursor another box holds).
+ * Start from (0, all-zero). Public and legacy rows never appear. A row that
+ * no longer verifies is skipped, never handed on. Returns the number of
+ * rows the visitor accepted, or -1 when the store could not be read. */
+int db_fleet_board_fleet_after(struct node_db *ndb, int64_t now,
+                               int64_t after_received_at,
+                               const uint8_t after_id[32],
+                               db_fleet_board_row_visit visit, void *ctx);
+
 /* Every distinct key that signed a post this node is storing, newest post
  * first, capped at FLEET_BOARD_HOST_LIST_MAX. A key appears only when at
  * least one of its stored posts still verifies here, so a tampered row

@@ -12,6 +12,7 @@
 #include "models/fleet_board_post.h"
 
 #include "util/fleet_role_check.h"
+#include "base/safe_alloc.h"
 #include "config/runtime.h"
 #include "json/json.h"
 /* model_fields.h defines the ZCL_MODEL_* constructors the field list is
@@ -24,6 +25,7 @@
 #include "util/log_macros.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 DEFINE_MODEL_CALLBACKS(fleet_board_post)
@@ -1173,6 +1175,78 @@ int db_fleet_board_ids_before(struct node_db *ndb, int64_t now,
     }
     sqlite3_finalize(s);
     return count;
+}
+
+/* True when `row` sits at or before the keyset (after_received_at, after_id):
+ * the page below asks the store for received_at >= after_received_at, so the
+ * rows that share that second are sorted out here by id. */
+static bool board_row_not_after(const struct db_fleet_board_post *row,
+                                int64_t after_received_at,
+                                const uint8_t after_id[32])
+{
+    if (row->received_at != after_received_at)
+        return row->received_at < after_received_at;
+    return memcmp(row->post.id, after_id, 32) <= 0;
+}
+
+/* Step the prepared page, handing each row past the keyset to `visit`.
+ * Returns the rows visited, or -1 when the read itself failed. */
+static int board_fleet_page_walk(struct node_db *ndb, sqlite3_stmt *s,
+                                 struct db_fleet_board_post *row,
+                                 int64_t after_received_at,
+                                 const uint8_t after_id[32],
+                                 db_fleet_board_row_visit visit, void *ctx)
+{
+    int visited = 0;
+    while (AR_STEP_ROW(s)) {
+        /* A row that no longer verifies is logged by board_row and never
+         * handed on; it must not wedge every later row behind it. */
+        if (!board_row(s, row) ||
+            board_row_not_after(row, after_received_at, after_id))
+            continue;
+        if (!visit(row, ctx))
+            return visited;
+        visited++;
+    }
+    if (sqlite3_reset(s) == SQLITE_OK)
+        return visited;
+    LOG_WARN("fleet.board", "fleet page read failed: %s",
+             sqlite3_errmsg(ndb->db));
+    return -1;
+}
+
+int db_fleet_board_fleet_after(struct node_db *ndb, int64_t now,
+                               int64_t after_received_at,
+                               const uint8_t after_id[32],
+                               db_fleet_board_row_visit visit, void *ctx)
+{
+    if (!ndb || !ndb->open || !after_id || !visit || after_received_at < 0)
+        return -1;
+    struct qb q;
+    qb_select(&q, QB_T_fleet_board_posts);
+    qb_select_columns(&q, k_board_cols, BOARD_NCOLS);
+    board_where_discoverable(&q, now);
+    qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_EQ,
+                 FLEET_BOARD_SCOPE_FLEET);
+    qb_where_int(&q, QB_C_fleet_board_posts_received_at, QB_GE,
+                 after_received_at);
+    qb_order_by(&q, QB_C_fleet_board_posts_received_at, QB_ASC);
+    qb_order_by(&q, QB_C_fleet_board_posts_id, QB_ASC);
+    sqlite3_stmt *s = NULL;
+    if (!QB_PREPARE(ndb, &q, s)) {
+        LOG_WARN("fleet.board", "fleet page prepare failed: %s", qb_error(&q));
+        return -1;
+    }
+    /* One row at a time on the heap: a wiki-sized row does not belong on
+     * whatever thread stack a stream callback happens to run on. */
+    struct db_fleet_board_post *row =
+        zcl_calloc(1, sizeof(*row), "fleet_board.fleet_page");
+    int visited = row ? board_fleet_page_walk(ndb, s, row, after_received_at,
+                                              after_id, visit, ctx)
+                      : -1;
+    sqlite3_finalize(s);
+    free(row);
+    return visited;
 }
 
 int db_fleet_board_recent_ids(struct node_db *ndb, int64_t now,

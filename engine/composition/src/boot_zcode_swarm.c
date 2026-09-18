@@ -851,6 +851,7 @@ void boot_zcode_swarm_wire(struct boot_svc_ctx *svc)
     mesh_tunnel_wire(svc);
     boot_mesh_game_wire(svc);
     boot_fleet_ledger_wire(svc);
+    boot_fleet_board_fleet_wire(svc);
     liveness_contract_init(&s_timer_contract, "net.zcode_swarm");
     s_timer_contract.on_tick = boot_zcode_swarm_timer_tick;
     supervisor_domains_init();
@@ -882,6 +883,7 @@ void boot_zcode_swarm_shutdown(void)
     boot_fleet_board_shutdown();
     boot_mesh_game_shutdown();
     boot_fleet_ledger_shutdown();
+    boot_fleet_board_fleet_shutdown();
     boot_mesh_terminal_shutdown();
     mesh_tunnel_shutdown();
     mesh_stream_shutdown();
