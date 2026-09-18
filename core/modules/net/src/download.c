@@ -56,7 +56,7 @@ static int64_t dl_peer_avoid_deadline(int64_t now)
     return now + cooldown;
 }
 
-static bool dl_peer_avoid_active(int64_t deadline, int64_t now)
+bool dl_peer_avoid_active(int64_t deadline, int64_t now)
 {
     if (deadline <= now)
         return false;

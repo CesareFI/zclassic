@@ -192,3 +192,11 @@ later lane flips it HARD.
 - 2026-09-18T20:21:22Z — REASON: Refactor the authorized delivery-sample rollback guard under the shrink-only download.c line ceiling; behavior unchanged
   old ROOT: d66e5ba5d6fc917eb6a837ff4ee5cf64cc3bcb4f7e607a988e50c9bbd95e4130
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T21:02:12Z — REASON: Make block-download diagnostics fail open impossible peer cooldowns after wall-clock rollback, matching scheduler behavior; reporting only, no consensus or validation change
+  old ROOT: d0ad9ffd5140a8a04e90d1965d4c2aa196b73a890bb58240cdd6dfc1521b9f89
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T21:12:53Z — REASON: Centralize the authorized peer-avoid rollback predicate so scheduler diagnostics cannot drift; refactor only, no behavior, consensus, or validation change
+  old ROOT: f9e027060acd4899406ca3263044c39a07c96fc5c12354ad3e672e6753e9adb3
+  by: owner unseal ritual (make core-unseal)

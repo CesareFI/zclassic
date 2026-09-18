@@ -80,6 +80,11 @@ size_t dl_get_max_in_flight_total(void);
 size_t dl_get_max_in_flight_per_peer(void);
 int    dl_get_request_timeout_secs(void);
 
+/* True only while a scheduler peer-avoid deadline is plausibly active at
+ * `now`; impossible future deadlines fail open after a wall-clock rollback.
+ * Shared with diagnostics so operator reports match assignment behavior. */
+bool dl_peer_avoid_active(int64_t deadline, int64_t now);
+
 /* Per-block in-flight entry */
 struct dl_in_flight {
     struct uint256 hash;

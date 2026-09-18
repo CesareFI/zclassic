@@ -1393,6 +1393,34 @@ static int test_dl_diagnostics(void)
     return failures;
 }
 
+static int test_dl_diagnostics_peer_avoid_fails_open_after_clock_rollback(void)
+{
+    int failures = 0;
+    TEST("download diagnostics ignore impossible peer avoids after clock rollback") {
+        struct download_manager dm;
+        dl_init(&dm);
+
+        struct uint256 h = make_hash(209);
+        ASSERT(dl_queue_blocks(&dm, &h, (int32_t[]){204}, 1) == 1);
+
+        zcl_mutex_lock(&dm.cs);
+        ASSERT(dm.queue_len == 1);
+        dm.queue_avoid_peers[0] = 7;
+        dm.queue_avoid_until[0] =
+            (int64_t)platform_time_wall_time_t() + 3600;
+        zcl_mutex_unlock(&dm.cs);
+
+        struct dl_diagnostics diag;
+        dl_get_diagnostics(&dm, &diag);
+        ASSERT(diag.queue_peer_avoid_count == 0);
+        ASSERT(diag.queue_peer_avoid_max_seconds == 0);
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_gap_fill_timeout_sweep(void)
 {
     int failures = 0;
@@ -2343,6 +2371,7 @@ int test_download(void)
     failures += test_dl_peer_body_progress();
     failures += test_dl_peer_body_staleness();
     failures += test_dl_diagnostics();
+    failures += test_dl_diagnostics_peer_avoid_fails_open_after_clock_rollback();
     failures += test_gap_fill_timeout_sweep();
     failures += test_gap_fill_timeout_wakes_dispatcher();
     failures += test_gap_fill_kick_latch_skips_wait();

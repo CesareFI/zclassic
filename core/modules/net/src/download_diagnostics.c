@@ -120,7 +120,7 @@ void dl_get_diagnostics(struct download_manager *dm,
             out->queued_history++;
         else
             out->queued_forward++;
-        if (dm->queue_avoid_until[i] <= now)
+        if (!dl_peer_avoid_active(dm->queue_avoid_until[i], now))
             continue;
         int64_t remaining = dm->queue_avoid_until[i] - now;
         out->queue_peer_avoid_count++;
