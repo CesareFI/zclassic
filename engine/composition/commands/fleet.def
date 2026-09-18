@@ -485,8 +485,14 @@ ZCL_COMMAND_READY_READ(
 ZCL_COMMAND_READY_COMMAND(
     "fleet.steer.send", "fleet.steer", "",
     "One bounded batch of directives to named fleet agents",
-    "Posts 1..8 directives to named agents through dev.agent.mail, each "
-    "with an idempotency_key: a retry returns the recorded accept with "
+    "Posts 1..8 directives to named agents through dev.agent.mail. The "
+    "sender is the presented grant's own label, so from must be stated and "
+    "must match it: a from that disagrees is refused rather than rewritten, "
+    "an unstated one is refused rather than defaulted, and the posted row "
+    "carries the grant's binding so a receiver admits on the credential "
+    "instead of on the name. Each item carries an "
+    "idempotency_key, checked after the sender: a retry returns the "
+    "recorded accept with "
     "duplicate:true and posts nothing, so retries reconcile the same "
     "request instead of duplicating work. Per-item states are queued or "
     "refused with the sibling's typed reason; the batch fails outright "

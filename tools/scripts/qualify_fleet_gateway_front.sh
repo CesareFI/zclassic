@@ -349,13 +349,13 @@ if [ "$SKIP_NODE" -eq 0 ]; then
         -X POST "$F/steer" \
         --data '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"steer_brief","arguments":{}}}'
     # Node-minted grant legs in the same isolated state root.
-    MINT="$(XDG_STATE_HOME="$ST" "$NODE_BIN" fleet steer grant --action=mint --scopes=brief,send,evidence 2>/dev/null || true)"
+    MINT="$(XDG_STATE_HOME="$ST" "$NODE_BIN" fleet steer grant --action=mint --scopes=brief,send,evidence --label=qual-caller 2>/dev/null || true)"
     GID="$(printf '%s' "$MINT" | grep -o '"id":"[0-9a-f]*"' | head -n 1 | cut -d'"' -f4)"
     if [ "${#GID}" -ge 16 ]; then ok "node grant mint"; else bad "node grant mint (got [$(printf '%s' "$MINT" | head -c 200)])"; fi
     have "steer_brief via grant" '"isError":false' -X POST "$F/steer" \
         --data "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"steer_brief\",\"arguments\":{\"grant\":\"$GID\"}}}"
     have "steer_send via grant" '"isError":false' -X POST "$F/steer" \
-        --data "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"steer_send\",\"arguments\":{\"grant\":\"$GID\",\"items\":[{\"to\":\"qual-agent\",\"body\":\"probe\",\"ref\":\"q-1\",\"idempotency_key\":\"qk-1\"}]}}}"
+        --data "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"steer_send\",\"arguments\":{\"grant\":\"$GID\",\"from\":\"qual-caller\",\"items\":[{\"to\":\"qual-agent\",\"body\":\"probe\",\"ref\":\"q-1\",\"idempotency_key\":\"qk-1\"}]}}}"
     have "steer_evidence via grant" '"isError":false' -X POST "$F/steer" \
         --data "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\",\"params\":{\"name\":\"steer_evidence\",\"arguments\":{\"grant\":\"$GID\",\"type\":\"mail\",\"ref\":\"q-1\"}}}"
     MINT2="$(XDG_STATE_HOME="$ST" "$NODE_BIN" fleet steer grant --action=mint --scopes=brief 2>/dev/null || true)"

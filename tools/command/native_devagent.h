@@ -149,9 +149,12 @@ bool zcl_devagent_worker_muse_executor(const struct wkr_job *job,
  * mail into a dev.agent.queue row and answers the sender under the same
  * ref. It never executes anything: dev.agent.worker's own resident loop
  * runs the job and posts the result. Admission is the EXISTING fleet.steer
- * grant store read by label (zcl_fleet_steer_grant_label_live), which means
- * "the owner has named this sender" and NOT "this peer was authenticated" —
- * nothing in this tree signs a peer's mail row today. */
+ * grant store, read by the binding the row carries
+ * (zcl_fleet_steer_grant_binding_live): the sender's name in a row is a
+ * claim, and what is checked is that the grant carrying that name is the
+ * one that stamped this row. A row with no stamp is unattributable and
+ * refused. This binds a row to a credential, not to a peer key: nothing in
+ * this tree signs a peer's mail row today. */
 
 /* Bounded drive options. `receiver` is this box's mail identity, and
  * `workspace` is the ONE workspace this receiver was started against — the
