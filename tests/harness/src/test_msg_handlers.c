@@ -17,6 +17,7 @@
 #include "core/hash.h"
 #include "net/msgprocessor.h"
 #include "net/msg_internal.h"
+#include "net/compact_blocks.h"
 #include "net/download.h"
 #include "net/peer_scoring.h"
 #include "consensus/validation.h"
@@ -383,6 +384,63 @@ static bool submit_reducer_pending_block(struct block *block,
     validation_state_invalid(out, false, REJECT_INVALID,
                              "block-not-finalized-by-reducer", NULL);
     return false;
+}
+
+static bool submit_compact_test_block(struct block *block,
+                                      struct validation_state *out,
+                                      void *ctx)
+{
+    (void)block;
+    (void)out;
+    int *calls = (int *)ctx;
+    if (calls)
+        (*calls)++;
+    return true;
+}
+
+static int test_process_blocktxn_rejects_clock_rollback_age(void)
+{
+    int failures = 0;
+    TEST("msg_handlers: future compact request timestamp after clock rollback "
+         "discards blocktxn") {
+        struct p2p_node node;
+        memset(&node, 0, sizeof(node));
+        node.id = 76;
+        snprintf(node.addr_name, sizeof(node.addr_name), "compact-peer");
+        node.compact_pending_block =
+            zcl_malloc(sizeof(*node.compact_pending_block),
+                       "test_compact_pending_block");
+        ASSERT(node.compact_pending_block != NULL);
+        block_init(node.compact_pending_block);
+        memset(node.compact_pending_hash.data, 0x76,
+               sizeof(node.compact_pending_hash.data));
+        node.compact_request_time =
+            (int64_t)platform_time_wall_time_t() + 3600;
+
+        struct block_txn_response resp;
+        block_txn_response_init(&resp);
+        resp.block_hash = node.compact_pending_hash;
+
+        struct byte_stream s;
+        stream_init(&s, 256);
+        ASSERT(block_txn_response_serialize(&resp, &s));
+
+        int submit_calls = 0;
+        struct msg_processor mp;
+        memset(&mp, 0, sizeof(mp));
+        mp.compact_block_submit = submit_compact_test_block;
+        mp.compact_block_submit_ctx = &submit_calls;
+
+        ASSERT(process_blocktxn(&mp, &node, &s));
+        ASSERT(submit_calls == 0);
+        ASSERT(node.compact_pending_block == NULL);
+        ASSERT(node.compact_request_time == 0);
+
+        stream_free(&s);
+        block_txn_response_free(&resp);
+        PASS();
+    } _test_next:;
+    return failures;
 }
 
 static int test_process_block_msg_reducer_pending_stays_retryable(void)
@@ -1229,6 +1287,7 @@ int test_msg_handlers(void)
     failures += test_should_announce_getblocks();
     failures += test_source_header_echo_policy();
     failures += test_block_validation_retryable_classifier();
+    failures += test_process_blocktxn_rejects_clock_rollback_age();
     failures += test_process_block_msg_reducer_pending_stays_retryable();
     failures += test_process_block_msg_scores_unrequested();
     failures += test_process_block_msg_no_score_when_requested();

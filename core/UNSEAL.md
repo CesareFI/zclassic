@@ -208,3 +208,7 @@ later lane flips it HARD.
 - 2026-09-18T22:00:41Z — REASON: Factor the authorized clock-rollback scoring predicate to satisfy the shrink-only complexity ratchet; behavior unchanged
   old ROOT: e28c7c0bfced2d15dd5cf26a039ccb42456b5b52bf85f52d26ecfe80ce32ffea
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T22:07:29Z — REASON: Reject rollback-aged compact block transaction responses so timeout recovery cannot accept stale peer state
+  old ROOT: 5ed0d8fe936e1b80ce90de5b499a9aa5bc888c3ce42f9846b0cf39330ef4555b
+  by: owner unseal ritual (make core-unseal)

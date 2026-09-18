@@ -363,9 +363,11 @@ bool process_blocktxn(struct msg_processor *mp, struct p2p_node *node,
         return true;
     }
 
-    /* Timeout check: reject stale responses (>30 seconds) */
+    /* Timeout check: reject stale responses (>30 seconds).  A negative age
+     * means the wall clock moved behind the request timestamp; fail closed
+     * instead of letting an arbitrarily old response bypass this bound. */
     int64_t age = (int64_t)platform_time_wall_time_t() - node->compact_request_time;
-    if (age > 30) {
+    if (age < 0 || age > 30) {
         LOG_WARN("compact", "peer %s: blocktxn %s — stale response (%lld sec), discarding",
                  node->addr_name, hex, (long long)age);
         compact_pending_clear(node);
