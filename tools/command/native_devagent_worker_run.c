@@ -372,13 +372,29 @@ long long zcl_devagent_worker_gate(const struct wkr_job *job,
 
 /* ── the job across the process boundary ───────────────────────────────── */
 
+static bool wkr_job_json(const struct wkr_job *job,
+                         unsigned long long memory_bytes,
+                         struct json_value *v)
+{
+    json_set_object(v);
+    return json_push_kv_str(v, "name", job->name) &&
+           json_push_kv_str(v, "kind", job->kind) &&
+           json_push_kv_int(v, "attempt", job->attempt) &&
+           json_push_kv_int(v, "seq", job->seq) &&
+           json_push_kv_str(v, "task", job->task) &&
+           json_push_kv_str(v, "model", job->model) &&
+           json_push_kv_int(v, "token_cap", job->token_cap) &&
+           json_push_kv_int(v, "time_cap_s", job->time_cap_s) &&
+           json_push_kv_int(v, "memory_bytes", (int64_t)memory_bytes);
+}
+
 bool zcl_devagent_worker_job_store(const struct wkr_job *job,
                                    unsigned long long memory_bytes)
 {
     struct json_value v;
     char path[4096 + 64];
-    char *text;
-    size_t n;
+    char *text = NULL;
+    size_t n = 0;
     bool ok;
     if (!job || !job->rundir[0] || memory_bytes == 0 ||
         memory_bytes > (unsigned long long)INT64_MAX ||
@@ -386,18 +402,10 @@ bool zcl_devagent_worker_job_store(const struct wkr_job *job,
             (int)sizeof(path))
         return false;
     json_init(&v);
-    json_set_object(&v);
-    ok = json_push_kv_str(&v, "name", job->name) &&
-         json_push_kv_str(&v, "kind", job->kind) &&
-         json_push_kv_int(&v, "attempt", job->attempt) &&
-         json_push_kv_int(&v, "seq", job->seq) &&
-         json_push_kv_str(&v, "task", job->task) &&
-         json_push_kv_str(&v, "model", job->model) &&
-         json_push_kv_int(&v, "token_cap", job->token_cap) &&
-         json_push_kv_int(&v, "time_cap_s", job->time_cap_s) &&
-         json_push_kv_int(&v, "memory_bytes", (int64_t)memory_bytes);
-    text = ok ? zcl_malloc(WKR_JOB_TEXT_CAP, "worker-job-text") : NULL;
-    n = text ? json_write(&v, text, WKR_JOB_TEXT_CAP) : 0;
+    if (wkr_job_json(job, memory_bytes, &v))
+        text = zcl_malloc(WKR_JOB_TEXT_CAP, "worker-job-text");
+    if (text)
+        n = json_write(&v, text, WKR_JOB_TEXT_CAP);
     ok = n > 0 && n < WKR_JOB_TEXT_CAP &&
          zcl_devagent_worker_write_atomic(path, text, n);
     free(text);

@@ -435,19 +435,24 @@ cf_launch(struct platform_process *process,
     return m;
 }
 
+static bool cf_roots_ok(const char *const *roots, size_t count)
+{
+    if (!roots || count == 0 || count > CF_MAX_ROOTS)
+        return false;
+    for (size_t i = 0; i < count; i++)
+        if (!roots[i] || !roots[i][0])
+            return false;
+    return true;
+}
+
 static bool cf_spec_ok(const struct platform_process *process,
                        const struct platform_confined_spec *spec)
 {
     if (!process || process->native != UINTPTR_MAX || !spec ||
-        !spec->image || !spec->argv || !spec->argv[0] || !spec->env ||
-        !spec->write_roots)
+        !spec->image || !spec->argv || !spec->argv[0] || !spec->env)
         return false;
-    if (spec->write_root_count == 0 || spec->write_root_count > CF_MAX_ROOTS)
-        return false;
-    for (size_t i = 0; i < spec->write_root_count; i++)
-        if (!spec->write_roots[i] || !spec->write_roots[i][0])
-            return false;
-    return spec->memory_bytes > 0 && spec->cpu_seconds > 0 &&
+    return cf_roots_ok(spec->write_roots, spec->write_root_count) &&
+           spec->memory_bytes > 0 && spec->cpu_seconds > 0 &&
            spec->cpu_seconds <= CF_MAX_CPU_SECONDS &&
            spec->active_processes > 0;
 }
