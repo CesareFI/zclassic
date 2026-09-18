@@ -89,7 +89,9 @@
  * still "queued" carries queued_age_s, and a directive this host sent
  * with no receiver evidence past FMC_QUEUED_STALE_S (120 s) becomes the
  * blocker "directive <ref> to <to>: no receiver evidence after N s" — the
- * visible form of "send said QUEUED but the target never read it".
+ * visible form of "send said QUEUED but the target never read it". The
+ * newest FMC_STALE_BLOCKER_CAP (8) are spelled out and one more line
+ * counts the rest, so they never crowd every other blocker out.
  *
  * WORKERS. `agents` is only the names seen in mail and on the board. The
  * `workers` array is evidence: an identity appears only after it answered
@@ -206,6 +208,7 @@
 #define FMC_WORKER_TRACK 64u
 #define FMC_DONE_TRACK 256u
 #define FMC_DIRECTIVE_SCAN 64
+#define FMC_STALE_BLOCKER_CAP 8
 #define FMC_ALIVE_WINDOW_S 900LL
 #define FMC_QUEUED_STALE_S 120LL
 #define FMC_REPLY_SOFT_BUDGET 49152u
@@ -1877,27 +1880,54 @@ static void fmc_workers_emit(struct json_value *data, struct fmc_roster *ro,
     json_free(&arr);
 }
 
-/* A directive this host sent that is still "queued" (no receiver evidence
- * at all) past FMC_QUEUED_STALE_S: exactly "steer send said QUEUED but
- * the target never read it". */
-static void fmc_stale_blocker(struct json_value *blockers,
-                              const struct fmc_row *v, long long age)
+/* Push one bounded blocker string. */
+static void fmc_push_blocker(struct json_value *blockers, const char *b)
 {
-    char b[256];
     struct json_value item;
-    int wlen;
-    if (age <= FMC_QUEUED_STALE_S || json_size(blockers) >= FMC_BLOCKER_CAP)
-        return;
-    wlen = snprintf(b, sizeof(b),
-                    "directive %.64s to %.48s: no receiver evidence after "
-                    "%lld s (threshold %lld s)",
-                    v->ref, v->to, age, FMC_QUEUED_STALE_S);
-    if (wlen <= 0 || (size_t)wlen >= sizeof(b))
+    if (json_size(blockers) >= FMC_BLOCKER_CAP)
         return;
     json_init(&item);
     json_set_str(&item, b);
     (void)json_push_back(blockers, &item);
     json_free(&item);
+}
+
+/* A directive this host sent that is still "queued" (no receiver evidence
+ * at all) past FMC_QUEUED_STALE_S: exactly "steer send said QUEUED but
+ * the target never read it". True when the row is stale; only the first
+ * FMC_STALE_BLOCKER_CAP are spelled out, so they cannot crowd every other
+ * blocker out, and fmc_stale_summary counts the rest. */
+static bool fmc_stale_blocker(struct json_value *blockers,
+                              const struct fmc_row *v, long long age,
+                              bool spell)
+{
+    char b[256];
+    int wlen;
+    if (age <= FMC_QUEUED_STALE_S)
+        return false;
+    if (!spell)
+        return true;
+    wlen = snprintf(b, sizeof(b),
+                    "directive %.64s to %.48s: no receiver evidence after "
+                    "%lld s (threshold %lld s)",
+                    v->ref, v->to, age, FMC_QUEUED_STALE_S);
+    if (wlen > 0 && (size_t)wlen < sizeof(b))
+        fmc_push_blocker(blockers, b);
+    return true;
+}
+
+/* One line for the stale directives not spelled out. */
+static void fmc_stale_summary(struct json_value *blockers, int stale)
+{
+    char b[192];
+    if (stale <= FMC_STALE_BLOCKER_CAP)
+        return;
+    (void)snprintf(b, sizeof(b),
+                   "%d more directives sent from here have no receiver "
+                   "evidence after %lld s (among the newest %d directives)",
+                   stale - FMC_STALE_BLOCKER_CAP, FMC_QUEUED_STALE_S,
+                   FMC_DIRECTIVE_SCAN);
+    fmc_push_blocker(blockers, b);
 }
 
 /* One bounded change row, carrying the state fmc_row_state resolves from
@@ -2003,6 +2033,7 @@ struct fmc_mail_ctx {
     long long now;
     long long shown;
     int scanned;
+    int stale;
     char sent_path[4096 + 32];
 };
 
@@ -2017,8 +2048,10 @@ static void fmc_mail_row(struct fmc_mail_ctx *c, const struct fmc_row *v,
     if (strcmp(v->kind, "directive") == 0 &&
         c->scanned < FMC_DIRECTIVE_SCAN) {
         c->scanned++;
-        if (strcmp(fmc_row_state(v, rows, c->sent_path), "queued") == 0)
-            fmc_stale_blocker(c->blockers, v, fmc_age_s(c->now, v->ts));
+        if (strcmp(fmc_row_state(v, rows, c->sent_path), "queued") == 0 &&
+            fmc_stale_blocker(c->blockers, v, fmc_age_s(c->now, v->ts),
+                              c->stale < FMC_STALE_BLOCKER_CAP))
+            c->stale++;
     }
     if (v->seq <= c->since || c->shown >= c->changes_cap)
         return;
@@ -2061,6 +2094,7 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
         if (fmc_row_parse(json_at(&rows, i - 1), &v))
             fmc_mail_row(c, &v, &rows);
     }
+    fmc_stale_summary(c->blockers, c->stale);
     json_free(&rows);
     return view->cursor;
 }

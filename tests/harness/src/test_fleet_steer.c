@@ -1908,6 +1908,41 @@ static int fmx_t_queued_stale(void)
         PASS();
     }
 
+    TEST("steer: many stale directives spell eight and count the rest") {
+        struct fmx_call b;
+        const struct json_value *bl;
+        char ref[32], line[160];
+        long long i;
+        size_t n, spelled = 0;
+        fmx_isolate("queued_stale_many");
+        fmx_prime_mail();
+        for (i = 0; i < 11; i++) {
+            (void)snprintf(ref, sizeof(ref), "many-%02lld", i);
+            fmx_seed_inbox("self", "2026-01-01T00:00:00Z", 30 + i,
+                           FMX_SENDER, "deaf-box", "directive", "work",
+                           ref);
+            (void)snprintf(line, sizeof(line),
+                           "{\"key\":\"k-%lld\",\"seq\":%lld,"
+                           "\"to\":\"deaf-box\",\"ref\":\"%s\"}\n",
+                           i, 30 + i, ref);
+            fmx_state_file("steer", "sent.jsonl", line, true);
+        }
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        bl = fmx_arr(&b, "blockers");
+        n = bl ? json_size(bl) : 0u;
+        for (i = 0; (size_t)i < n; i++) {
+            if (strstr(json_get_str(json_at(bl, (size_t)i)), "to deaf-box"))
+                spelled++;
+        }
+        ASSERT(spelled == 8);
+        ASSERT(fmx_blocker_has(&b, "3 more directives sent from here"));
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
 _test_next:;
     fmx_restore();
     return failures;
