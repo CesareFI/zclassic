@@ -22,6 +22,8 @@ void download_stats_snapshot_collect(struct download_stats_snapshot *out,
     struct download_manager *dm = msg_get_download_mgr();
     dl_get_stats(dm, &out->requested, &out->received, &out->timed_out,
                 &out->in_flight, &out->queued);
+    out->max_in_flight_total = dl_get_max_in_flight_total();
+    out->max_in_flight_per_peer = dl_get_max_in_flight_per_peer();
     dl_get_throughput(dm, &out->bytes_downloaded, &out->mbps_avg);
 
     if (!full)
@@ -47,6 +49,8 @@ void download_stats_snapshot_from_health(
     out->timed_out = health->blocks_timed_out;
     out->in_flight = health->in_flight;
     out->queued = health->queued;
+    out->max_in_flight_total = dl_get_max_in_flight_total();
+    out->max_in_flight_per_peer = dl_get_max_in_flight_per_peer();
     out->bytes_downloaded = health->download_bytes_received;
     out->mbps_avg = health->download_mbps_avg;
 }
@@ -63,6 +67,10 @@ void download_stats_push_json(struct json_value *obj,
     json_push_kv_int(obj, "timed_out", (int64_t)s->timed_out);
     json_push_kv_int(obj, "in_flight", (int64_t)s->in_flight);
     json_push_kv_int(obj, "queued", (int64_t)s->queued);
+    json_push_kv_int(obj, "max_in_flight_total",
+                     (int64_t)s->max_in_flight_total);
+    json_push_kv_int(obj, "max_in_flight_per_peer",
+                     (int64_t)s->max_in_flight_per_peer);
 
     if (full) {
         const struct dl_diagnostics *diag = &s->diag;

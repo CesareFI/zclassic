@@ -5,6 +5,22 @@
 
 #include "test/api_test_fixtures.h"
 
+static bool api_download_limits_json_valid(const struct json_value *value)
+{
+    return json_get_int(json_get(value, "max_in_flight_total")) > 0 &&
+           json_get_int(json_get(value, "max_in_flight_per_peer")) > 0;
+}
+
+static bool api_download_limits_snapshots_match(
+    const struct download_stats_snapshot *full,
+    const struct download_stats_snapshot *thin)
+{
+    return full->max_in_flight_total == thin->max_in_flight_total &&
+           full->max_in_flight_per_peer == thin->max_in_flight_per_peer &&
+           thin->max_in_flight_total > 0 &&
+           thin->max_in_flight_per_peer > 0;
+}
+
 int api_status_focused_tests(void)
 {
     int failures = 0;
@@ -152,6 +168,7 @@ int api_status_focused_tests(void)
         ok = ok && json_get(&root, "timed_out") != NULL;
         ok = ok && json_get(&root, "in_flight") != NULL;
         ok = ok && json_get(&root, "queued") != NULL;
+        ok &= api_download_limits_json_valid(&root);
         /* Diagnostics this endpoint already had. */
         ok = ok && json_get(&root, "orphaned") != NULL;
         ok = ok && json_get(&root, "accounting_drift") != NULL;
@@ -187,6 +204,7 @@ int api_status_focused_tests(void)
         ok = ok && full_snap.timed_out == thin_snap.timed_out;
         ok = ok && full_snap.in_flight == thin_snap.in_flight;
         ok = ok && full_snap.queued == thin_snap.queued;
+        ok &= api_download_limits_snapshots_match(&full_snap, &thin_snap);
         ok = ok && full_snap.bytes_downloaded == thin_snap.bytes_downloaded;
         ok = ok && full_snap.mbps_avg == thin_snap.mbps_avg;
 

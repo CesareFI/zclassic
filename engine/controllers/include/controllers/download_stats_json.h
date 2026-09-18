@@ -28,6 +28,8 @@ struct download_stats_snapshot {
     uint64_t timed_out;
     uint64_t in_flight;
     uint64_t queued;
+    uint64_t max_in_flight_total;
+    uint64_t max_in_flight_per_peer;
     uint64_t bytes_downloaded;
     double   mbps_avg;
     /* Only populated when download_stats_snapshot_collect() is called
