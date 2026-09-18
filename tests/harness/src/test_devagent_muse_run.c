@@ -1302,9 +1302,13 @@ static int mr_exec_delete_outside(void)
 
 /* One shim-fed case: the porcelain the audit reads is exactly `rows`.
  * `unmeasurable` says whether the rows are expected to be unreadable (the
- * whole pass refuses as unmeasurable) or readable but out of scope. */
+ * whole pass refuses as unmeasurable) or readable but out of scope.
+ * `why` is the EXACT reason the refusal must name — not merely that the
+ * pass refused. A refusal that cannot say which breakage it hit sends the
+ * operator back to guess, and every one of these rows fails for its own
+ * repairable reason, so each case pins its own sentence. */
 static int mr_rows_case(const char *label, const char *rows,
-    bool unmeasurable, const char *outside_json)
+    bool unmeasurable, const char *why, const char *outside_json)
 {
     int failures = 0;
     struct mr_dirs d;
@@ -1337,6 +1341,8 @@ static int mr_rows_case(const char *label, const char *rows,
             r.scope_changed_measured == false &&
             r.scope_changed_count == -1 && r.scope_outside_count == -1 &&
             strstr(r.reason, "change set unmeasurable") != NULL);
+        MR_CHECK("rows name the breakage",
+            why && strstr(r.reason, why) != NULL);
     } else {
         MR_CHECK("rows outside", r.scope_changed_measured &&
             strcmp(r.verdict, "failed") == 0 &&
@@ -1359,25 +1365,41 @@ static int mr_exec_rows_malformed(void)
     int failures = 0;
     /* A status pair porcelain cannot print. */
     failures += mr_rows_case("bad status pair", "XY src/turn.c\n",
-        true, NULL);
+        true, "a status column that is not a porcelain v1 character", NULL);
     /* Two legal status characters, but no space where the separator
      * always is: a blind three-character skip would have invented the
      * path "rc/turn.c" and judged that instead. */
     failures += mr_rows_case("no fixed separator", "MMsrc/turn.c\n",
-        true, NULL);
+        true, "no separating space after the two status columns", NULL);
     /* Unmodified in both columns, which this seam never prints. */
     failures += mr_rows_case("two blank columns", "   src/turn.c\n",
-        true, NULL);
+        true, "both status columns blank, which this seam never prints",
+        NULL);
     /* A rename separator on a status that cannot carry one. */
     failures += mr_rows_case("arrow without rename",
-        "M  src/turn.c -> src/other.c\n", true, NULL);
+        "M  src/turn.c -> src/other.c\n", true,
+        "a \" -> \" separator on a status that never carries one", NULL);
+    /* Shorter than the fixed prefix plus one path byte. Length is the
+     * first thing the parser checks and the only branch a reader can
+     * reach without a legal status byte, so it is proven on its own. */
+    failures += mr_rows_case("row too short", "M\n", true,
+        "a row too short to carry a status prefix and a path", NULL);
+    /* '?' and '!' are the two status characters porcelain only ever
+     * prints DOUBLED. One of them beside an ordinary status byte passes
+     * mr_status_char() on both columns and the separator test as well,
+     * so nothing but the doubling rule catches it — and each of the two
+     * has its own rule, which is why neither stands in for the other. */
+    failures += mr_rows_case("half untracked", "?M src/turn.c\n", true,
+        "'?' in one status column only, never doubled", NULL);
+    failures += mr_rows_case("half ignored", "!M src/turn.c\n", true,
+        "'!' in one status column only, never doubled", NULL);
     /* C-quoting that does not parse: an unterminated quote, then an
      * escape git never emits. A best-effort path out of either is a path
      * the audit cannot claim to have measured. */
     failures += mr_rows_case("unterminated quote", "?? \"src/turn.c\n",
-        true, NULL);
+        true, "malformed quoting on a row's path", NULL);
     failures += mr_rows_case("bad escape", "?? \"src/\\qturn.c\"\n",
-        true, NULL);
+        true, "malformed quoting on a row's path", NULL);
     return failures;
 }
 
@@ -1387,7 +1409,7 @@ static int mr_exec_rows_malformed(void)
 static int mr_exec_rows_rename_bare(void)
 {
     return mr_rows_case("rename without separator", "R  src/turn.c\n",
-        true, NULL);
+        true, "a rename or copy row with no \" -> \" separator", NULL);
 }
 
 /* (l) Regression guard on the path judgement itself: an absolute path and
@@ -1398,9 +1420,9 @@ static int mr_exec_rows_escaping_paths(void)
 {
     int failures = 0;
     failures += mr_rows_case("absolute path", "?? /etc/passwd\n", false,
-        "\"outside\":[\"/etc/passwd\"]");
+        NULL, "\"outside\":[\"/etc/passwd\"]");
     failures += mr_rows_case("dot dot path", "?? src/../../evil\n", false,
-        "\"outside\":[\"src/../../evil\"]");
+        NULL, "\"outside\":[\"src/../../evil\"]");
     return failures;
 }
 
