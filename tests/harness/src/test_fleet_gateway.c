@@ -35,6 +35,7 @@ int test_fleet_gateway(void)
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -72,8 +73,11 @@ static bool gw_read_line(int fd, char *out, size_t cap)
     return true;
 }
 
-/* Spawn the gateway; parse its `ready port=N` line. True when serving. */
-static bool gw_spawn(const char *bin, const char *node, const char *state)
+/* Spawn the gateway; parse its `ready port=N` line. True when serving.
+ * as_kb > 0 caps the child's address space (RLIMIT_AS, the limit ulimit -v
+ * sets) so a case can run the same request under exact memory pressure. */
+static bool gw_spawn_as(const char *bin, const char *node, const char *state,
+                        unsigned long as_kb)
 {
     int fds[2];
     char line[256];
@@ -87,6 +91,13 @@ static bool gw_spawn(const char *bin, const char *node, const char *state)
     }
     if (g_gw_pid == 0) {
         char *const argv[] = {(char *)bin, NULL};
+        if (as_kb > 0) {
+            struct rlimit rl;
+            rl.rlim_cur = (rlim_t)as_kb * 1024u;
+            rl.rlim_max = (rlim_t)as_kb * 1024u;
+            if (setrlimit(RLIMIT_AS, &rl) != 0)
+                _exit(126);
+        }
         dup2(fds[1], STDOUT_FILENO);
         close(fds[0]);
         close(fds[1]);
@@ -106,6 +117,11 @@ static bool gw_spawn(const char *bin, const char *node, const char *state)
     if (sscanf(line, "ready port=%d", &g_gw_port) != 1 || g_gw_port <= 0)
         return false;
     return true;
+}
+
+static bool gw_spawn(const char *bin, const char *node, const char *state)
+{
+    return gw_spawn_as(bin, node, state, 0);
 }
 
 static void gw_stop(void)
@@ -1397,6 +1413,190 @@ static bool gw_poll_match(const char *path, const char *needle, int tries)
     return false;
 }
 
+#if defined(__linux__)
+/* ── the bound under memory pressure ─────────────────────────────────────
+ *
+ * The node-input verdict is arithmetic, so it must not depend on how much
+ * heap the gateway has left. Swept with ulimit -v on one 132 KB call before
+ * the fix, the same request answered -32700 "parse error" at 3000 KB,
+ * -32603 at 3200, -32602 "arguments did not parse" at 3400, and the real
+ * limit only from 3600 up: the bound was checked after the body had been
+ * built into a tree, serialized, re-parsed and serialized again.
+ *
+ * The matrix is the same pressure, stated as headroom over the idle
+ * gateway's own address space (2752 KB where it was measured, which makes
+ * these exactly 3000 / 3200 / 3400 / 3600 KB there), so a gateway built
+ * elsewhere is pressed just as hard rather than failing to start. Every
+ * level must give the byte-identical reply the unconstrained gateway gives. */
+static const unsigned gw_press_headroom_kb[] = {248u, 448u, 648u, 848u};
+#define GW_PRESS_LEVELS \
+    (sizeof(gw_press_headroom_kb) / sizeof(gw_press_headroom_kb[0]))
+
+/* Address space of a live process in KB (Linux VmSize), or 0. */
+static unsigned long gw_vmsize_kb(pid_t pid)
+{
+    char path[64], line[256];
+    unsigned long kb = 0;
+    FILE *f;
+    if (snprintf(path, sizeof(path), "/proc/%d/status", (int)pid) < 0)
+        return 0;
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "VmSize: %lu kB", &kb) == 1)
+            break;
+    }
+    (void)fclose(f);
+    return kb;
+}
+
+/* The oversize steer_send with NO argument grant: the header credential is
+ * the one the gateway must add, so the measured size includes it. */
+static char *gw_big_send_header_only(size_t filler)
+{
+    size_t cap = filler + 512;
+    char *json = malloc(cap);
+    int n;
+    if (!json)
+        return NULL;
+    n = snprintf(json, cap,
+                 "{\"jsonrpc\":\"2.0\",\"id\":\"press-hdr\",\"method\":"
+                 "\"tools/call\",\"params\":{\"name\":\"steer_send\","
+                 "\"arguments\":{\"items\":[{\"to\":\"field-agent\","
+                 "\"ref\":\"bound-probe\",\"idempotency_key\":\"k-press\","
+                 "\"body\":\"");
+    if (n <= 0 || (size_t)n >= cap) {
+        free(json);
+        return NULL;
+    }
+    memset(json + n, 'x', filler);
+    snprintf(json + n + filler, cap - (size_t)n - filler, "\"}]}}}");
+    return json;
+}
+
+/* Bytes of the "arguments" value in a request built above: everything after
+ * the member name up to the params and envelope closers. */
+static size_t gw_args_span(const char *json)
+{
+    const char *a = strstr(json, "\"arguments\":");
+    if (!a)
+        return 0;
+    a += strlen("\"arguments\":");
+    return strlen(a) - 2u;
+}
+
+/* The three replies one gateway gives: oversize with the argument grant,
+ * oversize carrying the header credential, oversize and malformed. The
+ * suite's own gateway is parked and restored around the spawn. */
+static bool gw_press_round(const char *bin, const char *node,
+                           unsigned long as_kb, const char *const reqs[3],
+                           const char *gid, char *out[3], int st[3],
+                           unsigned long *idle_kb)
+{
+    pid_t saved_pid = g_gw_pid;
+    int saved_port = g_gw_port;
+    bool up;
+    int i;
+    for (i = 0; i < 3; i++) {
+        out[i] = NULL;
+        st[i] = 0;
+    }
+    up = gw_spawn_as(bin, node, g_gw_state, as_kb);
+    if (up && idle_kb)
+        *idle_kb = gw_vmsize_kb(g_gw_pid);
+    for (i = 0; up && i < 3; i++)
+        out[i] = gw_post_auth("/steer", reqs[i], gid, &st[i]);
+    gw_stop();
+    g_gw_pid = saved_pid;
+    g_gw_port = saved_port;
+    return up;
+}
+
+static int gw_t_bound_pressure(void)
+{
+    int failures = 0;
+    char *reqs_m[3] = {NULL, NULL, NULL};
+    char *ref[3] = {NULL, NULL, NULL};
+    char *got[3] = {NULL, NULL, NULL};
+    TEST("gateway: the node-input verdict does not move with memory pressure") {
+        const char *bin = gw_bin("Z23_TEST_GATEWAY_BIN", GW_TEST_BIN_DEFAULT);
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        const char *reqs[3];
+        char gid[64], want[160];
+        int st[3];
+        unsigned long idle = 0;
+        size_t lvl, i, n_arg, n_hdr, bad_len;
+        ASSERT(gw_mint(node, "brief,send,evidence", gid));
+        reqs_m[0] = gw_big_send(gid, GW_TEST_NODE_INPUT_MAX + 1024u);
+        reqs_m[1] = gw_big_send_header_only(GW_TEST_NODE_INPUT_MAX + 1024u);
+        reqs_m[2] = gw_big_send_header_only(GW_TEST_NODE_INPUT_MAX + 1024u);
+        ASSERT(reqs_m[0] && reqs_m[1] && reqs_m[2]);
+        /* Malformed: the envelope's closing brace is missing. */
+        bad_len = strlen(reqs_m[2]);
+        reqs_m[2][bad_len - 1] = '\0';
+        for (i = 0; i < 3; i++)
+            reqs[i] = reqs_m[i];
+
+        /* The unconstrained answers, stated as arithmetic: the input the
+         * node would get is the caller's argument bytes, plus
+         * ,"grant":"<id>" when the header credential is the one carried. */
+        ASSERT(gw_press_round(bin, node, 0, reqs, gid, ref, st, &idle));
+        ASSERT(idle > 0);
+        n_arg = gw_args_span(reqs[0]);
+        n_hdr = gw_args_span(reqs[1]) + strlen(",\"grant\":\"") +
+                strlen(gid) + 1u;
+        for (i = 0; i < 3; i++) {
+            ASSERT(ref[i] != NULL);
+            ASSERT_EQ(st[i], 200);
+        }
+        GW_ASSERT_BODY(ref[0], "\"code\":-32602");
+        GW_ASSERT_BODY(ref[1], "\"code\":-32602");
+        snprintf(want, sizeof(want), "tool input is %zu bytes; one node call "
+                 "carries at most %u", n_arg, GW_TEST_NODE_INPUT_MAX);
+        GW_ASSERT_BODY(ref[0], want);
+        snprintf(want, sizeof(want), "tool input is %zu bytes; one node call "
+                 "carries at most %u", n_hdr, GW_TEST_NODE_INPUT_MAX);
+        GW_ASSERT_BODY(ref[1], want);
+        GW_ASSERT_BODY(ref[1], "\"id\":\"press-hdr\"");
+        GW_ASSERT_BODY(ref[2], "\"code\":-32700");
+
+        /* The same requests, pressed: byte-identical or it is a failure
+         * that names the level and the body it got instead. */
+        for (lvl = 0; lvl < GW_PRESS_LEVELS; lvl++) {
+            unsigned long cap = idle + gw_press_headroom_kb[lvl];
+            bool up = gw_press_round(bin, node, cap, reqs, gid, got, st,
+                                     NULL);
+            printf("  pressure: as=%lu KB (idle %lu + %u) up=%d\n", cap,
+                   idle, gw_press_headroom_kb[lvl], up ? 1 : 0);
+            ASSERT(up);
+            for (i = 0; i < 3; i++) {
+                if (!got[i] || st[i] != 200 || strcmp(got[i], ref[i]) != 0) {
+                    printf("FAIL at %s:%d (pressure as=%lu KB, request %zu): "
+                           "status=%d body=[%.300s] want=[%.300s]\n",
+                           __FILE__, __LINE__, cap, i, st[i],
+                           got[i] ? got[i] : "(null)", ref[i]);
+                    failures++;
+                    goto _test_next;
+                }
+            }
+            for (i = 0; i < 3; i++) {
+                free(got[i]);
+                got[i] = NULL;
+            }
+        }
+        PASS();
+    }
+_test_next:;
+    for (int k = 0; k < 3; k++) {
+        free(reqs_m[k]);
+        free(ref[k]);
+        free(got[k]);
+    }
+    return failures;
+}
+#endif
+
 static int gw_t_life_send_ack(void)
 {
     int failures = 0;
@@ -2249,6 +2449,9 @@ int test_fleet_gateway(void)
     failures += gw_t_handshake();
     failures += gw_t_calls();
     failures += gw_t_node_input_bound();
+#if defined(__linux__)
+    failures += gw_t_bound_pressure();
+#endif
     failures += gw_t_auth();
     failures += gw_t_oauth();
     failures += gw_t_life_send_ack();

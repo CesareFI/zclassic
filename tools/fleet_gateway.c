@@ -115,13 +115,17 @@ struct gw_buf {
     size_t len;
     size_t cap;
     bool oom;
+    /* Measure only: len counts what the writers WOULD emit and nothing is
+     * stored or allocated. A size decided this way is the exact size the
+     * same writers later build, and holds with no heap left at all. */
+    bool count;
 };
 
 static void gw_buf_reserve(struct gw_buf *b, size_t extra)
 {
     size_t need;
     char *np;
-    if (!b || b->oom)
+    if (!b || b->oom || b->count)
         return;
     need = b->len + extra;
     if (need <= b->cap)
@@ -140,6 +144,10 @@ static void gw_buf_put(struct gw_buf *b, const char *s, size_t n)
 {
     if (!b || b->oom || !s)
         return;
+    if (b->count) {
+        b->len += n;
+        return;
+    }
     gw_buf_reserve(b, n + 1);
     if (b->oom)
         return;
@@ -292,6 +300,9 @@ struct gw_http {
     char *body;
     size_t body_len;
     bool bad;
+    /* The body could not be held: the gateway's memory, not the
+     * request, so it is never answered as a bad request. */
+    bool nomem;
     /* Captured "Authorization: Bearer <token>" credential, NUL-terminated
      * when auth_present. Overlong or non-token bytes set auth_bad instead;
      * both refuse a tool call before the node is forked. */
@@ -478,8 +489,10 @@ static bool gw_read_body(int fd, struct gw_http *h)
     if (h->content_length > GW_CAP_BODY)
         return false;
     h->body = zcl_malloc(h->content_length + 1, "fleet-gateway/body");
-    if (!h->body)
+    if (!h->body) {
+        h->nomem = true;
         return false;
+    }
     left = h->content_length;
     h->body_len = 0;
     while (left > 0) {
@@ -532,6 +545,10 @@ struct gw_node_out {
     char *text;
     size_t len;
     bool ok;
+    /* The gateway, not the node, ran out: a pipe, fork or reply buffer
+     * could not be had. Reported as a resource failure, never as the
+     * node's silence. */
+    bool nomem;
 };
 
 /* Forward declarations (defined below). */
@@ -540,35 +557,34 @@ static bool gw_authorize_issue(int fd, const struct gw_config *cfg,
                                const char *comma, char *loc, size_t loccap);
 static void gw_state_escape(const char *state, char *esc, size_t cap);
 
-/* Run: <node> fleet steer <verb> --input=<json>. Stdout (the node's own
- * result envelope) is captured up to GW_CAP_REPLY. */
-static struct gw_node_out gw_node_call(const char *node, const char *verb,
-                                       const char *input_json)
+/* Run: <node> fleet steer <verb> <arg>, where arg is the whole
+ * "--input=<json>" argv string, already built and already within
+ * GW_CAP_NODE_INPUT. Stdout (the node's own result envelope) is captured
+ * up to GW_CAP_REPLY, grown as it arrives rather than reserved up front. */
+static struct gw_node_out gw_node_exec(const char *node, const char *verb,
+                                       const char *arg)
 {
     struct gw_node_out out;
+    struct gw_buf reply;
     int fds[2];
     pid_t pid;
-    /* Sized to what execv can actually carry, not to the HTTP body cap: a
-     * buffer the kernel would reject can only produce a fork that dies. */
-    char arg[GW_CAP_NODE_INPUT + sizeof(GW_ARG_PREFIX) + 1];
-    int n;
     memset(&out, 0, sizeof(out));
-    n = snprintf(arg, sizeof(arg), GW_ARG_PREFIX "%s",
-                 input_json ? input_json : "{}");
-    if (n <= 0 || (size_t)n >= sizeof(arg))
+    memset(&reply, 0, sizeof(reply));
+    if (pipe(fds) != 0) {
+        out.nomem = true;
         return out;
-    if (pipe(fds) != 0)
-        return out;
+    }
     pid = fork();
     if (pid < 0) {
         close(fds[0]);
         close(fds[1]);
+        out.nomem = true;
         return out;
     }
     if (pid == 0) {
         char *const argv[] = {
             (char *)node, (char *)"fleet", (char *)"steer", (char *)verb,
-            arg, NULL
+            (char *)arg, NULL
         };
         dup2(fds[1], STDOUT_FILENO);
         close(fds[0]);
@@ -577,33 +593,59 @@ static struct gw_node_out gw_node_call(const char *node, const char *verb,
         _exit(127);
     }
     close(fds[1]);
-    out.text = zcl_malloc(GW_CAP_REPLY + 1, "fleet-gateway/reply");
-    if (!out.text) {
-        close(fds[0]);
-        waitpid(pid, NULL, 0);
-        return out;
-    }
     for (;;) {
+        size_t room;
         ssize_t r;
-        if (out.len >= GW_CAP_REPLY)
+        if (reply.len >= GW_CAP_REPLY)
             break;
-        r = read(fds[0], out.text + out.len, GW_CAP_REPLY - out.len);
+        gw_buf_reserve(&reply, 4096u + 1u);
+        if (reply.oom) {
+            out.nomem = true;
+            break;
+        }
+        room = reply.cap - reply.len - 1u;
+        if (room > GW_CAP_REPLY - reply.len)
+            room = GW_CAP_REPLY - reply.len;
+        r = read(fds[0], reply.p + reply.len, room);
         if (r <= 0)
             break;
-        out.len += (size_t)r;
+        reply.len += (size_t)r;
     }
-    out.text[out.len] = '\0';
     close(fds[0]);
     {
         int st = 0;
         waitpid(pid, &st, 0);
-        out.ok = WIFEXITED(st) && WEXITSTATUS(st) == 0 && out.len > 0;
+        out.ok = !out.nomem && WIFEXITED(st) && WEXITSTATUS(st) == 0 &&
+                 reply.len > 0;
     }
     if (!out.ok) {
-        free(out.text);
-        out.text = NULL;
-        out.len = 0;
+        gw_buf_free(&reply);
+        return out;
     }
+    reply.p[reply.len] = '\0';
+    out.text = reply.p;
+    out.len = reply.len;
+    return out;
+}
+
+/* The same call for a small gateway-built input (the OAuth mint). */
+static struct gw_node_out gw_node_call(const char *node, const char *verb,
+                                       const char *input_json)
+{
+    struct gw_node_out out;
+    struct gw_buf arg;
+    memset(&out, 0, sizeof(out));
+    memset(&arg, 0, sizeof(arg));
+    gw_buf_str(&arg, GW_ARG_PREFIX);
+    gw_buf_str(&arg, input_json ? input_json : "{}");
+    if (arg.oom || !arg.p || arg.len - (sizeof(GW_ARG_PREFIX) - 1u) >
+                                  GW_CAP_NODE_INPUT) {
+        out.nomem = arg.oom || !arg.p;
+        gw_buf_free(&arg);
+        return out;
+    }
+    out = gw_node_exec(node, verb, arg.p);
+    gw_buf_free(&arg);
     return out;
 }
 
@@ -796,28 +838,251 @@ static void gw_reply_tools_list(struct gw_buf *b, const struct json_value *id)
     gw_buf_str(b, "]}}");
 }
 
-/* Serialize tool arguments back to the --input JSON the node takes. */
-static void gw_args_input(struct gw_buf *b, const struct json_value *params)
+/* ── the node input, measured where it lies ───────────────────────────────
+ *
+ * GW_CAP_NODE_INPUT has to hold whatever memory is left. It used to be
+ * checked last, after the body had been built into a tree, the arguments
+ * serialized, parsed again for the credential and serialized a second
+ * time, so an oversize call got whichever answer the heap allowed. Swept
+ * with ulimit -v on one 132 KB call: 3000 KB answered -32700 "parse
+ * error", 3200 -32603, 3400 -32602 "arguments did not parse", and only
+ * 3600 and up the real limit.
+ *
+ * Now nothing on the way to that verdict allocates. json_valid proves the
+ * body is one value under json_read's own grammar, this walker finds the
+ * few spans the node input is made of, and the size is counted with the
+ * same writers that later build it. The forwarded input IS the caller's
+ * own argument bytes, plus the header credential when that is the one
+ * carried: built once, exactly sized, never re-parsed. */
+
+/* JSON whitespace, as json_read skips it. */
+static const char *gw_raw_ws(const char *p, const char *end)
 {
-    const struct json_value *args = params ? json_get(params, "arguments")
-                                           : NULL;
-    if (args && (args->type == JSON_OBJ || args->type == JSON_ARR))
-        gw_json_write(b, args);
-    else
-        gw_buf_str(b, "{}");
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+        p++;
+    return p;
+}
+
+/* One past the string opening at p, walked as json_read walks it: a \u
+ * escape consumes four more bytes, whatever they are. */
+static const char *gw_raw_str_end(const char *p, const char *end)
+{
+    p++;
+    while (p < end && *p != '"') {
+        if (*p == '\\' && end - p > 1) {
+            p++;
+            if (*p == 'u')
+                p += end - p > 4 ? 4 : end - p - 1;
+        }
+        p++;
+    }
+    return p < end ? p + 1 : end;
+}
+
+/* The string at p decodes, under json_read's rules, to exactly want. */
+static bool gw_raw_str_is(const char *p, const char *end, const char *want)
+{
+    p++;
+    while (p < end && *p != '"') {
+        char c = *p;
+        if (c == '\\' && end - p > 1) {
+            p++;
+            c = *p;
+            if (c == 'b')
+                c = '\b';
+            else if (c == 'f')
+                c = '\f';
+            else if (c == 'n')
+                c = '\n';
+            else if (c == 'r')
+                c = '\r';
+            else if (c == 't')
+                c = '\t';
+            else if (c == 'u') {
+                c = '?';
+                p += end - p > 4 ? 4 : end - p - 1;
+            }
+        }
+        if (*want == '\0' || *want != c)
+            return false;
+        want++;
+        p++;
+    }
+    return *want == '\0';
+}
+
+/* One past the value starting at p (the body is already json_valid). */
+static const char *gw_raw_skip(const char *p, const char *end)
+{
+    int depth = 0;
+    p = gw_raw_ws(p, end);
+    do {
+        if (p >= end)
+            return end;
+        if (*p == '"') {
+            p = gw_raw_str_end(p, end);
+            continue;
+        }
+        if (*p == '{' || *p == '[')
+            depth++;
+        else if (*p == '}' || *p == ']')
+            depth--;
+        else if (depth == 0) {
+            while (p < end && *p != ',' && *p != '}' && *p != ']' &&
+                   *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+                p++;
+            return p;
+        }
+        p++;
+    } while (depth > 0);
+    return p;
+}
+
+/* The value of the FIRST member named key in the object at p, or NULL:
+ * json_get's answer, found without the tree. */
+static const char *gw_raw_member(const char *p, const char *end,
+                                 const char *key)
+{
+    p = gw_raw_ws(p, end);
+    if (p >= end || *p != '{')
+        return NULL;
+    p = gw_raw_ws(p + 1, end);
+    while (p < end && *p == '"') {
+        const char *k = p;
+        p = gw_raw_ws(gw_raw_str_end(p, end), end);
+        p = gw_raw_ws(p + 1, end);
+        if (gw_raw_str_is(k, end, key))
+            return p;
+        p = gw_raw_ws(gw_raw_skip(p, end), end);
+        if (p < end && *p == ',')
+            p = gw_raw_ws(p + 1, end);
+    }
+    return NULL;
+}
+
+/* What one tools/call would forward, as spans of the request body. */
+struct gw_call_plan {
+    bool is_call;         /* method is the string "tools/call" */
+    const char *id;       /* raw id bytes; NULL for a notification */
+    size_t id_len;
+    const char *args;     /* raw arguments bytes; "{}" when not a container */
+    size_t args_len;
+    bool args_obj;
+    bool args_empty;
+    bool arg_grant;       /* arguments carry a non-empty string grant */
+};
+
+static void gw_call_scan(const char *body, size_t len,
+                         struct gw_call_plan *pl)
+{
+    const char *end = body + len;
+    const char *v, *g;
+    memset(pl, 0, sizeof(*pl));
+    /* A missing or scalar arguments member forwards as an empty object. */
+    pl->args = "{}";
+    pl->args_len = 2;
+    pl->args_obj = true;
+    pl->args_empty = true;
+    v = gw_raw_member(body, end, "method");
+    pl->is_call = v && *v == '"' && gw_raw_str_is(v, end, "tools/call");
+    v = gw_raw_member(body, end, "id");
+    if (v && !(end - v >= 4 && memcmp(v, "null", 4) == 0)) {
+        pl->id = v;
+        pl->id_len = (size_t)(gw_raw_skip(v, end) - v);
+    }
+    v = gw_raw_member(body, end, "params");
+    v = v ? gw_raw_member(v, end, "arguments") : NULL;
+    if (v && (*v == '{' || *v == '[')) {
+        pl->args = v;
+        pl->args_len = (size_t)(gw_raw_skip(v, end) - v);
+        pl->args_obj = *v == '{';
+        pl->args_empty = pl->args_obj && *gw_raw_ws(v + 1, end) == '}';
+        g = pl->args_obj ? gw_raw_member(v, end, "grant") : NULL;
+        pl->arg_grant = g && *g == '"' && gw_raw_str_end(g, end) - g > 2;
+    }
+}
+
+/* The node input: the caller's arguments, with the header credential
+ * appended as "grant" when it is the one carried. Into a count buffer this
+ * is the measurement; into a real one, the build. */
+static void gw_input_write(struct gw_buf *b, const struct gw_call_plan *pl,
+                           const char *carry)
+{
+    if (!carry) {
+        gw_buf_put(b, pl->args, pl->args_len);
+        return;
+    }
+    gw_buf_put(b, pl->args, pl->args_len - 1u);
+    if (!pl->args_empty)
+        gw_buf_put(b, ",", 1);
+    gw_buf_str(b, "\"grant\":");
+    gw_buf_json_str(b, carry);
+    gw_buf_put(b, "}", 1);
+}
+
+static size_t gw_input_len(const struct gw_call_plan *pl, const char *carry)
+{
+    struct gw_buf m;
+    memset(&m, 0, sizeof(m));
+    m.count = true;
+    gw_input_write(&m, pl, carry);
+    return m.len;
+}
+
+/* The header credential the node input will carry, if any: the one rule
+ * gw_credential enforces, read from the plan. */
+static const char *gw_plan_carry(const struct gw_call_plan *pl,
+                                 const char *bearer, bool bearer_bad)
+{
+    if (!bearer || bearer_bad || pl->arg_grant || !pl->args_obj)
+        return NULL;
+    return bearer;
+}
+
+static void gw_input_refusal(char *msg, size_t cap, size_t n)
+{
+    snprintf(msg, cap,
+             "tool input is %zu bytes; one node call carries at most %u", n,
+             (unsigned)GW_CAP_NODE_INPUT);
+}
+
+/* The oversize verdict, before any tree exists: a call that cannot be
+ * carried is refused as soon as its bytes are known to be JSON, whatever
+ * else it says. The id is echoed as the caller sent it. True when the
+ * refusal was written. */
+static bool gw_refuse_oversize(struct gw_buf *b, const struct gw_call_plan *pl,
+                               const char *bearer, bool bearer_bad)
+{
+    size_t n;
+    char msg[128];
+    if (!pl->is_call || !pl->id)
+        return false;
+    n = gw_input_len(pl, gw_plan_carry(pl, bearer, bearer_bad));
+    if (n <= GW_CAP_NODE_INPUT)
+        return false;
+    gw_input_refusal(msg, sizeof(msg), n);
+    gw_buf_str(b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    gw_buf_put(b, pl->id, pl->id_len);
+    gw_buf_str(b, ",\"error\":{\"code\":-32602,\"message\":");
+    gw_buf_json_str(b, msg);
+    gw_buf_str(b, "}}");
+    return true;
 }
 
 /* Fail-closed credential rule. A tool call reaches the node only with
  * exactly one credential: the Authorization Bearer [REDACTED] the tool-argument
  * grant. Neither may be ambiguous, and the node is never forked for an
  * unauthenticated call — its operator authority stays local-only. Scope,
- * expiry and revocation remain node-enforced after forwarding. */
+ * expiry and revocation remain node-enforced after forwarding. *carry is
+ * the header credential the input must add, or NULL. */
 static bool gw_credential(struct gw_buf *b, const struct json_value *id,
                           const char *bearer, bool bearer_bad,
-                          struct json_value *args, bool *challenge)
+                          const struct json_value *args, bool args_obj,
+                          const char **carry, bool *challenge)
 {
     const struct json_value *g;
     const char *arg_grant = NULL;
+    *carry = NULL;
     g = json_get(args, "grant");
     if (g && g->type == JSON_STR)
         arg_grant = json_get_str((struct json_value *)g);
@@ -840,76 +1105,30 @@ static bool gw_credential(struct gw_buf *b, const struct json_value *id,
         return false;
     }
     if (bearer && !arg_grant) {
-        if (args->type != JSON_OBJ ||
-            !json_push_kv_str(args, "grant", bearer)) {
+        if (!args_obj) {
             gw_rpc_error(b, id, -32602, "grant cannot be carried");
             return false;
         }
-    }
-    return true;
-}
-
-/* Serialize the tool arguments with the single credential carried as
- * the node-side "grant" input. False after emitting a typed error; the
- * node is never forked on that path. */
-static bool gw_input_with_grant(struct gw_buf *b, const struct json_value *id,
-                                const struct json_value *params,
-                                const char *bearer, bool bearer_bad,
-                                struct gw_buf *input, bool *challenge)
-{
-    struct json_value args;
-    memset(input, 0, sizeof(*input));
-    gw_args_input(input, params);
-    if (input->oom || !input->p) {
-        gw_buf_free(input);
-        gw_rpc_error(b, id, -32603, "arguments too large");
-        return false;
-    }
-    json_init(&args);
-    if (!json_read(&args, input->p, input->len)) {
-        gw_buf_free(input);
-        json_free(&args);
-        gw_rpc_error(b, id, -32602, "arguments did not parse");
-        return false;
-    }
-    if (!gw_credential(b, id, bearer, bearer_bad, &args, challenge)) {
-        gw_buf_free(input);
-        json_free(&args);
-        return false;
-    }
-    gw_buf_free(input);
-    memset(input, 0, sizeof(*input));
-    gw_json_write(input, &args);
-    json_free(&args);
-    if (input->oom || !input->p) {
-        gw_buf_free(input);
-        gw_rpc_error(b, id, -32603, "arguments too large");
-        return false;
+        *carry = bearer;
     }
     return true;
 }
 
 /* Fork the node for one credentialed call and format its own envelope as
  * the tool result content (a node refusal is content with isError:true,
- * never a transport error). */
+ * never a transport error). arg is the whole "--input=" argv string. */
 static void gw_forward_call(struct gw_buf *b, const struct json_value *id,
                             const struct gw_tool *t, const char *node,
-                            const char *input_text)
+                            const char *arg)
 {
     struct gw_node_out out;
     struct json_value env;
     const struct json_value *data;
-    /* Refuse oversize input here, before the fork, so the caller gets a
-     * typed limit instead of a dead child reported as silence. */
-    if (input_text && strlen(input_text) > GW_CAP_NODE_INPUT) {
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "tool input is %zu bytes; one node call carries at most %u",
-                 strlen(input_text), (unsigned)GW_CAP_NODE_INPUT);
-        gw_rpc_error(b, id, -32602, msg);
+    out = gw_node_exec(node, t->verb, arg);
+    if (out.nomem) {
+        gw_rpc_error(b, id, -32603, "gateway resources exhausted");
         return;
     }
-    out = gw_node_call(node, t->verb, input_text);
     if (!out.ok) {
         gw_rpc_error(b, id, -32000, "node did not answer");
         return;
@@ -956,23 +1175,46 @@ static void gw_forward_call(struct gw_buf *b, const struct json_value *id,
 
 static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
                                const struct json_value *params,
+                               const struct gw_call_plan *pl,
                                const char *node, const char *bearer,
                                bool bearer_bad, bool *challenge)
 {
     const struct gw_tool *t;
-    const char *name;
-    struct gw_buf input;
+    const char *name, *carry = NULL;
+    const struct json_value *args;
+    struct gw_buf arg;
+    size_t n;
     name = gw_json_str(params, "name");
     t = gw_tool_by_name(name);
     if (!t) {
         gw_rpc_error(b, id, -32602, "unknown tool");
         return;
     }
-    if (!gw_input_with_grant(b, id, params, bearer, bearer_bad, &input,
-                             challenge))
+    args = params ? json_get(params, "arguments") : NULL;
+    if (!gw_credential(b, id, bearer, bearer_bad, args, pl->args_obj, &carry,
+                       challenge))
         return;
-    gw_forward_call(b, id, t, node, input.p);
-    gw_buf_free(&input);
+    /* gw_refuse_oversize already held this bound; stating it again here
+     * keeps the fork unreachable for an input execv cannot carry, whatever
+     * the plan and the tree might ever disagree on. */
+    n = gw_input_len(pl, carry);
+    if (n > GW_CAP_NODE_INPUT) {
+        char msg[128];
+        gw_input_refusal(msg, sizeof(msg), n);
+        gw_rpc_error(b, id, -32602, msg);
+        return;
+    }
+    memset(&arg, 0, sizeof(arg));
+    gw_buf_reserve(&arg, sizeof(GW_ARG_PREFIX) + n);
+    gw_buf_str(&arg, GW_ARG_PREFIX);
+    gw_input_write(&arg, pl, carry);
+    if (arg.oom || !arg.p) {
+        gw_buf_free(&arg);
+        gw_rpc_error(b, id, -32603, "gateway resources exhausted");
+        return;
+    }
+    gw_forward_call(b, id, t, node, arg.p);
+    gw_buf_free(&arg);
 }
 
 static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
@@ -983,12 +1225,26 @@ static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
     const struct json_value *v;
     const char *method;
     const struct json_value *id, *params;
-    json_init(&req);
-    if (!body || !json_read(&req, body, strlen(body))) {
-        json_free(&req);
+    struct gw_call_plan plan;
+    size_t len = body ? strlen(body) : 0;
+    /* Malformed is decided without allocating, so it never depends on the
+     * heap; a body json_valid accepts is JSON whatever json_read says. */
+    if (!body || !json_valid(body, len)) {
         gw_buf_str(b, "{\"jsonrpc\":\"2.0\",\"id\":null,"
                       "\"error\":{\"code\":-32700,"
                       "\"message\":\"parse error\"}}");
+        return;
+    }
+    gw_call_scan(body, len, &plan);
+    if (gw_refuse_oversize(b, &plan, bearer, bearer_bad))
+        return;
+    json_init(&req);
+    if (!json_read(&req, body, len)) {
+        /* Valid JSON that could not be built: memory, not the caller. */
+        json_free(&req);
+        gw_buf_str(b, "{\"jsonrpc\":\"2.0\",\"id\":null,"
+                      "\"error\":{\"code\":-32603,"
+                      "\"message\":\"gateway resources exhausted\"}}");
         return;
     }
     if (req.type != JSON_OBJ) {
@@ -1021,7 +1277,7 @@ static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
     else if (strcmp(method, "tools/list") == 0)
         gw_reply_tools_list(b, id);
     else if (strcmp(method, "tools/call") == 0)
-        gw_reply_tool_call(b, id, params, node, bearer, bearer_bad,
+        gw_reply_tool_call(b, id, params, &plan, node, bearer, bearer_bad,
                            challenge);
     else if (strcmp(method, "ping") == 0) {
         gw_buf_str(b, "{\"jsonrpc\":\"2.0\",\"id\":");
@@ -2057,6 +2313,11 @@ static void gw_serve(int fd, const struct gw_config *cfg)
     if (!gw_http_read(fd, &h, hbuf)) {
         free(hbuf);
         free(h.body);
+        if (h.nomem) {
+            gw_reply(fd, 500, "application/json",
+                     "{\"error\":\"no memory\"}", 20);
+            return;
+        }
         gw_reply(fd, 400, "application/json", "{\"error\":\"bad request\"}",
                  22);
         return;

@@ -86,4 +86,10 @@ size_t json_write(const struct json_value *v, char *buf, size_t buflen);
  * leaves v a fresh JSON_NULL (safe to json_free or reuse). */
 bool json_read(struct json_value *v, const char *raw, size_t len);
 
+/* Exactly json_read's grammar, depth limit included, with no allocation and
+ * no tree: true iff json_read would accept raw[0..len) given the memory.
+ * This is what lets a caller tell malformed input from exhausted memory: a
+ * body json_valid accepts and json_read refuses could not be allocated. */
+bool json_valid(const char *raw, size_t len);
+
 #endif

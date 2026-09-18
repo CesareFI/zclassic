@@ -1,6 +1,9 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0 */
 #include "test/test_core.h"
+#include "base/safe_alloc.h"
 #include "json/json.h"
+
+#include <string.h>
 
 int test_json(void)
 {
@@ -347,5 +350,56 @@ int test_json(void)
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 
+
+    printf("json_valid is json_read's grammar with no allocation... ");
+    {
+        /* A caller tells malformed input from exhausted memory by asking
+         * json_valid first, so the two must never disagree about a byte
+         * string, quirks included: the bare "-" and the unchecked \u that
+         * json_read accepts, the 64-byte number it refuses, and the depth
+         * limit on both sides of the line. */
+        static const char *const corpus[] = {
+            "42", "-", "-7", "1.", "1e", "1.5e+3", "\"\\uZZZZ\"",
+            "\"a\\qb\"", "\"open", "{\"a\":1,}", "{\"a\" 1}", "[1,2]", "[1 2]",
+            "{}", " { \"k\" : [ true , false , null ] } ", "nul", "tru",
+            "\"\\\"\"", "{\"a\":\"b\"} x", "[", "]", "",
+            "1234567890123456789012345678901234567890123456789012345678901234",
+            "123456789012345678901234567890123456789012345678901234567890123",
+        };
+        char deep[600];
+        bool ok = true;
+        size_t i, d;
+        for (i = 0; i < sizeof(corpus) / sizeof(corpus[0]); i++) {
+            struct json_value v;
+            bool r = json_read(&v, corpus[i], strlen(corpus[i]));
+            json_free(&v);
+            if (r != json_valid(corpus[i], strlen(corpus[i]))) {
+                printf("[disagree on '%s'] ", corpus[i]);
+                ok = false;
+            }
+        }
+        for (d = 255; d <= 258; d++) {
+            struct json_value v;
+            bool r;
+            memset(deep, '[', d);
+            memset(deep + d, ']', d);
+            r = json_read(&v, deep, 2 * d);
+            json_free(&v);
+            ok = ok && r == (d <= 256) && json_valid(deep, 2 * d) == r;
+        }
+        ok = ok && !json_valid(NULL, 0);
+        /* No allocation at all: armed failures are still armed after a walk
+         * over strings, keys and containers. */
+        zcl_alloc_fault_fail_next("json_string");
+        ok = ok && json_valid("{\"a\":[\"x\",{\"b\":\"y\"}]}", 21);
+        ok = ok && zcl_alloc_fault_armed_label() != NULL &&
+             strcmp(zcl_alloc_fault_armed_label(), "json_string") == 0;
+        zcl_alloc_fault_fail_next("json_children");
+        ok = ok && json_valid("[[1],[2]]", 9);
+        ok = ok && zcl_alloc_fault_armed_label() != NULL &&
+             strcmp(zcl_alloc_fault_armed_label(), "json_children") == 0;
+        zcl_alloc_fault_clear();
+        if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
+    }
     return failures;
 }

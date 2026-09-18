@@ -388,19 +388,39 @@ static const char *skip_ws(const char *p, const char *end)
 static bool parse_value_r(struct json_value *v, const char **pp,
                           const char *end, int depth);
 
+/* Append one decoded byte. A NULL string is the validate-only scan: the
+ * grammar is walked exactly as for a kept string and nothing is stored. */
+static bool str_put(char **s, size_t *cap, size_t *len, char c)
+{
+    if (!*s)
+        return true;
+    if (*len >= *cap - 1) {
+        char *ns = zcl_realloc(*s, *cap * 2, "json_string");
+        if (!ns) return false;
+        *s = ns;
+        *cap *= 2;
+    }
+    (*s)[(*len)++] = c;
+    return true;
+}
+
+/* out == NULL validates without allocating (json_valid). */
 static bool parse_string(char **out, const char **pp, const char *end)
 {
     const char *p = *pp;
     if (p >= end || *p != '"') return false;
     p++;
     size_t cap = 64, len = 0;
-    char *s = zcl_malloc(cap, "json_string");
-    if (!s) return false;
+    char *s = NULL;
+    if (out) {
+        s = zcl_malloc(cap, "json_string");
+        if (!s) return false;
+    }
     while (p < end && *p != '"') {
+        char c = *p;
         if (*p == '\\') {
             p++;
             if (p >= end) { free(s); return false; }
-            char c;
             switch (*p) {
             case '"':  c = '"'; break;
             case '\\': c = '\\'; break;
@@ -416,28 +436,16 @@ static bool parse_string(char **out, const char **pp, const char *end)
                 break;
             default: free(s); return false;
             }
-            if (len >= cap - 1) {
-                cap *= 2;
-                char *ns = zcl_realloc(s, cap, "json_string");
-                if (!ns) { free(s); return false; }
-                s = ns;
-            }
-            s[len++] = c;
-        } else {
-            if (len >= cap - 1) {
-                cap *= 2;
-                char *ns = zcl_realloc(s, cap, "json_string");
-                if (!ns) { free(s); return false; }
-                s = ns;
-            }
-            s[len++] = *p;
         }
+        if (!str_put(&s, &cap, &len, c)) { free(s); return false; }
         p++;
     }
     if (p >= end) { free(s); return false; }
     p++;
-    s[len] = '\0';
-    *out = s;
+    if (out) {
+        s[len] = '\0';
+        *out = s;
+    }
     *pp = p;
     return true;
 }
@@ -480,11 +488,16 @@ static bool parse_value_r(struct json_value *v, const char **pp,
     const char *p = skip_ws(*pp, end);
     if (p >= end) return false;
 
+    /* v == NULL is json_valid: scalars land in a stack sink and containers
+     * never grow, so the walk is the same grammar with no allocation. */
+    struct json_value sink;
+    bool keep = v != NULL;
+    if (!keep) v = &sink;
     json_init(v);
 
     if (*p == '"') {
         char *s = NULL;
-        if (!parse_string(&s, &p, end)) return false;
+        if (!parse_string(keep ? &s : NULL, &p, end)) return false;
         v->type = JSON_STR;
         v->val.s = s;
         *pp = p;
@@ -499,16 +512,18 @@ static bool parse_value_r(struct json_value *v, const char **pp,
         while (p < end) {
             p = skip_ws(p, end);
             char *key = NULL;
-            if (!parse_string(&key, &p, end)) return false;
+            if (!parse_string(keep ? &key : NULL, &p, end)) return false;
             p = skip_ws(p, end);
             if (p >= end || *p != ':') { free(key); return false; }
             p++;
             struct json_value child;
-            if (!parse_value_r(&child, &p, end, depth + 1)) { free(key); return false; }
-            if (!json_grow(v)) { free(key); json_free(&child); return false; }
-            v->keys[v->num_children] = key;
-            v->children[v->num_children] = child;
-            v->num_children++;
+            if (!parse_value_r(keep ? &child : NULL, &p, end, depth + 1)) { free(key); return false; }
+            if (keep) {
+                if (!json_grow(v)) { free(key); json_free(&child); return false; }
+                v->keys[v->num_children] = key;
+                v->children[v->num_children] = child;
+                v->num_children++;
+            }
             p = skip_ws(p, end);
             if (p < end && *p == ',') { p++; continue; }
             if (p < end && *p == '}') { *pp = p + 1; return true; }
@@ -524,11 +539,13 @@ static bool parse_value_r(struct json_value *v, const char **pp,
         if (p < end && *p == ']') { *pp = p + 1; return true; }
         while (p < end) {
             struct json_value child;
-            if (!parse_value_r(&child, &p, end, depth + 1)) return false;
-            if (!json_grow(v)) { json_free(&child); return false; }
-            v->keys[v->num_children] = NULL;
-            v->children[v->num_children] = child;
-            v->num_children++;
+            if (!parse_value_r(keep ? &child : NULL, &p, end, depth + 1)) return false;
+            if (keep) {
+                if (!json_grow(v)) { json_free(&child); return false; }
+                v->keys[v->num_children] = NULL;
+                v->children[v->num_children] = child;
+                v->num_children++;
+            }
             p = skip_ws(p, end);
             if (p < end && *p == ',') { p++; continue; }
             if (p < end && *p == ']') { *pp = p + 1; return true; }
@@ -571,6 +588,15 @@ bool json_read(struct json_value *v, const char *raw, size_t len)
         return false;
     }
     return true;
+}
+
+bool json_valid(const char *raw, size_t len)
+{
+    const char *p = raw;
+    const char *end = raw + len;
+    if (!raw)
+        return false;
+    return parse_value_r(NULL, &p, end, 0) && skip_ws(p, end) == end;
 }
 
 void diag_push_health(struct json_value *out, bool ok, const char *reason)
