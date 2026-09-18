@@ -37,7 +37,19 @@
  *          cannot drift from the store's own semantics. `from` alone is a
  *          claim and was believed once: any holder of any send-capable
  *          grant could name any sender and have work dispatched under it.
- *          A row with no binding is unattributable and refused;
+ *          A row with no binding is unattributable and refused.
+ *          BE HONEST ABOUT WHAT THE BINDING BUYS. It is a value the sender
+ *          could only have produced by holding its own credential, and it
+ *          is therefore unforgeable by someone who has never seen a row
+ *          that carries it. It is NOT a signature over this row: it is
+ *          fixed per (grant, label), it rides in the clear, and mail rows
+ *          are readable by everyone who can read this box's maildir. So
+ *          anyone who can both READ one stamped row and WRITE the maildir
+ *          can lift that stamp onto a directive of their own and speak as
+ *          that label until the grant is revoked. That is a narrower hole
+ *          than "any grant may name any sender" and it is still a hole;
+ *          closing it needs a per-row signature, which is what routing
+ *          directives over the already-signed board is for;
  *        - the body parses as a well-formed Muse task direction (below).
  *      Anything else is refused with a typed reason and executes nothing.
  *   3. TO WORK. The directive body is written verbatim to
