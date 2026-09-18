@@ -1972,15 +1972,19 @@ static bool rcv_intake_page(struct rcv_ctx *c, const char *since, char *next,
 {
     struct rcv_sub sub;
     const struct json_value *rows;
+    char input[RCV_POS_MAX + 96];
     size_t n, i;
+    /* The cursor passed rcv_pos_ok (no quote, no backslash), so it is
+     * spliced into the fixed pull object verbatim. */
+    int w = since[0] ? snprintf(input, sizeof(input),
+                                "{\"action\":\"pull\",\"since\":\"%s\","
+                                "\"kind\":\"directive\"}", since)
+                     : snprintf(input, sizeof(input), "%s",
+                                "{\"action\":\"pull\",\"since\":0,"
+                                "\"kind\":\"directive\"}");
     rcv_sub_begin(&sub, "zcl.agent_mail.v1", "dev.agent.mail");
-    if (sub.valid) {
-        (void)json_push_kv_str(&sub.input, "action", "pull");
-        (void)json_push_kv_str(&sub.input, "kind", "directive");
-        if (since[0])
-            (void)json_push_kv_str(&sub.input, "since", since);
-        else
-            (void)json_push_kv_int(&sub.input, "since", 0);
+    if (sub.valid && w > 0 && (size_t)w < sizeof(input) &&
+        rcv_sub_input(&sub, input)) {
         zcl_native_handle_dev_agent_mail(&sub.request, &sub.reply);
         sub.ran = true;
     }

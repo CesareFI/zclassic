@@ -1996,12 +1996,9 @@ ZCL_COMMAND_DEV_COMMAND(
 ZCL_COMMAND_DEV_COMMAND(
     "dev.agent.receive", "dev.agent", "",
     "Turn directives arriving in this box's agent mail into queued work",
-    "One beat over the owner-private state root: dev.agent.mail is pulled "
-    "in-process with kind=directive as bounded pages from a durable intake "
-    "cursor (receive/intake.state holds the mail leaf's next_since token), "
-    "at most four pages a beat, advanced only after a page's rows were "
-    "handled, so a long history never deafens intake and a restart resumes "
-    "where it stopped; a failed pull is logged and shown by status as "
+    "Each beat, dev.agent.mail directive "
+    "pages are pulled in-process from a durable cursor (receive/intake."
+    "state), four a beat, advanced after each handled page; status shows "
     "intake_failures and intake_last_error. "
     "A row is admitted only when it is addressed to this receiver, carries "
     "a ref matching [A-Za-z0-9_.-]{1,64}, names a sender a live unrevoked "
@@ -2017,9 +2014,9 @@ ZCL_COMMAND_DEV_COMMAND(
     "refuses MISSING, ESCAPE or NOT_A_CHECKOUT; an optional muse-sha must "
     "name that HEAD or refuses SHA_MISMATCH; tracked paths diverging from "
     "its index refuse DIRTY early. The RESOLVED path goes into the brief, "
-    "so the worker and executor are unchanged and muse-scope stays relative "
-    "to it. Resolution is file reads (.git, HEAD, packed-refs, the DIRC "
-    "index), never a spawn. Received bytes, brief and record are stored "
+    "so worker and executor are unchanged. "
+    "Resolution reads files, never spawns. Received bytes, brief "
+    "and record are stored "
     "apart: a known ref reconciles when the RECEIVED body is "
     "byte-identical, is a conflict when it differs, and is never "
     "re-resolved, so restarting elsewhere cannot move decided work. Nothing "
@@ -2027,8 +2024,7 @@ ZCL_COMMAND_DEV_COMMAND(
     "took the row, carrying its seq, the brief digest and the workspace "
     "record (selector, path digest, HEAD, tree id — never the path). run "
     "holds one flock singleton, wakes on the mail watcher, stops on "
-    "SIGTERM; status surveys from the start of the history and writes "
-    "nothing.", 16384,
+    "SIGTERM; status surveys from the start and writes nothing.", 16384,
     "agent,receive,resident,mail,directive,admission,queue,ref,workspace",
     "zcl.agent_receive_input.v1", "zcl.agent_receive.v1",
     "action,receiver,workspace,deadline_s,wait_ms,max_beats",

@@ -1446,17 +1446,20 @@ static void dvm_stream_max_seq(const struct dvm_stream *s,
 
 /* ── one page ── */
 
-/* The escaped length json_write gives s, quotes included. */
+/* The escaped length json_write gives s, quotes included: quote and
+ * backslash take two bytes, the five short control escapes (byte 8 is
+ * backspace) take two, any other control byte takes six. */
 static size_t dvm_json_len(const char *s)
 {
     size_t n = 2;
     for (; *s; s++) {
         unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\' || c == '\b' || c == '\f' || c == '\n' ||
-            c == '\r' || c == '\t')
+        if (c == '"' || c == '\\')
             n += 2;
+        else if (c < 0x20)
+            n += (c == 8u || strchr("\f\n\r\t", c)) ? 2u : 6u;
         else
-            n += c < 0x20 ? 6u : 1u;
+            n += 1;
     }
     return n;
 }
