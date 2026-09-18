@@ -671,7 +671,9 @@ uint32_t dl_mark_received(struct download_manager *dm,
     }
 
     uint32_t peer_id = s->peer_id;
-    int64_t delivery = (int64_t)platform_time_wall_time_t() - s->request_time;
+    int64_t received_at = (int64_t)platform_time_wall_time_t();
+    bool delivery_sample_valid = received_at >= s->request_time;
+    int64_t delivery = delivery_sample_valid ? received_at - s->request_time : 0;
 
     s->active = false;
     /* Don't zero the hash — find_slot needs it to detect "was used" vs "never used"
@@ -680,7 +682,7 @@ uint32_t dl_mark_received(struct download_manager *dm,
      * is on its way through the intake worker but BLOCK_HAVE_DATA is not
      * observable yet, so queue/request producers must keep dedup'ing this
      * hash (bounded by DL_RECEIVED_PENDING_SECS, fail-open). */
-    s->received_time = (int64_t)platform_time_wall_time_t();
+    s->received_time = received_at;
     dm->num_received_pending++;
     dm->num_active--;
     dm->total_received++;
@@ -689,12 +691,17 @@ uint32_t dl_mark_received(struct download_manager *dm,
     struct dl_peer_stats *ps = dl_find_peer(dm, peer_id, false);
     if (ps) {
         ps->blocks_received++;
-        ps->last_body_received_time = (int64_t)platform_time_wall_time_t();
-        int64_t delivery_us = delivery * 1000000;
-        if (ps->avg_delivery_us == 0)
-            ps->avg_delivery_us = delivery_us;
-        else
-            ps->avg_delivery_us = (ps->avg_delivery_us * 7 + delivery_us) / 8;
+        ps->last_body_received_time = received_at;
+        /* Settle normally after a backward clock step, but do not let its
+         * impossible latency poison the peer's future download window. */
+        if (delivery_sample_valid) {
+            int64_t delivery_us = delivery * 1000000;
+            if (ps->avg_delivery_us == 0)
+                ps->avg_delivery_us = delivery_us;
+            else
+                ps->avg_delivery_us =
+                    (ps->avg_delivery_us * 7 + delivery_us) / 8;
+        }
 
         /* Update bandwidth score: inverse of delivery time.
          * Score 128 = baseline (1s delivery). Faster = higher score.

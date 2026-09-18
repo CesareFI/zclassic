@@ -898,6 +898,56 @@ static int test_dl_timeout_fails_open_after_clock_rollback(void)
     return failures;
 }
 
+static int test_dl_delivery_sample_ignores_clock_rollback(void)
+{
+    int failures = 0;
+    TEST("block receipt ignores negative delivery time after clock rollback") {
+        struct download_manager dm;
+        dl_init(&dm);
+
+        struct uint256 h = make_hash(209);
+        ASSERT(dl_mark_requested(&dm, &h, 102, 7));
+
+        int64_t now = (int64_t)platform_time_wall_time_t();
+        bool found_slot = false;
+        for (size_t i = 0; i < dm.num_slots; i++) {
+            if (dm.slots[i].active && uint256_eq(&dm.slots[i].hash, &h)) {
+                dm.slots[i].request_time = now + 3600;
+                found_slot = true;
+                break;
+            }
+        }
+        ASSERT(found_slot);
+
+        bool found_peer = false;
+        for (size_t i = 0; i < dm.num_peers; i++) {
+            if (dm.peers[i].peer_id == 7) {
+                dm.peers[i].avg_delivery_us = 1000000;
+                dm.peers[i].bandwidth_score = 128;
+                found_peer = true;
+                break;
+            }
+        }
+        ASSERT(found_peer);
+
+        /* Receipt and accounting still complete; only the impossible latency
+         * observation is discarded, preserving the last valid peer score. */
+        ASSERT(dl_mark_received(&dm, &h) == 7);
+        for (size_t i = 0; i < dm.num_peers; i++) {
+            if (dm.peers[i].peer_id == 7) {
+                ASSERT(dm.peers[i].blocks_received == 1);
+                ASSERT(dm.peers[i].avg_delivery_us == 1000000);
+                ASSERT(dm.peers[i].bandwidth_score == 128);
+            }
+        }
+        ASSERT(!dl_is_in_flight(&dm, &h));
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* Lane 3 hardening: dl_last_forced_settle_time() is the disambiguation
  * signal msg_blocks.c's PEER_OFFENCE_UNREQUESTED call-site consults —
  * both dl_drain_for_backpressure() and a dl_check_timeouts() reassignment
@@ -2281,6 +2331,7 @@ int test_download(void)
     failures += test_dl_settle_accounting();
     failures += test_dl_check_timeouts();
     failures += test_dl_timeout_fails_open_after_clock_rollback();
+    failures += test_dl_delivery_sample_ignores_clock_rollback();
     failures += test_dl_last_forced_settle_time_initial();
     failures += test_dl_last_forced_settle_time_drain();
     failures += test_dl_last_forced_settle_time_timeout();

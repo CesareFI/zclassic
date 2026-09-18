@@ -184,3 +184,11 @@ later lane flips it HARD.
 - 2026-09-18T17:36:09Z — REASON: Fail open block-download peer-avoid cooldowns after a backward wall-clock step; scheduler reliability only, no consensus or validation semantics change
   old ROOT: 0c33e7ea16680e8ad9bf598fa5e803c4134a7dc379427f4deb31fae9f778d5e7
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T20:09:47Z — REASON: Ignore impossible block-delivery latency samples after a backward wall-clock step; peer scheduling telemetry only, no consensus or validation semantics change
+  old ROOT: 888c92f7362b79913e880e16a574e47057230e2b41582b997388a9a2a606ebea
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T20:21:22Z — REASON: Refactor the authorized delivery-sample rollback guard under the shrink-only download.c line ceiling; behavior unchanged
+  old ROOT: d66e5ba5d6fc917eb6a837ff4ee5cf64cc3bcb4f7e607a988e50c9bbd95e4130
+  by: owner unseal ritual (make core-unseal)
