@@ -14,6 +14,8 @@
 #include "test/test_core.h"
 #include "test/muse_fake_host.h"
 #include "services/muse_run.h"
+#include "services/muse_run_audit.h"
+#include "services/muse_run_restore.h"
 #include "command/native_devagent.h"
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -1834,6 +1836,322 @@ static int mr_exec_claim_seed(void)
     return failures;
 }
 
+/* --- the workspace restore -------------------------------------------------
+ * A run leaves the workspace at its pinned base once the candidate is
+ * verified as a durable copy of the change, so the next claimed task on
+ * the same workspace is not refused for this run's own dirt. */
+
+static bool mr_path_in(const char *dir, const char *rel, char *out,
+    size_t cap)
+{
+    return snprintf(out, cap, "%s/%s", dir, rel) < (int)cap;
+}
+
+static bool mr_exists(const char *dir, const char *rel)
+{
+    char p[8192];
+    return mr_path_in(dir, rel, p, sizeof(p)) && access(p, F_OK) == 0;
+}
+
+static bool mr_file_is(const char *dir, const char *rel, const char *text)
+{
+    char p[8192];
+    char *got;
+    bool same;
+    if (!mr_path_in(dir, rel, p, sizeof(p))) return false;
+    got = mr_read(p);
+    same = got && strcmp(got, text) == 0;
+    free(got);
+    return same;
+}
+
+/* Clean at base: a measured empty porcelain and HEAD still the pin. */
+static bool mr_at_base(const struct mr_dirs *d, const char *base)
+{
+    char head[64];
+    return muse_files_changed(d->wt) == 0 &&
+        muse_head_at(d->wt, head, sizeof(head)) && strcmp(head, base) == 0;
+}
+
+/* An ignored build output laid down before the run: never the run's to
+ * touch, whatever the restore does. */
+static bool mr_build_output(const struct mr_dirs *d)
+{
+    char p[8192];
+    return mr_path_in(d->wt, "build/out.o", p, sizeof(p)) &&
+        mr_write(p, "object\n", 0);
+}
+
+/* Puts the recorded change back from the evidence alone: the tracked
+ * patch re-applied, and each untracked copy put back under its path. The
+ * fold of the result must be the candidate the run named. */
+static bool mr_reapply(const struct mr_dirs *d,
+    const struct muse_run_result *r, const char *untracked_rel,
+    const char *untracked_hash)
+{
+    char patch[8192], copy[8192], dst[8192], hex[64];
+    char *fold = NULL, *text;
+    bool same;
+    (void)snprintf(patch, sizeof(patch), "%s/candidate-%s.tracked.patch",
+        d->run, r->candidate);
+    if (access(patch, F_OK) == 0 &&
+        !mr_git3(d->wt, "apply", patch, NULL))
+        return false;
+    if (untracked_rel) {
+        (void)snprintf(copy, sizeof(copy), "%s/candidate-%s.untracked/%s",
+            d->run, r->candidate, untracked_hash);
+        text = mr_read(copy);
+        if (!text || !mr_path_in(d->wt, untracked_rel, dst, sizeof(dst)) ||
+            !mr_write(dst, text, 0)) {
+            free(text);
+            return false;
+        }
+        free(text);
+    }
+    if (!muse_candidate_fold(d->wt, d->run, hex, sizeof(hex), &fold))
+        return false;
+    same = strcmp(hex, r->candidate) == 0;
+    free(fold);
+    return same;
+}
+
+/* A passing run that modified a tracked file AND created an untracked
+ * one: afterwards the workspace is clean at base, the ignored build
+ * output is untouched, and the evidence alone reproduces the change. */
+static int mr_exec_restore_pass(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char *evidence = NULL;
+    char hash[64] = "";
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("restore lane", mr_lane(&d));
+    MR_CHECK("restore seed", mr_seed_committed(&d, "src/sum.c", "orig\n"));
+    MR_CHECK("restore gate", mr_gate_script(&d, mr_verdict_pass,
+        mr_head_pass, NULL));
+    MR_CHECK("restore build output", mr_build_output(&d));
+    MR_CHECK("restore tracked-edit hook", mr_fsmonitor(&d, "src/turn.c",
+        "printf 'edited\\n' > \"$W/src/sum.c\""));
+    rc = mr_run_prepared(&d, NULL, "src/turn.c", NULL, &r, &evidence);
+    MR_CHECK("restore pass", rc == 0 && strcmp(r.verdict, "pass") == 0);
+    MR_CHECK("restore restored", r.workspace_restored &&
+        strstr(r.workspace_restore, "restored to base") != NULL);
+    MR_CHECK("restore clean at base", mr_at_base(&d, r.base));
+    MR_CHECK("restore tracked back", mr_file_is(d.wt, "src/sum.c", "orig\n"));
+    MR_CHECK("restore untracked removed", !mr_exists(d.wt, "src/turn.c"));
+    MR_CHECK("restore ignored untouched",
+        mr_file_is(d.wt, "build/out.o", "object\n"));
+    {
+        char facts[8192];
+        char *ftext = mr_read_facts(&d, facts, sizeof(facts));
+        MR_CHECK("restore evidence", ftext &&
+            strstr(ftext, "\"workspace\":{\"restored\":true") &&
+            strstr(ftext, "\"verdict\":\"pass\""));
+        free(ftext);
+    }
+    {
+        char p[8192];
+        (void)snprintf(p, sizeof(p), "%s/src/turn.c", d.wt);
+        MR_CHECK("restore turn content hash", mr_write(p,
+            "the turn wrote this\n", 0) &&
+            muse_git_line(hash, sizeof(hash), d.wt, "hash-object", "--",
+                "src/turn.c") && unlink(p) == 0);
+    }
+    MR_CHECK("restore candidate re-applies",
+        mr_reapply(&d, &r, "src/turn.c", hash) &&
+        mr_file_is(d.wt, "src/sum.c", "edited\n") &&
+        mr_file_is(d.wt, "src/turn.c", "the turn wrote this\n"));
+    free(evidence);
+    return failures;
+}
+
+/* A judged-and-rejected run and a refused-after-the-turn run both leave
+ * a verified candidate, so both are restored too. */
+static int mr_exec_restore_rejected(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("rejected run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_fail,
+        mr_head_fail, NULL, &mr_edit_in_scope, NULL, NULL, NULL, false,
+        &r, err, &rc, &evidence) == 0);
+    MR_CHECK("rejected failed", strcmp(r.verdict, "failed") == 0);
+    MR_CHECK("rejected restored", r.workspace_restored &&
+        mr_at_base(&d, r.base) && !mr_exists(d.wt, "src/sum.c"));
+    free(evidence);
+    evidence = NULL;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("refused run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_pass,
+        mr_head_pass, "exit 7", &mr_edit_in_scope, NULL, NULL, NULL, false,
+        &r, err, &rc, &evidence) == 0);
+    MR_CHECK("refused verdict", strcmp(r.verdict, "refused") == 0);
+    MR_CHECK("refused restored", r.workspace_restored &&
+        mr_at_base(&d, r.base) && !mr_exists(d.wt, "src/sum.c"));
+    {
+        char receipt[8192];
+        char *rtext;
+        (void)snprintf(receipt, sizeof(receipt), "%s/receipt.json", d.run);
+        rtext = mr_read(receipt);
+        MR_CHECK("refused receipt carries restore", rtext &&
+            strstr(rtext, "\"workspace_restored\":true"));
+        free(rtext);
+    }
+    free(evidence);
+    return failures;
+}
+
+/* Baseline dirt is never this run's: it is refused before the turn and
+ * left exactly where it was. */
+static int mr_exec_restore_not_baseline(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char err[MUSE_RUN_ERROR_MAX] = {0};
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("baseline run", mr_execute(FAKE_JOURNEY, &d, mr_verdict_pass,
+        mr_head_pass, NULL, &mr_edit_baseline, NULL, NULL, NULL, false,
+        &r, err, &rc, &evidence) == 0);
+    MR_CHECK("baseline kept", !r.workspace_restored &&
+        strstr(r.workspace_restore, "not attempted") != NULL &&
+        mr_file_is(d.wt, "edit.txt", "changed\n"));
+    free(evidence);
+    return failures;
+}
+
+/* A dirty lane plus the artifact its fold would publish, laid down by
+ * hand so the restore can be handed a missing or damaged copy. */
+static bool mr_dirty_candidate(struct mr_dirs *d, char *hex, size_t cap,
+    char *base, size_t bcap, char *file, size_t fcap)
+{
+    char p[8192];
+    char *fold = NULL;
+    bool ok;
+    if (!mr_lane(d) || !mr_seed_committed(d, "src/a.c", "orig\n") ||
+        !muse_head_at(d->wt, base, bcap))
+        return false;
+    if (!mr_path_in(d->wt, "src/a.c", p, sizeof(p)) ||
+        !mr_write(p, "edited\n", 0) ||
+        !mr_path_in(d->wt, "src/b.c", p, sizeof(p)) ||
+        !mr_write(p, "made\n", 0))
+        return false;
+    if (!muse_candidate_fold(d->wt, d->run, hex, cap, &fold)) return false;
+    ok = snprintf(file, fcap, "candidate-%s.diff", hex) < (int)fcap &&
+        mr_path_in(d->run, file, p, sizeof(p)) && mr_write(p, fold, 0);
+    free(fold);
+    return ok;
+}
+
+static bool mr_still_dirty(const struct mr_dirs *d)
+{
+    return mr_file_is(d->wt, "src/a.c", "edited\n") &&
+        mr_file_is(d->wt, "src/b.c", "made\n");
+}
+
+static bool mr_restore_call(const struct mr_dirs *d, const char *base,
+    const char *hex, const char *file, bool pre_clean, char *why,
+    size_t cap)
+{
+    struct muse_restore_in in;
+    memset(&in, 0, sizeof(in));
+    in.workspace = d->wt;
+    in.rundir = d->run;
+    in.base = base;
+    in.candidate = hex;
+    in.candidate_file = file;
+    in.pre_clean = pre_clean;
+    return muse_restore_workspace(&in, why, cap);
+}
+
+/* A candidate that is missing, damaged, or no longer the workspace's
+ * change is never restored from: the change stays, with the reason. */
+static int mr_exec_restore_unverified(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    char hex[64], base[64], file[192], p[8192], why[256];
+    MR_CHECK("unverified lane", mr_dirty_candidate(&d, hex, sizeof(hex),
+        base, sizeof(base), file, sizeof(file)));
+    MR_CHECK("unverified pre-state gate",
+        !mr_restore_call(&d, base, hex, file, false, why, sizeof(why)) &&
+        strstr(why, "not attempted") && mr_still_dirty(&d));
+    (void)mr_path_in(d.run, file, p, sizeof(p));
+    MR_CHECK("corrupt artifact", mr_write(p, "diff --git a/x b/x\n", 0));
+    MR_CHECK("corrupt refused",
+        !mr_restore_call(&d, base, hex, file, true, why, sizeof(why)) &&
+        strstr(why, "do not hash") && mr_still_dirty(&d));
+    MR_CHECK("missing artifact", unlink(p) == 0);
+    MR_CHECK("missing refused",
+        !mr_restore_call(&d, base, hex, file, true, why, sizeof(why)) &&
+        strstr(why, "missing") && mr_still_dirty(&d));
+    MR_CHECK("stale lane", mr_dirty_candidate(&d, hex, sizeof(hex), base,
+        sizeof(base), file, sizeof(file)));
+    (void)mr_path_in(d.wt, "src/c.c", p, sizeof(p));
+    MR_CHECK("stale extra write", mr_write(p, "later\n", 0));
+    MR_CHECK("stale refused",
+        !mr_restore_call(&d, base, hex, file, true, why, sizeof(why)) &&
+        strstr(why, "no longer matches") && mr_still_dirty(&d) &&
+        mr_exists(d.wt, "src/c.c"));
+    MR_CHECK("stale cleared", unlink(p) == 0);
+    MR_CHECK("verified restores",
+        mr_restore_call(&d, base, hex, file, true, why, sizeof(why)) &&
+        mr_at_base(&d, base) && mr_file_is(d.wt, "src/a.c", "orig\n") &&
+        !mr_exists(d.wt, "src/b.c"));
+    return failures;
+}
+
+/* The point of it all: two claimed tasks in a row on one workspace. The
+ * second reaches the model turn instead of being refused for the first
+ * one's dirt. */
+static int mr_exec_restore_twice(void)
+{
+    int failures = 0;
+    struct mr_dirs d;
+    struct muse_run_result r;
+    char *evidence = NULL;
+    int rc = -1;
+    memset(&r, 0, sizeof(r));
+    MR_CHECK("twice lane", mr_lane(&d));
+    MR_CHECK("twice gate", mr_gate_script(&d, mr_verdict_pass,
+        mr_head_pass, NULL));
+    rc = mr_run_prepared(&d, NULL, "src/one.c", NULL, &r, &evidence);
+    MR_CHECK("twice first pass", rc == 0 && r.workspace_restored);
+    free(evidence);
+    evidence = NULL;
+    MR_CHECK("twice second rundir",
+        snprintf(d.run, sizeof(d.run), "%s/run2", d.root) <
+        (int)sizeof(d.run) && mr_mkdir_p(d.run));
+    memset(&r, 0, sizeof(r));
+    rc = mr_run_prepared(&d, NULL, "src/two.c", NULL, &r, &evidence);
+    MR_CHECK("twice second reached the turn", evidence &&
+        evidence_has(evidence, "turn-cmd:") && r.scope_pre_clean &&
+        r.total_tokens > 0);
+    MR_CHECK("twice second pass", rc == 0 &&
+        strcmp(r.verdict, "pass") == 0 && r.workspace_restored &&
+        mr_at_base(&d, r.base));
+    free(evidence);
+    return failures;
+}
+
+static int mr_failures_restore(void)
+{
+    int failures = 0;
+    failures += mr_exec_restore_pass();
+    failures += mr_exec_restore_rejected();
+    failures += mr_exec_restore_not_baseline();
+    failures += mr_exec_restore_unverified();
+    failures += mr_exec_restore_twice();
+    return failures;
+}
+
 static int mr_failures_execute(void)
 {
     int failures = 0;
@@ -1869,6 +2187,8 @@ static int mr_failures_execute(void)
     /* The gate's own process, not only the log it left behind. */
     failures += mr_exec_gate_exit_nonzero();
     failures += mr_exec_gate_timeout();
+    /* The workspace goes back to its base once the change is durable. */
+    failures += mr_failures_restore();
     return failures;
 }
 
