@@ -154,6 +154,8 @@ enum {
 #define FLEET_ENROL_WHY_ROSTER_FULL "roster_full"
 #define FLEET_ENROL_WHY_BRIDGE_UNWRITABLE "authorized_keys_unwritable"
 #define FLEET_ENROL_WHY_ARGUMENTS "fleet_arguments_invalid"
+#define FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED "roster_line_not_operator_sealed"
+#define FLEET_ENROL_WHY_OPERATOR_UNKNOWN "fleet_operator_unknown"
 
 /* ── the three records ──────────────────────────────────────────────────── */
 
@@ -353,6 +355,21 @@ bool fleet_roster_scan(const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
 
 /* Append one sealed roster line. */
 bool fleet_roster_append(const char *line, const char **why);
+
+/* Copy one roster line the manager sealed onto THIS box's roster — how a
+ * box that is not the manager learns which other machines its fleet holds.
+ * `operator_pubkey` is the key this box already trusts (the one `fleet
+ * join` recorded, or its own on the manager); the line is appended only
+ * after its operator seal verifies against exactly that key, so a line
+ * sealed by any other key, or a sealed line with one byte changed, is
+ * refused as FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED and the roster is not
+ * touched. The same box already on the roster is a no-op (`appended`
+ * false); a different box under a name already taken is refused as
+ * FLEET_ENROL_WHY_NAME_TAKEN. `out` receives the verified row. */
+bool fleet_roster_import(const char *line,
+                         const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                         struct fleet_machine *out, bool *appended,
+                         const char **why);
 
 /* Has this invite nonce ever been spent on this box? Spending is a separate
  * call so a refusal later in admission cannot leave a nonce burned. */

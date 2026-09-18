@@ -239,6 +239,41 @@ bool fleet_roster_append(const char *line, const char **why)
                           FLEET_ENROL_WHY_ROSTER_UNWRITABLE, why);
 }
 
+bool fleet_roster_import(const char *line,
+                         const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                         struct fleet_machine *out, bool *appended,
+                         const char **why)
+{
+    struct fleet_roster_scan scan = {0};
+    fe_why(why, NULL);
+    *appended = false;
+    if (!line || !operator_pubkey ||
+        strlen(line) >= (size_t)FLEET_ENROL_MACHINE_TEXT_MAX) {
+        fe_why(why, FLEET_ENROL_WHY_ARGUMENTS);
+        return false;
+    }
+    /* Verify FIRST, against the key this box already trusts, and only
+     * then look at the file: a line nobody this box trusts sealed never
+     * reaches the roster, not even as a counted unverifiable row. */
+    if (!fleet_machine_parse(line, operator_pubkey, out, NULL)) {
+        fe_why(why, FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED);
+        return false;
+    }
+    if (!fleet_roster_scan(operator_pubkey, out->receipt.invite.name,
+                           out->receipt.box_pubkey, &scan, why))
+        return false;
+    if (scan.same_box)
+        return true; /* already held: importing twice adds nothing */
+    if (scan.name_taken) {
+        fe_why(why, FLEET_ENROL_WHY_NAME_TAKEN);
+        return false;
+    }
+    if (!fleet_roster_append(line, why))
+        return false;
+    *appended = true;
+    return true;
+}
+
 /* ── spent invite nonces ────────────────────────────────────────────────── */
 
 struct fe_nonce_hunt {

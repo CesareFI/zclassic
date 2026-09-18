@@ -1,11 +1,13 @@
 /* One-paste fleet enrolment: how an owner adds a computer to the fleet.
  *
- * WHAT THIS BRANCH IS. Four leaves and one ceremony. `fleet invite` on the
+ * WHAT THIS BRANCH IS. Five leaves and one ceremony. `fleet invite` on the
  * manager prints a single signed line. The owner pastes it into the AI agent
  * on the new computer, which clones, builds and runs `fleet join`. That
  * prints a second single line — the box's signed enrolment receipt — which
  * the owner pastes back on the manager as `fleet admit`. `fleet machines`
- * then lists what the fleet holds. Two pastes, three commands, no ports to
+ * then lists what the fleet holds, and `fleet import` copies one sealed
+ * roster line onto a box that is not the manager, checked against the
+ * operator key that box trusts. Two pastes, three commands, no ports to
  * open and no node required on either end.
  *
  * NAMES. Every machine has one required, unique, human-readable name,
@@ -112,6 +114,32 @@ ZCL_COMMAND_READY_COMMAND(
     ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
     ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
     ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_fleet_enrol_dispatch)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.import", "fleet", "",
+    "Copy one manager-sealed roster line onto this box's machine roster",
+    "How a box that is not the manager learns which machines its fleet "
+    "holds: paste one whole line from the manager's roster. The line is "
+    "checked against the operator key this box already trusts — the one "
+    "`fleet join` recorded, or this box's own key on the manager — BEFORE "
+    "anything is written, so a line sealed by any other key, or a sealed "
+    "line with one byte changed, is refused and the roster is untouched. "
+    "Importing a machine already on the roster adds nothing (appended "
+    "false). Writes only this box's own roster file; grants no role, adds "
+    "no ssh line and asks no node. Refuses by name: "
+    "roster_line_not_operator_sealed, fleet_operator_unknown, "
+    "invite_name_taken, roster_unwritable.", 0,
+    "fleet,import,roster,machine,enrol,operator,verify",
+    "zcl.fleet_import_input.v1", "zcl.fleet.import.v1",
+    "line", "line",
+    "z23 fleet import <roster-line>",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
     zcl_native_fleet_enrol_dispatch)
 
 ZCL_COMMAND_READY_READ(

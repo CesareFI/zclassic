@@ -410,6 +410,78 @@ static int test_fe_roster_admission(void)
     return failures;
 }
 
+/* ── importing a roster line on a box that is not the manager ──────────── */
+
+static int test_fe_roster_import(void)
+{
+    int failures = 0;
+    TEST("fleet enrol: a roster line is imported only after the operator key "
+         "this box trusts verifies it; a forged line and a wrong operator key "
+         "leave the roster untouched") {
+        char row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char forged[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char foreign[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char twin[FLEET_ENROL_MACHINE_TEXT_MAX];
+        uint8_t op_seed[32], op_pub[32], other_seed[32], other_pub[32];
+        struct fleet_machine machine;
+        struct fleet_roster_scan scan = {0};
+        const char *why = NULL;
+        bool appended = true;
+        fe_isolate("import");
+        fe_key(0x81, op_seed, op_pub);    /* the operator this box trusts */
+        fe_key(0x91, other_seed, other_pub); /* somebody else's operator */
+        ASSERT(fe_row("studio", 0x81, 0x82, FLEET_ENROL_PORT_FIRST, "", row,
+                      sizeof(row)));
+
+        /* A FORGED line: the manager's genuine line with one byte changed
+         * in the middle. Still valid base64url, no longer its seal. */
+        ASSERT(fe_tamper(row, fe_wire_len(row) / 2, forged, sizeof(forged)));
+        ASSERT(!fleet_roster_import(forged, op_pub, &machine, &appended,
+                                    &why));
+        ASSERT_STR_EQ(why, FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED);
+        ASSERT(!appended);
+
+        /* A WRONG OPERATOR KEY, both ways round: a genuine line checked
+         * against a key this box does not trust, and a line another
+         * operator sealed checked against the key it does. */
+        ASSERT(!fleet_roster_import(row, other_pub, &machine, &appended,
+                                    &why));
+        ASSERT_STR_EQ(why, FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED);
+        ASSERT(fe_row("studio", 0x91, 0x82, FLEET_ENROL_PORT_FIRST, "",
+                      foreign, sizeof(foreign)));
+        ASSERT(!fleet_roster_import(foreign, op_pub, &machine, &appended,
+                                    &why));
+        ASSERT_STR_EQ(why, FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED);
+
+        /* None of the three reached the file, not even as a counted
+         * unverifiable row. */
+        ASSERT(fleet_roster_scan(op_pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 0u);
+        ASSERT_EQ(scan.unverifiable, 0u);
+
+        /* The genuine line, against the trusted key, is imported once. */
+        ASSERT(fleet_roster_import(row, op_pub, &machine, &appended, &why));
+        ASSERT(appended);
+        ASSERT_STR_EQ(machine.receipt.invite.name, "studio");
+        ASSERT_EQ(machine.relay_port, (uint16_t)FLEET_ENROL_PORT_FIRST);
+        ASSERT(fleet_roster_import(row, op_pub, &machine, &appended, &why));
+        ASSERT(!appended);
+        ASSERT(fleet_roster_scan(op_pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 1u);
+
+        /* A different box under a name this roster already gives away is
+         * refused by name, even though the operator sealed it. */
+        ASSERT(fe_row("studio", 0x81, 0x83, FLEET_ENROL_PORT_FIRST + 1, "",
+                      twin, sizeof(twin)));
+        ASSERT(!fleet_roster_import(twin, op_pub, &machine, &appended, &why));
+        ASSERT_STR_EQ(why, FLEET_ENROL_WHY_NAME_TAKEN);
+        ASSERT(fleet_roster_scan(op_pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 1u);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_fe_replay(void)
 {
     int failures = 0;
@@ -643,6 +715,7 @@ int test_fleet_enrol(void)
     failures += test_fe_receipt();
     failures += test_fe_roster_seal();
     failures += test_fe_roster_admission();
+    failures += test_fe_roster_import();
     failures += test_fe_replay();
     failures += test_fe_bridge();
     failures += test_fe_onion_grammar();

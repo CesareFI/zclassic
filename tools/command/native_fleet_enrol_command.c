@@ -1,9 +1,9 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * `fleet invite`, `fleet join`, `fleet admit`, `fleet machines` — the CLI
- * half of one-paste fleet enrolment.
+ * `fleet invite`, `fleet join`, `fleet admit`, `fleet import`, `fleet
+ * machines` — the CLI half of one-paste fleet enrolment.
  *
- * These four leaves are deliberately NODE-FREE. The box being enrolled has
+ * These five leaves are deliberately NODE-FREE. The box being enrolled has
  * just cloned and built; it has no datadir, no running node and no RPC
  * cookie, so a leaf that asked a node anything would refuse on exactly the
  * machine the owner is trying to add. Everything they need is an Ed25519
@@ -480,6 +480,71 @@ static void fe_admit(const struct zcl_command_request *request,
                                      "see the machine this fleet now holds");
 }
 
+/* ── fleet import ───────────────────────────────────────────────────────── */
+
+/* The operator key this box trusts: the one `fleet join` recorded, or, on
+ * the manager, its own. A box that has neither trusts nobody yet and has no
+ * key a line could be checked against. */
+static bool fe_import_operator(struct zcl_command_reply *reply,
+                               uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES])
+{
+    uint8_t seed[FLEET_ENROL_SEED_BYTES];
+    const char *why = NULL;
+    bool joined = false, own = false;
+    if (!fleet_enrol_operator_read(operator_pubkey, &joined, &why)) {
+        fe_fail(reply, "FLEET_OPERATOR_UNREADABLE", "resolve",
+                "this box has a recorded fleet operator key it cannot read.",
+                why);
+        return false;
+    }
+    if (joined)
+        return true;
+    if (!fe_key(reply, false, seed, operator_pubkey, &own))
+        return false;
+    memset(seed, 0, sizeof(seed)); /* only the public half is needed */
+    if (own)
+        return true;
+    fe_fail(reply, "FLEET_OPERATOR_UNKNOWN", "resolve",
+            "this box trusts no fleet operator key yet, so no roster line "
+            "can be checked here. Run `z23 fleet join <token>` first.",
+            FLEET_ENROL_WHY_OPERATOR_UNKNOWN);
+    return false;
+}
+
+static void fe_import(const struct zcl_command_request *request,
+                      struct zcl_command_reply *reply)
+{
+    uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES];
+    char hex[FLEET_ENROL_PUBKEY_HEX];
+    struct fleet_machine machine;
+    const struct json_value *in = request ? request->input : NULL;
+    const char *line = json_get_str(json_get(in, "line"));
+    const char *why = NULL;
+    bool appended = false;
+    if (!fe_import_operator(reply, operator_pubkey))
+        return;
+    if (!fleet_roster_import(line, operator_pubkey, &machine, &appended,
+                             &why)) {
+        fe_fail(reply, "FLEET_IMPORT_REFUSED", "authorize",
+                "this roster line was not added. It must be one whole line "
+                "from the manager's roster, sealed by the operator key this "
+                "box trusts, for a machine whose name no other box here "
+                "already has.", why);
+        return;
+    }
+    zcl_hex_encode(machine.receipt.box_pubkey, FLEET_ENROL_PUBKEY_BYTES, hex);
+    (void)json_push_kv_str(&reply->data, "schema", "zcl.fleet.import.v1");
+    (void)json_push_kv_str(&reply->data, "name", machine.receipt.invite.name);
+    (void)json_push_kv_str(&reply->data, "box_pubkey", hex);
+    (void)json_push_kv_int(&reply->data, "relay_port", machine.relay_port);
+    (void)json_push_kv_int(&reply->data, "enrolled_at", machine.enrolled_at);
+    /* False when this exact box was already on the roster: importing the
+     * same line twice is a no-op, never a second row. */
+    (void)json_push_kv_bool(&reply->data, "appended", appended);
+    (void)zcl_command_reply_add_next(reply, "fleet.machines", "{}",
+                                     "see the roster this box now holds");
+}
+
 /* ── fleet machines ─────────────────────────────────────────────────────── */
 
 struct fe_list {
@@ -574,6 +639,8 @@ void zcl_native_fleet_enrol_dispatch(
         fe_invite(request, reply);
     else if (path && strcmp(path, "fleet.join") == 0)
         fe_join(request, reply);
+    else if (path && strcmp(path, "fleet.import") == 0)
+        fe_import(request, reply);
     else if (path && strcmp(path, "fleet.admit") == 0)
         fe_admit(request, reply);
     else if (path && strcmp(path, "fleet.machines") == 0)

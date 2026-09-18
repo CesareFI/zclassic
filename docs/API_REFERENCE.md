@@ -74,17 +74,17 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 891 |
+| Registry entries (branches + leaves) | 892 |
 | Top-level roots | 14 |
 | Branches | 199 |
-| Leaves (dispatchable command paths) | 692 |
-| … `ready` (live handler in this build) | 613 |
+| Leaves (dispatchable command paths) | 693 |
+| … `ready` (live handler in this build) | 614 |
 | … `compat` (metadata only, names a fallback) | 49 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 48 |
-| Leaves with `effect=mutate` | 253 |
+| Leaves with `effect=mutate` | 254 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 130 |
+| Leaves requiring **owner** authority | 131 |
 
 Per source file:
 
@@ -110,7 +110,7 @@ Per source file:
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
 | `engine/composition/commands/fleet.def` | 28 | 7 | 21 |
 | `engine/composition/commands/fleet_agents.def` | 1 | 0 | 1 |
-| `engine/composition/commands/fleet_enrol.def` | 4 | 0 | 4 |
+| `engine/composition/commands/fleet_enrol.def` | 5 | 0 | 5 |
 | `engine/composition/commands/telemetry/root.def` | 6 | 2 | 4 |
 | `engine/composition/commands/telemetry/watch.def` | 1 | 0 | 1 |
 | `engine/composition/commands/telemetry/runtime.def` | 4 | 1 | 3 |
@@ -1789,6 +1789,7 @@ represented by its children's sections.
 | `fleet invite` | ready | mutate / app-write / **owner** · fast/low | **`name`**, `ttl_hours`, `relay` | `zcl.fleet.invite.v1` | `z23 fleet invite --name=studio --ttl-hours=24` | Mint one signed invite line that adds a computer to this fleet |
 | `fleet join` | ready | mutate / app-write / **owner** · fast/low | **`token`**, `onion` | `zcl.fleet.join.v1` | `z23 fleet join <token> [--onion=<v3>.onion]` | Join this computer to a fleet from one pasted invite |
 | `fleet admit` | ready | mutate / app-write / **owner** · fast/low | **`receipt`**, `bridge` | `zcl.fleet.admit.v1` | `z23 fleet admit <receipt>` | Admit one joined computer to this fleet's machine roster |
+| `fleet import` | ready | mutate / app-write / **owner** · fast/low | **`line`** | `zcl.fleet.import.v1` | `z23 fleet import <roster-line>` | Copy one manager-sealed roster line onto this box's machine roster |
 | `fleet machines` | ready | read / read / **owner** · fast/low | none | `zcl.fleet.machines.v1` | `z23 fleet machines` | List the computers this owner has admitted to the fleet |
 
 #### `fleet.board` — Signed, gossiped posts every node carries
