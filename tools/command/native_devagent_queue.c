@@ -62,6 +62,14 @@
  * or CANCEL_RUNNING/CANCEL_NOT_FOUND. claim refuses CLAIM_COMPLETED when
  * the closed predicate already finished the name.
  *
+ * USAGE. Every outcome (reap reply, outcomes.jsonl row, status) carries
+ * tokens_used and wall_ms copied from the run's receipt.json ("tokens" or
+ * "tokens_used", and "wall_ms"). A run with no receipt, or a receipt that
+ * does not state the field, reports JSON null (-1 in the jsonl row) — never
+ * 0, because an unrecorded cost is unknown, not free. Each running status
+ * row names its claimant as `worker` from the run's claim.json, or null
+ * when nothing claimed it through claim.
+ *
  * PROCESS RULE. Spawn only through zcl_spawn_detached() from util/spawn.h.
  * popen(), system() and a shell command string are forbidden and gated.
  *
@@ -2106,22 +2114,80 @@ static bool dvq_rate_limited(const char *text)
     return false;
 }
 
-static bool dvq_receipt_verdict(const char *path, char *out, size_t cap)
+/* What one run cost, as its receipt states it. -1 is UNKNOWN (no receipt,
+ * or a receipt that does not state the field), never zero: a run with no
+ * receipt did not cost nothing, it cost an amount nobody recorded. The
+ * worker's receipt names the field "tokens"; "tokens_used" is accepted
+ * as the same fact so an executor-side spelling is never dropped. */
+struct dvq_usage {
+    long long tokens;
+    long long wall_ms;
+};
+
+static void dvq_usage_unknown(struct dvq_usage *u)
+{
+    u->tokens = -1;
+    u->wall_ms = -1;
+}
+
+static void dvq_usage_from_text(const char *text, struct dvq_usage *u)
+{
+    long long v = -1;
+    dvq_usage_unknown(u);
+    if (!text)
+        return;
+    if ((dvq_line_int(text, "tokens", &v) ||
+         dvq_line_int(text, "tokens_used", &v)) &&
+        v >= 0)
+        u->tokens = v;
+    v = -1;
+    if (dvq_line_int(text, "wall_ms", &v) && v >= 0)
+        u->wall_ms = v;
+}
+
+static bool dvq_receipt_verdict(const char *path, char *out, size_t cap,
+                                struct dvq_usage *usage)
 {
     char text[DVQ_LINE_CAP];
+    if (usage)
+        dvq_usage_unknown(usage);
     if (!path || !out || cap == 0)
         return false;
     if (!dvq_read_file(path, text, sizeof(text), NULL))
         return false;
+    if (usage)
+        dvq_usage_from_text(text, usage);
     return dvq_line_str(text, "verdict", out, cap);
+}
+
+/* A usage field into an outcome item: the number when stated, JSON null
+ * when unknown. */
+static bool dvq_push_usage_field(struct json_value *item, const char *key,
+                                 long long v)
+{
+    struct json_value nv;
+    bool ok;
+    if (v >= 0)
+        return json_push_kv_int(item, key, v);
+    json_init(&nv);
+    json_set_null(&nv);
+    ok = json_push_kv(item, key, &nv);
+    json_free(&nv);
+    return ok;
 }
 
 static bool dvq_push_outcome(struct json_value *arr, const char *name,
                              long long attempt, const char *verdict,
-                             long long rc, const char *ts)
+                             long long rc, const char *ts,
+                             const struct dvq_usage *usage)
 {
     struct json_value item;
+    struct dvq_usage none;
     bool ok;
+    if (!usage) {
+        dvq_usage_unknown(&none);
+        usage = &none;
+    }
     json_init(&item);
     json_set_object(&item);
     ok = json_push_kv_str(&item, "name", name) &&
@@ -2129,6 +2195,8 @@ static bool dvq_push_outcome(struct json_value *arr, const char *name,
          json_push_kv_str(&item, "verdict", verdict) &&
          json_push_kv_int(&item, "rc", rc) &&
          json_push_kv_str(&item, "ts", ts ? ts : "") &&
+         dvq_push_usage_field(&item, "tokens_used", usage->tokens) &&
+         dvq_push_usage_field(&item, "wall_ms", usage->wall_ms) &&
          json_push_back(arr, &item);
     json_free(&item);
     return ok;
@@ -2198,6 +2266,8 @@ static void dvq_reap(const struct zcl_command_request *req,
         FILE *probe;
         long long rc = -1;
         bool have_receipt = false;
+        struct dvq_usage usage;
+        dvq_usage_unknown(&usage);
         if (strcmp(r->state, "running") != 0)
             continue;
         if (snprintf(dir, sizeof(dir), "%s/%s/a%lld", d.engine, r->name,
@@ -2232,14 +2302,15 @@ static void dvq_reap(const struct zcl_command_request *req,
             continue;
         }
         if (have_receipt) {
-            if (!dvq_receipt_verdict(receipt, verdict, sizeof(verdict)))
+            if (!dvq_receipt_verdict(receipt, verdict, sizeof(verdict),
+                                     &usage))
                 (void)snprintf(verdict, sizeof(verdict), "unknown");
         } else {
             (void)snprintf(verdict, sizeof(verdict), "no-receipt");
         }
         dvq_now_iso(ots);
         if (!dvq_push_outcome(&outcomes, r->name, r->attempt, verdict, rc,
-                              ots)) {
+                              ots, &usage)) {
             free(runtext);
             json_free(&outcomes);
             free(rows);
@@ -2262,8 +2333,10 @@ static void dvq_reap(const struct zcl_command_request *req,
             }
             w = snprintf(oline, sizeof(oline),
                          "{\"ts\":\"%s\",\"name\":\"%s\",\"attempt\":"
-                         "%lld,\"verdict\":\"%s\",\"rc\":%lld}\n",
-                         ots, r->name, r->attempt, esc_verdict, rc);
+                         "%lld,\"verdict\":\"%s\",\"rc\":%lld,"
+                         "\"tokens_used\":%lld,\"wall_ms\":%lld}\n",
+                         ots, r->name, r->attempt, esc_verdict, rc,
+                         usage.tokens, usage.wall_ms);
             if (w <= 0 || (size_t)w >= sizeof(oline) ||
                 !dvq_append_row(opath, oline, (size_t)w)) {
                 free(runtext);
@@ -2391,14 +2464,39 @@ static bool dvq_push_queued(struct json_value *arr, const struct dvq_row *r)
     return ok;
 }
 
-static bool dvq_push_running(struct json_value *arr, const struct dvq_row *r,
-                             long long now)
+/* The claimant a resident worker persisted in the run's claim.json, so a
+ * running row names who claimed it. Empty when the row was launched by
+ * `next` (no claim file) or the file does not read: the caller reports
+ * that as JSON null, never as a guessed name. */
+static void dvq_claim_worker(const char *engine, const struct dvq_row *r,
+                             char *out, size_t cap)
 {
-    struct json_value item;
+    char path[4096 + 256], text[DVQ_LINE_CAP];
+    out[0] = '\0';
+    if (!engine || snprintf(path, sizeof(path), "%s/%s/a%lld/claim.json",
+                            engine, r->name,
+                            r->attempt) >= (int)sizeof(path))
+        return;
+    if (!dvq_read_file(path, text, sizeof(text), NULL) ||
+        !dvq_line_str(text, "worker", out, cap))
+        out[0] = '\0';
+}
+
+static bool dvq_push_running(struct json_value *arr, const struct dvq_row *r,
+                             long long now, const char *engine)
+{
+    struct json_value item, nv;
+    char worker[64];
     long long age = now - r->started;
     bool ok;
     if (age < 0)
         age = 0;
+    dvq_claim_worker(engine, r, worker, sizeof(worker));
+    json_init(&nv);
+    if (worker[0])
+        json_set_str(&nv, worker);
+    else
+        json_set_null(&nv);
     json_init(&item);
     json_set_object(&item);
     ok = json_push_kv_int(&item, "seq", r->seq) &&
@@ -2408,8 +2506,10 @@ static bool dvq_push_running(struct json_value *arr, const struct dvq_row *r,
          json_push_kv_str(&item, "worktree", r->worktree) &&
          json_push_kv_str(&item, "pid_or_unit", r->pid_or_unit) &&
          json_push_kv_int(&item, "age_s", age) &&
+         json_push_kv(&item, "worker", &nv) &&
          json_push_back(arr, &item);
     json_free(&item);
+    json_free(&nv);
     return ok;
 }
 
@@ -2523,7 +2623,7 @@ static void dvq_status(const struct zcl_command_request *req,
             if (!dvq_push_queued(&queued, &rows[i]))
                 goto fail;
         } else if (strcmp(rows[i].state, "running") == 0) {
-            if (!dvq_push_running(&running, &rows[i], now))
+            if (!dvq_push_running(&running, &rows[i], now, d.engine))
                 goto fail;
         }
     }
@@ -2539,6 +2639,7 @@ static void dvq_status(const struct zcl_command_request *req,
                 char verdict[128];
                 long long rc;
                 char ts[64];
+                struct dvq_usage usage;
             } last[10];
             size_t kept = 0;
             char *save = NULL, *line;
@@ -2566,12 +2667,14 @@ static void dvq_status(const struct zcl_command_request *req,
                 last[kept].rc = rc;
                 (void)snprintf(last[kept].ts, sizeof(last[kept].ts), "%s",
                                ts);
+                dvq_usage_from_text(line, &last[kept].usage);
                 kept++;
             }
             for (size_t k = 0; k < kept; k++) {
                 if (!dvq_push_outcome(&outcomes, last[k].name,
                                       last[k].attempt, last[k].verdict,
-                                      last[k].rc, last[k].ts))
+                                      last[k].rc, last[k].ts,
+                                      &last[k].usage))
                     break;
             }
         }
