@@ -203,8 +203,9 @@ struct board_answer_head {
     int64_t scanned;
 };
 
-static void answer_head_encode(const uint8_t epoch[FLEET_BOARD_FLEET_EPOCH_BYTES],
-                               int64_t scanned, uint8_t *out)
+static void answer_head_encode(
+    const uint8_t epoch[FLEET_BOARD_FLEET_EPOCH_BYTES], int64_t scanned,
+    uint8_t *out)
 {
     out[0] = (uint8_t)FLEET_BOARD_FLEET_MSG_ANSWER;
     out[1] = (uint8_t)FLEET_BOARD_FLEET_VERSION;
@@ -586,7 +587,8 @@ static void board_plan_pull(struct board_ask *ask)
 
 /* Copy one peer's cursor out, so the store is written with no lock held.
  * False when the table has no room for this peer. */
-static bool board_cursor_load(const uint8_t box_id[32], struct board_cursor *out)
+static bool board_cursor_load(const uint8_t box_id[32],
+                              struct board_cursor *out)
 {
     board_lock();
     const struct board_cursor *c = board_cursor_slot(box_id, true);

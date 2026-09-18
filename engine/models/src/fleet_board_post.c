@@ -10,6 +10,7 @@
  * posts this node was willing to vouch for having seen. */
 
 #include "models/fleet_board_post.h"
+#include "models/fleet_board_post_internal.h"
 
 #include "util/fleet_role_check.h"
 #include "base/safe_alloc.h"
@@ -88,7 +89,7 @@ static const enum qb_column k_board_cols[] = {
 ZCL_MODEL_READ_ROW_FN(board_read_row, struct db_fleet_board_post,
                       FLEET_BOARD_POST_FIELDS)
 
-static bool board_row(sqlite3_stmt *s, struct db_fleet_board_post *out)
+bool fleet_board_row_read(sqlite3_stmt *s, struct db_fleet_board_post *out)
 {
     board_read_row(out, s);
     /* text_len is the exact SIGNED byte count, so it is re-derived from the
@@ -111,6 +112,12 @@ static bool board_row(sqlite3_stmt *s, struct db_fleet_board_post *out)
         return false;
     }
     return true;
+}
+
+void fleet_board_select_row(struct qb *q)
+{
+    qb_select(q, QB_T_fleet_board_posts);
+    qb_select_columns(q, k_board_cols, BOARD_NCOLS);
 }
 
 /* The three narrow projections. Each one names its columns through the same
@@ -542,7 +549,7 @@ static bool board_role_allows(const struct fleet_board_post *post)
  * question, so neither can drift into a different idea of what the board
  * still shows. board_where_reclaimable below is its complement, plus an
  * arrival floor the quota needs. */
-static void board_where_discoverable(struct qb *q, int64_t now)
+void fleet_board_where_discoverable(struct qb *q, int64_t now)
 {
     qb_group_begin(q, QB_OR);
     qb_where_int(q, QB_C_fleet_board_posts_expires_at, QB_GT, now);
@@ -733,8 +740,8 @@ enum fleet_board_result db_fleet_board_post_ingest(
  * and the delete can never key on different rows.
  *
  * Three conditions, all necessary. The TTL has run out and the row is not
- * durable wiki history — that is board_where_discoverable read the other
- * way round. And the row arrived longer ago than the public quota's
+ * durable wiki history — that is fleet_board_where_discoverable read the
+ * other way round. And the row arrived longer ago than the public quota's
  * rolling window: that leg counts EVERY arrival in the window regardless
  * of TTL, so a pass that deleted a row while its own window was still open
  * would hand the key the same slot twice. Without this floor a key posts
@@ -967,7 +974,7 @@ bool db_fleet_board_post_find(struct node_db *ndb, const uint8_t id[32],
                  qb_error(&q));
         return false;
     }
-    bool found = AR_STEP_ROW(s) && board_row(s, out);
+    bool found = AR_STEP_ROW(s) && fleet_board_row_read(s, out);
     sqlite3_finalize(s);
     return found;
 }
@@ -990,7 +997,7 @@ static void board_apply_filter(struct qb *q,
                                const struct fleet_board_filter *filter,
                                int64_t now, struct qb *sub_storage)
 {
-    board_where_discoverable(q, now);
+    fleet_board_where_discoverable(q, now);
     if (!filter)
         return;
     if (filter->kind)
@@ -1058,7 +1065,7 @@ int db_fleet_board_list(struct node_db *ndb,
     while (AR_STEP_ROW(s) && (size_t)count < max) {
         struct db_fleet_board_post row;
         memset(&row, 0, sizeof(row));
-        if (!board_row(s, &row))
+        if (!fleet_board_row_read(s, &row))
             continue;
         out[count++] = row;
     }
@@ -1092,7 +1099,7 @@ bool db_fleet_board_wiki_read(struct node_db *ndb, const char *slug,
     }
     bool found = false;
     while (!found && AR_STEP_ROW(s))
-        found = board_row(s, out);
+        found = fleet_board_row_read(s, out);
     sqlite3_finalize(s);
     return found;
 }
@@ -1121,7 +1128,7 @@ int db_fleet_board_wiki_history(struct node_db *ndb, const char *slug,
     while (AR_STEP_ROW(s) && (size_t)count < max) {
         struct db_fleet_board_post row;
         memset(&row, 0, sizeof(row));
-        if (!board_row(s, &row))
+        if (!fleet_board_row_read(s, &row))
             continue;
         out[count++] = row;
     }
@@ -1183,7 +1190,7 @@ int db_fleet_board_ids_before(struct node_db *ndb, int64_t now,
     struct qb q;
     qb_select(&q, QB_T_fleet_board_posts);
     qb_select_columns(&q, k_board_cols, BOARD_NCOLS);
-    board_where_discoverable(&q, now);
+    fleet_board_where_discoverable(&q, now);
     if (public_only)
         qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_NE,
                      FLEET_BOARD_SCOPE_FLEET);
@@ -1211,7 +1218,7 @@ int db_fleet_board_ids_before(struct node_db *ndb, int64_t now,
         }
         struct db_fleet_board_post row;
         memset(&row, 0, sizeof(row));
-        if (!board_row(s, &row)) {
+        if (!fleet_board_row_read(s, &row)) {
             sqlite3_finalize(s);
             memset(ids, 0, max * sizeof(ids[0]));
             if (last_seq_out)
@@ -1227,172 +1234,11 @@ int db_fleet_board_ids_before(struct node_db *ndb, int64_t now,
     return count;
 }
 
-/* Step the prepared page, handing each verified row to `visit`. A row that
- * no longer verifies is logged by board_row and consumed without being
- * handed on — it will never verify later, and it must not wedge every row
- * behind it. Returns the rows visited, or -1 when the read itself failed;
- * `*scanned` ends at the last row consumed. */
-static int board_fleet_page_walk(struct node_db *ndb, sqlite3_stmt *s,
-                                 struct db_fleet_board_post *row,
-                                 db_fleet_board_row_visit visit, void *ctx,
-                                 int64_t *scanned)
-{
-    int visited = 0;
-    while (AR_STEP_ROW(s)) {
-        if (board_row(s, row)) {
-            if (!visit(row, ctx))
-                return visited;
-            visited++;
-        }
-        *scanned = row->arrival;
-    }
-    if (sqlite3_reset(s) == SQLITE_OK)
-        return visited;
-    LOG_WARN("fleet.board", "fleet page read failed: %s",
-             sqlite3_errmsg(ndb->db));
-    return -1;
-}
-
-int db_fleet_board_fleet_after(struct node_db *ndb, int64_t now,
-                               int64_t after_arrival, unsigned limit,
-                               db_fleet_board_row_visit visit, void *ctx,
-                               int64_t *scanned_out)
-{
-    if (!ndb || !ndb->open || !visit || !scanned_out || after_arrival < 0 ||
-        limit == 0)
-        return -1;
-    *scanned_out = after_arrival;
-    struct qb q;
-    qb_select(&q, QB_T_fleet_board_posts);
-    qb_select_columns(&q, k_board_cols, BOARD_NCOLS);
-    qb_where_int(&q, QB_C_fleet_board_posts_arrival, QB_GT, after_arrival);
-    qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_EQ,
-                 FLEET_BOARD_SCOPE_FLEET);
-    board_where_discoverable(&q, now);
-    qb_order_by(&q, QB_C_fleet_board_posts_arrival, QB_ASC);
-    qb_limit(&q, (int64_t)limit);
-    sqlite3_stmt *s = NULL;
-    if (!QB_PREPARE(ndb, &q, s)) {
-        LOG_WARN("fleet.board", "fleet page prepare failed: %s", qb_error(&q));
-        return -1;
-    }
-    /* One row at a time on the heap: a wiki-sized row does not belong on
-     * whatever thread stack a stream callback happens to run on. */
-    struct db_fleet_board_post *row =
-        zcl_calloc(1, sizeof(*row), "fleet_board.fleet_page");
-    int64_t scanned = after_arrival;
-    int visited = row ? board_fleet_page_walk(ndb, s, row, visit, ctx,
-                                              &scanned)
-                      : -1;
-    sqlite3_finalize(s);
-    free(row);
-    if (visited >= 0)
-        *scanned_out = scanned;
-    return visited;
-}
-
 int db_fleet_board_recent_ids(struct node_db *ndb, int64_t now,
                               bool public_only, uint8_t (*ids)[32], size_t max)
 {
     return db_fleet_board_ids_before(ndb, now, 0, public_only, ids, max,
                                      NULL);
-}
-
-/* ── who this node has been storing posts from ───────────────────────── */
-
-/* One stored post by `key` that still verifies here. The whole list below
- * is built from a column read, which is fast; this is the signature check
- * that keeps a corrupted or hand-edited row from putting a key on it. */
-static bool board_host_verifies(struct node_db *ndb, const uint8_t key[32])
-{
-    struct qb q;
-    qb_select(&q, QB_T_fleet_board_posts);
-    qb_select_columns(&q, k_board_cols, BOARD_NCOLS);
-    qb_where_blob(&q, QB_C_fleet_board_posts_host_pubkey, QB_EQ, key, 32);
-    qb_order_by(&q, QB_C_fleet_board_posts_seq, QB_DESC);
-    qb_limit(&q, 1);
-    sqlite3_stmt *s = NULL;
-    bool ok = false;
-    if (!QB_PREPARE(ndb, &q, s)) {
-        LOG_WARN("fleet.board",
-                 "host verification query could not be prepared: %s",
-                 sqlite3_errmsg(ndb->db));
-        return false;
-    }
-    if (AR_STEP_ROW(s)) {
-        struct db_fleet_board_post row;
-        memset(&row, 0, sizeof(row));
-        ok = board_row(s, &row);
-    }
-    sqlite3_finalize(s);
-    return ok;
-}
-
-static bool board_host_seen(const uint8_t (*seen)[32], size_t count,
-                            const uint8_t *key)
-{
-    for (size_t i = 0; i < count; i++)
-        if (memcmp(seen[i], key, 32) == 0)
-            return true;
-    return false;
-}
-
-/* Newest first, one column, no signature work. A read that stops early
- * (end of table, or a read error) yields FEWER keys, never more, so the
- * caller's decision stays on the refusing side of any failure. */
-static size_t board_collect_hosts(struct node_db *ndb, uint8_t (*out)[32],
-                                  size_t max, bool *truncated)
-{
-    struct qb q;
-    qb_select(&q, QB_T_fleet_board_posts);
-    qb_select_column(&q, QB_C_fleet_board_posts_host_pubkey);
-    qb_order_by(&q, QB_C_fleet_board_posts_seq, QB_DESC);
-    sqlite3_stmt *s = NULL;
-    size_t count = 0;
-    if (!QB_PREPARE(ndb, &q, s)) {
-        LOG_WARN("fleet.board", "host scan could not be prepared: %s",
-                 sqlite3_errmsg(ndb->db));
-        return 0;
-    }
-    while (AR_STEP_ROW(s)) {
-        const uint8_t *blob = sqlite3_column_blob(s, 0);
-        if (!blob || sqlite3_column_bytes(s, 0) != 32 ||
-            board_host_seen(out, count, blob))
-            continue;
-        /* One distinct key more than fits is the whole point of the
-         * flag: the caller must be able to say the list is short. */
-        if (count >= max) {
-            *truncated = true;
-            break;
-        }
-        memcpy(out[count++], blob, 32);
-    }
-    sqlite3_finalize(s);
-    return count;
-}
-
-int db_fleet_board_distinct_hosts(struct node_db *ndb, uint8_t (*out)[32],
-                                  size_t max, bool *truncated)
-{
-    if (truncated)
-        *truncated = false;
-    if (!ndb || !ndb->open || !out || max == 0)
-        return -1;
-    if (max > FLEET_BOARD_HOST_LIST_MAX)
-        max = FLEET_BOARD_HOST_LIST_MAX;
-    bool over = false;
-    size_t count = board_collect_hosts(ndb, out, max, &over);
-    if (truncated)
-        *truncated = over;
-    size_t kept = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (!board_host_verifies(ndb, out[i]))
-            continue;
-        if (kept != i)
-            memcpy(out[kept], out[i], 32);
-        kept++;
-    }
-    return (int)kept;
 }
 
 static int64_t board_scalar(struct node_db *ndb, struct qb *q)
@@ -1482,7 +1328,7 @@ bool db_fleet_board_chain_verify(struct node_db *ndb, int64_t *checked_out)
         struct db_fleet_board_post row;
         uint8_t want[32];
         memset(&row, 0, sizeof(row));
-        if (!board_row(s, &row)) {
+        if (!fleet_board_row_read(s, &row)) {
             ok = false;
             break;
         }
