@@ -102,7 +102,9 @@
  *            with no terminal outcome (result row or queue outcome);
  *   blocked  the newest answer is a refusal, queued local work has no
  *            resident worker to claim it, or the local receiver's intake
- *            (the same mail pull) failed;
+ *            (the same mail pull) failed in this brief; the cumulative
+ *            count in receive/intake.state is named in the reason as
+ *            history, never taken as a current block;
  *   idle     evidence newer than FMC_ALIVE_WINDOW_S and nothing open;
  *   unknown  everything else,
  * always with a reason. A lock held or a name seen is liveness at most,
@@ -1515,7 +1517,37 @@ struct fmc_local {
     const char *worker_lock;
     const char *receive_lock;
     bool mail_ok;
+    long long intake_failures;
+    char intake_error[64];
 };
+
+/* The local receiver's own intake record (<state>/receive/intake.state:
+ * failures= and last_error=). The count is cumulative and never cleared,
+ * so it is reported in the reason as history, not taken as a current
+ * block; the current block is this brief's own failed pull of the same
+ * mail. -1 when the receiver never wrote one. */
+static void fmc_intake_read(struct fmc_local *lo)
+{
+    char root[4096], path[4096 + 64], text[1024];
+    FILE *f;
+    size_t n;
+    lo->intake_failures = -1;
+    lo->intake_error[0] = '\0';
+    if (!platform_state_root(root, sizeof(root)) ||
+        snprintf(path, sizeof(path), "%s/receive/intake.state", root) >=
+            (int)sizeof(path))
+        return;
+    f = fopen(path, "rb");
+    if (!f)
+        return;
+    n = fread(text, 1, sizeof(text) - 1, f);
+    (void)fclose(f);
+    text[n] = '\0';
+    lo->intake_failures = fmc_body_int(text, "failures");
+    if (!fmc_body_kv(text, "last_error", lo->intake_error,
+                     sizeof(lo->intake_error)))
+        lo->intake_error[0] = '\0';
+}
 
 static bool fmc_lock_seen(const char *s)
 {
@@ -1749,6 +1781,15 @@ static const char *fmc_local_fill(struct fmc_worker *e,
 {
     const char *state = fmc_local_state(c->qv, c->lo, why, cap);
     fmc_local_resources(e, res_why, res_cap);
+    if (c->lo->intake_failures > 0) {
+        size_t used = strlen(why);
+        (void)snprintf(why + used, cap - used,
+                       "; receiver intake.state records %lld past intake "
+                       "failure(s), last_error=%.48s",
+                       c->lo->intake_failures,
+                       c->lo->intake_error[0] ? c->lo->intake_error
+                                              : "unstated");
+    }
     if (c->qv->known && c->qv->running > 0) {
         (void)snprintf(e->ref, sizeof(e->ref), "%s", c->qv->run_ref);
         (void)snprintf(e->stage, sizeof(e->stage), "%s", "running");
@@ -1768,7 +1809,7 @@ static void fmc_worker_emit(struct json_value *arr, struct fmc_worker *e,
                             const struct fmc_emit_ctx *c)
 {
     struct json_value o;
-    char why[256], res_why[96];
+    char why[384], res_why[96];
     const char *state;
     long long age;
     if (e->local) {
@@ -2650,6 +2691,7 @@ static void fmc_do_brief(const struct zcl_command_request *req,
     lo.worker_lock = fmc_lock_state("queue", "worker.lock");
     lo.receive_lock = fmc_lock_state("receive", "receive.lock");
     lo.mail_ok = mv.ok;
+    fmc_intake_read(&lo);
     fmc_roster_local(&ro, &qv, &lo);
     ec.now = mc.now;
     ec.ro = &ro;

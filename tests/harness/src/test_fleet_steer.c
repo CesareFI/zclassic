@@ -2012,6 +2012,11 @@ static int fmx_t_process_not_work(void)
         fd = open(lockpath, O_RDWR);
         ASSERT(fd >= 0);
         ASSERT(flock(fd, LOCK_EX | LOCK_NB) == 0);
+        /* The receiver's cumulative intake record is history for the
+         * reason, never a current block. */
+        fmx_state_file("receive", "intake.state",
+                       "position=\nfailures=2\nlast_error=MAIL_READ_FAILED\n",
+                       false);
 #endif
         fmx_brief(&b, NULL, 0);
         ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
@@ -2030,6 +2035,9 @@ static int fmx_t_process_not_work(void)
         ASSERT(w != NULL);
         ASSERT_STR_EQ(fmx_wstr(w, "state"), "idle");
         ASSERT(fmx_wint(w, "age_s") == 0);
+        ASSERT(strstr(fmx_wstr(w, "reason"), "2 past intake failure") !=
+               NULL);
+        ASSERT(strstr(fmx_wstr(w, "reason"), "MAIL_READ_FAILED") != NULL);
         ASSERT(fmx_wnull(w, "current_ref"));
         (void)flock(fd, LOCK_UN);
         (void)close(fd);
@@ -2053,7 +2061,7 @@ static int fmx_t_large_history(void)
 
     TEST("steer: a large mail history is bounded, never a failed brief") {
         struct fmx_call b;
-        char body[2048], name[32], ref[32], ts[32], quotes[400];
+        char body[2048], name[32], ref[32], ts[32], quotes[400], peer[32];
         const struct json_value *workers, *cut;
         long long i;
         fmx_isolate("large_history");
@@ -2077,7 +2085,10 @@ static int fmx_t_large_history(void)
                            "brief_sha3=%064lld\\nworkspace_selector=receiver\\n"
                            "workspace_head=%040lld\\n",
                            quotes, name, i, i, i);
-            fmx_seed_inbox(name, ts, i + 1, name, FMX_SENDER, "claim", body,
+            /* Eight transport streams (the mail leaf reads at most 16),
+             * each carrying many receivers' answers. */
+            (void)snprintf(peer, sizeof(peer), "bulk-%lld", i % 8);
+            fmx_seed_inbox(peer, ts, i + 1, name, FMX_SENDER, "claim", body,
                            ref);
         }
         fmx_brief(&b, NULL, 0);
