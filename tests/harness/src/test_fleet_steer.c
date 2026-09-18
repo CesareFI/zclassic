@@ -26,11 +26,13 @@
 #include "json/json.h"
 #include "kernel/command_registry.h"
 #include "platform/private_directory.h"
+#include "platform/time_compat.h"
 
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -38,6 +40,8 @@
 #include <windows.h>
 #else
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1585,6 +1589,522 @@ _test_next:;
     return failures;
 }
 
+/* ── workers, capacity, stale directives, budget ─────────────────────────
+ *
+ * The brief's worker view must be evidence, never a name list: an entry
+ * exists only for an identity that answered as a receiver or worker, or
+ * for this host's own resident; unknown numbers are null with a reason;
+ * and a big history can never make the reply fail wholesale. */
+
+/* Write (or append) one file under the isolated state root, creating its
+ * directory. rel is "<dir>/<file>" relative to <state>/z23/dev. */
+static void fmx_state_file(const char *dirrel, const char *file,
+                           const char *text, bool append)
+{
+    char dir[1024], path[1400];
+    int n = snprintf(dir, sizeof(dir), "%s/z23/dev/%s/", g_fmx_state, dirrel);
+    size_t base = strlen(g_fmx_state) + 1, i;
+    if (n <= 0 || (size_t)n >= sizeof(dir))
+        fmx_fixture_fail("state dir exceeds bound");
+    /* Each component in turn: the private-directory helper makes one
+     * level, never a chain. */
+    for (i = base; dir[i]; i++) {
+        if (dir[i] != '/')
+            continue;
+        dir[i] = '\0';
+        if (!platform_private_directory_ensure(dir))
+            fmx_fixture_fail("cannot create an isolated state dir");
+        dir[i] = '/';
+    }
+    dir[n - 1] = '\0';
+    n = snprintf(path, sizeof(path), "%s/%s", dir, file);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        fmx_fixture_fail("state file exceeds bound");
+    FILE *f = fopen(path, append ? "a" : "w");
+    if (!f)
+        fmx_fixture_fail("cannot open an isolated state file");
+    if (fputs(text, f) < 0)
+        fmx_fixture_fail("cannot write an isolated state file");
+    if (fclose(f) != 0)
+        fmx_fixture_fail("cannot finish an isolated state file");
+}
+
+/* The mail dir chain exists before fmx_seed_inbox, which makes one level
+ * only. An empty stream file is no row at all. */
+static void fmx_prime_mail(void)
+{
+    fmx_state_file("mail", "inbox.prime.jsonl", "", true);
+}
+
+/* "now" as the mail leaf stamps it, so a seeded row is fresh evidence. */
+static void fmx_now_ts(char *out, size_t cap)
+{
+    struct tm tm_utc;
+    time_t now = platform_time_wall_time_t();
+    if (!platform_time_utc_tm(now, &tm_utc) ||
+        strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tm_utc) == 0)
+        fmx_fixture_fail("cannot format the current time");
+}
+
+/* The workers[] entry named name, or NULL. */
+static const struct json_value *fmx_worker(const struct fmx_call *c,
+                                           const char *name)
+{
+    const struct json_value *arr = fmx_arr(c, "workers");
+    size_t n = arr ? json_size(arr) : 0u, i;
+    for (i = 0; i < n; i++) {
+        const struct json_value *w = json_at(arr, i);
+        const struct json_value *v = w ? json_get(w, "name") : NULL;
+        if (v && v->type == JSON_STR && strcmp(json_get_str(v), name) == 0)
+            return w;
+    }
+    return NULL;
+}
+
+static const char *fmx_wstr(const struct json_value *o, const char *key)
+{
+    const struct json_value *v = o ? json_get(o, key) : NULL;
+    return v && v->type == JSON_STR && json_get_str(v) ? json_get_str(v) : "";
+}
+
+/* -1 when absent, not an int, or null — callers check null separately. */
+static long long fmx_wint(const struct json_value *o, const char *key)
+{
+    const struct json_value *v = o ? json_get(o, key) : NULL;
+    return v && v->type == JSON_INT ? json_get_int(v) : -1;
+}
+
+static bool fmx_wnull(const struct json_value *o, const char *key)
+{
+    const struct json_value *v = o ? json_get(o, key) : NULL;
+    return v && v->type == JSON_NULL;
+}
+
+static bool fmx_blocker_has(const struct fmx_call *c, const char *needle)
+{
+    const struct json_value *arr = fmx_arr(c, "blockers");
+    size_t n = arr ? json_size(arr) : 0u, i;
+    for (i = 0; i < n; i++) {
+        const struct json_value *b = json_at(arr, i);
+        if (b && b->type == JSON_STR && strstr(json_get_str(b), needle))
+            return true;
+    }
+    return false;
+}
+
+static int fmx_t_capacity_unknown(void)
+{
+#if defined(_WIN32)
+    return 0;
+#else
+    int failures = 0;
+
+    TEST("steer: a queue nobody could read is unknown capacity, not zero") {
+        struct fmx_call b;
+        const struct json_value *cap;
+        char dir[1200];
+        fmx_isolate("capacity_unknown");
+        /* queue.jsonl as a directory: the queue sibling cannot read it
+         * and refuses, exactly like an unreadable queue in the field. */
+        fmx_state_file("queue", "pool.txt", "", false);
+        (void)snprintf(dir, sizeof(dir), "%s/z23/dev/queue/queue.jsonl",
+                       g_fmx_state);
+        ASSERT(platform_private_directory_ensure(dir));
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        ASSERT(fmx_missing_has(&b, "dev.agent.queue"));
+        cap = fmx_get(&b, "capacity");
+        ASSERT(cap && cap->type == JSON_OBJ);
+        ASSERT(json_get(cap, "known") &&
+               !json_get_bool(json_get(cap, "known")));
+        ASSERT(fmx_wnull(cap, "pool_total"));
+        ASSERT(fmx_wnull(cap, "pool_free"));
+        ASSERT(fmx_wnull(cap, "queued"));
+        ASSERT(fmx_wnull(cap, "running"));
+        ASSERT(strstr(fmx_wstr(cap, "reason"), "sibling_refused") != NULL);
+        fmx_end(&b);
+        /* A readable queue reports real numbers and known:true. */
+        ASSERT(rmdir(dir) == 0);
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        cap = fmx_get(&b, "capacity");
+        ASSERT(json_get_bool(json_get(cap, "known")));
+        ASSERT(fmx_wint(cap, "queued") == 0);
+        ASSERT(fmx_wnull(cap, "reason"));
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+#endif
+}
+
+static int fmx_t_worker_answers(void)
+{
+    int failures = 0;
+
+    TEST("steer: a refusal answer makes that worker blocked with its reason") {
+        struct fmx_call b;
+        const struct json_value *w;
+        fmx_isolate("worker_refused");
+        fmx_prime_mail();
+        fmx_seed_inbox("box-a", "2026-09-16T00:00:00Z", 4, "box-a",
+                       FMX_SENDER, "problem",
+                       "receiver=box-a\\nstate=refused\\nsrc=inbox\\n"
+                       "reason=WORKSPACE_DIRTY\\ndetail=tracked paths "
+                       "diverge\\n",
+                       "job-refused");
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        w = fmx_worker(&b, "box-a");
+        ASSERT(w != NULL);
+        ASSERT_STR_EQ(fmx_wstr(w, "state"), "blocked");
+        ASSERT(strstr(fmx_wstr(w, "reason"), "WORKSPACE_DIRTY") != NULL);
+        ASSERT(strstr(fmx_wstr(w, "reason"), "job-refused") != NULL);
+        ASSERT_STR_EQ(fmx_wstr(w, "source"), "mail");
+        ASSERT(json_get_bool(json_get(w, "self_reported")));
+        ASSERT_STR_EQ(fmx_wstr(w, "current_ref"), "job-refused");
+        /* Nothing reported: every resource is null with its reason. */
+        ASSERT(fmx_wnull(w, "load1_centi"));
+        ASSERT(fmx_wnull(w, "mem_avail_kib"));
+        ASSERT(fmx_wnull(w, "disk_free_kib"));
+        ASSERT(fmx_wnull(w, "host"));
+        ASSERT(fmx_wnull(w, "tokens_last_run"));
+        ASSERT_STR_EQ(fmx_wstr(w, "resources_reason"), "not reported");
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+    TEST("steer: an accept answer populates the worker's workspace") {
+        struct fmx_call b;
+        const struct json_value *w;
+        char now[32], body[1024];
+        fmx_isolate("worker_accept");
+        fmx_prime_mail();
+        fmx_seed_inbox("box-b", "2026-09-16T00:00:00Z", 5, "box-b",
+                       FMX_SENDER, "claim",
+                       "receiver=box-b\\nstate=accepted\\nsrc=inbox\\n"
+                       "queue_seq=3\\nstage=running\\nkind=file\\n"
+                       "gate=steer_gate\\nbrief_sha3=aa\\n"
+                       "workspace_selector=receiver\\nworkspace_sha3=bb\\n"
+                       "workspace_head=0123456789abcdef\\n"
+                       "workspace_tree_sha3=cc\\nresolved_sha3=dd\\n"
+                       "host=box-b.lan\\nload1_centi=250\\n"
+                       "mem_avail_kib=4096\\n",
+                       "job-accept");
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        w = fmx_worker(&b, "box-b");
+        ASSERT(w != NULL);
+        ASSERT_STR_EQ(fmx_wstr(w, "workspace_head"), "0123456789abcdef");
+        ASSERT_STR_EQ(fmx_wstr(w, "workspace_selector"), "receiver");
+        ASSERT_STR_EQ(fmx_wstr(w, "current_ref"), "job-accept");
+        ASSERT_STR_EQ(fmx_wstr(w, "stage"), "running");
+        ASSERT_STR_EQ(fmx_wstr(w, "host"), "box-b.lan");
+        ASSERT(fmx_wint(w, "load1_centi") == 250);
+        ASSERT(fmx_wint(w, "mem_avail_kib") == 4096);
+        ASSERT(fmx_wnull(w, "disk_free_kib"));
+        ASSERT_STR_EQ(fmx_wstr(w, "last_seen_ts"), "2026-09-16T00:00:00Z");
+        ASSERT(fmx_wint(w, "age_s") > 0);
+        /* Claimed (stage=running) and no terminal result: working. */
+        ASSERT_STR_EQ(fmx_wstr(w, "state"), "working");
+        fmx_end(&b);
+        /* The worker's result row closes the ref and states its cost. */
+        fmx_now_ts(now, sizeof(now));
+        (void)snprintf(body, sizeof(body), "%s",
+                       "ref=job-accept\\nworker=box-b\\nsession=s1\\n"
+                       "model=m\\nattempt=1\\nterminal=pass\\n"
+                       "candidate=c\\ngate=pass\\nrc=0\\ntokens=1500\\n"
+                       "wall_ms=42\\n");
+        fmx_seed_inbox("box-b", now, 6, "box-b", "*", "result", body,
+                       "job-accept");
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        w = fmx_worker(&b, "box-b");
+        ASSERT(w != NULL);
+        ASSERT(fmx_wint(w, "tokens_last_run") == 1500);
+        ASSERT(fmx_wint(w, "tokens_total") == 1500);
+        /* Fresh terminal evidence, nothing open: idle, and the workspace
+         * the accept named is still reported. */
+        ASSERT_STR_EQ(fmx_wstr(w, "state"), "idle");
+        ASSERT_STR_EQ(fmx_wstr(w, "workspace_head"), "0123456789abcdef");
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_queued_stale(void)
+{
+    int failures = 0;
+
+    TEST("steer: a sent ref with no receiver evidence past 120 s blocks") {
+        struct fmx_call b;
+        const struct json_value *changes, *ch = NULL, *ev;
+        size_t i;
+        fmx_isolate("queued_stale");
+        fmx_prime_mail();
+        /* One directive this host sent long ago: its outbox row plus the
+         * send receipt naming the same seq and recipient. */
+        fmx_seed_inbox("self", "2026-01-01T00:00:00Z", 7, FMX_SENDER,
+                       "silent-box", "directive", "do the thing",
+                       "stale-ref");
+        fmx_state_file("steer", "sent.jsonl",
+                       "{\"key\":\"k-stale\",\"seq\":7,\"to\":\"silent-box\","
+                       "\"ref\":\"stale-ref\"}\n",
+                       true);
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        changes = fmx_arr(&b, "changes");
+        ASSERT_STR_EQ(fmx_change_state(changes, FMX_SENDER, "stale-ref"),
+                      "queued");
+        for (i = 0; changes && i < json_size(changes); i++) {
+            if (strcmp(fmx_wstr(json_at(changes, i), "ref"), "stale-ref") ==
+                0)
+                ch = json_at(changes, i);
+        }
+        ASSERT(ch != NULL);
+        ASSERT(fmx_wint(ch, "queued_age_s") > 120);
+        ASSERT(fmx_blocker_has(&b, "stale-ref"));
+        ASSERT(fmx_blocker_has(&b, "no receiver evidence after"));
+        ev = fmx_get(&b, "evidence");
+        ASSERT(fmx_wint(ev, "queued_stale_after_s") == 120);
+        /* The silent recipient never answered, so it is no worker. */
+        ASSERT(fmx_worker(&b, "silent-box") == NULL);
+        fmx_end(&b);
+        /* Its answer under the same ref is receiver evidence: the blocker
+         * goes away and the row is acknowledged. */
+        fmx_seed_inbox("silent-box", "2026-01-01T00:01:00Z", 1, "silent-box",
+                       FMX_SENDER, "claim",
+                       "receiver=silent-box\\nstate=accepted\\nstage=queued\\n",
+                       "stale-ref");
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        ASSERT_STR_EQ(fmx_change_state(fmx_arr(&b, "changes"), FMX_SENDER,
+                                       "stale-ref"),
+                      "acknowledged");
+        ASSERT(!fmx_blocker_has(&b, "stale-ref"));
+        /* Accepted into its queue but never claimed: unknown, not
+         * working. */
+        ASSERT_STR_EQ(fmx_wstr(fmx_worker(&b, "silent-box"), "state"),
+                      "unknown");
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+/* The outcome projection of one reaped name through the real queue leaf. */
+static const struct json_value *fmx_outcome_named(const struct fmx_call *q,
+                                                  const char *name)
+{
+    const struct json_value *arr = fmx_arr(q, "outcomes");
+    size_t n = arr ? json_size(arr) : 0u, i;
+    for (i = 0; i < n; i++) {
+        if (strcmp(fmx_wstr(json_at(arr, i), "name"), name) == 0)
+            return json_at(arr, i);
+    }
+    return NULL;
+}
+
+static int fmx_t_receipt_tokens(void)
+{
+    int failures = 0;
+
+    TEST("steer: receipt tokens reach the brief through the queue outcome") {
+        struct fmx_call q, b;
+        const struct json_value *w, *o;
+        fmx_isolate("receipt_tokens");
+        fmx_state_file("queue", "queue.jsonl",
+                       "{\"seq\":1,\"ts\":\"2026-09-15T00:00:00Z\","
+                       "\"kind\":\"file\",\"name\":\"tokjob\",\"group\":\"g\","
+                       "\"path\":\"p\",\"brief\":\"\",\"model\":\"\","
+                       "\"attempt\":1,\"state\":\"running\",\"worktree\":\"\","
+                       "\"pid_or_unit\":\"\",\"started\":0}\n"
+                       "{\"seq\":2,\"ts\":\"2026-09-15T00:00:00Z\","
+                       "\"kind\":\"file\",\"name\":\"nojob\",\"group\":\"g\","
+                       "\"path\":\"p\",\"brief\":\"\",\"model\":\"\","
+                       "\"attempt\":1,\"state\":\"running\",\"worktree\":\"\","
+                       "\"pid_or_unit\":\"\",\"started\":0}\n",
+                       false);
+        fmx_state_file("engine/tokjob/a1", "receipt.json",
+                       "{\"verdict\":\"pass\",\"worker\":\"wk\","
+                       "\"tokens\":1234,\"wall_ms\":99,\"ts\":1}\n",
+                       false);
+        fmx_state_file("engine/tokjob/a1", "run.out", "rc=0\n", false);
+        /* No receipt at all: its cost is unknown, never zero. */
+        fmx_state_file("engine/nojob/a1", "run.out", "rc=1\n", false);
+        fmx_begin(&q, "dev.agent.queue", "zcl.agent_queue.v1");
+        (void)json_push_kv_str(&q.input, "action", "reap");
+        ASSERT(fmx_run(&q, zcl_native_handle_dev_agent_queue));
+        ASSERT(fmx_ok(&q));
+        o = fmx_outcome_named(&q, "tokjob");
+        ASSERT(fmx_wint(o, "tokens_used") == 1234);
+        ASSERT(fmx_wint(o, "wall_ms") == 99);
+        o = fmx_outcome_named(&q, "nojob");
+        ASSERT(fmx_wnull(o, "tokens_used"));
+        ASSERT(fmx_wnull(o, "wall_ms"));
+        fmx_end(&q);
+        /* The resident worker's lock file exists (nobody holds it), so
+         * the local resident is reported; its usage is the receipt's. */
+        fmx_state_file("queue", "worker.lock", "", false);
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        w = fmx_worker(&b, "local");
+        ASSERT(w != NULL);
+        ASSERT_STR_EQ(fmx_wstr(w, "source"), "local");
+        ASSERT(!json_get_bool(json_get(w, "self_reported")));
+        ASSERT(fmx_wint(w, "tokens_last_run") == 1234);
+        ASSERT(fmx_wint(w, "tokens_total") == 1234);
+        /* Nothing running and no lock held: never "working" or "idle". */
+        ASSERT_STR_EQ(fmx_wstr(w, "state"), "unknown");
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_process_not_work(void)
+{
+    int failures = 0;
+
+    TEST("steer: a name or a live process alone is never a working worker") {
+        struct fmx_call b;
+        const struct json_value *w;
+        size_t i, n;
+        bool named = false;
+        fmx_isolate("process_not_work");
+        fmx_prime_mail();
+        /* A correspondent that never answered as a receiver: a name in
+         * agents[], and no worker. */
+        fmx_seed_inbox("chatty", "2026-09-16T00:00:00Z", 3, "chatty",
+                       FMX_SENDER, "note", "hello there", "chat-1");
+#if !defined(_WIN32)
+        char lockpath[1400];
+        int fd;
+        fmx_state_file("queue", "worker.lock", "", false);
+        (void)snprintf(lockpath, sizeof(lockpath),
+                       "%s/z23/dev/queue/worker.lock", g_fmx_state);
+        fd = open(lockpath, O_RDWR);
+        ASSERT(fd >= 0);
+        ASSERT(flock(fd, LOCK_EX | LOCK_NB) == 0);
+#endif
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        n = fmx_arr(&b, "agents") ? json_size(fmx_arr(&b, "agents")) : 0u;
+        for (i = 0; i < n; i++) {
+            const struct json_value *a = json_at(fmx_arr(&b, "agents"), i);
+            named = named || strcmp(json_get_str(a), "chatty") == 0;
+        }
+        ASSERT(named);
+        ASSERT(fmx_worker(&b, "chatty") == NULL);
+#if !defined(_WIN32)
+        /* A resident holds worker.lock: a live process with nothing
+         * queued or running is idle at most, never working. */
+        w = fmx_worker(&b, "local");
+        ASSERT(w != NULL);
+        ASSERT_STR_EQ(fmx_wstr(w, "state"), "idle");
+        ASSERT(fmx_wint(w, "age_s") == 0);
+        ASSERT(fmx_wnull(w, "current_ref"));
+        (void)flock(fd, LOCK_UN);
+        (void)close(fd);
+#else
+        w = NULL;
+        (void)w;
+#endif
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
+static int fmx_t_large_history(void)
+{
+    int failures = 0;
+
+    TEST("steer: a large mail history is bounded, never a failed brief") {
+        struct fmx_call b;
+        char body[2048], name[32], ref[32], ts[32], quotes[400];
+        const struct json_value *workers, *cut;
+        long long i;
+        fmx_isolate("large_history");
+        fmx_prime_mail();
+        /* A first line of 150 quote marks: every change lead is 160 chars
+         * that each escape to two bytes, so 100 changes alone overrun the
+         * budget and the trim must fire. */
+        for (i = 0; i < 150; i++)
+            memcpy(quotes + i * 2, "\\\"", 2);
+        quotes[300] = '\0';
+        for (i = 0; i < 3000; i++) {
+            (void)snprintf(name, sizeof(name), "box-%03lld", i % 200);
+            (void)snprintf(ref, sizeof(ref), "job-%04lld", i);
+            (void)snprintf(ts, sizeof(ts), "2026-09-16T%02lld:%02lld:%02lldZ",
+                           (i / 3600) % 24, (i / 60) % 60, i % 60);
+            (void)snprintf(body, sizeof(body),
+                           "note=%s\\nreceiver=%s\\nstate=accepted\\n"
+                           "src=inbox\\n"
+                           "queue_seq=%lld\\nstage=queued\\nkind=file\\n"
+                           "gate=a_long_gate_name_for_padding\\n"
+                           "brief_sha3=%064lld\\nworkspace_selector=receiver\\n"
+                           "workspace_head=%040lld\\n",
+                           quotes, name, i, i, i);
+            fmx_seed_inbox(name, ts, i + 1, name, FMX_SENDER, "claim", body,
+                           ref);
+        }
+        fmx_brief(&b, NULL, 0);
+        (void)json_push_kv_int(&b.input, "limit", 100);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        workers = fmx_arr(&b, "workers");
+        ASSERT(workers != NULL);
+        ASSERT(json_size(workers) <= 16);
+        ASSERT(json_get_bool(fmx_get(&b, "workers_truncated")));
+        cut = json_get(&b.reply.data, "budget_truncated");
+        ASSERT(cut && cut->type == JSON_OBJ);
+        ASSERT(fmx_wint(cut, "changes") > 0);
+        ASSERT(fmx_arr(&b, "changes") != NULL);
+        /* The whole reply data fits well inside the 64 KiB response
+         * budget, envelope included. */
+        ASSERT(json_write(&b.reply.data, NULL, 0) <= 49152u);
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
 int test_fleet_steer(void);
 int test_fleet_steer(void)
 {
@@ -1605,6 +2125,12 @@ int test_fleet_steer(void)
     failures += fmx_t_ref_grammar();
     failures += fmx_t_sender_binding();
     failures += fmx_t_board_absent();
+    failures += fmx_t_capacity_unknown();
+    failures += fmx_t_worker_answers();
+    failures += fmx_t_queued_stale();
+    failures += fmx_t_receipt_tokens();
+    failures += fmx_t_process_not_work();
+    failures += fmx_t_large_history();
 
     /* No ASSERT lives in this function, so no goto needs the label: the
      * hook is always cleared on the single fall-through path. */
