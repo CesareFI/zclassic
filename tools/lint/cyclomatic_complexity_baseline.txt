@@ -1289,7 +1289,7 @@ core/modules/net/src/https_server_install.c:https_server_try_public_install:18
 core/modules/net/src/https_server_install.c:public_install_filepath_under_root:16
 core/modules/net/src/https_server_redirect.c:acme_challenge_filepath_under_root:16
 core/modules/net/src/https_server_redirect.c:https_server_handle_http_client_fd:22
-core/modules/net/src/msg_blocks.c:process_block_msg:55
+core/modules/net/src/msg_blocks.c:process_block_msg:54
 core/modules/net/src/msg_blocks.c:process_getdata:17
 core/modules/net/src/msg_blocks.c:self_suspicion_record:17
 core/modules/net/src/msg_compact.c:process_cmpctblock:19

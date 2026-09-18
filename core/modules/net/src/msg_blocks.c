@@ -646,6 +646,12 @@ static bool msg_block_reject_self_suspected(struct msg_processor *mp,
     return true;
 }
 
+static bool settle_grace_active(int64_t last_settle, int64_t now)
+{
+    return last_settle != 0 && now >= last_settle &&
+           now - last_settle < DL_STALL_TIMEOUT_SECS;
+}
+
 bool process_block_msg(struct msg_processor *mp, struct p2p_node *node,
                        struct byte_stream *s)
 {
@@ -700,8 +706,7 @@ bool process_block_msg(struct msg_processor *mp, struct p2p_node *node,
     if (requester_id == UINT32_MAX) {
         int64_t now_s = (int64_t)platform_time_wall_time_t();
         int64_t last_settle = dl_last_forced_settle_time(dm);
-        bool within_settle_grace =
-            last_settle != 0 && (now_s - last_settle) < DL_STALL_TIMEOUT_SECS;
+        bool within_settle_grace = settle_grace_active(last_settle, now_s);
         /* An orderly respawn can begin after getdata was sent but before its
          * reply arrives.  Shutdown drains/tears down request bookkeeping
          * ahead of the socket reader, so UINT32_MAX no longer proves

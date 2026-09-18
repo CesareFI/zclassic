@@ -27,6 +27,7 @@
 #include "util/blocker.h"
 #include "util/thread_registry.h"
 #include "validation/main_state.h"
+#include "platform/time_compat.h"
 
 #include <stdio.h>
 #include <stdatomic.h>
@@ -648,6 +649,55 @@ static int test_process_block_msg_no_score_within_settle_grace(void)
     return failures;
 }
 
+static int test_process_block_msg_scores_after_clock_rollback(void)
+{
+    int failures = 0;
+    TEST("msg_handlers: future settle timestamp after clock rollback does "
+         "not suppress unrequested scoring") {
+        peer_scoring_init();
+        struct download_manager *dm = get_download_mgr();
+        dl_init(dm);
+        dm->last_forced_settle_time =
+            (int64_t)platform_time_wall_time_t() + 3600;
+
+        struct block blk;
+        block_init(&blk);
+        blk.header.nVersion = 4;
+        blk.header.nTime = 1700000015u;
+        blk.header.nBits = 0x1f00ffffu;
+        blk.header.nNonce.data[0] = 26;
+
+        struct uint256 hash;
+        block_get_hash(&blk, &hash);
+        block_clear_seen(&hash);
+
+        struct byte_stream s;
+        stream_init(&s, 256);
+        ASSERT(block_serialize(&blk, &s));
+
+        int submit_calls = 0;
+        struct net_manager nm;
+        memset(&nm, 0, sizeof(nm));
+        struct msg_processor mp;
+        memset(&mp, 0, sizeof(mp));
+        mp.block_submit = submit_reducer_pending_block;
+        mp.block_submit_ctx = &submit_calls;
+        mp.net_mgr = &nm;
+
+        struct p2p_node node;
+        unreq_setup_node(&node, 505);
+
+        ASSERT(process_block_msg(&mp, &node, &s));
+        ASSERT(atomic_load(&node.misbehavior) ==
+              peer_offence_weight(PEER_OFFENCE_UNREQUESTED));
+
+        stream_free(&s);
+        block_free(&blk);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_process_block_msg_no_score_during_shutdown(void)
 {
     int failures = 0;
@@ -1184,6 +1234,7 @@ int test_msg_handlers(void)
     failures += test_process_block_msg_no_score_when_requested();
     failures += test_process_block_msg_no_score_when_requested_from_peer_zero();
     failures += test_process_block_msg_no_score_within_settle_grace();
+    failures += test_process_block_msg_scores_after_clock_rollback();
     failures += test_process_block_msg_no_score_during_shutdown();
     failures += test_process_block_msg_queues_reducer_during_catchup();
     failures += test_msg_block_intake_full_stays_retryable();

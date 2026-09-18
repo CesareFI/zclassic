@@ -200,3 +200,11 @@ later lane flips it HARD.
 - 2026-09-18T21:12:53Z — REASON: Centralize the authorized peer-avoid rollback predicate so scheduler diagnostics cannot drift; refactor only, no behavior, consensus, or validation change
   old ROOT: f9e027060acd4899406ca3263044c39a07c96fc5c12354ad3e672e6753e9adb3
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T21:47:07Z — REASON: Fail closed unsolicited-block scoring grace after wall-clock rollback; defensive peer policy only, no block or transaction validation change
+  old ROOT: 80ec71f31b28b2564e54622abf335911f6387d59ddaa7dab863c12dd4a40a117
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T22:00:41Z — REASON: Factor the authorized clock-rollback scoring predicate to satisfy the shrink-only complexity ratchet; behavior unchanged
+  old ROOT: e28c7c0bfced2d15dd5cf26a039ccb42456b5b52bf85f52d26ecfe80ce32ffea
+  by: owner unseal ritual (make core-unseal)
