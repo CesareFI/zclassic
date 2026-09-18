@@ -784,7 +784,13 @@ static const struct dvm_fail_info {
                       "sender_binding is 32 lowercase hex, or absent",
                       "input.sender_binding has an illegal spelling"},
   ref_big_info = {"BAD_INPUT", "ref is at most 200 bytes",
-                 "input.ref too large"};
+                 "input.ref too large"},
+  escape_info = {"BAD_INPUT", "row fields too large to encode",
+                 "escape budget exceeded"},
+  line_big_info = {"BAD_INPUT", "row too large to encode",
+                   "line budget exceeded"},
+  newline_info = {"BAD_INPUT", "body must be one line of text",
+                  "embedded newline"};
 
 /* Read to/kind/body/from/ref out of req into *in (ref defaults to ""). Pure
  * extraction, no validation. */
@@ -900,22 +906,66 @@ static bool dvm_post_write_line(const char *outbox, const char *line,
 }
 #endif
 
+/* Compose the one outbox row this post appends. On success *len holds the
+ * row's byte count and line holds exactly one newline-terminated row;
+ * otherwise the refusal that stopped it is returned and line is not to be
+ * used. Split out of dvm_post() so escaping, the line budget, and the
+ * one-line invariant are this function's business rather than folded into
+ * the post path beside sequencing and the platform write. */
+static const struct dvm_fail_info *dvm_post_compose(
+    const struct dvm_post_input *in, long long seq, const char *ts,
+    char *line, size_t cap, size_t *len)
+{
+    char esc_from[512], esc_to[512], esc_kind[64], esc_body[DVM_BODY_MAX * 2];
+    char esc_ref[512];
+    char bind_part[DVM_BINDING_HEX + 32];
+    const char *nl;
+    int w;
+    if (!dvm_escape(in->from, esc_from, sizeof(esc_from)) ||
+        !dvm_escape(in->to, esc_to, sizeof(esc_to)) ||
+        !dvm_escape(in->kind, esc_kind, sizeof(esc_kind)) ||
+        !dvm_escape(in->body, esc_body, sizeof(esc_body)) ||
+        !dvm_escape(in->ref, esc_ref, sizeof(esc_ref)))
+        return &escape_info;
+    /* The binding is written only when the poster stamped one, so an
+     * unstamped row says so by carrying no field rather than by carrying
+     * an empty one that a reader could mistake for a value. Its alphabet
+     * was checked by validation, so it needs no escaping. */
+    bind_part[0] = '\0';
+    if (in->sender_binding[0])
+        (void)snprintf(bind_part, sizeof(bind_part),
+                       ",\"sender_binding\":\"%s\"", in->sender_binding);
+    w = snprintf(line, cap,
+                 "{\"seq\":%lld,\"ts\":\"%s\",\"from\":\"%s\","
+                 "\"to\":\"%s\",\"kind\":\"%s\",\"body\":\"%s\","
+                 "\"ref\":\"%s\"%s}\n",
+                 seq, ts, esc_from, esc_to, esc_kind, esc_body, esc_ref,
+                 bind_part);
+    if (w <= 0 || (size_t)w >= cap)
+        return &line_big_info;
+    *len = (size_t)w;
+    /* One row is one line: the terminator the format writes must be the
+     * only one present (bodies with control bytes are \\u-escaped above,
+     * so this is a guard, not a routine path). */
+    nl = strchr(line, '\n');
+    if (!nl || nl[1] != '\0')
+        return &newline_info;
+    return NULL;
+}
+
 static void dvm_post(const struct zcl_command_request *req,
                      struct zcl_command_reply *reply, const char *maildir)
 {
     struct dvm_post_input in;
     char outbox[DVM_PATH_CAP];
     char ts[40];
-    char esc_from[512], esc_to[512], esc_kind[64], esc_body[DVM_BODY_MAX * 2];
-    char esc_ref[512];
-    char bind_part[DVM_BINDING_HEX + 32];
     char line[DVM_LINE_CAP];
+    const struct dvm_fail_info *invalid;
     const char *code;
     char msg[256];
     long long seq;
     time_t now;
     struct tm tm_utc;
-    char *nl;
     size_t len;
 
     if (!req || !req->input) {
@@ -923,7 +973,7 @@ static void dvm_post(const struct zcl_command_request *req,
                  "request.input was missing");
         return;
     }
-    const struct dvm_fail_info *invalid = dvm_post_validate(req, &in);
+    invalid = dvm_post_validate(req, &in);
     if (invalid) {
         dvm_fail(reply, invalid->code, invalid->message, invalid->evidence);
         return;
@@ -952,40 +1002,9 @@ static void dvm_post(const struct zcl_command_request *req,
         return;
     }
 
-    if (!dvm_escape(in.from, esc_from, sizeof(esc_from)) ||
-        !dvm_escape(in.to, esc_to, sizeof(esc_to)) ||
-        !dvm_escape(in.kind, esc_kind, sizeof(esc_kind)) ||
-        !dvm_escape(in.body, esc_body, sizeof(esc_body)) ||
-        !dvm_escape(in.ref, esc_ref, sizeof(esc_ref))) {
-        dvm_fail(reply, "BAD_INPUT", "row fields too large to encode",
-                 "escape budget exceeded");
-        return;
-    }
-    /* The binding is written only when the poster stamped one, so an
-     * unstamped row says so by carrying no field rather than by carrying
-     * an empty one that a reader could mistake for a value. Its alphabet
-     * was checked above, so it needs no escaping. */
-    bind_part[0] = '\0';
-    if (in.sender_binding[0])
-        (void)snprintf(bind_part, sizeof(bind_part),
-                       ",\"sender_binding\":\"%s\"", in.sender_binding);
-    len = (size_t)snprintf(line, sizeof(line),
-                           "{\"seq\":%lld,\"ts\":\"%s\",\"from\":\"%s\","
-                           "\"to\":\"%s\",\"kind\":\"%s\",\"body\":\"%s\","
-                           "\"ref\":\"%s\"%s}\n",
-                           seq, ts, esc_from, esc_to, esc_kind, esc_body,
-                           esc_ref, bind_part);
-    if (len == 0 || len >= sizeof(line)) {
-        dvm_fail(reply, "BAD_INPUT", "row too large to encode",
-                 "line budget exceeded");
-        return;
-    }
-    /* Strip any embedded newline the format cannot carry (bodies with
-     * control bytes are \\u-escaped above, so this is just a guard). */
-    nl = strchr(line, '\n');
-    if (!nl || nl[1] != '\0') {
-        dvm_fail(reply, "BAD_INPUT", "body must be one line of text",
-                 "embedded newline");
+    invalid = dvm_post_compose(&in, seq, ts, line, sizeof(line), &len);
+    if (invalid) {
+        dvm_fail(reply, invalid->code, invalid->message, invalid->evidence);
         return;
     }
 

@@ -624,47 +624,69 @@ static bool fmc_binding_is(const struct fmc_grant *g, const char *label,
     return strcmp(want, binding) == 0;
 }
 
-const char *zcl_fleet_steer_grant_binding_live(const char *label,
-                                               const char *binding,
-                                               const char *scope)
+/* Read the owner-private grant store for a read-only admission question.
+ * Deliberately NOT fmc_dirs(): a caller answering a status question must
+ * not create the steer directory as a side effect. Returns the refusal
+ * that stopped it, or NULL with *set loaded. */
+static const char *fmc_grant_set_read(struct fmc_grant_set *set)
 {
     char root[4096], path[4096 + 32];
-    struct fmc_grant_set set;
-    const char *why = "STEER_GRANT_UNKNOWN";
-    size_t i;
-    long long now;
     int n;
-    if (!label || !label[0] || !scope || !scope[0])
-        return "STEER_GRANT_SCOPE";
-    /* An unattributable row is refused, never admitted: without a stamp
-     * there is nothing here to check the claimed name against. */
-    if (!binding || strlen(binding) != ZCL_FLEET_STEER_BINDING_HEX)
-        return "STEER_GRANT_BINDING";
-    /* Deliberately NOT fmc_dirs(): a caller answering a read-only status
-     * question must not create the steer directory as a side effect. */
     if (!platform_state_root(root, sizeof(root)))
         return "STEER_GRANT_STORE";
     n = snprintf(path, sizeof(path), "%s/steer/grants.jsonl", root);
     if (n <= 0 || (size_t)n >= sizeof(path))
         return "STEER_GRANT_STORE";
-    if (!fmc_grant_set_load(path, &set))
+    if (!fmc_grant_set_load(path, set))
         return "STEER_GRANT_UNKNOWN";
-    now = (long long)platform_time_wall_time_t();
-    for (i = 0; i < set.n; i++) {
+    return NULL;
+}
+
+/* The verdict the loaded store gives one (label, binding, scope) triple:
+ * NULL when some live grant of that label carries the scope AND is the
+ * grant that wrote this stamp, otherwise the most specific reason any row
+ * about that label gave. A label nobody holds stays UNKNOWN. */
+static const char *fmc_grant_binding_scan(const struct fmc_grant_set *set,
+                                          const char *label,
+                                          const char *binding,
+                                          const char *scope, long long now)
+{
+    const char *why = "STEER_GRANT_UNKNOWN";
+    size_t i;
+    for (i = 0; i < set->n; i++) {
         const char *row;
-        if (strcmp(set.g[i].label, label) != 0)
+        if (strcmp(set->g[i].label, label) != 0)
             continue;
         /* The label matched, so this row is at least ABOUT the claimed
          * sender: report its liveness reason rather than a bare unknown,
          * and only then ask whether it is the grant that stamped this row. */
-        row = fmc_grant_row_verdict(&set.g[i], scope, now);
-        if (!row && !fmc_binding_is(&set.g[i], label, binding))
+        row = fmc_grant_row_verdict(&set->g[i], scope, now);
+        if (!row && !fmc_binding_is(&set->g[i], label, binding))
             row = "STEER_GRANT_BINDING";
         if (!row)
             return NULL;
         why = row;
     }
     return why;
+}
+
+const char *zcl_fleet_steer_grant_binding_live(const char *label,
+                                               const char *binding,
+                                               const char *scope)
+{
+    struct fmc_grant_set set;
+    const char *store;
+    if (!label || !label[0] || !scope || !scope[0])
+        return "STEER_GRANT_SCOPE";
+    /* An unattributable row is refused, never admitted: without a stamp
+     * there is nothing here to check the claimed name against. */
+    if (!binding || strlen(binding) != ZCL_FLEET_STEER_BINDING_HEX)
+        return "STEER_GRANT_BINDING";
+    store = fmc_grant_set_read(&set);
+    if (store)
+        return store;
+    return fmc_grant_binding_scan(&set, label, binding, scope,
+                                  (long long)platform_time_wall_time_t());
 }
 
 /* ── idempotency store ─────────────────────────────────────────────────── */
