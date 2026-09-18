@@ -21,8 +21,16 @@
 #   FRONT_HOST=*           (public deploy: every address; the default
 #                          below binds loopback, which only qualification uses)
 #   GW_HOST=127.0.0.1      (optional; must stay loopback)
-# NOTE: 443 stays with the node front. This front uses
-# a HIGH port so it needs no capability and never contends with it.
+#   FRONT_SITE=127.0.0.1:8443   (optional; the node HTTPS site that takes
+#                          every path the gateway does not own. Set it and
+#                          this front can BE the apex front: /steer and the
+#                          OAuth paths go to the gateway, everything else to
+#                          the node. Leave it unset and the front is the
+#                          original single-backend pipe.)
+# PORTS: this unit binds no privileged port itself. On the apex deploy it
+# listens on a HIGH loopback port and the capability-holding forwarder
+# (zcl-portfwd, docs/BLOCK_EXPLORER_HOSTING.md) maps public 443 onto it —
+# because a hosted AI client reaches 443 and nothing else.
 
 [Unit]
 Description=z23 fleet gateway TLS front (public :%i -> loopback gateway)
@@ -38,7 +46,9 @@ EnvironmentFile=-%h/.config/z23-fleet-gateway/front-%i.env
 # Literal absolute path; a box whose checkout lives elsewhere overrides it,
 # together with the host/port variables above:
 #   systemctl --user edit z23-fleet-gateway-front@<front-port>
-ExecStart=%h/github/zclassic23/build/bin/zcl-fleet-front ${FRONT_HOST} ${FRONT_PORT} ${GW_HOST} ${GW_PORT} ${FRONT_CERT} ${FRONT_KEY}
+# $FRONT_SITE is deliberately UNBRACED: unset it must contribute no
+# argument at all, which is what tells the front "no routing, one backend".
+ExecStart=%h/github/zclassic23/build/bin/zcl-fleet-front ${FRONT_HOST} ${FRONT_PORT} ${GW_HOST} ${GW_PORT} ${FRONT_CERT} ${FRONT_KEY} $FRONT_SITE
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=300

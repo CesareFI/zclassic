@@ -259,6 +259,38 @@ static bool gw_body_has(const char *body, const char *needle)
     return body && needle && strstr(body, needle) != NULL;
 }
 
+/* Assert on a reply body and SAY WHAT THE BODY WAS when it is wrong.
+ *
+ * A bare ASSERT(gw_body_has(b, "-32602")) reaches the transcript as one
+ * line naming the needle and nothing else, so an intermittent here is
+ * indistinguishable from any other -32602 miss: -32603 "arguments too
+ * large", -32000 "node did not answer" and a plain success all print the
+ * same. That muteness is why the bound-test intermittent survived a
+ * qualification run with no diagnosis attached. These print a bounded
+ * excerpt of the actual body and its length, which is the whole difference
+ * between a rerun and a root cause. */
+#define GW_ASSERT_BODY(b, needle) do {                                        \
+    const char *gw_b_ = (b);                                                  \
+    if (!gw_body_has(gw_b_, (needle))) {                                      \
+        printf("FAIL at %s:%d (body missing \"%s\"): len=%zu body=[%.400s]\n",\
+               __FILE__, __LINE__, (needle),                                  \
+               gw_b_ ? strlen(gw_b_) : (size_t)0,                             \
+               gw_b_ ? gw_b_ : "(null)");                                     \
+        failures++; goto _test_next;                                          \
+    }                                                                         \
+} while (0)
+
+#define GW_ASSERT_BODY_NOT(b, needle) do {                                    \
+    const char *gw_b_ = (b);                                                  \
+    if (gw_body_has(gw_b_, (needle))) {                                       \
+        printf("FAIL at %s:%d (body has \"%s\"): len=%zu body=[%.400s]\n",    \
+               __FILE__, __LINE__, (needle),                                  \
+               gw_b_ ? strlen(gw_b_) : (size_t)0,                             \
+               gw_b_ ? gw_b_ : "(null)");                                     \
+        failures++; goto _test_next;                                          \
+    }                                                                         \
+} while (0)
+
 /* Loopback socket to the test gateway, or -1. */
 static int gw_sock_open(void)
 {
@@ -640,9 +672,9 @@ static int gw_t_node_input_bound(void)
         b = gw_post_auth("/steer", json, gid, &st);
         free(json);
         ASSERT(b != NULL);
-        ASSERT(st == 200);
-        ASSERT(!gw_body_has(b, "-32602"));
-        ASSERT(!gw_body_has(b, "node did not answer"));
+        ASSERT_EQ(st, 200);
+        GW_ASSERT_BODY_NOT(b, "-32602");
+        GW_ASSERT_BODY_NOT(b, "node did not answer");
         free(b);
 
         /* JUST below, through the real fork/exec: this is the invariant that
@@ -657,10 +689,10 @@ static int gw_t_node_input_bound(void)
         b = gw_post_auth("/steer", json, gid, &st);
         free(json);
         ASSERT(b != NULL);
-        ASSERT(st == 200);
-        ASSERT(!gw_body_has(b, "-32602"));
+        ASSERT_EQ(st, 200);
+        GW_ASSERT_BODY_NOT(b, "-32602");
         /* The node answered at all: the fork survived the near-max argv. */
-        ASSERT(!gw_body_has(b, "node did not answer"));
+        GW_ASSERT_BODY_NOT(b, "node did not answer");
         free(b);
 
         /* Above the bound: a typed refusal carrying the real limit. */
@@ -669,10 +701,10 @@ static int gw_t_node_input_bound(void)
         b = gw_post_auth("/steer", json, gid, &st);
         free(json);
         ASSERT(b != NULL);
-        ASSERT(st == 200);
-        ASSERT(gw_body_has(b, "-32602"));
-        ASSERT(gw_body_has(b, "at most"));
-        ASSERT(!gw_body_has(b, "node did not answer"));
+        ASSERT_EQ(st, 200);
+        GW_ASSERT_BODY(b, "-32602");
+        GW_ASSERT_BODY(b, "at most");
+        GW_ASSERT_BODY_NOT(b, "node did not answer");
         free(b);
 
         /* At the bound, stated as arithmetic: the argument the gateway

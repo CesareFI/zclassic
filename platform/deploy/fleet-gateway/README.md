@@ -9,10 +9,13 @@ This directory is the minimal hosting seam that makes the existing
 enforces what:
 
 ```text
-public HTTPS (:<front-port>) -> build/bin/zcl-fleet-front (TLS terminates,
-bytes preserved) -> loopback :<gw-port> z23-fleet-gateway (frozen /steer,
-Streamable HTTP) -> build/bin/z23 (node grant authority: scope, expiry,
-revocation per call)
+public HTTPS (:443) -> zcl-portfwd (the one capability-holding forwarder)
+-> loopback :<front-port> build/bin/zcl-fleet-front (TLS terminates, bytes
+preserved, ONE path decision) -> either
+   loopback :<gw-port> z23-fleet-gateway (frozen /steer, Streamable HTTP)
+     -> build/bin/z23 (node grant authority: scope, expiry, revocation per call)
+   or loopback :8443 the node's own HTTPS site (every path the gateway
+     does not own; it keeps every route it has today)
 ```
 
 The front is `tools/zcl_fleet_front.c`: one persistent listen socket (no
@@ -23,14 +26,24 @@ gateway leg, and no traffic or credential logging — one startup line only.
 It is built with plain `cc` like `tools/zcl_portfwd.c`, with no Makefile
 target and no new packages.
 
+The front also decides, per connection, which backend gets it. That decision
+is why the surface can live on the apex at all: a hosted AI client fetches
+port 443 and nothing else, so a gateway published on a high port is not
+"inconvenient", it is unreachable, and the failure it shows the owner is an
+opaque connect timeout. The gateway owns `/steer`, `/oauth/*` and the OAuth
+well-knowns; the node site keeps every other path it has today; neither one
+moved.
+
 The gateway file is `tools/fleet_gateway.c` (CONTRACT header); this seam only
 hosts it. Owner minting stays in `fleet.steer.grant`, outside AI-callable
 tools. Nothing here logs a credential, grants an authority, or bypasses one.
 
 ## Endpoints (after the owner deploy below)
 
-`<base>` is `https://<public-host>:<front-port>`, the value of
-`FLEET_GW_ISSUER`.
+`<base>` is the value of `FLEET_GW_ISSUER`. On the apex deploy that is
+`https://<public-host>` with NO port: every URL a hosted client is told to
+fetch has to be one its fetcher will actually open, and 443 is the only
+port it opens.
 
 | Surface | URL |
 |---|---|
@@ -78,9 +91,12 @@ content; reconnect the connector to sign in again.
 
 ## Owner deploy (owner-authorized; agents never run this unasked)
 
-Port 443 stays with the node front. The gateway front uses a high port, so
-it needs no capability and does not contend with it. Deployment is an
-explicit owner act and stays one:
+The front binds a HIGH loopback port and needs no capability. Public 443 is
+mapped onto it by `zcl-portfwd`, the single binary that already carries
+`cap_net_bind_service` (`docs/BLOCK_EXPLORER_HOSTING.md`), so putting the
+MCP surface on the apex adds no new privilege anywhere. The node site keeps
+binding 8443 exactly as before and is now reached THROUGH the front.
+Deployment is an explicit owner act and stays one:
 
 ```bash
 # 0. Exact position: a clean checkout at the QUALIFIED sha (see below).
@@ -106,6 +122,9 @@ FRONT_HOST=*
 GW_PORT=<gw-port>
 FRONT_CERT=<path to the public certificate chain for <public-host>>
 FRONT_KEY=<path to its private key>
+# Apex deploy: the node HTTPS site that answers every non-gateway path.
+# Omit it and this front serves the gateway alone, exactly as it always did.
+FRONT_SITE=127.0.0.1:8443
 ENV
 chmod 600 ~/.config/z23-fleet-gateway/*.env
 
@@ -119,9 +138,22 @@ systemctl --user daemon-reload
 systemctl --user enable --now 'z23-fleet-gateway@<gw-port>'
 systemctl --user enable --now 'z23-fleet-gateway-front@<front-port>'
 
-# 4. Allow inbound TCP/<front-port> (at least from 160.79.104.0/21).
-# 5. Verify from outside with a real (non -k) TLS client: discovery docs,
-#    and an unauthenticated tools/call answering 401 with the challenge.
+# 4. Apex only: point the capability-holding forwarder at the front instead
+#    of straight at the node, so public 443 lands on the path router. The
+#    node site is unchanged; it is now reached through the front.
+mkdir -p ~/.config/systemd/user/zcl-portfwd.service.d
+cat > ~/.config/systemd/user/zcl-portfwd.service.d/10-front.conf <<CONF
+[Service]
+ExecStart=
+ExecStart=%h/.local/bin/zcl-portfwd 443:<front-port>
+CONF
+systemctl --user daemon-reload && systemctl --user restart zcl-portfwd
+
+# 5. Allow inbound TCP/443 (at least from the hosted client's egress range).
+# 6. Verify from OUTSIDE this box with a real (non -k) TLS client: the two
+#    discovery docs, an unauthenticated tools/call answering 401 with the
+#    challenge, a DCR registration, AND an ordinary site page — that last
+#    one is what proves the apex move cost the node site nothing.
 ```
 
 ## Qualification (before any deploy)
@@ -147,8 +179,11 @@ HEAD and image hashes.
 
 ## Bounds and refusals (what the seam guarantees by construction)
 
-- At most 16 concurrent front children; the 17th connection is refused at
-  once and waits in the kernel backlog — processes never grow with load.
+- Front children are capped and the cap cannot grow with load: 16 for a
+  gateway-only front, 128 when a site backend makes it the apex (one browser
+  opens six connections, so 16 there would be a capacity ceiling rather than
+  a safety bound), `FRONT_MAX_CHILDREN` to override up to a hard 512. Over
+  the cap a connection is refused at once and waits in the kernel backlog.
 - 120 s idle budget per front connection; handshakes covered by 120 s socket
   timeouts; stale half-close signals exit instead of spinning.
 - 64 KiB streaming relay buffers: front memory never grows with body size.
@@ -158,8 +193,13 @@ HEAD and image hashes.
   `-32002 conflicting grants`; unknown → `STEER_GRANT_UNKNOWN`; wrong scope →
   `STEER_GRANT_SCOPE`; revoked → `STEER_GRANT_REVOKED` — all before or by the
   node, never by the front, and the front logs none of them.
-- `GET /steer` → 405; everything outside `/steer`, `/healthz`, `/.well-known/*`,
-  `/oauth/*` → 404. `/healthz` is loopback-only and is never proxied.
+- `GET /steer` → 405. `/healthz` is loopback-only and is never proxied.
+- The front routes to the gateway on `/steer`, `/oauth/`, and the
+  `oauth-protected-resource` / `oauth-authorization-server` /
+  `openid-configuration` well-knowns — prefix match on a path-segment
+  boundary, so `/steerage` stays the site's. Every other path is the node's
+  site. The front reads at most 8 KiB of request head to decide and forwards
+  those bytes VERBATIM, Host and all: it still rewrites nothing.
 - Revoking a grant kills the credential and best-effort cancels the queued
   work it sent (reply carries the `cancelled` count); completed history is
   never rewritten and stays readable under a fresh grant.
