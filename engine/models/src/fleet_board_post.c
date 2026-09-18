@@ -103,7 +103,11 @@ static bool board_row(sqlite3_stmt *s, struct db_fleet_board_post *out)
         LOG_WARN("fleet.board",
                  "stored post seq=%lld failed read verification: %s",
                  (long long)out->seq, fleet_board_result_string(verified));
+        /* The arrival number is this node's own bookkeeping, not post
+         * content: kept so a page walk can step past the row. */
+        int64_t arrival = out->arrival;
         memset(out, 0, sizeof(*out));
+        out->arrival = arrival;
         return false;
     }
     return true;
@@ -171,6 +175,8 @@ bool db_fleet_board_post_validate(const struct db_fleet_board_post *record,
         "expires_at", "must equal created_at + ttl");
     validates_custom(errors, record->received_at >= 0,
         "received_at", "must not be negative");
+    validates_custom(errors, record->arrival > 0, "arrival",
+        "must be positive");
     validates_custom(errors,
         record->body_bytes > 0 &&
             record->body_bytes <= (int64_t)FLEET_BOARD_BODY_MAX,
@@ -359,6 +365,7 @@ static bool board_insert_stmt(struct node_db *ndb,
     qb_value_int(&q, QB_C_fleet_board_posts_received_at, record->received_at);
     qb_value_int(&q, QB_C_fleet_board_posts_scope, record->post.scope);
     qb_value_text(&q, QB_C_fleet_board_posts_room, record->post.room);
+    qb_value_int(&q, QB_C_fleet_board_posts_arrival, record->arrival);
     /* ar-lifecycle-ok:qb-adhoc-save-expands-to-AR_BEGIN_SAVE-and-AR_FINISH_SAVE */
     QB_ADHOC_SAVE(ndb, &q, s, cbs, "fleet_board_post", record,
                   db_fleet_board_post_validate);
@@ -480,6 +487,36 @@ static bool board_append_fits(struct node_db *ndb, int64_t body_bytes)
            bytes <= max_bytes - body_bytes;
 }
 
+/* The highest arrival number this process has handed out, across every
+ * store it has written. Guarded by s_board_write_lock. */
+static int64_t s_board_arrival_high;
+
+/* The next arrival number: strictly above everything stored and everything
+ * this process has already assigned, so a reclaim that deletes the newest
+ * rows can never hand a number out twice while this process lives. Numbers
+ * are assigned and committed under the one board write lock, so every
+ * reader sees them land in increasing order with no hole a later commit
+ * fills. A restart may reuse a number whose row was reclaimed; the fleet
+ * pull names this process in every answer for exactly that reason. Caller
+ * holds the board write lock; a query error refuses. */
+static bool board_next_arrival(struct node_db *ndb, int64_t *out)
+{
+    struct qb q;
+    int64_t stored_high = 0;
+    qb_select(&q, QB_T_fleet_board_posts);
+    qb_select_agg(&q, QB_MAX, QB_C_fleet_board_posts_arrival, true);
+    if (!board_aggregate_checked(ndb, &q, &stored_high)) {
+        LOG_WARN("fleet.board", "arrival high-water aggregate failed");
+        return false;
+    }
+    int64_t high = stored_high > s_board_arrival_high ? stored_high
+                                                      : s_board_arrival_high;
+    if (high == INT64_MAX)
+        return false;
+    *out = high + 1;
+    return true;
+}
+
 /* Does the key that signed this post hold a role granting a post of this
  * KIND on this node? Asked through util/fleet_role_check.h, so this model
  * never learns where the grant store lives — and refused outright when
@@ -513,35 +550,38 @@ static void board_where_discoverable(struct qb *q, int64_t now)
     qb_group_end(q);
 }
 
-/* One capped count of this key's PUBLIC rows. `since < 0` drops the time
- * floor. Neither leg filters on TTL: the window leg counts every arrival
- * because a burst is a burst even if every post in it expires in a minute,
- * and the resident leg counts every stored row because an expired row this
- * node has not reclaimed yet is still bytes this node is carrying for the
- * key. Caller holds the board lock; a query error refuses rather than
- * reporting an empty count. */
-static bool board_public_count(struct node_db *ndb,
-                               const uint8_t host_pubkey[32], int64_t since,
-                               int64_t *out)
+/* One capped count of this key's rows in one scope. `since < 0` drops the
+ * time floor. Neither leg filters on TTL: the window leg counts every
+ * arrival because a burst is a burst even if every post in it expires in a
+ * minute, and the resident leg counts every stored row because an expired
+ * row this node has not reclaimed yet is still bytes this node is carrying
+ * for the key. Caller holds the board lock; a query error refuses rather
+ * than reporting an empty count. */
+static bool board_key_count(struct node_db *ndb,
+                            const uint8_t host_pubkey[32], uint16_t scope,
+                            int64_t since, int64_t *out)
 {
     struct qb q;
     qb_select(&q, QB_T_fleet_board_posts);
     qb_select_count_star(&q);
     qb_where_blob(&q, QB_C_fleet_board_posts_host_pubkey, QB_EQ, host_pubkey,
                  32);
-    qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_EQ,
-                FLEET_BOARD_SCOPE_PUBLIC);
+    qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_EQ, scope);
     if (since >= 0)
         qb_where_int(&q, QB_C_fleet_board_posts_received_at, QB_GT, since);
     return board_aggregate_checked(ndb, &q, out);
 }
 
-/* The only anti-flood check a PUBLIC-scope post gets, since it carries no
- * role grant at all: two independent per-key ceilings, a rolling-window
- * rate and a resident stored-row count. `received_at` drives the window,
- * not the post's own signed `created_at` — the signer chooses the latter,
- * this node chooses the former, so a flood cannot buy a fresh window by
- * lying about its clock.
+/* Two independent per-key ceilings, a rolling-window rate and a resident
+ * stored-row count, counted over the key's rows in the post's own scope.
+ * For a PUBLIC post, which carries no role grant at all, this is the only
+ * anti-flood check it gets. A FLEET post passes the role gate first and
+ * then this too: a grant says the key may write here, not that it may fill
+ * the store every other key shares — and a paired peer's pull carries
+ * other keys' posts in bulk. `received_at` drives the window, not the
+ * post's own signed `created_at` — the signer chooses the latter, this
+ * node chooses the former, so a flood cannot buy a fresh window by lying
+ * about its clock.
  *
  * The two legs ask different questions on purpose. The window leg asks "is
  * this key bursting?" and counts every arrival inside the window. The
@@ -551,12 +591,14 @@ static bool board_public_count(struct node_db *ndb,
  * a live one costs it. db_fleet_board_reclaim_expired is what hands those
  * slots back; this ceiling does not depend on it having run, so a node
  * that opts out of boot maintenance is still bounded. */
-static bool board_public_quota_ok(struct node_db *ndb,
-                                  const uint8_t host_pubkey[32], int64_t now)
+static bool board_key_quota_ok(struct node_db *ndb,
+                               const struct fleet_board_post *post,
+                               int64_t now)
 {
     int64_t resident = 0;
-    if (!board_public_count(ndb, host_pubkey, -1, &resident)) {
-        LOG_WARN("fleet.board", "public quota resident aggregate failed");
+    if (!board_key_count(ndb, post->host_pubkey, post->scope, -1,
+                         &resident)) {
+        LOG_WARN("fleet.board", "key quota resident aggregate failed");
         return false;
     }
     if (resident >= FLEET_BOARD_PUBLIC_QUOTA_STORED_MAX)
@@ -564,19 +606,21 @@ static bool board_public_quota_ok(struct node_db *ndb,
 
     int64_t windowed = 0;
     int64_t since = now - (int64_t)FLEET_BOARD_PUBLIC_QUOTA_WINDOW_SECONDS;
-    if (!board_public_count(ndb, host_pubkey, since, &windowed)) {
-        LOG_WARN("fleet.board", "public quota window aggregate failed");
+    if (!board_key_count(ndb, post->host_pubkey, post->scope, since,
+                         &windowed)) {
+        LOG_WARN("fleet.board", "key quota window aggregate failed");
         return false;
     }
     return windowed < FLEET_BOARD_PUBLIC_QUOTA_WINDOW_MAX;
 }
 
 /* Everything that must hold before a post is even considered for storage,
- * cheapest question first: shape, then time, then signature, then either
- * the quota (PUBLIC — any key, no grant needed) or the role the verified
- * key holds here (every other scope, unchanged). The first two reject the
- * bulk of a flood before any curve arithmetic, and both admission paths
- * come last because each is only meaningful once the key is proven to have
+ * cheapest question first: shape, then time, then signature, then the role
+ * the verified key holds here (every scope but PUBLIC, which needs none),
+ * then the per-key quota (PUBLIC and FLEET; a legacy post is admitted by
+ * its role alone, as it always was). The first two reject the bulk of a
+ * flood before any curve arithmetic, and both admission questions come
+ * last because each is only meaningful once the key is proven to have
  * signed these bytes. */
 static enum fleet_board_result board_ingest_admissible(
     struct node_db *ndb, const struct fleet_board_post *post, int64_t now)
@@ -590,11 +634,12 @@ static enum fleet_board_result board_ingest_admissible(
     r = fleet_board_post_verify(post);
     if (r != FLEET_BOARD_OK)
         return r;
-    if (post->scope == FLEET_BOARD_SCOPE_PUBLIC) {
-        return board_public_quota_ok(ndb, post->host_pubkey, now)
-                   ? FLEET_BOARD_OK : FLEET_BOARD_ERR_QUOTA;
-    }
-    return board_role_allows(post) ? FLEET_BOARD_OK : FLEET_BOARD_ERR_ROLE;
+    if (post->scope != FLEET_BOARD_SCOPE_PUBLIC && !board_role_allows(post))
+        return FLEET_BOARD_ERR_ROLE;
+    if (post->scope == FLEET_BOARD_SCOPE_LEGACY_PUBLIC)
+        return FLEET_BOARD_OK;
+    return board_key_quota_ok(ndb, post, now) ? FLEET_BOARD_OK
+                                              : FLEET_BOARD_ERR_QUOTA;
 }
 
 /* Every refusal that can be decided before the board write lock is taken:
@@ -656,6 +701,10 @@ enum fleet_board_result db_fleet_board_post_ingest(
 
     struct db_fleet_board_post record;
     memset(&record, 0, sizeof(record));
+    if (!board_next_arrival(ndb, &record.arrival)) {
+        zcl_mutex_unlock(&s_board_write_lock);
+        return FLEET_BOARD_ERR_STORAGE;
+    }
     record.post = *post;
     record.seq = board_next_seq(ndb);
     record.expires_at = (int64_t)post->created_at + (int64_t)post->ttl;
@@ -673,6 +722,7 @@ enum fleet_board_result db_fleet_board_post_ingest(
         zcl_mutex_unlock(&s_board_write_lock);
         return why;
     }
+    s_board_arrival_high = record.arrival;
     zcl_mutex_unlock(&s_board_write_lock);
     if (stored_out)
         *stored_out = true;
@@ -1177,36 +1227,24 @@ int db_fleet_board_ids_before(struct node_db *ndb, int64_t now,
     return count;
 }
 
-/* True when `row` sits at or before the keyset (after_received_at, after_id):
- * the page below asks the store for received_at >= after_received_at, so the
- * rows that share that second are sorted out here by id. */
-static bool board_row_not_after(const struct db_fleet_board_post *row,
-                                int64_t after_received_at,
-                                const uint8_t after_id[32])
-{
-    if (row->received_at != after_received_at)
-        return row->received_at < after_received_at;
-    return memcmp(row->post.id, after_id, 32) <= 0;
-}
-
-/* Step the prepared page, handing each row past the keyset to `visit`.
- * Returns the rows visited, or -1 when the read itself failed. */
+/* Step the prepared page, handing each verified row to `visit`. A row that
+ * no longer verifies is logged by board_row and consumed without being
+ * handed on — it will never verify later, and it must not wedge every row
+ * behind it. Returns the rows visited, or -1 when the read itself failed;
+ * `*scanned` ends at the last row consumed. */
 static int board_fleet_page_walk(struct node_db *ndb, sqlite3_stmt *s,
                                  struct db_fleet_board_post *row,
-                                 int64_t after_received_at,
-                                 const uint8_t after_id[32],
-                                 db_fleet_board_row_visit visit, void *ctx)
+                                 db_fleet_board_row_visit visit, void *ctx,
+                                 int64_t *scanned)
 {
     int visited = 0;
     while (AR_STEP_ROW(s)) {
-        /* A row that no longer verifies is logged by board_row and never
-         * handed on; it must not wedge every later row behind it. */
-        if (!board_row(s, row) ||
-            board_row_not_after(row, after_received_at, after_id))
-            continue;
-        if (!visit(row, ctx))
-            return visited;
-        visited++;
+        if (board_row(s, row)) {
+            if (!visit(row, ctx))
+                return visited;
+            visited++;
+        }
+        *scanned = row->arrival;
     }
     if (sqlite3_reset(s) == SQLITE_OK)
         return visited;
@@ -1216,22 +1254,23 @@ static int board_fleet_page_walk(struct node_db *ndb, sqlite3_stmt *s,
 }
 
 int db_fleet_board_fleet_after(struct node_db *ndb, int64_t now,
-                               int64_t after_received_at,
-                               const uint8_t after_id[32],
-                               db_fleet_board_row_visit visit, void *ctx)
+                               int64_t after_arrival, unsigned limit,
+                               db_fleet_board_row_visit visit, void *ctx,
+                               int64_t *scanned_out)
 {
-    if (!ndb || !ndb->open || !after_id || !visit || after_received_at < 0)
+    if (!ndb || !ndb->open || !visit || !scanned_out || after_arrival < 0 ||
+        limit == 0)
         return -1;
+    *scanned_out = after_arrival;
     struct qb q;
     qb_select(&q, QB_T_fleet_board_posts);
     qb_select_columns(&q, k_board_cols, BOARD_NCOLS);
-    board_where_discoverable(&q, now);
+    qb_where_int(&q, QB_C_fleet_board_posts_arrival, QB_GT, after_arrival);
     qb_where_int(&q, QB_C_fleet_board_posts_scope, QB_EQ,
                  FLEET_BOARD_SCOPE_FLEET);
-    qb_where_int(&q, QB_C_fleet_board_posts_received_at, QB_GE,
-                 after_received_at);
-    qb_order_by(&q, QB_C_fleet_board_posts_received_at, QB_ASC);
-    qb_order_by(&q, QB_C_fleet_board_posts_id, QB_ASC);
+    board_where_discoverable(&q, now);
+    qb_order_by(&q, QB_C_fleet_board_posts_arrival, QB_ASC);
+    qb_limit(&q, (int64_t)limit);
     sqlite3_stmt *s = NULL;
     if (!QB_PREPARE(ndb, &q, s)) {
         LOG_WARN("fleet.board", "fleet page prepare failed: %s", qb_error(&q));
@@ -1241,11 +1280,14 @@ int db_fleet_board_fleet_after(struct node_db *ndb, int64_t now,
      * whatever thread stack a stream callback happens to run on. */
     struct db_fleet_board_post *row =
         zcl_calloc(1, sizeof(*row), "fleet_board.fleet_page");
-    int visited = row ? board_fleet_page_walk(ndb, s, row, after_received_at,
-                                              after_id, visit, ctx)
+    int64_t scanned = after_arrival;
+    int visited = row ? board_fleet_page_walk(ndb, s, row, visit, ctx,
+                                              &scanned)
                       : -1;
     sqlite3_finalize(s);
     free(row);
+    if (visited >= 0)
+        *scanned_out = scanned;
     return visited;
 }
 

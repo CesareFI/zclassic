@@ -53,8 +53,12 @@ enum {
      *             live rows alone would then let one key grow into the
      *             whole shared store cap above and wedge the board for
      *             every key.
-     * Either one being spent refuses the post; neither one touches
-     * FLEET-scope rows or the global store cap above. */
+     * Either one being spent refuses the post. A FLEET-scope post meets the
+     * same two ceilings after its role check, counted over that key's
+     * fleet-scope rows alone: a granted key, or a paired peer carrying its
+     * posts, can no more fill the shared store than a stranger can. A
+     * legacy post is admitted by its role alone, as before. Neither touches
+     * the global store cap above. */
     FLEET_BOARD_PUBLIC_QUOTA_WINDOW_SECONDS = 600,   /* 10 minutes */
     FLEET_BOARD_PUBLIC_QUOTA_WINDOW_MAX = 60,        /* posts / key / window */
     FLEET_BOARD_PUBLIC_QUOTA_STORED_MAX = 1000,      /* stored posts / key */
@@ -71,6 +75,11 @@ struct db_fleet_board_post {
     int64_t received_at;
     uint8_t chain_prev[32];
     uint8_t chain_hash[32];
+    /* This store's own arrival number (schema v84): assigned once at
+     * ingest, strictly above every number this process has handed out and
+     * every number already stored, and never rewritten — a reclaim
+     * renumbers seq, not this. The paired fleet pull pages on it. */
+    int64_t arrival;
 };
 
 /* Filters for db_fleet_board_list. A zero/empty field does not filter. */
@@ -216,18 +225,23 @@ bool db_fleet_board_have(struct node_db *ndb, const uint8_t id[32]);
 typedef bool (*db_fleet_board_row_visit)(const struct db_fleet_board_post *row,
                                          void *ctx);
 
-/* The FLEET-scope page the paired pull service serves: every verified,
- * still-discoverable fleet-scoped row strictly after the keyset
- * (after_received_at, after_id), in ascending (received_at, id) order —
- * this node's own arrival clock, which a reclaim never rewrites (seq is
- * renumbered by a reclaim, so it cannot be a cursor another box holds).
- * Start from (0, all-zero). Public and legacy rows never appear. A row that
- * no longer verifies is skipped, never handed on. Returns the number of
- * rows the visitor accepted, or -1 when the store could not be read. */
+/* The FLEET-scope page the paired pull service serves: at most `limit`
+ * still-discoverable fleet-scoped rows with arrival > after_arrival, in
+ * ascending arrival order, read through the arrival index — so one page
+ * costs at most `limit` row reads and signature checks however large the
+ * store is. Start from 0. Public and legacy rows never appear.
+ *
+ * `*scanned_out` is the arrival of the last row this page consumed, or
+ * after_arrival when it consumed none: every row at or below it was either
+ * handed to the visitor or failed read verification (logged, never handed
+ * on, and never going to verify later). A row the visitor refused is not
+ * consumed, so the page stops there and the next one starts at it.
+ * Returns the number of rows the visitor accepted, or -1 when the store
+ * could not be read. */
 int db_fleet_board_fleet_after(struct node_db *ndb, int64_t now,
-                               int64_t after_received_at,
-                               const uint8_t after_id[32],
-                               db_fleet_board_row_visit visit, void *ctx);
+                               int64_t after_arrival, unsigned limit,
+                               db_fleet_board_row_visit visit, void *ctx,
+                               int64_t *scanned_out);
 
 /* Every distinct key that signed a post this node is storing, newest post
  * first, capped at FLEET_BOARD_HOST_LIST_MAX. A key appears only when at

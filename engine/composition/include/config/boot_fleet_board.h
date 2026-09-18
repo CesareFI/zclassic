@@ -154,19 +154,32 @@ void boot_fleet_board_register_rpc(struct rpc_table *table);
  * key's role and the store caps all still decide, and a post this box
  * already holds is a no-op by id. Public-scope behaviour is unchanged.
  *
- * The cursor is the ANSWERING box's own (received_at, id) keyset, held in
- * memory per peer: a reclaim never rewrites it, and a restart simply asks
- * from the beginning again, which dedupe by id makes free of effect. */
+ * The cursor is in the ANSWERING box's own arrival numbers (schema v84):
+ * assigned once at ingest, strictly rising in commit order, and never
+ * rewritten by a reclaim, so a page that resumes after number N misses
+ * nothing that lands later, whatever second it lands in. Every answer
+ * names the answering process by a random epoch; a restart may reuse a
+ * number whose row was reclaimed, so a new epoch sends the asking box
+ * back to the beginning, which dedupe by id makes free of effect. A post
+ * this box refuses for a reason that can clear (a role not granted yet, a
+ * clock behind the author's, a quota or a full store) is offered again by
+ * a sweep that alternates with forward pulls, so it is neither lost nor
+ * able to hold back the rest of the board. */
 
 #define FLEET_BOARD_FLEET_SERVICE_NAME "board"
 /* The command leaf whose grant lets a peer read this box's fleet posts:
  * the worker and observer roles already carry it (roles.def). */
 #define FLEET_BOARD_FLEET_READ_LEAF "fleet.board.list"
 #define FLEET_BOARD_FLEET_PULL_INTERVAL_S 15
+#define FLEET_BOARD_FLEET_VERSION 2u
 #define FLEET_BOARD_FLEET_MSG_PULL 1u
-/* type, version, u64 after_received_at, 32-byte after_id */
-#define FLEET_BOARD_FLEET_PULL_BYTES 42u
-/* One answer record: u64 received_at, 32-byte id, u32 length, post wire. */
+#define FLEET_BOARD_FLEET_MSG_ANSWER 2u
+#define FLEET_BOARD_FLEET_EPOCH_BYTES 16u
+/* type, version, u64 after_arrival */
+#define FLEET_BOARD_FLEET_PULL_BYTES 10u
+/* type, version, epoch, u64 arrival of the last row the page consumed */
+#define FLEET_BOARD_FLEET_ANSWER_HEAD (2u + FLEET_BOARD_FLEET_EPOCH_BYTES + 8u)
+/* One answer record: u64 arrival, 32-byte id, u32 length, post wire. */
 #define FLEET_BOARD_FLEET_RECORD_HEAD 44u
 #define FLEET_BOARD_FLEET_ANSWER_MAX (size_t)(48u * 1024u)
 #define FLEET_BOARD_FLEET_ANSWER_POSTS_MAX 32u
@@ -183,12 +196,16 @@ bool boot_fleet_board_fleet_register_service(void);
  * paired peer whose online key holds no FLEET_BOARD_FLEET_READ_LEAF grant,
  * refused before the store was read. inbox_full: an answer that arrived
  * with no free commit slot (asked for again next pull). stored: fleet posts
- * a pull added to this box's store. */
+ * a pull added to this box's store. deferred: pulled posts refused for a
+ * reason that can clear, each offered again by a later sweep.
+ * answer_refused: answers dropped whole because they did not add up. */
 struct boot_fleet_board_fleet_counts {
     uint64_t delegation_refused;
     uint64_t role_refused;
     uint64_t inbox_full;
     uint64_t stored;
+    uint64_t deferred;
+    uint64_t answer_refused;
 };
 void boot_fleet_board_fleet_counts(struct boot_fleet_board_fleet_counts *out);
 
@@ -213,6 +230,7 @@ size_t boot_fleet_board_fleet_test_drain_into(struct node_db *ndb);
 void boot_fleet_board_fleet_test_bind_authority(
     const struct vcs_zcode_dht_delegation *peer_delegation,
     const uint8_t network_genesis[32], int64_t now);
+void boot_fleet_board_fleet_test_new_epoch(void);
 #endif
 
 #endif /* ZCL_CONFIG_BOOT_FLEET_BOARD_H */

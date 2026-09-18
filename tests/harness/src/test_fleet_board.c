@@ -2530,18 +2530,24 @@ struct fbw {
 };
 
 static bool g_fbw_deny_read;
+static bool g_fbw_deny_post;
+static uint8_t g_fbw_deny_post_key[32];
 
 /* The role gate this group grades: every key may do everything, except
- * that reading fleet posts can be switched off to prove the service asks. */
+ * that reading fleet posts can be switched off to prove the service asks,
+ * and one author key can be refused a post to prove a refusal that later
+ * clears is not lost. */
 static bool fbw_role_check(const uint8_t key[32], const char *leaf,
                            const char *kind, char *why, size_t why_cap,
                            void *ctx)
 {
-    (void)key;
     (void)kind;
     (void)ctx;
-    bool deny = g_fbw_deny_read &&
-                strcmp(leaf, FLEET_BOARD_FLEET_READ_LEAF) == 0;
+    bool deny = (g_fbw_deny_read &&
+                 strcmp(leaf, FLEET_BOARD_FLEET_READ_LEAF) == 0) ||
+                (g_fbw_deny_post &&
+                 strcmp(leaf, ZCL_FLEET_LEAF_BOARD_POST) == 0 &&
+                 memcmp(key, g_fbw_deny_post_key, 32) == 0);
     if (deny && why && why_cap)
         (void)snprintf(why, why_cap, "role_refused: test denies %s", leaf);
     return !deny;
@@ -2667,7 +2673,7 @@ static uint8_t fbw_raw_open_verdict(struct fbw *w, uint64_t stream_id)
     uint8_t pull[FLEET_BOARD_FLEET_PULL_BYTES];
     memset(pull, 0, sizeof(pull));
     pull[0] = (uint8_t)FLEET_BOARD_FLEET_MSG_PULL;
-    pull[1] = 1u;
+    pull[1] = (uint8_t)FLEET_BOARD_FLEET_VERSION;
     uint8_t frame[MESH_LOOP_WIRE_MAX];
     size_t frame_len = mesh_stream_test_open_frame(
         stream_id, 4096u, FLEET_BOARD_FLEET_SERVICE_NAME, pull, sizeof(pull),
@@ -2766,9 +2772,10 @@ static int test_fleet_board_fleet_carriage(void)
         ASSERT(!db_fleet_board_have(&w.b, public_post.id));
 
         /* Everything is held: asking again moves nothing, and the answer
-         * is the CLOSE alone, with no DATA frame at all. */
+         * is its head alone — one DATA frame with no record — then the
+         * CLOSE. */
         ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)0);
-        ASSERT_EQ(frames, (size_t)1);
+        ASSERT_EQ(frames, (size_t)2);
         struct db_fleet_board_post row;
         ASSERT(db_fleet_board_post_find(&w.b, fleet[0].id, &row));
         ASSERT_EQ(row.post.scope, FLEET_BOARD_SCOPE_FLEET);
@@ -2777,15 +2784,16 @@ static int test_fleet_board_fleet_carriage(void)
 
     TEST("fleet board carriage: two paired stores converge") {
         /* The other box posts, and is now the one answering. Its cursor
-         * table starts empty, so it pages through everything it holds;
-         * only the post the first box lacks is new there. */
+         * table starts empty, so it pages through everything it holds in
+         * its own arrival order: first the 40 it pulled, which the first
+         * box already has, then the one post the first box lacks. */
         ASSERT(fbw_post(&w.b, 8, FLEET_BOARD_SCOPE_FLEET, "from the other box",
                         2200, 3600, 2200, &from_b));
         boot_fleet_board_fleet_test_bind(&w.b);
+        ASSERT_EQ(fbw_pull(&w, w.box_b, &w.a, &frames), (size_t)0);
         ASSERT_EQ(fbw_pull(&w, w.box_b, &w.a, &frames), (size_t)1);
         ASSERT_EQ(fbw_pull(&w, w.box_b, &w.a, &frames), (size_t)0);
-        ASSERT_EQ(fbw_pull(&w, w.box_b, &w.a, &frames), (size_t)0);
-        ASSERT_EQ(frames, (size_t)1);
+        ASSERT_EQ(frames, (size_t)2);
         ASSERT(db_fleet_board_have(&w.a, from_b.id));
         ASSERT(fbw_holds_all(&w.a, fleet, FBW_POSTS));
         ASSERT(fbw_holds_all(&w.b, fleet, FBW_POSTS));
@@ -2795,6 +2803,219 @@ static int test_fleet_board_fleet_carriage(void)
     _test_next:
     fbw_close(&w);
     zcl_fleet_role_checker_install_permissive_for_testing();
+    return failures;
+}
+
+/* Store posts from `who` in `db`, all arriving in the same second, until
+ * the batch holds an id below AND an id above `pivot`. Returns how many it
+ * stored, or 0 when no such pair turned up in the bound. */
+static size_t fbw_post_straddling(struct node_db *db, uint8_t who,
+                                  const uint8_t pivot[32], int64_t second,
+                                  struct fleet_board_post *out, size_t cap)
+{
+    bool below = false, above = false;
+    size_t n = 0;
+    while (n < cap && !(below && above)) {
+        char text[48];
+        (void)snprintf(text, sizeof(text), "same second %zu", n);
+        if (!fbw_post(db, who, FLEET_BOARD_SCOPE_FLEET, text, second, 3600,
+                      second, &out[n]))
+            return 0;
+        int order = memcmp(out[n].id, pivot, 32);
+        below = below || order < 0;
+        above = above || order > 0;
+        n++;
+    }
+    return below && above ? n : 0;
+}
+
+/* Pull `times` whole answers; returns the posts newly stored in all. */
+static size_t fbw_pull_n(struct fbw *w, const uint8_t peer_box[32],
+                         struct node_db *into, int times)
+{
+    size_t stored = 0, frames = 0;
+    for (int i = 0; i < times; i++) {
+        size_t got = fbw_pull(w, peer_box, into, &frames);
+        if (got == SIZE_MAX)
+            return SIZE_MAX;
+        stored += got;
+    }
+    return stored;
+}
+
+#define FBW_BATCH 16
+
+/* What the cursor must never do: pass over a row. Arrivals in one second,
+ * a refusal that clears later, a reclaim between pulls, and a restart of
+ * the answering process are each a way an arrival-time keyset used to lose
+ * a post for good. */
+static int test_fleet_board_fleet_carriage_gap_free(void)
+{
+    int failures = 0;
+    static struct fbw w;
+    static struct fleet_board_post first[FBW_BATCH], later[FBW_BATCH];
+    static struct fleet_board_post live[FBW_POSTS], late[3];
+    struct fleet_board_post refused, beside, behind, dead, restarted;
+    struct zcl_fleet_role_checker checker = {
+        .allow = fbw_role_check, .name = "fleet-board-gap-test" };
+    struct boot_fleet_board_fleet_counts before, after;
+    size_t frames = 0;
+    g_fbw_deny_read = false;
+    g_fbw_deny_post = false;
+    zcl_fleet_role_checker_install(&checker);
+    bool opened = fbw_open(&w);
+
+    TEST("fleet board carriage: posts arriving in the same second as the "
+         "last one pulled, with ids on both sides of it, all arrive") {
+        ASSERT(opened);
+        ASSERT(mesh_term_pair_row(&w.f, &w.f.term_peer,
+                                  MESH_PAIRING_CAP_STATUS_READ, FBW_PAIRED_AT,
+                                  FBW_PAIRING_EXPIRES));
+        boot_fleet_board_fleet_test_bind_authority(&w.f.term_peer.delegation,
+                                                   w.f.genesis, FBW_NOW);
+        boot_fleet_board_fleet_test_bind(&w.a);
+        ASSERT(fbw_post(&w.a, 20, FLEET_BOARD_SCOPE_FLEET, "first in 2300",
+                        2300, 3600, 2300, &first[0]));
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)1);
+        /* More posts in that very second, some sorting below the id just
+         * pulled and some above it. */
+        size_t n = fbw_post_straddling(&w.a, 21, first[0].id, 2300, later,
+                                       FBW_BATCH);
+        ASSERT(n >= 2);
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), n);
+        ASSERT(fbw_holds_all(&w.b, later, n));
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)0);
+        PASS();
+    }
+
+    TEST("fleet board carriage: a post refused for a reason that clears is "
+         "delivered once it clears, and never holds back the posts after "
+         "it") {
+        ASSERT(fbw_post(&w.a, 22, FLEET_BOARD_SCOPE_FLEET, "not granted yet",
+                        2310, 3600, 2310, &refused));
+        ASSERT(fbw_post(&w.a, 23, FLEET_BOARD_SCOPE_FLEET, "right beside it",
+                        2310, 3600, 2310, &beside));
+        /* This box does not let key 22 post here yet. */
+        uint8_t seed[32];
+        fb_test_identity(22, seed, g_fbw_deny_post_key);
+        g_fbw_deny_post = true;
+        boot_fleet_board_fleet_counts(&before);
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)1);
+        boot_fleet_board_fleet_counts(&after);
+        ASSERT_EQ(after.deferred, before.deferred + 1);
+        ASSERT(!db_fleet_board_have(&w.b, refused.id));
+        ASSERT(db_fleet_board_have(&w.b, beside.id));
+        /* Still refused: the next forward page carries the next post, and
+         * the sweep after it offers the refused one again, in vain. */
+        ASSERT(fbw_post(&w.a, 23, FLEET_BOARD_SCOPE_FLEET, "behind it",
+                        2320, 3600, 2320, &behind));
+        ASSERT_EQ(fbw_pull_n(&w, w.box_a, &w.b, 2), (size_t)1);
+        ASSERT(db_fleet_board_have(&w.b, behind.id));
+        ASSERT(!db_fleet_board_have(&w.b, refused.id));
+        /* The grant arrives. A forward page, then the sweep delivers it. */
+        g_fbw_deny_post = false;
+        ASSERT_EQ(fbw_pull_n(&w, w.box_a, &w.b, 2), (size_t)1);
+        ASSERT(db_fleet_board_have(&w.b, refused.id));
+        ASSERT_EQ(fbw_pull_n(&w, w.box_a, &w.b, 3), (size_t)0);
+        PASS();
+    }
+
+    TEST("fleet board carriage: a reclaim on the answering box between two "
+         "pulls skips nothing") {
+        /* Forty live posts with long-dead ones among them; the dead ones
+         * are never served, and are what the reclaim takes back. */
+        for (int i = 0; i < FBW_POSTS; i++) {
+            char text[48];
+            (void)snprintf(text, sizeof(text), "reclaim survivor %d", i);
+            ASSERT(fbw_post(&w.a, 24, FLEET_BOARD_SCOPE_FLEET, text, 2400,
+                            3600, 2400, &live[i]));
+            if (i % 4 == 0) {
+                (void)snprintf(text, sizeof(text), "long dead %d", i);
+                ASSERT(fbw_post(&w.a, 25, FLEET_BOARD_SCOPE_FLEET, text,
+                                1800, 60, 1800, &dead));
+            }
+        }
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames),
+                  (size_t)FLEET_BOARD_FLEET_ANSWER_POSTS_MAX);
+        int64_t removed = 0;
+        ASSERT_EQ(db_fleet_board_reclaim_expired(&w.a, FBW_NOW, &removed),
+                  FLEET_BOARD_RECLAIM_DONE);
+        ASSERT(removed >= FBW_POSTS / 4);
+        for (int i = 0; i < 3; i++) {
+            char text[48];
+            (void)snprintf(text, sizeof(text), "after the reclaim %d", i);
+            ASSERT(fbw_post(&w.a, 24, FLEET_BOARD_SCOPE_FLEET, text, 2450,
+                            3600, 2450, &late[i]));
+        }
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames),
+                  (size_t)(FBW_POSTS - FLEET_BOARD_FLEET_ANSWER_POSTS_MAX +
+                           3));
+        ASSERT(fbw_holds_all(&w.b, live, FBW_POSTS));
+        ASSERT(fbw_holds_all(&w.b, late, 3));
+        ASSERT(!db_fleet_board_have(&w.b, dead.id));
+        PASS();
+    }
+
+    TEST("fleet board carriage: an answer from a restarted process sends the "
+         "asking box back to the beginning") {
+        boot_fleet_board_fleet_test_new_epoch();
+        ASSERT(fbw_post(&w.a, 26, FLEET_BOARD_SCOPE_FLEET, "after a restart",
+                        2460, 3600, 2460, &restarted));
+        /* The first answer is in numbers the cursor cannot trust: nothing
+         * from it is taken, and the cursor goes back to 0. */
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)0);
+        ASSERT(!db_fleet_board_have(&w.b, restarted.id));
+        /* From the beginning: every page is dedupe until the new post. */
+        size_t got = fbw_pull_n(&w, w.box_a, &w.b, 4);
+        ASSERT_EQ(got, (size_t)1);
+        ASSERT(db_fleet_board_have(&w.b, restarted.id));
+        PASS();
+    }
+    _test_next:
+    g_fbw_deny_post = false;
+    fbw_close(&w);
+    zcl_fleet_role_checker_install_permissive_for_testing();
+    return failures;
+}
+
+/* A role grant lets a key write fleet posts here; it does not let that key
+ * fill the store every other key shares. */
+static int test_fleet_board_fleet_quota(void)
+{
+    int failures = 0;
+    TEST("fleet board: a fleet-scope key past the per-key quota is refused") {
+        struct node_db db;
+        memset(&db, 0, sizeof(db));
+        ASSERT(node_db_open(&db, ":memory:"));
+        uint8_t seed[32], pk[32];
+        fb_test_identity(31, seed, pk);
+        const int64_t now = 500000;
+        for (int i = 0; i <= FLEET_BOARD_PUBLIC_QUOTA_WINDOW_MAX; i++) {
+            struct fleet_board_post p;
+            char text[64];
+            (void)snprintf(text, sizeof(text), "fleet post number %d", i);
+            fb_test_compose(&p, FLEET_BOARD_KIND_NOTE, "flooder", text,
+                            (uint64_t)now, 3600);
+            fb_test_scope(&p, FLEET_BOARD_SCOPE_FLEET, "");
+            ASSERT_EQ(fleet_board_post_sign(&p, seed, pk), FLEET_BOARD_OK);
+            bool stored = false;
+            enum fleet_board_result want =
+                i < FLEET_BOARD_PUBLIC_QUOTA_WINDOW_MAX ? FLEET_BOARD_OK
+                                                        : FLEET_BOARD_ERR_QUOTA;
+            ASSERT_EQ(db_fleet_board_post_ingest(&db, &p, now, &stored), want);
+            ASSERT_EQ(stored, want == FLEET_BOARD_OK);
+        }
+        /* The key's public budget is its own: a public post still lands. */
+        struct fleet_board_post pub;
+        fb_test_compose(&pub, FLEET_BOARD_KIND_NOTE, "flooder",
+                        "public is counted apart", (uint64_t)now, 3600);
+        fb_test_scope(&pub, FLEET_BOARD_SCOPE_PUBLIC, "general");
+        ASSERT_EQ(fleet_board_post_sign(&pub, seed, pk), FLEET_BOARD_OK);
+        ASSERT_EQ(db_fleet_board_post_ingest(&db, &pub, now, NULL),
+                  FLEET_BOARD_OK);
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
     return failures;
 }
 
@@ -2857,6 +3078,8 @@ int test_fleet_board(void)
     failures += test_fleet_board_scope_store();
     failures += test_fleet_board_reclaim_expired();
     failures += test_fleet_board_fleet_carriage();
+    failures += test_fleet_board_fleet_carriage_gap_free();
+    failures += test_fleet_board_fleet_quota();
     failures += test_fleet_board_public_no_grant_needed();
     /* Leave the process as this group found it: the next group in the same
      * binary must not inherit an open gate. */

@@ -112,7 +112,7 @@ QB_COLUMN(peer_chain_observations, first_seen)
 QB_COLUMN(peer_chain_observations, last_seen)
 QB_COLUMN(peer_chain_observations, observed_at)
 
-/* fleet_board_posts — schema v81, database_migrate_features_v67_up.c */
+/* fleet_board_posts — schema v84, database_migrate_features_v67_up.c */
 QB_TABLE(fleet_board_posts)
 QB_COLUMN(fleet_board_posts, id)
 QB_COLUMN(fleet_board_posts, seq)
@@ -135,6 +135,7 @@ QB_COLUMN(fleet_board_posts, chain_hash)
 QB_COLUMN(fleet_board_posts, received_at)
 QB_COLUMN(fleet_board_posts, scope)
 QB_COLUMN(fleet_board_posts, room)
+QB_COLUMN(fleet_board_posts, arrival)
 
 /* Task contents belong to the user, independently of the serving program. */
 QB_TABLE(task_documents)

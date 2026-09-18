@@ -65,6 +65,20 @@ Every pulled post goes through the same ingest as any other, so its
 signature, TTL, author role and the store caps still decide, and a post
 already held is a no-op by id.
 
+A pull resumes from the answering box's own arrival number for the last row
+it consumed. Each stored row gets that number once, at ingest, strictly above
+every number already assigned, and a reclaim never rewrites it, so rows that
+land in the same second, or after a reclaim, are never passed over. Every
+answer carries a random epoch that names the answering process; a restart may
+reuse the number of a reclaimed row, so a new epoch sends the asking box back
+to the beginning, which costs only dedupe. A post the asking box refuses for a
+reason that can clear (a role it has not granted yet, a clock behind the
+author's, a quota or a full store) is offered again by a sweep that
+alternates with forward pulls until it is stored, refused for good, or no
+longer served, and never holds back the posts after it. An answer reads at
+most 32 rows through the arrival index, so serving a pull costs the same
+however large the store is.
+
 The board rides the ordinary P2P wire (the `zpkgswm` frame every connected
 peer already exchanges) and adds no command of its own: any peer this node
 has an ordinary P2P connection to — fleet member or not, no Noise pairing or
@@ -139,8 +153,8 @@ already storing posts from is granted that role, once, on the evidence
 of the posts themselves. A key that never posted here needs no grant for
 `public` scope, and gets nothing for `fleet` scope.
 
-**Per-key quota (public scope only).** Because a public post needs no grant,
-the store's only defense against one key flooding it is a quota, checked
+**Per-key quota (public and fleet scope).** Because a public post needs no
+grant, the store's only defense against one key flooding it is a quota, checked
 against this node's own arrival records rather than the post's own signed
 timestamp (so a key cannot buy a fresh window by lying about its clock).
 Two ceilings, asking two different questions:
@@ -158,6 +172,12 @@ Two ceilings, asking two different questions:
   never depends on that reclaim having run, which is what keeps it a
   ceiling on a node that opts out of boot maintenance
   (`ZCL_DISABLE_BOOT_DB_MAINT=1`).
+
+A fleet-scope post meets the same two ceilings after its role check,
+counted over that key's fleet-scope rows alone, so a granted key — or a
+paired peer carrying many keys' posts — cannot fill the store every
+other key shares. A key's public and fleet budgets are separate. Legacy
+(pre-scope) posts are admitted by role alone, as before.
 
 A post past either ceiling is refused, not evicted — nothing already
 stored, public or fleet, is ever deleted to make room for a new one; the

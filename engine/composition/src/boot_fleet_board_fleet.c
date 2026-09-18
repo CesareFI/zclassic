@@ -2,9 +2,12 @@
  * purpose: The "board" mesh stream service — FLEET-scope board posts pulled
  * between PAIRED peers (see config/boot_fleet_board.h). It is the fleet
  * ledger's pull lane (boot_fleet_ledger.c) applied to the board: one
- * registration serves both halves, the stream lane only ever copies bytes,
- * and every verify and every store write happens on this lane's own tick
- * with no lock held.
+ * registration serves both halves and the stream lane only ever copies
+ * bytes. The answering half reads one page when a stream opens, through
+ * the arrival index and capped at FLEET_BOARD_FLEET_ANSWER_POSTS_MAX row
+ * reads and signature checks, so a pull cannot hold the frame loop for
+ * longer than that however large the store is. Every pulled post is
+ * verified and stored on this lane's own tick with no lock held.
  */
 
 // one-result-type-ok:closed-security-verdict — the callbacks return the
@@ -22,6 +25,7 @@
 #include "util/fleet_role_check.h"
 #include "base/safe_alloc.h"
 #include "base/serialize_le.h"
+#include "crypto/random_secret.h"
 #include "models/fleet_board_post.h"
 #include "models/mesh_pairing.h"
 #include "platform/time_compat.h"
@@ -37,9 +41,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The asking half's per-stream state: whom we asked, and what came back. */
-struct board_pull_state {
+/* What one pull asked for: a forward page from the peer's cursor, or one
+ * page of a sweep back over rows a refusal left unsettled. */
+struct board_ask {
     uint8_t peer_box_id[32];
+    int64_t after;
+    bool sweep;
+};
+
+/* The asking half's per-stream state: what we asked, and what came back. */
+struct board_pull_state {
+    struct board_ask ask;
     size_t len;
     uint8_t rows[FLEET_BOARD_FLEET_ANSWER_MAX];
 };
@@ -55,18 +67,37 @@ struct board_serve_state {
 /* An answer waiting for the tick to verify and store it. */
 struct board_inbox_slot {
     bool used;
-    uint8_t peer_box_id[32];
+    struct board_ask ask;
     size_t len;
     uint8_t *rows;
 };
 
-/* Where the next pull toward one peer starts: that peer's own arrival
- * keyset for the last record this box took from it. */
+/* Everything this box knows about one peer's board, in that peer's own
+ * arrival numbers, which mean something only inside the answering process
+ * named by `epoch`.
+ *
+ * `next`: every row the peer could serve at or below it is settled here —
+ * stored, refused for good, or at or above `carry_min`.
+ * `carry_min`: the lowest arrival refused for a reason that can clear (a
+ * role not granted yet, a clock ahead of ours, a quota or a busy store);
+ * 0 when there is none. `next` never waits on such a row, so one post
+ * this box may never accept cannot hold back the rest of the board.
+ * A sweep re-reads (`sweep_pos`, `sweep_end`] page by page, offering every
+ * row this box still does not hold; whatever is refused again lands in
+ * `carry_min` for the next sweep. So a refused row is offered again until
+ * it is stored, refused for good, or no longer served, and no row is ever
+ * passed over. */
 struct board_cursor {
     bool used;
+    bool epoch_known;
+    bool sweep_active;
+    bool sweep_turn;
     uint8_t peer_box_id[32];
-    int64_t received_at;
-    uint8_t id[32];
+    uint8_t epoch[FLEET_BOARD_FLEET_EPOCH_BYTES];
+    int64_t next;
+    int64_t carry_min;
+    int64_t sweep_pos;
+    int64_t sweep_end;
 };
 
 static zcl_mutex_t g_lock;
@@ -81,6 +112,13 @@ static _Atomic uint64_t g_delegation_refused;
 static _Atomic uint64_t g_role_refused;
 static _Atomic uint64_t g_inbox_full;
 static _Atomic uint64_t g_stored;
+static _Atomic uint64_t g_deferred;
+static _Atomic uint64_t g_answer_refused;
+/* This process's answer epoch: drawn once, the first time it answers, and
+ * never reset while the process lives — the same lifetime as the store's
+ * arrival high-water mark, which is exactly what it names. Lane lock. */
+static uint8_t g_epoch[FLEET_BOARD_FLEET_EPOCH_BYTES];
+static bool g_epoch_ready;
 
 #ifdef ZCL_TESTING
 /* See boot_fleet_board_fleet_test_bind / _bind_authority. */
@@ -120,29 +158,73 @@ static struct node_db *board_db(void)
     return ndb && ndb->open ? ndb : NULL;
 }
 
-/* ── the PULL frame ──────────────────────────────────────────────────── */
+/* ── the frames ──────────────────────────────────────────────────────── */
 
-static size_t pull_encode(int64_t after_received_at, const uint8_t after_id[32],
+static size_t pull_encode(int64_t after,
                           uint8_t out[FLEET_BOARD_FLEET_PULL_BYTES])
 {
     out[0] = (uint8_t)FLEET_BOARD_FLEET_MSG_PULL;
-    out[1] = 1u; /* protocol version */
-    zcl_write_u64_be(out + 2, (uint64_t)after_received_at);
-    memcpy(out + 10, after_id, 32);
+    out[1] = (uint8_t)FLEET_BOARD_FLEET_VERSION;
+    zcl_write_u64_be(out + 2, (uint64_t)after);
     return FLEET_BOARD_FLEET_PULL_BYTES;
 }
 
-static bool pull_decode(const uint8_t *in, size_t len, int64_t *after_out,
-                        uint8_t after_id[32])
+static bool pull_decode(const uint8_t *in, size_t len, int64_t *after_out)
 {
     if (!in || len != FLEET_BOARD_FLEET_PULL_BYTES ||
-        in[0] != (uint8_t)FLEET_BOARD_FLEET_MSG_PULL || in[1] != 1u)
+        in[0] != (uint8_t)FLEET_BOARD_FLEET_MSG_PULL ||
+        in[1] != (uint8_t)FLEET_BOARD_FLEET_VERSION)
         return false;
     uint64_t after = zcl_read_u64_be(in + 2);
     if (after > (uint64_t)INT64_MAX)
         return false;
     *after_out = (int64_t)after;
-    memcpy(after_id, in + 10, 32);
+    return true;
+}
+
+/* This process's answer epoch, drawn on first use. False only when the
+ * system could not supply random bytes; nothing is answered then. */
+static bool board_epoch(uint8_t out[FLEET_BOARD_FLEET_EPOCH_BYTES])
+{
+    board_lock();
+    if (!g_epoch_ready)
+        g_epoch_ready = zcl_random_secret_bytes(g_epoch, sizeof g_epoch,
+                                                "fleet_board_epoch");
+    bool ready = g_epoch_ready;
+    if (ready)
+        memcpy(out, g_epoch, sizeof g_epoch);
+    board_unlock();
+    return ready;
+}
+
+/* The answer head: which process answered, and how far its page reached. */
+struct board_answer_head {
+    uint8_t epoch[FLEET_BOARD_FLEET_EPOCH_BYTES];
+    int64_t scanned;
+};
+
+static void answer_head_encode(const uint8_t epoch[FLEET_BOARD_FLEET_EPOCH_BYTES],
+                               int64_t scanned, uint8_t *out)
+{
+    out[0] = (uint8_t)FLEET_BOARD_FLEET_MSG_ANSWER;
+    out[1] = (uint8_t)FLEET_BOARD_FLEET_VERSION;
+    memcpy(out + 2, epoch, FLEET_BOARD_FLEET_EPOCH_BYTES);
+    zcl_write_u64_be(out + 2 + FLEET_BOARD_FLEET_EPOCH_BYTES,
+                     (uint64_t)scanned);
+}
+
+static bool answer_head_decode(const uint8_t *in, size_t len,
+                               struct board_answer_head *out)
+{
+    if (!in || len < FLEET_BOARD_FLEET_ANSWER_HEAD ||
+        in[0] != (uint8_t)FLEET_BOARD_FLEET_MSG_ANSWER ||
+        in[1] != (uint8_t)FLEET_BOARD_FLEET_VERSION)
+        return false;
+    memcpy(out->epoch, in + 2, FLEET_BOARD_FLEET_EPOCH_BYTES);
+    uint64_t scanned = zcl_read_u64_be(in + 2 + FLEET_BOARD_FLEET_EPOCH_BYTES);
+    if (scanned > (uint64_t)INT64_MAX)
+        return false;
+    out->scanned = (int64_t)scanned;
     return true;
 }
 
@@ -289,7 +371,7 @@ static bool board_answer_visit(const struct db_fleet_board_post *row,
     if (fleet_board_post_encode(&row->post, at + head, a->cap - a->len - head,
                                 &wire_len) != FLEET_BOARD_OK)
         return false;
-    zcl_write_u64_be(at, (uint64_t)row->received_at);
+    zcl_write_u64_be(at, (uint64_t)row->arrival);
     memcpy(at + 8, row->post.id, 32);
     zcl_write_u32_be(at + 40, (uint32_t)wire_len);
     a->len += head + wire_len;
@@ -316,25 +398,29 @@ static enum mesh_stream_refusal board_service_open(struct mesh_stream *st,
     if (reply_len)
         *reply_len = 0;
     int64_t after = 0;
-    uint8_t after_id[32];
-    if (!pull_decode(payload, len, &after, after_id))
+    if (!pull_decode(payload, len, &after))
         return MESH_STREAM_REFUSED_MALFORMED;
     if (!board_accept_authorized(st->peer_static))
         return MESH_STREAM_REFUSED_PEER_UNPAIRED;
     struct node_db *ndb = board_db();
-    if (!ndb)
+    uint8_t epoch[FLEET_BOARD_FLEET_EPOCH_BYTES];
+    if (!ndb || !board_epoch(epoch))
         return MESH_STREAM_REFUSED_UNAVAILABLE;
     struct board_serve_state *s =
         zcl_calloc(1, sizeof *s, "fleet_board_serve");
     if (!s)
         return MESH_STREAM_REFUSED_UNAVAILABLE;
-    struct board_answer a = { s->rows, sizeof s->rows, 0, 0 };
-    if (db_fleet_board_fleet_after(ndb, board_now(), after, after_id,
-                                   board_answer_visit, &a) < 0) {
+    const size_t head = FLEET_BOARD_FLEET_ANSWER_HEAD;
+    struct board_answer a = { s->rows + head, sizeof s->rows - head, 0, 0 };
+    int64_t scanned = after;
+    if (db_fleet_board_fleet_after(ndb, board_now(), after,
+                                   FLEET_BOARD_FLEET_ANSWER_POSTS_MAX,
+                                   board_answer_visit, &a, &scanned) < 0) {
         free(s);
         return MESH_STREAM_REFUSED_UNAVAILABLE;
     }
-    s->len = a.len;
+    answer_head_encode(epoch, scanned, s->rows);
+    s->len = head + a.len;
     st->service_state = s;
     return MESH_STREAM_OK;
 }
@@ -362,8 +448,7 @@ static void board_service_data(struct mesh_stream *st, const uint8_t *payload,
 }
 
 /* The answering half's drain: one answer inside the credit it holds, then
- * the stream is done. An empty answer closes at once, which is what makes
- * a pull with nothing new free. */
+ * the stream is done. A pull with nothing new costs one answer head. */
 static void board_service_tick(struct mesh_stream *st, int64_t now, void *ctx)
 {
     (void)now;
@@ -412,7 +497,7 @@ static void board_service_close(struct mesh_stream *st,
     struct board_inbox_slot *slot = board_inbox_claim();
     if (slot) {
         slot->used = true;
-        memcpy(slot->peer_box_id, p->peer_box_id, 32);
+        slot->ask = p->ask;
         slot->len = p->len;
         slot->rows = rows;
     }
@@ -474,45 +559,99 @@ static struct board_cursor *board_cursor_slot(const uint8_t box_id[32],
     return free_slot;
 }
 
-static void board_cursor_read(const uint8_t box_id[32], int64_t *received_at,
-                              uint8_t id[32])
+/* Choose the next pull toward one peer. While anything is waiting on a
+ * sweep, pulls alternate: a forward page, then a sweep page, so new posts
+ * keep flowing while refused ones are offered again. A sweep starts at the
+ * lowest refused arrival and ends where `next` stood when it started. */
+static void board_plan_pull(struct board_ask *ask)
 {
-    *received_at = 0;
-    memset(id, 0, 32);
+    ask->after = 0;
+    ask->sweep = false;
     board_lock();
-    const struct board_cursor *c = board_cursor_slot(box_id, false);
+    struct board_cursor *c = board_cursor_slot(ask->peer_box_id, true);
     if (c) {
-        *received_at = c->received_at;
-        memcpy(id, c->id, 32);
+        bool pending = c->sweep_active || c->carry_min > 0;
+        if (pending && c->sweep_turn && !c->sweep_active) {
+            c->sweep_active = true;
+            c->sweep_pos = c->carry_min - 1;
+            c->sweep_end = c->next;
+            c->carry_min = 0;
+        }
+        ask->sweep = pending && c->sweep_turn;
+        ask->after = ask->sweep ? c->sweep_pos : c->next;
+        c->sweep_turn = pending && !ask->sweep;
     }
     board_unlock();
 }
 
-/* Forward only: a cursor never moves back past a record already taken. */
-static void board_cursor_advance(const uint8_t box_id[32], int64_t received_at,
-                                 const uint8_t id[32])
+/* Copy one peer's cursor out, so the store is written with no lock held.
+ * False when the table has no room for this peer. */
+static bool board_cursor_load(const uint8_t box_id[32], struct board_cursor *out)
 {
     board_lock();
-    struct board_cursor *c = board_cursor_slot(box_id, true);
-    if (c && (received_at > c->received_at ||
-              (received_at == c->received_at && memcmp(id, c->id, 32) > 0))) {
-        c->received_at = received_at;
-        memcpy(c->id, id, 32);
-    }
+    const struct board_cursor *c = board_cursor_slot(box_id, true);
+    if (c)
+        *out = *c;
     board_unlock();
+    return c != NULL;
+}
+
+/* Only the lane tick touches a cursor — planning a pull and draining an
+ * answer both run there — so the copy it loaded is still the cursor it
+ * stores back. */
+static void board_cursor_store(const struct board_cursor *in)
+{
+    board_lock();
+    struct board_cursor *c = board_cursor_slot(in->peer_box_id, false);
+    if (c)
+        *c = *in;
+    board_unlock();
+}
+
+/* Is this answer's numbering the one the cursor holds? A different epoch
+ * means the peer's process restarted, and a restart may reuse an arrival
+ * number whose row was reclaimed, so everything the cursor says is void
+ * and the peer is read again from the beginning. An answer to a forward
+ * pull from 0 needs no numbering to be trusted; anything else waits for
+ * the next pull. */
+static bool board_cursor_epoch(struct board_cursor *c,
+                               const struct board_answer_head *h,
+                               const struct board_ask *ask)
+{
+    if (c->epoch_known &&
+        memcmp(c->epoch, h->epoch, FLEET_BOARD_FLEET_EPOCH_BYTES) == 0)
+        return true;
+    uint8_t box_id[32];
+    memcpy(box_id, c->peer_box_id, 32);
+    memset(c, 0, sizeof *c);
+    c->used = true;
+    memcpy(c->peer_box_id, box_id, 32);
+    memcpy(c->epoch, h->epoch, FLEET_BOARD_FLEET_EPOCH_BYTES);
+    c->epoch_known = true;
+    return !ask->sweep && ask->after == 0;
+}
+
+/* Is this answer to the question the cursor is waiting on? An answer to
+ * any other question is stale and moves nothing. */
+static bool board_answer_current(const struct board_cursor *c,
+                                 const struct board_ask *ask)
+{
+    if (ask->sweep)
+        return c->sweep_active && ask->after == c->sweep_pos;
+    return ask->after == c->next;
 }
 
 /* ── the commit, on this lane's tick ─────────────────────────────────── */
 
 struct board_record {
-    int64_t received_at;
+    int64_t arrival;
     uint8_t id[32];
     const uint8_t *wire;
     size_t wire_len;
 };
 
 /* The next framed record, or false at the end or at a frame that does not
- * add up — the rest of such an answer cannot be read and is not guessed. */
+ * add up. */
 static bool board_record_next(const uint8_t *buf, size_t len, size_t *off,
                               struct board_record *rec)
 {
@@ -520,12 +659,12 @@ static bool board_record_next(const uint8_t *buf, size_t len, size_t *off,
     if (*off >= len || len - *off < head)
         return false;
     const uint8_t *at = buf + *off;
-    uint64_t received_at = zcl_read_u64_be(at);
+    uint64_t arrival = zcl_read_u64_be(at);
     uint32_t wire_len = zcl_read_u32_be(at + 40);
-    if (received_at > (uint64_t)INT64_MAX || wire_len == 0 ||
+    if (arrival > (uint64_t)INT64_MAX || wire_len == 0 ||
         wire_len > len - *off - head)
         return false;
-    rec->received_at = (int64_t)received_at;
+    rec->arrival = (int64_t)arrival;
     memcpy(rec->id, at + 8, 32);
     rec->wire = at + head;
     rec->wire_len = wire_len;
@@ -533,12 +672,45 @@ static bool board_record_next(const uint8_t *buf, size_t len, size_t *off,
     return true;
 }
 
-/* A refusal that is about THIS box right now, not about the post: the
- * cursor stays put and the next pull asks for the same record again. */
-static bool board_refusal_transient(enum fleet_board_result r)
+/* The whole answer adds up before any of it is used: every record framed,
+ * arrivals strictly rising from where the pull asked, none past the point
+ * the page says it reached. One bad frame voids the answer; nothing in it
+ * is guessed at and no cursor moves. */
+static bool board_answer_valid(const uint8_t *buf, size_t len,
+                               const struct board_answer_head *h,
+                               int64_t asked_after)
 {
-    return r == FLEET_BOARD_ERR_BUSY || r == FLEET_BOARD_ERR_STORAGE ||
-           r == FLEET_BOARD_ERR_CAPACITY || r == FLEET_BOARD_ERR_ARGS;
+    if (h->scanned < asked_after)
+        return false;
+    size_t off = FLEET_BOARD_FLEET_ANSWER_HEAD;
+    int64_t prev = asked_after;
+    struct board_record rec;
+    while (board_record_next(buf, len, &off, &rec)) {
+        if (rec.arrival <= prev || rec.arrival > h->scanned)
+            return false;
+        prev = rec.arrival;
+    }
+    return off == len;
+}
+
+/* A refusal that says nothing final about the post: this box has not
+ * granted the author a role yet, its clock is behind the author's, the
+ * author's quota or this store is full right now, or the store could not
+ * write. Every one of these can clear, so the row is offered again. */
+static bool board_refusal_retryable(enum fleet_board_result r)
+{
+    switch (r) {
+    case FLEET_BOARD_ERR_ROLE:
+    case FLEET_BOARD_ERR_FUTURE:
+    case FLEET_BOARD_ERR_QUOTA:
+    case FLEET_BOARD_ERR_CAPACITY:
+    case FLEET_BOARD_ERR_BUSY:
+    case FLEET_BOARD_ERR_STORAGE:
+    case FLEET_BOARD_ERR_ARGS:
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* Decode, prove it is the record the header named and that it is
@@ -559,38 +731,94 @@ static enum fleet_board_result board_record_ingest(
     return db_fleet_board_post_ingest(ndb, post, now, stored);
 }
 
+/* Offer one record. A refusal that can clear lowers `carry_min` so a later
+ * sweep offers the row again; every other refusal is final and named.
+ * None names the post's text: that is the fleet's own. */
+static bool board_offer(struct node_db *ndb, const struct board_record *rec,
+                        struct fleet_board_post *post, int64_t now,
+                        struct board_cursor *c)
+{
+    bool stored = false;
+    enum fleet_board_result r = board_record_ingest(ndb, rec, post, now,
+                                                    &stored);
+    if (board_refusal_retryable(r)) {
+        if (c && (c->carry_min == 0 || rec->arrival < c->carry_min))
+            c->carry_min = rec->arrival;
+        atomic_fetch_add_explicit(&g_deferred, 1, memory_order_relaxed);
+        LOG_WARN("fleet.board", "fleet post deferred: %s",
+                 fleet_board_result_string(r));
+    } else if (r != FLEET_BOARD_OK && r != FLEET_BOARD_ERR_EXPIRED) {
+        /* An expired post is stale, not wrong. */
+        LOG_WARN("fleet.board", "fleet post refused: %s",
+                 fleet_board_result_string(r));
+    }
+    return stored;
+}
+
+/* Offer every record of a valid answer that this box does not already
+ * hold (a held row is settled). A sweep offers only rows inside its range:
+ * rows above it belong to forward pulls. */
+static size_t board_offer_all(struct node_db *ndb,
+                              const struct board_inbox_slot *slot,
+                              struct fleet_board_post *post, int64_t now,
+                              struct board_cursor *c)
+{
+    size_t off = FLEET_BOARD_FLEET_ANSWER_HEAD;
+    size_t stored = 0;
+    struct board_record rec;
+    while (board_record_next(slot->rows, slot->len, &off, &rec)) {
+        if ((slot->ask.sweep && rec.arrival > c->sweep_end) ||
+            db_fleet_board_have(ndb, rec.id))
+            continue;
+        if (board_offer(ndb, &rec, post, now, c))
+            stored++;
+    }
+    return stored;
+}
+
+/* Where the cursor stands once a whole answer has been offered. A forward
+ * page settles everything up to the point it reached. A sweep moves on, or
+ * ends once it reaches the end of its range or the peer has nothing more. */
+static void board_cursor_settle(struct board_cursor *c,
+                                const struct board_ask *ask,
+                                const struct board_answer_head *h)
+{
+    if (!ask->sweep) {
+        c->next = h->scanned;
+        return;
+    }
+    if (h->scanned >= c->sweep_end || h->scanned == ask->after)
+        c->sweep_active = false;
+    else
+        c->sweep_pos = h->scanned;
+}
+
 static size_t board_drain_slot(struct node_db *ndb,
                                const struct board_inbox_slot *slot,
                                struct fleet_board_post *post, int64_t now)
 {
-    size_t off = 0;
-    size_t stored_count = 0;
-    struct board_record rec;
-    struct board_record last;
-    memset(&last, 0, sizeof last);
-    bool advanced = false;
-    while (board_record_next(slot->rows, slot->len, &off, &rec)) {
-        bool stored = false;
-        enum fleet_board_result r =
-            board_record_ingest(ndb, &rec, post, now, &stored);
-        if (board_refusal_transient(r)) {
-            LOG_WARN("fleet.board", "fleet post deferred: %s",
-                     fleet_board_result_string(r));
-            break;
-        }
-        /* An expired post is stale, not wrong; every other refusal is
-         * named. None names the post's text: that is the fleet's own. */
-        if (r != FLEET_BOARD_OK && r != FLEET_BOARD_ERR_EXPIRED)
-            LOG_WARN("fleet.board", "fleet post refused: %s",
-                     fleet_board_result_string(r));
-        if (stored)
-            stored_count++;
-        last = rec;
-        advanced = true;
+    struct board_answer_head h;
+    if (!answer_head_decode(slot->rows, slot->len, &h) ||
+        !board_answer_valid(slot->rows, slot->len, &h, slot->ask.after)) {
+        atomic_fetch_add_explicit(&g_answer_refused, 1, memory_order_relaxed);
+        LOG_WARN("fleet.board", "fleet answer refused: malformed");
+        return 0;
     }
-    if (advanced)
-        board_cursor_advance(slot->peer_box_id, last.received_at, last.id);
-    return stored_count;
+    struct board_cursor c;
+    if (!board_cursor_load(slot->ask.peer_box_id, &c)) {
+        /* No room to remember this peer: take what arrived, remember
+         * nothing, and ask from the beginning again next time. */
+        return slot->ask.sweep ? 0 : board_offer_all(ndb, slot, post, now,
+                                                     NULL);
+    }
+    size_t stored = 0;
+    if (board_cursor_epoch(&c, &h, &slot->ask) &&
+        board_answer_current(&c, &slot->ask)) {
+        stored = board_offer_all(ndb, slot, post, now, &c);
+        board_cursor_settle(&c, &slot->ask, &h);
+    }
+    board_cursor_store(&c);
+    return stored;
 }
 
 static size_t board_drain_inbox(struct node_db *ndb, int64_t now)
@@ -643,12 +871,10 @@ static bool board_open_pull(const uint8_t peer_noise[32],
         zcl_calloc(1, sizeof *p, "fleet_board_pull");
     if (!p)
         return false;
-    memcpy(p->peer_box_id, peer_box_id, 32);
-    int64_t after = 0;
-    uint8_t after_id[32];
-    board_cursor_read(peer_box_id, &after, after_id);
+    memcpy(p->ask.peer_box_id, peer_box_id, 32);
+    board_plan_pull(&p->ask);
     uint8_t frame[FLEET_BOARD_FLEET_PULL_BYTES];
-    size_t frame_len = pull_encode(after, after_id, frame);
+    size_t frame_len = pull_encode(p->ask.after, frame);
     uint64_t stream_id = 0;
     enum mesh_stream_refusal refusal =
         mesh_stream_open(FLEET_BOARD_FLEET_SERVICE_NAME, peer_noise, 0, frame,
@@ -736,6 +962,9 @@ void boot_fleet_board_fleet_counts(struct boot_fleet_board_fleet_counts *out)
     out->inbox_full =
         atomic_load_explicit(&g_inbox_full, memory_order_relaxed);
     out->stored = atomic_load_explicit(&g_stored, memory_order_relaxed);
+    out->deferred = atomic_load_explicit(&g_deferred, memory_order_relaxed);
+    out->answer_refused =
+        atomic_load_explicit(&g_answer_refused, memory_order_relaxed);
 }
 
 /* ── lifecycle ───────────────────────────────────────────────────────── */
@@ -855,6 +1084,15 @@ void boot_fleet_board_fleet_test_bind_authority(
         memcpy(g_test_genesis, network_genesis, 32);
         g_test_now = now;
     }
+    board_unlock();
+}
+
+/* The answering process as if it had restarted: the next answer carries a
+ * fresh epoch. */
+void boot_fleet_board_fleet_test_new_epoch(void)
+{
+    board_lock();
+    g_epoch_ready = false;
     board_unlock();
 }
 #endif

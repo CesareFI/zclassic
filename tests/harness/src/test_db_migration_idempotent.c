@@ -1346,6 +1346,89 @@ static int t_v82_board_kind_ceiling_row_copy_is_lossless(void)
     return failures;
 }
 
+/* Sign one fleet-scope note from a fixed test key. */
+static bool db_mig_board_post(struct fleet_board_post *post, const char *text,
+                              int64_t now)
+{
+    uint8_t seed[32], sk[32], pk[32];
+    memset(seed, 0, sizeof(seed));
+    seed[0] = 0x84;
+    ed25519_keypair(pk, sk, seed);
+    memset(post, 0, sizeof(*post));
+    post->kind = FLEET_BOARD_KIND_NOTE;
+    post->created_at = (uint64_t)now;
+    post->ttl = 3600;
+    snprintf(post->agent, sizeof(post->agent), "node-x");
+    size_t text_len = strlen(text);
+    memcpy(post->text, text, text_len);
+    post->text[text_len] = '\0';
+    post->text_len = (uint32_t)text_len;
+    post->scope = FLEET_BOARD_SCOPE_FLEET;
+    return fleet_board_post_sign(post, sk, pk) == FLEET_BOARD_OK;
+}
+
+static int t_v84_board_arrival_survives_remigration(void)
+{
+    int failures = 0;
+    char dir[256];
+    db_mig_path(dir, sizeof(dir), "v84_board_arrival");
+    mkdir_p(dir);
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/node.db", dir);
+    zcl_fleet_role_checker_install_permissive_for_testing();
+
+    TEST("db_mig: re-migrating a board that already carries arrival keeps "
+         "every row and never hands an arrival number out twice") {
+        struct node_db seed;
+        ASSERT(node_db_open(&seed, dbpath));
+        struct fleet_board_post first;
+        ASSERT(db_mig_board_post(&first, "stored before the rollback",
+                                 600000));
+        ASSERT_EQ(db_fleet_board_post_ingest(&seed, &first, 600000, NULL),
+                  FLEET_BOARD_OK);
+        node_db_close(&seed);
+
+        /* Stamped back below v82, so the v82 rebuild copies a table that
+         * already has the v84 column, and v84 then runs again. */
+        sqlite3 *raw = NULL;
+        ASSERT(sqlite3_open(dbpath, &raw) == SQLITE_OK);
+        ASSERT(db_mig_stamp_schema(raw, 79));
+        ASSERT(db_mig_stamp_floor(raw, 79));
+        sqlite3_close(raw);
+        raw = NULL;
+
+        struct node_db ndb;
+        ASSERT(db_mig_open_raw_handle(&ndb, dbpath));
+        ASSERT(node_db_migrate(&ndb, NULL) >= 0);
+        ASSERT_EQ(node_db_schema_version(&ndb), NODE_DB_SCHEMA_LATEST);
+        struct db_fleet_board_post row;
+        ASSERT(db_fleet_board_post_find(&ndb, first.id, &row));
+        ASSERT(row.arrival > 0);
+        struct fleet_board_post second;
+        ASSERT(db_mig_board_post(&second, "stored after the rollback",
+                                 600001));
+        ASSERT_EQ(db_fleet_board_post_ingest(&ndb, &second, 600001, NULL),
+                  FLEET_BOARD_OK);
+        struct db_fleet_board_post row2;
+        ASSERT(db_fleet_board_post_find(&ndb, second.id, &row2));
+        ASSERT(row2.arrival > row.arrival);
+        db_mig_close_raw_handle(&ndb);
+
+        ASSERT(sqlite3_open(dbpath, &raw) == SQLITE_OK);
+        ASSERT_EQ(db_mig_count(raw, "SELECT count(*) FROM fleet_board_posts"),
+                  2);
+        ASSERT_EQ(db_mig_count(raw,
+                      "SELECT count(*) FROM sqlite_master WHERE type='index' "
+                      "AND name='idx_fleet_board_arrival'"),
+                  1);
+        sqlite3_close(raw);
+        PASS();
+    } _test_next:;
+    zcl_fleet_role_checker_install(NULL);
+    test_cleanup_tmpdir(dir);
+    return failures;
+}
+
 static int t_additive_migration_keeps_floor(void)
 {
     int failures = 0;
@@ -1821,6 +1904,7 @@ int test_db_migration_idempotent(void)
     failures += t_supported_current_schema_reopens_normally();
     failures += t_v29_incompatible_schema_fails_without_stamp();
     failures += t_v82_board_kind_ceiling_row_copy_is_lossless();
+    failures += t_v84_board_arrival_survives_remigration();
     failures += t_additive_migration_keeps_floor();
     failures += t_breaking_migration_raises_floor();
     failures += t_older_binary_within_floor_opens_read_compatible();

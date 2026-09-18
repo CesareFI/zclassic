@@ -80,8 +80,14 @@ static int db_migrate_v82_rebuild_table(struct node_db *ndb)
             "room TEXT NOT NULL DEFAULT '' CHECK(length(room)<=32))"))
         LOG_ERR("db", "migrate v82: agents-kind table rebuild failed");
     if (!node_db_exec(ndb,
-            "INSERT INTO fleet_board_posts_v82 SELECT * FROM "
-            "fleet_board_posts"))
+            /* Named columns, not SELECT *: a database re-migrated from a
+             * version stamped back below 82 already carries the v84
+             * `arrival` column, which this v81-shaped copy leaves behind
+             * and the v84 step then re-adds. */
+            "INSERT INTO fleet_board_posts_v82 SELECT id,seq,kind,"
+            "created_at,ttl,expires_at,ref,host_pubkey,agent,slug,title,"
+            "supersedes,receipt,text,body_bytes,signature,chain_prev,"
+            "chain_hash,received_at,scope,room FROM fleet_board_posts"))
         LOG_ERR("db", "migrate v82: agents-kind row copy failed");
     if (!node_db_exec(ndb, "DROP TABLE fleet_board_posts"))
         LOG_ERR("db", "migrate v82: old board table drop failed");
@@ -176,6 +182,52 @@ static int db_migrate_step_83(struct node_db *ndb, int *current_ver,
         LOG_ERR("db", "migrate v83: migration stamp failed");
     DB_MIGRATE_PERSIST_VERSION_FLOOR(ndb, 83, *floor_ver);
     *current_ver = 83;
+    (*applied)++;
+    return 0;
+}
+
+/* True once fleet_board_posts already carries the v84 `arrival` column.
+ * Same re-migration guard as fleet_board_posts_v81_scope_present(). */
+static bool fleet_board_posts_v84_arrival_present(struct node_db *ndb)
+{
+    const char *type = NULL;
+    return ndb && ndb->open &&
+           sqlite3_table_column_metadata(
+               ndb->db, NULL, "fleet_board_posts",
+               "arrival", &type, NULL, NULL, NULL, NULL) == SQLITE_OK;
+}
+
+/* v84: every board row gets a local arrival number that only ever grows.
+ * `seq` cannot serve as a cursor another box holds, because a reclaim
+ * renumbers it, and `received_at` has one-second resolution, so two rows
+ * landing in the same second have no order a pulling peer can resume
+ * from. The paired fleet pull pages on `arrival` instead. Existing rows
+ * take their current seq, which is already unique and in arrival order;
+ * the ingest path assigns every later row a number above the largest one
+ * stored. The UNIQUE index is both the integrity check and the index the
+ * page walks. */
+static int db_migrate_step_84(struct node_db *ndb, int *current_ver,
+                              int *floor_ver, int *applied)
+{
+    if (*current_ver >= 84) return 0;
+    if (!fleet_board_posts_v84_arrival_present(ndb)) {
+        if (!node_db_exec(ndb,
+                "ALTER TABLE fleet_board_posts ADD COLUMN arrival INTEGER "
+                "NOT NULL DEFAULT 0 CHECK(arrival>=0)"))
+            LOG_ERR("db", "migrate v84: board arrival column failed");
+        if (!node_db_exec(ndb, "UPDATE fleet_board_posts SET arrival=seq"))
+            LOG_ERR("db", "migrate v84: board arrival backfill failed");
+    }
+    if (!node_db_exec(ndb,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_board_arrival "
+            "ON fleet_board_posts(arrival)"))
+        LOG_ERR("db", "migrate v84: board arrival index failed");
+    if (!node_db_exec(ndb,
+            "INSERT OR IGNORE INTO schema_migrations(version) "
+            "VALUES('084')"))
+        LOG_ERR("db", "migrate v84: migration stamp failed");
+    DB_MIGRATE_PERSIST_VERSION_FLOOR(ndb, 84, *floor_ver);
+    *current_ver = 84;
     (*applied)++;
     return 0;
 }
@@ -819,6 +871,7 @@ int node_db_migrate_features_v67_up(struct node_db *ndb, int *version,
     (void)db_migrate_step_81(ndb, &current_ver, &floor_ver, &applied);
     (void)db_migrate_step_82(ndb, &current_ver, &applied, floor_ver);
     (void)db_migrate_step_83(ndb, &current_ver, &floor_ver, &applied);
+    (void)db_migrate_step_84(ndb, &current_ver, &floor_ver, &applied);
     *version = current_ver;
     *floor = floor_ver;
     return applied;
