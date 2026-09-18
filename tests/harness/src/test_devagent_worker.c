@@ -785,6 +785,41 @@ int test_devagent_worker(void)
         PASS();
     }
 
+    TEST("result mail survives a carriage-return candidate")
+    {
+        char body[4096];
+        /* A bare CR is the other half of the line terminator, and a
+         * reader that splits on CR as well as LF sees the same forged
+         * key=value line an LF would have made. The allowlist excludes
+         * it by construction, which is an argument; this is the
+         * evidence, and it is what keeps the exclusion from being
+         * deleted by someone who only sees the LF case. */
+        ASSERT(wtx_hostile_run("mcr", "wtx-cr", "cand\rinjected=1", body,
+                               sizeof(body)));
+        ASSERT(wtx_elided_ok(body, "wtx-cr", "injected=1"));
+        /* The gate verdict and the rc still reach the client. */
+        ASSERT(strstr(body, "gate=gate-refused\n") != NULL);
+        ASSERT(strstr(body, "rc=1\n") != NULL);
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("result mail survives a CRLF candidate")
+    {
+        char body[4096];
+        /* CR and LF together, the terminator every line-oriented reader
+         * agrees on. Proven separately from either byte alone: a check
+         * that rejected only the first character of a pair would still
+         * pass both single-byte cases. */
+        ASSERT(wtx_hostile_run("mcrlf", "wtx-crlf", "cand\r\ninjected=1",
+                               body, sizeof(body)));
+        ASSERT(wtx_elided_ok(body, "wtx-crlf", "injected=1"));
+        ASSERT(strstr(body, "gate=gate-refused\n") != NULL);
+        ASSERT(strstr(body, "rc=1\n") != NULL);
+        wtx_restore();
+        PASS();
+    }
+
     TEST("an oversized candidate cannot cancel the row")
     {
         char body[4096], huge[256];
