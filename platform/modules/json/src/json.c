@@ -482,6 +482,72 @@ static bool parse_number(struct json_value *v, const char **pp, const char *end)
     return true;
 }
 
+/* Take ownership of key and child as the next member of v; both are freed
+ * when v cannot grow. */
+static bool json_append(struct json_value *v, char *key,
+                        struct json_value *child)
+{
+    if (!json_grow(v)) { free(key); json_free(child); return false; }
+    v->keys[v->num_children] = key;
+    v->children[v->num_children] = *child;
+    v->num_children++;
+    return true;
+}
+
+/* One member name and its ':', whitespace allowed around both. key NULL
+ * is the validate-only walk. On failure nothing is left allocated. */
+static bool parse_member_key(char **key, const char **pp, const char *end)
+{
+    const char *p = skip_ws(*pp, end);
+    if (!parse_string(key, &p, end)) return false;
+    p = skip_ws(p, end);
+    if (p >= end || *p != ':') {
+        if (key) { free(*key); *key = NULL; }
+        return false;
+    }
+    *pp = p + 1;
+    return true;
+}
+
+/* The members of an object whose '{' has been consumed. v is the object
+ * being filled, or NULL for json_valid (no key, no child, no growth). */
+static bool parse_object_r(struct json_value *v, const char **pp,
+                           const char *end, int depth)
+{
+    const char *p = skip_ws(*pp, end);
+    if (p < end && *p == '}') { *pp = p + 1; return true; }
+    while (p < end) {
+        char *key = NULL;
+        if (!parse_member_key(v ? &key : NULL, &p, end)) return false;
+        struct json_value child;
+        if (!parse_value_r(v ? &child : NULL, &p, end, depth + 1)) { free(key); return false; }
+        if (v && !json_append(v, key, &child)) return false;
+        p = skip_ws(p, end);
+        if (p < end && *p == ',') { p++; continue; }
+        if (p < end && *p == '}') { *pp = p + 1; return true; }
+        return false;
+    }
+    return false;
+}
+
+/* The elements of an array whose '[' has been consumed; v as above. */
+static bool parse_array_r(struct json_value *v, const char **pp,
+                          const char *end, int depth)
+{
+    const char *p = skip_ws(*pp, end);
+    if (p < end && *p == ']') { *pp = p + 1; return true; }
+    while (p < end) {
+        struct json_value child;
+        if (!parse_value_r(v ? &child : NULL, &p, end, depth + 1)) return false;
+        if (v && !json_append(v, NULL, &child)) return false;
+        p = skip_ws(p, end);
+        if (p < end && *p == ',') { p++; continue; }
+        if (p < end && *p == ']') { *pp = p + 1; return true; }
+        return false;
+    }
+    return false;
+}
+
 static bool parse_value_r(struct json_value *v, const char **pp,
                           const char *end, int depth)
 {
@@ -503,55 +569,13 @@ static bool parse_value_r(struct json_value *v, const char **pp,
         *pp = p;
         return true;
     }
-    if (*p == '{') {
+    if (*p == '{' || *p == '[') {
+        bool obj = *p == '{';
         if (depth >= JSON_MAX_DEPTH) return false;
-        p++;
-        json_set_object(v);
-        p = skip_ws(p, end);
-        if (p < end && *p == '}') { *pp = p + 1; return true; }
-        while (p < end) {
-            p = skip_ws(p, end);
-            char *key = NULL;
-            if (!parse_string(keep ? &key : NULL, &p, end)) return false;
-            p = skip_ws(p, end);
-            if (p >= end || *p != ':') { free(key); return false; }
-            p++;
-            struct json_value child;
-            if (!parse_value_r(keep ? &child : NULL, &p, end, depth + 1)) { free(key); return false; }
-            if (keep) {
-                if (!json_grow(v)) { free(key); json_free(&child); return false; }
-                v->keys[v->num_children] = key;
-                v->children[v->num_children] = child;
-                v->num_children++;
-            }
-            p = skip_ws(p, end);
-            if (p < end && *p == ',') { p++; continue; }
-            if (p < end && *p == '}') { *pp = p + 1; return true; }
-            return false;
-        }
-        return false;
-    }
-    if (*p == '[') {
-        if (depth >= JSON_MAX_DEPTH) return false;
-        p++;
-        json_set_array(v);
-        p = skip_ws(p, end);
-        if (p < end && *p == ']') { *pp = p + 1; return true; }
-        while (p < end) {
-            struct json_value child;
-            if (!parse_value_r(keep ? &child : NULL, &p, end, depth + 1)) return false;
-            if (keep) {
-                if (!json_grow(v)) { json_free(&child); return false; }
-                v->keys[v->num_children] = NULL;
-                v->children[v->num_children] = child;
-                v->num_children++;
-            }
-            p = skip_ws(p, end);
-            if (p < end && *p == ',') { p++; continue; }
-            if (p < end && *p == ']') { *pp = p + 1; return true; }
-            return false;
-        }
-        return false;
+        *pp = p + 1;
+        if (obj) json_set_object(v); else json_set_array(v);
+        return obj ? parse_object_r(keep ? v : NULL, pp, end, depth)
+                   : parse_array_r(keep ? v : NULL, pp, end, depth);
     }
     if (end - p >= 4 && memcmp(p, "null", 4) == 0) {
         v->type = JSON_NULL;

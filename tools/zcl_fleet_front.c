@@ -19,13 +19,13 @@
  * A hosted AI client's fetcher reaches port 443 and nothing else. A gateway
  * published on a high port is not "hard to reach", it is UNREACHABLE for the
  * one client the gateway exists to serve, and the failure it shows is an
- * opaque connect timeout. So the public MCP/OAuth surface has to live on the
+ * opaque connect timeout. So the public steering/OAuth surface has to live on the
  * apex at :443 — which the node's own HTTPS site already owns.
  *
  * Both can own it, because they own DISJOINT PATHS. With a site backend
  * configured this binary terminates TLS once, reads the request head, and
  * hands the connection to exactly one backend: the loopback gateway for the
- * MCP/OAuth paths, the node's HTTPS site for everything else. It still
+ * steering/OAuth paths, the node's HTTPS site for everything else. It still
  * rewrites no byte of either direction — the head it parsed is forwarded
  * verbatim, Host and all. Without a site backend it behaves exactly as
  * before: one gateway, no parsing, a dumb pipe.
@@ -379,7 +379,7 @@ static bool ff_end_pending(const struct ff_end *end)
 
 /* Does this path belong to the gateway rather than the node's site?
  *
- * The set is exactly the MCP endpoint plus the OAuth surface that endpoint
+ * The set is exactly the steering endpoint plus the OAuth surface that endpoint
  * advertises, and it is matched as a PREFIX on purpose: clients probe
  * issuer-suffixed discovery variants (RFC 8414 §3.1 puts the resource path
  * after the well-known segment), and every such probe has to reach the one
@@ -410,7 +410,7 @@ static bool ff_path_is_gateway(const char *path)
 }
 
 /* Copy the request target out of an HTTP request line. False when the line
- * is not one (which routes to the site: the node front owns "not MCP"). */
+ * is not one (which routes to the site: the node front owns "not steering"). */
 static bool ff_request_path(const char *head, size_t len, char *out, size_t cap)
 {
     size_t i = 0;
@@ -893,6 +893,17 @@ static void ff_spawn(int client, const int *listen_fds, int listen_count,
     g_children++;
 }
 
+/* The one startup line: where the front listens and where it routes. */
+static void ff_log_listening(const struct ff_config *cfg, int listen_count)
+{
+    bool site = cfg->site_host[0] != 0;
+    fprintf(stderr, "fleet-front: listen [%s]:%s -> gw %s:%s%s%s%s%s (%d socket%s, max %d children)\n",
+        cfg->listen_host, cfg->listen_port, cfg->gw_host, cfg->gw_port,
+        site ? ", site " : "", site ? cfg->site_host : "",
+        site ? ":" : "", site ? cfg->site_port : "",
+        listen_count, listen_count == 1 ? "" : "s", cfg->max_children);
+}
+
 int main(int argc, char **argv)
 {
     struct ff_config cfg;
@@ -924,13 +935,7 @@ int main(int argc, char **argv)
             SSL_CTX_free(site_ctx);
         return 1;
     }
-    fprintf(stderr, "fleet-front: listen [%s]:%s -> gw %s:%s%s%s%s%s (%d socket%s, max %d children)\n",
-        cfg.listen_host, cfg.listen_port, cfg.gw_host, cfg.gw_port,
-        cfg.site_host[0] != 0 ? ", site " : "",
-        cfg.site_host[0] != 0 ? cfg.site_host : "",
-        cfg.site_host[0] != 0 ? ":" : "",
-        cfg.site_host[0] != 0 ? cfg.site_port : "",
-        listen_count, listen_count == 1 ? "" : "s", cfg.max_children);
+    ff_log_listening(&cfg, listen_count);
     for (;;) {
         int client = ff_accept_next(listen_fds, listen_count);
         if (client == -2)

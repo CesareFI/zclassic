@@ -560,6 +560,45 @@ static bool gw_authorize_issue(int fd, const struct gw_config *cfg,
                                const char *comma, char *loc, size_t loccap);
 static void gw_state_escape(const char *state, char *esc, size_t cap);
 
+/* Drain the node's stdout into reply, up to GW_CAP_REPLY, growing as it
+ * arrives. False when the buffer could not grow: the gateway's memory. */
+static bool gw_node_read(int fd, struct gw_buf *reply)
+{
+    for (;;) {
+        size_t room;
+        ssize_t r;
+        if (reply->len >= GW_CAP_REPLY)
+            return true;
+        gw_buf_reserve(reply, 4096u + 1u);
+        if (reply->oom)
+            return false;
+        room = reply->cap - reply->len - 1u;
+        if (room > GW_CAP_REPLY - reply->len)
+            room = GW_CAP_REPLY - reply->len;
+        r = read(fd, reply->p + reply->len, room);
+        if (r <= 0)
+            return true;
+        reply->len += (size_t)r;
+    }
+}
+
+/* The exit code of exactly this child, or -1 when it did not exit normally
+ * or its status could not be had. Only this child's own status counts:
+ * after ECHILD (reaped elsewhere, or SIGCHLD ignored) a status variable
+ * holds whatever it was initialised to, and a zero there reads as a clean
+ * exit. */
+static int gw_node_wait(pid_t pid)
+{
+    int st = 0;
+    pid_t w;
+    do
+        w = waitpid(pid, &st, 0);
+    while (w < 0 && errno == EINTR);
+    if (w != pid || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
 /* Run: <node> fleet steer <verb> <arg>, where arg is the whole
  * "--input=<json>" argv string, already built and already within
  * GW_CAP_NODE_INPUT. Stdout (the node's own result envelope) is captured
@@ -596,37 +635,10 @@ static struct gw_node_out gw_node_exec(const char *node, const char *verb,
         _exit(127);
     }
     close(fds[1]);
-    for (;;) {
-        size_t room;
-        ssize_t r;
-        if (reply.len >= GW_CAP_REPLY)
-            break;
-        gw_buf_reserve(&reply, 4096u + 1u);
-        if (reply.oom) {
-            out.nomem = true;
-            break;
-        }
-        room = reply.cap - reply.len - 1u;
-        if (room > GW_CAP_REPLY - reply.len)
-            room = GW_CAP_REPLY - reply.len;
-        r = read(fds[0], reply.p + reply.len, room);
-        if (r <= 0)
-            break;
-        reply.len += (size_t)r;
-    }
+    out.nomem = !gw_node_read(fds[0], &reply);
     close(fds[0]);
-    {
-        int st = 0;
-        pid_t w;
-        do
-            w = waitpid(pid, &st, 0);
-        while (w < 0 && errno == EINTR);
-        /* Only this child's own status counts. After ECHILD (the child was
-         * reaped elsewhere, or SIGCHLD is ignored) st is whatever it was
-         * initialised to, and a zero there reads as a clean exit. */
-        out.ok = !out.nomem && w == pid && WIFEXITED(st) && reply.len > 0;
-        out.exit_code = out.ok ? WEXITSTATUS(st) : -1;
-    }
+    out.exit_code = gw_node_wait(pid);
+    out.ok = !out.nomem && out.exit_code >= 0 && reply.len > 0;
     if (!out.ok) {
         gw_buf_free(&reply);
         return out;
@@ -894,6 +906,17 @@ static const char *gw_raw_str_end(const char *p, const char *end)
     return p < end ? p + 1 : end;
 }
 
+/* The byte json_read decodes one escape letter to: the control letters by
+ * table, a \u escape as '?' (json_read keeps no code points), anything else
+ * as itself. */
+static char gw_raw_unescape(char e)
+{
+    static const char from[] = "bfnrtu";
+    static const char to[] = {8, 12, 10, 13, 9, '?'};
+    const char *hit = e ? strchr(from, e) : NULL;
+    return hit ? to[hit - from] : e;
+}
+
 /* The string at p decodes, under json_read's rules, to exactly want. */
 static bool gw_raw_str_is(const char *p, const char *end, const char *want)
 {
@@ -902,21 +925,9 @@ static bool gw_raw_str_is(const char *p, const char *end, const char *want)
         char c = *p;
         if (c == '\\' && end - p > 1) {
             p++;
-            c = *p;
-            if (c == 'b')
-                c = '\b';
-            else if (c == 'f')
-                c = '\f';
-            else if (c == 'n')
-                c = '\n';
-            else if (c == 'r')
-                c = '\r';
-            else if (c == 't')
-                c = '\t';
-            else if (c == 'u') {
-                c = '?';
+            c = gw_raw_unescape(*p);
+            if (*p == 'u')
                 p += end - p > 4 ? 4 : end - p - 1;
-            }
         }
         if (*want == '\0' || *want != c)
             return false;
@@ -924,6 +935,14 @@ static bool gw_raw_str_is(const char *p, const char *end, const char *want)
         p++;
     }
     return *want == '\0';
+}
+
+/* One past a bare scalar (number or literal) starting at p. */
+static const char *gw_raw_scalar_end(const char *p, const char *end)
+{
+    while (p < end && !strchr(",}] \t\n\r", *p))
+        p++;
+    return p;
 }
 
 /* One past the value starting at p (the body is already json_valid). */
@@ -942,12 +961,8 @@ static const char *gw_raw_skip(const char *p, const char *end)
             depth++;
         else if (*p == '}' || *p == ']')
             depth--;
-        else if (depth == 0) {
-            while (p < end && *p != ',' && *p != '}' && *p != ']' &&
-                   *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
-                p++;
-            return p;
-        }
+        else if (depth == 0)
+            return gw_raw_scalar_end(p, end);
         p++;
     } while (depth > 0);
     return p;
@@ -1240,6 +1255,24 @@ static void gw_reply_tool_call(struct gw_buf *b, const struct json_value *id,
     gw_buf_free(&arg);
 }
 
+/* Everything decided before a tree exists, none of it allocating: malformed
+ * (json_valid, so it never depends on the heap; a body it accepts is JSON
+ * whatever json_read later says) and oversize. True when a reply was
+ * written; *plan is loaded otherwise. */
+static bool gw_rpc_pretree(struct gw_buf *b, const char *body, size_t len,
+                           struct gw_call_plan *plan, const char *bearer,
+                           bool bearer_bad)
+{
+    if (!body || !json_valid(body, len)) {
+        gw_buf_str(b, "{\"jsonrpc\":\"2.0\",\"id\":null,"
+                      "\"error\":{\"code\":-32700,"
+                      "\"message\":\"parse error\"}}");
+        return true;
+    }
+    gw_call_scan(body, len, plan);
+    return gw_refuse_oversize(b, plan, bearer, bearer_bad);
+}
+
 static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
                             const char *node, const char *bearer,
                             bool bearer_bad, bool *challenge)
@@ -1250,16 +1283,7 @@ static void gw_dispatch_rpc(struct gw_buf *b, const char *body,
     const struct json_value *id, *params;
     struct gw_call_plan plan;
     size_t len = body ? strlen(body) : 0;
-    /* Malformed is decided without allocating, so it never depends on the
-     * heap; a body json_valid accepts is JSON whatever json_read says. */
-    if (!body || !json_valid(body, len)) {
-        gw_buf_str(b, "{\"jsonrpc\":\"2.0\",\"id\":null,"
-                      "\"error\":{\"code\":-32700,"
-                      "\"message\":\"parse error\"}}");
-        return;
-    }
-    gw_call_scan(body, len, &plan);
-    if (gw_refuse_oversize(b, &plan, bearer, bearer_bad))
+    if (gw_rpc_pretree(b, body, len, &plan, bearer, bearer_bad))
         return;
     json_init(&req);
     if (!json_read(&req, body, len)) {
@@ -2316,10 +2340,36 @@ static bool gw_peer_is_loopback(int fd)
     return false;
 }
 
+/* Read one request into h, answering the failure itself: 500 when the
+ * gateway could not hold the headers or the body, 400 when the request was
+ * bad. True when h is ready to serve. */
+static bool gw_serve_read(int fd, struct gw_http *h)
+{
+    char *hbuf = zcl_malloc(GW_CAP_HEADERS, "fleet-gateway/headers");
+    bool ok;
+    if (!hbuf) {
+        gw_reply(fd, 500, "application/json", "{\"error\":\"no memory\"}",
+                 20);
+        return false;
+    }
+    ok = gw_http_read(fd, h, hbuf);
+    free(hbuf);
+    if (ok)
+        return true;
+    free(h->body);
+    h->body = NULL;
+    if (h->nomem)
+        gw_reply(fd, 500, "application/json", "{\"error\":\"no memory\"}",
+                 20);
+    else
+        gw_reply(fd, 400, "application/json",
+                 "{\"error\":\"bad request\"}", 22);
+    return false;
+}
+
 static void gw_serve(int fd, const struct gw_config *cfg)
 {
     struct gw_http h;
-    char *hbuf;
     struct gw_buf body;
     memset(&h, 0, sizeof(h));
     if (!gw_peer_is_loopback(fd)) {
@@ -2327,25 +2377,8 @@ static void gw_serve(int fd, const struct gw_config *cfg)
                  24);
         return;
     }
-    hbuf = zcl_malloc(GW_CAP_HEADERS, "fleet-gateway/headers");
-    if (!hbuf) {
-        gw_reply(fd, 500, "application/json", "{\"error\":\"no memory\"}",
-                 20);
+    if (!gw_serve_read(fd, &h))
         return;
-    }
-    if (!gw_http_read(fd, &h, hbuf)) {
-        free(hbuf);
-        free(h.body);
-        if (h.nomem) {
-            gw_reply(fd, 500, "application/json",
-                     "{\"error\":\"no memory\"}", 20);
-            return;
-        }
-        gw_reply(fd, 400, "application/json", "{\"error\":\"bad request\"}",
-                 22);
-        return;
-    }
-    free(hbuf);
     memset(&body, 0, sizeof(body));
     if (strcmp(h.method, "GET") == 0 && strcmp(h.path, "/healthz") == 0) {
         gw_buf_str(&body, "{\"ok\":true}");

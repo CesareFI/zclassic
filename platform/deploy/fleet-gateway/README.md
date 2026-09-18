@@ -94,7 +94,7 @@ content; reconnect the connector to sign in again.
 The front binds a HIGH loopback port and needs no capability. Public 443 is
 mapped onto it by `zcl-portfwd`, the single binary that already carries
 `cap_net_bind_service` (`docs/BLOCK_EXPLORER_HOSTING.md`), so putting the
-MCP surface on the apex adds no new privilege anywhere. The node site keeps
+steering surface on the apex adds no new privilege anywhere. The node site keeps
 binding 8443 exactly as before and is now reached THROUGH the front.
 Deployment is an explicit owner act and stays one:
 
