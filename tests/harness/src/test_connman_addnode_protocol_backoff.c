@@ -19,6 +19,41 @@
 #include <unistd.h>
 #include "test/test_connman_addnode_fallback_priv.h"
 
+int check_connman_addnode_clock_rollback_retry(void)
+{
+    int failures = 0;
+    printf("connman_addnode_fallback: clock rollback does not strand "
+           "operator addnode... ");
+    {
+        chain_params_select(CHAIN_MAIN);
+        const struct chain_params *params = chain_params_get();
+        struct connman cm;
+        struct node_signals sigs;
+        memset(&sigs, 0, sizeof(sigs));
+        bool ok = connman_init(&cm, params, &sigs);
+
+        test_set_ipv4(&cm.addnodes[0], 203, 0, 113, 44, 8033);
+        cm.num_addnodes = 1;
+        cm.addnode_backoff_sec[0] = 1800;
+        cm.addnode_last_attempt[0] =
+            (int64_t)platform_time_wall_time_t() + 3600;
+
+        struct addr_info pick;
+        enum connman_outbound_target_source source = CONNMAN_TARGET_NONE;
+        size_t addnode_index = SIZE_MAX;
+        memset(&pick, 0, sizeof(pick));
+        ok = ok && connman_pick_next_outbound_target(
+                       &cm, &cm.next_addnode_cursor, &pick, &source,
+                       &addnode_index) &&
+             source == CONNMAN_TARGET_ADDNODE && addnode_index == 0 &&
+             pick.addr.svc.port == 8033;
+
+        connman_free(&cm);
+        if (ok) printf("OK\n");
+        else { printf("FAIL\n"); failures++; }
+    }
+    return failures;
+}
 
 int check_connman_addnode_prehandshake_protocol_backoff(void)
 {
@@ -683,4 +718,3 @@ int check_connman_addnode_reactor_passes_default(void)
     }
     return failures;
 }
-

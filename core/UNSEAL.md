@@ -212,3 +212,15 @@ later lane flips it HARD.
 - 2026-09-18T22:07:29Z — REASON: Reject rollback-aged compact block transaction responses so timeout recovery cannot accept stale peer state
   old ROOT: 5ed0d8fe936e1b80ce90de5b499a9aa5bc888c3ce42f9846b0cf39330ef4555b
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T22:38:23Z — REASON: Fail open operator addnode retry cooldown after backward wall-clock step; peer recovery policy only, no consensus or validation semantics change
+  old ROOT: 31ad12c36805890fcda85f2915b9825484bda7db1490f9e5c5146cdc8e798404
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T22:53:37Z — REASON: Refactor the authorized addnode rollback cooldown predicate under the cyclomatic-complexity ratchet; behavior unchanged
+  old ROOT: cdba42013891a4f47c47f224f1968bc8520d117d25ac38b56ba87c90d9cd39ec
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T22:54:44Z — REASON: Move the authorized addnode rollback helper out of shrink-only connman.c; behavior unchanged
+  old ROOT: 2387ebd1362820a1ae0483b21546b27bdfc5aeb4d4526ffc180d4d12fd4c4250
+  by: owner unseal ritual (make core-unseal)

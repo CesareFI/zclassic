@@ -40,6 +40,7 @@ int check_connman_addnode_loopback_edges_distinct(void);
 int check_connman_addnode_custom_port_onion_redial(void);
 int check_connman_addnode_zcl23_backoff_ownership(void);
 int check_connman_addnode_addnodes_drain_before_addrman(void);
+int check_connman_addnode_clock_rollback_retry(void);
 int check_connman_addnode_remove_compacts_state(void);
 int check_connman_addnode_outbound_health_diversity(void);
 int check_connman_addnode_non_network_not_floor(void);

@@ -832,4 +832,3 @@ int check_connman_addnode_inbound_ephemeral_not_block(void)
     }
     return failures;
 }
-

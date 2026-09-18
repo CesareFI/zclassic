@@ -86,6 +86,7 @@ int test_connman_addnode_fallback(void)
     failures += check_connman_addnode_custom_port_onion_redial();
     failures += check_connman_addnode_zcl23_backoff_ownership();
     failures += check_connman_addnode_addnodes_drain_before_addrman();
+    failures += check_connman_addnode_clock_rollback_retry();
     failures += check_connman_addnode_remove_compacts_state();
     failures += check_connman_addnode_outbound_health_diversity();
     failures += check_connman_addnode_non_network_not_floor();

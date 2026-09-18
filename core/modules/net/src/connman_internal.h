@@ -96,6 +96,14 @@ bool connman_addr_is_connected(struct connman *cm,
 /* Shared failure-aware addrman policy. Discovered ZCL23 endpoints must pass
  * this same durable cooldown/diversity gate instead of owning a retry loop. */
 int connman_addrman_retry_cooldown_for_attempts(int attempts);
+static inline bool connman_addnode_cooldown_active(int64_t now,
+                                                    int64_t last_attempt,
+                                                    int cooldown)
+{
+    if (last_attempt > now)
+        return false;
+    return now - last_attempt < cooldown;
+}
 bool connman_addrman_candidate_usable(struct connman *cm,
                                       const struct addr_info *info);
 
