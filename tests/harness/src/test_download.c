@@ -5,6 +5,7 @@
 #include "test/test_core.h"
 #include "services/gap_fill_service.h"
 #include "net/download.h"
+#include "../../../core/modules/net/src/download_qset.h"
 #include "sync/sync_state.h"
 #include "core/uint256.h"
 #include "util/supervisor.h"
@@ -357,13 +358,13 @@ static int test_dl_received_pending_survives_rehash(void)
 
         /* Fill to the 50% growth threshold. The next request rehashes the
          * table while `received` is still inside its staging grace window. */
-        for (size_t i = 0; i < dm.num_slots / 2; i++) {
+        size_t old_slots = dm.num_slots;
+        for (size_t i = 0; i < old_slots / 2 - 1; i++) {
             struct uint256 h = make_hash((uint8_t)(i + 1));
             h.data[1] = (uint8_t)(i >> 8);
             h.data[2] = 1;
             ASSERT(dl_mark_requested(&dm, &h, 1000 + (int32_t)i, 2));
         }
-        size_t old_slots = dm.num_slots;
         struct uint256 trigger = make_hash(202);
         trigger.data[2] = 2;
         ASSERT(dl_mark_requested(&dm, &trigger, 3000, 2));
@@ -379,6 +380,42 @@ static int test_dl_received_pending_survives_rehash(void)
         PASS();
     } _test_next:;
     test_dl_force_sync_idle();
+    return failures;
+}
+
+static int test_dl_received_pending_survives_colliding_insert(void)
+{
+    int failures = 0;
+    TEST("received-pending dedup survives a colliding request insert") {
+        struct download_manager dm;
+        dl_init(&dm);
+
+        struct uint256 received = make_hash(203);
+        int32_t received_height = 901;
+        ASSERT(dl_mark_requested(&dm, &received, received_height, 1));
+        ASSERT(dl_mark_received(&dm, &received) == 1);
+        ASSERT(dm.num_received_pending == 1);
+
+        struct uint256 collision = make_hash(204);
+        size_t received_slot = dl_hash_slot(&received, dm.num_slots - 1);
+        uint32_t nonce = 1;
+        while (dl_hash_slot(&collision, dm.num_slots - 1) != received_slot &&
+               nonce < 1000000) {
+            collision.data[3] = (uint8_t)nonce;
+            collision.data[4] = (uint8_t)(nonce >> 8);
+            collision.data[5] = (uint8_t)(nonce >> 16);
+            nonce++;
+        }
+        ASSERT(dl_hash_slot(&collision, dm.num_slots - 1) == received_slot);
+
+        ASSERT(dl_mark_requested(&dm, &collision, 902, 2));
+        ASSERT(dm.num_received_pending == 1);
+        ASSERT(dl_queue_blocks(&dm, &received, &received_height, 1) == 0);
+        ASSERT(dm.total_requeue_suppressed_pending == 1);
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
     return failures;
 }
 
@@ -2079,6 +2116,7 @@ int test_download(void)
     failures += test_dl_queue_dedup();
     failures += test_dl_received_pending_staging();
     failures += test_dl_received_pending_survives_rehash();
+    failures += test_dl_received_pending_survives_colliding_insert();
     failures += test_dl_assign_to_peer();
     failures += test_dl_assignment_generation_parking();
     failures += test_dl_assignment_parking_is_per_peer();

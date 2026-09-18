@@ -160,3 +160,11 @@ later lane flips it HARD.
 - 2026-09-18T14:39:03Z — REASON: Preserve fresh received-pending block-download tombstones across scheduler table rehash; duplicate-request avoidance only, no consensus or validation semantics change
   old ROOT: c3090fae6b449bd80dc449c365caa0d452a626402d0deb8c8a77c66f6eafcdf7
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T14:46:03Z — REASON: Preserve fresh received-pending block-download dedup guards across colliding scheduler inserts and size the non-consensus in-flight table from occupied entries; no validation semantics change
+  old ROOT: ca171143339632e133b67beff708675e0eefcb5d4bc9f9bd3ba4971ac0e8c27d
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T14:54:33Z — REASON: Refactor received-pending slot activation after complexity gate feedback; behavior unchanged from the authorized scheduler fix
+  old ROOT: db077704a65881601c8d8164ed4ee5f247daa7fc0c560ad38792ac53d58bf14b
+  by: owner unseal ritual (make core-unseal)

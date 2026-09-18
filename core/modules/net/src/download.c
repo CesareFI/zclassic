@@ -422,6 +422,13 @@ static struct dl_peer_stats *dl_find_peer(struct download_manager *dm,
  * received-pending tombstone — callers apply their own active/tombstone
  * policy (see dl_slot_blocks_requeue). With find_empty, returns the first
  * reusable slot when no slot carries the hash. */
+static bool dl_slot_received_pending(const struct dl_in_flight *slot,
+                                     int64_t now)
+{
+    return !slot->active && slot->received_time != 0 &&
+           now - slot->received_time < DL_RECEIVED_PENDING_SECS;
+}
+
 static struct dl_in_flight *find_slot(struct download_manager *dm,
                                        const struct uint256 *hash,
                                        bool find_empty)
@@ -430,11 +437,13 @@ static struct dl_in_flight *find_slot(struct download_manager *dm,
     size_t mask = dm->num_slots - 1;
     size_t idx = dl_hash_slot(hash, mask);
     struct dl_in_flight *first_empty = NULL;
+    int64_t now = find_empty ? (int64_t)platform_time_wall_time_t() : 0;
 
     for (size_t i = 0; i < dm->num_slots; i++) {
         struct dl_in_flight *s = &dm->slots[(idx + i) & mask];
         if (!s->active) {
-            if (!first_empty) first_empty = s;
+            if (!first_empty && !dl_slot_received_pending(s, now))
+                first_empty = s;
             /* Check if this slot was NEVER used (zero hash = virgin) */
             if (uint256_is_null(&s->hash))
                 break; /* end of probe chain */
@@ -479,6 +488,7 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
 
     size_t new_mask = new_size - 1;
     int64_t now = (int64_t)platform_time_wall_time_t();
+    size_t received_pending_count = 0;
     for (size_t i = 0; i < dm->num_slots; i++) {
         const struct dl_in_flight *old = &dm->slots[i];
         bool received_pending = !old->active && old->received_time != 0 &&
@@ -493,6 +503,8 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
              * later active hash collides during rehash. */
             if (uint256_is_null(&s->hash)) {
                 *s = dm->slots[i];
+                if (!old->active)
+                    received_pending_count++;
                 break;
             }
         }
@@ -500,6 +512,7 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
     free(dm->slots);
     dm->slots = new_slots;
     dm->num_slots = new_size;
+    dm->num_received_pending = received_pending_count;
 }
 
 /* Grow or compact hash table.
@@ -508,13 +521,35 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
  * and total insertions have left many dead gaps. */
 static void maybe_grow(struct download_manager *dm)
 {
-    if (dm->num_active * 2 >= dm->num_slots) {
+    size_t occupied = dm->num_active + dm->num_received_pending;
+    if (occupied * 2 >= dm->num_slots) {
         dl_rehash(dm, dm->num_slots * 2);
     } else if (dm->num_slots > INITIAL_SLOTS &&
-               dm->num_active * 4 < dm->num_slots) {
+               occupied * 4 < dm->num_slots) {
         /* Compact: rehash at same size to eliminate dead gaps */
         dl_rehash(dm, dm->num_slots);
     }
+}
+
+/* Activate a reusable slot without discarding the occupancy accounting for
+ * an expired received-pending guard. Caller holds dm->cs. */
+static void dl_activate_slot(struct download_manager *dm,
+                             struct dl_in_flight *slot,
+                             const struct uint256 *hash, int32_t height,
+                             uint32_t peer_id, int64_t request_time,
+                             enum dl_work_class work_class)
+{
+    if (slot->received_time != 0)
+        dm->num_received_pending--;
+    slot->hash = *hash;
+    slot->height = height;
+    slot->peer_id = peer_id;
+    slot->request_time = request_time;
+    slot->received_time = 0;
+    slot->work_class = work_class;
+    slot->active = true;
+    dm->num_active++;
+    dm->total_requested++;
 }
 
 bool dl_is_in_flight(struct download_manager *dm, const struct uint256 *hash)
@@ -579,15 +614,8 @@ bool dl_mark_requested(struct download_manager *dm,
                  dm->num_active, dm->num_slots);
     }
 
-    slot->hash = *hash;
-    slot->height = height;
-    slot->peer_id = peer_id;
-    slot->request_time = (int64_t)platform_time_wall_time_t();
-    slot->received_time = 0; /* activation clears any stale tombstone */
-    slot->work_class = DL_WORK_FORWARD;
-    slot->active = true;
-    dm->num_active++;
-    dm->total_requested++;
+    dl_activate_slot(dm, slot, hash, height, peer_id,
+                     (int64_t)platform_time_wall_time_t(), DL_WORK_FORWARD);
 
     /* Update peer stats */
     {
@@ -621,6 +649,7 @@ uint32_t dl_mark_received(struct download_manager *dm,
      * observable yet, so queue/request producers must keep dedup'ing this
      * hash (bounded by DL_RECEIVED_PENDING_SECS, fail-open). */
     s->received_time = (int64_t)platform_time_wall_time_t();
+    dm->num_received_pending++;
     dm->num_active--;
     dm->total_received++;
     dl_generation_advance(&dm->capacity_generation);
@@ -1391,16 +1420,8 @@ size_t dl_assign_to_peer(struct download_manager *dm,
                 struct dl_in_flight *slot = find_slot(dm, &hash, true);
                 if (!slot)
                     continue;
-                slot->hash = hash;
-                slot->height = height;
-                slot->peer_id = peer_id;
-                slot->request_time = now;
-                slot->received_time = 0; /* activation clears any stale
-                                          * tombstone */
-                slot->work_class = work_class;
-                slot->active = true;
-                dm->num_active++;
-                dm->total_requested++;
+                dl_activate_slot(dm, slot, &hash, height, peer_id, now,
+                                 work_class);
                 out_hashes[assigned++] = hash;
                 if (work_class == DL_WORK_HISTORY)
                     history_assigned++;
@@ -1450,16 +1471,8 @@ size_t dl_assign_to_peer(struct download_manager *dm,
             struct dl_in_flight *slot = find_slot(dm, &hash, true);
             if (!slot) continue;
 
-            slot->hash = hash;
-            slot->height = height;
-            slot->peer_id = peer_id;
-            slot->request_time = now;
-            slot->received_time = 0; /* activation clears any stale
-                                      * tombstone */
-            slot->work_class = work_class;
-            slot->active = true;
-            dm->num_active++;
-            dm->total_requested++;
+            dl_activate_slot(dm, slot, &hash, height, peer_id, now,
+                             work_class);
 
             out_hashes[assigned++] = hash;
             if (work_class == DL_WORK_HISTORY)
