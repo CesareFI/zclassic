@@ -1597,6 +1597,87 @@ _test_next:;
 }
 #endif
 
+/* ── the node's exit status is observed, never assumed ───────────────────
+ *
+ * The listener ignores SIGCHLD so connection children reap themselves, and
+ * each connection child used to inherit that. With SIGCHLD ignored the
+ * kernel reaps the node child itself, waitpid fails with ECHILD, and the
+ * status it leaves behind is the zero it was initialised to — a clean exit.
+ * A node that printed a well-formed envelope and then FAILED was reported
+ * as a success. A fake node makes the two facts independent: the same
+ * envelope, exit 3 and exit 0. */
+static bool gw_fake_node(const char *path, int code)
+{
+    char text[256];
+    int n = snprintf(text, sizeof(text),
+                     "#!/bin/sh\n"
+                     "printf '%%s' '{\"ok\":true,\"data\":"
+                     "{\"fake\":\"child-status\"}}'\n"
+                     "exit %d\n",
+                     code);
+    if (n <= 0 || (size_t)n >= sizeof(text))
+        return false;
+    if (!gw_write_text(path, text))
+        return false;
+    return chmod(path, 0755) == 0;
+}
+
+/* One steer_brief through a gateway whose node is `node`; the suite's own
+ * gateway is parked and restored around it. */
+static char *gw_call_via(const char *bin, const char *node, int *st)
+{
+    pid_t saved_pid = g_gw_pid;
+    int saved_port = g_gw_port;
+    char *b = NULL;
+    *st = 0;
+    if (gw_spawn_as(bin, node, g_gw_state, 0))
+        b = gw_post_auth("/steer",
+                         "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":"
+                         "\"tools/call\",\"params\":{\"name\":"
+                         "\"steer_brief\",\"arguments\":{}}}",
+                         "00000000000000000000000000000000", st);
+    gw_stop();
+    g_gw_pid = saved_pid;
+    g_gw_port = saved_port;
+    return b;
+}
+
+static int gw_t_child_status(void)
+{
+    int failures = 0;
+    char *b = NULL;
+    TEST("gateway: a node that fails after answering is not a success") {
+        const char *bin = gw_bin("Z23_TEST_GATEWAY_BIN", GW_TEST_BIN_DEFAULT);
+        char dir[512], fake[600];
+        int st = 0;
+        test_make_tmpdir(dir, sizeof(dir), "fleet_gateway", "fake_node");
+        ASSERT(snprintf(fake, sizeof(fake), "%s/node", dir) > 0);
+
+        /* Control: the fake's envelope is well-formed and forwarded. */
+        ASSERT(gw_fake_node(fake, 0));
+        b = gw_call_via(bin, fake, &st);
+        ASSERT(b != NULL);
+        ASSERT_EQ(st, 200);
+        GW_ASSERT_BODY(b, "\"isError\":false");
+        GW_ASSERT_BODY(b, "child-status");
+        free(b);
+        b = NULL;
+
+        /* The same envelope, then a failing exit: the status decides. */
+        ASSERT(gw_fake_node(fake, 3));
+        b = gw_call_via(bin, fake, &st);
+        ASSERT(b != NULL);
+        ASSERT_EQ(st, 200);
+        GW_ASSERT_BODY(b, "\"code\":-32000");
+        GW_ASSERT_BODY(b, "node did not answer");
+        GW_ASSERT_BODY_NOT(b, "child-status");
+        PASS();
+    }
+_test_next:;
+    free(b);
+    return failures;
+}
+
 static int gw_t_life_send_ack(void)
 {
     int failures = 0;
@@ -2452,6 +2533,7 @@ int test_fleet_gateway(void)
 #if defined(__linux__)
     failures += gw_t_bound_pressure();
 #endif
+    failures += gw_t_child_status();
     failures += gw_t_auth();
     failures += gw_t_oauth();
     failures += gw_t_life_send_ack();

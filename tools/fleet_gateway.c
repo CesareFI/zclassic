@@ -545,6 +545,9 @@ struct gw_node_out {
     char *text;
     size_t len;
     bool ok;
+    /* The node's own exit code, valid when ok: 0, or non-zero with a
+     * typed ok:false refusal envelope. */
+    int exit_code;
     /* The gateway, not the node, ran out: a pipe, fork or reply buffer
      * could not be had. Reported as a resource failure, never as the
      * node's silence. */
@@ -614,9 +617,15 @@ static struct gw_node_out gw_node_exec(const char *node, const char *verb,
     close(fds[0]);
     {
         int st = 0;
-        waitpid(pid, &st, 0);
-        out.ok = !out.nomem && WIFEXITED(st) && WEXITSTATUS(st) == 0 &&
-                 reply.len > 0;
+        pid_t w;
+        do
+            w = waitpid(pid, &st, 0);
+        while (w < 0 && errno == EINTR);
+        /* Only this child's own status counts. After ECHILD (the child was
+         * reaped elsewhere, or SIGCHLD is ignored) st is whatever it was
+         * initialised to, and a zero there reads as a clean exit. */
+        out.ok = !out.nomem && w == pid && WIFEXITED(st) && reply.len > 0;
+        out.exit_code = out.ok ? WEXITSTATUS(st) : -1;
     }
     if (!out.ok) {
         gw_buf_free(&reply);
@@ -646,6 +655,12 @@ static struct gw_node_out gw_node_call(const char *node, const char *verb,
     }
     out = gw_node_exec(node, verb, arg.p);
     gw_buf_free(&arg);
+    if (out.ok && out.exit_code != 0) {
+        free(out.text);
+        out.text = NULL;
+        out.len = 0;
+        out.ok = false;
+    }
     return out;
 }
 
@@ -1144,10 +1159,18 @@ static void gw_forward_call(struct gw_buf *b, const struct json_value *id,
     /* The node's own data becomes the tool result content. A refused node
      * call (ok:false) is content, not a transport error: the caller sees
      * the exact typed refusal (the error object, never a bare null) and
-     * its evidence. */
+     * its evidence. The exit status must agree with the envelope: the CLI
+     * exits 0 for ok:true and non-zero (1 failed, 2 input refused) with a
+     * typed ok:false refusal. A failing exit claiming success is not an
+     * answer, whatever the bytes say; a signal never reaches here. */
     {
         const struct json_value *okv = json_get(&env, "ok");
         bool ok = okv && okv->type == JSON_BOOL && okv->val.b;
+        if (out.exit_code != 0 && ok) {
+            json_free(&env);
+            gw_rpc_error(b, id, -32000, "node did not answer");
+            return;
+        }
         data = json_get(&env, ok ? "data" : "error");
     }
     gw_buf_str(b, "{\"jsonrpc\":\"2.0\",\"id\":");
@@ -2448,6 +2471,11 @@ int main(int argc, char **argv)
         }
         if (pid == 0) {
             close(fd);
+            /* The listener ignores SIGCHLD so connection children reap
+             * themselves. A connection child must not inherit that: with it
+             * ignored, waitpid on the node child fails with ECHILD and the
+             * node's exit status is lost. */
+            signal(SIGCHLD, SIG_DFL);
             gw_serve(cfd, &cfg);
             close(cfd);
             _exit(0);
