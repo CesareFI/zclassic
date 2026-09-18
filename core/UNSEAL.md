@@ -176,3 +176,7 @@ later lane flips it HARD.
 - 2026-09-18T16:49:03Z — REASON: Fail open received-body download dedup guards after a backward wall-clock step; scheduler reliability only, no consensus or validation semantics change
   old ROOT: 45880d284e79329b13b2a456a5eb58e0995305903fdb0e2705c6167242284823
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T17:00:46Z — REASON: Fail open stale block-download requests after a backward wall-clock step; scheduler reliability only, no consensus or validation semantics change
+  old ROOT: 14fae82ed65487e2ebc868bd21607d43e99b4268ac2214760c0c66d4837c30a4
+  by: owner unseal ritual (make core-unseal)

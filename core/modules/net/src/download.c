@@ -710,12 +710,16 @@ size_t dl_check_timeouts(struct download_manager *dm, int64_t now)
         struct dl_in_flight *s = &dm->slots[i];
         if (!s->active) continue;
 
-        int64_t age = now - s->request_time;
-        if (age < dl_get_request_timeout_secs()) continue;
+        bool clock_rollback = now < s->request_time;
+        int64_t age = clock_rollback ? 0 : now - s->request_time;
+        if (!clock_rollback && age < dl_get_request_timeout_secs()) continue;
 
-        /* Timed out — move back to queue for reassignment */
+        /* Timed out — move back to queue for reassignment. A backward wall
+         * clock step also fails open: otherwise this slot can remain occupied
+         * until wall time catches up to its future-dated request timestamp. */
         event_emitf(EV_BLOCK_REQUESTED, s->peer_id,
-                    "TIMEOUT h=%d age=%llds", s->height, (long long)age);
+                    "TIMEOUT h=%d age=%llds clock_rollback=%s", s->height,
+                    (long long)age, clock_rollback ? "yes" : "no");
 
         struct dl_peer_stats *ps = dl_find_peer(dm, s->peer_id, false);
         if (ps) ps->blocks_timed_out++;
