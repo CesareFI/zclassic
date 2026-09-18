@@ -144,6 +144,129 @@ bool zcl_devagent_worker_no_executor(const struct wkr_job *job,
 bool zcl_devagent_worker_muse_executor(const struct wkr_job *job,
                                        struct wkr_result *res);
 
+/* ── one executor run: caps, confinement, outcome ─────────────────────────
+ * native_devagent_worker_run.c. The worker loop owns the queue, receipts
+ * and mail; this unit owns the one bounded executor run beneath it, so the
+ * POSIX fork backend and the Windows confined backend share ONE cap
+ * computation, ONE result record, ONE result parse, ONE gate, and ONE
+ * outcome mapping — a timeout, a crash, an ENOMEM or a failing executor
+ * therefore reaches the receipt through the same fields on every host.
+ *
+ * POSIX: fork, RLIMIT_CPU = cpu_s, RLIMIT_AS = memory_bytes, wall SIGKILL.
+ * Windows: the same image re-entered as a restricted low-integrity child
+ * in a kill-on-close job carrying memory_bytes (job-wide commit), cpu_s
+ * (job-wide user time) and WKR_ACTIVE_PROCESS_CAP; the parent keeps the
+ * wall clock and kills the whole job. The child image's own entry picks
+ * the executor (the production binary passes the Muse executor, as the
+ * leaf does); the drive's exec pointer is not carried across the
+ * process boundary. See docs/WINDOWS.md for what Windows does and does
+ * not enforce relative to POSIX. */
+
+#define WKR_ACTIVE_PROCESS_CAP 64u
+#define WKR_CHILD_FLAG "--z23-internal-agent-worker-child"
+#define WKR_JOB_FILE "executor_job.json"
+
+/* The caps one run is held to, derived once from the drive options. A
+ * zero field means "not capped" (POSIX keeps that meaning); Windows
+ * refuses to launch unless every field is nonzero. */
+struct wkr_caps {
+    unsigned long long memory_bytes; /* mem_mb MiB: RLIMIT_AS / job memory */
+    long long cpu_s;                 /* RLIMIT_CPU / job user time */
+    long long wall_s;                /* parent wall clock, both hosts */
+    unsigned active_processes;       /* Windows job only */
+};
+
+/* Fill caps from opts. True only when every cap is nonzero — the
+ * precondition for a Windows launch. */
+bool zcl_devagent_worker_caps(const struct wkr_drive_opts *opts,
+                              struct wkr_caps *caps);
+
+/* What the parent observed. status: 1 ran, 0 wall timeout (killed), -1
+ * launch/wait failure. signaled: the child died by signal (POSIX), by an
+ * exception or fast-fail exit, or by the job CPU cap (Windows). */
+struct wkr_spawn_out {
+    int status;
+    long long wall_ms;
+    bool signaled;
+};
+
+/* The receipt-facing mapping, shared by both backends. When gate is true
+ * the caller parses the result file and gates it; otherwise rc, terminal
+ * and note are the outcome and no receipt is written. */
+struct wkr_outcome {
+    long long rc;
+    const char *terminal;
+    const char *note;
+    bool gate;
+};
+
+void zcl_devagent_worker_outcome(const struct wkr_spawn_out *out,
+                                 bool terminating, struct wkr_outcome *o);
+
+/* Child side, both hosts: run exec on job, write executor_result.json
+ * under job->rundir, and return the process exit code (the executor rc
+ * clipped to 0..125; 125 no executor; 126 record failure). */
+int zcl_devagent_worker_child_record(const struct wkr_job *job,
+                                     wkr_executor_fn exec);
+
+/* Parse executor_result.json under rundir. False when absent/unusable. */
+bool zcl_devagent_worker_parse_result(const char *rundir,
+                                      struct wkr_result *res);
+
+/* The required gate. Writes the verdict and returns the receipt rc (0 only
+ * on pass). */
+long long zcl_devagent_worker_gate(const struct wkr_job *job,
+                                   const struct wkr_result *res,
+                                   char *verdict, size_t cap);
+
+/* Bounded small-file helpers the worker and its child share. */
+bool zcl_devagent_worker_read_file(const char *path, char *out, size_t cap);
+bool zcl_devagent_worker_write_atomic(const char *path, const char *text,
+                                      size_t len);
+bool zcl_devagent_worker_json_escape(const char *in, char *out, size_t cap);
+bool zcl_devagent_worker_file_exists(const char *path);
+
+/* The job handed across the Windows process boundary, as WKR_JOB_FILE in
+ * the run dir: every wkr_job field but rundir (the child takes that from
+ * its argv) plus the memory cap the child verifies its job against. */
+bool zcl_devagent_worker_job_store(const struct wkr_job *job,
+                                   unsigned long long memory_bytes);
+bool zcl_devagent_worker_job_load(const char *rundir, struct wkr_job *job,
+                                  unsigned long long *memory_bytes);
+
+/* The workspace a Muse brief names ("muse-workspace: <abs>" in the header
+ * block of job->task), admitted as a write root only when it is an
+ * absolute, existing directory with no ".." segment, is not a filesystem
+ * or drive root, and holds a ".git" entry (a checkout or worktree). False
+ * leaves out empty. */
+bool zcl_devagent_worker_task_workspace(const char *task, char *out,
+                                        size_t cap);
+
+/* The explicit child environment: a fixed allowlist of path/system
+ * variables copied from this process, plus TEMP and TMP pointed at the run
+ * dir. Nothing else crosses — no credential, token or key variable. Fills
+ * up to cap entries of storage[i] (each WKR_ENV_ENTRY_MAX bytes) and the
+ * NULL-terminated ptrs (cap + 1 slots). Returns the entry count, -1 on
+ * overflow. */
+#define WKR_ENV_ENTRY_MAX 4096u
+#define WKR_ENV_MAX 20u
+int zcl_devagent_worker_child_env(const char *rundir,
+                                  char storage[][WKR_ENV_ENTRY_MAX],
+                                  const char **ptrs, size_t cap);
+
+/* Windows backend: run job under the confinement described above and
+ * report exactly like the POSIX fork backend. terminating is the worker's
+ * shutdown flag, polled between wait slices. On a non-Windows host, or when
+ * the backend cannot arm, status is -1 and nothing ran. */
+struct wkr_spawn_out zcl_devagent_worker_spawn_confined(
+    const struct wkr_drive_opts *opts, const struct wkr_job *job,
+    const volatile int *terminating);
+
+/* Windows child entry (WKR_CHILD_FLAG <rundir>): load the job, refuse
+ * unless this process is confined, run exec, record. Returns the process
+ * exit code; a non-Windows host returns 2 without running anything. */
+int zcl_devagent_worker_child_main(const char *rundir, wkr_executor_fn exec);
+
 /* ── resident mail receiver ───────────────────────────────────────────────
  * The dev-only loop that turns a directive arriving in this box's agent
  * mail into a dev.agent.queue row and answers the sender under the same

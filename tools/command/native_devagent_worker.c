@@ -17,10 +17,14 @@
  * authority anywhere in this file. The model is never polled: the loop
  * waits on local queue files with bounded sleep/backoff between claims.
  *
- * ONE ACTIVE JOB PER WORKER. worker.lock (flock, non-blocking, held for
- * the whole drive) refuses a second concurrent drive on the same queue.
- * The executor runs in a forked child under RLIMIT_CPU/RLIMIT_AS with a
- * wall-clock watchdog; the parent never blocks past the job cap.
+ * ONE ACTIVE JOB PER WORKER. worker.lock (flock on POSIX, the platform's
+ * owner-private lock file on Windows; non-blocking, held for the whole
+ * drive) refuses a second concurrent drive on the same queue. On POSIX the
+ * executor runs in a forked child under RLIMIT_CPU/RLIMIT_AS; on Windows
+ * it runs in a restricted low-integrity child inside a kill-on-close Job
+ * Object carrying the same caps (native_devagent_worker_run.c). Either
+ * way a wall-clock watchdog kills it; the parent never blocks past the
+ * job cap, and no Windows run happens unless that backend arms.
  *
  * CLAIM BEFORE SUBMISSION. dev.agent.queue claim persists claim.json
  * (submitted:false) before this leaf ever sees the job; the leaf flips it
@@ -60,6 +64,8 @@
 #include "config/command_catalog.h"
 #include "json/json.h"
 #include "kernel/command_registry.h"
+#include "platform/confined_process.h"
+#include "platform/process_lock.h"
 #include "platform/state_root.h"
 #include "platform/time_compat.h"
 
@@ -81,7 +87,6 @@
 #endif
 
 #define WKR_LEAF "dev.agent.worker"
-#define WKR_RESULT_FILE "executor_result.json"
 #define WKR_CLAIM_FILE "claim.json"
 #define WKR_RECEIPT_FILE "receipt.json"
 #define WKR_RUNOUT_FILE "run.out"
@@ -200,104 +205,6 @@ static bool wkr_state_dir(char *out, size_t cap, const char *leaf)
     return true;
 }
 
-static bool wkr_read_file(const char *path, char *out, size_t cap)
-{
-    FILE *f;
-    size_t n;
-    if (!path || !out || cap == 0)
-        return false;
-    f = fopen(path, "rb");
-    if (!f)
-        return false;
-    n = fread(out, 1, cap - 1, f);
-    if (ferror(f)) {
-        (void)fclose(f);
-        return false;
-    }
-    if (!feof(f)) {
-        (void)fclose(f);
-        return false;
-    }
-    out[n] = '\0';
-    (void)fclose(f);
-    return true;
-}
-
-static bool wkr_file_exists(const char *path)
-{
-    struct stat st;
-    return path && stat(path, &st) == 0;
-}
-
-/* Atomic small write: temp in the same dir renamed over the target, so a
- * crash never leaves a half claim behind. */
-static bool wkr_write_atomic(const char *path, const char *text, size_t len)
-{
-    char tmp[4096 + 32];
-    FILE *f;
-    if (!path || !text)
-        return false;
-    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
-        return false;
-    f = fopen(tmp, "wb");
-    if (!f)
-        return false;
-    if (len > 0 && fwrite(text, 1, len, f) != len) {
-        (void)fclose(f);
-        (void)unlink(tmp);
-        return false;
-    }
-    if (fclose(f) != 0) {
-        (void)unlink(tmp);
-        return false;
-    }
-    if (rename(tmp, path) != 0) {
-        (void)unlink(tmp);
-        return false;
-    }
-    return true;
-}
-
-/* JSON string escape for the small files this leaf writes. */
-static bool wkr_escape(const char *in, char *out, size_t cap)
-{
-    size_t used = 0;
-    if (!in || !out || cap == 0)
-        return false;
-    for (; *in; in++) {
-        unsigned char c = (unsigned char)*in;
-        const char *rep = NULL;
-        char tmp[8];
-        if (c == '"')
-            rep = "\\\"";
-        else if (c == '\\')
-            rep = "\\\\";
-        else if (c == '\n')
-            rep = "\\n";
-        else if (c == '\t')
-            rep = "\\t";
-        else if (c < 0x20) {
-            (void)snprintf(tmp, sizeof(tmp), "\\u%04x", c);
-            rep = tmp;
-        }
-        if (rep) {
-            size_t n = strlen(rep);
-            if (used + n >= cap)
-                return false;
-            memcpy(out + used, rep, n);
-            used += n;
-        } else {
-            if (used + 1 >= cap)
-                return false;
-            out[used++] = (char)c;
-        }
-    }
-    if (used >= cap)
-        return false;
-    out[used] = '\0';
-    return true;
-}
-
 /* ── reap: settle whatever finished since the last pass ────────────────── */
 
 static void wkr_reap(void)
@@ -359,7 +266,7 @@ static void wkr_compose_task(const struct wkr_sub *sub, struct wkr_job *job)
     }
     if (!brief[0])
         return;
-    if (!wkr_read_file(brief, head, sizeof(head)))
+    if (!zcl_devagent_worker_read_file(brief, head, sizeof(head)))
         return;
     {
         size_t used = strlen(job->task);
@@ -427,7 +334,7 @@ static int wkr_claim_submitted(const char *rundir)
     if (snprintf(path, sizeof(path), "%s/%s", rundir, WKR_CLAIM_FILE) >=
         (int)sizeof(path))
         return -1;
-    if (!wkr_read_file(path, text, sizeof(text)))
+    if (!zcl_devagent_worker_read_file(path, text, sizeof(text)))
         return -1;
     p = strstr(text, "\"submitted\":");
     if (!p)
@@ -452,7 +359,7 @@ static bool wkr_set_submitted(const char *rundir)
     if (snprintf(path, sizeof(path), "%s/%s", rundir, WKR_CLAIM_FILE) >=
         (int)sizeof(path))
         return false;
-    if (!wkr_read_file(path, text, sizeof(text)))
+    if (!zcl_devagent_worker_read_file(path, text, sizeof(text)))
         return false;
     hit = strstr(text, "\"submitted\":false");
     if (!hit)
@@ -468,7 +375,7 @@ static bool wkr_set_submitted(const char *rundir)
         memcpy(out + pre, mid, strlen(mid));
         memcpy(out + pre + strlen(mid), hit + strlen("\"submitted\":false"),
                rest + 1);
-        return wkr_write_atomic(path, out, strlen(out));
+        return zcl_devagent_worker_write_atomic(path, out, strlen(out));
     }
 }
 
@@ -486,12 +393,12 @@ static bool wkr_row_is_orphan(const char *rundir)
     if (snprintf(path, sizeof(path), "%s/%s", rundir, WKR_RECEIPT_FILE) >=
         (int)sizeof(path))
         return false;
-    if (wkr_file_exists(path))
+    if (zcl_devagent_worker_file_exists(path))
         return false;
     if (snprintf(path, sizeof(path), "%s/%s", rundir, WKR_RUNOUT_FILE) >=
         (int)sizeof(path))
         return false;
-    return !wkr_file_exists(path);
+    return !zcl_devagent_worker_file_exists(path);
 }
 
 static long long wkr_row_attempt(const struct json_value *v)
@@ -598,31 +505,26 @@ static int wkr_adopt_job(const struct wkr_drive_opts *opts,
 }
 
 /* ── spawn: run the executor bounded ─────────────────────────────────────
- * The child takes RLIMIT_CPU/RLIMIT_AS, runs the wired executor, writes
- * executor_result.json, and exits. The parent watches the wall clock in
- * slices and kills past the cap. Outcomes: 1 ran (result file or not —
- * the caller parses), 0 timed out (killed), -1 launch/wait failure.
- * A crashed child is a ran-without-result: no receipt, reap records it
- * incomplete. SIGTERM in flight kills the child and crash-records. */
-
-struct wkr_spawn_out {
-    int status;          /* 1 ran, 0 timeout, -1 failed */
-    long long wall_ms;
-    bool signaled;
-};
+ * POSIX: the child takes RLIMIT_CPU/RLIMIT_AS from the shared caps, runs
+ * the wired executor, writes executor_result.json, and exits; the parent
+ * watches the wall clock in slices and kills past the cap. Windows: the
+ * confined backend in native_devagent_worker_run.c does the same under a
+ * restricted low-integrity token and a capped kill-on-close job. Both fill
+ * the same wkr_spawn_out, which zcl_devagent_worker_outcome maps: 1 ran
+ * (result file or not — the caller parses), 0 timed out (killed), -1
+ * launch/wait failure. A crashed child is a ran-without-result: no
+ * receipt, reap records it incomplete. SIGTERM in flight kills the child
+ * and crash-records. */
 
 #if defined(_WIN32)
+/* The executor that runs is the one this image's child entry wires (the
+ * production entry passes the Muse executor, as the leaf does). */
 static struct wkr_spawn_out wkr_spawn(const struct wkr_drive_opts *opts,
                                       const struct wkr_job *job,
                                       wkr_executor_fn exec)
 {
-    struct wkr_spawn_out out;
-    (void)opts;
-    (void)job;
     (void)exec;
-    memset(&out, 0, sizeof(out));
-    out.status = -1;
-    return out;
+    return zcl_devagent_worker_spawn_confined(opts, job, &g_wkr_term);
 }
 #else
 
@@ -630,39 +532,18 @@ static struct wkr_spawn_out wkr_spawn(const struct wkr_drive_opts *opts,
 static void wkr_child_run(const struct wkr_drive_opts *opts,
                           const struct wkr_job *job, wkr_executor_fn exec)
 {
-    struct wkr_result res;
+    struct wkr_caps caps;
     struct rlimit rl;
-    char path[4096 + 64], e_term[96], e_cand[512], e_ev[8192], line[12288];
-    int w;
-    if (opts->cpu_s > 0) {
-        rl.rlim_cur = rl.rlim_max = (rlim_t)opts->cpu_s;
+    (void)zcl_devagent_worker_caps(opts, &caps);
+    if (caps.cpu_s > 0) {
+        rl.rlim_cur = rl.rlim_max = (rlim_t)caps.cpu_s;
         (void)setrlimit(RLIMIT_CPU, &rl);
     }
-    if (opts->mem_mb > 0) {
-        rl.rlim_cur = rl.rlim_max =
-            (rlim_t)opts->mem_mb * 1024u * 1024u;
+    if (caps.memory_bytes > 0) {
+        rl.rlim_cur = rl.rlim_max = (rlim_t)caps.memory_bytes;
         (void)setrlimit(RLIMIT_AS, &rl);
     }
-    memset(&res, 0, sizeof(res));
-    if (!exec(job, &res))
-        _exit(125);
-    if (!wkr_escape(res.terminal, e_term, sizeof(e_term)) ||
-        !wkr_escape(res.candidate, e_cand, sizeof(e_cand)) ||
-        !wkr_escape(res.evidence, e_ev, sizeof(e_ev)))
-        _exit(126);
-    w = snprintf(line, sizeof(line),
-                 "{\"terminal\":\"%s\",\"rc\":%lld,\"candidate\":\"%s\","
-                 "\"evidence\":\"%s\",\"tokens_used\":%lld,\"wall_ms\":%lld}\n",
-                 e_term, res.rc, e_cand, e_ev, res.tokens_used,
-                 res.wall_ms);
-    if (w <= 0 || (size_t)w >= sizeof(line))
-        _exit(126);
-    if (snprintf(path, sizeof(path), "%s/%s", job->rundir,
-                 WKR_RESULT_FILE) >= (int)sizeof(path))
-        _exit(126);
-    if (!wkr_write_atomic(path, line, (size_t)w))
-        _exit(126);
-    _exit(res.rc >= 0 && res.rc <= 125 ? (int)res.rc : 125);
+    _exit(zcl_devagent_worker_child_record(job, exec));
 }
 
 /* Parent wait in slices: wall cap, SIGTERM, crash, and exit capture.
@@ -728,163 +609,6 @@ static struct wkr_spawn_out wkr_spawn(const struct wkr_drive_opts *opts,
 }
 #endif
 
-/* ── result parse ────────────────────────────────────────────────────────
- * True when executor_result.json carries a usable outcome. The executor's
- * own word is preserved verbatim (bounded charset); "completed" stays
- * "completed" here and the gate refuses to upgrade it. */
-
-static bool wkr_word_ok(const char *s)
-{
-    size_t i;
-    if (!s || !s[0] || strlen(s) > 24)
-        return false;
-    for (i = 0; s[i]; i++) {
-        char c = s[i];
-        if ((c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && c != '-' &&
-            c != '_')
-            return false;
-    }
-    return true;
-}
-
-/* Success-sounding executor words that are NOT the closed pass
- * vocabulary. The gate refuses to carry them into the receipt: only
- * pass/PASS gate to pass, everything else that sounds finished gates to
- * gate-refused so no reader mistakes it for completion. */
-static bool wkr_success_alias(const char *s)
-{
-    static const char *const aliases[] = {
-        "completed", "complete", "done", "finished", "success",
-        "succeeded", "successful", "ok",
-    };
-    size_t i;
-    if (!s)
-        return false;
-    for (i = 0; i < sizeof(aliases) / sizeof(aliases[0]); i++) {
-        if (strcmp(s, aliases[i]) == 0)
-            return true;
-    }
-    return false;
-}
-
-/* One raw string field copied out of the result text, unescaped. */
-static void wkr_result_field(const char *text, const char *key, char *out,
-                             size_t cap)
-{
-    char pat[64];
-    const char *p;
-    size_t n = 0;
-    if (!text || !key || !out || cap == 0)
-        return;
-    out[0] = '\0';
-    if (snprintf(pat, sizeof(pat), "\"%s\":\"", key) >= (int)sizeof(pat))
-        return;
-    p = strstr(text, pat);
-    if (!p)
-        return;
-    p += strlen(pat);
-    while (p[n] && p[n] != '"' && n + 1 < cap) {
-        out[n] = p[n];
-        n++;
-    }
-    out[n] = '\0';
-}
-
-static long long wkr_result_int(const char *text, const char *key,
-                                long long dflt)
-{
-    char pat[64];
-    const char *p;
-    if (!text || !key)
-        return dflt;
-    if (snprintf(pat, sizeof(pat), "\"%s\":", key) >= (int)sizeof(pat))
-        return dflt;
-    p = strstr(text, pat);
-    if (!p)
-        return dflt;
-    return strtoll(p + strlen(pat), NULL, 10);
-}
-
-static bool wkr_parse_result(const char *rundir, struct wkr_result *res)
-{
-    char path[4096 + 64], text[12288];
-    char word[32];
-    if (!rundir || !res)
-        return false;
-    if (snprintf(path, sizeof(path), "%s/%s", rundir, WKR_RESULT_FILE) >=
-        (int)sizeof(path))
-        return false;
-    if (!wkr_read_file(path, text, sizeof(text)))
-        return false;
-    memset(res, 0, sizeof(*res));
-    wkr_result_field(text, "terminal", word, sizeof(word));
-    if (!wkr_word_ok(word))
-        return false;
-    (void)snprintf(res->terminal, sizeof(res->terminal), "%s", word);
-    wkr_result_field(text, "candidate", res->candidate,
-                     sizeof(res->candidate));
-    wkr_result_field(text, "evidence", res->evidence,
-                     sizeof(res->evidence));
-    res->rc = wkr_result_int(text, "rc", -1);
-    res->tokens_used = wkr_result_int(text, "tokens_used", 0);
-    res->wall_ms = wkr_result_int(text, "wall_ms", 0);
-    return true;
-}
-
-/* ── gate: the required Z23 judgment ─────────────────────────────────────
- * "pass" is written only when every condition holds: the executor's own
- * word is already pass/PASS, rc is 0, a candidate is named AND present
- * under the run dir, evidence is present, and tokens fit the cap. A
- * model "completed" with rc 0 and a candidate still gates to
- * "gate-refused": only the gate plus the closed predicate reap success.
- * Returns the receipt rc (0 on pass, nonzero otherwise). */
-
-/* Every pass condition at once: the executor's own pass/PASS word, a
- * clean exit, a named candidate that exists under the run dir, evidence,
- * and tokens inside the cap. */
-static bool wkr_gate_ready(const struct wkr_job *job,
-                           const struct wkr_result *res)
-{
-    char candpath[4096 + 256];
-    bool word, clean, named, evidenced, budgeted;
-    if (!job || !res)
-        return false;
-    word = strcmp(res->terminal, "pass") == 0 ||
-           strcmp(res->terminal, "PASS") == 0;
-    clean = res->rc == 0;
-    named = res->candidate[0] != '\0';
-    evidenced = res->evidence[0] != '\0';
-    budgeted = res->tokens_used >= 0 && res->tokens_used <= job->token_cap;
-    if (!word || !clean || !named || !evidenced || !budgeted)
-        return false;
-    if (snprintf(candpath, sizeof(candpath), "%s/%s", job->rundir,
-                 res->candidate) >= (int)sizeof(candpath))
-        return false;
-    return wkr_file_exists(candpath);
-}
-
-static long long wkr_gate(const struct wkr_job *job,
-                          const struct wkr_result *res, char *verdict,
-                          size_t cap)
-{
-    bool word;
-    if (!job || !res || !verdict || cap == 0)
-        return 1;
-    if (wkr_gate_ready(job, res)) {
-        (void)snprintf(verdict, cap, "%s", res->terminal);
-        return 0;
-    }
-    word = strcmp(res->terminal, "pass") == 0 ||
-           strcmp(res->terminal, "PASS") == 0;
-    if (!wkr_word_ok(res->terminal) || res->terminal[0] == '\0')
-        (void)snprintf(verdict, cap, "%s", "failed");
-    else if (word || wkr_success_alias(res->terminal))
-        (void)snprintf(verdict, cap, "%s", "gate-refused");
-    else
-        (void)snprintf(verdict, cap, "%s", res->terminal);
-    return 1;
-}
-
 /* ── finish: run.out always, receipt only on a gated outcome ─────────────
  * run.out carries rc=N for the existing reap scan; receipt.json carries
  * the verdict reap judges. Crash/timeout/no-result write run.out alone,
@@ -903,7 +627,7 @@ static void wkr_write_runout(const struct wkr_job *job, long long rc,
     w = snprintf(text, sizeof(text), "rc=%lld\n%s\n", rc, note);
     if (w <= 0 || (size_t)w >= sizeof(text))
         return;
-    (void)wkr_write_atomic(path, text, (size_t)w);
+    (void)zcl_devagent_worker_write_atomic(path, text, (size_t)w);
 }
 
 static void wkr_write_receipt(const struct wkr_drive_opts *opts,
@@ -918,7 +642,7 @@ static void wkr_write_receipt(const struct wkr_drive_opts *opts,
     if (snprintf(path, sizeof(path), "%s/%s", job->rundir,
                  WKR_RECEIPT_FILE) >= (int)sizeof(path))
         return;
-    if (!wkr_escape(res->candidate, e_cand, sizeof(e_cand)))
+    if (!zcl_devagent_worker_json_escape(res->candidate, e_cand, sizeof(e_cand)))
         return;
     w = snprintf(text, sizeof(text),
                  "{\"verdict\":\"%s\",\"worker\":\"%.48s\","
@@ -930,7 +654,7 @@ static void wkr_write_receipt(const struct wkr_drive_opts *opts,
                  (long long)platform_time_wall_unix());
     if (w <= 0 || (size_t)w >= sizeof(text))
         return;
-    (void)wkr_write_atomic(path, text, (size_t)w);
+    (void)zcl_devagent_worker_write_atomic(path, text, (size_t)w);
 }
 
 /* ── result mail: the row the originating client sees ────────────────────
@@ -1023,8 +747,8 @@ static bool wkr_mail_post(const char *body, const char *ref,
     char ebody[8192], eref[192], input[9216];
     bool posted;
     (void)snprintf(code, cap, "%s", "encode-failed");
-    if (!wkr_escape(body, ebody, sizeof(ebody)) ||
-        !wkr_escape(ref, eref, sizeof(eref)))
+    if (!zcl_devagent_worker_json_escape(body, ebody, sizeof(ebody)) ||
+        !zcl_devagent_worker_json_escape(ref, eref, sizeof(eref)))
         return false;
     if (snprintf(input, sizeof(input),
                  "{\"action\":\"post\",\"to\":\"*\",\"kind\":\"result\","
@@ -1130,10 +854,10 @@ static long long wkr_run_fresh(const struct wkr_drive_opts *opts,
                                wkr_executor_fn exec)
 {
     struct wkr_spawn_out out;
+    struct wkr_outcome oc;
     struct wkr_result res;
     char verdict[32];
     long long rc;
-    bool have_res = false;
     if (!wkr_set_submitted(job->rundir)) {
         wkr_write_runout(job, 101, "claim-identity-unwritable");
         wkr_mail_result(opts, job, "claim-identity-unwritable", "",
@@ -1142,33 +866,21 @@ static long long wkr_run_fresh(const struct wkr_drive_opts *opts,
         return 1;
     }
     out = wkr_spawn(opts, job, exec);
-    if (out.status == 0) {
-        wkr_write_runout(job, 124, "executor-time-cap");
-        wkr_mail_result(opts, job, "timeout", "", "no-receipt", 124, 0,
-                        out.wall_ms, "executor-time-cap");
-        return 1;
+    zcl_devagent_worker_outcome(&out, g_wkr_term != 0, &oc);
+    if (oc.gate && !zcl_devagent_worker_parse_result(job->rundir, &res)) {
+        oc.gate = false;
+        oc.rc = 100;
+        oc.terminal = "no-result";
+        oc.note = "executor-no-result";
     }
-    if (out.status < 0) {
-        wkr_write_runout(job, 127, "executor-launch-failed");
-        wkr_mail_result(opts, job, "launch-failed", "", "no-receipt", 127,
-                        0, out.wall_ms, "executor-launch-failed");
-        return 1;
-    }
-    if (out.signaled || g_wkr_term) {
-        wkr_write_runout(job, 130, "executor-signaled");
-        wkr_mail_result(opts, job, "crashed", "", "no-receipt", 130, 0,
-                        out.wall_ms, "executor-signaled");
-        return 1;
-    }
-    have_res = wkr_parse_result(job->rundir, &res);
-    if (!have_res) {
-        wkr_write_runout(job, 100, "executor-no-result");
-        wkr_mail_result(opts, job, "no-result", "", "no-receipt", 100, 0,
-                        out.wall_ms, "executor-no-result");
+    if (!oc.gate) {
+        wkr_write_runout(job, oc.rc, oc.note);
+        wkr_mail_result(opts, job, oc.terminal, "", "no-receipt", oc.rc, 0,
+                        out.wall_ms, oc.note);
         return 1;
     }
     res.wall_ms = out.wall_ms;
-    rc = wkr_gate(job, &res, verdict, sizeof(verdict));
+    rc = zcl_devagent_worker_gate(job, &res, verdict, sizeof(verdict));
     wkr_write_runout(job, rc, res.evidence);
     wkr_write_receipt(opts, job, verdict, &res);
     wkr_mail_result(opts, job, res.terminal, res.candidate, verdict, rc,
@@ -1263,12 +975,52 @@ static long long wkr_drive_step(const struct wkr_drive_opts *opts,
 
 /* ── drive ─────────────────────────────────────────────────────────────── */
 
+/* worker.lock: one drive per queue, held for the whole drive. POSIX takes
+ * a non-blocking flock; Windows takes the platform's retained,
+ * owner-private, non-blocking lock file. Both release on process death. */
+struct wkr_lock {
+    int fd;
+#if defined(_WIN32)
+    struct platform_process_lock plock;
+#endif
+};
+
+static bool wkr_lock_take(struct wkr_lock *lk, const char *path)
+{
+    lk->fd = -1;
+#if defined(_WIN32)
+    platform_process_lock_init(&lk->plock);
+    return platform_process_lock_try_acquire(&lk->plock, path, true);
+#else
+    lk->fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (lk->fd < 0)
+        return false;
+    if (flock(lk->fd, LOCK_EX | LOCK_NB) != 0) {
+        (void)close(lk->fd);
+        lk->fd = -1;
+        return false;
+    }
+    return true;
+#endif
+}
+
+static void wkr_lock_drop(struct wkr_lock *lk)
+{
+#if defined(_WIN32)
+    platform_process_lock_release(&lk->plock);
+#else
+    (void)flock(lk->fd, LOCK_UN);
+    (void)close(lk->fd);
+    lk->fd = -1;
+#endif
+}
+
 long long zcl_devagent_worker_drive(const struct wkr_drive_opts *opts,
                                     wkr_executor_fn exec)
 {
     char queuedir[4096], lockpath[4096 + 32];
     void (*old_term)(int) = SIG_DFL;
-    int lockfd = -1;
+    struct wkr_lock lock;
     long long t0_s;
     long long jobs = 0, idle_streak = 0, wait_s;
     if (!opts || !exec)
@@ -1278,18 +1030,8 @@ long long zcl_devagent_worker_drive(const struct wkr_drive_opts *opts,
     if (snprintf(lockpath, sizeof(lockpath), "%s/%s", queuedir,
                  WKR_LOCK_FILE) >= (int)sizeof(lockpath))
         return -1;
-    lockfd = open(lockpath, O_CREAT | O_RDWR, 0600);
-    if (lockfd < 0)
+    if (!wkr_lock_take(&lock, lockpath))
         return -1;
-#if !defined(_WIN32)
-    if (flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
-        (void)close(lockfd);
-        return -1;
-    }
-#else
-    (void)close(lockfd);
-    return -1;
-#endif
     old_term = signal(SIGTERM, wkr_on_term);
     t0_s = platform_time_wall_unix();
     wait_s = opts->idle_start_s > 0 ? opts->idle_start_s : 1;
@@ -1313,10 +1055,7 @@ long long zcl_devagent_worker_drive(const struct wkr_drive_opts *opts,
             break;
     }
     (void)signal(SIGTERM, old_term);
-#if !defined(_WIN32)
-    (void)flock(lockfd, LOCK_UN);
-#endif
-    (void)close(lockfd);
+    wkr_lock_drop(&lock);
     return jobs;
 }
 
@@ -1351,42 +1090,25 @@ static const char *wkr_leaf_str(const struct zcl_command_request *req,
     return (v && v->type == JSON_STR) ? json_get_str(v) : "";
 }
 
-void zcl_native_handle_dev_agent_worker(
-    const struct zcl_command_request *request, struct zcl_command_reply *reply)
+/* Parse the run input into opts. NULL on success, else the refusal
+ * message (the evidence names the offending input). */
+static const char *wkr_leaf_opts(const struct zcl_command_request *request,
+                                 struct wkr_drive_opts *opts,
+                                 const char **evidence)
 {
-    struct wkr_drive_opts opts;
-    const char *action, *worker, *session, *model;
+    const char *worker, *session;
     char sess_default[56];
-    long long jobs;
-    if (!reply)
-        return;
-#if defined(_WIN32)
-    wkr_fail(reply, "WORKER_WINDOWS_UNAVAILABLE", "run",
-             "dev.agent.worker needs POSIX fork and rlimits",
-             "run the worker on a POSIX host");
-    return;
-#else
-    if (!request || !request->input) {
-        wkr_fail(reply, "BAD_INPUT", "run",
-                 "dev.agent.worker run needs a worker identity",
-                 "request.input was missing");
-        return;
-    }
-    action = wkr_leaf_str(request, "action");
-    if (strcmp(action, "run") != 0) {
-        wkr_fail(reply, "BAD_INPUT", "run",
-                 "action is exactly run",
-                 "input.action missing or unknown");
-        return;
-    }
+    *evidence = "request.input was missing";
+    if (!request || !request->input)
+        return "dev.agent.worker run needs a worker identity";
+    *evidence = "input.action missing or unknown";
+    if (strcmp(wkr_leaf_str(request, "action"), "run") != 0)
+        return "action is exactly run";
     worker = wkr_leaf_str(request, "worker");
-    if (!worker[0] || strlen(worker) > 48) {
-        wkr_fail(reply, "BAD_INPUT", "run",
-                 "worker names the resident worker, 1-48 characters",
-                 "input.worker missing or too long");
-        return;
-    }
-    memset(&opts, 0, sizeof(opts));
+    *evidence = "input.worker missing or too long";
+    if (!worker[0] || strlen(worker) > 48)
+        return "worker names the resident worker, 1-48 characters";
+    memset(opts, 0, sizeof(*opts));
     session = wkr_leaf_str(request, "session");
     if (!session[0]) {
         (void)snprintf(sess_default, sizeof(sess_default), "s%lld-%ld",
@@ -1394,24 +1116,63 @@ void zcl_native_handle_dev_agent_worker(
                        (long)getpid());
         session = sess_default;
     }
-    if (strlen(session) > (sizeof(opts.session) - 1)) {
-        wkr_fail(reply, "BAD_INPUT", "run",
-                 "session names this worker run, at most 55 characters",
-                 "input.session too long");
+    *evidence = "input.session too long";
+    if (strlen(session) > (sizeof(opts->session) - 1))
+        return "session names this worker run, at most 55 characters";
+    (void)snprintf(opts->worker, sizeof(opts->worker), "%s", worker);
+    (void)snprintf(opts->session, sizeof(opts->session), "%s", session);
+    (void)snprintf(opts->model, sizeof(opts->model), "%s",
+                   wkr_leaf_str(request, "model"));
+    opts->deadline_s = wkr_leaf_int(request, "deadline_s", 300, 1, 3600);
+    opts->idle_start_s = wkr_leaf_int(request, "idle_start_s", 1, 1, 30);
+    opts->idle_limit_s = wkr_leaf_int(request, "idle_limit_s", 60, 1, 600);
+    opts->max_jobs = wkr_leaf_int(request, "max_jobs", 0, 0, 1000);
+    opts->time_cap_s = wkr_leaf_int(request, "time_cap_s", 600, 1, 3600);
+    opts->cpu_s = wkr_leaf_int(request, "cpu_s", 600, 1, 3600);
+    opts->mem_mb = wkr_leaf_int(request, "mem_mb", 1024, 64, 8192);
+    opts->token_cap = wkr_leaf_int(request, "token_cap", 32000, 1, 1000000);
+    return NULL;
+}
+
+/* The run's confinement backend, or false with the refusal filled. POSIX
+ * forks under rlimits and is always available; Windows runs only when its
+ * confinement backend arms on this host, and otherwise names the missing
+ * capability — it never runs an executor unconfined. */
+static bool wkr_backend_armed(struct zcl_command_reply *reply)
+{
+#if defined(_WIN32)
+    enum platform_confine_missing m = platform_confined_probe();
+    char evidence[96];
+    if (m == PLATFORM_CONFINE_ARMED)
+        return true;
+    (void)snprintf(evidence, sizeof(evidence), "missing=%s",
+                   platform_confine_missing_name(m));
+    wkr_fail(reply, "WORKER_CONFINEMENT_UNAVAILABLE", "run",
+             "dev.agent.worker on Windows runs only inside its confinement "
+             "backend, which cannot arm on this host",
+             evidence);
+    return false;
+#else
+    (void)reply;
+    return true;
+#endif
+}
+
+void zcl_native_handle_dev_agent_worker(
+    const struct zcl_command_request *request, struct zcl_command_reply *reply)
+{
+    struct wkr_drive_opts opts;
+    const char *refusal, *evidence = "";
+    long long jobs;
+    if (!reply)
+        return;
+    refusal = wkr_leaf_opts(request, &opts, &evidence);
+    if (refusal) {
+        wkr_fail(reply, "BAD_INPUT", "run", refusal, evidence);
         return;
     }
-    model = wkr_leaf_str(request, "model");
-    (void)snprintf(opts.worker, sizeof(opts.worker), "%s", worker);
-    (void)snprintf(opts.session, sizeof(opts.session), "%s", session);
-    (void)snprintf(opts.model, sizeof(opts.model), "%s", model);
-    opts.deadline_s = wkr_leaf_int(request, "deadline_s", 300, 1, 3600);
-    opts.idle_start_s = wkr_leaf_int(request, "idle_start_s", 1, 1, 30);
-    opts.idle_limit_s = wkr_leaf_int(request, "idle_limit_s", 60, 1, 600);
-    opts.max_jobs = wkr_leaf_int(request, "max_jobs", 0, 0, 1000);
-    opts.time_cap_s = wkr_leaf_int(request, "time_cap_s", 600, 1, 3600);
-    opts.cpu_s = wkr_leaf_int(request, "cpu_s", 600, 1, 3600);
-    opts.mem_mb = wkr_leaf_int(request, "mem_mb", 1024, 64, 8192);
-    opts.token_cap = wkr_leaf_int(request, "token_cap", 32000, 1, 1000000);
+    if (!wkr_backend_armed(reply))
+        return;
     jobs = zcl_devagent_worker_drive(&opts,
                                      zcl_devagent_worker_muse_executor);
     if (jobs < 0) {
@@ -1427,5 +1188,4 @@ void zcl_native_handle_dev_agent_worker(
     (void)json_push_kv_str(&reply->data, "session", opts.session);
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
-#endif
 }

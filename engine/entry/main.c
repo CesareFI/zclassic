@@ -54,6 +54,7 @@
  * ships in every profile, not just dev builds: a released node that never
  * installed a checker would refuse every foreign row and post. */
 #include "dev/fleet_roles.h"
+#include "command/native_devagent.h" /* Windows confined worker child */
 #ifdef ZCL_DEV_BUILD
 #include "devloop.h"
 #endif
@@ -239,6 +240,15 @@ static bool main_dispatch_dev_ui_modes(int argc, char **argv, int *rc)
     }
     if (argc == 2 && strcmp(argv[1], "--ui-present-host") == 0) {
         *rc = ui_present_host_main();
+        return true;
+    }
+    /* dev.agent.worker's Windows confined executor child. Exact argv shape
+     * only, dispatched before argument parsing and node initialization.
+     * The entry runs nothing unless it observes its own job caps and
+     * low-integrity token; on a POSIX host it returns 2 without running. */
+    if (argc == 3 && strcmp(argv[1], WKR_CHILD_FLAG) == 0) {
+        *rc = zcl_devagent_worker_child_main(
+            argv[2], zcl_devagent_worker_muse_executor);
         return true;
     }
     return false;

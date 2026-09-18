@@ -5,6 +5,7 @@
 #endif
 #include "platform/process_lifecycle.h"
 #include "platform/os_proc.h"
+#include "process_lifecycle_internal.h"
 #include "base/safe_alloc.h"
 
 #include <errno.h>
@@ -259,6 +260,29 @@ bool platform_process_start_hidden(struct platform_process *process,
                                    const struct platform_process_options *options)
 {
     return process_start_hidden_with_stdout(process, options, NULL);
+}
+
+/* process_lifecycle_internal.h: the confined launch reuses these exact
+ * encoders so both launch paths quote and pass environments identically. */
+wchar_t *platform_process_windows_utf16(const char *text)
+{
+    wchar_t *wide = NULL;
+    return utf16(text, &wide) ? wide : NULL;
+}
+
+wchar_t *platform_process_windows_command_line(const char *const *argv)
+{
+    return command_line(argv);
+}
+
+wchar_t *platform_process_windows_environment(const char *const *env)
+{
+    return environment_block(env);
+}
+
+bool platform_process_windows_absolute(const wchar_t *path)
+{
+    return absolute_image(path);
 }
 
 bool platform_process_open_existing(struct platform_process *process,
