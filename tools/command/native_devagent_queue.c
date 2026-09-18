@@ -62,14 +62,6 @@
  * or CANCEL_RUNNING/CANCEL_NOT_FOUND. claim refuses CLAIM_COMPLETED when
  * the closed predicate already finished the name.
  *
- * USAGE. Every outcome (reap reply, outcomes.jsonl row, status) carries
- * tokens_used and wall_ms copied from the run's receipt.json ("tokens" or
- * "tokens_used", and "wall_ms"). A run with no receipt, or a receipt that
- * does not state the field, reports JSON null (-1 in the jsonl row) — never
- * 0, because an unrecorded cost is unknown, not free. Each running status
- * row names its claimant as `worker` from the run's claim.json, or null
- * when nothing claimed it through claim.
- *
  * PROCESS RULE. Spawn only through zcl_spawn_detached() from util/spawn.h.
  * popen(), system() and a shell command string are forbidden and gated.
  *
@@ -2114,11 +2106,14 @@ static bool dvq_rate_limited(const char *text)
     return false;
 }
 
-/* What one run cost, as its receipt states it. -1 is UNKNOWN (no receipt,
- * or a receipt that does not state the field), never zero: a run with no
- * receipt did not cost nothing, it cost an amount nobody recorded. The
- * worker's receipt names the field "tokens"; "tokens_used" is accepted
- * as the same fact so an executor-side spelling is never dropped. */
+/* USAGE CONTRACT. Every outcome (reap reply, outcomes.jsonl row, status)
+ * carries tokens_used and wall_ms copied from the run's receipt.json
+ * ("tokens" or "tokens_used", and "wall_ms"). A run with no receipt, or a
+ * receipt that does not state the field, reports JSON null (-1 in the
+ * jsonl row) — never 0: a run with no receipt did not cost nothing, it
+ * cost an amount nobody recorded. Each running status row names its
+ * claimant as `worker` from the run's claim.json, or null when nothing
+ * claimed it through claim. */
 struct dvq_usage {
     long long tokens;
     long long wall_ms;
