@@ -15,9 +15,13 @@ static C dependencies, and canonical GCC and Clang node builds are supported. Th
 binary is a native x86-64 PE named `build/bin/z23.exe`; its release audit
 allows only declared Windows system DLLs. Some optional package, snapshot, and
 agent operations still refuse where their Windows capability backend is not
-qualified. The agent adapter is deliberately unavailable because Windows
-confinement is not yet implemented. Never weaken those refusals to obtain a
-green build.
+qualified. The resident dev worker (`dev agent worker run`) runs its
+executor only inside the Windows confinement backend described under
+[Dev worker confinement backend](#dev-worker-confinement-backend). When
+that backend cannot be set up on a host, the worker refuses and names the
+missing capability. Agent operations that have no Windows backend yet,
+such as `dev agent queue next`, keep refusing. Never weaken those refusals
+to obtain a green build.
 
 The native code navigator can build and refresh `.codeindex/index.kv` on
 Windows. Publication stays beneath a retained private directory handle, writes
@@ -352,6 +356,89 @@ push. Do not disable `StrictHostKeyChecking`, embed a token in a remote URL, or
 commit credentials. Fetch current `origin/main`, integrate it, run the affected
 gates, push, and verify the exact remote SHA.
 
+## Dev worker confinement backend
+
+`z23 dev agent worker run` runs natively on Windows only inside the
+confinement backend in `platform/modules/platform/src/confined_process.c`,
+which the worker drives from `tools/command/native_devagent_worker_run.c`.
+At the start of every run the leaf checks that the backend can be set up.
+If it cannot, the leaf refuses with `WORKER_CONFINEMENT_UNAVAILABLE`, and
+the evidence names the missing capability: `missing=job-object`,
+`restricted-token`, `low-integrity`, `write-label`, or `handle-list`. It
+never falls back to an unconfined run.
+
+POSIX forks a child and sets `RLIMIT_CPU` and `RLIMIT_AS`. Windows has no
+fork, so the parent writes `executor_job.json` into the run directory and
+starts its own image again as
+`z23.exe --z23-internal-agent-worker-child <rundir>`. Each run gets the
+following:
+
+| Guarantee | How |
+| --- | --- |
+| Whole tree dies with the job | Kill-on-close Job Object. The parent kills the job on the wall cap, on worker shutdown, and after the child exits, so grandchildren never outlive the run. |
+| Memory cap equal to POSIX `mem_mb` | `JobMemoryLimit` = `mem_mb` MiB. A commit past it fails, which is the Windows ENOMEM. |
+| CPU cap equal to POSIX `cpu_s` | `PerJobUserTimeLimit` = `cpu_s`. The job terminates at the cap. |
+| Wall cap equal to POSIX `time_cap_s` | The parent polls in 25 ms slices and kills the whole job. |
+| Process cap | `ActiveProcessLimit` = 64 live processes, the child included. |
+| No privilege | `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE \| LUA_TOKEN)`. Administrators, Power Users, Account/Server/Print/Backup Operators and Network Configuration Operators become deny-only. |
+| Low integrity | The token is labeled `S-1-16-4096`, so no-write-up denies every medium-labeled object, which covers everything the user owns by default. |
+| Write scope | Only the run directory, plus the `muse-workspace:` checkout named in the brief (absolute path, holds `.git`, not a drive root, no `..`), get the inheritable low label `S:(ML;OICI;NW;;;LW)` for the run. When the run ends they are reset to medium through the whole tree, including any label the child set itself. |
+| No inherited handles | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` holds only `NUL`, used as stdin, stdout and stderr. |
+| Explicit environment | An allowlist of system and path variables (`SystemRoot`, `PATH`, `USERPROFILE`, `LOCALAPPDATA`, …) plus `TEMP`/`TMP` set to the run directory. No credential, token or key variable crosses. |
+| No UI reach | Job UI limits: desktop, clipboard, global atoms, USER handles, system parameters, exit-windows. |
+| Fail-closed child | The child runs nothing unless it can see its own job caps, low-integrity token, and disabled Administrators group. |
+
+The run ends in the same receipt fields and verdicts as on POSIX, because
+both backends share one outcome mapping. Wall timeout gives `rc=124
+executor-time-cap`. A crash gives `rc=130 executor-signaled`; on Windows a
+crash is an NTSTATUS exception or fast-fail exit, or the job CPU cap. Exit
+without a result gives `rc=100 executor-no-result`. A launch refusal gives
+`rc=127 executor-launch-failed`. A result the executor wrote is gated the
+same way, so `failed` stays `failed`. ENOMEM reaches the child as an
+allocation failure in both backends, so the verdict follows what the child
+does next.
+
+What this backend does not enforce, compared with POSIX:
+
+1. The memory cap counts committed memory summed over the whole job, not
+   each process's address space. Reserved but uncommitted address space and
+   mapped file views are not capped, while `RLIMIT_AS` counts both.
+2. The CPU cap counts user-mode time only, summed over the job. Kernel time
+   is not charged, while `RLIMIT_CPU` charges both.
+3. For the length of the run, any other low-integrity process of the same
+   user can also write the granted run directory and worktree. If the
+   release cannot relabel a root, the grant stays and
+   `confinement.txt` in the run directory records `confinement-release=failed`.
+4. Reads are not scoped, and neither is the network. The same is true of
+   the POSIX backend.
+5. The executor that runs is the one the child image's entry point wires,
+   which is the Muse executor in `z23.exe`. The drive's function pointer does
+   not cross the process boundary.
+6. A write root that contains a reparse point, or a path longer than
+   `MAX_PATH`, is refused before launch (`write-label`), never relabeled.
+7. The Muse executor requires a `/`-rooted `muse-workspace`. A native
+   `C:\` path is therefore still refused by the executor itself, inside the
+   confinement.
+8. Any existing `worker.lock` that is not owner-private, for example one
+   left by an older build, refuses the drive (`WORKER_BUSY`) until it is
+   removed.
+
+Native proof is the `devagent_worker_confine` program in the acceptance
+catalog. It covers write scope, the memory cap, the whole-tree wall kill,
+the CPU cap, the failed verdict, and the refusal to run unconfined. From
+UCRT64:
+
+```bash
+make build/tests/windows/devagent_worker_confine.exe && \
+  build/tests/windows/devagent_worker_confine.exe
+```
+
+Exit 77 is an honest refusal: Wine, or a named missing capability.
+`make windows-acceptance` runs the same program with the rest of the
+catalog. The platform-neutral half (caps, outcome mapping, job hand-off,
+write-root and environment selection, and refusal when unarmed) runs on
+Linux in `make t-fast ONLY=devagent_worker`.
+
 ## Linux-host syntax coverage of `_WIN32` code
 
 `gcc` and `clang` on a POSIX host never take the `_WIN32` branch, so a
@@ -390,8 +477,9 @@ The UCRT64 lane becomes a supported full-node lane only when all of these are
 observed, not merely compiled:
 
 1. GCC and Clang build the node in strict C23 mode from separate clean epochs.
-2. The agent adapter remains unavailable until a reviewed Windows confinement
-   backend exists.
+2. The dev worker's executor runs only inside the Windows confinement
+   backend, and `devagent_worker_confine` passes natively; every agent
+   operation without a Windows backend keeps its refusal.
 3. The native dependency audit admits only declared Windows system DLLs.
 4. Registered crypto, storage, network, wallet, and recovery groups pass.
 5. An isolated datadir reaches RPC-ready state and shuts down cleanly.
