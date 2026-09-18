@@ -221,6 +221,14 @@ struct muse_run_result {
     char scope_changed[MUSE_RUN_CHANGED_LIST_MAX];
     char scope_outside[MUSE_RUN_SCOPE_LIST_MAX];
     char reason[MUSE_RUN_REASON_MAX];
+    /* Whether the workspace was returned to `base` after the verdict and
+     * evidence were written (services/muse_run_restore.h). True only when
+     * the candidate artifact was verified as a durable copy of the change
+     * AND the workspace measured clean at base afterwards. False keeps
+     * the change in place, and the next run's pre-state refusal stays
+     * the fail-closed backstop. The reason says which, either way. */
+    bool workspace_restored;
+    char workspace_restore[MUSE_RUN_REASON_MAX];
 };
 
 /* Runs one task to a terminal verdict: restart pre-check, one bounded

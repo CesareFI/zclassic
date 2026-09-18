@@ -6,6 +6,7 @@
 
 #include "services/muse_run.h"
 #include "services/muse_run_audit.h"
+#include "services/muse_run_restore.h"
 #include "services/muse_session.h"
 #include "base/safe_alloc.h"
 #include "engine/engine_verdict.h"
@@ -310,148 +311,31 @@ static void mr_report_short(const struct muse_run_task *t,
 
 /* --- the candidate identity ---------------------------------------------- */
 
-/* Append "path hash" lines for every untracked path: the content half
- * of the change set that `git diff` never shows. */
-static void mr_fold_others(const char *workspace, char *acc, size_t acc_cap,
-    size_t *used)
-{
-    const char *argv[] = { "git", "-C", workspace, "ls-files", "--others",
-                           "--exclude-standard", NULL };
-    char *list = zcl_malloc(65536, "muse_run.others");
-    int rc;
-    if (!list) return;
-    list[0] = '\0';
-    rc = zcl_spawn_capture(argv, list, 65536, MR_GIT_TIMEOUT_MS);
-    if (rc != 0) {
-        free(list);
-        return;
-    }
-    for (char *line = strtok(list, "\n"); line;
-        line = strtok(NULL, "\n")) {
-        char h[128];
-        const char *path = line;
-        int w;
-        /* A path whose quoting will not read is not folded as a
-         * best-effort guess: the identity must name what was measured or
-         * name nothing, and the scope audit refuses the same row. */
-        if (!muse_dequote(line)) break;
-        w = snprintf(acc + *used, acc_cap - *used, "?? %s ",
-            path);
-        if (w <= 0 || (size_t)w >= acc_cap - *used) break;
-        *used += (size_t)w;
-        if (muse_git_line(h, sizeof(h), workspace, "hash-object", "--",
-                path)) {
-            w = snprintf(acc + *used, acc_cap - *used, "%s\n", h);
-        } else {
-            w = snprintf(acc + *used, acc_cap - *used, "missing\n");
-        }
-        if (w <= 0 || (size_t)w >= acc_cap - *used) break;
-        *used += (size_t)w;
-    }
-    free(list);
-}
-
-/* SHA-1 over the post-run change set: the tracked diff plus one
- * content hash per untracked path, hashed once more so the token is
- * fixed-width. Empty diffs hash deterministically; "none" only when
- * git itself fails. The fold passes through a rundir tempfile because
- * the capture helper is text-oriented. On success the fold is also
- * published as <rundir>/candidate-<hex>.diff (atomic): the named
- * artifact a gate checks for existence. file_out takes that filename
- * ("" when nothing is named). */
-/* Lays the fold down in a rundir tempfile, because the capture helper the
- * hash goes through is text-oriented. False when it could not be written. */
-static bool mr_fold_tempfile(const char *rundir, char *tmp, size_t tmpcap,
-    const char *acc, size_t used)
-{
-    FILE *f;
-    if (snprintf(tmp, tmpcap, "%s/.candidate.in", rundir) >= (int)tmpcap)
-        return false;
-    f = fopen(tmp, "wb");
-    if (!f) return false;
-    if (used > 0 && fwrite(acc, 1, used, f) != used) {
-        fclose(f);
-        (void)unlink(tmp);
-        return false;
-    }
-    fclose(f);
-    return true;
-}
-
-/* git hash-object over the fold tempfile, which is removed either way. The
- * 40-hex token lands in out; false on any git failure. */
-static bool mr_hash_fold(const char *tmp, char *out, size_t cap)
-{
-    const char *h_argv[] = { "git", "hash-object", tmp, NULL };
-    char *hbuf = zcl_malloc(128, "muse_run.hash");
-    bool ok = false;
-    int rc;
-    if (!hbuf) {
-        (void)unlink(tmp);
-        return false;
-    }
-    hbuf[0] = '\0';
-    rc = zcl_spawn_capture(h_argv, hbuf, 128, MR_GIT_TIMEOUT_MS);
-    (void)unlink(tmp);
-    if (rc == 0) {
-        hbuf[strcspn(hbuf, "\r\n")] = '\0';
-        if (muse_hex40(hbuf) && strlen(hbuf) < cap) {
-            (void)snprintf(out, cap, "%s", hbuf);
-            ok = true;
-        }
-    }
-    free(hbuf);
-    return ok;
-}
-
-/* Publishes the fold as the named artifact. */
-static void mr_publish_candidate(const char *rundir, const char *h,
-    const char *acc, char *file_out, size_t file_cap)
-{
-    char art[8192], fname[192];
-    if (snprintf(fname, sizeof(fname), "candidate-%s.diff",
-            h) < (int)sizeof(fname) &&
-        snprintf(art, sizeof(art), "%s/%s", rundir,
-            fname) < (int)sizeof(art) &&
-        strlen(fname) < file_cap &&
-        mr_write_atomic(art, acc)) {
-        (void)snprintf(file_out, file_cap, "%s", fname);
-    }
-}
-
+/* SHA-1 over the post-run change set (services/muse_run_restore.h): the
+ * tracked diff plus one content hash per untracked path, hashed once more
+ * so the token is fixed-width. Empty diffs hash deterministically; "none"
+ * only when git itself fails. On success the fold is also published as
+ * <rundir>/candidate-<hex>.diff (atomic): the named artifact a gate checks
+ * for existence, and the durable copy the workspace restore verifies
+ * before it undoes anything. file_out takes that filename ("" when
+ * nothing is named). */
 static void mr_candidate(const char *workspace, const char *rundir,
     char *out, size_t cap, char *file_out, size_t file_cap)
 {
-    const char *diff_argv[] = { "git", "-C", workspace, "diff", "HEAD",
-                                "--", NULL };
-    char *acc = zcl_malloc(MR_GATE_LOG_MAX, "muse_run.candidate");
-    char tmp[8192];
-    size_t used = 0;
-    int rc;
-    (void)snprintf(out, cap, "none");
-    if (!acc) return;
-    acc[0] = '\0';
-    rc = zcl_spawn_capture(diff_argv, acc, MR_GATE_LOG_MAX,
-        MR_GIT_TIMEOUT_MS);
-    if (rc != 0) {
-        free(acc);
-        return;
-    }
-    used = strlen(acc);
-    if (used + 2 < MR_GATE_LOG_MAX) {
-        acc[used++] = '\n';
-        acc[used] = '\0';
-    }
-    mr_fold_others(workspace, acc, MR_GATE_LOG_MAX, &used);
-    if (used < MR_GATE_LOG_MAX) acc[used] = '\0';
+    char art[8192], fname[192];
+    char *fold = NULL;
     if (file_out && file_cap > 0) file_out[0] = '\0';
-    if (!mr_fold_tempfile(rundir, tmp, sizeof(tmp), acc, used)) {
-        free(acc);
-        return;
+    if (!muse_candidate_fold(workspace, rundir, out, cap, &fold)) return;
+    if (file_out && file_cap > 0 &&
+        snprintf(fname, sizeof(fname), "candidate-%s.diff",
+            out) < (int)sizeof(fname) &&
+        snprintf(art, sizeof(art), "%s/%s", rundir,
+            fname) < (int)sizeof(art) &&
+        strlen(fname) < file_cap &&
+        mr_write_atomic(art, fold)) {
+        (void)snprintf(file_out, file_cap, "%s", fname);
     }
-    if (mr_hash_fold(tmp, out, cap) && file_out && file_cap > 0)
-        mr_publish_candidate(rundir, out, acc, file_out, file_cap);
-    free(acc);
+    free(fold);
 }
 
 /* --- the gate's own process ------------------------------------------------
@@ -624,10 +508,12 @@ static void mr_write_receipt(const struct muse_run_task *t,
     (void)snprintf(body, sizeof(body),
         "{\"verdict\":\"%s\",\"seq\":%lld,\"name\":\"%s\",\"attempt\":%lld,"
         "\"group\":\"%s\",\"turn\":\"%s\",\"reason\":\"%s\","
-        "\"engine\":\"%s\",\"tokens\":%llu,\"files_changed\":%lld}",
+        "\"engine\":\"%s\",\"tokens\":%llu,\"files_changed\":%lld,"
+        "\"workspace_restored\":%s}",
         r->verdict, t->ref.seq, t->ref.name, t->ref.attempt, t->gate,
         r->terminal, esc_reason, esc_engine,
-        r->total_tokens, r->files_changed);
+        r->total_tokens, r->files_changed,
+        r->workspace_restored ? "true" : "false");
     (void)mr_write_atomic(path, body);
 }
 
@@ -638,8 +524,10 @@ static void mr_write_facts(const struct muse_run_task *t,
     char *body = zcl_malloc(65536, "muse_run.facts");
     char esc_reason[1024], esc_engine[128], esc_verdict[2048];
     char esc_model[512], esc_gate[512], esc_spawn[192];
+    char esc_restore[512];
     if (!body) return;
     muse_json_escape(r->gate_spawn, esc_spawn, sizeof(esc_spawn));
+    muse_json_escape(r->workspace_restore, esc_restore, sizeof(esc_restore));
     muse_json_escape(r->reason, esc_reason, sizeof(esc_reason));
     muse_json_escape(r->engine, esc_engine, sizeof(esc_engine));
     muse_json_escape(r->gate_verdict, esc_verdict, sizeof(esc_verdict));
@@ -670,7 +558,8 @@ static void mr_write_facts(const struct muse_run_task *t,
         "\"pre_count\":%lld,\"pre\":[%s],\"changed_measured\":%s,"
         "\"changed_count\":%lld,\"changed\":[%s],"
         "\"outside_count\":%lld,\"outside\":[%s]},"
-        "\"prior_unresolved\":%s}",
+        "\"prior_unresolved\":%s,"
+        "\"workspace\":{\"restored\":%s,\"reason\":\"%s\"}}",
         t->ref.seq, t->ref.name, t->ref.attempt,
         t->worker, esc_gate, t->scope,
         t->model, esc_model,
@@ -693,7 +582,8 @@ static void mr_write_facts(const struct muse_run_task *t,
         r->scope_changed_measured ? "true" : "false",
         r->scope_changed_count, r->scope_changed,
         r->scope_outside_count, r->scope_outside,
-        r->prior_unresolved ? "true" : "false");
+        r->prior_unresolved ? "true" : "false",
+        r->workspace_restored ? "true" : "false", esc_restore);
     (void)mr_write_atomic(path, body);
     free(body);
 }
@@ -1033,6 +923,27 @@ static int mr_judge(struct mr_core *c, char *gate_log, size_t logcap,
     return 1;
 }
 
+/* AFTER the verdict and evidence are durable: return the workspace to the
+ * pinned base so the next claimed task on it is not refused for this
+ * run's own dirt. muse_restore_workspace touches nothing unless the
+ * published artifact verifies as a durable copy of exactly the change it
+ * would undo; a refusal leaves the change in place and says why. The
+ * host is already closed, so no turn can write underneath the restore. */
+static void mr_restore(const struct muse_run_task *t,
+    struct muse_run_result *r)
+{
+    struct muse_restore_in in;
+    memset(&in, 0, sizeof(in));
+    in.workspace = t->workspace;
+    in.rundir = t->rundir;
+    in.base = r->base;
+    in.candidate = r->candidate;
+    in.candidate_file = r->candidate_file;
+    in.pre_clean = r->scope_pre_measured && r->scope_pre_clean;
+    r->workspace_restored = muse_restore_workspace(&in,
+        r->workspace_restore, sizeof(r->workspace_restore));
+}
+
 /* The receipt, evidence and report every exit path shares. */
 static void mr_report(struct mr_core *c, struct muse_session *s,
     const char *engine_name, int rc)
@@ -1042,12 +953,22 @@ static void mr_report(struct mr_core *c, struct muse_session *s,
     (void)snprintf(r->engine, sizeof(r->engine), "%s",
         engine_name);
     r->rc = rc;
+    r->workspace_restored = false;
+    (void)snprintf(r->workspace_restore, sizeof(r->workspace_restore),
+        "not attempted yet: evidence first");
     mr_candidate(t->workspace, t->rundir, r->candidate,
         sizeof(r->candidate), r->candidate_file,
         sizeof(r->candidate_file));
     /* The claim-holding caller's receipt is canonical: never lay ours
      * beside it. Evidence (muse.json, candidate artifact, admission)
-     * is still written. */
+     * is still written — once before the restore, so the verdict is
+     * durable whatever the restore does, and once after, with its
+     * outcome. */
+    if (!t->caller_holds_claim)
+        mr_write_receipt(t, r);
+    mr_write_facts(t, r);
+    if (s) muse_session_close(s);
+    mr_restore(t, r);
     if (!t->caller_holds_claim)
         mr_write_receipt(t, r);
     mr_write_facts(t, r);
@@ -1056,7 +977,6 @@ static void mr_report(struct mr_core *c, struct muse_session *s,
         (unsigned long long)r->total_tokens, r->files_changed,
         r->wall_ms);
     printf("rc=%d\n", rc);
-    if (s) muse_session_close(s);
 }
 
 static int mr_finish(struct mr_core *c, struct muse_session *s,

@@ -321,6 +321,7 @@ static void mx_evidence(struct wkr_result *res,
         "ref=%lld/%s/%lld\nworker=%s\nverdict=%s\nterminal=%s\n"
         "tokens=%llu\nfiles=%lld\nbase=%.12s\ncandidate=%s\ngate=%s\n"
         "gate_evidence=%s\nmodel=%s\nsession=%s\nturn=%s\nwall_ms=%lld\n"
+        "workspace_restored=%s\nworkspace_restore=%.160s\n"
         "reason=%s\n",
         mres->ref.seq, mres->ref.name, mres->ref.attempt,
         mres->worker[0] ? mres->worker : "-",
@@ -335,6 +336,8 @@ static void mx_evidence(struct wkr_result *res,
         mres->session[0] ? mres->session : "-",
         mres->turn[0] ? mres->turn : "-",
         mres->wall_ms,
+        mres->workspace_restored ? "true" : "false",
+        mres->workspace_restore[0] ? mres->workspace_restore : "-",
         mres->reason[0] ? mres->reason : (err[0] ? err : "-"));
     if (w > 0)
         (void)snprintf(res->evidence, sizeof(res->evidence), "%s",
