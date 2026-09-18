@@ -121,9 +121,11 @@
 #include "kernel/command_registry.h"
 #include "platform/clock.h"
 #include "platform/directory_compat.h"
+#include "platform/os_proc.h"
 #include "platform/private_directory.h"
 #include "platform/state_root.h"
 #include "platform/time_compat.h"
+#include "services/disk_monitor.h"
 #include "sha3/sha3.h"
 #include "util/log_macros.h"
 
@@ -138,6 +140,9 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#if !defined(_WIN32)
+#include <sys/file.h>
+#endif
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -161,6 +166,21 @@
 #define FMC_LINE_CAP 8192
 #define FMC_INPUT_CAP 65536
 #define FMC_GRANT_TTL_MAX (30LL * 24 * 60 * 60)
+
+/* Worker roster: at most FMC_WORKER_TRACK distinct identities are tracked
+ * per brief and FMC_WORKER_CAP are emitted, newest first; the rest are
+ * counted in workers_total. Evidence newer than FMC_ALIVE_WINDOW_S counts
+ * as alive; a directive this host sent that is still queued with no
+ * receiver evidence after FMC_QUEUED_STALE_S becomes a blocker. The reply
+ * data is held under FMC_REPLY_SOFT_BUDGET so the leaf's 64 KiB response
+ * budget (envelope included) can never refuse the whole brief. */
+#define FMC_WORKER_CAP 16u
+#define FMC_WORKER_TRACK 64u
+#define FMC_DONE_TRACK 256u
+#define FMC_DIRECTIVE_SCAN 64
+#define FMC_ALIVE_WINDOW_S 900LL
+#define FMC_QUEUED_STALE_S 120LL
+#define FMC_REPLY_SOFT_BUDGET 49152u
 
 /* ── failure (every error return logs context) ─────────────────────────── */
 
@@ -1003,12 +1023,14 @@ static bool fmc_verdict_pass(const char *verdict, long long rc)
 struct fmc_mail_view {
     long long cursor;
     long long count;
+    bool ok;
 };
 
 /* One parsed mail row. String pointers borrow the sibling reply and are
  * valid until the sub call ends. */
 struct fmc_row {
     long long seq;
+    const char *ts;
     const char *from;
     const char *to;
     const char *kind;
@@ -1033,6 +1055,7 @@ static bool fmc_row_parse(const struct json_value *r, struct fmc_row *v)
     if (!s || s->type != JSON_INT)
         return false;
     v->seq = (long long)json_get_int(s);
+    v->ts = fmc_row_field(r, "ts");
     v->from = fmc_row_field(r, "from");
     v->to = fmc_row_field(r, "to");
     v->kind = fmc_row_field(r, "kind");
@@ -1107,16 +1130,721 @@ static const char *fmc_row_state(const struct fmc_row *v,
     return "queued";
 }
 
+/* ── brief: time and body fields ─────────────────────────────────────────
+ *
+ * Mail rows carry an RFC 3339 UTC `ts` ("YYYY-MM-DDTHH:MM:SSZ"), and
+ * receiver/worker answers carry flat `key=value` lines. Both are parsed
+ * here without libc timegm and without trusting a value's shape: anything
+ * that does not parse is UNKNOWN (-1 / false), never zero. */
+
+static long long fmc_days_from_civil(long long y, long long m, long long d)
+{
+    long long era, yoe, doy, doe;
+    y -= m <= 2 ? 1 : 0;
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = y - era * 400;
+    doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static bool fmc_digits(const char *s, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9')
+            return false;
+    }
+    return true;
+}
+
+static long long fmc_num(const char *s, size_t n)
+{
+    long long v = 0;
+    size_t i;
+    for (i = 0; i < n; i++)
+        v = v * 10 + (s[i] - '0');
+    return v;
+}
+
+/* True when ts has exactly the "YYYY-MM-DDTHH:MM:SSZ" shape. */
+static bool fmc_ts_shape_ok(const char *ts)
+{
+    static const char pat[] = "dddd-dd-ddTdd:dd:ddZ";
+    size_t i;
+    if (!ts || strlen(ts) != sizeof(pat) - 1)
+        return false;
+    for (i = 0; pat[i]; i++) {
+        bool ok = pat[i] == 'd' ? (ts[i] >= '0' && ts[i] <= '9')
+                                : ts[i] == pat[i];
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+/* Unix seconds of one "YYYY-MM-DDTHH:MM:SSZ" stamp, or -1. */
+static long long fmc_ts_unix(const char *ts)
+{
+    long long mo, d, h, mi, s;
+    if (!fmc_ts_shape_ok(ts))
+        return -1;
+    mo = fmc_num(ts + 5, 2);
+    d = fmc_num(ts + 8, 2);
+    h = fmc_num(ts + 11, 2);
+    mi = fmc_num(ts + 14, 2);
+    s = fmc_num(ts + 17, 2);
+    if (mo < 1 || mo > 12 || d < 1 || d > 31)
+        return -1;
+    if (h > 23 || mi > 59 || s > 59)
+        return -1;
+    return fmc_days_from_civil(fmc_num(ts, 4), mo, d) * 86400 + h * 3600 +
+           mi * 60 + s;
+}
+
+/* Seconds between a stamp and now, or -1 when the stamp does not parse.
+ * A stamp from the future (clock skew) reads as age 0, not negative. */
+static long long fmc_age_s(long long now, const char *ts)
+{
+    long long t = fmc_ts_unix(ts);
+    if (t < 0)
+        return -1;
+    return now > t ? now - t : 0;
+}
+
+/* The value of one `key=value` line in a body, bounded to cap. */
+static bool fmc_body_kv(const char *body, const char *key, char *out,
+                        size_t cap)
+{
+    size_t klen, n;
+    const char *p = body;
+    if (!body || !key || !out || cap == 0)
+        return false;
+    klen = strlen(key);
+    while (p && *p) {
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            n = strcspn(p + klen + 1, "\r\n");
+            if (n >= cap)
+                n = cap - 1;
+            memcpy(out, p + klen + 1, n);
+            out[n] = '\0';
+            return true;
+        }
+        p = strchr(p, '\n');
+        if (p)
+            p++;
+    }
+    return false;
+}
+
+/* A non-negative decimal `key=` value, or -1 when absent or malformed. */
+static long long fmc_body_int(const char *body, const char *key)
+{
+    char buf[24];
+    size_t n;
+    if (!fmc_body_kv(body, key, buf, sizeof(buf)))
+        return -1;
+    n = strlen(buf);
+    if (n == 0 || n > 18 || !fmc_digits(buf, n))
+        return -1;
+    return fmc_num(buf, n);
+}
+
+/* heartbeat_ts= as unix seconds or as an RFC 3339 UTC stamp; -1 when
+ * absent or neither. */
+static long long fmc_body_stamp(const char *body, const char *key)
+{
+    char buf[40];
+    size_t n;
+    if (!fmc_body_kv(body, key, buf, sizeof(buf)))
+        return -1;
+    n = strlen(buf);
+    if (n > 0 && n <= 18 && fmc_digits(buf, n))
+        return fmc_num(buf, n);
+    return fmc_ts_unix(buf);
+}
+
+/* ── brief: workers ──────────────────────────────────────────────────────
+ *
+ * A worker is an identity that has SPOKEN as one: a mail row whose body
+ * carries `receiver=` (the receiver's accept/refuse answer) or `worker=`
+ * (the resident worker's result row), or this host's own resident
+ * receiver/worker observed through the queue and its lock files. A name
+ * that only appears in from/to is a correspondent, not a worker, and stays
+ * in agents[]. Remote values are the worker's own words (self_reported);
+ * local resources are measured now. A process or a lock existing is
+ * liveness evidence only — "working" needs a running queue row or a
+ * claimed ref with no terminal outcome. */
+
+struct fmc_worker {
+    char name[FMC_NAME_MAX + 1];
+    char host[FMC_NAME_MAX + 1];
+    char ts[40];
+    char ref[FMC_REF_MAX + 1];
+    char state[24];
+    char stage[24];
+    char reason[96];
+    char ws_ts[40];
+    char ws_selector[FMC_NAME_MAX + 1];
+    char ws_head[72];
+    char tok_ts[40];
+    long long load1;
+    long long mem_kib;
+    long long disk_kib;
+    long long heartbeat;
+    long long tok_last;
+    long long tok_total;
+    bool local;
+};
+
+struct fmc_roster {
+    struct fmc_worker *w;
+    size_t n;
+    size_t untracked;
+    char (*done)[FMC_REF_MAX + 1];
+    size_t ndone;
+};
+
+static bool fmc_roster_init(struct fmc_roster *ro)
+{
+    memset(ro, 0, sizeof(*ro));
+    ro->w = (struct fmc_worker *)zcl_calloc(FMC_WORKER_TRACK, sizeof(*ro->w),
+                                            "fleet_steer.workers");
+    ro->done = (char (*)[FMC_REF_MAX + 1])zcl_calloc(
+        FMC_DONE_TRACK, FMC_REF_MAX + 1, "fleet_steer.done_refs");
+    return ro->w && ro->done;
+}
+
+static void fmc_roster_free(struct fmc_roster *ro)
+{
+    free(ro->w);
+    free(ro->done);
+    memset(ro, 0, sizeof(*ro));
+}
+
+/* A ref some worker posted a result under: its terminal outcome. */
+static void fmc_roster_done(struct fmc_roster *ro, const char *ref)
+{
+    size_t i;
+    if (!ro->done || !ref || !ref[0])
+        return;
+    for (i = 0; i < ro->ndone; i++) {
+        if (strcmp(ro->done[i], ref) == 0)
+            return;
+    }
+    if (ro->ndone < FMC_DONE_TRACK)
+        (void)snprintf(ro->done[ro->ndone++], FMC_REF_MAX + 1, "%s", ref);
+}
+
+static bool fmc_roster_is_done(const struct fmc_roster *ro, const char *ref)
+{
+    size_t i;
+    for (i = 0; ro->done && ref && ref[0] && i < ro->ndone; i++) {
+        if (strcmp(ro->done[i], ref) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* The entry for name, created fresh (every number unknown) when absent.
+ * NULL once FMC_WORKER_TRACK identities are held: the row is counted in
+ * `untracked`, and workers_total_exact turns false. */
+static struct fmc_worker *fmc_roster_entry(struct fmc_roster *ro,
+                                           const char *name)
+{
+    size_t i;
+    struct fmc_worker *e;
+    for (i = 0; ro->w && i < ro->n; i++) {
+        if (strcmp(ro->w[i].name, name) == 0)
+            return &ro->w[i];
+    }
+    if (!ro->w || ro->n >= FMC_WORKER_TRACK) {
+        ro->untracked++;
+        return NULL;
+    }
+    e = &ro->w[ro->n++];
+    memset(e, 0, sizeof(*e));
+    (void)snprintf(e->name, sizeof(e->name), "%s", name);
+    e->load1 = e->mem_kib = e->disk_kib = e->heartbeat = -1;
+    e->tok_last = e->tok_total = -1;
+    return e;
+}
+
+/* Workspace evidence from the newest row that states it. */
+static void fmc_worker_ws(struct fmc_worker *e, const struct fmc_row *v)
+{
+    char head[72], sel[FMC_NAME_MAX + 1];
+    if (!fmc_body_kv(v->body, "workspace_head", head, sizeof(head)))
+        return;
+    if (e->ws_ts[0] && strcmp(v->ts, e->ws_ts) <= 0)
+        return;
+    if (!fmc_body_kv(v->body, "workspace_selector", sel, sizeof(sel)))
+        sel[0] = '\0';
+    (void)snprintf(e->ws_head, sizeof(e->ws_head), "%s", head);
+    (void)snprintf(e->ws_selector, sizeof(e->ws_selector), "%s", sel);
+    (void)snprintf(e->ws_ts, sizeof(e->ws_ts), "%.39s", v->ts);
+}
+
+/* Token usage from one result row. A "no-receipt" row states tokens=0 as
+ * a placeholder (the run never produced a receipt), so it is not a known
+ * cost and is skipped rather than summed as zero. */
+static void fmc_worker_tokens(struct fmc_worker *e, const struct fmc_row *v)
+{
+    char gate[32];
+    long long t = fmc_body_int(v->body, "tokens");
+    if (t < 0)
+        return;
+    if (fmc_body_kv(v->body, "gate", gate, sizeof(gate)) &&
+        strcmp(gate, "no-receipt") == 0)
+        return;
+    e->tok_total = (e->tok_total < 0 ? 0 : e->tok_total) + t;
+    if (!e->tok_ts[0] || strcmp(v->ts, e->tok_ts) > 0) {
+        e->tok_last = t;
+        (void)snprintf(e->tok_ts, sizeof(e->tok_ts), "%.39s", v->ts);
+    }
+}
+
+/* The newest row this worker authored decides its current fields. */
+static void fmc_worker_newest(struct fmc_worker *e, const struct fmc_row *v)
+{
+    (void)snprintf(e->ts, sizeof(e->ts), "%.39s", v->ts);
+    (void)snprintf(e->ref, sizeof(e->ref), "%s", v->ref);
+    if (!fmc_body_kv(v->body, "state", e->state, sizeof(e->state)))
+        (void)snprintf(e->state, sizeof(e->state), "%s",
+                       strcmp(v->kind, "result") == 0 ? "result" : "");
+    if (!fmc_body_kv(v->body, "stage", e->stage, sizeof(e->stage)))
+        e->stage[0] = '\0';
+    if (!fmc_body_kv(v->body, "reason", e->reason, sizeof(e->reason)))
+        e->reason[0] = '\0';
+    if (!fmc_body_kv(v->body, "host", e->host, sizeof(e->host)))
+        e->host[0] = '\0';
+    e->load1 = fmc_body_int(v->body, "load1_centi");
+    e->mem_kib = fmc_body_int(v->body, "mem_avail_kib");
+    e->disk_kib = fmc_body_int(v->body, "disk_free_kib");
+    e->heartbeat = fmc_body_stamp(v->body, "heartbeat_ts");
+}
+
+/* Fold one pulled row into the roster. */
+static void fmc_roster_note(struct fmc_roster *ro, const struct fmc_row *v)
+{
+    char name[FMC_NAME_MAX + 2];
+    struct fmc_worker *e;
+    if (strcmp(v->kind, "result") == 0)
+        fmc_roster_done(ro, v->ref);
+    if (!fmc_body_kv(v->body, "receiver", name, sizeof(name)) &&
+        !fmc_body_kv(v->body, "worker", name, sizeof(name)))
+        return;
+    if (!fmc_is_token(name, 48, false))
+        return;
+    e = fmc_roster_entry(ro, name);
+    if (!e)
+        return;
+    fmc_worker_ws(e, v);
+    fmc_worker_tokens(e, v);
+    if (e->ts[0] && strcmp(v->ts, e->ts) <= 0)
+        return;
+    fmc_worker_newest(e, v);
+}
+
+/* What the queue sibling said, with `known` false whenever it did not
+ * answer: every number is then unknown, never an idle zero. */
+struct fmc_queue_view {
+    bool known;
+    char reason[48];
+    long long queued;
+    long long running;
+    long long pool_total;
+    long long pool_free;
+    char run_ref[FMC_REF_MAX + 1];
+    char run_worker[FMC_NAME_MAX + 1];
+    long long tok_last;
+    long long tok_total;
+    char outcome_ts[40];
+};
+
+/* This host's resident locks, probed without creating anything. "held"
+ * means some process holds it — liveness, never work. */
+static const char *fmc_lock_state(const char *sub, const char *file)
+{
+    char root[4096], path[4096 + 64];
+    const char *state = "unavailable";
+    int fd;
+    if (!platform_state_root(root, sizeof(root)) ||
+        snprintf(path, sizeof(path), "%s/%s/%s", root, sub, file) >=
+            (int)sizeof(path))
+        return "unknown";
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return "never-run";
+#if !defined(_WIN32)
+    state = flock(fd, LOCK_EX | LOCK_NB) == 0 ? "free" : "held";
+    if (strcmp(state, "free") == 0)
+        (void)flock(fd, LOCK_UN);
+#endif
+    (void)close(fd);
+    return state;
+}
+
+struct fmc_local {
+    const char *worker_lock;
+    const char *receive_lock;
+    bool mail_ok;
+};
+
+static bool fmc_lock_seen(const char *s)
+{
+    return strcmp(s, "held") == 0 || strcmp(s, "free") == 0;
+}
+
+static bool fmc_lock_held(const char *s)
+{
+    return strcmp(s, "held") == 0;
+}
+
+/* The local resident, when any local evidence exists: a queue row, or a
+ * receiver/worker lock file. Named after the claimant of the running row
+ * when there is one, else "local". Merges into a mail entry of the same
+ * name, so one identity is one entry. */
+static void fmc_roster_local(struct fmc_roster *ro,
+                             const struct fmc_queue_view *qv,
+                             const struct fmc_local *lo)
+{
+    struct fmc_worker *e;
+    bool rows = qv->known && (qv->queued > 0 || qv->running > 0);
+    if (!rows && !fmc_lock_seen(lo->worker_lock) &&
+        !fmc_lock_seen(lo->receive_lock))
+        return;
+    e = fmc_roster_entry(ro, qv->run_worker[0] ? qv->run_worker : "local");
+    if (e)
+        e->local = true;
+}
+
+/* Local state, per the rules in the file header. */
+static const char *fmc_local_state(const struct fmc_queue_view *qv,
+                                   const struct fmc_local *lo, char *why,
+                                   size_t cap)
+{
+    if (qv->known && qv->running > 0) {
+        (void)snprintf(why, cap, "queue row %s is running (claimant %s)",
+                       qv->run_ref, qv->run_worker[0] ? qv->run_worker
+                                                      : "not recorded");
+        return "working";
+    }
+    if (!lo->mail_ok && fmc_lock_held(lo->receive_lock)) {
+        (void)snprintf(why, cap, "%s",
+                       "local receiver intake failed: the dev.agent.mail "
+                       "pull it reads refused in this brief");
+        return "blocked";
+    }
+    if (qv->known && qv->queued > 0 && !fmc_lock_held(lo->worker_lock)) {
+        (void)snprintf(why, cap,
+                       "%lld queued row(s) and no resident worker holds "
+                       "worker.lock (%s) to claim them",
+                       qv->queued, lo->worker_lock);
+        return "blocked";
+    }
+    if (qv->known && qv->queued > 0) {
+        (void)snprintf(why, cap,
+                       "%lld queued row(s) not yet claimed; worker.lock held",
+                       qv->queued);
+        return "unknown";
+    }
+    if (!qv->known) {
+        (void)snprintf(why, cap, "queue status unavailable (%s)",
+                       qv->reason);
+        return "unknown";
+    }
+    if (fmc_lock_held(lo->worker_lock) || fmc_lock_held(lo->receive_lock)) {
+        (void)snprintf(why, cap, "%s",
+                       "a resident lock is held now; nothing queued or "
+                       "running");
+        return "idle";
+    }
+    (void)snprintf(why, cap, "%s",
+                   "no resident lock held and nothing running");
+    return "unknown";
+}
+
+static bool fmc_stage_claimed(const char *stage)
+{
+    return strcmp(stage, "running") == 0 || strcmp(stage, "engine") == 0;
+}
+
+/* Remote state from the worker's own newest words. */
+static const char *fmc_remote_state(const struct fmc_worker *e,
+                                    bool terminal, long long alive,
+                                    char *why, size_t cap)
+{
+    if (strcmp(e->state, "refused") == 0) {
+        (void)snprintf(why, cap, "newest answer refused ref %s: %s", e->ref,
+                       e->reason[0] ? e->reason : "no reason stated");
+        return "blocked";
+    }
+    if (!terminal && fmc_stage_claimed(e->stage)) {
+        (void)snprintf(why, cap,
+                       "claimed ref %s at stage %s; no terminal result yet",
+                       e->ref, e->stage);
+        return "working";
+    }
+    if (!terminal && strcmp(e->state, "accepted") == 0) {
+        (void)snprintf(why, cap,
+                       "ref %s accepted at stage %s; no claim or result "
+                       "evidence yet",
+                       e->ref, e->stage[0] ? e->stage : "unstated");
+        return "unknown";
+    }
+    if (alive >= 0 && alive <= FMC_ALIVE_WINDOW_S) {
+        (void)snprintf(why, cap,
+                       "last evidence %llds ago, within the %llds window; "
+                       "no open claim",
+                       alive, FMC_ALIVE_WINDOW_S);
+        return "idle";
+    }
+    if (alive < 0) {
+        (void)snprintf(why, cap, "%s",
+                       "newest row carries no parseable timestamp");
+        return "unknown";
+    }
+    (void)snprintf(why, cap, "last evidence %llds ago, older than the %llds "
+                   "window", alive, FMC_ALIVE_WINDOW_S);
+    return "unknown";
+}
+
+/* A string field, or JSON null when unknown. */
+static void fmc_put_str(struct json_value *o, const char *key, const char *s)
+{
+    struct json_value nv;
+    if (s && s[0]) {
+        (void)json_push_kv_str(o, key, s);
+        return;
+    }
+    json_init(&nv);
+    json_set_null(&nv);
+    (void)json_push_kv(o, key, &nv);
+    json_free(&nv);
+}
+
+/* A number field, or JSON null when unknown (-1). */
+static void fmc_put_int(struct json_value *o, const char *key, long long v)
+{
+    struct json_value nv;
+    if (v >= 0) {
+        (void)json_push_kv_int(o, key, v);
+        return;
+    }
+    json_init(&nv);
+    json_set_null(&nv);
+    (void)json_push_kv(o, key, &nv);
+    json_free(&nv);
+}
+
+/* Local resources, measured now through the platform seams. */
+static void fmc_local_resources(struct fmc_worker *e, char *why, size_t cap)
+{
+    char root[4096];
+    struct os_proc_mem mem;
+    int64_t disk = -1;
+    e->load1 = os_proc_load1_centi();
+    e->mem_kib = -1;
+    if (os_proc_mem_read(&mem) && mem.sys_avail_bytes >= 0)
+        e->mem_kib = mem.sys_avail_bytes / 1024;
+    if (platform_state_root(root, sizeof(root)))
+        disk = disk_monitor_free_bytes(root);
+    e->disk_kib = disk >= 0 ? disk / 1024 : -1;
+    (void)snprintf(why, cap, "%s",
+                   e->load1 >= 0 && e->mem_kib >= 0 && e->disk_kib >= 0
+                       ? "measured on this host now"
+                       : "measured on this host now; null = this host "
+                         "could not read it");
+}
+
+static void fmc_remote_resources(const struct fmc_worker *e, char *why,
+                                 size_t cap)
+{
+    bool any = e->load1 >= 0 || e->mem_kib >= 0 || e->disk_kib >= 0;
+    (void)snprintf(why, cap, "%s",
+                   any ? "self-reported in its newest answer; null = not "
+                         "reported"
+                       : "not reported");
+}
+
+struct fmc_emit_ctx {
+    long long now;
+    const struct fmc_roster *ro;
+    const struct json_value *outcomes;
+    const struct fmc_queue_view *qv;
+    const struct fmc_local *lo;
+};
+
+/* True when a retained queue outcome or a result row names ref. */
+static bool fmc_ref_terminal(const struct fmc_emit_ctx *c, const char *ref)
+{
+    size_t n, i;
+    if (!ref || !ref[0])
+        return false;
+    if (fmc_roster_is_done(c->ro, ref))
+        return true;
+    n = c->outcomes ? json_size(c->outcomes) : 0;
+    for (i = 0; i < n; i++) {
+        const struct json_value *r = json_at(c->outcomes, i);
+        if (strcmp(fmc_row_field(r, "name"), ref) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Alive age: the newest of the row stamp and a self-reported heartbeat. */
+static long long fmc_alive_age(const struct fmc_worker *e, long long now)
+{
+    long long age = fmc_age_s(now, e->ts);
+    long long hb = e->heartbeat >= 0 ? (now > e->heartbeat
+                                            ? now - e->heartbeat
+                                            : 0)
+                                     : -1;
+    if (hb >= 0 && (age < 0 || hb < age))
+        return hb;
+    return age;
+}
+
+static void fmc_now_iso(long long now, char *out, size_t cap)
+{
+    struct tm tm_utc;
+    out[0] = '\0';
+    if (!platform_time_utc_tm((time_t)now, &tm_utc) ||
+        strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tm_utc) == 0)
+        out[0] = '\0';
+}
+
+/* The local entry's view: queue claim, resources, token usage, stamp. */
+static const char *fmc_local_fill(struct fmc_worker *e,
+                                  const struct fmc_emit_ctx *c,
+                                  char *why, size_t cap, char *res_why,
+                                  size_t res_cap)
+{
+    const char *state = fmc_local_state(c->qv, c->lo, why, cap);
+    fmc_local_resources(e, res_why, res_cap);
+    if (c->qv->known && c->qv->running > 0) {
+        (void)snprintf(e->ref, sizeof(e->ref), "%s", c->qv->run_ref);
+        (void)snprintf(e->stage, sizeof(e->stage), "%s", "running");
+    }
+    e->tok_last = c->qv->tok_last;
+    e->tok_total = c->qv->tok_total;
+    if (fmc_lock_held(c->lo->worker_lock) ||
+        fmc_lock_held(c->lo->receive_lock))
+        fmc_now_iso(c->now, e->ts, sizeof(e->ts));
+    else if (!e->ts[0])
+        (void)snprintf(e->ts, sizeof(e->ts), "%s", c->qv->outcome_ts);
+    return state;
+}
+
+/* One worker as its JSON entry. */
+static void fmc_worker_emit(struct json_value *arr, struct fmc_worker *e,
+                            const struct fmc_emit_ctx *c)
+{
+    struct json_value o;
+    char why[256], res_why[96];
+    const char *state;
+    long long age;
+    if (e->local) {
+        state = fmc_local_fill(e, c, why, sizeof(why), res_why,
+                               sizeof(res_why));
+    } else {
+        state = fmc_remote_state(e, fmc_ref_terminal(c, e->ref),
+                                 fmc_alive_age(e, c->now), why, sizeof(why));
+        fmc_remote_resources(e, res_why, sizeof(res_why));
+    }
+    age = fmc_age_s(c->now, e->ts);
+    json_init(&o);
+    json_set_object(&o);
+    (void)json_push_kv_str(&o, "name", e->name);
+    fmc_put_str(&o, "host", e->host);
+    (void)json_push_kv_str(&o, "source", e->local ? "local" : "mail");
+    (void)json_push_kv_bool(&o, "self_reported", !e->local);
+    fmc_put_str(&o, "workspace_selector", e->ws_selector);
+    fmc_put_str(&o, "workspace_head", e->ws_head);
+    fmc_put_str(&o, "current_ref", e->ref);
+    fmc_put_str(&o, "stage", e->stage);
+    fmc_put_str(&o, "last_seen_ts", age >= 0 ? e->ts : "");
+    fmc_put_int(&o, "age_s", age);
+    fmc_put_int(&o, "tokens_last_run", e->tok_last);
+    fmc_put_int(&o, "tokens_total", e->tok_total);
+    fmc_put_int(&o, "load1_centi", e->load1);
+    fmc_put_int(&o, "mem_avail_kib", e->mem_kib);
+    fmc_put_int(&o, "disk_free_kib", e->disk_kib);
+    (void)json_push_kv_str(&o, "resources_reason", res_why);
+    (void)json_push_kv_str(&o, "state", state);
+    (void)json_push_kv_str(&o, "reason", why);
+    (void)json_push_back(arr, &o);
+    json_free(&o);
+}
+
+/* Local first, then newest evidence first. */
+static int fmc_worker_cmp(const void *a, const void *b)
+{
+    const struct fmc_worker *x = (const struct fmc_worker *)a;
+    const struct fmc_worker *y = (const struct fmc_worker *)b;
+    if (x->local != y->local)
+        return x->local ? -1 : 1;
+    return strcmp(y->ts, x->ts);
+}
+
+/* workers[] plus its bound: at most FMC_WORKER_CAP entries, with the true
+ * total and a truncated flag beside them. */
+static void fmc_workers_emit(struct json_value *data, struct fmc_roster *ro,
+                             const struct fmc_emit_ctx *c)
+{
+    struct json_value arr;
+    size_t i, total = ro->n;
+    json_init(&arr);
+    json_set_array(&arr);
+    if (ro->w && ro->n > 1)
+        qsort(ro->w, ro->n, sizeof(*ro->w), fmc_worker_cmp);
+    for (i = 0; ro->w && i < ro->n && i < FMC_WORKER_CAP; i++)
+        fmc_worker_emit(&arr, &ro->w[i], c);
+    (void)json_push_kv(data, "workers", &arr);
+    (void)json_push_kv_int(data, "workers_total", (long long)total);
+    (void)json_push_kv_bool(data, "workers_total_exact", ro->untracked == 0);
+    (void)json_push_kv_bool(data, "workers_truncated",
+                            total > json_size(&arr) || ro->untracked > 0);
+    (void)json_push_kv_int(data, "alive_window_s", FMC_ALIVE_WINDOW_S);
+    json_free(&arr);
+}
+
+/* A directive this host sent that is still "queued" (no receiver evidence
+ * at all) past FMC_QUEUED_STALE_S: exactly "steer send said QUEUED but
+ * the target never read it". */
+static void fmc_stale_blocker(struct json_value *blockers,
+                              const struct fmc_row *v, long long age)
+{
+    char b[256];
+    struct json_value item;
+    int wlen;
+    if (age <= FMC_QUEUED_STALE_S || json_size(blockers) >= FMC_BLOCKER_CAP)
+        return;
+    wlen = snprintf(b, sizeof(b),
+                    "directive %.64s to %.48s: no receiver evidence after "
+                    "%lld s (threshold %lld s)",
+                    v->ref, v->to, age, FMC_QUEUED_STALE_S);
+    if (wlen <= 0 || (size_t)wlen >= sizeof(b))
+        return;
+    json_init(&item);
+    json_set_str(&item, b);
+    (void)json_push_back(blockers, &item);
+    json_free(&item);
+}
+
 /* One bounded change row, carrying the state fmc_row_state resolves from
  * receiver evidence; completed is resolved later against queue outcomes
- * and board results. */
+ * and board results. queued_age_s is how long a row has sat "queued"
+ * (null for every other state, and when its stamp does not parse). */
 static void fmc_row_change(struct json_value *changes, const struct fmc_row *v,
                            const struct json_value *rows,
-                           const char *sent_path)
+                           const char *sent_path, long long now)
 {
     struct json_value item;
     char lead[FMC_LEAD_MAX + 1];
     const char *state = fmc_row_state(v, rows, sent_path);
+    bool queued = strcmp(state, "queued") == 0;
     json_init(&item);
     json_set_object(&item);
     fmc_lead(v->body, lead, sizeof(lead));
@@ -1126,8 +1854,11 @@ static void fmc_row_change(struct json_value *changes, const struct fmc_row *v,
         json_push_kv_str(&item, "kind", v->kind) &&
         json_push_kv_str(&item, "ref", v->ref) &&
         json_push_kv_str(&item, "lead", lead) &&
-        json_push_kv_str(&item, "state", state))
+        json_push_kv_str(&item, "state", state)) {
+        fmc_put_int(&item, "queued_age_s",
+                    queued ? fmc_age_s(now, v->ts) : -1);
         (void)json_push_back(changes, &item);
+    }
     json_free(&item);
 }
 
@@ -1193,24 +1924,55 @@ static const char *fmc_mail_drain(const struct zcl_command_request *req,
     return more ? "page_limit" : NULL;
 }
 
+/* Everything the mail walk writes into, so each row is one call. */
+struct fmc_mail_ctx {
+    struct json_value *agents;
+    struct json_value *work;
+    struct json_value *changes;
+    struct json_value *blockers;
+    struct fmc_roster *ro;
+    long long since;
+    long long changes_cap;
+    long long now;
+    long long shown;
+    int scanned;
+    char sent_path[4096 + 32];
+};
+
+/* One pulled row: roster, tallies, the stale-directive check (bounded to
+ * the newest FMC_DIRECTIVE_SCAN directives), and — above `since`, under
+ * the cap — one change row. */
+static void fmc_mail_row(struct fmc_mail_ctx *c, const struct fmc_row *v,
+                         const struct json_value *rows)
+{
+    fmc_row_tally(c->agents, c->work, v);
+    fmc_roster_note(c->ro, v);
+    if (strcmp(v->kind, "directive") == 0 &&
+        c->scanned < FMC_DIRECTIVE_SCAN) {
+        c->scanned++;
+        if (strcmp(fmc_row_state(v, rows, c->sent_path), "queued") == 0)
+            fmc_stale_blocker(c->blockers, v, fmc_age_s(c->now, v->ts));
+    }
+    if (v->seq <= c->since || c->shown >= c->changes_cap)
+        return;
+    fmc_row_change(c->changes, v, rows, c->sent_path, c->now);
+    c->shown++;
+}
+
 static long long fmc_brief_mail(const struct zcl_command_request *req,
-                                struct json_value *agents,
-                                struct json_value *work,
-                                struct json_value *changes, long long since,
-                                long long changes_cap,
+                                struct fmc_mail_ctx *c,
                                 struct json_value *missing,
                                 struct fmc_mail_view *view)
 {
     struct json_value rows;
-    char sent_path[4096 + 32];
     const char *why;
     size_t n, i;
-    long long shown = 0;
     int64_t t0, t1;
     view->cursor = -1;
     view->count = 0;
-    if (!fmc_sent_path_read(sent_path, sizeof(sent_path)))
-        sent_path[0] = '\0';
+    view->ok = false;
+    if (!fmc_sent_path_read(c->sent_path, sizeof(c->sent_path)))
+        c->sent_path[0] = '\0';
     json_init(&rows);
     json_set_array(&rows);
     t0 = clock_now_wall_ms();
@@ -1222,19 +1984,15 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
         view->cursor = -1;
         return -1;
     }
+    view->ok = true;
     n = json_size(&rows);
     view->count = (long long)n;
     /* Newest-first walk from the tail: changes[] carries the latest rows
      * above `since`, each with its lifecycle state. */
     for (i = n; i > 0; i--) {
         struct fmc_row v;
-        if (!fmc_row_parse(json_at(&rows, i - 1), &v))
-            continue;
-        fmc_row_tally(agents, work, &v);
-        if (v.seq <= since || shown >= changes_cap)
-            continue;
-        fmc_row_change(changes, &v, &rows, sent_path);
-        shown++;
+        if (fmc_row_parse(json_at(&rows, i - 1), &v))
+            fmc_mail_row(c, &v, &rows);
     }
     json_free(&rows);
     return view->cursor;
@@ -1256,13 +2014,6 @@ static void fmc_queue_row_name(const struct json_value *r,
     if (name && name[0])
         (void)fmc_push_distinct(list, name, FMC_LIST_CAP);
 }
-
-struct fmc_queue_view {
-    long long queued;
-    long long running;
-    long long pool_total;
-    long long pool_free;
-};
 
 /* One non-pass outcome row as a bounded blocker string. Pass-like rows
  * are not blockers and stay silent here. */
@@ -1297,11 +2048,30 @@ static void fmc_queue_outcome_row(const struct json_value *r,
     json_free(&item);
 }
 
+/* One outcome's receipt-stated token cost into the local usage totals.
+ * The status projection is oldest first, so the last known one is the
+ * last run. A null (no receipt) is skipped, never summed as zero. */
+static void fmc_queue_outcome_usage(const struct json_value *r,
+                                    struct fmc_queue_view *view)
+{
+    const struct json_value *v = json_get(r, "tokens_used");
+    const char *ts = fmc_row_field(r, "ts");
+    if (ts[0])
+        (void)snprintf(view->outcome_ts, sizeof(view->outcome_ts), "%.39s",
+                       ts);
+    if (!v || v->type != JSON_INT || json_get_int(v) < 0)
+        return;
+    view->tok_last = (long long)json_get_int(v);
+    view->tok_total =
+        (view->tok_total < 0 ? 0 : view->tok_total) + view->tok_last;
+}
+
 /* Non-pass outcomes become blockers; the whole array is retained for
  * completed-by-ref matching after the sub reply is freed. */
 static void fmc_queue_outcomes(struct fmc_sub *sub,
                                struct json_value *blockers,
-                               struct json_value *outcomes_keep)
+                               struct json_value *outcomes_keep,
+                               struct fmc_queue_view *view)
 {
     const struct json_value *arr;
     size_t n, i;
@@ -1313,8 +2083,10 @@ static void fmc_queue_outcomes(struct fmc_sub *sub,
     /* Bounded by the sibling's own cap. */
     json_copy(outcomes_keep, arr);
     n = json_size(arr);
-    for (i = 0; i < n && i < FMC_BLOCKER_CAP * 4; i++)
+    for (i = 0; i < n && i < FMC_BLOCKER_CAP * 4; i++) {
         fmc_queue_outcome_row(json_at(arr, i), blockers);
+        fmc_queue_outcome_usage(json_at(arr, i), view);
+    }
 }
 
 /* Pool numbers become capacity. */
@@ -1334,11 +2106,43 @@ static void fmc_queue_pool(struct fmc_sub *sub, struct fmc_queue_view *view)
         view->pool_free = (long long)json_get_int(v);
 }
 
+/* Running/queued names become work + candidates; the first running row
+ * names the local claim (its ref and, when claim.json recorded one, its
+ * claimant). */
+static void fmc_queue_rows(struct fmc_sub *sub, struct json_value *work,
+                           struct json_value *candidates,
+                           struct fmc_queue_view *view)
+{
+    const struct json_value *q = json_get(&sub->reply.data, "queued");
+    const struct json_value *r = json_get(&sub->reply.data, "running");
+    size_t nq = (q && q->type == JSON_ARR) ? json_size(q) : 0u;
+    size_t nr = (r && r->type == JSON_ARR) ? json_size(r) : 0u;
+    size_t i;
+    view->queued = (long long)nq;
+    view->running = (long long)nr;
+    for (i = 0; i < nq; i++) {
+        fmc_queue_row_name(json_at(q, i), candidates);
+        fmc_queue_row_name(json_at(q, i), work);
+    }
+    for (i = 0; i < nr; i++) {
+        fmc_queue_row_name(json_at(r, i), candidates);
+        fmc_queue_row_name(json_at(r, i), work);
+    }
+    if (nr == 0)
+        return;
+    (void)snprintf(view->run_ref, sizeof(view->run_ref), "%.128s",
+                   fmc_row_field(json_at(r, 0), "name"));
+    (void)snprintf(view->run_worker, sizeof(view->run_worker), "%.64s",
+                   fmc_row_field(json_at(r, 0), "worker"));
+}
+
 /* ── brief: queue section ────────────────────────────────────────────────
  *
  * Running/queued names become work + candidates; non-pass outcomes become
  * blockers; pool numbers become capacity. Completed-by-ref matching reads
- * the outcomes array for name==ref with an explicit pass verdict. */
+ * the outcomes array for name==ref with an explicit pass verdict. A
+ * sibling that did not answer leaves view->known false with the reason,
+ * so capacity reports unknown instead of an idle zero. */
 
 static void fmc_brief_queue(const struct zcl_command_request *req,
                             struct json_value *work,
@@ -1349,19 +2153,22 @@ static void fmc_brief_queue(const struct zcl_command_request *req,
                             struct json_value *outcomes_keep)
 {
     struct fmc_sub sub;
-    const struct json_value *arr;
-    size_t n, i;
     int64_t t0, t1;
     memset(view, 0, sizeof(*view));
+    view->tok_last = view->tok_total = -1;
+    (void)snprintf(view->reason, sizeof(view->reason), "%s",
+                   "unknown_sibling");
     fmc_sub_begin(&sub, "zcl.agent_queue.v1", req, "dev.agent.queue");
     if (!sub.valid) {
-        fmc_note_missing(missing, "dev.agent.queue", "unknown_sibling", 0);
+        fmc_note_missing(missing, "dev.agent.queue", view->reason, 0);
         fmc_sub_end(&sub);
         return;
     }
     if (!fmc_sub_input(&sub,
                        "{\"action\":\"status\",\"json\":true}")) {
-        fmc_note_missing(missing, "dev.agent.queue", "input_encode", 0);
+        (void)snprintf(view->reason, sizeof(view->reason), "%s",
+                       "input_encode");
+        fmc_note_missing(missing, "dev.agent.queue", view->reason, 0);
         fmc_sub_end(&sub);
         return;
     }
@@ -1370,30 +2177,16 @@ static void fmc_brief_queue(const struct zcl_command_request *req,
     t1 = clock_now_wall_ms();
     sub.ran = true;
     if (!fmc_sub_ok(&sub)) {
-        fmc_note_missing(missing, "dev.agent.queue", "sibling_refused",
-                         t1 - t0);
+        (void)snprintf(view->reason, sizeof(view->reason), "%s",
+                       "sibling_refused");
+        fmc_note_missing(missing, "dev.agent.queue", view->reason, t1 - t0);
         fmc_sub_end(&sub);
         return;
     }
-    arr = json_get(&sub.reply.data, "queued");
-    if (arr && arr->type == JSON_ARR) {
-        n = json_size(arr);
-        view->queued = (long long)n;
-        for (i = 0; i < n; i++) {
-            fmc_queue_row_name(json_at(arr, i), candidates);
-            fmc_queue_row_name(json_at(arr, i), work);
-        }
-    }
-    arr = json_get(&sub.reply.data, "running");
-    if (arr && arr->type == JSON_ARR) {
-        n = json_size(arr);
-        view->running = (long long)n;
-        for (i = 0; i < n; i++) {
-            fmc_queue_row_name(json_at(arr, i), candidates);
-            fmc_queue_row_name(json_at(arr, i), work);
-        }
-    }
-    fmc_queue_outcomes(&sub, blockers, outcomes_keep);
+    view->known = true;
+    view->reason[0] = '\0';
+    fmc_queue_rows(&sub, work, candidates, view);
+    fmc_queue_outcomes(&sub, blockers, outcomes_keep, view);
     fmc_queue_pool(&sub, view);
     fmc_sub_end(&sub);
 }
@@ -1659,86 +2452,187 @@ static void fmc_apply_completed(struct json_value *changes,
 
 /* ── brief entry ───────────────────────────────────────────────────────── */
 
+/* capacity: real numbers only when the queue sibling answered. Otherwise
+ * every number is null beside known:false and the reason, because a queue
+ * nobody could read is not an idle queue. */
+static void fmc_capacity_emit(struct json_value *cap,
+                              const struct fmc_queue_view *qv)
+{
+    char why[96];
+    (void)json_push_kv_bool(cap, "known", qv->known);
+    fmc_put_int(cap, "pool_total", qv->known ? qv->pool_total : -1);
+    fmc_put_int(cap, "pool_free", qv->known ? qv->pool_free : -1);
+    fmc_put_int(cap, "queued", qv->known ? qv->queued : -1);
+    fmc_put_int(cap, "running", qv->known ? qv->running : -1);
+    why[0] = '\0';
+    if (!qv->known)
+        (void)snprintf(why, sizeof(why), "dev.agent.queue did not answer: %s",
+                       qv->reason);
+    fmc_put_str(cap, "reason", why);
+}
+
+/* Drop the tail of one array member until the data fits the budget.
+ * Returns how many entries were dropped. */
+static long long fmc_trim_member(struct json_value *data, const char *key)
+{
+    struct json_value *arr = (struct json_value *)json_get(data, key);
+    long long dropped = 0;
+    if (!arr || arr->type != JSON_ARR)
+        return 0;
+    while (arr->num_children > 0 &&
+           json_write(data, NULL, 0) > FMC_REPLY_SOFT_BUDGET) {
+        json_free(&arr->children[arr->num_children - 1]);
+        arr->num_children--;
+        dropped++;
+    }
+    return dropped;
+}
+
+/* Hold the reply data under FMC_REPLY_SOFT_BUDGET so the leaf's response
+ * budget can never refuse the whole brief: the least essential arrays
+ * lose their tail first, and budget_truncated names every array that was
+ * cut and by how many entries (empty when nothing was). */
+static void fmc_fit_budget(struct json_value *data)
+{
+    static const char *const order[] = {
+        "changes", "workers", "candidates", "work", "agents", "blockers",
+    };
+    struct json_value trunc;
+    size_t i;
+    json_init(&trunc);
+    json_set_object(&trunc);
+    for (i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+        long long d = fmc_trim_member(data, order[i]);
+        if (d > 0)
+            (void)json_push_kv_int(&trunc, order[i], d);
+    }
+    (void)json_push_kv(data, "budget_truncated", &trunc);
+    json_free(&trunc);
+}
+
+struct fmc_brief_lists {
+    struct json_value agents, work, blockers, candidates, changes, missing;
+    struct json_value capacity, evidence, post_ids, outcomes;
+};
+
+static void fmc_lists_init(struct fmc_brief_lists *l)
+{
+    struct json_value *arrs[] = {&l->agents,   &l->work,    &l->blockers,
+                                 &l->candidates, &l->changes, &l->missing,
+                                 &l->post_ids, &l->outcomes};
+    size_t i;
+    for (i = 0; i < sizeof(arrs) / sizeof(arrs[0]); i++) {
+        json_init(arrs[i]);
+        json_set_array(arrs[i]);
+    }
+    json_init(&l->capacity);
+    json_set_object(&l->capacity);
+    json_init(&l->evidence);
+    json_set_object(&l->evidence);
+}
+
+static void fmc_lists_free(struct fmc_brief_lists *l)
+{
+    struct json_value *all[] = {&l->agents,   &l->work,     &l->blockers,
+                                &l->candidates, &l->changes, &l->missing,
+                                &l->capacity, &l->evidence, &l->post_ids,
+                                &l->outcomes};
+    size_t i;
+    for (i = 0; i < sizeof(all) / sizeof(all[0]); i++)
+        json_free(all[i]);
+}
+
+static void fmc_brief_evidence(struct fmc_brief_lists *l,
+                               const struct fmc_mail_view *mv,
+                               long long mail_cursor, long long boxes,
+                               long long rows, long long now)
+{
+    char ts[32];
+    (void)json_push_kv_int(&l->evidence, "mail_cursor", mail_cursor);
+    (void)json_push_kv_int(&l->evidence, "mail_count", mv->count);
+    (void)json_push_kv_int(&l->evidence, "ledger_boxes", boxes);
+    (void)json_push_kv_int(&l->evidence, "ledger_rows", rows);
+    (void)json_push_kv(&l->evidence, "post_ids", &l->post_ids);
+    (void)json_push_kv_int(&l->evidence, "queued_stale_after_s",
+                           FMC_QUEUED_STALE_S);
+    fmc_now_iso(now, ts, sizeof(ts));
+    if (ts[0])
+        (void)json_push_kv_str(&l->evidence, "observed_at", ts);
+}
+
+static void fmc_brief_reply(struct zcl_command_reply *reply,
+                            struct fmc_brief_lists *l,
+                            struct fmc_roster *ro,
+                            const struct fmc_emit_ctx *ec,
+                            long long mail_cursor)
+{
+    (void)json_push_kv_str(&reply->data, "leaf", FMC_LEAF);
+    (void)json_push_kv(&reply->data, "agents", &l->agents);
+    fmc_workers_emit(&reply->data, ro, ec);
+    (void)json_push_kv(&reply->data, "work", &l->work);
+    (void)json_push_kv(&reply->data, "blockers", &l->blockers);
+    (void)json_push_kv(&reply->data, "capacity", &l->capacity);
+    (void)json_push_kv(&reply->data, "candidates", &l->candidates);
+    (void)json_push_kv(&reply->data, "evidence", &l->evidence);
+    (void)json_push_kv(&reply->data, "changes", &l->changes);
+    (void)json_push_kv(&reply->data, "missing", &l->missing);
+    (void)json_push_kv_int(&reply->data, "cursor", mail_cursor);
+    fmc_fit_budget(&reply->data);
+    reply->status = ZCL_COMMAND_STATUS_PASSED;
+    reply->exit_code = 0;
+}
+
 static void fmc_do_brief(const struct zcl_command_request *req,
                          struct zcl_command_reply *reply)
 {
-    struct json_value agents, work, blockers, candidates, changes, missing;
-    struct json_value capacity, evidence, post_ids, outcomes;
+    struct fmc_brief_lists l;
+    struct fmc_mail_ctx mc;
     struct fmc_mail_view mv;
     struct fmc_queue_view qv;
-    long long since = 0, changes_cap = FMC_CHANGES_DEFAULT;
-    long long mail_cursor, boxes, rows;
-    long long tmp;
-    char ts[32];
-    struct tm tm_utc;
-    time_t now;
-    json_init(&agents);
-    json_set_array(&agents);
-    json_init(&work);
-    json_set_array(&work);
-    json_init(&blockers);
-    json_set_array(&blockers);
-    json_init(&candidates);
-    json_set_array(&candidates);
-    json_init(&changes);
-    json_set_array(&changes);
-    json_init(&missing);
-    json_set_array(&missing);
-    json_init(&capacity);
-    json_set_object(&capacity);
-    json_init(&evidence);
-    json_set_object(&evidence);
-    json_init(&post_ids);
-    json_set_array(&post_ids);
-    json_init(&outcomes);
-    json_set_array(&outcomes);
+    struct fmc_roster ro;
+    struct fmc_local lo;
+    struct fmc_emit_ctx ec;
+    long long mail_cursor, boxes, rows, tmp;
+    if (!fmc_roster_init(&ro)) {
+        fmc_roster_free(&ro);
+        fmc_fail(reply, "STEER_BRIEF_ALLOC", "cannot allocate the worker "
+                 "roster", "fleet.steer.brief");
+        return;
+    }
+    fmc_lists_init(&l);
+    memset(&mc, 0, sizeof(mc));
+    mc.agents = &l.agents;
+    mc.work = &l.work;
+    mc.changes = &l.changes;
+    mc.blockers = &l.blockers;
+    mc.ro = &ro;
+    mc.changes_cap = FMC_CHANGES_DEFAULT;
+    mc.now = (long long)platform_time_wall_unix();
     if (fmc_int(req, "since", &tmp) && tmp >= 0)
-        since = tmp;
+        mc.since = tmp;
     if (fmc_int(req, "limit", &tmp) && tmp > 0)
-        changes_cap = tmp > FMC_CHANGES_MAX ? FMC_CHANGES_MAX : tmp;
-    mail_cursor = fmc_brief_mail(req, &agents, &work, &changes, since,
-                                 changes_cap, &missing, &mv);
-    fmc_brief_queue(req, &work, &candidates, &blockers, &missing, &qv,
-                    &outcomes);
-    fmc_brief_board(req, &agents, &blockers, &candidates, &missing,
-                    &post_ids);
-    fmc_brief_ledger(req, &missing, &boxes, &rows);
-    fmc_apply_completed(&changes, &outcomes);
-    (void)json_push_kv_int(&capacity, "pool_total", qv.pool_total);
-    (void)json_push_kv_int(&capacity, "pool_free", qv.pool_free);
-    (void)json_push_kv_int(&capacity, "queued", qv.queued);
-    (void)json_push_kv_int(&capacity, "running", qv.running);
-    (void)json_push_kv_int(&evidence, "mail_cursor", mail_cursor);
-    (void)json_push_kv_int(&evidence, "mail_count", mv.count);
-    (void)json_push_kv_int(&evidence, "ledger_boxes", boxes);
-    (void)json_push_kv_int(&evidence, "ledger_rows", rows);
-    (void)json_push_kv(&evidence, "post_ids", &post_ids);
-    now = platform_time_wall_time_t();
-    if (platform_time_utc_tm(now, &tm_utc) &&
-        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc) != 0)
-        (void)json_push_kv_str(&evidence, "observed_at", ts);
-    (void)json_push_kv_str(&reply->data, "leaf", FMC_LEAF);
-    (void)json_push_kv(&reply->data, "agents", &agents);
-    (void)json_push_kv(&reply->data, "work", &work);
-    (void)json_push_kv(&reply->data, "blockers", &blockers);
-    (void)json_push_kv(&reply->data, "capacity", &capacity);
-    (void)json_push_kv(&reply->data, "candidates", &candidates);
-    (void)json_push_kv(&reply->data, "evidence", &evidence);
-    (void)json_push_kv(&reply->data, "changes", &changes);
-    (void)json_push_kv(&reply->data, "missing", &missing);
-    (void)json_push_kv_int(&reply->data, "cursor", mail_cursor);
-    reply->status = ZCL_COMMAND_STATUS_PASSED;
-    reply->exit_code = 0;
-    json_free(&agents);
-    json_free(&work);
-    json_free(&blockers);
-    json_free(&candidates);
-    json_free(&changes);
-    json_free(&missing);
-    json_free(&capacity);
-    json_free(&evidence);
-    json_free(&post_ids);
-    json_free(&outcomes);
+        mc.changes_cap = tmp > FMC_CHANGES_MAX ? FMC_CHANGES_MAX : tmp;
+    mail_cursor = fmc_brief_mail(req, &mc, &l.missing, &mv);
+    fmc_brief_queue(req, &l.work, &l.candidates, &l.blockers, &l.missing,
+                    &qv, &l.outcomes);
+    fmc_brief_board(req, &l.agents, &l.blockers, &l.candidates, &l.missing,
+                    &l.post_ids);
+    fmc_brief_ledger(req, &l.missing, &boxes, &rows);
+    fmc_apply_completed(&l.changes, &l.outcomes);
+    fmc_capacity_emit(&l.capacity, &qv);
+    fmc_brief_evidence(&l, &mv, mail_cursor, boxes, rows, mc.now);
+    lo.worker_lock = fmc_lock_state("queue", "worker.lock");
+    lo.receive_lock = fmc_lock_state("receive", "receive.lock");
+    lo.mail_ok = mv.ok;
+    fmc_roster_local(&ro, &qv, &lo);
+    ec.now = mc.now;
+    ec.ro = &ro;
+    ec.outcomes = &l.outcomes;
+    ec.qv = &qv;
+    ec.lo = &lo;
+    fmc_brief_reply(reply, &l, &ro, &ec, mail_cursor);
+    fmc_lists_free(&l);
+    fmc_roster_free(&ro);
 }
 
 /* ── send ────────────────────────────────────────────────────────────────
