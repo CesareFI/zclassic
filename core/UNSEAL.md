@@ -180,3 +180,7 @@ later lane flips it HARD.
 - 2026-09-18T17:00:46Z — REASON: Fail open stale block-download requests after a backward wall-clock step; scheduler reliability only, no consensus or validation semantics change
   old ROOT: 14fae82ed65487e2ebc868bd21607d43e99b4268ac2214760c0c66d4837c30a4
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T17:36:09Z — REASON: Fail open block-download peer-avoid cooldowns after a backward wall-clock step; scheduler reliability only, no consensus or validation semantics change
+  old ROOT: 0c33e7ea16680e8ad9bf598fa5e803c4134a7dc379427f4deb31fae9f778d5e7
+  by: owner unseal ritual (make core-unseal)

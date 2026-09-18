@@ -1117,6 +1117,53 @@ static int test_dl_timeout_retry_avoid_expiry(void)
     return failures;
 }
 
+static int test_dl_peer_avoid_fails_open_after_clock_rollback(void)
+{
+    int failures = 0;
+    TEST("peer-avoid cooldown fails open after a backward clock step") {
+        struct download_manager dm;
+        dl_init(&dm);
+
+        struct uint256 h = make_hash(208);
+        int64_t now = (int64_t)platform_time_wall_time_t();
+        ASSERT(dl_mark_requested(&dm, &h, 153, 1));
+        ASSERT(dl_check_timeouts(&dm,
+                                 now + dl_get_request_timeout_secs() + 1) == 1);
+
+        struct uint256 out[1];
+        /* The timeout sweep is deliberately one second beyond expiry. Its
+         * freshly stamped cooldown must remain active at this boundary. */
+        ASSERT(dl_assign_to_peer(&dm, 1, out, 1) == 0);
+        ASSERT(!dl_assignment_should_attempt(&dm, 1));
+
+        /* Model wall time stepping backward after both the queue cooldown
+         * and its zero-assignment park were recorded. Their remaining hour
+         * is impossible for a cooldown capped at 30 seconds, so neither may
+         * strand the queued block. */
+        zcl_mutex_lock(&dm.cs);
+        ASSERT(dm.queue_len == 1);
+        dm.queue_avoid_until[0] = now + 3600;
+        bool found_peer = false;
+        for (size_t i = 0; i < dm.num_peers; i++) {
+            if (dm.peers[i].peer_id != 1)
+                continue;
+            dm.peers[i].zero_assign_retry_after = now + 3600;
+            found_peer = true;
+            break;
+        }
+        zcl_mutex_unlock(&dm.cs);
+        ASSERT(found_peer);
+
+        ASSERT(dl_assignment_should_attempt(&dm, 1));
+        ASSERT(dl_assign_to_peer(&dm, 1, out, 1) == 1);
+        ASSERT(uint256_eq(&out[0], &h));
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_dl_peer_body_progress(void)
 {
     int failures = 0;
@@ -2241,6 +2288,7 @@ int test_download(void)
     failures += test_dl_timeout_retry_failover();
     failures += test_dl_timeout_retry_failover_peer_zero();
     failures += test_dl_timeout_retry_avoid_expiry();
+    failures += test_dl_peer_avoid_fails_open_after_clock_rollback();
     failures += test_dl_peer_body_progress();
     failures += test_dl_peer_body_staleness();
     failures += test_dl_diagnostics();

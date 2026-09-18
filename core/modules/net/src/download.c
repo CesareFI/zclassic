@@ -56,6 +56,19 @@ static int64_t dl_peer_avoid_deadline(int64_t now)
     return now + cooldown;
 }
 
+static bool dl_peer_avoid_active(int64_t deadline, int64_t now)
+{
+    if (deadline <= now)
+        return false;
+    /* Timeout sweeps accept a caller-supplied `now`, which can legitimately
+     * be one request-timeout ahead of a concurrent assignment pass. Beyond
+     * that plus the cooldown, a remaining interval is impossible without a
+     * backward wall-clock step; fail open instead of parking the only useful
+     * peer until the clock catches up. */
+    return deadline <= now + DL_REQUEST_TIMEOUT_SECS_IBD +
+                       DL_PEER_AVOID_COOLDOWN_SECS + 1;
+}
+
 static void dl_generation_advance(uint64_t *generation)
 {
     (*generation)++;
@@ -314,10 +327,8 @@ static bool dl_queue_item_avoids_peer(const struct download_manager *dm,
         return false;
     if (idx >= dm->queue_len)
         return false;
-    if (dm->queue_avoid_until[idx] <= now)
-        return false;
     return dm->queue_avoid_peers[idx] == peer_id &&
-           dm->queue_avoid_until[idx] > now;
+           dl_peer_avoid_active(dm->queue_avoid_until[idx], now);
 }
 
 static void dl_queue_remove_at(struct download_manager *dm, size_t idx)
@@ -1172,7 +1183,7 @@ static bool dl_assignment_peer_is_parked(const struct download_manager *dm,
         ps->zero_assign_global_limit != dl_get_max_in_flight_total())
         return false;
     return ps->zero_assign_retry_after <= 0 ||
-           now < ps->zero_assign_retry_after;
+           dl_peer_avoid_active(ps->zero_assign_retry_after, now);
 }
 
 bool dl_assignment_should_attempt(struct download_manager *dm,
