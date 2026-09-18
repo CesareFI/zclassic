@@ -30,9 +30,11 @@
  *   kind    post only, required: one of need|claim|result|problem|note|
  *           offer|directive. Also an optional pull filter (exact match).
  *   body    post only, required non-empty string, at most 4096 bytes.
- *   since   pull only, optional non-negative integer, default 0: return rows
- *           with seq greater than this cursor. A positive scalar refuses
- *           when multiple .jsonl streams make its sequence space ambiguous.
+ *   since   pull only, optional, default 0. Either a non-negative integer:
+ *           return rows with seq greater than this cursor (a positive
+ *           scalar refuses when multiple .jsonl streams make its sequence
+ *           space ambiguous); or the `next_since` token a previous page
+ *           returned, which resumes exactly where that page stopped.
  *   from    post: optional sender name (default $BOARD_AGENT, then $USER,
  *           then "local"). pull: optional exact-match sender filter.
  *   cursor  ack only: required non-negative integer; also accepted as the
@@ -71,9 +73,29 @@
  *
  * PULL. Reads every *.jsonl under <state>/mail/ (the outbox plus one inbox
  * file per peer, written by whatever transport delivers them). Returns rows
- * with seq greater than `since`, ordered by (ts, from, seq), plus `cursor`
- * (the largest seq seen anywhere in the dir, or `since` when empty) and
- * `count`. Malformed lines are skipped, never fatal.
+ * with seq greater than the seq floor, ordered by (ts, from, seq), plus
+ * `cursor` (the largest seq seen anywhere in the dir, or the floor when
+ * empty) and `count`. Malformed lines are skipped, never fatal, and counted
+ * in `skipped`.
+ *
+ * PAGING. A reply is ONE bounded page: at most 64 rows and about 16 KiB of
+ * row bytes (the first row always fits, so a page is never empty while rows
+ * remain), which keeps every reply inside the leaf's response budget no
+ * matter how long the history grows. `truncated` is true when rows remain
+ * past the page, and `next_since` is ALWAYS returned: pass it back as
+ * `since` (with the same from/kind filters) to get the next page, and keep
+ * it to resume later. Following it until `truncated` is false returns every
+ * matching row exactly once. The token is "<floor>|<stream>:<offset>,...":
+ * a byte offset per stream, each stream consumed as a prefix, so a row a
+ * transport appends later — even with an older ts — is still returned on
+ * a later page, never skipped. A page merges the stream heads in
+ * (ts, from, seq) order, ties broken by stream name. Only complete lines
+ * are consumed; a last line still being written waits for the next pull.
+ * Stream names must be 1-128 of [A-Za-z0-9._-] (MAIL_STREAM_NAME_INVALID)
+ * and at most 16 streams are read (MAIL_STREAMS_TOO_MANY), because the
+ * token must name every one. A token whose offset is past a stream's end
+ * or not on a line boundary means that stream was replaced or truncated,
+ * and is refused as MAIL_CURSOR_STALE; replay with since=0.
  *
  * ACK. Writes the decimal cursor plus "\n" to <state>/mail/cursor.<agent>
  * (owner-private) via a temporary file in the same directory renamed over the target,
@@ -109,11 +131,14 @@
  *
  * OUTPUT (zcl.agent_mail.v1). Every reply names its own `leaf`. Post returns
  * the row fields plus `cursor` (the row's seq) and `outbox`. Pull returns
- * `rows` (array), `cursor`, `count`. Ack returns `agent`, `cursor`.
+ * `rows` (array), `cursor`, `count`, `truncated`, `next_since`, `skipped`.
+ * Ack returns `agent`, `cursor`.
  *
  * FAILURE. BAD_INPUT (missing/empty action, to, kind, body; unknown kind or
  * action; bad cursor/agent spelling), MAIL_BODY_TOO_LARGE, MAIL_REFUSED_*,
- * STATE_DIR_FAILED, MAIL_WRITE_FAILED, MAIL_READ_FAILED.
+ * STATE_DIR_FAILED, MAIL_WRITE_FAILED, MAIL_READ_FAILED,
+ * MAIL_CURSOR_AMBIGUOUS, MAIL_CURSOR_STALE, MAIL_STREAM_NAME_INVALID,
+ * MAIL_STREAMS_TOO_MANY.
  *
  * PROCESS RULE. No spawn, no shell, no popen()/system(), no sleep, no poll
  * loop. Only local filesystem operations below.

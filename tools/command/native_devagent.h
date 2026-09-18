@@ -236,7 +236,9 @@ struct rcv_beat_stats {
 long long zcl_devagent_receive_drive(const struct rcv_drive_opts *opts,
                                      struct rcv_beat_stats *st);
 
-/* Decide exactly what one beat would decide, and write and post nothing.
+/* Decide what one beat would decide for every directive from the start of
+ * the mail history (a survey ignores the resident's intake cursor and pages
+ * through the whole history), and write and post nothing.
  * This is what the status action reports; it creates no directory, no
  * brief, no queue row, no marker and no mail. `workspace` is the same
  * operator-named workspace the resident runs with: a survey that is not

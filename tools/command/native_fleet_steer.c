@@ -1131,6 +1131,68 @@ static void fmc_row_change(struct json_value *changes, const struct fmc_row *v,
     json_free(&item);
 }
 
+/* dev.agent.mail answers in bounded pages, and every mail reader in this
+ * file needs the whole history: follow next_since until a page says it was
+ * the last, appending each page's rows to *rows (an initialized array).
+ * FMC_MAIL_PAGES_MAX bounds the walk so a runaway history is an explicit
+ * failure, never a silently partial view. NULL on success with *cursor set
+ * to the mail leaf's cursor, else the missing[] reason. */
+#define FMC_MAIL_PAGES_MAX 4096
+#define FMC_MAIL_SINCE_CAP 4096
+
+/* One page after `since` ("" = from the start) onto *rows. NULL on success,
+ * with *more saying whether another page follows and `since` advanced. */
+static const char *fmc_mail_page(const struct zcl_command_request *req,
+                                 struct json_value *rows, long long *cursor,
+                                 char *since, bool *more)
+{
+    struct fmc_sub sub;
+    const struct json_value *arr, *tok, *tr;
+    const char *next;
+    size_t n, i;
+    fmc_sub_begin(&sub, "zcl.agent_mail.v1", req, "dev.agent.mail");
+    if (!sub.valid) {
+        fmc_sub_end(&sub);
+        return "unknown_sibling";
+    }
+    (void)json_push_kv_str(&sub.input, "action", "pull");
+    if (since[0])
+        (void)json_push_kv_str(&sub.input, "since", since);
+    else
+        (void)json_push_kv_int(&sub.input, "since", 0);
+    zcl_native_handle_dev_agent_mail(&sub.request, &sub.reply);
+    sub.ran = true;
+    tok = json_get(&sub.reply.data, "next_since");
+    next = (tok && tok->type == JSON_STR) ? json_get_str(tok) : NULL;
+    if (!fmc_sub_ok(&sub) || !next || strlen(next) >= FMC_MAIL_SINCE_CAP) {
+        fmc_sub_end(&sub);
+        return "sibling_refused";
+    }
+    *cursor = fmc_sub_int(&sub, "cursor", -1);
+    arr = json_get(&sub.reply.data, "rows");
+    n = (arr && arr->type == JSON_ARR) ? json_size(arr) : 0u;
+    for (i = 0; i < n; i++)
+        (void)json_push_back(rows, json_at(arr, i));
+    tr = json_get(&sub.reply.data, "truncated");
+    *more = tr && tr->type == JSON_BOOL && json_get_bool(tr);
+    (void)snprintf(since, FMC_MAIL_SINCE_CAP, "%s", next);
+    fmc_sub_end(&sub);
+    return NULL;
+}
+
+static const char *fmc_mail_drain(const struct zcl_command_request *req,
+                                  struct json_value *rows, long long *cursor)
+{
+    char since[FMC_MAIL_SINCE_CAP] = "";
+    bool more = true;
+    for (int page = 0; page < FMC_MAIL_PAGES_MAX && more; page++) {
+        const char *why = fmc_mail_page(req, rows, cursor, since, &more);
+        if (why)
+            return why;
+    }
+    return more ? "page_limit" : NULL;
+}
+
 static long long fmc_brief_mail(const struct zcl_command_request *req,
                                 struct json_value *agents,
                                 struct json_value *work,
@@ -1139,9 +1201,9 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
                                 struct json_value *missing,
                                 struct fmc_mail_view *view)
 {
-    struct fmc_sub sub;
-    const struct json_value *rows;
+    struct json_value rows;
     char sent_path[4096 + 32];
+    const char *why;
     size_t n, i;
     long long shown = 0;
     int64_t t0, t1;
@@ -1149,48 +1211,32 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
     view->count = 0;
     if (!fmc_sent_path_read(sent_path, sizeof(sent_path)))
         sent_path[0] = '\0';
-    fmc_sub_begin(&sub, "zcl.agent_mail.v1", req, "dev.agent.mail");
-    if (!sub.valid) {
-        fmc_note_missing(missing, "dev.agent.mail", "unknown_sibling", 0);
-        fmc_sub_end(&sub);
-        return -1;
-    }
-    if (!fmc_sub_input(&sub, "{\"action\":\"pull\",\"since\":0}")) {
-        fmc_note_missing(missing, "dev.agent.mail", "input_encode", 0);
-        fmc_sub_end(&sub);
-        return -1;
-    }
+    json_init(&rows);
+    json_set_array(&rows);
     t0 = clock_now_wall_ms();
-    zcl_native_handle_dev_agent_mail(&sub.request, &sub.reply);
+    why = fmc_mail_drain(req, &rows, &view->cursor);
     t1 = clock_now_wall_ms();
-    sub.ran = true;
-    if (!fmc_sub_ok(&sub)) {
-        fmc_note_missing(missing, "dev.agent.mail", "sibling_refused",
-                         t1 - t0);
-        fmc_sub_end(&sub);
+    if (why) {
+        fmc_note_missing(missing, "dev.agent.mail", why, t1 - t0);
+        json_free(&rows);
+        view->cursor = -1;
         return -1;
     }
-    view->cursor = fmc_sub_int(&sub, "cursor", -1);
-    view->count = fmc_sub_int(&sub, "count", 0);
-    rows = json_get(&sub.reply.data, "rows");
-    if (!rows || rows->type != JSON_ARR) {
-        fmc_sub_end(&sub);
-        return view->cursor;
-    }
-    n = json_size(rows);
+    n = json_size(&rows);
+    view->count = (long long)n;
     /* Newest-first walk from the tail: changes[] carries the latest rows
      * above `since`, each with its lifecycle state. */
     for (i = n; i > 0; i--) {
         struct fmc_row v;
-        if (!fmc_row_parse(json_at(rows, i - 1), &v))
+        if (!fmc_row_parse(json_at(&rows, i - 1), &v))
             continue;
         fmc_row_tally(agents, work, &v);
         if (v.seq <= since || shown >= changes_cap)
             continue;
-        fmc_row_change(changes, &v, rows, sent_path);
+        fmc_row_change(changes, &v, &rows, sent_path);
         shown++;
     }
-    fmc_sub_end(&sub);
+    json_free(&rows);
     return view->cursor;
 }
 
@@ -2167,57 +2213,47 @@ static void fmc_evidence_mail(const struct zcl_command_request *req,
                               struct zcl_command_reply *reply,
                               const char *ref)
 {
-    struct fmc_sub sub;
-    const struct json_value *rows;
+    struct json_value rows;
+    const struct json_value *hit = NULL;
+    long long cursor = -1;
+    const char *why;
     size_t n, i;
-    fmc_sub_begin(&sub, "zcl.agent_mail.v1", req, "dev.agent.mail");
-    if (!sub.valid) {
-        fmc_fail(reply, "EVIDENCE_UNAVAILABLE", "the mail sibling is unknown", "dev.agent.mail");
-        fmc_sub_end(&sub);
-        return;
-    }
-    if (!fmc_sub_input(&sub, "{\"action\":\"pull\",\"since\":0}")) {
-        fmc_fail(reply, "BAD_INPUT", "cannot encode the mail lookup",
-                 "input_encode");
-        fmc_sub_end(&sub);
-        return;
-    }
-    zcl_native_handle_dev_agent_mail(&sub.request, &sub.reply);
-    sub.ran = true;
-    if (!fmc_sub_ok(&sub)) {
+    json_init(&rows);
+    json_set_array(&rows);
+    why = fmc_mail_drain(req, &rows, &cursor);
+    if (why) {
         fmc_fail(reply, "EVIDENCE_UNAVAILABLE",
-                 "the mail store did not answer", "dev.agent.mail");
-        fmc_sub_end(&sub);
+                 strcmp(why, "unknown_sibling") == 0
+                     ? "the mail sibling is unknown"
+                     : "the mail store did not answer",
+                 "dev.agent.mail");
+        json_free(&rows);
         return;
     }
     /* A ref may own a thread (directive, then worker result rows). The
      * latest entry is the exact result, matching the queue rule that the
      * last terminal outcome wins; single-row threads read unchanged. */
-    rows = json_get(&sub.reply.data, "rows");
-    if (rows && rows->type == JSON_ARR) {
-        const struct json_value *hit = NULL;
-        n = json_size(rows);
-        for (i = 0; i < n; i++) {
-            const struct json_value *r = json_at(rows, i);
-            const struct json_value *v;
-            const char *rref;
-            if (!r || r->type != JSON_OBJ)
-                continue;
-            v = json_get(r, "ref");
-            rref = (v && v->type == JSON_STR) ? json_get_str(v) : "";
-            if (rref && strcmp(rref, ref) == 0)
-                hit = r;
-        }
-        if (hit) {
-            fmc_emit_object(reply, "mail", hit);
-            fmc_evidence_mail_ack(reply, hit, rows);
-            fmc_sub_end(&sub);
-            return;
-        }
+    n = json_size(&rows);
+    for (i = 0; i < n; i++) {
+        const struct json_value *r = json_at(&rows, i);
+        const struct json_value *v;
+        const char *rref;
+        if (!r || r->type != JSON_OBJ)
+            continue;
+        v = json_get(r, "ref");
+        rref = (v && v->type == JSON_STR) ? json_get_str(v) : "";
+        if (rref && strcmp(rref, ref) == 0)
+            hit = r;
+    }
+    if (hit) {
+        fmc_emit_object(reply, "mail", hit);
+        fmc_evidence_mail_ack(reply, hit, &rows);
+        json_free(&rows);
+        return;
     }
     fmc_fail(reply, "EVIDENCE_NOT_FOUND", "no mail row carries that ref",
              ref);
-    fmc_sub_end(&sub);
+    json_free(&rows);
 }
 
 /* One queue row by name: terminal-section matches overwrite *term so the

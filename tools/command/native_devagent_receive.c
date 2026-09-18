@@ -18,11 +18,21 @@
  *
  * ONE BEAT.
  *   1. INTAKE. dev.agent.mail is called in-process (the same shape
- *      fleet.steer uses) with action=pull, since=0, kind=directive. since
- *      is ALWAYS 0: a positive scalar cursor is refused outright once
- *      several .jsonl streams exist, because their sequence spaces are
- *      independent, so the filtering happens here instead. Pulled rows are
- *      never echoed into this leaf's own reply.
+ *      fleet.steer uses) with action=pull, kind=directive, and `since` set
+ *      to the durable INTAKE CURSOR: the mail leaf's own next_since token,
+ *      stored in <state>/receive/intake.state, or the integer 0 when there
+ *      is none yet. Mail answers in bounded pages, so a beat drains at most
+ *      RCV_PAGES_PER_BEAT pages and the next beat continues from the
+ *      cursor; no row is ever dropped because the history is long. The
+ *      cursor is advanced only AFTER every row of a page was handled, so a
+ *      crash mid-page replays that page, and the answer markers below make
+ *      the replay idempotent. A missing or unreadable cursor starts from
+ *      the beginning for the same reason. A failed pull is never silent:
+ *      it is logged with its code, counted in intake_failed, and recorded
+ *      (intake_failures, intake_last_error) for the status action; a
+ *      cursor the mail leaf rejects as stale or malformed is dropped so the
+ *      next beat replays instead of failing forever. Pulled rows are never
+ *      echoed into this leaf's own reply.
  *   2. ADMISSION, fail-closed, re-derived every beat so a revocation takes
  *      effect on the next one. A row is admitted only when ALL hold:
  *        - `to` names this receiver or is the broadcast "*";
@@ -142,7 +152,8 @@
  * second drive refuses immediately with RECEIVE_BUSY and never waits.
  *
  * RESTART SAFETY. Nothing is remembered in memory between beats: every
- * decision is re-derived from files — the mail dir, the grant store, the
+ * decision is re-derived from files — the intake cursor, the mail dir, the
+ * grant store, the
  * queue, the run dirs, the outcomes, and the stored brief. A crash between
  * the brief write and the queue post leaves a brief with no row, and the
  * next beat writes the identical brief and posts once. A crash between the
@@ -243,7 +254,13 @@
 #define RCV_LOG "dev.agent.receive"
 #define RCV_LOCK_FILE "receive.lock"
 #define RCV_SCOPE "send"
-#define RCV_ROWS_MAX 128u
+/* Intake pages one beat drains before it lets the loop wait again, and the
+ * ceiling a read-only survey walks from the beginning. A backlog larger than
+ * one beat continues on the next beat from the persisted intake cursor. */
+#define RCV_PAGES_PER_BEAT 4u
+#define RCV_SURVEY_PAGES 4096u
+#define RCV_POS_MAX 4096u
+#define RCV_INTAKE_FILE "intake.state"
 #define RCV_BODY_MAX 4097u
 /* The resolved brief is the received body with the workspace selector
  * replaced by an absolute path, so it is bounded by the mail body cap plus
@@ -438,6 +455,7 @@ struct rcv_paths {
     char maildir[3200];   /* <state>/mail */
     char enginedir[3200]; /* <state>/engine */
     char outcomes[3264];  /* <state>/queue/outcomes.jsonl */
+    char intake[3264];    /* <state>/receive/intake.state */
 };
 
 /* Resolve every path this leaf reads or writes. Creates nothing: the
@@ -463,6 +481,9 @@ static bool rcv_paths_resolve(struct rcv_paths *p)
         return false;
     if (snprintf(p->outcomes, sizeof(p->outcomes), "%s/queue/outcomes.jsonl",
                  p->root) <= 0)
+        return false;
+    if (snprintf(p->intake, sizeof(p->intake), "%s/%s", p->dir,
+                 RCV_INTAKE_FILE) <= 0)
         return false;
     return true;
 }
@@ -1308,6 +1329,15 @@ static bool rcv_outcome_names(const char *path, const char *ref)
 
 /* ── the beat ──────────────────────────────────────────────────────────── */
 
+/* The durable intake cursor and the intake failure record, one small file
+ * under this receiver's own state dir. `pos` is the mail leaf's next_since
+ * token for the directive stream, "" meaning "from the beginning". */
+struct rcv_intake {
+    char pos[RCV_POS_MAX];
+    long long failures;
+    char error[64];
+};
+
 struct rcv_ctx {
     struct rcv_paths p;
     char receiver[RCV_NAME_MAX + 1];
@@ -1317,6 +1347,7 @@ struct rcv_ctx {
     char workspace[ZCL_DEVAGENT_WS_PATH_MAX];
     bool dry; /* status: decide and count, write and post nothing */
     struct rcv_beat_stats *st;
+    struct rcv_intake intake;
 };
 
 /* Ask the queue whether it already holds this ref, then the run dirs, then
@@ -1832,33 +1863,170 @@ static void rcv_row_handle(struct rcv_ctx *c, const struct json_value *r)
         (void)rcv_write_atomic(marker, "", 0);
 }
 
-/* One beat: pull, then decide each row from files alone. */
-static void rcv_beat(struct rcv_ctx *c)
+/* ── the intake cursor ─────────────────────────────────────────────────── */
+
+/* A token is the mail leaf's own spelling: digits, a bar, and
+ * "<stream>:<offset>" entries. Anything else in the file is not a token
+ * this receiver wrote, and is treated as no cursor (replay from the
+ * beginning, which the answer markers make idempotent). */
+static bool rcv_pos_ok(const char *s)
+{
+    size_t n = strlen(s);
+    if (n == 0 || n >= RCV_POS_MAX || !strchr(s, '|'))
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        if (!isalnum(ch) && !strchr("._-:|,", ch))
+            return false;
+    }
+    return true;
+}
+
+/* One "key=value" line of the intake file into *in. */
+static void rcv_intake_line(const char *line, struct rcv_intake *in)
+{
+    if (strncmp(line, "position=", 9) == 0 && rcv_pos_ok(line + 9))
+        (void)snprintf(in->pos, sizeof(in->pos), "%s", line + 9);
+    else if (strncmp(line, "failures=", 9) == 0)
+        in->failures = strtoll(line + 9, NULL, 10);
+    else if (strncmp(line, "last_error=", 11) == 0)
+        (void)snprintf(in->error, sizeof(in->error), "%.63s", line + 11);
+}
+
+/* Read the intake file. Absent or unreadable is the empty record. */
+static void rcv_intake_load(const struct rcv_paths *p, struct rcv_intake *in)
+{
+    char text[RCV_POS_MAX + 256];
+    char *line, *nl;
+    memset(in, 0, sizeof(*in));
+    if (!rcv_read_file(p->intake, text, sizeof(text)))
+        return;
+    for (line = text; line && *line; line = nl ? nl + 1 : NULL) {
+        nl = strchr(line, '\n');
+        if (nl)
+            *nl = '\0';
+        rcv_intake_line(line, in);
+    }
+    if (in->failures < 0)
+        in->failures = 0;
+}
+
+static void rcv_intake_save(const struct rcv_ctx *c)
+{
+    char text[RCV_POS_MAX + 256];
+    int n;
+    if (c->dry)
+        return;
+    n = snprintf(text, sizeof(text),
+                 "position=%s\nfailures=%lld\nlast_error=%s\n",
+                 c->intake.pos, c->intake.failures, c->intake.error);
+    if (n <= 0 || (size_t)n >= sizeof(text) ||
+        !rcv_write_atomic(c->p.intake, text, (size_t)n))
+        LOG_WARN(RCV_LOG, "cannot record the intake cursor in %s",
+                 c->p.intake);
+}
+
+/* Never silent: every failed pull is logged with its code, counted in this
+ * drive's stats, and recorded for the status action. A cursor the mail
+ * leaf rejects (a stream replaced or truncated under it) is dropped, so the
+ * next beat replays from the beginning instead of failing forever. */
+static void rcv_intake_failed(struct rcv_ctx *c, const char *code,
+                              const char *since)
+{
+    bool reset = since[0] && (strcmp(code, "MAIL_CURSOR_STALE") == 0 ||
+                              strcmp(code, "BAD_INPUT") == 0);
+    c->st->intake_failed++;
+    LOG_WARN(RCV_LOG, "intake pull failed: %s (%s)%s", code,
+             since[0] ? "resuming from the intake cursor"
+                      : "from the beginning",
+             reset ? "; dropping the cursor, next beat replays" : "");
+    if (c->dry)
+        return;
+    c->intake.failures++;
+    (void)snprintf(c->intake.error, sizeof(c->intake.error), "%s", code);
+    if (reset)
+        c->intake.pos[0] = '\0';
+    rcv_intake_save(c);
+}
+
+/* The page's resume token and whether more rows wait behind it. False
+ * when the reply does not carry a token this receiver can store. */
+static bool rcv_page_tail(const struct rcv_sub *sub, char *next, size_t cap,
+                          bool *more)
+{
+    const struct json_value *tok = json_get(&sub->reply.data, "next_since");
+    const struct json_value *tr = json_get(&sub->reply.data, "truncated");
+    const char *s = (tok && tok->type == JSON_STR) ? json_get_str(tok) : NULL;
+    if (!s || !rcv_pos_ok(s) || strlen(s) >= cap)
+        return false;
+    (void)snprintf(next, cap, "%s", s);
+    *more = tr && tr->type == JSON_BOOL && json_get_bool(tr);
+    return true;
+}
+
+/* Pull and handle one page of directives after `since` ("" = from the
+ * beginning). Rows are handled in page order before the caller may
+ * advance the cursor past them. False with *code set on intake failure. */
+static bool rcv_intake_page(struct rcv_ctx *c, const char *since, char *next,
+                            size_t cap, bool *more, char *code, size_t ccap)
 {
     struct rcv_sub sub;
     const struct json_value *rows;
     size_t n, i;
-    c->st->beats++;
-    if (c->dry && !rcv_is_dir(c->p.maildir))
-        return;
     rcv_sub_begin(&sub, "zcl.agent_mail.v1", "dev.agent.mail");
-    /* since is ALWAYS 0: a positive scalar cursor is refused once several
-     * .jsonl streams exist, because their sequence spaces are independent. */
-    if (sub.valid && rcv_sub_input(&sub, "{\"action\":\"pull\",\"since\":0,"
-                                         "\"kind\":\"directive\"}")) {
+    if (sub.valid) {
+        (void)json_push_kv_str(&sub.input, "action", "pull");
+        (void)json_push_kv_str(&sub.input, "kind", "directive");
+        if (since[0])
+            (void)json_push_kv_str(&sub.input, "since", since);
+        else
+            (void)json_push_kv_int(&sub.input, "since", 0);
         zcl_native_handle_dev_agent_mail(&sub.request, &sub.reply);
         sub.ran = true;
     }
-    if (!rcv_sub_ok(&sub)) {
+    if (!rcv_sub_ok(&sub) || !rcv_page_tail(&sub, next, cap, more)) {
+        (void)snprintf(code, ccap, "%s",
+                       !sub.valid ? "MAIL_LEAF_UNAVAILABLE"
+                       : sub.reply.error.code[0] ? sub.reply.error.code
+                                                 : "MAIL_REPLY_UNREADABLE");
         rcv_sub_end(&sub);
-        c->st->intake_failed++;
-        return;
+        return false;
     }
     rows = json_get(&sub.reply.data, "rows");
     n = (rows && rows->type == JSON_ARR) ? json_size(rows) : 0u;
-    for (i = 0; i < n && i < RCV_ROWS_MAX; i++)
+    for (i = 0; i < n; i++)
         rcv_row_handle(c, json_at(rows, i));
     rcv_sub_end(&sub);
+    return true;
+}
+
+/* One beat: drain up to RCV_PAGES_PER_BEAT pages from the intake cursor,
+ * persisting the cursor after each handled page, then decide each row from
+ * files alone. A survey walks from the beginning instead and persists
+ * nothing. */
+static void rcv_beat(struct rcv_ctx *c)
+{
+    char since[RCV_POS_MAX], next[RCV_POS_MAX], code[64];
+    unsigned pages = 0;
+    unsigned cap = c->dry ? RCV_SURVEY_PAGES : RCV_PAGES_PER_BEAT;
+    bool more = true;
+    c->st->beats++;
+    if (c->dry && !rcv_is_dir(c->p.maildir))
+        return;
+    (void)snprintf(since, sizeof(since), "%s", c->dry ? "" : c->intake.pos);
+    while (more && pages++ < cap) {
+        if (!rcv_intake_page(c, since, next, sizeof(next), &more, code,
+                             sizeof(code))) {
+            rcv_intake_failed(c, code, since);
+            return;
+        }
+        (void)snprintf(since, sizeof(since), "%s", next);
+        if (!c->dry && strcmp(since, c->intake.pos) != 0) {
+            (void)snprintf(c->intake.pos, sizeof(c->intake.pos), "%s",
+                           since);
+            rcv_intake_save(c);
+        }
+    }
 }
 
 /* ── the resident drive ────────────────────────────────────────────────── */
@@ -1945,6 +2113,9 @@ static long long rcv_drive_posix(const struct rcv_drive_opts *opts,
     (void)snprintf(c.receiver, sizeof(c.receiver), "%s", opts->receiver);
     (void)snprintf(c.workspace, sizeof(c.workspace), "%s", opts->workspace);
     c.st = st;
+    /* Resume where the last drive stopped: the cursor file is the only
+     * intake memory that survives a restart. */
+    rcv_intake_load(&c.p, &c.intake);
     g_rcv_term = 0;
     old_term = signal(SIGTERM, rcv_on_term);
     t0 = platform_time_wall_unix();
@@ -2102,6 +2273,22 @@ static void rcv_push_stats(struct zcl_command_reply *reply,
     (void)json_push_kv_int(&reply->data, "intake_failed", st->intake_failed);
 }
 
+/* The resident's durable intake record, read-only: where its cursor
+ * stands, how many pulls have failed across its drives, and the last
+ * failure code. A survey cannot see these, because it pulls on its own. */
+static void rcv_push_intake(struct zcl_command_reply *reply,
+                            const struct rcv_paths *p)
+{
+    struct rcv_intake in;
+    rcv_intake_load(p, &in);
+    (void)json_push_kv_str(&reply->data, "intake_cursor",
+                           in.pos[0] ? in.pos : "");
+    (void)json_push_kv_str(&reply->data, "intake_cursor_state",
+                           in.pos[0] ? "resuming" : "from-start");
+    (void)json_push_kv_int(&reply->data, "intake_failures", in.failures);
+    (void)json_push_kv_str(&reply->data, "intake_last_error", in.error);
+}
+
 static void rcv_status(const char *receiver, const char *workspace,
                        struct zcl_command_reply *reply)
 {
@@ -2131,6 +2318,7 @@ static void rcv_status(const char *receiver, const char *workspace,
                            rcv_is_dir(p.maildir) ? "present" : "absent");
     (void)json_push_kv_str(&reply->data, "scope", RCV_SCOPE);
     rcv_push_stats(reply, &st);
+    rcv_push_intake(reply, &p);
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
 }

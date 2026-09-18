@@ -367,6 +367,175 @@ static bool dvx_cursor_refusal_serializes(const struct dvx_call *call)
     return ok;
 }
 
+/* ── paging: a long history never fails a pull wholesale ─────────────────
+ * The live defect: an append-only history of ~130 directive rows made one
+ * `pull --since=0` exceed the leaf's response budget, so the CLI answered
+ * RESPONSE_BUDGET_EXCEEDED and returned nothing at all. A pull is now one
+ * bounded page plus a resume token, and draining the token returns every
+ * row exactly once. */
+
+#define DVX_PAGE_ROWS 202u
+
+static void dvx_pull_token(struct dvx_call *c, const char *token,
+                           const char *kind)
+{
+    dvx_begin(c);
+    (void)json_push_kv_str(&c->input, "action", "pull");
+    (void)json_push_kv_str(&c->input, "since", token);
+    if (kind)
+        (void)json_push_kv_str(&c->input, "kind", kind);
+}
+
+/* Serialize this exact pull through the real registry under the leaf's
+ * own declared response budget: the CLI shape that failed before. */
+static bool dvx_pull_fits_budget(const struct dvx_call *call)
+{
+    if (!call->request.spec)
+        return false;
+    struct zcl_command_spec spec = *call->request.spec;
+    spec.handler = zcl_native_handle_dev_agent_mail;
+    size_t cap = 65536;
+    char *wire = malloc(cap);
+    enum zcl_command_exit code = ZCL_COMMAND_EXIT_INTERNAL;
+    if (!wire)
+        return false;
+    size_t len = zcl_command_registry_execute_json(zcl_command_catalog(),
+        &spec, NULL, &call->input, false, DVX_PATH, NULL, 0, 0, NULL,
+        wire, cap, &code);
+    bool ok = len > 0 && code == ZCL_COMMAND_EXIT_OK &&
+              strstr(wire, "RESPONSE_BUDGET_EXCEEDED") == NULL &&
+              strstr(wire, "\"truncated\":true") != NULL;
+    free(wire);
+    return ok;
+}
+
+/* Mark each row's "row-NNN" body index; false on a duplicate or a body
+ * this rig never wrote. */
+static bool dvx_mark_rows(const struct json_value *rows, unsigned char *seen,
+                          size_t *total)
+{
+    for (size_t i = 0; rows && i < rows->num_children; i++) {
+        const char *body = json_get_str(json_get(&rows->children[i], "body"));
+        long idx;
+        if (!body || strncmp(body, "row-", 4) != 0)
+            return false;
+        idx = strtol(body + 4, NULL, 10);
+        if (idx < 0 || (size_t)idx >= DVX_PAGE_ROWS + 1u || seen[idx])
+            return false;
+        seen[idx] = 1;
+        (*total)++;
+    }
+    return true;
+}
+
+/* Post n directive rows, each ~1.5 KiB, so the history is several times
+ * one response budget. */
+static bool dvx_post_history(size_t n)
+{
+    char body[1600];
+    for (size_t i = 0; i < n; i++) {
+        struct dvx_call c;
+        int w = snprintf(body, sizeof(body), "row-%03zu ", i);
+        memset(body + w, 'x', 1500);
+        body[w + 1500] = '\0';
+        dvx_post(&c, "alice", "*", "directive", body);
+        bool ok = dvx_run(&c) && dvx_ok(&c);
+        dvx_end(&c);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+/* Follow next_since from `token` until a page is the last one. Returns the
+ * number of pages, or 0 when a page failed or repeated a row. */
+static size_t dvx_drain(char *token, size_t cap, unsigned char *seen,
+                        size_t *total)
+{
+    size_t pages = 0;
+    bool more = true;
+    while (more && pages < 1000) {
+        struct dvx_call p;
+        const struct json_value *tr;
+        dvx_pull_token(&p, token, "directive");
+        if (!dvx_run(&p) || !dvx_ok(&p) ||
+            !dvx_mark_rows(dvx_arr(&p, "rows"), seen, total)) {
+            dvx_end(&p);
+            return 0;
+        }
+        tr = json_get(&p.reply.data, "truncated");
+        more = tr && tr->type == JSON_BOOL && json_get_bool(tr);
+        (void)snprintf(token, cap, "%s", dvx_str(&p, "next_since"));
+        dvx_end(&p);
+        pages++;
+    }
+    return more ? 0 : pages;
+}
+
+static void dvx_import_append(const char *name, const char *row)
+{
+    char maildir[1024], path[1200];
+    dvx_maildir(maildir, sizeof(maildir));
+    (void)snprintf(path, sizeof(path), "%s/%s.jsonl", maildir, name);
+    FILE *f = fopen(path, "a");
+    if (!f || fputs(row, f) < 0 || fclose(f) != 0)
+        dvx_fixture_fail("cannot append to imported stream");
+}
+
+static int test_mail_paging(void)
+{
+    int failures = 0;
+    TEST("mail: a pull over a large history pages with a token, every row once") {
+        static unsigned char seen[DVX_PAGE_ROWS + 1u];
+        char token[4096];
+        size_t total = 0, pages;
+        struct dvx_call p;
+        memset(seen, 0, sizeof(seen));
+        dvx_isolate("paging");
+        ASSERT(dvx_post_history(200));
+        /* A second stream whose rows sort BEFORE the whole outbox. */
+        dvx_import_stream("inbox.peer",
+            "{\"seq\":1,\"ts\":\"2020-01-01T00:00:00Z\",\"from\":\"bob\","
+            "\"to\":\"*\",\"kind\":\"directive\",\"body\":\"row-200\","
+            "\"ref\":\"\"}\n"
+            "{\"seq\":2,\"ts\":\"2020-01-01T00:00:01Z\",\"from\":\"bob\","
+            "\"to\":\"*\",\"kind\":\"directive\",\"body\":\"row-201\","
+            "\"ref\":\"\"}\n");
+        /* The first page is bounded, truncated, resumable, and serializes
+         * inside the budget where the whole history could not. */
+        dvx_pull(&p, 0, NULL, "directive");
+        ASSERT(dvx_run(&p) && dvx_ok(&p));
+        ASSERT(json_get_bool(json_get(&p.reply.data, "truncated")));
+        ASSERT(dvx_int(&p, "count") > 0 && dvx_int(&p, "count") < 202);
+        ASSERT(strchr(dvx_str(&p, "next_since"), '|') != NULL);
+        ASSERT(dvx_pull_fits_budget(&p));
+        dvx_end(&p);
+        /* Draining the token from the start yields every row once. */
+        (void)snprintf(token, sizeof(token), "%s", "0|");
+        pages = dvx_drain(token, sizeof(token), seen, &total);
+        ASSERT(pages > 1);
+        ASSERT_EQ(total, (size_t)202);
+        /* A row a transport appends later, with a ts OLDER than every row
+         * already drained, is still returned: streams resume by offset. */
+        dvx_import_append("inbox.peer",
+            "{\"seq\":3,\"ts\":\"2019-01-01T00:00:00Z\",\"from\":\"bob\","
+            "\"to\":\"*\",\"kind\":\"directive\",\"body\":\"row-202\","
+            "\"ref\":\"\"}\n");
+        ASSERT_EQ(dvx_drain(token, sizeof(token), seen, &total), (size_t)1);
+        ASSERT_EQ(total, (size_t)203);
+        /* A stream replaced under the token is refused, never guessed. */
+        dvx_import_stream("inbox.peer", "\n");
+        dvx_pull_token(&p, token, "directive");
+        ASSERT(dvx_run(&p) && !dvx_ok(&p));
+        ASSERT_STR_EQ(p.reply.error.code, "MAIL_CURSOR_STALE");
+        dvx_end(&p);
+        dvx_restore();
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
 static int test_mail_independent_cursor(void)
 {
     int failures = 0;
@@ -513,6 +682,7 @@ int test_devagent_mail(void)
     long long cursor = 0;
 
     failures += test_mail_independent_cursor();
+    failures += test_mail_paging();
 #if !defined(_WIN32)
     failures += test_mail_cwd_invariance();
 #endif

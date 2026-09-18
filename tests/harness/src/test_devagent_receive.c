@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 #if !defined(_WIN32)
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/file.h>
@@ -530,33 +531,55 @@ static long long rtx_queue_count(const char *bucket, const char *ref)
     return hits;
 }
 
-/* How many mail rows from this receiver under `ref` carry `needle`. */
+/* Count one page's rows under `ref` whose body carries `needle`. */
+static long long rtx_answers_in(const struct json_value *arr, const char *ref,
+                                const char *needle)
+{
+    long long hits = 0;
+    size_t n = (arr && arr->type == JSON_ARR) ? json_size(arr) : 0u, i;
+    for (i = 0; i < n; i++) {
+        const struct json_value *r = json_at(arr, i);
+        const struct json_value *b = r ? json_get(r, "body") : NULL;
+        const struct json_value *f = r ? json_get(r, "ref") : NULL;
+        if (!b || b->type != JSON_STR || !f || f->type != JSON_STR)
+            continue;
+        if (strcmp(json_get_str(f), ref) != 0)
+            continue;
+        if (strstr(json_get_str(b), needle) != NULL)
+            hits++;
+    }
+    return hits;
+}
+
+/* How many mail rows from this receiver under `ref` carry `needle`. Mail
+ * answers in bounded pages, so this follows next_since to the last page. */
 static long long rtx_answers(const char *ref, const char *needle)
 {
-    struct rtx_call c;
-    const struct json_value *arr;
+    char since[4096] = "";
     long long hits = 0;
-    rtx_begin(&c, "dev.agent.mail", "zcl.agent_mail.v1");
-    (void)json_push_kv_str(&c.input, "action", "pull");
-    (void)json_push_kv_int(&c.input, "since", 0);
-    (void)json_push_kv_str(&c.input, "from", "box-a");
-    zcl_native_handle_dev_agent_mail(&c.request, &c.reply);
-    arr = rtx_ok(&c) ? json_get(&c.reply.data, "rows") : NULL;
-    if (arr && arr->type == JSON_ARR) {
-        size_t n = json_size(arr), i;
-        for (i = 0; i < n; i++) {
-            const struct json_value *r = json_at(arr, i);
-            const struct json_value *b = r ? json_get(r, "body") : NULL;
-            const struct json_value *f = r ? json_get(r, "ref") : NULL;
-            if (!b || b->type != JSON_STR || !f || f->type != JSON_STR)
-                continue;
-            if (strcmp(json_get_str(f), ref) != 0)
-                continue;
-            if (strstr(json_get_str(b), needle) != NULL)
-                hits++;
+    bool more = true;
+    for (int page = 0; more && page < 1000; page++) {
+        struct rtx_call c;
+        const struct json_value *tr;
+        rtx_begin(&c, "dev.agent.mail", "zcl.agent_mail.v1");
+        (void)json_push_kv_str(&c.input, "action", "pull");
+        if (since[0])
+            (void)json_push_kv_str(&c.input, "since", since);
+        else
+            (void)json_push_kv_int(&c.input, "since", 0);
+        (void)json_push_kv_str(&c.input, "from", "box-a");
+        zcl_native_handle_dev_agent_mail(&c.request, &c.reply);
+        if (!rtx_ok(&c)) {
+            rtx_end(&c);
+            return -1;
         }
+        hits += rtx_answers_in(json_get(&c.reply.data, "rows"), ref, needle);
+        tr = json_get(&c.reply.data, "truncated");
+        more = tr && tr->type == JSON_BOOL && json_get_bool(tr);
+        (void)snprintf(since, sizeof(since), "%s",
+                       rtx_reply_str(&c, "next_since"));
+        rtx_end(&c);
     }
-    rtx_end(&c);
     return hits;
 }
 
@@ -583,12 +606,295 @@ static void rtx_alarm_to_term(int sig)
 }
 #endif
 
+/* ── intake paging: a long history never deafens the receiver ────────────
+ * The live defect: every beat pulled the WHOLE directive history, so it
+ * grew without bound, and at most 128 rows of it were ever looked at — the
+ * newest directives sort last and were silently never handled. Intake now
+ * pages through the mail leaf's bounded replies from a durable cursor. */
+#if !defined(_WIN32)
+
+/* Deliver n rows from `peer` to `to`, refs "<prefix>-NNN". pad > 0 makes
+ * each body `pad` filler bytes; 0 makes it a well-formed direction. */
+static bool rtx_deliver_many(const char *peer, const char *to,
+                             const char *prefix, size_t n, size_t pad)
+{
+    char body[4096], ref[64];
+    for (size_t i = 0; i < n; i++) {
+        (void)snprintf(ref, sizeof(ref), "%s-%03zu", prefix, i);
+        if (pad > 0 && pad < sizeof(body)) {
+            memset(body, 'x', pad);
+            body[pad] = '\0';
+        } else {
+            rtx_direction(body, sizeof(body), "hex_codec", "Pending work.");
+        }
+        if (!rtx_deliver(peer, to, ref, body, (long long)i + 1))
+            return false;
+    }
+    return true;
+}
+
+/* Entries (not "." or "..") in one directory under the state root. */
+static long long rtx_count_dir(const char *tail)
+{
+    char path[1400];
+    DIR *d;
+    struct dirent *e;
+    long long n = 0;
+    rtx_path(path, sizeof(path), tail);
+    d = opendir(path);
+    if (!d)
+        return -1;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+            n++;
+    }
+    (void)closedir(d);
+    return n;
+}
+
+/* Remove every answer marker, so only the intake cursor can stop a
+ * replay from being answered twice. */
+static bool rtx_clear_answers(void)
+{
+    char dir[1400], path[1800];
+    DIR *d;
+    struct dirent *e;
+    rtx_path(dir, sizeof(dir), "receive/answered");
+    d = opendir(dir);
+    if (!d)
+        return false;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.')
+            continue;
+        (void)snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        (void)remove(path);
+    }
+    (void)closedir(d);
+    return rtx_count_dir("receive/answered") == 0;
+}
+
+/* Write (truncate) a file under the state root with `text`. */
+static bool rtx_write(const char *tail, const char *text)
+{
+    char path[1400];
+    FILE *f;
+    rtx_path(path, sizeof(path), tail);
+    f = fopen(path, "wb");
+    if (!f)
+        return false;
+    (void)fputs(text, f);
+    return fclose(f) == 0;
+}
+
+/* The receiver's status action: its durable intake record. */
+static bool rtx_status_intake(char *error, size_t cap, long long *failures,
+                              char *state, size_t scap)
+{
+    struct rtx_call c;
+    const struct json_value *v;
+    bool ok;
+    rtx_begin(&c, "dev.agent.receive", "zcl.agent_receive.v1");
+    (void)json_push_kv_str(&c.input, "action", "status");
+    (void)json_push_kv_str(&c.input, "receiver", "box-a");
+    zcl_native_handle_dev_agent_receive(&c.request, &c.reply);
+    ok = rtx_ok(&c);
+    (void)snprintf(error, cap, "%s", rtx_reply_str(&c, "intake_last_error"));
+    (void)snprintf(state, scap, "%s",
+                   rtx_reply_str(&c, "intake_cursor_state"));
+    v = json_get(&c.reply.data, "intake_failures");
+    *failures = (v && v->type == JSON_INT) ? json_get_int(v) : -1;
+    rtx_end(&c);
+    return ok;
+}
+
+/* One-beat drive, stats zeroed first. */
+static long long rtx_beat_once(struct rcv_beat_stats *st)
+{
+    struct rcv_drive_opts o;
+    rtx_opts(&o, 1);
+    memset(st, 0, sizeof(*st));
+    return zcl_devagent_receive_drive(&o, st);
+}
+
+/* Is a raw directive pull over this box's mail already one truncated
+ * page, i.e. is the history larger than one response? */
+static bool rtx_history_pages(void)
+{
+    struct rtx_call c;
+    const struct json_value *tr;
+    bool paged;
+    rtx_begin(&c, "dev.agent.mail", "zcl.agent_mail.v1");
+    (void)json_push_kv_str(&c.input, "action", "pull");
+    (void)json_push_kv_int(&c.input, "since", 0);
+    (void)json_push_kv_str(&c.input, "kind", "directive");
+    zcl_native_handle_dev_agent_mail(&c.request, &c.reply);
+    tr = json_get(&c.reply.data, "truncated");
+    paged = rtx_ok(&c) && tr && tr->type == JSON_BOOL && json_get_bool(tr);
+    rtx_end(&c);
+    return paged;
+}
+
+static int test_receive_intake_paging(void)
+{
+    int failures = 0;
+
+    TEST("a history past one response budget never deafens intake")
+    {
+        struct rcv_drive_opts o;
+        struct rcv_beat_stats st;
+        char body[4096];
+        rtx_isolate("budget");
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        /* 200 directives of ~1.5 KiB for another box: several responses'
+         * worth of history this receiver must read past. */
+        ASSERT(rtx_deliver_many("chatgpt", "box-b", "hist", 200, 1500));
+        ASSERT(rtx_history_pages());
+        rtx_direction(body, sizeof(body), "hex_codec", "After the history.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-fresh", body, 201));
+        /* A receiver with no cursor pages through and admits it. */
+        rtx_opts(&o, 20);
+        memset(&st, 0, sizeof(st));
+        ASSERT_EQ(zcl_devagent_receive_drive(&o, &st), 20);
+        ASSERT_EQ(st.intake_failed, 0);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-fresh"), 1);
+        /* Caught up, one fresh directive is admitted within one beat. */
+        rtx_direction(body, sizeof(body), "hex_codec", "One more.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-fresh2", body, 202));
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.intake_failed, 0);
+        ASSERT_EQ(st.seen, 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(rtx_answers("job-fresh2", "state=accepted"), 1);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("more than 128 pending directives are all handled across beats")
+    {
+        struct rcv_beat_stats st;
+        long long total;
+        rtx_isolate("backlog");
+        /* 300 pending rows from a sender with no grant: each is refused,
+         * answered, and marked — cheap to decide, so the case is intake. */
+        ASSERT(rtx_deliver_many("stranger", "box-a", "job-b", 300, 0));
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.intake_failed, 0);
+        /* One beat is bounded: it never swallows the whole backlog. */
+        ASSERT(st.seen > 0 && st.seen < 300);
+        total = st.seen;
+        for (int k = 0; k < 20 && total < 300; k++) {
+            ASSERT_EQ(rtx_beat_once(&st), 1);
+            ASSERT_EQ(st.intake_failed, 0);
+            total += st.seen;
+        }
+        ASSERT_EQ(total, 300);
+        ASSERT_EQ(rtx_count_dir("receive/answered"), 300);
+        ASSERT_EQ(rtx_answers("job-b-299", "RECEIVE_SENDER_UNGRANTED"), 1);
+        /* Drained: the next beat reads nothing again. */
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.seen, 0);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("a restart resumes from the persisted intake cursor")
+    {
+        struct rcv_beat_stats st;
+        char body[4096], err[64], state[32];
+        long long fails;
+        rtx_isolate("resume");
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction(body, sizeof(body), "hex_codec", "Before restart.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-r1", body, 1));
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT(rtx_exists("receive/intake.state"));
+        /* Without the markers, only the cursor keeps job-r1 from being
+         * read, reconciled and answered a second time. */
+        ASSERT(rtx_clear_answers());
+        rtx_direction(body, sizeof(body), "hex_codec", "After restart.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-r2", body, 2));
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.seen, 1);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(st.reconciled, 0);
+        ASSERT_EQ(rtx_queue_count("queued", "job-r1"), 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-r2"), 1);
+        ASSERT_EQ(rtx_answers("job-r1", "state=accepted"), 1);
+        ASSERT(rtx_status_intake(err, sizeof(err), &fails, state,
+                                 sizeof(state)));
+        ASSERT_STR_EQ(state, "resuming");
+        ASSERT_EQ(fails, 0);
+        rtx_restore();
+        PASS();
+    }
+
+    TEST("an intake failure is logged, counted and shown, never silent")
+    {
+        struct rcv_beat_stats st;
+        char body[4096], err[64], state[32];
+        long long fails;
+        rtx_isolate("intakefail");
+        ASSERT(rtx_mint("chatgpt", "send", 3600, NULL, 0));
+        rtx_direction(body, sizeof(body), "hex_codec", "First.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-f1", body, 1));
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.admitted, 1);
+        /* A stream no resume token can name makes the pull refuse. */
+        ASSERT(rtx_write("mail/bad name.jsonl", ""));
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.intake_failed, 1);
+        ASSERT(rtx_status_intake(err, sizeof(err), &fails, state,
+                                 sizeof(state)));
+        ASSERT_EQ(fails, 1);
+        ASSERT_STR_EQ(err, "MAIL_STREAM_NAME_INVALID");
+        {
+            char bad[1400];
+            rtx_path(bad, sizeof(bad), "mail/bad name.jsonl");
+            ASSERT_EQ(remove(bad), 0);
+        }
+        rtx_direction(body, sizeof(body), "hex_codec", "Second.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-f2", body, 2));
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.intake_failed, 0);
+        ASSERT_EQ(st.admitted, 1);
+        /* A stream replaced under the cursor: the stale cursor is dropped
+         * and the next beat replays from the start, queueing nothing twice. */
+        ASSERT(rtx_write("mail/inbox.chatgpt.jsonl", ""));
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.intake_failed, 1);
+        ASSERT(rtx_status_intake(err, sizeof(err), &fails, state,
+                                 sizeof(state)));
+        ASSERT_EQ(fails, 2);
+        ASSERT_STR_EQ(err, "MAIL_CURSOR_STALE");
+        ASSERT_STR_EQ(state, "from-start");
+        rtx_direction(body, sizeof(body), "hex_codec", "Third.");
+        ASSERT(rtx_deliver("chatgpt", "box-a", "job-f3", body, 1));
+        ASSERT_EQ(rtx_beat_once(&st), 1);
+        ASSERT_EQ(st.intake_failed, 0);
+        ASSERT_EQ(st.admitted, 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-f1"), 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-f2"), 1);
+        ASSERT_EQ(rtx_queue_count("queued", "job-f3"), 1);
+        rtx_restore();
+        PASS();
+    }
+
+_test_next:;
+    rtx_restore();
+    return failures;
+}
+#endif /* !defined(_WIN32) */
+
 int test_devagent_receive(void);
 int test_devagent_receive(void)
 {
     int failures = 0;
 
 #if !defined(_WIN32)
+    failures += test_receive_intake_paging();
+
     TEST("a granted directive becomes one queue row and one accept")
     {
         struct rcv_drive_opts o;
