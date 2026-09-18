@@ -25,6 +25,7 @@ ZCL_WINDOWS_ACCEPTANCE_TESTS := \
 	dev_agent_mail \
 	dev_fleet_capture \
 	dev_train_keep \
+	devagent_worker_confine \
 	directory_compat \
 	directory_transaction \
 	disk_space \
@@ -245,6 +246,26 @@ ZCL_WINDOWS_ACCEPTANCE_dev_agent_mail_FLAGS := \
 	-Itools
 ZCL_WINDOWS_ACCEPTANCE_dev_agent_mail_LIBS := \
 	-ladvapi32 -lshell32 -lole32 -luuid $(ZCL_WINDOWS_ACCEPTANCE_PTHREAD_LIB)
+
+# dev.agent.worker's Windows confinement backend, natively: write scope,
+# job memory cap, whole-tree wall kill, job CPU cap, failed-verdict
+# mapping, and the child entry's refusal outside its confinement. The
+# program is its own confined child (it re-enters with the worker's child
+# flag), so it links the real spawn and receipt mapping, not a copy.
+ZCL_WINDOWS_ACCEPTANCE_devagent_worker_confine_SOURCES := \
+	tests/harness/src/devagent_worker_confine_windows_acceptance.c \
+	tools/command/native_devagent_worker_run.c \
+	platform/modules/platform/src/confined_process.c \
+	platform/modules/platform/src/process_lifecycle.c \
+	platform/modules/platform/src/os_proc.c \
+	platform/modules/platform/src/clock.c \
+	platform/modules/json/src/json.c \
+	platform/modules/base/src/safe_alloc.c \
+	platform/modules/base/src/log_level.c
+ZCL_WINDOWS_ACCEPTANCE_devagent_worker_confine_FLAGS := \
+	-Itools
+ZCL_WINDOWS_ACCEPTANCE_devagent_worker_confine_LIBS := \
+	-ladvapi32 -lpsapi -lshell32 $(ZCL_WINDOWS_ACCEPTANCE_PTHREAD_LIB)
 
 ZCL_WINDOWS_ACCEPTANCE_dev_train_keep_SOURCES := \
 	tests/harness/src/dev_train_keep_windows_acceptance.c \

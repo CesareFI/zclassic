@@ -263,7 +263,11 @@ static bool cf_root_clean(const wchar_t *path)
     return cf_scan_clean(path, 0, &seen);
 }
 
-static bool cf_label(const char *root, const wchar_t *sddl)
+/* Apply one inheritable label to the root and every object beneath it.
+ * TREE_SEC_INFO_SET (grant) propagates the low label to what already
+ * exists; TREE_SEC_INFO_RESET (release) also replaces any explicit label
+ * the child stamped on its own files, so nothing it made stays low. */
+static bool cf_label(const char *root, const wchar_t *sddl, DWORD action)
 {
     PSECURITY_DESCRIPTOR sd = NULL;
     PACL sacl = NULL;
@@ -274,20 +278,22 @@ static bool cf_label(const char *root, const wchar_t *sddl)
                   sddl, SDDL_REVISION_1, &sd, NULL) &&
               GetSecurityDescriptorSacl(sd, &present, &sacl, &defaulted) &&
               present && sacl &&
-              SetNamedSecurityInfoW(path, SE_FILE_OBJECT,
-                                    LABEL_SECURITY_INFORMATION, NULL, NULL,
-                                    NULL, sacl) == ERROR_SUCCESS;
+              TreeSetNamedSecurityInfoW(path, SE_FILE_OBJECT,
+                                        LABEL_SECURITY_INFORMATION, NULL,
+                                        NULL, NULL, sacl, action, NULL,
+                                        ProgressInvokeNever,
+                                        NULL) == ERROR_SUCCESS;
     if (sd)
         LocalFree(sd);
     free(path);
     return ok;
 }
-
 static enum platform_confine_missing
 cf_grant_roots(const struct platform_confined_spec *spec)
 {
     for (size_t i = 0; i < spec->write_root_count; i++) {
-        if (!cf_label(spec->write_roots[i], CF_LABEL_LOW)) {
+        if (!cf_label(spec->write_roots[i], CF_LABEL_LOW,
+                      TREE_SEC_INFO_SET)) {
             (void)platform_confined_release_roots(spec->write_roots, i + 1u);
             return PLATFORM_CONFINE_MISSING_WRITE_LABEL;
         }
@@ -613,7 +619,8 @@ bool platform_confined_release_roots(const char *const *roots, size_t count)
      * leave a later root carrying the low grant. */
     for (size_t i = 0; roots && i < count; i++) {
 #if defined(_WIN32)
-        if (!roots[i] || !cf_label(roots[i], CF_LABEL_MEDIUM))
+        if (!roots[i] || !cf_label(roots[i], CF_LABEL_MEDIUM,
+                                   TREE_SEC_INFO_RESET))
             ok = false;
 #else
         ok = false;
