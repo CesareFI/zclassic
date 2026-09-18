@@ -26,6 +26,7 @@
 #include "kernel/command_registry.h"
 #include "platform/confined_process.h"
 #include "platform/process_lifecycle.h"
+#include "platform/time_compat.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -392,6 +394,48 @@ static void wtx_opts(struct wkr_drive_opts *o, const char *worker,
     o->mem_mb = 512;
     o->token_cap = 32000;
 }
+
+/* ── idle wake rig ───────────────────────────────────────────────────────
+ * A forked poster queues one row after `delay_ms`, the way the receiver
+ * does from its own process, while this process drives the worker. The
+ * measured latency is the drive return time minus the post time, on the
+ * system-wide monotonic clock. */
+
+#if !defined(_WIN32)
+static pid_t wtx_post_later(const char *name, int delay_ms)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        platform_sleep_ms(delay_ms);
+        wtx_queue_post(name);
+        _exit(0);
+    }
+    return pid;
+}
+
+/* One fixture job posted `delay_ms` after the drive starts. Returns jobs
+ * run; *after_post_ms gets the drive's return time since the post. */
+static long long wtx_drive_late_post(struct wkr_drive_opts *o,
+                                     const char *name, int delay_ms,
+                                     long long *after_post_ms)
+{
+    long long t0, jobs;
+    int st = 0;
+    pid_t pid;
+    /* The worker lock lives in the queue dir: let the queue create it. */
+    if (!wtx_queue_verb("status", NULL, NULL))
+        return -1;
+    t0 = (long long)platform_time_monotonic_ms();
+    pid = wtx_post_later(name, delay_ms);
+    if (pid < 0)
+        return -1;
+    jobs = zcl_devagent_worker_drive(o, wtx_fixture);
+    *after_post_ms =
+        (long long)platform_time_monotonic_ms() - (t0 + delay_ms);
+    (void)waitpid(pid, &st, 0);
+    return jobs;
+}
+#endif
 
 /* ── result-mail safety rig ──────────────────────────────────────────────
  * The result row under the ref is the ONLY thing the originating client
@@ -912,6 +956,86 @@ int test_devagent_worker(void)
         o.idle_limit_s = 2;
         ASSERT_EQ(zcl_devagent_worker_drive(&o, wtx_fixture), 0);
         ASSERT_EQ(wtx_count_read(), 0);
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("idle worker wakes on a queued row, not on its backoff")
+    {
+        struct wkr_drive_opts o;
+        long long after_post_ms = -1;
+        wtx_isolate("wake");
+        (void)remove(g_fx_count);
+        g_fx_mode = 0;
+        (void)snprintf(g_fx_terminal, sizeof(g_fx_terminal), "%s", "pass");
+        g_fx_rc = 0;
+        g_fx_candidate = true;
+        wtx_opts(&o, "wtx", "s-wake");
+        /* A 30 s backoff: only the queue watch can claim inside 3 s. */
+        o.idle_start_s = 30;
+        o.idle_limit_s = 60;
+        o.deadline_s = 60;
+        ASSERT_EQ(wtx_drive_late_post(&o, "wtx-wake", 1500, &after_post_ms),
+                  1);
+        ASSERT_EQ(wtx_count_read(), 1);
+        (void)printf("    devagent_worker wake latency: %lld ms after post\n",
+                     after_post_ms);
+        ASSERT(after_post_ms >= 0);
+        ASSERT(after_post_ms < 3000);
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("a wake right after a failed claim waits out the one-second floor")
+    {
+        struct wkr_drive_opts o;
+        long long after_post_ms = -1;
+        wtx_isolate("floor");
+        (void)remove(g_fx_count);
+        g_fx_mode = 0;
+        (void)snprintf(g_fx_terminal, sizeof(g_fx_terminal), "%s", "pass");
+        g_fx_rc = 0;
+        g_fx_candidate = true;
+        wtx_opts(&o, "wtx", "s-floor");
+        o.idle_start_s = 30;
+        o.idle_limit_s = 60;
+        o.deadline_s = 60;
+        /* Posted 0.2 s after the empty claim: the next claim still waits
+         * until 1 s after it, then happens at once. */
+        ASSERT_EQ(wtx_drive_late_post(&o, "wtx-floor", 200, &after_post_ms),
+                  1);
+        ASSERT_EQ(wtx_count_read(), 1);
+        (void)printf("    devagent_worker floor wake: %lld ms after post\n",
+                     after_post_ms);
+        ASSERT(after_post_ms >= 700);
+        ASSERT(after_post_ms < 2500);
+        wtx_restore();
+        PASS();
+    }
+
+    TEST("without a queue watch the backoff still bounds the idle wait")
+    {
+        struct wkr_drive_opts o;
+        long long after_post_ms = -1;
+        wtx_isolate("nowatch");
+        (void)remove(g_fx_count);
+        g_fx_mode = 0;
+        (void)snprintf(g_fx_terminal, sizeof(g_fx_terminal), "%s", "pass");
+        g_fx_rc = 0;
+        g_fx_candidate = true;
+        wtx_opts(&o, "wtx", "s-nowatch");
+        o.timed_idle_only = true;
+        o.idle_start_s = 2;
+        o.idle_limit_s = 4;
+        /* Posted at 0.3 s: the timed path must not see it before its 2 s
+         * backoff expires, and must claim it right after. */
+        ASSERT_EQ(wtx_drive_late_post(&o, "wtx-nowatch", 300, &after_post_ms),
+                  1);
+        ASSERT_EQ(wtx_count_read(), 1);
+        (void)printf("    devagent_worker timed fallback: %lld ms after post\n",
+                     after_post_ms);
+        ASSERT(after_post_ms >= 1500);
+        ASSERT(after_post_ms < 3500);
         wtx_restore();
         PASS();
     }

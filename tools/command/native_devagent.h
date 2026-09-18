@@ -92,6 +92,9 @@ struct wkr_drive_opts {
     long long cpu_s;      /* RLIMIT_CPU per executor run */
     long long mem_mb;     /* RLIMIT_AS per executor run */
     long long token_cap;  /* token budget handed to the executor */
+    bool timed_idle_only; /* skip the queue watch and sleep the backoff;
+                           * the leaf never sets it, tests prove the
+                           * fallback with it */
 };
 
 /* One claimed unit of work. task is executor-ready text; rundir owns

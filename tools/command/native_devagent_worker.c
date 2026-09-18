@@ -15,7 +15,10 @@
  * (queue, engine run dirs, mail outbox) plus one worker.lock beside the
  * queue. No yolo, no API fallback, no wallet, no deploy, no push
  * authority anywhere in this file. The model is never polled: the loop
- * waits on local queue files with bounded sleep/backoff between claims.
+ * waits on local queue files. While idle it blocks on a directory watch of
+ * the queue with the doubling backoff as the timeout, so a queued row is
+ * claimed within about a second, never faster than one claim attempt per
+ * second. Without a watch it sleeps the backoff exactly as before.
  *
  * ONE ACTIVE JOB PER WORKER. worker.lock (flock on POSIX, the platform's
  * owner-private lock file on Windows; non-blocking, held for the whole
@@ -65,6 +68,7 @@
 #include "json/json.h"
 #include "kernel/command_registry.h"
 #include "platform/confined_process.h"
+#include "platform/directory_watcher.h"
 #include "platform/process_lock.h"
 #include "platform/state_root.h"
 #include "platform/time_compat.h"
@@ -921,31 +925,145 @@ bool zcl_devagent_worker_no_executor(const struct wkr_job *job,
     return false;
 }
 
-static long long wkr_idle_sleep(long long wait_s)
+/* ── idle: wake on the queue, the backoff is only the ceiling ──────────────
+ * The drive arms one directory watch on the queue dir for its lifetime.
+ * The queue.jsonl identity taken after reap and before the claim is the
+ * baseline: a watch event wakes the worker only when the ledger differs
+ * from it, so the worker's own lock-file and reap writes never wake it and
+ * a row posted after the claim looked is never missed. A real wake still
+ * waits out WKR_CLAIM_FLOOR_MS since the failed claim. A watch that cannot
+ * be armed, or that errors, falls back to sleeping the backoff. */
+
+#define WKR_CLAIM_FLOOR_MS 1000
+#define WKR_IDLE_SLICE_MS 100
+
+struct wkr_qsig {
+    long long size;
+    long long mtime;
+    long long ino;
+    bool present;
+};
+
+struct wkr_idle {
+    struct platform_directory_watcher watcher;
+    bool watching;
+    char queuedir[4096];
+    struct wkr_qsig base;
+};
+
+static void wkr_qsig_take(const char *queuedir, struct wkr_qsig *sig)
 {
-    long long t0_s = platform_time_wall_unix();
-    while (platform_time_wall_unix() - t0_s < wait_s) {
-        struct timespec slice;
-        if (g_wkr_term)
-            break;
-        slice.tv_sec = 0;
-        slice.tv_nsec = 100u * 1000u * 1000u;
-        (void)nanosleep(&slice, NULL);
-    }
-    return platform_time_wall_unix() - t0_s;
+    char path[4096 + 32];
+    struct stat st;
+    memset(sig, 0, sizeof(*sig));
+    if (snprintf(path, sizeof(path), "%s/queue.jsonl", queuedir) >=
+        (int)sizeof(path))
+        return;
+    if (stat(path, &st) != 0)
+        return;
+    sig->present = true;
+    sig->size = (long long)st.st_size;
+    sig->mtime = (long long)st.st_mtime;
+    sig->ino = (long long)st.st_ino;
 }
 
-/* Bounded idle with doubling backoff. True when the idle streak hit
- * the limit and the drive should stop. */
-static bool wkr_drive_idle(const struct wkr_drive_opts *opts,
-                           long long *idle_streak, long long *wait_s)
+static bool wkr_qsig_moved(const struct wkr_idle *idle)
 {
-    if (!opts || !idle_streak || !wait_s)
+    struct wkr_qsig now;
+    wkr_qsig_take(idle->queuedir, &now);
+    return now.present != idle->base.present ||
+           now.size != idle->base.size || now.mtime != idle->base.mtime ||
+           now.ino != idle->base.ino;
+}
+
+static bool wkr_stop_asked(void *opaque)
+{
+    (void)opaque;
+    return g_wkr_term != 0;
+}
+
+/* Milliseconds from now until `until_ms` on the monotonic clock, >= 0. */
+static long long wkr_ms_left(long long until_ms)
+{
+    long long left = until_ms - (long long)platform_time_monotonic_ms();
+    return left > 0 ? left : 0;
+}
+
+/* Sleep until `until_ms` on the monotonic clock, in term-aware slices. */
+static void wkr_idle_sleep_until(long long until_ms)
+{
+    long long left = wkr_ms_left(until_ms);
+    while (!g_wkr_term && left > 0) {
+        platform_sleep_ms(
+            (int)(left < WKR_IDLE_SLICE_MS ? left : WKR_IDLE_SLICE_MS));
+        left = wkr_ms_left(until_ms);
+    }
+}
+
+static void wkr_idle_open(struct wkr_idle *idle, const char *queuedir,
+                          bool timed_only)
+{
+    platform_directory_watcher_init(&idle->watcher);
+    (void)snprintf(idle->queuedir, sizeof(idle->queuedir), "%s", queuedir);
+    memset(&idle->base, 0, sizeof(idle->base));
+    idle->watching = !timed_only && platform_directory_watcher_open(
+                                        &idle->watcher, idle->queuedir);
+}
+
+static void wkr_idle_close(struct wkr_idle *idle)
+{
+    if (idle->watching)
+        platform_directory_watcher_close(&idle->watcher);
+    idle->watching = false;
+}
+
+/* Block for at most wait_ms. True when the queue ledger changed and a
+ * claim is worth trying (the claim floor already honoured); false on
+ * timeout or shutdown. */
+static bool wkr_idle_wait(struct wkr_idle *idle, long long wait_ms)
+{
+    long long t0 = (long long)platform_time_monotonic_ms();
+    long long left = wait_ms;
+    while (!g_wkr_term && left > 0) {
+        enum platform_directory_watch_result r;
+        if (!idle->watching) {
+            wkr_idle_sleep_until(t0 + wait_ms);
+            return false;
+        }
+        r = platform_directory_watcher_wait(&idle->watcher, (uint32_t)left,
+                                            wkr_stop_asked, NULL);
+        if (r == PLATFORM_DIRECTORY_WATCH_ERROR)
+            wkr_idle_close(idle);
+        else if (r != PLATFORM_DIRECTORY_WATCH_CHANGED &&
+                 r != PLATFORM_DIRECTORY_WATCH_OVERFLOW)
+            return false;
+        else if (wkr_qsig_moved(idle)) {
+            wkr_idle_sleep_until(t0 + WKR_CLAIM_FLOOR_MS);
+            return !g_wkr_term;
+        }
+        left = wkr_ms_left(t0 + wait_ms);
+    }
+    return false;
+}
+
+/* Bounded idle. A timeout doubles the backoff up to the idle limit; a
+ * wake keeps it, so an unclaimable change never shortens later waits.
+ * True when the idle streak hit the limit and the drive should stop. */
+static bool wkr_drive_idle(const struct wkr_drive_opts *opts,
+                           struct wkr_idle *idle, long long *idle_ms,
+                           long long *wait_s)
+{
+    long long t0;
+    bool woke;
+    if (!opts || !idle || !idle_ms || !wait_s)
         return true;
-    *idle_streak += wkr_idle_sleep(*wait_s);
-    if (*idle_streak >= opts->idle_limit_s)
+    t0 = (long long)platform_time_monotonic_ms();
+    woke = wkr_idle_wait(idle, *wait_s * 1000);
+    *idle_ms += (long long)platform_time_monotonic_ms() - t0;
+    if (*idle_ms >= opts->idle_limit_s * 1000)
         return true;
-    *wait_s *= 2;
+    if (!woke)
+        *wait_s *= 2;
     if (*wait_s > opts->idle_limit_s)
         *wait_s = opts->idle_limit_s;
     if (*wait_s < 1)
@@ -1021,8 +1139,9 @@ long long zcl_devagent_worker_drive(const struct wkr_drive_opts *opts,
     char queuedir[4096], lockpath[4096 + 32];
     void (*old_term)(int) = SIG_DFL;
     struct wkr_lock lock;
+    struct wkr_idle idle;
     long long t0_s;
-    long long jobs = 0, idle_streak = 0, wait_s;
+    long long jobs = 0, idle_ms = 0, wait_s;
     if (!opts || !exec)
         return -1;
     if (!wkr_state_dir(queuedir, sizeof(queuedir), "queue"))
@@ -1033,6 +1152,7 @@ long long zcl_devagent_worker_drive(const struct wkr_drive_opts *opts,
     if (!wkr_lock_take(&lock, lockpath))
         return -1;
     old_term = signal(SIGTERM, wkr_on_term);
+    wkr_idle_open(&idle, queuedir, opts->timed_idle_only);
     t0_s = platform_time_wall_unix();
     wait_s = opts->idle_start_s > 0 ? opts->idle_start_s : 1;
     while (!g_wkr_term) {
@@ -1042,18 +1162,20 @@ long long zcl_devagent_worker_drive(const struct wkr_drive_opts *opts,
         if (opts->max_jobs > 0 && jobs >= opts->max_jobs)
             break;
         wkr_reap();
+        wkr_qsig_take(queuedir, &idle.base);
         /* A refused seam processes nothing: idle instead of re-adopting
          * the same orphan in a tight loop. */
         done = wkr_drive_step(opts, exec);
         jobs += done;
         if (done > 0) {
-            idle_streak = 0;
+            idle_ms = 0;
             wait_s = opts->idle_start_s > 0 ? opts->idle_start_s : 1;
             continue;
         }
-        if (wkr_drive_idle(opts, &idle_streak, &wait_s))
+        if (wkr_drive_idle(opts, &idle, &idle_ms, &wait_s))
             break;
     }
+    wkr_idle_close(&idle);
     (void)signal(SIGTERM, old_term);
     wkr_lock_drop(&lock);
     return jobs;
