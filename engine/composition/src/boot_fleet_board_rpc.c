@@ -132,6 +132,45 @@ static void fb_render_list(struct json_value *result,
     json_push_kv_int(result, "returned", n);
 }
 
+/* The two signed times: ttl, and created_at. created_at defaults to this
+ * node's clock. A caller retrying the same content passes back the
+ * created_at it used the first time: every signed byte is then the same,
+ * Ed25519 is deterministic, so the retry derives the same post id and the
+ * store keeps one post, not two. It is bounded on both sides — never more
+ * than the skew a peer would accept ahead of now, and never so old that the
+ * post would already be expired when it is signed. */
+static bool fb_compose_time(const struct json_value *in,
+                            struct json_value *result, int64_t now,
+                            struct fleet_board_post *post)
+{
+    int64_t ttl = fb_int(in, "ttl", FLEET_BOARD_TTL_DEFAULT);
+    if (ttl <= 0 || ttl > FLEET_BOARD_TTL_MAX) {
+        fb_error(result, "BAD_TTL", "ttl must be 1..2592000 seconds");
+        return false;
+    }
+    post->ttl = (uint32_t)ttl;
+    const struct json_value *given = json_get(in, "created_at");
+    if (!given || given->type == JSON_NULL) {
+        post->created_at = (uint64_t)now;
+        return true;
+    }
+    int64_t created_at = given->type == JSON_INT ? json_get_int(given) : 0;
+    if (created_at <= 0 || created_at > now + FLEET_BOARD_FUTURE_SKEW_MAX) {
+        fb_error(result, "BAD_CREATED_AT",
+                 "created_at must be Unix seconds, at most 300 seconds "
+                 "ahead of this node's clock");
+        return false;
+    }
+    if (created_at + ttl <= now) {
+        fb_error(result, "CREATED_AT_EXPIRED",
+                 "created_at is older than the post's ttl: the post would "
+                 "already be expired");
+        return false;
+    }
+    post->created_at = (uint64_t)created_at;
+    return true;
+}
+
 /* Build an unsigned post from the request. Signing, storing, and announcing
  * belong to boot_fleet_board_publish; this only reads caller input. */
 static bool fb_compose(const struct json_value *in, struct json_value *result,
@@ -204,13 +243,8 @@ static bool fb_compose(const struct json_value *in, struct json_value *result,
             return false;
         }
     }
-    int64_t ttl = fb_int(in, "ttl", FLEET_BOARD_TTL_DEFAULT);
-    if (ttl <= 0 || ttl > FLEET_BOARD_TTL_MAX) {
-        fb_error(result, "BAD_TTL", "ttl must be 1..2592000 seconds");
+    if (!fb_compose_time(in, result, now, post))
         return false;
-    }
-    post->ttl = (uint32_t)ttl;
-    post->created_at = (uint64_t)now;
 
     enum fleet_board_result r = fleet_board_post_validate(post);
     if (r != FLEET_BOARD_OK) {

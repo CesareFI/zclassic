@@ -1718,6 +1718,77 @@ static int test_fleet_board_rpc_scope_default(void)
     return failures;
 }
 
+/* One fleet-scoped note with an explicit signed created_at and ttl. */
+static bool fb_rpc_post_at(struct fb_rpc_fixture *f, const char *text,
+                           int64_t created_at, int64_t ttl,
+                           struct json_value *result)
+{
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    bool ok = json_push_kv_str(&input, "op", "post") &&
+              json_push_kv_str(&input, "kind", "note") &&
+              json_push_kv_str(&input, "scope", "fleet") &&
+              json_push_kv_str(&input, "text", text) &&
+              json_push_kv_int(&input, "created_at", created_at) &&
+              json_push_kv_int(&input, "ttl", ttl) &&
+              fb_rpc_call(f, &input, result);
+    json_free(&input);
+    return ok;
+}
+
+static int test_fleet_board_rpc_created_at(void)
+{
+    int failures = 0;
+    TEST("fleet board: an RPC retry with the same content and created_at is "
+         "the same post, and created_at is bounded both ways") {
+        struct fb_rpc_fixture f;
+        ASSERT(fb_rpc_fixture_open(&f, "rpc-created-at"));
+        int64_t now = (int64_t)platform_time_wall_time_t();
+        struct json_value first, retry, refused;
+        json_init(&first);
+        json_init(&retry);
+        ASSERT(fb_rpc_post_at(&f, "deliver row 7", now - 100, 3600, &first));
+        ASSERT(json_get_bool(json_get(&first, "ok")));
+        ASSERT_EQ(json_get_int(json_get(&first, "created_at")), now - 100);
+        /* The retry signs the same bytes, so it IS the first post: the same
+         * id, and the store still holds one post. */
+        ASSERT(fb_rpc_post_at(&f, "deliver row 7", now - 100, 3600, &retry));
+        ASSERT(json_get_bool(json_get(&retry, "ok")));
+        ASSERT_STR_EQ(json_get_str(json_get(&retry, "id")),
+                      json_get_str(json_get(&first, "id")));
+        struct fleet_board_status status;
+        ASSERT(db_fleet_board_status(&f.db, now, &status));
+        ASSERT_EQ(status.posts, INT64_C(1));
+        json_free(&first);
+        json_free(&retry);
+
+        /* Further ahead than a peer would accept: refused, nothing signed. */
+        json_init(&refused);
+        ASSERT(fb_rpc_post_at(&f, "from the future", now + 3600, 3600,
+                              &refused));
+        ASSERT(!json_get_bool(json_get(&refused, "ok")));
+        ASSERT_STR_EQ(json_get_str(json_get(&refused, "code")),
+                      "BAD_CREATED_AT");
+        json_free(&refused);
+
+        /* Older than its own ttl: it would be expired before it was sent. */
+        json_init(&refused);
+        ASSERT(fb_rpc_post_at(&f, "long gone", now - 7200, 3600, &refused));
+        ASSERT(!json_get_bool(json_get(&refused, "ok")));
+        ASSERT_STR_EQ(json_get_str(json_get(&refused, "code")),
+                      "CREATED_AT_EXPIRED");
+        json_free(&refused);
+        ASSERT(db_fleet_board_status(&f.db, now, &status));
+        ASSERT_EQ(status.posts, INT64_C(1));
+
+        fb_rpc_fixture_close(&f);
+        ASSERT(test_rm_rf_recursive(f.dir) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static void fb_test_scope(struct fleet_board_post *post, uint8_t scope,
                           const char *room)
 {
@@ -2777,6 +2848,7 @@ int test_fleet_board(void)
     failures += test_fleet_board_rpc_verification();
     failures += test_fleet_board_rpc_concurrency();
     failures += test_fleet_board_rpc_scope_default();
+    failures += test_fleet_board_rpc_created_at();
     failures += test_fleet_board_native_busy();
     failures += test_fleet_board_durable_wiki();
     failures += test_fleet_board_local_capacity_does_not_score_peer();
