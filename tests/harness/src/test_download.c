@@ -419,6 +419,39 @@ static int test_dl_received_pending_survives_colliding_insert(void)
     return failures;
 }
 
+static int test_dl_received_pending_fails_open_after_clock_rollback(void)
+{
+    int failures = 0;
+    TEST("received-pending dedup fails open after a backward clock step") {
+        struct download_manager dm;
+        dl_init(&dm);
+
+        struct uint256 received = make_hash(206);
+        ASSERT(dl_mark_requested(&dm, &received, 903, 1));
+        ASSERT(dl_mark_received(&dm, &received) == 1);
+        ASSERT(dm.num_received_pending == 1);
+
+        /* A backward wall-clock correction makes the recorded arrival look
+         * future-dated. It must expire the guard instead of suppressing this
+         * block until wall time catches up. */
+        for (size_t i = 0; i < dm.num_slots; i++) {
+            if (!dm.slots[i].active &&
+                uint256_eq(&dm.slots[i].hash, &received))
+                dm.slots[i].received_time =
+                    (int64_t)platform_time_wall_time_t() + 3600;
+        }
+
+        ASSERT(dl_mark_requested(&dm, &received, 903, 2));
+        ASSERT(dm.num_received_pending == 0);
+        ASSERT(dm.num_active == 1);
+        ASSERT(dm.total_requeue_suppressed_pending == 0);
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_dl_expired_received_pending_compacts_before_growth(void)
 {
     int failures = 0;
@@ -2157,6 +2190,7 @@ int test_download(void)
     failures += test_dl_received_pending_staging();
     failures += test_dl_received_pending_survives_rehash();
     failures += test_dl_received_pending_survives_colliding_insert();
+    failures += test_dl_received_pending_fails_open_after_clock_rollback();
     failures += test_dl_expired_received_pending_compacts_before_growth();
     failures += test_dl_assign_to_peer();
     failures += test_dl_assignment_generation_parking();

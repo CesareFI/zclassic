@@ -172,3 +172,7 @@ later lane flips it HARD.
 - 2026-09-18T15:33:24Z — REASON: Compact expired received-pending block-download guards before scheduler table growth; memory efficiency only, no consensus or validation semantics change
   old ROOT: 835a70d676498526d9587f574365b817ce6ee3c7d6addfa7a81ed78f93f018a2
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T16:49:03Z — REASON: Fail open received-body download dedup guards after a backward wall-clock step; scheduler reliability only, no consensus or validation semantics change
+  old ROOT: 45880d284e79329b13b2a456a5eb58e0995305903fdb0e2705c6167242284823
+  by: owner unseal ritual (make core-unseal)

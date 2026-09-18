@@ -426,6 +426,7 @@ static bool dl_slot_received_pending(const struct dl_in_flight *slot,
                                      int64_t now)
 {
     return !slot->active && slot->received_time != 0 &&
+           now >= slot->received_time &&
            now - slot->received_time < DL_RECEIVED_PENDING_SECS;
 }
 
@@ -473,7 +474,7 @@ static bool dl_slot_blocks_requeue(struct download_manager *dm,
 {
     if (s->active)
         return true;
-    if (s->received_time == 0 ||
+    if (s->received_time == 0 || now < s->received_time ||
         now - s->received_time >= DL_RECEIVED_PENDING_SECS)
         return false;
     dm->total_requeue_suppressed_pending++;
@@ -491,9 +492,7 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
     size_t received_pending_count = 0;
     for (size_t i = 0; i < dm->num_slots; i++) {
         const struct dl_in_flight *old = &dm->slots[i];
-        bool received_pending = !old->active && old->received_time != 0 &&
-                                now - old->received_time <
-                                    DL_RECEIVED_PENDING_SECS;
+        bool received_pending = dl_slot_received_pending(old, now);
         if (!old->active && !received_pending) continue;
         size_t idx = dl_hash_slot(&dm->slots[i].hash, new_mask);
         for (size_t j = 0; j < new_size; j++) {
@@ -524,7 +523,8 @@ static bool dl_has_expired_received_pending(const struct download_manager *dm)
     for (size_t i = 0; i < dm->num_slots; i++) {
         const struct dl_in_flight *slot = &dm->slots[i];
         if (!slot->active && slot->received_time != 0 &&
-            now - slot->received_time >= DL_RECEIVED_PENDING_SECS)
+            (now < slot->received_time ||
+             now - slot->received_time >= DL_RECEIVED_PENDING_SECS))
             return true;
     }
     return false;
