@@ -765,7 +765,7 @@ void p2p_node_copy_stats(const struct p2p_node *node, struct node_stats *stats)
 
     int64_t ping_wait = 0;
     if (node->ping_nonce_sent != 0 && node->ping_usec_start != 0)
-        ping_wait = GetTimeMicros() - node->ping_usec_start;
+        ping_wait = platform_time_monotonic_us() - node->ping_usec_start;
 
     stats->ping_time = (double)node->ping_usec_time / 1e6;
     stats->ping_wait = (double)ping_wait / 1e6;

@@ -1216,6 +1216,8 @@ static int test_net_node_stats_copy(void)
         node->version = 170002;
         snprintf(node->clean_sub_ver, sizeof(node->clean_sub_ver),
                  "/ZClassic:1.0.0/");
+        node->ping_nonce_sent = 1;
+        node->ping_usec_start = platform_time_monotonic_us() - 2000000;
 
         struct node_stats stats;
         p2p_node_copy_stats(node, &stats);
@@ -1224,6 +1226,9 @@ static int test_net_node_stats_copy(void)
         ok = ok && (stats.version == 170002);
         ok = ok && (stats.inbound == true);
         ok = ok && (strcmp(stats.clean_sub_ver, "/ZClassic:1.0.0/") == 0);
+        /* ping_usec_start is a monotonic origin.  Mixing it with civil epoch
+         * time produced a multi-decade wait in getpeerinfo. */
+        ok = ok && (stats.ping_wait >= 2.0 && stats.ping_wait < 3.0);
 
         p2p_node_free(node);
         net_manager_free(&nm);

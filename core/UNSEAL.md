@@ -276,3 +276,11 @@ later lane flips it HARD.
 - 2026-09-19T04:44:02Z — REASON: Use the existing monotonic peer connection stamp for disconnect lifetime diagnostics so wall-clock corrections cannot erase session-age evidence; reporting only, no consensus or validation change
   old ROOT: bdc75f4db95afc89999a68da83363fa6306b29dd0c8827acfce32eaf52557e9d
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T04:58:42Z — REASON: Use monotonic elapsed time for outstanding peer ping statistics, matching the existing monotonic ping origin; reporting only, no consensus or validation change
+  old ROOT: 32febd85aaee858c15f74cb94fc6886d35a384b3781345684a4db7d8f68357b1
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T05:07:42Z — REASON: Keep the authorized peer ping statistics clock correction within the enforced legacy file-size ceiling; behavior unchanged
+  old ROOT: e81d519e5e775997f1316d8714afabecd088ccddbb4a3981cf0d6f34695e45f0
+  by: owner unseal ritual (make core-unseal)
