@@ -6,12 +6,10 @@
  * The condition compares two consecutive detect() ticks of the (test-
  * injected) utxo_apply cursor once the drive has been active longer than
  * a (test-forced) threshold. condition_tick_one() gates a NOT-YET-active
- * condition's detect() calls by real wall-clock poll_secs, so this test
- * installs the same fake clock_iface_t the sync_watchdog condition tests
- * use to advance wall time without sleeping. reducer_drive_age_us() itself
- * reads GetTimeMicros() (real time, not the fake clock — see
- * core/modules/core/src/utiltime.c), so a short real nanosleep is used to get a
- * nonzero age; the forced threshold of 0s means any nonzero age trips it.
+ * condition's detect() calls by wall-clock poll_secs, so this test installs
+ * the same fake clock_iface_t the sync_watchdog condition tests use.  It
+ * advances wall and monotonic samples together: wall time opens the poll gate,
+ * while monotonic time ages the drive without sleeps or clock-basis coupling.
  */
 
 #include "test/test_core.h"
@@ -39,7 +37,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #define RDW_CHECK(name, expr) do { \
     printf("reducer_drive_watchdog: %s... ", (name)); \
@@ -49,12 +46,14 @@
 
 struct rdw_fake_clock {
     _Atomic int64_t wall_ms;
+    _Atomic int64_t monotonic_ns;
+    int64_t origin_unix_s;
 };
 
 static int64_t rdw_fake_now_mono(void *self)
 {
-    (void)self;
-    return 1;
+    struct rdw_fake_clock *c = (struct rdw_fake_clock *)self;
+    return atomic_load(&c->monotonic_ns);
 }
 
 static int64_t rdw_fake_now_wall(void *self)
@@ -66,6 +65,8 @@ static int64_t rdw_fake_now_wall(void *self)
 static void rdw_fake_clock_install(struct rdw_fake_clock *c, int64_t unix_s)
 {
     atomic_store(&c->wall_ms, unix_s * 1000);
+    atomic_store(&c->monotonic_ns, 1000000000LL);
+    c->origin_unix_s = unix_s;
     static clock_iface_t iface;
     iface.now_monotonic_ns = rdw_fake_now_mono;
     iface.now_wall_ms = rdw_fake_now_wall;
@@ -76,14 +77,9 @@ static void rdw_fake_clock_install(struct rdw_fake_clock *c, int64_t unix_s)
 static void rdw_fake_clock_set(struct rdw_fake_clock *c, int64_t unix_s)
 {
     atomic_store(&c->wall_ms, unix_s * 1000);
-}
-
-/* A few ms of REAL sleep so reducer_drive_age_us() (GetTimeMicros(), not the
- * fake clock) reports a nonzero age. */
-static void rdw_real_nap(void)
-{
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 3 * 1000 * 1000 };
-    nanosleep(&ts, NULL);
+    atomic_store(&c->monotonic_ns,
+                 1000000000LL +
+                 (unix_s - c->origin_unix_s) * 1000000000LL);
 }
 
 static void rdw_reset(void)
@@ -216,7 +212,6 @@ int test_reducer_drive_watchdog(void)
         reducer_drive_watchdog_test_set_cursor_override(100);
 
         reducer_drive_enter_labeled("test_drive");
-        rdw_real_nap();
 
         condition_engine_tick(); /* tick 1: baseline only, cursor=100 */
         bool ok = true;

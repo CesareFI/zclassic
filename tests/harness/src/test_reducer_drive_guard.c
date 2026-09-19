@@ -30,6 +30,14 @@ int test_reducer_drive_guard(void)
     RDG_CHECK("inactive: age is 0", reducer_drive_age_us() == 0);
     RDG_CHECK("inactive: label is empty",
               strcmp(reducer_drive_label(), "") == 0);
+    RDG_CHECK("elapsed: forward monotonic interval",
+              reducer_drive_elapsed_us(1000000, 3500000) == 2500000);
+    RDG_CHECK("elapsed: equal sample clamps to zero",
+              reducer_drive_elapsed_us(1000000, 1000000) == 0);
+    RDG_CHECK("elapsed: backwards sample clamps to zero",
+              reducer_drive_elapsed_us(1000000, 500000) == 0);
+    RDG_CHECK("elapsed: missing origin clamps to zero",
+              reducer_drive_elapsed_us(0, 3500000) == 0);
 
     reducer_drive_enter_labeled("mint_anchor");
     RDG_CHECK("labeled enter: drive active", reducer_drive_active());

@@ -40,6 +40,10 @@ bool reducer_drive_active(void);
  * Observational only — feeds the drive-age watchdog and dumpstate. */
 int64_t reducer_drive_age_us(void);
 
+/* Non-negative elapsed monotonic microseconds.  An impossible backwards
+ * sample returns zero rather than manufacturing a watchdog timeout. */
+int64_t reducer_drive_elapsed_us(int64_t started_us, int64_t now_us);
+
 /* Static label of the active drive ("" when inactive/unlabeled). */
 const char *reducer_drive_label(void);
 

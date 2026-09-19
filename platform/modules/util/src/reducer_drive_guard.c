@@ -3,7 +3,7 @@
  * reducer_drive_guard — see util/reducer_drive_guard.h. */
 
 #include "util/reducer_drive_guard.h"
-#include "core/utiltime.h"
+#include "platform/time_compat.h"
 #include <stdatomic.h>
 
 /* Number of synchronous reducer drives currently in progress (normally 0 or 1;
@@ -31,7 +31,8 @@ void reducer_drive_enter_labeled(const char *label)
         atomic_store_explicit(&g_reducer_drive_label,
                               label ? label : "unlabeled",
                               memory_order_release);
-        atomic_store_explicit(&g_reducer_drive_start_us, GetTimeMicros(),
+        atomic_store_explicit(&g_reducer_drive_start_us,
+                              platform_time_monotonic_us(),
                               memory_order_release);
     }
 }
@@ -53,14 +54,20 @@ bool reducer_drive_active(void)
     return atomic_load_explicit(&g_reducer_drive_depth, memory_order_acquire) > 0;
 }
 
+int64_t reducer_drive_elapsed_us(int64_t started_us, int64_t now_us)
+{
+    if (started_us <= 0 || now_us <= started_us)
+        return 0;
+    return now_us - started_us;
+}
+
 int64_t reducer_drive_age_us(void)
 {
     int64_t start = atomic_load_explicit(&g_reducer_drive_start_us,
                                          memory_order_acquire);
     if (start == 0)
         return 0;
-    int64_t age = GetTimeMicros() - start;
-    return age > 0 ? age : 0;
+    return reducer_drive_elapsed_us(start, platform_time_monotonic_us());
 }
 
 const char *reducer_drive_label(void)
