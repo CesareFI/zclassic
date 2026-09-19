@@ -836,7 +836,7 @@ bool connman_addrman_candidate_usable(struct connman *cm,
         int64_t now = (int64_t)platform_time_wall_time_t();
         int cooldown =
             connman_addrman_retry_cooldown_for_attempts(info->attempts);
-        if (now - info->last_try < cooldown)
+        if (connman_retry_cooldown_active(now, info->last_try, cooldown))
             return false;
     }
 
@@ -960,7 +960,7 @@ static bool connman_ready_addnode_from_other_group(struct connman *cm,
             continue;
         const int cooldown = cm->addnode_backoff_sec[ai] > 0
                            ? cm->addnode_backoff_sec[ai] : 30;
-        if (connman_addnode_cooldown_active(now, cm->addnode_last_attempt[ai], cooldown))
+        if (connman_retry_cooldown_active(now, cm->addnode_last_attempt[ai], cooldown))
             continue;
         if (connman_addnode_is_connected(cm, (size_t)ai))
             continue;
@@ -1006,7 +1006,7 @@ bool connman_pick_next_outbound_target(
                 cm->addnode_backoff_sec[ai] = 0;
                 continue;
             }
-            if (connman_addnode_cooldown_active(now, cm->addnode_last_attempt[ai], cooldown))
+            if (connman_retry_cooldown_active(now, cm->addnode_last_attempt[ai], cooldown))
                 continue;
 
             if (net_addr_is_ipv4(&cm->addnodes[ai].svc.addr)) {

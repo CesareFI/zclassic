@@ -224,3 +224,19 @@ later lane flips it HARD.
 - 2026-09-18T22:54:44Z — REASON: Move the authorized addnode rollback helper out of shrink-only connman.c; behavior unchanged
   old ROOT: 2387ebd1362820a1ae0483b21546b27bdfc5aeb4d4526ffc180d4d12fd4c4250
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T23:33:32Z — REASON: Fail open addrman and discovered-peer retry cooldowns after backward wall-clock step; peer recovery policy only, no consensus or validation semantics change
+  old ROOT: 1bac0cf627f15267c65592dec584be7008a3ac3b7ee2f5acca2ed6fcc55f7cf3
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T23:46:43Z — REASON: Expose the authorized rollback-safe retry predicate to its focused regression; test seam only
+  old ROOT: a4cd17ee7372643dc164648803d23776ab447a227a5f8b91c2b4b70e5b8c9432
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T23:55:58Z — REASON: Move the authorized test seam out of shrink-only connman.c; behavior unchanged
+  old ROOT: 94903b7df9fd25c96934d63249f42d8a74266b0d27a805428dae5458b418f64c
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-18T23:57:30Z — REASON: Remove one blank line from the authorized retry-policy edit to preserve the shrink-only connman.c ceiling
+  old ROOT: ed28f7cdc821fe32c4a6c96185eee7a580769c5b067fb030bd1cbf3a2d0583a0
+  by: owner unseal ritual (make core-unseal)

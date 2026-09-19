@@ -23,7 +23,7 @@ int check_connman_addnode_clock_rollback_retry(void)
 {
     int failures = 0;
     printf("connman_addnode_fallback: clock rollback does not strand "
-           "operator addnode... ");
+           "operator or learned peers... ");
     {
         chain_params_select(CHAIN_MAIN);
         const struct chain_params *params = chain_params_get();
@@ -47,6 +47,14 @@ int check_connman_addnode_clock_rollback_retry(void)
                        &addnode_index) &&
              source == CONNMAN_TARGET_ADDNODE && addnode_index == 0 &&
              pick.addr.svc.port == 8033;
+
+        const int64_t now = (int64_t)platform_time_wall_time_t();
+        ok = ok && !connman_retry_cooldown_active_for_test(
+                       now, now + 3600, 1800) &&
+             connman_retry_cooldown_active_for_test(
+                 now, now - 60, 1800) &&
+             !connman_retry_cooldown_active_for_test(
+                 now, now - 1800, 1800);
 
         connman_free(&cm);
         if (ok) printf("OK\n");

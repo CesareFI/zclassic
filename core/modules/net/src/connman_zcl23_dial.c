@@ -7,6 +7,15 @@
 
 #include "platform/time_compat.h"
 #include "connman_internal.h"
+
+#ifdef ZCL_TESTING
+bool connman_retry_cooldown_active_for_test(int64_t now,
+                                            int64_t last_attempt,
+                                            int cooldown)
+{
+    return connman_retry_cooldown_active(now, last_attempt, cooldown);
+}
+#endif
 #include "net/port_policy.h"
 #include "util/log_macros.h"
 #include "core/random.h"
@@ -131,7 +140,8 @@ bool connman_gather_known_zcl23_candidate(
 
         int cooldown =
             connman_addrman_retry_cooldown_for_attempts(info.attempts);
-        if (info.last_try > 0 && now - info.last_try < cooldown) {
+        if (info.last_try > 0 &&
+            connman_retry_cooldown_active(now, info.last_try, cooldown)) {
             atomic_fetch_add(&cm->zcl23_backoff_skips, 1);
             continue;
         }

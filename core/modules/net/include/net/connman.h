@@ -558,6 +558,9 @@ bool connman_outbound_rate_allowed_for_test(bool below_floor,
                                             bool interval_elapsed,
                                             bool dht_hint_pending);
 int connman_addrman_retry_cooldown_for_test(int attempts);
+bool connman_retry_cooldown_active_for_test(int64_t now,
+                                            int64_t last_attempt,
+                                            int cooldown);
 /* Pure form of the dial scheduler's per-pass admission decision. Until the
  * connection manager owns locked slot reservations, any positive decision is
  * limited to one attempt. */
