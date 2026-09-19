@@ -302,7 +302,7 @@ struct download_manager {
 
     /* Byte throughput tracking */
     uint64_t total_bytes_received;   /* total block bytes downloaded */
-    int64_t  sync_start_time;        /* epoch seconds when first block received */
+    int64_t  sync_start_time;        /* monotonic seconds at first block bytes */
 
     /* Epoch seconds of the most recent event that force-cleared an
      * in-flight slot WITHOUT the body ever arriving — either

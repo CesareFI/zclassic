@@ -15,7 +15,8 @@ void dl_get_throughput(struct download_manager *dm,
     if (total_bytes) *total_bytes = dm->total_bytes_received;
     if (mbps_avg) {
         if (dm->sync_start_time > 0 && dm->total_bytes_received > 0) {
-            int64_t elapsed = (int64_t)platform_time_wall_time_t() - dm->sync_start_time;
+            int64_t elapsed = platform_time_monotonic_us() / 1000000 -
+                              dm->sync_start_time;
             if (elapsed < 1) elapsed = 1;
             *mbps_avg = (double)dm->total_bytes_received / (1048576.0 * elapsed);
         } else {

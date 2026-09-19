@@ -1626,7 +1626,7 @@ void dl_add_bytes_received(struct download_manager *dm, uint64_t bytes)
 {
     zcl_mutex_lock(&dm->cs);
     if (dm->sync_start_time == 0)
-        dm->sync_start_time = (int64_t)platform_time_wall_time_t();
+        dm->sync_start_time = dl_now_monotonic_seconds();
     dm->total_bytes_received += bytes;
     zcl_mutex_unlock(&dm->cs);
 }

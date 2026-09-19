@@ -1862,10 +1862,16 @@ static int test_dl_byte_tracking(void)
         dl_add_bytes_received(&dm, 524288);   /* 0.5 MB */
         dl_add_bytes_received(&dm, 2097152);  /* 2 MB */
 
+        /* Throughput is elapsed-time telemetry. Pin its start stamp to the
+         * monotonic domain so an NTP correction cannot distort the rate. */
+        int64_t now_monotonic = platform_time_monotonic_us() / 1000000;
+        ASSERT(dm.sync_start_time >= now_monotonic - 1);
+        ASSERT(dm.sync_start_time <= now_monotonic);
+        dm.sync_start_time = now_monotonic - 10;
+
         dl_get_throughput(&dm, &total_bytes, &mbps);
         ASSERT(total_bytes == 3670016);  /* 3.5 MB total */
-        /* mbps > 0 since sync_start_time was set on first call */
-        ASSERT(mbps >= 0.0);
+        ASSERT(mbps >= 0.31 && mbps <= 0.35);
 
         /* Verify sync_start_time was set */
         ASSERT(dm.sync_start_time > 0);

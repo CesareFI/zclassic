@@ -336,3 +336,7 @@ later lane flips it HARD.
 - 2026-09-19T14:59:13Z — REASON: Use elapsed monotonic time for non-consensus received-block dedup guards; block and transaction validation remain unchanged
   old ROOT: 6bf77db5fd63df31627bb299bd63b681ee22d5567927c5280a9adf3f0f9cf956
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T15:11:23Z — REASON: Use monotonic elapsed time for block-download throughput reporting so wall-clock corrections cannot distort IBD diagnostics; observability only, no consensus or validation change
+  old ROOT: 4a99e9a43019a51409f734667ec538589628a2c1c5ed40459d2a8bd82facce54
+  by: owner unseal ritual (make core-unseal)
