@@ -70,7 +70,7 @@ void reducer_exit_batched_body_sync(void);
 
 /* Timing snapshot for the batched pre-commit durability flush (drive+fsync
  * telemetry gap 2): last_flush_us is the most recent single flush's
- * wall-clock duration; flush_us_ewma is its exponential moving average
+ * monotonic duration; flush_us_ewma is its exponential moving average
  * (alpha = 1/16, integer arithmetic, same shape as
  * platform/modules/util/src/stage.c's step_us_ewma). Either output pointer may be NULL.
  * Lock-free atomic reads, no allocation — safe from the reducer_drive
@@ -80,7 +80,7 @@ void reducer_body_fsync_timing_snapshot(int64_t *last_flush_us,
                                         int64_t *flush_us_ewma);
 
 /* Running totals beside the EWMA above: how many pre-commit durability
- * flushes have run and their summed wall time. A flush is the fold's ONE
+ * flushes have run and their summed monotonic time. A flush is the fold's ONE
  * remaining fsync/journal-barrier point per committed batch, so `count` is
  * literally the number of durability barriers paid — the number behind claims
  * of the form "at tip we pay N barriers per block" (divide the delta by the
@@ -90,6 +90,11 @@ void reducer_body_fsync_timing_snapshot(int64_t *last_flush_us,
  * atomic reads, no allocation. */
 void reducer_body_fsync_totals_snapshot(uint64_t *flush_count,
                                         uint64_t *flush_us_total);
+
+/* Non-negative elapsed monotonic microseconds used by fsync latency
+ * telemetry. An impossible backwards sample clamps to zero rather than
+ * corrupting the EWMA and cumulative duration. */
+int64_t reducer_body_fsync_elapsed_us(int64_t started_us, int64_t now_us);
 
 /* R1 round-cadence accounting: how many pre-commit hook invocations skipped
  * the durability flush because the live catch-up gate was open and the commit

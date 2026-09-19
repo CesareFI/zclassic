@@ -268,7 +268,7 @@ Z23_FLAG("ZCL_BYTE_ORDER_SCAN_ROOTS", "env_build", "-", "-",
 Z23_FLAG("ZCL_C23_MAX_GLIBC", "env_build", "GLIBC_2.38", "-",
           "undocumented; first use tools/scripts/check_c23_node_binary.sh:139")
 Z23_FLAG("ZCL_CATCHUP_FSYNC_COMMIT_INTERVAL", "env_runtime", "8", "-",
-          "undocumented; first use engine/reducer/services/src/reducer_body_fsync.c:152")
+          "undocumented; first use engine/reducer/services/src/reducer_body_fsync.c:159")
 Z23_FLAG("ZCL_C3_ARTIFACT_ROOT", "env_build", "-", "-",
           "undocumented; first use tools/scripts/cold_start_to_tip_probe.sh:87")
 Z23_FLAG("ZCL_C3_BLOCK_INDEX", "env_build", "-", "-",

@@ -38,7 +38,7 @@
  * "R1: catch-up ROUND cadence" block comment below.
  *
  * TIMING (drive+fsync telemetry gap 2): the flush above is bracketed with a
- * GetTimeMicros() pair so an IO stall INSIDE it (ext4 jbd2 journal-commit
+ * monotonic-clock pair so an IO stall INSIDE it (ext4 jbd2 journal-commit
  * wait, a slow/contended disk) becomes a visible number instead of an
  * indistinguishable-from-slow-fold mystery. last_flush_us is the most recent
  * sample; flush_us_ewma is an exponential moving average (alpha = 1/16,
@@ -52,8 +52,8 @@
 
 #include "services/reducer_ingest_service.h"
 
-#include "core/utiltime.h"       /* GetTimeMicros */
 #include "jobs/catchup_cadence.h" /* catchup_cadence_active_cached (R1 gate) */
+#include "platform/time_compat.h"
 #include "storage/disk_block_io.h"
 #include "storage/event_log.h"
 #include "storage/event_log_singleton.h"
@@ -81,6 +81,13 @@ static _Atomic int64_t g_fsync_flush_us_ewma;
  * flush here is exactly one barrier for one committing batch. */
 static _Atomic uint64_t g_fsync_flush_count;
 static _Atomic uint64_t g_fsync_flush_us_total;
+
+int64_t reducer_body_fsync_elapsed_us(int64_t started_us, int64_t now_us)
+{
+    if (started_us <= 0 || now_us <= started_us)
+        return 0;
+    return now_us - started_us;
+}
 
 /* ── R1: catch-up ROUND cadence ───────────────────────────────────────────
  * During a live catch-up (the same peers+gap gate the catch-up drain-batch /
@@ -201,7 +208,7 @@ static bool reducer_batched_durability_precommit(void)
             return true;
         }
     }
-    int64_t t0 = GetTimeMicros();
+    int64_t t0 = platform_time_monotonic_us();
 #ifdef ZCL_TESTING
     int64_t inj = atomic_load(&g_test_inject_delay_us);
     if (inj > 0) {
@@ -218,14 +225,13 @@ static bool reducer_batched_durability_precommit(void)
      * rolls back). Both are attempted (no short-circuit) so a transient
      * failure in one still fdatasyncs the other. Neither this ordering nor
      * the veto decision below is touched by the timing wrap — only the two
-     * GetTimeMicros() reads and the atomic stores after are new. */
+     * monotonic-clock reads and the atomic stores after are new. */
     bool bodies = disk_block_io_sync_pending();
     event_log_t *log = event_log_singleton();
     bool events = log ? event_log_flush(log) : true;
 
-    int64_t elapsed_us = GetTimeMicros() - t0;
-    if (elapsed_us < 0)
-        elapsed_us = 0;
+    int64_t elapsed_us = reducer_body_fsync_elapsed_us(
+        t0, platform_time_monotonic_us());
     atomic_store(&g_fsync_last_flush_us, elapsed_us);
     int64_t prev = atomic_load(&g_fsync_flush_us_ewma);
     int64_t next = (prev == 0) ? elapsed_us : prev + (elapsed_us - prev) / 16;

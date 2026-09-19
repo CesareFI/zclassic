@@ -119,7 +119,7 @@ static void rdw_cleanup(void)
  * (converged / at-tip) restores the strict per-commit regime on the very
  * next commit. The connman/peer fixture mirrors test_catchup_cadence.c
  * (real struct connman via sync_monitor_set_context; log_head driven by
- * the catchup_cadence test override). GetTimeMicros() is unfrozen here
+ * the catchup_cadence test override). The monotonic clock is unfrozen here
  * (case f restored the real clock). Extracted from
  * test_reducer_drive_watchdog so the harness body stays under its
  * cyclomatic-complexity pin; returns this case's failure count. */
@@ -430,12 +430,10 @@ int test_reducer_drive_watchdog(void)
 
     /* ---- (f) batch_fsync_slow condition: injected slow flush trips it,
      * a raised budget clears it, and a healthy (fast, unmodified) flush
-     * never false-fires. GetTimeMicros() (which the precommit timing wrap
-     * uses) routes through the SAME overridable platform.clock the fake
-     * wall clock above installs (clock_now_wall_ms — see
-     * platform/modules/platform/include/platform/time_compat.h), so it is frozen
-     * whenever that fake clock is still active — a real nanosleep would
-     * measure 0us elapsed, not the injected delay. Restore the REAL clock
+     * never false-fires. platform_time_monotonic_us() routes through the
+     * SAME overridable platform.clock the fake clock above installs, so it is
+     * frozen whenever that fake clock is still active — a real nanosleep
+     * would measure 0us elapsed, not the injected delay. Restore the REAL clock
      * for this section so the injected-delay timing is genuine. To keep
      * each detect() a "first tick" (last_poll_unix == 0, which
      * condition_tick_one always polls regardless of poll_secs — see
@@ -452,6 +450,16 @@ int test_reducer_drive_watchdog(void)
         blocker_reset_for_testing();
         reducer_body_fsync_test_reset();
         batch_fsync_slow_test_reset();
+
+        RDW_CHECK("fsync elapsed: forward monotonic interval",
+                  reducer_body_fsync_elapsed_us(1000000, 3500000) ==
+                      2500000);
+        RDW_CHECK("fsync elapsed: equal sample clamps to zero",
+                  reducer_body_fsync_elapsed_us(1000000, 1000000) == 0);
+        RDW_CHECK("fsync elapsed: backwards sample clamps to zero",
+                  reducer_body_fsync_elapsed_us(1000000, 500000) == 0);
+        RDW_CHECK("fsync elapsed: missing origin clamps to zero",
+                  reducer_body_fsync_elapsed_us(0, 3500000) == 0);
 
         /* (f1) healthy path: an unmodified (fast) precommit flush (no
          * pending bodies, no open event log — real work, sub-millisecond)
