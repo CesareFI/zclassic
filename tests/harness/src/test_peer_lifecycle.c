@@ -1528,11 +1528,28 @@ static int test_peer_periodic_cadence_is_monotonic(void)
     return failures;
 }
 
+static int test_peer_elapsed_intervals_are_monotonic(void)
+{
+    int failures = 0;
+    TEST_CASE("peer_lifecycle: elapsed peer-health timers ignore wall rollback") {
+        const int64_t started_us = 7000000LL;
+        const int64_t wall_before = 1800000000LL;
+        const int64_t wall_after = wall_before - 86400LL;
+        ASSERT(wall_after < wall_before);
+        ASSERT(peer_elapsed_secs(
+                   started_us, started_us + 120LL * 1000000LL) == 120);
+        ASSERT(peer_elapsed_secs(started_us, started_us - 1) == 0);
+        ASSERT(peer_elapsed_secs(0, started_us) == 0);
+    } TEST_END
+    return failures;
+}
+
 int test_peer_lifecycle(void)
 {
     int failures = 0;
     failures += test_peer_connection_timeouts_are_monotonic();
     failures += test_peer_periodic_cadence_is_monotonic();
+    failures += test_peer_elapsed_intervals_are_monotonic();
     failures += test_peer_lifecycle_user_agent();
     failures += test_peer_lifecycle_classify();
     failures += test_peer_lifecycle_version_build();

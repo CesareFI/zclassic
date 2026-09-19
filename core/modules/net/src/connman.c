@@ -500,8 +500,8 @@ static void *thread_dns_seed(void *arg)
      * boot back to fixed/DNS seeds — anti-sticky for a recovering node. */
     const int64_t ADDRMAN_FLUSH_US = 12 * 60 * 1000000LL;
     int64_t last_addrman_flush = platform_time_monotonic_us();
-    int64_t start_ts = (int64_t)platform_time_wall_time_t();
-    int64_t floor_below_since = 0;
+    int64_t start_us = platform_time_monotonic_us();
+    int64_t floor_below_since_us = 0;
     uint64_t seed_rounds = 0;
     while (!g_stop) {
         size_t n = connman_outbound_healthy_count(cm);
@@ -510,11 +510,11 @@ static void *thread_dns_seed(void *arg)
         if (g_stop) break;
         thread_liveness_beat(&g_dns_seed_liveness, (int64_t)++seed_rounds);
         size_t cur = connman_outbound_healthy_count(cm);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now_us = platform_time_monotonic_us();
         if (connman_seed_discovery_needed(cur)) {
-            if (floor_below_since == 0) floor_below_since = now;
-            int64_t below_for = now - floor_below_since;
-            int64_t since_start = now - start_ts;
+            if (floor_below_since_us == 0) floor_below_since_us = now_us;
+            int64_t below_for = peer_elapsed_secs(floor_below_since_us, now_us);
+            int64_t since_start = peer_elapsed_secs(start_us, now_us);
             if (since_start > PEER_FLOOR_GRACE_SECS) {
                 event_emitf(EV_PEER_FLOOR_BREACH, 0,
                             "healthy=%zu min=%d since=%llds",
@@ -535,7 +535,7 @@ static void *thread_dns_seed(void *arg)
             connman_save_addrman(cm);
             last_addrman_flush = platform_time_monotonic_us();
         } else {
-            floor_below_since = 0;
+            floor_below_since_us = 0;
         }
         /* Periodic flush regardless of floor state. */
         if (peer_periodic_due(last_addrman_flush, platform_time_monotonic_us(),

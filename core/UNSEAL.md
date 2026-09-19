@@ -340,3 +340,11 @@ later lane flips it HARD.
 - 2026-09-19T15:11:23Z — REASON: Use monotonic elapsed time for block-download throughput reporting so wall-clock corrections cannot distort IBD diagnostics; observability only, no consensus or validation change
   old ROOT: 4a99e9a43019a51409f734667ec538589628a2c1c5ed40459d2a8bd82facce54
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T15:32:42Z — REASON: Use monotonic elapsed time for non-consensus peer-floor alert grace and duration so wall-clock rollback cannot suppress degraded-peer recovery evidence; no consensus or validation change
+  old ROOT: c7b69a8124a3017d04f4e967665bfaf3ca0c1e48890cde53930e964bc0b1ecc0
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T15:42:14Z — REASON: Refactor the authorized monotonic peer-floor timer call after the shrink-only file-size gate; behavior unchanged, no consensus or validation change
+  old ROOT: 99002524bcc275d4d7eb67a67e2631d1365cca1652e54b43a319763cc01a9134
+  by: owner unseal ritual (make core-unseal)

@@ -39,6 +39,11 @@ enum peer_liveness_action peer_liveness_decide(
  * clock correction must not strand a half-open peer in an outbound slot. */
 int64_t peer_connection_age_secs(int64_t connected_us, int64_t now_us);
 
+/* Non-negative elapsed monotonic seconds for peer-health timers.  An
+ * impossible backwards sample returns zero rather than manufacturing a long
+ * duration. */
+int64_t peer_elapsed_secs(int64_t started_us, int64_t now_us);
+
 /* True when a monotonic periodic action should run.  An impossible backwards
  * sample fails open so diagnostics recover immediately instead of remaining
  * suppressed behind a stale origin. */
