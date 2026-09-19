@@ -646,6 +646,7 @@ static int test_block_swarm_disconnect_requeue(void)
          * BLOCK_PIECE_TIMEOUT sweep expired them. */
         bs_drop_queue(p1, sent_p1);                    /* isolate this tick     */
         mp_snapshot_send_tick(&mp_b, p1);
+        int64_t assigned_monotonic = platform_time_monotonic_us() / 1000000;
         size_t p1_reqs = bs_queue_depth(sent_p1);
         printf("(dead peer held %zu in-flight pieces) ", p1_reqs);
         const size_t expected_pieces =
@@ -655,6 +656,14 @@ static int test_block_swarm_disconnect_requeue(void)
             expected_pieces < PIECE_PIPELINE_DEPTH
                 ? expected_pieces : PIECE_PIPELINE_DEPTH;
         ASSERT(p1_reqs == expected_owned);             /* all bounded work owned */
+        for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+            if (p1->blk_pipeline[pi].piece_index < 0)
+                continue;
+            ASSERT(p1->blk_pipeline[pi].request_time >=
+                   assigned_monotonic - 1);
+            ASSERT(p1->blk_pipeline[pi].request_time <=
+                   assigned_monotonic);
+        }
         bs_drop_queue(p1, sent_p1);                    /* p1 vanishes mid-flight */
 
         /* THE FIX (wired into connman's disconnect cleanup): reclaim exactly the

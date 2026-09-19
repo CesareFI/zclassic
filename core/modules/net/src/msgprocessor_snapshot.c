@@ -1068,7 +1068,8 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                                         node->swarm_inflight_chunk =
                                             first_chunk;
                                         node->swarm_chunk_req_time =
-                                            (int64_t)platform_time_wall_time_t();
+                                            platform_time_monotonic_us() /
+                                                1000000;
                                     }
                                 } else {
                                     /* Init failed — release the claim so
@@ -1668,7 +1669,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
 
         /* Handle timeout: if this peer's chunk is stale, re-queue it */
         if (node->swarm_inflight_chunk >= 0) {
-            int64_t now_sw = (int64_t)platform_time_wall_time_t();
+            int64_t now_sw = platform_time_monotonic_us() / 1000000;
             if (now_sw - node->swarm_chunk_req_time > SWARM_CHUNK_TIMEOUT_SECS) {
                 uint32_t ci = (uint32_t)node->swarm_inflight_chunk;
                 if (ci < g_swarm.manifest.num_chunks &&
@@ -1689,7 +1690,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
             int32_t ci = swarm_sync_assign_chunk(&g_swarm, node->id);
             if (ci >= 0) {
                 node->swarm_inflight_chunk = ci;
-                node->swarm_chunk_req_time = (int64_t)platform_time_wall_time_t();
+                node->swarm_chunk_req_time =
+                    platform_time_monotonic_us() / 1000000;
                 push_chunk_request(mp, node, (uint32_t)ci);
             }
         }
@@ -1736,7 +1738,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         pthread_mutex_lock(&g_block_swarm_mutex);
 
         /* Handle timeouts on this peer's pipeline */
-        int64_t now_bs = (int64_t)platform_time_wall_time_t();
+        int64_t now_bs = platform_time_monotonic_us() / 1000000;
         block_swarm_handle_timeouts(&g_block_swarm,
                                     BLOCK_PIECE_TIMEOUT_SECS);
         for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {

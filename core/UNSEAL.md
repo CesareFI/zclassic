@@ -328,3 +328,7 @@ later lane flips it HARD.
 - 2026-09-19T13:32:32Z — REASON: Use elapsed monotonic time for non-consensus fast-sync chunk and block-piece timeout reassignment; block and transaction validation remain unchanged
   old ROOT: 6943bc3fbda56684708f8061a6b20548e40581aeee84317018ecd28ba34a9b53
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T14:07:21Z — REASON: Use elapsed monotonic time for non-consensus per-peer fast-sync request deadlines; block and transaction validation remain unchanged
+  old ROOT: 8df20e3b8aeb330cbb585f1a1ef5717d748ffa920afc8839207f3f3b25c4a480
+  by: owner unseal ritual (make core-unseal)

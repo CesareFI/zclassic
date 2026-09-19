@@ -547,7 +547,7 @@ struct p2p_node {
     bool swarm_manifest_sent;     /* true if we sent our manifest to this peer */
     bool swarm_manifest_received; /* true if we received manifest from peer */
     int32_t swarm_inflight_chunk; /* chunk index assigned to this peer, -1 = none */
-    int64_t swarm_chunk_req_time; /* when chunk was requested (for timeout) */
+    int64_t swarm_chunk_req_time; /* monotonic seconds at request */
 
     /* Block swarm state (parallel block download) */
     bool blk_manifest_advertise_armed; /* ZCL23 handshake completed */
@@ -556,7 +556,7 @@ struct p2p_node {
     bool blk_manifest_received;   /* true if we received block manifest from peer */
     struct {
         int32_t piece_index;      /* -1 = empty slot */
-        int64_t request_time;
+        int64_t request_time;     /* monotonic seconds at request */
     } blk_pipeline[PIECE_PIPELINE_DEPTH];
     uint8_t *blk_bitmap;          /* peer's piece availability bitmap (heap) */
     uint32_t blk_bitmap_len;      /* bytes in bitmap */
