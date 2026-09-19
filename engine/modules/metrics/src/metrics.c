@@ -32,7 +32,7 @@
 _Atomic uint64_t g_transactions_validated = 0;
 _Atomic uint64_t g_eh_solver_runs = 0;
 
-static int64_t g_start_time = 0;
+static int64_t g_start_monotonic_us = 0;
 /* Supervisor liveness: the metrics printer loops on a 1 s cadence. It
  * heartbeats onto the tree (deadline=120 s) with the loop count as its
  * progress marker; no-progress gate disabled (the deadline covers a frozen
@@ -47,6 +47,19 @@ static struct thread_liveness_child g_metrics_child = {
  * thread); the winner of this CAS is the only spawner, and metrics_stop()
  * pairs with it so only the matching join runs. */
 static _Atomic bool g_metrics_started = false;
+
+int64_t metrics_uptime_seconds_between(int64_t started_us, int64_t now_us)
+{
+    if (started_us < 0 || now_us <= started_us)
+        return 0;
+    return (now_us - started_us) / 1000000;
+}
+
+static int64_t metrics_uptime_seconds(void)
+{
+    return metrics_uptime_seconds_between(g_start_monotonic_us,
+                                           platform_time_monotonic_us());
+}
 
 static bool stdout_is_terminal(void)
 {
@@ -304,7 +317,7 @@ static int print_metrics(bool mining)
 {
     int lines = 3;
 
-    int64_t uptime = GetTime() - g_start_time;
+    int64_t uptime = metrics_uptime_seconds();
     int days = (int)(uptime / 86400);
     int hours = (int)((uptime % 86400) / 3600);
     int minutes = (int)((uptime % 3600) / 60);
@@ -347,7 +360,7 @@ static int print_metrics(bool mining)
 static void *metrics_thread_fn(void *arg)
 {
     struct metrics_context *ctx = (struct metrics_context *)arg;
-    g_start_time = GetTime();
+    g_start_monotonic_us = platform_time_monotonic_us();
 
     bool is_tty = stdout_is_terminal();
 
@@ -408,7 +421,7 @@ static void *metrics_thread_fn(void *arg)
         {
             int64_t gh = ext.tip_height;
             int64_t gpc = ext.connection_count;
-            int64_t gup = GetTime() - g_start_time;
+            int64_t gup = metrics_uptime_seconds();
 
             /* RSS from /proc/self/status (Linux) */
             double grss = 0.0;

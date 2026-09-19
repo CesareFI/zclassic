@@ -74,6 +74,11 @@ void metrics_print_art(void);
 bool metrics_start(struct metrics_context *ctx);
 void metrics_stop(struct metrics_context *ctx);
 
+/* Convert a monotonic-clock interval to whole uptime seconds. A backwards
+ * sample is clamped to zero so a platform-clock failure cannot leak a
+ * negative uptime into alert hysteresis or the Prometheus surface. */
+int64_t metrics_uptime_seconds_between(int64_t started_us, int64_t now_us);
+
 /* O(1) atomic counter bump; thread-safe, callable from any thread. */
 static inline void metrics_increment_tx_validated(void)
 {

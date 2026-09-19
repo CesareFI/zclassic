@@ -12,6 +12,7 @@
  */
 
 #include "test/test_core.h"
+#include "metrics/metrics.h"
 #include "metrics/prometheus_metrics.h"
 #include "metrics/operator_events.h"
 #include "event/event.h"
@@ -496,6 +497,20 @@ static int test_metrics_reset_clears_alert_state(void)
     return failures;
 }
 
+static int test_metrics_uptime_is_monotonic_interval(void)
+{
+    int failures = 0;
+    TEST("metric_alerts: uptime uses a bounded monotonic interval") {
+        ASSERT(metrics_uptime_seconds_between(1000000, 1000000) == 0);
+        ASSERT(metrics_uptime_seconds_between(1000000, 1999999) == 0);
+        ASSERT(metrics_uptime_seconds_between(1000000, 2000000) == 1);
+        ASSERT(metrics_uptime_seconds_between(5000000, 4000000) == 0);
+        ASSERT(metrics_uptime_seconds_between(-1, 4000000) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* ── Entry point ────────────────────────────────────────────── */
 
 int test_metric_alerts(void);
@@ -523,6 +538,7 @@ int test_metric_alerts(void)
     failures += test_consensus_reject_spike_rule();
 
     failures += test_metrics_reset_clears_alert_state();
+    failures += test_metrics_uptime_is_monotonic_interval();
 
     event_clear_observers(EV_CONDITION_DETECTED);
     blocker_clear("test.metric_alert_permanent");
