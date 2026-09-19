@@ -623,11 +623,11 @@ struct net_manager {
      * to re-serialize the whole table to banlist.dat on EVERY insert/extend
      * — O(n) disk writes for O(1) work. AUTO bans (score_at_ban != 0) now
      * skip the write when one happened within the debounce window and just
-     * set ban_db_dirty; ban_db_write() stamps ban_db_last_write_unix and
+     * set ban_db_dirty; ban_db_write() stamps the monotonic last-write time and
      * clears ban_db_dirty on success, and net_manager_free() flushes a
      * still-dirty table before the mutex goes away. Manual bans (operator
      * paths) ignore the debounce and always write. */
-    int64_t ban_db_last_write_unix;
+    int64_t ban_db_last_write_monotonic_us;
     bool ban_db_dirty;
     /* Bumped by EVERY ban-table mutation site (extend, cap eviction, insert,
      * unban swap-remove, clear) — but NOT by is_banned()'s lazy prune, which

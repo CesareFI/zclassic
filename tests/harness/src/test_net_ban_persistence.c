@@ -33,7 +33,8 @@
  *      and a simulated restart (the lost-update regression: the write
  *      used to clear the dirty flag unconditionally after installing a
  *      file that predated the mutation).
- *  11. concurrent writers serialize on the single-flight write mutex and
+ *  11. a backwards debounce-clock sample fails open and persists the new ban.
+ *  12. concurrent writers serialize on the single-flight write mutex and
  *      leave the file equal to the live table.
  *
  * One TEST()/ASSERT() block per function — this codebase's TEST macro
@@ -322,6 +323,47 @@ static int test_nbp_manual_ban_survives_flood(void)
     return failures;
 }
 
+static int test_nbp_debounce_backwards_time_persists(void)
+{
+    int failures = 0;
+    TEST("ban_db: backwards debounce time persists instead of stranding dirty state") {
+        nbp_default_scoring();
+        char dir[256];
+        test_make_tmpdir(dir, sizeof(dir), "net_ban_persistence",
+                         "debounce_backwards");
+        struct net_manager nm;
+        net_manager_init(&nm);
+        nm.datadir = dir;
+
+        struct p2p_node first;
+        nbp_flood_node(&first, nbp_flood_addr(1));
+        peer_scoring_record(&nm, &first,
+                            PEER_OFFENCE_INVALID_BLOCK, "first");
+        ASSERT(!nm.ban_db_dirty);
+
+        /* Simulate an impossible backwards monotonic sample. The old
+         * civil-time subtraction treated this as inside the debounce window
+         * indefinitely after a wall-clock rollback. */
+        nm.ban_db_last_write_monotonic_us = INT64_MAX;
+        struct p2p_node second;
+        nbp_flood_node(&second, nbp_flood_addr(2));
+        peer_scoring_record(&nm, &second,
+                            PEER_OFFENCE_INVALID_BLOCK, "second");
+        ASSERT(!nm.ban_db_dirty);
+
+        struct net_manager reloaded;
+        net_manager_init(&reloaded);
+        ASSERT(ban_db_read(&reloaded, dir));
+        ASSERT(nbp_banned(&reloaded, nbp_flood_addr(1)));
+        ASSERT(nbp_banned(&reloaded, nbp_flood_addr(2)));
+
+        net_manager_free(&reloaded);
+        net_manager_free(&nm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_nbp_full_manual_table_refuses_auto(void)
 {
     int failures = 0;
@@ -584,6 +626,7 @@ int test_net_ban_persistence(void)
     failures += test_nbp_corrupt_file_quarantined();
     failures += test_nbp_flood_caps_table();
     failures += test_nbp_manual_ban_survives_flood();
+    failures += test_nbp_debounce_backwards_time_persists();
     failures += test_nbp_full_manual_table_refuses_auto();
     failures += test_nbp_generation_contract();
     failures += test_nbp_ban_during_write_survives_restart();

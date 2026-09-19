@@ -264,3 +264,11 @@ later lane flips it HARD.
 - 2026-09-19T03:57:44Z — REASON: Repair the platform time compatibility include for the authorized addr-window monotonic timer change; behavior unchanged
   old ROOT: ffd23cf9f1a6a413b031666e3a26372b1323cda276fd144c8574da9e1b44a3af
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T04:18:30Z — REASON: Use monotonic elapsed time for automatic banlist write debounce so wall-clock corrections cannot strand dirty defensive-networking state; persistence scheduling only, no consensus or validation change
+  old ROOT: 2a918dc7bb8a6b8812b0984d8b765bf21aaa6142bca57ce28730f6e7fb5c989e
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T04:30:28Z — REASON: Keep the authorized banlist debounce change within the enforced legacy file-size ceiling; behavior unchanged
+  old ROOT: 1cf7a537a4f680b578596cb2a57f3ea70f405a8f5cb2159ffd08d2ac98c0edaf
+  by: owner unseal ritual (make core-unseal)

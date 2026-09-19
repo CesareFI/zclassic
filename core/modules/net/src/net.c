@@ -1549,8 +1549,9 @@ static bool ban_db_write_due_locked(struct net_manager *nm, int32_t score_at_ban
 {
     if (!nm->datadir || score_at_ban == 0)
         return true;
-    int64_t now = GetTime();
-    if (now - nm->ban_db_last_write_unix < NET_BAN_DB_WRITE_DEBOUNCE_SECS) {
+    int64_t now_us = platform_time_monotonic_us(), last_us = nm->ban_db_last_write_monotonic_us;
+    if (last_us > 0 && now_us >= last_us &&
+        now_us - last_us < NET_BAN_DB_WRITE_DEBOUNCE_SECS * 1000000LL) {
         nm->ban_db_dirty = true;
         return false;
     }
@@ -2067,11 +2068,10 @@ bool ban_db_write(struct net_manager *nm, const char *datadir)
      * serializes the newer table. Under cs_banned: all three fields are
      * declared cs_banned-guarded. */
     zcl_mutex_lock(&nm->cs_banned);
-    nm->ban_db_last_write_unix = now;
+    nm->ban_db_last_write_monotonic_us = platform_time_monotonic_us();
     if (nm->ban_db_generation == gen_snapshot)
         nm->ban_db_dirty = false;
     zcl_mutex_unlock(&nm->cs_banned);
-
     zcl_mutex_unlock(&nm->cs_ban_db_write);
     return true;
 }
