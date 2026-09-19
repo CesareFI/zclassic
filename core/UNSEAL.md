@@ -248,3 +248,7 @@ later lane flips it HARD.
 - 2026-09-19T02:28:59Z — REASON: Use the existing monotonic peer connection stamp for TCP-connect and version-handshake deadlines so backward wall-clock steps cannot strand outbound slots; networking policy only, no consensus or validation change
   old ROOT: 5112c261b8fb144a9ed22779fe430a883ee2d20d752501ecf79f0dba4bfa2667
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T02:49:45Z — REASON: Use monotonic elapsed time for compact-block response scheduling so wall-clock corrections cannot discard fresh blocktxn responses; networking policy only, no consensus or validation change
+  old ROOT: 0c2a7215781b897b98e65298041f1101b73c0920d6d0ec19a684995f375324d1
+  by: owner unseal ritual (make core-unseal)

@@ -398,11 +398,10 @@ static bool submit_compact_test_block(struct block *block,
     return true;
 }
 
-static int test_process_blocktxn_rejects_clock_rollback_age(void)
+static int test_process_blocktxn_ignores_wall_clock_corrections(void)
 {
     int failures = 0;
-    TEST("msg_handlers: future compact request timestamp after clock rollback "
-         "discards blocktxn") {
+    TEST("msg_handlers: compact response timeout uses monotonic elapsed time") {
         struct p2p_node node;
         memset(&node, 0, sizeof(node));
         node.id = 76;
@@ -414,8 +413,7 @@ static int test_process_blocktxn_rejects_clock_rollback_age(void)
         block_init(node.compact_pending_block);
         memset(node.compact_pending_hash.data, 0x76,
                sizeof(node.compact_pending_hash.data));
-        node.compact_request_time =
-            (int64_t)platform_time_wall_time_t() + 3600;
+        node.compact_request_monotonic_us = platform_time_monotonic_us();
 
         struct block_txn_response resp;
         block_txn_response_init(&resp);
@@ -432,9 +430,9 @@ static int test_process_blocktxn_rejects_clock_rollback_age(void)
         mp.compact_block_submit_ctx = &submit_calls;
 
         ASSERT(process_blocktxn(&mp, &node, &s));
-        ASSERT(submit_calls == 0);
+        ASSERT(submit_calls == 1);
         ASSERT(node.compact_pending_block == NULL);
-        ASSERT(node.compact_request_time == 0);
+        ASSERT(node.compact_request_monotonic_us == 0);
 
         stream_free(&s);
         block_txn_response_free(&resp);
@@ -1287,7 +1285,7 @@ int test_msg_handlers(void)
     failures += test_should_announce_getblocks();
     failures += test_source_header_echo_policy();
     failures += test_block_validation_retryable_classifier();
-    failures += test_process_blocktxn_rejects_clock_rollback_age();
+    failures += test_process_blocktxn_ignores_wall_clock_corrections();
     failures += test_process_block_msg_reducer_pending_stays_retryable();
     failures += test_process_block_msg_scores_unrequested();
     failures += test_process_block_msg_no_score_when_requested();

@@ -252,7 +252,7 @@ static void fuzz_reset_node_for_command(const char *command)
     free(node->compact_missing_indices);
     node->compact_missing_indices = NULL;
     node->compact_num_missing = 0;
-    node->compact_request_time = 0;
+    node->compact_request_monotonic_us = 0;
 
     free(node->blk_bitmap);
     node->blk_bitmap = NULL;

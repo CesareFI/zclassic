@@ -35,7 +35,7 @@ static void compact_pending_clear(struct p2p_node *node)
     free(node->compact_missing_indices);
     node->compact_missing_indices = NULL;
     node->compact_num_missing = 0;
-    node->compact_request_time = 0;
+    node->compact_request_monotonic_us = 0;
     memset(&node->compact_pending_hash, 0, sizeof(node->compact_pending_hash));
 }
 
@@ -222,7 +222,7 @@ bool process_cmpctblock(struct msg_processor *mp, struct p2p_node *node,
             node->compact_pending_hash = block_hash;
             node->compact_missing_indices = missing_indices;
             node->compact_num_missing = num_missing;
-            node->compact_request_time = (int64_t)platform_time_wall_time_t();
+            node->compact_request_monotonic_us = platform_time_monotonic_us();
             missing_indices = NULL; /* ownership transferred */
         } else {
             /* Alloc failed — fall back to just freeing */
@@ -363,13 +363,14 @@ bool process_blocktxn(struct msg_processor *mp, struct p2p_node *node,
         return true;
     }
 
-    /* Timeout check: reject stale responses (>30 seconds).  A negative age
-     * means the wall clock moved behind the request timestamp; fail closed
-     * instead of letting an arbitrarily old response bypass this bound. */
-    int64_t age = (int64_t)platform_time_wall_time_t() - node->compact_request_time;
-    if (age < 0 || age > 30) {
-        LOG_WARN("compact", "peer %s: blocktxn %s — stale response (%lld sec), discarding",
-                 node->addr_name, hex, (long long)age);
+    /* Scheduling timeouts use monotonic elapsed time.  Wall-clock correction
+     * must neither discard a fresh response nor extend this bounded wait. */
+    int64_t now_us = platform_time_monotonic_us();
+    int64_t age_us = now_us - node->compact_request_monotonic_us;
+    if (node->compact_request_monotonic_us <= 0 || age_us < 0 ||
+        age_us > 30 * 1000000LL) {
+        LOG_WARN("compact", "peer %s: blocktxn %s — stale response (%lld ms), discarding",
+                 node->addr_name, hex, (long long)(age_us / 1000));
         compact_pending_clear(node);
         block_txn_response_free(&resp);
         return true;

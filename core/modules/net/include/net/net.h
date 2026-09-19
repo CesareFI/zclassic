@@ -471,7 +471,7 @@ struct p2p_node {
     struct uint256 compact_pending_hash;       /* block hash we're waiting for */
     uint64_t *compact_missing_indices;         /* which tx slots are empty */
     size_t compact_num_missing;                /* count of missing indices */
-    int64_t compact_request_time;              /* when getblocktxn was sent (timeout) */
+    int64_t compact_request_monotonic_us;      /* getblocktxn timeout origin */
 
     /* Cross-thread: the msg-handler thread writes these (no cs_nodes) while
      * the self_heal thread reads/resets them (under cs_nodes). cs_nodes gives
