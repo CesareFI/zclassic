@@ -498,8 +498,8 @@ static void *thread_dns_seed(void *arg)
      * round, not only on clean shutdown. A kill-9 / OOM before connman_free
      * otherwise discards every host learned this session, forcing the next
      * boot back to fixed/DNS seeds — anti-sticky for a recovering node. */
-    const int64_t ADDRMAN_FLUSH_SECS = 12 * 60;
-    int64_t last_addrman_flush = (int64_t)platform_time_wall_time_t();
+    const int64_t ADDRMAN_FLUSH_US = 12 * 60 * 1000000LL;
+    int64_t last_addrman_flush = platform_time_monotonic_us();
     int64_t start_ts = (int64_t)platform_time_wall_time_t();
     int64_t floor_below_since = 0;
     uint64_t seed_rounds = 0;
@@ -533,17 +533,17 @@ static void *thread_dns_seed(void *arg)
             /* Persist immediately after a seed round: we just learned a
              * fresh host set and the node is degraded — protect it. */
             connman_save_addrman(cm);
-            last_addrman_flush = (int64_t)platform_time_wall_time_t();
+            last_addrman_flush = platform_time_monotonic_us();
         } else {
             floor_below_since = 0;
         }
         /* Periodic flush regardless of floor state. */
-        if (now - last_addrman_flush >= ADDRMAN_FLUSH_SECS && !g_stop) {
+        if (peer_periodic_due(last_addrman_flush, platform_time_monotonic_us(),
+                              ADDRMAN_FLUSH_US) && !g_stop) {
             connman_save_addrman(cm);
-            last_addrman_flush = now;
+            last_addrman_flush = platform_time_monotonic_us();
         }
     }
-
     return NULL;
 }
 

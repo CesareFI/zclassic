@@ -316,3 +316,7 @@ later lane flips it HARD.
 - 2026-09-19T08:12:28Z — REASON: Remove one blank line from the authorized peer lifecycle telemetry edit to preserve the shrink-only file-size ceiling
   old ROOT: 41836ea6f2b315111de74534615cf386e8c7091d44ba3dccdf93ff4a429a871a
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T08:43:24Z — REASON: Schedule periodic addrman durability from monotonic time so wall-clock rollback cannot postpone peer persistence; networking reliability only, no consensus or validation change
+  old ROOT: e4c199d594cfd4a7668e04d4cf6269734496753361c8cbd01bff05a743501bcd
+  by: owner unseal ritual (make core-unseal)
