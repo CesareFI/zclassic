@@ -8,7 +8,6 @@
 #include "prometheus_metrics_internal.h"
 #include "base/format_attribute.h"
 #include "metrics/stage_metrics.h"
-#include "core/utiltime.h"
 #include "event/event.h"
 #include "net/peer_scoring.h"
 #include "sync/sync_state.h"
@@ -337,7 +336,7 @@ void metrics_prometheus_evaluate_alert_rules(void)
     alert_rules_seed_locked();
     consensus_reject_spike_tick();
 
-    int64_t now = GetTime();
+    int64_t now_uptime = atomic_load(&g_node_uptime_seconds);
     for (size_t i = 0; i < g_alert_rule_count; i++) {
         const struct metric_alert_rule *r = &g_alert_rules[i];
         struct metric_alert_rule_state *st = &g_alert_state[i];
@@ -351,14 +350,16 @@ void metrics_prometheus_evaluate_alert_rules(void)
         }
 
         bool rising_edge   = !st->active;
-        bool cooldown_over = st->last_fired_unix == 0 ||
-                             (now - st->last_fired_unix) >= r->cooldown_sec;
+        bool cooldown_over = st->fire_count == 0 ||
+                             (now_uptime >= st->last_fired_uptime &&
+                              now_uptime - st->last_fired_uptime >=
+                                  r->cooldown_sec);
         bool should_fire   = rising_edge || cooldown_over;
 
         st->active = true;
 
         if (should_fire) {
-            st->last_fired_unix = now;
+            st->last_fired_uptime = now_uptime;
             st->fire_count++;
             event_emitf(EV_CONDITION_DETECTED, 0,
                         "name=metric_alert.%s severity=%s gauge=%s "

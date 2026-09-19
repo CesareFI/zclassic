@@ -42,7 +42,7 @@ struct metric_alert_rule {
 
 struct metric_alert_rule_state {
     bool     active;           /* latched true while the gauge stays crossed */
-    int64_t  last_fired_unix;
+    int64_t  last_fired_uptime;
     uint64_t fire_count;
 };
 

@@ -187,6 +187,35 @@ static int test_refires_after_clearing_and_recrossing(void)
     return failures;
 }
 
+static int test_continuous_breach_cooldown_uses_uptime(void)
+{
+    int failures = 0;
+    TEST("metric_alerts: continuous breach cooldown follows node uptime") {
+        ma_reset_all();
+        ma_install_observer();
+
+        metrics_prometheus_set_node_gauges(0, 0, 0, 0, 100);
+        metrics_prometheus_set_tip_advance_age(900);
+        metrics_prometheus_evaluate_alert_rules();
+        ASSERT(metrics_prometheus_alert_fire_count("tip_stalled") == 1);
+
+        /* The default cooldown is 300 seconds. A backwards uptime sample
+         * cannot manufacture elapsed time, and 299 elapsed seconds do not
+         * re-fire a continuous breach. */
+        metrics_prometheus_set_node_gauges(0, 0, 0, 0, 50);
+        metrics_prometheus_evaluate_alert_rules();
+        metrics_prometheus_set_node_gauges(0, 0, 0, 0, 399);
+        metrics_prometheus_evaluate_alert_rules();
+        ASSERT(metrics_prometheus_alert_fire_count("tip_stalled") == 1);
+
+        metrics_prometheus_set_node_gauges(0, 0, 0, 0, 400);
+        metrics_prometheus_evaluate_alert_rules();
+        ASSERT(metrics_prometheus_alert_fire_count("tip_stalled") == 2);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* Pre-bootstrap sentinel (-1) must never spuriously cross a GT rule. */
 static int test_sentinel_value_does_not_fire(void)
 {
@@ -525,6 +554,7 @@ int test_metric_alerts(void)
     failures += test_fires_exactly_once_on_crossing();
     failures += test_not_raised_below_threshold();
     failures += test_refires_after_clearing_and_recrossing();
+    failures += test_continuous_breach_cooldown_uses_uptime();
     failures += test_sentinel_value_does_not_fire();
 
     failures += test_mirror_lag_high_rule();
