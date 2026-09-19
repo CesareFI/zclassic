@@ -9,7 +9,7 @@
 #ifndef ZCL_CONSENSUS_STATE_BUNDLE_VALIDATE_HEARTBEAT_H
 #define ZCL_CONSENSUS_STATE_BUNDLE_VALIDATE_HEARTBEAT_H
 
-#include "core/utiltime.h"
+#include "platform/time_compat.h"
 #include "util/log_macros.h"
 
 #include <stdint.h>
@@ -27,7 +27,7 @@ static inline void heartbeat_begin(struct validate_heartbeat *hb,
                                    const char *stage, uint64_t total)
 {
     hb->stage = stage;
-    hb->started_us = GetTimeMicros();
+    hb->started_us = platform_time_monotonic_us();
     hb->last_log_us = hb->started_us;
     hb->total = total;
 }
@@ -35,7 +35,7 @@ static inline void heartbeat_begin(struct validate_heartbeat *hb,
 static inline void heartbeat_tick(struct validate_heartbeat *hb,
                                   uint64_t processed)
 {
-    int64_t now = GetTimeMicros();
+    int64_t now = platform_time_monotonic_us();
     if (now - hb->last_log_us < VALIDATE_HEARTBEAT_INTERVAL_US)
         return;
     hb->last_log_us = now;

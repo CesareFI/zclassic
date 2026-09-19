@@ -50,12 +50,13 @@ static int64_t activate_phase_begin(const char *phase, uint64_t count)
 {
     LOG_INFO(ACTIVATE_SUBSYS, "activate verify: phase=%s begin count=%llu",
              phase, (unsigned long long)count);
-    return GetTimeMicros();
+    return platform_time_monotonic_us();
 }
 static void activate_phase_done(const char *phase, int64_t started_us)
 {
     LOG_INFO(ACTIVATE_SUBSYS, "activate verify: phase=%s ok elapsed=%.0fs",
-             phase, (double)(GetTimeMicros() - started_us) / 1000000.0);
+             phase,
+             (double)(platform_time_monotonic_us() - started_us) / 1000000.0);
 }
 #ifdef ZCL_TESTING
 static void (*g_activate_after_stream_hook)(void *) = NULL;
