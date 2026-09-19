@@ -259,7 +259,8 @@ void dandelion_stempool_add(struct dandelion_state *ds,
     }
 
     ds->stempool[slot].txhash = *txhash;
-    ds->stempool[slot].embargo_time = (int64_t)platform_time_wall_time_t() + DANDELION_EMBARGO_SECS;
+    ds->stempool[slot].embargo_time =
+        platform_time_monotonic_us() / 1000000 + DANDELION_EMBARGO_SECS;
     ds->stempool[slot].from_peer = from_peer;
     ds->stempool[slot].active = true;
     ds->stempool_count++;
@@ -296,7 +297,7 @@ int dandelion_stempool_check_embargo(struct dandelion_state *ds,
     if (!ds || !out_hashes || max_out <= 0)
         return 0;
 
-    int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now = platform_time_monotonic_us() / 1000000;
     int count = 0;
 
     zcl_mutex_lock(&ds->cs);

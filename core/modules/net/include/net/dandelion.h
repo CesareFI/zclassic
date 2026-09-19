@@ -58,7 +58,7 @@
 
 struct dandelion_stem_entry {
     struct uint256 txhash;       /* tx hash */
-    int64_t        embargo_time; /* unix timestamp when embargo expires */
+    int64_t        embargo_time; /* monotonic seconds when embargo expires */
     node_id_t      from_peer;    /* peer that sent this tx (for loop detect) */
     bool           active;       /* slot in use */
 };

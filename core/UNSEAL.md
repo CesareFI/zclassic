@@ -320,3 +320,7 @@ later lane flips it HARD.
 - 2026-09-19T08:43:24Z — REASON: Schedule periodic addrman durability from monotonic time so wall-clock rollback cannot postpone peer persistence; networking reliability only, no consensus or validation change
   old ROOT: e4c199d594cfd4a7668e04d4cf6269734496753361c8cbd01bff05a743501bcd
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T11:36:09Z — REASON: Use elapsed monotonic time for non-consensus Dandelion embargo deadlines; transaction validation and consensus are unchanged
+  old ROOT: 03ba369c1c50416dd5591ce6a1284acb7a2ab174d7efd80fcd49ce1c96c236d7
+  by: owner unseal ritual (make core-unseal)

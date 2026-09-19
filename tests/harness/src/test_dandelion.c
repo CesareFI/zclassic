@@ -21,6 +21,24 @@ static struct uint256 make_test_hash(uint8_t seed)
     return h;
 }
 
+static int expire_monotonic_embargo(struct dandelion_state *ds,
+                                    int64_t before, int64_t after,
+                                    struct uint256 *expired, int max_expired)
+{
+    for (int i = 0; i < DANDELION_MAX_STEMPOOL; i++) {
+        if (!ds->stempool[i].active)
+            continue;
+        if (ds->stempool[i].embargo_time <
+                before + DANDELION_EMBARGO_SECS ||
+            ds->stempool[i].embargo_time >
+                after + DANDELION_EMBARGO_SECS)
+            return -1;
+        ds->stempool[i].embargo_time = after - 1;
+        return dandelion_stempool_check_embargo(ds, expired, max_expired);
+    }
+    return -1;
+}
+
 int test_dandelion(void)
 {
     int failures = 0;
@@ -216,18 +234,14 @@ int test_dandelion(void)
         dandelion_init(&ds);
 
         struct uint256 h = make_test_hash(0xEE);
+        int64_t before = platform_time_monotonic_us() / 1000000;
         dandelion_stempool_add(&ds, &h, 1);
+        int64_t after = platform_time_monotonic_us() / 1000000;
 
-        /* Force the embargo time to be in the past */
-        for (int i = 0; i < DANDELION_MAX_STEMPOOL; i++) {
-            if (ds.stempool[i].active) {
-                ds.stempool[i].embargo_time = (int64_t)platform_time_wall_time_t() - 1;
-                break;
-            }
-        }
-
+        /* The deadline must be derived from elapsed time, not the adjustable
+         * wall clock. Then force it into the past without sleeping. */
         struct uint256 expired[8];
-        int nexp = dandelion_stempool_check_embargo(&ds, expired, 8);
+        int nexp = expire_monotonic_embargo(&ds, before, after, expired, 8);
         if (nexp == 1 && uint256_eq(&expired[0], &h) &&
             ds.stempool_count == 0)
             printf("OK\n");
