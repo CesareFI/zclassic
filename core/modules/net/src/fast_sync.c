@@ -1347,7 +1347,7 @@ int32_t swarm_sync_assign_chunk(struct swarm_sync *ss, int peer_id)
         if (ss->chunk_states[i] == CHUNK_NEEDED) {
             ss->chunk_states[i] = CHUNK_INFLIGHT;
             ss->chunk_peer[i] = peer_id;
-            ss->chunk_request_time[i] = (int64_t)platform_time_wall_time_t();
+            ss->chunk_request_time[i] = platform_time_monotonic_us() / 1000000;
             ss->chunks_inflight++;
             return (int32_t)i;
         }
@@ -1430,7 +1430,7 @@ void swarm_sync_handle_timeouts(struct swarm_sync *ss, int timeout_secs)
 {
     if (!ss || !ss->chunk_states) return;
 
-    int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now = platform_time_monotonic_us() / 1000000;
     for (uint32_t i = 0; i < ss->manifest.num_chunks; i++) {
         if (ss->chunk_states[i] == CHUNK_INFLIGHT &&
             now - ss->chunk_request_time[i] > timeout_secs) {

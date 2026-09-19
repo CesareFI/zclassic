@@ -3593,8 +3593,9 @@ static int test_net_swarm_sync_timeout_resets_stale_inflight_to_n(void)
         swarm_sync_assign_chunk(&ss, 30);
 
         /* Backdate chunk 0 and 1 request times to simulate timeout */
-        ss.chunk_request_time[0] = (int64_t)platform_time_wall_time_t() - 120;
-        ss.chunk_request_time[1] = (int64_t)platform_time_wall_time_t() - 120;
+        int64_t now = platform_time_monotonic_us() / 1000000;
+        ss.chunk_request_time[0] = now - 120;
+        ss.chunk_request_time[1] = now - 120;
         /* Chunk 2 stays recent */
 
         swarm_sync_handle_timeouts(&ss, 60);

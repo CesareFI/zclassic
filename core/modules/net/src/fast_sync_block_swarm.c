@@ -154,7 +154,8 @@ static int32_t block_swarm_assign_piece_capped(struct block_swarm *bs,
     if (best >= 0) {
         bs->piece_states[best] = CHUNK_INFLIGHT;
         bs->piece_peer[best] = peer_id;
-        bs->piece_request_time[best] = (int64_t)platform_time_wall_time_t();
+        bs->piece_request_time[best] =
+            platform_time_monotonic_us() / 1000000;
         bs->pieces_inflight++;
         if ((uint32_t)best == bs->next_assign_hint)
             block_swarm_advance_assign_hint(bs);
@@ -282,7 +283,7 @@ void block_swarm_handle_timeouts(struct block_swarm *bs, int timeout_secs)
 {
     if (!bs || !bs->piece_states) return;
 
-    int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now = platform_time_monotonic_us() / 1000000;
     for (uint32_t i = 0; i < bs->manifest.num_pieces; i++) {
         if (bs->piece_states[i] == CHUNK_INFLIGHT &&
             now - bs->piece_request_time[i] > timeout_secs) {

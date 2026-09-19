@@ -324,3 +324,7 @@ later lane flips it HARD.
 - 2026-09-19T11:36:09Z — REASON: Use elapsed monotonic time for non-consensus Dandelion embargo deadlines; transaction validation and consensus are unchanged
   old ROOT: 03ba369c1c50416dd5591ce6a1284acb7a2ab174d7efd80fcd49ce1c96c236d7
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T13:32:32Z — REASON: Use elapsed monotonic time for non-consensus fast-sync chunk and block-piece timeout reassignment; block and transaction validation remain unchanged
+  old ROOT: 6943bc3fbda56684708f8061a6b20548e40581aeee84317018ecd28ba34a9b53
+  by: owner unseal ritual (make core-unseal)

@@ -329,7 +329,7 @@ struct swarm_sync {
     struct sync_manifest manifest;
     enum chunk_state *chunk_states;    /* array[num_chunks] */
     int *chunk_peer;                   /* which peer has each inflight chunk */
-    int64_t *chunk_request_time;       /* when each chunk was requested (ms) */
+    int64_t *chunk_request_time;       /* monotonic seconds at request */
     int *chunk_retries;                /* retry count per chunk (max 5) */
     uint32_t chunks_complete;
     uint32_t chunks_inflight;
@@ -423,7 +423,7 @@ struct block_swarm {
     struct block_piece_manifest manifest;
     enum chunk_state *piece_states;     /* array[num_pieces] */
     int *piece_peer;                    /* which peer has each piece */
-    int64_t *piece_request_time;        /* when each piece was requested */
+    int64_t *piece_request_time;        /* monotonic seconds at request */
     uint32_t *piece_availability;       /* how many peers have each piece */
     uint32_t pieces_complete;
     uint32_t pieces_inflight;

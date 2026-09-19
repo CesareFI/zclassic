@@ -588,10 +588,16 @@ static int test_swarm_timeout_reassign(void)
             swarm_sync_assign_chunk(&ss, 1);
         ASSERT(ss.chunks_inflight == 5);
 
+        int64_t monotonic_now = platform_time_monotonic_us() / 1000000;
+        for (uint32_t i = 0; i < 5; i++) {
+            ASSERT(ss.chunk_request_time[i] >= monotonic_now - 1);
+            ASSERT(ss.chunk_request_time[i] <= monotonic_now);
+        }
+
         /* No chunks available now */
         ASSERT(swarm_sync_assign_chunk(&ss, 2) == -1);
 
-        /* Simulate timeout: set request times to the past */
+        /* Simulate elapsed monotonic time without sleeping. */
         for (uint32_t i = 0; i < 5; i++)
             ss.chunk_request_time[i] -= 60; /* 60s ago */
         swarm_sync_handle_timeouts(&ss, 30); /* 30s timeout */
