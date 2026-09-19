@@ -304,3 +304,15 @@ later lane flips it HARD.
 - 2026-09-19T07:29:53Z — REASON: Keep connman within shrink-only file-size ratchet
   old ROOT: ed0e504d7723f1394df31ca1bb6da91e55f9023f2f6a154470d41fb8f298de34
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T08:02:24Z — REASON: Use monotonic elapsed time for peer lifecycle handshake and reconnect diagnostics so civil clock corrections cannot corrupt incident scoring; reporting only, no consensus or validation change
+  old ROOT: 4c8bd3796ba512e2bcb33b843cffc693e0a8557443aba389cc40812b5177a725
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T08:11:10Z — REASON: Keep the authorized peer lifecycle monotonic telemetry change within the shrink-only file-size ceiling; behavior unchanged
+  old ROOT: 3adc35e0768fdce323618a6d7f86ab45df6760d101feed0b8b92fac6359b5ce2
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T08:12:28Z — REASON: Remove one blank line from the authorized peer lifecycle telemetry edit to preserve the shrink-only file-size ceiling
+  old ROOT: 41836ea6f2b315111de74534615cf386e8c7091d44ba3dccdf93ff4a429a871a
+  by: owner unseal ritual (make core-unseal)

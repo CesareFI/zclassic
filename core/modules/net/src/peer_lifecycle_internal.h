@@ -20,6 +20,8 @@ struct peer_lifecycle_entry {
     int64_t first_seen;
     int64_t last_seen;
     int64_t connected_at;
+    /* Elapsed-time counterparts; wall fields above remain event chronology. */
+    int64_t connected_monotonic_us;
     int64_t last_reconnect_at;
     int64_t last_reconnect_interval_secs;
     uint64_t connected_seq;
@@ -27,6 +29,7 @@ struct peer_lifecycle_entry {
     int64_t version_received_at;
     int64_t verack_received_at;
     int64_t handshake_complete_at;
+    int64_t handshake_complete_monotonic_us;
     uint64_t handshake_complete_seq;
     int64_t active_at;
     int64_t disconnected_at;

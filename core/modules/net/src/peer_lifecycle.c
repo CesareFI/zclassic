@@ -8,7 +8,9 @@
 #include "net/net.h"
 #include "net/download.h"
 #include "net/fast_sync.h"
+#include "net/peer_liveness.h"
 #include "net/peer_scoring.h"
+#include "platform/time_compat.h"
 #include "storage/peers_projection.h"
 #include "storage/event_log_payloads.h"
 #include "util/blocker.h"
@@ -17,7 +19,6 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
-
 #include "peer_lifecycle_internal.h"
 
 static struct {
@@ -122,11 +123,8 @@ static bool subver_is_zcl23(const char *subver, uint64_t services)
 
 static int64_t handshake_duration_secs(const struct peer_lifecycle_entry *e)
 {
-    if (!e || e->connected_at <= 0 || e->handshake_complete_at <= 0)
-        return 0;
-    if (e->handshake_complete_at <= e->connected_at)
-        return 0;
-    return e->handshake_complete_at - e->connected_at;
+    if (!e) return 0;
+    return peer_connection_age_secs(e->connected_monotonic_us, e->handshake_complete_monotonic_us);
 }
 
 static void addr_host_key(const char *addr, char *out, size_t out_sz)
@@ -454,24 +452,25 @@ void peer_lifecycle_note_connected(const struct p2p_node *node,
     pthread_mutex_lock(&g_pl.lock);
     struct peer_lifecycle_entry *e = entry_for_node_locked(node, true);
     if (e) {
-        int64_t now = GetTime();
+        int64_t now = GetTime(), now_monotonic_us = platform_time_monotonic_us();
         uint64_t seq = ++g_pl.seq;
         bool terminal_after_connect =
             e->terminal_seq > 0 && e->terminal_seq >= e->connected_seq;
         e->peer_id = node ? node->id : e->peer_id;
         if (terminal_after_connect && e->connected_at > 0) {
             e->last_reconnect_at = now;
-            e->last_reconnect_interval_secs =
-                now >= e->connected_at ? now - e->connected_at : 0;
+            e->last_reconnect_interval_secs = peer_connection_age_secs(
+                e->connected_monotonic_us, now_monotonic_us);
         }
         e->connected++;
         if (e->connected_at == 0 || terminal_after_connect) {
-            e->connected_at = now;
+            e->connected_at = now; e->connected_monotonic_us = now_monotonic_us;
             e->connected_seq = seq;
             e->version_sent_at = 0;
             e->version_received_at = 0;
             e->verack_received_at = 0;
             e->handshake_complete_at = 0;
+            e->handshake_complete_monotonic_us = 0;
             e->handshake_complete_seq = 0;
             e->active_at = 0;
         }
@@ -556,6 +555,7 @@ void peer_lifecycle_note_handshake_complete(const struct p2p_node *node)
     if (e) {
         e->handshake_complete++;
         e->handshake_complete_at = GetTime();
+        e->handshake_complete_monotonic_us = platform_time_monotonic_us();
         e->handshake_complete_seq = ++g_pl.seq;
         e->last_seen = e->handshake_complete_at;
         magicbean = subver_is_magicbean(e->subver);
