@@ -101,7 +101,8 @@ int addr_info_get_bucket_position(const struct addr_info *info,
 
 bool addr_info_is_terrible(const struct addr_info *info, int64_t nNow)
 {
-    if (info->last_try && info->last_try >= nNow - 60)
+    if (info->last_try && info->last_try <= nNow &&
+        info->last_try >= nNow - 60)
         return false;
     if ((int64_t)info->addr.nTime > nNow + 10 * 60)
         return true;
@@ -160,8 +161,7 @@ double addr_info_get_chance(const struct addr_man *am,
 {
     double fChance = 1.0;
     int64_t nSinceLastTry = nNow - info->last_try;
-    if (nSinceLastTry < 0) nSinceLastTry = 0;
-    if (nSinceLastTry < 60 * 10)
+    if (nSinceLastTry >= 0 && nSinceLastTry < 60 * 10)
         fChance *= 0.01;
     /* Clamp BELOW as well as above. pow(0.66, n) is a decay only for n >= 0;
      * a negative attempts count inverts it into growth, and n == -100 yields

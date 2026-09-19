@@ -1044,6 +1044,31 @@ static int test_net_addr_info_bucket_computation(void)
     return failures;
 }
 
+static int test_net_addrman_clock_rollback_expires_cooldowns(void)
+{
+    printf("addrman clock rollback expires retry cooldowns... ");
+    int64_t now = GetTime();
+    struct addr_info info;
+    memset(&info, 0, sizeof(info));
+    info.addr.nTime = (uint32_t)now;
+    info.last_try = now + 3600;
+    info.attempts = ADDRMAN_RETRIES;
+
+    /* A rollback expires rather than extends protection for a dead peer. */
+    bool ok = addr_info_is_terrible(&info, now);
+
+    /* It also restores an otherwise fresh peer's normal selection chance. */
+    info.attempts = 0;
+    double baseline = addr_info_get_chance(NULL, &info, now);
+    info.last_try = now - 5;
+    double recent = addr_info_get_chance(NULL, &info, now);
+    ok = ok && baseline == 1.0 && recent < baseline;
+
+    if (ok) printf("OK\n");
+    else printf("FAIL\n");
+    return ok ? 0 : 1;
+}
+
 static int test_net_net_message_framing(void)
 {
     int failures = 0;
@@ -6803,6 +6828,7 @@ int test_net(void)
     failures += test_net_net_addr_rfc_classification();
     failures += test_net_net_service_get_key_torv3_distinctness();
     failures += test_net_addr_info_bucket_computation();
+    failures += test_net_addrman_clock_rollback_expires_cooldowns();
     failures += test_net_net_message_framing();
     failures += test_net_ban_management();
     failures += test_net_node_stats_copy();

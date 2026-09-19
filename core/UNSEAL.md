@@ -240,3 +240,7 @@ later lane flips it HARD.
 - 2026-09-18T23:57:30Z — REASON: Remove one blank line from the authorized retry-policy edit to preserve the shrink-only connman.c ceiling
   old ROOT: ed28f7cdc821fe32c4a6c96185eee7a580769c5b067fb030bd1cbf3a2d0583a0
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T00:42:22Z — REASON: Fail open addrman selection and dead-entry cooldowns after backward wall-clock step; peer scheduling policy only, no consensus or validation semantics change
+  old ROOT: b4706d661db69e751b185a3556d312faaf7ff60466676d08eedbb458275f6086
+  by: owner unseal ritual (make core-unseal)
