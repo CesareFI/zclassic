@@ -1526,15 +1526,13 @@ static void *thread_socket_handler(void *arg)
          * in deferred_free for the next cycle instead of being freed. */
         connman_run_deferred_free_sweep(cm);
 
-        /* Periodic peer stats (every 60s) */
+        /* Monotonic peer stats: civil-clock rollback must not hide warnings. */
         {
-            static int64_t last_peer_log = 0;
-            static int64_t first_peer_log = 0;
-            int64_t now_log = GetTime();
-            if (first_peer_log == 0)
-                first_peer_log = now_log;
-            if (now_log - last_peer_log >= 60) {
-                last_peer_log = now_log;
+            static int64_t last_peer_log_us = 0, first_peer_log_us = 0;
+            int64_t now_log_us = platform_time_monotonic_us();
+            if (first_peer_log_us == 0) first_peer_log_us = now_log_us;
+            if (peer_periodic_due(last_peer_log_us, now_log_us, 60000000LL)) {
+                last_peer_log_us = now_log_us;
                 size_t in = 0, out = 0, connected = 0;
                 for (size_t pi = 0; pi < cm->manager.num_nodes; pi++) {
                     struct p2p_node *p = cm->manager.nodes[pi];
@@ -1543,13 +1541,15 @@ static void *thread_socket_handler(void *arg)
                     if (p->state >= PEER_HANDSHAKE_COMPLETE) connected++;
                 }
                 if (out == 0 && cm->manager.num_nodes > 0 &&
-                    now_log - first_peer_log >= 60)
+                    peer_connection_age_secs(first_peer_log_us,
+                                             now_log_us) >= 60)
                     printf("WARNING: 0 outbound peers (%zu inbound) "
                            "— cannot sync\n", in);
                 else if (cm->manager.num_nodes > 0)
                     printf("Peers: %zu (%zu out, %zu in, %zu active)\n",
                            cm->manager.num_nodes, out, in, connected);
-                else if (now_log > 30) /* don't warn during first 30s */
+                else if (peer_connection_age_secs(first_peer_log_us,
+                                                  now_log_us) >= 30)
                     printf("WARNING: 0 peers connected\n");
             }
         }

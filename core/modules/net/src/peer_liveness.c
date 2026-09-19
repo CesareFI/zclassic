@@ -20,6 +20,14 @@ int64_t peer_connection_age_secs(int64_t connected_us, int64_t now_us)
     return (now_us - connected_us) / 1000000LL;
 }
 
+bool peer_periodic_due(int64_t last_us, int64_t now_us, int64_t interval_us)
+{
+    if (now_us <= 0 || interval_us <= 0)
+        return false;
+    return last_us <= 0 || now_us < last_us ||
+           now_us - last_us >= interval_us;
+}
+
 enum peer_liveness_action peer_liveness_decide(
     const struct peer_liveness_sample *sample, int64_t now_us)
 {

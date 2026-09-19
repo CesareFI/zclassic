@@ -1512,10 +1512,27 @@ static int test_peer_connection_timeouts_are_monotonic(void)
     return failures;
 }
 
+static int test_peer_periodic_cadence_is_monotonic(void)
+{
+    int failures = 0;
+    TEST_CASE("peer_lifecycle: periodic diagnostics survive clock rollback") {
+        const int64_t start_us = 7000000LL;
+        const int64_t interval_us = 60LL * 1000000LL;
+        ASSERT(peer_periodic_due(0, start_us, interval_us));
+        ASSERT(!peer_periodic_due(start_us, start_us + interval_us - 1,
+                                  interval_us));
+        ASSERT(peer_periodic_due(start_us, start_us + interval_us,
+                                 interval_us));
+        ASSERT(peer_periodic_due(start_us, start_us - 1, interval_us));
+    } TEST_END
+    return failures;
+}
+
 int test_peer_lifecycle(void)
 {
     int failures = 0;
     failures += test_peer_connection_timeouts_are_monotonic();
+    failures += test_peer_periodic_cadence_is_monotonic();
     failures += test_peer_lifecycle_user_agent();
     failures += test_peer_lifecycle_classify();
     failures += test_peer_lifecycle_version_build();

@@ -288,3 +288,19 @@ later lane flips it HARD.
 - 2026-09-19T05:40:42Z — REASON: Use monotonic elapsed time for WebSocket client heartbeat and idle deadlines so civil clock corrections cannot suppress cleanup or disconnect healthy subscribers; networking liveness only, no consensus or validation change
   old ROOT: 2c8297a00927988f5ec9fcd32710dbf969a8e03499fdad60679531484a0d0c4e
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T07:09:39Z — REASON: Use monotonic time for peer-status logging cadence; no consensus behavior changes
+  old ROOT: d14eef4dc07e5a3181a92cd6ce7dcbe96cc3bc018d36b961b77776ed3a339cd8
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T07:26:17Z — REASON: Add tested monotonic peer-status cadence; no consensus behavior changes
+  old ROOT: 40f4e10492da5f4597362af98ea784e9d880f797df598fd36a0fc484eec6330a
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T07:29:00Z — REASON: Reduce peer-status cadence change within complexity and file-size ratchets
+  old ROOT: 72269f6af256a245a86979d120ecfd369bf4ae3e3ed127e7d58bdab1d09f8f25
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T07:29:53Z — REASON: Keep connman within shrink-only file-size ratchet
+  old ROOT: ed0e504d7723f1394df31ca1bb6da91e55f9023f2f6a154470d41fb8f298de34
+  by: owner unseal ritual (make core-unseal)

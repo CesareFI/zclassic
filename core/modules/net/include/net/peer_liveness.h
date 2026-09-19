@@ -4,6 +4,7 @@
 #ifndef ZCL_NET_PEER_LIVENESS_H
 #define ZCL_NET_PEER_LIVENESS_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Peer liveness is driven exclusively by monotonic time.  Wall-clock changes
@@ -37,5 +38,10 @@ enum peer_liveness_action peer_liveness_decide(
  * connection stamp.  Wall time is intentionally not an input: an operator
  * clock correction must not strand a half-open peer in an outbound slot. */
 int64_t peer_connection_age_secs(int64_t connected_us, int64_t now_us);
+
+/* True when a monotonic periodic action should run.  An impossible backwards
+ * sample fails open so diagnostics recover immediately instead of remaining
+ * suppressed behind a stale origin. */
+bool peer_periodic_due(int64_t last_us, int64_t now_us, int64_t interval_us);
 
 #endif /* ZCL_NET_PEER_LIVENESS_H */
