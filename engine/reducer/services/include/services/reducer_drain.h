@@ -73,7 +73,7 @@ void reducer_drain_spin_reset_for_testing(void);
 
 /* Drain-exit telemetry snapshot (drive+fsync telemetry gap 1): deconflates
  * "the drain converged" (genuinely no more work) from "the drain hit the
- * budget ceiling" (wall-clock budget elapsed, or the round hard_cap was
+ * budget ceiling" (monotonic budget elapsed, or the round hard_cap was
  * exhausted without converging) — see the counters' doc comment in
  * reducer_drain.c for exactly what does and does not count toward each
  * total. Consumed by the reducer_drive dumpstate
@@ -83,7 +83,7 @@ struct reducer_drain_exit_stats {
     uint64_t exit_converged_total;
     uint64_t exit_budget_total;
     int64_t  last_round_advances;  /* adv count of the last round run */
-    int64_t  last_elapsed_us;      /* wall-clock time of the last drain call */
+    int64_t  last_elapsed_us;      /* monotonic time of the last drain call */
     int64_t  last_stage_us[REDUCER_DRAIN_NUM_STAGES];
     /* CUMULATIVE per-stage accounting. last_stage_us above describes ONLY the
      * most recent round and is overwritten every round, so it cannot answer
@@ -109,6 +109,11 @@ struct reducer_drain_exit_stats {
     uint64_t stage_quiescent_skips[REDUCER_DRAIN_NUM_STAGES];
 };
 void reducer_drain_exit_stats_snapshot(struct reducer_drain_exit_stats *out);
+
+/* Non-negative elapsed monotonic microseconds used by the drain yield budget
+ * and latency telemetry. An impossible backwards sample clamps to zero rather
+ * than manufacturing a budget expiry or a negative duration. */
+int64_t reducer_drain_elapsed_us(int64_t started_us, int64_t now_us);
 
 /* Pipeline-order name of drain stage `idx`, or NULL when out of range. The one
  * authority for the stage names (reducer_drain.c's g_drain_stages table); the

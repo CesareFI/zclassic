@@ -6,7 +6,7 @@
  * dedicated -mint-anchor driver). Split out of reducer_ingest_service.c (which
  * keeps the synchronous block-intake path) so each file holds one seam.
  *
- * LIVELOCK GUARD: reducer_kick_unbudgeted must never run with NO wall-clock
+ * LIVELOCK GUARD: reducer_kick_unbudgeted must never run with NO elapsed-time
  * budget and NO frontier-progress check — one call could drain
  * hard_cap(64) * ZCL_REFOLD_DRAIN_BATCH(2000) = 128k blocks back-to-back —
  * HOURS under the fsync-bound fold rate — starving the boot_mint_anchor drive
@@ -15,7 +15,7 @@
  *   (1) converge_on_frontier_stall — a round that advances upstream stages but
  *       not the utxo_apply frontier returns immediately (a walled fold hands
  *       control back so the driver fails closed with a named blocker);
- *   (2) a generous wall-clock budget (ZCL_MINT_KICK_BUDGET_MS, default 3000)
+ *   (2) a generous monotonic budget (ZCL_MINT_KICK_BUDGET_MS, default 3000)
  *       checked at ROUND boundaries only, so the per-batch fsync cadence (the
  *       fold's throughput lever) is untouched.
  * Guarded by tests/harness/src/test_reducer_step_drain_harness.c
@@ -31,7 +31,7 @@
 #include "services/reducer_drain.h"
 
 #include "event/event.h"
-#include "core/utiltime.h"
+#include "platform/time_compat.h"
 #include "util/blocker.h"
 #include "util/hw_bench.h"
 #include "util/hw_profile.h"  /* hw_profile_drain_batch_effective (K3 lever) */
@@ -245,7 +245,7 @@ void reducer_drain_spin_reset_for_testing(void)
  * regression cares about:
  *   - drain_exit_converged_total: a round found genuinely NO more work
  *     (adv == 0) — the fold is caught up, full stop.
- *   - drain_exit_budget_total: the wall-clock budget elapsed, OR the round
+ *   - drain_exit_budget_total: the monotonic budget elapsed, OR the round
  *     hard_cap was exhausted without ever converging — the fold still had
  *     (or may have had) work left but ran out of allotted time/rounds. A
  *     rising rate of this counter with a falling drain_last_round_advances
@@ -307,6 +307,13 @@ void reducer_drain_exit_stats_snapshot(struct reducer_drain_exit_stats *out)
         out->stage_quiescent_skips[i] = atomic_load(&g_quiescent_skips[i]);
     }
     out->quiescent_skips_total = atomic_load(&g_quiescent_skips_total);
+}
+
+int64_t reducer_drain_elapsed_us(int64_t started_us, int64_t now_us)
+{
+    if (started_us <= 0 || now_us <= started_us)
+        return 0;
+    return now_us - started_us;
 }
 
 #ifdef ZCL_TESTING
@@ -415,9 +422,10 @@ static int reducer_drain_all_stages(int max_steps_per_stage,
                 adv_per_stage[i] = 0;
             continue;
         }
-        int64_t started_us = GetTimeMicros();
+        int64_t started_us = platform_time_monotonic_us();
         int a = g_drain_stages[i].drain(max_steps_per_stage);
-        int64_t elapsed_us = GetTimeMicros() - started_us;
+        int64_t elapsed_us = reducer_drain_elapsed_us(
+            started_us, platform_time_monotonic_us());
         atomic_store(&g_drain_last_stage_us[i], elapsed_us);
         /* CUMULATIVE alongside the overwritten last-round value — three
          * relaxed adds on a path that just spent its time inside a stage
@@ -466,7 +474,7 @@ static int reducer_drain_core(int64_t budget_us, int hard_cap,
                               int per_stage_batch,
                               bool converge_on_frontier_stall)
 {
-    int64_t   start_us        = GetTimeMicros();
+    int64_t   start_us        = platform_time_monotonic_us();
     uint64_t  fatal_gen0      = stage_fatal_generation();
     int       total           = 0;
     int       last_adv        = 0;
@@ -534,7 +542,9 @@ static int reducer_drain_core(int64_t budget_us, int hard_cap,
             exit_reason = DRAIN_EXIT_FRONTIER_STALL;
             break;
         }
-        if (budget_us > 0 && GetTimeMicros() - start_us > budget_us) {
+        if (budget_us > 0 &&
+            reducer_drain_elapsed_us(start_us,
+                                     platform_time_monotonic_us()) > budget_us) {
             exit_reason = DRAIN_EXIT_BUDGET;
             break;
         }
@@ -557,7 +567,9 @@ static int reducer_drain_core(int64_t budget_us, int hard_cap,
      * outcome of THIS drain call. Shutdown and frontier-stall exits update
      * neither total — see the doc comment for why. */
     atomic_store(&g_drain_last_round_advances, (int64_t)last_adv);
-    atomic_store(&g_drain_last_elapsed_us, GetTimeMicros() - start_us);
+    atomic_store(&g_drain_last_elapsed_us,
+                 reducer_drain_elapsed_us(start_us,
+                                          platform_time_monotonic_us()));
     if (exit_reason == DRAIN_EXIT_CONVERGED)
         atomic_fetch_add(&g_drain_exit_converged_total, 1u);
     else if (exit_reason == DRAIN_EXIT_BUDGET)
@@ -594,7 +606,7 @@ int reducer_drain_to_convergence(void)
 int reducer_drain_to_convergence_unbudgeted(void)
 {
     /* Drain back-to-back, NOT in 2s slices like the supervisor path — but with
-     * a GENEROUS wall-clock budget so the call still returns periodically to
+     * a GENEROUS monotonic budget so the call still returns periodically to
      * the -mint-anchor drive loop (progress logging + the stall detector run
      * BETWEEN kicks; see the file header for the livelock this closes). The
      * budget is checked only at ROUND boundaries (committed points), so the

@@ -418,6 +418,14 @@ int test_reducer_drive_watchdog(void)
                   des.last_round_advances == 0 &&
                   des.last_elapsed_us == 0;
         RDW_CHECK("drain-exit stats: reset zeroes all four fields", ok);
+        RDW_CHECK("drain elapsed: forward monotonic interval",
+                  reducer_drain_elapsed_us(1000000, 3500000) == 2500000);
+        RDW_CHECK("drain elapsed: equal sample clamps to zero",
+                  reducer_drain_elapsed_us(1000000, 1000000) == 0);
+        RDW_CHECK("drain elapsed: backwards sample clamps to zero",
+                  reducer_drain_elapsed_us(1000000, 500000) == 0);
+        RDW_CHECK("drain elapsed: missing origin clamps to zero",
+                  reducer_drain_elapsed_us(0, 3500000) == 0);
     }
 
     /* ---- (f) batch_fsync_slow condition: injected slow flush trips it,
