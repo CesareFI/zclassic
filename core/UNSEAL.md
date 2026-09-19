@@ -284,3 +284,7 @@ later lane flips it HARD.
 - 2026-09-19T05:07:42Z — REASON: Keep the authorized peer ping statistics clock correction within the enforced legacy file-size ceiling; behavior unchanged
   old ROOT: e81d519e5e775997f1316d8714afabecd088ccddbb4a3981cf0d6f34695e45f0
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T05:40:42Z — REASON: Use monotonic elapsed time for WebSocket client heartbeat and idle deadlines so civil clock corrections cannot suppress cleanup or disconnect healthy subscribers; networking liveness only, no consensus or validation change
+  old ROOT: 2c8297a00927988f5ec9fcd32710dbf969a8e03499fdad60679531484a0d0c4e
+  by: owner unseal ritual (make core-unseal)

@@ -278,7 +278,7 @@ static void pump_events_to_clients(void)
                 atomic_fetch_sub(&g_client_count, 1);
             } else {
                 c->delivered++;
-                c->last_active_us = GetTimeMicros();
+                c->last_active_us = platform_time_monotonic_us();
                 atomic_fetch_add(&g_total_delivered, 1);
             }
         }
@@ -290,7 +290,7 @@ static void pump_events_to_clients(void)
 
 static void send_heartbeats(void)
 {
-    int64_t now = GetTimeMicros();
+    int64_t now = platform_time_monotonic_us();
     int64_t ping_interval = WS_HEARTBEAT_SEC * 1000000LL;
     int64_t idle_timeout = WS_IDLE_TIMEOUT_SEC * 1000000LL;
 
@@ -349,7 +349,7 @@ static void drain_client_input(void)
                     c->active = false;
                     atomic_fetch_sub(&g_client_count, 1);
                 } else {
-                    c->last_active_us = GetTimeMicros();
+                    c->last_active_us = platform_time_monotonic_us();
                 }
             }
         }
@@ -449,8 +449,12 @@ bool ws_events_accept(platform_socket_t fd, const char *domain_filter)
     memset(c, 0, sizeof(*c));
     c->fd = fd;
     c->active = true;
-    c->last_active_us = GetTimeMicros();
-    c->last_ping_us = GetTimeMicros();
+    /* Heartbeat and idle thresholds are elapsed-time decisions.  Keep both
+     * origins in the monotonic domain so civil clock corrections cannot
+     * strand stale clients or disconnect healthy ones. */
+    int64_t now_us = platform_time_monotonic_us();
+    c->last_active_us = now_us;
+    c->last_ping_us = now_us;
     if (domain_filter && domain_filter[0])
         snprintf(c->filter, sizeof(c->filter), "%s", domain_filter);
 
