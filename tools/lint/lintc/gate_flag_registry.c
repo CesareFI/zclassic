@@ -669,10 +669,10 @@ static int fr_st_first_use_cases(FILE *out, char *ob, size_t obcap)
         || strstr(ob, "flag_registry: ZCL_FU_PAST first use ./fu_short.c:5"
                       " does not read it (line past end (1 lines))") == NULL;
 
-    if (csr_write("./fu_secret.c",
-                "int f(void){ return getenv(\"ZCL_FU_UNREADABLE\") != 0; }\n"))
-        return 1;
-    bad |= chmod("./fu_secret.c", 0) != 0;
+    /* A mode-000 regular file remains readable to uid 0, so it is not a
+     * deterministic unreadable fixture on root-run build hosts.  A directory
+     * at the cited file path is never an admissible source file. */
+    bad |= mkdir("./fu_secret.c", 0700) != 0;
     bad |= fr_st_case(
             "Z23_FLAG(\"ZCL_FU_FILLER\", \"env_runtime\", \"-\", \"-\", \"why\")\n"
             "Z23_FLAG(\"ZCL_FU_UNREADABLE\", \"env_runtime\", \"-\", \"-\",\n"
@@ -680,7 +680,7 @@ static int fr_st_first_use_cases(FILE *out, char *ob, size_t obcap)
             NULL, NULL, "2026-01-01", "printf '%s\\0' fu_filler.c", out, ob,
             obcap, &rc);
     bad |= rc != 2;
-    chmod("./fu_secret.c", 0644);
+    rmdir("./fu_secret.c");
     return bad;
 }
 
@@ -698,6 +698,7 @@ static void fr_st_cleanup(void)
     unlink("./fu_bound.c");
     unlink("./fu_short.c");
     unlink("./fu_secret.c");
+    rmdir("./fu_secret.c");
 }
 
 int check_flag_registry_selftest(void)

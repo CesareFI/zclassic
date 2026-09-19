@@ -105,6 +105,8 @@ static int fru_open_check(const char *path, int line, const char *name,
         snprintf(reason, rcap, "file missing");
         return 1;
     }
+    if (!S_ISREG(st.st_mode))
+        return -1;
     FILE *f = fopen(path, "r");
     if (!f)
         return -1;
