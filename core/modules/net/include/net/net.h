@@ -363,9 +363,11 @@ struct p2p_node {
      * entry still counts here and excess entries are parsed but not admitted.
      * Fixed window: addr_rate_window_count
      * accumulates entries received since addr_rate_window_start; once the
-     * window rolls over (ADDR_RATE_WINDOW_SECS) it resets. Zero-initialised
-     * (memset in p2p_node_create) so window_start==0 correctly reads as "no
-     * window yet" on the very first addr message. */
+     * monotonic window rolls over (ADDR_RATE_WINDOW_SECS) it resets. An
+     * impossible backwards monotonic sample also resets fail-open rather than
+     * inheriting a stale count. Zero-initialised (memset in p2p_node_create)
+     * so window_start==0 correctly reads as "no window yet" on the very first
+     * addr message. */
     int64_t addr_rate_window_start;
     uint32_t addr_rate_window_count;
 

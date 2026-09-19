@@ -17,6 +17,7 @@
 #include "net/peer_scoring.h"
 #include "core/uint256.h"
 #include "core/utiltime.h"
+#include "platform/time_compat.h"
 #include "storage/topology_store.h"
 #include "util/log_macros.h"
 #include <stdio.h>
@@ -148,11 +149,12 @@ static bool process_addr(struct msg_processor *mp, struct p2p_node *node,
      * received (not message count), so one giant batch and many small
      * batches are both bounded the same way. */
     {
-        int64_t now = GetTime();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         uint32_t rate_cap = peer_supports_fast_sync(node->services)
                                 ? ADDR_RATE_LEGACY_ZCL23_MAX_PER_WINDOW
                                 : ADDR_RATE_MAX_PER_WINDOW;
         if (node->addr_rate_window_start == 0 ||
+            now < node->addr_rate_window_start ||
             now - node->addr_rate_window_start >= ADDR_RATE_WINDOW_SECS) {
             node->addr_rate_window_start = now;
             node->addr_rate_window_count = 0;

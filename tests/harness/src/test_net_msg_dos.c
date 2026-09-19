@@ -122,6 +122,41 @@ static const struct msg_dispatch_entry *dos_find_entry(const char *cmd)
     return NULL;
 }
 
+static int test_addr_rate_backwards_time(struct msg_processor *mp)
+{
+    int failures = 0;
+    const struct msg_dispatch_entry *e = dos_find_entry("addr");
+    DOS_CHECK("addr dispatch entry found (backwards-time case)", e != NULL);
+    if (!e)
+        return failures;
+
+    struct p2p_node node;
+    dos_setup_stack_node(&node);
+    node.addr_rate_window_start = INT64_MAX;
+    node.addr_rate_window_count = 3000;
+
+    struct byte_stream s;
+    stream_init(&s, 64);
+    stream_write_compact_size(&s, 1);
+    struct net_address addr;
+    net_address_init(&addr);
+    unsigned char ip4[4] = {10, 2, 3, 4};
+    net_addr_set_ipv4(&addr.svc.addr, ip4);
+    addr.svc.port = 8033;
+    net_address_serialize(&addr, &s, true);
+
+    bool ret = e->handler(mp, &node, &s);
+    stream_free(&s);
+    DOS_CHECK("addr backwards time: fresh batch accepted", ret == true);
+    DOS_CHECK("addr backwards time: peer remains connected",
+              node.disconnect == false);
+    DOS_CHECK("addr backwards time: stale count reset",
+              node.addr_rate_window_count == 1);
+    DOS_CHECK("addr backwards time: no flood score",
+              atomic_load(&node.misbehavior) == 0);
+    return failures;
+}
+
 static int dos_getblocks_have_data_plan(struct msg_processor *mp,
                                         struct block_locator *loc,
                                         const struct uint256 *child_hash);
@@ -409,6 +444,12 @@ int test_net_msg_dos(void)
                      !saw_disconnect_early);
         }
     }
+
+    /* A5b. The rate window is elapsed-time policy, not civil time. A stale
+     * future stamp (representing an impossible backwards monotonic sample)
+     * must start a fresh window. Before the guard, the inherited cap plus one
+     * honest address falsely scored and disconnected this peer. */
+    failures += test_addr_rate_backwards_time(&mp);
 
     /* ── B1. inv: truncated mid-item -> clean failure, no crash ── */
     {

@@ -256,3 +256,11 @@ later lane flips it HARD.
 - 2026-09-19T03:06:18Z — REASON: Use monotonic elapsed time for legacy block-download request deadlines and peer cooldowns so wall-clock corrections cannot mass-timeout or strand healthy IBD windows; networking scheduling only, no consensus or validation change
   old ROOT: 2a8f076f98e37325191560c0db6b42d4727acb133682cebd0522a5987e7a09bd
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T03:55:47Z — REASON: Use monotonic elapsed time for per-peer addr flood windows so wall-clock corrections cannot falsely disconnect healthy peers; defensive networking only, no consensus or validation change
+  old ROOT: 835256bb1efae997fe65bca13fa19abf1a5827f5c6b0fe20820909289e5d60e7
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T03:57:44Z — REASON: Repair the platform time compatibility include for the authorized addr-window monotonic timer change; behavior unchanged
+  old ROOT: ffd23cf9f1a6a413b031666e3a26372b1323cda276fd144c8574da9e1b44a3af
+  by: owner unseal ritual (make core-unseal)
