@@ -13,9 +13,9 @@
 #include "chain/chain.h"
 #include "core/serialize.h"
 #include "core/uint256.h"
-#include "core/utiltime.h"
 #include "jobs/reducer_frontier.h"
 #include "models/database.h"
+#include "platform/time_compat.h"
 #include "primitives/block.h"
 #include "sapling/incremental_merkle_tree.h"
 #include "services/block_index_loader.h"
@@ -150,7 +150,7 @@ int sapling_tree_rebuild(struct node_db *ndb,
         supervisor_progress(sup_id, 0);
         supervisor_tick(sup_id);
     }
-    int64_t last_heartbeat_ms = GetTimeMillis();
+    int64_t last_heartbeat_ms = platform_time_monotonic_ms();
 
     struct incremental_merkle_tree tree;
     sapling_tree_init(&tree);
@@ -289,7 +289,7 @@ int sapling_tree_rebuild(struct node_db *ndb,
         }
     }
 
-    int64_t t_replay_start = GetTimeMillis();
+    int64_t t_replay_start = platform_time_monotonic_ms();
     int cached_file = -1;
     struct sync_block_file_mapping cached_mapping;
     sync_block_file_mapping_init(&cached_mapping);
@@ -321,7 +321,7 @@ int sapling_tree_rebuild(struct node_db *ndb,
         if ((h % 100) == 0)
             boot_progress_tick("sapling_tree_rebuild");
         if (sup_id != SUPERVISOR_INVALID_ID && (h % 1000) == 0) {
-            int64_t now_ms = GetTimeMillis();
+            int64_t now_ms = platform_time_monotonic_ms();
             if (now_ms - last_heartbeat_ms >=
                 SAPLING_TREE_REBUILD_HEARTBEAT_MS) {
                 last_heartbeat_ms = now_ms;
@@ -532,7 +532,7 @@ int sapling_tree_rebuild(struct node_db *ndb,
 
     char root_hex[65];
     uint256_get_hex(&final_root, root_hex);
-    int64_t replay_ms = GetTimeMillis() - t_replay_start;
+    int64_t replay_ms = platform_time_monotonic_ms() - t_replay_start;
     int replayed_blocks = (chain_tip >= start_height)
                           ? (chain_tip - start_height + 1)
                           : 0;
