@@ -297,6 +297,19 @@ static int test_dl_received_pending_staging(void)
         ASSERT(dl_mark_received(&dm, &h1) == 1);
         ASSERT(!dl_is_in_flight(&dm, &h1));
 
+        /* The guard is elapsed-time state, not an epoch timestamp. A wall
+         * clock correction must not shorten or extend this dedup window. */
+        int64_t received_monotonic = platform_time_monotonic_us() / 1000000;
+        bool found_received = false;
+        for (size_t i = 0; i < dm.num_slots; i++) {
+            if (!dm.slots[i].active && uint256_eq(&dm.slots[i].hash, &h1)) {
+                ASSERT(dm.slots[i].received_time >= received_monotonic - 1);
+                ASSERT(dm.slots[i].received_time <= received_monotonic);
+                found_received = true;
+            }
+        }
+        ASSERT(found_received);
+
         /* A producer pass in the arrival->staging window must not
          * re-queue the hash ... */
         ASSERT(dl_queue_blocks(&dm, &h1, &h1_height, 1) == 0);
@@ -322,7 +335,7 @@ static int test_dl_received_pending_staging(void)
         for (size_t i = 0; i < dm.num_slots; i++) {
             if (!dm.slots[i].active && uint256_eq(&dm.slots[i].hash, &h1)) {
                 dm.slots[i].received_time =
-                    (int64_t)platform_time_wall_time_t() -
+                    platform_time_monotonic_us() / 1000000 -
                     DL_RECEIVED_PENDING_SECS - 1;
             }
         }
@@ -419,10 +432,10 @@ static int test_dl_received_pending_survives_colliding_insert(void)
     return failures;
 }
 
-static int test_dl_received_pending_fails_open_after_clock_rollback(void)
+static int test_dl_received_pending_fails_open_after_invalid_monotonic_sample(void)
 {
     int failures = 0;
-    TEST("received-pending dedup fails open after a backward clock step") {
+    TEST("received-pending dedup fails open after an invalid monotonic sample") {
         struct download_manager dm;
         dl_init(&dm);
 
@@ -431,14 +444,14 @@ static int test_dl_received_pending_fails_open_after_clock_rollback(void)
         ASSERT(dl_mark_received(&dm, &received) == 1);
         ASSERT(dm.num_received_pending == 1);
 
-        /* A backward wall-clock correction makes the recorded arrival look
-         * future-dated. It must expire the guard instead of suppressing this
-         * block until wall time catches up. */
+        /* Monotonic clocks should not move backward, but fail open if the
+         * platform ever returns an impossible sample rather than stranding
+         * the block behind the dedup guard. */
         for (size_t i = 0; i < dm.num_slots; i++) {
             if (!dm.slots[i].active &&
                 uint256_eq(&dm.slots[i].hash, &received))
                 dm.slots[i].received_time =
-                    (int64_t)platform_time_wall_time_t() + 3600;
+                    platform_time_monotonic_us() / 1000000 + 3600;
         }
 
         ASSERT(dl_mark_requested(&dm, &received, 903, 2));
@@ -472,7 +485,7 @@ static int test_dl_expired_received_pending_compacts_before_growth(void)
         /* Age every guard beyond the fail-open window. The next insertion
          * has a fully reusable table and must compact the stale accounting,
          * not double the allocation based on expired occupancy. */
-        int64_t expired = (int64_t)platform_time_wall_time_t() -
+        int64_t expired = platform_time_monotonic_us() / 1000000 -
                           DL_RECEIVED_PENDING_SECS - 1;
         for (size_t i = 0; i < dm.num_slots; i++) {
             if (!dm.slots[i].active && dm.slots[i].received_time != 0)
@@ -2380,7 +2393,8 @@ int test_download(void)
     failures += test_dl_received_pending_staging();
     failures += test_dl_received_pending_survives_rehash();
     failures += test_dl_received_pending_survives_colliding_insert();
-    failures += test_dl_received_pending_fails_open_after_clock_rollback();
+    failures +=
+        test_dl_received_pending_fails_open_after_invalid_monotonic_sample();
     failures += test_dl_expired_received_pending_compacts_before_growth();
     failures += test_dl_assign_to_peer();
     failures += test_dl_assignment_generation_parking();

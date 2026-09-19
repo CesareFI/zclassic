@@ -449,7 +449,7 @@ static struct dl_in_flight *find_slot(struct download_manager *dm,
     size_t mask = dm->num_slots - 1;
     size_t idx = dl_hash_slot(hash, mask);
     struct dl_in_flight *first_empty = NULL;
-    int64_t now = find_empty ? (int64_t)platform_time_wall_time_t() : 0;
+    int64_t now = find_empty ? dl_now_monotonic_seconds() : 0;
 
     for (size_t i = 0; i < dm->num_slots; i++) {
         struct dl_in_flight *s = &dm->slots[(idx + i) & mask];
@@ -499,7 +499,7 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
     if (!new_slots) return;
 
     size_t new_mask = new_size - 1;
-    int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now = dl_now_monotonic_seconds();
     size_t received_pending_count = 0;
     for (size_t i = 0; i < dm->num_slots; i++) {
         const struct dl_in_flight *old = &dm->slots[i];
@@ -530,7 +530,7 @@ static void dl_rehash(struct download_manager *dm, size_t new_size)
  * the recorded occupancy reaches the growth threshold. */
 static bool dl_has_expired_received_pending(const struct download_manager *dm)
 {
-    int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now = dl_now_monotonic_seconds();
     for (size_t i = 0; i < dm->num_slots; i++) {
         const struct dl_in_flight *slot = &dm->slots[i];
         if (!slot->active && slot->received_time != 0 &&
@@ -612,7 +612,7 @@ bool dl_mark_requested(struct download_manager *dm,
      * re-request inside the bounded window (fail-open after it lapses). */
     if (existing &&
         dl_slot_blocks_requeue(dm, existing,
-                               (int64_t)platform_time_wall_time_t())) {
+                               dl_now_monotonic_seconds())) {
         zcl_mutex_unlock(&dm->cs);
         return false;
     }
@@ -671,7 +671,6 @@ uint32_t dl_mark_received(struct download_manager *dm,
     }
 
     uint32_t peer_id = s->peer_id;
-    int64_t received_at = (int64_t)platform_time_wall_time_t();
     int64_t received_monotonic = dl_now_monotonic_seconds();
     bool delivery_sample_valid = received_monotonic >= s->request_time;
     int64_t delivery = delivery_sample_valid ? received_monotonic - s->request_time : 0;
@@ -683,7 +682,7 @@ uint32_t dl_mark_received(struct download_manager *dm,
      * is on its way through the intake worker but BLOCK_HAVE_DATA is not
      * observable yet, so queue/request producers must keep dedup'ing this
      * hash (bounded by DL_RECEIVED_PENDING_SECS, fail-open). */
-    s->received_time = received_at;
+    s->received_time = received_monotonic;
     dm->num_received_pending++;
     dm->num_active--;
     dm->total_received++;
@@ -692,7 +691,7 @@ uint32_t dl_mark_received(struct download_manager *dm,
     struct dl_peer_stats *ps = dl_find_peer(dm, peer_id, false);
     if (ps) {
         ps->blocks_received++;
-        ps->last_body_received_time = received_at;
+        ps->last_body_received_time = (int64_t)platform_time_wall_time_t();
         /* Settle normally after a backward clock step, but do not let its
          * impossible latency poison the peer's future download window. */
         if (delivery_sample_valid) {
@@ -1002,7 +1001,7 @@ size_t dl_queue_blocks_class(struct download_manager *dm,
         return 0;
     }
     dl_qset_reserve_n(dm, count);
-    const int64_t now_q = (int64_t)platform_time_wall_time_t();
+    const int64_t now_q = dl_now_monotonic_seconds();
     for (size_t i = 0; i < count; i++) {
         struct dl_in_flight *s = find_slot(dm, &hashes[i], false);
         /* Skip live (in-flight) hashes and received-pending tombstones:
@@ -1132,7 +1131,7 @@ void dl_queue_priority(struct download_manager *dm,
     /* Skip if already in-flight or received-pending-staging */
     struct dl_in_flight *s = find_slot(dm, hash, false);
     if (s && dl_slot_blocks_requeue(dm, s,
-                                    (int64_t)platform_time_wall_time_t())) {
+                                    dl_now_monotonic_seconds())) {
         zcl_mutex_unlock(&dm->cs);
         return;
     }

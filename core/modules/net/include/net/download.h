@@ -91,7 +91,7 @@ struct dl_in_flight {
     int32_t        height;          /* -1 if unknown */
     uint32_t       peer_id;
     int64_t        request_time;    /* monotonic seconds */
-    int64_t        received_time;   /* epoch seconds of body arrival; nonzero
+    int64_t        received_time;   /* monotonic seconds at body arrival; nonzero
                                      * only on an inactive slot whose settle
                                      * was dl_mark_received — a bounded
                                      * tombstone that keeps dedup'ing queue

@@ -332,3 +332,7 @@ later lane flips it HARD.
 - 2026-09-19T14:07:21Z — REASON: Use elapsed monotonic time for non-consensus per-peer fast-sync request deadlines; block and transaction validation remain unchanged
   old ROOT: 8df20e3b8aeb330cbb585f1a1ef5717d748ffa920afc8839207f3f3b25c4a480
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T14:59:13Z — REASON: Use elapsed monotonic time for non-consensus received-block dedup guards; block and transaction validation remain unchanged
+  old ROOT: 6bf77db5fd63df31627bb299bd63b681ee22d5567927c5280a9adf3f0f9cf956
+  by: owner unseal ritual (make core-unseal)
