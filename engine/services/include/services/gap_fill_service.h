@@ -108,8 +108,9 @@ bool gap_fill_dump_state_json(struct json_value *out, const char *key);
 /* Run the independent download timeout sweep owned by the supervised gap-fill
  * cadence. This is the redundant path for peers that keep in-flight slots
  * occupied while the peer send loop is not making timeout progress. */
+/* `now_monotonic` is monotonic seconds, or <=0 to sample it internally. */
 size_t gap_fill_sweep_download_timeouts(struct download_manager *dm,
-                                        int64_t now_seconds);
+                                        int64_t now_monotonic);
 
 /* Wake the network dispatcher when block work is already queued but no
  * request is in flight. This covers duplicate/no-op refill passes where the

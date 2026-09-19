@@ -252,3 +252,7 @@ later lane flips it HARD.
 - 2026-09-19T02:49:45Z — REASON: Use monotonic elapsed time for compact-block response scheduling so wall-clock corrections cannot discard fresh blocktxn responses; networking policy only, no consensus or validation change
   old ROOT: 0c2a7215781b897b98e65298041f1101b73c0920d6d0ec19a684995f375324d1
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T03:06:18Z — REASON: Use monotonic elapsed time for legacy block-download request deadlines and peer cooldowns so wall-clock corrections cannot mass-timeout or strand healthy IBD windows; networking scheduling only, no consensus or validation change
+  old ROOT: 2a8f076f98e37325191560c0db6b42d4727acb133682cebd0522a5987e7a09bd
+  by: owner unseal ritual (make core-unseal)

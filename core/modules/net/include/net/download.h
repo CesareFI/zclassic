@@ -90,7 +90,7 @@ struct dl_in_flight {
     struct uint256 hash;
     int32_t        height;          /* -1 if unknown */
     uint32_t       peer_id;
-    int64_t        request_time;    /* seconds since epoch */
+    int64_t        request_time;    /* monotonic seconds */
     int64_t        received_time;   /* epoch seconds of body arrival; nonzero
                                      * only on an inactive slot whose settle
                                      * was dl_mark_received — a bounded
@@ -244,7 +244,7 @@ struct download_manager {
     struct uint256      *queue;         /* block hashes to download */
     int32_t             *queue_heights; /* corresponding heights */
     uint32_t            *queue_avoid_peers; /* peer to avoid temporarily */
-    int64_t             *queue_avoid_until; /* epoch seconds; 0 = inactive */
+    int64_t             *queue_avoid_until; /* monotonic seconds; 0 = inactive */
     enum dl_work_class  *queue_classes; /* logical forward/history lanes */
     size_t               queue_len;
     size_t               queue_cap;
@@ -349,7 +349,8 @@ uint32_t dl_mark_received(struct download_manager *dm,
 /* Check for timed-out requests. Returns number of blocks reassigned.
  * Timed-out blocks are moved back to the download queue.
  * Call periodically from send_messages. */
-size_t dl_check_timeouts(struct download_manager *dm, int64_t now);
+/* `now_monotonic` is monotonic seconds, injectable for deterministic tests. */
+size_t dl_check_timeouts(struct download_manager *dm, int64_t now_monotonic);
 
 /* Get number of in-flight blocks for a specific peer. */
 size_t dl_peer_in_flight(struct download_manager *dm, uint32_t peer_id);

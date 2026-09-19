@@ -2712,7 +2712,7 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
     /* ── Download manager: assign queued blocks to this peer ────── */
     {
         struct download_manager *dm = get_download_mgr();
-        int64_t now_dl = (int64_t)platform_time_wall_time_t();
+        int64_t now_dl = platform_time_monotonic_us() / 1000000;
         bool block_swarm_active = mp_block_swarm_is_active();
         /* A swarm whose piece completions have gone silent would otherwise
          * hold body transfer forever: its only exit was full completion,

@@ -46,6 +46,7 @@ int dl_get_request_timeout_secs(void)
                        : DL_REQUEST_TIMEOUT_SECS;
 }
 
+static int64_t dl_now_monotonic_seconds(void) { return platform_time_monotonic_us() / 1000000; }
 static int64_t dl_peer_avoid_deadline(int64_t now)
 {
     int cooldown = dl_get_request_timeout_secs();
@@ -60,11 +61,10 @@ bool dl_peer_avoid_active(int64_t deadline, int64_t now)
 {
     if (deadline <= now)
         return false;
-    /* Timeout sweeps accept a caller-supplied `now`, which can legitimately
-     * be one request-timeout ahead of a concurrent assignment pass. Beyond
-     * that plus the cooldown, a remaining interval is impossible without a
-     * backward wall-clock step; fail open instead of parking the only useful
-     * peer until the clock catches up. */
+    /* Timeout sweeps accept a caller-supplied monotonic `now`, which can
+     * legitimately be one request-timeout ahead of a concurrent assignment
+     * pass. Beyond that plus the cooldown, a remaining interval is invalid;
+     * fail open instead of parking the only useful peer. */
     return deadline <= now + DL_REQUEST_TIMEOUT_SECS_IBD +
                        DL_PEER_AVOID_COOLDOWN_SECS + 1;
 }
@@ -647,7 +647,7 @@ bool dl_mark_requested(struct download_manager *dm,
     }
 
     dl_activate_slot(dm, slot, hash, height, peer_id,
-                     (int64_t)platform_time_wall_time_t(), DL_WORK_FORWARD);
+                     dl_now_monotonic_seconds(), DL_WORK_FORWARD);
 
     /* Update peer stats */
     {
@@ -672,8 +672,9 @@ uint32_t dl_mark_received(struct download_manager *dm,
 
     uint32_t peer_id = s->peer_id;
     int64_t received_at = (int64_t)platform_time_wall_time_t();
-    bool delivery_sample_valid = received_at >= s->request_time;
-    int64_t delivery = delivery_sample_valid ? received_at - s->request_time : 0;
+    int64_t received_monotonic = dl_now_monotonic_seconds();
+    bool delivery_sample_valid = received_monotonic >= s->request_time;
+    int64_t delivery = delivery_sample_valid ? received_monotonic - s->request_time : 0;
 
     s->active = false;
     /* Don't zero the hash — find_slot needs it to detect "was used" vs "never used"
@@ -719,7 +720,7 @@ uint32_t dl_mark_received(struct download_manager *dm,
     return peer_id;
 }
 
-size_t dl_check_timeouts(struct download_manager *dm, int64_t now)
+size_t dl_check_timeouts(struct download_manager *dm, int64_t now_monotonic)
 {
     zcl_mutex_lock(&dm->cs);
 
@@ -728,13 +729,12 @@ size_t dl_check_timeouts(struct download_manager *dm, int64_t now)
         struct dl_in_flight *s = &dm->slots[i];
         if (!s->active) continue;
 
-        bool clock_rollback = now < s->request_time;
-        int64_t age = clock_rollback ? 0 : now - s->request_time;
+        bool clock_rollback = now_monotonic < s->request_time;
+        int64_t age = clock_rollback ? 0 : now_monotonic - s->request_time;
         if (!clock_rollback && age < dl_get_request_timeout_secs()) continue;
 
-        /* Timed out — move back to queue for reassignment. A backward wall
-         * clock step also fails open: otherwise this slot can remain occupied
-         * until wall time catches up to its future-dated request timestamp. */
+        /* Reassign timed-out work. Invalid backwards monotonic samples also
+         * fail open rather than stranding the occupied slot. */
         event_emitf(EV_BLOCK_REQUESTED, s->peer_id,
                     "TIMEOUT h=%d age=%llds clock_rollback=%s", s->height,
                     (long long)age, clock_rollback ? "yes" : "no");
@@ -743,7 +743,7 @@ size_t dl_check_timeouts(struct download_manager *dm, int64_t now)
         if (ps) ps->blocks_timed_out++;
 
         dl_queue_push(dm, &s->hash, s->height,
-                      s->peer_id, dl_peer_avoid_deadline(now),
+                      s->peer_id, dl_peer_avoid_deadline(now_monotonic),
                       s->work_class);
         s->active = false;
         dm->num_active--;
@@ -755,7 +755,7 @@ size_t dl_check_timeouts(struct download_manager *dm, int64_t now)
      * last_forced_settle_time): the original peer's late reply — if it
      * ever arrives — will look identical to an unsolicited push. */
     if (reassigned > 0)
-        dm->last_forced_settle_time = now;
+        dm->last_forced_settle_time = (int64_t)platform_time_wall_time_t();
     if (reassigned > 0)
         dl_generation_advance(&dm->queue_generation);
     if (reassigned > 0)
@@ -823,7 +823,7 @@ size_t dl_peer_disconnected(struct download_manager *dm, uint32_t peer_id)
     zcl_mutex_lock(&dm->cs);
     size_t requeued = 0;
     int64_t avoid_until =
-        dl_peer_avoid_deadline((int64_t)platform_time_wall_time_t());
+        dl_peer_avoid_deadline(dl_now_monotonic_seconds());
 
     for (size_t i = 0; i < dm->num_slots; i++) {
         struct dl_in_flight *s = &dm->slots[i];
@@ -880,7 +880,7 @@ size_t dl_mark_notfound(struct download_manager *dm, uint32_t peer_id,
     }
 
     int64_t avoid_until =
-        dl_peer_avoid_deadline((int64_t)platform_time_wall_time_t());
+        dl_peer_avoid_deadline(dl_now_monotonic_seconds());
     dl_queue_push(dm, &s->hash, s->height, peer_id, avoid_until,
                   s->work_class);
     s->active = false;
@@ -1141,7 +1141,7 @@ void dl_queue_priority(struct download_manager *dm,
     if (dl_qset_contains(dm, hash)) {
         for (size_t j = 0; j < dm->queue_len; j++) {
             if (uint256_eq(&dm->queue[j], hash)) {
-                int64_t now = (int64_t)platform_time_wall_time_t();
+                int64_t now = dl_now_monotonic_seconds();
                 if (dm->queue_heights[j] == height &&
                     dm->queue_classes[j] == DL_WORK_FORWARD &&
                     dm->queue_avoid_until[j] <= now) {
@@ -1201,7 +1201,7 @@ bool dl_assignment_should_attempt(struct download_manager *dm,
     zcl_mutex_lock(&dm->cs);
     struct dl_peer_stats *ps = dl_find_peer(dm, peer_id, false);
     bool should_attempt = !dl_assignment_peer_is_parked(
-        dm, ps, (int64_t)platform_time_wall_time_t());
+        dm, ps, dl_now_monotonic_seconds());
     zcl_mutex_unlock(&dm->cs);
     return should_attempt;
 }
@@ -1251,7 +1251,7 @@ size_t dl_assign_to_peer(struct download_manager *dm,
                          size_t max_assign)
 {
     zcl_mutex_lock(&dm->cs);
-    int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now = dl_now_monotonic_seconds();
     struct dl_peer_stats *ps_assign = dl_find_peer(dm, peer_id, true);
     if (dl_assignment_peer_is_parked(dm, ps_assign, now)) {
         zcl_mutex_unlock(&dm->cs);

@@ -843,7 +843,7 @@ static int test_dl_check_timeouts(void)
         dl_mark_requested(&dm, &h1, 100, 1);
 
         /* No timeout at current time */
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         ASSERT(dl_check_timeouts(&dm, now) == 0);
         ASSERT(dl_is_in_flight(&dm, &h1));
 
@@ -865,24 +865,55 @@ static int test_dl_check_timeouts(void)
     return failures;
 }
 
+static int test_dl_request_deadlines_use_monotonic_time(void)
+{
+    int failures = 0;
+    TEST("block download request deadlines use monotonic time") {
+        struct download_manager dm;
+        dl_init(&dm);
+
+        int64_t before = platform_time_monotonic_us() / 1000000;
+        struct uint256 h = make_hash(210);
+        ASSERT(dl_mark_requested(&dm, &h, 103, 9));
+        int64_t after = platform_time_monotonic_us() / 1000000;
+
+        bool found = false;
+        for (size_t i = 0; i < dm.num_slots; i++) {
+            if (!dm.slots[i].active ||
+                !uint256_eq(&dm.slots[i].hash, &h))
+                continue;
+            ASSERT(dm.slots[i].request_time >= before);
+            ASSERT(dm.slots[i].request_time <= after);
+            found = true;
+            break;
+        }
+        ASSERT(found);
+        ASSERT(dl_check_timeouts(&dm, after) == 0);
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_dl_timeout_fails_open_after_clock_rollback(void)
 {
     int failures = 0;
-    TEST("block request timeout fails open after a backward clock step") {
+    TEST("block request timeout fails open after an invalid monotonic step") {
         struct download_manager dm;
         dl_init(&dm);
 
         struct uint256 h = make_hash(207);
         ASSERT(dl_mark_requested(&dm, &h, 101, 1));
 
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         for (size_t i = 0; i < dm.num_slots; i++) {
             if (dm.slots[i].active && uint256_eq(&dm.slots[i].hash, &h))
                 dm.slots[i].request_time = now + 3600;
         }
 
-        /* A backward correction must release the occupied download window
-         * immediately, not wait an hour for wall time to catch up. */
+        /* An impossible future stamp must release the occupied download
+         * window immediately rather than strand it indefinitely. */
         ASSERT(dl_check_timeouts(&dm, now) == 1);
         ASSERT(!dl_is_in_flight(&dm, &h));
 
@@ -901,14 +932,14 @@ static int test_dl_timeout_fails_open_after_clock_rollback(void)
 static int test_dl_delivery_sample_ignores_clock_rollback(void)
 {
     int failures = 0;
-    TEST("block receipt ignores negative delivery time after clock rollback") {
+    TEST("block receipt ignores an invalid negative monotonic delivery") {
         struct download_manager dm;
         dl_init(&dm);
 
         struct uint256 h = make_hash(209);
         ASSERT(dl_mark_requested(&dm, &h, 102, 7));
 
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         bool found_slot = false;
         for (size_t i = 0; i < dm.num_slots; i++) {
             if (dm.slots[i].active && uint256_eq(&dm.slots[i].hash, &h)) {
@@ -1008,10 +1039,11 @@ static int test_dl_last_forced_settle_time_timeout(void)
         dl_mark_requested(&dm, &h1, 200, 1);
         ASSERT(dl_last_forced_settle_time(&dm) == 0);
 
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
+        int64_t before_wall = (int64_t)platform_time_wall_time_t();
         int timeout = dl_get_request_timeout_secs();
         ASSERT(dl_check_timeouts(&dm, now + timeout + 1) == 1);
-        ASSERT(dl_last_forced_settle_time(&dm) >= now);
+        ASSERT(dl_last_forced_settle_time(&dm) >= before_wall);
 
         /* Same trace as the drain case: the original (slow) peer's late
          * reply, if it ever arrives, is indistinguishable from unsolicited. */
@@ -1032,7 +1064,7 @@ static int test_dl_last_forced_settle_time_untouched(void)
         struct uint256 h1 = make_hash(3);
         dl_mark_requested(&dm, &h1, 300, 1);
 
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         ASSERT(dl_check_timeouts(&dm, now) == 0); /* nothing stale yet */
         ASSERT(dl_last_forced_settle_time(&dm) == 0);
 
@@ -1057,7 +1089,7 @@ static int test_dl_timeout_retry_failover(void)
         dl_init(&dm);
 
         struct uint256 h1 = make_hash(4);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         int timeout = dl_get_request_timeout_secs();
         ASSERT(dl_mark_requested(&dm, &h1, 150, 1));
         ASSERT(dl_check_timeouts(&dm, now + timeout + 1) == 1);
@@ -1097,7 +1129,7 @@ static int test_dl_timeout_retry_failover_peer_zero(void)
         dl_init(&dm);
 
         struct uint256 h1 = make_hash(6);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         int timeout = dl_get_request_timeout_secs();
         ASSERT(dl_mark_requested(&dm, &h1, 152, 0));
         ASSERT(dl_check_timeouts(&dm, now + timeout + 1) == 1);
@@ -1134,7 +1166,7 @@ static int test_dl_timeout_retry_avoid_expiry(void)
         dl_init(&dm);
 
         struct uint256 h1 = make_hash(5);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         int timeout = dl_get_request_timeout_secs();
         ASSERT(dl_mark_requested(&dm, &h1, 151, 1));
         ASSERT(dl_check_timeouts(&dm, now + timeout + 1) == 1);
@@ -1175,7 +1207,7 @@ static int test_dl_peer_avoid_fails_open_after_clock_rollback(void)
         dl_init(&dm);
 
         struct uint256 h = make_hash(208);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         ASSERT(dl_mark_requested(&dm, &h, 153, 1));
         ASSERT(dl_check_timeouts(&dm,
                                  now + dl_get_request_timeout_secs() + 1) == 1);
@@ -1230,7 +1262,7 @@ static int test_dl_peer_body_progress(void)
          * peer the body-stall discipline must fail over from). */
         struct uint256 h1 = make_hash(21);
         struct uint256 h2 = make_hash(22);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         int timeout = dl_get_request_timeout_secs();
         ASSERT(dl_mark_requested(&dm, &h1, 100, 7));
         ASSERT(dl_mark_requested(&dm, &h2, 101, 7));
@@ -1296,7 +1328,7 @@ static int test_dl_peer_body_staleness(void)
          * stays > 0, so Rule C keeps exempting this peer). */
         struct uint256 h2 = make_hash(32);
         struct uint256 h3 = make_hash(33);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         int timeout = dl_get_request_timeout_secs();
         ASSERT(dl_mark_requested(&dm, &h2, 201, 7));
         ASSERT(dl_mark_requested(&dm, &h3, 202, 7));
@@ -1343,7 +1375,7 @@ static int test_dl_diagnostics(void)
 
         struct uint256 h1 = make_hash(11);
         struct uint256 h2 = make_hash(12);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         int timeout = dl_get_request_timeout_secs();
         ASSERT(dl_mark_requested(&dm, &h1, 200, 7));
         ASSERT(dl_mark_requested(&dm, &h2, 201, 8));
@@ -1407,7 +1439,7 @@ static int test_dl_diagnostics_peer_avoid_fails_open_after_clock_rollback(void)
         ASSERT(dm.queue_len == 1);
         dm.queue_avoid_peers[0] = 7;
         dm.queue_avoid_until[0] =
-            (int64_t)platform_time_wall_time_t() + 3600;
+            platform_time_monotonic_us() / 1000000 + 3600;
         zcl_mutex_unlock(&dm.cs);
 
         struct dl_diagnostics diag;
@@ -1429,7 +1461,7 @@ static int test_gap_fill_timeout_sweep(void)
         dl_init(&dm);
 
         struct uint256 h1 = make_hash(13);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         ASSERT(dl_mark_requested(&dm, &h1, 300, 9));
 
         int timeout = dl_get_request_timeout_secs();
@@ -1465,7 +1497,7 @@ static int test_gap_fill_timeout_wakes_dispatcher(void)
         dl_init(&dm);
 
         struct uint256 h1 = make_hash(14);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         int timeout = dl_get_request_timeout_secs();
         ok = ok && dl_mark_requested(&dm, &h1, 301, 10);
 
@@ -2000,7 +2032,7 @@ static int test_dl_sorted_across_paths(void)
          * time it out so it re-enters the queue via dl_queue_push. */
         struct uint256 reto = make_hash16(42);
         dl_mark_requested(&dm, &reto, 3125316, 7);
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         ASSERT(dl_check_timeouts(&dm, now + DL_REQUEST_TIMEOUT_SECS + 1) == 1);
 
         /* Drain a handful and assert heights come out monotonically
@@ -2358,6 +2390,7 @@ int test_download(void)
     failures += test_dl_mark_notfound_settles_only_named_block();
     failures += test_dl_settle_accounting();
     failures += test_dl_check_timeouts();
+    failures += test_dl_request_deadlines_use_monotonic_time();
     failures += test_dl_timeout_fails_open_after_clock_rollback();
     failures += test_dl_delivery_sample_ignores_clock_rollback();
     failures += test_dl_last_forced_settle_time_initial();

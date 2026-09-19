@@ -58,7 +58,8 @@ void dl_get_diagnostics(struct download_manager *dm,
 
     uint32_t peer_ids[DL_MAX_TRACKED_PEERS];
     size_t peer_count = 0;
-    int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now_wall = (int64_t)platform_time_wall_time_t();
+    int64_t now_monotonic = platform_time_monotonic_us() / 1000000;
     int timeout = dl_get_request_timeout_secs();
 
     zcl_mutex_lock(&dm->cs);
@@ -107,8 +108,8 @@ void dl_get_diagnostics(struct download_manager *dm,
         pd->avg_delivery_us = ps->avg_delivery_us;
         pd->last_body_age_seconds =
             ps->last_body_received_time > 0 &&
-            now >= ps->last_body_received_time
-                ? now - ps->last_body_received_time
+            now_wall >= ps->last_body_received_time
+                ? now_wall - ps->last_body_received_time
                 : -1;
         pd->oldest_in_flight_age_seconds = -1;
         pd->oldest_in_flight_height = -1;
@@ -120,9 +121,9 @@ void dl_get_diagnostics(struct download_manager *dm,
             out->queued_history++;
         else
             out->queued_forward++;
-        if (!dl_peer_avoid_active(dm->queue_avoid_until[i], now))
+        if (!dl_peer_avoid_active(dm->queue_avoid_until[i], now_monotonic))
             continue;
-        int64_t remaining = dm->queue_avoid_until[i] - now;
+        int64_t remaining = dm->queue_avoid_until[i] - now_monotonic;
         out->queue_peer_avoid_count++;
         if (remaining > out->queue_peer_avoid_max_seconds)
             out->queue_peer_avoid_max_seconds = remaining;
@@ -137,7 +138,9 @@ void dl_get_diagnostics(struct download_manager *dm,
         else
             out->in_flight_forward++;
 
-        int64_t age = now >= s->request_time ? now - s->request_time : 0;
+        int64_t age = now_monotonic >= s->request_time
+                          ? now_monotonic - s->request_time
+                          : 0;
         if (out->oldest_in_flight_age_seconds < 0 ||
             age > out->oldest_in_flight_age_seconds) {
             out->oldest_in_flight_age_seconds = age;

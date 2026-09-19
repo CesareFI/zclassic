@@ -281,14 +281,14 @@ bool gap_fill_dump_state_json(struct json_value *out, const char *key)
 }
 
 size_t gap_fill_sweep_download_timeouts(struct download_manager *dm,
-                                        int64_t now_seconds)
+                                        int64_t now_monotonic)
 {
     if (!dm)
         return 0;
-    if (now_seconds <= 0)
-        now_seconds = (int64_t)platform_time_wall_time_t();
+    if (now_monotonic <= 0)
+        now_monotonic = platform_time_monotonic_us() / 1000000;
 
-    size_t timed_out = dl_check_timeouts(dm, now_seconds);
+    size_t timed_out = dl_check_timeouts(dm, now_monotonic);
     if (timed_out > 0) {
         LOG_WARN("gap_fill",
                  "[gap-fill] download timeout sweep requeued=%zu",
@@ -412,7 +412,7 @@ static int gap_fill_pass(void)
     if (!ms || !dm) return 0;
 
     size_t timed_out = gap_fill_sweep_download_timeouts(
-        dm, (int64_t)platform_time_wall_time_t());
+        dm, platform_time_monotonic_us() / 1000000);
     pthread_mutex_lock(&g_gf.mu);
     g_gf.stats.timeout_sweeps++;
     g_gf.stats.timeouts_requeued += (uint64_t)timed_out;
