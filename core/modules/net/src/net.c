@@ -587,12 +587,12 @@ void p2p_log_peer_close(const struct p2p_node *node, const char *event,
     char addr_safe[96];
     log_json_escape(addr_safe, sizeof(addr_safe), node->addr_name);
 
-    /* Lifetime is wall-clock seconds since the socket was created. A clock
-     * step backwards must not print a negative age. */
-    int64_t now = GetTime();
+    /* Monotonic elapsed lifetime keeps civil-clock corrections from erasing
+     * or inflating the session age used to diagnose peer churn. */
+    int64_t connected_us = atomic_load(&node->connected_monotonic_us);
+    int64_t now_us = platform_time_monotonic_us();
     long long lifetime = 0;
-    if (node->time_connected > 0 && now > node->time_connected)
-        lifetime = (long long)(now - node->time_connected);
+    if (connected_us > 0 && now_us >= connected_us) lifetime = (long long)((now_us - connected_us) / 1000000);
 
     log_jsonf(LOG_JSON_INFO, event,
               "\"addr\":\"%s\",\"peer_id\":%d,\"inbound\":%s,"

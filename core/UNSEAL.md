@@ -272,3 +272,7 @@ later lane flips it HARD.
 - 2026-09-19T04:30:28Z — REASON: Keep the authorized banlist debounce change within the enforced legacy file-size ceiling; behavior unchanged
   old ROOT: 1cf7a537a4f680b578596cb2a57f3ea70f405a8f5cb2159ffd08d2ac98c0edaf
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T04:44:02Z — REASON: Use the existing monotonic peer connection stamp for disconnect lifetime diagnostics so wall-clock corrections cannot erase session-age evidence; reporting only, no consensus or validation change
+  old ROOT: bdc75f4db95afc89999a68da83363fa6306b29dd0c8827acfce32eaf52557e9d
+  by: owner unseal ritual (make core-unseal)

@@ -24,6 +24,7 @@
 #include "net/net.h"
 #include "core/utiltime.h"
 #include "platform/os_proc.h"
+#include "platform/time_compat.h"
 #include "util/log_json.h"
 
 #include <limits.h>
@@ -94,14 +95,18 @@ static struct p2p_node *make_node(const char *addr_name, int id, bool inbound,
     n->version = version;
     n->misbehavior = 0;
     n->endpoint_generation = (uint64_t)id + 1u;
-    /* GetTime() is the emitter's own clock, so the reported lifetime is
-     * age_secs — or age_secs+1 if the wall second ticks between here and the
-     * emit, which lifetime_is() below tolerates. */
+    /* Keep the civil timestamp plausible for legacy operator fields, but pin
+     * elapsed lifetime to the same monotonic origin the live constructor
+     * records. */
     n->time_connected = GetTime() - age_secs;
+    atomic_store_explicit(&n->connected_monotonic_us,
+                          platform_time_monotonic_us() -
+                              age_secs * 1000000,
+                          memory_order_relaxed);
     return n;
 }
 
-/* lifetime_secs is a wall-clock difference, so accept the one-second tick. */
+/* Accept the one-second tick between constructing the fixture and emitting. */
 static bool lifetime_is(const char *line, long long secs)
 {
     char want[64];
@@ -109,6 +114,29 @@ static bool lifetime_is(const char *line, long long secs)
     if (contains(line, want)) return true;
     snprintf(want, sizeof(want), "\"lifetime_secs\":%lld,", secs + 1);
     return contains(line, want);
+}
+
+static int test_lifetime_ignores_wall_clock_rollback(void)
+{
+    int failures = 0;
+    TEST("peer_disconnect_log: lifetime survives civil clock rollback") {
+        struct p2p_node *n = make_node("203.0.113.44:8033", 33, false,
+                                        PEER_ACTIVE, 170020, 37);
+        ASSERT(n != NULL);
+        /* Simulate a civil connection stamp far in the future. The old
+         * subtraction reported zero even though monotonic elapsed time was
+         * valid, hiding a real session's age from churn diagnostics. */
+        n->time_connected = GetTime() + 86400;
+        char buf[2048];
+        ASSERT(capture_close_line(n, "peer_disconnected",
+                                  P2P_DISCONNECT_REMOTE_CLOSE,
+                                  P2P_DISCONNECT_SOURCE_SOCKET,
+                                  buf, sizeof(buf)));
+        ASSERT(lifetime_is(buf, 37));
+        free(n);
+        PASS();
+    } _test_next:;
+    return failures;
 }
 
 /* ── Prong A: every reason produces a named, paired line ───────────── */
@@ -468,6 +496,7 @@ int test_peer_disconnect_log(void)
     int failures = 0;
 
     failures += test_close_line_shape();
+    failures += test_lifetime_ignores_wall_clock_rollback();
     failures += test_inbound_direction_recorded();
     failures += test_every_reason_is_named();
     failures += test_each_reason_emits_one_named_line();
