@@ -1557,11 +1557,13 @@ static void *thread_socket_handler(void *arg)
         /* Liveness and handshake timeouts.  The keepalive state machine uses
          * monotonic time and is evaluated even when poll() returned zero. */
         {
-            int64_t now_check = GetTime();
             int64_t now_mono_us = platform_time_monotonic_us();
             for (size_t i = 0; i < cm->manager.num_nodes; i++) {
                 struct p2p_node *n = cm->manager.nodes[i];
                 if (n->disconnect) continue;
+                int64_t connected_secs = peer_connection_age_secs(
+                    atomic_load_explicit(&n->connected_monotonic_us,
+                                         memory_order_relaxed), now_mono_us);
 
                 size_t addnode_index = SIZE_MAX;
                 bool is_addnode =
@@ -1632,11 +1634,10 @@ static void *thread_socket_handler(void *arg)
                     net_addr_is_local(&n->addr.svc.addr) ? 90 : 10;
                 if (!n->inbound &&
                     n->state == PEER_CONNECTING &&
-                    n->time_connected > 0 &&
-                    now_check - n->time_connected > connect_timeout) {
+                    connected_secs > connect_timeout) {
                     event_emitf(EV_TCP_TIMEOUT, (uint32_t)n->id,
                                 "tcp_connect %llds state=connecting",
-                                (long long)(now_check - n->time_connected));
+                                (long long)connected_secs);
                     /* Machine-readable in node.log, not only in the event
                      * ring. Its own event name: the terminal
                      * "peer_disconnected" line still follows from the sweep,
@@ -1668,11 +1669,10 @@ static void *thread_socket_handler(void *arg)
                  * dead peers out (TCP keepalive trips first) while
                  * giving slow ticks room. */
                 if (n->state < PEER_HANDSHAKE_COMPLETE &&
-                    n->time_connected > 0 &&
-                    now_check - n->time_connected > 90) {
+                    connected_secs > 90) {
                     event_emitf(EV_TCP_TIMEOUT, (uint32_t)n->id,
                                 "handshake %llds state=%s",
-                                (long long)(now_check - n->time_connected),
+                                (long long)connected_secs,
                                 peer_state_name(n->state));
                     /* Replaces a free-form printf that no tool could parse.
                      * Same facts (addr, age, version, state, direction) in

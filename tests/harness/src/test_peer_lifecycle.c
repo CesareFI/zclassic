@@ -6,6 +6,7 @@
 #include "event/event.h"
 #include "net/fast_sync.h"
 #include "net/msg_internal.h"
+#include "net/peer_liveness.h"
 #include "net/peer_lifecycle.h"
 #include "net/port_policy.h"
 #include "net/version.h"
@@ -1494,9 +1495,27 @@ static int test_peer_lifecycle_empty_incident_readiness(void)
     return failures;
 }
 
+static int test_peer_connection_timeouts_are_monotonic(void)
+{
+    int failures = 0;
+    TEST_CASE("peer_lifecycle: connection deadlines ignore wall rollback") {
+        const int64_t connected_us = 7000000LL;
+        const int64_t wall_before = 1800000000LL;
+        const int64_t wall_after = wall_before - 86400LL;
+        ASSERT(wall_after < wall_before);
+        ASSERT(peer_connection_age_secs(
+                   connected_us, connected_us + 10LL * 1000000LL) == 10);
+        ASSERT(peer_connection_age_secs(
+                   connected_us, connected_us + 11LL * 1000000LL) == 11);
+        ASSERT(peer_connection_age_secs(connected_us, connected_us - 1) == 0);
+    } TEST_END
+    return failures;
+}
+
 int test_peer_lifecycle(void)
 {
     int failures = 0;
+    failures += test_peer_connection_timeouts_are_monotonic();
     failures += test_peer_lifecycle_user_agent();
     failures += test_peer_lifecycle_classify();
     failures += test_peer_lifecycle_version_build();

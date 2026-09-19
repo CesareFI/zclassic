@@ -33,4 +33,9 @@ struct peer_liveness_sample {
 enum peer_liveness_action peer_liveness_decide(
     const struct peer_liveness_sample *sample, int64_t now_us);
 
+/* Connection and version-handshake deadlines share the node's monotonic
+ * connection stamp.  Wall time is intentionally not an input: an operator
+ * clock correction must not strand a half-open peer in an outbound slot. */
+int64_t peer_connection_age_secs(int64_t connected_us, int64_t now_us);
+
 #endif /* ZCL_NET_PEER_LIVENESS_H */

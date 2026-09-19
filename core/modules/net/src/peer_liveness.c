@@ -13,6 +13,13 @@ static int64_t elapsed_nonnegative(int64_t now_us, int64_t then_us)
     return now_us - then_us;
 }
 
+int64_t peer_connection_age_secs(int64_t connected_us, int64_t now_us)
+{
+    if (connected_us <= 0 || now_us <= connected_us)
+        return 0;
+    return (now_us - connected_us) / 1000000LL;
+}
+
 enum peer_liveness_action peer_liveness_decide(
     const struct peer_liveness_sample *sample, int64_t now_us)
 {

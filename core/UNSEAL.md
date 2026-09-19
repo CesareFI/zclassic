@@ -244,3 +244,7 @@ later lane flips it HARD.
 - 2026-09-19T00:42:22Z — REASON: Fail open addrman selection and dead-entry cooldowns after backward wall-clock step; peer scheduling policy only, no consensus or validation semantics change
   old ROOT: b4706d661db69e751b185a3556d312faaf7ff60466676d08eedbb458275f6086
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-19T02:28:59Z — REASON: Use the existing monotonic peer connection stamp for TCP-connect and version-handshake deadlines so backward wall-clock steps cannot strand outbound slots; networking policy only, no consensus or validation change
+  old ROOT: 5112c261b8fb144a9ed22779fe430a883ee2d20d752501ecf79f0dba4bfa2667
+  by: owner unseal ritual (make core-unseal)
