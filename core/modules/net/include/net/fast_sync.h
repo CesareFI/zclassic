@@ -486,6 +486,12 @@ void block_swarm_fail_piece(struct block_swarm *bs, uint32_t piece_index);
 bool block_swarm_requeue_piece(struct block_swarm *bs,
                                uint32_t piece_index);
 
+/* Requeue only if peer_id still owns this in-flight piece. Stale per-peer
+ * pipeline slots must not revoke work that a timeout reassigned elsewhere. */
+bool block_swarm_requeue_piece_for_peer(struct block_swarm *bs,
+                                        uint32_t piece_index,
+                                        int peer_id);
+
 /* Lowest piece not yet complete, or num_pieces when complete.  The monotonic
  * cursor makes contiguous-window calculation O(total pieces), not O(pipeline
  * fills * chain length). */

@@ -87,3 +87,21 @@ cryptography, PoW, activation, and monetary rules are untouched. Next inspect
 per-peer request ages and timeout/reassignment behavior before changing any
 timeout constant; diagnostic progress-report wall time remains a separate,
 non-authoritative cleanup candidate.
+
+## Block-swarm stale timeout ownership
+
+The global timeout sweep could make peer A's piece assignable and peer B could
+claim it before A's stale pipeline slot was cleared. A's later per-peer cleanup
+then requeued the piece solely because it was in flight, revoking B's valid
+ownership and enabling duplicate work.
+
+Per-peer cleanup now requeues only when the named peer is still the recorded
+owner. A deterministic A-to-B reassignment regression proves stale A cannot
+revoke B, while B retains normal requeue authority. Disconnect cleanup uses
+the same ownership-checked primitive. The loopback retained immediate requeue
+of 40 disconnected-peer pieces and moved 2,560 blocks (3,962,880 bytes) at
+30,001 blocks/s and 44.3 MiB/s.
+
+Consensus impact: none; only request ownership bookkeeping changed. Next
+measure timeout/reassignment counts and useful delivery per peer before
+considering adaptive scheduling or any timeout change.

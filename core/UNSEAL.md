@@ -360,3 +360,7 @@ later lane flips it HARD.
 - 2026-09-20T10:05:08Z — REASON: Use monotonic elapsed time for block-swarm silent-stall ownership; scheduling only, no consensus or validation change
   old ROOT: 60db33754e930e0ab95ad7728c8dea30bd34b1a653f4599f5c8dd8f316b70490
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T10:21:30Z — REASON: Prevent stale block-swarm pipeline owners from requeueing reassigned work; scheduling only, no consensus or validation change
+  old ROOT: 6a1393d9f20a11657fdb77482655cb0df8e579512d275ec2d34b4925c7514be8
+  by: owner unseal ritual (make core-unseal)

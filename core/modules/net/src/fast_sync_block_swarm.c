@@ -271,6 +271,18 @@ bool block_swarm_requeue_piece(struct block_swarm *bs, uint32_t piece_index)
     return true;
 }
 
+bool block_swarm_requeue_piece_for_peer(struct block_swarm *bs,
+                                        uint32_t piece_index,
+                                        int peer_id)
+{
+    if (!bs || !bs->piece_states || !bs->piece_peer ||
+        piece_index >= bs->manifest.num_pieces ||
+        bs->piece_states[piece_index] != CHUNK_INFLIGHT ||
+        bs->piece_peer[piece_index] != peer_id)
+        return false;
+    return block_swarm_requeue_piece(bs, piece_index);
+}
+
 uint32_t block_swarm_first_incomplete_piece(struct block_swarm *bs)
 {
     if (!bs || !bs->piece_states)
