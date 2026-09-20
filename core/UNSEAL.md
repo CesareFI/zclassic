@@ -348,3 +348,7 @@ later lane flips it HARD.
 - 2026-09-19T15:42:14Z — REASON: Refactor the authorized monotonic peer-floor timer call after the shrink-only file-size gate; behavior unchanged, no consensus or validation change
   old ROOT: 99002524bcc275d4d7eb67a67e2631d1365cca1652e54b43a319763cc01a9134
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T07:32:16Z — REASON: Bound block-swarm requests to each anchored peer manifest; peer scheduling only, no consensus semantics
+  old ROOT: 8b3df2f79fe3743f4819760874225bd83405cfb8a1d66abcfee338c926f9f426
+  by: owner unseal ritual (make core-unseal)
