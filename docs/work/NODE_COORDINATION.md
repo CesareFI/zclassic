@@ -123,5 +123,11 @@ loopback moved 2,560 blocks (3,962,880 bytes) at 31,486 blocks/s and 46.5 MiB/s.
 
 Consensus impact: none. This changes only the rate at which already-eligible
 requests are assigned to peers; every response retains the existing manifest,
-block, and consensus validation. Next measure whether the full-manifest timeout
-sweep costs meaningful CPU per peer tick before changing its data structure.
+block, and consensus validation.
+
+A follow-up profile scanned a 50,000-piece manifest 2,000 times: 100 million
+state checks took 28,638 microseconds, about 14.3 microseconds per sweep on the
+measured host. That does not justify a more complex timeout data structure.
+Next measure block-swarm delivery and timeout outcomes per peer; the legacy
+download manager already has bounded delivery-rate scoring, but block-piece
+responses do not currently feed equivalent scheduler evidence.
