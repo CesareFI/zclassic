@@ -779,6 +779,20 @@ static int test_block_swarm_bitmap(void)
         for (uint32_t i = 0; i < 12; i++) /* 0xFF=8bits + 0x0F=4bits */
             ASSERT(bs.piece_availability[i] >= 1);
 
+        /* Re-advertising replaces this peer's contribution; it must not
+         * inflate rarity counts or retain bits the peer withdrew. */
+        uint8_t replacement[2] = {0x03, 0x00};
+        block_swarm_replace_availability(&bs, peer_bitmap, 2,
+                                         peer_bitmap, 2);
+        for (uint32_t i = 0; i < 12; i++)
+            ASSERT(bs.piece_availability[i] == 1);
+        block_swarm_replace_availability(&bs, peer_bitmap, 2,
+                                         replacement, 2);
+        ASSERT(bs.piece_availability[0] == 1);
+        ASSERT(bs.piece_availability[1] == 1);
+        for (uint32_t i = 2; i < 12; i++)
+            ASSERT(bs.piece_availability[i] == 0);
+
         block_swarm_free(&bs);
         free(manifest.piece_hashes);
         PASS();

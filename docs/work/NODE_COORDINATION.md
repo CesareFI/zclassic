@@ -233,3 +233,35 @@ duplicate tail requests, but the current single-owner accounting cannot model
 them safely and the duplicate-selection branch is unreachable. Recommended
 next investigation: measure tail latency and design explicit bounded duplicate
 ownership before changing that behavior.
+
+## Idempotent block availability replacement
+
+Every accepted `zblkbitmap` previously incremented the global per-piece
+availability counters, then replaced the peer-local bitmap without removing
+that peer's prior contribution. Replaying one valid advertisement could grow
+selected counts without bound, and changing to a shorter bitmap left withdrawn
+pieces artificially common. Because rarest-first scheduling trusts these
+counters for ordering, one untrusted peer could bias work selection.
+
+Bitmap replacement now subtracts the peer's previous set bits (with a zero
+floor) and adds its new set bits (with a `UINT32_MAX` ceiling) while holding the
+block-swarm mutex. The original add-only entry point delegates to the same
+bounded implementation. A deterministic regression proves an identical replay
+leaves every advertised count at one and a replacement withdraws all old bits
+not present in the new bitmap.
+
+The four-group fast-sync suite and the production-path real-wire block-swarm
+loopback passed, as did the four-group ASan/UBSan fast-sync run; the loopback
+transferred 2,560 blocks / 3,962,880 bytes at 29,748 blocks/s (43.9 MB/s).
+Core seal/root mirror, consensus parity, generated capability inventory,
+cyclomatic complexity (55,553 functions), and whitespace gates passed.
+
+Consensus impact: none. Availability is only a request-order hint; every piece
+still requires its manifest hash and every block follows canonical validation.
+Worldstream commit `0b29bec27` remains confined to observer/startup work and
+does not overlap this ownership.
+
+Remaining risk and next investigation: disconnect currently requeues owned
+pieces by peer ID but does not receive the departing peer's bitmap, so its
+availability contribution persists until the swarm ends. Extend disconnect
+cleanup with bounded bitmap withdrawal and a reconnect regression.

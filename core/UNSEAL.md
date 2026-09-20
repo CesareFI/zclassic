@@ -384,3 +384,7 @@ later lane flips it HARD.
 - 2026-09-20T22:27:06Z — REASON: Make snapshot chunk and block-piece timeout arithmetic overflow-safe under monotonic anomalies; scheduling only, no consensus or validation semantic change
   old ROOT: 2891ed7d79f668f769b46504bdbcbead88a2d6cc9587a5c4c1a0ee6c5f16eafd
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T22:51:03Z — REASON: Keep block-swarm availability counts bounded when an untrusted peer repeats or replaces its bitmap; scheduling only, no consensus or validation semantic change
+  old ROOT: 2daff4bdfc7bbbc054d843d0c4093d435b492eca1b43550c31de12a558d59021
+  by: owner unseal ritual (make core-unseal)

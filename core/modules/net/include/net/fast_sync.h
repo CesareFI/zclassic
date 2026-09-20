@@ -520,6 +520,11 @@ void block_swarm_handle_timeouts_at(struct block_swarm *bs, int timeout_secs,
 void block_swarm_update_availability(struct block_swarm *bs,
                                       const uint8_t *bitmap,
                                       uint32_t bitmap_len);
+void block_swarm_replace_availability(struct block_swarm *bs,
+                                      const uint8_t *old_bitmap,
+                                      uint32_t old_bitmap_len,
+                                      const uint8_t *new_bitmap,
+                                      uint32_t new_bitmap_len);
 
 /* Check if in endgame mode and return list of needed pieces.
  * Returns count of pieces written to out_indices (up to max). */

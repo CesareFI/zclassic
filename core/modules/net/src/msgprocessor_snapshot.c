@@ -1567,18 +1567,18 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
             } else {
                 uint8_t *bitmap = zcl_calloc(bitmap_len, 1, "blk_bitmap");
                 if (bitmap && stream_read_bytes(s, bitmap, bitmap_len)) {
-                    /* Store on peer for rarest-first selection */
+                    /* Replace this peer's prior contribution rather than
+                     * accumulating repeated untrusted advertisements. */
+                    if (g_block_swarm_active) {
+                        pthread_mutex_lock(&g_block_swarm_mutex);
+                        block_swarm_replace_availability(
+                            &g_block_swarm, node->blk_bitmap,
+                            node->blk_bitmap_len, bitmap, bitmap_len);
+                        pthread_mutex_unlock(&g_block_swarm_mutex);
+                    }
                     free(node->blk_bitmap);
                     node->blk_bitmap = bitmap;
                     node->blk_bitmap_len = bitmap_len;
-
-                    /* Update global availability counts */
-                    if (g_block_swarm_active) {
-                        pthread_mutex_lock(&g_block_swarm_mutex);
-                        block_swarm_update_availability(&g_block_swarm,
-                                                         bitmap, bitmap_len);
-                        pthread_mutex_unlock(&g_block_swarm_mutex);
-                    }
                 } else {
                     free(bitmap);
                     printf("Peer %s: truncated zblkbitmap\n",

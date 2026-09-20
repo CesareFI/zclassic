@@ -324,15 +324,36 @@ void block_swarm_handle_timeouts(struct block_swarm *bs, int timeout_secs)
         bs, timeout_secs, platform_time_monotonic_us() / 1000000);
 }
 
+static bool block_swarm_bitmap_has(const uint8_t *bitmap,
+                                   uint32_t bitmap_len, uint32_t piece)
+{
+    return bitmap && piece / 8 < bitmap_len &&
+           (bitmap[piece / 8] & (1u << (piece % 8)));
+}
+
+void block_swarm_replace_availability(struct block_swarm *bs,
+                                      const uint8_t *old_bitmap,
+                                      uint32_t old_bitmap_len,
+                                      const uint8_t *new_bitmap,
+                                      uint32_t new_bitmap_len)
+{
+    if (!bs || !bs->piece_availability)
+        return;
+    for (uint32_t i = 0; i < bs->manifest.num_pieces; i++) {
+        if (block_swarm_bitmap_has(old_bitmap, old_bitmap_len, i) &&
+            bs->piece_availability[i] > 0)
+            bs->piece_availability[i]--;
+        if (block_swarm_bitmap_has(new_bitmap, new_bitmap_len, i) &&
+            bs->piece_availability[i] < UINT32_MAX)
+            bs->piece_availability[i]++;
+    }
+}
+
 void block_swarm_update_availability(struct block_swarm *bs,
                                       const uint8_t *bitmap,
                                       uint32_t bitmap_len)
 {
-    if (!bs || !bitmap || !bs->piece_availability) return;
-    for (uint32_t i = 0; i < bs->manifest.num_pieces; i++) {
-        if (i / 8 < bitmap_len && (bitmap[i / 8] & (1 << (i % 8))))
-            bs->piece_availability[i]++;
-    }
+    block_swarm_replace_availability(bs, NULL, 0, bitmap, bitmap_len);
 }
 
 uint32_t block_swarm_endgame_pieces(const struct block_swarm *bs,
