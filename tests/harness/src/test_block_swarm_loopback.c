@@ -737,6 +737,9 @@ bool mp_block_swarm_test_stall_elapsed_at(
     int64_t now_monotonic, int64_t last_complete_monotonic);
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
                                         uint32_t piece_index);
+size_t mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
+                                              struct p2p_node *node,
+                                              int64_t now_monotonic);
 
 static int test_block_swarm_peer_fairness(void)
 {
@@ -815,6 +818,54 @@ static int test_block_swarm_peer_fairness(void)
         p2p_node_free(second);
         net_manager_free(&nm);
         main_state_free(&ms);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_block_swarm_stale_pipeline_reclaim(void)
+{
+    int failures = 0;
+
+    TEST("block swarm immediately reclaims a reassigned peer slot completed "
+         "by the slow original peer") {
+        struct block_piece_manifest manifest;
+        struct block_swarm swarm;
+        struct p2p_node peer;
+        uint8_t piece_hashes[2][32] = {{0}};
+        const int peer_id = 22;
+        const int64_t requested_at = 1000;
+
+        memset(&manifest, 0, sizeof(manifest));
+        memset(&swarm, 0, sizeof(swarm));
+        memset(&peer, 0, sizeof(peer));
+        manifest.start_height = 1;
+        manifest.end_height = 2 * BLOCKS_PER_PIECE;
+        manifest.num_pieces = 2;
+        manifest.piece_hashes = piece_hashes;
+        ASSERT(block_swarm_init(&swarm, &manifest, NULL));
+
+        peer.id = peer_id;
+        for (int i = 0; i < PIECE_PIPELINE_DEPTH; i++)
+            peer.blk_pipeline[i].piece_index = -1;
+
+        int32_t piece = block_swarm_assign_piece(&swarm, peer_id, NULL, 0);
+        ASSERT(piece == 0);
+        peer.blk_pipeline[0].piece_index = piece;
+        peer.blk_pipeline[0].request_time = requested_at;
+
+        /* The original peer's late, verified response completes the piece
+         * after ownership moved to this peer. The peer-local slot is now
+         * stale even though its own eight-second timer has not elapsed. */
+        ASSERT(block_swarm_receive_piece(&swarm, (uint32_t)piece, 11));
+        ASSERT(mp_block_swarm_reconcile_peer_pipeline(
+                   &swarm, &peer, requested_at) == 1);
+        ASSERT(peer.blk_pipeline[0].piece_index == -1);
+        ASSERT(swarm.pieces_complete == 1);
+        ASSERT(swarm.pieces_inflight == 0);
+
+        block_swarm_free(&swarm);
         PASS();
     } _test_next:;
 
@@ -1390,6 +1441,7 @@ int test_block_swarm_loopback(void)
     failures += test_block_swarm_throughput();
     failures += test_block_swarm_disconnect_requeue();
     failures += test_block_swarm_peer_fairness();
+    failures += test_block_swarm_stale_pipeline_reclaim();
     failures += test_block_swarm_restart_cooldown();
     failures += test_block_swarm_stall_clock();
     failures += test_block_swarm_stall_reap();

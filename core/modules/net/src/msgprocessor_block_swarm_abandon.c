@@ -10,6 +10,84 @@
 #include "net/fast_sync.h"
 #include "platform/time_compat.h"
 #include "util/log_macros.h"
+#include "validation/main_state.h"
+
+#define BLOCK_PIECE_CONTIGUOUS_WINDOW PIECE_PIPELINE_DEPTH
+
+size_t mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
+                                              struct p2p_node *node,
+                                              int64_t now_monotonic)
+{
+    if (!swarm || !node || !swarm->piece_states || !swarm->piece_peer)
+        return 0;
+
+    size_t cleared = 0;
+    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+        int32_t piece = node->blk_pipeline[pi].piece_index;
+        if (piece < 0)
+            continue;
+
+        bool owns_piece = (uint32_t)piece < swarm->manifest.num_pieces &&
+            swarm->piece_states[piece] == CHUNK_INFLIGHT &&
+            swarm->piece_peer[piece] == node->id;
+        if (owns_piece &&
+            (now_monotonic < node->blk_pipeline[pi].request_time ||
+             now_monotonic - node->blk_pipeline[pi].request_time <=
+                 BLOCK_PIECE_TIMEOUT_SECS))
+            continue;
+
+        if (owns_piece)
+            (void)block_swarm_requeue_piece_for_peer(
+                swarm, (uint32_t)piece, node->id);
+        node->blk_pipeline[pi].piece_index = -1;
+        cleared++;
+    }
+    return cleared;
+}
+
+int32_t mp_block_swarm_peer_manifest_end(const struct p2p_node *node)
+{
+    return node->blk_manifest_received ? node->blk_peer_height : -1;
+}
+
+int32_t mp_block_swarm_local_header_cap(const struct msg_processor *mp)
+{
+    int32_t cap = 0;
+    if (!mp || !mp->main_state)
+        return cap;
+
+    int active_h = active_chain_height(&mp->main_state->chain_active);
+    if (active_h > cap)
+        cap = active_h;
+
+    struct block_index *best_header = mp->main_state->pindex_best_header;
+    if (best_header && best_header->nHeight > cap)
+        cap = best_header->nHeight;
+    return cap;
+}
+
+int32_t mp_block_swarm_contiguous_window_cap(struct block_swarm *swarm,
+                                             int32_t header_cap)
+{
+    if (!swarm || !swarm->piece_states || swarm->manifest.num_pieces == 0)
+        return header_cap;
+
+    uint32_t first_open = block_swarm_first_incomplete_piece(swarm);
+    if (first_open >= swarm->manifest.num_pieces)
+        return header_cap;
+
+    uint32_t window_cap = first_open + BLOCK_PIECE_CONTIGUOUS_WINDOW - 1;
+    if (window_cap >= swarm->manifest.num_pieces)
+        window_cap = swarm->manifest.num_pieces - 1;
+
+    int64_t piece_end = (int64_t)swarm->manifest.start_height +
+        ((int64_t)window_cap + 1) * BLOCKS_PER_PIECE - 1;
+    if (piece_end > swarm->manifest.end_height)
+        piece_end = swarm->manifest.end_height;
+    if (piece_end < header_cap)
+        return (int32_t)piece_end;
+    return header_cap;
+}
 
 void mp_block_swarm_mark_complete_through_height(
     struct block_swarm *swarm, int32_t have_height)

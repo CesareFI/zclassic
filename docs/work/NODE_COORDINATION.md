@@ -131,3 +131,36 @@ measured host. That does not justify a more complex timeout data structure.
 Next measure block-swarm delivery and timeout outcomes per peer; the legacy
 download manager already has bounded delivery-rate scoring, but block-piece
 responses do not currently feed equivalent scheduler evidence.
+
+That delivery/timeout audit found a narrower scheduling leak before adaptive
+scoring was justified. When a piece timed out at peer A, was reassigned to peer
+B, and A's late valid response completed it, B retained its now-stale pipeline
+slot until B's own eight-second timeout. Repeated late responses could therefore
+reduce useful parallelism despite continued valid delivery. Each peer send tick
+now reconciles its local slots with authoritative swarm ownership: completed or
+reassigned slots are reclaimed immediately, while timeout requeue remains
+ownership-checked. A deterministic regression reproduces the A-to-B handoff and
+proves B recovers the slot at zero elapsed seconds.
+
+Consensus impact: none. Piece completion remains manifest-hash verified and all
+block payloads still traverse the existing canonical reducer and consensus
+validation; this changes only request-slot bookkeeping after verification.
+
+Validation: the focused real-wire loopback moved 2,560 blocks (3,962,880
+bytes) at 31,687 blocks/s (46.8 MB/s), and the ASan/UBSan profile moved the
+same fixture at 8,968 blocks/s (13.2 MB/s) with no sanitizer finding. Core
+seal/root-mirror, consensus parity, generated capability inventory, complexity,
+and whitespace gates passed. Before the fix, B retained the stale slot for up
+to eight seconds; after reconciliation it is recovered on B's next send tick
+with zero elapsed seconds in the deterministic clock fixture.
+
+Remaining risk: reconciliation is intentionally per-peer send-tick work and
+still scans the fixed 256-slot pipeline. The measured 50,000-piece global scan
+above remains cheap, but useful-delivery and timeout outcome telemetry per peer
+is still absent, so adaptive peer ranking is not yet evidence-backed.
+
+Worldstream interaction: Worldstream's current branch owns fresh-sync startup
+observers, interruption gates, and telemetry overhead. It does not modify the
+block-swarm scheduler surface in this slice. Recommended next investigation:
+measure block-piece useful delivery, late delivery, and timeout outcomes by peer
+before changing ranking or timeout policy.

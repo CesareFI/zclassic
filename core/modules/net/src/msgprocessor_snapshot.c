@@ -83,7 +83,6 @@ static int64_t g_swarm_last_progress_time = 0;
  * shared with msgprocessor_snapshot_serve.c's build_block_piece_payloads,
  * which must agree with this file's parse_block_piece_payload_refs on the
  * same per-block cap. */
-#define BLOCK_PIECE_TIMEOUT_SECS 8
 /* No piece completion for this long => the swarm is black-holing (peer
  * silently dropping zblkreq, serve-side gap, TCP backpressure): abandon it
  * so legacy getdata — paused while a swarm is active — resumes the fetch. */
@@ -91,10 +90,6 @@ static int64_t g_swarm_last_progress_time = 0;
 /* Minimum legacy-getdata ownership window before a reaped swarm may be
  * re-armed by a fresh manifest (anti-flap). */
 #define BLOCK_SWARM_RESTART_COOLDOWN_SECS 300
-/* Keep one full per-peer request pipeline contiguous: a bounded 16,384-block
- * ahead window. Every piece remains manifest-hash checked before any block
- * reaches the reducer. */
-#define BLOCK_PIECE_CONTIGUOUS_WINDOW PIECE_PIPELINE_DEPTH
 /* Let multiple ready peers enter the fixed global window during one send
  * round. A lone peer retains its full pipeline by filling another batch on
  * each later tick. */
@@ -111,72 +106,6 @@ static void block_pipeline_clear_piece(struct p2p_node *node,
             break;
         }
     }
-}
-
-/* Caller holds g_block_swarm_mutex. A stale pipeline slot may refer to work
- * already reassigned elsewhere, so the ownership-checked requeue is required. */
-static void block_pipeline_expire_timeouts(struct block_swarm *swarm,
-                                           struct p2p_node *node,
-                                           int64_t now_monotonic)
-{
-    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
-        int32_t piece = node->blk_pipeline[pi].piece_index;
-        if (piece < 0 ||
-            now_monotonic - node->blk_pipeline[pi].request_time <=
-                BLOCK_PIECE_TIMEOUT_SECS)
-            continue;
-        (void)block_swarm_requeue_piece_for_peer(
-            swarm, (uint32_t)piece, node->id);
-        node->blk_pipeline[pi].piece_index = -1;
-    }
-}
-
-/* The end height of the manifest this peer advertised and we anchored, or
- * -1 when none arrived: the reach its piece requests must stay within. */
-static int32_t block_swarm_peer_manifest_end(const struct p2p_node *node)
-{
-    return node->blk_manifest_received ? node->blk_peer_height : -1;
-}
-
-static int32_t block_swarm_local_header_cap(const struct msg_processor *mp)
-{
-    int32_t cap = 0;
-    if (!mp || !mp->main_state)
-        return cap;
-
-    int active_h = active_chain_height(&mp->main_state->chain_active);
-    if (active_h > cap)
-        cap = active_h;
-
-    struct block_index *best_header = mp->main_state->pindex_best_header;
-    if (best_header && best_header->nHeight > cap)
-        cap = best_header->nHeight;
-
-    return cap;
-}
-
-static int32_t block_swarm_contiguous_window_cap(
-    struct block_swarm *bs,
-    int32_t header_cap)
-{
-    if (!bs || !bs->piece_states || bs->manifest.num_pieces == 0)
-        return header_cap;
-
-    uint32_t first_open = block_swarm_first_incomplete_piece(bs);
-    if (first_open >= bs->manifest.num_pieces)
-        return header_cap;
-
-    uint32_t window_cap = first_open + BLOCK_PIECE_CONTIGUOUS_WINDOW - 1;
-    if (window_cap >= bs->manifest.num_pieces)
-        window_cap = bs->manifest.num_pieces - 1;
-
-    int64_t piece_end = (int64_t)bs->manifest.start_height +
-        ((int64_t)window_cap + 1) * BLOCKS_PER_PIECE - 1;
-    if (piece_end > bs->manifest.end_height)
-        piece_end = bs->manifest.end_height;
-    if (piece_end < header_cap)
-        return (int32_t)piece_end;
-    return header_cap;
 }
 
 struct snapshot_sync_service *msg_snapshot_sync(
@@ -1812,7 +1741,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         int64_t now_bs = platform_time_monotonic_us() / 1000000;
         block_swarm_handle_timeouts(&g_block_swarm,
                                     BLOCK_PIECE_TIMEOUT_SECS);
-        block_pipeline_expire_timeouts(&g_block_swarm, node, now_bs);
+        (void)mp_block_swarm_reconcile_peer_pipeline(
+            &g_block_swarm, node, now_bs);
 
         /* Fill a bounded batch of empty slots. Limiting only NEW work per
          * tick prevents the first scheduled peer from consuming the entire
@@ -1824,13 +1754,14 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
             if (node->blk_pipeline[pi].piece_index >= 0)
                 continue; /* slot occupied */
 
-            int32_t header_cap = block_swarm_local_header_cap(mp);
+            int32_t header_cap = mp_block_swarm_local_header_cap(mp);
             int32_t assignment_cap =
-                block_swarm_contiguous_window_cap(&g_block_swarm, header_cap);
+                mp_block_swarm_contiguous_window_cap(
+                    &g_block_swarm, header_cap);
             int32_t pidx = block_swarm_assign_piece_for_peer(
                 &g_block_swarm, node->id, node->blk_bitmap,
                 node->blk_bitmap_len, assignment_cap,
-                block_swarm_peer_manifest_end(node));
+                mp_block_swarm_peer_manifest_end(node));
             if (pidx < 0)
                 break; /* no more pieces to assign */
 

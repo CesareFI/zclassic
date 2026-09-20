@@ -372,3 +372,7 @@ later lane flips it HARD.
 - 2026-09-20T12:03:57Z — REASON: Refactor block-swarm timeout cleanup to keep fairness scheduling complexity below its ratchet; no semantic change
   old ROOT: a90d743461a0b3c08d9883557be9d3f3375c5ec055f62d984677f03d0bc49897
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T16:36:13Z — REASON: Reclaim stale block-swarm peer pipeline slots after verified late delivery; request scheduling only, no consensus or validation semantics change
+  old ROOT: c2314e49c138d1eb24f5832f99b1e7f9580f525d89da859bab59a590a3c049c5
+  by: owner unseal ritual (make core-unseal)

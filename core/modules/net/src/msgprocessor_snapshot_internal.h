@@ -42,8 +42,9 @@
  *                                   adaptive-difficulty load window, and
  *                                   the deterministic-clock test surface
  *                                   over both.
- *   msgprocessor_block_swarm_abandon.c — the shared fail-closed transition
- *                                   from block swarm to legacy body fetch.
+ *   msgprocessor_block_swarm_abandon.c — block-swarm peer scheduling and the
+ *                                   shared fail-closed transition to legacy
+ *                                   body fetch.
  *
  * Everything declared here used to be `static` in msgprocessor_snapshot.c;
  * it is promoted to external linkage (single definition, still in
@@ -66,6 +67,8 @@ struct p2p_node;
 struct byte_stream;
 struct block_swarm;
 
+#define BLOCK_PIECE_TIMEOUT_SECS 8
+
 struct block_piece_payload_ref {
     const unsigned char *data;
     size_t len;
@@ -81,6 +84,16 @@ struct block_swarm_abandonment {
     uint32_t failed;
     int64_t last_complete_monotonic;
 };
+
+/* Caller holds the block-swarm mutex. Drop peer-local slots that no longer
+ * match authoritative ownership and requeue owned slots only after timeout. */
+size_t mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
+                                              struct p2p_node *node,
+                                              int64_t now_monotonic);
+int32_t mp_block_swarm_peer_manifest_end(const struct p2p_node *node);
+int32_t mp_block_swarm_local_header_cap(const struct msg_processor *mp);
+int32_t mp_block_swarm_contiguous_window_cap(struct block_swarm *swarm,
+                                             int32_t header_cap);
 
 /* Shared fail-closed transition for integrity and silent-stall abandonment.
  * Caller owns the block-swarm mutex; finish/report run after it is released
