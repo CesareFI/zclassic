@@ -196,6 +196,12 @@ static int64_t g_block_swarm_last_progress = 0;
  * transfer back out of legacy getdata's hands every few seconds. */
 static _Atomic int64_t g_block_swarm_reaped_monotonic = 0;
 
+static int64_t block_swarm_monotonic_seconds(void)
+{
+    int64_t now = platform_time_monotonic_us() / 1000000;
+    return now > 0 ? now : 1;
+}
+
 static bool block_swarm_restart_ready_at(int64_t now_monotonic,
                                          int64_t reaped_monotonic)
 {
@@ -205,6 +211,16 @@ static bool block_swarm_restart_ready_at(int64_t now_monotonic,
         return false;
     return now_monotonic - reaped_monotonic >=
            BLOCK_SWARM_RESTART_COOLDOWN_SECS;
+}
+
+static bool block_swarm_stall_elapsed_at(int64_t now_monotonic,
+                                         int64_t last_complete_monotonic)
+{
+    if (last_complete_monotonic <= 0 ||
+        now_monotonic < last_complete_monotonic)
+        return false;
+    return now_monotonic - last_complete_monotonic >=
+           BLOCK_SWARM_STALL_SECS;
 }
 
 /* The fc_rate_* per-peer FlyClient-challenge rate limiter (table, mutex,
@@ -389,15 +405,15 @@ bool mp_block_swarm_reap_if_stalled(struct msg_processor *mp)
     if (!atomic_load(&g_block_swarm_active))
         return false;
 
-    int64_t now = (int64_t)platform_time_wall_time_t();
+    int64_t now = block_swarm_monotonic_seconds();
     struct block_swarm_abandonment abandoned = {0};
     pthread_mutex_lock(&g_block_swarm_mutex);
     struct block_swarm *bs = &g_block_swarm;
     bool stalled = bs->piece_states &&
                    bs->manifest.num_pieces > 0 &&
                    bs->pieces_complete < bs->manifest.num_pieces &&
-                   bs->last_complete_unix > 0 &&
-                   now - bs->last_complete_unix >= BLOCK_SWARM_STALL_SECS;
+                   block_swarm_stall_elapsed_at(
+                       now, bs->last_complete_monotonic);
     if (stalled) {
         stalled = mp_block_swarm_abandon_locked(
             &g_block_swarm, &g_block_swarm_active,
@@ -414,11 +430,11 @@ bool mp_block_swarm_reap_if_stalled(struct msg_processor *mp)
              "block swarm stalled at %u/%u pieces (no completion for %llds) "
              "— abandoning swarm; legacy getdata resumes body fetch",
              abandoned.complete, abandoned.total,
-             (long long)(now - abandoned.last_complete_unix));
+             (long long)(now - abandoned.last_complete_monotonic));
     event_emitf(EV_BLOCK_REQUESTED, 0,
                 "block_swarm_stall_abandon complete=%u total=%u stall_s=%lld",
                 abandoned.complete, abandoned.total,
-                (long long)(now - abandoned.last_complete_unix));
+                (long long)(now - abandoned.last_complete_monotonic));
     return true;
 }
 
@@ -426,7 +442,7 @@ bool mp_block_swarm_reap_if_stalled(struct msg_processor *mp)
 /* Seed a minimal live swarm at a chosen completion age so stall-reap tests
  * need no wire dance. complete==0/total==0 tears the swarm down instead. */
 void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
-                                    int64_t last_complete_unix)
+                                    int64_t last_complete_monotonic)
 {
     pthread_mutex_lock(&g_block_swarm_mutex);
     block_swarm_free(&g_block_swarm);
@@ -440,7 +456,7 @@ void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
         pm.num_pieces = total;
         if (block_swarm_init(&g_block_swarm, &pm, NULL)) {
             g_block_swarm.pieces_complete = complete;
-            g_block_swarm.last_complete_unix = last_complete_unix;
+            g_block_swarm.last_complete_monotonic = last_complete_monotonic;
             atomic_store(&g_block_swarm_active, true);
         }
     }
@@ -456,6 +472,13 @@ bool mp_block_swarm_test_restart_ready_at(int64_t now_monotonic,
                                           int64_t reaped_monotonic)
 {
     return block_swarm_restart_ready_at(now_monotonic, reaped_monotonic);
+}
+
+bool mp_block_swarm_test_stall_elapsed_at(int64_t now_monotonic,
+                                          int64_t last_complete_monotonic)
+{
+    return block_swarm_stall_elapsed_at(now_monotonic,
+                                        last_complete_monotonic);
 }
 
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
@@ -1392,8 +1415,8 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                     memcpy(pm.merkle_root, merkle_root, 32);
                     pthread_mutex_lock(&g_block_swarm_mutex);
                     if (block_swarm_init(&g_block_swarm, &pm, mp->datadir)) {
-                        g_block_swarm.last_complete_unix =
-                            (int64_t)platform_time_wall_time_t();
+                        g_block_swarm.last_complete_monotonic =
+                            block_swarm_monotonic_seconds();
                         mp_block_swarm_mark_complete_through_height(
                             &g_block_swarm, our_h);
                         g_block_swarm_active = true;
@@ -1524,8 +1547,8 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                         } else {
                             block_swarm_receive_piece(&g_block_swarm,
                                                       piece_index, node->id);
-                            g_block_swarm.last_complete_unix =
-                                (int64_t)platform_time_wall_time_t();
+                            g_block_swarm.last_complete_monotonic =
+                                block_swarm_monotonic_seconds();
                             block_pipeline_clear_piece(node, piece_index);
 
                             if (block_swarm_is_complete(&g_block_swarm)) {

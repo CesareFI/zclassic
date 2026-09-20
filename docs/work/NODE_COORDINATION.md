@@ -61,6 +61,29 @@ defensive monotonic reversal, reset, and repeated abandonment cycles. The
 block-swarm loopback remained green, moving 2,560 blocks at approximately
 32,017 blocks/s and 47.3 MiB/s in the measured focused run.
 
-Remaining timing risk: the separate silent-stall age and progress-report
-cadence still use wall time and should be audited independently; neither is
-part of restart-cooldown authority after this change.
+The silent-stall age was subsequently corrected as described below. The
+progress-report cadence remains diagnostic wall-time state and does not own
+requests or control swarm abandonment/restart.
+
+## Block-swarm silent-stall clock
+
+The 90-second silent-stall watchdog stored piece-completion wall time. A
+backward clock correction could therefore leave block-piece ownership active
+and legacy download paused too long; a forward jump could abandon a healthy
+swarm early.
+
+Piece-completion stamps and the watchdog comparison now use process-local
+monotonic seconds. Zero remains the explicit uninitialized value, reversed
+samples fail closed before subtraction, each verified completion starts a
+fresh interval, and no cooldown state is persisted across restart. Deterministic
+coverage pins the 89/90-second boundary, backward and forward wall-clock
+steps, repeated completion cycles, zero state, and ownership before and after
+abandonment. The focused loopback passed with immediate disconnect requeue of
+40 pieces and transferred 2,560 blocks (3,962,880 bytes) at 31,009 blocks/s
+and 45.8 MiB/s.
+
+Consensus impact: none. Block/header/message validation, serialization,
+cryptography, PoW, activation, and monetary rules are untouched. Next inspect
+per-peer request ages and timeout/reassignment behavior before changing any
+timeout constant; diagnostic progress-report wall time remains a separate,
+non-authoritative cleanup candidate.

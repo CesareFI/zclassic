@@ -729,10 +729,12 @@ static int test_block_swarm_disconnect_requeue(void)
  * abandon a completion-silent swarm (and stay off a healthy or finished one). */
 bool mp_block_swarm_reap_if_stalled(struct msg_processor *mp);
 void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
-                                    int64_t last_complete_unix);
+                                    int64_t last_complete_monotonic);
 int64_t mp_block_swarm_test_reaped_monotonic(void);
 bool mp_block_swarm_test_restart_ready_at(int64_t now_monotonic,
                                           int64_t reaped_monotonic);
+bool mp_block_swarm_test_stall_elapsed_at(
+    int64_t now_monotonic, int64_t last_complete_monotonic);
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
                                         uint32_t piece_index);
 
@@ -773,13 +775,49 @@ static int test_block_swarm_restart_cooldown(void)
     return failures;
 }
 
+static int test_block_swarm_stall_clock(void)
+{
+    int failures = 0;
+
+    TEST("block swarm stall watchdog uses monotonic elapsed time across "
+         "clock jumps and repeated completion cycles") {
+        const int64_t completed = 1000;
+        int64_t wall = 5000;
+
+        ASSERT(!mp_block_swarm_test_stall_elapsed_at(1000, 0));
+        ASSERT(!mp_block_swarm_test_stall_elapsed_at(1089, completed));
+        ASSERT(mp_block_swarm_test_stall_elapsed_at(1090, completed));
+
+        /* Civil-clock changes are deliberately absent from the decision. */
+        wall -= 100000;
+        ASSERT(wall < 0);
+        ASSERT(!mp_block_swarm_test_stall_elapsed_at(1089, completed));
+        wall += INT64_C(1000000000);
+        ASSERT(wall > 0);
+        ASSERT(mp_block_swarm_test_stall_elapsed_at(1090, completed));
+
+        /* A defensive monotonic anomaly fails closed without subtraction. */
+        ASSERT(!mp_block_swarm_test_stall_elapsed_at(999, completed));
+        ASSERT(!mp_block_swarm_test_stall_elapsed_at(INT64_MAX, -1));
+
+        /* A later completion starts a fresh full stall interval. */
+        ASSERT(mp_block_swarm_test_stall_elapsed_at(1090, completed));
+        ASSERT(!mp_block_swarm_test_stall_elapsed_at(1090, 1090));
+        ASSERT(!mp_block_swarm_test_stall_elapsed_at(1179, 1090));
+        ASSERT(mp_block_swarm_test_stall_elapsed_at(1180, 1090));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_block_swarm_stall_reap(void)
 {
     int failures = 0;
 
     TEST("block swarm stall watchdog: completion-silent swarm is abandoned, "
          "healthy and finished swarms are left alone") {
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
 
         /* Healthy swarm (recent completion) → no reap. */
         mp_block_swarm_test_seed_stall(5, 10, now);
@@ -819,7 +857,7 @@ static int test_block_swarm_integrity_abandon(void)
 
     TEST("block swarm integrity mismatch abandons immediately, clears peer "
          "pipelines, and preserves the silent-stall watchdog separately") {
-        int64_t now = (int64_t)platform_time_wall_time_t();
+        int64_t now = platform_time_monotonic_us() / 1000000;
         struct net_manager nm;
         struct msg_processor mp;
         struct p2p_node peer;
@@ -1269,6 +1307,7 @@ int test_block_swarm_loopback(void)
     failures += test_block_swarm_throughput();
     failures += test_block_swarm_disconnect_requeue();
     failures += test_block_swarm_restart_cooldown();
+    failures += test_block_swarm_stall_clock();
     failures += test_block_swarm_stall_reap();
     failures += test_block_swarm_integrity_abandon();
     failures += test_block_swarm_duplicate_delivery();

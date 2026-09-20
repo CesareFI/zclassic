@@ -430,9 +430,9 @@ struct block_swarm {
     uint32_t pieces_failed;
     uint32_t next_assign_hint;       /* lowest possibly assignable piece */
     uint32_t first_incomplete_hint;  /* lowest possibly incomplete piece */
-    int64_t  last_complete_unix;        /* last piece-completion stamp; the
-                                         * stall watchdog (msgprocessor_snapshot.c)
-                                         * abandons the swarm when this goes quiet */
+    int64_t  last_complete_monotonic;   /* monotonic seconds at last piece
+                                         * completion; the stall watchdog
+                                         * abandons the swarm when this is quiet */
     bool endgame;                       /* true when < ENDGAME_THRESHOLD remain */
     const char *datadir;
 };

@@ -79,7 +79,7 @@ struct block_swarm_abandonment {
     uint32_t complete;
     uint32_t total;
     uint32_t failed;
-    int64_t last_complete_unix;
+    int64_t last_complete_monotonic;
 };
 
 /* Shared fail-closed transition for integrity and silent-stall abandonment.

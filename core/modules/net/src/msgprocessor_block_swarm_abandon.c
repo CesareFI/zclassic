@@ -41,7 +41,10 @@ void mp_block_swarm_mark_complete_through_height(
     if (swarm->first_incomplete_hint < full_pieces)
         swarm->first_incomplete_hint = full_pieces;
     if (full_pieces > 0)
-        swarm->last_complete_unix = (int64_t)platform_time_wall_time_t();
+        swarm->last_complete_monotonic =
+            platform_time_monotonic_us() / 1000000;
+    if (full_pieces > 0 && swarm->last_complete_monotonic <= 0)
+        swarm->last_complete_monotonic = 1;
 }
 
 bool mp_block_swarm_abandon_locked(
@@ -57,7 +60,7 @@ bool mp_block_swarm_abandon_locked(
         out->complete = swarm->pieces_complete;
         out->total = swarm->manifest.num_pieces;
         out->failed = swarm->pieces_failed;
-        out->last_complete_unix = swarm->last_complete_unix;
+        out->last_complete_monotonic = swarm->last_complete_monotonic;
     }
     block_swarm_free(swarm);
     atomic_store(active, false);
