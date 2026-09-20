@@ -14,14 +14,15 @@
 
 #define BLOCK_PIECE_CONTIGUOUS_WINDOW PIECE_PIPELINE_DEPTH
 
-size_t mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
-                                              struct p2p_node *node,
-                                              int64_t now_monotonic)
+struct block_swarm_pipeline_reconcile
+mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
+                                       struct p2p_node *node,
+                                       int64_t now_monotonic)
 {
+    struct block_swarm_pipeline_reconcile result = {0};
     if (!swarm || !node || !swarm->piece_states || !swarm->piece_peer)
-        return 0;
+        return result;
 
-    size_t cleared = 0;
     for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
         int32_t piece = node->blk_pipeline[pi].piece_index;
         if (piece < 0)
@@ -36,13 +37,15 @@ size_t mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
                  BLOCK_PIECE_TIMEOUT_SECS))
             continue;
 
-        if (owns_piece)
+        if (owns_piece) {
             (void)block_swarm_requeue_piece_for_peer(
                 swarm, (uint32_t)piece, node->id);
+            result.timed_out = true;
+        }
         node->blk_pipeline[pi].piece_index = -1;
-        cleared++;
+        result.cleared++;
     }
-    return cleared;
+    return result;
 }
 
 int32_t mp_block_swarm_peer_manifest_end(const struct p2p_node *node)

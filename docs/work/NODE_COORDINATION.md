@@ -164,3 +164,39 @@ observers, interruption gates, and telemetry overhead. It does not modify the
 block-swarm scheduler surface in this slice. Recommended next investigation:
 measure block-piece useful delivery, late delivery, and timeout outcomes by peer
 before changing ranking or timeout policy.
+
+## Block-swarm timeout-owner yield
+
+The production send-tick ordering let the peer whose piece had just exceeded
+the eight-second deadline reclaim that same piece immediately: the global
+timeout sweep requeued it, peer-local reconciliation emptied the slot, and the
+following fill loop assigned the first available piece back to the same peer.
+A deterministic baseline reproduced peer A receiving piece 0 again before
+healthy peer B could run.
+
+Peer-local reconciliation now runs before the global sweep and reports whether
+it expired work still owned by that peer. Such a peer receives no new pieces for
+that send tick; the global sweep still releases other expired work, and the next
+healthy peer can claim piece 0 immediately. This is a one-tick scheduling yield,
+not a ban, score, disconnect, or timeout change. Stale slots caused by completed
+or independently reassigned work remain immediately reclaimable without
+triggering the yield.
+
+After measurement: the deterministic sequence changed from A immediately
+reclaiming piece 0 to A receiving no assignment and B receiving piece 0. The
+real-wire loopback remained at 31,041 blocks/s (45.8 MB/s) for 2,560 blocks;
+ASan/UBSan moved the same fixture at 9,146 blocks/s (13.5 MB/s) with no finding.
+The broader UTXO/fast-sync group, core seal/root mirror, consensus parity,
+generated capability inventory, complexity, and whitespace gates passed.
+
+Consensus impact: none. The existing manifest hash, payload parsing, reducer,
+block validation, transaction validation, PoW, and chain-selection paths are
+unchanged. Remaining risk: a timed-out peer may receive unrelated work on a
+later network-loop pass after healthy peers have had their turn; persistent or
+adaptive deprioritization still requires per-peer delivery evidence.
+
+Worldstream interaction: the latest Worldstream branch remains confined to
+fresh-sync observers, startup interruption, and telemetry overhead, with no
+block-swarm scheduler overlap. Recommended next investigation: add bounded
+per-peer block-piece outcome counters and use measured useful/late/timeout
+ratios before considering longer-lived scheduling weights.

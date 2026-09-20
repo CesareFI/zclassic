@@ -737,9 +737,14 @@ bool mp_block_swarm_test_stall_elapsed_at(
     int64_t now_monotonic, int64_t last_complete_monotonic);
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
                                         uint32_t piece_index);
-size_t mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
-                                              struct p2p_node *node,
-                                              int64_t now_monotonic);
+struct block_swarm_pipeline_reconcile {
+    size_t cleared;
+    bool timed_out;
+};
+struct block_swarm_pipeline_reconcile
+mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
+                                       struct p2p_node *node,
+                                       int64_t now_monotonic);
 
 static int test_block_swarm_peer_fairness(void)
 {
@@ -859,11 +864,65 @@ static int test_block_swarm_stale_pipeline_reclaim(void)
          * after ownership moved to this peer. The peer-local slot is now
          * stale even though its own eight-second timer has not elapsed. */
         ASSERT(block_swarm_receive_piece(&swarm, (uint32_t)piece, 11));
-        ASSERT(mp_block_swarm_reconcile_peer_pipeline(
-                   &swarm, &peer, requested_at) == 1);
+        struct block_swarm_pipeline_reconcile reconciled =
+            mp_block_swarm_reconcile_peer_pipeline(
+                &swarm, &peer, requested_at);
+        ASSERT(reconciled.cleared == 1);
+        ASSERT(!reconciled.timed_out);
         ASSERT(peer.blk_pipeline[0].piece_index == -1);
         ASSERT(swarm.pieces_complete == 1);
         ASSERT(swarm.pieces_inflight == 0);
+
+        block_swarm_free(&swarm);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_block_swarm_timeout_owner_yields(void)
+{
+    int failures = 0;
+
+    TEST("block swarm timeout owner yields reassignment to a healthy peer") {
+        struct block_piece_manifest manifest;
+        struct block_swarm swarm;
+        struct p2p_node slow;
+        uint8_t piece_hashes[1][32] = {{0}};
+        const int64_t requested_at = 1000;
+        const int timeout_secs = 8;
+
+        memset(&manifest, 0, sizeof(manifest));
+        memset(&swarm, 0, sizeof(swarm));
+        memset(&slow, 0, sizeof(slow));
+        manifest.start_height = 1;
+        manifest.end_height = BLOCKS_PER_PIECE;
+        manifest.num_pieces = 1;
+        manifest.piece_hashes = piece_hashes;
+        ASSERT(block_swarm_init(&swarm, &manifest, NULL));
+
+        slow.id = 11;
+        for (int i = 0; i < PIECE_PIPELINE_DEPTH; i++)
+            slow.blk_pipeline[i].piece_index = -1;
+        ASSERT(block_swarm_assign_piece(&swarm, slow.id, NULL, 0) == 0);
+        slow.blk_pipeline[0].piece_index = 0;
+        slow.blk_pipeline[0].request_time = requested_at;
+        swarm.piece_request_time[0] = requested_at;
+
+        /* This is the production ordering before filling the same peer's
+         * newly-empty slots. The timeout owner must not take the piece again
+         * in this tick; otherwise a consistently slow first peer can starve
+         * the healthy peer that follows it in the send loop. */
+        struct block_swarm_pipeline_reconcile reconciled =
+            mp_block_swarm_reconcile_peer_pipeline(
+                &swarm, &slow, requested_at + timeout_secs + 1);
+        ASSERT(reconciled.cleared == 1);
+        ASSERT(reconciled.timed_out);
+        block_swarm_handle_timeouts(&swarm, timeout_secs);
+        int32_t slow_retry = reconciled.timed_out ? -1 :
+            block_swarm_assign_piece(&swarm, slow.id, NULL, 0);
+        ASSERT(slow_retry < 0);
+        ASSERT(block_swarm_assign_piece(&swarm, 22, NULL, 0) == 0);
 
         block_swarm_free(&swarm);
         PASS();
@@ -1442,6 +1501,7 @@ int test_block_swarm_loopback(void)
     failures += test_block_swarm_disconnect_requeue();
     failures += test_block_swarm_peer_fairness();
     failures += test_block_swarm_stale_pipeline_reclaim();
+    failures += test_block_swarm_timeout_owner_yields();
     failures += test_block_swarm_restart_cooldown();
     failures += test_block_swarm_stall_clock();
     failures += test_block_swarm_stall_reap();

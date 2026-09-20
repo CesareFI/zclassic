@@ -376,3 +376,7 @@ later lane flips it HARD.
 - 2026-09-20T16:36:13Z — REASON: Reclaim stale block-swarm peer pipeline slots after verified late delivery; request scheduling only, no consensus or validation semantics change
   old ROOT: c2314e49c138d1eb24f5832f99b1e7f9580f525d89da859bab59a590a3c049c5
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T22:03:51Z — REASON: Prevent a timed-out block-swarm peer from immediately reclaiming its own expired work; request scheduling only, no consensus or validation semantic change
+  old ROOT: 80d63e0d727d661a13b88f10ece4c2d70eb973cded0e7067730bdbbfc0820397
+  by: owner unseal ritual (make core-unseal)

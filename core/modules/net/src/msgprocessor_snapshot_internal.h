@@ -85,11 +85,17 @@ struct block_swarm_abandonment {
     int64_t last_complete_monotonic;
 };
 
+struct block_swarm_pipeline_reconcile {
+    size_t cleared;
+    bool timed_out;
+};
+
 /* Caller holds the block-swarm mutex. Drop peer-local slots that no longer
  * match authoritative ownership and requeue owned slots only after timeout. */
-size_t mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
-                                              struct p2p_node *node,
-                                              int64_t now_monotonic);
+struct block_swarm_pipeline_reconcile
+mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
+                                       struct p2p_node *node,
+                                       int64_t now_monotonic);
 int32_t mp_block_swarm_peer_manifest_end(const struct p2p_node *node);
 int32_t mp_block_swarm_local_header_cap(const struct msg_processor *mp);
 int32_t mp_block_swarm_contiguous_window_cap(struct block_swarm *swarm,

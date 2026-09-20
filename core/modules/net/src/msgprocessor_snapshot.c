@@ -95,6 +95,11 @@ static int64_t g_swarm_last_progress_time = 0;
  * each later tick. */
 #define BLOCK_PIECE_ASSIGN_BATCH (PIECE_PIPELINE_DEPTH / 4)
 
+static int block_swarm_assignment_batch(bool peer_timed_out)
+{
+    return peer_timed_out ? 0 : BLOCK_PIECE_ASSIGN_BATCH;
+}
+
 static void block_pipeline_clear_piece(struct p2p_node *node,
                                        uint32_t piece_index)
 {
@@ -1739,17 +1744,20 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
 
         /* Handle timeouts on this peer's pipeline */
         int64_t now_bs = platform_time_monotonic_us() / 1000000;
+        struct block_swarm_pipeline_reconcile reconciled =
+            mp_block_swarm_reconcile_peer_pipeline(
+                &g_block_swarm, node, now_bs);
         block_swarm_handle_timeouts(&g_block_swarm,
                                     BLOCK_PIECE_TIMEOUT_SECS);
-        (void)mp_block_swarm_reconcile_peer_pipeline(
-            &g_block_swarm, node, now_bs);
 
         /* Fill a bounded batch of empty slots. Limiting only NEW work per
          * tick prevents the first scheduled peer from consuming the entire
          * global window while preserving its full steady-state pipeline. */
         int assigned_this_tick = 0;
+        int assignment_batch =
+            block_swarm_assignment_batch(reconciled.timed_out);
         for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
-            if (assigned_this_tick >= BLOCK_PIECE_ASSIGN_BATCH)
+            if (assigned_this_tick >= assignment_batch)
                 break;
             if (node->blk_pipeline[pi].piece_index >= 0)
                 continue; /* slot occupied */
