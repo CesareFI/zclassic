@@ -95,6 +95,10 @@ static int64_t g_swarm_last_progress_time = 0;
  * ahead window. Every piece remains manifest-hash checked before any block
  * reaches the reducer. */
 #define BLOCK_PIECE_CONTIGUOUS_WINDOW PIECE_PIPELINE_DEPTH
+/* Let multiple ready peers enter the fixed global window during one send
+ * round. A lone peer retains its full pipeline by filling another batch on
+ * each later tick. */
+#define BLOCK_PIECE_ASSIGN_BATCH (PIECE_PIPELINE_DEPTH / 4)
 
 static void block_pipeline_clear_piece(struct p2p_node *node,
                                        uint32_t piece_index)
@@ -106,6 +110,24 @@ static void block_pipeline_clear_piece(struct p2p_node *node,
             node->blk_pipeline[pi].piece_index = -1;
             break;
         }
+    }
+}
+
+/* Caller holds g_block_swarm_mutex. A stale pipeline slot may refer to work
+ * already reassigned elsewhere, so the ownership-checked requeue is required. */
+static void block_pipeline_expire_timeouts(struct block_swarm *swarm,
+                                           struct p2p_node *node,
+                                           int64_t now_monotonic)
+{
+    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+        int32_t piece = node->blk_pipeline[pi].piece_index;
+        if (piece < 0 ||
+            now_monotonic - node->blk_pipeline[pi].request_time <=
+                BLOCK_PIECE_TIMEOUT_SECS)
+            continue;
+        (void)block_swarm_requeue_piece_for_peer(
+            swarm, (uint32_t)piece, node->id);
+        node->blk_pipeline[pi].piece_index = -1;
     }
 }
 
@@ -1790,19 +1812,15 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         int64_t now_bs = platform_time_monotonic_us() / 1000000;
         block_swarm_handle_timeouts(&g_block_swarm,
                                     BLOCK_PIECE_TIMEOUT_SECS);
-        for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
-            int32_t pidx = node->blk_pipeline[pi].piece_index;
-            if (pidx >= 0 &&
-                now_bs - node->blk_pipeline[pi].request_time >
-                    BLOCK_PIECE_TIMEOUT_SECS) {
-                (void)block_swarm_requeue_piece_for_peer(
-                    &g_block_swarm, (uint32_t)pidx, node->id);
-                node->blk_pipeline[pi].piece_index = -1;
-            }
-        }
+        block_pipeline_expire_timeouts(&g_block_swarm, node, now_bs);
 
-        /* Fill empty pipeline slots with new piece assignments */
+        /* Fill a bounded batch of empty slots. Limiting only NEW work per
+         * tick prevents the first scheduled peer from consuming the entire
+         * global window while preserving its full steady-state pipeline. */
+        int assigned_this_tick = 0;
         for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+            if (assigned_this_tick >= BLOCK_PIECE_ASSIGN_BATCH)
+                break;
             if (node->blk_pipeline[pi].piece_index >= 0)
                 continue; /* slot occupied */
 
@@ -1818,6 +1836,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
 
             node->blk_pipeline[pi].piece_index = pidx;
             node->blk_pipeline[pi].request_time = now_bs;
+            assigned_this_tick++;
 
             pthread_mutex_unlock(&g_block_swarm_mutex);
             push_block_piece_request(mp, node, (uint32_t)pidx);

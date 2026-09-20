@@ -738,6 +738,89 @@ bool mp_block_swarm_test_stall_elapsed_at(
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
                                         uint32_t piece_index);
 
+static int test_block_swarm_peer_fairness(void)
+{
+    int failures = 0;
+
+    TEST("block swarm send ticks share new work without reducing one-peer "
+         "pipeline capacity") {
+        const uint32_t pieces = PIECE_PIPELINE_DEPTH + 64;
+        const int32_t end_height = (int32_t)pieces * BLOCKS_PER_PIECE;
+        struct main_state ms;
+        struct net_manager nm;
+        struct msg_processor mp;
+
+        main_state_init(&ms);
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.main_state = &ms;
+        mp.net_mgr = &nm;
+        mp.params = chain_params_get();
+
+        struct uint256 header_hash;
+        memset(&header_hash, 0x5a, sizeof(header_hash));
+        struct block_index *best_header =
+            chainstate_insert_block_index((struct chainstate *)&ms,
+                                          &header_hash);
+        ASSERT(best_header != NULL);
+        best_header->nHeight = end_height;
+        best_header->nStatus = BLOCK_VALID_TREE;
+        ms.pindex_best_header = best_header;
+
+        struct p2p_node *first = bs_make_peer(&nm, 21);
+        struct p2p_node *second = bs_make_peer(&nm, 22);
+        ASSERT(first && second);
+        first->id = 21;
+        second->id = 22;
+        first->blk_manifest_received = true;
+        first->blk_peer_height = end_height;
+        second->blk_manifest_received = true;
+        second->blk_peer_height = end_height;
+        struct send_segment *sent_first = bs_install_sentinel(first);
+        struct send_segment *sent_second = bs_install_sentinel(second);
+
+        mp_block_swarm_test_seed_stall(0, pieces, 1);
+        ASSERT(mp_block_swarm_is_active());
+        mp_snapshot_send_tick(&mp, first);
+        mp_snapshot_send_tick(&mp, second);
+        size_t first_work = bs_queue_depth(sent_first);
+        size_t second_work = bs_queue_depth(sent_second);
+        printf("(first=%zu second=%zu window=%d) ", first_work,
+               second_work, PIECE_PIPELINE_DEPTH);
+        ASSERT(first_work == PIECE_PIPELINE_DEPTH / 4);
+        ASSERT(second_work == PIECE_PIPELINE_DEPTH / 4);
+        for (int a = 0; a < PIECE_PIPELINE_DEPTH; a++) {
+            if (first->blk_pipeline[a].piece_index < 0)
+                continue;
+            for (int b = 0; b < PIECE_PIPELINE_DEPTH; b++)
+                ASSERT(first->blk_pipeline[a].piece_index !=
+                       second->blk_pipeline[b].piece_index);
+        }
+
+        /* With no competing owner, later ticks fill the original capacity. */
+        mp_block_swarm_test_seed_stall(0, pieces, 1);
+        bs_drop_queue(first, sent_first);
+        for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++)
+            first->blk_pipeline[pi].piece_index = -1;
+        for (int tick = 0; tick < 4; tick++)
+            mp_snapshot_send_tick(&mp, first);
+        ASSERT(bs_queue_depth(sent_first) == PIECE_PIPELINE_DEPTH);
+
+        mp_block_swarm_test_seed_stall(0, 0, 0);
+        send_segment_free(sent_first);
+        send_segment_free(sent_second);
+        first->send_head = first->send_tail = NULL;
+        second->send_head = second->send_tail = NULL;
+        p2p_node_free(first);
+        p2p_node_free(second);
+        net_manager_free(&nm);
+        main_state_free(&ms);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_block_swarm_restart_cooldown(void)
 {
     int failures = 0;
@@ -1306,6 +1389,7 @@ int test_block_swarm_loopback(void)
     boot_snapshot_offer_test_set_trust_override(1);
     failures += test_block_swarm_throughput();
     failures += test_block_swarm_disconnect_requeue();
+    failures += test_block_swarm_peer_fairness();
     failures += test_block_swarm_restart_cooldown();
     failures += test_block_swarm_stall_clock();
     failures += test_block_swarm_stall_reap();

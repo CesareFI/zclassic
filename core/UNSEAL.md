@@ -364,3 +364,11 @@ later lane flips it HARD.
 - 2026-09-20T10:21:30Z — REASON: Prevent stale block-swarm pipeline owners from requeueing reassigned work; scheduling only, no consensus or validation change
   old ROOT: 6a1393d9f20a11657fdb77482655cb0df8e579512d275ec2d34b4925c7514be8
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T12:00:54Z — REASON: Bound new block-swarm assignments per send tick for multi-peer fairness; scheduling only, no consensus or validation change
+  old ROOT: 7fc95bf918b162332253e1707dd4acc6f41b48d4c8fcab7732588ba45a8e26e2
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T12:03:57Z — REASON: Refactor block-swarm timeout cleanup to keep fairness scheduling complexity below its ratchet; no semantic change
+  old ROOT: a90d743461a0b3c08d9883557be9d3f3375c5ec055f62d984677f03d0bc49897
+  by: owner unseal ritual (make core-unseal)

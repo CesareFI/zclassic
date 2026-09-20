@@ -105,3 +105,23 @@ of 40 disconnected-peer pieces and moved 2,560 blocks (3,962,880 bytes) at
 Consensus impact: none; only request ownership bookkeeping changed. Next
 measure timeout/reassignment counts and useful delivery per peer before
 considering adaptive scheduling or any timeout change.
+
+## Block-swarm first-peer fairness
+
+The global contiguous-work window and each peer pipeline were both 256 pieces,
+so the first peer receiving a send tick could claim the entire window. A
+production-path regression measured the resulting split as 256/0 across two
+ready peers with 320 pieces available.
+
+New assignments are now limited to 64 per peer per send tick. Existing
+in-flight work remains untouched, the global window and per-peer pipeline stay
+at 256, and a lone peer reaches all 256 slots over four ticks. The regression
+measures a 64/64 first-round split, proves the peers' piece sets are disjoint,
+and proves the single-peer steady-state capacity remains 256. Disconnect
+requeue still reclaimed all 40 outstanding pieces immediately. The real-wire
+loopback moved 2,560 blocks (3,962,880 bytes) at 31,486 blocks/s and 46.5 MiB/s.
+
+Consensus impact: none. This changes only the rate at which already-eligible
+requests are assigned to peers; every response retains the existing manifest,
+block, and consensus validation. Next measure whether the full-manifest timeout
+sweep costs meaningful CPU per peer tick before changing its data structure.
