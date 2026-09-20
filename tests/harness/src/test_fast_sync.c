@@ -614,6 +614,64 @@ static int test_swarm_timeout_reassign(void)
     return failures;
 }
 
+static int test_swarm_timeout_monotonic_boundaries(void)
+{
+    int failures = 0;
+    TEST("swarm timeout arithmetic is bounded across clock anomalies") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 1;
+        manifest.chunk_size = 500;
+        manifest.chunk_hashes = zcl_calloc(1, 32, "test_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+
+        struct swarm_sync ss;
+        ASSERT(swarm_sync_init(&ss, &manifest, NULL));
+        ASSERT(swarm_sync_assign_chunk(&ss, 1) == 0);
+
+        ss.chunk_request_time[0] = INT64_MAX;
+        swarm_sync_handle_timeouts_at(&ss, 30, INT64_MIN);
+        ASSERT(ss.chunk_states[0] == CHUNK_INFLIGHT);
+        ASSERT(ss.chunks_inflight == 1);
+
+        ss.chunk_request_time[0] = INT64_MIN;
+        swarm_sync_handle_timeouts_at(&ss, 30, INT64_MAX);
+        ASSERT(ss.chunk_states[0] == CHUNK_NEEDED);
+        ASSERT(ss.chunks_inflight == 0);
+
+        swarm_sync_free(&ss);
+        free(manifest.chunk_hashes);
+
+        struct block_piece_manifest block_manifest;
+        memset(&block_manifest, 0, sizeof(block_manifest));
+        block_manifest.start_height = 1;
+        block_manifest.end_height = BLOCKS_PER_PIECE;
+        block_manifest.num_pieces = 1;
+        block_manifest.piece_hashes =
+            zcl_calloc(1, 32, "test_piece_hashes");
+        ASSERT(block_manifest.piece_hashes != NULL);
+
+        struct block_swarm bs;
+        ASSERT(block_swarm_init(&bs, &block_manifest, NULL));
+        ASSERT(block_swarm_assign_piece(&bs, 1, NULL, 0) == 0);
+
+        bs.piece_request_time[0] = INT64_MAX;
+        block_swarm_handle_timeouts_at(&bs, 30, INT64_MIN);
+        ASSERT(bs.piece_states[0] == CHUNK_INFLIGHT);
+        ASSERT(bs.pieces_inflight == 1);
+
+        bs.piece_request_time[0] = INT64_MIN;
+        block_swarm_handle_timeouts_at(&bs, 30, INT64_MAX);
+        ASSERT(bs.piece_states[0] == CHUNK_NEEDED);
+        ASSERT(bs.pieces_inflight == 0);
+
+        block_swarm_free(&bs);
+        free(block_manifest.piece_hashes);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* ── Block swarm tests ───────────────────────────────────── */
 
 static int test_block_swarm_rarest_first(void)
@@ -1833,6 +1891,7 @@ int test_fast_sync(void)
     /* Swarm coordinator */
     failures += test_swarm_init_assign();
     failures += test_swarm_timeout_reassign();
+    failures += test_swarm_timeout_monotonic_boundaries();
 
     /* Block swarm */
     failures += test_block_swarm_rarest_first();

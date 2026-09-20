@@ -200,3 +200,36 @@ fresh-sync observers, startup interruption, and telemetry overhead, with no
 block-swarm scheduler overlap. Recommended next investigation: add bounded
 per-peer block-piece outcome counters and use measured useful/late/timeout
 ratios before considering longer-lived scheduling weights.
+
+## Overflow-safe swarm timeout accounting
+
+Both snapshot-chunk and block-piece timeout sweeps subtracted signed monotonic
+timestamps before comparing the result with their timeout. A future request
+stamp could spuriously expire after a clock anomaly, while the full
+`INT64_MIN` to `INT64_MAX` span invoked signed-overflow undefined behavior.
+The legacy block downloader had already hardened the same boundary, but the
+two fast-sync owners had not.
+
+A shared elapsed predicate now rejects future timestamps and computes an
+ordered elapsed distance in unsigned arithmetic. Production wrappers still
+sample the same monotonic clock and retain the exact `age > timeout` threshold;
+deterministic at-time entry points make both owners testable without sleeps or
+wall-clock dependence.
+
+Regression proof covers a future timestamp remaining in flight and the full
+signed range expiring safely for both snapshot chunks and block pieces. The
+four-group focused fast-sync suite passed, as did its ASan/UBSan run. Core
+seal/root mirror, consensus parity, generated capability inventory,
+cyclomatic complexity (55,551 functions), and whitespace gates passed.
+
+Consensus impact: none. This changes only timeout arithmetic for in-memory
+request scheduling; manifest verification, payload parsing, block/transaction
+validation, PoW, chain selection, and reducer behavior are unchanged.
+
+Worldstream interaction: refreshed Worldstream commit `0b29bec27` remains on
+fresh-sync observers, startup interruption, and telemetry overhead, with no
+overlap in swarm timeout ownership. Remaining risk: endgame comments promise
+duplicate tail requests, but the current single-owner accounting cannot model
+them safely and the duplicate-selection branch is unreachable. Recommended
+next investigation: measure tail latency and design explicit bounded duplicate
+ownership before changing that behavior.

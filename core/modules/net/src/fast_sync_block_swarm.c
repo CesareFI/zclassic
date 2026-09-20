@@ -303,17 +303,25 @@ int block_swarm_progress(const struct block_swarm *bs)
     return (int)(bs->pieces_complete * 100 / bs->manifest.num_pieces);
 }
 
-void block_swarm_handle_timeouts(struct block_swarm *bs, int timeout_secs)
+void block_swarm_handle_timeouts_at(struct block_swarm *bs, int timeout_secs,
+                                    int64_t now_monotonic)
 {
     if (!bs || !bs->piece_states) return;
 
-    int64_t now = platform_time_monotonic_us() / 1000000;
     for (uint32_t i = 0; i < bs->manifest.num_pieces; i++) {
         if (bs->piece_states[i] == CHUNK_INFLIGHT &&
-            now - bs->piece_request_time[i] > timeout_secs) {
+            fast_sync_timeout_elapsed_at(now_monotonic,
+                                         bs->piece_request_time[i],
+                                         timeout_secs)) {
             (void)block_swarm_requeue_piece(bs, i);
         }
     }
+}
+
+void block_swarm_handle_timeouts(struct block_swarm *bs, int timeout_secs)
+{
+    block_swarm_handle_timeouts_at(
+        bs, timeout_secs, platform_time_monotonic_us() / 1000000);
 }
 
 void block_swarm_update_availability(struct block_swarm *bs,

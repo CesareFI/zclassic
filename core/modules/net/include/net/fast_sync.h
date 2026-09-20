@@ -360,6 +360,13 @@ int swarm_sync_progress(const struct swarm_sync *ss);
 
 /* Handle timeout: re-assign inflight chunks older than timeout_ms */
 void swarm_sync_handle_timeouts(struct swarm_sync *ss, int timeout_secs);
+void swarm_sync_handle_timeouts_at(struct swarm_sync *ss, int timeout_secs,
+                                   int64_t now_monotonic);
+
+/* Overflow-safe monotonic deadline predicate shared by both swarm owners. */
+bool fast_sync_timeout_elapsed_at(int64_t now_monotonic,
+                                  int64_t requested_monotonic,
+                                  int timeout_secs);
 
 /* ── Block swarm: BitTorrent-style parallel block download ──── */
 /* Groups blocks into independently hashable/verifiable pieces. Each piece is
@@ -505,6 +512,8 @@ int block_swarm_progress(const struct block_swarm *bs);
 
 /* Handle timeouts: re-queue pieces older than timeout_secs */
 void block_swarm_handle_timeouts(struct block_swarm *bs, int timeout_secs);
+void block_swarm_handle_timeouts_at(struct block_swarm *bs, int timeout_secs,
+                                    int64_t now_monotonic);
 
 /* Update piece availability from peer's bitmap.
  * bitmap: bit array, bit i set = peer has piece i. */

@@ -1426,14 +1426,27 @@ int swarm_sync_progress(const struct swarm_sync *ss)
     return (int)(ss->chunks_complete * 100 / ss->manifest.num_chunks);
 }
 
-void swarm_sync_handle_timeouts(struct swarm_sync *ss, int timeout_secs)
+bool fast_sync_timeout_elapsed_at(int64_t now_monotonic,
+                                  int64_t requested_monotonic,
+                                  int timeout_secs)
+{
+    if (timeout_secs < 0 || now_monotonic < requested_monotonic)
+        return false;
+    uint64_t elapsed = (uint64_t)now_monotonic -
+                       (uint64_t)requested_monotonic;
+    return elapsed > (uint64_t)timeout_secs;
+}
+
+void swarm_sync_handle_timeouts_at(struct swarm_sync *ss, int timeout_secs,
+                                   int64_t now_monotonic)
 {
     if (!ss || !ss->chunk_states) return;
 
-    int64_t now = platform_time_monotonic_us() / 1000000;
     for (uint32_t i = 0; i < ss->manifest.num_chunks; i++) {
         if (ss->chunk_states[i] == CHUNK_INFLIGHT &&
-            now - ss->chunk_request_time[i] > timeout_secs) {
+            fast_sync_timeout_elapsed_at(now_monotonic,
+                                         ss->chunk_request_time[i],
+                                         timeout_secs)) {
             ss->chunk_states[i] = CHUNK_NEEDED;
             ss->chunk_peer[i] = -1;
             ss->chunk_request_time[i] = 0;
@@ -1441,6 +1454,12 @@ void swarm_sync_handle_timeouts(struct swarm_sync *ss, int timeout_secs)
                 ss->chunks_inflight--;
         }
     }
+}
+
+void swarm_sync_handle_timeouts(struct swarm_sync *ss, int timeout_secs)
+{
+    swarm_sync_handle_timeouts_at(
+        ss, timeout_secs, platform_time_monotonic_us() / 1000000);
 }
 
 /* ── Block swarm: BitTorrent-style parallel block download ──── */

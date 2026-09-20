@@ -380,3 +380,7 @@ later lane flips it HARD.
 - 2026-09-20T22:03:51Z — REASON: Prevent a timed-out block-swarm peer from immediately reclaiming its own expired work; request scheduling only, no consensus or validation semantic change
   old ROOT: 80d63e0d727d661a13b88f10ece4c2d70eb973cded0e7067730bdbbfc0820397
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T22:27:06Z — REASON: Make snapshot chunk and block-piece timeout arithmetic overflow-safe under monotonic anomalies; scheduling only, no consensus or validation semantic change
+  old ROOT: 2891ed7d79f668f769b46504bdbcbead88a2d6cc9587a5c4c1a0ee6c5f16eafd
+  by: owner unseal ritual (make core-unseal)
