@@ -671,9 +671,9 @@ static int test_block_swarm_disconnect_requeue(void)
          * under a second, so a timeout-based sweep (block_swarm_handle_timeouts,
          * 8 s) would reclaim NOTHING here — a non-zero return proves the requeue
          * is driven by the disconnect, not by elapsed time. */
-        size_t requeued = mp_block_swarm_peer_disconnected((uint32_t)p1->id);
+        size_t requeued = mp_block_swarm_peer_disconnected(p1);
         ASSERT(requeued == p1_reqs);                   /* exactly p1's pieces   */
-        ASSERT(mp_block_swarm_peer_disconnected((uint32_t)p1->id) == 0); /* idem */
+        ASSERT(mp_block_swarm_peer_disconnected(p1) == 0); /* idempotent */
 
         /* FAILOVER: the requeued pieces are NEEDED again, so a live peer claims
          * and downloads them. Drive p2 to completion and confirm every body of

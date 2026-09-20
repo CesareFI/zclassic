@@ -388,3 +388,11 @@ later lane flips it HARD.
 - 2026-09-20T22:51:03Z — REASON: Keep block-swarm availability counts bounded when an untrusted peer repeats or replaces its bitmap; scheduling only, no consensus or validation semantic change
   old ROOT: 2daff4bdfc7bbbc054d843d0c4093d435b492eca1b43550c31de12a558d59021
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T23:15:57Z — REASON: Withdraw a disconnected peer bitmap from block-swarm availability exactly once alongside piece requeue; scheduling only, no consensus or validation semantic change
+  old ROOT: 28236f4e061dcadd1f09a5468794b32abfac9059d1907c694147a8ed2338197e
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T23:40:30Z — REASON: Close active-swarm generation race in disconnect and bitmap replacement by deciding ownership under the swarm mutex; scheduling only, no consensus or validation semantic change
+  old ROOT: 48c14e43ce83c60259d6a4ebff58e7c61a298a828878fb7a7507dfefb8d906f1
+  by: owner unseal ritual (make core-unseal)

@@ -792,6 +792,9 @@ static int test_block_swarm_bitmap(void)
         ASSERT(bs.piece_availability[1] == 1);
         for (uint32_t i = 2; i < 12; i++)
             ASSERT(bs.piece_availability[i] == 0);
+        block_swarm_replace_availability(&bs, replacement, 2, NULL, 0);
+        ASSERT(bs.piece_availability[0] == 0);
+        ASSERT(bs.piece_availability[1] == 0);
 
         block_swarm_free(&bs);
         free(manifest.piece_hashes);

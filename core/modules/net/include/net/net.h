@@ -560,6 +560,7 @@ struct p2p_node {
     } blk_pipeline[PIECE_PIPELINE_DEPTH];
     uint8_t *blk_bitmap;          /* peer's piece availability bitmap (heap) */
     uint32_t blk_bitmap_len;      /* bytes in bitmap */
+    uint64_t blk_bitmap_swarm_generation; /* swarm this contribution belongs to */
     int32_t blk_peer_height;      /* peer's manifest end_height */
 
     /* Noise-encrypted transport. NULL = plaintext path (every zclassicd

@@ -265,3 +265,37 @@ Remaining risk and next investigation: disconnect currently requeues owned
 pieces by peer ID but does not receive the departing peer's bitmap, so its
 availability contribution persists until the swarm ends. Extend disconnect
 cleanup with bounded bitmap withdrawal and a reconnect regression.
+
+## Disconnect-safe availability ownership
+
+Disconnect cleanup reclaimed a peer's in-flight pieces but could not withdraw
+its bitmap because the API accepted only a numeric peer ID. Availability from
+departed sessions therefore survived for the rest of the swarm and repeated
+reconnects accumulated stale rarity evidence.
+
+Each peer now records the exact block-swarm generation to which its bitmap was
+counted. A successful swarm initialization advances a nonzero generation.
+Bitmap replacement subtracts an old contribution only when generations match,
+and terminal disconnect cleanup withdraws that contribution and clears the
+generation in the same swarm-locked transaction that requeues owned pieces.
+Repeated cleanup is idempotent; a stale peer from an earlier swarm cannot
+subtract a current peer's count.
+
+Regression proof extends bitmap replacement through complete withdrawal and
+keeps the real-wire disconnect/failover test's repeated cleanup assertion. The
+four-group fast-sync suite and block-swarm loopback passed; loopback transferred
+2,560 blocks / 3,962,880 bytes at 31,872 blocks/s (47.1 MB/s). Core seal/root
+mirror, consensus parity, generated capability inventory, cyclomatic
+complexity (55,555 functions), and whitespace gates passed.
+
+The ASan/UBSan block-swarm loopback also passed without a sanitizer finding,
+moving the same fixture at 8,920 blocks/s (13.2 MB/s).
+
+Consensus impact: none. This is bounded peer-local request-order accounting;
+all manifest, payload, block, transaction, PoW, and chain validation remains
+unchanged. Worldstream commit `0b29bec27` still has no scheduler overlap.
+
+Remaining risk: bitmaps received before a swarm starts are intentionally not
+retroactively counted, so their pieces tie at the neutral availability value
+until a fresh advertisement. Next investigate whether manifest acceptance
+should seed already-connected peer bitmaps for better rarest-first ordering.

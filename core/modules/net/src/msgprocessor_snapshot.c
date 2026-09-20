@@ -146,11 +146,39 @@ static struct block_swarm g_block_swarm __attribute__((used));
 static _Atomic bool g_block_swarm_active = false;
 static pthread_mutex_t g_block_swarm_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int64_t g_block_swarm_last_progress = 0;
+static uint64_t g_block_swarm_generation = 0;
 /* Monotonic-seconds stamp of the last abandonment. A reaped swarm may be re-armed by a
  * fresh manifest only after BLOCK_SWARM_RESTART_COOLDOWN_SECS, so a peer
  * whose piece service is silently black-holing cannot flap the body
  * transfer back out of legacy getdata's hands every few seconds. */
 static _Atomic int64_t g_block_swarm_reaped_monotonic = 0;
+
+static void block_swarm_advance_generation(void)
+{
+    g_block_swarm_generation++;
+    if (g_block_swarm_generation == 0)
+        g_block_swarm_generation = 1;
+}
+
+static void block_swarm_replace_peer_bitmap_locked(
+    struct p2p_node *node, uint64_t old_generation,
+    const uint8_t *new_bitmap, uint32_t new_bitmap_len)
+{
+    if (!atomic_load(&g_block_swarm_active)) {
+        node->blk_bitmap_swarm_generation = 0;
+        return;
+    }
+    const uint8_t *old_bitmap = NULL;
+    uint32_t old_bitmap_len = 0;
+    if (old_generation == g_block_swarm_generation) {
+        old_bitmap = node->blk_bitmap;
+        old_bitmap_len = node->blk_bitmap_len;
+    }
+    block_swarm_replace_availability(
+        &g_block_swarm, old_bitmap, old_bitmap_len,
+        new_bitmap, new_bitmap_len);
+    node->blk_bitmap_swarm_generation = g_block_swarm_generation;
+}
 
 static int64_t block_swarm_monotonic_seconds(void)
 {
@@ -411,6 +439,7 @@ void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
         pm.end_height = (int32_t)total * BLOCKS_PER_PIECE;
         pm.num_pieces = total;
         if (block_swarm_init(&g_block_swarm, &pm, NULL)) {
+            block_swarm_advance_generation();
             g_block_swarm.pieces_complete = complete;
             g_block_swarm.last_complete_monotonic = last_complete_monotonic;
             atomic_store(&g_block_swarm_active, true);
@@ -469,14 +498,25 @@ bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
  * assignment window that stalls forward progress for up to a full timeout per
  * dead peer. Resetting the peer's inflight pieces to CHUNK_NEEDED here lets the
  * next send tick hand them straight to a live peer. Returns pieces re-queued. */
-size_t mp_block_swarm_peer_disconnected(uint32_t peer_id)
+size_t mp_block_swarm_peer_disconnected(struct p2p_node *node)
 {
-    if (!atomic_load(&g_block_swarm_active))
+    if (!node)
         return 0;
+    uint32_t peer_id = (uint32_t)node->id;
 
     size_t requeued = 0;
     pthread_mutex_lock(&g_block_swarm_mutex);
+    if (!atomic_load(&g_block_swarm_active)) {
+        node->blk_bitmap_swarm_generation = 0;
+        pthread_mutex_unlock(&g_block_swarm_mutex);
+        return 0;
+    }
     struct block_swarm *bs = &g_block_swarm;
+    if (node->blk_bitmap_swarm_generation == g_block_swarm_generation) {
+        block_swarm_replace_availability(
+            bs, node->blk_bitmap, node->blk_bitmap_len, NULL, 0);
+        node->blk_bitmap_swarm_generation = 0;
+    }
     if (bs->piece_states && bs->piece_peer) {
         for (uint32_t i = 0; i < bs->manifest.num_pieces; i++) {
             if (bs->piece_states[i] == CHUNK_INFLIGHT &&
@@ -1372,6 +1412,7 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                     memcpy(pm.merkle_root, merkle_root, 32);
                     pthread_mutex_lock(&g_block_swarm_mutex);
                     if (block_swarm_init(&g_block_swarm, &pm, mp->datadir)) {
+                        block_swarm_advance_generation();
                         g_block_swarm.last_complete_monotonic =
                             block_swarm_monotonic_seconds();
                         mp_block_swarm_mark_complete_through_height(
@@ -1569,11 +1610,13 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                 if (bitmap && stream_read_bytes(s, bitmap, bitmap_len)) {
                     /* Replace this peer's prior contribution rather than
                      * accumulating repeated untrusted advertisements. */
+                    uint64_t old_generation =
+                        node->blk_bitmap_swarm_generation;
+                    node->blk_bitmap_swarm_generation = 0;
                     if (g_block_swarm_active) {
                         pthread_mutex_lock(&g_block_swarm_mutex);
-                        block_swarm_replace_availability(
-                            &g_block_swarm, node->blk_bitmap,
-                            node->blk_bitmap_len, bitmap, bitmap_len);
+                        block_swarm_replace_peer_bitmap_locked(
+                            node, old_generation, bitmap, bitmap_len);
                         pthread_mutex_unlock(&g_block_swarm_mutex);
                     }
                     free(node->blk_bitmap);

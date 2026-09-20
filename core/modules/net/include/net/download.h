@@ -21,6 +21,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+struct p2p_node;
+
 /* Tuning constants — conservative (at-tip) defaults.
  * During IBD, use dl_get_*() functions which return catch-up values.
  * IBD per-peer and timeout used to stay at the at-tip 128 / 15 s pair;
@@ -428,7 +430,7 @@ size_t dl_mark_notfound(struct download_manager *dm, uint32_t peer_id,
  * peer can claim them — until the 8 s BLOCK_PIECE_TIMEOUT sweep. Called from
  * connman's disconnect cleanup right after dl_peer_disconnected. A no-op
  * (returns 0) when no block swarm is active. Returns pieces re-queued. */
-size_t mp_block_swarm_peer_disconnected(uint32_t peer_id);
+size_t mp_block_swarm_peer_disconnected(struct p2p_node *node);
 
 /* NET-2: current per-peer EWMA bandwidth score (0..255, 0 = none measured).
  * Read at session close to bank the peer's final reputation. */
