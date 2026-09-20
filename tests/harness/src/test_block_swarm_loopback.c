@@ -730,9 +730,48 @@ static int test_block_swarm_disconnect_requeue(void)
 bool mp_block_swarm_reap_if_stalled(struct msg_processor *mp);
 void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
                                     int64_t last_complete_unix);
-int64_t mp_block_swarm_test_reaped_unix(void);
+int64_t mp_block_swarm_test_reaped_monotonic(void);
+bool mp_block_swarm_test_restart_ready_at(int64_t now_monotonic,
+                                          int64_t reaped_monotonic);
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
                                         uint32_t piece_index);
+
+static int test_block_swarm_restart_cooldown(void)
+{
+    int failures = 0;
+
+    TEST("block swarm restart cooldown uses monotonic elapsed time across "
+         "clock jumps and repeated cycles") {
+        const int64_t reaped = 1000;
+        int64_t wall = 5000;
+
+        ASSERT(mp_block_swarm_test_restart_ready_at(1000, 0));
+        ASSERT(!mp_block_swarm_test_restart_ready_at(1000, reaped));
+        ASSERT(!mp_block_swarm_test_restart_ready_at(1299, reaped));
+        ASSERT(mp_block_swarm_test_restart_ready_at(1300, reaped));
+
+        /* Civil-clock changes are deliberately absent from the decision. */
+        wall -= 100000;
+        ASSERT(wall < 0);
+        ASSERT(!mp_block_swarm_test_restart_ready_at(1299, reaped));
+        wall += INT64_C(1000000000);
+        ASSERT(wall > 0);
+        ASSERT(mp_block_swarm_test_restart_ready_at(1300, reaped));
+
+        /* A defensive monotonic anomaly fails closed without subtraction. */
+        ASSERT(!mp_block_swarm_test_restart_ready_at(999, reaped));
+        ASSERT(!mp_block_swarm_test_restart_ready_at(INT64_MAX, -1));
+
+        /* A later abandonment starts a fresh full cooldown. */
+        ASSERT(mp_block_swarm_test_restart_ready_at(1300, reaped));
+        ASSERT(!mp_block_swarm_test_restart_ready_at(1300, 1300));
+        ASSERT(!mp_block_swarm_test_restart_ready_at(1599, 1300));
+        ASSERT(mp_block_swarm_test_restart_ready_at(1600, 1300));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
 
 static int test_block_swarm_stall_reap(void)
 {
@@ -747,7 +786,7 @@ static int test_block_swarm_stall_reap(void)
         ASSERT(mp_block_swarm_is_active());
         ASSERT(!mp_block_swarm_reap_if_stalled(NULL));
         ASSERT(mp_block_swarm_is_active());
-        ASSERT(mp_block_swarm_test_reaped_unix() == 0);
+        ASSERT(mp_block_swarm_test_reaped_monotonic() == 0);
 
         /* Fully-complete swarm, however old → never reaped (completion is
          * the normal exit path, not a stall). */
@@ -755,19 +794,19 @@ static int test_block_swarm_stall_reap(void)
         ASSERT(mp_block_swarm_is_active());
         ASSERT(!mp_block_swarm_reap_if_stalled(NULL));
         ASSERT(mp_block_swarm_is_active());
-        ASSERT(mp_block_swarm_test_reaped_unix() == 0);
+        ASSERT(mp_block_swarm_test_reaped_monotonic() == 0);
 
         /* Completion-silent far past the stall threshold → reaped, once. */
         mp_block_swarm_test_seed_stall(5, 10, now - 100000);
         ASSERT(mp_block_swarm_is_active());
         ASSERT(mp_block_swarm_reap_if_stalled(NULL));
         ASSERT(!mp_block_swarm_is_active());
-        ASSERT(mp_block_swarm_test_reaped_unix() > 0);
+        ASSERT(mp_block_swarm_test_reaped_monotonic() > 0);
         ASSERT(!mp_block_swarm_reap_if_stalled(NULL));   /* idempotent */
 
         mp_block_swarm_test_seed_stall(0, 0, 0);         /* teardown */
         ASSERT(!mp_block_swarm_is_active());
-        ASSERT(mp_block_swarm_test_reaped_unix() == 0);
+        ASSERT(mp_block_swarm_test_reaped_monotonic() == 0);
         PASS();
     } _test_next:;
 
@@ -799,7 +838,7 @@ static int test_block_swarm_integrity_abandon(void)
         ASSERT(mp_block_swarm_is_active());
         ASSERT(mp_block_swarm_test_fail_integrity(&mp, 6));
         ASSERT(!mp_block_swarm_is_active());
-        ASSERT(mp_block_swarm_test_reaped_unix() > 0);
+        ASSERT(mp_block_swarm_test_reaped_monotonic() > 0);
         for (int i = 0; i < PIECE_PIPELINE_DEPTH; i++)
             ASSERT(peer.blk_pipeline[i].piece_index == -1);
         ASSERT(!mp_block_swarm_test_fail_integrity(&mp, 6));
@@ -1229,6 +1268,7 @@ int test_block_swarm_loopback(void)
     boot_snapshot_offer_test_set_trust_override(1);
     failures += test_block_swarm_throughput();
     failures += test_block_swarm_disconnect_requeue();
+    failures += test_block_swarm_restart_cooldown();
     failures += test_block_swarm_stall_reap();
     failures += test_block_swarm_integrity_abandon();
     failures += test_block_swarm_duplicate_delivery();

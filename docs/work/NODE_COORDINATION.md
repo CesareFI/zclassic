@@ -43,3 +43,24 @@ Validation at commit `0caeed6d1`:
 Follow-up: block-swarm stall and restart timing still needs an audit for
 wall-clock rollback behavior. Any change must preserve the legacy-download
 ownership window after abandonment and must not change validation semantics.
+
+## Block-swarm restart cooldown clock
+
+The 300-second post-abandonment cooldown was process-local but stored the last
+abandonment as Unix wall time. A backward civil-clock correction made elapsed
+time negative and could leave legacy download holding ownership far beyond the
+intended interval; a forward jump could expire it early.
+
+The abandonment stamp and restart comparison now use monotonic seconds. Zero
+explicitly means no prior abandonment, a reversed monotonic sample fails
+closed without subtraction, and every later abandonment starts a fresh full
+cooldown. The state remains non-persistent, so process restart continues to
+clear the cooldown as before. Regression coverage pins immediate retry,
+299/300-second boundaries, backward and large forward wall-clock changes,
+defensive monotonic reversal, reset, and repeated abandonment cycles. The
+block-swarm loopback remained green, moving 2,560 blocks at approximately
+32,017 blocks/s and 47.3 MiB/s in the measured focused run.
+
+Remaining timing risk: the separate silent-stall age and progress-report
+cadence still use wall time and should be audited independently; neither is
+part of restart-cooldown authority after this change.

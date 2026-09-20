@@ -352,3 +352,7 @@ later lane flips it HARD.
 - 2026-09-20T07:32:16Z — REASON: Bound block-swarm requests to each anchored peer manifest; peer scheduling only, no consensus semantics
   old ROOT: 8b3df2f79fe3743f4819760874225bd83405cfb8a1d66abcfee338c926f9f426
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T08:50:42Z — REASON: Use monotonic elapsed time for block-swarm restart cooldown; scheduling only, no consensus or validation change
+  old ROOT: 17cb70b6fc1e3b9ea97044740a345b6155dbebe057fd8552915c76882d1991a7
+  by: owner unseal ritual (make core-unseal)

@@ -87,7 +87,7 @@ struct block_swarm_abandonment {
  * so peer pipeline locks never nest inside the swarm lock. */
 bool mp_block_swarm_abandon_locked(
     struct block_swarm *swarm, _Atomic bool *active,
-    _Atomic int64_t *reaped_unix, int64_t now,
+    _Atomic int64_t *reaped_monotonic, int64_t now_monotonic,
     struct block_swarm_abandonment *out);
 void mp_block_swarm_finish_abandon(struct msg_processor *mp);
 void mp_block_swarm_report_integrity_abandon(

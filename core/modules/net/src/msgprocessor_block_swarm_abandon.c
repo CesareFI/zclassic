@@ -46,10 +46,10 @@ void mp_block_swarm_mark_complete_through_height(
 
 bool mp_block_swarm_abandon_locked(
     struct block_swarm *swarm, _Atomic bool *active,
-    _Atomic int64_t *reaped_unix, int64_t now,
+    _Atomic int64_t *reaped_monotonic, int64_t now_monotonic,
     struct block_swarm_abandonment *out)
 {
-    if (!swarm || !active || !reaped_unix || !atomic_load(active) ||
+    if (!swarm || !active || !reaped_monotonic || !atomic_load(active) ||
         !swarm->piece_states || swarm->manifest.num_pieces == 0)
         return false;
 
@@ -61,7 +61,7 @@ bool mp_block_swarm_abandon_locked(
     }
     block_swarm_free(swarm);
     atomic_store(active, false);
-    atomic_store(reaped_unix, now);
+    atomic_store(reaped_monotonic, now_monotonic);
     return true;
 }
 

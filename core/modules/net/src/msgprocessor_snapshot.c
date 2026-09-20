@@ -190,11 +190,22 @@ static struct block_swarm g_block_swarm __attribute__((used));
 static _Atomic bool g_block_swarm_active = false;
 static pthread_mutex_t g_block_swarm_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int64_t g_block_swarm_last_progress = 0;
-/* Wall-clock of the last stall-abandon. A reaped swarm may be re-armed by a
+/* Monotonic-seconds stamp of the last abandonment. A reaped swarm may be re-armed by a
  * fresh manifest only after BLOCK_SWARM_RESTART_COOLDOWN_SECS, so a peer
  * whose piece service is silently black-holing cannot flap the body
  * transfer back out of legacy getdata's hands every few seconds. */
-static _Atomic int64_t g_block_swarm_reaped_unix = 0;
+static _Atomic int64_t g_block_swarm_reaped_monotonic = 0;
+
+static bool block_swarm_restart_ready_at(int64_t now_monotonic,
+                                         int64_t reaped_monotonic)
+{
+    if (reaped_monotonic == 0)
+        return true;
+    if (reaped_monotonic < 0 || now_monotonic < reaped_monotonic)
+        return false;
+    return now_monotonic - reaped_monotonic >=
+           BLOCK_SWARM_RESTART_COOLDOWN_SECS;
+}
 
 /* The fc_rate_* per-peer FlyClient-challenge rate limiter (table, mutex,
  * fc_rate_acquire/fc_rate_should_score, and the msgprocessor_test_fc_rate_*
@@ -390,7 +401,8 @@ bool mp_block_swarm_reap_if_stalled(struct msg_processor *mp)
     if (stalled) {
         stalled = mp_block_swarm_abandon_locked(
             &g_block_swarm, &g_block_swarm_active,
-            &g_block_swarm_reaped_unix, now, &abandoned);
+            &g_block_swarm_reaped_monotonic,
+            platform_time_monotonic_us() / 1000000, &abandoned);
     }
     pthread_mutex_unlock(&g_block_swarm_mutex);
     if (!stalled)
@@ -419,7 +431,7 @@ void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
     pthread_mutex_lock(&g_block_swarm_mutex);
     block_swarm_free(&g_block_swarm);
     atomic_store(&g_block_swarm_active, false);
-    atomic_store(&g_block_swarm_reaped_unix, 0);
+    atomic_store(&g_block_swarm_reaped_monotonic, 0);
     if (total > 0) {
         struct block_piece_manifest pm;
         memset(&pm, 0, sizeof(pm));
@@ -435,9 +447,15 @@ void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
     pthread_mutex_unlock(&g_block_swarm_mutex);
 }
 
-int64_t mp_block_swarm_test_reaped_unix(void)
+int64_t mp_block_swarm_test_reaped_monotonic(void)
 {
-    return atomic_load(&g_block_swarm_reaped_unix);
+    return atomic_load(&g_block_swarm_reaped_monotonic);
+}
+
+bool mp_block_swarm_test_restart_ready_at(int64_t now_monotonic,
+                                          int64_t reaped_monotonic)
+{
+    return block_swarm_restart_ready_at(now_monotonic, reaped_monotonic);
 }
 
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
@@ -445,7 +463,6 @@ bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
 {
     struct block_swarm_abandonment abandoned = {0};
     bool did_abandon = false;
-    int64_t now = (int64_t)platform_time_wall_time_t();
 
     pthread_mutex_lock(&g_block_swarm_mutex);
     if (atomic_load(&g_block_swarm_active) &&
@@ -454,7 +471,8 @@ bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
         block_swarm_fail_piece(&g_block_swarm, piece_index);
         did_abandon = mp_block_swarm_abandon_locked(
             &g_block_swarm, &g_block_swarm_active,
-            &g_block_swarm_reaped_unix, now, &abandoned);
+            &g_block_swarm_reaped_monotonic,
+            platform_time_monotonic_us() / 1000000, &abandoned);
     }
     pthread_mutex_unlock(&g_block_swarm_mutex);
     if (did_abandon)
@@ -1361,9 +1379,9 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                 if (node->blk_manifest_received &&
                     end_h > our_h + BLOCKS_PER_PIECE &&
                     !g_block_swarm_active && num_pieces > 0 &&
-                    (int64_t)platform_time_wall_time_t() -
-                        atomic_load(&g_block_swarm_reaped_unix) >=
-                            BLOCK_SWARM_RESTART_COOLDOWN_SECS) {
+                    block_swarm_restart_ready_at(
+                        platform_time_monotonic_us() / 1000000,
+                        atomic_load(&g_block_swarm_reaped_monotonic))) {
                     struct block_piece_manifest pm = {
                         .start_height = start_h,
                         .end_height = end_h,
@@ -1539,8 +1557,8 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                          * traverses the canonical reducer. */
                         did_abandon_integrity = mp_block_swarm_abandon_locked(
                             &g_block_swarm, &g_block_swarm_active,
-                            &g_block_swarm_reaped_unix,
-                            (int64_t)platform_time_wall_time_t(),
+                            &g_block_swarm_reaped_monotonic,
+                            platform_time_monotonic_us() / 1000000,
                             &integrity_abandoned);
                     }
                     pthread_mutex_unlock(&g_block_swarm_mutex);
