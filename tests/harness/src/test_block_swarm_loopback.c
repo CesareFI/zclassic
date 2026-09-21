@@ -1271,13 +1271,17 @@ static int test_block_swarm_peer_fairness(void)
 
         struct p2p_node *first = bs_make_peer(&nm, 21);
         struct p2p_node *second = bs_make_peer(&nm, 22);
-        ASSERT(first && second);
+        struct p2p_node *outbound = bs_make_peer(&nm, 23);
+        ASSERT(first && second && outbound);
         first->id = 21;
         second->id = 22;
+        outbound->id = 23;
         first->blk_peer_height = end_height;
         second->blk_peer_height = end_height;
+        outbound->blk_peer_height = end_height;
         struct send_segment *sent_first = bs_install_sentinel(first);
         struct send_segment *sent_second = bs_install_sentinel(second);
+        struct send_segment *sent_outbound = bs_install_sentinel(outbound);
 
         mp_block_swarm_test_seed_stall(0, pieces, 1);
         ASSERT(mp_block_swarm_is_active());
@@ -1301,8 +1305,34 @@ static int test_block_swarm_peer_fairness(void)
                        second->blk_pipeline[b].piece_index);
         }
 
+        /* The connman send snapshot preserves node order. Two inbound peers
+         * repeatedly encountered first must not own the entire 256-piece
+         * urgent window before a healthy outbound source runs. Inbound-only
+         * operation still receives half the window immediately. */
+        mp_block_swarm_test_seed_stall(0, pieces, 1);
+        first->inbound = true;
+        second->inbound = true;
+        ASSERT(mp_block_swarm_test_admit_peer(first));
+        ASSERT(mp_block_swarm_test_admit_peer(second));
+        ASSERT(mp_block_swarm_test_admit_peer(outbound));
+        bs_drop_queue(first, sent_first);
+        bs_drop_queue(second, sent_second);
+        for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+            first->blk_pipeline[pi].piece_index = -1;
+            second->blk_pipeline[pi].piece_index = -1;
+        }
+        mp_snapshot_send_tick(&mp, first);
+        mp_snapshot_send_tick(&mp, second);
+        mp_snapshot_send_tick(&mp, first);
+        mp_snapshot_send_tick(&mp, second);
+        ASSERT(bs_queue_depth(sent_first) + bs_queue_depth(sent_second) ==
+               PIECE_PIPELINE_DEPTH / 2);
+        mp_snapshot_send_tick(&mp, outbound);
+        ASSERT(bs_queue_depth(sent_outbound) == PIECE_PIPELINE_DEPTH / 4);
+
         /* With no competing owner, later ticks fill the original capacity. */
         mp_block_swarm_test_seed_stall(0, pieces, 1);
+        first->inbound = false;
         ASSERT(mp_block_swarm_test_admit_peer(first));
         bs_drop_queue(first, sent_first);
         for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++)
@@ -1314,10 +1344,13 @@ static int test_block_swarm_peer_fairness(void)
         mp_block_swarm_test_seed_stall(0, 0, 0);
         send_segment_free(sent_first);
         send_segment_free(sent_second);
+        send_segment_free(sent_outbound);
         first->send_head = first->send_tail = NULL;
         second->send_head = second->send_tail = NULL;
+        outbound->send_head = outbound->send_tail = NULL;
         p2p_node_free(first);
         p2p_node_free(second);
+        p2p_node_free(outbound);
         net_manager_free(&nm);
         main_state_free(&ms);
         PASS();

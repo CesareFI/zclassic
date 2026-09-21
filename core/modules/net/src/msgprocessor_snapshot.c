@@ -97,10 +97,20 @@ static int64_t g_swarm_last_progress_time = 0;
  * round. A lone peer retains its full pipeline by filling another batch on
  * each later tick. */
 #define BLOCK_PIECE_ASSIGN_BATCH (PIECE_PIPELINE_DEPTH / 4)
+#define BLOCK_SWARM_INBOUND_INFLIGHT_CAP (PIECE_PIPELINE_DEPTH / 2)
 
-static int block_swarm_assignment_batch(bool peer_timed_out)
+static int block_swarm_assignment_batch(bool peer_timed_out, bool inbound,
+                                        uint32_t pieces_inflight)
 {
-    return peer_timed_out ? 0 : BLOCK_PIECE_ASSIGN_BATCH;
+    if (peer_timed_out)
+        return 0;
+    if (!inbound)
+        return BLOCK_PIECE_ASSIGN_BATCH;
+    if (pieces_inflight >= BLOCK_SWARM_INBOUND_INFLIGHT_CAP)
+        return 0;
+    uint32_t remaining = BLOCK_SWARM_INBOUND_INFLIGHT_CAP - pieces_inflight;
+    return remaining < BLOCK_PIECE_ASSIGN_BATCH
+        ? (int)remaining : BLOCK_PIECE_ASSIGN_BATCH;
 }
 
 static int64_t block_pipeline_clear_piece(struct p2p_node *node,
@@ -2170,7 +2180,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
          * global window while preserving its full steady-state pipeline. */
         int assigned_this_tick = 0;
         int assignment_batch =
-            block_swarm_assignment_batch(reconciled.timed_out);
+            block_swarm_assignment_batch(reconciled.timed_out, node->inbound,
+                                         g_block_swarm.pieces_inflight);
         const uint8_t *peer_bitmap = NULL;
         uint32_t peer_bitmap_len = 0;
         block_swarm_peer_bitmap_for_generation(

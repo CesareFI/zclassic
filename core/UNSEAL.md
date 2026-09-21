@@ -512,3 +512,7 @@ later lane flips it HARD.
 - 2026-09-21T07:14:38Z — REASON: Move the block-swarm credit helper below its file-local state declarations after a clean sanitizer compile exposed declaration order; refactor only, no behavior, consensus, or validation change
   old ROOT: 72e8e7ac118c013b8e2d0f5875fe8076b395b306c8b1f7ade29602ef1e314fd7
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T07:36:43Z — REASON: Reserve block-swarm forward-window capacity from inbound-first send ordering so healthy outbound peers cannot be starved; transport scheduling only, consensus and validation unchanged
+  old ROOT: b1d19b6f144ecf8ff56b2286c42333231ab118a2349fcad0f85c28655947f1cd
+  by: owner unseal ritual (make core-unseal)

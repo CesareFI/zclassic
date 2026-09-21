@@ -896,3 +896,37 @@ Remaining risk and next investigation: gather these counters during an
 isolated multi-peer sync before changing scheduler policy. Next inspect
 whether one timed-out peer's zero-assignment tick and fixed global send order
 provide sufficient opportunity to healthy later peers under reconnect churn.
+
+## Reserve urgent block work from inbound-first peer ordering
+
+Baseline: connman's message-cycle snapshot preserves peer array order and
+invokes every send callback in that order. The block swarm assigned a fixed
+64-piece batch per callback inside a 256-piece contiguous forward window, so
+four inbound peers encountered first could own the entire urgent window before
+a healthy outbound source ran. The existing timeout-owner yield protected the
+next peer only after eight seconds; it did not prevent this initial starvation.
+
+Root cause: per-peer batching bounded one peer but placed no bound on aggregate
+inbound ownership. The scheduler now allows inbound peers to own at most half
+of the 256-piece urgent window. It computes the allowance from the existing
+mutex-protected inflight count, with no peer scan, allocation, new lock, or
+implementation/version discrimination. Outbound peers retain the original
+64-piece batch and one-peer 256-slot capacity; inbound-only nodes still receive
+128 concurrent pieces and continue progressing.
+
+After-result and regression proof: an ordered regression gives two inbound
+peers repeated send ticks before one outbound peer. Inbound ownership stops at
+128 pieces and the later outbound peer immediately receives 64; the original
+multi-peer sharing, disjoint ownership, timeout yield, and outbound one-peer
+capacity checks remain green. The full block-swarm loopback group passes at
+31,755 blocks/s (46.9 MB/s).
+
+Consensus impact: NONE. This changes only which compatible peer temporarily
+owns a validated transport request. Wire format, piece integrity, canonical
+block validation, and every consensus predicate are unchanged. Worldstream
+remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: use the new per-peer counters during an
+isolated multi-peer sync to measure whether the fixed 50% inbound allowance is
+well utilized, then inspect block-swarm timeout ownership under repeated peer
+reconnect and endpoint replacement.
