@@ -1234,3 +1234,34 @@ observer work.
 Remaining risk and next investigation: coordinate terminal local apply-error
 recovery with Worldstream's storage ownership; a safe fallback must explicitly
 handle partially applied derived UTXO rows before releasing the active swarm.
+
+## Release malformed block-piece ownership immediately
+
+Baseline: after confirming that a peer owned an in-flight `zblkdata` piece,
+truncated hash arrays, malformed payload bodies, and invalid headers were
+scored but left both global ownership and the peer-local pipeline slot intact.
+The deterministic framed-wire regression showed the next send tick emitted no
+replacement request, forcing historical-body backfill to wait for timeout.
+
+Root cause and fix: early parser exits bypassed the ordinary piece completion
+and timeout cleanup paths. A single bounded helper now requeues the piece only
+when that peer remains its authoritative owner and clears every matching local
+pipeline slot. Header, hash-array, and payload truncation paths call it before
+returning; unsolicited or already-reassigned responses cannot revoke another
+peer's ownership.
+
+After-result and regression proof: the pre-fix `block_swarm_loopback` group
+failed because no request followed a complete but truncated `zblkdata` frame.
+It now observes one immediate replacement request, then delivers the retained
+valid response and completes normally. Duplicate, late-owner, disconnect,
+integrity-abandonment, timeout-yield, manifest-anchor, and throughput cases
+remain green.
+
+Consensus impact: NONE. Malformed data is still rejected and scored; valid
+block bodies still traverse normal parsing and the canonical reducer.
+Worldstream remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: exercise the malformed block-payload
+branch (valid hash list but truncated serialized body) with the same immediate
+reassignment assertion, then inspect whether request-send failures similarly
+leave authoritative ownership waiting for timeout.

@@ -552,3 +552,7 @@ later lane flips it HARD.
 - 2026-09-21T09:15:05Z — REASON: Prevent untrusted snapshot hash mismatches from exhausting global chunk retries; validation unchanged, transport liveness only
   old ROOT: 8fd77bf6c7c20c119347aac5c821f0dcb18279b8b748a5a4ab61e00023424f93
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T09:20:23Z — REASON: Release block-swarm ownership immediately after malformed or truncated owned zblkdata; transport recovery only, consensus unchanged
+  old ROOT: 43e9512fb836915da91f9ccdef65f26367f52925392693b36ca342402f60fe2f
+  by: owner unseal ritual (make core-unseal)

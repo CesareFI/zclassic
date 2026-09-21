@@ -328,6 +328,28 @@ static bool block_swarm_peer_response_allowed(
     return requested;
 }
 
+static bool block_swarm_release_malformed_response(
+    struct p2p_node *node, uint32_t piece_index, bool piece_index_valid)
+{
+    if (!node || !piece_index_valid)
+        return false;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    bool released = atomic_load(&g_block_swarm_active) &&
+        block_swarm_requeue_piece_for_peer(
+            &g_block_swarm, piece_index, node->id);
+    if (released) {
+        for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+            if (node->blk_pipeline[pi].piece_index != (int32_t)piece_index)
+                continue;
+            node->blk_pipeline[pi].piece_index = -1;
+            node->blk_pipeline[pi].request_time = 0;
+            node->blk_pipeline[pi].request_time_us = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return released;
+}
+
 static bool block_swarm_delivery_identity_matches_locked(
     int32_t start_height, uint32_t num_pieces, uint64_t generation)
 {
@@ -1930,9 +1952,13 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
             /* Peer sends block piece data (block hashes for a piece).
              * DEFENSIVE: validate piece_index, block_count, and hash. */
             uint32_t piece_index = 0, block_count = 0;
-            if (!stream_read_u32_le(s, &piece_index) ||
-                !stream_read_u32_le(s, &block_count) ||
+            bool piece_index_ok = stream_read_u32_le(s, &piece_index);
+            bool block_count_ok = piece_index_ok &&
+                stream_read_u32_le(s, &block_count);
+            if (!block_count_ok ||
                 block_count == 0 || block_count > BLOCKS_PER_PIECE) {
+                (void)block_swarm_release_malformed_response(
+                    node, piece_index, piece_index_ok);
                 printf("Peer %s: bad zblkdata (piece=%u count=%u)\n",
                        node->addr_name, piece_index, block_count);
                 peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_PAYLOAD,
@@ -1961,6 +1987,8 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                     if (!parse_block_piece_payload_refs(
                             s, (const uint8_t (*)[32])blk_hashes,
                             block_count, &block_refs)) {
+                        (void)block_swarm_release_malformed_response(
+                            node, piece_index, true);
                         printf("Peer %s: bad zblkdata block payloads\n",
                                node->addr_name);
                         peer_scoring_record(mp->net_mgr, node,
@@ -2063,6 +2091,8 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                     }
                     free(block_refs);
                 } else {
+                    (void)block_swarm_release_malformed_response(
+                        node, piece_index, true);
                     printf("Peer %s: truncated zblkdata\n", node->addr_name);
                     peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_PAYLOAD,
                                         "truncated zblkdata");

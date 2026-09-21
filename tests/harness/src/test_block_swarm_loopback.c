@@ -578,6 +578,24 @@ static bool bs_push_block_request_frame(
     return ok;
 }
 
+static bool bs_push_truncated_block_data_frame(
+    struct p2p_node *node, const struct chain_params *params,
+    uint32_t piece_index)
+{
+    struct byte_stream payload;
+    stream_init(&payload, 8);
+    bool ok = stream_write_u32_le(&payload, piece_index) &&
+        stream_write_u32_le(&payload, 1) &&
+        p2p_node_begin_message(node, MSG_BLOCK_DATA,
+                               params->pchMessageStart);
+    if (ok)
+        p2p_node_write_message_data(node, payload.data, payload.size);
+    if (ok)
+        ok = p2p_node_end_message(node);
+    stream_free(&payload);
+    return ok;
+}
+
 static bool bs_refuses_unsolicited_block_piece(
     struct p2p_node *requester, struct send_segment *requester_sent,
     struct msg_processor *serve_mp, struct p2p_node *server,
@@ -1818,6 +1836,17 @@ static int test_block_swarm_duplicate_delivery(void)
         struct bs_kept kept[4] = {0};
         size_t kept_n = bs_steal_queue(a_node, sent_a, kept, 4);
         ASSERT(kept_n == 2);
+
+        /* A peer that owns piece 0 sends a complete frame whose payload
+         * stops before the advertised block hash. Ownership must be released
+         * immediately so another send tick can request it without waiting
+         * for the piece timeout. */
+        ASSERT(bs_push_truncated_block_data_frame(b_node, params, 0));
+        ASSERT(bs_pump(b_node, sent_b, &mp_b, b_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        mp_snapshot_send_tick(&mp_b, b_node);
+        ASSERT(bs_queue_depth(sent_b) == 1);
+        bs_drop_queue(b_node, sent_b);
 
         /* Deliver piece 0, then a DUPLICATE of piece 0 (the timeout
          * re-request answered twice). The duplicate must not complete the
