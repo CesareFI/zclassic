@@ -90,6 +90,8 @@ bool mp_snapshot_test_chunk_state(uint32_t chunk_index,
                                   int *peer_out,
                                   uint32_t *inflight_out,
                                   uint32_t *complete_out);
+void mp_snapshot_test_age_peer_chunk(struct p2p_node *node,
+                                     int64_t request_time);
 void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
                                     int64_t last_complete_monotonic);
 bool mp_block_swarm_test_admit_peer(struct p2p_node *node);
@@ -796,6 +798,25 @@ static int test_snapshot_manifest_wire_reconnect(void)
         mp_snapshot_send_tick(&mp, peer_b);
         ASSERT(peer_b->swarm_inflight_chunk == 0);
         ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_b->id, 1, 0));
+
+        /* Re-admit the replacement source, then prove the timed-out owner
+         * yields instead of reclaiming its chunk in the same send tick. */
+        ASSERT(bs_push_manifest_frame(peer_a, mp.params, &manifest));
+        ASSERT(bs_pump(peer_a, sent_a, &mp, peer_a,
+                       mp.params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(peer_a->swarm_manifest_received);
+        bs_drop_queue(peer_a, sent_a);
+        bs_drop_queue(peer_b, sent_b);
+        int64_t expired = platform_time_monotonic_us() / 1000000 - 31;
+        mp_snapshot_test_age_peer_chunk(peer_b, expired);
+        mp_snapshot_send_tick(&mp, peer_b);
+        ASSERT(peer_b->swarm_inflight_chunk == -1);
+        ASSERT(bs_queue_depth(sent_b) == 0);
+        ASSERT(bs_snapshot_state(0, CHUNK_NEEDED, -1, 0, 0));
+        mp_snapshot_send_tick(&mp, peer_a);
+        ASSERT(peer_a->swarm_inflight_chunk == 0);
+        ASSERT(bs_queue_depth(sent_a) == 1);
+        ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_a->id, 1, 0));
 
         mp_snapshot_test_stop_swarm();
         ASSERT(bs_push_manifest_frame(peer_bad, mp.params, &manifest));

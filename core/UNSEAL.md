@@ -528,3 +528,11 @@ later lane flips it HARD.
 - 2026-09-21T08:19:40Z — REASON: Preserve per-peer timeout ownership attribution by reconciling only the owning pipeline before reassignment; transport telemetry and scheduling only, consensus unchanged
   old ROOT: 74b4745f2970992be3c4fd5df634256fc8ab6d7e2b18f1bba5c1e93403d7d7b2
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T08:26:11Z — REASON: Prevent a timed-out snapshot chunk owner from immediately reclaiming work while retaining bounded orphan cleanup; transport scheduling only, consensus unchanged
+  old ROOT: de56e48b624a944f2a2f344fbbad8bf56d999667d23cc13b640a65e43a31ab82
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T08:28:57Z — REASON: Refactor snapshot owner-timeout handling below the cyclomatic-complexity ratchet without changing transport behavior or consensus
+  old ROOT: ae43277e7f177a9b92cf867aaefa9d2753a845a0670c7154345c2884c427a25f
+  by: owner unseal ritual (make core-unseal)

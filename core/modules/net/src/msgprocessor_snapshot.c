@@ -983,6 +983,21 @@ bool mp_snapshot_test_chunk_state(uint32_t chunk_index,
     swarm_mutex_unlock();
     return available;
 }
+
+void mp_snapshot_test_age_peer_chunk(struct p2p_node *node,
+                                     int64_t request_time)
+{
+    if (!node || !swarm_mutex_lock())
+        return;
+    int32_t chunk = node->swarm_inflight_chunk;
+    node->swarm_chunk_req_time = request_time;
+    if (atomic_load(&g_swarm_active) && chunk >= 0 &&
+        (uint32_t)chunk < g_swarm.manifest.num_chunks &&
+        g_swarm.chunk_states[chunk] == CHUNK_INFLIGHT &&
+        g_swarm.chunk_peer[chunk] == node->id)
+        g_swarm.chunk_request_time[chunk] = request_time;
+    swarm_mutex_unlock();
+}
 #endif
 
 size_t mp_snapshot_swarm_peer_disconnected(struct p2p_node *node)
@@ -2143,6 +2158,28 @@ void mp_snapshot_maybe_offer(struct msg_processor *mp,
     }
 }
 
+/* Caller holds g_swarm_mutex. Return true when this owner must yield the
+ * current send tick after releasing expired work. */
+static bool swarm_reconcile_peer_timeout_locked(struct p2p_node *node,
+                                                 int64_t now_monotonic)
+{
+    if (node->swarm_inflight_chunk < 0 ||
+        !fast_sync_timeout_elapsed_at(now_monotonic,
+                                      node->swarm_chunk_req_time,
+                                      SWARM_CHUNK_TIMEOUT_SECS))
+        return false;
+
+    uint32_t chunk = (uint32_t)node->swarm_inflight_chunk;
+    bool released = swarm_sync_requeue_chunk_for_peer(
+        &g_swarm, chunk, node->id);
+    if (released) {
+        printf("Peer %s: chunk %u timed out, re-queuing\n",
+               node->addr_name, chunk);
+    }
+    node->swarm_inflight_chunk = -1;
+    return released;
+}
+
 /* Serve the snapshot stream and drive both swarm coordinators. */
 void mp_snapshot_send_tick(struct msg_processor *mp,
                             struct p2p_node *node)
@@ -2162,30 +2199,17 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
     if (node->state >= PEER_HANDSHAKE_COMPLETE &&
         swarm_lock_admitted_peer(node)) {
 
-        /* Requeue globally stale inflight chunks. A peer can disconnect and
-         * lose node->swarm_inflight_chunk while g_swarm still marks that
-         * chunk inflight; without the global sweep the final chunk can sit
-         * at 2679/2680 forever with no peer able to claim it. */
-        swarm_sync_handle_timeouts(&g_swarm, SWARM_CHUNK_TIMEOUT_SECS);
-
         /* Handle timeout: if this peer's chunk is stale, re-queue it */
-        if (node->swarm_inflight_chunk >= 0) {
-            int64_t now_sw = platform_time_monotonic_us() / 1000000;
-            if (fast_sync_timeout_elapsed_at(
-                    now_sw, node->swarm_chunk_req_time,
-                    SWARM_CHUNK_TIMEOUT_SECS)) {
-                uint32_t ci = (uint32_t)node->swarm_inflight_chunk;
-                if (swarm_sync_requeue_chunk_for_peer(
-                        &g_swarm, ci, node->id)) {
-                    printf("Peer %s: chunk %u timed out, re-queuing\n",
-                           node->addr_name, ci);
-                }
-                node->swarm_inflight_chunk = -1;
-            }
-        }
+        bool peer_timed_out = swarm_reconcile_peer_timeout_locked(
+            node, platform_time_monotonic_us() / 1000000);
+
+        /* Preserve a bounded fallback for a global-only orphan, but give the
+         * exact owner a full timeout window to account and yield first. */
+        swarm_sync_handle_timeouts(&g_swarm,
+                                   SWARM_CHUNK_TIMEOUT_SECS * 2);
 
         /* If peer has no inflight chunk, assign the next needed one */
-        if (node->swarm_inflight_chunk < 0) {
+        if (node->swarm_inflight_chunk < 0 && !peer_timed_out) {
             int32_t ci = swarm_sync_assign_chunk(&g_swarm, node->id);
             if (ci >= 0) {
                 node->swarm_inflight_chunk = ci;

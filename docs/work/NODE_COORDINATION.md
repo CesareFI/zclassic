@@ -1027,3 +1027,34 @@ measure the exposed requested/delivered/timeout counters during an isolated
 multi-peer synchronization or, if no consenting fast-sync peer is available,
 extend the deterministic scheduler fixture to quantify sustained slow-peer
 rotation without live-network dependence.
+
+## Make timed-out snapshot owners yield to healthy sources
+
+Baseline: the UTXO snapshot scheduler ran its global 30-second timeout sweep
+before examining the current peer. On the slow owner's tick, the sweep changed
+its chunk to needed, owner-local requeue no longer matched, and the same peer
+immediately assigned itself that chunk again. A lone slow peer encountered
+first could repeat this cycle and starve an already-admitted healthy source.
+
+Root cause and fix: global orphan recovery and exact-owner timeout recovery
+shared a deadline and assignment path. The scheduler now requeues the exact
+owner first, records that it timed out, and suppresses assignment to it for
+that tick. The global orphan sweep remains bounded at a separate 60-second
+backstop, while disconnect still requeues immediately.
+
+After-result and regression proof: the direct manifest-wire reconnect fixture
+admits two sources, deterministically ages the current owner's chunk, and runs
+that owner's production send tick. The owner releases the chunk and emits no
+new request; the healthy replacement source then owns and requests it on its
+next tick. The full `block_swarm_loopback` group passes, including malformed,
+duplicate, late, disconnect, generation, and ownership cases.
+
+Consensus impact: NONE. Snapshot object verification, roots, install policy,
+block/transaction validity, and all cryptography are unchanged. This is only
+peer scheduling after a monotonic transport timeout. Worldstream remains at
+`0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: add explicit UTXO-swarm timeout and
+delivery counters for operator visibility only if live or fixture evidence
+shows snapshot stalls remain hard to attribute; otherwise inspect header
+source rotation after repeated empty partial responses.
