@@ -1860,3 +1860,22 @@ timeout, and disconnect ownership cases pass in the same group. Consensus
 impact: NONE. Worldstream `d9f5153be` is complementary storage/startup work.
 Remaining risk and next investigation: inspect snapshot timeout/reassignment
 fairness under larger source churn without adding persistent peer trust state.
+
+## Snapshot timeout-source yield
+
+Baseline and root cause: the reconnect-source yield protected a replacement
+session, but a timed-out source was deferred only for the callback that
+released its chunk. In fixed peer order, that same source could reclaim the
+chunk on its next tick before another admitted compatible source ran.
+
+Fix and after-result: timeout requeue now records the existing bounded,
+endpoint-scoped generation yield. The first different source that actually
+receives work consumes the yield, so normal recovery and later retries are not
+delayed. This remains volatile scheduling state only.
+
+Regression proof: `test_block_swarm_loopback` expires an owner, invokes that
+owner's next send tick, and proves it cannot reacquire before the healthy
+admitted source owns the chunk. Consensus impact: NONE. Worldstream
+`d9f5153be` remains complementary storage/startup work. Remaining risk and
+next investigation: measure source fairness across repeated timeout and
+disconnect churn with more than two compatible peers.

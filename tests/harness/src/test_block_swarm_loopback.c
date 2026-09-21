@@ -900,6 +900,12 @@ static int test_snapshot_manifest_wire_reconnect(void)
         ASSERT(peer_b->swarm_inflight_chunk == -1);
         ASSERT(bs_queue_depth(sent_b) == 0);
         ASSERT(bs_snapshot_state(0, CHUNK_NEEDED, -1, 0, 0));
+        /* The timed-out owner is also deferred on its next fixed-order
+         * callback, giving the admitted alternative an actual recovery
+         * opportunity rather than merely yielding one call. */
+        mp_snapshot_send_tick(&mp, peer_b);
+        ASSERT(peer_b->swarm_inflight_chunk == -1);
+        ASSERT(bs_queue_depth(sent_b) == 0);
         mp_snapshot_send_tick(&mp, peer_a);
         ASSERT(peer_a->swarm_inflight_chunk == 0);
         ASSERT(bs_queue_depth(sent_a) == 1);

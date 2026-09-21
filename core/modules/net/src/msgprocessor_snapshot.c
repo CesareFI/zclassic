@@ -2423,6 +2423,7 @@ static bool swarm_reconcile_peer_timeout_locked(struct p2p_node *node,
     bool released = swarm_sync_requeue_chunk_for_peer(
         &g_swarm, chunk, node->id);
     if (released) {
+        swarm_record_reconnect_yield_locked(node, now_monotonic);
         printf("Peer %s: chunk %u timed out, re-queuing\n",
                node->addr_name, chunk);
     }

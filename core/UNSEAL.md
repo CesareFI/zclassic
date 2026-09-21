@@ -644,3 +644,7 @@ later lane flips it HARD.
 - 2026-09-21T14:44:08Z — REASON: Bound snapshot chunk reacquisition by a reconnecting endpoint so stable compatible peers get an immediate reassignment opportunity.
   old ROOT: a7cf767c120bb7ba23fc7d42085bf85e7a7a2a1f8f209fc4e1ee51e3de9daedf
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T15:03:48Z — REASON: Give an already-admitted snapshot source an immediate reassignment opportunity after another source times out.
+  old ROOT: 5afd3b1d83bca54918c95a5d899b021916e0d0193ac6defff1c9709fca4b5b5a
+  by: owner unseal ritual (make core-unseal)
