@@ -2027,3 +2027,21 @@ then restores the fixture cursor and completes the normal real-wire transfer.
 Consensus impact: NONE. Worldstream `5297c58f4` remains complementary.
 Remaining risk and next investigation: inspect snapshot requester recovery
 when a served peer disconnects after data enqueue but before terminal delivery.
+
+## Inbound block-download occupancy
+
+Baseline and root cause: every direct block request scanned the complete
+in-flight table merely to count inbound-owned slots for the outbound-reserved
+window. During IBD that bounded table reaches thousands of entries while the
+same count is maintained by the request lifecycle.
+
+Fix and after-result: `download_manager` now maintains bounded
+`num_inbound_active` state across assignment, receipt, timeout, disconnect,
+notfound, and forced drain. Direct reservation decisions are O(1); assignment
+still scans only for its necessary per-peer and history-lane counts.
+
+Regression proof: the focused download groups pass, including direct inbound
+reservation, concurrent access, timeout/disconnect/notfound recovery, and
+speed contracts. Consensus impact: NONE. Worldstream `5297c58f4` remains
+complementary. Remaining risk: maintain lifecycle counter coverage whenever a
+new active-slot terminal path is introduced.

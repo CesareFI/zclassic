@@ -672,3 +672,7 @@ later lane flips it HARD.
 - 2026-09-21T16:39:13Z — REASON: Preserve snapshot reconnect yield until zchunkreq enqueue succeeds
   old ROOT: eeb2ccc16f68be6f7f5e3537183c7eaf43a5a4d9a9a961617a09794844f69f8b
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T16:56:54Z — REASON: Maintain bounded inbound block-download occupancy counter
+  old ROOT: d94f1adac5689216cfc1e0683b5a1a39933d94de1edb86972517cc7e03e9d7cc
+  by: owner unseal ritual (make core-unseal)

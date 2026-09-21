@@ -218,10 +218,19 @@ static int test_dl_direct_inbound_reservation(void)
             memcpy(hash.data, &key, sizeof(key));
             ASSERT(dl_mark_requested(&dm, &hash, (int32_t)i, 1));
         }
+        ASSERT(dm.num_inbound_active == limit / 2);
         struct uint256 blocked = {{0}};
         uint32_t blocked_key = (uint32_t)limit + 1;
         memcpy(blocked.data, &blocked_key, sizeof(blocked_key));
         ASSERT(!dl_mark_requested(&dm, &blocked, (int32_t)limit, 1));
+
+        struct uint256 received = {{0}};
+        uint32_t received_key = 1;
+        memcpy(received.data, &received_key, sizeof(received_key));
+        ASSERT(dl_mark_received(&dm, &received) == 1);
+        ASSERT(dm.num_inbound_active == limit / 2 - 1);
+        ASSERT(dl_mark_requested(&dm, &blocked, (int32_t)limit, 1));
+        ASSERT(dm.num_inbound_active == limit / 2);
 
         dl_set_peer_inbound(&dm, 2, false);
         struct uint256 outbound = {{0}};

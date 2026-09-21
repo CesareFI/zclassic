@@ -585,6 +585,8 @@ static void dl_activate_slot(struct download_manager *dm,
     slot->peer_inbound = ps && ps->is_inbound;
     slot->active = true;
     dm->num_active++;
+    if (slot->peer_inbound)
+        dm->num_inbound_active++;
     dm->total_requested++;
 }
 
@@ -607,11 +609,7 @@ static bool dl_inbound_window_full_locked(struct download_manager *dm,
     size_t inbound_limit = global_limit / 2;
     if (inbound_limit == 0)
         inbound_limit = 1;
-    size_t inbound = 0;
-    for (size_t i = 0; i < dm->num_slots; i++)
-        if (dm->slots[i].active && dm->slots[i].peer_inbound)
-            inbound++;
-    return inbound >= inbound_limit;
+    return dm->num_inbound_active >= inbound_limit;
 }
 
 bool dl_mark_requested(struct download_manager *dm,
@@ -708,6 +706,8 @@ uint32_t dl_mark_received(struct download_manager *dm,
     s->received_time = received_monotonic;
     dm->num_received_pending++;
     dm->num_active--;
+    if (s->peer_inbound)
+        dm->num_inbound_active--;
     dm->total_received++;
     dl_generation_advance(&dm->capacity_generation);
 
@@ -769,6 +769,8 @@ size_t dl_check_timeouts(struct download_manager *dm, int64_t now_monotonic)
                       s->work_class);
         s->active = false;
         dm->num_active--;
+        if (s->peer_inbound)
+            dm->num_inbound_active--;
         dm->total_timed_out++;
         reassigned++;
     }
@@ -855,6 +857,8 @@ size_t dl_peer_disconnected(struct download_manager *dm, uint32_t peer_id)
                       s->work_class);
         s->active = false;
         dm->num_active--;
+        if (s->peer_inbound)
+            dm->num_inbound_active--;
         /* Settle the request (see the invariant on the stats fields): the
          * requeued block will increment total_requested AGAIN when it is
          * re-assigned, so leaving the original request open here leaks a
@@ -907,6 +911,8 @@ size_t dl_mark_notfound(struct download_manager *dm, uint32_t peer_id,
                   s->work_class);
     s->active = false;
     dm->num_active--;
+    if (s->peer_inbound)
+        dm->num_inbound_active--;
     /* Settle the request exactly once (see the invariant on the stats
      * fields): the requeued block increments total_requested again when it is
      * re-assigned, so the original must not be left open. */
@@ -1272,7 +1278,6 @@ struct dl_assignment_counts {
     size_t peer;
     size_t history_peer;
     size_t history_global;
-    size_t inbound;
 };
 
 static struct dl_assignment_counts dl_count_assignment_slots(
@@ -1283,8 +1288,6 @@ static struct dl_assignment_counts dl_count_assignment_slots(
         const struct dl_in_flight *slot = &dm->slots[i];
         if (!slot->active)
             continue;
-        if (slot->peer_inbound)
-            counts.inbound++;
         if (slot->work_class == DL_WORK_HISTORY) {
             counts.history_global++;
             if (slot->peer_id == peer_id)
@@ -1380,7 +1383,7 @@ size_t dl_assign_to_peer(struct download_manager *dm,
 
     bool inbound_window_full = false;
     available = dl_clamp_inbound_available(
-        ps_assign, counts.inbound, global_limit, available,
+        ps_assign, dm->num_inbound_active, global_limit, available,
         &inbound_window_full);
 
     /* History owns a subordinate lane. These limits never charge forward
@@ -1744,6 +1747,7 @@ size_t dl_drain_for_backpressure(struct download_manager *dm)
     for (size_t i = 0; i < dm->num_slots; i++)
         dm->slots[i].active = false;
     dm->num_active = 0;
+    dm->num_inbound_active = 0;
     if (drained > 0)
         dl_generation_advance(&dm->capacity_generation);
 

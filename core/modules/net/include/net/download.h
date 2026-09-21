@@ -239,6 +239,7 @@ struct download_manager {
     struct dl_in_flight *slots;
     size_t               num_slots;     /* capacity (power of 2) */
     size_t               num_active;    /* current in-flight count */
+    size_t               num_inbound_active; /* active inbound-owned slots */
     size_t               num_received_pending; /* fresh inactive dedup guards */
 
     /* Per-peer stats */
