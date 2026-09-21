@@ -2576,3 +2576,28 @@ unchanged. Worldstream `d9f5153be` remains complementary startup/recovery
 work. Remaining risk: exceptional configured peer ceilings can still outgrow
 the normal bounded fairness table; next investigate whether the block-swarm
 table has equivalent ownership behavior under its larger per-peer pipelines.
+
+## Block-swarm reconnect-yield diversity capacity
+
+Baseline and root cause: the block-swarm side shares the reconnect-yield
+policy but each source can own a 64-piece assignment batch. Its prior
+single-source regression did not exercise the 32-record endpoint table
+overflow, leaving the shared 125-peer capacity correction unproven for
+block-piece ownership.
+
+Regression proof: a deterministic scheduler fixture starts a 64-piece swarm,
+lets 33 distinct endpoints each claim then disconnect from the same batch, and
+admits a replacement for the first endpoint. The replacement has zero queued
+requests, proving its original fairness yield survived the churn beyond the
+old table size. Static C23 syntax passes; the loopback source has only its
+pre-existing unrelated trust-override declaration warning. Complexity,
+generated capability inventory, and whitespace gates pass. Runtime and
+ASan/UBSan remain disk-gated at 10 GB free because their cold verifier build
+would cross the safety floor.
+
+Consensus impact: NONE. This is direct regression coverage for volatile
+request scheduling only; manifest/payload verification, reducer admission,
+serialization, block/transaction validity, PoW, and chain selection are
+unchanged. Worldstream `d9f5153be` remains complementary startup/recovery
+work. Remaining risk: measure sustained high-churn useful delivery and timeout
+ratios before considering any adaptive scheduler policy.

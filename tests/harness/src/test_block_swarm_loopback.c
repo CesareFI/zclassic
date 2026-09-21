@@ -2004,6 +2004,68 @@ static int test_block_swarm_reconnect_yield(void)
     return failures;
 }
 
+static int test_block_swarm_reconnect_yield_table_capacity(void)
+{
+    int failures = 0;
+
+    TEST("block swarm reconnect yield survives churn beyond the old table") {
+        const size_t batch = PIECE_PIPELINE_DEPTH / 4;
+        const uint32_t pieces = (uint32_t)batch;
+        const int32_t end_height = (int32_t)pieces * BLOCKS_PER_PIECE;
+        struct main_state ms;
+        struct net_manager nm;
+        struct msg_processor mp;
+        struct uint256 header_hash;
+        struct p2p_node *old[BS_RECONNECT_CHURN_SOURCES] = {0};
+
+        main_state_init(&ms);
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.main_state = &ms;
+        mp.net_mgr = &nm;
+        mp.params = chain_params_get();
+        memset(&header_hash, 0x6c, sizeof(header_hash));
+        struct block_index *best_header =
+            chainstate_insert_block_index((struct chainstate *)&ms,
+                                          &header_hash);
+        ASSERT(best_header != NULL);
+        best_header->nHeight = end_height;
+        best_header->nStatus = BLOCK_VALID_TREE;
+        ms.pindex_best_header = best_header;
+
+        for (uint8_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++) {
+            old[i] = bs_make_peer(&nm, (uint8_t)(160 + i));
+            ASSERT(old[i] != NULL);
+            old[i]->blk_peer_height = end_height;
+        }
+        struct p2p_node *replacement = bs_make_peer(&nm, 160);
+        ASSERT(replacement != NULL);
+        replacement->blk_peer_height = end_height;
+
+        mp_block_swarm_test_seed_stall(0, pieces, 1);
+        for (size_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++) {
+            ASSERT(mp_block_swarm_test_admit_peer(old[i]));
+            mp_snapshot_send_tick(&mp, old[i]);
+            ASSERT(atomic_load(&old[i]->blk_pieces_requested) == batch);
+            ASSERT(mp_block_swarm_peer_disconnected(old[i]) == batch);
+        }
+
+        ASSERT(mp_block_swarm_test_admit_peer(replacement));
+        mp_snapshot_send_tick(&mp, replacement);
+        ASSERT(atomic_load(&replacement->blk_pieces_requested) == 0);
+
+        mp_block_swarm_test_seed_stall(0, 0, 0);
+        for (size_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++)
+            p2p_node_free(old[i]);
+        p2p_node_free(replacement);
+        net_manager_free(&nm);
+        main_state_free(&ms);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_block_swarm_stale_pipeline_reclaim(void)
 {
     int failures = 0;
@@ -2925,6 +2987,7 @@ int test_block_swarm_loopback(void)
     failures += test_block_swarm_disconnect_requeue();
     failures += test_block_swarm_peer_fairness();
     failures += test_block_swarm_reconnect_yield();
+    failures += test_block_swarm_reconnect_yield_table_capacity();
     failures += test_block_swarm_stale_pipeline_reclaim();
     failures += test_block_swarm_timeout_owner_yields();
     failures += test_block_swarm_restart_cooldown();
