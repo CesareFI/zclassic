@@ -708,3 +708,11 @@ later lane flips it HARD.
 - 2026-09-21T17:49:50Z — REASON: Skip empty block-swarm timeout sweeps while preserving piece timeout recovery
   old ROOT: cd5c3da89c8e5166a1d99ea7395903aa4f993009ca0f8f31fd5baa41dc2188cc
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:53:10Z — REASON: Coalesce block swarm global orphan timeout scans while retaining exact-owner recovery
+  old ROOT: 27b41374fd9af11b4878ddfc02192f715c1a4fe9fed34773951878f2c36eace7
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:54:21Z — REASON: Refactor authorized block swarm timeout sweep under complexity ratchet
+  old ROOT: 336e15cbb803a235d4b0db0440c76b176422cffadae94e3ac544ef63cf7f2e86
+  by: owner unseal ritual (make core-unseal)

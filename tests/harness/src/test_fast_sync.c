@@ -987,6 +987,10 @@ static int test_swarm_timeout_monotonic_boundaries(void)
 
         struct block_swarm bs;
         ASSERT(block_swarm_init(&bs, &block_manifest, NULL));
+        ASSERT(block_swarm_timeout_sweep_due(&bs, 100, 1));
+        ASSERT(!block_swarm_timeout_sweep_due(&bs, 100, 1));
+        ASSERT(block_swarm_timeout_sweep_due(&bs, 101, 1));
+        ASSERT(block_swarm_timeout_sweep_due(&bs, 99, 1));
         block_swarm_handle_timeouts_at(&bs, 30, 100);
         ASSERT(bs.timeout_probes == 0);
         ASSERT(block_swarm_assign_piece(&bs, 1, NULL, 0) == 0);

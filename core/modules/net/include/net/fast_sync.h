@@ -465,6 +465,7 @@ struct block_swarm {
     uint32_t pieces_inflight;
     uint32_t pieces_failed;
     uint64_t timeout_probes;        /* timeout scan states; diagnostic */
+    int64_t last_timeout_sweep_monotonic; /* global orphan scan cadence */
     uint32_t next_assign_hint;       /* lowest possibly assignable piece */
     uint32_t first_incomplete_hint;  /* lowest possibly incomplete piece */
     int64_t  last_complete_monotonic;   /* monotonic seconds at last piece
@@ -550,6 +551,9 @@ int block_swarm_progress(const struct block_swarm *bs);
 void block_swarm_handle_timeouts(struct block_swarm *bs, int timeout_secs);
 void block_swarm_handle_timeouts_at(struct block_swarm *bs, int timeout_secs,
                                     int64_t now_monotonic);
+bool block_swarm_timeout_sweep_due(struct block_swarm *bs,
+                                   int64_t now_monotonic,
+                                   int64_t interval_secs);
 
 /* Update piece availability from peer's bitmap.
  * bitmap: bit array, bit i set = peer has piece i. */

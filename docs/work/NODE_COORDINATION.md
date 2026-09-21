@@ -2159,3 +2159,20 @@ zero probes and both non-expired and expired in-flight piece cases. Consensus
 impact: NONE. Worldstream remains complementary. Remaining risk: cold runtime
 group awaits disk headroom. Next investigation: coalesce nonempty block-swarm
 orphan scans across peer ticks.
+
+## Block-swarm global timeout-sweep coalescing
+
+Baseline and root cause: each eligible block-swarm peer tick invoked the
+global orphan timeout sweep over the piece manifest, duplicating work while
+per-peer pipeline reconciliation already handled the normal owner path.
+
+Fix and after-result: the global backstop now runs at most once per monotonic
+second. Per-peer reconciliation remains immediate. A monotonic regression
+admits a sweep rather than suppressing recovery.
+
+Regression proof: `test_fast_sync` covers first admission, same-tick
+suppression, interval admission, and regression admission for block-swarm
+cadence. Consensus impact: NONE. Worldstream remains complementary. Remaining
+risk: cold runtime groups await safe disk headroom; syntax, seal, parity, and
+complexity checks pass. Next investigation: defer nonempty block-swarm scans
+until the earliest possible piece expiry.

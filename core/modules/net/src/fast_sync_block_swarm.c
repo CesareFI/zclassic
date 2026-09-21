@@ -338,6 +338,21 @@ void block_swarm_handle_timeouts(struct block_swarm *bs, int timeout_secs)
         bs, timeout_secs, platform_time_monotonic_us() / 1000000);
 }
 
+bool block_swarm_timeout_sweep_due(struct block_swarm *bs,
+                                   int64_t now_monotonic,
+                                   int64_t interval_secs)
+{
+    if (!bs || interval_secs <= 0)
+        return false;
+    if (bs->last_timeout_sweep_monotonic <= 0 ||
+        now_monotonic < bs->last_timeout_sweep_monotonic ||
+        now_monotonic - bs->last_timeout_sweep_monotonic >= interval_secs) {
+        bs->last_timeout_sweep_monotonic = now_monotonic;
+        return true;
+    }
+    return false;
+}
+
 static bool block_swarm_bitmap_has(const uint8_t *bitmap,
                                    uint32_t bitmap_len, uint32_t piece)
 {

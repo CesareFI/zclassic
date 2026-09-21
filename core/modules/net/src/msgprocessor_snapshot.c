@@ -422,6 +422,15 @@ static uint64_t g_block_swarm_generation = 0;
  * transfer back out of legacy getdata's hands every few seconds. */
 static _Atomic int64_t g_block_swarm_reaped_monotonic = 0;
 
+/* Caller holds g_block_swarm_mutex. Exact-owner pipeline reconciliation runs
+ * per peer tick; this bounded traversal is only the global orphan backstop. */
+static void block_swarm_global_timeout_sweep_locked(int64_t now_monotonic)
+{
+    if (block_swarm_timeout_sweep_due(&g_block_swarm, now_monotonic, 1))
+        block_swarm_handle_timeouts_at(
+            &g_block_swarm, BLOCK_PIECE_TIMEOUT_SECS * 2, now_monotonic);
+}
+
 static bool block_swarm_peer_response_allowed(
     struct p2p_node *node, uint32_t piece_index)
 {
@@ -2569,8 +2578,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
          * order expire another peer's pieces before that owner ran, losing
          * attribution and bypassing its one-tick yield. Retain a second-window
          * global backstop so a connected global-only orphan stays bounded. */
-        block_swarm_handle_timeouts(
-            &g_block_swarm, BLOCK_PIECE_TIMEOUT_SECS * 2);
+        block_swarm_global_timeout_sweep_locked(now_bs);
 
         /* Fill a bounded batch of empty slots. Limiting only NEW work per
          * tick prevents the first scheduled peer from consuming the entire
