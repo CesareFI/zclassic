@@ -308,10 +308,16 @@ int test_getheaders_serve_fallback(void)
                   !ok && header_serve_repair_test_armed() &&
                   header_serve_repair_wants(bi_a));
 
+        struct p2p_node failed_peer;
+        gsf_setup_outbound_peer(&failed_peer, bi_d->nHeight);
+        failed_peer.send_size = net_send_peer_bytes_hard_cap();
+        header_serve_repair_maybe_send(&mp, &failed_peer, 1);
+        failed_peer.send_size = 0;
+
         struct p2p_node peer;
         gsf_setup_outbound_peer(&peer, bi_d->nHeight);
         header_serve_repair_maybe_send(&mp, &peer, 1);
-        GSF_CHECK("first peer publishes one exact bounded repair span",
+        GSF_CHECK("failed enqueue leaves immediate repair retry eligible",
                   peer.send_size > 0 &&
                   header_serve_repair_test_expected_count() == 3);
         GSF_CHECK("verified span member records partial progress",
@@ -325,6 +331,7 @@ int test_getheaders_serve_fallback(void)
                   retry_peer.send_size > 0 &&
                   header_serve_repair_test_expected_count() == 3 &&
                   header_serve_repair_test_cached_count() == 1);
+        gsf_free_outbound_peer(&failed_peer);
         gsf_free_outbound_peer(&peer);
         gsf_free_outbound_peer(&retry_peer);
     }

@@ -103,6 +103,24 @@ bool header_serve_repair_wants(const struct block_index *bi)
     return wanted;
 }
 
+static void hsr_send_claimed_request(
+    struct msg_processor *mp, struct p2p_node *node,
+    const struct uint256 *parent_hash, const struct uint256 *stop_hash,
+    int64_t last, int64_t now_us, int32_t target_height, size_t count)
+{
+    if (!push_getheaders_span(mp, node, parent_hash, stop_hash)) {
+        int64_t claimed = now_us;
+        (void)atomic_compare_exchange_strong(
+            &g_hsr_last_send_us, &claimed, last);
+        return;
+    }
+    LOG_INFO(HSR_SUBSYS,
+             "getheaders: requested header-only repair h=%d..%d count=%zu "
+             "from %s",
+             target_height, target_height + (int32_t)count - 1, count,
+             node->addr_name);
+}
+
 void header_serve_repair_note_cached(const struct block_index *bi)
 {
     if (!bi || !bi->phashBlock ||
@@ -231,12 +249,9 @@ void header_serve_repair_maybe_send(struct msg_processor *mp,
         return; // raw-return-ok:another-peer-claimed-repair-send
 
     struct uint256 parent_hash = *target->pprev->phashBlock;
-    push_getheaders_span(mp, node, &parent_hash, &stop_hash);
-    LOG_INFO(HSR_SUBSYS,
-             "getheaders: requested header-only repair h=%d..%d count=%zu "
-             "from %s",
-             target_height, target_height + (int32_t)count - 1, count,
-             node->addr_name);
+    hsr_send_claimed_request(
+        mp, node, &parent_hash, &stop_hash, last, now_us,
+        target_height, count);
 }
 
 #ifdef ZCL_TESTING

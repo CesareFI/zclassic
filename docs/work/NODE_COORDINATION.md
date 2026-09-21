@@ -1373,3 +1373,30 @@ Remaining risk and next investigation: checkpoint-header fetch and
 header-serve repair use the same now-observable send result but still consume
 their retry throttle when enqueue fails; make those isolated retry gates
 failure-aware without changing range scheduling.
+
+## Preserve header-repair retry eligibility after enqueue failure
+
+Baseline and root cause: checkpoint-header fetch and missing-solution repair
+claimed their global retry timestamp before enqueue. Even after span sends
+became failure-aware, a refused request consumed the full retry interval and
+prevented another healthy peer from trying immediately.
+
+Fix: each sender conditionally restores the timestamp it claimed when
+`push_getheaders_span` reports failure. The compare-and-swap rollback cannot
+overwrite a newer claimant. Header-repair send/rollback/logging lives in a
+small helper so the existing complexity ratchet does not grow.
+
+After-result and regression proof: the serve-fallback regression first drives
+a repair request into a full 64 MiB peer queue, then invokes a healthy peer at
+the identical monotonic timestamp. Pre-fix the healthy request was throttled;
+it now queues immediately while retaining the immutable three-header span and
+partial-progress behavior. `getheaders_serve_fallback` passes.
+
+Consensus impact: NONE. This changes retry timing for unsent header requests;
+all header reconstruction, hash binding, Equihash, PoW, and persistence checks
+remain unchanged. Worldstream remains at `0b29bec27` on complementary
+startup/observer work.
+
+Remaining risk and next investigation: add the same direct failure/retry proof
+for compiled-checkpoint header capture, then inspect ordinary `getheaders` and
+legacy block-request accounting for discarded queue failures.

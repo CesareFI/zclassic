@@ -568,3 +568,7 @@ later lane flips it HARD.
 - 2026-09-21T09:44:25Z — REASON: Release header-range ownership when bounded getheaders enqueue fails; transport scheduling only, consensus unchanged
   old ROOT: e3af2a02f939e6b8a21fd943a70974bd6d8cf504543dbc38eb28c06e7f786d9f
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T09:52:13Z — REASON: Restore checkpoint and header-repair retry eligibility after bounded getheaders enqueue failure; transport liveness only, consensus unchanged
+  old ROOT: 272b995ba06b90c715944e7f90f36197255e8e47c0363b12645eb3520b782783
+  by: owner unseal ritual (make core-unseal)

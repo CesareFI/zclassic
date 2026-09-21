@@ -190,7 +190,12 @@ void checkpoint_header_fetch_maybe_send(struct msg_processor *mp,
     if (!atomic_compare_exchange_strong(&g_last_send_us, &last, now_us))
         return; // raw-return-ok:another-peer-claimed-this-interval
 
-    push_getheaders_span(mp, node, &parent_hash, &target_hash);
+    if (!push_getheaders_span(mp, node, &parent_hash, &target_hash)) {
+        int64_t claimed = now_us;
+        (void)atomic_compare_exchange_strong(
+            &g_last_send_us, &claimed, last);
+        return; // raw-return-ok:unsent-request-restores-throttle
+    }
     atomic_fetch_add(&g_sends, 1);
     LOG_INFO(CHF_SUBSYS,
              "requested checkpoint header h=%d from %s via bounded getheaders "
