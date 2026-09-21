@@ -432,3 +432,23 @@ later lane flips it HARD.
 - 2026-09-21T03:10:56Z — REASON: Add test-only snapshot swarm state seams for direct framed zchunkdata adversarial regression coverage; no production behavior or consensus semantic change
   old ROOT: ac003e6cd7671e32b1884b6c2287f9999ebceefeb36b7f97a4197579278bbe11
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T03:27:26Z — REASON: Admit secondary snapshot sources only when their verified manifest exactly matches the active swarm, with race-free mutex serialization; scheduling safety only, no consensus semantic change
+  old ROOT: 43f2dbf04364140eb36f20d2f024b532255d5f62819d58ce6b2d349de6633422
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T03:33:08Z — REASON: Add deterministic test access for exact snapshot manifest source admission and reconnect failover; no production or consensus semantic change
+  old ROOT: f951fe27e4d1bd6a7f10f42ff970c85fe65d9e5fdba06f522d29d67597450af6
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T03:48:56Z — REASON: Compare every snapshot manifest identity field when admitting secondary sources; future-safe scheduler validation only, no consensus semantic change
+  old ROOT: 3b28758fd41b449173bc79fe480cb40a386800af6aaa3f0c9599af4ab9f353c8
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T03:51:07Z — REASON: Refactor exact snapshot manifest identity comparison below the complexity cap; no behavioral or consensus semantic change
+  old ROOT: f77c2d480a4a324ca29c46cd59242e2d4efca303fe98adc85d2ef664827689c1
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T03:52:27Z — REASON: Remove a redundant manifest-size guard rejected as always true on supported 64-bit builds; no behavioral or consensus semantic change
+  old ROOT: 1d8cc5413ffef088c00be9a50458353c5c58c1ba95dc078ae45048ed34eb6acd
+  by: owner unseal ritual (make core-unseal)

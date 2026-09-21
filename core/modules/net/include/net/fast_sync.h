@@ -340,6 +340,8 @@ struct swarm_sync {
 /* Initialize swarm sync from a manifest */
 bool swarm_sync_init(struct swarm_sync *ss, const struct sync_manifest *manifest,
                       const char *datadir);
+bool sync_manifest_equal(const struct sync_manifest *a,
+                         const struct sync_manifest *b);
 
 /* Free swarm state */
 void swarm_sync_free(struct swarm_sync *ss);

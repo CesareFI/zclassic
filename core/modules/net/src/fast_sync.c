@@ -1323,6 +1323,37 @@ bool swarm_sync_init(struct swarm_sync *ss, const struct sync_manifest *manifest
     return true;
 }
 
+static bool sync_manifest_shape_equal(const struct sync_manifest *a,
+                                      const struct sync_manifest *b)
+{
+    return a->height == b->height &&
+        a->protocol_version == b->protocol_version &&
+        a->snapshot_schema_version == b->snapshot_schema_version &&
+        a->peer_tip_height == b->peer_tip_height &&
+        a->total_bytes == b->total_bytes &&
+        a->num_utxos == b->num_utxos &&
+        a->num_chunks == b->num_chunks && a->chunk_size == b->chunk_size;
+}
+
+static bool sync_manifest_roots_equal(const struct sync_manifest *a,
+                                      const struct sync_manifest *b)
+{
+    return memcmp(a->block_hash, b->block_hash, 32) == 0 &&
+        memcmp(a->anchor_block_hash, b->anchor_block_hash, 32) == 0 &&
+        memcmp(a->chain_work, b->chain_work, 32) == 0 &&
+        memcmp(a->merkle_root, b->merkle_root, 32) == 0 &&
+        memcmp(a->utxo_sha3, b->utxo_sha3, 32) == 0;
+}
+
+bool sync_manifest_equal(const struct sync_manifest *a,
+                         const struct sync_manifest *b)
+{
+    return a && b && a->chunk_hashes && b->chunk_hashes &&
+        sync_manifest_shape_equal(a, b) && sync_manifest_roots_equal(a, b) &&
+        memcmp(a->chunk_hashes, b->chunk_hashes,
+               (size_t)a->num_chunks * 32) == 0;
+}
+
 void swarm_sync_free(struct swarm_sync *ss)
 {
     if (!ss) return;

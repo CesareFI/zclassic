@@ -146,6 +146,29 @@ static void swarm_clear_matching_peer_chunk(struct p2p_node *node,
     }
 }
 
+static bool swarm_admit_manifest_source(struct p2p_node *node,
+                                        const struct sync_manifest *manifest,
+                                        const char *datadir,
+                                        bool allow_start,
+                                        int32_t *first_chunk_out)
+{
+    if (!node || !manifest || !first_chunk_out || !swarm_mutex_lock())
+        return false;
+    *first_chunk_out = -1;
+    bool admitted = false;
+    if (atomic_load(&g_swarm_active)) {
+        admitted = sync_manifest_equal(&g_swarm.manifest, manifest);
+    } else if (allow_start && swarm_sync_init(&g_swarm, manifest, datadir)) {
+        atomic_store(&g_swarm_active, true);
+        g_swarm_last_progress_time = (int64_t)platform_time_wall_time_t();
+        *first_chunk_out = swarm_sync_assign_chunk(&g_swarm, node->id);
+        admitted = true;
+    }
+    node->swarm_manifest_received = admitted;
+    swarm_mutex_unlock();
+    return admitted;
+}
+
 bool mp_block_swarm_manifest_shape_valid(int32_t start_height,
                                          int32_t end_height,
                                          uint32_t num_pieces)
@@ -544,6 +567,14 @@ bool mp_snapshot_test_start_swarm(const struct sync_manifest *manifest)
         atomic_store(&g_swarm_active, true);
     swarm_mutex_unlock();
     return started;
+}
+
+bool mp_snapshot_test_admit_source(struct p2p_node *node,
+                                   const struct sync_manifest *manifest)
+{
+    int32_t first_chunk = -1;
+    return swarm_admit_manifest_source(node, manifest, NULL, false,
+                                       &first_chunk);
 }
 
 void mp_snapshot_test_stop_swarm(void)
@@ -1159,7 +1190,6 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                         peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_PROOF,
                                             "manifest merkle root mismatch");
                     } else {
-                        node->swarm_manifest_received = true;
                         int our_h = active_chain_height(
                             &mp->main_state->chain_active);
                         printf("Peer %s: manifest h=%d chunks=%u "
@@ -1167,72 +1197,31 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                                node->addr_name, height, num_chunks,
                                (unsigned long long)num_utxos);
 
-                        /* If peer is significantly ahead and we have no
-                         * active swarm, initialize the swarm coordinator
-                         * from their (now-verified) manifest.
-                         *
-                         * atomic compare-exchange on g_swarm_active
-                         * (false → true) closes the TOCTOU window between
-                         * the "is a swarm already running?" check and the
-                         * "claim the slot" write. Without it, two peers
-                         * racing on near-simultaneous manifests could both
-                         * observe false and both call swarm_sync_init, the
-                         * loser overwriting the winner's chunk index. The
-                         * CAS lets only one peer win the init; the loser
-                         * drops its message. */
-                        if (height > our_h + 100) {
-                            bool expected = false;
-                            if (!atomic_compare_exchange_strong(
-                                    &g_swarm_active, &expected, true)) {
-                                /* Another peer raced us — drop silently
-                                 * rather than risk state leak. */
-                                printf("Peer %s: swarm already active "
-                                       "(peer raced), dropping manifest\n",
-                                       node->addr_name);
-                            } else {
-                                struct sync_manifest peer_manifest = {
-                                    .height = height,
-                                    .num_utxos = num_utxos,
-                                    .num_chunks = num_chunks,
-                                    .chunk_size = chunk_size,
-                                    .chunk_hashes = hashes
-                                };
-                                memcpy(peer_manifest.block_hash, block_hash, 32);
-                                memcpy(peer_manifest.merkle_root, merkle_root, 32);
-                                memcpy(peer_manifest.utxo_sha3, utxo_sha3, 32);
-
-                                int32_t first_chunk = -1;
-                                if (!swarm_mutex_lock()) {
-                                    atomic_store(&g_swarm_active, false);
-                                    free(hashes);
-                                    LOG_FAIL("net", "rejecting snapshot manifest: "
-                                             "swarm mutex unavailable");
-                                }
-                                if (swarm_sync_init(&g_swarm, &peer_manifest,
-                                                    mp->datadir)) {
-                                    g_swarm_last_progress_time =
-                                        (int64_t)platform_time_wall_time_t();
-                                    printf("Swarm sync started: %u chunks "
-                                           "from h=%d\n", num_chunks, height);
-                                    first_chunk = swarm_sync_assign_chunk(
-                                        &g_swarm, node->id);
-                                    if (first_chunk >= 0) {
-                                        node->swarm_inflight_chunk =
-                                            first_chunk;
-                                        node->swarm_chunk_req_time =
-                                            platform_time_monotonic_us() /
-                                                1000000;
-                                    }
-                                } else {
-                                    /* Init failed — release the claim so
-                                     * another peer's manifest can retry. */
-                                    atomic_store(&g_swarm_active, false);
-                                }
-                                swarm_mutex_unlock();
-                                if (first_chunk >= 0)
-                                    push_chunk_request(mp, node,
-                                                       (uint32_t)first_chunk);
-                            }
+                        struct sync_manifest peer_manifest = {
+                            .height = height,
+                            .num_utxos = num_utxos,
+                            .num_chunks = num_chunks,
+                            .chunk_size = chunk_size,
+                            .chunk_hashes = hashes
+                        };
+                        memcpy(peer_manifest.block_hash, block_hash, 32);
+                        memcpy(peer_manifest.merkle_root, merkle_root, 32);
+                        memcpy(peer_manifest.utxo_sha3, utxo_sha3, 32);
+                        int32_t first_chunk = -1;
+                        bool admitted = swarm_admit_manifest_source(
+                            node, &peer_manifest, mp->datadir,
+                            height > our_h + 100, &first_chunk);
+                        if (first_chunk >= 0) {
+                            node->swarm_inflight_chunk = first_chunk;
+                            node->swarm_chunk_req_time =
+                                platform_time_monotonic_us() / 1000000;
+                            push_chunk_request(mp, node,
+                                               (uint32_t)first_chunk);
+                            printf("Swarm sync started: %u chunks from h=%d\n",
+                                   num_chunks, height);
+                        } else if (!admitted) {
+                            printf("Peer %s: manifest does not match active "
+                                   "snapshot swarm\n", node->addr_name);
                         }
                         /* swarm_sync_init deep-copies the hash array, so
                          * our peer copy is ours to free regardless. */

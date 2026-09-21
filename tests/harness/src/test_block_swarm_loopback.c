@@ -84,6 +84,8 @@
 void mp_snapshot_send_tick(struct msg_processor *mp, struct p2p_node *node);
 bool mp_block_swarm_is_active(void);
 bool mp_snapshot_test_start_swarm(const struct sync_manifest *manifest);
+bool mp_snapshot_test_admit_source(struct p2p_node *node,
+                                   const struct sync_manifest *manifest);
 void mp_snapshot_test_stop_swarm(void);
 bool mp_snapshot_test_chunk_state(uint32_t chunk_index,
                                   enum chunk_state *state_out,
@@ -580,6 +582,71 @@ static int test_snapshot_chunk_wire_adversarial(void)
         peer_b->send_head = peer_b->send_tail = NULL;
         p2p_node_free(peer_a);
         p2p_node_free(peer_b);
+        net_manager_free(&nm);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    mp_snapshot_test_stop_swarm();
+    return failures;
+}
+
+static int test_snapshot_manifest_source_reconnect(void)
+{
+    int failures = 0;
+    TEST("snapshot manifest identity preserves diverse reconnect failover") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.height = 1000;
+        manifest.num_chunks = 2;
+        manifest.chunk_size = SYNC_CHUNK_SIZE;
+        manifest.chunk_hashes = zcl_calloc(2, 32, "source_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+        struct sync_manifest incompatible = manifest;
+        uint8_t incompatible_hashes[2][32] = {{0}};
+        memcpy(incompatible_hashes, manifest.chunk_hashes,
+               sizeof(incompatible_hashes));
+        incompatible_hashes[1][0] = 1;
+        incompatible.chunk_hashes = incompatible_hashes;
+
+        struct net_manager nm;
+        struct msg_processor mp;
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.params = chain_params_get();
+        mp.net_mgr = &nm;
+        mp.datadir = ".";
+        struct p2p_node *peer_a = bs_make_peer(&nm, 51);
+        struct p2p_node *peer_b = bs_make_peer(&nm, 52);
+        struct p2p_node *peer_bad = bs_make_peer(&nm, 53);
+        ASSERT(peer_a && peer_b && peer_bad);
+        struct send_segment *sent_a = bs_install_sentinel(peer_a);
+        struct send_segment *sent_b = bs_install_sentinel(peer_b);
+
+        ASSERT(mp_snapshot_test_start_swarm(&manifest));
+        ASSERT(mp_snapshot_test_admit_source(peer_a, &manifest));
+        ASSERT(mp_snapshot_test_admit_source(peer_b, &manifest));
+        ASSERT(!mp_snapshot_test_admit_source(peer_bad, &incompatible));
+        ASSERT(peer_a->swarm_manifest_received);
+        ASSERT(peer_b->swarm_manifest_received);
+        ASSERT(!peer_bad->swarm_manifest_received);
+
+        mp_snapshot_send_tick(&mp, peer_a);
+        ASSERT(peer_a->swarm_inflight_chunk == 0);
+        ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_a->id, 1, 0));
+        ASSERT(mp_snapshot_swarm_peer_disconnected(peer_a) == 1);
+        ASSERT(bs_snapshot_state(0, CHUNK_NEEDED, -1, 0, 0));
+        mp_snapshot_send_tick(&mp, peer_b);
+        ASSERT(peer_b->swarm_inflight_chunk == 0);
+        ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_b->id, 1, 0));
+
+        mp_snapshot_test_stop_swarm();
+        send_segment_free(sent_a);
+        send_segment_free(sent_b);
+        peer_a->send_head = peer_a->send_tail = NULL;
+        peer_b->send_head = peer_b->send_tail = NULL;
+        p2p_node_free(peer_a);
+        p2p_node_free(peer_b);
+        p2p_node_free(peer_bad);
         net_manager_free(&nm);
         free(manifest.chunk_hashes);
         PASS();
@@ -1662,6 +1729,7 @@ int test_block_swarm_loopback(void)
 {
     int failures = 0;
     failures += test_snapshot_chunk_wire_adversarial();
+    failures += test_snapshot_manifest_source_reconnect();
     failures += test_block_swarm_manifest_shape_bounds();
     /* Every test here advertises and serves block pieces from a fixture
      * that never booted the runtime port, so the live sovereignty

@@ -498,3 +498,38 @@ startup/observer work, with no coordination file in its fetched tree.
 Remaining risk and next investigation: snapshot manifest-source diversity and
 reconnect churn now become the next active slice, including whether a surviving
 compatible source can continue immediately after the manifest origin leaves.
+
+## Exact snapshot manifest-source diversity under reconnect churn
+
+Every Merkle-valid `zmanifest` peer was previously marked as a usable source
+while a snapshot swarm was active, even when its height, anchor, commitment, or
+chunk hashes described a different snapshot. The scheduler could consequently
+request active-swarm chunks from an incompatible peer. Manifest initialization
+also claimed the global active flag before taking the swarm mutex, leaving
+partially initialized state observable during a competing arrival.
+
+Manifest-source admission now runs under the swarm mutex. The first eligible
+manifest initializes and activates the swarm atomically; later peers are
+admitted only when every manifest identity field and chunk hash exactly matches
+the active snapshot. Incompatible peers remain ineligible for chunk assignment.
+
+The deterministic regression admits two exact-match peers, refuses a third
+peer whose chunk-hash list differs, assigns work to the first peer, disconnects
+it without advancing time, and proves the surviving compatible source
+immediately acquires the requeued chunk with unchanged accounting. The manifest
+identity unit regression, four fast-sync groups, block-swarm loopback, and the
+broader 13-group networking selection passed. Block-swarm loopback also passed
+under ASan/UBSan. Core seal/root mirror, consensus parity, generated capability
+inventory, cyclomatic complexity (55,581 functions), and whitespace gates
+passed.
+
+Consensus impact: none. This changes only snapshot-source scheduling after the
+existing manifest Merkle verification; snapshot commitments, chunk hashes,
+block and transaction validity, PoW, and chain selection are unchanged.
+Worldstream remains at `0b29bec27` on complementary startup/observer work, and
+its fetched tree contains no `docs/work/NODE_COORDINATION.md`.
+
+Remaining risk and next investigation: direct `zmanifest` wire coverage should
+exercise competing compatible and incompatible advertisements through the
+parser, then the snapshot scheduler should be inspected for whether repeated
+manifest churn can monopolize send ticks or retain stale source eligibility.

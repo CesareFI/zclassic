@@ -569,6 +569,33 @@ static int test_swarm_init_assign(void)
     return failures;
 }
 
+static int test_sync_manifest_identity(void)
+{
+    int failures = 0;
+    TEST("snapshot source diversity requires exact manifest identity") {
+        uint8_t hashes_a[2][32] = {{0}};
+        uint8_t hashes_b[2][32] = {{0}};
+        struct sync_manifest a = {
+            .height = 1000, .num_utxos = 10, .num_chunks = 2,
+            .chunk_size = 500, .chunk_hashes = hashes_a
+        };
+        struct sync_manifest b = a;
+        b.chunk_hashes = hashes_b;
+        ASSERT(sync_manifest_equal(&a, &b));
+        b.chunk_hashes[1][0] = 1;
+        ASSERT(!sync_manifest_equal(&a, &b));
+        b.chunk_hashes[1][0] = 0;
+        b.height++;
+        ASSERT(!sync_manifest_equal(&a, &b));
+        b.height = a.height;
+        b.total_bytes++;
+        ASSERT(!sync_manifest_equal(&a, &b));
+        ASSERT(!sync_manifest_equal(NULL, &b));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_swarm_timeout_reassign(void)
 {
     int failures = 0;
@@ -2037,6 +2064,7 @@ int test_fast_sync(void)
     failures += test_utxo_root_cache_versioning();
 
     /* Swarm coordinator */
+    failures += test_sync_manifest_identity();
     failures += test_swarm_init_assign();
     failures += test_swarm_timeout_reassign();
     failures += test_swarm_malformed_response_reassign();
