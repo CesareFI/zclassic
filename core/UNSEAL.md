@@ -744,3 +744,7 @@ later lane flips it HARD.
 - 2026-09-21T18:29:54Z — REASON: Harden block-swarm timeout yield against backwards monotonic samples
   old ROOT: 19b0c52eb9df9e7e478991b446b775b72df8a04b247da7f4858dfa704653e97d
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T18:38:16Z — REASON: Preserve block swarm peer diversity across reconnect churn
+  old ROOT: b5d99b243297863d848cd40bca08154dd7346de31365e2012ccc889c4aaa015f
+  by: owner unseal ritual (make core-unseal)

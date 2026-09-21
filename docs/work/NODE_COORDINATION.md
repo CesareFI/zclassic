@@ -2345,3 +2345,35 @@ Worldstream `5297c58f4` remains complementary classic-download timeout work.
 Remaining risk and next investigation: measure whether block-swarm peers can
 retain stale local pipeline slots after a global orphan sweep without a later
 receive or per-peer tick, before altering the bounded reconciliation design.
+
+## Block-swarm reconnect source diversity
+
+Baseline and root cause: block-swarm disconnect cleanup requeued a dead
+source's pieces immediately, but unlike snapshot chunk sync it did not defer a
+fresh connection from that same endpoint. Under connman's fixed peer order,
+reconnect churn could therefore let the just-disconnected endpoint reclaim the
+released batch before an already-admitted healthy source received a scheduler
+turn.
+
+Fix and after-result: a bounded 32-entry, generation-scoped reconnect-yield
+table now records only disconnects that actually release block pieces. A
+matching endpoint is deferred for one second or until a different admitted
+source successfully queues a block-piece request. The policy neither bans nor
+scores peers, and it expires so lone-peer recovery remains available.
+
+Regression proof: the block-swarm loopback fixture assigns a batch to source
+A, disconnects A, admits a new connection from A's endpoint ahead of healthy
+B, proves the replacement receives no work, proves B receives the released
+batch, then proves the replacement receives the next batch after B's queued
+request consumes the yield. Native C23 syntax for the changed production unit,
+core resealing, consensus-parity, complexity, and whitespace gates pass.
+Runtime and ASan/UBSan execution remain disk-gated: the prior focused command
+started a cold package-verifier build and was stopped at the 10 GB floor;
+current free space is 10.72 GB.
+
+Consensus impact: NONE. This is volatile peer scheduling only; manifest and
+payload verification, reducer admission, block/transaction validity, PoW, and
+chain selection are unchanged. Worldstream `5297c58f4` remains complementary
+classic-download timeout work. Remaining risk and next investigation: measure
+whether repeated block-manifest advertisements from a reconnecting endpoint
+can alter scheduler availability before its new bitmap is accepted.

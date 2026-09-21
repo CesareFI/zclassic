@@ -1738,6 +1738,92 @@ static int test_block_swarm_peer_fairness(void)
     return failures;
 }
 
+static int test_block_swarm_reconnect_yield(void)
+{
+    int failures = 0;
+
+    TEST("block swarm reconnect churn gives a healthy source the released "
+         "piece opportunity") {
+        const size_t batch = PIECE_PIPELINE_DEPTH / 4;
+        const uint32_t pieces = 2 * (uint32_t)batch;
+        const int32_t end_height = (int32_t)pieces * BLOCKS_PER_PIECE;
+        struct main_state ms;
+        struct net_manager nm;
+        struct msg_processor mp;
+        struct uint256 header_hash;
+
+        main_state_init(&ms);
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.main_state = &ms;
+        mp.net_mgr = &nm;
+        mp.params = chain_params_get();
+        memset(&header_hash, 0x6b, sizeof(header_hash));
+        struct block_index *best_header =
+            chainstate_insert_block_index((struct chainstate *)&ms,
+                                          &header_hash);
+        ASSERT(best_header != NULL);
+        best_header->nHeight = end_height;
+        best_header->nStatus = BLOCK_VALID_TREE;
+        ms.pindex_best_header = best_header;
+
+        struct p2p_node *old_source = bs_make_peer(&nm, 31);
+        struct p2p_node *healthy = bs_make_peer(&nm, 32);
+        struct p2p_node *reconnect = bs_make_peer(&nm, 31);
+        ASSERT(old_source && healthy && reconnect);
+        old_source->id = 31;
+        healthy->id = 32;
+        reconnect->id = 33;
+        old_source->blk_peer_height = end_height;
+        healthy->blk_peer_height = end_height;
+        reconnect->blk_peer_height = end_height;
+        struct send_segment *sent_old = bs_install_sentinel(old_source);
+        struct send_segment *sent_healthy = bs_install_sentinel(healthy);
+        struct send_segment *sent_reconnect =
+            bs_install_sentinel(reconnect);
+
+        mp_block_swarm_test_seed_stall(0, pieces, 1);
+        ASSERT(mp_block_swarm_test_admit_peer(old_source));
+        ASSERT(mp_block_swarm_test_admit_peer(healthy));
+        mp_snapshot_send_tick(&mp, old_source);
+        ASSERT(bs_queue_depth(sent_old) == batch);
+        bs_drop_queue(old_source, sent_old);
+        ASSERT(mp_block_swarm_peer_disconnected(old_source) ==
+               batch);
+
+        /* A fresh connection from the same endpoint runs first, but cannot
+         * reclaim the just-released range before the already-admitted healthy
+         * source has a scheduler opportunity. */
+        ASSERT(mp_block_swarm_test_admit_peer(reconnect));
+        mp_snapshot_send_tick(&mp, reconnect);
+        ASSERT(bs_queue_depth(sent_reconnect) == 0);
+        mp_snapshot_send_tick(&mp, healthy);
+        ASSERT(bs_queue_depth(sent_healthy) == batch);
+        bs_drop_queue(healthy, sent_healthy);
+
+        /* The healthy queued request consumes one endpoint's yield; the
+         * replacement is then eligible for the next independent batch. */
+        mp_snapshot_send_tick(&mp, reconnect);
+        ASSERT(bs_queue_depth(sent_reconnect) == batch);
+
+        mp_block_swarm_test_seed_stall(0, 0, 0);
+        send_segment_free(sent_old);
+        send_segment_free(sent_healthy);
+        send_segment_free(sent_reconnect);
+        old_source->send_head = old_source->send_tail = NULL;
+        healthy->send_head = healthy->send_tail = NULL;
+        reconnect->send_head = reconnect->send_tail = NULL;
+        p2p_node_free(old_source);
+        p2p_node_free(healthy);
+        p2p_node_free(reconnect);
+        net_manager_free(&nm);
+        main_state_free(&ms);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_block_swarm_stale_pipeline_reclaim(void)
 {
     int failures = 0;
@@ -2657,6 +2743,7 @@ int test_block_swarm_loopback(void)
     failures += test_block_swarm_throughput();
     failures += test_block_swarm_disconnect_requeue();
     failures += test_block_swarm_peer_fairness();
+    failures += test_block_swarm_reconnect_yield();
     failures += test_block_swarm_stale_pipeline_reclaim();
     failures += test_block_swarm_timeout_owner_yields();
     failures += test_block_swarm_restart_cooldown();

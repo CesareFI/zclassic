@@ -434,6 +434,88 @@ static uint64_t g_block_swarm_generation = 0;
  * transfer back out of legacy getdata's hands every few seconds. */
 static _Atomic int64_t g_block_swarm_reaped_monotonic = 0;
 
+/* A disconnecting endpoint can reconnect before connman's next peer tick.
+ * Keep one bounded opportunity for another admitted source to receive a
+ * piece, rather than letting fixed peer ordering turn reconnect churn into
+ * effective ownership. This is scheduling only: it neither bans nor judges
+ * an endpoint, and expires quickly if no alternative source is available. */
+#define BLOCK_SWARM_RECONNECT_YIELD_SECS 1
+#define BLOCK_SWARM_RECONNECT_YIELD_SOURCES 32
+
+struct block_swarm_reconnect_yield {
+    struct net_address address;
+    uint64_t generation;
+    int64_t until_monotonic;
+};
+
+static struct block_swarm_reconnect_yield
+    g_block_swarm_reconnect_yields[BLOCK_SWARM_RECONNECT_YIELD_SOURCES];
+
+/* Caller holds g_block_swarm_mutex. */
+static void block_swarm_record_reconnect_yield_locked(
+    const struct p2p_node *node, int64_t now_monotonic)
+{
+    if (!node)
+        return;
+    size_t replace = 0;
+    int64_t until = now_monotonic == INT64_MAX ? INT64_MAX :
+        now_monotonic + BLOCK_SWARM_RECONNECT_YIELD_SECS;
+    for (size_t i = 0; i < BLOCK_SWARM_RECONNECT_YIELD_SOURCES; i++) {
+        struct block_swarm_reconnect_yield *entry =
+            &g_block_swarm_reconnect_yields[i];
+        if (entry->generation == g_block_swarm_generation &&
+            net_service_eq(&entry->address.svc, &node->addr.svc)) {
+            entry->until_monotonic = until;
+            return;
+        }
+        if (entry->generation != g_block_swarm_generation ||
+            entry->until_monotonic <= now_monotonic) {
+            replace = i;
+            break;
+        }
+    }
+    g_block_swarm_reconnect_yields[replace].address = node->addr;
+    g_block_swarm_reconnect_yields[replace].generation =
+        g_block_swarm_generation;
+    g_block_swarm_reconnect_yields[replace].until_monotonic = until;
+}
+
+/* Caller holds g_block_swarm_mutex. */
+static bool block_swarm_reconnect_yield_active_locked(
+    const struct p2p_node *node, int64_t now_monotonic)
+{
+    if (!node)
+        return false;
+    for (size_t i = 0; i < BLOCK_SWARM_RECONNECT_YIELD_SOURCES; i++) {
+        const struct block_swarm_reconnect_yield *entry =
+            &g_block_swarm_reconnect_yields[i];
+        if (entry->generation == g_block_swarm_generation &&
+            entry->until_monotonic > now_monotonic &&
+            net_service_eq(&entry->address.svc, &node->addr.svc))
+            return true;
+    }
+    return false;
+}
+
+/* Caller holds g_block_swarm_mutex. */
+static void block_swarm_consume_reconnect_yield_locked(
+    const struct p2p_node *node, int64_t now_monotonic)
+{
+    if (!node)
+        return;
+    for (size_t i = 0; i < BLOCK_SWARM_RECONNECT_YIELD_SOURCES; i++) {
+        struct block_swarm_reconnect_yield *entry =
+            &g_block_swarm_reconnect_yields[i];
+        if (entry->generation == g_block_swarm_generation &&
+            entry->until_monotonic > now_monotonic &&
+            !net_service_eq(&entry->address.svc, &node->addr.svc)) {
+            entry->generation = 0;
+            entry->until_monotonic = 0;
+            return;
+        }
+    }
+}
+
 /* Caller holds g_block_swarm_mutex. Exact-owner pipeline reconciliation runs
  * per peer tick; this bounded traversal is only the global orphan backstop. */
 static void block_swarm_global_timeout_sweep_locked(int64_t now_monotonic)
@@ -910,7 +992,7 @@ static bool push_block_piece_request(struct msg_processor *mp,
  * peer cannot repeatedly acquire and release work in one pass. */
 static int block_swarm_queue_assigned_request(
     struct msg_processor *mp, struct p2p_node *node, int pipeline_index,
-    int32_t piece_index, int failure_increment)
+    int32_t piece_index, int failure_increment, int64_t now_monotonic)
 {
     pthread_mutex_unlock(&g_block_swarm_mutex);
     bool queued = push_block_piece_request(
@@ -918,6 +1000,7 @@ static int block_swarm_queue_assigned_request(
     pthread_mutex_lock(&g_block_swarm_mutex);
     if (queued) {
         atomic_fetch_add(&node->blk_pieces_requested, 1);
+        block_swarm_consume_reconnect_yield_locked(node, now_monotonic);
         return 1;
     }
 
@@ -1064,6 +1147,8 @@ void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
     block_swarm_free(&g_block_swarm);
     atomic_store(&g_block_swarm_active, false);
     atomic_store(&g_block_swarm_reaped_monotonic, 0);
+    memset(g_block_swarm_reconnect_yields, 0,
+           sizeof(g_block_swarm_reconnect_yields));
     if (total > 0) {
         struct block_piece_manifest pm;
         memset(&pm, 0, sizeof(pm));
@@ -1363,6 +1448,9 @@ size_t mp_block_swarm_peer_disconnected(struct p2p_node *node)
                 requeued++;
         }
     }
+    if (requeued)
+        block_swarm_record_reconnect_yield_locked(
+            node, block_swarm_monotonic_seconds());
     pthread_mutex_unlock(&g_block_swarm_mutex);
 
     if (requeued)
@@ -2609,6 +2697,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
                 &g_block_swarm, node, now_bs);
         reconciled.timed_out |= block_swarm_timeout_yield_active(node,
                                                                   now_bs);
+        reconciled.timed_out |= block_swarm_reconnect_yield_active_locked(
+            node, now_bs);
         /* Give exact-owner reconciliation the first timeout window. A global
          * sweep at the same deadline let an earlier peer in connman's fixed
          * order expire another peer's pieces before that owner ran, losing
@@ -2649,7 +2739,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
             node->blk_pipeline[pi].request_time_us =
                 platform_time_monotonic_us();
             assigned_this_tick += block_swarm_queue_assigned_request(
-                mp, node, pi, pidx, assignment_batch);
+                mp, node, pi, pidx, assignment_batch, now_bs);
         }
 
         /* Progress display (rate-limited) */
