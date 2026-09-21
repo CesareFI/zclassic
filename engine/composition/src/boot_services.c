@@ -796,7 +796,7 @@ bool app_init_services(struct app_context *ctx,
         .process_messages = msg_process_messages,
         .send_messages = msg_send_messages,
         .initialize_node = NULL,
-        .finalize_node = NULL,
+        .finalize_node = msg_finalize_node,
         .ctx = svc->msg_processor,
     };
     connman_init(svc->connman, params, &signals);

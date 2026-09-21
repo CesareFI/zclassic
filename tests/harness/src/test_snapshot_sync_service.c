@@ -263,6 +263,51 @@ static int test_snapshot_sync_service_followups(void)
     return failures;
 }
 
+static int test_snapshot_sync_service_peer_disconnect_ownership(void)
+{
+    int failures = 0;
+
+    TEST("snapshot disconnect releases only the active serving peer") {
+        struct snapshot_sync_service svc;
+        snapsync_init(&svc, NULL);
+
+        ASSERT(snapsync_get_state() == SNAPSYNC_IDLE);
+        ASSERT(snapsync_set_state(SNAPSYNC_NEGOTIATING,
+                                  "disconnect ownership test"));
+        svc.state = SNAPSYNC_NEGOTIATING;
+        svc.serving_peer_id = 77;
+
+        ASSERT(!snapsync_peer_disconnected(&svc, 78));
+        ASSERT(svc.state == SNAPSYNC_NEGOTIATING);
+        ASSERT(svc.serving_peer_id == 77);
+        ASSERT(snapsync_get_state() == SNAPSYNC_NEGOTIATING);
+
+        ASSERT(snapsync_peer_disconnected(&svc, 77));
+        ASSERT(svc.state == SNAPSYNC_IDLE);
+        ASSERT(svc.serving_peer_id == 0);
+        ASSERT(snapsync_get_state() == SNAPSYNC_IDLE);
+
+        ASSERT(snapsync_set_state(SNAPSYNC_NEGOTIATING,
+                                  "receiving disconnect test"));
+        ASSERT(snapsync_set_state(SNAPSYNC_RECEIVING,
+                                  "receiving disconnect test"));
+        ASSERT(sync_set_state(SYNC_SNAPSHOT_RECEIVE,
+                              "receiving disconnect test"));
+        svc.state = SNAPSYNC_RECEIVING;
+        svc.serving_peer_id = 91;
+
+        ASSERT(snapsync_peer_disconnected(&svc, 91));
+        ASSERT(svc.state == SNAPSYNC_IDLE);
+        ASSERT(svc.serving_peer_id == 0);
+        ASSERT(snapsync_get_state() == SNAPSYNC_IDLE);
+        ASSERT(sync_get_state() == SYNC_HEADERS_DOWNLOAD);
+        ASSERT(sync_set_state(SYNC_IDLE, "disconnect ownership cleanup"));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_snapshot_sync_service_handle_offer_requires_v2(void)
 {
     int failures = 0;
@@ -2067,6 +2112,7 @@ int test_snapshot_sync_service(void)
         return 1;
     }
     failures += test_snapshot_sync_service_followups();
+    failures += test_snapshot_sync_service_peer_disconnect_ownership();
     failures += test_snapshot_offer_trust_policy();
     failures += test_boot_publish_block_swarm();
     failures += test_snapshot_offer_seed_cap_matches_self_derived();

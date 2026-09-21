@@ -1481,3 +1481,37 @@ risk: a source that disconnects after a followup was successfully queued can
 still leave negotiation or receive state occupied until watchdog recovery.
 Recommended next investigation: add ownership-checked terminal-disconnect
 notification without doing database cleanup under connman's peer-list lock.
+
+## Snapshot source disconnect ownership release
+
+Baseline and root cause: after a snapshot followup was successfully queued,
+connman could remove the serving peer without notifying the snapshot service.
+The service retained `serving_peer_id` in NEGOTIATING or RECEIVING, so healthy
+replacement offers remained busy until the snapshot watchdog expired.
+
+Fix and after-result: connman's terminal-removal pass now records removed peer
+IDs while holding `cs_nodes`, then invokes the message-processor lifecycle
+callback only after releasing that lock.  The callback releases a snapshot
+session only when the disconnected ID still owns it.  Ownership is closed
+under the snapshot-service lock before rollback/discard work, preventing a
+concurrent replacement session from being erased and avoiding database work
+under the peer-list lock.  An active receive returns ordinary sync to header
+download immediately.
+
+Regression proof: `test_snapshot_sync_service` proves that an unrelated peer
+disconnect preserves the owner, while the exact negotiating and receiving
+owners reset to IDLE and the latter resumes header sync.  The full honest,
+tampered, and bounded-enqueue `test_snapshot_serve_loopback` wire cases remain
+green.
+
+Consensus impact: NONE.  Only volatile source ownership and transport
+lifecycle cleanup change; snapshot content verification, activation
+containment, block/transaction validation, PoW, and chain selection are
+unchanged.
+
+Worldstream interaction: refreshed Worldstream head `5297c58f4` remains on
+download-timeout arithmetic and does not overlap snapshot source lifecycle.
+Remaining risk: concurrent disconnect and replacement-offer churn should be
+exercised over the real connman socket lifecycle.  Recommended next
+investigation: add a real-reactor reconnect regression, then inspect manifest
+source diversity under repeated reconnects.

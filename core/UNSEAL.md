@@ -584,3 +584,11 @@ later lane flips it HARD.
 - 2026-09-21T10:17:44Z — REASON: release snapshot negotiation when its followup cannot reach the selected peer
   old ROOT: 9b3a3d8ba8af5bfab4b163bf35c62c3f43650f7ac303143a4a93fa4af45c07ff
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T10:25:58Z — REASON: notify snapshot negotiation after peer removal outside connman peer-list lock
+  old ROOT: 72d07388032f18dca178c1216d3f78cad910ac4bac4953d65c9e71b5df3c0a54
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T10:41:40Z — REASON: refactor peer-finalization callback out of connman reactor complexity
+  old ROOT: 01f01e6e246c6986e217570e541d417646811bb29ed23eb53452740726fe4e8f
+  by: owner unseal ritual (make core-unseal)

@@ -297,6 +297,37 @@ void snapsync_reset(struct snapshot_sync_service *svc)
     blocker_clear(SNAPSYNC_ACTIVATION_CONTAINED_BLOCKER_ID);
 }
 
+bool snapsync_peer_disconnected(struct snapshot_sync_service *svc,
+                                uint32_t peer_id)
+{
+    if (!svc)
+        return false;
+
+    snapsync_service_lock_internal();
+    bool owned = svc->serving_peer_id == peer_id &&
+        (svc->state == SNAPSYNC_NEGOTIATING ||
+         svc->state == SNAPSYNC_RECEIVING);
+    if (owned) {
+        /* Close ownership before releasing the lock. A replacement offer
+         * observes FAILED/busy until snapsync_reset finishes, so this reset
+         * can never erase a newer session. */
+        svc->state = SNAPSYNC_FAILED;
+        (void)snapsync_set_state(SNAPSYNC_FAILED,
+                                 "serving peer disconnected");
+    }
+    snapsync_service_unlock_internal();
+    if (!owned)
+        return false;
+
+    LOG_INFO("snapshot_sync", "serving peer %u disconnected; releasing "
+             "snapshot session for another source", peer_id);
+    snapsync_reset(svc);
+    if (sync_get_state() == SYNC_SNAPSHOT_RECEIVE)
+        sync_set_state(SYNC_HEADERS_DOWNLOAD,
+                       "snapshot serving peer disconnected");
+    return true;
+}
+
 bool snapsync_is_active(void)
 {
     struct snapshot_sync_service *svc = app_runtime_snapshot_sync();
@@ -666,4 +697,3 @@ void snapsync_get_status_snapshot(const struct snapshot_sync_service *svc,
     out->staged_row_count = snapsync_staging_count_internal(svc->ndb);
     snapsync_service_unlock_internal();
 }
-

@@ -202,6 +202,12 @@ void snapsync_init(struct snapshot_sync_service *svc, struct node_db *ndb);
 /* Reset service back to IDLE (after complete or failed) */
 void snapsync_reset(struct snapshot_sync_service *svc);
 
+/* Release an active negotiation/receive session only when `peer_id` still
+ * owns it.  The ownership claim is closed atomically before rollback work,
+ * so a concurrent replacement offer cannot be reset accidentally. */
+bool snapsync_peer_disconnected(struct snapshot_sync_service *svc,
+                                uint32_t peer_id);
+
 /* Global singleton — initialized lazily on first snapshot offer */
 struct snapshot_sync_service *snapsync_global(void);
 bool snapsync_global_initialized(void);

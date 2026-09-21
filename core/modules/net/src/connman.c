@@ -1254,11 +1254,33 @@ size_t connman_harvest_census_candidates(struct connman *cm,
     return harvested;
 }
 
+static void remember_finalized_node(node_id_t ids[REACTOR_MAX_FDS],
+                                    size_t *count, node_id_t id)
+{
+    if (*count < REACTOR_MAX_FDS) {
+        ids[(*count)++] = id;
+        return;
+    }
+    LOG_WARN("connman", "finalize callback queue full; peer id=%d cleanup "
+             "notification dropped", (int)id);
+}
+
+static void finalize_removed_nodes(struct connman *cm, const node_id_t *ids,
+                                   size_t count)
+{
+    if (!cm->manager.signals.finalize_node)
+        return;
+    for (size_t i = 0; i < count; i++)
+        cm->manager.signals.finalize_node(cm->manager.signals.ctx, ids[i]);
+}
+
 static void *thread_socket_handler(void *arg)
 {
     struct connman *cm = (struct connman *)arg;
 
     while (!g_stop) {
+        node_id_t finalized_ids[REACTOR_MAX_FDS];
+        size_t finalized_count = 0;
         /* Build poll array: listen sockets + connected nodes.
          * Using poll() instead of select() avoids FD_SETSIZE (1024) limit
          * which caused stack corruption with high fd numbers. Array size is
@@ -1768,6 +1790,8 @@ static void *thread_socket_handler(void *arg)
                 cm->manager.nodes[i] =
                     cm->manager.nodes[cm->manager.num_nodes - 1];
                 cm->manager.num_nodes--;
+                remember_finalized_node(finalized_ids, &finalized_count,
+                                        node->id);
                 /* Drop the manager's ownership ref (taken at creation in
                  * connect_node/accept_connection) now that the node has
                  * left nodes[]. Any remaining ref belongs to an in-flight
@@ -1821,6 +1845,10 @@ static void *thread_socket_handler(void *arg)
             }
         }
         zcl_mutex_unlock(&cm->manager.cs_nodes);
+        /* Lifecycle callbacks may perform snapshot rollback and database
+         * writes. Run them only after releasing cs_nodes so peer churn can
+         * never invert the peer-list lock with service/storage locks. */
+        finalize_removed_nodes(cm, finalized_ids, finalized_count);
     }
     return NULL;
 }

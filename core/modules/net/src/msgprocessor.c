@@ -36,6 +36,7 @@
 #include "net/file_manifest.h"
 #include "net/file_market.h"
 #include "net/rom_seed.h"
+#include "net/snapshot_sync_contract.h"
 #include "net/p2p_game.h"
 #include "net/net_fault.h"
 #include "net/peer_lifecycle.h"
@@ -2169,6 +2170,14 @@ int msg_get_height(void *ctx)
 {
     struct msg_processor *mp = (struct msg_processor *)ctx;
     return active_chain_height(&mp->main_state->chain_active);
+}
+
+void msg_finalize_node(void *ctx, node_id_t id)
+{
+    struct msg_processor *mp = (struct msg_processor *)ctx;
+    struct snapshot_sync_service *svc = msg_snapshot_sync(mp);
+    if (svc)
+        (void)snapsync_peer_disconnected(svc, (uint32_t)id);
 }
 
 /* ── msg_process_messages: dispatch loop ─────────────────────── */

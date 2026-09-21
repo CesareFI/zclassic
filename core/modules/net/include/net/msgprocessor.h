@@ -494,6 +494,7 @@ void msg_processor_set_beta6_bootstrap(
 bool msg_process_messages(void *ctx, struct p2p_node *node);
 bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle);
 int msg_get_height(void *ctx);
+void msg_finalize_node(void *ctx, node_id_t id);
 
 /* Update the cached snapshot offer (thread-safe). Called from boot.c. */
 struct snapshot_offer;
