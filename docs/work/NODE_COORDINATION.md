@@ -1570,3 +1570,27 @@ chain selection are unchanged.  Worldstream `5297c58f4` remains complementary
 on download-timeout arithmetic.  Remaining risk and next investigation:
 exercise repeated invalid-socket reconnect generations and verify each session
 finalizes once without retaining peer or snapshot ownership state.
+
+## Reconnect-generation terminal cleanup regression
+
+Baseline and root cause: the empty-reactor regression qualified only one peer
+generation, leaving repeated disconnect/reconnect lifecycle reuse unobserved.
+The production node assigns each session a distinct peer ID, and all ownership
+release callbacks are keyed by that ID; a missed or duplicate callback across
+generations could therefore retain old snapshot ownership or release a newer
+session's work.
+
+Fix and after-result: the real socket-reactor fixture now drives three
+successive invalid-socket generations through independent start/join cycles.
+It proves each distinct peer ID is finalized exactly once, every callback runs
+outside `cs_nodes`, and the peer table is empty after every generation.  No
+production behavior changed.
+
+Regression proof: `test_connman_addnode_fallback` passes the three-generation
+reactor sequence and the later fixed-seed case, also proving that each joined
+cycle restores the process-global stop state.  Consensus impact: NONE.
+Worldstream `0b29bec27` remains focused on fresh-sync startup interruption and
+observer coverage, with no overlap.  Remaining risk and next investigation:
+measure snapshot source selection under larger compatible-source reconnect
+churn, especially whether one rapidly reconnecting endpoint can crowd out
+diverse stable sources without violating the bounded manifest table.
