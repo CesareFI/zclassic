@@ -85,6 +85,10 @@ struct header_range_scheduler {
  * (regression: behaves exactly like today). */
 bool hrs_should_parallelize(int fast_peer_count, int32_t gap, int32_t batch);
 
+/* Fold one eligible peer's advertised height into the shared range target.
+ * The global plan must use the highest peer, not whichever peer ticked last. */
+int32_t hrs_include_peer_target(int32_t target, int32_t peer_height);
+
 /* Partition (lo, hi] into disjoint contiguous spans at the supplied
  * anchor heights. `anchors` must be sorted ascending; each entry is a
  * locally-known hash boundary. lo and hi are implicit endpoints (anchors
@@ -128,6 +132,18 @@ size_t hrs_note_frontier(struct header_range_scheduler *s, int32_t height);
  * span for another peer — it never stalls the whole sync. */
 size_t hrs_sweep_expired(struct header_range_scheduler *s, int64_t now_us,
                          int32_t *stalled, size_t max);
+
+/* Release any live span owned by peer_id immediately. Used when that peer
+ * answers its getheaders request with an empty batch: the source has supplied
+ * definitive evidence that it cannot advance this span, so waiting for the
+ * timeout would unnecessarily exclude healthy peers. Returns spans released
+ * (normally 0 or 1). Empty replies are not protocol offences. */
+size_t hrs_release_peer(struct header_range_scheduler *s, int32_t peer_id);
+
+/* Renew the deadline for a live span after its owner delivers accepted
+ * headers. Returns true iff that peer still owns a span. */
+bool hrs_note_peer_progress(struct header_range_scheduler *s, int32_t peer_id,
+                            int64_t now_us);
 
 /* Report the live span currently held by peer_id. Returns true and fills
  * out_lo/out_hi iff the peer holds an assigned, not-yet-expired span. */

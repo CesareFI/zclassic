@@ -1262,6 +1262,39 @@ bool push_verified_header_announcement(struct msg_processor *mp,
     return true;
 }
 
+static void push_getheaders_followup(struct msg_processor *mp,
+                                     struct p2p_node *node,
+                                     struct block_index *from,
+                                     int our_height);
+
+static void hrs_release_terminal_response(struct p2p_node *node,
+                                          const struct sync_header_batch *batch,
+                                          size_t accepted,
+                                          uint64_t count)
+{
+    if (!batch->should_release_range)
+        return;
+    struct header_range_scheduler *sched = header_range_scheduler_global();
+    if (hrs_release_peer(sched, node->id) > 0)
+        event_emitf(EV_HEADERS_REJECTED, (uint32_t)node->id,
+                    "terminal header response released range span "
+                    "accepted=%zu total=%llu", accepted,
+                    (unsigned long long)count);
+}
+
+static void hrs_note_response_progress(struct p2p_node *node, size_t accepted)
+{
+    if (accepted == 0)
+        return;
+    (void)hrs_note_peer_progress(header_range_scheduler_global(), node->id,
+                                 platform_time_monotonic_us());
+}
+
+size_t mp_header_range_peer_disconnected(uint32_t peer_id)
+{
+    return hrs_release_peer(header_range_scheduler_global(), (int32_t)peer_id);
+}
+
 bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                      struct byte_stream *s)
 {
@@ -1520,6 +1553,9 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                                        pindex_last, sync_get_state(),
                                        bi, tip, our_height,
                                        hashes, heights, max_collect);
+        hrs_note_response_progress(node, accepted);
+        hrs_release_terminal_response(node, &header_plan.batch,
+                                      accepted, count);
         if (seq_count > 0 && hashes && heights) {
             memcpy(hashes, seq_hashes, seq_count * sizeof(struct uint256));
             memcpy(heights, seq_heights, seq_count * sizeof(int32_t));
@@ -1803,6 +1839,8 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
      * If some headers were new, use pindex_last — the peer will continue
      * from right after it. */
     if (header_plan.batch.should_request_more_headers) {
+        int follow_height = active_chain_height(
+            &mp->main_state->chain_active);
         /* Band fill: a below-tip batch that extends the trust-rooted
          * frontier toward an installed-above-frontier island is progress
          * — it must suppress BOTH the restart-from-tip and the
@@ -1851,7 +1889,8 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                 struct block_index *restart_tip = active_chain_tip(
                     &mp->main_state->chain_active);
                 if (restart_tip && restart_tip->phashBlock)
-                    push_getheaders_from(mp, node, restart_tip);
+                    push_getheaders_followup(mp, node, restart_tip,
+                                             follow_height);
                 else
                     push_getheaders(mp, node);
             }
@@ -1881,12 +1920,14 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
              * moves), so the skip would ping-pong the identical request
              * with that peer forever. Such peers take the pindex_last
              * continuation below, which terminates at their tip. */
-            push_getheaders_from(mp, node, mp->main_state->pindex_best_header);
+            push_getheaders_followup(mp, node,
+                                     mp->main_state->pindex_best_header,
+                                     follow_height);
         } else {
             /* Advance from pindex_last — the actual last header the peer
              * sent.  Using pindex_best_header caused infinite loops after
              * snapshot/LDB import when heights were scrambled. */
-            push_getheaders_from(mp, node, pindex_last);
+            push_getheaders_followup(mp, node, pindex_last, follow_height);
         }
     }
 
@@ -2165,9 +2206,40 @@ static bool hrs_resolve_anchor_hash(struct msg_processor *mp, int32_t height,
     return false;
 }
 
+bool msg_range_continuation_stop(struct msg_processor *mp,
+                                 struct p2p_node *node,
+                                 int our_height,
+                                 int64_t now_us,
+                                 struct uint256 *stop_hash)
+{
+    int32_t hi = 0;
+    if (!mp || !node || !stop_hash || now_us < 0)
+        return false;
+    if (!hrs_peer_span(header_range_scheduler_global(), node->id,
+                       now_us, NULL, &hi))
+        return false;
+    return hrs_resolve_anchor_hash(mp, hi, our_height, stop_hash);
+}
+
+static void push_getheaders_followup(struct msg_processor *mp,
+                                     struct p2p_node *node,
+                                     struct block_index *from,
+                                     int our_height)
+{
+    struct uint256 stop_hash;
+    int64_t now_us = platform_time_monotonic_us();
+    if (from && from->phashBlock &&
+        msg_range_continuation_stop(mp, node, our_height, now_us,
+                                    &stop_hash)) {
+        push_getheaders_span(mp, node, from->phashBlock, &stop_hash);
+        return;
+    }
+    push_getheaders_from(mp, node, from);
+}
+
 bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
                                        struct p2p_node *node,
-                                       int our_height, int64_t now_seconds)
+                                       int our_height, int64_t now_us)
 {
     if (!mp || !node || !mp->main_state || !mp->net_mgr || !mp->params)
         return false;
@@ -2189,8 +2261,6 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
     if (ms->pindex_best_header &&
         ms->pindex_best_header->nHeight > target)
         target = ms->pindex_best_header->nHeight;
-    int32_t gap = (int32_t)(target - our_height);
-
     /* Count connected fast-sync-capable outbound peers. */
     int fast_peers = 0;
     zcl_mutex_lock(&mp->net_mgr->cs_nodes);
@@ -2198,10 +2268,14 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
         struct p2p_node *n = mp->net_mgr->nodes[pi];
         if (n && !n->inbound && !n->disconnect &&
             n->state >= PEER_ACTIVE &&
-            peer_supports_fast_sync(n->services))
+            peer_supports_fast_sync(n->services)) {
             fast_peers++;
+            target = hrs_include_peer_target(target, n->starting_height);
+        }
     }
     zcl_mutex_unlock(&mp->net_mgr->cs_nodes);
+
+    int32_t gap = (int32_t)(target - our_height);
 
     if (!hrs_should_parallelize(fast_peers, gap, 2000))
         return false;
@@ -2222,8 +2296,6 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
 
     struct header_range_scheduler *sched = header_range_scheduler_global();
     hrs_plan(sched, (int32_t)our_height, target, anchors, n_anchors);
-
-    int64_t now_us = now_seconds * 1000000;
 
     /* Advance completions from our current header frontier so already-synced
      * spans free their peer slots before we (re)assign. */

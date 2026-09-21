@@ -435,6 +435,10 @@ size_t mp_block_swarm_peer_disconnected(struct p2p_node *node);
 /* Snapshot-swarm sibling: reclaim UTXO chunks owned by a dead peer. */
 size_t mp_snapshot_swarm_peer_disconnected(struct p2p_node *node);
 
+/* Header-range sibling: immediately release a disconnected peer's assigned
+ * getheaders span so another healthy peer need not wait for its deadline. */
+size_t mp_header_range_peer_disconnected(uint32_t peer_id);
+
 /* NET-2: current per-peer EWMA bandwidth score (0..255, 0 = none measured).
  * Read at session close to bank the peer's final reputation. */
 uint32_t dl_peer_bandwidth_score(struct download_manager *dm, uint32_t peer_id);

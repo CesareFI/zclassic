@@ -43,6 +43,9 @@ struct sync_header_batch {
     bool should_warn_all_rejected;
     bool should_emit_received;
     bool should_request_more_headers;
+    /* A terminal response must not retain a range-scheduler span until its
+     * timeout. Another healthy peer can resume the span immediately. */
+    bool should_release_range;
     /* All-rejected batches may be a legitimate ahead-of-us tip announcement
      * we cannot connect (bad-prevblk). The receiver should re-probe with
      * getheaders from our best header — rate-limited at the call site via

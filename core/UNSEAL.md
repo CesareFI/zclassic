@@ -536,3 +536,7 @@ later lane flips it HARD.
 - 2026-09-21T08:28:57Z — REASON: Refactor snapshot owner-timeout handling below the cyclomatic-complexity ratchet without changing transport behavior or consensus
   old ROOT: ae43277e7f177a9b92cf867aaefa9d2753a845a0670c7154345c2884c427a25f
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T08:33:45Z — REASON: Integrate previously validated header range empty, terminal, disconnect, continuation, progress, and stable-target recovery onto the current networking branch; transport scheduling only, consensus unchanged
+  old ROOT: ffbe008855edc80638d13a9a116428c7d0a654a321cd4310cc32c60ae0e99bcc
+  by: owner unseal ritual (make core-unseal)

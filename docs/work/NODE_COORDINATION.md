@@ -1058,3 +1058,41 @@ Remaining risk and next investigation: add explicit UTXO-swarm timeout and
 delivery counters for operator visibility only if live or fixture evidence
 shows snapshot stalls remain hard to attribute; otherwise inspect header
 source rotation after repeated empty partial responses.
+
+## Restore validated header-range rotation on the current branch
+
+Baseline: inspection of the current Hetzner branch found that the validated
+header-range recovery series remained preserved only on
+`fix/bootstrap-after-peer-discovery-current`; neither this branch nor current
+`origin/main` contained it. Consequently an empty, terminal, or disconnected
+range source could retain its span until timeout, partial continuations could
+lose their stop boundary, progress did not renew the deadline, and a lower-tip
+peer tick could shrink the shared target.
+
+Root cause and fix: branch development had diverged after those six commits.
+Their final combined behavior was applied onto the current networking branch
+after a three-way applicability audit. The only overlap was connman's newer
+snapshot/block-swarm disconnect cleanup; it was preserved and the header-span
+release was added alongside it. Empty/terminal replies and disconnect now
+release ownership immediately, partial batches preserve the assigned stop,
+accepted progress renews the monotonic deadline, and planning retains the
+highest connected fast-peer target regardless of tick order.
+
+After-result and regression proof: `header_range_sched` passes its direct
+empty-response, disconnect, continuation-stop, progress-renewal, stable-target,
+timeout-reassignment, and cross-peer-sweep cases. `sync_service` and
+`snapshot_sync_service` pass, including the terminal-batch decision contract.
+The direct `process_headers_adversarial`, both header-sync groups, all three
+getheaders serve groups, and all 13 networking groups also pass.
+The original six commits remain preserved on their source branch; this slice
+integrates their audited net effect without merging unrelated history.
+
+Consensus impact: NONE. Header acceptance, PoW, checkpoints, chain selection,
+serialization, block/transaction validity, and cryptography are unchanged.
+This changes only request ownership and source rotation. Worldstream remains
+at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: add a production-wiring regression that
+binds a range span to a peer, drives a malformed/truncated headers response
+through the dispatcher and terminal disconnect cleanup, and proves another
+source can claim the span without waiting for its deadline.

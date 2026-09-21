@@ -39,6 +39,11 @@ bool hrs_should_parallelize(int fast_peer_count, int32_t gap, int32_t batch)
     return gap > batch;
 }
 
+int32_t hrs_include_peer_target(int32_t target, int32_t peer_height)
+{
+    return peer_height > target ? peer_height : target;
+}
+
 /* Insert `v` into a sorted-ascending, deduplicated int32 array of length
  * *n (capacity cap). No-op on a full array or a duplicate. */
 static void sorted_insert(int32_t *arr, size_t *n, size_t cap, int32_t v)
@@ -253,6 +258,46 @@ size_t hrs_sweep_expired(struct header_range_scheduler *s, int64_t now_us,
     }
     zcl_mutex_unlock(&s->lock);
     return n;
+}
+
+size_t hrs_release_peer(struct header_range_scheduler *s, int32_t peer_id)
+{
+    if (!s || !s->inited)
+        return 0;
+
+    size_t released = 0;
+    zcl_mutex_lock(&s->lock);
+    for (size_t i = 0; i < s->n_spans; i++) {
+        if (s->spans[i].assigned && !s->spans[i].completed &&
+            s->spans[i].peer_id == peer_id) {
+            s->spans[i].assigned = false;
+            s->spans[i].peer_id = 0;
+            s->spans[i].deadline_us = 0;
+            s->stat_reassigns++;
+            released++;
+        }
+    }
+    zcl_mutex_unlock(&s->lock);
+    return released;
+}
+
+bool hrs_note_peer_progress(struct header_range_scheduler *s, int32_t peer_id,
+                            int64_t now_us)
+{
+    if (!s || !s->inited)
+        return false;
+    bool renewed = false;
+    zcl_mutex_lock(&s->lock);
+    for (size_t i = 0; i < s->n_spans; i++) {
+        if (s->spans[i].assigned && !s->spans[i].completed &&
+            s->spans[i].peer_id == peer_id) {
+            s->spans[i].deadline_us = now_us + s->span_timeout_us;
+            renewed = true;
+            break;
+        }
+    }
+    zcl_mutex_unlock(&s->lock);
+    return renewed;
 }
 
 bool hrs_peer_span(struct header_range_scheduler *s, int32_t peer_id,

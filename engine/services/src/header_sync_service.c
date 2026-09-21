@@ -99,6 +99,7 @@ void syncsvc_evaluate_header_batch(struct sync_header_batch *result,
     result->should_request_more_headers =
         (accepted > 0 && total_count >= 160 &&
          last_header && last_header->phashBlock);
+    result->should_release_range = !result->should_request_more_headers;
 }
 
 void syncsvc_plan_header_download(struct sync_header_download_plan *plan,
