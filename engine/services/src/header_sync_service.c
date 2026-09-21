@@ -353,6 +353,21 @@ void syncsvc_plan_periodic_getheaders(struct sync_getheaders_action *action,
            node->id, our_height, node->starting_height, (long long)interval);
 }
 
+void syncsvc_plan_getheaders_with_fallback(
+    struct sync_getheaders_action *action, const struct p2p_node *node,
+    int our_height, int64_t now_seconds, bool header_stall)
+{
+    syncsvc_plan_periodic_getheaders(action, node, our_height, now_seconds);
+    if (!action || action->should_send ||
+        !syncsvc_should_request_headers_with_fallback(
+            node, our_height, now_seconds, header_stall))
+        return;
+
+    action->should_send = true;
+    action->anchor = SYNC_HEADER_REQUEST_TIP;
+    action->should_log = true;
+}
+
 void syncsvc_note_headers_requested(struct p2p_node *node,
                                     int64_t now_seconds)
 {

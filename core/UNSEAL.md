@@ -612,3 +612,7 @@ later lane flips it HARD.
 - 2026-09-21T11:37:52Z — REASON: propagate getheaders enqueue result so failed requests remain retryable
   old ROOT: de433d1462fb92629fd7f0f86f5341a5d1590aba7e17bb82a992acaca74b1a2d
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T11:47:39Z — REASON: make inbound header-stall fallback produce an explicit request action
+  old ROOT: f770b6603bbb3de54511085222239c20b75dfb1ec2847e88037719079404f145
+  by: owner unseal ritual (make core-unseal)

@@ -299,8 +299,9 @@ int test_header_sync_stall(void)
     {
         struct p2p_node n = make_stall_node(10000, true, 0);
         n.state = PEER_ACTIVE;
-        bool ok = syncsvc_should_request_headers_with_fallback(
-            &n, 100, 9999, true);
+        struct sync_getheaders_action action = {0};
+        syncsvc_plan_getheaders_with_fallback(&action, &n, 100, 9999, true);
+        bool ok = action.should_send;
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 

@@ -308,6 +308,9 @@ void syncsvc_plan_periodic_getheaders(struct sync_getheaders_action *action,
                                       const struct p2p_node *node,
                                       int our_height,
                                       int64_t now_seconds);
+void syncsvc_plan_getheaders_with_fallback(
+    struct sync_getheaders_action *action, const struct p2p_node *node,
+    int our_height, int64_t now_seconds, bool header_stall);
 void syncsvc_note_headers_requested(struct p2p_node *node,
                                     int64_t now_seconds);
 /* Pass the count of NEW-to-index headers (newly_added), never the raw

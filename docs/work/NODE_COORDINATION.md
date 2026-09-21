@@ -1688,3 +1688,31 @@ investigation: audit the header-stall inbound fallback action itself; it can set
 the outer send intent while the independently planned periodic action remains
 empty, so prove that an inbound-only stalled node actually emits a request
 before changing that path.
+
+## Inbound-only header-stall request planning
+
+Baseline and root cause: the header-stall fallback predicate admitted an
+inbound peer and set the send loop's outer `should_sync` flag, but the ordinary
+periodic planner ran afterward and reset the action to empty because inbound
+peers are deliberately excluded outside a stall.  `exec_getheaders_action`
+therefore received `should_send=false`; an inbound-only node could announce
+fallback recovery without putting any `getheaders` request on the wire.
+
+Fix and after-result: one pure planner now produces the ordinary periodic
+action first, then explicitly creates the same tip-anchored action when the
+stall fallback admits a peer.  The send loop consumes that single action and
+retains queue-success timestamp accounting.  Normal inbound peers remain
+ineligible, while outbound planning is unchanged.  Removing the duplicated
+branch reduced `msg_send_messages` complexity from 114 to 111 and the ratchet
+was lowered accordingly.
+
+Regression proof: the header-stall group now asserts the planner—not merely
+the lower-level predicate—returns a sendable action for an active inbound peer
+during a stall.  Its normal-inbound refusal and outbound control cases remain
+green.  Consensus impact: NONE; this changes only selection of a compatible
+peer for an ordinary `getheaders` request.  Header validation, checkpoints,
+PoW, chain selection, wire serialization, and transaction rules are untouched.
+Worldstream `0b29bec27` remains complementary on startup interruption and
+observer coverage.  Remaining risk and next investigation: drive the
+inbound-only recovery through the production send loop with a real peer table,
+including bounded-queue refusal followed by a second healthy inbound source.
