@@ -1389,16 +1389,40 @@ static int test_block_swarm_peer_fairness(void)
         struct p2p_node *first = bs_make_peer(&nm, 21);
         struct p2p_node *second = bs_make_peer(&nm, 22);
         struct p2p_node *outbound = bs_make_peer(&nm, 23);
-        ASSERT(first && second && outbound);
+        struct p2p_node *blocked = bs_make_peer(&nm, 24);
+        ASSERT(first && second && outbound && blocked);
         first->id = 21;
         second->id = 22;
         outbound->id = 23;
+        blocked->id = 24;
         first->blk_peer_height = end_height;
         second->blk_peer_height = end_height;
         outbound->blk_peer_height = end_height;
+        blocked->blk_peer_height = end_height;
         struct send_segment *sent_first = bs_install_sentinel(first);
         struct send_segment *sent_second = bs_install_sentinel(second);
         struct send_segment *sent_outbound = bs_install_sentinel(outbound);
+        struct send_segment *sent_blocked = bs_install_sentinel(blocked);
+
+        /* Assignment must be rolled back when the bounded send queue refuses
+         * the request. Otherwise a peer that cannot accept even zblkreq owns
+         * work until timeout despite no request ever reaching the wire. */
+        mp_block_swarm_test_seed_stall(0, pieces, 1);
+        ASSERT(mp_block_swarm_test_admit_peer(blocked));
+        blocked->send_size = net_send_peer_bytes_hard_cap();
+        mp_snapshot_send_tick(&mp, blocked);
+        blocked->send_size = 0;
+        ASSERT(bs_queue_depth(sent_blocked) == 0);
+        ASSERT(atomic_load(&blocked->blk_pieces_requested) == 0);
+        for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++)
+            ASSERT(blocked->blk_pipeline[pi].piece_index < 0);
+        ASSERT(mp_block_swarm_test_admit_peer(second));
+        mp_snapshot_send_tick(&mp, second);
+        ASSERT(bs_queue_depth(sent_second) == PIECE_PIPELINE_DEPTH / 4);
+        bs_drop_queue(second, sent_second);
+        for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++)
+            second->blk_pipeline[pi].piece_index = -1;
+        atomic_store(&second->blk_pieces_requested, 0);
 
         mp_block_swarm_test_seed_stall(0, pieces, 1);
         ASSERT(mp_block_swarm_is_active());
@@ -1474,12 +1498,15 @@ static int test_block_swarm_peer_fairness(void)
         send_segment_free(sent_first);
         send_segment_free(sent_second);
         send_segment_free(sent_outbound);
+        send_segment_free(sent_blocked);
         first->send_head = first->send_tail = NULL;
         second->send_head = second->send_tail = NULL;
         outbound->send_head = outbound->send_tail = NULL;
+        blocked->send_head = blocked->send_tail = NULL;
         p2p_node_free(first);
         p2p_node_free(second);
         p2p_node_free(outbound);
+        p2p_node_free(blocked);
         net_manager_free(&nm);
         main_state_free(&ms);
         PASS();

@@ -556,3 +556,7 @@ later lane flips it HARD.
 - 2026-09-21T09:20:23Z — REASON: Release block-swarm ownership immediately after malformed or truncated owned zblkdata; transport recovery only, consensus unchanged
   old ROOT: 43e9512fb836915da91f9ccdef65f26367f52925392693b36ca342402f60fe2f
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T09:31:42Z — REASON: Roll back block-swarm ownership when a request cannot enter the bounded send queue; transport scheduling only, consensus unchanged
+  old ROOT: c5a5943c46f71116ab0b7b3e1e69f9ad9b87de49dd47c79b8daca20657fdf442
+  by: owner unseal ritual (make core-unseal)

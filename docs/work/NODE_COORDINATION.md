@@ -1287,3 +1287,33 @@ Worldstream remains at `0b29bec27` on complementary startup/observer work.
 Remaining risk and next investigation: inspect request construction and queue
 failure paths for assignments that acquire authoritative ownership before the
 request is durably queued, forcing avoidable timeout recovery.
+
+## Roll back block ownership when request enqueue fails
+
+Baseline: with a peer send queue at its enforced 64 MiB hard ceiling, one
+scheduler tick attempted and refused 64 `zblkreq` frames, yet recorded all 64
+pieces as requested and authoritatively owned by the disconnecting peer. No
+request reached the wire, so healthy sources could not claim the pieces until
+timeout or disconnect teardown.
+
+Root cause and fix: `push_block_piece_request` discarded the bounded queue's
+failure result, while the caller committed its pipeline and request metric
+before enqueue. It now returns enqueue status. On failure the scheduler
+requeues that piece only if this peer still owns it, clears the matching local
+slot, leaves the successful-request metric unchanged, and stops the batch.
+
+After-result and regression proof: the pre-fix loopback regression failed with
+64 false request credits and occupied slots. It now observes one refused send,
+zero credits, an empty failed-peer pipeline, and immediate assignment of the
+released work to a healthy peer. The complete block-swarm loopback group,
+including throughput, peer fairness, timeout, disconnect, duplicate, late,
+malformed, integrity, and anchoring cases, passes.
+
+Consensus impact: NONE. This changes transport request ownership only; block
+bodies still traverse the canonical parser and reducer. Worldstream remains at
+`0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: the analogous snapshot chunk request
+helper also discards bounded send-queue failure after claiming its single
+global chunk; reproduce and close that ownership gap without conflating the
+two scheduler lifecycles.

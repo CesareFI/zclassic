@@ -676,19 +676,47 @@ static void push_chunk_request(struct msg_processor *mp,
 }
 
 /* Send a block piece request to a peer. */
-static void push_block_piece_request(struct msg_processor *mp,
-                                      struct p2p_node *node,
-                                      uint32_t piece_index)
+static bool push_block_piece_request(struct msg_processor *mp,
+                                     struct p2p_node *node,
+                                     uint32_t piece_index)
 {
     struct byte_stream s;
     stream_init(&s, 4);
-    stream_write_u32_le(&s, piece_index);
-
-    p2p_node_begin_message(node, MSG_BLOCK_REQ,
-                            mp->params->pchMessageStart);
-    p2p_node_write_message_data(node, s.data, s.size);
-    p2p_node_end_message(node);
+    bool ok = stream_write_u32_le(&s, piece_index) &&
+        p2p_node_begin_message(node, MSG_BLOCK_REQ,
+                               mp->params->pchMessageStart);
+    if (ok)
+        p2p_node_write_message_data(node, s.data, s.size);
+    if (ok)
+        ok = p2p_node_end_message(node);
     stream_free(&s);
+    return ok;
+}
+
+/* Called with g_block_swarm_mutex held; returns the scheduler-loop increment.
+ * A failed enqueue consumes the rest of this tick's batch so a disconnecting
+ * peer cannot repeatedly acquire and release work in one pass. */
+static int block_swarm_queue_assigned_request(
+    struct msg_processor *mp, struct p2p_node *node, int pipeline_index,
+    int32_t piece_index, int failure_increment)
+{
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    bool queued = push_block_piece_request(
+        mp, node, (uint32_t)piece_index);
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    if (queued) {
+        atomic_fetch_add(&node->blk_pieces_requested, 1);
+        return 1;
+    }
+
+    (void)block_swarm_requeue_piece_for_peer(
+        &g_block_swarm, (uint32_t)piece_index, node->id);
+    if (node->blk_pipeline[pipeline_index].piece_index == piece_index) {
+        node->blk_pipeline[pipeline_index].piece_index = -1;
+        node->blk_pipeline[pipeline_index].request_time = 0;
+        node->blk_pipeline[pipeline_index].request_time_us = 0;
+    }
+    return failure_increment;
 }
 
 static bool parse_block_piece_payload_refs(
@@ -2338,12 +2366,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
             node->blk_pipeline[pi].request_time = now_bs;
             node->blk_pipeline[pi].request_time_us =
                 platform_time_monotonic_us();
-            atomic_fetch_add(&node->blk_pieces_requested, 1);
-            assigned_this_tick++;
-
-            pthread_mutex_unlock(&g_block_swarm_mutex);
-            push_block_piece_request(mp, node, (uint32_t)pidx);
-            pthread_mutex_lock(&g_block_swarm_mutex);
+            assigned_this_tick += block_swarm_queue_assigned_request(
+                mp, node, pi, pidx, assignment_batch);
         }
 
         /* Progress display (rate-limited) */
