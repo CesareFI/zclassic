@@ -1560,6 +1560,19 @@ void block_piece_manifest_free(struct block_piece_manifest *m)
     }
 }
 
+bool block_piece_manifest_equal(const struct block_piece_manifest *a,
+                                const struct block_piece_manifest *b)
+{
+    return a && b && a->piece_hashes && b->piece_hashes &&
+        a->start_height == b->start_height &&
+        a->end_height == b->end_height &&
+        a->num_pieces == b->num_pieces &&
+        memcmp(a->tip_hash, b->tip_hash, 32) == 0 &&
+        memcmp(a->merkle_root, b->merkle_root, 32) == 0 &&
+        memcmp(a->piece_hashes, b->piece_hashes,
+               (size_t)a->num_pieces * 32) == 0;
+}
+
 bool block_piece_manifest_build(const char *datadir,
                                  int32_t start_height, int32_t end_height,
                                  struct block_piece_manifest *out)

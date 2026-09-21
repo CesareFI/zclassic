@@ -468,3 +468,7 @@ later lane flips it HARD.
 - 2026-09-21T04:38:35Z — REASON: Bound repeated per-peer block-swarm manifest parsing per swarm generation; networking resource defense only, no consensus semantic change
   old ROOT: e7959745e93cf66586b84343b491dd14ca873c7519efbc5d6dea83fd3171f8f1
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T04:56:19Z — REASON: Admit block-swarm sources only when their validated manifest exactly matches the active swarm, with serialized initialization; scheduling safety only, no consensus semantic change
+  old ROOT: 25f8856ae12c97d1e980c289cd4eab11133a75034902c0002c01f071ca3a175a
+  by: owner unseal ritual (make core-unseal)

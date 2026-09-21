@@ -868,6 +868,30 @@ static int test_block_swarm_rarest_first(void)
     return failures;
 }
 
+static int test_block_manifest_identity(void)
+{
+    int failures = 0;
+    TEST("block swarm sources require exact manifest identity") {
+        uint8_t hashes_a[2][32] = {{0}};
+        uint8_t hashes_b[2][32] = {{0}};
+        struct block_piece_manifest a = {
+            .start_height = 1, .end_height = 128, .num_pieces = 2,
+            .piece_hashes = hashes_a
+        };
+        struct block_piece_manifest b = a;
+        b.piece_hashes = hashes_b;
+        ASSERT(block_piece_manifest_equal(&a, &b));
+        b.piece_hashes[1][0] = 1;
+        ASSERT(!block_piece_manifest_equal(&a, &b));
+        b.piece_hashes[1][0] = 0;
+        b.end_height++;
+        ASSERT(!block_piece_manifest_equal(&a, &b));
+        ASSERT(!block_piece_manifest_equal(NULL, &b));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_block_swarm_endgame(void)
 {
     int failures = 0;
@@ -2074,6 +2098,7 @@ int test_fast_sync(void)
     failures += test_swarm_timeout_monotonic_boundaries();
 
     /* Block swarm */
+    failures += test_block_manifest_identity();
     failures += test_block_swarm_rarest_first();
     failures += test_block_swarm_endgame();
     failures += test_block_swarm_bitmap();

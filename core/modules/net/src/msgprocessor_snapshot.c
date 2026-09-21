@@ -314,6 +314,45 @@ static bool block_manifest_command_allowed(const char *cmd,
     return false;
 }
 
+static int64_t block_swarm_monotonic_seconds(void);
+static bool block_swarm_restart_ready_at(int64_t now_monotonic,
+                                         int64_t reaped_monotonic);
+
+static bool block_swarm_admit_manifest_source(
+    struct p2p_node *node, const struct block_piece_manifest *manifest,
+    const char *datadir, int32_t completed_height, bool allow_start,
+    bool *started_out)
+{
+    if (!node || !manifest || !started_out)
+        return false;
+    *started_out = false;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    bool admitted = false;
+    if (atomic_load(&g_block_swarm_active)) {
+        admitted = block_piece_manifest_equal(
+            &g_block_swarm.manifest, manifest);
+    } else if (allow_start && block_swarm_restart_ready_at(
+                   block_swarm_monotonic_seconds(),
+                   atomic_load(&g_block_swarm_reaped_monotonic)) &&
+               block_swarm_init(&g_block_swarm, manifest, datadir)) {
+        block_swarm_advance_generation();
+        g_block_swarm.last_complete_monotonic =
+            block_swarm_monotonic_seconds();
+        mp_block_swarm_mark_complete_through_height(
+            &g_block_swarm, completed_height);
+        atomic_store(&g_block_swarm_active, true);
+        g_block_swarm_last_progress =
+            (int64_t)platform_time_wall_time_t();
+        admitted = true;
+        *started_out = true;
+    }
+    node->blk_manifest_received = admitted;
+    if (admitted)
+        node->blk_peer_height = manifest->end_height;
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return admitted;
+}
+
 static void block_swarm_replace_peer_bitmap_locked(
     struct p2p_node *node, uint64_t old_generation,
     const uint8_t *new_bitmap, uint32_t new_bitmap_len)
@@ -1434,11 +1473,13 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
         } else if (block_manifest_command_allowed(cmd, node)) {
             /* Peer sends their block piece manifest.
              * DEFENSIVE: validate all fields before trusting any data. */
+            node->blk_manifest_received = false;
             int32_t start_h = 0, end_h = 0;
             uint32_t num_pieces = 0;
             uint8_t tip_hash[32], merkle_root[32];
             uint8_t (*piece_hashes)[32] = NULL;
             bool piece_hashes_valid = false;
+            bool anchored = false;
 
             if (stream_read_i32_le(s, &start_h) &&
                 stream_read_i32_le(s, &end_h) &&
@@ -1517,7 +1558,6 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                              * pure resource burn. */
                             struct uint256 tip_u;
                             memcpy(tip_u.data, tip_hash, 32);
-                            bool anchored = false;
                             if (mp->main_state) {
                                 struct block_index *tip_bi = block_map_find(
                                     &mp->main_state->map_block_index,
@@ -1529,10 +1569,7 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                                 mp->main_state->pindex_best_header)
                                 anchored = start_h <=
                                     mp->main_state->pindex_best_header->nHeight;
-                            if (anchored) {
-                                node->blk_manifest_received = true;
-                                node->blk_peer_height = end_h;
-                            } else {
+                            if (!anchored) {
                                 fprintf(stderr,  // obs-ok:peer-scored
                                         "Peer %s: block manifest not "
                                         "anchored in local header index "
@@ -1566,42 +1603,30 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                     if (hstar > our_h)
                         our_h = hstar;
                 }
-                if (node->blk_manifest_received)
+                struct block_piece_manifest pm = {
+                    .start_height = start_h,
+                    .end_height = end_h,
+                    .num_pieces = num_pieces,
+                    .piece_hashes = piece_hashes
+                };
+                memcpy(pm.tip_hash, tip_hash, 32);
+                memcpy(pm.merkle_root, merkle_root, 32);
+                bool started = false;
+                bool admitted = piece_hashes_valid && anchored &&
+                    block_swarm_admit_manifest_source(
+                        node, &pm, mp->datadir, our_h,
+                        end_h > our_h + BLOCKS_PER_PIECE,
+                        &started);
+                if (admitted)
                     printf("Peer %s: block manifest h=%d..%d (%u pieces)\n",
                            node->addr_name, start_h, end_h, num_pieces);
-                /* If peer is ahead and no active block swarm, start one.
-                 * After a stall-abandon, hold off re-arming for
-                 * BLOCK_SWARM_RESTART_COOLDOWN_SECS so legacy getdata owns
-                 * body transfer long enough to push past the hole. */
-                if (node->blk_manifest_received &&
-                    end_h > our_h + BLOCKS_PER_PIECE &&
-                    !g_block_swarm_active && num_pieces > 0 &&
-                    block_swarm_restart_ready_at(
-                        platform_time_monotonic_us() / 1000000,
-                        atomic_load(&g_block_swarm_reaped_monotonic))) {
-                    struct block_piece_manifest pm = {
-                        .start_height = start_h,
-                        .end_height = end_h,
-                        .num_pieces = num_pieces,
-                        .piece_hashes = piece_hashes
-                    };
-                    memcpy(pm.tip_hash, tip_hash, 32);
-                    memcpy(pm.merkle_root, merkle_root, 32);
-                    pthread_mutex_lock(&g_block_swarm_mutex);
-                    if (block_swarm_init(&g_block_swarm, &pm, mp->datadir)) {
-                        block_swarm_advance_generation();
-                        g_block_swarm.last_complete_monotonic =
-                            block_swarm_monotonic_seconds();
-                        mp_block_swarm_mark_complete_through_height(
-                            &g_block_swarm, our_h);
-                        g_block_swarm_active = true;
-                        g_block_swarm_last_progress = (int64_t)platform_time_wall_time_t();
-                        printf("Block swarm started: %u pieces, h=%d..%d "
-                               "(already_complete=%u at h=%d)\n",
-                               num_pieces, start_h, end_h,
-                               g_block_swarm.pieces_complete, our_h);
-                    }
-                    pthread_mutex_unlock(&g_block_swarm_mutex);
+                else if (piece_hashes_valid && anchored)
+                    printf("Peer %s: block manifest does not match active "
+                           "swarm\n", node->addr_name);
+                if (started) {
+                    printf("Block swarm started: %u pieces, h=%d..%d "
+                           "(seeded through h=%d)\n",
+                           num_pieces, start_h, end_h, our_h);
                 }
                 free(piece_hashes);
             }

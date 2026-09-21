@@ -490,6 +490,30 @@ static bool bs_push_manifest_frame(struct p2p_node *node,
     return ok;
 }
 
+static bool bs_push_block_manifest_frame(
+    struct p2p_node *node, const struct chain_params *params,
+    const struct block_piece_manifest *manifest)
+{
+    struct byte_stream payload;
+    stream_init(&payload, 76 + (size_t)manifest->num_pieces * 32);
+    bool ok = stream_write_i32_le(&payload, manifest->start_height) &&
+        stream_write_i32_le(&payload, manifest->end_height) &&
+        stream_write_u32_le(&payload, manifest->num_pieces) &&
+        stream_write_bytes(&payload, manifest->tip_hash, 32) &&
+        stream_write_bytes(&payload, manifest->merkle_root, 32);
+    for (uint32_t i = 0; i < manifest->num_pieces && ok; i++)
+        ok = stream_write_bytes(&payload, manifest->piece_hashes[i], 32);
+    if (ok)
+        ok = p2p_node_begin_message(node, MSG_BLOCK_MANIFEST,
+                                    params->pchMessageStart);
+    if (ok)
+        p2p_node_write_message_data(node, payload.data, payload.size);
+    if (ok)
+        ok = p2p_node_end_message(node);
+    stream_free(&payload);
+    return ok;
+}
+
 static bool bs_snapshot_state(uint32_t index,
                               enum chunk_state expected_state,
                               int expected_peer,
@@ -768,9 +792,11 @@ static int test_block_swarm_throughput(void)
         /* Peers: A-side sees B; B-side sees A. */
         struct p2p_node *a_node = bs_make_peer(&seed.nm, 1);
         struct p2p_node *b_node = bs_make_peer(&nm_b, 2);
-        ASSERT(a_node && b_node);
+        struct p2p_node *bad_node = bs_make_peer(&nm_b, 3);
+        ASSERT(a_node && b_node && bad_node);
         struct send_segment *sent_a = bs_install_sentinel(a_node);
         struct send_segment *sent_b = bs_install_sentinel(b_node);
+        struct send_segment *sent_bad = bs_install_sentinel(bad_node);
 
         /* Step 1: A pushes the block manifest; B ingests it → g_block_swarm. */
         push_block_manifest(&seed.mp, a_node);
@@ -779,6 +805,20 @@ static int test_block_swarm_throughput(void)
         ASSERT(ok);
         ASSERT(b_node->blk_manifest_received);
         ASSERT(mp_block_swarm_is_active());
+        struct block_piece_manifest incompatible;
+        ASSERT(block_piece_manifest_build_active_chain(
+            &seed.ms.chain_active, BS_START_HEIGHT, seed.end_height,
+            &incompatible));
+        incompatible.piece_hashes[0][0] ^= 1;
+        fast_sync_merkle_root(incompatible.piece_hashes,
+                              incompatible.num_pieces,
+                              incompatible.merkle_root);
+        ASSERT(bs_push_block_manifest_frame(bad_node, params,
+                                            &incompatible));
+        ASSERT(bs_pump(bad_node, sent_bad, &mp_b, bad_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(!bad_node->blk_manifest_received);
+        block_piece_manifest_free(&incompatible);
         a_node->blk_manifest_sent = false;
         push_block_manifest(&seed.mp, a_node);
         ASSERT(bs_pump(a_node, sent_a, &mp_b, b_node,
@@ -839,10 +879,13 @@ static int test_block_swarm_throughput(void)
 
         send_segment_free(sent_a);
         send_segment_free(sent_b);
+        send_segment_free(sent_bad);
         a_node->send_head = a_node->send_tail = NULL;
         b_node->send_head = b_node->send_tail = NULL;
+        bad_node->send_head = bad_node->send_tail = NULL;
         p2p_node_free(a_node);
         p2p_node_free(b_node);
+        p2p_node_free(bad_node);
         net_manager_free(&nm_b);
         coins_view_cache_free(&coins_b);
         tx_mempool_free(&mempool_b);

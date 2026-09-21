@@ -622,3 +622,38 @@ complementary startup/observer work.
 Remaining risk and next investigation: profile manifest hashing at the maximum
 wire-reachable piece count, then inspect block-swarm source identity and stale
 eligibility across abandonment/restart generations.
+
+## Exact block-swarm manifest source identity
+
+Any internally valid, header-anchored `zblkmanfst` previously set
+`blk_manifest_received`, even while its range, tip, Merkle root, or piece hashes
+differed from the active swarm. The scheduler could then request active-swarm
+piece indexes from a peer advertising different content. Swarm initialization
+also checked inactivity before taking the block-swarm mutex, allowing competing
+initializations to race.
+
+Block-manifest admission is now serialized under the block-swarm mutex. The
+first eligible manifest initializes and activates the swarm atomically; later
+sources are eligible only when every manifest field and piece hash exactly
+matches the active manifest. A new manifest attempt clears stale eligibility
+before validation. Header anchoring, restart cooldown, and completed-height
+seeding remain mandatory.
+
+The unit regression covers exact manifest identity. The framed loopback starts
+a 40-piece swarm, sends a different but internally Merkle-valid and
+header-anchored manifest from another peer, proves that peer remains
+ineligible, and then completes all 2,560 blocks from the compatible source at
+31,659 blocks/s (46.7 MB/s). The same path passed ASan/UBSan at 9,373 blocks/s
+(13.8 MB/s). Four fast-sync groups, the 13-group networking selection, core
+seal/root mirror, consensus parity, generated capability inventory, cyclomatic
+complexity (55,592 functions, dispatcher ratcheted M=170 to M=169), and
+whitespace gates passed.
+
+Consensus impact: none. This changes only optional source scheduling after
+existing manifest and header-anchor validation. Block, transaction, PoW,
+chain-selection, and cryptographic validation semantics are unchanged.
+Worldstream remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: verify that stale block-manifest
+eligibility and availability bitmaps cannot cross abandonment and restart
+generations, especially when the same TCP peer remains connected.

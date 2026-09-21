@@ -458,6 +458,8 @@ struct block_swarm {
 bool block_swarm_init(struct block_swarm *bs,
                       const struct block_piece_manifest *manifest,
                       const char *datadir);
+bool block_piece_manifest_equal(const struct block_piece_manifest *a,
+                                const struct block_piece_manifest *b);
 
 /* Free block swarm state */
 void block_swarm_free(struct block_swarm *bs);
