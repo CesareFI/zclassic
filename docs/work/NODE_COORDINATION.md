@@ -1096,3 +1096,30 @@ Remaining risk and next investigation: add a production-wiring regression that
 binds a range span to a peer, drives a malformed/truncated headers response
 through the dispatcher and terminal disconnect cleanup, and proves another
 source can claim the span without waiting for its deadline.
+
+## Pin malformed-header terminal ownership cleanup
+
+Baseline: the adversarial wire fixture proved that a truncated `headers`
+payload was rejected without block-tree mutation, while the range scheduler
+fixture separately proved that disconnect released a peer's span. Nothing
+joined those behaviors around the production-global scheduler, leaving the
+ownership boundary at the parser/connman handoff unpinned.
+
+Root cause and fix: this was a regression-coverage gap, not a runtime defect.
+The wire fixture now assigns a real global range span before delivering a
+truncated two-header response. It proves the parser preserves attribution,
+the terminal disconnect hook releases exactly once, and a healthy peer
+immediately reclaims the identical span without waiting for its deadline.
+
+After-result and regression proof: `process_headers_adversarial` passes the
+new source-assignment, malformed-wire rejection, ownership-preservation,
+single-release, and immediate-reassignment assertions together with its
+existing block-tree and peer-penalty checks.
+
+Consensus impact: NONE. This slice changes tests and coordination evidence
+only. Worldstream remains at `0b29bec27` on complementary fresh-sync observer
+and startup-interrupt acceptance work.
+
+Remaining risk and next investigation: inspect snapshot manifest-source
+diversity under reconnect churn, especially whether session replacement can
+leave an admitted source slot attributed to a dead endpoint generation.

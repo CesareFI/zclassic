@@ -23,9 +23,11 @@
 #include "platform/time_compat.h"
 
 #include "mining/miner.h"
+#include "net/download.h"
 #include "net/msg_internal.h"
 #include "net/msgprocessor.h"
 #include "net/peer_scoring.h"
+#include "services/header_range_scheduler.h"
 #include "validation/chainstate.h"
 #include "validation/process_block.h"  /* accept_block_header */
 
@@ -88,6 +90,61 @@ static bool ph_write_header(struct byte_stream *s,
 {
     return block_header_serialize(hdr, s) &&
            stream_write_compact_size(s, 0);
+}
+
+static int ph_test_truncated_range_ownership(struct main_state *ms,
+                                             struct msg_processor *mp,
+                                             struct p2p_node *node)
+{
+    int failures = 0;
+    /* Bind a production-global range span to this peer before feeding
+     * malformed wire bytes.  The parser must leave ownership intact:
+     * connman's one terminal-disconnect site is the authority that
+     * releases all peer scheduling state.  Releasing in both places
+     * would hide accounting bugs and allow an active peer's span to be
+     * stolen before its session is actually gone. */
+    header_range_scheduler_reset_for_testing();
+    struct header_range_scheduler *hrs = header_range_scheduler_global();
+    int32_t anchors[] = {50000};
+    int64_t now_us = 1000000;
+    hrs_plan(hrs, 0, 100000, anchors, 1);
+    int assigned = hrs_assign(hrs, node->id, now_us);
+    PH_CHECK("truncated: range span assigned to source",
+             assigned >= 0 &&
+             hrs_peer_span(hrs, node->id, now_us, NULL, NULL));
+
+    node->disconnect = false;
+    atomic_store(&node->misbehavior, 0);
+    size_t map0 = ms->map_block_index.size;
+    struct msg_headers_stats st0, st1;
+    msg_headers_get_stats(&st0);
+    struct byte_stream s;
+    stream_init(&s, 64);
+    stream_write_compact_size(&s, 2); /* promises 2 headers... */
+    unsigned char garbage[20];
+    memset(garbage, 0xab, sizeof(garbage));
+    stream_write_bytes(&s, garbage, sizeof(garbage)); /* ...delivers 20B */
+    bool ret = process_headers(mp, node, &s);
+    msg_headers_get_stats(&st1);
+    PH_CHECK("truncated: handler returns false", ret == false);
+    PH_CHECK("truncated: peer penalized",
+             atomic_load(&node->misbehavior) > 0);
+    PH_CHECK("truncated: no block-tree mutation",
+             ms->map_block_index.size == map0);
+    PH_CHECK("truncated: nothing accepted",
+             st1.total_accepted == st0.total_accepted &&
+             st1.batches_received == st0.batches_received);
+    PH_CHECK("truncated: parser preserves source ownership",
+             hrs_peer_span(hrs, node->id, now_us, NULL, NULL));
+    PH_CHECK("truncated: terminal disconnect releases exactly once",
+             mp_header_range_peer_disconnected((uint32_t)node->id) == 1 &&
+             mp_header_range_peer_disconnected((uint32_t)node->id) == 0);
+    PH_CHECK("truncated: healthy source immediately reclaims span",
+             hrs_assign(hrs, 10, now_us) == assigned &&
+             hrs_peer_span(hrs, 10, now_us, NULL, NULL));
+    header_range_scheduler_reset_for_testing();
+    stream_free(&s);
+    return failures;
 }
 
 static struct net_manager g_ph_nm;
@@ -184,30 +241,8 @@ int test_process_headers_adversarial(void)
     }
 
     /* ── 2. truncated mid-header: clean failure, no partial accept ── */
-    if (gen) {
-        node.disconnect = false;
-        atomic_store(&node.misbehavior, 0);
-        size_t map0 = ms.map_block_index.size;
-        struct msg_headers_stats st0, st1;
-        msg_headers_get_stats(&st0);
-        struct byte_stream s;
-        stream_init(&s, 64);
-        stream_write_compact_size(&s, 2); /* promises 2 headers... */
-        unsigned char garbage[20];
-        memset(garbage, 0xab, sizeof(garbage));
-        stream_write_bytes(&s, garbage, sizeof(garbage)); /* ...delivers 20B */
-        bool ret = process_headers(&mp, &node, &s);
-        msg_headers_get_stats(&st1);
-        PH_CHECK("truncated: handler returns false", ret == false);
-        PH_CHECK("truncated: peer penalized",
-                 atomic_load(&node.misbehavior) > 0);
-        PH_CHECK("truncated: no block-tree mutation",
-                 ms.map_block_index.size == map0);
-        PH_CHECK("truncated: nothing accepted",
-                 st1.total_accepted == st0.total_accepted &&
-                 st1.batches_received == st0.batches_received);
-        stream_free(&s);
-    }
+    if (gen)
+        failures += ph_test_truncated_range_ownership(&ms, &mp, &node);
 
     /* ── 3. valid 2-header batch + trailing garbage ── */
     struct block_header h1, h2;

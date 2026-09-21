@@ -3067,7 +3067,7 @@ tests/harness/src/test_postmortem.c:test_capsule_compress:17
 tests/harness/src/test_postmortem.c:test_signal_handler_capsule:16
 tests/harness/src/test_pprev_walk.c:test_pprev_walk:21
 tests/harness/src/test_primitives.c:test_primitives:77
-tests/harness/src/test_process_headers_adversarial.c:test_process_headers_adversarial:55
+tests/harness/src/test_process_headers_adversarial.c:test_process_headers_adversarial:54
 tests/harness/src/test_progress_store.c:test_progress_store:100
 tests/harness/src/test_projection_adoption.c:test_projection_adoption:30
 tests/harness/src/test_projection_replay_invariant.c:run_mempool:19
