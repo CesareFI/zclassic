@@ -215,8 +215,10 @@ static int block_swarm_assignment_batch(bool peer_timed_out, bool inbound,
 static bool block_swarm_timeout_yield_active(const struct p2p_node *node,
                                              int64_t now_monotonic)
 {
-    return node && node->blk_timeout_yield_until > now_monotonic &&
-        node->blk_timeout_yield_until - now_monotonic <= 1;
+    if (!node || node->blk_timeout_yield_until <= now_monotonic)
+        return false;
+    return (uint64_t)node->blk_timeout_yield_until -
+           (uint64_t)now_monotonic <= 1;
 }
 
 static int64_t block_pipeline_clear_piece(struct p2p_node *node,

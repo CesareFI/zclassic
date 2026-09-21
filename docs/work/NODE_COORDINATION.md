@@ -2222,3 +2222,25 @@ block/transaction validation, PoW, and chain selection are unchanged.
 Worldstream `5297c58f4` remains complementary classic-download timeout work.
 Remaining risk and next investigation: measure real sparse-advertisement
 frequency and tail latency before designing multi-owner endgame duplicates.
+
+## Block-swarm peer timeout arithmetic
+
+Baseline and root cause: peer-pipeline timeout reconciliation used ordered
+signed subtraction, which still overflowed for an `INT64_MIN` request stamp
+and an `INT64_MAX` monotonic sample. The one-second timeout-yield deadline
+also added directly to a signed timestamp.
+
+Fix and after-result: reconciliation now uses the shared overflow-safe elapsed
+predicate. Yield deadlines saturate at `INT64_MAX`, and the scheduler checks
+their bounded remaining interval using unsigned distance after an ordered
+comparison. Normal eight-second timeout semantics are unchanged.
+
+Regression proof: the block-swarm loopback fixture covers the full signed
+timestamp range, proves the stale owner is requeued, and proves the yield
+deadline saturates. Static C23 syntax and complexity gates pass; the cold
+runtime/sanitizer build remains deferred to preserve the 11 GB disk floor.
+Consensus impact: NONE. Only volatile peer request scheduling changes;
+manifest/payload verification and all chain validation are untouched.
+Worldstream `5297c58f4` remains complementary. Remaining risk: reconnect
+yield records are deliberately bounded to 32 endpoints; measure real churn
+before changing that policy.

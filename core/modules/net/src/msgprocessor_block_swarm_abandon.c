@@ -31,17 +31,18 @@ mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
         bool owns_piece = (uint32_t)piece < swarm->manifest.num_pieces &&
             swarm->piece_states[piece] == CHUNK_INFLIGHT &&
             swarm->piece_peer[piece] == node->id;
-        if (owns_piece &&
-            (now_monotonic < node->blk_pipeline[pi].request_time ||
-             now_monotonic - node->blk_pipeline[pi].request_time <=
-                 BLOCK_PIECE_TIMEOUT_SECS))
+        if (owns_piece && !fast_sync_timeout_elapsed_at(
+                              now_monotonic,
+                              node->blk_pipeline[pi].request_time,
+                              BLOCK_PIECE_TIMEOUT_SECS))
             continue;
 
         if (owns_piece) {
             (void)block_swarm_requeue_piece_for_peer(
                 swarm, (uint32_t)piece, node->id);
             result.timed_out = true;
-            node->blk_timeout_yield_until = now_monotonic + 1;
+            node->blk_timeout_yield_until = now_monotonic == INT64_MAX
+                ? INT64_MAX : now_monotonic + 1;
             atomic_fetch_add(&node->blk_pieces_timed_out, 1);
         }
         node->blk_pipeline[pi].piece_index = -1;

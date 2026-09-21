@@ -1838,6 +1838,22 @@ static int test_block_swarm_timeout_owner_yields(void)
          * than disappearing with `reconciled.timed_out`. */
         ASSERT(slow.blk_timeout_yield_until > requested_at + timeout_secs + 1);
 
+        /* The peer-local timeout path must remain defined across the full
+         * signed monotonic range.  The previous ordered signed subtraction
+         * overflowed here and could leave the stale owner in its pipeline. */
+        ASSERT(block_swarm_assign_piece(&swarm, slow.id, NULL, 0) == -1);
+        ASSERT(block_swarm_requeue_piece(&swarm, 0));
+        ASSERT(block_swarm_assign_piece(&swarm, slow.id, NULL, 0) == 0);
+        slow.blk_pipeline[0].piece_index = 0;
+        slow.blk_pipeline[0].request_time = INT64_MIN;
+        struct block_swarm_pipeline_reconcile extreme =
+            mp_block_swarm_reconcile_peer_pipeline(&swarm, &slow,
+                                                    INT64_MAX);
+        ASSERT(extreme.cleared == 1);
+        ASSERT(extreme.timed_out);
+        ASSERT(slow.blk_timeout_yield_until == INT64_MAX);
+        ASSERT(swarm.piece_states[0] == CHUNK_NEEDED);
+
         block_swarm_free(&swarm);
         PASS();
     } _test_next:;

@@ -728,3 +728,7 @@ later lane flips it HARD.
 - 2026-09-21T18:05:23Z — REASON: Refactor sparse block-swarm bitmap selection below complexity cap
   old ROOT: 29cee006eb345bb3b16805a939961b898c2d122ad553a509d74d432b99f9d1bc
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T18:10:11Z — REASON: Harden block swarm peer timeout yield against signed monotonic timestamp overflow
+  old ROOT: a86f11b52c7763eadd929825e16d220eba982c3f58a6ac165988526ea64d08c4
+  by: owner unseal ritual (make core-unseal)
