@@ -560,3 +560,7 @@ later lane flips it HARD.
 - 2026-09-21T09:31:42Z — REASON: Roll back block-swarm ownership when a request cannot enter the bounded send queue; transport scheduling only, consensus unchanged
   old ROOT: c5a5943c46f71116ab0b7b3e1e69f9ad9b87de49dd47c79b8daca20657fdf442
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T09:38:46Z — REASON: Release snapshot chunk ownership when its request cannot enter the bounded send queue; transport scheduling only, consensus unchanged
+  old ROOT: 24737b9af6cd205f57a4de84ee6399f6ea3cf9a93bb0722c2631ecf5b9a1c82c
+  by: owner unseal ritual (make core-unseal)

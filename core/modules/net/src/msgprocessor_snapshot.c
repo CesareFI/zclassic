@@ -661,18 +661,43 @@ bool msgprocessor_test_should_ignore_snapshot_offer(
 }
 
 /* Send a chunk request to a peer. */
-static void push_chunk_request(struct msg_processor *mp,
-                                struct p2p_node *node,
-                                uint32_t chunk_index)
+static bool push_chunk_request(struct msg_processor *mp,
+                               struct p2p_node *node,
+                               uint32_t chunk_index)
 {
     struct byte_stream s;
     stream_init(&s, 4);
-    stream_write_u32_le(&s, chunk_index);
-
-    p2p_node_begin_message(node, MSG_CHUNK_REQ, mp->params->pchMessageStart);
-    p2p_node_write_message_data(node, s.data, s.size);
-    p2p_node_end_message(node);
+    bool ok = stream_write_u32_le(&s, chunk_index) &&
+        p2p_node_begin_message(node, MSG_CHUNK_REQ,
+                               mp->params->pchMessageStart);
+    if (ok)
+        p2p_node_write_message_data(node, s.data, s.size);
+    if (ok)
+        ok = p2p_node_end_message(node);
     stream_free(&s);
+    return ok;
+}
+
+static bool swarm_queue_chunk_request(
+    struct msg_processor *mp, struct p2p_node *node, uint32_t chunk_index)
+{
+    bool queued = push_chunk_request(mp, node, chunk_index);
+    if (queued)
+        return true;
+
+    (void)swarm_requeue_peer_chunk(node, chunk_index);
+    return false;
+}
+
+/* Called with the snapshot swarm lock held. A queue refusal means no peer can
+ * answer this assignment, so release both authoritative and local ownership
+ * immediately instead of waiting for timeout or disconnect cleanup. */
+static void swarm_queue_assigned_chunk_request(
+    struct msg_processor *mp, struct p2p_node *node, uint32_t chunk_index)
+{
+    swarm_mutex_unlock();
+    (void)swarm_queue_chunk_request(mp, node, chunk_index);
+    (void)swarm_mutex_lock();
 }
 
 /* Send a block piece request to a peer. */
@@ -1674,8 +1699,8 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                             node->swarm_inflight_chunk = first_chunk;
                             node->swarm_chunk_req_time =
                                 platform_time_monotonic_us() / 1000000;
-                            push_chunk_request(mp, node,
-                                               (uint32_t)first_chunk);
+                            (void)swarm_queue_chunk_request(
+                                mp, node, (uint32_t)first_chunk);
                             printf("Swarm sync started: %u chunks from h=%d\n",
                                    num_chunks, height);
                         } else if (!admitted) {
@@ -2274,7 +2299,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
                 node->swarm_inflight_chunk = ci;
                 node->swarm_chunk_req_time =
                     platform_time_monotonic_us() / 1000000;
-                push_chunk_request(mp, node, (uint32_t)ci);
+                swarm_queue_assigned_chunk_request(
+                    mp, node, (uint32_t)ci);
             }
         }
 

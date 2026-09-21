@@ -1317,3 +1317,31 @@ Remaining risk and next investigation: the analogous snapshot chunk request
 helper also discards bounded send-queue failure after claiming its single
 global chunk; reproduce and close that ownership gap without conflating the
 two scheduler lifecycles.
+
+## Requeue snapshot chunks after request enqueue failure
+
+Baseline: a snapshot peer at the 64 MiB send-queue ceiling claimed chunk zero
+globally and locally even though its `zchunkreq` was refused. The framed-wire
+regression observed one in-flight chunk and no outbound request, leaving other
+manifest-compatible peers blocked until timeout or disconnect teardown.
+
+Root cause and fix: both initial manifest admission and ordinary snapshot send
+ticks ignored `p2p_node_end_message` failure. Chunk request construction now
+returns queue status; refusal requeues only the exact current owner's chunk and
+clears its local request timestamp/index. The locked scheduler wrapper drops
+the swarm mutex during queue work and reacquires it before continuing.
+
+After-result and regression proof: the pre-fix loopback case failed with
+`swarm_inflight_chunk == 0` and global `CHUNK_INFLIGHT`. It now observes no
+queued frame, no peer-local owner, and global `CHUNK_NEEDED`, after which the
+healthy peer immediately claims the same chunk. All existing truncated,
+unsolicited, duplicate, late, reconnect, timeout, and source-diversity wire
+cases pass.
+
+Consensus impact: NONE. This is transport ownership cleanup; snapshot content
+and proofs retain their existing validation. Worldstream remains at
+`0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: audit other request helpers that ignore
+the common bounded-queue result, prioritizing header/body IBD requests whose
+accounting is committed before enqueue and can starve healthy peers.

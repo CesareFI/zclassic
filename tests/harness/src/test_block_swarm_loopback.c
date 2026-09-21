@@ -682,12 +682,22 @@ static int test_snapshot_chunk_wire_adversarial(void)
 
         struct p2p_node *peer_a = bs_make_peer(&nm, 41);
         struct p2p_node *peer_b = bs_make_peer(&nm, 42);
-        ASSERT(peer_a && peer_b);
+        struct p2p_node *peer_blocked = bs_make_peer(&nm, 43);
+        ASSERT(peer_a && peer_b && peer_blocked);
         peer_a->swarm_manifest_received = true;
         peer_b->swarm_manifest_received = true;
+        peer_blocked->swarm_manifest_received = true;
         struct send_segment *sent_a = bs_install_sentinel(peer_a);
         struct send_segment *sent_b = bs_install_sentinel(peer_b);
+        struct send_segment *sent_blocked = bs_install_sentinel(peer_blocked);
         ASSERT(mp_snapshot_test_start_swarm(&manifest));
+
+        peer_blocked->send_size = net_send_peer_bytes_hard_cap();
+        mp_snapshot_send_tick(&mp, peer_blocked);
+        peer_blocked->send_size = 0;
+        ASSERT(bs_queue_depth(sent_blocked) == 0);
+        ASSERT(peer_blocked->swarm_inflight_chunk == -1);
+        ASSERT(bs_snapshot_state(0, CHUNK_NEEDED, -1, 0, 0));
 
         mp_snapshot_send_tick(&mp, peer_a);
         ASSERT(peer_a->swarm_inflight_chunk == 0);
@@ -747,10 +757,13 @@ static int test_snapshot_chunk_wire_adversarial(void)
         mp_snapshot_test_stop_swarm();
         send_segment_free(sent_a);
         send_segment_free(sent_b);
+        send_segment_free(sent_blocked);
         peer_a->send_head = peer_a->send_tail = NULL;
         peer_b->send_head = peer_b->send_tail = NULL;
+        peer_blocked->send_head = peer_blocked->send_tail = NULL;
         p2p_node_free(peer_a);
         p2p_node_free(peer_b);
+        p2p_node_free(peer_blocked);
         net_manager_free(&nm);
         free(manifest.chunk_hashes);
         PASS();
