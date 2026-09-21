@@ -533,3 +533,33 @@ Remaining risk and next investigation: direct `zmanifest` wire coverage should
 exercise competing compatible and incompatible advertisements through the
 parser, then the snapshot scheduler should be inspected for whether repeated
 manifest churn can monopolize send ticks or retain stale source eligibility.
+
+## Direct competing `zmanifest` wire regression
+
+Manifest-source diversity initially had scheduler-level regression coverage,
+but the wire parser, optional commitment field, Merkle reconstruction, active
+swarm initialization, and source eligibility were not exercised together.
+
+The loopback regression now sends three fully framed `zmanifest` messages
+through `p2p_node_receive_bytes` and `msg_process_messages`. Two peers advertise
+the same snapshot and are admitted; a third advertises a different but
+internally Merkle-valid snapshot and remains ineligible. The originating peer
+then disconnects, its owned chunk is immediately requeued, and the surviving
+compatible peer acquires it without timeout or accounting drift. The temporary
+admission test seam was removed because the regression now drives production
+parsing and dispatch directly.
+
+The block-swarm loopback passed normally and under ASan/UBSan, including the
+new framed-manifest path. The 13-group networking selection, core seal/root
+mirror, consensus parity, generated capability inventory, cyclomatic
+complexity, and whitespace gates passed.
+
+Consensus impact: none. This slice adds regression coverage and removes a
+test-only seam; production manifest admission remains the validated scheduling
+change from the preceding commit. Worldstream remains at `0b29bec27` on
+complementary startup/observer work with no coordination-file overlap.
+
+Remaining risk and next investigation: inspect repeated compatible and
+incompatible manifest advertisements for CPU amplification, stale eligibility,
+or send-tick monopolization, then select the next measured networking/IBD
+bottleneck.

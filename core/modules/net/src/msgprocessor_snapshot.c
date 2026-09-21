@@ -569,14 +569,6 @@ bool mp_snapshot_test_start_swarm(const struct sync_manifest *manifest)
     return started;
 }
 
-bool mp_snapshot_test_admit_source(struct p2p_node *node,
-                                   const struct sync_manifest *manifest)
-{
-    int32_t first_chunk = -1;
-    return swarm_admit_manifest_source(node, manifest, NULL, false,
-                                       &first_chunk);
-}
-
 void mp_snapshot_test_stop_swarm(void)
 {
     if (!swarm_mutex_lock())

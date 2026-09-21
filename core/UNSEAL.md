@@ -452,3 +452,7 @@ later lane flips it HARD.
 - 2026-09-21T03:52:27Z — REASON: Remove a redundant manifest-size guard rejected as always true on supported 64-bit builds; no behavioral or consensus semantic change
   old ROOT: 1d8cc5413ffef088c00be9a50458353c5c58c1ba95dc078ae45048ed34eb6acd
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T04:04:12Z — REASON: Remove the manifest-admission test seam after replacing it with direct framed zmanifest regression coverage; no production or consensus semantic change
+  old ROOT: fc1ac272f7dbf68a12f1c2158d730d3fd1517b00508399042751c8409b5a716f
+  by: owner unseal ritual (make core-unseal)

@@ -84,8 +84,6 @@
 void mp_snapshot_send_tick(struct msg_processor *mp, struct p2p_node *node);
 bool mp_block_swarm_is_active(void);
 bool mp_snapshot_test_start_swarm(const struct sync_manifest *manifest);
-bool mp_snapshot_test_admit_source(struct p2p_node *node,
-                                   const struct sync_manifest *manifest);
 void mp_snapshot_test_stop_swarm(void);
 bool mp_snapshot_test_chunk_state(uint32_t chunk_index,
                                   enum chunk_state *state_out,
@@ -466,6 +464,32 @@ static bool bs_push_chunk_frame(struct p2p_node *node,
     return ok;
 }
 
+static bool bs_push_manifest_frame(struct p2p_node *node,
+                                   const struct chain_params *params,
+                                   const struct sync_manifest *manifest)
+{
+    struct byte_stream payload;
+    stream_init(&payload, 116 + (size_t)manifest->num_chunks * 32);
+    bool ok = stream_write_i32_le(&payload, manifest->height) &&
+        stream_write_bytes(&payload, manifest->block_hash, 32) &&
+        stream_write_u64_le(&payload, manifest->num_utxos) &&
+        stream_write_u32_le(&payload, manifest->num_chunks) &&
+        stream_write_u32_le(&payload, manifest->chunk_size) &&
+        stream_write_bytes(&payload, manifest->merkle_root, 32) &&
+        stream_write_bytes(&payload, manifest->utxo_sha3, 32);
+    for (uint32_t i = 0; i < manifest->num_chunks && ok; i++)
+        ok = stream_write_bytes(&payload, manifest->chunk_hashes[i], 32);
+    if (ok)
+        ok = p2p_node_begin_message(node, MSG_MANIFEST,
+                                    params->pchMessageStart);
+    if (ok)
+        p2p_node_write_message_data(node, payload.data, payload.size);
+    if (ok)
+        ok = p2p_node_end_message(node);
+    stream_free(&payload);
+    return ok;
+}
+
 static bool bs_snapshot_state(uint32_t index,
                               enum chunk_state expected_state,
                               int expected_peer,
@@ -590,30 +614,40 @@ static int test_snapshot_chunk_wire_adversarial(void)
     return failures;
 }
 
-static int test_snapshot_manifest_source_reconnect(void)
+static int test_snapshot_manifest_wire_reconnect(void)
 {
     int failures = 0;
-    TEST("snapshot manifest identity preserves diverse reconnect failover") {
+    TEST("snapshot manifest wire preserves diverse reconnect failover") {
         struct sync_manifest manifest;
         memset(&manifest, 0, sizeof(manifest));
         manifest.height = 1000;
+        manifest.num_utxos = 10;
         manifest.num_chunks = 2;
         manifest.chunk_size = SYNC_CHUNK_SIZE;
         manifest.chunk_hashes = zcl_calloc(2, 32, "source_chunk_hashes");
         ASSERT(manifest.chunk_hashes != NULL);
+        manifest.chunk_hashes[1][0] = 2;
+        fast_sync_merkle_root(manifest.chunk_hashes, manifest.num_chunks,
+                              manifest.merkle_root);
         struct sync_manifest incompatible = manifest;
         uint8_t incompatible_hashes[2][32] = {{0}};
         memcpy(incompatible_hashes, manifest.chunk_hashes,
                sizeof(incompatible_hashes));
         incompatible_hashes[1][0] = 1;
         incompatible.chunk_hashes = incompatible_hashes;
+        fast_sync_merkle_root(incompatible.chunk_hashes,
+                              incompatible.num_chunks,
+                              incompatible.merkle_root);
 
         struct net_manager nm;
         struct msg_processor mp;
+        struct main_state ms;
         net_manager_init(&nm);
+        main_state_init(&ms);
         memset(&mp, 0, sizeof(mp));
         mp.params = chain_params_get();
         mp.net_mgr = &nm;
+        mp.main_state = &ms;
         mp.datadir = ".";
         struct p2p_node *peer_a = bs_make_peer(&nm, 51);
         struct p2p_node *peer_b = bs_make_peer(&nm, 52);
@@ -621,16 +655,23 @@ static int test_snapshot_manifest_source_reconnect(void)
         ASSERT(peer_a && peer_b && peer_bad);
         struct send_segment *sent_a = bs_install_sentinel(peer_a);
         struct send_segment *sent_b = bs_install_sentinel(peer_b);
+        struct send_segment *sent_bad = bs_install_sentinel(peer_bad);
+        bool ok = true;
 
-        ASSERT(mp_snapshot_test_start_swarm(&manifest));
-        ASSERT(mp_snapshot_test_admit_source(peer_a, &manifest));
-        ASSERT(mp_snapshot_test_admit_source(peer_b, &manifest));
-        ASSERT(!mp_snapshot_test_admit_source(peer_bad, &incompatible));
+        ASSERT(bs_push_manifest_frame(peer_a, mp.params, &manifest));
+        ASSERT(bs_pump(peer_a, sent_a, &mp, peer_a,
+                       mp.params->pchMessageStart, &ok) > 0 && ok);
+        bs_drop_queue(peer_a, sent_a);
+        ASSERT(bs_push_manifest_frame(peer_b, mp.params, &manifest));
+        ASSERT(bs_pump(peer_b, sent_b, &mp, peer_b,
+                       mp.params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(bs_push_manifest_frame(peer_bad, mp.params, &incompatible));
+        ASSERT(bs_pump(peer_bad, sent_bad, &mp, peer_bad,
+                       mp.params->pchMessageStart, &ok) > 0 && ok);
         ASSERT(peer_a->swarm_manifest_received);
         ASSERT(peer_b->swarm_manifest_received);
         ASSERT(!peer_bad->swarm_manifest_received);
 
-        mp_snapshot_send_tick(&mp, peer_a);
         ASSERT(peer_a->swarm_inflight_chunk == 0);
         ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_a->id, 1, 0));
         ASSERT(mp_snapshot_swarm_peer_disconnected(peer_a) == 1);
@@ -642,11 +683,14 @@ static int test_snapshot_manifest_source_reconnect(void)
         mp_snapshot_test_stop_swarm();
         send_segment_free(sent_a);
         send_segment_free(sent_b);
+        send_segment_free(sent_bad);
         peer_a->send_head = peer_a->send_tail = NULL;
         peer_b->send_head = peer_b->send_tail = NULL;
+        peer_bad->send_head = peer_bad->send_tail = NULL;
         p2p_node_free(peer_a);
         p2p_node_free(peer_b);
         p2p_node_free(peer_bad);
+        main_state_free(&ms);
         net_manager_free(&nm);
         free(manifest.chunk_hashes);
         PASS();
@@ -1729,7 +1773,7 @@ int test_block_swarm_loopback(void)
 {
     int failures = 0;
     failures += test_snapshot_chunk_wire_adversarial();
-    failures += test_snapshot_manifest_source_reconnect();
+    failures += test_snapshot_manifest_wire_reconnect();
     failures += test_block_swarm_manifest_shape_bounds();
     /* Every test here advertises and serves block pieces from a fixture
      * that never booted the runtime port, so the live sovereignty
