@@ -779,6 +779,15 @@ static int test_block_swarm_throughput(void)
         ASSERT(ok);
         ASSERT(b_node->blk_manifest_received);
         ASSERT(mp_block_swarm_is_active());
+        a_node->blk_manifest_sent = false;
+        push_block_manifest(&seed.mp, a_node);
+        ASSERT(bs_pump(a_node, sent_a, &mp_b, b_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        a_node->blk_manifest_sent = false;
+        push_block_manifest(&seed.mp, a_node);
+        ASSERT(bs_pump(a_node, sent_a, &mp_b, b_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(b_node->blk_manifest_attempts == 2);
 
         /* Step 2: drive the real piece dance to completion, measuring only the
          * transfer loop. Each round: B assigns+requests (real scheduler) → A

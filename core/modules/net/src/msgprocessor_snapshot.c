@@ -92,6 +92,7 @@ static int64_t g_swarm_last_progress_time = 0;
 /* Minimum legacy-getdata ownership window before a reaped swarm may be
  * re-armed by a fresh manifest (anti-flap). */
 #define BLOCK_SWARM_RESTART_COOLDOWN_SECS 300
+#define BLOCK_MANIFEST_ATTEMPT_MAX 2
 /* Let multiple ready peers enter the fixed global window during one send
  * round. A lone peer retains its full pipeline by filling another batch on
  * each later tick. */
@@ -275,6 +276,42 @@ static void block_swarm_advance_generation(void)
     g_block_swarm_generation++;
     if (g_block_swarm_generation == 0)
         g_block_swarm_generation = 1;
+}
+
+static uint64_t block_swarm_next_generation(uint64_t generation)
+{
+    return generation == UINT64_MAX ? 1 : generation + 1;
+}
+
+static bool block_manifest_attempt_allowed(struct p2p_node *node)
+{
+    if (!node)
+        return false;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    uint64_t generation = atomic_load(&g_block_swarm_active) ?
+        g_block_swarm_generation :
+        block_swarm_next_generation(g_block_swarm_generation);
+    if (node->blk_manifest_generation != generation) {
+        node->blk_manifest_generation = generation;
+        node->blk_manifest_attempts = 0;
+    }
+    bool allowed = node->blk_manifest_attempts <
+        BLOCK_MANIFEST_ATTEMPT_MAX;
+    if (allowed)
+        node->blk_manifest_attempts++;
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return allowed;
+}
+
+static bool block_manifest_command_allowed(const char *cmd,
+                                           struct p2p_node *node)
+{
+    if (strcmp(cmd, MSG_BLOCK_MANIFEST) != 0)
+        return false;
+    if (block_manifest_attempt_allowed(node))
+        return true;
+    printf("Peer %s: ignoring repeated block manifest\n", node->addr_name);
+    return false;
 }
 
 static void block_swarm_replace_peer_bitmap_locked(
@@ -1394,7 +1431,7 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
 
         /* ── Block swarm messages (parallel block download) ──── */
 
-        } else if (strcmp(cmd, MSG_BLOCK_MANIFEST) == 0) {
+        } else if (block_manifest_command_allowed(cmd, node)) {
             /* Peer sends their block piece manifest.
              * DEFENSIVE: validate all fields before trusting any data. */
             int32_t start_h = 0, end_h = 0;

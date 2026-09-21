@@ -464,3 +464,7 @@ later lane flips it HARD.
 - 2026-09-21T04:22:02Z — REASON: Keep zmanifest attempt admission outside the large wire dispatcher complexity pin; refactor only, no consensus semantic change
   old ROOT: 5f146cceb9ceb83721d078c7b1ce960e6f36786e16f0f9d577a3fc7d61308f24
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T04:38:35Z — REASON: Bound repeated per-peer block-swarm manifest parsing per swarm generation; networking resource defense only, no consensus semantic change
+  old ROOT: e7959745e93cf66586b84343b491dd14ca873c7519efbc5d6dea83fd3171f8f1
+  by: owner unseal ritual (make core-unseal)

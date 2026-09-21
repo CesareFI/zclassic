@@ -594,3 +594,31 @@ complementary startup/observer work.
 Remaining risk and next investigation: inspect whether block-swarm manifest
 advertisements have an equivalent repeated-parse amplification path, then
 continue with measured peer-scheduler and IBD recovery bottlenecks.
+
+## Bound repeated block-manifest work per peer
+
+`zblkmanfst` had the same repeated-work exposure as snapshot manifests: each
+advertisement could allocate a peer-controlled piece-hash array and rebuild its
+Merkle root, with no per-peer limit after the swarm was already selected.
+
+Block-manifest parsing now allows two attempts per peer per block-swarm
+generation. Further advertisements are discarded before allocation and Merkle
+work. The prospective generation is used while inactive, so flooding cannot
+avoid the cap before swarm activation; ordinary new peers and the next swarm
+generation retain independent budgets.
+
+The direct framed loopback sends the same validated manifest three times,
+proves only two attempts are admitted, and then completes all 2,560 blocks at
+31,585 blocks/s (46.6 MB/s). The regression passed under ASan/UBSan at 9,333
+blocks/s (13.8 MB/s). The 13-group networking selection, core seal/root mirror,
+consensus parity, generated capability inventory, cyclomatic complexity
+(55,588 functions), and whitespace gates passed.
+
+Consensus impact: none. This bounds optional block-download metadata parsing;
+header anchoring, piece hashes, block validation, transaction validation, PoW,
+and chain selection remain unchanged. Worldstream remains at `0b29bec27` on
+complementary startup/observer work.
+
+Remaining risk and next investigation: profile manifest hashing at the maximum
+wire-reachable piece count, then inspect block-swarm source identity and stale
+eligibility across abandonment/restart generations.
