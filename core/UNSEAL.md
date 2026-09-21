@@ -524,3 +524,7 @@ later lane flips it HARD.
 - 2026-09-21T08:05:22Z — REASON: Reclaim globally owned block-swarm pieces and source availability across peer reconnect churn; transport scheduling only, consensus and validation unchanged
   old ROOT: 9ff9481a45bafda06bb37e76f7065208dbb93a3be8e2e1302e5ee19be1f25e6e
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T08:19:40Z — REASON: Preserve per-peer timeout ownership attribution by reconciling only the owning pipeline before reassignment; transport telemetry and scheduling only, consensus unchanged
+  old ROOT: 74b4745f2970992be3c4fd5df634256fc8ab6d7e2b18f1bba5c1e93403d7d7b2
+  by: owner unseal ritual (make core-unseal)

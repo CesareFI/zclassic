@@ -97,6 +97,8 @@ bool mp_block_swarm_test_requeue_peer_piece(struct p2p_node *node,
                                              uint32_t piece_index);
 int32_t mp_block_swarm_test_assign_orphan_piece(struct p2p_node *node);
 uint32_t mp_block_swarm_test_piece_availability(uint32_t piece_index);
+void mp_block_swarm_test_age_peer_pipeline(struct p2p_node *node,
+                                            int64_t request_time);
 bool mp_block_swarm_test_restart_manifest(
     const struct block_piece_manifest *manifest);
 
@@ -1338,6 +1340,18 @@ static int test_block_swarm_peer_fairness(void)
                 ASSERT(first->blk_pipeline[a].piece_index !=
                        second->blk_pipeline[b].piece_index);
         }
+
+        /* An earlier healthy peer's tick must not globally expire this
+         * owner's work. The owner records every timeout and yields once;
+         * only a later peer tick may claim the released pieces. */
+        const int timeout_secs = 8;
+        int64_t expired = platform_time_monotonic_us() / 1000000 -
+            timeout_secs - 1;
+        mp_block_swarm_test_age_peer_pipeline(first, expired);
+        mp_snapshot_send_tick(&mp, second);
+        ASSERT(atomic_load(&first->blk_pieces_timed_out) == 0);
+        mp_snapshot_send_tick(&mp, first);
+        ASSERT(atomic_load(&first->blk_pieces_timed_out) == first_work);
 
         /* The connman send snapshot preserves node order. Two inbound peers
          * repeatedly encountered first must not own the entire 256-piece

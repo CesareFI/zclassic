@@ -866,6 +866,24 @@ uint32_t mp_block_swarm_test_piece_availability(uint32_t piece_index)
     return availability;
 }
 
+void mp_block_swarm_test_age_peer_pipeline(struct p2p_node *node,
+                                            int64_t request_time)
+{
+    if (!node)
+        return;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+        int32_t piece = node->blk_pipeline[pi].piece_index;
+        if (piece < 0 || (uint32_t)piece >= g_block_swarm.manifest.num_pieces)
+            continue;
+        node->blk_pipeline[pi].request_time = request_time;
+        if (g_block_swarm.piece_states[piece] == CHUNK_INFLIGHT &&
+            g_block_swarm.piece_peer[piece] == node->id)
+            g_block_swarm.piece_request_time[piece] = request_time;
+    }
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+}
+
 bool mp_block_swarm_test_restart_manifest(
     const struct block_piece_manifest *manifest)
 {
@@ -2225,8 +2243,13 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         struct block_swarm_pipeline_reconcile reconciled =
             mp_block_swarm_reconcile_peer_pipeline(
                 &g_block_swarm, node, now_bs);
-        block_swarm_handle_timeouts(&g_block_swarm,
-                                    BLOCK_PIECE_TIMEOUT_SECS);
+        /* Give exact-owner reconciliation the first timeout window. A global
+         * sweep at the same deadline let an earlier peer in connman's fixed
+         * order expire another peer's pieces before that owner ran, losing
+         * attribution and bypassing its one-tick yield. Retain a second-window
+         * global backstop so a connected global-only orphan stays bounded. */
+        block_swarm_handle_timeouts(
+            &g_block_swarm, BLOCK_PIECE_TIMEOUT_SECS * 2);
 
         /* Fill a bounded batch of empty slots. Limiting only NEW work per
          * tick prevents the first scheduled peer from consuming the entire

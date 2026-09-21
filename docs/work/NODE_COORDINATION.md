@@ -995,3 +995,35 @@ Remaining risk and next investigation: validate that per-peer timeout
 telemetry remains attributed to the actual owner when another peer's send tick
 runs the global orphan-timeout sweep first, then collect counters in an
 isolated multi-peer sync.
+
+## Keep block timeout attribution with the owning peer
+
+Baseline: every peer send tick first reconciled that peer's local pipeline and
+then ran a global timeout sweep. In fixed connection order, an earlier healthy
+peer could therefore expire a later slow peer's pieces. Reassignment worked,
+but the slow owner's timeout counter remained zero and its intended one-tick
+yield was bypassed, obscuring the peer responsible for repeated stalls.
+
+Root cause and fix: the global sweep duplicated owner-local timeout recovery
+at the same deadline without access to the owning peer's accounting. Exact
+owners retain the eight-second deadline; the global sweep is now a second-
+window, 16-second backstop for a connected global-only orphan. Terminal
+disconnect cleanup separately scans authoritative ownership immediately, and
+the completion-silent watchdog remains the whole-swarm fallback.
+
+After-result and regression proof: two peers first receive disjoint 64-piece
+batches. The first owner's pieces are deterministically aged; the second peer's
+tick leaves its counter and ownership intact. The first peer's own tick then
+records all 64 timeouts and yields rather than immediately retaking them.
+`block_swarm_loopback` passes, including disconnect-orphan, wire-response,
+fairness, and healthy-peer reassignment coverage.
+
+Consensus impact: NONE. This changes only transport timeout scheduling and
+observation. Validation and serialization paths are untouched. Worldstream is
+still `0b29bec27`, focused on complementary startup/observer acceptance.
+
+Remaining risk and next investigation: run the broader networking gates, then
+measure the exposed requested/delivered/timeout counters during an isolated
+multi-peer synchronization or, if no consenting fast-sync peer is available,
+extend the deterministic scheduler fixture to quantify sustained slow-peer
+rotation without live-network dependence.
