@@ -572,3 +572,11 @@ later lane flips it HARD.
 - 2026-09-21T09:52:13Z — REASON: Restore checkpoint and header-repair retry eligibility after bounded getheaders enqueue failure; transport liveness only, consensus unchanged
   old ROOT: 272b995ba06b90c715944e7f90f36197255e8e47c0363b12645eb3520b782783
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T10:03:30Z — REASON: release legacy block ownership when getdata cannot be queued
+  old ROOT: 3bbab9f94e70282e6cf084d5ed81b7b835ecb807de74e6cfbe63af88c3bb029d
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T10:07:43Z — REASON: extract bounded getdata enqueue settlement helper for complexity ratchet
+  old ROOT: 428edbb879f8df77d179ad38b33157b943af9e9b75d3a06e0bf8eb1a2d066ac5
+  by: owner unseal ritual (make core-unseal)

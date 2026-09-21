@@ -71,6 +71,7 @@
 #include "util/util.h"
 
 #include "mining/miner.h"
+#include "net/download.h"
 #include "net/msg_internal.h"
 #include "net/msgprocessor.h"
 #include "net/peer_scoring.h"
@@ -160,6 +161,70 @@ static int test_addr_rate_backwards_time(struct msg_processor *mp)
 static int dos_getblocks_have_data_plan(struct msg_processor *mp,
                                         struct block_locator *loc,
                                         const struct uint256 *child_hash);
+
+static int dos_getdata_queue_refusal(struct msg_processor *mp,
+                                     struct net_manager *nm)
+{
+    int failures = 0;
+    struct download_manager *dm = msg_get_download_mgr();
+    struct uint256 wanted;
+    int32_t wanted_height = 1;
+    struct net_address addr;
+
+    dl_free(dm);
+    dl_init(dm);
+    memset(&wanted, 0, sizeof(wanted));
+    wanted.data[0] = 0xa5;
+    DOS_CHECK("getdata refusal: block queued",
+              dl_queue_blocks(dm, &wanted, &wanted_height, 1) == 1);
+
+    net_address_init(&addr);
+    {
+        unsigned char ip4[4] = {203, 0, 113, 81};
+        net_addr_set_ipv4(&addr.svc.addr, ip4);
+    }
+    addr.svc.port = 8033;
+    struct p2p_node *blocked = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "getdata-blocked", true);
+    DOS_CHECK("getdata refusal: blocked peer created", blocked != NULL);
+    if (blocked) {
+        blocked->state = PEER_ACTIVE;
+        blocked->version = PROTOCOL_VERSION;
+        blocked->starting_height = 100;
+        blocked->send_size = net_send_peer_bytes_hard_cap();
+        DOS_CHECK("getdata refusal: send tick survives refusal",
+                  msg_send_messages(mp, blocked, false));
+
+        uint64_t blocked_inflight = 0, queued_after_refusal = 0;
+        dl_get_stats(dm, NULL, NULL, NULL, &blocked_inflight,
+                     &queued_after_refusal);
+        DOS_CHECK("getdata refusal: unsent ownership released",
+                  blocked_inflight == 0 && queued_after_refusal == 1 &&
+                  dl_peer_in_flight(dm, (uint32_t)blocked->id) == 0);
+
+        struct p2p_node *healthy = p2p_node_create(
+            nm, ZCL_INVALID_SOCKET, &addr, "getdata-healthy", true);
+        DOS_CHECK("getdata refusal: healthy peer created", healthy != NULL);
+        if (healthy) {
+            healthy->state = PEER_ACTIVE;
+            healthy->version = PROTOCOL_VERSION;
+            healthy->starting_height = 100;
+            DOS_CHECK("getdata refusal: healthy send tick succeeds",
+                      msg_send_messages(mp, healthy, false));
+            uint64_t reassigned = 0, queue_empty = 0;
+            dl_get_stats(dm, NULL, NULL, NULL, &reassigned, &queue_empty);
+            DOS_CHECK("getdata refusal: healthy peer takes block immediately",
+                      reassigned == 1 && queue_empty == 0 &&
+                      dl_peer_in_flight(dm, (uint32_t)healthy->id) == 1 &&
+                      dl_peer_in_flight(dm, (uint32_t)blocked->id) == 0);
+            p2p_node_free(healthy);
+        }
+        p2p_node_free(blocked);
+    }
+    dl_free(dm);
+    dl_init(dm);
+    return failures;
+}
 
 static int dos_getblocks_active_control(struct msg_processor *mp,
                                         struct p2p_node *node,
@@ -1091,6 +1156,14 @@ int test_net_msg_dos(void)
             p2p_node_free(node);
         }
     }
+
+    /* ── L. getdata queue refusal must release download ownership ────
+     * Assignment happens before the wire frame is queued.  A non-draining
+     * peer at the hard send ceiling must not retain ownership of a block it
+     * was never actually asked for: a healthy peer in the same send cycle
+     * must be able to claim it immediately, without waiting for teardown or
+     * the request timeout. */
+    failures += dos_getdata_queue_refusal(&mp, &nm);
 
     net_manager_free(&nm);
     sync_set_state(sync0, "net_msg_dos restore");

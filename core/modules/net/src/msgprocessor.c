@@ -2342,6 +2342,41 @@ bool msg_process_messages(void *ctx, struct p2p_node *node)
     return true;
 }
 
+static void msg_queue_getdata_batch(struct msg_processor *mp,
+                                    struct p2p_node *node,
+                                    struct download_manager *dm,
+                                    const struct sync_block_batch *batch,
+                                    const struct uint256 *assign_hashes)
+{
+    struct byte_stream getdata_msg;
+    bool request_queued = false;
+
+    stream_init(&getdata_msg, batch->assigned * 36 + 8);
+    if (getdata_blocks_serialize(&getdata_msg, assign_hashes,
+                                 batch->assigned)) {
+        p2p_node_begin_message(node, "getdata", mp->params->pchMessageStart);
+        p2p_node_write_message_data(node, getdata_msg.data, getdata_msg.size);
+        request_queued = p2p_node_end_message(node);
+    }
+    stream_free(&getdata_msg);
+
+    if (!request_queued) {
+        size_t released = dl_peer_disconnected(dm, (uint32_t)node->id);
+        LOG_WARN("net", "getdata for %zu blocks could not be queued to peer "
+                 "%s; released %zu in-flight requests immediately",
+                 batch->assigned, node->addr_name, released);
+        return;
+    }
+
+    char hex[65];
+    uint256_get_hex(&assign_hashes[0], hex);
+    printf("getdata: %zu blocks to %s (first=%s)\n",
+           batch->assigned, node->addr_name, hex);
+    event_emitf(EV_BLOCK_REQUESTED, (uint32_t)node->id,
+                "assigned=%zu inflight=%zu", batch->assigned,
+                batch->in_flight_before + batch->assigned);
+}
+
 /* ── msg_send_messages: per-peer trickle ─────────────────────── */
 
 bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
@@ -2760,30 +2795,8 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
                 syncsvc_assign_peer_blocks(&batch, dm, node, assign_hashes,
                                            assign_room, our_height);
             }
-            if (batch.assigned > 0) {
-                struct byte_stream getdata_msg;
-                stream_init(&getdata_msg, batch.assigned * 36 + 8);
-                if (getdata_blocks_serialize(&getdata_msg, assign_hashes,
-                                             batch.assigned)) {
-                    p2p_node_begin_message(node, "getdata",
-                                           mp->params->pchMessageStart);
-                    p2p_node_write_message_data(node, getdata_msg.data,
-                                                getdata_msg.size);
-                    p2p_node_end_message(node);
-                }
-                stream_free(&getdata_msg);
-
-                {
-                    char hex[65];
-                    uint256_get_hex(&assign_hashes[0], hex);
-                    printf("getdata: %zu blocks to %s (first=%s)\n",
-                           batch.assigned, node->addr_name, hex);
-                }
-                event_emitf(EV_BLOCK_REQUESTED, (uint32_t)node->id,
-                            "assigned=%zu inflight=%zu",
-                            batch.assigned,
-                            batch.in_flight_before + batch.assigned);
-            }
+            if (batch.assigned > 0)
+                msg_queue_getdata_batch(mp, node, dm, &batch, assign_hashes);
 
             /* Stall detection: if queue is empty, in-flight is zero,
              * and we're not at tip — find alternative blocks to download.

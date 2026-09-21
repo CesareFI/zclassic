@@ -1423,3 +1423,31 @@ Consensus impact: NONE; test coverage only. Worldstream remains at
 Remaining risk and next investigation: inspect ordinary `getheaders` and
 legacy `getdata` block-request accounting for discarded bounded-queue failures,
 starting from sites that mark peer/request state before message finalization.
+
+## Legacy getdata enqueue-failure reassignment
+
+The legacy body scheduler assigned queued blocks in the download manager
+before serializing and enqueuing `getdata`, but ignored
+`p2p_node_end_message()` failure.  A peer whose bounded send queue had reached
+the hard ceiling therefore owned blocks it was never asked for, suppressing
+healthy sources until disconnect cleanup or timeout.  The deterministic
+two-peer baseline reproduced one stale in-flight owner and an empty queue
+after the wire enqueue was refused.
+
+Serialization or send-queue failure now immediately settles that disconnect
+in the download manager.  Requested telemetry is emitted only after the frame
+is actually queued.  The direct message-loop regression fills peer A's send
+queue, proves A retains no ownership, then proves peer B owns the exact block
+on its immediately following send tick.  No timeout or wall-clock wait is
+involved.
+
+Consensus impact: NONE.  This changes only volatile P2P request ownership
+after a request failed to reach the wire; block parsing, validation, PoW,
+chain selection, transaction semantics, and serialization are unchanged.
+
+Worldstream interaction: refreshed Worldstream head `5297c58f4` remains on
+download timeout arithmetic and complementary observer/startup work; it does
+not change this legacy message-queue ownership boundary.  Remaining risk:
+other assign-before-send paths should continue to be audited for ignored
+enqueue results.  Recommended next investigation: snapshot manifest-source
+diversity and ownership under reconnect churn.
