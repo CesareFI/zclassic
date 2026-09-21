@@ -1901,3 +1901,29 @@ capacity. The complete real-wire group passes. Consensus impact: NONE.
 Worldstream `d9f5153be` remains complementary storage/startup work. Remaining
 risk and next investigation: measure larger repeated timeout/disconnect churn
 without weakening source diversity or the bounded pipeline.
+
+## Snapshot and block manifest enqueue ownership
+
+Baseline and root cause: snapshot and block manifest senders advanced their
+per-peer sent markers after constructing a frame, even when the bounded peer
+queue rejected it. Block manifests were revisited on later send ticks, but the
+snapshot manifest was handshake-only, so one saturated initial queue could
+silently suppress its advertisement for the rest of that connection.
+
+Fix and after-result: both markers now advance only after
+`p2p_node_end_message` accepts the complete frame. Eligible ZCL23 peers revisit
+an unsent snapshot manifest from their normal send tick, matching the existing
+block-manifest publication behavior. The retry is handshake-gated, bounded by
+the one sent marker, and does not alter the frame, source selection, or trust
+boundary.
+
+Regression proof: `test_block_swarm_loopback` fills a real peer queue to its
+hard cap, proves refused block and snapshot advertisements leave their markers
+clear and queue no frame, then proves a healthy retry queues exactly one
+manifest. The real-wire `block_swarm_loopback` and
+`snapshot_serve_loopback` groups pass. Consensus impact: NONE; this changes
+only volatile advertisement accounting. Validation, cryptography, PoW, chain
+selection, and wire payloads are unchanged. Worldstream `d9f5153be` remains
+complementary storage/startup work. Remaining risk and next investigation:
+measure snapshot manifest-source diversity under repeated reconnect churn with
+three or more compatible endpoints.

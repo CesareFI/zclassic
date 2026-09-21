@@ -459,13 +459,25 @@ void push_manifest(struct msg_processor *mp, struct p2p_node *node)
 
     p2p_node_begin_message(node, MSG_MANIFEST, mp->params->pchMessageStart);
     p2p_node_write_message_data(node, s.data, s.size);
-    p2p_node_end_message(node);
+    bool queued = p2p_node_end_message(node);
     stream_free(&s);
     free(hashes);
 
+    if (!queued)
+        return;
     node->swarm_manifest_sent = true;
     printf("Peer %s: sent manifest (h=%d, %u chunks)\n",
            node->addr_name, m.height, m.num_chunks);
+}
+
+void push_manifest_if_ready(struct msg_processor *mp, struct p2p_node *node)
+{
+    /* A manifest can be published after version handshake, and a bounded
+     * send queue can refuse the first advertisement. Revisit eligible peers
+     * from their normal send tick until one frame is actually queued. */
+    if (node->state >= PEER_HANDSHAKE_COMPLETE &&
+        peer_supports_fast_sync(node->services))
+        push_manifest(mp, node);
 }
 
 /* Send our block piece manifest to a ZCL23 peer.
@@ -512,10 +524,12 @@ void push_block_manifest(struct msg_processor *mp,
     p2p_node_begin_message(node, MSG_BLOCK_MANIFEST,
                             mp->params->pchMessageStart);
     p2p_node_write_message_data(node, s.data, s.size);
-    p2p_node_end_message(node);
+    bool queued = p2p_node_end_message(node);
     stream_free(&s);
     block_piece_manifest_free(&m);
 
+    if (!queued)
+        return;
     node->blk_manifest_sent = true;
     node->blk_manifest_sent_version = copied_version;
     printf("Peer %s: sent block manifest (h=%d..%d, %u pieces)\n",

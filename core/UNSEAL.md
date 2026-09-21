@@ -652,3 +652,7 @@ later lane flips it HARD.
 - 2026-09-21T15:09:30Z — REASON: Preserve one bounded healthy-peer reassignment opportunity after a block-swarm source times out.
   old ROOT: 36a9c0ddcd1c5fe35fe041e39c042e1e59d55d319b75cf75c86d94f1fd5ef623
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T15:31:13Z — REASON: Preserve snapshot and block manifest retry state when bounded peer send queues reject the frame.
+  old ROOT: 2c3a414d8ea5b2f6ca1506cd911d1f73d5f4a670e26c471626f6c47195017e3c
+  by: owner unseal ritual (make core-unseal)

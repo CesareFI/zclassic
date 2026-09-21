@@ -2304,6 +2304,19 @@ static int test_block_swarm_sovereignty_gate(void)
         ASSERT(bs_queue_depth(sent_a) == 1);       /* the zblkmanfst itself */
         bs_drop_queue(a_node, sent_a);
 
+        /* A saturated peer must not consume the per-version sent marker:
+         * no frame reached the wire, so the next healthy send must retry. */
+        a_node->blk_manifest_sent = false;
+        a_node->send_size = net_send_peer_bytes_hard_cap();
+        push_block_manifest(&seed.mp, a_node);
+        a_node->send_size = 0;
+        ASSERT(!a_node->blk_manifest_sent);
+        ASSERT(bs_queue_depth(sent_a) == 0);
+        push_block_manifest(&seed.mp, a_node);
+        ASSERT(a_node->blk_manifest_sent);
+        ASSERT(bs_queue_depth(sent_a) == 1);
+        bs_drop_queue(a_node, sent_a);
+
         struct byte_stream req;
         stream_init(&req, 16);
         stream_write_u32_le(&req, 0);              /* piece 0: h=1..64 */
@@ -2396,6 +2409,53 @@ static int test_block_swarm_manifest_republish(void)
     return failures;
 }
 
+static int test_snapshot_manifest_queue_retry(void)
+{
+    int failures = 0;
+
+    TEST("snapshot manifest retries after bounded queue refusal") {
+        struct net_manager nm;
+        struct msg_processor mp;
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.params = chain_params_get();
+        mp.net_mgr = &nm;
+        manifest.num_chunks = 1;
+        manifest.chunk_size = SYNC_CHUNK_SIZE;
+        manifest.chunk_hashes = zcl_calloc(1, sizeof(*manifest.chunk_hashes),
+                                           "manifest_queue_retry_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+        ASSERT(msg_processor_publish_manifest(&manifest));
+
+        struct p2p_node *node = bs_make_peer(&nm, 71);
+        ASSERT(node);
+        struct send_segment *sent = bs_install_sentinel(node);
+
+        node->send_size = net_send_peer_bytes_hard_cap();
+        push_manifest(&mp, node);
+        node->send_size = 0;
+        ASSERT(!node->swarm_manifest_sent);
+        ASSERT(bs_queue_depth(sent) == 0);
+
+        mp_snapshot_send_tick(&mp, node);
+        ASSERT(node->swarm_manifest_sent);
+        ASSERT(bs_queue_depth(sent) == 1);
+
+        bs_drop_queue(node, sent);
+        send_segment_free(sent);
+        node->send_head = node->send_tail = NULL;
+        p2p_node_free(node);
+        msg_processor_invalidate_manifest();
+        net_manager_free(&nm);
+        PASS();
+    } _test_next:;
+
+    msg_processor_invalidate_manifest();
+    return failures;
+}
+
 int test_block_swarm_loopback(void)
 {
     int failures = 0;
@@ -2427,6 +2487,7 @@ int test_block_swarm_loopback(void)
     failures += test_block_swarm_manifest_anchor();
     failures += test_block_swarm_sovereignty_gate();
     failures += test_block_swarm_manifest_republish();
+    failures += test_snapshot_manifest_queue_retry();
     boot_snapshot_offer_test_set_trust_override(-1);
     return failures;
 }

@@ -2456,6 +2456,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
             return;
     }
 
+    push_manifest_if_ready(mp, node);
     push_block_manifest_if_ready(mp, node);
     /* ── Swarm parallel chunk sync coordinator ────────────── */
     /* For each connected ZCL23 peer with no inflight chunk, assign one
