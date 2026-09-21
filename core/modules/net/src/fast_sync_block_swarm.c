@@ -34,6 +34,64 @@ static void block_swarm_advance_incomplete_hint(struct block_swarm *bs)
         bs->first_incomplete_hint++;
 }
 
+/* Return the next piece at or after start that the peer actually advertised.
+ * A NULL bitmap describes a full seeder.  Skipping zero bitmap bytes avoids
+ * touching a large swarm-state array for pieces a sparse peer cannot serve. */
+static bool block_swarm_next_advertised_piece(const uint8_t *peer_bitmap,
+                                              size_t peer_bitmap_bytes,
+                                              uint32_t start,
+                                              uint32_t max_piece_index,
+                                              uint32_t *piece_out)
+{
+    if (!peer_bitmap) {
+        *piece_out = start;
+        return true;
+    }
+
+    size_t byte_index = start / 8;
+    size_t max_byte_index = max_piece_index / 8;
+    uint32_t bit_index = start % 8;
+    while (byte_index < peer_bitmap_bytes && byte_index <= max_byte_index) {
+        uint8_t advertised = peer_bitmap[byte_index];
+        while (bit_index < 8) {
+            if (advertised & (uint8_t)(1U << bit_index)) {
+                uint32_t piece = (uint32_t)(byte_index * 8 + bit_index);
+                if (piece <= max_piece_index) {
+                    *piece_out = piece;
+                    return true;
+                }
+                return false;
+            }
+            bit_index++;
+        }
+        byte_index++;
+        bit_index = 0;
+    }
+    return false;
+}
+
+/* Consider one advertised piece.  Returns true when zero availability makes
+ * it the final possible rarest-first choice. */
+static bool block_swarm_consider_piece(const struct block_swarm *bs,
+                                       uint32_t piece_index,
+                                       int32_t *best_out,
+                                       uint32_t *best_avail_out)
+{
+    if (!block_swarm_piece_assignable(bs->piece_states[piece_index]))
+        return false;
+
+    uint32_t availability = 1;
+    if (bs->piece_availability)
+        availability = bs->piece_availability[piece_index];
+    if (availability > *best_avail_out ||
+        (availability == *best_avail_out && *best_out >= 0))
+        return false;
+
+    *best_avail_out = availability;
+    *best_out = (int32_t)piece_index;
+    return availability == 0;
+}
+
 bool block_swarm_init(struct block_swarm *bs,
                       const struct block_piece_manifest *manifest,
                       const char *datadir)
@@ -108,8 +166,9 @@ static int32_t block_swarm_assign_piece_capped(struct block_swarm *bs,
     if (bs->next_assign_hint > max_piece_index)
         return -1;
 
-    /* Endgame mode: if few pieces remain, use broadcast strategy.
-     * Caller should request all remaining from all peers. */
+    /* Remember entry into the tail for observability.  This coordinator has
+     * one authoritative owner per piece, so duplicate tail requests require
+     * an explicit multi-owner representation rather than overwriting it. */
     uint32_t remaining = bs->manifest.num_pieces - bs->pieces_complete;
     if (remaining <= ENDGAME_THRESHOLD && remaining > 0)
         bs->endgame = true;
@@ -117,38 +176,17 @@ static int32_t block_swarm_assign_piece_capped(struct block_swarm *bs,
     int32_t best = -1;
     uint32_t best_avail = UINT32_MAX;
 
-    for (uint32_t i = bs->next_assign_hint; i <= max_piece_index; i++) {
-        if (!block_swarm_piece_assignable(bs->piece_states[i]))
-            continue;
-
-        /* In endgame, also consider INFLIGHT pieces for duplicate requests */
-        if (bs->endgame && bs->piece_states[i] == CHUNK_INFLIGHT) {
-            /* Allow re-request in endgame, but not from same peer */
-            if (bs->piece_peer[i] == peer_id) continue;
-        } else if (bs->piece_states[i] == CHUNK_INFLIGHT) {
-            continue;
-        }
-
-        /* Check peer bitmap if available. Bits past the buffer's span count
-         * as NOT held, so a short bitmap can never be indexed out of bounds
-         * (same bound as block_swarm_update_availability). */
-        if (peer_bitmap && !(i / 8 < peer_bitmap_bytes &&
-                             (peer_bitmap[i / 8] & (1 << (i % 8)))))
-            continue;
-
-        /* Rarest-first: prefer pieces fewer peers have */
-        uint32_t avail = bs->piece_availability
-            ? bs->piece_availability[i] : 1;
-        if (avail < best_avail || (avail == best_avail && best < 0)) {
-            best_avail = avail;
-            best = (int32_t)i;
-            /* Availability cannot be lower than zero.  Because the scan is
-             * ascending, this is also the required lowest-index tie winner.
-             * Full seeders currently advertise no bitmap, so their common
-             * path stays linear across a multi-million-block manifest. */
-            if (avail == 0)
-                break;
-        }
+    uint32_t i = bs->next_assign_hint;
+    while (block_swarm_next_advertised_piece(peer_bitmap, peer_bitmap_bytes,
+                                             i, max_piece_index, &i)) {
+        bs->assignment_probes++;
+        /* Full seeders advertise no bitmap, so their common path stays
+         * linear across a multi-million-block manifest. */
+        if (block_swarm_consider_piece(bs, i, &best, &best_avail))
+            break;
+        if (i == max_piece_index)
+            break;
+        i++;
     }
 
     if (best >= 0) {

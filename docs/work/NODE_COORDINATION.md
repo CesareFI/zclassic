@@ -2192,3 +2192,33 @@ existing monotonic-boundary cases still inspect and recover an in-flight piece.
 Consensus impact: NONE. Worldstream remains complementary. Remaining risk:
 cold runtime groups await safe disk headroom. Next investigation: measure
 block-piece rarest-first scans under large, sparse peer bitmaps.
+
+## Sparse block-swarm bitmap scheduling
+
+Baseline and root cause: rarest-first assignment inspected every piece state
+before checking whether a peer's `zblkbitmap` advertised that piece. A sparse
+peer with one usable tail piece in a 4,096-piece manifest therefore touched
+all 4,096 swarm states per request, even though its bounded bitmap already
+proved 4,095 pieces unavailable.
+
+Fix and after-result: assignment now iterates set bitmap bits before reading
+piece state; zero bitmap bytes are skipped. Full seeders retain the prior
+linear cursor path and the same rarest-first tie rule. The new bounded
+diagnostic counter records actual advertised state probes. The former endgame
+duplicate-request branch was unreachable behind the single-owner state filter;
+it is removed rather than allowing an unsafe owner overwrite. Tail duplication
+still requires an explicit bounded multi-owner design.
+
+Regression proof: `test_fast_sync` adds a 4,096-piece fixture with only piece
+4,095 advertised and proves exactly one state probe, correct ownership, and
+no assignment or accounting change from an empty bitmap. Static C23 syntax,
+core seal/root mirror, consensus parity, generated complexity ratchet, and
+whitespace gates pass. The cold registered runtime group remains deferred to
+avoid consuming the 11 GB free-disk safety floor.
+
+Consensus impact: NONE. This only changes volatile request selection; manifest
+identity and piece-hash verification, payload parsing, reducer admission,
+block/transaction validation, PoW, and chain selection are unchanged.
+Worldstream `5297c58f4` remains complementary classic-download timeout work.
+Remaining risk and next investigation: measure real sparse-advertisement
+frequency and tail latency before designing multi-owner endgame duplicates.

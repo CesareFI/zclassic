@@ -1177,6 +1177,40 @@ static int test_block_swarm_bitmap(void)
     return failures;
 }
 
+static int test_block_swarm_sparse_bitmap_assignment(void)
+{
+    int failures = 0;
+    TEST("block_swarm sparse bitmap skips absent state probes") {
+        struct block_piece_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_pieces = 4096;
+        manifest.piece_hashes = zcl_calloc(manifest.num_pieces, 32,
+                                           "test_piece_hashes");
+        ASSERT(manifest.piece_hashes != NULL);
+
+        struct block_swarm bs;
+        ASSERT(block_swarm_init(&bs, &manifest, NULL));
+
+        uint8_t sparse_bitmap[512] = {0};
+        sparse_bitmap[511] = 0x80; /* Only piece 4095 is available. */
+        ASSERT(block_swarm_assign_piece(&bs, 7, sparse_bitmap,
+                                        sizeof(sparse_bitmap)) == 4095);
+        ASSERT(bs.assignment_probes == 1);
+        ASSERT(bs.piece_states[4095] == CHUNK_INFLIGHT);
+        ASSERT(bs.piece_peer[4095] == 7);
+
+        uint8_t empty_bitmap[512] = {0};
+        ASSERT(block_swarm_assign_piece(&bs, 8, empty_bitmap,
+                                        sizeof(empty_bitmap)) == -1);
+        ASSERT(bs.assignment_probes == 1);
+
+        block_swarm_free(&bs);
+        free(manifest.piece_hashes);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* ── Block piece hash tests ──────────────────────────────── */
 
 static int test_block_piece_hash_deterministic(void)
@@ -2298,6 +2332,7 @@ int test_fast_sync(void)
     failures += test_block_manifest_identity();
     failures += test_block_swarm_rarest_first();
     failures += test_block_swarm_endgame();
+    failures += test_block_swarm_sparse_bitmap_assignment();
     failures += test_block_swarm_bitmap();
     failures += test_block_piece_hash_deterministic();
     failures += test_block_piece_manifest_active_chain();

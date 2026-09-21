@@ -720,3 +720,11 @@ later lane flips it HARD.
 - 2026-09-21T17:56:58Z — REASON: Defer nonempty block swarm timeout scans until earliest possible expiry
   old ROOT: 4accbc2b3134dce23e014941f7a69177552f44a52ff6a13bd6ba6b77bff57ddf
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T18:02:53Z — REASON: Optimize sparse block-swarm bitmap scheduling with bounded state probes
+  old ROOT: 37a4efb49f9885d4cf55e83ef46786d539afa1ddc0500f58bced3562b6ff5b30
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T18:05:23Z — REASON: Refactor sparse block-swarm bitmap selection below complexity cap
+  old ROOT: 29cee006eb345bb3b16805a939961b898c2d122ad553a509d74d432b99f9d1bc
+  by: owner unseal ritual (make core-unseal)
