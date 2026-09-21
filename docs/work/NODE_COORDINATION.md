@@ -468,3 +468,33 @@ validation and chain semantics are unchanged. Worldstream remains at
 
 Remaining risk and next investigation: direct wire regressions remain the next
 gap, followed by snapshot manifest-source diversity under reconnect churn.
+
+## Direct adversarial `zchunkdata` wire regression
+
+The snapshot ownership fixes had algorithm-level coverage, but no regression
+sent framed `zchunkdata` through the real P2P receiver and message dispatcher.
+That left parsing, peer-local slot cleanup, reassignment, and shared accounting
+untested as one system.
+
+A deterministic two-peer loopback now activates an isolated two-chunk snapshot
+swarm through test-only state seams and transports real framed messages through
+`p2p_node_receive_bytes` and `msg_process_messages`. It proves an owned truncated
+response becomes immediately assignable to another peer; the original peer can
+hold different legitimate work; its late response cannot revoke the new owner
+or clear that unrelated slot; valid delivery completes once; duplicate replay
+cannot drift counters; a second owned truncation requeues immediately; and an
+unsolicited response cannot claim needed work.
+
+The block-swarm loopback group passed normally and under ASan/UBSan. The
+four-group fast-sync suite and 13-group networking selection passed, as did
+core seal/root mirror, consensus parity, generated capability inventory,
+cyclomatic complexity (55,574 functions), and whitespace gates.
+
+Consensus impact: none. The production parsing and validation behavior is
+unchanged; the only core additions are `ZCL_TESTING` seams for isolated state
+setup and observation. Worldstream remains at `0b29bec27` on complementary
+startup/observer work, with no coordination file in its fetched tree.
+
+Remaining risk and next investigation: snapshot manifest-source diversity and
+reconnect churn now become the next active slice, including whether a surviving
+compatible source can continue immediately after the manifest origin leaves.

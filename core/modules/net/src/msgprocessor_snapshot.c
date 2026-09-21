@@ -533,6 +533,49 @@ bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
         mp_block_swarm_finish_abandon(mp);
     return did_abandon;
 }
+
+bool mp_snapshot_test_start_swarm(const struct sync_manifest *manifest)
+{
+    if (!manifest || !swarm_mutex_lock())
+        return false;
+    bool started = !atomic_load(&g_swarm_active) &&
+        swarm_sync_init(&g_swarm, manifest, NULL);
+    if (started)
+        atomic_store(&g_swarm_active, true);
+    swarm_mutex_unlock();
+    return started;
+}
+
+void mp_snapshot_test_stop_swarm(void)
+{
+    if (!swarm_mutex_lock())
+        return;
+    if (atomic_load(&g_swarm_active))
+        swarm_sync_free(&g_swarm);
+    atomic_store(&g_swarm_active, false);
+    swarm_mutex_unlock();
+}
+
+bool mp_snapshot_test_chunk_state(uint32_t chunk_index,
+                                  enum chunk_state *state_out,
+                                  int *peer_out,
+                                  uint32_t *inflight_out,
+                                  uint32_t *complete_out)
+{
+    if (!state_out || !peer_out || !inflight_out || !complete_out ||
+        !swarm_mutex_lock())
+        return false;
+    bool available = atomic_load(&g_swarm_active) &&
+        chunk_index < g_swarm.manifest.num_chunks;
+    if (available) {
+        *state_out = g_swarm.chunk_states[chunk_index];
+        *peer_out = g_swarm.chunk_peer[chunk_index];
+        *inflight_out = g_swarm.chunks_inflight;
+        *complete_out = g_swarm.chunks_complete;
+    }
+    swarm_mutex_unlock();
+    return available;
+}
 #endif
 
 size_t mp_snapshot_swarm_peer_disconnected(struct p2p_node *node)

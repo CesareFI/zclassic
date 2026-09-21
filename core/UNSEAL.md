@@ -428,3 +428,7 @@ later lane flips it HARD.
 - 2026-09-21T01:36:10Z — REASON: Use overflow-safe monotonic elapsed-time evaluation for peer-local snapshot timeout cleanup; scheduling only, no consensus semantic change
   old ROOT: 8360d8d72c9f7ebd1ccaccf434265f3d9fb828248e1b6c5a40331e4c4a93492d
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T03:10:56Z — REASON: Add test-only snapshot swarm state seams for direct framed zchunkdata adversarial regression coverage; no production behavior or consensus semantic change
+  old ROOT: ac003e6cd7671e32b1884b6c2287f9999ebceefeb36b7f97a4197579278bbe11
+  by: owner unseal ritual (make core-unseal)

@@ -83,6 +83,13 @@
  * (mp_block_swarm_peer_disconnected is public — net/download.h.) */
 void mp_snapshot_send_tick(struct msg_processor *mp, struct p2p_node *node);
 bool mp_block_swarm_is_active(void);
+bool mp_snapshot_test_start_swarm(const struct sync_manifest *manifest);
+void mp_snapshot_test_stop_swarm(void);
+bool mp_snapshot_test_chunk_state(uint32_t chunk_index,
+                                  enum chunk_state *state_out,
+                                  int *peer_out,
+                                  uint32_t *inflight_out,
+                                  uint32_t *complete_out);
 
 /* Equihash 200,9 solution length — makes each synthetic block ~1.5 KB, so the
  * measured MB/s reflects realistic block bodies, not empty stubs. */
@@ -436,6 +443,149 @@ static struct p2p_node *bs_make_peer(struct net_manager *nm, uint8_t last_octet)
     n->services = NODE_ZCL23;
     n->state = PEER_HANDSHAKE_COMPLETE;
     return n;
+}
+
+static bool bs_push_chunk_frame(struct p2p_node *node,
+                                const struct chain_params *params,
+                                uint32_t chunk_index,
+                                uint32_t num_entries)
+{
+    struct byte_stream payload;
+    stream_init(&payload, 16);
+    bool ok = stream_write_u32_le(&payload, chunk_index) &&
+        stream_write_u32_le(&payload, num_entries) &&
+        p2p_node_begin_message(node, MSG_CHUNK_DATA,
+                               params->pchMessageStart);
+    if (ok)
+        p2p_node_write_message_data(node, payload.data, payload.size);
+    if (ok)
+        ok = p2p_node_end_message(node);
+    stream_free(&payload);
+    return ok;
+}
+
+static bool bs_snapshot_state(uint32_t index,
+                              enum chunk_state expected_state,
+                              int expected_peer,
+                              uint32_t expected_inflight,
+                              uint32_t expected_complete)
+{
+    enum chunk_state state = CHUNK_FAILED;
+    int peer = -2;
+    uint32_t inflight = UINT32_MAX;
+    uint32_t complete = UINT32_MAX;
+    return mp_snapshot_test_chunk_state(
+        index, &state, &peer, &inflight, &complete) &&
+        state == expected_state && peer == expected_peer &&
+        inflight == expected_inflight && complete == expected_complete;
+}
+
+static int test_snapshot_chunk_wire_adversarial(void)
+{
+    int failures = 0;
+    TEST("snapshot chunk wire: truncated, unsolicited, duplicate, and late "
+         "delivery preserve ownership and accounting") {
+        const struct chain_params *params = chain_params_get();
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 2;
+        manifest.chunk_size = SYNC_CHUNK_SIZE;
+        manifest.chunk_hashes = zcl_calloc(2, 32, "wire_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+        for (uint32_t i = 0; i < 2; i++) {
+            struct utxo_chunk *chunk = zcl_calloc(
+                1, sizeof(*chunk), "wire_empty_chunk");
+            ASSERT(chunk != NULL);
+            chunk->chunk_index = i;
+            fast_sync_chunk_hash(chunk, manifest.chunk_hashes[i]);
+            free(chunk);
+        }
+
+        struct net_manager nm;
+        struct msg_processor mp;
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.params = params;
+        mp.net_mgr = &nm;
+        mp.datadir = ".";
+
+        struct p2p_node *peer_a = bs_make_peer(&nm, 41);
+        struct p2p_node *peer_b = bs_make_peer(&nm, 42);
+        ASSERT(peer_a && peer_b);
+        peer_a->swarm_manifest_received = true;
+        peer_b->swarm_manifest_received = true;
+        struct send_segment *sent_a = bs_install_sentinel(peer_a);
+        struct send_segment *sent_b = bs_install_sentinel(peer_b);
+        ASSERT(mp_snapshot_test_start_swarm(&manifest));
+
+        mp_snapshot_send_tick(&mp, peer_a);
+        ASSERT(peer_a->swarm_inflight_chunk == 0);
+        ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_a->id, 1, 0));
+        bs_drop_queue(peer_a, sent_a);
+
+        ASSERT(bs_push_chunk_frame(peer_a, params, 0, 1));
+        bool ok = true;
+        ASSERT(bs_pump(peer_a, sent_a, &mp, peer_a,
+                       params->pchMessageStart, &ok) > 0);
+        ASSERT(ok);
+        ASSERT(peer_a->swarm_inflight_chunk == -1);
+        ASSERT(bs_snapshot_state(0, CHUNK_NEEDED, -1, 0, 0));
+
+        mp_snapshot_send_tick(&mp, peer_b);
+        ASSERT(peer_b->swarm_inflight_chunk == 0);
+        bs_drop_queue(peer_b, sent_b);
+        mp_snapshot_send_tick(&mp, peer_a);
+        ASSERT(peer_a->swarm_inflight_chunk == 1);
+        bs_drop_queue(peer_a, sent_a);
+        ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_b->id, 2, 0));
+        ASSERT(bs_snapshot_state(1, CHUNK_INFLIGHT, peer_a->id, 2, 0));
+
+        ASSERT(bs_push_chunk_frame(peer_a, params, 0, 0));
+        ASSERT(bs_pump(peer_a, sent_a, &mp, peer_a,
+                       params->pchMessageStart, &ok) > 0);
+        ASSERT(ok);
+        ASSERT(peer_a->swarm_inflight_chunk == 1);
+        ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_b->id, 2, 0));
+        ASSERT(bs_snapshot_state(1, CHUNK_INFLIGHT, peer_a->id, 2, 0));
+
+        ASSERT(bs_push_chunk_frame(peer_b, params, 0, 0));
+        ASSERT(bs_pump(peer_b, sent_b, &mp, peer_b,
+                       params->pchMessageStart, &ok) > 0);
+        ASSERT(ok);
+        ASSERT(peer_b->swarm_inflight_chunk == -1);
+        ASSERT(bs_snapshot_state(0, CHUNK_COMPLETE, peer_b->id, 1, 1));
+
+        ASSERT(bs_push_chunk_frame(peer_b, params, 0, 0));
+        ASSERT(bs_pump(peer_b, sent_b, &mp, peer_b,
+                       params->pchMessageStart, &ok) > 0);
+        ASSERT(ok);
+        ASSERT(bs_snapshot_state(0, CHUNK_COMPLETE, peer_b->id, 1, 1));
+
+        ASSERT(bs_push_chunk_frame(peer_a, params, 1, 1));
+        ASSERT(bs_pump(peer_a, sent_a, &mp, peer_a,
+                       params->pchMessageStart, &ok) > 0);
+        ASSERT(ok);
+        ASSERT(bs_snapshot_state(1, CHUNK_NEEDED, -1, 0, 1));
+
+        ASSERT(bs_push_chunk_frame(peer_b, params, 1, 0));
+        ASSERT(bs_pump(peer_b, sent_b, &mp, peer_b,
+                       params->pchMessageStart, &ok) > 0);
+        ASSERT(ok);
+        ASSERT(bs_snapshot_state(1, CHUNK_NEEDED, -1, 0, 1));
+
+        mp_snapshot_test_stop_swarm();
+        send_segment_free(sent_a);
+        send_segment_free(sent_b);
+        peer_a->send_head = peer_a->send_tail = NULL;
+        peer_b->send_head = peer_b->send_tail = NULL;
+        p2p_node_free(peer_a);
+        p2p_node_free(peer_b);
+        net_manager_free(&nm);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    mp_snapshot_test_stop_swarm();
+    return failures;
 }
 
 /* ══════════════════════ Test 1: throughput ══════════════════════════════ */
@@ -1511,6 +1661,7 @@ static int test_block_swarm_manifest_republish(void)
 int test_block_swarm_loopback(void)
 {
     int failures = 0;
+    failures += test_snapshot_chunk_wire_adversarial();
     failures += test_block_swarm_manifest_shape_bounds();
     /* Every test here advertises and serves block pieces from a fixture
      * that never booted the runtime port, so the live sovereignty
