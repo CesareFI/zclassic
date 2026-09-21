@@ -1566,6 +1566,12 @@ static int test_block_swarm_peer_fairness(void)
         ASSERT(atomic_load(&first->blk_pieces_timed_out) == 0);
         mp_snapshot_send_tick(&mp, first);
         ASSERT(atomic_load(&first->blk_pieces_timed_out) == first_work);
+        /* The next fixed-order pass must preserve that yield. Before the
+         * bounded deadline existed, this call immediately appended a new
+         * batch of requests from the same slow source. */
+        ASSERT(bs_queue_depth(sent_first) == first_work);
+        mp_snapshot_send_tick(&mp, first);
+        ASSERT(bs_queue_depth(sent_first) == first_work);
 
         /* The connman send snapshot preserves node order. Two inbound peers
          * repeatedly encountered first must not own the entire 256-piece

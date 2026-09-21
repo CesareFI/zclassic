@@ -1893,10 +1893,11 @@ deadline. Assignment suppresses only new work while that bounded deadline is
 active; a new block-swarm generation clears it at peer admission. This keeps
 same-generation reassignment fair without contaminating restart/recovery.
 
-Regression proof: `test_block_swarm_loopback` proves timeout reconciliation
-records the deadline and that a later generation clears it while preserving
-the established full one-peer pipeline capacity. The complete real-wire group
-passes. Consensus impact: NONE. Worldstream `d9f5153be` remains complementary
-storage/startup work. Remaining risk and next investigation: add a direct
-multi-peer repeated-timeout scheduler fixture that observes the production
-second-tick assignment rather than only its bounded deadline.
+Regression proof: `test_block_swarm_loopback` drives the production send loop
+through an owner timeout and its next fixed-order tick, proving the old owner
+emits no replacement batch before another source can run. It also proves a
+later generation clears the deadline while preserving full one-peer pipeline
+capacity. The complete real-wire group passes. Consensus impact: NONE.
+Worldstream `d9f5153be` remains complementary storage/startup work. Remaining
+risk and next investigation: measure larger repeated timeout/disconnect churn
+without weakening source diversity or the bounded pipeline.
