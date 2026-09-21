@@ -117,6 +117,7 @@ struct bs_sink {
     bool restart_swarm_on_submit;
     bool swarm_restarted;
     const struct block_piece_manifest *restart_manifest;
+    struct p2p_node *requeue_peer_on_submit;
 };
 
 static bool bs_block_submit(struct block *b, struct validation_state *out,
@@ -127,6 +128,11 @@ static bool bs_block_submit(struct block *b, struct validation_state *out,
         sink->swarm_restarted = true;
         sink->swarm_restarted = mp_block_swarm_test_restart_manifest(
             sink->restart_manifest);
+    }
+    if (sink->requeue_peer_on_submit) {
+        struct p2p_node *peer = sink->requeue_peer_on_submit;
+        sink->requeue_peer_on_submit = NULL;
+        (void)mp_block_swarm_peer_disconnected(peer);
     }
     if (!sink->scope_open)
         sink->submits_outside_scope++;
@@ -1285,6 +1291,8 @@ static int test_block_swarm_peer_fairness(void)
                second_work, PIECE_PIPELINE_DEPTH);
         ASSERT(first_work == PIECE_PIPELINE_DEPTH / 4);
         ASSERT(second_work == PIECE_PIPELINE_DEPTH / 4);
+        ASSERT(atomic_load(&first->blk_pieces_requested) == first_work);
+        ASSERT(atomic_load(&second->blk_pieces_requested) == second_work);
         for (int a = 0; a < PIECE_PIPELINE_DEPTH; a++) {
             if (first->blk_pipeline[a].piece_index < 0)
                 continue;
@@ -1358,6 +1366,7 @@ static int test_block_swarm_stale_pipeline_reclaim(void)
                 &swarm, &peer, requested_at);
         ASSERT(reconciled.cleared == 1);
         ASSERT(!reconciled.timed_out);
+        ASSERT(atomic_load(&peer.blk_pieces_timed_out) == 0);
         ASSERT(peer.blk_pipeline[0].piece_index == -1);
         ASSERT(swarm.pieces_complete == 1);
         ASSERT(swarm.pieces_inflight == 0);
@@ -1407,6 +1416,7 @@ static int test_block_swarm_timeout_owner_yields(void)
                 &swarm, &slow, requested_at + timeout_secs + 1);
         ASSERT(reconciled.cleared == 1);
         ASSERT(reconciled.timed_out);
+        ASSERT(atomic_load(&slow.blk_pieces_timed_out) == 1);
         block_swarm_handle_timeouts(&swarm, timeout_secs);
         int32_t slow_retry = reconciled.timed_out ? -1 :
             block_swarm_assign_piece(&swarm, slow.id, NULL, 0);
@@ -1716,6 +1726,24 @@ static int test_block_swarm_duplicate_delivery(void)
         sink.restart_manifest = &restart_manifest;
         ASSERT(bs_deliver(&mp_b, b_node, &kept[0], params->pchMessageStart));
         ASSERT(sink.swarm_restarted);
+        ASSERT(mp_block_swarm_is_active());
+        ASSERT(mp_block_swarm_test_admit_peer(b_node));
+        mp_snapshot_send_tick(&mp_b, b_node);
+        ASSERT(bs_queue_depth(sent_b) == 2);
+        bs_drop_queue(b_node, sent_b);
+
+        /* Same-generation ownership can also change while body submission
+         * runs unlocked. Requeue the peer synchronously from the submit
+         * callback: the late response must not count as a delivery, refresh
+         * progress, or consume the newly-needed piece. */
+        sink.restart_swarm_on_submit = false;
+        sink.requeue_peer_on_submit = b_node;
+        uint64_t delivered_before =
+            atomic_load(&b_node->blk_pieces_delivered);
+        ASSERT(bs_deliver(&mp_b, b_node, &kept[0],
+                          params->pchMessageStart));
+        ASSERT(atomic_load(&b_node->blk_pieces_delivered) ==
+               delivered_before);
         ASSERT(mp_block_swarm_is_active());
         ASSERT(mp_block_swarm_test_admit_peer(b_node));
         mp_snapshot_send_tick(&mp_b, b_node);

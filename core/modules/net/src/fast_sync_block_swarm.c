@@ -246,6 +246,18 @@ bool block_swarm_receive_piece(struct block_swarm *bs,
     return true;
 }
 
+bool block_swarm_receive_piece_for_peer(struct block_swarm *bs,
+                                         uint32_t piece_index, int peer_id)
+{
+    GUARD(bs && piece_index < bs->manifest.num_pieces, "sync",
+          "receive_piece_for_peer: invalid args (bs=%p piece=%u)",
+          (void *)bs, piece_index);
+    if (bs->piece_states[piece_index] != CHUNK_INFLIGHT ||
+        bs->piece_peer[piece_index] != peer_id)
+        return false;
+    return block_swarm_receive_piece(bs, piece_index, peer_id);
+}
+
 void block_swarm_fail_piece(struct block_swarm *bs, uint32_t piece_index)
 {
     if (block_swarm_requeue_piece(bs, piece_index))

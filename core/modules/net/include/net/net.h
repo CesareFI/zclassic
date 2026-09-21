@@ -562,7 +562,13 @@ struct p2p_node {
     struct {
         int32_t piece_index;      /* -1 = empty slot */
         int64_t request_time;     /* monotonic seconds at request */
+        int64_t request_time_us;  /* monotonic microseconds for diagnostics */
     } blk_pipeline[PIECE_PIPELINE_DEPTH];
+    /* Observation only: no scheduler or validation decision reads these. */
+    _Atomic uint_least64_t blk_pieces_requested;
+    _Atomic uint_least64_t blk_pieces_delivered;
+    _Atomic uint_least64_t blk_pieces_timed_out;
+    _Atomic uint_least64_t blk_piece_delivery_us;
     uint8_t *blk_bitmap;          /* peer's piece availability bitmap (heap) */
     uint32_t blk_bitmap_len;      /* bytes in bitmap */
     uint64_t blk_bitmap_swarm_generation; /* swarm this contribution belongs to */

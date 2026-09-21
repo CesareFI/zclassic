@@ -755,6 +755,19 @@ static bool rpc_getpeerinfo(const struct json_value *params, bool help,
                           (int64_t)node->misbehavior);
         json_push_kv_int(&entry, "blocks_received",
                           (int64_t)node->blocks_received);
+        uint64_t swarm_delivered =
+            atomic_load(&node->blk_pieces_delivered);
+        uint64_t swarm_delivery_us =
+            atomic_load(&node->blk_piece_delivery_us);
+        json_push_kv_int(&entry, "block_swarm_pieces_requested",
+            (int64_t)atomic_load(&node->blk_pieces_requested));
+        json_push_kv_int(&entry, "block_swarm_pieces_delivered",
+            (int64_t)swarm_delivered);
+        json_push_kv_int(&entry, "block_swarm_pieces_timed_out",
+            (int64_t)atomic_load(&node->blk_pieces_timed_out));
+        json_push_kv_int(&entry, "block_swarm_avg_delivery_us",
+            swarm_delivered > 0
+                ? (int64_t)(swarm_delivery_us / swarm_delivered) : 0);
         if (node->avg_latency_us > 0)
             json_push_kv_real(&entry, "avg_latency_ms",
                                (double)node->avg_latency_us / 1000.0);

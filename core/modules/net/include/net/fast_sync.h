@@ -497,6 +497,10 @@ int32_t block_swarm_assign_piece_for_peer(struct block_swarm *bs, int peer_id,
 bool block_swarm_receive_piece(struct block_swarm *bs,
                                 uint32_t piece_index, int peer_id);
 
+/* Ownership-enforcing receive boundary for untrusted wire responses. */
+bool block_swarm_receive_piece_for_peer(struct block_swarm *bs,
+                                         uint32_t piece_index, int peer_id);
+
 /* Mark a piece as failed (bad hash). Will be re-requested. */
 void block_swarm_fail_piece(struct block_swarm *bs, uint32_t piece_index);
 

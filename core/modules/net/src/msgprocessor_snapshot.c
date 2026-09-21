@@ -103,17 +103,21 @@ static int block_swarm_assignment_batch(bool peer_timed_out)
     return peer_timed_out ? 0 : BLOCK_PIECE_ASSIGN_BATCH;
 }
 
-static void block_pipeline_clear_piece(struct p2p_node *node,
-                                       uint32_t piece_index)
+static int64_t block_pipeline_clear_piece(struct p2p_node *node,
+                                          uint32_t piece_index)
 {
     if (!node)
-        return;
+        return 0;
     for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
         if (node->blk_pipeline[pi].piece_index == (int32_t)piece_index) {
+            int64_t requested_us = node->blk_pipeline[pi].request_time_us;
             node->blk_pipeline[pi].piece_index = -1;
-            break;
+            node->blk_pipeline[pi].request_time = 0;
+            node->blk_pipeline[pi].request_time_us = 0;
+            return requested_us;
         }
     }
+    return 0;
 }
 
 static bool swarm_requeue_peer_chunk(struct p2p_node *node,
@@ -363,6 +367,42 @@ static bool block_manifest_command_allowed(const char *cmd,
 static int64_t block_swarm_monotonic_seconds(void);
 static bool block_swarm_restart_ready_at(int64_t now_monotonic,
                                          int64_t reaped_monotonic);
+
+/* Caller holds g_block_swarm_mutex and has already verified the payload. */
+static void block_swarm_credit_verified_piece_locked(
+    struct p2p_node *node, uint32_t piece_index)
+{
+    if (g_block_swarm.piece_states[piece_index] == CHUNK_COMPLETE) {
+        (void)block_pipeline_clear_piece(node, piece_index);
+        return;
+    }
+
+    int64_t requested_us = block_pipeline_clear_piece(node, piece_index);
+    bool credited = block_swarm_receive_piece_for_peer(
+        &g_block_swarm, piece_index, node->id);
+    if (!credited) {
+        LOG_INFO("net", "zblkdata piece %u: ownership changed during "
+                 "payload submit; dropping piece credit", piece_index);
+        return;
+    }
+
+    g_block_swarm.last_complete_monotonic =
+        block_swarm_monotonic_seconds();
+    atomic_fetch_add(&node->blk_pieces_delivered, 1);
+    int64_t delivered_us = platform_time_monotonic_us();
+    if (requested_us > 0 && delivered_us >= requested_us) {
+        atomic_fetch_add(&node->blk_piece_delivery_us,
+                         (uint64_t)(delivered_us - requested_us));
+    }
+
+    if (block_swarm_is_complete(&g_block_swarm)) {
+        printf("Block swarm complete: %u/%u pieces\n",
+               g_block_swarm.pieces_complete,
+               g_block_swarm.manifest.num_pieces);
+        block_swarm_free(&g_block_swarm);
+        g_block_swarm_active = false;
+    }
+}
 
 static bool block_swarm_admit_manifest_source(
     struct p2p_node *node, const struct block_piece_manifest *manifest,
@@ -935,6 +975,7 @@ size_t mp_block_swarm_peer_disconnected(struct p2p_node *node)
             requeued++;
         node->blk_pipeline[pi].piece_index = -1;
         node->blk_pipeline[pi].request_time = 0;
+        node->blk_pipeline[pi].request_time_us = 0;
     }
     pthread_mutex_unlock(&g_block_swarm_mutex);
 
@@ -1889,33 +1930,10 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                     }
 
                     if (verified && payloads_accepted) {
-                        if (g_block_swarm.piece_states[piece_index] ==
-                            CHUNK_COMPLETE) {
-                            /* Duplicate delivery: a piece re-requested on
-                             * BLOCK_PIECE_TIMEOUT_SECS can be answered twice
-                             * (slow original + re-request). Crediting it again
-                             * inflates pieces_complete past the genuinely-
-                             * delivered count, letting the swarm "complete"
-                             * with pieces never fetched — fold holes behind a
-                             * complete swarm (the live tail wedge: 67 pieces
-                             * credited-but-never-delivered). Clear the stale
-                             * pipeline slot but never double-count. */
-                            block_pipeline_clear_piece(node, piece_index);
-                        } else {
-                            block_swarm_receive_piece(&g_block_swarm,
-                                                      piece_index, node->id);
-                            g_block_swarm.last_complete_monotonic =
-                                block_swarm_monotonic_seconds();
-                            block_pipeline_clear_piece(node, piece_index);
-
-                            if (block_swarm_is_complete(&g_block_swarm)) {
-                                printf("Block swarm complete: %u/%u pieces\n",
-                                       g_block_swarm.pieces_complete,
-                                       g_block_swarm.manifest.num_pieces);
-                                block_swarm_free(&g_block_swarm);
-                                g_block_swarm_active = false;
-                            }
-                        }
+                        /* Duplicate, late-owner and ordinary completion
+                         * accounting is one mutex-held transaction. */
+                        block_swarm_credit_verified_piece_locked(
+                            node, piece_index);
                     } else if (verified) {
                         LOG_INFO("net",
                                  "zblkdata piece %u waiting for timeout retry "
@@ -2176,6 +2194,9 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
 
             node->blk_pipeline[pi].piece_index = pidx;
             node->blk_pipeline[pi].request_time = now_bs;
+            node->blk_pipeline[pi].request_time_us =
+                platform_time_monotonic_us();
+            atomic_fetch_add(&node->blk_pieces_requested, 1);
             assigned_this_tick++;
 
             pthread_mutex_unlock(&g_block_swarm_mutex);

@@ -500,3 +500,15 @@ later lane flips it HARD.
 - 2026-09-21T06:46:28Z — REASON: Bind block-piece credit to the exact swarm generation across unlocked body submission; request accounting only, consensus unchanged
   old ROOT: a2609d3f108a0a253c8da6da2510caebc67e507703170d6592b3cf91309e649c
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T06:55:07Z — REASON: Observe per-peer block-swarm requests, deliveries, timeouts, and delivery latency for measured scheduler diagnosis; diagnostics only, no consensus or validation change
+  old ROOT: 6cc7e7112ec0532ec7124637162fc510042376b693ae9551be172e3d658def2a
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T07:07:19Z — REASON: Refactor block-swarm ownership credit into a bounded helper after complexity ratchet feedback; no behavior, consensus, or validation change
+  old ROOT: dbe24d98044c4eb3c2bbd563c5f63e1669559222824ce254c5407d2b177345a8
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T07:14:38Z — REASON: Move the block-swarm credit helper below its file-local state declarations after a clean sanitizer compile exposed declaration order; refactor only, no behavior, consensus, or validation change
+  old ROOT: 72e8e7ac118c013b8e2d0f5875fe8076b395b306c8b1f7ade29602ef1e314fd7
+  by: owner unseal ritual (make core-unseal)

@@ -857,3 +857,42 @@ remains at `0b29bec27` on complementary startup/observer work.
 
 Remaining risk and next investigation: expose bounded per-peer piece delivery
 and timeout observations before considering any adaptive scheduling policy.
+
+## Observe block-swarm outcomes and preserve ownership after unlocked submit
+
+Baseline: the parallel block-swarm scheduler owned exact request slots and
+timeouts but exposed no per-peer request, delivery, timeout, or latency
+evidence. Inspection of the unlocked body-submit window also found that its
+post-submit call ignored piece ownership: if disconnect or timeout requeued a
+piece while up to 64 bodies entered the reducer, the late original response
+could still be marked complete and refresh the global completion watchdog.
+
+Root cause: `block_swarm_receive_piece` is a general state helper whose legacy
+test contract permits marking a needed piece complete; it intentionally did
+not enforce its peer argument. The untrusted wire boundary incorrectly used
+that permissive helper after releasing its mutex. The wire path now uses a
+new ownership-enforcing receive helper and updates progress only when the
+same peer still owns the inflight piece. Each peer also carries atomic,
+observation-only counts for requested, delivered, and timed-out pieces plus
+cumulative delivery microseconds; `getpeerinfo` reports those counts and the
+derived average without feeding them back into scheduling.
+
+After-result and regression proof: a framed `zblkdata` response now invokes a
+synchronous disconnect/requeue during body submission and proves that the old
+owner receives no delivery credit, does not consume the needed piece, and can
+request it again after readmission. Separate deterministic checks distinguish
+stale-slot cleanup from a real timeout, attribute competing-peer requests,
+and verify the exact `getpeerinfo` values. `block_swarm_loopback`,
+`syncdiag_rpc`, all 13 focused `test_net*` groups, and the block-swarm
+ASan/UBSan run pass; the final normal 2,560-block loopback measured 31,104
+blocks/s (45.9 MB/s).
+
+Consensus impact: NONE. This changes transport ownership accounting and
+read-only diagnostics only. Every body still enters the canonical reducer and
+all block, transaction, PoW, and cryptographic validation remain unchanged.
+Worldstream remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: gather these counters during an
+isolated multi-peer sync before changing scheduler policy. Next inspect
+whether one timed-out peer's zero-assignment tick and fixed global send order
+provide sufficient opportunity to healthy later peers under reconnect churn.

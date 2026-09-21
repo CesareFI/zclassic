@@ -41,8 +41,11 @@ mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
             (void)block_swarm_requeue_piece_for_peer(
                 swarm, (uint32_t)piece, node->id);
             result.timed_out = true;
+            atomic_fetch_add(&node->blk_pieces_timed_out, 1);
         }
         node->blk_pipeline[pi].piece_index = -1;
+        node->blk_pipeline[pi].request_time = 0;
+        node->blk_pipeline[pi].request_time_us = 0;
         result.cleared++;
     }
     return result;
