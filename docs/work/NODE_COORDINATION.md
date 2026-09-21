@@ -961,3 +961,37 @@ complementary startup/observer work.
 Remaining risk and next investigation: inspect repeated reconnect and endpoint
 replacement for stale manifest admission or bitmap contributions, then use an
 isolated multi-peer sync to collect the new delivery/timeout counters.
+
+## Reclaim orphaned block ownership across reconnect churn
+
+Baseline: disconnect cleanup removed a source's availability bitmap and
+requeued only pieces still represented in its bounded local pipeline. Global
+piece ownership is authoritative, however, so an interrupted accounting
+transition could leave an in-flight piece owned by a removed peer but absent
+from those slots. That piece remained unavailable to healthy sources until
+the eight-second timeout sweep.
+
+Root cause and fix: the terminal disconnect boundary assumed local and global
+ownership could never diverge. After clearing the normal pipeline, it now
+performs one bounded scan of the active manifest and requeues any remaining
+piece whose exact owner is the disconnected peer. This work occurs only on
+disconnect, never on the send/receive hot path; manifest shape validation caps
+the scan at 100,000 pieces.
+
+After-result and regression proof: the wire fixture assigns 64 normal pieces
+to a peer, creates one global-only orphan, and advertises all 65 pieces in its
+availability bitmap. Disconnect immediately requeues all 65 and reduces
+availability from one source to zero. A replacement session is admitted over
+the wire, restores availability to exactly one, and its disconnect returns it
+to zero before the surviving peer downloads all 4,160 bodies. The focused
+`block_swarm_loopback` group passes.
+
+Consensus impact: NONE. This changes only transport ownership cleanup after a
+peer session ends. Block parsing, hashes, canonical reducer validation, chain
+history, PoW, transaction rules, and cryptographic semantics are unchanged.
+Worldstream remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: validate that per-peer timeout
+telemetry remains attributed to the actual owner when another peer's send tick
+runs the global orphan-timeout sweep first, then collect counters in an
+isolated multi-peer sync.

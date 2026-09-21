@@ -95,6 +95,8 @@ void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
 bool mp_block_swarm_test_admit_peer(struct p2p_node *node);
 bool mp_block_swarm_test_requeue_peer_piece(struct p2p_node *node,
                                              uint32_t piece_index);
+int32_t mp_block_swarm_test_assign_orphan_piece(struct p2p_node *node);
+uint32_t mp_block_swarm_test_piece_availability(uint32_t piece_index);
 bool mp_block_swarm_test_restart_manifest(
     const struct block_piece_manifest *manifest);
 
@@ -1046,7 +1048,7 @@ static int test_block_swarm_disconnect_requeue(void)
     TEST("block swarm loopback: a dead peer's in-flight pieces are event-"
          "driven requeued (pre-timeout) and picked up by a failover peer") {
         const struct chain_params *params = chain_params_get();
-        const int32_t end_height = 2560;            /* 40 pieces of 64 */
+        const int32_t end_height = 4160;            /* 65 pieces of 64 */
         struct bs_seeder seed;
 
         ASSERT(!mp_block_swarm_is_active());
@@ -1108,6 +1110,16 @@ static int test_block_swarm_disconnect_requeue(void)
         bs_pump(a_node, sent_a, &mp_b, p2, params->pchMessageStart, &ok);
         ASSERT(ok && p2->blk_manifest_received);
 
+        /* One source contributes every piece to rarest-first accounting. */
+        uint8_t complete_bitmap[9] = {
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01
+        };
+        ASSERT(bs_push_block_bitmap_frame(p1, params, 9,
+                                          complete_bitmap, 9));
+        ASSERT(bs_pump(p1, sent_p1, &mp_b, p1,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(mp_block_swarm_test_piece_availability(0) == 1);
+
         /* p1 grabs its window of pieces (marked CHUNK_INFLIGHT, owned by p1 in
          * g_block_swarm), then goes dark: the zblkreq segments are dropped and
          * never served, so those pieces would sit in flight until the 8 s
@@ -1117,13 +1129,8 @@ static int test_block_swarm_disconnect_requeue(void)
         int64_t assigned_monotonic = platform_time_monotonic_us() / 1000000;
         size_t p1_reqs = bs_queue_depth(sent_p1);
         printf("(dead peer held %zu in-flight pieces) ", p1_reqs);
-        const size_t expected_pieces =
-            (size_t)(end_height + (int)BLOCKS_PER_PIECE - 1) /
-            BLOCKS_PER_PIECE;
-        const size_t expected_owned =
-            expected_pieces < PIECE_PIPELINE_DEPTH
-                ? expected_pieces : PIECE_PIPELINE_DEPTH;
-        ASSERT(p1_reqs == expected_owned);             /* all bounded work owned */
+        const size_t expected_owned = 64; /* one bounded assignment batch */
+        ASSERT(p1_reqs == expected_owned);
         for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
             if (p1->blk_pipeline[pi].piece_index < 0)
                 continue;
@@ -1134,13 +1141,18 @@ static int test_block_swarm_disconnect_requeue(void)
         }
         bs_drop_queue(p1, sent_p1);                    /* p1 vanishes mid-flight */
 
+        /* Model an interrupted local/global accounting transition: the final
+         * piece is globally owned by p1 but has no local pipeline slot. */
+        ASSERT(mp_block_swarm_test_assign_orphan_piece(p1) == 64);
+
         /* THE FIX (wired into connman's disconnect cleanup): reclaim exactly the
          * pieces the dead peer held, EVENT-DRIVEN. This whole test runs in well
          * under a second, so a timeout-based sweep (block_swarm_handle_timeouts,
          * 8 s) would reclaim NOTHING here — a non-zero return proves the requeue
          * is driven by the disconnect, not by elapsed time. */
         size_t requeued = mp_block_swarm_peer_disconnected(p1);
-        ASSERT(requeued == p1_reqs);                   /* exactly p1's pieces   */
+        ASSERT(requeued == p1_reqs + 1); /* slots plus global orphan */
+        ASSERT(mp_block_swarm_test_piece_availability(0) == 0);
         ASSERT(!p1->blk_manifest_received);
         ASSERT(p1->blk_manifest_admitted_generation == 0);
         for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++)
@@ -1148,6 +1160,23 @@ static int test_block_swarm_disconnect_requeue(void)
         mp_snapshot_send_tick(&mp_b, p1);
         ASSERT(bs_queue_depth(sent_p1) == 0);          /* detached until re-admit */
         ASSERT(mp_block_swarm_peer_disconnected(p1) == 0); /* idempotent */
+
+        /* A replacement session must contribute availability afresh, without
+         * inheriting or double-counting the disconnected session. */
+        struct p2p_node *replacement = bs_make_peer(&nm_b, 4);
+        ASSERT(replacement != NULL);
+        struct send_segment *sent_replacement = bs_install_sentinel(replacement);
+        a_node->blk_manifest_sent = false;
+        push_block_manifest(&seed.mp, a_node);
+        ASSERT(bs_pump(a_node, sent_a, &mp_b, replacement,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(bs_push_block_bitmap_frame(replacement, params, 9,
+                                          complete_bitmap, 9));
+        ASSERT(bs_pump(replacement, sent_replacement, &mp_b, replacement,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(mp_block_swarm_test_piece_availability(0) == 1);
+        ASSERT(mp_block_swarm_peer_disconnected(replacement) == 0);
+        ASSERT(mp_block_swarm_test_piece_availability(0) == 0);
 
         /* FAILOVER: the requeued pieces are NEEDED again, so a live peer claims
          * and downloads them. Drive p2 to completion and confirm every body of
@@ -1167,7 +1196,7 @@ static int test_block_swarm_disconnect_requeue(void)
 
         ASSERT(!mp_block_swarm_is_active());           /* finished via failover */
         ASSERT(sink.blocks == (uint64_t)end_height);   /* all bodies delivered  */
-        ASSERT(sink.scope_begins == 40); /* one bounded scope per piece */
+        ASSERT(sink.scope_begins == 65); /* one bounded scope per piece */
         ASSERT(sink.scope_ends == sink.scope_begins);   /* exactly paired        */
         ASSERT(sink.scope_max_depth == 1);              /* never chain-wide */
         ASSERT(!sink.scope_open);
@@ -1178,12 +1207,15 @@ static int test_block_swarm_disconnect_requeue(void)
         send_segment_free(sent_a);
         send_segment_free(sent_p1);
         send_segment_free(sent_p2);
+        send_segment_free(sent_replacement);
         a_node->send_head = a_node->send_tail = NULL;
         p1->send_head = p1->send_tail = NULL;
         p2->send_head = p2->send_tail = NULL;
+        replacement->send_head = replacement->send_tail = NULL;
         p2p_node_free(a_node);
         p2p_node_free(p1);
         p2p_node_free(p2);
+        p2p_node_free(replacement);
         net_manager_free(&nm_b);
         coins_view_cache_free(&coins_b);
         tx_mempool_free(&mempool_b);

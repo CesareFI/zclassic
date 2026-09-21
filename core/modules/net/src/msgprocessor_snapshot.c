@@ -844,6 +844,28 @@ bool mp_block_swarm_test_requeue_peer_piece(struct p2p_node *node,
     return requeued;
 }
 
+int32_t mp_block_swarm_test_assign_orphan_piece(struct p2p_node *node)
+{
+    if (!node)
+        return -1;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    int32_t piece = atomic_load(&g_block_swarm_active) ?
+        block_swarm_assign_piece(&g_block_swarm, node->id, NULL, 0) : -1;
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return piece;
+}
+
+uint32_t mp_block_swarm_test_piece_availability(uint32_t piece_index)
+{
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    uint32_t availability = 0;
+    if (atomic_load(&g_block_swarm_active) &&
+        piece_index < g_block_swarm.manifest.num_pieces)
+        availability = g_block_swarm.piece_availability[piece_index];
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return availability;
+}
+
 bool mp_block_swarm_test_restart_manifest(
     const struct block_piece_manifest *manifest)
 {
@@ -1006,6 +1028,17 @@ size_t mp_block_swarm_peer_disconnected(struct p2p_node *node)
         node->blk_pipeline[pi].piece_index = -1;
         node->blk_pipeline[pi].request_time = 0;
         node->blk_pipeline[pi].request_time_us = 0;
+    }
+    /* Global ownership is authoritative. Normally every owned piece also
+     * has a local pipeline slot, but disconnect is the last safe recovery
+     * boundary for an interrupted or divergent accounting transition. Scan
+     * the bounded manifest so no orphan can retain a dead peer until timeout. */
+    if (active) {
+        for (uint32_t piece = 0; piece < bs->manifest.num_pieces; piece++) {
+            if (block_swarm_requeue_piece_for_peer(
+                    bs, piece, (int)peer_id))
+                requeued++;
+        }
     }
     pthread_mutex_unlock(&g_block_swarm_mutex);
 

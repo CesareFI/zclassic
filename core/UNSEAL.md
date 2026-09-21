@@ -520,3 +520,7 @@ later lane flips it HARD.
 - 2026-09-21T07:50:14Z — REASON: Reject stale block-piece responses before body parsing when global timeout or reassignment has revoked peer ownership; transport resource accounting only, consensus and validation unchanged
   old ROOT: 0c428e3cd4f8f45b134c59aa777563ede43521dcd7d8423bef2e538727119edd
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T08:05:22Z — REASON: Reclaim globally owned block-swarm pieces and source availability across peer reconnect churn; transport scheduling only, consensus and validation unchanged
+  old ROOT: 9ff9481a45bafda06bb37e76f7065208dbb93a3be8e2e1302e5ee19be1f25e6e
+  by: owner unseal ritual (make core-unseal)
