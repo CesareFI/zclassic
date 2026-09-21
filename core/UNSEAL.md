@@ -716,3 +716,7 @@ later lane flips it HARD.
 - 2026-09-21T17:54:21Z — REASON: Refactor authorized block swarm timeout sweep under complexity ratchet
   old ROOT: 336e15cbb803a235d4b0db0440c76b176422cffadae94e3ac544ef63cf7f2e86
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:56:58Z — REASON: Defer nonempty block swarm timeout scans until earliest possible expiry
+  old ROOT: 4accbc2b3134dce23e014941f7a69177552f44a52ff6a13bd6ba6b77bff57ddf
+  by: owner unseal ritual (make core-unseal)

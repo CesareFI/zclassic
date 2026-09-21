@@ -157,6 +157,7 @@ static int32_t block_swarm_assign_piece_capped(struct block_swarm *bs,
         bs->piece_request_time[best] =
             platform_time_monotonic_us() / 1000000;
         bs->pieces_inflight++;
+        bs->timeout_scan_after_monotonic = 0;
         if ((uint32_t)best == bs->next_assign_hint)
             block_swarm_advance_assign_hint(bs);
     }
@@ -233,6 +234,7 @@ bool block_swarm_receive_piece(struct block_swarm *bs,
     bs->piece_states[piece_index] = CHUNK_COMPLETE;
     bs->piece_peer[piece_index] = -1;
     bs->piece_request_time[piece_index] = 0;
+    bs->timeout_scan_after_monotonic = 0;
     bs->pieces_complete++;
     if (piece_index == bs->next_assign_hint)
         block_swarm_advance_assign_hint(bs);
@@ -278,6 +280,7 @@ bool block_swarm_requeue_piece(struct block_swarm *bs, uint32_t piece_index)
     bs->piece_states[piece_index] = CHUNK_NEEDED;
     bs->piece_peer[piece_index] = -1;
     bs->piece_request_time[piece_index] = 0;
+    bs->timeout_scan_after_monotonic = 0;
     if (piece_index < bs->next_assign_hint)
         bs->next_assign_hint = piece_index;
     return true;
@@ -321,6 +324,13 @@ void block_swarm_handle_timeouts_at(struct block_swarm *bs, int timeout_secs,
     if (!bs || !bs->piece_states || bs->pieces_inflight == 0)
         return;
 
+    if (bs->timeout_scan_timeout_secs == timeout_secs &&
+        bs->last_timeout_scan_monotonic > 0 &&
+        now_monotonic >= bs->last_timeout_scan_monotonic &&
+        bs->timeout_scan_after_monotonic > now_monotonic)
+        return;
+
+    int64_t next_expiry = INT64_MAX;
     for (uint32_t i = 0; i < bs->manifest.num_pieces; i++) {
         bs->timeout_probes++;
         if (bs->piece_states[i] == CHUNK_INFLIGHT &&
@@ -328,8 +338,18 @@ void block_swarm_handle_timeouts_at(struct block_swarm *bs, int timeout_secs,
                                          bs->piece_request_time[i],
                                          timeout_secs)) {
             (void)block_swarm_requeue_piece(bs, i);
+        } else if (bs->piece_states[i] == CHUNK_INFLIGHT &&
+                   timeout_secs >= 0) {
+            int64_t requested = bs->piece_request_time[i];
+            int64_t deadline = requested > INT64_MAX - timeout_secs - 1
+                ? INT64_MAX : requested + timeout_secs + 1;
+            if (deadline < next_expiry)
+                next_expiry = deadline;
         }
     }
+    bs->last_timeout_scan_monotonic = now_monotonic;
+    bs->timeout_scan_timeout_secs = timeout_secs;
+    bs->timeout_scan_after_monotonic = next_expiry;
 }
 
 void block_swarm_handle_timeouts(struct block_swarm *bs, int timeout_secs)

@@ -466,6 +466,9 @@ struct block_swarm {
     uint32_t pieces_failed;
     uint64_t timeout_probes;        /* timeout scan states; diagnostic */
     int64_t last_timeout_sweep_monotonic; /* global orphan scan cadence */
+    int64_t timeout_scan_after_monotonic; /* earliest known expiry */
+    int64_t last_timeout_scan_monotonic;  /* regression-safe scan epoch */
+    int timeout_scan_timeout_secs;        /* deadline's timeout policy */
     uint32_t next_assign_hint;       /* lowest possibly assignable piece */
     uint32_t first_incomplete_hint;  /* lowest possibly incomplete piece */
     int64_t  last_complete_monotonic;   /* monotonic seconds at last piece

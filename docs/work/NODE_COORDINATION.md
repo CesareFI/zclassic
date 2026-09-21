@@ -2176,3 +2176,19 @@ cadence. Consensus impact: NONE. Worldstream remains complementary. Remaining
 risk: cold runtime groups await safe disk headroom; syntax, seal, parity, and
 complexity checks pass. Next investigation: defer nonempty block-swarm scans
 until the earliest possible piece expiry.
+
+## Block-swarm timeout earliest-deadline cache
+
+Baseline and root cause: the coalesced global block-swarm fallback still
+scanned every in-flight piece once per second even when none could yet expire.
+
+Fix and after-result: timeout handling now caches the earliest possible
+expiration and skips scans before it. Assignment, receipt, and requeue clear
+the cache conservatively; timeout-policy changes and monotonic rollback force
+a fresh scan. Exact-owner pipeline reconciliation remains unchanged.
+
+Regression proof: `test_fast_sync` proves an early scan is suppressed and the
+existing monotonic-boundary cases still inspect and recover an in-flight piece.
+Consensus impact: NONE. Worldstream remains complementary. Remaining risk:
+cold runtime groups await safe disk headroom. Next investigation: measure
+block-piece rarest-first scans under large, sparse peer bitmaps.
