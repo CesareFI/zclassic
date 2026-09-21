@@ -600,3 +600,7 @@ later lane flips it HARD.
 - 2026-09-21T10:52:27Z — REASON: qualify peer-finalization callback through actual connman socket reactor
   old ROOT: e0f14cd5214b8d566b71dded5da7b6b22a223a7ac19aa1a48b46d69df5183c6c
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T11:14:24Z — REASON: reserve snapshot chunk capacity for outbound sources
+  old ROOT: f7cf47a87fd359cd4b8d9a48735134076559057af4d0c0388b4307473f483232
+  by: owner unseal ritual (make core-unseal)

@@ -84,6 +84,7 @@
 void mp_snapshot_send_tick(struct msg_processor *mp, struct p2p_node *node);
 bool mp_block_swarm_is_active(void);
 bool mp_snapshot_test_start_swarm(const struct sync_manifest *manifest);
+bool mp_snapshot_test_admit_peer(struct p2p_node *node);
 void mp_snapshot_test_stop_swarm(void);
 bool mp_snapshot_test_chunk_state(uint32_t chunk_index,
                                   enum chunk_state *state_out,
@@ -912,6 +913,74 @@ static int test_snapshot_manifest_wire_reconnect(void)
         p2p_node_free(peer_bad);
         p2p_node_free(peer_reconnect);
         main_state_free(&ms);
+        net_manager_free(&nm);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    mp_snapshot_test_stop_swarm();
+    return failures;
+}
+
+static int test_snapshot_inbound_reservation(void)
+{
+    int failures = 0;
+    TEST("snapshot chunk scheduler reserves half the window for outbound") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 4;
+        manifest.chunk_size = SYNC_CHUNK_SIZE;
+        manifest.chunk_hashes = zcl_calloc(
+            manifest.num_chunks, 32, "inbound_reservation_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+
+        struct net_manager nm;
+        struct msg_processor mp;
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.params = chain_params_get();
+        mp.net_mgr = &nm;
+        struct p2p_node *inbound[3] = {
+            bs_make_peer(&nm, 61), bs_make_peer(&nm, 62),
+            bs_make_peer(&nm, 63),
+        };
+        struct p2p_node *outbound = bs_make_peer(&nm, 64);
+        ASSERT(inbound[0] && inbound[1] && inbound[2] && outbound);
+        struct send_segment *sent_inbound[3];
+        for (size_t i = 0; i < 3; i++) {
+            inbound[i]->inbound = true;
+            sent_inbound[i] = bs_install_sentinel(inbound[i]);
+        }
+        struct send_segment *sent_outbound = bs_install_sentinel(outbound);
+        ASSERT(mp_snapshot_test_start_swarm(&manifest));
+        for (size_t i = 0; i < 3; i++)
+            ASSERT(mp_snapshot_test_admit_peer(inbound[i]));
+        ASSERT(mp_snapshot_test_admit_peer(outbound));
+
+        for (size_t i = 0; i < 3; i++)
+            mp_snapshot_send_tick(&mp, inbound[i]);
+        ASSERT(bs_queue_depth(sent_inbound[0]) +
+               bs_queue_depth(sent_inbound[1]) +
+               bs_queue_depth(sent_inbound[2]) == 2);
+
+        /* Churn below the ceiling must not disable inbound-only progress:
+         * releasing one owner immediately lets the waiting inbound source
+         * take the requeued chunk, while the outbound reserve remains. */
+        ASSERT(mp_snapshot_swarm_peer_disconnected(inbound[0]) == 1);
+        bs_drop_queue(inbound[0], sent_inbound[0]);
+        mp_snapshot_send_tick(&mp, inbound[2]);
+        ASSERT(bs_queue_depth(sent_inbound[2]) == 1);
+        mp_snapshot_send_tick(&mp, outbound);
+        ASSERT(bs_queue_depth(sent_outbound) == 1);
+
+        mp_snapshot_test_stop_swarm();
+        for (size_t i = 0; i < 3; i++) {
+            send_segment_free(sent_inbound[i]);
+            inbound[i]->send_head = inbound[i]->send_tail = NULL;
+            p2p_node_free(inbound[i]);
+        }
+        send_segment_free(sent_outbound);
+        outbound->send_head = outbound->send_tail = NULL;
+        p2p_node_free(outbound);
         net_manager_free(&nm);
         free(manifest.chunk_hashes);
         PASS();
@@ -2296,6 +2365,7 @@ int test_block_swarm_loopback(void)
     int failures = 0;
     failures += test_snapshot_chunk_wire_adversarial();
     failures += test_snapshot_manifest_wire_reconnect();
+    failures += test_snapshot_inbound_reservation();
     failures += test_block_swarm_manifest_shape_bounds();
     /* Every test here advertises and serves block pieces from a fixture
      * that never booted the runtime port, so the live sovereignty

@@ -1594,3 +1594,31 @@ observer coverage, with no overlap.  Remaining risk and next investigation:
 measure snapshot source selection under larger compatible-source reconnect
 churn, especially whether one rapidly reconnecting endpoint can crowd out
 diverse stable sources without violating the bounded manifest table.
+
+## Snapshot inbound-source reservation
+
+Baseline and root cause: a four-chunk deterministic scheduler fixture showed
+that three admitted inbound peers encountered first claimed three chunks before
+the healthy outbound source ran.  Snapshot assignment had no counterpart to
+the block swarm's inbound ceiling, so sufficiently many slow inbound sources
+could own every needed chunk and make outbound recovery wait for the full
+chunk timeout.
+
+Fix and after-result: simultaneous inbound-owned snapshot work is now bounded
+to half of the manifest's chunks (with one permitted for a one-chunk manifest).
+Outbound sources retain immediate work regardless of connman's stable peer
+iteration order.  The ceiling counts only current in-flight work, so delivery,
+disconnect, or timeout immediately restores inbound capacity and inbound-only
+sync continues rather than deadlocking.
+
+Regression proof: `test_block_swarm_loopback` first failed with three inbound
+requests in the four-chunk window.  It now proves two inbound assignments, an
+immediate churn/requeue replacement by the waiting inbound source, and an
+immediate outbound assignment.  Existing direct-wire truncated, unsolicited,
+duplicate, late-response, disconnect, timeout, and integrity cases remain in
+the same group.  Consensus impact: NONE; only request ownership changes, while
+snapshot hashes, content verification, chain validation, PoW, and activation
+are unchanged.  Worldstream `0b29bec27` remains focused on fresh-sync startup
+interruption and observers.  Remaining risk and next investigation: measure
+whether legacy block-download peer selection similarly lets inbound sources
+consume the bounded in-flight window ahead of faster outbound peers.

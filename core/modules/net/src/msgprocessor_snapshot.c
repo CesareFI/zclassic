@@ -261,6 +261,21 @@ static bool swarm_lock_admitted_peer(const struct p2p_node *node)
     return admitted;
 }
 
+static bool swarm_should_assign_chunk(const struct swarm_sync *swarm,
+                                      const struct p2p_node *node,
+                                      bool peer_timed_out)
+{
+    if (!swarm || !node || peer_timed_out ||
+        node->swarm_inflight_chunk >= 0)
+        return false;
+    if (!node->inbound)
+        return true;
+    uint32_t inbound_cap = swarm->manifest.num_chunks / 2;
+    if (inbound_cap == 0)
+        inbound_cap = 1;
+    return swarm->chunks_inflight < inbound_cap;
+}
+
 bool mp_block_swarm_manifest_shape_valid(int32_t start_height,
                                          int32_t end_height,
                                          uint32_t num_pieces)
@@ -1049,6 +1064,19 @@ bool mp_snapshot_test_start_swarm(const struct sync_manifest *manifest)
         atomic_store(&g_swarm_active, true);
     swarm_mutex_unlock();
     return started;
+}
+
+bool mp_snapshot_test_admit_peer(struct p2p_node *node)
+{
+    if (!node || !swarm_mutex_lock())
+        return false;
+    bool admitted = atomic_load(&g_swarm_active);
+    if (admitted) {
+        node->swarm_manifest_received = true;
+        node->swarm_manifest_generation = g_swarm_generation;
+    }
+    swarm_mutex_unlock();
+    return admitted;
 }
 
 void mp_snapshot_test_stop_swarm(void)
@@ -2344,7 +2372,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
                                    SWARM_CHUNK_TIMEOUT_SECS * 2);
 
         /* If peer has no inflight chunk, assign the next needed one */
-        if (node->swarm_inflight_chunk < 0 && !peer_timed_out) {
+        if (swarm_should_assign_chunk(&g_swarm, node, peer_timed_out)) {
             int32_t ci = swarm_sync_assign_chunk(&g_swarm, node->id);
             if (ci >= 0) {
                 node->swarm_inflight_chunk = ci;
