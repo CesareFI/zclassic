@@ -1307,7 +1307,7 @@ core/modules/net/src/msgprocessor.c:handle_zfilelist:19
 core/modules/net/src/msgprocessor.c:msg_block_intake_worker:19
 core/modules/net/src/msgprocessor.c:msg_process_messages:24
 core/modules/net/src/msgprocessor.c:msg_send_messages:109
-core/modules/net/src/msgprocessor_snapshot.c:mp_handle_zcl23_sync:160
+core/modules/net/src/msgprocessor_snapshot.c:mp_handle_zcl23_sync:159
 core/modules/net/src/msgprocessor_snapshot.c:mp_snapshot_maybe_offer:17
 core/modules/net/src/msgprocessor_snapshot.c:mp_snapshot_send_tick:23
 core/modules/net/src/msgprocessor_snapshot_payload.c:mp_block_payload_submit_all:25

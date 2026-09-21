@@ -464,6 +464,18 @@ static bool block_swarm_peer_response_allowed(
     return requested;
 }
 
+/* Caller holds g_block_swarm_mutex.  A response may have been admitted before
+ * parsing, so check ownership again before spending reducer intake on it. */
+static bool block_swarm_payload_submit_allowed_locked(
+    const struct p2p_node *node, uint32_t piece_index, bool verified,
+    const struct block_piece_payload_ref *block_refs)
+{
+    return verified && block_refs && node &&
+        piece_index < g_block_swarm.manifest.num_pieces &&
+        g_block_swarm.piece_states[piece_index] == CHUNK_INFLIGHT &&
+        g_block_swarm.piece_peer[piece_index] == node->id;
+}
+
 static bool block_swarm_release_malformed_response(
     struct p2p_node *node, uint32_t piece_index, bool piece_index_valid)
 {
@@ -2301,7 +2313,8 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                             32) == 0;
                     }
                     bool payloads_accepted = block_refs != NULL;
-                    if (verified && block_refs) {
+                    if (block_swarm_payload_submit_allowed_locked(
+                            node, piece_index, verified, block_refs)) {
                         /* Swarm identity before dropping the lock: payload
                          * submit can block for seconds under reducer
                          * backpressure, and the stall watchdog may reap (and
@@ -2334,8 +2347,8 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                             node, piece_index);
                     } else if (verified) {
                         LOG_INFO("net",
-                                 "zblkdata piece %u waiting for timeout retry "
-                                 "after local payload intake backpressure",
+                                 "zblkdata piece %u not submitted after "
+                                 "ownership change or local intake backpressure",
                                  piece_index);
                     } else {
                         fprintf(stderr, "Peer %s: block piece %u failed verification\n",  // obs-ok:helper-context-logged
