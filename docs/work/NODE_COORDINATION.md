@@ -1927,3 +1927,26 @@ selection, and wire payloads are unchanged. Worldstream `d9f5153be` remains
 complementary storage/startup work. Remaining risk and next investigation:
 measure snapshot manifest-source diversity under repeated reconnect churn with
 three or more compatible endpoints.
+
+## Independent snapshot reconnect yields
+
+Baseline and root cause: the bounded reconnect-yield table recorded each
+disconnected endpoint independently, but its consume helper cleared every
+outstanding record when any alternate source received one chunk. Under a
+multi-source disconnect, that single assignment could release all replacement
+endpoints at once and defeat the intended source-diversity opportunity.
+
+Fix and after-result: each successful assignment now consumes exactly one
+other endpoint's active yield. Further pending endpoint yields remain in force
+until another compatible source is assigned or their one-second monotonic
+deadline expires. The table remains fixed at 32 entries and generation-scoped.
+
+Regression proof: `test_block_swarm_loopback` starts a three-chunk swarm,
+disconnects two owners, then proves the healthy source receives the first
+recovered chunk while the other reconnecting endpoint is still deferred. The
+released first endpoint then provides the next valid alternative-source
+opportunity. The complete real-wire group passes. Consensus impact: NONE;
+only volatile peer scheduling changed. Worldstream `5297c58f4` is
+complementary classic-node timeout arithmetic work and owns no overlapping C
+surface. Remaining risk and next investigation: inspect whether a rejected
+`zchunkreq` has any residual owner/accounting state after a reconnect yield.

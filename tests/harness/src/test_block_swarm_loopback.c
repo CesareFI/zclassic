@@ -946,6 +946,93 @@ static int test_snapshot_manifest_wire_reconnect(void)
     return failures;
 }
 
+static int test_snapshot_reconnect_yields_are_independent(void)
+{
+    int failures = 0;
+    TEST("snapshot reconnect churn preserves one healthy opportunity per source") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 3;
+        manifest.chunk_size = SYNC_CHUNK_SIZE;
+        manifest.chunk_hashes = zcl_calloc(3, 32, "churn_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+        for (uint32_t i = 0; i < manifest.num_chunks; i++) {
+            struct utxo_chunk *chunk = zcl_calloc(
+                1, sizeof(*chunk), "churn_empty_chunk");
+            ASSERT(chunk != NULL);
+            chunk->chunk_index = i;
+            fast_sync_chunk_hash(chunk, manifest.chunk_hashes[i]);
+            free(chunk);
+        }
+
+        struct net_manager nm;
+        struct msg_processor mp;
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.params = chain_params_get();
+        mp.net_mgr = &nm;
+        mp.datadir = ".";
+        struct p2p_node *old_a = bs_make_peer(&nm, 81);
+        struct p2p_node *old_c = bs_make_peer(&nm, 82);
+        struct p2p_node *healthy = bs_make_peer(&nm, 83);
+        struct p2p_node *new_a = bs_make_peer(&nm, 81);
+        struct p2p_node *new_c = bs_make_peer(&nm, 82);
+        ASSERT(old_a && old_c && healthy && new_a && new_c);
+        struct send_segment *sent_a = bs_install_sentinel(new_a);
+        struct send_segment *sent_c = bs_install_sentinel(new_c);
+        struct send_segment *sent_healthy = bs_install_sentinel(healthy);
+        ASSERT(mp_snapshot_test_start_swarm(&manifest));
+        ASSERT(mp_snapshot_test_admit_peer(old_a));
+        ASSERT(mp_snapshot_test_admit_peer(old_c));
+        ASSERT(mp_snapshot_test_admit_peer(healthy));
+        ASSERT(mp_snapshot_test_admit_peer(new_a));
+        ASSERT(mp_snapshot_test_admit_peer(new_c));
+
+        mp_snapshot_send_tick(&mp, old_a);
+        mp_snapshot_send_tick(&mp, old_c);
+        ASSERT(old_a->swarm_inflight_chunk >= 0);
+        ASSERT(old_c->swarm_inflight_chunk >= 0);
+        ASSERT(mp_snapshot_swarm_peer_disconnected(old_a) == 1);
+        ASSERT(mp_snapshot_swarm_peer_disconnected(old_c) == 1);
+
+        /* The healthy source receives the first recovered chunk and consumes
+         * only one endpoint's yield. The other replacement remains deferred
+         * until another distinct source has a chance to receive work. */
+        mp_snapshot_send_tick(&mp, healthy);
+        ASSERT(healthy->swarm_inflight_chunk >= 0);
+        ASSERT(bs_queue_depth(sent_healthy) == 1);
+        mp_snapshot_send_tick(&mp, new_c);
+        ASSERT(new_c->swarm_inflight_chunk == -1);
+        ASSERT(bs_queue_depth(sent_c) == 0);
+        /* A's yield was consumed by healthy. Once A is released, it is a
+         * distinct compatible source for C and may receive the next chunk. */
+        mp_snapshot_send_tick(&mp, new_a);
+        ASSERT(new_a->swarm_inflight_chunk >= 0);
+        ASSERT(bs_queue_depth(sent_a) == 1);
+
+        mp_snapshot_test_stop_swarm();
+        bs_drop_queue(new_a, sent_a);
+        bs_drop_queue(new_c, sent_c);
+        bs_drop_queue(healthy, sent_healthy);
+        send_segment_free(sent_a);
+        send_segment_free(sent_c);
+        send_segment_free(sent_healthy);
+        new_a->send_head = new_a->send_tail = NULL;
+        new_c->send_head = new_c->send_tail = NULL;
+        healthy->send_head = healthy->send_tail = NULL;
+        p2p_node_free(old_a);
+        p2p_node_free(old_c);
+        p2p_node_free(healthy);
+        p2p_node_free(new_a);
+        p2p_node_free(new_c);
+        net_manager_free(&nm);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    mp_snapshot_test_stop_swarm();
+    return failures;
+}
+
 static int test_snapshot_inbound_reservation(void)
 {
     int failures = 0;
@@ -2461,6 +2548,7 @@ int test_block_swarm_loopback(void)
     int failures = 0;
     failures += test_snapshot_chunk_wire_adversarial();
     failures += test_snapshot_manifest_wire_reconnect();
+    failures += test_snapshot_reconnect_yields_are_independent();
     failures += test_snapshot_inbound_reservation();
     failures += test_block_swarm_manifest_shape_bounds();
     /* Every test here advertises and serves block pieces from a fixture

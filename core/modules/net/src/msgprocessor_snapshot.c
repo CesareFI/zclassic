@@ -134,8 +134,9 @@ static bool swarm_reconnect_yield_active_locked(const struct p2p_node *node,
 }
 
 /* Caller holds g_swarm_mutex. A different compatible source has actually
- * received work, so the reconnecting endpoint has had its fair opportunity
- * cost and must not be held back through a later timeout. */
+ * received work, so one reconnecting endpoint has had its fair opportunity.
+ * Consume one record per assignment: a single healthy peer must not erase
+ * every outstanding yield after several endpoints disconnect together. */
 static void swarm_consume_reconnect_yield_locked(const struct p2p_node *node,
                                                  int64_t now_monotonic)
 {
@@ -148,6 +149,7 @@ static void swarm_consume_reconnect_yield_locked(const struct p2p_node *node,
             !net_service_eq(&entry->address.svc, &node->addr.svc)) {
             entry->generation = 0;
             entry->until_monotonic = 0;
+            return;
         }
     }
 }
