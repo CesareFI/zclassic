@@ -2011,3 +2011,19 @@ NONE; no payload, validation, or selection rule changed. Worldstream
 `5297c58f4` remains complementary timeout arithmetic. Remaining risk and next
 investigation: audit snapshot serving state after a successful end-frame
 enqueue followed by immediate disconnect.
+
+## Snapshot terminal-frame refusal
+
+Baseline and root cause: data-frame refusal was covered, but `zsyncend` uses a
+separate serving-state transition and lacked a direct bounded-queue regression.
+An unobserved refusal there could strand a peer outside its retryable serving
+state.
+
+After-result and regression proof: the existing production path already keeps
+the peer serving until `p2p_node_end_message` accepts `zsyncend`.
+`test_snapshot_serve_loopback` now drives its real prepared-buffer end branch
+at the queue hard cap and proves state and terminal cursor remain unchanged,
+then restores the fixture cursor and completes the normal real-wire transfer.
+Consensus impact: NONE. Worldstream `5297c58f4` remains complementary.
+Remaining risk and next investigation: inspect snapshot requester recovery
+when a served peer disconnects after data enqueue but before terminal delivery.

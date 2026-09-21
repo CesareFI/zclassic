@@ -459,6 +459,24 @@ static int test_snapshot_serve_loopback_impl(enum lb_snapshot_case test_case)
         ASSERT(node_a_side->zsync_offset == 0);
         ASSERT(node_a_side->zsync_sent == 0);
 
+        /* A rejected terminal frame must also leave the serving state
+         * retryable. Drive the production end branch with the real prepared
+         * buffer boundary, then restore the ordinary fixture cursor for the
+         * complete wire transfer below. */
+        node_a_side->zsync_file_offset = node_a_side->zsync_file_size;
+        node_a_side->zsync_offset = node_a_side->zsync_total;
+        node_a_side->zsync_sent = 2;
+        node_a_side->send_size = net_send_peer_bytes_hard_cap();
+        lb_drive_serve_tick(&mp_a, node_a_side);
+        node_a_side->send_size = 0;
+        ASSERT(node_a_side->state == PEER_SNAPSHOT_SERVING);
+        ASSERT(node_a_side->zsync_file_offset == node_a_side->zsync_file_size);
+        ASSERT(node_a_side->zsync_offset == node_a_side->zsync_total);
+        ASSERT(node_a_side->zsync_sent == 2);
+        node_a_side->zsync_file_offset = 0;
+        node_a_side->zsync_offset = 0;
+        node_a_side->zsync_sent = 0;
+
         /* ── Step 5: streams both real zsnapdata chunks + zsnapend from
          * the real in-RAM snapshot buffer through the production tick. */
         lb_drive_serve_tick(&mp_a, node_a_side);
