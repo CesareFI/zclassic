@@ -812,12 +812,16 @@ static int test_snapshot_manifest_wire_reconnect(void)
         struct p2p_node *peer_b = bs_make_peer(&nm, 52);
         struct p2p_node *peer_bad = bs_make_peer(&nm, 53);
         struct p2p_node *peer_reconnect = bs_make_peer(&nm, 53);
-        ASSERT(peer_a && peer_b && peer_bad && peer_reconnect);
+        struct p2p_node *peer_a_reconnect = bs_make_peer(&nm, 51);
+        ASSERT(peer_a && peer_b && peer_bad && peer_reconnect &&
+               peer_a_reconnect);
         struct send_segment *sent_a = bs_install_sentinel(peer_a);
         struct send_segment *sent_b = bs_install_sentinel(peer_b);
         struct send_segment *sent_bad = bs_install_sentinel(peer_bad);
         struct send_segment *sent_reconnect =
             bs_install_sentinel(peer_reconnect);
+        struct send_segment *sent_a_reconnect =
+            bs_install_sentinel(peer_a_reconnect);
         bool ok = true;
 
         ASSERT(bs_push_manifest_frame(peer_a, mp.params, &manifest));
@@ -864,6 +868,18 @@ static int test_snapshot_manifest_wire_reconnect(void)
         ASSERT(peer_a->swarm_manifest_generation == 0);
         ASSERT(peer_a->swarm_manifest_attempts == 0);
         ASSERT(peer_a->swarm_inflight_chunk == -1);
+        /* A new connection from A's endpoint gets a fresh manifest budget,
+         * but cannot immediately reclaim A's just-released chunk ahead of
+         * the already-admitted healthy source B. */
+        ASSERT(bs_push_manifest_frame(peer_a_reconnect, mp.params,
+                                      &manifest));
+        ASSERT(bs_pump(peer_a_reconnect, sent_a_reconnect, &mp,
+                       peer_a_reconnect, mp.params->pchMessageStart,
+                       &ok) > 0 && ok);
+        ASSERT(peer_a_reconnect->swarm_manifest_received);
+        mp_snapshot_send_tick(&mp, peer_a_reconnect);
+        ASSERT(peer_a_reconnect->swarm_inflight_chunk == -1);
+        ASSERT(bs_queue_depth(sent_a_reconnect) == 0);
         mp_snapshot_send_tick(&mp, peer_a);
         ASSERT(bs_queue_depth(sent_a) == 0);
         mp_snapshot_send_tick(&mp, peer_b);
@@ -904,14 +920,17 @@ static int test_snapshot_manifest_wire_reconnect(void)
         send_segment_free(sent_b);
         send_segment_free(sent_bad);
         send_segment_free(sent_reconnect);
+        send_segment_free(sent_a_reconnect);
         peer_a->send_head = peer_a->send_tail = NULL;
         peer_b->send_head = peer_b->send_tail = NULL;
         peer_bad->send_head = peer_bad->send_tail = NULL;
         peer_reconnect->send_head = peer_reconnect->send_tail = NULL;
+        peer_a_reconnect->send_head = peer_a_reconnect->send_tail = NULL;
         p2p_node_free(peer_a);
         p2p_node_free(peer_b);
         p2p_node_free(peer_bad);
         p2p_node_free(peer_reconnect);
+        p2p_node_free(peer_a_reconnect);
         main_state_free(&ms);
         net_manager_free(&nm);
         free(manifest.chunk_hashes);

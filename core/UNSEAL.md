@@ -640,3 +640,7 @@ later lane flips it HARD.
 - 2026-09-21T12:59:46Z — REASON: Preserve post-handshake mempool retry when the bounded send queue refuses the request; no consensus or wire semantic change
   old ROOT: 3b424a56f09d88c014d167ee3d33acebdbd40e2bc26371c20d973d86ceb3f8df
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T14:44:08Z — REASON: Bound snapshot chunk reacquisition by a reconnecting endpoint so stable compatible peers get an immediate reassignment opportunity.
+  old ROOT: a7cf767c120bb7ba23fc7d42085bf85e7a7a2a1f8f209fc4e1ee51e3de9daedf
+  by: owner unseal ritual (make core-unseal)

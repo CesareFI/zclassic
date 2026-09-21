@@ -61,6 +61,23 @@ static _Atomic bool g_swarm_active = false;
 static pthread_mutex_t g_swarm_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_swarm_generation = 0;
 
+/* A disconnect can be followed immediately by a fresh connection from the
+ * same endpoint. Connman's fixed peer iteration would otherwise let that
+ * replacement reclaim its just-released chunk before an already-admitted
+ * source gets a send tick. This is only a short opportunity for another
+ * compatible source, never a ban or a trust decision. */
+#define SWARM_RECONNECT_YIELD_SECS 1
+#define SWARM_RECONNECT_YIELD_SOURCES 32
+
+struct swarm_reconnect_yield {
+    struct net_address address;
+    uint64_t generation;
+    int64_t until_monotonic;
+};
+
+static struct swarm_reconnect_yield
+    g_swarm_reconnect_yields[SWARM_RECONNECT_YIELD_SOURCES];
+
 static bool swarm_mutex_lock(void)
 {
     pthread_mutex_lock(&g_swarm_mutex);
@@ -70,6 +87,69 @@ static bool swarm_mutex_lock(void)
 static void swarm_mutex_unlock(void)
 {
     pthread_mutex_unlock(&g_swarm_mutex);
+}
+
+/* Caller holds g_swarm_mutex. */
+static void swarm_record_reconnect_yield_locked(const struct p2p_node *node,
+                                                int64_t now_monotonic)
+{
+    if (!node)
+        return;
+    size_t replace = 0;
+    for (size_t i = 0; i < SWARM_RECONNECT_YIELD_SOURCES; i++) {
+        struct swarm_reconnect_yield *entry = &g_swarm_reconnect_yields[i];
+        if (entry->generation == g_swarm_generation &&
+            net_service_eq(&entry->address.svc, &node->addr.svc)) {
+            entry->until_monotonic = now_monotonic +
+                SWARM_RECONNECT_YIELD_SECS;
+            return;
+        }
+        if (entry->generation != g_swarm_generation ||
+            entry->until_monotonic <= now_monotonic) {
+            replace = i;
+            break;
+        }
+    }
+    g_swarm_reconnect_yields[replace].address = node->addr;
+    g_swarm_reconnect_yields[replace].generation = g_swarm_generation;
+    g_swarm_reconnect_yields[replace].until_monotonic = now_monotonic +
+        SWARM_RECONNECT_YIELD_SECS;
+}
+
+/* Caller holds g_swarm_mutex. */
+static bool swarm_reconnect_yield_active_locked(const struct p2p_node *node,
+                                                 int64_t now_monotonic)
+{
+    if (!node)
+        return false;
+    for (size_t i = 0; i < SWARM_RECONNECT_YIELD_SOURCES; i++) {
+        const struct swarm_reconnect_yield *entry =
+            &g_swarm_reconnect_yields[i];
+        if (entry->generation == g_swarm_generation &&
+            entry->until_monotonic > now_monotonic &&
+            net_service_eq(&entry->address.svc, &node->addr.svc))
+            return true;
+    }
+    return false;
+}
+
+/* Caller holds g_swarm_mutex. A different compatible source has actually
+ * received work, so the reconnecting endpoint has had its fair opportunity
+ * cost and must not be held back through a later timeout. */
+static void swarm_consume_reconnect_yield_locked(const struct p2p_node *node,
+                                                 int64_t now_monotonic)
+{
+    if (!node)
+        return;
+    for (size_t i = 0; i < SWARM_RECONNECT_YIELD_SOURCES; i++) {
+        struct swarm_reconnect_yield *entry = &g_swarm_reconnect_yields[i];
+        if (entry->generation == g_swarm_generation &&
+            entry->until_monotonic > now_monotonic &&
+            !net_service_eq(&entry->address.svc, &node->addr.svc)) {
+            entry->generation = 0;
+            entry->until_monotonic = 0;
+        }
+    }
 }
 
 /* Snapshot sync service — global singleton in snapshot_sync_service.c */
@@ -263,10 +343,13 @@ static bool swarm_lock_admitted_peer(const struct p2p_node *node)
 
 static bool swarm_should_assign_chunk(const struct swarm_sync *swarm,
                                       const struct p2p_node *node,
-                                      bool peer_timed_out)
+                                      bool peer_timed_out,
+                                      int64_t now_monotonic)
 {
     if (!swarm || !node || peer_timed_out ||
         node->swarm_inflight_chunk >= 0)
+        return false;
+    if (swarm_reconnect_yield_active_locked(node, now_monotonic))
         return false;
     if (!node->inbound)
         return true;
@@ -1086,6 +1169,7 @@ void mp_snapshot_test_stop_swarm(void)
     if (atomic_load(&g_swarm_active))
         swarm_sync_free(&g_swarm);
     atomic_store(&g_swarm_active, false);
+    memset(g_swarm_reconnect_yields, 0, sizeof(g_swarm_reconnect_yields));
     swarm_mutex_unlock();
 }
 
@@ -1138,6 +1222,9 @@ size_t mp_snapshot_swarm_peer_disconnected(struct p2p_node *node)
          * prevents that churn from stranding owned chunks until timeout. */
         if (atomic_load(&g_swarm_active))
             requeued = swarm_sync_peer_disconnected(&g_swarm, node->id);
+        if (requeued > 0)
+            swarm_record_reconnect_yield_locked(
+                node, platform_time_monotonic_us() / 1000000);
         swarm_mutex_unlock();
     }
     node->swarm_manifest_received = false;
@@ -2363,8 +2450,9 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         swarm_lock_admitted_peer(node)) {
 
         /* Handle timeout: if this peer's chunk is stale, re-queue it */
+        int64_t now_monotonic = platform_time_monotonic_us() / 1000000;
         bool peer_timed_out = swarm_reconcile_peer_timeout_locked(
-            node, platform_time_monotonic_us() / 1000000);
+            node, now_monotonic);
 
         /* Preserve a bounded fallback for a global-only orphan, but give the
          * exact owner a full timeout window to account and yield first. */
@@ -2372,9 +2460,11 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
                                    SWARM_CHUNK_TIMEOUT_SECS * 2);
 
         /* If peer has no inflight chunk, assign the next needed one */
-        if (swarm_should_assign_chunk(&g_swarm, node, peer_timed_out)) {
+        if (swarm_should_assign_chunk(&g_swarm, node, peer_timed_out,
+                                      now_monotonic)) {
             int32_t ci = swarm_sync_assign_chunk(&g_swarm, node->id);
             if (ci >= 0) {
+                swarm_consume_reconnect_yield_locked(node, now_monotonic);
                 node->swarm_inflight_chunk = ci;
                 node->swarm_chunk_req_time =
                     platform_time_monotonic_us() / 1000000;

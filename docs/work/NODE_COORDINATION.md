@@ -1835,3 +1835,28 @@ are unchanged.  Worldstream `6c1a99c24` remains complementary on fresh-sync
 observer measurement.  Remaining risk and next investigation: measure the
 active-slot census cost in saturated legacy block assignment before replacing
 its scans with counters.
+
+## Snapshot reconnect-source yield
+
+Baseline and root cause: real framed `zmanifest`/`zchunkreq` coverage showed
+that terminal cleanup immediately released a disconnected source's chunk, but
+connman's fixed callback order allowed a new session from that same endpoint
+to reclaim it before an already-admitted compatible source was called. A
+rapid reconnect loop could therefore monopolize a released chunk without
+invalid data or a timeout.
+
+Fix and after-result: the active snapshot generation now retains at most 32
+endpoint-scoped, one-second reconnect yields. A same-endpoint replacement
+waits for one alternative-source opportunity; the yield is consumed as soon
+as a different compatible source actually receives work, so it cannot delay
+that endpoint through a later timeout. The state is volatile, bounded, and
+generation-scoped; it is neither a ban nor a trust decision.
+
+Regression proof: `test_block_swarm_loopback` drives a real wire manifest,
+disconnects the owner, admits a distinct new peer object for the same
+endpoint, and proves it emits no request before the healthy admitted source
+owns the released chunk. Existing truncated, unsolicited, duplicate, late,
+timeout, and disconnect ownership cases pass in the same group. Consensus
+impact: NONE. Worldstream `d9f5153be` is complementary storage/startup work.
+Remaining risk and next investigation: inspect snapshot timeout/reassignment
+fairness under larger source churn without adding persistent peer trust state.
