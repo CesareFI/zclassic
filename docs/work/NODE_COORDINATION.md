@@ -1400,3 +1400,26 @@ startup/observer work.
 Remaining risk and next investigation: add the same direct failure/retry proof
 for compiled-checkpoint header capture, then inspect ordinary `getheaders` and
 legacy block-request accounting for discarded queue failures.
+
+## Pin checkpoint-header enqueue failover directly
+
+Baseline and risk: checkpoint-header throttle rollback shared the repaired
+implementation but lacked a direct test with its required parent/target index
+shape. A future change could preserve missing-solution repair while regressing
+the one hash-pinned checkpoint request needed by a fresh seeded node.
+
+Fix and after-result: the checkpoint repair fixture now builds the real
+parent-linked target, arms the exact target hash, refuses the first request at
+the 64 MiB queue ceiling, and invokes a second eligible peer at the identical
+monotonic timestamp. The healthy peer immediately queues the bounded
+parent-to-checkpoint `getheaders` request.
+
+Regression proof: `checkpoint_header_solution_repair` passes the new enqueue
+failover plus wrong-hash refusal, frozen Equihash/PoW refusal, hash-pinned
+persistence, PASS-record creation, capture, consume, and compiled-arm cases.
+Consensus impact: NONE; test coverage only. Worldstream remains at
+`0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: inspect ordinary `getheaders` and
+legacy `getdata` block-request accounting for discarded bounded-queue failures,
+starting from sites that mark peer/request state before message finalization.

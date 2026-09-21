@@ -22,10 +22,13 @@
 #include "conditions/checkpoint_header_solution_repair.h"
 
 #include "chain/chain.h"
+#include "chain/chainparams.h"
 #include "core/uint256.h"
 #include "jobs/stage_repair.h"
 #include "jobs/validate_headers_stage.h"
 #include "net/checkpoint_header_fetch.h"
+#include "net/net.h"
+#include "net/msgprocessor.h"
 #include "primitives/block.h"
 #include "storage/progress_store.h"
 #include "validation/chainstate.h"
@@ -105,6 +108,28 @@ static struct block_index *seed_index(struct main_state *ms, int height,
     return bi;
 }
 
+static void chsr_setup_peer(struct p2p_node *node, int32_t height)
+{
+    memset(node, 0, sizeof(*node));
+    node->socket = ZCL_INVALID_SOCKET;
+    node->starting_height = height;
+    snprintf(node->addr_name, sizeof(node->addr_name),
+             "203.0.113.29:8033");
+    atomic_store(&node->state, PEER_HANDSHAKE_COMPLETE);
+    zcl_mutex_init(&node->cs_send);
+}
+
+static void chsr_free_peer(struct p2p_node *node)
+{
+    struct send_segment *seg = node->send_head;
+    while (seg) {
+        struct send_segment *next = seg->next;
+        send_segment_free(seg);
+        seg = next;
+    }
+    zcl_mutex_destroy(&node->cs_send);
+}
+
 int test_checkpoint_header_solution_repair(void)
 {
     printf("\n=== checkpoint_header_solution_repair tests ===\n");
@@ -121,7 +146,40 @@ int test_checkpoint_header_solution_repair(void)
     struct block_header good;
     struct uint256 good_hash;
     build_header(&good, H, &good_hash);
-    CHSR_CHECK("seed checkpoint header index", seed_index(&ms, H, &good_hash) != NULL);
+    struct block_index *target = seed_index(&ms, H, &good_hash);
+    CHSR_CHECK("seed checkpoint header index", target != NULL);
+
+    /* A refused wire enqueue must restore the global throttle so another
+     * eligible peer can request the hash-pinned checkpoint immediately. */
+    if (target) {
+        struct uint256 parent_hash = good.hashPrevBlock;
+        struct block_index *parent = chainstate_insert_block_index(
+            (struct chainstate *)&ms, &parent_hash);
+        CHSR_CHECK("seed checkpoint parent index", parent != NULL);
+        if (parent) {
+            parent->nHeight = H - 1;
+            parent->nStatus = BLOCK_VALID_TREE;
+            target->pprev = parent;
+
+            struct msg_processor mp = {0};
+            mp.main_state = &ms;
+            mp.params = chain_params_get();
+            struct p2p_node failed_peer, healthy_peer;
+            chsr_setup_peer(&failed_peer, H);
+            chsr_setup_peer(&healthy_peer, H);
+            checkpoint_header_fetch_test_reset();
+            checkpoint_header_fetch_arm(H, &good_hash);
+            failed_peer.send_size = net_send_peer_bytes_hard_cap();
+            checkpoint_header_fetch_maybe_send(&mp, &failed_peer, 1);
+            failed_peer.send_size = 0;
+            checkpoint_header_fetch_maybe_send(&mp, &healthy_peer, 1);
+            CHSR_CHECK("failed enqueue leaves checkpoint retry eligible",
+                       healthy_peer.send_size > 0);
+            checkpoint_header_fetch_test_reset();
+            chsr_free_peer(&failed_peer);
+            chsr_free_peer(&healthy_peer);
+        }
+    }
 
     /* (1) WRONG HASH → refused at hash-pin, nothing persisted. */
     checkpoint_header_solution_set_frozen_verifier_for_test(frozen_ok);
