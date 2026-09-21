@@ -958,6 +958,32 @@ static int test_mempool_requested_once_for_relay_peer(void)
     return failures;
 }
 
+static int test_mempool_queue_refusal_preserves_retry(void)
+{
+    int failures = 0;
+    TEST("mempool sync-on-connect: queue refusal preserves one-shot retry") {
+        struct hs_fixture f;
+        ASSERT(hs_fixture_setup(&f, true));
+        hs_force_sync_idle();
+        f.node.relay_txes = true;
+        f.node.send_size = net_send_peer_bytes_hard_cap();
+
+        ASSERT(!msg_tx_maybe_request_mempool(&f.mp, &f.node));
+        ASSERT(!f.node.mempool_requested);
+
+        f.node.send_size = 0;
+        ASSERT(msg_tx_maybe_request_mempool(&f.mp, &f.node));
+        ASSERT(f.node.mempool_requested);
+
+        struct hs_capture cap;
+        hs_capture_sent(f.peer_fd, &cap);
+        ASSERT(hs_captured_has_command(&cap, "mempool"));
+        hs_fixture_teardown(&f);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* ── 11. A peer whose version explicitly declares relay=false never gets
  * an outbound "mempool" pull. */
 
@@ -1375,6 +1401,7 @@ int test_net_handshake_adversarial(void)
     failures += test_honest_handshake_completes();
     failures += test_outbound_version_after_transport_bytes();
     failures += test_mempool_requested_once_for_relay_peer();
+    failures += test_mempool_queue_refusal_preserves_retry();
     failures += test_mempool_not_requested_for_non_relay_peer();
     failures += test_mempool_not_requested_during_ibd();
     failures += test_published_build_identity_is_the_baked_source_id();

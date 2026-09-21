@@ -434,12 +434,9 @@ bool msg_tx_maybe_request_mempool(struct msg_processor *mp,
     if (msg_tx_deep_in_ibd())
         return false;
 
-    /* Set the guard before queuing the send so this stays exactly-once
-     * per peer even if the caller somehow re-enters (e.g. a peer that
-     * resends verack). */
-    node->mempool_requested = true;
-
     p2p_node_begin_message(node, "mempool", mp->params->pchMessageStart);
-    p2p_node_end_message(node);
-    return true;
+    bool queued = p2p_node_end_message(node);
+    if (queued)
+        node->mempool_requested = true;
+    return queued;
 }

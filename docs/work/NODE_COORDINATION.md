@@ -1813,3 +1813,25 @@ Consensus impact: NONE; this changes only volatile peer-discovery bookkeeping.
 Worldstream `6c1a99c24` remains complementary on fresh-sync observer boundary
 measurement.  Remaining risk and next investigation: audit the post-handshake
 mempool one-shot guard, then return to measured block/header scheduling costs.
+
+## Mempool one-shot enqueue ownership
+
+Baseline and root cause: the post-handshake mempool pull set
+`mempool_requested=true` and returned success before the empty `mempool` frame
+entered the bounded send queue.  Queue refusal permanently consumed the
+connection's one-shot guard despite sending no request.
+
+Fix and after-result: `msg_tx_maybe_request_mempool` now returns the actual
+enqueue result and advances its guard only after success.  Relay and deep-IBD
+gates are unchanged, so historical synchronization still never competes with
+mempool inventory.
+
+Regression proof: the handshake-adversarial fixture first observed a true
+return and consumed guard at the hard queue ceiling.  It now proves refusal
+leaves the guard clear, then proves a subsequent healthy enqueue sets the guard
+and emits the real wire command.  The complete handshake-adversarial group
+passes normally and under ASan/UBSan.  Consensus impact: NONE; mempool relay policy and transaction validity
+are unchanged.  Worldstream `6c1a99c24` remains complementary on fresh-sync
+observer measurement.  Remaining risk and next investigation: measure the
+active-slot census cost in saturated legacy block assignment before replacing
+its scans with counters.
