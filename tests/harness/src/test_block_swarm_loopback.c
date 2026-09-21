@@ -975,16 +975,20 @@ static int test_snapshot_reconnect_yields_are_independent(void)
         struct p2p_node *old_a = bs_make_peer(&nm, 81);
         struct p2p_node *old_c = bs_make_peer(&nm, 82);
         struct p2p_node *healthy = bs_make_peer(&nm, 83);
+        struct p2p_node *healthy_retry = bs_make_peer(&nm, 84);
         struct p2p_node *new_a = bs_make_peer(&nm, 81);
         struct p2p_node *new_c = bs_make_peer(&nm, 82);
-        ASSERT(old_a && old_c && healthy && new_a && new_c);
+        ASSERT(old_a && old_c && healthy && healthy_retry && new_a && new_c);
         struct send_segment *sent_a = bs_install_sentinel(new_a);
         struct send_segment *sent_c = bs_install_sentinel(new_c);
         struct send_segment *sent_healthy = bs_install_sentinel(healthy);
+        struct send_segment *sent_healthy_retry =
+            bs_install_sentinel(healthy_retry);
         ASSERT(mp_snapshot_test_start_swarm(&manifest));
         ASSERT(mp_snapshot_test_admit_peer(old_a));
         ASSERT(mp_snapshot_test_admit_peer(old_c));
         ASSERT(mp_snapshot_test_admit_peer(healthy));
+        ASSERT(mp_snapshot_test_admit_peer(healthy_retry));
         ASSERT(mp_snapshot_test_admit_peer(new_a));
         ASSERT(mp_snapshot_test_admit_peer(new_c));
 
@@ -995,12 +999,23 @@ static int test_snapshot_reconnect_yields_are_independent(void)
         ASSERT(mp_snapshot_swarm_peer_disconnected(old_a) == 1);
         ASSERT(mp_snapshot_swarm_peer_disconnected(old_c) == 1);
 
-        /* The healthy source receives the first recovered chunk and consumes
-         * only one endpoint's yield. The other replacement remains deferred
-         * until another distinct source has a chance to receive work. */
+        /* A queue-refused alternate received no work, so it cannot consume a
+         * reconnect yield and let its endpoint reclaim the released chunk. */
+        healthy->send_size = net_send_peer_bytes_hard_cap();
         mp_snapshot_send_tick(&mp, healthy);
-        ASSERT(healthy->swarm_inflight_chunk >= 0);
-        ASSERT(bs_queue_depth(sent_healthy) == 1);
+        healthy->send_size = 0;
+        ASSERT(healthy->swarm_inflight_chunk == -1);
+        ASSERT(bs_queue_depth(sent_healthy) == 0);
+        mp_snapshot_send_tick(&mp, new_c);
+        ASSERT(new_c->swarm_inflight_chunk == -1);
+        ASSERT(bs_queue_depth(sent_c) == 0);
+
+        /* A fresh healthy source receives the first recovered chunk and
+         * consumes only one endpoint's yield. The other replacement remains
+         * deferred until another distinct source has a chance to receive work. */
+        mp_snapshot_send_tick(&mp, healthy_retry);
+        ASSERT(healthy_retry->swarm_inflight_chunk >= 0);
+        ASSERT(bs_queue_depth(sent_healthy_retry) == 1);
         mp_snapshot_send_tick(&mp, new_c);
         ASSERT(new_c->swarm_inflight_chunk == -1);
         ASSERT(bs_queue_depth(sent_c) == 0);
@@ -1014,15 +1029,19 @@ static int test_snapshot_reconnect_yields_are_independent(void)
         bs_drop_queue(new_a, sent_a);
         bs_drop_queue(new_c, sent_c);
         bs_drop_queue(healthy, sent_healthy);
+        bs_drop_queue(healthy_retry, sent_healthy_retry);
         send_segment_free(sent_a);
         send_segment_free(sent_c);
         send_segment_free(sent_healthy);
+        send_segment_free(sent_healthy_retry);
         new_a->send_head = new_a->send_tail = NULL;
         new_c->send_head = new_c->send_tail = NULL;
         healthy->send_head = healthy->send_tail = NULL;
+        healthy_retry->send_head = healthy_retry->send_tail = NULL;
         p2p_node_free(old_a);
         p2p_node_free(old_c);
         p2p_node_free(healthy);
+        p2p_node_free(healthy_retry);
         p2p_node_free(new_a);
         p2p_node_free(new_c);
         net_manager_free(&nm);

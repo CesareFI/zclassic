@@ -668,3 +668,7 @@ later lane flips it HARD.
 - 2026-09-21T16:07:57Z — REASON: Preserve snapshot serving cursor and completion state when bounded queues reject data or end frames.
   old ROOT: 3b505205f3aeeb339e5fd96f00bcfe021d4cfa5b770352f7e84959ab877def29
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T16:39:13Z — REASON: Preserve snapshot reconnect yield until zchunkreq enqueue succeeds
+  old ROOT: eeb2ccc16f68be6f7f5e3537183c7eaf43a5a4d9a9a961617a09794844f69f8b
+  by: owner unseal ritual (make core-unseal)

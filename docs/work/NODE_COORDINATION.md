@@ -1989,3 +1989,25 @@ serving state remain unchanged before completing the normal real-wire transfer.
 Consensus impact: NONE. Worldstream `5297c58f4` remains complementary.
 Remaining risk and next investigation: audit snapshot serve state after a
 successful end-frame enqueue followed by immediate disconnect.
+
+## Snapshot reconnect yield after queue refusal
+
+Baseline and root cause: reconnect-source fairness consumed an endpoint's
+yield when the scheduler assigned it a chunk, before the `zchunkreq` frame was
+accepted by the bounded peer queue. A saturated alternate could therefore
+release a reconnecting endpoint without having received any work.
+
+Fix and after-result: the assignment helper now returns the enqueue result and
+consumes one reconnect yield only after a `zchunkreq` frame is accepted. A
+refusal still immediately releases local and authoritative chunk ownership;
+the yield remains until a distinct source actually receives work. State stays
+bounded, volatile, and generation-scoped.
+
+Regression proof: `test_block_swarm_loopback` disconnects two sources, forces
+the healthy alternate's real queue to its hard cap, and proves the reconnecting
+endpoint remains deferred. A fresh healthy source then queues work and
+consumes exactly one yield. Focused real-wire group passes. Consensus impact:
+NONE; no payload, validation, or selection rule changed. Worldstream
+`5297c58f4` remains complementary timeout arithmetic. Remaining risk and next
+investigation: audit snapshot serving state after a successful end-frame
+enqueue followed by immediate disconnect.

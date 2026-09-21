@@ -819,12 +819,16 @@ static bool swarm_queue_chunk_request(
 /* Called with the snapshot swarm lock held. A queue refusal means no peer can
  * answer this assignment, so release both authoritative and local ownership
  * immediately instead of waiting for timeout or disconnect cleanup. */
-static void swarm_queue_assigned_chunk_request(
-    struct msg_processor *mp, struct p2p_node *node, uint32_t chunk_index)
+static bool swarm_queue_assigned_chunk_request(
+    struct msg_processor *mp, struct p2p_node *node, uint32_t chunk_index,
+    int64_t now_monotonic)
 {
     swarm_mutex_unlock();
-    (void)swarm_queue_chunk_request(mp, node, chunk_index);
+    bool queued = swarm_queue_chunk_request(mp, node, chunk_index);
     (void)swarm_mutex_lock();
+    if (queued)
+        swarm_consume_reconnect_yield_locked(node, now_monotonic);
+    return queued;
 }
 
 /* Send a block piece request to a peer. */
@@ -2489,12 +2493,11 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
                                       now_monotonic)) {
             int32_t ci = swarm_sync_assign_chunk(&g_swarm, node->id);
             if (ci >= 0) {
-                swarm_consume_reconnect_yield_locked(node, now_monotonic);
                 node->swarm_inflight_chunk = ci;
                 node->swarm_chunk_req_time =
                     platform_time_monotonic_us() / 1000000;
-                swarm_queue_assigned_chunk_request(
-                    mp, node, (uint32_t)ci);
+                (void)swarm_queue_assigned_chunk_request(
+                    mp, node, (uint32_t)ci, now_monotonic);
             }
         }
 
