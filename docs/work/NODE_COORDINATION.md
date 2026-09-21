@@ -2085,3 +2085,24 @@ Consensus impact: NONE; this changes only volatile request cleanup. Worldstream
 risk: runtime test execution awaits safe build headroom; seal, parity,
 complexity, and capability-inventory gates pass. Next investigation: measure
 snapshot scheduler work under large manifests and repeated reconnects.
+
+## Snapshot global timeout-sweep coalescing
+
+Baseline and root cause: every admitted snapshot peer tick ran the global
+orphan-timeout traversal across the complete manifest. With a large manifest
+and several peers this repeated identical O(chunk-count) work while the exact
+owner timeout path already ran on each peer tick.
+
+Fix and after-result: exact-owner timeout reconciliation remains per tick, but
+the global orphan fallback is now admitted at most once per monotonic second.
+A monotonic regression admits a sweep immediately, so clock accounting cannot
+suppress recovery. This bounds repeated scheduler CPU without changing wire,
+chunk verification, or validation behavior.
+
+Regression proof: `test_fast_sync` deterministically covers first admission,
+same-tick suppression, interval admission, invalid interval refusal, and
+monotonic-regression recovery. Consensus impact: NONE. Worldstream `5297c58f4`
+remains complementary. Remaining risk: execute the cold registered runtime
+group only when disk headroom permits; source syntax, seal, parity, and
+complexity gates pass. Next investigation: quantify scheduler scans under
+large manifest and multi-peer churn.

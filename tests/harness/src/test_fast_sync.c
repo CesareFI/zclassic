@@ -650,6 +650,33 @@ static int test_swarm_timeout_reassign(void)
     return failures;
 }
 
+static int test_swarm_global_timeout_sweep_rate_limit(void)
+{
+    int failures = 0;
+    TEST("swarm global timeout sweep is monotonic and rate limited") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 1;
+        manifest.chunk_size = 500;
+        manifest.chunk_hashes = zcl_calloc(1, 32, "test_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+
+        struct swarm_sync ss;
+        ASSERT(swarm_sync_init(&ss, &manifest, NULL));
+        ASSERT(swarm_sync_timeout_sweep_due(&ss, 100, 1));
+        ASSERT(!swarm_sync_timeout_sweep_due(&ss, 100, 1));
+        ASSERT(!swarm_sync_timeout_sweep_due(&ss, 100, 2));
+        ASSERT(swarm_sync_timeout_sweep_due(&ss, 101, 1));
+        ASSERT(swarm_sync_timeout_sweep_due(&ss, 99, 1));
+        ASSERT(!swarm_sync_timeout_sweep_due(&ss, 99, 0));
+
+        swarm_sync_free(&ss);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_swarm_malformed_response_reassign(void)
 {
     int failures = 0;
@@ -2178,6 +2205,7 @@ int test_fast_sync(void)
     failures += test_sync_manifest_identity();
     failures += test_swarm_init_assign();
     failures += test_swarm_timeout_reassign();
+    failures += test_swarm_global_timeout_sweep_rate_limit();
     failures += test_swarm_malformed_response_reassign();
     failures += test_swarm_disconnect_reassign();
     failures += test_swarm_disconnect_hint_recovery();

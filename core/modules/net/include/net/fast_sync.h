@@ -337,6 +337,7 @@ struct swarm_sync {
     uint32_t next_needed_hint;         /* bounded assignment scan cursor */
     uint64_t assignment_probes;        /* inspected states; test/diagnostic */
     uint64_t disconnect_probes;        /* fallback ownership scans; diagnostic */
+    int64_t last_timeout_sweep_monotonic; /* bounded global-orphan scan */
     const char *datadir;               /* for applying chunks */
 };
 
@@ -380,6 +381,12 @@ int swarm_sync_progress(const struct swarm_sync *ss);
 void swarm_sync_handle_timeouts(struct swarm_sync *ss, int timeout_secs);
 void swarm_sync_handle_timeouts_at(struct swarm_sync *ss, int timeout_secs,
                                    int64_t now_monotonic);
+
+/* Admit at most one global orphan-timeout scan per interval. A monotonic
+ * regression fails open so stale accounting cannot suppress recovery. */
+bool swarm_sync_timeout_sweep_due(struct swarm_sync *ss,
+                                  int64_t now_monotonic,
+                                  int64_t interval_secs);
 
 /* Overflow-safe monotonic deadline predicate shared by both swarm owners. */
 bool fast_sync_timeout_elapsed_at(int64_t now_monotonic,

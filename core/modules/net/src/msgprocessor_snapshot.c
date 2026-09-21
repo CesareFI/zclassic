@@ -159,6 +159,7 @@ static int64_t g_swarm_last_progress_monotonic = 0;
 
 /* Timeout for inflight chunk requests (30 seconds). */
 #define SWARM_CHUNK_TIMEOUT_SECS 30
+#define SWARM_GLOBAL_TIMEOUT_SWEEP_INTERVAL_SECS 1
 
 /* Progress display interval (5 seconds). */
 #define SWARM_PROGRESS_INTERVAL_SECS 5
@@ -2459,6 +2460,17 @@ static bool swarm_reconcile_peer_timeout_locked(struct p2p_node *node,
     return released;
 }
 
+/* Caller holds g_swarm_mutex. Exact-owner recovery runs on every peer tick;
+ * this bounded scan exists only for accounting orphans with no live owner. */
+static void swarm_global_timeout_sweep_locked(int64_t now_monotonic)
+{
+    if (swarm_sync_timeout_sweep_due(
+            &g_swarm, now_monotonic,
+            SWARM_GLOBAL_TIMEOUT_SWEEP_INTERVAL_SECS))
+        swarm_sync_handle_timeouts_at(
+            &g_swarm, SWARM_CHUNK_TIMEOUT_SECS * 2, now_monotonic);
+}
+
 /* Serve the snapshot stream and drive both swarm coordinators. */
 void mp_snapshot_send_tick(struct msg_processor *mp,
                             struct p2p_node *node)
@@ -2486,8 +2498,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
 
         /* Preserve a bounded fallback for a global-only orphan, but give the
          * exact owner a full timeout window to account and yield first. */
-        swarm_sync_handle_timeouts(&g_swarm,
-                                   SWARM_CHUNK_TIMEOUT_SECS * 2);
+        swarm_global_timeout_sweep_locked(now_monotonic);
 
         /* If peer has no inflight chunk, assign the next needed one */
         if (swarm_should_assign_chunk(&g_swarm, node, peer_timed_out,

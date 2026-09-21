@@ -1575,6 +1575,21 @@ void swarm_sync_handle_timeouts(struct swarm_sync *ss, int timeout_secs)
         ss, timeout_secs, platform_time_monotonic_us() / 1000000);
 }
 
+bool swarm_sync_timeout_sweep_due(struct swarm_sync *ss,
+                                  int64_t now_monotonic,
+                                  int64_t interval_secs)
+{
+    if (!ss || interval_secs <= 0)
+        return false;
+    if (ss->last_timeout_sweep_monotonic <= 0 ||
+        now_monotonic < ss->last_timeout_sweep_monotonic ||
+        now_monotonic - ss->last_timeout_sweep_monotonic >= interval_secs) {
+        ss->last_timeout_sweep_monotonic = now_monotonic;
+        return true;
+    }
+    return false;
+}
+
 /* ── Block swarm: BitTorrent-style parallel block download ──── */
 
 void block_piece_hash(const uint8_t (*block_hashes)[32], uint32_t count,

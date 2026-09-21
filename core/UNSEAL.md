@@ -684,3 +684,11 @@ later lane flips it HARD.
 - 2026-09-21T17:31:40Z — REASON: Avoid full snapshot-manifest scans on ordinary peer disconnect while retaining stale-state recovery
   old ROOT: 12850759442b7f639f52c99ba019aa83ecee58d1a77de46d54e3a38e9c8a1760
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:37:59Z — REASON: Rate-limit global snapshot orphan timeout scans without delaying exact-owner recovery
+  old ROOT: 0362e62817f0f63f83e7cd039223b3e33363995c55bda52a914223e472042e72
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:39:20Z — REASON: Refactor authorized snapshot timeout sweep under complexity ratchet
+  old ROOT: acec137c149ecd325770a567e6289b80c8969dec5ec71f050bf696c367a7d0db
+  by: owner unseal ritual (make core-unseal)
