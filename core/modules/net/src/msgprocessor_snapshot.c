@@ -757,6 +757,36 @@ static bool block_swarm_peer_admitted(struct p2p_node *node)
     return admitted;
 }
 
+/* Caller holds g_block_swarm_mutex. Release both local slots and any bounded
+ * authoritative orphan so a peer that loses admission cannot hold the body
+ * window until its ordinary timeout. */
+static size_t block_swarm_release_peer_pieces_locked(struct p2p_node *node)
+{
+    if (!node)
+        return 0;
+    bool active = atomic_load(&g_block_swarm_active);
+    size_t requeued = 0;
+    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+        int32_t piece = node->blk_pipeline[pi].piece_index;
+        if (active && piece >= 0 &&
+            (uint32_t)piece < g_block_swarm.manifest.num_pieces &&
+            block_swarm_requeue_piece_for_peer(
+                &g_block_swarm, (uint32_t)piece, node->id))
+            requeued++;
+        node->blk_pipeline[pi].piece_index = -1;
+        node->blk_pipeline[pi].request_time = 0;
+        node->blk_pipeline[pi].request_time_us = 0;
+    }
+    if (active)
+        for (uint32_t piece = 0; piece < g_block_swarm.manifest.num_pieces;
+             piece++) {
+            if (block_swarm_requeue_piece_for_peer(
+                    &g_block_swarm, piece, node->id))
+                requeued++;
+        }
+    return requeued;
+}
+
 static void block_swarm_clear_peer_admission(struct p2p_node *node)
 {
     pthread_mutex_lock(&g_block_swarm_mutex);
@@ -770,6 +800,7 @@ static void block_swarm_clear_peer_admission(struct p2p_node *node)
             &g_block_swarm, node->blk_bitmap, node->blk_bitmap_len,
             NULL, 0);
     }
+    (void)block_swarm_release_peer_pieces_locked(node);
     node->blk_bitmap_swarm_generation = 0;
     node->blk_manifest_received = false;
     node->blk_manifest_admitted_generation = 0;
@@ -1437,28 +1468,7 @@ size_t mp_block_swarm_peer_disconnected(struct p2p_node *node)
     node->blk_bitmap_swarm_generation = 0;
     node->blk_manifest_received = false;
     node->blk_manifest_admitted_generation = 0;
-    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
-        int32_t piece = node->blk_pipeline[pi].piece_index;
-        if (active && piece >= 0 &&
-            (uint32_t)piece < bs->manifest.num_pieces &&
-            block_swarm_requeue_piece_for_peer(
-                bs, (uint32_t)piece, (int)peer_id))
-            requeued++;
-        node->blk_pipeline[pi].piece_index = -1;
-        node->blk_pipeline[pi].request_time = 0;
-        node->blk_pipeline[pi].request_time_us = 0;
-    }
-    /* Global ownership is authoritative. Normally every owned piece also
-     * has a local pipeline slot, but disconnect is the last safe recovery
-     * boundary for an interrupted or divergent accounting transition. Scan
-     * the bounded manifest so no orphan can retain a dead peer until timeout. */
-    if (active) {
-        for (uint32_t piece = 0; piece < bs->manifest.num_pieces; piece++) {
-            if (block_swarm_requeue_piece_for_peer(
-                    bs, piece, (int)peer_id))
-                requeued++;
-        }
-    }
+    requeued = block_swarm_release_peer_pieces_locked(node);
     if (requeued)
         block_swarm_record_reconnect_yield_locked(
             node, block_swarm_monotonic_seconds());

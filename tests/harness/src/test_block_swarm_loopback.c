@@ -1120,6 +1120,17 @@ static int test_snapshot_inbound_reservation(void)
     return failures;
 }
 
+static bool bs_block_pipeline_empty(const struct p2p_node *node)
+{
+    if (!node)
+        return false;
+    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+        if (node->blk_pipeline[pi].piece_index >= 0)
+            return false;
+    }
+    return true;
+}
+
 static bool bs_repeated_manifest_requires_fresh_bitmap(
     struct bs_seeder *seed, struct p2p_node *serve_node,
     struct send_segment *serve_sent, struct msg_processor *receive_mp,
@@ -1127,6 +1138,10 @@ static bool bs_repeated_manifest_requires_fresh_bitmap(
     const struct chain_params *params, const uint8_t bitmap[5])
 {
     bool ok = true;
+    mp_snapshot_send_tick(receive_mp, receive_node);
+    if (bs_queue_depth(receive_sent) == 0)
+        return false;
+    bs_drop_queue(receive_node, receive_sent);
     serve_node->blk_manifest_sent = false;
     push_block_manifest(&seed->mp, serve_node);
     if (bs_pump(serve_node, serve_sent, receive_mp, receive_node,
@@ -1134,6 +1149,7 @@ static bool bs_repeated_manifest_requires_fresh_bitmap(
         return false;
     if (!receive_node->blk_manifest_received ||
         receive_node->blk_bitmap_swarm_generation != 0 ||
+        !bs_block_pipeline_empty(receive_node) ||
         mp_block_swarm_test_piece_availability(0) != 0)
         return false;
     if (!bs_push_block_bitmap_frame(receive_node, params, 5, bitmap, 5))

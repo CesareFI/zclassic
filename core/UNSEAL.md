@@ -752,3 +752,7 @@ later lane flips it HARD.
 - 2026-09-21T18:44:28Z — REASON: Clear stale block bitmap availability on manifest re-admission
   old ROOT: e631a70a97aa12473ea97bdeae6f372ddfc292595e08cb33d75fc1bb11238b9e
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T18:49:05Z — REASON: Release block swarm ownership when manifest admission resets
+  old ROOT: bf66dabd84646c7173aea42ef8516a14eae96d3796457097393c4933f245edc4
+  by: owner unseal ritual (make core-unseal)

@@ -2407,3 +2407,30 @@ complementary classic-download timeout work. Remaining risk and next
 investigation: verify that malformed manifest handling also promptly releases
 any in-flight block-piece ownership held by a source that has just lost
 admission.
+
+## Block-manifest ownership release
+
+Baseline and root cause: a peer that sent a new malformed or incompatible
+block manifest lost admission, but its already-owned pieces could remain
+in-flight until the ordinary timeout. This held bounded body-window capacity
+after the peer was no longer an eligible manifest source.
+
+Fix and after-result: manifest-admission reset now uses the same bounded
+authoritative ownership cleanup as disconnect handling: it clears local
+pipeline slots in every state and requeues exact owned pieces plus any bounded
+orphan while a swarm is active. A new manifest can only receive fresh work
+after re-admission and a new exact bitmap.
+
+Regression proof: the block-swarm wire fixture establishes in-flight work,
+sends a repeated manifest, and proves all local slots are clear and
+availability is zero before a fresh bitmap restores a single contribution.
+Native C23 syntax, core resealing, consensus parity, complexity, and
+whitespace gates pass. Runtime/ASan remain deferred at 10.72 GB free space:
+the focused runtime target launches a cold package-verifier build and reaches
+the 10 GB safety floor.
+
+Consensus impact: NONE. Only volatile request ownership and availability are
+changed; all manifest/payload checks, reducer admission, block/transaction
+validity, PoW, and chain selection are unchanged. Worldstream `5297c58f4`
+remains complementary. Next investigation: inspect block-manifest attempt-cap
+behavior after malformed responses for recovery without retry starvation.
