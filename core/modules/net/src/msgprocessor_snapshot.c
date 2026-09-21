@@ -307,6 +307,16 @@ static bool block_swarm_peer_response_allowed(
     return requested;
 }
 
+static bool block_swarm_delivery_identity_matches_locked(
+    int32_t start_height, uint32_t num_pieces, uint64_t generation)
+{
+    return atomic_load(&g_block_swarm_active) &&
+        g_block_swarm.piece_states &&
+        g_block_swarm.manifest.start_height == start_height &&
+        g_block_swarm.manifest.num_pieces == num_pieces &&
+        g_block_swarm_generation == generation;
+}
+
 static void block_swarm_advance_generation(void)
 {
     g_block_swarm_generation++;
@@ -762,6 +772,23 @@ bool mp_block_swarm_test_admit_peer(struct p2p_node *node)
         g_block_swarm_generation : 0;
     pthread_mutex_unlock(&g_block_swarm_mutex);
     return admitted;
+}
+
+bool mp_block_swarm_test_restart_manifest(
+    const struct block_piece_manifest *manifest)
+{
+    if (!manifest)
+        return false;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    block_swarm_free(&g_block_swarm);
+    atomic_store(&g_block_swarm_active, false);
+    bool started = block_swarm_init(&g_block_swarm, manifest, NULL);
+    if (started) {
+        block_swarm_advance_generation();
+        atomic_store(&g_block_swarm_active, true);
+    }
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return started;
 }
 
 int64_t mp_block_swarm_test_reaped_monotonic(void)
@@ -1844,16 +1871,15 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                             g_block_swarm.manifest.start_height;
                         const uint32_t swarm_pieces =
                             g_block_swarm.manifest.num_pieces;
+                        const uint64_t swarm_generation =
+                            g_block_swarm_generation;
                         pthread_mutex_unlock(&g_block_swarm_mutex);
                         payloads_accepted = mp_block_payload_submit_all(
                             mp, node, block_refs, block_count);
                         pthread_mutex_lock(&g_block_swarm_mutex);
-                        if (!atomic_load(&g_block_swarm_active) ||
-                            !g_block_swarm.piece_states ||
-                            g_block_swarm.manifest.start_height !=
-                                swarm_start ||
-                            g_block_swarm.manifest.num_pieces !=
-                                swarm_pieces) {
+                        if (!block_swarm_delivery_identity_matches_locked(
+                                swarm_start, swarm_pieces,
+                                swarm_generation)) {
                             LOG_INFO("net",
                                      "zblkdata piece %u: swarm reaped during "
                                      "payload submit; dropping piece credit",

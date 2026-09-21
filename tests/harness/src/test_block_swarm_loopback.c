@@ -90,6 +90,11 @@ bool mp_snapshot_test_chunk_state(uint32_t chunk_index,
                                   int *peer_out,
                                   uint32_t *inflight_out,
                                   uint32_t *complete_out);
+void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
+                                    int64_t last_complete_monotonic);
+bool mp_block_swarm_test_admit_peer(struct p2p_node *node);
+bool mp_block_swarm_test_restart_manifest(
+    const struct block_piece_manifest *manifest);
 
 /* Equihash 200,9 solution length — makes each synthetic block ~1.5 KB, so the
  * measured MB/s reflects realistic block bodies, not empty stubs. */
@@ -109,12 +114,20 @@ struct bs_sink {
     unsigned scope_depth;
     unsigned scope_max_depth;
     bool scope_open;
+    bool restart_swarm_on_submit;
+    bool swarm_restarted;
+    const struct block_piece_manifest *restart_manifest;
 };
 
 static bool bs_block_submit(struct block *b, struct validation_state *out,
                             void *ctx)
 {
     struct bs_sink *sink = ctx;
+    if (sink->restart_swarm_on_submit && !sink->swarm_restarted) {
+        sink->swarm_restarted = true;
+        sink->swarm_restarted = mp_block_swarm_test_restart_manifest(
+            sink->restart_manifest);
+    }
     if (!sink->scope_open)
         sink->submits_outside_scope++;
     if (sink->transient_submit_failures > 0) {
@@ -1181,9 +1194,6 @@ static int test_block_swarm_disconnect_requeue(void)
  * (queue full, flight zero, frontier body never fetched). The watchdog must
  * abandon a completion-silent swarm (and stay off a healthy or finished one). */
 bool mp_block_swarm_reap_if_stalled(struct msg_processor *mp);
-void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
-                                    int64_t last_complete_monotonic);
-bool mp_block_swarm_test_admit_peer(struct p2p_node *node);
 int64_t mp_block_swarm_test_reaped_monotonic(void);
 bool mp_block_swarm_test_restart_ready_at(int64_t now_monotonic,
                                           int64_t reaped_monotonic);
@@ -1690,6 +1700,29 @@ static int test_block_swarm_duplicate_delivery(void)
         ASSERT(sink.blocks == 2 * (uint64_t)BLOCKS_PER_PIECE); /* p0 + p1 */
         ASSERT(sink.scope_begins == 2);       /* duplicate refused pre-intake */
         ASSERT(sink.scope_ends == sink.scope_begins);
+
+        /* Reuse a valid response while body submission synchronously starts a
+         * new same-shape generation. The old response must not credit it. */
+        struct block_piece_manifest restart_manifest;
+        ASSERT(block_piece_manifest_build_active_chain(
+            &seed.ms.chain_active, BS_START_HEIGHT, end_height,
+            &restart_manifest));
+        ASSERT(mp_block_swarm_test_restart_manifest(&restart_manifest));
+        ASSERT(mp_block_swarm_test_admit_peer(b_node));
+        mp_snapshot_send_tick(&mp_b, b_node);
+        ASSERT(bs_queue_depth(sent_b) == 2);
+        bs_drop_queue(b_node, sent_b);
+        sink.restart_swarm_on_submit = true;
+        sink.restart_manifest = &restart_manifest;
+        ASSERT(bs_deliver(&mp_b, b_node, &kept[0], params->pchMessageStart));
+        ASSERT(sink.swarm_restarted);
+        ASSERT(mp_block_swarm_is_active());
+        ASSERT(mp_block_swarm_test_admit_peer(b_node));
+        mp_snapshot_send_tick(&mp_b, b_node);
+        ASSERT(bs_queue_depth(sent_b) == 2);
+        bs_drop_queue(b_node, sent_b);
+        mp_block_swarm_test_seed_stall(0, 0, 0);
+        block_piece_manifest_free(&restart_manifest);
 
         free(kept[0].data);
         free(kept[1].data);

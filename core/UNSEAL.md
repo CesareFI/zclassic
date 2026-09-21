@@ -496,3 +496,7 @@ later lane flips it HARD.
 - 2026-09-21T06:23:35Z — REASON: Reject block-piece bodies not owned by the admitted peer pipeline before parsing; transport scheduling only, consensus unchanged
   old ROOT: 574b7ac4056a179ccaf6c10fe4c24b98ce71cfdacc68cc3aa6af8faa0a8d9cfb
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T06:46:28Z — REASON: Bind block-piece credit to the exact swarm generation across unlocked body submission; request accounting only, consensus unchanged
+  old ROOT: a2609d3f108a0a253c8da6da2510caebc67e507703170d6592b3cf91309e649c
+  by: owner unseal ritual (make core-unseal)

@@ -829,3 +829,31 @@ requested blocks retain identical validation. Worldstream remains at
 Remaining risk and next investigation: add per-peer block-swarm delivery and
 timeout observations, then use measured outcomes to decide whether scheduling
 should adapt without allowing peer starvation.
+
+## Bind post-submit piece credit to the swarm generation
+
+Baseline: block-piece handling deliberately releases the swarm mutex while up
+to 64 canonical block bodies enter the bounded reducer intake. On reacquiring
+the mutex it checked only swarm activity, start height, and piece count. A new
+swarm with the same shape could therefore receive completion credit from the
+old response. The exact-manifest source admission fix did not cover this
+unlocked submission window.
+
+Root cause: the receive path captured manifest shape but not the monotonic
+swarm generation. It now captures the generation under the mutex and requires
+it to remain identical before crediting the piece. The existing fail-safe path
+leaves the new generation's piece needed for retry; already submitted bodies
+remain subject to canonical validation and are not claimed as swarm progress.
+
+After-result and regression proof: the block-submit fixture synchronously
+restarts an exact same-manifest swarm during the unlocked callback. The old
+response is logged as stale, receives no completion credit, and the subsequent
+send tick requests both pieces of the new generation. The full framed suite
+passes, including 2,560 blocks at 31,961 blocks/s (47.2 MB/s).
+
+Consensus impact: none. This tightens transport completion accounting only;
+the reducer and all block validity predicates remain unchanged. Worldstream
+remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: expose bounded per-peer piece delivery
+and timeout observations before considering any adaptive scheduling policy.
