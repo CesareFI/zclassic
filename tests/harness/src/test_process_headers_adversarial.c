@@ -522,6 +522,17 @@ int test_process_headers_adversarial(void)
                          a.push_getheaders_span_suppressed_snapshot + 1);
         }
 
+        /* A bounded-queue refusal must be observable by range ownership
+         * callers; otherwise an unsent span remains assigned until timeout. */
+        {
+            node.send_size = net_send_peer_bytes_hard_cap();
+            atomic_store(&node.disconnect, false);
+            bool sent = push_getheaders_span(&mp3, &node, &gh, NULL);
+            node.send_size = 0;
+            PH_CHECK("push_getheaders_span: queue refusal reported",
+                     !sent);
+        }
+
         /* (d) process_getheaders: request deferred while we are serving a
          *     snapshot to this peer — counted (was a bare printf). */
         {

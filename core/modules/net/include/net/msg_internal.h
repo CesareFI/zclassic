@@ -306,7 +306,7 @@ void exec_getheaders_action(struct msg_processor *mp,
  * path untouched — when the conditions don't hold, so single-peer sync
  * behaves exactly as before. Never fires while a header-band hole is open
  * (the band backfill owns the anchor then). */
-void push_getheaders_span(struct msg_processor *mp, struct p2p_node *node,
+bool push_getheaders_span(struct msg_processor *mp, struct p2p_node *node,
                           const struct uint256 *start_hash,
                           const struct uint256 *stop_hash);
 bool msg_range_continuation_stop(struct msg_processor *mp,

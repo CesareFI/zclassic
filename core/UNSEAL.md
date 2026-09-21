@@ -564,3 +564,7 @@ later lane flips it HARD.
 - 2026-09-21T09:38:46Z — REASON: Release snapshot chunk ownership when its request cannot enter the bounded send queue; transport scheduling only, consensus unchanged
   old ROOT: 24737b9af6cd205f57a4de84ee6399f6ea3cf9a93bb0722c2631ecf5b9a1c82c
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T09:44:25Z — REASON: Release header-range ownership when bounded getheaders enqueue fails; transport scheduling only, consensus unchanged
+  old ROOT: e3af2a02f939e6b8a21fd943a70974bd6d8cf504543dbc38eb28c06e7f786d9f
+  by: owner unseal ritual (make core-unseal)

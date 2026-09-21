@@ -1345,3 +1345,31 @@ and proofs retain their existing validation. Worldstream remains at
 Remaining risk and next investigation: audit other request helpers that ignore
 the common bounded-queue result, prioritizing header/body IBD requests whose
 accounting is committed before enqueue and can starve healthy peers.
+
+## Release unsent parallel header ranges
+
+Baseline and root cause: `msg_try_range_parallel_getheaders` assigned a
+checkpoint-bounded span before calling `push_getheaders_span`, whose void API
+discarded serialization and bounded send-queue failure. A non-draining peer
+could therefore own a range for the full deadline even though no request was
+queued, delaying another healthy header source.
+
+Fix: `push_getheaders_span` now reports whether the framed request entered the
+peer queue. The range driver releases only that peer's assigned span on failure
+and returns to the ordinary header path. A small helper contains send/release
+and observability together, preserving the existing complexity ratchet.
+
+After-result and regression proof: the adversarial header regression fills the
+peer queue to its hard cap and observes a false result for the refused span
+request. `process_headers_adversarial` and all 14 pure header-range scheduler
+cases pass, including empty, truncated, disconnect, timeout, cross-peer sweep,
+continuation, and reassignment behavior.
+
+Consensus impact: NONE. Header parsing, PoW, chain selection, and validity are
+unchanged; this only frees transport ownership for an unsent request.
+Worldstream remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: checkpoint-header fetch and
+header-serve repair use the same now-observable send result but still consume
+their retry throttle when enqueue fails; make those isolated retry gates
+failure-aware without changing range scheduling.
