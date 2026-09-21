@@ -676,3 +676,7 @@ later lane flips it HARD.
 - 2026-09-21T16:56:54Z — REASON: Maintain bounded inbound block-download occupancy counter
   old ROOT: d94f1adac5689216cfc1e0683b5a1a39933d94de1edb86972517cc7e03e9d7cc
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:09:48Z — REASON: Release header span when anchor resolution fails
+  old ROOT: 90c0d939a4051133bc01a2e5cc8ee0fb417e5f5201b857e2cd3fe3abcaf6b5d9
+  by: owner unseal ritual (make core-unseal)

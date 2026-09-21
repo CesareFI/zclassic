@@ -2392,8 +2392,10 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
     }
 
     struct uint256 start_hash, stop_hash;
-    if (!hrs_resolve_anchor_hash(mp, lo, our_height, &start_hash))
+    if (!hrs_resolve_anchor_hash(mp, lo, our_height, &start_hash)) {
+        (void)hrs_release_peer(sched, node->id);
         return false;       /* cannot anchor — fall back */
+    }
     bool have_stop = hrs_resolve_anchor_hash(mp, hi, our_height, &stop_hash);
 
     return hrs_send_assigned_span(
