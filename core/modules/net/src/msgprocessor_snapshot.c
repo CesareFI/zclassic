@@ -579,6 +579,28 @@ static void block_swarm_credit_verified_piece_locked(
     }
 }
 
+/* Caller holds g_block_swarm_mutex.  A response may have been admitted before
+ * parsing, then superseded by timeout or disconnect recovery.  Only the
+ * current owner may release a piece or trigger the integrity fallback. */
+static bool block_swarm_reject_invalid_piece_locked(
+    struct p2p_node *node, uint32_t piece_index,
+    struct block_swarm_abandonment *abandoned_out)
+{
+    bool failed_owner = block_swarm_requeue_piece_for_peer(
+        &g_block_swarm, piece_index, node->id);
+    if (!failed_owner) {
+        LOG_INFO("net", "zblkdata piece %u: late invalid response cannot "
+                 "revoke reassigned owner", piece_index);
+        return false;
+    }
+
+    g_block_swarm.pieces_failed++;
+    return mp_block_swarm_abandon_locked(
+        &g_block_swarm, &g_block_swarm_active,
+        &g_block_swarm_reaped_monotonic,
+        platform_time_monotonic_us() / 1000000, abandoned_out);
+}
+
 static bool block_swarm_admit_manifest_source(
     struct p2p_node *node, const struct block_piece_manifest *manifest,
     const char *datadir, int32_t completed_height, bool allow_start,
@@ -2316,24 +2338,13 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                                  "after local payload intake backpressure",
                                  piece_index);
                     } else {
-                        block_swarm_fail_piece(&g_block_swarm, piece_index);
                         fprintf(stderr, "Peer %s: block piece %u failed verification\n",  // obs-ok:helper-context-logged
                                node->addr_name, piece_index);
                         peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_CHUNK,
                                             "bad block piece hash");
-                        /* The manifest-bound piece hash is a cryptographic
-                         * identity check: this response is disproven, though a
-                         * different peer could still serve a valid response.
-                         * C3 measured 3,114 retries across 62 pieces followed
-                         * by the full 90 s silent-stall wait. Fail closed on
-                         * this swarm session and arm its anti-flap cooldown;
-                         * safe legacy getdata resumes and every block still
-                         * traverses the canonical reducer. */
-                        did_abandon_integrity = mp_block_swarm_abandon_locked(
-                            &g_block_swarm, &g_block_swarm_active,
-                            &g_block_swarm_reaped_monotonic,
-                            platform_time_monotonic_us() / 1000000,
-                            &integrity_abandoned);
+                        did_abandon_integrity =
+                            block_swarm_reject_invalid_piece_locked(
+                                node, piece_index, &integrity_abandoned);
                     }
                     pthread_mutex_unlock(&g_block_swarm_mutex);
                     if (did_abandon_integrity) {

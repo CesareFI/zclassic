@@ -732,3 +732,7 @@ later lane flips it HARD.
 - 2026-09-21T18:10:11Z — REASON: Harden block swarm peer timeout yield against signed monotonic timestamp overflow
   old ROOT: a86f11b52c7763eadd929825e16d220eba982c3f58a6ac165988526ea64d08c4
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T18:14:00Z — REASON: Preserve reassigned block-swarm ownership against late invalid responses
+  old ROOT: e0a48ce7e693767100a6d0cafc833f08930a4f3ba395f3b2f7755149276e202b
+  by: owner unseal ritual (make core-unseal)

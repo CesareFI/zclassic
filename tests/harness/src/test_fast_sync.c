@@ -1060,6 +1060,37 @@ static int test_block_swarm_rarest_first(void)
     return failures;
 }
 
+static int test_block_swarm_late_owner_cannot_requeue(void)
+{
+    int failures = 0;
+    TEST("block_swarm late owner cannot revoke reassigned piece") {
+        struct block_piece_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.start_height = 1;
+        manifest.end_height = BLOCKS_PER_PIECE;
+        manifest.num_pieces = 1;
+        manifest.piece_hashes = zcl_calloc(1, 32, "test_piece_hashes");
+        ASSERT(manifest.piece_hashes != NULL);
+
+        struct block_swarm bs;
+        ASSERT(block_swarm_init(&bs, &manifest, NULL));
+        ASSERT(block_swarm_assign_piece(&bs, 11, NULL, 0) == 0);
+        ASSERT(block_swarm_requeue_piece_for_peer(&bs, 0, 11));
+        ASSERT(block_swarm_assign_piece(&bs, 22, NULL, 0) == 0);
+
+        /* A late invalid response from 11 must not release B's work. */
+        ASSERT(!block_swarm_requeue_piece_for_peer(&bs, 0, 11));
+        ASSERT(bs.piece_states[0] == CHUNK_INFLIGHT);
+        ASSERT(bs.piece_peer[0] == 22);
+        ASSERT(bs.pieces_inflight == 1);
+
+        block_swarm_free(&bs);
+        free(manifest.piece_hashes);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_block_manifest_identity(void)
 {
     int failures = 0;
@@ -2331,6 +2362,7 @@ int test_fast_sync(void)
     /* Block swarm */
     failures += test_block_manifest_identity();
     failures += test_block_swarm_rarest_first();
+    failures += test_block_swarm_late_owner_cannot_requeue();
     failures += test_block_swarm_endgame();
     failures += test_block_swarm_sparse_bitmap_assignment();
     failures += test_block_swarm_bitmap();

@@ -2244,3 +2244,23 @@ manifest/payload verification and all chain validation are untouched.
 Worldstream `5297c58f4` remains complementary. Remaining risk: reconnect
 yield records are deliberately bounded to 32 endpoints; measure real churn
 before changing that policy.
+
+## Late invalid block-piece ownership
+
+Baseline and root cause: `zblkdata` admission precedes payload parsing outside
+the block-swarm mutex. A timeout or disconnect could reassign a piece while a
+former owner's invalid response was decoded; the old failure path then
+requeued the replacement and abandoned its healthy swarm session.
+
+Fix and after-result: invalid responses remain peer-scored, but only a sender
+that is still the authoritative owner can release the piece, increment failure
+state, or invoke the integrity fallback. A late invalid response is logged and
+cannot revoke the replacement. The deterministic A-to-B reassignment
+regression proves the former owner cannot requeue B's in-flight piece.
+
+Consensus impact: NONE. This changes volatile transport ownership only; the
+existing manifest hash, payload parsing, canonical reducer, and all block and
+transaction validation remain unchanged. Worldstream remains complementary.
+Remaining risk: runtime wire execution awaits safe disk headroom; C23 syntax,
+complexity, sealing, parity, and generated-inventory gates are required before
+publication.
