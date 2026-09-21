@@ -391,3 +391,29 @@ fetched tree contains no `docs/work/NODE_COORDINATION.md`; there is no overlap.
 Remaining risk and next investigation: build a direct wire-level truncated
 `zchunkdata` fixture, then inspect snapshot manifest competition for peer
 diversity and prompt failover when the single manifest source disappears.
+
+## Preserve reassigned snapshot work during stale timeout cleanup
+
+The global snapshot timeout sweep can requeue peer A's chunk and a healthy peer
+B can claim it before A's next send tick. A's stale peer-local slot then saw
+only `CHUNK_INFLIGHT` and unconditionally reset the chunk, revoking B's live
+request and decrementing shared accounting.
+
+Peer-local timeout cleanup now uses the same ownership-checked requeue primitive
+as malformed-response and disconnect recovery. A stale slot is cleared locally,
+but shared state changes only while that peer remains the recorded owner.
+
+The deterministic regression times out A, immediately assigns the chunk to B,
+then runs A's ownership cleanup without advancing time and proves B retains the
+in-flight chunk and accounting. The four-group fast-sync suite passed normally
+and under ASan/UBSan. Core seal/root mirror, consensus parity, generated
+capability inventory, whitespace, and cyclomatic complexity passed; the latter
+ratcheted `mp_snapshot_send_tick` downward from M=29 to M=27 (55,565 functions
+scanned).
+
+Consensus impact: none. Only snapshot request ownership/accounting changes;
+all chunk, snapshot, block, transaction, and cryptographic validation is
+unchanged. Worldstream remains at `0b29bec27` with no overlap.
+
+Remaining risk and next investigation: add the direct truncated-wire fixture,
+then audit invalid chunk-hash retry accounting for the same ownership invariant.

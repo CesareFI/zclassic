@@ -1779,12 +1779,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
             int64_t now_sw = platform_time_monotonic_us() / 1000000;
             if (now_sw - node->swarm_chunk_req_time > SWARM_CHUNK_TIMEOUT_SECS) {
                 uint32_t ci = (uint32_t)node->swarm_inflight_chunk;
-                if (ci < g_swarm.manifest.num_chunks &&
-                    g_swarm.chunk_states[ci] == CHUNK_INFLIGHT) {
-                    g_swarm.chunk_states[ci] = CHUNK_NEEDED;
-                    g_swarm.chunk_peer[ci] = -1;
-                    if (g_swarm.chunks_inflight > 0)
-                        g_swarm.chunks_inflight--;
+                if (swarm_sync_requeue_chunk_for_peer(
+                        &g_swarm, ci, node->id)) {
                     printf("Peer %s: chunk %u timed out, re-queuing\n",
                            node->addr_name, ci);
                 }

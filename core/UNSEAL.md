@@ -412,3 +412,7 @@ later lane flips it HARD.
 - 2026-09-21T00:42:39Z — REASON: Immediately requeue snapshot swarm chunks owned by a disconnected peer; scheduling recovery only, no consensus or validation semantic change
   old ROOT: 0925ea8ff0c0145779f3f3b4b951daf054ef9e2044da90653f413fbe55e9632f
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T01:04:13Z — REASON: Prevent stale peer-local snapshot timeout cleanup from revoking a chunk already reassigned to a healthy peer; scheduling only, no consensus semantic change
+  old ROOT: 2faa6ee45a426d8364e37b6fb4a8b6d360f2bf94479e829fd0224a373cc213b8
+  by: owner unseal ritual (make core-unseal)

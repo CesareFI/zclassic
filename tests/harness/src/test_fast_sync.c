@@ -676,6 +676,35 @@ static int test_swarm_disconnect_reassign(void)
     return failures;
 }
 
+static int test_swarm_stale_timeout_preserves_new_owner(void)
+{
+    int failures = 0;
+    TEST("stale peer timeout cannot revoke a chunk reassigned to a healthy peer") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 1;
+        manifest.chunk_size = 500;
+        manifest.chunk_hashes = zcl_calloc(1, 32, "test_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+
+        struct swarm_sync ss;
+        ASSERT(swarm_sync_init(&ss, &manifest, NULL));
+        ASSERT(swarm_sync_assign_chunk(&ss, 11) == 0);
+        ss.chunk_request_time[0] = 1;
+        swarm_sync_handle_timeouts_at(&ss, 30, 100);
+        ASSERT(swarm_sync_assign_chunk(&ss, 22) == 0);
+        ASSERT(!swarm_sync_requeue_chunk_for_peer(&ss, 0, 11));
+        ASSERT(ss.chunk_states[0] == CHUNK_INFLIGHT);
+        ASSERT(ss.chunk_peer[0] == 22);
+        ASSERT(ss.chunks_inflight == 1);
+
+        swarm_sync_free(&ss);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_swarm_timeout_monotonic_boundaries(void)
 {
     int failures = 0;
@@ -1972,6 +2001,7 @@ int test_fast_sync(void)
     failures += test_swarm_timeout_reassign();
     failures += test_swarm_malformed_response_reassign();
     failures += test_swarm_disconnect_reassign();
+    failures += test_swarm_stale_timeout_preserves_new_owner();
     failures += test_swarm_timeout_monotonic_boundaries();
 
     /* Block swarm */
