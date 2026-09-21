@@ -2264,3 +2264,22 @@ transaction validation remain unchanged. Worldstream remains complementary.
 Remaining risk: runtime wire execution awaits safe disk headroom; C23 syntax,
 complexity, sealing, parity, and generated-inventory gates are required before
 publication.
+
+## Superseded verified block-piece intake
+
+Baseline and root cause: a `zblkdata` response can pass its initial ownership
+admission, then lose ownership while its payload is parsed outside the swarm
+mutex. The prior path still submitted that stale but hash-valid payload to the
+reducer before later dropping its completion credit.
+
+Fix and after-result: the mutex-held pre-submit check now requires current
+in-flight ownership as well as a verified payload. Superseded responses are
+dropped before reducer intake; current owners retain the existing submission
+and canonical validation path. The existing A-to-B ownership regression covers
+the authoritative reassignment predicate used by this gate.
+
+Consensus impact: NONE. This reduces redundant transport/reducer work only;
+manifest hashes, payload verification, block and transaction validity, PoW,
+and chain selection are unchanged. Worldstream remains complementary.
+Remaining risk: a genuine runtime wire/sanitizer execution remains deferred to
+protect the 11 GB disk headroom.
