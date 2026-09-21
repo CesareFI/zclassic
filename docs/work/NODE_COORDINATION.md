@@ -2508,3 +2508,39 @@ validation, checkpoint anchoring, chain selection, blocks, transactions, PoW,
 and cryptographic validation are unchanged. Worldstream `5297c58f4` remains
 complementary. Next investigation: examine whether changing a peer's advertised
 height between range-planning ticks can unnecessarily discard live spans.
+
+## Sole-source legacy-download retry
+
+Baseline and root cause: after a timed-out body request, the legacy downloader
+correctly put that hash on a short avoid interval for the former owner so a
+healthy alternate peer could claim it. When that owner was the only live
+eligible source, the ordinary assignment path also honored the avoid interval,
+leaving the body idle despite having no alternate source to protect. The
+download manager cannot determine live source diversity itself; only the node
+manager owns the authoritative connected-peer set.
+
+Fix and after-result: immediately before planning a body batch, the message
+processor now checks the live peer set under its node lock using the existing
+block-assignment eligibility predicate. With no eligible alternative it clears
+only that requester's bounded active avoid marks, advances the queue generation
+that invalidates its parked cooldown result, and retries normally. If the node
+manager is unavailable or an eligible alternative exists, the avoid interval is
+preserved. The existing alternate-peer regression remains the failover proof.
+
+Regression proof: a deterministic downloader test times out peer 1's request,
+proves its avoid state blocks a retry, releases that peer's active avoidance,
+then proves the exact hash returns to peer 1 in flight and a second release is
+a no-op. Native C23 syntax passes for both changed production units. The
+registered runtime/ASan target remains disk-gated at 10 GB free: its cold
+verifier build would cross the repository safety floor. The full test source
+also retains two pre-existing missing test-helper declarations in unrelated
+gap-fill tests, so standalone syntax of that aggregate source cannot be used
+as a regression signal.
+
+Consensus impact: NONE. This only changes bounded GETDATA retry scheduling;
+header and block validation, payload serialization, reducer admission,
+transaction validity, PoW, and chain selection remain unchanged. Worldstream
+`d9f5153be` remains complementary fresh-sync/startup work. Remaining risk:
+the one-tick live-peer scan is intentionally linear in the bounded connected
+peer set; next investigate whether reconnect churn can cause snapshot manifest
+source diversity to be discarded before a replacement advertisement arrives.

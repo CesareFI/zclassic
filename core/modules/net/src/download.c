@@ -1235,6 +1235,27 @@ bool dl_assignment_should_attempt(struct download_manager *dm,
     return should_attempt;
 }
 
+size_t dl_release_peer_avoidance(struct download_manager *dm,
+                                 uint32_t peer_id)
+{
+    if (!dm)
+        return 0;
+    zcl_mutex_lock(&dm->cs);
+    size_t released = 0;
+    int64_t now = dl_now_monotonic_seconds();
+    for (size_t i = 0; i < dm->queue_len; i++) {
+        if (dm->queue_avoid_peers[i] == peer_id &&
+            dl_peer_avoid_active(dm->queue_avoid_until[i], now)) {
+            dm->queue_avoid_until[i] = 0;
+            released++;
+        }
+    }
+    if (released)
+        dl_generation_advance(&dm->queue_generation);
+    zcl_mutex_unlock(&dm->cs);
+    return released;
+}
+
 /* S2.3: best known bandwidth_score among other actively-tracked,
  * non-loopback peers. Used only to decide whether *this* requester is
  * demonstrably slower than some other known peer, gating the tip-adjacent

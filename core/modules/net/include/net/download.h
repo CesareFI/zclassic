@@ -489,6 +489,12 @@ size_t dl_assign_to_peer(struct download_manager *dm,
 bool dl_assignment_should_attempt(struct download_manager *dm,
                                   uint32_t peer_id);
 
+/* Clear active avoid marks for one peer's queued blocks. Call only when the
+ * caller has authoritatively established that no eligible alternate source
+ * exists; returns the bounded number of entries released. */
+size_t dl_release_peer_avoidance(struct download_manager *dm,
+                                 uint32_t peer_id);
+
 /* K2: mark a peer as loopback so dl_assign_to_peer uses
  * DL_MAX_IN_FLIGHT_PER_LOOPBACK and bypasses bandwidth-score scaling.
  * Caller-set (the download manager doesn't see net addresses). Idempotent. */

@@ -2425,6 +2425,33 @@ static void msg_queue_keepalive_ping(struct msg_processor *mp,
 
 /* ── msg_send_messages: per-peer trickle ─────────────────────── */
 
+static void msg_release_sole_source_avoidance(struct msg_processor *mp,
+                                              struct download_manager *dm,
+                                              const struct p2p_node *node,
+                                              int our_height)
+{
+    /* Only the node manager can tell whether a different live source is
+     * eligible. Retain the manager's avoid interval when that authority is
+     * unavailable. */
+    if (!mp || !mp->net_mgr || !dm || !node)
+        return;
+
+    bool alternate = false;
+    zcl_mutex_lock(&mp->net_mgr->cs_nodes);
+    for (size_t pi = 0; pi < mp->net_mgr->num_nodes; pi++) {
+        struct p2p_node *candidate = mp->net_mgr->nodes[pi];
+        if (candidate && candidate != node && !candidate->disconnect &&
+            candidate->state >= PEER_HANDSHAKE_COMPLETE &&
+            !syncsvc_peer_is_behind(candidate, our_height)) {
+            alternate = true;
+            break;
+        }
+    }
+    zcl_mutex_unlock(&mp->net_mgr->cs_nodes);
+    if (!alternate)
+        (void)dl_release_peer_avoidance(dm, (uint32_t)node->id);
+}
+
 bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
 {
     struct msg_processor *mp = (struct msg_processor *)ctx;
@@ -2826,6 +2853,7 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
                 memset(&batch, 0, sizeof(batch));
                 msg_processor_log_block_intake_backpressure(node);
             } else {
+                msg_release_sole_source_avoidance(mp, dm, node, our_height);
                 syncsvc_assign_peer_blocks(&batch, dm, node, assign_hashes,
                                            assign_room, our_height);
             }

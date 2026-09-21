@@ -764,3 +764,7 @@ later lane flips it HARD.
 - 2026-09-21T19:06:09Z — REASON: saturate untrusted header range gap arithmetic
   old ROOT: 3bd3def12e23d1dab88a739cfdc8067ea3f2598daff0790ff86d8702ae718cda
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T19:13:15Z — REASON: allow sole eligible source to retry avoided block requests
+  old ROOT: 49b80c627d1394151d57173d9203a98fd74d615cd60659fa1b67cf2fae2735dd
+  by: owner unseal ritual (make core-unseal)

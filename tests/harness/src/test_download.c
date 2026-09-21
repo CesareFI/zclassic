@@ -1252,6 +1252,35 @@ static int test_dl_timeout_retry_avoid_expiry(void)
     return failures;
 }
 
+static int test_dl_timeout_retry_sole_source(void)
+{
+    int failures = 0;
+    TEST("sole source may immediately retry an avoided timed-out block") {
+        struct download_manager dm;
+        dl_init(&dm);
+
+        struct uint256 h1 = make_hash(7);
+        int64_t now = platform_time_monotonic_us() / 1000000;
+        int timeout = dl_get_request_timeout_secs();
+        ASSERT(dl_mark_requested(&dm, &h1, 153, 1));
+        ASSERT(dl_check_timeouts(&dm, now + timeout + 1) == 1);
+
+        struct uint256 out[1];
+        ASSERT(dl_assign_to_peer(&dm, 1, out, 1) == 0);
+        ASSERT(!dl_assignment_should_attempt(&dm, 1));
+        ASSERT(dl_release_peer_avoidance(&dm, 1) == 1);
+        ASSERT(dl_assignment_should_attempt(&dm, 1));
+        ASSERT(dl_assign_to_peer(&dm, 1, out, 1) == 1);
+        ASSERT(uint256_eq(&out[0], &h1));
+        ASSERT(dl_is_in_flight(&dm, &h1));
+        ASSERT(dl_release_peer_avoidance(&dm, 1) == 0);
+
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_dl_peer_avoid_fails_open_after_clock_rollback(void)
 {
     int failures = 0;
@@ -2461,6 +2490,7 @@ int test_download(void)
     failures += test_dl_timeout_retry_failover();
     failures += test_dl_timeout_retry_failover_peer_zero();
     failures += test_dl_timeout_retry_avoid_expiry();
+    failures += test_dl_timeout_retry_sole_source();
     failures += test_dl_peer_avoid_fails_open_after_clock_rollback();
     failures += test_dl_peer_body_progress();
     failures += test_dl_peer_body_staleness();
