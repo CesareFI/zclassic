@@ -339,6 +339,9 @@ struct swarm_sync {
     uint64_t disconnect_probes;        /* fallback ownership scans; diagnostic */
     uint64_t timeout_probes;           /* timeout scan states; diagnostic */
     int64_t last_timeout_sweep_monotonic; /* bounded global-orphan scan */
+    int64_t timeout_scan_after_monotonic; /* earliest known expiry */
+    int64_t last_timeout_scan_monotonic;  /* regression-safe scan epoch */
+    int timeout_scan_timeout_secs;        /* deadline's timeout policy */
     const char *datadir;               /* for applying chunks */
 };
 

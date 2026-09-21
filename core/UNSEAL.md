@@ -696,3 +696,11 @@ later lane flips it HARD.
 - 2026-09-21T17:41:36Z — REASON: Skip empty snapshot timeout sweeps while preserving in-flight timeout recovery
   old ROOT: 12cd02ccc4111211fce9cfe721ccf0421e25c04a3677e44d087398ce02fb5507
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:45:27Z — REASON: Avoid premature nonempty snapshot timeout scans while preserving earliest expiry recovery
+  old ROOT: bec3887d887e8f640ca254946ddda9814d9e1bc4db45d4c04e84ddfcb3b6e96b
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:47:10Z — REASON: Refactor authorized snapshot timeout deadline arithmetic under complexity ratchet
+  old ROOT: dbf236028970af19bdef4ea3fab4f429a01d74a3ca144ace1fa38c29ee20f87a
+  by: owner unseal ritual (make core-unseal)

@@ -679,6 +679,39 @@ static int test_swarm_empty_timeout_sweep(void)
     return failures;
 }
 
+static int test_swarm_timeout_deadline_skips_early_scan(void)
+{
+    int failures = 0;
+    TEST("swarm timeout deadline skips early scan and reclaims at expiry") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 2;
+        manifest.chunk_size = 500;
+        manifest.chunk_hashes = zcl_calloc(2, 32, "test_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+
+        struct swarm_sync ss;
+        ASSERT(swarm_sync_init(&ss, &manifest, NULL));
+        ASSERT(swarm_sync_assign_chunk(&ss, 11) == 0);
+        ss.chunk_request_time[0] = 100;
+        swarm_sync_handle_timeouts_at(&ss, 30, 120);
+        ASSERT(ss.timeout_probes == manifest.num_chunks);
+        ASSERT(ss.timeout_scan_after_monotonic == 131);
+        swarm_sync_handle_timeouts_at(&ss, 30, 125);
+        ASSERT(ss.timeout_probes == manifest.num_chunks);
+        ASSERT(ss.chunks_inflight == 1);
+        swarm_sync_handle_timeouts_at(&ss, 30, 131);
+        ASSERT(ss.timeout_probes == manifest.num_chunks * 2);
+        ASSERT(ss.chunks_inflight == 0);
+        ASSERT(ss.chunk_states[0] == CHUNK_NEEDED);
+
+        swarm_sync_free(&ss);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_swarm_global_timeout_sweep_rate_limit(void)
 {
     int failures = 0;
@@ -2235,6 +2268,7 @@ int test_fast_sync(void)
     failures += test_swarm_init_assign();
     failures += test_swarm_timeout_reassign();
     failures += test_swarm_empty_timeout_sweep();
+    failures += test_swarm_timeout_deadline_skips_early_scan();
     failures += test_swarm_global_timeout_sweep_rate_limit();
     failures += test_swarm_malformed_response_reassign();
     failures += test_swarm_disconnect_reassign();

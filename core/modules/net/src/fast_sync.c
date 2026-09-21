@@ -1388,6 +1388,7 @@ int32_t swarm_sync_assign_chunk(struct swarm_sync *ss, int peer_id)
             ss->chunk_peer[i] = peer_id;
             ss->chunk_request_time[i] = platform_time_monotonic_us() / 1000000;
             ss->chunks_inflight++;
+            ss->timeout_scan_after_monotonic = 0;
             ss->next_needed_hint = i + 1 == n ? 0 : i + 1;
             return (int32_t)i;
         }
@@ -1418,6 +1419,7 @@ bool swarm_sync_requeue_chunk_for_peer(struct swarm_sync *ss,
     ss->chunk_states[chunk_index] = CHUNK_NEEDED;
     ss->chunk_peer[chunk_index] = -1;
     ss->chunk_request_time[chunk_index] = 0;
+    ss->timeout_scan_after_monotonic = 0;
     if (ss->chunks_inflight > 0)
         ss->chunks_inflight--;
     return true;
@@ -1489,6 +1491,7 @@ bool swarm_sync_receive_chunk(struct swarm_sync *ss,
         swarm_sync_hint_needed(ss, idx);
         ss->chunk_states[idx] = CHUNK_NEEDED;
         ss->chunk_peer[idx] = -1;
+        ss->timeout_scan_after_monotonic = 0;
         if (ss->chunks_inflight > 0)
             ss->chunks_inflight--;
         LOG_FAIL("sync", "receive_chunk: chunk %u hash mismatch from peer %d (retry %d/5)",
@@ -1511,6 +1514,7 @@ bool swarm_sync_receive_chunk(struct swarm_sync *ss,
                 ss->chunk_states[idx] = CHUNK_NEEDED;
             }
             ss->chunk_peer[idx] = -1;
+            ss->timeout_scan_after_monotonic = 0;
             if (ss->chunks_inflight > 0)
                 ss->chunks_inflight--;
             LOG_FAIL("sync", "receive_chunk: chunk %u apply failed (retry %d/5)",
@@ -1520,6 +1524,7 @@ bool swarm_sync_receive_chunk(struct swarm_sync *ss,
 
     ss->chunk_states[idx] = CHUNK_COMPLETE;
     ss->chunk_peer[idx] = peer_id;
+    ss->timeout_scan_after_monotonic = 0;
     if (ss->chunks_inflight > 0)
         ss->chunks_inflight--;
     ss->chunks_complete++;
@@ -1549,12 +1554,28 @@ bool fast_sync_timeout_elapsed_at(int64_t now_monotonic,
     return elapsed > (uint64_t)timeout_secs;
 }
 
+static int64_t swarm_sync_timeout_deadline(int64_t requested_monotonic,
+                                           int timeout_secs)
+{
+    if (timeout_secs < 0 ||
+        requested_monotonic > INT64_MAX - timeout_secs - 1)
+        return INT64_MAX;
+    return requested_monotonic + timeout_secs + 1;
+}
+
 void swarm_sync_handle_timeouts_at(struct swarm_sync *ss, int timeout_secs,
                                    int64_t now_monotonic)
 {
     if (!ss || !ss->chunk_states || ss->chunks_inflight == 0)
         return;
 
+    if (ss->timeout_scan_timeout_secs == timeout_secs &&
+        ss->last_timeout_scan_monotonic > 0 &&
+        now_monotonic >= ss->last_timeout_scan_monotonic &&
+        ss->timeout_scan_after_monotonic > now_monotonic)
+        return;
+
+    int64_t next_expiry = INT64_MAX;
     for (uint32_t i = 0; i < ss->manifest.num_chunks; i++) {
         ss->timeout_probes++;
         if (ss->chunk_states[i] == CHUNK_INFLIGHT &&
@@ -1567,8 +1588,16 @@ void swarm_sync_handle_timeouts_at(struct swarm_sync *ss, int timeout_secs,
             ss->chunk_request_time[i] = 0;
             if (ss->chunks_inflight > 0)
                 ss->chunks_inflight--;
+        } else if (ss->chunk_states[i] == CHUNK_INFLIGHT) {
+            int64_t deadline = swarm_sync_timeout_deadline(
+                ss->chunk_request_time[i], timeout_secs);
+            if (deadline < next_expiry)
+                next_expiry = deadline;
         }
     }
+    ss->last_timeout_scan_monotonic = now_monotonic;
+    ss->timeout_scan_timeout_secs = timeout_secs;
+    ss->timeout_scan_after_monotonic = next_expiry;
 }
 
 void swarm_sync_handle_timeouts(struct swarm_sync *ss, int timeout_secs)

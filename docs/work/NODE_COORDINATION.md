@@ -2123,3 +2123,22 @@ ownership is still released. Consensus impact: NONE. Worldstream remains
 complementary. Remaining risk: cold runtime group awaits safe disk headroom;
 syntax, seal, parity, and complexity checks pass. Next investigation: reduce
 nonempty sweep work without weakening orphan recovery.
+
+## Snapshot timeout earliest-deadline cache
+
+Baseline and root cause: a nonempty global orphan sweep still walked every
+manifest entry once per second even when every request was far from its timeout
+deadline. This was avoidable scheduler work on large snapshots.
+
+Fix and after-result: timeout scans cache the earliest future expiration for
+their timeout policy and return before that deadline. Assignment, completion,
+failed delivery, requeue, and disconnect transitions invalidate the cache;
+policy changes and monotonic rollback force a scan. The exact-owner path is
+unchanged.
+
+Regression proof: `test_fast_sync` proves an early sweep adds no probes, while
+the first eligible expiration performs the bounded scan and requeues the stale
+chunk. Consensus impact: NONE. Worldstream remains complementary. Remaining
+risk: cold runtime group awaits disk headroom; syntax, sealing, parity, and
+complexity gates pass. Next investigation: assess block-swarm scheduling
+under the same multi-peer churn profile.
