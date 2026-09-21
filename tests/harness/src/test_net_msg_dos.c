@@ -226,6 +226,52 @@ static int dos_getdata_queue_refusal(struct msg_processor *mp,
     return failures;
 }
 
+static int dos_getheaders_queue_refusal(struct msg_processor *mp,
+                                        struct net_manager *nm)
+{
+    int failures = 0;
+    struct net_address addr;
+    net_address_init(&addr);
+    {
+        unsigned char ip4[4] = {203, 0, 113, 82};
+        net_addr_set_ipv4(&addr.svc.addr, ip4);
+    }
+    addr.svc.port = 8033;
+
+    struct p2p_node *blocked = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "getheaders-blocked", false);
+    DOS_CHECK("getheaders refusal: blocked peer created", blocked != NULL);
+    if (blocked) {
+        blocked->state = PEER_SYNCING_HEADERS;
+        blocked->version = PROTOCOL_VERSION;
+        blocked->starting_height = 100;
+        blocked->send_size = net_send_peer_bytes_hard_cap();
+        atomic_store(&blocked->last_getheaders_time, 0);
+        DOS_CHECK("getheaders refusal: send tick survives refusal",
+                  msg_send_messages(mp, blocked, false));
+        DOS_CHECK("getheaders refusal: unsent request remains retryable",
+                  atomic_load(&blocked->last_getheaders_time) == 0);
+        p2p_node_free(blocked);
+    }
+
+    struct p2p_node *healthy = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "getheaders-healthy", false);
+    DOS_CHECK("getheaders refusal: healthy peer created", healthy != NULL);
+    if (healthy) {
+        healthy->state = PEER_SYNCING_HEADERS;
+        healthy->version = PROTOCOL_VERSION;
+        healthy->starting_height = 100;
+        atomic_store(&healthy->last_getheaders_time, 0);
+        DOS_CHECK("getheaders refusal: healthy send tick succeeds",
+                  msg_send_messages(mp, healthy, false));
+        DOS_CHECK("getheaders refusal: queued request advances throttle",
+                  atomic_load(&healthy->last_getheaders_time) > 0 &&
+                  healthy->send_size > 0);
+        p2p_node_free(healthy);
+    }
+    return failures;
+}
+
 static int dos_getblocks_active_control(struct msg_processor *mp,
                                         struct p2p_node *node,
                                         struct block_locator *loc,
@@ -1164,6 +1210,10 @@ int test_net_msg_dos(void)
      * must be able to claim it immediately, without waiting for teardown or
      * the request timeout. */
     failures += dos_getdata_queue_refusal(&mp, &nm);
+
+    /* A refused bounded enqueue is not a request: advancing the periodic
+     * throttle here would hide the failure for the full IBD/stale interval. */
+    failures += dos_getheaders_queue_refusal(&mp, &nm);
 
     net_manager_free(&nm);
     sync_set_state(sync0, "net_msg_dos restore");

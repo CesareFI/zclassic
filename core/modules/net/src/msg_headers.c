@@ -1940,7 +1940,18 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
     return true;
 }
 
-void push_getheaders_from(struct msg_processor *mp,
+static bool queue_getheaders_payload(struct msg_processor *mp,
+                                     struct p2p_node *node,
+                                     const struct byte_stream *payload)
+{
+    if (!p2p_node_begin_message(node, "getheaders",
+                                mp->params->pchMessageStart))
+        return false;
+    p2p_node_write_message_data(node, payload->data, payload->size);
+    return p2p_node_end_message(node);
+}
+
+bool push_getheaders_from(struct msg_processor *mp,
                           struct p2p_node *node,
                           struct block_index *from)
 {
@@ -1975,7 +1986,7 @@ void push_getheaders_from(struct msg_processor *mp,
                      (unsigned long long)n);
         from = reanchor;
         if (!from)
-            return;  /* no hashed frontier anywhere — cannot build a locator */
+            return false; /* no hashed frontier anywhere — no locator */
     } else {
         atomic_store(&g_no_hash_streak, false);
     }
@@ -1995,7 +2006,7 @@ void push_getheaders_from(struct msg_processor *mp,
                      "%llu) — header sync is paused until the snapshot "
                      "exchange completes or resets",
                      from ? from->nHeight : -1, (unsigned long long)n);
-        return;
+        return false;
     }
     atomic_store(&g_snapshot_streak, false);
 
@@ -2012,7 +2023,7 @@ void push_getheaders_from(struct msg_processor *mp,
         int max_hashes = 32;
         struct uint256 *tmp = zcl_malloc((size_t)max_hashes * sizeof(struct uint256),
                                          "exp_locator");
-        if (!tmp) return;
+        if (!tmp) return false;
         int nh = 0;
         struct block_index *walk = from;
         int step = 1;
@@ -2046,7 +2057,7 @@ void push_getheaders_from(struct msg_processor *mp,
         if (!_r.ok) {
             fprintf(stderr, "[headers] %s:%d push_getheaders_from: build_locator failed: %s\n",
                     _r.source_file, _r.source_line, _r.message);
-            return;
+            return false;
         }
     } else {
         struct zcl_result _r = syncsvc_build_getheaders_locator(&loc,
@@ -2057,7 +2068,7 @@ void push_getheaders_from(struct msg_processor *mp,
         if (!_r.ok) {
             fprintf(stderr, "[headers] %s:%d push_getheaders_from: build_locator failed: %s\n",
                     _r.source_file, _r.source_line, _r.message);
-            return;
+            return false;
         }
     }
 
@@ -2066,7 +2077,7 @@ void push_getheaders_from(struct msg_processor *mp,
     if (!getheaders_serialize(&s, &loc, NULL)) {
         stream_free(&s);
         block_locator_free(&loc);
-        return;
+        return false;
     }
 
     /* Debug: log locator hashes to diagnose sync stall */
@@ -2078,14 +2089,13 @@ void push_getheaders_from(struct msg_processor *mp,
         }
     }
 
-    p2p_node_begin_message(node, "getheaders", mp->params->pchMessageStart);
-    p2p_node_write_message_data(node, s.data, s.size);
-    p2p_node_end_message(node);
+    bool sent = queue_getheaders_payload(mp, node, &s);
     stream_free(&s);
     block_locator_free(&loc);
+    return sent;
 }
 
-void push_getheaders(struct msg_processor *mp, struct p2p_node *node)
+bool push_getheaders(struct msg_processor *mp, struct p2p_node *node)
 {
     if (msg_processor_snapshot_active(mp)) {
         uint64_t n =
@@ -2095,7 +2105,7 @@ void push_getheaders(struct msg_processor *mp, struct p2p_node *node)
                      "push_getheaders: request to %s SUPPRESSED by active "
                      "snapshot sync (suppressed=%llu)",
                      node->addr_name, (unsigned long long)n);
-        return;
+        return false;
     }
     atomic_store(&g_push_getheaders_snapshot_streak, false);
 
@@ -2112,15 +2122,11 @@ void push_getheaders(struct msg_processor *mp, struct p2p_node *node)
                 &mp->params->consensus.hashGenesisBlock).ok) {
             struct byte_stream s;
             stream_init(&s, 512);
-            if (getheaders_serialize(&s, &loc, NULL)) {
-                p2p_node_begin_message(node, "getheaders",
-                                       mp->params->pchMessageStart);
-                p2p_node_write_message_data(node, s.data, s.size);
-                p2p_node_end_message(node);
-            }
+            bool sent = getheaders_serialize(&s, &loc, NULL) &&
+                queue_getheaders_payload(mp, node, &s);
             stream_free(&s);
             block_locator_free(&loc);
-            return;
+            return sent;
         }
         /* Fall through to snapsync anchor locator path. Builder
          * already logged via ZCL_ERR source/line; no need to dup. */
@@ -2129,9 +2135,8 @@ void push_getheaders(struct msg_processor *mp, struct p2p_node *node)
     /* After snapshot sync, use the snapshot anchor as the locator start. */
     struct block_index *anchor = msg_processor_snapshot_anchor(mp);
     if (anchor && anchor->phashBlock)
-        push_getheaders_from(mp, node, anchor);
-    else
-        push_getheaders_from(mp, node, NULL);
+        return push_getheaders_from(mp, node, anchor);
+    return push_getheaders_from(mp, node, NULL);
 }
 
 bool push_getheaders_span(struct msg_processor *mp, struct p2p_node *node,
@@ -2388,14 +2393,14 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
         lo, hi, fast_peers, gap);
 }
 
-void exec_getheaders_action(struct msg_processor *mp,
+bool exec_getheaders_action(struct msg_processor *mp,
                             struct p2p_node *node,
                             const struct sync_getheaders_action *action)
 {
     struct block_index *tip;
 
     if (!mp || !node || !action || !action->should_send)
-        return;
+        return false;
 
     tip = active_chain_tip(&mp->main_state->chain_active);
 
@@ -2408,8 +2413,7 @@ void exec_getheaders_action(struct msg_processor *mp,
         struct block_index *band_anchor =
             syncsvc_header_band_backfill_anchor(&mp->main_state->chain_active);
         if (band_anchor) {
-            push_getheaders_from(mp, node, band_anchor);
-            return;
+            return push_getheaders_from(mp, node, band_anchor);
         }
     }
 
@@ -2423,13 +2427,13 @@ void exec_getheaders_action(struct msg_processor *mp,
             mp->main_state->pindex_best_header->phashBlock &&
             (!tip ||
              mp->main_state->pindex_best_header->nHeight > tip->nHeight)) {
-            push_getheaders_from(mp, node, mp->main_state->pindex_best_header);
+            return push_getheaders_from(
+                mp, node, mp->main_state->pindex_best_header);
         } else if (tip && tip->pprev) {
-            push_getheaders_from(mp, node, tip->pprev);
+            return push_getheaders_from(mp, node, tip->pprev);
         } else {
-            push_getheaders(mp, node);
+            return push_getheaders(mp, node);
         }
-        break;
     case SYNC_HEADER_REQUEST_TIP:
     case SYNC_HEADER_REQUEST_EXPLICIT:
     default:
@@ -2446,10 +2450,11 @@ void exec_getheaders_action(struct msg_processor *mp,
             mp->main_state->pindex_best_header->phashBlock &&
             (!tip ||
              mp->main_state->pindex_best_header->nHeight > tip->nHeight)) {
-            push_getheaders_from(mp, node, mp->main_state->pindex_best_header);
+            return push_getheaders_from(
+                mp, node, mp->main_state->pindex_best_header);
         } else {
-            push_getheaders(mp, node);
+            return push_getheaders(mp, node);
         }
-        break;
     }
+    return false;
 }

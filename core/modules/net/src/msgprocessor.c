@@ -2386,6 +2386,13 @@ static void msg_queue_getdata_batch(struct msg_processor *mp,
                 batch->in_flight_before + batch->assigned);
 }
 
+static void msg_note_getheaders_queued(struct p2p_node *node,
+                                       int64_t now_seconds, bool queued)
+{
+    if (queued)
+        syncsvc_note_headers_requested(node, now_seconds);
+}
+
 /* ── msg_send_messages: per-peer trickle ─────────────────────── */
 
 bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
@@ -2678,7 +2685,6 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
                 node, our_height, now_send, true);
             if (ok && !snapshot_active) {
                 should_sync = true;
-                syncsvc_note_headers_requested(node, now_send);
             }
         }
         if (!snapshot_active) {
@@ -2686,7 +2692,6 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
                                              now_send);
             if (periodic.should_send) {
                 should_sync = true;
-                syncsvc_note_headers_requested(node, now_send);
             }
         }
 
@@ -2737,9 +2742,11 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
              * band — so existing behavior is a strict regression-safe
              * fallback. Validation and band closure are unchanged; this
              * only changes WHICH peer is asked for WHICH range. */
-            if (!msg_try_range_parallel_getheaders(mp, node, our_height,
-                                                   platform_time_monotonic_us()))
-                exec_getheaders_action(mp, node, &periodic);
+            bool request_queued = msg_try_range_parallel_getheaders(
+                mp, node, our_height, platform_time_monotonic_us());
+            if (!request_queued)
+                request_queued = exec_getheaders_action(mp, node, &periodic);
+            msg_note_getheaders_queued(node, now_send, request_queued);
         }
 
         /* Checkpoint-header-solution cure: when the app-layer repair condition

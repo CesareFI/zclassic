@@ -1657,3 +1657,34 @@ only half the normal 1,024-slot window while an outbound request remains
 immediately admissible.  Remaining risk and next investigation: quantify the
 extra active-slot census cost under a saturated IBD window and, if material,
 replace repeated scans with explicitly verified incremental counters.
+
+## Getheaders enqueue-failure retry preservation
+
+Baseline and root cause: the periodic header-sync loop recorded a peer's
+`last_getheaders_time` before serializing or queueing the request.  When a
+non-draining peer had filled its bounded send queue, `p2p_node_end_message`
+refused the frame but the timestamp still suppressed another attempt for the
+full 10--600 second sync/backoff interval.  No `getheaders` request had reached
+the wire during that delay.
+
+Fix and after-result: ordinary and anchored `getheaders` helpers now return the
+actual bounded-queue result, as the range-parallel helper already did.  The
+periodic loop advances the throttle only after either the range request or its
+ordinary fallback was queued successfully.  Serialization, locators, request
+intervals, and response handling are unchanged.
+
+Regression proof: the production `msg_send_messages` fixture fills peer A's
+send queue to the hard ceiling and proves its timestamp remains zero after the
+refusal, then drives peer B through the same path and proves a real queued frame
+advances the timestamp.  The existing getdata enqueue-failure reassignment case
+remains adjacent and green.
+
+Consensus impact: NONE.  This changes only volatile retry accounting after a
+request failed to enter the P2P send queue.  Header validation, checkpoints,
+PoW, chain selection, serialization bytes, and transaction validity are
+untouched.  Worldstream `0b29bec27` remains focused on fresh-sync startup
+interruption and observer coverage, with no overlap.  Remaining risk and next
+investigation: audit the header-stall inbound fallback action itself; it can set
+the outer send intent while the independently planned periodic action remains
+empty, so prove that an inbound-only stalled node actually emits a request
+before changing that path.

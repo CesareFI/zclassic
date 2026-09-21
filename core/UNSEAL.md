@@ -608,3 +608,7 @@ later lane flips it HARD.
 - 2026-09-21T11:24:46Z — REASON: reserve legacy block download capacity for outbound peers
   old ROOT: 442d75e381f016cdf5ddd45f2c49ab82db65a628765eddd3a44c0b7c3987861d
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T11:37:52Z — REASON: propagate getheaders enqueue result so failed requests remain retryable
+  old ROOT: de433d1462fb92629fd7f0f86f5341a5d1590aba7e17bb82a992acaca74b1a2d
+  by: owner unseal ritual (make core-unseal)

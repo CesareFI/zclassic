@@ -284,11 +284,11 @@ bool process_getheaders(struct msg_processor *mp, struct p2p_node *node,
                         struct byte_stream *s);
 bool process_headers(struct msg_processor *mp, struct p2p_node *node,
                      struct byte_stream *s);
-void push_getheaders(struct msg_processor *mp, struct p2p_node *node);
-void push_getheaders_from(struct msg_processor *mp,
+bool push_getheaders(struct msg_processor *mp, struct p2p_node *node);
+bool push_getheaders_from(struct msg_processor *mp,
                           struct p2p_node *node,
                           struct block_index *from);
-void exec_getheaders_action(struct msg_processor *mp,
+bool exec_getheaders_action(struct msg_processor *mp,
                             struct p2p_node *node,
                             const struct sync_getheaders_action *action);
 
