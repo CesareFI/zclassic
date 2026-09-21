@@ -2434,3 +2434,25 @@ changed; all manifest/payload checks, reducer admission, block/transaction
 validity, PoW, and chain selection are unchanged. Worldstream `5297c58f4`
 remains complementary. Next investigation: inspect block-manifest attempt-cap
 behavior after malformed responses for recovery without retry starvation.
+
+## Block-manifest reconnect attempt budget
+
+Baseline and root cause: block-manifest parsing deliberately permits only two
+advertisements per connection and active swarm generation. The remaining
+risk was that an implementation could accidentally make that abuse bound an
+endpoint-wide penalty, starving a healthy replacement connection after a
+malformed predecessor exhausted its budget.
+
+After-result and regression proof: the real block-swarm wire loopback now
+exhausts the original receiver's two parses, creates a new connection from
+the same address, and proves the replacement admits the exact active manifest
+with a fresh one-parse budget while the old connection remains capped. The
+audit found the production accounting correctly lives in `p2p_node`, so no
+production behavior change is required.
+
+Consensus impact: NONE. This test covers volatile untrusted-advertisement
+admission only; manifest verification, payload checks, reducer admission, and
+all block/transaction validation, PoW, and chain selection are unchanged.
+Worldstream `5297c58f4` remains complementary. Next investigation: measure
+whether snapshot-manifest reconnect churn retains stale availability or
+ownership outside its existing authoritative disconnect cleanup.

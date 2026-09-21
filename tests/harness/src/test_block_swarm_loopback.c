@@ -1161,6 +1161,35 @@ static bool bs_repeated_manifest_requires_fresh_bitmap(
         mp_block_swarm_test_piece_availability(0) == 1;
 }
 
+static bool bs_reconnect_manifest_gets_fresh_budget(
+    struct bs_seeder *seed, struct p2p_node *serve_node,
+    struct send_segment *serve_sent, struct msg_processor *receive_mp,
+    struct net_manager *receive_nm, const struct chain_params *params,
+    const struct p2p_node *exhausted)
+{
+    struct p2p_node *reconnect = bs_make_peer(receive_nm, 2);
+    if (!reconnect)
+        return false;
+    struct send_segment *sent_reconnect = bs_install_sentinel(reconnect);
+    if (!sent_reconnect) {
+        p2p_node_free(reconnect);
+        return false;
+    }
+    bool ok = true;
+    serve_node->blk_manifest_sent = false;
+    push_block_manifest(&seed->mp, serve_node);
+    bool admitted = bs_pump(serve_node, serve_sent, receive_mp, reconnect,
+                            params->pchMessageStart, &ok) > 0 && ok &&
+        reconnect->blk_manifest_received &&
+        reconnect->blk_manifest_attempts == 1 &&
+        exhausted->blk_manifest_attempts == 2;
+    (void)mp_block_swarm_peer_disconnected(reconnect);
+    send_segment_free(sent_reconnect);
+    reconnect->send_head = reconnect->send_tail = NULL;
+    p2p_node_free(reconnect);
+    return admitted;
+}
+
 /* ══════════════════════ Test 1: throughput ══════════════════════════════ */
 static int test_block_swarm_throughput(void)
 {
@@ -1316,6 +1345,13 @@ static int test_block_swarm_throughput(void)
         ASSERT(bs_pump(a_node, sent_a, &mp_b, b_node,
                        params->pchMessageStart, &ok) > 0 && ok);
         ASSERT(b_node->blk_manifest_attempts == 2);
+
+        /* The bounded manifest budget belongs to this connection, rather
+         * than to the endpoint.  Once this session has used both parses, a
+         * replacement from the same address must be able to advertise the
+         * exact active manifest, while the exhausted object remains capped. */
+        ASSERT(bs_reconnect_manifest_gets_fresh_budget(
+            &seed, a_node, sent_a, &mp_b, &nm_b, params, b_node));
 
         /* Step 2: drive the real piece dance to completion, measuring only the
          * transfer loop. Each round: B assigns+requests (real scheduler) → A
