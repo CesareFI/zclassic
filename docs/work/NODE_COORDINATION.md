@@ -1950,3 +1950,23 @@ only volatile peer scheduling changed. Worldstream `5297c58f4` is
 complementary classic-node timeout arithmetic work and owns no overlapping C
 surface. Remaining risk and next investigation: inspect whether a rejected
 `zchunkreq` has any residual owner/accounting state after a reconnect yield.
+
+## Snapshot offer enqueue ownership
+
+Baseline and root cause: snapshot-offer serialization recorded the advertised
+snapshot identity regardless of whether the bounded peer queue accepted the
+frame. Its caller also marked the peer as offered first, so a rejected offer
+could suppress later advertisement of the same verified snapshot.
+
+Fix and after-result: `send_snapshot_offer_msg` now returns the actual enqueue
+result and commits offer identity only after the full frame is queued.
+`mp_snapshot_maybe_offer` advances its offered marker and emits its event only
+on that success. Wire bytes and all snapshot verification gates are unchanged.
+
+Regression proof: `test_block_swarm_loopback` saturates the real peer queue,
+proves a rejected offer leaves height/count identity clear and queues nothing,
+then proves a healthy retry queues exactly one frame and records the identity.
+The complete real-wire swarm and snapshot-serve groups pass. Consensus impact:
+NONE. Worldstream `5297c58f4` remains complementary timeout arithmetic work.
+Remaining risk and next investigation: audit offer refresh and serving-state
+transitions under disconnect after a successful advertisement.

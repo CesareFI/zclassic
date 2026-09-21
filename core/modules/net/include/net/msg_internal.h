@@ -418,7 +418,7 @@ struct download_manager *msg_get_download_mgr(void);
 #define get_download_mgr() msg_get_download_mgr()
 
 /* Access the cached snapshot offer/manifest. */
-void send_snapshot_offer_msg(struct p2p_node *node,
+bool send_snapshot_offer_msg(struct p2p_node *node,
                              const struct snapshot_offer *offer,
                              const unsigned char *msg_start);
 void push_manifest(struct msg_processor *mp, struct p2p_node *node);

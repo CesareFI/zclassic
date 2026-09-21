@@ -384,7 +384,7 @@ static bool msg_processor_copy_block_manifest(struct block_piece_manifest *out,
  *       num_utxos(8) + total_bytes(8) + mmb_root(32) = 148 bytes.
  * V2 appends protocol/schema/peer_tip/chainwork. Older ZCL23 nodes read
  * 116 or 148 bytes and ignore the trailing fields. */
-void send_snapshot_offer_msg(struct p2p_node *node,
+bool send_snapshot_offer_msg(struct p2p_node *node,
                              const struct snapshot_offer *offer,
                              const unsigned char *msg_start)
 {
@@ -406,8 +406,11 @@ void send_snapshot_offer_msg(struct p2p_node *node,
     stream_write_i32_le(&os, offer->peer_tip_height);
     stream_write_bytes(&os, offer->chain_work, 32);
     p2p_node_write_message_data(node, os.data, os.size);
-    p2p_node_end_message(node);
+    bool queued = p2p_node_end_message(node);
     stream_free(&os);
+
+    if (!queued)
+        return false;
 
     memcpy(node->zsync_offered_root, offer->utxo_root, 32);
     memcpy(node->zsync_offered_mmr, offer->mmr_root, 32);
@@ -416,6 +419,7 @@ void send_snapshot_offer_msg(struct p2p_node *node,
     node->zsync_offered_count = offer->num_utxos;
     node->zsync_offer_version = offer_version;
     node->zsync_snapshot_version = snapshot_version;
+    return true;
 }
 
 /* Send our manifest to a ZCL23 peer. Called after version/verack handshake. */

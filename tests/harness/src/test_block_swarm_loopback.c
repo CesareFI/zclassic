@@ -2543,6 +2543,52 @@ static int test_snapshot_manifest_queue_retry(void)
     return failures;
 }
 
+static int test_snapshot_offer_queue_retry_state(void)
+{
+    int failures = 0;
+
+    TEST("snapshot offer records identity only after queue acceptance") {
+        struct net_manager nm;
+        struct snapshot_offer offer;
+        memset(&offer, 0, sizeof(offer));
+        net_manager_init(&nm);
+        offer.height = 1000;
+        offer.num_utxos = 1;
+        offer.total_bytes = 80;
+        offer.utxo_root[0] = 1;
+        offer.block_hash[0] = 2;
+        msg_processor_update_offer(&offer);
+
+        struct p2p_node *node = bs_make_peer(&nm, 72);
+        ASSERT(node);
+        struct send_segment *sent = bs_install_sentinel(node);
+        node->send_size = net_send_peer_bytes_hard_cap();
+        ASSERT(!send_snapshot_offer_msg(node, &offer,
+                                        chain_params_get()->pchMessageStart));
+        node->send_size = 0;
+        ASSERT(node->zsync_offered_height == 0);
+        ASSERT(node->zsync_offered_count == 0);
+        ASSERT(bs_queue_depth(sent) == 0);
+
+        ASSERT(send_snapshot_offer_msg(node, &offer,
+                                       chain_params_get()->pchMessageStart));
+        ASSERT(node->zsync_offered_height == offer.height);
+        ASSERT(node->zsync_offered_count == offer.num_utxos);
+        ASSERT(bs_queue_depth(sent) == 1);
+
+        bs_drop_queue(node, sent);
+        send_segment_free(sent);
+        node->send_head = node->send_tail = NULL;
+        p2p_node_free(node);
+        msg_processor_invalidate_offer();
+        net_manager_free(&nm);
+        PASS();
+    } _test_next:;
+
+    msg_processor_invalidate_offer();
+    return failures;
+}
+
 int test_block_swarm_loopback(void)
 {
     int failures = 0;
@@ -2576,6 +2622,7 @@ int test_block_swarm_loopback(void)
     failures += test_block_swarm_sovereignty_gate();
     failures += test_block_swarm_manifest_republish();
     failures += test_snapshot_manifest_queue_retry();
+    failures += test_snapshot_offer_queue_retry_state();
     boot_snapshot_offer_test_set_trust_override(-1);
     return failures;
 }

@@ -2372,6 +2372,21 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
     return true;
 }
 
+static void snapshot_offer_queued(struct msg_processor *mp,
+                                  struct p2p_node *node,
+                                  const struct snapshot_offer *offer,
+                                  int our_height)
+{
+    if (!send_snapshot_offer_msg(node, offer, mp->params->pchMessageStart))
+        return;
+    node->zsync_sent = UINT64_MAX; /* mark: offered */
+    event_emitf(EV_SNAPSHOT_OFFER_SENT, (uint32_t)node->id,
+                "h=%d utxos=%llu", offer->height,
+                (unsigned long long)offer->num_utxos);
+    printf("Peer %s: offering snapshot (us=%d, peer=%d)\n",
+           node->addr_name, our_height, node->starting_height);
+}
+
 /* Offer a snapshot to a ZCL23 peer if we're significantly ahead.
  * Called from the per-peer trickle in msg_send_messages. */
 void mp_snapshot_maybe_offer(struct msg_processor *mp,
@@ -2412,14 +2427,7 @@ void mp_snapshot_maybe_offer(struct msg_processor *mp,
                offer.block_hash, 32) != 0;
 
     if (stale_offer) {
-        node->zsync_sent = UINT64_MAX; /* mark: offered */
-        event_emitf(EV_SNAPSHOT_OFFER_SENT, (uint32_t)node->id,
-                    "h=%d utxos=%llu", offer.height,
-                    (unsigned long long)offer.num_utxos);
-        printf("Peer %s: offering snapshot (us=%d, peer=%d)\n",
-               node->addr_name, our_h, node->starting_height);
-        send_snapshot_offer_msg(node, &offer,
-                                mp->params->pchMessageStart);
+        snapshot_offer_queued(mp, node, &offer, our_h);
     }
 }
 
