@@ -191,6 +191,20 @@ static int test_shared_target_is_order_independent(void)
     return ok ? 0 : 1;
 }
 
+static int test_gap_saturates_untrusted_peer_height(void)
+{
+    int failures = 0;
+    TEST("header range gap saturates extreme peer heights") {
+        ASSERT(hrs_gap_saturating(3000000, 2999999) == 1);
+        ASSERT(hrs_gap_saturating(INT32_MAX, -1) == INT32_MAX);
+        ASSERT(hrs_gap_saturating(INT32_MAX, INT32_MIN) == INT32_MAX);
+        ASSERT(hrs_gap_saturating(100, 100) == 0);
+        ASSERT(hrs_gap_saturating(99, 100) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_header_range_sched(void)
 {
     int failures = 0;
@@ -201,6 +215,7 @@ int test_header_range_sched(void)
     failures += test_deadline_saturates();
     failures += test_progress_cannot_shorten_deadline();
     failures += test_shared_target_is_order_independent();
+    failures += test_gap_saturates_untrusted_peer_height();
 
     /* ── 1. Parallelize gate ─────────────────────────────────────── */
     printf("header_range_sched: should_parallelize gate... ");

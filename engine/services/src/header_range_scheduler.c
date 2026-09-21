@@ -18,6 +18,7 @@
 #include "json/json.h"
 #include "util/log_macros.h"
 
+#include <limits.h>
 #include <string.h>
 
 /* Default per-span assignment budget: 30 s. A peer that has not driven its
@@ -42,6 +43,14 @@ bool hrs_should_parallelize(int fast_peer_count, int32_t gap, int32_t batch)
 int32_t hrs_include_peer_target(int32_t target, int32_t peer_height)
 {
     return peer_height > target ? peer_height : target;
+}
+
+int32_t hrs_gap_saturating(int32_t target, int32_t local_height)
+{
+    int64_t gap = (int64_t)target - (int64_t)local_height;
+    if (gap <= 0)
+        return 0;
+    return gap > INT32_MAX ? INT32_MAX : (int32_t)gap;
 }
 
 /* Insert `v` into a sorted-ascending, deduplicated int32 array of length

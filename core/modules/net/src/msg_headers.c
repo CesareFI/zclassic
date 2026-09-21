@@ -2306,7 +2306,8 @@ bool msg_try_range_parallel_getheaders(struct msg_processor *mp,
     }
     zcl_mutex_unlock(&mp->net_mgr->cs_nodes);
 
-    int32_t gap = (int32_t)(target - our_height);
+    int32_t gap = hrs_gap_saturating((int32_t)target,
+                                     (int32_t)our_height);
 
     if (!hrs_should_parallelize(fast_peers, gap, 2000))
         return false;

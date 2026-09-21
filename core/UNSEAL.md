@@ -760,3 +760,7 @@ later lane flips it HARD.
 - 2026-09-21T19:01:07Z — REASON: release snapshot chunk ownership when manifest admission is lost
   old ROOT: 45cf5f400c8f81c38c2268a3aed0a76efbfd6a3e517ad744659d29d51b1b9206
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T19:06:09Z — REASON: saturate untrusted header range gap arithmetic
+  old ROOT: 3bd3def12e23d1dab88a739cfdc8067ea3f2598daff0790ff86d8702ae718cda
+  by: owner unseal ritual (make core-unseal)

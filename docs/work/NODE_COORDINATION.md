@@ -2484,3 +2484,27 @@ snapshot commitment checks, reducer admission, all block/transaction validity,
 PoW, and chain selection remain unchanged. Worldstream `5297c58f4` remains
 complementary. Next investigation: audit snapshot chunk response cleanup on
 allocation or mutex-acquisition failure without relaxing validation.
+
+## Header-range untrusted-height saturation
+
+Baseline and root cause: range-parallel header scheduling formed its missing
+gap with signed `int` subtraction from a peer-advertised starting height. An
+extreme advertised height could overflow before narrowing, turning a large
+positive gap into an invalid scheduling decision.
+
+Fix and after-result: the scheduler now derives the gap in `int64_t`, returns
+zero for non-positive ranges, and saturates positive values at `INT32_MAX`.
+This is only a request-planning hint: no peer height is accepted as chain
+state, and all anchors remain local checkpoints or validated headers.
+
+Regression proof: deterministic scheduler coverage includes ordinary gaps,
+equal/reversed heights, and both overflowing `INT32_MAX` boundary cases.
+Native C23 syntax and the complexity ratchet pass. Runtime/ASan remain
+disk-gated at 10.7 GB free because the focused runtime target's cold verifier
+build crosses the 10 GB safety floor.
+
+Consensus impact: NONE. Only getheaders span planning changes; header
+validation, checkpoint anchoring, chain selection, blocks, transactions, PoW,
+and cryptographic validation are unchanged. Worldstream `5297c58f4` remains
+complementary. Next investigation: examine whether changing a peer's advertised
+height between range-planning ticks can unnecessarily discard live spans.
