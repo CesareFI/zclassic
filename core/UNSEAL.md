@@ -540,3 +540,7 @@ later lane flips it HARD.
 - 2026-09-21T08:33:45Z — REASON: Integrate previously validated header range empty, terminal, disconnect, continuation, progress, and stable-target recovery onto the current networking branch; transport scheduling only, consensus unchanged
   old ROOT: ffbe008855edc80638d13a9a116428c7d0a654a321cd4310cc32c60ae0e99bcc
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T08:48:09Z — REASON: Reclaim snapshot chunks from authoritative swarm ownership on peer disconnect; transport scheduling only, consensus unchanged
+  old ROOT: 6de072a9b3bfa619119445726598654447fe7a898cc82b2623645c54f4106e11
+  by: owner unseal ritual (make core-unseal)

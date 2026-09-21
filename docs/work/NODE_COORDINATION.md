@@ -1123,3 +1123,30 @@ and startup-interrupt acceptance work.
 Remaining risk and next investigation: inspect snapshot manifest-source
 diversity under reconnect churn, especially whether session replacement can
 leave an admitted source slot attributed to a dead endpoint generation.
+
+## Reclaim authoritative snapshot ownership across reconnect churn
+
+Baseline: snapshot terminal cleanup requeued only the chunk named by the
+disconnecting peer's local `swarm_inflight_chunk`. A deterministic real-wire
+manifest fixture cleared that local field while retaining the global owner;
+disconnect then returned zero and left the chunk in flight until timeout.
+
+Root cause and fix: cleanup trusted a lossy peer-local cache instead of the
+bounded global scheduler table. It now calls the existing
+`swarm_sync_peer_disconnected` primitive, scanning the authoritative manifest
+chunk table and reclaiming every chunk owned by that peer before clearing its
+admission state.
+
+After-result and regression proof: the pre-fix `block_swarm_loopback` fixture
+failed at the disconnect assertion. It now passes with local ownership erased,
+global ownership reclaimed immediately, and the already-admitted healthy
+manifest source taking the same chunk on its next send tick. The fixture also
+retains incompatible-manifest refusal and timeout-yield coverage.
+
+Consensus impact: NONE. Snapshot content hashes, Merkle/root checks, install
+policy, chain validation, serialization, PoW, and cryptography are unchanged.
+Worldstream remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: test a genuinely new peer object after
+reconnect (not only a reset existing object), then inspect whether bounded
+manifest-attempt state can incorrectly exclude a valid replacement source.

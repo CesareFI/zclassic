@@ -787,6 +787,10 @@ static int test_snapshot_manifest_wire_reconnect(void)
 
         ASSERT(peer_a->swarm_inflight_chunk == 0);
         ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_a->id, 1, 0));
+        /* The global scheduler is authoritative.  Reconnect churn must not
+         * strand ownership merely because peer-local bookkeeping was lost
+         * before connman's terminal cleanup ran. */
+        peer_a->swarm_inflight_chunk = -1;
         ASSERT(mp_snapshot_swarm_peer_disconnected(peer_a) == 1);
         ASSERT(bs_snapshot_state(0, CHUNK_NEEDED, -1, 0, 0));
         ASSERT(!peer_a->swarm_manifest_received);

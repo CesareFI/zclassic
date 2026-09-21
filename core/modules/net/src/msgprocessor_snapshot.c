@@ -1006,11 +1006,12 @@ size_t mp_snapshot_swarm_peer_disconnected(struct p2p_node *node)
         return 0;
     size_t requeued = 0;
     if (swarm_mutex_lock()) {
-        if (atomic_load(&g_swarm_active) &&
-            node->swarm_inflight_chunk >= 0 &&
-            swarm_sync_requeue_chunk_for_peer(
-                &g_swarm, (uint32_t)node->swarm_inflight_chunk, node->id))
-            requeued = 1;
+        /* The scheduler table is authoritative.  Peer-local bookkeeping can
+         * already have been cleared or replaced when connman reaches its
+         * single terminal cleanup site; scanning the bounded manifest table
+         * prevents that churn from stranding owned chunks until timeout. */
+        if (atomic_load(&g_swarm_active))
+            requeued = swarm_sync_peer_disconnected(&g_swarm, node->id);
         swarm_mutex_unlock();
     }
     node->swarm_manifest_received = false;
