@@ -2142,3 +2142,20 @@ chunk. Consensus impact: NONE. Worldstream remains complementary. Remaining
 risk: cold runtime group awaits disk headroom; syntax, sealing, parity, and
 complexity gates pass. Next investigation: assess block-swarm scheduling
 under the same multi-peer churn profile.
+
+## Empty block-swarm timeout-sweep fast path
+
+Baseline and root cause: block-swarm timeout handling traversed every piece on
+each eligible peer tick even when no piece was in flight. No timeout transition
+is possible in that state.
+
+Fix and after-result: the block-swarm timeout handler returns in O(1) when
+the bounded authoritative in-flight count is zero. A diagnostic probe counter
+proves the idle path reads no piece state; regular stale-piece recovery still
+walks and requeues the timed-out owner.
+
+Regression proof: the monotonic-boundary fast-sync regression now covers idle
+zero probes and both non-expired and expired in-flight piece cases. Consensus
+impact: NONE. Worldstream remains complementary. Remaining risk: cold runtime
+group awaits disk headroom. Next investigation: coalesce nonempty block-swarm
+orphan scans across peer ticks.

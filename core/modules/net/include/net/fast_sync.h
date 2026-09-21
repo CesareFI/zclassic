@@ -464,6 +464,7 @@ struct block_swarm {
     uint32_t pieces_complete;
     uint32_t pieces_inflight;
     uint32_t pieces_failed;
+    uint64_t timeout_probes;        /* timeout scan states; diagnostic */
     uint32_t next_assign_hint;       /* lowest possibly assignable piece */
     uint32_t first_incomplete_hint;  /* lowest possibly incomplete piece */
     int64_t  last_complete_monotonic;   /* monotonic seconds at last piece

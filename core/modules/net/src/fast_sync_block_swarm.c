@@ -318,9 +318,11 @@ int block_swarm_progress(const struct block_swarm *bs)
 void block_swarm_handle_timeouts_at(struct block_swarm *bs, int timeout_secs,
                                     int64_t now_monotonic)
 {
-    if (!bs || !bs->piece_states) return;
+    if (!bs || !bs->piece_states || bs->pieces_inflight == 0)
+        return;
 
     for (uint32_t i = 0; i < bs->manifest.num_pieces; i++) {
+        bs->timeout_probes++;
         if (bs->piece_states[i] == CHUNK_INFLIGHT &&
             fast_sync_timeout_elapsed_at(now_monotonic,
                                          bs->piece_request_time[i],

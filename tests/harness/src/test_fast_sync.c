@@ -987,15 +987,19 @@ static int test_swarm_timeout_monotonic_boundaries(void)
 
         struct block_swarm bs;
         ASSERT(block_swarm_init(&bs, &block_manifest, NULL));
+        block_swarm_handle_timeouts_at(&bs, 30, 100);
+        ASSERT(bs.timeout_probes == 0);
         ASSERT(block_swarm_assign_piece(&bs, 1, NULL, 0) == 0);
 
         bs.piece_request_time[0] = INT64_MAX;
         block_swarm_handle_timeouts_at(&bs, 30, INT64_MIN);
+        ASSERT(bs.timeout_probes == 1);
         ASSERT(bs.piece_states[0] == CHUNK_INFLIGHT);
         ASSERT(bs.pieces_inflight == 1);
 
         bs.piece_request_time[0] = INT64_MIN;
         block_swarm_handle_timeouts_at(&bs, 30, INT64_MAX);
+        ASSERT(bs.timeout_probes == 2);
         ASSERT(bs.piece_states[0] == CHUNK_NEEDED);
         ASSERT(bs.pieces_inflight == 0);
 
