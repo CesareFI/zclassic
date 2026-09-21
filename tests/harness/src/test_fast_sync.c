@@ -562,6 +562,15 @@ static int test_swarm_init_assign(void)
         ASSERT(c3 == 2);
         ASSERT(ss.chunks_inflight == 3);
 
+        for (int32_t i = 3; i < 10; i++)
+            ASSERT(swarm_sync_assign_chunk(&ss, 1) == i);
+        ASSERT(ss.assignment_probes == 10);
+        ASSERT(swarm_sync_assign_chunk(&ss, 2) == -1);
+        ASSERT(ss.assignment_probes == 10);
+        ASSERT(swarm_sync_requeue_chunk_for_peer(&ss, 2, 1));
+        ASSERT(swarm_sync_assign_chunk(&ss, 2) == 2);
+        ASSERT(ss.assignment_probes == 11);
+
         swarm_sync_free(&ss);
         free(manifest.chunk_hashes);
         PASS();

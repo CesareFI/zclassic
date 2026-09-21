@@ -1174,3 +1174,33 @@ Remaining risk and next investigation: inspect snapshot chunk assignment
 fairness when many admitted sources compete, especially whether fixed node
 iteration order lets one fast source repeatedly monopolize newly needed
 chunks after completions or timeouts.
+
+## Bound snapshot chunk assignment scans
+
+Baseline: `swarm_sync_assign_chunk` restarted at chunk zero for every request.
+Assigning N fresh chunks therefore inspected N(N+1)/2 states—about 2.1
+billion probes at the 65,000-chunk manifest cap—and every peer tick rescanned
+the whole table when all chunks were already complete, failed, or in flight.
+
+Root cause and fix: the scheduler retained no next-needed position. It now
+keeps a bounded cursor, returns in O(1) when counters prove every chunk is
+accounted for, and moves the cursor directly to a lone retry. Batched timeout
+or disconnect requeues retain the lowest reclaimed index, preserving existing
+deterministic assignment order.
+
+After-result and regression proof: the ten-chunk direct fixture now measures
+exactly ten probes for ten sequential assignments instead of 55, zero extra
+probes for a fully-accounted request, and one probe to reclaim a directly
+requeued chunk. The first implementation exposed and then preserved the
+existing lowest-index disconnect ordering. All four `fast_sync` groups and
+the real-wire `block_swarm_loopback` group pass.
+
+Consensus impact: NONE. This changes only selection among already-needed
+snapshot transport chunks. Content hashes, Merkle verification, snapshot
+application, chain rules, serialization, PoW, and cryptography are unchanged.
+Worldstream remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: expose the bounded probe count in sync
+observability only if field measurements need it; otherwise inspect failed-
+chunk terminal handling, because five verification failures currently leave
+the swarm active but permanently unable to satisfy its completion predicate.

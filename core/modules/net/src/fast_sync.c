@@ -1374,16 +1374,35 @@ int32_t swarm_sync_assign_chunk(struct swarm_sync *ss, int peer_id)
     if (!ss || !ss->chunk_states)
         LOG_RETURN(-1, "sync", "assign_chunk: ss or chunk_states is NULL");
 
-    for (uint32_t i = 0; i < ss->manifest.num_chunks; i++) {
+    uint32_t n = ss->manifest.num_chunks;
+    if (ss->chunks_complete + ss->chunks_inflight + ss->chunks_failed >= n)
+        return -1;
+    uint32_t start = ss->next_needed_hint < n ? ss->next_needed_hint : 0;
+    for (uint32_t step = 0; step < n; step++) {
+        uint32_t i = start + step;
+        if (i >= n)
+            i -= n;
+        ss->assignment_probes++;
         if (ss->chunk_states[i] == CHUNK_NEEDED) {
             ss->chunk_states[i] = CHUNK_INFLIGHT;
             ss->chunk_peer[i] = peer_id;
             ss->chunk_request_time[i] = platform_time_monotonic_us() / 1000000;
             ss->chunks_inflight++;
+            ss->next_needed_hint = i + 1 == n ? 0 : i + 1;
             return (int32_t)i;
         }
     }
     LOG_RETURN(-1, "sync", "assign_chunk: no chunks available for peer %d", peer_id);
+}
+
+static void swarm_sync_hint_needed(struct swarm_sync *ss,
+                                   uint32_t chunk_index)
+{
+    uint32_t accounted = ss->chunks_complete + ss->chunks_inflight +
+                         ss->chunks_failed;
+    if (accounted >= ss->manifest.num_chunks ||
+        chunk_index < ss->next_needed_hint)
+        ss->next_needed_hint = chunk_index;
 }
 
 bool swarm_sync_requeue_chunk_for_peer(struct swarm_sync *ss,
@@ -1395,6 +1414,7 @@ bool swarm_sync_requeue_chunk_for_peer(struct swarm_sync *ss,
         ss->chunk_states[chunk_index] != CHUNK_INFLIGHT ||
         ss->chunk_peer[chunk_index] != peer_id)
         return false;
+    swarm_sync_hint_needed(ss, chunk_index);
     ss->chunk_states[chunk_index] = CHUNK_NEEDED;
     ss->chunk_peer[chunk_index] = -1;
     ss->chunk_request_time[chunk_index] = 0;
@@ -1455,6 +1475,7 @@ bool swarm_sync_receive_chunk(struct swarm_sync *ss,
             ss->chunk_states[idx] = CHUNK_FAILED;
             ss->chunks_failed++;
         } else {
+            swarm_sync_hint_needed(ss, idx);
             ss->chunk_states[idx] = CHUNK_NEEDED;
         }
         ss->chunk_peer[idx] = -1;
@@ -1472,6 +1493,7 @@ bool swarm_sync_receive_chunk(struct swarm_sync *ss,
                 ss->chunk_states[idx] = CHUNK_FAILED;
                 ss->chunks_failed++;
             } else {
+                swarm_sync_hint_needed(ss, idx);
                 ss->chunk_states[idx] = CHUNK_NEEDED;
             }
             ss->chunk_peer[idx] = -1;
@@ -1523,6 +1545,7 @@ void swarm_sync_handle_timeouts_at(struct swarm_sync *ss, int timeout_secs,
             fast_sync_timeout_elapsed_at(now_monotonic,
                                          ss->chunk_request_time[i],
                                          timeout_secs)) {
+            swarm_sync_hint_needed(ss, i);
             ss->chunk_states[i] = CHUNK_NEEDED;
             ss->chunk_peer[i] = -1;
             ss->chunk_request_time[i] = 0;

@@ -544,3 +544,7 @@ later lane flips it HARD.
 - 2026-09-21T08:48:09Z — REASON: Reclaim snapshot chunks from authoritative swarm ownership on peer disconnect; transport scheduling only, consensus unchanged
   old ROOT: 6de072a9b3bfa619119445726598654447fe7a898cc82b2623645c54f4106e11
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T09:07:17Z — REASON: Bound snapshot chunk assignment scans with a retry-aware next-needed hint; transport efficiency only, consensus unchanged
+  old ROOT: 14c6492f015c8e84440796c01d37097f3150adbb1cc457fe417ae9e6338e9e24
+  by: owner unseal ritual (make core-unseal)

@@ -334,6 +334,8 @@ struct swarm_sync {
     uint32_t chunks_complete;
     uint32_t chunks_inflight;
     uint32_t chunks_failed;
+    uint32_t next_needed_hint;         /* bounded assignment scan cursor */
+    uint64_t assignment_probes;        /* inspected states; test/diagnostic */
     const char *datadir;               /* for applying chunks */
 };
 
