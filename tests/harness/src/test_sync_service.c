@@ -639,6 +639,82 @@ static int test_sync_service_assigns_peer_blocks(void)
     return failures;
 }
 
+static int test_sync_service_reserves_outbound_block_window(void)
+{
+    int failures = 0;
+    TEST("sync_service reserves half the IBD block window for outbound") {
+        sync_set_state(SYNC_FINDING_PEERS, "inbound reservation test");
+        sync_set_state(SYNC_HEADERS_DOWNLOAD, "inbound reservation test");
+        sync_set_state(SYNC_BLOCKS_DOWNLOAD, "inbound reservation test");
+        size_t window = dl_get_max_in_flight_total();
+        ASSERT(window == DL_MAX_IN_FLIGHT_TOTAL_IBD);
+        struct uint256 *queued = zcl_calloc(
+            window, sizeof(*queued), "inbound_reservation_hashes");
+        int32_t *heights = zcl_calloc(
+            window, sizeof(*heights), "inbound_reservation_heights");
+        struct uint256 *assigned = zcl_calloc(
+            DL_WINDOW_SIZE, sizeof(*assigned), "inbound_reservation_batch");
+        ASSERT(queued && heights && assigned);
+        for (size_t i = 0; i < window; i++) {
+            uint32_t key = (uint32_t)i + 1;
+            memcpy(queued[i].data, &key, sizeof(key));
+            heights[i] = (int32_t)i + 1;
+        }
+
+        struct download_manager dm;
+        dl_init(&dm);
+        ASSERT(dl_queue_blocks(&dm, queued, heights, window) == window);
+        size_t inbound_assigned = 0;
+        for (uint32_t i = 0; i < 40; i++) {
+            struct p2p_node node;
+            struct sync_block_batch batch;
+            memset(&node, 0, sizeof(node));
+            node.id = (node_id_t)i + 1;
+            node.state = PEER_HANDSHAKE_COMPLETE;
+            node.starting_height = (int32_t)window + 100;
+            node.inbound = true;
+            syncsvc_assign_peer_blocks(&batch, &dm, &node, assigned,
+                                       DL_WINDOW_SIZE, 0);
+            inbound_assigned += batch.assigned;
+        }
+        ASSERT(inbound_assigned == window / 2);
+
+        /* Inbound-only operation keeps moving: settling one owned slot
+         * immediately opens one place below the ceiling. */
+        ASSERT(dl_mark_received(&dm, &queued[0]) != UINT32_MAX);
+        struct p2p_node replacement;
+        struct sync_block_batch replacement_batch;
+        memset(&replacement, 0, sizeof(replacement));
+        replacement.id = 500;
+        replacement.state = PEER_HANDSHAKE_COMPLETE;
+        replacement.starting_height = (int32_t)window + 100;
+        replacement.inbound = true;
+        syncsvc_assign_peer_blocks(&replacement_batch, &dm, &replacement,
+                                   assigned, DL_WINDOW_SIZE, 0);
+        ASSERT(replacement_batch.assigned == 1);
+
+        struct p2p_node outbound;
+        struct sync_block_batch outbound_batch;
+        memset(&outbound, 0, sizeof(outbound));
+        outbound.id = 1000;
+        outbound.state = PEER_HANDSHAKE_COMPLETE;
+        outbound.starting_height = (int32_t)window + 100;
+        syncsvc_assign_peer_blocks(&outbound_batch, &dm, &outbound, assigned,
+                                   DL_WINDOW_SIZE, 0);
+        ASSERT(outbound_batch.assigned > 0);
+
+        dl_free(&dm);
+        free(assigned);
+        free(heights);
+        free(queued);
+        sync_set_state(SYNC_IDLE, "inbound reservation restore");
+        PASS();
+    } _test_next:;
+    if (sync_get_state() != SYNC_IDLE)
+        sync_set_state(SYNC_IDLE, "inbound reservation cleanup");
+    return failures;
+}
+
 static int test_sync_service_body_stall_disconnect(void)
 {
     int failures = 0;
@@ -2400,6 +2476,7 @@ int test_sync_service(void)
     failures += test_sync_service_block_file_scan_trigger();
     failures += test_sync_service_block_assignment_plan();
     failures += test_sync_service_assigns_peer_blocks();
+    failures += test_sync_service_reserves_outbound_block_window();
     failures += test_sync_service_body_stall_disconnect();
     failures += test_sync_service_body_dark_disconnect();
     failures += test_sync_service_collects_needed_blocks_oldest_first();

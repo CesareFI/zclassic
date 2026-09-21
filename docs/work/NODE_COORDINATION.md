@@ -1622,3 +1622,38 @@ are unchanged.  Worldstream `0b29bec27` remains focused on fresh-sync startup
 interruption and observers.  Remaining risk and next investigation: measure
 whether legacy block-download peer selection similarly lets inbound sources
 consume the bounded in-flight window ahead of faster outbound peers.
+
+## Legacy block-download outbound reservation
+
+Baseline and root cause: a production-entry regression queued the complete
+4,096-block IBD window and drove inbound peers through
+`syncsvc_assign_peer_blocks`.  Before correction they consumed the entire
+window, leaving a healthy outbound source with zero immediate work.  The
+download manager tracked peer bandwidth and loopback class, but not connection
+direction, so its locked global-cap calculation could not preserve peer-source
+diversity.
+
+Fix and after-result: each active download slot now records whether its owner
+was inbound when assigned.  Under the manager lock, an inbound assignment is
+limited to half the current dynamic global window; outbound assignments retain
+the other half.  Direction changes affect new work only, preserving exact
+ownership of existing slots.  Receive, timeout, and disconnect settlement free
+capacity through the existing capacity generation, so inbound-only sync keeps
+moving rather than deadlocking.  Slot census and cap calculation were split
+into helpers, reducing `dl_assign_to_peer` complexity from 90 to 86.
+
+Regression proof: `test_sync_service` first failed after inbound peers exceeded
+2,048 assignments.  It now proves the half-window ceiling, immediate one-slot
+inbound reuse after a body settles, and immediate outbound assignment.  The
+download, contention, speed-contract, and always-sync restart/chaos groups
+remain green.  Consensus impact: NONE; this changes only request scheduling
+and records no persistent or wire-visible state.  Block parsing, validation,
+PoW, chain selection, and transaction rules are unchanged.  Worldstream
+`0b29bec27` remains focused on fresh-sync startup interruption and observers.
+The at-tip unsolicited-announcement path now records peer direction before
+`dl_mark_requested`, and that locked direct-request path enforces the same
+half-window ceiling.  Its regression proves 512 inbound direct requests fill
+only half the normal 1,024-slot window while an outbound request remains
+immediately admissible.  Remaining risk and next investigation: quantify the
+extra active-slot census cost under a saturated IBD window and, if material,
+replace repeated scans with explicitly verified incremental counters.

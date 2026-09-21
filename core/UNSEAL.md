@@ -604,3 +604,7 @@ later lane flips it HARD.
 - 2026-09-21T11:14:24Z — REASON: reserve snapshot chunk capacity for outbound sources
   old ROOT: f7cf47a87fd359cd4b8d9a48735134076559057af4d0c0388b4307473f483232
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T11:24:46Z — REASON: reserve legacy block download capacity for outbound peers
+  old ROOT: 442d75e381f016cdf5ddd45f2c49ab82db65a628765eddd3a44c0b7c3987861d
+  by: owner unseal ritual (make core-unseal)

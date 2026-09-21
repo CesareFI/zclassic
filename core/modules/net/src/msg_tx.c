@@ -210,6 +210,7 @@ bool process_inv(struct msg_processor *mp, struct p2p_node *node,
                  * hash is already in-flight, de-duping concurrent announces. */
                 struct download_manager *dm = get_download_mgr();
                 int32_t req_height = bi ? (int32_t)bi->nHeight : -1;
+                dl_set_peer_inbound(dm, (uint32_t)node->id, node->inbound);
                 if (dl_mark_requested(dm, &inv.hash, req_height,
                                       (uint32_t)node->id)) {
                     inv_item_serialize(&inv, &getdata);

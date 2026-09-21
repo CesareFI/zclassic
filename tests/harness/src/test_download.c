@@ -203,6 +203,37 @@ static int test_dl_mark_requested(void)
     return failures;
 }
 
+static int test_dl_direct_inbound_reservation(void)
+{
+    int failures = 0;
+    TEST("direct block requests preserve outbound half-window") {
+        sync_set_state(SYNC_IDLE, "direct inbound reservation");
+        struct download_manager dm;
+        dl_init(&dm);
+        size_t limit = dl_get_max_in_flight_total();
+        dl_set_peer_inbound(&dm, 1, true);
+        for (size_t i = 0; i < limit / 2; i++) {
+            struct uint256 hash = {{0}};
+            uint32_t key = (uint32_t)i + 1;
+            memcpy(hash.data, &key, sizeof(key));
+            ASSERT(dl_mark_requested(&dm, &hash, (int32_t)i, 1));
+        }
+        struct uint256 blocked = {{0}};
+        uint32_t blocked_key = (uint32_t)limit + 1;
+        memcpy(blocked.data, &blocked_key, sizeof(blocked_key));
+        ASSERT(!dl_mark_requested(&dm, &blocked, (int32_t)limit, 1));
+
+        dl_set_peer_inbound(&dm, 2, false);
+        struct uint256 outbound = {{0}};
+        uint32_t outbound_key = (uint32_t)limit + 2;
+        memcpy(outbound.data, &outbound_key, sizeof(outbound_key));
+        ASSERT(dl_mark_requested(&dm, &outbound, (int32_t)limit + 1, 2));
+        dl_free(&dm);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_dl_mark_received(void)
 {
     int failures = 0;
@@ -2394,6 +2425,7 @@ int test_download(void)
     int failures = 0;
     failures += test_dl_init_free();
     failures += test_dl_mark_requested();
+    failures += test_dl_direct_inbound_reservation();
     failures += test_dl_mark_received();
     failures += test_dl_queue_dedup();
     failures += test_dl_received_pending_staging();

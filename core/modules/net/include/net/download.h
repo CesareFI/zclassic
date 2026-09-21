@@ -101,6 +101,7 @@ struct dl_in_flight {
                                      * observable (DL_RECEIVED_PENDING_SECS).
                                      * Zeroed whenever a slot is activated. */
     enum dl_work_class work_class;
+    bool           peer_inbound;    /* owner was an inbound connection */
     bool           active;          /* true if slot in use */
 };
 
@@ -135,6 +136,7 @@ struct dl_peer_stats {
     bool     is_loopback;           /* K2: peer at 127.0.0.0/8 or ::1; gets
                                      * DL_MAX_IN_FLIGHT_PER_LOOPBACK window
                                      * and bypasses bandwidth-score scaling */
+    bool     is_inbound;            /* aggregate inbound ownership is bounded */
     uint64_t zero_assign_generation; /* dependency generation of the most
                                       * recent parkable zero-result attempt */
     int64_t  zero_assign_retry_after; /* cooldown deadline; 0 means wait only
@@ -221,6 +223,7 @@ enum dl_assign_result {
     DL_ASSIGN_MAX_ZERO,
     DL_ASSIGN_PEER_WINDOW_FULL,
     DL_ASSIGN_GLOBAL_WINDOW_FULL,
+    DL_ASSIGN_INBOUND_WINDOW_FULL,
     DL_ASSIGN_HISTORY_THROTTLED,
     DL_ASSIGN_NO_SLOT,
     DL_ASSIGN_PEER_AVOID_COOLDOWN,
@@ -490,6 +493,10 @@ bool dl_assignment_should_attempt(struct download_manager *dm,
  * Caller-set (the download manager doesn't see net addresses). Idempotent. */
 void dl_set_peer_loopback(struct download_manager *dm,
                           uint32_t peer_id, bool is_loopback);
+
+/* Record connection direction before assignment. Idempotent. */
+void dl_set_peer_inbound(struct download_manager *dm,
+                         uint32_t peer_id, bool is_inbound);
 
 /* Update peer stats when a block is received from them. */
 void dl_peer_block_received(struct download_manager *dm,

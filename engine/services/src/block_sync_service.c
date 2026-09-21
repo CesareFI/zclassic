@@ -183,6 +183,7 @@ void syncsvc_assign_peer_blocks(struct sync_block_batch *batch,
      * re-scan storm without weakening multi-peer body fetch. */
     dl_set_peer_loopback(dm, (uint32_t)node->id,
                          net_addr_is_local(&node->addr.svc.addr));
+    dl_set_peer_inbound(dm, (uint32_t)node->id, node->inbound);
     if (!dl_assignment_should_attempt(dm, (uint32_t)node->id))
         return;
 

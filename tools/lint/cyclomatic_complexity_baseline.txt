@@ -1247,7 +1247,7 @@ core/modules/net/src/connman_onion_seeds.c:onion_seed_directory_has_endpoint:20
 core/modules/net/src/connman_zcl23_dial.c:connman_evict_same_ip_inbound_when_outbound:22
 core/modules/net/src/connman_zcl23_dial.c:connman_gather_known_zcl23_candidate:17
 core/modules/net/src/dandelion.c:dandelion_maybe_rotate_epoch:19
-core/modules/net/src/download.c:dl_assign_to_peer:90
+core/modules/net/src/download.c:dl_assign_to_peer:86
 core/modules/net/src/download.c:dl_queue_blocks_class:39
 core/modules/net/src/download_diagnostics.c:dl_get_diagnostics:27
 core/modules/net/src/fast_sync.c:block_piece_manifest_build:22

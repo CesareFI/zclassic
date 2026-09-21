@@ -81,6 +81,7 @@ static bool dl_assign_result_is_parkable(int result)
     return result == DL_ASSIGN_NO_QUEUE ||
            result == DL_ASSIGN_PEER_WINDOW_FULL ||
            result == DL_ASSIGN_GLOBAL_WINDOW_FULL ||
+           result == DL_ASSIGN_INBOUND_WINDOW_FULL ||
            result == DL_ASSIGN_HISTORY_THROTTLED ||
            result == DL_ASSIGN_PEER_AVOID_COOLDOWN;
 }
@@ -103,6 +104,7 @@ const char *dl_assign_result_name(int result)
     case DL_ASSIGN_MAX_ZERO:           return "max_zero";
     case DL_ASSIGN_PEER_WINDOW_FULL:   return "peer_window_full";
     case DL_ASSIGN_GLOBAL_WINDOW_FULL: return "global_window_full";
+    case DL_ASSIGN_INBOUND_WINDOW_FULL:return "inbound_window_full";
     case DL_ASSIGN_HISTORY_THROTTLED:  return "history_throttled";
     case DL_ASSIGN_NO_SLOT:            return "no_slot";
     case DL_ASSIGN_PEER_AVOID_COOLDOWN:return "peer_avoid_cooldown";
@@ -579,6 +581,8 @@ static void dl_activate_slot(struct download_manager *dm,
     slot->request_time = request_time;
     slot->received_time = 0;
     slot->work_class = work_class;
+    struct dl_peer_stats *ps = dl_find_peer(dm, peer_id, false);
+    slot->peer_inbound = ps && ps->is_inbound;
     slot->active = true;
     dm->num_active++;
     dm->total_requested++;
@@ -591,6 +595,23 @@ bool dl_is_in_flight(struct download_manager *dm, const struct uint256 *hash)
     bool found = (s != NULL && s->active);
     zcl_mutex_unlock(&dm->cs);
     return found;
+}
+
+static bool dl_inbound_window_full_locked(struct download_manager *dm,
+                                          uint32_t peer_id,
+                                          size_t global_limit)
+{
+    struct dl_peer_stats *peer = dl_find_peer(dm, peer_id, false);
+    if (!peer || !peer->is_inbound)
+        return false;
+    size_t inbound_limit = global_limit / 2;
+    if (inbound_limit == 0)
+        inbound_limit = 1;
+    size_t inbound = 0;
+    for (size_t i = 0; i < dm->num_slots; i++)
+        if (dm->slots[i].active && dm->slots[i].peer_inbound)
+            inbound++;
+    return inbound >= inbound_limit;
 }
 
 bool dl_mark_requested(struct download_manager *dm,
@@ -618,7 +639,9 @@ bool dl_mark_requested(struct download_manager *dm,
     }
 
     /* Check global limit (dynamic: aggressive during IBD) */
-    if (dm->num_active >= dl_get_max_in_flight_total()) {
+    size_t global_limit = dl_get_max_in_flight_total();
+    if (dm->num_active >= global_limit ||
+        dl_inbound_window_full_locked(dm, peer_id, global_limit)) {
         zcl_mutex_unlock(&dm->cs);
         return false;
     }
@@ -1185,7 +1208,8 @@ static bool dl_assignment_peer_is_parked(const struct download_manager *dm,
                 return false;
     }
     if ((ps->zero_assign_result == DL_ASSIGN_PEER_WINDOW_FULL ||
-         ps->zero_assign_result == DL_ASSIGN_GLOBAL_WINDOW_FULL) &&
+         ps->zero_assign_result == DL_ASSIGN_GLOBAL_WINDOW_FULL ||
+         ps->zero_assign_result == DL_ASSIGN_INBOUND_WINDOW_FULL) &&
         ps->zero_assign_global_limit != dl_get_max_in_flight_total())
         return false;
     return ps->zero_assign_retry_after <= 0 ||
@@ -1244,6 +1268,52 @@ static size_t dl_scan_queue_for_peer(struct download_manager *dm,
     return scan_to;
 }
 
+struct dl_assignment_counts {
+    size_t peer;
+    size_t history_peer;
+    size_t history_global;
+    size_t inbound;
+};
+
+static struct dl_assignment_counts dl_count_assignment_slots(
+    const struct download_manager *dm, uint32_t peer_id)
+{
+    struct dl_assignment_counts counts = {0};
+    for (size_t i = 0; i < dm->num_slots; i++) {
+        const struct dl_in_flight *slot = &dm->slots[i];
+        if (!slot->active)
+            continue;
+        if (slot->peer_inbound)
+            counts.inbound++;
+        if (slot->work_class == DL_WORK_HISTORY) {
+            counts.history_global++;
+            if (slot->peer_id == peer_id)
+                counts.history_peer++;
+        }
+        if (slot->peer_id == peer_id)
+            counts.peer++;
+    }
+    return counts;
+}
+
+static size_t dl_clamp_inbound_available(const struct dl_peer_stats *peer,
+                                         size_t inbound_count,
+                                         size_t global_limit,
+                                         size_t available,
+                                         bool *window_full)
+{
+    *window_full = false;
+    if (!peer || !peer->is_inbound)
+        return available;
+    size_t inbound_limit = global_limit / 2;
+    if (inbound_limit == 0)
+        inbound_limit = 1;
+    *window_full = inbound_count >= inbound_limit;
+    size_t inbound_available = *window_full ? 0 :
+        inbound_limit - inbound_count;
+    return available < inbound_available ? available : inbound_available;
+}
+
 size_t dl_assign_to_peer(struct download_manager *dm,
                          uint32_t peer_id,
                          struct uint256 *out_hashes,
@@ -1262,20 +1332,11 @@ size_t dl_assign_to_peer(struct download_manager *dm,
     /* Adaptive per-peer limit: fast peers get larger windows.
      * bandwidth_score 0-63 → 16 slots, 64-127 → 32-64, 128+ → 64-128.
      * This naturally gives ~4x more work to 4x-faster peers. */
-    size_t peer_count = 0;
-    size_t history_peer_count = 0;
-    size_t history_global_count = 0;
-    for (size_t i = 0; i < dm->num_slots; i++) {
-        if (!dm->slots[i].active)
-            continue;
-        if (dm->slots[i].work_class == DL_WORK_HISTORY) {
-            history_global_count++;
-            if (dm->slots[i].peer_id == peer_id)
-                history_peer_count++;
-        }
-        if (dm->slots[i].peer_id == peer_id)
-            peer_count++;
-    }
+    struct dl_assignment_counts counts =
+        dl_count_assignment_slots(dm, peer_id);
+    size_t peer_count = counts.peer;
+    size_t history_peer_count = counts.history_peer;
+    size_t history_global_count = counts.history_global;
     size_t forward_queued = 0;
     size_t history_queued = 0;
     for (size_t i = 0; i < dm->queue_len; i++) {
@@ -1317,6 +1378,11 @@ size_t dl_assign_to_peer(struct download_manager *dm,
     else if (dm->num_active + available > global_limit)
         available = global_limit - dm->num_active;
 
+    bool inbound_window_full = false;
+    available = dl_clamp_inbound_available(
+        ps_assign, counts.inbound, global_limit, available,
+        &inbound_window_full);
+
     /* History owns a subordinate lane. These limits never charge forward
      * work, so a saturated history lane cannot block a new tip request. */
     size_t history_available = 0;
@@ -1343,6 +1409,8 @@ size_t dl_assign_to_peer(struct download_manager *dm,
         assign_result = DL_ASSIGN_PEER_WINDOW_FULL;
     else if (active_before >= global_limit)
         assign_result = DL_ASSIGN_GLOBAL_WINDOW_FULL;
+    else if (inbound_window_full)
+        assign_result = DL_ASSIGN_INBOUND_WINDOW_FULL;
     else if (forward_queued == 0 && history_queued > 0 &&
              history_available == 0)
         assign_result = DL_ASSIGN_HISTORY_THROTTLED;
@@ -1617,6 +1685,19 @@ void dl_set_peer_loopback(struct download_manager *dm,
     struct dl_peer_stats *ps = dl_find_peer(dm, peer_id, true);
     if (ps && ps->is_loopback != is_loopback) {
         ps->is_loopback = is_loopback;
+        dl_generation_advance(&dm->capacity_generation);
+    }
+    zcl_mutex_unlock(&dm->cs);
+}
+
+void dl_set_peer_inbound(struct download_manager *dm,
+                         uint32_t peer_id, bool is_inbound)
+{
+    if (!dm) return;
+    zcl_mutex_lock(&dm->cs);
+    struct dl_peer_stats *ps = dl_find_peer(dm, peer_id, true);
+    if (ps && ps->is_inbound != is_inbound) {
+        ps->is_inbound = is_inbound;
         dl_generation_advance(&dm->capacity_generation);
     }
     zcl_mutex_unlock(&dm->cs);
