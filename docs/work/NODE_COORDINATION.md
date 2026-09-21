@@ -1879,3 +1879,24 @@ admitted source owns the chunk. Consensus impact: NONE. Worldstream
 `d9f5153be` remains complementary storage/startup work. Remaining risk and
 next investigation: measure source fairness across repeated timeout and
 disconnect churn with more than two compatible peers.
+
+## Block-swarm timeout-source yield
+
+Baseline and root cause: block-swarm pipeline reconciliation yielded a timed
+out owner only for its current send callback. On the next fixed-order tick,
+the cleared pipeline had no memory of that timeout and could reclaim work
+ahead of a healthy admitted peer. A direct scheduler fixture also exposed that
+such volatile state must not survive a new manifest generation.
+
+Fix and after-result: a peer now retains a one-second monotonic timeout-yield
+deadline. Assignment suppresses only new work while that bounded deadline is
+active; a new block-swarm generation clears it at peer admission. This keeps
+same-generation reassignment fair without contaminating restart/recovery.
+
+Regression proof: `test_block_swarm_loopback` proves timeout reconciliation
+records the deadline and that a later generation clears it while preserving
+the established full one-peer pipeline capacity. The complete real-wire group
+passes. Consensus impact: NONE. Worldstream `d9f5153be` remains complementary
+storage/startup work. Remaining risk and next investigation: add a direct
+multi-peer repeated-timeout scheduler fixture that observes the production
+second-tick assignment rather than only its bounded deadline.

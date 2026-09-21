@@ -559,6 +559,9 @@ struct p2p_node {
     uint64_t blk_manifest_generation; /* bounded parse generation */
     uint8_t blk_manifest_attempts; /* parses allowed in that generation */
     uint64_t blk_manifest_admitted_generation; /* exact active manifest */
+    /* A timed-out source yields one bounded scheduler interval so an
+     * already-admitted healthy source can claim the requeued work. */
+    int64_t blk_timeout_yield_until; /* monotonic seconds; 0 = none */
     struct {
         int32_t piece_index;      /* -1 = empty slot */
         int64_t request_time;     /* monotonic seconds at request */

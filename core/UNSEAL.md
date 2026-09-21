@@ -648,3 +648,7 @@ later lane flips it HARD.
 - 2026-09-21T15:03:48Z — REASON: Give an already-admitted snapshot source an immediate reassignment opportunity after another source times out.
   old ROOT: 5afd3b1d83bca54918c95a5d899b021916e0d0193ac6defff1c9709fca4b5b5a
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T15:09:30Z — REASON: Preserve one bounded healthy-peer reassignment opportunity after a block-swarm source times out.
+  old ROOT: 36a9c0ddcd1c5fe35fe041e39c042e1e59d55d319b75cf75c86d94f1fd5ef623
+  by: owner unseal ritual (make core-unseal)

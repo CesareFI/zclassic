@@ -1714,12 +1714,17 @@ static int test_block_swarm_timeout_owner_yields(void)
                 &swarm, &slow, requested_at + timeout_secs + 1);
         ASSERT(reconciled.cleared == 1);
         ASSERT(reconciled.timed_out);
+        ASSERT(slow.blk_timeout_yield_until == requested_at + timeout_secs + 2);
         ASSERT(atomic_load(&slow.blk_pieces_timed_out) == 1);
         block_swarm_handle_timeouts(&swarm, timeout_secs);
         int32_t slow_retry = reconciled.timed_out ? -1 :
             block_swarm_assign_piece(&swarm, slow.id, NULL, 0);
         ASSERT(slow_retry < 0);
         ASSERT(block_swarm_assign_piece(&swarm, 22, NULL, 0) == 0);
+
+        /* The yield persists through the following scheduler pass, rather
+         * than disappearing with `reconciled.timed_out`. */
+        ASSERT(slow.blk_timeout_yield_until > requested_at + timeout_secs + 1);
 
         block_swarm_free(&swarm);
         PASS();

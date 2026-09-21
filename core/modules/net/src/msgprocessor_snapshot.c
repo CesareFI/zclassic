@@ -209,6 +209,13 @@ static int block_swarm_assignment_batch(bool peer_timed_out, bool inbound,
         ? (int)remaining : BLOCK_PIECE_ASSIGN_BATCH;
 }
 
+static bool block_swarm_timeout_yield_active(const struct p2p_node *node,
+                                             int64_t now_monotonic)
+{
+    return node && node->blk_timeout_yield_until > now_monotonic &&
+        node->blk_timeout_yield_until - now_monotonic <= 1;
+}
+
 static int64_t block_pipeline_clear_piece(struct p2p_node *node,
                                           uint32_t piece_index)
 {
@@ -586,6 +593,9 @@ static bool block_swarm_admit_manifest_source(
         admitted = true;
         *started_out = true;
     }
+    if (admitted && node->blk_manifest_admitted_generation !=
+        g_block_swarm_generation)
+        node->blk_timeout_yield_until = 0;
     node->blk_manifest_received = admitted;
     node->blk_manifest_admitted_generation = admitted ?
         g_block_swarm_generation : 0;
@@ -1014,6 +1024,9 @@ bool mp_block_swarm_test_admit_peer(struct p2p_node *node)
         return false;
     pthread_mutex_lock(&g_block_swarm_mutex);
     bool admitted = atomic_load(&g_block_swarm_active);
+    if (admitted && node->blk_manifest_admitted_generation !=
+        g_block_swarm_generation)
+        node->blk_timeout_yield_until = 0;
     node->blk_manifest_received = admitted;
     node->blk_manifest_admitted_generation = admitted ?
         g_block_swarm_generation : 0;
@@ -2523,6 +2536,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         struct block_swarm_pipeline_reconcile reconciled =
             mp_block_swarm_reconcile_peer_pipeline(
                 &g_block_swarm, node, now_bs);
+        reconciled.timed_out |= block_swarm_timeout_yield_active(node,
+                                                                  now_bs);
         /* Give exact-owner reconciliation the first timeout window. A global
          * sweep at the same deadline let an earlier peer in connman's fixed
          * order expire another peer's pieces before that owner ran, losing
