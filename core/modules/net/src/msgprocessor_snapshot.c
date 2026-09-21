@@ -298,7 +298,7 @@ static uint64_t g_block_swarm_generation = 0;
 static _Atomic int64_t g_block_swarm_reaped_monotonic = 0;
 
 static bool block_swarm_peer_response_allowed(
-    const struct p2p_node *node, uint32_t piece_index)
+    struct p2p_node *node, uint32_t piece_index)
 {
     if (!node)
         return false;
@@ -309,7 +309,14 @@ static bool block_swarm_peer_response_allowed(
     bool requested = false;
     for (int pi = 0; admitted && pi < PIECE_PIPELINE_DEPTH; pi++) {
         if (node->blk_pipeline[pi].piece_index == (int32_t)piece_index) {
-            requested = true;
+            requested = piece_index < g_block_swarm.manifest.num_pieces &&
+                g_block_swarm.piece_states[piece_index] == CHUNK_INFLIGHT &&
+                g_block_swarm.piece_peer[piece_index] == node->id;
+            if (!requested) {
+                node->blk_pipeline[pi].piece_index = -1;
+                node->blk_pipeline[pi].request_time = 0;
+                node->blk_pipeline[pi].request_time_us = 0;
+            }
             break;
         }
     }
@@ -822,6 +829,19 @@ bool mp_block_swarm_test_admit_peer(struct p2p_node *node)
         g_block_swarm_generation : 0;
     pthread_mutex_unlock(&g_block_swarm_mutex);
     return admitted;
+}
+
+bool mp_block_swarm_test_requeue_peer_piece(struct p2p_node *node,
+                                             uint32_t piece_index)
+{
+    if (!node)
+        return false;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    bool requeued = atomic_load(&g_block_swarm_active) &&
+        block_swarm_requeue_piece_for_peer(
+            &g_block_swarm, piece_index, node->id);
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return requeued;
 }
 
 bool mp_block_swarm_test_restart_manifest(

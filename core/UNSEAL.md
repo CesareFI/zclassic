@@ -516,3 +516,7 @@ later lane flips it HARD.
 - 2026-09-21T07:36:43Z — REASON: Reserve block-swarm forward-window capacity from inbound-first send ordering so healthy outbound peers cannot be starved; transport scheduling only, consensus and validation unchanged
   old ROOT: b1d19b6f144ecf8ff56b2286c42333231ab118a2349fcad0f85c28655947f1cd
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T07:50:14Z — REASON: Reject stale block-piece responses before body parsing when global timeout or reassignment has revoked peer ownership; transport resource accounting only, consensus and validation unchanged
+  old ROOT: 0c428e3cd4f8f45b134c59aa777563ede43521dcd7d8423bef2e538727119edd
+  by: owner unseal ritual (make core-unseal)

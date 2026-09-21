@@ -809,9 +809,8 @@ consulted at the receive boundary. The handler now requires the peer to be an
 admitted source for the exact active generation and the piece index to exist in
 that peer's pipeline before allocating hash storage or parsing/submitting block
 bodies. A timed-out late response is refused without peer punishment because
-lateness alone is not proof of malicious behavior. Legitimate late delivery
-after reassignment remains accepted while its original pipeline slot is still
-outstanding.
+lateness alone is not proof of malicious behavior. A later ownership-hardening
+slice also requires the global piece owner to remain the sender before intake.
 
 After-result and regression proof: the framed unsolicited response contributes
 zero submitted blocks and leaves the swarm active. The duplicate regression
@@ -930,3 +929,35 @@ Remaining risk and next investigation: use the new per-peer counters during an
 isolated multi-peer sync to measure whether the fixed 50% inbound allowance is
 well utilized, then inspect block-swarm timeout ownership under repeated peer
 reconnect and endpoint replacement.
+
+## Refuse globally stale block responses before body intake
+
+Baseline: a global timeout sweep can requeue or reassign a piece before the
+old peer's own send tick reconciles its local pipeline. The response gate saw
+that stale local slot and admitted the response, parsing and submitting as many
+as 64 bodies before the post-submit ownership check correctly refused swarm
+credit. A slow peer could therefore consume reducer and parsing capacity after
+its work had already moved to a healthy source.
+
+Root cause: pre-intake authorization required exact swarm generation and a
+local pipeline slot but did not require the global piece state to remain
+`CHUNK_INFLIGHT` with the same peer ID. The gate now checks all three under the
+existing swarm mutex. Revoked ownership clears the stale slot and refuses the
+payload without scoring the peer, allowing immediate reassignment while
+avoiding untrusted body work.
+
+After-result and regression proof: the framed wire fixture requeues piece zero
+globally while deliberately retaining the old peer's local slot, then delivers
+its valid response. Submitted block count remains unchanged, the stale slot is
+reused on the next tick, and the distinct during-submit ownership race remains
+covered. `block_swarm_loopback` passes at 31,412 blocks/s (46.4 MB/s).
+
+Consensus impact: NONE. The change refuses a response whose transport request
+ownership has already expired; every admitted block still traverses canonical
+validation. Wire format, chain history, PoW, transaction validity, and
+cryptographic checks are unchanged. Worldstream remains at `0b29bec27` on
+complementary startup/observer work.
+
+Remaining risk and next investigation: inspect repeated reconnect and endpoint
+replacement for stale manifest admission or bitmap contributions, then use an
+isolated multi-peer sync to collect the new delivery/timeout counters.

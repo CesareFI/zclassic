@@ -93,6 +93,8 @@ bool mp_snapshot_test_chunk_state(uint32_t chunk_index,
 void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
                                     int64_t last_complete_monotonic);
 bool mp_block_swarm_test_admit_peer(struct p2p_node *node);
+bool mp_block_swarm_test_requeue_peer_piece(struct p2p_node *node,
+                                             uint32_t piece_index);
 bool mp_block_swarm_test_restart_manifest(
     const struct block_piece_manifest *manifest);
 
@@ -1763,6 +1765,19 @@ static int test_block_swarm_duplicate_delivery(void)
         ASSERT(mp_block_swarm_test_admit_peer(b_node));
         mp_snapshot_send_tick(&mp_b, b_node);
         ASSERT(bs_queue_depth(sent_b) == 2);
+        bs_drop_queue(b_node, sent_b);
+
+        /* A global timeout sweep can revoke ownership before this peer's
+         * local pipeline reconciliation runs. Its stale slot must not admit
+         * 64 bodies into reducer intake. The receive gate also clears that
+         * slot so the immediately-needed piece can be requested again. */
+        uint64_t blocks_before_stale = sink.blocks;
+        ASSERT(mp_block_swarm_test_requeue_peer_piece(b_node, 0));
+        ASSERT(bs_deliver(&mp_b, b_node, &kept[0],
+                          params->pchMessageStart));
+        ASSERT(sink.blocks == blocks_before_stale);
+        mp_snapshot_send_tick(&mp_b, b_node);
+        ASSERT(bs_queue_depth(sent_b) == 1);
         bs_drop_queue(b_node, sent_b);
 
         /* Same-generation ownership can also change while body submission
