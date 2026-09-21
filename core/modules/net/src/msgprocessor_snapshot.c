@@ -1240,7 +1240,8 @@ size_t mp_snapshot_swarm_peer_disconnected(struct p2p_node *node)
          * single terminal cleanup site; scanning the bounded manifest table
          * prevents that churn from stranding owned chunks until timeout. */
         if (atomic_load(&g_swarm_active))
-            requeued = swarm_sync_peer_disconnected(&g_swarm, node->id);
+            requeued = swarm_sync_peer_disconnected_hint(
+                &g_swarm, node->id, node->swarm_inflight_chunk);
         if (requeued > 0)
             swarm_record_reconnect_yield_locked(
                 node, platform_time_monotonic_us() / 1000000);

@@ -1429,10 +1429,22 @@ size_t swarm_sync_peer_disconnected(struct swarm_sync *ss, int peer_id)
         return 0;
     size_t requeued = 0;
     for (uint32_t i = 0; i < ss->manifest.num_chunks; i++) {
+        ss->disconnect_probes++;
         if (swarm_sync_requeue_chunk_for_peer(ss, i, peer_id))
             requeued++;
     }
     return requeued;
+}
+
+size_t swarm_sync_peer_disconnected_hint(struct swarm_sync *ss, int peer_id,
+                                         int32_t chunk_hint)
+{
+    if (!ss || !ss->chunk_states || !ss->chunk_peer)
+        return 0;
+    if (chunk_hint >= 0 &&
+        swarm_sync_requeue_chunk_for_peer(ss, (uint32_t)chunk_hint, peer_id))
+        return 1;
+    return swarm_sync_peer_disconnected(ss, peer_id);
 }
 
 static bool swarm_sync_receive_owner(const struct swarm_sync *ss,

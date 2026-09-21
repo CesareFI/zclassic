@@ -336,6 +336,7 @@ struct swarm_sync {
     uint32_t chunks_failed;
     uint32_t next_needed_hint;         /* bounded assignment scan cursor */
     uint64_t assignment_probes;        /* inspected states; test/diagnostic */
+    uint64_t disconnect_probes;        /* fallback ownership scans; diagnostic */
     const char *datadir;               /* for applying chunks */
 };
 
@@ -358,6 +359,11 @@ bool swarm_sync_requeue_chunk_for_peer(struct swarm_sync *ss,
 
 /* Requeue every in-flight chunk still owned by a disconnected peer. */
 size_t swarm_sync_peer_disconnected(struct swarm_sync *ss, int peer_id);
+
+/* Requeue a known owner in O(1).  A stale or absent hint falls back to the
+ * authoritative bounded ownership scan used by peer-disconnect recovery. */
+size_t swarm_sync_peer_disconnected_hint(struct swarm_sync *ss, int peer_id,
+                                         int32_t chunk_hint);
 
 /* Mark a chunk as received and verified. Returns false if bad hash. */
 bool swarm_sync_receive_chunk(struct swarm_sync *ss,

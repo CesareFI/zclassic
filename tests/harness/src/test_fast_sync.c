@@ -712,6 +712,41 @@ static int test_swarm_disconnect_reassign(void)
     return failures;
 }
 
+static int test_swarm_disconnect_hint_recovery(void)
+{
+    int failures = 0;
+    TEST("swarm disconnect hint avoids normal scan and recovers stale state") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 3;
+        manifest.chunk_size = 500;
+        manifest.chunk_hashes = zcl_calloc(3, 32, "test_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+
+        struct swarm_sync ss;
+        ASSERT(swarm_sync_init(&ss, &manifest, NULL));
+        ASSERT(swarm_sync_assign_chunk(&ss, 11) == 0);
+        ASSERT(swarm_sync_assign_chunk(&ss, 22) == 1);
+        ASSERT(swarm_sync_peer_disconnected_hint(&ss, 11, 0) == 1);
+        ASSERT(ss.disconnect_probes == 0);
+        ASSERT(ss.chunk_states[0] == CHUNK_NEEDED);
+        ASSERT(ss.chunk_states[1] == CHUNK_INFLIGHT);
+        ASSERT(ss.chunk_peer[1] == 22);
+
+        /* A peer-local hint can be cleared before terminal cleanup.  The
+         * bounded authoritative scan must still release its real owner. */
+        ASSERT(swarm_sync_peer_disconnected_hint(&ss, 22, -1) == 1);
+        ASSERT(ss.disconnect_probes == manifest.num_chunks);
+        ASSERT(ss.chunks_inflight == 0);
+        ASSERT(ss.chunk_states[1] == CHUNK_NEEDED);
+
+        swarm_sync_free(&ss);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_swarm_stale_timeout_preserves_new_owner(void)
 {
     int failures = 0;
@@ -2145,6 +2180,7 @@ int test_fast_sync(void)
     failures += test_swarm_timeout_reassign();
     failures += test_swarm_malformed_response_reassign();
     failures += test_swarm_disconnect_reassign();
+    failures += test_swarm_disconnect_hint_recovery();
     failures += test_swarm_stale_timeout_preserves_new_owner();
     failures += test_swarm_receive_requires_current_owner();
     failures += test_swarm_bad_sources_cannot_exhaust_chunk();

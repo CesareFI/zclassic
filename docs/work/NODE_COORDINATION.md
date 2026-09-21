@@ -2064,3 +2064,24 @@ Consensus impact: NONE. Worldstream `5297c58f4` remains complementary classic
 download timeout work. Remaining risk and next investigation: add direct
 wire-level `zchunkdata` coverage for malformed, duplicate, and late chunk
 delivery accounting.
+
+## Snapshot disconnect ownership fast path
+
+Baseline and root cause: terminal snapshot-peer cleanup always scanned every
+manifest chunk to find an owner.  Normal scheduling assigns at most one chunk
+per peer, so reconnect churn repeatedly paid an O(manifest-size) scan even
+when the peer's exact in-flight index was still available.
+
+Fix and after-result: disconnect cleanup first validates and requeues the
+peer-local chunk index in O(1).  A missing or stale index still takes the
+former bounded authoritative scan, preserving recovery when connman has
+already cleared peer-local state.  The new diagnostic probe counter makes the
+normal zero-scan and stale fallback paths deterministic to test.
+
+Regression proof: `test_fast_sync` covers both the exact-owner fast path and
+the cleared-hint fallback, including owner, state, and in-flight accounting.
+Consensus impact: NONE; this changes only volatile request cleanup. Worldstream
+`5297c58f4` remains complementary classic download timeout work. Remaining
+risk: runtime test execution awaits safe build headroom; seal, parity,
+complexity, and capability-inventory gates pass. Next investigation: measure
+snapshot scheduler work under large manifests and repeated reconnects.

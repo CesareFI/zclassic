@@ -680,3 +680,7 @@ later lane flips it HARD.
 - 2026-09-21T17:09:48Z — REASON: Release header span when anchor resolution fails
   old ROOT: 90c0d939a4051133bc01a2e5cc8ee0fb417e5f5201b857e2cd3fe3abcaf6b5d9
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:31:40Z — REASON: Avoid full snapshot-manifest scans on ordinary peer disconnect while retaining stale-state recovery
+  old ROOT: 12850759442b7f639f52c99ba019aa83ecee58d1a77de46d54e3a38e9c8a1760
+  by: owner unseal ritual (make core-unseal)
