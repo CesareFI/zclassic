@@ -897,6 +897,57 @@ void mp_serve_block_req(struct msg_processor *mp, struct p2p_node *node,
     }
 }
 
+static void mp_snapshot_send_tick_serve_stream(struct msg_processor *mp,
+                                               struct p2p_node *node,
+                                               const uint8_t *buf,
+                                               int64_t buf_size)
+{
+    for (int batch = 0; batch < 200; batch++) {
+        if (node->send_size > 8 * 1024 * 1024)
+            break;
+        struct snapsync_serve_step step;
+        if (!snapsync_prepare_serve_step(&step, node, buf, buf_size).ok ||
+            step.action == SNAPSYNC_SERVE_ACTION_NONE)
+            break;
+        if (step.action == SNAPSYNC_SERVE_ACTION_SEND_END) {
+            struct snapsync_serve_complete complete = {0};
+            snapsync_build_serve_complete(&complete);
+            p2p_node_begin_message(node, MSG_SNAPSHOT_END,
+                                   mp->params->pchMessageStart);
+            if (!p2p_node_end_message(node))
+                break;
+            if (complete.should_update_peer_state) {
+                peer_set_state_checked((uint32_t)node->id, &node->state,
+                                       complete.peer_state,
+                                       "snapshot serve done");
+            }
+            printf("Peer %s: snapshot complete (%llu UTXOs, "
+                   "%llu chunks sent)\n", node->addr_name,
+                   (unsigned long long)node->zsync_offset,
+                   (unsigned long long)node->zsync_sent);
+            break;
+        }
+        p2p_node_begin_message(node, MSG_SNAPSHOT_DATA,
+                               mp->params->pchMessageStart);
+        p2p_node_write_message_data(node, buf + step.chunk_offset,
+                                    step.chunk_len);
+        if (!p2p_node_end_message(node)) {
+            node->zsync_file_offset = step.chunk_offset;
+            node->zsync_offset -= step.entries;
+            node->zsync_sent--;
+            break;
+        }
+        if (node->zsync_sent % 100 == 0) {
+            printf("Peer %s: sent %llu/%llu UTXOs (%.0f%%)\n",
+                   node->addr_name, (unsigned long long)node->zsync_offset,
+                   (unsigned long long)node->zsync_total,
+                   node->zsync_total > 0 ?
+                       100.0 * (double)node->zsync_offset /
+                       (double)node->zsync_total : 0);
+        }
+    }
+}
+
 /* The PEER_SNAPSHOT_SERVING half of mp_snapshot_send_tick. Extracted as
  * bool-returning: the original inline code did `return;` out of the
  * WHOLE mp_snapshot_send_tick on a stale-offer reset, skipping the
@@ -935,55 +986,7 @@ bool mp_snapshot_send_tick_serve(struct msg_processor *mp,
                                    "snapshot serve stale offer");
             return true;
         }
-        /* Send chunks from memory, respecting TCP flow control.
-         * Stop when send buffer exceeds 8MB to avoid unbounded
-         * backlog that stalls the receiver.  The receiver's stall
-         * detector fires at 120s — we must not queue more than
-         * the receiver can process in that window. */
-        for (int batch = 0; batch < 200; batch++) {
-            if (node->send_size > 8 * 1024 * 1024)
-                break;  /* backpressure: wait for drain */
-            struct snapsync_serve_step step;
-            if (!snapsync_prepare_serve_step(&step, node, buf, buf_size).ok)
-                break;
-            if (step.action == SNAPSYNC_SERVE_ACTION_NONE)
-                break;
-            if (step.action == SNAPSYNC_SERVE_ACTION_SEND_END) {
-                /* EOF — all UTXOs sent */
-                struct snapsync_serve_complete complete = {0};
-                snapsync_build_serve_complete(&complete);
-                p2p_node_begin_message(node, MSG_SNAPSHOT_END,
-                                        mp->params->pchMessageStart);
-                p2p_node_end_message(node);
-                if (complete.should_update_peer_state) {
-                    peer_set_state_checked((uint32_t)node->id, &node->state,
-                                           complete.peer_state,
-                                           "snapshot serve done");
-                }
-                printf("Peer %s: snapshot complete (%llu UTXOs, "
-                       "%llu chunks sent)\n",
-                       node->addr_name,
-                       (unsigned long long)node->zsync_offset,
-                       (unsigned long long)node->zsync_sent);
-                break;
-            }
-
-            /* Send chunk directly from memory — true zero-copy */
-            p2p_node_begin_message(node, MSG_SNAPSHOT_DATA,
-                                    mp->params->pchMessageStart);
-            p2p_node_write_message_data(node, buf + step.chunk_offset,
-                                        step.chunk_len);
-            p2p_node_end_message(node);
-
-            if (node->zsync_sent % 100 == 0) {
-                printf("Peer %s: sent %llu/%llu UTXOs (%.0f%%)\n",
-                       node->addr_name,
-                       (unsigned long long)node->zsync_offset,
-                       (unsigned long long)node->zsync_total,
-                       node->zsync_total > 0 ?
-                           100.0 * (double)node->zsync_offset / (double)node->zsync_total : 0);
-            }
-        }
+        mp_snapshot_send_tick_serve_stream(mp, node, buf, buf_size);
     } else {
         fprintf(stderr, "Peer %s: no snapshot in memory\n", node->addr_name);  // obs-ok:helper-context-logged
         peer_set_state_checked((uint32_t)node->id, &node->state,

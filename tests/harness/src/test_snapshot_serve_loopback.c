@@ -33,7 +33,7 @@
  * in this test is therefore parsed and dispatched by the same code a live
  * socket would drive — only the socket syscalls are elided.
  *
- * Two deliberate, documented shortcuts (neither touches protocol bytes):
+ * One deliberate, documented shortcut (it does not touch protocol bytes):
  *
  *   1. FlyClient round trip. snapsync_offer_followup_action() only sends
  *      zsnapreq once svc->fc_verified is true, which normally requires a
@@ -47,20 +47,10 @@
  *      this test DOES send (zsnapshot, zsnapreq, zsnapdata, zsnapend) is
  *      real wire traffic dispatched by the real handler.
  *
- *   2. mp_snapshot_send_tick() itself (the per-peer serve-tick scheduler)
- *      lives in core/modules/net/src/msgprocessor_internal.h, a private header not
- *      on the test include path (LIB_INCLUDES only exposes lib/<name>/include).
- *      lb_drive_serve_tick() below reproduces its snapshot-serving loop
- *      verbatim from PUBLIC primitives only (snapsync_prepare_serve_step,
- *      fast_sync_get_snapshot_buf, p2p_node_begin/write/end_message,
- *      MSG_SNAPSHOT_DATA/END) — the same primitives
- *      net/snapshot_sync_contract.h exports specifically so a caller can
- *      drive this loop. Calling the real msg_send_messages() instead was
- *      evaluated and rejected: it is a kitchen-sink per-peer tick (header
- *      sync, download-manager assignment, IBD stall/eviction, ping) built
- *      for a live chain with real headers, and running it against a
- *      two-block fixture chain risks exercising unrelated machinery this
- *      test has no fixture for.
+ * The per-peer scheduler is invoked directly through a narrow forward
+ * declaration rather than via msg_send_messages(), which also drives header
+ * sync, download assignment, IBD eviction, and ping against a fixture that
+ * intentionally contains none of that unrelated live-chain state.
  *
  * HONEST-SERVER CONTAINMENT (asserted below): a fully valid, SHA3-verified
  * snapshot transfer over this wire loop still fails to activate, because
@@ -103,6 +93,11 @@
 #include <unistd.h>
 
 #define LB_ENTRY_COUNT 3
+
+/* Defined in the networking implementation's private header. This harness
+ * already owns the full isolated message-processor fixture, so drive the
+ * production per-peer tick directly rather than duplicate its accounting. */
+void mp_snapshot_send_tick(struct msg_processor *mp, struct p2p_node *node);
 
 /* ── Fixture: a tiny, deterministic 3-UTXO "snapshot" ────────────────── */
 
@@ -182,38 +177,10 @@ static bool lb_pump(struct p2p_node *from, struct send_segment *sentinel,
     return true;
 }
 
-/* Reproduces mp_snapshot_send_tick()'s snapshot-serving loop from PUBLIC
- * primitives only — see the file header "shortcut 2" for why. */
+/* Drive the production snapshot-serving tick in the isolated fixture. */
 static void lb_drive_serve_tick(struct msg_processor *mp, struct p2p_node *node)
 {
-    int64_t buf_size = 0;
-    const uint8_t *buf = fast_sync_get_snapshot_buf(&buf_size);
-
-    if (!buf || buf_size <= 0)
-        return;
-    for (int batch = 0; batch < 200; batch++) {
-        struct snapsync_serve_step step;
-
-        if (node->send_size > 8 * 1024 * 1024)
-            break;
-        if (!snapsync_prepare_serve_step(&step, node, buf, buf_size).ok)
-            break;
-        if (step.action == SNAPSYNC_SERVE_ACTION_NONE)
-            break;
-        if (step.action == SNAPSYNC_SERVE_ACTION_SEND_END) {
-            p2p_node_begin_message(node, MSG_SNAPSHOT_END,
-                                   mp->params->pchMessageStart);
-            p2p_node_end_message(node);
-            peer_set_state_checked((uint32_t)node->id, &node->state,
-                                   PEER_ACTIVE, "snapshot serve done (test)");
-            break;
-        }
-        p2p_node_begin_message(node, MSG_SNAPSHOT_DATA,
-                               mp->params->pchMessageStart);
-        p2p_node_write_message_data(node, buf + step.chunk_offset,
-                                    step.chunk_len);
-        p2p_node_end_message(node);
-    }
+    mp_snapshot_send_tick(mp, node);
 }
 
 static int64_t lb_count_rows(sqlite3 *db, const char *table)
@@ -483,9 +450,17 @@ static int test_snapshot_serve_loopback_impl(enum lb_snapshot_case test_case)
         ASSERT(census_after.first_sight + census_after.duplicates ==
                census_after.offered);
 
-        /* ── Step 5 (documented send-tick substitution — shortcut 2):
-         * streams both real zsnapdata chunks + zsnapend from the real
-         * in-RAM snapshot buffer via snapsync_prepare_serve_step. */
+        /* A rejected zsnapdata must not consume the serving cursor. */
+        node_a_side->send_size = net_send_peer_bytes_hard_cap();
+        lb_drive_serve_tick(&mp_a, node_a_side);
+        node_a_side->send_size = 0;
+        ASSERT(node_a_side->state == PEER_SNAPSHOT_SERVING);
+        ASSERT(node_a_side->zsync_file_offset == 0);
+        ASSERT(node_a_side->zsync_offset == 0);
+        ASSERT(node_a_side->zsync_sent == 0);
+
+        /* ── Step 5: streams both real zsnapdata chunks + zsnapend from
+         * the real in-RAM snapshot buffer through the production tick. */
         lb_drive_serve_tick(&mp_a, node_a_side);
 
         /* ── Step 6: pump A->B, real receive dispatch. Applies both chunks

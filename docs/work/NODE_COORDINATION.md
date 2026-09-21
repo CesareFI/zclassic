@@ -1970,3 +1970,22 @@ The complete real-wire swarm and snapshot-serve groups pass. Consensus impact:
 NONE. Worldstream `5297c58f4` remains complementary timeout arithmetic work.
 Remaining risk and next investigation: audit offer refresh and serving-state
 transitions under disconnect after a successful advertisement.
+
+## Snapshot serving enqueue accounting
+
+Baseline and root cause: `snapsync_prepare_serve_step` advances the serving
+cursor before `zsyncdata` is queued. A bounded queue refusal therefore left
+the sender ahead of bytes that never reached the peer; a rejected `zsyncend`
+also moved the peer out of serving state without an end frame on the wire.
+
+Fix and after-result: rejected data frames restore the exact chunk offset,
+entry progress, and sent count; rejected end frames keep the peer in serving
+state. This preserves retry/reconnect accounting without changing payload
+bytes, snapshot validation, or acceptance policy.
+
+Regression proof: `test_snapshot_serve_loopback` now drives the production
+`mp_snapshot_send_tick`, saturates its real peer queue, and proves cursor and
+serving state remain unchanged before completing the normal real-wire transfer.
+Consensus impact: NONE. Worldstream `5297c58f4` remains complementary.
+Remaining risk and next investigation: audit snapshot serve state after a
+successful end-frame enqueue followed by immediate disconnect.

@@ -1316,7 +1316,6 @@ core/modules/net/src/msgprocessor_snapshot_serve.c:build_block_piece_payloads:21
 core/modules/net/src/msgprocessor_snapshot_serve.c:mp_serve_block_req:18
 core/modules/net/src/msgprocessor_snapshot_serve.c:mp_serve_chunk_req:16
 core/modules/net/src/msgprocessor_snapshot_serve.c:mp_serve_snapshot_req:18
-core/modules/net/src/msgprocessor_snapshot_serve.c:mp_snapshot_send_tick_serve:20
 core/modules/net/src/nat.c:http_request:28
 core/modules/net/src/net.c:ban_addr_ex:21
 core/modules/net/src/net.c:ban_db_read:33

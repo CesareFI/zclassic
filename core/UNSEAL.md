@@ -664,3 +664,7 @@ later lane flips it HARD.
 - 2026-09-21T15:59:02Z — REASON: Preserve snapshot offer retry state when bounded peer queues reject advertisements.
   old ROOT: c11e814f13d19a434940304aa87269e434fa780b3f116db9361799762b295a43
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T16:07:57Z — REASON: Preserve snapshot serving cursor and completion state when bounded queues reject data or end frames.
+  old ROOT: 3b505205f3aeeb339e5fd96f00bcfe021d4cfa5b770352f7e84959ab877def29
+  by: owner unseal ritual (make core-unseal)
