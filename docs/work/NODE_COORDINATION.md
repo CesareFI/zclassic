@@ -1150,3 +1150,27 @@ Worldstream remains at `0b29bec27` on complementary startup/observer work.
 Remaining risk and next investigation: test a genuinely new peer object after
 reconnect (not only a reset existing object), then inspect whether bounded
 manifest-attempt state can incorrectly exclude a valid replacement source.
+
+## Keep snapshot manifest attempt limits session-local
+
+Baseline and root cause: manifest attempts are intentionally capped at two
+per peer object and swarm generation. The reconnect fixture previously reused
+a reset object, so it did not prove that an endpoint whose old session spent
+both attempts on incompatible manifests could return in a fresh session as a
+valid source. Code inspection showed the counters live on `p2p_node`, but the
+session boundary lacked direct wire-level proof.
+
+Fix and after-result: the real-wire fixture now creates a second peer object
+for the same endpoint, exhausts the predecessor's attempt budget, and sends
+the exact active manifest on the new session. The replacement is admitted on
+attempt one and its terminal cleanup is independent. `block_swarm_loopback`
+passes together with the existing incompatible-source and generation gates.
+
+Consensus impact: NONE. This is deterministic transport regression coverage
+only. Worldstream remains at `0b29bec27` on complementary startup/observer
+work.
+
+Remaining risk and next investigation: inspect snapshot chunk assignment
+fairness when many admitted sources compete, especially whether fixed node
+iteration order lets one fast source repeatedly monopolize newly needed
+chunks after completions or timeouts.

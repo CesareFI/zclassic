@@ -758,10 +758,13 @@ static int test_snapshot_manifest_wire_reconnect(void)
         struct p2p_node *peer_a = bs_make_peer(&nm, 51);
         struct p2p_node *peer_b = bs_make_peer(&nm, 52);
         struct p2p_node *peer_bad = bs_make_peer(&nm, 53);
-        ASSERT(peer_a && peer_b && peer_bad);
+        struct p2p_node *peer_reconnect = bs_make_peer(&nm, 53);
+        ASSERT(peer_a && peer_b && peer_bad && peer_reconnect);
         struct send_segment *sent_a = bs_install_sentinel(peer_a);
         struct send_segment *sent_b = bs_install_sentinel(peer_b);
         struct send_segment *sent_bad = bs_install_sentinel(peer_bad);
+        struct send_segment *sent_reconnect =
+            bs_install_sentinel(peer_reconnect);
         bool ok = true;
 
         ASSERT(bs_push_manifest_frame(peer_a, mp.params, &manifest));
@@ -784,6 +787,17 @@ static int test_snapshot_manifest_wire_reconnect(void)
         ASSERT(bs_pump(peer_bad, sent_bad, &mp, peer_bad,
                        mp.params->pchMessageStart, &ok) > 0 && ok);
         ASSERT(!peer_bad->swarm_manifest_received);
+
+        /* The attempt cap belongs to one connection, not its endpoint. A
+         * genuinely new session from the same address must remain eligible
+         * to provide the exact active manifest after its predecessor used
+         * both bounded attempts on incompatible data. */
+        ASSERT(bs_push_manifest_frame(peer_reconnect, mp.params, &manifest));
+        ASSERT(bs_pump(peer_reconnect, sent_reconnect, &mp, peer_reconnect,
+                       mp.params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(peer_reconnect->swarm_manifest_received);
+        ASSERT(peer_reconnect->swarm_manifest_attempts == 1);
+        ASSERT(mp_snapshot_swarm_peer_disconnected(peer_reconnect) == 0);
 
         ASSERT(peer_a->swarm_inflight_chunk == 0);
         ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_a->id, 1, 0));
@@ -836,12 +850,15 @@ static int test_snapshot_manifest_wire_reconnect(void)
         send_segment_free(sent_a);
         send_segment_free(sent_b);
         send_segment_free(sent_bad);
+        send_segment_free(sent_reconnect);
         peer_a->send_head = peer_a->send_tail = NULL;
         peer_b->send_head = peer_b->send_tail = NULL;
         peer_bad->send_head = peer_bad->send_tail = NULL;
+        peer_reconnect->send_head = peer_reconnect->send_tail = NULL;
         p2p_node_free(peer_a);
         p2p_node_free(peer_b);
         p2p_node_free(peer_bad);
+        p2p_node_free(peer_reconnect);
         main_state_free(&ms);
         net_manager_free(&nm);
         free(manifest.chunk_hashes);
