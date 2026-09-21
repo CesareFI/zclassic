@@ -1740,3 +1740,31 @@ refusal changed.  Recommended next investigation: audit the ordinary header
 continuation calls issued directly from `process_headers`; they do not own a
 separate throttle, but ignored queue refusal may still delay recovery until the
 periodic planner runs.
+
+## Outbound version enqueue-failure recovery
+
+Baseline and root cause: the production send loop advanced an outbound peer
+from `PEER_CONNECTING` to `PEER_VERSION_SENT` unconditionally after calling
+`push_version`.  At the bounded per-peer send-queue ceiling,
+`p2p_node_end_message` refused the frame, but the state transition suppressed
+all later version attempts even though no version message existed on the wire
+queue.
+
+Fix and after-result: `push_version` now returns the actual bounded enqueue
+result and records version-sent lifecycle telemetry only for a queued frame.
+The outbound send loop advances handshake state only on success.  A refused
+peer remains in `PEER_CONNECTING`; a healthy peer still queues exactly one
+version frame and advances normally.
+
+Regression proof: a direct production-loop `net_msg_dos` case first failed by
+observing `PEER_VERSION_SENT` with no queued version frame.  It now proves the
+refused peer remains retryable and the healthy control queues the frame before
+transitioning.  `net_msg_dos` passes normally and under ASan/UBSan; the broader
+handshake-adversarial group also passes.  The helper refactor lowered
+`msg_send_messages` complexity from 111 to 109.  Consensus impact: NONE;
+version serialization, network magic,
+service bits, validation, PoW, chain selection, and transaction rules are
+unchanged.  Worldstream `0b29bec27` remains complementary on fresh-sync startup
+interruption and observer coverage.  Remaining risk and next investigation:
+audit post-version one-shot negotiation flags (`getaddr`, `sendheaders`, and
+mempool pull) for the same enqueue-before-state invariant.

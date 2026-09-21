@@ -2393,6 +2393,16 @@ static void msg_note_request_queued(_Atomic int64_t *timestamp,
         atomic_store_explicit(timestamp, now_seconds, memory_order_relaxed);
 }
 
+static void msg_try_start_outbound_handshake(struct msg_processor *mp,
+                                             struct p2p_node *node)
+{
+    if (node->inbound || node->state != PEER_CONNECTING)
+        return;
+    if (push_version(mp, node))
+        peer_set_state_checked((uint32_t)node->id, &node->state,
+                               PEER_VERSION_SENT, "outbound version sent");
+}
+
 /* ── msg_send_messages: per-peer trickle ─────────────────────── */
 
 bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
@@ -2406,11 +2416,7 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
          * message loop sees the node, so send_bytes is not a handshake-state
          * predicate.  PEER_CONNECTING is: advance it exactly once after the
          * version has been queued (or buffered by the transport). */
-        if (!node->inbound && node->state == PEER_CONNECTING) {
-            push_version(mp, node);
-            peer_set_state_checked((uint32_t)node->id, &node->state,
-                                   PEER_VERSION_SENT, "outbound version sent");
-        }
+        msg_try_start_outbound_handshake(mp, node);
         return true;
     }
 

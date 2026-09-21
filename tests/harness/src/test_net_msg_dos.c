@@ -288,6 +288,47 @@ static bool dos_send_queue_has_command(const struct p2p_node *node,
     return false;
 }
 
+static int dos_version_queue_refusal(struct msg_processor *mp,
+                                     struct net_manager *nm)
+{
+    int failures = 0;
+    struct net_address addr;
+    net_address_init(&addr);
+    {
+        unsigned char ip4[4] = {203, 0, 113, 85};
+        net_addr_set_ipv4(&addr.svc.addr, ip4);
+    }
+    addr.svc.port = 8033;
+
+    struct p2p_node *blocked = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "version-blocked", false);
+    DOS_CHECK("version refusal: blocked peer created", blocked != NULL);
+    if (blocked) {
+        blocked->state = PEER_CONNECTING;
+        blocked->send_size = net_send_peer_bytes_hard_cap();
+        DOS_CHECK("version refusal: send tick survives refusal",
+                  msg_send_messages(mp, blocked, false));
+        DOS_CHECK("version refusal: unsent handshake remains retryable",
+                  blocked->state == PEER_CONNECTING &&
+                  !dos_send_queue_has_command(blocked, "version"));
+        p2p_node_free(blocked);
+    }
+
+    struct p2p_node *healthy = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "version-healthy", false);
+    DOS_CHECK("version refusal: healthy peer created", healthy != NULL);
+    if (healthy) {
+        healthy->state = PEER_CONNECTING;
+        DOS_CHECK("version refusal: healthy send tick succeeds",
+                  msg_send_messages(mp, healthy, false));
+        DOS_CHECK("version refusal: queued handshake advances state",
+                  healthy->state == PEER_VERSION_SENT &&
+                  dos_send_queue_has_command(healthy, "version"));
+        p2p_node_free(healthy);
+    }
+    return failures;
+}
+
 static int dos_inbound_only_getheaders_recovery(struct msg_processor *mp,
                                                 struct net_manager *nm)
 {
@@ -1336,6 +1377,10 @@ int test_net_msg_dos(void)
     /* The bad-prevblk recovery timer measures requests that reached the
      * queue, not attempts rejected by a non-draining peer. */
     failures += dos_reject_probe_queue_refusal(&mp, &nm);
+
+    /* Handshake state records a version frame that actually entered the
+     * bounded send queue.  A refused enqueue must leave CONNECTING retryable. */
+    failures += dos_version_queue_refusal(&mp, &nm);
 
     net_manager_free(&nm);
     sync_set_state(sync0, "net_msg_dos restore");

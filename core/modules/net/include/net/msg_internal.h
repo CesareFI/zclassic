@@ -31,7 +31,7 @@ struct msg_block_acceptance {
 };
 
 /* msg_version.c — version/verack handshake */
-void push_version(struct msg_processor *mp, struct p2p_node *node);
+bool push_version(struct msg_processor *mp, struct p2p_node *node);
 void push_verack(struct msg_processor *mp, struct p2p_node *node);
 void msg_version_build(struct version_message *ver,
                        const struct msg_processor *mp,

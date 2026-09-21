@@ -620,3 +620,11 @@ later lane flips it HARD.
 - 2026-09-21T11:53:58Z — REASON: stamp rejected-header probe rate limit only after successful request enqueue
   old ROOT: c282304f36fe0b56d9ceb1be51effbd26e181ae22f0c1dde02cc7cdcfe59a63e
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T12:10:18Z — REASON: Advance outbound handshake state only after the version frame enters the bounded send queue; no consensus or wire semantic change
+  old ROOT: 6cba006a8f34439f880b2b46e5a2c516d272c038e3753b063b19150eed43d5ca
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T12:14:02Z — REASON: Refactor version enqueue result handling below the existing send-loop complexity ratchet; no behavior or consensus change
+  old ROOT: ca98374bd5129a13fcc390228e48f2e247b4641a9a2ccc12d9ecf73185b941eb
+  by: owner unseal ritual (make core-unseal)
