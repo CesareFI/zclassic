@@ -725,6 +725,12 @@ static int test_snapshot_manifest_wire_reconnect(void)
         ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_a->id, 1, 0));
         ASSERT(mp_snapshot_swarm_peer_disconnected(peer_a) == 1);
         ASSERT(bs_snapshot_state(0, CHUNK_NEEDED, -1, 0, 0));
+        ASSERT(!peer_a->swarm_manifest_received);
+        ASSERT(peer_a->swarm_manifest_generation == 0);
+        ASSERT(peer_a->swarm_manifest_attempts == 0);
+        ASSERT(peer_a->swarm_inflight_chunk == -1);
+        mp_snapshot_send_tick(&mp, peer_a);
+        ASSERT(bs_queue_depth(sent_a) == 0);
         mp_snapshot_send_tick(&mp, peer_b);
         ASSERT(peer_b->swarm_inflight_chunk == 0);
         ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_b->id, 1, 0));
@@ -736,6 +742,9 @@ static int test_snapshot_manifest_wire_reconnect(void)
         ASSERT(peer_bad->swarm_manifest_received);
         ASSERT(peer_bad->swarm_inflight_chunk == 0);
         bs_drop_queue(peer_bad, sent_bad);
+        bs_drop_queue(peer_b, sent_b);
+        mp_snapshot_send_tick(&mp, peer_b);
+        ASSERT(bs_queue_depth(sent_b) == 0); /* old generation is ineligible */
         mp_snapshot_test_stop_swarm();
         send_segment_free(sent_a);
         send_segment_free(sent_b);

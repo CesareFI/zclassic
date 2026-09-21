@@ -218,6 +218,18 @@ static bool swarm_admit_manifest_source(struct p2p_node *node,
     return admitted;
 }
 
+static bool swarm_lock_admitted_peer(const struct p2p_node *node)
+{
+    if (!node || !swarm_mutex_lock())
+        return false;
+    bool admitted = atomic_load(&g_swarm_active) &&
+        node->swarm_manifest_received &&
+        node->swarm_manifest_generation == g_swarm_generation;
+    if (!admitted)
+        swarm_mutex_unlock();
+    return admitted;
+}
+
 bool mp_block_swarm_manifest_shape_valid(int32_t start_height,
                                          int32_t end_height,
                                          uint32_t num_pieces)
@@ -818,10 +830,16 @@ size_t mp_snapshot_swarm_peer_disconnected(struct p2p_node *node)
         return 0;
     size_t requeued = 0;
     if (swarm_mutex_lock()) {
-        if (atomic_load(&g_swarm_active))
-            requeued = swarm_sync_peer_disconnected(&g_swarm, node->id);
+        if (atomic_load(&g_swarm_active) &&
+            node->swarm_inflight_chunk >= 0 &&
+            swarm_sync_requeue_chunk_for_peer(
+                &g_swarm, (uint32_t)node->swarm_inflight_chunk, node->id))
+            requeued = 1;
         swarm_mutex_unlock();
     }
+    node->swarm_manifest_received = false;
+    node->swarm_manifest_generation = 0;
+    node->swarm_manifest_attempts = 0;
     node->swarm_inflight_chunk = -1;
     node->swarm_chunk_req_time = 0;
     if (requeued)
@@ -1989,14 +2007,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
     /* ── Swarm parallel chunk sync coordinator ────────────── */
     /* For each connected ZCL23 peer with no inflight chunk, assign one
      * and send a zchunkreq. Also handle timeouts on stale requests. */
-    if (g_swarm_active && node->swarm_manifest_received &&
-        node->state >= PEER_HANDSHAKE_COMPLETE) {
-
-        if (!swarm_mutex_lock()) {
-            LOG_ERROR("net", "snapshot send tick refused: swarm mutex "
-                      "unavailable peer=%s", node->addr_name);
-            return;
-        }
+    if (node->state >= PEER_HANDSHAKE_COMPLETE &&
+        swarm_lock_admitted_peer(node)) {
 
         /* Requeue globally stale inflight chunks. A peer can disconnect and
          * lose node->swarm_inflight_chunk while g_swarm still marks that
@@ -2040,6 +2052,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
             uint32_t complete = g_swarm.chunks_complete;
             uint32_t total = g_swarm.manifest.num_chunks;
             uint32_t inflight = g_swarm.chunks_inflight;
+            uint64_t progress_generation = g_swarm_generation;
             swarm_mutex_unlock();
 
             /* Count serving peers — under cs_nodes: the socket-thread
@@ -2050,7 +2063,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
                 zcl_mutex_lock(&mp->net_mgr->cs_nodes);
                 for (size_t i = 0; i < mp->net_mgr->num_nodes; i++) {
                     struct p2p_node *n = mp->net_mgr->nodes[i];
-                    if (n && n->swarm_manifest_received)
+                    if (n && n->swarm_manifest_received &&
+                        n->swarm_manifest_generation == progress_generation)
                         serving_peers++;
                 }
                 zcl_mutex_unlock(&mp->net_mgr->cs_nodes);

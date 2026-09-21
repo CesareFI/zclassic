@@ -756,3 +756,36 @@ Worldstream remains at `0b29bec27` on complementary fresh-sync observer work.
 Remaining risk and next investigation: apply the same explicit admission
 revocation audit to snapshot-swarm disconnects, then inspect scheduler lock
 hold time and request emission under high peer counts.
+
+## Isolate snapshot generations and make disconnect cleanup constant-time
+
+Baseline: snapshot disconnect cleanup scanned as many as 65,000 global chunks
+although each peer owns at most one, and left manifest admission metadata on
+the detached node. Separately, the scheduler checked only the received flag,
+not the manifest generation. Direct wire tests reproduced both consequences:
+a detached node could reacquire work, and a still-connected source admitted to
+an earlier swarm could receive work after another peer started a new swarm.
+
+Root cause: the node's authoritative `swarm_inflight_chunk` and recorded
+manifest generation were maintained but not used at these two ownership
+boundaries. Disconnect cleanup now requeues that one exact chunk, clears its
+request time, and revokes the received flag, generation, and attempt budget.
+The scheduler atomically locks and admits a peer only when its recorded
+generation equals the active swarm generation. Progress counts use the same
+captured generation. Worst-case disconnect inspection falls from 65,000
+chunks to one known owner slot.
+
+After-result and regression proof: the framed reconnect test proves immediate
+requeue, zeroed admission and request state, no detached-peer reassignment,
+healthy-peer failover, and refusal to schedule an old-generation connected
+peer after restart. The full block-swarm loopback group passes, including the
+2,560-block transfer at 31,394 blocks/s (46.3 MB/s).
+
+Consensus impact: none. This is snapshot request-source ownership and cleanup
+only; snapshot content verification and canonical chain validation are
+unchanged. Worldstream remains at `0b29bec27` on complementary startup and
+observer work.
+
+Remaining risk and next investigation: profile scheduler mutex hold time and
+the full-manifest timeout sweeps under high peer counts, then bound avoidable
+global scans without weakening timeout recovery.
