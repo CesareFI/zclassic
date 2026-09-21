@@ -2045,3 +2045,22 @@ reservation, concurrent access, timeout/disconnect/notfound recovery, and
 speed contracts. Consensus impact: NONE. Worldstream `5297c58f4` remains
 complementary. Remaining risk: maintain lifecycle counter coverage whenever a
 new active-slot terminal path is introduced.
+
+## Header-range anchor-resolution release
+
+Baseline and root cause: the parallel header scheduler claimed a range for a
+peer before resolving the local start anchor.  If that resolution failed, the
+request path returned with the peer still owning the range until its deadline,
+needlessly withholding it from other healthy sources.
+
+Fix and after-result: the failed-resolution path now releases the peer's
+range claim immediately before returning.  The scheduler can therefore assign
+the same bounded range to another eligible peer without waiting for timeout.
+No header bytes, validation rule, or chain-state transition changed.
+
+Regression proof: the focused `header_range_sched` group passes its complete
+release, reassignment, timeout, and disconnect coverage after the change.
+Consensus impact: NONE. Worldstream `5297c58f4` remains complementary classic
+download timeout work. Remaining risk and next investigation: add direct
+wire-level `zchunkdata` coverage for malformed, duplicate, and late chunk
+delivery accounting.
