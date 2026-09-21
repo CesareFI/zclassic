@@ -185,6 +185,16 @@ static bool peer_has_live_span_locked(const struct header_range_scheduler *s,
     return false;
 }
 
+/* Scheduler timestamps are process-local monotonic microseconds. Saturate an
+ * absolute deadline so an extreme test sample cannot wrap into the past and
+ * immediately release a live span to another peer. */
+static int64_t hrs_deadline_from(int64_t now_us, int64_t timeout_us)
+{
+    if (timeout_us > 0 && now_us > INT64_MAX - timeout_us)
+        return INT64_MAX;
+    return now_us + timeout_us;
+}
+
 int hrs_assign(struct header_range_scheduler *s, int32_t peer_id,
                int64_t now_us)
 {
@@ -202,7 +212,8 @@ int hrs_assign(struct header_range_scheduler *s, int32_t peer_id,
         if (!s->spans[i].assigned && !s->spans[i].completed) {
             s->spans[i].assigned = true;
             s->spans[i].peer_id = peer_id;
-            s->spans[i].deadline_us = now_us + s->span_timeout_us;
+            s->spans[i].deadline_us =
+                hrs_deadline_from(now_us, s->span_timeout_us);
             s->stat_assigns++;
             zcl_mutex_unlock(&s->lock);
             return (int)i;
@@ -291,7 +302,8 @@ bool hrs_note_peer_progress(struct header_range_scheduler *s, int32_t peer_id,
     for (size_t i = 0; i < s->n_spans; i++) {
         if (s->spans[i].assigned && !s->spans[i].completed &&
             s->spans[i].peer_id == peer_id) {
-            s->spans[i].deadline_us = now_us + s->span_timeout_us;
+            s->spans[i].deadline_us =
+                hrs_deadline_from(now_us, s->span_timeout_us);
             renewed = true;
             break;
         }

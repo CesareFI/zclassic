@@ -2283,3 +2283,21 @@ manifest hashes, payload verification, block and transaction validity, PoW,
 and chain selection are unchanged. Worldstream remains complementary.
 Remaining risk: a genuine runtime wire/sanitizer execution remains deferred to
 protect the 11 GB disk headroom.
+
+## Header-range deadline saturation
+
+Baseline and root cause: range-parallel header assignment and progress renewal
+formed deadlines with signed `now_us + timeout_us`. An extreme monotonic sample
+could wrap the deadline into the past, immediately releasing a live span and
+making its healthy peer look stalled.
+
+Fix and after-result: the allocation-free scheduler now saturates absolute
+deadlines at `INT64_MAX`. Assignment and renewal share the helper. The
+deterministic scheduler regression assigns and renews at `INT64_MAX - 1`,
+proves the span remains live there, and proves it expires only at the saturated
+deadline.
+
+Consensus impact: NONE. This is volatile getheaders scheduling only; header
+validation, checkpoint anchors, chain selection, and all consensus behavior
+remain unchanged. Worldstream remains complementary. Runtime/sanitizer
+execution remains deferred to preserve disk headroom.
