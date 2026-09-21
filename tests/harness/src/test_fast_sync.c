@@ -644,6 +644,38 @@ static int test_swarm_malformed_response_reassign(void)
     return failures;
 }
 
+static int test_swarm_disconnect_reassign(void)
+{
+    int failures = 0;
+    TEST("swarm disconnect immediately requeues only the dead peer's chunks") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 3;
+        manifest.chunk_size = 500;
+        manifest.chunk_hashes = zcl_calloc(3, 32, "test_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+
+        struct swarm_sync ss;
+        ASSERT(swarm_sync_init(&ss, &manifest, NULL));
+        ASSERT(swarm_sync_assign_chunk(&ss, 11) == 0);
+        ASSERT(swarm_sync_assign_chunk(&ss, 22) == 1);
+        ASSERT(swarm_sync_assign_chunk(&ss, 11) == 2);
+        ASSERT(ss.chunks_inflight == 3);
+        ASSERT(swarm_sync_peer_disconnected(&ss, 11) == 2);
+        ASSERT(ss.chunks_inflight == 1);
+        ASSERT(ss.chunk_states[1] == CHUNK_INFLIGHT);
+        ASSERT(ss.chunk_peer[1] == 22);
+        ASSERT(swarm_sync_peer_disconnected(&ss, 11) == 0);
+        ASSERT(swarm_sync_assign_chunk(&ss, 33) == 0);
+        ASSERT(swarm_sync_assign_chunk(&ss, 33) == 2);
+
+        swarm_sync_free(&ss);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_swarm_timeout_monotonic_boundaries(void)
 {
     int failures = 0;
@@ -1939,6 +1971,7 @@ int test_fast_sync(void)
     failures += test_swarm_init_assign();
     failures += test_swarm_timeout_reassign();
     failures += test_swarm_malformed_response_reassign();
+    failures += test_swarm_disconnect_reassign();
     failures += test_swarm_timeout_monotonic_boundaries();
 
     /* Block swarm */

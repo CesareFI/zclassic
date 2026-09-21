@@ -352,6 +352,9 @@ bool swarm_sync_requeue_chunk_for_peer(struct swarm_sync *ss,
                                        uint32_t chunk_index,
                                        int peer_id);
 
+/* Requeue every in-flight chunk still owned by a disconnected peer. */
+size_t swarm_sync_peer_disconnected(struct swarm_sync *ss, int peer_id);
+
 /* Mark a chunk as received and verified. Returns false if bad hash. */
 bool swarm_sync_receive_chunk(struct swarm_sync *ss,
                                 const struct utxo_chunk *chunk,

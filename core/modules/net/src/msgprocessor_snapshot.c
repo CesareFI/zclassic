@@ -526,6 +526,24 @@ bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
 }
 #endif
 
+size_t mp_snapshot_swarm_peer_disconnected(struct p2p_node *node)
+{
+    if (!node)
+        return 0;
+    size_t requeued = 0;
+    if (swarm_mutex_lock()) {
+        if (atomic_load(&g_swarm_active))
+            requeued = swarm_sync_peer_disconnected(&g_swarm, node->id);
+        swarm_mutex_unlock();
+    }
+    node->swarm_inflight_chunk = -1;
+    node->swarm_chunk_req_time = 0;
+    if (requeued)
+        LOG_INFO("net", "snapshot swarm: requeued %zu chunk(s) from "
+                 "disconnected peer %d", requeued, node->id);
+    return requeued;
+}
+
 /* Event-driven block-swarm requeue on peer disconnect. connman's cleanup
  * sweep already calls dl_peer_disconnected() to reclaim the legacy download
  * manager's in-flight blocks; this reclaims the parallel block-swarm pieces

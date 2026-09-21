@@ -1372,6 +1372,18 @@ bool swarm_sync_requeue_chunk_for_peer(struct swarm_sync *ss,
     return true;
 }
 
+size_t swarm_sync_peer_disconnected(struct swarm_sync *ss, int peer_id)
+{
+    if (!ss || !ss->chunk_states || !ss->chunk_peer)
+        return 0;
+    size_t requeued = 0;
+    for (uint32_t i = 0; i < ss->manifest.num_chunks; i++) {
+        if (swarm_sync_requeue_chunk_for_peer(ss, i, peer_id))
+            requeued++;
+    }
+    return requeued;
+}
+
 bool swarm_sync_receive_chunk(struct swarm_sync *ss,
                                 const struct utxo_chunk *chunk,
                                 int peer_id)

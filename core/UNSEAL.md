@@ -408,3 +408,7 @@ later lane flips it HARD.
 - 2026-09-21T00:24:14Z — REASON: Refactor malformed snapshot response recovery to preserve the cyclomatic-complexity ratchet; scheduling only, no consensus or validation semantic change
   old ROOT: 6524a8b4011dde023838d76f7ed4e4c0ba9f202ed14a8b70e3463f54af02a963
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T00:42:39Z — REASON: Immediately requeue snapshot swarm chunks owned by a disconnected peer; scheduling recovery only, no consensus or validation semantic change
+  old ROOT: 0925ea8ff0c0145779f3f3b4b951daf054ef9e2044da90653f413fbe55e9632f
+  by: owner unseal ritual (make core-unseal)

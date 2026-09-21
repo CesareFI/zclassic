@@ -361,3 +361,33 @@ work with no overlap.
 Remaining risk and next investigation: add a direct wire fixture for truncated
 `zchunkdata`, then audit snapshot peer disconnect for immediate owned-chunk
 requeue rather than timeout-only recovery.
+
+## Event-driven snapshot-swarm disconnect recovery
+
+Connman's terminal peer cleanup reclaimed legacy block-download requests and
+block-swarm pieces, but not UTXO snapshot-swarm chunks. A disconnected peer's
+chunk therefore remained globally `CHUNK_INFLIGHT` and unavailable to healthy
+peers until the 30-second timeout sweep.
+
+The snapshot coordinator now requeues every chunk still owned by the departing
+peer during connman's existing disconnect cleanup. The operation is bounded by
+the manifest chunk count, ownership checked, idempotent, and clears the dead
+peer's local request slot. Other peers' in-flight chunks remain untouched.
+
+The deterministic regression assigns three chunks across two peers, disconnects
+one without advancing time, proves exactly its two chunks become immediately
+available, proves repeat cleanup is inert, and proves a third peer can claim
+both while the surviving peer retains its work. The four-group fast-sync suite,
+the block-swarm loopback integration group, the same fast-sync groups under
+ASan/UBSan, core seal/root mirror, consensus parity, generated capability
+inventory, cyclomatic complexity (55,564 functions), and whitespace gates
+passed.
+
+Consensus impact: none. This changes only failed-peer scheduling state; chunk
+hash, Merkle proof, snapshot commitment, block, and transaction validation are
+unchanged. Worldstream remains at `0b29bec27` on startup/observer work, and its
+fetched tree contains no `docs/work/NODE_COORDINATION.md`; there is no overlap.
+
+Remaining risk and next investigation: build a direct wire-level truncated
+`zchunkdata` fixture, then inspect snapshot manifest competition for peer
+diversity and prompt failover when the single manifest source disappears.
