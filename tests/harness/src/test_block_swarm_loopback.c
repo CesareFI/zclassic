@@ -797,6 +797,10 @@ static int test_block_swarm_throughput(void)
         struct send_segment *sent_a = bs_install_sentinel(a_node);
         struct send_segment *sent_b = bs_install_sentinel(b_node);
         struct send_segment *sent_bad = bs_install_sentinel(bad_node);
+        b_node->blk_bitmap = zcl_calloc(1, 1, "stale_block_bitmap");
+        ASSERT(b_node->blk_bitmap != NULL);
+        b_node->blk_bitmap_len = 1;
+        b_node->blk_bitmap_swarm_generation = 0;
 
         /* Step 1: A pushes the block manifest; B ingests it → g_block_swarm. */
         push_block_manifest(&seed.mp, a_node);
@@ -818,6 +822,11 @@ static int test_block_swarm_throughput(void)
         ASSERT(bs_pump(bad_node, sent_bad, &mp_b, bad_node,
                        params->pchMessageStart, &ok) > 0 && ok);
         ASSERT(!bad_node->blk_manifest_received);
+        bad_node->blk_manifest_received = true;
+        bad_node->blk_manifest_admitted_generation = 0;
+        mp_snapshot_send_tick(&mp_b, bad_node);
+        ASSERT(bs_queue_depth(sent_bad) == 0);
+        bad_node->blk_manifest_received = false;
         block_piece_manifest_free(&incompatible);
         a_node->blk_manifest_sent = false;
         push_block_manifest(&seed.mp, a_node);
@@ -1057,6 +1066,7 @@ static int test_block_swarm_disconnect_requeue(void)
 bool mp_block_swarm_reap_if_stalled(struct msg_processor *mp);
 void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
                                     int64_t last_complete_monotonic);
+bool mp_block_swarm_test_admit_peer(struct p2p_node *node);
 int64_t mp_block_swarm_test_reaped_monotonic(void);
 bool mp_block_swarm_test_restart_ready_at(int64_t now_monotonic,
                                           int64_t reaped_monotonic);
@@ -1131,15 +1141,15 @@ static int test_block_swarm_peer_fairness(void)
         ASSERT(first && second);
         first->id = 21;
         second->id = 22;
-        first->blk_manifest_received = true;
         first->blk_peer_height = end_height;
-        second->blk_manifest_received = true;
         second->blk_peer_height = end_height;
         struct send_segment *sent_first = bs_install_sentinel(first);
         struct send_segment *sent_second = bs_install_sentinel(second);
 
         mp_block_swarm_test_seed_stall(0, pieces, 1);
         ASSERT(mp_block_swarm_is_active());
+        ASSERT(mp_block_swarm_test_admit_peer(first));
+        ASSERT(mp_block_swarm_test_admit_peer(second));
         mp_snapshot_send_tick(&mp, first);
         mp_snapshot_send_tick(&mp, second);
         size_t first_work = bs_queue_depth(sent_first);
@@ -1158,6 +1168,7 @@ static int test_block_swarm_peer_fairness(void)
 
         /* With no competing owner, later ticks fill the original capacity. */
         mp_block_swarm_test_seed_stall(0, pieces, 1);
+        ASSERT(mp_block_swarm_test_admit_peer(first));
         bs_drop_queue(first, sent_first);
         for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++)
             first->blk_pipeline[pi].piece_index = -1;

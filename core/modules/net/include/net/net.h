@@ -558,6 +558,7 @@ struct p2p_node {
     bool blk_manifest_received;   /* true if we received block manifest from peer */
     uint64_t blk_manifest_generation; /* bounded parse generation */
     uint8_t blk_manifest_attempts; /* parses allowed in that generation */
+    uint64_t blk_manifest_admitted_generation; /* exact active manifest */
     struct {
         int32_t piece_index;      /* -1 = empty slot */
         int64_t request_time;     /* monotonic seconds at request */

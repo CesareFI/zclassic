@@ -657,3 +657,37 @@ Worldstream remains at `0b29bec27` on complementary startup/observer work.
 Remaining risk and next investigation: verify that stale block-manifest
 eligibility and availability bitmaps cannot cross abandonment and restart
 generations, especially when the same TCP peer remains connected.
+
+## Isolate block-swarm eligibility and bitmaps by generation
+
+Connected peers retained `blk_manifest_received` and their availability bitmap
+across swarm abandonment and restart. The scheduler checked neither value's
+generation before assignment. A stale source flag could therefore authorize a
+peer that had not advertised the new manifest, while an old all-zero or partial
+bitmap could suppress useful requests in the new swarm.
+
+Manifest admission now records the exact active generation, and send ticks
+require that generation before assigning any piece. Availability bitmaps are
+passed to rarest-first selection only when their recorded generation matches;
+otherwise the peer is conservatively treated as having the exact admitted
+manifest's full piece set until it advertises a current bitmap. A new manifest
+attempt clears prior admission under the block-swarm mutex.
+
+The framed throughput regression plants an old all-zero bitmap and proves the
+new 40-piece swarm still assigns and completes all 2,560 blocks at 31,857
+blocks/s (47.0 MB/s). It also forges a stale received flag with generation zero
+on an incompatible peer and proves that peer receives no request. The fairness
+fixture now uses a generation-aware test admission seam and retains 64/64 work
+sharing. Block-swarm loopback passed under ASan/UBSan. The 13-group networking
+selection, core seal/root mirror, consensus parity, generated capability
+inventory, cyclomatic complexity (55,596 functions), and whitespace gates
+passed.
+
+Consensus impact: none. This changes only optional request-source and
+availability scheduling. Block, transaction, PoW, chain-selection, and
+cryptographic validation semantics are unchanged. Worldstream remains at
+`0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: audit bitmap message length against the
+active manifest span and ensure excess/truncated bitmap bytes cannot distort
+rarest-first availability accounting or consume unnecessary memory.

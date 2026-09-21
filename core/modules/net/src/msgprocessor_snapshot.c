@@ -347,10 +347,44 @@ static bool block_swarm_admit_manifest_source(
         *started_out = true;
     }
     node->blk_manifest_received = admitted;
+    node->blk_manifest_admitted_generation = admitted ?
+        g_block_swarm_generation : 0;
     if (admitted)
         node->blk_peer_height = manifest->end_height;
     pthread_mutex_unlock(&g_block_swarm_mutex);
     return admitted;
+}
+
+static bool block_swarm_peer_admitted(struct p2p_node *node)
+{
+    if (!node)
+        return false;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    bool admitted = atomic_load(&g_block_swarm_active) &&
+        node->blk_manifest_received &&
+        node->blk_manifest_admitted_generation == g_block_swarm_generation;
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return admitted;
+}
+
+static void block_swarm_clear_peer_admission(struct p2p_node *node)
+{
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    node->blk_manifest_received = false;
+    node->blk_manifest_admitted_generation = 0;
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+}
+
+static void block_swarm_peer_bitmap_for_generation(
+    const struct p2p_node *node, const uint8_t **bitmap_out,
+    uint32_t *bitmap_len_out)
+{
+    *bitmap_out = NULL;
+    *bitmap_len_out = 0;
+    if (node->blk_bitmap_swarm_generation == g_block_swarm_generation) {
+        *bitmap_out = node->blk_bitmap;
+        *bitmap_len_out = node->blk_bitmap_len;
+    }
 }
 
 static void block_swarm_replace_peer_bitmap_locked(
@@ -639,6 +673,19 @@ void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
         }
     }
     pthread_mutex_unlock(&g_block_swarm_mutex);
+}
+
+bool mp_block_swarm_test_admit_peer(struct p2p_node *node)
+{
+    if (!node)
+        return false;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    bool admitted = atomic_load(&g_block_swarm_active);
+    node->blk_manifest_received = admitted;
+    node->blk_manifest_admitted_generation = admitted ?
+        g_block_swarm_generation : 0;
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return admitted;
 }
 
 int64_t mp_block_swarm_test_reaped_monotonic(void)
@@ -1473,7 +1520,7 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
         } else if (block_manifest_command_allowed(cmd, node)) {
             /* Peer sends their block piece manifest.
              * DEFENSIVE: validate all fields before trusting any data. */
-            node->blk_manifest_received = false;
+            block_swarm_clear_peer_admission(node);
             int32_t start_h = 0, end_h = 0;
             uint32_t num_pieces = 0;
             uint8_t tip_hash[32], merkle_root[32];
@@ -1980,7 +2027,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
     /* Only for ZCL23 peers with completed handshake. Legacy peers
      * contribute via normal getdata/block (handled by download manager). */
     if (g_block_swarm_active && peer_supports_fast_sync(node->services) &&
-        node->blk_manifest_received &&
+        block_swarm_peer_admitted(node) &&
         node->state >= PEER_HANDSHAKE_COMPLETE) {
 
         pthread_mutex_lock(&g_block_swarm_mutex);
@@ -1999,6 +2046,10 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         int assigned_this_tick = 0;
         int assignment_batch =
             block_swarm_assignment_batch(reconciled.timed_out);
+        const uint8_t *peer_bitmap = NULL;
+        uint32_t peer_bitmap_len = 0;
+        block_swarm_peer_bitmap_for_generation(
+            node, &peer_bitmap, &peer_bitmap_len);
         for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
             if (assigned_this_tick >= assignment_batch)
                 break;
@@ -2010,8 +2061,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
                 mp_block_swarm_contiguous_window_cap(
                     &g_block_swarm, header_cap);
             int32_t pidx = block_swarm_assign_piece_for_peer(
-                &g_block_swarm, node->id, node->blk_bitmap,
-                node->blk_bitmap_len, assignment_cap,
+                &g_block_swarm, node->id, peer_bitmap,
+                peer_bitmap_len, assignment_cap,
                 mp_block_swarm_peer_manifest_end(node));
             if (pidx < 0)
                 break; /* no more pieces to assign */

@@ -472,3 +472,11 @@ later lane flips it HARD.
 - 2026-09-21T04:56:19Z — REASON: Admit block-swarm sources only when their validated manifest exactly matches the active swarm, with serialized initialization; scheduling safety only, no consensus semantic change
   old ROOT: 25f8856ae12c97d1e980c289cd4eab11133a75034902c0002c01f071ca3a175a
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T05:17:04Z — REASON: Bind block-swarm source eligibility and availability bitmaps to the exact active generation; scheduler safety only, no consensus semantic change
+  old ROOT: eccaebe1effc20ecf42bffa6630ca69f9ed90363a1f00fc583151223b8c5e275
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T05:21:58Z — REASON: Update block-swarm fairness fixtures through a generation-aware test admission seam; no production or consensus semantic change
+  old ROOT: 88ac87c0fe20b3f97fe7aa1feaad03d73740ccdfce26d25cbde5fc21db397b6b
+  by: owner unseal ritual (make core-unseal)
