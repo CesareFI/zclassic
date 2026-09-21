@@ -492,3 +492,7 @@ later lane flips it HARD.
 - 2026-09-21T06:15:54Z — REASON: Revoke snapshot-swarm admission on disconnect and require exact generation for scheduling; request coordination only, consensus unchanged
   old ROOT: 2c7d339897978e358afbb101236a52a81679865d1fbd2f53631cb5715483820d
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T06:23:35Z — REASON: Reject block-piece bodies not owned by the admitted peer pipeline before parsing; transport scheduling only, consensus unchanged
+  old ROOT: 574b7ac4056a179ccaf6c10fe4c24b98ce71cfdacc68cc3aa6af8faa0a8d9cfb
+  by: owner unseal ritual (make core-unseal)

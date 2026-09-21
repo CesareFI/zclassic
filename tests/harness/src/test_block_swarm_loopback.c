@@ -442,6 +442,8 @@ static struct p2p_node *bs_make_peer(struct net_manager *nm, uint8_t last_octet)
     n->version = 1;
     n->services = NODE_ZCL23;
     n->state = PEER_HANDSHAKE_COMPLETE;
+    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++)
+        n->blk_pipeline[pi].piece_index = -1;
     return n;
 }
 
@@ -530,6 +532,41 @@ static bool bs_push_block_bitmap_frame(
         ok = p2p_node_end_message(node);
     stream_free(&payload);
     return ok;
+}
+
+static bool bs_push_block_request_frame(
+    struct p2p_node *node, const struct chain_params *params,
+    uint32_t piece_index)
+{
+    struct byte_stream payload;
+    stream_init(&payload, 4);
+    bool ok = stream_write_u32_le(&payload, piece_index) &&
+        p2p_node_begin_message(node, MSG_BLOCK_REQ,
+                               params->pchMessageStart);
+    if (ok)
+        p2p_node_write_message_data(node, payload.data, payload.size);
+    if (ok)
+        ok = p2p_node_end_message(node);
+    stream_free(&payload);
+    return ok;
+}
+
+static bool bs_refuses_unsolicited_block_piece(
+    struct p2p_node *requester, struct send_segment *requester_sent,
+    struct msg_processor *serve_mp, struct p2p_node *server,
+    struct send_segment *server_sent, struct msg_processor *receive_mp,
+    const struct chain_params *params, const struct bs_sink *sink)
+{
+    bool ok = true;
+    if (!bs_push_block_request_frame(requester, params, 0))
+        return false;
+    if (bs_pump(requester, requester_sent, serve_mp, server,
+                params->pchMessageStart, &ok) == 0 || !ok)
+        return false;
+    if (bs_pump(server, server_sent, receive_mp, requester,
+                params->pchMessageStart, &ok) == 0 || !ok)
+        return false;
+    return sink->blocks == 0 && mp_block_swarm_is_active();
 }
 
 static bool bs_snapshot_state(uint32_t index,
@@ -890,6 +927,12 @@ static int test_block_swarm_throughput(void)
         ASSERT(bs_pump(b_node, sent_b, &mp_b, b_node,
                        params->pchMessageStart, &ok) > 0 && ok);
         ASSERT(b_node->blk_bitmap_len == 5);
+
+        /* A valid manifest source still cannot push a piece that the local
+         * scheduler never assigned to it. Drive the production serve path to
+         * produce a cryptographically valid but locally unsolicited frame. */
+        ASSERT(bs_refuses_unsolicited_block_piece(
+            b_node, sent_b, &seed.mp, a_node, sent_a, &mp_b, params, &sink));
         bad_node->blk_manifest_received = true;
         bad_node->blk_manifest_admitted_generation = 0;
         mp_snapshot_send_tick(&mp_b, bad_node);
@@ -1644,8 +1687,8 @@ static int test_block_swarm_duplicate_delivery(void)
         /* The genuine second piece completes the swarm. */
         ASSERT(bs_deliver(&mp_b, b_node, &kept[1], params->pchMessageStart));
         ASSERT(!mp_block_swarm_is_active());
-        ASSERT(sink.blocks == 3 * (uint64_t)BLOCKS_PER_PIECE); /* p0 + dup + p1 */
-        ASSERT(sink.scope_begins == 3);       /* duplicate still verified+submitted */
+        ASSERT(sink.blocks == 2 * (uint64_t)BLOCKS_PER_PIECE); /* p0 + p1 */
+        ASSERT(sink.scope_begins == 2);       /* duplicate refused pre-intake */
         ASSERT(sink.scope_ends == sink.scope_begins);
 
         free(kept[0].data);

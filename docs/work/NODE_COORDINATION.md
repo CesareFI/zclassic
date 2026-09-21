@@ -789,3 +789,43 @@ observer work.
 Remaining risk and next investigation: profile scheduler mutex hold time and
 the full-manifest timeout sweeps under high peer counts, then bound avoidable
 global scans without weakening timeout recovery.
+
+## Refuse unsolicited block pieces before body intake
+
+Worldstream's measured timeout profile (`f261d245d`) found a 50,000-piece
+global sweep costs about 14.3 microseconds and explicitly did not justify a
+more complex timeout structure, so Hetzner left that path unchanged and moved
+to block-piece outcomes as recommended.
+
+Baseline: the `zblkdata` handler checked swarm activity and cryptographic piece
+identity but never checked whether the sending peer owned the request. A direct
+wire regression used the production serve path to return a valid 64-block
+piece before any scheduler assignment; all 64 bodies entered block intake and
+the piece was credited. Duplicate responses were likewise submitted again
+before only the completion counter was deduplicated.
+
+Root cause: request ownership lived in the peer's bounded pipeline but was not
+consulted at the receive boundary. The handler now requires the peer to be an
+admitted source for the exact active generation and the piece index to exist in
+that peer's pipeline before allocating hash storage or parsing/submitting block
+bodies. A timed-out late response is refused without peer punishment because
+lateness alone is not proof of malicious behavior. Legitimate late delivery
+after reassignment remains accepted while its original pipeline slot is still
+outstanding.
+
+After-result and regression proof: the framed unsolicited response contributes
+zero submitted blocks and leaves the swarm active. The duplicate regression
+now proves only the two unique 64-block pieces enter intake, rather than three
+submissions, while completion accounting remains exact. The final refactored
+2,560-block loopback passes at 31,790 blocks/s (46.9 MB/s).
+The focused group also passes under ASan/UBSan, and all 13 selected networking
+groups pass.
+
+Consensus impact: none. The gate changes only whether an unrequested transport
+response is admitted to the existing canonical block-validation path; all
+requested blocks retain identical validation. Worldstream remains at
+`0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: add per-peer block-swarm delivery and
+timeout observations, then use measured outcomes to decide whether scheduling
+should adapt without allowing peer starvation.

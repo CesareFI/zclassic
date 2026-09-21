@@ -283,6 +283,30 @@ static uint64_t g_block_swarm_generation = 0;
  * transfer back out of legacy getdata's hands every few seconds. */
 static _Atomic int64_t g_block_swarm_reaped_monotonic = 0;
 
+static bool block_swarm_peer_response_allowed(
+    const struct p2p_node *node, uint32_t piece_index)
+{
+    if (!node)
+        return false;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    bool admitted = atomic_load(&g_block_swarm_active) &&
+        node->blk_manifest_received &&
+        node->blk_manifest_admitted_generation == g_block_swarm_generation;
+    bool requested = false;
+    for (int pi = 0; admitted && pi < PIECE_PIPELINE_DEPTH; pi++) {
+        if (node->blk_pipeline[pi].piece_index == (int32_t)piece_index) {
+            requested = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    if (!requested) {
+        printf("Peer %s: %s zblkdata piece=%u\n", node->addr_name,
+               admitted ? "unsolicited" : "inactive", piece_index);
+    }
+    return requested;
+}
+
 static void block_swarm_advance_generation(void)
 {
     g_block_swarm_generation++;
@@ -1748,9 +1772,12 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                        node->addr_name, piece_index, block_count);
                 peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_PAYLOAD,
                                     "bad zblkdata header");
-            } else if (!g_block_swarm_active) {
-                printf("Peer %s: zblkdata piece=%u but no block swarm\n",
-                       node->addr_name, piece_index);
+            } else if (!block_swarm_peer_response_allowed(
+                           node, piece_index)) {
+                /* A timed-out response may be honestly late, so refuse it
+                 * without scoring. Do this before allocating or parsing the
+                 * advertised bodies: unrequested valid history is still
+                 * untrusted resource consumption. */
             } else {
                 /* Read block hashes */
                 uint8_t (*blk_hashes)[32] = zcl_calloc(block_count, 32, "blk_piece_hashes");
