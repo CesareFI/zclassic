@@ -67,7 +67,11 @@ static uint64_t g_swarm_generation = 0;
  * source gets a send tick. This is only a short opportunity for another
  * compatible source, never a ban or a trust decision. */
 #define SWARM_RECONNECT_YIELD_SECS 1
-#define SWARM_RECONNECT_YIELD_SOURCES 32
+/* One record per normally admitted peer prevents reconnect churn just above
+ * a small fixed table from evicting the first endpoint's fairness yield.
+ * Still statically bounded; configured exceptional connection ceilings do
+ * not turn untrusted endpoints into allocation pressure. */
+#define SWARM_RECONNECT_YIELD_SOURCES DEFAULT_MAX_PEER_CONNECTIONS
 
 struct swarm_reconnect_yield {
     struct net_address address;
@@ -456,7 +460,7 @@ static _Atomic int64_t g_block_swarm_reaped_monotonic = 0;
  * effective ownership. This is scheduling only: it neither bans nor judges
  * an endpoint, and expires quickly if no alternative source is available. */
 #define BLOCK_SWARM_RECONNECT_YIELD_SECS 1
-#define BLOCK_SWARM_RECONNECT_YIELD_SOURCES 32
+#define BLOCK_SWARM_RECONNECT_YIELD_SOURCES DEFAULT_MAX_PEER_CONNECTIONS
 
 struct block_swarm_reconnect_yield {
     struct net_address address;

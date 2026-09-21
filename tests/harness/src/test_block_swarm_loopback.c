@@ -1083,6 +1083,70 @@ static int test_snapshot_reconnect_yields_are_independent(void)
     return failures;
 }
 
+#define BS_RECONNECT_CHURN_SOURCES 33
+
+static int test_snapshot_reconnect_yield_table_capacity(void)
+{
+    int failures = 0;
+    TEST("snapshot reconnect yield survives churn beyond the old table") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = BS_RECONNECT_CHURN_SOURCES;
+        manifest.chunk_size = SYNC_CHUNK_SIZE;
+        manifest.chunk_hashes = zcl_calloc(manifest.num_chunks, 32,
+                                           "churn_table_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+        for (uint32_t i = 0; i < manifest.num_chunks; i++) {
+            struct utxo_chunk *chunk = zcl_calloc(
+                1, sizeof(*chunk), "churn_table_empty_chunk");
+            ASSERT(chunk != NULL);
+            chunk->chunk_index = i;
+            fast_sync_chunk_hash(chunk, manifest.chunk_hashes[i]);
+            free(chunk);
+        }
+
+        struct net_manager nm;
+        struct msg_processor mp;
+        struct p2p_node *old[BS_RECONNECT_CHURN_SOURCES] = {0};
+        struct p2p_node *replacement[BS_RECONNECT_CHURN_SOURCES] = {0};
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.params = chain_params_get();
+        mp.net_mgr = &nm;
+        mp.datadir = ".";
+        for (uint8_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++) {
+            old[i] = bs_make_peer(&nm, (uint8_t)(130 + i));
+            replacement[i] = bs_make_peer(&nm, (uint8_t)(130 + i));
+            ASSERT(old[i] && replacement[i]);
+        }
+
+        ASSERT(mp_snapshot_test_start_swarm(&manifest));
+        for (size_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++) {
+            ASSERT(mp_snapshot_test_admit_peer(old[i]));
+            ASSERT(mp_snapshot_test_admit_peer(replacement[i]));
+            mp_snapshot_send_tick(&mp, old[i]);
+            ASSERT(old[i]->swarm_inflight_chunk >= 0);
+            ASSERT(mp_snapshot_swarm_peer_disconnected(old[i]) == 1);
+        }
+
+        /* 33 disconnects exceeded the former 32-record table. The first
+         * replacement remains deferred until a distinct source gets work. */
+        mp_snapshot_send_tick(&mp, replacement[0]);
+        ASSERT(replacement[0]->swarm_inflight_chunk == -1);
+
+        mp_snapshot_test_stop_swarm();
+        for (size_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++) {
+            p2p_node_free(old[i]);
+            p2p_node_free(replacement[i]);
+        }
+        net_manager_free(&nm);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    mp_snapshot_test_stop_swarm();
+    return failures;
+}
+
 static int test_snapshot_inbound_reservation(void)
 {
     int failures = 0;
@@ -2844,6 +2908,7 @@ int test_block_swarm_loopback(void)
     failures += test_snapshot_chunk_wire_adversarial();
     failures += test_snapshot_manifest_wire_reconnect();
     failures += test_snapshot_reconnect_yields_are_independent();
+    failures += test_snapshot_reconnect_yield_table_capacity();
     failures += test_snapshot_inbound_reservation();
     failures += test_block_swarm_manifest_shape_bounds();
     /* Every test here advertises and serves block pieces from a fixture

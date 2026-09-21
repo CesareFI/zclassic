@@ -2544,3 +2544,35 @@ transaction validity, PoW, and chain selection remain unchanged. Worldstream
 the one-tick live-peer scan is intentionally linear in the bounded connected
 peer set; next investigate whether reconnect churn can cause snapshot manifest
 source diversity to be discarded before a replacement advertisement arrives.
+
+## Snapshot reconnect-yield diversity capacity
+
+Baseline and root cause: snapshot and block-swarm reconnect fairness retained
+only 32 endpoint yields, while the normal node peer ceiling is 125. A burst of
+33 distinct disconnects therefore overwrote the first source's active yield.
+That source could reconnect and reclaim released work before an already
+admitted healthy source had one assignment opportunity, defeating the bounded
+anti-starvation policy under ordinary connection churn.
+
+Fix and after-result: both fixed reconnect-yield tables now hold one record
+per normally admitted peer (125). They remain static bounded allocations;
+exceptional operator-configured ceilings do not let remote endpoints allocate
+state. This adds roughly 12 KiB across snapshot and block-swarm bookkeeping.
+
+Regression proof: the direct snapshot scheduler fixture creates 33 distinct
+owners and same-endpoint replacements, assigns and disconnects every owner,
+then proves the first replacement stays deferred. That sequence exceeded the
+former 32-record bound and would have allowed an immediate reclaim. Native C23
+syntax passes for the changed production unit; the loopback source parses with
+only its pre-existing unrelated trust-override declaration warning. Core seal,
+consensus parity, complexity, generated capability inventory, and whitespace
+gates pass. Runtime and ASan/UBSan remain disk-gated at 10 GB free because the
+focused runtime lane's cold verifier build crosses the safety floor.
+
+Consensus impact: NONE. This changes only process-local request fairness;
+manifest verification, snapshot commitment checks, reducer admission,
+block/transaction validation, serialization, PoW, and chain selection are
+unchanged. Worldstream `d9f5153be` remains complementary startup/recovery
+work. Remaining risk: exceptional configured peer ceilings can still outgrow
+the normal bounded fairness table; next investigate whether the block-swarm
+table has equivalent ownership behavior under its larger per-peer pipelines.

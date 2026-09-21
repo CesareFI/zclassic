@@ -768,3 +768,7 @@ later lane flips it HARD.
 - 2026-09-21T19:13:15Z — REASON: allow sole eligible source to retry avoided block requests
   old ROOT: 49b80c627d1394151d57173d9203a98fd74d615cd60659fa1b67cf2fae2735dd
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T19:21:03Z — REASON: preserve reconnect yield diversity through normal peer churn
+  old ROOT: 0a85aad7ace1bf4287e3625738f78c82d6b31fcccb0bce7d2e5b74267feaae8a
+  by: owner unseal ritual (make core-unseal)
