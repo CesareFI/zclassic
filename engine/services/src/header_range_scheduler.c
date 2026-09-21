@@ -302,8 +302,10 @@ bool hrs_note_peer_progress(struct header_range_scheduler *s, int32_t peer_id,
     for (size_t i = 0; i < s->n_spans; i++) {
         if (s->spans[i].assigned && !s->spans[i].completed &&
             s->spans[i].peer_id == peer_id) {
-            s->spans[i].deadline_us =
+            int64_t renewed_deadline =
                 hrs_deadline_from(now_us, s->span_timeout_us);
+            if (renewed_deadline > s->spans[i].deadline_us)
+                s->spans[i].deadline_us = renewed_deadline;
             renewed = true;
             break;
         }

@@ -2301,3 +2301,16 @@ Consensus impact: NONE. This is volatile getheaders scheduling only; header
 validation, checkpoint anchors, chain selection, and all consensus behavior
 remain unchanged. Worldstream remains complementary. Runtime/sanitizer
 execution remains deferred to preserve disk headroom.
+
+## Header-range progress monotonicity
+
+Baseline and root cause: a backwards monotonic sample in progress renewal
+replaced a live header-span deadline with an earlier value. The scheduler could
+then expire and reassign a healthy peer's span before its original deadline.
+
+Fix and after-result: progress now applies the maximum of the existing and
+renewed deadlines. A deterministic rollback fixture assigns at 100, reports
+progress at 50, proves the span survives at 101, and proves normal expiry at
+130. Consensus impact: NONE; this is volatile getheaders scheduling only.
+Worldstream remains complementary. Runtime/sanitizer execution remains deferred
+to preserve disk headroom.

@@ -161,6 +161,24 @@ static int test_deadline_saturates(void)
     return ok ? 0 : 1;
 }
 
+static int test_progress_cannot_shorten_deadline(void)
+{
+    printf("header_range_sched: backward progress cannot shorten deadline... ");
+    struct header_range_scheduler s = {0};
+    hrs_init(&s, 30);
+    hrs_plan(&s, 0, 50000, NULL, 0);
+    int32_t stalled[1] = {0};
+    bool ok = hrs_assign(&s, 67, 100) >= 0;
+    ok = ok && hrs_note_peer_progress(&s, 67, 50);
+    ok = ok && hrs_peer_span(&s, 67, 101, NULL, NULL);
+    ok = ok && hrs_sweep_expired(&s, 101, stalled, 1) == 0;
+    ok = ok && hrs_sweep_expired(&s, 130, stalled, 1) == 1;
+    ok = ok && stalled[0] == 67;
+    hrs_reset(&s);
+    if (ok) printf("OK\n"); else printf("FAIL\n");
+    return ok ? 0 : 1;
+}
+
 static int test_shared_target_is_order_independent(void)
 {
     printf("header_range_sched: shared target ignores peer tick order... ");
@@ -181,6 +199,7 @@ int test_header_range_sched(void)
     failures += test_continuation_preserves_stop();
     failures += test_progress_renews_deadline();
     failures += test_deadline_saturates();
+    failures += test_progress_cannot_shorten_deadline();
     failures += test_shared_target_is_order_independent();
 
     /* ── 1. Parallelize gate ─────────────────────────────────────── */
