@@ -1541,3 +1541,32 @@ their existing semantics.  Worldstream `5297c58f4` remains complementary on
 download-timeout arithmetic.  Remaining risk and next investigation: exercise
 the snapshot-owner finalization callback through the real connman reactor,
 including repeated disconnect/reconnect churn and callback lock ordering.
+
+## Empty-reactor terminal peer cleanup
+
+Baseline and root cause: the real connman socket-handler regression initially
+could not observe `finalize_node` at all.  When all remaining peers already had
+invalid/closed sockets, the reactor built an empty poll set, slept, and
+`continue`d before its terminal-removal pass.  On an otherwise socket-idle node
+those disconnected peers—and their snapshot ownership—could therefore remain
+published indefinitely rather than merely until the next 50 ms reactor tick.
+
+Fix and after-result: the empty reactor retains its bounded 50 ms sleep but now
+falls through the same timeout and terminal-cleanup phase as a nonempty poll
+set.  A test-only launcher runs the production socket-handler thread without
+DNS or dialer threads.  Its callback observes exactly one peer ID, successfully
+acquires `cs_nodes`, and sees the peer removed, proving finalization occurs
+after the peer-list lock is released.  The launcher joins and restores the
+process-global stop state so later tests remain isolated.
+
+Regression proof: `test_connman_addnode_fallback` reproduces the original
+empty-poll failure using an invalid-socket disconnected peer, then proves
+bounded removal, exactly-once finalization, callback lock ordering, and no
+cross-test stop-state leak through the following fixed-seed case.
+
+Consensus impact: NONE.  This changes only terminal P2P lifecycle cleanup;
+wire parsing, snapshot verification, block/transaction validity, PoW, and
+chain selection are unchanged.  Worldstream `5297c58f4` remains complementary
+on download-timeout arithmetic.  Remaining risk and next investigation:
+exercise repeated invalid-socket reconnect generations and verify each session
+finalizes once without retaining peer or snapshot ownership state.

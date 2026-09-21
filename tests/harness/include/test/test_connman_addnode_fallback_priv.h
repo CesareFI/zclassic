@@ -65,6 +65,7 @@ int check_connman_addnode_reactor_clamps_over_cap(void);
 int check_connman_addnode_reactor_passthrough_in_cap(void);
 int check_connman_addnode_reactor_refuses_exhausted(void);
 int check_connman_addnode_reactor_passes_default(void);
+int check_connman_socket_finalize_outside_peer_lock(void);
 
 /* test_connman_addnode_retire_and_inbound.c — retire-threshold gating
  * and revival, census harvest into addrman, fixed-seed onion no-ops,

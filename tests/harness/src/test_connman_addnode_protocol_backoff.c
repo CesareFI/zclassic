@@ -19,6 +19,76 @@
 #include <unistd.h>
 #include "test/test_connman_addnode_fallback_priv.h"
 
+struct finalize_probe {
+    struct connman *cm;
+    _Atomic int calls;
+    _Atomic bool acquired_peer_lock;
+    _Atomic node_id_t peer_id;
+};
+
+static void probe_finalize_node(void *ctx, node_id_t id)
+{
+    struct finalize_probe *probe = ctx;
+    bool acquired = zcl_mutex_trylock(&probe->cm->manager.cs_nodes);
+    if (acquired)
+        zcl_mutex_unlock(&probe->cm->manager.cs_nodes);
+    atomic_store(&probe->acquired_peer_lock, acquired);
+    atomic_store(&probe->peer_id, id);
+    atomic_fetch_add(&probe->calls, 1);
+}
+
+int check_connman_socket_finalize_outside_peer_lock(void)
+{
+    int failures = 0;
+    printf("connman_addnode_fallback: socket reactor finalizes once outside "
+           "peer lock... ");
+    {
+        chain_params_select(CHAIN_MAIN);
+        struct connman cm;
+        struct finalize_probe probe;
+        memset(&probe, 0, sizeof(probe));
+        probe.cm = &cm;
+        atomic_init(&probe.calls, 0);
+        atomic_init(&probe.acquired_peer_lock, false);
+        atomic_init(&probe.peer_id, -1);
+        struct node_signals sigs = {
+            .finalize_node = probe_finalize_node,
+            .ctx = &probe,
+        };
+        bool ok = connman_init(&cm, chain_params_get(), &sigs);
+        struct p2p_node *node = NULL;
+        node_id_t expected_id = -1;
+        if (ok) {
+            node = add_test_peer(&cm, 203, 0, 113, 90,
+                                 PEER_HANDSHAKE_COMPLETE, false, true);
+            ok = node != NULL;
+        }
+        if (node)
+            expected_id = node->id;
+
+        bool started = ok && connman_start_socket_handler_for_test(&cm);
+        for (int i = 0; started && atomic_load(&probe.calls) == 0 &&
+             i < 2000; i++)
+            platform_sleep_ms(1);
+        if (started)
+            connman_stop_socket_handler_for_test();
+
+        int calls = atomic_load(&probe.calls);
+        bool lock_acquired = atomic_load(&probe.acquired_peer_lock);
+        node_id_t finalized_id = atomic_load(&probe.peer_id);
+        ok = ok && started && calls == 1 && lock_acquired &&
+             finalized_id == expected_id && cm.manager.num_nodes == 0;
+        if (!ok)
+            printf("[started=%d calls=%d lock=%d id=%d expected=%d nodes=%zu] ",
+                   started, calls, lock_acquired, (int)finalized_id,
+                   (int)expected_id, cm.manager.num_nodes);
+        connman_free(&cm);
+        if (ok) printf("OK\n");
+        else { printf("FAIL\n"); failures++; }
+    }
+    return failures;
+}
+
 int check_connman_addnode_clock_rollback_retry(void)
 {
     int failures = 0;

@@ -596,3 +596,7 @@ later lane flips it HARD.
 - 2026-09-21T10:47:21Z — REASON: use monotonic cadence for snapshot and block swarm progress diagnostics
   old ROOT: accd354f0932f88515769c6f706530b97579ae7dc55e5522e037b0ff5d80b29b
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T10:52:27Z — REASON: qualify peer-finalization callback through actual connman socket reactor
+  old ROOT: e0f14cd5214b8d566b71dded5da7b6b22a223a7ac19aa1a48b46d69df5183c6c
+  by: owner unseal ritual (make core-unseal)

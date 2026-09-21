@@ -512,6 +512,14 @@ void connman_wake_message_handler(struct connman *cm);
  * Caller must hold cm->manager.cs_nodes. Exposed for the stress test. */
 void connman_run_deferred_free_sweep(struct connman *cm);
 
+#ifdef ZCL_TESTING
+/* Launch only the real socket-handler reactor, without DNS or outbound
+ * dialer threads, so terminal-removal lifecycle ordering can be qualified
+ * against isolated peers. The matching stop always joins the reactor. */
+bool connman_start_socket_handler_for_test(struct connman *cm);
+void connman_stop_socket_handler_for_test(void);
+#endif
+
 bool connman_pick_next_outbound_target(
     struct connman *cm,
     size_t *addnode_cursor,

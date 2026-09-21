@@ -1349,13 +1349,18 @@ static void *thread_socket_handler(void *arg)
                                  &g_sock_poll_iterations, 1,
                                  memory_order_relaxed) + 1);
 
+        int nready = 0;
         if (npfds == 0) {
+            /* An invalid/closed peer fd is intentionally absent from pfds,
+             * but its terminal lifecycle cleanup still has to run below.
+             * Sleeping preserves the empty-reactor cadence without skipping
+             * removal and finalize_node notification. */
             platform_sleep_ms(50);
-            continue;
+        } else {
+            nready = platform_socket_poll(pfds, npfds, 50 /* ms */);
+            if (nready < 0)
+                continue;
         }
-
-        int nready = platform_socket_poll(pfds, npfds, 50 /* ms */);
-        if (nready < 0) continue;
 
         /* Accept new connections via net.c accept_connection() */
         for (size_t i = 0; i < listen_count; i++) {
@@ -1852,6 +1857,24 @@ static void *thread_socket_handler(void *arg)
     }
     return NULL;
 }
+
+#ifdef ZCL_TESTING
+bool connman_start_socket_handler_for_test(struct connman *cm)
+{
+    if (!cm)
+        return false;
+    g_stop = false;
+    return pthread_create(&g_thread_socket, NULL,
+                          thread_socket_handler, cm) == 0;
+}
+
+void connman_stop_socket_handler_for_test(void)
+{
+    g_stop = true;
+    (void)pthread_join(g_thread_socket, NULL);
+    g_stop = false;
+}
+#endif
 
 bool connman_run_message_cycle(struct connman *cm)
 {

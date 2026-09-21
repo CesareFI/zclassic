@@ -106,6 +106,7 @@ int test_connman_addnode_fallback(void)
     failures += check_connman_addnode_reactor_passthrough_in_cap();
     failures += check_connman_addnode_reactor_refuses_exhausted();
     failures += check_connman_addnode_reactor_passes_default();
+    failures += check_connman_socket_finalize_outside_peer_lock();
     failures += check_connman_addnode_retire_both_thresholds();
     failures += check_connman_addnode_retire_needs_both_gates();
     failures += check_connman_addnode_retire_suppressed_below_floor();
