@@ -756,3 +756,7 @@ later lane flips it HARD.
 - 2026-09-21T18:49:05Z — REASON: Release block swarm ownership when manifest admission resets
   old ROOT: bf66dabd84646c7173aea42ef8516a14eae96d3796457097393c4933f245edc4
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T19:01:07Z — REASON: release snapshot chunk ownership when manifest admission is lost
+  old ROOT: 45cf5f400c8f81c38c2268a3aed0a76efbfd6a3e517ad744659d29d51b1b9206
+  by: owner unseal ritual (make core-unseal)

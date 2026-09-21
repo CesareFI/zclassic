@@ -272,6 +272,20 @@ static void swarm_requeue_known_peer_chunk(struct p2p_node *node,
         (void)swarm_requeue_peer_chunk(node, chunk_index);
 }
 
+/* Caller holds g_swarm_mutex. A peer that loses manifest admission must not
+ * retain an owned chunk until timeout. The global table is authoritative, so
+ * the bounded fallback scan also repairs a missing peer-local hint. */
+static size_t swarm_release_peer_chunks_locked(struct p2p_node *node)
+{
+    if (!node || !atomic_load(&g_swarm_active))
+        return 0;
+    size_t requeued = swarm_sync_peer_disconnected_hint(
+        &g_swarm, node->id, node->swarm_inflight_chunk);
+    node->swarm_inflight_chunk = -1;
+    node->swarm_chunk_req_time = 0;
+    return requeued;
+}
+
 static void swarm_clear_matching_peer_chunk(struct p2p_node *node,
                                             uint32_t chunk_index)
 {
@@ -336,6 +350,8 @@ static bool swarm_admit_manifest_source(struct p2p_node *node,
     bool admitted = false;
     if (atomic_load(&g_swarm_active)) {
         admitted = sync_manifest_equal(&g_swarm.manifest, manifest);
+        if (!admitted)
+            (void)swarm_release_peer_chunks_locked(node);
     } else if (allow_start && swarm_sync_init(&g_swarm, manifest, datadir)) {
         g_swarm_generation = swarm_next_generation(g_swarm_generation);
         atomic_store(&g_swarm_active, true);
@@ -1422,9 +1438,7 @@ size_t mp_snapshot_swarm_peer_disconnected(struct p2p_node *node)
          * already have been cleared or replaced when connman reaches its
          * single terminal cleanup site; scanning the bounded manifest table
          * prevents that churn from stranding owned chunks until timeout. */
-        if (atomic_load(&g_swarm_active))
-            requeued = swarm_sync_peer_disconnected_hint(
-                &g_swarm, node->id, node->swarm_inflight_chunk);
+        requeued = swarm_release_peer_chunks_locked(node);
         if (requeued > 0)
             swarm_record_reconnect_yield_locked(
                 node, platform_time_monotonic_us() / 1000000);

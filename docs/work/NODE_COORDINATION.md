@@ -2456,3 +2456,31 @@ all block/transaction validation, PoW, and chain selection are unchanged.
 Worldstream `5297c58f4` remains complementary. Next investigation: measure
 whether snapshot-manifest reconnect churn retains stale availability or
 ownership outside its existing authoritative disconnect cleanup.
+
+## Snapshot-manifest ownership release
+
+Baseline and root cause: a source with an in-flight UTXO snapshot chunk could
+send a well-formed but incompatible `zmanifest`. That correctly revoked its
+admission, but left the source as the global chunk owner until the ordinary
+timeout, unnecessarily reducing the bounded body window during reconnect or
+advertisement churn.
+
+Fix and after-result: manifest admission now releases the peer's exact hinted
+chunk and performs the bounded authoritative orphan scan while already holding
+the swarm mutex. Disconnect cleanup reuses the same helper. Matching repeated
+manifests retain their valid ownership; only a rejected active-swarm manifest
+releases work.
+
+Regression proof: the direct snapshot wire fixture gives a source chunk 1,
+delivers an incompatible manifest, and proves admission is revoked, the local
+hint is cleared, and chunk 1 is immediately `CHUNK_NEEDED` while source A's
+chunk 0 remains in flight. Native C23 syntax for the changed production unit,
+core resealing, consensus parity, and the complexity ratchet pass. The
+registered runtime target and ASan/UBSan remain deferred at 10.7 GB free space
+because its cold verifier build crosses the 10 GB safety floor.
+
+Consensus impact: NONE. This is volatile untrusted transport ownership only;
+snapshot commitment checks, reducer admission, all block/transaction validity,
+PoW, and chain selection remain unchanged. Worldstream `5297c58f4` remains
+complementary. Next investigation: audit snapshot chunk response cleanup on
+allocation or mutex-acquisition failure without relaxing validation.

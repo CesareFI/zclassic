@@ -773,6 +773,30 @@ static int test_snapshot_chunk_wire_adversarial(void)
     return failures;
 }
 
+static bool bs_incompatible_manifest_releases_owned_chunk(
+    struct msg_processor *mp, struct p2p_node *owner,
+    struct send_segment *sent_owner, const struct sync_manifest *manifest,
+    const struct sync_manifest *incompatible)
+{
+    bool ok = true;
+    if (!bs_push_manifest_frame(owner, mp->params, manifest) ||
+        bs_pump(owner, sent_owner, mp, owner, mp->params->pchMessageStart,
+                &ok) == 0 || !ok)
+        return false;
+    mp_snapshot_send_tick(mp, owner);
+    if (owner->swarm_inflight_chunk != 1 ||
+        !bs_snapshot_state(1, CHUNK_INFLIGHT, owner->id, 2, 0))
+        return false;
+    bs_drop_queue(owner, sent_owner);
+    if (!bs_push_manifest_frame(owner, mp->params, incompatible) ||
+        bs_pump(owner, sent_owner, mp, owner, mp->params->pchMessageStart,
+                &ok) == 0 || !ok)
+        return false;
+    return !owner->swarm_manifest_received &&
+        owner->swarm_inflight_chunk == -1 &&
+        bs_snapshot_state(1, CHUNK_NEEDED, -1, 1, 0);
+}
+
 static int test_snapshot_manifest_wire_reconnect(void)
 {
     int failures = 0;
@@ -811,13 +835,15 @@ static int test_snapshot_manifest_wire_reconnect(void)
         struct p2p_node *peer_a = bs_make_peer(&nm, 51);
         struct p2p_node *peer_b = bs_make_peer(&nm, 52);
         struct p2p_node *peer_bad = bs_make_peer(&nm, 53);
+        struct p2p_node *peer_owner = bs_make_peer(&nm, 54);
         struct p2p_node *peer_reconnect = bs_make_peer(&nm, 53);
         struct p2p_node *peer_a_reconnect = bs_make_peer(&nm, 51);
-        ASSERT(peer_a && peer_b && peer_bad && peer_reconnect &&
+        ASSERT(peer_a && peer_b && peer_bad && peer_owner && peer_reconnect &&
                peer_a_reconnect);
         struct send_segment *sent_a = bs_install_sentinel(peer_a);
         struct send_segment *sent_b = bs_install_sentinel(peer_b);
         struct send_segment *sent_bad = bs_install_sentinel(peer_bad);
+        struct send_segment *sent_owner = bs_install_sentinel(peer_owner);
         struct send_segment *sent_reconnect =
             bs_install_sentinel(peer_reconnect);
         struct send_segment *sent_a_reconnect =
@@ -828,6 +854,8 @@ static int test_snapshot_manifest_wire_reconnect(void)
         ASSERT(bs_pump(peer_a, sent_a, &mp, peer_a,
                        mp.params->pchMessageStart, &ok) > 0 && ok);
         bs_drop_queue(peer_a, sent_a);
+        ASSERT(bs_incompatible_manifest_releases_owned_chunk(
+            &mp, peer_owner, sent_owner, &manifest, &incompatible));
         ASSERT(bs_push_manifest_frame(peer_b, mp.params, &manifest));
         ASSERT(bs_pump(peer_b, sent_b, &mp, peer_b,
                        mp.params->pchMessageStart, &ok) > 0 && ok);
@@ -925,16 +953,19 @@ static int test_snapshot_manifest_wire_reconnect(void)
         send_segment_free(sent_a);
         send_segment_free(sent_b);
         send_segment_free(sent_bad);
+        send_segment_free(sent_owner);
         send_segment_free(sent_reconnect);
         send_segment_free(sent_a_reconnect);
         peer_a->send_head = peer_a->send_tail = NULL;
         peer_b->send_head = peer_b->send_tail = NULL;
         peer_bad->send_head = peer_bad->send_tail = NULL;
+        peer_owner->send_head = peer_owner->send_tail = NULL;
         peer_reconnect->send_head = peer_reconnect->send_tail = NULL;
         peer_a_reconnect->send_head = peer_a_reconnect->send_tail = NULL;
         p2p_node_free(peer_a);
         p2p_node_free(peer_b);
         p2p_node_free(peer_bad);
+        p2p_node_free(peer_owner);
         p2p_node_free(peer_reconnect);
         p2p_node_free(peer_a_reconnect);
         main_state_free(&ms);
