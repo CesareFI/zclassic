@@ -59,6 +59,7 @@
 static struct swarm_sync g_swarm __attribute__((used));
 static _Atomic bool g_swarm_active = false;
 static pthread_mutex_t g_swarm_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_swarm_generation = 0;
 
 static bool swarm_mutex_lock(void)
 {
@@ -79,6 +80,7 @@ static int64_t g_swarm_last_progress_time = 0;
 
 /* Progress display interval (5 seconds). */
 #define SWARM_PROGRESS_INTERVAL_SECS 5
+#define SWARM_MANIFEST_ATTEMPT_MAX 2
 /* BLOCK_PIECE_MAX_BLOCK_BYTES lives in msgprocessor_snapshot_internal.h —
  * shared with msgprocessor_snapshot_serve.c's build_block_piece_payloads,
  * which must agree with this file's parse_block_piece_payload_refs on the
@@ -146,6 +148,49 @@ static void swarm_clear_matching_peer_chunk(struct p2p_node *node,
     }
 }
 
+static uint64_t swarm_next_generation(uint64_t generation)
+{
+    return generation == UINT64_MAX ? 1 : generation + 1;
+}
+
+static bool swarm_manifest_attempt_allowed(struct p2p_node *node)
+{
+    if (!node || !swarm_mutex_lock())
+        return false;
+    uint64_t generation = atomic_load(&g_swarm_active) ?
+        g_swarm_generation : swarm_next_generation(g_swarm_generation);
+    if (node->swarm_manifest_generation != generation) {
+        node->swarm_manifest_generation = generation;
+        node->swarm_manifest_attempts = 0;
+    }
+    bool allowed = node->swarm_manifest_attempts <
+        SWARM_MANIFEST_ATTEMPT_MAX;
+    if (allowed)
+        node->swarm_manifest_attempts++;
+    swarm_mutex_unlock();
+    return allowed;
+}
+
+static bool swarm_manifest_command_allowed(const char *cmd,
+                                           struct p2p_node *node)
+{
+    if (strcmp(cmd, MSG_MANIFEST) != 0)
+        return false;
+    if (swarm_manifest_attempt_allowed(node))
+        return true;
+    printf("Peer %s: ignoring repeated snapshot manifest\n",
+           node->addr_name);
+    return false;
+}
+
+static void swarm_record_manifest_generation(struct p2p_node *node)
+{
+    if (node->swarm_manifest_generation == g_swarm_generation)
+        return;
+    node->swarm_manifest_generation = g_swarm_generation;
+    node->swarm_manifest_attempts = 1;
+}
+
 static bool swarm_admit_manifest_source(struct p2p_node *node,
                                         const struct sync_manifest *manifest,
                                         const char *datadir,
@@ -159,11 +204,14 @@ static bool swarm_admit_manifest_source(struct p2p_node *node,
     if (atomic_load(&g_swarm_active)) {
         admitted = sync_manifest_equal(&g_swarm.manifest, manifest);
     } else if (allow_start && swarm_sync_init(&g_swarm, manifest, datadir)) {
+        g_swarm_generation = swarm_next_generation(g_swarm_generation);
         atomic_store(&g_swarm_active, true);
         g_swarm_last_progress_time = (int64_t)platform_time_wall_time_t();
         *first_chunk_out = swarm_sync_assign_chunk(&g_swarm, node->id);
         admitted = true;
     }
+    if (atomic_load(&g_swarm_active))
+        swarm_record_manifest_generation(node);
     node->swarm_manifest_received = admitted;
     swarm_mutex_unlock();
     return admitted;
@@ -1123,7 +1171,7 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
 
         /* ── Parallel chunk sync messages ────────────────────── */
 
-        } else if (strcmp(cmd, MSG_MANIFEST) == 0) {
+        } else if (swarm_manifest_command_allowed(cmd, node)) {
             /* Peer sends their manifest — describes available chunks. */
             int32_t height = 0;
             uint8_t block_hash[32], merkle_root[32], utxo_sha3[32];

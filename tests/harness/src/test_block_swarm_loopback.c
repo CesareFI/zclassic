@@ -671,6 +671,13 @@ static int test_snapshot_manifest_wire_reconnect(void)
         ASSERT(peer_a->swarm_manifest_received);
         ASSERT(peer_b->swarm_manifest_received);
         ASSERT(!peer_bad->swarm_manifest_received);
+        ASSERT(bs_push_manifest_frame(peer_bad, mp.params, &incompatible));
+        ASSERT(bs_pump(peer_bad, sent_bad, &mp, peer_bad,
+                       mp.params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(bs_push_manifest_frame(peer_bad, mp.params, &manifest));
+        ASSERT(bs_pump(peer_bad, sent_bad, &mp, peer_bad,
+                       mp.params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(!peer_bad->swarm_manifest_received);
 
         ASSERT(peer_a->swarm_inflight_chunk == 0);
         ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_a->id, 1, 0));
@@ -680,6 +687,13 @@ static int test_snapshot_manifest_wire_reconnect(void)
         ASSERT(peer_b->swarm_inflight_chunk == 0);
         ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_b->id, 1, 0));
 
+        mp_snapshot_test_stop_swarm();
+        ASSERT(bs_push_manifest_frame(peer_bad, mp.params, &manifest));
+        ASSERT(bs_pump(peer_bad, sent_bad, &mp, peer_bad,
+                       mp.params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(peer_bad->swarm_manifest_received);
+        ASSERT(peer_bad->swarm_inflight_chunk == 0);
+        bs_drop_queue(peer_bad, sent_bad);
         mp_snapshot_test_stop_swarm();
         send_segment_free(sent_a);
         send_segment_free(sent_b);

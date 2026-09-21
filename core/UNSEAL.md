@@ -456,3 +456,11 @@ later lane flips it HARD.
 - 2026-09-21T04:04:12Z — REASON: Remove the manifest-admission test seam after replacing it with direct framed zmanifest regression coverage; no production or consensus semantic change
   old ROOT: fc1ac272f7dbf68a12f1c2158d730d3fd1517b00508399042751c8409b5a716f
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T04:20:11Z — REASON: Bound repeated per-peer zmanifest parsing work per active snapshot generation while allowing one corrective retry; networking resource defense only, no consensus semantic change
+  old ROOT: 7fed10447c1fdd6dd2fe0c84208f9fd62a8668af6d7b0506e8e421d3090889eb
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T04:22:02Z — REASON: Keep zmanifest attempt admission outside the large wire dispatcher complexity pin; refactor only, no consensus semantic change
+  old ROOT: 5f146cceb9ceb83721d078c7b1ce960e6f36786e16f0f9d577a3fc7d61308f24
+  by: owner unseal ritual (make core-unseal)

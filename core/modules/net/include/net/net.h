@@ -546,6 +546,8 @@ struct p2p_node {
     /* Swarm parallel chunk sync state (UTXO) */
     bool swarm_manifest_sent;     /* true if we sent our manifest to this peer */
     bool swarm_manifest_received; /* true if we received manifest from peer */
+    uint64_t swarm_manifest_generation; /* active swarm attempt generation */
+    uint8_t swarm_manifest_attempts; /* bounded parses in that generation */
     int32_t swarm_inflight_chunk; /* chunk index assigned to this peer, -1 = none */
     int64_t swarm_chunk_req_time; /* monotonic seconds at request */
 

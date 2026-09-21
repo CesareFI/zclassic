@@ -563,3 +563,34 @@ Remaining risk and next investigation: inspect repeated compatible and
 incompatible manifest advertisements for CPU amplification, stale eligibility,
 or send-tick monopolization, then select the next measured networking/IBD
 bottleneck.
+
+## Bound repeated snapshot-manifest work per peer
+
+A single peer could repeatedly advertise a `zmanifest` with as many as 65,000
+chunk hashes. Each message could force roughly 2 MiB of allocation, hash-array
+parsing, and Merkle reconstruction even after that peer had already advertised
+for the current swarm. Both compatible duplicates and internally valid but
+incompatible alternatives were unbounded.
+
+Each peer now receives two manifest parse attempts per snapshot-swarm
+generation: the initial advertisement plus one corrective retry. Later messages
+in that generation are discarded before allocation or Merkle work. The bounded
+generation advances when a new swarm starts, including wrap-safe rollover, so a
+peer becomes eligible again after completion/restart. No peer identity,
+implementation version, or inbound/outbound class receives special treatment.
+
+The framed-wire regression proves two incompatible attempts are processed, a
+third compatible advertisement cannot bypass the cap, disconnect failover still
+works, and the same peer can start the next generation. Block-swarm loopback
+passed normally and under ASan/UBSan; the 13-group networking selection,
+core seal/root mirror, consensus parity, generated capability inventory,
+cyclomatic complexity (55,585 functions), and whitespace gates passed.
+
+Consensus impact: none. The cap applies only to optional snapshot-manifest
+scheduling and does not alter accepted blocks, transactions, PoW, chain rules,
+or snapshot content verification. Worldstream remains at `0b29bec27` on
+complementary startup/observer work.
+
+Remaining risk and next investigation: inspect whether block-swarm manifest
+advertisements have an equivalent repeated-parse amplification path, then
+continue with measured peer-scheduler and IBD recovery bottlenecks.
