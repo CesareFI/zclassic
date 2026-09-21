@@ -514,6 +514,24 @@ static bool bs_push_block_manifest_frame(
     return ok;
 }
 
+static bool bs_push_block_bitmap_frame(
+    struct p2p_node *node, const struct chain_params *params,
+    uint32_t declared_len, const uint8_t *bitmap, uint32_t supplied_len)
+{
+    struct byte_stream payload;
+    stream_init(&payload, 4 + supplied_len);
+    bool ok = stream_write_u32_le(&payload, declared_len) &&
+        (!supplied_len || stream_write_bytes(&payload, bitmap, supplied_len)) &&
+        p2p_node_begin_message(node, MSG_BLOCK_BITMAP,
+                               params->pchMessageStart);
+    if (ok)
+        p2p_node_write_message_data(node, payload.data, payload.size);
+    if (ok)
+        ok = p2p_node_end_message(node);
+    stream_free(&payload);
+    return ok;
+}
+
 static bool bs_snapshot_state(uint32_t index,
                               enum chunk_state expected_state,
                               int expected_peer,
@@ -809,6 +827,12 @@ static int test_block_swarm_throughput(void)
         ASSERT(ok);
         ASSERT(b_node->blk_manifest_received);
         ASSERT(mp_block_swarm_is_active());
+        uint8_t unsolicited_bitmap = 0xff;
+        ASSERT(bs_push_block_bitmap_frame(bad_node, params, 1,
+                                          &unsolicited_bitmap, 1));
+        ASSERT(bs_pump(bad_node, sent_bad, &mp_b, bad_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(bad_node->blk_bitmap == NULL);
         struct block_piece_manifest incompatible;
         ASSERT(block_piece_manifest_build_active_chain(
             &seed.ms.chain_active, BS_START_HEIGHT, seed.end_height,
@@ -822,6 +846,41 @@ static int test_block_swarm_throughput(void)
         ASSERT(bs_pump(bad_node, sent_bad, &mp_b, bad_node,
                        params->pchMessageStart, &ok) > 0 && ok);
         ASSERT(!bad_node->blk_manifest_received);
+
+        /* The 40-piece manifest has an exact five-byte bitmap. Truncated and
+         * oversized frames must preserve the prior generation's bitmap;
+         * repeated valid advertisements replace rather than accumulate. */
+        uint8_t truncated_bitmap[4] = {0xff, 0xff, 0xff, 0xff};
+        uint8_t oversized_bitmap[6] = {
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+        };
+        uint8_t complete_bitmap[5] = {
+            0xff, 0xff, 0xff, 0xff, 0xff
+        };
+        uint8_t *stale_bitmap = b_node->blk_bitmap;
+        ASSERT(bs_push_block_bitmap_frame(b_node, params, 5,
+                                          truncated_bitmap, 4));
+        ASSERT(bs_pump(b_node, sent_b, &mp_b, b_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(b_node->blk_bitmap == stale_bitmap);
+        ASSERT(b_node->blk_bitmap_swarm_generation == 0);
+        ASSERT(bs_push_block_bitmap_frame(b_node, params, 6,
+                                          oversized_bitmap, 6));
+        ASSERT(bs_pump(b_node, sent_b, &mp_b, b_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(b_node->blk_bitmap == stale_bitmap);
+        ASSERT(b_node->blk_bitmap_swarm_generation == 0);
+        ASSERT(bs_push_block_bitmap_frame(b_node, params, 5,
+                                          complete_bitmap, 5));
+        ASSERT(bs_pump(b_node, sent_b, &mp_b, b_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(b_node->blk_bitmap != stale_bitmap);
+        ASSERT(b_node->blk_bitmap_len == 5);
+        ASSERT(bs_push_block_bitmap_frame(b_node, params, 5,
+                                          complete_bitmap, 5));
+        ASSERT(bs_pump(b_node, sent_b, &mp_b, b_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        ASSERT(b_node->blk_bitmap_len == 5);
         bad_node->blk_manifest_received = true;
         bad_node->blk_manifest_admitted_generation = 0;
         mp_snapshot_send_tick(&mp_b, bad_node);

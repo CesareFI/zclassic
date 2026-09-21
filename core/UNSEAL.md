@@ -480,3 +480,7 @@ later lane flips it HARD.
 - 2026-09-21T05:21:58Z — REASON: Update block-swarm fairness fixtures through a generation-aware test admission seam; no production or consensus semantic change
   old ROOT: 88ac87c0fe20b3f97fe7aa1feaad03d73740ccdfce26d25cbde5fc21db397b6b
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T05:40:37Z — REASON: Bind block-swarm bitmap advertisements to an admitted manifest generation and exact piece span; scheduling only, consensus unchanged
+  old ROOT: 2fa02c75067bac59e2c0116bd901fe7e8f807742d0b2798b04b50d4ea283ac0b
+  by: owner unseal ritual (make core-unseal)

@@ -691,3 +691,36 @@ cryptographic validation semantics are unchanged. Worldstream remains at
 Remaining risk and next investigation: audit bitmap message length against the
 active manifest span and ensure excess/truncated bitmap bytes cannot distort
 rarest-first availability accounting or consume unnecessary memory.
+
+## Bind block availability to admitted manifest shape
+
+Baseline: the wire handler accepted any `zblkbitmap` length from 1 through
+65,536 bytes whenever a block swarm happened to be active. It did not require
+the sending peer to have supplied the active manifest. A framed regression
+confirmed that an unsolicited one-byte advertisement was stored and credited
+against a 40-piece swarm, whose only valid bitmap length is five bytes.
+
+Root cause: bitmap framing was bounded by a protocol-wide constant rather than
+the active manifest, and source admission was not consulted. The handler now
+requires the sender's manifest admission generation to equal the active swarm
+generation and requires exactly `ceil(num_pieces / 8)` bytes. Admission and
+shape are checked before allocation and rechecked under the swarm mutex at
+installation, so a concurrent restart cannot inherit the payload. Truncated,
+oversized, unsolicited, and generation-racing payloads preserve the peer's
+previous valid contribution; repeated valid advertisements still replace it.
+
+After-result and regression proof: the direct framed-wire regression rejects
+an unsolicited bitmap, a declared-five-byte/truncated-four-byte payload, and a
+six-byte payload; it accepts two repeated exact five-byte advertisements and
+then completes all 2,560 fixture blocks at 31,463 blocks/s (46.4 MB/s). The
+focused block-swarm loopback group passes normally and under ASan/UBSan; all
+13 selected networking groups pass.
+
+Consensus impact: none. The change only constrains optional peer availability
+metadata used for request ordering. Every delivered block still traverses the
+unchanged canonical validation path. Worldstream remains at `0b29bec27` on
+complementary fresh-sync startup and observer gates, with no bitmap overlap.
+
+Remaining risk and next investigation: inspect whether block-manifest and
+bitmap peer admission is cleared consistently on every disconnect/reconnect
+lifecycle, then profile the next block-swarm scheduling bottleneck.

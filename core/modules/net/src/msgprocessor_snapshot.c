@@ -407,6 +407,46 @@ static void block_swarm_replace_peer_bitmap_locked(
     node->blk_bitmap_swarm_generation = g_block_swarm_generation;
 }
 
+static bool block_swarm_bitmap_shape_allowed_locked(
+    const struct p2p_node *node, uint32_t bitmap_len)
+{
+    uint32_t pieces = g_block_swarm.manifest.num_pieces;
+    uint32_t expected_len = pieces / 8 + (pieces % 8 != 0);
+    return atomic_load(&g_block_swarm_active) &&
+        node->blk_manifest_received &&
+        node->blk_manifest_admitted_generation == g_block_swarm_generation &&
+        bitmap_len == expected_len;
+}
+
+static bool block_swarm_bitmap_shape_allowed(
+    const struct p2p_node *node, uint32_t bitmap_len)
+{
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    bool allowed = block_swarm_bitmap_shape_allowed_locked(node, bitmap_len);
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return allowed;
+}
+
+static bool block_swarm_install_peer_bitmap(
+    struct p2p_node *node, uint8_t *bitmap, uint32_t bitmap_len,
+    uint8_t **old_bitmap_out)
+{
+    *old_bitmap_out = NULL;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    if (!block_swarm_bitmap_shape_allowed_locked(node, bitmap_len)) {
+        pthread_mutex_unlock(&g_block_swarm_mutex);
+        return false;
+    }
+    uint64_t old_generation = node->blk_bitmap_swarm_generation;
+    block_swarm_replace_peer_bitmap_locked(
+        node, old_generation, bitmap, bitmap_len);
+    *old_bitmap_out = node->blk_bitmap;
+    node->blk_bitmap = bitmap;
+    node->blk_bitmap_len = bitmap_len;
+    pthread_mutex_unlock(&g_block_swarm_mutex);
+    return true;
+}
+
 static int64_t block_swarm_monotonic_seconds(void)
 {
     int64_t now = platform_time_monotonic_us() / 1000000;
@@ -1848,29 +1888,30 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
 
         } else if (strcmp(cmd, MSG_BLOCK_BITMAP) == 0) {
             /* Peer sends their piece availability bitmap.
-             * DEFENSIVE: validate length is reasonable. */
+             * Accept only the exact active manifest span from an admitted
+             * source. This bounds allocation and prevents unsolicited peers
+             * from distorting rarest-first availability. */
             uint32_t bitmap_len = 0;
             if (!stream_read_u32_le(s, &bitmap_len) ||
-                bitmap_len == 0 || bitmap_len > 65536) {
+                !block_swarm_bitmap_shape_allowed(node, bitmap_len)) {
                 printf("Peer %s: bad zblkbitmap len=%u\n",
                        node->addr_name, bitmap_len);
             } else {
                 uint8_t *bitmap = zcl_calloc(bitmap_len, 1, "blk_bitmap");
                 if (bitmap && stream_read_bytes(s, bitmap, bitmap_len)) {
                     /* Replace this peer's prior contribution rather than
-                     * accumulating repeated untrusted advertisements. */
-                    uint64_t old_generation =
-                        node->blk_bitmap_swarm_generation;
-                    node->blk_bitmap_swarm_generation = 0;
-                    if (g_block_swarm_active) {
-                        pthread_mutex_lock(&g_block_swarm_mutex);
-                        block_swarm_replace_peer_bitmap_locked(
-                            node, old_generation, bitmap, bitmap_len);
-                        pthread_mutex_unlock(&g_block_swarm_mutex);
+                     * accumulating repeated untrusted advertisements. The
+                     * install rechecks admission after allocation/read so a
+                     * concurrent swarm restart cannot inherit these bytes. */
+                    uint8_t *old_bitmap = NULL;
+                    if (block_swarm_install_peer_bitmap(
+                            node, bitmap, bitmap_len, &old_bitmap)) {
+                        free(old_bitmap);
+                    } else {
+                        free(bitmap);
+                        printf("Peer %s: stale zblkbitmap\n",
+                               node->addr_name);
                     }
-                    free(node->blk_bitmap);
-                    node->blk_bitmap = bitmap;
-                    node->blk_bitmap_len = bitmap_len;
                 } else {
                     free(bitmap);
                     printf("Peer %s: truncated zblkbitmap\n",
