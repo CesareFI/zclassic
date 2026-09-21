@@ -337,6 +337,7 @@ struct swarm_sync {
     uint32_t next_needed_hint;         /* bounded assignment scan cursor */
     uint64_t assignment_probes;        /* inspected states; test/diagnostic */
     uint64_t disconnect_probes;        /* fallback ownership scans; diagnostic */
+    uint64_t timeout_probes;           /* timeout scan states; diagnostic */
     int64_t last_timeout_sweep_monotonic; /* bounded global-orphan scan */
     const char *datadir;               /* for applying chunks */
 };

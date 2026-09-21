@@ -1552,9 +1552,11 @@ bool fast_sync_timeout_elapsed_at(int64_t now_monotonic,
 void swarm_sync_handle_timeouts_at(struct swarm_sync *ss, int timeout_secs,
                                    int64_t now_monotonic)
 {
-    if (!ss || !ss->chunk_states) return;
+    if (!ss || !ss->chunk_states || ss->chunks_inflight == 0)
+        return;
 
     for (uint32_t i = 0; i < ss->manifest.num_chunks; i++) {
+        ss->timeout_probes++;
         if (ss->chunk_states[i] == CHUNK_INFLIGHT &&
             fast_sync_timeout_elapsed_at(now_monotonic,
                                          ss->chunk_request_time[i],

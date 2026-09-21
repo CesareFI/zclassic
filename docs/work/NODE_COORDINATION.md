@@ -2106,3 +2106,20 @@ remains complementary. Remaining risk: execute the cold registered runtime
 group only when disk headroom permits; source syntax, seal, parity, and
 complexity gates pass. Next investigation: quantify scheduler scans under
 large manifest and multi-peer churn.
+
+## Empty snapshot timeout-sweep fast path
+
+Baseline and root cause: even after global sweep coalescing, an admitted sweep
+traversed every manifest entry when no chunks were in flight. Such a state has
+no timeout candidate, so the traversal was pure scheduler overhead.
+
+Fix and after-result: `swarm_sync_handle_timeouts_at` now returns immediately
+when its authoritative in-flight count is zero. A diagnostic probe counter
+shows zero manifest reads for the empty case and a complete bounded traversal
+when a real stale request exists.
+
+Regression proof: `test_fast_sync` exercises both states and proves stale
+ownership is still released. Consensus impact: NONE. Worldstream remains
+complementary. Remaining risk: cold runtime group awaits safe disk headroom;
+syntax, seal, parity, and complexity checks pass. Next investigation: reduce
+nonempty sweep work without weakening orphan recovery.

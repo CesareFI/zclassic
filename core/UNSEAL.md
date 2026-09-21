@@ -692,3 +692,7 @@ later lane flips it HARD.
 - 2026-09-21T17:39:20Z — REASON: Refactor authorized snapshot timeout sweep under complexity ratchet
   old ROOT: acec137c149ecd325770a567e6289b80c8969dec5ec71f050bf696c367a7d0db
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T17:41:36Z — REASON: Skip empty snapshot timeout sweeps while preserving in-flight timeout recovery
+  old ROOT: 12cd02ccc4111211fce9cfe721ccf0421e25c04a3677e44d087398ce02fb5507
+  by: owner unseal ritual (make core-unseal)
