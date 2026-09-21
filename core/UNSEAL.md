@@ -424,3 +424,7 @@ later lane flips it HARD.
 - 2026-09-21T01:21:22Z — REASON: Refactor snapshot chunk ownership enforcement into bounded helpers to preserve the cyclomatic-complexity ratchet; no semantic or consensus change
   old ROOT: 9501a1223bdc514822a8c6f3a9650b9468badcbbee5a7e430b0c40a08425bcb1
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T01:36:10Z — REASON: Use overflow-safe monotonic elapsed-time evaluation for peer-local snapshot timeout cleanup; scheduling only, no consensus semantic change
+  old ROOT: 8360d8d72c9f7ebd1ccaccf434265f3d9fb828248e1b6c5a40331e4c4a93492d
+  by: owner unseal ritual (make core-unseal)

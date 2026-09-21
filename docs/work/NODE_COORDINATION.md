@@ -447,3 +447,24 @@ Worldstream remains at `0b29bec27` with no overlap.
 Remaining risk and next investigation: add a direct wire fixture covering
 unsolicited and truncated `zchunkdata`, including preservation of the sender's
 unrelated legitimate request slot.
+
+## Overflow-safe peer-local snapshot timeout
+
+The global snapshot timeout sweep used the shared bounded monotonic-elapsed
+helper, but the peer-local cleanup immediately after it still subtracted two
+signed 64-bit timestamps directly. Extreme clock values could overflow that
+expression even though the global decision was safe.
+
+The peer-local scheduler now uses `fast_sync_timeout_elapsed_at` as well. Its
+existing deterministic boundary regression covers rollback and both `INT64`
+extremes, and that regression passed under ASan/UBSan in the immediately prior
+snapshot ownership slice. The four-group fast-sync suite, core seal/root mirror,
+consensus parity, generated capability inventory, cyclomatic complexity (55,568
+functions), and whitespace gates passed after wiring the scheduler to it.
+
+Consensus impact: none. This is timeout arithmetic for failed-request cleanup;
+validation and chain semantics are unchanged. Worldstream remains at
+`0b29bec27` with no overlap.
+
+Remaining risk and next investigation: direct wire regressions remain the next
+gap, followed by snapshot manifest-source diversity under reconnect churn.

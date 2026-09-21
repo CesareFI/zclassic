@@ -1786,7 +1786,9 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         /* Handle timeout: if this peer's chunk is stale, re-queue it */
         if (node->swarm_inflight_chunk >= 0) {
             int64_t now_sw = platform_time_monotonic_us() / 1000000;
-            if (now_sw - node->swarm_chunk_req_time > SWARM_CHUNK_TIMEOUT_SECS) {
+            if (fast_sync_timeout_elapsed_at(
+                    now_sw, node->swarm_chunk_req_time,
+                    SWARM_CHUNK_TIMEOUT_SECS)) {
                 uint32_t ci = (uint32_t)node->swarm_inflight_chunk;
                 if (swarm_sync_requeue_chunk_for_peer(
                         &g_swarm, ci, node->id)) {
