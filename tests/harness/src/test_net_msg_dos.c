@@ -329,6 +329,61 @@ static int dos_version_queue_refusal(struct msg_processor *mp,
     return failures;
 }
 
+static int dos_keepalive_queue_refusal(struct msg_processor *mp,
+                                       struct net_manager *nm)
+{
+    int failures = 0;
+    struct net_address addr;
+    net_address_init(&addr);
+    unsigned char ip4[4] = {203, 0, 113, 86};
+    net_addr_set_ipv4(&addr.svc.addr, ip4);
+    addr.svc.port = 8033;
+    struct p2p_node *node = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "keepalive-blocked", false);
+    DOS_CHECK("keepalive refusal: peer created", node != NULL);
+    if (node) {
+        int64_t now_us = platform_time_monotonic_us();
+        node->state = PEER_ACTIVE;
+        node->version = PROTOCOL_VERSION;
+        node->starting_height = 0;
+        node->send_size = net_send_peer_bytes_hard_cap();
+        atomic_store(&node->connected_monotonic_us,
+                     now_us - 120LL * 1000000LL);
+        atomic_store(&node->last_activity_monotonic_us,
+                     now_us - 61LL * 1000000LL);
+        atomic_store(&node->keepalive_ping_sent_monotonic_us, 0);
+        DOS_CHECK("keepalive refusal: send tick survives",
+                  msg_send_messages(mp, node, false));
+        DOS_CHECK("keepalive refusal: unsent ping creates no deadline",
+                  node->ping_nonce_sent == 0 && node->ping_usec_start == 0 &&
+                  atomic_load(&node->keepalive_ping_sent_monotonic_us) == 0 &&
+                  !dos_send_queue_has_command(node, "ping"));
+        p2p_node_free(node);
+    }
+
+    node = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "keepalive-healthy", false);
+    DOS_CHECK("keepalive refusal: healthy peer created", node != NULL);
+    if (node) {
+        int64_t now_us = platform_time_monotonic_us();
+        node->state = PEER_ACTIVE;
+        node->version = PROTOCOL_VERSION;
+        node->starting_height = 0;
+        atomic_store(&node->connected_monotonic_us,
+                     now_us - 120LL * 1000000LL);
+        atomic_store(&node->last_activity_monotonic_us,
+                     now_us - 61LL * 1000000LL);
+        DOS_CHECK("keepalive refusal: healthy send tick succeeds",
+                  msg_send_messages(mp, node, false));
+        DOS_CHECK("keepalive refusal: queued ping starts deadline",
+                  node->ping_nonce_sent != 0 && node->ping_usec_start > 0 &&
+                  atomic_load(&node->keepalive_ping_sent_monotonic_us) > 0 &&
+                  dos_send_queue_has_command(node, "ping"));
+        p2p_node_free(node);
+    }
+    return failures;
+}
+
 static int dos_inbound_only_getheaders_recovery(struct msg_processor *mp,
                                                 struct net_manager *nm)
 {
@@ -1381,6 +1436,10 @@ int test_net_msg_dos(void)
     /* Handshake state records a version frame that actually entered the
      * bounded send queue.  A refused enqueue must leave CONNECTING retryable. */
     failures += dos_version_queue_refusal(&mp, &nm);
+
+    /* A locally refused keepalive cannot start a pong timeout for a frame
+     * that never existed on the wire. */
+    failures += dos_keepalive_queue_refusal(&mp, &nm);
 
     net_manager_free(&nm);
     sync_set_state(sync0, "net_msg_dos restore");

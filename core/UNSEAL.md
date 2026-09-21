@@ -628,3 +628,7 @@ later lane flips it HARD.
 - 2026-09-21T12:14:02Z — REASON: Refactor version enqueue result handling below the existing send-loop complexity ratchet; no behavior or consensus change
   old ROOT: ca98374bd5129a13fcc390228e48f2e247b4641a9a2ccc12d9ecf73185b941eb
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T12:34:09Z — REASON: Record keepalive nonce and pong deadline only after the ping frame enters the bounded send queue; no consensus or wire semantic change
+  old ROOT: d9a9c1eaa5dee9fd125792aac7c00a110748a263c4dfb1a025bf3bbe9d49c0b0
+  by: owner unseal ritual (make core-unseal)

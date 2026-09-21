@@ -1768,3 +1768,28 @@ unchanged.  Worldstream `0b29bec27` remains complementary on fresh-sync startup
 interruption and observer coverage.  Remaining risk and next investigation:
 audit post-version one-shot negotiation flags (`getaddr`, `sendheaders`, and
 mempool pull) for the same enqueue-before-state invariant.
+
+## Keepalive deadline enqueue ownership
+
+Baseline and root cause: the send loop wrote `ping_nonce_sent`,
+`ping_usec_start`, and the monotonic pong-deadline origin before the ping frame
+entered the bounded peer queue.  A non-draining peer at the hard ceiling was
+therefore represented as awaiting a pong for a ping that never existed on the
+wire.
+
+Fix and after-result: keepalive construction is isolated in a bounded helper,
+and all nonce/deadline state is committed only after `p2p_node_end_message`
+accepts the frame.  Queue refusal leaves every ping marker clear, while the
+existing resource-limit disconnect remains authoritative.
+
+Regression proof: a production send-loop fixture supplies monotonic activity
+old enough to require a ping, fills the peer queue, and first observed all
+three false deadline fields.  It now proves the refused frame creates no nonce,
+timer, or queued ping, while a healthy control queues a ping and starts all
+three markers.  The full `net_msg_dos` group passes normally and under
+ASan/UBSan.  Consensus impact:
+NONE; this changes volatile peer-liveness accounting only.  Wire serialization,
+validation, PoW, chain selection, and transaction rules are unchanged.
+Worldstream `6c1a99c24` remains complementary on fresh-sync startup observer
+coverage.  Remaining risk and next investigation: continue auditing getaddr
+and mempool one-shot flags.

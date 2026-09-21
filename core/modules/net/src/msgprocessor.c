@@ -2403,6 +2403,26 @@ static void msg_try_start_outbound_handshake(struct msg_processor *mp,
                                PEER_VERSION_SENT, "outbound version sent");
 }
 
+static void msg_queue_keepalive_ping(struct msg_processor *mp,
+                                     struct p2p_node *node,
+                                     int64_t now_mono_us)
+{
+    uint64_t nonce = GetRand(UINT64_MAX);
+    struct byte_stream ping;
+    stream_init(&ping, 8);
+    stream_write_u64_le(&ping, nonce);
+    p2p_node_begin_message(node, "ping", mp->params->pchMessageStart);
+    p2p_node_write_message_data(node, ping.data, ping.size);
+    bool queued = p2p_node_end_message(node);
+    stream_free(&ping);
+    if (!queued)
+        return;
+    node->ping_nonce_sent = nonce;
+    node->ping_usec_start = now_mono_us;
+    atomic_store_explicit(&node->keepalive_ping_sent_monotonic_us,
+                          now_mono_us, memory_order_relaxed);
+}
+
 /* ── msg_send_messages: per-peer trickle ─────────────────────── */
 
 bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
@@ -2943,22 +2963,8 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
             &node->keepalive_ping_sent_monotonic_us, memory_order_relaxed),
     };
     if (peer_liveness_decide(&liveness, now_mono_us) ==
-        PEER_LIVENESS_SEND_PING) {
-        uint64_t nonce = GetRand(UINT64_MAX);
-        node->ping_nonce_sent = nonce;
-        node->ping_usec_start = now_mono_us;
-        atomic_store_explicit(&node->keepalive_ping_sent_monotonic_us,
-                              now_mono_us, memory_order_relaxed);
-
-        struct byte_stream ping;
-        stream_init(&ping, 8);
-        stream_write_u64_le(&ping, nonce);
-
-        p2p_node_begin_message(node, "ping", mp->params->pchMessageStart);
-        p2p_node_write_message_data(node, ping.data, ping.size);
-        p2p_node_end_message(node);
-        stream_free(&ping);
-    }
+        PEER_LIVENESS_SEND_PING)
+        msg_queue_keepalive_ping(mp, node, now_mono_us);
 
     /* Snapshot serving + swarm + block-swarm coordinators. */
     mp_snapshot_send_tick(mp, node);
