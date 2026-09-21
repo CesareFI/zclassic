@@ -113,6 +113,19 @@ static void block_pipeline_clear_piece(struct p2p_node *node,
     }
 }
 
+bool mp_block_swarm_manifest_shape_valid(int32_t start_height,
+                                         int32_t end_height,
+                                         uint32_t num_pieces)
+{
+    if (start_height < 0 || end_height < start_height ||
+        num_pieces == 0 || num_pieces > 100000)
+        return false;
+    int64_t blocks = (int64_t)end_height - start_height + 1;
+    uint64_t expected = ((uint64_t)blocks + BLOCKS_PER_PIECE - 1) /
+                        BLOCKS_PER_PIECE;
+    return expected == num_pieces;
+}
+
 struct snapshot_sync_service *msg_snapshot_sync(
     const struct msg_processor *mp)
 {
@@ -1277,13 +1290,11 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                                         "invalid block manifest params");
                 } else {
                     /* Verify piece count is consistent with height range */
-                    uint32_t expected = (uint32_t)((end_h - start_h +
-                        BLOCKS_PER_PIECE) / BLOCKS_PER_PIECE);
-                    if (num_pieces != expected) {
+                    if (!mp_block_swarm_manifest_shape_valid(
+                            start_h, end_h, num_pieces)) {
                         fprintf(stderr, "Peer %s: block manifest piece count mismatch "  // obs-ok:helper-context-logged
-                               "(got %u, expected %u for h=%d..%d)\n",
-                               node->addr_name, num_pieces, expected,
-                               start_h, end_h);
+                               "(got %u for h=%d..%d)\n",
+                               node->addr_name, num_pieces, start_h, end_h);
                         peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_MESSAGE,
                                             "block manifest piece count wrong");
                     } else {

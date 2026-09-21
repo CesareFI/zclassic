@@ -97,6 +97,9 @@ mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
                                        struct p2p_node *node,
                                        int64_t now_monotonic);
 int32_t mp_block_swarm_peer_manifest_end(const struct p2p_node *node);
+bool mp_block_swarm_manifest_shape_valid(int32_t start_height,
+                                         int32_t end_height,
+                                         uint32_t num_pieces);
 int32_t mp_block_swarm_local_header_cap(const struct msg_processor *mp);
 int32_t mp_block_swarm_contiguous_window_cap(struct block_swarm *swarm,
                                              int32_t header_cap);

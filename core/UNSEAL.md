@@ -396,3 +396,7 @@ later lane flips it HARD.
 - 2026-09-20T23:40:30Z — REASON: Close active-swarm generation race in disconnect and bitmap replacement by deciding ownership under the swarm mutex; scheduling only, no consensus or validation semantic change
   old ROOT: 48c14e43ce83c60259d6a4ebff58e7c61a298a828878fb7a7507dfefb8d906f1
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-20T23:49:34Z — REASON: Reject malformed block manifests with overflow-safe 64-bit height-span arithmetic before allocation; wire validation only, no consensus semantic change
+  old ROOT: 3a80ba0e49ec648fd6c30e17c6f67e27d6c27e01382e38d7d56fc2bb58e9e871
+  by: owner unseal ritual (make core-unseal)

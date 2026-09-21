@@ -745,6 +745,30 @@ struct block_swarm_pipeline_reconcile
 mp_block_swarm_reconcile_peer_pipeline(struct block_swarm *swarm,
                                        struct p2p_node *node,
                                        int64_t now_monotonic);
+bool mp_block_swarm_manifest_shape_valid(int32_t start_height,
+                                         int32_t end_height,
+                                         uint32_t num_pieces);
+
+static int test_block_swarm_manifest_shape_bounds(void)
+{
+    int failures = 0;
+
+    TEST("block swarm manifest shape rejects overflow and count mismatches") {
+        ASSERT(mp_block_swarm_manifest_shape_valid(
+            1, BLOCKS_PER_PIECE, 1));
+        ASSERT(mp_block_swarm_manifest_shape_valid(
+            1, 2 * BLOCKS_PER_PIECE, 2));
+        ASSERT(!mp_block_swarm_manifest_shape_valid(-1, 100, 2));
+        ASSERT(!mp_block_swarm_manifest_shape_valid(100, 99, 1));
+        ASSERT(!mp_block_swarm_manifest_shape_valid(1, 100, 1));
+        ASSERT(!mp_block_swarm_manifest_shape_valid(0, INT32_MAX, 1));
+        ASSERT(!mp_block_swarm_manifest_shape_valid(
+            INT32_MAX - BLOCKS_PER_PIECE + 1, INT32_MAX, 2));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
 
 static int test_block_swarm_peer_fairness(void)
 {
@@ -1487,6 +1511,7 @@ static int test_block_swarm_manifest_republish(void)
 int test_block_swarm_loopback(void)
 {
     int failures = 0;
+    failures += test_block_swarm_manifest_shape_bounds();
     /* Every test here advertises and serves block pieces from a fixture
      * that never booted the runtime port, so the live sovereignty
      * predicate reads "port absent" — not sovereign — and the serving

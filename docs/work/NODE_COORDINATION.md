@@ -299,3 +299,34 @@ Remaining risk: bitmaps received before a swarm starts are intentionally not
 retroactively counted, so their pieces tie at the neutral availability value
 until a fresh advertisement. Next investigate whether manifest acceptance
 should seed already-connected peer bitmaps for better rarest-first ordering.
+
+## Overflow-safe block-manifest shape validation
+
+The untrusted `zblkmanfst` parser bounded `num_pieces`, but calculated its
+expected value with `end_h - start_h + BLOCKS_PER_PIECE` in signed 32-bit
+arithmetic. A peer-supplied end height near `INT32_MAX` could overflow before
+the count mismatch rejected the manifest, invoking undefined behavior in the
+network receive path.
+
+Manifest shape validation now widens both heights before subtraction, computes
+the inclusive block span in `int64_t`, derives the expected piece count in
+`uint64_t`, and rejects any mismatch before allocating the piece-hash array.
+The existing 100,000-piece resource cap remains unchanged.
+
+A deterministic regression covers valid one- and two-piece ranges, negative
+and reversed heights, ordinary count mismatches, `INT32_MAX`, and a boundary
+range whose supplied count is wrong. The production-path block-swarm loopback
+passed and moved 2,560 blocks / 3,962,880 bytes at 30,268 blocks/s (44.7 MB/s).
+Core seal/root mirror, consensus parity, generated capability inventory,
+cyclomatic complexity (55,557 functions), and whitespace gates passed.
+
+The ASan/UBSan block-swarm loopback passed the same overflow regression with
+no sanitizer finding and moved 2,560 blocks at 8,939 blocks/s (13.2 MB/s).
+
+Consensus impact: none. This only rejects malformed fast-sync peer metadata
+before allocation; accepted manifests, hashes, payloads, blocks, transactions,
+PoW, and chain selection are unchanged. Worldstream commit `0b29bec27` remains
+on observer/startup work with no overlap.
+
+Remaining risk and next investigation: other peer-controlled range calculations
+in snapshot/chunk messages should receive the same explicit-width audit.
