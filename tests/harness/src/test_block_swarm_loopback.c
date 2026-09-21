@@ -1537,6 +1537,8 @@ bool mp_block_swarm_test_stall_elapsed_at(
     int64_t now_monotonic, int64_t last_complete_monotonic);
 bool mp_swarm_test_progress_due_at(int64_t now_monotonic,
                                    int64_t last_progress_monotonic);
+bool mp_block_swarm_test_timeout_yield_active(
+    const struct p2p_node *node, int64_t now_monotonic);
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
                                         uint32_t piece_index);
 struct block_swarm_pipeline_reconcile {
@@ -1853,6 +1855,16 @@ static int test_block_swarm_timeout_owner_yields(void)
         ASSERT(extreme.timed_out);
         ASSERT(slow.blk_timeout_yield_until == INT64_MAX);
         ASSERT(swarm.piece_states[0] == CHUNK_NEEDED);
+
+        /* A yield deadline is normally one scheduler second ahead. If a
+         * platform supplies an older monotonic value after timeout, preserving
+         * the yield is safer than letting the stalled peer reclaim the piece
+         * before another source gets a turn. */
+        slow.blk_timeout_yield_until = INT64_MAX;
+        ASSERT(mp_block_swarm_test_timeout_yield_active(&slow, INT64_MIN));
+        ASSERT(mp_block_swarm_test_timeout_yield_active(&slow,
+                                                        INT64_MAX - 1));
+        ASSERT(!mp_block_swarm_test_timeout_yield_active(&slow, INT64_MAX));
 
         block_swarm_free(&swarm);
         PASS();

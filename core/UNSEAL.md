@@ -740,3 +740,7 @@ later lane flips it HARD.
 - 2026-09-21T18:17:42Z — REASON: Avoid reducer intake for verified block pieces superseded during parsing
   old ROOT: 69e7238fb89a596ff5daeeeba5cc554367c6279e83ef0d21f6544c1412f75f68
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T18:29:54Z — REASON: Harden block-swarm timeout yield against backwards monotonic samples
+  old ROOT: 19b0c52eb9df9e7e478991b446b775b72df8a04b247da7f4858dfa704653e97d
+  by: owner unseal ritual (make core-unseal)

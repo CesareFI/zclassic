@@ -2314,3 +2314,34 @@ progress at 50, proves the span survives at 101, and proves normal expiry at
 130. Consensus impact: NONE; this is volatile getheaders scheduling only.
 Worldstream remains complementary. Runtime/sanitizer execution remains deferred
 to preserve disk headroom.
+
+## Block-swarm timeout-yield rollback safety
+
+Baseline and root cause: the one-tick block-swarm timeout yield used an
+unsigned remaining-distance check after confirming that its deadline was in
+the future. A backwards monotonic sample makes a normally one-second deadline
+appear arbitrarily far away, incorrectly disabling the yield and allowing the
+timed-out peer to reclaim work before another source receives its recovery
+turn.
+
+Fix and after-result: any future yield deadline now keeps that peer out of
+assignment. Normal expiry still clears the yield at its deadline; a farther
+future deadline is an anomalous rollback and is handled conservatively.
+
+Regression proof: the block-swarm loopback fixture proves a deadline at
+`INT64_MAX` remains active for an `INT64_MIN` rollback and at one second before
+expiry, then expires at its deadline. Native C23 syntax for the changed
+production unit, core resealing, consensus-parity, complexity, and whitespace
+gates pass. `t-fast ONLY=block_swarm_loopback` was intentionally stopped after
+it initiated a cold package-verifier build and reduced free space to the 10 GB
+safety floor; its two newly-created ignored build epochs were removed, leaving
+10.73 GB free. Runtime and ASan/UBSan execution remain deferred until safe
+headroom is available.
+
+Consensus impact: NONE. This changes only volatile peer scheduling after a
+timeout; manifest integrity, payload verification, reducer admission, all
+block/transaction validity, PoW, and chain selection are unchanged.
+Worldstream `5297c58f4` remains complementary classic-download timeout work.
+Remaining risk and next investigation: measure whether block-swarm peers can
+retain stale local pipeline slots after a global orphan sweep without a later
+receive or per-peer tick, before altering the bounded reconciliation design.

@@ -217,8 +217,18 @@ static bool block_swarm_timeout_yield_active(const struct p2p_node *node,
 {
     if (!node || node->blk_timeout_yield_until <= now_monotonic)
         return false;
-    return (uint64_t)node->blk_timeout_yield_until -
-           (uint64_t)now_monotonic <= 1;
+    /* A yield deadline is created as now + one second. Therefore a future
+     * deadline farther away than that can only result from a backwards
+     * monotonic sample. Keep the timed-out owner out of this assignment
+     * round in that anomalous state: reclaiming immediately would undo the
+     * reassignment opportunity that the yield exists to provide. */
+    return true;
+}
+
+bool mp_block_swarm_test_timeout_yield_active(
+    const struct p2p_node *node, int64_t now_monotonic)
+{
+    return block_swarm_timeout_yield_active(node, now_monotonic);
 }
 
 static int64_t block_pipeline_clear_piece(struct p2p_node *node,
