@@ -484,3 +484,7 @@ later lane flips it HARD.
 - 2026-09-21T05:40:37Z — REASON: Bind block-swarm bitmap advertisements to an admitted manifest generation and exact piece span; scheduling only, consensus unchanged
   old ROOT: 2fa02c75067bac59e2c0116bd901fe7e8f807742d0b2798b04b50d4ea283ac0b
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T05:57:50Z — REASON: Bound block-swarm disconnect cleanup to the peer pipeline and revoke detached peer admission; scheduling only, consensus unchanged
+  old ROOT: 359f21ab5c93b59f72c169e9d9437a3acfe2eb81f3a0d403dd32b84cad53ac96
+  by: owner unseal ritual (make core-unseal)

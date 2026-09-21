@@ -847,26 +847,25 @@ size_t mp_block_swarm_peer_disconnected(struct p2p_node *node)
 
     size_t requeued = 0;
     pthread_mutex_lock(&g_block_swarm_mutex);
-    if (!atomic_load(&g_block_swarm_active)) {
-        node->blk_bitmap_swarm_generation = 0;
-        pthread_mutex_unlock(&g_block_swarm_mutex);
-        return 0;
-    }
     struct block_swarm *bs = &g_block_swarm;
-    if (node->blk_bitmap_swarm_generation == g_block_swarm_generation) {
+    bool active = atomic_load(&g_block_swarm_active);
+    if (active &&
+        node->blk_bitmap_swarm_generation == g_block_swarm_generation) {
         block_swarm_replace_availability(
             bs, node->blk_bitmap, node->blk_bitmap_len, NULL, 0);
-        node->blk_bitmap_swarm_generation = 0;
     }
-    if (bs->piece_states && bs->piece_peer) {
-        for (uint32_t i = 0; i < bs->manifest.num_pieces; i++) {
-            if (bs->piece_states[i] == CHUNK_INFLIGHT &&
-                bs->piece_peer[i] == (int)peer_id) {
-                if (block_swarm_requeue_piece_for_peer(
-                        bs, i, (int)peer_id))
-                    requeued++;
-            }
-        }
+    node->blk_bitmap_swarm_generation = 0;
+    node->blk_manifest_received = false;
+    node->blk_manifest_admitted_generation = 0;
+    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+        int32_t piece = node->blk_pipeline[pi].piece_index;
+        if (active && piece >= 0 &&
+            (uint32_t)piece < bs->manifest.num_pieces &&
+            block_swarm_requeue_piece_for_peer(
+                bs, (uint32_t)piece, (int)peer_id))
+            requeued++;
+        node->blk_pipeline[pi].piece_index = -1;
+        node->blk_pipeline[pi].request_time = 0;
     }
     pthread_mutex_unlock(&g_block_swarm_mutex);
 

@@ -724,3 +724,35 @@ complementary fresh-sync startup and observer gates, with no bitmap overlap.
 Remaining risk and next investigation: inspect whether block-manifest and
 bitmap peer admission is cleared consistently on every disconnect/reconnect
 lifecycle, then profile the next block-swarm scheduling bottleneck.
+
+## Bound disconnect cleanup and revoke detached peers
+
+Baseline: block-swarm disconnect cleanup scanned all manifest pieces while
+holding the global swarm mutex, even though a peer can own only its fixed
+256-slot pipeline. At the accepted 100,000-piece manifest bound, each churned
+connection could therefore inspect 100,000 entries. Cleanup also left the
+detached node's manifest admission and pipeline slots intact; the wire fixture
+proved that the same deferred node could immediately reacquire work.
+
+Root cause: cleanup rediscovered ownership from the global piece table rather
+than consuming the authoritative per-peer assignment slots, and treated node
+freeing as implicit state revocation. It now visits exactly 256 slots, requeues
+only entries still owned by that peer, clears every slot and request timestamp,
+withdraws the current bitmap contribution, and revokes manifest admission in
+the same swarm-mutex critical section. Work at the protocol maximum falls from
+100,000 piece inspections to 256 bounded slot inspections (about 391x fewer).
+
+After-result and regression proof: the real-wire disconnect regression first
+assigns 40 pieces, then proves all 40 are immediately requeued, all 256 local
+slots are cleared, admission generation is zero, a post-disconnect send tick
+queues no work, repeated cleanup is idempotent, and the healthy peer completes
+all 2,560 blocks. The focused group completes at 31,676 blocks/s (46.8 MB/s),
+passes under ASan/UBSan, and all 13 selected networking groups pass.
+
+Consensus impact: none. This changes only request ownership cleanup after a
+transport disconnect; block validation and chain state are untouched.
+Worldstream remains at `0b29bec27` on complementary fresh-sync observer work.
+
+Remaining risk and next investigation: apply the same explicit admission
+revocation audit to snapshot-swarm disconnects, then inspect scheduler lock
+hold time and request emission under high peer counts.

@@ -1068,6 +1068,12 @@ static int test_block_swarm_disconnect_requeue(void)
          * is driven by the disconnect, not by elapsed time. */
         size_t requeued = mp_block_swarm_peer_disconnected(p1);
         ASSERT(requeued == p1_reqs);                   /* exactly p1's pieces   */
+        ASSERT(!p1->blk_manifest_received);
+        ASSERT(p1->blk_manifest_admitted_generation == 0);
+        for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++)
+            ASSERT(p1->blk_pipeline[pi].piece_index == -1);
+        mp_snapshot_send_tick(&mp_b, p1);
+        ASSERT(bs_queue_depth(sent_p1) == 0);          /* detached until re-admit */
         ASSERT(mp_block_swarm_peer_disconnected(p1) == 0); /* idempotent */
 
         /* FAILOVER: the requeued pieces are NEEDED again, so a live peer claims
