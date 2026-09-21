@@ -113,6 +113,30 @@ static void block_pipeline_clear_piece(struct p2p_node *node,
     }
 }
 
+static bool swarm_requeue_peer_chunk(struct p2p_node *node,
+                                     uint32_t chunk_index)
+{
+    if (!node || !swarm_mutex_lock())
+        return false;
+    bool requeued = atomic_load(&g_swarm_active) &&
+        swarm_sync_requeue_chunk_for_peer(
+            &g_swarm, chunk_index, node->id);
+    swarm_mutex_unlock();
+    if (requeued && node->swarm_inflight_chunk == (int32_t)chunk_index) {
+        node->swarm_inflight_chunk = -1;
+        node->swarm_chunk_req_time = 0;
+    }
+    return requeued;
+}
+
+static void swarm_requeue_known_peer_chunk(struct p2p_node *node,
+                                           bool chunk_index_known,
+                                           uint32_t chunk_index)
+{
+    if (chunk_index_known)
+        (void)swarm_requeue_peer_chunk(node, chunk_index);
+}
+
 bool mp_block_swarm_manifest_shape_valid(int32_t start_height,
                                          int32_t end_height,
                                          uint32_t num_pieces)
@@ -1153,9 +1177,12 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
         } else if (strcmp(cmd, MSG_CHUNK_DATA) == 0) {
             /* Peer sends chunk data in response to our request. */
             uint32_t chunk_index = 0, num_entries = 0;
-            if (!stream_read_u32_le(s, &chunk_index) ||
-                !stream_read_u32_le(s, &num_entries) ||
-                num_entries > 1000) {
+            bool chunk_index_ok = stream_read_u32_le(s, &chunk_index);
+            bool entry_count_ok = chunk_index_ok &&
+                stream_read_u32_le(s, &num_entries);
+            if (!entry_count_ok || num_entries > 1000) {
+                swarm_requeue_known_peer_chunk(
+                    node, chunk_index_ok, chunk_index);
                 printf("Peer %s: bad zchunkdata header\n", node->addr_name);
                 peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_PAYLOAD, "bad zchunkdata");
             } else if (!g_swarm_active) {
@@ -1254,12 +1281,15 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                             swarm_mutex_unlock();
                         }
                     } else {
+                        (void)swarm_requeue_peer_chunk(node, chunk_index);
                         printf("Peer %s: truncated zchunkdata\n",
                                node->addr_name);
                         peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_PAYLOAD,
                                             "truncated zchunkdata");
                     }
                     free(chunk);
+                } else {
+                    (void)swarm_requeue_peer_chunk(node, chunk_index);
                 }
             }
 

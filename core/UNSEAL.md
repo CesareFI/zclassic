@@ -400,3 +400,11 @@ later lane flips it HARD.
 - 2026-09-20T23:49:34Z — REASON: Reject malformed block manifests with overflow-safe 64-bit height-span arithmetic before allocation; wire validation only, no consensus semantic change
   old ROOT: 3a80ba0e49ec648fd6c30e17c6f67e27d6c27e01382e38d7d56fc2bb58e9e871
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T00:16:31Z — REASON: Immediately requeue an owned snapshot chunk after malformed or partial peer delivery; scheduling recovery only, no consensus or validation semantic change
+  old ROOT: 181e293a86861ab4105177fbbdac0aadaa1368194ceda1fd74b3148e061e16fc
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T00:24:14Z — REASON: Refactor malformed snapshot response recovery to preserve the cyclomatic-complexity ratchet; scheduling only, no consensus or validation semantic change
+  old ROOT: 6524a8b4011dde023838d76f7ed4e4c0ba9f202ed14a8b70e3463f54af02a963
+  by: owner unseal ritual (make core-unseal)

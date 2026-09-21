@@ -330,3 +330,34 @@ on observer/startup work with no overlap.
 
 Remaining risk and next investigation: other peer-controlled range calculations
 in snapshot/chunk messages should receive the same explicit-width audit.
+
+## Immediate malformed snapshot-chunk reassignment
+
+A truncated `zchunkdata` header/body or an oversized entry count was scored but
+left the advertised chunk globally `CHUNK_INFLIGHT` and in the peer-local slot.
+Healthy peers could not claim it until the fixed 30-second timeout. Local
+allocation failure had the same unnecessary delay.
+
+Snapshot swarm state now has an ownership-checked requeue primitive. Malformed
+responses with a decoded chunk index and local allocation failures invoke it
+under the swarm mutex, clearing the peer-local slot only when that peer still
+owns the chunk. A stale or malicious peer cannot revoke work reassigned to a
+different source. The recovery decision was factored into small helpers so the
+large wire dispatcher stayed at its existing complexity pin rather than raising
+the ratchet.
+
+The deterministic regression proves peer B cannot revoke peer A's chunk, peer
+A's malformed response immediately restores `CHUNK_NEEDED`, repeated cleanup
+is inert, and peer B can claim the work without elapsed time. The four-group
+fast-sync suite, core seal/root mirror, consensus parity, generated capability
+inventory, cyclomatic complexity (55,561 functions), and whitespace gates
+passed. The same four fast-sync groups also passed under ASan/UBSan.
+
+Consensus impact: none. Malformed or locally unbufferable data is still never
+applied; valid chunks retain the existing hash, Merkle, and final UTXO
+commitment checks. Worldstream commit `0b29bec27` remains on observer/startup
+work with no overlap.
+
+Remaining risk and next investigation: add a direct wire fixture for truncated
+`zchunkdata`, then audit snapshot peer disconnect for immediate owned-chunk
+requeue rather than timeout-only recovery.

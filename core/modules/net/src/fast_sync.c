@@ -1355,6 +1355,23 @@ int32_t swarm_sync_assign_chunk(struct swarm_sync *ss, int peer_id)
     LOG_RETURN(-1, "sync", "assign_chunk: no chunks available for peer %d", peer_id);
 }
 
+bool swarm_sync_requeue_chunk_for_peer(struct swarm_sync *ss,
+                                       uint32_t chunk_index,
+                                       int peer_id)
+{
+    if (!ss || !ss->chunk_states || !ss->chunk_peer ||
+        chunk_index >= ss->manifest.num_chunks ||
+        ss->chunk_states[chunk_index] != CHUNK_INFLIGHT ||
+        ss->chunk_peer[chunk_index] != peer_id)
+        return false;
+    ss->chunk_states[chunk_index] = CHUNK_NEEDED;
+    ss->chunk_peer[chunk_index] = -1;
+    ss->chunk_request_time[chunk_index] = 0;
+    if (ss->chunks_inflight > 0)
+        ss->chunks_inflight--;
+    return true;
+}
+
 bool swarm_sync_receive_chunk(struct swarm_sync *ss,
                                 const struct utxo_chunk *chunk,
                                 int peer_id)
