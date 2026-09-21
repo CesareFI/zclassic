@@ -1467,23 +1467,25 @@ bool swarm_sync_receive_chunk(struct swarm_sync *ss,
      * hash the peer advertised in the swarm manifest BEFORE handing any
      * bytes to fast_sync_apply_chunk — otherwise the AR_STEP_WRITE writer
      * would commit attacker-controlled rows into the utxos table and the
-     * only signal would be the end-of-sync Merkle root mismatch. */
+    * only signal would be the end-of-sync Merkle root mismatch. */
     if (!fast_sync_verify_chunk(chunk, ss->manifest.chunk_hashes[idx])) {
-        ss->chunk_retries[idx]++;
-        /* Reset to NEEDED so another peer can retry — unless max retries */
-        if (ss->chunk_retries[idx] >= 5) {
-            ss->chunk_states[idx] = CHUNK_FAILED;
-            ss->chunks_failed++;
-        } else {
-            swarm_sync_hint_needed(ss, idx);
-            ss->chunk_states[idx] = CHUNK_NEEDED;
-        }
+        if (ss->chunk_retries[idx] < 5)
+            ss->chunk_retries[idx]++;
+        /* A remote peer cannot spend a global chunk retry budget. Peer
+         * scoring owns punishment; the verified manifest remains valid and
+         * another source must always be able to supply these exact bytes. */
+        swarm_sync_hint_needed(ss, idx);
+        ss->chunk_states[idx] = CHUNK_NEEDED;
         ss->chunk_peer[idx] = -1;
         if (ss->chunks_inflight > 0)
             ss->chunks_inflight--;
         LOG_FAIL("sync", "receive_chunk: chunk %u hash mismatch from peer %d (retry %d/5)",
                  idx, peer_id, ss->chunk_retries[idx]);
     }
+
+    /* A valid hash starts the local apply budget independently of any bad
+     * sources that preceded it. */
+    ss->chunk_retries[idx] = 0;
 
     /* Apply chunk to database */
     if (ss->datadir) {

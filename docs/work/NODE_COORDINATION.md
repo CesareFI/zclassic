@@ -1204,3 +1204,33 @@ Remaining risk and next investigation: expose the bounded probe count in sync
 observability only if field measurements need it; otherwise inspect failed-
 chunk terminal handling, because five verification failures currently leave
 the swarm active but permanently unable to satisfy its completion predicate.
+
+## Prevent bad sources from exhausting snapshot chunks
+
+Baseline: a chunk accumulated one global retry for every hash-mismatching
+source. The fifth malicious delivery changed it to `CHUNK_FAILED`; no peer
+could request it afterward, while the active swarm could never satisfy its
+completion predicate. The deterministic regression reproduced this with five
+distinct bad owners followed by one healthy owner.
+
+Root cause and fix: remote integrity failures and local database-apply failures
+shared one terminal retry budget. Hash mismatches now remain strictly
+untrusted-peer events: the observation counter saturates, peer scoring still
+penalizes each sender, and the exact manifest-bound chunk remains needed for
+another source. A subsequently hash-valid delivery resets the independent
+local apply budget before any database write.
+
+After-result and regression proof: the pre-fix `fast_sync` group failed when
+the fifth bad source terminalized the chunk. It now proves all five deliveries
+fail verification, none increments `chunks_failed`, source six owns the same
+chunk and completes it, and the full four-group fast-sync plus real-wire
+`block_swarm_loopback` suites pass.
+
+Consensus impact: NONE. No received bytes bypass SHA3 verification, peer
+penalties remain, and snapshot application and final-root verification are
+unchanged. Worldstream remains at `0b29bec27` on complementary startup and
+observer work.
+
+Remaining risk and next investigation: coordinate terminal local apply-error
+recovery with Worldstream's storage ownership; a safe fallback must explicitly
+handle partially applied derived UTXO rows before releasing the active swarm.

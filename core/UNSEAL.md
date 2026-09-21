@@ -548,3 +548,7 @@ later lane flips it HARD.
 - 2026-09-21T09:07:17Z — REASON: Bound snapshot chunk assignment scans with a retry-aware next-needed hint; transport efficiency only, consensus unchanged
   old ROOT: 14c6492f015c8e84440796c01d37097f3150adbb1cc457fe417ae9e6338e9e24
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T09:15:05Z — REASON: Prevent untrusted snapshot hash mismatches from exhausting global chunk retries; validation unchanged, transport liveness only
+  old ROOT: 8fd77bf6c7c20c119347aac5c821f0dcb18279b8b748a5a4ab61e00023424f93
+  by: owner unseal ritual (make core-unseal)
