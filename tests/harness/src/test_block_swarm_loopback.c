@@ -1335,6 +1335,8 @@ bool mp_block_swarm_test_restart_ready_at(int64_t now_monotonic,
                                           int64_t reaped_monotonic);
 bool mp_block_swarm_test_stall_elapsed_at(
     int64_t now_monotonic, int64_t last_complete_monotonic);
+bool mp_swarm_test_progress_due_at(int64_t now_monotonic,
+                                   int64_t last_progress_monotonic);
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
                                         uint32_t piece_index);
 struct block_swarm_pipeline_reconcile {
@@ -1699,6 +1701,35 @@ static int test_block_swarm_stall_clock(void)
         ASSERT(!mp_block_swarm_test_stall_elapsed_at(1090, 1090));
         ASSERT(!mp_block_swarm_test_stall_elapsed_at(1179, 1090));
         ASSERT(mp_block_swarm_test_stall_elapsed_at(1180, 1090));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_swarm_progress_cadence_clock(void)
+{
+    int failures = 0;
+
+    TEST("swarm progress cadence uses monotonic time across civil clock jumps") {
+        const int64_t last_progress = 1000;
+        int64_t wall = 5000;
+
+        ASSERT(!mp_swarm_test_progress_due_at(1004, last_progress));
+        ASSERT(mp_swarm_test_progress_due_at(1005, last_progress));
+
+        wall -= 100000;
+        ASSERT(wall < 0);
+        ASSERT(mp_swarm_test_progress_due_at(1005, last_progress));
+        wall += INT64_C(1000000000);
+        ASSERT(wall > 0);
+        ASSERT(!mp_swarm_test_progress_due_at(1004, last_progress));
+
+        ASSERT(!mp_swarm_test_progress_due_at(999, last_progress));
+        ASSERT(!mp_swarm_test_progress_due_at(INT64_MAX, -1));
+        ASSERT(!mp_swarm_test_progress_due_at(1005, 1005));
+        ASSERT(!mp_swarm_test_progress_due_at(1009, 1005));
+        ASSERT(mp_swarm_test_progress_due_at(1010, 1005));
         PASS();
     } _test_next:;
 
@@ -2283,6 +2314,7 @@ int test_block_swarm_loopback(void)
     failures += test_block_swarm_timeout_owner_yields();
     failures += test_block_swarm_restart_cooldown();
     failures += test_block_swarm_stall_clock();
+    failures += test_swarm_progress_cadence_clock();
     failures += test_block_swarm_stall_reap();
     failures += test_block_swarm_integrity_abandon();
     failures += test_block_swarm_duplicate_delivery();

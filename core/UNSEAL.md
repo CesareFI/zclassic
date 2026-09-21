@@ -592,3 +592,7 @@ later lane flips it HARD.
 - 2026-09-21T10:41:40Z — REASON: refactor peer-finalization callback out of connman reactor complexity
   old ROOT: 01f01e6e246c6986e217570e541d417646811bb29ed23eb53452740726fe4e8f
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T10:47:21Z — REASON: use monotonic cadence for snapshot and block swarm progress diagnostics
+  old ROOT: accd354f0932f88515769c6f706530b97579ae7dc55e5522e037b0ff5d80b29b
+  by: owner unseal ritual (make core-unseal)

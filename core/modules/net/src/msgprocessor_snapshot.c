@@ -73,7 +73,7 @@ static void swarm_mutex_unlock(void)
 }
 
 /* Snapshot sync service — global singleton in snapshot_sync_service.c */
-static int64_t g_swarm_last_progress_time = 0;
+static int64_t g_swarm_last_progress_monotonic = 0;
 
 /* Timeout for inflight chunk requests (30 seconds). */
 #define SWARM_CHUNK_TIMEOUT_SECS 30
@@ -81,6 +81,22 @@ static int64_t g_swarm_last_progress_time = 0;
 /* Progress display interval (5 seconds). */
 #define SWARM_PROGRESS_INTERVAL_SECS 5
 #define SWARM_MANIFEST_ATTEMPT_MAX 2
+
+static int64_t swarm_progress_monotonic_seconds(void)
+{
+    int64_t now = platform_time_monotonic_us() / 1000000;
+    return now > 0 ? now : 1;
+}
+
+static bool swarm_progress_due_at(int64_t now_monotonic,
+                                  int64_t last_progress_monotonic)
+{
+    if (last_progress_monotonic <= 0 ||
+        now_monotonic < last_progress_monotonic)
+        return false;
+    return now_monotonic - last_progress_monotonic >=
+           SWARM_PROGRESS_INTERVAL_SECS;
+}
 /* BLOCK_PIECE_MAX_BLOCK_BYTES lives in msgprocessor_snapshot_internal.h —
  * shared with msgprocessor_snapshot_serve.c's build_block_piece_payloads,
  * which must agree with this file's parse_block_piece_payload_refs on the
@@ -221,7 +237,8 @@ static bool swarm_admit_manifest_source(struct p2p_node *node,
     } else if (allow_start && swarm_sync_init(&g_swarm, manifest, datadir)) {
         g_swarm_generation = swarm_next_generation(g_swarm_generation);
         atomic_store(&g_swarm_active, true);
-        g_swarm_last_progress_time = (int64_t)platform_time_wall_time_t();
+        g_swarm_last_progress_monotonic =
+            swarm_progress_monotonic_seconds();
         *first_chunk_out = swarm_sync_assign_chunk(&g_swarm, node->id);
         admitted = true;
     }
@@ -289,7 +306,7 @@ struct snapshot_sync_service *msg_snapshot_sync_ensure(
 static struct block_swarm g_block_swarm __attribute__((used));
 static _Atomic bool g_block_swarm_active = false;
 static pthread_mutex_t g_block_swarm_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int64_t g_block_swarm_last_progress = 0;
+static int64_t g_block_swarm_last_progress_monotonic = 0;
 static uint64_t g_block_swarm_generation = 0;
 /* Monotonic-seconds stamp of the last abandonment. A reaped swarm may be re-armed by a
  * fresh manifest only after BLOCK_SWARM_RESTART_COOLDOWN_SECS, so a peer
@@ -466,8 +483,8 @@ static bool block_swarm_admit_manifest_source(
         mp_block_swarm_mark_complete_through_height(
             &g_block_swarm, completed_height);
         atomic_store(&g_block_swarm_active, true);
-        g_block_swarm_last_progress =
-            (int64_t)platform_time_wall_time_t();
+        g_block_swarm_last_progress_monotonic =
+            swarm_progress_monotonic_seconds();
         admitted = true;
         *started_out = true;
     }
@@ -992,6 +1009,12 @@ bool mp_block_swarm_test_stall_elapsed_at(int64_t now_monotonic,
 {
     return block_swarm_stall_elapsed_at(now_monotonic,
                                         last_complete_monotonic);
+}
+
+bool mp_swarm_test_progress_due_at(int64_t now_monotonic,
+                                   int64_t last_progress_monotonic)
+{
+    return swarm_progress_due_at(now_monotonic, last_progress_monotonic);
 }
 
 bool mp_block_swarm_test_fail_integrity(struct msg_processor *mp,
@@ -2333,9 +2356,10 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         }
 
         /* Progress display (rate-limited to every 5 seconds) */
-        int64_t now_prog = (int64_t)platform_time_wall_time_t();
-        if (now_prog - g_swarm_last_progress_time >= SWARM_PROGRESS_INTERVAL_SECS) {
-            g_swarm_last_progress_time = now_prog;
+        int64_t now_prog = swarm_progress_monotonic_seconds();
+        if (swarm_progress_due_at(
+                now_prog, g_swarm_last_progress_monotonic)) {
+            g_swarm_last_progress_monotonic = now_prog;
 
             int progress = swarm_sync_progress(&g_swarm);
             uint32_t complete = g_swarm.chunks_complete;
@@ -2425,10 +2449,10 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         }
 
         /* Progress display (rate-limited) */
-        int64_t now_bp = (int64_t)platform_time_wall_time_t();
-        if (now_bp - g_block_swarm_last_progress >=
-            SWARM_PROGRESS_INTERVAL_SECS) {
-            g_block_swarm_last_progress = now_bp;
+        int64_t now_bp = swarm_progress_monotonic_seconds();
+        if (swarm_progress_due_at(
+                now_bp, g_block_swarm_last_progress_monotonic)) {
+            g_block_swarm_last_progress_monotonic = now_bp;
             int bprog = block_swarm_progress(&g_block_swarm);
             uint32_t bcomplete = g_block_swarm.pieces_complete;
             uint32_t btotal = g_block_swarm.manifest.num_pieces;

@@ -1515,3 +1515,29 @@ Remaining risk: concurrent disconnect and replacement-offer churn should be
 exercised over the real connman socket lifecycle.  Recommended next
 investigation: add a real-reactor reconnect regression, then inspect manifest
 source diversity under repeated reconnects.
+
+## Monotonic swarm progress diagnostics
+
+Baseline and root cause: snapshot-chunk and block-piece swarm progress output
+used wall-clock seconds for its five-second cadence even though ownership,
+timeouts, restart cooldown, and stall recovery already use monotonic time.  A
+backward civil-clock adjustment could therefore suppress the only periodic
+peer/inflight diagnostic until wall time caught up, obscuring an IBD stall.
+
+Fix and after-result: both progress cadences now initialize and compare
+monotonic seconds through one bounded helper.  Backward monotonic anomalies
+fail closed without signed underflow; the next completed interval re-arms the
+cadence normally.  Scheduling, timeout, and request ownership are unchanged.
+
+Regression proof: `test_block_swarm_loopback` drives the exact five-second
+boundary, large backward and forward civil-clock jumps, a monotonic anomaly,
+and a fresh interval after publication.  The complete snapshot `zchunkdata`,
+manifest reconnect/diversity, block-swarm transfer, timeout, disconnect, and
+integrity suite remains green.
+
+Consensus impact: NONE.  This changes diagnostic emission timing only; wire
+messages, validation, PoW, chain selection, and all request deadlines retain
+their existing semantics.  Worldstream `5297c58f4` remains complementary on
+download-timeout arithmetic.  Remaining risk and next investigation: exercise
+the snapshot-owner finalization callback through the real connman reactor,
+including repeated disconnect/reconnect churn and callback lock ordering.
