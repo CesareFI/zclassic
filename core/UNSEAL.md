@@ -616,3 +616,7 @@ later lane flips it HARD.
 - 2026-09-21T11:47:39Z — REASON: make inbound header-stall fallback produce an explicit request action
   old ROOT: f770b6603bbb3de54511085222239c20b75dfb1ec2847e88037719079404f145
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T11:53:58Z — REASON: stamp rejected-header probe rate limit only after successful request enqueue
+  old ROOT: c282304f36fe0b56d9ceb1be51effbd26e181ae22f0c1dde02cc7cdcfe59a63e
+  by: owner unseal ritual (make core-unseal)

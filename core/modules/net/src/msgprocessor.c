@@ -2386,11 +2386,11 @@ static void msg_queue_getdata_batch(struct msg_processor *mp,
                 batch->in_flight_before + batch->assigned);
 }
 
-static void msg_note_getheaders_queued(struct p2p_node *node,
-                                       int64_t now_seconds, bool queued)
+static void msg_note_request_queued(_Atomic int64_t *timestamp,
+                                    int64_t now_seconds, bool queued)
 {
     if (queued)
-        syncsvc_note_headers_requested(node, now_seconds);
+        atomic_store_explicit(timestamp, now_seconds, memory_order_relaxed);
 }
 
 /* ── msg_send_messages: per-peer trickle ─────────────────────── */
@@ -2696,13 +2696,13 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
          * again (any accepted header disarms it). */
         if (!snapshot_active &&
             syncsvc_should_fire_reject_probe(node, now_send)) {
-            atomic_store_explicit(&node->last_reject_probe_time, now_send,
-                                  memory_order_relaxed);
             printf("Peer %s: reject-probe pending — re-probing with "
                    "getheaders from our best header h=%d\n",
                    node->addr_name, best_header_height);
-            push_getheaders_from(mp, node,
-                                 mp->main_state->pindex_best_header);
+            bool probe_queued = push_getheaders_from(
+                mp, node, mp->main_state->pindex_best_header);
+            msg_note_request_queued(&node->last_reject_probe_time, now_send,
+                                    probe_queued);
         }
         if (should_sync && !snapshot_active) {
             struct block_index *tip = active_chain_tip(
@@ -2737,7 +2737,8 @@ bool msg_send_messages(void *ctx, struct p2p_node *node, bool send_trickle)
                 mp, node, our_height, platform_time_monotonic_us());
             if (!request_queued)
                 request_queued = exec_getheaders_action(mp, node, &periodic);
-            msg_note_getheaders_queued(node, now_send, request_queued);
+            msg_note_request_queued(&node->last_getheaders_time, now_send,
+                                    request_queued);
         }
 
         /* Checkpoint-header-solution cure: when the app-layer repair condition

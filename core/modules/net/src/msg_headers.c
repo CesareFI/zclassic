@@ -1290,6 +1290,15 @@ static void hrs_note_response_progress(struct p2p_node *node, size_t accepted)
                                  platform_time_monotonic_us());
 }
 
+static void note_reject_probe_queued(struct p2p_node *node, int64_t now_s,
+                                     bool queued)
+{
+    if (queued) {
+        atomic_store_explicit(&node->last_reject_probe_time, now_s,
+                              memory_order_relaxed);
+    }
+}
+
 size_t mp_header_range_peer_disconnected(uint32_t peer_id)
 {
     return hrs_release_peer(header_range_scheduler_global(), (int32_t)peer_id);
@@ -1594,15 +1603,14 @@ bool process_headers(struct msg_processor *mp, struct p2p_node *node,
             int64_t last_probe = atomic_load_explicit(
                 &node->last_reject_probe_time, memory_order_relaxed);
             if (syncsvc_should_probe_after_reject(now_s, last_probe)) {
-                atomic_store_explicit(&node->last_reject_probe_time, now_s,
-                                      memory_order_relaxed);
                 int best_h = mp->main_state->pindex_best_header
                     ? mp->main_state->pindex_best_header->nHeight : -1;
                 printf("Peer %s: all-rejected batch (bad-prevblk) — probing "
                        "with getheaders from our best header h=%d\n",
                        node->addr_name, best_h);
-                push_getheaders_from(mp, node,
-                                     mp->main_state->pindex_best_header);
+                bool probe_queued = push_getheaders_from(
+                    mp, node, mp->main_state->pindex_best_header);
+                note_reject_probe_queued(node, now_s, probe_queued);
             }
         }
 

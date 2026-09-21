@@ -1716,3 +1716,27 @@ Worldstream `0b29bec27` remains complementary on startup interruption and
 observer coverage.  Remaining risk and next investigation: drive the
 inbound-only recovery through the production send loop with a real peer table,
 including bounded-queue refusal followed by a second healthy inbound source.
+
+The production-loop follow-up is now pinned directly.  Starting from
+`SYNC_IDLE` with no outbound peers, the real `msg_send_messages` path promotes
+header sync and attempts the inbound fallback.  A first inbound source at the
+hard send-queue ceiling refuses the frame and retains a zero request timestamp;
+the next healthy inbound source queues an actual `getheaders` frame and advances
+its timestamp immediately.  This proves both zero-outbound recovery and
+queue-failure failover without sleeps or sockets.  Consensus impact remains
+NONE.  Recommended next investigation: inspect request-result accounting on
+the all-rejected header recovery probe, whose rate-limit timestamp is still
+stored before its `getheaders` enqueue result is known.
+
+That probe accounting is now corrected at both trigger sites.  The immediate
+receive-side bad-prevblk probe and the periodic pending-probe retry stamp
+`last_reject_probe_time` only after `push_getheaders_from` reports a successful
+bounded enqueue.  A production send-loop regression suppresses unrelated
+periodic requests, fills peer A's queue, and proves its zero probe timestamp is
+preserved; peer B then queues the exact recovery request and advances its
+timestamp.  The normal all-rejected adversarial header group remains green.
+Consensus impact: NONE; only volatile retry throttling after a local send-queue
+refusal changed.  Recommended next investigation: audit the ordinary header
+continuation calls issued directly from `process_headers`; they do not own a
+separate throttle, but ignored queue refusal may still delay recovery until the
+periodic planner runs.

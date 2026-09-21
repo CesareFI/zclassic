@@ -88,6 +88,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "platform/socket_compat.h"
+#include "platform/time_compat.h"
 #include <unistd.h>
 
 #define DOS_CHECK(name, expr) do { \
@@ -267,6 +268,119 @@ static int dos_getheaders_queue_refusal(struct msg_processor *mp,
         DOS_CHECK("getheaders refusal: queued request advances throttle",
                   atomic_load(&healthy->last_getheaders_time) > 0 &&
                   healthy->send_size > 0);
+        p2p_node_free(healthy);
+    }
+    return failures;
+}
+
+static bool dos_send_queue_has_command(const struct p2p_node *node,
+                                       const char *command)
+{
+    for (const struct send_segment *seg = node ? node->send_head : NULL;
+         seg; seg = seg->next) {
+        if (seg->size < MSG_HEADER_SIZE)
+            continue;
+        const struct msg_header *hdr =
+            (const struct msg_header *)(const void *)seg->data;
+        if (strcmp(hdr->pchCommand, command) == 0)
+            return true;
+    }
+    return false;
+}
+
+static int dos_inbound_only_getheaders_recovery(struct msg_processor *mp,
+                                                struct net_manager *nm)
+{
+    int failures = 0;
+    struct net_address addr;
+    net_address_init(&addr);
+    {
+        unsigned char ip4[4] = {203, 0, 113, 83};
+        net_addr_set_ipv4(&addr.svc.addr, ip4);
+    }
+    addr.svc.port = 8033;
+    sync_set_state(SYNC_IDLE, "inbound-only getheaders regression");
+
+    struct p2p_node *blocked = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "inbound-headers-blocked", true);
+    DOS_CHECK("inbound recovery: blocked source created", blocked != NULL);
+    if (blocked) {
+        blocked->state = PEER_ACTIVE;
+        blocked->version = PROTOCOL_VERSION;
+        blocked->starting_height = 1000;
+        blocked->send_size = net_send_peer_bytes_hard_cap();
+        atomic_store(&blocked->last_getheaders_time, 0);
+        DOS_CHECK("inbound recovery: refused source tick survives",
+                  msg_send_messages(mp, blocked, false));
+        DOS_CHECK("inbound recovery: refused source remains retryable",
+                  atomic_load(&blocked->last_getheaders_time) == 0);
+        p2p_node_free(blocked);
+    }
+
+    struct p2p_node *healthy = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "inbound-headers-healthy", true);
+    DOS_CHECK("inbound recovery: healthy source created", healthy != NULL);
+    if (healthy) {
+        healthy->state = PEER_ACTIVE;
+        healthy->version = PROTOCOL_VERSION;
+        healthy->starting_height = 1000;
+        atomic_store(&healthy->last_getheaders_time, 0);
+        DOS_CHECK("inbound recovery: healthy source tick succeeds",
+                  msg_send_messages(mp, healthy, false));
+        DOS_CHECK("inbound recovery: getheaders reaches wire queue",
+                  dos_send_queue_has_command(healthy, "getheaders") &&
+                  atomic_load(&healthy->last_getheaders_time) > 0);
+        p2p_node_free(healthy);
+    }
+    return failures;
+}
+
+static int dos_reject_probe_queue_refusal(struct msg_processor *mp,
+                                          struct net_manager *nm)
+{
+    int failures = 0;
+    struct net_address addr;
+    net_address_init(&addr);
+    {
+        unsigned char ip4[4] = {203, 0, 113, 84};
+        net_addr_set_ipv4(&addr.svc.addr, ip4);
+    }
+    addr.svc.port = 8033;
+    int64_t now = (int64_t)platform_time_wall_time_t();
+
+    struct p2p_node *blocked = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "reject-probe-blocked", false);
+    DOS_CHECK("reject probe: blocked source created", blocked != NULL);
+    if (blocked) {
+        blocked->state = PEER_ACTIVE;
+        blocked->version = PROTOCOL_VERSION;
+        blocked->starting_height = 1000;
+        blocked->send_size = net_send_peer_bytes_hard_cap();
+        atomic_store(&blocked->last_getheaders_time, now);
+        atomic_store(&blocked->reject_probe_pending, true);
+        atomic_store(&blocked->last_reject_probe_time, 0);
+        DOS_CHECK("reject probe: refused source tick survives",
+                  msg_send_messages(mp, blocked, false));
+        DOS_CHECK("reject probe: refused request remains retryable",
+                  atomic_load(&blocked->last_reject_probe_time) == 0);
+        p2p_node_free(blocked);
+    }
+
+    struct p2p_node *healthy = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "reject-probe-healthy", false);
+    DOS_CHECK("reject probe: healthy source created", healthy != NULL);
+    if (healthy) {
+        healthy->state = PEER_ACTIVE;
+        healthy->version = PROTOCOL_VERSION;
+        healthy->starting_height = 1000;
+        atomic_store(&healthy->last_getheaders_time, now);
+        atomic_store(&healthy->reject_probe_pending, true);
+        atomic_store(&healthy->last_reject_probe_time, 0);
+        DOS_CHECK("reject probe: healthy source tick succeeds",
+                  msg_send_messages(mp, healthy, false));
+        DOS_CHECK("reject probe: queued request advances throttle",
+                  dos_send_queue_has_command(healthy, "getheaders") &&
+                  atomic_load(&healthy->last_reject_probe_time) > 0);
         p2p_node_free(healthy);
     }
     return failures;
@@ -1214,6 +1328,14 @@ int test_net_msg_dos(void)
     /* A refused bounded enqueue is not a request: advancing the periodic
      * throttle here would hide the failure for the full IBD/stale interval. */
     failures += dos_getheaders_queue_refusal(&mp, &nm);
+
+    /* With no outbound peers, the production zero-outbound recovery path
+     * must emit—not merely plan—a request through a healthy inbound source. */
+    failures += dos_inbound_only_getheaders_recovery(&mp, &nm);
+
+    /* The bad-prevblk recovery timer measures requests that reached the
+     * queue, not attempts rejected by a non-draining peer. */
+    failures += dos_reject_probe_queue_refusal(&mp, &nm);
 
     net_manager_free(&nm);
     sync_set_state(sync0, "net_msg_dos restore");

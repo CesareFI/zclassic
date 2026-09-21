@@ -370,7 +370,8 @@ void syncsvc_note_header_batch_outcome(struct p2p_node *node,
                                        bool any_bad_prevblk);
 /* Periodic-tick decision: re-fire the probe only while pending AND the
  * per-peer rate limit (above) permits. Reads node->reject_probe_pending and
- * node->last_reject_probe_time; the caller stamps the time when true. */
+ * node->last_reject_probe_time; the caller stamps the time only after the
+ * request is successfully queued. */
 bool syncsvc_should_fire_reject_probe(const struct p2p_node *node,
                                       int64_t now_seconds);
 
