@@ -1451,3 +1451,33 @@ not change this legacy message-queue ownership boundary.  Remaining risk:
 other assign-before-send paths should continue to be audited for ignored
 enqueue results.  Recommended next investigation: snapshot manifest-source
 diversity and ownership under reconnect churn.
+
+## Snapshot negotiation followup failover
+
+The real-wire reconnect/diversity fixture already proved exact-manifest
+multi-source admission, incompatible-source attempt bounds, same-endpoint new
+sessions, authoritative disconnect cleanup, timeout-owner yield, and swarm
+generation isolation.  Its missing boundary was earlier: accepting a snapshot
+offer committed `serving_peer_id` and entered `SNAPSYNC_NEGOTIATING` before
+the FlyClient challenge or snapshot request was queued.  A non-draining peer
+could refuse that bounded enqueue while leaving every replacement offer busy
+until the negotiation watchdog fired.
+
+All requester followups now share one checked enqueue path.  Encoding or queue
+failure resets the unserviceable negotiation, clears its serving-peer owner,
+returns ordinary sync to header download, and avoids claiming a challenge was
+sent.  The deterministic two-node wire regression fills the selected source's
+send queue, delivers a valid `zsnapshot`, observes the real challenge refusal,
+and proves source selection is immediately IDLE with no serving owner.
+
+Consensus impact: NONE.  Snapshot offer validation, FlyClient verification,
+UTXO commitment verification, activation containment, block/transaction
+validation, PoW, and chain selection are unchanged.  The existing honest and
+tampered full-transfer cases remain green.
+
+Worldstream interaction: Worldstream `5297c58f4` owns download-timeout
+arithmetic and does not overlap snapshot negotiation transport.  Remaining
+risk: a source that disconnects after a followup was successfully queued can
+still leave negotiation or receive state occupied until watchdog recovery.
+Recommended next investigation: add ownership-checked terminal-disconnect
+notification without doing database cleanup under connman's peer-list lock.

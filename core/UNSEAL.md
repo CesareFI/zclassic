@@ -580,3 +580,7 @@ later lane flips it HARD.
 - 2026-09-21T10:07:43Z — REASON: extract bounded getdata enqueue settlement helper for complexity ratchet
   old ROOT: 428edbb879f8df77d179ad38b33157b943af9e9b75d3a06e0bf8eb1a2d066ac5
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T10:17:44Z — REASON: release snapshot negotiation when its followup cannot reach the selected peer
+  old ROOT: 9b3a3d8ba8af5bfab4b163bf35c62c3f43650f7ac303143a4a93fa4af45c07ff
+  by: owner unseal ritual (make core-unseal)

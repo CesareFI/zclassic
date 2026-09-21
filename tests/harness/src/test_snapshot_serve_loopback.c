@@ -246,11 +246,20 @@ static int64_t lb_count_rows(sqlite3 *db, const char *table)
  * containment. That case must still record the offence and ban the peer,
  * proving the fix distinguishes the two rather than just disabling the
  * ban outright. */
-static int test_snapshot_serve_loopback_impl(bool corrupt_chunk)
+enum lb_snapshot_case {
+    LB_SNAPSHOT_HONEST = 0,
+    LB_SNAPSHOT_CORRUPT,
+    LB_SNAPSHOT_FOLLOWUP_REFUSED
+};
+
+static int test_snapshot_serve_loopback_impl(enum lb_snapshot_case test_case)
 {
     int failures = 0;
+    bool corrupt_chunk = test_case == LB_SNAPSHOT_CORRUPT;
 
-    TEST(corrupt_chunk ?
+    TEST(test_case == LB_SNAPSHOT_FOLLOWUP_REFUSED ?
+        "snapshot serve loopback: refused offer followup reopens source "
+        "selection immediately" : corrupt_chunk ?
         "snapshot serve loopback: tampered chunk -> genuine SHA3 failure "
         "-> peer still banned" :
         "snapshot serve loopback: offer->request->chunk->end, two real "
@@ -409,12 +418,22 @@ static int test_snapshot_serve_loopback_impl(bool corrupt_chunk)
 
         send_snapshot_offer_msg(node_a_side, &offer, mp_a.params->pchMessageStart);
 
+        if (test_case == LB_SNAPSHOT_FOLLOWUP_REFUSED)
+            node_b_side->send_size = net_send_peer_bytes_hard_cap();
+
         /* ── Step 2: pump A->B, real receive dispatch. Accepts the offer,
          * transitions NEGOTIATING, auto-queues a real zfcchallenge on
          * node_b_side (harmlessly no-op'd by A below — mp_a.flyclient_proof
          * is unset, exactly like a peer with no MMB data). */
         ASSERT(lb_pump(node_a_side, sentinel_a, &mp_b, node_b_side,
                       params->pchMessageStart));
+        if (test_case == LB_SNAPSHOT_FOLLOWUP_REFUSED) {
+            ASSERT(node_b_side->disconnect);
+            ASSERT(svc_b.state == SNAPSYNC_IDLE);
+            ASSERT(svc_b.serving_peer_id == 0);
+            ASSERT(sync_get_state() == SYNC_HEADERS_DOWNLOAD);
+            goto lb_cleanup;
+        }
         ASSERT(svc_b.state == SNAPSYNC_NEGOTIATING);
 
         /* ── Step 3 (documented FlyClient bypass — file header shortcut 1):
@@ -558,6 +577,7 @@ static int test_snapshot_serve_loopback_impl(bool corrupt_chunk)
                                             * corruption still bans. */
         }
 
+lb_cleanup:
         blocker_clear(SNAPSYNC_ACTIVATION_CONTAINED_BLOCKER_ID);
         boot_snapshot_offer_test_set_publication_override(-1);
         boot_snapshot_offer_test_set_trust_override(-1);
@@ -612,8 +632,10 @@ int test_snapshot_serve_loopback(void)
      * served either way; the impl asserts exactly that. */
     snapsync_reset_serve_puzzle_census();
 
-    failures += test_snapshot_serve_loopback_impl(false);
-    failures += test_snapshot_serve_loopback_impl(true);
+    failures += test_snapshot_serve_loopback_impl(LB_SNAPSHOT_HONEST);
+    failures += test_snapshot_serve_loopback_impl(LB_SNAPSHOT_CORRUPT);
+    failures += test_snapshot_serve_loopback_impl(
+        LB_SNAPSHOT_FOLLOWUP_REFUSED);
 
     {
         struct snapsync_serve_puzzle_census c;
