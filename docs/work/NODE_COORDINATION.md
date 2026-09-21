@@ -1265,3 +1265,25 @@ Remaining risk and next investigation: exercise the malformed block-payload
 branch (valid hash list but truncated serialized body) with the same immediate
 reassignment assertion, then inspect whether request-send failures similarly
 leave authoritative ownership waiting for timeout.
+
+## Pin malformed block-body ownership recovery on the wire
+
+Baseline and root cause: the ownership-release fix covered payload parser
+failure, but its regression stopped before the advertised hash array. A future
+change could preserve hash-truncation recovery while regressing the distinct
+serialized-body branch without a direct wire failure.
+
+Fix and after-result: the loopback fixture now sends an owned `zblkdata` with
+a complete header and hash list, followed by a CompactSize body length whose
+advertised byte is absent. The parser rejects and scores it, the owner is
+released, and the next send tick emits exactly one replacement request before
+the retained valid response completes the swarm.
+
+Regression proof: `make -j2 t-fast ONLY=block_swarm_loopback` passes all wire,
+duplicate, late-owner, disconnect, integrity, timeout, anchoring, and
+throughput cases. Consensus impact: NONE; this adds test coverage only.
+Worldstream remains at `0b29bec27` on complementary startup/observer work.
+
+Remaining risk and next investigation: inspect request construction and queue
+failure paths for assignments that acquire authoritative ownership before the
+request is durably queued, forcing avoidable timeout recovery.

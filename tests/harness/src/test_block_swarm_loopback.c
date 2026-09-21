@@ -596,6 +596,27 @@ static bool bs_push_truncated_block_data_frame(
     return ok;
 }
 
+static bool bs_push_truncated_block_body_frame(
+    struct p2p_node *node, const struct chain_params *params,
+    uint32_t piece_index)
+{
+    static const uint8_t hash[32] = {0};
+    struct byte_stream payload;
+    stream_init(&payload, 41);
+    bool ok = stream_write_u32_le(&payload, piece_index) &&
+        stream_write_u32_le(&payload, 1) &&
+        stream_write_bytes(&payload, hash, sizeof(hash)) &&
+        stream_write_u8(&payload, 1) &&
+        p2p_node_begin_message(node, MSG_BLOCK_DATA,
+                               params->pchMessageStart);
+    if (ok)
+        p2p_node_write_message_data(node, payload.data, payload.size);
+    if (ok)
+        ok = p2p_node_end_message(node);
+    stream_free(&payload);
+    return ok;
+}
+
 static bool bs_refuses_unsolicited_block_piece(
     struct p2p_node *requester, struct send_segment *requester_sent,
     struct msg_processor *serve_mp, struct p2p_node *server,
@@ -1842,6 +1863,16 @@ static int test_block_swarm_duplicate_delivery(void)
          * immediately so another send tick can request it without waiting
          * for the piece timeout. */
         ASSERT(bs_push_truncated_block_data_frame(b_node, params, 0));
+        ASSERT(bs_pump(b_node, sent_b, &mp_b, b_node,
+                       params->pchMessageStart, &ok) > 0 && ok);
+        mp_snapshot_send_tick(&mp_b, b_node);
+        ASSERT(bs_queue_depth(sent_b) == 1);
+        bs_drop_queue(b_node, sent_b);
+
+        /* The same invariant holds after a complete hash list followed by a
+         * CompactSize body length whose advertised byte is absent. This
+         * exercises the body parser rather than the hash-array parser. */
+        ASSERT(bs_push_truncated_block_body_frame(b_node, params, 0));
         ASSERT(bs_pump(b_node, sent_b, &mp_b, b_node,
                        params->pchMessageStart, &ok) > 0 && ok);
         mp_snapshot_send_tick(&mp_b, b_node);
