@@ -1793,3 +1793,23 @@ validation, PoW, chain selection, and transaction rules are unchanged.
 Worldstream `6c1a99c24` remains complementary on fresh-sync startup observer
 coverage.  Remaining risk and next investigation: continue auditing getaddr
 and mempool one-shot flags.
+
+## Outbound getaddr enqueue ownership
+
+Baseline and root cause: outbound version handling set the per-peer `get_addr`
+one-shot guard even when the hard send-queue ceiling rejected its `getaddr`
+frame.  The peer was therefore recorded as queried without any discovery
+request entering the wire queue.
+
+Fix and after-result: `get_addr` now receives the actual bounded enqueue result.
+A refused frame leaves discovery retryable; a healthy control queues `getaddr`
+and advances the guard.  The message bytes and ordinary handshake ordering are
+unchanged.
+
+Regression proof: a direct production `process_version` fixture first failed
+with `get_addr=true` and no queued frame.  It now proves refusal and healthy
+enqueue behavior through the real version handler, and `net_msg_dos` passes.
+Consensus impact: NONE; this changes only volatile peer-discovery bookkeeping.
+Worldstream `6c1a99c24` remains complementary on fresh-sync observer boundary
+measurement.  Remaining risk and next investigation: audit the post-handshake
+mempool one-shot guard, then return to measured block/header scheduling costs.

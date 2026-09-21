@@ -632,3 +632,7 @@ later lane flips it HARD.
 - 2026-09-21T12:34:09Z — REASON: Record keepalive nonce and pong deadline only after the ping frame enters the bounded send queue; no consensus or wire semantic change
   old ROOT: d9a9c1eaa5dee9fd125792aac7c00a110748a263c4dfb1a025bf3bbe9d49c0b0
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T12:53:35Z — REASON: Mark outbound peer discovery requested only after getaddr enters the bounded send queue; no consensus or wire semantic change
+  old ROOT: 4c7f66674bdd0b007b10c1fe71f96bd483ec37a1fedc716a2982d442bf925cb6
+  by: owner unseal ritual (make core-unseal)

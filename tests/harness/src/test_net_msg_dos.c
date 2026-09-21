@@ -381,6 +381,69 @@ static int dos_keepalive_queue_refusal(struct msg_processor *mp,
                   dos_send_queue_has_command(node, "ping"));
         p2p_node_free(node);
     }
+
+    return failures;
+}
+
+static int dos_getaddr_queue_refusal(struct msg_processor *mp,
+                                     struct net_manager *nm)
+{
+    int failures = 0;
+    struct net_address addr;
+    net_address_init(&addr);
+    unsigned char ip4[4] = {203, 0, 113, 87};
+    net_addr_set_ipv4(&addr.svc.addr, ip4);
+    addr.svc.port = 8033;
+    struct p2p_node *node = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "getaddr-blocked", false);
+    DOS_CHECK("getaddr refusal: peer created", node != NULL);
+    if (node) {
+        struct version_message ver;
+        version_message_init(&ver);
+        ver.protocol_version = PROTOCOL_VERSION;
+        ver.services = NODE_NETWORK;
+        ver.timestamp = (int64_t)platform_time_wall_time_t();
+        ver.nonce = 0x87654321ULL;
+        snprintf(ver.sub_version, sizeof(ver.sub_version), "/getaddr-test/");
+        ver.relay = true;
+        struct byte_stream payload;
+        stream_init(&payload, 256);
+        version_message_serialize(&ver, &payload);
+        node->state = PEER_VERSION_SENT;
+        node->send_size = net_send_peer_bytes_hard_cap();
+        DOS_CHECK("getaddr refusal: version handling completes",
+                  process_version(mp, node, &payload));
+        DOS_CHECK("getaddr refusal: unsent discovery remains retryable",
+                  !node->get_addr &&
+                  !dos_send_queue_has_command(node, "getaddr"));
+        stream_free(&payload);
+        p2p_node_free(node);
+    }
+
+    node = p2p_node_create(
+        nm, ZCL_INVALID_SOCKET, &addr, "getaddr-healthy", false);
+    DOS_CHECK("getaddr refusal: healthy peer created", node != NULL);
+    if (node) {
+        struct version_message ver;
+        version_message_init(&ver);
+        ver.protocol_version = PROTOCOL_VERSION;
+        ver.services = NODE_NETWORK;
+        ver.timestamp = (int64_t)platform_time_wall_time_t();
+        ver.nonce = 0x12345678ULL;
+        snprintf(ver.sub_version, sizeof(ver.sub_version), "/getaddr-test/");
+        ver.relay = true;
+        struct byte_stream payload;
+        stream_init(&payload, 256);
+        version_message_serialize(&ver, &payload);
+        node->state = PEER_VERSION_SENT;
+        DOS_CHECK("getaddr refusal: healthy version handling completes",
+                  process_version(mp, node, &payload));
+        DOS_CHECK("getaddr refusal: queued discovery advances guard",
+                  node->get_addr &&
+                  dos_send_queue_has_command(node, "getaddr"));
+        stream_free(&payload);
+        p2p_node_free(node);
+    }
     return failures;
 }
 
@@ -1440,6 +1503,10 @@ int test_net_msg_dos(void)
     /* A locally refused keepalive cannot start a pong timeout for a frame
      * that never existed on the wire. */
     failures += dos_keepalive_queue_refusal(&mp, &nm);
+
+    /* Peer discovery is marked requested only when getaddr reaches the
+     * bounded wire queue. */
+    failures += dos_getaddr_queue_refusal(&mp, &nm);
 
     net_manager_free(&nm);
     sync_set_state(sync0, "net_msg_dos restore");

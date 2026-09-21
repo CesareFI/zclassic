@@ -599,8 +599,7 @@ bool process_version(struct msg_processor *mp, struct p2p_node *node,
     /* Ask outbound peers for their address list */
     if (!node->inbound && !node->get_addr) {
         p2p_node_begin_message(node, "getaddr", mp->params->pchMessageStart);
-        p2p_node_end_message(node);
-        node->get_addr = true;
+        node->get_addr = p2p_node_end_message(node);
     }
 
     /* Send sendheaders — tells peer we prefer headers announcements
