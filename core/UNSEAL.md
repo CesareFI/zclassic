@@ -748,3 +748,7 @@ later lane flips it HARD.
 - 2026-09-21T18:38:16Z — REASON: Preserve block swarm peer diversity across reconnect churn
   old ROOT: b5d99b243297863d848cd40bca08154dd7346de31365e2012ccc889c4aaa015f
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T18:44:28Z — REASON: Clear stale block bitmap availability on manifest re-admission
+  old ROOT: e631a70a97aa12473ea97bdeae6f372ddfc292595e08cb33d75fc1bb11238b9e
+  by: owner unseal ritual (make core-unseal)

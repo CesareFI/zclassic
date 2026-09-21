@@ -2377,3 +2377,33 @@ chain selection are unchanged. Worldstream `5297c58f4` remains complementary
 classic-download timeout work. Remaining risk and next investigation: measure
 whether repeated block-manifest advertisements from a reconnecting endpoint
 can alter scheduler availability before its new bitmap is accepted.
+
+## Block-manifest availability revocation
+
+Baseline and root cause: each inbound `zblkmanfst` cleared a peer's manifest
+admission before parsing the new advertisement, but left its previous
+generation's `zblkbitmap` contribution in global rarest-first availability.
+An invalid, truncated, or repeated manifest could therefore leave a
+non-admitted source influencing piece choice.
+
+Fix and after-result: clearing manifest admission now atomically removes that
+peer's current-generation bitmap contribution and clears its bitmap generation.
+Only a freshly accepted exact bitmap can restore availability after manifest
+re-admission; no bitmap bytes are trusted merely because a prior session had
+been admitted.
+
+Regression proof: the block-swarm wire fixture installs a valid bitmap, sends
+a repeated valid manifest, proves its availability becomes zero while
+re-admitted, then proves a new exact bitmap restores exactly one contribution.
+The production unit passes native C23 syntax; core resealing, consensus parity,
+complexity, and whitespace gates pass. Runtime and ASan/UBSan remain deferred
+at 10.72 GB free space because the focused runtime target starts a cold
+package-verifier build and reaches the 10 GB safety floor.
+
+Consensus impact: NONE. This changes only untrusted availability accounting;
+manifest/payload verification, reducer admission, block/transaction validity,
+PoW, and chain selection remain unchanged. Worldstream `5297c58f4` remains
+complementary classic-download timeout work. Remaining risk and next
+investigation: verify that malformed manifest handling also promptly releases
+any in-flight block-piece ownership held by a source that has just lost
+admission.

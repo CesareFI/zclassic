@@ -760,6 +760,17 @@ static bool block_swarm_peer_admitted(struct p2p_node *node)
 static void block_swarm_clear_peer_admission(struct p2p_node *node)
 {
     pthread_mutex_lock(&g_block_swarm_mutex);
+    if (atomic_load(&g_block_swarm_active) &&
+        node->blk_bitmap_swarm_generation == g_block_swarm_generation) {
+        /* A new manifest invalidates the peer's prior availability claim
+         * until the same active generation accepts a fresh exact bitmap.
+         * Otherwise an incompatible or repeated advertisement can leave a
+         * non-admitted source distorting rarest-first scheduling. */
+        block_swarm_replace_availability(
+            &g_block_swarm, node->blk_bitmap, node->blk_bitmap_len,
+            NULL, 0);
+    }
+    node->blk_bitmap_swarm_generation = 0;
     node->blk_manifest_received = false;
     node->blk_manifest_admitted_generation = 0;
     pthread_mutex_unlock(&g_block_swarm_mutex);

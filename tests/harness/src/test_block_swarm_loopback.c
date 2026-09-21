@@ -1120,6 +1120,31 @@ static int test_snapshot_inbound_reservation(void)
     return failures;
 }
 
+static bool bs_repeated_manifest_requires_fresh_bitmap(
+    struct bs_seeder *seed, struct p2p_node *serve_node,
+    struct send_segment *serve_sent, struct msg_processor *receive_mp,
+    struct p2p_node *receive_node, struct send_segment *receive_sent,
+    const struct chain_params *params, const uint8_t bitmap[5])
+{
+    bool ok = true;
+    serve_node->blk_manifest_sent = false;
+    push_block_manifest(&seed->mp, serve_node);
+    if (bs_pump(serve_node, serve_sent, receive_mp, receive_node,
+                params->pchMessageStart, &ok) == 0 || !ok)
+        return false;
+    if (!receive_node->blk_manifest_received ||
+        receive_node->blk_bitmap_swarm_generation != 0 ||
+        mp_block_swarm_test_piece_availability(0) != 0)
+        return false;
+    if (!bs_push_block_bitmap_frame(receive_node, params, 5, bitmap, 5))
+        return false;
+    if (bs_pump(receive_node, receive_sent, receive_mp, receive_node,
+                params->pchMessageStart, &ok) == 0 || !ok)
+        return false;
+    return receive_node->blk_bitmap_swarm_generation != 0 &&
+        mp_block_swarm_test_piece_availability(0) == 1;
+}
+
 /* ══════════════════════ Test 1: throughput ══════════════════════════════ */
 static int test_block_swarm_throughput(void)
 {
@@ -1246,6 +1271,14 @@ static int test_block_swarm_throughput(void)
         ASSERT(bs_pump(b_node, sent_b, &mp_b, b_node,
                        params->pchMessageStart, &ok) > 0 && ok);
         ASSERT(b_node->blk_bitmap_len == 5);
+
+        /* A repeated manifest starts a fresh advertisement conversation.
+         * Its previous bitmap must stop contributing immediately; otherwise
+         * a source that is no longer admitted can bias rarest-first choice.
+         * A fresh exact bitmap restores only this source's contribution. */
+        ASSERT(bs_repeated_manifest_requires_fresh_bitmap(
+            &seed, a_node, sent_a, &mp_b, b_node, sent_b, params,
+            complete_bitmap));
 
         /* A valid manifest source still cannot push a piece that the local
          * scheduler never assigned to it. Drive the production serve path to
