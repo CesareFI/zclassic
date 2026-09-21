@@ -137,6 +137,15 @@ static void swarm_requeue_known_peer_chunk(struct p2p_node *node,
         (void)swarm_requeue_peer_chunk(node, chunk_index);
 }
 
+static void swarm_clear_matching_peer_chunk(struct p2p_node *node,
+                                            uint32_t chunk_index)
+{
+    if (node->swarm_inflight_chunk == (int32_t)chunk_index) {
+        node->swarm_inflight_chunk = -1;
+        node->swarm_chunk_req_time = 0;
+    }
+}
+
 bool mp_block_swarm_manifest_shape_valid(int32_t start_height,
                                          int32_t end_height,
                                          uint32_t num_pieces)
@@ -1250,7 +1259,7 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                         }
                         bool verified = swarm_sync_receive_chunk(
                             &g_swarm, chunk, node->id);
-                        node->swarm_inflight_chunk = -1;
+                        swarm_clear_matching_peer_chunk(node, chunk_index);
 
                         if (!verified) {
                             swarm_mutex_unlock();

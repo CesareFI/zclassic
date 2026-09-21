@@ -1384,17 +1384,33 @@ size_t swarm_sync_peer_disconnected(struct swarm_sync *ss, int peer_id)
     return requeued;
 }
 
-bool swarm_sync_receive_chunk(struct swarm_sync *ss,
-                                const struct utxo_chunk *chunk,
-                                int peer_id)
+static bool swarm_sync_receive_owner(const struct swarm_sync *ss,
+                                     const struct utxo_chunk *chunk,
+                                     int peer_id,
+                                     uint32_t *idx_out)
 {
-    GUARD(ss && chunk && ss->manifest.chunk_hashes, "sync",
-          "receive_chunk: ss, chunk, or chunk_hashes is NULL");
-
+    GUARD(ss && chunk && ss->manifest.chunk_hashes && idx_out, "sync",
+          "receive_chunk: invalid ownership-check arguments");
     uint32_t idx = chunk->chunk_index;
     if (idx >= ss->manifest.num_chunks)
         LOG_FAIL("sync", "receive_chunk: chunk_index %u >= num_chunks %u",
                  idx, ss->manifest.num_chunks);
+    if (!ss->chunk_states || !ss->chunk_peer ||
+        ss->chunk_states[idx] != CHUNK_INFLIGHT ||
+        ss->chunk_peer[idx] != peer_id)
+        LOG_FAIL("sync", "receive_chunk: peer %d does not own in-flight "
+                 "chunk %u", peer_id, idx);
+    *idx_out = idx;
+    return true;
+}
+
+bool swarm_sync_receive_chunk(struct swarm_sync *ss,
+                                const struct utxo_chunk *chunk,
+                                int peer_id)
+{
+    uint32_t idx = 0;
+    if (!swarm_sync_receive_owner(ss, chunk, peer_id, &idx))
+        return false;
 
     /* verify SHA3-256 of the received chunk against the per-chunk
      * hash the peer advertised in the swarm manifest BEFORE handing any

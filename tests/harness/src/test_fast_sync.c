@@ -705,6 +705,46 @@ static int test_swarm_stale_timeout_preserves_new_owner(void)
     return failures;
 }
 
+static int test_swarm_receive_requires_current_owner(void)
+{
+    int failures = 0;
+    TEST("swarm rejects unsolicited and duplicate chunks without accounting drift") {
+        struct utxo_chunk *chunk = zcl_calloc(
+            1, sizeof(*chunk), "test_owner_chunk");
+        ASSERT(chunk != NULL);
+        chunk->chunk_index = 0;
+
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 1;
+        manifest.chunk_size = 500;
+        manifest.chunk_hashes = zcl_calloc(1, 32, "test_chunk_hashes");
+        ASSERT(manifest.chunk_hashes != NULL);
+        fast_sync_chunk_hash(chunk, manifest.chunk_hashes[0]);
+
+        struct swarm_sync ss;
+        ASSERT(swarm_sync_init(&ss, &manifest, NULL));
+        ASSERT(swarm_sync_assign_chunk(&ss, 11) == 0);
+        ASSERT(!swarm_sync_receive_chunk(&ss, chunk, 22));
+        ASSERT(ss.chunk_states[0] == CHUNK_INFLIGHT);
+        ASSERT(ss.chunk_peer[0] == 11);
+        ASSERT(ss.chunks_inflight == 1);
+        ASSERT(ss.chunks_complete == 0);
+        ASSERT(swarm_sync_receive_chunk(&ss, chunk, 11));
+        ASSERT(ss.chunks_inflight == 0);
+        ASSERT(ss.chunks_complete == 1);
+        ASSERT(!swarm_sync_receive_chunk(&ss, chunk, 11));
+        ASSERT(ss.chunks_inflight == 0);
+        ASSERT(ss.chunks_complete == 1);
+
+        swarm_sync_free(&ss);
+        free(manifest.chunk_hashes);
+        free(chunk);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_swarm_timeout_monotonic_boundaries(void)
 {
     int failures = 0;
@@ -2002,6 +2042,7 @@ int test_fast_sync(void)
     failures += test_swarm_malformed_response_reassign();
     failures += test_swarm_disconnect_reassign();
     failures += test_swarm_stale_timeout_preserves_new_owner();
+    failures += test_swarm_receive_requires_current_owner();
     failures += test_swarm_timeout_monotonic_boundaries();
 
     /* Block swarm */

@@ -417,3 +417,33 @@ unchanged. Worldstream remains at `0b29bec27` with no overlap.
 
 Remaining risk and next investigation: add the direct truncated-wire fixture,
 then audit invalid chunk-hash retry accounting for the same ownership invariant.
+
+## Reject unowned and duplicate snapshot chunk delivery
+
+`swarm_sync_receive_chunk` previously verified content but not request ownership.
+A peer could submit a valid chunk assigned to another peer, or replay a completed
+chunk, causing duplicate completion credit and incorrect in-flight accounting.
+The wire handler also cleared the sender's unrelated peer-local slot after such
+an unsolicited response.
+
+Snapshot receive now requires the chunk to be `CHUNK_INFLIGHT` and owned by the
+sender before hashing, applying, or changing counters. The handler clears its
+peer-local request only when the delivered index matches that slot. Unsolicited,
+late, and duplicate deliveries fail without modifying the legitimate owner's
+work.
+
+The deterministic regression proves a non-owner cannot alter state or counters,
+the owner can complete exactly once, and a duplicate cannot increment completion
+or decrement in-flight state again. The four-group fast-sync suite, the broader
+13-group networking selection, and fast-sync under ASan/UBSan passed. Core
+seal/root mirror, consensus parity, generated capability inventory, cyclomatic
+complexity (55,568 functions), and whitespace gates passed after factoring the
+checks into bounded helpers.
+
+Consensus impact: none. The accepted snapshot content rules are unchanged; this
+only enforces request ownership before existing verification and application.
+Worldstream remains at `0b29bec27` with no overlap.
+
+Remaining risk and next investigation: add a direct wire fixture covering
+unsolicited and truncated `zchunkdata`, including preservation of the sender's
+unrelated legitimate request slot.

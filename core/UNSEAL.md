@@ -416,3 +416,11 @@ later lane flips it HARD.
 - 2026-09-21T01:04:13Z — REASON: Prevent stale peer-local snapshot timeout cleanup from revoking a chunk already reassigned to a healthy peer; scheduling only, no consensus semantic change
   old ROOT: 2faa6ee45a426d8364e37b6fb4a8b6d360f2bf94479e829fd0224a373cc213b8
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T01:18:47Z — REASON: Reject unsolicited or duplicate snapshot chunks unless the sender still owns the in-flight request; accounting and scheduling safety only, no consensus semantic change
+  old ROOT: 62c0020008418c14d95c41bcdfc898e6fc6f28e1dca3addc1616ba6355f8bfa1
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-21T01:21:22Z — REASON: Refactor snapshot chunk ownership enforcement into bounded helpers to preserve the cyclomatic-complexity ratchet; no semantic or consensus change
+  old ROOT: 9501a1223bdc514822a8c6f3a9650b9468badcbbee5a7e430b0c40a08425bcb1
+  by: owner unseal ritual (make core-unseal)
