@@ -68,7 +68,7 @@
  * and follow budget: onion_service.h. The budget is a WALL-CLOCK bound as
  * much as a fan-out one — this runs on the discovery thread and each fetch
  * blocks — so depth-1 fetches also get a shorter deadline than a
- * configured seed, and g_stop aborts between hops. */
+ * configured seed, and instance cancellation aborts between hops. */
 #define ONION_RELAY_FETCH_TIMEOUT 20
 
 static int try_onion_seed_fetch_depth(struct connman *cm, const char *onion,
@@ -280,7 +280,7 @@ static int apply_onion_seed_directory(struct connman *cm, const char *onion,
     if (depth < ONION_RELAY_MAX_DEPTH &&
         cm->manager.num_nodes >= (size_t)ZCL_PEER_FLOOR_HEALTHY) {
         int64_t now = (int64_t)platform_time_wall_time_t();
-        for (int i = 0; i < nh && !g_stop; i++) {
+        for (int i = 0; i < nh && !connman_stop_requested(cm); i++) {
             if (strcmp(hints[i].hostname, onion) == 0)
                 continue;
             if (!onion_directory_claim_relay_follow(hints[i].hostname, now))
@@ -299,7 +299,7 @@ static int apply_onion_seed_directory(struct connman *cm, const char *onion,
 
 int connman_add_onion_seed(struct connman *cm, const char *onion)
 {
-    if (!cm || !onion_hostname_valid(onion) || g_stop ||
+    if (!cm || !onion_hostname_valid(onion) || connman_stop_requested(cm) ||
         !tor_integration_is_dial_ready())
         return -1;
     return try_onion_seed_fetch_depth(cm, onion, 0, true);
@@ -386,7 +386,7 @@ static int onion_seed_pass_fetch(const char *onion, const char *path,
 
 void connman_run_onion_seed_pass(struct connman *cm)
 {
-    if (!cm || !cm->params || g_stop) return;
+    if (!cm || !cm->params || connman_stop_requested(cm)) return;
     if (g_connect_only) return;
     if (!tor_integration_is_dial_ready()) return;
 
@@ -405,7 +405,8 @@ void connman_run_onion_seed_pass(struct connman *cm)
         if (fp) {
             char line[256];
             int n = 0;
-            while (n < 32 && !g_stop && fgets(line, sizeof(line), fp)) {
+            while (n < 32 && !connman_stop_requested(cm) &&
+                   fgets(line, sizeof(line), fp)) {
                 char *p = line;
                 while (*p == ' ' || *p == '\t') p++;
                 if (*p == '#' || *p == '\n' || *p == '\0') continue;
@@ -428,7 +429,8 @@ void connman_run_onion_seed_pass(struct connman *cm)
         int n = onion_service_directory_dial_candidates(
             cand, ONION_DIR_DIAL_CANDIDATES);
         int claimed = 0;
-        for (int i = 0; i < n && !g_stop && claimed < ONION_DIR_DIAL_ENOUGH; i++) {
+        for (int i = 0; i < n && !connman_stop_requested(cm) &&
+                        claimed < ONION_DIR_DIAL_ENOUGH; i++) {
             if (onion_pass_claim(&seen, cand[i].hostname))
                 claimed++;
         }
@@ -440,7 +442,8 @@ void connman_run_onion_seed_pass(struct connman *cm)
     }
 
     /* Tier 3 — hardcoded chainparams onion seeds. */
-    for (size_t i = 0; i < cm->params->nOnionSeeds && !g_stop; i++)
+    for (size_t i = 0; i < cm->params->nOnionSeeds &&
+                       !connman_stop_requested(cm); i++)
         (void)onion_pass_claim(&seen, cm->params->onionSeeds[i]);
 
     /* Tier 4 — .onion peers discovered on-chain (ZSLP scan) — same
@@ -449,13 +452,14 @@ void connman_run_onion_seed_pass(struct connman *cm)
         struct onion_peer peers[16];
         int found = cm->onion_peer_discover(cm->onion_peer_datadir,
                                             peers, 16);
-        for (int i = 0; i < found && i < 8 && !g_stop; i++) {
+        for (int i = 0; i < found && i < 8 &&
+                        !connman_stop_requested(cm); i++) {
             if (peers[i].hostname[0] && strstr(peers[i].hostname, ".onion"))
                 (void)onion_pass_claim(&seen, peers[i].hostname);
         }
     }
 
-    if (seen.n <= 0 || g_stop)
+    if (seen.n <= 0 || connman_stop_requested(cm))
         return;
 
     const char *hostptrs[ONION_PASS_SEEN_MAX];
@@ -470,9 +474,10 @@ void connman_run_onion_seed_pass(struct connman *cm)
                                           onion_seed_pass_fetch, NULL,
                                           onion_seed_directory_has_endpoint,
                                           NULL,
-                                          60, &g_stop,
+                                          60, &cm->manager.stop_requested,
                                           &winner, &winner_index, &join);
-    if (rc == 0 && winner.body && winner_index < (size_t)seen.n && !g_stop) {
+    if (rc == 0 && winner.body && winner_index < (size_t)seen.n &&
+        !connman_stop_requested(cm)) {
         printf("Onion seed: first usable door %s\n", hostptrs[winner_index]);
         fflush(stdout);
         (void)apply_onion_seed_directory(cm, hostptrs[winner_index],
@@ -489,7 +494,7 @@ void connman_run_onion_seed_pass(struct connman *cm)
 
 void connman_kick_onion_seeds(struct connman *cm)
 {
-    if (!cm || g_stop || g_connect_only) return;
+    if (!cm || connman_stop_requested(cm) || g_connect_only) return;
     LOG_INFO("connman", "peer-of-last-resort: querying onion-directory seeds");
     connman_run_onion_seed_pass(cm);
     /* Persist whatever clearnet hosts we just harvested so a subsequent

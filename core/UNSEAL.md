@@ -196,3 +196,7 @@ later lane flips it HARD.
 - 2026-09-17T19:21:29Z — REASON: Finish shrinking new connman lifecycle formatting to the fixed 3073-line ratchet; no behavior or consensus change
   old ROOT: 2b969b7517bdf30c4000bea7ec43f8616da0f2793b74422e7b0c0727336a41db
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-17T23:16:37Z — REASON: Owner-requested instance-owned connman cooperative cancellation; consensus validation and chain rules unchanged
+  old ROOT: f2a2be5f60e37af917058e976df51020e349b0bb6d1325dc912011d6a5401771
+  by: owner unseal ritual (make core-unseal)

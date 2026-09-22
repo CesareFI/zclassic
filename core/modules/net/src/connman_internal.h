@@ -29,9 +29,21 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
-/* Shared P2P-thread shutdown flag. Set false at connman_start(), true by
- * connman_signal_stop(); every long-running loop in both files polls it. */
-extern _Atomic bool g_stop;
+/* Every P2P worker observes only its owning connman's cancellation token.
+ * A NULL owner is treated as stopped so helpers fail closed rather than
+ * silently falling back to process-global lifecycle state. */
+static inline bool connman_stop_requested(const struct connman *cm)
+{
+    return !cm || atomic_load_explicit(&cm->manager.stop_requested,
+                                        memory_order_acquire);
+}
+
+static inline void connman_set_stop_requested(struct connman *cm, bool stop)
+{
+    if (cm)
+        atomic_store_explicit(&cm->manager.stop_requested, stop,
+                              memory_order_release);
+}
 
 /* -connect mode: only connect to specified peers, no seeds. Defined
  * (non-static) in connman.c; declared here for connman_dialer.c. */

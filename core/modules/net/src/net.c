@@ -1253,7 +1253,7 @@ void net_manager_init(struct net_manager *nm)
     nm->listen = true;
     nm->local_services = NODE_NETWORK;
     nm->max_connections = DEFAULT_MAX_PEER_CONNECTIONS;
-    nm->stop_requested = false;
+    atomic_init(&nm->stop_requested, false);
 
     addrman_init(&nm->addrman);
 

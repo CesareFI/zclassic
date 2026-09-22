@@ -53,9 +53,6 @@ bool g_connect_only = false;
 /* Per-peer bandwidth quotas. */
 static struct peer_bandwidth g_peer_bw;
 static bool g_peer_bw_active = false;
-
-/* Shared with connman_dialer.c — see connman_internal.h. */
-_Atomic bool g_stop = false;
 /* Supervisor liveness for the four P2P threads. These are root children
  * because core/modules/net cannot depend on app-side supervisor domains. The socket
  * poller has a real deadline; the three legitimately idle workers are
@@ -83,20 +80,20 @@ static _Atomic int64_t g_first_peer_us    = 0;   /* delta us; 0 = no peer yet */
 
 /* Optional discovery must never hold shutdown hostage.  The production
  * incident behind this helper was a healthy discovery thread parked in a
- * single sleep(300): connman_signal_stop() set g_stop immediately, but
+ * single sleep(300): connman_signal_stop() requested stop immediately, but
  * connman_join() could not own the thread again before the pre-durability
  * shutdown watchdog expired.  Sleep in short monotonic slices instead, so
  * every nominal multi-minute cadence has a bounded stop latency. */
-static bool connman_wait_for_stop(int seconds)
+static bool connman_wait_for_stop(struct connman *cm, int seconds)
 {
-    if (atomic_load_explicit(&g_stop, memory_order_acquire))
+    if (connman_stop_requested(cm))
         return true;
     if (seconds <= 0)
         return false;
 
     int64_t deadline_us = platform_time_monotonic_us() +
                           (int64_t)seconds * 1000000LL;
-    while (!atomic_load_explicit(&g_stop, memory_order_acquire)) {
+    while (!connman_stop_requested(cm)) {
         int64_t remaining_us = deadline_us - platform_time_monotonic_us();
         if (remaining_us <= 0)
             return false;
@@ -111,14 +108,14 @@ static bool connman_wait_for_stop(int seconds)
 }
 
 #ifdef ZCL_TESTING
-bool connman_wait_for_stop_for_test(int seconds)
+bool connman_wait_for_stop_for_test(struct connman *cm, int seconds)
 {
-    return connman_wait_for_stop(seconds);
+    return connman_wait_for_stop(cm, seconds);
 }
 
-void connman_set_stop_for_test(bool stop)
+void connman_set_stop_for_test(struct connman *cm, bool stop)
 {
-    atomic_store_explicit(&g_stop, stop, memory_order_release);
+    connman_set_stop_requested(cm, stop);
 }
 #endif
 
@@ -278,7 +275,7 @@ static void dns_seed_resolve(struct connman *cm)
 static void seed_from_fixed(struct connman *cm)
 {
     const struct chain_params *p = cm->params;
-    for (size_t i = 0; i < p->nFixedSeeds && !g_stop; i++) {
+    for (size_t i = 0; i < p->nFixedSeeds && !connman_stop_requested(cm); i++) {
         struct net_address addr;
         net_address_init(&addr);
         memcpy(addr.svc.addr.ip, p->vFixedSeeds[i].addr, 16);
@@ -300,7 +297,7 @@ static void seed_from_fixed(struct connman *cm)
  * resolves). Safe to call concurrently with the discovery thread. */
 void connman_kick_seed_discovery(struct connman *cm)
 {
-    if (!cm || !cm->params || g_stop) return;
+    if (!cm || !cm->params || connman_stop_requested(cm)) return;
     if (g_connect_only) return;
     seed_from_fixed(cm);
     dns_seed_resolve(cm);
@@ -394,22 +391,22 @@ static void *thread_dns_seed(void *arg)
         /* DNS seeds after 3 seconds (not 11). The wait is shutdown-aware: a
          * healthy node must not turn this optional delay into an unclean
          * stop. */
-        (void)connman_wait_for_stop(3);
-        if (!g_stop)
+        (void)connman_wait_for_stop(cm, 3);
+        if (!connman_stop_requested(cm))
             dns_seed_resolve(cm);
     } else {
         LOG_INFO("connman",
                  "bootstrap: %zu remembered peer(s) (%zu proven addresses, "
                  "%zu anchors) — hardcoded seeds deferred until memory fails",
                  remembered, proven, cm->anchors.count);
-        (void)connman_wait_for_stop(3);
+        (void)connman_wait_for_stop(cm, 3);
     }
 
     /* Onion peer discovery, ADD-only: the ZDIR on-chain directory projection
      * merged with the legacy wallet scrape (controllers/blog_controller.h). */
     struct onion_peer discovered[64];
     int n_discovered = 0;
-    if (!g_stop && cm->onion_peer_discover) {
+    if (!connman_stop_requested(cm) && cm->onion_peer_discover) {
         const char *datadir = cm->onion_peer_datadir;
         if (datadir) {
             n_discovered = cm->onion_peer_discover(datadir, discovered, 64);
@@ -432,7 +429,7 @@ static void *thread_dns_seed(void *arg)
      * block re-implemented its own copy of the operator-file + chainparams
      * loop inline; consolidated so a future seed-source change only needs
      * one edit.) connman_run_onion_seed_pass() checks tor_integration_is_dial_ready()
-     * and g_stop/g_connect_only itself. Gated on "few peers" so a fresh
+     * and instance stop/g_connect_only itself. Gated on "few peers" so a fresh
      * boot that already found peers via DNS/fixed seeds skips the
      * (up to 60s-per-seed, blocking) Tor round-trips.
      *
@@ -442,7 +439,7 @@ static void *thread_dns_seed(void *arg)
      * on the shipped list before those attempts have had a chance to land is
      * exactly the reflex that let a dead seed sit unnoticed. If memory fails,
      * the retry below runs this same pass. */
-    if (!g_stop && remembered == 0 &&
+    if (!connman_stop_requested(cm) && remembered == 0 &&
         connman_seed_discovery_needed(connman_outbound_healthy_count(cm)))
         connman_run_onion_seed_pass(cm);
 
@@ -455,8 +452,10 @@ static void *thread_dns_seed(void *arg)
      * connman_run_onion_seed_pass() already fetches from this same source when we
      * are below the floor, so this pass is the above-floor case and the
      * dedupe ring keeps a host from being fetched twice in a window. */
-    if (!g_stop && n_discovered > 0 && tor_integration_is_dial_ready()) {
-        for (int i = 0; i < n_discovered && i < 3 && !g_stop; i++)
+    if (!connman_stop_requested(cm) && n_discovered > 0 &&
+        tor_integration_is_dial_ready()) {
+        for (int i = 0; i < n_discovered && i < 3 &&
+                        !connman_stop_requested(cm); i++)
             connman_onion_seed_fetch_one(cm, discovered[i].hostname);
     }
 
@@ -466,8 +465,9 @@ static void *thread_dns_seed(void *arg)
      * peers skipped the shipped seed list entirely, and this is where the list
      * arrives if those remembered peers did not produce a connection. Memory
      * gets first refusal, never the only word. */
-    (void)connman_wait_for_stop(12);
-    if (!g_stop && connman_outbound_healthy_count(cm) == 0) {
+    (void)connman_wait_for_stop(cm, 12);
+    if (!connman_stop_requested(cm) &&
+        connman_outbound_healthy_count(cm) == 0) {
         printf("No peers found, retrying all discovery methods...\n");
         seed_from_fixed(cm);
         dns_seed_resolve(cm);
@@ -496,11 +496,11 @@ static void *thread_dns_seed(void *arg)
     int64_t start_ts = (int64_t)platform_time_wall_time_t();
     int64_t floor_below_since = 0;
     uint64_t seed_rounds = 0;
-    while (!g_stop) {
+    while (!connman_stop_requested(cm)) {
         size_t n = connman_outbound_healthy_count(cm);
         int interval = connman_seed_discovery_interval(n);
-        (void)connman_wait_for_stop(interval);
-        if (g_stop) break;
+        (void)connman_wait_for_stop(cm, interval);
+        if (connman_stop_requested(cm)) break;
         thread_liveness_beat(&g_dns_seed_liveness, (int64_t)++seed_rounds);
         size_t cur = connman_outbound_healthy_count(cm);
         int64_t now = (int64_t)platform_time_wall_time_t();
@@ -531,7 +531,8 @@ static void *thread_dns_seed(void *arg)
             floor_below_since = 0;
         }
         /* Periodic flush regardless of floor state. */
-        if (now - last_addrman_flush >= ADDRMAN_FLUSH_SECS && !g_stop) {
+        if (now - last_addrman_flush >= ADDRMAN_FLUSH_SECS &&
+            !connman_stop_requested(cm)) {
             connman_save_addrman(cm);
             last_addrman_flush = now;
         }
@@ -1251,7 +1252,7 @@ static void *thread_socket_handler(void *arg)
 {
     struct connman *cm = (struct connman *)arg;
 
-    while (!g_stop) {
+    while (!connman_stop_requested(cm)) {
         /* Build poll array: listen sockets + connected nodes.
          * Using poll() instead of select() avoids FD_SETSIZE (1024) limit
          * which caused stack corruption with high fd numbers. Array size is
@@ -1981,7 +1982,7 @@ static void *thread_message_handler(void *arg)
                           thread_work_probe_self_tid(),
                           memory_order_relaxed);
 
-    while (!g_stop) {
+    while (!connman_stop_requested(cm)) {
         atomic_store_explicit(&cm->message_last_progress_us,
                               platform_time_monotonic_us(),
                               memory_order_relaxed);
@@ -1992,7 +1993,7 @@ static void *thread_message_handler(void *arg)
             atomic_fetch_add_explicit(&cm->message_idle_waits, 1,
                                       memory_order_relaxed);
             zcl_mutex_lock(&cm->manager.msg_handler_mutex);
-            if (!g_stop)
+            if (!connman_stop_requested(cm))
                 (void)SleepConditionVariableCS(
                     &cm->manager.msg_handler_cond,
                     &cm->manager.msg_handler_mutex, 100);
@@ -2008,7 +2009,7 @@ static void *thread_message_handler(void *arg)
             atomic_fetch_add_explicit(&cm->message_idle_waits, 1,
                                       memory_order_relaxed);
             zcl_mutex_lock(&cm->manager.msg_handler_mutex);
-            if (!g_stop)
+            if (!connman_stop_requested(cm))
                 pthread_cond_timedwait(&cm->manager.msg_handler_cond,
                                        &cm->manager.msg_handler_mutex,
                                        &until);
@@ -2216,12 +2217,12 @@ bool connman_start(struct connman *cm)
         }
     }
 
-    g_stop = false;
+    connman_set_stop_requested(cm, false);
 
     if (thread_registry_spawn("zcl_dns_seed", thread_dns_seed, cm,
                                   &cm->dns_seed_thread) != 0) {
         perror("connman: thread_registry_spawn dns_seed");
-        g_stop = true;
+        connman_set_stop_requested(cm, true);
         LOG_FAIL("net", "thread_registry_spawn failed for dns_seed thread");
     }
     cm->dns_seed_thread_started = true;
@@ -2230,7 +2231,7 @@ bool connman_start(struct connman *cm)
     if (thread_registry_spawn("zcl_connman_sock", thread_socket_handler,
                                   cm, &cm->socket_thread) != 0) {
         perror("connman: thread_registry_spawn socket");
-        g_stop = true;
+        connman_set_stop_requested(cm, true);
         if (!connman_join(cm, CONNMAN_WORKER_JOIN_TIMEOUT_SECS))
             LOG_FAIL("net", "dns_seed thread did not stop after socket "
                             "thread spawn failure");
@@ -2246,7 +2247,7 @@ bool connman_start(struct connman *cm)
     if (thread_registry_spawn("zcl_connman_open", thread_open_connections,
                                   cm, &cm->open_thread) != 0) {
         perror("connman: thread_registry_spawn open");
-        g_stop = true;
+        connman_set_stop_requested(cm, true);
         if (!connman_join(cm, CONNMAN_WORKER_JOIN_TIMEOUT_SECS))
             LOG_FAIL("net", "connman workers did not stop after open thread "
                             "spawn failure");
@@ -2258,7 +2259,7 @@ bool connman_start(struct connman *cm)
     if (thread_registry_spawn("zcl_connman_msg", thread_message_handler,
                                   cm, &cm->message_thread) != 0) {
         perror("connman: thread_registry_spawn message");
-        g_stop = true;
+        connman_set_stop_requested(cm, true);
         if (!connman_join(cm, CONNMAN_WORKER_JOIN_TIMEOUT_SECS))
             LOG_FAIL("net", "connman workers did not stop after message "
                             "thread spawn failure");
@@ -2274,8 +2275,7 @@ bool connman_start(struct connman *cm)
 
 void connman_signal_stop(struct connman *cm)
 {
-    (void)cm;
-    g_stop = true;
+    connman_set_stop_requested(cm, true);
 }
 
 /* Registry completion makes the bounded wait portable. Clear ownership and

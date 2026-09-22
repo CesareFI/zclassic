@@ -560,8 +560,8 @@ size_t connman_gather_dial_candidates(struct connman *cm,
 #ifdef ZCL_TESTING
 /* Regression seam for the owned discovery-thread shutdown wait. A nominally
  * long cadence must observe connman_signal_stop() within one 100ms slice. */
-bool connman_wait_for_stop_for_test(int seconds);
-void connman_set_stop_for_test(bool stop);
+bool connman_wait_for_stop_for_test(struct connman *cm, int seconds);
+void connman_set_stop_for_test(struct connman *cm, bool stop);
 /* Pure form of the -connect idle gate. A pending chain-bound DHT hint must
  * keep the dialer awake even after every explicit addnode has a connection. */
 bool connman_connect_only_wait_needed_for_test(bool connect_only,

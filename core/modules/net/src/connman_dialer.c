@@ -567,7 +567,7 @@ static void connman_dial_batch(struct connman *cm,
     struct dial_inflight inflight[ZCL_DIAL_BATCH_MAX + 1];
     size_t nin = 0;
 
-    for (size_t i = 0; i < count && !g_stop; i++) {
+    for (size_t i = 0; i < count && !connman_stop_requested(cm); i++) {
         struct connman_dial_candidate *c = &batch[i];
         if (net_addr_is_tor(&c->addr.svc.addr))
             continue;                      /* second pass, below */
@@ -588,7 +588,7 @@ static void connman_dial_batch(struct connman *cm,
     }
 
     int64_t deadline_ms = platform_time_monotonic_ms() + DEFAULT_CONNECT_TIMEOUT;
-    while (nin > 0 && !g_stop) {
+    while (nin > 0 && !connman_stop_requested(cm)) {
         int64_t remaining = deadline_ms - platform_time_monotonic_ms();
         if (remaining <= 0)
             break;
@@ -637,7 +637,7 @@ static void connman_dial_batch(struct connman *cm,
      * blocking batch budget. A candidate finding it spent waits for the next
      * iteration without being dialed or charged. */
     int64_t onion_budget_ms = ONION_STREAM_CONNECT_TIMEOUT_MS;
-    for (size_t i = 0; i < count && !g_stop; i++) {
+    for (size_t i = 0; i < count && !connman_stop_requested(cm); i++) {
         struct connman_dial_candidate *c = &batch[i];
         if (!net_addr_is_tor(&c->addr.svc.addr))
             continue;
@@ -678,7 +678,7 @@ void *thread_open_connections(void *arg)
     atomic_store_explicit(&cm->dial_thread_tid, thread_work_probe_self_tid(),
                           memory_order_relaxed);
 
-    while (!g_stop) {
+    while (!connman_stop_requested(cm)) {
         atomic_store_explicit(&cm->dial_scheduler_last_progress_us,
                               platform_time_monotonic_us(),
                               memory_order_relaxed);

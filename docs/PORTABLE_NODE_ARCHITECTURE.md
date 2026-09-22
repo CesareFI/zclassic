@@ -196,8 +196,12 @@ shutdown exits unclean before releasing any network dependency. Process
 shutdown still escalates failures through a signal/`_exit` adapter. Those are
 the next bounded-shutdown and error-propagation inventory; they are not
 acceptable as the final Android lifecycle. The node also has process-global
-managers and scheduler instances, so a second in-process node is not presently
-supported.
+managers and scheduler instances, so a complete second in-process node is not
+presently supported. Connman cancellation itself is now instance-owned: its
+DNS, socket, dialer, message, and onion-seed paths all observe the owning
+`net_manager.stop_requested` atomic, including the onion fetch-race token. A
+deterministic regression proves stopping one connman neither stops nor poisons
+another instance in the same process.
 
 Android bionic does not provide glibc's `pthread_timedjoin_np`, and it also does
 not provide the cancellation mechanism used by the current Darwin emulation.
@@ -425,8 +429,11 @@ release runtime dependencies rather than falling through to `pthread_join`.
 The same contract now covers all four `connman` workers under one aggregate
 deadline, with pthread handles moved into the owning instance. A deterministic
 closed-gate regression proves timeout retention followed by a successful
-bounded retry. The dialer cancellation token remains process-global, so this is
-an ownership milestone rather than a complete multi-instance P2P lifecycle.
+bounded retry. The DNS, socket, dialer, message, and onion-seed loops now share
+the owning connman's atomic cancellation token rather than a process-global
+flag. This remains an ownership milestone rather than a complete multi-instance
+P2P lifecycle because peer telemetry, liveness records, bandwidth state, and
+other managers are still process-global.
 Signal/backtrace paths, unregistered raw thread creation, and other direct
 blocking subsystem joins remain known blockers.
 
@@ -504,8 +511,9 @@ chainstate, and no worker/socket use-after-free.
 - signal installation, backtrace/syscall diagnostics, daemon policy, and some
   `/proc` assumptions are still process/platform coupled.
 - the full node is not an independently owned `node_instance`; several global
-  managers and the P2P cancellation token prevent safe multiple create/destroy
-  cycles, although `connman` now owns its four pthread handles directly.
+  managers still prevent safe multiple create/destroy cycles, although
+  `connman` now owns its four pthread handles and cooperative cancellation
+  token directly.
 - storage ports do not yet cover every chainstate-critical store.
 - Tor, SQLite, cryptographic dependencies, and all generated artifacts need a
   pinned Android build profile.

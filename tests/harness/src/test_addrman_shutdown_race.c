@@ -137,6 +137,7 @@ static int test_mp_handle_addr_survives_torndown_addrman(void)
 }
 
 struct discovery_wait_ctx {
+    struct connman *cm;
     _Atomic bool observed_stop;
 };
 
@@ -144,7 +145,7 @@ static void *discovery_wait_worker(void *arg)
 {
     struct discovery_wait_ctx *ctx = arg;
     atomic_store(&ctx->observed_stop,
-                 connman_wait_for_stop_for_test(2));
+                 connman_wait_for_stop_for_test(ctx->cm, 2));
     return NULL;
 }
 
@@ -156,19 +157,29 @@ static int test_connman_discovery_wait_is_interruptible(void)
 {
     int failures = 0;
     TEST("addrman_shutdown_race: discovery cadence observes stop promptly") {
-        struct discovery_wait_ctx ctx;
+        struct connman cm = {0}, other = {0};
+        atomic_init(&cm.manager.stop_requested, false);
+        atomic_init(&other.manager.stop_requested, false);
+        struct discovery_wait_ctx ctx = { .cm = &cm };
         atomic_init(&ctx.observed_stop, false);
-        connman_set_stop_for_test(false);
+        connman_set_stop_for_test(&cm, false);
+
+        /* Cancellation belongs to one connman: stopping this instance must
+         * not poison another node that shares the process. */
+        connman_signal_stop(&cm);
+        ASSERT(connman_wait_for_stop_for_test(&cm, 0));
+        ASSERT(!connman_wait_for_stop_for_test(&other, 0));
+        connman_set_stop_for_test(&cm, false);
 
         int64_t start_us = platform_time_monotonic_us();
         pthread_t thread;
         ASSERT(pthread_create(&thread, NULL, discovery_wait_worker, &ctx) == 0);
         usleep(50000);
-        connman_signal_stop(NULL);
+        connman_signal_stop(&cm);
         ASSERT(pthread_join(thread, NULL) == 0);
         int64_t elapsed_us = platform_time_monotonic_us() - start_us;
         bool observed_stop = atomic_load(&ctx.observed_stop);
-        connman_set_stop_for_test(false);
+        connman_set_stop_for_test(&cm, false);
 
         /* Stop-aware wait must return promptly; the 500 ms ceiling scales
          * with measured host load so a busy lane does not flake the verdict
