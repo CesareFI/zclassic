@@ -772,3 +772,7 @@ later lane flips it HARD.
 - 2026-09-21T19:21:03Z — REASON: preserve reconnect yield diversity through normal peer churn
   old ROOT: 0a85aad7ace1bf4287e3625738f78c82d6b31fcccb0bce7d2e5b74267feaae8a
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-22T12:58:59Z — REASON: avoid snapshot chunk use after unavailable swarm mutex
+  old ROOT: d7e5c6b707e5af9506709f5e6b81bf8bd2a98116de07aa05de63ef9163896843
+  by: owner unseal ritual (make core-unseal)

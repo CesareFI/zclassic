@@ -2138,10 +2138,10 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
 
                     if (parse_ok) {
                         if (!swarm_mutex_lock()) {
-                            free(chunk);
+                            (void)swarm_requeue_peer_chunk(node, chunk_index);
                             LOG_FAIL("net", "rejecting snapshot chunk: "
                                              "swarm mutex unavailable");
-                        }
+                        } else {
                         bool verified = swarm_sync_receive_chunk(
                             &g_swarm, chunk, node->id);
                         swarm_clear_matching_peer_chunk(node, chunk_index);
@@ -2191,6 +2191,7 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                             swarm_mutex_unlock();
                         } else {
                             swarm_mutex_unlock();
+                        }
                         }
                     } else {
                         (void)swarm_requeue_peer_chunk(node, chunk_index);
