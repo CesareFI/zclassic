@@ -2711,3 +2711,32 @@ The strict all-groups profile remains unrun because its fuzz/sanitizer build
 would consume the disk headroom reserved for safe isolated node validation.
 Remaining risk: use bounded isolated IBD telemetry before attempting any
 adaptive policy.
+
+## Header-range target-growth ownership preservation
+
+Baseline and root cause: every header scheduling tick replans against the
+highest live advertised height. When that target grew, the final in-flight span
+changed only its upper endpoint, yet exact-endpoint carry-over discarded its
+live owner. A subsequent tick could assign the extended span and queue an
+overlapping `getheaders` request before the first response arrived.
+
+Fix and after-result: exact spans still carry all state. A live, incomplete
+span whose low anchor is unchanged and whose high endpoint only grows now
+carries its owner and deadline into the extended tail. Completed spans never
+carry across an extension, so newly added heights remain schedulable. Shrinking
+or changing a low anchor still drops obsolete work as before.
+
+Regression proof: the pure scheduler first assigns both checkpoint spans,
+extends only the target, and proves the tail owner remains live at the new
+endpoint and cannot receive a second assignment. It failed before the change.
+`test_header_range_sched` and wire-facing `test_process_headers_adversarial`
+pass.
+
+Consensus impact: NONE. This only preserves volatile `getheaders` ownership;
+header parsing, checkpoints, PoW, header/block/transaction validity, chain
+selection, serialization, and cryptographic checks are unchanged. Worldstream
+`3b9205df0` records live pruning and has no overlap. Remaining risk: perform
+isolated IBD observation of target churn before considering adaptive range
+policy. The complexity ratchet, consensus-parity check, capability inventory,
+and whitespace gate pass. The strict all-groups profile remains unrun because
+its fuzz/sanitizer build would consume the isolated-node disk reserve.

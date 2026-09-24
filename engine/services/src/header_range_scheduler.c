@@ -137,10 +137,12 @@ void hrs_reset(struct header_range_scheduler *s)
     zcl_mutex_unlock(&s->lock);
 }
 
-/* Carry a matching prior span's assignment onto a freshly-partitioned one.
- * Matching key is [lo, hi]: checkpoint anchors are process-stable, so a
- * span that keeps the same endpoints across a re-plan is the same work
- * unit and must retain its in-flight peer/deadline (or completed flag). */
+/* Carry a prior span's state onto a freshly-partitioned one.  Exact endpoints
+ * preserve all state.  A growing target changes only the final high endpoint:
+ * its live request remains the same logical work and must keep ownership, or
+ * the next planning tick can queue an overlapping getheaders request before
+ * that response arrives.  Completed spans never carry across an extension:
+ * the added suffix is still unsynced work. */
 static void carry_over_assignment(struct hrs_span *dst,
                                   const struct hrs_span *old, size_t n_old)
 {
@@ -148,6 +150,13 @@ static void carry_over_assignment(struct hrs_span *dst,
         if (old[i].lo == dst->lo && old[i].hi == dst->hi) {
             dst->assigned = old[i].assigned;
             dst->completed = old[i].completed;
+            dst->peer_id = old[i].peer_id;
+            dst->deadline_us = old[i].deadline_us;
+            return;
+        }
+        if (old[i].lo == dst->lo && old[i].hi < dst->hi &&
+            old[i].assigned && !old[i].completed) {
+            dst->assigned = true;
             dst->peer_id = old[i].peer_id;
             dst->deadline_us = old[i].deadline_us;
             return;

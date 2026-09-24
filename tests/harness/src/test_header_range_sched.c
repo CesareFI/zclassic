@@ -205,6 +205,30 @@ static int test_gap_saturates_untrusted_peer_height(void)
     return failures;
 }
 
+static int test_target_growth_retains_live_tail_owner(void)
+{
+    printf("header_range_sched: target growth retains live tail owner... ");
+    struct header_range_scheduler s = {0};
+    hrs_init(&s, 30 * 1000000);
+    int32_t anchors[] = {50000};
+    int64_t now = 1000 * 1000000LL;
+    hrs_plan(&s, 0, 100000, anchors, 1);
+    bool ok = hrs_assign(&s, 11, now) >= 0;
+    ok = ok && hrs_assign(&s, 22, now) >= 0;
+
+    /* A higher advertisement extends the tail.  The already-sent request
+     * still owns that logical range: dropping it would allow a second
+     * getheaders request to overlap the first response. */
+    hrs_plan(&s, 0, 120000, anchors, 1);
+    int32_t lo, hi;
+    ok = ok && hrs_peer_span(&s, 22, now, &lo, &hi);
+    ok = ok && lo == 50000 && hi == 120000;
+    ok = ok && hrs_assign(&s, 22, now) < 0;
+    hrs_reset(&s);
+    if (ok) printf("OK\n"); else printf("FAIL\n");
+    return ok ? 0 : 1;
+}
+
 int test_header_range_sched(void)
 {
     int failures = 0;
@@ -405,7 +429,10 @@ int test_header_range_sched(void)
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 
-    /* ── 7. Global instance + reset seam ─────────────────────────── */
+    /* ── 7. Extending a target retains its live tail owner ────────── */
+    failures += test_target_growth_retains_live_tail_owner();
+
+    /* ── 8. Global instance + reset seam ─────────────────────────── */
     printf("header_range_sched: global instance reset seam... ");
     {
         header_range_scheduler_reset_for_testing();
@@ -419,7 +446,7 @@ int test_header_range_sched(void)
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 
-    /* ── 8. Cross-peer sweep demotion (net-wiring defect regression) ── */
+    /* ── 9. Cross-peer sweep demotion (net-wiring defect regression) ── */
     printf("header_range_sched: one peer's tick sweeps ANOTHER peer's "
            "expired span... ");
     {
