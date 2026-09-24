@@ -765,6 +765,8 @@ static bool rpc_getpeerinfo(const struct json_value *params, bool help,
             (int64_t)swarm_delivered);
         json_push_kv_int(&entry, "block_swarm_pieces_timed_out",
             (int64_t)atomic_load(&node->blk_pieces_timed_out));
+        json_push_kv_int(&entry, "block_swarm_pieces_unrequested",
+            (int64_t)atomic_load(&node->blk_pieces_unrequested));
         json_push_kv_int(&entry, "block_swarm_avg_delivery_us",
             swarm_delivered > 0
                 ? (int64_t)(swarm_delivery_us / swarm_delivered) : 0);

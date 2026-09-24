@@ -2601,3 +2601,47 @@ serialization, block/transaction validity, PoW, and chain selection are
 unchanged. Worldstream `d9f5153be` remains complementary startup/recovery
 work. Remaining risk: measure sustained high-churn useful delivery and timeout
 ratios before considering any adaptive scheduler policy.
+
+## Block-swarm response observability and sole-source reconnect recovery
+
+Baseline and root cause: `getpeerinfo` exposed block-swarm requested,
+delivered, timed-out, and mean-delivery fields, but a duplicate, unsolicited,
+or reassigned `zblkdata` response was only logged at the pre-parse ownership
+gate. Operators could not distinguish useful delivery from stale response
+traffic. The same ownership regression exposed a separate scheduler gap: a
+disconnect recorded a one-second reconnect yield even when no same-generation
+source remained, so every released piece could sit idle despite one eligible
+peer being ready.
+
+Fix and after-result: the existing pre-parse ownership refusal now increments
+a bounded per-peer unrequested-response counter, exported as
+`block_swarm_pieces_unrequested`. No parsing, scoring, assignment, integrity
+check, or reducer-admission decision changed. Reconnect yield now applies only
+when the node manager reports another live, handshaken ZCL23 peer admitted to
+the same manifest generation; without one, the disconnected peer's reclaimed
+batch is immediately schedulable. Candidate lifetime is held by `cs_nodes`
+before the swarm mutex is taken, avoiding nested lock inversion.
+
+Regression proof: direct wire coverage proves duplicate delivery increments
+the counter once, a late response after reassignment increments it again, and
+neither reaches block intake. The sync diagnostic RPC fixture verifies the new
+field. The block-swarm loopback registers its synthetic peers with the node
+manager, proves a healthy alternate still receives the yield first, and proves
+the sole connected source immediately reclaims both pieces released during
+payload submission. `test_block_swarm_loopback` and `test_syncdiag_rpc` pass.
+Core seal, core-seal verification, consensus parity, cyclomatic complexity,
+capability inventory, and whitespace checks pass. `make lint` is blocked by
+the pre-existing local `check-git-hooks-installed` and `check-tor-full-default`
+environment gates; no lint finding concerns this slice. The broader strict
+`test-parallel --no-cache` build was intentionally interrupted before tests ran
+when its fuzz/sanitizer prerequisites reduced free disk from 13 GB to 12 GB,
+approaching the 10 GB repository safety floor. It is unrun, not passed.
+
+Consensus impact: NONE. This changes volatile peer diagnostics and bounded
+request scheduling only; manifest and payload verification, reducer admission,
+serialization, block/transaction validity, PoW, chain selection, and all
+cryptographic checks remain unchanged. Worldstream `396049072` is storage and
+reindex cleanup work, with no overlap. Remaining risk: use the new outcome
+counter during a bounded isolated IBD observation before considering any
+latency-adaptive policy; next investigate whether snapshot chunk responses
+need equivalent rejected-response observability.

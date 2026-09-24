@@ -571,6 +571,7 @@ struct p2p_node {
     _Atomic uint_least64_t blk_pieces_requested;
     _Atomic uint_least64_t blk_pieces_delivered;
     _Atomic uint_least64_t blk_pieces_timed_out;
+    _Atomic uint_least64_t blk_pieces_unrequested;
     _Atomic uint_least64_t blk_piece_delivery_us;
     uint8_t *blk_bitmap;          /* peer's piece availability bitmap (heap) */
     uint32_t blk_bitmap_len;      /* bytes in bitmap */

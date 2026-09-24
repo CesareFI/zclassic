@@ -776,3 +776,11 @@ later lane flips it HARD.
 - 2026-09-22T12:58:59Z — REASON: avoid snapshot chunk use after unavailable swarm mutex
   old ROOT: d7e5c6b707e5af9506709f5e6b81bf8bd2a98116de07aa05de63ef9163896843
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-24T20:42:30Z — REASON: Expose bounded block-swarm rejected-response outcomes so peer delivery, timeout, and unowned-response behavior can be measured without changing scheduling or validation
+  old ROOT: ef374357705b9324b058f0e5f47e2d870be4792c33d5e669e385ffd319f4502e
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-24T21:00:41Z — REASON: Let an isolated block-swarm source reclaim disconnect-released pieces immediately while retaining reconnect diversity whenever a same-generation alternate peer is live
+  old ROOT: e4eb4f4606aa709164740179154d984b4cd35fa5540374678c06d34d34a14007
+  by: owner unseal ritual (make core-unseal)

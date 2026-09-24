@@ -96,6 +96,8 @@ void mp_snapshot_test_age_peer_chunk(struct p2p_node *node,
 void mp_block_swarm_test_seed_stall(uint32_t complete, uint32_t total,
                                     int64_t last_complete_monotonic);
 bool mp_block_swarm_test_admit_peer(struct p2p_node *node);
+void mp_block_swarm_test_record_reconnect_yield(
+    const struct p2p_node *node, int64_t now_monotonic);
 bool mp_block_swarm_test_requeue_peer_piece(struct p2p_node *node,
                                              uint32_t piece_index);
 int32_t mp_block_swarm_test_assign_orphan_piece(struct p2p_node *node);
@@ -1121,11 +1123,17 @@ static int test_snapshot_reconnect_yield_table_capacity(void)
         }
 
         ASSERT(mp_snapshot_test_start_swarm(&manifest));
+        /* First give every source a live chunk. A burst means all sources
+         * were active before terminal cleanup; assigning a later source after
+         * an earlier disconnect legitimately consumes that earlier source's
+         * one-opportunity yield and is not a table-capacity test. */
         for (size_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++) {
             ASSERT(mp_snapshot_test_admit_peer(old[i]));
             ASSERT(mp_snapshot_test_admit_peer(replacement[i]));
             mp_snapshot_send_tick(&mp, old[i]);
             ASSERT(old[i]->swarm_inflight_chunk >= 0);
+        }
+        for (size_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++) {
             ASSERT(mp_snapshot_swarm_peer_disconnected(old[i]) == 1);
         }
 
@@ -1951,6 +1959,13 @@ static int test_block_swarm_reconnect_yield(void)
         struct p2p_node *healthy = bs_make_peer(&nm, 32);
         struct p2p_node *reconnect = bs_make_peer(&nm, 31);
         ASSERT(old_source && healthy && reconnect);
+        nm.nodes = zcl_calloc(3, sizeof(*nm.nodes),
+                              "bs_reconnect_nodes");
+        ASSERT(nm.nodes != NULL);
+        nm.nodes[0] = old_source;
+        nm.nodes[1] = healthy;
+        nm.nodes[2] = reconnect;
+        nm.num_nodes = nm.nodes_cap = 3;
         old_source->id = 31;
         healthy->id = 32;
         reconnect->id = 33;
@@ -1993,9 +2008,6 @@ static int test_block_swarm_reconnect_yield(void)
         old_source->send_head = old_source->send_tail = NULL;
         healthy->send_head = healthy->send_tail = NULL;
         reconnect->send_head = reconnect->send_tail = NULL;
-        p2p_node_free(old_source);
-        p2p_node_free(healthy);
-        p2p_node_free(reconnect);
         net_manager_free(&nm);
         main_state_free(&ms);
         PASS();
@@ -2040,14 +2052,25 @@ static int test_block_swarm_reconnect_yield_table_capacity(void)
         }
         struct p2p_node *replacement = bs_make_peer(&nm, 160);
         ASSERT(replacement != NULL);
+        nm.nodes = zcl_calloc(BS_RECONNECT_CHURN_SOURCES + 1,
+                              sizeof(*nm.nodes), "bs_capacity_nodes");
+        ASSERT(nm.nodes != NULL);
+        for (size_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++)
+            nm.nodes[i] = old[i];
+        nm.nodes[BS_RECONNECT_CHURN_SOURCES] = replacement;
+        nm.num_nodes = nm.nodes_cap = BS_RECONNECT_CHURN_SOURCES + 1;
         replacement->blk_peer_height = end_height;
 
         mp_block_swarm_test_seed_stall(0, pieces, 1);
+        int64_t yield_now = platform_time_monotonic_us() / 1000000;
         for (size_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++) {
             ASSERT(mp_block_swarm_test_admit_peer(old[i]));
-            mp_snapshot_send_tick(&mp, old[i]);
-            ASSERT(atomic_load(&old[i]->blk_pieces_requested) == batch);
-            ASSERT(mp_block_swarm_peer_disconnected(old[i]) == batch);
+            /* The fixed contiguous window admits only four 64-piece owners,
+             * so 33 terminal owners cannot coexist in the public scheduler.
+             * Exercise the same bounded terminal-yield primitive directly to
+             * prove its capacity rather than pretending sequential requests
+             * are a simultaneous churn burst. */
+            mp_block_swarm_test_record_reconnect_yield(old[i], yield_now);
         }
 
         ASSERT(mp_block_swarm_test_admit_peer(replacement));
@@ -2055,9 +2078,6 @@ static int test_block_swarm_reconnect_yield_table_capacity(void)
         ASSERT(atomic_load(&replacement->blk_pieces_requested) == 0);
 
         mp_block_swarm_test_seed_stall(0, 0, 0);
-        for (size_t i = 0; i < BS_RECONNECT_CHURN_SOURCES; i++)
-            p2p_node_free(old[i]);
-        p2p_node_free(replacement);
         net_manager_free(&nm);
         main_state_free(&ms);
         PASS();
@@ -2524,6 +2544,7 @@ static int test_block_swarm_duplicate_delivery(void)
         ASSERT(mp_block_swarm_is_active());
         ASSERT(bs_deliver(&mp_b, b_node, &kept[0], params->pchMessageStart));
         ASSERT(mp_block_swarm_is_active());   /* would be freed on double-credit */
+        ASSERT(atomic_load(&b_node->blk_pieces_unrequested) == 1);
 
         /* The genuine second piece completes the swarm. */
         ASSERT(bs_deliver(&mp_b, b_node, &kept[1], params->pchMessageStart));
@@ -2562,6 +2583,7 @@ static int test_block_swarm_duplicate_delivery(void)
         ASSERT(bs_deliver(&mp_b, b_node, &kept[0],
                           params->pchMessageStart));
         ASSERT(sink.blocks == blocks_before_stale);
+        ASSERT(atomic_load(&b_node->blk_pieces_unrequested) == 2);
         mp_snapshot_send_tick(&mp_b, b_node);
         ASSERT(bs_queue_depth(sent_b) == 1);
         bs_drop_queue(b_node, sent_b);
@@ -2581,6 +2603,9 @@ static int test_block_swarm_duplicate_delivery(void)
         ASSERT(mp_block_swarm_is_active());
         ASSERT(mp_block_swarm_test_admit_peer(b_node));
         mp_snapshot_send_tick(&mp_b, b_node);
+        /* No same-generation alternate source is connected to B. Reconnect
+         * diversity must not leave its reclaimed pieces idle for the yield
+         * interval; both immediately return to the sole eligible source. */
         ASSERT(bs_queue_depth(sent_b) == 2);
         bs_drop_queue(b_node, sent_b);
         mp_block_swarm_test_seed_stall(0, 0, 0);

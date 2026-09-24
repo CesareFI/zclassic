@@ -570,6 +570,7 @@ static bool block_swarm_peer_response_allowed(
     }
     pthread_mutex_unlock(&g_block_swarm_mutex);
     if (!requested) {
+        atomic_fetch_add(&node->blk_pieces_unrequested, 1);
         printf("Peer %s: %s zblkdata piece=%u\n", node->addr_name,
                admitted ? "unsolicited" : "inactive", piece_index);
     }
@@ -775,6 +776,35 @@ static bool block_swarm_peer_admitted(struct p2p_node *node)
         node->blk_manifest_admitted_generation == g_block_swarm_generation;
     pthread_mutex_unlock(&g_block_swarm_mutex);
     return admitted;
+}
+
+/* Reconnect fairness only helps when another current-generation source can
+ * receive the released work. Do not make a sole surviving source idle for
+ * the yield interval: its disconnect cleanup already returned the pieces to
+ * the bounded scheduler. cs_nodes stabilizes candidate lifetime; this runs
+ * before taking g_block_swarm_mutex, preserving the no-nested-lock pattern. */
+static bool block_swarm_has_alternate_source(
+    const struct msg_processor *mp, const struct p2p_node *node)
+{
+    if (!mp || !mp->net_mgr || !node)
+        return true; /* retain the conservative yield without peer authority */
+
+    bool alternate = false;
+    uint64_t generation = node->blk_manifest_admitted_generation;
+    zcl_mutex_lock(&mp->net_mgr->cs_nodes);
+    for (size_t i = 0; i < mp->net_mgr->num_nodes; i++) {
+        const struct p2p_node *candidate = mp->net_mgr->nodes[i];
+        if (candidate && candidate != node && !candidate->disconnect &&
+            candidate->state >= PEER_HANDSHAKE_COMPLETE &&
+            peer_supports_fast_sync(candidate->services) &&
+            candidate->blk_manifest_received &&
+            candidate->blk_manifest_admitted_generation == generation) {
+            alternate = true;
+            break;
+        }
+    }
+    zcl_mutex_unlock(&mp->net_mgr->cs_nodes);
+    return alternate;
 }
 
 /* Caller holds g_block_swarm_mutex. Release both local slots and any bounded
@@ -1241,6 +1271,17 @@ bool mp_block_swarm_test_admit_peer(struct p2p_node *node)
         g_block_swarm_generation : 0;
     pthread_mutex_unlock(&g_block_swarm_mutex);
     return admitted;
+}
+
+void mp_block_swarm_test_record_reconnect_yield(
+    const struct p2p_node *node, int64_t now_monotonic)
+{
+    if (!node)
+        return;
+    pthread_mutex_lock(&g_block_swarm_mutex);
+    if (atomic_load(&g_block_swarm_active))
+        block_swarm_record_reconnect_yield_locked(node, now_monotonic);
+    pthread_mutex_unlock(&g_block_swarm_mutex);
 }
 
 bool mp_block_swarm_test_requeue_peer_piece(struct p2p_node *node,
@@ -2728,6 +2769,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
         block_swarm_peer_admitted(node) &&
         node->state >= PEER_HANDSHAKE_COMPLETE) {
 
+        bool alternate_source = block_swarm_has_alternate_source(mp, node);
+
         pthread_mutex_lock(&g_block_swarm_mutex);
 
         /* Handle timeouts on this peer's pipeline */
@@ -2737,8 +2780,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
                 &g_block_swarm, node, now_bs);
         reconciled.timed_out |= block_swarm_timeout_yield_active(node,
                                                                   now_bs);
-        reconciled.timed_out |= block_swarm_reconnect_yield_active_locked(
-            node, now_bs);
+        reconciled.timed_out |= alternate_source &&
+            block_swarm_reconnect_yield_active_locked(node, now_bs);
         /* Give exact-owner reconciliation the first timeout window. A global
          * sweep at the same deadline let an earlier peer in connman's fixed
          * order expire another peer's pieces before that owner ran, losing

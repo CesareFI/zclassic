@@ -944,6 +944,7 @@ static bool sd_reachability_setup(struct sd_reach_ctx *ctx)
         atomic_store(&outbound->blk_pieces_requested, 7);
         atomic_store(&outbound->blk_pieces_delivered, 4);
         atomic_store(&outbound->blk_pieces_timed_out, 2);
+        atomic_store(&outbound->blk_pieces_unrequested, 3);
         atomic_store(&outbound->blk_piece_delivery_us, 1000);
     }
     if (ok) {
@@ -1148,6 +1149,8 @@ static bool sd_reachability_peerinfo_swarm(const struct json_value *peer,
          json_get_int(json_get(peer, "block_swarm_pieces_delivered")) == 4;
     ok = ok && peer &&
          json_get_int(json_get(peer, "block_swarm_pieces_timed_out")) == 2;
+    ok = ok && peer &&
+         json_get_int(json_get(peer, "block_swarm_pieces_unrequested")) == 3;
     ok = ok && peer &&
          json_get_int(json_get(peer, "block_swarm_avg_delivery_us")) == 250;
     return ok;
