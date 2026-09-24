@@ -2645,3 +2645,35 @@ reindex cleanup work, with no overlap. Remaining risk: use the new outcome
 counter during a bounded isolated IBD observation before considering any
 latency-adaptive policy; next investigate whether snapshot chunk responses
 need equivalent rejected-response observability.
+
+## Snapshot chunk response observability
+
+Baseline and root cause: the direct `zchunkdata` fixture already proved that
+truncated, unsolicited, duplicate, and late responses preserve chunk ownership
+and fail closed. The peer RPC exposed no outcome counters, however, so an
+operator could not distinguish a quiet source from one producing rejected
+snapshot traffic during bootstrap.
+
+Fix and after-result: each peer now exposes bounded atomic
+`snapshot_chunks_accepted` and `snapshot_chunks_rejected` values through
+`getpeerinfo`. The receive path records its outcome only after the existing
+parser/ownership/hash decision: malformed headers, inactive swarms, truncated
+payloads, and rejected owner/hash responses increment rejected; verified chunk
+completion increments accepted. Local allocation and mutex failures are not
+misrepresented as remote rejections. No request, ownership, scoring,
+validation, or reducer branch reads the counters.
+
+Regression proof: the real-wire snapshot fixture proves exact per-peer totals
+across truncated, unsolicited, accepted, duplicate, and late responses. The
+sync diagnostic RPC fixture verifies both fields. `test_block_swarm_loopback`
+and `test_syncdiag_rpc` pass.
+
+Consensus impact: NONE. This is bounded process-local observability only;
+snapshot proof/hash checks, requeue behavior, reducer admission, block and
+transaction validity, PoW, chain selection, and cryptographic checks are
+unchanged. Worldstream `396049072` remains storage/reindex cleanup with no
+overlap. `check-core-seal`, consensus-parity, and the complexity ratchet pass.
+The strict all-groups profile remains unrun: its fuzz/sanitizer prerequisite
+would consume the disk headroom needed for safe isolated node validation.
+Remaining risk: inspect isolated IBD outcome ratios before any scheduler
+adaptation.

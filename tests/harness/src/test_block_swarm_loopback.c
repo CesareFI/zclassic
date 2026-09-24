@@ -714,6 +714,8 @@ static int test_snapshot_chunk_wire_adversarial(void)
         ASSERT(ok);
         ASSERT(peer_a->swarm_inflight_chunk == -1);
         ASSERT(bs_snapshot_state(0, CHUNK_NEEDED, -1, 0, 0));
+        ASSERT(atomic_load(&peer_a->swarm_chunks_rejected) == 1);
+        ASSERT(atomic_load(&peer_a->swarm_chunks_accepted) == 0);
 
         mp_snapshot_send_tick(&mp, peer_b);
         ASSERT(peer_b->swarm_inflight_chunk == 0);
@@ -731,6 +733,7 @@ static int test_snapshot_chunk_wire_adversarial(void)
         ASSERT(peer_a->swarm_inflight_chunk == 1);
         ASSERT(bs_snapshot_state(0, CHUNK_INFLIGHT, peer_b->id, 2, 0));
         ASSERT(bs_snapshot_state(1, CHUNK_INFLIGHT, peer_a->id, 2, 0));
+        ASSERT(atomic_load(&peer_a->swarm_chunks_rejected) == 2);
 
         ASSERT(bs_push_chunk_frame(peer_b, params, 0, 0));
         ASSERT(bs_pump(peer_b, sent_b, &mp, peer_b,
@@ -738,24 +741,28 @@ static int test_snapshot_chunk_wire_adversarial(void)
         ASSERT(ok);
         ASSERT(peer_b->swarm_inflight_chunk == -1);
         ASSERT(bs_snapshot_state(0, CHUNK_COMPLETE, peer_b->id, 1, 1));
+        ASSERT(atomic_load(&peer_b->swarm_chunks_accepted) == 1);
 
         ASSERT(bs_push_chunk_frame(peer_b, params, 0, 0));
         ASSERT(bs_pump(peer_b, sent_b, &mp, peer_b,
                        params->pchMessageStart, &ok) > 0);
         ASSERT(ok);
         ASSERT(bs_snapshot_state(0, CHUNK_COMPLETE, peer_b->id, 1, 1));
+        ASSERT(atomic_load(&peer_b->swarm_chunks_rejected) == 1);
 
         ASSERT(bs_push_chunk_frame(peer_a, params, 1, 1));
         ASSERT(bs_pump(peer_a, sent_a, &mp, peer_a,
                        params->pchMessageStart, &ok) > 0);
         ASSERT(ok);
         ASSERT(bs_snapshot_state(1, CHUNK_NEEDED, -1, 0, 1));
+        ASSERT(atomic_load(&peer_a->swarm_chunks_rejected) == 3);
 
         ASSERT(bs_push_chunk_frame(peer_b, params, 1, 0));
         ASSERT(bs_pump(peer_b, sent_b, &mp, peer_b,
                        params->pchMessageStart, &ok) > 0);
         ASSERT(ok);
         ASSERT(bs_snapshot_state(1, CHUNK_NEEDED, -1, 0, 1));
+        ASSERT(atomic_load(&peer_b->swarm_chunks_rejected) == 2);
 
         mp_snapshot_test_stop_swarm();
         send_segment_free(sent_a);

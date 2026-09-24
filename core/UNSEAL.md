@@ -784,3 +784,15 @@ later lane flips it HARD.
 - 2026-09-24T21:00:41Z — REASON: Let an isolated block-swarm source reclaim disconnect-released pieces immediately while retaining reconnect diversity whenever a same-generation alternate peer is live
   old ROOT: e4eb4f4606aa709164740179154d984b4cd35fa5540374678c06d34d34a14007
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-24T21:20:47Z — REASON: Expose bounded snapshot chunk accepted and rejected response outcomes so bootstrap stalls and malformed or late zchunkdata can be diagnosed without changing validation or scheduling
+  old ROOT: 0614530c6440a2417d63493755408f92879ba6927a30a9fb649feee1907e58f9
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-24T21:25:21Z — REASON: Refactor snapshot outcome telemetry into existing completion branches to preserve the enforced cyclomatic complexity ratchet without changing behavior
+  old ROOT: de24150f05acf96d0bb1deca600a7758afc92121ac603721a8b7353bc0ef9596
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-09-24T21:27:30Z — REASON: Extract the existing block-swarm reconnect-yield boolean from the hot scheduler to restore the cyclomatic complexity ratchet without changing scheduling behavior
+  old ROOT: 55d5a92155163c118eef6fa9db0a11817558760d3bd214696ae5b8bd4c2b17c8
+  by: owner unseal ritual (make core-unseal)

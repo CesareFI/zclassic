@@ -276,6 +276,19 @@ static void swarm_requeue_known_peer_chunk(struct p2p_node *node,
         (void)swarm_requeue_peer_chunk(node, chunk_index);
 }
 
+/* Parser outcome telemetry is deliberately observation-only: malformed,
+ * late, duplicate, and unowned answers still follow their existing recovery
+ * and scoring paths. */
+static void swarm_note_chunk_outcome(struct p2p_node *node, bool accepted)
+{
+    if (!node)
+        return;
+    if (accepted)
+        atomic_fetch_add(&node->swarm_chunks_accepted, 1);
+    else
+        atomic_fetch_add(&node->swarm_chunks_rejected, 1);
+}
+
 /* Caller holds g_swarm_mutex. A peer that loses manifest admission must not
  * retain an owned chunk until timeout. The global table is authoritative, so
  * the bounded fallback scan also repairs a missing peer-local hint. */
@@ -515,6 +528,14 @@ static bool block_swarm_reconnect_yield_active_locked(
             return true;
     }
     return false;
+}
+
+static bool block_swarm_reconnect_yield_blocks(
+    const struct p2p_node *node, bool alternate_source,
+    int64_t now_monotonic)
+{
+    return alternate_source &&
+        block_swarm_reconnect_yield_active_locked(node, now_monotonic);
 }
 
 /* Caller holds g_block_swarm_mutex. */
@@ -2136,9 +2157,11 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
             if (!entry_count_ok || num_entries > 1000) {
                 swarm_requeue_known_peer_chunk(
                     node, chunk_index_ok, chunk_index);
+                swarm_note_chunk_outcome(node, false);
                 printf("Peer %s: bad zchunkdata header\n", node->addr_name);
                 peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_PAYLOAD, "bad zchunkdata");
             } else if (!g_swarm_active) {
+                swarm_note_chunk_outcome(node, false);
                 printf("Peer %s: zchunkdata but no swarm active\n",
                        node->addr_name);
             } else {
@@ -2188,12 +2211,14 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                         swarm_clear_matching_peer_chunk(node, chunk_index);
 
                         if (!verified) {
+                            swarm_note_chunk_outcome(node, false);
                             swarm_mutex_unlock();
                             fprintf(stderr, "Peer %s: chunk %u failed verification\n",  // obs-ok:helper-context-logged
                                    node->addr_name, chunk_index);
                             peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_CHUNK,
                                                 "bad chunk hash");
                         } else if (swarm_sync_is_complete(&g_swarm)) {
+                            swarm_note_chunk_outcome(node, true);
                             printf("Swarm sync complete: %u/%u chunks\n",
                                    g_swarm.chunks_complete,
                                    g_swarm.manifest.num_chunks);
@@ -2231,11 +2256,13 @@ bool mp_handle_zcl23_sync(struct msg_processor *mp,
                             atomic_store(&g_swarm_active, false);
                             swarm_mutex_unlock();
                         } else {
+                            swarm_note_chunk_outcome(node, true);
                             swarm_mutex_unlock();
                         }
                         }
                     } else {
                         (void)swarm_requeue_peer_chunk(node, chunk_index);
+                        swarm_note_chunk_outcome(node, false);
                         printf("Peer %s: truncated zchunkdata\n",
                                node->addr_name);
                         peer_scoring_record(mp->net_mgr, node, PEER_OFFENCE_INVALID_PAYLOAD,
@@ -2780,8 +2807,8 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
                 &g_block_swarm, node, now_bs);
         reconciled.timed_out |= block_swarm_timeout_yield_active(node,
                                                                   now_bs);
-        reconciled.timed_out |= alternate_source &&
-            block_swarm_reconnect_yield_active_locked(node, now_bs);
+        reconciled.timed_out |= block_swarm_reconnect_yield_blocks(
+            node, alternate_source, now_bs);
         /* Give exact-owner reconciliation the first timeout window. A global
          * sweep at the same deadline let an earlier peer in connman's fixed
          * order expire another peer's pieces before that owner ran, losing

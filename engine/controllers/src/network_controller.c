@@ -755,6 +755,10 @@ static bool rpc_getpeerinfo(const struct json_value *params, bool help,
                           (int64_t)node->misbehavior);
         json_push_kv_int(&entry, "blocks_received",
                           (int64_t)node->blocks_received);
+        json_push_kv_int(&entry, "snapshot_chunks_accepted",
+            (int64_t)atomic_load(&node->swarm_chunks_accepted));
+        json_push_kv_int(&entry, "snapshot_chunks_rejected",
+            (int64_t)atomic_load(&node->swarm_chunks_rejected));
         uint64_t swarm_delivered =
             atomic_load(&node->blk_pieces_delivered);
         uint64_t swarm_delivery_us =
