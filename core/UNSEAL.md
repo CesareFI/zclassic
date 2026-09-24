@@ -796,3 +796,7 @@ later lane flips it HARD.
 - 2026-09-24T21:27:30Z — REASON: Extract the existing block-swarm reconnect-yield boolean from the hot scheduler to restore the cyclomatic complexity ratchet without changing scheduling behavior
   old ROOT: 55d5a92155163c118eef6fa9db0a11817558760d3bd214696ae5b8bd4c2b17c8
   by: owner unseal ritual (make core-unseal)
+
+- 2026-09-24T21:32:49Z — REASON: Let a sole surviving snapshot source reclaim disconnect-released chunks immediately while retaining reconnect diversity whenever a same-generation alternate peer is live
+  old ROOT: a8a27f5b81e2e9a78be7b7ee87f7980d1e464d431612b74fb754754b91ea6060
+  by: owner unseal ritual (make core-unseal)

@@ -2677,3 +2677,37 @@ The strict all-groups profile remains unrun: its fuzz/sanitizer prerequisite
 would consume the disk headroom needed for safe isolated node validation.
 Remaining risk: inspect isolated IBD outcome ratios before any scheduler
 adaptation.
+
+## Snapshot sole-source reconnect recovery
+
+Baseline and root cause: snapshot reconnect fairness correctly reserved one
+assignment opportunity for another admitted source, but it applied even when
+the reconnecting endpoint was the only current-generation source. A released
+chunk could then remain idle for the one-second yield interval despite a live
+eligible requester. The block-swarm scheduler already guarded that same policy
+with an authoritative live-peer check; snapshot scheduling had no equivalent.
+
+Fix and after-result: before taking the snapshot mutex, the send tick now
+checks the node manager under `cs_nodes` for a distinct, live, handshaken,
+fast-sync peer admitted to the same snapshot generation. It suppresses the
+yield only when the current node is itself registered and no such alternate
+exists. Missing/partial manager authority remains conservative and preserves
+the yield. The scan occurs before the swarm lock, preserving the established
+lock order and bounded peer-table work.
+
+Regression proof: the direct scheduler fixture assigns a chunk to an old
+source, disconnects it, registers only a same-endpoint replacement, and proves
+that replacement immediately queues the reclaimed request. Before the change
+it deterministically failed because the yield kept the chunk idle. Existing
+multi-source reconnect-yield fixtures continue to prove fairness.
+
+Consensus impact: NONE. Only volatile request scheduling changes; snapshot
+commitment and chunk hash checks, reducer admission, block and transaction
+validity, PoW, chain selection, serialization, and cryptographic validation
+are unchanged. Worldstream `396049072` remains storage/reindex work with no
+overlap. `test_block_swarm_loopback`, the four focused `test_fast_sync` groups,
+core seal verification, consensus parity, and the complexity ratchet pass.
+The strict all-groups profile remains unrun because its fuzz/sanitizer build
+would consume the disk headroom reserved for safe isolated node validation.
+Remaining risk: use bounded isolated IBD telemetry before attempting any
+adaptive policy.

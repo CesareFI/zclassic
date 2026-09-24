@@ -1092,6 +1092,68 @@ static int test_snapshot_reconnect_yields_are_independent(void)
     return failures;
 }
 
+static int test_snapshot_sole_source_reconnect_recovers(void)
+{
+    int failures = 0;
+    TEST("snapshot sole-source reconnect immediately reclaims released chunk") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 1;
+        manifest.chunk_size = SYNC_CHUNK_SIZE;
+        manifest.chunk_hashes = zcl_calloc(1, 32, "sole_source_chunk_hash");
+        ASSERT(manifest.chunk_hashes != NULL);
+        struct utxo_chunk *chunk = zcl_calloc(
+            1, sizeof(*chunk), "sole_source_empty_chunk");
+        ASSERT(chunk != NULL);
+        fast_sync_chunk_hash(chunk, manifest.chunk_hashes[0]);
+        free(chunk);
+
+        struct net_manager nm;
+        struct msg_processor mp;
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.params = chain_params_get();
+        mp.net_mgr = &nm;
+        mp.datadir = ".";
+        struct p2p_node *old_source = bs_make_peer(&nm, 96);
+        struct p2p_node *reconnect = bs_make_peer(&nm, 96);
+        ASSERT(old_source && reconnect);
+        struct send_segment *sent_old = bs_install_sentinel(old_source);
+        struct send_segment *sent_reconnect = bs_install_sentinel(reconnect);
+        nm.nodes = zcl_calloc(1, sizeof(*nm.nodes), "sole_source_nodes");
+        ASSERT(nm.nodes != NULL);
+        nm.nodes[0] = reconnect;
+        nm.num_nodes = nm.nodes_cap = 1;
+
+        ASSERT(mp_snapshot_test_start_swarm(&manifest));
+        ASSERT(mp_snapshot_test_admit_peer(old_source));
+        mp_snapshot_send_tick(&mp, old_source);
+        ASSERT(old_source->swarm_inflight_chunk == 0);
+        ASSERT(mp_snapshot_swarm_peer_disconnected(old_source) == 1);
+        ASSERT(mp_snapshot_test_admit_peer(reconnect));
+
+        /* No current-generation alternate exists.  Fairness must not make
+         * the only recoverable source idle for the reconnect-yield interval. */
+        mp_snapshot_send_tick(&mp, reconnect);
+        ASSERT(reconnect->swarm_inflight_chunk == 0);
+        ASSERT(bs_queue_depth(sent_reconnect) == 1);
+
+        mp_snapshot_test_stop_swarm();
+        bs_drop_queue(old_source, sent_old);
+        bs_drop_queue(reconnect, sent_reconnect);
+        send_segment_free(sent_old);
+        send_segment_free(sent_reconnect);
+        old_source->send_head = old_source->send_tail = NULL;
+        reconnect->send_head = reconnect->send_tail = NULL;
+        p2p_node_free(old_source);
+        net_manager_free(&nm);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    mp_snapshot_test_stop_swarm();
+    return failures;
+}
+
 #define BS_RECONNECT_CHURN_SOURCES 33
 
 static int test_snapshot_reconnect_yield_table_capacity(void)
@@ -3002,6 +3064,7 @@ int test_block_swarm_loopback(void)
     failures += test_snapshot_chunk_wire_adversarial();
     failures += test_snapshot_manifest_wire_reconnect();
     failures += test_snapshot_reconnect_yields_are_independent();
+    failures += test_snapshot_sole_source_reconnect_recovers();
     failures += test_snapshot_reconnect_yield_table_capacity();
     failures += test_snapshot_inbound_reservation();
     failures += test_block_swarm_manifest_shape_bounds();

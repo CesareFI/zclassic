@@ -396,15 +396,52 @@ static bool swarm_lock_admitted_peer(const struct p2p_node *node)
     return admitted;
 }
 
+/* Reconnect fairness only helps when a live current-generation source can
+ * receive the released chunk.  Do not make a sole surviving source idle for
+ * the yield interval: its disconnect cleanup already returned that chunk to
+ * the bounded scheduler.  cs_nodes stabilizes candidates before g_swarm_mutex
+ * is taken, preserving the no-nested-lock order. */
+static bool swarm_has_alternate_source(const struct msg_processor *mp,
+                                       const struct p2p_node *node)
+{
+    if (!mp || !mp->net_mgr || !node)
+        return true; /* retain the conservative yield without peer authority */
+
+    bool alternate = false;
+    bool current_registered = false;
+    uint64_t generation = node->swarm_manifest_generation;
+    zcl_mutex_lock(&mp->net_mgr->cs_nodes);
+    for (size_t i = 0; i < mp->net_mgr->num_nodes; i++) {
+        const struct p2p_node *candidate = mp->net_mgr->nodes[i];
+        if (candidate == node)
+            current_registered = true;
+        if (candidate && candidate != node && !candidate->disconnect &&
+            candidate->state >= PEER_HANDSHAKE_COMPLETE &&
+            peer_supports_fast_sync(candidate->services) &&
+            candidate->swarm_manifest_received &&
+            candidate->swarm_manifest_generation == generation) {
+            alternate = true;
+            break;
+        }
+    }
+    zcl_mutex_unlock(&mp->net_mgr->cs_nodes);
+    /* Synthetic callers and teardown paths can provide a manager without
+     * registering this node.  It cannot authoritatively prove sole-source
+     * status, so retain the conservative yield in that case. */
+    return current_registered ? alternate : true;
+}
+
 static bool swarm_should_assign_chunk(const struct swarm_sync *swarm,
                                       const struct p2p_node *node,
                                       bool peer_timed_out,
+                                      bool alternate_source,
                                       int64_t now_monotonic)
 {
     if (!swarm || !node || peer_timed_out ||
         node->swarm_inflight_chunk >= 0)
         return false;
-    if (swarm_reconnect_yield_active_locked(node, now_monotonic))
+    if (alternate_source &&
+        swarm_reconnect_yield_active_locked(node, now_monotonic))
         return false;
     if (!node->inbound)
         return true;
@@ -2729,6 +2766,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
     /* ── Swarm parallel chunk sync coordinator ────────────── */
     /* For each connected ZCL23 peer with no inflight chunk, assign one
      * and send a zchunkreq. Also handle timeouts on stale requests. */
+    bool snapshot_alternate_source = swarm_has_alternate_source(mp, node);
     if (node->state >= PEER_HANDSHAKE_COMPLETE &&
         swarm_lock_admitted_peer(node)) {
 
@@ -2743,6 +2781,7 @@ void mp_snapshot_send_tick(struct msg_processor *mp,
 
         /* If peer has no inflight chunk, assign the next needed one */
         if (swarm_should_assign_chunk(&g_swarm, node, peer_timed_out,
+                                      snapshot_alternate_source,
                                       now_monotonic)) {
             int32_t ci = swarm_sync_assign_chunk(&g_swarm, node->id);
             if (ci >= 0) {
