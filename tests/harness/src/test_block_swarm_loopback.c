@@ -1154,6 +1154,59 @@ static int test_snapshot_sole_source_reconnect_recovers(void)
     return failures;
 }
 
+static int test_snapshot_chunk_queue_refusal_requeues(void)
+{
+    int failures = 0;
+    TEST("snapshot chunk queue refusal immediately releases ownership") {
+        struct sync_manifest manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.num_chunks = 1;
+        manifest.chunk_size = SYNC_CHUNK_SIZE;
+        manifest.chunk_hashes = zcl_calloc(1, 32, "queue_refusal_chunk_hash");
+        ASSERT(manifest.chunk_hashes != NULL);
+        struct utxo_chunk *chunk = zcl_calloc(
+            1, sizeof(*chunk), "queue_refusal_empty_chunk");
+        ASSERT(chunk != NULL);
+        fast_sync_chunk_hash(chunk, manifest.chunk_hashes[0]);
+        free(chunk);
+
+        struct net_manager nm;
+        struct msg_processor mp;
+        net_manager_init(&nm);
+        memset(&mp, 0, sizeof(mp));
+        mp.params = chain_params_get();
+        mp.net_mgr = &nm;
+        mp.datadir = ".";
+        struct p2p_node *peer = bs_make_peer(&nm, 97);
+        ASSERT(peer != NULL);
+        struct send_segment *sent = bs_install_sentinel(peer);
+        ASSERT(mp_snapshot_test_start_swarm(&manifest));
+        ASSERT(mp_snapshot_test_admit_peer(peer));
+
+        peer->send_size = net_send_peer_bytes_hard_cap();
+        mp_snapshot_send_tick(&mp, peer);
+        peer->send_size = 0;
+        ASSERT(peer->swarm_inflight_chunk == -1);
+        ASSERT(bs_queue_depth(sent) == 0);
+        ASSERT(bs_snapshot_state(0, CHUNK_NEEDED, -1, 0, 0));
+
+        mp_snapshot_send_tick(&mp, peer);
+        ASSERT(peer->swarm_inflight_chunk == 0);
+        ASSERT(bs_queue_depth(sent) == 1);
+
+        mp_snapshot_test_stop_swarm();
+        bs_drop_queue(peer, sent);
+        send_segment_free(sent);
+        peer->send_head = peer->send_tail = NULL;
+        p2p_node_free(peer);
+        net_manager_free(&nm);
+        free(manifest.chunk_hashes);
+        PASS();
+    } _test_next:;
+    mp_snapshot_test_stop_swarm();
+    return failures;
+}
+
 #define BS_RECONNECT_CHURN_SOURCES 33
 
 static int test_snapshot_reconnect_yield_table_capacity(void)
@@ -3065,6 +3118,7 @@ int test_block_swarm_loopback(void)
     failures += test_snapshot_manifest_wire_reconnect();
     failures += test_snapshot_reconnect_yields_are_independent();
     failures += test_snapshot_sole_source_reconnect_recovers();
+    failures += test_snapshot_chunk_queue_refusal_requeues();
     failures += test_snapshot_reconnect_yield_table_capacity();
     failures += test_snapshot_inbound_reservation();
     failures += test_block_swarm_manifest_shape_bounds();

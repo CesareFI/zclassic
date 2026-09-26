@@ -2740,3 +2740,21 @@ isolated IBD observation of target churn before considering adaptive range
 policy. The complexity ratchet, consensus-parity check, capability inventory,
 and whitespace gate pass. The strict all-groups profile remains unrun because
 its fuzz/sanitizer build would consume the isolated-node disk reserve.
+
+## Snapshot chunk request queue-refusal coverage
+
+Baseline and audit: a bounded send queue can reject a newly assigned
+`zchunkreq`; the risk was that the scheduler might retain ownership until its
+ordinary timeout. The production helper was already correct: after a failed
+enqueue it invokes the authoritative peer-chunk requeue path, which clears both
+global and peer-local ownership.
+
+Regression proof: the direct scheduler fixture fills a peer send queue, proves
+the assigned chunk is immediately `CHUNK_NEEDED` with no local in-flight hint,
+then clears the queue and proves the same peer requests it on the next tick.
+This protects the existing recovery behavior without changing production code.
+
+Consensus impact: NONE. Test-only coverage of volatile send-queue recovery;
+all validation and chain rules are unchanged. Worldstream `3b9205df0` remains
+storage/pruning-only with no overlap. Next investigation: measure block-swarm
+queue refusal under partial pipeline occupancy before changing scheduler policy.
