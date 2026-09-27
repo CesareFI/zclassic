@@ -1377,6 +1377,7 @@ int main(int argc, char **argv)
     failures += test_snapshot_sync_service();
     failures += test_snapshot_serve_loopback();
     failures += test_block_swarm_loopback();
+    failures += test_bench_fresh_sync_fixture();
     failures += test_file_controller();
     failures += test_file_ops();
     failures += test_file_tree_ops();

@@ -11,6 +11,7 @@
  */
 
 #include "platform/time_compat.h"
+#include "platform/socket_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,9 +154,51 @@ static const char *bench_connect_arg_or_exit(void)
     return connect_arg;
 }
 
+/* A bounded test-only preflight for the isolated-peer contract.  The actual
+ * benchmark deliberately accepts any operator-supplied isolated endpoint;
+ * this mode is narrower so its fixture can prove that no node, datadir, or
+ * non-loopback connection is needed merely to exercise the contract. */
+static void bench_loopback_preflight_or_exit(const char *endpoint)
+{
+    unsigned port = 0;
+    char extra = '\0';
+    if (sscanf(endpoint, "127.0.0.1:%u%c", &port, &extra) != 1 ||
+        port == 0 || port > 65535) {
+        fprintf(stderr, "ERROR: preflight requires 127.0.0.1:<port>\n");
+        exit(2);
+    }
+
+    platform_socket_t peer = platform_socket_open(AF_INET, SOCK_STREAM, 0,
+                                                   true, false);
+    struct sockaddr_in address = {0};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons((uint16_t)port);
+    if (peer == PLATFORM_SOCKET_INVALID ||
+        platform_socket_connect(peer, (const struct sockaddr *)&address,
+                                sizeof(address)) != 0) {
+        if (peer != PLATFORM_SOCKET_INVALID)
+            platform_socket_close(peer);
+        fprintf(stderr, "ERROR: isolated preflight peer is unavailable\n");
+        exit(1);
+    }
+    platform_socket_close(peer);
+    printf("BENCH_PREFLIGHT_OK endpoint=%s\n", endpoint);
+}
+
+static void bench_preflight_or_continue(const char *connect_arg)
+{
+    if (!getenv("ZCL_BENCH_PREFLIGHT_ONLY")) return;
+    /* connect_arg is exactly "-connect=" plus the checked environment
+     * value, so this never re-parses or mutates operator input. */
+    bench_loopback_preflight_or_exit(connect_arg + strlen("-connect="));
+    exit(0);
+}
+
 int main(void)
 {
     const char *connect_arg = bench_connect_arg_or_exit();
+    bench_preflight_or_continue(connect_arg);
 
     /* Build datadir path */
     char datadir[256];

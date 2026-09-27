@@ -2875,3 +2875,35 @@ throughput or OS networking. Worldstream remains confined to startup/fresh
 sync work. Remaining risk: obtain an explicitly authorized isolated peer
 process before measuring the standalone benchmark; until then, retain this
 deterministic offline wire coverage.
+
+## Fresh-sync benchmark localhost preflight fixture
+
+Baseline and risk: `bench_fresh_sync` correctly refused to use a default peer,
+but no checked-in fixture exercised an explicitly supplied isolated endpoint.
+Consequently a future benchmark edit could accidentally create a datadir or
+start a node before discovering that its peer was unusable.
+
+Fix and after-result: `ZCL_BENCH_PREFLIGHT_ONLY=1` now makes the standalone
+benchmark perform one bounded TCP connect to an exact `127.0.0.1:<port>`
+endpoint and exit before it creates a datadir or forks a node. The registered
+native fixture creates a mode-0700 `test-tmp/bench_peer_XXXXXX` directory,
+binds an OS-assigned IPv4 loopback port, accepts exactly one connection, then
+recursively removes only that fixture directory. The normal benchmark remains
+available for an operator-supplied isolated peer; only its test preflight is
+limited to loopback.
+
+Regression proof: the existing `build/bin/bench_fresh_sync` preflight
+connected to a one-shot `127.0.0.1` listener and printed
+`BENCH_PREFLIGHT_OK`; a missing endpoint exited 2 before startup. The new
+fixture compiles under the strict C23 warning set. The normal parallel test
+epoch was deliberately not rebuilt: the source-identity change made it a
+whole-epoch compile while the host retained only 11 GB free, one GB above the
+10 GB reserve. Its 40 MB partial epoch was stopped without any node or
+datadir being launched. Therefore this is deterministic socket/preflight
+coverage, not an IBD performance result or a representative sync benchmark.
+
+Consensus impact: NONE. Benchmark and test-fixture code only; chain state,
+validation, serialization, PoW, monetary rules, and cryptography are
+unchanged. Worldstream `d9f5153be` remains complementary storage/restart
+work. Remaining risk: an actual time-to-tip measurement still requires an
+authorized isolated full peer with independently verified chain material.
