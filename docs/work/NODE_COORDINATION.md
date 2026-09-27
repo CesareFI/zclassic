@@ -2789,5 +2789,32 @@ serialization, block and transaction validity, PoW, chain selection, and all
 cryptographic checks are untouched. Worldstream `d9f5153be` remains confined
 to startup/fresh-sync observers and has no overlap. Remaining risk: collect
 bounded isolated IBD outcome telemetry before changing timeout or adaptive
-peer-selection policy; next inspect whether queue refusal during reconnect
-yield can retain a fairness deferral after its request was rolled back.
+peer-selection policy.
+
+## Block-swarm reconnect yield after alternate queue refusal
+
+Baseline and audit: reconnect fairness correctly waits for another admitted
+source to receive work, but the queue-refusal path needed proof that an
+alternate which cannot accept its assigned `zblkreq` cannot keep the
+same-endpoint replacement deferred for the entire yield interval.
+
+After-result: no production change was needed. The bounded send queue marks a
+refusing alternate for disconnect, and alternate-source discovery excludes a
+disconnecting peer before the replacement's next scheduler tick. The extended
+real-wire fixture proves old-source release, replacement deferral, alternate
+request refusal, rollback, and immediate replacement recovery of all 64
+pieces.
+
+Regression proof: `make -j2 t-fast ONLY=block_swarm_loopback` passes; the
+focused loopback still transfers 2,560 blocks over real framed messages.
+Cyclomatic complexity and whitespace checks pass. Core seal/root mirror,
+consensus parity, and generated capability inventory are rerun before commit.
+ASan/UBSan and strict all-groups remain unrun because their cold prerequisites
+would violate the 10 GB isolated-node disk reserve (12 GB free).
+
+Consensus impact: NONE. Only deterministic coverage of volatile peer
+scheduling was added; validation, serialization, cryptography, PoW, chain
+selection, and transaction/block rules are untouched. Worldstream `d9f5153be`
+remains startup/fresh-sync observer work with no overlap. Next investigation:
+use bounded isolated IBD telemetry to measure useful versus rejected delivery
+before designing adaptive peer policy.

@@ -2176,6 +2176,37 @@ static int test_block_swarm_reconnect_yield(void)
         mp_snapshot_send_tick(&mp, reconnect);
         ASSERT(bs_queue_depth(sent_reconnect) == batch);
 
+        /* A healthy alternate can be selected but refuse its first request
+         * because its bounded send queue is full. That refusal marks it for
+         * disconnect and rolls its piece back. The reconnect yield must not
+         * then keep the only usable replacement idle for its full interval. */
+        bs_drop_queue(reconnect, sent_reconnect);
+        for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+            old_source->blk_pipeline[pi].piece_index = -1;
+            healthy->blk_pipeline[pi].piece_index = -1;
+            reconnect->blk_pipeline[pi].piece_index = -1;
+        }
+        old_source->disconnect = false;
+        healthy->disconnect = false;
+        reconnect->disconnect = false;
+        mp_block_swarm_test_seed_stall(0, pieces, 1);
+        ASSERT(mp_block_swarm_test_admit_peer(old_source));
+        ASSERT(mp_block_swarm_test_admit_peer(healthy));
+        ASSERT(mp_block_swarm_test_admit_peer(reconnect));
+        mp_snapshot_send_tick(&mp, old_source);
+        ASSERT(bs_queue_depth(sent_old) == batch);
+        bs_drop_queue(old_source, sent_old);
+        ASSERT(mp_block_swarm_peer_disconnected(old_source) == batch);
+        mp_snapshot_send_tick(&mp, reconnect);
+        ASSERT(bs_queue_depth(sent_reconnect) == 0);
+        healthy->send_size = net_send_peer_bytes_hard_cap();
+        mp_snapshot_send_tick(&mp, healthy);
+        healthy->send_size = 0;
+        ASSERT(healthy->disconnect);
+        ASSERT(bs_queue_depth(sent_healthy) == 0);
+        mp_snapshot_send_tick(&mp, reconnect);
+        ASSERT(bs_queue_depth(sent_reconnect) == batch);
+
         mp_block_swarm_test_seed_stall(0, 0, 0);
         send_segment_free(sent_old);
         send_segment_free(sent_healthy);
