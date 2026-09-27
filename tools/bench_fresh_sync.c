@@ -136,8 +136,27 @@ static int explorer_page_size(const char *path)
     return atoi(buf);
 }
 
+static const char *bench_connect_arg_or_exit(void)
+{
+    static char connect_arg[320];
+    const char *connect_target = getenv("ZCL_BENCH_CONNECT");
+    if (!connect_target || !*connect_target) {
+        fprintf(stderr, "ERROR: ZCL_BENCH_CONNECT must name an isolated peer endpoint\n");
+        exit(2);
+    }
+    int connect_len = snprintf(connect_arg, sizeof(connect_arg),
+                               "-connect=%s", connect_target);
+    if (connect_len < 0 || (size_t)connect_len >= sizeof(connect_arg)) {
+        fprintf(stderr, "ERROR: ZCL_BENCH_CONNECT endpoint is too long\n");
+        exit(2);
+    }
+    return connect_arg;
+}
+
 int main(void)
 {
+    const char *connect_arg = bench_connect_arg_or_exit();
+
     /* Build datadir path */
     char datadir[256];
     time_t t = platform_time_wall_time_t();
@@ -197,7 +216,7 @@ int main(void)
         snprintf(hp, sizeof(hp), "-httpsport=%d", HTTPSPORT);
         execlp(binary, "zclassic23",
             dd, pp, rp, hp,
-            "-connect=127.0.0.1:8033",
+            connect_arg,
             "-listen=0",
             "-txindex",
             "-showmetrics=0",

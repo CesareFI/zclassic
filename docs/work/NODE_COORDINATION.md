@@ -2834,6 +2834,11 @@ private-key path in the benchmark. The benchmark itself is deliberately
 unrun: it would spawn a node and attempt live peer contact, which is not
 required to prove this source-level isolation correction.
 
+The benchmark now also requires `ZCL_BENCH_CONNECT=<isolated-host:port>` and
+refuses before creating a datadir when absent; it no longer defaults to the
+protected loopback P2P port. The compiled standalone target's no-input path
+returns 2 without spawning a node or opening a connection.
+
 Consensus impact: NONE. Benchmark-only credential isolation; no node,
 networking, validation, or chain code changed. Worldstream `d9f5153be`
 remains complementary. Next investigation remains bounded isolated IBD
