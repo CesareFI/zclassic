@@ -263,16 +263,24 @@ static bool bs_seeder_build(struct bs_seeder *s, int32_t end_height,
                             uint32_t salt, const char *tag)
 {
     const struct chain_params *params = chain_params_get();
+    char tmp_prefix[80];
     memset(s, 0, sizeof(*s));
     s->end_height = end_height;
 
-    snprintf(s->datadir, sizeof(s->datadir), "./test-tmp/%d_%s_seed",
-             (int)getpid(), tag);
-    mkdir("./test-tmp", 0755);
-    mkdir(s->datadir, 0755);
+    int prefix_len = snprintf(tmp_prefix, sizeof(tmp_prefix),
+                              "block_swarm_%s_seed", tag);
+    if (prefix_len < 0 || (size_t)prefix_len >= sizeof(tmp_prefix) ||
+        !test_mkdtemp(s->datadir, sizeof(s->datadir), tmp_prefix))
+        return false;
     char blocks[512];
-    snprintf(blocks, sizeof(blocks), "%s/blocks", s->datadir);
-    mkdir(blocks, 0755);
+    int blocks_len = snprintf(blocks, sizeof(blocks), "%s/blocks",
+                              s->datadir);
+    if (blocks_len < 0 || (size_t)blocks_len >= sizeof(blocks) ||
+        mkdir(blocks, 0700) != 0) {
+        (void)test_rm_rf_recursive(s->datadir);
+        s->datadir[0] = '\0';
+        return false;
+    }
 
     main_state_init(&s->ms);
     tx_mempool_init(&s->mempool, 0);
@@ -369,9 +377,8 @@ static void bs_seeder_free(struct bs_seeder *s)
     tx_mempool_free(&s->mempool);
     main_state_free(&s->ms);
 
-    char cmd[600];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", s->datadir);
-    (void)system(cmd);
+    if (s->datadir[0])
+        (void)test_rm_rf_recursive(s->datadir);
 }
 
 /* ── Loopback transport (sentinel-guarded pump, per test_snapshot_serve_loopback) ── */
@@ -461,8 +468,10 @@ static struct p2p_node *bs_make_peer(struct net_manager *nm, uint8_t last_octet)
     struct net_address addr;
     memset(&addr, 0, sizeof(addr));
     memcpy(addr.svc.addr.ip, pchIPv4Prefix, 12);
-    addr.svc.addr.ip[12] = 10; addr.svc.addr.ip[13] = 20;
-    addr.svc.addr.ip[14] = 30; addr.svc.addr.ip[15] = last_octet;
+    /* The fixture never opens a socket, but make every logical endpoint
+     * loopback too: no test peer can be mistaken for a public-route target. */
+    addr.svc.addr.ip[12] = 127; addr.svc.addr.ip[13] = 0;
+    addr.svc.addr.ip[14] = 0; addr.svc.addr.ip[15] = last_octet;
     addr.svc.port = 18033;
 
     struct p2p_node *n = p2p_node_create(nm, ZCL_INVALID_SOCKET, &addr,

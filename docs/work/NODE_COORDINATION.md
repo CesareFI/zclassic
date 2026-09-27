@@ -2843,3 +2843,35 @@ Consensus impact: NONE. Benchmark-only credential isolation; no node,
 networking, validation, or chain code changed. Worldstream `d9f5153be`
 remains complementary. Next investigation remains bounded isolated IBD
 outcome observation before adaptive scheduling work.
+
+## Block-swarm localhost fixture isolation
+
+Baseline and risk: the existing real-wire block-swarm harness already used
+synthetic block files below the repository `test-tmp` root, but named its
+seeder directory from the PID and ignored directory-creation failures. An
+interrupted run could therefore leave a later same-PID fixture sharing stale
+data. Its logical peer addresses also looked like routed private addresses
+even though the harness deliberately uses invalid sockets and never contacts
+the network.
+
+Fix and after-result: each seeder now receives a unique, mode-0700
+`test_mkdtemp` directory below `test-tmp`, checks its bounded path and block
+directory creation, and removes only that directory through the native
+recursive fixture helper. Every logical peer is `127.0.0.x`; the test retains
+the existing production frame parser/dispatcher pump with socket syscalls
+elided. No source changes were made to runtime networking or validation.
+
+Regression proof: `make -j2 t-fast ONLY=block_swarm_loopback` passes (one
+registered group; 0.4 s wall after incremental rebuild), covering real framed
+manifest/request/data exchange plus truncated, unsolicited, duplicate, late,
+disconnect, timeout, and queue-refusal paths. The temporary fixture left no
+`block_swarm_*` directories. `make check-cyclomatic-complexity` passes at
+55,741 functions and the cap-15 ratchet; `git diff --check` passes.
+
+Consensus impact: NONE. This changes only C23 test-fixture paths and logical
+test endpoint labels. It neither opens a network listener nor supplies an
+OS-socket/full-chain benchmark, so it cannot measure representative IBD
+throughput or OS networking. Worldstream remains confined to startup/fresh
+sync work. Remaining risk: obtain an explicitly authorized isolated peer
+process before measuring the standalone benchmark; until then, retain this
+deterministic offline wire coverage.
