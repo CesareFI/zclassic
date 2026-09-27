@@ -1884,6 +1884,53 @@ static int test_block_swarm_manifest_shape_bounds(void)
     return failures;
 }
 
+static bool bs_partial_queue_refusal_preserves_accepted_owner(
+    struct msg_processor *mp, struct p2p_node *blocked,
+    struct send_segment *sent_blocked, struct p2p_node *second,
+    struct send_segment *sent_second)
+{
+    const size_t request_bytes = MSG_HEADER_SIZE + sizeof(uint32_t);
+    if (net_send_peer_bytes_hard_cap() < request_bytes)
+        return false;
+
+    mp_block_swarm_test_seed_stall(0, PIECE_PIPELINE_DEPTH / 4, 1);
+    if (!mp_block_swarm_test_admit_peer(blocked))
+        return false;
+    blocked->send_size = net_send_peer_bytes_hard_cap() - request_bytes;
+    mp_snapshot_send_tick(mp, blocked);
+    if (bs_queue_depth(sent_blocked) != 1 ||
+        atomic_load(&blocked->blk_pieces_requested) != 1 ||
+        blocked->blk_pipeline[0].piece_index < 0)
+        return false;
+    for (int pi = 1; pi < PIECE_PIPELINE_DEPTH; pi++)
+        if (blocked->blk_pipeline[pi].piece_index >= 0)
+            return false;
+
+    if (!mp_block_swarm_test_admit_peer(second))
+        return false;
+    mp_snapshot_send_tick(mp, second);
+    if (bs_queue_depth(sent_second) != PIECE_PIPELINE_DEPTH / 4 - 1 ||
+        atomic_load(&second->blk_pieces_requested) !=
+            PIECE_PIPELINE_DEPTH / 4 - 1)
+        return false;
+    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+        bool assigned = pi < PIECE_PIPELINE_DEPTH / 4 - 1;
+        if ((second->blk_pipeline[pi].piece_index >= 0) != assigned)
+            return false;
+    }
+
+    bs_drop_queue(blocked, sent_blocked);
+    bs_drop_queue(second, sent_second);
+    blocked->send_size = 0;
+    for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++) {
+        blocked->blk_pipeline[pi].piece_index = -1;
+        second->blk_pipeline[pi].piece_index = -1;
+    }
+    atomic_store(&blocked->blk_pieces_requested, 0);
+    atomic_store(&second->blk_pieces_requested, 0);
+    return true;
+}
+
 static int test_block_swarm_peer_fairness(void)
 {
     int failures = 0;
@@ -1950,6 +1997,12 @@ static int test_block_swarm_peer_fairness(void)
         for (int pi = 0; pi < PIECE_PIPELINE_DEPTH; pi++)
             second->blk_pipeline[pi].piece_index = -1;
         atomic_store(&second->blk_pieces_requested, 0);
+
+        /* A queue can become full after a request has already entered it.
+         * The helper permits one zblkreq, refuses the next, then proves the
+         * accepted owner stays live while every refused slot is reusable. */
+        ASSERT(bs_partial_queue_refusal_preserves_accepted_owner(
+            &mp, blocked, sent_blocked, second, sent_second));
 
         mp_block_swarm_test_seed_stall(0, pieces, 1);
         ASSERT(mp_block_swarm_is_active());

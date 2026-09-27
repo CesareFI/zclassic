@@ -2758,3 +2758,36 @@ Consensus impact: NONE. Test-only coverage of volatile send-queue recovery;
 all validation and chain rules are unchanged. Worldstream `3b9205df0` remains
 storage/pruning-only with no overlap. Next investigation: measure block-swarm
 queue refusal under partial pipeline occupancy before changing scheduler policy.
+
+## Block-swarm partial queue-refusal ownership preservation
+
+Baseline and audit: the block-swarm queue-refusal regression covered an
+already-full peer only. That proves a refused first `zblkreq` releases its
+assignment, but not the realistic boundary where one request has entered the
+bounded queue and the following request is refused. A rollback broader than
+the refused piece could discard the accepted owner; a missing rollback could
+strand the refused piece until timeout.
+
+Fix and after-result: production scheduling already requeues only the named
+failed owner and clears only its pipeline slot. The real scheduler fixture now
+admits exactly one 28-byte `zblkreq` at the hard queue cap, refuses the next,
+then proves the first owner stays in flight while the alternate peer immediately
+receives the other 63 pieces. The helper resets only fixture state after those
+ownership assertions; no production code changed.
+
+Regression proof: `make -j2 t-fast ONLY=block_swarm_loopback` passes the
+wire-facing block/snapshot swarm group; it includes the 2,560-block loopback
+at approximately 31,700 blocks/s (46.8 MiB/s) in the observed run. Core seal
+and root mirror, consensus parity, generated capability inventory, cyclomatic
+complexity (55,740 functions), and whitespace checks pass. ASan/UBSan and the
+strict all-groups profile remain unrun because their cold prerequisites would
+consume the isolated-node disk reserve (12 GB free; 10 GB safety floor).
+
+Consensus impact: NONE. This is deterministic test coverage for volatile
+send-queue ownership; manifest/payload verification, reducer admission,
+serialization, block and transaction validity, PoW, chain selection, and all
+cryptographic checks are untouched. Worldstream `d9f5153be` remains confined
+to startup/fresh-sync observers and has no overlap. Remaining risk: collect
+bounded isolated IBD outcome telemetry before changing timeout or adaptive
+peer-selection policy; next inspect whether queue refusal during reconnect
+yield can retain a fairness deferral after its request was rolled back.
