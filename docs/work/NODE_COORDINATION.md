@@ -2818,3 +2818,23 @@ selection, and transaction/block rules are untouched. Worldstream `d9f5153be`
 remains startup/fresh-sync observer work with no overlap. Next investigation:
 use bounded isolated IBD telemetry to measure useful versus rejected delivery
 before designing adaptive peer policy.
+
+## Fresh-sync benchmark datadir isolation
+
+Audit: the standalone fresh-sync benchmark minted a timestamped disposable
+datadir, but then copied a TLS certificate and private key from the default
+node datadir. That made a supposedly isolated performance observation touch
+operator credential material.
+
+Fix and proof: the benchmark no longer reads, copies, or shells out over any
+normal-datadir TLS path. It observes HTTPS only when its own isolated node
+startup provides suitable local material. `make bench_fresh_sync` compiles the
+small standalone target, and a tracked-source scan finds no certificate or
+private-key path in the benchmark. The benchmark itself is deliberately
+unrun: it would spawn a node and attempt live peer contact, which is not
+required to prove this source-level isolation correction.
+
+Consensus impact: NONE. Benchmark-only credential isolation; no node,
+networking, validation, or chain code changed. Worldstream `d9f5153be`
+remains complementary. Next investigation remains bounded isolated IBD
+outcome observation before adaptive scheduling work.

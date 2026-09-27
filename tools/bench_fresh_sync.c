@@ -161,23 +161,10 @@ int main(void)
 
     mkdir(datadir, 0755);
 
-    /* Copy SSL certs if available */
-    {
-        char src[512], dst[512], ssldir[512];
-        snprintf(ssldir, sizeof(ssldir), "%s/ssl", datadir);
-        mkdir(ssldir, 0755);
-        snprintf(src, sizeof(src), "%s/.zclassic-c23/ssl/fullchain.pem", getenv("HOME"));
-        snprintf(dst, sizeof(dst), "%s/ssl/fullchain.pem", datadir);
-        if (access(src, R_OK) == 0) {
-            char cp[1024];
-            snprintf(cp, sizeof(cp), "cp '%s' '%s'", src, dst);
-            system(cp);
-            snprintf(src, sizeof(src), "%s/.zclassic-c23/ssl/privkey.pem", getenv("HOME"));
-            snprintf(dst, sizeof(dst), "%s/ssl/privkey.pem", datadir);
-            snprintf(cp, sizeof(cp), "cp '%s' '%s'", src, dst);
-            system(cp);
-        }
-    }
+    /* This benchmark owns only its disposable datadir.  It must never read
+     * certificates or private keys from a node's normal datadir: the node
+     * supplies its isolated local TLS material through its ordinary startup
+     * path, or the HTTPS observation below simply remains unavailable. */
 
     char logfile[300];
     snprintf(logfile, sizeof(logfile), "%s/node.log", datadir);

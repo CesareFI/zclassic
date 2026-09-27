@@ -3561,7 +3561,7 @@ tools/arena_svg.c:main:16
 tools/arena_view.c:av_draw_hud:19
 tools/arena_view.c:av_input:23
 tools/arena_view.c:main:67
-tools/bench_fresh_sync.c:main:55
+tools/bench_fresh_sync.c:main:54
 tools/bot.c:main:35
 tools/check_describe_budget.c:main:30
 tools/check_no_hardlink_seeding.c:selftest:74
