@@ -3099,3 +3099,37 @@ The full complexity checker again passed 55,755 functions and its self-test.
 Remaining risk: the registered group is a bounded localhost preflight fixture,
 not a real-world IBD throughput measurement; its sanitizer evidence is exact
 for fixture lifecycle and socket teardown only.
+
+## Crawler periodic scheduling uses monotonic time
+
+Baseline and risk: the crawler's periodic worker calculated `next_round_at`
+from wall time and compared it to later wall-time reads. A backward NTP or
+operator clock correction after a round could therefore suppress peer discovery
+until the old wall deadline caught up. Census observations still need wall time
+as an externally meaningful label, but scheduling a local timeout from it is
+incorrect.
+
+Root cause and fix: the worker now uses `platform_time_monotonic_us()` only
+for its next-round deadline. The small internal `ncrawl_round_due` helper
+clamps a defensive caller-supplied interval, handles the first round, uses an
+exact due threshold, and saturates its deadline rather than overflowing.
+`ncrawl_do_round` continues to use wall time for persisted observation labels
+and topology records; this is not a protocol or consensus-time change.
+
+Regression proof and after-result: `test_network_crawler` now drives the real
+helper through first-run, just-before-expiry, exact-expiry, the monotonic
+sequence that remains due despite an unrelated wall-clock rollback, saturation,
+and null-state rejection. The original wall-time expression would leave a
+rollback-delayed deadline pending; the corrected helper sees elapsed monotonic
+time and schedules at the normal 60-second interval. The exact candidate
+passed `make -j2 t-fast ONLY=network_crawler` (1/1, 253 ms test body) and
+`ZCC_MAX_MB=500 make -j2 t-tsan ONLY=network_crawler` (1/1, 1,176 ms test
+body), with zero skips and no ThreadSanitizer finding.
+
+Consensus impact: NONE. This changes only local crawler cadence under wall
+clock adjustment; it does not alter chain, block, transaction, wire,
+cryptographic, wallet, PoW, monetary, or upgrade validation. Worldstream's
+C++ socket-buffer work and the separate header-sync candidate remain untouched.
+Remaining risk: this test validates scheduling arithmetic, not a real host
+clock correction against a running node; the production worker uses the same
+helper and monotonic clock source exercised by the test.

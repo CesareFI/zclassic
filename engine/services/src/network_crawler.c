@@ -387,15 +387,16 @@ static void ncrawl_on_stall(struct liveness_contract *c)
 static void *ncrawl_thread_fn(void *arg)
 {
     (void)arg;
-    int64_t next_round_at = 0; /* first round immediately when enabled */
+    int64_t next_round_at_us = 0; /* first round immediately when enabled */
     while (!atomic_load(&g_ncrawl.stop_requested)) {
         atomic_fetch_add(&g_ncrawl.loop_ticks, 1);
         ncrawl_heartbeat();
 
-        int64_t now = platform_time_wall_unix();
-        if (g_ncrawl.enabled && now >= next_round_at) {
+        int64_t now_us = platform_time_monotonic_us();
+        if (g_ncrawl.enabled &&
+            ncrawl_round_due(now_us, &next_round_at_us,
+                              g_ncrawl.round_interval_secs)) {
             ncrawl_do_round();
-            next_round_at = now + g_ncrawl.round_interval_secs;
         }
         platform_sleep_ms(200); /* responsive stop between rounds */
     }

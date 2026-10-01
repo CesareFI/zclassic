@@ -27,6 +27,30 @@ struct ncrawl_round_limits {
     int onion_round_budget_ms; /* wall-clock ceiling on the onion phase */
 };
 
+/* Decide whether a periodic crawl round is due using only a monotonic clock.
+ * Wall time labels census observations, but must never gate future network
+ * work: a backward NTP correction would otherwise defer discovery until the
+ * old wall deadline catches up. The caller owns next_round_us. */
+static inline bool ncrawl_round_due(int64_t now_us, int64_t *next_round_us,
+                                   int interval_secs)
+{
+    int64_t delay_us;
+
+    if (!next_round_us)
+        return false;
+    if (interval_secs < 5)
+        interval_secs = 5;
+    if (interval_secs > 86400)
+        interval_secs = 86400;
+    if (*next_round_us > now_us)
+        return false;
+    delay_us = (int64_t)interval_secs * 1000000;
+    *next_round_us = now_us > INT64_MAX - delay_us
+                         ? INT64_MAX
+                         : now_us + delay_us;
+    return true;
+}
+
 /* The dial TU is the last resource boundary before worker creation. Keep this
  * normalization here, alongside the internal limits type, so every caller
  * (including a direct internal caller) gets the same hard caps as runtime

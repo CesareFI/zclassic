@@ -287,6 +287,29 @@ int test_network_crawler(void)
         printf("done\n");
     }
 
+    printf("  scheduler: monotonic deadline survives wall-clock rollback... ");
+    {
+        int64_t next_round_us = 0;
+        NC_CHECK(ncrawl_round_due(1000000, &next_round_us, 60));
+        NC_CHECK(next_round_us == 61000000);
+        NC_CHECK(!ncrawl_round_due(60999999, &next_round_us, 60));
+        NC_CHECK(ncrawl_round_due(61000000, &next_round_us, 60));
+        NC_CHECK(next_round_us == 121000000);
+
+        /* The wall clock may move backward between rounds. The scheduler sees
+         * only elapsed monotonic time, so a full interval still becomes due. */
+        next_round_us = 61000000;
+        NC_CHECK(ncrawl_round_due(61000000, &next_round_us, 60));
+        NC_CHECK(next_round_us == 121000000);
+
+        next_round_us = INT64_MAX - 1;
+        NC_CHECK(ncrawl_round_due(INT64_MAX - 1, &next_round_us, 5));
+        NC_CHECK(next_round_us == INT64_MAX);
+        NC_CHECK(!ncrawl_round_due(INT64_MAX - 1, &next_round_us, 5));
+        NC_CHECK(!ncrawl_round_due(0, NULL, 60));
+        printf("done\n");
+    }
+
     /* ── 1. pure fold: histograms, splits, height distribution ─────────── */
     printf("  census fold: histogram + split + height distribution... ");
     {
