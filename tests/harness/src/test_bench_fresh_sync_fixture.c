@@ -116,9 +116,11 @@ static void bench_peer_fixture_stop(struct bench_peer_fixture *fixture)
     if (fixture->listener != PLATFORM_SOCKET_INVALID) {
         (void)platform_socket_shutdown_both(fixture->listener);
         platform_socket_close(fixture->listener);
-        fixture->listener = PLATFORM_SOCKET_INVALID;
     }
     pthread_join(fixture->thread, NULL);
+    /* The accept thread reads listener when it enters platform_socket_accept.
+     * Keep the field immutable until join establishes that it cannot read it. */
+    fixture->listener = PLATFORM_SOCKET_INVALID;
     (void)test_rm_rf_recursive(fixture->dir);
 }
 

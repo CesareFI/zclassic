@@ -3085,7 +3085,17 @@ refusal; it did not start a node or create a chain datadir.
 self-test. Consensus impact: NONE. This changes only test-build availability
 and fixture resource cleanup; no chain, wire validation, wallet, cryptography,
 PoW, monetary, or production-node behavior changes. Worldstream's current
-networking work is a separate buffer-limit slice and is untouched. Remaining
-risk: the optional TSan profile has the same now-correct prerequisite but was
-not run because no thread-safety behavior changed and its cold build does not
-fit the current focused validation budget.
+networking work is a separate buffer-limit slice and is untouched.
+
+TSan follow-up: the first exact `ZCC_MAX_MB=500 make -j2 t-tsan
+ONLY=bench_fresh_sync_fixture` run exposed a real race: the fixture's stop
+path cleared `fixture->listener` while the accept thread read that field for
+`platform_socket_accept`. The shutdown and close correctly unblock accept,
+but the field must remain immutable until `pthread_join` proves that the
+thread no longer reads it. The stop path now joins before clearing the field.
+The exact post-fix fast run passed 1/1 in 71 ms and the exact post-fix TSan
+run passed 1/1 (123 ms test body; zero skips) with no ThreadSanitizer report.
+The full complexity checker again passed 55,755 functions and its self-test.
+Remaining risk: the registered group is a bounded localhost preflight fixture,
+not a real-world IBD throughput measurement; its sanitizer evidence is exact
+for fixture lifecycle and socket teardown only.
