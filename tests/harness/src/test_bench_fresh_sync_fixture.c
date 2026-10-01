@@ -38,6 +38,57 @@ static void *bench_peer_accept_once(void *opaque) /* raw-pthread-ok: joined */
     return NULL;
 }
 
+static bool bench_peer_fixture_write_marker(const char *dir)
+{
+    char marker[PATH_MAX];
+    int marker_len;
+    FILE *file;
+    bool written;
+    bool closed;
+
+    if (!dir)
+        return false;
+    marker_len = snprintf(marker, sizeof(marker), "%s/fixture.ready", dir);
+    if (marker_len < 0 || (size_t)marker_len >= sizeof(marker))
+        return false;
+    file = fopen(marker, "w");
+    if (!file)
+        return false;
+    written = fputs("localhost-only\n", file) >= 0;
+    closed = fclose(file) == 0;
+    return written && closed;
+}
+
+static bool bench_peer_fixture_listen(struct bench_peer_fixture *fixture,
+                                      unsigned short *port_out)
+{
+    struct sockaddr_in address = {0};
+    size_t address_size = sizeof(address);
+
+    fixture->listener = platform_socket_open(AF_INET, SOCK_STREAM, 0, true,
+                                             false);
+    if (fixture->listener == PLATFORM_SOCKET_INVALID)
+        return false;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (platform_socket_bind(fixture->listener,
+                             (const struct sockaddr *)&address,
+                             sizeof(address)) != 0)
+        return false;
+    if (platform_socket_listen(fixture->listener, 1) != 0)
+        return false;
+    if (platform_socket_local_address(fixture->listener,
+                                      (struct sockaddr *)&address,
+                                      &address_size) != 0 ||
+        address.sin_family != AF_INET ||
+        address.sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
+        address.sin_port == 0)
+        return false;
+    *port_out = ntohs(address.sin_port);
+    return pthread_create(&fixture->thread, NULL, bench_peer_accept_once,
+                          fixture) == 0;
+}
+
 static bool bench_peer_fixture_start(struct bench_peer_fixture *fixture,
                                      unsigned short *port_out)
 {
@@ -46,41 +97,9 @@ static bool bench_peer_fixture_start(struct bench_peer_fixture *fixture,
     fixture->listener = PLATFORM_SOCKET_INVALID;
     if (!test_mkdtemp(fixture->dir, sizeof(fixture->dir), "bench_peer"))
         return false;
-
-    char marker[PATH_MAX];
-    int marker_len = snprintf(marker, sizeof(marker), "%s/fixture.ready",
-                              fixture->dir);
-    FILE *file = marker_len < 0 || (size_t)marker_len >= sizeof(marker)
-                     ? NULL : fopen(marker, "w");
-    if (!file) goto fail;
-    if (fputs("localhost-only\n", file) < 0 || fclose(file) != 0) {
-        file = NULL;
+    if (!bench_peer_fixture_write_marker(fixture->dir))
         goto fail;
-    }
-
-    fixture->listener = platform_socket_open(AF_INET, SOCK_STREAM, 0, true,
-                                             false);
-    if (fixture->listener == PLATFORM_SOCKET_INVALID) goto fail;
-    struct sockaddr_in address = {0};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    if (platform_socket_bind(fixture->listener,
-                             (const struct sockaddr *)&address,
-                             sizeof(address)) != 0 ||
-        platform_socket_listen(fixture->listener, 1) != 0)
-        goto fail;
-    size_t address_size = sizeof(address);
-    if (platform_socket_local_address(fixture->listener,
-                                      (struct sockaddr *)&address,
-                                      &address_size) != 0 ||
-        address.sin_family != AF_INET ||
-        address.sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
-        address.sin_port == 0)
-        goto fail;
-    *port_out = ntohs(address.sin_port);
-    if (pthread_create(&fixture->thread, NULL, bench_peer_accept_once,
-                       fixture) != 0)
+    if (!bench_peer_fixture_listen(fixture, port_out))
         goto fail;
     return true;
 
