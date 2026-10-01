@@ -27,6 +27,44 @@ struct ncrawl_round_limits {
     int onion_round_budget_ms; /* wall-clock ceiling on the onion phase */
 };
 
+/* The dial TU is the last resource boundary before worker creation. Keep this
+ * normalization here, alongside the internal limits type, so every caller
+ * (including a direct internal caller) gets the same hard caps as runtime
+ * configuration. */
+static inline void ncrawl_round_limits_normalize(struct ncrawl_round_limits *lim)
+{
+    if (!lim)
+        return;
+    if (lim->concurrent < 1)
+        lim->concurrent = 1;
+    if (lim->concurrent > NCRAWL_MAX_CONCURRENT)
+        lim->concurrent = NCRAWL_MAX_CONCURRENT;
+    if (lim->connect_timeout_ms < 100)
+        lim->connect_timeout_ms = 100;
+    if (lim->connect_timeout_ms > NCRAWL_CONNECT_TIMEOUT_MS_MAX)
+        lim->connect_timeout_ms = NCRAWL_CONNECT_TIMEOUT_MS_MAX;
+    if (lim->handshake_timeout_ms < 100)
+        lim->handshake_timeout_ms = 100;
+    if (lim->handshake_timeout_ms > NCRAWL_HANDSHAKE_TIMEOUT_MS_MAX)
+        lim->handshake_timeout_ms = NCRAWL_HANDSHAKE_TIMEOUT_MS_MAX;
+    if (lim->onion_per_round < 0)
+        lim->onion_per_round = 0;
+    if (lim->onion_per_round > NCRAWL_MAX_ONION_PER_ROUND)
+        lim->onion_per_round = NCRAWL_MAX_ONION_PER_ROUND;
+    if (lim->onion_concurrent < 1)
+        lim->onion_concurrent = 1;
+    if (lim->onion_concurrent > NCRAWL_MAX_ONION_CONCURRENT)
+        lim->onion_concurrent = NCRAWL_MAX_ONION_CONCURRENT;
+    if (lim->onion_timeout_ms < 100)
+        lim->onion_timeout_ms = 100;
+    if (lim->onion_timeout_ms > NCRAWL_ONION_TIMEOUT_MS_MAX)
+        lim->onion_timeout_ms = NCRAWL_ONION_TIMEOUT_MS_MAX;
+    if (lim->onion_round_budget_ms < 0)
+        lim->onion_round_budget_ms = 0;
+    if (lim->onion_round_budget_ms > NCRAWL_ONION_ROUND_BUDGET_MS_MAX)
+        lim->onion_round_budget_ms = NCRAWL_ONION_ROUND_BUDGET_MS_MAX;
+}
+
 /* What one round did. */
 struct ncrawl_round_stats {
     int recorded;    /* recordable results banked (measured + not-probed) */

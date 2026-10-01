@@ -2907,3 +2907,185 @@ validation, serialization, PoW, monetary rules, and cryptography are
 unchanged. Worldstream `d9f5153be` remains complementary storage/restart
 work. Remaining risk: an actual time-to-tip measurement still requires an
 authorized isolated full peer with independently verified chain material.
+
+## Crawler execution-bound normalization
+
+Baseline and risk: `ncrawl_run_round` is the execution boundary immediately
+before bounded crawler worker creation, but its local normalization applied
+only lower limits to several caller-provided fields. Runtime configuration
+normally clamps them, yet a direct internal caller could supply arbitrarily
+large per-dial timeouts or onion round budgets, violating the service's stated
+bounded-resource contract.
+
+Fix and after-result: the internal round-limits type now has one C23 inline
+normalizer used by the dial path. It applies the existing hard maxima for
+concurrency, clearnet connect/handshake timeouts, onion count/concurrency,
+onion timeout, and onion phase budget. The runtime configuration uses the
+same named maxima, removing duplicate numeric policy. `ncrawl_run_round`
+shrinks from cyclomatic M=24 to M=14, so its obsolete complexity baseline pin
+is removed.
+
+Regression proof: a new registered `test_network_crawler` case constructs an
+internal limits object with `INT_MIN`/`INT_MAX` fields and checks every
+normalized bound plus the null-safe no-op. A compact standalone C23 probe
+includes the changed production `network_crawler_internal.h` directly and
+passes with ASan+UBSan and leak detection enabled. Exact changed production
+and registered-test translation units pass strict C23 syntax checks using the
+repository CFLAGS and compatible shared vendor headers.
+
+The probe command was:
+`cc -std=c23 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined
+-fno-omit-frame-pointer -Iengine/services/include -Iengine/services/src
+-Icore/modules/net/include -Iplatform/modules/util/include
+-Iplatform/modules/base/include /tmp/z23-ncrawl-limits-probe-20261001.c
+-o /tmp/z23-ncrawl-limits-probe-20261001`, followed by
+`ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1` on that executable.
+The candidate source hashes are `a99f477eb75d52df644b561d804f421e394c48152b2660ee842fa3e120dd8f85`
+(public limits), `f800d8317699fa1fe6383ec6741b022367053d1a4a310f330dbc63c505863f60`
+(normalizer), `3523f4bc94b84f2f2dad99521a883eded1f8abe431c4807944378547a5502236`
+(dial path), and `7a78e02f1dc057bd3b8f644f3ec8436ae0d0f4f530bc0b5eebad106291788ef5`
+(registered fixture).
+
+The direct-call boundary is also exercised, not merely the inline helper:
+`/tmp/z23-ncrawl-round-boundary-20261001.c` links the actual production
+`engine/services/src/network_crawler_dial.c`, supplies only storage/clock
+seam stubs, and passes one non-onion synthetic address with every limits field
+at `INT_MAX`. Its callback observed exactly
+`NCRAWL_CONNECT_TIMEOUT_MS_MAX` and `NCRAWL_HANDSHAKE_TIMEOUT_MS_MAX`; the
+ASan/UBSan run passed with leak detection. This proves the production round
+path calls the normalizer before a worker invokes the dial callback.
+
+Validation scope: the registered `t-fast ONLY=network_crawler` group is
+passed from the exact-source test-fast epoch
+`f85cc2b2c47aed178f927a925f696428b61f18a6897b7bc4693c5e6c883f2e5b`
+(`source_id=bac20d768a0b13cf6742a9595bef1e717b759256356b80bc7f87ecb9dd566844`).
+The canonical runner's retained `.cache/test-timing/last-run.json` records
+`test_network_crawler` rc=0, `groups_ran=1`, `failed_count=0`,
+`skipped_count=1169` (the intentionally unselected groups), `self_skips=0`,
+and `env_unobserved=0`; measured test body time was 232 ms. The normalizer's
+targeted ASan/UBSan probe also fits and passed. After trimming only this
+worktree's regenerable cache, the registered sanitizer command
+`ZCC_MAX_MB=700 make -j2 t-asan ONLY=network_crawler` also passed from the
+exact candidate source: `test_network_crawler` rc=0 in 1,159 ms,
+`groups_ran=1`, `groups_failed=0`, `self_skips=0`, and `env_unobserved=0
+(receipt toolkey `5fb6af6b998d`, generated 2026-10-01T19:58:46Z). Its output
+contained no AddressSanitizer, UndefinedBehaviorSanitizer, or leak finding.
+The full complexity scan's self-test passes and confirms
+`ncrawl_run_round` is below the cap; it still fails only on the unrelated
+un-pinned `test_bench_fresh_sync_fixture.c:bench_peer_fixture_start` M=18
+baseline violation. `make check-architecture-tree` passes. This slice
+introduces no complexity violation.
+`make core-seal-check` passes all 554 sealed files and 80 section records;
+`make check-consensus-parity` passes its selftests and reports a clean
+consensus surface.
+
+Consensus impact: NONE. This is volatile crawler resource normalization only;
+no consensus, chain, wallet, serialization, validation, cryptography, or
+network wire behavior changes. Worldstream's storage/startup and Kimi's
+coverage-manifest ownership are untouched. The exact-source registered
+sanitizer confirmation for the final fixture is recorded in the following
+parser-strictness entry.
+
+Broader-lint note: `make lint` was started after the focused gates but expanded
+into a broad standalone-tool build and approached the 10 GiB disk reserve. Its
+own process group was terminated gracefully before the reserve was crossed;
+the partial receipt directory is retained at
+`.cache/lint-timing/gates/run.3751457`. It is **not** a passing lint result.
+The partial receipts include the unrelated pre-existing complexity ratchet and
+environment/publication failures (missing installed hooks and signing route),
+so no crawler-specific lint failure was established. Its regenerated build
+outputs were removed after the process exited, restoring reserve headroom.
+
+Publication status: the operator-authorized SSH signing key is configured only
+in this worktree (`user.name=CesareFI`,
+`user.email=236205415+CesareFI@users.noreply.github.com`, `gpg.format=ssh`,
+and `commit.gpgsign=true`). Its dedicated mode-0600 allowed-signers file holds
+the authorized public key. The separate fixture repair commit
+`041e4350c504dd0a1d1893f6463aa552bcca58db` verifies locally as a good `git`
+signature for that principal and is published on this development branch.
+The crawler slice is ready for the same signed-commit/push workflow. No private
+key material, identity invention, hook bypass, unsigned commit, or main/master
+publication was used.
+
+## Crawler environment parser strictness
+
+Baseline and risk: the crawler's six operational environment settings used
+`atoi`.  That accepts a numeric prefix, so a malformed value such as `5junk`
+silently becomes five; overflow behavior is also not a bounded configuration
+contract.  These values affect crawler work limits, not the protocol.
+
+Fix and after-result: `ncrawl_config_from_env` now uses the existing checked
+`zcl_parse_i64` helper through a small range-checked accessor.  A value is
+applied only when the entire string parses and fits that field's documented
+range; malformed, negative where forbidden, and oversized values leave the
+safe default intact.  The test-only configuration seam exercises the actual
+production parser without opening sockets or starting a crawler lifecycle.
+It also lowers `ncrawl_config_from_env` from its former M=32 ratchet pin to
+M=4 by moving repeated parsing policy into the bounded helper.
+
+Regression proof and measured result: the exact candidate passed
+`make -j2 t-fast ONLY=network_crawler` (1/1 groups, zero failures and skips;
+test body 243 ms) and then passed
+`ZCC_MAX_MB=500 make -j2 t-asan ONLY=network_crawler` (1/1 groups, zero
+failures and skips; test body 1,030 ms; receipt timestamp
+2026-10-01T22:29:21Z; toolkey `5fb6af6b998d`).  The latter registered run
+exercised malformed `5junk`, overflowing onion-budget, and valid input
+coverage in `test_network_crawler`; it reported no AddressSanitizer,
+UndefinedBehaviorSanitizer, or leak finding.  The fixture snapshots and
+restores pre-existing `ZCL_NETCRAWL_*` values, so it does not leak a mutated
+process environment into later test work. Exact final translation-unit
+SHA-256 values are `e6f7162670d9f2bf35da4690aa84d104ed0ccbc49d1f74def8d13ab17b6be107`
+for `network_crawler.c`,
+`3523f4bc94b84f2f2dad99521a883eded1f8abe431c4807944378547a5502236`
+for the dial path,
+`f800d8317699fa1fe6383ec6741b022367053d1a4a310f330dbc63c505863f60`
+for the internal header, and
+`a1ad6952f2ee4c314d8ba6a0c84f5a4b4ec13b4391d1340ae3c70ea0f0391a7c`
+for the registered fixture.
+
+Complexity/architecture/consensus: the candidate-specific complexity entries
+are within the ratchet. The fixture helper is now split below the cap, and the
+full checker passes all 55,755 functions with its self-test. Architecture-tree,
+sealed-core, and consensus-parity checks pass while these non-core production
+sources are present. Consensus impact: NONE. This changes only local acceptance of
+process environment configuration and keeps all invalid input at existing safe
+defaults.  Worldstream's storage/startup and Kimi's coverage-manifest paths
+remain untouched.  Remaining risk: this unsigned local candidate needs the
+operator-provided authorized signing mechanism already described above before
+it can be committed and pushed; no further test-capacity blocker remains for
+the focused group.
+
+## Fresh-sync fixture sanitizer dependency
+
+Baseline and risk: the registered localhost-only `test_bench_fresh_sync_fixture`
+passed under `t-fast`, but its first exact `t-asan` run failed before it printed
+the successful preflight result. The runner retried it alone and it still
+failed at `bench_preflight_run(endpoint, true)`, so this was a deterministic
+test-profile defect rather than a shared-worker flake.
+
+Root cause and fix: the fixture execs `build/bin/bench_fresh_sync`. Fast and
+release candidates already declare that tool as an order-only prerequisite,
+but the ASan and TSan candidates did not. After a clean sanitizer build the
+file was absent, so the child exited at `execl`. Both sanitizer candidates now
+declare the same order-only prerequisite. The fixture setup was also split
+below the M=15 limit; marker writes now call `fclose` even when `fputs` fails,
+instead of leaking the `FILE` stream through the old short-circuit expression.
+
+Regression proof and after-result: the initial focused fast group passed 1/1
+in 71 ms. The pre-fix ASan run failed 1/1 in 131 ms; its retained log names
+the preflight assertion and the missing executable was independently observed.
+`make -n t-asan ONLY=bench_fresh_sync_fixture` after the fix lists
+`build/bin/bench_fresh_sync` before the exact ASan candidate link. The clean
+exact `ZCC_MAX_MB=500 make -j2 t-asan ONLY=bench_fresh_sync_fixture` run then
+passed 1/1 in 88 ms with zero skips and no ASan, UBSan, or leak finding. It
+observed one `127.0.0.1` preflight connection and the expected missing-endpoint
+refusal; it did not start a node or create a chain datadir.
+
+`make check-cyclomatic-complexity` now passes all 55,755 functions and its
+self-test. Consensus impact: NONE. This changes only test-build availability
+and fixture resource cleanup; no chain, wire validation, wallet, cryptography,
+PoW, monetary, or production-node behavior changes. Worldstream's current
+networking work is a separate buffer-limit slice and is untouched. Remaining
+risk: the optional TSan profile has the same now-correct prerequisite but was
+not run because no thread-safety behavior changed and its cold build does not
+fit the current focused validation budget.

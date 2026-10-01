@@ -82,11 +82,15 @@ enum {
 
 #define NCRAWL_CONNECT_TIMEOUT_MS_DEFAULT   3000
 #define NCRAWL_HANDSHAKE_TIMEOUT_MS_DEFAULT 4000
+#define NCRAWL_CONNECT_TIMEOUT_MS_MAX       60000
+#define NCRAWL_HANDSHAKE_TIMEOUT_MS_MAX     60000
 #define NCRAWL_ROUND_INTERVAL_SECS_DEFAULT  60
 /* Per-onion-dial timeout and the wall-clock ceiling on the whole onion phase.
  * Worst case onion cost per round is budget + one in-flight dial timeout. */
 #define NCRAWL_ONION_TIMEOUT_MS_DEFAULT      20000
 #define NCRAWL_ONION_ROUND_BUDGET_MS_DEFAULT 25000
+#define NCRAWL_ONION_TIMEOUT_MS_MAX          120000
+#define NCRAWL_ONION_ROUND_BUDGET_MS_MAX     240000
 
 /* Did we actually MEASURE this address this round?
  *  MEASURED   — a dial ran; `reachable` is the verdict (true or false).
@@ -235,6 +239,9 @@ bool network_crawler_dump_state_json(struct json_value *out, const char *key);
 
 #ifdef ZCL_TESTING
 void network_crawler_test_reset(void);
+/* Resolve current process environment into an already-defaulted test config.
+ * Test-only seam: production applies this during network_crawler_start(). */
+void network_crawler_test_config_from_env(struct network_crawler_config *cfg);
 void network_crawler_test_set_probe_fn(ncrawl_probe_fn fn);
 void network_crawler_test_set_own_modal(int64_t h);
 /* Drive one synchronous probe round over addrs[0..n) using the (injected)

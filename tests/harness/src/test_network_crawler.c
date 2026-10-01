@@ -24,6 +24,7 @@
 #include "test/test_core.h"
 
 #include "services/network_crawler.h"
+#include "network_crawler_internal.h"
 #include "conditions/net_eclipse_suspected.h"
 #include "json/json.h"
 #include "net/netaddr.h"
@@ -33,9 +34,11 @@
 #include "util/blocker.h"
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <string.h>
 
 #define NC_CHECK(cond) do { \
@@ -172,10 +175,117 @@ static struct ncrawl_probe_result mk_res(const char *addr, bool reachable,
     return r;
 }
 
+struct crawler_env_saved {
+    bool was_set;
+    char *value;
+};
+
+static bool crawler_env_save(const char *name, struct crawler_env_saved *saved)
+{
+    const char *value;
+    size_t len;
+
+    if (!name || !saved)
+        return false;
+    saved->was_set = false;
+    saved->value = NULL;
+    value = getenv(name);
+    if (!value)
+        return true;
+    len = strlen(value);
+    if (len == SIZE_MAX)
+        return false;
+    saved->value = malloc(len + 1u);
+    if (!saved->value)
+        return false;
+    memcpy(saved->value, value, len + 1u);
+    saved->was_set = true;
+    return true;
+}
+
+static bool crawler_env_restore(const char *name, struct crawler_env_saved *saved)
+{
+    int rc;
+
+    if (!name || !saved)
+        return false;
+    rc = saved->was_set ? setenv(name, saved->value, 1) : unsetenv(name);
+    free(saved->value);
+    saved->value = NULL;
+    return rc == 0;
+}
+
+static bool crawler_env_config_is_strict(void)
+{
+    struct network_crawler_config cfg;
+    struct crawler_env_saved interval;
+    struct crawler_env_saved budget;
+    network_crawler_config_defaults(&cfg);
+    int default_interval = cfg.round_interval_secs;
+    int default_budget = cfg.onion_round_budget_ms;
+    bool interval_saved = crawler_env_save("ZCL_NETCRAWL_INTERVAL_SECS",
+                                           &interval);
+    bool budget_saved = crawler_env_save("ZCL_NETCRAWL_ONION_BUDGET_MS",
+                                         &budget);
+    if (!interval_saved || !budget_saved) {
+        if (interval_saved)
+            (void)crawler_env_restore("ZCL_NETCRAWL_INTERVAL_SECS", &interval);
+        return false;
+    }
+    bool env_ok = setenv("ZCL_NETCRAWL_INTERVAL_SECS", "5junk", 1) == 0 &&
+                  setenv("ZCL_NETCRAWL_ONION_BUDGET_MS",
+                         "999999999999999999999", 1) == 0;
+    if (env_ok)
+        network_crawler_test_config_from_env(&cfg);
+    bool malformed_rejected = cfg.round_interval_secs == default_interval &&
+                              cfg.onion_round_budget_ms == default_budget;
+    bool valid_set = setenv("ZCL_NETCRAWL_INTERVAL_SECS", "17", 1) == 0;
+    if (valid_set)
+        network_crawler_test_config_from_env(&cfg);
+    bool valid_applied = cfg.round_interval_secs == 17;
+    bool interval_restored = crawler_env_restore("ZCL_NETCRAWL_INTERVAL_SECS",
+                                                 &interval);
+    bool budget_restored = crawler_env_restore("ZCL_NETCRAWL_ONION_BUDGET_MS",
+                                               &budget);
+    return env_ok && malformed_rejected && valid_set && valid_applied &&
+           interval_restored && budget_restored;
+}
+
 int test_network_crawler(void)
 {
     int failures = 0;
     printf("network_crawler...\n");
+
+    /* The dial seam must retain hard resource bounds even if an internal
+     * caller constructs limits directly rather than through runtime config. */
+    printf("  direct limits: normalize every resource cap... ");
+    {
+        struct ncrawl_round_limits lim = {
+            .concurrent = INT_MAX,
+            .connect_timeout_ms = INT_MAX,
+            .handshake_timeout_ms = INT_MIN,
+            .onion_per_round = INT_MAX,
+            .onion_concurrent = INT_MIN,
+            .onion_timeout_ms = INT_MAX,
+            .onion_round_budget_ms = INT_MAX,
+        };
+        ncrawl_round_limits_normalize(&lim);
+        NC_CHECK(lim.concurrent == NCRAWL_MAX_CONCURRENT);
+        NC_CHECK(lim.connect_timeout_ms == NCRAWL_CONNECT_TIMEOUT_MS_MAX);
+        NC_CHECK(lim.handshake_timeout_ms == 100);
+        NC_CHECK(lim.onion_per_round == NCRAWL_MAX_ONION_PER_ROUND);
+        NC_CHECK(lim.onion_concurrent == 1);
+        NC_CHECK(lim.onion_timeout_ms == NCRAWL_ONION_TIMEOUT_MS_MAX);
+        NC_CHECK(lim.onion_round_budget_ms == NCRAWL_ONION_ROUND_BUDGET_MS_MAX);
+        ncrawl_round_limits_normalize(NULL);
+        printf("done\n");
+    }
+
+    printf("  config: malformed and overflowing env stays bounded... ");
+    {
+        NC_CHECK(crawler_env_config_is_strict());
+        printf("done\n");
+    }
 
     /* ── 1. pure fold: histograms, splits, height distribution ─────────── */
     printf("  census fold: histogram + split + height distribution... ");

@@ -222,25 +222,15 @@ int ncrawl_run_round(const struct net_address *addrs, int n,
     if (n > NCRAWL_MAX_PER_ROUND)
         n = NCRAWL_MAX_PER_ROUND;
 
-    int concurrent = lim->concurrent;
-    int ct_ms = lim->connect_timeout_ms;
-    int ht_ms = lim->handshake_timeout_ms;
-    int onion_per_round = lim->onion_per_round;
-    int onion_concurrent = lim->onion_concurrent;
-    int onion_timeout_ms = lim->onion_timeout_ms;
-    int onion_budget_ms = lim->onion_round_budget_ms;
-    if (concurrent < 1) concurrent = 1;
-    if (concurrent > NCRAWL_MAX_CONCURRENT) concurrent = NCRAWL_MAX_CONCURRENT;
-    if (ct_ms < 100) ct_ms = 100;
-    if (ht_ms < 100) ht_ms = 100;
-    if (onion_per_round < 0) onion_per_round = 0;
-    if (onion_per_round > NCRAWL_MAX_ONION_PER_ROUND)
-        onion_per_round = NCRAWL_MAX_ONION_PER_ROUND;
-    if (onion_concurrent < 1) onion_concurrent = 1;
-    if (onion_concurrent > NCRAWL_MAX_ONION_CONCURRENT)
-        onion_concurrent = NCRAWL_MAX_ONION_CONCURRENT;
-    if (onion_timeout_ms < 100) onion_timeout_ms = 100;
-    if (onion_budget_ms < 0) onion_budget_ms = 0;
+    struct ncrawl_round_limits bounded = *lim;
+    ncrawl_round_limits_normalize(&bounded);
+    int concurrent = bounded.concurrent;
+    int ct_ms = bounded.connect_timeout_ms;
+    int ht_ms = bounded.handshake_timeout_ms;
+    int onion_per_round = bounded.onion_per_round;
+    int onion_concurrent = bounded.onion_concurrent;
+    int onion_timeout_ms = bounded.onion_timeout_ms;
+    int onion_budget_ms = bounded.onion_round_budget_ms;
 
     int clear_idx[NCRAWL_MAX_PER_ROUND];
     int onion_idx[NCRAWL_MAX_PER_ROUND];
@@ -287,4 +277,3 @@ int ncrawl_run_round(const struct net_address *addrs, int n,
     }
     return acc.recorded;
 }
-
