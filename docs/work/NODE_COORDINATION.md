@@ -3050,10 +3050,10 @@ sealed-core, and consensus-parity checks pass while these non-core production
 sources are present. Consensus impact: NONE. This changes only local acceptance of
 process environment configuration and keeps all invalid input at existing safe
 defaults.  Worldstream's storage/startup and Kimi's coverage-manifest paths
-remain untouched.  Remaining risk: this unsigned local candidate needs the
-operator-provided authorized signing mechanism already described above before
-it can be committed and pushed; no further test-capacity blocker remains for
-the focused group.
+remain untouched. The signed crawler commit
+`25342370d3cfc9ed49e253981a9fce13f6a76835` is published with its remote SHA
+verified. Remaining risk: no focused-capacity blocker remains; the optional
+TSan profile was not run because this slice changes no shared-thread behavior.
 
 ## Fresh-sync fixture sanitizer dependency
 
