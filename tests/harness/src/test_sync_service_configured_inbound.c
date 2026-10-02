@@ -2227,7 +2227,16 @@ static int test_configured_inbound_probe_thread(void)
         ASSERT(gate_wait_calls(1));
         ASSERT(configured_sync_peer_request_probe(c[0].in) == 0);  /* busy */
         ASSERT(!syncsvc_peer_is_configured_inbound(c[0].in));
+        struct net_service target = {0};
+        net_addr_set_ipv4(&target.addr, a.ip);
+        target.port = a.port;
+        uint8_t learned[32];
+        ASSERT(configured_sync_peer_forget(&target));
+        ASSERT(configured_sync_peer_note(&target));
         gate_set(true);
+        ASSERT(configured_sync_peers_join_probe_for_testing());
+        ASSERT(!configured_sync_peer_identity(&target, learned));
+        ASSERT(configured_sync_peer_request_probe(c[0].in) == 1);
         ASSERT(configured_sync_peers_join_probe_for_testing());
         ASSERT(syncsvc_peer_is_configured_inbound(c[0].in));
 
@@ -2236,14 +2245,14 @@ static int test_configured_inbound_probe_thread(void)
         g_model_now += CONFIGURED_SYNC_PEER_PROBE_RETRY_SECS;
         ASSERT(configured_sync_peer_request_probe(c[1].in) == 1);
         ASSERT(configured_sync_peers_join_probe_for_testing());
-        ASSERT(g_gate_calls == 2);
+        ASSERT(g_gate_calls == 3);
         ASSERT(!syncsvc_peer_is_configured_inbound(c[1].in));
 
         /* Stop ends a probe held at the gate and joins its thread. */
         gate_set(false);
         g_model_now += CONFIGURED_SYNC_PEER_PROBE_RETRY_SECS;
         ASSERT(configured_sync_peer_request_probe(c[1].in) == 1);
-        ASSERT(gate_wait_calls(3));
+        ASSERT(gate_wait_calls(4));
         configured_sync_peers_stop();
         ASSERT(g_gate_saw_stop);
         ASSERT(!configured_sync_peers_join_probe_for_testing());
