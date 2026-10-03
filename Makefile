@@ -365,7 +365,8 @@ ZCL_WINDOWS_LAUNCHER_GOALS := windows-headless-run windows-headless-run-selftest
 # Build queries and game-only goals need no node vendor configure.
 ZCL_BUILD_QUERY_GOALS := print-node-c23-srcs help doctor doctor-build timings agent-dev-status print-CFLAGS print-DEV-CFLAGS print-LDFLAGS print-DEV-LDFLAGS print-build-flags
 ZCL_HOOK_ONLY_GOALS := git-hook git-hook-selftest git-hook-bootstrap-selftest install-hooks hooks-status check-git-hooks-installed
-ZCL_BOOTSTRAP_HELPER_ONLY := $(if $(strip $(MAKECMDGOALS)),$(if $(strip $(filter-out $(ZCL_WINDOWS_LAUNCHER_GOALS) $(ZCL_TOR_PROVENANCE_GOALS) $(ZCL_BUILD_QUERY_GOALS) $(ZCL_HOOK_ONLY_GOALS) check-capability-inventory-generated docs-proof-tools game game-check game-platform-probe,$(MAKECMDGOALS))),,1),)
+ZCL_LIGHTWEIGHT_BUILD_GOALS := bench_fresh_sync bench-fresh-sync-isolation-selftest
+ZCL_BOOTSTRAP_HELPER_ONLY := $(if $(strip $(MAKECMDGOALS)),$(if $(strip $(filter-out $(ZCL_WINDOWS_LAUNCHER_GOALS) $(ZCL_TOR_PROVENANCE_GOALS) $(ZCL_BUILD_QUERY_GOALS) $(ZCL_HOOK_ONLY_GOALS) $(ZCL_LIGHTWEIGHT_BUILD_GOALS) check-capability-inventory-generated docs-proof-tools game game-check game-platform-probe,$(MAKECMDGOALS))),,1),)
 ifneq ($(ZCL_STANDALONE_CLEAN),1)
 ifneq ($(ZCL_WORKTREE_PRIME_ONLY),1)
 ifneq ($(ZCL_PORTABLE_FRONTDOOR_ONLY),1)
@@ -1468,7 +1469,7 @@ ZCL_TOR_SKIP_GOALS := clean distclean clean-% help tor-full tor-ready c3-mutex-p
 	vendor vendor-force vendor-ready vendor-provenance worktree-prime \
 	worktree-prime-selftest install-hooks setup \
 	check-% lint lint-% %-selftest docs docs-% $(ZCL_WINDOWS_LAUNCHER_GOALS) game game-check game-platform-probe \
-	$(ZCL_TOR_PROVENANCE_GOALS) $(ZCL_BUILD_QUERY_GOALS) $(ZCL_HOOK_ONLY_GOALS)
+	$(ZCL_TOR_PROVENANCE_GOALS) $(ZCL_BUILD_QUERY_GOALS) $(ZCL_HOOK_ONLY_GOALS) $(ZCL_LIGHTWEIGHT_BUILD_GOALS)
 ZCL_TOR_LINK_REQUESTED := $(if $(strip $(MAKECMDGOALS)),\
 	$(strip $(filter-out $(ZCL_TOR_SKIP_GOALS),$(MAKECMDGOALS))),default-goal)
 
@@ -10390,6 +10391,10 @@ $(BIN_DIR)/bench_fresh_sync: tools/bench_fresh_sync.c \
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -Iplatform/modules/platform/include -Iplatform/modules/base/include -Iplatform/modules/util/include \
 	    -D_DEFAULT_SOURCE -o $@ $^
+
+.PHONY: bench-fresh-sync-isolation-selftest
+bench-fresh-sync-isolation-selftest: $(BIN_DIR)/bench_fresh_sync
+	@sh tools/bench_fresh_sync_isolation_selftest.sh "$(abspath $(BIN_DIR)/bench_fresh_sync)"
 
 # Per-ISA-tier crypto microbenchmark (tools/simd_bench.c). Drives the SAME
 # input through EVERY ISA tier of each primitive (generic / SHA-NI / AVX2 /
