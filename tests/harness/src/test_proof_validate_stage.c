@@ -21,6 +21,7 @@
 #include "validation/main_state.h"
 
 #include <sqlite3.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,22 @@
     if ((expr)) printf("OK\n"); \
     else { printf("FAIL\n"); failures++; } \
 } while (0)
+
+static int test_pv_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    PV_CHECK("cursor: representable durable height is retained",
+             proof_validate_stage_test_cursor_height(INT32_MAX, &height) &&
+             height == INT32_MAX);
+    PV_CHECK("cursor: unrepresentable durable heights are refused before narrowing",
+             !proof_validate_stage_test_cursor_height(
+                 (uint64_t)INT32_MAX + 1u, &height) &&
+             !proof_validate_stage_test_cursor_height(UINT64_C(1) << 32,
+                                                       &height) &&
+             !proof_validate_stage_test_cursor_height(UINT64_MAX, &height));
+    return failures;
+}
 
 enum pv_fail_kind {
     PV_FAIL_NONE = 0,
@@ -394,6 +411,7 @@ int test_proof_validate_stage(void)
     printf("\n=== proof_validate_stage tests ===\n");
     int failures = 0;
 
+    failures += test_pv_cursor_conversion_bounds();
     blocker_module_init();
 
     {

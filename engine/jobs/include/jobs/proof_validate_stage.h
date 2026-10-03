@@ -80,6 +80,13 @@ void proof_validate_stage_set_reader(proof_validate_reader_fn fn, void *user);
 void proof_validate_stage_set_tx_verifier(proof_validate_tx_verify_fn fn,
                                           void *user);
 
+#ifdef ZCL_TESTING
+/* Durable stage cursors are uint64_t, while block-index heights are signed
+ * ints. Keep the conversion explicit so corrupt local progress cannot wrap
+ * into a different verified height. */
+bool proof_validate_stage_test_cursor_height(uint64_t cursor, int *out);
+#endif
+
 /* Cross-height proof pre-verification pool (jobs/pv_lookahead.h): start/stop
  * the pool bound to this stage's exact (main_state, datadir, reader, verifier)
  * tuple. Production callers of the start are engine/composition/src/boot_mint_anchor.c
