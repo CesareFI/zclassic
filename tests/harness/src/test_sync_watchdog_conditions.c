@@ -18,6 +18,7 @@
 #include "validation/chainstate.h"
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <string.h>
 
 #define SYNC_WATCHDOG_CHECK(name, expr) do { \
@@ -968,6 +969,16 @@ int test_sync_watchdog_conditions(void)
         SYNC_WATCHDOG_CHECK(
             "local header refill clears after active tip advances", ok);
         cleanup_sync_watchdog();
+    }
+
+    {
+        struct watchdog_stats stats;
+        sync_monitor_test_set_recoveries_total(INT_MAX);
+        sync_monitor_record_recovery(WATCHDOG_BLOCK_STALL, 1, 2, 3,
+                                     "counter saturation");
+        sync_monitor_get_stats(&stats);
+        SYNC_WATCHDOG_CHECK("recovery count saturates",
+                            stats.recoveries_total == INT_MAX);
     }
 
     cleanup_sync_watchdog();

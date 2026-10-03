@@ -152,6 +152,7 @@ void sync_monitor_test_set_local_recovery(bool active,
 /* Override the last-block-connected timestamp so tip_advance_age() returns a
  * deterministic value. Pass 0 to restore the "never connected" sentinel. */
 void sync_monitor_test_set_tip_advance_ts(int64_t ts);
+void sync_monitor_test_set_recoveries_total(int total);
 #endif
 
 #endif /* ZCL_SERVICES_SYNC_MONITOR_H */

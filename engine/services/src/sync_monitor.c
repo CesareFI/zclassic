@@ -22,6 +22,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -85,6 +86,16 @@ static struct {
  * cs_nodes-derived state to locals and only touches g_local_recovery after
  * releasing cs_nodes, so the two never nest. */
 static pthread_mutex_t g_local_recovery_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void sync_monitor_increment_recoveries(void)
+{
+    int current = atomic_load_explicit(&g_recoveries_total, memory_order_relaxed);
+    while (current < INT_MAX &&
+           !atomic_compare_exchange_weak_explicit(
+               &g_recoveries_total, &current, current + 1,
+               memory_order_relaxed, memory_order_relaxed)) {
+    }
+}
 
 void sync_monitor_init(void)
 {
@@ -319,7 +330,7 @@ void sync_monitor_record_recovery(enum watchdog_recovery_type type,
                                   int peer_count,
                                   const char *reason)
 {
-    atomic_fetch_add(&g_recoveries_total, 1);
+    sync_monitor_increment_recoveries();
     atomic_store(&g_last_recovery_time,
                  (int64_t)platform_time_wall_time_t());
     atomic_store(&g_last_recovery_type, (int)type);
@@ -895,5 +906,10 @@ void sync_monitor_test_set_tip_advance_ts(int64_t ts)
 {
     atomic_store(&g_tip_advance_test_override, true);
     atomic_store(&g_last_block_connected_ts, ts);
+}
+
+void sync_monitor_test_set_recoveries_total(int total)
+{
+    atomic_store(&g_recoveries_total, total);
 }
 #endif
