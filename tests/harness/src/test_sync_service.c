@@ -1884,11 +1884,20 @@ static int test_sync_service_builds_alt_recovery_plan(void)
     int failures = 0;
 
     TEST("sync_service finds same-chain alternate blocks for stall recovery") {
+        struct main_state max_state = {0};
+        struct p2p_node max_node = {0};
+        struct sync_stall_recovery max_recovery = {0};
         struct main_state ms;
         struct p2p_node node;
         struct sync_stall_recovery recovery;
         struct uint256 hg = {0}, h1 = {0}, h2 = {0}, h3 = {0}, h4 = {0};
         struct block_index g, b1, alt2, alt3, fork2;
+
+        atomic_store(&max_state.chain_active.height, INT_MAX);
+        max_node.state = PEER_SYNCING_BLOCKS;
+        max_node.starting_height = INT_MAX;
+        ASSERT(!syncsvc_build_stall_recovery(&max_recovery, &max_state,
+                                             &max_node, 0, 0, 1000));
 
         memset(&node, 0, sizeof(node));
         memset(&g, 0, sizeof(g));

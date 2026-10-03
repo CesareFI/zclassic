@@ -458,7 +458,7 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
 
     int our_h = active_chain_height(&ms->chain_active);
     if (queued != 0 || in_flight != 0) return false;
-    if (node->starting_height <= our_h + 10) return false;
+    if ((int64_t)node->starting_height <= (int64_t)our_h + 10) return false;
     if (node->state < PEER_HANDSHAKE_COMPLETE) return false;
     if (!syncsvc_stall_recovery_due(now_seconds)) return false;
 
