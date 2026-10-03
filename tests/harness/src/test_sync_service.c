@@ -1672,6 +1672,10 @@ static int test_sync_service_tip_stale_warning_throttle(void)
         ASSERT(syncsvc_should_warn_tip_stale(&snapshot, &node, 1000));
         ASSERT(!syncsvc_should_warn_tip_stale(&snapshot, &node, 1200));
         ASSERT(syncsvc_should_warn_tip_stale(&snapshot, &node, 1301));
+        /* Rollback is a fresh rate-limit epoch: emit one recovery request,
+         * then suppress repeated ticks at the corrected wall time. */
+        ASSERT(syncsvc_should_warn_tip_stale(&snapshot, &node, 1200));
+        ASSERT(!syncsvc_should_warn_tip_stale(&snapshot, &node, 1200));
 
         node.inbound = true;
         ASSERT(!syncsvc_should_warn_tip_stale(&snapshot, &node, 1700));

@@ -667,6 +667,10 @@ bool syncsvc_should_warn_tip_stale(
 {
     if (!snapshot || !node || node->inbound || !snapshot->tip_stale)
         return false;
+    if (now_seconds < g_last_stale_warn) {
+        g_last_stale_warn = now_seconds;
+        return true;
+    }
     if (now_seconds - g_last_stale_warn <= 300)
         return false;
 
