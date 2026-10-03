@@ -781,6 +781,8 @@ bool syncsvc_is_header_sync_stalled(enum sync_state state,
         return false;
     if (last_advance_time == 0)
         return false;
+    if (now_seconds < last_advance_time)
+        return true;
     return (now_seconds - last_advance_time) >= HEADER_STALL_TIMEOUT_SECS;
 }
 

@@ -263,7 +263,9 @@ int test_header_sync_stall(void)
             SYNC_HEADERS_DOWNLOAD, 5000, 1000, 1119);
         bool at_120 = syncsvc_is_header_sync_stalled(
             SYNC_HEADERS_DOWNLOAD, 5000, 1000, 1120);
-        bool ok = !at_119 && at_120;
+        bool rollback = syncsvc_is_header_sync_stalled(
+            SYNC_HEADERS_DOWNLOAD, 5000, 1000, 999);
+        bool ok = (!at_119) & at_120 & rollback;
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 
