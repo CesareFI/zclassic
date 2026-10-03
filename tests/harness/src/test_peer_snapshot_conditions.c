@@ -16,6 +16,7 @@
 #include "validation/chainstate.h"
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -139,6 +140,25 @@ int test_peer_snapshot_conditions(void)
 {
     printf("\n=== peer and snapshot condition tests ===\n");
     int failures = 0;
+
+    {
+        struct fake_clock_peer_snapshot clock;
+        fake_clock_install(&clock, 1000);
+        struct connman cm;
+        struct download_manager dm;
+        struct main_state ms;
+        reset_peer_snapshot_conditions(&cm, &dm, &ms);
+        register_sync_violation_lag();
+        struct p2p_node peer = {0};
+        peer.starting_height = INT_MAX;
+        struct p2p_node *peers[1] = { &peer };
+        cm.manager.nodes = peers;
+        cm.manager.num_nodes = 1;
+        condition_engine_tick();
+        PEER_SNAPSHOT_CHECK("sync violation ignores extreme peer before local tip",
+                            sync_violation_lag_test_remedy_calls() == 0);
+        cleanup_peer_snapshot_conditions();
+    }
 
     {
         struct fake_clock_peer_snapshot clock;

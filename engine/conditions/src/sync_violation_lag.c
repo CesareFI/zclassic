@@ -12,6 +12,7 @@
 #include "validation/chainstate.h"
 #include "validation/main_state.h"
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 
@@ -31,6 +32,11 @@ static _Atomic int64_t g_age_at_detect;
 static _Atomic int g_test_remedy_calls;
 #endif
 
+static int64_t sync_violation_height_gap(int peer_height, int local_height)
+{
+    return (int64_t)peer_height - (int64_t)local_height;
+}
+
 static bool detect_sync_violation_lag(void)
 {
     struct connman *cm = sync_monitor_connman();
@@ -42,7 +48,7 @@ static bool detect_sync_violation_lag(void)
 
     int local = active_chain_height(&ms->chain_active);
     int peer_max = connman_max_peer_height(cm);
-    int gap = peer_max - local;
+    int64_t gap = sync_violation_height_gap(peer_max, local);
     if (peer_max <= 0 || local < 0 || gap <= SYNC_VIOLATION_GAP) {
         atomic_store(&g_first_seen_unix, 0);
         atomic_store(&g_last_local_seen, local);
@@ -68,7 +74,8 @@ static bool detect_sync_violation_lag(void)
 
     atomic_store(&g_local_tip_at_detect, local);
     atomic_store(&g_peer_max_at_detect, peer_max);
-    atomic_store(&g_gap_at_detect, gap);
+    atomic_store(&g_gap_at_detect,
+                 gap > INT_MAX ? INT_MAX : (int)gap);
     atomic_store(&g_age_at_detect, age);
     return true;
 }
@@ -115,7 +122,8 @@ static bool witness_sync_violation_lag(int64_t target_at_detect)
         return false;
     int local = active_chain_height(&ms->chain_active);
     int peer_max = connman_max_peer_height(cm);
-    return peer_max - local <= SYNC_VIOLATION_GAP;
+    return sync_violation_height_gap(peer_max, local) <=
+           SYNC_VIOLATION_GAP;
 }
 
 static struct condition c_sync_violation_lag = {
