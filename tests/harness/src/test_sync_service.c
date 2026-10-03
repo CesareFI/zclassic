@@ -2237,14 +2237,26 @@ static int test_sync_service_benchmark_tail_phases(void)
         sync_benchmark_reset_for_test();
         sync_benchmark_init(NULL);
 
+        struct sync_block_assignment plan;
+        memset(&plan, 0, sizeof(plan));
+        syncsvc_plan_block_assignment(&plan, NULL, 0, 100000);
+        ASSERT(!plan.should_assign);
+        struct json_value rejected_dump;
+        json_init(&rejected_dump);
+        ASSERT(sync_benchmark_dump_state_json(&rejected_dump, NULL));
+        const struct json_value *rejected_timings =
+            json_get(&rejected_dump, "timings_ms");
+        const struct json_value *rejected_tail_download =
+            rejected_timings ? json_get(rejected_timings, "tail_download") : NULL;
+        ASSERT(rejected_tail_download && json_is_null(rejected_tail_download));
+        json_free(&rejected_dump);
+
         struct p2p_node node;
         memset(&node, 0, sizeof(node));
         node.id = 11;
         node.state = PEER_HANDSHAKE_COMPLETE;
         node.starting_height = 100200;
 
-        struct sync_block_assignment plan;
-        memset(&plan, 0, sizeof(plan));
         syncsvc_plan_block_assignment(&plan, &node, 0, 100000);
         ASSERT(plan.should_assign);
 
