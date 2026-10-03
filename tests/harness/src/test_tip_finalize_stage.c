@@ -25,6 +25,7 @@
 #include "validation/main_state.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,22 @@ int tip_finalize_trusted_anchor_at(sqlite3 *db, int height,
     if ((expr)) printf("OK\n"); \
     else { printf("FAIL\n"); failures++; } \
 } while (0)
+
+static int test_tf_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    TF_CHECK("cursor: representable durable height is retained",
+             tip_finalize_stage_test_cursor_height(INT32_MAX, &height) &&
+             height == INT32_MAX);
+    TF_CHECK("cursor: unrepresentable durable heights are refused before narrowing",
+             !tip_finalize_stage_test_cursor_height(
+                 (uint64_t)INT32_MAX + 1u, &height) &&
+             !tip_finalize_stage_test_cursor_height(UINT64_C(1) << 32,
+                                                     &height) &&
+             !tip_finalize_stage_test_cursor_height(UINT64_MAX, &height));
+    return failures;
+}
 
 /* Test-only override of the compiled SHA3-checkpoint floor — lets H* track the
  * synthetic sub-checkpoint heights instead of clamping up to the mainnet
@@ -632,6 +649,7 @@ int test_tip_finalize_stage(void)
     printf("\n=== tip_finalize_stage tests ===\n");
     int failures = 0;
 
+    failures += test_tf_cursor_conversion_bounds();
     blocker_module_init();
 
     /* uv_cursor_gap crash-window clamp (Lane C root-cause fix).

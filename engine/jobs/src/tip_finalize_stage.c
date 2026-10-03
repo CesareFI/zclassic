@@ -30,6 +30,7 @@
 
 #include <pthread.h>
 #include <sqlite3.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -243,6 +244,21 @@ static bool live_utxo_count_after(int height_after, int64_t *out_count)
     return tip_finalize_hooks_count_utxos(height_after, out_count);
 }
 
+static bool tf_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool tip_finalize_stage_test_cursor_height(uint64_t cursor, int *out)
+{
+    return tf_cursor_height(cursor, out);
+}
+#endif
+
 static job_result_t step_finalize(struct stage_step_ctx *c)
 {
     tip_finalize_observe_mark_step();
@@ -252,8 +268,12 @@ static job_result_t step_finalize(struct stage_step_ctx *c)
     sqlite3 *db = progress_store_db();
     if (!db) return JOB_IDLE;
 
-    int next_h = (int)c->cursor_in;
-    if (next_h < 0) return JOB_FATAL;
+    int next_h = 0;
+    if (!tf_cursor_height(c->cursor_in, &next_h)) {
+        LOG_WARN(STAGE_NAME, "[tip_finalize] cursor out of range: %llu",
+                 (unsigned long long)c->cursor_in);
+        return JOB_FATAL;
+    }
 
     uint64_t uv_cursor = 0;
     if (!stage_upstream_frontier_or_zero(db, "utxo_apply", STAGE_NAME,

@@ -27,6 +27,10 @@ typedef bool (*tip_finalize_utxo_count_fn)(int height_after,
 bool tip_finalize_stage_init(struct main_state *ms);
 void tip_finalize_stage_shutdown(void);
 
+#ifdef ZCL_TESTING
+bool tip_finalize_stage_test_cursor_height(uint64_t cursor, int *out);
+#endif
+
 /* Force the authoritative tip state (height + hash). Used during
  * trusted bypasses (bootstrap/sync). */
 void tip_finalize_stage_set_authoritative_tip(int height,
