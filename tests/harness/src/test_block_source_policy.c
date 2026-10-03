@@ -786,6 +786,36 @@ static int test_bsp_projection_deferral_total_saturates(void)
     return failures;
 }
 
+static int test_bsp_decision_total_saturates(void)
+{
+    int failures = 0;
+    TEST_CASE("block_source_policy: restored decision total saturates")
+    {
+        struct node_db ndb;
+        struct json_value root;
+        const struct json_value *total;
+        const char op[] = "peer_floor";
+
+        ASSERT(node_db_open(&ndb, ":memory:"));
+        ASSERT(node_db_state_set(&ndb,
+            "chain_advance_coordinator.last_op", op, sizeof(op)));
+        ASSERT(node_db_state_set_int(
+            &ndb, "chain_advance_coordinator.decisions_total", INT64_MAX));
+        block_source_policy_reset_for_test();
+        block_source_policy_init(NULL, NULL, &ndb);
+        ASSERT(block_source_policy_peer_floor_recovery_needed(
+            0, 1, 7, 8, NULL));
+        json_init(&root);
+        ASSERT(block_source_policy_dump_state_json(&root, NULL));
+        total = json_get(&root, "decisions_total");
+        ASSERT(total != NULL && json_get_int(total) == INT64_MAX);
+        json_free(&root);
+        block_source_policy_reset_for_test();
+        node_db_close(&ndb);
+    } TEST_END
+    return failures;
+}
+
 static struct p2p_node *test_bsp_add_peer(struct connman *cm,
                                           unsigned char a,
                                           unsigned char b,
@@ -2064,6 +2094,7 @@ int test_block_source_policy(void)
     failures += test_bsp_dump_reports_projection_lag();
     failures += test_bsp_projection_deferral_accounting();
     failures += test_bsp_projection_deferral_total_saturates();
+    failures += test_bsp_decision_total_saturates();
     failures += test_bsp_dump_populates_p2p_diversity();
     failures += test_bsp_selects_viable_caught_up_p2p();
     failures += test_bsp_selects_single_caught_up_p2p();

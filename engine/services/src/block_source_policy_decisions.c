@@ -23,8 +23,18 @@
 #include "util/sync.h"
 
 #include <stdarg.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+
+static int64_t bsp_next_decisions_total(int64_t total)
+{
+    if (total < 0)
+        return 1;
+    if (total == INT64_MAX)
+        return INT64_MAX;
+    return total + 1;
+}
 
 struct zcl_result bsp_record_decision(const char *op,
                                       const struct bsp_decision *d)
@@ -44,7 +54,7 @@ struct zcl_result bsp_record_decision(const char *op,
     g_bsp.has_last = true;
     g_bsp.last_decision_time = when;
     bsp_copy_text(g_bsp.last_op, sizeof(g_bsp.last_op), op_copy);
-    g_bsp.decisions_total++;
+    g_bsp.decisions_total = bsp_next_decisions_total(g_bsp.decisions_total);
     total = g_bsp.decisions_total;
     ndb = g_bsp.node_db;
     zcl_mutex_unlock(&g_bsp.lock);
