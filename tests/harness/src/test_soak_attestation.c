@@ -690,6 +690,32 @@ static int test_sync_benchmark_bytes_reused_on_resume(void)
     return failures;
 }
 
+static int test_sync_benchmark_byte_counter_saturates(void)
+{
+    int failures = 0;
+    TEST("sync_benchmark: oversized counter input saturates") {
+        sync_benchmark_reset_for_test();
+        sync_benchmark_init(NULL);
+        sync_benchmark_note_downloaded(UINT64_MAX);
+
+        struct json_value receipt = {0};
+        json_init(&receipt);
+        bool ok = sync_benchmark_build_receipt(&receipt, false,
+                                               "counter_fixture");
+        const struct json_value *resources = json_get(&receipt, "resources");
+        const struct json_value *downloaded =
+            resources ? json_get(resources, "bytes_downloaded") : NULL;
+        ok = ok && downloaded && downloaded->type == JSON_INT &&
+             json_get_int(downloaded) == INT64_MAX;
+        json_free(&receipt);
+        sync_benchmark_reset_for_test();
+
+        if (ok) PASS();
+        else { printf("FAIL: oversized byte counter did not saturate\n"); failures++; }
+    }
+    return failures;
+}
+
 static int test_sync_benchmark_derived_monotonic(void)
 {
     int failures = 0;
@@ -817,6 +843,7 @@ int test_soak_attestation(void)
     failures += test_sync_benchmark_receipt_wellformed();
     failures += test_sync_benchmark_incomplete_on_abort();
     failures += test_sync_benchmark_bytes_reused_on_resume();
+    failures += test_sync_benchmark_byte_counter_saturates();
     failures += test_sync_benchmark_derived_monotonic();
     failures += test_sync_benchmark_no_datadir_no_write();
     failures += test_sync_benchmark_private_replacement();
