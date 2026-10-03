@@ -105,6 +105,12 @@ struct zcl_result lms_remote_hash_at(int height, char out_hex[65]);
 void lms_refresh_local_heights(int *out_local, int *out_header);
 struct zcl_result lms_request_catchup_result_internal(const char *reason);
 
+#ifdef ZCL_TESTING
+void lms_test_evaluate_lag_slo(int lag, int breach_blocks, int breach_secs,
+                               int critical_blocks, int critical_secs,
+                               int64_t now);
+#endif
+
 /* Trend-history write for one comparison outcome (parity_slo, see
  * legacy_mirror_sync_parity_trend.c). Best-effort: a missing/unopened
  * node.db is a silent no-op. `height` is the comparison height passed to

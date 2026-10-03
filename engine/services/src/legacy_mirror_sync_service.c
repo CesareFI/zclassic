@@ -559,6 +559,18 @@ static void lms_record_stuck_status(int height)
  *      ≥ breach_secs sustained → severity=critical (one emit)
  *   lag ≥ critical_blocks     → start/continue critical timer
  *      ≥ critical_secs sustained → severity=fatal (one emit; node_health flips) */
+static int64_t lms_lag_elapsed_or_rearm(_Atomic int64_t *since,
+                                        _Atomic int *emitted, int64_t now)
+{
+    int64_t prior = atomic_load(since);
+    if (now <= 0 || prior <= 0 || now < prior) {
+        atomic_store(since, now > 0 ? now : 0);
+        atomic_store(emitted, 0);
+        return 0;
+    }
+    return now - prior;
+}
+
 static void lms_evaluate_lag_slo(int lag, int legacy_height, int local_height,
                                  int64_t now)
 {
@@ -584,12 +596,8 @@ static void lms_evaluate_lag_slo(int lag, int legacy_height, int local_height,
         return;
     }
 
-    int64_t since = atomic_load(&g_lms.lag_breach_since);
-    if (since == 0) {
-        atomic_store(&g_lms.lag_breach_since, now);
-        since = now;
-    }
-    int64_t breach_for = now - since;
+    int64_t breach_for = lms_lag_elapsed_or_rearm(
+        &g_lms.lag_breach_since, &g_lms.lag_breach_emitted, now);
 
     if (breach_for >= breach_secs &&
         !atomic_exchange(&g_lms.lag_breach_emitted, 1)) {
@@ -601,12 +609,8 @@ static void lms_evaluate_lag_slo(int lag, int legacy_height, int local_height,
     }
 
     if (critical_blocks > 0 && lag >= critical_blocks) {
-        int64_t csince = atomic_load(&g_lms.lag_critical_since);
-        if (csince == 0) {
-            atomic_store(&g_lms.lag_critical_since, now);
-            csince = now;
-        }
-        int64_t crit_for = now - csince;
+        int64_t crit_for = lms_lag_elapsed_or_rearm(
+            &g_lms.lag_critical_since, &g_lms.lag_critical_emitted, now);
         if (crit_for >= critical_secs &&
             !atomic_exchange(&g_lms.lag_critical_emitted, 1)) {
             event_emitf(EV_LAG_SLO_BREACH, 0,
@@ -620,6 +624,19 @@ static void lms_evaluate_lag_slo(int lag, int legacy_height, int local_height,
         atomic_store(&g_lms.lag_critical_emitted, 0);
     }
 }
+
+#ifdef ZCL_TESTING
+void lms_test_evaluate_lag_slo(int lag, int breach_blocks, int breach_secs,
+                               int critical_blocks, int critical_secs,
+                               int64_t now)
+{
+    atomic_store(&g_lms.lag_sla_breach_blocks, breach_blocks);
+    atomic_store(&g_lms.lag_sla_breach_secs, breach_secs);
+    atomic_store(&g_lms.lag_sla_critical_blocks, critical_blocks);
+    atomic_store(&g_lms.lag_sla_critical_secs, critical_secs);
+    lms_evaluate_lag_slo(lag, 200, 190, now);
+}
+#endif
 
 static void lms_observe_local_primary(int local, int legacy_blocks)
 {

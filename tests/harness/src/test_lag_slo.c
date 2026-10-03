@@ -14,6 +14,7 @@
 #include "test/test_core.h"
 
 #include "services/legacy_mirror_sync_service.h"
+#include "legacy_mirror_sync_internal.h"
 #include "event/event.h"
 #include "json/json.h"
 #include "util/supervisor.h"
@@ -110,6 +111,32 @@ static int test_snapshot_surfaces_thresholds(void)
         ASSERT(out.lag_sla_critical_blocks >= 0);
         ASSERT(out.lag_sla_breach_secs >= 0);
         ASSERT(out.lag_sla_critical_secs >= 0);
+    } TEST_END
+    return failures;
+}
+
+static int test_lag_slo_rearms_after_wall_clock_rollback(void)
+{
+    int failures = 0;
+    TEST_CASE("lag_slo: wall-clock rollback starts a fresh breach episode")
+    {
+        legacy_mirror_sync_reset_for_test();
+        atomic_store(&g_slo_breach_events, 0);
+        event_clear_observers(EV_LAG_SLO_BREACH);
+        event_observe(EV_LAG_SLO_BREACH, slo_observer, NULL);
+        lms_test_evaluate_lag_slo(10, 10, 60, 0, 0, 100);
+        lms_test_evaluate_lag_slo(10, 10, 60, 0, 0, 50);
+
+        struct legacy_mirror_sync_stats out = {0};
+        legacy_mirror_sync_stats_cached_snapshot(&out);
+        ASSERT(out.lag_breach_since == 50);
+
+        lms_test_evaluate_lag_slo(10, 10, 60, 0, 0, 110);
+        legacy_mirror_sync_stats_cached_snapshot(&out);
+        ASSERT(out.lag_breach_since == 50);
+        ASSERT(atomic_load(&g_slo_breach_events) == 1);
+        event_clear_observers(EV_LAG_SLO_BREACH);
+        legacy_mirror_sync_reset_for_test();
     } TEST_END
     return failures;
 }
@@ -339,6 +366,7 @@ int test_lag_slo(void)
     failures += test_event_names_are_stable();
     failures += test_severity_none_when_under_threshold();
     failures += test_snapshot_surfaces_thresholds();
+    failures += test_lag_slo_rearms_after_wall_clock_rollback();
     failures += test_slo_breach_observer_fires();
     failures += test_concurrent_catchup_observer_fires();
     failures += test_legacy_mirror_registers_supervisor_contract();
