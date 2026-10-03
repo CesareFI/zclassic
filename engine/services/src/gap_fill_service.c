@@ -41,6 +41,7 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <limits.h>
 
 struct gap_fill_state {
     pthread_t              thread;
@@ -204,21 +205,29 @@ bool gap_fill_compute_window(int active_tip_h, int best_header_h,
     memset(out, 0, sizeof(*out));
     out->effective_tip_h = active_tip_h;
     out->best_h = best_header_h;
-    out->lo = active_tip_h + 1;
     out->hi = active_tip_h;
 
-    if (floor_cursor > 0 &&
-        (int64_t)floor_cursor - 1 < (int64_t)out->effective_tip_h) {
-        out->effective_tip_h = (int)floor_cursor - 1;
+    /* Block-index heights are int. A persisted cursor outside that domain
+     * cannot safely bound body work, so leave this pass empty rather than
+     * narrowing it into a false low frontier. */
+    if (floor_cursor > (uint64_t)INT_MAX)
+        return false;
+
+    if (floor_cursor > 0) {
+        int floor_tip_h = (int)(floor_cursor - 1);
+        if (floor_tip_h < out->effective_tip_h)
+            out->effective_tip_h = floor_tip_h;
     }
 
-    out->lo = out->effective_tip_h + 1;
     out->hi = out->effective_tip_h;
     if (best_header_h <= out->effective_tip_h)
         return false;
 
-    int gap = best_header_h - out->effective_tip_h;
-    int count = gap < GAPFILL_WINDOW ? gap : GAPFILL_WINDOW;
+    /* `best_header_h > effective_tip_h` makes this duration positive, but
+     * their signed endpoints can still span more than INT_MAX. */
+    int64_t gap = (int64_t)best_header_h - out->effective_tip_h;
+    int count = gap < GAPFILL_WINDOW ? (int)gap : GAPFILL_WINDOW;
+    out->lo = out->effective_tip_h + 1;
     out->count = count;
     out->hi = out->effective_tip_h + count;
     out->has_work = count > 0;
