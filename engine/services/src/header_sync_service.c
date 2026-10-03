@@ -12,8 +12,12 @@
 #include "validation/sync_evidence_policy.h"
 #include "core/arith_uint256.h"
 #include "chain/chain.h"
+#include "util/pprev_walk.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <time.h>
+
+enum { SYNC_HEADER_CHAIN_WALK_CAP = 100000 };
 #include <stdatomic.h>
 #include "util/log_macros.h"
 #include "util/safe_alloc.h"
@@ -563,13 +567,11 @@ bool syncsvc_headers_chain_from_tip(const struct block_index *candidate,
                                     const struct block_index *tip,
                                     int our_height)
 {
-    const struct block_index *verify = candidate;
-    const struct block_index *last_valid = NULL;
-
-    while (verify && verify->nHeight > our_height) {
-        last_valid = verify;
-        verify = verify->pprev;
-    }
+    const struct block_index *verify = pprev_walk_until_height(
+        (struct block_index *)candidate, our_height,
+        SYNC_HEADER_CHAIN_WALK_CAP, "header_sync.chain_from_tip");
+    if (!verify)
+        return false;
 
     if (verify == tip)
         return true;
@@ -582,18 +584,14 @@ bool syncsvc_headers_chain_from_tip(const struct block_index *candidate,
         return true;
 
     /* After snapshot sync, the chain walks back to the snapshot anchor
-     * (pprev=NULL at high height). If the walk stopped at a verified
-     * anchor (non-null last_valid with NULL pprev above our_height),
+     * (pprev=NULL at high height). If the bounded walk stopped at a
+     * verified anchor with NULL pprev above our_height,
      * accept this as a valid chain root. The anchor has FlyClient + SHA3
      * evidence and represents a verified chain point. */
     struct block_index *anchor = snapsync_get_anchor();
-    if (!verify && anchor && last_valid) {
-        const struct block_index *check = last_valid;
-        while (check && check != anchor)
-            check = check->pprev;
-        if (check == anchor)
-            return true;
-    }
+    if (anchor && verify == anchor && verify->nHeight > our_height &&
+        verify->pprev == NULL)
+        return true;
 
     /* Chainwork fallback: if pprev walk failed (broken links from LDB
      * import) but the candidate has strictly more chain work than our
@@ -635,10 +633,12 @@ void syncsvc_collect_needed_blocks(struct sync_needed_blocks *result,
          * isn't the tip, this is a genuine fork — reject it. */
         bool has_pprev_gap = false;
         if (candidate->nHeight > our_height) {
-            const struct block_index *w = candidate;
-            while (w && w->nHeight > our_height)
-                w = w->pprev;
-            has_pprev_gap = (w == NULL);
+            const struct block_index *w = pprev_walk_until_height(
+                (struct block_index *)candidate, our_height,
+                SYNC_HEADER_CHAIN_WALK_CAP,
+                "header_sync.collect_needed_blocks");
+            has_pprev_gap = w && w->nHeight > our_height &&
+                            w->pprev == NULL;
         }
         if (has_pprev_gap) {
             result->chains_from_tip = true; /* override — allow download */

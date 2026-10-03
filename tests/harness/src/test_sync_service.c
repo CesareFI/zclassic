@@ -1183,6 +1183,13 @@ static int test_sync_service_collects_needed_blocks_rejects_forks(void)
         ASSERT(!result.chains_from_tip);
         ASSERT(!result.should_activate_chain);
         ASSERT(result.count == 0);
+
+        fork.pprev = &fork;
+        syncsvc_collect_needed_blocks(&result, &fork, &tip, 1,
+                                      hashes, heights, 2);
+        ASSERT(!result.chains_from_tip);
+        ASSERT(!result.should_activate_chain);
+        ASSERT(result.count == 0);
         PASS();
     } _test_next:;
 
