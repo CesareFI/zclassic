@@ -26,4 +26,9 @@ bool header_admit_forward_replay_parent_ok(sqlite3 *db,
                                            const struct block_index *bi,
                                            int height);
 
+#ifdef ZCL_TESTING
+bool header_admit_forward_rewind_test_tip_next_height(int tip_height,
+                                                      int *out_next_height);
+#endif
+
 #endif /* ZCL_JOBS_HEADER_ADMIT_FORWARD_REWIND_H */

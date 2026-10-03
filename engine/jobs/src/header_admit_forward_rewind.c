@@ -11,6 +11,7 @@
 #include "util/stage.h"
 #include "validation/main_state.h"
 
+#include <limits.h>
 #include <string.h>
 
 #define STAGE_NAME "header_admit"
@@ -107,6 +108,14 @@ static bool log_row_hash_match(sqlite3 *db, int height,
     return true;
 }
 
+static bool tip_next_height(int tip_height, int *out_next_height)
+{
+    if (!out_next_height || tip_height < 0 || tip_height == INT_MAX)
+        return false;
+    *out_next_height = tip_height + 1;
+    return true;
+}
+
 bool header_admit_forward_replay_parent_ok(sqlite3 *db,
                                            struct main_state *ms,
                                            const struct block_index *bi,
@@ -157,10 +166,12 @@ bool header_admit_forward_rewind_target(sqlite3 *db,
     }
 
     struct block_index *tip = active_chain_tip(chain);
-    if (!tip || !tip->phashBlock || tip->nHeight < 0)
+    if (!tip || !tip->phashBlock)
         return true;
 
-    int next_h = tip->nHeight + 1;
+    int next_h = 0;
+    if (!tip_next_height(tip->nHeight, &next_h))
+        return true;
     if ((uint64_t)next_h >= cursor)
         return true;
 
@@ -180,6 +191,14 @@ bool header_admit_forward_rewind_target(sqlite3 *db,
     *out_reason = row_known ? "parent_mismatch" : "missing_row";
     return true;
 }
+
+#ifdef ZCL_TESTING
+bool header_admit_forward_rewind_test_tip_next_height(int tip_height,
+                                                      int *out_next_height)
+{
+    return tip_next_height(tip_height, out_next_height);
+}
+#endif
 
 static bool clamp_cursor_if_ahead(sqlite3 *db, const char *stage_name,
                                   int target)

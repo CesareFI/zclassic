@@ -199,13 +199,9 @@ static bool auth_observer(struct main_state *ms,
     return true;
 }
 
-int test_header_admit_stage(void)
+static int test_pending_header_height_boundaries(void)
 {
-    printf("\n=== header_admit_stage tests ===\n");
     int failures = 0;
-
-    blocker_module_init();
-
     HA_CHECK("pending producer rejects unrepresentable parent height",
              !header_admit_stage_test_parent_height_matches(INT_MAX, 0));
     HA_CHECK("pending producer retains representable parent boundary",
@@ -213,6 +209,26 @@ int test_header_admit_stage(void)
                                                            INT_MAX));
     HA_CHECK("pending producer retains ordinary successor",
              header_admit_stage_test_parent_height_matches(4, 5));
+
+    int next_height = -1;
+    HA_CHECK("forward rewind rejects unrepresentable tip successor",
+             !header_admit_forward_rewind_test_tip_next_height(INT_MAX,
+                                                                &next_height));
+    HA_CHECK("forward rewind retains representable tip successor",
+             header_admit_forward_rewind_test_tip_next_height(INT_MAX - 1,
+                                                               &next_height) &&
+             next_height == INT_MAX);
+    return failures;
+}
+
+int test_header_admit_stage(void)
+{
+    printf("\n=== header_admit_stage tests ===\n");
+    int failures = 0;
+
+    blocker_module_init();
+
+    failures += test_pending_header_height_boundaries();
 
     /* ── happy path: drain a 5-block synthetic chain ───────────────── */
     {
