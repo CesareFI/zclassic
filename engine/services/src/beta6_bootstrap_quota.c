@@ -26,6 +26,7 @@ struct beta6_quota_bucket {
     int64_t window_start_ms;
     uint64_t bytes_served;
     int64_t next_allowed_ms;
+    bool next_allowed_saturated;
     bool used;
 };
 
@@ -198,6 +199,18 @@ static uint64_t quota_bytes_served_add(uint64_t total, uint64_t bytes)
     return total + bytes;
 }
 
+static void quota_set_next_allowed(struct beta6_quota_bucket *bucket,
+                                   int64_t now_ms, int64_t delay_ms)
+{
+    if (now_ms > INT64_MAX - delay_ms) {
+        bucket->next_allowed_ms = INT64_MAX;
+        bucket->next_allowed_saturated = true;
+        return;
+    }
+    bucket->next_allowed_ms = now_ms + delay_ms;
+    bucket->next_allowed_saturated = false;
+}
+
 /* The bucket decision, taken under the lock. 0 = serve, and the two negative
  * codes are the ones the caller branches on (see the header). */
 static int quota_verdict_locked(const char *key, bool whitelisted, int64_t now_ms)
@@ -210,6 +223,8 @@ static int quota_verdict_locked(const char *key, bool whitelisted, int64_t now_m
         return 0;
     if (g_throttle_kbps <= 0)
         return BETA6_BS_ERR_QUOTA_STOPPED;
+    if (bucket->next_allowed_saturated)
+        return BETA6_BS_ERR_QUOTA_SPACING;
     return now_ms >= bucket->next_allowed_ms ? 0 : BETA6_BS_ERR_QUOTA_SPACING;
 }
 
@@ -253,12 +268,13 @@ void beta6_bs_quota_charge(const char *key, bool whitelisted, int64_t now_ms,
         bucket->window_start_ms = now_ms;
         bucket->bytes_served = 0;
         bucket->next_allowed_ms = 0;
+        bucket->next_allowed_saturated = false;
     }
     bucket->bytes_served = quota_bytes_served_add(bucket->bytes_served,
                                                    bytes);
     if (bucket->bytes_served >= (uint64_t)g_max_bytes_per_day && g_throttle_kbps > 0) {
         int64_t delay_ms = (int64_t)((bytes * 1000ULL) / ((uint64_t)g_throttle_kbps * 1024ULL));
-        bucket->next_allowed_ms = now_ms + (delay_ms > 1 ? delay_ms : 1);
+        quota_set_next_allowed(bucket, now_ms, delay_ms > 1 ? delay_ms : 1);
     }
     UNLOCK(g_quota_lock);
 }

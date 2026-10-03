@@ -738,6 +738,21 @@ int test_beta6_bootstrap(void)
         ASSERT_EQ(beta6_bs_quota_check("v4/24:203.0.113", false, 0).code,
                   BETA6_BS_ERR_QUOTA_STOPPED);
 
+        /* A future spacing deadline must saturate fail-closed rather than
+         * overflowing to an already-expired signed timestamp. */
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(1, 1);
+        beta6_bs_quota_charge("v4/24:203.0.113", false, INT64_MAX, 1024);
+        ASSERT_EQ(beta6_bs_quota_check("v4/24:203.0.113", false,
+                                       INT64_MAX).code,
+                  BETA6_BS_ERR_QUOTA_SPACING);
+
+        /* An exactly representable spacing deadline still expires normally. */
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(1, 1024);
+        beta6_bs_quota_charge("v4/24:203.0.113", false, 0, 1024);
+        ASSERT(beta6_bs_quota_check("v4/24:203.0.113", false, 1).ok);
+
         /* Throttle off means a hard stop instead of a slow trickle. */
         beta6_bs_quota_clear();
         beta6_bs_quota_configure(1000, 0);
