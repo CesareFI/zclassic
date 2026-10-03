@@ -22,8 +22,8 @@ void register_net_partition_suspected(void);
 
 #ifdef ZCL_TESTING
 void net_partition_suspected_test_reset(void);
-/* Override the wall clock (unix secs) this detector samples. -1 = real clock. */
-void net_partition_suspected_test_set_now(int64_t now_unix);
+/* Override the elapsed clock (seconds) this detector samples. -1 = real clock. */
+void net_partition_suspected_test_set_now(int64_t now_seconds);
 bool net_partition_suspected_test_detect(void);
 #endif
 

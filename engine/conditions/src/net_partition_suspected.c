@@ -49,7 +49,7 @@ static int64_t nps_now(void)
     if (o >= 0)
         return o;
 #endif
-    return platform_time_wall_unix();
+    return platform_time_monotonic_us() / 1000000;
 }
 
 static int nps_partition_secs(void)
@@ -196,9 +196,9 @@ void net_partition_suspected_test_reset(void)
     blocker_clear(NET_PARTITION_BLOCKER_ID);
 }
 
-void net_partition_suspected_test_set_now(int64_t now_unix)
+void net_partition_suspected_test_set_now(int64_t now_seconds)
 {
-    atomic_store(&g_now_override, now_unix);
+    atomic_store(&g_now_override, now_seconds);
 }
 
 bool net_partition_suspected_test_detect(void)
