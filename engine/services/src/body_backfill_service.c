@@ -209,9 +209,7 @@ static void bb_note_enqueued(size_t added, int64_t lo, size_t n, int tip_h,
 {
     const char *label = why ? why : "census";
 
-    body_history_global_lock();
-    body_history_global_census()->blocks_enqueued += (uint64_t)added;
-    body_history_global_unlock();
+    body_history_global_note_enqueued(added);
     LOG_WARN("body_backfill",
              "[body-history] backfill queued %zu below-tip "
              "bodies (%s window [%lld..%lld] tip=%d)",
@@ -487,7 +485,8 @@ static void bb_census_progress(uint64_t *passes, uint64_t *walked,
     if (passes)
         *passes = c->passes;
     if (walked)
-        *walked = c->heights_examined + c->heights_indeterminate;
+        *walked = body_history_counter_saturating_add(
+            c->heights_examined, c->heights_indeterminate);
     if (window_heights)
         *window_heights = (c->window_lo >= 0 && c->window_hi >= c->window_lo)
                               ? c->window_hi - c->window_lo + 1

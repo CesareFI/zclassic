@@ -1676,6 +1676,62 @@ static int test_bh_held_max_range_stays_in_window(void)
     return failures;
 }
 
+static int test_bh_lifetime_counters_saturate(void)
+{
+    int failures = 0;
+    TEST("census lifetime counters saturate instead of reporting wrapped progress") {
+        struct body_history_census census;
+        struct body_coverage_map held;
+        struct body_coverage_map measured;
+        struct body_history_pass_result pass;
+        uint8_t classes[] = {
+            BODY_HISTORY_PROBE_HAVE,
+            BODY_HISTORY_PROBE_MISSING,
+            BODY_HISTORY_PROBE_INDETERMINATE,
+        };
+
+        body_history_census_init(&census);
+        census.window_lo = 0;
+        census.window_hi = 0;
+        census.passes = UINT64_MAX;
+        census.sweeps_completed = UINT64_MAX;
+        body_history_census_advance(&census, 0, 0);
+        ASSERT(census.passes == UINT64_MAX);
+        ASSERT(census.sweeps_completed == UINT64_MAX);
+
+        body_coverage_init(&held);
+        body_coverage_init(&measured);
+        census.heights_examined = UINT64_MAX;
+        census.heights_have = UINT64_MAX;
+        census.heights_missing = UINT64_MAX;
+        census.heights_indeterminate = UINT64_MAX;
+        ASSERT(body_history_census_fold(&census, &held, &measured, 0,
+                                        classes, 3, &pass));
+        ASSERT(pass.examined == 2 && pass.have == 1 && pass.missing == 1 &&
+               pass.indeterminate == 1);
+        ASSERT(census.heights_examined == UINT64_MAX);
+        ASSERT(census.heights_have == UINT64_MAX);
+        ASSERT(census.heights_missing == UINT64_MAX);
+        ASSERT(census.heights_indeterminate == UINT64_MAX);
+        ASSERT(body_history_counter_saturating_add(UINT64_MAX, 1) ==
+               UINT64_MAX);
+        body_coverage_free(&held);
+        body_coverage_free(&measured);
+
+        body_history_reset();
+        body_history_global_lock();
+        body_history_global_census()->blocks_enqueued = UINT64_MAX;
+        body_history_global_unlock();
+        body_history_global_note_enqueued(1);
+        body_history_global_lock();
+        ASSERT(body_history_global_census()->blocks_enqueued == UINT64_MAX);
+        body_history_global_unlock();
+        body_history_reset();
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_body_history(void)
 {
     int failures = 0;
@@ -1707,5 +1763,6 @@ int test_body_history(void)
     failures += test_bh_fully_measured_is_looked_not_proven();
     failures += test_bh_dump_state_json_separates_the_three();
     failures += test_bh_held_max_range_stays_in_window();
+    failures += test_bh_lifetime_counters_saturate();
     return failures;
 }

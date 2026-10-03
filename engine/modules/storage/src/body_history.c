@@ -291,12 +291,13 @@ void body_history_census_advance(struct body_history_census *c,
 {
     if (!c || lo < 0 || lo > hi)
         return;
-    c->passes++;
+    c->passes = body_history_counter_saturating_add(c->passes, 1);
     c->last_pass_lo = lo;
     c->last_pass_hi = hi;
     c->cursor = lo - 1;
     if (c->cursor < c->window_lo) {
-        c->sweeps_completed++;
+        c->sweeps_completed =
+            body_history_counter_saturating_add(c->sweeps_completed, 1);
         c->cursor = c->window_hi;
     }
     c->cursor_valid = true;
@@ -426,10 +427,14 @@ bool body_history_census_fold(struct body_history_census *c,
         i = j;
     }
 
-    c->heights_examined += (uint64_t)res.examined;
-    c->heights_have += (uint64_t)res.have;
-    c->heights_missing += (uint64_t)res.missing;
-    c->heights_indeterminate += (uint64_t)res.indeterminate;
+    c->heights_examined = body_history_counter_saturating_add(
+        c->heights_examined, (uint64_t)res.examined);
+    c->heights_have = body_history_counter_saturating_add(
+        c->heights_have, (uint64_t)res.have);
+    c->heights_missing = body_history_counter_saturating_add(
+        c->heights_missing, (uint64_t)res.missing);
+    c->heights_indeterminate = body_history_counter_saturating_add(
+        c->heights_indeterminate, (uint64_t)res.indeterminate);
 
     if (out)
         *out = res;
@@ -488,6 +493,11 @@ static void bh_global_init_once(void)
     (void)zcl_once_call(&g_bh_once, bh_global_init);
 }
 
+uint64_t body_history_counter_saturating_add(uint64_t value, uint64_t add)
+{
+    return add > UINT64_MAX - value ? UINT64_MAX : value + add;
+}
+
 void body_history_global_lock(void)
 {
     bh_global_init_once();
@@ -510,6 +520,15 @@ struct body_history_census *body_history_global_census(void)
 {
     bh_global_init_once();
     return &g_bh_census;
+}
+
+void body_history_global_note_enqueued(size_t added)
+{
+    bh_global_init_once();
+    body_history_global_lock();
+    g_bh_census.blocks_enqueued = body_history_counter_saturating_add(
+        g_bh_census.blocks_enqueued, (uint64_t)added);
+    body_history_global_unlock();
 }
 
 struct body_coverage_map *body_history_global_measured(void)
