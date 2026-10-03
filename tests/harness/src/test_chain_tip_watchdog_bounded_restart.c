@@ -35,6 +35,7 @@
 #include "validation/main_state.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,6 +100,41 @@ static void wd_free_idx(struct block_index *bi)
     if (!bi) return;
     free((void *)(uintptr_t)bi->phashBlock);
     free(bi);
+}
+
+static int wd_test_corrupt_max_anchor(void)
+{
+    char dir[256];
+    int failures = 0;
+    int64_t stuck = INT64_MAX;
+    int32_t count = 0;
+    sqlite3 *db;
+    struct chain_tip_watchdog_stats s;
+
+    test_make_tmpdir(dir, sizeof(dir), "chain_tip_wd", "max_anchor");
+    WD_CHECK("open progress.kv (max anchor)", progress_store_open(dir));
+    db = progress_store_db();
+    WD_CHECK("store max persisted anchor",
+             db && progress_meta_set(db, "chain_tip_wd.stuck_height",
+                                     &stuck, sizeof(stuck)) &&
+             progress_meta_set(db, "chain_tip_wd.no_progress_restarts",
+                               &count, sizeof(count)));
+    wd_sim_boot();
+    WD_CHECK("max anchor same-height restart is requested",
+             chain_tip_watchdog_test_escalate_restart(INT64_MAX));
+    chain_tip_watchdog_get_stats(&s);
+    WD_CHECK("max anchor remains same episode",
+             s.persisted_stuck_height == INT64_MAX);
+    WD_CHECK("max anchor consumes one bounded restart",
+             s.no_progress_restarts == 1);
+    chain_tip_watchdog_test_observe_advance(INT64_MAX);
+    chain_tip_watchdog_get_stats(&s);
+    WD_CHECK("max anchor cannot clear without clear-distance advance",
+             s.no_progress_restarts == 1);
+
+    progress_store_close();
+    test_cleanup_tmpdir(dir);
+    return failures;
 }
 
 int test_chain_tip_watchdog_bounded_restart(void)
@@ -433,7 +469,16 @@ int test_chain_tip_watchdog_bounded_restart(void)
         sticky_escalator_test_reset();
     }
 
-    /* ── (f) escalation LADDER over the supervisor tick: 1 -> 3, reserved inert
+    /* ── (f) corrupt persisted high anchor: bounded arithmetic ────────
+     *
+     * progress.kv is local durable state and its fixed-width height value can
+     * be malformed.  A loaded INT64_MAX anchor must not make the episode
+     * margin or advance-clear comparison form INT64_MAX + N.  At the exact
+     * anchor, a restart remains part of the same episode; an advance cannot
+     * clear it because it is short of the clear distance. */
+    failures += wd_test_corrupt_max_anchor();
+
+    /* ── (g) escalation LADDER over the supervisor tick: 1 -> 3, reserved inert
      *
      * Drives the wall-clock ladder via chain_tip_watchdog_test_tick() (the
      * production wd_apply_tick body with an injected height and monotonic

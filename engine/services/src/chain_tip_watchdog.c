@@ -194,7 +194,8 @@ static bool wd_persist_store(int64_t stuck_height, int restarts)
 static void wd_note_advance(int64_t h)
 {
     int64_t stuck = atomic_load(&g_persisted_stuck_height);
-    if (stuck >= 0 && h >= stuck + CHAIN_TIP_WD_EPISODE_CLEAR) {
+    if (stuck >= 0 && h >= stuck &&
+        h - stuck >= CHAIN_TIP_WD_EPISODE_CLEAR) {
         atomic_store(&g_persisted_stuck_height, -1);
         atomic_store(&g_no_progress_restarts, 0);
         atomic_store(&g_operator_needed, false);
@@ -215,7 +216,7 @@ static bool wd_decide_restart(int64_t h, int64_t age_s, bool do_shutdown,
      * rewind below the anchor) starts a fresh episode and budget. */
     int64_t stuck = atomic_load(&g_persisted_stuck_height);
     if (stuck < 0 || h < stuck ||
-        h > stuck + CHAIN_TIP_WD_EPISODE_MARGIN) {
+        h - stuck > CHAIN_TIP_WD_EPISODE_MARGIN) {
         atomic_store(&g_persisted_stuck_height, h);
         atomic_store(&g_no_progress_restarts, 0);
         atomic_store(&g_operator_needed, false);
