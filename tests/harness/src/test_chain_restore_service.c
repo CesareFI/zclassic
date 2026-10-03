@@ -2088,6 +2088,27 @@ static int test_chain_restore_walks_abort_on_shutdown(void) {
     return failures;
 }
 
+static int test_nearest_backed_ancestor_rejects_pprev_cycle(void)
+{
+    int failures = 0;
+
+    TEST("chain_restore: malformed pprev cycle cannot stall nearest-backed search") {
+        struct block_index left;
+        struct block_index right;
+
+        memset(&left, 0, sizeof(left));
+        memset(&right, 0, sizeof(right));
+        left.nHeight = 2;
+        right.nHeight = 2;
+        left.pprev = &right;
+        right.pprev = &left;
+        ASSERT(chain_restore_nearest_consensus_backed_ancestor(&left) == NULL);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 /* ── Registration ──────────────────────────────────────────────── */
 
 int test_chain_restore_service(void) {
@@ -2137,5 +2158,6 @@ int test_chain_restore_service(void) {
     failures += test_rebuild_active_chain_is_o_chain_not_delta();
     failures += test_unclean_restart_recovery_is_o_delta();
     failures += test_chain_restore_walks_abort_on_shutdown();
+    failures += test_nearest_backed_ancestor_rejects_pprev_cycle();
     return failures;
 }

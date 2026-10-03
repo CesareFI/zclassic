@@ -13,7 +13,10 @@
 #include "primitives/block.h"
 #include "storage/disk_block_io.h"
 #include "util/log_macros.h"
+#include "util/pprev_walk.h"
 #include "util/util.h"
+
+enum { CHAIN_RESTORE_ANCESTRY_WALK_CAP = 4096 };
 
 bool chain_restore_block_is_consensus_backed(
     const struct block_index *tip)
@@ -167,6 +170,9 @@ bool chain_restore_block_is_consensus_backed_on_disk(
 struct block_index *chain_restore_nearest_consensus_backed_ancestor(
     struct block_index *tip)
 {
+    if (!pprev_walk_safe(tip, NULL, NULL, CHAIN_RESTORE_ANCESTRY_WALK_CAP,
+                         "chain_restore.nearest_consensus_backed"))
+        return NULL;
     for (struct block_index *walk = tip; walk; walk = walk->pprev) {
         if (chain_restore_block_is_consensus_backed(walk))
             return walk;
