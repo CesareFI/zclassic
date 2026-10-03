@@ -132,6 +132,16 @@ static struct beta6_quota_bucket *bucket_find(const char *key)
     return NULL;
 }
 
+/* A wall-clock rollback must not turn a still-live bucket into an expired
+ * one, and a hostile/extreme clock sample must never overflow elapsed-time
+ * arithmetic. Keeping a future-stamped bucket live is fail-closed for the
+ * serve cap; a normal forward clock still expires it at the same boundary. */
+static bool quota_window_expired(int64_t now_ms, int64_t window_start_ms)
+{
+    return now_ms >= window_start_ms &&
+           now_ms - window_start_ms >= BETA6_BS_QUOTA_WINDOW_MS;
+}
+
 /* Drop every bucket whose 24h window has fully expired, compacting the array. */
 static void buckets_sweep_expired(int64_t now_ms)
 {
@@ -139,7 +149,7 @@ static void buckets_sweep_expired(int64_t now_ms)
     for (size_t i = 0; i < g_bucket_count; i++) {
         if (!g_buckets[i].used)
             continue;
-        if (now_ms - g_buckets[i].window_start_ms >= BETA6_BS_QUOTA_WINDOW_MS)
+        if (quota_window_expired(now_ms, g_buckets[i].window_start_ms))
             continue;
         if (kept != i)
             g_buckets[kept] = g_buckets[i];
@@ -188,7 +198,7 @@ static int quota_verdict_locked(const char *key, bool whitelisted, int64_t now_m
     if (whitelisted || g_max_bytes_per_day <= 0)
         return 0;
     struct beta6_quota_bucket *bucket = bucket_find(key);
-    if (!bucket || now_ms - bucket->window_start_ms >= BETA6_BS_QUOTA_WINDOW_MS ||
+    if (!bucket || quota_window_expired(now_ms, bucket->window_start_ms) ||
         bucket->bytes_served < (uint64_t)g_max_bytes_per_day)
         return 0;
     if (g_throttle_kbps <= 0)
@@ -232,7 +242,7 @@ void beta6_bs_quota_charge(const char *key, bool whitelisted, int64_t now_ms,
     struct beta6_quota_bucket *bucket = bucket_find(key);
     if (!bucket)
         bucket = bucket_insert(key, now_ms);
-    if (now_ms - bucket->window_start_ms >= BETA6_BS_QUOTA_WINDOW_MS) {
+    if (quota_window_expired(now_ms, bucket->window_start_ms)) {
         bucket->window_start_ms = now_ms;
         bucket->bytes_served = 0;
         bucket->next_allowed_ms = 0;
