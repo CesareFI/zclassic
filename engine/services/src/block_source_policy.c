@@ -83,7 +83,7 @@ static bool mirror_fallback_allowed(const struct bsp_plan_input *in)
 
 static int bounded_height_bonus(int local_height, int source_height)
 {
-    int gap = source_height - local_height;
+    int64_t gap = (int64_t)source_height - (int64_t)local_height;
     if (gap <= 0) return -20;
     if (gap > 10000) return 30;
     if (gap > 1000) return 20;
@@ -100,7 +100,7 @@ static int target_lag_penalty(const struct bsp_plan_input *in,
     if (s->height <= in->local_height || s->height >= in->target_height)
         return 0;
 
-    int lag = in->target_height - s->height;
+    int64_t lag = (int64_t)in->target_height - (int64_t)s->height;
     if (lag > 10000)
         return 70;
     if (lag > 1000)
@@ -114,6 +114,12 @@ static int failure_penalty(const struct bsp_source_status *s)
 {
     if (!s)
         return 0;
+    /* Counters normally only increase, but policy input must never turn a
+     * corrupted or saturated counter into signed-overflow score credit. */
+    if (s->failures < 0 || s->timeouts < 0)
+        return 60;
+    if (s->failures >= 15 || s->timeouts >= 10)
+        return 60;
     int64_t penalty = s->failures * 4 + s->timeouts * 6;
     if (penalty > 60)
         penalty = 60;

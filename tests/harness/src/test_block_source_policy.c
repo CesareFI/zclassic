@@ -19,6 +19,8 @@
 #include "validation/main_state.h"
 #include "validation/mirror_consensus.h"
 
+#include <limits.h>
+
 static void init_source(struct bsp_plan_input *in,
                         enum bsp_source source,
                         bool available,
@@ -1974,6 +1976,42 @@ static int test_bsp_restores_local_header_refill_progress(void)
     return failures;
 }
 
+static int test_bsp_score_arithmetic_is_full_domain_safe(void)
+{
+    int failures = 0;
+    TEST_CASE("block_source_policy: score arithmetic handles extreme counters")
+    {
+        struct bsp_plan_input in = base_input();
+        struct bsp_decision out;
+
+        in.local_height = INT_MIN;
+        in.best_header_height = INT_MIN;
+        in.target_height = INT_MAX;
+        init_source(&in, BSP_SOURCE_P2P, true, true, INT_MAX);
+        block_source_policy_plan(&in, &out);
+        ASSERT(out.sources[BSP_SOURCE_P2P].score_height == 30);
+
+        init_source(&in, BSP_SOURCE_SNAPSHOT, true, true, INT_MIN + 1);
+        block_source_policy_plan(&in, &out);
+        ASSERT(out.sources[BSP_SOURCE_SNAPSHOT].score_target_lag_penalty == 70);
+
+        in.local_height = 0;
+        in.best_header_height = 0;
+        in.target_height = 1;
+        init_source(&in, BSP_SOURCE_P2P, true, true, 1);
+        in.sources[BSP_SOURCE_P2P].failures = INT64_MAX;
+        in.sources[BSP_SOURCE_P2P].timeouts = INT64_MAX;
+        block_source_policy_plan(&in, &out);
+        ASSERT(out.sources[BSP_SOURCE_P2P].score_failure_penalty == 60);
+
+        in.sources[BSP_SOURCE_P2P].failures = -1;
+        in.sources[BSP_SOURCE_P2P].timeouts = 0;
+        block_source_policy_plan(&in, &out);
+        ASSERT(out.sources[BSP_SOURCE_P2P].score_failure_penalty == 60);
+    } TEST_END
+    return failures;
+}
+
 int test_block_source_policy(void)
 {
     int failures = 0;
@@ -2019,5 +2057,6 @@ int test_block_source_policy(void)
     failures += test_bsp_restores_last_decision_from_node_state();
     failures += test_bsp_restores_peer_floor_sources_from_node_state();
     failures += test_bsp_restores_local_header_refill_progress();
+    failures += test_bsp_score_arithmetic_is_full_domain_safe();
     return failures;
 }
