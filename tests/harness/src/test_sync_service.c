@@ -1080,6 +1080,9 @@ static int test_sync_service_restarts_low_header_batches_from_tip(void)
             160, &low, 3087298, 3087300, false));
         ASSERT(!syncsvc_should_restart_headers_from_tip(
             0, &low, 3087298, 3107754, false));
+        low.nHeight = INT_MAX - 1;
+        ASSERT(!syncsvc_should_restart_headers_from_tip(
+            1, &low, INT_MAX, INT_MAX, false));
         PASS();
     } _test_next:;
 
