@@ -97,8 +97,9 @@ static int64_t it_env_int64(const char *name, int64_t fallback)
     const char *v = getenv(name);
     if (!v || !*v) return fallback;
     char *end = NULL;
+    errno = 0;
     long long n = strtoll(v, &end, 10);
-    if (!end || *end != '\0' || n <= 0) return fallback;
+    if (errno == ERANGE || !end || *end != '\0' || n <= 0) return fallback;
     return (int64_t)n;
 }
 

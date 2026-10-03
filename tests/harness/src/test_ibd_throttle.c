@@ -110,26 +110,40 @@ int test_ibd_throttle(void)
         unsetenv("ZCL_IBD_BURST");
     }
 
-    /* ── 4. Pure refill — elapsed 0 keeps tokens ───────────── */
+    /* ── 4. Env overflow falls back instead of disabling limits ─ */
+    {
+        setenv("ZCL_IBD_BLOCKS_PER_SEC", "999999999999999999999999", 1);
+        setenv("ZCL_IBD_BURST", "999999999999999999999999", 1);
+        struct ibd_throttle_config cfg;
+        ibd_throttle_config_from_env(&cfg);
+        IT_CHECK("it: overflowed rate env falls back to default",
+                 cfg.blocks_per_sec == IBD_THROTTLE_DEFAULT_BLOCKS_PER_SEC);
+        IT_CHECK("it: overflowed burst env falls back to default",
+                 cfg.burst == IBD_THROTTLE_DEFAULT_BURST);
+        unsetenv("ZCL_IBD_BLOCKS_PER_SEC");
+        unsetenv("ZCL_IBD_BURST");
+    }
+
+    /* ── 5. Pure refill — elapsed 0 keeps tokens ───────────── */
     {
         double t = ibd_throttle_refill(10.0, 500.0, 50.0, 0);
         IT_CHECK("it: refill elapsed=0 keeps tokens", near_d(t, 10.0));
     }
 
-    /* ── 5. Pure refill — 1 second at rate 500 caps at burst — */
+    /* ── 6. Pure refill — 1 second at rate 500 caps at burst — */
     {
         double t = ibd_throttle_refill(0.0, 500.0, 50.0, 1000000);
         IT_CHECK("it: refill caps at burst", near_d(t, 50.0));
     }
 
-    /* ── 6. Pure refill — sub-second partial refill ────────── */
+    /* ── 7. Pure refill — sub-second partial refill ────────── */
     {
         /* Rate 1000/s, elapsed 2ms → +2 tokens. */
         double t = ibd_throttle_refill(0.0, 1000.0, 100.0, 2000);
         IT_CHECK("it: refill sub-second arithmetic", near_d(t, 2.0));
     }
 
-    /* ── 7. Pure refill — negative tokens clamped to 0 first — */
+    /* ── 8. Pure refill — negative tokens clamped to 0 first — */
     {
         double t = ibd_throttle_refill(-5.0, 1000.0, 10.0, 1000);
         /* 0 + (1000 * 0.001) = 1.0 */
@@ -137,14 +151,14 @@ int test_ibd_throttle(void)
                  near_d(t, 1.0));
     }
 
-    /* ── 8. Pure refill — zero rate is a no-op ─────────────── */
+    /* ── 9. Pure refill — zero rate is a no-op ─────────────── */
     {
         double t = ibd_throttle_refill(3.0, 0.0, 10.0, 1000000);
         IT_CHECK("it: refill with rate=0 is a no-op",
                  near_d(t, 3.0));
     }
 
-    /* ── 9. Not-running: acquire is a pass-through ─────────── */
+    /* ── 10. Not-running: acquire is a pass-through ────────── */
     {
         IT_CHECK("it: stopped acquire passes through",
                  ibd_throttle_acquire().ok == true);
@@ -154,7 +168,7 @@ int test_ibd_throttle(void)
                  ibd_throttle_is_running() == false);
     }
 
-    /* ── 10. Start/stop lifecycle ──────────────────────────── */
+    /* ── 11. Start/stop lifecycle ──────────────────────────── */
     {
         struct ibd_throttle_config cfg = { .blocks_per_sec = 10000,
                                             .burst = 3 };
@@ -171,7 +185,7 @@ int test_ibd_throttle(void)
         ibd_throttle_stop();
     }
 
-    /* ── 11. Burst drains to zero then refuses try_acquire ── */
+    /* ── 12. Burst drains to zero then refuses try_acquire ── */
     {
         struct ibd_throttle_config cfg = { .blocks_per_sec = 1,
                                             .burst = 3 };
@@ -187,7 +201,7 @@ int test_ibd_throttle(void)
         ibd_throttle_stop();
     }
 
-    /* ── 12. Counters match successful acquires ────────────── */
+    /* ── 13. Counters match successful acquires ────────────── */
     {
         struct ibd_throttle_config cfg = { .blocks_per_sec = 10000,
                                             .burst = 5 };
@@ -204,7 +218,7 @@ int test_ibd_throttle(void)
         ibd_throttle_stop();
     }
 
-    /* ── 13. acquire() blocks then returns once refilled ───── */
+    /* ── 14. acquire() blocks then returns once refilled ───── */
     {
         /* burst=1, rate=500/s → 2ms per token. */
         struct ibd_throttle_config cfg = { .blocks_per_sec = 500,
@@ -222,7 +236,7 @@ int test_ibd_throttle(void)
         /* Lower bound only: the drained bucket refills at 500/s, so the call
          * cannot return before ~2ms. An upper bound on one sample is a fact
          * about the box; the refill arithmetic is covered by the pure cases
-         * (4-8). */
+         * (5-9). */
         IT_CHECK("it: blocked at least ~1ms before refill",
                  dur_ms >= 1);
 
@@ -254,7 +268,7 @@ int test_ibd_throttle(void)
         ibd_throttle_stop();
     }
 
-    /* ── 14. stop() while waiting makes acquire return ────── */
+    /* ── 15. stop() while waiting makes acquire return ────── */
     {
         /* burst=1 then drain; kick off a thread that blocks in
          * acquire, then stop the throttle. acquire must unstick. */
@@ -279,7 +293,7 @@ int test_ibd_throttle(void)
                  atomic_load(&done) == true);
     }
 
-    /* ── 15. Event fires on blocked acquire (rate-limit aware) */
+    /* ── 16. Event fires on blocked acquire (rate-limit aware) */
     {
         it_reset_observer();
         struct ibd_throttle_config cfg = { .blocks_per_sec = 500,
@@ -299,7 +313,7 @@ int test_ibd_throttle(void)
         ibd_throttle_stop();
     }
 
-    /* ── 16. No event if nothing ever blocks ───────────────── */
+    /* ── 17. No event if nothing ever blocks ───────────────── */
     {
         it_reset_observer();
         struct ibd_throttle_config cfg = { .blocks_per_sec = 100000,
@@ -311,7 +325,7 @@ int test_ibd_throttle(void)
         ibd_throttle_stop();
     }
 
-    /* ── 17. Status snapshot reflects resolved config ──────── */
+    /* ── 18. Status snapshot reflects resolved config ──────── */
     {
         struct ibd_throttle_config cfg = { .blocks_per_sec = 777,
                                             .burst = 12 };
