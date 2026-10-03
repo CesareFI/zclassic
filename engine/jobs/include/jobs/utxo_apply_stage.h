@@ -95,6 +95,10 @@ void utxo_apply_post_prune_stats(uint64_t *runs, int64_t *last_floor);
  * chain. -1 restores the compile-time default. */
 void utxo_apply_created_outputs_retain_set_for_test(int retain_blocks);
 
+#ifdef ZCL_TESTING
+bool utxo_apply_stage_test_cursor_height(uint64_t cursor, int *out);
+#endif
+
 uint64_t utxo_apply_stage_cursor(void);
 /* Step-timing EWMA (us); see util/stage.h. 0 if never stepped. */
 int64_t  utxo_apply_stage_step_us_ewma(void);

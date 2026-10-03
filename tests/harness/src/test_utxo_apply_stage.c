@@ -50,6 +50,22 @@
     else { printf("FAIL\n"); failures++; } \
 } while (0)
 
+static int test_ua_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    UV_CHECK("cursor: representable durable height is retained",
+             utxo_apply_stage_test_cursor_height(INT32_MAX, &height) &&
+             height == INT32_MAX);
+    UV_CHECK("cursor: unrepresentable durable heights are refused before narrowing",
+             !utxo_apply_stage_test_cursor_height(
+                 (uint64_t)INT32_MAX + 1u, &height) &&
+             !utxo_apply_stage_test_cursor_height(UINT64_C(1) << 32,
+                                                  &height) &&
+             !utxo_apply_stage_test_cursor_height(UINT64_MAX, &height));
+    return failures;
+}
+
 /* Rewind primitives under test in the nullifier rewind case (f). Mirrors
  * engine/jobs/src/utxo_apply_delta_internal.h (a src-private header). */
 bool utxo_apply_emit_inverse_delta(sqlite3 *db, int height);
@@ -757,6 +773,7 @@ int test_utxo_apply_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    failures += test_ua_cursor_conversion_bounds();
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_uv sc;

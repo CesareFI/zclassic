@@ -45,6 +45,7 @@
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -284,6 +285,39 @@ static void ua_fatal_permanent_blocker(int height, const char *reason_tail)
                          * logged by blocker_set; the fact persists */
 }
 
+static bool ua_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool utxo_apply_stage_test_cursor_height(uint64_t cursor, int *out)
+{
+    return ua_cursor_height(cursor, out);
+}
+#endif
+
+static bool ua_step_cursor_heights(const struct stage_step_ctx *c,
+                                   uint64_t proof_cursor,
+                                   int *out_next, int *out_proof)
+{
+    if (!c || !ua_cursor_height(c->cursor_in, out_next)) {
+        LOG_WARN(STAGE_NAME, "[utxo_apply] cursor out of range: %llu",
+                 (unsigned long long)(c ? c->cursor_in : 0));
+        return false;
+    }
+    if (!ua_cursor_height(proof_cursor, out_proof)) {
+        LOG_WARN(STAGE_NAME,
+                 "[utxo_apply] proof_validate cursor out of range: %llu",
+                 (unsigned long long)proof_cursor);
+        return false;
+    }
+    return true;
+}
+
 static job_result_t step_apply(struct stage_step_ctx *c)
 {
     atomic_store(&g_ua_last_step_unix, platform_time_wall_unix());
@@ -293,23 +327,23 @@ static job_result_t step_apply(struct stage_step_ctx *c)
     sqlite3 *db = progress_store_db();
     if (!db) return JOB_IDLE;
 
-    int next_h = (int)c->cursor_in;
-    if (next_h < 0) {
-        ua_fatal_permanent_blocker((int)c->cursor_in,
-                                   "stage cursor persisted negative");
-        return JOB_FATAL;
-    }
     bool skip_crypto = mint_skip_crypto_get();
     enum mint_validation_evidence expected_evidence =
         mint_validation_evidence_expected(skip_crypto);
     uint64_t pv_cursor = 0;
     if (!stage_upstream_frontier_or_zero(db, "proof_validate", STAGE_NAME,
                                    &pv_cursor)) {
-        ua_fatal_permanent_blocker(next_h,
+        ua_fatal_permanent_blocker(-1,
                                    "proof_validate cursor read failed");
         return JOB_FATAL;
     }
-    if ((uint64_t)next_h >= pv_cursor) {
+    int next_h = 0;
+    int proof_cursor = 0;
+    if (!ua_step_cursor_heights(c, pv_cursor, &next_h, &proof_cursor)) {
+        ua_fatal_permanent_blocker(-1, "stage cursor out of range");
+        return JOB_FATAL;
+    }
+    if (next_h >= proof_cursor) {
         atomic_store(&g_ua_last_blocked_unix, platform_time_wall_unix());
         return JOB_IDLE;
     }
