@@ -121,6 +121,15 @@ static void pending_header_stage(const struct block_header *h)
     g_pending[slot].occupied = true;
 }
 
+static bool pending_header_child_height(const struct block_index *parent,
+                                        int *out_height)
+{
+    if (!parent || !out_height || parent->nHeight == INT_MAX)
+        return false;
+    *out_height = parent->nHeight + 1;
+    return true;
+}
+
 /* Find a staged raw header whose parent is already in the block_index and
  * would land at `want_height`. Returns the slot's header pointer, or NULL.
  * Consumes (frees) the slot on a hit. */
@@ -139,7 +148,8 @@ static const struct block_header *pending_header_take(struct main_state *ms,
                                                        &h->hashPrevBlock);
             if (!pprev)
                 continue;
-            produced_height = pprev->nHeight + 1;
+            if (!pending_header_child_height(pprev, &produced_height))
+                continue;
         }
         if (produced_height != want_height)
             continue;
@@ -148,6 +158,17 @@ static const struct block_header *pending_header_take(struct main_state *ms,
     }
     return NULL;
 }
+
+#ifdef ZCL_TESTING
+bool header_admit_stage_test_parent_height_matches(int parent_height,
+                                                   int want_height)
+{
+    struct block_index parent = { .nHeight = parent_height };
+    int child_height = 0;
+    return pending_header_child_height(&parent, &child_height) &&
+           child_height == want_height;
+}
+#endif
 
 /* ── Step body ─────────────────────────────────────────────────────── */
 

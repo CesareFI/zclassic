@@ -206,6 +206,14 @@ int test_header_admit_stage(void)
 
     blocker_module_init();
 
+    HA_CHECK("pending producer rejects unrepresentable parent height",
+             !header_admit_stage_test_parent_height_matches(INT_MAX, 0));
+    HA_CHECK("pending producer retains representable parent boundary",
+             header_admit_stage_test_parent_height_matches(INT_MAX - 1,
+                                                           INT_MAX));
+    HA_CHECK("pending producer retains ordinary successor",
+             header_admit_stage_test_parent_height_matches(4, 5));
+
     /* ── happy path: drain a 5-block synthetic chain ───────────────── */
     {
         char dir[256];

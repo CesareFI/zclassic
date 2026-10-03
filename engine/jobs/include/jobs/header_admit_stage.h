@@ -111,6 +111,9 @@ typedef bool (*header_admit_authoritative_hook)(
 void header_admit_stage_set_authoritative_hook(
     header_admit_authoritative_hook hook,
     void *user);
+
+bool header_admit_stage_test_parent_height_matches(int parent_height,
+                                                   int want_height);
 #endif
 
 #endif /* ZCL_SERVICES_HEADER_ADMIT_STAGE_H */
