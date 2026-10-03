@@ -56,6 +56,22 @@ const char *sv_find_body_availability_cause(struct blocker_snapshot *snap_out);
     else { printf("FAIL\n"); failures++; } \
 } while (0)
 
+static int test_sv_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    SV_CHECK("cursor: representable durable height is retained",
+             script_validate_stage_test_cursor_height(INT32_MAX, &height) &&
+             height == INT32_MAX);
+    SV_CHECK("cursor: unrepresentable durable heights are refused before narrowing",
+             !script_validate_stage_test_cursor_height(
+                 (uint64_t)INT32_MAX + 1u, &height) &&
+             !script_validate_stage_test_cursor_height(UINT64_C(1) << 32,
+                                                       &height) &&
+             !script_validate_stage_test_cursor_height(UINT64_MAX, &height));
+    return failures;
+}
+
 struct synth_chain_sv {
     struct block_index *blocks;
     struct uint256     *hashes;
@@ -353,6 +369,7 @@ int test_script_validate_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    failures += test_sv_cursor_conversion_bounds();
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_sv sc;

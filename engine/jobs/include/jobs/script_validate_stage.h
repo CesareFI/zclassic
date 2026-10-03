@@ -78,6 +78,7 @@ bool script_validate_dump_state_json(struct json_value *out, const char *key);
  * named-blocker path without waiting SV_UNRESOLVED_BUDGET_SECONDS. Pass <0 to
  * restore the default. */
 void script_validate_stage_unresolved_budget_set_for_test(int seconds);
+bool script_validate_stage_test_cursor_height(uint64_t cursor, int *out);
 #endif
 
 #endif /* ZCL_SERVICES_SCRIPT_VALIDATE_STAGE_H */

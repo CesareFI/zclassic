@@ -52,6 +52,7 @@
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -387,6 +388,39 @@ bool script_validate_stage_dry_run_block(
     return dry_run_block_impl(blk, height, NULL, NULL, out);
 }
 
+static bool script_validate_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool script_validate_stage_test_cursor_height(uint64_t cursor, int *out)
+{
+    return script_validate_cursor_height(cursor, out);
+}
+#endif
+
+static bool script_validate_step_cursor_heights(const struct stage_step_ctx *c,
+                                                uint64_t persisted_cursor,
+                                                int *out_next, int *out_persisted)
+{
+    if (!c || !script_validate_cursor_height(c->cursor_in, out_next)) {
+        LOG_WARN(STAGE_NAME, "[script_validate] cursor out of range: %llu",
+                 (unsigned long long)(c ? c->cursor_in : 0));
+        return false;
+    }
+    if (!script_validate_cursor_height(persisted_cursor, out_persisted)) {
+        LOG_WARN(STAGE_NAME,
+                 "[script_validate] body_persist cursor out of range: %llu",
+                 (unsigned long long)persisted_cursor);
+        return false;
+    }
+    return true;
+}
+
 static job_result_t step_validate(struct stage_step_ctx *c)
 {
     int64_t total_started = platform_time_monotonic_us();
@@ -397,15 +431,17 @@ static job_result_t step_validate(struct stage_step_ctx *c)
     sqlite3 *db = progress_store_db();
     if (!db) return JOB_IDLE;
 
-    int next_h = (int)c->cursor_in;
-    if (next_h < 0) return JOB_FATAL;
-
+    int next_h = 0;
+    int persisted_cursor = 0;
     uint64_t bp_cursor = 0;
     if (!stage_upstream_frontier_or_zero(db, "body_persist", STAGE_NAME,
                                    &bp_cursor))
         return sv_db_fault(sqlite3_extended_errcode(db), next_h,
                            "body_persist cursor read");
-    if ((uint64_t)next_h >= bp_cursor) {
+    if (!script_validate_step_cursor_heights(c, bp_cursor, &next_h,
+                                             &persisted_cursor))
+        return JOB_FATAL;
+    if (next_h >= persisted_cursor) {
         atomic_store(&g_last_blocked_unix, platform_time_wall_unix());
         return JOB_IDLE;
     }
