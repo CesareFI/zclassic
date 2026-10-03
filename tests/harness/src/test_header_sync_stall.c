@@ -219,8 +219,12 @@ int test_header_sync_stall(void)
          * overflow before the future-clock policy can apply. */
         bool extreme_future = syncsvc_should_disconnect_stale_header_peer(
             &n, 100, 5000, INT64_MAX, INT64_MIN);
+        n.time_connected = INT64_MAX;
+        bool extreme_connection = syncsvc_should_disconnect_stale_header_peer(
+            &n, 100, 5000, 0, INT64_MIN);
         bool ok = !recent && boundary && !future_clock;
         ok &= !extreme_future;
+        ok &= extreme_connection;
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 

@@ -722,6 +722,8 @@ bool syncsvc_should_disconnect_stale_header_peer(const struct p2p_node *node,
     if (ref_time == 0)
         ref_time = node->time_connected;
 
+    if (now_seconds < ref_time)
+        return true;
     return (now_seconds - ref_time) >= HEADER_STALL_TIMEOUT_SECS;
 }
 
