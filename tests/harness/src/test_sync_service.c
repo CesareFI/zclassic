@@ -1800,6 +1800,16 @@ static int test_sync_service_valid_block_transition(void)
         ASSERT(result.should_set_flush_policy);
         ASSERT(result.should_update_peer_state);
         ASSERT(result.next_peer_state == PEER_ACTIVE);
+
+        /* starting_height is a signed peer wire value. Its maximum valid
+         * representation must not overflow the stale-height tolerance. */
+        memset(&result, 0, sizeof(result));
+        node.starting_height = INT_MAX;
+        syncsvc_note_valid_block(&result, &node, SYNC_BLOCKS_DOWNLOAD,
+                                 INT_MAX, INT_MAX, 0, INT_MAX,
+                                 BODY_HISTORY_COMPLETE);
+        ASSERT(result.reached_peer_tip);
+        ASSERT(result.should_set_sync_state);
         PASS();
     } _test_next:;
 
