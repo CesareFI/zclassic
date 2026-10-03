@@ -197,6 +197,46 @@ static int test_legacy_mirror_registers_supervisor_contract(void)
     return failures;
 }
 
+static int test_legacy_mirror_rejects_partial_environment_integer(void)
+{
+    int failures = 0;
+    TEST_CASE("lag_slo: partial environment integer keeps configured cadence")
+    {
+        legacy_mirror_sync_reset_for_test();
+        supervisor_reset_for_testing();
+        setenv("ZCL_MIRROR_CADENCE_SECS", "12tail", 1);
+
+        struct legacy_mirror_sync_config cfg = {
+            .rpc_host = "127.0.0.1",
+            .rpc_port = 1,
+            .rpc_user = "user",
+            .rpc_password = "pass",
+            .cadence_secs = 17,
+            .enabled = true,
+        };
+        ASSERT(legacy_mirror_sync_init(&cfg, NULL, NULL, NULL, NULL).ok);
+        ASSERT(legacy_mirror_sync_start().ok);
+
+        struct supervisor_snapshot snaps[SUPERVISOR_CAP];
+        int n = supervisor_snapshot_all(snaps, SUPERVISOR_CAP);
+        const struct supervisor_snapshot *mirror = NULL;
+        for (int i = 0; i < n; i++) {
+            if (strcmp(snaps[i].name, "chain.legacy_mirror") == 0) {
+                mirror = &snaps[i];
+                break;
+            }
+        }
+        ASSERT(mirror != NULL);
+        ASSERT(mirror->period_secs == 17);
+
+        legacy_mirror_sync_stop();
+        legacy_mirror_sync_reset_for_test();
+        supervisor_reset_for_testing();
+        unsetenv("ZCL_MIRROR_CADENCE_SECS");
+    } TEST_END
+    return failures;
+}
+
 static int test_legacy_mirror_backs_off_when_rpc_is_absent(void)
 {
     int failures = 0;
@@ -342,6 +382,7 @@ int test_lag_slo(void)
     failures += test_slo_breach_observer_fires();
     failures += test_concurrent_catchup_observer_fires();
     failures += test_legacy_mirror_registers_supervisor_contract();
+    failures += test_legacy_mirror_rejects_partial_environment_integer();
     failures += test_legacy_mirror_backs_off_when_rpc_is_absent();
     failures += test_dump_shape_is_stable();
     legacy_mirror_sync_reset_for_test();
