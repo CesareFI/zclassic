@@ -38,8 +38,6 @@
 #include "event/event.h"
 
 #include <pthread.h>
-#include <errno.h>
-#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -205,16 +203,8 @@ static void lms_record_unknown_comparison(const char *code, const char *msg)
 int lms_env_int(const char *name, int fallback, int min, int max)
 {
     const char *s = getenv(name);
-    char *end = NULL;
-    long value;
-    if (!s || !s[0])
-        return fallback;
-    errno = 0;
-    value = strtol(s, &end, 10);
-    if (errno == ERANGE || end == s || *end != '\0' ||
-        value < INT_MIN || value > INT_MAX)
-        return fallback;
-    int n = (int)value;
+    if (!s || !s[0]) return fallback;
+    int n = atoi(s);
     if (n < min) return fallback;
     if (n > max) return max;
     return n;
