@@ -331,8 +331,11 @@ bool syncsvc_should_request_headers(const struct p2p_node *node,
         return false;
 
     int64_t interval = syncsvc_getheaders_interval(node, our_height);
-    return (now_seconds - atomic_load_explicit(&node->last_getheaders_time,
-                                                memory_order_relaxed)) > interval;
+    int64_t last = atomic_load_explicit(&node->last_getheaders_time,
+                                        memory_order_relaxed);
+    if (now_seconds < last)
+        return true;
+    return now_seconds - last > interval;
 }
 
 void syncsvc_plan_periodic_getheaders(struct sync_getheaders_action *action,

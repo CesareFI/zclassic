@@ -226,6 +226,10 @@ static int test_sync_service_request_policy(void)
         ASSERT(syncsvc_is_initial_block_download(&node, 500));
         ASSERT(!syncsvc_should_request_headers(&node, 500, 109));
         ASSERT(syncsvc_should_request_headers(&node, 500, 111));
+        /* A backward wall-clock correction must re-arm one request rather
+         * than suppressing header recovery until the old time catches up. */
+        ASSERT(syncsvc_should_request_headers(&node, 500, 99));
+        ASSERT(!syncsvc_should_request_headers(&node, 500, 100));
 
         /* Catching up (not IBD, but behind peer): 30s interval */
         ASSERT(!syncsvc_is_initial_block_download(&node, 900));
