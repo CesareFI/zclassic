@@ -15,6 +15,7 @@
 
 #include <sqlite3.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -417,6 +418,30 @@ static int test_bc_scheduler_fill_rate(void)
     return failures;
 }
 
+static int test_bc_scheduler_counters_saturate(void)
+{
+    int failures = 0;
+    TEST("scheduler counters saturate instead of wrapping to zero") {
+        struct body_coverage_map m;
+        struct body_coverage_scheduler s;
+        struct bc_range hole;
+        body_coverage_init(&m);
+        body_coverage_scheduler_init(&s);
+        s.plans = UINT64_MAX;
+        s.holes_seen = UINT64_MAX;
+        s.no_source_fires = UINT64_MAX;
+
+        ASSERT(body_coverage_scheduler_plan(&s, &m, 0, 0, 1, &hole));
+        body_coverage_scheduler_mark_no_source(&s, 1);
+        ASSERT(s.plans == UINT64_MAX);
+        ASSERT(s.holes_seen == UINT64_MAX);
+        ASSERT(s.no_source_fires == UINT64_MAX);
+        body_coverage_free(&m);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* ── Fixture: drive a synthetic hole through the download manager ── */
 
 /* Deterministic block hash for a height (distinct, non-null). */
@@ -505,6 +530,7 @@ int test_body_coverage(void)
     failures += test_bc_persistence_roundtrip();
     failures += test_bc_scheduler_plan_and_blocker();
     failures += test_bc_scheduler_fill_rate();
+    failures += test_bc_scheduler_counters_saturate();
     failures += test_bc_gap_enqueue_drain_fixture();
     return failures;
 }

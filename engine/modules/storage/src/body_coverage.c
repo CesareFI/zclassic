@@ -476,6 +476,11 @@ bool body_coverage_load(struct body_coverage_map *m, struct sqlite3 *db)
 
 /* ── Gap-fill scheduler ─────────────────────────────────────────── */
 
+static uint64_t bc_counter_increment(uint64_t value)
+{
+    return value + (value < UINT64_MAX);
+}
+
 void body_coverage_scheduler_init(struct body_coverage_scheduler *s)
 {
     if (!s)
@@ -495,7 +500,7 @@ bool body_coverage_scheduler_plan(struct body_coverage_scheduler *s,
     if (!s || !map)
         return false;
 
-    s->plans++;
+    s->plans = bc_counter_increment(s->plans);
     s->needed_lo = needed_lo;
     s->needed_hi = needed_hi;
 
@@ -524,7 +529,7 @@ bool body_coverage_scheduler_plan(struct body_coverage_scheduler *s,
 
     s->active_hole = hole;
     s->has_active_hole = true;
-    s->holes_seen++;
+    s->holes_seen = bc_counter_increment(s->holes_seen);
     if (out_hole)
         *out_hole = hole;
     return true;
@@ -546,7 +551,7 @@ void body_coverage_scheduler_mark_no_source(struct body_coverage_scheduler *s,
     if (!s->blocked_no_source) {
         s->blocked_no_source = true;
         s->blocked_since_unix = now_unix;
-        s->no_source_fires++;
+        s->no_source_fires = bc_counter_increment(s->no_source_fires);
     }
 }
 
