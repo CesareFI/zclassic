@@ -142,6 +142,18 @@ static int gf_dump_saturates_unsigned_stats(void)
     return failures;
 }
 
+static bool gf_out_of_range_body_fetch_cursor_keeps_tip(void)
+{
+    return gap_fill_test_raise_tip_to_body_fetch_cursor(
+               100, (uint64_t)INT64_MAX) == 100 &&
+           gap_fill_test_raise_tip_to_body_fetch_cursor(100, UINT64_MAX) ==
+               100 &&
+           gap_fill_test_raise_tip_to_body_fetch_cursor(
+               100, (uint64_t)INT_MAX) == INT_MAX - 1 &&
+           gap_fill_test_raise_tip_to_body_fetch_cursor(
+               100, (uint64_t)INT_MAX + 1u) == 100;
+}
+
 int test_gap_fill_frontier_window(void)
 {
     printf("\n=== gap_fill_frontier_window ===\n");
@@ -234,6 +246,8 @@ int test_gap_fill_frontier_window(void)
      * still corrupt and must be refused. */
     GF_CHECK("maximum first height is collected without sentinel overflow",
              gf_pprev_maximum_height_regression());
+    GF_CHECK("out-of-range body-fetch cursor keeps the active scheduling tip",
+             gf_out_of_range_body_fetch_cursor_keeps_tip());
 
     /* Regression: during initial sync the validated-header lead exceeds the
      * old 131072-step pprev cap.  The production index has skip pointers, so

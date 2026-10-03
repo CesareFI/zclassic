@@ -253,6 +253,27 @@ bool gap_fill_compute_window(int active_tip_h, int best_header_h,
     return out->has_work;
 }
 
+/* body_fetch's cursor is durable input, while block-index heights are int.
+ * A corrupt high cursor must not narrow through an implementation-defined
+ * conversion and turn the scheduling floor negative. */
+static int gap_fill_raise_tip_to_body_fetch_cursor(int active_tip_h,
+                                                   uint64_t cursor)
+{
+    if (cursor == 0 || cursor > (uint64_t)INT_MAX)
+        return active_tip_h;
+
+    int cursor_tip = (int)(cursor - 1);
+    return cursor_tip > active_tip_h ? cursor_tip : active_tip_h;
+}
+
+#ifdef ZCL_TESTING
+int gap_fill_test_raise_tip_to_body_fetch_cursor(int active_tip_h,
+                                                 uint64_t cursor)
+{
+    return gap_fill_raise_tip_to_body_fetch_cursor(active_tip_h, cursor);
+}
+#endif
+
 struct block_index *gap_fill_window_walk_start(
     struct block_index *best, const struct gap_fill_window *window)
 {
@@ -480,11 +501,8 @@ static int gap_fill_pass(void)
      * or ahead of the active tip. The S2.4 floor below still applies
      * unchanged — it only ever LOWERS the window as a defensive
      * backstop, never behind the fold. */
-    {
-        uint64_t bf_cur = body_fetch_stage_cursor();
-        if (bf_cur > 0 && bf_cur - 1 > (uint64_t)tip_h)
-            tip_h = (int)(bf_cur - 1);
-    }
+    tip_h = gap_fill_raise_tip_to_body_fetch_cursor(
+        tip_h, body_fetch_stage_cursor());
     struct gap_fill_window gf_window;
     /* S2.4: floor the download window on the validate_headers cursor, not
      * body_fetch. body_fetch only advances once a body is already on disk
