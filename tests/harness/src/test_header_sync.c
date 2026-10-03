@@ -7,6 +7,8 @@
 #include "net/net.h"
 #include "sync/sync_planner.h"
 
+#include <limits.h>
+
 /* Helper: build a minimal p2p_node for testing sync decisions. */
 static struct p2p_node make_test_node(int starting_height, int64_t last_gh_time)
 {
@@ -215,7 +217,15 @@ int test_header_sync(void)
 
         bool too_early = syncsvc_should_release_snapshot_anchor(&anchor, &h9);
         bool at_finality = syncsvc_should_release_snapshot_anchor(&anchor, &h10);
+        struct block_index terminal_anchor, terminal_tip;
+        memset(&terminal_anchor, 0, sizeof(terminal_anchor));
+        memset(&terminal_tip, 0, sizeof(terminal_tip));
+        terminal_anchor.nHeight = INT_MAX;
+        terminal_tip.nHeight = INT_MAX;
+        bool terminal_released = syncsvc_should_release_snapshot_anchor(
+            &terminal_anchor, &terminal_tip);
         bool ok = !too_early && at_finality;
+        ok &= !terminal_released;
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 

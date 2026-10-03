@@ -518,7 +518,8 @@ bool syncsvc_should_release_snapshot_anchor(
     const struct block_index *header_tip)
 {
     return anchor && header_tip &&
-           header_tip->nHeight >= anchor->nHeight + zcl_finality_depth();
+           (int64_t)header_tip->nHeight >=
+               (int64_t)anchor->nHeight + zcl_finality_depth();
 }
 
 bool syncsvc_should_begin_blocks_download(enum sync_state sync_state,
