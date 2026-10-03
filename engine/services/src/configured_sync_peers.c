@@ -19,6 +19,7 @@
 #include "util/thread_registry.h"
 
 #include <pthread.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -319,6 +320,13 @@ static int64_t probe_now_ms(void)
     return platform_time_monotonic_us() / 1000;
 }
 
+static int64_t probe_deadline_ms(int64_t now_ms)
+{
+    if (now_ms > INT64_MAX - CONFIGURED_SYNC_PEER_PROBE_DEADLINE_MS)
+        return INT64_MAX;
+    return now_ms + CONFIGURED_SYNC_PEER_PROBE_DEADLINE_MS;
+}
+
 bool configured_sync_peers_probe_should_stop(void)
 {
     return atomic_load(&g_probe_stop) || thread_registry_shutdown_requested();
@@ -445,7 +453,7 @@ static bool probe_noise_identity(const struct net_service *target,
                                  const unsigned char *magic,
                                  uint8_t out_static[32])
 {
-    int64_t deadline_ms = probe_now_ms() + CONFIGURED_SYNC_PEER_PROBE_DEADLINE_MS;
+    int64_t deadline_ms = probe_deadline_ms(probe_now_ms());
     zcl_socket_t sock = ZCL_INVALID_SOCKET;
     if (configured_sync_peers_probe_should_stop() ||
         !probe_connect(target, deadline_ms, &sock))

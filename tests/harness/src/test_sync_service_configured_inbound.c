@@ -40,6 +40,8 @@
 #include "validation/chainstate.h"
 #include "validation/main_state.h"
 
+#include <limits.h>
+
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -2057,6 +2059,11 @@ static int64_t fake_probe_clock_ms(void)
     return atomic_fetch_add(&g_fake_probe_ms, 1000) + 1000;
 }
 
+static int64_t fake_probe_clock_near_max_ms(void)
+{
+    return INT64_MAX - CONFIGURED_SYNC_PEER_PROBE_DEADLINE_MS + 1;
+}
+
 static int test_configured_inbound_probe_deadline(void)
 {
     int failures = 0;
@@ -2082,6 +2089,30 @@ static int test_configured_inbound_probe_deadline(void)
         ASSERT(atomic_load(&g_fake_probe_ms) >=
                CONFIGURED_SYNC_PEER_PROBE_DEADLINE_MS);
         ASSERT(real_ms < CONFIGURED_SYNC_PEER_PROBE_DEADLINE_MS);
+        PASS();
+    } _test_next:;
+
+    configured_sync_peers_set_probe_clock_ms_for_testing(NULL);
+    return failures;
+}
+
+static int test_configured_inbound_probe_deadline_saturates(void)
+{
+    int failures = 0;
+    TEST("configured inbound: a near-maximum monotonic sample still permits "
+         "the real Noise identity probe") {
+        uint8_t probe_priv[32], out[32];
+        model_key(probe_priv, 201);
+        struct probe_listener l;
+        memset(&l, 0, sizeof(l));
+        l.mode = LISTEN_NOISE;
+        model_key(l.priv, 1);
+        configured_sync_peers_set_probe_clock_ms_for_testing(
+            fake_probe_clock_near_max_ms);
+        bool ok = probe_loopback(&l, probe_priv, out);
+        configured_sync_peers_set_probe_clock_ms_for_testing(NULL);
+        ASSERT(ok);
+        ASSERT(l.established);
         PASS();
     } _test_next:;
     configured_sync_peers_set_probe_clock_ms_for_testing(NULL);
@@ -2332,6 +2363,7 @@ int check_sync_service_configured_inbound(void)
     failures += test_configured_inbound_outbound_unchanged();
     failures += test_configured_inbound_probe_socket();
     failures += test_configured_inbound_probe_deadline();
+    failures += test_configured_inbound_probe_deadline_saturates();
     failures += test_configured_inbound_probe_stop();
     failures += test_configured_inbound_probe_thread();
     failures += test_configured_inbound_revocation();
