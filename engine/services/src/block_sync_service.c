@@ -501,7 +501,7 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
     struct main_state *mutable_ms = (struct main_state *)ms;
     zcl_mutex_lock(&mutable_ms->cs_main);
     int our_h = active_chain_height(&ms->chain_active);
-    if (node->starting_height <= our_h + 10) {
+    if ((int64_t)node->starting_height <= (int64_t)our_h + 10) {
         zcl_mutex_unlock(&mutable_ms->cs_main);
         free(cand);
         return false;

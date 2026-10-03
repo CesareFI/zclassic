@@ -2328,7 +2328,6 @@ static int test_sync_service_builds_alt_recovery_plan(void)
         ASSERT(empty_recovery.next_height == 0);
         syncsvc_free_stall_recovery(&empty_recovery);
         main_state_free(&empty_state);
-
         memset(&node, 0, sizeof(node));
         memset(&g, 0, sizeof(g));
         memset(&b1, 0, sizeof(b1));
