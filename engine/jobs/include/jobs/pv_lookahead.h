@@ -123,4 +123,9 @@ uint64_t pv_lookahead_bodiless_skipped_total(void);
 struct json_value;
 bool pv_lookahead_dump_state_json(struct json_value *out, const char *key);
 
+#ifdef ZCL_TESTING
+/* Test seam for the worker's persisted-cursor claim boundary. */
+bool pv_lookahead_test_claim_window(int64_t claim, uint64_t cursor);
+#endif
+
 #endif /* ZCL_JOBS_PV_LOOKAHEAD_H */

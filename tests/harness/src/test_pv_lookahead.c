@@ -710,6 +710,22 @@ static bool la_params_available(void)
     return sapling_init_params(params_dir);
 }
 
+static int test_pvla_cursor_claim_boundaries(void)
+{
+    int failures = 0;
+    TEST_CASE("pv_lookahead rejects unrepresentable durable cursor before window arithmetic") {
+        bool normal = pv_lookahead_test_claim_window(100, 100);
+        bool edge = pv_lookahead_test_claim_window(
+            100 + PV_LOOKAHEAD_WINDOW - 1, 100);
+        bool exhausted = !pv_lookahead_test_claim_window(
+            100 + PV_LOOKAHEAD_WINDOW, 100);
+        bool max_rejected = !pv_lookahead_test_claim_window(
+            INT64_MAX, (uint64_t)INT64_MAX);
+        ASSERT(normal && edge && exhausted && max_rejected);
+    } TEST_END;
+    return failures;
+}
+
 int test_pv_lookahead(void);
 int test_pv_lookahead(void)
 {
@@ -889,6 +905,7 @@ int test_pv_lookahead(void)
     failures += la_test_bodiless_storm();
     failures += la_test_bodiless_heal();
     failures += la_test_bodiless_reset();
+    failures += test_pvla_cursor_claim_boundaries();
 
     printf("pv_lookahead tests: %s\n", failures ? "FAILED" : "PASSED");
     return failures;

@@ -158,6 +158,24 @@ static void pvla_timed_wait_locked(int ms)
     (void)pthread_cond_timedwait(&g_cv, &g_mu, &until);
 }
 
+/* Stage cursors are unsigned durable metadata, but block-index heights are
+ * representable only through INT32_MAX. Reject an out-of-domain cursor before
+ * narrowing or adding the bounded lookahead window. */
+static bool pvla_claim_in_window(int64_t claim, uint64_t cursor)
+{
+    if (cursor > INT32_MAX)
+        return false;
+    return claim <= INT32_MAX &&
+           claim < (int64_t)cursor + PV_LOOKAHEAD_WINDOW;
+}
+
+#ifdef ZCL_TESTING
+bool pv_lookahead_test_claim_window(int64_t claim, uint64_t cursor)
+{
+    return pvla_claim_in_window(claim, cursor);
+}
+#endif
+
 enum pvla_attempt {
     PVLA_STORED,   /* verdict cached (or an identical one already was) */
     /* This height's block/header/body is unavailable.  It is safe to scan
@@ -345,7 +363,15 @@ static void *pvla_worker_entry(void *arg)
             supervisor_progress(child,
                                 (int64_t)atomic_load(&g_verified_total));
         }
-        int64_t cursor = (int64_t)proof_validate_stage_cursor();
+        uint64_t raw_cursor = proof_validate_stage_cursor();
+        if (raw_cursor > INT32_MAX) {
+            /* The authoritative stage will fail the malformed durable cursor;
+             * keep this optional cache idle rather than wrapping it into an
+             * unrelated lookahead range. */
+            pvla_timed_wait_locked(PVLA_RETRY_WAIT_MS);
+            continue;
+        }
+        int64_t cursor = (int64_t)raw_cursor;
         /* Rewind (reorg): the drive moved BACKWARD, which the offline fold never
          * does. Pull the claim back so the workers do not sit stranded above
          * cursor + WINDOW until the drive climbs again. Liveness only — the
@@ -361,7 +387,7 @@ static void *pvla_worker_entry(void *arg)
         if (g_next_claim < cursor)
             g_next_claim = cursor;
         int64_t h = g_next_claim;
-        if (h >= cursor + PV_LOOKAHEAD_WINDOW || h > INT32_MAX) {
+        if (!pvla_claim_in_window(h, raw_cursor)) {
             /* Window exhausted. Re-sweep from the lowest height we skipped for
              * a not-yet-written body: on the live path those bodies land while
              * we scan. Bounded — the reclaim happens at most once per
@@ -465,7 +491,8 @@ bool pv_lookahead_start(struct main_state *ms, const char *datadir,
     g_reader_user = reader_user;
     g_verifier = verifier;
     g_verifier_user = verifier_user;
-    g_next_claim = (int64_t)proof_validate_stage_cursor();
+    uint64_t cursor = proof_validate_stage_cursor();
+    g_next_claim = cursor <= INT32_MAX ? (int64_t)cursor : INT32_MAX;
     atomic_store(&g_hit_total, (uint64_t)0);
     atomic_store(&g_miss_total, (uint64_t)0);
     atomic_store(&g_verified_total, (uint64_t)0);
