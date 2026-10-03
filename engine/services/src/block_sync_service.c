@@ -47,6 +47,16 @@ static bool syncsvc_stall_recovery_due(int64_t now_seconds)
     return now_seconds - g_last_stall_log > 10;
 }
 
+static bool syncsvc_should_reset_stalled_tip(size_t alt_count,
+                                             int64_t now_seconds)
+{
+    if (alt_count != 0)
+        return false;
+    if (now_seconds < g_last_stall_reset)
+        return true;
+    return now_seconds - g_last_stall_reset > 30;
+}
+
 /* zcl.sync_benchmark.v1 one-shot guards. Each flips exactly once per process
  * (matching sync_benchmark_init's per-boot arming in boot.c): the two
  * *_begun flags stamp SYNC_BENCH_TAIL_DOWNLOAD / SYNC_BENCH_TAIL_FOLD on
@@ -575,7 +585,7 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
     recovery->alt_count = alt_count;
     recovery->should_request_tip_parent = (tip->pprev != NULL);
 
-    if (alt_count == 0 && now_seconds - g_last_stall_reset > 30) {
+    if (syncsvc_should_reset_stalled_tip(alt_count, now_seconds)) {
         g_last_stall_reset = now_seconds;
         recovery->should_reset_tip_next = true;
     }

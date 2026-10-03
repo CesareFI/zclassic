@@ -2047,6 +2047,16 @@ static int test_sync_service_requests_reset_when_no_alts(void)
         ASSERT(recovery.alt_count == 0);
         ASSERT(recovery.should_reset_tip_next);
         syncsvc_free_stall_recovery(&recovery);
+
+        /* The reset throttle is a wall-clock diagnostic. A backward
+         * correction must not keep a body-stall recovery dormant until
+         * wall time catches up. This exercises the production planner's
+         * no-alternate reset branch, not a copied timeout predicate. */
+        ASSERT(syncsvc_build_stall_recovery(&recovery, &ms, &node,
+                                            0, 0, 1999));
+        ASSERT(recovery.alt_count == 0);
+        ASSERT(recovery.should_reset_tip_next);
+        syncsvc_free_stall_recovery(&recovery);
         main_state_free(&ms);
         PASS();
     } _test_next:;
