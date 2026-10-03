@@ -191,6 +191,13 @@ static struct beta6_quota_bucket *bucket_insert(const char *key, int64_t now_ms)
     return bucket;
 }
 
+static uint64_t quota_bytes_served_add(uint64_t total, uint64_t bytes)
+{
+    if (bytes > UINT64_MAX - total)
+        return UINT64_MAX;
+    return total + bytes;
+}
+
 /* The bucket decision, taken under the lock. 0 = serve, and the two negative
  * codes are the ones the caller branches on (see the header). */
 static int quota_verdict_locked(const char *key, bool whitelisted, int64_t now_ms)
@@ -247,7 +254,8 @@ void beta6_bs_quota_charge(const char *key, bool whitelisted, int64_t now_ms,
         bucket->bytes_served = 0;
         bucket->next_allowed_ms = 0;
     }
-    bucket->bytes_served += bytes;
+    bucket->bytes_served = quota_bytes_served_add(bucket->bytes_served,
+                                                   bytes);
     if (bucket->bytes_served >= (uint64_t)g_max_bytes_per_day && g_throttle_kbps > 0) {
         int64_t delay_ms = (int64_t)((bytes * 1000ULL) / ((uint64_t)g_throttle_kbps * 1024ULL));
         bucket->next_allowed_ms = now_ms + (delay_ms > 1 ? delay_ms : 1);

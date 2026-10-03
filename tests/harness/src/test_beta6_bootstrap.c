@@ -727,6 +727,17 @@ int test_beta6_bootstrap(void)
         ASSERT(!rollback.ok);
         ASSERT_EQ(rollback.code, BETA6_BS_ERR_QUOTA_STOPPED);
 
+        /* Saturation keeps a bucket over cap even if a hostile accounting
+         * sample would otherwise wrap the unsigned total back to zero. */
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(1, 0);
+        beta6_bs_quota_charge("v4/24:203.0.113", false, 0, UINT64_MAX);
+        ASSERT_EQ(beta6_bs_quota_check("v4/24:203.0.113", false, 0).code,
+                  BETA6_BS_ERR_QUOTA_STOPPED);
+        beta6_bs_quota_charge("v4/24:203.0.113", false, 0, 1);
+        ASSERT_EQ(beta6_bs_quota_check("v4/24:203.0.113", false, 0).code,
+                  BETA6_BS_ERR_QUOTA_STOPPED);
+
         /* Throttle off means a hard stop instead of a slow trickle. */
         beta6_bs_quota_clear();
         beta6_bs_quota_configure(1000, 0);
