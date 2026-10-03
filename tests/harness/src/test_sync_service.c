@@ -1910,6 +1910,16 @@ static int test_sync_service_builds_alt_recovery_plan(void)
         ASSERT(recovery.should_request_tip_parent);
         ASSERT(!recovery.should_reset_tip_next);
         syncsvc_free_stall_recovery(&recovery);
+
+        /* The planner's rate-limit timestamp is a wall-clock diagnostic.
+         * A backward correction must re-arm recovery rather than suppressing
+         * an otherwise actionable body stall until wall time catches up. This
+         * calls the production planner twice, not a copied predicate. */
+        ASSERT(syncsvc_build_stall_recovery(&recovery, &ms, &node,
+                                            0, 0, 999));
+        ASSERT(recovery.should_recover);
+        ASSERT(recovery.alt_count == 2);
+        syncsvc_free_stall_recovery(&recovery);
         main_state_free(&ms);
         PASS();
     } _test_next:;

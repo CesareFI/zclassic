@@ -36,6 +36,17 @@ static int64_t g_last_stall_log = 0;
 static int64_t g_last_stall_reset = 0;
 static int64_t g_last_stale_warn = 0;
 
+/* `now_seconds` is retained as a wall-clock diagnostic timestamp, so a
+ * backward correction must start a fresh throttle epoch. Otherwise the
+ * log-rate limiter also suppresses the recovery planner until wall time
+ * catches up, leaving an otherwise recoverable body stall idle. */
+static bool syncsvc_stall_recovery_due(int64_t now_seconds)
+{
+    if (now_seconds < g_last_stall_log)
+        return true;
+    return now_seconds - g_last_stall_log > 10;
+}
+
 /* zcl.sync_benchmark.v1 one-shot guards. Each flips exactly once per process
  * (matching sync_benchmark_init's per-boot arming in boot.c): the two
  * *_begun flags stamp SYNC_BENCH_TAIL_DOWNLOAD / SYNC_BENCH_TAIL_FOLD on
@@ -439,7 +450,7 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
     if (queued != 0 || in_flight != 0) return false;
     if (node->starting_height <= our_h + 10) return false;
     if (node->state < PEER_HANDSHAKE_COMPLETE) return false;
-    if (now_seconds - g_last_stall_log <= 10) return false;
+    if (!syncsvc_stall_recovery_due(now_seconds)) return false;
 
     g_last_stall_log = now_seconds;
     recovery->should_recover = true;
