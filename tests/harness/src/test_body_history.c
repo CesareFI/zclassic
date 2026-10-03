@@ -37,6 +37,7 @@
 #include "core/uint256.h"
 
 #include <sqlite3.h>
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1651,6 +1652,30 @@ static int test_bh_service_abort_resume_rewind(void)
     return failures;
 }
 
+static int test_bh_held_max_range_stays_in_window(void)
+{
+    int failures = 0;
+    TEST("restored INT64_MAX coverage range is clipped without overflow") {
+        struct bc_range held_range = { .lo = 0, .hi = INT64_MAX };
+        struct bc_range measured_range = { .lo = 0, .hi = INT_MAX };
+        struct body_coverage_map held = {
+            .ranges = &held_range, .count = 1, .cap = 1
+        };
+        struct body_coverage_map measured = {
+            .ranges = &measured_range, .count = 1, .cap = 1
+        };
+        struct body_history_verdict verdict;
+
+        ASSERT(body_history_evaluate(&held, &measured, 0, INT_MAX,
+                                     &verdict));
+        ASSERT(verdict.status == BODY_HISTORY_COMPLETE);
+        ASSERT(verdict.held_count == (int64_t)INT_MAX + 1);
+        ASSERT(verdict.unmeasured_count == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_body_history(void)
 {
     int failures = 0;
@@ -1681,5 +1706,6 @@ int test_body_history(void)
     failures += test_bh_persistence_never_restores_a_verdict();
     failures += test_bh_fully_measured_is_looked_not_proven();
     failures += test_bh_dump_state_json_separates_the_three();
+    failures += test_bh_held_max_range_stays_in_window();
     return failures;
 }

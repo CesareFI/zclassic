@@ -63,6 +63,37 @@ bool body_history_verdict_is_proven(const struct body_history_verdict *v)
     return v && body_history_status_is_proven(v->status);
 }
 
+static bool bh_held_advance_to_range_end(int64_t hhi, int64_t rhi,
+                                         int64_t *hcur)
+{
+    if (hhi >= rhi)
+        return true;
+    *hcur = hhi + 1;
+    return false;
+}
+
+static bool bh_missing_tail(bool held_to_range_end, int64_t hcur,
+                            int64_t rhi, int64_t lowest_missing)
+{
+    return !held_to_range_end && hcur <= rhi && lowest_missing < 0;
+}
+
+static bool bh_measured_advance_to_window_end(int64_t rhi, int64_t hi,
+                                               int64_t *cursor)
+{
+    if (rhi >= hi)
+        return true;
+    *cursor = rhi + 1;
+    return false;
+}
+
+static bool bh_unmeasured_tail(bool measured_to_window_end, int64_t cursor,
+                               int64_t hi, int64_t lowest_unmeasured)
+{
+    return !measured_to_window_end && cursor <= hi &&
+           lowest_unmeasured < 0;
+}
+
 bool body_history_evaluate(const struct body_coverage_map *held,
                            const struct body_coverage_map *measured,
                            int64_t lo, int64_t hi,
@@ -100,6 +131,7 @@ bool body_history_evaluate(const struct body_coverage_map *held,
     int64_t held_in_w = 0;
     int64_t cursor = lo;      /* first window height not yet accounted for */
     size_t h_idx = 0;         /* monotone cursor into held->ranges */
+    bool measured_to_window_end = false;
 
     for (size_t i = 0; i < measured->count; i++) {
         int64_t rlo = measured->ranges[i].lo;
@@ -124,6 +156,7 @@ bool body_history_evaluate(const struct body_coverage_map *held,
         while (h_idx < held->count && held->ranges[h_idx].hi < rlo)
             h_idx++;
         int64_t hcur = rlo;
+        bool held_to_range_end = false;
         for (size_t j = h_idx; j < held->count; j++) {
             int64_t hlo = held->ranges[j].lo;
             int64_t hhi = held->ranges[j].hi;
@@ -137,16 +170,22 @@ bool body_history_evaluate(const struct body_coverage_map *held,
             int64_t b = hhi < rhi ? hhi : rhi;
             if (b >= a)
                 held_in_w += b - a + 1;
-            if (hhi + 1 > hcur)
-                hcur = hhi + 1;
+            held_to_range_end = bh_held_advance_to_range_end(hhi, rhi,
+                                                              &hcur);
+            if (held_to_range_end)
+                break;
         }
-        if (hcur <= rhi && out->lowest_missing < 0)
+        if (bh_missing_tail(held_to_range_end, hcur, rhi,
+                            out->lowest_missing))
             out->lowest_missing = hcur;
 
-        if (rhi + 1 > cursor)
-            cursor = rhi + 1;
+        measured_to_window_end = bh_measured_advance_to_window_end(
+            rhi, hi, &cursor);
+        if (measured_to_window_end)
+            break;
     }
-    if (cursor <= hi && out->lowest_unmeasured < 0)
+    if (bh_unmeasured_tail(measured_to_window_end, cursor, hi,
+                           out->lowest_unmeasured))
         out->lowest_unmeasured = cursor;
 
     out->held_count = held_in_w;
