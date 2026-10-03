@@ -755,6 +755,12 @@ bool syncsvc_should_disconnect_body_stalled_peer(const struct p2p_node *node,
     /* Grace: never judge a peer inside its first stall window. */
     int64_t ref_time = node->time_connected ? node->time_connected
                                             : now_seconds;
+    /* A backward wall-clock correction can leave the connection cursor
+     * future-dated. Once the independent timeout floor above is met, do not
+     * keep a never-serving IBD peer until wall time catches up. Comparing
+     * first also keeps the elapsed-time subtraction representable. */
+    if (now_seconds < ref_time)
+        return true;
     return (now_seconds - ref_time) >= SYNC_BODY_STALL_TIMEOUT_SECS;
 }
 
