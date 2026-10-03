@@ -28,6 +28,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -291,6 +292,39 @@ struct block_index *body_fetch_exact_authority_resolve(
 
 /* ── Step body ─────────────────────────────────────────────────────── */
 
+static bool body_fetch_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool body_fetch_stage_test_cursor_height(uint64_t cursor, int *out)
+{
+    return body_fetch_cursor_height(cursor, out);
+}
+#endif
+
+static bool body_fetch_step_cursor_heights(const struct stage_step_ctx *c,
+                                           uint64_t validated_cursor,
+                                           int *out_next, int *out_validated)
+{
+    if (!c || !body_fetch_cursor_height(c->cursor_in, out_next)) {
+        LOG_WARN(STAGE_NAME, "[body_fetch] cursor out of range: %llu",
+                 (unsigned long long)(c ? c->cursor_in : 0));
+        return false;
+    }
+    if (!body_fetch_cursor_height(validated_cursor, out_validated)) {
+        LOG_WARN(STAGE_NAME,
+                 "[body_fetch] validate_headers cursor out of range: %llu",
+                 (unsigned long long)validated_cursor);
+        return false;
+    }
+    return true;
+}
+
 static job_result_t step_body_fetch(struct stage_step_ctx *c)
 {
     atomic_store(&g_last_step_unix, platform_time_wall_unix());
@@ -299,9 +333,6 @@ static job_result_t step_body_fetch(struct stage_step_ctx *c)
     if (!ms) return JOB_IDLE;
     sqlite3 *db = progress_store_db();
     if (!db) return JOB_IDLE;
-
-    int next_h = (int)c->cursor_in;
-    if (next_h < 0) return JOB_FATAL;
 
     /* Floor: never overrun validate_headers' DURABLY persisted cursor.
      * validate cursor = "next height to validate" → heights
@@ -313,7 +344,12 @@ static job_result_t step_body_fetch(struct stage_step_ctx *c)
     if (!stage_upstream_frontier_or_zero(db, "validate_headers", STAGE_NAME,
                                    &vh_cursor))
         return JOB_FATAL;
-    if ((uint64_t)next_h >= vh_cursor) {
+    int next_h = 0;
+    int validated_cursor = 0;
+    if (!body_fetch_step_cursor_heights(c, vh_cursor, &next_h,
+                                        &validated_cursor))
+        return JOB_FATAL;
+    if (next_h >= validated_cursor) {
         atomic_store(&g_last_blocked_unix, platform_time_wall_unix());
         return JOB_IDLE;  /* not BLOCKED — validate will catch up */
     }
