@@ -772,5 +772,7 @@ bool syncsvc_should_disconnect_body_dark_peer(const struct p2p_node *node,
         return false;
 
     /* Genuine staleness: no body for a full stall window. */
+    if (now_seconds < last_body_time)
+        return false;
     return (now_seconds - last_body_time) >= SYNC_BODY_STALL_TIMEOUT_SECS;
 }

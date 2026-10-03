@@ -766,6 +766,13 @@ static int test_sync_service_body_dark_disconnect(void)
                    &node, our_height, 5, SYNC_BODY_STALL_MIN_TIMEOUTS,
                    now - (SYNC_BODY_STALL_TIMEOUT_SECS - 1), now));
 
+        /* A wall-clock rollback leaves a future body cursor. Keep the
+         * previously useful peer until time catches up; subtracting this
+         * pair can otherwise overflow and turn a rollback into eviction. */
+        ASSERT(!syncsvc_should_disconnect_body_dark_peer(
+                   &node, our_height, 5, SYNC_BODY_STALL_MIN_TIMEOUTS,
+                   INT64_MAX, INT64_MIN));
+
         /* Zero/unknown cursor is never judged (defensive). */
         ASSERT(!syncsvc_should_disconnect_body_dark_peer(
                    &node, our_height, 5, SYNC_BODY_STALL_MIN_TIMEOUTS, 0, now));
