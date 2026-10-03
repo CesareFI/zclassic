@@ -127,6 +127,20 @@ static bool vh_header_from_bi_solution(const struct block_index *bi,
     return true;
 }
 
+static int test_vh_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    VH_CHECK("cursor: representable durable height is retained",
+             validate_headers_stage_test_cursor_height(INT32_MAX, &height) &&
+             height == INT32_MAX);
+    VH_CHECK("cursor: unrepresentable durable heights are refused before narrowing",
+             !validate_headers_stage_test_cursor_height(
+                 (uint64_t)INT32_MAX + 1u, &height) &&
+             !validate_headers_stage_test_cursor_height(UINT64_MAX, &height));
+    return failures;
+}
+
 static bool vh_set_bi_hash_for_solution(struct block_index *bi,
                                         struct uint256 *hash_slot,
                                         const unsigned char *sol,
@@ -499,6 +513,7 @@ int test_validate_headers_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    failures += test_vh_cursor_conversion_bounds();
 
     /* ── happy: 5 blocks, all pass under stub ──────────────────────── */
     {

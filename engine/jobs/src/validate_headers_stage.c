@@ -677,6 +677,42 @@ static bool vh_authoritative_mark(struct vh_job *job, bool clearable)
 
 /* ── Step body ────────────────────────────────────────────────────── */
 
+/* Durable stage cursors are unsigned, while every block-index access takes a
+ * signed height. Refuse an out-of-domain cursor before narrowing it into a
+ * different, potentially already-validated height. */
+static bool vh_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool validate_headers_stage_test_cursor_height(uint64_t cursor, int *out)
+{
+    return vh_cursor_height(cursor, out);
+}
+#endif
+
+static bool vh_step_cursor_heights(const struct stage_step_ctx *c,
+                                   uint64_t header_cursor,
+                                   int *out_next, int *out_header)
+{
+    if (!c || !vh_cursor_height(c->cursor_in, out_next)) {
+        LOG_WARN(STAGE_NAME, "[validate_headers] cursor out of range: %llu",
+                 (unsigned long long)(c ? c->cursor_in : 0));
+        return false;
+    }
+    if (!vh_cursor_height(header_cursor, out_header)) {
+        LOG_WARN(STAGE_NAME,
+                 "[validate_headers] header_admit cursor out of range: %llu",
+                 (unsigned long long)header_cursor);
+        return false;
+    }
+    return true;
+}
+
 static job_result_t step_validate(struct stage_step_ctx *c)
 {
     atomic_store(&g_last_step_unix, platform_time_wall_unix());
@@ -687,23 +723,24 @@ static job_result_t step_validate(struct stage_step_ctx *c)
     sqlite3 *db = progress_store_db();
     if (!db) return JOB_IDLE;
 
-    int next_h = (int)c->cursor_in;
-    if (next_h < 0) return JOB_FATAL;
-
     /* Floor: never get ahead of header_admit. The header_admit cursor
      * is "next height to admit" — so heights [0, ha_cursor-1] are
      * admitted. We can validate up to ha_cursor-1. */
+    int next_h = 0;
+    int header_cursor = 0;
     uint64_t ha_cursor = 0;
     if (!stage_cursor_read_or_zero(db, "header_admit", STAGE_NAME,
                                    &ha_cursor))
         return vh_db_fault(sqlite3_extended_errcode(db), next_h,
                            "header_admit cursor read");
-    if ((uint64_t)next_h >= ha_cursor) {
+    if (!vh_step_cursor_heights(c, ha_cursor, &next_h, &header_cursor))
+        return JOB_FATAL;
+    if (next_h >= header_cursor) {
         atomic_store(&g_last_blocked_unix, platform_time_wall_unix());
         return JOB_IDLE;  /* not BLOCKED — header_admit will catch up */
     }
 
-    int available = (int)(ha_cursor - (uint64_t)next_h);
+    int available = header_cursor - next_h;
     int batch_n = (available < g_pool.batch_cap) ? available : g_pool.batch_cap;
     if (batch_n <= 0 || !g_pool.batch) return JOB_IDLE;
 

@@ -156,6 +156,11 @@ uint64_t validate_headers_stage_failed_total(void);
  * a value that stays 1 while many JOB_IDLE steps run proves the storm is gone. */
 int64_t validate_headers_stage_mark_fail_warn_count(void);
 
+#ifdef ZCL_TESTING
+/* Test seam for durable cursor conversion before block-index height use. */
+bool validate_headers_stage_test_cursor_height(uint64_t cursor, int *out);
+#endif
+
 /* Test-only: the current failure-recheck floor (lowest height the recheck pass
  * revisits). See the Task A #12 floor-pin regression test. */
 int64_t validate_headers_stage_recheck_floor_for_test(void);
