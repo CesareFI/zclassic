@@ -37,6 +37,7 @@
 
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define SRBF_CHECK(name, expr) do { \
@@ -116,6 +117,40 @@ static void srbf_tick(struct srbf_fake_clock *fc, int64_t wall_s,
     sync_rate_below_floor_test_set_cursor_override(cursor);
     sync_rate_below_floor_test_set_throttle_wait_us_override(throttle_us);
     condition_engine_tick();
+}
+
+static bool srbf_extreme_floor_saturates(struct srbf_fake_clock *fc,
+                                         int64_t t0, int64_t window_us)
+{
+    struct connman cm; struct download_manager dm; struct main_state ms;
+    srbf_reset(&cm, &dm, &ms);
+    srbf_fake_clock_install(fc, t0);
+    sync_rate_below_floor_test_set_log_head_override(0);
+    bool env_ok = setenv("ZCL_SYNC_RATE_FLOOR_BPS",
+                         "9223372036854775807", 1) == 0;
+
+    struct p2p_node peer = {0};
+    peer.id = 1;
+    peer.starting_height = 10000;
+    peer.state = PEER_ACTIVE;
+    peer.services = NODE_NETWORK;
+    struct p2p_node *peers[1] = { &peer };
+    cm.manager.nodes = peers;
+    cm.manager.num_nodes = 1;
+
+    int64_t mono = 1000000000;
+    int64_t cur = 0;
+    srbf_tick(fc, t0, mono, cur, 0);
+    for (int i = 0; i < 5; i++) {
+        mono += window_us;
+        cur += 1;
+        srbf_tick(fc, t0 + 30 * (i + 1), mono, cur, 0);
+    }
+    bool ok = env_ok && sync_rate_below_floor_test_remedy_calls() == 1 &&
+              condition_engine_get_active_count() == 1;
+    (void)unsetenv("ZCL_SYNC_RATE_FLOOR_BPS");
+    srbf_cleanup();
+    return ok;
 }
 
 int test_sync_rate_below_floor(void);
@@ -345,6 +380,13 @@ int test_sync_rate_below_floor(void)
         SRBF_CHECK("network_tip <= log_head (no backlog) never trips", ok);
         srbf_cleanup();
     }
+
+    /* A syntactically valid but extreme operator floor must remain a
+     * conservative floor, not overflow negative and silently turn a stalled
+     * IBD lane into an above-floor result. This drives sr_floor_bps_scaled()
+     * through the production condition's detect path. */
+    SRBF_CHECK("extreme configured floor saturates conservatively",
+               srbf_extreme_floor_saturates(&fc, t0, WINDOW_US));
 
     printf("=== test_sync_rate_below_floor complete: %d failure(s) ===\n",
            failures);
