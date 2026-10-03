@@ -18,6 +18,7 @@
 #include "json/json.h"
 #include "util/log_macros.h"
 
+#include <limits.h>
 #include <string.h>
 
 /* Default per-span assignment budget: 30 s. A peer that has not driven its
@@ -180,6 +181,17 @@ static bool peer_has_live_span_locked(const struct header_range_scheduler *s,
     return false;
 }
 
+/* A timeout is positive after initialization.  Saturate its absolute
+ * monotonic deadline so an extreme clock sample cannot turn a newly-issued
+ * span into an already-expired one and hand the same header range to another
+ * peer. */
+static int64_t hrs_deadline_from(int64_t now_us, int64_t timeout_us)
+{
+    if (now_us > INT64_MAX - timeout_us)
+        return INT64_MAX;
+    return now_us + timeout_us;
+}
+
 int hrs_assign(struct header_range_scheduler *s, int32_t peer_id,
                int64_t now_us)
 {
@@ -197,7 +209,8 @@ int hrs_assign(struct header_range_scheduler *s, int32_t peer_id,
         if (!s->spans[i].assigned && !s->spans[i].completed) {
             s->spans[i].assigned = true;
             s->spans[i].peer_id = peer_id;
-            s->spans[i].deadline_us = now_us + s->span_timeout_us;
+            s->spans[i].deadline_us =
+                hrs_deadline_from(now_us, s->span_timeout_us);
             s->stat_assigns++;
             zcl_mutex_unlock(&s->lock);
             return (int)i;

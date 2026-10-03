@@ -32,6 +32,42 @@
 #include "test/test_core.h"
 #include "services/header_range_scheduler.h"
 
+#include <limits.h>
+
+static bool hrs_saturated_deadline_keeps_ownership(void)
+{
+    struct header_range_scheduler s = {0};
+    const int64_t timeout_us = 30 * 1000000;
+    const int64_t boundary = INT64_MAX - timeout_us;
+    hrs_init(&s, timeout_us);
+    hrs_plan(&s, 0, 1, NULL, 0);
+
+    int at_boundary = hrs_assign(&s, 11, boundary);
+    bool ok = at_boundary >= 0 &&
+              hrs_peer_span(&s, 11, boundary, NULL, NULL) &&
+              !hrs_peer_owns_expired_span(&s, 11, boundary);
+    hrs_reset(&s);
+
+    hrs_plan(&s, 0, 1, NULL, 0);
+    int past_boundary = hrs_assign(&s, 22, boundary + 1);
+    bool after = past_boundary >= 0 &&
+                 hrs_peer_span(&s, 22, boundary + 1, NULL, NULL) &&
+                 !hrs_peer_owns_expired_span(&s, 22, boundary + 1);
+    hrs_reset(&s);
+    return ok && after;
+}
+
+static int test_hrs_saturated_deadline(void)
+{
+    printf("header_range_sched: max-clock assignment keeps ownership... ");
+    if (hrs_saturated_deadline_keeps_ownership()) {
+        printf("OK\n");
+        return 0;
+    }
+    printf("FAIL\n");
+    return 1;
+}
+
 int test_header_range_sched(void)
 {
     int failures = 0;
@@ -123,6 +159,9 @@ int test_header_range_sched(void)
         hrs_reset(&s);
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
+
+    /* ── 3b. Saturated deadline stays live, not immediately reassignable ─ */
+    failures += test_hrs_saturated_deadline();
 
     /* ── 4. Stall -> reassign + report for demotion ──────────────── */
     printf("header_range_sched: stalled span reassigned + peer reported... ");
