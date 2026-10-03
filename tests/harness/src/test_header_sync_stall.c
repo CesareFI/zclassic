@@ -49,6 +49,34 @@ static struct p2p_node make_stall_node(int starting_height, bool inbound,
     return n;
 }
 
+static bool fallback_rearms_once_after_rollback(void)
+{
+    struct p2p_node n = make_stall_node(10000, true, 0);
+    n.state = PEER_ACTIVE;
+    atomic_store(&n.last_getheaders_time, 100);
+    bool rearmed = syncsvc_should_request_headers_with_fallback(
+        &n, 100, 99, true);
+    syncsvc_note_headers_requested(&n, 99);
+    bool repeated = syncsvc_should_request_headers_with_fallback(
+        &n, 100, 99, true);
+    bool exact = syncsvc_should_request_headers_with_fallback(
+        &n, 100, 109, true);
+    bool after = syncsvc_should_request_headers_with_fallback(
+        &n, 100, 110, true);
+    return rearmed && !repeated && !exact && after;
+}
+
+static int test_fallback_rollback_rearm(void)
+{
+    printf("header_sync_stall: fallback re-arms once after rollback... ");
+    if (fallback_rearms_once_after_rollback()) {
+        printf("OK\n");
+        return 0;
+    }
+    printf("FAIL\n");
+    return 1;
+}
+
 int test_header_sync_stall(void)
 {
     int failures = 0;
@@ -291,6 +319,9 @@ int test_header_sync_stall(void)
             &n, 100, 15, false);
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
+
+    /* ── 17. Fallback recovers once after a wall-clock rollback ─── */
+    failures += test_fallback_rollback_rearm();
 
     return failures;
 }

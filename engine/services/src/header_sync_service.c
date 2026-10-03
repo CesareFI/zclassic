@@ -796,6 +796,9 @@ bool syncsvc_should_request_headers_with_fallback(const struct p2p_node *node,
         interval = 10;
     else
         interval = 30; /* tighter during stall */
-    return (now_seconds - atomic_load_explicit(&node->last_getheaders_time,
-                                                memory_order_relaxed)) > interval;
+    int64_t last = atomic_load_explicit(&node->last_getheaders_time,
+                                        memory_order_relaxed);
+    if (now_seconds < last)
+        return true;
+    return now_seconds - last > interval;
 }
