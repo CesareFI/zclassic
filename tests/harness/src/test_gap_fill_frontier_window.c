@@ -71,12 +71,13 @@ static bool gf_pprev_maximum_height_regression(void)
     return one == 1 && out[0] == &top && corrupt == -1;
 }
 
-static bool gf_out_of_range_cursor_refuses_window(void)
+static bool gf_out_of_range_cursor_keeps_window(void)
 {
     struct gap_fill_window window;
     bool has_work = gap_fill_compute_window(
-        INT_MAX - 1, INT_MAX, (uint64_t)INT64_MAX + UINT64_C(1), &window);
-    return !has_work && !window.has_work;
+        100, 200, UINT64_MAX, &window);
+    return has_work && window.has_work && window.effective_tip_h == 100 &&
+           window.lo == 101 && window.hi == 200 && window.count == 100;
 }
 
 int test_gap_fill_frontier_window(void)
@@ -168,8 +169,8 @@ int test_gap_fill_frontier_window(void)
      * still corrupt and must be refused. */
     GF_CHECK("maximum first height is collected without sentinel overflow",
              gf_pprev_maximum_height_regression());
-    GF_CHECK("out-of-range header cursor refuses a body window",
-             gf_out_of_range_cursor_refuses_window());
+    GF_CHECK("out-of-range header cursor keeps the bounded body window",
+             gf_out_of_range_cursor_keeps_window());
 
     /* Regression: during initial sync the validated-header lead exceeds the
      * old 131072-step pprev cap.  The production index has skip pointers, so

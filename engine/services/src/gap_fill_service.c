@@ -207,13 +207,10 @@ bool gap_fill_compute_window(int active_tip_h, int best_header_h,
     out->best_h = best_header_h;
     out->hi = active_tip_h;
 
-    /* Block-index heights are int. A persisted cursor outside that domain
-     * cannot safely bound body work, so leave this pass empty rather than
-     * narrowing it into a false low frontier. */
-    if (floor_cursor > (uint64_t)INT_MAX)
-        return false;
-
-    if (floor_cursor > 0) {
+    /* Block-index heights are int. An out-of-range high cursor cannot lower
+     * this bounded window, so keep the independently bounded header range
+     * instead of narrowing it through an implementation-defined cast. */
+    if (floor_cursor > 0 && floor_cursor <= (uint64_t)INT_MAX) {
         int floor_tip_h = (int)(floor_cursor - 1);
         if (floor_tip_h < out->effective_tip_h)
             out->effective_tip_h = floor_tip_h;
