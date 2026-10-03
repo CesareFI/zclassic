@@ -137,9 +137,11 @@ static bool detect_tip_wedged_resnapshot(void)
         return false;
 
     int local = active_chain_height(&ms->chain_active);
+    if (local < 0)
+        return false;
     int best = best_header_height(ms);
-    int gap = best - local;
-    if (local < 0 || best <= local ||
+    int64_t gap = (int64_t)best - (int64_t)local;
+    if (best <= local ||
         gap > TIP_WEDGED_RESNAPSHOT_NEAR_TIP_BLOCKS)
         return false;
     if (snapshot_recovery_already_active())
