@@ -77,6 +77,31 @@ static int test_bc_insert_left_adjacency(void)
     return failures;
 }
 
+static int test_bc_insert_int64_max_boundary(void)
+{
+    int failures = 0;
+    TEST("insert: INT64_MAX has no successor and totals saturate") {
+        struct body_coverage_map m;
+        body_coverage_init(&m);
+
+        ASSERT(body_coverage_insert(&m, 0, INT64_MAX - 1));
+        /* The last representable height touches the existing range. */
+        ASSERT(body_coverage_insert(&m, INT64_MAX, INT64_MAX));
+        ASSERT(body_coverage_range_count(&m) == 1);
+        ASSERT(body_coverage_contains(&m, INT64_MAX));
+        ASSERT(body_coverage_total_covered(&m) == INT64_MAX);
+        ASSERT(body_coverage_covered_in_window(&m, INT64_MAX - 1,
+                                               INT64_MAX) == 2);
+
+        struct bc_range hole;
+        ASSERT(!body_coverage_find_first_hole(&m, INT64_MAX - 1,
+                                              INT64_MAX, &hole));
+        body_coverage_free(&m);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_bc_remove_split_and_edges(void)
 {
     int failures = 0;
@@ -411,6 +436,7 @@ int test_body_coverage(void)
     int failures = 0;
     failures += test_bc_insert_disjoint_and_merge();
     failures += test_bc_insert_left_adjacency();
+    failures += test_bc_insert_int64_max_boundary();
     failures += test_bc_remove_split_and_edges();
     failures += test_bc_note_stored_pruned();
     failures += test_bc_find_first_hole();
