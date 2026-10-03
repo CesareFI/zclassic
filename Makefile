@@ -364,7 +364,8 @@ ZCL_WINDOWS_LAUNCHER_GOALS := windows-headless-run windows-headless-run-selftest
 	build/bin/z23-headless-run.exe
 # Build queries and game-only goals need no node vendor configure.
 ZCL_BUILD_QUERY_GOALS := print-node-c23-srcs help doctor doctor-build timings agent-dev-status print-CFLAGS print-DEV-CFLAGS print-LDFLAGS print-DEV-LDFLAGS print-build-flags
-ZCL_BOOTSTRAP_HELPER_ONLY := $(if $(strip $(MAKECMDGOALS)),$(if $(strip $(filter-out $(ZCL_WINDOWS_LAUNCHER_GOALS) $(ZCL_TOR_PROVENANCE_GOALS) $(ZCL_BUILD_QUERY_GOALS) check-capability-inventory-generated docs-proof-tools game game-check game-platform-probe,$(MAKECMDGOALS))),,1),)
+ZCL_HOOK_ONLY_GOALS := git-hook git-hook-selftest git-hook-bootstrap-selftest install-hooks hooks-status check-git-hooks-installed
+ZCL_BOOTSTRAP_HELPER_ONLY := $(if $(strip $(MAKECMDGOALS)),$(if $(strip $(filter-out $(ZCL_WINDOWS_LAUNCHER_GOALS) $(ZCL_TOR_PROVENANCE_GOALS) $(ZCL_BUILD_QUERY_GOALS) $(ZCL_HOOK_ONLY_GOALS) check-capability-inventory-generated docs-proof-tools game game-check game-platform-probe,$(MAKECMDGOALS))),,1),)
 ifneq ($(ZCL_STANDALONE_CLEAN),1)
 ifneq ($(ZCL_WORKTREE_PRIME_ONLY),1)
 ifneq ($(ZCL_PORTABLE_FRONTDOOR_ONLY),1)
@@ -1467,7 +1468,7 @@ ZCL_TOR_SKIP_GOALS := clean distclean clean-% help tor-full tor-ready c3-mutex-p
 	vendor vendor-force vendor-ready vendor-provenance worktree-prime \
 	worktree-prime-selftest install-hooks setup \
 	check-% lint lint-% %-selftest docs docs-% $(ZCL_WINDOWS_LAUNCHER_GOALS) game game-check game-platform-probe \
-	$(ZCL_TOR_PROVENANCE_GOALS) $(ZCL_BUILD_QUERY_GOALS)
+	$(ZCL_TOR_PROVENANCE_GOALS) $(ZCL_BUILD_QUERY_GOALS) $(ZCL_HOOK_ONLY_GOALS)
 ZCL_TOR_LINK_REQUESTED := $(if $(strip $(MAKECMDGOALS)),\
 	$(strip $(filter-out $(ZCL_TOR_SKIP_GOALS),$(MAKECMDGOALS))),default-goal)
 
@@ -11865,7 +11866,7 @@ GIT_HOOK_CFLAGS = -std=$(ZCL_C_STD) -O2 -Wall -Wextra -Werror -pedantic \
 	-Iplatform/modules/util/include -Icore/modules/crypto/include \
 	$(GIT_HOOK_WINDOWS_INCLUDES)
 
-.PHONY: git-hook git-hook-selftest install-hooks
+.PHONY: git-hook git-hook-selftest git-hook-bootstrap-selftest install-hooks
 git-hook: $(GIT_HOOK_BIN)
 
 # The ELF collector drops ed25519's unused batch-verification path. PE/COFF
@@ -11878,6 +11879,17 @@ $(GIT_HOOK_BIN): $(GIT_HOOK_SRCS) $(GIT_HOOK_HDRS) Makefile
 
 git-hook-selftest: $(GIT_HOOK_BIN)
 	@$(GIT_HOOK_BIN) --selftest
+
+git-hook-bootstrap-selftest:
+	@set -eu; \
+	log="$$(mktemp)"; \
+	trap 'rm -f "$$log"' EXIT HUP INT TERM; \
+	$(MAKE) --no-print-directory -n git-hook >"$$log" 2>&1; \
+	if grep -Eq 'build_vendor|vendor-ready|tor-ready|build_libs' "$$log"; then \
+	  cat "$$log"; \
+	  echo "git-hook-bootstrap-selftest: hook-only target started dependency bootstrap" >&2; \
+	  exit 1; \
+	fi
 
 install-hooks: $(GIT_HOOK_BIN)
 	@ZCL_GIT_HOOK_HOST=$(GIT_HOOK_HOST) \
