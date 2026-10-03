@@ -339,9 +339,10 @@ static bool probe_wait(platform_socket_t sock, bool writable,
                        int64_t deadline_ms)
 {
     for (;;) {
-        int64_t left = deadline_ms - probe_now_ms();
-        if (left <= 0 || configured_sync_peers_probe_should_stop())
+        int64_t now_ms = probe_now_ms();
+        if (now_ms >= deadline_ms || configured_sync_peers_probe_should_stop())
             return false;  // raw-return-ok:deadline-or-stop-ends-the-probe
+        int64_t left = deadline_ms - now_ms;
         int slice = left < PROBE_WAIT_SLICE_MS ? (int)left : PROBE_WAIT_SLICE_MS;
         int ready = writable ? platform_socket_wait_writable(sock, slice)
                              : platform_socket_wait_readable(sock, slice);
