@@ -28,12 +28,13 @@
 
 struct fake_clock_peer_snapshot {
     _Atomic int64_t wall_ms;
+    _Atomic int64_t mono_ms;
 };
 
 static int64_t fake_now_mono(void *self)
 {
-    (void)self;
-    return 1;
+    struct fake_clock_peer_snapshot *c = self;
+    return atomic_load(&c->mono_ms) * 1000000;
 }
 
 static int64_t fake_now_wall(void *self)
@@ -47,6 +48,7 @@ static void fake_clock_install(struct fake_clock_peer_snapshot *c,
                                int64_t unix_s)
 {
     atomic_store(&c->wall_ms, unix_s * 1000);
+    atomic_store(&c->mono_ms, unix_s * 1000);
     static clock_iface_t iface;
     iface.now_monotonic_ns = fake_now_mono;
     iface.now_wall_ms = fake_now_wall;
@@ -57,6 +59,14 @@ static void fake_clock_install(struct fake_clock_peer_snapshot *c,
 static void fake_clock_set(struct fake_clock_peer_snapshot *c, int64_t unix_s)
 {
     atomic_store(&c->wall_ms, unix_s * 1000);
+    atomic_store(&c->mono_ms, unix_s * 1000);
+}
+
+static void fake_clock_set_split(struct fake_clock_peer_snapshot *c,
+                                 int64_t wall_s, int64_t mono_s)
+{
+    atomic_store(&c->wall_ms, wall_s * 1000);
+    atomic_store(&c->mono_ms, mono_s * 1000);
 }
 
 static void reset_peer_snapshot_conditions(struct connman *cm,
@@ -134,6 +144,30 @@ static int run_peer_floor_connect_only_case(void)
                         ok);
     cleanup_peer_snapshot_conditions();
     return failures;
+}
+
+static bool sync_violation_ignores_wall_rollback(void)
+{
+    struct fake_clock_peer_snapshot clock;
+    fake_clock_install(&clock, 1000);
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    reset_peer_snapshot_conditions(&cm, &dm, &ms);
+    register_sync_violation_lag();
+    struct block_index tip = { .nHeight = 100 };
+    bool ok = active_chain_move_window_tip(&ms.chain_active, &tip);
+    struct p2p_node peer = { .id = 1, .starting_height = 250,
+                             .state = PEER_ACTIVE, .services = NODE_NETWORK };
+    struct p2p_node *peers[1] = { &peer };
+    cm.manager.nodes = peers;
+    cm.manager.num_nodes = 1;
+    condition_engine_tick();
+    fake_clock_set_split(&clock, 700, 1601);
+    condition_engine_tick();
+    ok = ok && sync_violation_lag_test_remedy_calls() == 1;
+    cleanup_peer_snapshot_conditions();
+    return ok;
 }
 
 int test_peer_snapshot_conditions(void)
@@ -304,6 +338,9 @@ int test_peer_snapshot_conditions(void)
         PEER_SNAPSHOT_CHECK("sync violation rotates peers and clears", ok);
         cleanup_peer_snapshot_conditions();
     }
+
+    PEER_SNAPSHOT_CHECK("sync violation ignores wall-clock rollback",
+                        sync_violation_ignores_wall_rollback());
 
     {
         struct fake_clock_peer_snapshot clock;

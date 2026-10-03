@@ -20,8 +20,8 @@
 #define SYNC_VIOLATION_SECS 600
 #define SYNC_VIOLATION_COOLDOWN_SECS 3600
 
-static _Atomic int64_t g_first_seen_unix;
-static _Atomic int64_t g_last_attempt_unix;
+static _Atomic int64_t g_first_seen_mono_s;
+static _Atomic int64_t g_last_attempt_mono_s;
 static _Atomic int g_last_local_seen;
 static _Atomic int g_local_tip_at_detect;
 static _Atomic int g_peer_max_at_detect;
@@ -42,7 +42,7 @@ static bool detect_sync_violation_lag(void)
     struct connman *cm = sync_monitor_connman();
     struct main_state *ms = sync_monitor_main_state();
     if (!cm || !ms) {
-        atomic_store(&g_first_seen_unix, 0);
+        atomic_store(&g_first_seen_mono_s, 0);
         return false;
     }
 
@@ -50,22 +50,22 @@ static bool detect_sync_violation_lag(void)
     int peer_max = connman_max_peer_height(cm);
     int64_t gap = sync_violation_height_gap(peer_max, local);
     if (peer_max <= 0 || local < 0 || gap <= SYNC_VIOLATION_GAP) {
-        atomic_store(&g_first_seen_unix, 0);
+        atomic_store(&g_first_seen_mono_s, 0);
         atomic_store(&g_last_local_seen, local);
         return false;
     }
 
-    int64_t now = platform_time_wall_unix();
+    int64_t now = platform_time_monotonic_us() / 1000000;
     int last_local = atomic_load(&g_last_local_seen);
     if (last_local != local) {
         atomic_store(&g_last_local_seen, local);
-        atomic_store(&g_first_seen_unix, now);
+        atomic_store(&g_first_seen_mono_s, now);
         return false;
     }
 
-    int64_t first = atomic_load(&g_first_seen_unix);
+    int64_t first = atomic_load(&g_first_seen_mono_s);
     if (first == 0) {
-        atomic_store(&g_first_seen_unix, now);
+        atomic_store(&g_first_seen_mono_s, now);
         return false;
     }
     int64_t age = now - first;
@@ -82,8 +82,8 @@ static bool detect_sync_violation_lag(void)
 
 static enum condition_remedy_result remedy_sync_violation_lag(void)
 {
-    int64_t now = platform_time_wall_unix();
-    int64_t last = atomic_load(&g_last_attempt_unix);
+    int64_t now = platform_time_monotonic_us() / 1000000;
+    int64_t last = atomic_load(&g_last_attempt_mono_s);
     if (last != 0 && now - last < SYNC_VIOLATION_COOLDOWN_SECS)
         return COND_REMEDY_SKIP;
 
@@ -106,7 +106,7 @@ static enum condition_remedy_result remedy_sync_violation_lag(void)
                                  "condition:sync_violation_lag");
     sync_set_state(SYNC_IDLE, "condition sync_violation_lag");
     sync_monitor_kick_local_sync("condition:sync_violation_lag");
-    atomic_store(&g_last_attempt_unix, now);
+    atomic_store(&g_last_attempt_mono_s, now);
 #ifdef ZCL_TESTING
     atomic_fetch_add(&g_test_remedy_calls, 1);
 #endif
@@ -159,8 +159,8 @@ void register_sync_violation_lag(void)
 #ifdef ZCL_TESTING
 void sync_violation_lag_test_reset(void)
 {
-    atomic_store(&g_first_seen_unix, 0);
-    atomic_store(&g_last_attempt_unix, 0);
+    atomic_store(&g_first_seen_mono_s, 0);
+    atomic_store(&g_last_attempt_mono_s, 0);
     atomic_store(&g_last_local_seen, -1);
     atomic_store(&g_local_tip_at_detect, -1);
     atomic_store(&g_peer_max_at_detect, -1);
