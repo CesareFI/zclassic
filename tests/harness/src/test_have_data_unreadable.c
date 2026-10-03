@@ -51,6 +51,7 @@
 #include "validation/main_state.h"
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -150,6 +151,40 @@ static struct block_index *hdu_insert_torn_variant(struct main_state *ms,
 static int64_t g_hdu_stub_height = -1;
 static int64_t hdu_stub_select_idle_height(void) { return g_hdu_stub_height; }
 static bool hdu_stub_select_idle_is_read_failure(void) { return true; }
+
+static bool hdu_out_of_range_select_idle_cannot_target_block(void)
+{
+    struct main_state ms;
+    struct uint256 local_hashes[10];
+    main_state_init(&ms);
+    hdu_build_chain(&ms, 10, local_hashes);
+    condition_engine_set_main_state(&ms);
+    register_have_data_unreadable();
+
+    struct block_index *mid = block_map_find(&ms.map_block_index,
+                                              &local_hashes[5]);
+    if (!mid) {
+        main_state_free(&ms);
+        return false;
+    }
+    mid->nFile = -1;
+    mid->nDataPos = 0;
+    sync_monitor_test_set_tip_advance_ts(platform_time_wall_unix() - 120);
+    g_hdu_stub_height = (int64_t)INT_MAX + 2147483654LL;
+    have_data_unreadable_test_set_select_idle_stubs(
+        hdu_stub_select_idle_height, hdu_stub_select_idle_is_read_failure);
+
+    condition_engine_tick();
+    bool ok = have_data_unreadable_test_remedy_calls() == 0 &&
+              (mid->nStatus & BLOCK_HAVE_DATA) != 0;
+    g_hdu_stub_height = -1;
+    condition_engine_set_main_state(NULL);
+    condition_engine_reset_for_testing();
+    have_data_unreadable_test_reset();
+    sync_monitor_test_set_tip_advance_ts(0);
+    main_state_free(&ms);
+    return ok;
+}
 
 /* Insert a block_index entry at an explicit real hash; the "witness clears on
  * readability" test needs a block a real pread can hash-verify. */
@@ -264,6 +299,16 @@ int test_have_data_unreadable(void)
         condition_engine_reset_for_testing();
         have_data_unreadable_test_reset();
         main_state_free(&ms);
+    }
+
+    /* A persisted reducer note is int64_t, while block-index heights are
+     * int.  An out-of-range note must not narrow into a different valid
+     * height and clear that block's HAVE_DATA flag. */
+    {
+        condition_engine_reset_for_testing();
+        have_data_unreadable_test_reset();
+        HDU_CHECK("out-of-range select-idle height cannot narrow to a block",
+                  hdu_out_of_range_select_idle_cannot_target_block());
     }
 
     /* ── 1b. Unknown tip age is not fresh: a snapshot boot may not have seen a

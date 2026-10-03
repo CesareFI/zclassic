@@ -15,6 +15,7 @@
 #include "validation/main_state.h"
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdio.h>
 
 static _Atomic int g_target_at_detect = -1;
@@ -37,6 +38,11 @@ static hdu_select_idle_height_fn g_select_idle_height_fn =
     utxo_apply_stage_select_idle_height;
 static hdu_select_idle_is_read_failure_fn g_select_idle_is_read_failure_fn =
     utxo_apply_stage_select_idle_is_read_failure;
+
+static bool select_idle_height_fits_block_index(int64_t height)
+{
+    return height >= 0 && height <= INT_MAX;
+}
 
 static struct block_index *target_index(struct main_state *ms, int target)
 {
@@ -115,7 +121,8 @@ static bool detect_have_data_unreadable(void)
      * value, not necessarily still pending). */
     if (!tip_recent && g_select_idle_is_read_failure_fn()) {
         int64_t ua_h = g_select_idle_height_fn();
-        if (ua_h >= 0 && (p == NULL || ua_h < target)) {
+        if (select_idle_height_fits_block_index(ua_h) &&
+            (p == NULL || ua_h < target)) {
             struct block_index *ua_p = unreadable_at(ms, (int)ua_h, datadir);
             if (ua_p) {
                 target = (int)ua_h;
