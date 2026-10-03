@@ -2289,11 +2289,45 @@ static int test_sync_service_builds_alt_recovery_plan(void)
     int failures = 0;
 
     TEST("sync_service finds same-chain alternate blocks for stall recovery") {
+        struct main_state max_state = {0};
+        struct p2p_node max_node = {0};
+        struct sync_stall_recovery max_recovery = {0};
+        struct main_state empty_state;
+        struct p2p_node empty_node = {0};
+        struct sync_stall_recovery empty_recovery = {0};
+        struct block_index malformed_high;
+        struct uint256 malformed_hash = {0};
         struct main_state ms;
         struct p2p_node node;
         struct sync_stall_recovery recovery;
         struct uint256 hg = {0}, h1 = {0}, h2 = {0}, h3 = {0}, h4 = {0};
         struct block_index g, b1, alt2, alt3, fork2;
+
+        atomic_store(&max_state.chain_active.height, INT_MAX);
+        max_node.state = PEER_SYNCING_BLOCKS;
+        max_node.starting_height = INT_MAX;
+        ASSERT(!syncsvc_build_stall_recovery(&max_recovery, &max_state,
+                                             &max_node, 0, 0, 1000));
+
+        /* A corrupted header index can carry INT_MAX while the active chain
+         * is still empty (height -1). The production map scan must classify
+         * that entry as far outside its 10-height probe window, rather than
+         * overflowing the signed height delta before the bound check. */
+        main_state_init(&empty_state);
+        block_index_init(&malformed_high);
+        malformed_high.phashBlock = &malformed_hash;
+        malformed_high.nHeight = INT_MAX;
+        malformed_hash.data[0] = 0xa5;
+        block_map_insert(&empty_state.map_block_index, &malformed_hash,
+                         &malformed_high);
+        empty_node.state = PEER_SYNCING_BLOCKS;
+        empty_node.starting_height = INT_MAX;
+        ASSERT(syncsvc_build_stall_recovery(&empty_recovery, &empty_state,
+                                             &empty_node, 0, 0, INT64_MAX));
+        ASSERT(empty_recovery.should_recover);
+        ASSERT(empty_recovery.next_height == 0);
+        syncsvc_free_stall_recovery(&empty_recovery);
+        main_state_free(&empty_state);
 
         memset(&node, 0, sizeof(node));
         memset(&g, 0, sizeof(g));

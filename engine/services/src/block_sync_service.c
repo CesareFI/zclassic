@@ -518,7 +518,7 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
         struct block_index *px;
         while (block_map_next(&ms->map_block_index, &pi, NULL, &px)) {
             if (!px) continue;
-            int dh = px->nHeight - our_h;
+            int64_t dh = (int64_t)px->nHeight - (int64_t)our_h;
             if (dh < 1) continue;
             if (dh > 512) continue;
             unsigned int status = block_index_status_load(px);
