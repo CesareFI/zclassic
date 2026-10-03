@@ -438,7 +438,7 @@ struct zcl_result bsp_restore_projection_deferral(struct node_db *ndb)
 
     bsp_lock_init_once();
     zcl_mutex_lock(&g_bsp.lock);
-    g_bsp.projection_deferred_total = total;
+    g_bsp.projection_deferred_total = total > 0 ? total : 0;
     g_bsp.last_projection_deferred_height = (int)height;
     g_bsp.last_projection_deferred_time = when;
     bsp_copy_text(g_bsp.last_projection_deferred_reason,

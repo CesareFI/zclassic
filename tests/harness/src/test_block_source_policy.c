@@ -763,6 +763,29 @@ static int test_bsp_projection_deferral_accounting(void)
     return failures;
 }
 
+static int test_bsp_projection_deferral_total_saturates(void)
+{
+    int failures = 0;
+    TEST_CASE("block_source_policy: restored deferral total saturates")
+    {
+        struct node_db ndb;
+        struct bsp_decision status;
+
+        ASSERT(node_db_open(&ndb, ":memory:"));
+        ASSERT(node_db_state_set_int(
+            &ndb, "chain_advance_coordinator.projection_deferred_total",
+            INT64_MAX));
+        block_source_policy_reset_for_test();
+        block_source_policy_init(NULL, NULL, &ndb);
+        block_source_policy_note_projection_deferred(42, "saturation");
+        block_source_policy_get_status(&status);
+        ASSERT(status.projection_deferred_total == INT64_MAX);
+        block_source_policy_reset_for_test();
+        node_db_close(&ndb);
+    } TEST_END
+    return failures;
+}
+
 static struct p2p_node *test_bsp_add_peer(struct connman *cm,
                                           unsigned char a,
                                           unsigned char b,
@@ -2040,6 +2063,7 @@ int test_block_source_policy(void)
     failures += test_bsp_dump_json_contract();
     failures += test_bsp_dump_reports_projection_lag();
     failures += test_bsp_projection_deferral_accounting();
+    failures += test_bsp_projection_deferral_total_saturates();
     failures += test_bsp_dump_populates_p2p_diversity();
     failures += test_bsp_selects_viable_caught_up_p2p();
     failures += test_bsp_selects_single_caught_up_p2p();

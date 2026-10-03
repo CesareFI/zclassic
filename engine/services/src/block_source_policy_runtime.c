@@ -31,6 +31,7 @@
 #include "util/sync.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <string.h>
 #include <time.h>
 
@@ -57,6 +58,18 @@
  * --------------------------------------------------------------------------- */
 
 struct bsp_state g_bsp;
+
+/* This total is diagnostic-only, but it is persisted and can be restored at
+ * the full int64_t range. Saturate rather than letting the next normal
+ * deferral turn a retained diagnostic value into signed overflow. */
+static int64_t bsp_next_projection_deferred_total(int64_t total)
+{
+    if (total < 0)
+        return 1;
+    if (total == INT64_MAX)
+        return INT64_MAX;
+    return total + 1;
+}
 
 void bsp_copy_text(char *dst, size_t dst_len, const char *src)
 {
@@ -427,7 +440,8 @@ void block_source_policy_note_projection_deferred(int height,
 
     bsp_lock_init_once();
     zcl_mutex_lock(&g_bsp.lock);
-    g_bsp.projection_deferred_total++;
+    g_bsp.projection_deferred_total =
+        bsp_next_projection_deferred_total(g_bsp.projection_deferred_total);
     total = g_bsp.projection_deferred_total;
     g_bsp.last_projection_deferred_height = height;
     g_bsp.last_projection_deferred_time = when;
