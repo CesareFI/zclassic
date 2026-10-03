@@ -167,17 +167,19 @@ bool chain_restore_block_is_consensus_backed_on_disk(
         tip, datadir, NULL, -1);
 }
 
+static bool chain_restore_needs_backed_ancestor(
+    const struct block_index *walk, void *unused)
+{
+    (void)unused;
+    return !chain_restore_block_is_consensus_backed(walk);
+}
+
 struct block_index *chain_restore_nearest_consensus_backed_ancestor(
     struct block_index *tip)
 {
-    if (!pprev_walk_safe(tip, NULL, NULL, CHAIN_RESTORE_ANCESTRY_WALK_CAP,
-                         "chain_restore.nearest_consensus_backed"))
-        return NULL;
-    for (struct block_index *walk = tip; walk; walk = walk->pprev) {
-        if (chain_restore_block_is_consensus_backed(walk))
-            return walk;
-    }
-    return NULL;
+    return pprev_walk_safe(tip, chain_restore_needs_backed_ancestor, NULL,
+                           CHAIN_RESTORE_ANCESTRY_WALK_CAP,
+                           "chain_restore.nearest_consensus_backed");
 }
 
 struct block_index *chain_restore_nearest_consensus_backed_ancestor_on_disk_seeded(

@@ -2103,6 +2103,18 @@ static int test_nearest_backed_ancestor_rejects_pprev_cycle(void)
         left.pprev = &right;
         right.pprev = &left;
         ASSERT(chain_restore_nearest_consensus_backed_ancestor(&left) == NULL);
+
+        struct uint256 hash = {0};
+        struct block_index backed;
+        memset(&backed, 0, sizeof(backed));
+        hash.data[0] = 1;
+        backed.phashBlock = &hash;
+        backed.hashMerkleRoot.data[0] = 1;
+        backed.nStatus = BLOCK_VALID_TREE | BLOCK_HAVE_DATA;
+        backed.nTx = 1;
+        backed.nChainTx = 1;
+        ASSERT(chain_restore_nearest_consensus_backed_ancestor(&backed) ==
+               &backed);
         PASS();
     } _test_next:;
 
