@@ -13,6 +13,7 @@
 #include "validation/main_state.h"
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdio.h>
 
 static _Atomic int g_tip_at_detect = -1;
@@ -83,9 +84,11 @@ static bool detect_local_header_refill_needed(void)
     struct block_index *tip = active_chain_tip(&ms->chain_active);
     if (tip) {
         tip_h = tip->nHeight;
-        next_h = tip_h + 1;
-        missing = peer_max >= next_h &&
-            !sync_monitor_active_next_child_exists(ms, tip, next_h);
+        if (tip_h < INT_MAX) {
+            next_h = tip_h + 1;
+            missing = peer_max >= next_h &&
+                !sync_monitor_active_next_child_exists(ms, tip, next_h);
+        }
     }
     zcl_mutex_unlock(&ms->cs_main);
     if (!missing)
