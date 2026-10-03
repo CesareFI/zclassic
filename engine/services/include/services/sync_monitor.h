@@ -85,6 +85,9 @@ struct zcl_result sync_monitor_queue_best_header_body(
 int sync_monitor_local_header_refill(struct connman *cm,
                                      int next_h,
                                      const char *reason);
+/* Clear a completed local-header refill only when the witness names the
+ * same missing height. A later episode must not erase a newer recovery. */
+void sync_monitor_local_header_refill_resolved(int missing_height);
 bool sync_monitor_active_next_child_exists(struct main_state *ms,
                                            struct block_index *tip,
                                            int next_h);

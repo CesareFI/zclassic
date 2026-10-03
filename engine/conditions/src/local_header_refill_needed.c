@@ -177,8 +177,10 @@ static bool witness_local_header_refill_needed(int64_t target_at_detect)
 
     int peer_max = connman_max_peer_height(cm);
     atomic_store(&g_last_witness_peer_max, peer_max);
-    if (peer_max < missing_h)
+    if (peer_max < missing_h) {
+        sync_monitor_local_header_refill_resolved(missing_h);
         return true; /* peers retreated below the needed height */
+    }
 
     bool arrived = false;
     zcl_mutex_lock(&ms->cs_main);
@@ -189,6 +191,8 @@ static bool witness_local_header_refill_needed(int64_t target_at_detect)
         arrived = sync_monitor_active_next_child_exists(ms, tip, missing_h);
     zcl_mutex_unlock(&ms->cs_main);
     atomic_store(&g_last_witness_arrived, arrived ? 1 : 0);
+    if (arrived)
+        sync_monitor_local_header_refill_resolved(missing_h);
     return arrived; /* the missing header child actually showed up */
 }
 

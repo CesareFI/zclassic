@@ -203,6 +203,46 @@ static int test_local_header_refill_retry_counter_saturates(void)
     return ok ? 0 : 1;
 }
 
+static int test_local_header_refill_resolution_matches_episode(void)
+{
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    struct watchdog_local_recovery_stats lr;
+    bool ok = true;
+
+    reset_sync_watchdog(&cm, &dm, &ms);
+    sync_monitor_test_set_local_recovery(
+        true, false, 100, 1, "next-child-missing");
+    sync_monitor_local_header_refill_resolved(101);
+    sync_monitor_get_local_recovery_stats(&lr);
+    ok = ok && lr.active && lr.missing_height == 100 &&
+         lr.mirror_repair_gated;
+    sync_monitor_local_header_refill_resolved(100);
+    sync_monitor_get_local_recovery_stats(&lr);
+    ok = ok && !lr.active && !lr.mirror_repair_gated &&
+         lr.retry_count == 0;
+    printf("sync_watchdog_conditions: local header refill resolution "
+           "clears only its matching episode... %s\n", ok ? "OK" : "FAIL");
+    cleanup_sync_watchdog();
+    return ok ? 0 : 1;
+}
+
+static void local_header_refill_witness_releases(struct p2p_node *first,
+                                                 struct p2p_node *second,
+                                                 struct p2p_node *third,
+                                                 bool *ok)
+{
+    struct watchdog_local_recovery_stats lr;
+
+    first->starting_height = second->starting_height =
+        third->starting_height = 10;
+    condition_engine_tick();
+    sync_monitor_get_local_recovery_stats(&lr);
+    if (lr.active || lr.mirror_repair_gated || lr.retry_count != 0)
+        *ok = false;
+}
+
 /* Header-stall detection is a real recovery path, not helper arithmetic.
  * Once the same header has remained stalled for five minutes of uptime, an
  * NTP rollback must not defer its getheaders refill until civil time catches
@@ -948,8 +988,13 @@ int test_sync_watchdog_conditions(void)
             detail, "local_recovery_mode")), "next-child-missing") == 0;
         ok = ok && json_get(detail, "remedy_contract") != NULL;
         json_free(&dump);
+
+        /* Exercise the production witness, not merely the recovery-state
+         * helper: a successful same-episode witness must release the mirror
+         * gate and its retry budget. */
+        local_header_refill_witness_releases(&p1, &p2, &p3, &ok);
         SYNC_WATCHDOG_CHECK(
-            "local header refill rotates peers with detail json", ok);
+            "local header refill resolves through its production witness", ok);
         cleanup_sync_watchdog();
     }
 
@@ -1106,6 +1151,7 @@ int test_sync_watchdog_conditions(void)
 
     failures += test_local_header_refill_new_episode();
     failures += test_local_header_refill_retry_counter_saturates();
+    failures += test_local_header_refill_resolution_matches_episode();
     failures += test_header_stall_uses_monotonic_timeout();
 
     {

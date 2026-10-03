@@ -744,6 +744,15 @@ int sync_monitor_local_header_refill(struct connman *cm,
     return eligible;
 }
 
+void sync_monitor_local_header_refill_resolved(int missing_height)
+{
+    pthread_mutex_lock(&g_local_recovery_lock);
+    if (g_local_recovery.active &&
+        g_local_recovery.missing_height == missing_height)
+        memset(&g_local_recovery, 0, sizeof(g_local_recovery));
+    pthread_mutex_unlock(&g_local_recovery_lock);
+}
+
 void sync_monitor_get_local_recovery_stats(
     struct watchdog_local_recovery_stats *out)
 {
