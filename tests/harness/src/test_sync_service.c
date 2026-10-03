@@ -17,6 +17,7 @@
 #include "chain/checkpoints.h"
 #include "util/blocker.h"
 #include "util/safe_alloc.h"
+#include <limits.h>
 #include <string.h>
 #include <time.h>
 
@@ -577,6 +578,12 @@ static int test_sync_service_block_assignment_plan(void)
         syncsvc_plan_block_assignment(&plan, &node, 0, our_height);
         ASSERT(!plan.should_assign);
         node.starting_height = -1;   /* unknown height: stays eligible */
+        syncsvc_plan_block_assignment(&plan, &node, 0, our_height);
+        ASSERT(plan.should_assign);
+        /* start_height comes directly from the peer's signed wire field;
+         * an extreme claim remains ahead, never wrapping into "behind". */
+        node.starting_height = INT_MAX;
+        ASSERT(!syncsvc_peer_is_behind(&node, our_height));
         syncsvc_plan_block_assignment(&plan, &node, 0, our_height);
         ASSERT(plan.should_assign);
         PASS();
