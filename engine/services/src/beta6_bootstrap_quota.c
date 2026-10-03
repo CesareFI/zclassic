@@ -30,18 +30,20 @@ struct beta6_quota_bucket {
 };
 
 static zcl_mutex_t g_quota_lock;
-static bool g_quota_lock_ready;
+static zcl_once_t g_quota_lock_once = ZCL_ONCE_INIT;
 static struct beta6_quota_bucket g_buckets[BETA6_BS_QUOTA_MAX_TRACKED];
 static size_t g_bucket_count;
 static int64_t g_max_bytes_per_day = BETA6_BS_DEFAULT_MAX_BYTES_PER_DAY;
 static int64_t g_throttle_kbps = BETA6_BS_DEFAULT_THROTTLE_KBPS;
 
+static void quota_lock_init(void)
+{
+    zcl_mutex_init(&g_quota_lock);
+}
+
 static void quota_lock_init_once(void)
 {
-    if (!g_quota_lock_ready) {
-        zcl_mutex_init(&g_quota_lock);
-        g_quota_lock_ready = true;
-    }
+    (void)zcl_once_call(&g_quota_lock_once, quota_lock_init);
 }
 
 void beta6_bs_quota_configure(int64_t max_bytes_per_day, int64_t throttle_kbps)
