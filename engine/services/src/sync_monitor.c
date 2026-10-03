@@ -30,6 +30,9 @@
 #define LOCAL_HEADER_REFILL_MAX_RETRIES 3
 
 static _Atomic int64_t g_last_block_connected_ts;
+/* Keep the civil timestamp for operator diagnostics, but never use it to
+ * decide whether a stalled tip may be repaired: civil time can move back. */
+static _Atomic int64_t g_last_block_connected_mono_us;
 static _Atomic int g_last_block_connected_height;
 /* The reducer-owned provable tip is the runtime serving authority.  P2P body
  * intake can complete without moving that frontier, so its callback must not
@@ -117,6 +120,7 @@ void sync_monitor_init(void)
     memset(g_last_recovery_reason, 0, sizeof(g_last_recovery_reason));
     memset(g_last_recovery_trigger, 0, sizeof(g_last_recovery_trigger));
     atomic_store(&g_last_block_connected_ts, 0);
+    atomic_store(&g_last_block_connected_mono_us, 0);
     atomic_store(&g_last_block_connected_height, -1);
     atomic_store(&g_last_observed_provable_tip, -1);
 #ifdef ZCL_TESTING
@@ -162,6 +166,8 @@ void sync_monitor_set_context(struct connman *cm,
         if (height >= 0) {
             atomic_store(&g_last_block_connected_ts,
                          (int64_t)platform_time_wall_time_t());
+            atomic_store(&g_last_block_connected_mono_us,
+                         platform_time_monotonic_us());
             atomic_store(&g_last_block_connected_height, height);
         }
     }
@@ -191,6 +197,8 @@ void sync_monitor_on_block_connected(int height)
         return;
     atomic_store(&g_last_block_connected_ts,
                  (int64_t)platform_time_wall_time_t());
+    atomic_store(&g_last_block_connected_mono_us,
+                 platform_time_monotonic_us());
     atomic_store(&g_last_block_connected_height, height);
 }
 
@@ -220,6 +228,8 @@ static void sync_monitor_observe_provable_tip(void)
         atomic_store(&g_last_block_connected_height, current);
         atomic_store(&g_last_block_connected_ts,
                      (int64_t)platform_time_wall_time_t());
+        atomic_store(&g_last_block_connected_mono_us,
+                     platform_time_monotonic_us());
         atomic_store(&g_last_observed_provable_tip, current);
     }
     pthread_mutex_unlock(&g_tip_progress_lock);
@@ -228,11 +238,11 @@ static void sync_monitor_observe_provable_tip(void)
 int64_t sync_monitor_tip_advance_age(void)
 {
     sync_monitor_observe_provable_tip();
-    int64_t last = atomic_load(&g_last_block_connected_ts);
+    int64_t last = atomic_load(&g_last_block_connected_mono_us);
     if (last == 0)
         return -1; // raw-return-ok:sentinel
-    int64_t now = (int64_t)platform_time_wall_time_t();
-    return (now > last) ? (now - last) : 0;
+    int64_t now = platform_time_monotonic_us();
+    return (now > last) ? (now - last) / 1000000 : 0;
 }
 
 int sync_monitor_peer_height_cached(void)
@@ -914,6 +924,20 @@ void sync_monitor_test_set_tip_advance_ts(int64_t ts)
 {
     atomic_store(&g_tip_advance_test_override, true);
     atomic_store(&g_last_block_connected_ts, ts);
+    if (ts <= 0) {
+        atomic_store(&g_last_block_connected_mono_us, 0);
+        return;
+    }
+
+    int64_t now_wall = (int64_t)platform_time_wall_time_t();
+    int64_t elapsed_s = now_wall > ts ? now_wall - ts : 0;
+    int64_t now_mono = platform_time_monotonic_us();
+    if (elapsed_s > INT64_MAX / 1000000 ||
+        elapsed_s * 1000000 >= now_mono)
+        atomic_store(&g_last_block_connected_mono_us, 1);
+    else
+        atomic_store(&g_last_block_connected_mono_us,
+                     now_mono - elapsed_s * 1000000);
 }
 
 void sync_monitor_test_set_recoveries_total(int total)

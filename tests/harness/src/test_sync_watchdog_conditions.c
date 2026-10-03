@@ -348,6 +348,24 @@ int test_sync_watchdog_conditions(void)
     }
 
     {
+        /* Repair gates consume sync_monitor_tip_advance_age().  Its elapsed
+         * value must remain monotonic even while the displayed civil receipt
+         * timestamp moves backward. */
+        struct fake_clock clock;
+        fake_clock_install(&clock, 1000);
+        fake_clock_set_split(&clock, 1000, 1000);
+        reducer_frontier_provable_tip_reset();
+        sync_monitor_init();
+        sync_monitor_on_block_connected(42);
+        fake_clock_set_split(&clock, 700, 1061);
+        bool ok = sync_monitor_tip_advance_age() == 61;
+        SYNC_WATCHDOG_CHECK(
+            "tip repair age ignores wall-clock rollback", ok);
+        cleanup_sync_watchdog();
+        reducer_frontier_provable_tip_reset();
+    }
+
+    {
         struct fake_clock clock;
         fake_clock_install(&clock, 1000);
         struct connman cm;
