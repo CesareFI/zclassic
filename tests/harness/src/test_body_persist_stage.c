@@ -115,6 +115,22 @@ static int mkdir_p_bp(const char *p)
     return -1;
 }
 
+static int test_bp_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    BP_CHECK("cursor: representable durable height is retained",
+             body_persist_stage_test_cursor_height(INT32_MAX, &height) &&
+             height == INT32_MAX);
+    BP_CHECK("cursor: unrepresentable durable heights are refused before narrowing",
+             !body_persist_stage_test_cursor_height(
+                 (uint64_t)INT32_MAX + 1u, &height) &&
+             !body_persist_stage_test_cursor_height(UINT64_C(1) << 32,
+                                                    &height) &&
+             !body_persist_stage_test_cursor_height(UINT64_MAX, &height));
+    return failures;
+}
+
 static bool make_body(struct block *b, int h)
 {
     block_init(b);
@@ -496,6 +512,7 @@ int test_body_persist_stage(void)
 {
     printf("\n=== body_persist_stage tests ===\n");
     int failures = 0;
+    failures += test_bp_cursor_conversion_bounds();
 
     BP_CHECK("guard: status accessors are empty after shutdown",
              body_persist_stage_cursor() == 0 &&

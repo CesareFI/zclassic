@@ -57,6 +57,7 @@ void body_persist_stage_test_set_verified_total(uint64_t value);
 bool body_persist_stage_test_hold_expired(int64_t since_monotonic_us,
                                           int64_t now_monotonic_us,
                                           int hold_secs);
+bool body_persist_stage_test_cursor_height(uint64_t cursor, int *out);
 #endif
 
 bool body_persist_dump_state_json(struct json_value *out, const char *key);

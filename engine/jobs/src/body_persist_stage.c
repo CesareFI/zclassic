@@ -38,6 +38,7 @@
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -304,6 +305,39 @@ static job_result_t requeue_body_for_refetch(struct block_index *bi,
     return JOB_IDLE;
 }
 
+static bool body_persist_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool body_persist_stage_test_cursor_height(uint64_t cursor, int *out)
+{
+    return body_persist_cursor_height(cursor, out);
+}
+#endif
+
+static bool body_persist_step_cursor_heights(const struct stage_step_ctx *c,
+                                             uint64_t fetched_cursor,
+                                             int *out_next, int *out_fetched)
+{
+    if (!c || !body_persist_cursor_height(c->cursor_in, out_next)) {
+        LOG_WARN(STAGE_NAME, "[body_persist] cursor out of range: %llu",
+                 (unsigned long long)(c ? c->cursor_in : 0));
+        return false;
+    }
+    if (!body_persist_cursor_height(fetched_cursor, out_fetched)) {
+        LOG_WARN(STAGE_NAME,
+                 "[body_persist] body_fetch cursor out of range: %llu",
+                 (unsigned long long)fetched_cursor);
+        return false;
+    }
+    return true;
+}
+
 static job_result_t step_persist(struct stage_step_ctx *c)
 {
     int64_t total_started = platform_time_monotonic_us();
@@ -314,14 +348,16 @@ static job_result_t step_persist(struct stage_step_ctx *c)
     sqlite3 *db = progress_store_db();
     if (!db) return JOB_IDLE;
 
-    int next_h = (int)c->cursor_in;
-    if (next_h < 0) return JOB_FATAL;
-
     uint64_t bf_cursor = 0;
     if (!stage_cursor_read_or_zero(db, "body_fetch", STAGE_NAME,
                                    &bf_cursor))
         return JOB_FATAL;
-    if ((uint64_t)next_h >= bf_cursor) {
+    int next_h = 0;
+    int fetched_cursor = 0;
+    if (!body_persist_step_cursor_heights(c, bf_cursor, &next_h,
+                                          &fetched_cursor))
+        return JOB_FATAL;
+    if (next_h >= fetched_cursor) {
         atomic_store(&g_last_blocked_unix, platform_time_wall_unix());
         return JOB_IDLE;
     }
