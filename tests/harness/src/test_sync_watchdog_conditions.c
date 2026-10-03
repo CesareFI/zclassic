@@ -133,6 +133,33 @@ static const struct json_value *sync_watchdog_condition_json(
     return NULL;
 }
 
+static int test_local_header_refill_new_episode(void)
+{
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    struct watchdog_local_recovery_stats lr;
+    bool ok = true;
+
+    reset_sync_watchdog(&cm, &dm, &ms);
+    sync_monitor_test_set_local_recovery(
+        true, true, 100, 3, "next-child-missing");
+    if (sync_monitor_local_header_refill(
+            &cm, 101, "test new local header gap") != 0)
+        ok = false;
+    sync_monitor_get_local_recovery_stats(&lr);
+    if (!lr.active || lr.missing_height != 101)
+        ok = false;
+    if (lr.retry_count != 1 || lr.retries_exhausted)
+        ok = false;
+    if (!lr.mirror_repair_gated)
+        ok = false;
+    printf("sync_watchdog_conditions: local header refill resets retries "
+           "for a new missing height... %s\n", ok ? "OK" : "FAIL");
+    cleanup_sync_watchdog();
+    return ok ? 0 : 1;
+}
+
 int test_sync_watchdog_conditions(void)
 {
     printf("\n=== sync watchdog condition tests ===\n");
@@ -970,6 +997,8 @@ int test_sync_watchdog_conditions(void)
             "local header refill clears after active tip advances", ok);
         cleanup_sync_watchdog();
     }
+
+    failures += test_local_header_refill_new_episode();
 
     {
         struct watchdog_stats stats;

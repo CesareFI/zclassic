@@ -87,6 +87,13 @@ static struct {
  * releasing cs_nodes, so the two never nest. */
 static pthread_mutex_t g_local_recovery_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void sync_monitor_begin_local_header_recovery_locked(int next_h)
+{
+    if (g_local_recovery.active &&
+        g_local_recovery.missing_height != next_h)
+        memset(&g_local_recovery, 0, sizeof(g_local_recovery));
+}
+
 static void sync_monitor_increment_recoveries(void)
 {
     int current = atomic_load_explicit(&g_recoveries_total, memory_order_relaxed);
@@ -664,6 +671,7 @@ int sync_monitor_local_header_refill(struct connman *cm,
      * never touches g_local_recovery while cs_nodes is held (lock-order: the
      * recovery lock must not nest under cs_nodes). */
     pthread_mutex_lock(&g_local_recovery_lock);
+    sync_monitor_begin_local_header_recovery_locked(next_h);
     int prev_retry_count = g_local_recovery.retry_count;
     pthread_mutex_unlock(&g_local_recovery_lock);
 
