@@ -931,7 +931,25 @@ static int test_body_fetch_stage_platform_arm(void)
 }
 #endif
 
+static int test_body_fetch_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    printf("body_fetch: cursor conversion bounds... ");
+    bool ok = body_fetch_stage_test_cursor_height(INT32_MAX, &height) &&
+              height == INT32_MAX &&
+              !body_fetch_stage_test_cursor_height(
+                  (uint64_t)INT32_MAX + 1u, &height) &&
+              !body_fetch_stage_test_cursor_height(UINT64_C(1) << 32,
+                                                   &height) &&
+              !body_fetch_stage_test_cursor_height(UINT64_MAX, &height);
+    if (ok) printf("OK\n");
+    else { printf("FAIL\n"); failures++; }
+    return failures;
+}
+
 int test_body_fetch_stage(void)
 {
-    return test_body_fetch_stage_platform_arm();
+    return test_body_fetch_stage_platform_arm() +
+           test_body_fetch_cursor_conversion_bounds();
 }

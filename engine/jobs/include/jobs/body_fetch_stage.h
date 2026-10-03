@@ -133,6 +133,8 @@ uint64_t body_fetch_stage_skipped_total(void);    /* source='skipped_invalid' */
 #ifdef ZCL_TESTING
 /* Test-only seam for JSON diagnostics at the uint64_t boundary. */
 void body_fetch_stage_test_set_observed_total(uint64_t value);
+/* Test seam for durable cursor conversion before block-index height use. */
+bool body_fetch_stage_test_cursor_height(uint64_t cursor, int *out);
 #endif
 
 /* `z23 dumpstate body_fetch` (dump-state convention). */
