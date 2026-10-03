@@ -29,12 +29,13 @@
 
 struct fake_clock {
     _Atomic int64_t wall_ms;
+    _Atomic int64_t monotonic_ms;
 };
 
 static int64_t fake_now_mono(void *self)
 {
-    (void)self;
-    return 1;
+    struct fake_clock *c = (struct fake_clock *)self;
+    return atomic_load(&c->monotonic_ms) * 1000000;
 }
 
 static int64_t fake_now_wall(void *self)
@@ -46,6 +47,7 @@ static int64_t fake_now_wall(void *self)
 static void fake_clock_install(struct fake_clock *c, int64_t unix_s)
 {
     atomic_store(&c->wall_ms, unix_s * 1000);
+    atomic_store(&c->monotonic_ms, 1);
     static clock_iface_t iface;
     iface.now_monotonic_ns = fake_now_mono;
     iface.now_wall_ms = fake_now_wall;
@@ -56,6 +58,13 @@ static void fake_clock_install(struct fake_clock *c, int64_t unix_s)
 static void fake_clock_set(struct fake_clock *c, int64_t unix_s)
 {
     atomic_store(&c->wall_ms, unix_s * 1000);
+}
+
+static void fake_clock_set_split(struct fake_clock *c, int64_t wall_s,
+                                 int64_t monotonic_s)
+{
+    atomic_store(&c->wall_ms, wall_s * 1000);
+    atomic_store(&c->monotonic_ms, monotonic_s * 1000);
 }
 
 static void reset_sync_watchdog(struct connman *cm,
@@ -156,6 +165,51 @@ static int test_local_header_refill_new_episode(void)
         ok = false;
     printf("sync_watchdog_conditions: local header refill resets retries "
            "for a new missing height... %s\n", ok ? "OK" : "FAIL");
+    cleanup_sync_watchdog();
+    return ok ? 0 : 1;
+}
+
+/* Header-stall detection is a real recovery path, not helper arithmetic.
+ * Once the same header has remained stalled for five minutes of uptime, an
+ * NTP rollback must not defer its getheaders refill until civil time catches
+ * up. */
+static int test_header_stall_uses_monotonic_timeout(void)
+{
+    struct fake_clock clock;
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    struct block_index header = {0};
+    struct p2p_node peer = {0};
+    struct p2p_node *peers[1] = { &peer };
+
+    fake_clock_install(&clock, 1000);
+    reset_sync_watchdog(&cm, &dm, &ms);
+    register_header_stall_at_height();
+    header.nHeight = 2000;
+    ms.pindex_best_header = &header;
+    peer.id = 1;
+    peer.starting_height = 2600;
+    peer.state = PEER_ACTIVE;
+    peer.services = NODE_NETWORK;
+    peer.last_getheaders_time = 999;
+    peer.getheaders_stale_count = 3;
+    cm.manager.nodes = peers;
+    cm.manager.num_nodes = 1;
+    sync_set_state(SYNC_HEADERS_DOWNLOAD, "test monotonic header stall");
+
+    fake_clock_set_split(&clock, 1000, 1000);
+    condition_engine_tick();
+    fake_clock_set_split(&clock, 700, 1301);
+    /* The clock-skew remedy re-baselines the framework's wall-keyed poll
+     * cadence. The condition still owns its own elapsed recovery interval. */
+    condition_engine_rebaseline_clocks();
+    condition_engine_tick();
+    bool ok = header_stall_at_height_test_remedy_calls() == 1 &&
+              peer.last_getheaders_time == 0 &&
+              peer.getheaders_stale_count == 0;
+    printf("sync_watchdog_conditions: header stall timeout ignores wall "
+           "rollback... %s\n", ok ? "OK" : "FAIL");
     cleanup_sync_watchdog();
     return ok ? 0 : 1;
 }
@@ -999,6 +1053,7 @@ int test_sync_watchdog_conditions(void)
     }
 
     failures += test_local_header_refill_new_episode();
+    failures += test_header_stall_uses_monotonic_timeout();
 
     {
         struct watchdog_stats stats;

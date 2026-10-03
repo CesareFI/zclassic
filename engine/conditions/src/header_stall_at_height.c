@@ -18,7 +18,9 @@
 static _Atomic int g_last_header_height = -1;
 static _Atomic int g_header_height_at_detect = -1;
 static _Atomic int g_peer_max_at_detect = -1;
-static _Atomic int64_t g_unchanged_since = 0;
+/* The recovery interval measures elapsed uptime. A civil-clock rollback must
+ * not postpone a header refill until wall time catches up. */
+static _Atomic int64_t g_unchanged_since_mono_s = -1;
 static _Atomic int64_t g_age_at_detect = 0;
 
 #ifdef ZCL_TESTING
@@ -32,32 +34,32 @@ static bool detect_header_stall_at_height(void)
     enum sync_state state = sync_get_state();
     if (!ms || !cm ||
         (state != SYNC_HEADERS_DOWNLOAD && state != SYNC_BLOCKS_DOWNLOAD)) {
-        atomic_store(&g_unchanged_since, 0);
+        atomic_store(&g_unchanged_since_mono_s, -1);
         atomic_store(&g_last_header_height, -1);
         return false;
     }
 
     int header_h = ms->pindex_best_header ? ms->pindex_best_header->nHeight : -1;
     int peer_max = connman_max_peer_height(cm);
-    int64_t now = platform_time_wall_unix();
+    int64_t now_mono_s = platform_time_monotonic_us() / 1000000;
     int prev = atomic_load(&g_last_header_height);
     if (header_h < 0 || peer_max <= header_h) {
-        atomic_store(&g_unchanged_since, 0);
+        atomic_store(&g_unchanged_since_mono_s, -1);
         atomic_store(&g_last_header_height, header_h);
         return false;
     }
     if (prev != header_h) {
         atomic_store(&g_last_header_height, header_h);
-        atomic_store(&g_unchanged_since, now);
+        atomic_store(&g_unchanged_since_mono_s, now_mono_s);
         return false;
     }
 
-    int64_t since = atomic_load(&g_unchanged_since);
-    if (since == 0) {
-        atomic_store(&g_unchanged_since, now);
+    int64_t since = atomic_load(&g_unchanged_since_mono_s);
+    if (since < 0) {
+        atomic_store(&g_unchanged_since_mono_s, now_mono_s);
         return false;
     }
-    int64_t age = now - since;
+    int64_t age = now_mono_s - since;
     if (age < 300)
         return false;
 
@@ -141,7 +143,7 @@ void header_stall_at_height_test_reset(void)
     atomic_store(&g_last_header_height, -1);
     atomic_store(&g_header_height_at_detect, -1);
     atomic_store(&g_peer_max_at_detect, -1);
-    atomic_store(&g_unchanged_since, 0);
+    atomic_store(&g_unchanged_since_mono_s, -1);
     atomic_store(&g_age_at_detect, 0);
     atomic_store(&g_test_remedy_calls, 0);
 }
