@@ -235,7 +235,11 @@ void service_state_driver_tick(void)
     if (peer_max < 0)
         return;
 
-    int gap = peer_max - local_h;
+    /* Heights are ints at the network boundary, but an empty local chain
+     * (-1) paired with a peer at INT_MAX is one wider than int.  Keep the
+     * state-only gap arithmetic wide so a hostile/extreme advertisement
+     * cannot wrap into the on-tip branch. */
+    int64_t gap = (int64_t)peer_max - (int64_t)local_h;
     if (gap < 0)
         gap = 0; /* stale peer starting_height can read below us; treat on-tip */
 
@@ -252,8 +256,8 @@ void service_state_driver_tick(void)
     if (next != cur) {
         char reason[128];
         snprintf(reason, sizeof(reason),
-                 "local=%d peer=%d gap=%d active=%d age=%llds",
-                 local_h, peer_max, gap, active, (long long)age);
+                 "local=%d peer=%d gap=%lld active=%d age=%llds",
+                 local_h, peer_max, (long long)gap, active, (long long)age);
         /* Record the new mode as the prior-state to restore after a REPAIRING
          * detour BEFORE the atomic advance+persist; the stored value is `next`
          * (independent of the transition), so the order is semantically inert

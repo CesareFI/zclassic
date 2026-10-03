@@ -17,6 +17,7 @@
 #include "framework/condition.h"
 #include "storage/progress_store.h"
 
+#include <limits.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -140,6 +141,15 @@ int test_service_state_driver(void)
         service_state_driver_tick();
         SSD("peer below us (negative gap) -> HEALTHY (clamped on-tip)",
             service_state_current() == SERVICE_STATE_HEALTHY);
+
+        /* The production driver must not subtract these int boundary values
+         * before widening: INT_MAX - (-1) is one wider than int.  It is a
+         * large outstanding sync gap, never an on-tip/HEALTHY result. */
+        service_state_advance(SERVICE_STATE_HEALTHY, "boundary baseline");
+        service_state_driver_test_set_overrides(-1, INT_MAX, 10);
+        service_state_driver_tick();
+        SSD("empty local chain + maximum peer height -> SYNCING",
+            service_state_current() == SERVICE_STATE_SYNCING);
 
         service_state_driver_test_clear_overrides();
     }
