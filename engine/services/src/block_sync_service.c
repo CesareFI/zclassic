@@ -610,6 +610,8 @@ bool syncsvc_should_probe_after_reject(int64_t now_seconds,
 {
     if (last_probe_seconds <= 0)
         return true;  // raw-return-ok:never-probed-is-not-an-error
+    if (now_seconds < last_probe_seconds)
+        return true;
     return (now_seconds - last_probe_seconds) >=
            SYNC_REJECT_PROBE_INTERVAL_SECS;
 }

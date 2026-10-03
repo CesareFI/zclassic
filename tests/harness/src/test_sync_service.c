@@ -435,6 +435,9 @@ static int test_sync_service_reject_probe_rate_limit(void)
         ASSERT(!syncsvc_should_probe_after_reject(
             1000, 1000 - SYNC_REJECT_PROBE_INTERVAL_SECS + 1));
         ASSERT(!syncsvc_should_probe_after_reject(1000, 1000));
+        /* A wall-clock rollback must not suppress the only pending
+         * bad-prevblk recovery request until time catches back up. */
+        ASSERT(syncsvc_should_probe_after_reject(999, 1000));
         /* At and past the interval → allowed. */
         ASSERT(syncsvc_should_probe_after_reject(
             1000, 1000 - SYNC_REJECT_PROBE_INTERVAL_SECS));
