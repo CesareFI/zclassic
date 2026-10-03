@@ -14,6 +14,7 @@
 #include "validation/sync_evidence_policy.h"
 #include "core/arith_uint256.h"
 #include "chain/chain.h"
+#include "util/pprev_walk.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <time.h>
@@ -535,13 +536,12 @@ bool syncsvc_headers_chain_from_tip(const struct block_index *candidate,
                                     const struct block_index *tip,
                                     int our_height)
 {
-    const struct block_index *verify = candidate;
-    const struct block_index *last_valid = NULL;
-
-    while (verify && verify->nHeight > our_height) {
-        last_valid = verify;
-        verify = verify->pprev;
-    }
+    enum { SYNC_HEADER_CHAIN_WALK_CAP = 100000 };
+    const struct block_index *verify = pprev_walk_until_height(
+        (struct block_index *)candidate, our_height,
+        SYNC_HEADER_CHAIN_WALK_CAP, "header_sync.chain_from_tip");
+    if (!verify)
+        return false;
 
     if (verify == tip)
         return true;
@@ -559,18 +559,14 @@ bool syncsvc_headers_chain_from_tip(const struct block_index *candidate,
      * accept this as a valid chain root. The anchor has FlyClient + SHA3
      * evidence and represents a verified chain point. */
     struct block_index *anchor = snapsync_get_anchor();
-    if (!verify && anchor && last_valid) {
-        const struct block_index *check = last_valid;
-        while (check && check != anchor)
-            check = check->pprev;
-        if (check == anchor)
-            return true;
-    }
+    if (anchor && verify->nHeight > our_height &&
+        verify->pprev == NULL && verify == anchor)
+        return true;
 
-    /* Chainwork fallback: if pprev walk failed (broken links from LDB
-     * import) but the candidate has strictly more chain work than our
-     * tip, accept it. Block download + connect_block will still fully
-     * validate everything — this check is just a sanity gate. */
+    /* Chainwork fallback: when a bounded, structurally valid ancestry
+     * does not meet the local tip, a strictly greater candidate chainwork
+     * still permits download. Block download + connect_block fully
+     * validate everything; this is only a scheduling sanity gate. */
     if (candidate && tip &&
         candidate->nHeight > our_height &&
         arith_uint256_compare(&candidate->nChainWork, &tip->nChainWork) > 0)

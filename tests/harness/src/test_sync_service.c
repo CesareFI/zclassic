@@ -1884,6 +1884,9 @@ static int test_sync_service_header_chain_policy(void)
                                                     &next, 1));
         ASSERT(syncsvc_headers_chain_from_tip(&next, &tip, 1));
         ASSERT(!syncsvc_headers_chain_from_tip(&fork, &tip, 1));
+        next.pprev = &fork;
+        fork.pprev = &next;
+        ASSERT(!syncsvc_headers_chain_from_tip(&next, &tip, 1));
         PASS();
     } _test_next:;
 
