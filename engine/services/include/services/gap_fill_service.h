@@ -103,6 +103,11 @@ int gap_fill_test_collect_pprev_window(struct block_index *start,
                                        int stop_height_exclusive,
                                        struct block_index **out,
                                        int out_cap);
+
+/* Production body-fetch scheduling-floor conversion, exposed only so the
+ * fixture can cover malformed durable cursors without starting the worker. */
+int gap_fill_test_raise_tip_to_body_fetch_cursor(int active_tip_h,
+                                                 uint64_t cursor);
 #endif
 
 /* Candidate predicate before the download-manager in-flight check. */
