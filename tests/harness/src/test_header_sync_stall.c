@@ -222,9 +222,14 @@ int test_header_sync_stall(void)
         n.time_connected = INT64_MAX;
         bool extreme_connection = syncsvc_should_disconnect_stale_header_peer(
             &n, 100, 5000, 0, INT64_MIN);
+        atomic_store(&n.getheaders_stale_count, INT_MAX);
+        syncsvc_note_headers_received(&n, 0);
+        bool stale_count_saturates =
+            atomic_load(&n.getheaders_stale_count) == INT_MAX;
         bool ok = !recent && boundary && !future_clock;
         ok &= !extreme_future;
         ok &= extreme_connection;
+        ok &= stale_count_saturates;
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 

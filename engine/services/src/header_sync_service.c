@@ -14,6 +14,7 @@
 #include "validation/sync_evidence_policy.h"
 #include "core/arith_uint256.h"
 #include "chain/chain.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <time.h>
 #include <stdatomic.h>
@@ -312,6 +313,18 @@ static int64_t syncsvc_getheaders_interval(const struct p2p_node *node,
     return base;
 }
 
+static void syncsvc_note_stale_headers(struct p2p_node *node)
+{
+    int stale = atomic_load_explicit(&node->getheaders_stale_count,
+                                     memory_order_relaxed);
+
+    while (stale < INT_MAX &&
+           !atomic_compare_exchange_weak_explicit(
+               &node->getheaders_stale_count, &stale, stale + 1,
+               memory_order_relaxed, memory_order_relaxed)) {
+    }
+}
+
 bool syncsvc_should_request_headers(const struct p2p_node *node,
                                     int our_height,
                                     int64_t now_seconds)
@@ -385,8 +398,7 @@ void syncsvc_note_headers_received(struct p2p_node *node,
                               memory_order_relaxed);
         node->total_headers_delivered += (uint64_t)newly_added;
     } else {
-        atomic_fetch_add_explicit(&node->getheaders_stale_count, 1,
-                                  memory_order_relaxed);
+        syncsvc_note_stale_headers(node);
     }
 }
 
