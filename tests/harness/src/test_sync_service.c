@@ -2250,8 +2250,8 @@ static int test_sync_service_recent_tip_bypasses_headers(void)
     return failures;
 }
 
-/* zcl.sync_benchmark.v1: TAIL_DOWNLOAD begins on the first block-assignment
- * plan, TAIL_FOLD begins on the first accepted-block note, and both end
+/* zcl.sync_benchmark.v1: TAIL_DOWNLOAD begins on the first issued block
+ * assignment, TAIL_FOLD begins on the first accepted-block note, and both end
  * (plus mark_sovereign + a single complete=true receipt write) the moment
  * syncsvc_collect_progress observes sync_state == SYNC_AT_TIP — never on any
  * other state, and never more than once. Driven on a scratch fixture
@@ -2287,6 +2287,33 @@ static int test_sync_service_benchmark_tail_phases(void)
 
         syncsvc_plan_block_assignment(&plan, &node, 0, 100000);
         ASSERT(plan.should_assign);
+
+        /* Eligibility alone is not download work. A vacant queue must leave
+         * the timing unmeasured until the manager issues a body request. */
+        struct json_value eligible_dump;
+        json_init(&eligible_dump);
+        ASSERT(sync_benchmark_dump_state_json(&eligible_dump, NULL));
+        const struct json_value *eligible_timings =
+            json_get(&eligible_dump, "timings_ms");
+        const struct json_value *eligible_tail_download =
+            eligible_timings ? json_get(eligible_timings, "tail_download") : NULL;
+        ASSERT(eligible_tail_download && json_is_null(eligible_tail_download));
+        json_free(&eligible_dump);
+
+        struct download_manager dm;
+        struct sync_block_batch batch;
+        struct uint256 queued = {0};
+        struct uint256 assigned[DL_WINDOW_SIZE];
+        int32_t height = 100001;
+        memset(&batch, 0, sizeof(batch));
+        memset(assigned, 0, sizeof(assigned));
+        queued.data[0] = 1;
+        dl_init(&dm);
+        ASSERT(dl_queue_blocks(&dm, &queued, &height, 1) == 1);
+        syncsvc_assign_peer_blocks(&batch, &dm, &node, assigned,
+                                   DL_WINDOW_SIZE, 100000);
+        ASSERT(batch.assigned == 1);
+        dl_free(&dm);
 
         struct sync_block_acceptance accept;
         memset(&accept, 0, sizeof(accept));
