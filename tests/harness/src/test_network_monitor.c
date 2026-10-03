@@ -16,7 +16,9 @@
 #include "conditions/net_tip_regression.h"
 #include "conditions/net_fork_detected.h"
 #include "conditions/net_partition_suspected.h"
+#include "platform/clock.h"
 
+#include <stdatomic.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,6 +196,49 @@ static void inject_view(int num_peers, int64_t our_h, int64_t modal,
     network_monitor_test_set_view(&v);
 }
 
+struct ntr_split_clock {
+    _Atomic int64_t wall_ms;
+    _Atomic int64_t mono_ns;
+};
+
+static int64_t ntr_split_wall(void *self)
+{
+    struct ntr_split_clock *clock = self;
+    return atomic_load(&clock->wall_ms);
+}
+
+static int64_t ntr_split_mono(void *self)
+{
+    struct ntr_split_clock *clock = self;
+    return atomic_load(&clock->mono_ns);
+}
+
+static bool ntr_uses_monotonic_timeout(void)
+{
+    struct ntr_split_clock clock;
+    atomic_store(&clock.wall_ms, 1000000);
+    atomic_store(&clock.mono_ns, 1000000000000LL);
+    struct clock_iface iface = {
+        .now_monotonic_ns = ntr_split_mono,
+        .now_wall_ms = ntr_split_wall,
+        .self = &clock,
+    };
+    clock_set_default(&iface);
+
+    net_tip_regression_test_reset();
+    inject_view(3, 100, 100, 100, false, -1);
+    bool baseline = !net_tip_regression_test_detect();
+
+    atomic_store(&clock.wall_ms, 700000);
+    atomic_store(&clock.mono_ns, 1901000000000LL);
+    inject_view(3, 100, 103, 110, false, -1);
+    bool detected = net_tip_regression_test_detect();
+
+    net_tip_regression_test_reset();
+    clock_reset_default();
+    return baseline && detected;
+}
+
 /* ── 3a. net_tip_regression ──────────────────────────────────────────── */
 static int test_tip_regression_condition(void)
 {
@@ -226,6 +271,8 @@ static int test_tip_regression_condition(void)
     net_tip_regression_test_set_now(3000 + 901);
     inject_view(3, 500, 500, 500, false, -1);
     NM_CHECK(!net_tip_regression_test_detect());
+
+    NM_CHECK(ntr_uses_monotonic_timeout());
 
     net_tip_regression_test_reset();
     return failures;

@@ -20,8 +20,8 @@ void register_net_tip_regression(void);
 
 #ifdef ZCL_TESTING
 void net_tip_regression_test_reset(void);
-/* Override the wall clock (unix secs) this detector samples. -1 = real clock. */
-void net_tip_regression_test_set_now(int64_t now_unix);
+/* Override the elapsed clock (seconds) this detector samples. -1 = real clock. */
+void net_tip_regression_test_set_now(int64_t now_seconds);
 bool net_tip_regression_test_detect(void);
 #endif
 
