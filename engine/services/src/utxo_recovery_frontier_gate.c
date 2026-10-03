@@ -181,7 +181,7 @@ const struct block_index *utxo_recovery_block_ancestry_break(
      * the anchor is the whole proof (caps the walk at ~tip-anchor hops). */
     const struct block_index *p = bi;
     while (p->pprev) {
-        if (p->pprev->nHeight != p->nHeight - 1) {
+        if ((int64_t)p->pprev->nHeight != (int64_t)p->nHeight - 1) {
             /* Height tear — p is the island root, UNLESS p is itself the
              * provenance-matched cold-import trust anchor. A shielded-history
              * import registers the cured coins tip (a legitimate SHA3-attested
