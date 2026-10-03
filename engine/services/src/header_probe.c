@@ -41,6 +41,7 @@
 #include "util/safe_alloc.h"
 
 #include <pthread.h>
+#include <limits.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -91,6 +92,21 @@ static struct {
 } g_hp = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
+
+static void hp_stat_add(_Atomic int64_t *stat, int64_t add)
+{
+    if (add <= 0)
+        return;
+    int64_t old = atomic_load(stat);
+    for (;;) {
+        if (old >= INT64_MAX)
+            return;
+        int64_t room = INT64_MAX - old;
+        int64_t next = old + (add < room ? add : room);
+        if (atomic_compare_exchange_weak(stat, &old, next))
+            return;
+    }
+}
 
 /* Returns false when the admit ring is saturated, so the pull loop can apply
  * backpressure (stop pulling) rather than fetch + re-validate more headers only
@@ -165,7 +181,7 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
     const struct chain_params *params = g_hp.params;
     pthread_mutex_unlock(&g_hp.lock);
 
-    atomic_fetch_add(&g_hp.calls_total, 1);
+    hp_stat_add(&g_hp.calls_total, 1);
 
     /* Clamp batch size. */
     if (max_headers <= 0) max_headers = HP_DEFAULT_BATCH;
@@ -176,7 +192,7 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
     char err[160] = {0};
     if (!legacy_header_rpc_fetch_remote_tip(host, port, user, pass,
                                             &remote_tip, err, sizeof(err))) {
-        atomic_fetch_add(&g_hp.rpc_errors, 1);
+        hp_stat_add(&g_hp.rpc_errors, 1);
         /* Not a fatal logic failure — return OK with 0 added so the
          * native/test callers can distinguish "RPC unreachable" via state. */
         return ZCL_OK;
@@ -218,21 +234,21 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
         if (!legacy_header_rpc_fetch_batch(host, port, user, pass,
                                            h, n, hbuf, &parsed,
                                            err, sizeof(err))) {
-            atomic_fetch_add(&g_hp.rpc_errors, 1);
+            hp_stat_add(&g_hp.rpc_errors, 1);
             /* Batch failed — fall back to single-call for this one
              * header so we still make some progress and surface a
              * precise error message. */
             struct block_header hdr;
             if (!legacy_header_rpc_fetch_one(host, port, user, pass, h,
                                              &hdr, err, sizeof(err))) {
-                atomic_fetch_add(&g_hp.rpc_errors, 1);
+                hp_stat_add(&g_hp.rpc_errors, 1);
                 break;
             }
             struct validation_state vs;
             validation_state_init(&vs);
             struct block_index *pindex = NULL;
             if (accept_block_header(&hdr, &vs, ms, params, &pindex)) {
-                atomic_fetch_add(&g_hp.headers_added, 1);
+                hp_stat_add(&g_hp.headers_added, 1);
                 added++;
                 hp_save_repair_header(pindex, &hdr);
                 if (pindex && pindex->nHeight > 0)
@@ -245,7 +261,7 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
                 h++;
                 continue;
             }
-            atomic_fetch_add(&g_hp.headers_rejected, 1);
+            hp_stat_add(&g_hp.headers_rejected, 1);
             break;
         }
 
@@ -255,7 +271,7 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
             validation_state_init(&vs);
             struct block_index *pindex = NULL;
             if (accept_block_header(&hbuf[i], &vs, ms, params, &pindex)) {
-                atomic_fetch_add(&g_hp.headers_added, 1);
+                hp_stat_add(&g_hp.headers_added, 1);
                 added++;
                 hp_save_repair_header(pindex, &hbuf[i]);
                 if (pindex && pindex->nHeight > 0)
@@ -266,7 +282,7 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
                     break;
                 }
             } else {
-                atomic_fetch_add(&g_hp.headers_rejected, 1);
+                hp_stat_add(&g_hp.headers_rejected, 1);
                 reject = true;
                 break;
             }
@@ -276,7 +292,7 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
             /* Partial batch — surface per-item decode/deserialize
              * failures as RPC errors so callers see the same
              * "something went wrong" signal as the single-call path. */
-            atomic_fetch_add(&g_hp.rpc_errors, (int64_t)(n - parsed));
+            hp_stat_add(&g_hp.rpc_errors, (int64_t)(n - parsed));
             break;
         }
         h += parsed;
@@ -323,7 +339,7 @@ void header_probe_tick_once(void)
     char err[160] = {0};
     if (!legacy_header_rpc_fetch_remote_tip(host, port, user, pass,
                                             &remote_tip, err, sizeof(err))) {
-        atomic_fetch_add(&g_hp.rpc_errors, 1);
+        hp_stat_add(&g_hp.rpc_errors, 1);
         return;
     }
     atomic_store(&g_hp.last_remote_height, remote_tip);
@@ -433,9 +449,9 @@ void header_probe_note_repair_served(enum header_probe_repair_source src,
                                      int height)
 {
     if (src == HEADER_PROBE_SRC_ORACLE) {
-        atomic_fetch_add(&g_hp.oracle_repairs, 1);
+        hp_stat_add(&g_hp.oracle_repairs, 1);
     } else if (src == HEADER_PROBE_SRC_P2P) {
-        atomic_fetch_add(&g_hp.p2p_repairs, 1);
+        hp_stat_add(&g_hp.p2p_repairs, 1);
     } else {
         return;  /* NONE — nothing to record */
     }
@@ -448,10 +464,10 @@ void header_probe_note_repair_served(enum header_probe_repair_source src,
 
 void header_probe_note_p2p_request(int height, int peers_available)
 {
-    atomic_fetch_add(&g_hp.p2p_requests, 1);
+    hp_stat_add(&g_hp.p2p_requests, 1);
     atomic_store(&g_hp.last_repair_height, height);
     if (peers_available <= 0)
-        atomic_fetch_add(&g_hp.p2p_no_peer_events, 1);
+        hp_stat_add(&g_hp.p2p_no_peer_events, 1);
 }
 
 #ifdef ZCL_TESTING
@@ -464,6 +480,17 @@ void header_probe_test_get_repair_stats(struct header_probe_repair_stats *out)
     out->p2p_no_peer_events = atomic_load(&g_hp.p2p_no_peer_events);
     out->last_repair_source = atomic_load(&g_hp.last_repair_source);
     out->last_repair_height = atomic_load(&g_hp.last_repair_height);
+}
+
+void header_probe_test_seed_repair_stats(int64_t oracle_repairs,
+                                         int64_t p2p_requests,
+                                         int64_t p2p_repairs,
+                                         int64_t p2p_no_peer_events)
+{
+    atomic_store(&g_hp.oracle_repairs, oracle_repairs);
+    atomic_store(&g_hp.p2p_requests, p2p_requests);
+    atomic_store(&g_hp.p2p_repairs, p2p_repairs);
+    atomic_store(&g_hp.p2p_no_peer_events, p2p_no_peer_events);
 }
 #endif
 

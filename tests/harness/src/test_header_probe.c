@@ -310,10 +310,31 @@ static void hp_teardown(void)
 
 int test_header_probe(void);
 
+static int test_header_probe_repair_stats_saturate(void)
+{
+    header_probe_reset_for_test();
+    header_probe_test_seed_repair_stats(INT64_MAX, INT64_MAX,
+                                        INT64_MAX, INT64_MAX);
+    header_probe_note_repair_served(HEADER_PROBE_SRC_ORACLE, 7);
+    header_probe_note_repair_served(HEADER_PROBE_SRC_P2P, 8);
+    header_probe_note_p2p_request(9, 0);
+    struct header_probe_repair_stats stats;
+    header_probe_test_get_repair_stats(&stats);
+    bool ok = stats.oracle_repairs == INT64_MAX &&
+              stats.p2p_repairs == INT64_MAX &&
+              stats.p2p_requests == INT64_MAX &&
+              stats.p2p_no_peer_events == INT64_MAX;
+    printf("header_probe: repair statistics saturate... %s\n",
+           ok ? "OK" : "FAIL");
+    header_probe_reset_for_test();
+    return ok ? 0 : 1;
+}
+
 int test_header_probe(void)
 {
     printf("\n=== header probe service tests ===\n");
     int failures = 0;
+    failures += test_header_probe_repair_stats_saturate();
 
     const struct chain_params *params = chain_params_get();
     if (!params) {

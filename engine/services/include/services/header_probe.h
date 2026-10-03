@@ -129,6 +129,10 @@ struct header_probe_repair_stats {
     int     last_repair_height;
 };
 void header_probe_test_get_repair_stats(struct header_probe_repair_stats *out);
+void header_probe_test_seed_repair_stats(int64_t oracle_repairs,
+                                         int64_t p2p_requests,
+                                         int64_t p2p_repairs,
+                                         int64_t p2p_no_peer_events);
 #endif
 
 #endif /* ZCL_SERVICES_HEADER_PROBE_H */
