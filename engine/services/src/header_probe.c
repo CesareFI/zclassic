@@ -157,6 +157,12 @@ static void hp_save_repair_header(const struct block_index *pindex,
 
 /* ── Public pull-range ─────────────────────────────────────────── */
 
+static int hp_range_end(int start_height, int max_headers)
+{
+    int64_t end = (int64_t)start_height + max_headers - 1;
+    return end > INT_MAX ? INT_MAX : (int)end;
+}
+
 struct zcl_result header_probe_pull_range(int start_height, int max_headers,
                                           int *out_added)
 {
@@ -186,6 +192,7 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
     /* Clamp batch size. */
     if (max_headers <= 0) max_headers = HP_DEFAULT_BATCH;
     if (max_headers > HP_MAX_BATCH) max_headers = HP_MAX_BATCH;
+    int end_height = hp_range_end(start_height, max_headers);
 
     /* Discover remote tip — bounds the loop and updates last_remote. */
     int remote_tip = -1;
@@ -208,12 +215,11 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
     if (local_tip < 0) local_tip = 0;
     atomic_store(&g_hp.last_local_height, local_tip);
 
-    int end_height = start_height + max_headers - 1;
     if (end_height > remote_tip) end_height = remote_tip;
     if (end_height < start_height) return ZCL_OK;  /* nothing to do */
 
     int added = 0;
-    int h = start_height;
+    int64_t h = start_height;
     bool inbox_full = false;  /* admit ring saturated → stop pulling this call */
     /* Batched fast path: fetch headers via JSON-RPC arrays. Per-item accept
      * still validates PoW + chain link locally after the RPC helper
@@ -226,20 +232,20 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
     }
 
     while (h <= end_height) {
-        int n = end_height - h + 1;
+        int n = (int)((int64_t)end_height - h + 1);
         if (n > LEGACY_HEADER_RPC_BATCH_MAX)
             n = LEGACY_HEADER_RPC_BATCH_MAX;
 
         int parsed = 0;
         if (!legacy_header_rpc_fetch_batch(host, port, user, pass,
-                                           h, n, hbuf, &parsed,
+                                           (int)h, n, hbuf, &parsed,
                                            err, sizeof(err))) {
             hp_stat_add(&g_hp.rpc_errors, 1);
             /* Batch failed — fall back to single-call for this one
              * header so we still make some progress and surface a
              * precise error message. */
             struct block_header hdr;
-            if (!legacy_header_rpc_fetch_one(host, port, user, pass, h,
+            if (!legacy_header_rpc_fetch_one(host, port, user, pass, (int)h,
                                              &hdr, err, sizeof(err))) {
                 hp_stat_add(&g_hp.rpc_errors, 1);
                 break;
@@ -299,8 +305,9 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
     }
     if (inbox_full)
         LOG_INFO("header_probe",
-                 "[header_probe] admit ring saturated at h=%d; paused pull "
-                 "(admitted=%d this call) — resuming next tick", h, added);
+                 "[header_probe] admit ring saturated at h=%lld; paused pull "
+                 "(admitted=%d this call) — resuming next tick",
+                 (long long)h, added);
     free(hbuf);
 
     if (out_added) *out_added = added;
