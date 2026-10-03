@@ -712,7 +712,8 @@ bool syncsvc_should_disconnect_stale_header_peer(const struct p2p_node *node,
      * evidence they own. A future timestamp is treated as recent rather than
      * turning clock skew into peer churn. */
     if (last_body_time > 0 &&
-        now_seconds - last_body_time < SYNC_BODY_STALL_TIMEOUT_SECS)
+        (now_seconds < last_body_time ||
+         now_seconds - last_body_time < SYNC_BODY_STALL_TIMEOUT_SECS))
         return false;
 
     /* If peer has never delivered useful headers, use connection time. */

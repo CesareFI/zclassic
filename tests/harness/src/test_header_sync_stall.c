@@ -31,6 +31,8 @@
 #include "sync/sync_planner.h"
 #include "net/netaddr.h"
 
+#include <limits.h>
+
 /* Helper: build a minimal p2p_node for testing stall detection. */
 static struct p2p_node make_stall_node(int starting_height, bool inbound,
                                        int64_t connected_time)
@@ -212,7 +214,13 @@ int test_header_sync_stall(void)
             &n, 100, 5000, 1000, 1120);
         bool future_clock = syncsvc_should_disconnect_stale_header_peer(
             &n, 100, 5000, 1200, 1120);
+        /* Compare before subtraction: a malformed/future timestamp must
+         * remain a recent body source without making INT64_MIN - INT64_MAX
+         * overflow before the future-clock policy can apply. */
+        bool extreme_future = syncsvc_should_disconnect_stale_header_peer(
+            &n, 100, 5000, INT64_MAX, INT64_MIN);
         bool ok = !recent && boundary && !future_clock;
+        ok &= !extreme_future;
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 
