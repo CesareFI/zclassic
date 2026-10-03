@@ -18,6 +18,8 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <time.h>
+
+enum { SYNC_HEADER_CHAIN_WALK_CAP = 100000 };
 #include <stdatomic.h>
 #include "util/log_macros.h"
 #include "util/safe_alloc.h"
@@ -536,7 +538,6 @@ bool syncsvc_headers_chain_from_tip(const struct block_index *candidate,
                                     const struct block_index *tip,
                                     int our_height)
 {
-    enum { SYNC_HEADER_CHAIN_WALK_CAP = 100000 };
     const struct block_index *verify = pprev_walk_until_height(
         (struct block_index *)candidate, our_height,
         SYNC_HEADER_CHAIN_WALK_CAP, "header_sync.chain_from_tip");
@@ -603,10 +604,12 @@ void syncsvc_collect_needed_blocks(struct sync_needed_blocks *result,
          * isn't the tip, this is a genuine fork — reject it. */
         bool has_pprev_gap = false;
         if (candidate->nHeight > our_height) {
-            const struct block_index *w = candidate;
-            while (w && w->nHeight > our_height)
-                w = w->pprev;
-            has_pprev_gap = (w == NULL);
+            const struct block_index *w = pprev_walk_until_height(
+                (struct block_index *)candidate, our_height,
+                SYNC_HEADER_CHAIN_WALK_CAP,
+                "header_sync.collect_needed_blocks");
+            has_pprev_gap = w && w->nHeight > our_height &&
+                            w->pprev == NULL;
         }
         if (has_pprev_gap) {
             result->chains_from_tip = true; /* override — allow download */
