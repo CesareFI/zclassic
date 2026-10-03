@@ -1887,6 +1887,11 @@ static int test_sync_service_builds_alt_recovery_plan(void)
         struct main_state max_state = {0};
         struct p2p_node max_node = {0};
         struct sync_stall_recovery max_recovery = {0};
+        struct main_state empty_state;
+        struct p2p_node empty_node = {0};
+        struct sync_stall_recovery empty_recovery = {0};
+        struct block_index malformed_high;
+        struct uint256 malformed_hash = {0};
         struct main_state ms;
         struct p2p_node node;
         struct sync_stall_recovery recovery;
@@ -1898,6 +1903,26 @@ static int test_sync_service_builds_alt_recovery_plan(void)
         max_node.starting_height = INT_MAX;
         ASSERT(!syncsvc_build_stall_recovery(&max_recovery, &max_state,
                                              &max_node, 0, 0, 1000));
+
+        /* A corrupted header index can carry INT_MAX while the active chain
+         * is still empty (height -1). The production map scan must classify
+         * that entry as far outside its 10-height probe window, rather than
+         * overflowing the signed height delta before the bound check. */
+        main_state_init(&empty_state);
+        block_index_init(&malformed_high);
+        malformed_high.phashBlock = &malformed_hash;
+        malformed_high.nHeight = INT_MAX;
+        malformed_hash.data[0] = 0xa5;
+        block_map_insert(&empty_state.map_block_index, &malformed_hash,
+                         &malformed_high);
+        empty_node.state = PEER_SYNCING_BLOCKS;
+        empty_node.starting_height = INT_MAX;
+        ASSERT(syncsvc_build_stall_recovery(&empty_recovery, &empty_state,
+                                             &empty_node, 0, 0, INT64_MAX));
+        ASSERT(empty_recovery.should_recover);
+        ASSERT(empty_recovery.next_height == 0);
+        syncsvc_free_stall_recovery(&empty_recovery);
+        main_state_free(&empty_state);
 
         memset(&node, 0, sizeof(node));
         memset(&g, 0, sizeof(g));
