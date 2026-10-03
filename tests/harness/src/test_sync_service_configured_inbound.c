@@ -2119,6 +2119,23 @@ static int test_configured_inbound_probe_deadline_saturates(void)
     return failures;
 }
 
+static int test_configured_inbound_probe_retry_rearms_after_clock_rollback(void)
+{
+    int failures = 0;
+
+    TEST("configured inbound: a rollback re-arms a completed identity probe") {
+        ASSERT(!configured_sync_peers_test_probe_due(
+            false, true, 100, 100));
+        ASSERT(configured_sync_peers_test_probe_due(
+            false, true, INT64_MAX, INT64_MIN));
+        ASSERT(!configured_sync_peers_test_probe_due(
+            true, true, INT64_MAX, INT64_MIN));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 struct socket_probe_run {
     struct net_service target;
     uint8_t priv[32];
@@ -2364,6 +2381,7 @@ int check_sync_service_configured_inbound(void)
     failures += test_configured_inbound_probe_socket();
     failures += test_configured_inbound_probe_deadline();
     failures += test_configured_inbound_probe_deadline_saturates();
+    failures += test_configured_inbound_probe_retry_rearms_after_clock_rollback();
     failures += test_configured_inbound_probe_stop();
     failures += test_configured_inbound_probe_thread();
     failures += test_configured_inbound_revocation();

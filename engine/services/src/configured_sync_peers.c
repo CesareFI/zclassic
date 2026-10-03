@@ -495,9 +495,24 @@ static bool probe_due_locked(const struct configured_target *t, int64_t now)
 {
     if (t->probe_running)
         return false;  // raw-return-ok:one-probe-per-target-at-a-time
+    if (t->probe_finished_once && now < t->probe_finished_s)
+        return true;
     return !t->probe_finished_once ||
            now - t->probe_finished_s >= CONFIGURED_SYNC_PEER_PROBE_RETRY_SECS;
 }
+
+#ifdef ZCL_TESTING
+bool configured_sync_peers_test_probe_due(bool running, bool finished,
+                                          int64_t finished_seconds,
+                                          int64_t now_seconds)
+{
+    struct configured_target target = {0};
+    target.probe_running = running;
+    target.probe_finished_once = finished;
+    target.probe_finished_s = finished_seconds;
+    return probe_due_locked(&target, now_seconds);
+}
+#endif
 
 /* Mark every due target at `ip` running and copy it into `out` (or only
  * count them when `out` is NULL). */

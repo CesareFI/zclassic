@@ -146,6 +146,9 @@ void configured_sync_peers_reset_for_testing(void);
 bool configured_sync_peer_probe_socket_for_testing(
     const struct net_service *target, const uint8_t identity_priv[32],
     const unsigned char magic[4], uint8_t out_static[32]);
+bool configured_sync_peers_test_probe_due(bool running, bool finished,
+                                          int64_t finished_seconds,
+                                          int64_t now_seconds);
 
 /* The inbound half of the rule above. False for outbound peers. */
 bool syncsvc_peer_is_configured_inbound(const struct p2p_node *node);
