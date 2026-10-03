@@ -17,6 +17,7 @@
 
 #include <sqlite3.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -291,6 +292,32 @@ static void teardown_fixture(struct bfmhd_fixture *fx)
     test_cleanup_tmpdir(fx->dir);
 }
 
+static bool bfmhd_out_of_range_select_idle_keeps_frontier_target(void)
+{
+    struct bfmhd_fixture fx;
+    bool ok = setup_fixture(&fx, "out_of_range_select_idle");
+    if (!ok)
+        return false;
+
+    fx.tip->nStatus &= ~(unsigned)BLOCK_HAVE_DATA;
+    fx.tip->nFile = -1;
+    fx.tip->nDataPos = 0;
+    g_bfmhd_stub_height = (int64_t)INT_MAX + 2147483650LL;
+    body_fetch_missing_have_data_test_set_select_idle_stubs(
+        bfmhd_stub_select_idle_height,
+        bfmhd_stub_select_idle_is_read_failure);
+    condition_engine_tick();
+
+    uint64_t queued = 0;
+    dl_get_stats(&fx.dm, NULL, NULL, NULL, NULL, &queued);
+    ok = body_fetch_missing_have_data_test_remedy_calls() == 1 &&
+         queued == 1 && fx.dm.queue_len == 1 &&
+         fx.dm.queue_heights[0] == fx.target;
+    g_bfmhd_stub_height = -1;
+    teardown_fixture(&fx);
+    return ok;
+}
+
 static bool queue_has_target(struct bfmhd_fixture *fx)
 {
     uint64_t queued = 0;
@@ -346,6 +373,12 @@ int test_body_fetch_missing_have_data_condition(void)
         ok2 = ok2 && snap.cleared_count == 1;
         BFMHD_CHECK("body_fetch success row witnesses clear", ok2);
         teardown_fixture(&fx);
+    }
+
+    {
+        BFMHD_CHECK("out-of-range select-idle height cannot narrow below the "
+                    "frontier target",
+                    bfmhd_out_of_range_select_idle_keeps_frontier_target());
     }
 
     {

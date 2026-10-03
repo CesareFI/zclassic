@@ -17,6 +17,7 @@
 
 #include <sqlite3.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <string.h>
 
 static _Atomic int g_target_at_detect = -1;
@@ -47,6 +48,11 @@ static bfmhd_select_idle_height_fn g_select_idle_height_fn =
     utxo_apply_stage_select_idle_height;
 static bfmhd_select_idle_is_read_failure_fn g_select_idle_is_read_failure_fn =
     utxo_apply_stage_select_idle_is_read_failure;
+
+static bool select_idle_height_fits_block_index(int64_t height)
+{
+    return height >= 0 && height <= INT_MAX;
+}
 
 #ifdef ZCL_TESTING
 static void (*g_before_remedy_recheck_fn)(void);
@@ -200,7 +206,8 @@ static bool detect_body_fetch_missing_have_data(void)
      * fetch for it. Prefer the lower of the two candidates. */
     if (!tip_recent && g_select_idle_is_read_failure_fn()) {
         int64_t ua_h = g_select_idle_height_fn();
-        if (ua_h >= 0 && (target < 0 || ua_h < target) &&
+        if (select_idle_height_fits_block_index(ua_h) &&
+            (target < 0 || ua_h < target) &&
             active_target_missing_data(ms, (int)ua_h, &target_hash)) {
             target = (int)ua_h;
             route = BFMHD_TARGET_ACTIVE_FRONTIER;
