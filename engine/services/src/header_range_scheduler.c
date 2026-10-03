@@ -192,6 +192,18 @@ static int64_t hrs_deadline_from(int64_t now_us, int64_t timeout_us)
     return now_us + timeout_us;
 }
 
+/* State-dump integers are signed.  Keep monotone scheduler observations in
+ * that representable range: reporting a negative or wrapped zero count would
+ * make a busy sync appear idle to an operator. */
+static void hrs_stat_increment(uint64_t *stat)
+{
+    if (*stat >= (uint64_t)INT64_MAX) {
+        *stat = (uint64_t)INT64_MAX;
+        return;
+    }
+    (*stat)++;
+}
+
 int hrs_assign(struct header_range_scheduler *s, int32_t peer_id,
                int64_t now_us)
 {
@@ -211,7 +223,7 @@ int hrs_assign(struct header_range_scheduler *s, int32_t peer_id,
             s->spans[i].peer_id = peer_id;
             s->spans[i].deadline_us =
                 hrs_deadline_from(now_us, s->span_timeout_us);
-            s->stat_assigns++;
+            hrs_stat_increment(&s->stat_assigns);
             zcl_mutex_unlock(&s->lock);
             return (int)i;
         }
@@ -234,7 +246,7 @@ size_t hrs_note_frontier(struct header_range_scheduler *s, int32_t height)
             s->spans[i].assigned = false;
             s->spans[i].peer_id = 0;
             s->spans[i].deadline_us = 0;
-            s->stat_completions++;
+            hrs_stat_increment(&s->stat_completions);
             completed++;
         }
     }
@@ -259,8 +271,8 @@ size_t hrs_sweep_expired(struct header_range_scheduler *s, int64_t now_us,
             s->spans[i].assigned = false;
             s->spans[i].peer_id = 0;
             s->spans[i].deadline_us = 0;
-            s->stat_timeouts++;
-            s->stat_reassigns++;
+            hrs_stat_increment(&s->stat_timeouts);
+            hrs_stat_increment(&s->stat_reassigns);
             n++;
         }
     }

@@ -68,6 +68,39 @@ static int test_hrs_saturated_deadline(void)
     return 1;
 }
 
+static int test_hrs_statistics_saturate(void)
+{
+    struct header_range_scheduler s = {0};
+    hrs_init(&s, 1);
+    hrs_plan(&s, 0, 1, NULL, 0);
+    s.stat_assigns = (uint64_t)INT64_MAX;
+    int assigned = hrs_assign(&s, 11, 100);
+    bool assigns = assigned >= 0 &&
+                   s.stat_assigns == (uint64_t)INT64_MAX;
+    s.stat_completions = (uint64_t)INT64_MAX;
+    (void)hrs_note_frontier(&s, 1);
+    bool completed = s.stat_completions == (uint64_t)INT64_MAX;
+    hrs_reset(&s);
+
+    hrs_plan(&s, 0, 1, NULL, 0);
+    assigned = hrs_assign(&s, 22, 100);
+    s.stat_timeouts = (uint64_t)INT64_MAX;
+    s.stat_reassigns = (uint64_t)INT64_MAX;
+    (void)hrs_sweep_expired(&s, 101, NULL, 0);
+    bool expired = assigned >= 0 &&
+                   s.stat_timeouts == (uint64_t)INT64_MAX &&
+                   s.stat_reassigns == (uint64_t)INT64_MAX;
+    hrs_reset(&s);
+
+    printf("header_range_sched: statistics saturate at dump limit... ");
+    if (assigns && completed && expired) {
+        printf("OK\n");
+        return 0;
+    }
+    printf("FAIL\n");
+    return 1;
+}
+
 int test_header_range_sched(void)
 {
     int failures = 0;
@@ -162,6 +195,7 @@ int test_header_range_sched(void)
 
     /* ── 3b. Saturated deadline stays live, not immediately reassignable ─ */
     failures += test_hrs_saturated_deadline();
+    failures += test_hrs_statistics_saturate();
 
     /* ── 4. Stall -> reassign + report for demotion ──────────────── */
     printf("header_range_sched: stalled span reassigned + peer reported... ");
