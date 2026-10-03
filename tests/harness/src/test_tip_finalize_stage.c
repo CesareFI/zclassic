@@ -59,6 +59,22 @@ static int test_tf_cursor_conversion_bounds(void)
     return failures;
 }
 
+static int test_tf_durable_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    TF_CHECK("durable cursor: representable height is retained",
+             tip_finalize_stage_test_durable_cursor_height(INT32_MAX, &height) &&
+             height == INT32_MAX);
+    TF_CHECK("durable cursor: unrepresentable heights are refused before resolution",
+             !tip_finalize_stage_test_durable_cursor_height(
+                 (uint64_t)INT32_MAX + 1u, &height) &&
+             !tip_finalize_stage_test_durable_cursor_height(UINT64_C(1) << 32,
+                                                             &height) &&
+             !tip_finalize_stage_test_durable_cursor_height(UINT64_MAX, &height));
+    return failures;
+}
+
 /* Test-only override of the compiled SHA3-checkpoint floor — lets H* track the
  * synthetic sub-checkpoint heights instead of clamping up to the mainnet
  * anchor (3,056,758). Forward-declared (defined ZCL_TESTING-only in
@@ -650,6 +666,7 @@ int test_tip_finalize_stage(void)
     int failures = 0;
 
     failures += test_tf_cursor_conversion_bounds();
+    failures += test_tf_durable_cursor_conversion_bounds();
     blocker_module_init();
 
     /* uv_cursor_gap crash-window clamp (Lane C root-cause fix).

@@ -78,6 +78,10 @@ bool tip_finalize_stage_resolve_durable_tip(struct sqlite3 *db,
                                             int *out_height,
                                             uint8_t out_hash[32]);
 
+#ifdef ZCL_TESTING
+bool tip_finalize_stage_test_durable_cursor_height(uint64_t cursor, int *out);
+#endif
+
 /* Terminal-verb warm (the -install-consensus-bundle boot-order fix). A normal
  * boot publishes the runtime authority pair + provable-tip cache in
  * tip_finalize_stage_init, which runs AFTER the terminal install verb (the

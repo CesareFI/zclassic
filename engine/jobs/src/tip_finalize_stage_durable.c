@@ -18,6 +18,7 @@
 #include "support/log_throttle.h"
 #include "platform/time_compat.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -264,6 +265,21 @@ bool tip_finalize_stage_block_hash_at(sqlite3 *db, int height,
     return false;
 }
 
+static bool tf_durable_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool tip_finalize_stage_test_durable_cursor_height(uint64_t cursor, int *out)
+{
+    return tf_durable_cursor_height(cursor, out);
+}
+#endif
+
 bool tip_finalize_stage_resolve_durable_tip(sqlite3 *db, int *out_height,
                                             uint8_t out_hash[32])
 {
@@ -274,11 +290,18 @@ bool tip_finalize_stage_resolve_durable_tip(sqlite3 *db, int *out_height,
         LOG_FAIL("tip_finalize", "durable tip cursor read failed");
     if (cursor == 0)
         return false;
+    int cursor_height = 0;
+    if (!tf_durable_cursor_height(cursor, &cursor_height)) {
+        LOG_WARN("tip_finalize",
+                 "[tip_finalize] durable tip cursor out of range: %llu",
+                 (unsigned long long)cursor);
+        return false;
+    }
     /* Try cursor (anchor-at-cursor steady state), then cursor-1 (legacy +1
      * lattice / finalized-row convention). block_hash_at discriminates the row
      * types, so whichever height resolves owns the returned hash. */
     for (int back = 0; back <= 1; back++) {
-        int h = (int)cursor - back;
+        int h = cursor_height - back;
         if (h < 0)
             break;
         if (tip_finalize_stage_block_hash_at(db, h, out_hash)) {
