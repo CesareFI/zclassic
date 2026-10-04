@@ -96,6 +96,7 @@
 #include "util/supervisor.h"
 #include "util/thread_qos.h"
 #include "util/thread_registry.h"
+#include <limits.h>
 
 /* Global instance for RPC access */
 struct bg_validation_service *g_bg_validation = NULL;
@@ -116,6 +117,34 @@ struct bg_validation_service *g_bg_validation = NULL;
 static bool bg_validation_coverage_version_current(int64_t version)
 {
     return version == BG_VALIDATION_COVERAGE_VERSION;
+}
+
+/* A current-coverage cursor resumes at its successor. INT_MAX has no
+ * representable successor, so it must take the existing refused-cursor path
+ * and restart the non-consensus audit rather than wrap into a false height. */
+static bool bg_validation_resume_height(int cursor, int *height_out)
+{
+    if (!height_out || cursor < 0 || cursor >= INT_MAX)
+        return false;
+    *height_out = cursor + 1;
+    return true;
+}
+
+static bool bg_validation_external_seed_floor(int32_t *seed_floor_out)
+{
+    bool found = false;
+    if (!seed_floor_out ||
+        !reducer_seed_floor_height_read(progress_store_db(), seed_floor_out,
+                                        &found) ||
+        !found || *seed_floor_out <= 0)
+        return false;
+    if (*seed_floor_out >= INT_MAX) {
+        LOG_WARN("bg_validation",
+                 "seed floor has no representable successor=%d; restarting full walk",
+                 *seed_floor_out);
+        return false;
+    }
+    return true;
 }
 
 static _Atomic supervisor_child_id g_bg_validation_supervisor_id =
@@ -484,14 +513,16 @@ static struct bg_walk_start bg_validation_walk_start(
     struct bg_validation_service *svc, bool external_seeded,
     int32_t seed_floor)
 {
-    struct bg_walk_start ws = { .height = external_seeded ? seed_floor + 1
-                                                          : 0 };
+    struct bg_walk_start ws = { .height =
+        external_seeded && seed_floor < INT_MAX ? seed_floor + 1 : 0 };
     const struct bg_validation_store_port *store = &svc->progress_store;
     int cursor = load_progress(store);
+    int resume_height = 0;
     if (cursor >= 0 &&
-        bg_validation_coverage_version_current(load_coverage_version(store))) {
+        bg_validation_coverage_version_current(load_coverage_version(store)) &&
+        bg_validation_resume_height(cursor, &resume_height)) {
         int64_t ls = load_skips(store);
-        ws.height = cursor + 1; /* Resume from next unverified block. */
+        ws.height = resume_height; /* Resume from next unverified block. */
         ws.coverage_complete = true;
         ws.skips = ls < 0 ? 0 : ls;
         return ws;
@@ -658,7 +689,6 @@ static void *bg_validation_thread(void *arg)
     const struct chain_params *params = svc->params;
     const char *datadir = svc->datadir;
     int num_workers = svc->num_workers;
-    bool external_seeded = false;
     bool coverage_complete;
 
     /* Genuinely-background bulk walker (full proof/script re-verification
@@ -670,10 +700,7 @@ static void *bg_validation_thread(void *arg)
     bg_validation_supervisor_heartbeat(svc);
 
     int32_t seed_floor = 0;
-    bool seed_floor_found = false;
-    external_seeded = reducer_seed_floor_height_read(
-        progress_store_db(), &seed_floor, &seed_floor_found) &&
-        seed_floor_found && seed_floor > 0;
+    bool external_seeded = bg_validation_external_seed_floor(&seed_floor);
 
     struct bg_walk_start ws =
         bg_validation_walk_start(svc, external_seeded, seed_floor);
@@ -1018,6 +1045,11 @@ bool bg_validation_record_reverify(struct bg_validation_service *svc,
 bool bg_validation_test_coverage_version_current(int64_t version)
 {
     return bg_validation_coverage_version_current(version);
+}
+
+bool bg_validation_test_resume_height(int cursor, int *height_out)
+{
+    return bg_validation_resume_height(cursor, height_out);
 }
 #endif
 

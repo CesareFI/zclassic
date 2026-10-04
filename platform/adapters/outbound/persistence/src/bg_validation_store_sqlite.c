@@ -12,7 +12,9 @@
 #include "adapters/outbound/persistence/bg_validation_store_sqlite.h"
 
 #include "models/database.h"
+#include "util/log_macros.h"
 
+#include <limits.h>
 #include <stdint.h>
 
 /* The single state key the cursor lives under: "bg_validation_height".
@@ -39,6 +41,12 @@ static bool bgv_load_progress(void *self, int *out)
     int64_t val = 0;
     if (!node_db_state_get_int(ndb, BGV_PROGRESS_KEY, &val))
         return false;
+    if (val < -1 || val > INT_MAX) {
+        LOG_WARN("bg_validation",
+                 "bg validation cursor out of range=%lld; restarting walk",
+                 (long long)val);
+        return false;
+    }
     *out = (int)val;
     return true;
 }

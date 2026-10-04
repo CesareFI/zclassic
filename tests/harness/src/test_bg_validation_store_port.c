@@ -27,6 +27,7 @@
 #include "models/database.h"
 #include "services/bg_validation_service.h"
 
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -47,6 +48,14 @@ int test_bg_validation_store_port(void)
     BGV_CHECK("current coverage resumes from the persisted cursor",
               bg_validation_test_coverage_version_current(
                   BG_VALIDATION_COVERAGE_VERSION));
+    int resumed = -1;
+    BGV_CHECK("ordinary cursor resumes at its successor",
+              bg_validation_test_resume_height(1000, &resumed) &&
+              resumed == 1001);
+    resumed = -1;
+    BGV_CHECK("maximum cursor has no representable successor",
+              !bg_validation_test_resume_height(INT_MAX, &resumed) &&
+              resumed == -1);
 
     /* ---- Round-trip through the port over an in-memory node DB ---- */
     {
@@ -76,6 +85,12 @@ int test_bg_validation_store_port(void)
                   store.load_progress(store.self, &got));
         BGV_CHECK("loaded cursor == 1000", got == 1000);
 
+        BGV_CHECK("save INT_MAX succeeds",
+                  store.save_progress(store.self, INT_MAX));
+        got = 0;
+        BGV_CHECK("INT_MAX round-trips for refused-cursor recovery",
+                  store.load_progress(store.self, &got) && got == INT_MAX);
+
         /* 3. overwrite. */
         BGV_CHECK("save 2000 overwrites",
                   store.save_progress(store.self, 2000));
@@ -93,6 +108,13 @@ int test_bg_validation_store_port(void)
                   store.save_coverage_version(store.self, 1) &&
                   store.load_coverage_version(store.self, &version) &&
                   version == 1);
+
+        BGV_CHECK("out-of-range persisted cursor is stored",
+                  node_db_state_set_int(&ndb, "bg_validation_height",
+                                        (int64_t)INT_MAX + 1));
+        got = 12345;
+        BGV_CHECK("out-of-range cursor is refused without narrowing",
+                  !store.load_progress(store.self, &got) && got == 12345);
 
         node_db_close(&ndb);
     }

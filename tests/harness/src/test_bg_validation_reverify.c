@@ -31,6 +31,7 @@
 #include "validation/main_state.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
@@ -641,6 +642,55 @@ static int test_bg_validation_legacy_cursor_restarts_walk(void)
     return failures;
 }
 
+static int test_bg_validation_maximum_cursor_restarts_walk(void)
+{
+    int failures = 0;
+
+    TEST("bg_validation: maximum cursor restarts instead of overflowing") {
+        struct main_state ms;
+        main_state_init(&ms);
+        struct uint256 h0_hash;
+        struct uint256 h1_hash;
+        struct block_index *h0 = make_repair_index(&ms, &h0_hash);
+        ASSERT(h0 != NULL);
+        ASSERT(extend_repair_chain(&ms, h0, &h1_hash) != NULL);
+
+        struct bg_validation_service svc;
+        memset(&svc, 0, sizeof(svc));
+        svc.ms = &ms;
+        svc.datadir = "unused";
+        svc.progress_store = (struct bg_validation_store_port) {
+            .self = &svc,
+            .load_progress = restart_load_progress,
+            .save_progress = restart_save_progress,
+            .load_skips = restart_load_i64,
+            .save_skips = restart_save_i64,
+            .load_coverage_version = restart_load_version,
+            .save_coverage_version = restart_save_version,
+        };
+        g_body_repair_svc = &svc;
+        atomic_store(&g_body_read_calls, 0);
+        g_restart_progress = INT_MAX;
+        g_restart_version = BG_VALIDATION_COVERAGE_VERSION;
+        g_restart_skips = 41;
+        bg_validation_test_set_body_repair_stubs(
+            body_read_never_succeeds, body_repair_stop_on_sleep);
+
+        ASSERT(bg_validation_start(&svc));
+        ASSERT(body_read_count_wait_at_least(1));
+        ASSERT_EQ(atomic_load(&svc.progress.verified_height), 0);
+        bg_validation_stop(&svc);
+        ASSERT_EQ(g_restart_progress, -1);
+        ASSERT_EQ(g_restart_skips, 0);
+
+        bg_validation_test_set_body_repair_stubs(NULL, NULL);
+        reducer_frontier_body_read_note_reset_for_testing();
+        main_state_free(&ms);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* Wire a two-block walk over the restart stubs, for the census/gate cases. */
 static void walk_svc_init(struct bg_validation_service *svc,
                           struct main_state *ms)
@@ -1134,6 +1184,7 @@ int test_bg_validation_reverify(void)
     failures += test_bg_validation_post_verify_reorg_is_orphan();
     failures += test_bg_validation_restart_keeps_reverify_worker();
     failures += test_bg_validation_legacy_cursor_restarts_walk();
+    failures += test_bg_validation_maximum_cursor_restarts_walk();
     failures += test_bg_validation_v1_cursor_drops_skip_census();
     failures += test_bg_validation_current_cursor_keeps_census();
     failures += test_bg_validation_walk_waits_for_fold();
