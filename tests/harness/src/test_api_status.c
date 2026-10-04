@@ -5,6 +5,44 @@
 
 #include "test/api_test_fixtures.h"
 
+#include <limits.h>
+
+static int api_download_stats_json_counters_saturate(void)
+{
+    struct download_stats_snapshot snap = {0};
+    snap.requested = (uint64_t)INT64_MAX + 1u;
+    snap.received = UINT64_MAX;
+    snap.timed_out = UINT64_MAX;
+    snap.bytes_downloaded = UINT64_MAX;
+    snap.diag.total_orphaned = UINT64_MAX;
+    snap.diag.assign_attempts = UINT64_MAX;
+    snap.diag.peer_download_total = UINT64_MAX;
+    snap.diag.peer_download_count = 1;
+    snap.diag.peer_downloads[0].requested = UINT64_MAX;
+    snap.diag.peer_downloads[0].in_flight = UINT64_MAX;
+
+    struct json_value out;
+    json_init(&out);
+    json_set_object(&out);
+    download_stats_push_json(&out, &snap, true);
+    const struct json_value *peers = json_get(&out, "peer_downloads");
+    const struct json_value *peer = peers ? json_at(peers, 0) : NULL;
+    bool ok = json_get_int(json_get(&out, "requested")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&out, "received")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&out, "timed_out")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&out, "bytes_downloaded")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&out, "orphaned")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&out, "assign_attempts")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&out, "peer_download_total")) == INT64_MAX;
+    ok = ok && peer != NULL;
+    ok = ok && json_get_int(json_get(peer, "requested")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(peer, "in_flight")) == INT64_MAX;
+    json_free(&out);
+    printf("api: download statistics JSON saturates unsigned counters... %s\n",
+           ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int api_status_focused_tests(void)
 {
     int failures = 0;
@@ -170,6 +208,8 @@ int api_status_focused_tests(void)
         if (ok) printf("OK\n");
         else { printf("FAIL\n"); failures++; }
     }
+
+    failures += api_download_stats_json_counters_saturate();
 
     printf("api: download_stats_snapshot_collect(full=false) is a "
            "counts-consistent subset of full=true (shared collector)... ");
