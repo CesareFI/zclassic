@@ -205,6 +205,9 @@ static int case_active_when_gap_exceeds_threshold(void)
     setenv("ZCL_CATCHUP_GAP_THRESHOLD", "0", 1); /* below floor -> clamp to 1 */
     CC_CHECK("threshold clamp low: still active (gap 300 >= 1)",
              catchup_cadence_active());
+    setenv("ZCL_CATCHUP_GAP_THRESHOLD", "1junk", 1);
+    CC_CHECK("threshold trailing junk falls back to default",
+             !catchup_cadence_active());
     cc_clear_env();
 
     cc_cleanup();
@@ -394,6 +397,9 @@ static int case_small_backlog_defer_sync_gate(void)
     setenv("ZCL_CATCHUP_DEFER_GAP_THRESHOLD", "0", 1); /* clamp to 1 */
     CC_CHECK("defer threshold clamp low: gap 1 still opens",
              catchup_cadence_deferred_sync_active());
+    setenv("ZCL_CATCHUP_DEFER_GAP_THRESHOLD", "1junk", 1);
+    CC_CHECK("defer threshold trailing junk falls back to default",
+             !catchup_cadence_deferred_sync_active());
     cc_clear_env();
 
     /* Peers disconnect mid-backlog: closed. */
