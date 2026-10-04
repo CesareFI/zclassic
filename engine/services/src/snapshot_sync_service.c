@@ -604,13 +604,16 @@ bool snapsync_check_stall(void)
 
     snapsync_reset(svc);
 
-    /* Discard committed staging rows so the next offer starts clean.
-     * Active UTXOs were never touched by the stalled receive. */
-    if (svc->ndb && svc->ndb->open) {
-        if (snapsync_discard_staging_internal(svc->ndb, "stall_cleanup").ok)
-            event_emitf(EV_SNAPSYNC_VERIFIED, stall.serving_peer_id,
-                        "snapshot=FAILED reason=stall staging_discarded=true");
-    }
+    /* A successful reset already rolled back and discarded the isolated
+     * staging namespace.  Do not issue a second DELETE/marker write here:
+     * it adds avoidable I/O during recovery and cannot make a failed reset
+     * safe to resume. */
+    snapsync_service_lock_internal();
+    bool reset_idle = svc->state == SNAPSYNC_IDLE;
+    snapsync_service_unlock_internal();
+    if (reset_idle)
+        event_emitf(EV_SNAPSYNC_VERIFIED, stall.serving_peer_id,
+                    "snapshot=FAILED reason=stall staging_discarded=true");
 
     /* Reset sync state so the node can accept a new snapshot offer.
      * SYNC_SNAPSHOT_RECEIVE → SYNC_HEADERS_DOWNLOAD allows re-entry

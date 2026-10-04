@@ -2279,6 +2279,39 @@ static int test_snapshot_blacklist_survives_reset(void)
     return failures;
 }
 
+static int test_snapshot_stall_reuses_reset_cleanup(void)
+{
+    int failures = 0;
+    TEST("snapshot stall reset discards staging exactly once") {
+        struct snapshot_sync_service svc;
+        struct node_db ndb;
+        struct app_runtime_context runtime = {0};
+        char discard_reason[32] = {0};
+        size_t discard_reason_len = 0;
+
+        ASSERT(node_db_open(&ndb, ":memory:"));
+        snapsync_init(&svc, &ndb);
+        svc.state = SNAPSYNC_RECEIVING;
+        svc.serving_peer_id = 42;
+        svc.last_progress_time_us = 1;
+        runtime.snapshot_sync = &svc;
+        app_runtime_set_current(&runtime);
+
+        ASSERT(snapsync_check_stall());
+        ASSERT(svc.state == SNAPSYNC_IDLE);
+        ASSERT(node_db_state_get(&ndb, "snapshot_staging_last_discard",
+                                 discard_reason, sizeof(discard_reason),
+                                 &discard_reason_len));
+        ASSERT_EQ(discard_reason_len, strlen("reset"));
+        ASSERT(memcmp(discard_reason, "reset", discard_reason_len) == 0);
+
+        app_runtime_set_current(NULL);
+        node_db_close(&ndb);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_snapshot_sync_service(void)
 {
     int failures = 0;
@@ -2337,6 +2370,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_blacklist_multiple();
     failures += test_snapshot_blacklist_rejects_offer();
     failures += test_snapshot_blacklist_survives_reset();
+    failures += test_snapshot_stall_reuses_reset_cleanup();
     progress_store_close();
     test_cleanup_tmpdir(progress_dir);
     return failures;
