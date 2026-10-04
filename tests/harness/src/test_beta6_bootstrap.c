@@ -431,6 +431,24 @@ int test_beta6_bootstrap(void)
         PASS();
     }
 
+    TEST("an overlong anchor sidecar is refused before prefix parsing") {
+        char dir[512];
+        char sidecar[1100];
+        test_make_tmpdir(dir, sizeof(dir), "beta6_bootstrap", "sidecar_bound");
+        snprintf(sidecar, sizeof(sidecar), "%s.anchor", dir);
+        FILE *f = fopen(sidecar, "w");
+        ASSERT(f != NULL);
+        ASSERT(fputs("3126937 00000663e40f1fe0bc32a7e7282fac25de5fe8ecefd9c627"
+                     "e2fd948d388f7053 ", f) >= 0);
+        for (int i = 0; i < 300; i++)
+            ASSERT(fputc('x', f) != EOF);
+        ASSERT(fclose(f) == 0);
+        int32_t height = -1;
+        struct uint256 hash = {0};
+        ASSERT(!beta6_bs_read_height_hash_sidecar(sidecar, &height, &hash).ok);
+        PASS();
+    }
+
     /* ───────────────────── arm against a real tree ───────────────────── */
 
     TEST("arming orders chainstate before blocks and totals the real bytes") {

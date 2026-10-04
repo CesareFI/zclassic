@@ -96,13 +96,19 @@ struct zcl_result beta6_bs_sidecar_path(const char *source_dir, const char *suff
  * operator-written records; anything longer than the buffer is malformed. */
 static bool sidecar_read_line(const char *sidecar_path, char *line, size_t line_size)
 {
+    if (!line || line_size < 2)
+        return false;
     struct platform_positioned_file file;
     platform_positioned_file_init(&file);
     if (!platform_positioned_file_open(&file, sidecar_path))
         return false;  // raw-return-ok:an absent sidecar is the normal case
-    int64_t got = platform_positioned_file_read(&file, line, line_size - 1, 0);
+    uint64_t size = 0;
+    bool sized = platform_positioned_file_size(&file, &size);
+    int64_t got = sized && size < line_size
+        ? platform_positioned_file_read(&file, line, line_size - 1, 0)
+        : -1;
     platform_positioned_file_close(&file);
-    if (got <= 0)
+    if (got <= 0 || (uint64_t)got != size)
         return false;
     line[got] = '\0';
     return true;
