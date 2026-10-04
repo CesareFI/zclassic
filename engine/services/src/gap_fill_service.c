@@ -77,6 +77,11 @@ static void gap_fill_stat_add(uint64_t *stat, uint64_t add)
         *stat += add;
 }
 
+static int64_t gap_fill_counter_i64(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
+
 static int64_t gap_fill_supervisor_deadline_secs(void)
 {
     return (int64_t)GAPFILL_TICK_SECS * 3 + 30;
@@ -86,7 +91,7 @@ static int64_t gap_fill_progress_marker(void)
 {
     struct gap_fill_stats st;
     gap_fill_get_stats(&st);
-    return (int64_t)st.passes;
+    return gap_fill_counter_i64(st.passes);
 }
 
 static void gap_fill_supervisor_heartbeat(void)
@@ -298,11 +303,6 @@ void gap_fill_get_stats(struct gap_fill_stats *out)
     pthread_mutex_unlock(&g_gf.mu);
 }
 
-static int64_t gap_fill_json_u64(uint64_t value)
-{
-    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
-}
-
 /* See CLAUDE.md "Adding state introspection". Reentrant-safe: reuses the
  * same lock-guarded snapshot the supervisor heartbeat and RPC/agent paths
  * already read. */
@@ -317,15 +317,15 @@ bool gap_fill_dump_state_json(struct json_value *out, const char *key)
 
     struct gap_fill_stats st;
     gap_fill_get_stats(&st);
-    json_push_kv_int(out, "passes", gap_fill_json_u64(st.passes));
-    json_push_kv_int(out, "blocks_enqueued", gap_fill_json_u64(st.blocks_enqueued));
-    json_push_kv_int(out, "passes_idle", gap_fill_json_u64(st.passes_idle));
+    json_push_kv_int(out, "passes", gap_fill_counter_i64(st.passes));
+    json_push_kv_int(out, "blocks_enqueued", gap_fill_counter_i64(st.blocks_enqueued));
+    json_push_kv_int(out, "passes_idle", gap_fill_counter_i64(st.passes_idle));
     json_push_kv_int(out, "passes_corrupt_walk",
-                     gap_fill_json_u64(st.passes_corrupt_walk));
-    json_push_kv_int(out, "timeout_sweeps", gap_fill_json_u64(st.timeout_sweeps));
+                     gap_fill_counter_i64(st.passes_corrupt_walk));
+    json_push_kv_int(out, "timeout_sweeps", gap_fill_counter_i64(st.timeout_sweeps));
     json_push_kv_int(out, "timeouts_requeued",
-                     gap_fill_json_u64(st.timeouts_requeued));
-    json_push_kv_int(out, "dispatch_wakes", gap_fill_json_u64(st.dispatch_wakes));
+                     gap_fill_counter_i64(st.timeouts_requeued));
+    json_push_kv_int(out, "dispatch_wakes", gap_fill_counter_i64(st.dispatch_wakes));
     json_push_kv_int(out, "last_tip_h", (int64_t)st.last_tip_h);
     json_push_kv_int(out, "last_best_h", (int64_t)st.last_best_h);
     json_push_kv_int(out, "last_window_lo", (int64_t)st.last_window_lo);
@@ -887,6 +887,11 @@ void gap_fill_test_add_stats(uint64_t enqueue_add, uint64_t timeout_add)
     gap_fill_stat_add(&g_gf.stats.blocks_enqueued, enqueue_add);
     gap_fill_stat_add(&g_gf.stats.timeouts_requeued, timeout_add);
     pthread_mutex_unlock(&g_gf.mu);
+}
+
+int64_t gap_fill_test_progress_marker(void)
+{
+    return gap_fill_progress_marker();
 }
 
 /* The worker's real wait block, exposed so a test can time the skip. */

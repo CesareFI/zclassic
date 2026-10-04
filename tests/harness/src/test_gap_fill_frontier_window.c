@@ -107,6 +107,7 @@ static bool gf_dump_saturates_unsigned_stats(void)
     const struct json_value *passes = json_get(&v, "passes");
     ok = ok && running && !json_get_bool(running) && passes &&
          json_get_int(passes) == INT64_MAX &&
+         gap_fill_test_progress_marker() == INT64_MAX &&
          json_get_int(json_get(&v, "blocks_enqueued")) == INT64_MAX &&
          json_get_int(json_get(&v, "timeouts_requeued")) == INT64_MAX &&
          json_get_int(json_get(&v, "dispatch_wakes")) == INT64_MAX;
