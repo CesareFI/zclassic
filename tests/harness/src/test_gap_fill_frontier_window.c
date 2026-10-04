@@ -92,6 +92,27 @@ static bool gf_out_of_range_body_fetch_cursor_keeps_tip(void)
                100, (uint64_t)INT_MAX + 1u) == 100;
 }
 
+static bool gf_dump_saturates_unsigned_stats(void)
+{
+    struct gap_fill_stats stats = {
+        .passes = UINT64_MAX, .blocks_enqueued = UINT64_MAX,
+        .timeouts_requeued = UINT64_MAX, .dispatch_wakes = UINT64_MAX,
+    };
+    gap_fill_test_set_stats(&stats);
+    struct json_value v = {0};
+    json_set_object(&v);
+    bool ok = gap_fill_dump_state_json(&v, NULL);
+    const struct json_value *running = json_get(&v, "running");
+    const struct json_value *passes = json_get(&v, "passes");
+    ok = ok && running && !json_get_bool(running) && passes &&
+         json_get_int(passes) == INT64_MAX &&
+         json_get_int(json_get(&v, "blocks_enqueued")) == INT64_MAX &&
+         json_get_int(json_get(&v, "timeouts_requeued")) == INT64_MAX &&
+         json_get_int(json_get(&v, "dispatch_wakes")) == INT64_MAX;
+    json_free(&v);
+    return ok;
+}
+
 int test_gap_fill_frontier_window(void)
 {
     printf("\n=== gap_fill_frontier_window ===\n");
@@ -219,15 +240,8 @@ int test_gap_fill_frontier_window(void)
      * the service was never started in this test, so it must still report
      * a well-formed, not-running snapshot instead of crashing. */
     {
-        struct json_value v = {0};
-        json_set_object(&v);
-        bool ok = gap_fill_dump_state_json(&v, NULL);
-        const struct json_value *running = json_get(&v, "running");
-        const struct json_value *passes = json_get(&v, "passes");
         GF_CHECK("dump_state_json returns true and reports running+passes",
-                 ok && running && json_get_bool(running) == false &&
-                     passes && json_get_int(passes) == 0);
-        json_free(&v);
+                 gf_dump_saturates_unsigned_stats());
     }
 
     printf("gap_fill_frontier_window: %s (%d failures)\n",

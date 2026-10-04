@@ -505,7 +505,6 @@ contexts/commons/modules/vcs/src/zcode_c23_corpus_shard.c:vcs_zcode_c23_corpus_s
 contexts/commons/modules/vcs/src/zcode_candidate_bundle.c:bundle_parse_parts:17
 contexts/commons/modules/vcs/src/zcode_candidate_bundle.c:bundle_validate_authority:18
 contexts/commons/modules/vcs/src/zcode_candidate_bundle.c:vcs_zcode_candidate_bundle_export:27
-contexts/commons/modules/vcs/src/zcode_candidate_bundle.c:vcs_zcode_candidate_bundle_import:14
 contexts/commons/modules/vcs/src/zcode_candidate_tree.c:vcs_zcode_candidate_tree_import:37
 contexts/commons/modules/vcs/src/zcode_claim_epoch.c:vcs_zcode_claim_epoch_decode:16
 contexts/commons/modules/vcs/src/zcode_claim_epoch.c:vcs_zcode_claim_epoch_from_selection:18
@@ -1865,7 +1864,6 @@ engine/models/src/schema_migration.c:schema_migration_run_pending:17
 engine/models/src/shared_validators.c:zcl_validate_zcl_address:20
 engine/models/src/zid_domain.c:zid_domain_replace_leaves:19
 engine/modules/chainlog/src/chainlog.c:scan:16
-engine/modules/chainlog/src/chainlog.c:zcl_chainlog_open:1
 engine/modules/chainlog/src/chainlog.c:zcl_chainlog_read:17
 engine/modules/determinism/src/classify.c:zcl_det_classify:21
 engine/modules/determinism/src/receipt.c:zcl_det_receipt_check:16
@@ -1900,7 +1898,6 @@ engine/modules/fleetledger/src/fleet_ledger.c:chain_load:17
 engine/modules/fleetledger/src/fleet_ledger.c:index_row:17
 engine/modules/fleetledger/src/fleet_ledger.c:zcl_fleet_ledger_append:27
 engine/modules/fleetledger/src/fleet_ledger.c:zcl_fleet_ledger_experiment_stats:42
-engine/modules/fleetledger/src/fleet_ledger.c:zcl_fleet_ledger_open:1
 engine/modules/fleetledger/src/fleet_ledger.c:zcl_fleet_ledger_query:30
 engine/modules/fleetledger/src/fleet_ledger.c:zcl_fleet_ledger_replicate:29
 engine/modules/fleetledger/src/fleet_ledger_row.c:zcl_fleet_row_decode:20
@@ -2317,7 +2314,6 @@ engine/services/src/shielded_history_import_service.c:shielded_history_import_fr
 engine/services/src/shielded_history_promote_service.c:shielded_history_promote_run:59
 engine/services/src/slo_ledger_summary.c:push_summary:45
 engine/services/src/slo_ledger_summary.c:slo_ledger_summary_render_path:39
-engine/services/src/snapshot_fetch.c:snapsync_apply_chunk_local:10
 engine/services/src/snapshot_manifest.c:snapshot_manifest_parse:19
 engine/services/src/snapshot_offer.c:snapsync_build_local_recovery_manifest:17
 engine/services/src/snapshot_serve.c:snapsync_prepare_serve_step:20
@@ -2408,9 +2404,8 @@ platform/modules/platform/src/private_file.c:platform_private_file_link_no_clobb
 platform/modules/platform/src/private_file.c:platform_private_path_resolve:49
 platform/modules/platform/src/process_lifecycle.c:append_arg:20
 platform/modules/platform/src/process_lifecycle.c:environment_block:16
-platform/modules/platform/src/process_lifecycle.c:platform_process_capture_stdout:1
-platform/modules/platform/src/process_lifecycle.c:process_capture_stdout_stdio:53
 platform/modules/platform/src/process_lifecycle.c:platform_process_start_hidden#2:34
+platform/modules/platform/src/process_lifecycle.c:process_capture_stdout_stdio:53
 platform/modules/platform/src/process_lifecycle.c:process_start_hidden_with_stdout:44
 platform/modules/platform/src/ram_scratch.c:platform_ram_scratch_reserve:18
 platform/modules/platform/src/safe_root_read.c:platform_safe_root_read:38
@@ -2819,7 +2814,6 @@ tests/harness/src/test_fold_inram_crash_proof.c:fip_proof2_crash_resume:30
 tests/harness/src/test_fold_inram_crash_proof.c:fip_setup:25
 tests/harness/src/test_fr_accel.c:test_fr_accel:16
 tests/harness/src/test_game.c:test_game:58
-tests/harness/src/test_gap_fill_frontier_window.c:test_gap_fill_frontier_window:18
 tests/harness/src/test_generatetoaddress.c:test_generatetoaddress:34
 tests/harness/src/test_getheaders_serve_fallback.c:test_getheaders_serve_fallback:63
 tests/harness/src/test_getheaders_serve_pow_dedup.c:test_getheaders_serve_pow_dedup:47
@@ -3986,11 +3980,9 @@ tools/wallet_check.c:main:22
 tools/wallet_dump.c:dump_text:29
 tools/z23_gpu_miner.c:hash_meets_target:16
 tools/z23_gpu_miner.c:main:35
-tools/zcc.c:deps_scan:4
 tools/zcc.c:epoch_authority_current:16
 tools/zcc.c:epoch_authority_open:23
 tools/zcc.c:epoch_compile_publish:22
-tools/zcc.c:manifest_verify:6
 tools/zcc.c:plan_build:41
 tools/zcc.c:preprocess:26
 tools/zcc.c:scan_entries:27

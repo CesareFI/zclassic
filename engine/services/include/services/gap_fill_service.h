@@ -158,6 +158,7 @@ void gap_fill_set_dispatch_wake(gap_fill_dispatch_wake_fn fn, void *ctx);
 void gap_fill_test_set_running(bool running);
 bool gap_fill_test_kick_pending(void);
 void gap_fill_test_await_kick_or_tick(void);
+void gap_fill_test_set_stats(const struct gap_fill_stats *stats);
 #endif
 
 #endif /* ZCL_GAP_FILL_SERVICE_H */

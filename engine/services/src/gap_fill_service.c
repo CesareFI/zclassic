@@ -290,6 +290,11 @@ void gap_fill_get_stats(struct gap_fill_stats *out)
     pthread_mutex_unlock(&g_gf.mu);
 }
 
+static int64_t gap_fill_json_u64(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
+
 /* See CLAUDE.md "Adding state introspection". Reentrant-safe: reuses the
  * same lock-guarded snapshot the supervisor heartbeat and RPC/agent paths
  * already read. */
@@ -304,15 +309,15 @@ bool gap_fill_dump_state_json(struct json_value *out, const char *key)
 
     struct gap_fill_stats st;
     gap_fill_get_stats(&st);
-    json_push_kv_int(out, "passes", (int64_t)st.passes);
-    json_push_kv_int(out, "blocks_enqueued", (int64_t)st.blocks_enqueued);
-    json_push_kv_int(out, "passes_idle", (int64_t)st.passes_idle);
+    json_push_kv_int(out, "passes", gap_fill_json_u64(st.passes));
+    json_push_kv_int(out, "blocks_enqueued", gap_fill_json_u64(st.blocks_enqueued));
+    json_push_kv_int(out, "passes_idle", gap_fill_json_u64(st.passes_idle));
     json_push_kv_int(out, "passes_corrupt_walk",
-                     (int64_t)st.passes_corrupt_walk);
-    json_push_kv_int(out, "timeout_sweeps", (int64_t)st.timeout_sweeps);
+                     gap_fill_json_u64(st.passes_corrupt_walk));
+    json_push_kv_int(out, "timeout_sweeps", gap_fill_json_u64(st.timeout_sweeps));
     json_push_kv_int(out, "timeouts_requeued",
-                     (int64_t)st.timeouts_requeued);
-    json_push_kv_int(out, "dispatch_wakes", (int64_t)st.dispatch_wakes);
+                     gap_fill_json_u64(st.timeouts_requeued));
+    json_push_kv_int(out, "dispatch_wakes", gap_fill_json_u64(st.dispatch_wakes));
     json_push_kv_int(out, "last_tip_h", (int64_t)st.last_tip_h);
     json_push_kv_int(out, "last_best_h", (int64_t)st.last_best_h);
     json_push_kv_int(out, "last_window_lo", (int64_t)st.last_window_lo);
@@ -857,6 +862,15 @@ bool gap_fill_test_kick_pending(void)
     bool pending = g_gf.kick_pending;
     pthread_mutex_unlock(&g_gf.mu);
     return pending;
+}
+
+void gap_fill_test_set_stats(const struct gap_fill_stats *stats)
+{
+    if (!stats)
+        return;
+    pthread_mutex_lock(&g_gf.mu);
+    g_gf.stats = *stats;
+    pthread_mutex_unlock(&g_gf.mu);
 }
 
 /* The worker's real wait block, exposed so a test can time the skip. */
