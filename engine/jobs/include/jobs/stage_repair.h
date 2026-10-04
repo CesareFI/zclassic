@@ -13,6 +13,7 @@
 #include "primitives/block.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct sqlite3;
 struct main_state;
@@ -512,6 +513,8 @@ bool stage_reducer_frontier_reconcile_tip_finalize_cursor_for_testing(
     struct sqlite3 *db,
     bool apply,
     struct stage_reducer_frontier_reconcile_result *out);
+
+bool stage_repair_test_cursor_height(int64_t cursor, int *out);
 #endif
 
 #endif /* ZCL_JOBS_STAGE_REPAIR_H */

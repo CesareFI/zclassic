@@ -14,6 +14,7 @@
 #include "storage/progress_store.h"
 #include "util/log_macros.h"
 
+#include <limits.h>
 #include <sqlite3.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -59,6 +60,21 @@ bool stage_repair_read_validate_row(sqlite3 *db, int height,
     return true;
 }
 
+static bool stage_repair_cursor_height(int64_t cursor, int *out)
+{
+    if (!out || cursor < INT_MIN || cursor > INT_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool stage_repair_test_cursor_height(int64_t cursor, int *out)
+{
+    return stage_repair_cursor_height(cursor, out);
+}
+#endif
+
 bool stage_repair_cursor_at_unlocked(sqlite3 *db, const char *name, int *out)
 {
     *out = -1;
@@ -74,7 +90,14 @@ bool stage_repair_cursor_at_unlocked(sqlite3 *db, const char *name, int *out)
     sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
     int rc = sqlite3_step(st);  // raw-sql-ok:progress-kv-kernel-store
     if (rc == SQLITE_ROW) {
-        *out = sqlite3_column_int(st, 0);
+        int64_t cursor = sqlite3_column_int64(st, 0);
+        if (!stage_repair_cursor_height(cursor, out)) {
+            LOG_WARN("stage_repair",
+                     "[stage_repair] cursor out of range stage=%s value=%lld",
+                     name, (long long)cursor);
+            sqlite3_finalize(st);
+            return false;
+        }
     } else if (rc != SQLITE_DONE) {
         LOG_WARN("stage_repair",
                  "[stage_repair] cursor read step failed stage=%s rc=%d: %s",

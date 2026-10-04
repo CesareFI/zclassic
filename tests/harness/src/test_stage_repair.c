@@ -9,6 +9,7 @@
 #include "util/stage.h"
 
 #include <sqlite3.h>
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -254,10 +255,27 @@ static void teardown_case(const char *dir)
     test_cleanup_tmpdir(dir);
 }
 
+static int test_stage_repair_cursor_boundaries(void)
+{
+    int failures = 0;
+    int height = -1;
+
+    STR_CHECK("cursor reader retains ordinary height",
+              stage_repair_test_cursor_height(7, &height) && height == 7);
+    STR_CHECK("cursor reader retains int maximum",
+              stage_repair_test_cursor_height(INT_MAX, &height) &&
+              height == INT_MAX);
+    STR_CHECK("cursor reader rejects malformed high durable value",
+              !stage_repair_test_cursor_height(INT64_MAX, &height));
+    return failures;
+}
+
 int test_stage_repair(void)
 {
     printf("\n=== stage_repair poison-rewind safety guard tests ===\n");
     int failures = 0;
+
+    failures += test_stage_repair_cursor_boundaries();
 
     /* --- Guard 1: ok=1 row AT the frontier refuses the whole rewind. ---
      * This is the regression guard: a finalized (ok=1) row at/above the
