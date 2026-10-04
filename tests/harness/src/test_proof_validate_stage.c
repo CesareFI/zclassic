@@ -48,6 +48,22 @@ static int test_pv_cursor_conversion_bounds(void)
     return failures;
 }
 
+static int test_pv_rearm_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    PV_CHECK("rearm cursor: representable durable height is retained",
+             proof_validate_rearm_test_cursor_height(INT32_MAX, &height) &&
+             height == INT32_MAX);
+    PV_CHECK("rearm cursor: unrepresentable durable heights are refused before scanning",
+             !proof_validate_rearm_test_cursor_height(
+                 (uint64_t)INT32_MAX + 1u, &height) &&
+             !proof_validate_rearm_test_cursor_height(UINT64_C(1) << 32,
+                                                       &height) &&
+             !proof_validate_rearm_test_cursor_height(UINT64_MAX, &height));
+    return failures;
+}
+
 enum pv_fail_kind {
     PV_FAIL_NONE = 0,
     PV_FAIL_SAPLING_SPEND,
@@ -412,6 +428,7 @@ int test_proof_validate_stage(void)
     int failures = 0;
 
     failures += test_pv_cursor_conversion_bounds();
+    failures += test_pv_rearm_cursor_conversion_bounds();
     blocker_module_init();
 
     {

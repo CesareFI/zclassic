@@ -20,6 +20,7 @@
 #include "util/log_macros.h"
 #include "util/stage.h"
 
+#include <limits.h>
 #include <sqlite3.h>
 #include <stdint.h>
 
@@ -36,6 +37,59 @@ finish(struct proof_validate_rearm_report *report,
         report->outcome = outcome;
     return outcome;
 }
+
+static bool pv_rearm_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+struct pv_rearm_cursors {
+    uint64_t pv_raw;
+    uint64_t ua_raw;
+    int pv_height;
+    int ua_floor_height;
+};
+
+static bool pv_rearm_read_cursors(sqlite3 *db, struct pv_rearm_cursors *out)
+{
+    uint64_t tf_cursor = 0;
+    int tf_height = 0;
+    if (!out ||
+        !stage_cursor_read_or_zero(db, STAGE_NAME, STAGE_NAME,
+                                   &out->pv_raw) ||
+        !stage_cursor_read_or_zero(db, UTXO_APPLY_STAGE_NAME, STAGE_NAME,
+                                   &out->ua_raw) ||
+        !stage_cursor_read_or_zero(db, TIP_FINALIZE_STAGE_NAME, STAGE_NAME,
+                                   &tf_cursor)) {
+        LOG_WARN("proof_validate",
+                 "[proof_validate] null-hash re-arm: cursor read failed");
+        return false;
+    }
+    if (!pv_rearm_cursor_height(out->pv_raw, &out->pv_height) ||
+        !pv_rearm_cursor_height(out->ua_raw, &out->ua_floor_height) ||
+        !pv_rearm_cursor_height(tf_cursor, &tf_height)) {
+        LOG_WARN("proof_validate",
+                 "[proof_validate] null-hash re-arm: cursor out of range "
+                 "pv=%llu ua=%llu tip=%llu",
+                 (unsigned long long)out->pv_raw,
+                 (unsigned long long)out->ua_raw,
+                 (unsigned long long)tf_cursor);
+        return false;
+    }
+    if (tf_height < out->ua_floor_height)
+        out->ua_floor_height = tf_height;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool proof_validate_rearm_test_cursor_height(uint64_t cursor, int *out)
+{
+    return pv_rearm_cursor_height(cursor, out);
+}
+#endif
 
 enum proof_validate_rearm_outcome proof_validate_null_hash_rearm(
     sqlite3 *db, const struct recovery_policy *policy,
@@ -66,31 +120,11 @@ enum proof_validate_rearm_outcome proof_validate_null_hash_rearm(
      * tip_finalize lags utxo_apply by up to one block, so flooring at utxo_apply
      * alone leaves the tip_finalize boundary block hashless and it cannot
      * finalize. */
-    uint64_t pv_cursor = 0, ua_cursor = 0, tf_cursor = 0;
-    if (!stage_cursor_read_or_zero(db, STAGE_NAME, STAGE_NAME, &pv_cursor)) {
-        LOG_WARN("proof_validate",
-                 "[proof_validate] null-hash re-arm: pv cursor read failed");
+    struct pv_rearm_cursors cursors;
+    if (!pv_rearm_read_cursors(db, &cursors))
         return finish(report, PV_REARM_ERROR);
-    }
-    if (!stage_cursor_read_or_zero(db, UTXO_APPLY_STAGE_NAME, STAGE_NAME,
-                                   &ua_cursor)) {
-        LOG_WARN("proof_validate",
-                 "[proof_validate] null-hash re-arm: utxo_apply cursor read "
-                 "failed");
-        return finish(report, PV_REARM_ERROR);
-    }
-    if (!stage_cursor_read_or_zero(db, TIP_FINALIZE_STAGE_NAME, STAGE_NAME,
-                                   &tf_cursor)) {
-        LOG_WARN("proof_validate",
-                 "[proof_validate] null-hash re-arm: tip_finalize cursor read "
-                 "failed");
-        return finish(report, PV_REARM_ERROR);
-    }
-    /* The deepest consumer cursor = the lowest of the two; use it as the floor. */
-    if (tf_cursor < ua_cursor)
-        ua_cursor = tf_cursor;
-    report->pv_cursor_before = pv_cursor;
-    report->ua_cursor_floor = ua_cursor;
+    report->pv_cursor_before = cursors.pv_raw;
+    report->ua_cursor_floor = (uint64_t)cursors.ua_floor_height;
 
     /* The pre-stamping artifact predates even the block_hash column on some
      * datadirs (the live canonical node's proof_validate_log has no block_hash
@@ -101,13 +135,13 @@ enum proof_validate_rearm_outcome proof_validate_null_hash_rearm(
         return finish(report, PV_REARM_ERROR);
 
     /* Nothing to re-derive if proof_validate has not led utxo_apply. */
-    if (pv_cursor <= ua_cursor)
+    if (cursors.pv_height <= cursors.ua_floor_height)
         return finish(report, PV_REARM_NOT_NEEDED);
 
     int lowest_null = -1;
     int64_t null_count = 0;
     int scan = proof_validate_log_lowest_null_block_hash(
-        db, (int)ua_cursor, (int)pv_cursor, &lowest_null, &null_count);
+        db, cursors.ua_floor_height, cursors.pv_height, &lowest_null, &null_count);
     if (scan < 0)
         return finish(report, PV_REARM_ERROR);
     if (scan == 0)
@@ -132,15 +166,15 @@ enum proof_validate_rearm_outcome proof_validate_null_hash_rearm(
         policy = &loaded;
     }
     enum policy_decision decision = policy_check_validation_rebind(
-        policy, (int64_t)pv_cursor, (int64_t)lowest_null, REARM_REASON);
+        policy, (int64_t)cursors.pv_height, (int64_t)lowest_null, REARM_REASON);
     if (decision != POLICY_ALLOW) {
         LOG_WARN("proof_validate",
                  "[proof_validate] null-hash re-arm REFUSED (%s): would rewind "
                  "pv cursor %llu -> %d (%lld heights, %lld NULL rows); raise "
                  "ZCL_MAX_VALIDATION_REBIND or ack to authorise after copy proof",
                  policy_decision_name(decision),
-                 (unsigned long long)pv_cursor, lowest_null,
-                 (long long)((int64_t)pv_cursor - lowest_null),
+                 (unsigned long long)cursors.pv_raw, lowest_null,
+                 (long long)((int64_t)cursors.pv_height - lowest_null),
                  (long long)null_count);
         return finish(report, PV_REARM_REFUSED);
     }
@@ -152,7 +186,7 @@ enum proof_validate_rearm_outcome proof_validate_null_hash_rearm(
     if (!stage_set_named_cursor(db, STAGE_NAME, (uint64_t)lowest_null)) {
         LOG_WARN("proof_validate",
                  "[proof_validate] null-hash re-arm: pv cursor rewind %llu -> "
-                 "%d failed", (unsigned long long)pv_cursor, lowest_null);
+                 "%d failed", (unsigned long long)cursors.pv_raw, lowest_null);
         return finish(report, PV_REARM_ERROR);
     }
     report->rewound_to = (uint64_t)lowest_null;
@@ -173,6 +207,6 @@ enum proof_validate_rearm_outcome proof_validate_null_hash_rearm(
              "[proof_validate] null-hash re-arm DONE: pv cursor %llu -> %d, "
              "%lld NULL row(s) deleted; reducer will re-derive + re-stamp "
              "block_hash so utxo_apply can advance",
-             (unsigned long long)pv_cursor, lowest_null, (long long)deleted);
+             (unsigned long long)cursors.pv_raw, lowest_null, (long long)deleted);
     return finish(report, PV_REARM_REARMED);
 }

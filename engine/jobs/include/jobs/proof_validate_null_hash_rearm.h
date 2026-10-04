@@ -72,4 +72,8 @@ enum proof_validate_rearm_outcome proof_validate_null_hash_rearm(
     struct sqlite3 *db, const struct recovery_policy *policy,
     struct proof_validate_rearm_report *report);
 
+#ifdef ZCL_TESTING
+bool proof_validate_rearm_test_cursor_height(uint64_t cursor, int *out);
+#endif
+
 #endif /* ZCL_JOBS_PROOF_VALIDATE_NULL_HASH_REARM_H */
