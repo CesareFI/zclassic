@@ -54,6 +54,8 @@ void body_persist_stage_set_reader(body_persist_reader_fn fn, void *user);
  * 60 s; a test drives it to 0 to assert the naming without sleeping. */
 void body_persist_stage_set_unfetchable_hold_secs_for_testing(int secs);
 bool body_persist_stage_test_cursor_height(uint64_t cursor, int *out);
+bool body_persist_stage_test_hold_expired(int64_t since_mono_us,
+                                          int64_t now_mono_us, int hold_secs);
 #endif
 
 bool body_persist_dump_state_json(struct json_value *out, const char *key);

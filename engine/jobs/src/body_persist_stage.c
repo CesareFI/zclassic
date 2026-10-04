@@ -84,14 +84,15 @@ static _Atomic int64_t  g_last_advance_height = -1;
  * without re-reading, so a repeat COUNT never grows — the hold is invisible:
  * JOB_IDLE, blocked_count 0, nothing in `dumpstate blocker`.
  *
- * So arm a WALL-CLOCK hold instead: remember (height, first requeue time) and,
- * once the HAVE_DATA gate has been idling on that same height for longer than
- * BODY_PERSIST_UNFETCHABLE_HOLD_SECS, NAME it. Cleared on any cursor advance
- * and whenever the stage moves to a different height. */
+ * So arm a monotonic hold: remember (height, first requeue time) and, once the
+ * HAVE_DATA gate has been idling on that same height for longer than
+ * BODY_PERSIST_UNFETCHABLE_HOLD_SECS, NAME it. A civil-clock correction must
+ * not postpone the diagnostic. Cleared on any cursor advance and whenever the
+ * stage moves to a different height. */
 #define BODY_PERSIST_UNFETCHABLE_HOLD_SECS 60
 
 static _Atomic int64_t g_requeue_height = -1;   /* -1 = nothing armed */
-static _Atomic int64_t g_requeue_since_unix = 0;
+static _Atomic int64_t g_requeue_since_mono_us = -1;
 static _Atomic int     g_unfetchable_hold_secs = BODY_PERSIST_UNFETCHABLE_HOLD_SECS;
 
 #ifdef ZCL_TESTING
@@ -118,9 +119,26 @@ static void requeue_hold_arm(int height)
     if (atomic_load(&g_requeue_height) == (int64_t)height)
         return; /* already armed for this height — keep the original clock */
     atomic_store(&g_requeue_height, (int64_t)height);
-    atomic_store(&g_requeue_since_unix, platform_time_wall_unix());
+    atomic_store(&g_requeue_since_mono_us, platform_time_monotonic_us());
     blocker_clear(BODY_UNFETCHABLE_BLOCKER_ID);
 }
+
+static bool requeue_hold_expired(int64_t since_mono_us, int64_t now_mono_us,
+                                 int hold_secs)
+{
+    if (since_mono_us < 0 || now_mono_us < since_mono_us || hold_secs < 0)
+        return false;
+    return now_mono_us - since_mono_us >=
+           (int64_t)hold_secs * INT64_C(1000000);
+}
+
+#ifdef ZCL_TESTING
+bool body_persist_stage_test_hold_expired(int64_t since_mono_us,
+                                          int64_t now_mono_us, int hold_secs)
+{
+    return requeue_hold_expired(since_mono_us, now_mono_us, hold_secs);
+}
+#endif
 
 /* Called from the !BLOCK_HAVE_DATA idle branch. Names the hold once the
  * re-fetch remedy has demonstrably failed to produce a body for this height. */
@@ -128,10 +146,12 @@ static void requeue_hold_note_idle(int height, int tip_height)
 {
     if (atomic_load(&g_requeue_height) != (int64_t)height)
         return;
-    int64_t since = atomic_load(&g_requeue_since_unix);
-    int64_t now = platform_time_wall_unix();
-    if (since <= 0 || now - since < (int64_t)atomic_load(&g_unfetchable_hold_secs))
+    int64_t since = atomic_load(&g_requeue_since_mono_us);
+    int64_t now = platform_time_monotonic_us();
+    int hold_secs = atomic_load(&g_unfetchable_hold_secs);
+    if (!requeue_hold_expired(since, now, hold_secs))
         return;
+    int64_t elapsed_secs = (now - since) / INT64_C(1000000);
 
     char reason[BLOCKER_REASON_MAX];
     if (height == 0)
@@ -139,13 +159,13 @@ static void requeue_hold_note_idle(int height, int tip_height)
                  "height=0 genesis body absent; body_persist held %llds. "
                  "The boot genesis anchor seed did not run or its integrity "
                  "gate refused the seed",
-                 (long long)(now - since));
+                 (long long)elapsed_secs);
     else
         snprintf(reason, sizeof(reason),
                  "height=%d body refetch pending %llds, tip=%d; the header "
                  "queue cannot request at/below tip; inspect blk*.dat and "
                  "the block_index position",
-                 height, (long long)(now - since), tip_height);
+                 height, (long long)elapsed_secs, tip_height);
 
     struct blocker_record rec;
     int set_rc = -1;
@@ -156,7 +176,7 @@ static void requeue_hold_note_idle(int height, int tip_height)
         LOG_WARN(STAGE_NAME,
                  "[body_persist] body re-fetch has not produced a body for "
                  "height=%d in %llds — holding cursor, see blocker %s",
-                 height, (long long)(now - since),
+                 height, (long long)elapsed_secs,
                  BODY_UNFETCHABLE_BLOCKER_ID);
 }
 
