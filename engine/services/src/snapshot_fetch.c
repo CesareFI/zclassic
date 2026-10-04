@@ -36,6 +36,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 
 /* Snapshot values are serialized as eight unsigned little-endian bytes, but
  * the staging model stores a signed CAmount. Decode without signed shifts,
@@ -56,10 +57,30 @@ static bool snapsync_decode_money(const uint8_t bytes[8], int64_t *out)
     return true;
 }
 
+static bool snapsync_decode_height(const uint8_t bytes[4], int *out)
+{
+    if (!bytes || !out)
+        return false;
+
+    uint32_t height = 0;
+    for (size_t i = 0; i < 4; i++)
+        height |= (uint32_t)bytes[i] << (i * 8);
+    if (height > INT_MAX)
+        return false;
+
+    *out = (int)height;
+    return true;
+}
+
 #ifdef ZCL_TESTING
 bool snapsync_test_decode_money(const uint8_t bytes[8], int64_t *out)
 {
     return snapsync_decode_money(bytes, out);
+}
+
+bool snapsync_test_decode_height(const uint8_t bytes[4], int *out)
+{
+    return snapsync_decode_height(bytes, out);
 }
 #endif
 
@@ -311,75 +332,91 @@ bool snapsync_rollback_receive_write_internal(struct node_db *ndb, void *ctx)
     return node_db_rollback(ndb);
 }
 
-static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
-                                      const uint8_t *chunk_data,
-                                      size_t chunk_len)
+static bool snapsync_apply_chunk_entry(struct snapshot_sync_service *svc,
+                                       const uint8_t *chunk_data,
+                                       size_t chunk_len, size_t *pos,
+                                       uint32_t entry)
 {
-    size_t pos = 4;
-    int applied = 0;
-    uint32_t entries;
+    size_t at = *pos;
+    if (at + 48 > chunk_len)
+        LOG_FAIL("snapshot_sync",
+                 "apply_chunk: truncated entry %u at pos %zu (need 48, have %zu)",
+                 entry, at, chunk_len);
+
+    struct db_utxo u;
+    memset(&u, 0, sizeof(u));
+    memcpy(u.txid, chunk_data + at, 32);
+    at += 32;
+
+    u.vout = (uint32_t)(chunk_data[at] | (chunk_data[at + 1] << 8) |
+                        (chunk_data[at + 2] << 16) |
+                        (chunk_data[at + 3] << 24));
+    at += 4;
+
+    if (!snapsync_decode_money(chunk_data + at, &u.value))
+        LOG_FAIL("snapshot_sync",
+                 "apply_chunk: value outside money range entry %u", entry);
+    at += 8;
+
+    if (!snapsync_decode_height(chunk_data + at, &u.height))
+        LOG_FAIL("snapshot_sync",
+                 "apply_chunk: height outside int range entry %u", entry);
+    at += 4;
+
+    if (at >= chunk_len)
+        LOG_FAIL("snapshot_sync",
+                 "apply_chunk: truncated at coinbase flag, entry %u pos %zu",
+                 entry, at);
+    u.is_coinbase = (chunk_data[at++] != 0);
+
+    if (at >= chunk_len)
+        LOG_FAIL("snapshot_sync",
+                 "apply_chunk: truncated at script varint, entry %u pos %zu",
+                 entry, at);
+    uint64_t slen = chunk_data[at++];
+    if (slen == 253) {
+        if (at + 2 > chunk_len)
+            LOG_FAIL("snapshot_sync",
+                     "apply_chunk: truncated at 2-byte varint, entry %u pos %zu",
+                     entry, at);
+        slen = chunk_data[at] | (chunk_data[at + 1] << 8);
+        at += 2;
+    } else if (slen == 254) {
+        if (at + 4 > chunk_len)
+            LOG_FAIL("snapshot_sync",
+                     "apply_chunk: truncated at 4-byte varint, entry %u pos %zu",
+                     entry, at);
+        slen = chunk_data[at] | ((uint32_t)chunk_data[at + 1] << 8) |
+               ((uint32_t)chunk_data[at + 2] << 16) |
+               ((uint32_t)chunk_data[at + 3] << 24);
+        at += 4;
+    }
+    if (at + slen > chunk_len)
+        LOG_FAIL("snapshot_sync",
+                 "apply_chunk: script overflows chunk, entry %u pos %zu slen %llu",
+                 entry, at, (unsigned long long)slen);
+
+    u.script = (uint8_t *)(chunk_data + at);
+    u.script_len = (size_t)slen;
+    at += slen;
+    u.script_type = utxo_classify_script(u.script, u.script_len,
+                                         u.address_hash, &u.has_address);
+    if (!snapsync_insert_staging_raw(svc->ndb, &u))
+        LOG_FAIL("snapshot_sync",
+                 "apply_chunk: staging insert failed at entry %u vout=%u",
+                 entry, u.vout);
+
+    *pos = at;
+    return true;
+}
+
+static int snapsync_record_chunk_progress(struct snapshot_sync_service *svc,
+                                          int applied)
+{
     bool commit_batch = false;
     uint32_t serving_peer_id = 0;
     uint64_t offered_count = 0;
     uint64_t received = 0;
-
-    if (!svc || !svc->ndb || !svc->ndb->open || !chunk_data || chunk_len < 4)
-        LOG_ERR("snapshot_sync", "apply_chunk: invalid args svc=%p chunk=%p len=%zu",
-                (void*)svc, (void*)chunk_data, chunk_len);
-
-    entries = chunk_data[0] | ((uint32_t)chunk_data[1] << 8) |
-              ((uint32_t)chunk_data[2] << 16) | ((uint32_t)chunk_data[3] << 24);
-    if (entries == 0 || entries > 1000)
-        LOG_ERR("snapshot_sync", "apply_chunk: bad entry count %u", entries);
-
-    for (uint32_t i = 0; i < entries; i++) {
-        if (pos + 48 > chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated entry %u at pos %zu (need 48, have %zu)", i, pos, chunk_len);
-
-        struct db_utxo u;
-        memset(&u, 0, sizeof(u));
-        memcpy(u.txid, chunk_data + pos, 32); pos += 32;
-
-        u.vout = (uint32_t)(chunk_data[pos] | (chunk_data[pos+1] << 8) |
-                  (chunk_data[pos+2] << 16) | (chunk_data[pos+3] << 24));
-        pos += 4;
-
-        if (!snapsync_decode_money(chunk_data + pos, &u.value))
-            LOG_ERR("snapshot_sync",
-                    "apply_chunk: value outside money range entry %u", i);
-        pos += 8;
-
-        u.height = (int)(chunk_data[pos] | (chunk_data[pos+1] << 8) |
-                    (chunk_data[pos+2] << 16) | (chunk_data[pos+3] << 24));
-        pos += 4;
-
-        if (pos >= chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated at coinbase flag, entry %u pos %zu", i, pos);
-        u.is_coinbase = (chunk_data[pos++] != 0);
-
-        if (pos >= chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated at script varint, entry %u pos %zu", i, pos);
-        uint64_t slen = chunk_data[pos++];
-        if (slen == 253) {
-            if (pos + 2 > chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated at 2-byte varint, entry %u pos %zu", i, pos);
-            slen = chunk_data[pos] | (chunk_data[pos+1] << 8);
-            pos += 2;
-        } else if (slen == 254) {
-            if (pos + 4 > chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated at 4-byte varint, entry %u pos %zu", i, pos);
-            slen = chunk_data[pos] | ((uint32_t)chunk_data[pos+1] << 8) |
-                   ((uint32_t)chunk_data[pos+2] << 16) | ((uint32_t)chunk_data[pos+3] << 24);
-            pos += 4;
-        }
-        if (pos + slen > chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: script overflows chunk, entry %u pos %zu slen %llu", i, pos, (unsigned long long)slen);
-
-        u.script = (uint8_t *)(chunk_data + pos);
-        u.script_len = (size_t)slen;
-        pos += slen;
-
-        u.script_type = utxo_classify_script(u.script, u.script_len,
-                                             u.address_hash, &u.has_address);
-
-        if (!snapsync_insert_staging_raw(svc->ndb, &u))
-            LOG_ERR("snapshot_sync", "apply_chunk: staging insert failed at entry %u vout=%u", i, u.vout);
-        applied++;
-    }
 
     snapsync_service_lock_internal();
     if (svc->state != SNAPSYNC_RECEIVING) {
@@ -398,17 +435,47 @@ static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
     }
     snapsync_service_unlock_internal();
 
-    if (commit_batch) {
-        if (!node_db_commit(svc->ndb) || !node_db_begin(svc->ndb))
-            LOG_ERR("snapshot_sync", "apply_chunk: batch commit/begin failed at %llu UTXOs", (unsigned long long)received);
+    if (!commit_batch)
+        return 1;
 
-        double elapsed_s = (double)(snapsync_now_us_internal() - svc->start_time_us) / 1000000.0;
-        double rate = elapsed_s > 0 ? (double)received / elapsed_s : 0;
-        event_emitf(EV_SNAPSYNC_PROGRESS, serving_peer_id,
-                    "received=%llu/%llu rate=%.0f/s",
-                    (unsigned long long)received,
-                    (unsigned long long)offered_count, rate);
+    if (!node_db_commit(svc->ndb) || !node_db_begin(svc->ndb))
+        LOG_ERR("snapshot_sync", "apply_chunk: batch commit/begin failed at %llu UTXOs", (unsigned long long)received);
+
+    double elapsed_s = (double)(snapsync_now_us_internal() - svc->start_time_us) / 1000000.0;
+    double rate = elapsed_s > 0 ? (double)received / elapsed_s : 0;
+    event_emitf(EV_SNAPSYNC_PROGRESS, serving_peer_id,
+                "received=%llu/%llu rate=%.0f/s",
+                (unsigned long long)received,
+                (unsigned long long)offered_count, rate);
+    return 1;
+}
+
+static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
+                                      const uint8_t *chunk_data,
+                                      size_t chunk_len)
+{
+    size_t pos = 4;
+    int applied = 0;
+    uint32_t entries;
+
+    if (!svc || !svc->ndb || !svc->ndb->open || !chunk_data || chunk_len < 4)
+        LOG_ERR("snapshot_sync", "apply_chunk: invalid args svc=%p chunk=%p len=%zu",
+                (void*)svc, (void*)chunk_data, chunk_len);
+
+    entries = chunk_data[0] | ((uint32_t)chunk_data[1] << 8) |
+              ((uint32_t)chunk_data[2] << 16) | ((uint32_t)chunk_data[3] << 24);
+    if (entries == 0 || entries > 1000)
+        LOG_ERR("snapshot_sync", "apply_chunk: bad entry count %u", entries);
+
+    for (uint32_t i = 0; i < entries; i++) {
+        if (!snapsync_apply_chunk_entry(svc, chunk_data, chunk_len, &pos, i))
+            return -1;
+        applied++;
     }
+
+    int progress = snapsync_record_chunk_progress(svc, applied);
+    if (progress <= 0)
+        return progress;
 
     return applied;
 }
