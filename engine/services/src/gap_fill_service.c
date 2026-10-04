@@ -68,6 +68,32 @@ static struct gap_fill_state g_gf = {
 };
 
 static struct liveness_contract g_gap_fill_contract;
+static pthread_once_t g_gap_fill_wait_once = PTHREAD_ONCE_INIT;
+static pthread_cond_t g_gap_fill_monotonic_cv;
+static bool g_gap_fill_wait_uses_monotonic;
+
+/* The refill period is an operational deadline, not a wall-time promise.
+ * Linux exposes CLOCK_MONOTONIC condition variables, so an NTP/manual wall
+ * rollback cannot make an otherwise idle gap-fill worker sleep until wall
+ * time catches up. Platforms without that POSIX extension retain the prior
+ * condition-clock behavior rather than emulating a wake loop with polling. */
+static void gap_fill_wait_init_once(void)
+{
+    pthread_condattr_t attr;
+    bool attr_ready = pthread_condattr_init(&attr) == 0;
+#if defined(__linux__)
+    if (attr_ready && pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0 &&
+        pthread_cond_init(&g_gap_fill_monotonic_cv, &attr) == 0)
+        g_gap_fill_wait_uses_monotonic = true;
+#endif
+    if (attr_ready)
+        (void)pthread_condattr_destroy(&attr);
+}
+
+static void gap_fill_wait_init(void)
+{
+    (void)pthread_once(&g_gap_fill_wait_once, gap_fill_wait_init_once);
+}
 
 static void gap_fill_stat_add(uint64_t *stat, uint64_t add)
 {
@@ -674,12 +700,18 @@ static void gap_fill_burst_heartbeat(void *ctx)
  * completion can never be lost to the timer. */
 static void gap_fill_await_kick_or_tick(void)
 {
+    gap_fill_wait_init();
     pthread_mutex_lock(&g_gf.mu);
     if (!atomic_load(&g_gf.stop_requested) && !g_gf.kick_pending) {
         struct timespec until;
-        platform_time_realtime_timespec(&until);
+        if (g_gap_fill_wait_uses_monotonic)
+            (void)platform_time_monotonic_timespec(&until);
+        else
+            (void)platform_time_realtime_timespec(&until);
         until.tv_sec += GAPFILL_TICK_SECS;
-        pthread_cond_timedwait(&g_gf.cv, &g_gf.mu, &until);
+        pthread_cond_t *cv = g_gap_fill_wait_uses_monotonic
+            ? &g_gap_fill_monotonic_cv : &g_gf.cv;
+        pthread_cond_timedwait(cv, &g_gf.mu, &until);
     } else if (g_gf.kick_pending && !atomic_load(&g_gf.stop_requested)) {
         gap_fill_stat_add(&g_gf.stats.kick_latch_skips, 1);
     }
@@ -753,6 +785,7 @@ struct zcl_result gap_fill_start(struct main_state *ms, struct download_manager 
     if (!ms || !dm)
         return ZCL_ERR(-1, "start: null ms or dm");
     if (atomic_load(&g_gf.running)) return ZCL_OK;
+    gap_fill_wait_init();
     g_gf.ms = ms;
     g_gf.dm = dm;
     memset(&g_gf.stats, 0, sizeof(g_gf.stats));
@@ -806,8 +839,10 @@ void gap_fill_stop(void)
     if (id != SUPERVISOR_INVALID_ID)
         supervisor_set_deadline(id, 0);
     atomic_store(&g_gf.stop_requested, true);
+    gap_fill_wait_init();
     pthread_mutex_lock(&g_gf.mu);
-    pthread_cond_broadcast(&g_gf.cv);
+    pthread_cond_broadcast(g_gap_fill_wait_uses_monotonic
+                               ? &g_gap_fill_monotonic_cv : &g_gf.cv);
     pthread_mutex_unlock(&g_gf.mu);
     if (g_gf.thread_started) {
         /* Five seconds is a diagnostic deadline. Retain ownership until the
@@ -846,9 +881,11 @@ void gap_fill_stop(void)
 void gap_fill_kick(void)
 {
     if (!atomic_load(&g_gf.running)) return;
+    gap_fill_wait_init();
     pthread_mutex_lock(&g_gf.mu);
     g_gf.kick_pending = true;
-    pthread_cond_broadcast(&g_gf.cv);
+    pthread_cond_broadcast(g_gap_fill_wait_uses_monotonic
+                               ? &g_gap_fill_monotonic_cv : &g_gf.cv);
     pthread_mutex_unlock(&g_gf.mu);
 }
 
@@ -898,6 +935,12 @@ int64_t gap_fill_test_progress_marker(void)
 void gap_fill_test_await_kick_or_tick(void)
 {
     gap_fill_await_kick_or_tick();
+}
+
+bool gap_fill_test_wait_uses_monotonic_clock(void)
+{
+    gap_fill_wait_init();
+    return g_gap_fill_wait_uses_monotonic;
 }
 #endif
 

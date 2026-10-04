@@ -1216,6 +1216,22 @@ static int test_gap_fill_kick_latch_skips_wait(void)
     return failures;
 }
 
+static int test_gap_fill_wait_clock_is_monotonic(void)
+{
+    int failures = 0;
+    TEST("gap_fill wait: Linux refill cadence ignores wall-clock rollback") {
+#if defined(__linux__)
+        /* This reads the clock selected by the production condition object,
+         * not a helper-only arithmetic calculation. The prior realtime
+         * condition made a backward wall correction extend the periodic
+         * body-gap wait until wall time caught up. */
+        ASSERT(gap_fill_test_wait_uses_monotonic_clock());
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_gap_fill_queued_idle_wakes_dispatcher(void)
 {
     int failures = 0;
@@ -2029,6 +2045,7 @@ int test_download(void)
     failures += test_gap_fill_timeout_sweep();
     failures += test_gap_fill_timeout_wakes_dispatcher();
     failures += test_gap_fill_kick_latch_skips_wait();
+    failures += test_gap_fill_wait_clock_is_monotonic();
     failures += test_gap_fill_queued_idle_wakes_dispatcher();
     failures += test_dl_many_insertions();
     failures += test_dl_ibd_windows();

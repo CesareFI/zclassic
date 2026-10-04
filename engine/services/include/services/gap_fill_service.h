@@ -158,6 +158,7 @@ void gap_fill_set_dispatch_wake(gap_fill_dispatch_wake_fn fn, void *ctx);
 void gap_fill_test_set_running(bool running);
 bool gap_fill_test_kick_pending(void);
 void gap_fill_test_await_kick_or_tick(void);
+bool gap_fill_test_wait_uses_monotonic_clock(void);
 void gap_fill_test_set_stats(const struct gap_fill_stats *stats);
 void gap_fill_test_add_stats(uint64_t enqueue_add, uint64_t timeout_add);
 int64_t gap_fill_test_progress_marker(void);
