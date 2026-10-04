@@ -65,6 +65,7 @@ static pthread_cond_t g_monotonic_cv;
 static bool g_wait_uses_monotonic;
 static pthread_t g_thread;
 static bool      g_thread_started = false;
+static bool      g_starting = false;      /* under g_mu */
 static bool      g_running = false;       /* under g_mu */
 static bool      g_stop = false;          /* under g_mu */
 static _Atomic bool g_running_fast = false;
@@ -110,6 +111,17 @@ static pthread_cond_t *bp_wait_cv(void)
 {
     bp_wait_init();
     return g_wait_uses_monotonic ? &g_monotonic_cv : &g_cv;
+}
+
+/* Claim the spawn-to-publish interval before dropping g_mu. A concurrent
+ * start must not create a second worker, and stop waits for this transition
+ * to publish either a joinable worker or a failed start. */
+static bool bp_start_claim_locked(void)
+{
+    if (g_running || g_starting)
+        return false;
+    g_starting = true;
+    return true;
 }
 
 /* A reorg can move the cursor back while the old frontier still lies inside
@@ -471,9 +483,9 @@ bool block_prefetch_start(const char *datadir,
     bp_wait_init();
 
     pthread_mutex_lock(&g_mu);
-    if (g_running) {
+    if (!bp_start_claim_locked()) {
         pthread_mutex_unlock(&g_mu);
-        LOG_WARN("block_prefetch", "[block_prefetch] start: already running");
+        LOG_WARN("block_prefetch", "[block_prefetch] start: already starting or running");
         return false;
     }
     g_cfg = local;
@@ -529,13 +541,17 @@ bool block_prefetch_start(const char *datadir,
         pthread_mutex_lock(&g_mu);
         g_cursor_fn = NULL;
         g_pos_fn = NULL;
+        g_starting = false;
+        pthread_cond_broadcast(&g_cv);
         pthread_mutex_unlock(&g_mu);
         return false;
     }
     pthread_mutex_lock(&g_mu);
     g_thread_started = true;
     g_running = true;
+    g_starting = false;
     atomic_store_explicit(&g_running_fast, true, memory_order_release);
+    pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
     LOG_INFO("block_prefetch",
              "[block_prefetch] started (window=%d lead=%d lru_budget=%zuB)",
@@ -546,6 +562,8 @@ bool block_prefetch_start(const char *datadir,
 void block_prefetch_stop(void)
 {
     pthread_mutex_lock(&g_mu);
+    while (g_starting)
+        (void)pthread_cond_wait(&g_cv, &g_mu);
     bool was_running = g_running;
     if (was_running) {
         g_stop = true;
@@ -657,6 +675,21 @@ bool block_prefetch_test_rewind_resets_frontier(void)
     g_last_cursor = saved_cursor;
     pthread_mutex_unlock(&g_mu);
     return reset;
+}
+
+bool block_prefetch_test_start_claim_is_exclusive(void)
+{
+    pthread_mutex_lock(&g_mu);
+    bool saved_starting = g_starting;
+    bool saved_running = g_running;
+    g_starting = false;
+    g_running = false;
+    bool first = bp_start_claim_locked();
+    bool second = bp_start_claim_locked();
+    g_starting = saved_starting;
+    g_running = saved_running;
+    pthread_mutex_unlock(&g_mu);
+    return first && !second;
 }
 #endif
 

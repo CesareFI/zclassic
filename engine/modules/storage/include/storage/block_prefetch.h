@@ -123,6 +123,7 @@ bool block_prefetch_dump_state_json(struct json_value *out, const char *key);
 /* Exposes the clock selected by the worker's actual condition variable. */
 bool block_prefetch_test_wait_uses_monotonic_clock(void);
 bool block_prefetch_test_rewind_resets_frontier(void);
+bool block_prefetch_test_start_claim_is_exclusive(void);
 #endif
 
 #endif /* ZCL_STORAGE_BLOCK_PREFETCH_H */

@@ -207,6 +207,19 @@ static int t_reorg_rewinds_frontier(void)
     return failures;
 }
 
+static int t_start_claim_is_exclusive(void)
+{
+    int failures = 0;
+    block_prefetch_stop();
+    TEST_CASE("lifecycle: a pending start excludes a second worker claim") {
+        /* This reaches the exact production transition used before spawning
+         * the worker. The old running-only guard admitted a second caller
+         * while the first had spawned but not yet published its worker. */
+        ASSERT(block_prefetch_test_start_claim_is_exclusive());
+    } TEST_END
+    return failures;
+}
+
 /* ── Test: disabled config is a benign no-op ────────────────────────────── */
 static int t_disabled_noop(void)
 {
@@ -441,6 +454,7 @@ int test_block_prefetch(void)
     int failures = 0;
     failures += t_idle_wait_uses_monotonic_clock();
     failures += t_reorg_rewinds_frontier();
+    failures += t_start_claim_is_exclusive();
     failures += t_disabled_noop();
     failures += t_lifecycle();
     failures += t_bounded_memory();
