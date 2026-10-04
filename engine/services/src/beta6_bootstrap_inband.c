@@ -39,6 +39,7 @@
 #include "base/log_macros.h"
 #include "base/safe_alloc.h"
 #include "platform/clock.h"
+#include "util/sync.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,6 +60,18 @@ static char s_params_dir[4096];
 static unsigned char *s_manifest_bytes;
 static size_t s_manifest_len;
 static bool s_ready;
+static zcl_mutex_t s_inband_lock;
+static zcl_once_t s_inband_lock_once = ZCL_ONCE_INIT;
+
+static void inband_lock_init(void)
+{
+    zcl_mutex_init(&s_inband_lock);
+}
+
+static void inband_lock_init_once(void)
+{
+    (void)zcl_once_call(&s_inband_lock_once, inband_lock_init);
+}
 
 /* ── framing ─────────────────────────────────────────────────────────── */
 
@@ -254,7 +267,11 @@ struct zcl_result beta6_bs_inband_serve(struct msg_processor *mp, struct p2p_nod
 
 struct zcl_result beta6_bs_inband_status(void)
 {
-    if (!s_ready)
+    inband_lock_init_once();
+    LOCK(s_inband_lock);
+    bool ready = s_ready;
+    UNLOCK(s_inband_lock);
+    if (!ready)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "the beta6 in-band bootstrap manifest is not cached");
     return beta6_bs_status();
@@ -262,10 +279,15 @@ struct zcl_result beta6_bs_inband_status(void)
 
 struct zcl_result beta6_bs_inband_params_status(void)
 {
-    if (!s_ready)
+    inband_lock_init_once();
+    LOCK(s_inband_lock);
+    bool ready = s_ready;
+    bool has_params = s_params_dir[0] != '\0';
+    UNLOCK(s_inband_lock);
+    if (!ready)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "beta6 in-band seam is not armed");
-    if (s_params_dir[0] == '\0')
+    if (!has_params)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "armed without -paramsdir: getbspman is answered "
                        "with a reject");
@@ -293,28 +315,37 @@ struct zcl_result beta6_bs_inband_arm(const char *network, const char *params_di
                        "one P2P message",
                        out.size);
     }
-    s_manifest_bytes = zcl_malloc(out.size, "beta6 inband manifest");
-    if (!s_manifest_bytes) {
+    unsigned char *manifest_bytes = zcl_malloc(out.size, "beta6 inband manifest");
+    if (!manifest_bytes) {
         stream_free(&out);
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "out of memory encoding the beta6 bootstrap manifest");
     }
-    memcpy(s_manifest_bytes, out.data, out.size);
-    s_manifest_len = out.size;
+    memcpy(manifest_bytes, out.data, out.size);
+    size_t manifest_len = out.size;
     stream_free(&out);
 
+    inband_lock_init_once();
+    LOCK(s_inband_lock);
+    free(s_manifest_bytes);
+    s_manifest_bytes = manifest_bytes;
+    s_manifest_len = manifest_len;
     snprintf(s_network, sizeof(s_network), "%s", network ? network : "");
     snprintf(s_params_dir, sizeof(s_params_dir), "%s", params_dir ? params_dir : "");
     s_ready = true;
+    UNLOCK(s_inband_lock);
     return ZCL_OK;
 }
 
 void beta6_bs_inband_disarm(void)
 {
+    inband_lock_init_once();
+    LOCK(s_inband_lock);
     s_ready = false;
     free(s_manifest_bytes);
     s_manifest_bytes = NULL;
     s_manifest_len = 0;
     s_network[0] = '\0';
     s_params_dir[0] = '\0';
+    UNLOCK(s_inband_lock);
 }

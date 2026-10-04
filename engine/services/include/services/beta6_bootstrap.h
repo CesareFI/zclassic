@@ -169,6 +169,17 @@ struct zcl_result beta6_bs_arm(const char *source_dir, const char *network);
 void beta6_bs_disarm(void);
 /* ok while a snapshot is armed; otherwise a named refusal. */
 struct zcl_result beta6_bs_status(void);
+/* Copy the operator-visible armed state while the serve lock is held.  The
+ * snapshot owns no manifest storage, so it remains valid across disarm. */
+struct beta6_bs_status_snapshot {
+    bool armed;
+    char source_dir[4096];
+    int32_t manifest_version;
+    int32_t manifest_height;
+    size_t manifest_files;
+    uint64_t manifest_bytes;
+};
+void beta6_bs_status_snapshot(struct beta6_bs_status_snapshot *out);
 /* The armed source directory, or "" when disarmed. */
 const char *beta6_bs_source_dir(void);
 /* The cached manifest, or NULL when disarmed. Immutable while armed. */

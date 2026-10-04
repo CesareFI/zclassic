@@ -32,7 +32,9 @@
 #include "net/version.h"
 #include "util/sync.h"
 
+#include <pthread.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -169,6 +171,52 @@ static bool fixture_build(const char *dir)
            fixture_write(dir, "chainstate/000007.ldb", 20) &&
            fixture_anchor(dir, "3126937 00000663e40f1fe0bc32a7e7282fac25de5fe8ec"
                                "efd9c627e2fd948d388f7053");
+}
+
+struct bootstrap_status_hammer {
+    const char *source_dir;
+    pthread_barrier_t start;
+    atomic_bool failed;
+};
+
+static bool snapshot_is_armed_fixture(const struct beta6_bs_status_snapshot *snapshot,
+                                      const char *source_dir)
+{
+    return snapshot->armed && strcmp(snapshot->source_dir, source_dir) == 0 &&
+           snapshot->manifest_version == 1 && snapshot->manifest_height == 3126937 &&
+           snapshot->manifest_files == 3 && snapshot->manifest_bytes == 70;
+}
+
+static void *bootstrap_status_arm_disarm(void *opaque)
+{
+    struct bootstrap_status_hammer *hammer = opaque;
+    (void)pthread_barrier_wait(&hammer->start);
+    for (int i = 0; i < 128; i++) {
+        if (!beta6_bs_arm(hammer->source_dir, "main").ok ||
+            !beta6_bs_inband_arm("main", "").ok) {
+            atomic_store(&hammer->failed, true);
+            break;
+        }
+        beta6_bs_inband_disarm();
+        beta6_bs_disarm();
+    }
+    return NULL;
+}
+
+static void *bootstrap_status_observe(void *opaque)
+{
+    struct bootstrap_status_hammer *hammer = opaque;
+    (void)pthread_barrier_wait(&hammer->start);
+    for (int i = 0; i < 4096; i++) {
+        struct beta6_bs_status_snapshot snapshot;
+        beta6_bs_status_snapshot(&snapshot);
+        if (snapshot.armed && !snapshot_is_armed_fixture(&snapshot, hammer->source_dir)) {
+            atomic_store(&hammer->failed, true);
+            break;
+        }
+        (void)beta6_bs_inband_status();
+    }
+    return NULL;
 }
 
 /* ── in-band seam fixtures ───────────────────────────────────────────
@@ -474,6 +522,60 @@ int test_beta6_bootstrap(void)
         ASSERT(!unaligned.ok);
         ASSERT(strstr(unaligned.message, "not aligned") != NULL);
 
+        beta6_bs_disarm();
+        test_rm_rf(dir);
+        PASS();
+    }
+
+    TEST("status snapshot owns no manifest storage across disarm") {
+        char dir[512];
+        test_make_tmpdir(dir, sizeof(dir), "beta6_bootstrap", "snapshot");
+        ASSERT(fixture_build(dir));
+        ASSERT(beta6_bs_arm(dir, "main").ok);
+
+        struct beta6_bs_status_snapshot snapshot;
+        beta6_bs_status_snapshot(&snapshot);
+        ASSERT(snapshot.armed);
+        ASSERT_STR_EQ(snapshot.source_dir, dir);
+        ASSERT_EQ(snapshot.manifest_version, 1);
+        ASSERT_EQ(snapshot.manifest_height, 3126937);
+        ASSERT_EQ((int)snapshot.manifest_files, 3);
+        ASSERT_EQ((int)snapshot.manifest_bytes, 70);
+
+        beta6_bs_disarm();
+        ASSERT(snapshot.armed);
+        ASSERT_STR_EQ(snapshot.source_dir, dir);
+        ASSERT_EQ(snapshot.manifest_height, 3126937);
+        struct beta6_bs_status_snapshot disarmed;
+        beta6_bs_status_snapshot(&disarmed);
+        ASSERT(!disarmed.armed);
+        ASSERT_STR_EQ(disarmed.source_dir, "");
+        ASSERT_EQ(disarmed.manifest_height, -1);
+        ASSERT_EQ((int)disarmed.manifest_files, 0);
+        test_rm_rf(dir);
+        PASS();
+    }
+
+    TEST("status snapshots stay coherent while bootstrap serving is torn down") {
+        char dir[512];
+        struct bootstrap_status_hammer hammer = {0};
+        pthread_t arm_disarm;
+        pthread_t observe;
+
+        beta6_bs_inband_disarm();
+        beta6_bs_disarm();
+        test_make_tmpdir(dir, sizeof(dir), "beta6_bootstrap", "status_hammer");
+        ASSERT(fixture_build(dir));
+        hammer.source_dir = dir;
+        ASSERT_EQ(pthread_barrier_init(&hammer.start, NULL, 2), 0);
+        ASSERT_EQ(pthread_create(&arm_disarm, NULL, bootstrap_status_arm_disarm,
+                                 &hammer), 0);
+        ASSERT_EQ(pthread_create(&observe, NULL, bootstrap_status_observe, &hammer), 0);
+        ASSERT_EQ(pthread_join(arm_disarm, NULL), 0);
+        ASSERT_EQ(pthread_join(observe, NULL), 0);
+        ASSERT(!atomic_load(&hammer.failed));
+        ASSERT_EQ(pthread_barrier_destroy(&hammer.start), 0);
+        beta6_bs_inband_disarm();
         beta6_bs_disarm();
         test_rm_rf(dir);
         PASS();

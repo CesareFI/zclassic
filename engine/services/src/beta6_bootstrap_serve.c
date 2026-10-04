@@ -22,17 +22,19 @@
 #include <string.h>
 
 static zcl_mutex_t g_serve_lock;
-static bool g_serve_lock_ready;
+static zcl_once_t g_serve_lock_once = ZCL_ONCE_INIT;
 static bool g_armed;
 static char g_source_dir[4096];
 static struct beta6_bs_manifest g_manifest;
 
+static void serve_lock_init(void)
+{
+    zcl_mutex_init(&g_serve_lock);
+}
+
 static void serve_lock_init_once(void)
 {
-    if (!g_serve_lock_ready) {
-        zcl_mutex_init(&g_serve_lock);
-        g_serve_lock_ready = true;
-    }
+    (void)zcl_once_call(&g_serve_lock_once, serve_lock_init);
 }
 
 /* Decide which manifest version this serve directory publishes, and fill the
@@ -222,11 +224,34 @@ void beta6_bs_disarm(void)
 
 struct zcl_result beta6_bs_status(void)
 {
-    if (!g_armed)
+    serve_lock_init_once();
+    LOCK(g_serve_lock);
+    bool armed = g_armed;
+    UNLOCK(g_serve_lock);
+    if (!armed)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "the beta6 bootstrap snapshot service is not armed; set "
                        "-beta6-bootstrap-source");
     return ZCL_OK;
+}
+
+void beta6_bs_status_snapshot(struct beta6_bs_status_snapshot *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    out->manifest_height = -1;
+    serve_lock_init_once();
+    LOCK(g_serve_lock);
+    out->armed = g_armed;
+    if (g_armed) {
+        snprintf(out->source_dir, sizeof(out->source_dir), "%s", g_source_dir);
+        out->manifest_version = g_manifest.version;
+        out->manifest_height = g_manifest.height;
+        out->manifest_files = g_manifest.file_count;
+        out->manifest_bytes = g_manifest.snapshot_bytes;
+    }
+    UNLOCK(g_serve_lock);
 }
 
 const char *beta6_bs_source_dir(void)
