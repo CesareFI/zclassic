@@ -11,6 +11,7 @@
 #include "sync/sync_state.h"
 #include "util/blocker.h"
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 
@@ -44,6 +45,12 @@ static _Atomic int g_test_remedy_calls;
 static bool download_work_pending(uint64_t inflight, uint64_t queued)
 {
     return queued > 0 || inflight > 0;
+}
+
+/* JSON integers are signed. Keep large monotone counters nonnegative. */
+static int64_t download_queue_starved_json_u64(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
 }
 
 /* A PERMANENT typed blocker (bad PoW, malformed block, consensus reject, an
@@ -196,44 +203,45 @@ static bool detail_download_queue_starved(struct json_value *out)
     ok = ok && json_push_kv_int(out, "detect_age_s",
                                 atomic_load(&g_age_at_detect));
     ok = ok && json_push_kv_int(out, "requested_at_detect",
-                                (int64_t)atomic_load(
-                                    &g_requested_at_detect));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_requested_at_detect)));
     ok = ok && json_push_kv_int(out, "received_at_detect",
-                                (int64_t)atomic_load(
-                                    &g_received_at_detect));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_received_at_detect)));
     ok = ok && json_push_kv_int(out, "timed_out_at_detect",
-                                (int64_t)atomic_load(
-                                    &g_timed_out_at_detect));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_timed_out_at_detect)));
     ok = ok && json_push_kv_int(out, "inflight_at_detect",
-                                (int64_t)atomic_load(
-                                    &g_inflight_at_detect));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_inflight_at_detect)));
     ok = ok && json_push_kv_int(out, "queued_at_detect",
-                                (int64_t)atomic_load(&g_queued_at_detect));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_queued_at_detect)));
     ok = ok && json_push_kv_int(out, "current_requested",
-                                (int64_t)requested);
+                                download_queue_starved_json_u64(requested));
     ok = ok && json_push_kv_int(out, "current_received",
-                                (int64_t)received);
+                                download_queue_starved_json_u64(received));
     ok = ok && json_push_kv_int(out, "current_timed_out",
-                                (int64_t)timed_out);
+                                download_queue_starved_json_u64(timed_out));
     ok = ok && json_push_kv_int(out, "current_inflight",
-                                (int64_t)inflight);
+                                download_queue_starved_json_u64(inflight));
     ok = ok && json_push_kv_int(out, "current_queued",
-                                (int64_t)queued);
+                                download_queue_starved_json_u64(queued));
     ok = ok && json_push_kv_int(out, "last_witness_requested",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_requested));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_last_witness_requested)));
     ok = ok && json_push_kv_int(out, "last_witness_received",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_received));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_last_witness_received)));
     ok = ok && json_push_kv_int(out, "last_witness_timed_out",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_timed_out));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_last_witness_timed_out)));
     ok = ok && json_push_kv_int(out, "last_witness_inflight",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_inflight));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_last_witness_inflight)));
     ok = ok && json_push_kv_int(out, "last_witness_queued",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_queued));
+                                download_queue_starved_json_u64(
+                                    atomic_load(&g_last_witness_queued)));
     ok = ok && json_push_kv_bool(
         out, "witness_request_counter_advanced",
         atomic_load(&g_last_witness_requested) >
@@ -246,32 +254,41 @@ static bool detail_download_queue_starved(struct json_value *out)
     ok = ok && json_push_kv_bool(out, "witness_download_work_drained",
                                  !witness_pending);
     ok = ok && json_push_kv_int(out, "total_orphaned",
-                                (int64_t)diag.total_orphaned);
+                                download_queue_starved_json_u64(
+                                    diag.total_orphaned));
     ok = ok && json_push_kv_int(out, "accounting_drift",
                                 diag.accounting_drift);
     ok = ok && json_push_kv_int(out, "assign_attempts",
-                                (int64_t)diag.assign_attempts);
+                                download_queue_starved_json_u64(
+                                    diag.assign_attempts));
     ok = ok && json_push_kv_int(out, "assign_successes",
-                                (int64_t)diag.assign_successes);
+                                download_queue_starved_json_u64(
+                                    diag.assign_successes));
     ok = ok && json_push_kv_int(out, "assign_zero_results",
-                                (int64_t)diag.assign_zero_results);
+                                download_queue_starved_json_u64(
+                                    diag.assign_zero_results));
     ok = ok && json_push_kv_str(out, "last_assign_result",
                                 dl_assign_result_name(
                                     diag.last_assign_result));
     ok = ok && json_push_kv_int(out, "last_assign_peer_id",
                                 diag.last_assign_peer_id);
     ok = ok && json_push_kv_int(out, "last_assign_available",
-                                (int64_t)diag.last_assign_available);
+                                download_queue_starved_json_u64(
+                                    diag.last_assign_available));
     ok = ok && json_push_kv_int(out, "last_assign_assigned",
-                                (int64_t)diag.last_assign_assigned);
+                                download_queue_starved_json_u64(
+                                    diag.last_assign_assigned));
     ok = ok && json_push_kv_int(out, "last_assign_queue_len",
-                                (int64_t)diag.last_assign_queue_len);
+                                download_queue_starved_json_u64(
+                                    diag.last_assign_queue_len));
     ok = ok && json_push_kv_int(out, "last_assign_active",
-                                (int64_t)diag.last_assign_active);
+                                download_queue_starved_json_u64(
+                                    diag.last_assign_active));
     ok = ok && json_push_kv_int(out, "oldest_in_flight_age_seconds",
                                 diag.oldest_in_flight_age_seconds);
     ok = ok && json_push_kv_int(out, "overdue_in_flight",
-                                (int64_t)diag.overdue_in_flight);
+                                download_queue_starved_json_u64(
+                                    diag.overdue_in_flight));
     ok = ok && json_push_kv_str(
         out, "remedy_contract",
         "kick_local_sync is witnessed when total_requested advances past requested_at_detect or the pending queue/in-flight work drains; DEFERRED (not attempted) whenever a permanent fold blocker is active, since a queue kick can never clear one");
@@ -361,5 +378,10 @@ void download_queue_starved_test_reset(void)
 int download_queue_starved_test_remedy_calls(void)
 {
     return atomic_load(&g_test_remedy_calls);
+}
+
+int64_t download_queue_starved_test_json_u64(uint64_t value)
+{
+    return download_queue_starved_json_u64(value);
 }
 #endif

@@ -290,6 +290,42 @@ static int test_sync_monitor_download_counter_saturation(void)
     return ok ? 0 : 1;
 }
 
+static int test_download_queue_starved_counter_saturation(void)
+{
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    reset_sync_watchdog(&cm, &dm, &ms);
+    bool ok = download_queue_starved_test_json_u64(
+                  (uint64_t)INT64_MAX + 1u) == INT64_MAX &&
+              download_queue_starved_test_json_u64(UINT64_MAX) == INT64_MAX;
+    dm.total_requested = (uint64_t)INT64_MAX + 1u;
+    dm.total_received = UINT64_MAX;
+    dm.total_timed_out = UINT64_MAX;
+    dm.total_orphaned = UINT64_MAX;
+    dm.assign_attempts = UINT64_MAX;
+    register_download_queue_starved();
+
+    struct json_value state;
+    json_init(&state);
+    ok = ok && condition_engine_dump_state_json(&state, NULL);
+    const struct json_value *conditions = json_get(&state, "conditions");
+    const struct json_value *cond = sync_watchdog_condition_json(
+        conditions, "download_queue_starved");
+    const struct json_value *detail = cond ? json_get(cond, "detail") : NULL;
+    ok = ok && detail != NULL;
+    ok = ok && json_get_int(json_get(detail, "current_requested")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(detail, "current_received")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(detail, "current_timed_out")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(detail, "total_orphaned")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(detail, "assign_attempts")) == INT64_MAX;
+    json_free(&state);
+    printf("sync_watchdog_conditions: download queue diagnostics saturate "
+           "unsigned counters... %s\n", ok ? "OK" : "FAIL");
+    cleanup_sync_watchdog();
+    return ok ? 0 : 1;
+}
+
 static void local_header_refill_witness_releases(struct p2p_node *first,
                                                  struct p2p_node *second,
                                                  struct p2p_node *third,
@@ -1218,6 +1254,7 @@ int test_sync_watchdog_conditions(void)
     failures += test_header_stall_uses_monotonic_timeout();
 
     failures += test_sync_monitor_download_counter_saturation();
+    failures += test_download_queue_starved_counter_saturation();
 
     {
         struct watchdog_stats stats;
