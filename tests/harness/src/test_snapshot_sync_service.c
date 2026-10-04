@@ -31,6 +31,8 @@
 #include <unistd.h>
 
 uint32_t snapsync_test_decode_vout(const uint8_t bytes[4]);
+bool snapsync_test_read_compact_size(const uint8_t *data, size_t len,
+                                     size_t *pos, uint64_t *out);
 
 static void build_snapshot_chunk(struct byte_stream *s)
 {
@@ -178,6 +180,31 @@ static int test_snapshot_sync_service_vout_wire_decode(void)
         ASSERT(snapsync_test_decode_vout(ordinary) == 2);
         ASSERT(snapsync_test_decode_vout(high_bit) == UINT32_C(0x80000000));
         ASSERT(snapsync_test_decode_vout(maximum) == UINT32_MAX);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_snapshot_sync_service_script_length_decode(void)
+{
+    int failures = 0;
+
+    TEST("snapshot sync consumes all CompactSize script-length forms") {
+        const uint8_t compact_255[9] = { 255, 255, 0, 0, 0, 0, 0, 0, 0 };
+        const uint8_t truncated_255[8] = { 255, 0, 0, 0, 0, 0, 0, 0 };
+        size_t pos = 0;
+        uint64_t size = 0;
+
+        ASSERT(snapsync_test_read_compact_size(compact_255,
+                                                sizeof(compact_255),
+                                                &pos, &size));
+        ASSERT(pos == sizeof(compact_255));
+        ASSERT(size == 255);
+        pos = 0;
+        ASSERT(!snapsync_test_read_compact_size(truncated_255,
+                                                 sizeof(truncated_255),
+                                                 &pos, &size));
         PASS();
     } _test_next:;
 
@@ -2222,6 +2249,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_out_of_range_value_fails_closed();
     failures += test_snapshot_sync_service_out_of_range_height_fails_closed();
     failures += test_snapshot_sync_service_vout_wire_decode();
+    failures += test_snapshot_sync_service_script_length_decode();
     failures += test_snapshot_accept_offer_with_few_utxos();
     failures += test_snapshot_accept_offer_with_real_utxos();
     failures += test_snapshot_recovery_request_allows_populated_utxos();
