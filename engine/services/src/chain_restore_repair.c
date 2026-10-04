@@ -24,6 +24,7 @@
 #include "storage/progress_store.h"
 #include "net/snapshot_sync_contract.h"
 #include <sqlite3.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,15 @@
 
 /* Tier-2 P2 fast restart (see header). Boot-time toggle. */
 static _Atomic bool g_trust_index_fastpath = false;
+
+/* active_chain_install_tip_slot grows its window through height + 1024.
+ * A corrupted persisted index can carry any int height, so refuse the one
+ * tail that cannot name that required window before entering sealed
+ * chainstate allocation code. */
+static bool chain_restore_tip_fits_active_window(int tip_h)
+{
+    return tip_h >= 0 && tip_h <= INT_MAX - 1024;
+}
 
 void chain_restore_set_trust_index_fastpath(bool on)
 {
@@ -237,7 +247,7 @@ int chain_restore_rebuild_active_chain(struct main_state *ms,
                                        struct block_index *tip,
                                        const char *datadir)
 {
-    if (!ms || !tip || tip->nHeight < 0)
+    if (!ms || !tip || !chain_restore_tip_fits_active_window(tip->nHeight))
         return 0;
 
     /* Tier-2 P2: under a verified-clean binding, drop the datadir so the
@@ -428,6 +438,13 @@ int chain_restore_rebuild_active_chain(struct main_state *ms,
 
     return populated;
 }
+
+#ifdef ZCL_TESTING
+bool chain_restore_test_tip_fits_active_window(int tip_h)
+{
+    return chain_restore_tip_fits_active_window(tip_h);
+}
+#endif
 
 static bool chain_restore_backfill_args_ok(const struct main_state *ms,
                                            const char *datadir)

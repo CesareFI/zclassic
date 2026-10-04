@@ -30,6 +30,10 @@ int chain_restore_rebuild_active_chain(struct main_state *ms,
 void chain_restore_set_trust_index_fastpath(bool on);
 bool chain_restore_trust_index_fastpath(void);
 
+#ifdef ZCL_TESTING
+bool chain_restore_test_tip_fits_active_window(int tip_h);
+#endif
+
 int chain_restore_backfill_nbits_from_disk(struct main_state *ms,
                                            const char *datadir);
 

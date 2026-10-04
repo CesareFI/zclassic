@@ -24,6 +24,7 @@
 #include "util/boot_scan.h"
 #include "util/thread_registry.h"
 #include <sqlite3.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -33,6 +34,17 @@
 
 extern bool process_block_test_hydrate_index_from_disk(
     struct block_index *pindex, const char *datadir);
+
+static int test_rebuild_rejects_unrepresentable_active_window(void) {
+    int failures = 0;
+    TEST("chain_restore_rebuild: rejects height beyond active-window growth") {
+        ASSERT(chain_restore_test_tip_fits_active_window(INT_MAX - 1024));
+        ASSERT(!chain_restore_test_tip_fits_active_window(INT_MAX - 1023));
+        ASSERT(!chain_restore_test_tip_fits_active_window(INT_MAX));
+        PASS();
+    } _test_next:;
+    return failures;
+}
 
 /* ── Plan tests ────────────────────────────────────────────────── */
 
@@ -2152,6 +2164,7 @@ int test_chain_restore_service(void) {
     failures += test_integrity_live_tip_only_chain_is_operational();
     failures += test_integrity_detects_isolated_nbits_zero();
     /* — post-restore repair tests */
+    failures += test_rebuild_rejects_unrepresentable_active_window();
     failures += test_rebuild_active_chain_fills_holes_from_block_map();
     failures += test_rebuild_active_chain_relabels_wrong_height_parent();
     failures += test_rebuild_active_chain_relinks_wrong_active_parent();
