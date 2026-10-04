@@ -156,6 +156,9 @@ void sync_monitor_test_set_local_recovery(bool active,
  * deterministic value. Pass 0 to restore the "never connected" sentinel. */
 void sync_monitor_test_set_tip_advance_ts(int64_t ts);
 void sync_monitor_test_set_recoveries_total(int total);
+void sync_monitor_test_set_tip_state_counters(uint64_t evaluations,
+                                              uint64_t transitions,
+                                              uint64_t intake_pending);
 #endif
 
 #endif /* ZCL_SERVICES_SYNC_MONITOR_H */
