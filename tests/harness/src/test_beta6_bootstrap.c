@@ -753,6 +753,16 @@ int test_beta6_bootstrap(void)
         beta6_bs_quota_charge("v4/24:203.0.113", false, 0, 1024);
         ASSERT(beta6_bs_quota_check("v4/24:203.0.113", false, 1).ok);
 
+        /* A valid but extreme operator throttle must not wrap the bytes/s
+         * denominator to zero. Its exact chunk delay is below one millisecond,
+         * so the normal one-millisecond minimum still controls the retry. */
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(1, INT64_C(1) << 54);
+        beta6_bs_quota_charge("v4/24:203.0.113", false, 0, 1);
+        ASSERT_EQ(beta6_bs_quota_check("v4/24:203.0.113", false, 0).code,
+                  BETA6_BS_ERR_QUOTA_SPACING);
+        ASSERT(beta6_bs_quota_check("v4/24:203.0.113", false, 1).ok);
+
         /* Throttle off means a hard stop instead of a slow trickle. */
         beta6_bs_quota_clear();
         beta6_bs_quota_configure(1000, 0);

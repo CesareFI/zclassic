@@ -199,6 +199,22 @@ static uint64_t quota_bytes_served_add(uint64_t total, uint64_t bytes)
     return total + bytes;
 }
 
+static int64_t quota_spacing_delay_ms(uint64_t bytes, int64_t throttle_kbps)
+{
+    uint64_t throttle = (uint64_t)throttle_kbps;
+    /* The production callers charge accepted bootstrap chunks (at most
+     * BETA6_BS_CHUNK_SIZE), so a rate too large to express in bytes/s means
+     * the exact delay is below one millisecond. Avoid wrapping that denominator
+     * to zero; the existing caller retains its one-millisecond minimum. */
+    if (throttle > UINT64_MAX / 1024ULL)
+        return 0;
+    uint64_t bytes_per_second = throttle * 1024ULL;
+    if (bytes > UINT64_MAX / 1000ULL)
+        return INT64_MAX;
+    uint64_t delay_ms = (bytes * 1000ULL) / bytes_per_second;
+    return delay_ms > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)delay_ms;
+}
+
 static void quota_set_next_allowed(struct beta6_quota_bucket *bucket,
                                    int64_t now_ms, int64_t delay_ms)
 {
@@ -273,7 +289,7 @@ void beta6_bs_quota_charge(const char *key, bool whitelisted, int64_t now_ms,
     bucket->bytes_served = quota_bytes_served_add(bucket->bytes_served,
                                                    bytes);
     if (bucket->bytes_served >= (uint64_t)g_max_bytes_per_day && g_throttle_kbps > 0) {
-        int64_t delay_ms = (int64_t)((bytes * 1000ULL) / ((uint64_t)g_throttle_kbps * 1024ULL));
+        int64_t delay_ms = quota_spacing_delay_ms(bytes, g_throttle_kbps);
         quota_set_next_allowed(bucket, now_ms, delay_ms > 1 ? delay_ms : 1);
     }
     UNLOCK(g_quota_lock);
