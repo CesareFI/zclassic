@@ -498,7 +498,8 @@ static bool queue_body_uses_history_lane(enum body_queue_selector selector,
 {
     return selector == BODY_QUEUE_ACTIVE_FRONTIER &&
            served_tip >= 0 &&
-           target_height + (int)DL_TIP_BIAS_RESERVE < served_tip;
+           target_height >= 0 && target_height < served_tip &&
+           served_tip - target_height > (int)DL_TIP_BIAS_RESERVE;
 }
 
 static void queue_body_push(struct download_manager *dm,
@@ -530,7 +531,6 @@ static struct zcl_result queue_body_target(
     struct uint256 target_hash;
     memset(&target_hash, 0, sizeof(target_hash));
     bool already_have_data = false;
-    int local_h = target_height - 1;
 
     zcl_mutex_lock(&ms->cs_main);
     if (target_height < 0) {
@@ -538,6 +538,7 @@ static struct zcl_result queue_body_target(
         return ZCL_ERR(-2, "frontier body queue: invalid target=%d",
                        target_height);
     }
+    int local_h = target_height - 1;
 
     struct block_index *target =
         resolve_body_queue_target(ms, target_height, selector);

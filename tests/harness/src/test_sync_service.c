@@ -8,6 +8,7 @@
 #include "controllers/diagnostics_internal.h"
 #include "json/json.h"
 #include "services/sync_benchmark_service.h"
+#include "services/sync_monitor.h"
 #include "sync/sync_planner.h"
 #include "sync/sync_state.h"
 #include "validation/main_state.h"
@@ -439,6 +440,34 @@ static int test_sync_service_reject_probe_rate_limit(void)
         /* A clock rollback cannot keep an already-pending recovery probe
          * asleep until the old wall-clock stamp is reached. */
         ASSERT(syncsvc_should_probe_after_reject(999, 1000));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_sync_service_rejects_unrepresentable_body_target(void)
+{
+    int failures = 0;
+
+    TEST("sync_service rejects an unrepresentable body recovery target") {
+        struct main_state ms;
+        struct download_manager dm;
+        main_state_init(&ms);
+        dl_init(&dm);
+        sync_monitor_init();
+        sync_monitor_set_context(NULL, &dm, &ms);
+
+        struct zcl_result result =
+            sync_monitor_queue_active_frontier_body(INT_MIN,
+                                                    "test:invalid-target");
+        ASSERT(!result.ok);
+        ASSERT(result.code == -2);
+        ASSERT(dm.queue_len == 0);
+
+        sync_monitor_set_context(NULL, NULL, NULL);
+        dl_free(&dm);
+        main_state_free(&ms);
         PASS();
     } _test_next:;
 
@@ -2478,6 +2507,7 @@ int test_sync_service(void)
     failures += test_sync_service_headers_log_throttle();
     failures += test_sync_service_header_batch_followup();
     failures += test_sync_service_reject_probe_rate_limit();
+    failures += test_sync_service_rejects_unrepresentable_body_target();
     failures += test_sync_service_reject_probe_pending();
     failures += test_sync_service_block_file_scan_trigger();
     failures += test_sync_service_block_assignment_plan();
