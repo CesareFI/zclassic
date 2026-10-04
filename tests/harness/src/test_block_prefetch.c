@@ -179,6 +179,21 @@ static struct block_prefetch_config bpt_cfg(size_t budget)
     return cfg;
 }
 
+static int t_idle_wait_uses_monotonic_clock(void)
+{
+    int failures = 0;
+    TEST_CASE("idle wait: Linux cache warming ignores wall-clock rollback") {
+#if defined(__linux__)
+        /* This queries the production condition-variable selection, rather
+         * than only testing deadline arithmetic. Previously the worker used
+         * a realtime timed wait, so a backward wall correction could suppress
+         * its periodic cache-warming poll until wall time caught up. */
+        ASSERT(block_prefetch_test_wait_uses_monotonic_clock());
+#endif
+    } TEST_END
+    return failures;
+}
+
 /* ── Test: disabled config is a benign no-op ────────────────────────────── */
 static int t_disabled_noop(void)
 {
@@ -411,6 +426,7 @@ int test_block_prefetch(void)
 {
     printf("\n=== block_prefetch (read-ahead worker) ===\n");
     int failures = 0;
+    failures += t_idle_wait_uses_monotonic_clock();
     failures += t_disabled_noop();
     failures += t_lifecycle();
     failures += t_bounded_memory();

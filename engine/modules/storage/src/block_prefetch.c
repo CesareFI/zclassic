@@ -60,6 +60,9 @@ static void *g_pos_user;
 /* ── Worker lifecycle ──────────────────────────────────────────────────── */
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
+static pthread_once_t g_wait_once = PTHREAD_ONCE_INIT;
+static pthread_cond_t g_monotonic_cv;
+static bool g_wait_uses_monotonic;
 static pthread_t g_thread;
 static bool      g_thread_started = false;
 static bool      g_running = false;       /* under g_mu */
@@ -79,6 +82,34 @@ static _Atomic uint64_t g_resolve_gaps = 0;
 static _Atomic uint64_t g_read_fails = 0;
 static _Atomic uint64_t g_passes = 0;
 static _Atomic int64_t  g_start_us = 0;
+
+/* The worker's idle poll is a progress deadline, not a wall-time promise.
+ * On Linux bind a separate condition variable to CLOCK_MONOTONIC so a wall
+ * clock rollback cannot delay the next cache-warming pass indefinitely.
+ * Other platforms retain the existing realtime condition variable. */
+static void bp_wait_init_once(void)
+{
+    pthread_condattr_t attr;
+    bool attr_ready = pthread_condattr_init(&attr) == 0;
+#if defined(__linux__)
+    if (attr_ready && pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0 &&
+        pthread_cond_init(&g_monotonic_cv, &attr) == 0)
+        g_wait_uses_monotonic = true;
+#endif
+    if (attr_ready)
+        (void)pthread_condattr_destroy(&attr);
+}
+
+static void bp_wait_init(void)
+{
+    (void)pthread_once(&g_wait_once, bp_wait_init_once);
+}
+
+static pthread_cond_t *bp_wait_cv(void)
+{
+    bp_wait_init();
+    return g_wait_uses_monotonic ? &g_monotonic_cv : &g_cv;
+}
 
 /* ── Bounded raw-body LRU (worker writes; readers under g_lru_mu) ───────── */
 struct bp_lru_entry {
@@ -368,13 +399,16 @@ static void *bp_worker_entry(void *arg)
 
         /* Bounded idle wait: re-poll the cursor even without a wakeup. */
         struct timespec until;
-        if (platform_time_realtime_timespec(&until) == 0) {
+        int clock_ok = g_wait_uses_monotonic
+            ? platform_time_monotonic_timespec(&until)
+            : platform_time_realtime_timespec(&until);
+        if (clock_ok == 0) {
             until.tv_nsec += (long)BP_IDLE_WAIT_MS * 1000000L;
             if (until.tv_nsec >= 1000000000L) {
                 until.tv_sec += 1;
                 until.tv_nsec -= 1000000000L;
             }
-            (void)pthread_cond_timedwait(&g_cv, &g_mu, &until);
+            (void)pthread_cond_timedwait(bp_wait_cv(), &g_mu, &until);
         }
     }
     pthread_mutex_unlock(&g_mu);
@@ -418,6 +452,8 @@ bool block_prefetch_start(const char *datadir,
                  "[block_prefetch] start: NULL cursor_fn/pos_fn — not starting");
         return false;
     }
+
+    bp_wait_init();
 
     pthread_mutex_lock(&g_mu);
     if (g_running) {
@@ -499,7 +535,7 @@ void block_prefetch_stop(void)
         g_stop = true;
         g_running = false;
         atomic_store_explicit(&g_running_fast, false, memory_order_release);
-        pthread_cond_broadcast(&g_cv);
+        pthread_cond_broadcast(bp_wait_cv());
     }
     bool started = g_thread_started;
     pthread_mutex_unlock(&g_mu);
@@ -554,6 +590,14 @@ size_t block_prefetch_lru_count(void)
     pthread_mutex_unlock(&g_lru_mu);
     return n;
 }
+
+#ifdef ZCL_TESTING
+bool block_prefetch_test_wait_uses_monotonic_clock(void)
+{
+    bp_wait_init();
+    return g_wait_uses_monotonic;
+}
+#endif
 
 bool block_prefetch_dump_state_json(struct json_value *out, const char *key)
 {

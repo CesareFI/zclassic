@@ -119,4 +119,9 @@ ssize_t block_prefetch_lru_get(const struct disk_block_pos *pos,
 struct json_value;
 bool block_prefetch_dump_state_json(struct json_value *out, const char *key);
 
+#ifdef ZCL_TESTING
+/* Exposes the clock selected by the worker's actual condition variable. */
+bool block_prefetch_test_wait_uses_monotonic_clock(void);
+#endif
+
 #endif /* ZCL_STORAGE_BLOCK_PREFETCH_H */
