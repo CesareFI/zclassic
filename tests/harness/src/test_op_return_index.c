@@ -1121,6 +1121,20 @@ static int test_backfill_declared_partial_coverage(void)
 
 /* ── Entry point ──────────────────────────────────────────────────── */
 
+static int test_backfill_batch_target_bounds(void)
+{
+    int failures = 0;
+    printf("backfill batch target: ordinary and INT_MAX endpoints... ");
+    bool ok = op_return_backfill_test_batch_target(10, 1000) == 510 &&
+              op_return_backfill_test_batch_target(INT_MAX - 500, INT_MAX) ==
+                  INT_MAX &&
+              op_return_backfill_test_batch_target(INT_MAX - 1, INT_MAX) ==
+                  INT_MAX;
+    if (ok) printf("OK\n");
+    else { printf("FAIL\n"); failures++; }
+    return failures;
+}
+
 int test_op_return_index(void)
 {
     int failures = 0;
@@ -1129,6 +1143,7 @@ int test_op_return_index(void)
     failures += test_explorer_wiring();
     failures += test_digest_pure();
     failures += test_cursor_state();
+    failures += test_backfill_batch_target_bounds();
     failures += test_backfill_e2e();
     failures += test_backfill_genesis_fake_pos();
     failures += test_backfill_unreadable_body_backoff();

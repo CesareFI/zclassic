@@ -83,6 +83,7 @@ extern const char *g_op_return_backfill_test_datadir;
  * declared-partial-coverage adoption path is testable. -1 = ask the kernel
  * authority (index_fold_snapshot_seed_floor), which is the production path. */
 extern _Atomic int64_t g_op_return_backfill_test_seed_floor;
+int32_t op_return_backfill_test_batch_target(int32_t cursor, int32_t hstar);
 #endif
 
 #endif /* ZCL_SERVICES_OP_RETURN_BACKFILL_SERVICE_H */

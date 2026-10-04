@@ -62,6 +62,13 @@ static _Atomic uint64_t g_backfill_base_seeds     = 0;
  * index_fold_declare_partial_coverage. */
 static _Atomic bool     g_backfill_partial_declared = false;
 
+static int32_t backfill_batch_target(int32_t cursor, int32_t hstar)
+{
+    if (cursor > hstar - OP_RETURN_BACKFILL_BATCH_BLOCKS)
+        return hstar;
+    return cursor + OP_RETURN_BACKFILL_BATCH_BLOCKS;
+}
+
 /* ── Unreadable-body latch + backoff ────────────────────────────────
  *
  * A body the index flags BLOCK_HAVE_DATA but that does not read back is not a
@@ -91,6 +98,11 @@ const char *g_op_return_backfill_test_datadir;
 /* -1 = "ask the kernel authority" (production path). >=0 injects a snapshot
  * seed floor without a progress_store, so the adoption path is testable. */
 _Atomic int64_t g_op_return_backfill_test_seed_floor = -1;
+
+int32_t op_return_backfill_test_batch_target(int32_t cursor, int32_t hstar)
+{
+    return backfill_batch_target(cursor, hstar);
+}
 #endif
 
 void op_return_backfill_set_datadir(const char *datadir)
@@ -304,8 +316,7 @@ static enum op_return_backfill_outcome backfill_run_once_typed(int *folded_out)
     if (cursor >= hstar)
         return OP_RETURN_BACKFILL_IDLE; /* caught up to the provable frontier */
 
-    int32_t target = cursor + OP_RETURN_BACKFILL_BATCH_BLOCKS;
-    if (target > hstar) target = hstar;
+    int32_t target = backfill_batch_target(cursor, hstar);
 
     struct op_return_index_row *rows = zcl_malloc(
         (size_t)OP_RETURN_BACKFILL_MAX_ROWS_PER_BLOCK * sizeof(*rows),
