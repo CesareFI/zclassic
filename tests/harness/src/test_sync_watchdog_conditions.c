@@ -228,6 +228,29 @@ static int test_local_header_refill_resolution_matches_episode(void)
     return ok ? 0 : 1;
 }
 
+static int test_sync_monitor_download_counter_saturation(void)
+{
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    reset_sync_watchdog(&cm, &dm, &ms);
+    dm.total_requested = (uint64_t)INT64_MAX + 1u;
+    dm.total_received = UINT64_MAX;
+    dm.total_bytes_received = UINT64_MAX;
+    sync_monitor_set_context(&cm, &dm, &ms);
+    struct json_value state;
+    json_init(&state);
+    bool ok = sync_monitor_dump_state_json(&state, NULL);
+    ok = ok && json_get_int(json_get(&state, "download_requested")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&state, "download_received")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&state, "download_bytes_received")) == INT64_MAX;
+    json_free(&state);
+    printf("sync_watchdog_conditions: sync monitor saturates unsigned "
+           "download counters... %s\n", ok ? "OK" : "FAIL");
+    cleanup_sync_watchdog();
+    return ok ? 0 : 1;
+}
+
 static void local_header_refill_witness_releases(struct p2p_node *first,
                                                  struct p2p_node *second,
                                                  struct p2p_node *third,
@@ -1153,6 +1176,8 @@ int test_sync_watchdog_conditions(void)
     failures += test_local_header_refill_retry_counter_saturates();
     failures += test_local_header_refill_resolution_matches_episode();
     failures += test_header_stall_uses_monotonic_timeout();
+
+    failures += test_sync_monitor_download_counter_saturation();
 
     {
         struct watchdog_stats stats;
