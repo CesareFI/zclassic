@@ -93,7 +93,7 @@ static int64_t env_int_default(const char *name, int64_t def, int64_t lo,
         return def;
     char *end = NULL;
     long long n = strtoll(v, &end, 10);
-    if (end == v)
+    if (end == v || *end != '\0')
         return def;
     if (n < lo) n = lo;
     if (n > hi) n = hi;
