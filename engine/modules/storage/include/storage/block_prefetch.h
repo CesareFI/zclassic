@@ -124,6 +124,7 @@ bool block_prefetch_dump_state_json(struct json_value *out, const char *key);
 bool block_prefetch_test_wait_uses_monotonic_clock(void);
 bool block_prefetch_test_rewind_resets_frontier(void);
 bool block_prefetch_test_start_claim_is_exclusive(void);
+bool block_prefetch_test_scratch_failure_releases_lifecycle(void);
 #endif
 
 #endif /* ZCL_STORAGE_BLOCK_PREFETCH_H */

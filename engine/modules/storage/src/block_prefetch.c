@@ -118,7 +118,9 @@ static pthread_cond_t *bp_wait_cv(void)
  * to publish either a joinable worker or a failed start. */
 static bool bp_start_claim_locked(void)
 {
-    if (g_running || g_starting)
+    /* A worker that exited before its owner joined it remains a joinable
+     * lifecycle object.  Do not overwrite g_thread with a second start. */
+    if (g_running || g_starting || g_thread_started)
         return false;
     g_starting = true;
     return true;
@@ -389,6 +391,19 @@ static void bp_run_pass_locked_released(int32_t cursor, uint8_t *scratch)
 static void *bp_worker_entry(void *arg)
 {
     (void)arg;
+    /* The starter owns publication of g_thread/g_running.  Do not let an
+     * immediate allocation failure race that publication and leave a false
+     * running latch behind. */
+    pthread_mutex_lock(&g_mu);
+    while (g_starting)
+        (void)pthread_cond_wait(&g_cv, &g_mu);
+    bool stopped_before_start = g_stop;
+    pthread_mutex_unlock(&g_mu);
+    if (stopped_before_start) {
+        thread_registry_unregister_self();
+        return NULL;
+    }
+
     int child = atomic_load(&g_child_id);
     if (child != SUPERVISOR_INVALID_ID)
         supervisor_worker_alive(child);
@@ -398,6 +413,11 @@ static void *bp_worker_entry(void *arg)
         LOG_WARN("block_prefetch",
                  "[block_prefetch] scratch alloc failed — worker exits, fold "
                  "reads cold (no correctness impact)");
+        pthread_mutex_lock(&g_mu);
+        g_running = false;
+        atomic_store_explicit(&g_running_fast, false, memory_order_release);
+        pthread_cond_broadcast(&g_cv);
+        pthread_mutex_unlock(&g_mu);
         if (child != SUPERVISOR_INVALID_ID)
             supervisor_worker_exited(child);
         thread_registry_unregister_self();
@@ -573,7 +593,7 @@ void block_prefetch_stop(void)
     }
     bool started = g_thread_started;
     pthread_mutex_unlock(&g_mu);
-    if (!was_running)
+    if (!was_running && !started)
         return;
 
     if (started)
@@ -690,6 +710,54 @@ bool block_prefetch_test_start_claim_is_exclusive(void)
     g_running = saved_running;
     pthread_mutex_unlock(&g_mu);
     return first && !second;
+}
+
+static bool bp_test_no_cursor(void *user, int32_t *out_height)
+{
+    (void)user;
+    (void)out_height;
+    return false;
+}
+
+static bool bp_test_no_position(void *user, int32_t height,
+                                struct disk_block_pos *out)
+{
+    (void)user;
+    (void)height;
+    (void)out;
+    return false;
+}
+
+static bool bp_test_wait_for_worker_exit(void)
+{
+    pthread_mutex_lock(&g_mu);
+    while (g_running)
+        (void)pthread_cond_wait(&g_cv, &g_mu);
+    bool exited = g_thread_started && !g_starting;
+    pthread_mutex_unlock(&g_mu);
+    return exited;
+}
+
+bool block_prefetch_test_scratch_failure_releases_lifecycle(void)
+{
+    struct block_prefetch_config cfg;
+    block_prefetch_config_default(&cfg);
+    cfg.enabled = true;
+    zcl_alloc_fault_fail_next("bp_scratch");
+    if (!block_prefetch_start("", &cfg, bp_test_no_cursor, NULL,
+                              bp_test_no_position, NULL)) {
+        zcl_alloc_fault_clear();
+        return false;
+    }
+
+    bool exited = bp_test_wait_for_worker_exit();
+    bool second_start_refused = !block_prefetch_start(
+        "", &cfg, bp_test_no_cursor, NULL, bp_test_no_position, NULL);
+    block_prefetch_stop();
+    bool restarted = block_prefetch_start("", &cfg, bp_test_no_cursor, NULL,
+                                          bp_test_no_position, NULL);
+    block_prefetch_stop();
+    return exited && second_start_refused && restarted;
 }
 #endif
 

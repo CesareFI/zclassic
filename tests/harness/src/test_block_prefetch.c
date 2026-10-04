@@ -220,6 +220,19 @@ static int t_start_claim_is_exclusive(void)
     return failures;
 }
 
+static int t_scratch_failure_releases_lifecycle(void)
+{
+    int failures = 0;
+    block_prefetch_stop();
+    TEST_CASE("lifecycle: scratch allocation failure releases stale running state") {
+        /* The worker's checked scratch allocation can fail after pthread
+         * creation.  That must clear the public running latch, retain the
+         * join obligation until stop, and permit a clean later restart. */
+        ASSERT(block_prefetch_test_scratch_failure_releases_lifecycle());
+    } TEST_END
+    return failures;
+}
+
 /* ── Test: disabled config is a benign no-op ────────────────────────────── */
 static int t_disabled_noop(void)
 {
@@ -455,6 +468,7 @@ int test_block_prefetch(void)
     failures += t_idle_wait_uses_monotonic_clock();
     failures += t_reorg_rewinds_frontier();
     failures += t_start_claim_is_exclusive();
+    failures += t_scratch_failure_releases_lifecycle();
     failures += t_disabled_noop();
     failures += t_lifecycle();
     failures += t_bounded_memory();
