@@ -26,6 +26,7 @@
 #include "platform/time_compat.h"
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -180,6 +181,12 @@ static bool read_seed_floor(sqlite3 *db, int64_t *floor_out, bool *found)
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--)
         v = (v << 8) | blob[i];              /* little-endian */
+    if (v > INT32_MAX) {
+        LOG_WARN("index_backfill",
+                 "trusted_base height out of range=%llu — leaving seed floor unknown",
+                 (unsigned long long)v);
+        return false;
+    }
     /* A floor at genesis is the from-genesis anchor tip_finalize declares on a
      * fresh datadir, not a snapshot seed: nothing lies below it. Reading it as
      * a seed told every fresh install that it "was seeded from a UTXO

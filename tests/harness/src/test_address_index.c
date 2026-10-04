@@ -146,6 +146,21 @@ static int ai_genesis_base_is_no_seed(sqlite3 *db)
     return failures;
 }
 
+static int ai_out_of_range_seed_is_unknown(sqlite3 *db)
+{
+    int failures = 0;
+    (void)db;
+    uint8_t high[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    int64_t floor = 0;
+    AI_CHECK("write out-of-range trusted_base_height",
+             progress_meta_set(progress_store_db(),
+                               REDUCER_TRUSTED_BASE_HEIGHT_KEY,
+                               high, sizeof(high)));
+    AI_CHECK("out-of-range trusted base leaves seed floor unknown",
+             !index_fold_snapshot_seed_floor(&floor) && floor == -1);
+    return failures;
+}
+
 /* The loader marks genesis BLOCK_HAVE_DATA but never writes its body. A fold
  * must pass genesis with zero rows instead of wedging at h=0; any other
  * unreadable height is still refused so the fold names it. */
@@ -540,6 +555,7 @@ int test_address_index(void)
                  !blocker_exists("address_index.below_snapshot_seed"));
 
         failures += ai_genesis_base_is_no_seed(db);
+        failures += ai_out_of_range_seed_is_unknown(db);
         failures += ai_genesis_body_folds_empty(dir);
 
         /* Install a snapshot-seed floor at height 1000. */
