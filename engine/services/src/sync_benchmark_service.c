@@ -30,6 +30,7 @@
 #include "util/log_macros.h"
 
 #include <pthread.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -152,7 +153,10 @@ static void sb_note(int64_t *counter, uint64_t bytes)
     pthread_mutex_lock(&g_sb.lock);
     if (*counter < 0)
         *counter = 0;
-    *counter += (int64_t)bytes;
+    if (bytes > (uint64_t)INT64_MAX - (uint64_t)*counter)
+        *counter = INT64_MAX;
+    else
+        *counter += (int64_t)bytes;
     pthread_mutex_unlock(&g_sb.lock);
 }
 
