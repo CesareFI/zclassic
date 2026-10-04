@@ -147,4 +147,9 @@ double ibd_throttle_refill(double current_tokens,
                            double burst,
                            int64_t elapsed_us);
 
+#ifdef ZCL_TESTING
+void ibd_throttle_test_seed_counters(uint64_t acquired, uint64_t blocked,
+                                     int64_t total_wait_us);
+#endif
+
 #endif /* ZCL_SERVICES_IBD_THROTTLE_H */

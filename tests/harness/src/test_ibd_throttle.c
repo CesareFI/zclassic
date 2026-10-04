@@ -12,7 +12,9 @@
 #include "test/test_core.h"
 #include "services/ibd_throttle.h"
 #include "event/event.h"
+#include "json/json.h"
 
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -24,6 +26,28 @@
 #include "test/setup_result.h"
 
 static _Atomic int g_it_events;
+
+static bool it_saturated_counters_stay_capped(void)
+{
+    struct ibd_throttle_config cfg = { .blocks_per_sec = 10000,
+                                       .burst = 2 };
+    if (!ibd_throttle_start(&cfg).ok)
+        return false;
+    ibd_throttle_test_seed_counters(UINT64_MAX, UINT64_MAX, INT64_MAX);
+    bool acquired = ibd_throttle_try_acquire();
+    struct ibd_throttle_status st;
+    ibd_throttle_status_snapshot(&st);
+    struct json_value dump = {0};
+    json_set_object(&dump);
+    bool dumped = ibd_throttle_dump_state_json(&dump, NULL);
+    bool capped = acquired && st.acquired_count == UINT64_MAX &&
+        st.blocked_count == UINT64_MAX && st.total_wait_us == INT64_MAX &&
+        dumped && json_get_int(json_get(&dump, "acquired_count")) == INT64_MAX &&
+        json_get_int(json_get(&dump, "blocked_count")) == INT64_MAX;
+    json_free(&dump);
+    ibd_throttle_stop();
+    return capped;
+}
 
 static void it_ev_observer(enum event_type type, uint32_t peer_id,
                             const void *payload, uint32_t payload_len,
@@ -71,6 +95,14 @@ int test_ibd_throttle(void)
 
     /* Always start from a known-stopped state. */
     ibd_throttle_stop();
+
+    /* Saturated lifetime counters are diagnostic only, but they also feed
+     * the IBD throttling event stream. They must not wrap into a false zero
+     * or negative JSON value after prolonged block download. */
+    {
+        IT_CHECK("it: saturated counters stay capped after acquire",
+                 it_saturated_counters_stay_capped());
+    }
 
     /* ── 1. Defaults applied when cfg is zeroed ─────────────── */
     {

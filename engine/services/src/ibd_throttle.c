@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <limits.h>
 
 #include "util/log_macros.h"
 
@@ -73,6 +74,23 @@ struct ibd_throttle_state {
 static struct ibd_throttle_state g_it = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
+
+static uint64_t it_saturating_add_u64(uint64_t value, uint64_t add)
+{
+    return add > UINT64_MAX - value ? UINT64_MAX : value + add;
+}
+
+static int64_t it_saturating_add_i64(int64_t value, int64_t add)
+{
+    if (add <= 0)
+        return value;
+    return value > INT64_MAX - add ? INT64_MAX : value + add;
+}
+
+static int64_t it_counter_i64(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
 
 /* ── Time helper ────────────────────────────────────────────── */
 
@@ -248,7 +266,7 @@ bool ibd_throttle_try_acquire(void)
         return false;
     }
     g_it.tokens -= 1.0;
-    g_it.acquired_count++;
+    g_it.acquired_count = it_saturating_add_u64(g_it.acquired_count, 1);
     pthread_mutex_unlock(&g_it.lock);
     return true;
 }
@@ -277,12 +295,18 @@ struct zcl_result ibd_throttle_acquire(void)
         it_refill_locked(now);
         if (g_it.tokens >= 1.0) {
             g_it.tokens -= 1.0;
-            g_it.acquired_count++;
+            g_it.acquired_count =
+                it_saturating_add_u64(g_it.acquired_count, 1);
             int64_t waited = now - wait_start;
-            g_it.blocked_count++;
-            g_it.total_wait_us += waited;
-            g_it.blocked_since_last_event++;
-            g_it.wait_since_last_event_us += waited;
+            if (waited < 0)
+                waited = 0;
+            g_it.blocked_count = it_saturating_add_u64(g_it.blocked_count, 1);
+            g_it.total_wait_us =
+                it_saturating_add_i64(g_it.total_wait_us, waited);
+            g_it.blocked_since_last_event =
+                it_saturating_add_u64(g_it.blocked_since_last_event, 1);
+            g_it.wait_since_last_event_us = it_saturating_add_i64(
+                g_it.wait_since_last_event_us, waited);
 
             emit = it_drain_pending_event_locked(now, &ev_blocked,
                                                   &ev_wait, &ev_rate,
@@ -332,8 +356,20 @@ bool ibd_throttle_dump_state_json(struct json_value *out, const char *key)
     json_push_kv_int(out, "blocks_per_sec", s.blocks_per_sec);
     json_push_kv_int(out, "burst", s.burst);
     json_push_kv_real(out, "tokens_available", s.tokens_available);
-    json_push_kv_int(out, "acquired_count", (int64_t)s.acquired_count);
-    json_push_kv_int(out, "blocked_count", (int64_t)s.blocked_count);
+    json_push_kv_int(out, "acquired_count", it_counter_i64(s.acquired_count));
+    json_push_kv_int(out, "blocked_count", it_counter_i64(s.blocked_count));
     json_push_kv_int(out, "total_wait_us", s.total_wait_us);
     return true;
 }
+
+#ifdef ZCL_TESTING
+void ibd_throttle_test_seed_counters(uint64_t acquired, uint64_t blocked,
+                                     int64_t total_wait_us)
+{
+    pthread_mutex_lock(&g_it.lock);
+    g_it.acquired_count = acquired;
+    g_it.blocked_count = blocked;
+    g_it.total_wait_us = total_wait_us;
+    pthread_mutex_unlock(&g_it.lock);
+}
+#endif
