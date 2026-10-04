@@ -1203,6 +1203,14 @@ static int test_gap_fill_kick_latch_skips_wait(void)
         gap_fill_kick();
         ASSERT(!gap_fill_test_kick_pending());
 
+        /* The actual stop path must discard a kick that races shutdown, so a
+         * subsequent service generation starts without a stale extra pass. */
+        gap_fill_test_set_running(true);
+        gap_fill_kick();
+        ASSERT(gap_fill_test_kick_pending());
+        gap_fill_stop();
+        ASSERT(!gap_fill_test_kick_pending());
+
         PASS();
     } _test_next:;
     return failures;

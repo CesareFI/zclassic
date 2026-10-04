@@ -816,6 +816,10 @@ void gap_fill_stop(void)
     gap_fill_persist_coverage();
     atomic_store(&g_gf.running, false);
     pthread_mutex_lock(&g_gf.mu);
+    /* A kick can race shutdown while `running` remains true until the worker
+     * joins. It belongs to the retiring generation; do not make the next
+     * start perform an otherwise redundant immediate pass. */
+    g_gf.kick_pending = false;
     g_gf.wake_dispatch = NULL;
     g_gf.wake_dispatch_ctx = NULL;
     pthread_mutex_unlock(&g_gf.mu);
