@@ -95,10 +95,11 @@ static bool gf_out_of_range_body_fetch_cursor_keeps_tip(void)
 static bool gf_dump_saturates_unsigned_stats(void)
 {
     struct gap_fill_stats stats = {
-        .passes = UINT64_MAX, .blocks_enqueued = UINT64_MAX,
-        .timeouts_requeued = UINT64_MAX, .dispatch_wakes = UINT64_MAX,
+        .passes = UINT64_MAX, .blocks_enqueued = UINT64_MAX - 1,
+        .timeouts_requeued = UINT64_MAX - 1, .dispatch_wakes = UINT64_MAX,
     };
     gap_fill_test_set_stats(&stats);
+    gap_fill_test_add_stats(2, 2);
     struct json_value v = {0};
     json_set_object(&v);
     bool ok = gap_fill_dump_state_json(&v, NULL);
