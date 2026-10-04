@@ -110,6 +110,14 @@ void snapsync_hash_staging_internal(struct node_db *ndb, uint8_t out[32],
 bool snapsync_rollback_receive_write_internal(struct node_db *ndb, void *ctx);
 struct zcl_result snapsync_exit_turbo_mode_internal(struct snapshot_sync_service *svc);
 
+#ifdef ZCL_TESTING
+/* Test-only reset barrier: lets the fixture hold reset after it closes an
+ * active session and before cleanup reaches the database. */
+typedef void (*snapsync_reset_gate_fn)(void *ctx);
+void snapsync_test_set_reset_gate(snapsync_reset_gate_fn fn, void *ctx);
+void snapsync_test_run_reset_gate(void);
+#endif
+
 /* ── Failure helpers (snapshot_verify.c) ───────────────────────── */
 void snapsync_mark_failed_internal(struct snapshot_sync_service *svc,
                                    const char *state_reason);

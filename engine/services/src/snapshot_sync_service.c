@@ -69,6 +69,32 @@ static struct snapshot_sync_service g_snapsync_instance;
 static bool g_snapsync_init_done = false;
 static pthread_mutex_t g_snapsync_service_lock = PTHREAD_MUTEX_INITIALIZER;
 
+#ifdef ZCL_TESTING
+static snapsync_reset_gate_fn g_snapsync_reset_gate = NULL;
+static void *g_snapsync_reset_gate_ctx = NULL;
+
+void snapsync_test_set_reset_gate(snapsync_reset_gate_fn fn, void *ctx)
+{
+    snapsync_service_lock_internal();
+    g_snapsync_reset_gate = fn;
+    g_snapsync_reset_gate_ctx = ctx;
+    snapsync_service_unlock_internal();
+}
+
+void snapsync_test_run_reset_gate(void)
+{
+    snapsync_reset_gate_fn gate;
+    void *ctx;
+
+    snapsync_service_lock_internal();
+    gate = g_snapsync_reset_gate;
+    ctx = g_snapsync_reset_gate_ctx;
+    snapsync_service_unlock_internal();
+    if (gate)
+        gate(ctx);
+}
+#endif
+
 /* Snapshot anchor: non-owning pointer to a placeholder block_index at
  * verified snapshot height. The pointed-to block_index is owned by the
  * block map; this slot only lets getheaders locators resume from the
@@ -230,6 +256,7 @@ void snapsync_reset(struct snapshot_sync_service *svc)
     bool discard_ok = true;
     bool has_db = false;
     bool has_db_owner = false;
+    bool active_session = false;
 
     if (!svc) {
         return;
@@ -238,7 +265,19 @@ void snapsync_reset(struct snapshot_sync_service *svc)
     bool turbo_active = svc->turbo_active;
     has_db_owner = svc->ndb != NULL;
     has_db = svc->ndb && svc->ndb->open;
+    active_session = svc->state == SNAPSYNC_NEGOTIATING ||
+        svc->state == SNAPSYNC_RECEIVING;
+    if (active_session) {
+        /* Refuse new chunks and offers before cleanup begins. Otherwise a
+         * concurrent chunk can enter the serialized DB lane after the final
+         * staging discard and leave rows behind an apparently IDLE service. */
+        svc->state = SNAPSYNC_FAILED;
+    }
     snapsync_service_unlock_internal();
+#ifdef ZCL_TESTING
+    if (active_session)
+        snapsync_test_run_reset_gate();
+#endif
     if (has_db_owner && !has_db)
         rollback_ok = false;
     if (has_db)

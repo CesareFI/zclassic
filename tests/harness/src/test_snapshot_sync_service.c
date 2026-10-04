@@ -23,12 +23,60 @@
 #include "storage/progress_store.h"
 #include "util/blocker.h"
 #include "validation/main_state.h"
+#include "snapshot_sync_internal.h"
 #include <string.h>
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+struct reset_gate {
+    pthread_mutex_t mutex;
+    pthread_cond_t entered;
+    pthread_cond_t release;
+    bool is_entered;
+    bool is_released;
+};
+
+struct reset_thread_ctx {
+    struct snapshot_sync_service *svc;
+};
+
+struct snapshot_reset_fixture {
+    struct snapshot_sync_service svc;
+    struct node_db ndb;
+    struct db_service dbsvc;
+    struct app_runtime_context runtime;
+    struct byte_stream chunk;
+    struct reset_gate gate;
+    struct reset_thread_ctx thread_ctx;
+    pthread_t thread;
+    bool db_open;
+    bool db_service_started;
+    bool gate_initialized;
+    bool thread_started;
+};
+
+static void snapshot_reset_gate(void *ctx)
+{
+    struct reset_gate *gate = ctx;
+
+    pthread_mutex_lock(&gate->mutex);
+    gate->is_entered = true;
+    pthread_cond_signal(&gate->entered);
+    while (!gate->is_released)
+        pthread_cond_wait(&gate->release, &gate->mutex);
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+static void *snapshot_reset_thread(void *ctx)
+{
+    struct reset_thread_ctx *thread = ctx;
+
+    snapsync_reset(thread->svc);
+    return NULL;
+}
 
 static void build_snapshot_chunk(struct byte_stream *s)
 {
@@ -56,6 +104,99 @@ static void build_snapshot_chunk(struct byte_stream *s)
     stream_write_u8(s, 0);
     stream_write_u8(s, (uint8_t)sizeof(script));
     stream_write_bytes(s, script, sizeof(script));
+}
+
+static void snapshot_reset_fixture_cleanup(struct snapshot_reset_fixture *f)
+{
+    if (f->thread_started) {
+        pthread_mutex_lock(&f->gate.mutex);
+        f->gate.is_released = true;
+        pthread_cond_signal(&f->gate.release);
+        pthread_mutex_unlock(&f->gate.mutex);
+        pthread_join(f->thread, NULL);
+    }
+    snapsync_test_set_reset_gate(NULL, NULL);
+    if (f->gate_initialized) {
+        pthread_cond_destroy(&f->gate.release);
+        pthread_cond_destroy(&f->gate.entered);
+        pthread_mutex_destroy(&f->gate.mutex);
+    }
+    stream_free(&f->chunk);
+    app_runtime_set_current(NULL);
+    if (f->db_service_started)
+        db_service_stop(&f->dbsvc);
+    if (f->db_open)
+        node_db_close(&f->ndb);
+}
+
+static bool snapshot_reset_fixture_open(struct snapshot_reset_fixture *f)
+{
+    memset(f, 0, sizeof(*f));
+    if (!node_db_open(&f->ndb, ":memory:"))
+        return false;
+    f->db_open = true;
+    db_service_init(&f->dbsvc);
+    if (!db_service_attach(&f->dbsvc, &f->ndb) ||
+        !db_service_start_test_worker(&f->dbsvc))
+        return false;
+    f->db_service_started = true;
+    f->runtime.db_service = &f->dbsvc;
+    app_runtime_set_current(&f->runtime);
+    return true;
+}
+
+static bool snapshot_reset_fixture_start(struct snapshot_reset_fixture *f)
+{
+    f->svc.state = SNAPSYNC_NEGOTIATING;
+    if (!snapsync_begin_receive(&f->svc).ok)
+        return false;
+    build_snapshot_chunk(&f->chunk);
+    if (pthread_mutex_init(&f->gate.mutex, NULL) != 0 ||
+        pthread_cond_init(&f->gate.entered, NULL) != 0 ||
+        pthread_cond_init(&f->gate.release, NULL) != 0)
+        return false;
+    f->gate_initialized = true;
+    snapsync_test_set_reset_gate(snapshot_reset_gate, &f->gate);
+    f->thread_ctx.svc = &f->svc;
+    if (pthread_create(&f->thread, NULL, snapshot_reset_thread,
+                       &f->thread_ctx) != 0)
+        return false;
+    f->thread_started = true;
+    pthread_mutex_lock(&f->gate.mutex);
+    while (!f->gate.is_entered)
+        pthread_cond_wait(&f->gate.entered, &f->gate.mutex);
+    pthread_mutex_unlock(&f->gate.mutex);
+    return true;
+}
+
+static bool snapshot_reset_closes_session_before_cleanup(void)
+{
+    struct snapshot_reset_fixture f;
+    struct node_db_status status;
+    bool admitted;
+
+    if (!snapshot_reset_fixture_open(&f)) {
+        snapshot_reset_fixture_cleanup(&f);
+        return false;
+    }
+    snapsync_init(&f.svc, &f.ndb);
+    if (!snapshot_reset_fixture_start(&f)) {
+        snapshot_reset_fixture_cleanup(&f);
+        return false;
+    }
+    admitted = snapsync_apply_chunk(&f.svc, f.chunk.data, f.chunk.size) != 0;
+    pthread_mutex_lock(&f.gate.mutex);
+    f.gate.is_released = true;
+    pthread_cond_signal(&f.gate.release);
+    pthread_mutex_unlock(&f.gate.mutex);
+    pthread_join(f.thread, NULL);
+    f.thread_started = false;
+    snapsync_test_set_reset_gate(NULL, NULL);
+    node_db_get_status(&f.ndb, &status);
+    bool reset_ok = f.svc.state == SNAPSYNC_IDLE && !f.svc.turbo_active &&
+        !status.turbo_mode && snapsync_staging_count_internal(&f.ndb) == 0;
+    snapshot_reset_fixture_cleanup(&f);
+    return !admitted && reset_ok;
 }
 
 static int test_snapshot_offer_trust_policy(void)
@@ -1043,6 +1184,18 @@ static int test_snapshot_sync_service_db_service_runtime(void)
         app_runtime_set_current(NULL);
         db_service_stop(&dbsvc);
         node_db_close(&ndb);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_snapshot_sync_reset_rejects_late_chunk(void)
+{
+    int failures = 0;
+
+    TEST("snapshot reset closes chunk admission before staging cleanup") {
+        ASSERT(snapshot_reset_closes_session_before_cleanup());
         PASS();
     } _test_next:;
 
@@ -2132,6 +2285,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_verify_flyclient_begin_failure();
     failures += test_snapshot_sync_service_offer_churn();
     failures += test_snapshot_sync_service_db_service_runtime();
+    failures += test_snapshot_sync_reset_rejects_late_chunk();
     failures += test_snapshot_sync_service_runtime_accessor();
     failures += test_snapshot_sync_service_db_service_chunk_contained();
     failures += test_snapshot_sync_service_containment_preserves_canonical_state();
