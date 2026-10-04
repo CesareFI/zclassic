@@ -8,6 +8,8 @@
 #include "util/blocker.h"
 #include "util/stage.h"
 
+#include "../../../engine/reducer/jobs/src/stage_repair_reducer_frontier_internal.h"
+
 #include <sqlite3.h>
 #include <limits.h>
 #include <stdint.h>
@@ -286,6 +288,21 @@ static int test_stage_repair_frontier_range_boundaries(void)
     return failures;
 }
 
+static int test_stage_repair_trusted_base_boundaries(void)
+{
+    int failures = 0;
+    char dir[256];
+    sqlite3 *db = NULL;
+    struct stage_reducer_frontier_reconcile_result result;
+    memset(&result, 0, sizeof(result));
+    bool ok = setup_case("trusted_base_int_max", dir, sizeof(dir), &db);
+    ok = ok && !stage_repair_preserve_trusted_base_transition(
+                   db, INT_MAX, INT_MAX, &result);
+    STR_CHECK("INT_MAX trusted base has no representable transition cursor", ok);
+    teardown_case(dir);
+    return failures;
+}
+
 int test_stage_repair(void)
 {
     printf("\n=== stage_repair poison-rewind safety guard tests ===\n");
@@ -293,6 +310,7 @@ int test_stage_repair(void)
 
     failures += test_stage_repair_cursor_boundaries();
     failures += test_stage_repair_frontier_range_boundaries();
+    failures += test_stage_repair_trusted_base_boundaries();
 
     /* --- Guard 1: ok=1 row AT the frontier refuses the whole rewind. ---
      * This is the regression guard: a finalized (ok=1) row at/above the

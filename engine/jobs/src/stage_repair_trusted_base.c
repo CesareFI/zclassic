@@ -15,12 +15,20 @@
 #include <stdint.h>
 #include <string.h>
 
+static bool trusted_base_transition_args_valid(
+    sqlite3 *db, int hstar, int cursor,
+    const struct stage_reducer_frontier_reconcile_result *out)
+{
+    return db && out && hstar >= 0 && hstar < INT32_MAX &&
+           cursor == hstar + 1 && out->coins_applied_found &&
+           out->coins_applied_height == cursor;
+}
+
 bool stage_repair_preserve_trusted_base_transition(
     sqlite3 *db, int hstar, int cursor,
     const struct stage_reducer_frontier_reconcile_result *out)
 {
-    if (!db || !out || hstar < 0 || cursor != hstar + 1 ||
-        !out->coins_applied_found || out->coins_applied_height != cursor)
+    if (!trusted_base_transition_args_valid(db, hstar, cursor, out))
         return false; /* raw-return-ok:not the narrow transition shape */
 
     uint8_t trusted_hash[32] = {0};
