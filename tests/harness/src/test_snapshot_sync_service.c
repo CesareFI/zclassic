@@ -33,6 +33,8 @@
 uint32_t snapsync_test_decode_vout(const uint8_t bytes[4]);
 bool snapsync_test_read_compact_size(const uint8_t *data, size_t len,
                                      size_t *pos, uint64_t *out);
+bool snapsync_test_chunk_fits_offer(struct snapshot_sync_service *svc,
+                                    uint32_t entries);
 
 static void build_snapshot_chunk(struct byte_stream *s)
 {
@@ -168,6 +170,20 @@ static void build_out_of_range_height_snapshot_chunk(struct byte_stream *s)
     s->data[4 + 32 + 4 + 8 + 3] = 0x80;
 }
 
+static void build_two_entry_snapshot_chunk(struct byte_stream *s)
+{
+    uint8_t entry[128];
+
+    build_snapshot_chunk(s);
+    size_t entry_len = s->size - 4;
+    memcpy(entry, s->data + 4, entry_len);
+    s->data[0] = 2;
+    s->data[1] = 0;
+    s->data[2] = 0;
+    s->data[3] = 0;
+    (void)stream_write_bytes(s, entry, entry_len);
+}
+
 static int test_snapshot_sync_service_vout_wire_decode(void)
 {
     int failures = 0;
@@ -205,6 +221,54 @@ static int test_snapshot_sync_service_script_length_decode(void)
         ASSERT(!snapsync_test_read_compact_size(truncated_255,
                                                  sizeof(truncated_255),
                                                  &pos, &size));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_snapshot_sync_service_excess_entries_fail_before_staging(void)
+{
+    int failures = 0;
+
+    TEST("snapshot sync rejects chunk entries beyond its accepted offer") {
+        struct snapshot_sync_service svc;
+        struct node_db ndb;
+        struct byte_stream chunk;
+
+        memset(&svc, 0, sizeof(svc));
+        ASSERT(node_db_open(&ndb, ":memory:"));
+        snapsync_init(&svc, &ndb);
+        svc.state = SNAPSYNC_NEGOTIATING;
+        svc.start_time_us = 1;
+        svc.offered_count = 1;
+        ASSERT(snapsync_begin_receive(&svc).ok);
+        build_two_entry_snapshot_chunk(&chunk);
+        ASSERT(snapsync_apply_chunk(&svc, chunk.data, chunk.size) < 0);
+        ASSERT(svc.received_utxos == 0);
+        ASSERT(svc.state == SNAPSYNC_FAILED);
+        stream_free(&chunk);
+        node_db_close(&ndb);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_snapshot_sync_service_chunk_offer_headroom(void)
+{
+    int failures = 0;
+
+    TEST("snapshot sync reserves only accepted offered-entry headroom") {
+        struct snapshot_sync_service svc;
+
+        memset(&svc, 0, sizeof(svc));
+        svc.offered_count = 2;
+        svc.received_utxos = 1;
+        ASSERT(snapsync_test_chunk_fits_offer(&svc, 1));
+        ASSERT(!snapsync_test_chunk_fits_offer(&svc, 2));
+        svc.received_utxos = 3;
+        ASSERT(!snapsync_test_chunk_fits_offer(&svc, 1));
         PASS();
     } _test_next:;
 
@@ -2250,6 +2314,8 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_out_of_range_height_fails_closed();
     failures += test_snapshot_sync_service_vout_wire_decode();
     failures += test_snapshot_sync_service_script_length_decode();
+    failures += test_snapshot_sync_service_excess_entries_fail_before_staging();
+    failures += test_snapshot_sync_service_chunk_offer_headroom();
     failures += test_snapshot_accept_offer_with_few_utxos();
     failures += test_snapshot_accept_offer_with_real_utxos();
     failures += test_snapshot_recovery_request_allows_populated_utxos();

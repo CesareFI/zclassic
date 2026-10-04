@@ -2317,7 +2317,7 @@ engine/services/src/shielded_history_import_service.c:shielded_history_import_fr
 engine/services/src/shielded_history_promote_service.c:shielded_history_promote_run:59
 engine/services/src/slo_ledger_summary.c:push_summary:45
 engine/services/src/slo_ledger_summary.c:slo_ledger_summary_render_path:39
-engine/services/src/snapshot_fetch.c:snapsync_apply_chunk_local:11
+engine/services/src/snapshot_fetch.c:snapsync_apply_chunk_local:10
 engine/services/src/snapshot_manifest.c:snapshot_manifest_parse:19
 engine/services/src/snapshot_offer.c:snapsync_build_local_recovery_manifest:17
 engine/services/src/snapshot_serve.c:snapsync_prepare_serve_step:20

@@ -78,6 +78,9 @@ static uint32_t snapsync_decode_vout(const uint8_t bytes[4])
            ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
 }
 
+static bool snapsync_chunk_fits_offer(struct snapshot_sync_service *svc,
+                                      uint32_t entries);
+
 static bool snapsync_read_compact_size(const uint8_t *data, size_t len,
                                        size_t *pos, uint64_t *out)
 {
@@ -122,6 +125,12 @@ bool snapsync_test_read_compact_size(const uint8_t *data, size_t len,
                                      size_t *pos, uint64_t *out)
 {
     return snapsync_read_compact_size(data, len, pos, out);
+}
+
+bool snapsync_test_chunk_fits_offer(struct snapshot_sync_service *svc,
+                                    uint32_t entries)
+{
+    return snapsync_chunk_fits_offer(svc, entries);
 }
 #endif
 
@@ -476,12 +485,47 @@ static int snapsync_record_chunk_progress(struct snapshot_sync_service *svc,
     return 1;
 }
 
+static bool snapsync_chunk_fits_offer(struct snapshot_sync_service *svc,
+                                      uint32_t entries)
+{
+    uint64_t received = 0;
+    uint64_t offered = 0;
+
+    snapsync_service_lock_internal();
+    received = svc->received_utxos;
+    offered = svc->offered_count;
+    snapsync_service_unlock_internal();
+    if (received > offered || (uint64_t)entries > offered - received) {
+        LOG_ERROR("snapshot_sync",
+                  "apply_chunk: entries exceed offer received=%llu entries=%u offered=%llu",
+                  (unsigned long long)received, entries,
+                  (unsigned long long)offered);
+        return false;
+    }
+    return true;
+}
+
+static int snapsync_apply_chunk_entries(struct snapshot_sync_service *svc,
+                                        const uint8_t *chunk_data,
+                                        size_t chunk_len, uint32_t entries)
+{
+    size_t pos = 4;
+    int applied = 0;
+
+    if (!snapsync_chunk_fits_offer(svc, entries))
+        return -1;
+    for (uint32_t i = 0; i < entries; i++) {
+        if (!snapsync_apply_chunk_entry(svc, chunk_data, chunk_len, &pos, i))
+            return -1;
+        applied++;
+    }
+    return applied;
+}
+
 static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
                                       const uint8_t *chunk_data,
                                       size_t chunk_len)
 {
-    size_t pos = 4;
-    int applied = 0;
     uint32_t entries;
 
     if (!svc || !svc->ndb || !svc->ndb->open || !chunk_data || chunk_len < 4)
@@ -493,11 +537,10 @@ static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
     if (entries == 0 || entries > 1000)
         LOG_ERR("snapshot_sync", "apply_chunk: bad entry count %u", entries);
 
-    for (uint32_t i = 0; i < entries; i++) {
-        if (!snapsync_apply_chunk_entry(svc, chunk_data, chunk_len, &pos, i))
-            return -1;
-        applied++;
-    }
+    int applied = snapsync_apply_chunk_entries(svc, chunk_data, chunk_len,
+                                                entries);
+    if (applied < 0)
+        return -1;
 
     int progress = snapsync_record_chunk_progress(svc, applied);
     if (progress <= 0)
