@@ -103,6 +103,8 @@ struct beta6_session_slot {
 };
 
 static struct beta6_listener g_listener;
+static zcl_mutex_t g_listener_lock;
+static zcl_once_t g_listener_lock_once = ZCL_ONCE_INIT;
 static zcl_mutex_t g_session_lock;
 static bool g_session_lock_ready;
 static struct beta6_session_slot g_sessions[BETA6_MAX_SESSIONS];
@@ -112,6 +114,16 @@ static struct beta6_session_slot g_sessions[BETA6_MAX_SESSIONS];
  * worker pool does). */
 static struct thread_liveness_child g_accept_liveness = { .id = SUPERVISOR_INVALID_ID };
 static struct thread_liveness_child g_session_liveness = { .id = SUPERVISOR_INVALID_ID };
+
+static void listener_lock_init(void)
+{
+    zcl_mutex_init(&g_listener_lock);
+}
+
+static void listener_lock_init_once(void)
+{
+    (void)zcl_once_call(&g_listener_lock_once, listener_lock_init);
+}
 
 static void session_lock_init_once(void)
 {
@@ -586,15 +598,23 @@ struct zcl_result beta6_bs_listen_start(const char *bind_ip, uint16_t port,
                                         const unsigned char magic[4],
                                         const char *network, const char *params_dir)
 {
-    if (g_listener.running)
+    listener_lock_init_once();
+    LOCK(g_listener_lock);
+    if (g_listener.running) {
+        UNLOCK(g_listener_lock);
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "the beta6 bootstrap listener is already running");
+    }
     struct zcl_result armed = beta6_bs_status();
-    if (!armed.ok)
+    if (!armed.ok) {
+        UNLOCK(g_listener_lock);
         return armed;
-    if (!bind_ip || !magic || !network)
+    }
+    if (!bind_ip || !magic || !network) {
+        UNLOCK(g_listener_lock);
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "the beta6 bootstrap listener needs an address and network");
+    }
 
     memset(&g_listener, 0, sizeof(g_listener));
     memcpy(g_listener.magic, magic, 4);
@@ -602,12 +622,15 @@ struct zcl_result beta6_bs_listen_start(const char *bind_ip, uint16_t port,
     snprintf(g_listener.params_dir, sizeof(g_listener.params_dir), "%s",
              params_dir ? params_dir : "");
     struct zcl_result cached = encode_cached_manifest();
-    if (!cached.ok)
+    if (!cached.ok) {
+        UNLOCK(g_listener_lock);
         return cached;
+    }
     struct zcl_result bound = bind_listen_socket(bind_ip, port);
     if (!bound.ok) {
         free(g_listener.manifest_bytes);
         g_listener.manifest_bytes = NULL;
+        UNLOCK(g_listener_lock);
         return bound;
     }
 
@@ -623,9 +646,11 @@ struct zcl_result beta6_bs_listen_start(const char *bind_ip, uint16_t port,
         g_listener.manifest_bytes = NULL;
         thread_liveness_retire(&g_accept_liveness);
         thread_liveness_retire(&g_session_liveness);
+        UNLOCK(g_listener_lock);
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "could not start the beta6 bootstrap accept thread");
     }
+    UNLOCK(g_listener_lock);
     LOG_INFO("beta6boot", "serving beta6 bootstrap snapshots on %s:%u from %s", bind_ip,
              (unsigned)port, beta6_bs_source_dir());
     return ZCL_OK;
@@ -633,15 +658,23 @@ struct zcl_result beta6_bs_listen_start(const char *bind_ip, uint16_t port,
 
 void beta6_bs_listen_stop(void)
 {
-    if (!g_listener.running)
+    listener_lock_init_once();
+    LOCK(g_listener_lock);
+    if (!g_listener.running) {
+        UNLOCK(g_listener_lock);
         return;
+    }
     g_listener.stopping = true;
-    platform_socket_shutdown_both(g_listener.socket);
-    platform_socket_close(g_listener.socket);
-    pthread_join(g_listener.thread, NULL);
+    platform_socket_t socket = g_listener.socket;
+    pthread_t thread = g_listener.thread;
+    UNLOCK(g_listener_lock);
+    platform_socket_shutdown_both(socket);
+    platform_socket_close(socket);
+    pthread_join(thread, NULL);
     sessions_stop_all();
     thread_liveness_retire(&g_accept_liveness);
     thread_liveness_retire(&g_session_liveness);
+    LOCK(g_listener_lock);
     free(g_listener.manifest_bytes);
     g_listener.manifest_bytes = NULL;
     g_listener.running = false;
@@ -650,7 +683,11 @@ void beta6_bs_listen_stop(void)
 
 struct zcl_result beta6_bs_listen_status(void)
 {
-    if (!g_listener.running)
+    listener_lock_init_once();
+    LOCK(g_listener_lock);
+    bool running = g_listener.running;
+    UNLOCK(g_listener_lock);
+    if (!running)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "the beta6 bootstrap listener is not running");
     return ZCL_OK;
@@ -658,5 +695,9 @@ struct zcl_result beta6_bs_listen_status(void)
 
 uint16_t beta6_bs_listen_port(void)
 {
-    return g_listener.running ? g_listener.port : 0;
+    listener_lock_init_once();
+    LOCK(g_listener_lock);
+    uint16_t port = g_listener.running ? g_listener.port : 0;
+    UNLOCK(g_listener_lock);
+    return port;
 }
