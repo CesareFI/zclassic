@@ -50,6 +50,7 @@
 #include "util/thread_registry.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,7 +70,7 @@ struct beta6_listener {
     platform_socket_t socket;
     pthread_t thread;
     bool running;
-    bool stopping;
+    atomic_bool stopping;
     uint16_t port;
     unsigned char magic[4];
     char network[BETA6_BS_MAX_NETWORK_LEN];
@@ -371,7 +372,7 @@ static void *session_thread(void *opaque)
     platform_socket_set_receive_timeout(session->socket, BETA6_IO_TIMEOUT_MS);
     platform_socket_set_send_timeout(session->socket, BETA6_IO_TIMEOUT_MS);
 
-    while (!g_listener.stopping) {
+    while (!atomic_load_explicit(&g_listener.stopping, memory_order_acquire)) {
         char command[BETA6_COMMAND_SIZE + 1];
         unsigned char *payload = NULL;
         size_t payload_len = 0;
@@ -506,14 +507,14 @@ static void sessions_stop_all(void)
 static void *accept_thread(void *opaque)
 {
     (void)opaque;
-    while (!g_listener.stopping) {
+    while (!atomic_load_explicit(&g_listener.stopping, memory_order_acquire)) {
         struct sockaddr_in from;
         size_t from_size = sizeof(from);
         platform_socket_t accepted =
             platform_socket_accept(g_listener.socket, (struct sockaddr *)&from, &from_size);
         thread_liveness_beat(&g_accept_liveness, -1);
         if (accepted == PLATFORM_SOCKET_INVALID) {
-            if (g_listener.stopping)
+            if (atomic_load_explicit(&g_listener.stopping, memory_order_acquire))
                 break;
             continue;
         }
@@ -617,6 +618,7 @@ struct zcl_result beta6_bs_listen_start(const char *bind_ip, uint16_t port,
     }
 
     memset(&g_listener, 0, sizeof(g_listener));
+    atomic_init(&g_listener.stopping, false);
     memcpy(g_listener.magic, magic, 4);
     snprintf(g_listener.network, sizeof(g_listener.network), "%s", network);
     snprintf(g_listener.params_dir, sizeof(g_listener.params_dir), "%s",
@@ -664,7 +666,7 @@ void beta6_bs_listen_stop(void)
         UNLOCK(g_listener_lock);
         return;
     }
-    g_listener.stopping = true;
+    atomic_store_explicit(&g_listener.stopping, true, memory_order_release);
     platform_socket_t socket = g_listener.socket;
     pthread_t thread = g_listener.thread;
     UNLOCK(g_listener_lock);
@@ -678,7 +680,7 @@ void beta6_bs_listen_stop(void)
     free(g_listener.manifest_bytes);
     g_listener.manifest_bytes = NULL;
     g_listener.running = false;
-    g_listener.stopping = false;
+    atomic_store_explicit(&g_listener.stopping, false, memory_order_release);
 }
 
 struct zcl_result beta6_bs_listen_status(void)
