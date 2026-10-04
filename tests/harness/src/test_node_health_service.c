@@ -101,6 +101,27 @@ static bool health_test_network_tip_resolution(void)
                INT64_MAX, 0, INT64_MAX, false, -1, 0) == INT64_MAX;
 }
 
+static bool health_test_chain_advance_height_bounds(void)
+{
+    struct bsp_decision decision = {0};
+    struct bsp_source_status *p2p = &decision.sources[BSP_SOURCE_P2P];
+
+    decision.result = BSP_DECISION_USE_SOURCE;
+    decision.selected_source = BSP_SOURCE_P2P;
+    p2p->available = true;
+    p2p->healthy = true;
+    p2p->selectable = true;
+    decision.local_height = INT_MAX;
+    decision.target_height = INT_MAX;
+    if (!node_health_chain_advance_synced(&decision))
+        return false;
+    decision.local_height = INT_MAX - 1;
+    if (!node_health_chain_advance_synced(&decision))
+        return false;
+    decision.local_height = INT_MAX - 2;
+    return !node_health_chain_advance_synced(&decision);
+}
+
 int test_node_health_service(void)
 {
     int failures = 0;
@@ -934,6 +955,7 @@ int test_node_health_service(void)
         snprintf(decision.blocker, sizeof(decision.blocker),
                  "body-hash-mismatch");
         ok = ok && !node_health_chain_advance_synced(&decision);
+        ok &= health_test_chain_advance_height_bounds();
 
         if (ok) printf("OK\n");
         else { printf("FAIL\n"); failures++; }

@@ -131,6 +131,14 @@ void node_health_test_set_memory_rss_mb_override(int64_t memory_rss_mb)
 }
 #endif
 
+static bool node_health_chain_advance_has_gap(int local_height,
+                                              int target_height)
+{
+    return local_height >= 0 && target_height >= 0 &&
+           local_height < target_height &&
+           target_height - local_height > 1;
+}
+
 bool node_health_chain_advance_synced(const struct bsp_decision *decision)
 {
     if (!decision)
@@ -142,9 +150,9 @@ bool node_health_chain_advance_synced(const struct bsp_decision *decision)
         return false;
     if (decision->blocker[0] != '\0')
         return false;
-    if (decision->local_height < 0 || decision->target_height < 0)
-        return false;
-    if (decision->local_height + 1 < decision->target_height)
+    if (decision->local_height < 0 || decision->target_height < 0 ||
+        node_health_chain_advance_has_gap(decision->local_height,
+                                          decision->target_height))
         return false;
     const struct bsp_source_status *source =
         &decision->sources[decision->selected_source];
@@ -163,8 +171,8 @@ static bool node_health_chain_advance_blocks_at_tip(
         return true;
     if (decision->result == BSP_DECISION_BLOCKED)
         return true;
-    if (decision->local_height >= 0 && decision->target_height >= 0 &&
-        decision->local_height + 1 < decision->target_height)
+    if (node_health_chain_advance_has_gap(decision->local_height,
+                                          decision->target_height))
         return true;
     return false;
 }
@@ -185,8 +193,8 @@ static void node_health_chain_advance_reason(
         snprintf(out, out_len, "chain_advance_%.100s", decision->blocker);
         return;
     }
-    if (decision->local_height >= 0 && decision->target_height >= 0 &&
-        decision->local_height + 1 < decision->target_height) {
+    if (node_health_chain_advance_has_gap(decision->local_height,
+                                          decision->target_height)) {
         snprintf(out, out_len, "chain_advance_gap_%d",
                  decision->target_height - decision->local_height);
         return;
