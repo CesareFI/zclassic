@@ -72,6 +72,12 @@ static bool snapsync_decode_height(const uint8_t bytes[4], int *out)
     return true;
 }
 
+static uint32_t snapsync_decode_vout(const uint8_t bytes[4])
+{
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
 #ifdef ZCL_TESTING
 bool snapsync_test_decode_money(const uint8_t bytes[8], int64_t *out)
 {
@@ -81,6 +87,11 @@ bool snapsync_test_decode_money(const uint8_t bytes[8], int64_t *out)
 bool snapsync_test_decode_height(const uint8_t bytes[4], int *out)
 {
     return snapsync_decode_height(bytes, out);
+}
+
+uint32_t snapsync_test_decode_vout(const uint8_t bytes[4])
+{
+    return snapsync_decode_vout(bytes);
 }
 #endif
 
@@ -348,9 +359,7 @@ static bool snapsync_apply_chunk_entry(struct snapshot_sync_service *svc,
     memcpy(u.txid, chunk_data + at, 32);
     at += 32;
 
-    u.vout = (uint32_t)(chunk_data[at] | (chunk_data[at + 1] << 8) |
-                        (chunk_data[at + 2] << 16) |
-                        (chunk_data[at + 3] << 24));
+    u.vout = snapsync_decode_vout(chunk_data + at);
     at += 4;
 
     if (!snapsync_decode_money(chunk_data + at, &u.value))

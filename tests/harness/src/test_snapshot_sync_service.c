@@ -30,6 +30,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+uint32_t snapsync_test_decode_vout(const uint8_t bytes[4]);
+
 static void build_snapshot_chunk(struct byte_stream *s)
 {
     const uint8_t txid[32] = {
@@ -162,6 +164,24 @@ static void build_out_of_range_height_snapshot_chunk(struct byte_stream *s)
     /* [entry count:4][txid:32][vout:4][value:8][height:4]. The high
      * height byte sets bit 31, outside the signed block-index domain. */
     s->data[4 + 32 + 4 + 8 + 3] = 0x80;
+}
+
+static int test_snapshot_sync_service_vout_wire_decode(void)
+{
+    int failures = 0;
+
+    TEST("snapshot sync decodes high-bit vouts without signed shifts") {
+        const uint8_t ordinary[4] = { 2, 0, 0, 0 };
+        const uint8_t high_bit[4] = { 0, 0, 0, 0x80 };
+        const uint8_t maximum[4] = { 0xff, 0xff, 0xff, 0xff };
+
+        ASSERT(snapsync_test_decode_vout(ordinary) == 2);
+        ASSERT(snapsync_test_decode_vout(high_bit) == UINT32_C(0x80000000));
+        ASSERT(snapsync_test_decode_vout(maximum) == UINT32_MAX);
+        PASS();
+    } _test_next:;
+
+    return failures;
 }
 
 static void fill_v2_offer_params(struct snapshot_offer_params *params,
@@ -2201,6 +2221,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_chunk_apply_failure_fails_closed();
     failures += test_snapshot_sync_service_out_of_range_value_fails_closed();
     failures += test_snapshot_sync_service_out_of_range_height_fails_closed();
+    failures += test_snapshot_sync_service_vout_wire_decode();
     failures += test_snapshot_accept_offer_with_few_utxos();
     failures += test_snapshot_accept_offer_with_real_utxos();
     failures += test_snapshot_recovery_request_allows_populated_utxos();
