@@ -62,6 +62,28 @@ static int nw_count(struct node_db *ndb, const char *sql)
     return n;
 }
 
+static int test_refold_trailing_data_is_replaced(void)
+{
+    char dir[256], path[512];
+    const int32_t anchor = 3056758;
+    test_make_tmpdir(dir, sizeof(dir), "recovery_no_worse", "refold_trailing");
+    snprintf(path, sizeof(path), "%s/auto_refold_request", dir);
+    FILE *file = fopen(path, "w");
+    bool wrote = file != NULL;
+    if (file) {
+        wrote = fputs("999 2 trailing\n", file) >= 0 && fclose(file) == 0;
+    }
+    int32_t stored_anchor = 0;
+    int count = -1;
+    bool ok = wrote && boot_auto_refold_request(dir, anchor) == 1 &&
+              boot_auto_refold_status(dir, &stored_anchor, &count) &&
+              stored_anchor == anchor && count == 0;
+    printf("  recovery_no_worse: D3 trailing sentinel data is replaced, not resumed... %s\n",
+           ok ? "OK" : "FAIL");
+    test_cleanup_tmpdir(dir);
+    return ok ? 0 : 1;
+}
+
 int test_recovery_no_worse(void);
 int test_recovery_no_worse(void)
 {
@@ -194,6 +216,8 @@ int test_recovery_no_worse(void)
 
         test_cleanup_tmpdir(dir);
     }
+
+    failures += test_refold_trailing_data_is_replaced();
 
     /* Section D companion: a genuinely RECOVERED episode is not falsely
      * exhausted — the reindex sentinel's proven pattern, for refold. */

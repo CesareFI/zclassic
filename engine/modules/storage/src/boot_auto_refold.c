@@ -16,11 +16,23 @@
 #include "platform/private_file.h"
 
 #include <errno.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <string.h>
 
 static _Atomic uint64_t g_arf_temp_sequence;
+
+static bool arf_parse(const char *raw, int32_t *anchor, int *count)
+{
+    int consumed = 0;
+    bool ok = sscanf(raw, "%d %d %n", anchor, count, &consumed) == 2;
+
+    while (ok && raw[consumed] != '\0' &&
+           isspace((unsigned char)raw[consumed]))
+        consumed++;
+    return ok && raw[consumed] == '\0';
+}
 
 static void arf_path(const char *datadir, char *out, size_t n)
 {
@@ -60,7 +72,7 @@ static bool arf_read(const char *path, int32_t *anchor, int *count)
     if (!stable)
         return false;
     raw[before.size] = '\0';
-    bool ok = sscanf(raw, "%d %d", anchor, count) == 2;
+    bool ok = arf_parse(raw, anchor, count);
     if (!ok) {
         *anchor = 0;
         *count = 0;
