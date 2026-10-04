@@ -500,9 +500,23 @@ static _Atomic supervisor_child_id g_backfill_id = SUPERVISOR_INVALID_ID;
  * monotone. */
 static int64_t backfill_progress_marker(void)
 {
-    return (int64_t)atomic_load(&g_backfill_blocks_folded) +
-           (int64_t)atomic_load(&g_backfill_base_seeds);
+    uint64_t blocks = atomic_load(&g_backfill_blocks_folded);
+    uint64_t bases = atomic_load(&g_backfill_base_seeds);
+    if (blocks >= (uint64_t)INT64_MAX || bases >= (uint64_t)INT64_MAX ||
+        blocks > (uint64_t)INT64_MAX - bases)
+        return INT64_MAX;
+    return (int64_t)(blocks + bases);
 }
+
+#ifdef ZCL_TESTING
+int64_t op_return_backfill_test_progress_marker(uint64_t blocks,
+                                                uint64_t bases)
+{
+    atomic_store(&g_backfill_blocks_folded, blocks);
+    atomic_store(&g_backfill_base_seeds, bases);
+    return backfill_progress_marker();
+}
+#endif
 
 static void backfill_tick(struct liveness_contract *c)
 {

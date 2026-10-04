@@ -84,6 +84,8 @@ extern const char *g_op_return_backfill_test_datadir;
  * authority (index_fold_snapshot_seed_floor), which is the production path. */
 extern _Atomic int64_t g_op_return_backfill_test_seed_floor;
 int32_t op_return_backfill_test_batch_target(int32_t cursor, int32_t hstar);
+int64_t op_return_backfill_test_progress_marker(uint64_t blocks,
+                                                uint64_t bases);
 #endif
 
 #endif /* ZCL_SERVICES_OP_RETURN_BACKFILL_SERVICE_H */

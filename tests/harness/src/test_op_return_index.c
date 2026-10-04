@@ -1135,6 +1135,20 @@ static int test_backfill_batch_target_bounds(void)
     return failures;
 }
 
+static int test_backfill_progress_marker_bounds(void)
+{
+    int failures = 0;
+    printf("backfill progress marker: saturates instead of wrapping... ");
+    bool ok = op_return_backfill_test_progress_marker(4, 5) == 9 &&
+              op_return_backfill_test_progress_marker(UINT64_MAX, 1) ==
+                  INT64_MAX &&
+              op_return_backfill_test_progress_marker(INT64_MAX - 1, 2) ==
+                  INT64_MAX;
+    if (ok) printf("OK\n");
+    else { printf("FAIL\n"); failures++; }
+    return failures;
+}
+
 int test_op_return_index(void)
 {
     int failures = 0;
@@ -1144,6 +1158,7 @@ int test_op_return_index(void)
     failures += test_digest_pure();
     failures += test_cursor_state();
     failures += test_backfill_batch_target_bounds();
+    failures += test_backfill_progress_marker_bounds();
     failures += test_backfill_e2e();
     failures += test_backfill_genesis_fake_pos();
     failures += test_backfill_unreadable_body_backoff();
