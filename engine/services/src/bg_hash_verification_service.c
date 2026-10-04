@@ -140,11 +140,58 @@ const char *bg_hash_verify_state_name(enum bg_hash_verify_state state)
     switch (state) {
     case BG_HASH_VERIFY_IDLE:     return "idle";
     case BG_HASH_VERIFY_RUNNING:  return "running";
+    case BG_HASH_VERIFY_PAUSED:   return "paused";
     case BG_HASH_VERIFY_COMPLETE: return "complete";
     case BG_HASH_VERIFY_FAILED:   return "failed";
     default:                      return "unknown";
     }
 }
+
+static void bg_hash_verify_finish(struct bg_hash_verification_service *svc,
+                                  bool coverage_complete, int last_verified,
+                                  int chain_height, int mismatches, int verified,
+                                  const struct timespec *ts_start)
+{
+    if (!atomic_load(&svc->stop_requested) && !coverage_complete) {
+        save_progress(&svc->progress_store, last_verified);
+        atomic_store(&svc->progress.state, BG_HASH_VERIFY_PAUSED);
+        LOG_WARN("bg_hash_verify",
+                 "[bg-hash-verify] PAUSED at h=%d: body unavailable; will retry",
+                 last_verified);
+        bg_hash_verify_supervisor_done();
+        return;
+    }
+
+    if (!atomic_load(&svc->stop_requested))
+        save_progress(&svc->progress_store, chain_height);
+
+    struct timespec ts_end;
+    platform_time_monotonic_timespec(&ts_end);
+    double total = (ts_end.tv_sec - ts_start->tv_sec) +
+        (ts_end.tv_nsec - ts_start->tv_nsec) / 1e9;
+
+    if (mismatches > 0) {
+        LOG_WARN("bg", "[bg-hash-verify] FAILED: %d mismatches in %d blocks "
+                 "(%.0fs)", mismatches, verified, total);
+        atomic_store(&svc->progress.state, BG_HASH_VERIFY_FAILED);
+    } else if (!atomic_load(&svc->stop_requested)) {
+        printf("[bg-hash-verify] Complete: %d blocks verified, 0 mismatches "
+               "(%.0fs)\n", verified, total);
+        atomic_store(&svc->progress.state, BG_HASH_VERIFY_COMPLETE);
+    }
+    bg_hash_verify_supervisor_done();
+}
+
+#ifdef ZCL_TESTING
+void bg_hash_verify_test_pause_for_missing_body(
+    struct bg_hash_verification_service *svc, int last_verified)
+{
+    struct timespec now;
+    platform_time_monotonic_timespec(&now);
+    bg_hash_verify_finish(svc, false, last_verified, last_verified, 0, 0,
+                          &now);
+}
+#endif
 
 /* ── Main verification thread ─────────────────────────────────── */
 
@@ -185,6 +232,8 @@ static void *bg_hash_verify_thread(void *arg)
 
     int verified = 0;
     int mismatches = 0;
+    int last_verified = start_height - 1;
+    bool coverage_complete = true;
 
     for (int h = start_height; h <= chain_height; h++) {
         if (atomic_load(&svc->stop_requested)) break;
@@ -212,7 +261,10 @@ static void *bg_hash_verify_thread(void *arg)
         }
         zcl_mutex_unlock(&ms->cs_main);
 
-        if (!have_data) continue;
+        if (!have_data) {
+            coverage_complete = false;
+            break;
+        }
 
         /* Read block from disk (pread — thread-safe, no FILE* cache).
          * All disk I/O happens OUTSIDE cs_main to avoid blocking P2P. */
@@ -220,7 +272,8 @@ static void *bg_hash_verify_thread(void *arg)
         block_init(&blk);
         if (!read_block_from_disk_pread(&blk, &snap_pos, svc->datadir)) {
             block_free(&blk);
-            continue; /* block file may be missing — not a hash error */
+            coverage_complete = false;
+            break;
         }
 
         /* Recompute hash from the deserialized header */
@@ -239,6 +292,7 @@ static void *bg_hash_verify_thread(void *arg)
         }
 
         verified++;
+        last_verified = h;
         atomic_store(&svc->progress.verified_height, h);
         bg_hash_verify_supervisor_heartbeat(svc);
 
@@ -265,25 +319,8 @@ static void *bg_hash_verify_thread(void *arg)
         }
     }
 
-    /* Final save */
-    if (!atomic_load(&svc->stop_requested))
-        save_progress(&svc->progress_store, chain_height);
-
-    struct timespec ts_end;
-    platform_time_monotonic_timespec(&ts_end);
-    double total = (ts_end.tv_sec - ts_start.tv_sec) +
-        (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
-
-    if (mismatches > 0) {
-        LOG_WARN("bg", "[bg-hash-verify] FAILED: %d mismatches in %d blocks " "(%.0fs)", mismatches, verified, total);
-        atomic_store(&svc->progress.state, BG_HASH_VERIFY_FAILED);
-    } else if (!atomic_load(&svc->stop_requested)) {
-        printf("[bg-hash-verify] Complete: %d blocks verified, 0 mismatches "
-               "(%.0fs)\n", verified, total);
-        atomic_store(&svc->progress.state, BG_HASH_VERIFY_COMPLETE);
-    }
-
-    bg_hash_verify_supervisor_done();
+    bg_hash_verify_finish(svc, coverage_complete, last_verified, chain_height,
+                          mismatches, verified, &ts_start);
     return NULL;
 }
 

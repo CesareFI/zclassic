@@ -15,12 +15,42 @@
 #include "services/bg_hash_verification_service.h"
 #include "sync/sync_planner.h"
 #include "services/utxo_recovery_service.h"
+#include "platform/time_compat.h"
 #include "util/blocker.h"
 #include "util/supervisor.h"
 #include "validation/main_state.h"
 #include <string.h>
 #include <stdlib.h>
 #include <sqlite3.h>
+
+static int g_hash_verify_test_cursor;
+static int g_hash_verify_test_saved;
+
+static bool hash_verify_test_load_progress(void *self, int *out)
+{
+    (void)self;
+    *out = g_hash_verify_test_cursor;
+    return true;
+}
+
+static bool hash_verify_test_save_progress(void *self, int height)
+{
+    (void)self;
+    g_hash_verify_test_saved = height;
+    return true;
+}
+
+static bool hash_verify_wait_for_state(
+    const struct bg_hash_verification_service *svc,
+    enum bg_hash_verify_state expected)
+{
+    for (int attempt = 0; attempt < 100; attempt++) {
+        if (atomic_load(&svc->progress.state) == (int)expected)
+            return true;
+        platform_sleep_ms(10);
+    }
+    return false;
+}
 
 /* ── Helper: open in-memory SQLite with node_state + utxos tables ── */
 
@@ -535,12 +565,51 @@ static int test_integrity_bg_hash_verify_state_names(void)
     TEST("integrity: bg_hash_verify state names are correct") {
         ASSERT_STR_EQ(bg_hash_verify_state_name(BG_HASH_VERIFY_IDLE), "idle");
         ASSERT_STR_EQ(bg_hash_verify_state_name(BG_HASH_VERIFY_RUNNING), "running");
+        ASSERT_STR_EQ(bg_hash_verify_state_name(BG_HASH_VERIFY_PAUSED), "paused");
         ASSERT_STR_EQ(bg_hash_verify_state_name(BG_HASH_VERIFY_COMPLETE), "complete");
         ASSERT_STR_EQ(bg_hash_verify_state_name(BG_HASH_VERIFY_FAILED), "failed");
         ASSERT_STR_EQ(bg_hash_verify_state_name(99), "unknown");
         PASS();
     } _test_next:;
 
+    return failures;
+}
+
+static int test_integrity_bg_hash_verify_missing_body_pauses(void)
+{
+    int failures = 0;
+
+    TEST("integrity: bg_hash_verify never completes across a missing body") {
+        struct main_state ms;
+        main_state_init(&ms);
+        struct uint256 hash = {{0}};
+        hash.data[0] = 1;
+        struct block_index *index = chainstate_insert_block_index(
+            (struct chainstate *)&ms, &hash);
+        ASSERT(index != NULL);
+        index->nHeight = 1;
+        index->nStatus = BLOCK_VALID_SCRIPTS;
+        active_chain_move_window_tip(&ms.chain_active, index);
+
+        struct bg_hash_verification_service svc;
+        bg_hash_verify_init(&svc, &ms, NULL, "/tmp", NULL);
+        svc.progress_store = (struct bg_hash_verify_store_port) {
+            .self = &svc,
+            .load_progress = hash_verify_test_load_progress,
+            .save_progress = hash_verify_test_save_progress,
+        };
+        g_hash_verify_test_cursor = 1;
+        g_hash_verify_test_saved = -1;
+
+        ASSERT(bg_hash_verify_start(&svc).ok);
+        ASSERT(hash_verify_wait_for_state(&svc, BG_HASH_VERIFY_PAUSED));
+        bg_hash_verify_stop(&svc);
+        ASSERT_EQ(g_hash_verify_test_saved, 0);
+        ASSERT_EQ(atomic_load(&svc.progress.verified_height), 0);
+
+        main_state_free(&ms);
+        PASS();
+    } _test_next:;
     return failures;
 }
 
@@ -935,6 +1004,7 @@ int test_integrity(void)
     failures += test_integrity_bg_hash_verify_init();
     failures += test_integrity_bg_hash_verify_owns_datadir();
     failures += test_integrity_bg_hash_verify_state_names();
+    failures += test_integrity_bg_hash_verify_missing_body_pauses();
     failures += test_integrity_bg_hash_verify_no_start_without_ms();
     failures += test_integrity_bg_hash_verify_supervisor_contract();
     failures += test_integrity_bg_validation_supervisor_contract();

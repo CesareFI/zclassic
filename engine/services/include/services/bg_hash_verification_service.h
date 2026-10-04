@@ -33,6 +33,7 @@ struct chain_params;
 enum bg_hash_verify_state {
     BG_HASH_VERIFY_IDLE = 0,
     BG_HASH_VERIFY_RUNNING,
+    BG_HASH_VERIFY_PAUSED,
     BG_HASH_VERIFY_COMPLETE,
     BG_HASH_VERIFY_FAILED,
 };
@@ -79,6 +80,12 @@ struct bg_hash_verify_progress bg_hash_verify_get_progress(
     const struct bg_hash_verification_service *svc);
 
 const char *bg_hash_verify_state_name(enum bg_hash_verify_state state);
+
+#ifdef ZCL_TESTING
+/* Exact terminal path used when the active chain has an unreadable body. */
+void bg_hash_verify_test_pause_for_missing_body(
+    struct bg_hash_verification_service *svc, int last_verified);
+#endif
 
 extern struct bg_hash_verification_service *g_bg_hash_verify;
 
