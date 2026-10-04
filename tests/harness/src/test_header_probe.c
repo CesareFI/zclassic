@@ -330,11 +330,27 @@ static int test_header_probe_repair_stats_saturate(void)
     return ok ? 0 : 1;
 }
 
+static int test_header_probe_lag_bounds(void)
+{
+    int failures = 0;
+
+    HP_CHECK("lag: exact threshold remains under-lag",
+             header_probe_test_remote_tip_within_lag(INT_MAX - 100,
+                                                     INT_MAX, 100));
+    HP_CHECK("lag: one block beyond threshold schedules pull",
+             !header_probe_test_remote_tip_within_lag(INT_MAX - 100,
+                                                      INT_MAX, 99));
+    HP_CHECK("lag: maximum local tip does not overflow into a pull",
+             header_probe_test_remote_tip_within_lag(INT_MAX, INT_MAX, 100));
+    return failures;
+}
+
 int test_header_probe(void)
 {
     printf("\n=== header probe service tests ===\n");
     int failures = 0;
     failures += test_header_probe_repair_stats_saturate();
+    failures += test_header_probe_lag_bounds();
 
     const struct chain_params *params = chain_params_get();
     if (!params) {

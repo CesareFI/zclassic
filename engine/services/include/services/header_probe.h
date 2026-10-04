@@ -133,6 +133,8 @@ void header_probe_test_seed_repair_stats(int64_t oracle_repairs,
                                          int64_t p2p_requests,
                                          int64_t p2p_repairs,
                                          int64_t p2p_no_peer_events);
+bool header_probe_test_remote_tip_within_lag(int local_tip, int remote_tip,
+                                             int lag_threshold);
 #endif
 
 #endif /* ZCL_SERVICES_HEADER_PROBE_H */

@@ -163,6 +163,13 @@ static int hp_range_end(int start_height, int max_headers)
     return end > INT_MAX ? INT_MAX : (int)end;
 }
 
+static bool hp_remote_tip_within_lag(int local_tip, int remote_tip,
+                                     int lag_threshold)
+{
+    return (int64_t)remote_tip <=
+           (int64_t)local_tip + (int64_t)lag_threshold;
+}
+
 struct zcl_result header_probe_pull_range(int start_height, int max_headers,
                                           int *out_added)
 {
@@ -352,7 +359,8 @@ void header_probe_tick_once(void)
     atomic_store(&g_hp.last_remote_height, remote_tip);
     atomic_store(&g_hp.last_local_height, local_tip);
 
-    if (remote_tip <= local_tip + lag_thresh) return;  /* under-lag */
+    if (hp_remote_tip_within_lag(local_tip, remote_tip, lag_thresh))
+        return;  /* under-lag */
 
     int added = 0;
     (void)header_probe_pull_range(local_tip + 1, batch, &added);  /* result ignored — RPC errors surface via state counters */
@@ -498,6 +506,12 @@ void header_probe_test_seed_repair_stats(int64_t oracle_repairs,
     atomic_store(&g_hp.p2p_requests, p2p_requests);
     atomic_store(&g_hp.p2p_repairs, p2p_repairs);
     atomic_store(&g_hp.p2p_no_peer_events, p2p_no_peer_events);
+}
+
+bool header_probe_test_remote_tip_within_lag(int local_tip, int remote_tip,
+                                             int lag_threshold)
+{
+    return hp_remote_tip_within_lag(local_tip, remote_tip, lag_threshold);
 }
 #endif
 
