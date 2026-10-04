@@ -382,13 +382,18 @@ bool snapsync_is_peer_blacklisted(const struct snapshot_sync_service *svc,
 
     int64_t now = snapsync_now_us_internal();
     int64_t expiry_us = SNAPSYNC_BLACKLIST_SECS * 1000000LL;
+    bool blacklisted = false;
 
+    snapsync_service_lock_internal();
     for (int i = 0; i < svc->blacklist_count; i++) {
         if (svc->blacklist[i].peer_id == peer_id &&
-            (now - svc->blacklist[i].blacklisted_at_us) < expiry_us)
-            return true;
+            (now - svc->blacklist[i].blacklisted_at_us) < expiry_us) {
+            blacklisted = true;
+            break;
+        }
     }
-    return false;
+    snapsync_service_unlock_internal();
+    return blacklisted;
 }
 
 void snapsync_blacklist_peer(struct snapshot_sync_service *svc,
@@ -400,10 +405,12 @@ void snapsync_blacklist_peer(struct snapshot_sync_service *svc,
     int64_t now = snapsync_now_us_internal();
     int64_t expiry_us = SNAPSYNC_BLACKLIST_SECS * 1000000LL;
 
+    snapsync_service_lock_internal();
     /* Check if already blacklisted — refresh timestamp */
     for (int i = 0; i < svc->blacklist_count; i++) {
         if (svc->blacklist[i].peer_id == peer_id) {
             svc->blacklist[i].blacklisted_at_us = now;
+            snapsync_service_unlock_internal();
             return;
         }
     }
@@ -423,6 +430,7 @@ void snapsync_blacklist_peer(struct snapshot_sync_service *svc,
         svc->blacklist[svc->blacklist_count].blacklisted_at_us = now;
         svc->blacklist_count++;
     }
+    snapsync_service_unlock_internal();
 }
 
 /* ── Init / Reset ────────────────────────────────────────── */
