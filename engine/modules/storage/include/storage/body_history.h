@@ -246,6 +246,10 @@ struct body_history_census {
  * catch-up loop. Saturate rather than wrapping back to apparent zero work. */
 uint64_t body_history_counter_saturating_add(uint64_t value, uint64_t add);
 
+/* JSON and condition progress use signed integers. Keep a saturated lifetime
+ * counter honest at that boundary instead of narrowing UINT64_MAX to -1. */
+int64_t body_history_counter_saturating_i64(uint64_t value);
+
 /* Record bodies accepted by the history download lane. Keeping this update
  * here makes the counter's saturation and locking policy single-owner. */
 void body_history_global_note_enqueued(size_t added);

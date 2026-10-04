@@ -36,7 +36,8 @@ static bool bhu_snapshot(struct body_history_verdict *v, int64_t *examined)
     bool published = body_history_get_verdict(v);
     if (examined) {
         body_history_global_lock();
-        *examined = (int64_t)body_history_global_census()->heights_examined;
+        *examined = body_history_counter_saturating_i64(
+            body_history_global_census()->heights_examined);
         body_history_global_unlock();
     }
     return published;
