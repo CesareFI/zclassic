@@ -224,7 +224,8 @@ bool syncsvc_peer_is_configured_inbound(const struct p2p_node *node)
 
 bool syncsvc_peer_may_serve_headers(const struct p2p_node *node)
 {
-    return node && (!node->inbound || syncsvc_peer_is_configured_inbound(node));
+    return node && !node->disconnect &&
+           (!node->inbound || syncsvc_peer_is_configured_inbound(node));
 }
 
 bool syncsvc_configured_inbound_body_stalled(const struct p2p_node *node,

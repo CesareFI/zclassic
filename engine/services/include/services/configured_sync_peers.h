@@ -150,7 +150,9 @@ bool configured_sync_peer_probe_socket_for_testing(
 /* The inbound half of the rule above. False for outbound peers. */
 bool syncsvc_peer_is_configured_inbound(const struct p2p_node *node);
 
-/* An outbound peer, or an inbound peer that satisfies the rule above. */
+/* A live outbound peer, or a live inbound peer that satisfies the rule above.
+ * A peer marked for disconnect cannot receive another header request before
+ * connman removes its session. */
 bool syncsvc_peer_may_serve_headers(const struct p2p_node *node);
 
 /* Body discipline parity. The sealed core applies Rule C (header-only peer

@@ -115,6 +115,19 @@ int test_header_sync(void)
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 
+    /* ── 9a. Disconnecting peers never get a new header request ── */
+    printf("header_sync: disconnecting peer not requested... ");
+    {
+        struct p2p_node n = make_test_node(10000, 0);
+        struct sync_getheaders_action action;
+        n.disconnect = true;
+        n.state = PEER_DISCONNECTING;
+        syncsvc_plan_periodic_getheaders(&action, &n, 100, 15);
+        bool ok = !syncsvc_should_request_headers(&n, 100, 15) &&
+                  !action.should_send;
+        if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
+    }
+
     /* ── 10. plan_periodic_getheaders sets should_send ────── */
     printf("header_sync: plan periodic getheaders... ");
     {
