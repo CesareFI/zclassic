@@ -30,6 +30,8 @@
 
 #include <sqlite3.h>
 
+#include <limits.h>
+
 #include "util/ar_step_readonly.h"
 #include "util/log_macros.h"
 
@@ -88,6 +90,32 @@ static bool urs_utxo_height_summary(struct node_db *ndb,
     return ok;
 }
 
+static bool urs_utxo_height_below_window(int64_t max_utxo_h,
+                                         int64_t sync_h)
+{
+    if (max_utxo_h < 0 || sync_h <= 0 || sync_h > INT_MAX)
+        return true;
+    return max_utxo_h < sync_h &&
+           sync_h - max_utxo_h > UTXO_CHECKPOINT_NEAR_WINDOW;
+}
+
+static bool urs_utxo_height_above_guard(int64_t max_utxo_h,
+                                        int64_t sync_h)
+{
+    if (max_utxo_h <= sync_h)
+        return false;
+    return sync_h == INT64_MAX || max_utxo_h - sync_h > 1;
+}
+
+#ifdef ZCL_TESTING
+bool utxo_recovery_test_stale_cursor_heights_allowed(int64_t max_utxo_h,
+                                                     int64_t sync_h)
+{
+    return !urs_utxo_height_below_window(max_utxo_h, sync_h) &&
+           !urs_utxo_height_above_guard(max_utxo_h, sync_h);
+}
+#endif
+
 bool utxo_recovery_repair_stale_cursor_from_sync_projection(
     struct node_db *ndb)
 {
@@ -130,7 +158,7 @@ bool utxo_recovery_repair_stale_cursor_from_sync_projection(
         !have_utxos)
         return false;
 
-    if (max_utxo_h + UTXO_CHECKPOINT_NEAR_WINDOW < sync_h) {
+    if (urs_utxo_height_below_window(max_utxo_h, sync_h)) {
         LOG_WARN("chain", "stale cursor repair refused: coins_h=%lld "
                  "sync_h=%lld max_utxo_h=%lld below sync window=%d",
                  (long long)coins_h, (long long)sync_h,
@@ -143,7 +171,7 @@ bool utxo_recovery_repair_stale_cursor_from_sync_projection(
         return false;
     }
 
-    if (max_utxo_h > sync_h + 1) {
+    if (urs_utxo_height_above_guard(max_utxo_h, sync_h)) {
         LOG_WARN("chain", "stale cursor repair refused: coins_h=%lld "
                  "sync_h=%lld max_utxo_h=%lld exceeds one-block guard",
                  (long long)coins_h, (long long)sync_h,

@@ -373,10 +373,30 @@ static void urs_frontier_fixture_teardown(struct urs_frontier_fixture *fx)
     unlink(fx->db_path);
 }
 
+extern bool utxo_recovery_test_stale_cursor_heights_allowed(
+    int64_t max_utxo_h, int64_t sync_h);
+
+static int urs_test_stale_cursor_height_bounds(void)
+{
+    int failures = 0;
+
+    URS_CHECK("urs: stale cursor height bounds reject INT64_MAX safely",
+              utxo_recovery_test_stale_cursor_heights_allowed(105, 105) &&
+              utxo_recovery_test_stale_cursor_heights_allowed(106, 105) &&
+              !utxo_recovery_test_stale_cursor_heights_allowed(
+                  INT64_MAX, INT64_MAX) &&
+              !utxo_recovery_test_stale_cursor_heights_allowed(
+                  INT64_MAX, 105) &&
+              !utxo_recovery_test_stale_cursor_heights_allowed(-1, 105));
+    return failures;
+}
+
 int test_utxo_recovery_service(void)
 {
     printf("\n=== utxo recovery service tests ===\n");
     int failures = 0;
+
+    failures += urs_test_stale_cursor_height_bounds();
 
     /* ── 1. Policy-gated wipe: allowed (small UTXO set) ── */
 
