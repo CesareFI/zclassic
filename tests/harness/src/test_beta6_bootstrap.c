@@ -462,6 +462,19 @@ int test_beta6_bootstrap(void)
         PASS();
     }
 
+    TEST("an anchor sidecar rejects an out-of-range height") {
+        char dir[512];
+        char sidecar[1100];
+        test_make_tmpdir(dir, sizeof(dir), "beta6_bootstrap", "sidecar_height");
+        snprintf(sidecar, sizeof(sidecar), "%s.anchor", dir);
+        ASSERT(fixture_anchor(dir, "4294967296 00000663e40f1fe0bc32a7e7282fac25de5fe8ec"
+                                   "efd9c627e2fd948d388f7053"));
+        int32_t height = -1;
+        struct uint256 hash = {0};
+        ASSERT(!beta6_bs_read_height_hash_sidecar(sidecar, &height, &hash).ok);
+        PASS();
+    }
+
     /* ───────────────────── arm against a real tree ───────────────────── */
 
     TEST("arming orders chainstate before blocks and totals the real bytes") {
