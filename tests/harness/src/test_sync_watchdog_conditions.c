@@ -127,6 +127,40 @@ static struct block_index *insert_watchdog_block(struct main_state *ms,
     return bi;
 }
 
+static int test_local_header_refill_child_lookup_paths(void)
+{
+    struct main_state ms;
+    main_state_init(&ms);
+    struct uint256 root_h, tip_h, best_h, fork_h;
+    struct block_index *root = insert_watchdog_block(
+        &ms, &root_h, 0x61, 9, NULL, BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA);
+    struct block_index *tip = insert_watchdog_block(
+        &ms, &tip_h, 0x62, 10, root, BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA);
+    struct block_index *best_child = insert_watchdog_block(
+        &ms, &best_h, 0x63, 11, tip, BLOCK_VALID_TREE);
+    bool ok = root && tip && best_child &&
+        active_chain_move_window_tip(&ms.chain_active, tip);
+    ms.pindex_best_header = best_child;
+
+    zcl_mutex_lock(&ms.cs_main);
+    ok = ok && sync_monitor_active_next_child_exists(&ms, tip, 11);
+    zcl_mutex_unlock(&ms.cs_main);
+
+    /* A best-header fork cannot hide another nonfailed child of the active
+     * tip: the production predicate must retain its old scan fallback. */
+    struct block_index *fork = insert_watchdog_block(
+        &ms, &fork_h, 0x64, 11, root, BLOCK_VALID_TREE);
+    ms.pindex_best_header = fork;
+    zcl_mutex_lock(&ms.cs_main);
+    ok = ok && fork && sync_monitor_active_next_child_exists(&ms, tip, 11);
+    zcl_mutex_unlock(&ms.cs_main);
+
+    printf("sync_watchdog_conditions: local header child lookup paths... %s\n",
+           ok ? "OK" : "FAIL");
+    main_state_free(&ms);
+    return ok ? 0 : 1;
+}
+
 static const struct json_value *sync_watchdog_condition_json(
     const struct json_value *conditions,
     const char *name)
@@ -1180,6 +1214,7 @@ int test_sync_watchdog_conditions(void)
     failures += test_local_header_refill_new_episode();
     failures += test_local_header_refill_retry_counter_saturates();
     failures += test_local_header_refill_resolution_matches_episode();
+    failures += test_local_header_refill_child_lookup_paths();
     failures += test_header_stall_uses_monotonic_timeout();
 
     failures += test_sync_monitor_download_counter_saturation();

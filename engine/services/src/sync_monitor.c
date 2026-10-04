@@ -649,12 +649,36 @@ struct zcl_result sync_monitor_queue_best_header_body(
                              expected_hash);
 }
 
+static bool sync_monitor_best_header_child_exists(struct main_state *ms,
+                                                  struct block_index *tip,
+                                                  int next_h)
+{
+    /* The normal recovery case is a best-header continuation above the
+     * active tip.  Resolve that child through the skip list before falling
+     * back to the map walk: block_map_next() takes its rwlock once per
+     * visited bucket, so scanning a deep index while cs_main is held turns a
+     * cheap watchdog witness into avoidable contention with block intake.
+     *
+     * Keep the exact old predicate for this fast path.  In particular, an
+     * off-best-chain child still reaches the scan below; merely receiving a
+     * nonfailed child is sufficient to resolve the local-header symptom. */
+    struct block_index *best = ms->pindex_best_header;
+    if (!best || best->nHeight < next_h)
+        return false;
+    struct block_index *child = block_index_get_ancestor(best, next_h);
+    return child && child->nHeight == next_h && child->pprev == tip &&
+           child->phashBlock && !(child->nStatus & BLOCK_FAILED_MASK);
+}
+
 bool sync_monitor_active_next_child_exists(struct main_state *ms,
                                            struct block_index *tip,
                                            int next_h)
 {
     if (!ms || !tip)
         return false;
+
+    if (sync_monitor_best_header_child_exists(ms, tip, next_h))
+        return true;
 
     size_t iter = 0;
     struct block_index *bi = NULL;
