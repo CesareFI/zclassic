@@ -399,7 +399,11 @@ void syncsvc_note_headers_received(struct p2p_node *node,
         atomic_store_explicit(&node->last_useful_headers_time,
                               (int64_t)platform_time_wall_time_t(),
                               memory_order_relaxed);
-        node->total_headers_delivered += (uint64_t)newly_added;
+        uint64_t added = (uint64_t)newly_added;
+        node->total_headers_delivered =
+            node->total_headers_delivered > UINT64_MAX - added
+                ? UINT64_MAX
+                : node->total_headers_delivered + added;
     } else {
         syncsvc_note_stale_headers(node);
     }

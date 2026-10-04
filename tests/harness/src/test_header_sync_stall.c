@@ -79,6 +79,23 @@ static int test_fallback_rollback_rearm(void)
     return 1;
 }
 
+static int test_delivered_header_credit_saturates(void)
+{
+    printf("header_sync_stall: delivered-header credit saturates... ");
+    struct p2p_node n = make_stall_node(10000, false, 1000);
+    n.total_headers_delivered = UINT64_MAX - 1;
+    syncsvc_note_headers_received(&n, 2);
+    bool ok = n.total_headers_delivered == UINT64_MAX;
+    syncsvc_note_headers_received(&n, 1);
+    ok = ok && n.total_headers_delivered == UINT64_MAX;
+    if (ok) {
+        printf("OK\n");
+        return 0;
+    }
+    printf("FAIL\n");
+    return 1;
+}
+
 int test_header_sync_stall(void)
 {
     int failures = 0;
@@ -135,7 +152,12 @@ int test_header_sync_stall(void)
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 
-    /* ── 4. Stale peer disconnect fires after 120s in IBD ─────────
+    /* The recovery path uses this counter to choose the least-useful peer.
+     * A long-lived useful peer must not become the apparent worst peer after
+     * its lifetime total reaches the unsigned boundary. */
+    failures += test_delivered_header_credit_saturates();
+
+    /* ── 5. Stale peer disconnect fires after 120s in IBD ─────────
      * best_header_height far below the peer's claimed tip: the parity
      * gate (P2) stays out of the way. */
     printf("header_sync_stall: disconnect stale peer after 120s... ");
@@ -151,7 +173,7 @@ int test_header_sync_stall(void)
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
 
-    /* ── 5. Peer with recent useful headers not disconnected ─────── */
+    /* ── 6. Peer with recent useful headers not disconnected ─────── */
     printf("header_sync_stall: active peer not disconnected... ");
     {
         struct p2p_node n = make_stall_node(10000, false, 1000);
