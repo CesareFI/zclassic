@@ -95,6 +95,14 @@ static int case_mint_active(void)
     setenv("ZCL_REFOLD_TICK_MS", "999999", 1);       /* above ceiling → 60000 */
     RC_CHECK("mint: tick clamp high",
              refold_cadence_tick_period_us() == (int64_t)60000 * 1000);
+    setenv("ZCL_REFOLD_DRAIN_BATCH", "1junk", 1);
+    RC_CHECK("mint: batch trailing junk falls back to default",
+             refold_cadence_drain_batch(100) ==
+                 REFOLD_CADENCE_DEFAULT_DRAIN_BATCH);
+    setenv("ZCL_REFOLD_TICK_MS", "1junk", 1);
+    RC_CHECK("mint: tick trailing junk falls back to default",
+             refold_cadence_tick_period_us() ==
+                 (int64_t)REFOLD_CADENCE_DEFAULT_TICK_MS * 1000);
 
     rc_clear_gates();
     return failures;

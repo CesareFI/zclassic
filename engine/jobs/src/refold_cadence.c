@@ -20,7 +20,7 @@ static int cadence_env_int(const char *name, int def, int lo, int hi)
         return def;
     char *end = NULL;
     long n = strtol(v, &end, 10);
-    if (end == v)          /* no digits parsed */
+    if (end == v || *end != '\0')
         return def;
     if (n < lo) n = lo;
     if (n > hi) n = hi;
