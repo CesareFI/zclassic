@@ -181,10 +181,12 @@ bool txindex_projection_get_cursor(sqlite3 *db, int64_t *cursor_out)
         const void *b = sqlite3_column_blob(st, 0);
         int n = sqlite3_column_bytes(st, 0);
         if (b && n == 8) {
-            int64_t v = 0;
+            uint64_t raw = 0;
             const uint8_t *p = b;
             for (int i = 0; i < 8; i++)
-                v |= (int64_t)p[i] << (8 * i);
+                raw |= (uint64_t)p[i] << (8 * i);
+            int64_t v = 0;
+            memcpy(&v, &raw, sizeof(v));
             *cursor_out = v;
         }
     } else if (rc != SQLITE_DONE) {

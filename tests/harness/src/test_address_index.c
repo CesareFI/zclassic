@@ -57,6 +57,18 @@ static void ai_set_vouts(struct transaction *tx, size_t nout,
     }
 }
 
+static int ai_check_negative_cursor(sqlite3 *db, const uint8_t digest[32])
+{
+    int failures = 0;
+    int64_t cursor = 0;
+
+    AI_CHECK("set_cursor preserves negative sentinel",
+             address_index_set_cursor(db, -1, digest));
+    AI_CHECK("get_cursor preserves negative sentinel",
+             address_index_get_cursor(db, &cursor) && cursor == -1);
+    return failures;
+}
+
 /* Give `tx` one input spending (prev_txid, prev_vout). NULL prev_txid => a
  * coinbase-shaped null prevout. */
 static void ai_set_spend(struct transaction *tx, const struct uint256 *prev,
@@ -386,6 +398,7 @@ int test_address_index(void)
                  address_index_get_digest(db, dg, &found) && found &&
                  memcmp(dg, digest_full, 32) == 0);
     }
+    failures += ai_check_negative_cursor(db, digest_full);
 
     /* ── drop-and-rederive is deterministic (rebuildable) ────────── */
     AI_CHECK("drop", address_index_drop(db));

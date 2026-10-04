@@ -38,6 +38,18 @@ static void ti_set_txid(struct transaction *tx, uint8_t tag)
     tx->hash.data[31] = 0xAB;
 }
 
+static int ti_check_negative_cursor(sqlite3 *db, const uint8_t digest[32])
+{
+    int failures = 0;
+    int64_t cursor = 0;
+
+    TI_CHECK("set_cursor preserves negative sentinel",
+             txindex_projection_set_cursor(db, -1, digest));
+    TI_CHECK("get_cursor preserves negative sentinel",
+             txindex_projection_get_cursor(db, &cursor) && cursor == -1);
+    return failures;
+}
+
 int test_txindex_projection(void);
 int test_txindex_projection(void)
 {
@@ -195,6 +207,7 @@ int test_txindex_projection(void)
                  txindex_projection_get_digest(db, dg, &found) && found &&
                  memcmp(dg, digest_full, 32) == 0);
     }
+    failures += ti_check_negative_cursor(db, digest_full);
 
     /* ── drop-and-rederive is deterministic (rebuildable) ────────── */
     TI_CHECK("drop", txindex_projection_drop(db));
