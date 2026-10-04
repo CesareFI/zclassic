@@ -688,8 +688,9 @@ struct zcl_result beta6_bs_listen_status(void)
     listener_lock_init_once();
     LOCK(g_listener_lock);
     bool running = g_listener.running;
+    bool stopping = atomic_load_explicit(&g_listener.stopping, memory_order_acquire);
     UNLOCK(g_listener_lock);
-    if (!running)
+    if (!running || stopping)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "the beta6 bootstrap listener is not running");
     return ZCL_OK;
@@ -699,7 +700,11 @@ uint16_t beta6_bs_listen_port(void)
 {
     listener_lock_init_once();
     LOCK(g_listener_lock);
-    uint16_t port = g_listener.running ? g_listener.port : 0;
+    uint16_t port = g_listener.running &&
+                            !atomic_load_explicit(&g_listener.stopping,
+                                                  memory_order_acquire)
+                        ? g_listener.port
+                        : 0;
     UNLOCK(g_listener_lock);
     return port;
 }
