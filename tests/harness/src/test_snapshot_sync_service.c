@@ -43,6 +43,10 @@ struct reset_thread_ctx {
     struct snapshot_sync_service *svc;
 };
 
+struct failed_reset_thread_ctx {
+    bool reset_detected;
+};
+
 struct snapshot_reset_fixture {
     struct snapshot_sync_service svc;
     struct node_db ndb;
@@ -75,6 +79,14 @@ static void *snapshot_reset_thread(void *ctx)
     struct reset_thread_ctx *thread = ctx;
 
     snapsync_reset(thread->svc);
+    return NULL;
+}
+
+static void *snapshot_failed_reset_thread(void *ctx)
+{
+    struct failed_reset_thread_ctx *thread = ctx;
+
+    thread->reset_detected = snapsync_check_failed_reset();
     return NULL;
 }
 
@@ -1202,6 +1214,52 @@ static int test_snapshot_sync_reset_rejects_late_chunk(void)
     return failures;
 }
 
+static bool snapshot_reset_blocks_concurrent_failed_reset(void)
+{
+    struct snapshot_reset_fixture f;
+    struct failed_reset_thread_ctx failed_reset = {0};
+    pthread_t failed_reset_thread;
+    uint8_t root[32] = {0};
+    bool failed_reset_started = false;
+    bool result = false;
+
+    memset(&f, 0, sizeof(f));
+    if (!snapshot_reset_fixture_open(&f))
+        goto cleanup;
+    f.runtime.snapshot_sync = &f.svc;
+    snapsync_init(&f.svc, &f.ndb);
+    if (!snapshot_reset_fixture_start(&f))
+        goto cleanup;
+    if (pthread_create(&failed_reset_thread, NULL,
+                       snapshot_failed_reset_thread, &failed_reset) != 0)
+        goto cleanup;
+    failed_reset_started = true;
+    if (pthread_join(failed_reset_thread, NULL) != 0)
+        goto cleanup;
+    failed_reset_started = false;
+    if (!failed_reset.reset_detected)
+        goto cleanup;
+    result = !snapsync_accept_offer(&f.svc, 1, 1, root, root, root, 99).ok;
+
+cleanup:
+    if (failed_reset_started)
+        (void)pthread_join(failed_reset_thread, NULL);
+    snapshot_reset_fixture_cleanup(&f);
+    return result;
+}
+
+static int test_snapshot_sync_reset_coalesces_concurrent_failure(void)
+{
+    int failures = 0;
+
+    TEST("snapshot reset keeps admission closed until concurrent cleanup ends") {
+        ASSERT(snapshot_reset_blocks_concurrent_failed_reset());
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_snapshot_sync_service_runtime_accessor(void)
 {
     int failures = 0;
@@ -2286,6 +2344,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_offer_churn();
     failures += test_snapshot_sync_service_db_service_runtime();
     failures += test_snapshot_sync_reset_rejects_late_chunk();
+    failures += test_snapshot_sync_reset_coalesces_concurrent_failure();
     failures += test_snapshot_sync_service_runtime_accessor();
     failures += test_snapshot_sync_service_db_service_chunk_contained();
     failures += test_snapshot_sync_service_containment_preserves_canonical_state();

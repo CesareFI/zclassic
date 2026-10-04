@@ -68,6 +68,11 @@
 static struct snapshot_sync_service g_snapsync_instance;
 static bool g_snapsync_init_done = false;
 static pthread_mutex_t g_snapsync_service_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The service lock protects the one process-wide snapshot service.  Reset
+ * deliberately releases it while it drains the database lane, so retain an
+ * explicit lifecycle latch under that same lock: a second failure observer
+ * must not publish IDLE while the first reset is still cleaning up. */
+static bool g_snapsync_resetting = false;
 
 #ifdef ZCL_TESTING
 static snapsync_reset_gate_fn g_snapsync_reset_gate = NULL;
@@ -262,6 +267,11 @@ void snapsync_reset(struct snapshot_sync_service *svc)
         return;
     }
     snapsync_service_lock_internal();
+    if (g_snapsync_resetting) {
+        snapsync_service_unlock_internal();
+        return;
+    }
+    g_snapsync_resetting = true;
     bool turbo_active = svc->turbo_active;
     has_db_owner = svc->ndb != NULL;
     has_db = svc->ndb && svc->ndb->open;
@@ -292,6 +302,7 @@ void snapsync_reset(struct snapshot_sync_service *svc)
     if (!rollback_ok || !normal_mode_ok || !discard_ok) {
         snapsync_service_lock_internal();
         svc->state = SNAPSYNC_FAILED;
+        g_snapsync_resetting = false;
         (void)snapsync_set_state(SNAPSYNC_FAILED,
                                  "reset incomplete; containment retained");
         snapsync_service_unlock_internal();
@@ -327,6 +338,7 @@ void snapsync_reset(struct snapshot_sync_service *svc)
      * to main_state.map_block_index (or a caller-owned test object). */
     g_snapshot_anchor = NULL;
     svc->state = SNAPSYNC_IDLE;
+    g_snapsync_resetting = false;
     snapsync_set_state(SNAPSYNC_IDLE, "reset");
     snapsync_service_unlock_internal();
 
