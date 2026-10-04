@@ -9,6 +9,11 @@
 
 #include <limits.h>
 
+/* ZCL_TESTING seam from header_sync_service.c.  It observes the real
+ * stale-interval telemetry fold rather than duplicating planner arithmetic. */
+void syncsvc_test_reset_stale_interval_observations(void);
+int syncsvc_test_stale_interval_observations(void);
+
 /* Helper: build a minimal p2p_node for testing sync decisions. */
 static struct p2p_node make_test_node(int starting_height, int64_t last_gh_time)
 {
@@ -21,6 +26,22 @@ static struct p2p_node make_test_node(int starting_height, int64_t last_gh_time)
     n.inbound = false;
     n.getheaders_stale_count = 0;
     return n;
+}
+
+static int test_planned_stale_request_records_once(void)
+{
+    const uint8_t remote[4] = {203, 0, 113, 9};
+    struct p2p_node n = make_test_node(1000, 0);
+    struct sync_getheaders_action action;
+
+    n.getheaders_stale_count = 1;
+    net_addr_set_ipv4(&n.addr.svc.addr, remote);
+    syncsvc_test_reset_stale_interval_observations();
+    syncsvc_plan_periodic_getheaders(&action, &n, 1000, 241);
+    bool ok = action.should_send &&
+              syncsvc_test_stale_interval_observations() == 1;
+    printf(ok ? "OK\n" : "FAIL\n");
+    return ok ? 0 : 1;
 }
 
 int test_header_sync(void)
@@ -126,6 +147,10 @@ int test_header_sync(void)
         bool ok = action.should_send;
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
+
+    /* ── 10b. planned stale request records one observation ─ */
+    printf("header_sync: planned stale request records once... ");
+    failures += test_planned_stale_request_records_once();
 
     /* ── 11. evaluate_header_batch: full batch requests more ─ */
     printf("header_sync: full batch requests more headers... ");

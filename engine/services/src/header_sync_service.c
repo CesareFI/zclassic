@@ -47,6 +47,24 @@ static int syncsvc_stale_window_note(void)
     return current;
 }
 
+#ifdef ZCL_TESTING
+void syncsvc_test_reset_stale_interval_observations(void)
+{
+    const memory_order rx = memory_order_relaxed;
+
+    atomic_store_explicit(&g_stale_window_start_unix, 0, rx);
+    atomic_store_explicit(&g_stale_window_count, 0, rx);
+    atomic_store_explicit(&g_stale_window_min, 0, rx);
+    atomic_store_explicit(&g_stale_window_max, 0, rx);
+}
+
+int syncsvc_test_stale_interval_observations(void)
+{
+    return atomic_load_explicit(&g_stale_window_count,
+                                memory_order_relaxed);
+}
+#endif
+
 static void syncsvc_build_locator_from_tip(struct block_locator *loc,
                                            const struct block_index *tip,
                                            const char *alloc_label,
@@ -340,9 +358,11 @@ static void syncsvc_note_stale_headers(struct p2p_node *node)
     }
 }
 
-bool syncsvc_should_request_headers(const struct p2p_node *node,
-                                    int our_height,
-                                    int64_t now_seconds)
+static bool syncsvc_should_request_headers_with_interval(
+    const struct p2p_node *node,
+    int our_height,
+    int64_t now_seconds,
+    int64_t *interval_out)
 {
     /* Outbound peers, plus an inbound peer from an operator-named target
      * (services/configured_sync_peers.h). */
@@ -359,11 +379,21 @@ bool syncsvc_should_request_headers(const struct p2p_node *node,
         return false;
 
     int64_t interval = syncsvc_getheaders_interval(node, our_height);
+    if (interval_out)
+        *interval_out = interval;
     int64_t last = atomic_load_explicit(&node->last_getheaders_time,
                                         memory_order_relaxed);
     if (now_seconds < last)
         return true;
     return now_seconds - last > interval;
+}
+
+bool syncsvc_should_request_headers(const struct p2p_node *node,
+                                    int our_height,
+                                    int64_t now_seconds)
+{
+    return syncsvc_should_request_headers_with_interval(node, our_height,
+                                                        now_seconds, NULL);
 }
 
 void syncsvc_plan_periodic_getheaders(struct sync_getheaders_action *action,
@@ -376,14 +406,15 @@ void syncsvc_plan_periodic_getheaders(struct sync_getheaders_action *action,
     if (!action) return;
     *action = empty;
 
-    if (!syncsvc_should_request_headers(node, our_height, now_seconds))
+    int64_t interval = 0;
+    if (!syncsvc_should_request_headers_with_interval(node, our_height,
+                                                      now_seconds, &interval))
         return;
 
     action->should_send = true;
     action->anchor = SYNC_HEADER_REQUEST_TIP;
     action->should_log = true;
 
-    int64_t interval = syncsvc_getheaders_interval(node, our_height);
     printf("[headers] getheaders planned: peer=%d our_h=%d peer_start_h=%d interval=%llds\n",
            node->id, our_height, node->starting_height, (long long)interval);
 }
