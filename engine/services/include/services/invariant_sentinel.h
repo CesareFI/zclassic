@@ -102,6 +102,9 @@ struct invariant_sweep_inputs {
     uint64_t reorg_detected_total;       /* monotonic stage counter */
     uint64_t prev_reorg_detected_total;  /* value at the previous sweep */
     int64_t prev_cur_tip_finalize;       /* cursor at the previous sweep */
+    /* Set only when a persisted stage cursor cannot be represented by the
+     * signed observer domain.  False is the normal/fresh-store value. */
+    bool cursor_range_invalid;
 };
 
 struct invariant_sweep_verdict {
@@ -165,6 +168,8 @@ void invariant_sentinel_note_loader_height_fallback(void);
 #ifdef ZCL_TESTING
 void invariant_sentinel_reset_for_testing(void);
 void invariant_sentinel_set_node_db_for_testing(struct node_db *ndb);
+bool invariant_sentinel_test_cursor_from_persisted(uint64_t raw,
+                                                   int64_t *out);
 #endif
 
 #endif /* ZCL_SERVICES_INVARIANT_SENTINEL_H */

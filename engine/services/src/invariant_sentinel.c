@@ -39,6 +39,7 @@
 #include "validation/chain_linkage_check.h"
 
 #include <inttypes.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdarg.h>
@@ -232,13 +233,65 @@ bool invariant_sentinel_check_pair(struct node_db *ndb,
 
 /* ── Check 4: window consistency sweep ──────────────────────────── */
 
-void invariant_sentinel_sweep_evaluate(
+static bool invariant_sentinel_cursor_from_persisted(uint64_t raw,
+                                                      int64_t *out)
+{
+    if (!out || raw > INT64_MAX)
+        return false;
+    *out = (int64_t)raw;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool invariant_sentinel_test_cursor_from_persisted(uint64_t raw, int64_t *out)
+{
+    return invariant_sentinel_cursor_from_persisted(raw, out);
+}
+#endif
+
+static bool invariant_sentinel_read_sweep_cursors(
+    sqlite3 *db, struct invariant_sweep_inputs *in)
+{
+    const char *const names[] = {
+        "tip_finalize", "utxo_apply", "script_validate", "body_fetch",
+        "validate_headers",
+    };
+    int64_t *const cursors[] = {
+        &in->cur_tip_finalize, &in->cur_utxo_apply,
+        &in->cur_script_validate, &in->cur_body_fetch,
+        &in->cur_validate_headers,
+    };
+    bool valid = true;
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        uint64_t raw = stage_cursor_persisted(db, names[i], "sentinel");
+        if (!invariant_sentinel_cursor_from_persisted(raw, cursors[i])) {
+            LOG_WARN("validation_pack",
+                     "[validation_pack] sweep cursor out of signed range "
+                     "stage=%s raw=%llu", names[i],
+                     (unsigned long long)raw);
+            valid = false;
+        }
+    }
+    return valid;
+}
+
+static bool invariant_sentinel_invalid_cursor_verdict(
+    const struct invariant_sweep_inputs *in, struct invariant_sweep_verdict *out)
+{
+    if (!in->cursor_range_invalid)
+        return false;
+    out->violated = true;
+    snprintf(out->invariant, sizeof(out->invariant), "I4.0");
+    snprintf(out->detail, sizeof(out->detail),
+             "persisted stage cursor outside signed observer range");
+    return true;
+}
+
+static void invariant_sentinel_sweep_evaluate_valid(
     const struct invariant_sweep_inputs *in,
     struct invariant_sweep_verdict *out)
 {
-    memset(out, 0, sizeof(*out));
-    out->first_bad_h = -1;
-
     /* I4.1 — pipeline ordering, restricted to the PROVEN pairs:
      *   tip_finalize <= utxo_apply   (step_finalize requires
      *                                 next_h < utxo_apply cursor)
@@ -323,6 +376,17 @@ void invariant_sentinel_sweep_evaluate(
     }
 }
 
+void invariant_sentinel_sweep_evaluate(
+    const struct invariant_sweep_inputs *in,
+    struct invariant_sweep_verdict *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->first_bad_h = -1;
+    if (invariant_sentinel_invalid_cursor_verdict(in, out))
+        return;
+    invariant_sentinel_sweep_evaluate_valid(in, out);
+}
+
 bool invariant_sentinel_confirm_violation(
     const struct invariant_sweep_verdict *v)
 {
@@ -365,16 +429,7 @@ bool invariant_sentinel_sweep_once(void)
      * I4.3/I4.1 the same way. The in-repo precedent
      * (reducer_frontier_compute_hstar) reads under one lock hold too. */
     progress_store_tx_lock();
-    in.cur_tip_finalize =
-        (int64_t)stage_cursor_persisted(db, "tip_finalize", "sentinel");
-    in.cur_utxo_apply =
-        (int64_t)stage_cursor_persisted(db, "utxo_apply", "sentinel");
-    in.cur_script_validate =
-        (int64_t)stage_cursor_persisted(db, "script_validate", "sentinel");
-    in.cur_body_fetch =
-        (int64_t)stage_cursor_persisted(db, "body_fetch", "sentinel");
-    in.cur_validate_headers =
-        (int64_t)stage_cursor_persisted(db, "validate_headers", "sentinel");
+    in.cursor_range_invalid = !invariant_sentinel_read_sweep_cursors(db, &in);
 
     /* Frontier proof: extend the memoized clean frontier in one O(delta)
      * ranged scan when valid; full anchor-rooted walk otherwise. A cursor

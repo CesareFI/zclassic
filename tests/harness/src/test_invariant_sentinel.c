@@ -30,6 +30,7 @@
 #include "validation/chain_linkage_check.h"
 
 #include <sqlite3.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -104,6 +105,27 @@ static void isn_healthy_inputs(struct invariant_sweep_inputs *in)
     in->reorg_detected_total = 100;
     in->prev_reorg_detected_total = 100;
     in->prev_cur_tip_finalize = 3142990; /* cursor moved since last sweep */
+}
+
+static int test_sweep_cursor_range(void)
+{
+    int failures = 0;
+    int64_t cursor = -1;
+    struct invariant_sweep_inputs in;
+    struct invariant_sweep_verdict verdict;
+
+    /* A negative SQLite cursor is represented by the persisted reader as
+     * UINT64_MAX.  It must not narrow back to the sentinel's negative
+     * "unknown" value and hide the malformed durable state. */
+    bool raw_rejected =
+        !invariant_sentinel_test_cursor_from_persisted(UINT64_MAX, &cursor);
+    isn_healthy_inputs(&in);
+    in.cursor_range_invalid = raw_rejected;
+    invariant_sentinel_sweep_evaluate(&in, &verdict);
+    ISN_CHECK("sweep: unrepresentable persisted cursor is I4.0",
+              raw_rejected && verdict.violated &&
+              strcmp(verdict.invariant, "I4.0") == 0);
+    return failures;
 }
 
 int test_invariant_sentinel(void)
@@ -246,6 +268,8 @@ int test_invariant_sentinel(void)
         ISN_CHECK("sweep: reorg burst at a MOVING cursor -> quiet",
                   !v.violated);
     }
+
+    failures += test_sweep_cursor_range();
 
     /* ── two-sweep confirmation gate ──────────────────────────────── */
     {
