@@ -12,6 +12,7 @@
 #include "framework/condition.h"
 #include "mining/miner.h"
 #include "jobs/reducer_frontier.h"
+#include "jobs/script_validate_null_hash_rearm.h"
 #include "jobs/stage_repair.h"
 #include "jobs/stage_repair_coin_backfill.h"
 #include "json/json.h"
@@ -44,6 +45,22 @@
 } while (0)
 
 #define A REDUCER_FRONTIER_TRUSTED_ANCHOR
+
+static int test_sv_rearm_cursor_conversion_bounds(void)
+{
+    int failures = 0;
+    int height = -1;
+    RFRL_CHECK("script rearm cursor retains INT32_MAX",
+               script_validate_rearm_test_cursor_height(INT32_MAX, &height) &&
+               height == INT32_MAX);
+    RFRL_CHECK("script rearm cursor rejects unrepresentable durable heights",
+               !script_validate_rearm_test_cursor_height(
+                   (uint64_t)INT32_MAX + 1u, &height) &&
+               !script_validate_rearm_test_cursor_height(UINT64_C(1) << 32,
+                                                          &height) &&
+               !script_validate_rearm_test_cursor_height(UINT64_MAX, &height));
+    return failures;
+}
 
 void reducer_frontier_test_set_compiled_anchor(int32_t height);
 
@@ -817,6 +834,7 @@ int test_reducer_frontier_reconcile_light(void)
     printf("\n=== reducer_frontier_reconcile_light tests ===\n");
     int failures = 0;
 
+    failures += test_sv_rearm_cursor_conversion_bounds();
     {
         /* Mirror reducer_frontier_reconcile_light_impl's init for the
          * -1-sentinel refill-hole fields (memset(0) reads as a hole at 0). */

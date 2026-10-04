@@ -22,6 +22,7 @@
 #include "util/log_macros.h"
 #include "util/stage.h"
 
+#include <limits.h>
 #include <sqlite3.h>
 #include <stdint.h>
 
@@ -38,6 +39,59 @@ finish(struct script_validate_rearm_report *report,
         report->outcome = outcome;
     return outcome;
 }
+
+static bool sv_rearm_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+struct sv_rearm_cursors {
+    uint64_t sv_raw;
+    uint64_t ua_raw;
+    int sv_height;
+    int consumer_floor_height;
+};
+
+static bool sv_rearm_read_cursors(sqlite3 *db, struct sv_rearm_cursors *out)
+{
+    uint64_t tf_cursor = 0;
+    int tf_height = 0;
+    if (!out ||
+        !stage_cursor_read_or_zero(db, STAGE_NAME, STAGE_NAME,
+                                   &out->sv_raw) ||
+        !stage_cursor_read_or_zero(db, UTXO_APPLY_STAGE_NAME, STAGE_NAME,
+                                   &out->ua_raw) ||
+        !stage_cursor_read_or_zero(db, TIP_FINALIZE_STAGE_NAME, STAGE_NAME,
+                                   &tf_cursor)) {
+        LOG_WARN("script_validate",
+                 "[script_validate] null-hash re-arm: cursor read failed");
+        return false;
+    }
+    if (!sv_rearm_cursor_height(out->sv_raw, &out->sv_height) ||
+        !sv_rearm_cursor_height(out->ua_raw, &out->consumer_floor_height) ||
+        !sv_rearm_cursor_height(tf_cursor, &tf_height)) {
+        LOG_WARN("script_validate",
+                 "[script_validate] null-hash re-arm: cursor out of range "
+                 "sv=%llu ua=%llu tip=%llu",
+                 (unsigned long long)out->sv_raw,
+                 (unsigned long long)out->ua_raw,
+                 (unsigned long long)tf_cursor);
+        return false;
+    }
+    if (tf_height < out->consumer_floor_height)
+        out->consumer_floor_height = tf_height;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool script_validate_rearm_test_cursor_height(uint64_t cursor, int *out)
+{
+    return sv_rearm_cursor_height(cursor, out);
+}
+#endif
 
 enum script_validate_rearm_outcome script_validate_null_hash_rearm(
     sqlite3 *db, const struct recovery_policy *policy,
@@ -67,31 +121,11 @@ enum script_validate_rearm_outcome script_validate_null_hash_rearm(
      * yet never rewind below the deepest consumer's cursor (the LCC invariant —
      * rewinding below a downstream consumer's cursor recreates the reducer
      * wedge). This floor is HARD; it does not depend on the recovery cap. */
-    uint64_t sv_cursor = 0, ua_cursor = 0, tf_cursor = 0;
-    if (!stage_cursor_read_or_zero(db, STAGE_NAME, STAGE_NAME, &sv_cursor)) {
-        LOG_WARN("script_validate",
-                 "[script_validate] null-hash re-arm: sv cursor read failed");
+    struct sv_rearm_cursors cursors;
+    if (!sv_rearm_read_cursors(db, &cursors))
         return finish(report, SV_REARM_ERROR);
-    }
-    if (!stage_cursor_read_or_zero(db, UTXO_APPLY_STAGE_NAME, STAGE_NAME,
-                                   &ua_cursor)) {
-        LOG_WARN("script_validate",
-                 "[script_validate] null-hash re-arm: utxo_apply cursor read "
-                 "failed");
-        return finish(report, SV_REARM_ERROR);
-    }
-    if (!stage_cursor_read_or_zero(db, TIP_FINALIZE_STAGE_NAME, STAGE_NAME,
-                                   &tf_cursor)) {
-        LOG_WARN("script_validate",
-                 "[script_validate] null-hash re-arm: tip_finalize cursor read "
-                 "failed");
-        return finish(report, SV_REARM_ERROR);
-    }
-    /* The deepest consumer cursor = the lowest of the two; use it as the floor. */
-    if (tf_cursor < ua_cursor)
-        ua_cursor = tf_cursor;
-    report->sv_cursor_before = sv_cursor;
-    report->consumer_floor = ua_cursor;
+    report->sv_cursor_before = cursors.sv_raw;
+    report->consumer_floor = (uint64_t)cursors.consumer_floor_height;
 
     /* Ensure the block_hash column exists (idempotent) before scanning for
      * NULL-block_hash rows, else the scan fails with "no such column". */
@@ -99,13 +133,14 @@ enum script_validate_rearm_outcome script_validate_null_hash_rearm(
         return finish(report, SV_REARM_ERROR);
 
     /* Nothing to re-derive if script_validate has not led its consumers. */
-    if (sv_cursor <= ua_cursor)
+    if (cursors.sv_height <= cursors.consumer_floor_height)
         return finish(report, SV_REARM_NOT_NEEDED);
 
     int lowest_null = -1;
     int64_t null_count = 0;
     int scan = script_validate_log_lowest_null_block_hash(
-        db, (int)ua_cursor, (int)sv_cursor, &lowest_null, &null_count);
+        db, cursors.consumer_floor_height, cursors.sv_height, &lowest_null,
+        &null_count);
     if (scan < 0)
         return finish(report, SV_REARM_ERROR);
     if (scan == 0)
@@ -124,15 +159,15 @@ enum script_validate_rearm_outcome script_validate_null_hash_rearm(
         policy = &loaded;
     }
     enum policy_decision decision = policy_check_validation_rebind(
-        policy, (int64_t)sv_cursor, (int64_t)lowest_null, REARM_REASON);
+        policy, (int64_t)cursors.sv_height, (int64_t)lowest_null, REARM_REASON);
     if (decision != POLICY_ALLOW) {
         LOG_WARN("script_validate",
                  "[script_validate] null-hash re-arm REFUSED (%s): would rewind "
                  "sv cursor %llu -> %d (%lld heights, %lld NULL rows); raise "
                  "ZCL_MAX_VALIDATION_REBIND or ack to authorise after copy proof",
                  policy_decision_name(decision),
-                 (unsigned long long)sv_cursor, lowest_null,
-                 (long long)((int64_t)sv_cursor - lowest_null),
+                 (unsigned long long)cursors.sv_raw, lowest_null,
+                 (long long)((int64_t)cursors.sv_height - lowest_null),
                  (long long)null_count);
         return finish(report, SV_REARM_REFUSED);
     }
@@ -144,7 +179,7 @@ enum script_validate_rearm_outcome script_validate_null_hash_rearm(
     if (!stage_set_named_cursor(db, STAGE_NAME, (uint64_t)lowest_null)) {
         LOG_WARN("script_validate",
                  "[script_validate] null-hash re-arm: sv cursor rewind %llu -> "
-                 "%d failed", (unsigned long long)sv_cursor, lowest_null);
+                 "%d failed", (unsigned long long)cursors.sv_raw, lowest_null);
         return finish(report, SV_REARM_ERROR);
     }
     report->rewound_to = (uint64_t)lowest_null;
@@ -165,6 +200,6 @@ enum script_validate_rearm_outcome script_validate_null_hash_rearm(
              "[script_validate] null-hash re-arm DONE: sv cursor %llu -> %d, "
              "%lld NULL row(s) deleted; reducer will re-derive + re-stamp "
              "block_hash so utxo_apply can advance",
-             (unsigned long long)sv_cursor, lowest_null, (long long)deleted);
+             (unsigned long long)cursors.sv_raw, lowest_null, (long long)deleted);
     return finish(report, SV_REARM_REARMED);
 }

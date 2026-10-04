@@ -70,4 +70,8 @@ enum script_validate_rearm_outcome script_validate_null_hash_rearm(
     struct sqlite3 *db, const struct recovery_policy *policy,
     struct script_validate_rearm_report *report);
 
+#ifdef ZCL_TESTING
+bool script_validate_rearm_test_cursor_height(uint64_t cursor, int *out);
+#endif
+
 #endif /* ZCL_JOBS_SCRIPT_VALIDATE_NULL_HASH_REARM_H */
