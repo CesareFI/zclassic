@@ -47,6 +47,20 @@ static _Atomic int64_t  g_last_run_unix = 0;
 static _Atomic uint64_t g_runs          = 0;
 static _Atomic uint64_t g_blocker_fires = 0;
 
+/* The dump-state schema represents counters as signed integers. Keep the
+ * producer counters in that range so a very long-lived recovery episode
+ * cannot make a growing count appear negative to an operator. */
+static void recovery_counter_increment(_Atomic uint64_t *counter)
+{
+    uint64_t old = atomic_load(counter);
+    for (;;) {
+        if (old >= (uint64_t)INT64_MAX)
+            return;
+        if (atomic_compare_exchange_weak(counter, &old, old + 1))
+            return;
+    }
+}
+
 /* The conditions that own the cheap recovery rungs. When either is the active
  * healer the coordinator's naming fallback stays quiet — the applicable rung
  * is already firing on that condition's own tick (5s / 30s). Kept as a small
@@ -90,7 +104,7 @@ static void name_blocker(void)
              "[recovery_coordinator] no cheap self-heal owns the unresolved "
              "critical — named typed blocker "
              "recovery_coordinator.no_applicable_rung");
-    atomic_fetch_add(&g_blocker_fires, 1u);
+    recovery_counter_increment(&g_blocker_fires);
 }
 
 /* ── Self-driven supervised tick ──────────────────────────────────── */
@@ -111,7 +125,7 @@ static void recovery_coordinator_drive(void)
 
     name_blocker();
     atomic_store(&g_last_run_unix, platform_time_wall_unix());
-    atomic_fetch_add(&g_runs, 1u);
+    recovery_counter_increment(&g_runs);
 }
 
 static void recovery_coordinator_tick(struct liveness_contract *c)
@@ -189,7 +203,19 @@ void recovery_coordinator_test_name_blocker(void)
 {
     name_blocker();
     atomic_store(&g_last_run_unix, platform_time_wall_unix());
-    atomic_fetch_add(&g_runs, 1u);
+    recovery_counter_increment(&g_runs);
+}
+
+bool recovery_coordinator_test_counters_saturate(void)
+{
+    atomic_store(&g_runs, (uint64_t)INT64_MAX - 1);
+    atomic_store(&g_blocker_fires, (uint64_t)INT64_MAX - 1);
+    recovery_counter_increment(&g_runs);
+    recovery_counter_increment(&g_blocker_fires);
+    recovery_counter_increment(&g_runs);
+    recovery_counter_increment(&g_blocker_fires);
+    return atomic_load(&g_runs) == (uint64_t)INT64_MAX &&
+           atomic_load(&g_blocker_fires) == (uint64_t)INT64_MAX;
 }
 
 long long recovery_coordinator_test_blocker_fires(void)

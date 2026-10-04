@@ -48,6 +48,7 @@ void recovery_coordinator_test_drive(void);
 void recovery_coordinator_test_name_blocker(void);
 long long recovery_coordinator_test_blocker_fires(void);
 long long recovery_coordinator_test_runs(void);
+bool recovery_coordinator_test_counters_saturate(void);
 #endif
 
 #endif /* ZCL_SERVICES_RECOVERY_COORDINATOR_H */

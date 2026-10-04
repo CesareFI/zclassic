@@ -21,6 +21,7 @@
 #include "util/blocker.h"
 
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -139,6 +140,14 @@ int test_recovery_coordinator(void)
         RC_CHECK("naming: blocker is a retry-forever DEPENDENCY (guard kept)",
                  retry_forever_dependency);
         blocker_reset_for_testing();
+    }
+
+    /* The dump-state API is signed. A lifetime counter must saturate before
+     * the signed boundary rather than wrap to a negative operational value. */
+    {
+        rc_reset();
+        RC_CHECK("counters: recovery telemetry saturates at INT64_MAX",
+                 recovery_coordinator_test_counters_saturate());
     }
 
     printf("recovery_coordinator: %d failures\n", failures);
