@@ -35,6 +35,18 @@ static _Atomic int64_t g_stale_window_min = 0;
 static _Atomic int64_t g_stale_window_max = 0;
 #define STALE_SUMMARY_WINDOW_SECS ((int64_t)60)
 
+static int syncsvc_stale_window_note(void)
+{
+    int current = atomic_load_explicit(&g_stale_window_count,
+                                       memory_order_relaxed);
+    while (current < INT_MAX &&
+           !atomic_compare_exchange_weak_explicit(
+               &g_stale_window_count, &current, current + 1,
+               memory_order_relaxed, memory_order_relaxed)) {
+    }
+    return current;
+}
+
 static void syncsvc_build_locator_from_tip(struct block_locator *loc,
                                            const struct block_index *tip,
                                            const char *alloc_label,
@@ -290,7 +302,7 @@ static int64_t syncsvc_getheaders_interval(const struct p2p_node *node,
             atomic_store_explicit(&g_stale_window_start_unix, now, rx);
             window_start = now;
         }
-        if (atomic_fetch_add_explicit(&g_stale_window_count, 1, rx) == 0) {
+        if (syncsvc_stale_window_note() == 0) {
             atomic_store_explicit(&g_stale_window_min, base, rx);
             atomic_store_explicit(&g_stale_window_max, base, rx);
         } else {
