@@ -58,13 +58,23 @@ static const int64_t HEALTH_RSS_WARNING_MB = 4096;
  * ~17 days; see node_health_resolve_network_tip in the header). */
 #define NODE_HEALTH_PLAUSIBLE_TIP_BAND 10000
 
+/* Header and peer heights are diagnostic inputs, but their range can still
+ * reach int64_t's edge through a malformed local projection. Keep the
+ * observability-only plausibility ceiling representable before comparing an
+ * untrusted peer claim. */
+static int64_t node_health_plausible_tip_ceiling(int64_t header_tip)
+{
+    if (header_tip < 0 ||
+        header_tip > INT64_MAX - NODE_HEALTH_PLAUSIBLE_TIP_BAND)
+        return INT64_MAX;
+    return header_tip + NODE_HEALTH_PLAUSIBLE_TIP_BAND;
+}
+
 int64_t node_health_resolve_network_tip(int64_t raw_max, int peers_above_band,
                                         int64_t header_tip, bool modal_ready,
                                         int64_t modal_height, int modal_count)
 {
-    int64_t plausible_ceiling =
-        header_tip >= 0 ? header_tip + NODE_HEALTH_PLAUSIBLE_TIP_BAND
-                        : INT64_MAX;
+    int64_t plausible_ceiling = node_health_plausible_tip_ceiling(header_tip);
     int64_t clamped_max = raw_max;
     if (raw_max > plausible_ceiling && peers_above_band < 2)
         clamped_max = plausible_ceiling; /* lone uncorroborated outlier */
@@ -382,8 +392,7 @@ void node_health_collect(struct node_health_snapshot *snapshot,
         int64_t raw_max = -1;
         int64_t header_tip = snapshot->header_height;
         int64_t plausible_ceiling =
-            header_tip >= 0 ? header_tip + NODE_HEALTH_PLAUSIBLE_TIP_BAND
-                            : INT64_MAX;
+            node_health_plausible_tip_ceiling(header_tip);
         int peers_above_band = 0;
         zcl_mutex_lock(&cm->manager.cs_nodes);
         for (size_t i = 0; i < cm->manager.num_nodes; i++) {
