@@ -146,7 +146,8 @@ struct zcl_result beta6_bs_read_height_hash_sidecar(const char *sidecar_path,
                        "beta6 sidecar is absent or unreadable: %s", sidecar_path);
     int parsed_height = -1;
     char hash_hex[160] = { 0 };
-    if (sscanf(line, "%d %159s", &parsed_height, hash_hex) != 2)
+    char trailing = '\0';
+    if (sscanf(line, "%d %159s %c", &parsed_height, hash_hex, &trailing) != 2)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "beta6 sidecar is not '<height> <blockhash>': %s", sidecar_path);
     if (parsed_height < 0)
@@ -174,7 +175,9 @@ struct zcl_result beta6_bs_read_meta_sidecar(const char *sidecar_path, int32_t *
     int parsed_height = -1;
     char hash_hex[128] = { 0 };
     char commitment_hex[128] = { 0 };
-    if (sscanf(line, "%d %127s %127s", &parsed_height, hash_hex, commitment_hex) != 3)
+    char trailing = '\0';
+    if (sscanf(line, "%d %127s %127s %c", &parsed_height, hash_hex,
+               commitment_hex, &trailing) != 3)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "beta6 .meta sidecar is not "
                        "'<height> <blockhash> <chainstate>': %s",
