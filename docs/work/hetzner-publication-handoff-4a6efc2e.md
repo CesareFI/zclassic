@@ -37,8 +37,11 @@ The local pre-push policy refused non-main publication with:
 pre-push: REFUSED status=remote-ref-not-main
 ```
 
-The documented hook implementation admits only `refs/heads/main`; the
-contribution guide provides no alternate contributor branch, submit helper,
-patch/bundle, or maintainer-assisted command that avoids this policy. No hook
-or configuration was modified and no bypass was attempted. Publication needs
-repository-owner/maintainer action through the approved main admission path.
+The documented hook implementation admits only `refs/heads/main`. The
+documented sanctioned route is native `z23-dev dev land`, which prepares a
+main landing and requires an exact proof receipt; it is not a feature-branch
+or pull-request publication route. This host cannot run that proof scheduler
+(it has 4 CPUs and about 2.6 GiB available RAM; the supported lane requires
+8 CPUs and 24 GiB). No hook or configuration was modified and no bypass was
+attempted. Publication therefore needs a repository-owner/maintainer action
+through `dev land` on a proof-capable host.
