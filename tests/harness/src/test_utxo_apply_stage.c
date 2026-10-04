@@ -66,6 +66,25 @@ static int test_ua_cursor_conversion_bounds(void)
     return failures;
 }
 
+static int test_ua_prune_floor_bounds(void)
+{
+    int failures = 0;
+    int floor = -1;
+    UV_CHECK("prune floor: ordinary retained range is exact",
+             utxo_apply_created_outputs_prune_test_floor(9, 2, &floor) &&
+             floor == 7);
+    UV_CHECK("prune floor: exact retention boundary does not delete",
+             !utxo_apply_created_outputs_prune_test_floor(2, 2, &floor));
+    UV_CHECK("prune floor: unrepresentable durable cursors are refused",
+             !utxo_apply_created_outputs_prune_test_floor(
+                 (uint64_t)INT32_MAX + 1u, 2, &floor) &&
+             !utxo_apply_created_outputs_prune_test_floor(
+                 UINT64_C(1) << 32, 2, &floor) &&
+             !utxo_apply_created_outputs_prune_test_floor(UINT64_MAX, 2,
+                                                           &floor));
+    return failures;
+}
+
 /* Rewind primitives under test in the nullifier rewind case (f). Mirrors
  * engine/jobs/src/utxo_apply_delta_internal.h (a src-private header). */
 bool utxo_apply_emit_inverse_delta(sqlite3 *db, int height);
@@ -774,6 +793,7 @@ int test_utxo_apply_stage(void)
 
     blocker_module_init();
     failures += test_ua_cursor_conversion_bounds();
+    failures += test_ua_prune_floor_bounds();
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_uv sc;

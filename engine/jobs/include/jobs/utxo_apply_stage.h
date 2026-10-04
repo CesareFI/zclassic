@@ -97,6 +97,8 @@ void utxo_apply_created_outputs_retain_set_for_test(int retain_blocks);
 
 #ifdef ZCL_TESTING
 bool utxo_apply_stage_test_cursor_height(uint64_t cursor, int *out);
+bool utxo_apply_created_outputs_prune_test_floor(uint64_t cursor, int retain,
+                                                 int *out);
 #endif
 
 uint64_t utxo_apply_stage_cursor(void);

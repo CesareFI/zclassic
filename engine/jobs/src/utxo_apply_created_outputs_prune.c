@@ -21,6 +21,7 @@
 #include "util/log_macros.h"
 #include "validation/main_constants.h"
 
+#include <limits.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -64,6 +65,51 @@ static int utxo_apply_created_outputs_retain(void)
     return t >= 0 ? t : CREATED_OUTPUTS_PRUNE_RETAIN_BLOCKS;
 }
 
+static bool ua_prune_floor(uint64_t cursor, int retain, int *out)
+{
+    if (!out || retain < 0 || cursor > INT32_MAX ||
+        cursor <= (uint64_t)retain)
+        return false;
+    *out = (int)cursor - retain;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool utxo_apply_created_outputs_prune_test_floor(uint64_t cursor, int retain,
+                                                 int *out)
+{
+    return ua_prune_floor(cursor, retain, out);
+}
+#endif
+
+static bool ua_prune_hint_due(int retain, int64_t *out_floor)
+{
+    uint64_t cursor = utxo_apply_stage_cursor();
+    int floor = 0;
+    if (!out_floor || !ua_prune_floor(cursor, retain, &floor)) {
+        if (cursor > INT32_MAX)
+            LOG_WARN(STAGE_NAME,
+                     "[utxo_apply] created_outputs prune cursor out of range: %llu",
+                     (unsigned long long)cursor);
+        return false;
+    }
+    *out_floor = (int64_t)floor;
+    return true;
+}
+
+static bool ua_prune_committed_floor(sqlite3 *db, int retain, int *out_floor)
+{
+    uint64_t cursor = stage_cursor_persisted(db, STAGE_NAME, STAGE_NAME);
+    if (!ua_prune_floor(cursor, retain, out_floor)) {
+        if (cursor > INT32_MAX)
+            LOG_WARN(STAGE_NAME,
+                     "[utxo_apply] created_outputs prune cursor out of range: %llu",
+                     (unsigned long long)cursor);
+        return false;
+    }
+    return true;
+}
+
 /* The prune is a retention sweep with NO consensus value, decoupled from the
  * kernel CO-COMMIT tx (a separate post-commit BEGIN IMMEDIATE). created_outputs and
  * stage_cursor both live in consensus.db (the kernel
@@ -81,10 +127,9 @@ bool utxo_apply_created_outputs_prune_post_commit(void)
     int retain_override = atomic_load(&g_ua_created_outputs_retain_for_test);
     int retain = retain_override >= 0
         ? retain_override : CREATED_OUTPUTS_PRUNE_RETAIN_BLOCKS;
-    int cursor_hint = utxo_apply_stage_cursor();
-    if (cursor_hint <= retain)
+    int64_t floor_hint = 0;
+    if (!ua_prune_hint_due(retain, &floor_hint))
         return false;
-    int64_t floor_hint = (int64_t)cursor_hint - retain;
     int64_t last_floor = atomic_load(&g_ua_post_prune_last_floor);
     if (retain_override < 0 && last_floor >= 0 &&
         floor_hint < last_floor + CREATED_OUTPUTS_PRUNE_CADENCE_BLOCKS)
@@ -101,14 +146,13 @@ bool utxo_apply_created_outputs_prune_post_commit(void)
         return false;
     }
     /* Snapshot the committed cursor INSIDE the tx for a consistent floor. */
-    uint64_t cursor = stage_cursor_persisted(db, STAGE_NAME, STAGE_NAME);
     retain = utxo_apply_created_outputs_retain();
-    if (cursor <= (uint64_t)retain) {
+    int prune_floor = 0;
+    if (!ua_prune_committed_floor(db, retain, &prune_floor)) {
         sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
         progress_store_tx_unlock();
         return false;
     }
-    int prune_floor = (int)cursor - retain;
     int pruned_rows = 0;
     bool ok = created_outputs_index_prune_below_limited(
         db, prune_floor, CREATED_OUTPUTS_PRUNE_MAX_HEIGHTS_PER_STEP,
