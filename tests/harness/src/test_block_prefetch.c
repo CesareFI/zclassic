@@ -194,6 +194,19 @@ static int t_idle_wait_uses_monotonic_clock(void)
     return failures;
 }
 
+static int t_reorg_rewinds_frontier(void)
+{
+    int failures = 0;
+    block_prefetch_stop();
+    TEST_CASE("reorg: cursor rewind invalidates an overlapping warm frontier") {
+        /* The old range can overlap the new one numerically while referring
+         * to different active-chain blocks after a reorg. A prefetch frontier
+         * at 17 belongs to the old cursor 10; cursor 9 needs [10..22). */
+        ASSERT(block_prefetch_test_rewind_resets_frontier());
+    } TEST_END
+    return failures;
+}
+
 /* ── Test: disabled config is a benign no-op ────────────────────────────── */
 static int t_disabled_noop(void)
 {
@@ -427,6 +440,7 @@ int test_block_prefetch(void)
     printf("\n=== block_prefetch (read-ahead worker) ===\n");
     int failures = 0;
     failures += t_idle_wait_uses_monotonic_clock();
+    failures += t_reorg_rewinds_frontier();
     failures += t_disabled_noop();
     failures += t_lifecycle();
     failures += t_bounded_memory();

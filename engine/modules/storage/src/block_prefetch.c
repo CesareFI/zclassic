@@ -69,6 +69,7 @@ static bool      g_running = false;       /* under g_mu */
 static bool      g_stop = false;          /* under g_mu */
 static _Atomic bool g_running_fast = false;
 static int64_t   g_warm_frontier = -1;    /* under g_mu: highest+1 warmed */
+static int32_t   g_last_cursor = INT32_MIN; /* under g_mu */
 
 static struct liveness_contract g_contract;
 static _Atomic int g_child_id = SUPERVISOR_INVALID_ID;
@@ -109,6 +110,18 @@ static pthread_cond_t *bp_wait_cv(void)
 {
     bp_wait_init();
     return g_wait_uses_monotonic ? &g_monotonic_cv : &g_cv;
+}
+
+/* A reorg can move the cursor back while the old frontier still lies inside
+ * the new numeric window. Those heights can now name different block files,
+ * so range overlap alone is not proof the page cache is warm for the active
+ * chain. Restart the bounded pass on every cursor rewind. */
+static bool bp_frontier_needs_reset(int64_t frontier, int32_t previous_cursor,
+                                    int32_t cursor, int64_t want_lo,
+                                    int64_t want_hi)
+{
+    return cursor < previous_cursor || frontier < want_lo ||
+           frontier > want_hi;
 }
 
 /* ── Bounded raw-body LRU (worker writes; readers under g_lru_mu) ───────── */
@@ -319,8 +332,10 @@ static void bp_run_pass_locked_released(int32_t cursor, uint8_t *scratch)
 
     /* A cursor that moved BACKWARD (reorg / restart) resets the frontier so we
      * re-warm the new forward window rather than skip it. */
-    if (g_warm_frontier < want_lo || g_warm_frontier > want_hi)
+    if (bp_frontier_needs_reset(g_warm_frontier, g_last_cursor, cursor,
+                                want_lo, want_hi))
         g_warm_frontier = want_lo;
+    g_last_cursor = cursor;
     int64_t start = g_warm_frontier;
     int64_t end = want_hi;
     pthread_mutex_unlock(&g_mu);
@@ -469,6 +484,7 @@ bool block_prefetch_start(const char *datadir,
     g_pos_user = pos_user;
     g_stop = false;
     g_warm_frontier = -1;
+    g_last_cursor = INT32_MIN;
     atomic_store(&g_warm_hits, 0);
     atomic_store(&g_warmed, 0);
     atomic_store(&g_nowait_misses, 0);
@@ -553,6 +569,7 @@ void block_prefetch_stop(void)
     g_cursor_fn = NULL;
     g_pos_fn = NULL;
     g_warm_frontier = -1;
+    g_last_cursor = INT32_MIN;
     pthread_mutex_unlock(&g_mu);
 
     pthread_mutex_lock(&g_lru_mu);
@@ -596,6 +613,50 @@ bool block_prefetch_test_wait_uses_monotonic_clock(void)
 {
     bp_wait_init();
     return g_wait_uses_monotonic;
+}
+
+static bool bp_test_gap_pos(void *user, int32_t height,
+                            struct disk_block_pos *out)
+{
+    (void)user;
+    (void)height;
+    (void)out;
+    return false;
+}
+
+/* Exercise the actual production pass, not just its range arithmetic. The
+ * synthetic resolver stops immediately, leaving the pass's selected frontier
+ * observable without opening a block file. */
+bool block_prefetch_test_rewind_resets_frontier(void)
+{
+    const int32_t previous_cursor = 10;
+    const int32_t cursor = 9;
+    const int64_t old_frontier = 17;
+    const int64_t expected_frontier = 10;
+    pthread_mutex_lock(&g_mu);
+    struct block_prefetch_config saved_cfg = g_cfg;
+    block_prefetch_pos_fn saved_pos_fn = g_pos_fn;
+    void *saved_pos_user = g_pos_user;
+    bool saved_stop = g_stop;
+    int64_t saved_frontier = g_warm_frontier;
+    int32_t saved_cursor = g_last_cursor;
+    g_cfg.window = 12;
+    g_cfg.lead = 1;
+    g_pos_fn = bp_test_gap_pos;
+    g_pos_user = NULL;
+    g_stop = false;
+    g_warm_frontier = old_frontier;
+    g_last_cursor = previous_cursor;
+    bp_run_pass_locked_released(cursor, NULL);
+    bool reset = g_warm_frontier == expected_frontier;
+    g_cfg = saved_cfg;
+    g_pos_fn = saved_pos_fn;
+    g_pos_user = saved_pos_user;
+    g_stop = saved_stop;
+    g_warm_frontier = saved_frontier;
+    g_last_cursor = saved_cursor;
+    pthread_mutex_unlock(&g_mu);
+    return reset;
 }
 #endif
 
