@@ -2029,6 +2029,54 @@ static int test_bsp_restores_local_header_refill_progress(void)
     return failures;
 }
 
+static int test_bsp_restore_clamps_malformed_int_diagnostics(void)
+{
+    int failures = 0;
+    TEST_CASE("block_source_policy: restart clamps malformed int diagnostics")
+    {
+        struct node_db ndb;
+        struct bsp_decision cached;
+
+        ASSERT(node_db_open(&ndb, ":memory:"));
+        ASSERT(node_db_state_set(&ndb, "chain_advance_coordinator.last_op",
+                                 "malformed", sizeof("malformed")));
+        ASSERT(node_db_state_set_int(&ndb, "chain_advance_coordinator.last_result",
+                                     BSP_DECISION_USE_SOURCE));
+        ASSERT(node_db_state_set_int(&ndb, "chain_advance_coordinator.last_source",
+                                     BSP_SOURCE_P2P));
+        ASSERT(node_db_state_set_int(&ndb,
+                                     "chain_advance_coordinator.last_local_height",
+                                     INT64_MAX));
+        ASSERT(node_db_state_set_int(
+            &ndb, "chain_advance_coordinator.last_best_header_height", INT64_MIN));
+        ASSERT(node_db_state_set_int(&ndb,
+                                     "chain_advance_coordinator.last_target_height",
+                                     INT64_MAX));
+        ASSERT(node_db_state_set_int(&ndb,
+                                     "chain_advance_coordinator.last_selected_score",
+                                     INT64_MIN));
+        ASSERT(node_db_state_set_int(
+            &ndb, "chain_advance_coordinator.last_source.1.height", INT64_MAX));
+        ASSERT(node_db_state_set_int(
+            &ndb, "chain_advance_coordinator.last_projection_deferred_height",
+            INT64_MIN));
+
+        block_source_policy_reset_for_test();
+        block_source_policy_init(NULL, NULL, &ndb);
+        ASSERT(block_source_policy_get_cached_status(&cached));
+        ASSERT(cached.local_height == INT_MAX);
+        ASSERT(cached.best_header_height == INT_MIN);
+        ASSERT(cached.target_height == INT_MAX);
+        ASSERT(cached.selected_score == INT_MIN);
+        ASSERT(cached.sources[BSP_SOURCE_P2P].height == INT_MAX);
+        ASSERT(cached.last_projection_deferred_height == INT_MIN);
+
+        block_source_policy_reset_for_test();
+        node_db_close(&ndb);
+    } TEST_END
+    return failures;
+}
+
 static int test_bsp_score_arithmetic_is_full_domain_safe(void)
 {
     int failures = 0;
@@ -2112,6 +2160,7 @@ int test_block_source_policy(void)
     failures += test_bsp_restores_last_decision_from_node_state();
     failures += test_bsp_restores_peer_floor_sources_from_node_state();
     failures += test_bsp_restores_local_header_refill_progress();
+    failures += test_bsp_restore_clamps_malformed_int_diagnostics();
     failures += test_bsp_score_arithmetic_is_full_domain_safe();
     return failures;
 }

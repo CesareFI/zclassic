@@ -10,6 +10,7 @@
 #include "models/database.h"
 #include "util/sync.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -43,6 +44,19 @@
 #define BSP_KEY_SOURCE_AVAILABLE BSP_STATE_PREFIX "last_source_available"
 #define BSP_KEY_SOURCE_BLOCKED BSP_STATE_PREFIX "last_source_blocked"
 #define BSP_KEY_SOURCE_PREFIX BSP_STATE_PREFIX "last_source."
+
+/* Persisted policy snapshots are diagnostic evidence, not authority for the
+ * live planner.  Still, a damaged local value must not narrow into a plausible
+ * sentinel (for example, INT64_MAX becoming -1 on a 32-bit int field) and
+ * mislead restart diagnostics. */
+static int restore_int_clamped(int64_t value)
+{
+    if (value > INT_MAX)
+        return INT_MAX;
+    if (value < INT_MIN)
+        return INT_MIN;
+    return (int)value;
+}
 
 static struct zcl_result persist_text(struct node_db *ndb, const char *key,
                                       const char *val)
@@ -196,22 +210,24 @@ static void restore_source_snapshot(struct node_db *ndb,
     if (source_field_key(key, sizeof(key), source, "blocker") &&
         node_db_state_get(ndb, key, text, sizeof(text) - 1, &len))
         bsp_copy_text(s->blocker, sizeof(s->blocker), text);
-    restore_source_int(ndb, source, "height", &v); s->height = (int)v;
-    restore_source_int(ndb, source, "score", &v); s->score = (int)v;
+    restore_source_int(ndb, source, "height", &v);
+    s->height = restore_int_clamped(v);
+    restore_source_int(ndb, source, "score", &v);
+    s->score = restore_int_clamped(v);
     restore_source_int(ndb, source, "score_base", &v);
-    s->score_base = (int)v;
+    s->score_base = restore_int_clamped(v);
     restore_source_int(ndb, source, "score_health", &v);
-    s->score_health = (int)v;
+    s->score_health = restore_int_clamped(v);
     restore_source_int(ndb, source, "score_height", &v);
-    s->score_height = (int)v;
+    s->score_height = restore_int_clamped(v);
     restore_source_int(ndb, source, "score_authorized", &v);
-    s->score_authorized = (int)v;
+    s->score_authorized = restore_int_clamped(v);
     restore_source_int(ndb, source, "score_target_lag_penalty", &v);
-    s->score_target_lag_penalty = (int)v;
+    s->score_target_lag_penalty = restore_int_clamped(v);
     restore_source_int(ndb, source, "score_failure_penalty", &v);
-    s->score_failure_penalty = (int)v;
+    s->score_failure_penalty = restore_int_clamped(v);
     restore_source_int(ndb, source, "score_mirror_gate_penalty", &v);
-    s->score_mirror_gate_penalty = (int)v;
+    s->score_mirror_gate_penalty = restore_int_clamped(v);
     restore_source_int(ndb, source, "healthy", &v); s->healthy = v != 0;
     restore_source_int(ndb, source, "available", &v); s->available = v != 0;
     restore_source_int(ndb, source, "blocked", &v); s->blocked = v != 0;
@@ -363,7 +379,7 @@ struct zcl_result bsp_restore_decision(struct node_db *ndb)
     if (node_db_state_get_int(ndb, BSP_KEY_MIRROR_FALLBACK_ALLOWED, &v))
         d.mirror_fallback_allowed = v != 0;
     if (node_db_state_get_int(ndb, BSP_KEY_SELECTED_SCORE, &v))
-        d.selected_score = (int)v;
+        d.selected_score = restore_int_clamped(v);
     if (node_db_state_get(ndb, BSP_KEY_REASON, reason,
                           sizeof(reason) - 1, &len))
         bsp_copy_text(d.reason, sizeof(d.reason), reason);
@@ -371,11 +387,11 @@ struct zcl_result bsp_restore_decision(struct node_db *ndb)
                           sizeof(blocker) - 1, &len))
         bsp_copy_text(d.blocker, sizeof(d.blocker), blocker);
     if (node_db_state_get_int(ndb, BSP_KEY_LOCAL_HEIGHT, &v))
-        d.local_height = (int)v;
+        d.local_height = restore_int_clamped(v);
     if (node_db_state_get_int(ndb, BSP_KEY_BEST_HEADER_HEIGHT, &v))
-        d.best_header_height = (int)v;
+        d.best_header_height = restore_int_clamped(v);
     if (node_db_state_get_int(ndb, BSP_KEY_TARGET_HEIGHT, &v))
-        d.target_height = (int)v;
+        d.target_height = restore_int_clamped(v);
     for (int i = 1; i < BSP_SOURCE_NUM; i++)
         restore_source_snapshot(ndb, (enum bsp_source)i, &d.sources[i]);
     if (d.selected_source > BSP_SOURCE_NONE &&
@@ -393,7 +409,7 @@ struct zcl_result bsp_restore_decision(struct node_db *ndb)
                               sizeof(source_block_text) - 1, &len))
             bsp_copy_text(s->blocker, sizeof(s->blocker), source_block_text);
         if (node_db_state_get_int(ndb, BSP_KEY_SOURCE_HEIGHT, &v))
-            s->height = (int)v;
+            s->height = restore_int_clamped(v);
         if (node_db_state_get_int(ndb, BSP_KEY_SOURCE_HEALTHY, &v))
             s->healthy = v != 0;
         if (node_db_state_get_int(ndb, BSP_KEY_SOURCE_AVAILABLE, &v))
@@ -439,7 +455,7 @@ struct zcl_result bsp_restore_projection_deferral(struct node_db *ndb)
     bsp_lock_init_once();
     zcl_mutex_lock(&g_bsp.lock);
     g_bsp.projection_deferred_total = total > 0 ? total : 0;
-    g_bsp.last_projection_deferred_height = (int)height;
+    g_bsp.last_projection_deferred_height = restore_int_clamped(height);
     g_bsp.last_projection_deferred_time = when;
     bsp_copy_text(g_bsp.last_projection_deferred_reason,
                   sizeof(g_bsp.last_projection_deferred_reason),
