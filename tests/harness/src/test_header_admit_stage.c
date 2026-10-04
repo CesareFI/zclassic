@@ -31,6 +31,7 @@
 #include "../../../engine/jobs/src/header_admit_forward_rewind.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -221,6 +222,21 @@ static int test_pending_header_height_boundaries(void)
     return failures;
 }
 
+static int test_header_admit_cursor_boundaries(void)
+{
+    int failures = 0;
+    int height = -1;
+    HA_CHECK("header admit accepts ordinary durable cursor",
+             header_admit_stage_test_cursor_height(7, &height) && height == 7);
+    HA_CHECK("header admit accepts maximum representable cursor",
+             header_admit_stage_test_cursor_height(INT32_MAX, &height) &&
+             height == INT32_MAX);
+    HA_CHECK("header admit rejects cursor above height range",
+             !header_admit_stage_test_cursor_height((UINT64_C(1) << 32),
+                                                    &height));
+    return failures;
+}
+
 int test_header_admit_stage(void)
 {
     printf("\n=== header_admit_stage tests ===\n");
@@ -229,6 +245,7 @@ int test_header_admit_stage(void)
     blocker_module_init();
 
     failures += test_pending_header_height_boundaries();
+    failures += test_header_admit_cursor_boundaries();
 
     /* ── happy path: drain a 5-block synthetic chain ───────────────── */
     {

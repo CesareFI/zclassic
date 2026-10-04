@@ -114,6 +114,7 @@ void header_admit_stage_set_authoritative_hook(
 
 bool header_admit_stage_test_parent_height_matches(int parent_height,
                                                    int want_height);
+bool header_admit_stage_test_cursor_height(uint64_t cursor, int *out);
 #endif
 
 #endif /* ZCL_SERVICES_HEADER_ADMIT_STAGE_H */

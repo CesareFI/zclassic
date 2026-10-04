@@ -485,6 +485,21 @@ static struct block_index *produce_block_index(struct main_state *ms,
     return bi;
 }
 
+static bool header_admit_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool header_admit_stage_test_cursor_height(uint64_t cursor, int *out)
+{
+    return header_admit_cursor_height(cursor, out);
+}
+#endif
+
 static job_result_t step_admit(struct stage_step_ctx *c)
 {
     atomic_store(&g_last_step_unix, platform_time_wall_unix());
@@ -495,8 +510,12 @@ static job_result_t step_admit(struct stage_step_ctx *c)
     sqlite3 *db = progress_store_db();
     if (!db) return JOB_IDLE;
 
-    int next_h = (int)c->cursor_in;
-    if (next_h < 0) return JOB_FATAL;
+    int next_h = 0;
+    if (!header_admit_cursor_height(c->cursor_in, &next_h)) {
+        LOG_WARN(STAGE_NAME, "[header_admit] cursor out of range: %llu",
+                 (unsigned long long)c->cursor_in);
+        return JOB_FATAL;
+    }
 
     /* ANCHOR-SET MINT bound: the `-mint-anchor` driver caps the fold at the
      * SHA3 checkpoint anchor so the resulting coins_kv set IS the anchor set.
