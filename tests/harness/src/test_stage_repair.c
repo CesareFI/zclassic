@@ -270,12 +270,29 @@ static int test_stage_repair_cursor_boundaries(void)
     return failures;
 }
 
+static int test_stage_repair_frontier_range_boundaries(void)
+{
+    int failures = 0;
+    char dir[256];
+    sqlite3 *db = NULL;
+    bool ok = setup_case("frontier_int_max", dir, sizeof(dir), &db);
+    ok = ok && seed_cursors(db, INT_MAX, INT_MAX);
+    int height = -1;
+    ok = ok && stage_repair_header_solution_repairable_validate_frontier(
+                   db, &height);
+    ok = ok && height == -1;
+    STR_CHECK("INT_MAX finalized cursor has no overflowing repair successor", ok);
+    teardown_case(dir);
+    return failures;
+}
+
 int test_stage_repair(void)
 {
     printf("\n=== stage_repair poison-rewind safety guard tests ===\n");
     int failures = 0;
 
     failures += test_stage_repair_cursor_boundaries();
+    failures += test_stage_repair_frontier_range_boundaries();
 
     /* --- Guard 1: ok=1 row AT the frontier refuses the whole rewind. ---
      * This is the regression guard: a finalized (ok=1) row at/above the

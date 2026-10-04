@@ -136,6 +136,13 @@ bool stage_repair_header_solution_repairable_validate_frontier(
         return false;
     }
 
+    /* A persisted INT_MAX cursor is representable but has no representable
+     * successor. There can be no repairable int-height row above it, so do
+     * not form the overflowing endpoint merely to discover an empty range. */
+    if (tip_finalize_cursor == INT_MAX) {
+        progress_store_tx_unlock();
+        return true;
+    }
     int start_height = tip_finalize_cursor >= 0 ? tip_finalize_cursor + 1 : 0;
     int end_height = validate_cursor > 0 ? validate_cursor - 1 : INT_MAX;
     if (end_height < start_height) {
