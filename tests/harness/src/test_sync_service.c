@@ -474,6 +474,30 @@ static int test_sync_service_rejects_unrepresentable_body_target(void)
     return failures;
 }
 
+static int test_sync_service_snapshots_recovery_text(void)
+{
+    int failures = 0;
+
+    TEST("sync_service snapshots recovery reason and trigger") {
+        struct watchdog_stats stats;
+        sync_monitor_init();
+        sync_monitor_record_snapshot_resnapshot(
+            10, 12, 3, 20, 18, "manifest-retry", "snapshot stalled");
+        sync_monitor_get_stats(&stats);
+        ASSERT(strcmp(stats.last_recovery_reason, "snapshot stalled") == 0);
+        ASSERT(strcmp(stats.last_recovery_trigger, "manifest-retry") == 0);
+
+        sync_monitor_record_recovery(WATCHDOG_HEADER_STALL,
+                                     12, 13, 3, "headers stalled");
+        sync_monitor_get_stats(&stats);
+        ASSERT(strcmp(stats.last_recovery_reason, "headers stalled") == 0);
+        ASSERT(stats.last_recovery_trigger[0] == '\0');
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_sync_service_reject_probe_pending(void)
 {
     int failures = 0;
@@ -2508,6 +2532,7 @@ int test_sync_service(void)
     failures += test_sync_service_header_batch_followup();
     failures += test_sync_service_reject_probe_rate_limit();
     failures += test_sync_service_rejects_unrepresentable_body_target();
+    failures += test_sync_service_snapshots_recovery_text();
     failures += test_sync_service_reject_probe_pending();
     failures += test_sync_service_block_file_scan_trigger();
     failures += test_sync_service_block_assignment_plan();

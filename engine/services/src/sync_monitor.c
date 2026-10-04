@@ -55,6 +55,7 @@ static _Atomic int g_tip_eval_local_gap;
 static _Atomic uint64_t g_tip_eval_intake_pending;
 static char g_last_recovery_reason[96];
 static char g_last_recovery_trigger[64];
+static pthread_mutex_t g_recovery_text_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct connman *g_condition_cm;
 static struct download_manager *g_condition_dm;
@@ -96,8 +97,10 @@ void sync_monitor_init(void)
     pthread_mutex_lock(&g_local_recovery_lock);
     memset(&g_local_recovery, 0, sizeof(g_local_recovery));
     pthread_mutex_unlock(&g_local_recovery_lock);
+    pthread_mutex_lock(&g_recovery_text_lock);
     memset(g_last_recovery_reason, 0, sizeof(g_last_recovery_reason));
     memset(g_last_recovery_trigger, 0, sizeof(g_last_recovery_trigger));
+    pthread_mutex_unlock(&g_recovery_text_lock);
     atomic_store(&g_last_block_connected_ts, 0);
     atomic_store(&g_last_block_connected_height, -1);
     atomic_store(&g_last_observed_provable_tip, -1);
@@ -328,9 +331,11 @@ void sync_monitor_record_recovery(enum watchdog_recovery_type type,
     atomic_store(&g_last_recovery_peer_count, peer_count);
     atomic_store(&g_last_recovery_target_height, -1);
     atomic_store(&g_last_recovery_manifest_height, -1);
+    pthread_mutex_lock(&g_recovery_text_lock);
     snprintf(g_last_recovery_reason, sizeof(g_last_recovery_reason), "%s",
              reason ? reason : "");
     g_last_recovery_trigger[0] = '\0';
+    pthread_mutex_unlock(&g_recovery_text_lock);
 }
 
 void sync_monitor_record_snapshot_resnapshot(int local_height,
@@ -346,8 +351,10 @@ void sync_monitor_record_snapshot_resnapshot(int local_height,
                                  reason);
     atomic_store(&g_last_recovery_target_height, target_height);
     atomic_store(&g_last_recovery_manifest_height, manifest_height);
+    pthread_mutex_lock(&g_recovery_text_lock);
     snprintf(g_last_recovery_trigger, sizeof(g_last_recovery_trigger), "%s",
              trigger ? trigger : "");
+    pthread_mutex_unlock(&g_recovery_text_lock);
 }
 
 void sync_monitor_kick_local_sync(const char *reason)
@@ -752,12 +759,14 @@ void sync_monitor_get_stats(struct watchdog_stats *out)
         atomic_load(&g_last_recovery_target_height);
     out->last_recovery_manifest_height =
         atomic_load(&g_last_recovery_manifest_height);
+    pthread_mutex_lock(&g_recovery_text_lock);
     snprintf(out->last_recovery_reason,
              sizeof(out->last_recovery_reason), "%s",
              g_last_recovery_reason);
     snprintf(out->last_recovery_trigger,
              sizeof(out->last_recovery_trigger), "%s",
              g_last_recovery_trigger);
+    pthread_mutex_unlock(&g_recovery_text_lock);
 }
 
 const char *watchdog_recovery_type_name(enum watchdog_recovery_type type)
