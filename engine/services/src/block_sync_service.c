@@ -612,6 +612,11 @@ bool syncsvc_should_probe_after_reject(int64_t now_seconds,
 {
     if (last_probe_seconds <= 0)
         return true;  // raw-return-ok:never-probed-is-not-an-error
+    /* The stamp is wall-clock diagnostic state.  A local backward
+     * correction must not strand a pending bad-prevblk recovery probe until
+     * wall time catches up to the previous stamp. */
+    if (now_seconds < last_probe_seconds)
+        return true;
     return (now_seconds - last_probe_seconds) >=
            SYNC_REJECT_PROBE_INTERVAL_SECS;
 }

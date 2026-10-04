@@ -436,6 +436,9 @@ static int test_sync_service_reject_probe_rate_limit(void)
         ASSERT(syncsvc_should_probe_after_reject(
             1000, 1000 - SYNC_REJECT_PROBE_INTERVAL_SECS));
         ASSERT(syncsvc_should_probe_after_reject(1000, 500));
+        /* A clock rollback cannot keep an already-pending recovery probe
+         * asleep until the old wall-clock stamp is reached. */
+        ASSERT(syncsvc_should_probe_after_reject(999, 1000));
         PASS();
     } _test_next:;
 
@@ -458,6 +461,9 @@ static int test_sync_service_reject_probe_pending(void)
          * inside the rate-limit window. */
         node.last_reject_probe_time = 1000;
         ASSERT(!syncsvc_should_fire_reject_probe(&node, 1001));
+        /* The pending production path re-arms immediately on a backward
+         * wall-clock correction instead of waiting for 1000 again. */
+        ASSERT(syncsvc_should_fire_reject_probe(&node, 999));
         /* Interval elapsed → fires. */
         ASSERT(syncsvc_should_fire_reject_probe(
             &node, 1000 + SYNC_REJECT_PROBE_INTERVAL_SECS));
