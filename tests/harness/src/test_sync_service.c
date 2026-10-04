@@ -1361,6 +1361,15 @@ static int test_sync_service_band_anchor_follows_index_frontier(void)
          * authority — the boot anchor. */
         ASSERT(syncsvc_header_band_backfill_anchor(&chain) == &f[2]);
 
+        /* A retry can run after the active-chain slots have temporarily
+         * lagged a known frontier but before a peer responds. The first
+         * selector call must retain its vetted frontier: rebuilding from
+         * the remaining slots would move the locator backward to f[1],
+         * re-serving known headers and making every retry rescan the band. */
+        chain.chain[f[2].nHeight] = NULL;
+        ASSERT(syncsvc_header_band_backfill_anchor(&chain) == &f[2]);
+        chain.chain[f[2].nHeight] = &f[2];
+
         /* The livelock batch: every header already known (newly_added==0),
          * tail f[7] trust-rooted below the island. It is still PROGRESS
          * and the anchor must advance to the INDEX frontier — re-deriving

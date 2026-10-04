@@ -163,32 +163,15 @@ struct block_index *syncsvc_header_band_backfill_anchor(
     if (!island_root)
         return NULL;           /* band closed; after_batch clears the fact */
 
-    /* SLOT half — the highest populated slot below the island root.
-     * Sufficient at boot (the restored chain ends there), but it LAGS
-     * the block index during the walk: header acceptance inserts into
-     * the index only, so a slot-only anchor pins one batch back and the
-     * peer re-serves the same known range forever. */
-    struct block_index *slot_frontier = NULL;
-    for (int h = island_root->nHeight - 1; h >= 0; h--) {
-        struct block_index *slot = active_chain_at(chain, h);
-        if (!slot)
-            continue;
-        if (utxo_recovery_block_trust_rooted(slot))
-            slot_frontier = slot;
-        else
-            LOG_WARN("headers",
-                     "header band backfill: frontier candidate h=%d below "
-                     "island_root=%d is itself not trust-rooted — no "
-                     "servable slot anchor", h, island_root->nHeight);
-        break;                 /* only the highest populated slot counts */
-    }
-
-    /* INDEX half — the cursor band_continue/after_batch advance on
-     * EVERY accepted band batch (including all-known newly_added==0
-     * ones). Re-verify at use: repair ladders can rewrite ancestry, so
-     * a cursor that no longer walks to a trust root or no longer sits
-     * below the island root is stale — drop it (CAS: never clobber a
-     * concurrent advance) so a lower one can re-establish. */
+    /* INDEX half — the cursor advances on EVERY accepted band batch
+     * (including all-known newly_added==0 ones). It also retains the
+     * first slot frontier found below: that pointer has already passed the
+     * same trust-root test and lets the next retry avoid re-scanning every
+     * empty active-chain slot while the peer is preparing its response.
+     * Re-verify at use: repair ladders can rewrite ancestry, so a cursor
+     * that no longer walks to a trust root or no longer sits below the
+     * island root is stale — drop it (CAS: never clobber a concurrent
+     * advance) and re-establish from the slots. */
     struct block_index *cursor = atomic_load(&g_band_index_frontier);
     if (cursor && (cursor->nHeight >= island_root->nHeight ||
                    !utxo_recovery_block_trust_rooted(cursor))) {
@@ -197,14 +180,28 @@ struct block_index *syncsvc_header_band_backfill_anchor(
         cursor = NULL;
     }
 
-    /* Anchor at the HIGHER of the two authorities: anchoring below the
-     * index frontier makes the peer fork there and re-serve headers the
-     * index already holds. */
-    struct block_index *anchor = slot_frontier;
-    if (cursor && (!anchor || cursor->nHeight > anchor->nHeight))
-        anchor = cursor;
-    if (anchor)
-        return anchor;
+    if (cursor)
+        return cursor;
+
+    /* Bootstrap the cursor from the highest populated slot below the island
+     * root. Header acceptance normally advances it from then on. Until the
+     * first response returns, retaining this vetted slot avoids a repeated
+     * linear scan and prevents a temporary slot lag from moving the locator
+     * backward to an older known header. */
+    for (int h = island_root->nHeight - 1; h >= 0; h--) {
+        struct block_index *slot = active_chain_at(chain, h);
+        if (!slot)
+            continue;
+        if (!utxo_recovery_block_trust_rooted(slot)) {
+            LOG_WARN("headers",
+                     "header band backfill: frontier candidate h=%d below "
+                     "island_root=%d is itself not trust-rooted — no "
+                     "servable slot anchor", h, island_root->nHeight);
+            break;             /* only the highest populated slot counts */
+        }
+        band_cursor_advance(slot);
+        return atomic_load(&g_band_index_frontier);
+    }
 
     LOG_WARN("headers",
              "header band backfill: no populated slot below island_root=%d "
