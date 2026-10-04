@@ -21,6 +21,38 @@ static struct p2p_node make_test_node(int starting_height, int64_t last_gh_time)
     return n;
 }
 
+static int test_header_sync_backward_clock(void)
+{
+    struct p2p_node n = make_test_node(10000, 1000);
+
+    /* The production send loop records this stamp from wall time.  If wall
+     * time steps backward, both the regular and stalled-peer fallback paths
+     * must send one replacement request rather than wait for the previous
+     * wall-clock value. */
+    bool at_boundary = !syncsvc_should_request_headers(&n, 100, 1010) &&
+                       !syncsvc_should_request_headers_with_fallback(
+                           &n, 100, 1010, true);
+    bool backward = syncsvc_should_request_headers(&n, 100, 900) &&
+                    syncsvc_should_request_headers_with_fallback(&n, 100,
+                                                                 900, true);
+
+    /* A queued retry replaces the future stamp.  Normal strict-after-interval
+     * behavior must return immediately after that recovery. */
+    syncsvc_note_headers_requested(&n, 900);
+    bool recovered = !syncsvc_should_request_headers(&n, 100, 910) &&
+                     syncsvc_should_request_headers(&n, 100, 911);
+    syncsvc_note_headers_requested(&n, INT64_MIN);
+    bool extreme_elapsed = syncsvc_should_request_headers(&n, 100,
+                                                          INT64_MAX);
+    bool ok = at_boundary && backward && recovered && extreme_elapsed;
+    if (ok) {
+        printf("header_sync: backward clock retry and recovery cadence... OK\n");
+        return 0;
+    }
+    printf("header_sync: backward clock retry and recovery cadence... FAIL\n");
+    return 1;
+}
+
 int test_header_sync(void)
 {
     int failures = 0;
@@ -218,6 +250,9 @@ int test_header_sync(void)
         bool ok = !too_early && at_finality;
         if (ok) printf("OK\n"); else { printf("FAIL\n"); failures++; }
     }
+
+    /* ── 18. Backward wall clock cannot strand header retries ─ */
+    failures += test_header_sync_backward_clock();
 
     return failures;
 }

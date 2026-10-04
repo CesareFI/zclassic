@@ -311,6 +311,25 @@ static int64_t syncsvc_getheaders_interval(const struct p2p_node *node,
     return base;
 }
 
+/* Header request stamps intentionally use wall time because they are shared
+ * with the send loop's peer diagnostics.  A local clock correction can make
+ * that stamp appear to be in the future, however.  Treat that impossible
+ * interval as expired: otherwise IBD can park this peer until wall time
+ * reaches the old value.  The next successfully queued request replaces the
+ * stamp, restoring normal cadence. */
+static bool syncsvc_header_request_interval_elapsed(int64_t now_seconds,
+                                                    int64_t last_request,
+                                                    int64_t interval)
+{
+    if (now_seconds < last_request)
+        return true;
+    /* The ordered signed pair can span the entire int64_t range.  Unsigned
+     * subtraction retains that non-negative elapsed duration without signed
+     * overflow. */
+    return (uint64_t)now_seconds - (uint64_t)last_request >
+           (uint64_t)interval;
+}
+
 bool syncsvc_should_request_headers(const struct p2p_node *node,
                                     int our_height,
                                     int64_t now_seconds)
@@ -327,8 +346,10 @@ bool syncsvc_should_request_headers(const struct p2p_node *node,
         return false;
 
     int64_t interval = syncsvc_getheaders_interval(node, our_height);
-    return (now_seconds - atomic_load_explicit(&node->last_getheaders_time,
-                                                memory_order_relaxed)) > interval;
+    int64_t last_request = atomic_load_explicit(&node->last_getheaders_time,
+                                                memory_order_relaxed);
+    return syncsvc_header_request_interval_elapsed(now_seconds, last_request,
+                                                   interval);
 }
 
 void syncsvc_plan_periodic_getheaders(struct sync_getheaders_action *action,
@@ -771,6 +792,8 @@ bool syncsvc_should_request_headers_with_fallback(const struct p2p_node *node,
         interval = 10;
     else
         interval = 30; /* tighter during stall */
-    return (now_seconds - atomic_load_explicit(&node->last_getheaders_time,
-                                                memory_order_relaxed)) > interval;
+    int64_t last_request = atomic_load_explicit(&node->last_getheaders_time,
+                                                memory_order_relaxed);
+    return syncsvc_header_request_interval_elapsed(now_seconds, last_request,
+                                                   interval);
 }
