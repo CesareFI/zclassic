@@ -685,6 +685,13 @@ static int test_snapshot_manifest_contract(void)
         ASSERT(snapshot_manifest_validate_offer(&manifest, 0) ==
                SNAPSHOT_MANIFEST_OK);
 
+        manifest.height = INT32_MAX;
+        manifest.peer_tip_height = INT32_MAX;
+        ASSERT(snapshot_manifest_validate_offer(&manifest, INT32_MAX) ==
+               SNAPSHOT_MANIFEST_NOT_AHEAD);
+        manifest.height = 10000;
+        manifest.peer_tip_height = 10010;
+
         offer.read_pos = 0;
         stream_write_u8(&offer, 0xff);
         ASSERT(!snapshot_manifest_parse(&manifest, &offer, &result).ok);
