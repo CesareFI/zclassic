@@ -1676,6 +1676,27 @@ static int test_bh_held_max_range_stays_in_window(void)
     return failures;
 }
 
+static int test_bh_unrepresentable_window_is_unknown(void)
+{
+    int failures = 0;
+    TEST("unrepresentable body-history window remains unknown") {
+        struct body_coverage_map held;
+        struct body_coverage_map measured;
+        struct body_history_verdict verdict;
+
+        body_coverage_init(&held);
+        body_coverage_init(&measured);
+        ASSERT(!body_history_evaluate(&held, &measured, 0, INT64_MAX,
+                                      &verdict));
+        ASSERT(verdict.status == BODY_HISTORY_UNKNOWN);
+        ASSERT(verdict.window_lo == -1 && verdict.window_hi == -1);
+        body_coverage_free(&held);
+        body_coverage_free(&measured);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_bh_lifetime_counters_saturate(void)
 {
     int failures = 0;
@@ -1783,6 +1804,7 @@ int test_body_history(void)
     failures += test_bh_fully_measured_is_looked_not_proven();
     failures += test_bh_dump_state_json_separates_the_three();
     failures += test_bh_held_max_range_stays_in_window();
+    failures += test_bh_unrepresentable_window_is_unknown();
     failures += test_bh_lifetime_counters_saturate();
     return failures;
 }

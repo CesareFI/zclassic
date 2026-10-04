@@ -94,6 +94,11 @@ static bool bh_unmeasured_tail(bool measured_to_window_end, int64_t cursor,
            lowest_unmeasured < 0;
 }
 
+static bool bh_window_has_representable_width(int64_t lo, int64_t hi)
+{
+    return lo >= 0 && lo <= hi && hi - lo < INT64_MAX;
+}
+
 bool body_history_evaluate(const struct body_coverage_map *held,
                            const struct body_coverage_map *measured,
                            int64_t lo, int64_t hi,
@@ -105,7 +110,11 @@ bool body_history_evaluate(const struct body_coverage_map *held,
 
     if (!held || !measured)
         return false;
-    if (lo < 0 || lo > hi)
+    /* Counts use signed int64_t.  A nonnegative window spanning the entire
+     * representable domain contains INT64_MAX + 1 heights, which cannot be
+     * represented without overflow.  It is malformed local recovery input,
+     * so retain the pessimistic UNKNOWN verdict rather than wrapping it. */
+    if (!bh_window_has_representable_width(lo, hi))
         return false;
 
     out->window_lo = lo;
