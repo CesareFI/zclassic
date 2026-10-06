@@ -1065,6 +1065,48 @@ int test_utxo_recovery_service(void)
         unlink(db_path);
     }
 
+    /* ── 11b. Invalid LevelDB source fails before the SQLite wipe ── */
+    {
+        char db_path[256], dir[256], chainstate[300];
+        snprintf(db_path, sizeof(db_path), "./test-tmp/%d_urs_ldb_open.db", getpid());
+        snprintf(dir, sizeof(dir), "./test-tmp/%d_urs_ldb_open", getpid());
+        snprintf(chainstate, sizeof(chainstate), "%s/chainstate", dir);
+        mkdir("./test-tmp", 0755);
+        mkdir(dir, 0700);
+        mkdir(chainstate, 0700);
+        char current_path[340];
+        snprintf(current_path, sizeof(current_path), "%s/CURRENT", chainstate);
+        FILE *bad_current = fopen(current_path, "w");
+        if (bad_current) { fputs("MANIFEST-000001\n", bad_current); fclose(bad_current); }
+        struct node_db ndb;
+        memset(&ndb, 0, sizeof(ndb));
+        bool opened = node_db_open(&ndb, db_path);
+        if (opened)
+            node_db_exec(&ndb, "INSERT INTO utxos(txid,vout,height,value,script) VALUES(X'01',0,7,4242,X'51')");
+        struct main_state ms;
+        memset(&ms, 0, sizeof(ms));
+        block_map_init(&ms.map_block_index);
+        active_chain_init(&ms.chain_active);
+        struct coins_view_sqlite cvs;
+        struct coins_view_cache cache;
+        memset(&cvs, 0, sizeof(cvs));
+        memset(&cache, 0, sizeof(cache));
+        struct utxo_recovery_ctx uctx = {
+            .state = &ms, .coins_sqlite = &cvs,
+            .coins_tip = &cache, .ndb = &ndb,
+            .datadir = dir,
+        };
+        struct utxo_import_result ir = opened
+            ? utxo_recovery_import_ldb(&uctx)
+            : (struct utxo_import_result){ .status = ZCL_ERR(-99, "fixture") };
+        int64_t after = opened ? node_db_utxo_count(&ndb) : -1;
+        URS_CHECK("urs: invalid LevelDB source fails before target wipe",
+                  ir.status.code == -6 && !ir.status.ok && !ir.imported && after == 1);
+        block_map_free(&ms.map_block_index);
+        if (opened) node_db_close(&ndb);
+        unlink(current_path); rmdir(chainstate); rmdir(dir); unlink(db_path);
+    }
+
     /* ── 12. Restore with no UTXOs publishes genesis through CSR ── */
 
     {

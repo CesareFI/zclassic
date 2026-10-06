@@ -195,6 +195,16 @@ struct utxo_import_result utxo_recovery_import_ldb(
         snprintf(import_path, sizeof(import_path), "%s", cs_path);
     }
 
+    struct coins_view_db migrate_db;
+    if (!coins_view_db_open(&migrate_db, import_path,
+                            450 << 20, false, false)) {
+        res.status = ZCL_ERR(-6,
+            "utxo_recovery_import_ldb: failed to open source chainstate path=%s",
+            import_path);
+        LOG_WARN("utxo_recovery", "%s", res.status.message);
+        goto cleanup;
+    }
+
     {
         struct zcl_result wipe =
             utxo_recovery_wipe(ctx->ndb, "boot.ldb_import_prepare");
@@ -203,9 +213,7 @@ struct utxo_import_result utxo_recovery_import_ldb(
     }
     coins_view_sqlite_close(ctx->coins_sqlite);
 
-    struct coins_view_db migrate_db;
-    if (coins_view_db_open(&migrate_db, import_path,
-                           450 << 20, false, false)) {
+    {
         struct node_db import_db;
         if (node_db_sync_open_private_db_like(ctx->ndb, &import_db)) {
             node_db_sync_import_utxos(&import_db, &migrate_db);
