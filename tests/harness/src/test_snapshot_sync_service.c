@@ -2,6 +2,7 @@
  * Tests for snapshot sync service policy helpers. */
 
 #include "test/test_core.h"
+#include "controllers/sync_controller.h"
 #include "models/database.h"
 #include "net/snapshot_sync_contract.h"
 #include "services/snapshot_manifest.h"
@@ -1950,9 +1951,6 @@ static int test_snapshot_local_recovery_manifest_builder(void)
         memset(chain_work, 0x55, sizeof(chain_work));
 
         ASSERT(node_db_open(&ndb, ":memory:"));
-        ASSERT(node_db_state_set_int(&ndb, "tip_height", 1));
-        ASSERT(node_db_state_set(&ndb, "tip_hash", block_hash, 32));
-
         sqlite3_stmt *st = NULL;
         ASSERT(sqlite3_prepare_v2(ndb.db,
             "INSERT INTO blocks "
@@ -1972,6 +1970,9 @@ static int test_snapshot_local_recovery_manifest_builder(void)
         sqlite3_bind_blob(st, 10, chain_work, 32, SQLITE_STATIC);
         ASSERT(sqlite3_step(st) == SQLITE_DONE);
         sqlite3_finalize(st);
+        /* The builder must consume the production sync-projection cursor,
+         * not obsolete test-only tip_height/tip_hash state keys. */
+        ASSERT(node_db_sync_set_tip(&ndb, block_hash, 1));
 
         ASSERT(node_db_exec(&ndb,
             "INSERT INTO utxos "

@@ -8,6 +8,7 @@
  * to parse/write the offer and FlyClient request envelopes. */
 
 #include "net/snapshot_sync_contract.h"
+#include "controllers/sync_controller.h"
 #include "services/snapshot_manifest.h"
 #include "services/block_source_policy.h"
 #include "chain/mmb.h"
@@ -37,22 +38,6 @@ static bool snapsync_bytes32_nonzero_internal(const uint8_t b[32])
             return true;
     }
     return false;
-}
-
-static bool snapsync_read_i64_state_internal(struct node_db *ndb,
-                                             const char *key,
-                                             int64_t *out)
-{
-    uint8_t buf[8] = {0};
-    size_t len = 0;
-
-    if (!ndb || !key || !out)
-        return false;
-    if (!node_db_state_get(ndb, key, buf, sizeof(buf), &len) ||
-        len == 0 || len > sizeof(buf))
-        return false;
-    memcpy(out, buf, len);
-    return true;
 }
 
 static bool snapsync_load_state_mmr_root_internal(struct node_db *ndb,
@@ -172,15 +157,14 @@ struct zcl_result snapsync_build_local_recovery_manifest(struct node_db *ndb,
                                             uint32_t peer_id)
 {
     int64_t tip_height = 0;
-    size_t hash_len = 0;
     uint64_t utxo_count = 0;
 
     if (!ndb || !ndb->open || !out)
         return ZCL_ERR(-1, "build_local_recovery_manifest: null/closed ndb or null out");
 
     memset(out, 0, sizeof(*out));
-    if (!snapsync_read_i64_state_internal(ndb, "tip_height", &tip_height) ||
-        tip_height <= 0 || tip_height > INT32_MAX)
+    tip_height = node_db_sync_get_tip_height(ndb);
+    if (tip_height <= 0 || tip_height > INT32_MAX)
         return ZCL_ERR(-2, "build_local_recovery_manifest: invalid tip_height=%lld",
                        (long long)tip_height);
     out->height = (int32_t)tip_height;
@@ -190,9 +174,7 @@ struct zcl_result snapsync_build_local_recovery_manifest(struct node_db *ndb,
     out->protocol_version = FAST_SYNC_PROTOCOL_VERSION;
     out->snapshot_schema_version = FAST_SYNC_SNAPSHOT_SCHEMA_VERSION;
 
-    if (!node_db_state_get(ndb, "tip_hash", out->block_hash, 32,
-                           &hash_len) ||
-        hash_len != 32 ||
+    if (!node_db_sync_get_tip_hash(ndb, out->block_hash) ||
         !snapsync_bytes32_nonzero_internal(out->block_hash))
         return ZCL_ERR(-3, "build_local_recovery_manifest: missing/invalid tip_hash");
     if (!snapsync_read_tip_chainwork_internal(ndb, out->block_hash,
