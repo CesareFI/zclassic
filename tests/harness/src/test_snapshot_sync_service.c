@@ -1230,6 +1230,28 @@ static int test_snapshot_turbo_restore_failure_keeps_retry_latch(void)
     return failures;
 }
 
+static int test_snapshot_failed_status_marks_closed_staging_unknown(void)
+{
+    int failures = 0;
+
+    TEST("snapshot failed status reports closed staging as unknown") {
+        struct snapshot_sync_service svc;
+        struct node_db ndb;
+        struct snapsync_failed_status status;
+
+        memset(&svc, 0, sizeof(svc));
+        memset(&ndb, 0, sizeof(ndb));
+        svc.ndb = &ndb;
+        svc.state = SNAPSYNC_FAILED;
+        snapsync_get_failed_status(&svc, &status);
+        ASSERT(status.failed);
+        ASSERT(status.staged_row_count == -1);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_snapshot_sync_reset_rejects_late_chunk(void)
 {
     int failures = 0;
@@ -2372,6 +2394,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_offer_churn();
     failures += test_snapshot_sync_service_db_service_runtime();
     failures += test_snapshot_turbo_restore_failure_keeps_retry_latch();
+    failures += test_snapshot_failed_status_marks_closed_staging_unknown();
     failures += test_snapshot_sync_reset_rejects_late_chunk();
     failures += test_snapshot_sync_reset_coalesces_concurrent_failure();
     failures += test_snapshot_sync_service_runtime_accessor();
