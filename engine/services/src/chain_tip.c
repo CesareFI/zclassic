@@ -47,12 +47,20 @@
 
 static _Atomic uint64_t g_fsync_seq = 0;
 
-static int monotonic_ms(void)
+static int64_t chain_tip_fsync_elapsed_ms(int64_t start_ms, int64_t end_ms)
 {
-    struct timespec ts;
-    platform_time_monotonic_timespec(&ts);
-    return (int)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    if (start_ms < 0 || end_ms < start_ms)
+        return 0;
+    return end_ms - start_ms;
 }
+
+#ifdef ZCL_TESTING
+int64_t chain_tip_fsync_elapsed_ms_for_testing(int64_t start_ms,
+                                               int64_t end_ms)
+{
+    return chain_tip_fsync_elapsed_ms(start_ms, end_ms);
+}
+#endif
 
 static void chain_tip_fsync_barrier(struct main_state *ms,
                                     const struct block_index *new_tip)
@@ -69,17 +77,19 @@ static void chain_tip_fsync_barrier(struct main_state *ms,
     bool should = (gap <= 1000) || (seq % CATCHUP_FSYNC_EVERY == 0);
     if (!should) return;
 
-    int t0 = monotonic_ms();
+    int64_t t0 = platform_time_monotonic_ms();
     int rc = sqlite3_db_cacheflush(ndb->db);
-    int elapsed = monotonic_ms() - t0;
+    int64_t elapsed = chain_tip_fsync_elapsed_ms(
+        t0, platform_time_monotonic_ms());
     if (rc != SQLITE_OK) {
         fprintf(stderr,
-            "[tip-fsync] db_cacheflush rc=%d elapsed=%dms — continuing\n",
-            rc, elapsed);
+            "[tip-fsync] db_cacheflush rc=%d elapsed=%lldms — continuing\n",
+            rc, (long long)elapsed);
         return;
     }
     if (elapsed > FSYNC_BARRIER_BUDGET_MS) {
-        LOG_WARN("tip", "[tip-fsync] slow cacheflush elapsed=%dms (gap=%d seq=%llu)", elapsed, gap, (unsigned long long)seq);
+        LOG_WARN("tip", "[tip-fsync] slow cacheflush elapsed=%lldms (gap=%d seq=%llu)",
+                 (long long)elapsed, gap, (unsigned long long)seq);
     }
 }
 

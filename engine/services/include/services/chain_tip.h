@@ -24,6 +24,7 @@
 #define ZCL_CHAIN_TIP_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "util/result.h"
 
@@ -68,5 +69,12 @@ struct zcl_result chain_set_active_tip(struct main_state *ms,
                                        struct block_index *new_tip,
                                        enum tip_source src,
                                        const char *reason);
+
+#ifdef ZCL_TESTING
+/* Exercises the production fsync-barrier elapsed-time calculation at the
+ * former 32-bit monotonic-millisecond boundary. */
+int64_t chain_tip_fsync_elapsed_ms_for_testing(int64_t start_ms,
+                                               int64_t end_ms);
+#endif
 
 #endif /* ZCL_CHAIN_TIP_H */

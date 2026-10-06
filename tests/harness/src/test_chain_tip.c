@@ -6,6 +6,7 @@
 #include "chain/chain.h"
 #include "event/event.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -50,6 +51,17 @@ int test_chain_tip(void)
     {
         bool r = chain_set_active_tip(NULL, NULL, TIP_FROM_TEST, "null_ms").ok;
         if (!r) printf("OK\n");
+        else { printf("FAIL\n"); failures++; }
+    }
+
+    printf("chain_tip: fsync elapsed crosses former int millisecond boundary... ");
+    {
+        int64_t elapsed = chain_tip_fsync_elapsed_ms_for_testing(
+            INT_MAX, (int64_t)INT_MAX + 1);
+        if (elapsed == 1 &&
+            chain_tip_fsync_elapsed_ms_for_testing(-1, 0) == 0 &&
+            chain_tip_fsync_elapsed_ms_for_testing(100, 99) == 0)
+            printf("OK\n");
         else { printf("FAIL\n"); failures++; }
     }
 
