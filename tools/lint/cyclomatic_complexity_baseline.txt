@@ -2379,8 +2379,8 @@ engine/services/src/snapshot_offer.c:snapsync_build_local_recovery_manifest:15
 engine/services/src/snapshot_serve.c:snapsync_prepare_serve_step:20
 engine/services/src/snapshot_sync_service.c:snapsync_awaiting_utxos:18
 engine/services/src/snapshot_verify.c:snapsync_build_fc_response:26
-engine/services/src/snapshot_verify.c:snapsync_finalize:16
-engine/services/src/snapshot_verify.c:snapsync_finalize_write:22
+engine/services/src/snapshot_verify.c:snapsync_finalize:13
+engine/services/src/snapshot_verify.c:snapsync_finalize_write:19
 engine/services/src/snapshot_verify.c:snapsync_parse_fc_response:24
 engine/services/src/snapshot_verify.c:snapsync_verify_flyclient:16
 engine/services/src/soak_attestation_service.c:soak_attestation_tick:28

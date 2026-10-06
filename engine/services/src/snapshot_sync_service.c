@@ -70,6 +70,7 @@ static bool g_snapsync_init_done = false;
 static pthread_mutex_t g_snapsync_service_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_snapsync_chunk_writes_done = PTHREAD_COND_INITIALIZER;
 static size_t g_snapsync_chunk_writes = 0;
+static size_t g_snapsync_finalize_writes = 0;
 /* The service lock protects the one process-wide snapshot service.  Reset
  * deliberately releases it while it drains the database lane, so retain an
  * explicit lifecycle latch under that same lock: a second failure observer
@@ -81,6 +82,8 @@ static snapsync_reset_gate_fn g_snapsync_reset_gate = NULL;
 static void *g_snapsync_reset_gate_ctx = NULL;
 static snapsync_reset_gate_fn g_snapsync_chunk_drain_gate = NULL;
 static void *g_snapsync_chunk_drain_gate_ctx = NULL;
+static snapsync_reset_gate_fn g_snapsync_finalize_admit_gate = NULL;
+static void *g_snapsync_finalize_admit_gate_ctx = NULL;
 
 void snapsync_test_set_reset_gate(snapsync_reset_gate_fn fn, void *ctx)
 {
@@ -108,6 +111,14 @@ void snapsync_test_set_chunk_drain_gate(snapsync_reset_gate_fn fn, void *ctx)
     snapsync_service_lock_internal();
     g_snapsync_chunk_drain_gate = fn;
     g_snapsync_chunk_drain_gate_ctx = ctx;
+    snapsync_service_unlock_internal();
+}
+
+void snapsync_test_set_finalize_admit_gate(snapsync_reset_gate_fn fn, void *ctx)
+{
+    snapsync_service_lock_internal();
+    g_snapsync_finalize_admit_gate = fn;
+    g_snapsync_finalize_admit_gate_ctx = ctx;
     snapsync_service_unlock_internal();
 }
 #endif
@@ -146,18 +157,61 @@ void snapsync_chunk_write_finish_internal(void)
     snapsync_service_lock_internal();
     if (g_snapsync_chunk_writes > 0)
         g_snapsync_chunk_writes--;
-    if (g_snapsync_chunk_writes == 0)
+    if (g_snapsync_chunk_writes == 0 && g_snapsync_finalize_writes == 0)
+        pthread_cond_broadcast(&g_snapsync_chunk_writes_done);
+    snapsync_service_unlock_internal();
+}
+
+bool snapsync_finalize_write_admit_internal(struct snapshot_sync_service *svc)
+{
+    bool admitted = false;
+
+    snapsync_service_lock_internal();
+    if (svc && svc->state == SNAPSYNC_RECEIVING && svc->ndb && svc->ndb->open) {
+        /* This transition and its lifetime admission must be indivisible:
+         * reset changes RECEIVING/VERIFYING to FAILED before draining writes.
+         * Otherwise a queued finalizer can revive VERIFYING after reset has
+         * discarded staging and published IDLE. */
+        svc->state = SNAPSYNC_VERIFYING;
+        snapsync_set_state(SNAPSYNC_VERIFYING, "all chunks received");
+        g_snapsync_finalize_writes++;
+        admitted = true;
+    }
+    snapsync_service_unlock_internal();
+
+#ifdef ZCL_TESTING
+    if (admitted) {
+        snapsync_reset_gate_fn gate;
+        void *ctx;
+
+        snapsync_service_lock_internal();
+        gate = g_snapsync_finalize_admit_gate;
+        ctx = g_snapsync_finalize_admit_gate_ctx;
+        snapsync_service_unlock_internal();
+        if (gate)
+            gate(ctx);
+    }
+#endif
+    return admitted;
+}
+
+void snapsync_finalize_write_finish_internal(void)
+{
+    snapsync_service_lock_internal();
+    if (g_snapsync_finalize_writes > 0)
+        g_snapsync_finalize_writes--;
+    if (g_snapsync_chunk_writes == 0 && g_snapsync_finalize_writes == 0)
         pthread_cond_broadcast(&g_snapsync_chunk_writes_done);
     snapsync_service_unlock_internal();
 }
 
 /* The caller holds g_snapsync_service_lock. Reset has already refused new
- * admissions, so waiting here drains only writes that crossed the receive
- * admission boundary before reset began. */
-static void snapsync_wait_for_chunk_writes_locked(void)
+ * admissions, so waiting here drains only staging writes admitted before
+ * reset began. */
+static void snapsync_wait_for_writes_locked(void)
 {
 #ifdef ZCL_TESTING
-    if (g_snapsync_chunk_writes != 0) {
+    if (g_snapsync_chunk_writes != 0 || g_snapsync_finalize_writes != 0) {
         snapsync_reset_gate_fn gate = g_snapsync_chunk_drain_gate;
         void *ctx = g_snapsync_chunk_drain_gate_ctx;
 
@@ -167,9 +221,15 @@ static void snapsync_wait_for_chunk_writes_locked(void)
         snapsync_service_lock_internal();
     }
 #endif
-    while (g_snapsync_chunk_writes != 0)
+    while (g_snapsync_chunk_writes != 0 || g_snapsync_finalize_writes != 0)
         pthread_cond_wait(&g_snapsync_chunk_writes_done,
                           &g_snapsync_service_lock);
+}
+
+static bool snapsync_state_has_active_session(enum snapshot_sync_state state)
+{
+    return state == SNAPSYNC_NEGOTIATING || state == SNAPSYNC_RECEIVING ||
+        state == SNAPSYNC_VERIFYING;
 }
 
 struct snapshot_sync_service *snapsync_global(void) { return &g_snapsync_instance; }
@@ -331,15 +391,14 @@ void snapsync_reset(struct snapshot_sync_service *svc)
     bool turbo_active = svc->turbo_active;
     has_db_owner = svc->ndb != NULL;
     has_db = svc->ndb && svc->ndb->open;
-    active_session = svc->state == SNAPSYNC_NEGOTIATING ||
-        svc->state == SNAPSYNC_RECEIVING;
+    active_session = snapsync_state_has_active_session(svc->state);
     if (active_session) {
         /* Refuse new chunks and offers before cleanup begins. Otherwise a
          * concurrent chunk can enter the serialized DB lane after the final
          * staging discard and leave rows behind an apparently IDLE service. */
         svc->state = SNAPSYNC_FAILED;
     }
-    snapsync_wait_for_chunk_writes_locked();
+    snapsync_wait_for_writes_locked();
     snapsync_service_unlock_internal();
 #ifdef ZCL_TESTING
     if (active_session)

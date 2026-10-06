@@ -44,6 +44,11 @@ struct reset_thread_ctx {
     struct snapshot_sync_service *svc;
 };
 
+struct finalize_thread_ctx {
+    struct snapshot_sync_service *svc;
+    struct zcl_result result;
+};
+
 struct failed_reset_thread_ctx {
     bool reset_detected;
 };
@@ -75,12 +80,50 @@ static void snapshot_reset_gate(void *ctx)
     pthread_mutex_unlock(&gate->mutex);
 }
 
+static bool snapshot_reset_gate_init(struct reset_gate *gate)
+{
+    if (pthread_mutex_init(&gate->mutex, NULL) != 0)
+        return false;
+    if (pthread_cond_init(&gate->entered, NULL) != 0) {
+        pthread_mutex_destroy(&gate->mutex);
+        return false;
+    }
+    if (pthread_cond_init(&gate->release, NULL) != 0) {
+        pthread_cond_destroy(&gate->entered);
+        pthread_mutex_destroy(&gate->mutex);
+        return false;
+    }
+    return true;
+}
+
 static void *snapshot_reset_thread(void *ctx)
 {
     struct reset_thread_ctx *thread = ctx;
 
     snapsync_reset(thread->svc);
     return NULL;
+}
+
+static void *snapshot_finalize_thread(void *ctx)
+{
+    struct finalize_thread_ctx *thread = ctx;
+
+    thread->result = snapsync_finalize(thread->svc);
+    return NULL;
+}
+
+static void snapshot_finalize_thread_release_and_join(struct reset_gate *gate,
+                                                       pthread_t thread,
+                                                       bool *started)
+{
+    if (!*started)
+        return;
+    pthread_mutex_lock(&gate->mutex);
+    gate->is_released = true;
+    pthread_cond_signal(&gate->release);
+    pthread_mutex_unlock(&gate->mutex);
+    pthread_join(thread, NULL);
+    *started = false;
 }
 
 static void *snapshot_failed_reset_thread(void *ctx)
@@ -1329,6 +1372,99 @@ static int test_snapshot_sync_reset_drains_admitted_chunk(void)
     return failures;
 }
 
+static bool snapshot_reset_drains_admitted_finalize(void)
+{
+    struct snapshot_reset_fixture f;
+    struct reset_gate finalize_gate;
+    struct finalize_thread_ctx finalize = {0};
+    pthread_t finalize_thread;
+    bool finalize_gate_initialized = false;
+    bool finalize_started = false;
+    bool reset_waiting = false;
+    bool second_finalize_rejected = false;
+    bool result = false;
+
+    memset(&f, 0, sizeof(f));
+    memset(&finalize_gate, 0, sizeof(finalize_gate));
+    if (!snapshot_reset_fixture_open(&f))
+        goto cleanup;
+    snapsync_init(&f.svc, &f.ndb);
+    f.svc.state = SNAPSYNC_NEGOTIATING;
+    if (!snapsync_begin_receive(&f.svc).ok)
+        goto cleanup;
+    if (!snapshot_reset_gate_init(&finalize_gate))
+        goto cleanup;
+    finalize_gate_initialized = true;
+    snapsync_test_set_finalize_admit_gate(snapshot_reset_gate, &finalize_gate);
+    finalize.svc = &f.svc;
+    if (pthread_create(&finalize_thread, NULL, snapshot_finalize_thread,
+                       &finalize) != 0)
+        goto cleanup;
+    finalize_started = true;
+    pthread_mutex_lock(&finalize_gate.mutex);
+    while (!finalize_gate.is_entered)
+        pthread_cond_wait(&finalize_gate.entered, &finalize_gate.mutex);
+    pthread_mutex_unlock(&finalize_gate.mutex);
+
+    if (!snapshot_reset_gate_init(&f.gate))
+        goto cleanup;
+    f.gate_initialized = true;
+    snapsync_test_set_chunk_drain_gate(snapshot_reset_gate, &f.gate);
+    f.thread_ctx.svc = &f.svc;
+    if (pthread_create(&f.thread, NULL, snapshot_reset_thread,
+                       &f.thread_ctx) != 0)
+        goto cleanup;
+    f.thread_started = true;
+    pthread_mutex_lock(&f.gate.mutex);
+    while (!f.gate.is_entered)
+        pthread_cond_wait(&f.gate.entered, &f.gate.mutex);
+    pthread_mutex_unlock(&f.gate.mutex);
+    reset_waiting = true;
+    second_finalize_rejected = !snapsync_finalize(&f.svc).ok;
+
+    pthread_mutex_lock(&finalize_gate.mutex);
+    finalize_gate.is_released = true;
+    pthread_cond_signal(&finalize_gate.release);
+    pthread_mutex_unlock(&finalize_gate.mutex);
+    pthread_join(finalize_thread, NULL);
+    finalize_started = false;
+
+    pthread_mutex_lock(&f.gate.mutex);
+    f.gate.is_released = true;
+    pthread_cond_signal(&f.gate.release);
+    pthread_mutex_unlock(&f.gate.mutex);
+    pthread_join(f.thread, NULL);
+    f.thread_started = false;
+    result = reset_waiting && second_finalize_rejected && !finalize.result.ok &&
+        f.svc.state == SNAPSYNC_IDLE &&
+        snapsync_staging_count_internal(&f.ndb) == 0;
+
+cleanup:
+    snapshot_finalize_thread_release_and_join(&finalize_gate, finalize_thread,
+                                              &finalize_started);
+    snapsync_test_set_finalize_admit_gate(NULL, NULL);
+    snapsync_test_set_chunk_drain_gate(NULL, NULL);
+    if (finalize_gate_initialized) {
+        pthread_cond_destroy(&finalize_gate.release);
+        pthread_cond_destroy(&finalize_gate.entered);
+        pthread_mutex_destroy(&finalize_gate.mutex);
+    }
+    snapshot_reset_fixture_cleanup(&f);
+    return result;
+}
+
+static int test_snapshot_sync_reset_drains_admitted_finalize(void)
+{
+    int failures = 0;
+
+    TEST("snapshot reset drains an admitted finalizer before staging cleanup") {
+        ASSERT(snapshot_reset_drains_admitted_finalize());
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static bool snapshot_reset_blocks_concurrent_failed_reset(void)
 {
     struct snapshot_reset_fixture f;
@@ -2462,6 +2598,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_failed_status_marks_closed_staging_unknown();
     failures += test_snapshot_sync_reset_rejects_late_chunk();
     failures += test_snapshot_sync_reset_drains_admitted_chunk();
+    failures += test_snapshot_sync_reset_drains_admitted_finalize();
     failures += test_snapshot_sync_reset_coalesces_concurrent_failure();
     failures += test_snapshot_sync_service_runtime_accessor();
     failures += test_snapshot_sync_service_db_service_chunk_contained();

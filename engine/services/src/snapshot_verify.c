@@ -80,6 +80,40 @@ struct zcl_result snapsync_finalize_fail_internal(struct snapsync_finalize_ctx *
 
 /* ── Finalize (SHA3 verification + atomic activate) ──────── */
 
+static bool snapsync_finalize_session_snapshot(
+    struct snapshot_sync_service *svc, uint32_t *serving_peer_id,
+    bool *fc_verified)
+{
+    bool verifying;
+
+    snapsync_service_lock_internal();
+    verifying = svc->state == SNAPSYNC_VERIFYING;
+    if (verifying) {
+        *serving_peer_id = svc->serving_peer_id;
+        *fc_verified = svc->fc_verified;
+    }
+    snapsync_service_unlock_internal();
+    return verifying;
+}
+
+static bool snapsync_received_count_matches_offer(
+    const struct snapshot_sync_service *svc)
+{
+    return svc->offered_count != 0 &&
+        svc->received_utxos == svc->offered_count;
+}
+
+static bool snapsync_finalize_write_args(struct snapsync_finalize_ctx *finalize,
+                                         struct node_db *ndb,
+                                         struct snapshot_sync_service **svc)
+{
+    if (!finalize || !finalize->svc || !ndb || !ndb->open)
+        LOG_FAIL("snapshot_sync", "finalize_write: null args finalize=%p ndb=%p",
+                 (void *)finalize, (void *)ndb);
+    *svc = finalize->svc;
+    return true;
+}
+
 static bool snapsync_finalize_write(struct node_db *ndb, void *ctx)
 {
     struct snapsync_finalize_ctx *finalize = ctx;
@@ -92,28 +126,23 @@ static bool snapsync_finalize_write(struct node_db *ndb, void *ctx)
     bool sha3_ok;
     double elapsed_s;
 
-    if (!finalize || !finalize->svc || !ndb || !ndb->open)
-        LOG_FAIL("snapshot_sync", "finalize_write: null args finalize=%p ndb=%p", (void*)finalize, (void*)ndb);
-    svc = finalize->svc;
+    if (!snapsync_finalize_write_args(finalize, ndb, &svc))
+        return false;
 
     node_db_get_status(ndb, &db_status);
     if (db_status.tx_open && !node_db_commit(ndb))
         LOG_FAIL("snapshot_sync", "finalize_write: failed to commit open transaction");
 
-    snapsync_service_lock_internal();
-    svc->state = SNAPSYNC_VERIFYING;
-    snapsync_set_state(SNAPSYNC_VERIFYING, "all chunks received");
-    serving_peer_id = svc->serving_peer_id;
-    fc_verified = svc->fc_verified;
-    snapsync_service_unlock_internal();
+    if (!snapsync_finalize_session_snapshot(svc, &serving_peer_id,
+                                            &fc_verified))
+        return false;
 
     if (!fc_verified)
         return snapsync_finalize_fail_internal(finalize, ndb, svc, serving_peer_id,
                                                "proof_missing",
                                                "snapshot proof missing").ok;
 
-    if (svc->offered_count == 0 ||
-        svc->received_utxos != svc->offered_count) {
+    if (!snapsync_received_count_matches_offer(svc)) {
         event_emitf(EV_SNAPSYNC_VERIFIED, serving_peer_id,
                     "snapshot=FAILED reason=count_mismatch received=%llu offered=%llu",
                     (unsigned long long)svc->received_utxos,
@@ -239,27 +268,25 @@ static bool snapsync_finalize_write(struct node_db *ndb, void *ctx)
 struct zcl_result snapsync_finalize(struct snapshot_sync_service *svc)
 {
     struct snapsync_finalize_ctx ctx;
-    bool finalize_allowed = false;
     bool turbo_active = false;
     bool keep_failed_state = false;
 
     if (!svc)
         return ZCL_ERR(-1, "finalize: svc is NULL");
-    snapsync_service_lock_internal();
-    finalize_allowed = (svc->state == SNAPSYNC_RECEIVING &&
-                       svc->ndb && svc->ndb->open);
-    if (finalize_allowed)
-        turbo_active = svc->turbo_active;
-    snapsync_service_unlock_internal();
-
-    if (!finalize_allowed) {
+    if (!snapsync_finalize_write_admit_internal(svc)) {
         return ZCL_ERR(-2, "finalize: not allowed (state != RECEIVING or ndb not open)");
     }
+
+    snapsync_service_lock_internal();
+    turbo_active = svc->turbo_active;
+    snapsync_service_unlock_internal();
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.svc = svc;
 
-    if (!snapsync_run_write_internal(svc, snapsync_finalize_write, &ctx)) {
+    bool write_ok = snapsync_run_write_internal(svc, snapsync_finalize_write, &ctx);
+    snapsync_finalize_write_finish_internal();
+    if (!write_ok) {
         snapsync_service_lock_internal();
         keep_failed_state = (svc->state == SNAPSYNC_FAILED);
         if (!keep_failed_state)
