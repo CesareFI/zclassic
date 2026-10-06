@@ -1264,6 +1264,71 @@ static int test_snapshot_sync_reset_rejects_late_chunk(void)
     return failures;
 }
 
+static bool snapshot_reset_waits_for_admitted_chunk(void)
+{
+    struct snapshot_reset_fixture f;
+    bool admitted = false;
+    bool finished = false;
+    bool rejected = false;
+    bool reset_ok = false;
+
+    memset(&f, 0, sizeof(f));
+    if (!snapshot_reset_fixture_open(&f))
+        goto cleanup;
+    snapsync_init(&f.svc, &f.ndb);
+    f.svc.state = SNAPSYNC_NEGOTIATING;
+    if (!snapsync_begin_receive(&f.svc).ok)
+        goto cleanup;
+    admitted = snapsync_chunk_write_admit_internal(&f.svc);
+    if (!admitted)
+        goto cleanup;
+    if (pthread_mutex_init(&f.gate.mutex, NULL) != 0 ||
+        pthread_cond_init(&f.gate.entered, NULL) != 0 ||
+        pthread_cond_init(&f.gate.release, NULL) != 0)
+        goto cleanup;
+    f.gate_initialized = true;
+    snapsync_test_set_chunk_drain_gate(snapshot_reset_gate, &f.gate);
+    f.thread_ctx.svc = &f.svc;
+    if (pthread_create(&f.thread, NULL, snapshot_reset_thread,
+                       &f.thread_ctx) != 0)
+        goto cleanup;
+    f.thread_started = true;
+    pthread_mutex_lock(&f.gate.mutex);
+    while (!f.gate.is_entered)
+        pthread_cond_wait(&f.gate.entered, &f.gate.mutex);
+    pthread_mutex_unlock(&f.gate.mutex);
+    rejected = !snapsync_chunk_write_admit_internal(&f.svc);
+    snapsync_chunk_write_finish_internal();
+    finished = true;
+    pthread_mutex_lock(&f.gate.mutex);
+    f.gate.is_released = true;
+    pthread_cond_signal(&f.gate.release);
+    pthread_mutex_unlock(&f.gate.mutex);
+    pthread_join(f.thread, NULL);
+    f.thread_started = false;
+    reset_ok = f.svc.state == SNAPSYNC_IDLE &&
+        snapsync_staging_count_internal(&f.ndb) == 0;
+
+cleanup:
+    if (admitted && !finished)
+        snapsync_chunk_write_finish_internal();
+    snapsync_test_set_chunk_drain_gate(NULL, NULL);
+    snapshot_reset_fixture_cleanup(&f);
+    return rejected && reset_ok;
+}
+
+static int test_snapshot_sync_reset_drains_admitted_chunk(void)
+{
+    int failures = 0;
+
+    TEST("snapshot reset drains an admitted chunk before staging cleanup") {
+        ASSERT(snapshot_reset_waits_for_admitted_chunk());
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static bool snapshot_reset_blocks_concurrent_failed_reset(void)
 {
     struct snapshot_reset_fixture f;
@@ -2396,6 +2461,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_turbo_restore_failure_keeps_retry_latch();
     failures += test_snapshot_failed_status_marks_closed_staging_unknown();
     failures += test_snapshot_sync_reset_rejects_late_chunk();
+    failures += test_snapshot_sync_reset_drains_admitted_chunk();
     failures += test_snapshot_sync_reset_coalesces_concurrent_failure();
     failures += test_snapshot_sync_service_runtime_accessor();
     failures += test_snapshot_sync_service_db_service_chunk_contained();

@@ -498,17 +498,16 @@ int snapsync_apply_chunk(struct snapshot_sync_service *svc,
         LOG_ERR("snapshot_sync", "apply_chunk: invalid args svc=%p chunk=%p len=%zu",
                 (void*)svc, (void*)chunk_data, chunk_len);
 
-    snapsync_service_lock_internal();
-
     /* Only accept chunks in RECEIVING state.
      * NEGOTIATING means FlyClient verification hasn't completed yet —
      * do NOT auto-transition, that would bypass chain verification. */
-    if (svc->state != SNAPSYNC_RECEIVING) {
-        snapsync_service_unlock_internal();
+    if (!snapsync_chunk_write_admit_internal(svc)) {
         return 0;
     }
+    snapsync_service_lock_internal();
     if (!svc->ndb || !svc->ndb->open) {
         snapsync_service_unlock_internal();
+        snapsync_chunk_write_finish_internal();
         LOG_ERR("snapshot_sync", "apply_chunk: ndb null or not open during RECEIVING");
     }
     restore_turbo = svc->turbo_active;
@@ -518,6 +517,7 @@ int snapsync_apply_chunk(struct snapshot_sync_service *svc,
     ctx.chunk_data = zcl_malloc(chunk_len, "snapsync chunk copy");
     if (!ctx.chunk_data) {
         snapsync_service_unlock_internal();
+        snapsync_chunk_write_finish_internal();
         LOG_ERR("snapshot_sync", "apply_chunk: malloc(%zu) failed for chunk copy", chunk_len);
     }
     memcpy(ctx.chunk_data, chunk_data, chunk_len);
@@ -526,6 +526,7 @@ int snapsync_apply_chunk(struct snapshot_sync_service *svc,
 
     if (!snapsync_run_write_internal(svc, snapsync_apply_chunk_write, &ctx)) {
         free(ctx.chunk_data);
+        snapsync_chunk_write_finish_internal();
         if (restore_turbo)
             snapsync_run_write_internal(svc, snapsync_rollback_receive_write_internal, NULL);
         snapsync_service_lock_internal();
@@ -538,6 +539,7 @@ int snapsync_apply_chunk(struct snapshot_sync_service *svc,
         LOG_ERR("snapsync", "chunk apply failed");
     }
     free(ctx.chunk_data);
+    snapsync_chunk_write_finish_internal();
     return ctx.applied;
 }
 

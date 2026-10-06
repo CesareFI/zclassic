@@ -63,6 +63,8 @@ struct snapsync_finalize_ctx {
 /* ── Lock helpers (defined in snapshot_sync_service.c) ─────────── */
 void snapsync_service_lock_internal(void);
 void snapsync_service_unlock_internal(void);
+bool snapsync_chunk_write_admit_internal(struct snapshot_sync_service *svc);
+void snapsync_chunk_write_finish_internal(void);
 
 /* ── Misc shared helpers (defined in snapshot_sync_service.c) ──── */
 int64_t snapsync_now_us_internal(void);
@@ -116,6 +118,7 @@ struct zcl_result snapsync_exit_turbo_mode_internal(struct snapshot_sync_service
 typedef void (*snapsync_reset_gate_fn)(void *ctx);
 void snapsync_test_set_reset_gate(snapsync_reset_gate_fn fn, void *ctx);
 void snapsync_test_run_reset_gate(void);
+void snapsync_test_set_chunk_drain_gate(snapsync_reset_gate_fn fn, void *ctx);
 #endif
 
 /* ── Failure helpers (snapshot_verify.c) ───────────────────────── */
