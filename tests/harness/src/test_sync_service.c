@@ -18,6 +18,7 @@
 #include "chain/checkpoints.h"
 #include "util/blocker.h"
 #include "util/safe_alloc.h"
+#include <limits.h>
 #include <string.h>
 #include <time.h>
 
@@ -636,6 +637,30 @@ static int test_sync_service_block_assignment_plan(void)
     } _test_next:;
     if (sync_get_state() != SYNC_IDLE)
         (void)sync_set_state(SYNC_IDLE, "assignment plan restore");
+    return failures;
+}
+
+static int test_sync_service_extreme_peer_height(void)
+{
+    int failures = 0;
+
+    TEST("sync_service handles an extreme peer height without overflow") {
+        struct p2p_node node;
+        struct sync_block_assignment plan;
+
+        memset(&node, 0, sizeof(node));
+        memset(&plan, 0, sizeof(plan));
+        node.state = PEER_HANDSHAKE_COMPLETE;
+        node.starting_height = INT_MAX;
+
+        /* VERSION start_height is peer-provided int32_t input.  A wildly
+         * ahead claim remains eligible, but must not wrap through the
+         * substantially-behind comparison. */
+        syncsvc_plan_block_assignment(&plan, &node, 0, 1);
+        ASSERT(plan.should_assign);
+        PASS();
+    } _test_next:;
+
     return failures;
 }
 
@@ -2342,6 +2367,30 @@ static int test_sync_service_genuinely_at_tip(void)
     return failures;
 }
 
+static int test_sync_service_extreme_peer_tip_comparison(void)
+{
+    int failures = 0;
+
+    TEST("sync_service compares extreme peer heights without overflow") {
+        struct p2p_node node;
+        struct sync_block_acceptance result;
+
+        memset(&node, 0, sizeof(node));
+        memset(&result, 0, sizeof(result));
+        node.state = PEER_SYNCING_BLOCKS;
+        node.starting_height = INT_MAX;
+
+        syncsvc_note_valid_block(&result, &node, SYNC_BLOCKS_DOWNLOAD,
+                                 INT_MAX, INT_MAX, 0, INT_MAX,
+                                 BODY_HISTORY_COMPLETE);
+        ASSERT(result.reached_peer_tip);
+        ASSERT(result.should_set_sync_state);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_sync_service_recent_tip_bypasses_headers(void)
 {
     int failures = 0;
@@ -2536,6 +2585,7 @@ int test_sync_service(void)
     failures += test_sync_service_reject_probe_pending();
     failures += test_sync_service_block_file_scan_trigger();
     failures += test_sync_service_block_assignment_plan();
+    failures += test_sync_service_extreme_peer_height();
     failures += test_sync_service_assigns_peer_blocks();
     failures += test_sync_service_reserves_outbound_block_window();
     failures += test_sync_service_body_stall_disconnect();
@@ -2574,6 +2624,7 @@ int test_sync_service(void)
     failures += test_sync_service_recovery_header_anchor();
     failures += test_sync_service_false_at_tip_peer_far_ahead();
     failures += test_sync_service_genuinely_at_tip();
+    failures += test_sync_service_extreme_peer_tip_comparison();
     failures += test_sync_service_recent_tip_bypasses_headers();
     failures += test_sync_service_periodic_tip_evaluator();
     failures += test_sync_service_benchmark_tail_phases();

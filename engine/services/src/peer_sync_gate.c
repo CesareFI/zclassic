@@ -36,7 +36,9 @@ bool syncsvc_peer_is_behind(const struct p2p_node *node, int our_height)
      * reorg tolerance eligible, but gate a peer proven substantially behind.
      * The zero-height onion exception above lasts only until its first
      * request records last_getheaders_time. */
-    return node->starting_height + SYNC_PEER_BEHIND_TOLERANCE < our_height;
+    return (int64_t)node->starting_height +
+               (int64_t)SYNC_PEER_BEHIND_TOLERANCE <
+           (int64_t)our_height;
 }
 
 bool syncsvc_should_begin_peer_sync(const struct p2p_node *node,

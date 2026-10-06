@@ -243,14 +243,15 @@ void syncsvc_note_valid_block(struct sync_block_acceptance *result,
      * 144+ blocks beyond this node's starting_height, don't use it
      * for at-tip detection — it would trigger false AT_TIP. */
     if (reached_peer && max_peer_height > 0 &&
-        max_peer_height > node->starting_height + 144)
+        (int64_t)max_peer_height > (int64_t)node->starting_height + 144)
         reached_peer = false;
 
     if (!reached_peer && !tip_is_recent)
         return;
 
     headers_caught_up =
-        (best_header_height >= 0 && best_header_height <= new_tip_height + 1);
+        (best_header_height >= 0 &&
+         (int64_t)best_header_height <= (int64_t)new_tip_height + 1);
     result->reached_peer_tip = true;
 
     /* This is the at-tip edge that actually fires on a live node:
