@@ -14,6 +14,7 @@
 #include "core/uint256.h"
 
 #include <sqlite3.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -259,6 +260,62 @@ static int test_bc_persistence_roundtrip(void)
     return failures;
 }
 
+static int test_bc_int64_boundaries_and_persist_cap(void)
+{
+    int failures = 0;
+    TEST("coverage handles INT64_MAX without wrapping or oversized loads") {
+        struct body_coverage_map m;
+        struct bc_range hole;
+        body_coverage_init(&m);
+
+        ASSERT(body_coverage_insert(&m, 0, INT64_MAX - 1));
+        ASSERT(body_coverage_insert(&m, INT64_MAX, INT64_MAX));
+        ASSERT(body_coverage_range_count(&m) == 1);
+        ASSERT(body_coverage_total_covered(&m) == INT64_MAX);
+        ASSERT(body_coverage_covered_in_window(&m, INT64_MAX - 1,
+                                               INT64_MAX) == 2);
+        ASSERT(!body_coverage_find_first_hole(&m, INT64_MAX - 1,
+                                              INT64_MAX, &hole));
+        body_coverage_reset(&m);
+        ASSERT(body_coverage_insert(&m, INT64_MAX - 1, INT64_MAX - 1));
+        ASSERT(body_coverage_find_first_hole(&m, INT64_MAX - 1, INT64_MAX,
+                                             &hole));
+        ASSERT(hole.lo == INT64_MAX && hole.hi == INT64_MAX);
+        body_coverage_free(&m);
+
+        char dir[256];
+        test_make_tmpdir(dir, sizeof(dir), "body_coverage", "overcap");
+        ASSERT(progress_store_open(dir));
+        sqlite3 *db = progress_store_db();
+        ASSERT(db != NULL);
+        ASSERT(progress_meta_table_ensure(db));
+
+        body_coverage_init(&m);
+        ASSERT(body_coverage_save(&m, db));
+        uint8_t header[3 * sizeof(uint32_t)];
+        size_t header_len = 0;
+        bool found = false;
+        ASSERT(progress_meta_get(db, BODY_COVERAGE_META_KEY, header,
+                                 sizeof(header), &header_len, &found));
+        ASSERT(found && header_len == sizeof(header));
+
+        uint32_t count = BODY_COVERAGE_PERSIST_MAX_RANGES + 1u;
+        size_t blob_len = sizeof(header) + (size_t)count * 2 * sizeof(int64_t);
+        uint8_t *blob = calloc(1, blob_len);
+        ASSERT(blob != NULL);
+        memcpy(blob, header, sizeof(header));
+        memcpy(blob + 2 * sizeof(uint32_t), &count, sizeof(count));
+        ASSERT(progress_meta_set(db, "body_coverage_overcap", blob, blob_len));
+        free(blob);
+        ASSERT(!body_coverage_load_key(&m, db, "body_coverage_overcap"));
+        ASSERT(body_coverage_range_count(&m) == 0);
+        body_coverage_free(&m);
+        progress_store_close();
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* ── Scheduler ──────────────────────────────────────────────────── */
 
 static int test_bc_scheduler_plan_and_blocker(void)
@@ -416,6 +473,7 @@ int test_body_coverage(void)
     failures += test_bc_find_first_hole();
     failures += test_bc_scan_window();
     failures += test_bc_persistence_roundtrip();
+    failures += test_bc_int64_boundaries_and_persist_cap();
     failures += test_bc_scheduler_plan_and_blocker();
     failures += test_bc_scheduler_fill_rate();
     failures += test_bc_gap_enqueue_drain_fixture();
