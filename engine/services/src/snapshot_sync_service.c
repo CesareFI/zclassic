@@ -84,6 +84,8 @@ static snapsync_reset_gate_fn g_snapsync_chunk_drain_gate = NULL;
 static void *g_snapsync_chunk_drain_gate_ctx = NULL;
 static snapsync_reset_gate_fn g_snapsync_finalize_admit_gate = NULL;
 static void *g_snapsync_finalize_admit_gate_ctx = NULL;
+static snapsync_reset_gate_fn g_snapsync_stall_action_gate = NULL;
+static void *g_snapsync_stall_action_gate_ctx = NULL;
 
 void snapsync_test_set_reset_gate(snapsync_reset_gate_fn fn, void *ctx)
 {
@@ -120,6 +122,27 @@ void snapsync_test_set_finalize_admit_gate(snapsync_reset_gate_fn fn, void *ctx)
     g_snapsync_finalize_admit_gate = fn;
     g_snapsync_finalize_admit_gate_ctx = ctx;
     snapsync_service_unlock_internal();
+}
+
+void snapsync_test_set_stall_action_gate(snapsync_reset_gate_fn fn, void *ctx)
+{
+    snapsync_service_lock_internal();
+    g_snapsync_stall_action_gate = fn;
+    g_snapsync_stall_action_gate_ctx = ctx;
+    snapsync_service_unlock_internal();
+}
+
+void snapsync_test_run_stall_action_gate(void)
+{
+    snapsync_reset_gate_fn gate;
+    void *ctx;
+
+    snapsync_service_lock_internal();
+    gate = g_snapsync_stall_action_gate;
+    ctx = g_snapsync_stall_action_gate_ctx;
+    snapsync_service_unlock_internal();
+    if (gate)
+        gate(ctx);
 }
 #endif
 
@@ -244,6 +267,23 @@ static bool snapsync_state_has_active_session(enum snapshot_sync_state state)
 {
     return state == SNAPSYNC_NEGOTIATING || state == SNAPSYNC_RECEIVING ||
         state == SNAPSYNC_VERIFYING;
+}
+
+static bool snapsync_fail_observed_session(struct snapshot_sync_service *svc,
+                                           enum snapshot_sync_state state,
+                                           uint32_t peer_id,
+                                           const char *reason)
+{
+    bool matched = false;
+
+    snapsync_service_lock_internal();
+    if (svc && svc->state == state && svc->serving_peer_id == peer_id) {
+        svc->state = SNAPSYNC_FAILED;
+        snapsync_set_state(SNAPSYNC_FAILED, reason);
+        matched = true;
+    }
+    snapsync_service_unlock_internal();
+    return matched;
 }
 
 struct snapshot_sync_service *snapsync_global(void) { return &g_snapsync_instance; }
@@ -732,6 +772,11 @@ bool snapsync_check_negotiation_stall(void)
     if (!st.stalled)
         return false;
 
+    if (!snapsync_fail_observed_session(svc, SNAPSYNC_NEGOTIATING,
+                                        st.serving_peer_id,
+                                        "snapshot negotiation stalled"))
+        return false;
+
     event_emitf(EV_SNAPSHOT_OFFER_RECEIVED, st.serving_peer_id,
                 "accepted=false reason=negotiation_stall elapsed_s=%lld "
                 "h=%d utxos=%llu action=blacklist_reset",
@@ -755,6 +800,11 @@ bool snapsync_check_failed_reset(void)
     struct snapsync_failed_status st;
     snapsync_get_failed_status(svc, &st);
     if (!st.failed)
+        return false;
+
+    if (!snapsync_fail_observed_session(svc, SNAPSYNC_FAILED,
+                                        st.serving_peer_id,
+                                        "snapshot failed reset"))
         return false;
 
     event_emitf(EV_SNAPSYNC_VERIFIED, st.serving_peer_id,
@@ -793,6 +843,14 @@ bool snapsync_check_stall(void)
     struct snapsync_stall_status stall;
     snapsync_get_stall_status(svc, &stall);
     if (!stall.stalled)
+        return false;
+
+#ifdef ZCL_TESTING
+    snapsync_test_run_stall_action_gate();
+#endif
+    if (!snapsync_fail_observed_session(svc, SNAPSYNC_RECEIVING,
+                                        stall.serving_peer_id,
+                                        "snapshot receive stalled"))
         return false;
 
     event_emitf(EV_SNAPSYNC_VERIFIED, stall.serving_peer_id,

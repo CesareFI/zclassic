@@ -128,6 +128,8 @@ void snapsync_test_set_chunk_drain_gate(snapsync_reset_gate_fn fn, void *ctx);
 void snapsync_test_set_finalize_admit_gate(snapsync_reset_gate_fn fn, void *ctx);
 void snapsync_test_set_end_finalize_gate(snapsync_reset_gate_fn fn, void *ctx);
 void snapsync_test_run_end_finalize_gate(void);
+void snapsync_test_set_stall_action_gate(snapsync_reset_gate_fn fn, void *ctx);
+void snapsync_test_run_stall_action_gate(void);
 #endif
 
 /* ── Failure helpers (snapshot_verify.c) ───────────────────────── */
