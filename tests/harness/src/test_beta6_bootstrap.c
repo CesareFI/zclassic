@@ -219,6 +219,29 @@ static void *bootstrap_status_observe(void *opaque)
     return NULL;
 }
 
+static void *bootstrap_status_read_chunks(void *opaque)
+{
+    struct bootstrap_status_hammer *hammer = opaque;
+    struct beta6_bs_chunk_request request = {
+        .file_index = 0, .offset = 0, .length = 20
+    };
+
+    (void)pthread_barrier_wait(&hammer->start);
+    for (int i = 0; i < 4096; i++) {
+        unsigned char data[20];
+        struct zcl_result read = beta6_bs_read_chunk(&request, data, sizeof(data));
+        if (!read.ok)
+            continue;
+        for (size_t j = 0; j < sizeof(data); j++) {
+            if (data[j] != 0xAB) {
+                atomic_store(&hammer->failed, true);
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
 /* ── in-band seam fixtures ───────────────────────────────────────────
  * The seam under test is core/modules/net's dispatch rows plus the engine
  * server they route to. Both halves are exercised without a socket: a
@@ -561,18 +584,22 @@ int test_beta6_bootstrap(void)
         struct bootstrap_status_hammer hammer = {0};
         pthread_t arm_disarm;
         pthread_t observe;
+        pthread_t read_chunks;
 
         beta6_bs_inband_disarm();
         beta6_bs_disarm();
         test_make_tmpdir(dir, sizeof(dir), "beta6_bootstrap", "status_hammer");
         ASSERT(fixture_build(dir));
         hammer.source_dir = dir;
-        ASSERT_EQ(pthread_barrier_init(&hammer.start, NULL, 2), 0);
+        ASSERT_EQ(pthread_barrier_init(&hammer.start, NULL, 3), 0);
         ASSERT_EQ(pthread_create(&arm_disarm, NULL, bootstrap_status_arm_disarm,
                                  &hammer), 0);
         ASSERT_EQ(pthread_create(&observe, NULL, bootstrap_status_observe, &hammer), 0);
+        ASSERT_EQ(pthread_create(&read_chunks, NULL, bootstrap_status_read_chunks,
+                                 &hammer), 0);
         ASSERT_EQ(pthread_join(arm_disarm, NULL), 0);
         ASSERT_EQ(pthread_join(observe, NULL), 0);
+        ASSERT_EQ(pthread_join(read_chunks, NULL), 0);
         ASSERT(!atomic_load(&hammer.failed));
         ASSERT_EQ(pthread_barrier_destroy(&hammer.start), 0);
         beta6_bs_inband_disarm();

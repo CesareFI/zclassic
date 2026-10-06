@@ -254,6 +254,31 @@ void beta6_bs_status_snapshot(struct beta6_bs_status_snapshot *out)
     UNLOCK(g_serve_lock);
 }
 
+static struct zcl_result beta6_bs_snapshot_chunk(
+    const struct beta6_bs_chunk_request *request,
+    char source_dir[sizeof(g_source_dir)], struct beta6_bs_file *file)
+{
+    serve_lock_init_once();
+    LOCK(g_serve_lock);
+    if (!g_armed) {
+        UNLOCK(g_serve_lock);
+        return ZCL_ERR(BETA6_BS_ERR_REFUSED,
+                       "the beta6 bootstrap snapshot service is not armed; set "
+                       "-beta6-bootstrap-source");
+    }
+    if (!g_manifest.files || request->file_index >= g_manifest.file_count) {
+        size_t file_count = g_manifest.file_count;
+        UNLOCK(g_serve_lock);
+        return ZCL_ERR(BETA6_BS_ERR_REFUSED,
+                       "beta6 bootstrap chunk file index %u out of range (%zu served)",
+                       (unsigned)request->file_index, file_count);
+    }
+    snprintf(source_dir, sizeof(g_source_dir), "%s", g_source_dir);
+    *file = g_manifest.files[request->file_index];
+    UNLOCK(g_serve_lock);
+    return ZCL_OK;
+}
+
 const char *beta6_bs_source_dir(void)
 {
     return g_armed ? g_source_dir : "";
@@ -346,20 +371,18 @@ struct zcl_result beta6_bs_read_chunk(const struct beta6_bs_chunk_request *reque
     if (!request || !out)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "beta6 bootstrap chunk read needs a request and a buffer");
-    struct zcl_result armed = beta6_bs_status();
-    if (!armed.ok)
-        return armed;
     if (request->length == 0 || request->length > BETA6_BS_CHUNK_SIZE)
         return ZCL_ERR(BETA6_BS_ERR_REFUSED, "invalid beta6 bootstrap chunk length %u",
                        (unsigned)request->length);
-    if (request->file_index >= g_manifest.file_count)
-        return ZCL_ERR(BETA6_BS_ERR_REFUSED,
-                       "beta6 bootstrap chunk file index %u out of range (%zu served)",
-                       (unsigned)request->file_index, g_manifest.file_count);
-    struct zcl_result safe =
-        beta6_bs_check_data_path(g_manifest.files[request->file_index].path);
+    char source_dir[sizeof(g_source_dir)];
+    struct beta6_bs_file file;
+    struct zcl_result snap =
+        beta6_bs_snapshot_chunk(request, source_dir, &file);
+    if (!snap.ok)
+        return snap;
+    struct zcl_result safe = beta6_bs_check_data_path(file.path);
     if (!safe.ok)
         return safe;
-    return beta6_bs_read_file_chunk(g_source_dir, &g_manifest.files[request->file_index],
-                                    request, "bootstrap", out, out_capacity);
+    return beta6_bs_read_file_chunk(source_dir, &file, request, "bootstrap",
+                                    out, out_capacity);
 }
