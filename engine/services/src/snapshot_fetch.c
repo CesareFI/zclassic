@@ -214,12 +214,13 @@ struct zcl_result snapsync_exit_turbo_mode_internal(struct snapshot_sync_service
 
     ok = snapsync_run_write_internal(svc, snapsync_exit_receive_mode_write, &ok) && ok;
 
+    if (!ok)
+        return ZCL_ERR(-2, "exit_turbo_mode: exit_receive_mode write failed");
+
     snapsync_service_lock_internal();
     svc->turbo_active = false;
     snapsync_service_unlock_internal();
 
-    if (!ok)
-        return ZCL_ERR(-2, "exit_turbo_mode: exit_receive_mode write failed");
     return ZCL_OK;
 }
 

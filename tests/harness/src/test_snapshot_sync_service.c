@@ -1203,6 +1203,33 @@ static int test_snapshot_sync_service_db_service_runtime(void)
     return failures;
 }
 
+static int test_snapshot_turbo_restore_failure_keeps_retry_latch(void)
+{
+    int failures = 0;
+
+    TEST("snapshot turbo restore failure keeps the retry latch armed") {
+        struct snapshot_sync_service svc;
+        struct node_db ndb;
+
+        memset(&svc, 0, sizeof(svc));
+        ASSERT(node_db_open(&ndb, ":memory:"));
+        snapsync_init(&svc, &ndb);
+        svc.state = SNAPSYNC_NEGOTIATING;
+        ASSERT(snapsync_begin_receive(&svc).ok);
+        ASSERT(svc.turbo_active);
+
+        /* The closed handle makes the real receive-mode restore callback
+         * fail.  Keep turbo_active set so reset/recovery can retry rather
+         * than falsely reporting that normal-mode restoration completed. */
+        node_db_close(&ndb);
+        ASSERT(!snapsync_exit_turbo_mode_internal(&svc).ok);
+        ASSERT(svc.turbo_active);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_snapshot_sync_reset_rejects_late_chunk(void)
 {
     int failures = 0;
@@ -2344,6 +2371,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_verify_flyclient_begin_failure();
     failures += test_snapshot_sync_service_offer_churn();
     failures += test_snapshot_sync_service_db_service_runtime();
+    failures += test_snapshot_turbo_restore_failure_keeps_retry_latch();
     failures += test_snapshot_sync_reset_rejects_late_chunk();
     failures += test_snapshot_sync_reset_coalesces_concurrent_failure();
     failures += test_snapshot_sync_service_runtime_accessor();
