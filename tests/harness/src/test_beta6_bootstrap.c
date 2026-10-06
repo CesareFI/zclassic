@@ -984,6 +984,14 @@ int test_beta6_bootstrap(void)
         beta6_bs_quota_configure(0, 0);
         ASSERT(beta6_bs_quota_check("v4/24:203.0.113", false, 0).ok);
 
+        /* A saturated wall clock remains a bounded throttle deadline. */
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(1, 1024);
+        ASSERT(beta6_bs_quota_admit("v4/24:203.0.113", false,
+                                    INT64_MAX, 1).ok);
+        ASSERT(!beta6_bs_quota_check("v4/24:203.0.113", false,
+                                     INT64_MAX).ok);
+
         beta6_bs_quota_clear();
         beta6_bs_quota_configure(BETA6_BS_DEFAULT_MAX_BYTES_PER_DAY,
                                  BETA6_BS_DEFAULT_THROTTLE_KBPS);

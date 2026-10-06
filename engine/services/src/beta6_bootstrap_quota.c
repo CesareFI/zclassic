@@ -16,6 +16,7 @@
 
 #include "util/sync.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -35,6 +36,15 @@ static struct beta6_quota_bucket g_buckets[BETA6_BS_QUOTA_MAX_TRACKED];
 static size_t g_bucket_count;
 static int64_t g_max_bytes_per_day = BETA6_BS_DEFAULT_MAX_BYTES_PER_DAY;
 static int64_t g_throttle_kbps = BETA6_BS_DEFAULT_THROTTLE_KBPS;
+
+static int64_t quota_next_allowed_ms(int64_t now_ms, int64_t delay_ms)
+{
+    if (delay_ms < 1)
+        delay_ms = 1;
+    if (now_ms > INT64_MAX - delay_ms)
+        return INT64_MAX;
+    return now_ms + delay_ms;
+}
 
 static void quota_lock_init_once(void)
 {
@@ -191,6 +201,8 @@ static int quota_verdict_locked(const char *key, bool whitelisted, int64_t now_m
         return 0;
     if (g_throttle_kbps <= 0)
         return BETA6_BS_ERR_QUOTA_STOPPED;
+    if (bucket->next_allowed_ms == INT64_MAX && now_ms == INT64_MAX)
+        return BETA6_BS_ERR_QUOTA_SPACING;
     return now_ms >= bucket->next_allowed_ms ? 0 : BETA6_BS_ERR_QUOTA_SPACING;
 }
 
@@ -226,7 +238,7 @@ static void quota_charge_locked(const char *key, int64_t now_ms, uint64_t bytes)
         g_throttle_kbps > 0) {
         int64_t delay_ms = (int64_t)((bytes * 1000ULL) /
                                      ((uint64_t)g_throttle_kbps * 1024ULL));
-        bucket->next_allowed_ms = now_ms + (delay_ms > 1 ? delay_ms : 1);
+        bucket->next_allowed_ms = quota_next_allowed_ms(now_ms, delay_ms);
     }
 }
 
