@@ -315,6 +315,77 @@ static void seam_drain(struct p2p_node *node)
     node->send_size = 0;
 }
 
+/* The ordinary-P2P handler must not retain an in-band manifest pointer after
+ * its readiness check: boot teardown removes the seam, then disarms this
+ * cache while a message already dispatched through the old seam can finish.
+ * Keep the observer on beta6_bs_inband_serve(), not a private cache helper,
+ * so this exercises the same production reply path a peer uses. */
+struct inband_teardown_hammer {
+    const char *source_dir;
+    pthread_barrier_t start;
+    atomic_bool failed;
+};
+
+static void *inband_teardown_arm_disarm(void *opaque)
+{
+    struct inband_teardown_hammer *hammer = opaque;
+
+    (void)pthread_barrier_wait(&hammer->start);
+    for (int i = 0; i < 512; i++) {
+        if (!beta6_bs_arm(hammer->source_dir, "main").ok ||
+            !beta6_bs_inband_arm("main", "").ok) {
+            atomic_store(&hammer->failed, true);
+            break;
+        }
+        beta6_bs_inband_disarm();
+        beta6_bs_disarm();
+    }
+    return NULL;
+}
+
+static void *inband_teardown_observe_manifest(void *opaque)
+{
+    struct inband_teardown_hammer *hammer = opaque;
+    const unsigned char magic[4] = { 0x24, 0xe9, 0x27, 0x64 };
+    struct chain_params params;
+    struct msg_processor mp;
+    struct p2p_node node;
+
+    memset(&params, 0, sizeof(params));
+    memcpy(params.pchMessageStart, magic, sizeof(magic));
+    memset(&mp, 0, sizeof(mp));
+    mp.params = &params;
+    memset(&node, 0, sizeof(node));
+    zcl_mutex_init(&node.cs_send);
+    seam_addr_loopback(&node.addr);
+    (void)pthread_barrier_wait(&hammer->start);
+    for (int i = 0; i < 8192; i++) {
+        const unsigned char param_chunk_request[16] = {
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 1, 0, 0, 0
+        };
+        const char *command = "getbsman";
+        const unsigned char *payload = NULL;
+        size_t payload_len = 0;
+
+        if ((i % 257) == 0) {
+            command = "getbspman";
+        } else if ((i % 257) == 1) {
+            command = "getbspchk";
+            payload = param_chunk_request;
+            payload_len = sizeof(param_chunk_request);
+        }
+        if (!beta6_bs_inband_serve(&mp, &node, command, payload, payload_len).ok) {
+            atomic_store(&hammer->failed, true);
+            break;
+        }
+        seam_drain(&node);
+    }
+    seam_drain(&node);
+    zcl_mutex_destroy(&node.cs_send);
+    return NULL;
+}
+
 int test_beta6_bootstrap(void);
 int test_beta6_bootstrap(void)
 {
@@ -765,6 +836,24 @@ int test_beta6_bootstrap(void)
         beta6_bs_manifest_free(&decoded);
         seam_drain(&node);
 
+        /* These two parameter requests reach the same in-band state snapshot
+         * path. With no -paramsdir they remain named rejections, rather than
+         * retaining the reset strings while shutdown can clear them. */
+        ASSERT(beta6_bs_inband_serve(&mp, &node, "getbspman", NULL, 0).ok);
+        ASSERT(node.send_head != NULL);
+        ASSERT_STR_EQ((const char *)node.send_head->data + 4, "reject");
+        seam_drain(&node);
+        const unsigned char param_chunk_request[16] = {
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 1, 0, 0, 0
+        };
+        ASSERT(beta6_bs_inband_serve(&mp, &node, "getbspchk",
+                                     param_chunk_request,
+                                     sizeof(param_chunk_request)).ok);
+        ASSERT(node.send_head != NULL);
+        ASSERT_STR_EQ((const char *)node.send_head->data + 4, "reject");
+        seam_drain(&node);
+
         /* An unsolicited SERVER reply is dropped, not parsed and not answered. */
         ASSERT(beta6_bs_inband_serve(&mp, &node, "bschk", NULL, 0).ok);
         ASSERT(node.send_head == NULL);
@@ -773,6 +862,32 @@ int test_beta6_bootstrap(void)
         ASSERT(!beta6_bs_inband_status().ok);
         beta6_bs_disarm();
         zcl_mutex_destroy(&node.cs_send);
+        test_rm_rf(dir);
+        PASS();
+    }
+
+    TEST("in-band manifest replies survive concurrent bootstrap teardown") {
+        char dir[512];
+        struct inband_teardown_hammer hammer = {0};
+        pthread_t arm_disarm;
+        pthread_t observe;
+
+        beta6_bs_inband_disarm();
+        beta6_bs_disarm();
+        test_make_tmpdir(dir, sizeof(dir), "beta6_bootstrap", "inband_teardown");
+        ASSERT(fixture_build(dir));
+        hammer.source_dir = dir;
+        ASSERT_EQ(pthread_barrier_init(&hammer.start, NULL, 2), 0);
+        ASSERT_EQ(pthread_create(&arm_disarm, NULL, inband_teardown_arm_disarm,
+                                 &hammer), 0);
+        ASSERT_EQ(pthread_create(&observe, NULL, inband_teardown_observe_manifest,
+                                 &hammer), 0);
+        ASSERT_EQ(pthread_join(arm_disarm, NULL), 0);
+        ASSERT_EQ(pthread_join(observe, NULL), 0);
+        ASSERT(!atomic_load(&hammer.failed));
+        ASSERT_EQ(pthread_barrier_destroy(&hammer.start), 0);
+        beta6_bs_inband_disarm();
+        beta6_bs_disarm();
         test_rm_rf(dir);
         PASS();
     }

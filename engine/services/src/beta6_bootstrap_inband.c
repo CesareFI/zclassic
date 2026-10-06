@@ -126,19 +126,78 @@ static bool peer_quota_key(const struct p2p_node *node, char *out, size_t out_si
     return beta6_bs_quota_key(ip, out, out_size).ok;
 }
 
+/* A dispatched P2P message can outlive boot's removal of the seam. Copy the
+ * shared reply while its owner lock is held, then let the send run without
+ * retaining a pointer that beta6_bs_inband_disarm() can free. The copy stays
+ * bounded by the protocol message cap. */
+static struct zcl_result inband_snapshot_manifest(unsigned char **out,
+                                                   size_t *out_len)
+{
+    unsigned char *copy = NULL;
+
+    if (!out || !out_len)
+        return ZCL_ERR(BETA6_BS_ERR_REFUSED,
+                       "beta6 manifest snapshot needs output storage");
+    *out = NULL;
+    *out_len = 0;
+    inband_lock_init_once();
+    LOCK(s_inband_lock);
+    if (!s_ready || !s_manifest_bytes || s_manifest_len == 0 ||
+        s_manifest_len > BETA6_BS_MAX_MESSAGE_LEN) {
+        UNLOCK(s_inband_lock);
+        return ZCL_ERR(BETA6_BS_ERR_REFUSED, "no beta6 snapshot is armed");
+    }
+    copy = zcl_malloc(s_manifest_len, "beta6 inband manifest snapshot");
+    if (copy)
+        memcpy(copy, s_manifest_bytes, s_manifest_len);
+    *out_len = s_manifest_len;
+    UNLOCK(s_inband_lock);
+    if (!copy)
+        return ZCL_ERR(BETA6_BS_ERR_REFUSED,
+                       "out of memory copying the beta6 snapshot manifest");
+    *out = copy;
+    return ZCL_OK;
+}
+
+static struct zcl_result inband_snapshot_params(
+    char network[sizeof(s_network)], char params_dir[sizeof(s_params_dir)])
+{
+    inband_lock_init_once();
+    LOCK(s_inband_lock);
+    if (!s_ready) {
+        UNLOCK(s_inband_lock);
+        return ZCL_ERR(BETA6_BS_ERR_REFUSED, "no beta6 snapshot is armed");
+    }
+    snprintf(network, sizeof(s_network), "%s", s_network);
+    snprintf(params_dir, sizeof(s_params_dir), "%s", s_params_dir);
+    UNLOCK(s_inband_lock);
+    return ZCL_OK;
+}
+
 /* ── serve handlers ──────────────────────────────────────────────────── */
 
 static bool serve_snapshot_manifest(struct msg_processor *mp, struct p2p_node *node)
 {
-    if (!s_manifest_bytes)
-        return send_reject(mp, node, "getbsman", "no beta6 snapshot is armed");
-    return send_reply(mp, node, "bsman", s_manifest_bytes, s_manifest_len);
+    unsigned char *manifest_bytes = NULL;
+    size_t manifest_len = 0;
+    struct zcl_result snapshot =
+        inband_snapshot_manifest(&manifest_bytes, &manifest_len);
+    if (!snapshot.ok)
+        return send_reject(mp, node, "getbsman", snapshot.message);
+    bool ok = send_reply(mp, node, "bsman", manifest_bytes, manifest_len);
+    free(manifest_bytes);
+    return ok;
 }
 
 static bool serve_param_manifest(struct msg_processor *mp, struct p2p_node *node)
 {
+    char network[sizeof(s_network)];
+    char params_dir[sizeof(s_params_dir)];
+    struct zcl_result snapshot = inband_snapshot_params(network, params_dir);
+    if (!snapshot.ok)
+        return send_reject(mp, node, "getbspman", snapshot.message);
     struct beta6_bs_manifest manifest;
-    struct zcl_result built = beta6_bs_param_manifest(s_params_dir, s_network, &manifest);
+    struct zcl_result built = beta6_bs_param_manifest(params_dir, network, &manifest);
     if (!built.ok) {
         LOG_INFO("beta6boot", "peer %s: no zcash params to serve: %s", node->addr_name,
                  built.message);
@@ -180,6 +239,22 @@ static bool quota_admits(const struct p2p_node *node, uint32_t bytes)
     return true;
 }
 
+static struct zcl_result read_requested_chunk(bool params,
+                                              const struct beta6_bs_chunk_request *request,
+                                              unsigned char *data)
+{
+    if (!params)
+        return beta6_bs_read_chunk(request, data, request->length);
+
+    char network[sizeof(s_network)];
+    char params_dir[sizeof(s_params_dir)];
+    struct zcl_result snapshot = inband_snapshot_params(network, params_dir);
+    if (!snapshot.ok)
+        return snapshot;
+    return beta6_bs_read_param_chunk(params_dir, network, request, data,
+                                     request->length);
+}
+
 static bool serve_chunk(struct msg_processor *mp, struct p2p_node *node,
                         const unsigned char *payload, size_t payload_len, bool params)
 {
@@ -199,10 +274,7 @@ static bool serve_chunk(struct msg_processor *mp, struct p2p_node *node,
     if (!data)
         LOG_FAIL("beta6boot", "out of memory for a %u byte beta6 chunk",
                  (unsigned)request.length);
-    struct zcl_result chunk = params ? beta6_bs_read_param_chunk(s_params_dir, s_network,
-                                                                 &request, data,
-                                                                 request.length)
-                                     : beta6_bs_read_chunk(&request, data, request.length);
+    struct zcl_result chunk = read_requested_chunk(params, &request, data);
     if (!chunk.ok) {
         LOG_INFO("beta6boot", "peer %s: %s refused: %s", node->addr_name, command,
                  chunk.message);
