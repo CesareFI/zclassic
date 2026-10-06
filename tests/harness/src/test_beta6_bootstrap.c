@@ -25,11 +25,13 @@
 #include "services/beta6_bootstrap.h"
 
 #include "chain/chainparams.h"
+#include "core/hash.h"
 #include "net/msg_internal.h"
 #include "net/msgprocessor.h"
 #include "net/net.h"
 #include "net/protocol.h"
 #include "net/version.h"
+#include "platform/socket_compat.h"
 #include "util/sync.h"
 
 #include <pthread.h>
@@ -171,6 +173,136 @@ static bool fixture_build(const char *dir)
            fixture_write(dir, "chainstate/000007.ldb", 20) &&
            fixture_anchor(dir, "3126937 00000663e40f1fe0bc32a7e7282fac25de5fe8ec"
                                "efd9c627e2fd948d388f7053");
+}
+
+static uint16_t listener_test_port(void)
+{
+    platform_socket_t socket = platform_socket_open(AF_INET, SOCK_STREAM, 0,
+                                                     true, false);
+    struct sockaddr_in address;
+    size_t address_size = sizeof(address);
+    uint16_t port = 0;
+
+    if (socket == PLATFORM_SOCKET_INVALID)
+        return 0;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (platform_socket_bind(socket, (struct sockaddr *)&address,
+                             sizeof(address)) == 0 &&
+        platform_socket_local_address(socket, (struct sockaddr *)&address,
+                                      &address_size) == 0)
+        port = ntohs(address.sin_port);
+    platform_socket_close(socket);
+    return port;
+}
+
+static bool listener_receive_exact(platform_socket_t socket, unsigned char *out,
+                                   size_t length)
+{
+    size_t received = 0;
+
+    while (received < length) {
+        int part = platform_socket_receive(socket, out + received,
+                                           length - received);
+        if (part <= 0)
+            return false;
+        received += (size_t)part;
+    }
+    return true;
+}
+
+static bool listener_handshake_from(uint32_t source, uint16_t port,
+                                    platform_socket_t *out)
+{
+    static const unsigned char magic[4] = { 0x24, 0xe9, 0x27, 0x64 };
+    struct sockaddr_in local;
+    struct sockaddr_in remote;
+    unsigned char request[24] = {0};
+    unsigned char reply[24];
+    unsigned char digest[32];
+    platform_socket_t socket;
+
+    if (!out || port == 0)
+        return false;
+    *out = PLATFORM_SOCKET_INVALID;
+    socket = platform_socket_open(AF_INET, SOCK_STREAM, 0, true, false);
+    if (socket == PLATFORM_SOCKET_INVALID)
+        return false;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(source);
+    memset(&remote, 0, sizeof(remote));
+    remote.sin_family = AF_INET;
+    remote.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    remote.sin_port = htons(port);
+    if (platform_socket_bind(socket, (struct sockaddr *)&local, sizeof(local)) != 0 ||
+        platform_socket_connect(socket, (struct sockaddr *)&remote,
+                                sizeof(remote)) != 0) {
+        platform_socket_close(socket);
+        return false;
+    }
+    platform_socket_set_receive_timeout(socket, 1000);
+    memcpy(request, magic, sizeof(magic));
+    memcpy(request + 4, "version", sizeof("version") - 1);
+    hash256((const unsigned char *)"", 0, digest);
+    memcpy(request + 20, digest, 4);
+    if (!platform_socket_send_all(socket, request, sizeof(request)) ||
+        !listener_receive_exact(socket, reply, sizeof(reply)) ||
+        memcmp(reply, magic, sizeof(magic)) != 0 ||
+        memcmp(reply + 4, "version", sizeof("version") - 1) != 0) {
+        platform_socket_close(socket);
+        return false;
+    }
+    *out = socket;
+    return true;
+}
+
+static bool listener_peer_cap_preserves_other_source(void)
+{
+    static const unsigned char magic[4] = { 0x24, 0xe9, 0x27, 0x64 };
+    platform_socket_t attacker[4] = {
+        PLATFORM_SOCKET_INVALID, PLATFORM_SOCKET_INVALID,
+        PLATFORM_SOCKET_INVALID, PLATFORM_SOCKET_INVALID
+    };
+    platform_socket_t rejected = PLATFORM_SOCKET_INVALID;
+    platform_socket_t healthy = PLATFORM_SOCKET_INVALID;
+    char dir[512] = {0};
+    bool ok = false;
+    uint16_t port = listener_test_port();
+
+    beta6_bs_listen_stop();
+    beta6_bs_disarm();
+    if (port == 0)
+        goto done;
+    test_make_tmpdir(dir, sizeof(dir), "beta6_bootstrap", "peer_cap");
+    if (!fixture_build(dir) || !beta6_bs_arm(dir, "main").ok ||
+        !beta6_bs_listen_start("127.0.0.1", port, magic, "main", "").ok)
+        goto done;
+    for (size_t i = 0; i < sizeof(attacker) / sizeof(attacker[0]); i++) {
+        if (!listener_handshake_from(0x7f000002u, port, &attacker[i]))
+            goto done;
+    }
+    if (listener_handshake_from(0x7f000002u, port, &rejected))
+        goto done;
+    if (!listener_handshake_from(0x7f000003u, port, &healthy))
+        goto done;
+    ok = true;
+
+done:
+    for (size_t i = 0; i < sizeof(attacker) / sizeof(attacker[0]); i++) {
+        if (attacker[i] != PLATFORM_SOCKET_INVALID)
+            platform_socket_close(attacker[i]);
+    }
+    if (rejected != PLATFORM_SOCKET_INVALID)
+        platform_socket_close(rejected);
+    if (healthy != PLATFORM_SOCKET_INVALID)
+        platform_socket_close(healthy);
+    beta6_bs_listen_stop();
+    beta6_bs_disarm();
+    if (dir[0] != '\0')
+        test_rm_rf(dir);
+    return ok;
 }
 
 struct bootstrap_status_hammer {
@@ -691,6 +823,11 @@ int test_beta6_bootstrap(void)
         beta6_bs_inband_disarm();
         beta6_bs_disarm();
         test_rm_rf(dir);
+        PASS();
+    }
+
+    TEST("one bootstrap source cannot consume every listener session") {
+        ASSERT(listener_peer_cap_preserves_other_source());
         PASS();
     }
 

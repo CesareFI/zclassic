@@ -59,6 +59,9 @@
 #define BETA6_COMMAND_SIZE 12
 #define BETA6_IO_TIMEOUT_MS 120000
 #define BETA6_MAX_SESSIONS 16
+/* A stock beta6 client uses at most four bootstrap streams.  Keep enough of
+ * the bounded listener for other sources when one peer opens idle sockets. */
+#define BETA6_MAX_SESSIONS_PER_PEER 4
 /* version.h:12,21 — a beta6 client refuses a peer below MIN_PEER_PROTO_VERSION
  * and reads our version payload at INIT_PROTO_VERSION, where CAddress carries
  * no nTime. */
@@ -101,6 +104,7 @@ struct beta6_session_slot {
     bool finished;
     platform_socket_t socket;
     pthread_t tid;
+    char peer_ip[64];
 };
 
 static struct beta6_listener g_listener;
@@ -414,25 +418,34 @@ static void sessions_reap_finished_locked(void)
         LOCK(g_session_lock);
         g_sessions[i].used = false;
         g_sessions[i].finished = false;
+        g_sessions[i].peer_ip[0] = '\0';
     }
 }
 
 /* Reserve a session row, reaping finished ones first. Returns its index, or
  * -1 when BETA6_MAX_SESSIONS clients are already being served. */
-static int session_slot_take(platform_socket_t socket)
+static int session_slot_take(platform_socket_t socket, const char *peer_ip)
 {
+    int peer_sessions = 0;
+
     session_lock_init_once();
     LOCK(g_session_lock);
     sessions_reap_finished_locked();
     int slot = -1;
-    for (int i = 0; i < BETA6_MAX_SESSIONS && slot < 0; i++) {
-        if (!g_sessions[i].used)
+    for (int i = 0; i < BETA6_MAX_SESSIONS; i++) {
+        if (g_sessions[i].used && strcmp(g_sessions[i].peer_ip, peer_ip) == 0)
+            peer_sessions++;
+        if (!g_sessions[i].used && slot < 0)
             slot = i;
     }
+    if (peer_sessions >= BETA6_MAX_SESSIONS_PER_PEER)
+        slot = -1;
     if (slot >= 0) {
         g_sessions[slot].used = true;
         g_sessions[slot].finished = false;
         g_sessions[slot].socket = socket;
+        snprintf(g_sessions[slot].peer_ip, sizeof(g_sessions[slot].peer_ip),
+                 "%s", peer_ip);
     }
     UNLOCK(g_session_lock);
     return slot;
@@ -444,12 +457,18 @@ static void session_slot_abandon(int slot)
     LOCK(g_session_lock);
     g_sessions[slot].used = false;
     g_sessions[slot].socket = PLATFORM_SOCKET_INVALID;
+    g_sessions[slot].peer_ip[0] = '\0';
     UNLOCK(g_session_lock);
 }
 
 static void spawn_session(platform_socket_t accepted, const struct sockaddr_in *from)
 {
-    int slot = session_slot_take(accepted);
+    char peer_ip[64];
+
+    if (!platform_socket_format_address(AF_INET, &from->sin_addr, peer_ip,
+                                        sizeof(peer_ip)))
+        snprintf(peer_ip, sizeof(peer_ip), "unknown");
+    int slot = session_slot_take(accepted, peer_ip);
     if (slot < 0) {
         platform_socket_close(accepted);
         return;
@@ -463,9 +482,7 @@ static void spawn_session(platform_socket_t accepted, const struct sockaddr_in *
     session->socket = accepted;
     session->listener = &g_listener;
     session->slot = slot;
-    if (!platform_socket_format_address(AF_INET, &from->sin_addr, session->peer_ip,
-                                        sizeof(session->peer_ip)))
-        snprintf(session->peer_ip, sizeof(session->peer_ip), "unknown");
+    snprintf(session->peer_ip, sizeof(session->peer_ip), "%s", peer_ip);
     if (!beta6_bs_quota_key(session->peer_ip, session->quota_key,
                             sizeof(session->quota_key)).ok)
         snprintf(session->quota_key, sizeof(session->quota_key), "unknown");
@@ -498,6 +515,7 @@ static void sessions_stop_all(void)
         LOCK(g_session_lock);
         g_sessions[i].used = false;
         g_sessions[i].finished = false;
+        g_sessions[i].peer_ip[0] = '\0';
     }
     UNLOCK(g_session_lock);
 }
