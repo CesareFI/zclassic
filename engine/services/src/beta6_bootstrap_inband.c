@@ -232,11 +232,7 @@ static bool quota_admits(const struct p2p_node *node, uint32_t bytes)
     if (!peer_quota_key(node, quota_key, sizeof(quota_key)))
         return true; /* an unaddressable peer is charged to no bucket */
     int64_t now_ms = clock_now_wall_ms();
-    struct zcl_result allowed = beta6_bs_quota_check(quota_key, node->whitelisted, now_ms);
-    if (!allowed.ok)
-        return false;
-    beta6_bs_quota_charge(quota_key, node->whitelisted, now_ms, bytes);
-    return true;
+    return beta6_bs_quota_admit(quota_key, node->whitelisted, now_ms, bytes).ok;
 }
 
 static struct zcl_result read_requested_chunk(bool params,

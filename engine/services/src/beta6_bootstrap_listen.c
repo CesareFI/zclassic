@@ -285,12 +285,10 @@ static bool quota_gate(struct beta6_session *session, uint32_t bytes)
 {
     for (int attempt = 0; attempt < 64; attempt++) {
         int64_t now_ms = clock_now_wall_ms();
-        struct zcl_result allowed = beta6_bs_quota_check(session->quota_key, false,
-                                                         now_ms);
-        if (allowed.ok) {
-            beta6_bs_quota_charge(session->quota_key, false, now_ms, bytes);
+        struct zcl_result allowed =
+            beta6_bs_quota_admit(session->quota_key, false, now_ms, bytes);
+        if (allowed.ok)
             return true;
-        }
         if (allowed.code != BETA6_BS_ERR_QUOTA_SPACING)
             return false;
         struct timespec pause = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };

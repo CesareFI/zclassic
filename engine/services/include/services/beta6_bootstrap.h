@@ -250,6 +250,11 @@ struct zcl_result beta6_bs_quota_check(const char *key, bool whitelisted,
                                        int64_t now_ms);
 void beta6_bs_quota_charge(const char *key, bool whitelisted, int64_t now_ms,
                            uint64_t bytes);
+/* Atomically check and reserve `bytes` for one request. Production serving
+ * paths use this instead of a separate check followed by charge, so parallel
+ * peers in one address bucket cannot both pass the same remaining quota. */
+struct zcl_result beta6_bs_quota_admit(const char *key, bool whitelisted,
+                                       int64_t now_ms, uint64_t bytes);
 void beta6_bs_quota_clear(void);
 /* Override the compiled cap/throttle (operator config; tests). A cap <= 0
  * disables the quota; a throttle <= 0 turns the over-cap case into a hard

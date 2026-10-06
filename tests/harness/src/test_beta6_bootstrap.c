@@ -386,6 +386,21 @@ static void *inband_teardown_observe_manifest(void *opaque)
     return NULL;
 }
 
+struct quota_admit_hammer {
+    pthread_barrier_t start;
+    atomic_int admitted;
+};
+
+static void *quota_admit_once(void *opaque)
+{
+    struct quota_admit_hammer *hammer = opaque;
+
+    (void)pthread_barrier_wait(&hammer->start);
+    if (beta6_bs_quota_admit("v4/24:203.0.113", false, 0, 1).ok)
+        atomic_fetch_add(&hammer->admitted, 1);
+    return NULL;
+}
+
 int test_beta6_bootstrap(void);
 int test_beta6_bootstrap(void)
 {
@@ -969,6 +984,30 @@ int test_beta6_bootstrap(void)
         beta6_bs_quota_configure(0, 0);
         ASSERT(beta6_bs_quota_check("v4/24:203.0.113", false, 0).ok);
 
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(BETA6_BS_DEFAULT_MAX_BYTES_PER_DAY,
+                                 BETA6_BS_DEFAULT_THROTTLE_KBPS);
+        PASS();
+    }
+
+    TEST("quota admission reserves one concurrent request at the cap") {
+        struct quota_admit_hammer hammer = {0};
+        pthread_t first;
+        pthread_t second;
+
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(1, 0);
+        /* The historical split API does not reserve: two callers can both
+         * observe an empty bucket before either records its request. */
+        ASSERT(beta6_bs_quota_check("v4/24:203.0.113", false, 0).ok);
+        ASSERT(beta6_bs_quota_check("v4/24:203.0.113", false, 0).ok);
+        ASSERT_EQ(pthread_barrier_init(&hammer.start, NULL, 2), 0);
+        ASSERT_EQ(pthread_create(&first, NULL, quota_admit_once, &hammer), 0);
+        ASSERT_EQ(pthread_create(&second, NULL, quota_admit_once, &hammer), 0);
+        ASSERT_EQ(pthread_join(first, NULL), 0);
+        ASSERT_EQ(pthread_join(second, NULL), 0);
+        ASSERT_EQ(atomic_load(&hammer.admitted), 1);
+        ASSERT_EQ(pthread_barrier_destroy(&hammer.start), 0);
         beta6_bs_quota_clear();
         beta6_bs_quota_configure(BETA6_BS_DEFAULT_MAX_BYTES_PER_DAY,
                                  BETA6_BS_DEFAULT_THROTTLE_KBPS);

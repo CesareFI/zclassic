@@ -194,15 +194,8 @@ static int quota_verdict_locked(const char *key, bool whitelisted, int64_t now_m
     return now_ms >= bucket->next_allowed_ms ? 0 : BETA6_BS_ERR_QUOTA_SPACING;
 }
 
-struct zcl_result beta6_bs_quota_check(const char *key, bool whitelisted,
-                                       int64_t now_ms)
+static struct zcl_result quota_verdict_result(const char *key, int verdict)
 {
-    if (!key)
-        return ZCL_ERR(BETA6_BS_ERR_REFUSED, "beta6 quota check needs a bucket key");
-    quota_lock_init_once();
-    LOCK(g_quota_lock);
-    int verdict = quota_verdict_locked(key, whitelisted, now_ms);
-    UNLOCK(g_quota_lock);
     if (verdict == BETA6_BS_ERR_QUOTA_STOPPED)
         return ZCL_ERR(BETA6_BS_ERR_QUOTA_STOPPED,
                        "beta6 bucket %s is over the daily serve cap and throttling "
@@ -216,17 +209,10 @@ struct zcl_result beta6_bs_quota_check(const char *key, bool whitelisted,
     return ZCL_OK;
 }
 
-void beta6_bs_quota_charge(const char *key, bool whitelisted, int64_t now_ms,
-                           uint64_t bytes)
+static void quota_charge_locked(const char *key, int64_t now_ms, uint64_t bytes)
 {
-    if (!key || whitelisted)
+    if (g_max_bytes_per_day <= 0)
         return;
-    quota_lock_init_once();
-    LOCK(g_quota_lock);
-    if (g_max_bytes_per_day <= 0) {
-        UNLOCK(g_quota_lock);
-        return;
-    }
     struct beta6_quota_bucket *bucket = bucket_find(key);
     if (!bucket)
         bucket = bucket_insert(key, now_ms);
@@ -236,9 +222,47 @@ void beta6_bs_quota_charge(const char *key, bool whitelisted, int64_t now_ms,
         bucket->next_allowed_ms = 0;
     }
     bucket->bytes_served += bytes;
-    if (bucket->bytes_served >= (uint64_t)g_max_bytes_per_day && g_throttle_kbps > 0) {
-        int64_t delay_ms = (int64_t)((bytes * 1000ULL) / ((uint64_t)g_throttle_kbps * 1024ULL));
+    if (bucket->bytes_served >= (uint64_t)g_max_bytes_per_day &&
+        g_throttle_kbps > 0) {
+        int64_t delay_ms = (int64_t)((bytes * 1000ULL) /
+                                     ((uint64_t)g_throttle_kbps * 1024ULL));
         bucket->next_allowed_ms = now_ms + (delay_ms > 1 ? delay_ms : 1);
     }
+}
+
+struct zcl_result beta6_bs_quota_check(const char *key, bool whitelisted,
+                                       int64_t now_ms)
+{
+    if (!key)
+        return ZCL_ERR(BETA6_BS_ERR_REFUSED, "beta6 quota check needs a bucket key");
+    quota_lock_init_once();
+    LOCK(g_quota_lock);
+    int verdict = quota_verdict_locked(key, whitelisted, now_ms);
     UNLOCK(g_quota_lock);
+    return quota_verdict_result(key, verdict);
+}
+
+void beta6_bs_quota_charge(const char *key, bool whitelisted, int64_t now_ms,
+                           uint64_t bytes)
+{
+    if (!key || whitelisted)
+        return;
+    quota_lock_init_once();
+    LOCK(g_quota_lock);
+    quota_charge_locked(key, now_ms, bytes);
+    UNLOCK(g_quota_lock);
+}
+
+struct zcl_result beta6_bs_quota_admit(const char *key, bool whitelisted,
+                                       int64_t now_ms, uint64_t bytes)
+{
+    if (!key)
+        return ZCL_ERR(BETA6_BS_ERR_REFUSED, "beta6 quota admission needs a bucket key");
+    quota_lock_init_once();
+    LOCK(g_quota_lock);
+    int verdict = quota_verdict_locked(key, whitelisted, now_ms);
+    if (verdict == 0 && !whitelisted)
+        quota_charge_locked(key, now_ms, bytes);
+    UNLOCK(g_quota_lock);
+    return quota_verdict_result(key, verdict);
 }
