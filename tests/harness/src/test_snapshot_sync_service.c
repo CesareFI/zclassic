@@ -49,6 +49,12 @@ struct finalize_thread_ctx {
     struct zcl_result result;
 };
 
+struct end_thread_ctx {
+    struct snapshot_sync_service *svc;
+    uint32_t peer_id;
+    struct zcl_result result;
+};
+
 struct failed_reset_thread_ctx {
     bool reset_detected;
 };
@@ -112,9 +118,17 @@ static void *snapshot_finalize_thread(void *ctx)
     return NULL;
 }
 
-static void snapshot_finalize_thread_release_and_join(struct reset_gate *gate,
-                                                       pthread_t thread,
-                                                       bool *started)
+static void *snapshot_end_thread(void *ctx)
+{
+    struct end_thread_ctx *thread = ctx;
+
+    thread->result = snapsync_handle_end(thread->svc, thread->peer_id);
+    return NULL;
+}
+
+static void snapshot_gate_release_and_join(struct reset_gate *gate,
+                                           pthread_t thread,
+                                           bool *started)
 {
     if (!*started)
         return;
@@ -1440,8 +1454,8 @@ static bool snapshot_reset_drains_admitted_finalize(void)
         snapsync_staging_count_internal(&f.ndb) == 0;
 
 cleanup:
-    snapshot_finalize_thread_release_and_join(&finalize_gate, finalize_thread,
-                                              &finalize_started);
+    snapshot_gate_release_and_join(&finalize_gate, finalize_thread,
+                                   &finalize_started);
     snapsync_test_set_finalize_admit_gate(NULL, NULL);
     snapsync_test_set_chunk_drain_gate(NULL, NULL);
     if (finalize_gate_initialized) {
@@ -1459,6 +1473,79 @@ static int test_snapshot_sync_reset_drains_admitted_finalize(void)
 
     TEST("snapshot reset drains an admitted finalizer before staging cleanup") {
         ASSERT(snapshot_reset_drains_admitted_finalize());
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static bool snapshot_end_rejects_replaced_serving_peer(void)
+{
+    struct snapshot_reset_fixture f;
+    struct reset_gate gate;
+    struct end_thread_ctx end = {0};
+    pthread_t end_thread;
+    bool gate_initialized = false;
+    bool end_started = false;
+    bool service_initialized = false;
+    bool result = false;
+
+    memset(&f, 0, sizeof(f));
+    memset(&gate, 0, sizeof(gate));
+    if (!snapshot_reset_fixture_open(&f))
+        goto cleanup;
+    snapsync_init(&f.svc, &f.ndb);
+    service_initialized = true;
+    f.svc.state = SNAPSYNC_NEGOTIATING;
+    f.svc.serving_peer_id = 71;
+    if (!snapsync_begin_receive(&f.svc).ok || !snapshot_reset_gate_init(&gate))
+        goto cleanup;
+    gate_initialized = true;
+    snapsync_test_set_end_finalize_gate(snapshot_reset_gate, &gate);
+    end.svc = &f.svc;
+    end.peer_id = 71;
+    if (pthread_create(&end_thread, NULL, snapshot_end_thread, &end) != 0)
+        goto cleanup;
+    end_started = true;
+    pthread_mutex_lock(&gate.mutex);
+    while (!gate.is_entered)
+        pthread_cond_wait(&gate.entered, &gate.mutex);
+    pthread_mutex_unlock(&gate.mutex);
+
+    snapsync_reset(&f.svc);
+    snapsync_service_lock_internal();
+    f.svc.state = SNAPSYNC_NEGOTIATING;
+    f.svc.serving_peer_id = 72;
+    snapsync_service_unlock_internal();
+    if (!snapsync_begin_receive(&f.svc).ok)
+        goto cleanup;
+    snapshot_gate_release_and_join(&gate, end_thread, &end_started);
+
+    snapsync_service_lock_internal();
+    result = !end.result.ok && f.svc.state == SNAPSYNC_RECEIVING &&
+        f.svc.serving_peer_id == 72;
+    snapsync_service_unlock_internal();
+
+cleanup:
+    snapshot_gate_release_and_join(&gate, end_thread, &end_started);
+    snapsync_test_set_end_finalize_gate(NULL, NULL);
+    if (service_initialized)
+        snapsync_reset(&f.svc);
+    if (gate_initialized) {
+        pthread_cond_destroy(&gate.release);
+        pthread_cond_destroy(&gate.entered);
+        pthread_mutex_destroy(&gate.mutex);
+    }
+    snapshot_reset_fixture_cleanup(&f);
+    return result;
+}
+
+static int test_snapshot_sync_end_rejects_replaced_serving_peer(void)
+{
+    int failures = 0;
+
+    TEST("snapshot end cannot finalize a replacement serving peer") {
+        ASSERT(snapshot_end_rejects_replaced_serving_peer());
         PASS();
     } _test_next:;
 
@@ -2599,6 +2686,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_reset_rejects_late_chunk();
     failures += test_snapshot_sync_reset_drains_admitted_chunk();
     failures += test_snapshot_sync_reset_drains_admitted_finalize();
+    failures += test_snapshot_sync_end_rejects_replaced_serving_peer();
     failures += test_snapshot_sync_reset_coalesces_concurrent_failure();
     failures += test_snapshot_sync_service_runtime_accessor();
     failures += test_snapshot_sync_service_db_service_chunk_contained();

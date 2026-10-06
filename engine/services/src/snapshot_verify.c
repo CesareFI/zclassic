@@ -265,17 +265,12 @@ static bool snapsync_finalize_write(struct node_db *ndb, void *ctx)
     }
 }
 
-struct zcl_result snapsync_finalize(struct snapshot_sync_service *svc)
+static struct zcl_result snapsync_finalize_after_admission(
+    struct snapshot_sync_service *svc)
 {
     struct snapsync_finalize_ctx ctx;
     bool turbo_active = false;
     bool keep_failed_state = false;
-
-    if (!svc)
-        return ZCL_ERR(-1, "finalize: svc is NULL");
-    if (!snapsync_finalize_write_admit_internal(svc)) {
-        return ZCL_ERR(-2, "finalize: not allowed (state != RECEIVING or ndb not open)");
-    }
 
     snapsync_service_lock_internal();
     turbo_active = svc->turbo_active;
@@ -317,6 +312,25 @@ struct zcl_result snapsync_finalize(struct snapshot_sync_service *svc)
     if (!ctx.ok)
         return ZCL_ERR(-4, "finalize: SHA3 verification failed");
     return ZCL_OK;
+}
+
+struct zcl_result snapsync_finalize(struct snapshot_sync_service *svc)
+{
+    if (!svc)
+        return ZCL_ERR(-1, "finalize: svc is NULL");
+    if (!snapsync_finalize_write_admit_internal(svc))
+        return ZCL_ERR(-2, "finalize: not allowed (state != RECEIVING or ndb not open)");
+    return snapsync_finalize_after_admission(svc);
+}
+
+struct zcl_result snapsync_finalize_peer_internal(
+    struct snapshot_sync_service *svc, uint32_t peer_id)
+{
+    if (!svc)
+        return ZCL_ERR(-1, "finalize: svc is NULL");
+    if (!snapsync_finalize_write_admit_peer_internal(svc, peer_id))
+        return ZCL_ERR(-2, "finalize: peer is no longer serving this snapshot");
+    return snapsync_finalize_after_admission(svc);
 }
 
 /* ── FlyClient wire format helpers ───────────────────────── */

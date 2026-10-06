@@ -162,12 +162,15 @@ void snapsync_chunk_write_finish_internal(void)
     snapsync_service_unlock_internal();
 }
 
-bool snapsync_finalize_write_admit_internal(struct snapshot_sync_service *svc)
+static bool snapsync_finalize_write_admit(struct snapshot_sync_service *svc,
+                                          uint32_t peer_id,
+                                          bool require_peer_match)
 {
     bool admitted = false;
 
     snapsync_service_lock_internal();
-    if (svc && svc->state == SNAPSYNC_RECEIVING && svc->ndb && svc->ndb->open) {
+    if (svc && svc->state == SNAPSYNC_RECEIVING && svc->ndb && svc->ndb->open &&
+        (!require_peer_match || svc->serving_peer_id == peer_id)) {
         /* This transition and its lifetime admission must be indivisible:
          * reset changes RECEIVING/VERIFYING to FAILED before draining writes.
          * Otherwise a queued finalizer can revive VERIFYING after reset has
@@ -193,6 +196,17 @@ bool snapsync_finalize_write_admit_internal(struct snapshot_sync_service *svc)
     }
 #endif
     return admitted;
+}
+
+bool snapsync_finalize_write_admit_internal(struct snapshot_sync_service *svc)
+{
+    return snapsync_finalize_write_admit(svc, 0, false);
+}
+
+bool snapsync_finalize_write_admit_peer_internal(
+    struct snapshot_sync_service *svc, uint32_t peer_id)
+{
+    return snapsync_finalize_write_admit(svc, peer_id, true);
 }
 
 void snapsync_finalize_write_finish_internal(void)

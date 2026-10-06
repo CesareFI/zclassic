@@ -36,6 +36,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifdef ZCL_TESTING
+static snapsync_reset_gate_fn g_snapsync_end_finalize_gate = NULL;
+static void *g_snapsync_end_finalize_gate_ctx = NULL;
+
+void snapsync_test_set_end_finalize_gate(snapsync_reset_gate_fn fn, void *ctx)
+{
+    snapsync_service_lock_internal();
+    g_snapsync_end_finalize_gate = fn;
+    g_snapsync_end_finalize_gate_ctx = ctx;
+    snapsync_service_unlock_internal();
+}
+
+void snapsync_test_run_end_finalize_gate(void)
+{
+    snapsync_reset_gate_fn gate;
+    void *ctx;
+
+    snapsync_service_lock_internal();
+    gate = g_snapsync_end_finalize_gate;
+    ctx = g_snapsync_end_finalize_gate_ctx;
+    snapsync_service_unlock_internal();
+    if (gate)
+        gate(ctx);
+}
+#endif
+
 /* ── Staging helpers ─────────────────────────────────────── */
 
 struct zcl_result snapsync_discard_staging_internal(struct node_db *ndb,
@@ -573,9 +599,14 @@ struct zcl_result snapsync_handle_end(struct snapshot_sync_service *svc, uint32_
                        snapsync_state_name(state));
     }
 
+#ifdef ZCL_TESTING
+    snapsync_test_run_end_finalize_gate();
+#endif
+    struct zcl_result finalized = snapsync_finalize_peer_internal(svc, peer_id);
+    if (!finalized.ok)
+        return finalized;
     event_emitf(EV_SNAPSHOT_COMPLETE, peer_id,
                 "%llu UTXOs received",
                 (unsigned long long)received);
-
-    return snapsync_finalize(svc);
+    return finalized;
 }
