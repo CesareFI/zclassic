@@ -727,6 +727,31 @@ static int test_snapshot_sync_service_builds_pow(void)
     return failures;
 }
 
+static int test_snapshot_serve_request_requires_exact_pow_frame(void)
+{
+    int failures = 0;
+
+    TEST("snapshot serve request rejects a valid PoW with trailing bytes") {
+        uint8_t ip[16] = {0};
+        uint8_t request[49] = {0};
+        struct fast_sync_pow pow;
+
+        ip[0] = 0xa5; /* a fresh rate-limit bucket for this direct parser test */
+        ip[15] = 7;
+        ASSERT(snapsync_build_request_pow(ip, &pow).ok);
+        ASSERT(fast_sync_verify_pow(&pow));
+        memcpy(request, pow.peer_id, sizeof(pow.peer_id));
+        memcpy(request + 32, &pow.timestamp, sizeof(pow.timestamp));
+        memcpy(request + 40, &pow.nonce, sizeof(pow.nonce));
+        request[48] = 0x42;
+        ASSERT(snapsync_validate_serve_request(request, sizeof(request), ip) ==
+               SNAPSYNC_SERVE_TRUNCATED);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_snapshot_sync_service_stream_helpers(void)
 {
     int failures = 0;
@@ -2755,6 +2780,7 @@ int test_snapshot_sync_service(void)
     failures += test_boot_publish_block_swarm();
     failures += test_snapshot_offer_seed_cap_matches_self_derived();
     failures += test_snapshot_sync_service_builds_pow();
+    failures += test_snapshot_serve_request_requires_exact_pow_frame();
     failures += test_snapshot_sync_service_stream_helpers();
     failures += test_snapshot_manifest_contract();
     failures += test_snapshot_manifest_recovery_contract();

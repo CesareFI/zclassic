@@ -174,7 +174,7 @@ enum snapsync_serve_result snapsync_validate_serve_request(
     const uint8_t *pow_data, size_t pow_len,
     const uint8_t peer_ip[16])
 {
-    if (!pow_data || pow_len < 48)
+    if (!pow_data || pow_len != 48)
         return SNAPSYNC_SERVE_TRUNCATED;
 
     /* Parse PoW fields */
