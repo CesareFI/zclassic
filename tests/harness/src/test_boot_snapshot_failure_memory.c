@@ -32,6 +32,11 @@ static void bsfm_touch_in_dir(const char *dir, const char *name)
     bsfm_touch(path);
 }
 
+static bool bsfm_selected_path(const char *selected, const char *expected)
+{
+    return selected && strcmp(selected, expected) == 0;
+}
+
 int test_boot_snapshot_failure_memory(void)
 {
     int failures = 0;
@@ -119,6 +124,24 @@ int test_boot_snapshot_failure_memory(void)
 
         boot_snapshot_failure_memory_clear(marker);
         free((void *)ctx.load_snapshot_at_own_height);
+        test_rm_rf_recursive(dir);
+    }
+
+    {
+        char dir[256];
+        test_make_tmpdir(dir, sizeof(dir), "boot_snapshot_failure", "height_overflow");
+        bsfm_touch_in_dir(dir, "block_index.bin");
+        bsfm_touch_in_dir(dir, "utxo-seed-99.snapshot");
+        /* This decimal value is UINT64_MAX + 101.  It is not a valid
+         * signed snapshot height and must not wrap into a preferred seed. */
+        bsfm_touch_in_dir(dir, "utxo-seed-18446744073709551716.snapshot");
+
+        char *selected = boot_autodetect_bundle_snapshot(dir);
+        char expected[512];
+        snprintf(expected, sizeof(expected), "%s/utxo-seed-99.snapshot", dir);
+        BSFM_CHECK("autodetect ignores out-of-range snapshot height",
+                   bsfm_selected_path(selected, expected));
+        free(selected);
         test_rm_rf_recursive(dir);
     }
 

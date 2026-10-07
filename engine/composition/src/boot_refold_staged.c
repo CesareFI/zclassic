@@ -833,6 +833,28 @@ static bool reopen_progress_store_after_verified_snapshot(const char *datadir,
     return true;
 }
 
+static bool snapshot_seed_name_height(const char *name, size_t prefix_len,
+                                      size_t suffix_len, long long *out)
+{
+    if (!name || !out)
+        return false;
+    size_t len = strlen(name);
+    if (len <= prefix_len + suffix_len)
+        return false;
+
+    long long height = 0;
+    for (size_t i = prefix_len; i < len - suffix_len; i++) {
+        if (name[i] < '0' || name[i] > '9')
+            return false;
+        int digit = name[i] - '0';
+        if (height > ((long long)INT32_MAX - digit) / 10)
+            return false;
+        height = height * 10 + digit;
+    }
+    *out = height;
+    return true;
+}
+
 char *boot_autodetect_bundle_snapshot(const char *datadir)
 {
     if (!datadir || !datadir[0])
@@ -866,12 +888,7 @@ char *boot_autodetect_bundle_snapshot(const char *datadir)
         if (strcmp(nm + len - slen, SFX) != 0)
             continue;
         long long h = 0;
-        bool digits_ok = true;
-        for (size_t i = plen; i < len - slen; i++) {
-            if (nm[i] < '0' || nm[i] > '9') { digits_ok = false; break; }
-            h = h * 10 + (nm[i] - '0');
-        }
-        if (!digits_ok)
+        if (!snapshot_seed_name_height(nm, plen, slen, &h))
             continue;
         /* Failure memory (never-stuck): a prior boot that crash-failed seeding
          * THIS snapshot wrote a sibling "<name>.failed" marker (see boot.c

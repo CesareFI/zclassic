@@ -1511,7 +1511,7 @@ engine/composition/src/boot_node_utilities.c:boot_metrics_external_gauges:16
 engine/composition/src/boot_params_gate.c:boot_params_gate_evaluate:16
 engine/composition/src/boot_projections.c:boot_start_projection_storage:35
 engine/composition/src/boot_ratify_mint_anchor.c:ratify_seam_core:18
-engine/composition/src/boot_refold_staged.c:boot_autodetect_bundle_snapshot:24
+engine/composition/src/boot_refold_staged.c:boot_autodetect_bundle_snapshot:21
 engine/composition/src/boot_refold_staged.c:boot_load_snapshot_at_own_height_reset:113
 engine/composition/src/boot_refold_staged.c:boot_load_snapshot_resume_seed_from_authority:33
 engine/composition/src/boot_refold_staged.c:boot_refold_from_anchor_reset:34
