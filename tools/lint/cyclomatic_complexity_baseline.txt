@@ -1528,7 +1528,7 @@ engine/composition/src/boot_shutdown_marker.c:boot_shutdown_marker_parse:53
 engine/composition/src/boot_shutdown_marker.c:boot_shutdown_marker_write_clean:21
 engine/composition/src/boot_shutdown_marker.c:node_db_file_identity_read:16
 engine/composition/src/boot_snapshot_failure_memory.c:quarantine_borrowed_seed:17
-engine/composition/src/boot_snapshot_import.c:boot_import_snapshot_db:55
+engine/composition/src/boot_snapshot_import.c:boot_import_snapshot_db:54
 engine/composition/src/boot_snapshot_install.c:boot_snapshot_install_marker_complete:18
 engine/composition/src/boot_snapshot_install.c:boot_snapshot_install_resume_allowed:23
 engine/composition/src/boot_snapshot_offer.c:build_snapshot_offer_thread:33
