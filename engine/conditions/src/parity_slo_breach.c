@@ -17,8 +17,10 @@
 #include "services/legacy_mirror_sync_service.h"
 #include "util/blocker.h"
 #include "util/log_macros.h"
+#include "util/parse_num.h"
 #include "platform/time_compat.h"
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -62,11 +64,10 @@ static int64_t pslo_now(void)
 static int pslo_env_secs(const char *name, int fallback)
 {
     const char *e = getenv(name);
-    if (e && e[0]) {
-        int v = atoi(e);
-        if (v >= 1)
-            return v;
-    }
+    int64_t value;
+
+    if (e && zcl_parse_i64(e, &value) && value >= 1 && value <= INT_MAX)
+        return (int)value;
     return fallback;
 }
 

@@ -61,6 +61,31 @@ static struct legacy_mirror_sync_stats ps_stats(bool enabled, bool reachable,
     return s;
 }
 
+static int test_malformed_window_override(void)
+{
+    int failures = 0;
+    struct legacy_mirror_sync_stats s =
+        ps_stats(true, true, true, false, 200, 200, 205);
+
+    printf("parity_slo_breach: rejects malformed duration override...\n");
+    PS_CHECK("set malformed duration",
+             setenv("ZCL_PARITY_SLO_DISAGREE_SECS", "5junk", 1) == 0);
+    legacy_mirror_sync_reset_for_test();
+    parity_slo_breach_test_reset();
+    parity_slo_breach_test_set_now(1000);
+    legacy_mirror_sync_test_set_stats(&s, NULL);
+    PS_CHECK("malformed duration: baseline stays clear",
+             !parity_slo_breach_test_detect());
+    parity_slo_breach_test_set_now(1006);
+    legacy_mirror_sync_test_set_stats(&s, NULL);
+    PS_CHECK("malformed duration: default window remains active",
+             !parity_slo_breach_test_detect());
+    PS_CHECK("clear malformed duration",
+             unsetenv("ZCL_PARITY_SLO_DISAGREE_SECS") == 0);
+    parity_slo_breach_test_reset();
+    return failures;
+}
+
 static int test_detector(void)
 {
     int failures = 0;
@@ -287,6 +312,7 @@ int test_parity_slo(void)
 {
     printf("\n=== parity_slo tests ===\n");
     int failures = 0;
+    failures += test_malformed_window_override();
     failures += test_detector();
     failures += test_remedy_witness_registration();
     failures += test_ring_buffer_cap();
