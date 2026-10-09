@@ -235,11 +235,15 @@ static int t_dump_saturates_unsigned_counters(void)
         struct json_value v;
         json_init(&v);
         block_prefetch_test_set_warm_hits(UINT64_MAX);
+        block_prefetch_test_set_nowait_misses(1);
         ASSERT(block_prefetch_dump_state_json(&v, NULL));
         const struct json_value *hits = json_get(&v, "hits");
+        const struct json_value *rate = json_get(&v, "resident_rate");
         ASSERT(hits && json_get_int(hits) == INT64_MAX);
+        ASSERT(rate && json_get_real(rate) == 1.0);
         json_free(&v);
         block_prefetch_test_set_warm_hits(0);
+        block_prefetch_test_set_nowait_misses(0);
     } TEST_END
 
     return failures;

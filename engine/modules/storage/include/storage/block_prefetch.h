@@ -104,6 +104,7 @@ bool block_prefetch_running(void);
  * block_prefetch_start guard used while a real stop owns the worker join. */
 void block_prefetch_test_set_stopping(bool stopping);
 void block_prefetch_test_set_warm_hits(uint64_t value);
+void block_prefetch_test_set_nowait_misses(uint64_t value);
 #endif
 
 /* ── Stats (lock-free atomic reads) ──────────────────────────────────── */

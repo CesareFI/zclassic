@@ -89,6 +89,11 @@ static int64_t bp_json_counter(uint64_t value)
     return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
 }
 
+static uint64_t bp_counter_sum(uint64_t left, uint64_t right)
+{
+    return left > UINT64_MAX - right ? UINT64_MAX : left + right;
+}
+
 /* ── Bounded raw-body LRU (worker writes; readers under g_lru_mu) ───────── */
 struct bp_lru_entry {
     int          nFile;
@@ -559,6 +564,11 @@ void block_prefetch_test_set_warm_hits(uint64_t value)
 {
     atomic_store(&g_warm_hits, value);
 }
+
+void block_prefetch_test_set_nowait_misses(uint64_t value)
+{
+    atomic_store(&g_nowait_misses, value);
+}
 #endif
 
 bool block_prefetch_running(void)
@@ -631,7 +641,7 @@ bool block_prefetch_dump_state_json(struct json_value *out, const char *key)
     json_push_kv_int(out, "lru_bytes", bp_json_counter((uint64_t)lru_bytes));
     json_push_kv_int(out, "lru_count", (int64_t)lru_count);
 
-    uint64_t probed = hits + nowait;
+    uint64_t probed = bp_counter_sum(hits, nowait);
     double resident_rate = probed > 0 ? (double)hits / (double)probed : 0.0;
     json_push_kv_real(out, "resident_rate", resident_rate);
 
