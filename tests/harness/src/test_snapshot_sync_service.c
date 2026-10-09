@@ -6,8 +6,10 @@
 #include "net/snapshot_sync_contract.h"
 #include "services/snapshot_manifest.h"
 #include "config/db_service.h"
+#include "config/boot_internal.h"
 #include "config/boot_snapshot_offer.h"
 #include "config/runtime.h"
+#include "services/chain_state_service.h"
 #include "services/sync_trust_policy.h"
 #include "coins/utxo_commitment.h"
 #include "core/serialize.h"
@@ -107,6 +109,45 @@ static int test_boot_publish_block_swarm(void)
         ASSERT(!boot_publish_block_swarm(65, 65, 0));
         PASS();
     } _test_next:;
+    return failures;
+}
+
+/* Network service threads start before the optional offer worker decision.
+ * Keep a stale raw header in the service context and the live frontier in the
+ * repository, proving that the production decision observes the latter. */
+static int test_boot_offer_service_uses_repository_header(void)
+{
+    int failures = 0;
+    struct main_state state;
+    struct block_index repository_tip;
+    struct block_index stale_raw_tip;
+    struct block_index *repository_header = &repository_tip;
+    struct chain_state_repository repository;
+    struct boot_svc_ctx svc = {0};
+    int chain_height = 0;
+    int header_height = 0;
+
+    memset(&repository_tip, 0, sizeof(repository_tip));
+    memset(&stale_raw_tip, 0, sizeof(stale_raw_tip));
+    memset(&repository, 0, sizeof(repository));
+    repository_tip.nHeight = 2000;
+    stale_raw_tip.nHeight = 7;
+    main_state_init(&state);
+    state.pindex_best_header = &stale_raw_tip;
+    svc.state = &state;
+    csr_init(&repository, &state.map_block_index, &state.chain_active,
+             &repository_header, NULL, NULL, NULL);
+
+    TEST("offer startup reads the repository header frontier") {
+        ASSERT(boot_services_test_offer_deferred(
+            &svc, &repository, &chain_height, &header_height));
+        ASSERT(chain_height == -1);
+        ASSERT(header_height == repository_tip.nHeight);
+        PASS();
+    } _test_next:;
+
+    csr_free(&repository);
+    main_state_free(&state);
     return failures;
 }
 
@@ -2155,6 +2196,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_followups();
     failures += test_snapshot_offer_trust_policy();
     failures += test_boot_publish_block_swarm();
+    failures += test_boot_offer_service_uses_repository_header();
     failures += test_snapshot_offer_seed_cap_matches_self_derived();
     failures += test_snapshot_sync_service_builds_pow();
     failures += test_snapshot_sync_service_stream_helpers();

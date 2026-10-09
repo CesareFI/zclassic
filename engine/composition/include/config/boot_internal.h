@@ -547,6 +547,7 @@ void boot_ready_legs_describe(const struct boot_ready_legs *l,
                               char *out, size_t cap);
 
 #ifdef ZCL_TESTING
+struct chain_state_repository;
 /* Pillar 7's own refusal: a root supervisor sweep that has stopped advancing
  * withholds the systemd keepalive, so systemd restarts the process. A sweep
  * that has never run yet (heartbeat 0, very early boot) is not a wedge.
@@ -571,6 +572,14 @@ bool boot_sd_watchdog_test_connman_alive(bool msg_marker_fresh,
                                          bool dial_marker_fresh,
                                          bool dial_working,
                                          bool dial_bounded_wait_active);
+
+/* Snapshot-offer startup must read the live header frontier through the
+ * repository lock after P2P starts. */
+bool boot_services_test_offer_deferred(
+    const struct boot_svc_ctx *svc,
+    struct chain_state_repository *repository,
+    int *out_chain_height,
+    int *out_header_height);
 #endif
 
 /* ── boot_supervisor_backstop.c ──────────────────────────────────

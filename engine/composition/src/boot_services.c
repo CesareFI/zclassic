@@ -68,6 +68,7 @@
 #include "net/connman.h"
 #include "config/boot_snapshot_import.h"
 #include "storage/disk_block_io.h"
+#include <limits.h>
 #include "storage/event_log.h"
 #include "storage/mempool_projection.h"
 #include "storage/peers_projection.h"
@@ -562,6 +563,45 @@ bool boot_wallet_rebuild_probe(sqlite3 *db, bool *has_utxos, bool *has_keys)
     sqlite3_finalize(stmt);
     return false;
 }
+
+static bool boot_offer_service_is_behind_ibd(
+    const struct boot_svc_ctx *svc,
+    struct chain_state_repository *repository,
+    int *out_chain_height,
+    int *out_header_height)
+{
+    int chain_height = -1;
+    int header_height = -1;
+    int64_t repository_header_height;
+
+    if (svc && svc->state) {
+        chain_height = active_chain_height(&svc->state->chain_active);
+        repository_header_height = csr_header_height(repository);
+        if (repository_header_height >= chain_height &&
+            repository_header_height <= INT_MAX)
+            header_height = (int)repository_header_height;
+        else
+            header_height = chain_height;
+    }
+    if (out_chain_height)
+        *out_chain_height = chain_height;
+    if (out_header_height)
+        *out_header_height = header_height;
+    return (int64_t)header_height - chain_height > 1000;
+}
+
+#ifdef ZCL_TESTING
+bool boot_services_test_offer_deferred(
+    const struct boot_svc_ctx *svc,
+    struct chain_state_repository *repository,
+    int *out_chain_height,
+    int *out_header_height)
+{
+    return boot_offer_service_is_behind_ibd(svc, repository,
+                                            out_chain_height,
+                                            out_header_height);
+}
+#endif
 
 #if defined(_WIN32) && defined(__clang__)
     __attribute__((optnone)) /* Bound the Windows startup coordinator frame. */
@@ -1295,17 +1335,18 @@ bool app_init_services(struct app_context *ctx,
 
     /* Pre-compute fast sync snapshot offer in background */
     {
-        int chain_tip_h = active_chain_height(&svc->state->chain_active);
-        int best_header = svc->state->pindex_best_header ?
-            svc->state->pindex_best_header->nHeight : chain_tip_h;
-        bool behind_ibd = (best_header - chain_tip_h) > 1000;
+        int chain_tip_h = -1;
+        int best_header = -1;
+        bool behind_ibd = boot_offer_service_is_behind_ibd(
+            svc, csr_instance(), &chain_tip_h, &best_header);
 
         if (svc->defer_offer_service) {
             printf("Fast sync offer build deferred during bootstrap receiver mode\n");
         } else if (behind_ibd) {
             printf("Fast sync offer build deferred during IBD "
-                   "(chain=%d, headers=%d, behind=%d)\n",
-                   chain_tip_h, best_header, best_header - chain_tip_h);
+                   "(chain=%d, headers=%d, behind=%lld)\n",
+                   chain_tip_h, best_header,
+                   (long long)((int64_t)best_header - chain_tip_h));
         } else if (!boot_start_offer_service(svc)) {
             fprintf(stderr,
                     "WARNING: failed to start tracked snapshot-offer thread\n");
