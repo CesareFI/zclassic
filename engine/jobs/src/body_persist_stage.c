@@ -607,6 +607,18 @@ uint64_t body_persist_stage_merkle_mismatch_total(void)
     return atomic_load(&g_merkle_mismatch_total);
 }
 
+#ifdef ZCL_TESTING
+void body_persist_stage_test_set_verified_total(uint64_t value)
+{
+    atomic_store(&g_verified_total, value);
+}
+#endif
+
+static int64_t body_persist_json_counter(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
+
 bool body_persist_dump_state_json(struct json_value *out, const char *key)
 {
     (void)key;
@@ -618,19 +630,19 @@ bool body_persist_dump_state_json(struct json_value *out, const char *key)
 
     stage_dump_header(out, STAGE_NAME, g_stage);
     json_push_kv_int (out, "verified_total",
-                      (int64_t)atomic_load(&g_verified_total));
+                      body_persist_json_counter(atomic_load(&g_verified_total)));
     json_push_kv_int (out, "upstream_failed_total",
-                      (int64_t)atomic_load(&g_upstream_failed_total));
+                      body_persist_json_counter(atomic_load(&g_upstream_failed_total)));
     json_push_kv_int (out, "read_failed_total",
-                      (int64_t)atomic_load(&g_read_failed_total));
+                      body_persist_json_counter(atomic_load(&g_read_failed_total)));
     json_push_kv_int (out, "header_mismatch_total",
-                      (int64_t)atomic_load(&g_header_mismatch_total));
+                      body_persist_json_counter(atomic_load(&g_header_mismatch_total)));
     json_push_kv_int (out, "merkle_mismatch_total",
-                      (int64_t)atomic_load(&g_merkle_mismatch_total));
+                      body_persist_json_counter(atomic_load(&g_merkle_mismatch_total)));
     json_push_kv_int (out, "header_event_emit_total",
-                      (int64_t)atomic_load(&g_header_event_emit_total));
+                      body_persist_json_counter(atomic_load(&g_header_event_emit_total)));
     json_push_kv_int (out, "header_event_emit_fail_total",
-                      (int64_t)atomic_load(&g_header_event_emit_fail_total));
+                      body_persist_json_counter(atomic_load(&g_header_event_emit_fail_total)));
     json_push_kv_int (out, "last_advance_height",
                       atomic_load(&g_last_advance_height));
     json_push_kv_int (out, "last_step_unix", last);

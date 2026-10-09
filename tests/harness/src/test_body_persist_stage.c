@@ -23,6 +23,7 @@
 #include "validation/main_state.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -616,6 +617,14 @@ int test_body_persist_stage(void)
         BP_CHECK("dump: log_rows=2",
                  strstr(buf, "\"log_rows\":2") != NULL);
         json_free(&v);
+
+        body_persist_stage_test_set_verified_total(UINT64_MAX);
+        json_init(&v);
+        BP_CHECK("dump: saturates unsigned verified_total",
+                 body_persist_dump_state_json(&v, NULL) &&
+                 json_get_int(json_get(&v, "verified_total")) == INT64_MAX);
+        json_free(&v);
+        body_persist_stage_test_set_verified_total(0);
         bp_teardown(dir, &ms, &sc);
     }
 

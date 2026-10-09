@@ -42,6 +42,7 @@
 
 #include "json/json.h"
 #include "jobs/body_fetch_stage.h"
+#include "jobs/body_persist_stage.h"
 #include "services/sync_telemetry.h"
 #include "util/telemetry_ontology.h"
 #include "util/telemetry_render.h"
@@ -339,6 +340,21 @@ static int check_body_fetch_count_saturates(void)
     return failures;
 }
 
+static int check_body_persist_count_saturates(void)
+{
+    int failures = 0;
+    struct sync_snapshot snap = {0};
+
+    body_persist_stage_test_set_verified_total(UINT64_MAX);
+    bool filled = sync_dump_state_fill(&snap);
+    body_persist_stage_test_set_verified_total(0);
+
+    TS_CHECK("[sync] body persist count snapshot fills", filled);
+    TS_CHECK("[sync] body persist count saturates at INT64_MAX",
+             snap.body_persist_verified_total == INT64_MAX);
+    return failures;
+}
+
 /* ── 3. health is derived, and the view prunes output only ───────────── */
 
 static int check_renders_at_every_view(void)
@@ -546,6 +562,7 @@ int test_telemetry_sync(void)
     failures += check_table_is_annotated();
     failures += check_provider_leaves_nothing_unset();
     failures += check_body_fetch_count_saturates();
+    failures += check_body_persist_count_saturates();
     failures += check_renders_at_every_view();
     failures += check_unavailable_is_unknown_not_unhealthy();
     failures += check_ladder_ordering_rules_bite();

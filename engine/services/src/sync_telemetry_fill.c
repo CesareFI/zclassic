@@ -200,16 +200,16 @@ static void fill_bodies(struct sync_snapshot *s)
     TELEMETRY_SET_I64(s, body_persist_cursor,
                       body_persist_stage_cursor(), TELEMETRY_SRC_IN_PROCESS);
     TELEMETRY_SET_I64(s, body_persist_verified_total,
-                      body_persist_stage_verified_total(),
+                      sync_tl_count(body_persist_stage_verified_total()),
                       TELEMETRY_SRC_IN_PROCESS);
     TELEMETRY_SET_I64(s, body_persist_read_failed_total,
-                      body_persist_stage_read_failed_total(),
+                      sync_tl_count(body_persist_stage_read_failed_total()),
                       TELEMETRY_SRC_IN_PROCESS);
     TELEMETRY_SET_I64(s, body_persist_header_mismatch_total,
-                      body_persist_stage_header_mismatch_total(),
+                      sync_tl_count(body_persist_stage_header_mismatch_total()),
                       TELEMETRY_SRC_IN_PROCESS);
     TELEMETRY_SET_I64(s, body_persist_merkle_mismatch_total,
-                      body_persist_stage_merkle_mismatch_total(),
+                      sync_tl_count(body_persist_stage_merkle_mismatch_total()),
                       TELEMETRY_SRC_IN_PROCESS);
     TELEMETRY_SET_I64(s, body_persist_step_us_ewma,
                       body_persist_stage_step_us_ewma(),

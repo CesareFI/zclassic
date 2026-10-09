@@ -53,6 +53,7 @@ void body_persist_stage_set_reader(body_persist_reader_fn fn, void *user);
  * NAMES the hold (blocker body_persist.body_unfetchable). Production value is
  * 60 s; a test drives it to 0 to assert the naming without sleeping. */
 void body_persist_stage_set_unfetchable_hold_secs_for_testing(int secs);
+void body_persist_stage_test_set_verified_total(uint64_t value);
 #endif
 
 bool body_persist_dump_state_json(struct json_value *out, const char *key);
