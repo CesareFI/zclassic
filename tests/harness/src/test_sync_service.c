@@ -2417,8 +2417,8 @@ static int test_sync_service_recent_tip_bypasses_headers(void)
     return failures;
 }
 
-/* zcl.sync_benchmark.v1: TAIL_DOWNLOAD begins on the first block-assignment
- * plan, TAIL_FOLD begins on the first accepted-block note, and both end
+/* zcl.sync_benchmark.v1: TAIL_DOWNLOAD begins on the first eligible
+ * block-assignment plan, TAIL_FOLD begins on the first accepted-block note, and both end
  * (plus mark_sovereign + a single complete=true receipt write) the moment
  * syncsvc_collect_progress observes sync_state == SYNC_AT_TIP — never on any
  * other state, and never more than once. Driven on a scratch fixture
@@ -2432,14 +2432,50 @@ static int test_sync_service_benchmark_tail_phases(void)
         sync_benchmark_reset_for_test();
         sync_benchmark_init(NULL);
 
+        struct sync_block_assignment plan;
+        memset(&plan, 0, sizeof(plan));
+        syncsvc_plan_block_assignment(&plan, NULL, 0, 100000);
+        ASSERT(!plan.should_assign);
+        struct json_value rejected_dump;
+        json_init(&rejected_dump);
+        ASSERT(sync_benchmark_dump_state_json(&rejected_dump, NULL));
+        const struct json_value *rejected_timings =
+            json_get(&rejected_dump, "timings_ms");
+        const struct json_value *rejected_tail_download =
+            rejected_timings ? json_get(rejected_timings, "tail_download") : NULL;
+        ASSERT(rejected_tail_download && json_is_null(rejected_tail_download));
+        json_free(&rejected_dump);
+
+        /* `null` also represents a phase that has merely started, so carry
+         * the rejected-only path through the real terminal observation. The
+         * original planner stamped TAIL_DOWNLOAD before rejecting the NULL
+         * source; that terminal edge then turned the false stamp into a
+         * completed timing. A rejected source must remain unmeasured. */
+        struct sync_progress_snapshot rejected_terminal;
+        syncsvc_collect_progress(&rejected_terminal, NULL, SYNC_AT_TIP,
+                                 100000, 100000, 0, 0);
+        struct json_value rejected_terminal_dump;
+        json_init(&rejected_terminal_dump);
+        ASSERT(sync_benchmark_dump_state_json(&rejected_terminal_dump, NULL));
+        rejected_timings = json_get(&rejected_terminal_dump, "timings_ms");
+        rejected_tail_download =
+            rejected_timings ? json_get(rejected_timings, "tail_download") : NULL;
+        ASSERT(rejected_tail_download && json_is_null(rejected_tail_download));
+        json_free(&rejected_terminal_dump);
+
+        /* The rejected-only terminal observation consumed the one-shot
+         * sovereignty guard. Start a fresh fixture before proving that an
+         * eligible peer still begins the real body-download phase. */
+        syncsvc_sync_benchmark_reset_for_testing();
+        sync_benchmark_reset_for_test();
+        sync_benchmark_init(NULL);
+
         struct p2p_node node;
         memset(&node, 0, sizeof(node));
         node.id = 11;
         node.state = PEER_HANDSHAKE_COMPLETE;
         node.starting_height = 100200;
 
-        struct sync_block_assignment plan;
-        memset(&plan, 0, sizeof(plan));
         syncsvc_plan_block_assignment(&plan, &node, 0, 100000);
         ASSERT(plan.should_assign);
 

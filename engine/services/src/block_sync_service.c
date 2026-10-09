@@ -108,13 +108,6 @@ void syncsvc_plan_block_assignment(struct sync_block_assignment *plan,
     if (!plan) return;
     *plan = empty;
 
-    /* zcl.sync_benchmark.v1: SYNC_BENCH_TAIL_DOWNLOAD begins on this boot's
-     * first block-assignment planning call — the earliest real signal that
-     * tail body download has started. Fires at most once per process; ended
-     * (alongside TAIL_FOLD) in syncsvc_collect_progress once the frontier
-     * reaches the peer-agreed tip. */
-    sb_begin_tail_download_once();
-
     if (!node || node->state < PEER_HANDSHAKE_COMPLETE)
         return;
 
@@ -126,6 +119,12 @@ void syncsvc_plan_block_assignment(struct sync_block_assignment *plan,
      * mid-handshake oracle) stay eligible. Net policy only. */
     if (syncsvc_peer_is_behind(node, our_height))
         return;
+
+    /* zcl.sync_benchmark.v1: only an eligible body source begins this phase.
+     * Rejected planning calls are not download work and must leave the phase
+     * unmeasured. Fires at most once per process; it ends alongside
+     * TAIL_FOLD once the frontier reaches the peer-agreed tip. */
+    sb_begin_tail_download_once();
 
     /* K2: loopback peers have a wider request window. The WAN-fairness
      * cap exists to spread block-body load across strangers — neither
