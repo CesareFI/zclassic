@@ -7,6 +7,7 @@
 #include "jobs/reducer_frontier.h"
 #include "jobs/stage_repair.h"
 #include "jobs/utxo_apply_stage.h"
+#include "services/chain_state_service.h"
 #include "services/sync_monitor.h"
 #include "storage/disk_block_io.h"
 #include "storage/progress_store.h"
@@ -91,6 +92,28 @@ static struct block_index *active_target_for_hash_locked(
     return bi;
 }
 
+static struct block_index *body_fetch_header_tip_snapshot(
+    struct main_state *ms)
+{
+    struct block_index *tip = csr_header_tip_snapshot(csr_instance());
+#ifdef ZCL_TESTING
+    if (!tip && ms)
+        tip = ms->pindex_best_header;
+#else
+    (void)ms;
+#endif
+    return tip;
+}
+
+static struct block_index *body_fetch_target_header_tip(
+    enum bfmhd_target_route route,
+    struct main_state *ms)
+{
+    if (route != BFMHD_TARGET_BEST_HEADER)
+        return NULL;
+    return body_fetch_header_tip_snapshot(ms);
+}
+
 static bool target_has_readable_data(
     sqlite3 *db, struct main_state *ms, int target,
     enum bfmhd_target_route route,
@@ -107,12 +130,12 @@ static bool target_has_readable_data(
     }
 
     bool readable = false;
+    struct block_index *header_tip = body_fetch_target_header_tip(route, ms);
     zcl_mutex_lock(&ms->cs_main);
     struct block_index *bi = NULL;
     if (route == BFMHD_TARGET_BEST_HEADER) {
-        if (ms->pindex_best_header &&
-            target <= ms->pindex_best_header->nHeight)
-            bi = block_index_get_ancestor(ms->pindex_best_header, target);
+        if (header_tip && target <= header_tip->nHeight)
+            bi = block_index_get_ancestor(header_tip, target);
     } else {
         bi = active_target_for_hash_locked(ms, target, expected_hash);
     }
@@ -376,6 +399,12 @@ void body_fetch_missing_have_data_test_reset(void)
 int body_fetch_missing_have_data_test_remedy_calls(void)
 {
     return atomic_load(&g_remedy_calls);
+}
+
+int body_fetch_missing_have_data_test_header_height(struct main_state *ms)
+{
+    struct block_index *tip = body_fetch_header_tip_snapshot(ms);
+    return tip ? tip->nHeight : -1; /* raw-return-ok:sentinel */
 }
 
 const char *body_fetch_missing_have_data_test_last_skip_reason(void)

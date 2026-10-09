@@ -3,6 +3,7 @@
 #include "test/test_core.h"
 
 #include "conditions/body_fetch_missing_have_data.h"
+#include "services/chain_state_service.h"
 #include "core/arith_uint256.h"
 #include "framework/condition.h"
 #include "jobs/reducer_frontier.h"
@@ -301,10 +302,29 @@ static bool queue_has_target(struct bfmhd_fixture *fx)
            uint256_eq(&fx->dm.queue[0], fx->child->phashBlock);
 }
 
+static bool body_fetch_witness_uses_published_csr_header(void)
+{
+    struct bfmhd_fixture fx;
+    if (!setup_fixture(&fx, "csr_witness_header"))
+        return false;
+    struct block_index *published = fx.child;
+    csr_init(csr_instance(), &fx.ms.map_block_index, &fx.ms.chain_active,
+             &published, NULL, NULL, NULL);
+    fx.ms.pindex_best_header = fx.tip;
+    bool ok = body_fetch_missing_have_data_test_header_height(&fx.ms) ==
+        fx.target;
+    csr_test_reset_singleton();
+    teardown_fixture(&fx);
+    return ok;
+}
+
 int test_body_fetch_missing_have_data_condition(void)
 {
     printf("\n=== body_fetch_missing_have_data condition tests ===\n");
     int failures = 0;
+
+    BFMHD_CHECK("body witness uses the published csr header",
+                body_fetch_witness_uses_published_csr_header());
 
     {
         struct bfmhd_fixture fx;
