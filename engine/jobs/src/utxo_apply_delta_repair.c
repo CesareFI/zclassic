@@ -121,8 +121,9 @@ static bool prove_exact_future_coin_suffix(
     utxo_apply_reader_fn reader, void *reader_user,
     int first, int last, int64_t actual_rows)
 {
-    if (!ms || !datadir || last < first ||
-        last - first + 1 > UNAPPLIED_COIN_SUFFIX_REPAIR_MAX_BLOCKS) {
+    int64_t span = (int64_t)last - (int64_t)first + 1;
+    if (!ms || !datadir || first < 0 || last < first || span <= 0 ||
+        span > UNAPPLIED_COIN_SUFFIX_REPAIR_MAX_BLOCKS) {
         LOG_WARN("utxo_apply",
                  "[utxo_apply] future coin repair refused range=[%d,%d] "
                  "cap=%d main_state=%p datadir=%p",
@@ -132,7 +133,8 @@ static bool prove_exact_future_coin_suffix(
     }
 
     int64_t expected_rows = 0;
-    for (int h = first; h <= last; h++) {
+    for (int64_t offset = 0; offset < span; offset++) {
+        int h = first + (int)offset;
         struct block_index *bi = stage_body_index_at(ms, h);
         struct block blk;
         block_init(&blk);

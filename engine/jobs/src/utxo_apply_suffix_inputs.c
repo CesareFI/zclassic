@@ -150,7 +150,8 @@ bool utxo_apply_restore_suffix_inputs(
     bool ok = true;
     *restored_out = 0;
     *already_live_out = 0;
-    for (int h = scan_first; h <= last && ok; h++) {
+    for (int64_t h64 = scan_first; h64 <= (int64_t)last && ok; h64++) {
+        int h = (int)h64;
         struct block_index *bi = stage_body_index_at(ms, h);
         struct block blk;
         block_init(&blk);

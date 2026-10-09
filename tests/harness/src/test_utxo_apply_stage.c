@@ -1574,6 +1574,34 @@ int test_utxo_apply_stage(void)
         uv_teardown(dir, &ms, &sc);
     }
 
+    /* A corrupt coins projection can name a sparse suffix through INT_MAX.
+     * Recovery must refuse the range before attempting to walk it; accepting
+     * the old int subtraction wrapped the bounded-repair cap. */
+    {
+        char dir[256]; struct main_state ms; struct synth_chain_uv sc;
+        UV_CHECK("coin suffix range: setup",
+                 uv_setup("coin_suffix_range", 1, UV_FAIL_NONE, -1, dir,
+                          sizeof(dir), &ms, &sc) == 0);
+        UV_CHECK("coin suffix range: establish cursor one",
+                 utxo_apply_stage_drain(1) == 1 &&
+                     utxo_apply_stage_cursor() == 1);
+        sqlite3 *db = progress_store_db();
+        utxo_apply_stage_shutdown();
+        uint8_t low_hash[32] = {1};
+        uint8_t high_hash[32] = {2};
+        UV_CHECK("coin suffix range: seed sparse future rows",
+                 coins_kv_add(db, low_hash, 0, 1, 1, false, NULL, 0) &&
+                     coins_kv_add(db, high_hash, 0, 1, INT_MAX, false,
+                                  NULL, 0));
+        UV_CHECK("coin suffix range: restart fails closed on overflowed span",
+                 !utxo_apply_stage_init(&ms) &&
+                     uv_coin_rows_at(db, 1) == 1 &&
+                     uv_coin_rows_at(db, INT_MAX) == 1 &&
+                     stage_cursor_persisted(db, "utxo_apply",
+                                            "coin_suffix_range") == 1);
+        uv_teardown(dir, &ms, &sc);
+    }
+
     /* A proved suffix may contain transparent spends.  Reconstruct each
      * missing pre-suffix coin from created_outputs plus its canonical creator
      * block, in the same transaction that removes the future outputs. */
