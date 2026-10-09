@@ -11,6 +11,8 @@
 #include "primitives/block.h"
 #include "primitives/transaction.h"
 #include "jobs/body_persist_stage.h"
+#include "jobs/stage_body_index.h"
+#include "services/chain_state_service.h"
 #include "storage/block_parse_cache.h"
 #include "storage/disk_block_io.h"
 #include "storage/progress_store.h"
@@ -276,6 +278,11 @@ static int bp_setup(const char *tag, int n, int upstream_fail_height,
     active_chain_init(&ms->chain_active);
     if (!synth_chain_bp_build(sc, n)) return 2;
     active_chain_move_window_tip(&ms->chain_active, &sc->blocks[n - 1]);
+    /* Exercise stage_body_index_at through its production CSR frontier
+     * capture.  The fixture is sequential, so resetting the singleton in
+     * teardown cannot overlap another repository user. */
+    csr_init(csr_instance(), &ms->map_block_index, &ms->chain_active,
+             &ms->pindex_best_header, NULL, NULL, NULL);
 
     if (!seed_body_fetch(progress_store_db(), n, upstream_fail_height,
                          missing_row_height))
@@ -289,6 +296,7 @@ static void bp_teardown(const char *dir, struct main_state *ms,
                         struct synth_chain_bp *sc)
 {
     body_persist_stage_shutdown();
+    csr_test_reset_singleton();
     active_chain_free(&ms->chain_active);
     synth_chain_bp_free(sc);
     progress_store_close();
@@ -376,6 +384,29 @@ out_datadir:
     return result;
 }
 
+static int test_bp_rejects_detached_frontier(void)
+{
+    int failures = 0;
+    char dir[256];
+    struct main_state ms;
+    struct main_state detached;
+    struct synth_chain_bp sc;
+    memset(&detached, 0, sizeof(detached));
+    BP_CHECK("frontier binding: setup",
+             bp_setup("frontier_binding", 2, -1, -1, dir, sizeof(dir),
+                      &ms, &sc) == 0);
+    /* A singleton rebound to another lifecycle must not authorize this
+     * stage's raw active/header fields.  The old resolver returned its
+     * active-window entry; the repository snapshot rejects the mismatch. */
+    csr_init(csr_instance(), &detached.map_block_index,
+             &detached.chain_active, &detached.pindex_best_header,
+             NULL, NULL, NULL);
+    BP_CHECK("frontier binding: detached state fails closed",
+             stage_body_index_at(&ms, 0) == NULL);
+    bp_teardown(dir, &ms, &sc);
+    return failures;
+}
+
 int test_body_persist_stage(void);
 int test_body_persist_stage(void)
 {
@@ -383,6 +414,7 @@ int test_body_persist_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    failures += test_bp_rejects_detached_frontier();
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_bp sc;
