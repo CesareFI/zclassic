@@ -193,6 +193,11 @@ void chain_tip_watchdog_test_set_main_state(struct main_state *ms);
  * against synthetic block-index shapes. */
 const char *chain_tip_watchdog_test_stall_cause(void);
 
+/* Run the production observed-work frontier calculation against the injected
+ * main state.  Tests use this to prove header observations go through the
+ * chain-state repository rather than a raw publisher slot. */
+bool chain_tip_watchdog_test_observed_work_frontier(int64_t *frontier_out);
+
 /* Suppress the real process_block_revalidate call in the selection-wedge
  * remedy path (which would reach the quorum oracle / activation controller),
  * so a test observes only that the remedy was DRIVEN (fires_selection_remedy)

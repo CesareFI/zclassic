@@ -22,6 +22,7 @@
 
 #include "platform/time_compat.h"
 #include "services/chain_tip_watchdog.h"
+#include "services/chain_state_service.h"
 
 #include "supervisors/domains.h"
 #include "validation/chainstate.h"
@@ -97,6 +98,24 @@ static _Atomic uint64_t g_restarts_suppressed_at_tip = 0;
 static _Atomic bool    g_test_suppress_selection_remedy = false;
 static _Atomic int64_t g_selection_remedy_last_target   = -1;
 #endif
+
+/* The header publisher owns pindex_best_header through the chain-state
+ * repository.  A watchdog tick must snapshot it through that authority: a
+ * raw read can race a header publication and turn useful work into a false
+ * caught-up observation.  Block-index instances have process lifetime, so
+ * the returned pointer remains valid after the repository lock is released. */
+static struct block_index *wd_header_tip_snapshot(void)
+{
+    struct block_index *tip = csr_header_tip_snapshot(csr_instance());
+#ifdef ZCL_TESTING
+    /* Hermetic watchdog tests that do not wire the process singleton retain
+     * their existing local fixture path.  Production never reads the raw
+     * publisher slot here. */
+    if (!tip && g_ms)
+        tip = g_ms->pindex_best_header;
+#endif
+    return tip;
+}
 
 static _Atomic int64_t  g_thr_mirror   = CHAIN_TIP_WD_DEFAULT_MIRROR_SECS;
 static _Atomic int64_t  g_thr_reserved = CHAIN_TIP_WD_DEFAULT_RESERVED_SECS;
@@ -323,7 +342,7 @@ static const char *wd_deterministic_stall_cause(void)
      * generic deterministic causes below. */
     if (g_ms) {
         struct block_index *tip = active_chain_tip(&g_ms->chain_active);
-        struct block_index *bh  = g_ms->pindex_best_header;
+        struct block_index *bh = wd_header_tip_snapshot();
         if (tip && bh && bh->nHeight > tip->nHeight) {
             struct block_index *succ =
                 block_index_get_ancestor(bh, tip->nHeight + 1);
@@ -407,7 +426,7 @@ static bool wd_observed_work_frontier(int64_t *frontier_out)
         return false;
 
     int64_t frontier = (int64_t)active_chain_height(&g_ms->chain_active);
-    struct block_index *best_header = g_ms->pindex_best_header;
+    struct block_index *best_header = wd_header_tip_snapshot();
     if (best_header && (int64_t)best_header->nHeight > frontier)
         frontier = (int64_t)best_header->nHeight;
     if (frontier < 0)
@@ -785,6 +804,11 @@ void chain_tip_watchdog_test_set_main_state(struct main_state *ms)
 const char *chain_tip_watchdog_test_stall_cause(void)
 {
     return wd_deterministic_stall_cause();
+}
+
+bool chain_tip_watchdog_test_observed_work_frontier(int64_t *frontier_out)
+{
+    return wd_observed_work_frontier(frontier_out);
 }
 
 void chain_tip_watchdog_test_set_suppress_selection_remedy(bool suppress)

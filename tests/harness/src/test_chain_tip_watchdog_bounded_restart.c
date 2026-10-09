@@ -23,6 +23,7 @@
 
 #include "config/boot_background_workers.h"
 #include "services/chain_tip_watchdog.h"
+#include "services/chain_state_service.h"
 #include "services/sticky_escalator.h"
 #include "storage/progress_store.h"
 #include "event/event.h"
@@ -127,6 +128,55 @@ static int wd_check_boot_worker_supervisor_restart(void)
              second != SUPERVISOR_INVALID_ID &&
              !atomic_load(&g_restart_worker_contract.completed));
     boot_complete_worker_supervisor(&g_restart_worker_id);
+    return failures;
+}
+
+/* The header publisher is the chain-state repository.  Keep the legacy
+ * main-state slot at tip while the repository publishes next: raw reads report
+ * frontier=1 and miss the failed successor, whereas the production snapshot
+ * must report frontier=2 and classify the wedge. */
+static int wd_check_repository_header_snapshot(void)
+{
+    int failures = 0;
+    blocker_reset_for_testing();
+    sticky_escalator_test_reset();
+    chain_tip_watchdog_test_reset_runtime();
+    csr_test_reset_singleton();
+
+    struct main_state ms;
+    memset(&ms, 0, sizeof(ms));
+    main_state_init(&ms);
+    struct block_index *g = wd_mk_idx(&ms, 0, 1, 0x60, NULL);
+    struct block_index *tip = wd_mk_idx(&ms, 1, 10, 0x61, g);
+    struct block_index *next = wd_mk_idx(&ms, 2, 20, 0x62, tip);
+    WD_CHECK("repository-header fixture built", g && tip && next);
+    if (g && tip && next) {
+        active_chain_move_window_tip(&ms.chain_active, g);
+        active_chain_move_window_tip(&ms.chain_active, tip);
+        ms.pindex_best_header = tip; /* deliberately stale raw slot */
+        struct block_index *published = next;
+        csr_init(csr_instance(), &ms.map_block_index, &ms.chain_active,
+                 &published, NULL, NULL, NULL);
+        chain_tip_watchdog_test_set_main_state(&ms);
+
+        int64_t frontier = -1;
+        WD_CHECK("frontier observes repository-published header",
+                 chain_tip_watchdog_test_observed_work_frontier(&frontier) &&
+                 frontier == next->nHeight);
+        next->nStatus |= BLOCK_FAILED_VALID;
+        const char *cause = chain_tip_watchdog_test_stall_cause();
+        WD_CHECK("cause probe observes repository-published successor",
+                 cause && strcmp(cause, "tip_selection_wedge") == 0);
+        chain_tip_watchdog_test_set_main_state(NULL);
+        csr_test_reset_singleton();
+    }
+    wd_free_idx(next);
+    wd_free_idx(tip);
+    wd_free_idx(g);
+    main_state_free(&ms);
+    blocker_reset_for_testing();
+    sticky_escalator_test_reset();
+    chain_tip_watchdog_test_reset_runtime();
     return failures;
 }
 
@@ -787,6 +837,8 @@ int test_chain_tip_watchdog_bounded_restart(void)
         sticky_escalator_test_reset();
         chain_tip_watchdog_test_reset_runtime();
     }
+
+    failures += wd_check_repository_header_snapshot();
 
     /* Leave global state clean for the next test. */
     chain_tip_watchdog_test_reset_runtime();
