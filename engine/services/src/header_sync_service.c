@@ -18,7 +18,7 @@
 #include "util/log_macros.h"
 #include "util/safe_alloc.h"
 
-static int g_getheaders_log_count = 0;
+static atomic_uint g_getheaders_log_count = 0;
 static atomic_bool g_block_file_scan_triggered = false;
 
 /* Fold stale-peer backoffs into one 60s summary; atomic state keeps the
@@ -514,12 +514,18 @@ enum sync_header_log_mode syncsvc_header_log_mode(
         return SYNC_HEADER_LOG_NONE;
 
     if (in_ibd) {
-        if (g_getheaders_log_count++ % 10 == 0)
+        if (atomic_fetch_add_explicit(&g_getheaders_log_count, 1U,
+                                      memory_order_relaxed) % 10U == 0U)
             return SYNC_HEADER_LOG_IBD;
         return SYNC_HEADER_LOG_NONE;
     }
 
     return SYNC_HEADER_LOG_TIP;
+}
+
+void syncsvc_header_log_reset_for_testing(void)
+{
+    atomic_store_explicit(&g_getheaders_log_count, 0U, memory_order_relaxed);
 }
 
 bool syncsvc_should_activate_after_block_file_scan(int scanned_blocks)
