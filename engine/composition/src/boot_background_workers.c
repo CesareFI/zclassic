@@ -233,9 +233,12 @@ bool boot_start_payment_service(struct boot_svc_ctx *svc)
     boot_register_worker_supervisor(&g_payment_sup_id, &g_payment_contract,
                                     &g_op_sup, "op.payment_processor",
                                     PAYMENT_SUPERVISOR_DEADLINE_SEC, 0);
-    return boot_start_thread_service(&svc->payment_thread,
-                                     &svc->payment_thread_started,
-                                     payment_processor_thread, svc);
+    bool started = boot_start_thread_service(&svc->payment_thread,
+                                             &svc->payment_thread_started,
+                                             payment_processor_thread, svc);
+    if (!started)
+        boot_retire_worker_supervisor(&g_payment_sup_id);
+    return started;
 }
 
 void boot_join_payment_service(struct boot_svc_ctx *svc)
@@ -255,9 +258,12 @@ bool boot_start_address_backfill_service(struct boot_svc_ctx *svc)
                                     &g_address_backfill_contract, &g_chain_sup,
                                     "chain.address_backfill",
                                     ADDRESS_BACKFILL_SUPERVISOR_DEADLINE_SEC, 0);
-    return boot_start_thread_service(&svc->address_backfill_thread,
-                                     &svc->address_backfill_thread_started,
-                                     address_backfill_service_thread, svc);
+    bool started = boot_start_thread_service(&svc->address_backfill_thread,
+                                             &svc->address_backfill_thread_started,
+                                             address_backfill_service_thread, svc);
+    if (!started)
+        boot_retire_worker_supervisor(&g_address_backfill_sup_id);
+    return started;
 }
 
 void boot_join_address_backfill_service(struct boot_svc_ctx *svc)
@@ -619,9 +625,12 @@ bool boot_start_hodl_history_service(struct boot_svc_ctx *svc)
                                     "op.hodl_history",
                                     HODL_HISTORY_SUPERVISOR_DEADLINE_SEC, 0);
     svc->hodl_history_thread_stop = false;
-    return boot_start_thread_service(&svc->hodl_history_thread,
-                                     &svc->hodl_history_thread_started,
-                                     hodl_history_worker_thread, svc);
+    bool started = boot_start_thread_service(&svc->hodl_history_thread,
+                                             &svc->hodl_history_thread_started,
+                                             hodl_history_worker_thread, svc);
+    if (!started)
+        boot_retire_worker_supervisor(&g_hodl_history_sup_id);
+    return started;
 }
 
 void boot_join_hodl_history_service(struct boot_svc_ctx *svc)
@@ -644,9 +653,12 @@ bool boot_start_projection_backfill_service(struct boot_svc_ctx *svc)
                                     PROJECTION_BACKFILL_SUPERVISOR_DEADLINE_SEC,
                                     PROJECTION_BACKFILL_PROGRESS_QUIET_US);
     svc->projection_backfill_thread_stop = false;
-    return boot_start_thread_service(&svc->projection_backfill_thread,
-                                     &svc->projection_backfill_thread_started,
-                                     projection_backfill_service_thread, svc);
+    bool started = boot_start_thread_service(&svc->projection_backfill_thread,
+                                             &svc->projection_backfill_thread_started,
+                                             projection_backfill_service_thread, svc);
+    if (!started)
+        boot_retire_worker_supervisor(&g_projection_backfill_sup_id);
+    return started;
 }
 
 void boot_join_projection_backfill_service(struct boot_svc_ctx *svc)

@@ -57,9 +57,12 @@ bool boot_start_replay_service(struct boot_svc_ctx *svc)
                                     &g_utxo_replay_contract, &g_chain_sup,
                                     "chain.background_utxo_replay",
                                     UTXO_REPLAY_SUPERVISOR_DEADLINE_SEC, 0);
-    return boot_start_thread_service(&svc->replay_thread,
-                                     &svc->replay_thread_started,
-                                     background_utxo_replay, svc);
+    bool started = boot_start_thread_service(&svc->replay_thread,
+                                             &svc->replay_thread_started,
+                                             background_utxo_replay, svc);
+    if (!started)
+        boot_retire_worker_supervisor(&g_utxo_replay_sup_id);
+    return started;
 }
 
 void boot_join_replay_service(struct boot_svc_ctx *svc)
