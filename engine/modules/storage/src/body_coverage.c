@@ -11,6 +11,7 @@
 #include "util/safe_alloc.h"
 #include "util/sync.h"
 
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -558,16 +559,20 @@ void body_coverage_scheduler_clear_no_source(struct body_coverage_scheduler *s)
 static struct body_coverage_map       g_bc_map;
 static struct body_coverage_scheduler g_bc_sched;
 static zcl_mutex_t                     g_bc_lock;
-static bool                            g_bc_inited = false;
+static zcl_once_t                      g_bc_once = ZCL_ONCE_INIT;
+static _Atomic bool                    g_bc_inited = false;
 
-static void bc_global_init_once(void)
+static void bc_global_init(void)
 {
-    if (g_bc_inited)
-        return;
     zcl_mutex_init(&g_bc_lock);
     body_coverage_init(&g_bc_map);
     body_coverage_scheduler_init(&g_bc_sched);
-    g_bc_inited = true;
+    atomic_store_explicit(&g_bc_inited, true, memory_order_release);
+}
+
+static void bc_global_init_once(void)
+{
+    (void)zcl_once_call(&g_bc_once, bc_global_init);
 }
 
 struct body_coverage_map *body_coverage_global_map(void)
@@ -590,7 +595,7 @@ void body_coverage_global_lock(void)
 
 void body_coverage_global_unlock(void)
 {
-    if (!g_bc_inited)
+    if (!atomic_load_explicit(&g_bc_inited, memory_order_acquire))
         return;
     zcl_mutex_unlock(&g_bc_lock);
 }

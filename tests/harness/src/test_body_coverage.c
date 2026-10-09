@@ -13,10 +13,11 @@
 #include "net/download.h"
 #include "core/uint256.h"
 
-#include <sqlite3.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sqlite3.h>
 
 /* ── Pure range algebra ─────────────────────────────────────────── */
 
@@ -73,6 +74,66 @@ static int test_bc_insert_left_adjacency(void)
         ASSERT(body_coverage_contains(&m, 200));
         ASSERT(body_coverage_total_covered(&m) == 111);
         body_coverage_free(&m);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+struct tbc_global_init_ctx {
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    size_t waiting;
+    bool go;
+    struct body_coverage_map *maps[2];
+};
+
+struct tbc_global_init_arg {
+    struct tbc_global_init_ctx *ctx;
+    size_t slot;
+};
+
+static void *tbc_get_global_map(void *opaque)
+{
+    struct tbc_global_init_arg *arg = opaque;
+
+    pthread_mutex_lock(&arg->ctx->lock);
+    arg->ctx->waiting++;
+    pthread_cond_signal(&arg->ctx->ready);
+    while (!arg->ctx->go)
+        pthread_cond_wait(&arg->ctx->ready, &arg->ctx->lock);
+    pthread_mutex_unlock(&arg->ctx->lock);
+    arg->ctx->maps[arg->slot] = body_coverage_global_map();
+    return NULL;
+}
+
+static int test_bc_global_init_is_thread_safe(void)
+{
+    int failures = 0;
+    TEST("global coverage map initializes once under concurrent first use") {
+        struct tbc_global_init_ctx ctx;
+        struct tbc_global_init_arg args[2] = {
+            { .ctx = &ctx, .slot = 0 },
+            { .ctx = &ctx, .slot = 1 },
+        };
+        pthread_t threads[2];
+        ASSERT_EQ(pthread_mutex_init(&ctx.lock, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&ctx.ready, NULL), 0);
+        ASSERT_EQ(pthread_create(&threads[0], NULL, tbc_get_global_map,
+                                 &args[0]), 0);
+        ASSERT_EQ(pthread_create(&threads[1], NULL, tbc_get_global_map,
+                                 &args[1]), 0);
+        ASSERT_EQ(pthread_mutex_lock(&ctx.lock), 0);
+        while (ctx.waiting < 2)
+            ASSERT_EQ(pthread_cond_wait(&ctx.ready, &ctx.lock), 0);
+        ctx.go = true;
+        ASSERT_EQ(pthread_cond_broadcast(&ctx.ready), 0);
+        ASSERT_EQ(pthread_mutex_unlock(&ctx.lock), 0);
+        ASSERT_EQ(pthread_join(threads[0], NULL), 0);
+        ASSERT_EQ(pthread_join(threads[1], NULL), 0);
+        ASSERT_EQ(pthread_cond_destroy(&ctx.ready), 0);
+        ASSERT_EQ(pthread_mutex_destroy(&ctx.lock), 0);
+        ASSERT(ctx.maps[0] != NULL);
+        ASSERT(ctx.maps[0] == ctx.maps[1]);
         PASS();
     } _test_next:;
     return failures;
@@ -468,6 +529,7 @@ int test_body_coverage(void)
     int failures = 0;
     failures += test_bc_insert_disjoint_and_merge();
     failures += test_bc_insert_left_adjacency();
+    failures += test_bc_global_init_is_thread_safe();
     failures += test_bc_remove_split_and_edges();
     failures += test_bc_note_stored_pruned();
     failures += test_bc_find_first_hole();
