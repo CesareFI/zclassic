@@ -84,14 +84,14 @@ bool boot_start_offer_service(struct boot_svc_ctx *svc)
                                              &svc->offer_thread_started,
                                              build_snapshot_offer_thread, svc);
     if (!started)
-        boot_complete_worker_supervisor(&g_offer_sup_id);
+        boot_retire_worker_supervisor(&g_offer_sup_id);
     return started;
 }
 
 #ifdef ZCL_TESTING
-bool boot_snapshot_offer_test_supervisor_completed(void)
+bool boot_snapshot_offer_test_supervisor_retired(void)
 {
-    return atomic_load(&g_offer_contract.completed);
+    return atomic_load(&g_offer_sup_id) == SUPERVISOR_INVALID_ID;
 }
 #endif
 

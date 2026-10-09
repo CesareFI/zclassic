@@ -342,7 +342,7 @@ static int test_snapshot_offer_start_failure_retires_supervisor(void)
         boot_test_fail_next_thread_start();
         ASSERT(!boot_start_offer_service(&svc));
         ASSERT(!svc.offer_thread_started);
-        ASSERT(boot_snapshot_offer_test_supervisor_completed());
+        ASSERT(boot_snapshot_offer_test_supervisor_retired());
         PASS();
     } _test_next:;
     return failures;

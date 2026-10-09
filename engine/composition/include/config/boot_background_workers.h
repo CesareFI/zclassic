@@ -94,6 +94,10 @@ void boot_worker_clear_stall_blocker(const struct liveness_contract *c);
  * and the register helper remains idempotent. */
 void boot_complete_worker_supervisor(_Atomic supervisor_child_id *slot);
 
+/* Retire a registration that never acquired a worker. Unlike completion this
+ * clears the slot, so a later start attempt receives a fresh observer. */
+void boot_retire_worker_supervisor(_Atomic supervisor_child_id *slot);
+
 /* Store payment processor (store profile). Its runtime-kernel start/stop
  * adapters live in boot_frontend_services.c beside store RPC composition. */
 bool boot_start_payment_service(struct boot_svc_ctx *svc);

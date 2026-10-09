@@ -114,3 +114,12 @@ void boot_complete_worker_supervisor(_Atomic supervisor_child_id *slot)
         return;
     supervisor_child_complete(id);
 }
+
+void boot_retire_worker_supervisor(_Atomic supervisor_child_id *slot)
+{
+    if (!slot)
+        return;
+    supervisor_child_id id = atomic_exchange(slot, SUPERVISOR_INVALID_ID);
+    if (id != SUPERVISOR_INVALID_ID)
+        supervisor_unregister(id);
+}

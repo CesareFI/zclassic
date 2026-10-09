@@ -76,8 +76,8 @@ void boot_snapshot_offer_test_set_trust_override(int value);
  * Release builds have no such symbol. */
 void boot_snapshot_offer_test_set_publication_override(int value);
 
-/* True after a forced worker-start failure has retired its observer. */
-bool boot_snapshot_offer_test_supervisor_completed(void);
+/* True when a forced worker-start failure leaves no observer registration. */
+bool boot_snapshot_offer_test_supervisor_retired(void);
 #endif
 
 /* Fast-sync snapshot offer + chunk/block manifest builder. */
