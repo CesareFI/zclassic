@@ -34,6 +34,7 @@
 #include "jobs/reducer_frontier.h"
 #include "net/file_service.h"
 #include "net/fast_sync.h"
+#include "services/chain_state_service.h"
 #include "services/sync_trust_policy.h"
 #include "storage/anchor_kv.h"
 #include "storage/coins_kv.h"
@@ -133,6 +134,52 @@ bool boot_publish_block_swarm(int32_t body_height, int32_t header_height,
     return true;
 }
 
+static void boot_block_swarm_heights_from_repository(
+    const struct boot_svc_ctx *svc,
+    struct chain_state_repository *repository,
+    int32_t *out_body_height,
+    int32_t *out_header_height)
+{
+    int32_t body_h = 0;
+    int32_t header_h = 0;
+    int64_t repository_header_h;
+
+    if (svc && svc->state) {
+        body_h = active_chain_height(&svc->state->chain_active);
+        repository_header_h = csr_header_height(repository);
+        if (repository_header_h >= 0 && repository_header_h <= INT32_MAX)
+            header_h = (int32_t)repository_header_h;
+    }
+    if (header_h < body_h)
+        header_h = body_h;
+    if (out_body_height)
+        *out_body_height = body_h;
+    if (out_header_height)
+        *out_header_height = header_h;
+}
+
+static void boot_block_swarm_heights(const struct boot_svc_ctx *svc,
+                                     int32_t *out_body_height,
+                                     int32_t *out_header_height)
+{
+    boot_block_swarm_heights_from_repository(svc, csr_instance(),
+                                             out_body_height,
+                                             out_header_height);
+}
+
+#ifdef ZCL_TESTING
+void boot_snapshot_offer_test_block_swarm_heights(
+    struct boot_svc_ctx *svc,
+    struct chain_state_repository *repository,
+    int32_t *out_body_height,
+    int32_t *out_header_height)
+{
+    boot_block_swarm_heights_from_repository(svc, repository,
+                                             out_body_height,
+                                             out_header_height);
+}
+#endif
+
 static void boot_try_publish_block_swarm(struct boot_svc_ctx *svc,
                                          const char *datadir)
 {
@@ -140,13 +187,7 @@ static void boot_try_publish_block_swarm(struct boot_svc_ctx *svc,
     int32_t header_h = 0;
     struct block_piece_manifest block_manifest;
 
-    if (svc && svc->state) {
-        body_h = active_chain_height(&svc->state->chain_active);
-        if (svc->state->pindex_best_header)
-            header_h = svc->state->pindex_best_header->nHeight;
-    }
-    if (header_h < body_h)
-        header_h = body_h;
+    boot_block_swarm_heights(svc, &body_h, &header_h);
     if (!boot_publish_block_swarm(body_h, header_h, BLOCKS_PER_PIECE))
         return;
     if (!datadir || datadir[0] == '\0')

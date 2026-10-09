@@ -28,6 +28,7 @@
 #include <stdint.h>
 
 struct boot_svc_ctx;
+struct chain_state_repository;
 
 /* Pure trust policy behind snapshot re-serving. Assisted state is never
  * advertised: transparent state must be self-derived at H*, and every
@@ -75,6 +76,14 @@ void boot_snapshot_offer_test_set_trust_override(int value);
  * second gate off to prove that state trust alone grants no serving authority.
  * Release builds have no such symbol. */
 void boot_snapshot_offer_test_set_publication_override(int value);
+
+/* Exercises the production block-swarm height snapshot.  Tests use this
+ * narrow seam to verify that the snapshot reads the header frontier through
+ * the chain-state repository rather than racing its publisher. */
+void boot_snapshot_offer_test_block_swarm_heights(struct boot_svc_ctx *svc,
+                                                  struct chain_state_repository *repository,
+                                                  int32_t *out_body_height,
+                                                  int32_t *out_header_height);
 #endif
 
 /* Fast-sync snapshot offer + chunk/block manifest builder. */

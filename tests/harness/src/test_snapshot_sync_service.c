@@ -6,8 +6,10 @@
 #include "net/snapshot_sync_contract.h"
 #include "services/snapshot_manifest.h"
 #include "config/db_service.h"
+#include "config/boot_internal.h"
 #include "config/boot_snapshot_offer.h"
 #include "config/runtime.h"
+#include "services/chain_state_service.h"
 #include "services/sync_trust_policy.h"
 #include "coins/utxo_commitment.h"
 #include "core/serialize.h"
@@ -107,6 +109,48 @@ static int test_boot_publish_block_swarm(void)
         ASSERT(!boot_publish_block_swarm(65, 65, 0));
         PASS();
     } _test_next:;
+    return failures;
+}
+
+/* The offer worker runs after the chain-state repository is wired, while
+ * header reception can continue publishing a newer tip.  Deliberately give
+ * the service context a stale raw slot and the repository its live slot: this
+ * proves the production height snapshot reads the repository accessor rather
+ * than dereferencing main_state::pindex_best_header directly. */
+static int test_boot_block_swarm_uses_repository_header_snapshot(void)
+{
+    int failures = 0;
+    struct main_state state;
+    struct block_index repository_tip;
+    struct block_index stale_raw_tip;
+    struct block_index *repository_header = &repository_tip;
+    struct chain_state_repository repository;
+    struct boot_svc_ctx svc = {0};
+    int32_t body_height = 0;
+    int32_t header_height = 0;
+
+    memset(&repository_tip, 0, sizeof(repository_tip));
+    memset(&stale_raw_tip, 0, sizeof(stale_raw_tip));
+    repository_tip.nHeight = 321;
+    stale_raw_tip.nHeight = 7;
+    main_state_init(&state);
+    state.pindex_best_header = &stale_raw_tip;
+    svc.state = &state;
+
+    memset(&repository, 0, sizeof(repository));
+    csr_init(&repository, &state.map_block_index, &state.chain_active,
+             &repository_header, NULL, NULL, NULL);
+
+    TEST("block swarm snapshots the repository header frontier") {
+        boot_snapshot_offer_test_block_swarm_heights(
+            &svc, &repository, &body_height, &header_height);
+        ASSERT(body_height == -1);
+        ASSERT(header_height == repository_tip.nHeight);
+        PASS();
+    } _test_next:;
+
+    csr_free(&repository);
+    main_state_free(&state);
     return failures;
 }
 
@@ -2155,6 +2199,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_followups();
     failures += test_snapshot_offer_trust_policy();
     failures += test_boot_publish_block_swarm();
+    failures += test_boot_block_swarm_uses_repository_header_snapshot();
     failures += test_snapshot_offer_seed_cap_matches_self_derived();
     failures += test_snapshot_sync_service_builds_pow();
     failures += test_snapshot_sync_service_stream_helpers();
