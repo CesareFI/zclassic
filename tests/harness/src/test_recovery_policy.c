@@ -23,6 +23,7 @@
 #include "event/event.h"
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -397,6 +398,26 @@ static int t_rollback_forwards_invalid(void)
     return failures;
 }
 
+static int t_rollback_extreme_heights_refused(void)
+{
+    int failures = 0;
+    rp_install_observer();
+    struct recovery_policy p;
+    policy_set_defaults(&p);
+    enum policy_decision rollback = policy_check_block_rollback(
+        &p, INT64_MAX, INT64_MIN, "test.rollback_extreme");
+    enum policy_decision rebind = policy_check_validation_rebind(
+        &p, INT64_MAX, INT64_MIN, "test.rebind_extreme");
+    enum policy_decision negative = policy_check_block_rollback(
+        &p, 1, -1, "test.rollback_negative");
+    bool ok = rollback == POLICY_REFUSE_INVALID &&
+              rebind == POLICY_REFUSE_INVALID &&
+              negative == POLICY_REFUSE_INVALID &&
+              atomic_load(&g_ev_refused) == 3;
+    RP_RUN("rp: extreme or negative recovery heights refuse without overflow", ok);
+    return failures;
+}
+
 /* ── 15. block_rollback: allow within depth, refuse beyond ─── */
 
 static int t_rollback_depth_gate(void)
@@ -537,6 +558,7 @@ int test_recovery_policy(void)
     failures += t_null_policy();
     failures += t_negative_amount_invalid();
     failures += t_rollback_forwards_invalid();
+    failures += t_rollback_extreme_heights_refused();
     failures += t_rollback_depth_gate();
     failures += t_header_rewind_uses_own_cap();
     failures += t_dry_run_trumps_backup();

@@ -156,6 +156,19 @@ static bool write_prompt_ack_file(const char *path, const char *op,
     return true;
 }
 
+/* Recovery heights are non-negative and descending. Establish that relation
+ * before subtracting so malformed persisted values cannot overflow the policy
+ * gate and turn a refusal into undefined behavior. */
+static bool policy_recovery_depth(int64_t from_height, int64_t to_height,
+                                  int64_t *out_depth)
+{
+    if (!out_depth || from_height < 0 || to_height < 0 ||
+        to_height > from_height)
+        return false;
+    *out_depth = from_height - to_height;
+    return true;
+}
+
 /* ── Core decision engine ───────────────────────────────────────── */
 
 /* Centralised decision function for the three checks above. `amount`
@@ -247,11 +260,10 @@ enum policy_decision policy_check_block_rollback(
     int64_t to_height,
     const char *reason)
 {
-    /* Depth is the amount of ground we would lose. Negative depth
-     * (to_height > from_height) means the caller tried to "rollback"
-     * forwards — that's a bug, not a recovery. */
-    int64_t depth = from_height - to_height;
     int64_t cap = p ? p->max_block_rollback : 0;
+    int64_t depth = -1;
+    if (!policy_recovery_depth(from_height, to_height, &depth))
+        return decide(p, "block_rollback", depth, cap, reason);
     return decide(p, "block_rollback", depth, cap, reason);
 }
 
@@ -261,11 +273,10 @@ enum policy_decision policy_check_validation_rebind(
     int64_t to_height,
     const char *reason)
 {
-    /* Same depth arithmetic as block_rollback, but the larger validation-rebind
-     * cap: this rewinds only the proof/script VALIDATION cursors (no coins, no
-     * nullifiers, no tip_finalize) and re-derives every verdict idempotently. */
-    int64_t depth = from_height - to_height;
     int64_t cap = p ? p->max_validation_rebind : 0;
+    int64_t depth = -1;
+    if (!policy_recovery_depth(from_height, to_height, &depth))
+        return decide(p, "validation_rebind", depth, cap, reason);
     return decide(p, "validation_rebind", depth, cap, reason);
 }
 

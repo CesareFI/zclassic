@@ -120,8 +120,9 @@ enum policy_decision policy_check_utxo_wipe(
     const char *reason);
 
 /* Decide whether rolling the chain from `from_height` down to
- * `to_height` is allowed. Depth = from_height - to_height; a negative
- * depth is structurally invalid. Same event behaviour. */
+ * `to_height` is allowed. Both heights must be non-negative and
+ * `from_height >= to_height`; otherwise the request is structurally invalid.
+ * Same event behaviour. */
 enum policy_decision policy_check_block_rollback(
     const struct recovery_policy *p,
     int64_t from_height,
