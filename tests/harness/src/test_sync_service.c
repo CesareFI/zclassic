@@ -30,6 +30,7 @@
  * this suite already use for test-only entry points. */
 extern void syncsvc_sync_benchmark_reset_for_testing(void);
 extern void syncsvc_stale_warning_reset_for_testing(void);
+extern void syncsvc_block_file_scan_reset_for_testing(void);
 
 struct stale_warning_hammer {
     pthread_mutex_t lock;
@@ -585,6 +586,7 @@ static int test_sync_service_block_file_scan_trigger(void)
         struct block_index tip;
 
         memset(&tip, 0, sizeof(tip));
+        syncsvc_block_file_scan_reset_for_testing();
 
         tip.nHeight = 1000;
         ASSERT(!syncsvc_should_scan_block_files_after_headers(1, &tip));
@@ -594,6 +596,77 @@ static int test_sync_service_block_file_scan_trigger(void)
         ASSERT(!syncsvc_should_scan_block_files_after_headers(1, &tip));
         ASSERT(!syncsvc_should_scan_block_files_after_headers(0, &tip));
         ASSERT(!syncsvc_should_scan_block_files_after_headers(1, NULL));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+struct block_file_scan_hammer {
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    pthread_cond_t release;
+    size_t waiting;
+    bool go;
+    bool scanned[2];
+};
+
+struct block_file_scan_worker {
+    struct block_file_scan_hammer *hammer;
+    size_t slot;
+};
+
+static void *syncsvc_claim_block_file_scan_concurrently(void *opaque)
+{
+    struct block_file_scan_worker *worker = opaque;
+    struct block_index tip = { .nHeight = 1001 };
+
+    (void)pthread_mutex_lock(&worker->hammer->lock);
+    worker->hammer->waiting++;
+    (void)pthread_cond_signal(&worker->hammer->ready);
+    while (!worker->hammer->go)
+        (void)pthread_cond_wait(&worker->hammer->release,
+                                &worker->hammer->lock);
+    (void)pthread_mutex_unlock(&worker->hammer->lock);
+    worker->hammer->scanned[worker->slot] =
+        syncsvc_should_scan_block_files_after_headers(1, &tip);
+    return NULL;
+}
+
+static int test_sync_service_block_file_scan_claim_is_atomic(void)
+{
+    int failures = 0;
+
+    TEST("sync_service schedules one post-header scan under concurrent peers") {
+        struct block_file_scan_hammer hammer = {0};
+        struct block_file_scan_worker workers[2] = {
+            { .hammer = &hammer, .slot = 0 },
+            { .hammer = &hammer, .slot = 1 },
+        };
+        pthread_t threads[2];
+
+        syncsvc_block_file_scan_reset_for_testing();
+        ASSERT_EQ(pthread_mutex_init(&hammer.lock, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&hammer.ready, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&hammer.release, NULL), 0);
+        ASSERT_EQ(pthread_create(&threads[0], NULL,
+                                 syncsvc_claim_block_file_scan_concurrently,
+                                 &workers[0]), 0);
+        ASSERT_EQ(pthread_create(&threads[1], NULL,
+                                 syncsvc_claim_block_file_scan_concurrently,
+                                 &workers[1]), 0);
+        ASSERT_EQ(pthread_mutex_lock(&hammer.lock), 0);
+        while (hammer.waiting < 2)
+            ASSERT_EQ(pthread_cond_wait(&hammer.ready, &hammer.lock), 0);
+        hammer.go = true;
+        ASSERT_EQ(pthread_cond_broadcast(&hammer.release), 0);
+        ASSERT_EQ(pthread_mutex_unlock(&hammer.lock), 0);
+        ASSERT_EQ(pthread_join(threads[0], NULL), 0);
+        ASSERT_EQ(pthread_join(threads[1], NULL), 0);
+        ASSERT_EQ(pthread_cond_destroy(&hammer.release), 0);
+        ASSERT_EQ(pthread_cond_destroy(&hammer.ready), 0);
+        ASSERT_EQ(pthread_mutex_destroy(&hammer.lock), 0);
+        ASSERT(hammer.scanned[0] != hammer.scanned[1]);
         PASS();
     } _test_next:;
 
@@ -2703,6 +2776,7 @@ int test_sync_service(void)
     failures += test_sync_service_snapshots_recovery_text();
     failures += test_sync_service_reject_probe_pending();
     failures += test_sync_service_block_file_scan_trigger();
+    failures += test_sync_service_block_file_scan_claim_is_atomic();
     failures += test_sync_service_block_assignment_plan();
     failures += test_sync_service_extreme_peer_height();
     failures += test_sync_service_assigns_peer_blocks();

@@ -19,7 +19,7 @@
 #include "util/safe_alloc.h"
 
 static int g_getheaders_log_count = 0;
-static bool g_block_file_scan_triggered = false;
+static atomic_bool g_block_file_scan_triggered = false;
 
 /* Fold stale-peer backoffs into one 60s summary; atomic state keeps the
  * concurrent hot path lock-free. */
@@ -422,15 +422,21 @@ void syncsvc_note_headers_received(struct p2p_node *node,
 bool syncsvc_should_scan_block_files_after_headers(size_t accepted,
                                                    const struct block_index *header_tip)
 {
-    if (g_block_file_scan_triggered)
-        return false;
     if (accepted == 0 || !header_tip)
         return false;
     if (header_tip->nHeight <= 1000)
         return false;
 
-    g_block_file_scan_triggered = true;
-    return true;
+    bool expected = false;
+    return atomic_compare_exchange_strong_explicit(
+        &g_block_file_scan_triggered, &expected, true,
+        memory_order_relaxed, memory_order_relaxed);
+}
+
+void syncsvc_block_file_scan_reset_for_testing(void)
+{
+    atomic_store_explicit(&g_block_file_scan_triggered, false,
+                          memory_order_relaxed);
 }
 
 struct zcl_result syncsvc_build_getheaders_locator(struct block_locator *loc,
