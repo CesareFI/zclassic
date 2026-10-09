@@ -179,6 +179,26 @@ static struct block_prefetch_config bpt_cfg(size_t budget)
     return cfg;
 }
 
+static int t_start_claim_is_exclusive(void)
+{
+    int failures = 0;
+    block_prefetch_stop();
+    TEST_CASE("lifecycle: a pending start excludes a second worker claim") {
+        ASSERT(block_prefetch_test_start_claim_is_exclusive());
+    } TEST_END
+    return failures;
+}
+
+static int t_scratch_failure_releases_lifecycle(void)
+{
+    int failures = 0;
+    block_prefetch_stop();
+    TEST_CASE("lifecycle: scratch allocation failure releases running state") {
+        ASSERT(block_prefetch_test_scratch_failure_releases_lifecycle());
+    } TEST_END
+    return failures;
+}
+
 /* ── Test: disabled config is a benign no-op ────────────────────────────── */
 static int t_disabled_noop(void)
 {
@@ -411,6 +431,8 @@ int test_block_prefetch(void)
 {
     printf("\n=== block_prefetch (read-ahead worker) ===\n");
     int failures = 0;
+    failures += t_start_claim_is_exclusive();
+    failures += t_scratch_failure_releases_lifecycle();
     failures += t_disabled_noop();
     failures += t_lifecycle();
     failures += t_bounded_memory();

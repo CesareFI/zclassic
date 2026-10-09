@@ -62,6 +62,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
 static pthread_t g_thread;
 static bool      g_thread_started = false;
+static bool      g_starting = false;      /* under g_mu */
 static bool      g_running = false;       /* under g_mu */
 static bool      g_stop = false;          /* under g_mu */
 static _Atomic bool g_running_fast = false;
@@ -69,6 +70,17 @@ static int64_t   g_warm_frontier = -1;    /* under g_mu: highest+1 warmed */
 
 static struct liveness_contract g_contract;
 static _Atomic int g_child_id = SUPERVISOR_INVALID_ID;
+
+/* Claim the spawn-to-publication interval before dropping g_mu.  A worker
+ * that exits before its owner joins it still owns g_thread, so another start
+ * must not overwrite that identity. */
+static bool bp_start_claim_locked(void)
+{
+    if (g_running || g_starting || g_thread_started)
+        return false;
+    g_starting = true;
+    return true;
+}
 
 /* ── Stats ─────────────────────────────────────────────────────────────── */
 static _Atomic uint64_t g_warm_hits = 0;
@@ -331,6 +343,19 @@ static void bp_run_pass_locked_released(int32_t cursor, uint8_t *scratch)
 static void *bp_worker_entry(void *arg)
 {
     (void)arg;
+    /* The starter publishes g_thread and g_running before the worker may
+     * report an allocation failure.  Without this hand-off an immediate
+     * failure can be overwritten by the starter's later running latch. */
+    pthread_mutex_lock(&g_mu);
+    while (g_starting)
+        (void)pthread_cond_wait(&g_cv, &g_mu);
+    bool stopped_before_start = g_stop;
+    pthread_mutex_unlock(&g_mu);
+    if (stopped_before_start) {
+        thread_registry_unregister_self();
+        return NULL;
+    }
+
     int child = atomic_load(&g_child_id);
     if (child != SUPERVISOR_INVALID_ID)
         supervisor_worker_alive(child);
@@ -340,6 +365,11 @@ static void *bp_worker_entry(void *arg)
         LOG_WARN("block_prefetch",
                  "[block_prefetch] scratch alloc failed — worker exits, fold "
                  "reads cold (no correctness impact)");
+        pthread_mutex_lock(&g_mu);
+        g_running = false;
+        atomic_store_explicit(&g_running_fast, false, memory_order_release);
+        pthread_cond_broadcast(&g_cv);
+        pthread_mutex_unlock(&g_mu);
         if (child != SUPERVISOR_INVALID_ID)
             supervisor_worker_exited(child);
         thread_registry_unregister_self();
@@ -420,9 +450,10 @@ bool block_prefetch_start(const char *datadir,
     }
 
     pthread_mutex_lock(&g_mu);
-    if (g_running) {
+    if (!bp_start_claim_locked()) {
         pthread_mutex_unlock(&g_mu);
-        LOG_WARN("block_prefetch", "[block_prefetch] start: already running");
+        LOG_WARN("block_prefetch",
+                 "[block_prefetch] start: already starting or running");
         return false;
     }
     g_cfg = local;
@@ -477,13 +508,17 @@ bool block_prefetch_start(const char *datadir,
         pthread_mutex_lock(&g_mu);
         g_cursor_fn = NULL;
         g_pos_fn = NULL;
+        g_starting = false;
+        pthread_cond_broadcast(&g_cv);
         pthread_mutex_unlock(&g_mu);
         return false;
     }
     pthread_mutex_lock(&g_mu);
     g_thread_started = true;
     g_running = true;
+    g_starting = false;
     atomic_store_explicit(&g_running_fast, true, memory_order_release);
+    pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
     LOG_INFO("block_prefetch",
              "[block_prefetch] started (window=%d lead=%d lru_budget=%zuB)",
@@ -494,6 +529,8 @@ bool block_prefetch_start(const char *datadir,
 void block_prefetch_stop(void)
 {
     pthread_mutex_lock(&g_mu);
+    while (g_starting)
+        (void)pthread_cond_wait(&g_cv, &g_mu);
     bool was_running = g_running;
     if (was_running) {
         g_stop = true;
@@ -503,7 +540,7 @@ void block_prefetch_stop(void)
     }
     bool started = g_thread_started;
     pthread_mutex_unlock(&g_mu);
-    if (!was_running)
+    if (!was_running && !started)
         return;
 
     if (started)
@@ -554,6 +591,74 @@ size_t block_prefetch_lru_count(void)
     pthread_mutex_unlock(&g_lru_mu);
     return n;
 }
+
+#ifdef ZCL_TESTING
+bool block_prefetch_test_start_claim_is_exclusive(void)
+{
+    pthread_mutex_lock(&g_mu);
+    bool saved_starting = g_starting;
+    bool saved_running = g_running;
+    bool saved_started = g_thread_started;
+    g_starting = false;
+    g_running = false;
+    g_thread_started = false;
+    bool first = bp_start_claim_locked();
+    bool second = bp_start_claim_locked();
+    g_starting = saved_starting;
+    g_running = saved_running;
+    g_thread_started = saved_started;
+    pthread_mutex_unlock(&g_mu);
+    return first && !second;
+}
+
+static bool bp_test_no_cursor(void *user, int32_t *out_height)
+{
+    (void)user;
+    (void)out_height;
+    return false;
+}
+
+static bool bp_test_no_position(void *user, int32_t height,
+                                struct disk_block_pos *out)
+{
+    (void)user;
+    (void)height;
+    (void)out;
+    return false;
+}
+
+static bool bp_test_wait_for_worker_exit(void)
+{
+    pthread_mutex_lock(&g_mu);
+    while (g_running)
+        (void)pthread_cond_wait(&g_cv, &g_mu);
+    bool exited = g_thread_started && !g_starting;
+    pthread_mutex_unlock(&g_mu);
+    return exited;
+}
+
+bool block_prefetch_test_scratch_failure_releases_lifecycle(void)
+{
+    struct block_prefetch_config cfg;
+    block_prefetch_config_default(&cfg);
+    cfg.enabled = true;
+    zcl_alloc_fault_fail_next("bp_scratch");
+    if (!block_prefetch_start("", &cfg, bp_test_no_cursor, NULL,
+                              bp_test_no_position, NULL)) {
+        zcl_alloc_fault_clear();
+        return false;
+    }
+
+    bool exited = bp_test_wait_for_worker_exit();
+    bool second_start_refused = !block_prefetch_start(
+        "", &cfg, bp_test_no_cursor, NULL, bp_test_no_position, NULL);
+    block_prefetch_stop();
+    bool restarted = block_prefetch_start("", &cfg, bp_test_no_cursor, NULL,
+                                          bp_test_no_position, NULL);
+    block_prefetch_stop();
+    return exited && second_start_refused && restarted;
+}
+#endif
 
 bool block_prefetch_dump_state_json(struct json_value *out, const char *key)
 {
