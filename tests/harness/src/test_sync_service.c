@@ -953,6 +953,17 @@ static int test_sync_service_body_stall_disconnect(void)
                    &node, our_height, 0, SYNC_BODY_STALL_MIN_TIMEOUTS, now));
         node.time_connected = now - (SYNC_BODY_STALL_TIMEOUT_SECS + 5);
 
+        /* A backward wall-clock correction must not retain a never-serving
+         * peer until the old wall time catches up. The independent timeout
+         * floor remains mandatory evidence before recovery can fire. */
+        node.time_connected = now + 3600;
+        ASSERT(syncsvc_should_disconnect_body_stalled_peer(
+                   &node, our_height, 0, SYNC_BODY_STALL_MIN_TIMEOUTS, now));
+        ASSERT(!syncsvc_should_disconnect_body_stalled_peer(
+                   &node, our_height, 0, SYNC_BODY_STALL_MIN_TIMEOUTS - 1,
+                   now));
+        node.time_connected = now - (SYNC_BODY_STALL_TIMEOUT_SECS + 5);
+
         /* At/near tip (not IBD) a peer legitimately delivers no bodies. */
         ASSERT(!syncsvc_should_disconnect_body_stalled_peer(
                    &node, /*our_height=*/199999, 0,
