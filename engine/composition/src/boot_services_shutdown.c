@@ -121,6 +121,12 @@ static bool shutdown_quiesce_network_and_flush_coins(struct boot_svc_ctx *svc,
      * already copied out of gap-fill's mutex.  The runtime-kernel stop later
      * is idempotent. */
     boot_gap_fill_stop(svc);
+    /* The heartbeat sweeper calls node_health_collect(), which obtains the
+     * live block-source status and reads connman.  It has its own explicit
+     * stop/join boundary, so join it before connman is joined and freed below.
+     * Stopping it later in runtime teardown leaves a live status reader with
+     * a dangling connman pointer during the final network flush. */
+    health_stop();
     printf("[shutdown] joining replay service\n");
     boot_join_replay_service(svc);
     msg_processor_stop_block_intake(svc->msg_processor);
@@ -183,13 +189,9 @@ static void shutdown_stop_runtime_and_drain_workers(struct boot_svc_ctx *svc)
      * cancel seam) but is bounded by its per-socket timeouts (~25 s worst
      * case), which the join waits out rather than detaching. */
     peer_strategy_worker_stop(&svc->nat_probe_worker);
-    /* The heartbeat sweeper owns periodic callbacks into runtime services,
-     * including node-health collection. It does not poll the registry's
-     * global shutdown flag because health_stop() is its explicit lifecycle
-     * boundary. Stop and join it while the supervisor and node DB are still
-     * live; otherwise a periodic health callback can race the DB close below
-     * and dereference closed runtime state. */
-    health_stop();
+    /* The heartbeat sweeper was stopped before connman teardown because its
+     * periodic health callback reads block-source state backed by connman.
+     * It is already joined here, before the remaining runtime services stop. */
     /* Stop + join the self-heal condition runner FIRST, while main_state and
      * the progress store are still live: the runner dereferences both inside a
      * condition tick, so it must never outlive them (they are freed in

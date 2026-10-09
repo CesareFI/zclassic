@@ -160,6 +160,7 @@ int t_boot_shutdown_persistence_order_contract(void)
         ASSERT(read_entire_file(path, &buf) == 0);
         char *network_stop = strstr(buf, "zcl_service_kernel_stop_all(&svc->network_kernel);");
         char *health_stop = strstr(buf, "health_stop();");
+        char *connman_join = strstr(buf, "connman_join(svc->connman);");
         char *supervisor_stop = strstr(buf, "supervisor_stop();");
         char *stages_stop = strstr(buf,
             "staged_sync_supervisor_shutdown_stages();");
@@ -176,6 +177,7 @@ int t_boot_shutdown_persistence_order_contract(void)
         char *fast = strstr(buf, "shutdown_persist_fast_restart_state(svc);");
         ASSERT(network_stop != NULL);
         ASSERT(health_stop != NULL);
+        ASSERT(connman_join != NULL);
         ASSERT(supervisor_stop != NULL);
         ASSERT(stages_stop != NULL);
         ASSERT(service_stop != NULL);
@@ -184,8 +186,11 @@ int t_boot_shutdown_persistence_order_contract(void)
         ASSERT(thread_join != NULL);
         ASSERT(marker != NULL);
         ASSERT(fast != NULL);
-        /* Periodic health callbacks can read node.db. Their sweeper must be
-         * joined before the DB checkpoint/close begins. */
+        /* Periodic health callbacks read both node.db and block-source state
+         * backed by connman. Their sweeper must be joined before either
+         * connman teardown or the DB checkpoint/close begins. */
+        ASSERT(network_stop < health_stop);
+        ASSERT(health_stop < connman_join);
         ASSERT(health_stop < wal_checkpoint);
         /* Two call sites, and exactly two. The online path stops the sweeper
          * above, before the DB checkpoint. Every offline one-shot
@@ -198,8 +203,7 @@ int t_boot_shutdown_persistence_order_contract(void)
          * not by the count alone, so a third unreviewed call still fails. */
         ASSERT(count_occurrences(buf, "health_stop();") == 2);
         ASSERT(strstr(buf, "health_stop();\n"
-                           "    /* Stop + join the self-heal condition runner "
-                           "FIRST") != NULL);
+                           "    printf(\"[shutdown] joining replay service") != NULL);
         ASSERT(strstr(buf, "health_stop();\n"
                            "    int stragglers = thread_registry_join_all(2);")
                != NULL);
