@@ -34,7 +34,34 @@
 
 static int64_t g_last_stall_log = 0;
 static int64_t g_last_stall_reset = 0;
-static int64_t g_last_stale_warn = 0;
+static _Atomic int64_t g_last_stale_warn = 0;
+
+/* The stale-tip warning is an operational throttle shared by all peer
+ * handlers. Claiming it must be one operation: concurrent stale peers may
+ * emit one warning, never race while updating the timestamp. */
+static bool stale_warn_cooldown_active(int64_t now_seconds,
+                                       int64_t last_seconds)
+{
+    if (now_seconds <= last_seconds)
+        return true;
+    return (uint64_t)now_seconds - (uint64_t)last_seconds <= 300U;
+}
+
+static bool syncsvc_claim_stale_warning(int64_t now_seconds)
+{
+    int64_t last_seconds = atomic_load_explicit(&g_last_stale_warn,
+                                                memory_order_relaxed);
+
+    for (;;) {
+        if (stale_warn_cooldown_active(now_seconds, last_seconds))
+            return false;
+        if (atomic_compare_exchange_weak_explicit(&g_last_stale_warn,
+                                                  &last_seconds, now_seconds,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed))
+            return true;
+    }
+}
 
 /* zcl.sync_benchmark.v1 one-shot guards. Each flips exactly once per process
  * (matching sync_benchmark_init's per-boot arming in boot.c): the two
@@ -425,6 +452,11 @@ void syncsvc_sync_benchmark_reset_for_testing(void)
                           memory_order_relaxed);
 }
 
+void syncsvc_stale_warning_reset_for_testing(void)
+{
+    atomic_store_explicit(&g_last_stale_warn, 0, memory_order_relaxed);
+}
+
 bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
                                   const struct main_state *ms,
                                   const struct p2p_node *node,
@@ -673,11 +705,7 @@ bool syncsvc_should_warn_tip_stale(
 {
     if (!snapshot || !node || node->inbound || !snapshot->tip_stale)
         return false;
-    if (now_seconds - g_last_stale_warn <= 300)
-        return false;
-
-    g_last_stale_warn = now_seconds;
-    return true;
+    return syncsvc_claim_stale_warning(now_seconds);
 }
 
 void syncsvc_plan_tip_stale_getheaders(struct sync_getheaders_action *action,

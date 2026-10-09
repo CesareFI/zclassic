@@ -19,6 +19,7 @@
 #include "util/blocker.h"
 #include "util/safe_alloc.h"
 #include <limits.h>
+#include <pthread.h>
 #include <string.h>
 #include <time.h>
 
@@ -28,6 +29,39 @@
  * this hook is declared here instead, the same pattern other test files in
  * this suite already use for test-only entry points. */
 extern void syncsvc_sync_benchmark_reset_for_testing(void);
+extern void syncsvc_stale_warning_reset_for_testing(void);
+
+struct stale_warning_hammer {
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    pthread_cond_t release;
+    size_t waiting;
+    bool go;
+    bool warned[2];
+};
+
+struct stale_warning_worker {
+    struct stale_warning_hammer *hammer;
+    size_t slot;
+};
+
+static void *syncsvc_claim_stale_warning_concurrently(void *opaque)
+{
+    struct stale_warning_worker *worker = opaque;
+    struct sync_progress_snapshot snapshot = { .tip_stale = true };
+    struct p2p_node node = {0};
+
+    (void)pthread_mutex_lock(&worker->hammer->lock);
+    worker->hammer->waiting++;
+    (void)pthread_cond_signal(&worker->hammer->ready);
+    while (!worker->hammer->go)
+        (void)pthread_cond_wait(&worker->hammer->release,
+                                &worker->hammer->lock);
+    (void)pthread_mutex_unlock(&worker->hammer->lock);
+    worker->hammer->warned[worker->slot] =
+        syncsvc_should_warn_tip_stale(&snapshot, &node, 301);
+    return NULL;
+}
 
 static int test_sync_service_begin_sync(void)
 {
@@ -1858,6 +1892,46 @@ static int test_sync_service_tip_stale_warning_throttle(void)
     return failures;
 }
 
+static int test_sync_service_tip_stale_warning_claim_is_atomic(void)
+{
+    int failures = 0;
+
+    TEST("sync_service emits one stale-tip warning under concurrent peers") {
+        struct stale_warning_hammer hammer = {0};
+        struct stale_warning_worker workers[2] = {
+            { .hammer = &hammer, .slot = 0 },
+            { .hammer = &hammer, .slot = 1 },
+        };
+        pthread_t threads[2];
+
+        syncsvc_stale_warning_reset_for_testing();
+        ASSERT_EQ(pthread_mutex_init(&hammer.lock, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&hammer.ready, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&hammer.release, NULL), 0);
+        ASSERT_EQ(pthread_create(&threads[0], NULL,
+                                 syncsvc_claim_stale_warning_concurrently,
+                                 &workers[0]), 0);
+        ASSERT_EQ(pthread_create(&threads[1], NULL,
+                                 syncsvc_claim_stale_warning_concurrently,
+                                 &workers[1]), 0);
+        ASSERT_EQ(pthread_mutex_lock(&hammer.lock), 0);
+        while (hammer.waiting < 2)
+            ASSERT_EQ(pthread_cond_wait(&hammer.ready, &hammer.lock), 0);
+        hammer.go = true;
+        ASSERT_EQ(pthread_cond_broadcast(&hammer.release), 0);
+        ASSERT_EQ(pthread_mutex_unlock(&hammer.lock), 0);
+        ASSERT_EQ(pthread_join(threads[0], NULL), 0);
+        ASSERT_EQ(pthread_join(threads[1], NULL), 0);
+        ASSERT_EQ(pthread_cond_destroy(&hammer.release), 0);
+        ASSERT_EQ(pthread_cond_destroy(&hammer.ready), 0);
+        ASSERT_EQ(pthread_mutex_destroy(&hammer.lock), 0);
+        ASSERT(hammer.warned[0] != hammer.warned[1]);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_sync_service_tip_stale_getheaders_action(void)
 {
     int failures = 0;
@@ -2655,6 +2729,7 @@ int test_sync_service(void)
     failures += test_sync_service_progress_snapshot();
     failures += test_sync_service_tip_stale_threshold();
     failures += test_sync_service_tip_stale_warning_throttle();
+    failures += test_sync_service_tip_stale_warning_claim_is_atomic();
     failures += test_sync_service_tip_stale_getheaders_action();
     failures += test_sync_service_header_activation_policy();
     failures += test_sync_service_recovery_getheaders_action();
