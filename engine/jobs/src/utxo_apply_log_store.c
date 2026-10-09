@@ -108,6 +108,11 @@ int utxo_apply_proof_validate_log_at(sqlite3 *db, int height,
             out->has_block_hash = true;
         }
         found = 1;
+    } else if (rc != SQLITE_DONE) {
+        LOG_WARN("utxo_apply",
+                 "[utxo_apply] proof_validate_log read failed h=%d rc=%d: %s",
+                 height, rc, sqlite3_errmsg(db));
+        found = -1;
     }
     sqlite3_finalize(st);
     return found;

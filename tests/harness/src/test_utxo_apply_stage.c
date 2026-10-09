@@ -20,6 +20,7 @@
 #include "jobs/utxo_apply_anchors.h"
 #include "jobs/utxo_apply_stage.h"
 #include "jobs/tip_finalize_stage.h"
+#include "../../../engine/jobs/src/utxo_apply_log_store.h"
 #include "storage/anchor_kv.h"
 #include "storage/coins_kv.h"
 #include "storage/disk_block_io.h"
@@ -301,6 +302,34 @@ static bool exec_sql(sqlite3 *db, const char *sql)
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
     if (err) sqlite3_free(err);
     return rc == SQLITE_OK;
+}
+
+static int interrupt_proof_validate_read(void *unused)
+{
+    (void)unused;
+    return 1;
+}
+
+static bool proof_validate_log_read_error_is_not_missing(void)
+{
+    sqlite3 *db = NULL;
+    struct proof_validate_row row;
+    bool ok = sqlite3_open(":memory:", &db) == SQLITE_OK;
+    if (ok)
+        ok = exec_sql(db,
+            "CREATE TABLE proof_validate_log (height INTEGER PRIMARY KEY, "
+            "ok INTEGER NOT NULL, status TEXT NOT NULL, block_hash BLOB)") &&
+            exec_sql(db,
+                "INSERT INTO proof_validate_log VALUES "
+                "(0, 1, 'verified', zeroblob(32))");
+    if (ok) {
+        sqlite3_progress_handler(db, 1, interrupt_proof_validate_read, NULL);
+        ok = utxo_apply_proof_validate_log_at(db, 0, &row) == -1;
+        sqlite3_progress_handler(db, 0, NULL, NULL);
+    }
+    if (db)
+        sqlite3_close(db);
+    return ok;
 }
 
 /* Count created_outputs rows at `height` (lane-A1 prune subtest). */
@@ -782,6 +811,8 @@ int test_utxo_apply_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    UV_CHECK("proof_validate_log: read errors are not missing rows",
+             proof_validate_log_read_error_is_not_missing());
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_uv sc;
