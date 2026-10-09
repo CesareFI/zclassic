@@ -303,6 +303,24 @@ static int test_tip_regression_condition(void)
     return failures;
 }
 
+static int test_tip_regression_rejects_malformed_window(void)
+{
+    int failures = 0;
+
+    printf("net_tip_regression: rejects malformed duration override...\n");
+    NM_CHECK(setenv("ZCL_NET_TIP_REGRESSION_SECS", "5junk", 1) == 0);
+    net_tip_regression_test_reset();
+    net_tip_regression_test_set_now(1000);
+    inject_view(3, 100, 100, 100, false, -1);
+    NM_CHECK(!net_tip_regression_test_detect());
+    net_tip_regression_test_set_now(1006);
+    inject_view(3, 100, 103, 110, false, -1);
+    NM_CHECK(!net_tip_regression_test_detect());
+    NM_CHECK(unsetenv("ZCL_NET_TIP_REGRESSION_SECS") == 0);
+    net_tip_regression_test_reset();
+    return failures;
+}
+
 /* ── 3b. net_fork_detected ───────────────────────────────────────────── */
 static int test_fork_condition(void)
 {
@@ -376,6 +394,7 @@ int test_network_monitor(void)
     failures += test_observation_model();
     failures += test_consensus_view();
     failures += test_tip_regression_condition();
+    failures += test_tip_regression_rejects_malformed_window();
     failures += test_fork_condition();
     failures += test_partition_condition();
     if (failures == 0)

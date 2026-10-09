@@ -14,8 +14,10 @@
 #include "validation/main_state.h"
 #include "util/blocker.h"
 #include "util/log_macros.h"
+#include "util/parse_num.h"
 #include "platform/time_compat.h"
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,11 +48,10 @@ static int64_t ntr_now(void)
 static int ntr_regression_secs(void)
 {
     const char *e = getenv("ZCL_NET_TIP_REGRESSION_SECS");
-    if (e && e[0]) {
-        int v = atoi(e);
-        if (v >= 1)
-            return v;
-    }
+    int64_t value;
+
+    if (e && zcl_parse_i64(e, &value) && value >= 1 && value <= INT_MAX)
+        return (int)value;
     return NET_TIP_REGRESSION_SECS;
 }
 
