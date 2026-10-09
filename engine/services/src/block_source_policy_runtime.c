@@ -57,6 +57,7 @@
  * --------------------------------------------------------------------------- */
 
 struct bsp_state g_bsp;
+static zcl_once_t g_bsp_lock_once = ZCL_ONCE_INIT;
 
 void bsp_copy_text(char *dst, size_t dst_len, const char *src)
 {
@@ -65,12 +66,14 @@ void bsp_copy_text(char *dst, size_t dst_len, const char *src)
     snprintf(dst, dst_len, "%s", src);
 }
 
+static void bsp_lock_init(void)
+{
+    zcl_mutex_init(&g_bsp.lock);
+}
+
 void bsp_lock_init_once(void)
 {
-    if (!g_bsp.lock_init) {
-        zcl_mutex_init(&g_bsp.lock);
-        g_bsp.lock_init = true;
-    }
+    (void)zcl_once_call(&g_bsp_lock_once, bsp_lock_init);
 }
 
 /* Classify legacy_mirror_sync_service blocker strings into the typed enum

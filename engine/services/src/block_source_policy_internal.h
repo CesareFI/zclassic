@@ -29,7 +29,6 @@ struct node_db;
  * block_source_policy_runtime.c; touched by all four sibling files. */
 extern struct bsp_state {
     zcl_mutex_t lock;
-    bool lock_init;
     struct connman *connman;
     struct main_state *main_state;
     struct node_db *node_db;

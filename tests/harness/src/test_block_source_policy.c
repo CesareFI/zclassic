@@ -19,6 +19,73 @@
 #include "validation/main_state.h"
 #include "validation/mirror_consensus.h"
 
+#include <pthread.h>
+
+struct bsp_global_init_ctx {
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    pthread_cond_t release;
+    size_t waiting;
+    bool go;
+    bool observed[2];
+};
+
+struct bsp_global_init_arg {
+    struct bsp_global_init_ctx *ctx;
+    size_t slot;
+};
+
+static void *bsp_get_cached_status(void *opaque)
+{
+    struct bsp_global_init_arg *arg = opaque;
+    struct bsp_decision decision;
+
+    pthread_mutex_lock(&arg->ctx->lock);
+    arg->ctx->waiting++;
+    pthread_cond_signal(&arg->ctx->ready);
+    while (!arg->ctx->go)
+        pthread_cond_wait(&arg->ctx->release, &arg->ctx->lock);
+    pthread_mutex_unlock(&arg->ctx->lock);
+    arg->ctx->observed[arg->slot] =
+        block_source_policy_get_cached_status(&decision);
+    return NULL;
+}
+
+static int test_bsp_global_init_is_thread_safe(void)
+{
+    int failures = 0;
+    TEST_CASE("block_source_policy: cached status initializes once concurrently")
+    {
+        struct bsp_global_init_ctx ctx = {0};
+        struct bsp_global_init_arg args[2] = {
+            { .ctx = &ctx, .slot = 0 },
+            { .ctx = &ctx, .slot = 1 },
+        };
+        pthread_t threads[2];
+        ASSERT_EQ(pthread_mutex_init(&ctx.lock, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&ctx.ready, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&ctx.release, NULL), 0);
+        ASSERT_EQ(pthread_create(&threads[0], NULL, bsp_get_cached_status,
+                                 &args[0]), 0);
+        ASSERT_EQ(pthread_create(&threads[1], NULL, bsp_get_cached_status,
+                                 &args[1]), 0);
+        ASSERT_EQ(pthread_mutex_lock(&ctx.lock), 0);
+        while (ctx.waiting < 2)
+            ASSERT_EQ(pthread_cond_wait(&ctx.ready, &ctx.lock), 0);
+        ctx.go = true;
+        ASSERT_EQ(pthread_cond_broadcast(&ctx.release), 0);
+        ASSERT_EQ(pthread_mutex_unlock(&ctx.lock), 0);
+        ASSERT_EQ(pthread_join(threads[0], NULL), 0);
+        ASSERT_EQ(pthread_join(threads[1], NULL), 0);
+        ASSERT_EQ(pthread_cond_destroy(&ctx.release), 0);
+        ASSERT_EQ(pthread_cond_destroy(&ctx.ready), 0);
+        ASSERT_EQ(pthread_mutex_destroy(&ctx.lock), 0);
+        ASSERT(!ctx.observed[0]);
+        ASSERT(!ctx.observed[1]);
+    } TEST_END
+    return failures;
+}
+
 static void init_source(struct bsp_plan_input *in,
                         enum bsp_source source,
                         bool available,
@@ -1977,6 +2044,7 @@ static int test_bsp_restores_local_header_refill_progress(void)
 int test_block_source_policy(void)
 {
     int failures = 0;
+    failures += test_bsp_global_init_is_thread_safe();
     failures += test_bsp_names();
     failures += test_bsp_prefers_native_p2p();
     failures += test_bsp_keeps_caught_up_p2p_when_legacy_is_ahead();
