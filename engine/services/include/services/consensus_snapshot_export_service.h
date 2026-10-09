@@ -12,6 +12,7 @@
 
 #include "util/result.h"
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -22,6 +23,15 @@
 struct zcl_result consensus_snapshot_export_service_run_bound(
     const char *datadir, int32_t state_height,
     const uint8_t state_block_hash[32]);
+
+/* Optional cooperative cancellation for the boot-time publisher.  A set flag
+ * aborts before publication and causes long SQLite operations to yield through
+ * their progress handler.  The flag remains owned by, and must outlive, this
+ * synchronous call. */
+struct zcl_result consensus_snapshot_export_service_run_bound_cancellable(
+    const char *datadir, int32_t state_height,
+    const uint8_t state_block_hash[32],
+    const atomic_bool *cancel_requested);
 
 /* Verify the durable LOCAL-export proof for consensus_snapshot.db.  This
  * re-hashes the artifact on first use, caches only an inode/stat-bound success,

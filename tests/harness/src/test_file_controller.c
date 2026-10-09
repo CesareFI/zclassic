@@ -721,6 +721,42 @@ static int test_file_export_snapshot_fail_closes_partial(void)
     return failures;
 }
 
+static int test_file_export_snapshot_honors_pre_cancel(void)
+{
+    int failures = 0;
+
+    printf("file_controller: consensus snapshot export honors cancellation... ");
+    {
+        char dir[320];
+        char db_path[320];
+        char snap_path[320];
+        const uint8_t block_hash[32] = {0};
+        atomic_bool cancelled = true;
+        bool ok = true;
+
+        snprintf(dir, sizeof(dir), "/tmp/zcl_file_export_cancel_XXXXXX");
+        ok = ok && mkdtemp(dir) != NULL;
+        snprintf(db_path, sizeof(db_path), "%s/node.db", dir);
+        snprintf(snap_path, sizeof(snap_path), "%s/consensus_snapshot.db", dir);
+        ok = ok && build_snapshot_source_db(db_path, true);
+        if (ok) {
+            struct zcl_result result =
+                consensus_snapshot_export_service_run_bound_cancellable(
+                    dir, 0, block_hash, &cancelled);
+            ok = !result.ok && strstr(result.message, "cancelled") != NULL;
+            ok = ok && !sqlite_has_file(snap_path);
+        }
+        cleanup_file_controller_test_dir(dir);
+        if (ok) printf("OK\n");
+        else {
+            printf("FAIL\n");
+            failures++;
+        }
+    }
+
+    return failures;
+}
+
 int test_file_controller(void)
 {
     int failures = 0;
@@ -735,6 +771,7 @@ int test_file_controller(void)
     failures += test_file_service_resolved_connect_lifecycle();
     failures += test_file_export_snapshot_success();
     failures += test_file_export_snapshot_fail_closes_partial();
+    failures += test_file_export_snapshot_honors_pre_cancel();
 
     return failures;
 }

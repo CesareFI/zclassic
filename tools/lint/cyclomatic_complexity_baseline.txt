@@ -1531,7 +1531,7 @@ engine/composition/src/boot_snapshot_failure_memory.c:quarantine_borrowed_seed:1
 engine/composition/src/boot_snapshot_import.c:boot_import_snapshot_db:54
 engine/composition/src/boot_snapshot_install.c:boot_snapshot_install_marker_complete:18
 engine/composition/src/boot_snapshot_install.c:boot_snapshot_install_resume_allowed:23
-engine/composition/src/boot_snapshot_offer.c:build_snapshot_offer_thread:33
+engine/composition/src/boot_snapshot_offer.c:build_snapshot_offer_thread:32
 engine/composition/src/boot_snapshot_offer.c:snapshot_offer_state_has_replayed_history_at:27
 engine/composition/src/boot_tip_hooks.c:boot_process_block_commit_tip:21
 engine/composition/src/boot_tip_hooks.c:boot_process_block_restore_mempool:56
@@ -2282,7 +2282,7 @@ engine/services/src/chain_state_service.c:csr_validate_locked:41
 engine/services/src/chain_state_validator.c:validate_coins_chain_agreement:48
 engine/services/src/chain_tip_watchdog.c:wd_apply_tick:22
 engine/services/src/consensus_reject_index.c:cri_parse_payload:22
-engine/services/src/consensus_snapshot_export_service.c:consensus_snapshot_export_service_run_internal:54
+engine/services/src/consensus_snapshot_export_service.c:consensus_snapshot_export_service_run_internal:51
 engine/services/src/consensus_snapshot_export_service.c:load_verified_local_export:31
 engine/services/src/consensus_snapshot_export_service.c:read_local_export_proof:17
 engine/services/src/consensus_state_chain_binding_service.c:consensus_state_chain_binding_decide:47

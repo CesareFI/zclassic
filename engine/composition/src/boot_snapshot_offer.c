@@ -61,6 +61,7 @@
 
 static struct liveness_contract g_offer_contract;
 static _Atomic supervisor_child_id g_offer_sup_id = SUPERVISOR_INVALID_ID;
+static atomic_bool g_offer_cancel_requested = false;
 
 static void *build_snapshot_offer_thread(void *arg);
 
@@ -74,6 +75,8 @@ bool boot_start_offer_service(struct boot_svc_ctx *svc)
 {
     if (!svc)
         return false;
+    atomic_store_explicit(&g_offer_cancel_requested, false,
+                          memory_order_relaxed);
     boot_register_worker_supervisor(&g_offer_sup_id, &g_offer_contract,
                                     &g_op_sup, "op.build_snapshot_offer",
                                     SNAPSHOT_OFFER_SUPERVISOR_DEADLINE_SEC, 0);
@@ -86,6 +89,10 @@ void boot_join_offer_service(struct boot_svc_ctx *svc)
 {
     if (!svc)
         return;
+    /* The optional export may be a long SQLite copy/VACUUM. Signal its
+     * cooperative progress handler before the diagnostic join deadline. */
+    atomic_store_explicit(&g_offer_cancel_requested, true,
+                          memory_order_relaxed);
     boot_join_thread_service_named(&svc->offer_thread,
                                    &svc->offer_thread_started,
                                    "snapshot_offer", 5);
@@ -397,13 +404,36 @@ done:
     return ok;
 }
 
+static bool offer_worker_can_run(const char *datadir)
+{
+    return datadir && datadir[0] != '\0' &&
+           !atomic_load_explicit(&g_offer_cancel_requested,
+                                 memory_order_relaxed);
+}
+
+static bool offer_finish_export(const struct zcl_result *export_result)
+{
+    if (atomic_load_explicit(&g_offer_cancel_requested,
+                             memory_order_relaxed))
+        return false;
+    if (export_result && export_result->ok) {
+        file_controller_refresh_manifest();
+        fs_server_refresh_manifest();
+        printf("Consensus snapshot ready for file service\n");
+    } else {
+        printf("Consensus snapshot export skipped/failed (%s)\n",
+               export_result ? export_result->message : "unknown");
+    }
+    return true;
+}
+
 static void *build_snapshot_offer_thread(void *arg)
 {
     struct boot_svc_ctx *svc = arg;
     const char *datadir = svc ? svc->datadir : NULL;
     int64_t checkpoint = 0;
 
-    if (!datadir || datadir[0] == '\0')
+    if (!offer_worker_can_run(datadir))
         goto done;
 
     offer_checkpoint(&checkpoint);
@@ -461,17 +491,12 @@ static void *build_snapshot_offer_thread(void *arg)
             sovereign_height);
         if (snapshot_offer_read_block_hash(datadir, sovereign_height,
                                            sovereign_hash)) {
-            export_result = consensus_snapshot_export_service_run_bound(
-                datadir, sovereign_height, sovereign_hash);
+            export_result = consensus_snapshot_export_service_run_bound_cancellable(
+                datadir, sovereign_height, sovereign_hash,
+                &g_offer_cancel_requested);
         }
-        if (export_result.ok) {
-            file_controller_refresh_manifest();
-            fs_server_refresh_manifest();
-            printf("Consensus snapshot ready for file service\n");
-        } else {
-            printf("Consensus snapshot export skipped/failed (%s)\n",
-                   export_result.message);
-        }
+        if (!offer_finish_export(&export_result))
+            goto done;
     } else {
         printf("Consensus snapshot export skipped on boot "
                "(ZCL_EXPORT_CONSENSUS_SNAPSHOT_ON_BOOT=0 — opt-out)\n");

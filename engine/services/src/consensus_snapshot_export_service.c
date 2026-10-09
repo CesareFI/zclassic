@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,6 +88,33 @@ static bool export_path(char *out, size_t out_size, const char *datadir,
     return n >= 0 && (size_t)n < out_size;
 }
 
+#define EXPORT_CANCEL_POLL_OPS 20000
+
+static bool export_cancelled(const atomic_bool *cancel_requested)
+{
+    return cancel_requested &&
+           atomic_load_explicit(cancel_requested, memory_order_relaxed);
+}
+
+static int export_cancel_progress(void *ctx)
+{
+    return export_cancelled((const atomic_bool *)ctx) ? 1 : 0;
+}
+
+static void export_install_cancel_handler(sqlite3 *db,
+                                          const atomic_bool *cancel_requested)
+{
+    if (db && cancel_requested)
+        sqlite3_progress_handler(db, EXPORT_CANCEL_POLL_OPS,
+                                 export_cancel_progress,
+                                 (void *)cancel_requested);
+}
+
+static struct zcl_result export_cancelled_result(void)
+{
+    return ZCL_ERR(-28, "export_snapshot: cancelled by shutdown");
+}
+
 static bool snapshot_identity_equal(
     const struct platform_positioned_file_snapshot *a,
     const struct platform_positioned_file_snapshot *b)
@@ -107,11 +135,45 @@ static void local_export_cache_invalidate(void)
     pthread_mutex_unlock(&g_local_export_cache_mutex);
 }
 
+static bool hash_regular_file_contents(
+    struct platform_positioned_file *file, uint64_t size,
+    struct sha3_256_ctx *sha3, uint64_t *out_total,
+    const atomic_bool *cancel_requested)
+{
+    enum { HASH_WINDOW = 1u << 20 };
+    uint8_t *buf = zcl_malloc(HASH_WINDOW, "snapshot_local_export_hash");
+    if (!buf)
+        return false;
+
+    uint64_t total = 0;
+    bool ok = true;
+    while (total < size) {
+        if (export_cancelled(cancel_requested)) {
+            ok = false;
+            break;
+        }
+        size_t wanted = size - total > HASH_WINDOW
+            ? HASH_WINDOW : (size_t)(size - total);
+        int64_t n = platform_positioned_file_read(file, buf, wanted, total);
+        if (n > 0) {
+            sha3_256_write(sha3, buf, (size_t)n);
+            total += (uint64_t)n;
+            continue;
+        }
+        ok = false;
+        break;
+    }
+    free(buf);
+    *out_total = total;
+    return ok;
+}
+
 static bool hash_regular_file(const char *path, uint8_t out_sha3[32],
     uint64_t *out_size,
-    struct platform_positioned_file_snapshot *out_snapshot)
+    struct platform_positioned_file_snapshot *out_snapshot,
+    const atomic_bool *cancel_requested)
 {
-    if (!path || !out_sha3 || !out_size)
+    if (!path || !out_sha3 || !out_size || export_cancelled(cancel_requested))
         return false; /* raw-return-ok:validation predicate rejects input */
     struct platform_positioned_file file;
     platform_positioned_file_init(&file);
@@ -124,34 +186,15 @@ static bool hash_regular_file(const char *path, uint8_t out_sha3[32],
         return false; /* raw-return-ok:bounded policy reason returned */
     }
 
-    enum { HASH_WINDOW = 1u << 20 };
-    uint8_t *buf = zcl_malloc(HASH_WINDOW, "snapshot_local_export_hash");
-    if (!buf) {
-        platform_positioned_file_close(&file);
-        return false; /* raw-return-ok:bounded policy reason returned */
-    }
-
     struct sha3_256_ctx sha3;
     sha3_256_init(&sha3);
     uint64_t total = 0;
-    bool ok = true;
-    while (total < before.size) {
-        size_t wanted = before.size - total > HASH_WINDOW
-            ? HASH_WINDOW : (size_t)(before.size - total);
-        int64_t n = platform_positioned_file_read(&file, buf, wanted, total);
-        if (n > 0) {
-            sha3_256_write(&sha3, buf, (size_t)n);
-            total += (uint64_t)n;
-            continue;
-        }
-        ok = false;
-        break;
-    }
+    bool ok = hash_regular_file_contents(&file, before.size, &sha3, &total,
+                                         cancel_requested);
     struct platform_positioned_file_snapshot after;
     if (!platform_positioned_file_snapshot(&file, &after) ||
         !snapshot_identity_equal(&before, &after) || total != before.size)
         ok = false;
-    free(buf);
     platform_positioned_file_close(&file);
     if (!ok)
         return false;
@@ -286,7 +329,7 @@ static bool load_verified_local_export(const char *datadir,
         return false; /* raw-return-ok:bounded policy reason returned */
     }
     if (!hash_regular_file(body_path, got_sha3, &got_size,
-                           &opened_body_snapshot) ||
+                           &opened_body_snapshot, NULL) ||
         got_size != proof.body_size ||
         memcmp(got_sha3, proof.body_sha3, 32) != 0) {
         if (reason && reason_size)
@@ -327,7 +370,8 @@ static bool load_verified_local_export(const char *datadir,
 
 static struct zcl_result write_local_export_proof(
     const char *datadir, int32_t state_height,
-    const uint8_t state_block_hash[32])
+    const uint8_t state_block_hash[32],
+    const atomic_bool *cancel_requested)
 {
     char body_path[640], proof_path[640], tmp_path[672];
     if (!datadir || state_height < 0 || !state_block_hash)
@@ -342,8 +386,11 @@ static struct zcl_result write_local_export_proof(
 
     uint8_t body_sha3[32];
     uint64_t body_size = 0;
-    if (!hash_regular_file(body_path, body_sha3, &body_size, NULL))
-        return ZCL_ERR(-22, "local export proof: snapshot hash failed");
+    if (!hash_regular_file(body_path, body_sha3, &body_size, NULL,
+                           cancel_requested))
+        return export_cancelled(cancel_requested)
+            ? export_cancelled_result()
+            : ZCL_ERR(-22, "local export proof: snapshot hash failed");
 
     uint8_t raw[LOCAL_EXPORT_PROOF_BYTES] = {0};
     memcpy(raw, LOCAL_EXPORT_PROOF_MAGIC, sizeof(LOCAL_EXPORT_PROOF_MAGIC));
@@ -426,8 +473,11 @@ struct zcl_result consensus_snapshot_export_artifact_check(
 }
 
 static struct zcl_result export_exec_checked(sqlite3 *db, const char *sql,
-                                             const char *label)
+                                             const char *label,
+                                             const atomic_bool *cancel_requested)
 {
+    if (export_cancelled(cancel_requested))
+        return export_cancelled_result();
     if (!db || !sql) {
         return ZCL_ERR(-1, "export exec %s: NULL %s",
                        label ? label : "(unknown)",
@@ -435,6 +485,8 @@ static struct zcl_result export_exec_checked(sqlite3 *db, const char *sql,
     }
 
     if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) {
+        if (export_cancelled(cancel_requested))
+            return export_cancelled_result();
         return ZCL_ERR(-2, "export exec %s failed: %s",
                        label ? label : "(unknown)",
                        sqlite3_errmsg(db));
@@ -461,8 +513,11 @@ static struct zcl_result export_prepare_checked(sqlite3 *db, const char *sql,
 }
 
 static struct zcl_result export_step_checked(sqlite3_stmt *stmt, sqlite3 *db,
-                                             const char *label)
+                                             const char *label,
+                                             const atomic_bool *cancel_requested)
 {
+    if (export_cancelled(cancel_requested))
+        return export_cancelled_result();
     if (!stmt || !db) {
         return ZCL_ERR(-1, "export step %s: NULL %s",
                        label ? label : "(unknown)",
@@ -473,16 +528,52 @@ static struct zcl_result export_step_checked(sqlite3_stmt *stmt, sqlite3 *db,
      * AR-managed model writes still go through the normal AR lifecycle. */
     int rc = AR_STEP_ROW_READONLY(stmt);
     if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+        if (export_cancelled(cancel_requested))
+            return export_cancelled_result();
         return ZCL_ERR(-2, "export step %s failed: rc=%d err=%s",
                        label ? label : "(unknown)", rc, sqlite3_errmsg(db));
     }
     return ZCL_OK;
 }
 
+static struct zcl_result export_source_preflight(
+    const char *src_path, const atomic_bool *cancel_requested)
+{
+    sqlite3 *probe = NULL;
+    int64_t src_utxos = 0;
+
+    if (sqlite3_open_v2(src_path, &probe, SQLITE_OPEN_READONLY, NULL) ==
+            SQLITE_OK && probe) {
+        export_install_cancel_handler(probe, cancel_requested);
+        sqlite3_stmt *q = NULL;
+        if (sqlite3_prepare_v2(probe, "SELECT COUNT(*) FROM utxos", -1,
+                               &q, NULL) == SQLITE_OK && q) {
+            if (sqlite3_step(q) == SQLITE_ROW)  // raw-sql-ok:read-only-probe
+                src_utxos = sqlite3_column_int64(q, 0);
+            sqlite3_finalize(q);
+        }
+        sqlite3_close(probe);
+    }
+    if (export_cancelled(cancel_requested))
+        return export_cancelled_result();
+    if (src_utxos < 1000) {
+        return ZCL_ERR(
+            -3,
+            "export_snapshot: source utxos=%lld is below the 1000-row "
+            "threshold; preserving any downloaded consensus_snapshot.db "
+            "so the next boot can import it",
+            (long long)src_utxos);
+    }
+    return ZCL_OK;
+}
+
 static struct zcl_result consensus_snapshot_export_service_run_internal(
     const char *datadir, int32_t state_height,
-    const uint8_t state_block_hash[32])
+    const uint8_t state_block_hash[32],
+    const atomic_bool *cancel_requested)
 {
+    if (export_cancelled(cancel_requested))
+        return export_cancelled_result();
     if (!datadir)
         return ZCL_ERR(-1, "export_snapshot: NULL datadir");
     if (state_height < 0 || !state_block_hash)
@@ -509,31 +600,10 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
      * boot needs to import, destroying the secure-snapshot fast path
      * for any node that runs file_service and then restarts before
      * full chain catchup. */
-    {
-        sqlite3 *probe = NULL;
-        int64_t src_utxos = 0;
-        if (sqlite3_open_v2(src_path, &probe,
-                            SQLITE_OPEN_READONLY, NULL) == SQLITE_OK
-            && probe) {
-            sqlite3_stmt *q = NULL;
-            if (sqlite3_prepare_v2(probe,
-                    "SELECT COUNT(*) FROM utxos",
-                    -1, &q, NULL) == SQLITE_OK && q) {
-                if (sqlite3_step(q) == SQLITE_ROW)  // raw-sql-ok:read-only-probe
-                    src_utxos = sqlite3_column_int64(q, 0);
-                sqlite3_finalize(q);
-            }
-            sqlite3_close(probe);
-        }
-        if (src_utxos < 1000) {
-            return ZCL_ERR(
-                -3,
-                "export_snapshot: source utxos=%lld is below the 1000-row "
-                "threshold; preserving any downloaded consensus_snapshot.db "
-                "so the next boot can import it",
-                (long long)src_utxos);
-        }
-    }
+    struct zcl_result preflight = export_source_preflight(src_path,
+                                                           cancel_requested);
+    if (!preflight.ok)
+        return preflight;
 
     /* Remove eligibility before touching the body.  A crash at any later
      * boundary leaves either no artifact or an unstamped artifact, neither of
@@ -557,6 +627,7 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
         goto export_cleanup;
     }
     src_db_opened = true;
+    export_install_cancel_handler(src_db, cancel_requested);
 
     if (sqlite3_open_v2(dst_path, &dst_db,
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK ||
@@ -566,18 +637,19 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
         goto export_cleanup;
     }
     dst_db_opened = true;
+    export_install_cancel_handler(dst_db, cancel_requested);
 
     struct zcl_result step = export_exec_checked(dst_db,
-        "PRAGMA journal_mode=WAL", "set journal_mode WAL");
+        "PRAGMA journal_mode=WAL", "set journal_mode WAL", cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
     step = export_exec_checked(dst_db, "PRAGMA synchronous=OFF",
-                               "set synchronous OFF");
+                               "set synchronous OFF", cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
     step = export_exec_checked(dst_db, "PRAGMA cache_size=-65536",
-                               "set cache_size");
+                               "set cache_size", cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
     step = export_exec_checked(dst_db, "PRAGMA temp_store=FILE",
-                               "set temp_store FILE");
+                               "set temp_store FILE", cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
 
     char *attach_sql = sqlite3_mprintf("ATTACH DATABASE '%q' AS src",
@@ -586,7 +658,8 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
         result = ZCL_ERR(-12, "export_snapshot: out of memory building ATTACH");
         goto export_cleanup;
     }
-    step = export_exec_checked(dst_db, attach_sql, "attach source db");
+    step = export_exec_checked(dst_db, attach_sql, "attach source db",
+                               cancel_requested);
     sqlite3_free(attach_sql);
     if (!step.ok) { result = step; goto export_cleanup; }
     src_attached = true;
@@ -598,7 +671,7 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
     };
 
     step = export_exec_checked(dst_db, "BEGIN",
-                               "begin snapshot transaction");
+                               "begin snapshot transaction", cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
     dst_txn_open = true;
 
@@ -609,7 +682,7 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
             "CREATE TABLE IF NOT EXISTS %s AS SELECT * FROM src.%s",
             safe_tables[i], safe_tables[i]);
         step = export_exec_checked(dst_db, create_sql,
-                                   "copy consensus table");
+                                   "copy consensus table", cancel_requested);
         if (!step.ok) { result = step; goto export_cleanup; }
         tables_copied++;
     }
@@ -617,7 +690,7 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
     step = export_exec_checked(dst_db,
         "CREATE TABLE IF NOT EXISTS _snapshot_meta "
         "(key TEXT PRIMARY KEY, value TEXT)",
-        "create metadata table");
+        "create metadata table", cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
 
     sqlite3_stmt *meta = NULL;
@@ -636,7 +709,8 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
         sqlite3_finalize(meta);
         goto export_cleanup;
     }
-    step = export_step_checked(meta, dst_db, "insert metadata height");
+    step = export_step_checked(meta, dst_db, "insert metadata height",
+                               cancel_requested);
     if (!step.ok) {
         result = step;
         sqlite3_finalize(meta);
@@ -654,7 +728,8 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
         sqlite3_finalize(meta);
         goto export_cleanup;
     }
-    step = export_step_checked(meta, dst_db, "insert metadata table count");
+    step = export_step_checked(meta, dst_db, "insert metadata table count",
+                               cancel_requested);
     if (!step.ok) {
         result = step;
         sqlite3_finalize(meta);
@@ -664,18 +739,19 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
     meta = NULL;
 
     step = export_exec_checked(dst_db, "COMMIT",
-                               "commit snapshot transaction");
+                               "commit snapshot transaction", cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
     dst_txn_open = false;
     src_attached = false;
     step = export_exec_checked(dst_db, "DETACH DATABASE src",
-                               "detach source db");
+                               "detach source db", cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
 
     step = export_exec_checked(dst_db, "PRAGMA synchronous=NORMAL",
-                               "restore sync NORMAL");
+                               "restore sync NORMAL", cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
-    step = export_exec_checked(dst_db, "VACUUM", "vacuum snapshot");
+    step = export_exec_checked(dst_db, "VACUUM", "vacuum snapshot",
+                               cancel_requested);
     if (!step.ok) { result = step; goto export_cleanup; }
 
     struct platform_file_metadata dst_metadata;
@@ -696,25 +772,32 @@ static struct zcl_result consensus_snapshot_export_service_run_internal(
 
 export_cleanup:
     if (dst_db_opened && dst_db) {
+        sqlite3_progress_handler(dst_db, 0, NULL, NULL);
         if (dst_txn_open && !sqlite3_get_autocommit(dst_db)) {
             step = export_exec_checked(dst_db, "ROLLBACK",
-                                       "rollback snapshot tx");
+                                       "rollback snapshot tx", NULL);
             if (!step.ok && result.ok)
                 result = step;
         }
         if (src_attached) {
             step = export_exec_checked(dst_db, "DETACH DATABASE src",
-                                       "detach source db");
+                                       "detach source db", NULL);
             if (!step.ok && result.ok)
                 result = step;
         }
         sqlite3_close(dst_db);
     }
-    if (src_db_opened && src_db)
+    if (src_db_opened && src_db) {
+        sqlite3_progress_handler(src_db, 0, NULL, NULL);
         sqlite3_close(src_db);
+    }
 
     if (!result.ok) {
         LOG_WARN("consensus_snapshot_export", "%s", result.message);
+        (void)platform_private_file_unlink_missing_ok(dst_path);
+        (void)platform_private_file_unlink_missing_ok(proof_path);
+    } else if (export_cancelled(cancel_requested)) {
+        result = export_cancelled_result();
         (void)platform_private_file_unlink_missing_ok(dst_path);
         (void)platform_private_file_unlink_missing_ok(proof_path);
     } else if (!sqlite_has_bound_block(dst_path, state_height,
@@ -726,7 +809,7 @@ export_cleanup:
         (void)platform_private_file_unlink_missing_ok(proof_path);
     } else {
         struct zcl_result proof_result = write_local_export_proof(
-            datadir, state_height, state_block_hash);
+            datadir, state_height, state_block_hash, cancel_requested);
         if (!proof_result.ok) {
             result = proof_result;
             LOG_WARN("consensus_snapshot_export", "%s", result.message);
@@ -744,5 +827,14 @@ struct zcl_result consensus_snapshot_export_service_run_bound(
     const uint8_t state_block_hash[32])
 {
     return consensus_snapshot_export_service_run_internal(
-        datadir, state_height, state_block_hash);
+        datadir, state_height, state_block_hash, NULL);
+}
+
+struct zcl_result consensus_snapshot_export_service_run_bound_cancellable(
+    const char *datadir, int32_t state_height,
+    const uint8_t state_block_hash[32],
+    const atomic_bool *cancel_requested)
+{
+    return consensus_snapshot_export_service_run_internal(
+        datadir, state_height, state_block_hash, cancel_requested);
 }
