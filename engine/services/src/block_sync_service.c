@@ -470,17 +470,9 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
 
     if (!ms || !node) LOG_FAIL("block_sync", "build_stall_recovery: null ms=%d node=%d", !ms, !node);
 
-    int our_h = active_chain_height(&ms->chain_active);
     if (queued != 0 || in_flight != 0) return false;
-    if (node->starting_height <= our_h + 10) return false;
     if (node->state < PEER_HANDSHAKE_COMPLETE) return false;
     if (now_seconds - g_last_stall_log <= 10) return false;
-
-    g_last_stall_log = now_seconds;
-    recovery->should_recover = true;
-    recovery->should_log = true;
-    recovery->chain_height = our_h;
-    recovery->next_height = our_h + 1;
 
     /* ONE pass over block_map gathers everything the planning below
      * needs: per-height data presence for the probe window (our_h+1..
@@ -491,13 +483,33 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
     #define STALL_PROBE_WINDOW 10
     #define STALL_ALT_CANDIDATES 64
     bool have_data_at[STALL_PROBE_WINDOW] = {false};
+    struct stall_candidate {
+        struct uint256 hash;
+        int32_t height;
+    };
     struct stall_candidates {
-        struct block_index *descendants[STALL_ALT_CANDIDATES];
-        struct block_index *fallback[STALL_PROBE_WINDOW][STALL_ALT_CANDIDATES];
+        struct stall_candidate descendants[STALL_ALT_CANDIDATES];
+        struct stall_candidate fallback[STALL_PROBE_WINDOW][STALL_ALT_CANDIDATES];
         size_t fallback_count[STALL_PROBE_WINDOW];
     };
     struct stall_candidates *cand = zcl_calloc(1, sizeof(*cand), "stall cand");
     if (!cand) return true;
+    /* The message-loop caller does not hold cs_main.  Snapshot every
+     * map-owned field before releasing it: block-index entries can be
+     * replaced or rewound while recovery allocates its queue payload. */
+    struct main_state *mutable_ms = (struct main_state *)ms;
+    zcl_mutex_lock(&mutable_ms->cs_main);
+    int our_h = active_chain_height(&ms->chain_active);
+    if (node->starting_height <= our_h + 10) {
+        zcl_mutex_unlock(&mutable_ms->cs_main);
+        free(cand);
+        return false;
+    }
+    g_last_stall_log = now_seconds;
+    recovery->should_recover = true;
+    recovery->should_log = true;
+    recovery->chain_height = our_h;
+    recovery->next_height = our_h + 1;
     struct block_index *tip = active_chain_tip(&ms->chain_active);
     size_t cand_count = 0;
     {
@@ -524,9 +536,13 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
                  * data later in the map can move that gap forward. */
                 if (dh <= STALL_PROBE_WINDOW &&
                     cand->fallback_count[dh - 1] < STALL_ALT_CANDIDATES)
-                    cand->fallback[dh - 1][cand->fallback_count[dh - 1]++] = px;
+                    cand->fallback[dh - 1][cand->fallback_count[dh - 1]++] =
+                        (struct stall_candidate){
+                            .hash = *px->phashBlock,
+                            .height = px->nHeight,
+                        };
                 if (cand_count == STALL_ALT_CANDIDATES &&
-                    px->nHeight >= cand->descendants[cand_count - 1]->nHeight)
+                    px->nHeight >= cand->descendants[cand_count - 1].height)
                     continue;
                 /* Filter BEFORE bounding the pool. Unrelated forks must
                  * not crowd out a descendant, nor deep descendants H+1. */
@@ -543,11 +559,14 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
                     ++cand_count;
                 }
                 while (pos > 0 &&
-                       cand->descendants[pos - 1]->nHeight > px->nHeight) {
+                       cand->descendants[pos - 1].height > px->nHeight) {
                     cand->descendants[pos] = cand->descendants[pos - 1];
                     --pos;
                 }
-                cand->descendants[pos] = px;
+                cand->descendants[pos] = (struct stall_candidate){
+                    .hash = *px->phashBlock,
+                    .height = px->nHeight,
+                };
             }
         }
     }
@@ -559,9 +578,13 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
     }
 
     if (!tip) {
+        zcl_mutex_unlock(&mutable_ms->cs_main);
         free(cand);
         return true;
     }
+    bool tip_has_parent = tip->pprev != NULL;
+
+    zcl_mutex_unlock(&mutable_ms->cs_main);
 
     struct uint256 *alt_hashes = zcl_calloc(64, sizeof(struct uint256), "stall recovery hashes");
     int32_t *alt_heights = zcl_calloc(64, sizeof(int32_t), "stall recovery heights");
@@ -574,9 +597,8 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
 
     size_t alt_count = 0;
     for (size_t ci = 0; ci < cand_count; ci++) {
-        struct block_index *alt = cand->descendants[ci];
-        alt_hashes[alt_count] = *alt->phashBlock;
-        alt_heights[alt_count++] = alt->nHeight;
+        alt_hashes[alt_count] = cand->descendants[ci].hash;
+        alt_heights[alt_count++] = cand->descendants[ci].height;
     }
 
     if (alt_count == 0) {
@@ -584,9 +606,8 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
          * required (matches the old iter3 pass). */
         size_t gap = (size_t)(recovery->next_height - our_h - 1);
         for (size_t ci = 0; ci < cand->fallback_count[gap]; ci++) {
-            struct block_index *alt = cand->fallback[gap][ci];
-            alt_hashes[alt_count] = *alt->phashBlock;
-            alt_heights[alt_count] = alt->nHeight;
+            alt_hashes[alt_count] = cand->fallback[gap][ci].hash;
+            alt_heights[alt_count] = cand->fallback[gap][ci].height;
             alt_count++;
         }
     }
@@ -597,7 +618,7 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
     recovery->alt_hashes = alt_hashes;
     recovery->alt_heights = alt_heights;
     recovery->alt_count = alt_count;
-    recovery->should_request_tip_parent = (tip->pprev != NULL);
+    recovery->should_request_tip_parent = tip_has_parent;
 
     if (alt_count == 0 && now_seconds - g_last_stall_reset > 30) {
         g_last_stall_reset = now_seconds;
