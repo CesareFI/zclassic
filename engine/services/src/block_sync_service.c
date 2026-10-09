@@ -108,7 +108,8 @@ void syncsvc_plan_block_assignment(struct sync_block_assignment *plan,
     if (!plan) return;
     *plan = empty;
 
-    if (!node || node->state < PEER_HANDSHAKE_COMPLETE)
+    if (!node || node->disconnect ||
+        node->state < PEER_HANDSHAKE_COMPLETE)
         return;
 
     /* Don't assign block bodies to a peer we KNOW is behind — it cannot

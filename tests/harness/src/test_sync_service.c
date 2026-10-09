@@ -597,6 +597,15 @@ static int test_sync_service_block_assignment_plan(void)
         ASSERT(plan.should_assign);
         ASSERT(plan.max_assign == 64);
 
+        /* Connman marks disconnect before its terminal sweep removes a
+         * session. That peer must not receive another getdata assignment. */
+        node.disconnect = true;
+        node.state = PEER_DISCONNECTING;
+        syncsvc_plan_block_assignment(&plan, &node, 0, our_height);
+        ASSERT(!plan.should_assign);
+        node.disconnect = false;
+        node.state = PEER_HANDSHAKE_COMPLETE;
+
         syncsvc_plan_block_assignment(&plan, &node,
                                       (DL_MAX_IN_FLIGHT_PER_PEER / 2) + 1,
                                       our_height);
