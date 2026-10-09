@@ -136,6 +136,15 @@ static struct liveness_contract g_projection_backfill_contract;
 static struct liveness_contract g_hodl_history_contract;
 static struct liveness_contract g_address_backfill_contract;
 
+#ifdef ZCL_TESTING
+static _Atomic bool g_boot_test_fail_next_thread_start = false;
+
+void boot_test_fail_next_thread_start(void)
+{
+    atomic_store(&g_boot_test_fail_next_thread_start, true);
+}
+#endif
+
 static _Atomic supervisor_child_id g_payment_sup_id = SUPERVISOR_INVALID_ID;
 static _Atomic supervisor_child_id g_projection_backfill_sup_id =
     SUPERVISOR_INVALID_ID;
@@ -156,6 +165,10 @@ bool boot_start_thread_service(pthread_t *thread,
 {
     if (!thread || !started || !entry || *started)
         return false;
+#ifdef ZCL_TESTING
+    if (atomic_exchange(&g_boot_test_fail_next_thread_start, false))
+        return false;
+#endif
     /* Generic boot service starter wrapper for composition-owned helper
      * threads. Callers own the pthread_t and join it explicitly. A
      * thread_registry_spawn equivalent here would require a

@@ -8,6 +8,8 @@
 #include "services/snapshot_manifest.h"
 #include "config/db_service.h"
 #include "config/boot_snapshot_offer.h"
+#include "config/boot_background_workers.h"
+#include "config/boot_internal.h"
 #include "config/runtime.h"
 #include "services/sync_trust_policy.h"
 #include "coins/utxo_commitment.h"
@@ -327,6 +329,20 @@ static int test_boot_publish_block_swarm(void)
         ASSERT(!boot_publish_block_swarm(3000000, 3001025, 64));
         ASSERT(!boot_publish_block_swarm(3000000, 2999999, 64));
         ASSERT(!boot_publish_block_swarm(65, 65, 0));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_snapshot_offer_start_failure_retires_supervisor(void)
+{
+    int failures = 0;
+    TEST("snapshot offer start failure retires its supervisor") {
+        struct boot_svc_ctx svc = {0};
+        boot_test_fail_next_thread_start();
+        ASSERT(!boot_start_offer_service(&svc));
+        ASSERT(!svc.offer_thread_started);
+        ASSERT(boot_snapshot_offer_test_supervisor_completed());
         PASS();
     } _test_next:;
     return failures;
@@ -2778,6 +2794,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_peer_disconnect_ownership();
     failures += test_snapshot_offer_trust_policy();
     failures += test_boot_publish_block_swarm();
+    failures += test_snapshot_offer_start_failure_retires_supervisor();
     failures += test_snapshot_offer_seed_cap_matches_self_derived();
     failures += test_snapshot_sync_service_builds_pow();
     failures += test_snapshot_serve_request_requires_exact_pow_frame();

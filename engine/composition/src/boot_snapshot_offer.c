@@ -80,10 +80,20 @@ bool boot_start_offer_service(struct boot_svc_ctx *svc)
     boot_register_worker_supervisor(&g_offer_sup_id, &g_offer_contract,
                                     &g_op_sup, "op.build_snapshot_offer",
                                     SNAPSHOT_OFFER_SUPERVISOR_DEADLINE_SEC, 0);
-    return boot_start_thread_service(&svc->offer_thread,
-                                     &svc->offer_thread_started,
-                                     build_snapshot_offer_thread, svc);
+    bool started = boot_start_thread_service(&svc->offer_thread,
+                                             &svc->offer_thread_started,
+                                             build_snapshot_offer_thread, svc);
+    if (!started)
+        boot_complete_worker_supervisor(&g_offer_sup_id);
+    return started;
 }
+
+#ifdef ZCL_TESTING
+bool boot_snapshot_offer_test_supervisor_completed(void)
+{
+    return atomic_load(&g_offer_contract.completed);
+}
+#endif
 
 void boot_join_offer_service(struct boot_svc_ctx *svc)
 {

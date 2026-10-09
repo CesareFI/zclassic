@@ -55,6 +55,11 @@ bool boot_start_thread_service(pthread_t *thread, bool *started,
 void boot_join_thread_service_named(pthread_t *thread, bool *started,
                                     const char *name, int timeout_sec);
 
+#ifdef ZCL_TESTING
+/* One-shot seam for exercising callers' thread-start rollback paths. */
+void boot_test_fail_next_thread_start(void);
+#endif
+
 /* ── Shared background-worker supervision (Shape 5 — MONITOR) ──────────
  * One observe-only stall handler + one register helper, shared by every
  * background worker in this unit AND the snapshot-offer worker that was
