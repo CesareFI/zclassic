@@ -136,6 +136,11 @@ static bool shutdown_quiesce_network_and_flush_coins(struct boot_svc_ctx *svc,
      * Stopping it later in runtime teardown leaves a live status reader with
      * a dangling connman pointer during the final network flush. */
     health_stop();
+    /* The supervisor tick and stall workers dispatch net.outbound_floor,
+     * whose callbacks retain connman. Completing a child only prevents a
+     * future dispatch; it cannot retract a callback already claimed by the
+     * worker. Join every supervisor callback before connman teardown. */
+    supervisor_stop();
     printf("[shutdown] joining replay service\n");
     boot_join_replay_service(svc);
     msg_processor_stop_block_intake(svc->msg_processor);
@@ -212,9 +217,9 @@ static void shutdown_stop_runtime_and_drain_workers(struct boot_svc_ctx *svc)
      * registry then verifies ownership instead of trying to invent a stop
      * protocol for an otherwise-running service. */
     zcl_service_kernel_stop_all(&svc->service_kernel);
-    /* Stop the supervisor AFTER runtime services so any stall-detection
-     * callbacks they emit at teardown are still delivered. */
-    supervisor_stop();
+    /* The supervisor was joined before connman teardown because net-domain
+     * callbacks borrow connman. Runtime teardown therefore has no asynchronous
+     * supervisor callback left in flight. */
     /* The supervisor is now joined, so no stage callback can be in flight.
      * Quiesce the staged-sync pipeline while progress storage, node.db, and
      * main_state are still valid. In particular validate_headers owns the

@@ -198,6 +198,10 @@ int t_boot_shutdown_persistence_order_contract(void)
         ASSERT(seniority_stop < connman_join);
         ASSERT(self_heal_stop < connman_join);
         ASSERT(health_stop < connman_join);
+        /* net.outbound_floor callbacks retain connman, and completing their
+         * child cannot quiesce a callback already claimed by the supervisor
+         * worker. Join the supervisor before connman teardown. */
+        ASSERT(supervisor_stop < connman_join);
         ASSERT(health_stop < wal_checkpoint);
         /* Two call sites, and exactly two. The online path stops the sweeper
          * above, before the DB checkpoint. Every offline one-shot
