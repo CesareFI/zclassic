@@ -387,6 +387,12 @@ static job_result_t step_persist(struct stage_step_ctx *c)
     }
     if (merkle_result != MERKLE_VERIFY_OK) {
         release_stage_block(&handle, &owned, borrowed);
+        /* The cache key binds the header hash, not the body transaction
+         * Merkle root. A malformed body can therefore be resident under the
+         * right (height, header-hash) key. Drop it before requesting a fresh
+         * body, otherwise the next attempt can borrow the same rejected body
+         * instead of reading the replacement from disk. */
+        block_parse_cache_evict(next_h, bi->phashBlock->data);
         return requeue_body_for_refetch(bi, next_h, "merkle_mismatch",
                                         &g_merkle_mismatch_total);
     }

@@ -11,11 +11,14 @@
 #include "primitives/block.h"
 #include "primitives/transaction.h"
 #include "jobs/body_persist_stage.h"
+#include "storage/block_parse_cache.h"
+#include "storage/disk_block_io.h"
 #include "storage/progress_store.h"
 #include "util/blocker.h"
 #include "util/reducer_stage_profile.h"
 #include "util/safe_alloc.h"
 #include "util/stage.h"
+#include "util/util.h"
 #include "validation/chainstate.h"
 #include "validation/main_state.h"
 
@@ -25,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #define BP_CHECK(name, expr) do { \
@@ -245,7 +249,9 @@ static int64_t profile_cumulative_field(const char *name)
 static void bp_fmt_tmpdir(char *dir_out, size_t dir_out_size,
                           const char *tag)
 {
-    if (access("/dev/shm", W_OK) == 0) {
+    struct statvfs vfs;
+    if (access("/dev/shm", W_OK) == 0 &&
+        statvfs("/dev/shm", &vfs) == 0 && vfs.f_bavail > 0) {
         int wrote = snprintf(dir_out, dir_out_size,
                              "/dev/shm/body_persist_%d_%s",
                              (int)getpid(), tag);
@@ -286,6 +292,87 @@ static void bp_teardown(const char *dir, struct main_state *ms,
     synth_chain_bp_free(sc);
     progress_store_close();
     test_cleanup_tmpdir(dir);
+}
+
+static bool merkle_cache_refetch_test(void)
+{
+    char dir[256], netdir[512];
+    struct main_state ms;
+    struct synth_chain_bp sc;
+    struct block bad;
+    struct disk_block_pos bad_pos;
+    struct disk_block_pos good_pos;
+    struct block_parse_handle cached;
+    const unsigned char msg_start[4] = {0x24, 0xe9, 0x27, 0x64};
+    bool setup = false;
+    bool result = false;
+
+    memset(&sc, 0, sizeof(sc));
+    block_init(&bad);
+    bp_fmt_tmpdir(dir, sizeof(dir), "merkle_cache_refetch");
+    if (!SetDataDir(dir))
+        return false;
+    setup = bp_setup("merkle_cache_refetch", 1, -1, -1,
+                     dir, sizeof(dir), &ms, &sc) == 0;
+    if (!setup)
+        goto out_datadir;
+    GetDataDir(true, netdir, sizeof(netdir));
+    if (!netdir[0] || strncmp(netdir, dir, strlen(dir)) != 0)
+        goto out_fixture;
+    body_persist_stage_set_reader(NULL, NULL);
+    block_parse_cache_clear();
+
+    transaction_compute_hash(&sc.bodies[0].vtx[0]);
+    sc.bodies[0].header.hashMerkleRoot =
+        compute_merkle_root(&sc.bodies[0].vtx[0].hash, 1);
+    block_header_get_hash(&sc.bodies[0].header, &sc.hashes[0]);
+    if (!test_block_copy(&bad, &sc.bodies[0], "bp_cache_bad"))
+        goto out_fixture;
+    bad.vtx[0].lock_time++;
+    disk_block_pos_init(&bad_pos);
+    if (!write_block_to_disk(&bad, &bad_pos, netdir, msg_start))
+        goto out_fixture;
+    sc.blocks[0].nFile = bad_pos.nFile;
+    sc.blocks[0].nDataPos = bad_pos.nPos;
+    sc.blocks[0].nStatus |= BLOCK_HAVE_DATA;
+    memset(&cached, 0, sizeof(cached));
+    if (!block_parse_cache_acquire(0, sc.blocks[0].phashBlock->data,
+                                   &sc.blocks[0], netdir, &cached))
+        goto out_fixture;
+    block_parse_cache_release(&cached);
+    char bad_path[512];
+    get_block_pos_filename(bad_path, sizeof(bad_path), netdir, &bad_pos,
+                           "blk");
+    if (unlink(bad_path) != 0)
+        goto out_fixture;
+    if (body_persist_stage_step_once() != JOB_IDLE ||
+        body_persist_stage_merkle_mismatch_total() != 1)
+        goto out_fixture;
+
+    memset(&cached, 0, sizeof(cached));
+    if (block_parse_cache_acquire(0, sc.blocks[0].phashBlock->data,
+                                  &sc.blocks[0], netdir, &cached)) {
+        block_parse_cache_release(&cached);
+        goto out_fixture;
+    }
+
+    disk_block_pos_init(&good_pos);
+    if (!write_block_to_disk(&sc.bodies[0], &good_pos, netdir, msg_start))
+        goto out_fixture;
+    sc.blocks[0].nFile = good_pos.nFile;
+    sc.blocks[0].nDataPos = good_pos.nPos;
+    sc.blocks[0].nStatus |= BLOCK_HAVE_DATA;
+    result = body_persist_stage_drain(1) == 1 &&
+             body_persist_stage_cursor() == 1 &&
+             body_persist_stage_merkle_mismatch_total() == 1;
+
+out_fixture:
+    block_free(&bad);
+    block_parse_cache_clear();
+    bp_teardown(dir, &ms, &sc);
+out_datadir:
+    SetDataDir("");
+    return result;
 }
 
 int test_body_persist_stage(void);
@@ -418,6 +505,14 @@ int test_body_persist_stage(void)
                  ok == 1 && strcmp(src, "verified") == 0);
         bp_teardown(dir, &ms, &sc);
     }
+
+    /* The default reader uses the parsed-body cache. A body with the expected
+     * header hash but a bad transaction Merkle root is cacheable until this
+     * stage rejects it. After the body is re-fetched at a new disk position,
+     * the retry must read that replacement rather than borrowing the rejected
+     * cached bytes again. */
+    BP_CHECK("merkle_cache_refetch: replacement advances",
+             merkle_cache_refetch_test());
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_bp sc;
