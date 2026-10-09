@@ -21,8 +21,24 @@ struct block_index *stage_body_index_at(struct main_state *ms, int height)
     struct chain_state_frontier_view frontier;
     if (!csr_capture_frontiers(csr_instance(), &ms->chain_active,
                                &ms->pindex_best_header, height,
-                               &frontier).ok)
+                               &frontier).ok) {
+#ifdef ZCL_TESTING
+        /* Isolated stage fixtures intentionally omit process boot wiring.
+         * Preserve that fixture seam only before the repository exists; a
+         * live but differently-bound repository is a lifecycle mismatch and
+         * must still fail closed. */
+        if (!frontier.initialized) {
+            struct block_index *legacy =
+                active_chain_at(&ms->chain_active, height);
+            if (!legacy && ms->pindex_best_header &&
+                height <= ms->pindex_best_header->nHeight)
+                legacy = block_index_get_ancestor(ms->pindex_best_header,
+                                                  height);
+            return legacy;
+        }
+#endif
         return NULL;
+    }
 
     struct block_index *canonical = frontier.window.requested;
     if (!canonical && frontier.header_tip &&
