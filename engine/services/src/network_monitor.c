@@ -150,10 +150,23 @@ static void nm_config_from_env(struct network_monitor_config *cfg)
         cfg->retain_rows = value;
 }
 
+static void nm_clamp_config(struct network_monitor_config *cfg)
+{
+    if (cfg->sample_interval_secs < 1)
+        cfg->sample_interval_secs = 1;
+    if (cfg->sample_interval_secs > 3600)
+        cfg->sample_interval_secs = 3600;
+    if (cfg->retain_rows < 100)
+        cfg->retain_rows = 100;
+    if (cfg->retain_rows > 10000000)
+        cfg->retain_rows = 10000000;
+}
+
 #ifdef ZCL_TESTING
 void network_monitor_test_config_from_env(struct network_monitor_config *cfg)
 {
     nm_config_from_env(cfg);
+    nm_clamp_config(cfg);
 }
 #endif
 
@@ -594,6 +607,7 @@ struct zcl_result network_monitor_start(const struct network_monitor_config *cfg
     if (cfg)
         local = *cfg;
     nm_config_from_env(&local);
+    nm_clamp_config(&local);
 
     g_nm.db = db;
     g_nm.sample_interval_secs = local.sample_interval_secs;

@@ -19,6 +19,7 @@
 #include "util/supervisor.h"
 
 #include <string.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -77,6 +78,11 @@ static int test_config_env_numbers(void)
     NM_CHECK(cfg.sample_interval_secs == 1 && cfg.retain_rows == 100);
     unsetenv("ZCL_NETMON_INTERVAL_SECS");
     unsetenv("ZCL_NETMON_RETAIN_ROWS");
+
+    cfg.sample_interval_secs = -1;
+    cfg.retain_rows = INT_MAX;
+    network_monitor_test_config_from_env(&cfg);
+    NM_CHECK(cfg.sample_interval_secs == 1 && cfg.retain_rows == 10000000);
     return failures;
 }
 
