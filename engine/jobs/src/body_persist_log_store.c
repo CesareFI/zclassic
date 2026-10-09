@@ -170,6 +170,11 @@ int body_persist_body_fetch_log_at(sqlite3 *db, int height,
                      (const char *)src);
         out->ok = sqlite3_column_int(st, 1);
         found = 1;
+    } else if (rc != SQLITE_DONE) {
+        LOG_WARN("body_persist",
+                 "[body_persist] body_fetch_log read failed height=%d: %s",
+                 height, sqlite3_errmsg(db));
+        found = -1;
     }
     /* Release the read cursor before returning: a parked SELECT cursor on the
      * shared WAL connection permanently wedges writers (see MEMORY). */

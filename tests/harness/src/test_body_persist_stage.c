@@ -12,6 +12,7 @@
 #include "primitives/transaction.h"
 #include "jobs/body_persist_stage.h"
 #include "jobs/stage_body_index.h"
+#include "../../../engine/jobs/src/body_persist_log_store.h"
 #include "services/chain_state_service.h"
 #include "storage/block_parse_cache.h"
 #include "storage/disk_block_io.h"
@@ -140,6 +141,32 @@ static bool exec_sql(sqlite3 *db, const char *sql)
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err);
     if (err) sqlite3_free(err);
     return rc == SQLITE_OK;
+}
+
+static int interrupt_body_fetch_read(void *unused)
+{
+    (void)unused;
+    return 1;
+}
+
+static bool body_fetch_log_read_error_is_not_missing(void)
+{
+    sqlite3 *db = NULL;
+    struct body_fetch_row row;
+    bool ok = sqlite3_open(":memory:", &db) == SQLITE_OK;
+    if (ok)
+        ok = exec_sql(db,
+            "CREATE TABLE body_fetch_log (height INTEGER PRIMARY KEY, "
+            "source TEXT NOT NULL, ok INTEGER NOT NULL)") &&
+            exec_sql(db, "INSERT INTO body_fetch_log VALUES (0, 'disk', 1)");
+    if (ok) {
+        sqlite3_progress_handler(db, 1, interrupt_body_fetch_read, NULL);
+        ok = body_persist_body_fetch_log_at(db, 0, &row) == -1;
+        sqlite3_progress_handler(db, 0, NULL, NULL);
+    }
+    if (db)
+        sqlite3_close(db);
+    return ok;
 }
 
 static bool seed_body_fetch(sqlite3 *db, int n, int upstream_fail_height,
@@ -415,6 +442,8 @@ int test_body_persist_stage(void)
 
     blocker_module_init();
     failures += test_bp_rejects_detached_frontier();
+    BP_CHECK("body_fetch_log: read errors are not missing rows",
+             body_fetch_log_read_error_is_not_missing());
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_bp sc;
