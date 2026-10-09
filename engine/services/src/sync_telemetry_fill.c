@@ -56,6 +56,11 @@
 /* Fixed-point scale of the TFU_BPS_X1000 leaves: blocks per second x1000. */
 #define SYNC_TL_BPS_SCALE 1000
 
+static int64_t sync_tl_count(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
+
 /* One microsecond-per-step EWMA converted to the x1000 blocks-per-second the
  * TFU_BPS_X1000 unit promises. Returns false when the stage has never stepped
  * (EWMA 0 — see stage_record_step_timing's floor-to-1, which is what makes 0
@@ -183,10 +188,10 @@ static void fill_bodies(struct sync_snapshot *s)
     TELEMETRY_SET_I64(s, body_fetch_cursor,
                       body_fetch_stage_cursor(), TELEMETRY_SRC_IN_PROCESS);
     TELEMETRY_SET_I64(s, body_fetch_observed_total,
-                      body_fetch_stage_observed_total(),
+                      sync_tl_count(body_fetch_stage_observed_total()),
                       TELEMETRY_SRC_IN_PROCESS);
     TELEMETRY_SET_I64(s, body_fetch_skipped_total,
-                      body_fetch_stage_skipped_total(),
+                      sync_tl_count(body_fetch_stage_skipped_total()),
                       TELEMETRY_SRC_IN_PROCESS);
     TELEMETRY_SET_I64(s, body_fetch_step_us_ewma,
                       body_fetch_stage_step_us_ewma(),
