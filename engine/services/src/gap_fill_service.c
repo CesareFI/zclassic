@@ -168,18 +168,31 @@ static int collect_pprev_window(struct block_index *start,
     if (!start || out_cap <= 0) return 0;
     int count = 0;
     struct block_index *cur = start;
-    int last_h = cur->nHeight + 1; /* sentinel: any valid prev_h < this */
+    int last_h = 0;
+    bool first = true;
     int steps = 0;
     while (cur && count < out_cap &&
            cur->nHeight > stop_height_exclusive) {
         if (steps++ > GAPFILL_WALK_CAP) return -1; // raw-return-ok:sentinel
-        if (cur->nHeight >= last_h) return -1; // raw-return-ok:sentinel
+        if (!first && cur->nHeight >= last_h)
+            return -1; // raw-return-ok:sentinel
         last_h = cur->nHeight;
+        first = false;
         out[count++] = cur;
         cur = cur->pprev;
     }
     return count;
 }
+
+#ifdef ZCL_TESTING
+int gap_fill_test_collect_pprev_window(struct block_index *start,
+                                       int stop_height_exclusive,
+                                       struct block_index **out,
+                                       int out_cap)
+{
+    return collect_pprev_window(start, stop_height_exclusive, out, out_cap);
+}
+#endif
 
 bool gap_fill_compute_window(int active_tip_h, int best_header_h,
                              uint64_t floor_cursor,

@@ -54,6 +54,23 @@ static bool gf_build_chain(int count, struct block_index **blocks_out,
     return true;
 }
 
+static bool gf_pprev_maximum_height_regression(void)
+{
+    struct block_index top;
+    struct block_index duplicate;
+    struct block_index *out[2] = {0};
+    block_index_init(&top);
+    block_index_init(&duplicate);
+    top.nHeight = INT_MAX;
+    duplicate.nHeight = INT_MAX;
+    top.pprev = &duplicate;
+
+    int one = gap_fill_test_collect_pprev_window(&top, INT_MAX - 1, out, 1);
+    int corrupt =
+        gap_fill_test_collect_pprev_window(&top, INT_MAX - 1, out, 2);
+    return one == 1 && out[0] == &top && corrupt == -1;
+}
+
 static int gf_maximum_height_window_bounds(void)
 {
     int failures = 0;
@@ -168,6 +185,13 @@ int test_gap_fill_frontier_window(void)
     }
     free(blocks);
     free(hashes);
+
+    /* The first item has no predecessor to compare. It may legitimately be
+     * INT_MAX in a synthetic or imported index, so the production walk must
+     * not manufacture an overflowing sentinel. Subsequent equal heights are
+     * still corrupt and must be refused. */
+    GF_CHECK("maximum first height is collected without sentinel overflow",
+             gf_pprev_maximum_height_regression());
 
     /* Regression: during initial sync the validated-header lead exceeds the
      * old 131072-step pprev cap.  The production index has skip pointers, so

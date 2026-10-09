@@ -95,6 +95,16 @@ bool gap_fill_compute_window(int active_tip_h, int best_header_h,
 struct block_index *gap_fill_window_walk_start(
     struct block_index *best, const struct gap_fill_window *window);
 
+#ifdef ZCL_TESTING
+/* Direct seam for the bounded pprev walk: fixtures must exercise the
+ * production corruption check without starting the worker or mutating chain
+ * state. */
+int gap_fill_test_collect_pprev_window(struct block_index *start,
+                                       int stop_height_exclusive,
+                                       struct block_index **out,
+                                       int out_cap);
+#endif
+
 /* Candidate predicate before the download-manager in-flight check. */
 bool gap_fill_block_needs_queue(const struct block_index *bi);
 
