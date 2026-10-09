@@ -289,6 +289,7 @@ bool network_monitor_netsplit_dump_state_json(struct json_value *out,
 /* Inject a folded view (marks it ready) so condition detectors can be unit
  * tested without a live connman. */
 void network_monitor_test_set_view(const struct network_consensus_view *v);
+void network_monitor_test_config_from_env(struct network_monitor_config *cfg);
 /* Exercise the production monotonic sampler decision without a worker. The
  * test caller must not run the monitor thread concurrently. */
 void network_monitor_test_reset_schedule(void);

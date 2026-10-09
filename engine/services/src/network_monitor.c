@@ -39,6 +39,7 @@
 #include "json/json.h"
 #include "platform/time_compat.h"
 #include "util/log_macros.h"
+#include "util/parse_num.h"
 #include "util/supervisor.h"
 #include "util/sync.h"
 #include "util/thread_registry.h"
@@ -127,21 +128,34 @@ void network_monitor_config_defaults(struct network_monitor_config *cfg)
     cfg->retain_rows = 10000;
 }
 
+static bool nm_env_int(const char *name, int min, int max, int *out)
+{
+    const char *text = getenv(name);
+    int64_t value;
+
+    if (!text || !text[0] || !out || !zcl_parse_i64(text, &value) ||
+        value < min || value > max)
+        return false;
+    *out = (int)value;
+    return true;
+}
+
 static void nm_config_from_env(struct network_monitor_config *cfg)
 {
-    const char *iv = getenv("ZCL_NETMON_INTERVAL_SECS");
-    if (iv && iv[0]) {
-        int v = atoi(iv);
-        if (v >= 1 && v <= 3600)
-            cfg->sample_interval_secs = v;
-    }
-    const char *rr = getenv("ZCL_NETMON_RETAIN_ROWS");
-    if (rr && rr[0]) {
-        int v = atoi(rr);
-        if (v >= 100 && v <= 10000000)
-            cfg->retain_rows = v;
-    }
+    int value;
+
+    if (nm_env_int("ZCL_NETMON_INTERVAL_SECS", 1, 3600, &value))
+        cfg->sample_interval_secs = value;
+    if (nm_env_int("ZCL_NETMON_RETAIN_ROWS", 100, 10000000, &value))
+        cfg->retain_rows = value;
 }
+
+#ifdef ZCL_TESTING
+void network_monitor_test_config_from_env(struct network_monitor_config *cfg)
+{
+    nm_config_from_env(cfg);
+}
+#endif
 
 /* ── header-vote map ─────────────────────────────────────────────────── */
 

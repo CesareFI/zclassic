@@ -54,6 +54,31 @@ static struct db_peer_chain_observation mk_obs(int64_t peer_id, int64_t height,
     return o;
 }
 
+static int test_config_env_numbers(void)
+{
+    struct network_monitor_config cfg;
+    int failures = 0;
+
+    setenv("ZCL_NETMON_INTERVAL_SECS", "1junk", 1);
+    network_monitor_config_defaults(&cfg);
+    network_monitor_test_config_from_env(&cfg);
+    NM_CHECK(cfg.sample_interval_secs == 30);
+
+    setenv("ZCL_NETMON_RETAIN_ROWS", "999999999999999999999", 1);
+    network_monitor_config_defaults(&cfg);
+    network_monitor_test_config_from_env(&cfg);
+    NM_CHECK(cfg.retain_rows == 10000);
+
+    setenv("ZCL_NETMON_INTERVAL_SECS", "1", 1);
+    setenv("ZCL_NETMON_RETAIN_ROWS", "100", 1);
+    network_monitor_config_defaults(&cfg);
+    network_monitor_test_config_from_env(&cfg);
+    NM_CHECK(cfg.sample_interval_secs == 1 && cfg.retain_rows == 100);
+    unsetenv("ZCL_NETMON_INTERVAL_SECS");
+    unsetenv("ZCL_NETMON_RETAIN_ROWS");
+    return failures;
+}
+
 /* The worker calls this exact decision with platform_time_monotonic_us(). A
  * wall-clock rollback used to leave its seconds deadline in the future and
  * suppress samples until wall time caught back up. */
@@ -323,6 +348,7 @@ int test_network_monitor(void)
 {
     printf("\n=== network_monitor tests ===\n");
     int failures = 0;
+    failures += test_config_env_numbers();
     failures += test_monotonic_sample_schedule();
     failures += test_observation_model();
     failures += test_consensus_view();
