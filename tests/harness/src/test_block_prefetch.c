@@ -199,6 +199,26 @@ static int t_scratch_failure_releases_lifecycle(void)
     return failures;
 }
 
+static int t_overlong_datadir_refused(void)
+{
+    int failures = 0;
+    block_prefetch_stop();
+    char datadir[2049];
+    memset(datadir, 'x', sizeof(datadir) - 1);
+    datadir[sizeof(datadir) - 1] = '\0';
+    struct bpt_ctx ctx = {0};
+    struct block_prefetch_config cfg = bpt_cfg(0);
+
+    TEST_CASE("lifecycle: an overlong datadir is refused before worker start") {
+        ASSERT(!block_prefetch_start(datadir, &cfg, bpt_cursor, &ctx,
+                                     bpt_pos, &ctx));
+        ASSERT(!block_prefetch_running());
+    } TEST_END
+
+    block_prefetch_stop();
+    return failures;
+}
+
 /* ── Test: disabled config is a benign no-op ────────────────────────────── */
 static int t_disabled_noop(void)
 {
@@ -433,6 +453,7 @@ int test_block_prefetch(void)
     int failures = 0;
     failures += t_start_claim_is_exclusive();
     failures += t_scratch_failure_releases_lifecycle();
+    failures += t_overlong_datadir_refused();
     failures += t_disabled_noop();
     failures += t_lifecycle();
     failures += t_bounded_memory();

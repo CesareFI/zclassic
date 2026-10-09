@@ -449,6 +449,15 @@ bool block_prefetch_start(const char *datadir,
         return false;
     }
 
+    const char *data_root = datadir ? datadir : "";
+    size_t data_root_len = strnlen(data_root, sizeof(g_datadir));
+    if (data_root_len >= sizeof(g_datadir)) {
+        LOG_WARN("block_prefetch",
+                 "[block_prefetch] start: datadir path exceeds bounded storage "
+                 "— fold reads cold");
+        return false;
+    }
+
     pthread_mutex_lock(&g_mu);
     if (!bp_start_claim_locked()) {
         pthread_mutex_unlock(&g_mu);
@@ -457,7 +466,7 @@ bool block_prefetch_start(const char *datadir,
         return false;
     }
     g_cfg = local;
-    snprintf(g_datadir, sizeof(g_datadir), "%s", datadir ? datadir : "");
+    memcpy(g_datadir, data_root, data_root_len + 1);
     g_cursor_fn = cursor_fn;
     g_cursor_user = cursor_user;
     g_pos_fn = pos_fn;
