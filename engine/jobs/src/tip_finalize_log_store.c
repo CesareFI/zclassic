@@ -95,6 +95,11 @@ int utxo_apply_log_at(sqlite3 *db, int height,
         out->added_count = sqlite3_column_type(st, 3) == SQLITE_INTEGER
             ? sqlite3_column_int64(st, 3) : -1;
         found = 1;
+    } else if (rc != SQLITE_DONE) {
+        LOG_WARN("tip_finalize",
+                 "[tip_finalize] utxo_apply_log read failed h=%d rc=%d: %s",
+                 height, rc, sqlite3_errmsg(db));
+        found = -1;
     }
     sqlite3_finalize(st);
     return found;

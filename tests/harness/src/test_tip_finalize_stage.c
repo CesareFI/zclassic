@@ -121,6 +121,35 @@ static bool exec_sql(sqlite3 *db, const char *sql)
     return rc == SQLITE_OK;
 }
 
+static int interrupt_utxo_apply_read(void *unused)
+{
+    (void)unused;
+    return 1;
+}
+
+static bool utxo_apply_log_read_error_is_not_missing(void)
+{
+    sqlite3 *db = NULL;
+    struct utxo_apply_row row;
+    bool ok = sqlite3_open(":memory:", &db) == SQLITE_OK;
+    if (ok)
+        ok = exec_sql(db,
+            "CREATE TABLE utxo_apply_log (height INTEGER PRIMARY KEY, "
+            "ok INTEGER NOT NULL, status TEXT NOT NULL, "
+            "spent_count INTEGER NOT NULL, added_count INTEGER NOT NULL)") &&
+            exec_sql(db,
+                "INSERT INTO utxo_apply_log VALUES "
+                "(0, 1, 'verified', 0, 0)");
+    if (ok) {
+        sqlite3_progress_handler(db, 1, interrupt_utxo_apply_read, NULL);
+        ok = utxo_apply_log_at(db, 0, &row) == -1;
+        sqlite3_progress_handler(db, 0, NULL, NULL);
+    }
+    if (db)
+        sqlite3_close(db);
+    return ok;
+}
+
 static bool seed_utxo_apply(sqlite3 *db, int n, int upstream_fail_height)
 {
     if (!exec_sql(db,
@@ -633,6 +662,8 @@ int test_tip_finalize_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    TF_CHECK("utxo_apply_log: read errors are not missing rows",
+             utxo_apply_log_read_error_is_not_missing());
 
     /* uv_cursor_gap crash-window clamp (Lane C root-cause fix).
      *
