@@ -3,8 +3,10 @@
 #include "test/test_core.h"
 
 #include "conditions/body_fetch_missing_have_data.h"
+#include "services/chain_state_service.h"
 #include "core/arith_uint256.h"
 #include "framework/condition.h"
+#include "jobs/body_fetch_stage.h"
 #include "jobs/reducer_frontier.h"
 #include "jobs/stage_repair.h"
 #include "net/download.h"
@@ -267,6 +269,8 @@ static bool setup_fixture(struct bfmhd_fixture *fx, const char *tag)
     if (!active_chain_move_window_tip(&fx->ms.chain_active, fx->tip))
         return false;
     fx->ms.pindex_best_header = fx->child;
+    csr_init(csr_instance(), &fx->ms.map_block_index, &fx->ms.chain_active,
+             &fx->ms.pindex_best_header, NULL, NULL, NULL);
 
     if (!seed_cursors(progress_store_db(), fx->target + 1, fx->target))
         return false;
@@ -285,6 +289,7 @@ static void teardown_fixture(struct bfmhd_fixture *fx)
     sync_monitor_set_context(NULL, NULL, NULL);
     condition_engine_reset_for_testing();
     body_fetch_missing_have_data_test_reset();
+    csr_test_reset_singleton();
     dl_free(&fx->dm);
     main_state_free(&fx->ms);
     progress_store_close();
@@ -301,10 +306,31 @@ static bool queue_has_target(struct bfmhd_fixture *fx)
            uint256_eq(&fx->dm.queue[0], fx->child->phashBlock);
 }
 
+static bool body_fetch_uses_published_csr_header(void)
+{
+    struct bfmhd_fixture fx;
+    if (!setup_fixture(&fx, "csr_header"))
+        return false;
+    struct block_index *published = fx.child;
+    csr_init(csr_instance(), &fx.ms.map_block_index, &fx.ms.chain_active,
+             &published, NULL, NULL, NULL);
+    /* The old raw access observes this earlier tip and rejects h=2. */
+    fx.ms.pindex_best_header = fx.tip;
+    enum body_fetch_exact_authority_state state = BODY_FETCH_EXACT_BEST_ABSENT;
+    struct block_index *resolved = body_fetch_exact_authority_resolve(
+        progress_store_db(), &fx.ms, fx.target, fx.child->phashBlock, &state);
+    bool ok = resolved == fx.child && state == BODY_FETCH_EXACT_READY;
+    teardown_fixture(&fx);
+    return ok;
+}
+
 int test_body_fetch_missing_have_data_condition(void)
 {
     printf("\n=== body_fetch_missing_have_data condition tests ===\n");
     int failures = 0;
+
+    BFMHD_CHECK("exact authority uses the published csr header",
+                body_fetch_uses_published_csr_header());
 
     {
         struct bfmhd_fixture fx;

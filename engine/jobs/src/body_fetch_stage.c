@@ -15,6 +15,7 @@
 #include "jobs/stage_helpers.h"
 #include "jobs/tip_finalize_stage.h"
 #include "body_fetch_log_store.h"
+#include "services/chain_state_service.h"
 
 #include "chain/chain.h"
 #include "core/uint256.h"
@@ -129,17 +130,18 @@ const char *body_fetch_exact_authority_state_name(
  * owns cs_main.  `durable_parent_hash` was captured before taking cs_main and
  * is consulted only when the raw active parent slot is absent. */
 static struct block_index *body_fetch_exact_authority_locked(
-    struct main_state *ms, int height, const struct uint256 *expected_hash,
+    struct main_state *ms, struct block_index *header_tip, int height,
+    const struct uint256 *expected_hash,
     const struct uint256 *durable_parent_hash,
     enum body_fetch_exact_authority_state *out_state)
 {
     *out_state = BODY_FETCH_EXACT_BEST_ABSENT;
-    if (!ms || height < 0 || !expected_hash || !ms->pindex_best_header ||
-        height > ms->pindex_best_header->nHeight)
+    if (!ms || height < 0 || !expected_hash || !header_tip ||
+        height > header_tip->nHeight)
         return NULL;
 
     struct block_index *best = block_index_get_ancestor(
-        ms->pindex_best_header, height);
+        header_tip, height);
     if (!best || !best->phashBlock)
         return NULL;
     if (!uint256_eq(best->phashBlock, expected_hash)) {
@@ -202,6 +204,22 @@ static struct block_index *body_fetch_exact_authority_locked(
     return active ? active : best;
 }
 
+/* CSR owns best-header publication. Snapshot before cs_main so this resolver
+ * never nests the two lock domains; the block-index object has process
+ * lifetime and remains readable while cs_main protects map/active-chain use. */
+static struct block_index *body_fetch_header_tip_snapshot(
+    struct main_state *ms)
+{
+    struct block_index *tip = csr_header_tip_snapshot(csr_instance());
+#ifdef ZCL_TESTING
+    if (!tip && ms)
+        tip = ms->pindex_best_header;
+#else
+    (void)ms;
+#endif
+    return tip;
+}
+
 static bool body_fetch_durable_parent_hash_at(sqlite3 *db, int height,
                                                struct uint256 *out)
 {
@@ -236,9 +254,10 @@ struct block_index *body_fetch_exact_authority_resolve(
     if (!db || !ms || height < 0 || !expected_hash)
         return NULL;
 
+    struct block_index *header_tip = body_fetch_header_tip_snapshot(ms);
     zcl_mutex_lock(&ms->cs_main);
     struct block_index *bi = body_fetch_exact_authority_locked(
-        ms, height, expected_hash, NULL, out_state);
+        ms, header_tip, height, expected_hash, NULL, out_state);
     zcl_mutex_unlock(&ms->cs_main);
     if (bi || *out_state != BODY_FETCH_EXACT_PARENT_ABSENT || height == 0)
         return bi;
@@ -273,9 +292,11 @@ struct block_index *body_fetch_exact_authority_resolve(
 
     /* Re-resolve every identity after re-locking.  No pointer or verdict from
      * the first pass crosses the lock gap. */
+    header_tip = body_fetch_header_tip_snapshot(ms);
     zcl_mutex_lock(&ms->cs_main);
     bi = body_fetch_exact_authority_locked(
-        ms, height, expected_hash, &durable_parent_hash, out_state);
+        ms, header_tip, height, expected_hash, &durable_parent_hash,
+        out_state);
     zcl_mutex_unlock(&ms->cs_main);
     return bi;
 }
