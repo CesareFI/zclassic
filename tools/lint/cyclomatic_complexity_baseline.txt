@@ -1866,7 +1866,7 @@ engine/jobs/src/utxo_apply_anchors.c:utxo_apply_anchor_bind_mismatch:20
 engine/jobs/src/utxo_apply_delta.c:utxo_apply_compute_block_delta:61
 engine/jobs/src/utxo_apply_delta_reorg.c:utxo_apply_emit_inverse_delta:21
 engine/jobs/src/utxo_apply_delta_reorg.c:utxo_apply_reorg_unwind_if_needed:39
-engine/jobs/src/utxo_apply_delta_repair.c:prove_exact_future_coin_suffix:19
+engine/jobs/src/utxo_apply_delta_repair.c:prove_exact_future_coin_suffix:5
 engine/jobs/src/utxo_apply_delta_repair.c:utxo_apply_reconcile_unapplied_suffix:22
 engine/jobs/src/utxo_apply_delta_repair.c:utxo_apply_repair_value_overflow_hole:42
 engine/jobs/src/utxo_apply_history_hold.c:utxo_apply_history_hold_should_park:20

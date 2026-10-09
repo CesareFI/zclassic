@@ -113,13 +113,9 @@ static bool future_coin_matches_output(sqlite3 *db,
             memcmp(script, out->script_pub_key.data, script_len) == 0);
 }
 
-/* Prove that rows with creator heights at/above `first` are exactly every
- * spendable output of a canonical, body-readable block suffix.  Inputs are
- * restored separately from their hash-verified pre-suffix creators below. */
-static bool prove_exact_future_coin_suffix(
-    sqlite3 *db, struct main_state *ms, const char *datadir,
-    utxo_apply_reader_fn reader, void *reader_user,
-    int first, int last, int64_t actual_rows)
+static bool future_coin_range_is_bounded(struct main_state *ms,
+                                         const char *datadir, int first,
+                                         int last, int64_t *span_out)
 {
     int64_t span = (int64_t)last - (int64_t)first + 1;
     if (!ms || !datadir || first < 0 || last < first || span <= 0 ||
@@ -131,44 +127,69 @@ static bool prove_exact_future_coin_suffix(
                  (void *)ms, (const void *)datadir);
         return false;
     }
+    *span_out = span;
+    return true;
+}
+
+static bool prove_future_coin_block(sqlite3 *db, struct main_state *ms,
+                                    const char *datadir,
+                                    utxo_apply_reader_fn reader,
+                                    void *reader_user, int height,
+                                    int64_t *expected_rows)
+{
+    struct block_index *bi = stage_body_index_at(ms, height);
+    struct block blk;
+    block_init(&blk);
+    if (!bi || bi->nHeight != height || !bi->phashBlock ||
+        !stage_read_block(&blk, bi, height, datadir, reader, reader_user)) {
+        block_free(&blk);
+        LOG_WARN("utxo_apply",
+                 "[utxo_apply] future coin repair refused: canonical "
+                 "body unavailable h=%d", height);
+        return false;
+    }
+
+    bool block_ok = true;
+    for (size_t ti = 0; ti < blk.num_vtx && block_ok; ti++) {
+        const struct transaction *tx = &blk.vtx[ti];
+        for (size_t vo = 0; vo < tx->num_vout; vo++) {
+            const struct tx_out *out = &tx->vout[vo];
+            if (tx_out_is_null(out) ||
+                script_is_unspendable(&out->script_pub_key))
+                continue;
+            if (vo > UINT32_MAX ||
+                !future_coin_matches_output(db, tx, (uint32_t)vo, height)) {
+                LOG_WARN("utxo_apply",
+                         "[utxo_apply] future coin repair refused: "
+                         "created-output mismatch h=%d tx=%zu vout=%zu",
+                         height, ti, vo);
+                block_ok = false;
+                break;
+            }
+            (*expected_rows)++;
+        }
+    }
+    block_free(&blk);
+    return block_ok;
+}
+
+/* Prove that rows with creator heights at/above `first` are exactly every
+ * spendable output of a canonical, body-readable block suffix.  Inputs are
+ * restored separately from their hash-verified pre-suffix creators below. */
+static bool prove_exact_future_coin_suffix(
+    sqlite3 *db, struct main_state *ms, const char *datadir,
+    utxo_apply_reader_fn reader, void *reader_user,
+    int first, int last, int64_t actual_rows)
+{
+    int64_t span = 0;
+    if (!future_coin_range_is_bounded(ms, datadir, first, last, &span))
+        return false;
 
     int64_t expected_rows = 0;
     for (int64_t offset = 0; offset < span; offset++) {
         int h = first + (int)offset;
-        struct block_index *bi = stage_body_index_at(ms, h);
-        struct block blk;
-        block_init(&blk);
-        if (!bi || bi->nHeight != h || !bi->phashBlock ||
-            !stage_read_block(&blk, bi, h, datadir, reader, reader_user)) {
-            block_free(&blk);
-            LOG_WARN("utxo_apply",
-                     "[utxo_apply] future coin repair refused: canonical "
-                     "body unavailable h=%d", h);
-            return false;
-        }
-
-        bool block_ok = true;
-        for (size_t ti = 0; ti < blk.num_vtx && block_ok; ti++) {
-            const struct transaction *tx = &blk.vtx[ti];
-            for (size_t vo = 0; vo < tx->num_vout; vo++) {
-                const struct tx_out *out = &tx->vout[vo];
-                if (tx_out_is_null(out) ||
-                    script_is_unspendable(&out->script_pub_key))
-                    continue;
-                if (vo > UINT32_MAX ||
-                    !future_coin_matches_output(db, tx, (uint32_t)vo, h)) {
-                    LOG_WARN("utxo_apply",
-                             "[utxo_apply] future coin repair refused: "
-                             "created-output mismatch h=%d tx=%zu vout=%zu",
-                             h, ti, vo);
-                    block_ok = false;
-                    break;
-                }
-                expected_rows++;
-            }
-        }
-        block_free(&blk);
-        if (!block_ok)
+        if (!prove_future_coin_block(db, ms, datadir, reader, reader_user,
+                                     h, &expected_rows))
             return false;
     }
     if (expected_rows != actual_rows) {

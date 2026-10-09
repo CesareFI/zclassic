@@ -8,6 +8,23 @@
 #include "validation/chainstate.h"
 #include "validation/main_state.h"
 
+static struct block_index *body_owner_from_canonical(
+    struct main_state *ms, struct block_index *canonical, int height)
+{
+    if (!canonical || !canonical->phashBlock)
+        return NULL;
+    if (block_index_status_load(canonical) & BLOCK_HAVE_DATA)
+        return canonical;
+
+    struct block_index *body =
+        block_map_find(&ms->map_block_index, canonical->phashBlock);
+    if (!body || body->nHeight != height ||
+        !(block_index_status_load(body) & BLOCK_HAVE_DATA) ||
+        (block_index_status_load(body) & BLOCK_FAILED_MASK))
+        return canonical;
+    return body;
+}
+
 struct block_index *stage_body_index_at(struct main_state *ms, int height)
 {
     if (!ms || height < 0)
@@ -44,16 +61,5 @@ struct block_index *stage_body_index_at(struct main_state *ms, int height)
     if (!canonical && frontier.header_tip &&
         height <= frontier.header_tip->nHeight)
         canonical = block_index_get_ancestor(frontier.header_tip, height);
-    if (!canonical || !canonical->phashBlock)
-        return NULL;
-    if (block_index_status_load(canonical) & BLOCK_HAVE_DATA)
-        return canonical;
-
-    struct block_index *body =
-        block_map_find(&ms->map_block_index, canonical->phashBlock);
-    if (!body || body->nHeight != height ||
-        !(block_index_status_load(body) & BLOCK_HAVE_DATA) ||
-        (block_index_status_load(body) & BLOCK_FAILED_MASK))
-        return canonical;
-    return body;
+    return body_owner_from_canonical(ms, canonical, height);
 }
