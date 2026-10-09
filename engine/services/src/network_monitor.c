@@ -635,6 +635,10 @@ void network_monitor_stop(void)
         pthread_join(g_nm.thread, NULL);
         g_nm.thread_running = false;
     }
+    supervisor_child_id id = atomic_exchange(&g_nm.supervisor_id,
+                                              SUPERVISOR_INVALID_ID);
+    if (id != SUPERVISOR_INVALID_ID)
+        supervisor_unregister(id);
     g_nm.started = false;
 }
 

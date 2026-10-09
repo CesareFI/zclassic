@@ -16,6 +16,7 @@
 #include "conditions/net_tip_regression.h"
 #include "conditions/net_fork_detected.h"
 #include "conditions/net_partition_suspected.h"
+#include "util/supervisor.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -76,6 +77,21 @@ static int test_config_env_numbers(void)
     NM_CHECK(cfg.sample_interval_secs == 1 && cfg.retain_rows == 100);
     unsetenv("ZCL_NETMON_INTERVAL_SECS");
     unsetenv("ZCL_NETMON_RETAIN_ROWS");
+    return failures;
+}
+
+static int test_monitor_stop_releases_supervisor(void)
+{
+    struct network_monitor_config cfg;
+    int failures = 0;
+
+    supervisor_reset_for_testing();
+    network_monitor_config_defaults(&cfg);
+    NM_CHECK(network_monitor_start(&cfg, NULL).ok);
+    NM_CHECK(supervisor_child_count_total() == 1);
+    network_monitor_stop();
+    NM_CHECK(supervisor_child_count_total() == 0);
+    supervisor_reset_for_testing();
     return failures;
 }
 
@@ -349,6 +365,7 @@ int test_network_monitor(void)
     printf("\n=== network_monitor tests ===\n");
     int failures = 0;
     failures += test_config_env_numbers();
+    failures += test_monitor_stop_releases_supervisor();
     failures += test_monotonic_sample_schedule();
     failures += test_observation_model();
     failures += test_consensus_view();
