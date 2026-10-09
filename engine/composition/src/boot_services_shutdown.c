@@ -117,6 +117,12 @@ static bool shutdown_quiesce_network_and_flush_coins(struct boot_svc_ctx *svc,
      * g_shutdown_requested and returns before mutating coins further. */
     printf("[shutdown] stopping network services\n");
     zcl_service_kernel_stop_all(&svc->network_kernel);
+    /* gap-fill can still hold its optional dispatcher callback here.  That
+     * callback targets connman, so join the worker before connman teardown:
+     * clearing the callback alone cannot retract a callback another worker
+     * already copied out of gap-fill's mutex.  The runtime-kernel stop later
+     * is idempotent. */
+    boot_gap_fill_stop(svc);
     printf("[shutdown] joining replay service\n");
     boot_join_replay_service(svc);
     msg_processor_stop_block_intake(svc->msg_processor);
