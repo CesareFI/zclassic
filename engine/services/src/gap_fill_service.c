@@ -205,8 +205,8 @@ bool gap_fill_compute_window(int active_tip_h, int best_header_h,
     /* Only form the successor after the strict ordering above establishes
      * that effective_tip_h is below an in-domain best_header_h. */
     out->lo = out->effective_tip_h + 1;
-    int gap = best_header_h - out->effective_tip_h;
-    int count = gap < GAPFILL_WINDOW ? gap : GAPFILL_WINDOW;
+    int64_t gap = (int64_t)best_header_h - out->effective_tip_h;
+    int count = gap < GAPFILL_WINDOW ? (int)gap : GAPFILL_WINDOW;
     out->count = count;
     out->hi = out->effective_tip_h + count;
     out->has_work = count > 0;

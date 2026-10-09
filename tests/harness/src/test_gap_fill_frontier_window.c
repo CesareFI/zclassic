@@ -73,6 +73,15 @@ static int gf_maximum_height_window_bounds(void)
              has && window.effective_tip_h == INT_MAX - 1 &&
                  window.lo == INT_MAX && window.hi == INT_MAX &&
                  window.count == 1);
+
+    /* A fresh chain has active height -1. An extreme imported header tip is
+     * still an ordered gap, so the bounded window must be formed without
+     * evaluating INT_MAX - (-1) in int arithmetic. */
+    has = gap_fill_compute_window(-1, INT_MAX, 0, &window);
+    GF_CHECK("genesis-to-maximum header gap stays bounded",
+             has && window.effective_tip_h == -1 && window.lo == 0 &&
+                 window.count == GAPFILL_WINDOW &&
+                 window.hi == GAPFILL_WINDOW - 1);
     return failures;
 }
 
