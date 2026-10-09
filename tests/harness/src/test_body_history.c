@@ -56,6 +56,7 @@
 struct bh_global_init_ctx {
     pthread_mutex_t lock;
     pthread_cond_t ready;
+    pthread_cond_t release;
     size_t waiting;
     bool go;
     struct body_history_census *censuses[2];
@@ -74,7 +75,7 @@ static void *bh_get_global_census(void *opaque)
     arg->ctx->waiting++;
     pthread_cond_signal(&arg->ctx->ready);
     while (!arg->ctx->go)
-        pthread_cond_wait(&arg->ctx->ready, &arg->ctx->lock);
+        pthread_cond_wait(&arg->ctx->release, &arg->ctx->lock);
     pthread_mutex_unlock(&arg->ctx->lock);
     arg->ctx->censuses[arg->slot] = body_history_global_census();
     return NULL;
@@ -92,6 +93,7 @@ static int test_bh_global_init_is_thread_safe(void)
         pthread_t threads[2];
         ASSERT_EQ(pthread_mutex_init(&ctx.lock, NULL), 0);
         ASSERT_EQ(pthread_cond_init(&ctx.ready, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&ctx.release, NULL), 0);
         ASSERT_EQ(pthread_create(&threads[0], NULL, bh_get_global_census,
                                  &args[0]), 0);
         ASSERT_EQ(pthread_create(&threads[1], NULL, bh_get_global_census,
@@ -100,10 +102,11 @@ static int test_bh_global_init_is_thread_safe(void)
         while (ctx.waiting < 2)
             ASSERT_EQ(pthread_cond_wait(&ctx.ready, &ctx.lock), 0);
         ctx.go = true;
-        ASSERT_EQ(pthread_cond_broadcast(&ctx.ready), 0);
+        ASSERT_EQ(pthread_cond_broadcast(&ctx.release), 0);
         ASSERT_EQ(pthread_mutex_unlock(&ctx.lock), 0);
         ASSERT_EQ(pthread_join(threads[0], NULL), 0);
         ASSERT_EQ(pthread_join(threads[1], NULL), 0);
+        ASSERT_EQ(pthread_cond_destroy(&ctx.release), 0);
         ASSERT_EQ(pthread_cond_destroy(&ctx.ready), 0);
         ASSERT_EQ(pthread_mutex_destroy(&ctx.lock), 0);
         ASSERT(ctx.censuses[0] != NULL);
