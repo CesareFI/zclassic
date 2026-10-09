@@ -263,7 +263,8 @@ int script_validate_log_verdict_at(sqlite3 *db, int height,
         return -1;  // raw-return-ok:logged-above
     }
     int found = 0;
-    if (sqlite3_step(st) == SQLITE_ROW) {  // raw-sql-ok:progress-kv-kernel-store
+    int rc = sqlite3_step(st);  // raw-sql-ok:progress-kv-kernel-store
+    if (rc == SQLITE_ROW) {
         out->ok = sqlite3_column_type(st, 0) == SQLITE_INTEGER
                     ? sqlite3_column_int(st, 0) : -1;
         int status_type = sqlite3_column_type(st, 1);
@@ -281,6 +282,11 @@ int script_validate_log_verdict_at(sqlite3 *db, int height,
             out->has_block_hash = true;
         }
         found = 1;
+    } else if (rc != SQLITE_DONE) {
+        LOG_WARN("script_validate",
+                 "[script_validate] verdict_at step failed h=%d rc=%d: %s",
+                 height, rc, sqlite3_errmsg(db));
+        found = -1;
     }
     sqlite3_finalize(st);
     return found;

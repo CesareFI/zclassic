@@ -21,6 +21,7 @@
 #include "jobs/utxo_apply_stage.h"
 #include "jobs/tip_finalize_stage.h"
 #include "../../../engine/jobs/src/utxo_apply_log_store.h"
+#include "../../../engine/jobs/src/script_validate_log_store.h"
 #include "storage/anchor_kv.h"
 #include "storage/coins_kv.h"
 #include "storage/disk_block_io.h"
@@ -325,6 +326,28 @@ static bool proof_validate_log_read_error_is_not_missing(void)
     if (ok) {
         sqlite3_progress_handler(db, 1, interrupt_proof_validate_read, NULL);
         ok = utxo_apply_proof_validate_log_at(db, 0, &row) == -1;
+        sqlite3_progress_handler(db, 0, NULL, NULL);
+    }
+    if (db)
+        sqlite3_close(db);
+    return ok;
+}
+
+static bool script_validate_log_read_error_is_not_missing(void)
+{
+    sqlite3 *db = NULL;
+    struct script_validate_verdict_row row;
+    bool ok = sqlite3_open(":memory:", &db) == SQLITE_OK;
+    if (ok)
+        ok = exec_sql(db,
+            "CREATE TABLE script_validate_log (height INTEGER PRIMARY KEY, "
+            "ok INTEGER NOT NULL, status TEXT NOT NULL, block_hash BLOB)") &&
+            exec_sql(db,
+                "INSERT INTO script_validate_log VALUES "
+                "(0, 1, 'verified', zeroblob(32))");
+    if (ok) {
+        sqlite3_progress_handler(db, 1, interrupt_proof_validate_read, NULL);
+        ok = script_validate_log_verdict_at(db, 0, &row) == -1;
         sqlite3_progress_handler(db, 0, NULL, NULL);
     }
     if (db)
@@ -813,6 +836,8 @@ int test_utxo_apply_stage(void)
     blocker_module_init();
     UV_CHECK("proof_validate_log: read errors are not missing rows",
              proof_validate_log_read_error_is_not_missing());
+    UV_CHECK("script_validate_log: read errors are not missing rows",
+             script_validate_log_read_error_is_not_missing());
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_uv sc;
