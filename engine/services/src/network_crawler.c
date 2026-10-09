@@ -34,6 +34,7 @@
 #include "platform/time_compat.h"
 #include "storage/topology_store.h"
 #include "util/log_macros.h"
+#include "util/parse_num.h"
 #include "util/supervisor.h"
 #include "util/sync.h"
 #include "util/thread_registry.h"
@@ -150,6 +151,18 @@ static bool ncrawl_env_falsy(const char *e)
                  e[0] == 'n' || e[0] == 'N');
 }
 
+static bool ncrawl_env_int(const char *name, int min, int max, int *out)
+{
+    const char *text = getenv(name);
+    int64_t value;
+
+    if (!text || !text[0] || !out || !zcl_parse_i64(text, &value) ||
+        value < min || value > max)
+        return false;
+    *out = (int)value;
+    return true;
+}
+
 static void ncrawl_config_from_env(struct network_crawler_config *cfg)
 {
     /* ON by default (omniscience directive); both the -netcrawl CLI flag and
@@ -165,48 +178,27 @@ static void ncrawl_config_from_env(struct network_crawler_config *cfg)
         cfg->enabled = true;
     if (GetArg("-netcrawl", NULL))            /* flag present → it decides */
         cfg->enabled = GetBoolArg("-netcrawl", true);
-    const char *iv = getenv("ZCL_NETCRAWL_INTERVAL_SECS");
-    if (iv && iv[0]) {
-        int v = atoi(iv);
-        if (v >= 5 && v <= 86400)
-            cfg->round_interval_secs = v;
-    }
-    const char *pr = getenv("ZCL_NETCRAWL_MAX_PER_ROUND");
-    if (pr && pr[0]) {
-        int v = atoi(pr);
-        if (v >= 1 && v <= NCRAWL_MAX_PER_ROUND)
-            cfg->max_per_round = v;
-    }
-    const char *mc = getenv("ZCL_NETCRAWL_MAX_CONCURRENT");
-    if (mc && mc[0]) {
-        int v = atoi(mc);
-        if (v >= 1 && v <= NCRAWL_MAX_CONCURRENT)
-            cfg->max_concurrent = v;
-    }
-    const char *op = getenv("ZCL_NETCRAWL_ONION_PER_ROUND");
-    if (op && op[0]) {
-        int v = atoi(op);
-        if (v >= 0 && v <= NCRAWL_MAX_ONION_PER_ROUND)
-            cfg->onion_max_per_round = v;
-    }
-    const char *oc = getenv("ZCL_NETCRAWL_ONION_CONCURRENT");
-    if (oc && oc[0]) {
-        int v = atoi(oc);
-        if (v >= 1 && v <= NCRAWL_MAX_ONION_CONCURRENT)
-            cfg->onion_max_concurrent = v;
-    }
-    const char *ot = getenv("ZCL_NETCRAWL_ONION_TIMEOUT_MS");
-    if (ot && ot[0]) {
-        int v = atoi(ot);
-        if (v >= 100 && v <= 120000)
-            cfg->onion_timeout_ms = v;
-    }
-    const char *ob = getenv("ZCL_NETCRAWL_ONION_BUDGET_MS");
-    if (ob && ob[0]) {
-        int v = atoi(ob);
-        if (v >= 0 && v <= 240000)
-            cfg->onion_round_budget_ms = v;
-    }
+    int value;
+    if (ncrawl_env_int("ZCL_NETCRAWL_INTERVAL_SECS", 5, 86400, &value))
+        cfg->round_interval_secs = value;
+    if (ncrawl_env_int("ZCL_NETCRAWL_MAX_PER_ROUND", 1,
+                       NCRAWL_MAX_PER_ROUND, &value))
+        cfg->max_per_round = value;
+    if (ncrawl_env_int("ZCL_NETCRAWL_MAX_CONCURRENT", 1,
+                       NCRAWL_MAX_CONCURRENT, &value))
+        cfg->max_concurrent = value;
+    if (ncrawl_env_int("ZCL_NETCRAWL_ONION_PER_ROUND", 0,
+                       NCRAWL_MAX_ONION_PER_ROUND, &value))
+        cfg->onion_max_per_round = value;
+    if (ncrawl_env_int("ZCL_NETCRAWL_ONION_CONCURRENT", 1,
+                       NCRAWL_MAX_ONION_CONCURRENT, &value))
+        cfg->onion_max_concurrent = value;
+    if (ncrawl_env_int("ZCL_NETCRAWL_ONION_TIMEOUT_MS", 100, 120000,
+                       &value))
+        cfg->onion_timeout_ms = value;
+    if (ncrawl_env_int("ZCL_NETCRAWL_ONION_BUDGET_MS", 0, 240000,
+                       &value))
+        cfg->onion_round_budget_ms = value;
 }
 
 /* Clamp every knob into its hard bound (defensive: env + cfg both untrusted). */
@@ -650,6 +642,14 @@ bool network_crawler_dump_state_json(struct json_value *out, const char *key)
 }
 
 #ifdef ZCL_TESTING
+void network_crawler_test_config_from_env(struct network_crawler_config *cfg)
+{
+    if (!cfg)
+        return;
+    ncrawl_config_from_env(cfg);
+    ncrawl_clamp(cfg);
+}
+
 void network_crawler_test_reset(void)
 {
     ncrawl_lock();

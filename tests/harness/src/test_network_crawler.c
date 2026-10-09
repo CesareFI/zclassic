@@ -43,6 +43,49 @@
     else { printf("  FAIL: %s (line %d)\n", #cond, __LINE__); failures++; } \
 } while (0)
 
+struct nc_saved_env {
+    const char *name;
+    char *value;
+    bool was_set;
+};
+
+static bool nc_save_env(struct nc_saved_env *saved, const char *name)
+{
+    const char *value;
+    size_t length;
+
+    if (!saved || !name)
+        return false;
+    value = getenv(name);
+    saved->name = name;
+    saved->value = NULL;
+    saved->was_set = value != NULL;
+    if (!value)
+        return true;
+    length = strlen(value);
+    if (length == SIZE_MAX)
+        return false;
+    saved->value = malloc(length + 1);
+    if (!saved->value)
+        return false;
+    memcpy(saved->value, value, length + 1);
+    return true;
+}
+
+static bool nc_restore_env(struct nc_saved_env *saved)
+{
+    bool ok;
+
+    if (!saved || !saved->name)
+        return false;
+    ok = saved->was_set ?
+        setenv(saved->name, saved->value, 1) == 0 :
+        unsetenv(saved->name) == 0;
+    free(saved->value);
+    saved->value = NULL;
+    return ok;
+}
+
 /* ── synthetic address + probe (properties encoded in IPv4 octets) ────── */
 
 static struct net_address mk_addr(uint8_t hc, bool reachable, bool onion,
@@ -172,10 +215,52 @@ static struct ncrawl_probe_result mk_res(const char *addr, bool reachable,
     return r;
 }
 
+static int test_crawler_config_env(void)
+{
+    int failures = 0;
+    struct network_crawler_config cfg;
+    struct nc_saved_env interval_env = {0};
+    struct nc_saved_env concurrent_env = {0};
+    struct nc_saved_env budget_env = {0};
+    network_crawler_config_defaults(&cfg);
+    int before_interval = cfg.round_interval_secs;
+    int before_concurrent = cfg.max_concurrent;
+    int before_budget = cfg.onion_round_budget_ms;
+    bool env_ok =
+        nc_save_env(&interval_env, "ZCL_NETCRAWL_INTERVAL_SECS") &&
+        nc_save_env(&concurrent_env, "ZCL_NETCRAWL_MAX_CONCURRENT") &&
+        nc_save_env(&budget_env, "ZCL_NETCRAWL_ONION_BUDGET_MS") &&
+        setenv("ZCL_NETCRAWL_INTERVAL_SECS", "5junk", 1) == 0 &&
+        setenv("ZCL_NETCRAWL_MAX_CONCURRENT",
+               "999999999999999999999", 1) == 0 &&
+        setenv("ZCL_NETCRAWL_ONION_BUDGET_MS", "25000ms", 1) == 0;
+
+    network_crawler_test_config_from_env(&cfg);
+    NC_CHECK(env_ok);
+    NC_CHECK(cfg.round_interval_secs == before_interval);
+    NC_CHECK(cfg.max_concurrent == before_concurrent);
+    NC_CHECK(cfg.onion_round_budget_ms == before_budget);
+    NC_CHECK(setenv("ZCL_NETCRAWL_INTERVAL_SECS", "30", 1) == 0);
+    NC_CHECK(setenv("ZCL_NETCRAWL_MAX_CONCURRENT", "2", 1) == 0);
+    NC_CHECK(setenv("ZCL_NETCRAWL_ONION_BUDGET_MS", "0", 1) == 0);
+    network_crawler_test_config_from_env(&cfg);
+    NC_CHECK(cfg.round_interval_secs == 30);
+    NC_CHECK(cfg.max_concurrent == 2);
+    NC_CHECK(cfg.onion_round_budget_ms == 0);
+    NC_CHECK(nc_restore_env(&interval_env));
+    NC_CHECK(nc_restore_env(&concurrent_env));
+    NC_CHECK(nc_restore_env(&budget_env));
+    return failures;
+}
+
 int test_network_crawler(void)
 {
     int failures = 0;
     printf("network_crawler...\n");
+
+    printf("  config: rejects malformed and overflowing numeric overrides... ");
+    failures += test_crawler_config_env();
+    printf("done\n");
 
     /* ── 1. pure fold: histograms, splits, height distribution ─────────── */
     printf("  census fold: histogram + split + height distribution... ");

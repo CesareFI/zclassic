@@ -235,6 +235,9 @@ bool network_crawler_dump_state_json(struct json_value *out, const char *key);
 
 #ifdef ZCL_TESTING
 void network_crawler_test_reset(void);
+/* Apply the crawler's environment overrides and hard bounds without starting
+ * a worker. Keeps malformed configuration regression coverage hermetic. */
+void network_crawler_test_config_from_env(struct network_crawler_config *cfg);
 void network_crawler_test_set_probe_fn(ncrawl_probe_fn fn);
 void network_crawler_test_set_own_modal(int64_t h);
 /* Drive one synchronous probe round over addrs[0..n) using the (injected)
