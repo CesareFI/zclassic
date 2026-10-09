@@ -106,6 +106,11 @@ int proof_validate_script_validate_log_at(sqlite3 *db, int height,
             out->has_block_hash = true;
         }
         found = 1;
+    } else if (rc != SQLITE_DONE) {
+        LOG_WARN("proof_validate",
+                 "[proof_validate] script_validate_log read failed h=%d "
+                 "rc=%d: %s", height, rc, sqlite3_errmsg(db));
+        found = -1;
     }
     sqlite3_finalize(st);
     return found;
