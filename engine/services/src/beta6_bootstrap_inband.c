@@ -260,6 +260,14 @@ static bool serve_chunk(struct msg_processor *mp, struct p2p_node *node,
         LOG_INFO("beta6boot", "peer %s: malformed %s", node->addr_name, command);
         return send_reject(mp, node, command, "malformed bootstrap chunk request");
     }
+    if (params) {
+        struct zcl_result params_status = beta6_bs_inband_params_status();
+        if (!params_status.ok) {
+            LOG_INFO("beta6boot", "peer %s: %s refused before quota: %s",
+                     node->addr_name, command, params_status.message);
+            return send_reject(mp, node, command, params_status.message);
+        }
+    }
     if (!quota_admits(node, request.length)) {
         LOG_INFO("beta6boot", "peer %s: %s refused, over the daily serve cap",
                  node->addr_name, command);

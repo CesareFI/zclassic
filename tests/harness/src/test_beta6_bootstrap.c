@@ -997,7 +997,7 @@ int test_beta6_bootstrap(void)
         seam_drain(&node);
         const unsigned char param_chunk_request[16] = {
             0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 1, 0, 0, 0
+            0, 0, 0, 0, 20, 0, 0, 0
         };
         ASSERT(beta6_bs_inband_serve(&mp, &node, "getbspchk",
                                      param_chunk_request,
@@ -1005,6 +1005,25 @@ int test_beta6_bootstrap(void)
         ASSERT(node.send_head != NULL);
         ASSERT_STR_EQ((const char *)node.send_head->data + 4, "reject");
         seam_drain(&node);
+
+        /* An unavailable parameter source must reject before reserving this
+         * peer's quota. Otherwise this rejected request fills the small
+         * fixture bucket and denies the next valid snapshot chunk. */
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(20, 0);
+        ASSERT(beta6_bs_inband_serve(&mp, &node, "getbspchk",
+                                     param_chunk_request,
+                                     sizeof(param_chunk_request)).ok);
+        ASSERT_STR_EQ((const char *)node.send_head->data + 4, "reject");
+        seam_drain(&node);
+        ASSERT(beta6_bs_inband_serve(&mp, &node, "getbschk",
+                                     param_chunk_request,
+                                     sizeof(param_chunk_request)).ok);
+        ASSERT_STR_EQ((const char *)node.send_head->data + 4, "bschk");
+        seam_drain(&node);
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(BETA6_BS_DEFAULT_MAX_BYTES_PER_DAY,
+                                 BETA6_BS_DEFAULT_THROTTLE_KBPS);
 
         /* An unsolicited SERVER reply is dropped, not parsed and not answered. */
         ASSERT(beta6_bs_inband_serve(&mp, &node, "bschk", NULL, 0).ok);
