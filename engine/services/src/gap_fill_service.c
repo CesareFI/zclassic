@@ -191,7 +191,6 @@ bool gap_fill_compute_window(int active_tip_h, int best_header_h,
     memset(out, 0, sizeof(*out));
     out->effective_tip_h = active_tip_h;
     out->best_h = best_header_h;
-    out->lo = active_tip_h + 1;
     out->hi = active_tip_h;
 
     if (floor_cursor > 0 &&
@@ -199,11 +198,13 @@ bool gap_fill_compute_window(int active_tip_h, int best_header_h,
         out->effective_tip_h = (int)floor_cursor - 1;
     }
 
-    out->lo = out->effective_tip_h + 1;
     out->hi = out->effective_tip_h;
     if (best_header_h <= out->effective_tip_h)
         return false;
 
+    /* Only form the successor after the strict ordering above establishes
+     * that effective_tip_h is below an in-domain best_header_h. */
+    out->lo = out->effective_tip_h + 1;
     int gap = best_header_h - out->effective_tip_h;
     int count = gap < GAPFILL_WINDOW ? gap : GAPFILL_WINDOW;
     out->count = count;

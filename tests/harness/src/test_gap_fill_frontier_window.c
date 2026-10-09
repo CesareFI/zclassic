@@ -12,6 +12,7 @@
 #include "services/gap_fill_service.h"
 #include "util/safe_alloc.h"
 
+#include <limits.h>
 #include <stdlib.h>
 
 #define GF_CHECK(name, expr) do {                                      \
@@ -53,6 +54,28 @@ static bool gf_build_chain(int count, struct block_index **blocks_out,
     return true;
 }
 
+static int gf_maximum_height_window_bounds(void)
+{
+    int failures = 0;
+    struct gap_fill_window window;
+
+    /* A corrupt/imported maximum height can name no successor.  Refuse an
+     * empty window without forming INT_MAX + 1.  A lower validated-header
+     * cursor still leaves the single maximum-height body requestable. */
+    bool has = gap_fill_compute_window(INT_MAX, INT_MAX, 0, &window);
+    GF_CHECK("maximum tip without a successor refuses without overflow",
+             !has && !window.has_work &&
+                 window.effective_tip_h == INT_MAX &&
+                 window.hi == INT_MAX);
+    has = gap_fill_compute_window(INT_MAX, INT_MAX, (uint64_t)INT_MAX,
+                                  &window);
+    GF_CHECK("maximum header remains requestable from a lower cursor",
+             has && window.effective_tip_h == INT_MAX - 1 &&
+                 window.lo == INT_MAX && window.hi == INT_MAX &&
+                 window.count == 1);
+    return failures;
+}
+
 int test_gap_fill_frontier_window(void)
 {
     printf("\n=== gap_fill_frontier_window ===\n");
@@ -64,6 +87,7 @@ int test_gap_fill_frontier_window(void)
     GF_CHECK("body-fetch cursor anchors below active tip",
              has && w.effective_tip_h == 6763 && w.lo == 6764 &&
                  w.hi == 7600 && w.count == 837);
+    failures += gf_maximum_height_window_bounds();
 
     /* S2.4: gap_fill_compute_window's floor cursor is generic. Feeding it
      * the (structurally faster, body-independent) validate_headers cursor
