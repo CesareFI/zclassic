@@ -13,6 +13,7 @@
 #include "net/protocol.h"
 #include "net/tip_watchdog.h"
 #include "platform/clock.h"
+#include "services/chain_state_service.h"
 #include "services/sync_monitor.h"
 #include "util/blocker.h"
 #include "validation/chainstate.h"
@@ -136,6 +137,28 @@ int test_sync_watchdog_conditions(void)
 {
     printf("\n=== sync watchdog condition tests ===\n");
     int failures = 0;
+
+    {
+        /* Best-header publication belongs to CSR. A stale main-state slot
+         * must not drive periodic sync decisions once the repository exposes
+         * a newer header. This would read height 7 with the old raw access. */
+        struct connman cm;
+        struct download_manager dm;
+        struct main_state ms;
+        struct block_index stale = {0};
+        struct block_index current = {0};
+        reset_sync_watchdog(&cm, &dm, &ms);
+        stale.nHeight = 7;
+        current.nHeight = 8;
+        ms.pindex_best_header = &stale;
+        struct block_index *csr_header = &current;
+        csr_init(csr_instance(), &ms.map_block_index, &ms.chain_active,
+                 &csr_header, NULL, NULL, NULL);
+        bool ok = sync_monitor_test_header_tip_height(&ms) == 8;
+        SYNC_WATCHDOG_CHECK("sync monitor snapshots best header through csr", ok);
+        csr_test_reset_singleton();
+        cleanup_sync_watchdog();
+    }
 
     {
         /* C3: verified reducer progress must reach the network backpressure

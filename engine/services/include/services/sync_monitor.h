@@ -152,6 +152,9 @@ void sync_monitor_test_set_local_recovery(bool active,
 /* Override the last-block-connected timestamp so tip_advance_age() returns a
  * deterministic value. Pass 0 to restore the "never connected" sentinel. */
 void sync_monitor_test_set_tip_advance_ts(int64_t ts);
+/* Exercises the production CSR-backed best-header snapshot. Isolated legacy
+ * fixtures without CSR setup retain the explicit test-only fallback. */
+int sync_monitor_test_header_tip_height(struct main_state *ms);
 #endif
 
 #endif /* ZCL_SERVICES_SYNC_MONITOR_H */

@@ -15,6 +15,7 @@
 #include "platform/time_compat.h"
 #include "sync/sync_planner.h"
 #include "services/chain_activation_service.h"
+#include "services/chain_state_service.h"
 #include "services/gap_fill_service.h"
 #include "sync/sync_state.h"
 #include "validation/chainstate.h"
@@ -222,6 +223,26 @@ int sync_monitor_peer_height_cached(void)
     return atomic_load(&g_tip_eval_peer_height);
 }
 
+/* Best-header publication is serialized by the chain-state repository, not
+ * cs_main. Take that snapshot before callers acquire cs_main: body-queue
+ * selection subsequently reads the process-lifetime index object while it
+ * holds cs_main, without creating a CSR -> cs_main lock-order edge. */
+static struct block_index *sync_monitor_header_tip_snapshot(
+    struct main_state *ms)
+{
+    struct block_index *tip = csr_header_tip_snapshot(csr_instance());
+#ifdef ZCL_TESTING
+    /* Older isolated condition fixtures intentionally do not initialize the
+     * process-wide CSR. They are single-threaded and retain this explicit
+     * test-only seam until their fixtures adopt repository setup. */
+    if (!tip && ms)
+        tip = ms->pindex_best_header;
+#else
+    (void)ms;
+#endif
+    return tip;
+}
+
 struct zcl_result sync_monitor_evaluate_tip_state(void)
 {
     struct main_state *ms = sync_monitor_main_state();
@@ -232,12 +253,11 @@ struct zcl_result sync_monitor_evaluate_tip_state(void)
         return ZCL_OK;
 
     int local_height;
-    int header_height;
+    struct block_index *header_tip = sync_monitor_header_tip_snapshot(ms);
     zcl_mutex_lock(&ms->cs_main);
     local_height = active_chain_height(&ms->chain_active);
-    header_height = ms->pindex_best_header
-        ? ms->pindex_best_header->nHeight : local_height;
     zcl_mutex_unlock(&ms->cs_main);
+    int header_height = header_tip ? header_tip->nHeight : local_height;
 
     int peer_height = connman_max_peer_height(cm);
     size_t peer_count = connman_get_node_count(cm);
@@ -401,13 +421,12 @@ static struct block_index *find_active_frontier_child(
 }
 
 static struct block_index *find_best_header_ancestor(
-    struct main_state *ms,
+    struct block_index *best,
     int target_height)
 {
-    if (!ms || target_height < 0)
+    if (target_height < 0)
         return NULL;
 
-    struct block_index *best = ms->pindex_best_header;
     if (!best || target_height > best->nHeight)
         return NULL;
 
@@ -482,13 +501,14 @@ enum body_queue_selector { BODY_QUEUE_ACTIVE_FRONTIER = 0,
 static struct block_index *resolve_body_queue_target(
     struct main_state *ms,
     int target_height,
-    enum body_queue_selector selector)
+    enum body_queue_selector selector,
+    struct block_index *header_tip)
 {
     switch (selector) {
     case BODY_QUEUE_ACTIVE_FRONTIER:
         return find_active_frontier_child(ms, target_height);
     case BODY_QUEUE_BEST_HEADER_ANCESTOR:
-        return find_best_header_ancestor(ms, target_height);
+        return find_best_header_ancestor(header_tip, target_height);
     }
     return NULL;
 }
@@ -514,6 +534,15 @@ static void queue_body_push(struct download_manager *dm,
     dl_queue_priority(dm, hash, target_height);
 }
 
+static struct block_index *queue_body_header_tip(
+    enum body_queue_selector selector,
+    struct main_state *ms)
+{
+    if (selector != BODY_QUEUE_BEST_HEADER_ANCESTOR)
+        return NULL;
+    return sync_monitor_header_tip_snapshot(ms);
+}
+
 static struct zcl_result queue_body_target(
     int target_height,
     const char *reason,
@@ -531,6 +560,8 @@ static struct zcl_result queue_body_target(
     memset(&target_hash, 0, sizeof(target_hash));
     bool already_have_data = false;
     int local_h = target_height - 1;
+    /* Do not take the CSR lock while cs_main is held below. */
+    struct block_index *header_tip = queue_body_header_tip(selector, ms);
 
     zcl_mutex_lock(&ms->cs_main);
     if (target_height < 0) {
@@ -540,7 +571,7 @@ static struct zcl_result queue_body_target(
     }
 
     struct block_index *target =
-        resolve_body_queue_target(ms, target_height, selector);
+        resolve_body_queue_target(ms, target_height, selector, header_tip);
     if (!target) {
         zcl_mutex_unlock(&ms->cs_main);
         return ZCL_ERR(-3,
@@ -895,5 +926,11 @@ void sync_monitor_test_set_tip_advance_ts(int64_t ts)
 {
     atomic_store(&g_tip_advance_test_override, true);
     atomic_store(&g_last_block_connected_ts, ts);
+}
+
+int sync_monitor_test_header_tip_height(struct main_state *ms)
+{
+    struct block_index *tip = sync_monitor_header_tip_snapshot(ms);
+    return tip ? tip->nHeight : -1; /* raw-return-ok:sentinel */
 }
 #endif
