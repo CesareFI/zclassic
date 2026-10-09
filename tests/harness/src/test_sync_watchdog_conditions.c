@@ -13,6 +13,7 @@
 #include "net/protocol.h"
 #include "net/tip_watchdog.h"
 #include "platform/clock.h"
+#include "services/chain_state_service.h"
 #include "services/sync_monitor.h"
 #include "util/blocker.h"
 #include "validation/chainstate.h"
@@ -132,6 +133,44 @@ static const struct json_value *sync_watchdog_condition_json(
     return NULL;
 }
 
+static bool header_stall_uses_published_csr_header(void)
+{
+    /* CSR may publish a newer header while a stale main-state reader would
+     * still see 2000. The old raw condition then falsely kicked getheaders
+     * against a peer already at the published 2050 frontier. */
+    struct fake_clock clock;
+    fake_clock_install(&clock, 900);
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    reset_sync_watchdog(&cm, &dm, &ms);
+    register_header_stall_at_height();
+    struct block_index stale = {0};
+    struct block_index current = {0};
+    stale.nHeight = 2000;
+    current.nHeight = 2050;
+    ms.pindex_best_header = &stale;
+    struct block_index *csr_header = &current;
+    csr_init(csr_instance(), &ms.map_block_index, &ms.chain_active,
+             &csr_header, NULL, NULL, NULL);
+    struct p2p_node peer = {0};
+    peer.starting_height = 2050;
+    peer.state = PEER_ACTIVE;
+    peer.services = NODE_NETWORK;
+    struct p2p_node *peers[1] = { &peer };
+    cm.manager.nodes = peers;
+    cm.manager.num_nodes = 1;
+    sync_set_state(SYNC_HEADERS_DOWNLOAD, "test");
+    condition_engine_tick();
+    fake_clock_set(&clock, 1201);
+    condition_engine_tick();
+    bool ok = header_stall_at_height_test_remedy_calls() == 0;
+    ok = ok && condition_engine_get_active_count() == 0;
+    csr_test_reset_singleton();
+    cleanup_sync_watchdog();
+    return ok;
+}
+
 int test_sync_watchdog_conditions(void)
 {
     printf("\n=== sync watchdog condition tests ===\n");
@@ -181,6 +220,9 @@ int test_sync_watchdog_conditions(void)
         cleanup_sync_watchdog();
         reducer_frontier_provable_tip_reset();
     }
+
+    SYNC_WATCHDOG_CHECK("header stall uses the published csr header",
+                        header_stall_uses_published_csr_header());
 
     {
         struct fake_clock clock;
@@ -278,6 +320,8 @@ int test_sync_watchdog_conditions(void)
         struct block_index header = {0};
         header.nHeight = 2000;
         ms.pindex_best_header = &header;
+        csr_init(csr_instance(), &ms.map_block_index, &ms.chain_active,
+                 &ms.pindex_best_header, NULL, NULL, NULL);
         struct p2p_node peer = {0};
         peer.id = 1;
         peer.starting_height = 2600;
@@ -301,6 +345,7 @@ int test_sync_watchdog_conditions(void)
         condition_engine_tick();
         ok = ok && condition_engine_get_active_count() == 0;
         SYNC_WATCHDOG_CHECK("header stall kicks header fetch", ok);
+        csr_test_reset_singleton();
         cleanup_sync_watchdog();
     }
 

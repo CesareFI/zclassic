@@ -13,8 +13,10 @@
 void register_header_stall_at_height(void);
 
 #ifdef ZCL_TESTING
+struct main_state;
 void header_stall_at_height_test_reset(void);
 int header_stall_at_height_test_remedy_calls(void);
+int header_stall_at_height_test_header_height(struct main_state *ms);
 #endif
 
 #endif /* ZCL_CONDITIONS_HEADER_STALL_AT_HEIGHT_H */

@@ -6,6 +6,7 @@
 
 #include "net/connman.h"
 #include "platform/time_compat.h"
+#include "services/chain_state_service.h"
 #include "services/header_probe.h"
 #include "services/sync_monitor.h"
 #include "sync/sync_state.h"
@@ -25,6 +26,23 @@ static _Atomic int64_t g_age_at_detect = 0;
 static _Atomic int g_test_remedy_calls;
 #endif
 
+/* Header publication is owned by CSR rather than cs_main. The returned
+ * block-index height is an int by construction; -1 remains the unarmed
+ * sentinel when the repository has no published header. */
+static int header_stall_header_height(struct main_state *ms)
+{
+    int64_t height = csr_header_height(csr_instance());
+#ifdef ZCL_TESTING
+    /* Legacy isolated condition fixtures can intentionally omit CSR setup.
+     * They are single-threaded; production never takes this raw fallback. */
+    if (height < 0 && ms && ms->pindex_best_header)
+        height = ms->pindex_best_header->nHeight;
+#else
+    (void)ms;
+#endif
+    return height < 0 ? -1 : (int)height; /* raw-return-ok:sentinel */
+}
+
 static bool detect_header_stall_at_height(void)
 {
     struct main_state *ms = sync_monitor_main_state();
@@ -37,7 +55,7 @@ static bool detect_header_stall_at_height(void)
         return false;
     }
 
-    int header_h = ms->pindex_best_header ? ms->pindex_best_header->nHeight : -1;
+    int header_h = header_stall_header_height(ms);
     int peer_max = connman_max_peer_height(cm);
     int64_t now = platform_time_wall_unix();
     int prev = atomic_load(&g_last_header_height);
@@ -106,9 +124,9 @@ static bool witness_header_stall_at_height(int64_t target_at_detect)
 {
     (void)target_at_detect;
     struct main_state *ms = sync_monitor_main_state();
-    if (!ms || !ms->pindex_best_header)
+    if (!ms)
         return false;
-    return ms->pindex_best_header->nHeight >
+    return header_stall_header_height(ms) >
            atomic_load(&g_header_height_at_detect);
 }
 
@@ -149,5 +167,10 @@ void header_stall_at_height_test_reset(void)
 int header_stall_at_height_test_remedy_calls(void)
 {
     return atomic_load(&g_test_remedy_calls);
+}
+
+int header_stall_at_height_test_header_height(struct main_state *ms)
+{
+    return header_stall_header_height(ms);
 }
 #endif
