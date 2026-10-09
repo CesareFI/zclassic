@@ -33,6 +33,7 @@
 
 struct configured_target {
     struct net_service svc;
+    uint64_t generation;
     bool have_identity;
     uint8_t identity[32];
     bool probe_running;
@@ -43,6 +44,7 @@ struct configured_target {
 static pthread_mutex_t g_configured_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct configured_target g_configured[CONFIGURED_SYNC_PEERS_MAX];
 static size_t g_configured_count;
+static uint64_t g_next_generation;
 /* Lock-free hint for the per-tick outbound observation fast path. */
 static _Atomic size_t g_configured_count_hint;
 static const struct net_manager *g_network;
@@ -75,6 +77,13 @@ static struct configured_target *find_target_locked(
     return NULL;
 }
 
+static uint64_t next_generation_locked(void)
+{
+    if (g_next_generation == UINT64_MAX)
+        return 0;
+    return ++g_next_generation;
+}
+
 bool configured_sync_peer_note(const struct net_service *target)
 {
     if (!target || !configured_address_usable(&target->addr))
@@ -86,7 +95,13 @@ bool configured_sync_peer_note(const struct net_service *target)
         struct configured_target *t = &g_configured[g_configured_count++];
         memset(t, 0, sizeof(*t));
         t->svc = *target;
-        recorded = true;
+        t->generation = next_generation_locked();
+        if (t->generation != 0)
+            recorded = true;
+        else {
+            memset(t, 0, sizeof(*t));
+            g_configured_count--;
+        }
     }
     atomic_store(&g_configured_count_hint, g_configured_count);
     pthread_mutex_unlock(&g_configured_lock);
@@ -256,23 +271,35 @@ void configured_sync_peers_attach_network(const struct net_manager *nm)
     pthread_mutex_unlock(&g_configured_lock);
 }
 
-static void probe_finished(const struct net_service *target, bool ok,
+static void probe_finished(const struct net_service *target,
+                           uint64_t generation, bool ok,
                            const uint8_t remote_static[32])
 {
+    bool accepted = false;
+    bool changed = false;
     pthread_mutex_lock(&g_configured_lock);
     struct configured_target *t = find_target_locked(target);
-    if (t) {
+    if (t && t->generation == generation) {
         t->probe_running = false;
         t->probe_finished_once = true;
         t->probe_finished_s = configured_now_s();
+        if (ok) {
+            changed = !t->have_identity ||
+                      memcmp(t->identity, remote_static, 32) != 0;
+            memcpy(t->identity, remote_static, 32);
+            t->have_identity = true;
+        }
+        accepted = true;
     }
     pthread_mutex_unlock(&g_configured_lock);
+    if (!accepted)
+        return;
     char addr[NET_SERVICE_STR_MAX + 1];
     net_service_to_string(target, addr, sizeof(addr));
     if (ok) {
-        configured_sync_peer_record_identity(target, remote_static);
-        LOG_INFO("header_sync", "configured sync peer identity probe "
-                 "completed Noise XX with target=%s", addr);
+        LOG_INFO("header_sync", "configured sync peer identity probe %s "
+                 "Noise XX with target=%s", changed ? "updated" : "completed",
+                 addr);
     } else {
         LOG_WARN("header_sync", "configured sync peer identity probe of "
                  "target=%s did not complete a Noise XX handshake; an inbound "
@@ -286,6 +313,7 @@ static void probe_finished(const struct net_service *target, bool ok,
 struct probe_job {
     size_t count;
     struct net_service targets[CONFIGURED_SYNC_PEERS_MAX];
+    uint64_t generations[CONFIGURED_SYNC_PEERS_MAX];
     uint8_t identity_priv[32];
     unsigned char magic[MESSAGE_START_SIZE];
     configured_sync_peer_prober_fn prober;  /* NULL: the network prober */
@@ -468,7 +496,8 @@ static void *probe_thread(void *arg)
                        : probe_noise_identity(&job->targets[i],
                                               job->identity_priv, job->magic,
                                               remote));
-        probe_finished(&job->targets[i], ok, ok ? remote : NULL);
+        probe_finished(&job->targets[i], job->generations[i], ok,
+                       ok ? remote : NULL);
     }
     memory_cleanse(job->identity_priv, sizeof(job->identity_priv));
     free(job);
@@ -487,7 +516,8 @@ static bool probe_due_locked(const struct configured_target *t, int64_t now)
 /* Mark every due target at `ip` running and copy it into `out` (or only
  * count them when `out` is NULL). */
 static size_t collect_due_locked(const struct net_addr *ip,
-                                 struct net_service *out, int64_t now)
+                                 struct net_service *out,
+                                 uint64_t *generations, int64_t now)
 {
     size_t n = 0;
     for (size_t i = 0; i < g_configured_count; i++) {
@@ -497,6 +527,7 @@ static size_t collect_due_locked(const struct net_addr *ip,
         if (out) {
             t->probe_running = true;
             out[n] = t->svc;
+            generations[n] = t->generation;
         }
         n++;
     }
@@ -508,13 +539,14 @@ static size_t request_probe_with_test_prober(const struct net_addr *ip,
                                              configured_sync_peer_prober_fn fn)
 {
     struct net_service due[CONFIGURED_SYNC_PEERS_MAX];
+    uint64_t generations[CONFIGURED_SYNC_PEERS_MAX];
     pthread_mutex_lock(&g_configured_lock);
-    size_t n = collect_due_locked(ip, due, configured_now_s());
+    size_t n = collect_due_locked(ip, due, generations, configured_now_s());
     pthread_mutex_unlock(&g_configured_lock);
     for (size_t i = 0; i < n; i++) {
         uint8_t remote[32];
         bool ok = fn(&due[i], remote);
-        probe_finished(&due[i], ok, ok ? remote : NULL);
+        probe_finished(&due[i], generations[i], ok, ok ? remote : NULL);
     }
     return n;
 }
@@ -529,7 +561,7 @@ static bool probe_thread_wanted(const struct net_addr *ip)
     bool can_probe = g_test_threaded_prober ||
                      (g_network && g_network->noise_enabled);
     bool wanted = can_probe &&
-                  collect_due_locked(ip, NULL, configured_now_s()) > 0;
+                  collect_due_locked(ip, NULL, NULL, configured_now_s()) > 0;
     pthread_mutex_unlock(&g_configured_lock);
     return wanted;
 }
@@ -545,7 +577,8 @@ static size_t probe_job_fill(struct probe_job *job, const struct net_addr *ip)
             memcpy(job->identity_priv, nm->identity_priv, 32);
             memcpy(job->magic, nm->message_start, sizeof(job->magic));
         }
-        job->count = collect_due_locked(ip, job->targets, configured_now_s());
+        job->count = collect_due_locked(ip, job->targets, job->generations,
+                                        configured_now_s());
     }
     pthread_mutex_unlock(&g_configured_lock);
     return job->count;
@@ -582,7 +615,7 @@ static size_t request_probe_on_thread(const struct net_addr *ip)
     }
     atomic_store(&g_probe_busy, false);
     for (size_t i = 0; job && i < job->count; i++)
-        probe_finished(&job->targets[i], false, NULL);
+        probe_finished(&job->targets[i], job->generations[i], false, NULL);
     if (job)
         memory_cleanse(job->identity_priv, sizeof(job->identity_priv));
     free(job);
@@ -670,6 +703,7 @@ void configured_sync_peers_reset_for_testing(void)
     pthread_mutex_lock(&g_configured_lock);
     memset(g_configured, 0, sizeof(g_configured));
     g_configured_count = 0;
+    g_next_generation = 0;
     atomic_store(&g_configured_count_hint, 0);
     pthread_mutex_unlock(&g_configured_lock);
 }

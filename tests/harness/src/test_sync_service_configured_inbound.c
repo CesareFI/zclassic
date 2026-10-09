@@ -2308,6 +2308,48 @@ static int test_configured_inbound_revocation(void)
     return failures;
 }
 
+static int test_configured_inbound_probe_generation(void)
+{
+    int failures = 0;
+    TEST("configured inbound: a removed target rejects its old in-flight probe") {
+        static struct model_node a, b;
+        model_reset();
+        configured_sync_peers_set_prober_for_testing(NULL);
+        configured_sync_peers_set_threaded_prober_for_testing(gate_prober);
+        g_gate_calls = 0;
+        g_gate_saw_stop = false;
+        gate_set(false);
+        ASSERT(model_node_init(&a, "A", 7, 18233, 1));
+        ASSERT(model_node_init(&b, "B", 8, 18234, 2));
+        ASSERT(model_configure(&b, &a));
+        struct model_conn c;
+        ASSERT(model_connect(&c, &a, &b, a.priv, true, 40001));
+        c.in->state = PEER_ACTIVE;
+        ASSERT(configured_sync_peer_request_probe(c.in) == 1);
+        ASSERT(gate_wait_calls(1));
+
+        struct net_service target;
+        memset(&target, 0, sizeof(target));
+        net_addr_set_ipv4(&target.addr, a.ip);
+        target.port = a.port;
+        ASSERT(configured_sync_peer_forget(&target));
+        ASSERT(configured_sync_peer_note(&target));
+        gate_set(true);
+        ASSERT(configured_sync_peers_join_probe_for_testing());
+        uint8_t learned[32];
+        ASSERT(!configured_sync_peer_identity(&target, learned));
+
+        ASSERT(configured_sync_peer_request_probe(c.in) == 1);
+        ASSERT(configured_sync_peers_join_probe_for_testing());
+        ASSERT(configured_sync_peer_identity(&target, learned));
+        PASS();
+    } _test_next:;
+    gate_set(true);
+    configured_sync_peers_set_threaded_prober_for_testing(NULL);
+    model_reset();
+    return failures;
+}
+
 int check_sync_service_configured_inbound(void)
 {
     int failures = 0;
@@ -2337,6 +2379,7 @@ int check_sync_service_configured_inbound(void)
     failures += test_configured_inbound_probe_stop();
     failures += test_configured_inbound_probe_thread();
     failures += test_configured_inbound_revocation();
+    failures += test_configured_inbound_probe_generation();
     model_reset();
     configured_sync_peers_set_prober_for_testing(NULL);
     configured_sync_peers_set_clock_for_testing(NULL);
