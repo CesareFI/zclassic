@@ -227,6 +227,24 @@ static int t_start_refused_while_stopping(void)
     return failures;
 }
 
+static int t_dump_saturates_unsigned_counters(void)
+{
+    int failures = 0;
+
+    TEST_CASE("diagnostics: unsigned counters never render as negative JSON") {
+        struct json_value v;
+        json_init(&v);
+        block_prefetch_test_set_warm_hits(UINT64_MAX);
+        ASSERT(block_prefetch_dump_state_json(&v, NULL));
+        const struct json_value *hits = json_get(&v, "hits");
+        ASSERT(hits && json_get_int(hits) == INT64_MAX);
+        json_free(&v);
+        block_prefetch_test_set_warm_hits(0);
+    } TEST_END
+
+    return failures;
+}
+
 /* ── Test: lifecycle + supervised child + window processed ──────────────── */
 static int t_lifecycle(void)
 {
@@ -437,6 +455,7 @@ int test_block_prefetch(void)
     int failures = 0;
     failures += t_disabled_noop();
     failures += t_start_refused_while_stopping();
+    failures += t_dump_saturates_unsigned_counters();
     failures += t_lifecycle();
     failures += t_bounded_memory();
     failures += t_misspath_failsafe();

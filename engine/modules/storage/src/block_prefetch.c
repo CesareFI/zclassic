@@ -81,6 +81,14 @@ static _Atomic uint64_t g_read_fails = 0;
 static _Atomic uint64_t g_passes = 0;
 static _Atomic int64_t  g_start_us = 0;
 
+/* JSON integer values are signed. Keep long-lived unsigned counters
+ * nonnegative in diagnostics instead of narrowing them into misleading
+ * negative values after the signed range is exhausted. */
+static int64_t bp_json_counter(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
+
 /* ── Bounded raw-body LRU (worker writes; readers under g_lru_mu) ───────── */
 struct bp_lru_entry {
     int          nFile;
@@ -546,6 +554,11 @@ void block_prefetch_test_set_stopping(bool stopping)
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
 }
+
+void block_prefetch_test_set_warm_hits(uint64_t value)
+{
+    atomic_store(&g_warm_hits, value);
+}
 #endif
 
 bool block_prefetch_running(void)
@@ -608,14 +621,14 @@ bool block_prefetch_dump_state_json(struct json_value *out, const char *key)
     json_push_kv_int(out, "window", (int64_t)window);
     json_push_kv_int(out, "lead", (int64_t)lead);
     json_push_kv_int(out, "warm_frontier", frontier);
-    json_push_kv_int(out, "hits", (int64_t)hits);
-    json_push_kv_int(out, "warmed", (int64_t)warmed);
-    json_push_kv_int(out, "nowait_misses", (int64_t)nowait);
-    json_push_kv_int(out, "bytes", (int64_t)bytes);
-    json_push_kv_int(out, "resolve_gaps", (int64_t)gaps);
-    json_push_kv_int(out, "read_fails", (int64_t)rfails);
-    json_push_kv_int(out, "passes", (int64_t)passes);
-    json_push_kv_int(out, "lru_bytes", (int64_t)lru_bytes);
+    json_push_kv_int(out, "hits", bp_json_counter(hits));
+    json_push_kv_int(out, "warmed", bp_json_counter(warmed));
+    json_push_kv_int(out, "nowait_misses", bp_json_counter(nowait));
+    json_push_kv_int(out, "bytes", bp_json_counter(bytes));
+    json_push_kv_int(out, "resolve_gaps", bp_json_counter(gaps));
+    json_push_kv_int(out, "read_fails", bp_json_counter(rfails));
+    json_push_kv_int(out, "passes", bp_json_counter(passes));
+    json_push_kv_int(out, "lru_bytes", bp_json_counter((uint64_t)lru_bytes));
     json_push_kv_int(out, "lru_count", (int64_t)lru_count);
 
     uint64_t probed = hits + nowait;
