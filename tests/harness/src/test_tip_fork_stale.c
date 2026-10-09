@@ -28,6 +28,7 @@
 #include "core/arith_uint256.h"
 #include "core/uint256.h"
 #include "framework/condition.h"
+#include "services/chain_state_service.h"
 #include "util/result.h"
 #include "validation/chainstate.h"
 #include "validation/main_state.h"
@@ -156,6 +157,31 @@ static struct block_index *tfs_build_incident_shape(
     ms->pindex_best_header = best_header;
     if (out_best_header) *out_best_header = best_header;
     return tip;
+}
+
+static bool tfs_production_csr_frontier_capture(int tip_h)
+{
+    csr_test_reset_singleton();
+    struct main_state ms;
+    main_state_init(&ms);
+    struct uint256 hashes[256], canon_hash, hdr_hashes[8];
+    struct block_index *best_header = NULL;
+    struct block_index *tip = tfs_build_incident_shape(
+        &ms, hashes, &canon_hash, hdr_hashes, tip_h, 61, &best_header);
+    csr_init(csr_instance(), &ms.map_block_index, &ms.chain_active,
+             &ms.pindex_best_header, NULL, NULL, NULL);
+
+    int64_t captured_tip = -1;
+    int64_t captured_header = -1;
+    bool ok = tip_fork_stale_test_capture_frontier(
+        &ms, &captured_tip, &captured_header);
+    ok = ok && tip != NULL && best_header != NULL;
+    ok = ok && captured_tip == tip_h;
+    ok = ok && captured_header == tip_h + 5;
+
+    csr_test_reset_singleton();
+    main_state_free(&ms);
+    return ok;
 }
 
 int test_tip_fork_stale(void)
@@ -694,6 +720,16 @@ int test_tip_fork_stale(void)
         condition_engine_reset_for_testing();
         tip_fork_stale_test_reset();
         main_state_free(&ms);
+    }
+
+    {
+        /* 11. Production frontier capture: wire the CSR singleton to this
+         * fixture and verify the condition captures active-tip and
+         * best-header together through the repository API.  The ordinary
+         * condition fixtures deliberately leave CSR unbound, which exercises
+         * their explicit test-only fallback but not this production route. */
+        TFS_CHECK("production CSR frontier capture keeps active/header views",
+                  tfs_production_csr_frontier_capture(TIP_H));
     }
 
     return failures;

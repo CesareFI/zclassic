@@ -61,6 +61,7 @@
 #include "core/uint256.h"
 #include "jobs/utxo_apply_stage.h"
 #include "platform/time_compat.h"
+#include "services/chain_state_service.h"
 #include "services/sync_monitor.h"
 #include "validation/chainstate.h"
 #include "validation/main_state.h"
@@ -177,6 +178,47 @@ static int64_t current_tip_height(struct main_state *ms)
     return ms ? (int64_t)active_chain_height(&ms->chain_active) : -1;
 }
 
+/* Fork repair must compare one active-window tip with one best-header
+ * publication.  CSR captures that pair under its repository/active-window
+ * lock order; independently reading the two fields can manufacture a stale
+ * fork during a concurrent advance. */
+static bool tfs_capture_frontier(struct main_state *ms,
+                                 struct chain_state_frontier_view *out)
+{
+    if (!ms || !out)
+        return false;
+    struct zcl_result r = csr_capture_frontiers(
+        csr_instance(), &ms->chain_active, &ms->pindex_best_header, -1, out);
+#ifdef ZCL_TESTING
+    if (!r.ok) {
+        memset(out, 0, sizeof(*out));
+        out->window.height = -1;
+        out->window.requested_height = -1;
+        if (!active_chain_capture_window(&ms->chain_active, -1, &out->window))
+            return false;
+        out->header_tip = ms->pindex_best_header;
+    }
+#else
+    if (!r.ok)
+        return false;
+#endif
+    return out->window.tip && out->header_tip && out->window.height >= 0;
+}
+
+#ifdef ZCL_TESTING
+bool tip_fork_stale_test_capture_frontier(struct main_state *ms,
+                                          int64_t *tip_height,
+                                          int64_t *header_height)
+{
+    struct chain_state_frontier_view frontier;
+    if (!tip_height || !header_height || !tfs_capture_frontier(ms, &frontier))
+        return false;
+    *tip_height = frontier.window.height;
+    *header_height = frontier.header_tip->nHeight;
+    return true;
+}
+#endif
+
 static bool same_index_hash(const struct block_index *a,
                             const struct block_index *b)
 {
@@ -253,9 +295,12 @@ static bool detect_tip_fork_stale(void)
     if (!ms)
         return false;
 
-    struct block_index *tip = active_chain_tip(&ms->chain_active);
-    int64_t tip_h = current_tip_height(ms);
-    if (!tip || tip_h <= 0)
+    struct chain_state_frontier_view frontier;
+    if (!tfs_capture_frontier(ms, &frontier))
+        return false;
+    struct block_index *tip = frontier.window.tip;
+    int64_t tip_h = frontier.window.height;
+    if (tip_h <= 0)
         return false; /* tip not established — stay quiet */
 
     /* (a) sustained no-advance window. Reset the timer whenever the tip
@@ -278,9 +323,7 @@ static bool detect_tip_fork_stale(void)
     atomic_store(&g_stall_window_at_detect, window);
 
     /* (b) a strictly higher-work HEADER chain exists. */
-    struct block_index *bh = ms->pindex_best_header;
-    if (!bh)
-        return false;
+    struct block_index *bh = frontier.header_tip;
     if (arith_uint256_compare(&bh->nChainWork, &tip->nChainWork) <= 0)
         return false; /* no more-work header chain — normal at-tip */
     if (bh->nHeight <= tip_h)

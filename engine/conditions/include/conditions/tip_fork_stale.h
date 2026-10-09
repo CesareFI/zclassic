@@ -32,6 +32,13 @@ void tip_fork_stale_test_set_queue_body_stub(
  * the real utxo_apply selection path). Return the height utxo_apply is held at,
  * or -1 for "no live hold". */
 void tip_fork_stale_test_set_anomaly_hold_stub(int64_t (*hold)(void));
+/* Capture the same coherent active/header frontier used by production
+ * detection.  The harness binds CSR to a local main_state before calling it,
+ * so this exercises the production repository path rather than the
+ * unbound-fixture fallback. */
+bool tip_fork_stale_test_capture_frontier(struct main_state *ms,
+                                          int64_t *tip_height,
+                                          int64_t *header_height);
 /* The no-advance window detect() last applied — TIP_STALL_SECS (300) on the
  * patient path, TIP_STALL_CORROBORATED_SECS (10) on the corroborated one. */
 int64_t tip_fork_stale_test_stall_window_at_detect(void);
