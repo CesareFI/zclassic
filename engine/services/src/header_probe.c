@@ -19,6 +19,7 @@
  */
 
 #include "services/header_probe.h"
+#include "services/chain_state_service.h"
 
 #include "platform/clock.h"
 #include "services/header_admit_inbox.h"
@@ -41,6 +42,7 @@
 #include "util/safe_alloc.h"
 
 #include <pthread.h>
+#include <limits.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -91,6 +93,32 @@ static struct {
 } g_hp = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
+
+/* Header admission publishes through CSR in production.  The probe runs from
+ * a separate supervised job, so read the publisher-owned frontier through the
+ * repository rather than racing the mutable main-state slot. */
+static int hp_local_header_height(const struct main_state *ms)
+{
+    int64_t height = csr_header_height(csr_instance());
+#ifdef ZCL_TESTING
+    if (height < 0 && ms && ms->pindex_best_header)
+        height = ms->pindex_best_header->nHeight;
+#endif
+    if (height < 0 && ms)
+        height = active_chain_height(&ms->chain_active);
+    if (height < 0)
+        return 0;
+    if (height > INT_MAX)
+        return INT_MAX;
+    return (int)height;
+}
+
+#ifdef ZCL_TESTING
+int header_probe_test_local_header_height(const struct main_state *ms)
+{
+    return hp_local_header_height(ms);
+}
+#endif
 
 /* Returns false when the admit ring is saturated, so the pull loop can apply
  * backpressure (stop pulling) rather than fetch + re-validate more headers only
@@ -184,12 +212,7 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
     atomic_store(&g_hp.last_remote_height, remote_tip);
 
     /* Local tip (header tip is the high-water mark for headers). */
-    int local_tip = 0;
-    if (ms->pindex_best_header)
-        local_tip = ms->pindex_best_header->nHeight;
-    else
-        local_tip = active_chain_height(&ms->chain_active);
-    if (local_tip < 0) local_tip = 0;
+    int local_tip = hp_local_header_height(ms);
     atomic_store(&g_hp.last_local_height, local_tip);
 
     int end_height = start_height + max_headers - 1;
@@ -311,12 +334,7 @@ void header_probe_tick_once(void)
     pthread_mutex_unlock(&g_hp.lock);
     if (!inited || !ms) return;
 
-    int local_tip = 0;
-    if (ms->pindex_best_header)
-        local_tip = ms->pindex_best_header->nHeight;
-    else
-        local_tip = active_chain_height(&ms->chain_active);
-    if (local_tip < 0) local_tip = 0;
+    int local_tip = hp_local_header_height(ms);
 
     /* Cheap getblockcount to decide whether to pull. */
     int remote_tip = -1;

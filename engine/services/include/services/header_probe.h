@@ -132,6 +132,9 @@ struct header_probe_repair_stats {
     int     last_repair_height;
 };
 void header_probe_test_get_repair_stats(struct header_probe_repair_stats *out);
+
+/* Production local-frontier calculation exposed only to hermetic tests. */
+int header_probe_test_local_header_height(const struct main_state *ms);
 #endif
 
 #endif /* ZCL_SERVICES_HEADER_PROBE_H */

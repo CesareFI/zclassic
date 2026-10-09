@@ -14,6 +14,7 @@
 
 #include "test/test_core.h"
 #include "services/header_probe.h"
+#include "services/chain_state_service.h"
 #include "controllers/wallet_helpers.h"
 #include "validation/main_state.h"
 #include "validation/chainstate.h"
@@ -321,6 +322,22 @@ static bool hp_dump_omits_config(const struct json_value *dump)
            json_get(dump, "lag_threshold") == NULL;
 }
 
+static int hp_test_repository_header_snapshot(void)
+{
+    int failures = 0;
+    hp_build_fixture();
+    struct block_index published = {.nHeight = 7};
+    struct block_index *published_ptr = &published;
+    csr_test_reset_singleton();
+    csr_init(csr_instance(), &g_hp_ms.map_block_index, &g_hp_ms.chain_active,
+             &published_ptr, NULL, NULL, NULL);
+    HP_CHECK("local height uses repository-published header",
+             header_probe_test_local_header_height(&g_hp_ms) == 7);
+    csr_test_reset_singleton();
+    hp_teardown();
+    return failures;
+}
+
 int test_header_probe(void);
 
 static int hp_test_reinit_clears_credentials(const struct chain_params *params)
@@ -564,6 +581,7 @@ int test_header_probe(void)
      * prior run. With no credentials in the replacement config and no conf
      * file, re-init fails closed and leaves the probe inactive. */
     failures += hp_test_reinit_clears_credentials(params);
+    failures += hp_test_repository_header_snapshot();
 
     if (failures == 0)
         printf("=== header probe service: all checks passed ===\n");
