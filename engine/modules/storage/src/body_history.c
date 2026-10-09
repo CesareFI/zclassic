@@ -19,6 +19,7 @@
 #include "util/safe_alloc.h"
 #include "util/sync.h"
 
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -444,18 +445,22 @@ static struct body_coverage_map    g_bh_measured;
 static struct body_history_verdict g_bh_verdict;
 static bool                        g_bh_verdict_published = false;
 static zcl_mutex_t                 g_bh_lock;
-static bool                        g_bh_inited = false;
+static zcl_once_t                  g_bh_once = ZCL_ONCE_INIT;
+static _Atomic bool                g_bh_inited = false;
 
-static void bh_global_init_once(void)
+static void bh_global_init(void)
 {
-    if (g_bh_inited)
-        return;
     zcl_mutex_init(&g_bh_lock);
     body_history_census_init(&g_bh_census);
     body_coverage_init(&g_bh_measured);
     bh_verdict_reset(&g_bh_verdict);
     g_bh_verdict_published = false;
-    g_bh_inited = true;
+    atomic_store_explicit(&g_bh_inited, true, memory_order_release);
+}
+
+static void bh_global_init_once(void)
+{
+    (void)zcl_once_call(&g_bh_once, bh_global_init);
 }
 
 void body_history_global_lock(void)
@@ -470,7 +475,7 @@ void body_history_global_lock(void)
 
 void body_history_global_unlock(void)
 {
-    if (!g_bh_inited)
+    if (!atomic_load_explicit(&g_bh_inited, memory_order_acquire))
         return;
     body_coverage_global_unlock();
     zcl_mutex_unlock(&g_bh_lock);

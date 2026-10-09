@@ -46,11 +46,72 @@
 #include "json/json.h"
 #include "core/uint256.h"
 
+#include <pthread.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+
+struct bh_global_init_ctx {
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    size_t waiting;
+    bool go;
+    struct body_history_census *censuses[2];
+};
+
+struct bh_global_init_arg {
+    struct bh_global_init_ctx *ctx;
+    size_t slot;
+};
+
+static void *bh_get_global_census(void *opaque)
+{
+    struct bh_global_init_arg *arg = opaque;
+
+    pthread_mutex_lock(&arg->ctx->lock);
+    arg->ctx->waiting++;
+    pthread_cond_signal(&arg->ctx->ready);
+    while (!arg->ctx->go)
+        pthread_cond_wait(&arg->ctx->ready, &arg->ctx->lock);
+    pthread_mutex_unlock(&arg->ctx->lock);
+    arg->ctx->censuses[arg->slot] = body_history_global_census();
+    return NULL;
+}
+
+static int test_bh_global_init_is_thread_safe(void)
+{
+    int failures = 0;
+    TEST("global history initializes once under concurrent first use") {
+        struct bh_global_init_ctx ctx = {0};
+        struct bh_global_init_arg args[2] = {
+            { .ctx = &ctx, .slot = 0 },
+            { .ctx = &ctx, .slot = 1 },
+        };
+        pthread_t threads[2];
+        ASSERT_EQ(pthread_mutex_init(&ctx.lock, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&ctx.ready, NULL), 0);
+        ASSERT_EQ(pthread_create(&threads[0], NULL, bh_get_global_census,
+                                 &args[0]), 0);
+        ASSERT_EQ(pthread_create(&threads[1], NULL, bh_get_global_census,
+                                 &args[1]), 0);
+        ASSERT_EQ(pthread_mutex_lock(&ctx.lock), 0);
+        while (ctx.waiting < 2)
+            ASSERT_EQ(pthread_cond_wait(&ctx.ready, &ctx.lock), 0);
+        ctx.go = true;
+        ASSERT_EQ(pthread_cond_broadcast(&ctx.ready), 0);
+        ASSERT_EQ(pthread_mutex_unlock(&ctx.lock), 0);
+        ASSERT_EQ(pthread_join(threads[0], NULL), 0);
+        ASSERT_EQ(pthread_join(threads[1], NULL), 0);
+        ASSERT_EQ(pthread_cond_destroy(&ctx.ready), 0);
+        ASSERT_EQ(pthread_mutex_destroy(&ctx.lock), 0);
+        ASSERT(ctx.censuses[0] != NULL);
+        ASSERT(ctx.censuses[0] == ctx.censuses[1]);
+        PASS();
+    } _test_next:;
+    return failures;
+}
 
 /* ── A synthetic chain the probe can read ───────────────────────── */
 
@@ -1732,6 +1793,7 @@ static int test_bh_service_abort_resume_rewind(void)
 int test_body_history(void)
 {
     int failures = 0;
+    failures += test_bh_global_init_is_thread_safe();
     failures += test_bh_service_abort_resume_rewind();
     failures += test_bh_service_boundary(4095, 2);
     failures += test_bh_service_boundary(4096, 2);
