@@ -23,6 +23,7 @@
 #include "core/arith_uint256.h"
 #include "core/uint256.h"
 #include "framework/condition.h"
+#include "platform/clock.h"
 #include "validation/chainstate.h"
 #include "validation/main_state.h"
 
@@ -41,6 +42,42 @@ static _Atomic int g_stub_oracle_height = 0;
 static _Atomic bool g_stub_oracle_ok = true;
 static struct main_state *g_advance_ms;
 static struct block_index *g_advance_to;
+
+struct tsor_fake_clock {
+    _Atomic int64_t wall_ms;
+    _Atomic int64_t monotonic_ms;
+};
+
+static int64_t tsor_fake_now_mono(void *self)
+{
+    struct tsor_fake_clock *clock = self;
+    return atomic_load(&clock->monotonic_ms) * 1000000;
+}
+
+static int64_t tsor_fake_now_wall(void *self)
+{
+    struct tsor_fake_clock *clock = self;
+    return atomic_load(&clock->wall_ms);
+}
+
+static void tsor_fake_clock_install(struct tsor_fake_clock *clock,
+                                    int64_t wall_s, int64_t monotonic_s)
+{
+    static clock_iface_t iface;
+    atomic_store(&clock->wall_ms, wall_s * 1000);
+    atomic_store(&clock->monotonic_ms, monotonic_s * 1000);
+    iface.now_monotonic_ns = tsor_fake_now_mono;
+    iface.now_wall_ms = tsor_fake_now_wall;
+    iface.self = clock;
+    clock_set_default(&iface);
+}
+
+static void tsor_fake_clock_set(struct tsor_fake_clock *clock,
+                                int64_t wall_s, int64_t monotonic_s)
+{
+    atomic_store(&clock->wall_ms, wall_s * 1000);
+    atomic_store(&clock->monotonic_ms, monotonic_s * 1000);
+}
 
 static bool stub_oracle_height(int *out)
 {
@@ -131,6 +168,42 @@ static const struct json_value *tsor_json_condition(
             return cond;
     }
     return NULL;
+}
+
+static bool tsor_wall_rollback_still_recovers(int tip_h)
+{
+    struct tsor_fake_clock clock;
+    tsor_fake_clock_install(&clock, 1000, 1000);
+    condition_engine_reset_for_testing();
+    tip_stall_oracle_rebuild_test_reset();
+    atomic_store(&g_stub_oracle_ok, true);
+    atomic_store(&g_stub_oracle_height, tip_h + 5);
+
+    struct main_state ms;
+    main_state_init(&ms);
+    struct uint256 hashes[256], hdr_h[8];
+    struct block_index *tip = tsor_build_main(&ms, hashes, tip_h);
+    struct block_index *best_header =
+        tsor_build_header_chain(&ms, hdr_h, tip, tip_h);
+    ms.pindex_best_header = best_header;
+    condition_engine_set_main_state(&ms);
+    register_tip_stall_oracle_rebuild();
+    tip_stall_oracle_rebuild_test_set_stubs(stub_oracle_height, stub_rebuild);
+
+    condition_engine_tick();
+    tsor_fake_clock_set(&clock, 700, 1121);
+    condition_engine_rebaseline_clocks();
+    condition_engine_tick();
+
+    bool ok = best_header != NULL;
+    ok = ok && tip_stall_oracle_rebuild_test_rebuild_calls() == 1;
+
+    condition_engine_set_main_state(NULL);
+    condition_engine_reset_for_testing();
+    tip_stall_oracle_rebuild_test_reset();
+    main_state_free(&ms);
+    clock_reset_default();
+    return ok;
 }
 
 int test_tip_stall_oracle_rebuild_condition(void)
@@ -368,6 +441,12 @@ int test_tip_stall_oracle_rebuild_condition(void)
         tip_stall_oracle_rebuild_test_reset();
         main_state_free(&ms);
     }
+
+    /* 6. A civil-clock rollback must not leave a canonical body stall silent
+     * until wall time catches up.  The recovery decision consumes monotonic
+     * elapsed time; the wall timestamp remains diagnostic census only. */
+    TSOR_CHECK("oracle stall timeout ignores wall-clock rollback",
+               tsor_wall_rollback_still_recovers(TIP_H));
 
     return failures;
 }

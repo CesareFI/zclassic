@@ -68,7 +68,11 @@
 #define MIN_GAP 2
 
 static _Atomic int64_t g_tip_height_at_check = -1;
-static _Atomic int64_t g_tip_unchanged_since = 0;
+/* Recovery patience is elapsed uptime, not civil time.  Keep the wall-clock
+ * census separately for diagnostics so an NTP correction cannot postpone an
+ * otherwise eligible oracle rebuild. */
+static _Atomic int64_t g_tip_unchanged_since_mono_s = -1;
+static _Atomic int64_t g_tip_unchanged_since_unix = -1;
 static _Atomic int64_t g_tip_at_detect = -1;
 static _Atomic int64_t g_best_header_at_detect = -1;
 static _Atomic int g_oracle_height_at_detect = -1;
@@ -140,19 +144,22 @@ static bool detect_tip_stall_oracle_rebuild(void)
 
     /* (a) sustained no-advance window. Reset the timer whenever the tip
      * moves; only a tip that has held still for TIP_STALL_SECS qualifies. */
-    int64_t now = platform_time_wall_unix();
+    int64_t now_mono_s = platform_time_monotonic_us() / 1000000;
+    int64_t now_unix = platform_time_wall_unix();
     int64_t prev_tip = atomic_load(&g_tip_height_at_check);
     if (prev_tip != tip_h) {
         atomic_store(&g_tip_height_at_check, tip_h);
-        atomic_store(&g_tip_unchanged_since, now);
+        atomic_store(&g_tip_unchanged_since_mono_s, now_mono_s);
+        atomic_store(&g_tip_unchanged_since_unix, now_unix);
         return false;
     }
-    int64_t since = atomic_load(&g_tip_unchanged_since);
-    if (since == 0) {
-        atomic_store(&g_tip_unchanged_since, now);
+    int64_t since_mono_s = atomic_load(&g_tip_unchanged_since_mono_s);
+    if (since_mono_s < 0 || now_mono_s < since_mono_s) {
+        atomic_store(&g_tip_unchanged_since_mono_s, now_mono_s);
+        atomic_store(&g_tip_unchanged_since_unix, now_unix);
         return false;
     }
-    if (now - since < TIP_STALL_SECS)
+    if (now_mono_s - since_mono_s < TIP_STALL_SECS)
         return false;
 
     /* (b) a strictly higher-work HEADER chain exists, ahead by a real
@@ -243,7 +250,7 @@ static bool detail_tip_stall_oracle_rebuild(struct json_value *out)
     int64_t current_tip = current_tip_height(ms);
     int64_t current_best_header =
         ms && ms->pindex_best_header ? ms->pindex_best_header->nHeight : -1;
-    int64_t unchanged_since = atomic_load(&g_tip_unchanged_since);
+    int64_t unchanged_since = atomic_load(&g_tip_unchanged_since_unix);
     int64_t now = platform_time_wall_unix();
     int64_t unchanged_age =
         unchanged_since > 0 && now >= unchanged_since ? now - unchanged_since
@@ -316,7 +323,8 @@ void register_tip_stall_oracle_rebuild(void)
 void tip_stall_oracle_rebuild_test_reset(void)
 {
     atomic_store(&g_tip_height_at_check, -1);
-    atomic_store(&g_tip_unchanged_since, 0);
+    atomic_store(&g_tip_unchanged_since_mono_s, -1);
+    atomic_store(&g_tip_unchanged_since_unix, -1);
     atomic_store(&g_tip_at_detect, -1);
     atomic_store(&g_best_header_at_detect, -1);
     atomic_store(&g_oracle_height_at_detect, -1);
@@ -333,7 +341,9 @@ void tip_stall_oracle_rebuild_test_reset(void)
 void tip_stall_oracle_rebuild_test_force_stall(int64_t tip_h, int64_t age_secs)
 {
     atomic_store(&g_tip_height_at_check, tip_h);
-    atomic_store(&g_tip_unchanged_since,
+    atomic_store(&g_tip_unchanged_since_mono_s,
+                 platform_time_monotonic_us() / 1000000 - age_secs);
+    atomic_store(&g_tip_unchanged_since_unix,
                  platform_time_wall_unix() - age_secs);
 }
 
