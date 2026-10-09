@@ -203,6 +203,30 @@ static int t_disabled_noop(void)
     return failures;
 }
 
+/* A second start must not reuse global worker state while stop has made the
+ * running flag false but has not yet joined the prior worker. The test seam
+ * models precisely that join interval and invokes the production start API. */
+static int t_start_refused_while_stopping(void)
+{
+    int failures = 0;
+    block_prefetch_stop();
+    char dir[256];
+    bpt_make_dir(dir, sizeof(dir));
+    struct bpt_ctx ctx = {0};
+    struct block_prefetch_config cfg = bpt_cfg(0);
+
+    TEST_CASE("lifecycle: start is refused while a prior worker is joining") {
+        block_prefetch_test_set_stopping(true);
+        ASSERT(!block_prefetch_start(dir, &cfg, bpt_cursor, &ctx,
+                                     bpt_pos, &ctx));
+        ASSERT(block_prefetch_running() == false);
+        block_prefetch_test_set_stopping(false);
+    } TEST_END
+
+    bpt_cleanup(dir);
+    return failures;
+}
+
 /* ── Test: lifecycle + supervised child + window processed ──────────────── */
 static int t_lifecycle(void)
 {
@@ -412,6 +436,7 @@ int test_block_prefetch(void)
     printf("\n=== block_prefetch (read-ahead worker) ===\n");
     int failures = 0;
     failures += t_disabled_noop();
+    failures += t_start_refused_while_stopping();
     failures += t_lifecycle();
     failures += t_bounded_memory();
     failures += t_misspath_failsafe();

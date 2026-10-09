@@ -99,6 +99,12 @@ void block_prefetch_stop(void);
 /* True between a successful enabled start and stop. */
 bool block_prefetch_running(void);
 
+#ifdef ZCL_TESTING
+/* Test-only seam for the stop-to-join interval. It drives the same
+ * block_prefetch_start guard used while a real stop owns the worker join. */
+void block_prefetch_test_set_stopping(bool stopping);
+#endif
+
 /* ── Stats (lock-free atomic reads) ──────────────────────────────────── */
 uint64_t block_prefetch_warm_hits(void);     /* probe found pages resident */
 uint64_t block_prefetch_warmed(void);        /* blocking pread issued to warm */

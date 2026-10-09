@@ -63,6 +63,7 @@ static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
 static pthread_t g_thread;
 static bool      g_thread_started = false;
 static bool      g_running = false;       /* under g_mu */
+static bool      g_stopping = false;      /* under g_mu; join is in progress */
 static bool      g_stop = false;          /* under g_mu */
 static _Atomic bool g_running_fast = false;
 static int64_t   g_warm_frontier = -1;    /* under g_mu: highest+1 warmed */
@@ -420,9 +421,10 @@ bool block_prefetch_start(const char *datadir,
     }
 
     pthread_mutex_lock(&g_mu);
-    if (g_running) {
+    if (g_running || g_stopping) {
         pthread_mutex_unlock(&g_mu);
-        LOG_WARN("block_prefetch", "[block_prefetch] start: already running");
+        LOG_WARN("block_prefetch",
+                 "[block_prefetch] start: already running or stopping");
         return false;
     }
     g_cfg = local;
@@ -494,8 +496,12 @@ bool block_prefetch_start(const char *datadir,
 void block_prefetch_stop(void)
 {
     pthread_mutex_lock(&g_mu);
+    while (g_stopping)
+        (void)pthread_cond_wait(&g_cv, &g_mu);
     bool was_running = g_running;
+    pthread_t thread = g_thread;
     if (was_running) {
+        g_stopping = true;
         g_stop = true;
         g_running = false;
         atomic_store_explicit(&g_running_fast, false, memory_order_release);
@@ -507,7 +513,7 @@ void block_prefetch_stop(void)
         return;
 
     if (started)
-        pthread_join(g_thread, NULL);
+        pthread_join(thread, NULL);
 
     supervisor_unregister(atomic_load(&g_child_id));
     atomic_store(&g_child_id, SUPERVISOR_INVALID_ID);
@@ -517,6 +523,8 @@ void block_prefetch_stop(void)
     g_cursor_fn = NULL;
     g_pos_fn = NULL;
     g_warm_frontier = -1;
+    g_stopping = false;
+    pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
 
     pthread_mutex_lock(&g_lru_mu);
@@ -529,6 +537,16 @@ void block_prefetch_stop(void)
              (unsigned long long)atomic_load(&g_warmed),
              (unsigned long long)atomic_load(&g_bytes));
 }
+
+#ifdef ZCL_TESTING
+void block_prefetch_test_set_stopping(bool stopping)
+{
+    pthread_mutex_lock(&g_mu);
+    g_stopping = stopping;
+    pthread_cond_broadcast(&g_cv);
+    pthread_mutex_unlock(&g_mu);
+}
+#endif
 
 bool block_prefetch_running(void)
 {
