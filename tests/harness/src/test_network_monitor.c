@@ -54,6 +54,31 @@ static struct db_peer_chain_observation mk_obs(int64_t peer_id, int64_t height,
     return o;
 }
 
+/* The worker calls this exact decision with platform_time_monotonic_us(). A
+ * wall-clock rollback used to leave its seconds deadline in the future and
+ * suppress samples until wall time caught back up. */
+static int test_monotonic_sample_schedule(void)
+{
+    int failures = 0;
+
+    network_monitor_test_reset_schedule();
+    NM_CHECK(network_monitor_test_schedule_tick(1000000, 30));
+    NM_CHECK(!network_monitor_test_schedule_tick(30999999, 30));
+    NM_CHECK(network_monitor_test_schedule_tick(31000000, 30));
+
+    /* A lower wall-clock reading cannot affect this monotonic timeline. */
+    NM_CHECK(!network_monitor_test_schedule_tick(5000000, 30));
+    NM_CHECK(!network_monitor_test_schedule_tick(60999999, 30));
+    NM_CHECK(network_monitor_test_schedule_tick(61000000, 30));
+
+    network_monitor_test_reset_schedule();
+    NM_CHECK(network_monitor_test_schedule_tick(0, 1));
+    NM_CHECK(!network_monitor_test_schedule_tick(999999, 1));
+    NM_CHECK(network_monitor_test_schedule_tick(1000000, 1));
+    NM_CHECK(!network_monitor_test_schedule_tick(0, 0));
+    return failures;
+}
+
 /* ── 1. model ingest + retention ─────────────────────────────────────── */
 static int test_observation_model(void)
 {
@@ -298,6 +323,7 @@ int test_network_monitor(void)
 {
     printf("\n=== network_monitor tests ===\n");
     int failures = 0;
+    failures += test_monotonic_sample_schedule();
     failures += test_observation_model();
     failures += test_consensus_view();
     failures += test_tip_regression_condition();

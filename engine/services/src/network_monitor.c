@@ -46,6 +46,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,10 @@ static struct {
     struct node_db *db;
     int sample_interval_secs;
     int retain_rows;
+    /* A cadence deadline, deliberately monotonic. Observation rows retain
+     * wall-clock timestamps, but an NTP correction must not postpone the
+     * next recovery sample. Owned by the sampler thread (or test-only seam). */
+    int64_t next_sample_at_us;
 
     /* header-vote map (bounded) */
     struct nm_header_vote votes[NM_MAX_HEADER_VOTES];
@@ -512,19 +517,32 @@ static void nm_on_stall(struct liveness_contract *c)
              (long long)atomic_load(&g_nm.loop_ticks));
 }
 
+/* This is the production sampler decision. Keep its deadline in monotonic
+ * microseconds: wall time belongs in observation provenance, not in periodic
+ * liveness. sample_interval_secs is constrained by the configuration parser;
+ * saturation also keeps the deadline safe if that contract changes. */
+static bool nm_schedule_tick(int64_t now_us)
+{
+    if (now_us < g_nm.next_sample_at_us)
+        return false;
+
+    nm_sample_once();
+    int64_t interval_us = (int64_t)g_nm.sample_interval_secs * 1000000;
+    if (now_us > INT64_MAX - interval_us)
+        g_nm.next_sample_at_us = INT64_MAX;
+    else
+        g_nm.next_sample_at_us = now_us + interval_us;
+    return true;
+}
+
 static void *nm_thread_fn(void *arg)
 {
     (void)arg;
-    int64_t next_sample_at = 0; /* sample immediately on first wake */
     while (!atomic_load(&g_nm.stop_requested)) {
         atomic_fetch_add(&g_nm.loop_ticks, 1);
         nm_supervisor_heartbeat();
 
-        int64_t now = platform_time_wall_unix();
-        if (now >= next_sample_at) {
-            nm_sample_once();
-            next_sample_at = now + g_nm.sample_interval_secs;
-        }
+        (void)nm_schedule_tick(platform_time_monotonic_us());
         /* 200ms increments so stop() stays responsive between samples. */
         platform_sleep_ms(200);
     }
@@ -566,6 +584,7 @@ struct zcl_result network_monitor_start(const struct network_monitor_config *cfg
     g_nm.db = db;
     g_nm.sample_interval_secs = local.sample_interval_secs;
     g_nm.retain_rows = local.retain_rows;
+    g_nm.next_sample_at_us = 0;
     atomic_store(&g_nm.stop_requested, false);
     atomic_store(&g_nm.loop_ticks, 0);
     atomic_store(&g_nm.supervisor_id, SUPERVISOR_INVALID_ID);
@@ -686,5 +705,18 @@ void network_monitor_test_set_view(const struct network_consensus_view *v)
     g_nm.view = *v;
     g_nm.view.ready = true;
     zcl_mutex_unlock(&g_nm.lock);
+}
+
+void network_monitor_test_reset_schedule(void)
+{
+    g_nm.next_sample_at_us = 0;
+}
+
+bool network_monitor_test_schedule_tick(int64_t now_us, int interval_secs)
+{
+    if (interval_secs < 1 || interval_secs > 3600)
+        return false;
+    g_nm.sample_interval_secs = interval_secs;
+    return nm_schedule_tick(now_us);
 }
 #endif
