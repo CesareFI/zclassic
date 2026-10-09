@@ -244,6 +244,51 @@ int t_boot_shutdown_persistence_order_contract(void)
     return failures;
 }
 
+static bool zcode_timer_lifecycle_contract(char *buf)
+{
+    char *tick = strstr(buf, "static void boot_zcode_swarm_timer_tick(");
+    char *wire = strstr(buf, "void boot_zcode_swarm_wire(");
+    char *lock = tick ? strstr(tick, "boot_zcode_swarm_lock();") : NULL;
+    char *svc = tick ? strstr(tick, "struct boot_svc_ctx *svc = s_svc;") : NULL;
+    char *dht = tick ? strstr(tick, "boot_zcode_dht_periodic(") : NULL;
+    if (!tick || !wire || !lock || !svc || !dht)
+        return false;
+    return lock < svc && svc < dht && dht < wire;
+}
+
+static bool zcode_frame_lifecycle_contract(char *buf)
+{
+    char *frame = strstr(buf, "bool boot_zcode_swarm_frame(");
+    char *periodic = strstr(buf, "static void boot_zcode_swarm_periodic(");
+    char *lock = frame ? strstr(frame, "boot_zcode_swarm_lock();") : NULL;
+    char *dht = frame ? strstr(frame, "boot_zcode_dht_frame(") : NULL;
+    if (!frame || !periodic || !lock || !dht)
+        return false;
+    return lock < dht && dht < periodic;
+}
+
+static bool zcode_message_tick_lifecycle_contract(char *buf)
+{
+    char *tick = strstr(buf, "void boot_zcode_swarm_tick(");
+    char *timer = strstr(buf, "static void boot_zcode_swarm_timer_tick(");
+    char *lock = tick ? strstr(tick, "boot_zcode_swarm_lock();") : NULL;
+    char *board = tick ? strstr(tick, "boot_fleet_board_tick(") : NULL;
+    if (!tick || !timer || !lock || !board)
+        return false;
+    return lock < board && board < timer;
+}
+
+static bool zcode_shutdown_lifecycle_contract(char *buf)
+{
+    char *shutdown = strstr(buf, "void boot_zcode_swarm_shutdown(void)");
+    char *lock = shutdown ? strstr(shutdown, "boot_zcode_swarm_lock();") : NULL;
+    char *dht = shutdown ? strstr(shutdown, "boot_zcode_dht_shutdown();") : NULL;
+    char *clear = shutdown ? strstr(shutdown, "s_svc = NULL;") : NULL;
+    if (!shutdown || !lock || !dht || !clear)
+        return false;
+    return lock < dht && dht < clear;
+}
+
 int t_boot_zcode_swarm_timer_shutdown_contract(void)
 {
     int failures = 0;
@@ -253,25 +298,10 @@ int t_boot_zcode_swarm_timer_shutdown_contract(void)
         ASSERT(repo_path(path, sizeof(path),
                          "engine/composition/src/boot_zcode_swarm.c") == 0);
         ASSERT(read_entire_file(path, &buf) == 0);
-        char *tick = strstr(buf, "static void boot_zcode_swarm_timer_tick(");
-        char *wire = strstr(buf, "void boot_zcode_swarm_wire(");
-        char *shutdown = strstr(buf, "void boot_zcode_swarm_shutdown(void)");
-        char *tick_lock = tick ? strstr(tick, "boot_zcode_swarm_lock();") : NULL;
-        char *svc = tick ? strstr(tick, "struct boot_svc_ctx *svc = s_svc;") : NULL;
-        char *dht_tick = tick ? strstr(tick, "boot_zcode_dht_periodic(") : NULL;
-        char *shutdown_lock = shutdown
-            ? strstr(shutdown, "boot_zcode_swarm_lock();") : NULL;
-        char *dht_shutdown = shutdown
-            ? strstr(shutdown, "boot_zcode_dht_shutdown();") : NULL;
-        char *clear = shutdown ? strstr(shutdown, "s_svc = NULL;") : NULL;
-        ASSERT(tick != NULL);
-        ASSERT(wire != NULL);
-        ASSERT(shutdown != NULL);
-        ASSERT(tick_lock != NULL && tick_lock < wire);
-        ASSERT(svc != NULL && tick_lock < svc && svc < wire);
-        ASSERT(dht_tick != NULL && tick_lock < dht_tick && dht_tick < wire);
-        ASSERT(shutdown_lock != NULL && shutdown_lock < dht_shutdown);
-        ASSERT(dht_shutdown != NULL && dht_shutdown < clear);
+        ASSERT(zcode_timer_lifecycle_contract(buf));
+        ASSERT(zcode_frame_lifecycle_contract(buf));
+        ASSERT(zcode_message_tick_lifecycle_contract(buf));
+        ASSERT(zcode_shutdown_lifecycle_contract(buf));
         PASS();
     } _test_next:;
     free(buf);

@@ -66,7 +66,7 @@ static int64_t s_work_capability_expires;
 static char s_work_workspace[4096];
 static struct boot_svc_ctx *s_svc;          /* borrowed; set by wire() */
 static struct liveness_contract s_timer_contract;
-static supervisor_child_id s_timer_child = SUPERVISOR_INVALID_ID;
+static _Atomic supervisor_child_id s_timer_child = SUPERVISOR_INVALID_ID;
 static _Atomic bool s_work_wake_pending;
 static uint64_t s_frames_sent;              /* supervisor progress marker */
 static size_t boot_zcode_swarm_drain_node(
@@ -534,26 +534,37 @@ bool boot_zcode_swarm_frame(struct msg_processor *mp, struct p2p_node *node,
 {
     if (!mp || !node || !payload)
         LOG_FAIL("net.zcode_swarm", "null mp/node/payload");
+    /* Frontend shutdown runs before connman joins its message callbacks.
+     * Serialize every hook-owned reach with teardown: unregistering the timer
+     * cannot cancel an already-entered message callback. */
+    boot_zcode_swarm_lock();
     if (boot_zcode_dht_frame(mp, node, payload, payload_len,
-                             (struct boot_svc_ctx *)ctx))
+                             (struct boot_svc_ctx *)ctx)) {
+        zcl_mutex_unlock(&s_lock);
         return true;
+    }
     /* Mesh status must answer with hosting off: dispatch before ensure. */
     if (boot_mesh_status_frame(mp, node, payload, payload_len,
-                               (struct boot_svc_ctx *)ctx))
+                               (struct boot_svc_ctx *)ctx)) {
+        zcl_mutex_unlock(&s_lock);
         return true;
+    }
     /* The AI message board and wiki: every full node carries them, so the
      * board leg answers before swarm hosting is even considered. */
-    if (boot_fleet_board_frame(mp, node, payload, payload_len, ctx))
+    if (boot_fleet_board_frame(mp, node, payload, payload_len, ctx)) {
+        zcl_mutex_unlock(&s_lock);
         return true;
+    }
     /* Multiplexed streams (the confined terminal among them): one lookup
      * by service name inside the primitive replaces what used to be a
      * per-service link in this chain. Same reasoning as mesh status — a
      * stream's OPEN is answered on the pairing authority alone, never
      * gated on swarm hosting. */
     if (mesh_stream_frame(mp, node, payload, payload_len,
-                          (struct boot_svc_ctx *)ctx))
+                          (struct boot_svc_ctx *)ctx)) {
+        zcl_mutex_unlock(&s_lock);
         return true;
-    boot_zcode_swarm_lock();
+    }
     struct vcs_swarm_engine *engine =
         boot_zcode_swarm_ensure((struct boot_svc_ctx *)ctx);
     if (!engine) {
@@ -684,8 +695,9 @@ static void boot_zcode_swarm_periodic(struct msg_processor *mp,
 void boot_zcode_swarm_request_tick(void)
 {
     atomic_store(&s_work_wake_pending, true);
-    if (s_timer_child != SUPERVISOR_INVALID_ID)
-        supervisor_request_tick(s_timer_child);
+    supervisor_child_id child = atomic_load(&s_timer_child);
+    if (child != SUPERVISOR_INVALID_ID)
+        supervisor_request_tick(child);
 }
 
 /* Drain queued frames for ONE node (bounded by the engine's outbound
@@ -735,6 +747,7 @@ void boot_zcode_swarm_tick(struct msg_processor *mp, struct p2p_node *node,
 {
     if (!mp || !node)
         return;
+    boot_zcode_swarm_lock();
     boot_fleet_board_tick(mp, node, ctx);
     /* ZRC-0011: the consumer half advances on the peer-link tick, which is the
      * first place in this process that runs WITH a live peer. The boot-time
@@ -744,7 +757,6 @@ void boot_zcode_swarm_tick(struct msg_processor *mp, struct p2p_node *node,
      * download it may start runs on its own thread, never on this one. */
     state_offer_service_tick();
     int64_t wall = (int64_t)platform_time_wall_time_t();
-    boot_zcode_swarm_lock();
     struct vcs_swarm_engine *engine =
         boot_zcode_swarm_ensure((struct boot_svc_ctx *)ctx);
     if (engine) {
@@ -861,27 +873,29 @@ void boot_zcode_swarm_wire(struct boot_svc_ctx *svc)
     liveness_contract_init(&s_timer_contract, "net.zcode_swarm");
     s_timer_contract.on_tick = boot_zcode_swarm_timer_tick;
     supervisor_domains_init();
-    s_timer_child = supervisor_register_in_domain(g_net_sup,
-                                                  &s_timer_contract);
-    if (s_timer_child == SUPERVISOR_INVALID_ID) {
+    supervisor_child_id child = supervisor_register_in_domain(g_net_sup,
+                                                               &s_timer_contract);
+    atomic_store(&s_timer_child, child);
+    if (child == SUPERVISOR_INVALID_ID) {
         LOG_ERROR("net.zcode_swarm",
                   "supervisor register failed; swarm is message-driven only");
         return;
     }
-    supervisor_set_period(s_timer_child, ZCODE_SWARM_TICK_PERIOD_SEC);
-    supervisor_set_deadline(s_timer_child, 30);
+    supervisor_set_period(child, ZCODE_SWARM_TICK_PERIOD_SEC);
+    supervisor_set_deadline(child, 30);
     /* ARMED progress policy (gate-recognised form: one line, plain
      * non-zero literal — 30 min in us). A seeder with no peers is
      * legitimately quiet (idle-reported); a downloader that sends
      * nothing for 30 minutes is wedged. */
-    supervisor_set_progress_max_quiet(s_timer_child, 1800000000);
+    supervisor_set_progress_max_quiet(child, 1800000000);
 }
 
 void boot_zcode_swarm_shutdown(void)
 {
-    if (s_timer_child != SUPERVISOR_INVALID_ID) {
-        supervisor_unregister(s_timer_child);
-        s_timer_child = SUPERVISOR_INVALID_ID;
+    supervisor_child_id child = atomic_exchange(&s_timer_child,
+                                                 SUPERVISOR_INVALID_ID);
+    if (child != SUPERVISOR_INVALID_ID) {
+        supervisor_unregister(child);
     }
     /* The unregister above is not a callback quiescence barrier.  Hold the
      * same lock used by the timer before dismantling DHT and swarm state, so
