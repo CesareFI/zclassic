@@ -229,6 +229,34 @@ int t_boot_shutdown_persistence_order_contract(void)
     return failures;
 }
 
+int t_boot_gap_fill_stops_before_connman_teardown_contract(void)
+{
+    int failures = 0;
+    char *buf = NULL;
+    TEST("gap-fill stops before its connman wake target is torn down") {
+        char path[PATH_MAX];
+        ASSERT(repo_path(path, sizeof(path),
+                         "engine/composition/src/boot_services_shutdown.c") == 0);
+        ASSERT(read_entire_file(path, &buf) == 0);
+        char *network_stop = strstr(
+            buf, "zcl_service_kernel_stop_all(&svc->network_kernel);");
+        char *gap_fill_stop = strstr(buf, "boot_gap_fill_stop(svc);");
+        char *connman_join = strstr(buf, "connman_join(svc->connman);");
+        char *connman_free = strstr(buf, "connman_free(svc->connman);");
+        ASSERT(network_stop != NULL);
+        ASSERT(gap_fill_stop != NULL);
+        ASSERT(connman_join != NULL);
+        ASSERT(connman_free != NULL);
+        ASSERT(network_stop < gap_fill_stop);
+        ASSERT(gap_fill_stop < connman_join);
+        ASSERT(connman_join < connman_free);
+        ASSERT(count_occurrences(buf, "boot_gap_fill_stop(svc);") == 1);
+        PASS();
+    } _test_next:;
+    free(buf);
+    return failures;
+}
+
 int t_hodl_history_uses_runtime_db_service(void)
 {
     int failures = 0;
