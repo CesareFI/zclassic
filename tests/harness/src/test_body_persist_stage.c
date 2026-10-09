@@ -474,6 +474,41 @@ int test_body_persist_stage(void)
         bp_teardown(dir, &ms, &sc);
     }
 
+    /* A process-local restart can stop while a re-fetch hold is armed. The
+     * next boot may pause at the same height before it has attempted its own
+     * re-fetch; it must not inherit the previous boot's elapsed hold clock. */
+    {
+        char old_dir[256]; struct main_state old_ms;
+        struct synth_chain_bp old_sc;
+        BP_CHECK("restart_hold: first setup",
+                 bp_setup("restart_hold_old", 2, -1, -1, old_dir,
+                          sizeof(old_dir), &old_ms, &old_sc) == 0);
+        old_sc.fail_read_height = 1;
+        BP_CHECK("restart_hold: first boot advances to h=1",
+                 body_persist_stage_drain(100) == 1);
+        BP_CHECK("restart_hold: first boot arms re-fetch hold",
+                 body_persist_stage_step_once() == JOB_IDLE);
+        body_persist_stage_shutdown();
+        active_chain_free(&old_ms.chain_active);
+        synth_chain_bp_free(&old_sc);
+        progress_store_close();
+        test_cleanup_tmpdir(old_dir);
+
+        char dir[256]; struct main_state ms; struct synth_chain_bp sc;
+        BP_CHECK("restart_hold: second setup",
+                 bp_setup("restart_hold_new", 2, -1, -1, dir, sizeof(dir),
+                          &ms, &sc) == 0);
+        sc.blocks[1].nStatus &= ~BLOCK_HAVE_DATA;
+        BP_CHECK("restart_hold: second boot advances to h=1",
+                 body_persist_stage_drain(100) == 1);
+        body_persist_stage_set_unfetchable_hold_secs_for_testing(0);
+        BP_CHECK("restart_hold: second boot has no inherited hold",
+                 body_persist_stage_step_once() == JOB_IDLE &&
+                 !blocker_exists("body_persist.body_unfetchable"));
+        body_persist_stage_set_unfetchable_hold_secs_for_testing(-1);
+        bp_teardown(dir, &ms, &sc);
+    }
+
     {
         char dir[256]; struct main_state ms; struct synth_chain_bp sc;
         BP_CHECK("idle_missing_fetch_row: setup",

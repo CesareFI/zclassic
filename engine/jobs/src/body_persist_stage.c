@@ -109,6 +109,7 @@ static void requeue_hold_disarm(void)
 {
     if (atomic_exchange(&g_requeue_height, -1) >= 0)
         blocker_clear(BODY_UNFETCHABLE_BLOCKER_ID);
+    atomic_store(&g_requeue_since_unix, 0);
 }
 
 /* Arm the hold clock for `height` (called from requeue_body_for_refetch). */
@@ -530,6 +531,11 @@ void body_persist_stage_shutdown(void)
      * state the next time the condition fires, so clearing here loses
      * nothing. */
     stage_upstream_log_hole_clear(STAGE_NAME);
+    /* A process-local restart must not inherit a prior boot's missing-body
+     * hold. In particular, a new stage paused at the same height has not yet
+     * attempted its own re-fetch and must not immediately publish the old
+     * diagnostic. */
+    requeue_hold_disarm();
     pthread_mutex_lock(&g_lock);
     if (g_stage) {
         stage_destroy(g_stage);
