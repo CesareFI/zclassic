@@ -5,6 +5,7 @@
 
 #include "conditions/local_header_refill_needed.h"
 #include "services/block_source_policy.h"
+#include "services/chain_state_service.h"
 #include "services/legacy_mirror_sync_service.h"
 #include "net/snapshot_sync_contract.h"
 #include "services/sync_monitor.h"
@@ -73,6 +74,30 @@ static int test_bsp_names(void)
                       "use_source");
         ASSERT_STR_EQ(bsp_source_name((enum bsp_source)BSP_SOURCE_NUM),
                       "unknown");
+    } TEST_END
+    return failures;
+}
+
+static int test_bsp_uses_published_header_height(void)
+{
+    int failures = 0;
+    TEST_CASE("block_source_policy: reads the repository-published header")
+    {
+        struct main_state ms;
+        struct block_index stale;
+        struct block_index published;
+        memset(&ms, 0, sizeof(ms));
+        memset(&stale, 0, sizeof(stale));
+        memset(&published, 0, sizeof(published));
+        stale.nHeight = 7;
+        published.nHeight = 8;
+        ms.pindex_best_header = &stale;
+        struct block_index *header_slot = &published;
+        csr_init(csr_instance(), &ms.map_block_index, &ms.chain_active,
+                 &header_slot, NULL, NULL, NULL);
+        ASSERT(block_source_policy_test_best_header_height(&ms) ==
+               published.nHeight);
+        csr_test_reset_singleton();
     } TEST_END
     return failures;
 }
@@ -1978,6 +2003,7 @@ int test_block_source_policy(void)
 {
     int failures = 0;
     failures += test_bsp_names();
+    failures += test_bsp_uses_published_header_height();
     failures += test_bsp_prefers_native_p2p();
     failures += test_bsp_keeps_caught_up_p2p_when_legacy_is_ahead();
     failures += test_bsp_gates_mirror_during_local_retries();

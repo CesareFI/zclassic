@@ -172,4 +172,9 @@ bool block_source_policy_dump_state_json(struct json_value *out,
                                          const char *key);
 void block_source_policy_reset_for_test(void);
 
+#ifdef ZCL_TESTING
+/* Exercises the live policy's best-header source without peer setup. */
+int block_source_policy_test_best_header_height(struct main_state *ms);
+#endif
+
 #endif /* ZCL_SERVICES_BLOCK_SOURCE_POLICY_H */

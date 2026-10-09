@@ -19,6 +19,7 @@
 #include "net/snapshot_sync_contract.h"
 #include "config/runtime.h"          /* app_runtime_snapshot_sync */
 #include "services/sync_monitor.h"
+#include "services/chain_state_service.h"
 #include "models/block.h"
 #include "models/database.h"
 #include "net/connman.h"
@@ -31,6 +32,7 @@
 #include "util/sync.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <string.h>
 #include <time.h>
 
@@ -141,8 +143,14 @@ static int runtime_local_height(struct main_state *ms)
 
 static int runtime_best_header_height(struct main_state *ms)
 {
-    if (!ms || !ms->pindex_best_header) return -1; /* raw-return-ok:sentinel */
-    return ms->pindex_best_header->nHeight;
+    int64_t height = csr_header_height(csr_instance());
+#ifdef ZCL_TESTING
+    if (height < 0 && ms && ms->pindex_best_header)
+        height = ms->pindex_best_header->nHeight;
+#else
+    (void)ms;
+#endif
+    return height >= 0 && height <= INT_MAX ? (int)height : -1;
 }
 
 static bool p2p_minimum_viable(const struct bsp_plan_input *in,
@@ -490,3 +498,10 @@ void block_source_policy_reset_for_test(void)
     g_bsp.last_projection_deferred_persist = 0;
     zcl_mutex_unlock(&g_bsp.lock);
 }
+
+#ifdef ZCL_TESTING
+int block_source_policy_test_best_header_height(struct main_state *ms)
+{
+    return runtime_best_header_height(ms); /* raw-return-ok:sentinel */
+}
+#endif
