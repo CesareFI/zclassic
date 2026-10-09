@@ -312,7 +312,7 @@ size_t body_coverage_scan_window(struct body_coverage_map *m,
     /* Coalesce contiguous have-data runs into one insert to keep the map
      * minimal and the scan O(window) inserts-amortized. */
     int64_t run_lo = -1;
-    for (int64_t h = lo; h <= hi; h++) {
+    for (int64_t h = lo;; h++) {
         if (have_data(h, ctx)) {
             if (run_lo < 0)
                 run_lo = h;
@@ -321,6 +321,10 @@ size_t body_coverage_scan_window(struct body_coverage_map *m,
                 inserted += (size_t)(h - run_lo);
             run_lo = -1;
         }
+        /* `hi` is inclusive and may be INT64_MAX. Stop before the loop
+         * expression could form its unrepresentable successor. */
+        if (h == hi)
+            break;
     }
     if (run_lo >= 0 && body_coverage_insert(m, run_lo, hi))
         inserted += (size_t)(hi - run_lo + 1);

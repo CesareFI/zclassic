@@ -276,6 +276,28 @@ static int test_bc_scan_window(void)
     return failures;
 }
 
+static bool tbc_never_have_data(int64_t h, void *ctx)
+{
+    (void)h;
+    (void)ctx;
+    return false;
+}
+
+static int test_bc_scan_window_int64_max(void)
+{
+    int failures = 0;
+    TEST("scan_window: INT64_MAX endpoint does not wrap the iterator") {
+        struct body_coverage_map m;
+        body_coverage_init(&m);
+        ASSERT(body_coverage_scan_window(&m, INT64_MAX - 1, INT64_MAX,
+                                         tbc_never_have_data, NULL) == 0);
+        ASSERT(body_coverage_range_count(&m) == 0);
+        body_coverage_free(&m);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* ── Persistence ────────────────────────────────────────────────── */
 
 static int test_bc_persistence_roundtrip(void)
@@ -534,6 +556,7 @@ int test_body_coverage(void)
     failures += test_bc_note_stored_pruned();
     failures += test_bc_find_first_hole();
     failures += test_bc_scan_window();
+    failures += test_bc_scan_window_int64_max();
     failures += test_bc_persistence_roundtrip();
     failures += test_bc_int64_boundaries_and_persist_cap();
     failures += test_bc_scheduler_plan_and_blocker();
