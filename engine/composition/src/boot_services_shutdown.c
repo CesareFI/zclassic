@@ -126,6 +126,10 @@ static bool shutdown_quiesce_network_and_flush_coins(struct boot_svc_ctx *svc,
      * connection manager is released rather than relying on the later generic
      * worker drain. */
     boot_seniority_stop();
+    /* The condition runner reaches sync-monitor recovery callbacks, some of
+     * which read connman. Join it before connman teardown rather than leaving
+     * a final condition tick with a borrowed network handle. */
+    self_heal_stop();
     /* The heartbeat sweeper calls node_health_collect(), which obtains the
      * live block-source status and reads connman.  It has its own explicit
      * stop/join boundary, so join it before connman is joined and freed below.
@@ -197,12 +201,9 @@ static void shutdown_stop_runtime_and_drain_workers(struct boot_svc_ctx *svc)
     /* The heartbeat sweeper was stopped before connman teardown because its
      * periodic health callback reads block-source state backed by connman.
      * It is already joined here, before the remaining runtime services stop. */
-    /* Stop + join the self-heal condition runner FIRST, while main_state and
-     * the progress store are still live: the runner dereferences both inside a
-     * condition tick, so it must never outlive them (they are freed in
-     * shutdown_release_owned_resources). The global shutdown flag is already
-     * set, so this joins at most one in-flight tick. */
-    self_heal_stop();
+    /* The condition runner was joined before connman teardown because its
+     * sync-monitor recovery callbacks read network state. It remains stopped
+     * before the main-state and progress-store teardown below. */
     zcl_service_kernel_stop_all(&svc->runtime_kernel);
     /* The base service kernel currently owns mempool_limits. Its stop hook is
      * the only authority that sets zcl_mempool_lim's stop token, so it must run
