@@ -217,6 +217,17 @@ static bool dump_has_idle_reason(const char *reason)
     return matches;
 }
 
+static bool dump_observed_total_is(int64_t expected)
+{
+    struct json_value v;
+    json_init(&v);
+    bool dumped = body_fetch_stage_dump_state_json(&v, NULL);
+    const struct json_value *observed = json_get(&v, "observed_total");
+    bool matches = dumped && observed && json_get_int(observed) == expected;
+    json_free(&v);
+    return matches;
+}
+
 /* Flip the ok flag on a validate_headers_log row (for testing the
  * skipped_invalid path without rewiring the vh stub validator). */
 static bool vh_log_force_ok(sqlite3 *db, int height, int ok)
@@ -738,6 +749,11 @@ static int test_body_fetch_stage_platform_arm(void)
         BF_CHECK("dump: observed_total=2",
                  strstr(buf, "\"observed_total\":2") != NULL);
         json_free(&v);
+
+        body_fetch_stage_test_set_observed_total(UINT64_MAX);
+        BF_CHECK("dump: saturates unsigned observed_total",
+                 dump_observed_total_is(INT64_MAX));
+        body_fetch_stage_test_set_observed_total(0);
 
         bf_teardown(dir, &ms, &sc);
     }

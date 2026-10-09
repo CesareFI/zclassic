@@ -479,6 +479,18 @@ uint64_t body_fetch_stage_skipped_total(void)
     return atomic_load(&g_skipped_total);
 }
 
+#ifdef ZCL_TESTING
+void body_fetch_stage_test_set_observed_total(uint64_t value)
+{
+    atomic_store(&g_observed_total, value);
+}
+#endif
+
+static int64_t body_fetch_json_counter(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
+
 bool body_fetch_stage_dump_state_json(struct json_value *out,
                                        const char *key)
 {
@@ -488,9 +500,11 @@ bool body_fetch_stage_dump_state_json(struct json_value *out,
 
     stage_dump_header(out, STAGE_NAME, g_stage);
     json_push_kv_int (out, "observed_total",
-                      (int64_t)atomic_load(&g_observed_total));
+                      body_fetch_json_counter(
+                          atomic_load(&g_observed_total)));
     json_push_kv_int (out, "skipped_total",
-                      (int64_t)atomic_load(&g_skipped_total));
+                      body_fetch_json_counter(
+                          atomic_load(&g_skipped_total)));
     json_push_kv_int (out, "last_advance_height",
                       atomic_load(&g_last_advance_height));
     json_push_kv_int (out, "last_step_unix",
@@ -502,26 +516,26 @@ bool body_fetch_stage_dump_state_json(struct json_value *out,
     json_push_kv_str(out, "last_idle_reason",
                      body_fetch_idle_reason_name(idle_reason));
     json_push_kv_int(out, "authority_best_header_absent_total",
-                     (int64_t)atomic_load(
-                         &g_idle_reason_total[BF_IDLE_BEST_HEADER_ABSENT]));
+                     body_fetch_json_counter(atomic_load(
+                         &g_idle_reason_total[BF_IDLE_BEST_HEADER_ABSENT])));
     json_push_kv_int(out, "authority_best_hash_mismatch_total",
-                     (int64_t)atomic_load(
-                         &g_idle_reason_total[BF_IDLE_BEST_HASH_MISMATCH]));
+                     body_fetch_json_counter(atomic_load(
+                         &g_idle_reason_total[BF_IDLE_BEST_HASH_MISMATCH])));
     json_push_kv_int(out, "authority_active_hash_mismatch_total",
-                     (int64_t)atomic_load(
-                         &g_idle_reason_total[BF_IDLE_ACTIVE_HASH_MISMATCH]));
+                     body_fetch_json_counter(atomic_load(
+                         &g_idle_reason_total[BF_IDLE_ACTIVE_HASH_MISMATCH])));
     json_push_kv_int(out, "authority_visible_parent_absent_total",
-                     (int64_t)atomic_load(
-                         &g_idle_reason_total[BF_IDLE_VISIBLE_PARENT_ABSENT]));
+                     body_fetch_json_counter(atomic_load(
+                         &g_idle_reason_total[BF_IDLE_VISIBLE_PARENT_ABSENT])));
     json_push_kv_int(out, "authority_visible_parent_mismatch_total",
-                     (int64_t)atomic_load(
-                         &g_idle_reason_total[BF_IDLE_VISIBLE_PARENT_MISMATCH]));
+                     body_fetch_json_counter(atomic_load(
+                         &g_idle_reason_total[BF_IDLE_VISIBLE_PARENT_MISMATCH])));
     json_push_kv_int(out, "authority_failed_total",
-                     (int64_t)atomic_load(
-                         &g_idle_reason_total[BF_IDLE_AUTHORITY_FAILED]));
+                     body_fetch_json_counter(atomic_load(
+                         &g_idle_reason_total[BF_IDLE_AUTHORITY_FAILED])));
     json_push_kv_int(out, "body_missing_total",
-                     (int64_t)atomic_load(
-                         &g_idle_reason_total[BF_IDLE_BODY_MISSING]));
+                     body_fetch_json_counter(atomic_load(
+                         &g_idle_reason_total[BF_IDLE_BODY_MISSING])));
     stage_dump_counters(out, g_stage);
     stage_dump_health(out, STAGE_NAME, g_stage);
     return true;

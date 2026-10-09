@@ -130,6 +130,11 @@ int64_t  body_fetch_stage_step_us_ewma(void);
 uint64_t body_fetch_stage_observed_total(void);   /* source='disk' rows */
 uint64_t body_fetch_stage_skipped_total(void);    /* source='skipped_invalid' */
 
+#ifdef ZCL_TESTING
+/* Test-only seam for JSON diagnostics at the uint64_t boundary. */
+void body_fetch_stage_test_set_observed_total(uint64_t value);
+#endif
+
 /* `z23 dumpstate body_fetch` (dump-state convention). */
 bool body_fetch_stage_dump_state_json(struct json_value *out,
                                        const char *key);
