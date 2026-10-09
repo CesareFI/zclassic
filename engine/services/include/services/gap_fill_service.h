@@ -138,6 +138,9 @@ void gap_fill_kick(void);
 void gap_fill_set_dispatch_wake(gap_fill_dispatch_wake_fn fn, void *ctx);
 
 #ifdef ZCL_TESTING
+/* Confirms the worker's best-header snapshot source without starting its
+ * thread or touching the download queue. */
+int gap_fill_test_header_tip_height(struct main_state *ms);
 /* Test seam for the kick latch: drive and observe the worker's wait state
  * without starting the thread. */
 void gap_fill_test_set_running(bool running);

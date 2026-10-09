@@ -9,9 +9,12 @@
 #include "json/json.h"
 
 #include "chain/chain.h"
+#include "services/chain_state_service.h"
 #include "services/gap_fill_service.h"
 #include "util/safe_alloc.h"
+#include "validation/main_state.h"
 
+#include <string.h>
 #include <stdlib.h>
 
 #define GF_CHECK(name, expr) do {                                      \
@@ -57,6 +60,24 @@ int test_gap_fill_frontier_window(void)
 {
     printf("\n=== gap_fill_frontier_window ===\n");
     int failures = 0;
+
+    {
+        struct main_state ms;
+        struct block_index stale;
+        struct block_index published;
+        memset(&ms, 0, sizeof(ms));
+        memset(&stale, 0, sizeof(stale));
+        memset(&published, 0, sizeof(published));
+        stale.nHeight = 7;
+        published.nHeight = 8;
+        ms.pindex_best_header = &stale;
+        struct block_index *header_slot = &published;
+        csr_init(csr_instance(), &ms.map_block_index, &ms.chain_active,
+                 &header_slot, NULL, NULL, NULL);
+        GF_CHECK("uses the repository-published header",
+                 gap_fill_test_header_tip_height(&ms) == published.nHeight);
+        csr_test_reset_singleton();
+    }
 
     struct gap_fill_window w;
 

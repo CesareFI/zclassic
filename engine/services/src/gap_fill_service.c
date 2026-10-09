@@ -28,6 +28,7 @@
 #include "storage/progress_store.h"
 #include "jobs/body_fetch_stage.h"
 #include "jobs/validate_headers_stage.h"
+#include "services/chain_state_service.h"
 #include "json/json.h"
 #include "util/log_macros.h"
 #include "util/safe_alloc.h"
@@ -402,6 +403,23 @@ static void gap_fill_persist_coverage(void)
     (void)body_history_save(db);
 }
 
+/* The best-header slot is published by CSR, not cs_main. Block indexes have
+ * process lifetime, so this copied pointer remains safe to walk after the
+ * repository lock is released; cs_main still protects active-chain and
+ * status reads below. Keep the two lock domains separate. */
+static struct block_index *gap_fill_header_tip_snapshot(
+    struct main_state *ms)
+{
+    struct block_index *tip = csr_header_tip_snapshot(csr_instance());
+#ifdef ZCL_TESTING
+    if (!tip && ms)
+        tip = ms->pindex_best_header;
+#else
+    (void)ms;
+#endif
+    return tip;
+}
+
 /* One pass: scan [tip+1, best_header] for missing data, queue
  * downloads. Returns number of blocks enqueued (0 = idle, -1 =
  * corrupt walk detected). */
@@ -420,12 +438,12 @@ static int gap_fill_pass(void)
     if (timed_out > 0)
         gap_fill_wake_dispatcher("timeout_sweep");
 
-    /* Snapshot tip and best_header under cs_main. We hold the lock
-     * only for the pointer reads + pprev walk; the dl_queue_blocks
-     * call is done outside the lock. */
+    /* Snapshot the CSR-owned header tip before cs_main. We hold cs_main only
+     * for active-chain/status reads plus the pprev walk; dl_queue_blocks
+     * remains outside both locks. */
+    struct block_index *best = gap_fill_header_tip_snapshot(ms);
     zcl_mutex_lock(&ms->cs_main);
     int tip_h = active_chain_height(&ms->chain_active);
-    struct block_index *best = ms->pindex_best_header;
     int best_h = best ? best->nHeight : 0;
     /* Seed-floor raise: on a bundle/snapshot-seeded node the install
      * advances the stage cursors (body_fetch = seed+1) but never moves
@@ -799,6 +817,12 @@ void gap_fill_kick(void)
 }
 
 #ifdef ZCL_TESTING
+int gap_fill_test_header_tip_height(struct main_state *ms)
+{
+    struct block_index *tip = gap_fill_header_tip_snapshot(ms);
+    return tip ? tip->nHeight : -1; /* raw-return-ok:sentinel */
+}
+
 /* Test seam: drive and observe the kick latch without the worker thread.
  * Setting running also clears a stale latch so each case starts clean. */
 void gap_fill_test_set_running(bool running)
