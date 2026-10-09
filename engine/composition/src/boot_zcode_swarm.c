@@ -767,13 +767,19 @@ void boot_zcode_swarm_tick(struct msg_processor *mp, struct p2p_node *node,
 static void boot_zcode_swarm_timer_tick(struct liveness_contract *self)
 {
     (void)self;
+    /* supervisor_unregister() only prevents a future registry lookup: the
+     * tick runner may already own this callback.  Serialize its first
+     * lifecycle observation and every borrowed swarm reach with shutdown, so
+     * a claimed tick either finishes before teardown or observes s_svc NULL. */
+    boot_zcode_swarm_lock();
     struct boot_svc_ctx *svc = s_svc;
-    if (!svc || !svc->msg_processor)
+    if (!svc || !svc->msg_processor) {
+        zcl_mutex_unlock(&s_lock);
         return; /* not wired: nothing legitimate to report */
+    }
     struct msg_processor *mp = svc->msg_processor;
     boot_zcode_dht_periodic(mp, svc);
     int64_t wall = (int64_t)platform_time_wall_time_t();
-    boot_zcode_swarm_lock();
     if (svc != s_svc) {
         zcl_mutex_unlock(&s_lock);
         return; /* shutdown raced us */
@@ -877,6 +883,10 @@ void boot_zcode_swarm_shutdown(void)
         supervisor_unregister(s_timer_child);
         s_timer_child = SUPERVISOR_INVALID_ID;
     }
+    /* The unregister above is not a callback quiescence barrier.  Hold the
+     * same lock used by the timer before dismantling DHT and swarm state, so
+     * an already-claimed tick completes before any borrowed owner is cleared. */
+    boot_zcode_swarm_lock();
     boot_zcode_dht_shutdown();
     boot_mesh_status_shutdown();
     state_offer_service_shutdown();
@@ -887,7 +897,6 @@ void boot_zcode_swarm_shutdown(void)
     boot_mesh_terminal_shutdown();
     mesh_tunnel_shutdown();
     mesh_stream_shutdown();
-    boot_zcode_swarm_lock();
     s_svc = NULL;
     vcs_swarm_engine_set_global(NULL);
     vcs_zcode_work_node_set_global(NULL);
