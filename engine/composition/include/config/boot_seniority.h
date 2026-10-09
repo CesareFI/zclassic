@@ -176,10 +176,13 @@ enum boot_seniority_action boot_seniority_next_action(int32_t tip_height,
  * then register the supervised refresh child and spawn its worker. Called
  * once from app_log_bootstrap_sources(); idempotent. Never blocks boot and
  * never fails it. The worker is a long-running daemon: it exits on
- * thread_registry_shutdown_requested() and is swept by
- * thread_registry_join_all(), so there is no stop entry point to forget to
- * call. */
+ * thread_registry_shutdown_requested(). Its addrman belongs to connman, so
+ * shutdown must join it before connman is released. */
 void boot_seniority_start(struct addr_man *am);
+
+/* Stop and join the refresh worker before its connman-owned addrman is
+ * released. Idempotent for boot paths where startup never reached it. */
+void boot_seniority_stop(void);
 
 /* Rebuild the whole weight table for `epoch_height` and publish it to
  * addrman, replacing the previous epoch's table entirely. Every address that

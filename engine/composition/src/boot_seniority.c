@@ -33,6 +33,7 @@
 #include "util/thread_registry.h"
 
 #include <stdatomic.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -62,6 +63,8 @@ static _Atomic bool     g_running;
 static _Atomic supervisor_child_id g_sup_id = SUPERVISOR_INVALID_ID;
 static struct liveness_contract g_contract;
 static struct addr_man *g_am;   /* owned by connman; outlives the worker */
+static pthread_t g_worker_tid;
+static _Atomic bool g_worker_started;
 
 int32_t boot_seniority_applied_epoch(void)
 {
@@ -620,11 +623,23 @@ void boot_seniority_start(struct addr_man *am)
     atomic_store(&g_running, true);
     /* supervised:net.seniority_refresh */
     int rc = thread_registry_spawn("zcl_seniority", bsen_worker_main, NULL,
-                                   NULL);
+                                   &g_worker_tid);
     if (rc != 0) {
         atomic_store(&g_running, false);
+        g_am = NULL;
         supervisor_child_complete(id);
         LOG_WARN(BSEN_LOG, "worker spawn failed (%d); rotation is frozen at "
                  "epoch %d until restart", rc, epoch);
+        return;
     }
+    atomic_store(&g_worker_started, true);
+}
+
+void boot_seniority_stop(void)
+{
+    atomic_store(&g_running, false);
+    if (atomic_exchange(&g_worker_started, false))
+        pthread_join(g_worker_tid, NULL);
+    supervisor_child_complete(atomic_load(&g_sup_id));
+    g_am = NULL;
 }

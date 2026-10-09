@@ -5,6 +5,7 @@
  * best-effort release). Split from boot_services.c along the
  * app_shutdown_svc seam. */
 #include "config/boot_internal.h"
+#include "config/boot_seniority.h"
 #include "config/boot_background_workers.h"
 #include "config/boot_snapshot_offer.h"
 #include "config/boot_shutdown_marker.h"
@@ -121,6 +122,10 @@ static bool shutdown_quiesce_network_and_flush_coins(struct boot_svc_ctx *svc,
      * already copied out of gap-fill's mutex.  The runtime-kernel stop later
      * is idempotent. */
     boot_gap_fill_stop(svc);
+    /* The seniority worker refreshes connman's addrman. Join it before the
+     * connection manager is released rather than relying on the later generic
+     * worker drain. */
+    boot_seniority_stop();
     /* The heartbeat sweeper calls node_health_collect(), which obtains the
      * live block-source status and reads connman.  It has its own explicit
      * stop/join boundary, so join it before connman is joined and freed below.

@@ -159,6 +159,7 @@ int t_boot_shutdown_persistence_order_contract(void)
                          "engine/composition/src/boot_services_shutdown.c") == 0);
         ASSERT(read_entire_file(path, &buf) == 0);
         char *network_stop = strstr(buf, "zcl_service_kernel_stop_all(&svc->network_kernel);");
+        char *seniority_stop = strstr(buf, "boot_seniority_stop();");
         char *health_stop = strstr(buf, "health_stop();");
         char *connman_join = strstr(buf, "connman_join(svc->connman);");
         char *supervisor_stop = strstr(buf, "supervisor_stop();");
@@ -176,6 +177,7 @@ int t_boot_shutdown_persistence_order_contract(void)
             buf, "boot_shutdown_marker_write_clean(svc->datadir)");
         char *fast = strstr(buf, "shutdown_persist_fast_restart_state(svc);");
         ASSERT(network_stop != NULL);
+        ASSERT(seniority_stop != NULL);
         ASSERT(health_stop != NULL);
         ASSERT(connman_join != NULL);
         ASSERT(supervisor_stop != NULL);
@@ -190,6 +192,8 @@ int t_boot_shutdown_persistence_order_contract(void)
          * backed by connman. Their sweeper must be joined before either
          * connman teardown or the DB checkpoint/close begins. */
         ASSERT(network_stop < health_stop);
+        ASSERT(network_stop < seniority_stop);
+        ASSERT(seniority_stop < connman_join);
         ASSERT(health_stop < connman_join);
         ASSERT(health_stop < wal_checkpoint);
         /* Two call sites, and exactly two. The online path stops the sweeper
