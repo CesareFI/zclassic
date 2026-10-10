@@ -20,6 +20,7 @@
 #include "validation/chainstate.h"
 #include "validation/process_block.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -788,6 +789,13 @@ const char *watchdog_recovery_type_name(enum watchdog_recovery_type type)
     return "UNKNOWN";
 }
 
+/* JSON integer values are signed. Preserve a large monotone download counter
+ * as its greatest representable value instead of wrapping it negative. */
+static int64_t sync_monitor_json_u64(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
+
 /* `z23 dumpstate sync_monitor` — sync watchdog recovery counters
  * plus the local-recovery (header-refill) sub-state. See CLAUDE.md "Adding
  * state introspection". Reentrant-safe (both accessors snapshot internally). */
@@ -838,12 +846,18 @@ bool sync_monitor_dump_state_json(struct json_value *out, const char *key)
                      &dl_in_flight, &dl_queued);
         dl_get_throughput(dm, &dl_bytes, &dl_mbps_avg);
     }
-    json_push_kv_int(out, "download_requested", (int64_t)dl_requested);
-    json_push_kv_int(out, "download_received", (int64_t)dl_received);
-    json_push_kv_int(out, "download_timed_out", (int64_t)dl_timed_out);
-    json_push_kv_int(out, "download_in_flight", (int64_t)dl_in_flight);
-    json_push_kv_int(out, "download_queued", (int64_t)dl_queued);
-    json_push_kv_int(out, "download_bytes_received", (int64_t)dl_bytes);
+    json_push_kv_int(out, "download_requested",
+                     sync_monitor_json_u64(dl_requested));
+    json_push_kv_int(out, "download_received",
+                     sync_monitor_json_u64(dl_received));
+    json_push_kv_int(out, "download_timed_out",
+                     sync_monitor_json_u64(dl_timed_out));
+    json_push_kv_int(out, "download_in_flight",
+                     sync_monitor_json_u64(dl_in_flight));
+    json_push_kv_int(out, "download_queued",
+                     sync_monitor_json_u64(dl_queued));
+    json_push_kv_int(out, "download_bytes_received",
+                     sync_monitor_json_u64(dl_bytes));
     json_push_kv_real(out, "download_mbps_avg", dl_mbps_avg);
     json_push_kv_int(out, "tip_state_evaluations",
                      (int64_t)atomic_load(&g_tip_state_evaluations));

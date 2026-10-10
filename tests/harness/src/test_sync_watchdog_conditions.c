@@ -17,6 +17,7 @@
 #include "util/blocker.h"
 #include "validation/chainstate.h"
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -102,6 +103,29 @@ static void cleanup_sync_watchdog(void)
     blocker_reset_for_testing();
     sync_monitor_set_context(NULL, NULL, NULL);
     clock_reset_default();
+}
+
+static int test_sync_monitor_download_counter_saturation(void)
+{
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    reset_sync_watchdog(&cm, &dm, &ms);
+    dm.total_requested = (uint64_t)INT64_MAX + 1u;
+    dm.total_received = UINT64_MAX;
+    dm.total_bytes_received = UINT64_MAX;
+    sync_monitor_set_context(&cm, &dm, &ms);
+    struct json_value state;
+    json_init(&state);
+    bool ok = sync_monitor_dump_state_json(&state, NULL);
+    ok = ok && json_get_int(json_get(&state, "download_requested")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&state, "download_received")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&state, "download_bytes_received")) == INT64_MAX;
+    json_free(&state);
+    printf("sync_watchdog_conditions: sync monitor saturates unsigned "
+           "download counters... %s\n", ok ? "OK" : "FAIL");
+    cleanup_sync_watchdog();
+    return ok ? 0 : 1;
 }
 
 static bool header_stall_timeout_ignores_wall_rollback(void)
@@ -228,6 +252,7 @@ int test_sync_watchdog_conditions(void)
     int failures = 0;
 
     failures += test_download_queue_uses_monotonic_timeout();
+    failures += test_sync_monitor_download_counter_saturation();
 
     {
         /* C3: verified reducer progress must reach the network backpressure
