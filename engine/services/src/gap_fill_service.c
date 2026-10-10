@@ -301,7 +301,8 @@ struct block_index *gap_fill_window_walk_start(
 
 bool gap_fill_block_needs_queue(const struct block_index *bi)
 {
-    return bi && bi->phashBlock && !(bi->nStatus & BLOCK_HAVE_DATA);
+    return bi && bi->phashBlock &&
+           !(block_index_status_load(bi) & BLOCK_HAVE_DATA);
 }
 
 void gap_fill_get_stats(struct gap_fill_stats *out)
@@ -619,7 +620,7 @@ static int gap_fill_pass(void)
     int hi = bis[0] ? bis[0]->nHeight : tip_h;
     for (int i = 0; i < collected; i++) {
         struct block_index *bi = bis[i];
-        if (bi && (bi->nStatus & BLOCK_HAVE_DATA))
+        if (bi && (block_index_status_load(bi) & BLOCK_HAVE_DATA))
             have_heights[n_have++] = bi->nHeight;
         if (!gap_fill_block_needs_queue(bi)) continue;
         if (dl_is_in_flight(dm, bi->phashBlock)) continue;
