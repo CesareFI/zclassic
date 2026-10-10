@@ -102,11 +102,12 @@ void boot_refold_body_rebind_set_datadir(const char *datadir)
     }
 }
 
-/* True iff at least one non-empty blk*.dat exists under datadir/blocks (a cheap
- * stat probe over the first few files — the scan itself walks the rest). */
+/* True iff at least one non-empty numbered blk*.dat exists under
+ * datadir/blocks. Pruning can leave an absent prefix before retained files,
+ * so this bounded probe must cover the same namespace as the rebind scan. */
 static bool refold_have_local_block_files(const char *datadir)
 {
-    for (int ci = 0; ci < 3; ci++) {
+    for (int ci = 0; ci < 256; ci++) {
         char p[576];
         int n = snprintf(p, sizeof(p), "%s/blocks/blk%05d.dat", datadir, ci);
         if (n < 0 || (size_t)n >= sizeof(p))

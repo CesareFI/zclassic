@@ -221,7 +221,7 @@ int test_refold_body_span_contiguous(void)
      * proof-N covers the end-to-end "marks HAVE_DATA from real bodies → fold
      * arms". */
 
-    /* C7a: datadir set + a local blk00000.dat present → the rebind scan fires
+    /* C7a: datadir set + a retained local blk00003.dat present → the rebind scan fires
      * exactly ONCE (once-per-process guard), even across two calls. */
     {
         boot_refold_body_rebind_reset_for_test();
@@ -232,11 +232,11 @@ int test_refold_body_span_contiguous(void)
         test_make_tmpdir(root, sizeof(root), "refold_rebind", "havefiles");
         snprintf(blocksdir, sizeof(blocksdir), "%s/blocks", root);
         (void)mkdir(blocksdir, 0700);
-        snprintf(blkpath, sizeof(blkpath), "%s/blk00000.dat", blocksdir);
+        snprintf(blkpath, sizeof(blkpath), "%s/blk00003.dat", blocksdir);
         FILE *bf = fopen(blkpath, "wb");
         bool wrote = bf && fwrite("nomagic-dummy-body", 1, 18, bf) == 18;
         if (bf) fclose(bf);
-        BSC_CHECK("C7a: dummy blk00000.dat staged", wrote);
+        BSC_CHECK("C7a: dummy retained blk00003.dat staged", wrote);
 
         boot_refold_body_rebind_set_datadir(root);
 
