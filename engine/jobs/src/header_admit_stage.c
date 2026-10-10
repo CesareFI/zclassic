@@ -693,14 +693,18 @@ void header_admit_stage_shutdown(void)
 
 uint64_t header_admit_stage_cursor(void)
 {
-    if (!g_stage)
-        return 0;
-    return stage_cursor(g_stage);
+    pthread_mutex_lock(&g_lock);
+    uint64_t cursor = g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return cursor;
 }
 
 int64_t header_admit_stage_step_us_ewma(void)
 {
-    return g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_lock(&g_lock);
+    int64_t ewma = g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return ewma;
 }
 
 uint64_t header_admit_stage_admitted_total(void)
@@ -768,6 +772,10 @@ bool header_admit_stage_dump_state_json(struct json_value *out,
     if (!out) return false;
     json_set_object(out);
 
+    /* Shutdown destroys g_stage under g_lock. Keep the pointer live for the
+     * complete snapshot instead of treating stage's lock-free field reads as
+     * a lifetime guarantee. */
+    pthread_mutex_lock(&g_lock);
     stage_dump_header(out, STAGE_NAME, g_stage);
     json_push_kv_int (out, "admitted_total",
                       (int64_t)atomic_load(&g_admitted_total));
@@ -796,5 +804,6 @@ bool header_admit_stage_dump_state_json(struct json_value *out,
     json_push_kv_str(out, "authority", "authoritative");
     stage_dump_counters(out, g_stage);
     stage_dump_health(out, STAGE_NAME, g_stage);
+    pthread_mutex_unlock(&g_lock);
     return true;
 }

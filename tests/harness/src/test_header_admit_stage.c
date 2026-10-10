@@ -199,12 +199,28 @@ static bool auth_observer(struct main_state *ms,
     return true;
 }
 
+static int test_ha_shutdown_status_guards(void)
+{
+    int failures = 0;
+
+    HA_CHECK("guard: status accessors are empty after shutdown",
+             header_admit_stage_cursor() == 0 &&
+             header_admit_stage_step_us_ewma() == 0);
+    struct json_value status;
+    json_init(&status);
+    HA_CHECK("guard: status snapshot is safe after shutdown",
+             header_admit_stage_dump_state_json(&status, NULL));
+    json_free(&status);
+    return failures;
+}
+
 int test_header_admit_stage(void)
 {
     printf("\n=== header_admit_stage tests ===\n");
     int failures = 0;
 
     blocker_module_init();
+    failures += test_ha_shutdown_status_guards();
 
     /* ── happy path: drain a 5-block synthetic chain ───────────────── */
     {
