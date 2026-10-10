@@ -124,6 +124,9 @@ static int test_sync_service_keeps_caught_up_peers_active(void)
                                                SYNC_AT_TIP));
         ASSERT(!syncsvc_begin_peer_sync(&node, 1000, 1000));
         ASSERT(node.state == PEER_ACTIVE);
+        node.starting_height = INT_MAX;
+        ASSERT(!syncsvc_should_begin_peer_sync(&node, INT_MAX, INT_MAX,
+                                               SYNC_AT_TIP));
         PASS();
     } _test_next:;
 
@@ -239,6 +242,8 @@ static int test_sync_service_marks_caught_up_syncing_peers_active(void)
 
         ASSERT(syncsvc_should_mark_peer_caught_up(&node, 1000, 1000));
         ASSERT(!syncsvc_should_mark_peer_caught_up(&node, 999, 1000));
+        node.starting_height = INT_MAX;
+        ASSERT(syncsvc_should_mark_peer_caught_up(&node, INT_MAX, INT_MAX));
         PASS();
     } _test_next:;
 

@@ -55,7 +55,7 @@ bool syncsvc_should_begin_peer_sync(const struct p2p_node *node,
     if (node->starting_height > our_height ||
         sync_state == SYNC_FINDING_PEERS)
         return true;
-    if (best_header_height > our_height + 1)
+    if ((int64_t)best_header_height > (int64_t)our_height + 1)
         return true;
     if (node->starting_height >= 0 || sync_state == SYNC_AT_TIP)
         return false;
@@ -78,7 +78,7 @@ bool syncsvc_should_mark_peer_caught_up(const struct p2p_node *node,
         return false;
     if (zero_height_onion_probe_pending(node))
         return false;
-    return best_header_height <= our_height + 1 &&
+    return (int64_t)best_header_height <= (int64_t)our_height + 1 &&
            node->starting_height <= our_height;
 }
 
