@@ -86,6 +86,46 @@ static bool bsc_install(struct main_state *ms, int height, bool have_data)
     return active_chain_install_tip_slot(&ms->chain_active, bi);
 }
 
+static int bsc_check_sync_spool_rebind(void)
+{
+    int failures = 0;
+    boot_refold_body_rebind_reset_for_test();
+    blocker_reset_for_testing();
+    chain_params_select(CHAIN_REGTEST);
+
+    char root[256], blocksdir[400], syncpath[512];
+    test_make_tmpdir(root, sizeof(root), "refold_rebind", "syncspool");
+    snprintf(blocksdir, sizeof(blocksdir), "%s/blocks", root);
+    (void)mkdir(blocksdir, 0700);
+    snprintf(syncpath, sizeof(syncpath), "%s/blk_sync.dat", blocksdir);
+    FILE *bf = fopen(syncpath, "wb");
+    bool wrote = bf && fwrite("nomagic-dummy-body", 1, 18, bf) == 18;
+    if (bf) fclose(bf);
+    BSC_CHECK("C7d: dummy blk_sync.dat staged", wrote);
+
+    boot_refold_body_rebind_set_datadir(root);
+    struct main_state ms;
+    main_state_init(&ms);
+    bool seeded = true;
+    for (int h = BSC_ANCHOR; h <= BSC_ANCHOR + 4; h++)
+        seeded = seeded && bsc_install(&ms, h, (h != BSC_ANCHOR + 2));
+    BSC_CHECK("C7d: chain with a body hole installed", seeded);
+
+    int32_t fm = -1;
+    bool ok = boot_refold_body_span_contiguous(
+        &ms, BSC_ANCHOR, BSC_ANCHOR + 4, &fm, true);
+    BSC_CHECK("C7d: gap persists (dummy sync spool has no real bodies)", !ok);
+    BSC_CHECK("C7d: sync spool rebind scan FIRED once",
+              boot_refold_body_rebind_scan_attempts_for_test() == 1);
+    BSC_CHECK("C7d: named blocker still raised", blocker_exists("refold.body_gap"));
+
+    main_state_free(&ms);
+    test_rm_rf_recursive(root);
+    boot_refold_body_rebind_reset_for_test();
+    blocker_reset_for_testing();
+    return failures;
+}
+
 int test_refold_body_span_contiguous(void);
 int test_refold_body_span_contiguous(void)
 {
@@ -324,6 +364,10 @@ int test_refold_body_span_contiguous(void)
         boot_refold_body_rebind_reset_for_test();
         blocker_reset_for_testing();
     }
+
+    /* C7d: file-service bootstrap may retain only blk_sync.dat. It is a
+     * scanner input and must therefore trigger the same one-shot rebind. */
+    failures += bsc_check_sync_spool_rebind();
 
     return failures;
 }

@@ -102,9 +102,9 @@ void boot_refold_body_rebind_set_datadir(const char *datadir)
     }
 }
 
-/* True iff at least one non-empty numbered blk*.dat exists under
- * datadir/blocks. Pruning can leave an absent prefix before retained files,
- * so this bounded probe must cover the same namespace as the rebind scan. */
+/* True iff at least one non-empty scanner input exists under datadir/blocks.
+ * Pruning can leave an absent prefix before retained numbered files, and
+ * file-service bootstrap may retain only blk_sync.dat. */
 static bool refold_have_local_block_files(const char *datadir)
 {
     for (int ci = 0; ci < 256; ci++) {
@@ -116,7 +116,12 @@ static bool refold_have_local_block_files(const char *datadir)
         if (stat(p, &st) == 0 && st.st_size > 0)
             return true;
     }
-    return false;
+    char sync_path[576];
+    int n = snprintf(sync_path, sizeof(sync_path), "%s/blocks/blk_sync.dat",
+                     datadir);
+    struct stat st;
+    return n > 0 && (size_t)n < sizeof(sync_path) &&
+           stat(sync_path, &st) == 0 && st.st_size > 0;
 }
 
 /* First height in (anchor, target] whose active-chain slot is absent or lacks
