@@ -556,6 +556,7 @@ int t_projection_deferral_is_not_block_rejected_contract(void);
 int t_trusted_peer_stall_guard_contract(void);
 int t_gap_fill_wakes_connman_dispatch_contract(void);
 int t_have_data_unreadable_uses_atomic_index_snapshots_contract(void);
+int t_block_failed_mask_at_tip_uses_atomic_index_status_contract(void);
 int t_msg_process_yields_to_send_phase_contract(void);
 int t_no_dev_history_in_contracts(void);
 int t_no_uncited_victory(void);

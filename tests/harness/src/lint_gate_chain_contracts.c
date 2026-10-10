@@ -708,6 +708,27 @@ int t_have_data_unreadable_uses_atomic_index_snapshots_contract(void)
     return failures;
 }
 
+int t_block_failed_mask_at_tip_uses_atomic_index_status_contract(void)
+{
+    int failures = 0;
+    char *buf = NULL;
+    TEST("tip failure recovery uses atomic block-index status") {
+        char path[PATH_MAX];
+        ASSERT(repo_path(path, sizeof(path),
+                         "engine/conditions/src/block_failed_mask_at_tip.c") == 0);
+        ASSERT(read_entire_file(path, &buf) == 0);
+        ASSERT(count_occurrences(buf,
+                                 "unsigned int status = block_index_status_load(p);")
+               == 2);
+        ASSERT(strstr(buf, "status & BLOCK_FAILED_MASK") != NULL);
+        ASSERT(strstr(buf, "status & BLOCK_HAVE_DATA") != NULL);
+        ASSERT(strstr(buf, "p->nStatus") == NULL);
+        PASS();
+    } _test_next:;
+    free(buf);
+    return failures;
+}
+
 int t_msg_process_yields_to_send_phase_contract(void)
 {
     int failures = 0;

@@ -244,7 +244,9 @@ static struct block_index *find_failed_next(struct main_state *ms, int target)
     size_t iter = 0;
     struct block_index *p = NULL;
     while (block_map_next(&ms->map_block_index, &iter, NULL, &p)) {
-        if (p && p->nHeight == target && (p->nStatus & BLOCK_FAILED_MASK))
+        unsigned int status = block_index_status_load(p);
+        if (p && p->nHeight == target &&
+            (status & BLOCK_FAILED_MASK))
             return p;
     }
     return NULL;
@@ -260,10 +262,10 @@ static struct block_index *find_have_data_next(struct main_state *ms, int target
     size_t iter = 0;
     struct block_index *p = NULL;
     while (block_map_next(&ms->map_block_index, &iter, NULL, &p)) {
+        unsigned int status = block_index_status_load(p);
         if (p && p->nHeight == target &&
             p->pprev == tip &&
-            (p->nStatus & BLOCK_HAVE_DATA) &&
-            !(p->nStatus & BLOCK_FAILED_MASK))
+            (status & BLOCK_HAVE_DATA) && !(status & BLOCK_FAILED_MASK))
             return p;
     }
     return NULL;

@@ -282,6 +282,7 @@ static const struct lint_gate_entry g_lint_gate_entries[] = {
     S_(t_trusted_peer_stall_guard_contract),
     S_(t_gap_fill_wakes_connman_dispatch_contract),
     N_(t_have_data_unreadable_uses_atomic_index_snapshots_contract), /* read-only */
+    N_(t_block_failed_mask_at_tip_uses_atomic_index_status_contract), /* read-only */
     S_(t_msg_process_yields_to_send_phase_contract),
     S_(t_e1_file_size_bands),
     S_(t_e1_file_size_baseline_and_hollow_scan),
