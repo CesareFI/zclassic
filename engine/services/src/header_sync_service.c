@@ -580,8 +580,6 @@ bool syncsvc_headers_chain_from_tip(const struct block_index *candidate,
         uint256_eq(verify->phashBlock, tip->phashBlock)) {
         return true;
     }
-    if (verify && tip && verify->nHeight == tip->nHeight)
-        return true;
 
     /* After snapshot sync, the chain walks back to the snapshot anchor
      * (pprev=NULL at high height). If the bounded walk stopped at a

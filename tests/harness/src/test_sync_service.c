@@ -1157,26 +1157,37 @@ static int test_sync_service_collects_needed_blocks_rejects_forks(void)
     int failures = 0;
 
     TEST("sync_service refuses needed-block collection for forked headers") {
-        struct uint256 h0 = {0}, h1 = {0}, h2 = {0};
-        struct block_index genesis, tip, fork;
+        struct uint256 h0 = {0}, h1 = {0}, h1_fork = {0}, h2 = {0};
+        struct block_index genesis, tip, fork_base, fork;
         struct sync_needed_blocks result;
         struct uint256 hashes[2];
         int32_t heights[2];
 
         memset(&genesis, 0, sizeof(genesis));
         memset(&tip, 0, sizeof(tip));
+        memset(&fork_base, 0, sizeof(fork_base));
         memset(&fork, 0, sizeof(fork));
         memset(&result, 0, sizeof(result));
         memset(hashes, 0, sizeof(hashes));
         memset(heights, 0, sizeof(heights));
         block_index_init(&genesis);
         block_index_init(&tip);
+        block_index_init(&fork_base);
         block_index_init(&fork);
 
-        h0.data[0] = 20; h1.data[0] = 21; h2.data[0] = 22;
+        h0.data[0] = 20; h1.data[0] = 21; h1_fork.data[0] = 22;
+        h2.data[0] = 23;
         genesis.phashBlock = &h0; genesis.nHeight = 0;
         tip.phashBlock = &h1; tip.nHeight = 1; tip.pprev = &genesis;
-        fork.phashBlock = &h2; fork.nHeight = 2; fork.pprev = &genesis;
+        /* The alternate chain reaches a DIFFERENT row at our current
+         * height. It must not be treated as an extension just because its
+         * height agrees with our tip: otherwise its descendants consume body
+         * download slots before ordinary header/reorg processing decides
+         * whether the fork can ever become active. */
+        fork_base.phashBlock = &h1_fork;
+        fork_base.nHeight = 1;
+        fork_base.pprev = &genesis;
+        fork.phashBlock = &h2; fork.nHeight = 2; fork.pprev = &fork_base;
 
         syncsvc_collect_needed_blocks(&result, &fork, &tip, 1,
                                       hashes, heights, 2);
