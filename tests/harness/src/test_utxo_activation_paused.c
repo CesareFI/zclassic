@@ -16,6 +16,7 @@
 #include "platform/clock.h"
 #include "net/snapshot_sync_contract.h"
 #include "services/sync_monitor.h"
+#include "services/chain_state_service.h"
 #include "storage/coins_kv.h"
 #include "storage/progress_store.h"
 #include "validation/process_block.h"
@@ -49,6 +50,7 @@ void tip_wedged_resnapshot_test_reset(void);
 void tip_wedged_resnapshot_test_set_runtime(
     struct node_db *ndb,
     struct snapshot_sync_service *svc);
+void tip_wedged_resnapshot_test_require_csr_binding(bool required);
 int tip_wedged_resnapshot_test_remedy_calls(void);
 int tip_wedged_resnapshot_test_recovery_accepted(void);
 int tip_wedged_resnapshot_test_last_manifest_height(void);
@@ -212,6 +214,60 @@ static bool seed_snapshot_manifest_db(struct node_db *ndb,
         return false;
     persist_snapshot_roots(ndb, block_hash, chain_work);
     return true;
+}
+
+static bool tip_wedged_rejects_detached_csr_state(void)
+{
+    struct fake_clock clock;
+    struct main_state live;
+    struct main_state detached;
+    struct block_index tip;
+    struct block_index best_header;
+    struct node_db ndb;
+    struct snapshot_sync_service svc;
+    uint8_t block_hash[32];
+    uint8_t chain_work[32];
+    bool ok = true;
+
+    reset_conditions();
+    fake_clock_install(&clock, 6600);
+    memset(&tip, 0, sizeof(tip));
+    memset(&best_header, 0, sizeof(best_header));
+    memset(block_hash, 0x64, sizeof(block_hash));
+    memset(chain_work, 0x68, sizeof(chain_work));
+    main_state_init(&live);
+    main_state_init(&detached);
+    tip.nHeight = 100;
+    tip.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA;
+    best_header.nHeight = 110;
+    live.pindex_best_header = &best_header;
+    ok = ok && active_chain_move_window_tip(&live.chain_active, &tip);
+    ok = ok && node_db_open(&ndb, ":memory:");
+    ok = ok && seed_snapshot_manifest_db(&ndb, block_hash, chain_work);
+    snapsync_init(&svc, &ndb);
+
+    csr_init(csr_instance(), &detached.map_block_index,
+             &detached.chain_active, &detached.pindex_best_header,
+             NULL, NULL, NULL);
+    tip_wedged_resnapshot_test_require_csr_binding(true);
+    condition_engine_set_main_state(&live);
+    sync_monitor_init();
+    sync_monitor_set_context(NULL, NULL, &live);
+    tip_wedged_resnapshot_test_set_runtime(&ndb, &svc);
+    block_failed_mask_at_tip_test_mark_no_advance_exhausted(101, 100);
+    register_tip_wedged_resnapshot();
+
+    condition_engine_tick();
+    ok = ok && tip_wedged_resnapshot_test_remedy_calls() == 0;
+    ok = ok && condition_engine_get_active_count() == 0;
+
+    csr_free(csr_instance());
+    snapsync_reset(&svc);
+    node_db_close(&ndb);
+    main_state_free(&detached);
+    main_state_free(&live);
+    clock_reset_default();
+    return ok;
 }
 
 static bool exec_progress_sql(sqlite3 *db, const char *sql)
@@ -1290,6 +1346,9 @@ int test_utxo_activation_paused(void)
         main_state_free(&ms);
         clock_reset_default();
     }
+
+    UAP_CHECK("tip_wedged_resnapshot rejects detached csr state",
+              tip_wedged_rejects_detached_csr_state());
 
     reset_conditions();
     clock_reset_default();

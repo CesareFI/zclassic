@@ -6,6 +6,7 @@
 #include "config/runtime.h"
 #include "event/event.h"
 #include "net/snapshot_sync_contract.h"
+#include "services/chain_state_service.h"
 #include "sync/sync_state.h"
 #include "services/sync_monitor.h"
 #include "validation/chainstate.h"
@@ -43,6 +44,7 @@ static _Atomic int g_last_witness_snapsync_state = SNAPSYNC_IDLE;
 static struct node_db *g_test_ndb;
 static struct snapshot_sync_service *g_test_svc;
 static _Atomic int g_test_remedy_calls;
+static _Atomic bool g_test_require_csr_binding;
 #endif
 
 static const char *trigger_name(enum tip_wedged_trigger trigger)
@@ -105,13 +107,49 @@ static bool snapshot_recovery_already_active(void)
     return svc && svc->state != SNAPSYNC_IDLE;
 }
 
-static int best_header_height(struct main_state *ms)
+/* Capture the two chain-owned heights through the CSR.  The condition engine
+ * runs on its own self-heal thread while CSR publishes active-chain and header
+ * changes on reducer/message threads.  A raw active_chain/pindex_best_header
+ * read can otherwise combine different publications (or race a window move).
+ *
+ * Do not hold a chain lock while querying connman: CSR's capture primitive
+ * owns the chain-side lock ordering, and peer state is intentionally only an
+ * advisory maximum for this recovery condition. */
+static bool tip_wedged_snapshot_chain_heights(struct main_state *ms,
+                                              int *local_out,
+                                              int *header_out)
 {
-    struct connman *cm = sync_monitor_connman();
-    int peer_max = cm ? connman_max_peer_height(cm) : -1;
-    int best = ms && ms->pindex_best_header ? ms->pindex_best_header->nHeight
-                                            : -1;
-    return peer_max > best ? peer_max : best;
+    struct chain_state_frontier_view view;
+    struct chain_state_repository *csr = csr_instance();
+
+    if (!ms || !local_out || !header_out)
+        return false;
+    if (csr_capture_frontiers(csr, &ms->chain_active,
+                              &ms->pindex_best_header, -1, &view).ok) {
+        *local_out = view.window.height;
+        *header_out = view.header_tip ? view.header_tip->nHeight : -1;
+        return true;
+    }
+#ifdef ZCL_TESTING
+    /* Focused condition fixtures can outlive a prior fixture's singleton
+     * binding. Keep their local model usable without reintroducing an
+     * unlocked production read. */
+    if (atomic_load(&g_test_require_csr_binding))
+        return false;
+    zcl_mutex_lock(&ms->cs_main);
+    *local_out = active_chain_height(&ms->chain_active);
+    *header_out = ms->pindex_best_header ? ms->pindex_best_header->nHeight
+                                         : -1;
+    zcl_mutex_unlock(&ms->cs_main);
+    return true;
+#else
+    return false;
+#endif
+}
+
+static int best_header_height(int peer_max, int header_height)
+{
+    return peer_max > header_height ? peer_max : header_height;
 }
 
 static bool local_import_exhausted(int local_height, int *target_height)
@@ -136,8 +174,13 @@ static bool detect_tip_wedged_resnapshot(void)
     if (!ms)
         return false;
 
-    int local = active_chain_height(&ms->chain_active);
-    int best = best_header_height(ms);
+    int local;
+    int header_height;
+    struct connman *cm = sync_monitor_connman();
+    int peer_max = cm ? connman_max_peer_height(cm) : -1;
+    if (!tip_wedged_snapshot_chain_heights(ms, &local, &header_height))
+        return false;
+    int best = best_header_height(peer_max, header_height);
     int gap = best - local;
     if (local < 0 || best <= local ||
         gap > TIP_WEDGED_RESNAPSHOT_NEAR_TIP_BLOCKS)
@@ -228,7 +271,9 @@ static bool witness_tip_wedged_resnapshot(int64_t target_at_detect)
     if (!ms)
         ms = condition_engine_main_state();
     int target = atomic_load(&g_target_height_at_detect);
-    int local = ms ? active_chain_height(&ms->chain_active) : -1;
+    int local = -1;
+    int header_height = -1;
+    (void)tip_wedged_snapshot_chain_heights(ms, &local, &header_height);
     atomic_store(&g_last_witness_local_height, local);
     if (target > 0 && local >= target)
         return true;
@@ -246,7 +291,10 @@ static bool detail_tip_wedged_resnapshot(struct json_value *out)
         ms = condition_engine_main_state();
     struct snapshot_sync_service *svc = runtime_snapsync_existing();
     enum snapshot_sync_state st = svc ? svc->state : SNAPSYNC_IDLE;
-    int current_local = ms ? active_chain_height(&ms->chain_active) : -1;
+    int current_local = -1;
+    int header_height = -1;
+    (void)tip_wedged_snapshot_chain_heights(ms, &current_local,
+                                             &header_height);
 
     bool ok = true;
     ok = ok && json_push_kv_str(
@@ -324,6 +372,7 @@ void tip_wedged_resnapshot_test_reset(void)
     atomic_store(&g_last_witness_local_height, -1);
     atomic_store(&g_last_witness_snapsync_state, SNAPSYNC_IDLE);
     atomic_store(&g_test_remedy_calls, 0);
+    atomic_store(&g_test_require_csr_binding, false);
     g_test_ndb = NULL;
     g_test_svc = NULL;
 }
@@ -334,6 +383,11 @@ void tip_wedged_resnapshot_test_set_runtime(
 {
     g_test_ndb = ndb;
     g_test_svc = svc;
+}
+
+void tip_wedged_resnapshot_test_require_csr_binding(bool required)
+{
+    atomic_store(&g_test_require_csr_binding, required);
 }
 
 int tip_wedged_resnapshot_test_remedy_calls(void)
