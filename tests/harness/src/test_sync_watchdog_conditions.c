@@ -105,6 +105,9 @@ static void cleanup_sync_watchdog(void)
     clock_reset_default();
 }
 
+static const struct json_value *sync_watchdog_condition_json(
+    const struct json_value *conditions, const char *name);
+
 static int test_sync_monitor_download_counter_saturation(void)
 {
     struct connman cm;
@@ -129,6 +132,52 @@ static int test_sync_monitor_download_counter_saturation(void)
     json_free(&state);
     printf("sync_watchdog_conditions: sync monitor saturates unsigned "
            "download counters... %s\n", ok ? "OK" : "FAIL");
+    cleanup_sync_watchdog();
+    return ok ? 0 : 1;
+}
+
+static int test_download_queue_starved_detail_counter_saturation(void)
+{
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    reset_sync_watchdog(&cm, &dm, &ms);
+    dm.total_requested = UINT64_MAX;
+    dm.total_received = UINT64_MAX;
+    dm.total_timed_out = UINT64_MAX;
+    dm.total_orphaned = UINT64_MAX;
+    dm.assign_attempts = UINT64_MAX;
+    dm.assign_successes = UINT64_MAX;
+    dm.assign_zero_results = UINT64_MAX;
+    dm.last_assign_available = UINT64_MAX;
+    dm.last_assign_assigned = UINT64_MAX;
+    dm.last_assign_queue_len = UINT64_MAX;
+    dm.last_assign_active = UINT64_MAX;
+    register_download_queue_starved();
+
+    struct json_value state;
+    json_init(&state);
+    json_set_object(&state);
+    bool ok = condition_engine_dump_state_json(&state, NULL);
+    const struct json_value *conditions = json_get(&state, "conditions");
+    const struct json_value *condition = sync_watchdog_condition_json(
+        conditions, "download_queue_starved");
+    const struct json_value *detail = condition ? json_get(condition, "detail")
+                                                : NULL;
+    const char *const names[] = {
+        "current_requested", "current_received", "current_timed_out",
+        "total_orphaned", "assign_attempts", "assign_successes",
+        "assign_zero_results", "last_assign_available",
+        "last_assign_assigned", "last_assign_queue_len",
+        "last_assign_active",
+    };
+    ok = ok && detail != NULL;
+    for (size_t i = 0; ok && i < sizeof(names) / sizeof(names[0]); i++)
+        ok = json_get_int(json_get(detail, names[i])) == INT64_MAX;
+    json_free(&state);
+    printf("sync_watchdog_conditions: queue starvation detail saturates "
+           "unsigned counters... %s\n", ok ? "OK" : "FAIL");
+    zcl_mutex_destroy(&dm.cs);
     cleanup_sync_watchdog();
     return ok ? 0 : 1;
 }
@@ -258,6 +307,7 @@ int test_sync_watchdog_conditions(void)
 
     failures += test_download_queue_uses_monotonic_timeout();
     failures += test_sync_monitor_download_counter_saturation();
+    failures += test_download_queue_starved_detail_counter_saturation();
 
     {
         /* C3: verified reducer progress must reach the network backpressure

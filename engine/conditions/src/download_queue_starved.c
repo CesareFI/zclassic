@@ -49,6 +49,13 @@ static bool download_work_pending(uint64_t inflight, uint64_t queued)
     return queued > 0 || inflight > 0;
 }
 
+/* JSON integers are signed. Keep long-running download diagnostics truthful
+ * instead of turning valid unsigned counters negative after INT64_MAX. */
+static int64_t queue_starved_json_counter(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
+
 /* A PERMANENT typed blocker (bad PoW, malformed block, consensus reject, an
  * irreducible fold hole — see util/blocker.h) means H* cannot advance no
  * matter how much download work is kept in flight: kick_local_sync (the
@@ -204,44 +211,45 @@ static bool detail_download_queue_starved(struct json_value *out)
     ok = ok && json_push_kv_int(out, "detect_age_s",
                                 atomic_load(&g_age_at_detect));
     ok = ok && json_push_kv_int(out, "requested_at_detect",
-                                (int64_t)atomic_load(
-                                    &g_requested_at_detect));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_requested_at_detect)));
     ok = ok && json_push_kv_int(out, "received_at_detect",
-                                (int64_t)atomic_load(
-                                    &g_received_at_detect));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_received_at_detect)));
     ok = ok && json_push_kv_int(out, "timed_out_at_detect",
-                                (int64_t)atomic_load(
-                                    &g_timed_out_at_detect));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_timed_out_at_detect)));
     ok = ok && json_push_kv_int(out, "inflight_at_detect",
-                                (int64_t)atomic_load(
-                                    &g_inflight_at_detect));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_inflight_at_detect)));
     ok = ok && json_push_kv_int(out, "queued_at_detect",
-                                (int64_t)atomic_load(&g_queued_at_detect));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_queued_at_detect)));
     ok = ok && json_push_kv_int(out, "current_requested",
-                                (int64_t)requested);
+                                queue_starved_json_counter(requested));
     ok = ok && json_push_kv_int(out, "current_received",
-                                (int64_t)received);
+                                queue_starved_json_counter(received));
     ok = ok && json_push_kv_int(out, "current_timed_out",
-                                (int64_t)timed_out);
+                                queue_starved_json_counter(timed_out));
     ok = ok && json_push_kv_int(out, "current_inflight",
-                                (int64_t)inflight);
+                                queue_starved_json_counter(inflight));
     ok = ok && json_push_kv_int(out, "current_queued",
-                                (int64_t)queued);
+                                queue_starved_json_counter(queued));
     ok = ok && json_push_kv_int(out, "last_witness_requested",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_requested));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_last_witness_requested)));
     ok = ok && json_push_kv_int(out, "last_witness_received",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_received));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_last_witness_received)));
     ok = ok && json_push_kv_int(out, "last_witness_timed_out",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_timed_out));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_last_witness_timed_out)));
     ok = ok && json_push_kv_int(out, "last_witness_inflight",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_inflight));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_last_witness_inflight)));
     ok = ok && json_push_kv_int(out, "last_witness_queued",
-                                (int64_t)atomic_load(
-                                    &g_last_witness_queued));
+                                queue_starved_json_counter(atomic_load(
+                                    &g_last_witness_queued)));
     ok = ok && json_push_kv_bool(
         out, "witness_request_counter_advanced",
         atomic_load(&g_last_witness_requested) >
@@ -254,32 +262,41 @@ static bool detail_download_queue_starved(struct json_value *out)
     ok = ok && json_push_kv_bool(out, "witness_download_work_drained",
                                  !witness_pending);
     ok = ok && json_push_kv_int(out, "total_orphaned",
-                                (int64_t)diag.total_orphaned);
+                                queue_starved_json_counter(
+                                    diag.total_orphaned));
     ok = ok && json_push_kv_int(out, "accounting_drift",
                                 diag.accounting_drift);
     ok = ok && json_push_kv_int(out, "assign_attempts",
-                                (int64_t)diag.assign_attempts);
+                                queue_starved_json_counter(
+                                    diag.assign_attempts));
     ok = ok && json_push_kv_int(out, "assign_successes",
-                                (int64_t)diag.assign_successes);
+                                queue_starved_json_counter(
+                                    diag.assign_successes));
     ok = ok && json_push_kv_int(out, "assign_zero_results",
-                                (int64_t)diag.assign_zero_results);
+                                queue_starved_json_counter(
+                                    diag.assign_zero_results));
     ok = ok && json_push_kv_str(out, "last_assign_result",
                                 dl_assign_result_name(
                                     diag.last_assign_result));
     ok = ok && json_push_kv_int(out, "last_assign_peer_id",
                                 diag.last_assign_peer_id);
     ok = ok && json_push_kv_int(out, "last_assign_available",
-                                (int64_t)diag.last_assign_available);
+                                queue_starved_json_counter(
+                                    diag.last_assign_available));
     ok = ok && json_push_kv_int(out, "last_assign_assigned",
-                                (int64_t)diag.last_assign_assigned);
+                                queue_starved_json_counter(
+                                    diag.last_assign_assigned));
     ok = ok && json_push_kv_int(out, "last_assign_queue_len",
-                                (int64_t)diag.last_assign_queue_len);
+                                queue_starved_json_counter(
+                                    diag.last_assign_queue_len));
     ok = ok && json_push_kv_int(out, "last_assign_active",
-                                (int64_t)diag.last_assign_active);
+                                queue_starved_json_counter(
+                                    diag.last_assign_active));
     ok = ok && json_push_kv_int(out, "oldest_in_flight_age_seconds",
                                 diag.oldest_in_flight_age_seconds);
     ok = ok && json_push_kv_int(out, "overdue_in_flight",
-                                (int64_t)diag.overdue_in_flight);
+                                queue_starved_json_counter(
+                                    diag.overdue_in_flight));
     ok = ok && json_push_kv_str(
         out, "remedy_contract",
         "kick_local_sync is witnessed when total_requested advances past requested_at_detect or the pending queue/in-flight work drains; DEFERRED (not attempted) whenever a permanent fold blocker is active, since a queue kick can never clear one");
