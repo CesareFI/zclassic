@@ -955,14 +955,18 @@ int64_t validate_headers_stage_recheck_floor_for_test(void)
 
 uint64_t validate_headers_stage_cursor(void)
 {
-    if (!g_stage)
-        return 0;
-    return stage_cursor(g_stage);
+    pthread_mutex_lock(&g_lock);
+    uint64_t cursor = g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return cursor;
 }
 
 int64_t validate_headers_stage_step_us_ewma(void)
 {
-    return g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_lock(&g_lock);
+    int64_t ewma = g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return ewma;
 }
 
 uint64_t validate_headers_stage_passed_total(void)
@@ -1010,6 +1014,11 @@ bool validate_headers_stage_dump_state_json(struct json_value *out,
     (void)key;
     if (!out) return false;
     json_set_object(out);
+
+    /* Shutdown destroys g_stage under g_lock. Keep the pointer live while
+     * rendering this snapshot; stage's lock-free field reads do not extend
+     * the singleton's lifetime. */
+    pthread_mutex_lock(&g_lock);
     json_push_kv_bool(out, "initialised", g_stage != NULL);
     json_push_kv_str (out, "stage_name", STAGE_NAME);
     json_push_kv_str(out, "authority", "authoritative");
@@ -1045,5 +1054,6 @@ bool validate_headers_stage_dump_state_json(struct json_value *out,
     json_push_kv_str(out, "last_fail_reason", failures.last_reason);
     stage_dump_counters(out, g_stage);
     stage_dump_health(out, STAGE_NAME, g_stage);
+    pthread_mutex_unlock(&g_lock);
     return true;
 }

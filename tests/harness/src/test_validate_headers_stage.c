@@ -445,6 +445,21 @@ static void vh_teardown(const char *dir, struct main_state *ms,
     test_cleanup_tmpdir(dir);
 }
 
+static int test_vh_shutdown_status_guards(void)
+{
+    int failures = 0;
+
+    VH_CHECK("guard: status accessors are empty after shutdown",
+             validate_headers_stage_cursor() == 0 &&
+             validate_headers_stage_step_us_ewma() == 0);
+    struct json_value status;
+    json_init(&status);
+    VH_CHECK("guard: status snapshot is safe after shutdown",
+             validate_headers_stage_dump_state_json(&status, NULL));
+    json_free(&status);
+    return failures;
+}
+
 int test_validate_headers_stage(void);
 int test_validate_headers_stage(void)
 {
@@ -452,6 +467,7 @@ int test_validate_headers_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    failures += test_vh_shutdown_status_guards();
 
     /* ── happy: 5 blocks, all pass under stub ──────────────────────── */
     {
