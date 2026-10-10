@@ -439,6 +439,21 @@ static void run_invalid_case(int *failures_out, enum pv_fail_kind kind,
     *failures_out += failures;
 }
 
+static int test_pv_shutdown_status_guards(void)
+{
+    int failures = 0;
+
+    PV_CHECK("guard: status accessors are empty after shutdown",
+             proof_validate_stage_cursor() == 0 &&
+             proof_validate_stage_step_us_ewma() == 0);
+    struct json_value v;
+    json_init(&v);
+    PV_CHECK("guard: status snapshot is safe after shutdown",
+             proof_validate_dump_state_json(&v, NULL));
+    json_free(&v);
+    return failures;
+}
+
 int test_proof_validate_stage(void);
 int test_proof_validate_stage(void)
 {
@@ -446,6 +461,7 @@ int test_proof_validate_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    failures += test_pv_shutdown_status_guards();
     PV_CHECK("script_validate_log: read errors are not missing rows",
              script_validate_log_read_error_is_not_missing());
     PV_CHECK("cursor: malformed durable proof cursor is rejected",

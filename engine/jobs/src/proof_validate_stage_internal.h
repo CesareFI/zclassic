@@ -15,8 +15,9 @@
 #include <stdint.h>
 
 struct uint256;
+struct json_value;
 
-stage_t *proof_validate_stage_handle(void);
+void proof_validate_stage_dump_fields(struct json_value *out);
 int64_t proof_validate_stage_last_step_unix(void);
 int64_t proof_validate_stage_last_blocked_unix(void);
 int64_t proof_validate_stage_last_advance_height(void);
