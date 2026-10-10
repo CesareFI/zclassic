@@ -116,6 +116,11 @@ static bool shutdown_quiesce_network_and_flush_coins(struct boot_svc_ctx *svc,
      * g_shutdown_requested and returns before mutating coins further. */
     printf("[shutdown] stopping network services\n");
     zcl_service_kernel_stop_all(&svc->network_kernel);
+    /* The watchdog owns both a periodic callback and a pet thread. Both read
+     * connman liveness through g_sd_watchdog_ctx, so join them before the
+     * connection manager is joined and freed below. The later runtime-kernel
+     * stop is idempotent and records the normal service-kernel teardown. */
+    boot_sd_watchdog_stop(svc);
     /* gap-fill can still hold its optional dispatcher callback here.  That
      * callback targets connman, so join the worker before connman teardown:
      * clearing the callback alone cannot retract a callback another worker
