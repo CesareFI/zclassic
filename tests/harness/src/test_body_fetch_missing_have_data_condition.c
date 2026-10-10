@@ -10,15 +10,22 @@
 #include "net/download.h"
 #include "net/msgprocessor.h"
 #include "platform/time_compat.h"
+#include "primitives/block.h"
 #include "services/sync_monitor.h"
+#include "storage/disk_block_io.h"
 #include "storage/progress_store.h"
+#include "util/util.h"
 #include "validation/chainstate.h"
 #include "validation/main_state.h"
 
+#include <errno.h>
+#include <pthread.h>
 #include <sqlite3.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define BFMHD_CHECK(name, expr) do { \
     printf("body_fetch_missing_have_data: %s... ", (name)); \
@@ -31,6 +38,51 @@
 static int64_t g_bfmhd_stub_height = -1;
 static int64_t bfmhd_stub_select_idle_height(void) { return g_bfmhd_stub_height; }
 static bool bfmhd_stub_select_idle_is_read_failure(void) { return true; }
+
+static struct main_state *g_bfmhd_readable_ms;
+static bool g_bfmhd_readable_io_unlocked;
+static struct block_index *g_bfmhd_readable_arrival_index;
+static struct disk_block_pos g_bfmhd_readable_arrival_pos;
+
+struct bfmhd_main_lock_probe {
+    struct main_state *ms;
+    bool unlocked;
+};
+
+static void *bfmhd_probe_main_lock_thread(void *opaque)
+{
+    struct bfmhd_main_lock_probe *probe = opaque;
+    probe->unlocked = zcl_mutex_trylock(&probe->ms->cs_main);
+    if (probe->unlocked)
+        zcl_mutex_unlock(&probe->ms->cs_main);
+    return NULL;
+}
+
+static void bfmhd_probe_readable_io_lock(void)
+{
+    if (!g_bfmhd_readable_ms)
+        return;
+    struct bfmhd_main_lock_probe probe = {
+        .ms = g_bfmhd_readable_ms,
+        .unlocked = false,
+    };
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, bfmhd_probe_main_lock_thread, &probe) == 0) {
+        (void)pthread_join(thread, NULL);
+        g_bfmhd_readable_io_unlocked = probe.unlocked;
+    }
+}
+
+static void bfmhd_publish_readable_before_remedy_recheck(void)
+{
+    if (!g_bfmhd_readable_arrival_index)
+        return;
+    block_index_disk_pos_store(g_bfmhd_readable_arrival_index,
+                               g_bfmhd_readable_arrival_pos.nFile,
+                               g_bfmhd_readable_arrival_pos.nPos);
+    block_index_status_fetch_or(g_bfmhd_readable_arrival_index,
+                                BLOCK_HAVE_DATA);
+}
 
 struct bfmhd_fixture {
     char dir[256];
@@ -209,6 +261,59 @@ static struct block_index *insert_index(struct main_state *ms,
     return bi;
 }
 
+static struct block_index *insert_index_at_hash(
+    struct main_state *ms, const struct uint256 *hash, int height,
+    struct block_index *prev, unsigned status)
+{
+    struct block_index *bi =
+        chainstate_insert_block_index((struct chainstate *)ms, hash);
+    if (!bi)
+        return NULL;
+    bi->nHeight = height;
+    bi->pprev = prev;
+    bi->nStatus = status;
+    bi->nTx = 1;
+    bi->nChainTx = prev ? prev->nChainTx + 1 : 1;
+    bi->nFile = status & BLOCK_HAVE_DATA ? 0 : -1;
+    bi->nDataPos = status & BLOCK_HAVE_DATA ? 8u : 0u;
+    arith_uint256_set_u64(&bi->nChainWork, (uint64_t)(height + 1));
+    return bi;
+}
+
+static bool bfmhd_make_real_block(struct block *b, uint32_t ntime)
+{
+    block_init(b);
+    b->header.nVersion = 4;
+    b->header.nTime = ntime;
+    b->header.nBits = 0x2000ffff;
+    b->num_vtx = 1;
+    b->vtx = calloc(1, sizeof(*b->vtx)); // raw-alloc-ok:test-fixture
+    if (!b->vtx) {
+        block_free(b);
+        return false;
+    }
+    transaction_init(&b->vtx[0]);
+    transaction_alloc(&b->vtx[0], 1, 1);
+    b->vtx[0].vin[0].sequence = 0xffffffff;
+    b->vtx[0].vout[0].value = 10 * COIN;
+    return true;
+}
+
+static bool bfmhd_write_real_block(const char *datadir, uint32_t ntime,
+                                   struct disk_block_pos *pos,
+                                   struct uint256 *hash_out)
+{
+    struct block b;
+    if (!bfmhd_make_real_block(&b, ntime))
+        return false;
+    unsigned char msg_start[4] = {0x24, 0xe9, 0x27, 0x64};
+    bool ok = write_block_to_disk(&b, pos, datadir, msg_start);
+    if (ok)
+        block_get_hash(&b, hash_out);
+    block_free(&b);
+    return ok;
+}
+
 static struct block_index *insert_sibling(struct main_state *ms,
                                           struct uint256 *hash,
                                           int height,
@@ -236,7 +341,9 @@ static struct block_index *insert_sibling(struct main_state *ms,
     return bi;
 }
 
-static bool setup_fixture(struct bfmhd_fixture *fx, const char *tag)
+static bool setup_fixture_with_child_hash(struct bfmhd_fixture *fx,
+                                          const char *tag,
+                                          const struct uint256 *child_hash)
 {
     memset(fx, 0, sizeof(*fx));
     fx->tip_h = 1;
@@ -260,8 +367,13 @@ static bool setup_fixture(struct bfmhd_fixture *fx, const char *tag)
                      BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA);
     fx->tip = insert_index(&fx->ms, &fx->hashes[1], fx->tip_h,
                            genesis, BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA);
-    fx->child = insert_index(&fx->ms, &fx->hashes[2], fx->target,
-                             fx->tip, BLOCK_VALID_TREE);
+    if (child_hash)
+        fx->hashes[2] = *child_hash;
+    fx->child = child_hash
+        ? insert_index_at_hash(&fx->ms, &fx->hashes[2], fx->target,
+                               fx->tip, BLOCK_VALID_TREE)
+        : insert_index(&fx->ms, &fx->hashes[2], fx->target,
+                       fx->tip, BLOCK_VALID_TREE);
     if (!genesis || !fx->tip || !fx->child)
         return false;
     if (!active_chain_move_window_tip(&fx->ms.chain_active, fx->tip))
@@ -280,6 +392,11 @@ static bool setup_fixture(struct bfmhd_fixture *fx, const char *tag)
     return true;
 }
 
+static bool setup_fixture(struct bfmhd_fixture *fx, const char *tag)
+{
+    return setup_fixture_with_child_hash(fx, tag, NULL);
+}
+
 static void teardown_fixture(struct bfmhd_fixture *fx)
 {
     sync_monitor_set_context(NULL, NULL, NULL);
@@ -288,6 +405,8 @@ static void teardown_fixture(struct bfmhd_fixture *fx)
     dl_free(&fx->dm);
     main_state_free(&fx->ms);
     progress_store_close();
+    SetDataDir("");
+    ClearDataDirCache();
     test_cleanup_tmpdir(fx->dir);
 }
 
@@ -299,6 +418,75 @@ static bool queue_has_target(struct bfmhd_fixture *fx)
            fx->dm.queue_len == 1 &&
            fx->dm.queue_heights[0] == fx->target &&
            uint256_eq(&fx->dm.queue[0], fx->child->phashBlock);
+}
+
+static bool bfmhd_readable_witness_cleared(int cleared_before)
+{
+    struct condition_runtime_snapshot snap;
+    return g_bfmhd_readable_io_unlocked &&
+        condition_engine_get_active_count() == 0 &&
+        condition_engine_get_registered_snapshot(
+            "body_fetch_missing_have_data", &snap) &&
+        snap.cleared_count == cleared_before + 1;
+}
+
+static int test_readable_witness_releases_main(void)
+{
+    int failures = 0;
+    const uint32_t ntime = 91003;
+    struct block expected_block;
+    struct uint256 expected_hash;
+    bool made = bfmhd_make_real_block(&expected_block, ntime);
+    if (made) {
+        block_get_hash(&expected_block, &expected_hash);
+        block_free(&expected_block);
+    }
+
+    struct bfmhd_fixture fx;
+    memset(&fx, 0, sizeof(fx));
+    bool fixture_ready = made && setup_fixture_with_child_hash(
+        &fx, "readable_unlocks_main", &expected_hash);
+    bool ok = fixture_ready;
+    char netdir[512];
+    char blocksdir[560];
+    struct disk_block_pos pos;
+    struct uint256 written_hash;
+    struct condition_runtime_snapshot before;
+    int cleared_before = 0;
+    disk_block_pos_init(&pos);
+    if (ok) {
+        ok = SetDataDir(fx.dir);
+        GetDataDir(true, netdir, sizeof(netdir));
+        snprintf(blocksdir, sizeof(blocksdir), "%s/blocks", netdir);
+        ok = ok && (mkdir(blocksdir, 0755) == 0 || errno == EEXIST) &&
+             bfmhd_write_real_block(netdir, ntime, &pos, &written_hash) &&
+             uint256_eq(&written_hash, &expected_hash);
+        if (condition_engine_get_registered_snapshot(
+                "body_fetch_missing_have_data", &before))
+            cleared_before = before.cleared_count;
+    }
+
+    if (ok) {
+        g_bfmhd_readable_ms = &fx.ms;
+        g_bfmhd_readable_io_unlocked = false;
+        g_bfmhd_readable_arrival_index = fx.child;
+        g_bfmhd_readable_arrival_pos = pos;
+        body_fetch_missing_have_data_test_set_before_readable_data_io(
+            bfmhd_probe_readable_io_lock);
+        body_fetch_missing_have_data_test_set_before_remedy_recheck(
+            bfmhd_publish_readable_before_remedy_recheck);
+        condition_engine_tick();
+    }
+
+    ok = ok && body_fetch_missing_have_data_test_remedy_calls() == 0 &&
+        bfmhd_readable_witness_cleared(cleared_before);
+    BFMHD_CHECK("readable witness releases cs_main during real disk I/O", ok);
+
+    g_bfmhd_readable_ms = NULL;
+    g_bfmhd_readable_arrival_index = NULL;
+    if (fixture_ready)
+        teardown_fixture(&fx);
+    return failures;
 }
 
 int test_body_fetch_missing_have_data_condition(void)
@@ -709,6 +897,8 @@ int test_body_fetch_missing_have_data_condition(void)
         sync_monitor_test_set_tip_advance_ts(0);
         teardown_fixture(&fx);
     }
+
+    failures += test_readable_witness_releases_main();
 
     return failures;
 }

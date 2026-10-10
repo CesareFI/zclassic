@@ -51,6 +51,7 @@ static bfmhd_select_idle_is_read_failure_fn g_select_idle_is_read_failure_fn =
 #ifdef ZCL_TESTING
 static void (*g_before_remedy_recheck_fn)(void);
 static void (*g_before_remedy_queue_fn)(void);
+static void (*g_before_readable_data_io_fn)(void);
 #endif
 
 static struct block_index *active_target_index_locked(struct main_state *ms,
@@ -91,6 +92,48 @@ static struct block_index *active_target_for_hash_locked(
     return bi;
 }
 
+static struct block_index *target_index_for_route_locked(
+    struct main_state *ms, int target, enum bfmhd_target_route route,
+    const struct uint256 *expected_hash, const struct block_index *resolved)
+{
+    struct block_index *bi = NULL;
+    if (route == BFMHD_TARGET_BEST_HEADER) {
+        if (ms->pindex_best_header &&
+            target <= ms->pindex_best_header->nHeight)
+            bi = block_index_get_ancestor(ms->pindex_best_header, target);
+    } else {
+        bi = active_target_for_hash_locked(ms, target, expected_hash);
+    }
+    if (route == BFMHD_TARGET_BEST_HEADER &&
+        (bi != resolved || !bi || !bi->phashBlock ||
+         block_has_any_failure(bi) ||
+         !uint256_eq(bi->phashBlock, expected_hash)))
+        return NULL;
+    return bi;
+}
+
+static bool target_still_authoritative(
+    sqlite3 *db, struct main_state *ms, int target,
+    enum bfmhd_target_route route, const struct uint256 *expected_hash,
+    const struct block_index *readable_index)
+{
+    if (route == BFMHD_TARGET_BEST_HEADER) {
+        enum body_fetch_exact_authority_state state =
+            BODY_FETCH_EXACT_BEST_ABSENT;
+        return body_fetch_exact_authority_resolve(
+                   db, ms, target, expected_hash, &state) == readable_index &&
+               state == BODY_FETCH_EXACT_HAVE_DATA;
+    }
+
+    zcl_mutex_lock(&ms->cs_main);
+    bool still_active =
+        active_target_for_hash_locked(ms, target, expected_hash) ==
+            readable_index &&
+        (block_index_status_load(readable_index) & BLOCK_HAVE_DATA) != 0;
+    zcl_mutex_unlock(&ms->cs_main);
+    return still_active;
+}
+
 static bool target_has_readable_data(
     sqlite3 *db, struct main_state *ms, int target,
     enum bfmhd_target_route route,
@@ -106,28 +149,32 @@ static bool target_has_readable_data(
             return false;
     }
 
-    bool readable = false;
+    struct block_index *readable_index = NULL;
+    char datadir[2048];
     zcl_mutex_lock(&ms->cs_main);
-    struct block_index *bi = NULL;
-    if (route == BFMHD_TARGET_BEST_HEADER) {
-        if (ms->pindex_best_header &&
-            target <= ms->pindex_best_header->nHeight)
-            bi = block_index_get_ancestor(ms->pindex_best_header, target);
-    } else {
-        bi = active_target_for_hash_locked(ms, target, expected_hash);
-    }
-    if (route == BFMHD_TARGET_BEST_HEADER &&
-        (bi != resolved || !bi || !bi->phashBlock ||
-         block_has_any_failure(bi) ||
-         !uint256_eq(bi->phashBlock, expected_hash)))
-        bi = NULL;
-    if (bi && (bi->nStatus & BLOCK_HAVE_DATA)) {
-        char datadir[2048];
+    struct block_index *bi = target_index_for_route_locked(
+        ms, target, route, expected_hash, resolved);
+    if (bi && (block_index_status_load(bi) & BLOCK_HAVE_DATA)) {
         GetDataDir(true, datadir, sizeof(datadir));
-        readable = block_index_have_data_readable(bi, datadir);
+        readable_index = bi;
     }
     zcl_mutex_unlock(&ms->cs_main);
-    return readable;
+    if (!readable_index)
+        return false;
+
+    /* block_index entries and hashes have process lifetime, while the disk
+     * position/status snapshot used by the pread helper is atomic.  Keep
+     * slow read/deserialize/hash work out of cs_main, then re-prove the same
+     * route below so a concurrent chain switch cannot clear this episode. */
+#ifdef ZCL_TESTING
+    if (g_before_readable_data_io_fn)
+        g_before_readable_data_io_fn();
+#endif
+    if (!block_index_have_data_readable(readable_index, datadir))
+        return false;
+
+    return target_still_authoritative(
+        db, ms, target, route, expected_hash, readable_index);
 }
 
 static bool active_target_missing_data(struct main_state *ms, int target,
@@ -370,6 +417,7 @@ void body_fetch_missing_have_data_test_reset(void)
     g_select_idle_is_read_failure_fn = bfmhd_test_no_select_idle_read_failure;
     g_before_remedy_recheck_fn = NULL;
     g_before_remedy_queue_fn = NULL;
+    g_before_readable_data_io_fn = NULL;
     condition_reset_state(&c_body_fetch_missing_have_data);
 }
 
@@ -405,5 +453,11 @@ void body_fetch_missing_have_data_test_set_before_remedy_queue(
     void (*fn)(void))
 {
     g_before_remedy_queue_fn = fn;
+}
+
+void body_fetch_missing_have_data_test_set_before_readable_data_io(
+    void (*fn)(void))
+{
+    g_before_readable_data_io_fn = fn;
 }
 #endif
