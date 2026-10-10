@@ -40,6 +40,7 @@
 #include "util/result.h"
 #include "util/safe_alloc.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
@@ -141,6 +142,20 @@ static void hp_save_repair_header(const struct block_index *pindex,
 
 /* ── Public pull-range ─────────────────────────────────────────── */
 
+static struct zcl_result hp_normalize_pull_range(int start_height,
+                                                 int *max_headers)
+{
+    if (*max_headers <= 0)
+        *max_headers = HP_DEFAULT_BATCH;
+    if (*max_headers > HP_MAX_BATCH)
+        *max_headers = HP_MAX_BATCH;
+    if (start_height > INT_MAX - (*max_headers - 1)) {
+        return ZCL_ERR(-4, "pull_range: range overflows start=%d count=%d",
+                       start_height, *max_headers);
+    }
+    return ZCL_OK;
+}
+
 struct zcl_result header_probe_pull_range(int start_height, int max_headers,
                                           int *out_added)
 {
@@ -165,11 +180,12 @@ struct zcl_result header_probe_pull_range(int start_height, int max_headers,
     const struct chain_params *params = g_hp.params;
     pthread_mutex_unlock(&g_hp.lock);
 
-    atomic_fetch_add(&g_hp.calls_total, 1);
+    struct zcl_result range = hp_normalize_pull_range(start_height,
+                                                      &max_headers);
+    if (!range.ok)
+        return range;
 
-    /* Clamp batch size. */
-    if (max_headers <= 0) max_headers = HP_DEFAULT_BATCH;
-    if (max_headers > HP_MAX_BATCH) max_headers = HP_MAX_BATCH;
+    atomic_fetch_add(&g_hp.calls_total, 1);
 
     /* Discover remote tip — bounds the loop and updates last_remote. */
     int remote_tip = -1;
@@ -329,7 +345,10 @@ void header_probe_tick_once(void)
     atomic_store(&g_hp.last_remote_height, remote_tip);
     atomic_store(&g_hp.last_local_height, local_tip);
 
-    if (remote_tip <= local_tip + lag_thresh) return;  /* under-lag */
+    if ((int64_t)remote_tip <= (int64_t)local_tip + lag_thresh)
+        return;  /* under-lag */
+    if (local_tip == INT_MAX)
+        return;  /* no representable next header height */
 
     int added = 0;
     (void)header_probe_pull_range(local_tip + 1, batch, &added);  /* result ignored — RPC errors surface via state counters */

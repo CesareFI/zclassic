@@ -23,6 +23,7 @@
 #include "json/json.h"
 #include "platform/socket_compat.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -49,6 +50,13 @@ static int64_t hp_dump_int(const char *key)
     }
     json_free(&dump);
     return value;
+}
+
+static bool hp_range_overflow_was_rejected(struct zcl_result result,
+                                           int added)
+{
+    return !result.ok && added == 0 &&
+           strstr(result.message, "overflows") != NULL;
 }
 
 /* ── Mock RPC server ──────────────────────────────────────────────
@@ -346,6 +354,12 @@ int test_header_probe(void)
             .lag_threshold = 1,
         };
         HP_CHECK("init", header_probe_init(&cfg, &g_hp_ms, params).ok);
+
+        int overflow_added = -1;
+        struct zcl_result overflow =
+            header_probe_pull_range(INT_MAX, 2, &overflow_added);
+        HP_CHECK("pull_range rejects overflowing end height",
+                 hp_range_overflow_was_rejected(overflow, overflow_added));
 
         int added = 0;
         bool ok = header_probe_pull_range(1, 5, &added).ok;
