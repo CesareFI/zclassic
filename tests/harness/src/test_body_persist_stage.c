@@ -11,6 +11,7 @@
 #include "primitives/block.h"
 #include "primitives/transaction.h"
 #include "jobs/body_persist_stage.h"
+#include "platform/clock.h"
 #include "jobs/stage_body_index.h"
 #include "../../../engine/jobs/src/body_persist_log_store.h"
 #include "services/chain_state_service.h"
@@ -26,6 +27,7 @@
 #include "validation/main_state.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <sqlite3.h>
 #include <stdio.h>
@@ -50,6 +52,61 @@ struct synth_chain_bp {
     int                 header_mismatch_height;
     int                 merkle_mismatch_height;
 };
+
+struct bp_fake_clock {
+    _Atomic int64_t wall_ms;
+    _Atomic int64_t monotonic_ns;
+};
+
+static int64_t bp_fake_monotonic_ns(void *self)
+{
+    struct bp_fake_clock *clock = self;
+    return atomic_load(&clock->monotonic_ns);
+}
+
+static int64_t bp_fake_wall_ms(void *self)
+{
+    struct bp_fake_clock *clock = self;
+    return atomic_load(&clock->wall_ms);
+}
+
+static void bp_fake_clock_install(struct bp_fake_clock *clock, int64_t wall_s,
+                                  int64_t monotonic_s)
+{
+    static clock_iface_t iface = {
+        .now_monotonic_ns = bp_fake_monotonic_ns,
+        .now_wall_ms = bp_fake_wall_ms,
+    };
+    atomic_store(&clock->wall_ms, wall_s * INT64_C(1000));
+    atomic_store(&clock->monotonic_ns, monotonic_s * INT64_C(1000000000));
+    iface.self = clock;
+    clock_set_default(&iface);
+}
+
+static void bp_fake_clock_set(struct bp_fake_clock *clock, int64_t wall_s,
+                              int64_t monotonic_s)
+{
+    atomic_store(&clock->wall_ms, wall_s * INT64_C(1000));
+    atomic_store(&clock->monotonic_ns, monotonic_s * INT64_C(1000000000));
+}
+
+static int test_bp_hold_monotonic_boundary(void)
+{
+    int failures = 0;
+    BP_CHECK("hold: ordinary monotonic interval expires",
+             body_persist_stage_test_hold_expired(1000000, 6000000, 5));
+    BP_CHECK("hold: exact monotonic interval expires",
+             body_persist_stage_test_hold_expired(1000000, 61000000, 60));
+    BP_CHECK("hold: one microsecond before interval remains pending",
+             !body_persist_stage_test_hold_expired(1000000, 60999999, 60));
+    BP_CHECK("hold: zero timestamp is valid",
+             body_persist_stage_test_hold_expired(0, 1000000, 1));
+    BP_CHECK("hold: reversed monotonic sample remains pending",
+             !body_persist_stage_test_hold_expired(61000000, 1000000, 60));
+    BP_CHECK("hold: invalid interval remains pending",
+             !body_persist_stage_test_hold_expired(1000000, 61000000, -1));
+    return failures;
+}
 
 static int mkdir_p_bp(const char *p)
 {
@@ -440,10 +497,34 @@ int test_body_persist_stage(void)
     printf("\n=== body_persist_stage tests ===\n");
     int failures = 0;
 
+    failures += test_bp_hold_monotonic_boundary();
     blocker_module_init();
     failures += test_bp_rejects_detached_frontier();
     BP_CHECK("body_fetch_log: read errors are not missing rows",
              body_fetch_log_read_error_is_not_missing());
+
+    {
+        char dir[256]; struct main_state ms; struct synth_chain_bp sc;
+        struct bp_fake_clock clock;
+        bp_fake_clock_install(&clock, 1000, 1000);
+        BP_CHECK("read_failed rollback: setup",
+                 bp_setup("rollback", 3, -1, -1, dir, sizeof(dir), &ms,
+                          &sc) == 0);
+        sc.fail_read_height = 1;
+        BP_CHECK("read_failed rollback: first requeue arms hold",
+                 body_persist_stage_drain(100) == 1);
+        bp_fake_clock_set(&clock, 700, 1060);
+        BP_CHECK("read_failed rollback: monotonic expiry names hold",
+                 body_persist_stage_step_once() == JOB_IDLE &&
+                 blocker_exists("body_persist.body_unfetchable"));
+        sc.fail_read_height = -1;
+        sc.blocks[1].nStatus |= BLOCK_HAVE_DATA;
+        BP_CHECK("read_failed rollback: re-fetch clears named hold",
+                 body_persist_stage_drain(100) == 2 &&
+                 !blocker_exists("body_persist.body_unfetchable"));
+        clock_reset_default();
+        bp_teardown(dir, &ms, &sc);
+    }
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_bp sc;

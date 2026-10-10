@@ -85,14 +85,15 @@ static _Atomic int64_t  g_last_advance_height = -1;
  * mainnet cold start 2026-07-27: read_failed_total 1, idle_count 26,545,
  * cursor 0 for 617 s with no blocker naming height 0.
  *
- * So arm a WALL-CLOCK hold instead: remember (height, first requeue time) and,
+ * So arm a monotonic hold instead: remember (height, first requeue time) and,
  * once the HAVE_DATA gate has been idling on that same height for longer than
- * BODY_PERSIST_UNFETCHABLE_HOLD_SECS, NAME it. Cleared on any cursor advance
- * and whenever the stage moves to a different height. */
+ * BODY_PERSIST_UNFETCHABLE_HOLD_SECS, NAME it. Civil-clock corrections must
+ * not postpone this liveness diagnostic. Cleared on any cursor advance and
+ * whenever the stage moves to a different height. */
 #define BODY_PERSIST_UNFETCHABLE_HOLD_SECS 60
 
 static _Atomic int64_t g_requeue_height = -1;   /* -1 = nothing armed */
-static _Atomic int64_t g_requeue_since_unix = 0;
+static _Atomic int64_t g_requeue_since_monotonic_us = -1;
 static _Atomic int     g_unfetchable_hold_secs = BODY_PERSIST_UNFETCHABLE_HOLD_SECS;
 
 #ifdef ZCL_TESTING
@@ -109,8 +110,10 @@ void body_persist_stage_set_unfetchable_hold_secs_for_testing(int secs)
 /* Disarm + clear: the stage advanced, or moved off the held height. */
 static void requeue_hold_disarm(void)
 {
-    if (atomic_exchange(&g_requeue_height, -1) >= 0)
+    if (atomic_exchange(&g_requeue_height, -1) >= 0) {
+        atomic_store(&g_requeue_since_monotonic_us, -1);
         blocker_clear(BODY_UNFETCHABLE_BLOCKER_ID);
+    }
 }
 
 /* Arm the hold clock for `height` (called from requeue_body_for_refetch). */
@@ -119,9 +122,30 @@ static void requeue_hold_arm(int height)
     if (atomic_load(&g_requeue_height) == (int64_t)height)
         return; /* already armed for this height — keep the original clock */
     atomic_store(&g_requeue_height, (int64_t)height);
-    atomic_store(&g_requeue_since_unix, platform_time_wall_unix());
+    atomic_store(&g_requeue_since_monotonic_us,
+                 platform_time_monotonic_us());
     blocker_clear(BODY_UNFETCHABLE_BLOCKER_ID);
 }
+
+static bool requeue_hold_expired(int64_t since_monotonic_us,
+                                 int64_t now_monotonic_us, int hold_secs)
+{
+    if (since_monotonic_us < 0 || now_monotonic_us < since_monotonic_us ||
+        hold_secs < 0)
+        return false;
+    return (uint64_t)now_monotonic_us - (uint64_t)since_monotonic_us >=
+           (uint64_t)hold_secs * UINT64_C(1000000);
+}
+
+#ifdef ZCL_TESTING
+bool body_persist_stage_test_hold_expired(int64_t since_monotonic_us,
+                                          int64_t now_monotonic_us,
+                                          int hold_secs)
+{
+    return requeue_hold_expired(since_monotonic_us, now_monotonic_us,
+                                hold_secs);
+}
+#endif
 
 /* Called from the !BLOCK_HAVE_DATA idle branch. Names the hold once the
  * re-fetch remedy has demonstrably failed to produce a body for this height. */
@@ -129,10 +153,12 @@ static void requeue_hold_note_idle(int height, int tip_height)
 {
     if (atomic_load(&g_requeue_height) != (int64_t)height)
         return;
-    int64_t since = atomic_load(&g_requeue_since_unix);
-    int64_t now = platform_time_wall_unix();
-    if (since <= 0 || now - since < (int64_t)atomic_load(&g_unfetchable_hold_secs))
+    int64_t since = atomic_load(&g_requeue_since_monotonic_us);
+    int64_t now = platform_time_monotonic_us();
+    int hold_secs = atomic_load(&g_unfetchable_hold_secs);
+    if (!requeue_hold_expired(since, now, hold_secs))
         return;
+    int64_t elapsed_secs = (now - since) / INT64_C(1000000);
 
     char reason[BLOCKER_REASON_MAX];
     if (height == 0)
@@ -140,13 +166,13 @@ static void requeue_hold_note_idle(int height, int tip_height)
                  "height=0 genesis body absent; body_persist held %llds. "
                  "The boot genesis anchor seed did not run or its integrity "
                  "gate refused the seed",
-                 (long long)(now - since));
+                 (long long)elapsed_secs);
     else
         snprintf(reason, sizeof(reason),
                  "height=%d body refetch pending %llds, tip=%d; the header "
                  "queue cannot request at/below tip; inspect blk*.dat and "
                  "the block_index position",
-                 height, (long long)(now - since), tip_height);
+                 height, (long long)elapsed_secs, tip_height);
 
     struct blocker_record rec;
     int set_rc = -1;
@@ -157,7 +183,7 @@ static void requeue_hold_note_idle(int height, int tip_height)
         LOG_WARN(STAGE_NAME,
                  "[body_persist] body re-fetch has not produced a body for "
                  "height=%d in %llds — holding cursor, see blocker %s",
-                 height, (long long)(now - since),
+                 height, (long long)elapsed_secs,
                  BODY_UNFETCHABLE_BLOCKER_ID);
 }
 
