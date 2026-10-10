@@ -1161,6 +1161,39 @@ static int test_snapshot_sync_service_prepare_serve_step(void)
     return failures;
 }
 
+static int test_snapshot_sync_service_prepare_serve_step_compact_size_255(void)
+{
+    int failures = 0;
+
+    TEST("snapshot serving retains an eight-byte CompactSize script") {
+        struct p2p_node node;
+        struct snapsync_serve_step step;
+        uint8_t buf[4 + 49 + 9 + 255];
+        size_t pos = 0;
+
+        memset(&node, 0, sizeof(node));
+        memset(buf, 0, sizeof(buf));
+        buf[pos++] = 1;
+        pos += 3; /* one entry, little-endian */
+        pos += 32 + 4 + 8 + 4 + 1;
+        buf[pos++] = 255;
+        buf[pos++] = 255; /* CompactSize 255, encoded in eight bytes. */
+        pos += 7;
+        memset(buf + pos, 0x51, 255);
+        pos += 255;
+
+        ASSERT(pos == sizeof(buf));
+        ASSERT(snapsync_prepare_serve_step(&step, &node, buf,
+                                            (int64_t)sizeof(buf)).ok);
+        ASSERT(step.action == SNAPSYNC_SERVE_ACTION_SEND_CHUNK);
+        ASSERT(step.chunk_len == sizeof(buf));
+        ASSERT(node.zsync_file_offset == (int64_t)sizeof(buf));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_snapshot_sync_service_prepare_serve_step_bad_input(void)
 {
     int failures = 0;
@@ -2815,6 +2848,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_contains_fallback_tip();
     failures += test_snapshot_reset_clears_non_owned_anchor();
     failures += test_snapshot_sync_service_prepare_serve_step();
+    failures += test_snapshot_sync_service_prepare_serve_step_compact_size_255();
     failures += test_snapshot_sync_service_prepare_serve_step_bad_input();
     failures += test_snapshot_sync_service_transition_results();
     failures += test_snapshot_sync_service_handle_offer_requires_v2();

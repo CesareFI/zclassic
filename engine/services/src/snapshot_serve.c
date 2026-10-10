@@ -199,6 +199,16 @@ static bool snapsync_serve_offset_is_negative(int64_t offset)
     return offset < 0;
 }
 
+static bool snapsync_serve_skip_bytes(int64_t *scan, int64_t buf_size,
+                                      uint64_t count)
+{
+    if (!scan || *scan < 0 || *scan > buf_size ||
+        count > (uint64_t)(buf_size - *scan))
+        return false;
+    *scan += (int64_t)count;
+    return true;
+}
+
 static bool snapsync_serve_entries_fit(const uint8_t *buf, int64_t buf_size,
                                        int64_t scan, uint32_t entries,
                                        int64_t *scan_out)
@@ -208,31 +218,41 @@ static bool snapsync_serve_entries_fit(const uint8_t *buf, int64_t buf_size,
     for (uint32_t i = 0; i < entries && ok; i++) {
         uint64_t slen;
 
-        scan += 49;
-        if (scan >= buf_size) {
+        if (!snapsync_serve_skip_bytes(&scan, buf_size, 49) ||
+            scan >= buf_size) {
             ok = false;
             break;
         }
 
         slen = buf[scan++];
         if (slen == 253) {
-            if (scan + 2 > buf_size) {
+            int64_t encoded_at = scan;
+            if (!snapsync_serve_skip_bytes(&scan, buf_size, 2)) {
                 ok = false;
                 break;
             }
-            slen = buf[scan] | ((uint16_t)buf[scan + 1] << 8);
-            scan += 2;
+            slen = buf[encoded_at] | ((uint16_t)buf[encoded_at + 1] << 8);
         } else if (slen == 254) {
-            if (scan + 4 > buf_size) {
+            int64_t encoded_at = scan;
+            if (!snapsync_serve_skip_bytes(&scan, buf_size, 4)) {
                 ok = false;
                 break;
             }
-            slen = buf[scan] | ((uint32_t)buf[scan + 1] << 8) |
-                   ((uint32_t)buf[scan + 2] << 16) |
-                   ((uint32_t)buf[scan + 3] << 24);
-            scan += 4;
+            slen = buf[encoded_at] | ((uint32_t)buf[encoded_at + 1] << 8) |
+                   ((uint32_t)buf[encoded_at + 2] << 16) |
+                   ((uint32_t)buf[encoded_at + 3] << 24);
+        } else if (slen == 255) {
+            int64_t encoded_at = scan;
+            if (!snapsync_serve_skip_bytes(&scan, buf_size, 8)) {
+                ok = false;
+                break;
+            }
+            slen = 0;
+            for (size_t j = 0; j < 8; j++)
+                slen |= (uint64_t)buf[encoded_at + (int64_t)j] << (j * 8);
         }
-        scan += (int64_t)slen;
+        if (!snapsync_serve_skip_bytes(&scan, buf_size, slen))
+            ok = false;
     }
 
     *scan_out = scan;
