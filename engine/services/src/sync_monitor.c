@@ -632,7 +632,8 @@ bool sync_monitor_active_next_child_exists(struct main_state *ms,
     struct block_index *bi = NULL;
     while (block_map_next(&ms->map_block_index, &iter, NULL, &bi)) {
         if (bi && bi->nHeight == next_h && bi->pprev == tip &&
-            bi->phashBlock && !(bi->nStatus & BLOCK_FAILED_MASK))
+            bi->phashBlock &&
+            !(block_index_status_load(bi) & BLOCK_FAILED_MASK))
             return true;
     }
     return false;
