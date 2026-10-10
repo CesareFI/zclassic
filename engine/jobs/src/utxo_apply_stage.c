@@ -930,15 +930,30 @@ bool utxo_apply_stage_lookup_is_live(void)
     return live;
 }
 
-uint64_t utxo_apply_stage_cursor(void) { return g_stage ? stage_cursor(g_stage) : 0; }
-int64_t  utxo_apply_stage_step_us_ewma(void)
-{ return g_stage ? stage_step_us_ewma(g_stage) : 0; }
-
-/* Internal (utxo_apply_stage_internal.h): the dump TU reads the live stage
- * handle lock-free, exactly as the pre-extraction in-TU dump did. */
-stage_t *utxo_apply_stage_handle(void)
+uint64_t utxo_apply_stage_cursor(void)
 {
-    return g_stage;
+    pthread_mutex_lock(&g_lock);
+    uint64_t cursor = g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return cursor;
+}
+
+int64_t utxo_apply_stage_step_us_ewma(void)
+{
+    pthread_mutex_lock(&g_lock);
+    int64_t ewma = g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return ewma;
+}
+
+void utxo_apply_stage_dump_snapshot(struct json_value *out)
+{
+    if (!out)
+        return;
+    pthread_mutex_lock(&g_lock);
+    stage_dump_header(out, STAGE_NAME, g_stage);
+    stage_dump_counters(out, g_stage);
+    pthread_mutex_unlock(&g_lock);
 }
 
 /* utxo_apply_stage_succeeded_at + the per-status counter total accessors

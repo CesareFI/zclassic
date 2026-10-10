@@ -21,6 +21,7 @@
 struct uint256;
 struct block_index;
 struct main_state;
+struct json_value;
 struct script_validate_verdict_row;
 struct utxo_apply_lookup;
 
@@ -112,9 +113,9 @@ void utxo_apply_select_idle_note(int height,
  * candidate (mirrors stage_body_read_hold_clear's clear-on-resolve contract). */
 void utxo_apply_select_idle_blocker_clear(void);
 
-/* The live stage handle (NULL before init / after shutdown). The dump reads
- * it lock-free. */
-stage_t *utxo_apply_stage_handle(void);
+/* Emit the stage-owned status fields while the lifecycle owner lock keeps the
+ * handle live. The dump must not retain a raw stage pointer across shutdown. */
+void utxo_apply_stage_dump_snapshot(struct json_value *out);
 
 /* Production prevout resolver installed by utxo_apply_stage_init when tests
  * have not injected a custom lookup. Read-only; writes stay in

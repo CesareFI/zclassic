@@ -76,9 +76,10 @@ bool utxo_apply_dump_state_json(struct json_value *out, const char *key)
     sqlite3 *db = progress_store_db();
     int64_t now = platform_time_wall_unix();
     int64_t last = atomic_load(&g_ua_last_step_unix);
-    stage_t *stage = utxo_apply_stage_handle();
-
-    stage_dump_header(out, STAGE_NAME, stage);
+    /* Snapshot the owner-managed stage before acquiring the optional
+     * progress-store lock. This prevents shutdown from freeing the handle
+     * while the dump reads it and avoids an owner/progress lock inversion. */
+    utxo_apply_stage_dump_snapshot(out);
     json_push_kv_int (out, "verified_total",
                       (int64_t)atomic_load(&g_ua_verified_total));
     json_push_kv_int (out, "spend_unknown_total",
@@ -166,7 +167,6 @@ bool utxo_apply_dump_state_json(struct json_value *out, const char *key)
         json_push_kv_bool(out, "snapshot_complete", false);
         json_push_kv_str (out, "snapshot_status", "progress_store_busy");
         json_push_kv_bool(out, "retryable", true);
-        stage_dump_counters(out, stage);
         return true;
     }
 
@@ -189,6 +189,5 @@ bool utxo_apply_dump_state_json(struct json_value *out, const char *key)
     }
     dump_first_failure(out, db);
     if (db) progress_store_tx_unlock();
-    stage_dump_counters(out, stage);
     return true;
 }

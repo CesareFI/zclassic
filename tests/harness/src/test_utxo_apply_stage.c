@@ -791,6 +791,21 @@ static bool uv_dump_has(const char *needle)
     return ok && n > 0 && n < sizeof(buf) && strstr(buf, needle) != NULL;
 }
 
+static int test_uv_preinit_status_guards(void)
+{
+    int failures = 0;
+
+    UV_CHECK("guard: status accessors are empty before init",
+             utxo_apply_stage_cursor() == 0 &&
+             utxo_apply_stage_step_us_ewma() == 0);
+    struct json_value status;
+    json_init(&status);
+    UV_CHECK("guard: status snapshot is safe before init",
+             utxo_apply_dump_state_json(&status, NULL));
+    json_free(&status);
+    return failures;
+}
+
 static void run_fail_case(int *failures_out, enum uv_fail_kind kind,
                           const char *expected_status,
                           uint64_t (*counter)(void))
@@ -832,6 +847,8 @@ int test_utxo_apply_stage(void)
 {
     printf("\n=== utxo_apply_stage tests ===\n");
     int failures = 0;
+
+    failures += test_uv_preinit_status_guards();
 
     blocker_module_init();
     UV_CHECK("proof_validate_log: read errors are not missing rows",
