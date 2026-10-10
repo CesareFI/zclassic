@@ -31,6 +31,7 @@
 #include "support/log_throttle.h"
 #include <sqlite3.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -205,10 +206,65 @@ static bool bih_insert_header_row(sqlite3 *db, int h,
     return ok;
 }
 
+static bool bih_bad_height_is_quarantined(int64_t bad_height, bool reject_delete)
+{
+    struct node_db ndb = {0};
+    struct main_state ms = {0};
+    struct uint256 hashes[3];
+    struct uint256 zero = {0};
+    bool ok = sqlite3_open(":memory:", &ndb.db) == SQLITE_OK;
+    ndb.open = ok;
+    ok = ok && bih_create_blocks_table(ndb.db);
+    for (int h = 0; ok && h < 3; h++)
+        ok = bih_insert_header_row(ndb.db, h,
+                                   h == 0 ? &zero : &hashes[h - 1],
+                                   &hashes[h]);
+    if (ok) {
+        sqlite3_stmt *update = NULL;
+        ok = sqlite3_prepare_v2(ndb.db,
+                                "UPDATE blocks SET height=? WHERE height=1",
+                                -1, &update, NULL) == SQLITE_OK && update;
+        if (ok) {
+            sqlite3_bind_int64(update, 1, bad_height);
+            ok = sqlite3_step(update) == SQLITE_DONE;
+            sqlite3_finalize(update);
+        }
+    }
+    if (ok && reject_delete) {
+        ok = sqlite3_exec(ndb.db,
+                          "CREATE TRIGGER retain_poison BEFORE DELETE ON blocks "
+                          "BEGIN SELECT RAISE(FAIL, 'fixture retains poison'); END",
+                          NULL, NULL, NULL) == SQLITE_OK;
+    }
+
+    block_map_init(&ms.map_block_index);
+    active_chain_init(&ms.chain_active);
+    int64_t before = block_index_blocks_hydrate_quarantined();
+    ok = ok && load_block_index_from_blocks_table(&ndb, &ms).ok;
+    bool quarantined = block_index_blocks_hydrate_quarantined() == before + 1 &&
+                       block_map_find(&ms.map_block_index, &hashes[1]) == NULL;
+
+    active_chain_free(&ms.chain_active);
+    block_map_free(&ms.map_block_index);
+    if (ndb.db)
+        sqlite3_close(ndb.db);
+    return ok && quarantined;
+}
+
+static bool bih_out_of_range_heights_are_quarantined(void)
+{
+    return bih_bad_height_is_quarantined(-1, false) &&
+           bih_bad_height_is_quarantined((int64_t)INT32_MAX + 1, false) &&
+           bih_bad_height_is_quarantined(-1, true);
+}
+
 int test_block_index_loader(void)
 {
     printf("\n=== block index loader tests ===\n");
     int failures = 0;
+
+    BIL_CHECK("bil: blocks-table hydrate quarantines out-of-range projection heights",
+              bih_out_of_range_heights_are_quarantined());
 
     /* ── 1. Flat file round-trip ─────────────────────────── */
 

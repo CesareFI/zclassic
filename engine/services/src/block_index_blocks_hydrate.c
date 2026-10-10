@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include <sqlite3.h>
 
@@ -97,7 +98,7 @@ static const char *bhc_bad_reason_name(enum bhc_bad_reason r)
 /* One poisoned row queued for deferred purge (we must not DELETE while the
  * validate SELECT is still stepping the same table). */
 struct bhc_bad_row {
-    int                 height;
+    int64_t             height;
     uint8_t             hash[32];
     bool                has_hash;
     enum bhc_bad_reason reason;
@@ -106,9 +107,9 @@ struct bhc_bad_row {
 /* Purge one queued poisoned row: db_block_delete by hash when the hash column
  * is usable, else db_block_delete_by_height. Names the typed blocker with
  * height+hash+reason, bumps the dumpstate counter, and emits a throttled WARN.
- * Never aborts the caller — a failed DELETE is logged and the row is still
- * counted (it will be re-attempted on a later boot). */
-static void bhc_quarantine_row(struct node_db *ndb, const struct bhc_bad_row *b)
+ * Never aborts the caller — a failed DELETE is logged and its caller retains
+ * the row identity until the insert pass has excluded it. */
+static bool bhc_quarantine_row(struct node_db *ndb, const struct bhc_bad_row *b)
 {
     char hex[65] = "(no-hash)";
     if (b->has_hash) {
@@ -117,9 +118,11 @@ static void bhc_quarantine_row(struct node_db *ndb, const struct bhc_bad_row *b)
         uint256_get_hex(&hh, hex);
     }
 
+    bool height_fits_int =
+        b->height >= 0 && b->height <= INT32_MAX;
     bool purged = b->has_hash
         ? db_block_delete(ndb, b->hash)
-        : db_block_delete_by_height(ndb, b->height);
+        : height_fits_int && db_block_delete_by_height(ndb, (int)b->height);
 
     atomic_fetch_add_explicit(&g_blocks_hydrate_quarantined, 1,
                               memory_order_relaxed);
@@ -127,10 +130,11 @@ static void bhc_quarantine_row(struct node_db *ndb, const struct bhc_bad_row *b)
     struct blocker_record rec;
     char reason[BLOCKER_REASON_MAX];
     snprintf(reason, sizeof(reason),
-             "blocks-hydrate poisoned row height=%d hash=%s reason=%s: purged "
+             "blocks-hydrate poisoned row height=%lld hash=%s reason=%s: purged "
              "from `blocks`%s; height re-fetched via header sync + body_fetch, "
-             "stages revalidate", b->height, hex, bhc_bad_reason_name(b->reason),
-             purged ? "" : " FAILED (retry next boot)");
+             "stages revalidate", (long long)b->height, hex,
+             bhc_bad_reason_name(b->reason),
+             purged ? "" : " FAILED (excluded this boot; retry next boot)");
     if (blocker_init(&rec, BLOCKS_HYDRATE_QUARANTINE_BLOCKER_ID, "block_index",
                      BLOCKER_TRANSIENT, reason))
         (void)blocker_set(&rec);
@@ -141,17 +145,30 @@ static void bhc_quarantine_row(struct node_db *ndb, const struct bhc_bad_row *b)
                                  platform_time_wall_unix(), 60, &reps)) {
         if (purged)
             LOG_WARN("block_index",
-                     "blocks-hydrate: quarantined poisoned row height=%d hash=%s "
+                     "blocks-hydrate: quarantined poisoned row height=%lld hash=%s "
                      "reason=%s — purged, load continues (repeats=%llu)",
-                     b->height, hex, bhc_bad_reason_name(b->reason),
+                     (long long)b->height, hex, bhc_bad_reason_name(b->reason),
                      (unsigned long long)reps);
         else
             LOG_WARN("block_index",
-                     "blocks-hydrate: poisoned row height=%d hash=%s reason=%s — "
-                     "purge FAILED (row remains, retry next boot) (repeats=%llu)",
-                     b->height, hex, bhc_bad_reason_name(b->reason),
+                     "blocks-hydrate: poisoned row height=%lld hash=%s reason=%s — "
+                     "purge FAILED (excluded this boot; retry next boot) (repeats=%llu)",
+                     (long long)b->height, hex, bhc_bad_reason_name(b->reason),
                      (unsigned long long)reps);
     }
+    return purged;
+}
+
+static bool bhc_quarantine_rows(struct node_db *ndb,
+                                const struct bhc_bad_row *bad,
+                                int64_t bad_count)
+{
+    bool retained_poison = false;
+    for (int64_t i = 0; i < bad_count; i++) {
+        if (!bhc_quarantine_row(ndb, &bad[i]))
+            retained_poison = true;
+    }
+    return retained_poison;
 }
 
 /* Column order shared by the validate + insert passes of the blocks-table
@@ -171,8 +188,29 @@ enum {
  * same hash-bind test engine/models/src/block.c performs on a stored row). Returns
  * false when a fixed header field is missing/short or the Equihash solution is
  * empty/oversize — every such row makes the whole hydration refuse. */
-static bool blocks_row_to_header(sqlite3_stmt *s, struct block_header *out)
+static bool blocks_row_height_valid(int64_t height)
 {
+    return height >= 0 && height <= INT32_MAX;
+}
+
+/* A failed quarantine DELETE leaves a poisoned row in `blocks` for this boot.
+ * Pass B must not hydrate it before the next boot retries that purge. */
+static bool blocks_row_is_retained_poison(const struct bhc_bad_row *bad,
+                                          int64_t bad_count,
+                                          const uint8_t hash[32])
+{
+    for (int64_t i = 0; i < bad_count; i++) {
+        if (bad[i].has_hash && memcmp(bad[i].hash, hash, 32) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool blocks_row_to_header(sqlite3_stmt *s, int64_t height,
+                                 struct block_header *out)
+{
+    if (!blocks_row_height_valid(height))
+        return false;
     block_header_init(out);
     out->nVersion = (int32_t)sqlite3_column_int(s, BHC_VERSION);
 
@@ -210,6 +248,56 @@ static bool blocks_row_to_header(sqlite3_stmt *s, struct block_header *out)
     memcpy(out->nSolution, sol, (size_t)sol_len);
     out->nSolutionSize = (size_t)sol_len;
     return true;
+}
+
+static struct block_index *blocks_row_to_index(sqlite3_stmt *s,
+                                                struct main_state *ms,
+                                                const struct bhc_bad_row *bad,
+                                                int64_t bad_count,
+                                                bool retained_poison)
+{
+    const void *hash = sqlite3_column_blob(s, BHC_HASH);
+    int64_t height = sqlite3_column_int64(s, BHC_HEIGHT);
+    if (!hash || sqlite3_column_bytes(s, BHC_HASH) < 32 ||
+        !blocks_row_height_valid(height))
+        return NULL;
+
+    struct uint256 hh;
+    memcpy(hh.data, hash, sizeof(hh.data));
+    if (retained_poison &&
+        blocks_row_is_retained_poison(bad, bad_count, hh.data))
+        return NULL;
+    struct block_index *bi = chainstate_insert_block_index(
+        (struct chainstate *)ms, &hh);
+    if (!bi)
+        return NULL;
+
+    bi->nHeight = (int)height;
+    bi->nVersion = (int32_t)sqlite3_column_int(s, BHC_VERSION);
+    bi->nTime = (uint32_t)sqlite3_column_int64(s, BHC_TIME);
+    bi->nBits = (uint32_t)sqlite3_column_int64(s, BHC_BITS);
+    int nt = sqlite3_column_int(s, BHC_NUMTX);
+    if (nt > 0)
+        bi->nTx = (unsigned int)nt;
+
+    const void *merkle = sqlite3_column_blob(s, BHC_MERKLE);
+    if (merkle && sqlite3_column_bytes(s, BHC_MERKLE) >= 32)
+        memcpy(bi->hashMerkleRoot.data, merkle, 32);
+    const void *sapling = sqlite3_column_blob(s, BHC_SAPLING);
+    if (sapling && sqlite3_column_bytes(s, BHC_SAPLING) >= 32)
+        memcpy(bi->hashFinalSaplingRoot.data, sapling, 32);
+    const void *nonce = sqlite3_column_blob(s, BHC_NONCE);
+    if (nonce && sqlite3_column_bytes(s, BHC_NONCE) >= 32)
+        memcpy(bi->nNonce.data, nonce, 32);
+
+    /* Rows verified in pass A are header-only: retain no HAVE/FAILED bits
+     * and never promote their persisted validity beyond TREE. */
+    unsigned int stored = (unsigned int)sqlite3_column_int(s, BHC_STATUS);
+    unsigned int level = stored & (unsigned int)BLOCK_VALID_MASK;
+    if (level > (unsigned int)BLOCK_VALID_TREE)
+        level = (unsigned int)BLOCK_VALID_TREE;
+    bi->nStatus = level;
+    return bi;
 }
 
 /* Hydrate the in-memory block_index map from the node.db `blocks` table.
@@ -303,7 +391,7 @@ struct zcl_result load_block_index_from_blocks_table(struct node_db *ndb,
             boot_progress_note("block_index.blocks_hydrate_validate",
                                (uint64_t)seen, (uint64_t)row_count);
         const void *hb = sqlite3_column_blob(sel, BHC_HASH);
-        int h = sqlite3_column_int(sel, BHC_HEIGHT);
+        int64_t h = sqlite3_column_int64(sel, BHC_HEIGHT);
         bool has_hash = (hb && sqlite3_column_bytes(sel, BHC_HASH) >= 32);
         uint8_t stored_hash[32];
         if (has_hash)
@@ -314,7 +402,7 @@ struct zcl_result load_block_index_from_blocks_table(struct node_db *ndb,
         struct block_header hdr;
         if (!has_hash) {
             reason = BHC_BAD_SHORT_HASH;
-        } else if (!blocks_row_to_header(sel, &hdr)) {
+        } else if (!blocks_row_to_header(sel, h, &hdr)) {
             reason = BHC_BAD_UNUSABLE_HEADER;
         } else if (cp) {
             /* Canonical admission (J5 upgrade): hash-bind + PoW target on every
@@ -406,74 +494,39 @@ struct zcl_result load_block_index_from_blocks_table(struct node_db *ndb,
     /* ── Quarantine phase: purge each queued poisoned row now that the
      *    validate SELECT is finalized. Purge before Pass B re-SELECTs so the
      *    poisoned rows are already gone from `blocks`. */
-    for (int64_t i = 0; i < bad_count; i++)
-        bhc_quarantine_row(ndb, &bad[i]);
-    free(bad);
-    bad = NULL;
+    bool retained_poison = bhc_quarantine_rows(ndb, bad, bad_count);
 
-    if (validated == 0)
+    if (validated == 0) {
+        free(bad);
         return ZCL_ERR(-6, "load_block_index_from_blocks_table: 0 usable rows "
                        "(quarantined %lld poisoned)", (long long)bad_count);
+    }
 
     /* ── Pass B: INSERT (rows are hash-bound now). ORDER BY height means the
      *    collected array is height-ASC, so pprev is always resolvable in the
      *    link pass and the forward pass sees each parent before its child. */
     struct block_index **sorted = zcl_malloc(
         (size_t)validated * sizeof(*sorted), "blocks_table hydrate sorted");
-    if (!sorted)
+    if (!sorted) {
+        free(bad);
         return ZCL_ERR(-7, "load_block_index_from_blocks_table: OOM for %lld "
                        "sorted pointers", (long long)validated);
+    }
 
     if (sqlite3_prepare_v2(ndb->db, BLOCKS_HYDRATE_SEL, -1, &sel, NULL)
             != SQLITE_OK || !sel) {
         free(sorted);
+        free(bad);
         return ZCL_ERR(-3, "load_block_index_from_blocks_table: failed to "
                        "prepare insert SELECT over `blocks`");
     }
 
     size_t n = 0;
     while (AR_STEP_ROW_READONLY(sel) == SQLITE_ROW && n < (size_t)validated) {
-        const void *hb = sqlite3_column_blob(sel, BHC_HASH);
-        if (!hb || sqlite3_column_bytes(sel, BHC_HASH) < 32)
-            continue;   /* validated in pass A; defensive */
-        struct uint256 hh;
-        memcpy(hh.data, hb, 32);
-        struct block_index *bi = chainstate_insert_block_index(
-            (struct chainstate *)ms, &hh);
+        struct block_index *bi = blocks_row_to_index(sel, ms, bad, bad_count,
+                                                      retained_poison);
         if (!bi)
             continue;
-
-        bi->nHeight  = sqlite3_column_int(sel, BHC_HEIGHT);
-        bi->nVersion = (int32_t)sqlite3_column_int(sel, BHC_VERSION);
-        bi->nTime    = (uint32_t)sqlite3_column_int64(sel, BHC_TIME);
-        bi->nBits    = (uint32_t)sqlite3_column_int64(sel, BHC_BITS);
-        {
-            int nt = sqlite3_column_int(sel, BHC_NUMTX);
-            if (nt > 0)
-                bi->nTx = (unsigned int)nt;
-        }
-
-        const void *mr = sqlite3_column_blob(sel, BHC_MERKLE);
-        if (mr && sqlite3_column_bytes(sel, BHC_MERKLE) >= 32)
-            memcpy(bi->hashMerkleRoot.data, mr, 32);
-        const void *sr = sqlite3_column_blob(sel, BHC_SAPLING);
-        if (sr && sqlite3_column_bytes(sel, BHC_SAPLING) >= 32)
-            memcpy(bi->hashFinalSaplingRoot.data, sr, 32);
-        const void *nn = sqlite3_column_blob(sel, BHC_NONCE);
-        if (nn && sqlite3_column_bytes(sel, BHC_NONCE) >= 32)
-            memcpy(bi->nNonce.data, nn, 32);
-
-        /* HONEST validity: we verified the header hash-binds (and the link
-         * pass verifies parent linkage), but we hold NO block body and have
-         * NOT checked tx/script/context validity. Clamp the BLOCK_VALID level
-         * to at most BLOCK_VALID_TREE and assert NO HAVE_DATA/HAVE_UNDO — the
-         * node fetches bodies lazily via P2P. Never fabricate a higher
-         * validity than the stored row, and never above TREE. */
-        unsigned int stored = (unsigned int)sqlite3_column_int(sel, BHC_STATUS);
-        unsigned int level = stored & (unsigned int)BLOCK_VALID_MASK;
-        if (level > (unsigned int)BLOCK_VALID_TREE)
-            level = (unsigned int)BLOCK_VALID_TREE;
-        bi->nStatus = level;   /* header-only: no HAVE bits, no FAILED bits */
 
         sorted[n++] = bi;
         if ((n & 0xFFF) == 0)
@@ -482,6 +535,8 @@ struct zcl_result load_block_index_from_blocks_table(struct node_db *ndb,
     }
     sqlite3_finalize(sel);
     sel = NULL;
+    free(bad);
+    bad = NULL;
 
     /* ── Pass C: link pprev by prev_hash (both endpoints now in the map). */
     if (sqlite3_prepare_v2(ndb->db, "SELECT hash,prev_hash FROM blocks",
