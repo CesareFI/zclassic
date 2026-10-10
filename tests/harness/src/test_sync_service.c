@@ -2721,7 +2721,8 @@ static int test_sync_service_benchmark_tail_phases(void)
 
         /* The rejected-only terminal observation consumed the one-shot
          * sovereignty guard. Start a fresh fixture before proving that an
-         * eligible peer still begins the real body-download phase. */
+         * eligible peer does not start the phase until the manager actually
+         * issues a body request. */
         syncsvc_sync_benchmark_reset_for_testing();
         sync_benchmark_reset_for_test();
         sync_benchmark_init(NULL);
@@ -2734,6 +2735,53 @@ static int test_sync_service_benchmark_tail_phases(void)
 
         syncsvc_plan_block_assignment(&plan, &node, 0, 100000);
         ASSERT(plan.should_assign);
+
+        struct json_value eligible_dump;
+        json_init(&eligible_dump);
+        ASSERT(sync_benchmark_dump_state_json(&eligible_dump, NULL));
+        const struct json_value *eligible_timings =
+            json_get(&eligible_dump, "timings_ms");
+        const struct json_value *eligible_tail_download =
+            eligible_timings ? json_get(eligible_timings, "tail_download") : NULL;
+        ASSERT(eligible_tail_download && json_is_null(eligible_tail_download));
+        json_free(&eligible_dump);
+
+        /* `null` also represents a running phase. Drive the terminal edge:
+         * a planner-only eligible peer must still leave TAIL_DOWNLOAD
+         * unmeasured, whereas the old implementation completed a false
+         * elapsed interval here. */
+        struct sync_progress_snapshot eligible_terminal;
+        syncsvc_collect_progress(&eligible_terminal, NULL, SYNC_AT_TIP,
+                                 100000, 100000, 0, 0);
+        struct json_value eligible_terminal_dump;
+        json_init(&eligible_terminal_dump);
+        ASSERT(sync_benchmark_dump_state_json(&eligible_terminal_dump, NULL));
+        eligible_timings = json_get(&eligible_terminal_dump, "timings_ms");
+        eligible_tail_download =
+            eligible_timings ? json_get(eligible_timings, "tail_download") : NULL;
+        ASSERT(eligible_tail_download && json_is_null(eligible_tail_download));
+        json_free(&eligible_terminal_dump);
+
+        /* The terminal observation consumed the one-shot guard. Start a
+         * fresh fixture to prove that an actual issued request begins it. */
+        syncsvc_sync_benchmark_reset_for_testing();
+        sync_benchmark_reset_for_test();
+        sync_benchmark_init(NULL);
+
+        struct download_manager dm;
+        struct sync_block_batch batch;
+        struct uint256 queued = {0};
+        struct uint256 assigned[DL_WINDOW_SIZE];
+        int32_t height = 100001;
+        memset(&batch, 0, sizeof(batch));
+        memset(assigned, 0, sizeof(assigned));
+        queued.data[0] = 1;
+        dl_init(&dm);
+        ASSERT(dl_queue_blocks(&dm, &queued, &height, 1) == 1);
+        syncsvc_assign_peer_blocks(&batch, &dm, &node, assigned,
+                                   DL_WINDOW_SIZE, 100000);
+        ASSERT(batch.assigned == 1);
+        dl_free(&dm);
 
         struct sync_block_acceptance accept;
         memset(&accept, 0, sizeof(accept));

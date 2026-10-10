@@ -151,12 +151,6 @@ void syncsvc_plan_block_assignment(struct sync_block_assignment *plan,
     if (syncsvc_peer_is_behind(node, our_height))
         return;
 
-    /* zcl.sync_benchmark.v1: only an eligible body source begins this phase.
-     * Rejected planning calls are not download work and must leave the phase
-     * unmeasured. Fires at most once per process; it ends alongside
-     * TAIL_FOLD once the frontier reaches the peer-agreed tip. */
-    sb_begin_tail_download_once();
-
     /* K2: loopback peers have a wider request window. The WAN-fairness
      * cap exists to spread block-body load across strangers — neither
      * fairness nor RTT scaling applies to a co-located zclassicd. The
@@ -231,6 +225,10 @@ void syncsvc_assign_peer_blocks(struct sync_block_batch *batch,
      * Idempotent; cheap; no harm in calling on every assignment. */
     batch->assigned = dl_assign_to_peer(dm, (uint32_t)node->id,
                                         out_hashes, plan.max_assign);
+    /* Eligibility and a nonempty plan do not move block bytes. Begin
+     * TAIL_DOWNLOAD only after the manager has issued a body request. */
+    if (batch->assigned > 0)
+        sb_begin_tail_download_once();
 }
 
 void syncsvc_note_valid_block(struct sync_block_acceptance *result,
