@@ -123,7 +123,7 @@ static bool bb_queue_has_room(struct download_manager *dm,
     if (mode == BB_BACKFILL_NORMAL)
         return true;
     dl_get_stats(dm, NULL, NULL, NULL, &in_flight, &queued);
-    return queued <= BODY_HISTORY_QUEUE_HEADROOM &&
+    return queued < BODY_HISTORY_QUEUE_HEADROOM &&
            in_flight < dl_get_max_in_flight_total() / 4;
 }
 

@@ -1641,7 +1641,9 @@ static int test_bh_service_full_queue_is_bounded(void)
         struct download_manager dm;
         dl_init(&dm);
         body_history_reset();
-        for (int h = 1; h <= 300; h++) {
+        /* Exactly at the producer throttle must remain backpressured: a
+         * pass must not append another history batch beyond its headroom. */
+        for (int h = 1; h <= 256; h++) {
             struct uint256 hash;
             int32_t height = h;
             bh_fake_hash(&hash, h);
@@ -1654,7 +1656,7 @@ static int test_bh_service_full_queue_is_bounded(void)
             int64_t begin = platform_time_monotonic_us();
             ASSERT(body_backfill_pass(ms, &dm, false, false, NULL, NULL) == 0);
             elapsed[sample] = platform_time_monotonic_us() - begin;
-            ASSERT(dm.queue_len == 300 && dm.queue_cap == initial_cap);
+            ASSERT(dm.queue_len == 256 && dm.queue_cap == initial_cap);
             struct body_history_verdict v;
             ASSERT(body_history_get_verdict(&v));
             ASSERT(v.status == BODY_HISTORY_INCOMPLETE && v.missing_count == 500);
