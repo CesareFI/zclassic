@@ -393,6 +393,28 @@ static void pv_teardown(const char *dir, struct main_state *ms,
     test_cleanup_tmpdir(dir);
 }
 
+static bool pv_rejects_unrepresentable_proof_cursor(void)
+{
+    char dir[256];
+    struct main_state ms;
+    struct synth_chain_pv sc;
+    bool setup = false;
+    bool ok = false;
+
+    memset(&sc, 0, sizeof(sc));
+    setup = pv_setup("cursor_range", 1, -1, dir, sizeof(dir), &ms, &sc)
+            == 0;
+    if (!setup)
+        return false;
+
+    ok = exec_sql(progress_store_db(),
+                  "INSERT OR REPLACE INTO stage_cursor(name, cursor, updated_at) "
+                  "VALUES('proof_validate', 4294967296, 1)") &&
+         proof_validate_stage_step_once() == JOB_FATAL;
+    pv_teardown(dir, &ms, &sc);
+    return ok;
+}
+
 static void run_invalid_case(int *failures_out, enum pv_fail_kind kind,
                              const char *expected_type,
                              uint64_t (*counter)(void))
@@ -426,6 +448,8 @@ int test_proof_validate_stage(void)
     blocker_module_init();
     PV_CHECK("script_validate_log: read errors are not missing rows",
              script_validate_log_read_error_is_not_missing());
+    PV_CHECK("cursor: malformed durable proof cursor is rejected",
+             pv_rejects_unrepresentable_proof_cursor());
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_pv sc;

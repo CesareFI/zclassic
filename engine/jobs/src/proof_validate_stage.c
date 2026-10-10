@@ -45,6 +45,7 @@
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -242,6 +243,14 @@ static void add_failure_counter(const char *type, void *user)
         atomic_fetch_add(&g_binding_sig_failed_total, 1);
 }
 
+static bool pv_cursor_height(uint64_t cursor, int *out)
+{
+    if (!out || cursor > INT32_MAX)
+        return false;
+    *out = (int)cursor;
+    return true;
+}
+
 static job_result_t step_validate(struct stage_step_ctx *c)
 {
     atomic_store(&g_last_step_unix, platform_time_wall_unix());
@@ -271,8 +280,12 @@ static job_result_t step_validate(struct stage_step_ctx *c)
             LOG_WARN(STAGE_NAME, "[pv-trace] declined: progress_store_db NULL");
         return JOB_IDLE;
     }
-    int next_h = (int)c->cursor_in;
-    if (next_h < 0) return JOB_FATAL;
+    int next_h = 0;
+    if (!pv_cursor_height(c->cursor_in, &next_h)) {
+        LOG_WARN(STAGE_NAME, "[proof_validate] cursor out of range: %llu",
+                 (unsigned long long)c->cursor_in);
+        return JOB_FATAL;
+    }
     bool skip_crypto = mint_skip_crypto_get();
     enum mint_validation_evidence expected_evidence =
         mint_validation_evidence_expected(skip_crypto);
