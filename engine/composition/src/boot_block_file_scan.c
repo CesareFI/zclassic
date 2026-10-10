@@ -362,24 +362,20 @@ int scan_compute_contiguous_data_height(struct block_index *best_header,
     if (!walk) return 0; /* genesis has data and walk fell off the chain */
     return -1;
 }
-/* Pass 0: enumerate the block files on disk into `files` and return how
- * many were found. blk00000.dat may legitimately be empty while later
- * files hold data, so this does not stop at the first gap — it stops after
- * 3 consecutive misses. blk_sync.dat is appended last when present. */
+/* Pass 0: enumerate the bounded block-file namespace into `files` and return
+ * how many were found. Pruning can leave an absent prefix before a retained
+ * later file, so recovery must inspect every numbered slot. blk_sync.dat is
+ * appended last when present. */
 static int scan_enumerate_block_files(const char *datadir,
                                       struct boot_scan_file_result *files)
 {
     char path[576];
     int nfiles = 0;
-    int consecutive_misses = 0;
     for (int file_idx = 0; file_idx < 256; file_idx++) {
         snprintf(path, sizeof(path), "%s/blocks/blk%05d.dat",
                  datadir, file_idx);
-        if (!scan_regular_nonempty(path)) {
-            if (++consecutive_misses >= 3) break;
+        if (!scan_regular_nonempty(path))
             continue;
-        }
-        consecutive_misses = 0;
 #ifndef _WIN32
         /* Advisory hardlink tripwire. Authoritative scan acceptance remains
          * bound to the opened file identity checked by scan_parse_one_file. */

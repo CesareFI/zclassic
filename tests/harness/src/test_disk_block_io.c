@@ -931,6 +931,50 @@ _test_next:
     return failures;
 }
 
+/* A pruned datadir can retain blk00003.dat while older files are gone. The
+ * boot scan must still discover and index that retained local body instead of
+ * needlessly sending the recovery path back to peers. */
+static int test_scan_finds_retained_file_after_pruned_prefix(void)
+{
+    int failures = 0;
+    char tmpdir[256];
+    make_test_dir(tmpdir, sizeof(tmpdir));
+
+    TEST("blk scan: retained later file survives a pruned prefix") {
+        struct block b;
+        build_test_block(&b, 383838);
+        struct disk_block_pos pos;
+        disk_block_pos_init(&pos);
+        bool ok = write_block_to_disk(&b, &pos, tmpdir, TEST_MSG_START);
+        struct uint256 hash;
+        block_get_hash(&b, &hash);
+        block_free(&b);
+        ASSERT(ok);
+        ASSERT(pos.nFile == 0);
+
+        char old_path[512], retained_path[512];
+        snprintf(old_path, sizeof(old_path), "%s/blocks/blk00000.dat", tmpdir);
+        snprintf(retained_path, sizeof(retained_path), "%s/blocks/blk00003.dat",
+                 tmpdir);
+        ASSERT(rename(old_path, retained_path) == 0);
+
+        struct main_state ms;
+        main_state_init(&ms);
+        struct block_index *bi = chainstate_insert_block_index(
+            (struct chainstate *)&ms, &hash);
+        ASSERT(bi != NULL);
+
+        ASSERT(scan_block_files_mark_data(&ms, tmpdir, NULL) > 0);
+        ASSERT((bi->nStatus & BLOCK_HAVE_DATA) != 0);
+        ASSERT(bi->nFile == 3);
+        main_state_free(&ms);
+        printf("OK\n");
+    }
+_test_next:
+    cleanup_test_dir(tmpdir);
+    return failures;
+}
+
 /* block_index_repair_pos_from_disk: a stale/torn (nFile,nDataPos) is healed
  * by a hash-targeted blk-file scan + verified re-store; a hash with NO copy
  * on disk returns false and leaves the entry untouched, so the caller's
@@ -1211,6 +1255,7 @@ int test_disk_block_io(void)
     failures += test_deferred_sync_byte_identical();
     failures += test_scoped_read_fd_cache();
     failures += test_scan_duplicate_keeps_earliest_copy();
+    failures += test_scan_finds_retained_file_after_pruned_prefix();
     failures += test_position_repair_from_local_copy();
     failures += test_block_pos_filename_datadir_contract();
     failures += test_flat_save_gate_skips_when_quiet();
