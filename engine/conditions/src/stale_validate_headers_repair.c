@@ -510,7 +510,7 @@ static struct block_index *best_header_target_locked(struct main_state *ms,
     struct block_index *bi =
         block_index_get_ancestor(ms->pindex_best_header, height);
     if (!bi || bi->nHeight != height || !bi->phashBlock ||
-        (bi->nStatus & BLOCK_FAILED_ANY_MASK))
+        (block_index_status_load(bi) & BLOCK_FAILED_ANY_MASK))
         return NULL;
 
     struct block_index *visible =
@@ -561,8 +561,7 @@ static int cure_request_peer_refetch(int height,
         return -1; // raw-return-ok:best-header-authority-changed
     }
 
-    if (bi->nStatus & BLOCK_HAVE_DATA) {
-        bi->nStatus &= ~(unsigned)BLOCK_HAVE_DATA;
+    if (block_index_status_clear_bits(bi, BLOCK_HAVE_DATA) & BLOCK_HAVE_DATA) {
         cleared_have_data = true;
     }
     zcl_mutex_unlock(&ms->cs_main);
