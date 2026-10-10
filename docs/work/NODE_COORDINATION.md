@@ -15,7 +15,7 @@ describe live production state.
 | `36ec1efc3de34f4e467bcd158029f894fab7bf10` | `242226516e2f5da28263ae20fc72cc3b53099ad8` | `sync_monitor.c`, `test_sync_watchdog_conditions.c` | The registered watchdog group was RED with raw signed JSON casts at `INT64_MAX + 1` / `UINT64_MAX`, then GREEN after saturation. Strict C23/Werror syntax and whitespace passed. | ASan/UBSan epoch not run: the exact full-harness sanitizer profile exceeds the available Hetzner disk margin. Complexity is blocked only by the same unrelated baseline debt. | NONE |
 | `9a9f2ce6156235f890323f426124f22526415a88` | `242226516e2f5da28263ae20fc72cc3b53099ad8` | `sync_monitor.h`, `sync_monitor.c`, `test_sync_watchdog_conditions.c` | The same registered group was RED when tip-state evaluations, transitions, and intake-pending wrapped in JSON; it was GREEN after all three saturated at `INT64_MAX`. Strict C23/Werror syntax and whitespace passed. | ASan/UBSan epoch not run: its full-harness output would breach the Hetzner disk margin. Complexity is blocked only by the same unrelated baseline debt. | NONE |
 
-Publication: both commits are signed local checkpoints on
+Publication: the listed commits are signed local checkpoints on
 `agent/hetzner-zclassic-node-20260918`; normal non-main publication is blocked
 by the repository pre-push policy (`pre-push: REFUSED status=remote-ref-not-main`).
 No hook bypass was attempted. The next owner action is authorized contributor
