@@ -71,6 +71,21 @@ static bool gf_pprev_maximum_height_regression(void)
     return one == 1 && out[0] == &top && corrupt == -1;
 }
 
+static int gf_out_of_range_floor_cursor(void)
+{
+    int failures = 0;
+    struct gap_fill_window window;
+
+    /* A malformed durable cursor outside the representable block-height
+     * domain must not narrow the window through an implementation-defined
+     * uint64_t-to-int64_t conversion. */
+    bool has = gap_fill_compute_window(10, 20, UINT64_MAX, &window);
+    GF_CHECK("out-of-range floor cursor leaves a valid window intact",
+             has && window.effective_tip_h == 10 && window.lo == 11 &&
+                 window.hi == 20 && window.count == 10);
+    return failures;
+}
+
 static int gf_maximum_height_window_bounds(void)
 {
     int failures = 0;
@@ -139,6 +154,7 @@ int test_gap_fill_frontier_window(void)
              has && w.effective_tip_h == 6763 && w.lo == 6764 &&
                  w.hi == 7600 && w.count == 837);
     failures += gf_maximum_height_window_bounds();
+    failures += gf_out_of_range_floor_cursor();
     failures += gf_dump_saturates_unsigned_stats();
 
     /* S2.4: gap_fill_compute_window's floor cursor is generic. Feeding it

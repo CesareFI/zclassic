@@ -35,6 +35,7 @@
 #include "util/thread_registry.h"
 #include "event/event.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -231,9 +232,10 @@ bool gap_fill_compute_window(int active_tip_h, int best_header_h,
     out->best_h = best_header_h;
     out->hi = active_tip_h;
 
-    if (floor_cursor > 0 &&
-        (int64_t)floor_cursor - 1 < (int64_t)out->effective_tip_h) {
-        out->effective_tip_h = (int)floor_cursor - 1;
+    if (floor_cursor > 0 && floor_cursor <= (uint64_t)INT_MAX) {
+        int floor_tip_h = (int)floor_cursor - 1;
+        if (floor_tip_h < out->effective_tip_h)
+            out->effective_tip_h = floor_tip_h;
     }
 
     out->hi = out->effective_tip_h;
