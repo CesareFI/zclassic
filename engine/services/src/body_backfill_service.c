@@ -166,7 +166,7 @@ static enum body_history_probe bb_probe(int64_t height,
     if (!bi || bi->nHeight != (int)height || !bi->phashBlock)
         return BODY_HISTORY_PROBE_INDETERMINATE;
 
-    if (bi->nStatus & BLOCK_HAVE_DATA)
+    if (block_index_status_load(bi) & BLOCK_HAVE_DATA)
         return BODY_HISTORY_PROBE_HAVE;
 
     if (out_hash)
