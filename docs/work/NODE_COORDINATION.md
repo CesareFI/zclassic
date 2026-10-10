@@ -6,6 +6,19 @@ This note records validated public-node findings that another development
 branch should check before duplicating work. It does not set priorities or
 describe live production state.
 
+## Hetzner bootstrap quota hardening (2026-10-10)
+
+| Commit | Base | Scope | Focused evidence | Deferred gate | Consensus |
+| --- | --- | --- | --- | --- | --- |
+| `c0aa0415821ddca6e59a09ab9f177949838e45fa` | `242226516e2f5da28263ae20fc72cc3b53099ad8` | `beta6_bootstrap_quota.c`, `test_beta6_bootstrap.c` | Parent overflow case failed; candidate `make -j2 t-fast ONLY=beta6_bootstrap` passed, strict C23/Werror syntax and whitespace passed. | ASan/UBSan epoch not run: its fresh full-harness output would exceed the Hetzner disk margin. Complexity is blocked only by existing unrelated benchmark/UTXO baseline debt. | NONE |
+| `7eeace887bb4e6e0e650f48e7023908ccad463c9` | `242226516e2f5da28263ae20fc72cc3b53099ad8` | `beta6_bootstrap_quota.c`, `test_beta6_bootstrap.c` | Future-stamped quota stays capped after `INT64_MIN` rollback; `make -j2 t-fast ONLY=beta6_bootstrap`, strict C23/Werror syntax, and whitespace passed. | ASan/UBSan epoch not run for the same disk-margin reason. Complexity is blocked only by the same unrelated baseline debt. | NONE |
+
+Publication: both commits are signed local checkpoints on
+`agent/hetzner-zclassic-node-20260918`; normal non-main publication is blocked
+by the repository pre-push policy (`pre-push: REFUSED status=remote-ref-not-main`).
+No hook bypass was attempted. The next owner action is authorized contributor
+publication or qualification on a larger runner for the deferred sanitizer lane.
+
 ## Block-swarm peer manifest reach
 
 Block-swarm assignment previously used the swarm-wide manifest range when a
