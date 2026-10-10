@@ -1971,7 +1971,7 @@ engine/modules/framework/src/app_platform.c:zcl_app_manifest_v1_validate:45
 engine/modules/framework/src/app_platform.c:zcl_app_signed_event_v1_sign_wallet:22
 engine/modules/framework/src/app_runtime.c:zcl_app_runtime_v1_activate:28
 engine/modules/framework/src/app_runtime.c:zcl_app_runtime_v1_create:16
-engine/modules/framework/src/condition.c:condition_tick_one:28
+engine/modules/framework/src/condition.c:condition_tick_one:26
 engine/modules/hotswap/src/hotswap_activate.c:activate_from_sealed_fd:21
 engine/modules/hotswap/src/hotswap_activate.c:hotswap_module_admit:46
 engine/modules/hotswap/src/hotswap_activate.c:hotswap_module_publish:21

@@ -17,7 +17,10 @@
 #define QUEUE_STARVED_TRIGGER_SECS 120
 #define QUEUE_STARVED_RATIO_DEN 10
 
-static _Atomic int64_t g_first_seen;
+/* The recovery interval is elapsed uptime. Keep a separate civil timestamp
+ * solely for diagnostics so a wall-clock rollback cannot postpone refill. */
+static _Atomic int64_t g_first_seen_mono_s = -1;
+static _Atomic int64_t g_first_seen_unix;
 static _Atomic uint64_t g_inflight_at_detect;
 static _Atomic uint64_t g_queued_at_detect;
 static _Atomic uint64_t g_requested_at_detect;
@@ -67,19 +70,21 @@ static bool detect_download_queue_starved(void)
     struct connman *cm = sync_monitor_connman();
     struct download_manager *dm =
         sync_monitor_download_manager();
-    int64_t now = platform_time_wall_unix();
+    int64_t now_mono_s = platform_time_monotonic_ms() / 1000;
     /* Defer: never START a new episode while a permanent fold blocker holds
      * H* — see permanent_fold_blocker_active() above. An episode that is
      * ALREADY active when the blocker appears is deferred by the witness
      * below (detect() gates episode START, never CONTINUATION — see
      * framework/condition.c condition_tick_one). */
     if (permanent_fold_blocker_active()) {
-        atomic_store(&g_first_seen, 0);
+        atomic_store(&g_first_seen_mono_s, -1);
+        atomic_store(&g_first_seen_unix, 0);
         return false;
     }
     if (sync_get_state() != SYNC_BLOCKS_DOWNLOAD || !cm || !dm ||
         connman_get_node_count(cm) == 0) {
-        atomic_store(&g_first_seen, 0);
+        atomic_store(&g_first_seen_mono_s, -1);
+        atomic_store(&g_first_seen_unix, 0);
         return false;
     }
 
@@ -87,21 +92,24 @@ static bool detect_download_queue_starved(void)
     uint64_t inflight = 0, queued = 0;
     dl_get_stats(dm, &requested, &received, &timed_out, &inflight, &queued);
     if (!download_work_pending(inflight, queued)) {
-        atomic_store(&g_first_seen, 0);
+        atomic_store(&g_first_seen_mono_s, -1);
+        atomic_store(&g_first_seen_unix, 0);
         return false;
     }
     uint64_t threshold = DL_MAX_IN_FLIGHT_TOTAL_IBD /
                          QUEUE_STARVED_RATIO_DEN;
     if (inflight >= threshold) {
-        atomic_store(&g_first_seen, 0);
+        atomic_store(&g_first_seen_mono_s, -1);
+        atomic_store(&g_first_seen_unix, 0);
         return false;
     }
-    int64_t first = atomic_load(&g_first_seen);
-    if (first == 0) {
-        atomic_store(&g_first_seen, now);
+    int64_t first = atomic_load(&g_first_seen_mono_s);
+    if (first < 0) {
+        atomic_store(&g_first_seen_mono_s, now_mono_s);
+        atomic_store(&g_first_seen_unix, platform_time_wall_unix());
         return false;
     }
-    int64_t age = now - first;
+    int64_t age = now_mono_s - first;
     if (age < QUEUE_STARVED_TRIGGER_SECS)
         return false;
 
@@ -192,7 +200,7 @@ static bool detail_download_queue_starved(struct json_value *out)
     ok = ok && json_push_kv_int(out, "trigger_secs",
                                 QUEUE_STARVED_TRIGGER_SECS);
     ok = ok && json_push_kv_int(out, "first_seen_unix",
-                                atomic_load(&g_first_seen));
+                                atomic_load(&g_first_seen_unix));
     ok = ok && json_push_kv_int(out, "detect_age_s",
                                 atomic_load(&g_age_at_detect));
     ok = ok && json_push_kv_int(out, "requested_at_detect",
@@ -343,7 +351,8 @@ void register_download_queue_starved(void)
 #ifdef ZCL_TESTING
 void download_queue_starved_test_reset(void)
 {
-    atomic_store(&g_first_seen, 0);
+    atomic_store(&g_first_seen_mono_s, -1);
+    atomic_store(&g_first_seen_unix, 0);
     atomic_store(&g_inflight_at_detect, 0);
     atomic_store(&g_queued_at_detect, 0);
     atomic_store(&g_requested_at_detect, 0);

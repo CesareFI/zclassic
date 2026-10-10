@@ -46,7 +46,7 @@ static int64_t fake_now_wall(void *self)
 static void fake_clock_install(struct fake_clock *c, int64_t unix_s)
 {
     atomic_store(&c->wall_ms, unix_s * 1000);
-    atomic_store(&c->monotonic_ms, 1);
+    atomic_store(&c->monotonic_ms, unix_s * 1000);
     static clock_iface_t iface;
     iface.now_monotonic_ns = fake_now_mono;
     iface.now_wall_ms = fake_now_wall;
@@ -184,10 +184,50 @@ static const struct json_value *sync_watchdog_condition_json(
     return NULL;
 }
 
+static int test_download_queue_uses_monotonic_timeout(void)
+{
+    int failures = 0;
+    struct fake_clock clock;
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    struct p2p_node peer = {0};
+    struct p2p_node *peers[1] = { &peer };
+    struct uint256 hash = {0};
+    int32_t height = 77;
+
+    fake_clock_install(&clock, 1000);
+    reset_sync_watchdog(&cm, &dm, &ms);
+    zcl_mutex_destroy(&dm.cs);
+    dl_init(&dm);
+    sync_monitor_set_context(&cm, &dm, &ms);
+    register_download_queue_starved();
+    cm.manager.nodes = peers;
+    cm.manager.num_nodes = 1;
+    hash.data[0] = 0xd1;
+    SYNC_WATCHDOG_CHECK("queue for monotonic timeout",
+                        dl_queue_blocks(&dm, &hash, &height, 1) == 1);
+    sync_set_state(SYNC_HEADERS_DOWNLOAD, "setup monotonic queue timeout");
+    sync_set_state(SYNC_BLOCKS_DOWNLOAD, "test monotonic queue timeout");
+    condition_engine_tick();
+
+    /* Elapsed runtime reaches the trigger while civil time moves backward. */
+    fake_clock_set_split(&clock, 700, 1121);
+    condition_engine_tick();
+    SYNC_WATCHDOG_CHECK("download queue timeout ignores wall rollback",
+                        download_queue_starved_test_remedy_calls() == 1);
+    dl_free(&dm);
+    zcl_mutex_destroy(&dm.cs);
+    cleanup_sync_watchdog();
+    return failures;
+}
+
 int test_sync_watchdog_conditions(void)
 {
     printf("\n=== sync watchdog condition tests ===\n");
     int failures = 0;
+
+    failures += test_download_queue_uses_monotonic_timeout();
 
     {
         /* C3: verified reducer progress must reach the network backpressure

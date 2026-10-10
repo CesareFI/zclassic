@@ -287,13 +287,23 @@ static bool condition_due_for_remedy(const struct condition *cond,
     return last == 0 || now - last >= backoff;
 }
 
+static bool condition_poll_due(bool active, int64_t last_poll, int64_t now,
+                               int poll_secs)
+{
+    if (active || last_poll == 0)
+        return true;
+    /* Rebaseline after a civil-clock rollback. This one poll lets detectors
+     * whose intervals use monotonic time continue without opening a spin. */
+    return now < last_poll || now - last_poll >= poll_secs;
+}
+
 static void condition_tick_one(const struct condition *cond, int64_t now)
 {
     struct condition_state *s = (struct condition_state *)&cond->state;
     int poll_secs = cond->poll_secs > 0 ? cond->poll_secs : 1;
     int64_t last_poll = atomic_load(&s->last_poll_unix);
     bool active = atomic_load(&s->currently_active);
-    if (!active && last_poll != 0 && now - last_poll < poll_secs)
+    if (!condition_poll_due(active, last_poll, now, poll_secs))
         return;
     if (!active)
         atomic_store(&s->last_poll_unix, now);
