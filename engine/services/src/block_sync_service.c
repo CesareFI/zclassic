@@ -42,8 +42,11 @@ static _Atomic int64_t g_last_stale_warn = 0;
 static bool stale_warn_cooldown_active(int64_t now_seconds,
                                        int64_t last_seconds)
 {
-    if (now_seconds <= last_seconds)
-        return true;
+    /* This is a wall-clock diagnostic stamp. A backward correction starts a
+     * fresh throttle epoch so a stale peer can still trigger the recovery
+     * getheaders path instead of waiting for civil time to catch up. */
+    if (now_seconds < last_seconds)
+        return false;
     return (uint64_t)now_seconds - (uint64_t)last_seconds <= 300U;
 }
 

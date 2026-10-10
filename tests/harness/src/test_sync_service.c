@@ -2037,6 +2037,7 @@ static int test_sync_service_tip_stale_warning_throttle(void)
         memset(&node, 0, sizeof(node));
         snapshot.tip_stale = true;
 
+        syncsvc_stale_warning_reset_for_testing();
         ASSERT(syncsvc_should_warn_tip_stale(&snapshot, &node, 1000));
         ASSERT(!syncsvc_should_warn_tip_stale(&snapshot, &node, 1200));
         ASSERT(syncsvc_should_warn_tip_stale(&snapshot, &node, 1301));
@@ -2107,10 +2108,21 @@ static int test_sync_service_tip_stale_getheaders_action(void)
         memset(&action, 0, sizeof(action));
         snapshot.tip_stale = true;
 
+        syncsvc_stale_warning_reset_for_testing();
         syncsvc_plan_tip_stale_getheaders(&action, &snapshot, &node, 5000);
         ASSERT(action.should_send);
         ASSERT(action.anchor == SYNC_HEADER_REQUEST_TIP);
         ASSERT(action.should_log);
+
+        /* The throttle stamp is wall-clock diagnostic state. A backward
+         * correction must start a new recovery epoch, while equal time must
+         * still suppress duplicate getheaders sends. */
+        syncsvc_plan_tip_stale_getheaders(&action, &snapshot, &node, 4900);
+        ASSERT(action.should_send);
+        ASSERT(action.anchor == SYNC_HEADER_REQUEST_TIP);
+        ASSERT(action.should_log);
+        syncsvc_plan_tip_stale_getheaders(&action, &snapshot, &node, 4900);
+        ASSERT(!action.should_send);
         PASS();
     } _test_next:;
 
