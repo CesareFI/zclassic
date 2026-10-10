@@ -181,7 +181,7 @@ bool syncsvc_should_restart_headers_from_tip(size_t accepted,
     /* A far-ahead peer that answers with headers below our active tip is not
      * making sync progress. Continuing from that low header crawls the node
      * around genesis and starves the real next block after the active tip. */
-    return peer_height > our_height + 100;
+    return (int64_t)peer_height > (int64_t)our_height + 100;
 }
 
 void syncsvc_build_block_file_scan_activation(
