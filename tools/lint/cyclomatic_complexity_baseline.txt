@@ -2330,7 +2330,7 @@ engine/services/src/mesh_private_object_admission.c:mesh_private_object_admit_of
 engine/services/src/mesh_private_object_receiver.c:mesh_private_object_receiver_admit:22
 engine/services/src/mesh_private_object_receiver.c:mesh_private_object_receiver_chunk:20
 engine/services/src/mesh_private_object_receiver.c:mesh_private_object_receiver_drive:19
-engine/services/src/mirror_divergence_locator.c:mirror_divergence_locate:18
+engine/services/src/mirror_divergence_locator.c:mirror_divergence_locate:16
 engine/services/src/network_census_fold.c:network_census_compute:46
 engine/services/src/network_crawler.c:ncrawl_clamp:19
 engine/services/src/network_crawler_dial.c:ncrawl_dial_group:19

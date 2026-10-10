@@ -49,6 +49,44 @@ static pthread_mutex_t g_pending_lock = PTHREAD_MUTEX_INITIALIZER;
 static int     g_pending_first_div = -1;
 static int64_t g_pending_first_seen_unix = 0;
 
+/* This is a wall-clock limiter because the locator's timestamps are exposed
+ * to operators as Unix time.  A backwards correction must start a fresh
+ * local retry epoch instead of suppressing a real divergence until wall time
+ * catches up.  The unsigned delta is safe for every ordered int64_t pair. */
+static bool mdl_relocate_due(int64_t now, int64_t last)
+{
+    return last == 0 || now < last ||
+           (uint64_t)now - (uint64_t)last >= MDL_RELOCATE_MIN_SECS;
+}
+
+/* The pending confirmation timer shares the same wall-clock domain as the
+ * retry limiter.  Re-arm it after rollback: a future start time must never
+ * indefinitely delay a persistent tip-window divergence. */
+static bool mdl_pending_divergence_persisted(int first_div, int64_t now,
+                                             int64_t *pending_age)
+{
+    bool persisted = false;
+
+    if (pending_age)
+        *pending_age = 0;
+    pthread_mutex_lock(&g_pending_lock);
+    if (g_pending_first_div != first_div) {
+        g_pending_first_div = first_div;
+        g_pending_first_seen_unix = now;
+    } else if (now < g_pending_first_seen_unix) {
+        g_pending_first_seen_unix = now;
+    } else {
+        uint64_t elapsed = (uint64_t)now -
+                           (uint64_t)g_pending_first_seen_unix;
+        persisted = elapsed >= MDL_CONFIRM_PERSIST_SECS;
+        if (pending_age)
+            *pending_age = elapsed > INT64_MAX ? INT64_MAX :
+                           (int64_t)elapsed;
+    }
+    pthread_mutex_unlock(&g_pending_lock);
+    return persisted;
+}
+
 /* ── production probes ──────────────────────────────────────────── */
 
 /* Local: the in-RAM active chain first (fast, covers the recent window),
@@ -148,7 +186,7 @@ int mirror_divergence_locate(int disagree_height)
 
     int64_t now = platform_time_wall_unix();
     int64_t last = atomic_load(&g_last_locate_unix);
-    if (last != 0 && now - last < MDL_RELOCATE_MIN_SECS)
+    if (!mdl_relocate_due(now, last))
         return -1; // raw-return-ok:rate-limited-relocate-by-design
     atomic_store(&g_last_locate_unix, now);
 
@@ -209,17 +247,9 @@ int mirror_divergence_locate(int disagree_height)
      * repeated locates for >= MDL_CONFIRM_PERSIST_SECS (the wedged-at-tip
      * shape, where our tip never advances so depth never confirms). */
     if (first_div > disagree_height - MDL_CONFIRM_DEPTH) {
-        bool persisted = false;
         int64_t pending_age = 0;
-        pthread_mutex_lock(&g_pending_lock);
-        if (g_pending_first_div == first_div) {
-            pending_age = now - g_pending_first_seen_unix;
-            persisted = pending_age >= MDL_CONFIRM_PERSIST_SECS;
-        } else {
-            g_pending_first_div = first_div;
-            g_pending_first_seen_unix = now;
-        }
-        pthread_mutex_unlock(&g_pending_lock);
+        bool persisted = mdl_pending_divergence_persisted(first_div, now,
+                                                           &pending_age);
         if (!persisted) {
             LOG_WARN("validation_pack",
                      "[mirror_divergence] tip-window divergence at h=%d "

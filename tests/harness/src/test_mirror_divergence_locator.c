@@ -57,6 +57,35 @@ static bool probe_remote_mock(int height, char out_hex[65])
     return true;
 }
 
+static int test_clock_rollback_rearms_pending_divergence(void)
+{
+    int failures = 0;
+
+    /* A backwards wall-clock step must re-arm both the 10-minute locate
+     * limiter and the pending tip-window epoch.  The test helper shifts
+     * their stamps forward, which is equivalent to the clock moving
+     * backward while no locator call runs.  Before the fix this second
+     * locate was suppressed until wall time caught up. */
+    mirror_divergence_reset_for_testing();
+    g_div_height = 3143355;
+    int r = mirror_divergence_locate(3143355);
+    mirror_divergence_backdate_pending_for_testing(
+        -(MDL_CONFIRM_PERSIST_SECS + 1));
+    int r2 = mirror_divergence_locate(3143355);
+    MDL_CHECK("clock rollback: re-arms pending tip divergence",
+              r == 3143355 && r2 == 3143355 &&
+              !blocker_exists("mirror.divergence_located"));
+    mirror_divergence_backdate_pending_for_testing(
+        MDL_CONFIRM_PERSIST_SECS + 1);
+    int r3 = mirror_divergence_locate(3143355);
+    MDL_CHECK("clock rollback: new epoch still confirms normally",
+              r3 == 3143355 &&
+              blocker_exists("mirror.divergence_located") &&
+              chain_linkage_hold_active());
+    mirror_divergence_reset_for_testing();
+    return failures;
+}
+
 int test_mirror_divergence_locator(void)
 {
     printf("\n=== mirror_divergence_locator tests ===\n");
@@ -119,6 +148,8 @@ int test_mirror_divergence_locator(void)
                   !chain_linkage_hold_active());
         mirror_divergence_reset_for_testing();
     }
+
+    failures += test_clock_rollback_rearms_pending_divergence();
 
     /* 5. RPC error mid-bisect: silent abort, no blocker. */
     {
