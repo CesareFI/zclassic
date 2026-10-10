@@ -19,6 +19,7 @@
 #include "test/test_core.h"
 #include "services/disk_monitor.h"
 #include "event/event.h"
+#include "util/supervisor.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -63,12 +64,33 @@ static void dm_reset_observer(void)
     else { printf("FAIL\n"); failures++; } \
 } while (0)
 
+static int test_disk_monitor_stop_releases_supervisor(void)
+{
+    struct disk_monitor_config cfg;
+    int failures = 0;
+
+    supervisor_reset_for_testing();
+    disk_monitor_config_defaults(&cfg);
+    cfg.datadir = DM_SCRATCH_DIR;
+    cfg.poll_seconds = 3600;
+    DM_CHECK("dm: start registers its supervisor child",
+             disk_monitor_start(&cfg).ok &&
+             supervisor_child_count_total() == 1);
+    disk_monitor_stop();
+    DM_CHECK("dm: stop releases its supervisor child",
+             supervisor_child_count_total() == 0);
+    supervisor_reset_for_testing();
+    return failures;
+}
+
 int test_disk_monitor(void)
 {
     printf("\n=== disk_monitor tests ===\n");
     int failures = 0;
 
     mkdir(DM_SCRATCH_DIR, 0755);
+
+    failures += test_disk_monitor_stop_releases_supervisor();
 
     /* ── 1. free_bytes returns positive for a real path ───── */
     {

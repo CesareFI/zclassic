@@ -368,16 +368,20 @@ void disk_monitor_stop(void)
 
     if (joinable) {
         pthread_join(th, NULL);
-        pthread_mutex_lock(&g_dm.lock);
+    }
+
+    /* Do not publish a stopped monitor until its old child id is gone.  A
+     * concurrent restart may otherwise reuse that id just before this stop
+     * unregisters it. */
+    pthread_mutex_lock(&g_dm.lock);
+    if (joinable) {
         g_dm.thread_running = false;
         g_dm.stop_requested = false;
-        pthread_mutex_unlock(&g_dm.lock);
     }
-#ifdef ZCL_TESTING
     id = atomic_exchange(&g_dm.supervisor_id, SUPERVISOR_INVALID_ID);
+    pthread_mutex_unlock(&g_dm.lock);
     if (id != SUPERVISOR_INVALID_ID)
         supervisor_unregister(id);
-#endif
 }
 
 /* ── Status / queries ───────────────────────────────────────── */

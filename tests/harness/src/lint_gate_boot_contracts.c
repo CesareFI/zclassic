@@ -368,6 +368,42 @@ int t_gap_fill_unregisters_supervisor_on_production_stop_contract(void)
     return failures;
 }
 
+int t_disk_monitor_unregisters_supervisor_on_production_stop_contract(void)
+{
+    int failures = 0;
+    char *buf = NULL;
+    TEST("disk-monitor stop unregisters its supervisor in every build") {
+        char path[PATH_MAX];
+        ASSERT(repo_path(path, sizeof(path),
+                         "engine/services/src/disk_monitor.c") == 0);
+        ASSERT(read_entire_file(path, &buf) == 0);
+        char *stop = strstr(buf, "void disk_monitor_stop(void)");
+        char *cleanup = stop ? strstr(
+            stop, "id = atomic_exchange(&g_dm.supervisor_id,") : NULL;
+        char *unregister = cleanup
+            ? strstr(cleanup, "supervisor_unregister(id);") : NULL;
+        char *unlock = cleanup
+            ? strstr(cleanup, "pthread_mutex_unlock(&g_dm.lock);") : NULL;
+        char *status = cleanup
+            ? strstr(cleanup, "/* ── Status / queries") : NULL;
+        char *test_guard = cleanup ? strstr(cleanup, "#ifdef ZCL_TESTING")
+                                   : NULL;
+        ASSERT(stop != NULL);
+        ASSERT(cleanup != NULL);
+        ASSERT(unregister != NULL);
+        ASSERT(unlock != NULL);
+        ASSERT(status != NULL);
+        ASSERT(cleanup < unlock);
+        ASSERT(cleanup < unregister);
+        ASSERT(unlock < unregister);
+        ASSERT(unregister < status);
+        ASSERT(test_guard == NULL || test_guard > status);
+        PASS();
+    } _test_next:;
+    free(buf);
+    return failures;
+}
+
 int t_boot_watchdog_stops_before_connman_teardown_contract(void)
 {
     int failures = 0;
