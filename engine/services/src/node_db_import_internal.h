@@ -104,5 +104,7 @@ static inline void import_chunk_reset(struct import_chunk *chunk)
  * table inside ~100K-row transactions. */
 void *node_db_import_decoder_thread(void *arg);
 void *node_db_import_writer_thread(void *arg);
+void node_db_import_writer_finish_transaction(struct import_context *ctx,
+                                              struct node_db *ndb);
 
 #endif /* ZCL_NODE_DB_IMPORT_INTERNAL_H */

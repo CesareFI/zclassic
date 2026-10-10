@@ -89,6 +89,20 @@ void *node_db_import_decoder_thread(void *arg)
     return NULL;
 }
 
+void node_db_import_writer_finish_transaction(struct import_context *ctx,
+                                              struct node_db *ndb)
+{
+    if (import_ctx_should_stop(ctx)) {
+        if (!node_db_rollback(ndb))
+            LOG_WARN("sync", "UTXO import writer: rollback requested by stop flag failed");
+        return;
+    }
+    if (!node_db_commit(ndb)) {
+        LOG_WARN("sync", "UTXO import writer: final COMMIT failed");
+        import_ctx_request_stop(ctx);
+    }
+}
+
 /* Writer thread — consumes decoded chunks, inserts into SQLite */
 void *node_db_import_writer_thread(void *arg)
 {
@@ -242,13 +256,7 @@ void *node_db_import_writer_thread(void *arg)
         atomic_store(&chunk->state, 0); /* free for reuse */
     }
 
-    if (!import_ctx_should_stop(ctx)) {
-        if (!node_db_commit(ndb))
-            LOG_WARN("sync", "UTXO import writer: final COMMIT failed");
-    } else {
-        if (!node_db_rollback(ndb))
-            LOG_WARN("sync", "UTXO import writer: rollback requested by stop flag failed");
-    }
+    node_db_import_writer_finish_transaction(ctx, ndb);
     sync_job_import_progress(total_rows);
     atomic_store(&ctx->total_rows, total_rows);
     return NULL;

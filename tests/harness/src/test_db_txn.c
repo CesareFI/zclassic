@@ -15,10 +15,12 @@
 #include "models/activerecord.h"
 #include "models/ar_after_commit.h"
 #include "event/event.h"
+#include "node_db_import_internal.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ── Event counters ─────────────────────────────────────────── */
@@ -758,6 +760,46 @@ static int t_poisoned_commit_recovery(void)
     return failures;
 }
 
+/* ── 20. UTXO writer final-commit failure is terminal ─────────── */
+
+static int t_utxo_writer_final_commit_failure(void)
+{
+    int failures = 0;
+    struct node_db ndb;
+    memset(&ndb, 0, sizeof(ndb));
+    bool opened = node_db_open(&ndb, ":memory:");
+    struct import_context *ctx = opened ? calloc(1, sizeof(*ctx)) : NULL;
+    bool begun = ctx && node_db_begin(&ndb);
+
+    /* Leave a write VM at SQLITE_ROW so the final COMMIT fails exactly as a
+     * poisoned shared handle does. The actual writer entry point must turn
+     * that failed final commit into the cancellation seen by its orchestrator;
+     * merely logging it would let a partial import report success. */
+    sqlite3_stmt *vm = NULL;
+    bool poisoned = begun &&
+        sqlite3_prepare_v2(ndb.db,
+            "INSERT INTO node_state(key,value) VALUES('import.commit', X'00')"
+            " RETURNING key",
+            -1, &vm, NULL) == SQLITE_OK &&
+        sqlite3_step(vm) == SQLITE_ROW;
+    if (ctx)
+        ctx->ndb = &ndb;
+    if (poisoned)
+        node_db_import_writer_finish_transaction(ctx, &ndb);
+
+    bool stopped = ctx && atomic_load(&ctx->cancel_requested);
+    if (vm)
+        sqlite3_finalize(vm);
+    bool rolled_back = !opened || node_db_rollback(&ndb);
+    DT_RUN("dt: UTXO writer rejects a failed final COMMIT",
+           poisoned && stopped && rolled_back);
+
+    free(ctx);
+    if (opened)
+        node_db_close(&ndb);
+    return failures;
+}
+
 
 /* ── after_commit: a hook that must not outrun durability ────────
  *
@@ -1074,6 +1116,7 @@ int test_db_txn(void)
     failures += t_failed_commit_rolls_back();
     failures += t_busy_snapshot_rollback_rebegin();
     failures += t_poisoned_commit_recovery();
+    failures += t_utxo_writer_final_commit_failure();
     failures += t_after_commit_not_fired_on_rollback();
     failures += t_after_commit_fires_on_commit();
     failures += t_after_commit_sees_a_copy();
