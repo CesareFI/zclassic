@@ -14,6 +14,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+struct json_value;
+
 struct script_validate_created_prevout_view {
     sqlite3 *db;
     int height;
@@ -32,7 +34,7 @@ bool script_validate_created_index_prevout(const struct outpoint *prevout,
  * script_validate drain teardown (one prepared statement per completed batch). */
 void script_validate_prevout_batch_reset(void);
 
-stage_t *script_validate_stage_handle(void);
+void script_validate_stage_dump_fields(struct json_value *out);
 uint64_t script_validate_stage_inputs_failed_total(void);
 uint64_t script_validate_stage_header_event_emit_total(void);
 uint64_t script_validate_stage_header_event_emit_fail_total(void);

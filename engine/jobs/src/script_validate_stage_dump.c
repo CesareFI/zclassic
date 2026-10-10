@@ -120,9 +120,11 @@ bool script_validate_dump_state_json(struct json_value *out, const char *key)
     sqlite3 *db = progress_store_db();
     int64_t now = platform_time_wall_unix();
     int64_t last = script_validate_stage_last_step_unix();
-    stage_t *stage = script_validate_stage_handle();
 
-    stage_dump_header(out, STAGE_NAME, stage);
+    /* The owner destroys its stage under a private mutex. Emit a copied
+     * snapshot through that owner instead of carrying its pointer across
+     * this dump's database work. */
+    script_validate_stage_dump_fields(out);
     json_push_kv_int(out, "verified_total",
                      (int64_t)script_validate_stage_verified_total());
     json_push_kv_int(out, "script_invalid_total",
@@ -165,15 +167,11 @@ bool script_validate_dump_state_json(struct json_value *out, const char *key)
         json_push_kv_bool(out, "snapshot_complete", false);
         json_push_kv_str(out, "snapshot_status", "progress_store_busy");
         json_push_kv_bool(out, "retryable", true);
-        stage_dump_counters(out, stage);
-        stage_dump_health(out, STAGE_NAME, stage);
         return true;
     }
     /* "Why is the pipeline stuck": surface the lowest ok=0 row's typed
      * reason (status + txid + vin) so dumpstate pinpoints the blocker. */
     dump_blocking_failure(out, db);
     if (db) progress_store_tx_unlock();
-    stage_dump_counters(out, stage);
-    stage_dump_health(out, STAGE_NAME, stage);
     return true;
 }

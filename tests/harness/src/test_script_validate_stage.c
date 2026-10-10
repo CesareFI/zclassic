@@ -346,6 +346,21 @@ static void sv_teardown(const char *dir, struct main_state *ms,
     test_cleanup_tmpdir(dir);
 }
 
+static int test_sv_shutdown_status_guards(void)
+{
+    int failures = 0;
+
+    SV_CHECK("guard: status accessors are empty after shutdown",
+             script_validate_stage_cursor() == 0 &&
+             script_validate_stage_step_us_ewma() == 0);
+    struct json_value v;
+    json_init(&v);
+    SV_CHECK("guard: status snapshot is safe after shutdown",
+             script_validate_dump_state_json(&v, NULL));
+    json_free(&v);
+    return failures;
+}
+
 int test_script_validate_stage(void);
 int test_script_validate_stage(void)
 {
@@ -353,6 +368,7 @@ int test_script_validate_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    failures += test_sv_shutdown_status_guards();
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_sv sc;

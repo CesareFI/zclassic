@@ -725,12 +725,18 @@ void script_validate_stage_set_prevout_resolver(script_validate_prevout_fn fn,
 
 uint64_t script_validate_stage_cursor(void)
 {
-    return g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_lock(&g_lock);
+    uint64_t cursor = g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return cursor;
 }
 
 int64_t script_validate_stage_step_us_ewma(void)
 {
-    return g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_lock(&g_lock);
+    int64_t ewma = g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return ewma;
 }
 
 uint64_t script_validate_stage_verified_total(void)
@@ -758,9 +764,15 @@ uint64_t script_validate_stage_inputs_verified_total(void)
     return atomic_load(&g_inputs_verified_total);
 }
 
-stage_t *script_validate_stage_handle(void)
+void script_validate_stage_dump_fields(struct json_value *out)
 {
-    return g_stage;
+    if (!out)
+        return;
+    pthread_mutex_lock(&g_lock);
+    stage_dump_header(out, STAGE_NAME, g_stage);
+    stage_dump_counters(out, g_stage);
+    stage_dump_health(out, STAGE_NAME, g_stage);
+    pthread_mutex_unlock(&g_lock);
 }
 
 uint64_t script_validate_stage_inputs_failed_total(void)
