@@ -62,6 +62,10 @@
  * forward long before an operator would think to look. */
 #define STATE_OFFER_WAIT_MS INT64_C(120000)
 
+/* A local pthread_create failure is neither a bad offer nor peer misconduct.
+ * Keep its offer available, but do not let each inbound frame retry creation. */
+#define STATE_OFFER_FETCH_START_RETRY_MS INT64_C(1000)
+
 /* One retained offer plus the endpoint that would be dialled for it. The
  * endpoint comes from the LIVE CONNECTION and the message's own port field,
  * never from the offer — see net/state_offer.h. */
@@ -126,6 +130,11 @@ enum state_offer_decision state_offer_store_decide(
 /* Mark the chosen offer as being acted on, so a second decide() does not hand
  * the same offer to a second fetch. Cleared by note_bad (try the next one). */
 void state_offer_store_note_fetching(const uint8_t content_digest[32]);
+
+/* Release an offer when the local fetch worker could not start. This is not a
+ * peer fault: make it eligible again after a bounded monotonic cooldown. */
+void state_offer_store_note_fetch_start_failed(const uint8_t content_digest[32],
+                                               int64_t now_ms);
 
 /* The newest bundle height ANY peer offered this run, acceptable or not — the
  * number bootstrap.stale_offers_only must name. 0 when nothing was offered. */

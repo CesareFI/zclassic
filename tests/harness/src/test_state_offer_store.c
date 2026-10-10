@@ -20,6 +20,7 @@
 #include "vcs/zcode_dht_identity.h"
 
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -155,6 +156,51 @@ static int picks_newest_acceptable(void)
         ASSERT_EQ(state_offer_store_decide(2000, &second),
                   STATE_OFFER_DECIDE_FETCH);
         ASSERT(second.offer.bundle_height == 900050);
+    } TEST_END
+    return failures;
+}
+
+static int fetch_start_failure_releases_offer(void)
+{
+    int failures = 0;
+    TEST_CASE("a local fetch-start failure leaves its offer retryable") {
+        struct state_offer_v1 offer;
+        struct state_offer_record chosen;
+        uint8_t ip[16];
+
+        an_ip(ip, 74);
+        state_offer_store_reset();
+        make_offer(&offer, 900000, 900000, 0x74);
+        ASSERT_EQ(state_offer_store_record(&offer, ip, 18034, 74, 1000),
+                  STATE_OFFER_STORE_KEPT);
+        ASSERT_EQ(state_offer_store_decide(1001, &chosen),
+                  STATE_OFFER_DECIDE_FETCH);
+        state_offer_store_note_fetching(chosen.offer.content_digest);
+        ASSERT_EQ(state_offer_store_decide(1002, &chosen),
+                  STATE_OFFER_DECIDE_WAIT);
+
+        state_offer_store_note_fetch_start_failed(offer.content_digest, 1003);
+        ASSERT_EQ(state_offer_store_decide(1003, &chosen),
+                  STATE_OFFER_DECIDE_WAIT);
+        ASSERT_EQ(state_offer_store_decide(
+                      1003 + STATE_OFFER_FETCH_START_RETRY_MS, &chosen),
+                  STATE_OFFER_DECIDE_FETCH);
+        ASSERT(memcmp(chosen.offer.content_digest, offer.content_digest,
+                      sizeof(offer.content_digest)) == 0);
+
+        state_offer_store_note_fetching(chosen.offer.content_digest);
+        state_offer_store_note_fetch_start_failed(
+            offer.content_digest, INT64_MAX - STATE_OFFER_FETCH_START_RETRY_MS);
+        ASSERT_EQ(state_offer_store_decide(INT64_MAX - 1, &chosen),
+                  STATE_OFFER_DECIDE_WAIT);
+        ASSERT_EQ(state_offer_store_decide(INT64_MAX, &chosen),
+                  STATE_OFFER_DECIDE_FETCH);
+
+        state_offer_store_note_fetching(chosen.offer.content_digest);
+        state_offer_store_note_fetch_start_failed(offer.content_digest,
+                                                  INT64_MAX);
+        ASSERT_EQ(state_offer_store_decide(INT64_MAX, &chosen),
+                  STATE_OFFER_DECIDE_WAIT);
     } TEST_END
     return failures;
 }
@@ -853,6 +899,7 @@ int test_state_offer_store(void)
     failures += advertise_when_we_hold_the_checkpoint_bundle();
     failures += no_advertisement_for_a_stale_bundle();
     failures += picks_newest_acceptable();
+    failures += fetch_start_failure_releases_offer();
     failures += stale_offer_never_chosen();
     failures += bad_bundle_discards_and_tries_next();
     failures += bounded_wait_names_the_newest_height();

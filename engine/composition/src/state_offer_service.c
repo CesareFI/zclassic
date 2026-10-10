@@ -606,6 +606,8 @@ void state_offer_service_tick(void)
     g_fetch_running = true;
     if (pthread_create(&g_fetch_thread, NULL, sosvc_fetch_main, NULL) != 0) {
         g_fetch_running = false;
+        state_offer_store_note_fetch_start_failed(
+            chosen.offer.content_digest, now_ms);
         LOG_WARN(SOSVC_SUBSYS, "could not start the offer fetch thread");
         return;
     }

@@ -11,6 +11,7 @@
 #include "json/json.h"
 #include "util/log_macros.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +33,8 @@ struct sos_peer_strike {
 static struct state_offer_record g_offers[STATE_OFFER_STORE_MAX];
 static bool g_offer_used[STATE_OFFER_STORE_MAX];
 static bool g_offer_fetching[STATE_OFFER_STORE_MAX];
+static int64_t g_offer_retry_after_ms[STATE_OFFER_STORE_MAX];
+static bool g_offer_retry_saturated[STATE_OFFER_STORE_MAX];
 static struct sos_bad g_bad[STATE_OFFER_STORE_BAD_MAX];
 static struct sos_peer_strike g_strikes[STATE_OFFER_STORE_BAD_MAX];
 
@@ -83,6 +86,8 @@ void state_offer_store_reset(void)
     memset(g_offers, 0, sizeof(g_offers));
     memset(g_offer_used, 0, sizeof(g_offer_used));
     memset(g_offer_fetching, 0, sizeof(g_offer_fetching));
+    memset(g_offer_retry_after_ms, 0, sizeof(g_offer_retry_after_ms));
+    memset(g_offer_retry_saturated, 0, sizeof(g_offer_retry_saturated));
     memset(g_bad, 0, sizeof(g_bad));
     memset(g_strikes, 0, sizeof(g_strikes));
     g_wait_armed = false;
@@ -276,6 +281,8 @@ static enum state_offer_store_result state_offer_store_record_locked(
     g_offers[slot].heard_ms = now_ms;
     g_offer_used[slot] = true;
     g_offer_fetching[slot] = false;
+    g_offer_retry_after_ms[slot] = 0;
+    g_offer_retry_saturated[slot] = false;
     return STATE_OFFER_STORE_KEPT;
 }
 
@@ -312,6 +319,8 @@ static bool state_offer_store_note_bad_locked(const uint8_t content_digest[32],
     if (slot < STATE_OFFER_STORE_MAX) {
         g_offer_used[slot] = false;
         g_offer_fetching[slot] = false;
+        g_offer_retry_after_ms[slot] = 0;
+        g_offer_retry_saturated[slot] = false;
         memset(&g_offers[slot], 0, sizeof(g_offers[slot]));
     }
     if (digest_eq(g_chosen_digest, content_digest)) {
@@ -362,12 +371,39 @@ done:
     pthread_mutex_unlock(&g_store_lock);
 }
 
+void state_offer_store_note_fetch_start_failed(const uint8_t content_digest[32],
+                                               int64_t now_ms)
+{
+    pthread_mutex_lock(&g_store_lock);
+    if (content_digest) {
+        size_t slot = find_by_digest(content_digest);
+        if (slot < STATE_OFFER_STORE_MAX) {
+            g_offer_fetching[slot] = false;
+            if (now_ms > INT64_MAX - STATE_OFFER_FETCH_START_RETRY_MS) {
+                g_offer_retry_after_ms[slot] = INT64_MAX;
+                g_offer_retry_saturated[slot] = true;
+            } else {
+                g_offer_retry_after_ms[slot] =
+                    now_ms + STATE_OFFER_FETCH_START_RETRY_MS;
+                g_offer_retry_saturated[slot] = false;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_store_lock);
+}
+
 int32_t state_offer_store_newest_height_seen(void)
 {
     pthread_mutex_lock(&g_store_lock);
     int32_t height = g_newest_height_seen;
     pthread_mutex_unlock(&g_store_lock);
     return height;
+}
+
+static bool offer_retry_pending(size_t slot, int64_t now_ms)
+{
+    return g_offer_retry_saturated[slot] ||
+           now_ms < g_offer_retry_after_ms[slot];
 }
 
 static enum state_offer_decision state_offer_store_decide_locked(
@@ -379,6 +415,8 @@ static enum state_offer_decision state_offer_store_decide_locked(
     size_t best = STATE_OFFER_STORE_MAX;
     for (size_t i = 0; i < STATE_OFFER_STORE_MAX; i++) {
         if (!g_offer_used[i] || g_offer_fetching[i])
+            continue;
+        if (offer_retry_pending(i, now_ms))
             continue;
         if (best == STATE_OFFER_STORE_MAX ||
             g_offers[i].offer.bundle_height >
