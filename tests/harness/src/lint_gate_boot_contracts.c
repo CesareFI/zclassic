@@ -336,6 +336,38 @@ int t_boot_gap_fill_stops_before_connman_teardown_contract(void)
     return failures;
 }
 
+int t_gap_fill_unregisters_supervisor_on_production_stop_contract(void)
+{
+    int failures = 0;
+    char *buf = NULL;
+    TEST("gap-fill stop unregisters its supervisor in every build") {
+        char path[PATH_MAX];
+        ASSERT(repo_path(path, sizeof(path),
+                         "engine/services/src/gap_fill_service.c") == 0);
+        ASSERT(read_entire_file(path, &buf) == 0);
+        char *stop = strstr(buf, "void gap_fill_stop(void)");
+        char *cleanup = stop ? strstr(
+            stop, "id = atomic_exchange(&g_gf.supervisor_id,") : NULL;
+        char *unregister = cleanup
+            ? strstr(cleanup, "supervisor_unregister(id);") : NULL;
+        char *unlock = cleanup
+            ? strstr(cleanup, "pthread_mutex_unlock(&g_gf.lifecycle_mu);")
+            : NULL;
+        char *test_guard = cleanup ? strstr(cleanup, "#ifdef ZCL_TESTING")
+                                   : NULL;
+        ASSERT(stop != NULL);
+        ASSERT(cleanup != NULL);
+        ASSERT(unregister != NULL);
+        ASSERT(unlock != NULL);
+        ASSERT(cleanup < unregister);
+        ASSERT(unregister < unlock);
+        ASSERT(test_guard == NULL || test_guard > unlock);
+        PASS();
+    } _test_next:;
+    free(buf);
+    return failures;
+}
+
 int t_boot_watchdog_stops_before_connman_teardown_contract(void)
 {
     int failures = 0;

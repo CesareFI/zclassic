@@ -848,11 +848,9 @@ void gap_fill_stop(void)
     g_gf.wake_dispatch = NULL;
     g_gf.wake_dispatch_ctx = NULL;
     pthread_mutex_unlock(&g_gf.mu);
-#ifdef ZCL_TESTING
     id = atomic_exchange(&g_gf.supervisor_id, SUPERVISOR_INVALID_ID);
     if (id != SUPERVISOR_INVALID_ID)
         supervisor_unregister(id);
-#endif
     pthread_mutex_unlock(&g_gf.lifecycle_mu);
 }
 

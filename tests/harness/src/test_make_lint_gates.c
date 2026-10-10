@@ -251,6 +251,7 @@ static const struct lint_gate_entry g_lint_gate_entries[] = {
     S_(t_boot_shutdown_persistence_order_contract),
     S_(t_boot_zcode_swarm_timer_shutdown_contract),
     S_(t_boot_gap_fill_stops_before_connman_teardown_contract),
+    S_(t_gap_fill_unregisters_supervisor_on_production_stop_contract),
     S_(t_boot_watchdog_stops_before_connman_teardown_contract),
     S_(t_hodl_history_uses_runtime_db_service),
     S_(t_db_service_query_handle_is_canonical),
