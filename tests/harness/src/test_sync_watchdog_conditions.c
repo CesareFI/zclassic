@@ -28,12 +28,13 @@
 
 struct fake_clock {
     _Atomic int64_t wall_ms;
+    _Atomic int64_t monotonic_ms;
 };
 
 static int64_t fake_now_mono(void *self)
 {
-    (void)self;
-    return 1;
+    struct fake_clock *c = (struct fake_clock *)self;
+    return atomic_load(&c->monotonic_ms) * 1000000;
 }
 
 static int64_t fake_now_wall(void *self)
@@ -45,6 +46,7 @@ static int64_t fake_now_wall(void *self)
 static void fake_clock_install(struct fake_clock *c, int64_t unix_s)
 {
     atomic_store(&c->wall_ms, unix_s * 1000);
+    atomic_store(&c->monotonic_ms, 1);
     static clock_iface_t iface;
     iface.now_monotonic_ns = fake_now_mono;
     iface.now_wall_ms = fake_now_wall;
@@ -55,6 +57,14 @@ static void fake_clock_install(struct fake_clock *c, int64_t unix_s)
 static void fake_clock_set(struct fake_clock *c, int64_t unix_s)
 {
     atomic_store(&c->wall_ms, unix_s * 1000);
+    atomic_store(&c->monotonic_ms, unix_s * 1000);
+}
+
+static void fake_clock_set_split(struct fake_clock *c, int64_t wall_s,
+                                 int64_t monotonic_s)
+{
+    atomic_store(&c->wall_ms, wall_s * 1000);
+    atomic_store(&c->monotonic_ms, monotonic_s * 1000);
 }
 
 static void reset_sync_watchdog(struct connman *cm,
@@ -92,6 +102,48 @@ static void cleanup_sync_watchdog(void)
     blocker_reset_for_testing();
     sync_monitor_set_context(NULL, NULL, NULL);
     clock_reset_default();
+}
+
+static bool header_stall_timeout_ignores_wall_rollback(void)
+{
+    /* The timeout is elapsed uptime, not civil time: a wall-clock rollback
+     * must not postpone a stalled-header retry. */
+    struct fake_clock clock;
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    fake_clock_install(&clock, 1000);
+    reset_sync_watchdog(&cm, &dm, &ms);
+    register_header_stall_at_height();
+
+    struct block_index header = {0};
+    header.nHeight = 2000;
+    ms.pindex_best_header = &header;
+    struct p2p_node peer = {0};
+    peer.id = 1;
+    peer.starting_height = 2600;
+    peer.state = PEER_ACTIVE;
+    peer.services = NODE_NETWORK;
+    peer.last_getheaders_time = 999;
+    peer.getheaders_stale_count = 3;
+    struct p2p_node *peers[1] = { &peer };
+    cm.manager.nodes = peers;
+    cm.manager.num_nodes = 1;
+    sync_set_state(SYNC_HEADERS_DOWNLOAD, "test monotonic header stall");
+
+    fake_clock_set_split(&clock, 1000, 1000);
+    condition_engine_tick();
+    fake_clock_set_split(&clock, 700, 1301);
+    condition_engine_rebaseline_clocks();
+    /* The engine's wall-keyed poll cadence remains bounded after the
+     * rollback; advance only that cadence, not elapsed uptime. */
+    fake_clock_set_split(&clock, 706, 1301);
+    condition_engine_tick();
+    bool ok = header_stall_at_height_test_remedy_calls() == 1 &&
+              atomic_load(&peer.last_getheaders_time) == 0 &&
+              atomic_load(&peer.getheaders_stale_count) == 0;
+    cleanup_sync_watchdog();
+    return ok;
 }
 
 static struct block_index *insert_watchdog_block(struct main_state *ms,
@@ -303,6 +355,9 @@ int test_sync_watchdog_conditions(void)
         SYNC_WATCHDOG_CHECK("header stall kicks header fetch", ok);
         cleanup_sync_watchdog();
     }
+
+    SYNC_WATCHDOG_CHECK("header stall timeout ignores wall rollback",
+                        header_stall_timeout_ignores_wall_rollback());
 
     {
         struct fake_clock clock;
