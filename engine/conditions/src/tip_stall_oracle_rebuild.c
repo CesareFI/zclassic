@@ -115,7 +115,7 @@ static bool has_stale_fork_child(struct main_state *ms, struct block_index *tip,
             continue;
         if (p->pprev != tip)
             continue; /* must be a direct child of the active tip */
-        if (!(p->nStatus & BLOCK_HAVE_DATA))
+        if (!(block_index_status_load(p) & BLOCK_HAVE_DATA))
             continue;
         if (block_has_any_failure(p))
             continue;
