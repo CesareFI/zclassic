@@ -115,12 +115,17 @@ static int test_sync_monitor_download_counter_saturation(void)
     dm.total_received = UINT64_MAX;
     dm.total_bytes_received = UINT64_MAX;
     sync_monitor_set_context(&cm, &dm, &ms);
+    sync_monitor_test_set_tip_state_counters(UINT64_MAX, UINT64_MAX,
+                                             UINT64_MAX);
     struct json_value state;
     json_init(&state);
     bool ok = sync_monitor_dump_state_json(&state, NULL);
     ok = ok && json_get_int(json_get(&state, "download_requested")) == INT64_MAX;
     ok = ok && json_get_int(json_get(&state, "download_received")) == INT64_MAX;
     ok = ok && json_get_int(json_get(&state, "download_bytes_received")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&state, "tip_state_evaluations")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&state, "tip_state_transitions")) == INT64_MAX;
+    ok = ok && json_get_int(json_get(&state, "tip_eval_intake_pending")) == INT64_MAX;
     json_free(&state);
     printf("sync_watchdog_conditions: sync monitor saturates unsigned "
            "download counters... %s\n", ok ? "OK" : "FAIL");

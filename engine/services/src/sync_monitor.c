@@ -860,9 +860,11 @@ bool sync_monitor_dump_state_json(struct json_value *out, const char *key)
                      sync_monitor_json_u64(dl_bytes));
     json_push_kv_real(out, "download_mbps_avg", dl_mbps_avg);
     json_push_kv_int(out, "tip_state_evaluations",
-                     (int64_t)atomic_load(&g_tip_state_evaluations));
+                     sync_monitor_json_u64(
+                         atomic_load(&g_tip_state_evaluations)));
     json_push_kv_int(out, "tip_state_transitions",
-                     (int64_t)atomic_load(&g_tip_state_transitions));
+                     sync_monitor_json_u64(
+                         atomic_load(&g_tip_state_transitions)));
     json_push_kv_int(out, "tip_eval_served_height",
                      atomic_load(&g_tip_eval_served_height));
     json_push_kv_int(out, "tip_eval_local_height",
@@ -878,7 +880,8 @@ bool sync_monitor_dump_state_json(struct json_value *out, const char *key)
     json_push_kv_int(out, "tip_eval_local_gap",
                      atomic_load(&g_tip_eval_local_gap));
     json_push_kv_int(out, "tip_eval_intake_pending",
-                     (int64_t)atomic_load(&g_tip_eval_intake_pending));
+                     sync_monitor_json_u64(
+                         atomic_load(&g_tip_eval_intake_pending)));
 
     struct watchdog_local_recovery_stats lr;
     sync_monitor_get_local_recovery_stats(&lr);
@@ -919,5 +922,14 @@ void sync_monitor_test_set_tip_advance_ts(int64_t ts)
 {
     atomic_store(&g_tip_advance_test_override, true);
     atomic_store(&g_last_block_connected_ts, ts);
+}
+
+void sync_monitor_test_set_tip_state_counters(uint64_t evaluations,
+                                              uint64_t transitions,
+                                              uint64_t intake_pending)
+{
+    atomic_store(&g_tip_state_evaluations, evaluations);
+    atomic_store(&g_tip_state_transitions, transitions);
+    atomic_store(&g_tip_eval_intake_pending, intake_pending);
 }
 #endif
