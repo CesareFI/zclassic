@@ -164,6 +164,8 @@ void gap_fill_test_set_lifecycle_hooks(
     gap_fill_test_lifecycle_hook_fn stop_before_lock,
     gap_fill_test_lifecycle_hook_fn stop_after_lock, void *ctx);
 bool gap_fill_test_is_running(void);
+void gap_fill_test_set_stats(const struct gap_fill_stats *stats);
+void gap_fill_test_add_stats(uint64_t enqueue_add, uint64_t timeout_add);
 #endif
 
 #endif /* ZCL_GAP_FILL_SERVICE_H */

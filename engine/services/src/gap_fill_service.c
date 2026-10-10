@@ -72,6 +72,14 @@ static struct gap_fill_state g_gf = {
 
 static struct liveness_contract g_gap_fill_contract;
 
+static void gap_fill_stat_add(uint64_t *stat, uint64_t add)
+{
+    if (UINT64_MAX - *stat < add)
+        *stat = UINT64_MAX;
+    else
+        *stat += add;
+}
+
 #ifdef ZCL_TESTING
 static gap_fill_test_lifecycle_hook_fn g_gap_fill_start_after_spawn;
 static gap_fill_test_lifecycle_hook_fn g_gap_fill_stop_before_lock;
@@ -343,7 +351,7 @@ static void gap_fill_wake_dispatcher(const char *reason)
         return;
     fn(ctx);
     pthread_mutex_lock(&g_gf.mu);
-    g_gf.stats.dispatch_wakes++;
+    gap_fill_stat_add(&g_gf.stats.dispatch_wakes, 1);
     total = g_gf.stats.dispatch_wakes;
     pthread_mutex_unlock(&g_gf.mu);
     event_emitf(EV_BLOCK_REQUESTED, 0,
@@ -445,8 +453,8 @@ static int gap_fill_pass(void)
     size_t timed_out = gap_fill_sweep_download_timeouts(
         dm, platform_time_monotonic_us() / 1000000);
     pthread_mutex_lock(&g_gf.mu);
-    g_gf.stats.timeout_sweeps++;
-    g_gf.stats.timeouts_requeued += (uint64_t)timed_out;
+    gap_fill_stat_add(&g_gf.stats.timeout_sweeps, 1);
+    gap_fill_stat_add(&g_gf.stats.timeouts_requeued, (uint64_t)timed_out);
     pthread_mutex_unlock(&g_gf.mu);
     if (timed_out > 0)
         gap_fill_wake_dispatcher("timeout_sweep");
@@ -663,7 +671,7 @@ static void gap_fill_await_kick_or_tick(void)
         until.tv_sec += GAPFILL_TICK_SECS;
         pthread_cond_timedwait(&g_gf.cv, &g_gf.mu, &until);
     } else if (g_gf.kick_pending && !atomic_load(&g_gf.stop_requested)) {
-        g_gf.stats.kick_latch_skips++;
+        gap_fill_stat_add(&g_gf.stats.kick_latch_skips, 1);
     }
     g_gf.kick_pending = false;
     pthread_mutex_unlock(&g_gf.mu);
@@ -688,13 +696,13 @@ static void *gap_fill_thread_main(void *arg)
                                      gap_fill_burst_should_abort, NULL,
                                      gap_fill_burst_heartbeat, NULL);
         pthread_mutex_lock(&g_gf.mu);
-        g_gf.stats.passes++;
+        gap_fill_stat_add(&g_gf.stats.passes, 1);
         if (n > 0) {
-            g_gf.stats.blocks_enqueued += (uint64_t)n;
+            gap_fill_stat_add(&g_gf.stats.blocks_enqueued, (uint64_t)n);
         } else if (n == 0) {
-            g_gf.stats.passes_idle++;
+            gap_fill_stat_add(&g_gf.stats.passes_idle, 1);
         } else {
-            g_gf.stats.passes_corrupt_walk++;
+            gap_fill_stat_add(&g_gf.stats.passes_corrupt_walk, 1);
         }
         pthread_mutex_unlock(&g_gf.mu);
         if (n < 0) {
@@ -897,6 +905,23 @@ void gap_fill_test_set_lifecycle_hooks(
 bool gap_fill_test_is_running(void)
 {
     return atomic_load(&g_gf.running);
+}
+
+void gap_fill_test_set_stats(const struct gap_fill_stats *stats)
+{
+    if (!stats)
+        return;
+    pthread_mutex_lock(&g_gf.mu);
+    g_gf.stats = *stats;
+    pthread_mutex_unlock(&g_gf.mu);
+}
+
+void gap_fill_test_add_stats(uint64_t enqueue_add, uint64_t timeout_add)
+{
+    pthread_mutex_lock(&g_gf.mu);
+    gap_fill_stat_add(&g_gf.stats.blocks_enqueued, enqueue_add);
+    gap_fill_stat_add(&g_gf.stats.timeouts_requeued, timeout_add);
+    pthread_mutex_unlock(&g_gf.mu);
 }
 #endif
 

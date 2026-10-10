@@ -102,6 +102,31 @@ static int gf_maximum_height_window_bounds(void)
     return failures;
 }
 
+static int gf_dump_saturates_unsigned_stats(void)
+{
+    int failures = 0;
+    struct gap_fill_stats stats = {
+        .passes = UINT64_MAX,
+        .blocks_enqueued = UINT64_MAX - 1,
+        .timeouts_requeued = UINT64_MAX - 1,
+        .dispatch_wakes = UINT64_MAX,
+    };
+    gap_fill_test_set_stats(&stats);
+    gap_fill_test_add_stats(2, 2);
+    struct json_value v = {0};
+    json_set_object(&v);
+    bool ok = gap_fill_dump_state_json(&v, NULL);
+    const struct json_value *enqueued = json_get(&v, "blocks_enqueued");
+    const struct json_value *requeued = json_get(&v, "timeouts_requeued");
+
+    GF_CHECK("gap-fill counters saturate instead of wrapping",
+             ok && enqueued && requeued &&
+             json_get_int(enqueued) == INT64_MAX &&
+             json_get_int(requeued) == INT64_MAX);
+    json_free(&v);
+    return failures;
+}
+
 int test_gap_fill_frontier_window(void)
 {
     printf("\n=== gap_fill_frontier_window ===\n");
@@ -114,6 +139,7 @@ int test_gap_fill_frontier_window(void)
              has && w.effective_tip_h == 6763 && w.lo == 6764 &&
                  w.hi == 7600 && w.count == 837);
     failures += gf_maximum_height_window_bounds();
+    failures += gf_dump_saturates_unsigned_stats();
 
     /* S2.4: gap_fill_compute_window's floor cursor is generic. Feeding it
      * the (structurally faster, body-independent) validate_headers cursor
