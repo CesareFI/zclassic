@@ -121,7 +121,7 @@ static bool target_has_readable_data(
          block_has_any_failure(bi) ||
          !uint256_eq(bi->phashBlock, expected_hash)))
         bi = NULL;
-    if (bi && (bi->nStatus & BLOCK_HAVE_DATA)) {
+    if (bi && (block_index_status_load(bi) & BLOCK_HAVE_DATA)) {
         char datadir[2048];
         GetDataDir(true, datadir, sizeof(datadir));
         readable = block_index_have_data_readable(bi, datadir);
@@ -137,7 +137,7 @@ static bool active_target_missing_data(struct main_state *ms, int target,
     zcl_mutex_lock(&ms->cs_main);
     struct block_index *bi = active_target_index_locked(ms, target);
     if (bi) {
-        missing = (bi->nStatus & BLOCK_HAVE_DATA) == 0;
+        missing = (block_index_status_load(bi) & BLOCK_HAVE_DATA) == 0;
         if (missing && out_hash)
             *out_hash = *bi->phashBlock;
     }
