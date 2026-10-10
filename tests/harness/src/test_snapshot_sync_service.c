@@ -1724,6 +1724,72 @@ static int test_snapshot_sync_stall_rejects_replaced_serving_peer(void)
     return failures;
 }
 
+static bool snapshot_stall_failed_reset_keeps_sync_contained(void)
+{
+    struct snapshot_reset_fixture f;
+    bool trigger_created = false;
+    bool result = false;
+
+    memset(&f, 0, sizeof(f));
+    if (!snapshot_reset_fixture_open(&f))
+        goto cleanup;
+    snapsync_init(&f.svc, &f.ndb);
+    f.runtime.snapshot_sync = &f.svc;
+    f.svc.state = SNAPSYNC_NEGOTIATING;
+    f.svc.serving_peer_id = 91;
+    if (!snapsync_begin_receive(&f.svc).ok)
+        goto cleanup;
+    build_snapshot_chunk(&f.chunk);
+    if (snapsync_apply_chunk(&f.svc, f.chunk.data, f.chunk.size) != 1 ||
+        !db_service_commit_write(&f.dbsvc))
+        goto cleanup;
+    if (!db_service_exec_write(
+            &f.dbsvc,
+            "CREATE TRIGGER snapsync_test_stall_reject_discard "
+            "BEFORE DELETE ON snapshot_staging_utxos "
+            "BEGIN SELECT RAISE(ABORT, 'injected discard failure'); END"))
+        goto cleanup;
+    trigger_created = true;
+    /* Persist the trigger before reopening the receive transaction. Reset
+     * rolls that transaction back first; an uncommitted trigger would vanish
+     * with it and fail to exercise the staging-discard failure path. */
+    if (!db_service_begin_write(&f.dbsvc))
+        goto cleanup;
+    snapsync_service_lock_internal();
+    f.svc.last_progress_time_us = snapsync_now_us_internal() -
+        (int64_t)SNAPSYNC_STALL_TIMEOUT_SECS * 1000000LL - 1;
+    f.svc.last_progress_utxos = f.svc.received_utxos;
+    snapsync_service_unlock_internal();
+
+    result = snapsync_check_stall() &&
+        f.svc.state == SNAPSYNC_FAILED &&
+        sync_get_state() == SYNC_SNAPSHOT_RECEIVE;
+
+cleanup:
+    if (trigger_created)
+        (void)db_service_exec_write(
+            &f.dbsvc, "DROP TRIGGER snapsync_test_stall_reject_discard");
+    if (f.svc.ndb)
+        snapsync_reset(&f.svc);
+    if (sync_get_state() == SYNC_SNAPSHOT_RECEIVE)
+        (void)sync_set_state(SYNC_HEADERS_DOWNLOAD,
+                             "snapshot stall test cleanup");
+    snapshot_reset_fixture_cleanup(&f);
+    return result;
+}
+
+static int test_snapshot_sync_stall_failed_reset_keeps_sync_contained(void)
+{
+    int failures = 0;
+
+    TEST("snapshot stall retains containment when reset cleanup fails") {
+        ASSERT(snapshot_stall_failed_reset_keeps_sync_contained());
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static bool snapshot_reset_blocks_concurrent_failed_reset(void)
 {
     struct snapshot_reset_fixture f;
@@ -2863,6 +2929,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_reset_drains_admitted_finalize();
     failures += test_snapshot_sync_end_rejects_replaced_serving_peer();
     failures += test_snapshot_sync_stall_rejects_replaced_serving_peer();
+    failures += test_snapshot_sync_stall_failed_reset_keeps_sync_contained();
     failures += test_snapshot_sync_reset_coalesces_concurrent_failure();
     failures += test_snapshot_sync_service_runtime_accessor();
     failures += test_snapshot_sync_service_db_service_chunk_contained();
