@@ -679,6 +679,35 @@ int t_gap_fill_wakes_connman_dispatch_contract(void)
     return failures;
 }
 
+int t_have_data_unreadable_uses_atomic_index_snapshots_contract(void)
+{
+    int failures = 0;
+    char *buf = NULL;
+    TEST("have-data-unreadable uses atomic block-index snapshots") {
+        char path[PATH_MAX];
+        ASSERT(repo_path(path, sizeof(path),
+                         "engine/conditions/src/have_data_unreadable.c") == 0);
+        ASSERT(read_entire_file(path, &buf) == 0);
+        /* This condition walks the map without cs_main while reducer stages
+         * publish these fields.  chain.h requires the acquire/load helpers
+         * for that exact cross-thread boundary. */
+        ASSERT(strstr(buf, "unsigned int status = block_index_status_load(p);")
+               != NULL);
+        ASSERT(strstr(buf,
+                      "atomic_store(&g_file_at_detect, block_index_file_load(p));")
+               != NULL);
+        ASSERT(strstr(buf,
+                      "atomic_store(&g_pos_at_detect, block_index_data_pos_load(p));")
+               != NULL);
+        ASSERT(strstr(buf, "p->nStatus") == NULL);
+        ASSERT(strstr(buf, "p->nFile") == NULL);
+        ASSERT(strstr(buf, "p->nDataPos") == NULL);
+        PASS();
+    } _test_next:;
+    free(buf);
+    return failures;
+}
+
 int t_msg_process_yields_to_send_phase_contract(void)
 {
     int failures = 0;

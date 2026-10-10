@@ -45,8 +45,9 @@ static struct block_index *target_index(struct main_state *ms, int target)
     size_t iter = 0;
     struct block_index *p = NULL;
     while (block_map_next(&ms->map_block_index, &iter, NULL, &p)) {
-        if (p && p->nHeight == target && (p->nStatus & BLOCK_HAVE_DATA) &&
-            !(p->nStatus & BLOCK_FAILED_MASK))
+        unsigned int status = block_index_status_load(p);
+        if (p && p->nHeight == target && (status & BLOCK_HAVE_DATA) &&
+            !(status & BLOCK_FAILED_MASK))
             return p;
     }
     return NULL;
@@ -150,8 +151,8 @@ static bool detect_have_data_unreadable(void)
         return false;
 
     atomic_store(&g_target_at_detect, target);
-    atomic_store(&g_file_at_detect, p->nFile);
-    atomic_store(&g_pos_at_detect, p->nDataPos);
+    atomic_store(&g_file_at_detect, block_index_file_load(p));
+    atomic_store(&g_pos_at_detect, block_index_data_pos_load(p));
     g_target_hash = *p->phashBlock;
     atomic_store(&g_target_from_note, from_note);
     if (from_note)
