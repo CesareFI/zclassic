@@ -556,19 +556,20 @@ static struct zcl_result queue_body_target(
                        "frontier body queue: no %s block at h=%d",
                        selector_name, target_height);
     }
-    if (target->nStatus & BLOCK_FAILED_ANY_MASK) {
+    unsigned int target_status = block_index_status_load(target);
+    if (target_status & BLOCK_FAILED_ANY_MASK) {
         zcl_mutex_unlock(&ms->cs_main);
         return ZCL_ERR(-4,
                        "frontier body queue: %s block failed h=%d status=%u",
                        selector_name, target_height,
-                       target->nStatus);
+                       target_status);
     }
     if (expected_hash && !uint256_eq(target->phashBlock, expected_hash)) {
         zcl_mutex_unlock(&ms->cs_main);
         return ZCL_ERR(-6, "frontier body queue: %s hash changed at h=%d",
                        selector_name, target_height);
     }
-    already_have_data = (target->nStatus & BLOCK_HAVE_DATA) != 0;
+    already_have_data = (target_status & BLOCK_HAVE_DATA) != 0;
     target_hash = *target->phashBlock;
     int served_tip = active_chain_height(&ms->chain_active);
     if (selector == BODY_QUEUE_BEST_HEADER_ANCESTOR)
