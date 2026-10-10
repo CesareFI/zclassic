@@ -254,3 +254,23 @@ void node_db_sync_get_job_status(struct node_db_sync_job_status *out)
     out->import_started_at = atomic_load(&g_import_started_at);
     out->import_last_progress_at = atomic_load(&g_import_last_progress_at);
 }
+
+#ifdef ZCL_TESTING
+void node_db_sync_test_set_job_status(const struct node_db_sync_job_status *in)
+{
+    struct node_db_sync_job_status empty = {0};
+    const struct node_db_sync_job_status *status = in ? in : &empty;
+
+    atomic_store(&g_catchup_active, status->catchup_active);
+    atomic_store(&g_catchup_height, status->catchup_height);
+    atomic_store(&g_catchup_target_height, status->catchup_target_height);
+    atomic_store(&g_catchup_started_at, status->catchup_started_at);
+    atomic_store(&g_catchup_last_progress_at,
+                 status->catchup_last_progress_at);
+    atomic_store(&g_import_active, status->import_active);
+    atomic_store(&g_import_rows_written, status->import_rows_written);
+    atomic_store(&g_import_started_at, status->import_started_at);
+    atomic_store(&g_import_last_progress_at,
+                 status->import_last_progress_at);
+}
+#endif

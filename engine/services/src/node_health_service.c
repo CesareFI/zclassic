@@ -58,6 +58,16 @@ static const int64_t HEALTH_RSS_WARNING_MB = 4096;
  * ~17 days; see node_health_resolve_network_tip in the header). */
 #define NODE_HEALTH_PLAUSIBLE_TIP_BAND 10000
 
+/* A job timestamp in the future relative to the civil clock cannot yield a
+ * meaningful elapsed duration. Keep zero for an absent timestamp, but expose
+ * a rollback as unknown so operators do not mistake it for fresh progress. */
+static int64_t health_wall_elapsed_seconds(int64_t now, int64_t then)
+{
+    if (then <= 0)
+        return 0;
+    return now >= then ? now - then : -1;
+}
+
 int64_t node_health_resolve_network_tip(int64_t raw_max, int peers_above_band,
                                         int64_t header_tip, bool modal_ready,
                                         int64_t modal_height, int modal_count)
@@ -482,28 +492,15 @@ void node_health_collect(struct node_health_snapshot *snapshot,
         snapshot->catchup_target_height = jobs.catchup_target_height;
         snapshot->import_active = jobs.import_active;
         snapshot->import_rows_written = jobs.import_rows_written;
-        if (jobs.catchup_started_at > 0) {
-            int64_t now = (int64_t)platform_time_wall_time_t();
-            if (now >= jobs.catchup_started_at)
-                snapshot->catchup_uptime_seconds = now - jobs.catchup_started_at;
-        }
-        if (jobs.catchup_last_progress_at > 0) {
-            int64_t now = (int64_t)platform_time_wall_time_t();
-            if (now >= jobs.catchup_last_progress_at)
-                snapshot->catchup_progress_age_seconds =
-                    now - jobs.catchup_last_progress_at;
-        }
-        if (jobs.import_started_at > 0) {
-            int64_t now = (int64_t)platform_time_wall_time_t();
-            if (now >= jobs.import_started_at)
-                snapshot->import_uptime_seconds = now - jobs.import_started_at;
-        }
-        if (jobs.import_last_progress_at > 0) {
-            int64_t now = (int64_t)platform_time_wall_time_t();
-            if (now >= jobs.import_last_progress_at)
-                snapshot->import_progress_age_seconds =
-                    now - jobs.import_last_progress_at;
-        }
+        int64_t now = (int64_t)platform_time_wall_time_t();
+        snapshot->catchup_uptime_seconds =
+            health_wall_elapsed_seconds(now, jobs.catchup_started_at);
+        snapshot->catchup_progress_age_seconds =
+            health_wall_elapsed_seconds(now, jobs.catchup_last_progress_at);
+        snapshot->import_uptime_seconds =
+            health_wall_elapsed_seconds(now, jobs.import_started_at);
+        snapshot->import_progress_age_seconds =
+            health_wall_elapsed_seconds(now, jobs.import_last_progress_at);
 
         struct error_ring *er = error_ring_global();
         const struct error_entry *last_err = error_ring_last(er);

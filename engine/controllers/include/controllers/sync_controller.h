@@ -94,6 +94,10 @@ bool node_db_sync_open_private_db_like(const struct node_db *src,
 void node_db_sync_catchup_test_reset_lane_stats(void);
 int node_db_sync_catchup_test_lane_calls(void);
 int node_db_sync_catchup_test_worker_lane_calls(void);
+/* Test-only snapshot of the atomic job-status producer. This permits health
+ * consumers to exercise clock boundaries without reaching into the private
+ * sync_controller implementation header. */
+void node_db_sync_test_set_job_status(const struct node_db_sync_job_status *in);
 #endif
 
 /* Global flag: set to true while rescanwitnesses is running.

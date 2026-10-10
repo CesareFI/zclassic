@@ -7,6 +7,7 @@
 #include "config/runtime.h"
 #include "coins/coins_view.h"
 #include "controllers/network_controller.h"
+#include "controllers/sync_controller.h"
 #include "net/connman.h"
 #include "net/net.h"
 #include "services/block_source_policy.h"
@@ -20,6 +21,7 @@
 #include "storage/progress_store.h"
 #include "event/event.h"
 #include "platform/os_proc.h"
+#include "platform/clock.h"
 #include "util/alerts.h"
 #include "util/mem_pressure.h"
 #include "validation/main_state.h"
@@ -27,7 +29,64 @@
 #include "util/safe_alloc.h"
 
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
+
+struct health_job_clock {
+    _Atomic int64_t wall_ms;
+};
+
+static int64_t health_job_clock_mono(void *self)
+{
+    (void)self;
+    return 1;
+}
+
+static int64_t health_job_clock_wall(void *self)
+{
+    struct health_job_clock *clock = self;
+    return atomic_load(&clock->wall_ms);
+}
+
+static void health_job_clock_set(struct health_job_clock *clock, int64_t unix_s)
+{
+    atomic_store(&clock->wall_ms, unix_s * 1000);
+}
+
+static int health_job_rollback_is_unknown(void)
+{
+    struct health_job_clock clock;
+    const clock_iface_t iface = {
+        .now_monotonic_ns = health_job_clock_mono,
+        .now_wall_ms = health_job_clock_wall,
+        .self = &clock,
+    };
+    const struct node_db_sync_job_status jobs = {
+        .catchup_active = true,
+        .catchup_started_at = 1000,
+        .catchup_last_progress_at = 1000,
+        .import_active = true,
+        .import_started_at = 1000,
+        .import_last_progress_at = 1000,
+    };
+    struct node_health_snapshot health;
+
+    atomic_init(&clock.wall_ms, 0);
+    health_job_clock_set(&clock, 999);
+    clock_set_default(&iface);
+    node_db_sync_test_set_job_status(&jobs);
+    node_health_collect(&health, NULL, NULL);
+    bool ok = health.catchup_active && health.import_active &&
+        health.catchup_uptime_seconds == -1 &&
+        health.catchup_progress_age_seconds == -1 &&
+        health.import_uptime_seconds == -1 &&
+        health.import_progress_age_seconds == -1;
+    node_db_sync_test_set_job_status(NULL);
+    clock_reset_default();
+    printf("node_health_service: active job ages are unknown after a "
+           "wall-clock rollback... %s\n", ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
 
 static bool health_test_init_main_tip(struct main_state *ms,
                                       struct block_index *tip,
@@ -1602,6 +1661,8 @@ int test_node_health_service(void)
         if (ok) printf("OK\n");
         else { printf("FAIL\n"); failures++; }
     }
+
+    failures += health_job_rollback_is_unknown();
 
     sync_set_state(SYNC_IDLE, "done");
     return failures;
