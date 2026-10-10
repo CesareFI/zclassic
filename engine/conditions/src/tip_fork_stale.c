@@ -221,7 +221,7 @@ static struct block_index *find_active_tip_child_with_data(
             continue;
         if (!same_index_hash(p->pprev, tip))
             continue; /* must be a direct child of the active tip */
-        if (!(p->nStatus & BLOCK_HAVE_DATA))
+        if (!(block_index_status_load(p) & BLOCK_HAVE_DATA))
             continue;
         if (block_has_any_failure(p))
             continue; /* already invalidated — nothing to heal */
@@ -291,7 +291,8 @@ static bool detect_tip_fork_stale(void)
      * simple sibling shape (same parent, different hash); deeper divergence
      * will be named by follow-up repair once the frontier rewinds. */
     struct block_index *bh_at_tip = block_index_get_ancestor(bh, (int)tip_h);
-    if ((tip->nStatus & BLOCK_HAVE_DATA) && !block_has_any_failure(tip) &&
+    if ((block_index_status_load(tip) & BLOCK_HAVE_DATA) &&
+        !block_has_any_failure(tip) &&
         bh_at_tip && !same_index_hash(bh_at_tip, tip) &&
         !block_has_any_failure(bh_at_tip) &&
         same_parent_hash(bh_at_tip, tip)) {
