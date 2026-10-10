@@ -19,6 +19,7 @@
 #include "util/safe_alloc.h"
 #include "util/sync.h"
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
@@ -299,12 +300,13 @@ void body_history_census_advance(struct body_history_census *c,
 {
     if (!c || lo < 0 || lo > hi)
         return;
-    c->passes++;
+    c->passes = body_history_counter_saturating_add(c->passes, 1);
     c->last_pass_lo = lo;
     c->last_pass_hi = hi;
     c->cursor = lo - 1;
     if (c->cursor < c->window_lo) {
-        c->sweeps_completed++;
+        c->sweeps_completed =
+            body_history_counter_saturating_add(c->sweeps_completed, 1);
         c->cursor = c->window_hi;
     }
     c->cursor_valid = true;
@@ -440,10 +442,14 @@ bool body_history_census_fold(struct body_history_census *c,
         i = j;
     }
 
-    c->heights_examined += (uint64_t)res.examined;
-    c->heights_have += (uint64_t)res.have;
-    c->heights_missing += (uint64_t)res.missing;
-    c->heights_indeterminate += (uint64_t)res.indeterminate;
+    c->heights_examined = body_history_counter_saturating_add(
+        c->heights_examined, (uint64_t)res.examined);
+    c->heights_have = body_history_counter_saturating_add(
+        c->heights_have, (uint64_t)res.have);
+    c->heights_missing = body_history_counter_saturating_add(
+        c->heights_missing, (uint64_t)res.missing);
+    c->heights_indeterminate = body_history_counter_saturating_add(
+        c->heights_indeterminate, (uint64_t)res.indeterminate);
 
     if (out)
         *out = res;
@@ -502,6 +508,16 @@ static void bh_global_init_once(void)
     (void)zcl_once_call(&g_bh_once, bh_global_init);
 }
 
+uint64_t body_history_counter_saturating_add(uint64_t value, uint64_t add)
+{
+    return add > UINT64_MAX - value ? UINT64_MAX : value + add;
+}
+
+static int64_t bh_counter_json_value(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
+
 void body_history_global_lock(void)
 {
     bh_global_init_once();
@@ -524,6 +540,15 @@ struct body_history_census *body_history_global_census(void)
 {
     bh_global_init_once();
     return &g_bh_census;
+}
+
+void body_history_global_note_enqueued(size_t added)
+{
+    bh_global_init_once();
+    body_history_global_lock();
+    g_bh_census.blocks_enqueued = body_history_counter_saturating_add(
+        g_bh_census.blocks_enqueued, (uint64_t)added);
+    body_history_global_unlock();
 }
 
 struct body_coverage_map *body_history_global_measured(void)
@@ -726,14 +751,19 @@ bool body_history_dump_state_json(struct json_value *out, const char *key)
     json_set_object(&census);
     json_push_kv_int(&census, "cursor", c.cursor_valid ? c.cursor : -1);
     json_push_kv_bool(&census, "cursor_valid", c.cursor_valid);
-    json_push_kv_int(&census, "passes", (int64_t)c.passes);
-    json_push_kv_int(&census, "sweeps_completed", (int64_t)c.sweeps_completed);
-    json_push_kv_int(&census, "heights_examined", (int64_t)c.heights_examined);
-    json_push_kv_int(&census, "heights_have", (int64_t)c.heights_have);
-    json_push_kv_int(&census, "heights_missing", (int64_t)c.heights_missing);
+    json_push_kv_int(&census, "passes", bh_counter_json_value(c.passes));
+    json_push_kv_int(&census, "sweeps_completed",
+                     bh_counter_json_value(c.sweeps_completed));
+    json_push_kv_int(&census, "heights_examined",
+                     bh_counter_json_value(c.heights_examined));
+    json_push_kv_int(&census, "heights_have",
+                     bh_counter_json_value(c.heights_have));
+    json_push_kv_int(&census, "heights_missing",
+                     bh_counter_json_value(c.heights_missing));
     json_push_kv_int(&census, "heights_indeterminate",
-                     (int64_t)c.heights_indeterminate);
-    json_push_kv_int(&census, "blocks_enqueued", (int64_t)c.blocks_enqueued);
+                     bh_counter_json_value(c.heights_indeterminate));
+    json_push_kv_int(&census, "blocks_enqueued",
+                     bh_counter_json_value(c.blocks_enqueued));
     json_push_kv_int(&census, "last_pass_lo", c.last_pass_lo);
     json_push_kv_int(&census, "last_pass_hi", c.last_pass_hi);
     json_push_kv_int(&census, "measured_ranges", measured_ranges);

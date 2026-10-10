@@ -248,6 +248,14 @@ struct body_history_census {
     int64_t last_pass_hi;
 };
 
+/* Lifetime census accounting is observational, but it also bounds the boot
+ * catch-up loop. Saturate rather than wrapping back to apparent zero work. */
+uint64_t body_history_counter_saturating_add(uint64_t value, uint64_t add);
+
+/* Record bodies accepted by the history download lane. Keeping this update
+ * here makes the counter's saturation and locking policy single-owner. */
+void body_history_global_note_enqueued(size_t added);
+
 struct body_history_pass_result {
     int64_t lo;
     int64_t hi;
