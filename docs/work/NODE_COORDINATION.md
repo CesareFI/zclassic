@@ -2907,3 +2907,72 @@ validation, serialization, PoW, monetary rules, and cryptography are
 unchanged. Worldstream `d9f5153be` remains complementary storage/restart
 work. Remaining risk: an actual time-to-tip measurement still requires an
 authorized isolated full peer with independently verified chain material.
+
+## Header retry recovery after backward wall-clock correction
+
+Baseline and risk: the production `msgprocessor` send loop records
+`last_getheaders_time` from wall time. Both ordinary and stalled-peer fallback
+retry predicates directly subtracted that stamp from the next wall-time sample.
+After a local backward clock correction, a future-dated stamp therefore
+suppressed header recovery until the clock caught up, potentially parking IBD
+for an arbitrarily long correction interval.
+
+Fix and after-result: the engine-owned header-sync planner now treats a
+backward wall-time interval as expired in both paths. The next successfully
+queued request replaces the stamp, after which ordinary cadence resumes. The
+change is bounded to volatile request scheduling; it does not alter header
+parsing, block download, validation, serialization, chain selection, PoW,
+monetary rules, or cryptography.
+
+Regression proof: the focused `test_header_sync` case models a stamp of 1000
+and a wall-time sample of 900 for both regular and stall-fallback paths. It
+also pins the exact ordinary IBD boundary (10 seconds remains not due), then
+records the replacement stamp and proves normal strict-after-interval cadence
+resumes. A one-shot, localhost-free C probe links the actual
+`engine/services/src/header_sync_service.c` predicates: against the pre-change
+`HEAD` source it aborts at the backward-clock assertion (exit 134), while the
+candidate passes under ASan and UBSan with leak detection. A separate extreme
+stamp run against the old source reports the original signed-overflow
+subtraction (`INT64_MAX - INT64_MIN`) and exits 1 under UBSan; the candidate's
+unsigned elapsed-duration comparison passes. The helper holds only unrelated
+peer/band/clock dependencies at their ordinary false values; it does not
+duplicate the production retry predicate.
+`make core-seal-check` passes: all 554 sealed files and all 80 section records
+match their pinned roots.
+`make check-consensus-parity` passes its selftests and finds no non-zclassicd
+consensus mechanism, future-height literal, or consensus-path wall-clock read.
+Strict C23 syntax checks for the changed production and fixture translation
+units and `git diff --check` pass. After confirming that no dashboard build
+process or open descriptor used its old output epochs, cleanup removed only
+the regenerable `bin` (1.2 GiB), `test-obj` (801 MiB), `dev-obj` (159 MiB), and
+`node-obj` (180 MiB) roots; the compact manifest is retained at
+`/tmp/z23-dashboard-build-cleanup-20261001.manifest`. This gave the candidate
+an actual 3 GiB margin above the 10 GiB reserve. The fresh exact-source
+`t-fast ONLY=header_sync` epoch occupied 361 MiB plus supporting outputs, and
+passed both registered groups (0/2 failed). The separate fresh ASan/UBSan
+epoch occupied 642 MiB plus a 384 MiB candidate binary; its completed outputs
+briefly left 9.55 GiB free. No further build was started: those two regenerable
+output roots were removed and free space was restored to 10.55 GiB
+(595,005,440 bytes above reserve). The retained sanitizer epoch has no durable
+transcript or build-session, so its registered ASan/UBSan verdict is **unverified**
+for handover and is not counted as a completed gate. The compact cleanup
+manifest records the exact paths. The fast registered-suite result and the
+small probe remain distinct evidence. The complexity check confirms this slice
+did not grow its pinned test function; its sole remaining failure is the
+unrelated, pre-existing `test_bench_fresh_sync_fixture.c:bench_peer_fixture_start`
+cap violation.
+
+Artifact-reuse audit: before the cleanup no source-identity-compatible
+registered-test epoch was available. The only other worktree at this commit
+had no test candidate, while retained dashboard epochs belonged to a different
+commit with unrelated pending work, so the epoch protocol correctly rejected
+reuse. Both candidate epochs above were rebuilt locally from the exact dirty
+source closure.
+
+Consensus impact: NONE. The latest available Worldstream reference
+`8e5e0a6a0` is a coordination-only bounded-IBD-sampler timeout record; this
+engine planner change has no overlapping source surface. Kimi
+coverage-manifest work and wallet surfaces are untouched. Remaining risk: run
+the broader suite once separate capacity is available. Recommended next
+investigation: measure header retry recovery across a real isolated peer
+restart without changing validation.
