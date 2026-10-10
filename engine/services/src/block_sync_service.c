@@ -520,18 +520,19 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
             if (!px) continue;
             int dh = px->nHeight - our_h;
             if (dh < 1) continue;
+            if (dh > 512) continue;
+            unsigned int status = block_index_status_load(px);
             if (dh <= STALL_PROBE_WINDOW) {
                 if (dh == 1) {
                     recovery->entries_at_next++;
-                    if (px->nStatus & BLOCK_FAILED_MASK) recovery->entries_failed++;
-                    if (px->nStatus & BLOCK_HAVE_DATA) recovery->entries_with_data++;
+                    if (status & BLOCK_FAILED_MASK) recovery->entries_failed++;
+                    if (status & BLOCK_HAVE_DATA) recovery->entries_with_data++;
                 }
-                if (px->nStatus & BLOCK_HAVE_DATA)
+                if (status & BLOCK_HAVE_DATA)
                     have_data_at[dh - 1] = true;
             }
-            if (tip && dh <= 512 &&
-                !(px->nStatus & BLOCK_FAILED_MASK) &&
-                !(px->nStatus & BLOCK_HAVE_DATA) &&
+            if (tip && !(status & BLOCK_FAILED_MASK) &&
+                !(status & BLOCK_HAVE_DATA) &&
                 px->phashBlock) {
                 /* Keep each possible first-gap fallback independently;
                  * data later in the map can move that gap forward. */
