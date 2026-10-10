@@ -30,6 +30,7 @@
 #include "base/result.h"
 #include "core/serialize.h"
 #include "core/uint256.h"
+#include "platform/positioned_file.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -71,10 +72,10 @@ struct beta6_bs_file {
     char path[BETA6_BS_MAX_PATH_LEN];
     uint64_t size;
     struct uint256 sha256;
-    /* Handle-bound mtime captured when the manifest was built. A chunk read
-     * refuses when the file's size or mtime moved since (bootstrap.cpp:4362-
-     * 4372). Not serialized. */
-    int64_t mtime_seconds;
+    /* Handle-bound identity captured when the manifest was built. A chunk
+     * read refuses when its size, timestamp precision, or opened file
+     * identity moved since then. This is local serve state, never wire data. */
+    struct platform_positioned_file_snapshot snapshot;
 };
 
 /* CBootstrapSnapshotManifest (protocol.h:205-289). v1 is the compiled-anchor

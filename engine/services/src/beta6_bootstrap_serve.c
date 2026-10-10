@@ -328,7 +328,8 @@ static struct zcl_result open_verified(const char *root,
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "could not stat beta6 bootstrap snapshot file: %s", file->path);
     }
-    if (size != file->size || stamp.modified_seconds != file->mtime_seconds) {
+    if (size != file->size ||
+        !platform_positioned_file_snapshot_equal(&stamp, &file->snapshot)) {
         platform_positioned_file_close(out);
         return ZCL_ERR(BETA6_BS_ERR_REFUSED,
                        "beta6 bootstrap snapshot file changed after manifest "

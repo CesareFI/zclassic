@@ -65,7 +65,7 @@ static bool describe_param(const char *params_dir, size_t index,
     memset(out, 0, sizeof(*out));
     snprintf(out->path, sizeof(out->path), "%s", k_param_specs[index].name);
     out->size = size;
-    out->mtime_seconds = stamp.modified_seconds;
+    out->snapshot = stamp;
     uint256_set_hex(&out->sha256, k_param_specs[index].sha256_hex);
     return true;
 }

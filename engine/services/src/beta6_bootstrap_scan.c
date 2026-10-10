@@ -129,7 +129,7 @@ static bool scan_record_file(struct beta6_scan *scan, const char *relative)
 
     snprintf(entry->path, sizeof(entry->path), "%s", relative);
     entry->size = size;
-    entry->mtime_seconds = stamp.modified_seconds;
+    entry->snapshot = stamp;
     scan->total_bytes += size;
     scan->count++;
     return true;

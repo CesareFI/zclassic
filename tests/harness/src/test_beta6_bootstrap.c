@@ -35,11 +35,13 @@
 #include "util/sync.h"
 
 #include <pthread.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* v1, network "main", height 2, snapshot_bytes 5, chunk 1 MiB, NO files.
  * hashBlock/hashAnchorSha256/hashAnchorSha3 carry 0x11/0x22/0x33 in their
@@ -768,6 +770,40 @@ int test_beta6_bootstrap(void)
         test_rm_rf(dir);
         PASS();
     }
+
+#if !defined(_WIN32)
+    TEST("serving refuses a same-size source rewrite with restored mtime") {
+        char dir[512];
+        char path[1024];
+        struct stat before;
+        struct timespec times[2];
+        unsigned char data[20];
+        struct beta6_bs_chunk_request request = {
+            .file_index = 0, .offset = 0, .length = 20,
+        };
+
+        test_make_tmpdir(dir, sizeof(dir), "beta6_bootstrap", "rewrite");
+        ASSERT(fixture_build(dir));
+        ASSERT(beta6_bs_arm(dir, "main").ok);
+        snprintf(path, sizeof(path), "%s/chainstate/000007.ldb", dir);
+        ASSERT(stat(path, &before) == 0);
+        ASSERT(fixture_write(dir, "chainstate/000007.ldb", 20));
+#if defined(__APPLE__)
+        times[0] = before.st_atimespec;
+        times[1] = before.st_mtimespec;
+#else
+        times[0] = before.st_atim;
+        times[1] = before.st_mtim;
+#endif
+        ASSERT(utimensat(AT_FDCWD, path, times, 0) == 0);
+        ASSERT(!beta6_bs_read_chunk(&request, data, sizeof(data)).ok);
+        beta6_bs_disarm();
+        test_rm_rf(dir);
+        PASS();
+    }
+#else
+    printf("beta6_bootstrap: SKIP same-size rewrite fixture (POSIX timestamps required)\n");
+#endif
 
     TEST("status snapshot owns no manifest storage across disarm") {
         char dir[512];
