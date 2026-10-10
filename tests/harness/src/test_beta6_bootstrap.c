@@ -1135,6 +1135,17 @@ int test_beta6_bootstrap(void)
         ASSERT(!stopped.ok);
         ASSERT_EQ(stopped.code, BETA6_BS_ERR_QUOTA_STOPPED);
 
+        /* Accounting is unsigned but must remain fail-closed: a later
+         * oversized sample cannot wrap an already capped bucket to zero. */
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(1, 0);
+        beta6_bs_quota_charge("v4/24:203.0.113", false, 0, UINT64_MAX);
+        ASSERT_EQ(beta6_bs_quota_check("v4/24:203.0.113", false, 0).code,
+                  BETA6_BS_ERR_QUOTA_STOPPED);
+        beta6_bs_quota_charge("v4/24:203.0.113", false, 0, 1);
+        ASSERT_EQ(beta6_bs_quota_check("v4/24:203.0.113", false, 0).code,
+                  BETA6_BS_ERR_QUOTA_STOPPED);
+
         /* A whitelisted peer and a zero cap both bypass the accounting. */
         ASSERT(beta6_bs_quota_check("v4/24:203.0.113", true, 0).ok);
         beta6_bs_quota_configure(0, 0);
