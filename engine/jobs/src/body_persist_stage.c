@@ -600,12 +600,18 @@ void body_persist_stage_set_reader(body_persist_reader_fn fn, void *user)
 
 uint64_t body_persist_stage_cursor(void)
 {
-    return g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_lock(&g_lock);
+    uint64_t cursor = g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return cursor;
 }
 
 int64_t body_persist_stage_step_us_ewma(void)
 {
-    return g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_lock(&g_lock);
+    int64_t ewma = g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return ewma;
 }
 
 uint64_t body_persist_stage_verified_total(void)
@@ -654,6 +660,10 @@ bool body_persist_dump_state_json(struct json_value *out, const char *key)
     int64_t now = platform_time_wall_unix();
     int64_t last = atomic_load(&g_last_step_unix);
 
+    /* Shutdown destroys g_stage under g_lock. Keep the pointer live for the
+     * entire snapshot instead of treating stage's lock-free field reads as a
+     * lifetime guarantee. */
+    pthread_mutex_lock(&g_lock);
     stage_dump_header(out, STAGE_NAME, g_stage);
     json_push_kv_int (out, "verified_total",
                       body_persist_json_counter(atomic_load(&g_verified_total)));
@@ -682,5 +692,6 @@ bool body_persist_dump_state_json(struct json_value *out, const char *key)
     stage_log_rows_emit(out, "body_persist_log", "log_rows");
     stage_dump_counters(out, g_stage);
     stage_dump_health(out, STAGE_NAME, g_stage);
+    pthread_mutex_unlock(&g_lock);
     return true;
 }

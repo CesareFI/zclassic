@@ -497,6 +497,16 @@ int test_body_persist_stage(void)
     printf("\n=== body_persist_stage tests ===\n");
     int failures = 0;
 
+    BP_CHECK("guard: status accessors are empty after shutdown",
+             body_persist_stage_cursor() == 0 &&
+             body_persist_stage_step_us_ewma() == 0);
+    {
+        struct json_value status;
+        json_init(&status);
+        BP_CHECK("guard: status snapshot is safe after shutdown",
+                 body_persist_dump_state_json(&status, NULL));
+        json_free(&status);
+    }
     failures += test_bp_hold_monotonic_boundary();
     blocker_module_init();
     failures += test_bp_rejects_detached_frontier();
