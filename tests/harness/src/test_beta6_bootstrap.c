@@ -35,6 +35,7 @@
 #include "util/sync.h"
 
 #include <pthread.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -1126,6 +1127,21 @@ int test_beta6_bootstrap(void)
         ASSERT(beta6_bs_quota_check("v4/24:198.51.100", false, 0).ok);
         ASSERT(beta6_bs_quota_check("v4/24:203.0.113", false,
                                     BETA6_BS_QUOTA_WINDOW_MS).ok);
+
+        /* A future-stamped bucket must remain capped after a backward clock
+         * correction rather than overflowing elapsed-time arithmetic. */
+        beta6_bs_quota_clear();
+        beta6_bs_quota_configure(1000, 0);
+        beta6_bs_quota_charge("v4/24:203.0.113", false, INT64_MAX, 1000);
+        struct zcl_result rollback = beta6_bs_quota_check(
+            "v4/24:203.0.113", false, INT64_MIN);
+        ASSERT(!rollback.ok);
+        ASSERT_EQ(rollback.code, BETA6_BS_ERR_QUOTA_STOPPED);
+        beta6_bs_quota_charge("v4/24:203.0.113", false, INT64_MIN, 1);
+        rollback = beta6_bs_quota_check("v4/24:203.0.113", false,
+                                        INT64_MIN);
+        ASSERT(!rollback.ok);
+        ASSERT_EQ(rollback.code, BETA6_BS_ERR_QUOTA_STOPPED);
 
         /* Throttle off means a hard stop instead of a slow trickle. */
         beta6_bs_quota_clear();
