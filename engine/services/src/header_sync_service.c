@@ -650,8 +650,9 @@ void syncsvc_collect_needed_blocks(struct sync_needed_blocks *result,
     walk = (struct block_index *)candidate;
     while (walk && walk->nHeight > our_height &&
            result->count < max_collect && walk_steps < 2048) {
-        if (!(walk->nStatus & BLOCK_HAVE_DATA) &&
-            !(walk->nStatus & BLOCK_FAILED_MASK) &&
+        unsigned int status = block_index_status_load(walk);
+        if (!(status & BLOCK_HAVE_DATA) &&
+            !(status & BLOCK_FAILED_MASK) &&
             walk->phashBlock) {
             hashes[result->count] = *walk->phashBlock;
             heights[result->count] = walk->nHeight;
