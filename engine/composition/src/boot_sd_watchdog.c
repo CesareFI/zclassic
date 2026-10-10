@@ -92,6 +92,15 @@ static _Atomic bool g_pet_handle_set = false;
 static pthread_t    g_pet_tid;
 static _Atomic bool g_notify_ready_sent = false;
 
+#ifdef ZCL_TESTING
+static _Atomic bool g_test_fail_next_pet_spawn = false;
+
+void boot_sd_watchdog_test_fail_next_pet_spawn(bool fail)
+{
+    atomic_store(&g_test_fail_next_pet_spawn, fail);
+}
+#endif
+
 /* Type=notify first-boot must not fire READY=1 on hostname-only onion
  * readiness, and must not treat "Tor requested but not running" as
  * "Tor was never asked for". Hold READY until DESCRIPTOR PUBLICATION
@@ -689,6 +698,27 @@ static void boot_sd_watchdog_tick(void *ctx)
     sd_notify_status(status);
 }
 
+static int boot_sd_watchdog_spawn_pet(void)
+{
+#ifdef ZCL_TESTING
+    if (atomic_exchange(&g_test_fail_next_pet_spawn, false))
+        return -1;
+#endif
+    return thread_registry_spawn("zcl_sd_watchdog_pet",
+                                 boot_sd_watchdog_pet_main, NULL,
+                                 &g_pet_tid);
+}
+
+static void boot_sd_watchdog_release_registration(void)
+{
+    if (g_sd_watchdog_id != HEALTH_INVALID_ID) {
+        health_unregister(g_sd_watchdog_id);
+        g_sd_watchdog_id = HEALTH_INVALID_ID;
+    }
+    sd_notify_set_health_check(NULL);
+    g_sd_watchdog_ctx = NULL;
+}
+
 /* Start the systemd watchdog heartbeat (runtime service kernel entry). */
 bool boot_sd_watchdog_start(void *ctx)
 {
@@ -755,12 +785,12 @@ bool boot_sd_watchdog_start(void *ctx)
      * it must not ride the health ring. */
     atomic_store(&g_pet_stop, false);
     // thread-supervision-ok:pets-systemd-from-atomics-only-a-supervised-child-could-be-starved-by-the-ring-contention-this-thread-exists-to-survive
-    if (thread_registry_spawn("zcl_sd_watchdog_pet",
-                              boot_sd_watchdog_pet_main, NULL,
-                              &g_pet_tid) != 0) {
+    if (boot_sd_watchdog_spawn_pet() != 0) {
         /* No pet thread = no heartbeat once boot progress goes quiet. Fail
-         * the service start: under WatchdogSec a silently un-petted unit is
-         * a kill loop waiting for the first long collect stall. */
+         * the service start. Release the periodic callback and its borrowed
+         * context too: optional service-kernel failures are not unwound. */
+        atomic_store(&g_pet_stop, true);
+        boot_sd_watchdog_release_registration();
         LOG_FAIL("sd_watchdog", "pet thread spawn failed");
         return false;
     }
@@ -779,12 +809,7 @@ void boot_sd_watchdog_stop(void *ctx)
         pthread_join(g_pet_tid, NULL);
         atomic_store(&g_pet_handle_set, false);
     }
-    if (g_sd_watchdog_id != HEALTH_INVALID_ID) {
-        health_unregister(g_sd_watchdog_id);
-        g_sd_watchdog_id = HEALTH_INVALID_ID;
-    }
     if (sd_notify_is_active())
         sd_notify_stopping("shutdown");
-    sd_notify_set_health_check(NULL);
-    g_sd_watchdog_ctx = NULL;
+    boot_sd_watchdog_release_registration();
 }

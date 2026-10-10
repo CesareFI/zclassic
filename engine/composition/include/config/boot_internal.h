@@ -470,6 +470,10 @@ void boot_bg_hash_verify_stop(void *ctx);
  * boot_register_runtime_services() (boot_services.c spec table). */
 bool boot_sd_watchdog_start(void *ctx);   /* arm WATCHDOG=1 heartbeat ring */
 void boot_sd_watchdog_stop(void *ctx);
+#ifdef ZCL_TESTING
+/* Force exactly the next dedicated pet-thread spawn to fail. */
+void boot_sd_watchdog_test_fail_next_pet_spawn(bool fail);
+#endif
 /* True when onion was requested (or is running) but DESCRIPTOR
  * PUBLICATION has not been observed — READY=1 must wait. */
 bool boot_sd_watchdog_onion_blocks_ready(void);

@@ -35,6 +35,7 @@
 #include "platform/time_compat.h"
 #include "util/sd_notify.h"
 #include "config/boot_internal.h"   /* boot_sd_watchdog_test_pet_decide */
+#include "health/heartbeat.h"
 #include "net/tor_integration.h"
 #include "util/thread_work_probe.h"
 
@@ -84,6 +85,43 @@ static int sdn_bind_path_socket(char *path_out, size_t path_out_len)
         return -1;
     }
     return fd;
+}
+
+static bool sdn_health_has_periodic(const char *name)
+{
+    struct health_snapshot snapshot[HEALTH_REGISTRY_CAP];
+    int n = health_snapshot_all(snapshot, HEALTH_REGISTRY_CAP);
+
+    for (int i = 0; i < n; i++) {
+        if (snapshot[i].periodic && strcmp(snapshot[i].name, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool sdn_pet_spawn_failure_releases_periodic(void)
+{
+    char path[108];
+    int fd = sdn_bind_path_socket(path, sizeof(path));
+    if (fd < 0)
+        return false;
+
+    setenv("NOTIFY_SOCKET", path, 1);
+    setenv("WATCHDOG_USEC", "8000000", 1);
+    sd_notify_reset_for_testing();
+    struct boot_svc_ctx svc = {0};
+    boot_sd_watchdog_test_fail_next_pet_spawn(true);
+    bool ok = !boot_sd_watchdog_start(&svc) &&
+              !sdn_health_has_periodic("sd_watchdog");
+    /* Cleanup also makes the parent implementation harmless after the
+     * caller has observed its leaked registration. */
+    boot_sd_watchdog_stop(&svc);
+    close(fd);
+    unlink(path);
+    unsetenv("NOTIFY_SOCKET");
+    unsetenv("WATCHDOG_USEC");
+    sd_notify_reset_for_testing();
+    return ok;
 }
 
 /* Bind a fresh non-blocking AF_UNIX datagram socket in the Linux
@@ -826,6 +864,11 @@ static int test_sd_notify_platform_arm(void)
             sd_notify_reset_for_testing();
         }
     }
+
+    /* An optional runtime-service start is not unwound by the service
+     * kernel. Its failure must not retain a periodic callback with svc. */
+    SDN_CHECK("pet-spawn failure releases periodic callback",
+              sdn_pet_spawn_failure_releases_periodic());
 
     /* ── The READY hold buys time only when a leg newly confirms ──
      * Holding READY extends TimeoutStartSec. Extending on every pet
