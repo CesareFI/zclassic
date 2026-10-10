@@ -20,6 +20,9 @@
 #include "vcs/zcode_dht_identity.h"
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +75,48 @@ static void an_ip(uint8_t ip[16], uint8_t last)
     memset(ip, 0, 16);
     ip[10] = 0xff; ip[11] = 0xff; /* IPv4-mapped */
     ip[12] = 10; ip[13] = 0; ip[14] = 0; ip[15] = last;
+}
+
+struct fetch_progress_race_ctx {
+    _Atomic bool start;
+    _Atomic bool done;
+};
+
+static void *write_fetch_progress(void *opaque)
+{
+    struct fetch_progress_race_ctx *ctx = opaque;
+    while (!atomic_load_explicit(&ctx->start, memory_order_acquire))
+        sched_yield();
+    for (uint32_t i = 0; i < 100000; i++)
+        state_offer_store_note_fetch_progress(i, 100000, i, 100000);
+    state_offer_store_note_fetch_progress(100000, 100000, 100000, 100000);
+    atomic_store_explicit(&ctx->done, true, memory_order_release);
+    return NULL;
+}
+
+static int fetch_progress_status_snapshot(void)
+{
+    int failures = 0;
+    TEST_CASE("fetch progress and status snapshot share synchronized state") {
+        struct fetch_progress_race_ctx ctx = {0};
+        struct state_offer_store_status status;
+        pthread_t worker;
+
+        atomic_init(&ctx.start, false);
+        atomic_init(&ctx.done, false);
+        state_offer_store_reset();
+        ASSERT_EQ(pthread_create(&worker, NULL, write_fetch_progress, &ctx), 0);
+        atomic_store_explicit(&ctx.start, true, memory_order_release);
+        while (!atomic_load_explicit(&ctx.done, memory_order_acquire))
+            state_offer_store_status_get(&status);
+        ASSERT_EQ(pthread_join(worker, NULL), 0);
+        state_offer_store_status_get(&status);
+        ASSERT_EQ(status.fetch_chunks_done, 100000u);
+        ASSERT_EQ(status.fetch_chunks_total, 100000u);
+        ASSERT_EQ(status.fetch_bytes_done, UINT64_C(100000));
+        ASSERT_EQ(status.fetch_bytes_total, UINT64_C(100000));
+    } TEST_END
+    return failures;
 }
 
 static int picks_newest_acceptable(void)
@@ -819,6 +864,7 @@ int test_state_offer_store(void)
     failures += catalog_bundles_prefix_resolves();
     failures += catalog_bare_basename_resolves();
     failures += missing_bundle_file_fails_closed_with_named_log();
+    failures += fetch_progress_status_snapshot();
     state_offer_store_reset();
     return failures;
 }

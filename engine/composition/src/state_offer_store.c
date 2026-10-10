@@ -11,6 +11,7 @@
 #include "json/json.h"
 #include "util/log_macros.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -46,6 +47,10 @@ static char g_fallback_reason[128];
 static enum state_offer_decision g_last_decision = STATE_OFFER_DECIDE_WAIT;
 static uint64_t g_fetch_bytes_done, g_fetch_bytes_total;
 static uint32_t g_fetch_chunks_done, g_fetch_chunks_total;
+/* The fetch worker updates progress while the HTTP status path snapshots this
+ * store. Keep every fixed-size row and counter behind one mutex so a status
+ * row cannot observe a partially updated offer or progress tuple. */
+static pthread_mutex_t g_store_lock = PTHREAD_MUTEX_INITIALIZER;
 
 const char *state_offer_store_result_string(enum state_offer_store_result r)
 {
@@ -74,6 +79,7 @@ const char *state_offer_decision_string(enum state_offer_decision d)
 
 void state_offer_store_reset(void)
 {
+    pthread_mutex_lock(&g_store_lock);
     memset(g_offers, 0, sizeof(g_offers));
     memset(g_offer_used, 0, sizeof(g_offer_used));
     memset(g_offer_fetching, 0, sizeof(g_offer_fetching));
@@ -91,24 +97,33 @@ void state_offer_store_reset(void)
     g_last_decision = STATE_OFFER_DECIDE_WAIT;
     g_fetch_bytes_done = g_fetch_bytes_total = 0;
     g_fetch_chunks_done = g_fetch_chunks_total = 0;
+    pthread_mutex_unlock(&g_store_lock);
 }
 
 void state_offer_store_note_first_peer(int64_t now_ms)
 {
-    if (g_wait_armed)
-        return; /* the window measures from the FIRST peer, not the last */
-    g_wait_armed = true;
-    g_wait_started_ms = now_ms;
-    LOG_INFO(SOS_SUBSYS,
-             "first peer connected — waiting up to %llds for a state offer "
-             "while headers keep flowing; a peer that offers nothing costs "
-             "this node nothing but the wait",
-             (long long)(STATE_OFFER_WAIT_MS / 1000));
+    bool armed = false;
+    pthread_mutex_lock(&g_store_lock);
+    if (!g_wait_armed) {
+        g_wait_armed = true;
+        g_wait_started_ms = now_ms;
+        armed = true;
+    }
+    pthread_mutex_unlock(&g_store_lock);
+    if (armed)
+        LOG_INFO(SOS_SUBSYS,
+                 "first peer connected — waiting up to %llds for a state "
+                 "offer while headers keep flowing; a peer that offers "
+                 "nothing costs this node nothing but the wait",
+                 (long long)(STATE_OFFER_WAIT_MS / 1000));
 }
 
 bool state_offer_store_wait_armed(void)
 {
-    return g_wait_armed;
+    pthread_mutex_lock(&g_store_lock);
+    bool armed = g_wait_armed;
+    pthread_mutex_unlock(&g_store_lock);
+    return armed;
 }
 
 static bool digest_eq(const uint8_t a[32], const uint8_t b[32])
@@ -116,7 +131,7 @@ static bool digest_eq(const uint8_t a[32], const uint8_t b[32])
     return memcmp(a, b, 32) == 0;
 }
 
-bool state_offer_store_digest_is_bad(const uint8_t content_digest[32])
+static bool digest_is_bad_locked(const uint8_t content_digest[32])
 {
     if (!content_digest)
         return false;
@@ -126,12 +141,25 @@ bool state_offer_store_digest_is_bad(const uint8_t content_digest[32])
     return false;
 }
 
+bool state_offer_store_digest_is_bad(const uint8_t content_digest[32])
+{
+    pthread_mutex_lock(&g_store_lock);
+    bool bad = digest_is_bad_locked(content_digest);
+    pthread_mutex_unlock(&g_store_lock);
+    return bad;
+}
+
 uint32_t state_offer_store_peer_strikes(int64_t peer_id)
 {
+    pthread_mutex_lock(&g_store_lock);
+    uint32_t strikes = 0;
     for (size_t i = 0; i < STATE_OFFER_STORE_BAD_MAX; i++)
-        if (g_strikes[i].used && g_strikes[i].peer_id == peer_id)
-            return g_strikes[i].strikes;
-    return 0;
+        if (g_strikes[i].used && g_strikes[i].peer_id == peer_id) {
+            strikes = g_strikes[i].strikes;
+            break;
+        }
+    pthread_mutex_unlock(&g_store_lock);
+    return strikes;
 }
 
 static void strike_peer(int64_t peer_id)
@@ -204,21 +232,10 @@ static size_t weakest_slot(void)
     return worst;
 }
 
-enum state_offer_store_result state_offer_store_record(
+static enum state_offer_store_result state_offer_store_record_locked(
     const struct state_offer_v1 *offer, const uint8_t peer_ip[16],
     uint16_t file_service_port, int64_t peer_id, int64_t now_ms)
 {
-    if (!offer || !peer_ip)
-        return STATE_OFFER_STORE_DROPPED_INVALID;
-    /* Re-checked here even though the net layer already checked: this module is
-     * reachable from a test and from a future caller, and a store that trusted
-     * its caller to have validated would be one refactor away from holding a
-     * row nobody checked. */
-    if (state_offer_v1_validate(offer) != STATE_OFFER_OK)
-        return STATE_OFFER_STORE_DROPPED_INVALID;
-    if (state_offer_v1_verify(offer) != STATE_OFFER_OK)
-        return STATE_OFFER_STORE_DROPPED_UNSIGNED;
-
     g_offers_seen++;
     if (offer->bundle_height > g_newest_height_seen)
         g_newest_height_seen = offer->bundle_height;
@@ -228,7 +245,7 @@ enum state_offer_store_result state_offer_store_record(
      * teaches us the newest height a peer has) and not retained for choice. */
     if (offer->kind != (uint16_t)ROM_ARTIFACT_CONSENSUS_BUNDLE)
         return STATE_OFFER_STORE_DROPPED_KIND;
-    if (state_offer_store_digest_is_bad(offer->content_digest))
+    if (digest_is_bad_locked(offer->content_digest))
         return STATE_OFFER_STORE_DROPPED_BAD;
     if (!endpoint_dialable(peer_ip, file_service_port))
         return STATE_OFFER_STORE_DROPPED_ENDPOINT;
@@ -262,11 +279,32 @@ enum state_offer_store_result state_offer_store_record(
     return STATE_OFFER_STORE_KEPT;
 }
 
-void state_offer_store_note_bad(const uint8_t content_digest[32],
-                                int64_t peer_id)
+enum state_offer_store_result state_offer_store_record(
+    const struct state_offer_v1 *offer, const uint8_t peer_ip[16],
+    uint16_t file_service_port, int64_t peer_id, int64_t now_ms)
+{
+    if (!offer || !peer_ip)
+        return STATE_OFFER_STORE_DROPPED_INVALID;
+    /* Re-checked here even though the net layer already checked: this module is
+     * reachable from a test and from a future caller, and a store that trusted
+     * its caller to have validated would be one refactor away from holding a
+     * row nobody checked. Keep signature work outside the status mutex. */
+    if (state_offer_v1_validate(offer) != STATE_OFFER_OK)
+        return STATE_OFFER_STORE_DROPPED_INVALID;
+    if (state_offer_v1_verify(offer) != STATE_OFFER_OK)
+        return STATE_OFFER_STORE_DROPPED_UNSIGNED;
+    pthread_mutex_lock(&g_store_lock);
+    enum state_offer_store_result result = state_offer_store_record_locked(
+        offer, peer_ip, file_service_port, peer_id, now_ms);
+    pthread_mutex_unlock(&g_store_lock);
+    return result;
+}
+
+static bool state_offer_store_note_bad_locked(const uint8_t content_digest[32],
+                                              int64_t peer_id)
 {
     if (!content_digest)
-        return;
+        return false;
     g_offers_rejected++;
     strike_peer(peer_id);
 
@@ -282,42 +320,58 @@ void state_offer_store_note_bad(const uint8_t content_digest[32],
     }
     for (size_t i = 0; i < STATE_OFFER_STORE_BAD_MAX; i++)
         if (g_bad[i].used && digest_eq(g_bad[i].digest, content_digest))
-            return;
+            return false;
     for (size_t i = 0; i < STATE_OFFER_STORE_BAD_MAX; i++)
         if (!g_bad[i].used) {
             g_bad[i].used = true;
             memcpy(g_bad[i].digest, content_digest, 32);
             g_bad[i].peer_id = peer_id;
-            LOG_WARN(SOS_SUBSYS,
-                     "offered bundle failed verification — digest refused for "
-                     "the rest of this run, peer %lld struck, no address ban "
-                     "(one shared loopback source fronts every onion peer); "
-                     "trying the next offer",
-                     (long long)peer_id);
-            return;
+            return true;
         }
     /* Full: the newest refusal replaces the oldest. Forgetting a digest costs
      * at most one repeated bounded fetch that fails the same way. */
     memcpy(g_bad[0].digest, content_digest, 32);
     g_bad[0].peer_id = peer_id;
+    return false;
+}
+
+void state_offer_store_note_bad(const uint8_t content_digest[32],
+                                int64_t peer_id)
+{
+    pthread_mutex_lock(&g_store_lock);
+    bool named = state_offer_store_note_bad_locked(content_digest, peer_id);
+    pthread_mutex_unlock(&g_store_lock);
+    if (named)
+        LOG_WARN(SOS_SUBSYS,
+                 "offered bundle failed verification — digest refused for "
+                 "the rest of this run, peer %lld struck, no address ban "
+                 "(one shared loopback source fronts every onion peer); "
+                 "trying the next offer",
+                 (long long)peer_id);
 }
 
 void state_offer_store_note_fetching(const uint8_t content_digest[32])
 {
+    pthread_mutex_lock(&g_store_lock);
     if (!content_digest)
-        return;
+        goto done;
     size_t slot = find_by_digest(content_digest);
     if (slot < STATE_OFFER_STORE_MAX)
         g_offer_fetching[slot] = true;
+done:
+    pthread_mutex_unlock(&g_store_lock);
 }
 
 int32_t state_offer_store_newest_height_seen(void)
 {
-    return g_newest_height_seen;
+    pthread_mutex_lock(&g_store_lock);
+    int32_t height = g_newest_height_seen;
+    pthread_mutex_unlock(&g_store_lock);
+    return height;
 }
 
-enum state_offer_decision state_offer_store_decide(
-    int64_t now_ms, struct state_offer_record *out)
+static enum state_offer_decision state_offer_store_decide_locked(
+    int64_t now_ms, struct state_offer_record *out, bool *fresh_fallback)
 {
     /* Newest first. Every retained offer already cleared the freshness rule
      * against its OWN offerer's tip at parse time, so "newest" here is a
@@ -365,11 +419,28 @@ enum state_offer_decision state_offer_store_decide(
             snprintf(g_fallback_reason, sizeof(g_fallback_reason),
                      "no peer offered any state within %llds of the first peer",
                      (long long)(STATE_OFFER_WAIT_MS / 1000));
-        LOG_WARN(SOS_SUBSYS, "%s — folding forward from local state",
-                 g_fallback_reason);
+        *fresh_fallback = true;
     }
     g_last_decision = STATE_OFFER_DECIDE_FALL_BACK;
     return STATE_OFFER_DECIDE_FALL_BACK;
+}
+
+enum state_offer_decision state_offer_store_decide(
+    int64_t now_ms, struct state_offer_record *out)
+{
+    char fallback_reason[sizeof(g_fallback_reason)] = {0};
+    bool fresh_fallback = false;
+    pthread_mutex_lock(&g_store_lock);
+    enum state_offer_decision decision =
+        state_offer_store_decide_locked(now_ms, out, &fresh_fallback);
+    if (fresh_fallback)
+        snprintf(fallback_reason, sizeof(fallback_reason), "%s",
+                 g_fallback_reason);
+    pthread_mutex_unlock(&g_store_lock);
+    if (fresh_fallback)
+        LOG_WARN(SOS_SUBSYS, "%s — folding forward from local state",
+                 fallback_reason);
+    return decision;
 }
 
 void state_offer_store_note_fetch_progress(uint32_t chunks_done,
@@ -377,16 +448,19 @@ void state_offer_store_note_fetch_progress(uint32_t chunks_done,
                                            uint64_t bytes_done,
                                            uint64_t bytes_total)
 {
+    pthread_mutex_lock(&g_store_lock);
     g_fetch_chunks_done = chunks_done;
     g_fetch_chunks_total = chunks_total;
     g_fetch_bytes_done = bytes_done;
     g_fetch_bytes_total = bytes_total;
+    pthread_mutex_unlock(&g_store_lock);
 }
 
 void state_offer_store_status_get(struct state_offer_store_status *out)
 {
     if (!out)
         return;
+    pthread_mutex_lock(&g_store_lock);
     memset(out, 0, sizeof(*out));
     out->wait_armed = g_wait_armed;
     out->wait_started_ms = g_wait_started_ms;
@@ -416,6 +490,7 @@ void state_offer_store_status_get(struct state_offer_store_status *out)
             seen_peers[npeers++] = g_offers[i].peer_id;
     }
     out->peers_offering = npeers;
+    pthread_mutex_unlock(&g_store_lock);
 }
 
 /* ── Introspection ──────────────────────────────────────────────────── */
