@@ -1181,6 +1181,15 @@ static int test_snapshot_sync_service_prepare_serve_step_bad_input(void)
         node.zsync_file_offset = 0;
         ASSERT(!snapsync_prepare_serve_step(&step, &node, buf,
                                             (int64_t)sizeof(buf)).ok);
+
+        /* Session offsets are signed; a stale/corrupt negative value must
+         * fail closed before it can index before the serving buffer. */
+        node.zsync_file_offset = -1;
+        {
+            struct zcl_result negative = snapsync_prepare_serve_step(
+                &step, &node, buf, (int64_t)sizeof(buf));
+            ASSERT(!negative.ok && negative.code == -2);
+        }
         PASS();
     } _test_next:;
 

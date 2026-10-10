@@ -194,50 +194,17 @@ enum snapsync_serve_result snapsync_validate_serve_request(
     return SNAPSYNC_SERVE_OK;
 }
 
-struct zcl_result snapsync_prepare_serve_step(struct snapsync_serve_step *step,
-                                              struct p2p_node *node,
-                                              const uint8_t *buf,
-                                              int64_t buf_size)
+static bool snapsync_serve_offset_is_negative(int64_t offset)
 {
-    int64_t pos;
-    int64_t scan;
-    uint32_t entries;
+    return offset < 0;
+}
+
+static bool snapsync_serve_entries_fit(const uint8_t *buf, int64_t buf_size,
+                                       int64_t scan, uint32_t entries,
+                                       int64_t *scan_out)
+{
     bool ok = true;
 
-    if (!step || !node || !buf || buf_size <= 0)
-        return ZCL_ERR(-1, "prepare_serve_step: invalid args step=%p node=%p "
-                       "buf=%p size=%lld", (void*)step, (void*)node,
-                       (void*)buf, (long long)buf_size);
-
-    memset(step, 0, sizeof(*step));
-    if (node->zsync_file_size == 0)
-        node->zsync_file_size = buf_size;
-    /* Allow up to 8MB of send buffer during snapshot serving.
-     * The previous 2MB limit caused stalls: the receiver's SQLite writes
-     * slow TCP drainage, the 2MB fills in ~50 chunks, and the sender's
-     * message loop moves on to other peers before returning to pump more.
-     * 8MB gives ~200 chunks of headroom. */
-    if (node->send_size > 8 * 1024 * 1024)
-        return ZCL_OK;  /* step->action == SNAPSYNC_SERVE_ACTION_NONE (backpressure) */
-
-    pos = node->zsync_file_offset;
-    if (pos >= buf_size) {
-        step->action = SNAPSYNC_SERVE_ACTION_SEND_END;
-        return ZCL_OK;
-    }
-
-    if (pos + 4 > buf_size)
-        return ZCL_ERR(-2, "prepare_serve_step: pos %lld + 4 > buf_size %lld",
-                       (long long)pos, (long long)buf_size);
-
-    entries = buf[pos] | ((uint32_t)buf[pos + 1] << 8) |
-              ((uint32_t)buf[pos + 2] << 16) |
-              ((uint32_t)buf[pos + 3] << 24);
-    if (entries == 0 || entries > 1000)
-        return ZCL_ERR(-3, "prepare_serve_step: bad entry count %u at pos %lld",
-                       entries, (long long)pos);
-
-    scan = pos + 4;
     for (uint32_t i = 0; i < entries && ok; i++) {
         uint64_t slen;
 
@@ -268,7 +235,57 @@ struct zcl_result snapsync_prepare_serve_step(struct snapsync_serve_step *step,
         scan += (int64_t)slen;
     }
 
-    if (!ok || scan > buf_size)
+    *scan_out = scan;
+    return ok && scan <= buf_size;
+}
+
+struct zcl_result snapsync_prepare_serve_step(struct snapsync_serve_step *step,
+                                              struct p2p_node *node,
+                                              const uint8_t *buf,
+                                              int64_t buf_size)
+{
+    int64_t pos;
+    int64_t scan;
+    uint32_t entries;
+
+    if (!step || !node || !buf || buf_size <= 0)
+        return ZCL_ERR(-1, "prepare_serve_step: invalid args step=%p node=%p "
+                       "buf=%p size=%lld", (void*)step, (void*)node,
+                       (void*)buf, (long long)buf_size);
+
+    memset(step, 0, sizeof(*step));
+    if (node->zsync_file_size == 0)
+        node->zsync_file_size = buf_size;
+    /* Allow up to 8MB of send buffer during snapshot serving.
+     * The previous 2MB limit caused stalls: the receiver's SQLite writes
+     * slow TCP drainage, the 2MB fills in ~50 chunks, and the sender's
+     * message loop moves on to other peers before returning to pump more.
+     * 8MB gives ~200 chunks of headroom. */
+    if (node->send_size > 8 * 1024 * 1024)
+        return ZCL_OK;  /* step->action == SNAPSYNC_SERVE_ACTION_NONE (backpressure) */
+
+    pos = node->zsync_file_offset;
+    if (snapsync_serve_offset_is_negative(pos))
+        return ZCL_ERR(-2, "prepare_serve_step: negative offset %lld",
+                       (long long)pos);
+    if (pos >= buf_size) {
+        step->action = SNAPSYNC_SERVE_ACTION_SEND_END;
+        return ZCL_OK;
+    }
+
+    if (pos + 4 > buf_size)
+        return ZCL_ERR(-2, "prepare_serve_step: pos %lld + 4 > buf_size %lld",
+                       (long long)pos, (long long)buf_size);
+
+    entries = buf[pos] | ((uint32_t)buf[pos + 1] << 8) |
+              ((uint32_t)buf[pos + 2] << 16) |
+              ((uint32_t)buf[pos + 3] << 24);
+    if (entries == 0 || entries > 1000)
+        return ZCL_ERR(-3, "prepare_serve_step: bad entry count %u at pos %lld",
+                       entries, (long long)pos);
+
+    scan = pos + 4;
+    if (!snapsync_serve_entries_fit(buf, buf_size, scan, entries, &scan))
         return ZCL_ERR(-4, "prepare_serve_step: scan overflow scan=%lld "
                        "buf_size=%lld entries=%u",
                        (long long)scan, (long long)buf_size, entries);
