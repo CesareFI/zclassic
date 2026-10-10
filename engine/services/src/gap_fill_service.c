@@ -44,6 +44,9 @@
 
 struct gap_fill_state {
     pthread_t              thread;
+    /* Serializes start publication with stop's no-op decision. The worker
+     * itself never takes this lock, so shutdown may still join it safely. */
+    pthread_mutex_t        lifecycle_mu;
     pthread_mutex_t        mu;
     pthread_cond_t         cv;
     _Atomic bool           running;
@@ -61,12 +64,26 @@ struct gap_fill_state {
 };
 
 static struct gap_fill_state g_gf = {
+    .lifecycle_mu = PTHREAD_MUTEX_INITIALIZER,
     .mu = PTHREAD_MUTEX_INITIALIZER,
     .cv = PTHREAD_COND_INITIALIZER,
     .supervisor_id = SUPERVISOR_INVALID_ID,
 };
 
 static struct liveness_contract g_gap_fill_contract;
+
+#ifdef ZCL_TESTING
+static gap_fill_test_lifecycle_hook_fn g_gap_fill_start_after_spawn;
+static gap_fill_test_lifecycle_hook_fn g_gap_fill_stop_before_lock;
+static gap_fill_test_lifecycle_hook_fn g_gap_fill_stop_after_lock;
+static void *g_gap_fill_lifecycle_hook_ctx;
+
+static void gap_fill_test_call_hook(gap_fill_test_lifecycle_hook_fn hook)
+{
+    if (hook)
+        hook(g_gap_fill_lifecycle_hook_ctx);
+}
+#endif
 
 static int64_t gap_fill_supervisor_deadline_secs(void)
 {
@@ -702,7 +719,15 @@ struct zcl_result gap_fill_start(struct main_state *ms, struct download_manager 
 {
     if (!ms || !dm)
         return ZCL_ERR(-1, "start: null ms or dm");
-    if (atomic_load(&g_gf.running)) return ZCL_OK;
+    pthread_mutex_lock(&g_gf.lifecycle_mu);
+    if (atomic_load(&g_gf.running)) {
+        pthread_mutex_unlock(&g_gf.lifecycle_mu);
+        return ZCL_OK;
+    }
+    /* Publish the lifecycle claim before spawning. A concurrent stop waits
+     * on lifecycle_mu until thread_started is also true, rather than seeing
+     * a false running flag and leaving this worker behind. */
+    atomic_store(&g_gf.running, true);
     g_gf.ms = ms;
     g_gf.dm = dm;
     memset(&g_gf.stats, 0, sizeof(g_gf.stats));
@@ -731,10 +756,14 @@ struct zcl_result gap_fill_start(struct main_state *ms, struct download_manager 
     atomic_store(&g_gf.stop_requested, false);
     if (thread_registry_spawn("zcl_gap_fill", gap_fill_thread_main, NULL,
                                   &g_gf.thread) != 0) {
+        atomic_store(&g_gf.running, false);
+        pthread_mutex_unlock(&g_gf.lifecycle_mu);
         return ZCL_ERR(-2, "thread_registry_spawn failed: errno=%d", errno);
     }
+#ifdef ZCL_TESTING
+    gap_fill_test_call_hook(g_gap_fill_start_after_spawn);
+#endif
     g_gf.thread_started = true;
-    atomic_store(&g_gf.running, true);
     struct zcl_result sup_r = gap_fill_register_supervisor();
     if (!sup_r.ok) {
         atomic_store(&g_gf.stop_requested, true);
@@ -744,14 +773,26 @@ struct zcl_result gap_fill_start(struct main_state *ms, struct download_manager 
         pthread_join(g_gf.thread, NULL);
         g_gf.thread_started = false;
         atomic_store(&g_gf.running, false);
+        pthread_mutex_unlock(&g_gf.lifecycle_mu);
         return sup_r;
     }
+    pthread_mutex_unlock(&g_gf.lifecycle_mu);
     return ZCL_OK;
 }
 
 void gap_fill_stop(void)
 {
-    if (!atomic_load(&g_gf.running)) return;
+#ifdef ZCL_TESTING
+    gap_fill_test_call_hook(g_gap_fill_stop_before_lock);
+#endif
+    pthread_mutex_lock(&g_gf.lifecycle_mu);
+#ifdef ZCL_TESTING
+    gap_fill_test_call_hook(g_gap_fill_stop_after_lock);
+#endif
+    if (!atomic_load(&g_gf.running)) {
+        pthread_mutex_unlock(&g_gf.lifecycle_mu);
+        return;
+    }
     supervisor_child_id id = atomic_load(&g_gf.supervisor_id);
     if (id != SUPERVISOR_INVALID_ID)
         supervisor_set_deadline(id, 0);
@@ -787,6 +828,7 @@ void gap_fill_stop(void)
     if (id != SUPERVISOR_INVALID_ID)
         supervisor_unregister(id);
 #endif
+    pthread_mutex_unlock(&g_gf.lifecycle_mu);
 }
 
 void gap_fill_kick(void)
@@ -822,6 +864,24 @@ bool gap_fill_test_kick_pending(void)
 void gap_fill_test_await_kick_or_tick(void)
 {
     gap_fill_await_kick_or_tick();
+}
+
+void gap_fill_test_set_lifecycle_hooks(
+    gap_fill_test_lifecycle_hook_fn start_after_spawn,
+    gap_fill_test_lifecycle_hook_fn stop_before_lock,
+    gap_fill_test_lifecycle_hook_fn stop_after_lock, void *ctx)
+{
+    pthread_mutex_lock(&g_gf.lifecycle_mu);
+    g_gap_fill_start_after_spawn = start_after_spawn;
+    g_gap_fill_stop_before_lock = stop_before_lock;
+    g_gap_fill_stop_after_lock = stop_after_lock;
+    g_gap_fill_lifecycle_hook_ctx = ctx;
+    pthread_mutex_unlock(&g_gf.lifecycle_mu);
+}
+
+bool gap_fill_test_is_running(void)
+{
+    return atomic_load(&g_gf.running);
 }
 #endif
 

@@ -145,6 +145,80 @@ static struct uint256 make_hash(uint8_t v)
 
 static _Atomic int g_gap_fill_dispatch_wakes;
 
+struct gap_fill_lifecycle_gate {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool start_after_spawn;
+    bool release_start;
+    bool stop_before_lock;
+    bool stop_after_lock;
+    bool stop_returned;
+};
+
+struct gap_fill_lifecycle_call {
+    struct main_state *ms;
+    struct download_manager *dm;
+    struct zcl_result result;
+    struct gap_fill_lifecycle_gate *gate;
+};
+
+static void gap_fill_lifecycle_start_hook(void *ctx)
+{
+    struct gap_fill_lifecycle_gate *gate = ctx;
+    pthread_mutex_lock(&gate->mu);
+    gate->start_after_spawn = true;
+    pthread_cond_broadcast(&gate->cv);
+    while (!gate->release_start)
+        pthread_cond_wait(&gate->cv, &gate->mu);
+    pthread_mutex_unlock(&gate->mu);
+}
+
+static void gap_fill_lifecycle_stop_before_hook(void *ctx)
+{
+    struct gap_fill_lifecycle_gate *gate = ctx;
+    pthread_mutex_lock(&gate->mu);
+    gate->stop_before_lock = true;
+    pthread_cond_broadcast(&gate->cv);
+    pthread_mutex_unlock(&gate->mu);
+}
+
+static void gap_fill_lifecycle_stop_after_hook(void *ctx)
+{
+    struct gap_fill_lifecycle_gate *gate = ctx;
+    pthread_mutex_lock(&gate->mu);
+    gate->stop_after_lock = true;
+    pthread_cond_broadcast(&gate->cv);
+    pthread_mutex_unlock(&gate->mu);
+}
+
+static void *gap_fill_lifecycle_start_thread(void *ctx)
+{
+    struct gap_fill_lifecycle_call *call = ctx;
+    call->result = gap_fill_start(call->ms, call->dm);
+    return NULL;
+}
+
+static void *gap_fill_lifecycle_stop_thread(void *ctx)
+{
+    struct gap_fill_lifecycle_call *call = ctx;
+    gap_fill_stop();
+    pthread_mutex_lock(&call->gate->mu);
+    call->gate->stop_returned = true;
+    pthread_cond_broadcast(&call->gate->cv);
+    pthread_mutex_unlock(&call->gate->mu);
+    return NULL;
+}
+
+static bool gap_fill_lifecycle_wait_for(struct gap_fill_lifecycle_gate *gate,
+                                        bool *flag)
+{
+    pthread_mutex_lock(&gate->mu);
+    while (!*flag)
+        pthread_cond_wait(&gate->cv, &gate->mu);
+    pthread_mutex_unlock(&gate->mu);
+    return true;
+}
+
 static void test_gap_fill_dispatch_wake(void *ctx)
 {
     (void)ctx;
@@ -1208,6 +1282,73 @@ static int test_gap_fill_kick_latch_skips_wait(void)
     return failures;
 }
 
+static int test_gap_fill_shutdown_serializes_start_publication(void)
+{
+    int failures = 0;
+    TEST("gap_fill shutdown waits for start publication") {
+        supervisor_reset_for_testing();
+        struct main_state ms;
+        struct download_manager dm;
+        struct gap_fill_lifecycle_gate gate = {
+            .mu = PTHREAD_MUTEX_INITIALIZER,
+            .cv = PTHREAD_COND_INITIALIZER,
+        };
+        struct gap_fill_lifecycle_call call = {
+            .ms = &ms,
+            .dm = &dm,
+            .gate = &gate,
+        };
+        pthread_t starter;
+        pthread_t stopper;
+        bool started = false;
+        bool stopped = false;
+
+        main_state_init(&ms);
+        dl_init(&dm);
+        gap_fill_test_set_lifecycle_hooks(gap_fill_lifecycle_start_hook,
+                                          gap_fill_lifecycle_stop_before_hook,
+                                          gap_fill_lifecycle_stop_after_hook,
+                                          &gate);
+        if (pthread_create(&starter, NULL, gap_fill_lifecycle_start_thread,
+                           &call) == 0) {
+            started = true;
+            (void)gap_fill_lifecycle_wait_for(&gate, &gate.start_after_spawn);
+            if (pthread_create(&stopper, NULL, gap_fill_lifecycle_stop_thread,
+                               &call) == 0) {
+                stopped = true;
+                (void)gap_fill_lifecycle_wait_for(&gate,
+                                                   &gate.stop_before_lock);
+                /* The start hook holds the production lifecycle lock. The
+                 * stop-after-lock hook is therefore reachable only after
+                 * start publishes the worker and releases that lock. In the
+                 * old ordering stop instead returns on running=false and
+                 * never calls this hook. */
+            }
+            pthread_mutex_lock(&gate.mu);
+            gate.release_start = true;
+            pthread_cond_broadcast(&gate.cv);
+            pthread_mutex_unlock(&gate.mu);
+        }
+        if (started)
+            pthread_join(starter, NULL);
+        if (stopped)
+            pthread_join(stopper, NULL);
+        if (started && gap_fill_test_is_running())
+            gap_fill_stop();
+
+        gap_fill_test_set_lifecycle_hooks(NULL, NULL, NULL, NULL);
+        bool ok = started && stopped && call.result.ok && gate.stop_after_lock &&
+                  gate.stop_returned && !gap_fill_test_is_running() &&
+                  supervisor_child_count_total() == 0;
+        dl_free(&dm);
+        main_state_free(&ms);
+        supervisor_reset_for_testing();
+        ASSERT(ok);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_gap_fill_queued_idle_wakes_dispatcher(void)
 {
     int failures = 0;
@@ -2021,6 +2162,7 @@ int test_download(void)
     failures += test_gap_fill_timeout_sweep();
     failures += test_gap_fill_timeout_wakes_dispatcher();
     failures += test_gap_fill_kick_latch_skips_wait();
+    failures += test_gap_fill_shutdown_serializes_start_publication();
     failures += test_gap_fill_queued_idle_wakes_dispatcher();
     failures += test_dl_many_insertions();
     failures += test_dl_ibd_windows();

@@ -143,6 +143,16 @@ void gap_fill_set_dispatch_wake(gap_fill_dispatch_wake_fn fn, void *ctx);
 void gap_fill_test_set_running(bool running);
 bool gap_fill_test_kick_pending(void);
 void gap_fill_test_await_kick_or_tick(void);
+
+/* Lifecycle interleaving seam. Hooks run while gap_fill_start holds its
+ * lifecycle lock: tests use them to prove that shutdown cannot treat a
+ * newly spawned worker as absent before its running state is published. */
+typedef void (*gap_fill_test_lifecycle_hook_fn)(void *ctx);
+void gap_fill_test_set_lifecycle_hooks(
+    gap_fill_test_lifecycle_hook_fn start_after_spawn,
+    gap_fill_test_lifecycle_hook_fn stop_before_lock,
+    gap_fill_test_lifecycle_hook_fn stop_after_lock, void *ctx);
+bool gap_fill_test_is_running(void);
 #endif
 
 #endif /* ZCL_GAP_FILL_SERVICE_H */
