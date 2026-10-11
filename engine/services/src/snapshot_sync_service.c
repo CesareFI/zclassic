@@ -61,12 +61,13 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <pthread.h>
 
 /* Global singleton */
 static struct snapshot_sync_service g_snapsync_instance;
-static bool g_snapsync_init_done = false;
+static _Atomic bool g_snapsync_init_done = false;
 static pthread_mutex_t g_snapsync_service_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_snapsync_chunk_writes_done = PTHREAD_COND_INITIALIZER;
 static size_t g_snapsync_chunk_writes = 0;
@@ -287,7 +288,19 @@ static bool snapsync_fail_observed_session(struct snapshot_sync_service *svc,
 }
 
 struct snapshot_sync_service *snapsync_global(void) { return &g_snapsync_instance; }
-bool snapsync_global_initialized(void) { return g_snapsync_init_done; }
+
+bool snapsync_global_initialized(void)
+{
+    return atomic_load_explicit(&g_snapsync_init_done, memory_order_acquire);
+}
+
+static void snapsync_init_locked(struct snapshot_sync_service *svc,
+                                 struct node_db *ndb)
+{
+    memset(svc, 0, sizeof(*svc));
+    svc->state = SNAPSYNC_IDLE;
+    svc->ndb = ndb;
+}
 
 struct snapshot_sync_service *snapsync_condition_service(void)
 {
@@ -302,9 +315,10 @@ struct snapshot_sync_service *snapsync_condition_service(void)
 void snapsync_global_ensure_init(struct node_db *ndb)
 {
     snapsync_service_lock_internal();
-    if (!g_snapsync_init_done) {
-        snapsync_init(&g_snapsync_instance, ndb);
-        g_snapsync_init_done = true;
+    if (!atomic_load_explicit(&g_snapsync_init_done, memory_order_relaxed)) {
+        snapsync_init_locked(&g_snapsync_instance, ndb);
+        atomic_store_explicit(&g_snapsync_init_done, true,
+                              memory_order_release);
     }
     snapsync_service_unlock_internal();
 }
@@ -418,9 +432,7 @@ void snapsync_init(struct snapshot_sync_service *svc, struct node_db *ndb)
     if (!svc)
         return;
     snapsync_service_lock_internal();
-    memset(svc, 0, sizeof(*svc));
-    svc->state = SNAPSYNC_IDLE;
-    svc->ndb = ndb;
+    snapsync_init_locked(svc, ndb);
     snapsync_service_unlock_internal();
 }
 
