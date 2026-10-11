@@ -58,6 +58,12 @@ struct end_thread_ctx {
     struct zcl_result result;
 };
 
+struct disconnect_thread_ctx {
+    struct snapshot_sync_service *svc;
+    uint32_t peer_id;
+    bool result;
+};
+
 struct stall_thread_ctx {
     bool result;
 };
@@ -136,6 +142,14 @@ static void *snapshot_end_thread(void *ctx)
     struct end_thread_ctx *thread = ctx;
 
     thread->result = snapsync_handle_end(thread->svc, thread->peer_id);
+    return NULL;
+}
+
+static void *snapshot_disconnect_thread(void *ctx)
+{
+    struct disconnect_thread_ctx *thread = ctx;
+
+    thread->result = snapsync_peer_disconnected(thread->svc, thread->peer_id);
     return NULL;
 }
 
@@ -564,6 +578,57 @@ static int test_snapshot_sync_service_peer_disconnect_ownership(void)
         ASSERT(snapsync_get_state() == SNAPSYNC_IDLE);
         ASSERT(sync_get_state() == SYNC_HEADERS_DOWNLOAD);
         ASSERT(sync_set_state(SYNC_IDLE, "disconnect ownership cleanup"));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_snapshot_disconnect_keeps_replacement_global_state(void)
+{
+    int failures = 0;
+
+    TEST("snapshot disconnect cannot overwrite replacement global state") {
+        struct snapshot_sync_service svc;
+        struct reset_gate gate;
+        struct disconnect_thread_ctx thread = { .svc = &svc, .peer_id = 91 };
+        pthread_t worker;
+
+        memset(&svc, 0, sizeof(svc));
+        memset(&gate, 0, sizeof(gate));
+        ASSERT(snapshot_reset_gate_init(&gate));
+        snapsync_init(&svc, NULL);
+        svc.state = SNAPSYNC_RECEIVING;
+        svc.serving_peer_id = thread.peer_id;
+        ASSERT(sync_set_state(SYNC_SNAPSHOT_RECEIVE, "disconnect race test"));
+        snapsync_test_set_headers_resume_gate(snapshot_reset_gate, &gate);
+        ASSERT(pthread_create(&worker, NULL, snapshot_disconnect_thread,
+                              &thread) == 0);
+        pthread_mutex_lock(&gate.mutex);
+        while (!gate.is_entered)
+            pthread_cond_wait(&gate.entered, &gate.mutex);
+        pthread_mutex_unlock(&gate.mutex);
+
+        snapsync_service_lock_internal();
+        svc.state = SNAPSYNC_NEGOTIATING;
+        svc.serving_peer_id = 92;
+        snapsync_service_unlock_internal();
+
+        pthread_mutex_lock(&gate.mutex);
+        gate.is_released = true;
+        pthread_cond_signal(&gate.release);
+        pthread_mutex_unlock(&gate.mutex);
+        ASSERT(pthread_join(worker, NULL) == 0);
+        ASSERT(thread.result);
+        ASSERT(svc.state == SNAPSYNC_NEGOTIATING);
+        ASSERT(svc.serving_peer_id == 92);
+        ASSERT(sync_get_state() == SYNC_SNAPSHOT_RECEIVE);
+
+        snapsync_test_set_headers_resume_gate(NULL, NULL);
+        ASSERT(sync_set_state(SYNC_IDLE, "disconnect race cleanup"));
+        pthread_cond_destroy(&gate.release);
+        pthread_cond_destroy(&gate.entered);
+        pthread_mutex_destroy(&gate.mutex);
         PASS();
     } _test_next:;
 
@@ -3213,6 +3278,7 @@ int test_snapshot_sync_service(void)
     }
     failures += test_snapshot_sync_service_followups();
     failures += test_snapshot_sync_service_peer_disconnect_ownership();
+    failures += test_snapshot_disconnect_keeps_replacement_global_state();
     failures += test_snapshot_offer_trust_policy();
     failures += test_boot_publish_block_swarm();
     failures += test_snapshot_offer_start_failure_retires_supervisor();

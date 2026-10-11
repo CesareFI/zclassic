@@ -90,6 +90,8 @@ static snapsync_reset_gate_fn g_snapsync_stall_action_gate = NULL;
 static void *g_snapsync_stall_action_gate_ctx = NULL;
 static snapsync_reset_gate_fn g_snapsync_offer_accepted_gate = NULL;
 static void *g_snapsync_offer_accepted_gate_ctx = NULL;
+static snapsync_reset_gate_fn g_snapsync_headers_resume_gate = NULL;
+static void *g_snapsync_headers_resume_gate_ctx = NULL;
 
 void snapsync_test_set_reset_gate(snapsync_reset_gate_fn fn, void *ctx)
 {
@@ -166,6 +168,28 @@ void snapsync_test_run_offer_accepted_gate(void)
     snapsync_service_lock_internal();
     gate = g_snapsync_offer_accepted_gate;
     ctx = g_snapsync_offer_accepted_gate_ctx;
+    snapsync_service_unlock_internal();
+    if (gate)
+        gate(ctx);
+}
+
+void snapsync_test_set_headers_resume_gate(snapsync_reset_gate_fn fn,
+                                           void *ctx)
+{
+    snapsync_service_lock_internal();
+    g_snapsync_headers_resume_gate = fn;
+    g_snapsync_headers_resume_gate_ctx = ctx;
+    snapsync_service_unlock_internal();
+}
+
+void snapsync_test_run_headers_resume_gate(void)
+{
+    snapsync_reset_gate_fn gate;
+    void *ctx;
+
+    snapsync_service_lock_internal();
+    gate = g_snapsync_headers_resume_gate;
+    ctx = g_snapsync_headers_resume_gate_ctx;
     snapsync_service_unlock_internal();
     if (gate)
         gate(ctx);
@@ -581,6 +605,24 @@ void snapsync_reset(struct snapshot_sync_service *svc)
     blocker_clear(SNAPSYNC_ACTIVATION_CONTAINED_BLOCKER_ID);
 }
 
+static bool snapsync_resume_headers_if_idle(struct snapshot_sync_service *svc,
+                                            const char *reason)
+{
+    bool idle = false;
+
+#ifdef ZCL_TESTING
+    snapsync_test_run_headers_resume_gate();
+#endif
+    snapsync_service_lock_internal();
+    if (svc && svc->state == SNAPSYNC_IDLE) {
+        idle = true;
+        (void)sync_try_transition(SYNC_SNAPSHOT_RECEIVE,
+                                  SYNC_HEADERS_DOWNLOAD, reason);
+    }
+    snapsync_service_unlock_internal();
+    return idle;
+}
+
 bool snapsync_peer_disconnected(struct snapshot_sync_service *svc,
                                 uint32_t peer_id)
 {
@@ -606,9 +648,8 @@ bool snapsync_peer_disconnected(struct snapshot_sync_service *svc,
     LOG_INFO("snapshot_sync", "serving peer %u disconnected; releasing "
              "snapshot session for another source", peer_id);
     snapsync_reset(svc);
-    if (sync_get_state() == SYNC_SNAPSHOT_RECEIVE)
-        sync_set_state(SYNC_HEADERS_DOWNLOAD,
-                       "snapshot serving peer disconnected");
+    (void)snapsync_resume_headers_if_idle(
+        svc, "snapshot serving peer disconnected");
     return true;
 }
 
@@ -855,13 +896,8 @@ bool snapsync_check_negotiation_stall(void)
                 (unsigned long long)st.offered_utxos);
     snapsync_blacklist_peer(svc, st.serving_peer_id);
     snapsync_reset(svc);
-    snapsync_service_lock_internal();
-    bool reset_idle = svc->state == SNAPSYNC_IDLE;
-    snapsync_service_unlock_internal();
-    if (reset_idle)
-        (void)sync_try_transition(SYNC_SNAPSHOT_RECEIVE,
-                                  SYNC_HEADERS_DOWNLOAD,
-                                  "snapshot negotiation stall reset");
+    (void)snapsync_resume_headers_if_idle(
+        svc, "snapshot negotiation stall reset");
     return true;
 }
 
@@ -893,18 +929,13 @@ bool snapsync_check_failed_reset(void)
                 (long long)st.staged_row_count);
     snapsync_blacklist_peer(svc, st.serving_peer_id);
     snapsync_reset(svc);
-    snapsync_service_lock_internal();
-    bool reset_idle = svc->state == SNAPSYNC_IDLE;
-    snapsync_service_unlock_internal();
-    if (!reset_idle) {
+    if (!snapsync_resume_headers_if_idle(svc, "snapshot failed reset")) {
         event_emitf(EV_SNAPSYNC_VERIFIED, st.serving_peer_id,
                     "snapshot=FAILED reason=reset_incomplete "
                     "fallback_to_headers=false blocker=%s",
                     SNAPSYNC_ACTIVATION_CONTAINED_BLOCKER_ID);
         return true;
     }
-    if (sync_get_state() == SYNC_SNAPSHOT_RECEIVE)
-        sync_set_state(SYNC_HEADERS_DOWNLOAD, "snapshot failed reset");
     return true;
 }
 
@@ -944,10 +975,7 @@ bool snapsync_check_stall(void)
     /* A successful reset already rolled back and discarded staging. If that
      * cleanup failed, it deliberately retained FAILED containment; do not
      * advertise an ordinary headers fallback over that failure. */
-    snapsync_service_lock_internal();
-    bool reset_idle = svc->state == SNAPSYNC_IDLE;
-    snapsync_service_unlock_internal();
-    if (!reset_idle) {
+    if (!snapsync_resume_headers_if_idle(svc, "snapshot stall reset")) {
         event_emitf(EV_SNAPSYNC_VERIFIED, stall.serving_peer_id,
                     "snapshot=FAILED reason=reset_incomplete "
                     "fallback_to_headers=false blocker=%s",
@@ -956,12 +984,6 @@ bool snapsync_check_stall(void)
     }
     event_emitf(EV_SNAPSYNC_VERIFIED, stall.serving_peer_id,
                 "snapshot=FAILED reason=stall staging_discarded=true");
-
-    /* Reset sync state so the node can accept a new snapshot offer.
-     * SYNC_SNAPSHOT_RECEIVE → SYNC_HEADERS_DOWNLOAD allows re-entry
-     * into the snapshot path when the next peer offers. */
-    if (sync_get_state() == SYNC_SNAPSHOT_RECEIVE)
-        sync_set_state(SYNC_HEADERS_DOWNLOAD, "snapshot stall reset");
 
     return true;
 }
