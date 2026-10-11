@@ -6,6 +6,7 @@
 #include "framework/condition.h"
 #include "net/snapshot_sync_contract.h"
 #include "platform/clock.h"
+#include "sync/sync_state.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -75,44 +76,59 @@ static void cleanup_sns(void)
     clock_reset_default();
 }
 
+static bool enter_stalled_negotiation_sync_state(void)
+{
+    if (sync_get_state() != SYNC_IDLE)
+        return false;
+    return sync_set_state(SYNC_SNAPSHOT_RECEIVE, "test stalled negotiation");
+}
+
+static void cleanup_negotiation_sync_state(void)
+{
+    if (sync_get_state() == SYNC_HEADERS_DOWNLOAD)
+        (void)sync_set_state(SYNC_IDLE, "test cleanup");
+}
+
+static bool stalled_negotiation_resets_and_resumes(void)
+{
+    struct snapshot_sync_service svc;
+    struct app_runtime_context runtime;
+    bool ok = true;
+
+    reset_sns(&svc, &runtime);
+    register_snapshot_negotiation_stalled();
+    svc.state = SNAPSYNC_NEGOTIATING;
+    svc.offered_height = 3000000;
+    svc.offered_count = 1350000;
+    svc.serving_peer_id = 11;
+    svc.start_time_us = snapsync_now_us_internal() -
+        ((int64_t)SNAPSYNC_NEGOTIATION_TIMEOUT_SECS + 1) * 1000000LL;
+    ok = ok && enter_stalled_negotiation_sync_state();
+
+    condition_engine_tick();
+    ok = ok && snapshot_negotiation_stalled_test_remedy_calls() == 1;
+    ok = ok && svc.state == SNAPSYNC_IDLE;
+    ok = ok && snapsync_is_peer_blacklisted(&svc, 11);
+    ok = ok && sync_get_state() == SYNC_HEADERS_DOWNLOAD;
+    ok = ok && condition_engine_get_active_count() == 1;
+    svc.state = SNAPSYNC_NEGOTIATING;
+    svc.serving_peer_id = 14;
+    svc.offered_height = 3000001;
+    svc.offered_count = 1350001;
+    condition_engine_tick();
+    ok = ok && condition_engine_get_active_count() == 0;
+    cleanup_negotiation_sync_state();
+    cleanup_sns();
+    return ok;
+}
+
 int test_snapshot_negotiation_stalled_condition(void)
 {
     printf("\n=== snapshot_negotiation_stalled condition tests ===\n");
     int failures = 0;
 
-    {
-        struct snapshot_sync_service svc;
-        struct app_runtime_context runtime;
-        reset_sns(&svc, &runtime);
-        bool ok = true;
-        register_snapshot_negotiation_stalled();
-
-        svc.state = SNAPSYNC_NEGOTIATING;
-        svc.offered_height = 3000000;
-        svc.offered_count = 1350000;
-        svc.serving_peer_id = 11;
-        svc.start_time_us =
-            snapsync_now_us_internal() -
-            ((int64_t)SNAPSYNC_NEGOTIATION_TIMEOUT_SECS + 1) * 1000000LL;
-
-        condition_engine_tick();
-        ok = ok && snapshot_negotiation_stalled_test_remedy_calls() == 1;
-        ok = ok && svc.state == SNAPSYNC_IDLE;
-        ok = ok && snapsync_is_peer_blacklisted(&svc, 11);
-        /* Honest witness (Law 7): the remedy reset + blacklisted the dead
-         * peer, but the symptom has not yet MOVED — no fresh negotiation is
-         * advancing, so the condition stays active (unwitnessed). The reset's
-         * real forward progress is that a DIFFERENT peer can now negotiate. */
-        ok = ok && condition_engine_get_active_count() == 1;
-        svc.state = SNAPSYNC_NEGOTIATING;
-        svc.serving_peer_id = 14;
-        svc.offered_height = 3000001;
-        svc.offered_count = 1350001;
-        condition_engine_tick();
-        ok = ok && condition_engine_get_active_count() == 0;
-        SNS_CHECK("stalled negotiation resets and blacklists peer", ok);
-        cleanup_sns();
-    }
+    SNS_CHECK("stalled negotiation resets, blacklists, and resumes headers",
+              stalled_negotiation_resets_and_resumes());
 
     {
         struct snapshot_sync_service svc;
