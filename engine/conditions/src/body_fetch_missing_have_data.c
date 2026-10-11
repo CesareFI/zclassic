@@ -184,7 +184,7 @@ static bool active_target_missing_data(struct main_state *ms, int target,
     zcl_mutex_lock(&ms->cs_main);
     struct block_index *bi = active_target_index_locked(ms, target);
     if (bi) {
-        missing = (bi->nStatus & BLOCK_HAVE_DATA) == 0;
+        missing = (block_index_status_load(bi) & BLOCK_HAVE_DATA) == 0;
         if (missing && out_hash)
             *out_hash = *bi->phashBlock;
     }
