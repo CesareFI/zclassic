@@ -499,6 +499,8 @@ int test_node_db_catchup_service(void)
         NDC_CHECK("every retry is named in the log",
                   capturedS && strstr(logS, firstS) != NULL &&
                   strstr(logS, lastS) != NULL);
+        NDC_CHECK("a real failed walk counts exactly one logical abort",
+                  node_db_catchup_lock_guard_test_abort_streak() == 1);
 
         /* (r2b) Regression guard: that plain fail-closed abort above must
          * pair its one catchup_active_begin() with exactly one finish.
@@ -533,6 +535,8 @@ int test_node_db_catchup_service(void)
             ? node_db_catchup_service_run(&ndbS, &ac, NULL, dirF) : -1;
         NDC_CHECK("a following real walk drains the rest of the work",
                   resS2 == FIX_N - 2);
+        NDC_CHECK("a successful real walk resets the abort streak",
+                  node_db_catchup_lock_guard_test_abort_streak() == 0);
         NDC_CHECK("catchup reports inactive after the following real walk",
                   !node_db_catchup_service_active());
         NDC_CHECK("the depth counter is still paired after a fresh begin",

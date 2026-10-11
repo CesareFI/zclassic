@@ -914,6 +914,11 @@ int node_db_catchup_service_run(struct node_db *ndb,
         return r;
     }
 
+    /* One logical pass = one outcome (the restart path above returns
+     * before this, so a restarted attempt never double-counts). Account
+     * before LOG_ERR returns from a failed pass. */
+    node_db_catchup_lock_guard_note_outcome(failed || !restore_ok);
+
     /* LOG_ERR (base/log_macros.h) logs AND `return -1;`s — this branch
      * never falls through to the unconditional catchup_active_finish()
      * at the bottom of this function, so the finish just above already
@@ -928,10 +933,6 @@ int node_db_catchup_service_run(struct node_db *ndb,
         LOG_ERR("sync", "catchup: aborting (failed=%d, restore_ok=%d, indexed=%d)",
                 failed, restore_ok, indexed);
     }
-
-    /* One logical pass = one outcome (the restart path above returns
-     * before this, so a restarted attempt never double-counts). */
-    node_db_catchup_lock_guard_note_outcome(failed || !restore_ok);
 
     int64_t elapsed = (int64_t)platform_time_wall_time_t() - t_start;
     printf("SQLite catchup %s: %d blocks in %llds (%d blk/s, tip=%d)\n",
