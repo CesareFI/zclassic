@@ -395,12 +395,18 @@ struct zcl_result snapsync_parse_fc_response(struct fc_response *resp,
 struct zcl_result snapsync_write_fc_challenge(const struct snapshot_sync_service *svc,
                                  struct byte_stream *s)
 {
+    struct fc_challenge challenge;
+
     if (!svc || !s)
         return ZCL_ERR(-1, "write_fc_challenge: svc=%p stream=%p", (void*)svc, (void*)s);
 
-    stream_write_bytes(s, svc->fc_challenge.seed, 32);
-    stream_write_u64_le(s, svc->fc_challenge.chain_length);
-    stream_write_bytes(s, svc->fc_challenge.mmb_root, 32);
+    snapsync_service_lock_internal();
+    memcpy(&challenge, &svc->fc_challenge, sizeof(challenge));
+    snapsync_service_unlock_internal();
+
+    stream_write_bytes(s, challenge.seed, 32);
+    stream_write_u64_le(s, challenge.chain_length);
+    stream_write_bytes(s, challenge.mmb_root, 32);
     return ZCL_OK;
 }
 
