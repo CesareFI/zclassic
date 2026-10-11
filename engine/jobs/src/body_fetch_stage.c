@@ -497,12 +497,18 @@ void body_fetch_stage_shutdown(void)
 
 uint64_t body_fetch_stage_cursor(void)
 {
-    return g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_lock(&g_lock);
+    uint64_t cursor = g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return cursor;
 }
 
 int64_t body_fetch_stage_step_us_ewma(void)
 {
-    return g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_lock(&g_lock);
+    int64_t ewma = g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return ewma;
 }
 
 uint64_t body_fetch_stage_observed_total(void)
@@ -520,6 +526,13 @@ void body_fetch_stage_test_set_observed_total(uint64_t value)
 {
     atomic_store(&g_observed_total, value);
 }
+
+void body_fetch_stage_test_install_stage(stage_t *stage)
+{
+    pthread_mutex_lock(&g_lock);
+    g_stage = stage;
+    pthread_mutex_unlock(&g_lock);
+}
 #endif
 
 static int64_t body_fetch_json_counter(uint64_t value)
@@ -534,6 +547,7 @@ bool body_fetch_stage_dump_state_json(struct json_value *out,
     if (!out) return false;
     json_set_object(out);
 
+    pthread_mutex_lock(&g_lock);
     stage_dump_header(out, STAGE_NAME, g_stage);
     json_push_kv_int (out, "observed_total",
                       body_fetch_json_counter(
@@ -574,5 +588,6 @@ bool body_fetch_stage_dump_state_json(struct json_value *out,
                          &g_idle_reason_total[BF_IDLE_BODY_MISSING])));
     stage_dump_counters(out, g_stage);
     stage_dump_health(out, STAGE_NAME, g_stage);
+    pthread_mutex_unlock(&g_lock);
     return true;
 }

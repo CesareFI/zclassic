@@ -948,8 +948,39 @@ static int test_body_fetch_cursor_conversion_bounds(void)
     return failures;
 }
 
+static int test_body_fetch_status_after_shutdown(void)
+{
+    int failures = 0;
+    TEST("body_fetch status is safe after shutdown") {
+        char dir[256]; struct main_state ms; struct synth_chain_bf sc;
+        ASSERT(bf_setup("status_after_shutdown", 2, dir, sizeof(dir), &ms,
+                        &sc) == 0);
+
+        body_fetch_stage_shutdown();
+        ASSERT(body_fetch_stage_cursor() == 0);
+        ASSERT(body_fetch_stage_step_us_ewma() == 0);
+
+        struct json_value v;
+        json_init(&v);
+        ASSERT(body_fetch_stage_dump_state_json(&v, NULL));
+        const struct json_value *initialised = json_get(&v, "initialised");
+        ASSERT(initialised && !json_get_bool(initialised));
+        json_free(&v);
+
+        validate_headers_stage_shutdown();
+        header_admit_stage_shutdown();
+        main_state_free(&ms);
+        synth_chain_bf_free(&sc);
+        progress_store_close();
+        test_cleanup_tmpdir(dir);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_body_fetch_stage(void)
 {
     return test_body_fetch_stage_platform_arm() +
-           test_body_fetch_cursor_conversion_bounds();
+           test_body_fetch_cursor_conversion_bounds() +
+           test_body_fetch_status_after_shutdown();
 }
