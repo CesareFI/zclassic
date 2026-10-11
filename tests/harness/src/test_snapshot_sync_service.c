@@ -47,6 +47,11 @@ struct reset_thread_ctx {
     struct snapshot_sync_service *svc;
 };
 
+struct begin_thread_ctx {
+    struct snapshot_sync_service *svc;
+    struct zcl_result result;
+};
+
 struct finalize_thread_ctx {
     struct snapshot_sync_service *svc;
     struct zcl_result result;
@@ -126,6 +131,14 @@ static void *snapshot_reset_thread(void *ctx)
     struct reset_thread_ctx *thread = ctx;
 
     snapsync_reset(thread->svc);
+    return NULL;
+}
+
+static void *snapshot_begin_thread(void *ctx)
+{
+    struct begin_thread_ctx *thread = ctx;
+
+    thread->result = snapsync_begin_receive(thread->svc);
     return NULL;
 }
 
@@ -1671,6 +1684,112 @@ cleanup:
     snapsync_test_set_chunk_drain_gate(NULL, NULL);
     snapshot_reset_fixture_cleanup(&f);
     return rejected && reset_ok;
+}
+
+static bool snapshot_reset_drains_admitted_begin_receive(void)
+{
+    struct snapshot_reset_fixture f;
+    struct reset_gate drain_gate;
+    struct begin_thread_ctx begin = {0};
+    pthread_t begin_thread;
+    bool begin_started = false;
+    bool drain_gate_initialized = false;
+    bool result = false;
+
+    memset(&f, 0, sizeof(f));
+    memset(&drain_gate, 0, sizeof(drain_gate));
+    if (!snapshot_reset_fixture_open(&f))
+        goto cleanup;
+    snapsync_init(&f.svc, &f.ndb);
+    f.svc.state = SNAPSYNC_NEGOTIATING;
+    if (!snapshot_reset_gate_init(&f.gate))
+        goto cleanup;
+    f.gate_initialized = true;
+    if (!snapshot_reset_gate_init(&drain_gate))
+        goto cleanup;
+    drain_gate_initialized = true;
+
+    /* Hold begin_receive after it admits the staging write.  reset must wait
+     * for that admitted write rather than publishing IDLE underneath it. */
+    snapsync_test_set_begin_write_gate(snapshot_reset_gate, &f.gate);
+    snapsync_test_set_chunk_drain_gate(snapshot_reset_gate, &drain_gate);
+    begin.svc = &f.svc;
+    if (pthread_create(&begin_thread, NULL, snapshot_begin_thread, &begin) != 0)
+        goto cleanup;
+    begin_started = true;
+    pthread_mutex_lock(&f.gate.mutex);
+    while (!f.gate.is_entered)
+        pthread_cond_wait(&f.gate.entered, &f.gate.mutex);
+    pthread_mutex_unlock(&f.gate.mutex);
+
+    f.thread_ctx.svc = &f.svc;
+    if (pthread_create(&f.thread, NULL, snapshot_reset_thread,
+                       &f.thread_ctx) != 0)
+        goto cleanup;
+    f.thread_started = true;
+
+    /* The reset drain gate proves reset has closed the session and observed
+     * the begin-write admission before the begin thread may continue. */
+    pthread_mutex_lock(&drain_gate.mutex);
+    while (!drain_gate.is_entered)
+        pthread_cond_wait(&drain_gate.entered, &drain_gate.mutex);
+    pthread_mutex_unlock(&drain_gate.mutex);
+
+    /* reset has changed the session to FAILED and is now waiting for the
+     * begin-write admission to close. Releasing begin must not leave a
+     * resurrected RECEIVING session after reset completes. */
+    pthread_mutex_lock(&f.gate.mutex);
+    f.gate.is_released = true;
+    pthread_cond_signal(&f.gate.release);
+    pthread_mutex_unlock(&f.gate.mutex);
+    pthread_join(begin_thread, NULL);
+    begin_started = false;
+    pthread_mutex_lock(&drain_gate.mutex);
+    drain_gate.is_released = true;
+    pthread_cond_signal(&drain_gate.release);
+    pthread_mutex_unlock(&drain_gate.mutex);
+    pthread_join(f.thread, NULL);
+    f.thread_started = false;
+    result = !begin.result.ok && f.svc.state == SNAPSYNC_IDLE &&
+        !f.svc.turbo_active && snapsync_staging_count_internal(&f.ndb) == 0;
+
+cleanup:
+    if (begin_started) {
+        pthread_mutex_lock(&f.gate.mutex);
+        f.gate.is_released = true;
+        pthread_cond_signal(&f.gate.release);
+        pthread_mutex_unlock(&f.gate.mutex);
+        pthread_join(begin_thread, NULL);
+    }
+    if (f.thread_started) {
+        pthread_mutex_lock(&drain_gate.mutex);
+        drain_gate.is_released = true;
+        pthread_cond_signal(&drain_gate.release);
+        pthread_mutex_unlock(&drain_gate.mutex);
+        pthread_join(f.thread, NULL);
+        f.thread_started = false;
+    }
+    snapsync_test_set_begin_write_gate(NULL, NULL);
+    snapsync_test_set_chunk_drain_gate(NULL, NULL);
+    if (drain_gate_initialized) {
+        pthread_cond_destroy(&drain_gate.release);
+        pthread_cond_destroy(&drain_gate.entered);
+        pthread_mutex_destroy(&drain_gate.mutex);
+    }
+    snapshot_reset_fixture_cleanup(&f);
+    return result;
+}
+
+static int test_snapshot_sync_reset_drains_admitted_begin_receive(void)
+{
+    int failures = 0;
+
+    TEST("snapshot reset drains admitted begin-receive staging setup") {
+        ASSERT(snapshot_reset_drains_admitted_begin_receive());
+        PASS();
+    } _test_next:;
+
+    return failures;
 }
 
 static int test_snapshot_sync_reset_drains_admitted_chunk(void)
@@ -3305,6 +3424,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_turbo_restore_failure_keeps_retry_latch();
     failures += test_snapshot_failed_status_marks_closed_staging_unknown();
     failures += test_snapshot_sync_reset_rejects_late_chunk();
+    failures += test_snapshot_sync_reset_drains_admitted_begin_receive();
     failures += test_snapshot_sync_reset_drains_admitted_chunk();
     failures += test_snapshot_sync_reset_drains_admitted_finalize();
     failures += test_snapshot_sync_end_rejects_replaced_serving_peer();

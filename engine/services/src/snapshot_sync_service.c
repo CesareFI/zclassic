@@ -72,6 +72,7 @@ static _Atomic bool g_snapsync_init_done = false;
 static pthread_mutex_t g_snapsync_service_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_snapsync_chunk_writes_done = PTHREAD_COND_INITIALIZER;
 static size_t g_snapsync_chunk_writes = 0;
+static size_t g_snapsync_begin_writes = 0;
 static size_t g_snapsync_finalize_writes = 0;
 /* The service lock protects the one process-wide snapshot service.  Reset
  * deliberately releases it while it drains the database lane, so retain an
@@ -84,6 +85,8 @@ static snapsync_reset_gate_fn g_snapsync_reset_gate = NULL;
 static void *g_snapsync_reset_gate_ctx = NULL;
 static snapsync_reset_gate_fn g_snapsync_chunk_drain_gate = NULL;
 static void *g_snapsync_chunk_drain_gate_ctx = NULL;
+static snapsync_reset_gate_fn g_snapsync_begin_write_gate = NULL;
+static void *g_snapsync_begin_write_gate_ctx = NULL;
 static snapsync_reset_gate_fn g_snapsync_finalize_admit_gate = NULL;
 static void *g_snapsync_finalize_admit_gate_ctx = NULL;
 static snapsync_reset_gate_fn g_snapsync_stall_action_gate = NULL;
@@ -120,6 +123,27 @@ void snapsync_test_set_chunk_drain_gate(snapsync_reset_gate_fn fn, void *ctx)
     g_snapsync_chunk_drain_gate = fn;
     g_snapsync_chunk_drain_gate_ctx = ctx;
     snapsync_service_unlock_internal();
+}
+
+void snapsync_test_set_begin_write_gate(snapsync_reset_gate_fn fn, void *ctx)
+{
+    snapsync_service_lock_internal();
+    g_snapsync_begin_write_gate = fn;
+    g_snapsync_begin_write_gate_ctx = ctx;
+    snapsync_service_unlock_internal();
+}
+
+void snapsync_test_run_begin_write_gate(void)
+{
+    snapsync_reset_gate_fn gate;
+    void *ctx;
+
+    snapsync_service_lock_internal();
+    gate = g_snapsync_begin_write_gate;
+    ctx = g_snapsync_begin_write_gate_ctx;
+    snapsync_service_unlock_internal();
+    if (gate)
+        gate(ctx);
 }
 
 void snapsync_test_set_finalize_admit_gate(snapsync_reset_gate_fn fn, void *ctx)
@@ -236,12 +260,43 @@ bool snapsync_chunk_write_admit_internal(struct snapshot_sync_service *svc)
     return admitted;
 }
 
+bool snapsync_begin_write_admit_internal(struct snapshot_sync_service *svc)
+{
+    bool admitted = false;
+
+    snapsync_service_lock_internal();
+    if (svc && svc->state == SNAPSYNC_NEGOTIATING && svc->ndb &&
+        svc->ndb->open && !g_snapsync_resetting) {
+        g_snapsync_begin_writes++;
+        admitted = true;
+    }
+    snapsync_service_unlock_internal();
+
+#ifdef ZCL_TESTING
+    if (admitted)
+        snapsync_test_run_begin_write_gate();
+#endif
+    return admitted;
+}
+
+void snapsync_begin_write_finish_internal(void)
+{
+    snapsync_service_lock_internal();
+    if (g_snapsync_begin_writes > 0)
+        g_snapsync_begin_writes--;
+    if (g_snapsync_begin_writes == 0 && g_snapsync_chunk_writes == 0 &&
+        g_snapsync_finalize_writes == 0)
+        pthread_cond_broadcast(&g_snapsync_chunk_writes_done);
+    snapsync_service_unlock_internal();
+}
+
 void snapsync_chunk_write_finish_internal(void)
 {
     snapsync_service_lock_internal();
     if (g_snapsync_chunk_writes > 0)
         g_snapsync_chunk_writes--;
-    if (g_snapsync_chunk_writes == 0 && g_snapsync_finalize_writes == 0)
+    if (g_snapsync_begin_writes == 0 && g_snapsync_chunk_writes == 0 &&
+        g_snapsync_finalize_writes == 0)
         pthread_cond_broadcast(&g_snapsync_chunk_writes_done);
     snapsync_service_unlock_internal();
 }
@@ -298,7 +353,8 @@ void snapsync_finalize_write_finish_internal(void)
     snapsync_service_lock_internal();
     if (g_snapsync_finalize_writes > 0)
         g_snapsync_finalize_writes--;
-    if (g_snapsync_chunk_writes == 0 && g_snapsync_finalize_writes == 0)
+    if (g_snapsync_begin_writes == 0 && g_snapsync_chunk_writes == 0 &&
+        g_snapsync_finalize_writes == 0)
         pthread_cond_broadcast(&g_snapsync_chunk_writes_done);
     snapsync_service_unlock_internal();
 }
@@ -309,7 +365,8 @@ void snapsync_finalize_write_finish_internal(void)
 static void snapsync_wait_for_writes_locked(void)
 {
 #ifdef ZCL_TESTING
-    if (g_snapsync_chunk_writes != 0 || g_snapsync_finalize_writes != 0) {
+    if (g_snapsync_begin_writes != 0 || g_snapsync_chunk_writes != 0 ||
+        g_snapsync_finalize_writes != 0) {
         snapsync_reset_gate_fn gate = g_snapsync_chunk_drain_gate;
         void *ctx = g_snapsync_chunk_drain_gate_ctx;
 
@@ -319,7 +376,8 @@ static void snapsync_wait_for_writes_locked(void)
         snapsync_service_lock_internal();
     }
 #endif
-    while (g_snapsync_chunk_writes != 0 || g_snapsync_finalize_writes != 0)
+    while (g_snapsync_begin_writes != 0 || g_snapsync_chunk_writes != 0 ||
+           g_snapsync_finalize_writes != 0)
         pthread_cond_wait(&g_snapsync_chunk_writes_done,
                           &g_snapsync_service_lock);
 }

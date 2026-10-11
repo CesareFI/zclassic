@@ -65,6 +65,11 @@ void snapsync_service_lock_internal(void);
 void snapsync_service_unlock_internal(void);
 bool snapsync_chunk_write_admit_internal(struct snapshot_sync_service *svc);
 void snapsync_chunk_write_finish_internal(void);
+/* Begin-receive opens and prepares the staging transaction outside the
+ * service lock.  It must remain admitted until it publishes RECEIVING or
+ * unwinds, so reset cannot discard staging underneath it. */
+bool snapsync_begin_write_admit_internal(struct snapshot_sync_service *svc);
+void snapsync_begin_write_finish_internal(void);
 bool snapsync_finalize_write_admit_internal(struct snapshot_sync_service *svc);
 bool snapsync_finalize_write_admit_peer_internal(
     struct snapshot_sync_service *svc, uint32_t peer_id);
@@ -130,6 +135,8 @@ typedef void (*snapsync_reset_gate_fn)(void *ctx);
 void snapsync_test_set_reset_gate(snapsync_reset_gate_fn fn, void *ctx);
 void snapsync_test_run_reset_gate(void);
 void snapsync_test_set_chunk_drain_gate(snapsync_reset_gate_fn fn, void *ctx);
+void snapsync_test_set_begin_write_gate(snapsync_reset_gate_fn fn, void *ctx);
+void snapsync_test_run_begin_write_gate(void);
 void snapsync_test_set_finalize_admit_gate(snapsync_reset_gate_fn fn, void *ctx);
 void snapsync_test_set_end_finalize_gate(snapsync_reset_gate_fn fn, void *ctx);
 void snapsync_test_run_end_finalize_gate(void);

@@ -312,8 +312,6 @@ static bool snapsync_begin_receive_write(struct node_db *ndb, void *ctx)
     if (!node_db_begin(ndb))
         LOG_FAIL("snapshot_sync", "begin_receive_write: node_db_begin failed for chunk loop");
 
-    svc->received_utxos = 0;
-    svc->last_commit_at = 0;
     return true;
 }
 
@@ -510,32 +508,60 @@ struct zcl_result snapsync_begin_receive(struct snapshot_sync_service *svc)
     svc->turbo_active = true;
     snapsync_service_unlock_internal();
 
+    /* The staging setup runs outside the service lock.  Keep an explicit
+     * lifecycle admission around it so reset drains this write before it
+     * discards staging and publishes IDLE. */
+    if (!snapsync_begin_write_admit_internal(svc)) {
+        trace_set_status(ss_span, TRACE_STATUS_ERROR);
+        trace_attr_str(ss_span, "error", "begin_receive_reset");
+        trace_end(ss_span);
+        return ZCL_ERR(-6, "begin_receive: reset before staging setup");
+    }
     if (!snapsync_run_write_internal(svc, snapsync_begin_receive_write, svc)) {
         /* Every other exit_turbo call site checks .ok; this one used to drop
          * it, so a stuck turbo pragma set left no trace. */
         if (!snapsync_exit_turbo_mode_internal(svc).ok)
             event_emitf(EV_SNAPSYNC_VERIFIED, 0,
                         "snapshot=FAILED reason=turbo_exit_failed path=begin_receive");
+        snapsync_begin_write_finish_internal();
         trace_set_status(ss_span, TRACE_STATUS_ERROR);
         trace_attr_str(ss_span, "error", "begin_receive_write");
         trace_end(ss_span);
         return ZCL_ERR(-6, "begin_receive: begin_receive_write failed");
     }
+    snapsync_service_lock_internal();
+    if (svc->state != SNAPSYNC_NEGOTIATING) {
+        snapsync_service_unlock_internal();
+        snapsync_begin_write_finish_internal();
+        trace_set_status(ss_span, TRACE_STATUS_ERROR);
+        trace_attr_str(ss_span, "error", "begin_receive_reset");
+        trace_end(ss_span);
+        return ZCL_ERR(-7, "begin_receive: reset during staging setup");
+    }
+    /* Keep the global sync FSM and the service state publication together.
+     * A reset that already closed this NEGOTIATING session must not be able
+     * to leave a later begin-receive call reporting SNAPSHOT_RECEIVE. */
     if (!sync_set_state(SYNC_SNAPSHOT_RECEIVE, "snapshot receive started")) {
+        snapsync_service_unlock_internal();
         snapsync_run_write_internal(svc, snapsync_rollback_receive_write_internal, NULL);
+        snapsync_begin_write_finish_internal();
         snapsync_reset(svc);
         trace_set_status(ss_span, TRACE_STATUS_ERROR);
         trace_attr_str(ss_span, "error", "sync_set_state");
         trace_end(ss_span);
-        return ZCL_ERR(-7, "begin_receive: sync_set_state failed");
+        return ZCL_ERR(-8, "begin_receive: sync_set_state failed");
     }
-
-    snapsync_service_lock_internal();
+    /* Publish receive counters with the state transition.  The database
+     * worker prepared staging above, but status snapshots share this mutex
+     * and must never race those scalar writes. */
+    svc->received_utxos = 0;
+    svc->last_commit_at = 0;
     svc->state = SNAPSYNC_RECEIVING;
     svc->last_progress_time_us = snapsync_now_us_internal();  /* start stall timer */
     svc->last_progress_utxos = 0;
     snapsync_set_state(SNAPSYNC_RECEIVING, "receive mode active");
     snapsync_service_unlock_internal();
+    snapsync_begin_write_finish_internal();
     trace_end(ss_span);
     return ZCL_OK;
 }
