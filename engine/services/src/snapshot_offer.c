@@ -232,6 +232,30 @@ static void snapsync_publish_accepted_metadata_locked(
     svc->fc_verified = false;
 }
 
+static int64_t snapsync_existing_utxo_count(
+    const struct snapshot_sync_service *svc)
+{
+    struct snapshot_store_sqlite_ctx sctx;
+    struct snapshot_store_port store = {0};
+    int64_t count = 0;
+
+    if (!svc || !svc->ndb || !svc->ndb->open)
+        return 0;
+    if (snapsync_bind_store_internal(&sctx, svc->ndb, &store).ok)
+        (void)store.utxo_count(store.self, &count);
+    return count;
+}
+
+static bool snapsync_offer_is_admissible_locked(
+    const struct snapshot_sync_service *svc, int32_t height,
+    uint64_t num_utxos, const uint8_t utxo_root[32],
+    const uint8_t block_hash[32], uint32_t peer_id)
+{
+    return svc && utxo_root && block_hash && svc->state == SNAPSYNC_IDLE &&
+           height > 0 && num_utxos > 0 && num_utxos <= 100000000ULL &&
+           !snapsync_is_peer_blacklisted_locked_internal(svc, peer_id);
+}
+
 static bool snapsync_accept_offer_internal(struct snapshot_sync_service *svc,
                                            int32_t height,
                                            uint64_t num_utxos,
@@ -243,10 +267,25 @@ static bool snapsync_accept_offer_internal(struct snapshot_sync_service *svc,
                                            const struct snapshot_offer_params *metadata,
                                            const uint8_t seed[32])
 {
+    int64_t existing_utxo_count = 0;
+
     snapsync_service_lock_internal();
-    if (!svc || !utxo_root || !block_hash || svc->state != SNAPSYNC_IDLE
-        || height <= 0 || num_utxos == 0 || num_utxos > 100000000ULL
-        || snapsync_is_peer_blacklisted_locked_internal(svc, peer_id)) {
+    if (!snapsync_offer_is_admissible_locked(svc, height, num_utxos,
+                                             utxo_root, block_hash, peer_id)) {
+        snapsync_service_unlock_internal();
+        return false;
+    }
+
+    /* The UTXO-count query can block on SQLite. Do not hold the singleton
+     * service mutex across it: reset, status, and peer cleanup must remain
+     * responsive. Recheck admission after the query before publishing state. */
+    snapsync_service_unlock_internal();
+    if (!allow_populated_utxos)
+        existing_utxo_count = snapsync_existing_utxo_count(svc);
+
+    snapsync_service_lock_internal();
+    if (!snapsync_offer_is_admissible_locked(svc, height, num_utxos,
+                                             utxo_root, block_hash, peer_id)) {
         snapsync_service_unlock_internal();
         return false;
     }
@@ -258,18 +297,11 @@ static bool snapsync_accept_offer_internal(struct snapshot_sync_service *svc,
      * coins_best_block but produces very few UTXOs — not a real set.
      * Only skip if the UTXO count indicates a genuine snapshot import
      * (100K+ UTXOs from file sync or a previous P2P snapshot). */
-    if (svc->ndb && svc->ndb->open) {
-        int64_t utxo_count = 0;
-        struct snapshot_store_sqlite_ctx sctx;
-        struct snapshot_store_port store = {0};
-        if (snapsync_bind_store_internal(&sctx, svc->ndb, &store).ok)
-            (void)store.utxo_count(store.self, &utxo_count);
-        if (utxo_count > 100000 && !allow_populated_utxos) {
-            printf("[snapsync] Skipping P2P snapshot — %lld UTXOs already "
-                   "imported\n", (long long)utxo_count);
-            snapsync_service_unlock_internal();
-            return false;
-        }
+    if (existing_utxo_count > 100000) {
+        printf("[snapsync] Skipping P2P snapshot — %lld UTXOs already "
+               "imported\n", (long long)existing_utxo_count);
+        snapsync_service_unlock_internal();
+        return false;
     }
 
     memcpy(svc->offered_utxo_root, utxo_root, 32);

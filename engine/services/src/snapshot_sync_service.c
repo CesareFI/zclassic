@@ -64,6 +64,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <errno.h>
 
 /* Global singleton */
 static struct snapshot_sync_service g_snapsync_instance;
@@ -168,6 +169,17 @@ void snapsync_test_run_offer_accepted_gate(void)
     snapsync_service_unlock_internal();
     if (gate)
         gate(ctx);
+}
+
+bool snapsync_test_service_lock_is_held(void)
+{
+    int result = pthread_mutex_trylock(&g_snapsync_service_lock);
+
+    if (result == 0) {
+        pthread_mutex_unlock(&g_snapsync_service_lock);
+        return false;
+    }
+    return result == EBUSY;
 }
 #endif
 

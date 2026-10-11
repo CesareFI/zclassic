@@ -1979,6 +1979,29 @@ struct snapshot_active_sqlite_authorizer {
     unsigned int select_count;
 };
 
+struct snapshot_offer_lock_authorizer {
+    bool saw_select;
+    bool service_lock_held;
+};
+
+static int snapshot_offer_lock_authorizer(void *ctx, int action,
+                                          const char *arg1, const char *arg2,
+                                          const char *db_name,
+                                          const char *trigger_name)
+{
+    struct snapshot_offer_lock_authorizer *authorizer = ctx;
+
+    (void)arg1;
+    (void)arg2;
+    (void)db_name;
+    (void)trigger_name;
+    if (authorizer && action == SQLITE_SELECT) {
+        authorizer->saw_select = true;
+        authorizer->service_lock_held = snapsync_test_service_lock_is_held();
+    }
+    return SQLITE_OK;
+}
+
 static int snapshot_active_sqlite_authorizer(void *ctx, int action,
                                              const char *arg1,
                                              const char *arg2,
@@ -2481,6 +2504,7 @@ static int test_snapshot_accept_offer_with_few_utxos(void)
          * non-null.  The fix checks UTXO count instead. */
         struct snapshot_sync_service svc;
         struct node_db ndb;
+        struct snapshot_offer_lock_authorizer authorizer = {0};
         ASSERT(node_db_open(&ndb, ":memory:"));
         snapsync_init(&svc, &ndb);
 
@@ -2488,6 +2512,8 @@ static int test_snapshot_accept_offer_with_few_utxos(void)
         uint8_t fake_best[32];
         memset(fake_best, 0x11, 32);
         node_db_state_set(&ndb, "coins_best_block", fake_best, 32);
+        ASSERT(sqlite3_set_authorizer(ndb.db, snapshot_offer_lock_authorizer,
+                                     &authorizer) == SQLITE_OK);
 
         /* UTXOs table exists but has 0 rows — should NOT block offer */
         uint8_t utxo_root[32], mmb_root[32], block_hash[32];
@@ -2499,8 +2525,43 @@ static int test_snapshot_accept_offer_with_few_utxos(void)
                                                utxo_root, mmb_root,
                                                block_hash, 42).ok;
         ASSERT(accepted);
+        ASSERT(authorizer.saw_select);
+        ASSERT(!authorizer.service_lock_held);
         ASSERT(svc.state == SNAPSYNC_NEGOTIATING);
 
+        (void)sqlite3_set_authorizer(ndb.db, NULL, NULL);
+        snapsync_reset(&svc);
+        node_db_close(&ndb);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_snapshot_busy_offer_skips_utxo_count(void)
+{
+    int failures = 0;
+
+    TEST("snapshot busy offer skips UTXO-count query") {
+        struct snapshot_sync_service svc;
+        struct node_db ndb;
+        struct snapshot_offer_lock_authorizer authorizer = {0};
+        uint8_t utxo_root[32] = {0};
+        uint8_t mmb_root[32] = {0};
+        uint8_t block_hash[32] = {0};
+
+        ASSERT(node_db_open(&ndb, ":memory:"));
+        snapsync_init(&svc, &ndb);
+        svc.state = SNAPSYNC_NEGOTIATING;
+        ASSERT(sqlite3_set_authorizer(ndb.db, snapshot_offer_lock_authorizer,
+                                     &authorizer) == SQLITE_OK);
+
+        ASSERT(!snapsync_accept_offer(&svc, 3000000, 1350000,
+                                      utxo_root, mmb_root,
+                                      block_hash, 42).ok);
+        ASSERT(!authorizer.saw_select);
+
+        (void)sqlite3_set_authorizer(ndb.db, NULL, NULL);
         snapsync_reset(&svc);
         node_db_close(&ndb);
         PASS();
@@ -3192,6 +3253,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_chunk_apply_failure_fails_closed();
     failures += test_snapshot_sync_service_out_of_range_value_fails_closed();
     failures += test_snapshot_accept_offer_with_few_utxos();
+    failures += test_snapshot_busy_offer_skips_utxo_count();
     failures += test_snapshot_accept_offer_with_real_utxos();
     failures += test_snapshot_recovery_request_allows_populated_utxos();
     failures += test_snapshot_recovery_request_rejects_unverified_manifest();
