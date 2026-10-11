@@ -112,12 +112,22 @@ static int target_lag_penalty(const struct bsp_plan_input *in,
 
 static int failure_penalty(const struct bsp_source_status *s)
 {
+    int64_t failure_score;
+
     if (!s)
         return 0;
-    int64_t penalty = s->failures * 4 + s->timeouts * 6;
-    if (penalty > 60)
-        penalty = 60;
-    return (int)penalty;
+
+    /* These counters can be restored from local status persistence. Treat
+     * malformed negative or extreme values as the maximum penalty instead of
+     * overflowing into a score boost. */
+    if (s->failures < 0 || s->timeouts < 0 || s->failures >= 15 ||
+        s->timeouts >= 10)
+        return 60;
+
+    failure_score = s->failures * 4;
+    if (s->timeouts > (60 - failure_score) / 6)
+        return 60;
+    return (int)(failure_score + s->timeouts * 6);
 }
 
 static int redundancy_bonus(const struct bsp_plan_input *in,

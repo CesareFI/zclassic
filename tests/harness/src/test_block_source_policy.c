@@ -19,6 +19,7 @@
 #include "validation/main_state.h"
 #include "validation/mirror_consensus.h"
 
+#include <limits.h>
 #include <pthread.h>
 
 struct bsp_global_init_ctx {
@@ -162,6 +163,45 @@ static int test_bsp_prefers_native_p2p(void)
         ASSERT(out.local_height == 100);
         ASSERT(out.target_height == 120);
         ASSERT(out.mirror_fallback_allowed);
+    } TEST_END
+    return failures;
+}
+
+static int test_bsp_saturates_malformed_failure_counters(void)
+{
+    int failures = 0;
+    struct bsp_plan_input in;
+    struct bsp_decision out;
+    struct bsp_source_status *p2p;
+
+    TEST_CASE("block_source_policy: malformed failure counters saturate")
+    {
+        in = base_input();
+        init_source(&in, BSP_SOURCE_P2P, true, true, 125);
+        p2p = &in.sources[BSP_SOURCE_P2P];
+
+        p2p->failures = 14;
+        block_source_policy_plan(&in, &out);
+        ASSERT(out.sources[BSP_SOURCE_P2P].score_failure_penalty == 56);
+
+        p2p->timeouts = 1;
+        block_source_policy_plan(&in, &out);
+        ASSERT(out.sources[BSP_SOURCE_P2P].score_failure_penalty == 60);
+
+        p2p->failures = INT64_MAX;
+        p2p->timeouts = 0;
+        block_source_policy_plan(&in, &out);
+        ASSERT(out.sources[BSP_SOURCE_P2P].score_failure_penalty == 60);
+
+        p2p->failures = 0;
+        p2p->timeouts = INT64_MAX;
+        block_source_policy_plan(&in, &out);
+        ASSERT(out.sources[BSP_SOURCE_P2P].score_failure_penalty == 60);
+
+        p2p->failures = -1;
+        p2p->timeouts = 0;
+        block_source_policy_plan(&in, &out);
+        ASSERT(out.sources[BSP_SOURCE_P2P].score_failure_penalty == 60);
     } TEST_END
     return failures;
 }
@@ -2047,6 +2087,7 @@ int test_block_source_policy(void)
     failures += test_bsp_global_init_is_thread_safe();
     failures += test_bsp_names();
     failures += test_bsp_prefers_native_p2p();
+    failures += test_bsp_saturates_malformed_failure_counters();
     failures += test_bsp_keeps_caught_up_p2p_when_legacy_is_ahead();
     failures += test_bsp_gates_mirror_during_local_retries();
     failures += test_bsp_allows_bounded_mirror_after_retries();
