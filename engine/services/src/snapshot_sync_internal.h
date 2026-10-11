@@ -77,6 +77,11 @@ int64_t snapsync_now_us_internal(void);
 bool snapsync_run_write_internal(struct snapshot_sync_service *svc,
                                  db_service_write_fn fn,
                                  void *ctx);
+/* Caller holds the snapshot service lock.  Keep peer eligibility and offer
+ * admission in one critical section so a concurrent stall cannot blacklist a
+ * peer after it passes a separate check but before it claims the service. */
+bool snapsync_is_peer_blacklisted_locked_internal(
+    const struct snapshot_sync_service *svc, uint32_t peer_id);
 
 /* Bind the default snapshot storage port (sqlite adapter) onto `ndb`.
  * The caller owns `ctx` (stack storage); it must outlive every call made

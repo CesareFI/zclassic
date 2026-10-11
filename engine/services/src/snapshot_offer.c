@@ -221,7 +221,8 @@ static bool snapsync_accept_offer_internal(struct snapshot_sync_service *svc,
 {
     snapsync_service_lock_internal();
     if (!svc || !utxo_root || !block_hash || svc->state != SNAPSYNC_IDLE
-        || height <= 0 || num_utxos == 0 || num_utxos > 100000000ULL) {
+        || height <= 0 || num_utxos == 0 || num_utxos > 100000000ULL
+        || snapsync_is_peer_blacklisted_locked_internal(svc, peer_id)) {
         snapsync_service_unlock_internal();
         return false;
     }

@@ -2863,6 +2863,28 @@ static int test_snapshot_blacklist_rejects_offer(void)
     return failures;
 }
 
+static int test_snapshot_blacklist_blocks_low_level_admission(void)
+{
+    int failures = 0;
+    TEST("snapshot low-level admission rejects a blacklisted peer") {
+        struct snapshot_sync_service svc;
+        struct node_db ndb;
+        uint8_t root[32] = {1};
+        uint8_t block_hash[32] = {2};
+
+        ASSERT(node_db_open(&ndb, ":memory:"));
+        snapsync_init(&svc, &ndb);
+        snapsync_blacklist_peer(&svc, 5);
+
+        ASSERT(!snapsync_accept_offer(&svc, 3000000, 1350000,
+                                      root, NULL, block_hash, 5).ok);
+        ASSERT(svc.state == SNAPSYNC_IDLE);
+        node_db_close(&ndb);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_snapshot_blacklist_survives_reset(void)
 {
     int failures = 0;
@@ -2950,6 +2972,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_blacklist_refresh();
     failures += test_snapshot_blacklist_multiple();
     failures += test_snapshot_blacklist_rejects_offer();
+    failures += test_snapshot_blacklist_blocks_low_level_admission();
     failures += test_snapshot_blacklist_survives_reset();
     progress_store_close();
     test_cleanup_tmpdir(progress_dir);

@@ -374,24 +374,31 @@ struct zcl_result snapsync_bind_store_internal(
 
 /* ── Peer Blacklist ──────────────────────────────────────── */
 
-bool snapsync_is_peer_blacklisted(const struct snapshot_sync_service *svc,
-                                  uint32_t peer_id)
+bool snapsync_is_peer_blacklisted_locked_internal(
+    const struct snapshot_sync_service *svc, uint32_t peer_id)
 {
     if (!svc || peer_id == 0)
         return false;
 
     int64_t now = snapsync_now_us_internal();
     int64_t expiry_us = SNAPSYNC_BLACKLIST_SECS * 1000000LL;
-    bool blacklisted = false;
-
-    snapsync_service_lock_internal();
     for (int i = 0; i < svc->blacklist_count; i++) {
         if (svc->blacklist[i].peer_id == peer_id &&
-            (now - svc->blacklist[i].blacklisted_at_us) < expiry_us) {
-            blacklisted = true;
-            break;
-        }
+            (now - svc->blacklist[i].blacklisted_at_us) < expiry_us)
+            return true;
     }
+    return false;
+}
+
+bool snapsync_is_peer_blacklisted(const struct snapshot_sync_service *svc,
+                                  uint32_t peer_id)
+{
+    bool blacklisted;
+
+    if (!svc || peer_id == 0)
+        return false;
+    snapsync_service_lock_internal();
+    blacklisted = snapsync_is_peer_blacklisted_locked_internal(svc, peer_id);
     snapsync_service_unlock_internal();
     return blacklisted;
 }
