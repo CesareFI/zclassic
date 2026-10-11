@@ -293,7 +293,7 @@ struct zcl_result snapsync_prepare_serve_step(struct snapsync_serve_step *step,
         return ZCL_OK;
     }
 
-    if (pos + 4 > buf_size)
+    if (buf_size - pos < 4)
         return ZCL_ERR(-2, "prepare_serve_step: pos %lld + 4 > buf_size %lld",
                        (long long)pos, (long long)buf_size);
 

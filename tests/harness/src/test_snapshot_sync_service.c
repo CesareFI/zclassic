@@ -1458,6 +1458,16 @@ static int test_snapshot_sync_service_prepare_serve_step_bad_input(void)
                 &step, &node, buf, (int64_t)sizeof(buf));
             ASSERT(!negative.ok && negative.code == -2);
         }
+
+        /* A corrupt persisted cursor can be positive but still too close to
+         * INT64_MAX to add the four-byte chunk-entry count safely. Reject it
+         * by remaining capacity, not by forming pos + 4. */
+        node.zsync_file_offset = INT64_MAX - 1;
+        {
+            struct zcl_result near_limit = snapsync_prepare_serve_step(
+                &step, &node, buf, INT64_MAX);
+            ASSERT(!near_limit.ok && near_limit.code == -2);
+        }
         PASS();
     } _test_next:;
 
