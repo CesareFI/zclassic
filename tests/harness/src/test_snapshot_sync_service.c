@@ -62,6 +62,12 @@ struct stall_thread_ctx {
     bool result;
 };
 
+struct offer_thread_ctx {
+    struct snapshot_sync_service *svc;
+    struct snapshot_offer_params params;
+    enum snapsync_offer_result result;
+};
+
 struct failed_reset_thread_ctx {
     bool reset_detected;
 };
@@ -138,6 +144,14 @@ static void *snapshot_stall_thread(void *ctx)
     struct stall_thread_ctx *thread = ctx;
 
     thread->result = snapsync_check_stall();
+    return NULL;
+}
+
+static void *snapshot_offer_thread(void *ctx)
+{
+    struct offer_thread_ctx *thread = ctx;
+
+    thread->result = snapsync_handle_offer(thread->svc, &thread->params);
     return NULL;
 }
 
@@ -711,6 +725,116 @@ static int test_snapshot_sync_service_offer_churn(void)
         ASSERT(svc.state == SNAPSYNC_NEGOTIATING ||
                svc.state == SNAPSYNC_IDLE);
         snapsync_reset(&svc);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static bool snapshot_offer_replacement_matches(
+    const struct snapshot_sync_service *svc,
+    const struct snapshot_offer_params *replacement,
+    enum snapsync_offer_result replacement_result,
+    enum snapsync_offer_result old_result)
+{
+    return replacement_result == SNAPSYNC_OFFER_ACCEPTED &&
+           old_result == SNAPSYNC_OFFER_REJECTED_BUSY &&
+           svc->state == SNAPSYNC_NEGOTIATING &&
+           svc->serving_peer_id == replacement->peer_id &&
+           svc->offered_height == replacement->height &&
+           svc->offered_count == replacement->num_utxos &&
+           svc->offered_peer_tip_height == replacement->peer_tip_height &&
+           svc->offered_protocol_version == replacement->protocol_version &&
+           svc->offered_schema_version == replacement->snapshot_schema_version &&
+           memcmp(svc->offered_chain_work, replacement->chain_work, 32) == 0 &&
+           memcmp(svc->fc_challenge.mmb_root, replacement->mmb_root, 32) == 0 &&
+           svc->fc_challenge.chain_length ==
+               (uint64_t)replacement->height + 1;
+}
+
+static bool snapshot_offer_reset_preserves_replacement_metadata(void)
+{
+    struct snapshot_sync_service svc;
+    struct node_db ndb;
+    struct snapshot_offer_params old_offer;
+    struct snapshot_offer_params replacement;
+    struct offer_thread_ctx old_thread;
+    struct reset_gate gate;
+    pthread_t thread;
+    bool db_open = false;
+    bool gate_ready = false;
+    bool thread_started = false;
+    bool ok = false;
+
+    memset(&svc, 0, sizeof(svc));
+    memset(&ndb, 0, sizeof(ndb));
+    memset(&gate, 0, sizeof(gate));
+    if (!node_db_open(&ndb, ":memory:"))
+        goto done;
+    db_open = true;
+    snapsync_init(&svc, &ndb);
+    fill_v2_offer_params(&old_offer, 3000000, 0, 101);
+    fill_v2_offer_params(&replacement, 3000000, 0, 101);
+    old_offer.peer_tip_height = old_offer.height + 10;
+    replacement.peer_tip_height = replacement.height + 11;
+    replacement.num_utxos = old_offer.num_utxos + 1;
+    memset(old_offer.chain_work, 0x11, sizeof(old_offer.chain_work));
+    memset(replacement.chain_work, 0x22, sizeof(replacement.chain_work));
+    memset(old_offer.mmb_root, 0x33, sizeof(old_offer.mmb_root));
+    memset(replacement.mmb_root, 0x44, sizeof(replacement.mmb_root));
+    old_offer.utxo_root[0] = 0x61;
+    replacement.utxo_root[0] = 0x62;
+    old_offer.block_hash[0] = 0x51;
+    replacement.block_hash[0] = 0x52;
+    if (!snapshot_reset_gate_init(&gate))
+        goto done;
+    gate_ready = true;
+    memset(&old_thread, 0, sizeof(old_thread));
+    old_thread.svc = &svc;
+    old_thread.params = old_offer;
+    snapsync_test_set_offer_accepted_gate(snapshot_reset_gate, &gate);
+    if (pthread_create(&thread, NULL, snapshot_offer_thread, &old_thread) != 0)
+        goto done;
+    thread_started = true;
+    pthread_mutex_lock(&gate.mutex);
+    while (!gate.is_entered)
+        pthread_cond_wait(&gate.entered, &gate.mutex);
+    pthread_mutex_unlock(&gate.mutex);
+
+    /* Old offer A owns NEGOTIATING but is held before metadata publication.
+     * Reset and replace it with B using the same peer and height but a new
+     * manifest; resuming A must not rewrite B's fields. */
+    snapsync_test_set_offer_accepted_gate(NULL, NULL);
+    snapsync_reset(&svc);
+    enum snapsync_offer_result replacement_result =
+        snapsync_handle_offer(&svc, &replacement);
+    snapshot_gate_release_and_join(&gate, thread, &thread_started);
+    ok = snapshot_offer_replacement_matches(&svc, &replacement,
+                                            replacement_result,
+                                            old_thread.result);
+
+done:
+    snapsync_test_set_offer_accepted_gate(NULL, NULL);
+    if (thread_started)
+        snapshot_gate_release_and_join(&gate, thread, &thread_started);
+    if (db_open) {
+        snapsync_reset(&svc);
+        node_db_close(&ndb);
+    }
+    if (gate_ready) {
+        pthread_cond_destroy(&gate.release);
+        pthread_cond_destroy(&gate.entered);
+        pthread_mutex_destroy(&gate.mutex);
+    }
+    return ok;
+}
+
+static int test_snapshot_sync_service_offer_reset_replacement(void)
+{
+    int failures = 0;
+
+    TEST("snapshot offer cannot overwrite a replacement after reset") {
+        ASSERT(snapshot_offer_reset_preserves_replacement_metadata());
         PASS();
     } _test_next:;
 
@@ -3002,6 +3126,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_handle_offer_null_inputs();
     failures += test_snapshot_sync_service_verify_flyclient_begin_failure();
     failures += test_snapshot_sync_service_offer_churn();
+    failures += test_snapshot_sync_service_offer_reset_replacement();
     failures += test_snapshot_sync_service_db_service_runtime();
     failures += test_snapshot_turbo_restore_failure_keeps_retry_latch();
     failures += test_snapshot_failed_status_marks_closed_staging_unknown();

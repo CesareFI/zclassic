@@ -210,6 +210,28 @@ struct zcl_result snapsync_build_local_recovery_manifest(struct node_db *ndb,
 
 /* ── Accept Offer ────────────────────────────────────────── */
 
+/* Caller holds the snapshot service lock.  Public offer entry points that
+ * carry a complete manifest install their session-only metadata together
+ * with the admission identity. */
+static void snapsync_publish_accepted_metadata_locked(
+    struct snapshot_sync_service *svc, int32_t height,
+    const uint8_t mmb_root[32], const struct snapshot_offer_params *metadata,
+    const uint8_t seed[32])
+{
+    if (!metadata || !seed)
+        return;
+    memcpy(svc->offered_chain_work, metadata->chain_work,
+           sizeof(svc->offered_chain_work));
+    svc->offered_peer_tip_height = metadata->peer_tip_height;
+    svc->offered_protocol_version = metadata->protocol_version;
+    svc->offered_schema_version = metadata->snapshot_schema_version;
+    memcpy(svc->fc_challenge.seed, seed, sizeof(svc->fc_challenge.seed));
+    svc->fc_challenge.chain_length = (uint64_t)height + 1;
+    memcpy(svc->fc_challenge.mmb_root, mmb_root,
+           sizeof(svc->fc_challenge.mmb_root));
+    svc->fc_verified = false;
+}
+
 static bool snapsync_accept_offer_internal(struct snapshot_sync_service *svc,
                                            int32_t height,
                                            uint64_t num_utxos,
@@ -217,7 +239,9 @@ static bool snapsync_accept_offer_internal(struct snapshot_sync_service *svc,
                                            const uint8_t mmb_root[32],
                                            const uint8_t block_hash[32],
                                            uint32_t peer_id,
-                                           bool allow_populated_utxos)
+                                           bool allow_populated_utxos,
+                                           const struct snapshot_offer_params *metadata,
+                                           const uint8_t seed[32])
 {
     snapsync_service_lock_internal();
     if (!svc || !utxo_root || !block_hash || svc->state != SNAPSYNC_IDLE
@@ -255,6 +279,8 @@ static bool snapsync_accept_offer_internal(struct snapshot_sync_service *svc,
     svc->offered_count = num_utxos;
     svc->serving_peer_id = peer_id;
     svc->start_time_us = snapsync_now_us_internal();
+    snapsync_publish_accepted_metadata_locked(svc, height, mmb_root,
+                                              metadata, seed);
 
     svc->state = SNAPSYNC_NEGOTIATING;
     snapsync_set_state(SNAPSYNC_NEGOTIATING, "accepted offer");
@@ -271,10 +297,45 @@ struct zcl_result snapsync_accept_offer(struct snapshot_sync_service *svc,
 {
     if (!snapsync_accept_offer_internal(svc, height, num_utxos, utxo_root,
                                         mmb_root, block_hash, peer_id,
-                                        false))
+                                        false, NULL, NULL))
         return ZCL_ERR(-1, "accept_offer: rejected (busy/invalid/populated) h=%d utxos=%llu peer=%u",
                        height, (unsigned long long)num_utxos, peer_id);
     return ZCL_OK;
+}
+
+/* Admission publishes every session field under the service lock.  The
+ * policy callback runs afterwards, so an old offer must prove that its exact
+ * session still owns the service before it reports acceptance to the router.
+ * This is a read-only check: a replacement can never be overwritten. */
+static bool snapsync_offer_still_owned(
+    const struct snapshot_sync_service *svc,
+    const struct snapshot_offer_params *params)
+{
+    bool owns_session = false;
+
+    snapsync_service_lock_internal();
+    if (svc->state == SNAPSYNC_NEGOTIATING &&
+        svc->serving_peer_id == params->peer_id &&
+        svc->offered_height == params->height &&
+        svc->offered_count == params->num_utxos &&
+        memcmp(svc->offered_block_hash, params->block_hash,
+               sizeof(svc->offered_block_hash)) == 0 &&
+        memcmp(svc->offered_utxo_root, params->utxo_root,
+               sizeof(svc->offered_utxo_root)) == 0 &&
+        memcmp(svc->offered_mmb_root, params->mmb_root,
+               sizeof(svc->offered_mmb_root)) == 0 &&
+        memcmp(svc->offered_chain_work, params->chain_work,
+               sizeof(svc->offered_chain_work)) == 0 &&
+        svc->offered_peer_tip_height == params->peer_tip_height &&
+        svc->offered_protocol_version == params->protocol_version &&
+        svc->offered_schema_version == params->snapshot_schema_version &&
+        svc->fc_challenge.chain_length == (uint64_t)params->height + 1 &&
+        memcmp(svc->fc_challenge.mmb_root, params->mmb_root,
+               sizeof(svc->fc_challenge.mmb_root)) == 0) {
+        owns_session = true;
+    }
+    snapsync_service_unlock_internal();
+    return owns_session;
 }
 
 enum snapsync_followup_action snapsync_offer_followup_action(
@@ -530,10 +591,17 @@ enum snapsync_offer_result snapsync_handle_offer(
         return SNAPSYNC_OFFER_REJECTED_BUSY;
     }
 
-    /* Accept the offer via service */
-    if (!snapsync_accept_offer(svc, params->height, params->num_utxos,
-                               params->utxo_root, params->mmb_root,
-                               params->block_hash, params->peer_id).ok) {
+    uint8_t fc_seed[32];
+
+    GetRandBytes(fc_seed, sizeof(fc_seed));
+    /* Publish the complete session atomically with admission. */
+    if (!snapsync_accept_offer_internal(svc, params->height,
+                                        params->num_utxos,
+                                        params->utxo_root,
+                                        params->mmb_root,
+                                        params->block_hash,
+                                        params->peer_id, false, params,
+                                        fc_seed)) {
         (void)block_source_policy_snapshot_offer_allowed(
             params->our_height,
             params->height,
@@ -553,12 +621,11 @@ enum snapsync_offer_result snapsync_handle_offer(
         snapsync_reset(svc);
         return SNAPSYNC_OFFER_REJECTED_BUSY;
     }
-    snapsync_service_lock_internal();
-    memcpy(svc->offered_chain_work, params->chain_work, 32);
-    svc->offered_peer_tip_height = params->peer_tip_height;
-    svc->offered_protocol_version = params->protocol_version;
-    svc->offered_schema_version = params->snapshot_schema_version;
-    snapsync_service_unlock_internal();
+#ifdef ZCL_TESTING
+    snapsync_test_run_offer_accepted_gate();
+#endif
+    if (!snapsync_offer_still_owned(svc, params))
+        return SNAPSYNC_OFFER_REJECTED_BUSY;
 
     printf("[snapsync] Accepted offer: h=%d, %llu UTXOs from peer %u\n",
            params->height, (unsigned long long)params->num_utxos,
@@ -567,19 +634,6 @@ enum snapsync_offer_result snapsync_handle_offer(
                 "accepted=true h=%d peer_tip=%d utxos=%llu",
                 params->height, params->peer_tip_height,
                 (unsigned long long)params->num_utxos);
-
-    /* Generate FlyClient challenge for MMB chain verification.
-     * The router sends zfcchallenge to the peer, who must respond
-     * with zfcproofs before we send zsnapreq. */
-    uint8_t fc_seed[32];
-
-    GetRandBytes(fc_seed, sizeof(fc_seed));
-    snapsync_service_lock_internal();
-    memcpy(svc->fc_challenge.seed, fc_seed, 32);
-    svc->fc_challenge.chain_length = (uint64_t)params->height + 1;
-    memcpy(svc->fc_challenge.mmb_root, params->mmb_root, 32);
-    svc->fc_verified = false;
-    snapsync_service_unlock_internal();
     printf("[snapsync] FlyClient challenge generated (%u samples, "
            "chain_length=%llu)\n", FC_NUM_SAMPLES,
            (unsigned long long)((uint64_t)params->height + 1));
@@ -624,13 +678,14 @@ struct zcl_result snapsync_request_recovery(struct snapshot_sync_service *svc,
                        manifest->height, target_height);
     }
 
+    GetRandBytes(fc_seed, sizeof(fc_seed));
     if (!snapsync_accept_offer_internal(svc, manifest->height,
                                         manifest->num_utxos,
                                         manifest->utxo_root,
                                         manifest->mmb_root,
                                         manifest->block_hash,
                                         manifest->peer_id,
-                                        true)) {
+                                        true, manifest, fc_seed)) {
         event_emitf(EV_SNAPSHOT_OFFER_RECEIVED, manifest->peer_id,
                     "accepted=false recovery=true reason=accept_failed "
                     "h=%d target=%d",
@@ -639,17 +694,9 @@ struct zcl_result snapsync_request_recovery(struct snapshot_sync_service *svc,
                        manifest->height, target_height);
     }
 
-    GetRandBytes(fc_seed, sizeof(fc_seed));
-    snapsync_service_lock_internal();
-    memcpy(svc->offered_chain_work, manifest->chain_work, 32);
-    svc->offered_peer_tip_height = manifest->peer_tip_height;
-    svc->offered_protocol_version = manifest->protocol_version;
-    svc->offered_schema_version = manifest->snapshot_schema_version;
-    memcpy(svc->fc_challenge.seed, fc_seed, 32);
-    svc->fc_challenge.chain_length = (uint64_t)manifest->height + 1;
-    memcpy(svc->fc_challenge.mmb_root, manifest->mmb_root, 32);
-    svc->fc_verified = false;
-    snapsync_service_unlock_internal();
+    if (!snapsync_offer_still_owned(svc, manifest))
+        return ZCL_ERR(-5, "request_recovery: accepted offer lost ownership h=%d",
+                       manifest->height);
 
     event_emitf(EV_SNAPSHOT_OFFER_RECEIVED, manifest->peer_id,
                 "accepted=true recovery=true h=%d target=%d utxos=%llu",

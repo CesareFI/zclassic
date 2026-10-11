@@ -87,6 +87,8 @@ static snapsync_reset_gate_fn g_snapsync_finalize_admit_gate = NULL;
 static void *g_snapsync_finalize_admit_gate_ctx = NULL;
 static snapsync_reset_gate_fn g_snapsync_stall_action_gate = NULL;
 static void *g_snapsync_stall_action_gate_ctx = NULL;
+static snapsync_reset_gate_fn g_snapsync_offer_accepted_gate = NULL;
+static void *g_snapsync_offer_accepted_gate_ctx = NULL;
 
 void snapsync_test_set_reset_gate(snapsync_reset_gate_fn fn, void *ctx)
 {
@@ -141,6 +143,28 @@ void snapsync_test_run_stall_action_gate(void)
     snapsync_service_lock_internal();
     gate = g_snapsync_stall_action_gate;
     ctx = g_snapsync_stall_action_gate_ctx;
+    snapsync_service_unlock_internal();
+    if (gate)
+        gate(ctx);
+}
+
+void snapsync_test_set_offer_accepted_gate(snapsync_reset_gate_fn fn,
+                                           void *ctx)
+{
+    snapsync_service_lock_internal();
+    g_snapsync_offer_accepted_gate = fn;
+    g_snapsync_offer_accepted_gate_ctx = ctx;
+    snapsync_service_unlock_internal();
+}
+
+void snapsync_test_run_offer_accepted_gate(void)
+{
+    snapsync_reset_gate_fn gate;
+    void *ctx;
+
+    snapsync_service_lock_internal();
+    gate = g_snapsync_offer_accepted_gate;
+    ctx = g_snapsync_offer_accepted_gate_ctx;
     snapsync_service_unlock_internal();
     if (gate)
         gate(ctx);
