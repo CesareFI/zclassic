@@ -101,6 +101,13 @@ uint32_t state_offer_service_test_refresh_and_count(void);
  * g_datadir is set. */
 bool state_offer_service_test_compose_path(const char *filename, char *out,
                                            size_t out_sz);
+/* Exercise the worker-to-tick fetch-completion handoff without performing a
+ * network fetch. These access the same state used by the production worker and
+ * tick so ThreadSanitizer can qualify the handoff itself. */
+void state_offer_service_test_set_fetch_running(bool running);
+bool state_offer_service_test_fetch_running(void);
+/* True iff the production fetch-running object has atomic boolean type. */
+bool state_offer_service_test_fetch_running_is_atomic(void);
 #endif
 
 #endif /* ZCL_CONFIG_STATE_OFFER_SERVICE_H */

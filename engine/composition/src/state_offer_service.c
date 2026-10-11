@@ -39,6 +39,7 @@
 #include "vcs/zcode_dht_identity.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -77,7 +78,7 @@ static bool g_snapshot_valid;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_fetch_thread;
-static bool g_fetch_running;
+static _Atomic bool g_fetch_running;
 static bool g_fetch_started;
 static bool g_fallback_raised;
 static struct state_offer_record g_fetch_target;
@@ -615,6 +616,11 @@ void state_offer_service_tick(void)
 }
 
 #ifdef ZCL_TESTING
+bool state_offer_service_test_fetch_running_is_atomic(void)
+{
+    return _Generic(&g_fetch_running, _Atomic bool *: true, default: false);
+}
+
 void state_offer_service_test_invalidate(void)
 {
     pthread_mutex_lock(&g_lock);
@@ -663,5 +669,15 @@ bool state_offer_service_test_compose_path(const char *filename, char *out,
                                            size_t out_sz)
 {
     return sosvc_artifact_path(out, out_sz, filename);
+}
+
+void state_offer_service_test_set_fetch_running(bool running)
+{
+    g_fetch_running = running;
+}
+
+bool state_offer_service_test_fetch_running(void)
+{
+    return g_fetch_running;
 }
 #endif

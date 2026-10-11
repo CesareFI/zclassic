@@ -11,9 +11,13 @@
 
 #include "base/bytes.h"
 #include "chain/checkpoints.h"
+#include "config/state_offer_service.h"
 #include "crypto/ed25519.h"
 #include "net/state_offer.h"
 
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <string.h>
 
 /* Wire offsets the tamper cases below poke directly. Named here so a layout
@@ -603,6 +607,42 @@ static int null_and_empty_inputs(void)
     return failures;
 }
 
+struct fetch_running_race_ctx {
+    _Atomic bool start;
+    _Atomic bool done;
+};
+
+static void *toggle_fetch_running(void *arg)
+{
+    struct fetch_running_race_ctx *ctx = arg;
+    while (!atomic_load(&ctx->start))
+        sched_yield();
+    for (int i = 0; i < 100000; i++)
+        state_offer_service_test_set_fetch_running((i & 1) != 0);
+    state_offer_service_test_set_fetch_running(false);
+    atomic_store(&ctx->done, true);
+    return NULL;
+}
+
+static int fetch_completion_handoff(void)
+{
+    int failures = 0;
+    TEST_CASE("fetch completion state is safe across worker and tick threads") {
+        ASSERT(state_offer_service_test_fetch_running_is_atomic());
+        struct fetch_running_race_ctx ctx = {0};
+        pthread_t worker;
+        ASSERT_EQ(pthread_create(&worker, NULL, toggle_fetch_running, &ctx), 0);
+        atomic_store(&ctx.start, true);
+        while (!atomic_load(&ctx.done)) {
+            (void)state_offer_service_test_fetch_running();
+            sched_yield();
+        }
+        ASSERT_EQ(pthread_join(worker, NULL), 0);
+        ASSERT(!state_offer_service_test_fetch_running());
+    } TEST_END
+    return failures;
+}
+
 int test_state_offer(void)
 {
     int failures = 0;
@@ -615,5 +655,6 @@ int test_state_offer(void)
     failures += batch_cap_and_bounds();
     failures += batch_bounds();
     failures += null_and_empty_inputs();
+    failures += fetch_completion_handoff();
     return failures;
 }
