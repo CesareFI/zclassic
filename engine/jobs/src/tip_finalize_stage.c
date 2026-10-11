@@ -784,16 +784,34 @@ void tip_finalize_stage_shutdown(void)
  * (tip_finalize_stage_set_utxo_counter / _set_reorg_clamp) and their accessors
  * live in tip_finalize_stage_hooks.c. */
 
-uint64_t tip_finalize_stage_cursor(void) { return g_stage ? stage_cursor(g_stage) : 0; }
+uint64_t tip_finalize_stage_cursor(void)
+{
+    pthread_mutex_lock(&g_lock);
+    uint64_t cursor = g_stage ? stage_cursor(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return cursor;
+}
+
 int64_t tip_finalize_stage_step_us_ewma(void)
 {
-    return g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_lock(&g_lock);
+    int64_t ewma = g_stage ? stage_step_us_ewma(g_stage) : 0;
+    pthread_mutex_unlock(&g_lock);
+    return ewma;
 }
 int64_t tip_finalize_stage_last_height(void) { return tip_finalize_observe_last_height(); }
 
 /* Test-only: reset the published served-tip height to -1 (a stale high value
  * from a prior group without shutdown() poisons later active_chain_tip reads). */
 void tip_finalize_stage_test_reset(void) { tip_finalize_observe_reset_last_height(); reducer_frontier_provable_tip_reset(); utxo_apply_sum_through_reset(); }
+#ifdef ZCL_TESTING
+void tip_finalize_stage_test_install_stage(stage_t *stage)
+{
+    pthread_mutex_lock(&g_lock);
+    g_stage = stage;
+    pthread_mutex_unlock(&g_lock);
+}
+#endif
 uint64_t tip_finalize_stage_finalized_total(void) { return tip_finalize_observe_finalized_total(); }
 uint64_t tip_finalize_stage_upstream_failed_total(void) { return tip_finalize_observe_upstream_failed_total(); }
 uint64_t tip_finalize_stage_reorg_detected_total(void) { return tip_finalize_observe_reorg_detected_total(); }

@@ -130,6 +130,10 @@ bool tip_finalize_stage_authority_snapshot(int64_t *height,
                                            uint8_t hash[32]);
 /* Test-only: reset the published served-tip height to -1 (see .c). */
 void     tip_finalize_stage_test_reset(void);
+#ifdef ZCL_TESTING
+/* Lifecycle sanitizer seam: installs a caller-owned synthetic stage. */
+void     tip_finalize_stage_test_install_stage(stage_t *stage);
+#endif
 uint64_t tip_finalize_stage_finalized_total(void);
 uint64_t tip_finalize_stage_upstream_failed_total(void);
 uint64_t tip_finalize_stage_reorg_detected_total(void);
