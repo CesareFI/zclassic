@@ -431,6 +431,7 @@ static bool snapsync_apply_chunk_write(struct node_db *ndb, void *ctx)
 struct zcl_result snapsync_begin_receive(struct snapshot_sync_service *svc)
 {
     struct trace_span *ss_span = trace_start("snapsync.begin_receive");
+    int32_t offered_height = 0;
 
     if (!svc) {
         trace_set_status(ss_span, TRACE_STATUS_ERROR);
@@ -438,7 +439,14 @@ struct zcl_result snapsync_begin_receive(struct snapshot_sync_service *svc)
         trace_end(ss_span);
         return ZCL_ERR(-1, "begin_receive: svc is NULL");
     }
-    trace_attr_int(ss_span, "snap_height", svc->offered_height);
+
+    /* Offer/reset paths publish this field under the service lock.  Snapshot
+     * it before tracing, but do not hold the service lock while trace code
+     * runs: tracing may take unrelated locks or allocate. */
+    snapsync_service_lock_internal();
+    offered_height = svc->offered_height;
+    snapsync_service_unlock_internal();
+    trace_attr_int(ss_span, "snap_height", offered_height);
 
     snapsync_service_lock_internal();
     if (svc->state != SNAPSYNC_NEGOTIATING) {
