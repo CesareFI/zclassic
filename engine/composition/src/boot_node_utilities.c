@@ -58,6 +58,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
+
+static int64_t boot_metrics_stage_cursor_value(uint64_t cursor)
+{
+    return cursor > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)cursor;
+}
+
+#ifdef ZCL_TESTING
+int64_t boot_metrics_test_stage_cursor_value(uint64_t cursor)
+{
+    return boot_metrics_stage_cursor_value(cursor);
+}
+#endif
 
 /* External-gauge callback injected into the metrics thread: snapshots
  * sync state, UTXO count, tip-advance age, mirror lag, and peer counts. */
@@ -119,21 +132,29 @@ static void boot_metrics_external_gauges(
      * fixed-order rows[] pattern diag_profile_push_stage_ewma() uses in
      * engine/controllers/src/diagnostics_registry.c for the `profile`
      * command's stage_ewma block. */
-    out->stage_cursor[0]       = (int64_t)header_admit_stage_cursor();
+    out->stage_cursor[0]       = boot_metrics_stage_cursor_value(
+        header_admit_stage_cursor());
     out->stage_step_us_ewma[0] = header_admit_stage_step_us_ewma();
-    out->stage_cursor[1]       = (int64_t)validate_headers_stage_cursor();
+    out->stage_cursor[1]       = boot_metrics_stage_cursor_value(
+        validate_headers_stage_cursor());
     out->stage_step_us_ewma[1] = validate_headers_stage_step_us_ewma();
-    out->stage_cursor[2]       = (int64_t)body_fetch_stage_cursor();
+    out->stage_cursor[2]       = boot_metrics_stage_cursor_value(
+        body_fetch_stage_cursor());
     out->stage_step_us_ewma[2] = body_fetch_stage_step_us_ewma();
-    out->stage_cursor[3]       = (int64_t)body_persist_stage_cursor();
+    out->stage_cursor[3]       = boot_metrics_stage_cursor_value(
+        body_persist_stage_cursor());
     out->stage_step_us_ewma[3] = body_persist_stage_step_us_ewma();
-    out->stage_cursor[4]       = (int64_t)script_validate_stage_cursor();
+    out->stage_cursor[4]       = boot_metrics_stage_cursor_value(
+        script_validate_stage_cursor());
     out->stage_step_us_ewma[4] = script_validate_stage_step_us_ewma();
-    out->stage_cursor[5]       = (int64_t)proof_validate_stage_cursor();
+    out->stage_cursor[5]       = boot_metrics_stage_cursor_value(
+        proof_validate_stage_cursor());
     out->stage_step_us_ewma[5] = proof_validate_stage_step_us_ewma();
-    out->stage_cursor[6]       = (int64_t)utxo_apply_stage_cursor();
+    out->stage_cursor[6]       = boot_metrics_stage_cursor_value(
+        utxo_apply_stage_cursor());
     out->stage_step_us_ewma[6] = utxo_apply_stage_step_us_ewma();
-    out->stage_cursor[7]       = (int64_t)tip_finalize_stage_cursor();
+    out->stage_cursor[7]       = boot_metrics_stage_cursor_value(
+        tip_finalize_stage_cursor());
     out->stage_step_us_ewma[7] = tip_finalize_stage_step_us_ewma();
 
     /* Active-chain tip + peer count. engine/modules/metrics used to call

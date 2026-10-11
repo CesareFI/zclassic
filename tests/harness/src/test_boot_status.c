@@ -16,9 +16,11 @@
  * the parallel test driver without touching any live datadir. */
 
 #include "test/test_core.h"
+#include "config/boot_internal.h"
 #include "util/boot_status.h"
 #include "util/boot_phase.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +49,19 @@ int test_boot_status(void)
 {
     printf("\n=== boot_status tests ===\n");
     int failures = 0;
+
+    /* The live external metrics callback must not reinterpret a malformed
+     * uint64_t stage cursor as a negative int64_t operator metric. */
+    BS_CHECK("stage cursor telemetry retains normal values",
+             boot_metrics_test_stage_cursor_value(42) == 42);
+    BS_CHECK("stage cursor telemetry retains INT64_MAX",
+             boot_metrics_test_stage_cursor_value((uint64_t)INT64_MAX) ==
+                 INT64_MAX);
+    BS_CHECK("stage cursor telemetry saturates above INT64_MAX",
+             boot_metrics_test_stage_cursor_value((uint64_t)INT64_MAX + 1) ==
+                 INT64_MAX);
+    BS_CHECK("stage cursor telemetry saturates UINT64_MAX",
+             boot_metrics_test_stage_cursor_value(UINT64_MAX) == INT64_MAX);
 
     /* ── phase derivation ─────────────────────────────────────────── */
     {

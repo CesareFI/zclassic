@@ -593,6 +593,12 @@ void boot_sync_state_logger(enum event_type type, uint32_t peer_id,
                             const void *payload, uint32_t payload_len,
                             void *ctx);
 
+#ifdef ZCL_TESTING
+/* Exact conversion used by the live metrics callback. Kept as a test seam so
+ * a malformed persisted stage cursor cannot become a negative metric. */
+int64_t boot_metrics_test_stage_cursor_value(uint64_t cursor);
+#endif
+
 /* Wire the process_block tip-publication hooks + gap-fill kick (defined in
  * boot_tip_hooks.c) into the validation engine. Called once from
  * app_init_services. The teardown counterpart stays inline in app_shutdown_svc
