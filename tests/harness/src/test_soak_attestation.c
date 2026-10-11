@@ -29,7 +29,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -425,6 +427,16 @@ static bool sb_timing_ok(const struct json_value *timings, const char *phase,
     return json_is_null(v);
 }
 
+static bool sb_redownloaded_counter_saturated(const struct json_value *resources)
+{
+    if (!resources)
+        return false;
+    const struct json_value *value = json_get(resources, "bytes_redownloaded");
+
+    return value && value->type == JSON_INT &&
+           json_get_int(value) == INT64_MAX;
+}
+
 static int test_sync_benchmark_receipt_wellformed(void)
 {
     int failures = 0;
@@ -446,6 +458,7 @@ static int test_sync_benchmark_receipt_wellformed(void)
         sync_benchmark_phase_end(SYNC_BENCH_ARTIFACT_DOWNLOAD);
         sync_benchmark_note_reused(4096);
         sync_benchmark_note_downloaded(9000);
+        sync_benchmark_note_redownloaded(UINT64_MAX);
         /* Derived milestone: T_ready at +12 ms from t0. */
         g_fake_us += 2000;
         sync_benchmark_mark_ready();
@@ -491,6 +504,7 @@ static int test_sync_benchmark_receipt_wellformed(void)
         ok = ok && res && res->type == JSON_OBJ;
         ok = ok && json_get_int(json_get(res, "bytes_reused")) == 4096;
         ok = ok && json_get_int(json_get(res, "bytes_downloaded")) == 9000;
+        ok &= sb_redownloaded_counter_saturated(res);
         json_free(&r);
 
         if (ok) PASS();
