@@ -164,8 +164,12 @@ bool block_index_loader_torn_import_detect(struct main_state *ms,
          * genuine tear that sits above it. One lock span (the lock is
          * recursive): the hole scan AND the refusal-marker read see a
          * consistent progress.kv snapshot. */
+        /* The persisted cursor is signed. INT32_MAX is not a reachable
+         * Zclassic height, but a corrupt local record must not turn this
+         * exclusive-bound conversion into signed overflow at boot. */
+        int scan_cursor = ceiling == INT32_MAX ? INT32_MAX : (int)ceiling + 1;
         (void)find_lowest_prevout_unresolved_hole_unlocked(
-            progress_db, (int)ceiling + 1, "prevout_unresolved", &hole_h,
+            progress_db, scan_cursor, "prevout_unresolved", &hole_h,
             hole_status, &hole_hash, &hole_hash_found);
         hole_found = (hole_h > 0);
         /* (3) require coin_backfill's durable refusal of THIS hole, keyed by

@@ -53,6 +53,7 @@
 #include "util/blocker.h"
 #include "jobs/reducer_frontier.h"
 
+#include <limits.h>
 #include <sqlite3.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -770,6 +771,38 @@ int test_seed_torn_import_gate(void)
         event_clear_observers(EV_OPERATOR_NEEDED);
         main_state_free(&ms);
         node_db_close(&ndb);
+        progress_store_close();
+        test_cleanup_tmpdir(dir);
+    }
+
+    /* A corrupt persisted cursor at the signed maximum must remain a bounded
+     * no-tear result; the detector's exclusive scan cursor must not form
+     * INT32_MAX + 1. */
+    {
+        char dir[256];
+        snprintf(dir, sizeof(dir), "./test-tmp/torn_import_%d_maxcursor",
+                 (int)getpid());
+        mkdir("./test-tmp", 0755);
+        mkdir(dir, 0755);
+
+        progress_store_close();
+        bool pk_ok = progress_store_open(dir);
+        STIG_CHECK("maxcursor: progress store opens", pk_ok);
+        sqlite3 *pk = progress_store_db();
+        STIG_CHECK("maxcursor: applied cursor stamped", pk &&
+                   stig_set_applied(pk, INT32_MAX));
+
+        struct main_state ms;
+        main_state_init(&ms);
+        int32_t hole_h = 0;
+        int32_t ceiling = 0;
+        bool tear = pk && block_index_loader_torn_import_detect(
+            &ms, pk, 0, &hole_h, &ceiling);
+        STIG_CHECK("maxcursor: no false torn-import verdict", !tear);
+        STIG_CHECK("maxcursor: ceiling remains observable",
+                   ceiling == INT32_MAX);
+
+        main_state_free(&ms);
         progress_store_close();
         test_cleanup_tmpdir(dir);
     }
