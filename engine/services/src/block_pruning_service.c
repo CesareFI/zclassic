@@ -219,18 +219,20 @@ static int block_pruning_run_below(struct block_pruning_service *svc,
         return 0;
 
     int lowest_have = chain_height;
+    zcl_mutex_lock(&svc->ms->cs_main);
     for (int h = 0; h <= chain_height; h++) {
         struct block_index *bi = active_chain_at(&svc->ms->chain_active, h);
         if (!bi) continue;
-        if (!(bi->nStatus & BLOCK_HAVE_DATA)) continue;
+        if (!(block_index_status_load(bi) & BLOCK_HAVE_DATA)) continue;
 
-        int fn = bi->nFile;
+        int fn = block_index_file_load(bi);
         if (fn == 255) continue;  /* never prune sync file */
         if (fn == 0)   continue;  /* never prune file 0 (genesis) */
 
         file_height_map_record(&fmap, fn, h);
         if (h < lowest_have) lowest_have = h;
     }
+    zcl_mutex_unlock(&svc->ms->cs_main);
     atomic_store(&svc->lowest_have_data, lowest_have);
 
     /* Phase 2: Delete files where max_height < prune_below. */
@@ -271,17 +273,17 @@ static int block_pruning_run_below(struct block_pruning_service *svc,
 
         /* Phase 3: Clear BLOCK_HAVE_DATA/UNDO flags on affected blocks. */
         int blocks_cleared = 0;
+        zcl_mutex_lock(&svc->ms->cs_main);
         for (int h = 0; h <= chain_height; h++) {
             struct block_index *bi = active_chain_at(&svc->ms->chain_active, h);
             if (!bi) continue;
-            if (bi->nFile != fn) continue;
-            if (bi->nStatus & BLOCK_HAVE_DATA) {
-                bi->nStatus &= ~(unsigned int)BLOCK_HAVE_DATA;
+            if (block_index_file_load(bi) != fn) continue;
+            unsigned int old = block_index_status_clear_bits(
+                bi, BLOCK_HAVE_DATA | BLOCK_HAVE_UNDO);
+            if (old & BLOCK_HAVE_DATA)
                 blocks_cleared++;
-            }
-            if (bi->nStatus & BLOCK_HAVE_UNDO)
-                bi->nStatus &= ~(unsigned int)BLOCK_HAVE_UNDO;
         }
+        zcl_mutex_unlock(&svc->ms->cs_main);
         atomic_fetch_add(&svc->blocks_pruned, blocks_cleared);
 
         event_emitf(EV_BLOCK_PRUNING_DONE, 0,
@@ -293,14 +295,16 @@ static int block_pruning_run_below(struct block_pruning_service *svc,
 
     /* Update lowest_have_data after pruning */
     lowest_have = chain_height;
+    zcl_mutex_lock(&svc->ms->cs_main);
     for (int h = 0; h <= chain_height; h++) {
         struct block_index *bi = active_chain_at(&svc->ms->chain_active, h);
         if (!bi) continue;
-        if (bi->nStatus & BLOCK_HAVE_DATA) {
+        if (block_index_status_load(bi) & BLOCK_HAVE_DATA) {
             lowest_have = h;
             break;
         }
     }
+    zcl_mutex_unlock(&svc->ms->cs_main);
     atomic_store(&svc->lowest_have_data, lowest_have);
 
     file_height_map_free(&fmap);
@@ -312,7 +316,9 @@ int block_pruning_run_once(struct block_pruning_service *svc)
     if (!svc || !svc->ms || !svc->datadir)
         return 0;
 
+    zcl_mutex_lock(&svc->ms->cs_main);
     int chain_height = active_chain_height(&svc->ms->chain_active);
+    zcl_mutex_unlock(&svc->ms->cs_main);
     atomic_store(&svc->lowest_have_data, chain_height);
     if (chain_height < svc->keep_blocks)
         return 0;  /* chain too short to prune anything */
@@ -327,7 +333,9 @@ int block_pruning_prune_sealed_range(struct block_pruning_service *svc,
     if (!svc || !svc->ms || !svc->datadir)
         return 0;
 
+    zcl_mutex_lock(&svc->ms->cs_main);
     int chain_height = active_chain_height(&svc->ms->chain_active);
+    zcl_mutex_unlock(&svc->ms->cs_main);
 
     /* Never prune above the caller's just-sealed+verified boundary, and never
      * beyond what keep_blocks already permits — the intersection of both
@@ -502,8 +510,11 @@ void block_pruning_get_status(const struct block_pruning_service *svc,
     out->bytes_reclaimed = atomic_load(&svc->bytes_reclaimed);
     out->lowest_have_data = atomic_load(&svc->lowest_have_data);
     out->keep_blocks     = svc->keep_blocks;
-    if (svc->ms)
+    if (svc->ms) {
+        zcl_mutex_lock(&svc->ms->cs_main);
         out->chain_height = active_chain_height(&svc->ms->chain_active);
+        zcl_mutex_unlock(&svc->ms->cs_main);
+    }
 }
 
 /* See CLAUDE.md "Adding state introspection". Reads g_block_pruning
