@@ -101,10 +101,32 @@ static struct snapshot_sync_service *runtime_snapsync_existing(void)
     return svc;
 }
 
+/* The snapshot service changes state on network and reset workers.  This
+ * condition runs independently, so read the state through the service
+ * snapshot instead of racing its lock-owned field. */
+static enum snapshot_sync_state snapshot_service_state(
+    struct snapshot_sync_service *svc)
+{
+    struct snapsync_status status = {0};
+
+    if (!svc)
+        return SNAPSYNC_IDLE;
+#ifdef ZCL_TESTING
+    if (svc == g_test_svc)
+        return svc->state;
+#endif
+    snapsync_get_status_snapshot(svc, &status);
+    return status.state;
+}
+
+static enum snapshot_sync_state snapshot_recovery_state(void)
+{
+    return snapshot_service_state(runtime_snapsync_existing());
+}
+
 static bool snapshot_recovery_already_active(void)
 {
-    struct snapshot_sync_service *svc = runtime_snapsync_existing();
-    return svc && svc->state != SNAPSYNC_IDLE;
+    return snapshot_recovery_state() != SNAPSYNC_IDLE;
 }
 
 /* Capture the two chain-owned heights through the CSR.  The condition engine
@@ -278,8 +300,8 @@ static bool witness_tip_wedged_resnapshot(int64_t target_at_detect)
     if (target > 0 && local >= target)
         return true;
 
-    struct snapshot_sync_service *svc = runtime_snapsync(runtime_ndb());
-    enum snapshot_sync_state st = svc ? svc->state : SNAPSYNC_IDLE;
+    enum snapshot_sync_state st = snapshot_service_state(
+        runtime_snapsync(runtime_ndb()));
     atomic_store(&g_last_witness_snapsync_state, (int)st);
     return st == SNAPSYNC_COMPLETE;
 }
@@ -289,8 +311,7 @@ static bool detail_tip_wedged_resnapshot(struct json_value *out)
     struct main_state *ms = sync_monitor_main_state();
     if (!ms)
         ms = condition_engine_main_state();
-    struct snapshot_sync_service *svc = runtime_snapsync_existing();
-    enum snapshot_sync_state st = svc ? svc->state : SNAPSYNC_IDLE;
+    enum snapshot_sync_state st = snapshot_recovery_state();
     int current_local = -1;
     int header_height = -1;
     (void)tip_wedged_snapshot_chain_heights(ms, &current_local,
