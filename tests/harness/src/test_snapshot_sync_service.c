@@ -1975,22 +1975,69 @@ static int test_snapshot_sync_reset_coalesces_concurrent_failure(void)
     return failures;
 }
 
+struct snapshot_active_sqlite_authorizer {
+    unsigned int select_count;
+};
+
+static int snapshot_active_sqlite_authorizer(void *ctx, int action,
+                                             const char *arg1,
+                                             const char *arg2,
+                                             const char *db_name,
+                                             const char *trigger_name)
+{
+    struct snapshot_active_sqlite_authorizer *authorizer = ctx;
+
+    (void)arg1;
+    (void)arg2;
+    (void)db_name;
+    (void)trigger_name;
+    if (authorizer && action == SQLITE_SELECT)
+        authorizer->select_count++;
+    return SQLITE_OK;
+}
+
 static int test_snapshot_sync_service_runtime_accessor(void)
 {
     int failures = 0;
 
-    TEST("snapshot sync service uses runtime-owned instance when present") {
+    TEST("snapshot active predicate avoids status storage query") {
         struct snapshot_sync_service runtime_svc;
         struct app_runtime_context runtime = {0};
+        struct node_db ndb;
+        struct snapshot_active_sqlite_authorizer authorizer = {0};
+        bool ndb_open = false;
+        bool authorizer_set = false;
+        bool runtime_accessor = false;
+        bool active = false;
+        bool no_select = false;
 
         memset(&runtime_svc, 0, sizeof(runtime_svc));
-        runtime_svc.state = SNAPSYNC_RECEIVING;
-        runtime.snapshot_sync = &runtime_svc;
-
-        app_runtime_set_current(&runtime);
-        ASSERT(app_runtime_snapshot_sync() == &runtime_svc);
-        ASSERT(snapsync_is_active());
+        if (snapsync_get_state() != SNAPSYNC_IDLE)
+            ASSERT(snapsync_set_state(SNAPSYNC_IDLE, "test reset"));
+        ndb_open = node_db_open(&ndb, ":memory:");
+        if (ndb_open) {
+            runtime_svc.state = SNAPSYNC_RECEIVING;
+            runtime_svc.ndb = &ndb;
+            runtime.snapshot_sync = &runtime_svc;
+            app_runtime_set_current(&runtime);
+            runtime_accessor = app_runtime_snapshot_sync() == &runtime_svc;
+            authorizer_set = sqlite3_set_authorizer(
+                ndb.db, snapshot_active_sqlite_authorizer, &authorizer) == SQLITE_OK;
+            if (authorizer_set) {
+                active = snapsync_is_active();
+                no_select = authorizer.select_count == 0;
+            }
+        }
+        if (authorizer_set)
+            (void)sqlite3_set_authorizer(ndb.db, NULL, NULL);
         app_runtime_set_current(NULL);
+        if (ndb_open)
+            node_db_close(&ndb);
+        ASSERT(ndb_open);
+        ASSERT(runtime_accessor);
+        ASSERT(authorizer_set);
+        ASSERT(active);
+        ASSERT(no_select);
         if (snapsync_get_state() != SNAPSYNC_IDLE)
             ASSERT(snapsync_set_state(SNAPSYNC_IDLE, "test reset"));
         ASSERT(snapsync_set_state(SNAPSYNC_NEGOTIATING, "test active guard"));

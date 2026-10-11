@@ -603,7 +603,7 @@ bool snapsync_peer_disconnected(struct snapshot_sync_service *svc,
 bool snapsync_is_active(void)
 {
     struct snapshot_sync_service *svc = app_runtime_snapshot_sync();
-    struct snapsync_status st;
+    bool active;
 
     switch (snapsync_get_state()) {
     case SNAPSYNC_NEGOTIATING:
@@ -619,10 +619,17 @@ bool snapsync_is_active(void)
             return false;  // raw-return-ok:not-initialized-is-a-normal-not-active-result
         svc = snapsync_global();
     }
-    snapsync_get_status_snapshot(svc, &st);
-    return st.state == SNAPSYNC_NEGOTIATING ||
-           st.state == SNAPSYNC_RECEIVING ||
-           st.state == SNAPSYNC_VERIFYING;
+
+    /* This predicate runs from the P2P message path.  It needs only the
+     * lifecycle state, not the diagnostic staging-row count collected by a
+     * full status snapshot.  Keep the state read serialized with reset and
+     * admission, but avoid a SQLite query while the service mutex is held. */
+    snapsync_service_lock_internal();
+    active = svc->state == SNAPSYNC_NEGOTIATING ||
+             svc->state == SNAPSYNC_RECEIVING ||
+             svc->state == SNAPSYNC_VERIFYING;
+    snapsync_service_unlock_internal();
+    return active;
 }
 
 bool snapsync_awaiting_utxos(void)
