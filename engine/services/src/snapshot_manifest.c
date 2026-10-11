@@ -95,7 +95,7 @@ enum snapshot_manifest_result snapshot_manifest_validate_offer(
         snapshot_manifest_validate_common(m);
     if (common != SNAPSHOT_MANIFEST_OK)
         return common;
-    if (m->height <= our_height + 5000)
+    if ((int64_t)m->height <= (int64_t)our_height + 5000)
         return SNAPSHOT_MANIFEST_NOT_AHEAD;
     return SNAPSHOT_MANIFEST_OK;
 }
