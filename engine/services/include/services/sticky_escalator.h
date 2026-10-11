@@ -130,6 +130,12 @@ void sticky_escalator_test_set_refold_artifact_available(int override_value);
  * connman_kick_onion_seeds dispatches (excludes the no-connman / already-
  * healthy / cooldown-hold early-outs). */
 uint64_t sticky_escalator_test_widen_kicks(void);
+/* Override only the wall-clock sampled by the widen-peers cooldown. A value
+ * of INT64_MIN restores the platform clock. */
+void sticky_escalator_test_set_widen_clock(int64_t now_unix);
+/* Exact cooldown predicate used by the widen-peers production rung. */
+bool sticky_escalator_test_widen_cooldown_active(int64_t now_unix,
+                                                  int64_t last_kick_unix);
 
 /* Livelock backstop test seam: count of times a rung was force-advanced by the
  * per-episode zero-progress assertion (STICKY_LIVELOCK_MAX_PASSES). */

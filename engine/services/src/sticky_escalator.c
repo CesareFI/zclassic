@@ -113,6 +113,7 @@ static _Atomic int64_t g_widen_last_kick_unix = 0;
 /* Refold seams: suppress shutdown/respawn; override the artifact gate. */
 static _Atomic bool g_test_suppress_refold_restart = false;
 static _Atomic int  g_test_refold_artifact_override = -1;
+static _Atomic int64_t g_test_widen_clock_unix = INT64_MIN;
 /* widen_peers seam: counts actual dispatches of the kick functions (as
  * opposed to the early-out "already healthy" / "no connman" paths), so a
  * hermetic test can assert the rung genuinely solicited peers. */
@@ -152,6 +153,11 @@ const char *sticky_rung_name(enum sticky_rung r)
 
 static int64_t now_unix(void)
 {
+#ifdef ZCL_TESTING
+    int64_t test_now = atomic_load(&g_test_widen_clock_unix);
+    if (test_now != INT64_MIN)
+        return test_now;
+#endif
     return platform_time_wall_unix();
 }
 
@@ -630,6 +636,13 @@ static enum sticky_rung_result rung_self_mint_refold_default(void)
 #define STICKY_WIDEN_PEERS_MIN_HEALTHY 3
 #define STICKY_WIDEN_PEERS_KICK_COOLDOWN_SECS 60
 
+static bool widen_peers_cooldown_active(int64_t now, int64_t last_kick)
+{
+    return last_kick != 0 && now >= last_kick &&
+           (uint64_t)now - (uint64_t)last_kick <
+               (uint64_t)STICKY_WIDEN_PEERS_KICK_COOLDOWN_SECS;
+}
+
 static enum sticky_rung_result rung_widen_peers_default(void)
 {
     struct connman *cm = sync_monitor_connman();
@@ -655,8 +668,7 @@ static enum sticky_rung_result rung_widen_peers_default(void)
 
     int64_t now = now_unix();
     int64_t last_kick = atomic_load(&g_widen_last_kick_unix);
-    if (last_kick != 0 &&
-        now - last_kick < STICKY_WIDEN_PEERS_KICK_COOLDOWN_SECS) {
+    if (widen_peers_cooldown_active(now, last_kick)) {
         /* Kicked this episode + still within cooldown: hold, don't re-thrash
          * seed/onion discovery every supervisor tick. */
         event_emitf(EV_RECOVERY_ACTION, 0,
@@ -1224,6 +1236,7 @@ void sticky_escalator_test_reset(void)
     atomic_store(&g_test_suppress_refold_restart, false);
     atomic_store(&g_test_refold_artifact_override, -1);
     atomic_store(&g_test_widen_kicks, 0u);
+    atomic_store(&g_test_widen_clock_unix, INT64_MIN);
     for (int i = 0; i < STICKY_RUNG_COUNT; i++) {
         atomic_store(&g_rung_dispatches[i], 0u);
         g_rung_fn[i] = NULL;
@@ -1250,6 +1263,13 @@ void sticky_escalator_test_set_refold_artifact_available(int v)
 
 uint64_t sticky_escalator_test_widen_kicks(void)
 { return atomic_load(&g_test_widen_kicks); }
+
+void sticky_escalator_test_set_widen_clock(int64_t now_unix_in)
+{ atomic_store(&g_test_widen_clock_unix, now_unix_in); }
+
+bool sticky_escalator_test_widen_cooldown_active(int64_t now_unix_in,
+                                                  int64_t last_kick_unix)
+{ return widen_peers_cooldown_active(now_unix_in, last_kick_unix); }
 
 uint64_t sticky_escalator_test_livelock_force_advances(void)
 { return atomic_load(&g_livelock_force_advances); }

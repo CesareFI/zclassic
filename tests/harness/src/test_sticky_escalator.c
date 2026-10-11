@@ -568,6 +568,19 @@ static enum sticky_rung_result se_always_progressing(void)
     return STICKY_RUNG_PROGRESSING;
 }
 
+/* Exercise the real widen-peers rung after its prior dispatch.  Keep this
+ * clock-boundary assertion out of the main scenario so that adding one
+ * recovery edge does not increase that already dense test's complexity. */
+static bool widen_peers_rearms_after_clock_rollback(int64_t drive_time)
+{
+    sticky_escalator_test_set_widen_clock(drive_time - 1051);
+    bool rearmed = sticky_escalator_test_drive(0, drive_time) ==
+                       STICKY_RUNG_WIDEN_PEERS &&
+                   sticky_escalator_test_widen_kicks() == 2;
+    sticky_escalator_test_set_widen_clock(INT64_MIN);
+    return rearmed;
+}
+
 int test_sticky_escalator(void);
 int test_sticky_escalator(void)
 {
@@ -1025,6 +1038,7 @@ int test_sticky_escalator(void)
                  sticky_escalator_test_drive(0, t9 + 35) ==
                      STICKY_RUNG_WIDEN_PEERS &&
                  sticky_escalator_test_widen_kicks() == 0);
+        sticky_escalator_test_set_widen_clock(t9 + 36);
         /* First dispatch of the rung: it kicks seed discovery and HOLDS the
          * rung within its witness window — never NOT_IMPLEMENTED (which would
          * have advanced instead of holding). */
@@ -1038,6 +1052,11 @@ int test_sticky_escalator(void)
                  sticky_escalator_test_drive(0, t9 + 50) ==
                      STICKY_RUNG_WIDEN_PEERS &&
                  sticky_escalator_test_widen_kicks() == 1);
+        /* A civil-clock rollback is not evidence that the earlier discovery
+         * kick is still fresh. Re-arm once so seed discovery can recover a
+         * partition instead of waiting for wall time to catch up. */
+        SE_CHECK("T9: rollback re-arms widen_peers discovery",
+                 widen_peers_rearms_after_clock_rollback(t9 + 51));
 
         sticky_escalator_set_datadir(NULL);
         teardown_fixture(&fx);
