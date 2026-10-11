@@ -58,7 +58,7 @@ static int best_header_same_height_body_target(struct main_state *ms)
             }
             if (uint256_eq(side->phashBlock, active->phashBlock))
                 break;
-            if ((side->nStatus & BLOCK_HAVE_DATA) == 0)
+            if ((block_index_status_load(side) & BLOCK_HAVE_DATA) == 0)
                 target = side->nHeight;
             side = side->pprev;
             active = active->pprev;
