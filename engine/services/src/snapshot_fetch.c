@@ -24,6 +24,7 @@
 #include "models/db_txn.h"
 #include "models/utxo.h"
 #include "coins/utxo_commitment.h"
+#include "core/amount.h"
 #include "event/event.h"
 #include "sync/sync_state.h"
 #include "util/log_macros.h"
@@ -61,6 +62,24 @@ void snapsync_test_run_end_finalize_gate(void)
         gate(ctx);
 }
 #endif
+
+/* Snapshot values are unsigned little-endian wire bytes. Decode them before
+ * converting to the signed staging representation so bit 63 is never shifted
+ * through a signed value. */
+static bool snapsync_decode_money(const uint8_t bytes[8], int64_t *out)
+{
+    if (!bytes || !out)
+        return false;
+
+    uint64_t value = 0;
+    for (size_t i = 0; i < 8; i++)
+        value |= (uint64_t)bytes[i] << (i * 8);
+    if (value > (uint64_t)MAX_MONEY)
+        return false;
+
+    *out = (int64_t)value;
+    return true;
+}
 
 /* ── Staging helpers ─────────────────────────────────────── */
 
@@ -343,9 +362,9 @@ static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
                   (chunk_data[pos+2] << 16) | (chunk_data[pos+3] << 24));
         pos += 4;
 
-        u.value = 0;
-        for (int j = 0; j < 8; j++)
-            u.value |= (int64_t)chunk_data[pos + j] << (j * 8);
+        if (!snapsync_decode_money(chunk_data + pos, &u.value))
+            LOG_ERR("snapshot_sync",
+                    "apply_chunk: value outside money range entry %u", i);
         pos += 8;
 
         u.height = (int)(chunk_data[pos] | (chunk_data[pos+1] << 8) |
