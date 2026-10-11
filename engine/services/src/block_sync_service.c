@@ -32,9 +32,30 @@
 #include "util/log_macros.h"
 #include "util/safe_alloc.h"
 
-static int64_t g_last_stall_log = 0;
-static int64_t g_last_stall_reset = 0;
+static _Atomic int64_t g_last_stall_log = 0;
+static _Atomic int64_t g_last_stall_reset = 0;
 static _Atomic int64_t g_last_stale_warn = 0;
+
+/* Recovery throttles are shared by peer handlers. Claim an interval in one
+ * operation so concurrent stalled peers cannot both schedule the same
+ * recovery. A non-forward wall clock starts a fresh recovery epoch instead
+ * of suppressing recovery until civil time catches up. */
+static bool syncsvc_claim_interval(_Atomic int64_t *last, int64_t now,
+                                   int64_t interval)
+{
+    int64_t observed = atomic_load_explicit(last, memory_order_relaxed);
+
+    for (;;) {
+        if (now == observed ||
+            (now > observed && (uint64_t)now - (uint64_t)observed <=
+                               (uint64_t)interval))
+            return false;
+        if (atomic_compare_exchange_weak_explicit(last, &observed, now,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed))
+            return true;
+    }
+}
 
 /* The stale-tip warning is an operational throttle shared by all peer
  * handlers. Claiming it must be one operation: concurrent stale peers may
@@ -458,6 +479,14 @@ void syncsvc_stale_warning_reset_for_testing(void)
     atomic_store_explicit(&g_last_stale_warn, 0, memory_order_relaxed);
 }
 
+#ifdef ZCL_TESTING
+void syncsvc_stall_recovery_reset_for_testing(void)
+{
+    atomic_store_explicit(&g_last_stall_log, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_last_stall_reset, 0, memory_order_relaxed);
+}
+#endif
+
 bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
                                   const struct main_state *ms,
                                   const struct p2p_node *node,
@@ -473,7 +502,6 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
 
     if (queued != 0 || in_flight != 0) return false;
     if (node->state < PEER_HANDSHAKE_COMPLETE) return false;
-    if (now_seconds - g_last_stall_log <= 10) return false;
 
     /* ONE pass over block_map gathers everything the planning below
      * needs: per-height data presence for the probe window (our_h+1..
@@ -506,7 +534,11 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
         free(cand);
         return false;
     }
-    g_last_stall_log = now_seconds;
+    if (!syncsvc_claim_interval(&g_last_stall_log, now_seconds, 10)) {
+        zcl_mutex_unlock(&mutable_ms->cs_main);
+        free(cand);
+        return false;
+    }
     recovery->should_recover = true;
     recovery->should_log = true;
     recovery->chain_height = our_h;
@@ -622,8 +654,8 @@ bool syncsvc_build_stall_recovery(struct sync_stall_recovery *recovery,
     recovery->alt_count = alt_count;
     recovery->should_request_tip_parent = tip_has_parent;
 
-    if (alt_count == 0 && now_seconds - g_last_stall_reset > 30) {
-        g_last_stall_reset = now_seconds;
+    if (alt_count == 0 &&
+        syncsvc_claim_interval(&g_last_stall_reset, now_seconds, 30)) {
         recovery->should_reset_tip_next = true;
     }
 

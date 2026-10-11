@@ -30,6 +30,7 @@
  * this suite already use for test-only entry points. */
 extern void syncsvc_sync_benchmark_reset_for_testing(void);
 extern void syncsvc_stale_warning_reset_for_testing(void);
+extern void syncsvc_stall_recovery_reset_for_testing(void);
 extern void syncsvc_block_file_scan_reset_for_testing(void);
 extern void syncsvc_header_log_reset_for_testing(void);
 
@@ -2472,6 +2473,7 @@ static int test_sync_service_requests_reset_when_no_alts(void)
         memset(&b1, 0, sizeof(b1));
         memset(&bad2, 0, sizeof(bad2));
         main_state_init(&ms);
+        syncsvc_stall_recovery_reset_for_testing();
         block_index_init(&g);
         block_index_init(&b1);
         block_index_init(&bad2);
@@ -2493,6 +2495,17 @@ static int test_sync_service_requests_reset_when_no_alts(void)
         ASSERT(recovery.alt_count == 0);
         ASSERT(recovery.should_reset_tip_next);
         syncsvc_free_stall_recovery(&recovery);
+        /* Equal time remains throttled; a backward wall-clock correction
+         * starts one fresh recovery epoch rather than stranding the missing
+         * body request until civil time catches up. */
+        ASSERT(!syncsvc_build_stall_recovery(&recovery, &ms, &node, 0, 0,
+                                             2000));
+        ASSERT(syncsvc_build_stall_recovery(&recovery, &ms, &node, 0, 0,
+                                            1900));
+        ASSERT(recovery.should_reset_tip_next);
+        syncsvc_free_stall_recovery(&recovery);
+        ASSERT(!syncsvc_build_stall_recovery(&recovery, &ms, &node, 0, 0,
+                                             1900));
         main_state_free(&ms);
         PASS();
     } _test_next:;
