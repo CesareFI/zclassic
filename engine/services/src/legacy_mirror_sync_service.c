@@ -534,10 +534,10 @@ static void lms_record_stuck_status(int height)
             if (!bi) {
                 lms_set_stuck_reason("no-authorized-child");
             } else {
-                flags = bi->nStatus;
-                if (!(bi->nStatus & BLOCK_HAVE_DATA))
+                flags = block_index_status_load(bi);
+                if (!(flags & BLOCK_HAVE_DATA))
                     lms_set_stuck_reason("missing-have-data");
-                else if (bi->nStatus & BLOCK_FAILED_MASK)
+                else if (flags & BLOCK_FAILED_MASK)
                     lms_set_stuck_reason("failed-mask");
                 else
                     lms_set_stuck_reason("activation-state");
