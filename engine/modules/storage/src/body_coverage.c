@@ -404,6 +404,20 @@ static bool bc_load_persist_count(struct sqlite3 *db, const char *key,
     return true;
 }
 
+static bool bc_persist_blob_len_valid(size_t blob_len)
+{
+    const size_t hdr = 3 * sizeof(uint32_t);
+    const size_t max_blob = hdr +
+        (size_t)BODY_COVERAGE_PERSIST_MAX_RANGES * 2 * sizeof(int64_t);
+
+    if (blob_len < hdr)
+        LOG_FAIL("body_coverage", "load: blob too small (%zu)", blob_len);
+    if (blob_len > max_blob)
+        LOG_FAIL("body_coverage", "load: blob too large (%zu > %zu)",
+                 blob_len, max_blob);
+    return true;
+}
+
 bool body_coverage_load_key(struct body_coverage_map *m,
                             struct sqlite3 *db, const char *key)
 {
@@ -413,15 +427,14 @@ bool body_coverage_load_key(struct body_coverage_map *m,
 
     size_t blob_len = 0;
     bool found = false;
-    if (!progress_meta_get(db, key, NULL, 0,
-                           &blob_len, &found))
-        LOG_FAIL("body_coverage", "load: progress_meta_get(len) failed");
+    if (!progress_meta_get_blob_exact(db, key, NULL, 0,
+                                      &blob_len, &found))
+        LOG_FAIL("body_coverage", "load: progress_meta_get_blob_exact(len) failed");
     if (!found)
         return true; /* fresh datadir: no coverage yet */
 
-    size_t hdr = 3 * sizeof(uint32_t);
-    if (blob_len < hdr)
-        LOG_FAIL("body_coverage", "load: blob too small (%zu)", blob_len);
+    if (!bc_persist_blob_len_valid(blob_len))
+        return false;
 
     /* Validate the fixed header before committing to the blob allocation.
      * The writer caps persisted ranges; a corrupted local row must not turn
@@ -429,6 +442,7 @@ bool body_coverage_load_key(struct body_coverage_map *m,
     uint32_t cnt = 0;
     if (!bc_load_persist_count(db, key, blob_len, &cnt))
         return false;
+    size_t hdr = 3 * sizeof(uint32_t);
     size_t need = hdr + (size_t)cnt * 2 * sizeof(int64_t);
     if (need != blob_len)
         LOG_FAIL("body_coverage", "load: length mismatch cnt=%u len=%zu",
@@ -439,10 +453,11 @@ bool body_coverage_load_key(struct body_coverage_map *m,
         LOG_FAIL("body_coverage", "load: alloc %zu failed", blob_len);
     size_t got = 0;
     bool found2 = false;
-    if (!progress_meta_get(db, key, buf, blob_len,
-                           &got, &found2) || !found2 || got != blob_len) {
+    if (!progress_meta_get_blob_exact(db, key, buf, blob_len,
+                                      &got, &found2) || !found2 ||
+        got != blob_len) {
         free(buf);
-        LOG_FAIL("body_coverage", "load: progress_meta_get(read) short/failed");
+        LOG_FAIL("body_coverage", "load: progress_meta_get_blob_exact(read) short/failed");
     }
 
     /* Re-insert every range: insert enforces the sorted/disjoint invariant,

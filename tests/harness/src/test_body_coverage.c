@@ -399,6 +399,52 @@ static int test_bc_int64_boundaries_and_persist_cap(void)
     return failures;
 }
 
+static int test_bc_persistence_rejects_non_blob(void)
+{
+    int failures = 0;
+    TEST("load rejects a coverage row stored as SQLite text") {
+        char dir[256];
+        test_make_tmpdir(dir, sizeof(dir), "body_coverage", "non_blob");
+        ASSERT(progress_store_open(dir));
+        sqlite3 *db = progress_store_db();
+        ASSERT(db != NULL);
+        ASSERT(progress_meta_table_ensure(db));
+
+        uint8_t blob[3 * sizeof(uint32_t) + 2 * sizeof(int64_t)] = {0};
+        uint32_t magic = 0x42434f56u;
+        uint32_t version = 1u;
+        uint32_t count = 1u;
+        int64_t lo = 7;
+        int64_t hi = 9;
+        memcpy(blob + 0, &magic, sizeof(magic));
+        memcpy(blob + 4, &version, sizeof(version));
+        memcpy(blob + 8, &count, sizeof(count));
+        memcpy(blob + 12, &lo, sizeof(lo));
+        memcpy(blob + 12 + sizeof(lo), &hi, sizeof(hi));
+
+        sqlite3_stmt *st = NULL;
+        ASSERT(sqlite3_prepare_v2(
+                   db,
+                   "INSERT OR REPLACE INTO progress_meta(key,value) VALUES(?,?)",
+                   -1, &st, NULL) == SQLITE_OK);
+        ASSERT(sqlite3_bind_text(st, 1, "body_coverage_non_blob", -1,
+                                 SQLITE_STATIC) == SQLITE_OK);
+        ASSERT(sqlite3_bind_text(st, 2, (const char *)blob, (int)sizeof(blob),
+                                 SQLITE_TRANSIENT) == SQLITE_OK);
+        ASSERT(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+
+        struct body_coverage_map m;
+        body_coverage_init(&m);
+        ASSERT(!body_coverage_load_key(&m, db, "body_coverage_non_blob"));
+        ASSERT(body_coverage_range_count(&m) == 0);
+        body_coverage_free(&m);
+        progress_store_close();
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 /* ── Scheduler ──────────────────────────────────────────────────── */
 
 static int test_bc_scheduler_plan_and_blocker(void)
@@ -559,6 +605,7 @@ int test_body_coverage(void)
     failures += test_bc_scan_window_int64_max();
     failures += test_bc_persistence_roundtrip();
     failures += test_bc_int64_boundaries_and_persist_cap();
+    failures += test_bc_persistence_rejects_non_blob();
     failures += test_bc_scheduler_plan_and_blocker();
     failures += test_bc_scheduler_fill_rate();
     failures += test_bc_gap_enqueue_drain_fixture();
