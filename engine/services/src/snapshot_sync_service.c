@@ -95,6 +95,10 @@ static snapsync_reset_gate_fn g_snapsync_offer_accepted_gate = NULL;
 static void *g_snapsync_offer_accepted_gate_ctx = NULL;
 static snapsync_reset_gate_fn g_snapsync_headers_resume_gate = NULL;
 static void *g_snapsync_headers_resume_gate_ctx = NULL;
+static snapsync_reset_gate_fn g_snapsync_staging_count_gate = NULL;
+static void *g_snapsync_staging_count_gate_ctx = NULL;
+static pthread_mutex_t g_snapsync_staging_count_gate_lock =
+    PTHREAD_MUTEX_INITIALIZER;
 
 void snapsync_test_set_reset_gate(snapsync_reset_gate_fn fn, void *ctx)
 {
@@ -215,6 +219,28 @@ void snapsync_test_run_headers_resume_gate(void)
     gate = g_snapsync_headers_resume_gate;
     ctx = g_snapsync_headers_resume_gate_ctx;
     snapsync_service_unlock_internal();
+    if (gate)
+        gate(ctx);
+}
+
+void snapsync_test_set_staging_count_gate(snapsync_reset_gate_fn fn,
+                                          void *ctx)
+{
+    pthread_mutex_lock(&g_snapsync_staging_count_gate_lock);
+    g_snapsync_staging_count_gate = fn;
+    g_snapsync_staging_count_gate_ctx = ctx;
+    pthread_mutex_unlock(&g_snapsync_staging_count_gate_lock);
+}
+
+void snapsync_test_run_staging_count_gate(void)
+{
+    snapsync_reset_gate_fn gate;
+    void *ctx;
+
+    pthread_mutex_lock(&g_snapsync_staging_count_gate_lock);
+    gate = g_snapsync_staging_count_gate;
+    ctx = g_snapsync_staging_count_gate_ctx;
+    pthread_mutex_unlock(&g_snapsync_staging_count_gate_lock);
     if (gate)
         gate(ctx);
 }
@@ -898,6 +924,7 @@ void snapsync_get_failed_status(struct snapshot_sync_service *svc,
                                 struct snapsync_failed_status *out)
 {
     struct snapsync_failed_status local = {0};
+    struct node_db *ndb = NULL;
     if (!out)
         out = &local;
     memset(out, 0, sizeof(*out));
@@ -917,14 +944,14 @@ void snapsync_get_failed_status(struct snapshot_sync_service *svc,
     out->offered_utxos = svc->offered_count;
     out->serving_peer_id = svc->serving_peer_id;
     out->turbo_active = svc->turbo_active;
-    out->staged_row_count =
-        (svc->ndb && svc->ndb->open) ? snapsync_staging_count_internal(svc->ndb)
-                                     : -1;
+    ndb = svc->ndb;
     if (out->failed && svc->start_time_us > 0) {
         int64_t elapsed_us = snapsync_now_us_internal() - svc->start_time_us;
         out->elapsed_secs = elapsed_us > 0 ? elapsed_us / 1000000LL : 0;
     }
     snapsync_service_unlock_internal();
+    out->staged_row_count = (ndb && ndb->open)
+        ? snapsync_staging_count_internal(ndb) : -1;
 }
 
 bool snapsync_check_negotiation_stall(void)
@@ -1089,6 +1116,8 @@ void snapsync_get_progress(const struct snapshot_sync_service *svc,
 void snapsync_get_status_snapshot(const struct snapshot_sync_service *svc,
                                  struct snapsync_status *out)
 {
+    struct node_db *ndb;
+
     if (!svc || !out)
         return;
 
@@ -1098,6 +1127,8 @@ void snapsync_get_status_snapshot(const struct snapshot_sync_service *svc,
     out->serving_peer_id = svc->serving_peer_id;
     out->offered_height = svc->offered_height;
     out->turbo_active = svc->turbo_active;
-    out->staged_row_count = snapsync_staging_count_internal(svc->ndb);
+    ndb = svc->ndb;
     snapsync_service_unlock_internal();
+    out->staged_row_count = (ndb && ndb->open)
+        ? snapsync_staging_count_internal(ndb) : -1;
 }

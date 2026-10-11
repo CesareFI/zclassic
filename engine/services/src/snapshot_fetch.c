@@ -156,6 +156,9 @@ int64_t snapsync_staging_count_internal(struct node_db *ndb)
                 ndb ? (void*)ndb->db : NULL);
     if (!snapsync_bind_store_internal(&sctx, ndb, &store).ok)
         LOG_ERR("snapshot_sync", "staging_count: bind snapshot store failed");
+#ifdef ZCL_TESTING
+    snapsync_test_run_staging_count_gate();
+#endif
     return store.staging_count(store.self);
 }
 

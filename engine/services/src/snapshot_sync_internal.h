@@ -148,6 +148,9 @@ void snapsync_test_run_offer_accepted_gate(void);
 void snapsync_test_set_headers_resume_gate(snapsync_reset_gate_fn fn,
                                            void *ctx);
 void snapsync_test_run_headers_resume_gate(void);
+void snapsync_test_set_staging_count_gate(snapsync_reset_gate_fn fn,
+                                          void *ctx);
+void snapsync_test_run_staging_count_gate(void);
 bool snapsync_test_service_lock_is_held(void);
 #endif
 

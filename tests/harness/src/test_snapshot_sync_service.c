@@ -83,6 +83,13 @@ struct failed_reset_thread_ctx {
     bool reset_detected;
 };
 
+struct status_thread_ctx {
+    struct snapshot_sync_service *svc;
+    bool failed_status;
+    struct snapsync_status status;
+    struct snapsync_failed_status failed;
+};
+
 struct snapshot_reset_fixture {
     struct snapshot_sync_service svc;
     struct node_db ndb;
@@ -201,6 +208,17 @@ static void *snapshot_failed_reset_thread(void *ctx)
     struct failed_reset_thread_ctx *thread = ctx;
 
     thread->reset_detected = snapsync_check_failed_reset();
+    return NULL;
+}
+
+static void *snapshot_status_thread(void *ctx)
+{
+    struct status_thread_ctx *thread = ctx;
+
+    if (thread->failed_status)
+        snapsync_get_failed_status(thread->svc, &thread->failed);
+    else
+        snapsync_get_status_snapshot(thread->svc, &thread->status);
     return NULL;
 }
 
@@ -1615,6 +1633,113 @@ static int test_snapshot_failed_status_marks_closed_staging_unknown(void)
         snapsync_get_failed_status(&svc, &status);
         ASSERT(status.failed);
         ASSERT(status.staged_row_count == -1);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static bool snapshot_status_count_releases_service_lock(void)
+{
+    struct snapshot_sync_service svc;
+    struct node_db ndb;
+    struct reset_gate gate;
+    struct status_thread_ctx status_thread = {0};
+    pthread_t thread;
+    bool gate_initialized = false;
+    bool thread_started = false;
+    bool lock_released = false;
+    bool failed_lock_released = false;
+    bool result = false;
+
+    memset(&svc, 0, sizeof(svc));
+    memset(&ndb, 0, sizeof(ndb));
+    memset(&gate, 0, sizeof(gate));
+    if (!node_db_open(&ndb, ":memory:") ||
+        !snapshot_reset_gate_init(&gate))
+        goto cleanup;
+    gate_initialized = true;
+    snapsync_init(&svc, &ndb);
+    svc.state = SNAPSYNC_RECEIVING;
+    svc.offered_count = 9;
+    svc.serving_peer_id = 17;
+    svc.offered_height = 6000;
+    snapsync_test_set_staging_count_gate(snapshot_reset_gate, &gate);
+    status_thread.svc = &svc;
+    if (pthread_create(&thread, NULL, snapshot_status_thread,
+                       &status_thread) != 0)
+        goto cleanup;
+    thread_started = true;
+    pthread_mutex_lock(&gate.mutex);
+    while (!gate.is_entered)
+        pthread_cond_wait(&gate.entered, &gate.mutex);
+    pthread_mutex_unlock(&gate.mutex);
+
+    lock_released = !snapsync_test_service_lock_is_held();
+    pthread_mutex_lock(&gate.mutex);
+    gate.is_released = true;
+    pthread_cond_signal(&gate.release);
+    pthread_mutex_unlock(&gate.mutex);
+    pthread_join(thread, NULL);
+    thread_started = false;
+    result = lock_released && status_thread.status.state == SNAPSYNC_RECEIVING &&
+        status_thread.status.offered_count == 9 &&
+        status_thread.status.serving_peer_id == 17 &&
+        status_thread.status.offered_height == 6000;
+    if (!result)
+        goto cleanup;
+
+    pthread_mutex_lock(&gate.mutex);
+    gate.is_entered = false;
+    gate.is_released = false;
+    pthread_mutex_unlock(&gate.mutex);
+    svc.state = SNAPSYNC_FAILED;
+    status_thread.failed_status = true;
+    if (pthread_create(&thread, NULL, snapshot_status_thread,
+                       &status_thread) != 0)
+        goto cleanup;
+    thread_started = true;
+    pthread_mutex_lock(&gate.mutex);
+    while (!gate.is_entered)
+        pthread_cond_wait(&gate.entered, &gate.mutex);
+    pthread_mutex_unlock(&gate.mutex);
+    failed_lock_released = !snapsync_test_service_lock_is_held();
+    pthread_mutex_lock(&gate.mutex);
+    gate.is_released = true;
+    pthread_cond_signal(&gate.release);
+    pthread_mutex_unlock(&gate.mutex);
+    pthread_join(thread, NULL);
+    thread_started = false;
+    result = failed_lock_released && status_thread.failed.failed &&
+        status_thread.failed.offered_utxos == 9 &&
+        status_thread.failed.serving_peer_id == 17 &&
+        status_thread.failed.offered_height == 6000;
+
+cleanup:
+    snapsync_test_set_staging_count_gate(NULL, NULL);
+    if (thread_started) {
+        pthread_mutex_lock(&gate.mutex);
+        gate.is_released = true;
+        pthread_cond_signal(&gate.release);
+        pthread_mutex_unlock(&gate.mutex);
+        pthread_join(thread, NULL);
+    }
+    if (gate_initialized) {
+        pthread_cond_destroy(&gate.release);
+        pthread_cond_destroy(&gate.entered);
+        pthread_mutex_destroy(&gate.mutex);
+    }
+    if (ndb.open)
+        node_db_close(&ndb);
+    return result;
+}
+
+static int test_snapshot_status_count_releases_service_lock(void)
+{
+    int failures = 0;
+
+    TEST("snapshot status counts do not block lifecycle mutex") {
+        ASSERT(snapshot_status_count_releases_service_lock());
         PASS();
     } _test_next:;
 
@@ -3423,6 +3548,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_db_service_runtime();
     failures += test_snapshot_turbo_restore_failure_keeps_retry_latch();
     failures += test_snapshot_failed_status_marks_closed_staging_unknown();
+    failures += test_snapshot_status_count_releases_service_lock();
     failures += test_snapshot_sync_reset_rejects_late_chunk();
     failures += test_snapshot_sync_reset_drains_admitted_begin_receive();
     failures += test_snapshot_sync_reset_drains_admitted_chunk();
