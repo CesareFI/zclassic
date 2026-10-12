@@ -41,6 +41,64 @@
 #include "net/msg_internal.h"
 #include "services/header_range_scheduler.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
+
+enum { HRS_GLOBAL_INIT_THREADS = 4 };
+
+static _Atomic int g_hrs_global_init_ready;
+static _Atomic bool g_hrs_global_init_go;
+static _Atomic bool g_hrs_global_init_same;
+static _Atomic(struct header_range_scheduler *) g_hrs_global_init_first;
+
+static void *hrs_global_init_worker(void *opaque)
+{
+    (void)opaque;
+    atomic_fetch_add(&g_hrs_global_init_ready, 1);
+    while (!atomic_load(&g_hrs_global_init_go))
+        ;
+    struct header_range_scheduler *current = header_range_scheduler_global();
+    struct header_range_scheduler *first =
+        atomic_load(&g_hrs_global_init_first);
+    if (!first)
+        (void)atomic_compare_exchange_strong(&g_hrs_global_init_first,
+                                             &first, current);
+    else if (first != current)
+        atomic_store(&g_hrs_global_init_same, false);
+    return NULL;
+}
+
+static int test_hrs_global_init_once(void)
+{
+    pthread_t threads[HRS_GLOBAL_INIT_THREADS];
+    bool started = true;
+    int started_count = 0;
+
+    atomic_store(&g_hrs_global_init_ready, 0);
+    atomic_store(&g_hrs_global_init_go, false);
+    atomic_store(&g_hrs_global_init_same, true);
+    atomic_store(&g_hrs_global_init_first, NULL);
+    for (; started_count < HRS_GLOBAL_INIT_THREADS; started_count++) {
+        if (pthread_create(&threads[started_count], NULL,
+                           hrs_global_init_worker, NULL) != 0) {
+            started = false;
+            break;
+        }
+    }
+    if (started) {
+        while (atomic_load(&g_hrs_global_init_ready) < HRS_GLOBAL_INIT_THREADS)
+            ;
+    }
+    atomic_store(&g_hrs_global_init_go, true);
+    for (int i = 0; i < started_count; i++)
+        (void)pthread_join(threads[i], NULL);
+    bool ok = started && atomic_load(&g_hrs_global_init_same) &&
+              atomic_load(&g_hrs_global_init_first) != NULL;
+    printf("header_range_sched: global init is once-only under concurrency... %s\n",
+           ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 static int test_continuation_preserves_stop(void)
 {
     printf("header_range_sched: continuation preserves assigned stop... ");
@@ -232,6 +290,7 @@ static int test_target_growth_retains_live_tail_owner(void)
 int test_header_range_sched(void)
 {
     int failures = 0;
+    failures += test_hrs_global_init_once();
     failures += test_empty_reply_releases_span();
     failures += test_disconnect_releases_span();
     failures += test_continuation_preserves_stop();

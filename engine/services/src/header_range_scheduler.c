@@ -401,22 +401,16 @@ size_t hrs_free_span_count(struct header_range_scheduler *s)
 
 static struct header_range_scheduler g_hrs;
 static zcl_mutex_t g_hrs_init_lock;
-static bool g_hrs_init_lock_ready = false;
+static zcl_once_t g_hrs_init_once = ZCL_ONCE_INIT;
 
-/* Cheap, race-tolerant one-time init of the init lock. The first caller in
- * the process is single-threaded boot (config/boot), so this initializes
- * before any net thread touches the global. */
-static void ensure_hrs_init_lock(void)
+static void hrs_init_lock_once(void)
 {
-    if (!g_hrs_init_lock_ready) {
-        zcl_mutex_init(&g_hrs_init_lock);
-        g_hrs_init_lock_ready = true;
-    }
+    zcl_mutex_init(&g_hrs_init_lock);
 }
 
 struct header_range_scheduler *header_range_scheduler_global(void)
 {
-    ensure_hrs_init_lock();
+    (void)zcl_once_call(&g_hrs_init_once, hrs_init_lock_once);
     zcl_mutex_lock(&g_hrs_init_lock);
     if (!g_hrs.inited)
         hrs_init(&g_hrs, HRS_DEFAULT_SPAN_TIMEOUT_US);
