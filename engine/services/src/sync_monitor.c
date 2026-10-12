@@ -707,7 +707,8 @@ int sync_monitor_local_header_refill(struct connman *cm,
 
     pthread_mutex_lock(&g_local_recovery_lock);
     if (rotated_peer)
-        g_local_recovery.peer_rotation_count++;
+        g_local_recovery.peer_rotation_count +=
+            g_local_recovery.peer_rotation_count < INT_MAX;
     g_local_recovery.active = true;
     g_local_recovery.missing_height = next_h;
     g_local_recovery.retry_count +=
@@ -918,6 +919,13 @@ void sync_monitor_test_set_local_recovery(bool active,
     snprintf(g_local_recovery.mode, sizeof(g_local_recovery.mode), "%s",
              mode ? mode : "");
     g_local_recovery.last_reason[0] = '\0';
+    pthread_mutex_unlock(&g_local_recovery_lock);
+}
+
+void sync_monitor_test_set_local_recovery_peer_rotation_count(int count)
+{
+    pthread_mutex_lock(&g_local_recovery_lock);
+    g_local_recovery.peer_rotation_count = count;
     pthread_mutex_unlock(&g_local_recovery_lock);
 }
 

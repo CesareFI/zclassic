@@ -333,6 +333,40 @@ static int test_local_header_refill_retry_counter_saturates(void)
     return ok ? 0 : 1;
 }
 
+static int test_local_header_refill_rotation_counter_saturates(void)
+{
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    struct watchdog_local_recovery_stats lr;
+    struct p2p_node first = {0};
+    struct p2p_node second = {0};
+    struct p2p_node *peers[2] = { &first, &second };
+
+    reset_sync_watchdog(&cm, &dm, &ms);
+    first.id = 1;
+    second.id = 2;
+    first.state = PEER_SYNCING_HEADERS;
+    second.state = PEER_SYNCING_HEADERS;
+    first.starting_height = 100;
+    second.starting_height = 100;
+    cm.manager.nodes = peers;
+    cm.manager.num_nodes = 2;
+    sync_monitor_test_set_local_recovery(
+        true, false, 99, 1, "next-child-missing");
+    sync_monitor_test_set_local_recovery_peer_rotation_count(INT_MAX);
+
+    bool ok = sync_monitor_local_header_refill(
+        &cm, 99, "test saturated local header rotation") == 2;
+    sync_monitor_get_local_recovery_stats(&lr);
+    ok = ok && lr.peer_rotation_count == INT_MAX &&
+         first.disconnect;
+    printf("sync_watchdog_conditions: local header refill rotation counter "
+           "saturates... %s\n", ok ? "OK" : "FAIL");
+    cleanup_sync_watchdog();
+    return ok ? 0 : 1;
+}
+
 int test_sync_watchdog_conditions(void)
 {
     printf("\n=== sync watchdog condition tests ===\n");
@@ -342,6 +376,7 @@ int test_sync_watchdog_conditions(void)
     failures += test_sync_monitor_download_counter_saturation();
     failures += test_download_queue_starved_detail_counter_saturation();
     failures += test_local_header_refill_retry_counter_saturates();
+    failures += test_local_header_refill_rotation_counter_saturates();
 
     {
         /* C3: verified reducer progress must reach the network backpressure
