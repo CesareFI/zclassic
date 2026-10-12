@@ -2,215 +2,155 @@
 
 # Z23 agent entry point
 
-This is the model-neutral operating contract for coding agents. Read it before
-changing the repository. Detailed procedure belongs in
-[`docs/DEVELOPING.md`](./docs/DEVELOPING.md); current priorities belong in
-[`docs/work/FORWARD_PLAN.md`](./docs/work/FORWARD_PLAN.md); current state of the
-maintainer's hosted node belongs only in
-[`docs/HANDOFF.md`](./docs/HANDOFF.md).
-
-The disposition this repository expects from an agent — act when the rails
-hold, and build the missing rail rather than remembering to avoid it — is
-[`docs/CODE_FEARLESSLY.md`](./docs/CODE_FEARLESSLY.md).
+Read this model-neutral contract before changing the repository. It owns
+durable principles and authority. [FORWARD_PLAN.md](docs/work/FORWARD_PLAN.md)
+owns the ordered mission; [DEVELOPING.md](docs/DEVELOPING.md) owns procedure;
+[AGENT_FLEET.md](docs/work/AGENT_FLEET.md) owns the fleet operating model.
+[HANDOFF.md](docs/HANDOFF.md) is maintainer-host live-state routing only.
+[CODE_FEARLESSLY.md](docs/CODE_FEARLESSLY.md) explains the operating
+disposition: act when the rails hold and build a missing rail.
 
 ## North Star
 
-Z23 exists to make useful software abundant without taking control away from
-the user. **Software made for you, not imposed on you.**
+**Software made for you, not imposed on you.** A person describes what a device
+should do; interchangeable workers reuse C23 parts, create only what is missing,
+build quickly, show the real consequence, reproduce the exact result elsewhere,
+and let the person accept and use that version.
 
-A person should be able to describe what they want a device to do. AI workers
-reuse existing C23 parts first, create only what is missing, build the result
-quickly, show its real behavior, reproduce the exact result on another
-machine, and let the user accept and use that exact version.
-
-AI workers are replaceable. Z23 is the durable layer: exact source identity,
-reusable packages, dependency graphs, bounded builds, independent
-reproduction, local policy, distribution, release history, and preservation.
-The result must remain usable even when the original agent, vendor, registry,
-or company disappears.
-
-The work is one journey:
-
-> Describe desired behavior → reuse existing C23 first → create only missing
-> code → build fast → show the real consequence → reproduce it on another
-> node → accept the exact version → use it in a real application.
-
-The user should feel: "I can make my device work exactly the way I want."
-Keep complexity hidden but inspectable. Give the user one obvious next
-action.
-
-### Fleet speed north star
+Z23 is the durable layer: exact source identity, reusable packages, dependency
+graphs, bounded builds, independent reproduction, local policy, distribution,
+release history and preservation. The result must remain usable after the
+agent, vendor, registry or company disappears. Keep complexity hidden but
+inspectable, with one obvious next action.
 
 Treat participating machines as one distributed C23 production computer.
-Before each action, ask whether cryptographically bound work from any peer
-can eliminate that computation under the receiver's exact policy. Minimize
-new computation, new bytes, and critical-path latency across the fleet.
+Before computing, ask whether receiver-verified peer work can satisfy the
+exact request. Derive action roots early, attach duplicate requests to existing
+work, and distribute independent missing actions to qualified peers. Serialize
+dependencies, conflicting writes and protected resources, not unrelated work.
+Measure duplicate CPU, bytes, hashes, copies, queue waits and tool launches.
+Optimize complete accepted-task cost, including failed attempts, repair and
+review. Preserve unknown costs and conflicting evidence.
 
-Derive exact action roots early. Attach duplicate requests to existing work;
-distribute independent missing actions across qualified idle peers. Race local
-execution against qualified P2P discovery when measurements justify it. Fetch
-only missing chunks, prefetch likely dependencies, and keep popular verified
-native components hot in existing caches. Serialize actual dependencies,
-conflicting writes, and protected resources; unrelated work must not wait
-behind one machine.
+Use existing CAS, action, receipt, queue and transport authorities. Keep verified
+components warm; transfer only missing content. Qualification precedes replacing
+old computation or artifacts.
+## Product and architecture
 
-Separate fine-grained identity from efficient packed transfer and mapping.
-Measure duplicate CPU, transferred bytes, hashes, copies, queue waits, and
-compiler, linker, and test launches. Delete work that adds no information once
-its exact replacement qualifies. Explore function/island capsules, lightweight
-native binding, distributed ThinLTO, and later QEDC-native emission through
-bounded experiments with explicit evidence limits.
+Z23 is a public ZClassic blockchain full node first. One self-contained C23
+binary validates the chain, participates in P2P, holds transparent and shielded
+wallet state, and can serve through embedded Tor. Consensus must remain
+bit-for-bit compatible with `zclassicd`.
 
-Reuse remains receiver-verified: a hash or signature alone does not establish
-the claimed computation. Preserve conflicts, platform compatibility, local
-authority, and the priority of consensus and custody. Use existing native
-CAS, action, receipt, queue, and transport authorities; verify available
-interfaces before describing a proposed capability as implemented.
+The optional C23 Commons lets ordinary nodes publish, discover, fetch, verify,
+build, independently reproduce and serve exact packages without a central
+registry. Keep the chain small and sovereign and the large software corpus
+off-chain and content-addressed. Do not force ZCL as the sole payment method.
+There is no live ZC23 token economics. Do not turn Z23 into a company, another
+AI harness or a speculative token product.
 
-## Product
+Paths declare ownership:
 
-Z23 is a public ZClassic blockchain full node first. One self-contained
-C23 binary validates the ZClassic chain, participates in its P2P network, holds
-transparent and shielded wallet state, and can expose its services through an
-embedded Tor onion service. It must remain bit-for-bit consensus-compatible
-with `zclassicd`.
+- `core/` is sealed truth; `engine/` composes and runs the node.
+  `engine/reducer/` alone owns chain-state advancement.
+- `contexts/<feature>/` contains feature-first product rooms;
+  `cognition/` contains software-understanding machinery.
+- `platform/ports/` and `platform/adapters/` isolate outside systems.
+  Reusable modules live beneath their owning authority; do not recreate
+  legacy global roots or duplicate owners.
+- `apps/` holds separate C23 programs that link neither `core/` nor
+  `engine/`, currently including Skycombat. They retain strict warnings and
+  portability gates; node architecture gates do not scan them.
 
-The node also provides an optional decentralized C23 software commons. Ordinary
-full nodes can publish, discover, fetch, verify, build, independently reproduce,
-and serve exact C23 packages without GitHub or a central package registry.
+After placement changes run `make check-architecture-tree`. It rejects legacy
+or undeclared roots, unknown rooms, duplicate owners, manifest drift and
+misplaced reducer paths. Use `build/bin/z23 code context-map` for the generated
+view, not a hand-maintained ownership catalog.
 
-## Physical architecture
+## Priority and evidence
 
-Paths declare ownership. `core/` is sealed truth; `engine/` composes and runs
-the node; `engine/reducer/` is the one authoritative chain-state advancement
-room; `contexts/<feature>/` contains feature-first product rooms; `cognition/`
-contains software-understanding machinery; and `platform/ports/` plus
-`platform/adapters/` isolate the outside world. Reusable modules live beneath
-the authority that owns them. Do not recreate global `app/`, `lib/`, `config/`,
-`domain/`, `platform/ports/`, or `platform/adapters/` roots.
+1. **P0:** consensus, wallet/custody and public-node correctness.
+2. **P1:** public-node V1 acceptance and reliability under
+   [MVP.md](docs/MVP.md), criteria C1–C8.
+3. **P2:** decentralized C23 Commons acceptance: content-addressed,
+   independently verifiable, bounded and locally accepted.
+4. **P3:** development machinery only when it advances P1 or P2.
+5. **P4:** simulation economics, marketplace expansion and speculative work.
 
-`apps/` is the one root that is not the node: programs that ship from this
-repository but link nothing from `core/` or `engine/` (today `apps/skycombat`,
-see `docs/GAME.md`). They are C23 with `-Werror` and must pass the portability
-gates; the node-architecture gates do not scan them.
+C1–C8 are necessary for platform v1, not the complete application journey.
+The release demonstration and current continuation queue live in
+[FORWARD_PLAN.md](docs/work/FORWARD_PLAN.md). No other plan, handoff,
+scorecard, skill or old session note may reorder that mission.
 
-Run `make check-architecture-tree` after placement changes. It rejects legacy
-roots, an undeclared top-level entry, unknown rooms, duplicate module owners,
-module-manifest drift, and reducer-owned paths outside `engine/reducer/`. The
-generated view is `build/bin/z23 code context-map`; do not hand-maintain a
-competing ownership catalog.
+The blockchain wins resource and authority contention. Builds, telemetry,
+package traffic and AI workers may not delay chain advancement, block
+processing, transaction relay, synchronization, peer health or wallet custody.
 
-## Operating rules
+**VERIFY, DON'T TRUST.** Any agent may propose and any node may compute.
+Receivers independently verify exact objects, signatures, roots and evidence
+under their own policy. A hash identifies bytes; a signature identifies the
+statement's signing key; a receipt binds an observation. None alone proves
+safety, correctness, usefulness or acceptance.
 
-**VERIFY, DON'T TRUST.** Any agent may propose code. Any node may perform
-computation. No result is accepted because of who produced it. Each receiving
-node independently verifies exact objects, signatures, roots, and evidence
-under its own local policy.
+Downloaded C is inert. Fetch/store, build/test, install/link and execute/deploy
+are separate authority transitions. None grants canonical-datadir, wallet or
+consensus authority. A unit test cannot replace acceptance of a real consensus
+or custody invariant. Distinguish source review, fixtures, runtime observations,
+platform qualification and production acceptance.
 
-Evidence establishes only its exact stated claim. A hash identifies bytes; a
-signature identifies the key that made a statement; a receipt records a bound
-observation. None of these alone proves that arbitrary code is safe, correct,
-secure, useful, or worthy of acceptance.
-
-Downloaded C is inert by default. Fetching and storing are separate from
-building and testing. Building and testing are separate from installing,
-linking, executing, or deploying. None grants wallet, consensus,
-canonical-datadir, or deployment authority.
-
-Every change should improve at least one of these: reuse useful C23 code;
-shorten the path from intent to working software; make the result smaller,
-faster, safer, or easier to customize; remove duplication or central
-dependency; improve exact reproduction and long-term preservation. Prefer
-deletion, reuse, and composition over new abstractions. Keep the blockchain
-small and sovereign. Keep the large software corpus off-chain and
-content-addressed. Do not force ZCL as the only payment method. Do not turn
-Z23 into a company, another AI harness, or a speculative token product.
-
-The near-term proof is one person creating or improving a real C23
-application from reusable parts, seeing the consequence, reproducing it
-elsewhere, accepting the exact version, and using it.
-
-AI workers are replaceable proposal engines. The fast
-development reactor is factory equipment, not the public product; expand it
-only when that directly advances public-node or C23 Commons acceptance.
-
-## Durable priority order
-
-1. **P0 — consensus, wallet/custody, and public-node correctness.** Consensus
-   parity is inviolable. Private keys and production state remain
-   operator-controlled.
-2. **P1 — public-node V1 acceptance and reliability.** The acceptance contract
-   is [`docs/MVP.md`](./docs/MVP.md): criteria C1–C8 for the public node only.
-   MVP 8/8 is necessary for platform v1 but does not complete it; the full
-   journey and its release demonstration are defined in
-   [`docs/work/FORWARD_PLAN.md`](./docs/work/FORWARD_PLAN.md).
-3. **P2 — decentralized C23 Commons product acceptance.** Packages and
-   evidence remain content-addressed, independently verifiable, bounded, and
-   locally accepted.
-4. **P3 — developer and orchestration machinery**, only when it unblocks P1 or
-   P2.
-5. **P4 — simulation-only economics, marketplace expansion, and speculative
-   features.** There is no live ZC23 token economics today.
-
-The blockchain wins resource and authority contention. Package activity may
-never delay or acquire authority over consensus, block processing, transaction
-relay, synchronization, peer health, wallet custody, or deployment.
-
+Every change should improve reuse, intent-to-working-software time, size,
+speed, safety, customization, exact reproduction or preservation. Prefer
+deletion, reuse and composition over new abstractions.
 ## First session
 
-Read `~/.config/dev-workers/OPERATIONS.md` and run `devworker where z23`
-before work on a shared host. Resume owned dirty work in place. Route every
-heavy build, proof, benchmark, and test matrix through `devbuild --wait`,
-preserving preset job counts and native locks. On the Mac use one focused
-build, normally two make jobs, with the 50 GB admission floor and 60 GB
-cleanup target. Keep services and watchers disabled unless explicitly requested.
-Derive catalogs from the binary instead of copying counts into prose.
+Read the installed
+`~/.config/dev-workers/OPERATIONS.md`, `STORAGE.md` and `WORKER.md`, then
+run `devworker where z23`. Their current reserves supersede historical
+floors. Managed Z23, QEDC and gate_computer development runs remotely through
+existing `devon` routes; the laptop coordinates and reviews, without builds
+or worker copies.
 
-1. Inspect the checkout and upstream before changing anything:
+Reuse a sanctioned worktree and preserve owned dirty work. Route heavy builds,
+proofs, benchmarks and matrices through `devbuild --wait`, preserving job
+counts and native locks. On the managed Mac use one focused build, normally
+two jobs. Do not launch services, watchers or workers automatically.
 
-   ```bash
-   pwd
-   git status --short --branch
-   git fetch origin main
-   git rev-parse HEAD origin/main
-   ```
+Inspect before editing:
 
-2. On a fresh clone, arm dependencies and local hooks:
+```bash
+pwd
+git status --short --branch
+git fetch origin main
+git rev-parse HEAD origin/main
+```
 
-   ```bash
-   devbuild --wait make setup
-   ```
+On a fresh clone, `devbuild --wait make setup` arms dependencies and hooks;
+its suggested `make doctor` is an optional environment check. Build the public
+binary on an admitted host:
 
-   It ends with `Next: make doctor`; that is an optional environment check.
+```bash
+devbuild --wait make -j"$(getconf _NPROCESSORS_ONLN)" z23
+build/bin/z23 code guide
+build/bin/z23 discover help
+build/bin/z23 code map
+```
 
-3. Build the public binary:
+Apply the installed host job limit to these generic examples. Descend through
+`discover help <path>`, search with `discover search <query>`, and inspect
+inputs with `discover schema <leaf>`. A command in a plan is a target until
+the selected binary lists it. The generated full catalog is
+[API_REFERENCE.md](docs/API_REFERENCE.md).
 
-   ```bash
-   devbuild --wait make -j"$(getconf _NPROCESSORS_ONLN)" z23
-   ```
+Use registered tests and the canonical runner, never direct `test_zcl`:
 
-4. Ask the built binary for the current command tree and source map:
+```bash
+make t-list
+devbuild --wait make -j"$(getconf _NPROCESSORS_ONLN)" t-fast-exact ONLY=<exact-group>
+devbuild --wait make -j"$(getconf _NPROCESSORS_ONLN)" test-parallel TEST_PARALLEL_ARGS=--no-cache
+```
 
-   ```bash
-   build/bin/z23 code guide
-   build/bin/z23 discover help
-   build/bin/z23 code map
-   ```
-
-   Descend with `discover help <path>`, search with the positional
-   `discover search <query>`, and inspect exact input keys with
-   `discover schema <leaf>`. The generated full catalog is
-   [`docs/API_REFERENCE.md`](./docs/API_REFERENCE.md).
-
-5. List or run registered test groups through the canonical runner:
-
-   ```bash
-   make t-list
-   devbuild --wait make -j"$(getconf _NPROCESSORS_ONLN)" t-fast-exact ONLY=<exact-group>
-   devbuild --wait make -j"$(getconf _NPROCESSORS_ONLN)" test-parallel TEST_PARALLEL_ARGS=--no-cache
-   ```
-
-   `ONLY=` is mandatory for `t-fast`. Do not invoke `test_zcl` directly.
+`ONLY=` is mandatory for `t-fast`. Derive catalogs from the binary rather
+than copying counts into entry documents.
 
 <!-- claim: symbol-present t-fast Makefile # focused registered-test target -->
 <!-- claim: symbol-present test-parallel Makefile # full registered-test target -->
@@ -220,197 +160,117 @@ Derive catalogs from the binary instead of copying counts into prose.
 
 ## Verified platform baseline
 
-The public node has native Linux and macOS build paths. macOS does not use a
-Linux virtual machine. On 2026-08-26, `make z23` completed on an arm64
-`Mac16,10` running macOS 26.0.1 with Apple Clang 17.0.0. The resulting Mach-O
-executable passed its dependency audit with Apple system libraries and
-frameworks as its only dynamic dependencies. The registered crypto group
-passed 3/3 groups, including secp256k1, Ed25519, Equihash, BLS12-381, and hash
-coverage. Native RNG, thread QoS, sandbox capability,
-backtrace capability, process introspection, and the 46-case SQLite group also
-passed their platform contracts. A fresh isolated test-lane datadir reached
-`phase=serving`, `stage=ready`, height 0 with RPC bound, then completed a
-graceful shutdown. This is startup evidence, not chain-sync acceptance.
-Descriptor-bound A/B execution is unavailable on macOS and fails closed;
-pathname reconstruction is not accepted as a substitute for `fexecve`.
-The dev/test proof executor has a narrower native rail: it obtains the
-CodeDirectory hash from the already-open thin Mach-O, spawns the locator path
-suspended, asks the kernel for the mapped child's CodeDirectory hash, and
-resumes only on an exact match. This does not promote production A/B or hot
-activation.
-The optimized ROM-seed background-scan regression also passed after bounding
-its worker-stack use; the artifact snapshot uses checked allocation instead of
-a roughly 1 MiB automatic array.
-The exact 10-package C23 Commons root and dependency-DAG projection, including
-all 217 monolith-owned package sources, also passed on macOS. Mach-O fixture
-builds use a fixed nonzero UUID and fixed-identifier ad-hoc signature; publisher
-and independent-checkout binaries execute and hash identically. The separate
-package verifier qualifies native Seatbelt filesystem scoping, network denial,
-and enforced rlimits as full package isolation; this does not claim Linux
-Landlock/seccomp mechanisms or resident-node confinement on macOS.
-
-The macOS capability boundary is explicit: the public node, wallet, P2P, RPC,
-database, cryptography, embedded Tor, and a native kqueue directory watcher build
-natively; qualified Seatbelt confinement is available only to the separate
-package verifier. Linux Landlock/seccomp resident confinement, signal-context
-self-backtraces, native hot-swap activation, and `O_TMPFILE` consensus snapshot
-export remain unavailable. Those paths refuse or report unavailable instead of
-claiming Linux guarantees. Only arm64 macOS is measured; Intel macOS remains
-unverified.
-
-Embedded full Tor has been observed to complete on the arm64 Mac host
-(`make tor-full`, ~110 s, producing `vendor/tor/libtor.a` from vendored
-OpenSSL/libevent/zlib). What the node links is decided by which archives exist,
-on every host. Build and test instructions are in
-[`docs/GETTING_STARTED.md`](./docs/GETTING_STARTED.md).
+Linux and arm64 macOS have native build paths; macOS does not require a Linux
+VM. On 2026-08-26, an arm64 Mac16,10 with macOS 26.0.1 and Apple Clang 17
+built the node, passed the dependency audit and recorded isolated startup and
+platform tests. That evidence is not current-candidate chain-sync acceptance.
+Intel macOS remains unverified. The detailed historical observations and
+platform refusal boundaries belong in
+[NATIVE_MACOS_RUNBOOK.md](docs/work/NATIVE_MACOS_RUNBOOK.md#historical-platform-baseline).
+Use its native acceptance target for new qualification; Linux tests do not
+qualify macOS.
 
 ## Orient before editing
 
-A fresh agent chooses work from one route: this contract, then the first open
-item in [`docs/work/FORWARD_PLAN.md`](./docs/work/FORWARD_PLAN.md). No other
-plan, scorecard, runbook, handoff, vendor skill, or old session note may
-reorder that mission.
+Read [DEVELOPING.md](docs/DEVELOPING.md) before edits and
+[AGENT_TRAPS.md](docs/AGENT_TRAPS.md) before repairing behavior that may be
+intentional or complete. Use the native navigator before broad search.
+Consult [CODEBASE_MAP.md](docs/CODEBASE_MAP.md) when ownership remains unclear.
+Raw search must stay in the tracked tree with `git grep` or `git ls-files`;
+never recursively scan a repository root containing scratch or worktrees.
 
-Each entry document owns one thing. This file owns durable principles, the
-priority order and authority boundaries. `FORWARD_PLAN.md` owns the active
-scope and the ordered queue. `MVP.md` owns public-node acceptance (C1–C8).
-`HANDOFF.md` points to maintainer-host evidence and never sets priorities.
-A command named in a plan is a target interface until the built binary's
-`discover` catalog lists it. An unchecked or unlisted item is not evidence
-that the code is absent; check the tree before rebuilding it.
-
-Load detail only when the task needs it:
-
-- Read [`docs/DEVELOPING.md`](./docs/DEVELOPING.md) before editing for the
-  development loop, integration gates, and exact build profiles.
-- Use [`docs/CODEBASE_MAP.md`](./docs/CODEBASE_MAP.md) after the built-in
-  navigator when source ownership is unclear.
-- Read [`docs/AGENT_TRAPS.md`](./docs/AGENT_TRAPS.md) before repairing behavior
-  that may be intentional or already complete.
-- Read [`docs/SECURITY_AND_INTEGRITY.md`](./docs/SECURITY_AND_INTEGRITY.md) and
-  [`docs/CONSENSUS_PARITY_DOCTRINE.md`](./docs/CONSENSUS_PARITY_DOCTRINE.md)
-  only when work approaches a security, custody, or consensus boundary.
-
-Do not read [`docs/HANDOFF.md`](./docs/HANDOFF.md) for ordinary development.
-It is maintainer-host live-state routing only. When the assignment explicitly
-requires that host, read it and then verify it against the running node:
-
-```bash
-build/bin/z23 status
-build/bin/z23 dumpstate reducer_frontier
-```
-
-A document can be stale; the node cannot. Do not copy live height, soak, or
-deployment state into durable entry documents.
-
-Use the built-in code navigator before broad text search. When raw search is
-needed, scope it to the tracked tree with `git grep` or `git ls-files`; never
-recursively scan the repository root, which can contain scratch data and full
-untracked worktrees.
+Read [SECURITY_AND_INTEGRITY.md](docs/SECURITY_AND_INTEGRITY.md) and
+[CONSENSUS_PARITY_DOCTRINE.md](docs/CONSENSUS_PARITY_DOCTRINE.md) when
+approaching security, custody or consensus. Read [HANDOFF.md](docs/HANDOFF.md)
+only for an explicit maintainer-host assignment, then verify against the
+running node with `build/bin/z23 status` and
+`build/bin/z23 dumpstate reducer_frontier`. Do not copy live height, soak or
+deployment status into durable entry documents.
 
 ## Authority and safety boundaries
 
-Agents may inspect, edit, build, and test source in the checkout and isolated
-fixtures. Agents do not implicitly have authority to:
+Source inspection, editing, builds and isolated tests do not implicitly permit:
 
-- change a consensus predicate or the byte-sealed consensus core;
-- spend funds, export private keys, or weaken wallet custody;
-- mutate a canonical datadir or perform live database surgery;
-- deploy, restart, or promote a production node;
-- weaken an assertion, acceptance threshold, or fail-closed refusal to obtain
-  a green result;
-- execute fetched package source outside the explicit bounded build/test
-  lifecycle;
-- publish, sign, or accept evidence on another operator's behalf.
+- consensus predicate changes or changes to the byte-sealed core;
+- spending funds, exporting keys or weakening custody;
+- canonical-datadir mutation or live database surgery;
+- production deployment, restart or promotion;
+- weakened assertions, acceptance thresholds or fail-closed refusals;
+- fetched-source execution outside the bounded build/test lifecycle;
+- publication, signing or acceptance on another operator's behalf.
 
-Consensus-core edits require the explicit unseal/reseal ritual documented in
-[`docs/CONSENSUS_PARITY_DOCTRINE.md`](./docs/CONSENSUS_PARITY_DOCTRINE.md).
-Recovery work is copy-first; see [`docs/TENACITY.md`](./docs/TENACITY.md).
-Deployment and custody actions remain owner-gated.
+Consensus edits require the documented explicit unseal/reseal ritual.
+Recovery is copy-first under [TENACITY.md](docs/TENACITY.md). Deployment and
+custody remain owner-gated. Explicit scoped owner authorization persists;
+do not repeatedly request the same authorization.
 
-Escalate only for a consensus or custody risk, a destructive production
-action, irreconcilable authority ambiguity, a missing human product decision,
-an assertion that would need weakening, or genuine completion of the current
-mission.
+Escalate only for consensus/custody risk, destructive production action,
+irreconcilable authority ambiguity, a missing human product decision, an
+assertion that would need weakening, or genuine mission completion.
 
 ## Development contract
 
-- Never use Python. Do not add `.py` files, `python3` shebangs, Python
-  heredocs, or `python3`/`python` invocations. Compiled code is C23. Operator
-  and test glue is POSIX or bash shell, or a small in-tree C23 helper such as
-  `tools/sqlq.c` and `tools/jsonq.c`. JSON is extracted with grep/sed/awk for
-  flat fields, or `build/bin/jsonq` for nested documents. SQLite inspection
-  uses `build/bin/sqlq`. Do not add Python as a fallback, optional path, or
-  "legacy" exception.
-- Preserve unrelated dirty work. Never reset, overwrite, or fold it into your
-  commit.
-- Maintain one primary writer per component. GitHub Issues and pull requests
-  are not coordination authorities and must not be created. Coordinate through
-  Z23 task, candidate, action, and receipt objects; committed `origin/main`
-  identity is the shared integration blackboard.
-- Coordination must survive replacement of any worker. Claim disjoint scopes
-  through native tools, obtain independent review where required, and hand
-  off persisted candidate/action/receipt state without requiring a permanent
-  lead. Preserve live leases; silence alone does not establish an orphan.
-- Fetch current `origin/main` before work and before each push. Integrate it
-  safely, then rerun affected gates.
-- Use typed native commands to inspect and operate a running node. Git,
-  compilers, `make`, and bounded shell scripts remain normal repository tools.
-- Add a native command only for a recurring operator or agent product need,
-  not for a one-off development convenience.
-- Keep tests scoped to local fixtures, isolated datadirs, and consenting peers.
-- **Fleet access is a prerequisite for distributed work.** Participating
-  machines must establish authenticated machine access in both directions
-  between each pair, using direct connections or tunnels where needed. Agents
-  coordinate and repair authorized development routes directly instead of
-  relying on human message relays. Before dispatch, verify a bounded command
-  and an exact-object transfer in each direction; a ping or delivered board
-  message alone does not qualify a route. Each receiver controls the permitted
-  workspace, commands, concurrency, access lifetime, and revocation. Reuse
-  existing SSH, tunnel, and native transport configuration; keep private
-  credentials local and endpoints out of public coordination messages. Record
-  route readiness and missing access in existing task/action/receipt evidence,
-  using peer aliases and object roots. Machine access retains the authority
-  boundaries above, including the separate production and custody gates.
-  Recurring fleet transport, tunnels, access control, and job execution belong
-  in the existing C23 node services. Shell is bootstrap, build, and test glue;
-  do not add a shell orchestration layer for these product capabilities.
-- Use existing CAS, task, candidate, action, receipt, queue, and signature
-  authorities. Do not create a parallel source of truth for convenience.
-- No consensus or custody claim is complete because a unit test passed. Run
-  the acceptance that observes the real invariant.
+- **C23 is canonical. Never use Python:** no `.py` files, Python shebangs,
+  invocations, heredocs, fallback or legacy exceptions. Operator/test glue is
+  POSIX or bash shell, or a small in-tree C23 helper such as `sqlq`/`jsonq`.
+  Extract flat JSON with grep/sed/awk and nested JSON with `build/bin/jsonq`;
+  use `build/bin/sqlq` for SQLite inspection.
+- Preserve unrelated dirty work; never reset, overwrite or include it in
+  your commit. Keep one primary writer per component and respect live leases.
+  Silence alone does not establish an orphan.
+- GitHub Issues and pull requests are not coordination authorities and must
+  not be created. Use native tasks, candidates, actions and receipts;
+  committed `origin/main` is the integration blackboard.
+- Claim disjoint scopes through native tools. Obtain required independent
+  review and persist handoffs so coordination survives replacement of any
+  worker without a permanent privileged lead.
+- Fetch current `origin/main` before work and every push. Integrate safely
+  and rerun affected gates. Never rewrite others' history.
+- Use typed native commands for a running node. Git, compilers, make and
+  bounded shell remain repository tools. New native commands require a
+  recurring operator/product need; reuse existing command families.
+- Use existing CAS, task, candidate, action, receipt, queue and signature
+  authorities. Do not create a competing source of truth.
+- Tests use local fixtures, isolated datadirs and consenting peers.
+  Every application write follows the ActiveRecord save lifecycle; retain
+  custody-bearing before/after-save hooks. Check allocations, log contextual
+  errors, and give native command failures explanatory response bodies.
+  [DEFENSIVE_CODING.md](docs/DEFENSIVE_CODING.md) and lint enforce the rules.
 
-Mandatory defensive rules are enforced by `make lint` and explained in
-[`docs/DEFENSIVE_CODING.md`](./docs/DEFENSIVE_CODING.md). In particular:
+Fleet access is a prerequisite for distributed work. Before dispatch verify
+authenticated access, a bounded command and exact-object transfer in both
+directions between each participating pair, directly or through tunnels.
+Ping, stale status and board delivery do not qualify a route. Repair authorized
+routes directly rather than using the human as a message relay. Reuse existing
+SSH, tunnels and native transport; keep private credentials local and endpoints
+out of public coordination messages.
 
-- every application write uses the ActiveRecord save lifecycle;
-- every error return logs context;
-- every allocation is checked;
-- every native command failure sets an explanatory response body;
-- custody-bearing models retain their before/after-save hooks.
+Each receiver controls workspace, commands, concurrency, access lifetime and
+revocation. Record readiness and missing access in native task/action/receipt
+evidence with aliases and object roots. Transport does not expand execution,
+production or custody authority. Recurring transport, access control, tunnels
+and job execution belong in C23 node services; shell remains bootstrap/build/
+test glue, not a new orchestration layer. Protected native execution,
+hardware virtualization and emulated guests retain their separate qualification
+boundaries under [AGENT_FLEET.md](docs/work/AGENT_FLEET.md).
 
 ## Completion and continuation
 
-A coherent slice is ready to publish only when its focused acceptance is green,
-required generated files are current, lint passes at the required scope, and
-the commit contains no unrelated work. Use native receipt-gated landing tools
-under `devbuild --wait`, following `docs/DEVELOPING.md`. Independently fetch
-and verify the exact remote SHA. Evidence applies only to its exact source,
-commit/base pair, and policy. Reconcile an unknown push before any retry.
+A coherent slice needs green focused acceptance, current generated files,
+required lint, independent review where required and no unrelated changes.
+Use native receipt-gated landing under `devbuild --wait`, as specified in
+[DEVELOPING.md](docs/DEVELOPING.md). Independently fetch and verify the exact
+remote SHA. Evidence applies only to its source, commit/base pair and policy;
+reconcile an unknown push before retrying.
 
-A push is a checkpoint, not completion. A status report does not suspend work.
-After each coherent push, fetch current `origin/main`, integrate it, and
-continue through the mission's ordered continuation queue. Stop only when the
-complete acceptance is green or one of the named escalation conditions is
-reached.
+A push is a checkpoint. Fetch current main, integrate safely and continue the
+ordered mission until complete acceptance or a named escalation condition.
+A status report does not suspend work. Remove obsolete code/instructions only
+after verifying ownership, callers and replacement acceptance. Update the
+owning document in the same slice and regenerate derived references through
+canonical targets. Preserve historical evidence and active work.
 
-Remove obsolete code and instructions when encountered, after verifying
-callers, ownership, and replacement acceptance. Update the document that
-owns the behavior in the same slice; regenerate generated references through
-their canonical targets. Preserve historical evidence and active work.
-
-For substantial assignments, workers should provide a compact mission
-capsule instead of repeating the repository doctrine:
+Use a compact mission capsule for substantial work:
 
 ```text
 NORTH STAR
@@ -423,28 +283,13 @@ CONTINUATION QUEUE
 ESCALATE ONLY IF
 ```
 
-The curated documentation map is [`docs/README.md`](./docs/README.md).
-
 ## Source baseline and managed development
 
-The owner authorized a single-commit source baseline on 2026-10-12, including
-retirement of prior branch/tag history and obsolete documentation. The prior
-remote main was `181b8f3591a538e28c56d22858b5c9b2284908cd`. Its complete remote history is
-preserved in a verified offline Git bundle. This one-time maintenance exception
-does not authorize future history rewriting or claim acceptance of unpublished
-work. Existing unpublished changes retain separate recovery custody.
+The owner authorized a one-time source-history baseline on 2026-10-12;
+verified offline recovery history and unpublished work retain separate custody.
+This grants no future rewrite authority. Start from current main and recover
+needed old work as bounded reviewed patches; do not merge unrelated old
+history. Detailed baseline provenance is in
+[DEVELOPING.md](docs/DEVELOPING.md#managed-source-baseline).
 
-This baseline removes 171 unreferenced pre-October dated documents. The
-production source, build definitions, tests and submodule identities are unchanged
-from that prior remote main. Current contracts and referenced evidence remain.
-A fresh checkout starts from the new main; do not merge an old checkout's
-unrelated history back into it. Recover a needed change as a bounded, reviewed
-patch against the current baseline.
-
-On the managed development fleet, read `~/.config/dev-workers/OPERATIONS.md`,
-`STORAGE.md` and `WORKER.md` in that directory. Use existing remote lanes and
-host build admission. Keep one writer per component, bounded scratch and caches,
-and a compact task capsule containing exact source, owned interfaces, invariants,
-acceptance and resource budgets. JSON carries machine control; Markdown carries
-reasoning and review. Local review does not authorize laptop builds or worker
-copies of these managed projects.
+Documentation map: [docs/README.md](docs/README.md).

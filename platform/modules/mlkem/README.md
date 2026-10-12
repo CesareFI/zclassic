@@ -1,11 +1,15 @@
+<!-- Copyright 2026 Rhett Creighton. Licensed under Apache-2.0. -->
+
 # zclassic23/mlkem
 
 Allocation-free ML-KEM-768 (NIST FIPS 203, August 2024) for C23. It provides
 key generation, encapsulation and decapsulation with the encapsulation-key and
 decapsulation-key checks of FIPS 203 Sections 7.2 and 7.3. Hashing uses
 `zclassic23/sha3` (SHA3-256, SHA3-512, SHAKE128, SHAKE256); wiping uses
-`memory_cleanse` from `zclassic23/base`. The module is not yet connected to
-any handshake.
+`memory_cleanse` from `zclassic23/base`. The [zssh engine](../../../contexts/commons/modules/zssh/README.md)
+calls this module for its hybrid SSH handshake. That engine has no production
+session owner or accepted guest integration; module tests do not establish a
+deployed SSH endpoint.
 
 | Object | Bytes |
 | --- | --- |

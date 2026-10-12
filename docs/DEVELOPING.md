@@ -21,6 +21,39 @@ decentralized C23 software commons. Consensus, custody, synchronization, peer
 health, and public-node reliability always outrank package computation and
 development convenience.
 
+## Fleet entry and policy ownership
+
+On a managed fleet, begin with `devworker where z23` and the installed
+`~/.config/dev-workers/OPERATIONS.md`, `STORAGE.md`, and `WORKER.md`.
+Use the existing remote `devon` route from a coordination-only laptop.
+Do not build there or materialize another worker copy. Reuse a sanctioned
+worktree, preserve native claims, and run heavy commands through
+`devbuild --wait`. Admission reserves come from the installed storage
+contract, not an old benchmark or a copied constant in a runbook.
+
+[`work/AGENT_FLEET.md`](work/AGENT_FLEET.md#consolidated-operating-model)
+owns the fleet operating model and capability limits. This document owns the
+development sequence. The native command catalog owns implemented schemas;
+the shared wiki explains approved procedures and links evidence. Neither wiki
+text nor a cached status row grants execution, deployment, or cleanup authority.
+
+## Managed source baseline
+
+The owner authorized a single-commit source baseline on 2026-10-12, including
+retirement of prior branch/tag history and obsolete documentation. The prior
+remote main was `181b8f3591a538e28c56d22858b5c9b2284908cd`. Its complete remote history is
+preserved in a verified offline Git bundle. This one-time maintenance exception
+does not authorize future history rewriting or claim acceptance of unpublished
+work. Existing unpublished changes retain separate recovery custody.
+
+This baseline removes 171 unreferenced pre-October dated documents. The
+production source, build definitions, tests and submodule identities are unchanged
+from that prior remote main. Current contracts and referenced evidence remain.
+A fresh checkout starts from the new main; do not merge an old checkout's
+unrelated history back into it. Recover a needed change as a bounded, reviewed
+patch against the current baseline.
+
+
 ## The normal loop
 
 1. Orient in the current checkout and mission.

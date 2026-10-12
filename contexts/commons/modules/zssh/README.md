@@ -1,3 +1,5 @@
+<!-- Copyright 2026 Rhett Creighton. Licensed under Apache-2.0. -->
+
 # zclassic23/zssh
 
 Allocation-free, sans-IO SSH-2 engine for C23: transport (key exchange,
@@ -149,8 +151,10 @@ half-close directions, window overrun.
 
 ## Post-quantum claims
 
-Post-quantum claims wait for the in-tree ML-KEM correction to land. Until
-then the hybrid is a negotiated option, not a security statement.
+The in-tree ML-KEM module's known-answer tests and this engine's handshake
+tests are distinct from independent SSH interoperability and deployed-route
+qualification. A negotiated hybrid algorithm alone does not establish either.
+No production session owner or accepted guest route is supplied here.
 
 ## Resources
 

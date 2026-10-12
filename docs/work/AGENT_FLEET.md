@@ -1,11 +1,133 @@
 <!-- Copyright 2026 Rhett Creighton. Licensed under Apache-2.0. -->
 
-# Measured fleet development contract
+# Fleet operation and measured development
 
 Status: implementation contract with partial fixture evidence; complete fleet,
 cost and model-quality qualification remains **NOTRUN**.
 This document supplies detail for [FORWARD_PLAN.md](FORWARD_PLAN.md), without
 changing its priority order or granting execution or publication authority.
+
+## Consolidated operating model
+
+One receiver policy governs each machine's storage, accepted work, execution
+and transport. Reuse native task, candidate, action, lease, receipt, CAS and
+fleet authorities. A CLI, JSON client, agent or wiki page is an interface to
+those authorities, not another scheduler or ownership ledger.
+
+| Subject | Authority |
+|---|---|
+| Product priorities and permitted scope | `AGENTS.md` and `FORWARD_PLAN.md` |
+| Development sequence and exact publication gates | `DEVELOPING.md` |
+| Host routes, working-set limits, admission reserves and output lifetime | Installed `~/.config/dev-workers/OPERATIONS.md`, `STORAGE.md` and `WORKER.md` |
+| Ownership, current work and accepted evidence | Native task, action, lease, candidate and receipt objects |
+| Implemented commands and input contracts | The selected binary's `discover` catalog |
+| Human operating explanations | Repository runbooks and the native fleet wiki, with source/evidence references |
+| Current resource state | Timestamped native observations with coverage and explicit unknowns |
+
+Host policy remains local. Repository examples do not lower an installed
+reserve. Never count a cached remote observation as a current admission check.
+
+### Disk and development lifetime
+
+Before admitting work, identify the actual development filesystem, its
+available bytes, configured reserve, expected temporary growth and already
+admitted work. Node datadir headroom does not establish development headroom
+when those paths use different filesystems. Recheck at admission, including
+after a queue wait. Preserve the public node's CPU, memory and I/O priority.
+
+Reuse a sanctioned worktree and one writer per component. Bind each task to
+its exact source, editable paths, acceptance, CPU/memory/disk budget and scratch
+lifetime. Retain unique source and compact qualification evidence. Retire
+completed generated output only after checking active processes, leases,
+replacement evidence and the installed archive/restore policy. Measure
+reclaimed capacity with filesystem free blocks, not summed directory sizes.
+Keep useful toolchains and current artifacts warm. Function/island capsules,
+native binding, distributed ThinLTO and QEDC emission remain bounded
+experiments until measured.
+
+The installed `devbuild --wait` is the current host admission entry. It is
+not proof that Z23 already implements unified storage reservations. Extending
+native admission must preserve that policy and prove concurrent admission,
+queue-time rechecking, exhausted-reserve refusal, cancellation and recovery
+before replacing the existing entry.
+
+### Execution and connection choices
+
+| Choice | Purpose | Qualification boundary |
+|---|---|---|
+| Confined native process | Avoid CPU emulation for permitted host workloads | Exact artifact, filesystem scope, child-process policy, network capability, limits and cancellation |
+| Hardware-virtualized guest | Guest kernel isolation on compatible hosts | Actual host support, guest image, device policy and recovery |
+| Emulated RISC-V guest | Explicit guest environment across supported host architectures | Exact kernel/disk inputs, entropy, device byte route, limits and restart evidence |
+| Direct authenticated peer route | Reach an explicitly authorized receiver | Pinned peer identity, scoped grant, freshness, revocation and exact-object transfer |
+| SSH tunnel | Carry authorized traffic through an SSH connection | Negotiated algorithms, pinned identities, permitted forwarding target and reconnect behavior |
+| Embedded Tor route | Reach a receiver through the node's onion transport | Persistent onion identity, descriptor publication, reachable stream and the same application authorization |
+
+These are composable policy choices, not claims that every combination is
+implemented. Select a qualified protected execution path; never fall back to
+unprotected execution. A network route grants neither shell execution nor
+wallet, consensus or deployment access. A Tor route must not silently fall
+back to clearnet when policy requires onion transport.
+
+Reuse `ops.mesh.terminal` for native terminal access. Its existing worker
+launches the granted FreeBSD shell on a PTY, with Linux Landlock/seccomp,
+filesystem scope, byte/lifetime/idle limits and process-group cleanup.
+The terminal profile permits bounded fork/exec but denies sockets. It is
+not an OpenSSH server and does not provide arbitrary networked development.
+macOS is refused by that worker. The Windows unconfined opt-in is not a
+qualified protected path and must not be used under this fleet contract.
+
+The separate `app.run.confined` package runner denies child processes and
+networking; keep its policy unchanged. Reuse the terminal owner and platform
+sandbox interfaces for new qualified execution options. Native OpenSSH
+integration, wider development capabilities and protected macOS terminal
+execution need their own acceptance. The emulated guest remains distinct;
+host terminal access cannot substitute for guest-route acceptance.
+
+Post-quantum key exchange can operate in native or guest OpenSSH. Record the
+negotiated algorithm and reject forbidden downgrade. Key agreement,
+authentication, endpoint confinement and guest identity protection are
+separate claims. Compare native and guest startup, command latency, transfer
+throughput, CPU, memory and complete accepted-task cost under matched policies
+before claiming a measured performance advantage.
+
+### Native JSON monitoring and wiki
+
+Inspect the selected binary before using an interface:
+
+```bash
+z23 discover schema ops.telemetry.storage.disk
+z23 discover schema fleet.steer.brief
+z23 discover schema fleet.vitals.sample
+z23 discover help fleet.wiki
+```
+
+| Existing interface | What it establishes | What it does not establish |
+|---|---|---|
+| `ops.telemetry.storage.disk` | Running-node datadir headroom and node thresholds | Every development volume or the installed development reserve |
+| `ops.mesh.machines` | Durable paired-machine rows and a bounded live status refresh | Instant live collection from every peer; it probes at most eight active records within a collective deadline |
+| `ops.mesh.status` | One paired receiver's verified signed status capsule | An unrestricted remote query or authority beyond status-read |
+| `fleet.vitals.sample` | Signed local host measurements, including datadir free space | A remote refresh or automatic collection on every peer |
+| `fleet.steer.brief` | Bounded task/worker view with resource fields, ages and missing reasons | A live probe of every admitted machine |
+| `fleet.ledger.status` | Held local/replica chains and newest-row ages | Fresh remote measurements or their complete contents |
+| `ops.host.gc` | Classification of its configured development proof pools; dry-run by default | Authority to remove unique source, evidence or production state |
+| `fleet.wiki.*` | Shared procedural explanations and their history | Current measurements, task ownership or an execution grant |
+
+An instant fleet answer is a bounded local projection. Each host row must
+identify observation time, age, source, filesystem scope, policy identity,
+coverage and missing data. Stale, unreachable and unavailable remain distinct;
+none becomes zero usage. Traverse pagination and expose omitted rows.
+
+The remaining integration acceptance is fresh collection and replication for
+every admitted host, verified mapping to development filesystems and reserves,
+and bounded read latency under missing peers. Exercise full disk, stale
+replica, disconnected peer, duplicate delivery and restarted collector cases.
+A passing command schema or local sample does not qualify that fleet path.
+
+Keep wiki procedures short and link the owning contract, exact command schema
+and retained evidence. Publish no private credentials or endpoints. Record
+implementation limits rather than teaching a workaround that weakens them.
+The wiki is a learning aid; live observations and native receipts remain the
+source of operational truth.
 
 ## Mission capsule
 

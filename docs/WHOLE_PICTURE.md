@@ -10,7 +10,25 @@ tunnels fit together. It does not set priorities. The ranked priorities are in
 [`MVP.md`](MVP.md). Every element below carries exactly one status label, and
 each row of the table says what its evidence does not show.
 
-![Nested boxes: a Z23 program inside the local-authority boundary of your machine, holding a full node, the C23 Commons (with an ML-KEM-768 module that no caller uses yet) and an emulated RISC-V machine that contains a FreeBSD guest and one post-quantum key-exchange experiment, with mesh tunnels, an onion transport and the landing path below; every element carries one of four labels, ON MAIN, CANDIDATE, EXPERIMENT or TARGET](assets/z23-whole-picture.svg)
+![Nested boxes: a Z23 program inside the local-authority boundary of your machine, holding a full node, the C23 Commons (with an ML-KEM-768 module used by the unintegrated zssh engine) and an emulated RISC-V machine that contains a FreeBSD guest and one post-quantum key-exchange experiment, with mesh tunnels, an onion transport and the landing path below; every element carries one of four labels, ON MAIN, CANDIDATE, EXPERIMENT or TARGET](assets/z23-whole-picture.svg)
+
+## Execution and transport choices
+
+The [fleet operating contract](work/AGENT_FLEET.md#consolidated-operating-model)
+is the shared reference for disk admission, task ownership and JSON monitoring.
+Execution and connection are separate choices. Confined native shell/SSH,
+hardware virtualization where qualified, and the emulated guest must each
+retain receiver policy. Direct peer connections, SSH tunnels and embedded Tor
+can carry permitted traffic without expanding execution authority.
+
+The native mesh terminal is **on main**, with a Linux confined shell worker
+that refuses sockets and bounds execution. Native OpenSSH integration,
+protected macOS terminal execution and complete transport combinations remain
+**targets**. The separate confined package runner refuses child processes
+and networking. Neither a host terminal connection nor Tor availability
+qualifies the guest route. Compare complete workloads before asserting an emulator
+performance penalty; measured startup, throughput and accepted-task cost belong
+in exact experiment receipts.
 
 ## Status labels
 
@@ -30,7 +48,7 @@ each row of the table says what its evidence does not show.
 | FreeBSD guest | An unmodified FreeBSD 15.1 riscv64 kernel booted in that machine. | Experiment | [`RISCV_MACHINE.md`](RISCV_MACHINE.md), [experiment record](experiments/2026-10-11-guest-pq-ssh-loopback.md) | `RISCV_MACHINE.md` calls these boots "an operator recipe: they are run by hand through the command and are not part of the registered tests". No kernel or disk image is kept in the repository. |
 | Network device source | A virtio network device in `platform/modules/rvvirtio/src/rvvirtio_net.c`, exercised by that module's standalone test. | On main as source | [`rvvirtio_net.c`](../platform/modules/rvvirtio/src/rvvirtio_net.c) | Nothing outside the module and its tests calls it; the machine does not attach it. |
 | Post-quantum key exchange | A hybrid key exchange between `sshd` and `ssh` on guest loopback, in one run. | Experiment | [experiment record](experiments/2026-10-11-guest-pq-ssh-loopback.md) | Host and user identities are classical Ed25519. No machine-to-machine route was used, and the guest has no network device. A fixture, `tools/guest_ssh_fixture.c`, requests the hybrid algorithm; it does not implement it. |
-| ML-KEM-768 module | An allocation-free C23 implementation of ML-KEM-768 (FIPS 203) that is also a Commons package (`zclassic23/mlkem`), with NIST ACVP known-answer vectors run by the registered test group `mlkem`. | On main | [`README.md`](../platform/modules/mlkem/README.md), `tools/dev/test_group_catalog.def` | Its README says "The module is not yet connected to any handshake". No source file outside the module and `docs/` includes its header or calls `zcl_mlkem768_*`; the test harness only runs the module's own test, so the node, the tunnels and the guest SSH path do not use it. Constant-time behaviour rests on reading the code: the README limits it to the compiler being "trusted not to introduce secret-dependent branches", and this page cites no timing measurement. Failure ordering is corrected: `decaps_core` checks SHAKE and re-encryption success before `ct_select`, wipes its intermediate buffers, and the public wrapper zeroes output on failure. The registered `mlkem` controls force only matrix-sampler failures at first, middle and last rows; noise-sampler and SHAKE failure branches are source-reviewed only. |
+| ML-KEM-768 module | Allocation-free C23 ML-KEM-768, called by the sans-IO zssh hybrid handshake. | On main | [Module contract](../platform/modules/mlkem/README.md), [SSH contract](../contexts/commons/modules/zssh/README.md), `zssh_kex.c` | Module and handshake tests do not establish a deployed SSH endpoint. zssh has no production session owner and no accepted guest route; the guest loopback experiment uses OpenSSH. |
 | Mesh tunnels | Loopback TCP tunnels between paired machines, carried on the mesh stream, with an explicit allow table that permits nothing by default. | On main | [`mesh_tunnel.c`](../engine/composition/src/mesh_tunnel.c), `engine/composition/commands/dev.def` | Whether anything is carried is the far machine's decision. No guest-to-guest route is qualified by the cited evidence. |
 | Tunnel entrances that survive a restart | Local entrances that return after a restart. | Candidate | None on main. | Not landed. On main, entrances are not restored after a restart; only the allow table is kept. |
 | Onion transport | Embedded Tor for the onion service; the default build (`ZCL_TOR=full`) builds the pinned Tor and links it. | On main | [`BUILD.md`](BUILD.md) | `ZCL_TOR=stub` is a development-only build that cannot reach the onion network and must be requested by name. This page cites no measurement of an onion session between machines. |
@@ -43,10 +61,9 @@ each row of the table says what its evidence does not show.
 - Post-quantum protection applies to the key exchange only, in one loopback
   run; peer authentication is classical.
 - The guest has no attached network device.
-- The ML-KEM-768 module is not used by the node, the tunnels or the guest SSH
-  path. Decapsulation now checks SHAKE and re-encryption success before
-  selecting output and wipes intermediate buffers; public failure output is
-  zeroed. Forced failure tests cover matrix sampling only, not noise or SHAKE.
+- The ML-KEM-768 module is called by zssh's hybrid handshake, but the SSH
+  engine has no production session owner or accepted guest integration.
+  Module tests do not establish a deployed quantum-resistant route.
 - `MVP.md` records criteria 6 and 8 as partial, and the evidence recorded for
   criterion 4 is a smaller amount, seen at mempool entry, than its wording asks
   for.

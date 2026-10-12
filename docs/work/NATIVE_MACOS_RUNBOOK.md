@@ -18,6 +18,24 @@ repeat them.
 
 ---
 
+## Managed fleet operation
+
+Use the installed `~/.config/dev-workers/OPERATIONS.md`, `STORAGE.md` and
+`WORKER.md` before development. They own host routes, admission reserves,
+retention and concurrency. On the managed Mac use one focused
+`devbuild --wait make -j2 …` command; generic all-core examples below do not
+override that host policy. See the
+[fleet operating contract](AGENT_FLEET.md#consolidated-operating-model) for
+the shared execution, transport and observation boundaries.
+
+Native packaging is distinct from production activation. The existing
+`tools/scripts/install_z23.sh` stages immutable generations and checks
+launchd readiness, mapped vnode, digest and stable PID. Its current upgrade
+path regenerates the plist and automatically restores the previous binary on
+failure. A deployment requiring preserved service arguments or forward-only
+schema migration must first qualify those behaviors in that existing path.
+An isolated launchd fixture or a successful native build does not close them.
+
 ## §1 Build matrix
 
 ### Expected green on arm64
@@ -222,3 +240,49 @@ git grep -nE 'ZCL_GC_SECTIONS_LDFLAG|ZCL_TOOL_SANDBOX_SRC' -- Makefile
 ```
 
 Use those seams rather than adding per-recipe platform branches.
+
+## Historical platform baseline
+
+The public node has native Linux and macOS build paths. macOS does not use a
+Linux virtual machine. On 2026-08-26, `make z23` completed on an arm64
+`Mac16,10` running macOS 26.0.1 with Apple Clang 17.0.0. The resulting Mach-O
+executable passed its dependency audit with Apple system libraries and
+frameworks as its only dynamic dependencies. The registered crypto group
+passed 3/3 groups, including secp256k1, Ed25519, Equihash, BLS12-381, and hash
+coverage. Native RNG, thread QoS, sandbox capability,
+backtrace capability, process introspection, and the 46-case SQLite group also
+passed their platform contracts. A fresh isolated test-lane datadir reached
+`phase=serving`, `stage=ready`, height 0 with RPC bound, then completed a
+graceful shutdown. This is startup evidence, not chain-sync acceptance.
+Descriptor-bound A/B execution is unavailable on macOS and fails closed;
+pathname reconstruction is not accepted as a substitute for `fexecve`.
+The dev/test proof executor has a narrower native rail: it obtains the
+CodeDirectory hash from the already-open thin Mach-O, spawns the locator path
+suspended, asks the kernel for the mapped child's CodeDirectory hash, and
+resumes only on an exact match. This does not promote production A/B or hot
+activation.
+The optimized ROM-seed background-scan regression also passed after bounding
+its worker-stack use; the artifact snapshot uses checked allocation instead of
+a roughly 1 MiB automatic array.
+The exact 10-package C23 Commons root and dependency-DAG projection, including
+all 217 monolith-owned package sources, also passed on macOS. Mach-O fixture
+builds use a fixed nonzero UUID and fixed-identifier ad-hoc signature; publisher
+and independent-checkout binaries execute and hash identically. The separate
+package verifier qualifies native Seatbelt filesystem scoping, network denial,
+and enforced rlimits as full package isolation; this does not claim Linux
+Landlock/seccomp mechanisms or resident-node confinement on macOS.
+
+The macOS capability boundary is explicit: the public node, wallet, P2P, RPC,
+database, cryptography, embedded Tor, and a native kqueue directory watcher build
+natively; qualified Seatbelt confinement is available only to the separate
+package verifier. Linux Landlock/seccomp resident confinement, signal-context
+self-backtraces, native hot-swap activation, and `O_TMPFILE` consensus snapshot
+export remain unavailable. Those paths refuse or report unavailable instead of
+claiming Linux guarantees. Only arm64 macOS is measured; Intel macOS remains
+unverified.
+
+Embedded full Tor has been observed to complete on the arm64 Mac host
+(`make tor-full`, ~110 s, producing `vendor/tor/libtor.a` from vendored
+OpenSSL/libevent/zlib). What the node links is decided by which archives exist,
+on every host. Build and test instructions are in
+[`docs/GETTING_STARTED.md`](../GETTING_STARTED.md).

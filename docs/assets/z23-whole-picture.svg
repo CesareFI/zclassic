@@ -1,6 +1,7 @@
+<!-- Copyright 2026 Rhett Creighton. Licensed under Apache-2.0. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="780" viewBox="0 0 960 780" role="img" aria-labelledby="whole-title whole-desc">
   <title id="whole-title">Z23: the whole picture and the status of each part</title>
-  <desc id="whole-desc">Nested boxes show one Z23 program inside your machine's local-authority boundary: a full node, the C23 Commons with an ML-KEM-768 module that no caller uses yet, and an emulated RISC-V machine, built into the developer binary z23-dev, that contains a FreeBSD guest and a post-quantum key exchange, with mesh tunnels and an onion transport below. Every element carries one of four status labels: ON MAIN, CANDIDATE, EXPERIMENT or TARGET. The guest and the post-quantum exchange are experiment-level. Two dashed target boxes name goals: a guest-to-guest tunnel between machines, and warm compile and focused proof, p95 within 10 seconds on a frozen small-change corpus. The landing path lists edit, focused proof, integrate current main, gates and push.</desc>
+  <desc id="whole-desc">Nested boxes show one Z23 program inside your machine's local-authority boundary: a full node, the C23 Commons with an ML-KEM-768 module used by the unintegrated zssh engine, and an emulated RISC-V machine, built into the developer binary z23-dev, that contains a FreeBSD guest and a post-quantum key exchange, with mesh tunnels and an onion transport below. Every element carries one of four status labels: ON MAIN, CANDIDATE, EXPERIMENT or TARGET. The guest and the post-quantum exchange are experiment-level. Two dashed target boxes name goals: a guest-to-guest tunnel between machines, and warm compile and focused proof, p95 within 10 seconds on a frozen small-change corpus. The landing path lists edit, focused proof, integrate current main, gates and push.</desc>
   <defs>
     <linearGradient id="whole-node" x1="0" x2="1">
       <stop offset="0" stop-color="#10243b"/>
@@ -47,7 +48,7 @@
     <rect x="286" y="296" width="162" height="42" rx="6" fill="#171421" stroke="#a78bfa" stroke-width="1.5"/>
     <text x="294" y="311" font-size="13" font-weight="760" fill="#e9eef6">ML-KEM-768 module</text>
     <rect x="294" y="316" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="329" y="329" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
-    <text x="372" y="329" font-size="12" fill="#97a3b6">unused yet</text>
+    <text x="372" y="329" font-size="12" fill="#97a3b6">zssh module</text>
     <rect x="286" y="344" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="321" y="357" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
 
     <rect x="474" y="188" width="416" height="190" rx="10" fill="#0d1419" stroke="#303a4b" stroke-width="1.5"/>

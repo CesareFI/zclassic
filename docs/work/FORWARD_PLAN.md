@@ -121,9 +121,19 @@ below describe work to prove, not capabilities declared complete.
 
    Next concrete task: record the literal criterion 4 run (1 ZCL received, balance reflected within 2 blocks), because the evidence in its row of [`MVP.md`](../MVP.md) is a 0.02 ZCL note decrypted after mempool entry, and close criteria 6 and 8, both marked partial there.
 
-2. **Qualify the permitted guest route through restart.** The target is an SSH
-   client and daemon inside Z23's FreeBSD guest on each participating Linux and
-   Mac machine, with guest-held identity and tunnel recovery across restart.
+2. **Qualify protected native and guest access through restart.** Reuse the
+   existing `ops.mesh.terminal` Linux confined shell owner; qualify additional
+   native SSH/development capabilities and macOS confinement, and retain an
+   SSH client and daemon inside Z23's FreeBSD guest on participating Linux and
+   Mac machines, with guest-held identity and tunnel recovery across restart.
+   Execution and transport are separate policy choices: direct authenticated
+   connections, SSH tunnels and embedded Tor share the same receiver authority
+   and evidence requirements. Their capability and admission contract is
+   [AGENT_FLEET.md](AGENT_FLEET.md#consolidated-operating-model). Reuse existing
+   shell and SSH programs as bounded processes; do not place general shell
+   execution inside the consensus node. Native execution, hardware
+   virtualization where qualified, and RISC-V emulation are protected options,
+   not permission to fall back to unconfined execution.
    Bind image identity, admission, guest boot, negotiated SSH algorithms, routing
    and reconnection to exact source, image, platform and configuration. First
    prove each layer separately, then the route between consenting machines, including wrong

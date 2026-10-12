@@ -45,6 +45,7 @@ target, see [the whole picture](docs/WHOLE_PICTURE.md).
 | Share and reuse C23 source | [The C23 Commons](#the-c23-commons) | [Commons Quickstart](docs/C23_COMMONS_QUICKSTART.md) |
 | Change Z23 itself | [Working on Z23 itself](#working-on-z23-itself) | [Developing](docs/DEVELOPING.md) |
 | Attach a coding agent | [Connect coding agents](#connect-coding-agents) | [AGENTS.md](AGENTS.md) |
+| Operate development across machines | [Fleet operating contract](docs/work/AGENT_FLEET.md#consolidated-operating-model) | [Developing](docs/DEVELOPING.md) |
 
 ## Public start here
 

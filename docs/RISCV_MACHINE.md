@@ -1,3 +1,5 @@
+<!-- Copyright 2026 Rhett Creighton. Licensed under Apache-2.0. -->
+
 # The built-in RISC-V machine
 
 `z23-dev` carries a small RISC-V computer: one RV64 IMAFDC hart with
@@ -13,6 +15,31 @@ deterministic test mode, the same kernel, disk and inputs give the same console
 output and counts; fresh host randomness is not a replayable input. The
 module is `platform/modules/rvmachine`; its README states the machine
 contract.
+
+## Execution and transport boundaries
+
+The guest is one execution option in the
+[fleet operating contract](work/AGENT_FLEET.md#consolidated-operating-model).
+Native terminal access already has a separate `ops.mesh.terminal` owner:
+its Linux worker confines a granted FreeBSD shell and refuses sockets.
+OpenSSH integration and protected macOS terminal execution remain separate
+qualification work. Native execution avoids instruction emulation but does
+not supply a guest kernel boundary. Hardware virtualization is a separate option where supported
+and qualified. None may fall back to unprotected execution.
+
+A transport route and an execution environment are independent choices.
+Direct authenticated connections, SSH tunnels, and embedded Tor must retain
+receiver authorization, identity verification, revocation and resource limits.
+An available Tor service is not evidence that a guest byte route is connected.
+A successful host SSH session does not qualify guest SSH.
+
+The native terminal worker and `app.run.confined` are different profiles.
+The package runner refuses child processes and networking; it is not a general
+development shell. The guest commands
+below establish their stated boot, console, disk or snapshot behavior.
+Persistent guest service ownership and cross-machine SSH require separate
+acceptance, including initialized entropy, retained identities, wrong-key and
+downgrade rejection, and recovery across disconnect and restart.
 
 ## Booting a kernel
 
