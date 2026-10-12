@@ -38,6 +38,7 @@
 bool snapsync_test_read_compact_size(const uint8_t *data, size_t len,
                                      size_t *pos, uint64_t *out);
 uint32_t snapsync_test_decode_vout(const uint8_t bytes[4]);
+bool snapsync_test_recovery_count_is_admissible(int64_t count);
 
 struct reset_gate {
     pthread_mutex_t mutex;
@@ -287,6 +288,22 @@ static int test_snapshot_sync_service_vout_decode(void)
         const uint8_t high_bit_vout[4] = { 0, 0, 0, 0x80 };
 
         ASSERT(snapsync_test_decode_vout(high_bit_vout) == UINT32_C(0x80000000));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_snapshot_sync_service_recovery_count_bound(void)
+{
+    int failures = 0;
+
+    TEST("snapshot local recovery refuses out-of-range UTXO counts") {
+        ASSERT(!snapsync_test_recovery_count_is_admissible(-1));
+        ASSERT(!snapsync_test_recovery_count_is_admissible(0));
+        ASSERT(snapsync_test_recovery_count_is_admissible(100000000));
+        ASSERT(!snapsync_test_recovery_count_is_admissible(100000001));
+        ASSERT(!snapsync_test_recovery_count_is_admissible(INT64_MAX));
         PASS();
     } _test_next:;
 
@@ -3730,6 +3747,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_boot_discards_staging();
     failures += test_snapshot_sync_service_script_length_decode();
     failures += test_snapshot_sync_service_vout_decode();
+    failures += test_snapshot_sync_service_recovery_count_bound();
     failures += test_snapshot_sync_service_finalize_mismatch();
     failures += test_snapshot_sync_service_chunk_apply_failure_fails_closed();
     failures += test_snapshot_sync_service_out_of_range_value_fails_closed();

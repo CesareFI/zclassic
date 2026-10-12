@@ -29,6 +29,20 @@
 #include <stdint.h>
 #include <limits.h>
 
+#define SNAPSYNC_MAX_OFFER_UTXOS UINT64_C(100000000)
+
+static bool snapsync_recovery_count_is_admissible(int64_t count)
+{
+    return count > 0 && (uint64_t)count <= SNAPSYNC_MAX_OFFER_UTXOS;
+}
+
+#ifdef ZCL_TESTING
+bool snapsync_test_recovery_count_is_admissible(int64_t count)
+{
+    return snapsync_recovery_count_is_admissible(count);
+}
+#endif
+
 static bool snapsync_bytes32_nonzero_internal(const uint8_t b[32])
 {
     if (!b)
@@ -158,6 +172,7 @@ struct zcl_result snapsync_build_local_recovery_manifest(struct node_db *ndb,
 {
     int64_t tip_height = 0;
     uint64_t utxo_count = 0;
+    int64_t stored_utxo_count = 0;
 
     if (!ndb || !ndb->open || !out)
         return ZCL_ERR(-1, "build_local_recovery_manifest: null/closed ndb or null out");
@@ -193,16 +208,17 @@ struct zcl_result snapsync_build_local_recovery_manifest(struct node_db *ndb,
     {
         struct snapshot_store_sqlite_ctx sctx;
         struct snapshot_store_port store = {0};
-        int64_t count = 0;
         struct zcl_result bind = snapsync_bind_store_internal(&sctx, ndb, &store);
         if (!bind.ok)
             return ZCL_ERR(-7, "build_local_recovery_manifest: %s", bind.message);
-        if (!store.utxo_count(store.self, &count))
+        if (!store.utxo_count(store.self, &stored_utxo_count))
             return ZCL_ERR(-7, "build_local_recovery_manifest: prepare utxo count failed");
-        utxo_count = (uint64_t)count;
     }
-    if (utxo_count == 0)
-        return ZCL_ERR(-8, "build_local_recovery_manifest: zero utxos");
+    if (!snapsync_recovery_count_is_admissible(stored_utxo_count))
+        return ZCL_ERR(-8,
+                       "build_local_recovery_manifest: invalid utxo count=%lld",
+                       (long long)stored_utxo_count);
+    utxo_count = (uint64_t)stored_utxo_count;
     out->num_utxos = utxo_count;
     out->total_bytes = utxo_count * 80;
     return ZCL_OK;
