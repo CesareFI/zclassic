@@ -710,7 +710,8 @@ int sync_monitor_local_header_refill(struct connman *cm,
         g_local_recovery.peer_rotation_count++;
     g_local_recovery.active = true;
     g_local_recovery.missing_height = next_h;
-    g_local_recovery.retry_count++;
+    g_local_recovery.retry_count +=
+        g_local_recovery.retry_count < INT_MAX;
     g_local_recovery.distinct_peer_count = eligible;
     snprintf(g_local_recovery.mode, sizeof(g_local_recovery.mode),
              "%s", "next-child-missing");
