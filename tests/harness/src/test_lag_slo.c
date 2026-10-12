@@ -114,6 +114,18 @@ static int test_snapshot_surfaces_thresholds(void)
     return failures;
 }
 
+static int test_mirror_statistics_saturate(void)
+{
+    int failures = 0;
+
+    TEST_CASE("lag_slo: mirror diagnostic counters saturate")
+    {
+        ASSERT(legacy_mirror_sync_test_stat_saturates(INT64_MAX - 1, 1));
+        ASSERT(legacy_mirror_sync_test_stat_saturates(INT64_MAX, 1));
+    } TEST_END
+    return failures;
+}
+
 static int test_slo_breach_observer_fires(void)
 {
     int failures = 0;
@@ -339,6 +351,7 @@ int test_lag_slo(void)
     failures += test_event_names_are_stable();
     failures += test_severity_none_when_under_threshold();
     failures += test_snapshot_surfaces_thresholds();
+    failures += test_mirror_statistics_saturate();
     failures += test_slo_breach_observer_fires();
     failures += test_concurrent_catchup_observer_fires();
     failures += test_legacy_mirror_registers_supervisor_contract();

@@ -186,6 +186,7 @@ void legacy_mirror_sync_reset_for_test(void);
 void legacy_mirror_sync_test_set_stats(
     const struct legacy_mirror_sync_stats *stats,
     struct main_state *ms);
+bool legacy_mirror_sync_test_stat_saturates(int64_t initial, int64_t add);
 #endif
 
 #endif /* ZCL_SERVICES_LEGACY_MIRROR_SYNC_SERVICE_H */

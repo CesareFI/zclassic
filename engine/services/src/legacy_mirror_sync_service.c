@@ -39,6 +39,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,12 +53,36 @@ struct legacy_mirror_sync_runtime g_lms = {
     .hash_disagreement_height = -1,
 };
 
+/* Counters feed health and recovery diagnostics for the process lifetime.
+ * Saturate instead of invoking signed-overflow UB or reporting a new zero. */
+static void lms_stat_add(_Atomic int64_t *stat, int64_t add)
+{
+    int64_t current = atomic_load_explicit(stat, memory_order_relaxed);
+
+    while (add > 0 && current < INT64_MAX) {
+        int64_t room = INT64_MAX - current;
+        int64_t next = add < room ? current + add : INT64_MAX;
+        if (atomic_compare_exchange_weak_explicit(
+                stat, &current, next, memory_order_relaxed,
+                memory_order_relaxed))
+            return;
+    }
+}
+
 #ifdef ZCL_TESTING
 bool g_lms_test_fake_running;
 _Atomic int g_lms_test_catchup_enabled;
 _Atomic int g_lms_test_catchup_result;
 _Atomic int g_lms_test_catchup_clear_stuck;
 _Atomic int g_lms_test_catchup_calls;
+
+bool legacy_mirror_sync_test_stat_saturates(int64_t initial, int64_t add)
+{
+    _Atomic int64_t stat = initial;
+
+    lms_stat_add(&stat, add);
+    return atomic_load(&stat) == INT64_MAX;
+}
 #endif
 
 void lms_set_error(const char *msg)
@@ -100,7 +125,7 @@ static void lms_set_stuck_reason(const char *reason)
              "%s", reason ? reason : "");
     pthread_mutex_unlock(&g_lms.lock);
     if (count_stall)
-        atomic_fetch_add(&g_lms.stalls_total, 1);
+        lms_stat_add(&g_lms.stalls_total, 1);
 }
 
 static void lms_clear_blocker(void)
@@ -352,7 +377,7 @@ struct zcl_result lms_remote_hash_at(int height, char out_hex[65])
 {
     char err[160] = {0};
     if (!lms_fetch_hash(height, out_hex, err, sizeof(err))) {
-        atomic_fetch_add(&g_lms.rpc_errors, 1);
+        lms_stat_add(&g_lms.rpc_errors, 1);
         return ZCL_ERR(-1, "lms_remote_hash_at: height=%d err=%s", height,
                        err[0] ? err : "(unknown)");
     }
@@ -440,7 +465,7 @@ lms_verify_common_height(int height,
         return LMS_HASH_COMPARISON_UNKNOWN;
     }
     if (!remote[0] && !lms_fetch_hash(height, remote, err, sizeof(err))) {
-        atomic_fetch_add(&g_lms.rpc_errors, 1);
+        lms_stat_add(&g_lms.rpc_errors, 1);
         lms_cache_comparison(height, local, NULL, false, false);
         lms_record_unknown_comparison("rpc-unreachable", err);
         return LMS_HASH_COMPARISON_UNKNOWN;
@@ -676,7 +701,7 @@ struct zcl_result legacy_mirror_sync_request_catchup(const char *reason)
     if (!lms_fetch_chain_info(&legacy_blocks, &legacy_headers,
                               err, sizeof(err))) {
         atomic_store(&g_lms.reachable, 0);
-        atomic_fetch_add(&g_lms.rpc_errors, 1);
+        lms_stat_add(&g_lms.rpc_errors, 1);
         lms_cache_comparison(-1, NULL, NULL, false, false);
         lms_record_unknown_comparison("rpc-unreachable", err);
         ok = false;
@@ -730,7 +755,7 @@ struct zcl_result legacy_mirror_sync_request_catchup(const char *reason)
         atomic_store(&g_lms.target_height, legacy_blocks);
         int prev_advanced = atomic_load(&g_lms.last_advanced_height);
         if (local >= prev_advanced)
-            atomic_fetch_add(&g_lms.catchups_total, 1);
+            lms_stat_add(&g_lms.catchups_total, 1);
         lms_mark_success(local, local - prev_advanced);
         ok = true;
         goto out;
