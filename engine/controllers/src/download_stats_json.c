@@ -9,8 +9,14 @@
 #include "net/download.h"
 #include "services/node_health_service.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+
+static int64_t download_stats_json_u64(uint64_t value)
+{
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
+}
 
 void download_stats_snapshot_collect(struct download_stats_snapshot *out,
                                      bool full)
@@ -62,22 +68,23 @@ void download_stats_push_json(struct json_value *obj,
     if (!obj || !s)
         return;
 
-    json_push_kv_int(obj, "requested", (int64_t)s->requested);
-    json_push_kv_int(obj, "received", (int64_t)s->received);
-    json_push_kv_int(obj, "timed_out", (int64_t)s->timed_out);
-    json_push_kv_int(obj, "in_flight", (int64_t)s->in_flight);
-    json_push_kv_int(obj, "queued", (int64_t)s->queued);
+    json_push_kv_int(obj, "requested", download_stats_json_u64(s->requested));
+    json_push_kv_int(obj, "received", download_stats_json_u64(s->received));
+    json_push_kv_int(obj, "timed_out", download_stats_json_u64(s->timed_out));
+    json_push_kv_int(obj, "in_flight", download_stats_json_u64(s->in_flight));
+    json_push_kv_int(obj, "queued", download_stats_json_u64(s->queued));
     json_push_kv_int(obj, "max_in_flight_total",
-                     (int64_t)s->max_in_flight_total);
+                     download_stats_json_u64(s->max_in_flight_total));
     json_push_kv_int(obj, "max_in_flight_per_peer",
-                     (int64_t)s->max_in_flight_per_peer);
+                     download_stats_json_u64(s->max_in_flight_per_peer));
 
     if (full) {
         const struct dl_diagnostics *diag = &s->diag;
 
-        json_push_kv_int(obj, "orphaned", (int64_t)diag->total_orphaned);
+        json_push_kv_int(obj, "orphaned",
+                         download_stats_json_u64(diag->total_orphaned));
         json_push_kv_int(obj, "requeue_suppressed_pending",
-                         (int64_t)diag->requeue_suppressed_pending);
+                         download_stats_json_u64(diag->requeue_suppressed_pending));
         json_push_kv_int(obj, "accounting_drift", diag->accounting_drift);
         json_push_kv_int(obj, "request_timeout_seconds",
                          (int64_t)diag->request_timeout_seconds);
@@ -88,66 +95,66 @@ void download_stats_push_json(struct json_value *obj,
         json_push_kv_int(obj, "oldest_in_flight_peer_id",
                          (int64_t)diag->oldest_in_flight_peer_id);
         json_push_kv_int(obj, "overdue_in_flight",
-                         (int64_t)diag->overdue_in_flight);
+                         download_stats_json_u64(diag->overdue_in_flight));
         json_push_kv_int(obj, "in_flight_peer_count",
-                         (int64_t)diag->in_flight_peer_count);
+                         download_stats_json_u64(diag->in_flight_peer_count));
         json_push_kv_int(obj, "queue_peer_avoid_count",
-                         (int64_t)diag->queue_peer_avoid_count);
+                         download_stats_json_u64(diag->queue_peer_avoid_count));
         json_push_kv_int(obj, "queue_peer_avoid_max_seconds",
                          diag->queue_peer_avoid_max_seconds);
         json_push_kv_int(obj, "queued_forward",
-                         (int64_t)diag->queued_forward);
+                         download_stats_json_u64(diag->queued_forward));
         json_push_kv_int(obj, "queued_history",
-                         (int64_t)diag->queued_history);
+                         download_stats_json_u64(diag->queued_history));
         json_push_kv_int(obj, "in_flight_forward",
-                         (int64_t)diag->in_flight_forward);
+                         download_stats_json_u64(diag->in_flight_forward));
         json_push_kv_int(obj, "in_flight_history",
-                         (int64_t)diag->in_flight_history);
+                         download_stats_json_u64(diag->in_flight_history));
         json_push_kv_int(obj, "assign_attempts",
-                         (int64_t)diag->assign_attempts);
+                         download_stats_json_u64(diag->assign_attempts));
         json_push_kv_int(obj, "assign_successes",
-                         (int64_t)diag->assign_successes);
+                         download_stats_json_u64(diag->assign_successes));
         json_push_kv_int(obj, "assign_zero_results",
-                         (int64_t)diag->assign_zero_results);
+                         download_stats_json_u64(diag->assign_zero_results));
         json_push_kv_int(obj, "dispatch_wakes",
-                         (int64_t)s->gf_stats.dispatch_wakes);
+                         download_stats_json_u64(s->gf_stats.dispatch_wakes));
         json_push_kv_int(obj, "message_cycles",
-                         (int64_t)s->msg_stats.cycles);
+                         download_stats_json_u64(s->msg_stats.cycles));
         json_push_kv_int(obj, "message_nodes_snapshotted",
-                         (int64_t)s->msg_stats.nodes_snapshotted);
+                         download_stats_json_u64(s->msg_stats.nodes_snapshotted));
         json_push_kv_int(obj, "message_send_calls",
-                         (int64_t)s->msg_stats.send_calls);
+                         download_stats_json_u64(s->msg_stats.send_calls));
         json_push_kv_int(obj, "message_process_calls",
-                         (int64_t)s->msg_stats.process_calls);
+                         download_stats_json_u64(s->msg_stats.process_calls));
         json_push_kv_int(obj, "message_recv_ready",
-                         (int64_t)s->msg_stats.recv_ready);
+                         download_stats_json_u64(s->msg_stats.recv_ready));
         json_push_kv_int(obj, "message_idle_waits",
-                         (int64_t)s->msg_stats.idle_waits);
+                         download_stats_json_u64(s->msg_stats.idle_waits));
         json_push_kv_int(obj, "message_wakes",
-                         (int64_t)s->msg_stats.wakes);
+                         download_stats_json_u64(s->msg_stats.wakes));
         json_push_kv_int(obj, "last_assign_peer_id",
                          (int64_t)diag->last_assign_peer_id);
         json_push_kv_int(obj, "last_assign_max_requested",
-                         (int64_t)diag->last_assign_max_requested);
+                         download_stats_json_u64(diag->last_assign_max_requested));
         json_push_kv_int(obj, "last_assign_available",
-                         (int64_t)diag->last_assign_available);
+                         download_stats_json_u64(diag->last_assign_available));
         json_push_kv_int(obj, "last_assign_assigned",
-                         (int64_t)diag->last_assign_assigned);
+                         download_stats_json_u64(diag->last_assign_assigned));
         json_push_kv_int(obj, "last_assign_queue_len",
-                         (int64_t)diag->last_assign_queue_len);
+                         download_stats_json_u64(diag->last_assign_queue_len));
         json_push_kv_int(obj, "last_assign_active",
-                         (int64_t)diag->last_assign_active);
+                         download_stats_json_u64(diag->last_assign_active));
         json_push_kv_int(obj, "last_assign_peer_in_flight",
-                         (int64_t)diag->last_assign_peer_in_flight);
+                         download_stats_json_u64(diag->last_assign_peer_in_flight));
         json_push_kv_int(obj, "last_assign_peer_limit",
-                         (int64_t)diag->last_assign_peer_limit);
+                         download_stats_json_u64(diag->last_assign_peer_limit));
         json_push_kv_int(obj, "last_assign_global_limit",
-                         (int64_t)diag->last_assign_global_limit);
+                         download_stats_json_u64(diag->last_assign_global_limit));
         json_push_kv_str(obj, "last_assign_result",
                          dl_assign_result_name(diag->last_assign_result));
 
         json_push_kv_int(obj, "peer_download_total",
-                         (int64_t)diag->peer_download_total);
+                         download_stats_json_u64(diag->peer_download_total));
         json_push_kv_bool(obj, "peer_download_truncated",
                           diag->peer_download_truncated);
         struct json_value peers = {0};
@@ -158,10 +165,14 @@ void download_stats_push_json(struct json_value *obj,
             struct json_value peer = {0};
             json_set_object(&peer);
             json_push_kv_int(&peer, "peer_id", (int64_t)pd->peer_id);
-            json_push_kv_int(&peer, "requested", (int64_t)pd->requested);
-            json_push_kv_int(&peer, "received", (int64_t)pd->received);
-            json_push_kv_int(&peer, "timed_out", (int64_t)pd->timed_out);
-            json_push_kv_int(&peer, "in_flight", (int64_t)pd->in_flight);
+            json_push_kv_int(&peer, "requested",
+                             download_stats_json_u64(pd->requested));
+            json_push_kv_int(&peer, "received",
+                             download_stats_json_u64(pd->received));
+            json_push_kv_int(&peer, "timed_out",
+                             download_stats_json_u64(pd->timed_out));
+            json_push_kv_int(&peer, "in_flight",
+                             download_stats_json_u64(pd->in_flight));
             json_push_kv_int(&peer, "avg_delivery_us",
                              pd->avg_delivery_us);
             json_push_kv_int(&peer, "last_body_age_seconds",
@@ -180,7 +191,8 @@ void download_stats_push_json(struct json_value *obj,
         json_free(&peers);
     }
 
-    json_push_kv_int(obj, "bytes_downloaded", (int64_t)s->bytes_downloaded);
+    json_push_kv_int(obj, "bytes_downloaded",
+                     download_stats_json_u64(s->bytes_downloaded));
     char mbps_str[32];
     snprintf(mbps_str, sizeof(mbps_str), "%.1f", s->mbps_avg);
     json_push_kv_str(obj, "mbps_avg", mbps_str);
