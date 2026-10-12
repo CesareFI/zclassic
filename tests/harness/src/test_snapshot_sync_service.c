@@ -3618,6 +3618,30 @@ static int test_snapshot_blacklist_multiple(void)
     return failures;
 }
 
+static int test_snapshot_blacklist_replaces_oldest_when_full(void)
+{
+    int failures = 0;
+    TEST("snapshot blacklist retains the newest stalled peer at capacity") {
+        struct snapshot_sync_service svc;
+        memset(&svc, 0, sizeof(svc));
+
+        for (uint32_t peer_id = 1; peer_id <= SNAPSYNC_MAX_BLACKLIST;
+             peer_id++)
+            snapsync_blacklist_peer(&svc, peer_id);
+        ASSERT(svc.blacklist_count == SNAPSYNC_MAX_BLACKLIST);
+
+        /* Parent behavior silently drops this peer, allowing it to win the
+         * next snapshot offer race immediately after its stall reset. */
+        snapsync_blacklist_peer(&svc, SNAPSYNC_MAX_BLACKLIST + 1U);
+        ASSERT(svc.blacklist_count == SNAPSYNC_MAX_BLACKLIST);
+        ASSERT(snapsync_is_peer_blacklisted(
+            &svc, SNAPSYNC_MAX_BLACKLIST + 1U));
+        ASSERT(!snapsync_is_peer_blacklisted(&svc, 1));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 static int test_snapshot_blacklist_rejects_offer(void)
 {
     int failures = 0;
@@ -3766,6 +3790,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_blacklist_zero_peer();
     failures += test_snapshot_blacklist_refresh();
     failures += test_snapshot_blacklist_multiple();
+    failures += test_snapshot_blacklist_replaces_oldest_when_full();
     failures += test_snapshot_blacklist_rejects_offer();
     failures += test_snapshot_blacklist_blocks_low_level_admission();
     failures += test_snapshot_blacklist_survives_reset();

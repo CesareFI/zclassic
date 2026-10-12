@@ -547,6 +547,22 @@ bool snapsync_is_peer_blacklisted(const struct snapshot_sync_service *svc,
     return blacklisted;
 }
 
+/* Caller holds the snapshot service lock. Keep the bounded blacklist useful
+ * under peer churn: a newly stalled peer must not be able to re-offer merely
+ * because older, still-valid entries filled every slot. */
+static int snapsync_oldest_blacklist_entry(
+    const struct snapshot_sync_service *svc)
+{
+    int oldest = 0;
+
+    for (int i = 1; i < svc->blacklist_count; i++) {
+        if (svc->blacklist[i].blacklisted_at_us <
+            svc->blacklist[oldest].blacklisted_at_us)
+            oldest = i;
+    }
+    return oldest;
+}
+
 void snapsync_blacklist_peer(struct snapshot_sync_service *svc,
                              uint32_t peer_id)
 {
@@ -573,6 +589,12 @@ void snapsync_blacklist_peer(struct snapshot_sync_service *svc,
         } else {
             i++;
         }
+    }
+
+    if (svc->blacklist_count == SNAPSYNC_MAX_BLACKLIST) {
+        int oldest = snapsync_oldest_blacklist_entry(svc);
+
+        svc->blacklist[oldest] = svc->blacklist[--svc->blacklist_count];
     }
 
     /* Add new entry */
