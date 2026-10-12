@@ -1,0 +1,269 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Distributed under the MIT software license, see the accompanying
+ * file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ *
+ * Internal helper contract shared between the node_db connection-handle
+ * source files (database.c, database_migrate.c, database_migrate_features.c,
+ * database_modes.c). NOT part of the public model API — callers must
+ * include models/database.h.
+ *
+ * This header keeps shared connection-handle helpers visible only to the
+ * database model siblings that own migrations, runtime modes, and health
+ * activity stamping. */
+
+#ifndef ZCL_DB_MODEL_DATABASE_INTERNAL_H
+#define ZCL_DB_MODEL_DATABASE_INTERNAL_H
+
+#include "models/database.h"
+#include "util/log_macros.h"
+#include <sqlite3.h>
+
+/* ── WAL bounds ────────────────────────────────────────────────────────
+ *
+ * Two settings, and they do DIFFERENT jobs. Getting one without the other is
+ * how a node ends up with a write-ahead log many times the size of the
+ * database it journals.
+ *
+ *   wal_autocheckpoint   how many WAL pages may accumulate before a writer
+ *                        folds them back into the database. It bounds how far
+ *                        BEHIND the WAL runs — not the size of the file.
+ *   journal_size_limit   the size the .wal FILE is truncated back to after a
+ *                        checkpoint. Without it a checkpointed WAL keeps its
+ *                        high-water mark for the life of the connection, so
+ *                        one burst leaves a permanently large file that
+ *                        nothing reclaims.
+ *
+ * Both are per-connection: neither survives into the next process, which is
+ * exactly why the bound has to be established when the connection is OPENED
+ * rather than restored at the end of a phase. A process killed mid-sync never
+ * reaches an end-of-phase restore, and the run after it opens a fresh
+ * connection carrying whatever the open path set.
+ *
+ * Bulk-sync mode gets looser bounds, not absent ones. Its whole point is to
+ * checkpoint rarely, and 256 MiB of WAL is rare enough on any disk; unbounded
+ * is not a faster setting, it is an unbounded one. */
+/* Spelled as bare decimal literals: they are pasted into PRAGMA text by
+ * ZCL_NODE_DB_PRAGMA_NUM below, and an arithmetic expression would stringify
+ * into SQL sqlite cannot parse. */
+#define ZCL_NODE_DB_WAL_AUTOCKPT_PAGES        1000       /* ~4 MiB   */
+#define ZCL_NODE_DB_WAL_AUTOCKPT_PAGES_BULK   65536      /* ~256 MiB */
+#define ZCL_NODE_DB_JOURNAL_SIZE_LIMIT        67108864   /* 64 MiB   */
+#define ZCL_NODE_DB_JOURNAL_SIZE_LIMIT_BULK   268435456  /* 256 MiB  */
+
+/* Paste one of the constants above into a PRAGMA string at compile time, so
+ * the number in the SQL and the number a test asserts are the same token. */
+#define ZCL_NODE_DB_PRAGMA_NUM_(x_) #x_
+#define ZCL_NODE_DB_PRAGMA_NUM(x_) ZCL_NODE_DB_PRAGMA_NUM_(x_)
+
+/* Persist schema_version AND schema_compat_floor together, in the same
+ * write, so a reader can never observe one bumped without the other; halt
+ * migration on failure so we don't silently re-apply the same migration on
+ * next boot. `floor_ver` is the RUNNING floor value the caller is
+ * threading through its migration chain: pass it unchanged for an ADDITIVE
+ * step (a new table/column/index an older binary simply ignores) and set it
+ * to `ver` itself, before this call, for a BREAKING step (a rename, drop, or
+ * a change to what an existing column/row means). Used by every versioned
+ * migration block in database_migrate.c and database_migrate_features*.c. */
+#define DB_MIGRATE_PERSIST_VERSION_FLOOR(ndb, ver, floor_ver) do { \
+    int32_t _v = (int32_t)(ver); \
+    int32_t _f = (int32_t)(floor_ver); \
+    bool _txn_owned = node_db_begin((ndb)); \
+    bool _ok = node_db_state_set((ndb), "schema_version", &_v, sizeof(_v)) && \
+               node_db_state_set((ndb), "schema_compat_floor", &_f, \
+                                 sizeof(_f)); \
+    if (_txn_owned) { \
+        if (_ok) \
+            _ok = node_db_commit((ndb)); \
+        else \
+            (void)node_db_rollback((ndb)); \
+    } \
+    if (!_ok) { \
+        LOG_ERR("db", "migrate: failed to persist " \
+                "schema_version=%d schema_compat_floor=%d atomically; " \
+                "aborting migration to prevent loop on next boot", \
+                (int)_v, (int)_f); \
+    } \
+} while (0)
+
+/* Log the Campaign-C3 newer-schema refusal banner: schema_version exceeds
+ * NODE_DB_MAX_SCHEMA AND the database's own schema_compat_floor is also
+ * above it, so no binary at this level can safely open it. Defined in
+ * database_migrate.c; called by the open-time preflight in database.c
+ * (before anything writes to the datadir) and by node_db_migrate()'s
+ * own recheck. */
+void node_db_log_newer_schema_refusal(int current_ver, int floor);
+/* Log the read-compatible open banner: schema_version exceeds
+ * NODE_DB_MAX_SCHEMA but the database's own schema_compat_floor is at or
+ * below it, so this binary opens normally without attempting any schema
+ * write. Defined in database_migrate.c; called only from node_db_migrate()
+ * (the preflight in database.c already let the open proceed). */
+void node_db_log_read_compatible_open(int current_ver, int floor);
+void node_db_log_unknown_schema_refusal(const char *detail);
+
+/* node_db_migrate()'s error code when a required pre-migration backup could
+ * not be written (see node_db_backup_before_breaking_migration below) — kept
+ * distinct from the generic -1 "not open" so a caller can tell WHY the
+ * migration stopped instead of only that it did. */
+#define NODE_DB_MIGRATE_ERR_BACKUP_FAILED (-3)
+
+/* Internal-only propagation sentinel between the versioned-migration hop
+ * functions (node_db_migrate_features() -> ..._v30_up() -> ..._v49_up() ->
+ * ..._v67_up()), NOT the public error code a caller of node_db_migrate()
+ * sees. Each hop's own tail line forwards its downstream call's result with
+ * a plain, branch-free `applied + <downstream call>` (matching every other
+ * migration hop here and keeping each hop function's own pinned cyclomatic
+ * complexity unchanged) — so the one function that actually detects a
+ * refusal must return a magnitude so far below any
+ * possible sum of `applied` counts (each hop applies at most a few dozen
+ * versioned steps) that no amount of unconditional addition on the way up
+ * can bring it back to a non-negative value. node_db_migrate() itself is
+ * the ONLY place that reads the range and translates backup refusal to
+ * NODE_DB_MIGRATE_ERR_BACKUP_FAILED or schema failure to generic -1. */
+#define DB_MIGRATE_BACKUP_FAILED_PROPAGATE (-1000000)
+/* Distinct from the backup refusal after each feature helper adds its own
+ * applied count on return. A failed additive DDL step is a schema error. */
+#define DB_MIGRATE_SCHEMA_FAILED_PROPAGATE (-2000000)
+#define DB_MIGRATE_SCHEMA_FAILED_BOUND (-1500000)
+
+/* Opt-in pre-migration safety net for -db-backup-before-migrate
+ * (ZCL_DB_BACKUP_BEFORE_MIGRATE; see engine/composition/src/args.c). When the
+ * flag is unset this is a no-op that returns true immediately — it never
+ * gates a migration nobody asked it to protect. When set, it copies ndb's
+ * live database to node.db.schema<old_schema_version>.bak beside it, via
+ * SQLite's own online backup API, before a BREAKING migration step (one that
+ * renames, drops, or repurposes existing rows/columns — see the versions
+ * marked BREAKING in database_migrate_features_v49_up.c and
+ * database_migrate_features_v67_up.c) is allowed to touch the live file.
+ * Refuses (returns false, writing nothing partial) rather than racing a full
+ * disk when free space is short. Defined in database_backup.c. */
+bool node_db_backup_before_breaking_migration(struct node_db *ndb,
+                                              int old_schema_version);
+
+/* Unit-test seam: override the free-space figure
+ * node_db_backup_before_breaking_migration() compares against the database
+ * file size + margin, without touching the real filesystem. A negative value
+ * (the default) restores the real platform_disk_space_available() query.
+ * Process-local; mirrors disk_monitor_set_free_bytes_for_test(). */
+void node_db_backup_set_free_bytes_override_for_test(int64_t bytes);
+
+/* Existing-file schema preflight. This runs before database.c opens a
+ * write-capable handle or applies journal_mode=WAL. FRESH includes a missing
+ * path and a genuinely empty SQLite store; SUPPORTED means an exact, readable
+ * 4-byte schema marker in this binary's supported range; READ_COMPATIBLE
+ * means the marker is above this binary's NODE_DB_MAX_SCHEMA but the
+ * database's own schema_compat_floor is not — the open proceeds exactly like
+ * SUPPORTED, and node_db_migrate()'s own recheck (which independently
+ * derives the same floor) logs the WARN and skips every schema write. */
+enum node_db_schema_preflight_state {
+    NODE_DB_SCHEMA_PREFLIGHT_FRESH = 0,
+    NODE_DB_SCHEMA_PREFLIGHT_SUPPORTED,
+    NODE_DB_SCHEMA_PREFLIGHT_READ_COMPATIBLE,
+    NODE_DB_SCHEMA_PREFLIGHT_NEWER,
+    NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN,
+};
+
+struct node_db_schema_preflight {
+    enum node_db_schema_preflight_state state;
+    int32_t version;
+    /* schema_compat_floor as read from this database, or `version` itself
+     * when no floor key is recorded (pre-unit database: no downgrade is
+     * assumed safe). Populated for SUPPORTED, READ_COMPATIBLE and NEWER;
+     * 0 for FRESH/UNKNOWN, where no version was established. */
+    int32_t floor;
+    const char *detail;
+};
+
+struct node_db_schema_preflight node_db_schema_preflight_existing(
+    const char *path);
+
+/* Apply the app-feature migration blocks (schema v14+): store products
+ * and orders, ZCL Market file offers, ZNAM name registry, ZMSG
+ * messaging, ZSWP atomic-swap contracts, HODL wave history, and the
+ * content-addressed blob store. `*version` is the current schema
+ * version on entry and the post-migration version on return; `*floor` is
+ * likewise the running schema_compat_floor. Returns
+ * the number of migration blocks applied. (Defined in
+ * database_migrate_features.c; called only by node_db_migrate().) */
+int node_db_migrate_features(struct node_db *ndb, int *version, int *floor);
+
+/* Continuation of node_db_migrate_features() for schema v30+ (E1 file-size
+ * split — database_migrate_features_v30_up.c). Same contract; called only by
+ * node_db_migrate_features() at the v30 handoff. */
+int node_db_migrate_features_v30_up(struct node_db *ndb, int *version,
+                                    int *floor);
+
+/* Continuation of node_db_migrate_features_v30_up() for schema v49+ (same
+ * E1 file-size split — database_migrate_features_v49_up.c). Same contract;
+ * called only by node_db_migrate_features_v30_up() at the v49 handoff. */
+int node_db_migrate_features_v49_up(struct node_db *ndb, int *version,
+                                    int *floor);
+int node_db_migrate_features_v67_up(struct node_db *ndb, int *version,
+                                    int *floor);
+
+/* Execute `sql`, logging any error with `where` context. Returns the
+ * sqlite3 rc so callers can make tolerance decisions. (Defined in
+ * database.c; used by migrations and performance-mode helpers.) */
+int db_exec_checked(sqlite3 *db, const char *sql, const char *where);
+
+/* Apply the idempotent baseline schema DDL (SCHEMA[]). Defined in
+ * database_schema.c; called once from node_db_open(). Returns false on a
+ * real schema regression (boot must halt). */
+bool create_schema(struct node_db *ndb);
+
+/* Like db_exec_checked but tolerates a known-benign error substring
+ * (e.g. "duplicate column name" when re-applying idempotent ALTERs).
+ * (Defined in database.c; used by the migration runner.) */
+int db_exec_tolerant(sqlite3 *db, const char *sql, const char *where,
+                     const char *tolerable_substr);
+
+/* Record turbo-mode transition in the runtime health snapshot.
+ * (Defined in database.c; used by performance-mode helpers.) */
+void node_db_note_turbo_mode(struct node_db *ndb, bool turbo_mode,
+                             const char *op, int rc);
+
+/* Stamp last-activity time + sqlite rc + op label into the runtime
+ * health snapshot. (Defined in database.c; used by the KV state store
+ * in database_migrate.c.) */
+void node_db_note_activity(struct node_db *ndb, const char *op, int rc);
+
+/* Atomically stamp transaction-open state with the same health activity
+ * fields. Defined by the connection lifecycle unit and used by the runtime
+ * transaction operations sibling. */
+void node_db_note_tx_state(struct node_db *ndb, bool tx_open,
+                           const char *op, int rc);
+
+/* ── Long-running maintenance-op machinery (database_long_op.c) ─────────
+ *
+ * The progress-handler wrappers and the lock-free busy-op registry that backs
+ * the public node_db_long_op_active() live in database_long_op.c so database.c
+ * stays focused on the connection open/migration lifecycle. db_quick_check_ok()
+ * and node_db_open() (in database.c) call db_long_op_start/finish and
+ * db_exec_checked_progress;
+ * the progress callback raises the deadline blocker via note_deadline. See
+ * database.h for the public reader and database_long_op.c for the rationale. */
+#define ZCL_DB_LONG_OP_DEADLINE_MS  (15 * 60 * 1000)
+
+struct db_long_op_progress {
+    const char *op;
+    const char *path;
+    int64_t start_ms;
+    int64_t last_log_ms;
+    uint64_t callbacks;
+    bool log_enabled;
+};
+
+/* Install/remove the SQLite progress handler and publish/clear the busy op. */
+void db_long_op_start(sqlite3 *db, struct db_long_op_progress *progress,
+                      const char *op, const char *path);
+void db_long_op_finish(sqlite3 *db, struct db_long_op_progress *progress,
+                       bool ok, int rc);
+/* db_exec_checked wrapped in the long-op progress lifecycle. */
+int db_exec_checked_progress(sqlite3 *db, const char *sql,
+                             const char *where, const char *path);
+
+/* Registry hooks shared with the progress callback. */
+void db_long_op_publish(const char *op, int64_t start_ms);
+void db_long_op_unpublish(void);
+void db_long_op_note_deadline(const char *op, int64_t elapsed_ms);
+
+#endif

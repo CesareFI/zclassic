@@ -1,0 +1,408 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Purpose: exclusive process ownership of a canonical node database.
+ * ar-validate-skip:connection-ownership-not-a-row */
+
+#include "models/database_owner_lease.h"
+
+#include "models/database.h"
+#include "platform/path_compat.h"
+#include "util/log_macros.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#endif
+
+enum { NODE_DB_OWNER_LEASES = 128 };
+enum { NODE_DB_OWNER_PATH_MAX = 1100 };
+
+/* ── Lease lock mechanism ──────────────────────────────────────────────
+ * The lease is an advisory exclusive lock on ONE byte of node.db itself
+ * (no sidecar artifacts; independent scratch databases stay independent).
+ *
+ * Linux keeps the historical flock(LOCK_EX). Darwin cannot: flock and POSIX
+ * fcntl record locks share one kernel lock space there, so a held flock
+ * blocks this same process's SQLite byte-range locks on the very inode the
+ * lease protects (measured: hold flock(EX), then fcntl(F_SETLK, WRLCK) on a
+ * second descriptor of the same process fails with EAGAIN). Every boot
+ * would race its own lease. On that host the identical mutual exclusion is
+ * carried by one fcntl record at an offset far above every byte SQLite can
+ * address for its own locking region, so lease and database locks stay
+ * disjoint advisory states on the exact inode — same ownership contract,
+ * same fail-closed probes. */
+
+#if defined(_WIN32)
+#define NODE_DB_OWNER_LEASE_LOCK_START UINT64_C(0x0000F00000000000)
+
+static int owner_lease_apply(int fd, bool lock)
+{
+    intptr_t raw = _get_osfhandle(fd);
+    if (raw == -1) {
+        errno = EBADF;
+        return -1;
+    }
+    OVERLAPPED overlap;
+    memset(&overlap, 0, sizeof(overlap));
+    overlap.Offset = (DWORD)NODE_DB_OWNER_LEASE_LOCK_START;
+    overlap.OffsetHigh = (DWORD)(NODE_DB_OWNER_LEASE_LOCK_START >> 32);
+    BOOL ok = lock
+        ? LockFileEx((HANDLE)raw, LOCKFILE_EXCLUSIVE_LOCK |
+                     LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &overlap)
+        : UnlockFileEx((HANDLE)raw, 0, 1, 0, &overlap);
+    if (!ok) {
+        DWORD error = GetLastError();
+        errno = error == ERROR_LOCK_VIOLATION ? EWOULDBLOCK : EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int owner_lease_lock(int fd) { return owner_lease_apply(fd, true); }
+static int owner_lease_unlock(int fd) { return owner_lease_apply(fd, false); }
+
+static int owner_lease_open(const char *path, bool writable, bool create)
+{
+    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
+                                    NULL, 0);
+    if (count <= 0 || count > 32767) {
+        errno = EINVAL;
+        return -1;
+    }
+    wchar_t wide[32768];
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
+                            wide, count) != count) {
+        errno = EINVAL;
+        return -1;
+    }
+    DWORD access = GENERIC_READ | (writable ? GENERIC_WRITE : 0);
+    HANDLE handle = CreateFileW(wide, access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        create ? OPEN_ALWAYS : OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        errno = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+              ? ENOENT : EACCES;
+        return -1;
+    }
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag,
+                                      sizeof(tag)) ||
+        (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                               FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+        CloseHandle(handle);
+        errno = ELOOP;
+        return -1;
+    }
+    int fd = _open_osfhandle((intptr_t)handle,
+                             (writable ? _O_RDWR : _O_RDONLY) | _O_BINARY);
+    if (fd < 0) CloseHandle(handle);
+    return fd;
+}
+#elif defined(__APPLE__)
+#define NODE_DB_OWNER_LEASE_LOCK_START ((off_t)0x0000F00000000000ULL)
+
+static int owner_lease_apply(int fd, short type)
+{
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = type;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = NODE_DB_OWNER_LEASE_LOCK_START;
+    fl.l_len = 1;
+    return fcntl(fd, F_SETLK, &fl);
+}
+
+static int owner_lease_lock(int fd)
+{
+    return owner_lease_apply(fd, F_WRLCK);
+}
+
+static int owner_lease_unlock(int fd)
+{
+    return owner_lease_apply(fd, F_UNLCK);
+}
+#else
+static int owner_lease_lock(int fd)
+{
+    return flock(fd, LOCK_EX | LOCK_NB);
+}
+
+static int owner_lease_unlock(int fd)
+{
+    return flock(fd, LOCK_UN);
+}
+#endif
+
+#if !defined(_WIN32)
+static int owner_lease_open(const char *path, bool writable, bool create)
+{
+    int flags = writable ? O_RDWR : O_RDONLY;
+    flags |= O_CLOEXEC | O_NOFOLLOW;
+    if (create) flags |= O_CREAT;
+    return open(path, flags, 0600);
+}
+#endif
+
+struct node_db_owner_lease {
+    char path[1024];
+    int fd;
+    unsigned refs;
+    pid_t pid;
+};
+
+static pthread_mutex_t g_owner_lease_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct node_db_owner_lease g_owner_leases[NODE_DB_OWNER_LEASES];
+
+static bool node_db_owner_lock_path(char out[NODE_DB_OWNER_PATH_MAX],
+                                    const char *db_path)
+{
+#if defined(__APPLE__)
+    int written = snprintf(out, NODE_DB_OWNER_PATH_MAX, "%s.owner-lock",
+                           db_path);
+    return written >= 0 && written < NODE_DB_OWNER_PATH_MAX;
+#else
+    int written = snprintf(out, NODE_DB_OWNER_PATH_MAX, "%s", db_path);
+    return written >= 0 && written < NODE_DB_OWNER_PATH_MAX;
+#endif
+}
+
+static bool owner_lease_owned_self(const char *identity)
+{
+    pthread_mutex_lock(&g_owner_lease_mutex);
+    for (int i = 0; i < NODE_DB_OWNER_LEASES; i++) {
+        struct node_db_owner_lease *lease = &g_owner_leases[i];
+        if (lease->refs > 0 && lease->pid == getpid() &&
+            strcmp(lease->path, identity) == 0) {
+            pthread_mutex_unlock(&g_owner_lease_mutex);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&g_owner_lease_mutex);
+    return false;
+}
+
+static enum node_db_owner_lease_probe owner_lease_probe_fd(int fd)
+{
+#if defined(__APPLE__)
+    /* The read-only probe descriptor cannot carry F_SETLK write attempts, so
+     * the lease byte is interrogated instead: F_GETLK reports whichever
+     * process, if any, currently owns the record. */
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = NODE_DB_OWNER_LEASE_LOCK_START;
+    fl.l_len = 1;
+    int rc = fcntl(fd, F_GETLK, &fl);
+    (void)close(fd);
+    if (rc != 0)
+        return NODE_DB_OWNER_LEASE_PROBE_ERROR;
+    if (fl.l_type == F_UNLCK)
+        return NODE_DB_OWNER_LEASE_UNOWNED;
+    return fl.l_pid == getpid() ? NODE_DB_OWNER_LEASE_OWNED_SELF
+                                : NODE_DB_OWNER_LEASE_LIVE;
+#else
+    if (owner_lease_lock(fd) == 0) {
+        int unlock_rc = owner_lease_unlock(fd);
+        int close_rc = close(fd);
+        return unlock_rc == 0 && close_rc == 0
+            ? NODE_DB_OWNER_LEASE_UNOWNED
+            : NODE_DB_OWNER_LEASE_PROBE_ERROR;
+    }
+    int saved = errno;
+    (void)close(fd);
+    return saved == EWOULDBLOCK || saved == EAGAIN
+        ? NODE_DB_OWNER_LEASE_LIVE : NODE_DB_OWNER_LEASE_PROBE_ERROR;
+#endif
+}
+
+enum node_db_owner_lease_probe node_db_owner_lease_probe(const char *path)
+{
+    char identity[NODE_DB_OWNER_PATH_MAX];
+    char lock_path[NODE_DB_OWNER_PATH_MAX];
+    if (!path || !path[0]) return NODE_DB_OWNER_LEASE_PROBE_ERROR;
+    if (strcmp(path, ":memory:") == 0) return NODE_DB_OWNER_LEASE_UNOWNED;
+#if !defined(_WIN32)
+    /* Inspect the caller's leaf before realpath can erase a symlink or the
+     * registry/sidecar can classify an invalid database as unowned. */
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return errno == ENOENT ? NODE_DB_OWNER_LEASE_UNOWNED
+                               : NODE_DB_OWNER_LEASE_PROBE_ERROR;
+    if (!S_ISREG(st.st_mode)) return NODE_DB_OWNER_LEASE_PROBE_ERROR;
+#endif
+    if (!platform_path_identity(identity, sizeof(identity), path))
+        return NODE_DB_OWNER_LEASE_PROBE_ERROR;
+    if (owner_lease_owned_self(identity)) return NODE_DB_OWNER_LEASE_OWNED_SELF;
+    if (!node_db_owner_lock_path(lock_path, identity))
+        return NODE_DB_OWNER_LEASE_PROBE_ERROR;
+    int fd = owner_lease_open(lock_path, false, false);
+    if (fd < 0)
+        return errno == ENOENT ? NODE_DB_OWNER_LEASE_UNOWNED
+                               : NODE_DB_OWNER_LEASE_PROBE_ERROR;
+    return owner_lease_probe_fd(fd);
+}
+
+void node_db_owner_lease_release(struct node_db *ndb)
+{
+    char identity[NODE_DB_OWNER_PATH_MAX];
+    if (!ndb || ndb->lifetime_owner_lease_slot < 0) return;
+    if (!platform_path_identity(identity, sizeof(identity), ndb->path))
+        return;
+    pthread_mutex_lock(&g_owner_lease_mutex);
+    int slot = ndb->lifetime_owner_lease_slot;
+    struct node_db_owner_lease *lease =
+        slot < NODE_DB_OWNER_LEASES ? &g_owner_leases[slot] : NULL;
+    if (lease && lease->pid == getpid() && lease->refs > 0 &&
+        strcmp(lease->path, identity) == 0) {
+        lease->refs--;
+        if (lease->refs == 0) {
+            if (owner_lease_unlock(lease->fd) != 0)
+                LOG_WARN("db", "database owner lease unlock failed for %s: %s",
+                         ndb->path, strerror(errno));
+            if (close(lease->fd) != 0)
+                LOG_WARN("db", "database owner lease close failed for %s: %s",
+                         ndb->path, strerror(errno));
+            memset(lease, 0, sizeof(*lease));
+            lease->fd = -1;
+        }
+    }
+    pthread_mutex_unlock(&g_owner_lease_mutex);
+    ndb->lifetime_owner_lease_slot = -1;
+}
+
+bool node_db_owner_lease_acquire(struct node_db *ndb, bool create_if_missing)
+{
+    char identity[NODE_DB_OWNER_PATH_MAX];
+    char lock_path[NODE_DB_OWNER_PATH_MAX];
+    if (!ndb || !ndb->path[0])
+        LOG_FAIL("db", "database owner lease requires a path");
+    if (strcmp(ndb->path, ":memory:") == 0) return true;
+    if (!platform_path_identity(identity, sizeof(identity), ndb->path) ||
+        !node_db_owner_lock_path(lock_path, identity))
+        LOG_FAIL("db", "database owner lease path is too long: %s", ndb->path);
+#if defined(__APPLE__)
+    if (!create_if_missing && access(ndb->path, F_OK) != 0)
+        LOG_FAIL("db", "database owner lease open failed for %s: %s",
+                 ndb->path, strerror(errno));
+#endif
+    pthread_mutex_lock(&g_owner_lease_mutex);
+    int free_slot = -1;
+    for (int i = 0; i < NODE_DB_OWNER_LEASES; i++) {
+        struct node_db_owner_lease *lease = &g_owner_leases[i];
+        if (lease->refs > 0 && lease->pid != getpid()) {
+            (void)close(lease->fd);
+            memset(lease, 0, sizeof(*lease));
+            lease->fd = -1;
+        }
+        if (lease->refs > 0 && lease->pid == getpid() &&
+            strcmp(lease->path, identity) == 0) {
+            lease->refs++;
+            ndb->lifetime_owner_lease_slot = i;
+            pthread_mutex_unlock(&g_owner_lease_mutex);
+            return true;
+        }
+        if (lease->refs == 0 && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) {
+        pthread_mutex_unlock(&g_owner_lease_mutex);
+        LOG_FAIL("db", "database owner lease registry is full for %s", ndb->path);
+    }
+    /* Linux flock and SQLite's POSIX byte locks are independent, so the
+     * database inode is the lease. Darwin implements flock through fcntl and
+     * would make SQLite conflict with its own process; use one persistent
+     * per-database lock inode there. Independent databases remain independent. */
+    bool create_lease = create_if_missing;
+#if defined(__APPLE__)
+    create_lease = true;
+#endif
+    int fd = owner_lease_open(lock_path, true, create_lease);
+    if (fd < 0) goto fail_locked;
+    if (owner_lease_lock(fd) != 0) {
+        int saved = errno;
+        (void)close(fd);
+        pthread_mutex_unlock(&g_owner_lease_mutex);
+        LOG_FAIL("db", "DATABASE_OWNERSHIP_CONFLICT: canonical database owner "
+                 "already holds path=%s (error=%s)", ndb->path,
+                 strerror(saved));
+    }
+    struct node_db_owner_lease *lease = &g_owner_leases[free_slot];
+    (void)snprintf(lease->path, sizeof(lease->path), "%s", identity);
+    lease->fd = fd;
+    lease->refs = 1;
+    lease->pid = getpid();
+    ndb->lifetime_owner_lease_slot = free_slot;
+    pthread_mutex_unlock(&g_owner_lease_mutex);
+    return true;
+
+fail_locked:
+    {
+        int saved = errno;
+        pthread_mutex_unlock(&g_owner_lease_mutex);
+        LOG_FAIL("db", "database owner lease open failed for %s: %s",
+                 ndb->path, strerror(saved));
+    }
+}
+
+bool node_db_owner_lease_rebind(struct node_db *ndb)
+{
+    if (!ndb || ndb->lifetime_owner_lease_slot < 0)
+        LOG_FAIL("db", "database owner lease rebind requires ownership");
+#if defined(__APPLE__)
+    char identity[NODE_DB_OWNER_PATH_MAX];
+    if (!platform_path_identity(identity, sizeof(identity), ndb->path))
+        LOG_FAIL("db", "database owner rebind path is invalid");
+    pthread_mutex_lock(&g_owner_lease_mutex);
+    int slot = ndb->lifetime_owner_lease_slot;
+    struct node_db_owner_lease *lease =
+        slot < NODE_DB_OWNER_LEASES ? &g_owner_leases[slot] : NULL;
+    bool valid = lease && lease->pid == getpid() && lease->refs == 1 &&
+                 strcmp(lease->path, identity) == 0;
+    pthread_mutex_unlock(&g_owner_lease_mutex);
+    if (!valid)
+        LOG_FAIL("db", "database owner rebind found ambiguous ownership");
+    return true;
+#else
+    int replacement = owner_lease_open(ndb->path, true, true);
+    if (replacement < 0)
+        LOG_FAIL("db", "database owner rebind open failed for %s: %s",
+                 ndb->path, strerror(errno));
+    if (owner_lease_lock(replacement) != 0) {
+        int saved = errno;
+        (void)close(replacement);
+        LOG_FAIL("db", "DATABASE_OWNERSHIP_CONFLICT: replacement path=%s "
+                 "was acquired during quarantine (error=%s)", ndb->path,
+                 strerror(saved));
+    }
+    pthread_mutex_lock(&g_owner_lease_mutex);
+    int slot = ndb->lifetime_owner_lease_slot;
+    struct node_db_owner_lease *lease =
+        slot < NODE_DB_OWNER_LEASES ? &g_owner_leases[slot] : NULL;
+    if (!lease || lease->pid != getpid() || lease->refs != 1 ||
+        strcmp(lease->path, ndb->path) != 0) {
+        pthread_mutex_unlock(&g_owner_lease_mutex);
+        (void)owner_lease_unlock(replacement);
+        (void)close(replacement);
+        LOG_FAIL("db", "database owner rebind found ambiguous ownership");
+    }
+    int retired = lease->fd;
+    lease->fd = replacement;
+    pthread_mutex_unlock(&g_owner_lease_mutex);
+    (void)owner_lease_unlock(retired);
+    (void)close(retired);
+    return true;
+#endif
+}

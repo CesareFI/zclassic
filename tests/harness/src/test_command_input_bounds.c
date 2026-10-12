@@ -1,0 +1,1299 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * test_command_input_bounds: the per-key length rule in
+ * zcl_command_registry_input_validate() and the per-leaf read frame
+ * (zcl_command_registry_input_budget_bytes()).
+ *
+ * Unlisted keys are strings of at most 4096 characters; hex payload keys are
+ * bounded by their wire constants. Both edges are held for:
+ *
+ *   manifest_hex  2 * VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES  (2 MiB chars)
+ *   recipe_hex    2 * VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES    (512 KiB chars)
+ *   release_hex   2 * VCS_PACKAGE_RELEASE_MAX_WIRE_BYTES
+ *   everything else                     4096 chars
+ *
+ * and the read frame each leaf gets, since a validator accepting 2 MiB in
+ * front of a reader that stops at 16 KiB is not a fix. */
+
+#include "test/test_core.h"
+
+#include "config/command_catalog.h"
+#include "json/json.h"
+#include "kernel/command_registry.h"
+
+#include "fleetledger/fleet_ledger.h"
+#include "vcs/package_manifest.h"
+#include "vcs/package_recipe.h"
+#include "vcs/package_release.h"
+#include "vcs/zcode_c23_corpus.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define CIB_CHECK(name, expr) do {                                         \
+    if (expr) { printf("  command_input_bounds: %s... OK\n", (name)); }     \
+    else { printf("  command_input_bounds: %s... FAIL\n", (name));          \
+           failures++; }                                                    \
+} while (0)
+
+/* A malloc'd run of `len` 'a' characters. */
+static char *cib_fill(size_t len)
+{
+    char *s = malloc(len + 1);
+    if (!s)
+        return NULL;
+    memset(s, 'a', len);
+    s[len] = 0;
+    return s;
+}
+
+/* Validate `{key: <len chars>}` against `path`. `why` receives the refusal. */
+static bool cib_accepts(const char *path, const char *key, size_t len,
+                        char *why, size_t why_size)
+{
+    const struct zcl_command_spec *spec =
+        zcl_command_registry_find(zcl_command_catalog(), path, NULL);
+    if (!spec)
+        return false;
+    char *value = cib_fill(len);
+    if (!value)
+        return false;
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_str(&input, key, value);
+    if (why && why_size)
+        why[0] = 0;
+    bool ok = zcl_command_registry_input_validate(spec, &input, why, why_size);
+    json_free(&input);
+    free(value);
+    return ok;
+}
+
+static bool cib_accepts_int(const char *path, const char *key, int64_t value)
+{
+    const struct zcl_command_spec *spec =
+        zcl_command_registry_find(zcl_command_catalog(), path, NULL);
+    if (!spec) return false;
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    bool built = json_push_kv_int(&input, key, value);
+    bool ok = built && zcl_command_registry_input_validate(
+        spec, &input, NULL, 0);
+    json_free(&input);
+    return ok;
+}
+
+enum cib_fleet_type { CIB_FLEET_INT, CIB_FLEET_STRING, CIB_FLEET_BOOL,
+                      CIB_FLEET_REAL };
+
+static bool cib_fleet_value(const struct zcl_command_spec *spec,
+                            const char *kind, const char *subject,
+                            const char *key, enum cib_fleet_type type,
+                            int64_t value, bool duplicate, bool *built_out)
+{
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    bool built = json_push_kv_str(&input, "kind", kind) &&
+                 json_push_kv_str(&input, "subject", subject);
+    if (built && type == CIB_FLEET_INT)
+        built = json_push_kv_int(&input, key, value);
+    else if (built && type == CIB_FLEET_STRING)
+        built = json_push_kv_str(&input, key, "1");
+    else if (built && type == CIB_FLEET_BOOL)
+        built = json_push_kv_bool(&input, key, true);
+    else if (built)
+        built = json_push_kv_real(&input, key, 1.5);
+    if (built && duplicate)
+        built = json_push_kv_int(&input, key, value);
+    bool accepted = built &&
+        zcl_command_registry_input_validate(spec, &input, NULL, 0);
+    json_free(&input);
+    *built_out = built;
+    return accepted;
+}
+
+static int t_fleet_ledger_numeric_keys(void)
+{
+    int failures = 0;
+    const char *const keys[] = {
+        "tokens_in", "tokens_out", "tokens_cached", "tokens_reasoning",
+        "wall_ms", "turns", "tool_uses", "cost_micro_usd", "value",
+        "count", "bytes", "limit",
+    };
+    const struct zcl_command_spec *spec =
+        zcl_command_registry_find(zcl_command_catalog(), "fleet.ledger.add",
+                                  NULL);
+    CIB_CHECK("fleet.ledger.add resolves", spec != NULL);
+    if (!spec)
+        return failures;
+
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    bool built = json_push_kv_str(&input, "kind", "usage") &&
+                 json_push_kv_str(&input, "subject", "grok");
+    CIB_CHECK("fleet usage without counters constructs", built);
+    if (built)
+        CIB_CHECK("fleet usage permits every counter to be absent",
+                  zcl_command_registry_input_validate(spec, &input, NULL, 0));
+    json_free(&input);
+
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        char name[128];
+        bool made = false;
+        bool accepted = cib_fleet_value(spec, "usage", "grok", keys[i],
+                                        CIB_FLEET_INT, 0, false, &made);
+        snprintf(name, sizeof name, "%s measured zero constructs", keys[i]);
+        CIB_CHECK(name, made);
+        snprintf(name, sizeof name, "%s accepts measured zero", keys[i]);
+        CIB_CHECK(name, made && accepted);
+        accepted = cib_fleet_value(spec, "usage", "grok", keys[i],
+                                   CIB_FLEET_INT, INT64_C(4294967296), false,
+                                   &made);
+        snprintf(name, sizeof name, "%s wide integer constructs", keys[i]);
+        CIB_CHECK(name, made);
+        snprintf(name, sizeof name, "%s accepts a wide integer", keys[i]);
+        CIB_CHECK(name, made && accepted);
+
+        if (strcmp(keys[i], "value") != 0) {
+            accepted = cib_fleet_value(spec, "usage", "grok", keys[i],
+                                       CIB_FLEET_INT, -1, false, &made);
+            snprintf(name, sizeof name, "%s negative counter constructs",
+                     keys[i]);
+            CIB_CHECK(name, made);
+            snprintf(name, sizeof name, "%s refuses a negative counter",
+                     keys[i]);
+            CIB_CHECK(name, made && !accepted);
+        }
+        const enum cib_fleet_type wrong[] = {
+            CIB_FLEET_STRING, CIB_FLEET_BOOL, CIB_FLEET_REAL,
+        };
+        const char *const labels[] = { "string", "boolean", "real" };
+        for (size_t j = 0; j < sizeof wrong / sizeof wrong[0]; j++) {
+            accepted = cib_fleet_value(spec, "usage", "grok", keys[i],
+                                       wrong[j], 0, false, &made);
+            snprintf(name, sizeof name, "%s %s constructs", keys[i],
+                     labels[j]);
+            CIB_CHECK(name, made);
+            snprintf(name, sizeof name, "%s refuses a %s", keys[i],
+                     labels[j]);
+            CIB_CHECK(name, made && !accepted);
+        }
+    }
+
+    bool accepted = cib_fleet_value(spec, "vitals", "box.load1", "value",
+                                    CIB_FLEET_INT, -1, false, &built);
+    CIB_CHECK("negative gauge input constructs", built);
+    CIB_CHECK("a negative gauge value is valid", built && accepted);
+    accepted = cib_fleet_value(spec, "usage", "grok", "tokens_in",
+                               CIB_FLEET_INT, 1, true, &built);
+    CIB_CHECK("duplicate counter input constructs", built);
+    CIB_CHECK("duplicate counter keys are refused", built && !accepted);
+
+    const struct zcl_command_spec *query = zcl_command_registry_find(
+        zcl_command_catalog(), "core.storage.query", NULL);
+    CIB_CHECK("core.storage.query resolves for collateral limit checks",
+              query != NULL);
+    const int64_t limits[] = { 1, 0, INT64_C(4294967296) };
+    const bool limit_ok[] = { true, false, false };
+    for (size_t i = 0; query && i < sizeof limits / sizeof limits[0]; i++) {
+        json_init(&input);
+        json_set_object(&input);
+        built = json_push_kv_str(&input, "sql", "SELECT 1") &&
+                json_push_kv_int(&input, "limit", limits[i]);
+        CIB_CHECK("complete core storage query input constructs", built);
+        if (built) {
+            bool valid = zcl_command_registry_input_validate(
+                query, &input, NULL, 0);
+            CIB_CHECK(limit_ok[i] ? "core storage query accepts limit one"
+                                  : "core storage query refuses bad limit",
+                      valid == limit_ok[i]);
+        }
+        json_free(&input);
+    }
+    return failures;
+}
+
+/* ── 1. Both edges of three differently-limited keys ─────────────────── */
+
+static int t_key_edges(void)
+{
+    int failures = 0;
+    const char *plan = "zcode.package.publish.plan";
+    char why[192];
+
+    struct {
+        const char *key;
+        size_t max;
+        const char *label;
+    } cases[] = {
+        { "manifest_hex", 2u * (size_t)VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES,
+          "manifest_hex" },
+        { "recipe_hex", 2u * (size_t)VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES,
+          "recipe_hex" },
+        { "release_hex", 2u * (size_t)VCS_PACKAGE_RELEASE_MAX_WIRE_BYTES,
+          "release_hex" },
+        /* `dir` is on the same leaf and takes the unchanged default — proof
+         * that the raise is per key, not a global loosening. */
+        { "dir", 4096u, "dir (default bound)" },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char name[128];
+
+        snprintf(name, sizeof(name), "%s: the stated maximum is exactly the "
+                 "advertised bound", cases[i].label);
+        CIB_CHECK(name,
+                  zcl_command_registry_input_str_max(cases[i].key) ==
+                      cases[i].max);
+
+        snprintf(name, sizeof(name), "%s: a value AT the bound is accepted",
+                 cases[i].label);
+        bool at = cib_accepts(plan, cases[i].key, cases[i].max, why,
+                              sizeof(why));
+        CIB_CHECK(name, at);
+        if (!at)
+            printf("    refused at the bound: %s\n", why);
+
+        snprintf(name, sizeof(name), "%s: one character OVER is refused",
+                 cases[i].label);
+        bool over = cib_accepts(plan, cases[i].key, cases[i].max + 1, why,
+                                sizeof(why));
+        CIB_CHECK(name, !over);
+
+        /* The refusal must name the length rule. An over-long string is
+         * perfectly well-typed, so "invalid type or range" sends the
+         * operator hunting the wrong problem. */
+        snprintf(name, sizeof(name), "%s: the refusal names length, not type",
+                 cases[i].label);
+        CIB_CHECK(name, !over && strstr(why, cases[i].key) != NULL &&
+                            strstr(why, "characters") != NULL &&
+                            strstr(why, "limit") != NULL);
+    }
+
+    /* The default is a property of not knowing the key, so a key nobody has
+     * ruled on must still get 4096 — never the largest per-key bound. */
+    CIB_CHECK("an unruled key keeps the 4096 default",
+              zcl_command_registry_input_str_max("no_such_key_at_all") == 4096u);
+    CIB_CHECK("a NULL key is answered, not dereferenced",
+              zcl_command_registry_input_str_max(NULL) == 4096u);
+    CIB_CHECK("zcode work CPU floor is typed and reachable",
+              cib_accepts_int("zcode.work.start", "max_cpu_seconds", 1));
+    CIB_CHECK("zcode work CPU ceiling is typed and reachable",
+              cib_accepts_int("zcode.work.start", "max_cpu_seconds", 600));
+    CIB_CHECK("zcode work CPU zero is refused at transport",
+              !cib_accepts_int("zcode.work.start", "max_cpu_seconds", 0));
+    CIB_CHECK("zcode work CPU overflow is refused at transport",
+              !cib_accepts_int("zcode.work.start", "max_cpu_seconds", 601));
+
+    /* The package bounds must stay DERIVED. If someone edits a wire's own
+     * maximum, the input bound has to move with it in the same build; a
+     * hand-copied number would fail this the moment the two disagree. */
+    CIB_CHECK("manifest bound tracks VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES",
+              zcl_command_registry_input_str_max("manifest_hex") ==
+                  2u * (size_t)VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES);
+    CIB_CHECK("recipe bound tracks VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES",
+              zcl_command_registry_input_str_max("recipe_hex") ==
+                  2u * (size_t)VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES);
+
+    const char *verify = "zcode.commons.corpus.verify";
+    size_t checkpoint_hex_max = ZCL_COMMAND_MAX_INPUT;
+    CIB_CHECK("checkpoint bound carries the 54-shard inline wire",
+              zcl_command_registry_input_str_max("checkpoint") ==
+                  checkpoint_hex_max &&
+              (checkpoint_hex_max / 2u -
+               VCS_ZCODE_C23_CHECKPOINT_HEADER_WIRE_BYTES) /
+                  VCS_ZCODE_C23_CHECKPOINT_BINDING_WIRE_BYTES == 54u);
+    CIB_CHECK("checkpoint at its canonical inline bound is deliverable",
+              cib_accepts(verify, "checkpoint", checkpoint_hex_max, why,
+                          sizeof(why)));
+    CIB_CHECK("checkpoint one character over its bound is refused",
+              !cib_accepts(verify, "checkpoint", checkpoint_hex_max + 1u,
+                           why, sizeof(why)) &&
+              strstr(why, "checkpoint") != NULL &&
+              strstr(why, "limit") != NULL);
+    const char *shard_verify = "zcode.commons.corpus.shard.verify";
+    size_t shard_hex_max = ZCL_COMMAND_MAX_INPUT;
+    CIB_CHECK("shard bound carries 28 whole inline entries",
+              zcl_command_registry_input_str_max("shard") == shard_hex_max &&
+              (shard_hex_max / 2u - VCS_ZCODE_C23_SHARD_HEADER_WIRE_BYTES) /
+                  VCS_ZCODE_C23_SHARD_ENTRY_WIRE_BYTES == 28u);
+    CIB_CHECK("shard at its canonical inline bound is deliverable",
+              cib_accepts(shard_verify, "shard", shard_hex_max, why,
+                          sizeof(why)));
+    CIB_CHECK("shard one character over its bound is refused",
+              !cib_accepts(shard_verify, "shard", shard_hex_max + 1u,
+                           why, sizeof(why)) &&
+              strstr(why, "shard") != NULL &&
+              strstr(why, "limit") != NULL);
+    return failures;
+}
+
+/* ── 2. The read frame follows the per-key bounds ────────────────────── */
+
+static int t_frame_budget(void)
+{
+    int failures = 0;
+    const struct zcl_command_registry *reg = zcl_command_catalog();
+    const struct zcl_command_spec *plan =
+        zcl_command_registry_find(reg, "zcode.package.publish.plan", NULL);
+    const struct zcl_command_spec *query =
+        zcl_command_registry_find(reg, "core.storage.query", NULL);
+    const struct zcl_command_spec *verify =
+        zcl_command_registry_find(reg, "zcode.commons.corpus.verify", NULL);
+    const struct zcl_command_spec *shard_verify = zcl_command_registry_find(
+        reg, "zcode.commons.corpus.shard.verify", NULL);
+    const struct zcl_command_spec *shard_page = zcl_command_registry_find(
+        reg, "zcode.commons.corpus.shard.page", NULL);
+
+    CIB_CHECK("all fixture leaves resolve",
+              plan && query && verify && shard_verify && shard_page);
+    if (!plan || !query || !verify || !shard_verify || !shard_page)
+        return failures;
+
+    size_t plan_budget = zcl_command_registry_input_budget_bytes(plan);
+    size_t query_budget = zcl_command_registry_input_budget_bytes(query);
+    size_t verify_budget = zcl_command_registry_input_budget_bytes(verify);
+    size_t shard_verify_budget =
+        zcl_command_registry_input_budget_bytes(shard_verify);
+
+    /* A reader that stopped before the validator's ceiling would truncate a
+     * legal document — the exact second wall this change had to clear. */
+    size_t declared = 2u * (size_t)VCS_PACKAGE_MANIFEST_MAX_WIRE_BYTES +
+                      2u * (size_t)VCS_PACKAGE_RECIPE_MAX_WIRE_BYTES +
+                      2u * (size_t)VCS_PACKAGE_RELEASE_MAX_WIRE_BYTES;
+    CIB_CHECK("the publish frame holds every declared key at its bound",
+              plan_budget > declared);
+
+    /* ...and a leaf that declares only default-bounded keys keeps the frame
+     * it always had. Widening is per leaf, not global. */
+    CIB_CHECK("a small leaf keeps the ZCL_COMMAND_MAX_INPUT floor",
+              query_budget == ZCL_COMMAND_MAX_INPUT);
+    CIB_CHECK("the floor is a floor, never a ceiling",
+              plan_budget > ZCL_COMMAND_MAX_INPUT);
+    CIB_CHECK("the checkpoint read frame includes JSON overhead above its wire hex",
+              verify_budget >
+                  zcl_command_registry_input_str_max("checkpoint"));
+    CIB_CHECK("the shard read frame includes JSON overhead above its wire hex",
+              shard_verify_budget >
+                  zcl_command_registry_input_str_max("shard"));
+
+    /* NULL is answered with the floor rather than a crash or a zero frame
+     * (a zero frame would refuse every input on an unresolved leaf). */
+    CIB_CHECK("a NULL spec yields the floor",
+              zcl_command_registry_input_budget_bytes(NULL) ==
+                  ZCL_COMMAND_MAX_INPUT);
+
+    /* Every leaf in the live catalog must get a frame at least as large as
+     * its own largest single key, or that key is undeliverable by any
+     * transport — the failure mode this whole group exists to prevent. */
+    size_t checked = 0, undeliverable = 0;
+    for (size_t i = 0; i < reg->count; i++) {
+        const struct zcl_command_spec *spec = &reg->commands[i];
+        if (!spec->input_keys || !spec->input_keys[0])
+            continue;
+        size_t budget = zcl_command_registry_input_budget_bytes(spec);
+        const char *at = spec->input_keys;
+        char token[128];
+        while (*at) {
+            const char *end = strchr(at, ',');
+            size_t len = end ? (size_t)(end - at) : strlen(at);
+            if (len > 0 && len < sizeof(token)) {
+                memcpy(token, at, len);
+                token[len] = 0;
+                checked++;
+                if (zcl_command_registry_input_str_max(token) >= budget)
+                    undeliverable++;
+            }
+            if (!end)
+                break;
+            at = end + 1;
+        }
+    }
+    CIB_CHECK("the catalog declares input keys to walk", checked > 0);
+    CIB_CHECK("no catalog key is larger than its own leaf's frame",
+              undeliverable == 0);
+    return failures;
+}
+
+/* ── 3. The raise did not loosen anything else ───────────────────────── */
+
+static int t_no_collateral_loosening(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *query =
+        zcl_command_registry_find(zcl_command_catalog(), "core.storage.query",
+                                  NULL);
+    CIB_CHECK("core.storage.query resolves", query != NULL);
+    if (!query)
+        return failures;
+
+    char why[192];
+    /* `sql` is arbitrary operator SQL — it must keep the default bound even
+     * though it sits one catalog row away from the raised keys. */
+    CIB_CHECK("sql at 4096 is accepted",
+              cib_accepts("core.storage.query", "sql", 4096, why,
+                          sizeof(why)));
+    CIB_CHECK("sql at 4097 is refused",
+              !cib_accepts("core.storage.query", "sql", 4097, why,
+                           sizeof(why)));
+    CIB_CHECK("the sql refusal names the 4096 limit",
+              strstr(why, "4096") != NULL);
+
+    /* An empty string is still not a value, at any bound. */
+    CIB_CHECK("an empty string is still refused",
+              !cib_accepts("zcode.package.publish.plan", "manifest_hex", 0,
+                           why, sizeof(why)));
+
+    /* A key nothing declares is still unknown, however long or short. */
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_str(&input, "manifest_hex", "aa");
+    why[0] = 0;
+    bool leaked = zcl_command_registry_input_validate(query, &input, why,
+                                                      sizeof(why));
+    json_free(&input);
+    CIB_CHECK("a raised key is still unknown on a leaf that never declared it",
+              !leaked && strstr(why, "unknown input key") != NULL);
+
+    const struct zcl_command_spec *policy = zcl_command_registry_find(
+        zcl_command_catalog(), "zcode.network.policy.mutate", NULL);
+    CIB_CHECK("the sovereignty policy mutation leaf resolves", policy != NULL);
+    if (policy) {
+        json_init(&input);
+        json_set_object(&input);
+        (void)json_push_kv_str(&input, "mode", "plan");
+        (void)json_push_kv_str(&input, "operation", "add");
+        (void)json_push_kv_int(&input, "action_mask", 127);
+        CIB_CHECK("the seven-action policy mask reaches its handler",
+                  zcl_command_registry_input_validate(policy, &input, why,
+                                                      sizeof(why)));
+        json_free(&input);
+
+        json_init(&input);
+        json_set_object(&input);
+        (void)json_push_kv_str(&input, "mode", "plan");
+        (void)json_push_kv_str(&input, "operation", "advisory");
+        (void)json_push_kv_bool(&input, "enabled", true);
+        CIB_CHECK("the advisory opt-in boolean reaches its handler",
+                  zcl_command_registry_input_validate(policy, &input, why,
+                                                      sizeof(why)));
+        json_free(&input);
+    }
+
+    const struct zcl_command_spec *work_status = zcl_command_registry_find(
+        zcl_command_catalog(), "zcode.work.status", NULL);
+    CIB_CHECK("zcode work status resolves", work_status != NULL);
+    if (work_status) {
+        json_init(&input);
+        json_set_object(&input);
+        (void)json_push_kv_bool(&input, "details", true);
+        CIB_CHECK("work proof details opt-in reaches its handler",
+                  zcl_command_registry_input_validate(
+                      work_status, &input, why, sizeof(why)));
+        json_free(&input);
+
+        json_init(&input);
+        json_set_object(&input);
+        (void)json_push_kv_str(&input, "details", "true");
+        CIB_CHECK("work proof details refuses a string lookalike",
+                  !zcl_command_registry_input_validate(
+                      work_status, &input, why, sizeof(why)));
+        json_free(&input);
+    }
+    return failures;
+}
+
+/* ── 4. Structured vault effects reach their owning handler ──────────── */
+
+static int t_vault_effects_array(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *plan = zcl_command_registry_find(
+        zcl_command_catalog(), "vault.intent.plan", NULL);
+    CIB_CHECK("vault.intent.plan resolves", plan != NULL);
+    if (!plan)
+        return failures;
+
+    struct json_value input, effects, effect;
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_str(&input, "wallet_scope", "dev");
+    (void)json_push_kv_str(&input, "route", "transparent");
+    (void)json_push_kv_str(&input, "idempotency_key", "payment-001");
+    json_init(&effects);
+    json_set_array(&effects);
+    json_init(&effect);
+    json_set_object(&effect);
+    (void)json_push_kv_str(&effect, "asset", "ZCL");
+    (void)json_push_kv_str(&effect, "to",
+                           "t1Recipient000000000000000000000000");
+    (void)json_push_kv_str(&effect, "amount", "0.01000000");
+    (void)json_push_back(&effects, &effect);
+    (void)json_push_kv(&input, "effects", &effects);
+    json_free(&effect);
+    json_free(&effects);
+
+    char why[192] = {0};
+    CIB_CHECK("a documented structured effect passes transport validation",
+              zcl_command_registry_input_validate(plan, &input, why,
+                                                  sizeof(why)));
+    json_free(&input);
+
+    json_init(&input);
+    json_set_object(&input);
+    json_init(&effects);
+    json_set_array(&effects);
+    (void)json_push_kv(&input, "effects", &effects);
+    json_free(&effects);
+    CIB_CHECK("an empty effects array fails closed",
+              !zcl_command_registry_input_validate(plan, &input, why,
+                                                   sizeof(why)));
+    json_free(&input);
+
+    json_init(&input);
+    json_set_object(&input);
+    json_init(&effects);
+    json_set_array(&effects);
+    for (size_t i = 0; i < 51; i++) {
+        json_init(&effect);
+        json_set_object(&effect);
+        (void)json_push_back(&effects, &effect);
+        json_free(&effect);
+    }
+    (void)json_push_kv(&input, "effects", &effects);
+    json_free(&effects);
+    CIB_CHECK("more than 50 effects fails closed",
+              !zcl_command_registry_input_validate(plan, &input, why,
+                                                   sizeof(why)));
+    json_free(&input);
+
+    CIB_CHECK("the vault plan frame budgets a structured effects document",
+              zcl_command_registry_input_budget_bytes(plan) >
+                  ZCL_COMMAND_MAX_INPUT);
+    return failures;
+}
+
+/* ── 5. Liquidity planner's numeric contract reaches its handler ─────── */
+
+static int t_liquidity_numeric_input(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), "metaverse.agent.liquidity", NULL);
+    CIB_CHECK("metaverse.agent.liquidity resolves", spec != NULL);
+    if (!spec)
+        return failures;
+
+    struct json_value input;
+    char why[192] = {0};
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_str(&input, "dir", "/private/broker");
+    (void)json_push_kv_str(&input, "wallet_scope", "dev");
+    (void)json_push_kv_int(&input, "recipient_value_zat", 1000);
+    (void)json_push_kv_int(&input, "maximum_fee_zat", 10000);
+    (void)json_push_kv_int(&input, "concurrency", 10);
+    CIB_CHECK("documented liquidity request passes transport validation",
+              zcl_command_registry_input_validate(spec, &input, why,
+                                                  sizeof(why)));
+    json_free(&input);
+
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_int(&input, "concurrency", 51);
+    CIB_CHECK("liquidity concurrency above 50 fails closed",
+              !zcl_command_registry_input_validate(spec, &input, why,
+                                                   sizeof(why)));
+    json_free(&input);
+
+    spec = zcl_command_registry_find(
+        zcl_command_catalog(), "vault.intent.fanout-plan", NULL);
+    CIB_CHECK("vault.intent.fanout-plan resolves", spec != NULL);
+    if (!spec)
+        return failures;
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_str(&input, "wallet_scope", "dev");
+    (void)json_push_kv_int(&input, "recipient_value_zat", 1000);
+    (void)json_push_kv_int(&input, "maximum_fee_zat", 10000);
+    (void)json_push_kv_int(&input, "concurrency", 10);
+    (void)json_push_kv_str(&input, "idempotency_key", "parallel-lab-001");
+    CIB_CHECK("documented fanout request passes transport validation",
+              zcl_command_registry_input_validate(spec, &input, why,
+                                                  sizeof(why)));
+    json_free(&input);
+    return failures;
+}
+
+/* ── 6. Package preparation's documented sequence reaches its handler ── */
+
+static int t_package_prepare_sequence(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), "zcode.package.dev.prepare", NULL);
+    CIB_CHECK("zcode.package.dev.prepare resolves", spec != NULL);
+    if (!spec)
+        return failures;
+
+    struct json_value input;
+    char why[192] = {0};
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_str(&input, "dir", "platform/modules/sha3");
+    (void)json_push_kv_str(
+        &input, "publisher_pubkey",
+        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+    (void)json_push_kv_int(&input, "publisher_sequence", 1);
+    CIB_CHECK("documented package publisher sequence passes transport validation",
+              zcl_command_registry_input_validate(spec, &input, why,
+                                                  sizeof(why)));
+    json_free(&input);
+    return failures;
+}
+
+/* ── 7. Shared key names keep command-specific numeric bounds ──────────── */
+
+static int t_package_fetch_maximum_bytes(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *fetch = zcl_command_registry_find(
+        zcl_command_catalog(), "zcode.package.fetch", NULL);
+    const struct zcl_command_spec *scout = zcl_command_registry_find(
+        zcl_command_catalog(), "metaverse.space.scout.plan", NULL);
+    CIB_CHECK("package fetch and space scout resolve", fetch && scout);
+    if (!fetch || !scout)
+        return failures;
+
+    struct json_value input;
+    char why[192] = {0};
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_int(&input, "maximum_bytes", 256 * 1024 * 1024);
+    CIB_CHECK("package fetch admits one full 256 MiB source carrier",
+              zcl_command_registry_input_validate(fetch, &input, why,
+                                                  sizeof(why)));
+    json_free(&input);
+
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_int(&input, "maximum_bytes",
+                           256 * 1024 * 1024 + 1);
+    CIB_CHECK("package fetch refuses more than its 256 MiB carrier bound",
+              !zcl_command_registry_input_validate(fetch, &input, why,
+                                                   sizeof(why)));
+    json_free(&input);
+
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_int(&input, "maximum_bytes", 8 * 1024 * 1024);
+    CIB_CHECK("space scout retains its independent 8 MiB traversal bound",
+              zcl_command_registry_input_validate(scout, &input, why,
+                                                  sizeof(why)));
+    json_free(&input);
+
+    json_init(&input);
+    json_set_object(&input);
+    (void)json_push_kv_int(&input, "maximum_bytes", 8 * 1024 * 1024 + 1);
+    CIB_CHECK("package fetch widening does not widen space scout",
+              !zcl_command_registry_input_validate(scout, &input, why,
+                                                   sizeof(why)));
+    json_free(&input);
+    return failures;
+}
+
+static int t_fleet_usage_days(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *usage = zcl_command_registry_find(
+        zcl_command_catalog(), "fleet.usage", NULL);
+    CIB_CHECK("fleet.usage resolves", usage != NULL);
+    if (!usage)
+        return failures;
+
+    CIB_CHECK("fleet usage admits day one",
+              cib_accepts_int("fleet.usage", "days", 1));
+    CIB_CHECK("fleet usage admits its default seven-day window",
+              cib_accepts_int("fleet.usage", "days", 7));
+    CIB_CHECK("fleet usage transport admits the index window",
+              cib_accepts_int("fleet.usage", "days", ZCL_FLEET_INDEX_DAYS));
+
+    static const char *const refused[] = {
+        "{\"days\":0}", "{\"days\":-1}", "{\"days\":\"7\"}",
+        "{\"days\":true}", "{\"days\":7.0}", "{\"days\":null}",
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        struct json_value input;
+        json_init(&input);
+        const bool built = json_read(&input, refused[i], strlen(refused[i]));
+        const bool accepted = built && zcl_command_registry_input_validate(
+            usage, &input, NULL, 0);
+        CIB_CHECK("fleet usage refuses a non-positive or non-integer day",
+                  built && !accepted);
+        json_free(&input);
+    }
+
+    struct zcl_command_spec other = *usage;
+    other.path = "fixture.fleet-usage-shape";
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    const bool string_built = json_push_kv_str(&input, "days", "7");
+    CIB_CHECK("days remains an ordinary string outside fleet.usage",
+              string_built && zcl_command_registry_input_validate(
+                  &other, &input, NULL, 0));
+    json_free(&input);
+    json_init(&input);
+    json_set_object(&input);
+    const bool int_built = json_push_kv_int(&input, "days", 7);
+    CIB_CHECK("the integer exception is scoped to fleet.usage",
+              int_built && !zcl_command_registry_input_validate(
+                  &other, &input, NULL, 0));
+    json_free(&input);
+    return failures;
+}
+
+/* ── 10. The rules that moved into command_registry_input_types.c ──────
+ *
+ * The dual-shape keys, the chunk and line integer bounds, and the
+ * discovery required-key rule left command_registry.c in the complexity
+ * split. A moved rule with no owning case is a rule that can be deleted
+ * without a red test, so each one is pinned here at BOTH of its edges: an
+ * accept at the bound and a reject one step outside it, on each side. A
+ * pair of assertions that both sit at the same edge would leave the other
+ * edge free to move, which is how a shared rule quietly loses the half of
+ * itself that differs between its keys. */
+
+/* Validate `{key: <value>}` as an integer against `path`, keeping the
+ * refusal text so the exact `why` can be asserted. */
+static bool cib_accepts_int_why(const char *path, const char *key,
+                                int64_t value, char *why, size_t why_size)
+{
+    const struct zcl_command_spec *spec =
+        zcl_command_registry_find(zcl_command_catalog(), path, NULL);
+    if (!spec)
+        return false;
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    bool built = json_push_kv_int(&input, key, value);
+    if (why && why_size)
+        why[0] = 0;
+    bool ok = built && zcl_command_registry_input_validate(spec, &input, why,
+                                                           why_size);
+    json_free(&input);
+    return ok;
+}
+
+/* The refusal every one of these bounds produces: the value is the wrong
+ * type or out of range, named by key. */
+static bool cib_type_refusal(const char *why, const char *key)
+{
+    char expect[192];
+    (void)snprintf(expect, sizeof(expect),
+                   "invalid type or range for input key '%s'", key);
+    return strcmp(why, expect) == 0;
+}
+
+/* cr_match_dual: `since` is a non-negative integer OR a non-empty string,
+ * and nothing else. Both shapes are live wire shapes for code.recent
+ * (`--since=5` and `--since=HEAD~5`), so dropping either half breaks a
+ * documented call. */
+static int t_moved_dual_shape_since(void)
+{
+    int failures = 0;
+    char why[192];
+
+    CIB_CHECK("code.recent admits `since` as a non-negative integer",
+              cib_accepts_int("code.recent", "since", 0));
+    CIB_CHECK("code.recent admits `since` as a non-empty string",
+              cib_accepts("code.recent", "since", 7, why, sizeof(why)));
+    CIB_CHECK("code.recent refuses a negative `since`",
+              !cib_accepts_int_why("code.recent", "since", -1, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "since"));
+    CIB_CHECK("code.recent refuses an empty `since` string",
+              !cib_accepts("code.recent", "since", 0, why, sizeof(why)) &&
+              cib_type_refusal(why, "since"));
+    return failures;
+}
+
+/* fleet.board `ttl`: a post/proposal lifetime in seconds, bounded by
+ * FLEET_BOARD_TTL_MAX (1..2592000, cognition .../fleet_board_proto.h) and
+ * typed integer-only from the k_bounds table. Before the entry, `ttl` fell
+ * through to the default string rule, so every numeric ttl was refused at
+ * normalize and the vitals heartbeat's explicit --ttl=86400 (the documented
+ * default value, stated for its quota comment) failed INVALID_INPUT on every
+ * 5-minute run. */
+static int t_moved_ttl_bounds(void)
+{
+    int failures = 0;
+    char why[192];
+    const char *path = "fleet.board.post";
+
+    CIB_CHECK("fleet.board.post admits ttl=86400 (the documented default)",
+              cib_accepts_int(path, "ttl", 86400));
+    CIB_CHECK("fleet.board.post admits ttl=1 (low edge)",
+              cib_accepts_int(path, "ttl", 1));
+    CIB_CHECK("fleet.board.post admits ttl=2592000 (FLEET_BOARD_TTL_MAX)",
+              cib_accepts_int(path, "ttl", 2592000));
+    CIB_CHECK("fleet.board.post refuses ttl=0",
+              !cib_accepts_int_why(path, "ttl", 0, why, sizeof(why)) &&
+              cib_type_refusal(why, "ttl"));
+    CIB_CHECK("fleet.board.post refuses ttl past FLEET_BOARD_TTL_MAX",
+              !cib_accepts_int_why(path, "ttl", 2592001, why, sizeof(why)) &&
+              cib_type_refusal(why, "ttl"));
+    CIB_CHECK("fleet.board.post refuses ttl typed as a string",
+              !cib_accepts(path, "ttl", 5, why, sizeof(why)) &&
+              cib_type_refusal(why, "ttl"));
+    return failures;
+}
+
+/* cr_match_chunks_and_lines, first key: a PAID chunk count starts at one —
+ * zero paid chunks is not a purchase — and stops at the 32-bit chunk index
+ * space. Both edges, both sides. */
+static int t_moved_chunks_paid_bounds(void)
+{
+    int failures = 0;
+    char why[192];
+    const char *path = "app.market.purchase.plan";
+
+    CIB_CHECK("purchase plan admits one paid chunk (low edge)",
+              cib_accepts_int(path, "chunks_paid", 1));
+    CIB_CHECK("purchase plan refuses zero paid chunks (below the low edge)",
+              !cib_accepts_int_why(path, "chunks_paid", 0, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "chunks_paid"));
+    CIB_CHECK("purchase plan admits the last 32-bit chunk count (high edge)",
+              cib_accepts_int(path, "chunks_paid", 4294967295LL));
+    CIB_CHECK("purchase plan refuses one chunk past 32 bits",
+              !cib_accepts_int_why(path, "chunks_paid", 4294967296LL, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "chunks_paid"));
+    return failures;
+}
+
+/* cr_match_chunks_and_lines, second key: the two keys share one rule but
+ * carry DIFFERENT low bounds — a chunk OFFSET starts at zero. Pinning only
+ * the shared high edge would let the two low bounds collapse into one. */
+static int t_moved_chunk_start_bounds(void)
+{
+    int failures = 0;
+    char why[192];
+    const char *path = "app.market.purchase.plan";
+
+    CIB_CHECK("purchase plan admits chunk zero as a start offset (low edge)",
+              cib_accepts_int(path, "chunk_start", 0));
+    CIB_CHECK("purchase plan refuses a negative chunk start",
+              !cib_accepts_int_why(path, "chunk_start", -1, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "chunk_start"));
+    CIB_CHECK("purchase plan admits the last 32-bit chunk offset (high edge)",
+              cib_accepts_int(path, "chunk_start", 4294967295LL));
+    CIB_CHECK("purchase plan refuses one offset past 32 bits",
+              !cib_accepts_int_why(path, "chunk_start", 4294967296LL, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "chunk_start"));
+    return failures;
+}
+
+/* cr_match_chunks_and_lines, third key: `line` is a source line number —
+ * one-based, reaching a million. */
+static int t_moved_line_bounds(void)
+{
+    int failures = 0;
+    char why[192];
+
+    CIB_CHECK("agent mutate admits the first source line (low edge)",
+              cib_accepts_int("dev.agent.mutate", "line", 1));
+    CIB_CHECK("agent mutate refuses line zero",
+              !cib_accepts_int_why("dev.agent.mutate", "line", 0, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "line"));
+    CIB_CHECK("agent mutate admits the millionth source line (high edge)",
+              cib_accepts_int("dev.agent.mutate", "line", 1000000));
+    CIB_CHECK("agent mutate refuses one line past its ceiling",
+              !cib_accepts_int_why("dev.agent.mutate", "line", 1000001, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "line"));
+    return failures;
+}
+
+/* `line` names two unrelated inputs: dev.agent.mutate's integer source line
+ * and fleet.import's whole base64url roster line. The name-keyed type table
+ * needs a per-leaf exception; both meanings are pinned in both directions. */
+static int t_line_key_is_per_leaf(void)
+{
+    int failures = 0;
+    char why[192];
+
+    /* The roster line an owner pastes is about 320 characters; the wire
+     * ceiling is FLEET_ENROL_MACHINE_TEXT_MAX (2333). Both are inside the
+     * 4096-character default string bound, and the bound's own edges are
+     * held so a later "line is special, drop its length rule" is caught. */
+    CIB_CHECK("fleet import accepts a pasted roster line",
+              cib_accepts("fleet.import", "line", 320, why, sizeof(why)));
+    CIB_CHECK("fleet import accepts a roster line at the wire ceiling",
+              cib_accepts("fleet.import", "line", 2333, why, sizeof(why)));
+    CIB_CHECK("fleet import accepts a roster line at the string bound",
+              cib_accepts("fleet.import", "line", 4096, why, sizeof(why)));
+    /* An over-long line is well-typed, so the refusal names the length rule. */
+    CIB_CHECK("fleet import refuses one character past the string bound",
+              !cib_accepts("fleet.import", "line", 4097, why, sizeof(why)) &&
+              strstr(why, "line") != NULL &&
+              strstr(why, "characters") != NULL &&
+              strstr(why, "limit") != NULL);
+    CIB_CHECK("fleet import refuses an empty roster line",
+              !cib_accepts("fleet.import", "line", 0, why, sizeof(why)) &&
+              cib_type_refusal(why, "line"));
+    /* A number is not a roster line, and a string is not a source line.
+     * Neither leaf inherits the other's meaning in either direction. */
+    CIB_CHECK("fleet import refuses a NUMBER for its roster line",
+              !cib_accepts_int_why("fleet.import", "line", 42, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "line"));
+    CIB_CHECK("agent mutate still refuses a STRING for its source line",
+              !cib_accepts("dev.agent.mutate", "line", 3, why, sizeof(why)) &&
+              cib_type_refusal(why, "line"));
+    return failures;
+}
+
+/* cr_match_chunks_and_lines, fourth key: `max_lines` is a tail size — it
+ * shares `line`'s low bound but stops a thousand times earlier, so its own
+ * high edge has to be held down separately. */
+static int t_moved_max_lines_bounds(void)
+{
+    int failures = 0;
+    char why[192];
+
+    CIB_CHECK("ops logs admits a one-line tail (low edge)",
+              cib_accepts_int("ops.logs", "max_lines", 1));
+    CIB_CHECK("ops logs refuses a zero-line tail",
+              !cib_accepts_int_why("ops.logs", "max_lines", 0, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "max_lines"));
+    CIB_CHECK("ops logs admits a thousand lines (high edge)",
+              cib_accepts_int("ops.logs", "max_lines", 1000));
+    CIB_CHECK("ops logs refuses one line past its own ceiling",
+              !cib_accepts_int_why("ops.logs", "max_lines", 1001, why,
+                                   sizeof(why)) &&
+              cib_type_refusal(why, "max_lines"));
+    return failures;
+}
+
+/* command_registry_input_required_discovery: discover.search without a
+ * query is refused by NAME, not by type — the only rule in the moved set
+ * that reads the whole document rather than one value. */
+static int t_moved_required_discovery(void)
+{
+    int failures = 0;
+    char why[192];
+
+    CIB_CHECK("discover search admits a query",
+              cib_accepts("discover.search", "query", 5, why, sizeof(why)));
+
+    const struct zcl_command_spec *search =
+        zcl_command_registry_find(zcl_command_catalog(), "discover.search",
+                                  NULL);
+    CIB_CHECK("discover.search resolves", search != NULL);
+    if (!search)
+        return failures;
+
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    why[0] = 0;
+    CIB_CHECK("discover search refuses a request with no query",
+              !zcl_command_registry_input_validate(search, &input, why,
+                                                   sizeof(why)) &&
+              strcmp(why, "missing required input key 'query'") == 0);
+    json_free(&input);
+    return failures;
+}
+
+/* Shape admission is separate from the handler's exact execution grant.
+ * A string "true" must never substitute for JSON boolean true. */
+static int t_resident_execution_grant(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), "app.invoke.package", NULL);
+    CIB_CHECK("resident package leaf resolves", spec != NULL);
+    if (!spec) return failures;
+    const char *wires[] = {"{\"accept_execution\":true}",
+                          "{\"accept_execution\":false}",
+                          "{\"accept_execution\":\"true\"}",
+                          "{\"accept_execution\":1}"};
+    for (size_t i = 0; i < sizeof(wires) / sizeof(wires[0]); ++i) {
+        struct json_value input;
+        json_init(&input);
+        char why[192] = {0};
+        bool parsed = json_read(&input, wires[i], strlen(wires[i]));
+        bool admitted = parsed && zcl_command_registry_input_validate(
+            spec, &input, why, sizeof(why));
+        CIB_CHECK("resident execution grant admits only boolean shape",
+                  parsed && admitted == (i < 2));
+        if (i < 2 && parsed) {
+            struct zcl_command_spec unrelated = *spec;
+            unrelated.path = "app.invoke.unrelated";
+            CIB_CHECK("resident boolean rule does not widen another leaf",
+                      !zcl_command_registry_input_validate(
+                          &unrelated, &input, why, sizeof(why)));
+        }
+        json_free(&input);
+    }
+    return failures;
+}
+static int t_local_acceptance_boolean(void)
+{
+    int failures = 0;
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), "zcode.package.add.plan", NULL);
+    CIB_CHECK("local plan leaf resolves", spec != NULL);
+    if (!spec) return failures;
+    const char *wires[] = {"{\"local_only\":true}", "{\"local_only\":false}",
+                          "{\"local_only\":\"true\"}", "{\"local_only\":1}"};
+    for (size_t i = 0; i < sizeof(wires) / sizeof(wires[0]); ++i) {
+        struct json_value input;
+        json_init(&input);
+        bool parsed = json_read(&input, wires[i], strlen(wires[i])) &&
+            json_push_kv_str(&input, "name_or_root", "ztasks/ztasks");
+        bool admitted = parsed && zcl_command_registry_input_validate(spec, &input, NULL, 0);
+        CIB_CHECK("local-only uses one boolean contract", parsed && admitted == (i < 2));
+        json_free(&input);
+    }
+    return failures;
+}
+
+static int t_resident_binding_types(void)
+{
+    int failures = 0;
+    const char *path = "app.invoke.package";
+    CIB_CHECK("resident generation zero is a typed precondition",
+        cib_accepts_int(path, "generation", 0));
+    CIB_CHECK("resident negative generation refuses",
+        !cib_accepts_int(path, "generation", -1));
+    CIB_CHECK("resident positive start token is an integer",
+        cib_accepts_int(path, "start_token", INT64_MAX));
+    CIB_CHECK("resident zero start token refuses",
+        !cib_accepts_int(path, "start_token", 0));
+    CIB_CHECK("resident start token string refuses",
+        !cib_accepts(path, "start_token", 1, NULL, 0));
+    CIB_CHECK("resident generation string refuses",
+        !cib_accepts(path, "generation", 1, NULL, 0));
+    return failures;
+}
+
+static int t_policy_fact_types(void)
+{
+    int failures = 0;
+    const char *path = "zcode.package.policy.limits";
+    const char *keys[] = {
+        "earned_score", "uploaded_bytes", "downloaded_bytes"
+    };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        CIB_CHECK("policy fact accepts zero", cib_accepts_int(path, keys[i], 0));
+        CIB_CHECK("policy fact accepts the largest JSON integer",
+                  cib_accepts_int(path, keys[i], INT64_MAX));
+        CIB_CHECK("policy fact refuses negative input",
+                  !cib_accepts_int(path, keys[i], -1));
+        CIB_CHECK("policy fact refuses string input",
+                  !cib_accepts(path, keys[i], 3, NULL, 0));
+    }
+    return failures;
+}
+
+static int g_cib_handler_calls;
+
+static void cib_counting_handler(const struct zcl_command_request *request,
+                                 struct zcl_command_reply *reply)
+{
+    (void)request;
+    (void)reply;
+    g_cib_handler_calls++;
+}
+
+static bool cib_execute_int(const struct zcl_command_spec *spec,
+                            const char *key, int64_t value, char *out,
+                            size_t out_size, enum zcl_command_exit *code)
+{
+    const struct zcl_command_registry *reg = zcl_command_catalog();
+    struct zcl_command_context ctx = {
+        .registry = reg,
+        .granted_capabilities = ~(uint64_t)0,
+        .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+    };
+    struct json_value input;
+    json_init(&input);
+    json_set_object(&input);
+    bool built = json_push_kv_int(&input, key, value);
+    *code = ZCL_COMMAND_EXIT_OK;
+    size_t n = built ? zcl_command_registry_execute_json(
+                           reg, spec, &ctx, &input, false, spec->path,
+                           "normal", 0, 0, NULL, out, out_size, code)
+                     : 0;
+    json_free(&input);
+    return n > 0;
+}
+
+static int t_execute_json_valid_call(void)
+{
+    int failures = 0;
+    static char out[65536];
+    enum zcl_command_exit code;
+    const struct zcl_command_spec *ok_spec = zcl_command_registry_find(
+        zcl_command_catalog(), "ops.statecatalog", NULL);
+    struct json_value empty;
+    json_init(&empty);
+    json_set_object(&empty);
+    struct zcl_command_context ctx = {
+        .registry = zcl_command_catalog(),
+        .granted_capabilities = ~(uint64_t)0,
+        .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+    };
+    code = ZCL_COMMAND_EXIT_INTERNAL;
+    size_t n = ok_spec ? zcl_command_registry_execute_json(
+                             zcl_command_catalog(), ok_spec, &ctx, &empty,
+                             false, ok_spec->path, "normal", 0, 0, NULL, out,
+                             sizeof(out), &code)
+                       : 0;
+    json_free(&empty);
+    CIB_CHECK("a valid existing call still succeeds",
+              n > 0 && code == ZCL_COMMAND_EXIT_OK);
+    return failures;
+}
+
+static int t_execute_json_validates_input(void)
+{
+    int failures = 0;
+    static char out[65536];
+    enum zcl_command_exit code;
+    const struct zcl_command_spec *real = zcl_command_registry_find(
+        zcl_command_catalog(), "core.node.bootwait", NULL);
+    CIB_CHECK("execute_json fixture leaf exists", real != NULL);
+    if (!real)
+        return failures + 1;
+    /* Counting stub over the real bootwait contract: same keys and ranges. */
+    struct zcl_command_spec stub = *real;
+    stub.handler = cib_counting_handler;
+
+    g_cib_handler_calls = 0;
+    bool got = cib_execute_int(real, "timeout_ms", 999999999, out,
+                               sizeof(out), &code);
+    struct json_value env;
+    bool parsed = got && json_read(&env, out, strlen(out));
+    const struct json_value *err = parsed ? json_get(&env, "error") : NULL;
+    CIB_CHECK("execute_json refuses out-of-range bootwait input",
+              parsed && !json_get_bool(json_get(&env, "ok")) && err &&
+                  code == ZCL_COMMAND_EXIT_INVALID &&
+                  strcmp(json_get_str(json_get(err, "code")),
+                         "INVALID_INPUT") == 0 &&
+                  strcmp(json_get_str(json_get(err, "phase")),
+                         "normalize") == 0 &&
+                  !json_get_bool(json_get(err, "mutated")));
+    if (parsed)
+        json_free(&env);
+
+    got = cib_execute_int(&stub, "timeout_ms", 999999999, out, sizeof(out),
+                          &code);
+    CIB_CHECK("invalid input never reaches the handler",
+              got && code == ZCL_COMMAND_EXIT_INVALID &&
+                  g_cib_handler_calls == 0);
+    got = cib_execute_int(&stub, "timeout_ms", 1000, out, sizeof(out), &code);
+    CIB_CHECK("valid input reaches the handler once",
+              got && code == ZCL_COMMAND_EXIT_OK && g_cib_handler_calls == 1);
+
+    return failures + t_execute_json_valid_call();
+}
+
+/* Real catalog/type normalization only; never executes the boot handler. */
+static bool cib_machine_shape(const char *key,const char *value)
+{
+    const struct zcl_command_spec *spec=zcl_command_registry_find(
+        zcl_command_catalog(),"dev.app.machine.boot",NULL);
+    char raw[2048];
+    int n=snprintf(raw,sizeof raw,"{\"%s\":%s}",key,value);
+    if(!spec||n<0||(size_t)n>=sizeof raw)return false;
+    struct json_value input;json_init(&input);
+    bool parsed=json_read(&input,raw,(size_t)n);
+    bool accepted=parsed&&zcl_command_registry_input_validate(spec,&input,NULL,0);
+    json_free(&input);return accepted;
+}
+static int t_machine_protected_object_types(void)
+{
+    int failures=0;
+    CIB_CHECK("protected_kernel object reaches nested handler validation",
+        cib_machine_shape("protected_kernel","{}"));
+    CIB_CHECK("protected_unlock object reaches nested handler validation",
+        cib_machine_shape("protected_unlock","{}"));
+    static const char selector[]=
+        "{\"datadir\":\"test-tmp/protected-capture/cas\","
+        "\"observation_root\":\"625184de81e80c9fa1a86120de9024ffff5f0cc818aa236a282bca403b935108\","
+        "\"max_artifact_bytes\":43412608,\"max_verification_bytes\":50000000}";
+    static const char unlock[]=
+        "{\"policy\":\"protected_host\",\"purpose\":\"protected_geli_keyfile\","
+        "\"receiver_revision\":1,"
+        "\"authorized_kernel_sha256\":\"a5080bb076351c5b5e058a81e5bf6ad3a0f748e97423d2214af5602a5f90097c\","
+        "\"credential_mode\":\"create_new_host\",\"mode\":\"initial\","
+        "\"volume\":\"test-tmp/protected/volume\",\"record\":\"test-tmp/protected/record\","
+        "\"credential\":\"test-tmp/protected/credential\",\"extension\":\"test-tmp/protected/extension\","
+        "\"reserve_stage\":\"test-tmp/protected/reserve\",\"ready_stage\":\"test-tmp/protected/ready\"}";
+    CIB_CHECK("full protected capture selector passes typed normalizer",
+        cib_machine_shape("protected_kernel",selector));
+    CIB_CHECK("full twelve-field protected unlock passes typed normalizer",
+        cib_machine_shape("protected_unlock",unlock));
+    static const char *const old[]={"accepted_kernel","public_kernel","public_unlock"};
+    for(size_t i=0;i<sizeof old/sizeof old[0];i++)
+        CIB_CHECK("existing machine object type remains accepted",cib_machine_shape(old[i],"{}"));
+    return failures;
+}
+static int t_machine_protected_wrong_types(void)
+{
+    int failures=0;
+    static const char *const keys[]={"protected_kernel","protected_unlock"};
+    static const char *const wrong[]={"\"wrong\"","[]","null","0","true"};
+    for(size_t i=0;i<sizeof keys/sizeof keys[0];i++)
+        for(size_t j=0;j<sizeof wrong/sizeof wrong[0];j++)
+            CIB_CHECK("protected machine key refuses non-object",
+                !cib_machine_shape(keys[i],wrong[j]));
+    CIB_CHECK("unlisted machine object key still refused",
+        !cib_machine_shape("protected_kernel_extra","{}"));
+    return failures;
+}
+
+int test_command_input_bounds(void)
+{
+    printf("\n=== command_input_bounds: per-key input length rules ===\n");
+    int failures = 0;
+    failures += t_key_edges();
+    failures += t_machine_protected_object_types();
+    failures += t_machine_protected_wrong_types();
+    failures += t_frame_budget();
+    failures += t_no_collateral_loosening();
+    failures += t_vault_effects_array();
+    failures += t_liquidity_numeric_input();
+    failures += t_fleet_ledger_numeric_keys();
+    failures += t_package_prepare_sequence();
+    failures += t_package_fetch_maximum_bytes();
+    failures += t_fleet_usage_days();
+    failures += t_moved_dual_shape_since();
+    failures += t_moved_ttl_bounds();
+    failures += t_moved_chunks_paid_bounds();
+    failures += t_moved_chunk_start_bounds();
+    failures += t_moved_line_bounds();
+    failures += t_line_key_is_per_leaf();
+    failures += t_moved_max_lines_bounds();
+    failures += t_moved_required_discovery();
+    failures += t_resident_execution_grant();
+    failures += t_local_acceptance_boolean();
+    failures += t_resident_binding_types();
+    failures += t_policy_fact_types();
+    failures += t_execute_json_validates_input();
+    printf("=== command_input_bounds complete: %d failure(s) ===\n", failures);
+    return failures;
+}

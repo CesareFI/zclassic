@@ -1,0 +1,188 @@
+# check_privileged_transition_receipt.sh baseline — Law-7 dispositions.
+#
+# Every native command leaf whose spec is ZCL_COMMAND_AUTH_OWNER AND effect
+# ZCL_COMMAND_EFFECT_MUTATE or ZCL_COMMAND_EFFECT_DESTRUCTIVE is a candidate
+# privileged transition. Each such leaf MUST have a disposition here; a new
+# owner-mutating leaf with none FAILS the gate, forcing a conscious Law-7
+# review. RATCHET: this file only grows when a genuinely new owner-mutating
+# leaf is added — and it should grow with `receipt:` far more often than
+# `exempt:` from now on.
+#
+# Line format (one leaf per line; `#` comments / blank lines ignored):
+#   <leaf.path>  receipt:<relative_file>   # binds an authority_receipt verifier
+#   <leaf.path>  exempt:<one-line reason>  # not an artifact-install transition
+#
+# For a `receipt:<file>` line the gate additionally asserts <file> contains a
+# call matching authority_receipt_.*_available( OR the pre-generalized
+# consensus_state_replay_receipt_authority_available( — a positive check that
+# the wired consumer actually gates on the contract.
+#
+# Today's universe (25 leaves — the initial baseline, all `exempt`). The first
+# real privileged artifact-install transition surfaced as an OWNER leaf (bundle
+# ACTIVATE, hot-swap Phase-3 reopen, `make deploy` generation publish, App
+# cartridge activation) lands here as `receipt:<handler_file>`.
+
+app.account.add           exempt: App-principal AR write, no artifact install
+app.account.role          exempt: App-principal AR write, no artifact install
+app.account.suspend       exempt: App-principal AR write, no artifact install
+app.account.unsuspend     exempt: App-principal AR write, no artifact install
+core.consensus.block.invalidate   exempt: in-memory validity mask, no state bundle install
+core.consensus.block.reconsider   exempt: in-memory validity mask, no state bundle install
+core.wallet.address.new    exempt: keystore write, guarded by wallet AR + AT_REST
+core.wallet.address.import exempt: keystore write, guarded by wallet AR + AT_REST
+core.wallet.transaction.send  exempt: signs+broadcasts, no privileged datadir install
+core.wallet.shielded.send     exempt: signs+broadcasts, no privileged datadir install
+core.wallet.shielded.address  exempt: wallet-local, rebuildable projection
+core.wallet.backup.now     exempt: wallet-local, rebuildable projection
+core.wallet.rescan         exempt: wallet-local, rebuildable projection
+core.wallet.replay         exempt: wallet-local, rebuildable projection
+dev.app.scaffold           exempt: dev-lane, publication already contained
+dev.app.publish            exempt: dev-lane, publication already contained
+dev.change.apply           exempt: dev-lane, publication already contained
+dev.publication.advance    exempt: appends local scheduler evidence only; installs and publishes no artifact
+dev.vcs.revert             exempt: ZVCS source epoch, seal ritual owns authority
+dev.vcs.seal.grant         exempt: ZVCS source epoch, seal ritual owns authority
+dev.hotswap.apply          exempt: verify-only dev loop, no live generation swap
+dev.loop.ensure            exempt: verify-only dev loop, no live generation swap
+dev.loop.stop              exempt: verify-only dev loop, no live generation swap
+dev.generation.rollback    exempt: dev generation store, contained
+dev.generation.compact     exempt: dev generation store, contained
+dev.generation.activate    receipt:tools/command/native_dev_activation_command.c
+dev.agent.mutate           exempt: edits one line of one CHECKOUT source file and writes it back in the same call; installs no artifact, opens no datadir, and refuses any path outside the checkout
+ops.recovery.rebuild       exempt: refold reset, gated by copy-prove doctrine
+ops.mesh.pair.commit       exempt: node.db pairing AR write via mesh_pairing_service, no artifact install
+
+# ZCL app-feature writes (engine/composition/commands/app_features.def). None of them
+# installs a privileged datadir artifact, so every row stays `exempt` — the
+# disposition CLASS is unchanged, only the recorded rationale is refreshed
+# now that ten of the thirteen bind a real native handler
+# (engine/controllers/src/app_write_native_handlers.c). The ZNAM rows are the
+# same class as core.wallet.transaction.send: sign + broadcast, no install.
+app.names.register         exempt: signs+broadcasts an OP_RETURN tx, no privileged datadir install
+app.names.update           exempt: signs+broadcasts an OP_RETURN tx, no privileged datadir install
+app.names.transfer         exempt: signs+broadcasts an OP_RETURN tx, no privileged datadir install
+app.names.renew            exempt: signs+broadcasts an OP_RETURN tx, no privileged datadir install
+app.names.set-record       exempt: signs+broadcasts an OP_RETURN tx, no privileged datadir install
+app.names.set-text         exempt: signs+broadcasts an OP_RETURN tx, no privileged datadir install
+app.messaging.send         exempt: peer-socket write (p2p) or shielded send (onchain), no artifact install
+app.messaging.send-named   exempt: PLANNED fail-closed, no artifact install (no outbound delivery path exists)
+app.messaging.read         exempt: flips one message's read bit, rebuildable projection
+app.tokens.burn            exempt: signs+broadcasts a ZSLP burn transaction, no privileged datadir install
+app.market.offer           exempt: signs a local offer + floods gossip (p2p), persists app-local AR rows (file_offers/market_contents), no executable or consensus artifact install
+app.market.buy             exempt: PLANNED fail-closed, no artifact install (buyer retrieval and publication are absent)
+app.market.content.register exempt: app-local AR content binding, no executable or consensus artifact install
+app.market.purchase.plan   exempt: encrypted wallet-local reservation row, no privileged artifact install
+app.market.purchase.commit exempt: signs+broadcasts an exact Sapling-memo payment, no privileged artifact install
+app.market.moderation.profile.set exempt: rewrites only the node-local market/moderation.v1 view-policy file (per-datadir operator preference), no privileged artifact install
+app.market.moderation.relay.set exempt: rewrites only the node-local market/moderation.v1 policy file (per-datadir operator preference for whether this node forwards other people's offer announcements), no privileged artifact install
+app.market.moderation.review.set exempt: flips one node-local file_offers.review_state column + appends an audit line; local curation metadata only, never gossiped, no privileged artifact install
+app.store.list-product     exempt: app-local AR write (one products row + one content-addressed store_blobs row) into node.db; the payload is merchant-supplied storefront content the store re-hashes on every read, never an artifact the node executes or trusts
+app.shop.want.post         exempt: app-local AR write (one shop_wants row, buyer-signed want ad) into node.db; declares terms only, broadcasts nothing, no executable or consensus artifact install
+app.shop.want.cancel       exempt: flips one node-local shop_wants.cancelled_unix column after a buyer-key check; local board metadata only, never gossiped, no privileged artifact install
+app.shop.want.review       exempt: flips one node-local shop_wants.review_state column; local curation metadata only, never gossiped, no privileged artifact install
+app.swap.initiate          exempt: mints a local HTLC contract row, broadcasts nothing
+app.swap.participate       exempt: mints a local HTLC contract row, broadcasts nothing
+ops.debug.rom_seed.enable  exempt: in-process policy flag flip + JSON persist, no artifact install
+ops.debug.rom_seed.disable exempt: in-process policy flag flip + JSON persist, no artifact install
+ops.debug.rom_fetch.bundle exempt: downloads+content-verifies a file into the datadir only; activation is the separate receipt-gated -install-consensus-bundle path
+ops.debug.rom_seed.publish exempt: idempotent re-scan registering already-on-disk content-verified artifacts for serving; produces and installs nothing
+
+# Vault custody verbs (engine/composition/commands/vault.def). None of them builds, signs
+# or installs anything: each resolves the path that already owns the spend and
+# dispatches to it, so the Law-7 disposition of the routed leaf governs. If a
+# vault verb ever grows its own artifact install it stops being a route, and
+# this line must become a receipt:.
+vault.send                 exempt: pure route to core.wallet.transaction.send, which owns the disposition
+vault.send-shielded        exempt: pure route to core.wallet.shielded.send, which owns the disposition
+vault.intent.issue         exempt: persists a wallet receive key, no artifact install
+vault.intent.plan          exempt: encrypted wallet-local plan row, no artifact install
+vault.intent.fanout-plan   exempt: persists receive keys plus one encrypted wallet-local plan, no artifact install
+vault.intent.commit        exempt: signs+broadcasts the exact planned transaction, no artifact install
+vault.swap.redeem          exempt: pure route to the swap_redeem RPC, which owns build/sign/broadcast
+vault.swap.refund          exempt: pure route to the swap_refund RPC, which owns build/sign/broadcast
+
+# Agent session grants (engine/composition/commands/vault.def). Minting/revoking writes an
+# agent_sessions ROW through the AR lifecycle — a scoped, revocable grant
+# record in node.db, not a privileged artifact installed over the datadir or
+# the running binary, and the row is itself fail-closed policy input (an
+# over-broad grant still passes through the ceiling/caps the kernel derives
+# from the principal's role).
+vault.session.create       exempt: AR insert of an agent_sessions grant row; no artifact install
+vault.session.revoke       exempt: AR update marking an agent_sessions row revoked; no artifact install
+
+# Wallet runtime custody transitions change key residency or wrap wallet-local
+# secret rows; they install no executable or consensus artifact.
+core.wallet.security.encrypt exempt: wallet-local WKS1 wrapping plus runtime lock, no artifact install
+core.wallet.security.unlock  exempt: bounded in-memory key residency, no artifact install
+core.wallet.security.lock    exempt: scrubs in-memory keys, no artifact install
+
+# Wallet key-disclosure and wallet-recovery leaves (engine/composition/commands/core.def).
+# None installs a privileged artifact over the datadir or the running binary.
+#
+# export-key was reclassified from EFFECT_READ/RISK_READ to
+# EFFECT_MUTATE/RISK_WALLET (it writes a raw spending key to the caller's
+# terminal, and the registry couples the two axes), which is why it appears
+# here at all. It reveals a key that already exists; it creates nothing.
+core.wallet.address.export-key  exempt: reveals an existing key over the response; builds, signs and installs nothing
+core.wallet.backup.decrypt      exempt: decrypts an operator-named backup FILE to an operator-named path; touches neither the datadir nor the running binary
+core.wallet.restore             exempt: merges wallet rows into node.db through the node's own schema path, in one transaction, and refuses while a node holds the datadir; a row merge, not an artifact install
+core.wallet.rescan-witnesses    exempt: rebuilds a DERIVED Sapling witness projection and refuses to save a tree whose final root does not match the block header; installs no artifact
+
+# app.store.* — the buying half of the store. None of the three installs a
+# privileged artifact over the datadir or the running binary.
+#   order   writes an app-layer purchase row (store_purchases) plus the
+#           merchant's own order row, both ordinary AR records in node.db.
+#   pay     moves value, but the spend is already covered by the node's
+#           sovereignty spend guard (sovereignty_guard_allow("wallet_spend"))
+#           and by z_sendmany's own path; this leaf adds no new authority.
+#   collect writes a buyer-chosen data file whose bytes are SHA3-256-bound to
+#           the product content hash BEFORE the write, and the write is
+#           atomic-by-rename — a mismatch leaves nothing behind at all.
+app.store.order            exempt: AR insert/update of a buyer purchase row; no artifact install
+app.store.pay              exempt: shielded spend already gated by the sovereignty spend guard; no artifact install
+app.store.collect          exempt: writes a content-hash-verified data file to an operator-chosen path; no artifact install
+app.store.remotebuy        exempt: POSTs a buyer order form to a remote seller's onion service and AR-inserts the local purchase row; no artifact install
+app.market.purchase.retrieve exempt: publishes only manifest-verified bytes to an operator-chosen path without overwrite; no datadir or binary artifact install
+app.tokens.create          exempt: broadcasts a wallet transaction through the existing sovereignty, admission, durability and relay gates; installs no privileged artifact
+app.tokens.mint            exempt: broadcasts a mint-baton-authorized wallet transaction through existing spend gates; installs no privileged artifact
+app.tokens.send            exempt: broadcasts an explicitly token-funded wallet transaction through existing spend gates; installs no privileged artifact
+app.blog.anchor            exempt: reserves fee state and broadcasts one identity-bound wallet transaction through existing vault-intent, admission, durability and relay gates; installs no privileged artifact
+vault.send-token           exempt: dispatch-only alias of app.tokens.send; builds or installs nothing itself
+core.wallet.transaction.raw.create    exempt: composes unsigned transaction bytes only; mutates no node or wallet state and installs no artifact
+core.wallet.transaction.raw.sign      exempt: produces signatures with resident wallet keys but imports nothing, persists nothing and installs no artifact
+core.wallet.transaction.raw.broadcast exempt: submits bytes through the shared mempool acceptance and relay gates; installs no privileged artifact
+core.wallet.recovery.restore    exempt: derives a wallet's own keys from an operator-supplied phrase and writes them into an EMPTY datadir through the node's own schema path; refuses while a node holds the datadir and refuses outright if a wallet is already there; installs no artifact and changes no running binary
+core.identity.anchor       exempt: reserves and broadcasts an identity-bound wallet transaction through durable vault-intent gates; installs no privileged artifact
+core.identity.rotate       exempt: reserves and broadcasts an identity-bound wallet transaction through durable vault-intent gates; installs no privileged artifact
+core.identity.revoke       exempt: reserves and broadcasts an identity-bound wallet transaction through durable vault-intent gates; installs no privileged artifact
+core.zdir.register         exempt: reserves and broadcasts an owner-bound directory transaction through durable vault-intent gates; installs no privileged artifact
+core.zdir.deregister       exempt: reserves and broadcasts an owner-bound directory transaction through durable vault-intent gates; installs no privileged artifact
+yardsale.seller.arm      exempt: configures a process-memory seller profile from the operator's own wallet keys behind an exact expiring plan/commit; persists only a plan row and installs no privileged artifact
+yardsale.seller.disarm   exempt: clears the process-memory seller profile (cleansing the retained key); persists nothing and installs no privileged artifact
+yardsale.buy             exempt: floods a signed accept through the existing ceremony + relay gates behind an exact expiring plan/commit; persists only a plan row and installs no privileged artifact
+vault.intent.submit      exempt: schedules an already reserved wallet intent through the existing identity, snapshot, exact-byte, admission, durability and relay gates; installs no privileged artifact
+vault.intent.cancel      exempt: atomically terminates only an unclaimed planned wallet intent and releases its reservation; installs no privileged artifact
+app.shop.init  exempt: provisions datadir-local storefront state (persistent onion identity seed, products.json, directory/apps.csv) behind an exact plan/commit; installs no privileged runtime artifact and changes no running binary
+app.shop.want.fulfill.post  exempt: persists a signed evidence claim over already-registered CAS bytes; installs no executable or privileged artifact and moves no value
+app.shop.want.fulfill.withdraw  exempt: marks only the signer-owned local evidence projection withdrawn; installs no artifact and moves no value
+app.shop.want.fulfill.review  exempt: changes only this node's local moderation view metadata; the signed claim is unchanged and no artifact or value moves
+dev.begin                   exempt: starts or reattaches only the checkout-local development watcher; installs no privileged artifact and changes no canonical node
+dev.proof.ensure            exempt: schedules checkout-local verification and publishes local evidence; installs no privileged artifact and changes no canonical node
+dev.proof.retry             exempt: reschedules failed checkout-local verification while preserving its evidence; installs no privileged artifact and changes no canonical node
+dev.proof.wait              exempt: schedules missing checkout-local verification before a bounded wait; installs no privileged artifact and changes no canonical node
+dev.publication.mirror.record exempt: appends optional declared mirror evidence after verified P2P publication; installs no artifact and grants no Git, network, source or publication authority
+dev.publication.collect exempt: appends verified signed storage evidence to an immutable dev publication job; installs no artifact and grants no approval, deployment, wallet or publication authority
+ops.mesh.pair.revoke exempt: removes one target-local status-read authority through bounded plan/commit; it creates no authority and installs no artifact
+ops.mesh.terminal exempt: CLI-only attach to a confined shell under the peer pairing capability; installs no artifact and its JSON handler is a blocker
+zcode.workspace.source.bundle.publish exempt: publicly serves an inert content-addressed source bundle behind owner authorization and idempotency confirmation; it installs no artifact and grants no execution or acceptance authority
+zcode.work.publish exempt: continues the existing bounded publication job for the exact accepted source and verified receipt lineage; it installs no artifact and grants no deployment or custody authority
+dev.fleet.tunnel.allow exempt: writes one datadir policy row naming a peer and a loopback port that the tunnel acceptor consults; installs no artifact, changes no binary, and grants no execution, wallet or publication authority
+dev.fleet.tunnel.deny exempt: removes one such policy row, which can only narrow what this node admits; installs no artifact and grants nothing
+fleet.invite exempt: signs one short-lived, single-use invite line with this box's own fleet key and writes nothing but that key on first use; it installs no artifact, changes no running binary, and the invite grants nothing until an owner admits the receipt it produces
+fleet.join exempt: records which operator public key this computer trusts and creates this computer's own Ed25519 key under the owner-private state root, then signs a receipt for the owner to carry back; it installs no artifact, changes no running binary, and grants this computer no authority over anything
+fleet.admit exempt: appends one operator-sealed inventory row and, when the receipt carried a dedicated key, ONE ssh line restricted to a single loopback listen port. That line is a real standing authority and is why this disposition is written out rather than assumed - but it is a `restrict` port-forward with no shell, no command, no agent, no pty and no X11, it is idempotent per machine name, it installs no artifact, and it changes no running binary, so there is no artifact digest or binary anchor for an authority_receipt to bind
+fleet.import exempt: appends one inventory row to this box's own roster only after its operator seal verifies against the operator key this box already trusts; it installs no artifact, grants no role, writes no ssh line and changes no running binary, so there is no artifact digest or binary anchor for an authority_receipt to bind
+dev.proof.step exempt: executes exact-pair checkout-local verification and publishes local evidence; installs no privileged artifact and changes no canonical node
+fleet.steer.grant exempt: appends one scoped messaging-grant row (brief/send/evidence subset, bounded lifetime, revocable) to the owner-private state root; it installs no artifact, changes no running binary, and confers no shell, wallet, deployment, deletion or soak authority, and every composed sibling leaf still enforces its own permissions
+core.network.onion.vanity exempt: writes one new 32-byte seed file at a caller-named path, never replacing an existing file and never inside a node data directory; it installs no artifact, changes no running binary, and grants no authority, so there is no artifact digest or binary anchor for an authority_receipt to bind
+fleet.steer.drop exempt: removes one retained quarantine upload (payload and manifest) beneath the owner-private steer inbox on the local state root; it installs no artifact, changes no running binary, reads no payload bytes and is never remotable

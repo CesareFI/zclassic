@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "zrange/zrange",
+  "semver": "0.1.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "name": "zsemver/zsemver",
+      "root": "b230aee3718cf40a830a3e23f0979fe8694b5c5b0219cf0726dffc855e4d7973",
+      "semver": "0.1.0"
+    }
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zrange/zrange.h",
+    "src/zrange.c",
+    "tests/test_zrange.c",
+    "zcode-package.json"
+  ]
+}

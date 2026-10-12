@@ -1,0 +1,28 @@
+# service-result-convergence baseline — Phase 3 shrinking-floor ratchet.
+#
+# check_service_result_convergence.sh (sibling to E2
+# check_one_result_type.sh) counts exported (non-static, top-level)
+# bool-returning function DEFINITIONS per engine/services/src/*.c file. E2
+# only requires a file to reference `struct zcl_result` SOMEWHERE, so a
+# file can be E2-clean while still exporting bare-bool functions
+# elsewhere — this baseline tracks and ratchets THAT residue down.
+#
+# Each line is '<path> <legacy-bool-export-count>', the count recorded
+# when the file was baselined. The gate FAILS when:
+#   - a baselined file's live count grows above its recorded count, OR
+#   - a baselined file's live count reaches 0 (or the file grows a
+#     `// one-result-type-ok:<tag>` marker) and the stale line is still
+#     here, OR
+#   - a baselined path no longer exists on disk, OR
+#   - a NEW (non-baselined, non-marker) file exports any legacy bool
+#     function.
+#
+# A file carrying a `// one-result-type-ok:<tag>` marker (same marker E2
+# uses) is fully exempt and must NOT appear here — see docs/work/
+# service-result-convergence.md for the full inventory, call sites, and
+# the lane partition for paying this down.
+#
+# This baseline may ONLY SHRINK. Migrate a file's legacy bool exports to
+# struct zcl_result (ZCL_OK / ZCL_ERR), then delete its line.
+#
+# One '<path> <count>' entry per line, repo-relative, sorted by path.

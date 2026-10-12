@@ -1,0 +1,110 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Purpose: handle-based read-only regular-file abstraction with offset reads
+ * that do not share a seek cursor, a symlink/reparse-point-safe open beneath
+ * a trusted directory, and identity/executable/private-ACL checks, portable
+ * across POSIX and Windows. */
+#ifndef ZCL_PLATFORM_POSITIONED_FILE_H
+#define ZCL_PLATFORM_POSITIONED_FILE_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/* A read-only regular file whose reads carry their own byte offset.  Multiple
+ * threads may read one instance concurrently without sharing or changing a
+ * seek cursor. */
+struct platform_positioned_file {
+    uintptr_t native;
+};
+
+/* Handle-bound metadata used to prove that content and metadata came from
+ * one regular file, even when its pathname is concurrently replaced. */
+struct platform_positioned_file_snapshot {
+    uint64_t size;
+    int64_t modified_seconds;
+    uint32_t modified_nanoseconds;
+    int64_t changed_seconds;
+    uint32_t changed_nanoseconds;
+    uint64_t volume;
+    uint64_t file_low;
+    uint64_t file_high;
+};
+
+void platform_positioned_file_init(struct platform_positioned_file *file);
+/* Open a regular file WITHOUT following a symlink/reparse point at the final
+ * component, so a link planted at a content path cannot redirect the read.
+ * This is the right call for every datadir, market, snapshot and CAS path. */
+bool platform_positioned_file_open(struct platform_positioned_file *file,
+                                   const char *utf8_path);
+/* Open the regular file a path RESOLVES to, following symlinks/reparse
+ * points. This exists for identifying an external tool the host installs
+ * behind an indirection the operator chose: on a Debian-family box
+ * /usr/bin/cc is a symlink into /etc/alternatives and /usr/bin/as is a
+ * symlink to x86_64-linux-gnu-as, so the no-follow open above refuses both
+ * with ELOOP and a toolchain identity cannot be captured at all. It restores
+ * exactly the reach realpath() gave those callers before they were bound to
+ * handles, while keeping the content hash and the stamp bound to the handle
+ * that was actually opened.
+ *
+ * ONLY for a fixed, compiled-in, trusted tool location. Never for datadir,
+ * market, or any other path an attacker can influence: following a link is
+ * precisely the property platform_positioned_file_open() refuses, and
+ * platform_positioned_file_open_beneath() is the confined form. Both still
+ * refuse a directory and any non-regular object. */
+bool platform_positioned_file_open_resolved(
+    struct platform_positioned_file *file, const char *utf8_path);
+/* Open a slash-separated relative path beneath a trusted real directory,
+ * without following a symlink/reparse point at any component. */
+bool platform_positioned_file_open_beneath(
+    struct platform_positioned_file *file, const char *root_utf8,
+    const char *leaf_utf8);
+void platform_positioned_file_close(struct platform_positioned_file *file);
+bool platform_positioned_file_size(const struct platform_positioned_file *file,
+                                   uint64_t *size);
+bool platform_positioned_file_snapshot(
+    const struct platform_positioned_file *file,
+    struct platform_positioned_file_snapshot *snapshot);
+/* Compare two snapshots FIELD-WISE. The struct carries 8 bytes of alignment
+ * padding (after each nanoseconds member), and neither the assignment inside
+ * platform_positioned_file_snapshot nor C itself defines what those padding
+ * bytes hold — so `memcmp` over the whole object compares stack garbage and
+ * reports two snapshots of one unchanged file as DIFFERENT. Every
+ * read-then-prove-stable caller must use this predicate, never memcmp.
+ * Structure padding is indeterminate and must never participate in an
+ * identity or stability decision. */
+bool platform_positioned_file_snapshot_equal(
+    const struct platform_positioned_file_snapshot *a,
+    const struct platform_positioned_file_snapshot *b);
+/* Return the canonical path of the opened object, bound to its handle. */
+bool platform_positioned_file_path(
+    const struct platform_positioned_file *file, char *utf8_path,
+    size_t path_size);
+/* True for a regular executable image. Windows validates the PE image magic;
+ * POSIX additionally requires at least one execute permission bit. */
+bool platform_positioned_file_is_executable(
+    const struct platform_positioned_file *file);
+/* True only when the opened file is private to the current user (plus SYSTEM
+ * on Windows), matching POSIX mode 0600 policy files. */
+bool platform_positioned_file_is_private(
+    const struct platform_positioned_file *file);
+/* True when only the current user (plus SYSTEM on Windows) can access the
+ * file. POSIX owner permission bits may be read-only, as with service-manager
+ * credentials, but group/other permissions are forbidden. */
+bool platform_positioned_file_is_current_user_only(
+    const struct platform_positioned_file *file);
+
+/* Return bytes read (zero at EOF), or -1 on invalid input/I/O failure.  A
+ * successful short read is preserved for callers that deliberately race an
+ * appending or truncating producer. */
+int64_t platform_positioned_file_read(
+    const struct platform_positioned_file *file, void *data, size_t size,
+    uint64_t offset);
+
+/* A BORROWED view of the pinned descriptor (POSIX: the open fd; Windows:
+ * the file HANDLE cast to intptr_t), for callers that must fcntl/fexecve
+ * the exact inode this handle already identity-bound. Never close it: the
+ * handle owns it. -1 means "not open". */
+intptr_t platform_positioned_file_native_fd(
+    const struct platform_positioned_file *file);
+
+#endif

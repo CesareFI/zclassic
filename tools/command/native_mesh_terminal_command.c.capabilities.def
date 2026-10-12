@@ -1,0 +1,2 @@
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
+ZCL_MODULE_CAPABILITY("tools/command/native_mesh_terminal_command.c", CAP_FS_READ|CAP_FS_WRITE|CAP_PRIVILEGE|CAP_CLOCK, "Reads the caller's stdin and writes remote output to stdout and diagnostics to stderr; the only ioctl is the window-size query on the already-held stdin descriptor, and termios changes touch only that descriptor; no privilege is acquired")

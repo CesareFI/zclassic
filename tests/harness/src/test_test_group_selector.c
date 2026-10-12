@@ -1,0 +1,2152 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0 */
+
+#include "test/test_core.h"
+#include "test/test_group_selector.h"
+#include "test/test_verdict_json.h"
+#include "platform/os_proc.h"
+#include "platform/file_metadata.h"
+#include "test_group_catalog.h"
+#include "test_group_weights.h"
+#include "util/clientversion.h"
+#include "json/json.h"
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/stat.h>
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#endif
+#include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#if defined(_WIN32)
+/* The UCRT _pclose() returns the child's raw exit code, not a wait(2)
+ * status word; map the two macros onto that honestly. popen() routes
+ * through cmd.exe, which cannot run the POSIX test-group-list.sh driver,
+ * so commands are re-dispatched through the MSYS2 sh on the lane's PATH.
+ * The command strings in this file carry no double quotes. */
+#define WIFEXITED(s) ((s) >= 0)
+#define WEXITSTATUS(s) (s)
+static const char *tgs_wrap_command(const char *command, char *buf,
+                                    size_t cap)
+{
+    int n = snprintf(buf, cap, "sh -c \"%s\"", command);
+    if (n < 0 || (size_t)n >= cap)
+        return NULL;
+    return buf;
+}
+#endif
+
+static int capture_command(const char *command, char *out, size_t cap)
+{
+    if (!command || !out || cap == 0)
+        return -1;
+    out[0] = '\0';
+#if defined(_WIN32)
+    char wrapped[4096];
+    command = tgs_wrap_command(command, wrapped, sizeof(wrapped));
+    if (!command)
+        return -1;
+#endif
+    FILE *pipe = popen(command, "r");
+    if (!pipe)
+        return -1;
+    size_t used = 0;
+    unsigned char chunk[4096];
+    for (;;) {
+        size_t got = fread(chunk, 1, sizeof(chunk), pipe);
+        size_t room = cap - used - 1;
+        size_t keep = got < room ? got : room;
+        if (keep > 0) {
+            memcpy(out + used, chunk, keep);
+            used += keep;
+        }
+        if (got == 0)
+            break;
+    }
+    out[used] = '\0';
+    int status = pclose(pipe);
+    if (status < 0 || !WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
+/* These nested runs select at most two groups. Refuse a larger or partial
+ * artifact instead of accidentally validating a prefix of another run. */
+static bool selector_timing_read(struct json_value *out)
+{
+    char bytes[8192];
+    FILE *fp = fopen(".cache/test-timing/last-run.json", "rb");
+    if (!fp) {
+        fprintf(stderr, "selector: timing artifact open failed\n");
+        return false;
+    }
+    size_t n = fread(bytes, 1, sizeof(bytes), fp);
+    bool complete = !ferror(fp) && feof(fp) && n < sizeof(bytes);
+    if (fclose(fp) != 0)
+        complete = false;
+    if (!complete || !json_read(out, bytes, n) || out->type != JSON_OBJ) {
+        fprintf(stderr, "selector: timing artifact incomplete or invalid\n");
+        json_free(out);
+        return false;
+    }
+    return true;
+}
+
+static bool selector_timing_zero(const struct json_value *row, const char *key)
+{
+    const struct json_value *v = json_get(row, key);
+    return v && v->type == JSON_INT && json_get_int(v) == 0;
+}
+
+static bool selector_timing_hex_key(const struct json_value *value)
+{
+    const char *s = json_get_str(value);
+    if (!s || strlen(s) != 64)
+        return false;
+    for (size_t i = 0; i < 64; i++)
+        if (!((s[i] >= '0' && s[i] <= '9') ||
+              (s[i] >= 'a' && s[i] <= 'f')))
+            return false;
+    return true;
+}
+
+static void reverse_range(char *b, size_t lo, size_t hi)
+{
+    while (lo < hi) {
+        char t = b[lo];
+        b[lo] = b[hi];
+        b[hi] = t;
+        lo++;
+        hi--;
+    }
+}
+
+/* Left-rotate b[0..n) by k using three reversals. */
+static void reverse_rotate(char *b, size_t n, size_t k)
+{
+    if (n == 0 || k % n == 0)
+        return;
+    k %= n;
+    reverse_range(b, 0, k - 1);
+    reverse_range(b, k, n - 1);
+    reverse_range(b, 0, n - 1);
+}
+
+/* Capture a bounded HEAD and a bounded TAIL of a command whose total output
+ * is unbounded, discarding the middle. Both buffers are NUL-terminated and
+ * neither grows with the output. Return value matches capture_command. */
+static int capture_command_ends(const char *command, char *head,
+                                size_t head_cap, char *tail, size_t tail_cap)
+{
+    if (!command || !head || head_cap == 0 || !tail || tail_cap < 2)
+        return -1;
+    head[0] = '\0';
+    tail[0] = '\0';
+#if defined(_WIN32)
+    char wrapped[4096];
+    command = tgs_wrap_command(command, wrapped, sizeof(wrapped));
+    if (!command)
+        return -1;
+#endif
+    FILE *pipe = popen(command, "r");
+    if (!pipe)
+        return -1;
+    const size_t ring_cap = tail_cap - 1;
+    size_t head_used = 0;
+    size_t ring_len = 0;  /* bytes held in the ring */
+    size_t ring_head = 0; /* index of the oldest byte once wrapped */
+    unsigned char chunk[4096];
+    for (;;) {
+        size_t got = fread(chunk, 1, sizeof(chunk), pipe);
+        if (got == 0)
+            break;
+        size_t room = head_cap - head_used - 1;
+        size_t keep = got < room ? got : room;
+        if (keep > 0) {
+            memcpy(head + head_used, chunk, keep);
+            head_used += keep;
+        }
+        /* Ring-append the same bytes; only the last ring_cap survive. */
+        for (size_t i = 0; i < got; i++) {
+            if (ring_len < ring_cap) {
+                tail[ring_len++] = (char)chunk[i];
+            } else {
+                tail[ring_head] = (char)chunk[i];
+                ring_head = (ring_head + 1) % ring_cap;
+            }
+        }
+    }
+    head[head_used] = '\0';
+    /* Rotate the ring into reading order in place (three reversals), so the
+     * capture needs no allocation at all. ring_head is non-zero only after
+     * the ring wrapped, and then ring_len == ring_cap. */
+    if (ring_head != 0)
+        reverse_rotate(tail, ring_len, ring_head);
+    tail[ring_len] = '\0';
+    int status = pclose(pipe);
+    if (status < 0 || !WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
+static int test_selector_predicate(void)
+{
+    int failures = 0;
+    TEST("test group selector: exact mode cannot widen to a sibling") {
+        ASSERT(test_group_selector_matches("test_api", "api", false));
+        ASSERT(test_group_selector_matches("test_native_api_contract", "api",
+                                           false));
+        ASSERT(!test_group_selector_matches("test_api", "api", true));
+        ASSERT(test_group_selector_matches("test_api", "test_api", true));
+        ASSERT(!test_group_selector_matches("test_native_api_contract",
+                                            "test_api", true));
+        ASSERT(!test_group_selector_matches("test_api", "", true));
+        ASSERT(!test_group_selector_matches(NULL, "test_api", true));
+        ASSERT(test_group_selector_matches_exact_set(
+            "test_api", "test_hex_codec,test_api"));
+        ASSERT(!test_group_selector_matches_exact_set(
+            "test_native_api_contract", "test_hex_codec,test_api"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+
+/* ── Assertion-message contract ───────────────────────────────────
+ *
+ * The FAIL line is the whole diagnosis for most failures, so its shape is
+ * a contract rather than cosmetics: it has to name the source position and,
+ * for a value comparison, both actual values. A reader who has to reopen the
+ * file and add printf calls is paying for a message that was already free.
+ *
+ * The macros bind their operands to temporaries before comparing, which is
+ * also what makes the message trustworthy: each operand is evaluated exactly
+ * ONCE, so the value printed is the value the predicate tested. Call sites
+ * routinely pass function calls with side effects.
+ *
+ * Each deliberately failing assertion runs in its own frame (its own
+ * `failures` counter and `_test_next` label) with stdout captured, so the
+ * FAIL text is inspected here and never reaches the transcript. */
+
+static int g_assert_probe_calls;
+
+static int assert_probe(int value)
+{
+    g_assert_probe_calls++;
+    return value;
+}
+
+static const char *assert_probe_str(const char *value)
+{
+    g_assert_probe_calls++;
+    return value;
+}
+
+static int probe_failing_assert(void)
+{
+    int failures = 0;
+    ASSERT(assert_probe(0) != 0);
+_test_next:;
+    return failures;
+}
+
+static int probe_failing_assert_eq(void)
+{
+    int failures = 0;
+    ASSERT_EQ(assert_probe(7), assert_probe(9));
+_test_next:;
+    return failures;
+}
+
+static int probe_failing_assert_str_eq(void)
+{
+    int failures = 0;
+    ASSERT_STR_EQ(assert_probe_str("alpha"), assert_probe_str("beta"));
+_test_next:;
+    return failures;
+}
+
+/* A pointer against NULL, and an unsigned lvalue against the integer
+ * constant 0, are the two operand shapes that a naive per-operand `auto`
+ * binding breaks: the first becomes a pointer/int comparison error, the
+ * second loses its constant expression and trips -Wsign-compare under
+ * -Werror. Both are ordinary in this suite, so both are compiled here. */
+static int probe_failing_assert_eq_pointer(void)
+{
+    int failures = 0;
+    const char *present = "x";
+    ASSERT_EQ(present, NULL);
+_test_next:;
+    return failures;
+}
+
+static int probe_failing_assert_eq_unsigned(void)
+{
+    int failures = 0;
+    size_t counted = 3;
+    ASSERT_EQ(counted, 0);
+_test_next:;
+    return failures;
+}
+
+static int probe_failing_assert_eq_char(void)
+{
+    int failures = 0;
+    char got = 'a';
+    ASSERT_EQ(got, 'b');
+_test_next:;
+    return failures;
+}
+
+static int probe_failing_assert_eq_bool(void)
+{
+    int failures = 0;
+    bool ready = false;
+    ASSERT_EQ(ready, true);
+_test_next:;
+    return failures;
+}
+
+/* Run `probe` with stdout redirected into an unnamed temp file and return
+ * the harness failure count it reported, leaving what it printed in `out`. */
+static int run_capturing_stdout(int (*probe)(void), char *out, size_t cap)
+{
+    if (!out || cap == 0)
+        return -1;
+    out[0] = '\0';
+    FILE *sink = tmpfile();
+    if (!sink)
+        return -1;
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    if (saved < 0) {
+        fclose(sink);
+        return -1;
+    }
+    if (dup2(fileno(sink), STDOUT_FILENO) < 0) {
+        close(saved);
+        fclose(sink);
+        return -1;
+    }
+    int reported = probe();
+    fflush(stdout);
+    if (dup2(saved, STDOUT_FILENO) < 0)
+        reported = -1;
+    close(saved);
+    rewind(sink);
+    size_t used = fread(out, 1, cap - 1, sink);
+    out[used] = '\0';
+    fclose(sink);
+    return reported;
+}
+
+static int test_assert_macros_report_where_and_what(void)
+{
+    int failures = 0;
+    char msg[512];
+
+    TEST("assert macros: operands are evaluated exactly once") {
+        g_assert_probe_calls = 0;
+        ASSERT_EQ(assert_probe(5), assert_probe(5));   /* passing path */
+        ASSERT_EQ(g_assert_probe_calls, 2);
+
+        g_assert_probe_calls = 0;
+        ASSERT_STR_EQ(assert_probe_str("same"), assert_probe_str("same"));
+        ASSERT_EQ(g_assert_probe_calls, 2);
+
+        g_assert_probe_calls = 0;                      /* failing path */
+        ASSERT_EQ(run_capturing_stdout(probe_failing_assert_eq,
+                                       msg, sizeof(msg)), 1);
+        ASSERT_EQ(g_assert_probe_calls, 2);
+
+        g_assert_probe_calls = 0;
+        ASSERT_EQ(run_capturing_stdout(probe_failing_assert_str_eq,
+                                       msg, sizeof(msg)), 1);
+        ASSERT_EQ(g_assert_probe_calls, 2);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_assert_messages_name_file_line_and_values(void)
+{
+    int failures = 0;
+    char msg[512];
+
+    TEST("assert macros: FAIL names file:line and both values") {
+        ASSERT_EQ(run_capturing_stdout(probe_failing_assert,
+                                       msg, sizeof(msg)), 1);
+        ASSERT(strstr(msg, "test_test_group_selector.c:") != NULL);
+        ASSERT(strstr(msg, "assert_probe(0) != 0") != NULL);
+
+        ASSERT_EQ(run_capturing_stdout(probe_failing_assert_eq,
+                                       msg, sizeof(msg)), 1);
+        ASSERT(strstr(msg, "test_test_group_selector.c:") != NULL);
+        ASSERT(strstr(msg, "7 != 9") != NULL);
+
+        ASSERT_EQ(run_capturing_stdout(probe_failing_assert_str_eq,
+                                       msg, sizeof(msg)), 1);
+        ASSERT(strstr(msg, "test_test_group_selector.c:") != NULL);
+        ASSERT(strstr(msg, "\"alpha\" != \"beta\"") != NULL);
+
+        /* Pointers cannot be enumerated in a _Generic, so they take the
+         * fallback arm; both sides must still print as addresses. */
+        ASSERT_EQ(run_capturing_stdout(probe_failing_assert_eq_pointer,
+                                       msg, sizeof(msg)), 1);
+        ASSERT(strstr(msg, "test_test_group_selector.c:") != NULL);
+        ASSERT(strstr(msg, "(nil)") != NULL);
+        ASSERT(strstr(msg, "0x") != NULL);
+
+        ASSERT_EQ(run_capturing_stdout(probe_failing_assert_eq_unsigned,
+                                       msg, sizeof(msg)), 1);
+        ASSERT(strstr(msg, "3 != 0") != NULL);
+
+        ASSERT_EQ(run_capturing_stdout(probe_failing_assert_eq_bool,
+                                       msg, sizeof(msg)), 1);
+        ASSERT(strstr(msg, "false != true") != NULL);
+
+        /* The printer type comes from the ORIGINAL operand, so a char
+         * still renders as a char even though `1 ? c : 'b'` promotes
+         * the compared value to int. */
+        ASSERT_EQ(run_capturing_stdout(probe_failing_assert_eq_char,
+                                       msg, sizeof(msg)), 1);
+        ASSERT(strstr(msg, "'a' (97) != 98") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+static int test_tmpdir_recursive_cleanup(void)
+{
+    int failures = 0;
+    TEST("test tmpdir: repeated PID/tag removes nested stale state") {
+        char root[PATH_MAX], nested[PATH_MAX], stale[PATH_MAX];
+        test_make_tmpdir(root, sizeof(root), "tmpdir_cleanup", "nested");
+        int n = snprintf(nested, sizeof(nested), "%s/one", root);
+        ASSERT(n > 0 && (size_t)n < sizeof(nested));
+        ASSERT(mkdir(nested, 0755) == 0);
+        n = snprintf(stale, sizeof(stale), "%s/stale", nested);
+        ASSERT(n > 0 && (size_t)n < sizeof(stale));
+        FILE *fixture = fopen(stale, "wb");
+        ASSERT(fixture != NULL);
+        ASSERT(fputs("stale", fixture) >= 0);
+        ASSERT(fclose(fixture) == 0);
+
+        test_make_tmpdir(root, sizeof(root), "tmpdir_cleanup", "nested");
+        ASSERT(access(root, F_OK) == 0);
+        ASSERT(access(nested, F_OK) != 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+static int test_cleanup_symlink_boundary(int mode)
+{
+    int failures = 0;
+    char root[PATH_MAX] = {0}, target[PATH_MAX] = {0};
+    char link[PATH_MAX] = {0}, sentinel[PATH_MAX] = {0};
+    TEST("test cleanup leaves sibling symlink target and sentinel intact") {
+        test_make_tmpdir(root, sizeof(root), "cleanup_boundary", "root");
+        test_make_tmpdir(target, sizeof(target), "cleanup_boundary", "target");
+        int n = snprintf(sentinel, sizeof(sentinel), "%s/public-sentinel", target);
+        ASSERT(n > 0 && (size_t)n < sizeof(sentinel));
+        FILE *file = fopen(sentinel, "wb");
+        ASSERT(file != NULL);
+        bool wrote = fputs("PUBLIC cleanup boundary", file) >= 0;
+        int closed = fclose(file);
+        ASSERT(wrote);
+        ASSERT_EQ(closed, 0);
+        n = snprintf(link, sizeof(link), "%s/link", root);
+        ASSERT(n > 0 && (size_t)n < sizeof(link));
+        char selected[PATH_MAX];
+        n = snprintf(selected, sizeof(selected), "%s%s", target,
+                     mode == 3 ? "/missing" : "");
+        ASSERT(n > 0 && (size_t)n < sizeof(selected));
+        if (mode == 3)
+            ASSERT_EQ(platform_file_shape_read(selected), PLATFORM_FILE_SHAPE_MISSING);
+        ASSERT_EQ(symlink(selected, link), 0);
+        if (mode == 0)
+            (void)test_rm_rf_recursive(link);
+        else if (mode == 1)
+            (void)test_rm_rf_recursive(root);
+        else if (mode == 2)
+            test_cleanup_tmpdir(link);
+        else {
+            n = snprintf(selected, sizeof(selected), "%s%s", link,
+                         mode == 4 ? "/" : "");
+            ASSERT(n > 0 && (size_t)n < sizeof(selected));
+            (void)test_rm_rf_recursive(selected);
+        }
+        ASSERT_EQ(access(target, F_OK), 0);
+        ASSERT_EQ(access(sentinel, F_OK), 0);
+        ASSERT_EQ(platform_file_shape_read(link), PLATFORM_FILE_SHAPE_MISSING);
+        PASS();
+    } _test_next:;
+    /* Every target is this test's sibling directory. Remove the link first,
+     * even when an assertion failed, before ordinary fixture retirement. */
+    if (link[0]) (void)unlink(link);
+    if (root[0]) (void)test_rm_rf_recursive(root);
+    if (target[0]) (void)test_rm_rf_recursive(target);
+    return failures;
+}
+#endif
+
+static bool exact_suggestions_valid(const char *out)
+{
+    size_t count = 0;
+    const char *next = out;
+    while ((next = strstr(next, "\n  ")) != NULL) {
+        next += 3;
+        size_t len = strcspn(next, "\n");
+        char name[ZCL_TEST_GROUP_FULL_MAX];
+        if (len == 0 || len >= sizeof(name)) return false;
+        memcpy(name, next, len);
+        name[len] = '\0';
+        if (!zcl_test_group_catalog_contains(name) || ++count > 3)
+            return false;
+    }
+    return count > 0;
+}
+
+static int test_exact_set_diagnostics(void)
+{
+    int failures = 0;
+    TEST("exact set: unknown token explains separator and closest names") {
+        char out[4096];
+        int rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact-set zvec 2>&1",
+            out, sizeof(out));
+        ASSERT_EQ(rc, 1);
+        ASSERT(strstr(out, "unknown exact group 'zvec'") != NULL);
+        ASSERT(strstr(out, "comma-separated") != NULL);
+        ASSERT(strstr(out, "closest registered names:") != NULL);
+        ASSERT(exact_suggestions_valid(out));
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact-set test_dev_landd 2>&1",
+            out, sizeof(out));
+        ASSERT_EQ(rc, 1);
+        ASSERT(strstr(out, "closest registered names:\n  test_dev_land\n") != NULL);
+        ASSERT(exact_suggestions_valid(out));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_exact_set_mixed(void)
+{
+    int failures = 0;
+    TEST("exact set: every unknown token is named without admitting prefix") {
+        char out[4096];
+        int rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact-set api,zvec,api_missing 2>&1",
+            out, sizeof(out));
+        ASSERT_EQ(rc, 1);
+        ASSERT(strstr(out, "unknown exact group 'zvec'") != NULL);
+        ASSERT(strstr(out, "unknown exact group 'api_missing'") != NULL);
+        ASSERT(strstr(out, "unknown exact group 'api'") == NULL);
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact-set api,zvec,api_missing 2>/dev/null",
+            out, sizeof(out));
+        ASSERT_EQ(rc, 1);
+        ASSERT(out[0] == '\0');
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact-set api,zvec,,api_missing 2>&1",
+            out, sizeof(out));
+        ASSERT_EQ(rc, 1);
+        ASSERT(strstr(out, "empty exact group token") != NULL);
+        ASSERT(strstr(out, "unknown exact group 'zvec'") != NULL);
+        ASSERT(strstr(out, "unknown exact group 'api_missing'") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_exact_set_empty(void)
+{
+    int failures = 0;
+    TEST("exact set: empty selection explains accepted syntax") {
+        char out[4096];
+        int rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact-set '' 2>&1",
+            out, sizeof(out));
+        ASSERT_EQ(rc, 2);
+        ASSERT(strstr(out, "empty") != NULL);
+        ASSERT(strstr(out, "comma-separated") != NULL);
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact-set api,,impact_composition 2>&1",
+            out, sizeof(out));
+        ASSERT_EQ(rc, 1);
+        ASSERT(strstr(out, "empty exact group token") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_exact_set_valid(void)
+{
+    int failures = 0;
+    TEST("exact set: comma sets remain ordered and deduplicated") {
+        char out[4096];
+        int rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact-set api,impact_composition,api 2>&1",
+            out, sizeof(out));
+        ASSERT_EQ(rc, 0);
+        ASSERT(strcmp(out, "test_api,test_impact_composition\n") == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_exact_set_space_separator(void)
+{
+    int failures = 0;
+    TEST("exact set: spaces remain invalid and comma multi-set is explained") {
+        char out[4096];
+        int rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact-set 'dev_land impact_composition' 2>&1",
+            out, sizeof(out));
+        ASSERT_EQ(rc, 1);
+        ASSERT(strstr(out, "unknown exact group 'dev_land impact_composition'") != NULL);
+        ASSERT(strstr(out, "comma-separated") != NULL);
+        ASSERT(strstr(out, "ONLY=dev_land,impact_composition") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_registry_exact_resolution(void)
+{
+    int failures = 0;
+    TEST("test group selector: legacy plan id resolves to one canonical id") {
+        char out[4096];
+        char bounded[64];
+        int rc = capture_command("yes x 2>/dev/null | head -c 65536", bounded,
+                                 sizeof(bounded));
+        ASSERT(rc == 0);
+        ASSERT(strlen(bounded) == sizeof(bounded) - 1);
+
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact api 2>&1", out,
+            sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(strcmp(out, "test_api\n") == 0);
+
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact test_api 2>&1", out,
+            sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(strcmp(out, "test_api\n") == 0);
+
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact api_missing 2>&1",
+            out, sizeof(out));
+        ASSERT(rc == 1);
+        ASSERT(out[0] == '\0');
+
+        /* Registry membership is whole-name only. A strict prefix or suffix
+         * of a registered name (test_api) is not itself registered, so a
+         * lookup that degraded into substring or prefix matching fails here. */
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact test_ap 2>&1", out,
+            sizeof(out));
+        ASSERT(rc == 1);
+        ASSERT(out[0] == '\0');
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-exact est_api 2>&1", out,
+            sizeof(out));
+        ASSERT(rc == 1);
+        ASSERT(out[0] == '\0');
+
+        /* Two plan tokens that select the same group print it once, in
+         * first-selected order. */
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-proof test_api api 2>&1",
+            out, sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(strncmp(out, "test_api\n", strlen("test_api\n")) == 0);
+        ASSERT(strstr(out + 1, "\ntest_api\n") == NULL);
+        ASSERT(strstr(out, "test_native_api_contract\n") != NULL);
+
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --check-impact-rules 2>&1", out,
+            sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(out[0] == '\0');
+
+        char fixture_path[256];
+        int fixture_n = snprintf(
+            fixture_path, sizeof(fixture_path),
+            "test-tmp/impact-rules-negative-%ld.def", (long)getpid());
+        ASSERT(fixture_n > 0 && (size_t)fixture_n < sizeof(fixture_path));
+        FILE *fixture = fopen(fixture_path, "w");
+        ASSERT(fixture != NULL);
+        ASSERT(fprintf(fixture,
+            "AGENT_IMPACT_RULE(\"tests/harness/src/test_hex_codec.c\", \"\")\n"
+            "AGENT_IMPACT_RULE(\"tests/harness/src/test_api.c\", \"api_missing\")\n"
+            "AGENT_IMPACT_RULE(\"tests/harness/src/test_hex_codec.c\", \"api\")\n") > 0);
+        ASSERT(fclose(fixture) == 0);
+        char fixture_command[512];
+        int command_n = snprintf(
+            fixture_command, sizeof(fixture_command),
+            "tools/dev/test-group-list.sh --check-impact-rules %s 2>&1",
+            fixture_path);
+        ASSERT(command_n > 0 && (size_t)command_n < sizeof(fixture_command));
+        rc = capture_command(fixture_command, out, sizeof(out));
+        ASSERT(remove(fixture_path) == 0);
+        ASSERT(rc == 1);
+        ASSERT(strstr(out, "empty impact proof plan") != NULL);
+        ASSERT(strstr(out, "non-exact impact proof id: api_missing") != NULL);
+        ASSERT(strstr(out, "omits its registered group test_hex_codec") !=
+               NULL);
+
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-proof make_lint_gates "
+            "api 2>&1", out, sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(strstr(out, "test_make_lint_gates\n") != NULL);
+        ASSERT(strstr(out, "test_make_lint_gates_shard_01\n") != NULL);
+        ASSERT(strstr(out, "test_make_lint_gates_heavy_02\n") != NULL);
+        ASSERT(strstr(out, "test_make_lint_gates_heavy_03\n") != NULL);
+        ASSERT(strstr(out, "test_api\n") != NULL);
+        ASSERT(strstr(out, "test_native_api_contract\n") != NULL);
+
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-proof test_api 2>&1",
+            out, sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(strcmp(out, "test_api\n") == 0);
+
+        /* A legacy prefixless ID may itself begin with "test_". It is exact
+         * only when that literal full ID exists in the registry. */
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-proof "
+            "test_group_selector 2>&1", out, sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(strcmp(out, "test_test_group_selector\n") == 0);
+
+        /* Coverage migration is lossless: a legacy family selector becomes
+         * exact full IDs, but only after its exact primary is admitted. */
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-proof stage_repair 2>&1",
+            out, sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(strstr(out, "test_stage_repair\n") != NULL);
+        ASSERT(strstr(out, "test_stage_repair_coin_backfill\n") != NULL);
+        ASSERT(strstr(out, "test_stage_repair_script_refill\n") != NULL);
+        ASSERT(strstr(out, "test_stage_repair_tipfin_backfill\n") != NULL);
+
+        rc = capture_command(
+            "tools/dev/test-group-list.sh --resolve-proof oracle_policy "
+            "2>&1", out, sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(strstr(out, "test_oracle_policy\n") != NULL);
+        ASSERT(strstr(out, "test_groth16_r1cs_oracle\n") != NULL);
+        ASSERT(strstr(out, "test_zclassicd_oracle\n") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── declared-family expansion ────────────────────────────────────
+ *
+ * zcl_test_group_family_expand() is what the proof selector and the plan
+ * builder both call. Before it existed the proof resolved an impact-rule
+ * token EXACTLY, so `make_lint_gates` -- the token every README/Makefile/docs
+ * rule names -- selected the one group whose body is the root-file check and
+ * the sandbox cleanup, and none of the shards that actually read those files.
+ * A README rewrite landed through such a proof and left main red on
+ * test_make_lint_gates_shard_08 and test_make_lint_gates_realroot for six
+ * hours. */
+
+#define FAMILY_EXPAND_MAX 64
+
+struct family_expansion {
+    char ids[FAMILY_EXPAND_MAX][ZCL_TEST_GROUP_FULL_MAX];
+    size_t len;
+    bool overflowed;
+};
+
+static bool family_expansion_collect(const char *full_id, void *ctx)
+{
+    struct family_expansion *seen = ctx;
+    if (seen->len >= FAMILY_EXPAND_MAX) {
+        seen->overflowed = true;
+        return false;
+    }
+    snprintf(seen->ids[seen->len], ZCL_TEST_GROUP_FULL_MAX, "%s", full_id);
+    seen->len++;
+    return true;
+}
+
+static bool family_expansion_has(const struct family_expansion *seen,
+                                 const char *full_id)
+{
+    for (size_t i = 0; i < seen->len; i++)
+        if (strcmp(seen->ids[i], full_id) == 0)
+            return true;
+    return false;
+}
+
+static int test_declared_family_expansion(void)
+{
+    int failures = 0;
+    TEST("test group selector: a declared family token reaches every shard") {
+        struct family_expansion lint = {0};
+        ASSERT(zcl_test_group_family_expand("make_lint_gates",
+                                            family_expansion_collect, &lint));
+        ASSERT(!lint.overflowed);
+        /* The primary comes first: the expansion is a superset of the exact
+         * resolution, never a replacement for it. */
+        ASSERT(lint.len > 1);
+        ASSERT(strcmp(lint.ids[0], "test_make_lint_gates") == 0);
+        for (unsigned shard = 1; shard <= 8; shard++) {
+            char id[ZCL_TEST_GROUP_FULL_MAX];
+            snprintf(id, sizeof(id), "test_make_lint_gates_shard_%02u", shard);
+            ASSERT(family_expansion_has(&lint, id));
+        }
+        ASSERT(family_expansion_has(&lint, "test_make_lint_gates_realroot"));
+        ASSERT(family_expansion_has(&lint, "test_make_lint_gates_partition"));
+        ASSERT(family_expansion_has(&lint, "test_make_lint_gates_heavy_01"));
+        ASSERT(family_expansion_has(&lint, "test_make_lint_gates_heavy_02"));
+        ASSERT(family_expansion_has(&lint, "test_make_lint_gates_heavy_03"));
+        /* Every member is a registered group, and the shard list is derived
+         * from the catalog rather than written down here: a shard added to
+         * the registry joins the family with no edit to this test. */
+        size_t registered = 0;
+        for (size_t i = 0; i < lint.len; i++)
+            ASSERT(zcl_test_group_catalog_contains(lint.ids[i]));
+        for (size_t i = 0; i < zcl_test_group_catalog_count(); i++)
+            if (strncmp(zcl_test_group_catalog_at(i), "test_make_lint_gates",
+                        strlen("test_make_lint_gates")) == 0)
+                registered++;
+        ASSERT(lint.len == registered);
+
+        /* The gateway umbrella: its base group only proves the shard
+         * partition, so an impact rule naming `fleet_gateway` must reach
+         * every registered test_fleet_gateway* shard or a proof runs none
+         * of the gateway sub-suites. */
+        struct family_expansion gw = {0};
+        ASSERT(zcl_test_group_family_expand("fleet_gateway",
+                                            family_expansion_collect, &gw));
+        ASSERT(!gw.overflowed);
+        ASSERT(gw.len > 1);
+        ASSERT(strcmp(gw.ids[0], "test_fleet_gateway") == 0);
+        ASSERT(family_expansion_has(&gw, "test_fleet_gateway_shard_01"));
+        size_t gw_registered = 0;
+        for (size_t i = 0; i < zcl_test_group_catalog_count(); i++)
+            if (strncmp(zcl_test_group_catalog_at(i), "test_fleet_gateway",
+                        strlen("test_fleet_gateway")) == 0) {
+                gw_registered++;
+                ASSERT(family_expansion_has(&gw,
+                                            zcl_test_group_catalog_at(i)));
+            }
+        ASSERT(gw.len == gw_registered);
+
+        /* An exact single-group token still yields exactly one group. */
+        struct family_expansion exact = {0};
+        ASSERT(zcl_test_group_family_expand("test_api",
+                                            family_expansion_collect, &exact));
+        ASSERT(exact.len == 1);
+        ASSERT(strcmp(exact.ids[0], "test_api") == 0);
+
+        /* And a legacy prefixless token with NO declared family expands to
+         * its primary alone. This is the guard against a bare substring
+         * rule: "api" must not drag in test_native_api_contract merely
+         * because the name contains it. */
+        struct family_expansion legacy = {0};
+        ASSERT(zcl_test_group_family_expand("api", family_expansion_collect,
+                                            &legacy));
+        ASSERT(legacy.len == 1);
+        ASSERT(strcmp(legacy.ids[0], "test_api") == 0);
+        ASSERT(!family_expansion_has(&legacy, "test_native_api_contract"));
+
+        /* An unknown token still fails, with and without a visitor, and a
+         * NULL visitor is the admission question the plan builder asks. */
+        struct family_expansion missing = {0};
+        ASSERT(!zcl_test_group_family_expand("api_missing",
+                                             family_expansion_collect,
+                                             &missing));
+        ASSERT(missing.len == 0);
+        ASSERT(!zcl_test_group_family_expand("api_missing", NULL, NULL));
+        ASSERT(!zcl_test_group_family_expand(NULL, NULL, NULL));
+        ASSERT(!zcl_test_group_family_expand("", NULL, NULL));
+        ASSERT(zcl_test_group_family_expand("make_lint_gates", NULL, NULL));
+
+        /* A visitor that refuses aborts the walk and the expansion reports
+         * failure, so a caller out of room refuses instead of quietly
+         * running a narrower set than the plan asked for. */
+        struct family_expansion tiny = {0};
+        tiny.len = FAMILY_EXPAND_MAX;
+        ASSERT(!zcl_test_group_family_expand("make_lint_gates",
+                                             family_expansion_collect, &tiny));
+        ASSERT(tiny.overflowed);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool umbrella_all_but_first_shard(const char *full_id, void *ctx)
+{
+    const char *umbrella = ctx;
+    char first[ZCL_TEST_GROUP_FULL_MAX];
+    snprintf(first, sizeof(first), "%s_shard_01", umbrella);
+    return strcmp(full_id, first) != 0;
+}
+
+static bool umbrella_every_shard(const char *full_id, void *ctx)
+{
+    (void)full_id;
+    (void)ctx;
+    return true;
+}
+
+/* One umbrella's selection contract, asked through every expansion the
+ * proof, the plan builder and the runner use. */
+static int umbrella_contract(const char *umbrella, const char *token)
+{
+    int failures = 0;
+    TEST("test group selector: an umbrella runs whole only when named "
+         "exactly, and as its shards everywhere else") {
+        char shard_prefix[ZCL_TEST_GROUP_FULL_MAX];
+        size_t shards = zcl_test_group_umbrella_shard_count(umbrella);
+        snprintf(shard_prefix, sizeof(shard_prefix), "%s_shard_", umbrella);
+        ASSERT(zcl_test_group_is_umbrella(umbrella));
+        ASSERT(shards >= 2);
+        ASSERT(zcl_test_group_umbrella_subsumed(
+            umbrella, umbrella_every_shard, NULL));
+        /* One shard missing from the set and the umbrella must run whole,
+         * or that shard's sub-suites go unrun. */
+        ASSERT(!zcl_test_group_umbrella_subsumed(
+            umbrella, umbrella_all_but_first_shard, (void *)umbrella));
+
+        /* The declared family: every shard, never the umbrella. */
+        struct family_expansion fam = {0};
+        ASSERT(zcl_test_group_family_expand(token, family_expansion_collect,
+                                            &fam));
+        ASSERT(!fam.overflowed);
+        ASSERT(!family_expansion_has(&fam, umbrella));
+        ASSERT(fam.len == shards);
+        for (size_t i = 0; i < fam.len; i++) {
+            ASSERT(strncmp(fam.ids[i], shard_prefix, strlen(shard_prefix)) ==
+                   0);
+            ASSERT(zcl_test_group_is_umbrella_shard(umbrella, fam.ids[i]));
+        }
+
+        /* The exact id is the historic group, whole. */
+        struct family_expansion whole = {0};
+        ASSERT(zcl_test_group_family_expand(umbrella,
+                                            family_expansion_collect,
+                                            &whole));
+        ASSERT(whole.len == 1);
+        ASSERT(strcmp(whole.ids[0], umbrella) == 0);
+
+        /* The plan expansion folds the same way. */
+        static char out[FAMILY_EXPAND_MAX][ZCL_TEST_GROUP_FULL_MAX];
+        bool truncated = true;
+        const char *legacy[] = {token};
+        size_t n = zcl_test_group_expand_plan(legacy, 1, out,
+                                              FAMILY_EXPAND_MAX, &truncated);
+        ASSERT(!truncated);
+        ASSERT(n == shards);
+        for (size_t i = 0; i < n; i++)
+            ASSERT(zcl_test_group_is_umbrella_shard(umbrella, out[i]));
+        const char *exact[] = {umbrella};
+        n = zcl_test_group_expand_plan(exact, 1, out, FAMILY_EXPAND_MAX,
+                                       &truncated);
+        ASSERT(!truncated);
+        ASSERT(n == 1);
+        ASSERT(strcmp(out[0], umbrella) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_umbrella_groups(void)
+{
+    int failures = 0;
+    TEST("test group selector: umbrella declarations are well formed") {
+        ASSERT(zcl_test_group_umbrellas_valid());
+        /* An ordinary group, and a sharded group whose base is not an
+         * umbrella, are never subsumed. */
+        ASSERT(!zcl_test_group_is_umbrella("test_api"));
+        ASSERT(!zcl_test_group_is_umbrella("test_fleet_gateway"));
+        ASSERT(!zcl_test_group_umbrella_subsumed(
+            "test_fleet_gateway", umbrella_every_shard, NULL));
+        ASSERT(zcl_test_group_umbrella_shard_count("test_api") == 0);
+        PASS();
+    } _test_next:;
+    failures += umbrella_contract("test_zcode_swarm_net", "zcode_swarm_net");
+    failures += umbrella_contract("test_zcode_package_dev",
+                                  "zcode_package_dev");
+    return failures;
+}
+
+static int test_umbrella_runner_fold(void)
+{
+    int failures = 0;
+    TEST("test group selector: the runner folds an umbrella into its shards "
+         "for --only and keeps it whole for --exact") {
+        /* A cache probe stops before any fork, so nothing here runs a
+         * sub-suite; the fold decision is printed before it. */
+        static char out[256 * 1024];
+        char exe[PATH_MAX];
+        char command[PATH_MAX + 160];
+        ASSERT(os_proc_exe_path(exe, sizeof(exe)));
+        int n = snprintf(command, sizeof(command),
+                         "\"%s\" --jobs=1 --only=zcode_swarm_net --cache "
+                         "--cache-probe-only 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        ASSERT(capture_command(command, out, sizeof(out)) == 0);
+        ASSERT(strstr(out, "test_zcode_swarm_net runs as its") != NULL);
+        n = snprintf(command, sizeof(command),
+                     "\"%s\" --jobs=1 --exact=test_zcode_swarm_net --cache "
+                     "--cache-probe-only 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        ASSERT(capture_command(command, out, sizeof(out)) == 0);
+        ASSERT(strstr(out, "runs as its") == NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_native_catalog_resolution(void)
+{
+    int failures = 0;
+    TEST("test group selector: C catalog owns exact proof expansion") {
+        ASSERT(zcl_test_group_catalog_count() > 800);
+        ASSERT(zcl_test_group_catalog_contains("test_api"));
+        ASSERT(zcl_test_group_integration_policy_valid());
+        ASSERT(!zcl_test_group_catalog_contains("api"));
+        ASSERT(zcl_test_group_source_is_semantic_leaf(
+            "tests/harness/src/test_stage_repair_coin_backfill.c"));
+        ASSERT(zcl_test_group_source_is_semantic_leaf(
+            "tests/harness/src/test_dev_platform.c"));
+        ASSERT(zcl_test_group_source_is_semantic_leaf(
+            "tests/harness/src/test_file_controller.c"));
+        ASSERT(zcl_test_group_source_is_semantic_leaf(
+            "tests/harness/src/test_cold_join_sovereign.c"));
+        ASSERT(zcl_test_group_source_is_semantic_leaf(
+            "tests/harness/src/test_test_group_selector.c"));
+        ASSERT(!zcl_test_group_source_is_semantic_leaf(
+            "tests/harness/src/test_api.c"));
+
+        char full[ZCL_TEST_GROUP_FULL_MAX];
+        ASSERT(zcl_test_group_resolve_exact("api", full));
+        ASSERT(strcmp(full, "test_api") == 0);
+        ASSERT(zcl_test_group_resolve_exact("test_api", full));
+        ASSERT(strcmp(full, "test_api") == 0);
+        ASSERT(!zcl_test_group_resolve_exact("api_missing", full));
+        /* The indexed catalog must answer exactly like a linear scan: for
+         * every row, its bare name, and a missing sibling, count the rows a
+         * resolve can name and require the same verdict and the same row. */
+        for (size_t row = 0; row < zcl_test_group_catalog_count(); row++) {
+            const char *cat = zcl_test_group_catalog_at(row);
+            ASSERT(zcl_test_group_catalog_contains(cat));
+            const char *bare = strchr(cat, '_') ? strchr(cat, '_') + 1 : cat;
+            char missing[ZCL_TEST_GROUP_FULL_MAX + 8];
+            snprintf(missing, sizeof(missing), "%s_zz", cat);
+            ASSERT(!zcl_test_group_catalog_contains(missing));
+            const char *probes[] = { cat, bare, missing };
+            for (size_t p = 0; p < 3; p++) {
+                char want_t[ZCL_TEST_GROUP_FULL_MAX + 8];
+                char want_s[ZCL_TEST_GROUP_FULL_MAX + 8];
+                snprintf(want_t, sizeof(want_t), "test_%s", probes[p]);
+                snprintf(want_s, sizeof(want_s), "spec_%s", probes[p]);
+                size_t hits = 0;
+                const char *hit = NULL;
+                for (size_t i = 0; i < zcl_test_group_catalog_count(); i++) {
+                    const char *c = zcl_test_group_catalog_at(i);
+                    if (strcmp(c, probes[p]) == 0 || strcmp(c, want_t) == 0 ||
+                        strcmp(c, want_s) == 0) {
+                        hit = c;
+                        hits++;
+                    }
+                }
+                char got[ZCL_TEST_GROUP_FULL_MAX];
+                bool ok = zcl_test_group_resolve_exact(probes[p], got);
+                ASSERT(ok == (hits == 1));
+                if (ok)
+                    ASSERT(strcmp(got, hit) == 0);
+            }
+        }
+        ASSERT(zcl_test_group_plan_selects("test_api", "test_api"));
+        ASSERT(!zcl_test_group_plan_selects("test_api",
+                                            "test_native_api_contract"));
+        ASSERT(zcl_test_group_plan_selects("api",
+                                           "test_native_api_contract"));
+        ASSERT(zcl_test_group_plan_selects("test_group_selector",
+                                           "test_test_group_selector"));
+
+        const char *ids[] = { "api", "stage_repair", "oracle_policy" };
+        char expanded[16][ZCL_TEST_GROUP_FULL_MAX];
+        bool truncated = true;
+        size_t total = zcl_test_group_expand_plan(
+            ids, sizeof(ids) / sizeof(ids[0]), expanded,
+            sizeof(expanded) / sizeof(expanded[0]), &truncated);
+        ASSERT(total == 10);
+        ASSERT(!truncated);
+        bool saw_api = false, saw_native_api = false, saw_stage_coin = false;
+        bool saw_groth = false, saw_zclassicd = false, saw_quorum = false;
+        for (size_t i = 0; i < total; i++) {
+            saw_api |= strcmp(expanded[i], "test_api") == 0;
+            saw_native_api |= strcmp(expanded[i],
+                                     "test_native_api_contract") == 0;
+            saw_stage_coin |= strcmp(expanded[i],
+                                      "test_stage_repair_coin_backfill") == 0;
+            saw_groth |= strcmp(expanded[i],
+                                "test_groth16_r1cs_oracle") == 0;
+            saw_zclassicd |= strcmp(expanded[i],
+                                    "test_zclassicd_oracle") == 0;
+            saw_quorum |= strcmp(expanded[i], "test_quorum_oracle") == 0;
+        }
+        ASSERT(saw_api && saw_native_api && saw_stage_coin);
+        ASSERT(saw_groth && saw_zclassicd && saw_quorum);
+
+        const char *exact_ids[] = { "test_api" };
+        truncated = true;
+        ASSERT(zcl_test_group_expand_plan(
+                   exact_ids, 1, expanded,
+                   sizeof(expanded) / sizeof(expanded[0]), &truncated) == 1);
+        ASSERT(!truncated);
+        ASSERT(strcmp(expanded[0], "test_api") == 0);
+
+        char one[1][ZCL_TEST_GROUP_FULL_MAX];
+        truncated = false;
+        ASSERT(zcl_test_group_expand_plan(ids, 3, one, 1, &truncated) == 10);
+        ASSERT(truncated);
+        const char *invalid[] = { "api_missing" };
+        ASSERT(zcl_test_group_expand_plan(invalid, 1, one, 1, &truncated) ==
+               SIZE_MAX);
+
+        const char *lint_ids[] = { "make_lint_gates" };
+        char immediate[32][ZCL_TEST_GROUP_FULL_MAX];
+        truncated = true;
+        size_t immediate_total = zcl_test_group_expand_plan_immediate(
+            lint_ids, 1, immediate,
+            sizeof(immediate) / sizeof(immediate[0]), &truncated);
+        ASSERT(immediate_total == 0);
+        ASSERT(!truncated);
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_make_lint_gates_heavy_01"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_make_lint_gates_heavy_02"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_make_lint_gates_heavy_03"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_make_lint_gates_shard_01"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_shielded_payment_gate"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_event_log_kill9"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_event_log_benchmark"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_kill9_recovery"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_chain_advance_atomicity"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_reducer_block_ingest_gate"));
+        ASSERT(zcl_test_group_is_integration_only("test_store_e2e_gate"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_store_e2e_shielded"));
+        ASSERT(zcl_test_group_is_integration_only(
+            "test_self_folded_anchor_heavy"));
+        ASSERT(!zcl_test_group_is_integration_only("test_event_log"));
+        ASSERT(zcl_test_group_proof_contracts_valid());
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_shielded_payment_gate") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_shielded_receive_persist") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_shielded_receive_slice") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_shielded_spend_slice") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_kill9_recovery") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_chain_advance_atomicity") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_reducer_block_ingest_gate") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_reducer_forward_progress_gate") ==
+               ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_parity_slice") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_store_e2e_gate") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_store_e2e_shielded") == ZCL_TEST_PROOF_STRESS);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_event_log_kill9") == ZCL_TEST_PROOF_EVENT_LOG_KILL9);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_event_log_benchmark") ==
+               ZCL_TEST_PROOF_EVENT_LOG_BENCH);
+        ASSERT(zcl_test_group_proof_contract(
+                   "test_golden_dev_cycle") ==
+               ZCL_TEST_PROOF_GOLDEN_TIMING);
+        ASSERT(zcl_test_group_proof_contract("test_event_log") ==
+               ZCL_TEST_PROOF_NONE);
+        ASSERT(zcl_test_group_catalog_contains(
+            "test_zcode_score_receipt_packages"));
+        ASSERT(zcl_test_group_catalog_contains(
+            "test_zcode_score_receipt_rejections"));
+        ASSERT(zcl_test_group_catalog_contains(
+            "test_zcode_score_receipt_creation"));
+        ASSERT(zcl_test_group_catalog_contains(
+            "test_zcode_score_receipt_patronage"));
+        ASSERT(zcl_test_group_catalog_contains(
+            "test_zcode_score_receipt_reproduction"));
+        ASSERT(zcl_test_group_catalog_contains(
+            "test_zcode_score_receipt_shadow"));
+        for (size_t i = 0; i < immediate_total; i++) {
+            ASSERT(strcmp(immediate[i],
+                          "test_make_lint_gates_heavy_01") != 0);
+            ASSERT(strcmp(immediate[i],
+                          "test_make_lint_gates_heavy_02") != 0);
+            ASSERT(strcmp(immediate[i],
+                          "test_make_lint_gates_heavy_03") != 0);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_process_sensitive_groups_are_catalog_exclusive(void)
+{
+    int failures = 0;
+    TEST("process-sensitive groups are isolated without serializing catalog structure") {
+        ASSERT(zcl_test_group_catalog_contains(
+            "test_command_registry_latency"));
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_command_registry_latency"));
+        /* Constant-time comparisons are paired CPU measurements. Saturated
+         * process concurrency created a 1.250 false delta in physical CI;
+         * measure cryptographic weight sensitivity before the worker pool. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_sapling_crypto"));
+        /* ZVCS hard-gates warm status and manifest latency. Running it in
+         * the worker pool made unrelated CPU and filesystem producers turn
+         * the 20 ms contract into a scheduler-contention measurement. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_vcs_core"));
+        /* Exact push proof enables this group's wall-clock assertions, so it
+         * must finish before the worker pool can add scheduler contention. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_golden_dev_cycle"));
+        /* SIGKILL recovery carries bounded wall-clock budgets and kill
+         * windows; execute it before unrelated workers can distort either. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_kill9_recovery"));
+        /* Sandbox lint shards retain a bounded parallel lane of their own;
+         * they are not smuggled into this serial predicate. */
+        ASSERT(!zcl_test_group_requires_exclusive_run(
+            "test_make_lint_gates_shard_01"));
+        ASSERT(lint_gates_group_requires_quiet_pool(
+            "test_make_lint_gates_shard_01"));
+        ASSERT(lint_gates_group_requires_quiet_pool(
+            "test_make_lint_gates_shard_08"));
+        ASSERT(!lint_gates_group_requires_quiet_pool(
+            "test_make_lint_gates_realroot"));
+        /* This compares forced-pool and serial routing back-to-back. The
+         * worker pool must not introduce a different producer population
+         * between those two measurements. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_validate_parallel_determinism"));
+        /* The clean-vs-injected growth detector is a host-latency contract;
+         * parallel CPU/disk contention can invert its positive control. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_simnet_perf"));
+        /* The replay-canary identity fixture waits on a child/FIFO handshake.
+         * A saturated 32-worker parent can starve that child past the bounded
+         * five-second rendezvous and grade scheduler pressure as identity
+         * failure. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_replay_canary_verdict"));
+        /* Shared-pool load trips these groups' silence watchdog. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_crypto_registry"));
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_dev_platform_shard_02"));
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_dev_platform_shard_03"));
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_devagent_ticketkey"));
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_character_sheet"));
+        /* The code-index scale gate measures a load-sensitive build ratio. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_codeindex_scale"));
+        /* This group launches the current runner recursively to prove exact
+         * selection.  Competing with the 32-worker parent pool can kill the
+         * nested positive control under transient memory pressure, grading
+         * host saturation instead of selector semantics. */
+        ASSERT(zcl_test_group_requires_exclusive_run(
+            "test_test_group_selector"));
+        ASSERT(!zcl_test_group_requires_exclusive_run(
+            "test_command_registry_catalog"));
+        ASSERT(!zcl_test_group_plan_selects(
+            "command_registry_catalog", "test_command_registry_latency"));
+        ASSERT(zcl_test_group_plan_selects(
+            "command_registry_latency", "test_command_registry_latency"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Hosted-CI diagnosis: an rc assert failing deep into this test used to
+ * leave no evidence (the captured command output never made the group log).
+ * Print the command tag, both rc values, and a bounded output prefix. */
+static void dump_bad_rc(const char *tag, int rc, int expected,
+                        const char *out)
+{
+    if (rc == expected) return;
+    fprintf(stderr, "%s: rc=%d (expected %d), captured output prefix:\n",
+            tag, rc, expected);
+    fprintf(stderr, "%.4000s\n", out ? out : "(null)");
+}
+
+static bool selector_output_contains(const char *out, const char *expected)
+{
+    if (out && strstr(out, expected)) return true;
+    fprintf(stderr, "selector: missing output '%s', captured prefix:\n%.4000s\n",
+            expected, out ? out : "(null)");
+    return false;
+}
+
+/* Landing proofs start the runner with --no-cache so that no environment can
+ * re-enable verdict reuse (tools/dev/dev_proof.c, dp_test_dimension_argv).
+ * Control: ZCL_TEST_CACHE=1 alone turns the cache on, which prints its PLAN
+ * (or its fail-safe downgrade) before dispatch. With --no-cache on the
+ * command line the same environment must leave every cache path unexecuted
+ * and the group must run. */
+static int test_runner_no_cache_outranks_env(void)
+{
+    int failures = 0;
+    TEST("test group selector: --no-cache outranks ZCL_TEST_CACHE=1") {
+        static char out[1024 * 1024];
+        char exe[PATH_MAX];
+        ASSERT(os_proc_exe_path(exe, sizeof(exe)));
+        ASSERT(exe[0] != '\0');
+        char command[PATH_MAX + 320];
+        int n = snprintf(command, sizeof(command),
+                         "env ZCL_TEST_CACHE=1 \"%s\" --jobs=1 "
+                         "--exact=test_hex_codec 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        int rc = capture_command(command, out, sizeof(out));
+        dump_bad_rc("nested env cache control", rc, 0, out);
+        ASSERT(rc == 0);
+        ASSERT(strstr(out, "cache PLAN") != NULL ||
+               strstr(out, "cache probe failed") != NULL);
+        n = snprintf(command, sizeof(command),
+                     "env ZCL_TEST_CACHE=1 \"%s\" --jobs=1 "
+                     "--exact=test_hex_codec --no-cache 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command(command, out, sizeof(out));
+        dump_bad_rc("nested --no-cache over ZCL_TEST_CACHE=1", rc, 0, out);
+        ASSERT(rc == 0);
+        ASSERT(strstr(out, "cache PLAN") == NULL);
+        ASSERT(strstr(out, "cache probe failed") == NULL);
+        ASSERT(strstr(out, "SUITE VERDICT mode=cold") != NULL);
+        ASSERT(strstr(out, "groups_ran=1 groups_cached=0") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_runner_exact_selection(void)
+{
+    int failures = 0;
+    TEST("test group selector: runner exact mode executes exactly one id") {
+        /* The make -n dry run below prints the full out-of-date recipe
+         * chain, and that chain's SIZE is a property of the CHECKOUT's build
+         * state, not of the seam under test: invoked from a parent make that
+         * just built this profile's epoch chain (isolated t-fast) it is a
+         * few KB, but invoked cold — the parallel suite, which builds a
+         * different profile, or a fresh clone — every object, session, link
+         * and stamp recipe in the chain prints. Measured 12.2 MB on a cold
+         * clone of this commit, and it grows with the tree.
+         *
+         * This probe needs exactly two facts, and they sit at the two ends:
+         * the parse-time admission line is the FIRST line, and the selector
+         * actually handed to the runner is in the LAST. So capture a bounded
+         * head and a bounded tail and throw the middle away — a whole-output
+         * buffer is a race against the source tree that the tree wins. An
+         * earlier revision sized that buffer at 8 MiB against a claimed
+         * ~2 MB worst case; the cold measurement above is 1.5x past it, and
+         * the truncation would have silently dropped the tail assertion. */
+        static char head[64 * 1024];
+        static char tail[64 * 1024];
+        /* The nested-runner captures below still need the WHOLE output —
+         * --source-id/--source-record are compared exactly. Their size is
+         * bounded by one test group's own logging, not by the source tree,
+         * so a fixed buffer is honest here in a way it was not above. */
+        static char out[1024 * 1024];
+        char exe[PATH_MAX];
+        ASSERT(os_proc_exe_path(exe, sizeof(exe)));
+        ASSERT(exe[0] != '\0');
+        char command[PATH_MAX + 320];
+        int n = snprintf(command, sizeof(command),
+                         "\"%s\" --jobs=1 --exact=test_hex_codec "
+                         "--no-cache 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        int rc = capture_command(command, out, sizeof(out));
+        if (rc != 0)
+            fprintf(stderr, "nested exact positive control:\n%s\n", out);
+        ASSERT(rc == 0);
+        ASSERT(strstr(out, "groups_ran=1") != NULL);
+        ASSERT(strstr(out, "groups_failed=0") != NULL);
+        ASSERT(strstr(out, "\"schema\":\"zcl.test_phase_receipt.v1\"") !=
+               NULL);
+        ASSERT(strstr(out, "\"startup_ms\":") != NULL);
+        ASSERT(strstr(out, "\"test_body_ms\":") != NULL);
+
+        struct json_value timing = {0};
+        ASSERT(selector_timing_read(&timing));
+        ASSERT(selector_timing_zero(&timing, "self_skips"));
+        ASSERT(selector_timing_zero(&timing, "env_unobserved"));
+        ASSERT(selector_timing_zero(&timing, "load_flaky"));
+        ASSERT(selector_timing_hex_key(json_get(&timing, "toolkey_full")));
+        const struct json_value *module = json_get(&timing,
+                                                   "hotswap_module_active");
+        ASSERT(module && module->type == JSON_BOOL && !json_get_bool(module));
+        ASSERT(json_get(&timing, "hotswap_module_sha256") &&
+               json_is_null(json_get(&timing, "hotswap_module_sha256")));
+        ASSERT(json_get(&timing, "hotswap_module_source") &&
+               json_is_null(json_get(&timing, "hotswap_module_source")));
+        const struct json_value *timing_rows = json_get(&timing, "groups");
+        ASSERT(timing_rows && timing_rows->type == JSON_ARR &&
+               json_size(timing_rows) == 1);
+        const struct json_value *timing_row = json_at(timing_rows, 0);
+        ASSERT(strcmp(json_get_str(json_get(timing_row, "name")),
+                      "test_hex_codec") == 0);
+        ASSERT(json_get_bool(json_get(timing_row, "measured")));
+        const struct json_value *key_valid = json_get(timing_row, "key_valid");
+        ASSERT(key_valid && key_valid->type == JSON_BOOL &&
+               !json_get_bool(key_valid));
+        ASSERT(json_get(timing_row, "input_key") &&
+               json_is_null(json_get(timing_row, "input_key")));
+        ASSERT(selector_timing_zero(timing_row, "proof_contract"));
+        ASSERT(selector_timing_zero(timing_row, "skip_markers"));
+        ASSERT(selector_timing_zero(timing_row, "env_unobserved"));
+        ASSERT(selector_timing_zero(timing_row, "load_flaky"));
+        json_free(&timing);
+
+        n = snprintf(command, sizeof(command), "\"%s\" --source-id 2>&1",
+                     exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command(command, out, sizeof(out));
+        dump_bad_rc("nested --source-id", rc, 0, out);
+        ASSERT(rc == 0);
+        char expected_source[80];
+        ASSERT(snprintf(expected_source, sizeof(expected_source), "%s\n",
+                        zcl_build_source_id_sha256()) == 65);
+        ASSERT(strcmp(out, expected_source) == 0);
+
+        n = snprintf(command, sizeof(command),
+                     "\"%s\" --source-record 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command(command, out, sizeof(out));
+        dump_bad_rc("nested --source-record", rc, 0, out);
+        ASSERT(rc == 0);
+        char expected_record[160];
+        ASSERT(snprintf(expected_record, sizeof(expected_record),
+                        "%s 1 %s\n", zcl_build_source_id_sha256(),
+                        zcl_build_source_mutation_sha256()) == 132);
+        ASSERT(strcmp(out, expected_record) == 0);
+
+        n = snprintf(command, sizeof(command),
+                     "\"%s\" --source-id --list 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command(command, out, sizeof(out));
+        ASSERT(rc == 2);
+        ASSERT(strstr(out, "Usage:") != NULL);
+
+        n = snprintf(command, sizeof(command),
+                     "\"%s\" --jobs=1 "
+                     "--exact=test_hex_codec,test_byte_order_codec "
+                     "--no-cache 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command(command, out, sizeof(out));
+        dump_bad_rc("nested exact two-id", rc, 0, out);
+        ASSERT(rc == 0);
+        ASSERT(strstr(out, "groups_ran=2") != NULL);
+        ASSERT(strstr(out, "groups_failed=0") != NULL);
+
+        /* Exercise the runner's proof-contract/cache boundary with the
+         * smallest real STRESS-contract group.  The contract dispatch is the
+         * behavior under test here; recursively running the roughly
+         * 100-second reducer forward-progress acceptance twice only tested
+         * that unrelated product behavior twice and dominated every exact
+         * selector proof. */
+        ASSERT(zcl_test_group_proof_contract("test_store_e2e_gate") ==
+               ZCL_TEST_PROOF_STRESS);
+        n = snprintf(command, sizeof(command),
+                     "\"%s\" --jobs=1 "
+                     "--exact=test_store_e2e_gate "
+                     "--activate-proof-contracts --cache 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        char first_proof_key[65] = {0};
+        for (int proof_run = 0; proof_run < 2; proof_run++) {
+            rc = capture_command(command, out, sizeof(out));
+            dump_bad_rc("nested proof-contract activation", rc, 0, out);
+            ASSERT(rc == 0);
+            ASSERT(strstr(out,
+                          "proof contract "
+                          "group=test_store_e2e_gate "
+                          "env=ZCL_STRESS_TESTS") != NULL);
+            ASSERT(selector_output_contains(out, "active-proof-contract"));
+            ASSERT(strstr(out, "cache PLAN — 0 cacheable, 0 cache HIT") !=
+                   NULL);
+            ASSERT(strstr(out, "groups_ran=1 groups_cached=0") != NULL);
+            ASSERT(strstr(out, "groups_failed=0 self_skips=0") != NULL);
+            ASSERT(selector_timing_read(&timing));
+            timing_rows = json_get(&timing, "groups");
+            ASSERT(timing_rows && json_size(timing_rows) == 1);
+            timing_row = json_at(timing_rows, 0);
+            ASSERT(json_get_bool(json_get(timing_row, "measured")));
+            ASSERT(!json_get_bool(json_get(timing_row, "cached")));
+            ASSERT(json_get_int(json_get(timing_row, "proof_contract")) ==
+                   ZCL_TEST_PROOF_STRESS);
+            ASSERT(json_get_bool(json_get(timing_row, "key_valid")));
+            ASSERT(selector_timing_hex_key(json_get(timing_row, "input_key")));
+            const char *key = json_get_str(json_get(timing_row, "input_key"));
+            if (proof_run == 0)
+                memcpy(first_proof_key, key, sizeof(first_proof_key));
+            else
+                ASSERT(strcmp(first_proof_key, key) == 0);
+            ASSERT(selector_timing_zero(timing_row, "skip_markers"));
+            ASSERT(selector_timing_zero(timing_row, "env_unobserved"));
+            json_free(&timing);
+        }
+
+        n = snprintf(command, sizeof(command),
+                     "env -u ZCL_STRESS_TESTS \"%s\" --jobs=1 "
+                     "--exact=test_store_e2e_gate --no-cache 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command(command, out, sizeof(out));
+        ASSERT(rc == 0);
+        ASSERT(strstr(out, "self_skips=1") != NULL);
+        ASSERT(selector_timing_read(&timing));
+        ASSERT(json_get_int(json_get(&timing, "self_skips")) == 1);
+        timing_row = json_at(json_get(&timing, "groups"), 0);
+        ASSERT(json_get_int(json_get(timing_row, "skip_markers")) > 0);
+        ASSERT(json_get_bool(json_get(timing_row, "measured")));
+        ASSERT(selector_timing_zero(timing_row, "rc"));
+        ASSERT(selector_timing_zero(timing_row, "proof_contract"));
+        json_free(&timing);
+
+        n = snprintf(command, sizeof(command),
+                     "\"%s\" --activate-proof-contracts --no-cache 2>&1",
+                     exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command(command, out, sizeof(out));
+        ASSERT(rc == 2);
+        ASSERT(strstr(out,
+                      "--activate-proof-contracts requires an exact selector")
+               != NULL);
+
+        /* "test_api" is a valid exact id. Bare "api" is deliberately not:
+         * accepting it here would restore the substring false-green. */
+        n = snprintf(command, sizeof(command),
+                     "\"%s\" --jobs=1 --exact=api --no-cache 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command(command, out, sizeof(out));
+        ASSERT(rc == 2);
+        ASSERT(strstr(out, "--exact contains no registered group: api") !=
+               NULL);
+
+        n = snprintf(command, sizeof(command),
+                     "\"%s\" --jobs=1 "
+                     "--exact=test_hex_codec,api --no-cache 2>&1", exe);
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command(command, out, sizeof(out));
+        ASSERT(rc == 2);
+        ASSERT(strstr(out, "--exact contains no registered group: api") !=
+               NULL);
+
+        /* Exercise the Make admission seam without running its recipe (and
+         * therefore without recursively acquiring the checkout lock). */
+        n = snprintf(command, sizeof(command),
+                     "make -n t-fast-exact ONLY=api "
+                     "TEST_PARALLEL_ARGS= "
+                     "TEST_PARALLEL_FAST_CANDIDATE=/bin/true "
+                     "TEST_PARALLEL_FAST_ACTIVE=/bin/true "
+                     "BUILD_SOURCE_RECORD='%s 1 %s' 2>&1",
+                     zcl_build_source_id_sha256(),
+                     zcl_build_source_mutation_sha256());
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        rc = capture_command_ends(command, head, sizeof(head), tail,
+                                  sizeof(tail));
+        dump_bad_rc("make -n t-fast-exact ONLY=api (head)", rc, 0, head);
+        dump_bad_rc("make -n t-fast-exact ONLY=api (tail)", rc, 0, tail);
+        ASSERT(rc == 0);
+        ASSERT(strstr(head, "resolves to exact set test_api") != NULL);
+        ASSERT(strstr(tail, "--exact=test_api") != NULL);
+
+        n = snprintf(command, sizeof(command),
+                     "make -n t-fast-exact ONLY=api_missing "
+                     "TEST_PARALLEL_ARGS= "
+                     "TEST_PARALLEL_FAST_CANDIDATE=/bin/true "
+                     "TEST_PARALLEL_FAST_ACTIVE=/bin/true "
+                     "BUILD_SOURCE_RECORD='%s 1 %s' 2>&1",
+                     zcl_build_source_id_sha256(),
+                     zcl_build_source_mutation_sha256());
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        /* The refusal is a parse-time $(error): make stops before printing
+         * any recipe, so this leg is small and the head alone carries it. */
+        rc = capture_command_ends(command, head, sizeof(head), tail,
+                                  sizeof(tail));
+        ASSERT(rc == 2);
+        ASSERT(strstr(head, "ONLY='api_missing' is not a valid exact registered group set") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── Longest-expected-first dispatch ───────────────────────────────────── */
+
+enum { TGS_WEIGHT_ROWS = 4096 };
+
+static size_t tgs_catalog_index(const char *full_id)
+{
+    for (size_t i = 0; i < zcl_test_group_catalog_count(); i++)
+        if (strcmp(zcl_test_group_catalog_at(i), full_id) == 0)
+            return i;
+    return SIZE_MAX;
+}
+
+static bool tgs_write_file(const char *path, const char *text)
+{
+    FILE *fp = fopen(path, "wb");
+    if (!fp)
+        return false;
+    bool ok = fputs(text, fp) >= 0;
+    return fclose(fp) == 0 && ok;
+}
+
+/* Test targets default to parallel prerequisite builds. A caller's -j reaches
+ * the recursive make through MAKEFLAGS, so the recursive line must carry a
+ * default -j only when make got none, and never a second one. */
+static int test_exact_default_parallel_jobs(void)
+{
+    int failures = 0;
+    TEST("t-fast-exact recursion defaults to -j only when make got no -j") {
+        char command[1024], line[512];
+        int n = snprintf(command, sizeof(command),
+            "env -u MAKEFLAGS -u MFLAGS make -n t-fast-exact ONLY=api "
+            "TEST_PARALLEL_ARGS= TEST_PARALLEL_FAST_CANDIDATE=/bin/true "
+            "TEST_PARALLEL_FAST_ACTIVE=/bin/true "
+            "BUILD_SOURCE_RECORD='%s 1 %s' 2>&1 | "
+            "grep 'make --no-print-directory.*t-fast-exact-locked'",
+            zcl_build_source_id_sha256(), zcl_build_source_mutation_sha256());
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        ASSERT(capture_command(command, line, sizeof(line)) == 0);
+        ASSERT(strstr(line, "--no-print-directory -j") != NULL);
+
+        n = snprintf(command, sizeof(command),
+            "env -u MAKEFLAGS -u MFLAGS make -n -j3 t-fast-exact ONLY=api "
+            "TEST_PARALLEL_ARGS= TEST_PARALLEL_FAST_CANDIDATE=/bin/true "
+            "TEST_PARALLEL_FAST_ACTIVE=/bin/true "
+            "BUILD_SOURCE_RECORD='%s 1 %s' 2>&1 | "
+            "grep 'make --no-print-directory.*t-fast-exact-locked'",
+            zcl_build_source_id_sha256(), zcl_build_source_mutation_sha256());
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        ASSERT(capture_command(command, line, sizeof(line)) == 0);
+        ASSERT(strstr(line, "t-fast-exact-locked") != NULL);
+        ASSERT(strstr(line, "-j") == NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_exact_verifier_prerequisites(void)
+{
+    int failures = 0;
+    TEST("exact storage selection avoids verifier; consumer ensure honors platform support") {
+        char command[4096], out[4096], root[256], stamp[320], fresh[160];
+#if defined(_WIN32)
+        /* No qualified package verifier: Make deliberately does no work. */
+        const int rebuild_rc = 0;
+#else
+        /* A supported host must rebuild stale/missing helpers or refuse. */
+        const int rebuild_rc = 2;
+#endif
+        /* Inspect the database through the help query goal. Naming an
+         * internal locked goal refuses in a native proof without an inherited
+         * checkout lock; naming its public goal can execute recursive makes
+         * even under -q. Neither is needed to inspect this prerequisite row. */
+        int n = snprintf(command, sizeof(command),
+            "env -u ZCL_CHECKOUT_LOCK_HELD make --no-print-directory -qp help "
+            "EXACT_ONLY_MATCHED=test_zcode_store "
+            "TEST_PARALLEL_FAST_CANDIDATE=/bin/true "
+            "BUILD_SOURCE_RECORD='%s 1 %s' 2>/dev/null | "
+            "sed -n '/^t-fast-exact-locked: /p'",
+            zcl_build_source_id_sha256(), zcl_build_source_mutation_sha256());
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        ASSERT(capture_command(command, out, sizeof(out)) == 0);
+        ASSERT(strstr(out, "t-fast-exact-locked:") != NULL);
+        ASSERT(strstr(out, "dev-package-verifier-ensure") == NULL);
+
+        test_make_tmpdir(root, sizeof(root), "test_group_selector", "verifier_ensure");
+        n = snprintf(stamp, sizeof(stamp), "%s/ready", root);
+        ASSERT(n > 0 && (size_t)n < sizeof(stamp));
+        n = snprintf(fresh, sizeof(fresh), "%s 1 %s\n",
+            zcl_build_source_id_sha256(), zcl_build_source_mutation_sha256());
+        ASSERT(n > 0 && (size_t)n < sizeof(fresh));
+        ASSERT(tgs_write_file(stamp, fresh));
+        n = snprintf(command, sizeof(command),
+            "make --no-print-directory dev-package-verifier-ensure "
+            "DEV_PACKAGE_VERIFY_BIN=/bin/true DEV_PACKAGE_VERIFY_ENSURE_STAMP='%s' "
+            "MAKE=/bin/false BUILD_SOURCE_RECORD='%s 1 %s' 2>&1",
+            stamp, zcl_build_source_id_sha256(), zcl_build_source_mutation_sha256());
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        ASSERT(capture_command(command, out, sizeof(out)) == 0);
+        ASSERT(tgs_write_file(stamp, "stale source identity\n"));
+        ASSERT(capture_command(command, out, sizeof(out)) == rebuild_rc);
+        ASSERT(tgs_write_file(stamp, fresh));
+        n = snprintf(command, sizeof(command),
+            "make --no-print-directory dev-package-verifier-ensure "
+            "DEV_PACKAGE_VERIFY_BIN='%s/missing' DEV_PACKAGE_VERIFY_ENSURE_STAMP='%s' "
+            "MAKE=/bin/false BUILD_SOURCE_RECORD='%s 1 %s' 2>&1",
+            root, stamp, zcl_build_source_id_sha256(), zcl_build_source_mutation_sha256());
+        ASSERT(n > 0 && (size_t)n < sizeof(command));
+        ASSERT(capture_command(command, out, sizeof(out)) == rebuild_rc);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Offset of the runner's verbose "[dispatch] ... <name>" line, or SIZE_MAX.
+ * Only dispatch lines count: the replayed transcript and the [done] lines
+ * name the same groups in other orders. */
+static size_t tgs_dispatch_pos(const char *out, const char *name)
+{
+    size_t name_len = strlen(name);
+    for (const char *line = out; line && *line;) {
+        const char *end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        if (strncmp(line, "[dispatch", 9) == 0 && len > name_len &&
+            line[len - name_len - 1] == ' ' &&
+            memcmp(line + len - name_len, name, name_len) == 0)
+            return (size_t)(line - out);
+        line = end ? end + 1 : NULL;
+    }
+    return SIZE_MAX;
+}
+
+static int test_dispatch_order_pure(void)
+{
+    int failures = 0;
+    TEST("dispatch order: longest-expected-first, stable ties, zeros keep catalog order") {
+        const unsigned w[] = {0, 5, 0, 90, 5, 65};
+        const size_t want[] = {3, 5, 1, 4, 0, 2};
+        size_t order[6];
+        zcl_test_group_order_longest_first(w, 6, order);
+        for (size_t i = 0; i < 6; i++)
+            ASSERT_EQ(order[i], want[i]);
+        const unsigned zeros[4] = {0};
+        zcl_test_group_order_longest_first(zeros, 4, order);
+        for (size_t i = 0; i < 4; i++)
+            ASSERT_EQ(order[i], i);
+        zcl_test_group_order_longest_first(NULL, 4, order);
+        for (size_t i = 0; i < 4; i++)
+            ASSERT_EQ(order[i], i);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_dispatch_weights_framing(void)
+{
+    int failures = 0;
+    TEST("dispatch weights: NUL row cannot drain next row or hide suffix") {
+        static unsigned w[TGS_WEIGHT_ROWS];
+        static const char bytes[] =
+            "x\0\n"
+            "test_chain\t7\n"
+            "test_chain\t8\rjunk\n"
+            "test_chain\t9\0junk";
+        size_t n = zcl_test_group_catalog_count();
+        ASSERT(n > 0 && n <= TGS_WEIGHT_ROWS);
+        char root[PATH_MAX], path[PATH_MAX + 32];
+        test_make_tmpdir(root, sizeof(root), "tgs_weights", "framing");
+        int len = snprintf(path, sizeof(path), "%s/weights.tsv", root);
+        ASSERT(len > 0 && (size_t)len < sizeof(path));
+        FILE *fp = fopen(path, "wb");
+        ASSERT(fp != NULL);
+        size_t written = fwrite(bytes, 1, sizeof(bytes) - 1, fp);
+        int closed = fclose(fp);
+        ASSERT_EQ(written, sizeof(bytes) - 1);
+        ASSERT_EQ(closed, 0);
+        ASSERT_EQ(zcl_test_group_weights_read(path, w, n), (size_t)1);
+        ASSERT_EQ(w[tgs_catalog_index("test_chain")], 7u);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_dispatch_weights_read(void)
+{
+    int failures = 0;
+    TEST("dispatch weights: malformed, unknown, missing rows weigh 0; last duplicate wins") {
+        static unsigned w[TGS_WEIGHT_ROWS];
+        static char text[1024];
+        size_t n = zcl_test_group_catalog_count();
+        ASSERT(n > 0 && n <= TGS_WEIGHT_ROWS);
+        char root[PATH_MAX], path[PATH_MAX + 32];
+        test_make_tmpdir(root, sizeof(root), "tgs_weights", "read");
+        int len = snprintf(path, sizeof(path), "%s/weights.tsv", root);
+        ASSERT(len > 0 && (size_t)len < sizeof(path));
+        char overlong[301];
+        memset(overlong, 'x', 300);
+        overlong[300] = '\0';
+        len = snprintf(text, sizeof(text),
+                       "# comment\ttest_hex_codec\t40\n"
+                       "test_codec_cursor\t9\n"
+                       "test_no_such_group_zz\t50\n"
+                       "test_hex_codec\tabc\n"
+                       "test_byte_order_codec\t12x\n"
+                       "\t30\n"
+                       "test_determinism\t99999999\n"
+                       "%s\t7\n"
+                       "test_base_foundation\t3\n"
+                       "test_base_foundation\t4\r\n"
+                       "test_chain\t7", overlong);
+        ASSERT(len > 0 && (size_t)len < sizeof(text));
+        ASSERT(tgs_write_file(path, text));
+        ASSERT_EQ(zcl_test_group_weights_read(path, w, n), (size_t)4);
+        ASSERT_EQ(w[tgs_catalog_index("test_codec_cursor")], 9u);
+        ASSERT_EQ(w[tgs_catalog_index("test_base_foundation")], 4u);
+        ASSERT_EQ(w[tgs_catalog_index("test_chain")], 7u);
+        ASSERT_EQ(w[tgs_catalog_index("test_hex_codec")], 0u);
+        ASSERT_EQ(w[tgs_catalog_index("test_byte_order_codec")], 0u);
+        ASSERT_EQ(w[tgs_catalog_index("test_determinism")], 0u);
+        /* A table that is not the catalog's shape is never indexed. */
+        ASSERT_EQ(zcl_test_group_weights_read(path, w, n - 1), (size_t)0);
+        ASSERT_EQ(w[tgs_catalog_index("test_codec_cursor")], 0u);
+        ASSERT(snprintf(path, sizeof(path), "%s/absent.tsv", root) > 0);
+        ASSERT_EQ(zcl_test_group_weights_read(path, w, n), (size_t)0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Run the real runner from a scratch cwd whose tools/dev/ holds `weights`
+ * (NULL = no weights file) over two cheap groups on one worker, so dispatch
+ * order is observable in its verbose transcript. */
+static int tgs_run_weighted(const char *root, const char *weights, char *out,
+                            size_t cap)
+{
+    char dir[PATH_MAX + 32], path[PATH_MAX + 64], exe[PATH_MAX];
+    char command[3 * PATH_MAX];
+    if (snprintf(dir, sizeof(dir), "%s/tools", root) <= 0 ||
+        (mkdir(dir, 0755) != 0 && errno != EEXIST) ||
+        snprintf(dir, sizeof(dir), "%s/tools/dev", root) <= 0 ||
+        (mkdir(dir, 0755) != 0 && errno != EEXIST) ||
+        snprintf(path, sizeof(path), "%s/test_group_weights.tsv", dir) <= 0)
+        return -1;
+    (void)remove(path);
+    if ((weights && !tgs_write_file(path, weights)) ||
+        !os_proc_exe_path(exe, sizeof(exe)))
+        return -1;
+    int n = snprintf(command, sizeof(command),
+                     "cd \"%s\" && \"%s\" --jobs=1 --verbose --no-cache "
+                     "--exact=test_hex_codec,test_codec_cursor 2>&1",
+                     root, exe);
+    if (n <= 0 || (size_t)n >= sizeof(command))
+        return -1;
+    return capture_command(command, out, cap);
+}
+
+static int test_runner_dispatches_longest_first(void)
+{
+    int failures = 0;
+    TEST("runner: tracked weights dispatch longest-first; no weights keep catalog order") {
+        static char out[1024 * 1024];
+        char root[PATH_MAX];
+        test_make_tmpdir(root, sizeof(root), "tgs_weights", "runner");
+        /* Control: no weights file, catalog order (hex_codec is row 0). */
+        int rc = tgs_run_weighted(root, NULL, out, sizeof(out));
+        dump_bad_rc("unweighted runner", rc, 0, out);
+        ASSERT(rc == 0);
+        size_t hex = tgs_dispatch_pos(out, "test_hex_codec");
+        size_t cursor = tgs_dispatch_pos(out, "test_codec_cursor");
+        ASSERT(hex != SIZE_MAX && cursor != SIZE_MAX);
+        ASSERT(hex < cursor);
+        /* Weighted: the later, heavier row goes first. Garbage rows around
+         * it weigh 0 and never fail the run. */
+        rc = tgs_run_weighted(root,
+                              "# weights\nnot a row\ntest_hex_codec\t-1\n"
+                              "test_unknown_zz\t99\ntest_codec_cursor\t9\n",
+                              out, sizeof(out));
+        dump_bad_rc("weighted runner", rc, 0, out);
+        ASSERT(rc == 0);
+        ASSERT(selector_output_contains(out, "groups_failed=0"));
+        hex = tgs_dispatch_pos(out, "test_hex_codec");
+        cursor = tgs_dispatch_pos(out, "test_codec_cursor");
+        ASSERT(hex != SIZE_MAX && cursor != SIZE_MAX);
+        ASSERT(cursor < hex);
+        /* Only malformed rows: catalog order again. */
+        rc = tgs_run_weighted(root, "test_codec_cursor 9\n\x01\t\t\n",
+                              out, sizeof(out));
+        dump_bad_rc("malformed-weights runner", rc, 0, out);
+        ASSERT(rc == 0);
+        hex = tgs_dispatch_pos(out, "test_hex_codec");
+        cursor = tgs_dispatch_pos(out, "test_codec_cursor");
+        ASSERT(hex != SIZE_MAX && cursor != SIZE_MAX);
+        ASSERT(hex < cursor);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_runner_build_needs_selection(void)
+{
+    int failures = 0;
+    TEST("runner build needs distinguish invalid selection from no needs") {
+        char exe[PATH_MAX], command[PATH_MAX + 128], out[512];
+        ASSERT(os_proc_exe_path(exe, sizeof(exe)));
+        ASSERT(strpbrk(exe, "'\r\n") == NULL);
+        const struct {
+            const char *selector;
+            int status;
+            const char *stdout_text;
+        } cases[] = {
+            {"--only=test_jsonqq", 2, ""},
+            {"--only=", 2, ""},
+            {"--exact=test_jsonq,test_jsonqq", 2, ""},
+            {"--only=test_jsonq", 0, "jsonq build/bin/jsonq\n"},
+            {"--only=test_hex_codec", 0, ""},
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            int n = snprintf(command, sizeof(command),
+                             "'%s' --list-build-needs %s", exe,
+                             cases[i].selector);
+            ASSERT(n > 0 && (size_t)n < sizeof(command));
+            ASSERT_EQ(capture_command(command, out, sizeof(out)),
+                      cases[i].status);
+            ASSERT_STR_EQ(out, cases[i].stdout_text);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_compile_scope_proof(void)
+{
+    int failures = 0;
+    TEST("compile scope proof narrows one complete TU and keeps refusals") {
+        char out[512];
+        int rc = capture_command("tools/agent_fast_ci.sh compile-scope-selftest",
+                                 out, sizeof(out));
+        ASSERT_EQ(rc, 0);
+        ASSERT(strstr(out, "affected_translation_units") != NULL ||
+               strstr(out, "PASS compile-scope-selftest affected") != NULL);
+        ASSERT(strstr(out, "proof_observation_conflict") != NULL);
+        ASSERT(strstr(out, "closure_incomplete") != NULL);
+        ASSERT(strstr(out, "missing_receipt") != NULL);
+        ASSERT(strstr(out, "verify_record_recipes=0") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* build/test-verdict.json renderer (test_verdict_json.h): exact bytes for the
+ * zero, two, over-cap and quote-bearing cases the verdict file must hold. */
+static struct test_verdict_doc verdict_doc_base(void)
+{
+    struct test_verdict_doc doc = {
+        .mode = "cold", .groups_total = 3, .groups_ran = 3,
+        .groups_cached = 0, .groups_failed = 0,
+        .failed_names = NULL, .failed_names_count = 0,
+        .toolkey = "abc123", .devbuild_lane = NULL, .ended_unix = 1234,
+    };
+    return doc;
+}
+
+/* One TEST per function: ASSERT jumps to a fixed _test_next label. */
+static int test_verdict_json_zero_failures(void)
+{
+    int failures = 0;
+    struct test_verdict_doc doc = verdict_doc_base();
+    TEST("test verdict json: zero failures, null lane, empty list") {
+        char out[1024];
+        ASSERT(test_verdict_json_format(out, sizeof(out), &doc) > 0);
+        ASSERT_STR_EQ(out,
+            "{\"schema\":\"zcl.test_verdict.v1\",\"mode\":\"cold\","
+            "\"groups_total\":3,\"groups_ran\":3,\"groups_cached\":0,"
+            "\"groups_failed\":0,\"failed_groups\":[],"
+            "\"failed_groups_truncated\":false,\"toolkey\":\"abc123\","
+            "\"devbuild_lane\":null,\"ended_unix\":1234}\n");
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_verdict_json_two_failures(void)
+{
+    int failures = 0;
+    struct test_verdict_doc doc = verdict_doc_base();
+    TEST("test verdict json: two failures and a lane name") {
+        const char *names[] = { "alpha", "beta" };
+        struct test_verdict_doc two = doc;
+        two.groups_failed = 2;
+        two.failed_names = names;
+        two.failed_names_count = 2;
+        two.devbuild_lane = "z23-lane-a";
+        char out[1024];
+        ASSERT(test_verdict_json_format(out, sizeof(out), &two) > 0);
+        ASSERT_STR_EQ(out,
+            "{\"schema\":\"zcl.test_verdict.v1\",\"mode\":\"cold\","
+            "\"groups_total\":3,\"groups_ran\":3,\"groups_cached\":0,"
+            "\"groups_failed\":2,\"failed_groups\":[\"alpha\",\"beta\"],"
+            "\"failed_groups_truncated\":false,\"toolkey\":\"abc123\","
+            "\"devbuild_lane\":\"z23-lane-a\",\"ended_unix\":1234}\n");
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_verdict_json_over_cap(void)
+{
+    int failures = 0;
+    struct test_verdict_doc doc = verdict_doc_base();
+    TEST("test verdict json: 70 failures keep 64 names and set truncated") {
+        char names_buf[70][8];
+        const char *names[70];
+        for (size_t i = 0; i < 70; i++) {
+            (void)snprintf(names_buf[i], sizeof(names_buf[i]), "g%02zu", i);
+            names[i] = names_buf[i];
+        }
+        struct test_verdict_doc many = doc;
+        many.groups_failed = 70;
+        many.failed_names = names;
+        many.failed_names_count = 70;
+        static char out[8192];
+        ASSERT(test_verdict_json_format(out, sizeof(out), &many) > 0);
+        ASSERT(strstr(out, "\"groups_failed\":70,") != NULL);
+        ASSERT(strstr(out, "\"g00\",\"g01\"") != NULL);
+        ASSERT(strstr(out, "\"g63\"],\"failed_groups_truncated\":true") != NULL);
+        ASSERT(strstr(out, "\"g64\"") == NULL);
+        ASSERT(strstr(out, "\"failed_groups_truncated\":false") == NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_verdict_json_quoted_name(void)
+{
+    int failures = 0;
+    struct test_verdict_doc doc = verdict_doc_base();
+    TEST("test verdict json: quote and backslash in a name are escaped") {
+        const char *names[] = { "a\"b\\c" };
+        struct test_verdict_doc quoted = doc;
+        quoted.groups_ran = 2;
+        quoted.groups_failed = 1;
+        quoted.failed_names = names;
+        quoted.failed_names_count = 1;
+        char out[1024];
+        ASSERT(test_verdict_json_format(out, sizeof(out), &quoted) > 0);
+        ASSERT_STR_EQ(out,
+            "{\"schema\":\"zcl.test_verdict.v1\",\"mode\":\"cold\","
+            "\"groups_total\":3,\"groups_ran\":2,\"groups_cached\":0,"
+            "\"groups_failed\":1,\"failed_groups\":[\"a\\\"b\\\\c\"],"
+            "\"failed_groups_truncated\":false,\"toolkey\":\"abc123\","
+            "\"devbuild_lane\":null,\"ended_unix\":1234}\n");
+        char tiny[16];
+        ASSERT(test_verdict_json_format(tiny, sizeof(tiny), &doc) == -1);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_cleanup_path_namespaces(void)
+{
+    int failures = 0;
+    TEST("cleanup refuses root and network namespaces without filesystem access") {
+        const char *refused[] = {
+            "\\\\server\\share", "\\\\server\\share\\", "//server/share",
+            "\\\\?\\UNC\\server\\share", "\\\\?\\C:\\", "\\\\.\\device",
+            "/\\server", "\\/server", "/", "C:", ".", "..",
+            "owned/.", "owned/..", "owned/.///", "owned/../",
+            "/owned/leaf/.", "/owned/leaf/..", "link/./", "C:/owned/.."
+#if defined(_WIN32)
+            , "owned\\.", "owned\\..\\", "C:.", "C:.."
+#endif
+        };
+        char normalized[768];
+        for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); ++i) {
+            errno = 0;
+            ASSERT(!test_cleanup_path(refused[i], normalized));
+            ASSERT_EQ(errno, EINVAL);
+        }
+        ASSERT(test_cleanup_path("/owned/leaf/", normalized));
+        ASSERT_STR_EQ(normalized, "/owned/leaf");
+        ASSERT(test_cleanup_path("owned/leaf", normalized));
+        ASSERT_STR_EQ(normalized, "owned/leaf");
+        ASSERT(test_cleanup_path("C:/owned/leaf/", normalized));
+        ASSERT_STR_EQ(normalized, "C:/owned/leaf");
+        const char *allowed[] = {"owned/.hidden", "owned/name.", "owned/...", "C:leaf"
+#if !defined(_WIN32)
+            , "owned\\.", "owned:.."
+#endif
+        };
+        for (size_t i = 0; i < sizeof allowed / sizeof allowed[0]; ++i) {
+            ASSERT(test_cleanup_path(allowed[i], normalized));
+            ASSERT_STR_EQ(normalized, allowed[i]);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+int test_test_group_selector(void)
+{
+    int failures = 0;
+    failures += test_exact_default_parallel_jobs();
+    failures += test_exact_verifier_prerequisites();
+    failures += test_compile_scope_proof();
+    failures += test_runner_build_needs_selection();
+    failures += test_tmpdir_recursive_cleanup();
+    failures += test_cleanup_path_namespaces();
+#if !defined(_WIN32)
+    for (int mode = 0; mode < 5; ++mode)
+        failures += test_cleanup_symlink_boundary(mode);
+#endif
+    failures += test_selector_predicate();
+    failures += test_registry_exact_resolution();
+    failures += test_exact_set_diagnostics();
+    failures += test_exact_set_mixed();
+    failures += test_exact_set_empty();
+    failures += test_exact_set_valid();
+    failures += test_exact_set_space_separator();
+    failures += test_declared_family_expansion();
+    failures += test_umbrella_groups();
+    failures += test_umbrella_runner_fold();
+    failures += test_native_catalog_resolution();
+    failures += test_process_sensitive_groups_are_catalog_exclusive();
+    failures += test_runner_exact_selection();
+    failures += test_runner_no_cache_outranks_env();
+    failures += test_dispatch_order_pure();
+    failures += test_dispatch_weights_read();
+    failures += test_dispatch_weights_framing();
+    failures += test_runner_dispatches_longest_first();
+    failures += test_assert_macros_report_where_and_what();
+    failures += test_assert_messages_name_file_line_and_values();
+    failures += test_verdict_json_zero_failures();
+    failures += test_verdict_json_two_failures();
+    failures += test_verdict_json_over_cap();
+    failures += test_verdict_json_quoted_name();
+    return failures;
+}

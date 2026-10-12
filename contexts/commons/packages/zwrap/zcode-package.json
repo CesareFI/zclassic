@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "zwrap/zwrap",
+  "semver": "0.1.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "root": "af83b6a944a42d26ad7af42e18ec0d67119bfda96c539baca0091a6a1d76b6b6",
+      "name": "zutf8/zutf8",
+      "semver": "0.1.0"
+    }
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zwrap/zwrap.h",
+    "src/zwrap.c",
+    "tests/test_zwrap.c",
+    "zcode-package.json"
+  ]
+}

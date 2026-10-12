@@ -1,0 +1,732 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * Decode one UNTRUSTED engine response.
+ *
+ * Everything this file reads came off a socket. It is not a parser so much as
+ * a series of refusals with a value at the end: each field is bounded and
+ * type-checked before it is believed, and the only two outcomes are a fully
+ * populated reply or `false` with the output zeroed. There is no partial
+ * success, because a half-decoded instruction is what a caller then acts on.
+ *
+ * The NUL check deserves its own note. The in-tree JSON parser is
+ * length-driven and will happily copy a raw 0x00 out of a string literal, but
+ * it stores strings as C strings — so the text a caller reads back is
+ * TRUNCATED at that byte, with no error anywhere. A hostile vendor could use
+ * that to show a reviewer one instruction and a machine another. Refusing the
+ * whole body is cheap and removes the class.
+ */
+
+#include "engine/engine_wire.h"
+
+#include "base/log_macros.h"
+#include "base/safe_alloc.h"
+#include "json/json.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+void engine_reply_free(struct engine_reply *r)
+{
+    if (!r)
+        return;
+    free(r->text);
+    memset(r, 0, sizeof(*r));
+}
+
+/* The bound check every entry point shares. Split out so the error text
+ * naming each refusal is written once. */
+static bool body_is_admissible(const char *body, size_t len)
+{
+    if (!body || len == 0)
+        LOG_FAIL("engine", "refusing an empty response body");
+    if (len > ENGINE_MAX_RESPONSE_BYTES)
+        LOG_FAIL("engine", "refusing a %zu-byte response: over the %u-byte cap",
+                 len, (unsigned)ENGINE_MAX_RESPONSE_BYTES);
+    if (memchr(body, 0, len) != NULL)
+        LOG_FAIL("engine",
+                 "refusing a response containing a NUL byte: it would silently "
+                 "truncate the text this harness is about to act on");
+    return true;
+}
+
+/* Copy a bounded string field, refusing rather than truncating. An engine
+ * that returns a 400-byte finish_reason is malfunctioning or probing; either
+ * way this harness does not want a quietly clipped copy of it. */
+static bool copy_bounded(const struct json_value *v, char *out, size_t out_len,
+                         const char *what)
+{
+    out[0] = '\0';
+    if (!v)
+        return true;              /* absent optional field */
+    if (v->type == JSON_NULL)
+        return true;
+    if (v->type != JSON_STR)
+        LOG_FAIL("engine", "refusing a non-string %s", what);
+    const char *s = json_get_str(v);
+    if (!s)
+        return true;
+    if (strlen(s) >= out_len)
+        LOG_FAIL("engine", "refusing an oversized %s: %zu bytes", what,
+                 strlen(s));
+    memcpy(out, s, strlen(s) + 1);
+    return true;
+}
+
+static bool copy_required_observable_text(const char *s, char *out,
+                                          size_t out_len, const char *what)
+{
+    out[0] = '\0';
+    if (!s || !s[0])
+        LOG_FAIL("engine", "refusing Grok metadata without %s", what);
+    if (strlen(s) >= out_len)
+        LOG_FAIL("engine", "refusing oversized Grok %s", what);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (*p < 0x20u || *p > 0x7eu)
+            LOG_FAIL("engine", "refusing non-printable Grok %s", what);
+    memcpy(out, s, strlen(s) + 1u);
+    return true;
+}
+
+static bool copy_required_observable(const struct json_value *v, char *out,
+                                     size_t out_len, const char *what)
+{
+    if (!v || v->type != JSON_STR) {
+        if (out && out_len != 0) out[0] = '\0';
+        LOG_FAIL("engine", "refusing Grok metadata without %s", what);
+    }
+    return copy_required_observable_text(
+        json_get_str(v), out, out_len, what);
+}
+
+static bool read_required_nonnegative(const struct json_value *obj,
+                                      const char *key, int64_t *out)
+{
+    *out = 0;
+    const struct json_value *v = json_get(obj, key);
+    if (!v || v->type != JSON_INT || json_get_int(v) < 0)
+        LOG_FAIL("engine", "refusing invalid Grok integer %s", key);
+    *out = json_get_int(v);
+    return true;
+}
+
+static bool cli_observation_from_grok(const char *body, size_t len,
+                                      struct engine_cli_observation *out)
+{
+    if (!body_is_admissible(body, len))
+        return false;
+    struct json_value root;
+    json_init(&root);
+    if (!json_read(&root, body, len)) {
+        json_free(&root);
+        LOG_FAIL("engine", "refusing malformed Grok CLI JSON");
+    }
+
+    struct engine_cli_observation tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    bool ok = false;
+    const struct json_value *usage = json_get(&root, "usage");
+    const struct json_value *models = json_get(&root, "modelUsage");
+    const struct json_value *incomplete =
+        json_get(&root, "usage_is_incomplete");
+    const struct json_value *text = json_get(&root, "text");
+    if (root.type != JSON_OBJ || !text || text->type != JSON_STR) {
+        LOG_WARN("engine", "refusing Grok JSON without observable text");
+    } else if (incomplete &&
+               (incomplete->type != JSON_BOOL || json_get_bool(incomplete))) {
+        LOG_WARN("engine", "refusing incomplete Grok usage");
+    } else if (!usage || usage->type != JSON_OBJ ||
+               !models || models->type != JSON_OBJ ||
+               json_size(models) != 1u || !models->keys ||
+               !models->keys[0] || !models->keys[0][0]) {
+        LOG_WARN("engine", "refusing incomplete Grok usage/model metadata");
+    } else {
+        const struct json_value *model_row = json_at(models, 0u);
+        int64_t model_input = 0, model_output = 0;
+        int64_t model_cache_read = 0, model_cache_create = 0;
+        int64_t model_calls = 0;
+        if (model_row && model_row->type == JSON_OBJ &&
+            copy_required_observable(json_get(&root, "sessionId"),
+                tmp.session_id, sizeof(tmp.session_id), "sessionId") &&
+            copy_required_observable(json_get(&root, "requestId"),
+                tmp.request_id, sizeof(tmp.request_id), "requestId") &&
+            copy_required_observable(json_get(&root, "stopReason"),
+                tmp.stop_reason, sizeof(tmp.stop_reason), "stopReason") &&
+            copy_required_observable_text(models->keys[0],
+                tmp.resolved_model, sizeof(tmp.resolved_model),
+                "resolved model") &&
+            read_required_nonnegative(&root, "num_turns", &tmp.turns) &&
+            read_required_nonnegative(usage, "input_tokens",
+                &tmp.input_tokens) &&
+            read_required_nonnegative(usage, "cache_read_input_tokens",
+                &tmp.cache_read_input_tokens) &&
+            read_required_nonnegative(usage, "cache_creation_input_tokens",
+                &tmp.cache_creation_input_tokens) &&
+            read_required_nonnegative(usage, "output_tokens",
+                &tmp.output_tokens) &&
+            read_required_nonnegative(usage, "reasoning_tokens",
+                &tmp.reasoning_tokens) &&
+            read_required_nonnegative(usage, "total_tokens",
+                &tmp.total_tokens) &&
+            read_required_nonnegative(model_row, "inputTokens",
+                &model_input) &&
+            read_required_nonnegative(model_row, "outputTokens",
+                &model_output) &&
+            read_required_nonnegative(model_row, "cacheReadInputTokens",
+                &model_cache_read) &&
+            read_required_nonnegative(model_row, "cacheCreationInputTokens",
+                &model_cache_create) &&
+            read_required_nonnegative(model_row, "modelCalls",
+                &model_calls)) {
+            const bool base_add_ok =
+                tmp.input_tokens <= INT64_MAX - tmp.output_tokens &&
+                tmp.cache_read_input_tokens <=
+                    INT64_MAX - tmp.cache_creation_input_tokens;
+            const int64_t uncached_total = base_add_ok
+                ? tmp.input_tokens + tmp.output_tokens : -1;
+            const int64_t cached = base_add_ok
+                ? tmp.cache_read_input_tokens +
+                  tmp.cache_creation_input_tokens : -1;
+            const bool cache_inclusive = base_add_ok &&
+                uncached_total == tmp.total_tokens &&
+                cached <= tmp.input_tokens;
+            const bool additive_ok = base_add_ok && cached >= 0 &&
+                uncached_total <= INT64_MAX - cached;
+            const bool cache_additive = additive_ok &&
+                uncached_total + cached == tmp.total_tokens;
+            if (tmp.turns > 0 &&
+                (cache_inclusive || cache_additive) &&
+                tmp.reasoning_tokens <= tmp.output_tokens &&
+                model_input == tmp.input_tokens &&
+                model_output == tmp.output_tokens &&
+                model_cache_read == tmp.cache_read_input_tokens &&
+                model_cache_create == tmp.cache_creation_input_tokens &&
+                model_calls == tmp.turns) {
+                tmp.known = true;
+                ok = true;
+            } else {
+                LOG_WARN("engine", "refusing inconsistent Grok usage totals");
+            }
+        }
+    }
+    json_free(&root);
+    if (!ok)
+        return false;
+    *out = tmp;
+    return true;
+}
+
+/* The resolved model is the modelUsage key that produced the most output. */
+static const char *claude_pick_model(const struct json_value *models)
+{
+    const char *best = NULL;
+    int64_t best_out = -1;
+    for (size_t i = 0; i < json_size(models); i++) {
+        const struct json_value *row = json_at(models, i);
+        int64_t o = 0;
+        if (!row || row->type != JSON_OBJ || !models->keys ||
+            !models->keys[i] ||
+            !read_required_nonnegative(row, "outputTokens", &o))
+            continue;
+        if (o > best_out) { best_out = o; best = models->keys[i]; }
+    }
+    return best;
+}
+
+/* Counters plus the additive total; false on a missing, negative or
+ * overflowing value. */
+static bool claude_read_counters(const struct json_value *root,
+                                 const struct json_value *usage,
+                                 struct engine_cli_observation *t)
+{
+    if (!read_required_nonnegative(root, "num_turns", &t->turns) ||
+        !read_required_nonnegative(usage, "input_tokens", &t->input_tokens) ||
+        !read_required_nonnegative(usage, "output_tokens",
+                                   &t->output_tokens) ||
+        !read_required_nonnegative(usage, "cache_read_input_tokens",
+                                   &t->cache_read_input_tokens) ||
+        !read_required_nonnegative(usage, "cache_creation_input_tokens",
+                                   &t->cache_creation_input_tokens))
+        return false;
+    const int64_t parts[] = { t->output_tokens, t->cache_read_input_tokens,
+                              t->cache_creation_input_tokens };
+    int64_t sum = t->input_tokens;
+    for (size_t i = 0; i < 3; i++) {
+        if (parts[i] > INT64_MAX - sum)
+            return false;
+        sum += parts[i];
+    }
+    if (t->turns < 1)
+        return false;
+    t->total_tokens = sum;
+    return true;
+}
+
+/* total_cost_usd is optional. Only a finite, nonnegative JSON number is a
+ * cost; anything else leaves the cost unknown rather than zero. */
+static void claude_read_cost(const struct json_value *root,
+                             struct engine_cli_observation *t)
+{
+    const struct json_value *c = json_get(root, "total_cost_usd");
+    double v = 0.0;
+    if (c && c->type == JSON_REAL)
+        v = json_get_real(c);
+    else if (c && c->type == JSON_INT)
+        v = (double)json_get_int(c);
+    else
+        return;
+    if (!isfinite(v) || v < 0.0)
+        return;
+    t->cost_usd = v;
+    t->cost_known = true;
+}
+
+/* A result that is not a clean success: typed refusal, not usage to count. */
+static bool claude_result_is_success(const struct json_value *root)
+{
+    const struct json_value *type = json_get(root, "type");
+    const struct json_value *sub = json_get(root, "subtype");
+    const struct json_value *err = json_get(root, "is_error");
+    const struct json_value *text = json_get(root, "result");
+    if (root->type != JSON_OBJ || !type || type->type != JSON_STR ||
+        strcmp(json_get_str(type), "result") != 0 ||
+        !sub || sub->type != JSON_STR || !err || err->type != JSON_BOOL)
+        LOG_FAIL("engine", "refusing Claude JSON that is not a result");
+    if (json_get_bool(err) || strcmp(json_get_str(sub), "success") != 0)
+        LOG_FAIL("engine", "Claude CLI reported a failed invocation");
+    if (!text || text->type != JSON_STR)
+        LOG_FAIL("engine", "refusing Claude JSON without result text");
+    return true;
+}
+
+/* The Claude CLI prints ONE result object. Claude reports no reasoning
+ * counter, so that field stays -1 (unreported), never 0. total_tokens is the
+ * additive sum (input + output + cache read + cache creation), a shape the
+ * dispatcher already accepts for cache-additive accounting. */
+static bool cli_observation_from_claude(const char *body, size_t len,
+                                        struct engine_cli_observation *out)
+{
+    if (!body_is_admissible(body, len))
+        return false;
+    struct json_value root;
+    json_init(&root);
+    if (!json_read(&root, body, len)) {
+        json_free(&root);
+        LOG_FAIL("engine", "refusing malformed Claude CLI JSON");
+    }
+    struct engine_cli_observation tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    bool ok = false;
+    const struct json_value *usage = json_get(&root, "usage");
+    const struct json_value *models = json_get(&root, "modelUsage");
+    if (claude_result_is_success(&root)) {
+        const char *best = NULL;
+        if (!usage || usage->type != JSON_OBJ || !models ||
+            models->type != JSON_OBJ || json_size(models) < 1u)
+            LOG_WARN("engine", "refusing incomplete Claude usage/model metadata");
+        else if ((best = claude_pick_model(models)) &&
+                 copy_required_observable(json_get(&root, "session_id"),
+                     tmp.session_id, sizeof(tmp.session_id), "session_id") &&
+                 copy_required_observable_text(best, tmp.resolved_model,
+                     sizeof(tmp.resolved_model), "resolved model") &&
+                 claude_read_counters(&root, usage, &tmp)) {
+            tmp.reasoning_tokens = -1;
+            claude_read_cost(&root, &tmp);
+            snprintf(tmp.stop_reason, sizeof(tmp.stop_reason), "%s", "success");
+            tmp.known = true;
+            ok = true;
+        }
+    }
+    json_free(&root);
+    if (!ok)
+        return false;
+    *out = tmp;
+    return true;
+}
+
+bool engine_cli_observation_parse(const struct engine_vendor *vendor,
+                                  const char *body, size_t len,
+                                  struct engine_cli_observation *out)
+{
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    if (!vendor)
+        LOG_FAIL("engine", "refusing CLI metadata without a vendor");
+    if (vendor->report_format == ENGINE_CLI_OUTPUT_PLAIN)
+        return true;
+    if (vendor->report_format == ENGINE_CLI_OUTPUT_CLAUDE_JSON)
+        return cli_observation_from_claude(body, len, out);
+    if (vendor->report_format != ENGINE_CLI_OUTPUT_GROK_JSON)
+        LOG_FAIL("engine", "refusing unknown CLI output shape");
+    return cli_observation_from_grok(body, len, out);
+}
+
+/* Usage is optional and stays optional. A vendor that omits it, or sends it
+ * with the wrong types, leaves the operator without a cost line — which is
+ * reported as unknown, not invented, and never as zero. */
+static bool read_counter(const struct json_value *object,
+                         const char *const *keys, size_t key_count,
+                         int64_t *out)
+{
+    bool found = false;
+    int64_t value = 0;
+    for (size_t i = 0; i < key_count; i++) {
+        const struct json_value *item = json_get(object, keys[i]);
+        if (!item)
+            continue;
+        if (item->type != JSON_INT || json_get_int(item) < 0)
+            return false;
+        if (found && value != json_get_int(item))
+            return false;
+        value = json_get_int(item);
+        found = true;
+    }
+    if (found) *out = value;
+    return found;
+}
+
+enum counter_state {
+    COUNTER_ABSENT,
+    COUNTER_VALID,
+    COUNTER_INVALID,
+};
+
+static enum counter_state read_counter_at(const struct json_value *object,
+                                          const char *key, int64_t *out)
+{
+    const struct json_value *item = json_get(object, key);
+    if (!item) return COUNTER_ABSENT;
+    if (item->type != JSON_INT || json_get_int(item) < 0)
+        return COUNTER_INVALID;
+    *out = json_get_int(item);
+    return COUNTER_VALID;
+}
+
+static enum counter_state read_detail_counter(const struct json_value *usage,
+                                              const char *object_key,
+                                              const char *counter_key,
+                                              int64_t *out)
+{
+    const struct json_value *details = json_get(usage, object_key);
+    if (!details) return COUNTER_ABSENT;
+    if (details->type != JSON_OBJ) return COUNTER_INVALID;
+    return read_counter_at(details, counter_key, out);
+}
+
+static bool read_counter_locations(const struct json_value *usage,
+                                   const char *direct_key,
+                                   const char *first_details,
+                                   const char *second_details,
+                                   const char *detail_key, int64_t *out)
+{
+    bool found = false;
+    int64_t value = 0;
+    int64_t candidate = 0;
+    enum counter_state state = read_counter_at(usage, direct_key, &candidate);
+    if (state == COUNTER_INVALID) return false;
+    if (state == COUNTER_VALID) {
+        value = candidate;
+        found = true;
+    }
+
+    const char *locations[] = { first_details, second_details };
+    for (size_t i = 0; i < 2 && locations[i]; i++) {
+        state = read_detail_counter(usage, locations[i], detail_key,
+                                    &candidate);
+        if (state == COUNTER_INVALID) return false;
+        if (state == COUNTER_VALID) {
+            if (found && candidate != value) return false;
+            value = candidate;
+            found = true;
+        }
+    }
+    if (found) *out = value;
+    return found;
+}
+
+static void read_usage(const struct json_value *root, struct engine_usage *u)
+{
+    memset(u, 0, sizeof(*u));
+    const struct json_value *usage = json_get(root, "usage");
+    if (!usage || usage->type != JSON_OBJ)
+        return;
+
+    static const char *const prompt[] = { "prompt_tokens", "input_tokens" };
+    static const char *const completion[] = { "completion_tokens", "output_tokens" };
+    static const char *const total[] = { "total_tokens" };
+    static const char *const cache_create[] = { "cache_creation_input_tokens" };
+    u->prompt_tokens_known = read_counter(usage,prompt,2,&u->prompt_tokens);
+    u->completion_tokens_known = read_counter(usage,completion,2,&u->completion_tokens);
+    u->total_tokens_known = read_counter(usage,total,1,&u->total_tokens);
+    u->cache_read_input_tokens_known = read_counter_locations(
+        usage,"cache_read_input_tokens","prompt_tokens_details",
+        "input_tokens_details","cached_tokens",&u->cache_read_input_tokens);
+    u->cache_creation_input_tokens_known =
+        read_counter(usage,cache_create,1,&u->cache_creation_input_tokens);
+    u->reasoning_tokens_known = read_counter_locations(
+        usage,"reasoning_tokens","completion_tokens_details",
+        "output_tokens_details","reasoning_tokens",&u->reasoning_tokens);
+    u->tokens_known = u->prompt_tokens_known && u->completion_tokens_known &&
+                      u->total_tokens_known;
+
+    /* Few vendors report money. When one does, it is reported verbatim; when
+     * none does, the operator is told the cost is unknown rather than free. */
+    static const char *const k_cost[] = { "cost", "total_cost", "cost_usd" };
+    for (size_t i = 0; i < sizeof(k_cost) / sizeof(k_cost[0]); i++) {
+        const struct json_value *c = json_get(usage, k_cost[i]);
+        if (!c)
+            continue;
+        if (c->type == JSON_REAL)
+            u->cost_usd = json_get_real(c);
+        else if (c->type == JSON_INT)
+            u->cost_usd = (double)json_get_int(c);
+        else
+            continue;
+        if (u->cost_usd >= 0.0)
+            u->cost_known = true;
+    }
+}
+
+/* Pull choices[0].message.content out of an already-parsed root. Every step
+ * is a refusal point; none of them tolerates a wrong type. */
+static bool read_text(const struct json_value *root, struct engine_reply *out)
+{
+    const struct json_value *choices = json_get(root, "choices");
+    if (!choices || choices->type != JSON_ARR)
+        LOG_FAIL("engine", "refusing a response with no `choices` array");
+    if (json_size(choices) == 0)
+        LOG_FAIL("engine", "refusing a response with zero choices");
+    if (json_size(choices) > ENGINE_MAX_CHOICES)
+        LOG_FAIL("engine", "refusing a response with %zu choices: over the cap",
+                 json_size(choices));
+
+    const struct json_value *choice = json_at(choices, 0);
+    if (!choice || choice->type != JSON_OBJ)
+        LOG_FAIL("engine", "refusing a choice that is not an object");
+
+    const struct json_value *msg = json_get(choice, "message");
+    if (!msg || msg->type != JSON_OBJ)
+        LOG_FAIL("engine", "refusing a choice with no `message` object");
+
+    const struct json_value *content = json_get(msg, "content");
+    if (!content || content->type != JSON_STR)
+        LOG_FAIL("engine", "refusing a message whose `content` is not a string");
+
+    const char *text = json_get_str(content);
+    if (!text)
+        LOG_FAIL("engine", "refusing a message with unreadable content");
+    const size_t n = strlen(text);
+    if (n == 0) {
+        /* An empty `content` has two very different causes.
+         *
+         * A REASONING model writes its chain of thought into a sibling
+         * field (`reasoning_content` at Z.ai, `reasoning` elsewhere) and
+         * only then writes the answer. Give it a small max_tokens and the
+         * whole budget goes to the thought: content is "", finish_reason is
+         * "length", and the leg is working perfectly. Reporting that as an
+         * empty message points an operator at the vendor when the answer is
+         * the token budget, so it is named. It is still a refusal — there is
+         * no answer to act on — but a refusal with the repair in it. */
+        const struct json_value *fr = json_get(choice, "finish_reason");
+        const char *fs = (fr && fr->type == JSON_STR) ? json_get_str(fr) : NULL;
+        const struct json_value *rc = json_get(msg, "reasoning_content");
+        if (!rc)
+            rc = json_get(msg, "reasoning");
+        if (rc && rc->type == JSON_STR && json_get_str(rc)
+            && json_get_str(rc)[0])
+            LOG_FAIL("engine",
+                     "refusing an empty assistant message: this model wrote "
+                     "%zu bytes of reasoning and no answer (finish_reason=%s) "
+                     "— raise the output-token budget",
+                     strlen(json_get_str(rc)), fs ? fs : "absent");
+        LOG_FAIL("engine", "refusing an empty assistant message");
+    }
+    if (n > ENGINE_MAX_TEXT_BYTES)
+        LOG_FAIL("engine", "refusing %zu bytes of assistant text: over the cap",
+                 n);
+
+    if (!copy_bounded(json_get(choice, "finish_reason"), out->finish_reason,
+                      sizeof(out->finish_reason), "finish_reason"))
+        return false;
+
+    out->text = zcl_malloc(n + 1, "engine_reply_text");
+    if (!out->text)
+        LOG_FAIL("engine", "cannot allocate %zu bytes of reply text", n + 1);
+    memcpy(out->text, text, n + 1);
+    out->text_len = n;
+    return true;
+}
+
+size_t engine_response_excerpt(const char *body, size_t len,
+                               char *out, size_t cap)
+{
+    if (!out || cap == 0)
+        return 0;
+    out[0] = '\0';
+    if (!body || len == 0)
+        return 0;
+    /* Room for the three-dot marker when the body is longer than the room. */
+    const size_t room = cap - 1u;
+    size_t n = 0;
+    bool last_was_space = true;   /* true so a leading run is dropped */
+    size_t consumed = 0;
+    for (; consumed < len && n < room; consumed++) {
+        unsigned char c = (unsigned char)body[consumed];
+        const bool printable = (c >= 0x20u && c <= 0x7eu);
+        if (!printable || c == ' ') {
+            if (last_was_space)
+                continue;
+            out[n++] = ' ';
+            last_was_space = true;
+            continue;
+        }
+        out[n++] = (char)c;
+        last_was_space = false;
+    }
+    while (n > 0 && out[n - 1] == ' ')
+        n--;
+    out[n] = '\0';
+    if (consumed < len && n + 3u < cap) {
+        out[n++] = '.'; out[n++] = '.'; out[n++] = '.';
+        out[n] = '\0';
+    }
+    return n;
+}
+
+/* Say what came back when a body is refused.
+ *
+ * A refusal names the RULE that fired ("no `choices` array") plus an excerpt
+ * of the document, e.g. a Z.ai coding-plan key against the general-plan
+ * endpoint answers HTTP 200 with neither `choices` nor `error`. */
+static void log_refused_body(const struct engine_vendor *vendor,
+                             const char *body, size_t len, const char *why)
+{
+    char excerpt[ENGINE_RESPONSE_EXCERPT_BYTES + 4u];
+    (void)engine_response_excerpt(body, len, excerpt, sizeof(excerpt));
+    LOG_WARN("engine",
+             "%s refused a %zu-byte body (%s); first %u bytes: %s",
+             vendor && vendor->id ? vendor->id : "?", len, why,
+             (unsigned)ENGINE_RESPONSE_EXCERPT_BYTES,
+             excerpt[0] ? excerpt : "(nothing printable)");
+}
+
+bool engine_response_parse(const struct engine_vendor *vendor,
+                           const char *body, size_t len,
+                           struct engine_reply *out)
+{
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    if (!vendor)
+        LOG_FAIL("engine", "refusing a response with no vendor to attribute it to");
+    if (!body_is_admissible(body, len))
+        return false;
+
+    struct json_value root;
+    json_init(&root);
+    if (!json_read(&root, body, len)) {
+        json_free(&root);
+        log_refused_body(vendor, body, len, "not well-formed JSON");
+        LOG_FAIL("engine",
+                 "refusing a response that is not well-formed JSON (truncated, "
+                 "over-nested, or not JSON at all)");
+    }
+    bool ok = false;
+    if (root.type != JSON_OBJ) {
+        LOG_WARN("engine", "refusing a response whose root is not an object");
+    } else if (copy_bounded(json_get(&root, "model"), out->model,
+                            sizeof(out->model), "model name")
+               && read_text(&root, out)) {
+        read_usage(&root, &out->usage);
+        ok = true;
+    }
+    json_free(&root);
+    if (!ok) {
+        engine_reply_free(out);
+        log_refused_body(vendor, body, len, "no usable assistant message");
+    }
+    return ok;
+}
+
+bool engine_response_error_text(const char *body, size_t len,
+                                char *out, size_t out_len)
+{
+    if (!out || out_len == 0)
+        return false;
+    out[0] = '\0';
+    if (!body_is_admissible(body, len))
+        return false;
+
+    struct json_value root;
+    json_init(&root);
+    if (!json_read(&root, body, len)) {
+        json_free(&root);
+        return false;
+    }
+    bool found = false;
+    const struct json_value *err = json_get(&root, "error");
+    if (err && err->type == JSON_STR && json_get_str(err)) {
+        (void)snprintf(out, out_len, "%s", json_get_str(err));
+        found = out[0] != '\0';
+    } else if (err && err->type == JSON_OBJ) {
+        const struct json_value *m = json_get(err, "message");
+        const struct json_value *c = json_get(err, "code");
+        const char *ms = (m && m->type == JSON_STR) ? json_get_str(m) : NULL;
+        const char *cs = (c && c->type == JSON_STR) ? json_get_str(c) : NULL;
+        if (ms || cs) {
+            (void)snprintf(out, out_len, "%s%s%s", cs ? cs : "",
+                           (cs && ms) ? ": " : "", ms ? ms : "");
+            found = out[0] != '\0';
+        }
+    }
+    json_free(&root);
+    return found;
+}
+
+bool engine_cli_reply_text(const struct engine_vendor *vendor,
+                           const char *body, size_t len,
+                           struct engine_reply *out)
+{
+    if (!out || !vendor || out->text ||
+        (vendor->report_format != ENGINE_CLI_OUTPUT_CLAUDE_JSON &&
+         vendor->report_format != ENGINE_CLI_OUTPUT_GROK_JSON))
+        return false;
+
+    struct engine_cli_observation observation;
+    if (!engine_cli_observation_parse(vendor, body, len, &observation))
+        return false;
+
+    struct json_value root;
+    json_init(&root);
+    if (!json_read(&root, body, len)) {
+        json_free(&root);
+        LOG_FAIL("engine", "refusing malformed CLI reply text");
+    }
+    const char *key = vendor->report_format == ENGINE_CLI_OUTPUT_CLAUDE_JSON
+                          ? "result" : "text";
+    const struct json_value *value = json_get(&root, key);
+    const char *text = value && value->type == JSON_STR
+                           ? json_get_str(value) : NULL;
+    if (!text) {
+        json_free(&root);
+        LOG_FAIL("engine", "refusing CLI reply without string %s", key);
+    }
+    const size_t text_len = strlen(text);
+    if (text_len > ENGINE_MAX_TEXT_BYTES) {
+        json_free(&root);
+        LOG_FAIL("engine", "refusing %zu bytes of CLI reply text: over the cap",
+                 text_len);
+    }
+    char *copy = zcl_malloc(text_len + 1u, "engine_cli_reply_text");
+    if (!copy) {
+        json_free(&root);
+        LOG_FAIL("engine", "cannot allocate %zu bytes of CLI reply text",
+                 text_len + 1u);
+    }
+    memcpy(copy, text, text_len + 1u);
+    json_free(&root);
+    out->text = copy;
+    out->text_len = text_len;
+    return true;
+}

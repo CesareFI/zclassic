@@ -1,0 +1,4 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * The loader reads the executable path, maps the GUI library, and
+ * reports a failed load on stderr. */
+ZCL_MODULE_CAPABILITY("tools/dev/wallet_gui_load.c", CAP_FS_READ|CAP_FS_WRITE, "resolves the executable path and asks the dev library opener for libz23walletgui.so only after -gui, --gui, or --self-test; a headless start does not reach this file")

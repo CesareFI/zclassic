@@ -1,0 +1,120 @@
+{
+  "schema": 1,
+  "name": "zotpcli/zotpcli",
+  "semver": "0.1.1",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "name": "zarg/zarg",
+      "root": "7309492dde70c7fa5ccb8f9b171810860251794f3b65b69c689407415b8fe303",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zbase64/zbase64",
+      "root": "4a13ecdea45774b8548865a3ee71e4f52a6447845065ae3219b4702a9c97a7ed",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zb32/zb32",
+      "root": "ec92c51e00ace0cf88c52f7f6ea40300e570f0519ab27311c1128fc2da423716",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zbuf/zbuf",
+      "root": "979ab0b0a3ead240682f4f55e9ba4c8b1c63157fca59ce07a6089fa4c3a1a941",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zfmt/zfmt",
+      "root": "b1cda301e340bd4334d7ac04a8bbda5bcb2be4045930bb0fdab6974726e209db",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zhex/zhex",
+      "root": "14cdf8dfb79bd55018759301c489411cc4003b0f0765cf891f39a5231e99dc70",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zhkdf/zhkdf",
+      "root": "16e9fe945456d97b7c8d95756fee1d50cf653ca0fb788e2f069c2d748dfd3e02",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zjson/zjson",
+      "root": "9d6deead41e106fa0a414f2767cb767850aac321203d4de887aebad983edcc13",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zjsonp/zjsonp",
+      "root": "15988e532dbcf5693bc01afacda312e671c8fc77f15f690b7653fa1804d22308",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zlog/zlog",
+      "root": "e9d81f161b5d9e78b77675e1aebd80ee1bc1abd834ca446e38923b634394034a",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zotp/zotp",
+      "root": "084b0cdfb501fd7420efa596242308051e84b8639bd323ab590fd24c3e4d905c",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zpct/zpct",
+      "root": "0abb783e2d813769d19f0c74daf2edc78561d4710d40d8b8a7e62b823a55ed14",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zpem/zpem",
+      "root": "c7698c3844ad36c8e4f228653c5636516cf558c5b2a96c614033618b467e9605",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zscrypt/zscrypt",
+      "root": "2f9a1a08f6ec05cb61af59327ee7bdc081177351bcc9aed21a98b539427cab32",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zsha256/zsha256",
+      "root": "061ca24e84e53d73c0181273c02a53488b31b5300327f95d26a8ee004860cccd",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zstr/zstr",
+      "root": "812ba0c8ad022361b50d5d15c66a9ded074a43d78d5a3cce19b84263bf3a5533",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "ztime/ztime",
+      "root": "4c781d49f9c553a8f43479d6de5d72aa592c3a7a85f2d692726b13fecdb947a8",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zurl/zurl",
+      "root": "99fea84f2e31686f8577099b054f0a3721a148d54470a542e30719f1b8bc5e2e",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zutf8/zutf8",
+      "root": "af83b6a944a42d26ad7af42e18ec0d67119bfda96c539baca0091a6a1d76b6b6",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zvarint/zvarint",
+      "root": "e6cc3aa6ddc7650ce2e212d171625853db8a39556bf0ec7cb371759cb90b44a5",
+      "semver": "0.1.0"
+    }
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zotpcli/zotpcli.h",
+    "src/zotpcli.c",
+    "tests/test_zotpcli.c",
+    "zcode-package.json"
+  ]
+}

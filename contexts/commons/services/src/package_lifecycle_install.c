@@ -1,0 +1,1373 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * package_lifecycle_install — the WRITE adapter of the ZCODE install
+ * lifecycle: spawn the confined build worker, re-hash everything it emitted,
+ * install atomically, append the generation log, swap the active pointer,
+ * and pin.
+ *
+ * The node NEVER compiles anything and NEVER loads a package's output. The
+ * only compilation is inside the fixed package verifier --emit; the
+ * only thing that crosses back is bytes on disk, and every one of those bytes
+ * is re-hashed here against the worker's own receipt before it is installed.
+ * There is no dlopen anywhere in this file by design. */
+
+/* realpath() reaches this TU only through the glibc fortify inline that
+ * -D_FORTIFY_SOURCE=2 pulls in at -O1 and above; the build's
+ * -D_POSIX_C_SOURCE=200809L declares it nowhere. Without this the file
+ * compiles by accident of optimisation and breaks at -O0, under
+ * -U_FORTIFY_SOURCE, and on any non-glibc libc. It must precede every
+ * include: after them it does nothing. */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
+#include "package_lifecycle_internal.h"
+
+#include "base/hex.h"
+#include "base/cleanse.h"
+#include "base/log_macros.h"
+#include "base/result.h"
+#include "base/safe_alloc.h"
+#include "crypto/sha3.h"
+#include "platform/os_proc.h"
+#include "util/spawn.h"
+#include "vcs/package_store.h"
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
+
+#define PKGL_DEV_WORKER_NAME "zclassic23-package-verify-dev"
+#define PKGL_RELEASE_WORKER_NAME "zclassic23-package-verify"
+
+#ifndef _WIN32
+static struct zcl_result pkgl_parent_shape(const char *path,
+                                           const char *role);
+#endif
+
+static struct zcl_result pkgl_receipt_path(const struct pkgl_ctx *ctx,
+                                           const char *rel, char *out,
+                                           size_t cap)
+{
+#ifndef _WIN32
+    char parent[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_join(ctx, "receipts", parent, sizeof(parent)));
+    ZCL_CHECK(pkgl_parent_shape(parent, "receipt"));
+#endif
+    return pkgl_join(ctx, rel, out, cap);
+}
+
+/* ── worker discovery ───────────────────────────────────────────────── */
+
+static bool pkgl_worker_runnable(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+        return false;
+#ifdef _WIN32
+    return true; /* Windows execution uses the file extension. */
+#else
+    return access(path, X_OK) == 0;
+#endif
+}
+
+/* The worker ships beside whatever binary is running. Resolving it from
+ * /proc/self/exe — never from PATH — means a PATH entry can never substitute
+ * a different program into the only place that compiles. The one fallback is
+ * the build tree's own build/bin, because the fast-test lane runs its binary
+ * out of a per-epoch subdirectory; it is still a fixed relative path, not a
+ * search. */
+struct zcl_result pkgl_worker_path_for_executable(const char *executable,
+                                                 char *out, size_t cap)
+{
+    char exe[PKGL_PATH_MAX];
+    if (!executable)
+        return ZCL_ERR(-1, "executable path is required");
+    int n = snprintf(exe, sizeof(exe), "%s", executable);
+    if (n < 0 || (size_t)n >= sizeof(exe))
+        return ZCL_ERR(-1, "executable path too long");
+    /* A kernel deletion marker trails the basename, so taking its parent
+     * already excludes it. Preserve literal marker text in directory names. */
+    char *slash = strrchr(exe, '/');
+    if (!slash)
+        return ZCL_ERR(-1, "resolved executable path has no directory component");
+    *slash = '\0';
+    const char *names[] = {
+        PKGL_DEV_WORKER_NAME,
+        PKGL_RELEASE_WORKER_NAME,
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        int w = snprintf(out, cap, "%s/%s", exe, names[i]);
+        if (w <= 0 || (size_t)w >= cap)
+            return ZCL_ERR(-1, "worker path too long");
+        if (pkgl_worker_runnable(out))
+            return ZCL_OK;
+    }
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        int w = snprintf(out, cap, "build/bin/%s", names[i]);
+        if (w <= 0 || (size_t)w >= cap)
+            return ZCL_ERR(-1, "worker path too long");
+        if (pkgl_worker_runnable(out))
+            return ZCL_OK;
+    }
+    return ZCL_ERR(-1,
+                   "no executable regular development or release package "
+                   "verifier beside this binary or in build/bin — build the "
+                   "development helper (make dev-bin), or repair its file "
+                   "type and execute permission before installing packages");
+}
+
+struct zcl_result pkgl_worker_path(char *out, size_t cap)
+{
+    char exe[PKGL_PATH_MAX];
+    if (!os_proc_exe_path(exe, sizeof(exe)))
+        return ZCL_ERR(-1, "cannot resolve own executable path");
+    return pkgl_worker_path_for_executable(exe, out, cap);
+}
+
+/* ── streaming copy that hashes what it wrote ───────────────────────── */
+
+static struct zcl_result pkgl_copy_hashed(const char *src, const char *dst,
+                                          uint8_t out32[32],
+                                          uint64_t *bytes_out)
+{
+    char parent[PKGL_PATH_MAX];
+    int n = snprintf(parent, sizeof(parent), "%s", dst);
+    if (n <= 0 || (size_t)n >= sizeof(parent))
+        return ZCL_ERR(-1, "install path too long");
+    char *slash = strrchr(parent, '/');
+    if (slash) {
+        *slash = '\0';
+        ZCL_CHECK(pkgl_mkdir_p(parent));
+    }
+    FILE *in = fopen(src, "rb");
+    if (!in)
+        return ZCL_ERR(-1, "fopen %s: %s", src, strerror(errno));
+    FILE *outf = fopen(dst, "wb");
+    if (!outf) {
+        fclose(in);
+        return ZCL_ERR(-1, "fopen %s: %s", dst, strerror(errno));
+    }
+    struct sha3_256_ctx ctx;
+    sha3_256_init(&ctx);
+    uint8_t buf[65536];
+    uint64_t total = 0;
+    size_t got;
+    bool bad = false;
+    while ((got = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, got, outf) != got) {
+            bad = true;
+            break;
+        }
+        sha3_256_write(&ctx, buf, got);
+        total += got;
+    }
+    if (ferror(in))
+        bad = true;
+    fclose(in);
+    if (fflush(outf) != 0)
+        bad = true;
+    else if (!vcs_package_store_deferred_sync_enabled()
+#ifdef _WIN32
+             && _commit(_fileno(outf)) != 0
+#else
+             && fsync(fileno(outf)) != 0
+#endif
+    )
+        bad = true;
+    if (fclose(outf) != 0)
+        bad = true;
+    if (bad)
+        return ZCL_ERR(-1, "copy %s -> %s failed: %s", src, dst,
+                       strerror(errno));
+    sha3_256_finalize(&ctx, out32);
+    *bytes_out = total;
+    return ZCL_OK;
+}
+
+/* An output whose receipt path is under bin/ is the PROGRAM a person runs,
+ * so it is staged — and therefore installed, the stage is renamed into
+ * place — with the executable bit set. Everything else (the static archive,
+ * the public headers) is data and stays 0644. The mode is deliberately NOT
+ * a receipt field: the receipt commits BYTES, and two verifiers under
+ * different umasks must still agree on every hash, so the permission is
+ * decided here, by the layer that owns the install layout, from the path
+ * the receipt already commits. On Windows there is no executable bit — the
+ * file extension decides — so there is nothing to set. */
+static struct zcl_result pkgl_apply_output_mode(const char *path,
+                                                const char *rel)
+{
+#ifdef _WIN32
+    (void)path;
+    (void)rel;
+#else
+    mode_t mode = strncmp(rel, "bin/", 4) == 0 ? (mode_t)0755 : (mode_t)0644;
+    if (chmod(path, mode) != 0)
+        return ZCL_ERR(-1, "chmod %o %s: %s", (unsigned)mode, path,
+                       strerror(errno));
+#endif
+    return ZCL_OK;
+}
+
+/* ── the receipt cross-check ────────────────────────────────────────── */
+
+static struct zcl_result pkgl_receipt_inputs_match(
+    const struct vcs_package_build_receipt *receipt,
+    const uint8_t root[32], const struct vcs_package_release *release,
+    const uint8_t (*dep_roots)[32], size_t dep_count)
+{
+    if (memcmp(receipt->package_root, root, 32) != 0)
+        return ZCL_ERR(-1, "receipt names a different package root");
+    if (memcmp(receipt->recipe_root, release->recipe_root, 32) != 0)
+        return ZCL_ERR(-1, "receipt names a different recipe root");
+    if (receipt->dep_count != dep_count)
+        return ZCL_ERR(-1, "receipt lists %zu dependencies, package has %zu",
+                       receipt->dep_count, dep_count);
+    for (size_t i = 0; i < dep_count; i++) {
+        bool found = false;
+        for (size_t j = 0; j < receipt->dep_count && !found; j++)
+            found = memcmp(receipt->dep_roots[j], dep_roots[i], 32) == 0;
+        if (!found)
+            return ZCL_ERR(-1, "receipt omits an exact dependency root");
+    }
+    return ZCL_OK;
+}
+
+static struct zcl_result pkgl_receipt_matches(
+    const struct vcs_package_build_receipt *receipt,
+    const uint8_t root[32], const struct vcs_package_release *release,
+    const uint8_t lock_root[32], const uint8_t (*dep_roots)[32],
+    size_t dep_count)
+{
+    ZCL_CHECK(pkgl_receipt_inputs_match(receipt, root, release, dep_roots,
+                                        dep_count));
+    if (memcmp(receipt->lock_root, lock_root, 32) != 0)
+        return ZCL_ERR(-1, "receipt names a different dependency lock");
+    return ZCL_OK;
+}
+
+static struct zcl_result pkgl_installed_outputs_match(
+    const char *installed, const struct vcs_package_build_receipt *receipt)
+{
+    for (size_t i = 0; i < receipt->output_count; i++) {
+        const struct vcs_package_build_output *output = &receipt->outputs[i];
+        char path[PKGL_PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", installed,
+                         output->path);
+        if (n <= 0 || (size_t)n >= sizeof(path))
+            return ZCL_ERR(-1, "installed output path is too long");
+        uint8_t digest[32];
+        uint64_t bytes = 0;
+        ZCL_CHECK(pkgl_sha3_file_beneath(installed, output->path,
+                                         digest, &bytes));
+        if (bytes != output->bytes || memcmp(digest, output->sha3, 32) != 0)
+            return ZCL_ERR(-1, "installed output %s does not match receipt",
+                           output->path);
+#ifndef _WIN32
+        if (strncmp(output->path, "bin/", 4) == 0 &&
+            access(path, X_OK) != 0)
+            return ZCL_ERR(-1, "program lacks executable permission; "
+                               "restore mode 0755 or reinstall the exact "
+                               "root: %s", output->path);
+#endif
+    }
+    return ZCL_OK;
+}
+
+static struct zcl_result pkgl_installed_filed_match(
+    const struct pkgl_ctx *ctx, const uint8_t receipt_id[32],
+    const uint8_t *wire, size_t wire_len)
+{
+    char id_hex[65], filed[PKGL_PATH_MAX];
+    zcl_hex_encode(receipt_id, 32, id_hex);
+    char relative[96];
+    int n = snprintf(relative, sizeof(relative), "receipts/%s", id_hex);
+    struct zcl_result joined = n > 0 && (size_t)n < sizeof(relative)
+        ? pkgl_receipt_path(ctx, relative, filed, sizeof(filed))
+        : ZCL_ERR(-1, "filed receipt path is too long");
+    uint8_t *filed_wire = NULL;
+    size_t filed_len = 0;
+    if (joined.ok)
+        joined = pkgl_read_file(filed, VCS_PACKAGE_BUILD_MAX_WIRE_BYTES,
+                                &filed_wire, &filed_len);
+    bool filed_equal = joined.ok && filed_len == wire_len &&
+        memcmp(filed_wire, wire, wire_len) == 0;
+    free(filed_wire);
+    if (!filed_equal)
+        return joined.ok ? ZCL_ERR(-1, "filed receipt bytes do not match install")
+                         : joined;
+    return ZCL_OK;
+}
+
+struct zcl_result pkgl_installed_evidence(
+    const struct pkgl_ctx *ctx, const uint8_t root[32],
+    const struct vcs_package_release *release,
+    const uint8_t (*dep_roots)[32], size_t dep_count,
+    struct vcs_package_build_receipt *receipt_out, uint8_t receipt_id_out[32])
+{
+    if (!ctx || !root || !release || !receipt_out || !receipt_id_out)
+        return ZCL_ERR(-1, "null argument verifying installed evidence");
+    char installed[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_installed_dir(ctx, root, installed, sizeof(installed)));
+    char report[PKGL_PATH_MAX];
+    int n = snprintf(report, sizeof(report), "%s/build-report", installed);
+    if (n <= 0 || (size_t)n >= sizeof(report))
+        return ZCL_ERR(-1, "installed receipt path is too long");
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    ZCL_CHECK(pkgl_read_file(report, VCS_PACKAGE_BUILD_MAX_WIRE_BYTES,
+                             &wire, &wire_len));
+    enum vcs_package_build_error parsed =
+        vcs_package_build_parse(wire, wire_len, receipt_out);
+    if (parsed != VCS_PACKAGE_BUILD_OK) {
+        free(wire);
+        return ZCL_ERR(-1, "installed receipt: %s",
+                       vcs_package_build_error_string(parsed));
+    }
+    struct zcl_result matched = pkgl_receipt_inputs_match(
+        receipt_out, root, release, dep_roots, dep_count);
+    if (!matched.ok || !vcs_package_build_installable(receipt_out)) {
+        free(wire);
+        return matched.ok ? ZCL_ERR(-1, "installed receipt is not installable")
+                          : matched;
+    }
+    uint8_t receipt_id[32];
+    if (vcs_package_build_id(receipt_out, receipt_id) != VCS_PACKAGE_BUILD_OK) {
+        free(wire);
+        return ZCL_ERR(-1, "installed receipt id cannot be rederived");
+    }
+    struct zcl_result filed = pkgl_installed_filed_match(ctx, receipt_id, wire, wire_len);
+    free(wire);
+    if (!filed.ok) return filed;
+    memcpy(receipt_id_out, receipt_id, 32);
+    return ZCL_OK;
+}
+
+struct zcl_result pkgl_verify_installed_receipt(
+    const struct pkgl_ctx *ctx, const uint8_t root[32],
+    const struct vcs_package_release *release, const uint8_t lock_root[32],
+    const uint8_t (*dep_roots)[32], size_t dep_count,
+    struct package_lifecycle_step *step)
+{
+    if (!ctx || !root || !release || !lock_root || !step)
+        return ZCL_ERR(-1, "null argument verifying installed evidence");
+    struct vcs_package_build_receipt receipt;
+    uint8_t receipt_id[32];
+    ZCL_CHECK(pkgl_installed_evidence(ctx, root, release, dep_roots,
+                                      dep_count, &receipt, receipt_id));
+    char installed[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_installed_dir(ctx, root, installed, sizeof(installed)));
+    ZCL_CHECK(pkgl_installed_outputs_match(installed, &receipt));
+    step->has_receipt = true;
+    step->receipt_reused = memcmp(receipt.lock_root, lock_root, 32) == 0;
+    memcpy(step->receipt_id, receipt_id, 32);
+    return ZCL_OK;
+}
+
+static void pkgl_step_fail(struct package_lifecycle_step *step,
+                           const char *rule, const char *detail)
+{
+    if (!step)
+        return;
+    (void)snprintf(step->rule, sizeof(step->rule), "%s", rule);
+    (void)snprintf(step->detail, sizeof(step->detail), "%.191s", detail);
+}
+
+/* ── build + install one root ───────────────────────────────────────── */
+
+struct pkgl_build_paths {
+    char worker[PKGL_PATH_MAX];
+    char emit[PKGL_PATH_MAX];
+    char stage[PKGL_PATH_MAX];
+    char final[PKGL_PATH_MAX];
+};
+
+static struct zcl_result pkgl_build_paths_init(const struct pkgl_ctx *ctx,
+                                               const uint8_t root[32],
+                                               struct pkgl_build_paths *p)
+{
+    char hex[65];
+    zcl_hex_encode(root, 32, hex);
+    char rel[128];
+    ZCL_CHECK(pkgl_worker_path(p->worker, sizeof(p->worker)));
+#ifndef _WIN32
+    char buildwork[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_join(ctx, "buildwork", buildwork, sizeof(buildwork)));
+    ZCL_CHECK(pkgl_parent_shape(buildwork, "buildwork"));
+#endif
+    (void)snprintf(rel, sizeof(rel), "buildwork/%s", hex);
+    ZCL_CHECK(pkgl_join(ctx, rel, p->emit, sizeof(p->emit)));
+    (void)snprintf(rel, sizeof(rel), "installed/.stage-%s", hex);
+    ZCL_CHECK(pkgl_join(ctx, rel, p->stage, sizeof(p->stage)));
+    ZCL_CHECK(pkgl_installed_dir(ctx, root, p->final, sizeof(p->final)));
+    return ZCL_OK;
+}
+
+/* Spawn the worker over one package root. Returns non-ok when the worker
+ * could not be run or reported a non-zero verdict. */
+static struct zcl_result pkgl_run_worker(const struct pkgl_ctx *ctx,
+                                         const struct pkgl_build_paths *p,
+                                         const uint8_t root[32],
+                                         const uint8_t lock_root[32],
+                                         const uint8_t (*dep_roots)[32],
+                                         size_t dep_count)
+{
+    if (dep_count > VCS_PACKAGE_BUILD_MAX_DEPS)
+        return ZCL_ERR(-1, "%zu dependencies exceeds the worker bound",
+                       dep_count);
+    char root_hex[65];
+    zcl_hex_encode(root, 32, root_hex);
+    char lock_hex[65];
+    zcl_hex_encode(lock_root, 32, lock_hex);
+    char store_arg[PKGL_PATH_MAX + 16];
+    (void)snprintf(store_arg, sizeof(store_arg), "--store=%s", ctx->zcode_dir);
+    char emit_arg[PKGL_PATH_MAX + 16];
+    (void)snprintf(emit_arg, sizeof(emit_arg), "--emit=%s", p->emit);
+    char lock_arg[96];
+    (void)snprintf(lock_arg, sizeof(lock_arg), "--lock-root=%s", lock_hex);
+
+    char *dep_args = NULL;
+    const size_t dep_stride = PKGL_PATH_MAX + 96u;
+    if (dep_count) {
+        dep_args = zcl_malloc(dep_stride * dep_count, "pkgl.dep_args");
+        if (!dep_args)
+            return ZCL_ERR(-1, "cannot allocate the dependency argv");
+    }
+    const char *argv[8u + VCS_PACKAGE_BUILD_MAX_DEPS];
+    size_t argc = 0;
+    argv[argc++] = p->worker;
+    argv[argc++] = root_hex;
+    argv[argc++] = store_arg;
+    argv[argc++] = emit_arg;
+    argv[argc++] = lock_arg;
+    for (size_t i = 0; i < dep_count; i++) {
+        char dep_hex[65];
+        zcl_hex_encode(dep_roots[i], 32, dep_hex);
+        char *slot = dep_args + dep_stride * i;
+        char install[PKGL_PATH_MAX];
+        struct zcl_result ir =
+            pkgl_installed_dir(ctx, dep_roots[i], install, sizeof(install));
+        if (!ir.ok) {
+            free(dep_args);
+            return ir;
+        }
+        (void)snprintf(slot, dep_stride, "--dep=%s,%s", dep_hex, install);
+        argv[argc++] = slot;
+    }
+    argv[argc] = NULL;
+
+    char out[8192];
+    int rc = zcl_spawn_capture(argv, out, sizeof(out), PKGL_BUILD_TIMEOUT_MS);
+    free(dep_args);
+    if (rc != 0) {
+        /* Trim the captured stdout to one line for the operator's detail. */
+        char *nl = strchr(out, '\n');
+        if (nl)
+            *nl = '\0';
+        return ZCL_ERR(-1, "build worker exit %d%s%s", rc,
+                       out[0] ? ": " : "", out);
+    }
+    return ZCL_OK;
+}
+
+// long-function-ok:one-install-transaction — the emit, the receipt
+// cross-check, the per-output re-hash and the atomic rename are ONE
+// transaction; a split would create a reachable state where some outputs
+// were copied without the receipt having been checked.
+struct zcl_result pkgl_build_and_install(
+    const struct pkgl_ctx *ctx, const uint8_t root[32],
+    const struct vcs_package_release *release, const uint8_t lock_root[32],
+    const uint8_t (*dep_roots)[32], size_t dep_count,
+    struct package_lifecycle_step *step)
+{
+    if (!ctx || !root || !release || !lock_root || !step)
+        return ZCL_ERR(-1, "null argument installing a package");
+#ifdef _WIN32
+    /* Package builds execute untrusted recipes and activation publishes their
+     * output.  Keep the native boundary closed until the restricted-token /
+     * Job Object sandbox and immutable generation transaction are qualified. */
+    pkgl_step_fail(step, "windows-package-install-disabled",
+                   "native package install awaits sandbox qualification");
+    return ZCL_ERR(-1,
+                   "native Windows package install is disabled until the "
+                   "sandbox and secure immutable generation activation pass "
+                   "qualification");
+#endif
+
+    struct pkgl_build_paths p;
+    struct zcl_result pr = pkgl_build_paths_init(ctx, root, &p);
+    if (!pr.ok) {
+        pkgl_step_fail(step, "worker-missing", pr.message);
+        return pr;
+    }
+    ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "stale build work is replaced");
+    ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "stale staging is replaced");
+    ZCL_CHECK(pkgl_mkdir_p(p.emit));
+
+    struct zcl_result wr =
+        pkgl_run_worker(ctx, &p, root, lock_root, dep_roots, dep_count);
+    if (!wr.ok) {
+        pkgl_step_fail(step, "build-failed", wr.message);
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "failed build work removed");
+        return wr;
+    }
+
+    /* The worker's own account of what it produced. */
+    char report[PKGL_PATH_MAX];
+    int n = snprintf(report, sizeof(report), "%s/build-report", p.emit);
+    if (n <= 0 || (size_t)n >= sizeof(report)) {
+        pkgl_step_fail(step, "build-report-path", "emit path too long");
+        return ZCL_ERR(-1, "emit path too long");
+    }
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    struct zcl_result rr = pkgl_read_file(
+        report, VCS_PACKAGE_BUILD_MAX_WIRE_BYTES, &wire, &wire_len);
+    if (!rr.ok) {
+        pkgl_step_fail(step, "build-report-missing", rr.message);
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "unusable build work removed");
+        return rr;
+    }
+    struct vcs_package_build_receipt receipt;
+    enum vcs_package_build_error berr =
+        vcs_package_build_parse(wire, wire_len, &receipt);
+    free(wire);
+    if (berr != VCS_PACKAGE_BUILD_OK) {
+        pkgl_step_fail(step, "build-report-invalid",
+                       vcs_package_build_error_string(berr));
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "unusable build work removed");
+        return ZCL_ERR(-1, "build report: %s",
+                       vcs_package_build_error_string(berr));
+    }
+    struct zcl_result mr = pkgl_receipt_matches(&receipt, root, release,
+                                                lock_root, dep_roots,
+                                                dep_count);
+    if (!mr.ok) {
+        pkgl_step_fail(step, "build-report-mismatch", mr.message);
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "unusable build work removed");
+        return mr;
+    }
+    step->state = VCS_PACKAGE_LIFECYCLE_BUILT;
+    if (!vcs_package_build_installable(&receipt)) {
+        char detail[PACKAGE_LIFECYCLE_DETAIL_MAX + 1u];
+        (void)snprintf(detail, sizeof(detail), "verdict %s (test exit %u)",
+                       vcs_package_build_result_string(
+                           (enum vcs_package_build_result)
+                               receipt.result_class),
+                       receipt.test_exit_code);
+        pkgl_step_fail(step, "build-not-installable", detail);
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "failed build work removed");
+        return ZCL_ERR(-1, "%s", detail);
+    }
+    step->state = VCS_PACKAGE_LIFECYCLE_TESTED;
+
+    /* Re-hash and install ONLY what the receipt declares. An artifact the
+     * worker produced but did not commit to simply never lands. */
+    ZCL_CHECK(pkgl_mkdir_p(p.stage));
+    char src[PKGL_PATH_MAX];
+    char dst[PKGL_PATH_MAX];
+    for (size_t i = 0; i < receipt.output_count; i++) {
+        const struct vcs_package_build_output *o = &receipt.outputs[i];
+        int sn = snprintf(src, sizeof(src), "%s/%s", p.emit, o->path);
+        int dn = snprintf(dst, sizeof(dst), "%s/%s", p.stage, o->path);
+        if (sn <= 0 || (size_t)sn >= sizeof(src) || dn <= 0 ||
+            (size_t)dn >= sizeof(dst)) {
+            pkgl_step_fail(step, "output-path-too-long", o->path);
+            ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "aborted install removed");
+            return ZCL_ERR(-1, "output path too long: %s", o->path);
+        }
+        uint8_t got[32];
+        uint64_t bytes = 0;
+        struct zcl_result cr = pkgl_copy_hashed(src, dst, got, &bytes);
+        if (!cr.ok) {
+            pkgl_step_fail(step, "output-missing", cr.message);
+            ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "aborted install removed");
+            ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "aborted build removed");
+            return cr;
+        }
+        if (bytes != o->bytes || memcmp(got, o->sha3, 32) != 0) {
+            pkgl_step_fail(step, "output-hash-mismatch", o->path);
+            ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "aborted install removed");
+            ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "aborted build removed");
+            return ZCL_ERR(-1,
+                           "%s does not match the hash the build receipt "
+                           "commits — refusing to install it", o->path);
+        }
+        struct zcl_result moded = pkgl_apply_output_mode(dst, o->path);
+        if (!moded.ok) {
+            pkgl_step_fail(step, "output-mode", moded.message);
+            ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "aborted install removed");
+            ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "aborted build removed");
+            return moded;
+        }
+    }
+
+    /* The receipt travels with the install and is also filed by its id, so
+     * "what produced this tree" is answerable from either end. */
+    uint8_t *rwire = NULL;
+    size_t rwire_len = 0;
+    if (vcs_package_build_serialize(&receipt, &rwire, &rwire_len) !=
+        VCS_PACKAGE_BUILD_OK) {
+        pkgl_step_fail(step, "receipt-serialize", "cannot re-encode receipt");
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "aborted install removed");
+        return ZCL_ERR(-1, "cannot re-encode the build receipt");
+    }
+    uint8_t receipt_id[32];
+    if (vcs_package_build_id(&receipt, receipt_id) != VCS_PACKAGE_BUILD_OK) {
+        free(rwire);
+        pkgl_step_fail(step, "receipt-id", "cannot compute receipt id");
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "aborted install removed");
+        return ZCL_ERR(-1, "cannot compute the build receipt id");
+    }
+    int dst_len = snprintf(dst, sizeof(dst), "%s/build-report", p.stage);
+    if (dst_len <= 0 || (size_t)dst_len >= sizeof(dst)) {
+        free(rwire);
+        pkgl_step_fail(step, "receipt-store", "build report path is too long");
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "aborted install removed");
+        return ZCL_ERR(-1, "build report path is too long");
+    }
+    struct zcl_result sw = pkgl_write_atomic(dst, rwire, rwire_len);
+    if (sw.ok) {
+        char id_hex[65];
+        zcl_hex_encode(receipt_id, 32, id_hex);
+        (void)snprintf(src, sizeof(src), "receipts/%s", id_hex);
+        struct zcl_result jr =
+            pkgl_receipt_path(ctx, src, dst, sizeof(dst));
+        if (jr.ok) {
+            char *slash = strrchr(dst, '/');
+            if (slash) {
+                *slash = '\0';
+                sw = pkgl_mkdir_p(dst);
+                *slash = '/';
+            }
+            if (sw.ok)
+                sw = pkgl_write_atomic(dst, rwire, rwire_len);
+        } else {
+            sw = jr;
+        }
+    }
+    free(rwire);
+    if (!sw.ok) {
+        pkgl_step_fail(step, "receipt-write", sw.message);
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "aborted install removed");
+        return sw;
+    }
+
+    /* Atomic activation of THIS root's tree: rename, never in-place edit. */
+    bool present = false;
+    ZCL_CHECK(pkgl_exists(p.final, &present));
+    if (present) {
+        /* Same root, same content: the existing tree is already correct. */
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "already installed");
+    } else if (rename(p.stage, p.final) != 0) {
+        pkgl_step_fail(step, "install-rename", strerror(errno));
+        struct zcl_result e = ZCL_ERR(-1, "rename %s -> %s: %s", p.stage,
+                                      p.final, strerror(errno));
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(p.stage), "aborted install removed");
+        return e;
+    }
+    ZCL_IGNORE_RESULT(pkgl_rm_rf(p.emit), "build work is not kept");
+
+    step->state = VCS_PACKAGE_LIFECYCLE_INSTALLED;
+    step->has_receipt = true;
+    memcpy(step->receipt_id, receipt_id, 32);
+    return ZCL_OK;
+}
+
+/* ── generations + activation ───────────────────────────────────────── */
+
+#ifndef _WIN32
+static struct zcl_result pkgl_parent_shape(const char *path,
+                                           const char *role)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return errno == ENOENT
+            ? ZCL_OK
+            : ZCL_ERR(-1, "inspect %s parent %s: %s", role, path,
+                      strerror(errno));
+    if (!S_ISDIR(st.st_mode))
+        return ZCL_ERR(-1, "%s parent is not a real directory; inspect "
+                           "the substituted path and restore the local "
+                           "%s directory: %s", role, role, path);
+    return ZCL_OK;
+}
+#endif
+
+static struct zcl_result pkgl_generations_path(const struct pkgl_ctx *ctx,
+                                               const char *name, char *out,
+                                               size_t cap)
+{
+    char publisher[VCS_PACKAGE_RELEASE_NAME_MAX + 1u];
+    char package[VCS_PACKAGE_RELEASE_NAME_MAX + 1u];
+    if (!vcs_package_name_split(name, publisher, package))
+        return ZCL_ERR(-1, "'%s' is not a publisher/package name", name);
+    char rel[2u * (VCS_PACKAGE_RELEASE_NAME_MAX + 1u) + 32u];
+    int n = snprintf(rel, sizeof(rel), "generations/%s/%s", publisher,
+                     package);
+    if (n <= 0 || (size_t)n >= sizeof(rel))
+        return ZCL_ERR(-1, "generation path too long for %s", name);
+#ifndef _WIN32
+    char parent[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_join(ctx, "generations", parent, sizeof(parent)));
+    ZCL_CHECK(pkgl_parent_shape(parent, "generation"));
+    n = snprintf(parent, sizeof(parent), "%s/generations/%s", ctx->zcode_dir,
+                 publisher);
+    if (n <= 0 || (size_t)n >= sizeof(parent))
+        return ZCL_ERR(-1, "generation publisher path too long for %s", name);
+    ZCL_CHECK(pkgl_parent_shape(parent, "generation"));
+#endif
+    return pkgl_join(ctx, rel, out, cap);
+}
+
+static struct zcl_result pkgl_active_path(const struct pkgl_ctx *ctx,
+                                          const char *name, char *out,
+                                          size_t cap)
+{
+    char publisher[VCS_PACKAGE_RELEASE_NAME_MAX + 1u];
+    char package[VCS_PACKAGE_RELEASE_NAME_MAX + 1u];
+    if (!vcs_package_name_split(name, publisher, package))
+        return ZCL_ERR(-1, "'%s' is not a publisher/package name", name);
+    char rel[2u * (VCS_PACKAGE_RELEASE_NAME_MAX + 1u) + 32u];
+    int n = snprintf(rel, sizeof(rel), "active/%s/%s", publisher, package);
+    if (n <= 0 || (size_t)n >= sizeof(rel))
+        return ZCL_ERR(-1, "active path too long for %s", name);
+#ifndef _WIN32
+    char parent[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_join(ctx, "active", parent, sizeof(parent)));
+    ZCL_CHECK(pkgl_parent_shape(parent, "active"));
+    n = snprintf(parent, sizeof(parent), "%s/active/%s", ctx->zcode_dir,
+                 publisher);
+    if (n <= 0 || (size_t)n >= sizeof(parent))
+        return ZCL_ERR(-1, "active publisher path too long for %s", name);
+    ZCL_CHECK(pkgl_parent_shape(parent, "active"));
+#endif
+    return pkgl_join(ctx, rel, out, cap);
+}
+
+#ifndef _WIN32
+static struct zcl_result pkgl_active_target_matches(
+    const struct pkgl_ctx *ctx, const char *name,
+    const uint8_t expected_root[32], const char *actual)
+{
+    char canonical[PKGL_PATH_MAX], expected[PKGL_PATH_MAX], hex[65];
+    if (!realpath(ctx->zcode_dir, canonical))
+        return ZCL_ERR(-1, "cannot resolve package store %s: %s",
+                       ctx->zcode_dir, strerror(errno));
+    zcl_hex_encode(expected_root, 32, hex);
+    int n = snprintf(expected, sizeof(expected), "%s/installed/%s",
+                     canonical, hex);
+    if (n <= 0 || (size_t)n >= sizeof(expected))
+        return ZCL_ERR(-1, "expected active pointer path is too long");
+    struct stat installed;
+    if (lstat(expected, &installed) != 0 || !S_ISDIR(installed.st_mode))
+        return ZCL_ERR(-1,
+                       "active installed root for %s is missing or not a "
+                       "directory; inspect the install and reinstall the "
+                       "exact verified root", name);
+    if (strcmp(actual, expected) != 0) {
+        /* Older absolute links may contain a spelling of the same parent
+         * through a symlink. Accept only if both paths resolve to the same
+         * installed directory; a missing tree needs exact pointer bytes. */
+        struct stat observed;
+        if (stat(actual, &observed) != 0 ||
+            observed.st_dev != installed.st_dev ||
+            observed.st_ino != installed.st_ino)
+            return ZCL_ERR(-1,
+                           "active pointer and generation log disagree for %s; "
+                           "inspect both and retry activation of the exact "
+                           "verified root", name);
+    }
+    return ZCL_OK;
+}
+#endif
+
+struct zcl_result pkgl_active_pointer_matches(
+    const struct pkgl_ctx *ctx, const char *name,
+    const uint8_t expected_root[32], bool expected_present)
+{
+    if (!ctx || !name || (expected_present && !expected_root))
+        return ZCL_ERR(-1, "active pointer check needs a package and root");
+#ifdef _WIN32
+    (void)expected_root;
+    (void)expected_present;
+    return ZCL_OK; /* Native package activation is disabled on Windows. */
+#else
+    char link[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_active_path(ctx, name, link, sizeof(link)));
+    struct stat st;
+    if (lstat(link, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return expected_present
+                ? ZCL_ERR(-1, "generation log names %s but its active pointer "
+                               "is missing; inspect the install and retry "
+                               "activation of the exact verified root", name)
+                : ZCL_OK;
+        return ZCL_ERR(-1, "inspect active pointer %s: %s", link,
+                       strerror(errno));
+    }
+    if (!expected_present || !S_ISLNK(st.st_mode))
+        return ZCL_ERR(-1, "active pointer and generation log disagree for %s; "
+                           "inspect both and retry activation of the exact "
+                           "verified root", name);
+    char actual[PKGL_PATH_MAX];
+    ssize_t len = readlink(link, actual, sizeof(actual) - 1u);
+    if (len < 0 || (size_t)len >= sizeof(actual) - 1u)
+        return ZCL_ERR(-1, "cannot read active pointer %s: %s", link,
+                       len < 0 ? strerror(errno) : "target path too long");
+    actual[len] = '\0';
+    return pkgl_active_target_matches(ctx, name, expected_root, actual);
+#endif
+}
+
+struct zcl_result pkgl_data_dir(const struct pkgl_ctx *ctx, const char *name,
+                                char *out, size_t cap)
+{
+    if (!ctx || !name || !out)
+        return ZCL_ERR(-1, "null argument resolving a package data directory");
+    char publisher[VCS_PACKAGE_RELEASE_NAME_MAX + 1u];
+    char package[VCS_PACKAGE_RELEASE_NAME_MAX + 1u];
+    if (!vcs_package_name_split(name, publisher, package))
+        return ZCL_ERR(-1, "'%s' is not a publisher/package name", name);
+    char rel[2u * (VCS_PACKAGE_RELEASE_NAME_MAX + 1u) + 32u];
+    int n = snprintf(rel, sizeof(rel), "data/%s/%s", publisher, package);
+    if (n <= 0 || (size_t)n >= sizeof(rel))
+        return ZCL_ERR(-1, "data path too long for %s", name);
+#ifndef _WIN32
+    char parent[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_join(ctx, "data", parent, sizeof(parent)));
+    ZCL_CHECK(pkgl_parent_shape(parent, "data"));
+    n = snprintf(parent, sizeof(parent), "%s/data/%s", ctx->zcode_dir,
+                 publisher);
+    if (n <= 0 || (size_t)n >= sizeof(parent))
+        return ZCL_ERR(-1, "data publisher path too long for %s", name);
+    ZCL_CHECK(pkgl_parent_shape(parent, "data"));
+#endif
+    return pkgl_join(ctx, rel, out, cap);
+}
+
+struct zcl_result pkgl_generations_load(const struct pkgl_ctx *ctx,
+                                        const char *name,
+                                        struct vcs_package_generations *out)
+{
+    if (!ctx || !name || !out)
+        return ZCL_ERR(-1, "null argument loading the generation log");
+    vcs_package_generations_init(out);
+    char path[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_generations_path(ctx, name, path, sizeof(path)));
+    bool present = false;
+    ZCL_CHECK(pkgl_exists(path, &present));
+    if (!present)
+        return ZCL_OK;
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    ZCL_CHECK(pkgl_read_file(path, VCS_PACKAGE_GENERATION_MAX_WIRE_BYTES,
+                             &wire, &wire_len));
+    enum vcs_package_install_error err =
+        vcs_package_generations_parse(wire, wire_len, out);
+    free(wire);
+    if (err != VCS_PACKAGE_INSTALL_OK)
+        return ZCL_ERR(-1, "generation log for %s: %s", name,
+                       vcs_package_install_error_string(err));
+    return ZCL_OK;
+}
+
+/* Point active/<publisher>/<package> at installed/<root>. The swap is a
+ * rename over a fresh symlink, so a reader either sees the old generation or
+ * the new one — never a missing or half-written pointer. */
+#ifndef _WIN32
+static struct zcl_result pkgl_clear_stale_active_link(const char *tmp)
+{
+    struct stat st;
+    if (lstat(tmp, &st) != 0)
+        return errno == ENOENT
+            ? ZCL_OK
+            : ZCL_ERR(-1, "inspect active temporary path %s: %s", tmp,
+                      strerror(errno));
+    if (!S_ISLNK(st.st_mode))
+        return ZCL_ERR(-1, "active temporary path is not a symlink; inspect "
+                           "and move it before retrying activation: %s", tmp);
+    if (unlink(tmp) != 0)
+        return ZCL_ERR(-1, "unlink stale active symlink %s: %s", tmp,
+                       strerror(errno));
+    return ZCL_OK;
+}
+#endif
+
+static struct zcl_result pkgl_swap_active(const struct pkgl_ctx *ctx,
+                                          const char *name,
+                                          const uint8_t root[32])
+{
+    char link[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_active_path(ctx, name, link, sizeof(link)));
+    char parent[PKGL_PATH_MAX];
+    (void)snprintf(parent, sizeof(parent), "%s", link);
+    char *slash = strrchr(parent, '/');
+    if (!slash)
+        return ZCL_ERR(-1, "active path has no parent");
+    *slash = '\0';
+    ZCL_CHECK(pkgl_mkdir_p(parent));
+
+    char target[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_installed_dir(ctx, root, target, sizeof(target)));
+    bool present = false;
+    ZCL_CHECK(pkgl_exists(target, &present));
+    if (!present)
+        return ZCL_ERR(-1, "cannot activate a root that is not installed");
+#ifndef _WIN32
+    struct stat target_st;
+    if (lstat(target, &target_st) != 0)
+        return ZCL_ERR(-1, "inspect installed root %s: %s", target,
+                       strerror(errno));
+    if (!S_ISDIR(target_st.st_mode))
+        return ZCL_ERR(-1,
+                       "installed root %s is not a directory; quarantine "
+                       "the invalid path and reinstall the exact root",
+                       target);
+    /* A caller may use a relative datadir. Symlink contents are resolved
+     * relative to active/<publisher>/, not the caller's working directory. */
+    char absolute_target[PKGL_PATH_MAX];
+    if (!realpath(target, absolute_target))
+        return ZCL_ERR(-1,
+                       "cannot resolve installed root %s for activation: %s; "
+                       "inspect the install path and retry",
+                       target, strerror(errno));
+#endif
+
+    char tmp[PKGL_PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s.zplnew.%ld", link, (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(tmp))
+        return ZCL_ERR(-1, "active temp path too long");
+#ifdef _WIN32
+    errno = ENOTSUP;
+    return ZCL_ERR(-1, "symlink %s: %s", tmp, strerror(errno));
+#else
+    ZCL_CHECK(pkgl_clear_stale_active_link(tmp));
+    if (symlink(absolute_target, tmp) != 0)
+        return ZCL_ERR(-1, "symlink %s: %s", tmp, strerror(errno));
+#endif
+    if (rename(tmp, link) != 0) {
+        int e = errno;
+#ifndef _WIN32
+        ZCL_IGNORE_RESULT(pkgl_clear_stale_active_link(tmp),
+                          "failed active swap symlink cleaned up");
+#endif
+        return ZCL_ERR(-1, "activate %s: %s", link, strerror(e));
+    }
+    return ZCL_OK;
+}
+
+/* Finish all fallible directory and file writes before changing the active
+ * pointer. Only the short final rename remains after the pointer swap. */
+static struct zcl_result pkgl_prepare_generation_log(
+    const struct pkgl_ctx *ctx, const char *name,
+    const struct vcs_package_generations *gens,
+    char path[PKGL_PATH_MAX], char staged[PKGL_PATH_MAX])
+{
+    staged[0] = '\0';
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    enum vcs_package_install_error err =
+        vcs_package_generations_serialize(gens, &wire, &wire_len);
+    if (err != VCS_PACKAGE_INSTALL_OK)
+        return ZCL_ERR(-1, "generation serialize for %s: %s", name,
+                       vcs_package_install_error_string(err));
+    struct zcl_result r = pkgl_generations_path(ctx, name, path,
+                                                PKGL_PATH_MAX);
+    if (r.ok) {
+        char parent[PKGL_PATH_MAX];
+        (void)snprintf(parent, sizeof(parent), "%s", path);
+        char *slash = strrchr(parent, '/');
+        if (!slash)
+            r = ZCL_ERR(-1, "generation log path has no parent for %s", name);
+        else {
+            *slash = '\0';
+            r = pkgl_mkdir_p(parent);
+        }
+    }
+    if (r.ok) {
+        int n = snprintf(staged, PKGL_PATH_MAX, "%s.zplprep.%ld", path,
+                         (long)getpid());
+        if (n <= 0 || (size_t)n >= PKGL_PATH_MAX) {
+            staged[0] = '\0';
+            r = ZCL_ERR(-1, "generation staging path too long for %s", name);
+        } else
+            r = pkgl_write_atomic(staged, wire, wire_len);
+    }
+    free(wire);
+    if (!r.ok)
+        return ZCL_ERR(-1, "prepare generation log for %s: %s; inspect the "
+                           "log path and retry activation", name, r.message);
+    return ZCL_OK;
+}
+
+struct zcl_result pkgl_activate(const struct pkgl_ctx *ctx, const char *name,
+                                const uint8_t root[32], int64_t now_unix,
+                                uint8_t prev_root_out[32],
+                                bool *had_previous_out)
+{
+    if (!ctx || !name || !root || !prev_root_out || !had_previous_out)
+        return ZCL_ERR(-1, "null argument activating a package");
+    memset(prev_root_out, 0, 32);
+    *had_previous_out = false;
+#ifdef _WIN32
+    return ZCL_ERR(-1,
+                   "native Windows package activation is disabled until the "
+                   "sandbox and secure immutable generation activation pass "
+                   "qualification");
+#endif
+
+    struct vcs_package_generations gens;
+    ZCL_CHECK(pkgl_generations_load(ctx, name, &gens));
+    bool already_active =
+        gens.count > 0 && memcmp(gens.items[gens.count - 1].root, root, 32) == 0;
+    if (gens.count > 0 && !already_active) {
+        memcpy(prev_root_out, gens.items[gens.count - 1].root, 32);
+        *had_previous_out = true;
+    } else if (already_active) {
+        *had_previous_out =
+            vcs_package_generations_previous(&gens, prev_root_out);
+    }
+
+    /* The package's persistent data directory is created before the swap
+     * and is never removed by an install, an update, or a rollback — those
+     * only ever move the active pointer between content-addressed trees.
+     * Creating it here rather than at first install means every path that
+     * makes a version current also guarantees the place the user's own data
+     * lives, including a rollback onto a generation installed before this
+     * directory existed. mkdir_p is idempotent, so re-activation is a
+     * no-op and an existing directory is left exactly as the user left it. */
+    char data_dir[PKGL_PATH_MAX];
+    ZCL_CHECK(pkgl_data_dir(ctx, name, data_dir, sizeof(data_dir)));
+    ZCL_CHECK(pkgl_mkdir_p(data_dir));
+
+    if (already_active)
+        return pkgl_swap_active(ctx, name, root);
+
+    enum vcs_package_install_error err =
+        vcs_package_generations_append(&gens, root, now_unix);
+    if (err != VCS_PACKAGE_INSTALL_OK)
+        return ZCL_ERR(-1, "generation append for %s: %s", name,
+                       vcs_package_install_error_string(err));
+    char path[PKGL_PATH_MAX], staged[PKGL_PATH_MAX];
+    struct zcl_result prepared =
+        pkgl_prepare_generation_log(ctx, name, &gens, path, staged);
+    if (!prepared.ok) {
+        if (staged[0])
+            ZCL_IGNORE_RESULT(pkgl_rm_rf(staged),
+                              "failed generation staging cleaned up");
+        return prepared;
+    }
+    struct zcl_result swapped = pkgl_swap_active(ctx, name, root);
+    if (!swapped.ok) {
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(staged), "unused generation staged file");
+        return swapped;
+    }
+    if (rename(staged, path) != 0) {
+        int e = errno;
+        ZCL_IGNORE_RESULT(pkgl_rm_rf(staged), "failed generation staged file");
+        return ZCL_ERR(-1, "publish generation log for %s: %s; the active "
+                           "pointer may have changed, so inspect both and "
+                           "retry activation of the exact verified root",
+                       name, strerror(e));
+    }
+    return ZCL_OK;
+}
+
+/* ── pinning ────────────────────────────────────────────────────────── */
+
+struct zcl_result pkgl_pin(const struct pkgl_ctx *ctx, const uint8_t root[32])
+{
+    if (!ctx || !root)
+        return ZCL_ERR(-1, "null argument pinning a package");
+    struct vcs_package_store *store =
+        vcs_package_store_open(ctx->datadir, vcs_package_store_quota_bytes());
+    if (!store)
+        return ZCL_ERR(-1, "cannot open the package store under %s",
+                       ctx->datadir);
+    enum vcs_package_store_result r =
+        vcs_package_store_pin(store, root, true);
+    vcs_package_store_close(store);
+    if (r != VCS_PACKAGE_STORE_OK)
+        return ZCL_ERR(-1, "pin refused: %s",
+                       vcs_package_store_result_string(r));
+    return ZCL_OK;
+}
+
+/* ── the programs an install hands a person ─────────────────────────── */
+
+static struct zcl_result pkgl_programs_check_install(
+    const char *datadir, const uint8_t root[32])
+{
+    struct package_lifecycle_step inspected;
+    bool verified_install = false;
+    struct zcl_result inspection = package_lifecycle_installed_inspect(
+        datadir, root, &inspected, &verified_install);
+    if (!inspection.ok)
+        return ZCL_ERR(-1,
+                       "cannot list programs from an invalid install: %s; "
+                       "quarantine the damaged tree and reinstall the exact root",
+                       inspection.message);
+    if (!verified_install)
+        return ZCL_ERR(-1,
+                       "cannot list programs from a root that is not installed; "
+                       "install the exact root first");
+    return ZCL_OK;
+}
+
+struct zcl_result package_lifecycle_installed_programs(
+    const char *datadir, const uint8_t root[32],
+    struct package_lifecycle_programs *out)
+{
+    if (!out)
+        return ZCL_ERR(-1, "null installed-programs report");
+    memset(out, 0, sizeof(*out));
+    if (!root)
+        return ZCL_ERR(-1, "null package root");
+    ZCL_CHECK(pkgl_programs_check_install(datadir, root));
+    struct pkgl_ctx ctx;
+    ZCL_CHECK(pkgl_ctx_open(&ctx, datadir));
+    char installed[PKGL_PATH_MAX];
+    struct zcl_result r =
+        pkgl_installed_dir(&ctx, root, installed, sizeof(installed));
+    bool present = false;
+    if (r.ok)
+        r = pkgl_exists(installed, &present);
+    if (r.ok && !present)
+        r = ZCL_ERR(-1, "this package root is not installed under %s",
+                    ctx.datadir);
+    /* An operator is handed a path to RUN, so report the resolved absolute
+     * one: a relative datadir would otherwise produce a command that only
+     * works from whichever directory the node happened to be started in. */
+    if (r.ok) {
+#ifdef _WIN32
+        int n = snprintf(out->install_dir, sizeof(out->install_dir), "%s",
+                         installed);
+        if (n <= 0 || (size_t)n >= sizeof(out->install_dir))
+            r = ZCL_ERR(-1, "installed directory path is too long");
+#else
+        char resolved[PKGL_PATH_MAX];
+        if (!realpath(installed, resolved))
+            r = ZCL_ERR(-1, "cannot resolve %s: %s", installed,
+                        strerror(errno));
+        else {
+            int n = snprintf(out->install_dir, sizeof(out->install_dir),
+                             "%s", resolved);
+            if (n <= 0 || (size_t)n >= sizeof(out->install_dir))
+                r = ZCL_ERR(-1, "installed directory path is too long");
+        }
+#endif
+    }
+    char report[PKGL_PATH_MAX];
+    if (r.ok) {
+        int n = snprintf(report, sizeof(report), "%s/build-report", installed);
+        if (n <= 0 || (size_t)n >= sizeof(report))
+            r = ZCL_ERR(-1, "installed receipt path is too long");
+    }
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    if (r.ok)
+        r = pkgl_read_file(report, VCS_PACKAGE_BUILD_MAX_WIRE_BYTES, &wire,
+                           &wire_len);
+    if (!r.ok) {
+        pkgl_ctx_close(&ctx);
+        return r;
+    }
+    struct vcs_package_build_receipt receipt;
+    enum vcs_package_build_error parsed =
+        vcs_package_build_parse(wire, wire_len, &receipt);
+    free(wire);
+    pkgl_ctx_close(&ctx);
+    if (parsed != VCS_PACKAGE_BUILD_OK)
+        return ZCL_ERR(-1, "installed receipt: %s",
+                       vcs_package_build_error_string(parsed));
+    for (size_t i = 0; i < receipt.output_count; i++) {
+        const char *path = receipt.outputs[i].path;
+        if (strncmp(path, "bin/", 4) != 0)
+            continue;
+        if (out->count >= PACKAGE_LIFECYCLE_MAX_PROGRAMS)
+            return ZCL_ERR(-1, "receipt names more than %u programs",
+                           (unsigned)PACKAGE_LIFECYCLE_MAX_PROGRAMS);
+        (void)snprintf(out->output[out->count],
+                       sizeof(out->output[out->count]), "%s", path);
+        out->count++;
+    }
+    return ZCL_OK;
+}
+void package_lifecycle_declared_output_close(
+    struct package_lifecycle_declared_output **handle)
+{
+    if (!handle || !*handle) return;
+    platform_positioned_file_close(&(*handle)->file);
+    free(*handle);
+    *handle = NULL;
+}
+
+static struct zcl_result pkgl_declared_hash(
+    const struct platform_positioned_file *file, uint64_t bytes,
+    const uint8_t digest[32])
+{
+    struct platform_positioned_file_snapshot before, after;
+    if (!platform_positioned_file_snapshot(file, &before) || before.size != bytes)
+        return ZCL_ERR(-1, "declared output size cannot be verified");
+    struct sha3_256_ctx hash;
+    sha3_256_init(&hash);
+    uint8_t chunk[4096];
+    uint64_t offset = 0;
+    while (offset < bytes) {
+        size_t want = bytes - offset < sizeof(chunk)
+            ? (size_t)(bytes - offset) : sizeof(chunk);
+        int64_t got = platform_positioned_file_read(file, chunk, want, offset);
+        if (got <= 0 || (uint64_t)got > want)
+            return ZCL_ERR(-1, "declared output bounded read failed");
+        sha3_256_write(&hash, chunk, (size_t)got);
+        offset += (uint64_t)got;
+    }
+    uint8_t actual[32];
+    sha3_256_finalize(&hash, actual);
+    if (platform_positioned_file_read(file, chunk, 1, bytes) != 0 ||
+        !platform_positioned_file_snapshot(file, &after) ||
+        !platform_positioned_file_snapshot_equal(&before, &after) ||
+        memcmp(actual, digest, 32) != 0)
+        return ZCL_ERR(-1, "declared output changed or its digest differs");
+    return ZCL_OK;
+}
+
+static struct zcl_result pkgl_declared_outputs_verify(
+    const char *installed, const struct vcs_package_build_receipt *receipt)
+{
+    for (size_t i = 0; i < receipt->output_count; i++) {
+        const struct vcs_package_build_output *o = &receipt->outputs[i];
+        struct platform_positioned_file file;
+        platform_positioned_file_init(&file);
+        if (!platform_positioned_file_open_beneath(&file, installed, o->path))
+            return ZCL_ERR(-1, "declared output %s is not a confined regular file", o->path);
+        struct zcl_result result = pkgl_declared_hash(&file, o->bytes, o->sha3);
+        platform_positioned_file_close(&file);
+        if (!result.ok) return result;
+#ifndef _WIN32
+        char path[PKGL_PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", installed, o->path);
+        if (n <= 0 || (size_t)n >= sizeof(path))
+            return ZCL_ERR(-1, "declared output permission path is too long");
+        if (strncmp(o->path, "bin/", 4) == 0 && access(path, X_OK) != 0)
+            return ZCL_ERR(-1, "declared program %s lacks executable permission", o->path);
+#endif
+    }
+    return ZCL_OK;
+}
+
+static struct zcl_result pkgl_declared_budget(
+    const struct vcs_package_build_receipt *receipt, const char *path,
+    uint64_t artifact_max, uint64_t verification_max, size_t *selected)
+{
+    uint64_t demand = 0;
+    bool found = false;
+    for (size_t i = 0; i < receipt->output_count; i++) {
+        uint64_t bytes = receipt->outputs[i].bytes;
+        if (bytes == UINT64_MAX || demand > UINT64_MAX - bytes - 1u)
+            return ZCL_ERR(-1, "declared output verification demand overflows");
+        demand += bytes + 1u;
+        if (strcmp(receipt->outputs[i].path, path) == 0) {
+            *selected = i;
+            found = true;
+        }
+    }
+    if (!found) return ZCL_ERR(-1, "requested output is not declared by the installed receipt");
+    uint64_t bytes = receipt->outputs[*selected].bytes;
+    if (bytes > artifact_max || bytes > SIZE_MAX)
+        return ZCL_ERR(-1, "declared output exceeds the caller artifact limit");
+    if (bytes == UINT64_MAX || demand > UINT64_MAX - bytes - 1u)
+        return ZCL_ERR(-1, "retained output verification demand overflows");
+    if (demand + bytes + 1u > verification_max)
+        return ZCL_ERR(-1, "declared outputs exceed the caller verification limit");
+    return ZCL_OK;
+}
+
+struct zcl_result pkgl_declared_open_bytes(
+    struct package_lifecycle_declared_output *handle,
+    struct vcs_package_build_receipt *receipt, const char *path,
+    uint64_t artifact_max, uint64_t verification_max, const char *installed)
+{
+    size_t selected = 0;
+    ZCL_CHECK(pkgl_declared_budget(receipt, path, artifact_max, verification_max, &selected));
+    const struct vcs_package_build_output *o = &receipt->outputs[selected];
+    handle->bytes = o->bytes;
+    memcpy(handle->digest, o->sha3, 32);
+    memcpy(handle->path, o->path, sizeof(handle->path));
+    if (!platform_positioned_file_open_beneath(&handle->file, installed, path))
+        return ZCL_ERR(-1, "retained output is not a confined regular file");
+    ZCL_CHECK(pkgl_declared_outputs_verify(installed, receipt));
+    ZCL_CHECK(pkgl_declared_hash(&handle->file, handle->bytes, handle->digest));
+    if (!platform_positioned_file_snapshot(&handle->file, &handle->opened) ||
+        handle->opened.size != handle->bytes)
+        return ZCL_ERR(-1, "retained output final snapshot failed");
+    return ZCL_OK;
+}
+
+static bool pkgl_declared_same_identity(
+    const struct platform_positioned_file_snapshot *a,
+    const struct platform_positioned_file_snapshot *b)
+{
+    return a->size == b->size && a->volume == b->volume &&
+        a->file_low == b->file_low && a->file_high == b->file_high;
+}
+
+static struct zcl_result pkgl_declared_copied_verify(
+    const struct package_lifecycle_declared_output *handle, const void *buffer,
+    size_t copied, const struct platform_positioned_file_snapshot *before)
+{
+    struct platform_positioned_file_snapshot after;
+    uint8_t digest[32], extra;
+    struct sha3_256_ctx hash;
+    sha3_256_init(&hash);
+    if (copied) sha3_256_write(&hash, buffer, copied);
+    sha3_256_finalize(&hash, digest);
+    if (copied != handle->bytes ||
+        platform_positioned_file_read(&handle->file, &extra, 1, handle->bytes) != 0 ||
+        !platform_positioned_file_snapshot(&handle->file, &after) ||
+        !platform_positioned_file_snapshot_equal(before, &after) ||
+        memcmp(digest, handle->digest, 32) != 0)
+        return ZCL_ERR(-1, "retained output read changed or differs from the receipt");
+    return ZCL_OK;
+}
+
+struct zcl_result pkgl_declared_copy(
+    struct package_lifecycle_declared_output *handle, void *buffer,
+    size_t capacity, size_t *produced)
+{
+    if (produced) *produced = 0;
+    if (!handle || !produced || (!buffer && handle->bytes) || capacity < handle->bytes)
+        return ZCL_ERR(-1, "retained output read requires sufficient capacity");
+    struct platform_positioned_file_snapshot before;
+    if (!platform_positioned_file_snapshot(&handle->file, &before) ||
+        !pkgl_declared_same_identity(&handle->opened, &before))
+        return ZCL_ERR(-1, "retained output identity or size changed");
+    size_t copied = 0;
+    while (copied < (size_t)handle->bytes) {
+        size_t remaining = (size_t)handle->bytes - copied;
+        size_t want = remaining < 4096u ? remaining : 4096u;
+        int64_t got = platform_positioned_file_read(&handle->file,
+            (uint8_t *)buffer + copied, want, copied);
+        if (got <= 0 || (uint64_t)got > want) break;
+        copied += (size_t)got;
+    }
+    struct zcl_result result = pkgl_declared_copied_verify(handle, buffer, copied, &before);
+    if (!result.ok) {
+        if (copied) memory_cleanse(buffer, copied);
+        return result;
+    }
+    *produced = copied;
+    return ZCL_OK;
+}
+
+void pkgl_declared_copy_clear(void *buffer, size_t copied)
+{
+    if (copied) memory_cleanse(buffer, copied);
+}

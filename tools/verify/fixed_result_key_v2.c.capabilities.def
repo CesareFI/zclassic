@@ -1,0 +1,2 @@
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
+ZCL_MODULE_CAPABILITY("tools/verify/fixed_result_key_v2.c", CAP_FS_READ|CAP_FS_WRITE, "the Darwin arm of platform_dirfd_child_path re-derives a directory descriptor path with fcntl(F_GETPATH), fstat and stat to refuse a replaced directory")

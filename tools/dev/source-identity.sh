@@ -1,0 +1,1529 @@
+#!/usr/bin/env bash
+# Copyright 2026 Rhett Creighton - Apache License 2.0
+#
+# Supersession identity for the complete current build-source inventory. Git is
+# used only to enumerate tracked/untracked paths and inspect index flags; its
+# object ids and commit history are never hashed or trusted. This is a
+# verify-loop diagnostic, not the immutable Phase-3 publication epoch schema.
+# Initialized gitlinks are inventoried recursively. Exact static archives and
+# generated vendor headers selected by the current build are included even when
+# Git-ignored. Every file beneath the C23 source/include/template roots is also
+# inventoried independently of `.gitignore` and `.git/info/exclude`, because
+# Make wildcards and compiler includes do not honor Git ignore rules -- with
+# the one exception Make itself makes, the ephemeral lint fixture (a "/_" path
+# component), which no compile glob admits. `capture-record` re-derives the
+# whole record in a fresh process when the tree moves under an attempt, so a
+# concurrent writer costs seconds rather than the whole build; a tree that
+# never holds still still fails closed. The
+# compiler/toolchain state, environment, and full build configuration remain
+# deferred. Hidden index bits, discovery errors, and unsupported source types
+# fail closed. Linked binaries must also `verify-record` after linking; capture
+# alone is not a filesystem snapshot or publication receipt. `verify-mutation`
+# is the bounded post-proof CAS: it re-enumerates the complete inventory and
+# compares ABA-resistant file, directory/index, and Git exclude-policy epochs
+# around that scan, but does not redundantly re-hash proved source contents.
+
+set -euo pipefail
+
+MODE="${1:-capture}"
+EXPECTED="${2:-}"
+EXPECTED_CLEAN="${3:-}"
+EXPECTED_MUTATION="${4:-}"
+NEED_DIRTY_PATHS=0
+[ "$MODE" = paths ] && NEED_DIRTY_PATHS=1
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 2
+SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
+if [ -n "${ZCL_SOVEREIGN_SOURCE_ROOT:-}" ]; then
+    exec "$SELF_DIR/sovereign-source-identity.sh" "$@"
+fi
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "source-identity: not inside a Git worktree" >&2
+    exit 2
+}
+cd "$ROOT"
+
+# The native helper replaces hundreds of stat/sha256sum children without
+# becoming an availability dependency. A missing or stale helper is rebuilt
+# atomically when a C23 compiler is present; otherwise capture retains the
+# byte-identical coreutils/portable implementation below.
+SOURCE_IDENTITY_BATCH=""
+if [ "${ZCL_SOURCE_IDENTITY_BATCH_DISABLE:-0}" != 1 ]; then
+    SOURCE_IDENTITY_BATCH="$($SELF_DIR/source-identity-batch-bootstrap.sh \
+        2>/dev/null || true)"
+    [ -x "$SOURCE_IDENTITY_BATCH" ] || SOURCE_IDENTITY_BATCH=""
+fi
+
+# Optional host-local, per-Make-invocation memoization for capture-record and
+# verify-record (see capture_record_cached() below). One plain `make
+# build-only` or `make t-fast` calls one of those two modes 4-5 times even
+# with zero source changes (Makefile parse-time BUILD_SOURCE_RECORD, the
+# mutation/identity stamps, and every build-epoch-session.sh acquire/verify),
+# and each call is a full git-ls-files+find+sha256 walk of every build input.
+# A caller opts in by setting ZCL_SOURCE_IDENTITY_SESSION to a `pid:start`
+# token identifying the ONE live Make process driving the whole invocation
+# (Make's own pid plus its /proc start-time in clock ticks, so a later
+# process that reuses the same pid never collides with a stale entry). Unset
+# or malformed disables memoization for that call -- always safe, just slower.
+ZCL_SOURCE_IDENTITY_SESSION="${ZCL_SOURCE_IDENTITY_SESSION:-}"
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/zcl-source-identity.XXXXXX")" || exit 2
+trap 'rm -rf "$WORK"' EXIT HUP INT TERM
+
+fail()
+{
+    echo "source-identity: $*" >&2
+    exit 3
+}
+
+# A capture that loses a race with a concurrent writer is NOT the same class of
+# failure as an unreadable submodule or an unsupported file type. The test
+# suite deliberately plants short-lived files inside the worktree (the lint
+# gates do it so their scan scopes stay honest), and any other checkout
+# activity can create or remove one while a whole-tree capture is running.
+# Exit 4 marks "the tree moved under this attempt, ask again"; capture-record
+# re-derives the whole record in a fresh process instead of stopping the build
+# on the first blip. Exit 3 stays reserved for a verdict a retry cannot change.
+RACY_EXIT=4
+fail_racy()
+{
+    echo "source-identity: $*" >&2
+    exit $RACY_EXIT
+}
+
+GIT_INDEX_PATH=""
+if [ "$MODE" = verify-mutation ]; then
+    GIT_INDEX_PATH="$(git rev-parse --git-path index 2>/dev/null)" ||
+        fail "could not resolve Git index path"
+    case "$GIT_INDEX_PATH" in
+        /*) ;;
+        *) GIT_INDEX_PATH="$ROOT/$GIT_INDEX_PATH" ;;
+    esac
+    [ -f "$GIT_INDEX_PATH" ] || fail "Git index is unavailable"
+    : > "$WORK/epoch-indexes"
+    printf '%s\0' "$GIT_INDEX_PATH" >> "$WORK/epoch-indexes"
+    : > "$WORK/epoch-repos"
+    printf '.\0' >> "$WORK/epoch-repos"
+fi
+
+sha256_stream()
+{
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    else
+        fail "no SHA-256 implementation is available"
+    fi
+}
+
+sha256_file()
+{
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum < "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 < "$1" | awk '{print $1}'
+    else
+        fail "no SHA-256 implementation is available"
+    fi
+}
+
+# Collapse host permission details into the modes Git can represent. Special
+# bits and group/other write bits are not source identity; executable intent is.
+canonical_source_mode()
+{
+    local kind="$1" raw="$2" out_name="$3" value canonical
+    [[ "$raw" =~ ^[0-9a-fA-F]+$ ]] || return 1
+    value=$((16#$raw))
+    case "$kind" in
+        L)
+            [ $((value & 0170000)) -eq $((0120000)) ] || return 1
+            canonical=120000
+            ;;
+        F)
+            [ $((value & 0170000)) -eq $((0100000)) ] || return 1
+            if [ $((value & 0111)) -ne 0 ]; then
+                canonical=100755
+            else
+                canonical=100644
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    printf -v "$out_name" '%s' "$canonical"
+}
+
+# readlink writes one record-terminating newline. Command substitution normally
+# strips every trailing newline, including legal newlines that are part of the
+# symlink target. Append a non-newline sentinel, then remove exactly the
+# sentinel and readlink's one delimiter while preserving target bytes.
+read_symlink_target()
+{
+    local link_path="$1" out_name="$2" raw sentinel=$'\x1f'
+    raw="$(
+        readlink -- "$link_path" || exit 1
+        printf '%s' "$sentinel"
+    )" || return 1
+    [ "${raw: -1}" = "$sentinel" ] || return 1
+    raw="${raw%"$sentinel"}"
+    [ "${raw: -1}" = $'\n' ] || return 1
+    raw="${raw%$'\n'}"
+    printf -v "$out_name" '%s' "$raw"
+}
+
+# `git diff` deliberately does not reveal content hidden by assume-unchanged
+# or skip-worktree.  Refuse the entire publication epoch if either bit exists;
+# silently trusting those flags would let a sealed edit evade the dirty set.
+# The helper's refusal message and exit status 3 are this file's fail()
+# verdict byte-for-byte; the loop remains the no-helper fallback.
+git ls-files -v -z > "$WORK/index-tags" ||
+    fail "could not inspect Git index flags"
+if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+    "$SOURCE_IDENTITY_BATCH" check-tags < "$WORK/index-tags"
+else
+    while IFS= read -r -d '' record; do
+        tag="${record:0:1}"
+        path="${record:2}"
+        case "$tag" in
+            S|[a-z]) fail "hidden Git index bit on path: $path (clear skip-worktree/assume-unchanged before publication)" ;;
+        esac
+    done < "$WORK/index-tags"
+fi
+
+git ls-files --others --exclude-standard -z -- > "$WORK/untracked" ||
+    fail "untracked dirty-set discovery failed"
+: > "$WORK/paths"
+if [ "$NEED_DIRTY_PATHS" = 1 ]; then
+    git diff --name-only --no-renames -z HEAD -- > "$WORK/tracked" ||
+        fail "tracked dirty-set discovery failed"
+    {
+        cat "$WORK/tracked"
+        cat "$WORK/untracked"
+    } | LC_ALL=C sort -zu > "$WORK/paths"
+fi
+
+# Build the COMPLETE current source inventory separately from the dirty-path
+# API above. A clean tree derives its identity from file bytes, never a Git
+# object id. An initialized gitlink is recursively inventoried from its current
+# tracked and nonignored-untracked bytes; a missing gitlink gets a distinct
+# marker. Direct vendored archive and generated-header inputs are included even
+# when ignored, so an active vendor input change supersedes the build identity.
+: > "$WORK/tracked-source"
+declare -A GITLINK_STATE=()
+GITLINK_SEQ=0
+if [ "$MODE" = verify-mutation ]; then
+    : > "$WORK/source-dirs"
+    printf '.\0' >> "$WORK/source-dirs"
+fi
+
+append_prefixed_nul()
+{
+    local input="$1" prefix="$2" output="$3" relative
+    if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+        "$SOURCE_IDENTITY_BATCH" prefix "$prefix" < "$input" >> "$output"
+        return
+    fi
+    while IFS= read -r -d '' relative; do
+        printf '%s/%s\0' "$prefix" "$relative" >> "$output"
+    done < "$input"
+}
+
+collect_gitlink()
+{
+    local prefix="$1" top physical record meta relative mode stage tag path
+    local gitlink_index nested
+    local seq=$GITLINK_SEQ
+    GITLINK_SEQ=$((GITLINK_SEQ + 1))
+    printf '%s\0' "$prefix" >> "$WORK/tracked-source"
+    GITLINK_STATE["$prefix"]=absent
+    if [ ! -e "$prefix" ] && [ ! -L "$prefix" ]; then
+        return 0
+    fi
+    [ -d "$prefix" ] && [ ! -L "$prefix" ] ||
+        fail "invalid gitlink worktree: $prefix"
+    if [ ! -e "$prefix/.git" ]; then
+        if find "$prefix" -mindepth 1 -maxdepth 1 -print -quit \
+                > "$WORK/gitlink-uninitialized-$seq" 2>/dev/null &&
+           [ ! -s "$WORK/gitlink-uninitialized-$seq" ]; then
+            GITLINK_STATE["$prefix"]=uninitialized-empty
+            return 0
+        fi
+        # Name the recovery command in the message itself. This refusal stops
+        # EVERY build (Makefile refuses to select a compile epoch without an
+        # exact source id), so it surfaces as `make test-parallel` dying in
+        # seconds having run no tests, or `make ship` reporting only that the
+        # suite did not pass. Without the fix on the line, each reader has to
+        # rediscover that a submodule with bytes but no .git is the cause.
+        fail "nonempty uninitialized gitlink would omit bytes: $prefix
+  This stops every build: the source id cannot be exact while a populated
+  submodule is unreadable, so no compile epoch can be selected.
+  Fix:      make worktree-prime
+            It initializes the submodule FIRST and copies the Tor archives
+            second. Doing those two in the other order converts this hard
+            failure into a silent stub-Tor build that only surfaces at ship
+            time, roughly 25 minutes in.
+  Why:      docs/AGENT_TRAPS.md, build-trap table, rows 1 and 2"
+    fi
+    top="$(git -C "$prefix" rev-parse --show-toplevel 2>/dev/null)" ||
+        fail "could not resolve gitlink worktree: $prefix"
+    top="$(cd "$top" && pwd -P)" ||
+        fail "could not canonicalize gitlink worktree: $prefix"
+    physical="$(cd "$prefix" && pwd -P)" ||
+        fail "could not enter gitlink worktree: $prefix"
+    [ "$top" = "$physical" ] ||
+        fail "gitlink resolves to a foreign worktree: $prefix"
+    GITLINK_STATE["$prefix"]=present
+    if [ "$MODE" = verify-mutation ]; then
+        gitlink_index="$(git -C "$prefix" rev-parse --git-path index \
+            2>/dev/null)" ||
+            fail "could not resolve gitlink index path: $prefix"
+        case "$gitlink_index" in
+            /*) ;;
+            *) gitlink_index="$physical/$gitlink_index" ;;
+        esac
+        [ -f "$gitlink_index" ] ||
+            fail "gitlink index is unavailable: $prefix"
+        printf '%s\0' "$gitlink_index" >> "$WORK/epoch-indexes"
+        printf '%s\0' "$prefix" >> "$WORK/epoch-repos"
+        find "$prefix" -name .git -prune -o -type d -print0 \
+            >> "$WORK/source-dirs" 2>/dev/null ||
+            fail "gitlink directory inventory failed: $prefix"
+    fi
+
+    git -C "$prefix" ls-files -v -z > "$WORK/gitlink-tags-$seq" ||
+        fail "could not inspect gitlink index flags: $prefix"
+    if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+        "$SOURCE_IDENTITY_BATCH" check-tags "$prefix" \
+            < "$WORK/gitlink-tags-$seq"
+    else
+        while IFS= read -r -d '' record; do
+            tag="${record:0:1}"
+            path="${record:2}"
+            case "$tag" in
+                S|[a-z]) fail "hidden Git index bit in gitlink path: $prefix/$path" ;;
+            esac
+        done < "$WORK/gitlink-tags-$seq"
+    fi
+
+    git -C "$prefix" ls-files --others --exclude-standard -z -- \
+        > "$WORK/gitlink-untracked-$seq" ||
+        fail "gitlink untracked discovery failed: $prefix"
+    if [ "$NEED_DIRTY_PATHS" = 1 ]; then
+        git -C "$prefix" diff --name-only --no-renames -z HEAD -- \
+            > "$WORK/gitlink-dirty-$seq" ||
+            fail "gitlink dirty-set discovery failed: $prefix"
+        append_prefixed_nul "$WORK/gitlink-dirty-$seq" "$prefix" \
+            "$WORK/paths"
+        append_prefixed_nul "$WORK/gitlink-untracked-$seq" "$prefix" \
+            "$WORK/paths"
+    fi
+    # Tor's generated receipt describes the selected archives and their
+    # producer; it is not source consumed by the compiler. Archive bytes
+    # remain explicit inputs below, and readiness still verifies the receipt.
+    # Only the untracked receipt is excluded: a tracked file remains an input.
+    while IFS= read -r -d '' relative; do
+        if [ "$prefix/$relative" = vendor/tor/.provenance ]; then
+            continue
+        fi
+        printf '%s/%s\0' "$prefix" "$relative" >> "$WORK/tracked-source"
+    done < "$WORK/gitlink-untracked-$seq"
+
+    git -C "$prefix" ls-files --stage -z -- \
+        > "$WORK/gitlink-index-$seq" ||
+        fail "gitlink tracked-source discovery failed: $prefix"
+    if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+        # Native split: regular/symlink records land on tracked-source, nested
+        # gitlinks on the queue file this loop then recurses over. The legacy
+        # loop interleaves recursion with the parse; the final tracked-source
+        # sort makes the orders equivalent.
+        "$SOURCE_IDENTITY_BATCH" split-index "$WORK/gitlink-nested-$seq" \
+            "$prefix" < "$WORK/gitlink-index-$seq" >> "$WORK/tracked-source"
+        while IFS= read -r -d '' nested; do
+            collect_gitlink "$nested"
+        done < "$WORK/gitlink-nested-$seq"
+    else
+        while IFS= read -r -d '' record; do
+            meta="${record%%$'\t'*}"
+            relative="${record#*$'\t'}"
+            mode="${meta%% *}"
+            stage="${meta##* }"
+            [ "$stage" = 0 ] ||
+                fail "unmerged gitlink index stage $stage for path: $prefix/$relative"
+            case "$mode" in
+                100644|100755|120000)
+                    printf '%s/%s\0' "$prefix" "$relative" \
+                        >> "$WORK/tracked-source"
+                    ;;
+                160000) collect_gitlink "$prefix/$relative" ;;
+                *) fail "unsupported gitlink index mode $mode for path: $prefix/$relative" ;;
+            esac
+        done < "$WORK/gitlink-index-$seq"
+    fi
+}
+
+git ls-files --stage -z -- > "$WORK/tracked-index" ||
+    fail "tracked source discovery failed"
+if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+    # Native split: regular/symlink records land on tracked-source, top-level
+    # gitlinks on the queue file this loop then recurses over (see
+    # collect_gitlink for why the deferred order is equivalent).
+    "$SOURCE_IDENTITY_BATCH" split-index "$WORK/gitlink-queue" \
+        < "$WORK/tracked-index" >> "$WORK/tracked-source"
+    while IFS= read -r -d '' nested; do
+        collect_gitlink "$nested"
+    done < "$WORK/gitlink-queue"
+else
+    while IFS= read -r -d '' record; do
+        meta="${record%%$'\t'*}"
+        path="${record#*$'\t'}"
+        mode="${meta%% *}"
+        stage="${meta##* }"
+        [ "$stage" = 0 ] ||
+            fail "unmerged index stage $stage for path: $path"
+        case "$mode" in
+            100644|100755|120000) printf '%s\0' "$path" >> "$WORK/tracked-source" ;;
+            160000) collect_gitlink "$path" ;;
+            *) fail "unsupported tracked index mode $mode for path: $path" ;;
+        esac
+    done < "$WORK/tracked-index"
+fi
+
+# Git ignore policy is not build policy. GNU Make selects C sources with
+# wildcards and the compiler recursively opens headers/templates beneath these
+# roots even when `.gitignore` or the local `.git/info/exclude` hides them from
+# `git ls-files --others --exclude-standard`. Inventory every regular file in
+# those roots independently. Reject symlinks, sockets, FIFOs, and other special
+# nodes there: a compiler-followed symlink would bind only its target pathname,
+# not the mutable target bytes. `.git` metadata inside a future nested worktree
+# is pruned; initialized gitlinks are handled by collect_gitlink() above.
+#
+# One class beneath these roots is deliberately NOT a compiler input: the
+# ephemeral lint fixture. Lint-gate self-tests plant short-lived sources such
+# as engine/services/src/_trust_order_fixture_tmp.c inside the production scan
+# tree so the gates prove their scopes, and the Makefile already refuses to
+# compile them (zcl_filter_ephemeral_sources drops every path containing
+# "/_"). Inventorying a file the build never opens bought no identity and cost
+# every concurrent `make` in the checkout its compile epoch: the path set is
+# enumerated twice around a capture that takes seconds on a loaded box, so a
+# fixture that appeared or vanished in between reported "source inventory
+# changed during identity capture" and stopped the build before a single test
+# ran. Prune the same "/_" component the compile globs prune, so the inventory
+# covers exactly what the build can read.
+#
+# tools/lint/scan_exclusions.sh already gave every repo-scanning LINT gate
+# immunity to this same "scanner fixture-race"; this walk is the scanner that
+# never got it. The rule here is the Makefile's, not that file's narrower
+# fixture-name glob, because the authority for "is this a build input" is the
+# glob that decides whether the compiler ever opens it.
+BUILD_INPUT_ROOTS=(core engine contexts cognition platform tests tools)
+
+# The Makefile's own ephemeral-source predicate, expressed once here so the
+# inventory and the compile globs cannot drift apart: a path beneath a build
+# input root that carries a "/_" component is a lint fixture, never a
+# translation unit. Anything outside those roots is left alone.
+is_ephemeral_build_input()
+{
+    local candidate="$1" root
+    case "$candidate" in
+        */_*) ;;
+        *) return 1 ;;
+    esac
+    for root in "${BUILD_INPUT_ROOTS[@]}"; do
+        case "$candidate" in
+            "$root"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+existing_build_roots=()
+for path in "${BUILD_INPUT_ROOTS[@]}"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        [ -d "$path" ] && [ ! -L "$path" ] ||
+            fail "build input root is not a real directory: $path"
+        existing_build_roots+=("$path")
+    fi
+done
+if [ "$MODE" = verify-mutation ]; then
+    for path in vendor vendor/lib vendor/tor \
+                vendor/tor/src/ext/ed25519/donna \
+                vendor/tor/src/ext/ed25519/ref10 \
+                vendor/tor/src/ext/keccak-tiny; do
+        if [ -d "$path" ] && [ ! -L "$path" ]; then
+            printf '%s\0' "$path" >> "$WORK/source-dirs"
+        fi
+    done
+fi
+if [ "${#existing_build_roots[@]}" -gt 0 ]; then
+    find "${existing_build_roots[@]}" \( -name .git -o -name "_*" \) -prune -o \
+        ! -type d ! -type f -print0 \
+        > "$WORK/build-root-unsupported" 2>/dev/null ||
+        fail "build input root discovery failed"
+    if [ -s "$WORK/build-root-unsupported" ]; then
+        IFS= read -r -d '' path < "$WORK/build-root-unsupported" || true
+        fail "unsupported compiler input beneath build roots: ${path:-unknown}"
+    fi
+    find "${existing_build_roots[@]}" \( -name .git -o -name "_*" \) -prune -o \
+        -type f -print0 >> "$WORK/tracked-source" 2>/dev/null ||
+        fail "build input inventory failed"
+    if [ "$MODE" = verify-mutation ]; then
+        find "${existing_build_roots[@]}" \( -name .git -o -name "_*" \) -prune -o \
+            -type d -print0 >> "$WORK/source-dirs" 2>/dev/null ||
+            fail "build input directory inventory failed"
+    fi
+fi
+
+# Gitlink discovery appends its own paths after the root diagnostic list was
+# sorted. Restore one canonical set for the explicit `paths` mode. Authority
+# modes never execute the HEAD-relative diagnostic at all.
+if [ "$NEED_DIRTY_PATHS" = 1 ]; then
+    LC_ALL=C sort -zu "$WORK/paths" > "$WORK/paths.sorted" ||
+        fail "could not canonicalize dirty source inventory"
+    mv -- "$WORK/paths.sorted" "$WORK/paths" ||
+        fail "could not publish dirty source inventory"
+fi
+
+for path in vendor/lib/*.a \
+            vendor/tor/libtor.a \
+            vendor/tor/src/ext/ed25519/donna/libed25519_donna.a \
+            vendor/tor/src/ext/ed25519/ref10/libed25519_ref10.a \
+            vendor/tor/src/ext/keccak-tiny/libkeccak-tiny.a; do
+    [ -L "$path" ] && fail "linked archive must not be a symlink: $path"
+    if [ -e "$path" ] && [ ! -f "$path" ]; then
+        fail "linked archive is not a regular file: $path"
+    fi
+    [ -f "$path" ] && printf '%s\0' "$path" >> "$WORK/tracked-source"
+done
+
+# These directories are explicit -I inputs outside BUILD_INPUT_ROOTS.
+# Generated OpenSSL/zlib headers and ignored X11/raylib/RGFW/cross headers can change a
+# compile or an __has_include decision even though Git does not list them.
+# Inventory their exact bytes and every absence/presence change. Do not apply
+# the project's /_ lint-fixture exception here: these vendor files can be
+# named by a compiler include regardless of their basename.
+for include_root in vendor/include vendor/x11/include vendor/raylib/src vendor/rgfw vendor/cross/*/include; do
+    if [ -e "$include_root" ] || [ -L "$include_root" ]; then
+        [ -d "$include_root" ] && [ ! -L "$include_root" ] ||
+            fail "include root is not a real directory: $include_root"
+        find "$include_root" -mindepth 1 ! -type d ! -type f \
+            -print -quit > "$WORK/vendor-include-unsupported" 2>/dev/null ||
+            fail "include input discovery failed: $include_root"
+        [ ! -s "$WORK/vendor-include-unsupported" ] ||
+            fail "unsupported compiler input beneath $include_root"
+        find "$include_root" -mindepth 1 -type f -print0 \
+            >> "$WORK/tracked-source" 2>/dev/null ||
+            fail "include inventory failed: $include_root"
+        if [ "$MODE" = verify-mutation ]; then
+            printf '%s\0' "$include_root" >> "$WORK/source-dirs"
+            find "$include_root" -mindepth 1 -type d -print0 \
+                >> "$WORK/source-dirs" 2>/dev/null ||
+                fail "include directory inventory failed: $include_root"
+        fi
+    fi
+done
+# The nonignored-untracked selector reaches the same ephemeral lint fixtures
+# the recursive walk above prunes: the trust-order gate greps `--untracked`,
+# so its fixture must stay visible to Git while staying out of the build
+# inventory. Drop exactly what the compile globs drop -- a "/_" component
+# beneath a build input root. Every other untracked path, including one
+# outside those roots, is inventoried unchanged.
+: > "$WORK/untracked-source"
+while IFS= read -r -d '' path; do
+    if is_ephemeral_build_input "$path"; then
+        continue
+    fi
+    printf '%s\0' "$path" >> "$WORK/untracked-source"
+done < "$WORK/untracked"
+{
+    cat "$WORK/tracked-source"
+    cat "$WORK/untracked-source"
+} | LC_ALL=C sort -zu > "$WORK/source-paths"
+
+if [ "$MODE" = verify-mutation ]; then
+    # Directory epochs close the inventory scanner's traversal race. Derive
+    # every current input's ancestors, and keep every directory beneath the
+    # recursive compiler roots above (including empty/ignored directories).
+    # An input created behind the fresh scan therefore changes a directory at
+    # the final post-scan observation even though neither path set contains it.
+    while IFS= read -r -d '' path; do
+        while [[ "$path" == */* ]]; do
+            path="${path%/*}"
+            printf '%s\0' "$path" >> "$WORK/source-dirs"
+        done
+    done < "$WORK/source-paths"
+
+    # The global nonignored-untracked selector can discover a future file in
+    # an otherwise empty directory outside the recursive compiler roots. Walk
+    # only top-level worktree directories and prune every Git-ignored directory
+    # by exact inode identity, so nested agent worktrees/build/test debris are
+    # never traversed while every directory capable of yielding an authoritative
+    # untracked path gets an epoch record.
+    git ls-files --others --ignored --exclude-standard --directory -z -- \
+        > "$WORK/ignored-inventory" ||
+        fail "ignored directory discovery failed"
+    ignored_dirs=()
+    while IFS= read -r -d '' path; do
+        case "$path" in
+            */)
+                path="${path%/}"
+                if [ -d "$path" ] && [ ! -L "$path" ]; then
+                    ignored_dirs+=("./$path")
+                fi
+                ;;
+        esac
+    done < "$WORK/ignored-inventory"
+    shopt -s nullglob dotglob
+    top_dirs=(*/)
+    shopt -u nullglob dotglob
+    scan_roots=()
+    for path in "${top_dirs[@]}"; do
+        path="${path%/}"
+        [ "$path" = .git ] || scan_roots+=("./$path")
+    done
+    if [ "${#scan_roots[@]}" -gt 0 ]; then
+        find_args=("${scan_roots[@]}")
+        for path in "${ignored_dirs[@]}"; do
+            find_args+=(-samefile "$path" -prune -o)
+        done
+        find_args+=(-type d -print0)
+        find "${find_args[@]}" >> "$WORK/source-dirs" 2>/dev/null ||
+            fail "nonignored source directory inventory failed"
+    fi
+
+    LC_ALL=C sort -zu "$WORK/source-dirs" > "$WORK/source-dirs.sorted" ||
+        fail "could not canonicalize source directory inventory"
+    {
+        cat "$WORK/source-dirs"
+        # Git may compress a directory whose every child is ignored into one
+        # trailing-slash record even when a self-hidden .gitignore inside that
+        # directory supplied the rules. Bind that boundary selector without
+        # recursively traversing or epoch-watching ignored build/test/worktree
+        # debris.
+        for path in "${ignored_dirs[@]}"; do
+            printf '%s\0' "${path#./}"
+        done
+    } | LC_ALL=C sort -zu > "$WORK/selector-dirs.sorted" ||
+        fail "could not canonicalize Git selector directory inventory"
+    LC_ALL=C sort -zu "$WORK/epoch-indexes" > "$WORK/epoch-indexes.sorted" ||
+        fail "could not canonicalize source index inventory"
+    LC_ALL=C sort -zu "$WORK/epoch-repos" > "$WORK/epoch-repos.sorted" ||
+        fail "could not canonicalize source repository inventory"
+    mv -- "$WORK/source-dirs.sorted" "$WORK/source-dirs" ||
+        fail "could not publish source directory inventory"
+    mv -- "$WORK/selector-dirs.sorted" "$WORK/selector-dirs" ||
+        fail "could not publish Git selector directory inventory"
+    mv -- "$WORK/epoch-indexes.sorted" "$WORK/epoch-indexes" ||
+        fail "could not publish source index inventory"
+    mv -- "$WORK/epoch-repos.sorted" "$WORK/epoch-repos" ||
+        fail "could not publish source repository inventory"
+fi
+
+emit_paths()
+{
+    local path
+    while IFS= read -r -d '' path; do
+        case "$path" in
+            *$'\n'*|*$'\r'*) fail "control character in dirty path" ;;
+        esac
+        printf '%s\n' "$path"
+    done < "$WORK/paths"
+}
+
+capture_portable()
+{
+    local path mode raw_mode digest target state
+    {
+        printf 'zcl.dev_source_identity.v2\0'
+        while IFS= read -r -d '' path; do
+            printf 'P\0%s\0' "$path"
+            if [ "${GITLINK_STATE[$path]+known}" = known ]; then
+                state="${GITLINK_STATE[$path]}"
+                printf 'G\0%s\0' "$state"
+            elif [ -L "$path" ]; then
+                raw_mode="$(stat -c '%f' -- "$path" 2>/dev/null)" ||
+                    fail "could not stat symlink: $path"
+                canonical_source_mode L "$raw_mode" mode ||
+                    fail "noncanonical symlink mode: $path"
+                read_symlink_target "$path" target ||
+                    fail "could not read symlink: $path"
+                digest="$(printf '%s' "$target" | sha256_stream)" ||
+                    fail "could not hash symlink: $path"
+                printf 'L\0%s\0%s\0' "$mode" "$digest"
+            elif [ -f "$path" ]; then
+                raw_mode="$(stat -c '%f' -- "$path" 2>/dev/null)" ||
+                    fail_racy "could not stat source: $path"
+                canonical_source_mode F "$raw_mode" mode ||
+                    fail "noncanonical regular-file mode: $path"
+                digest="$(sha256_file "$path")" ||
+                    fail_racy "could not hash source: $path"
+                printf 'F\0%s\0%s\0' "$mode" "$digest"
+            elif [ ! -e "$path" ]; then
+                printf 'D\0'
+            else
+                fail "unsupported dirty source type: $path"
+            fi
+        done < "$WORK/source-paths"
+    } > "$WORK/preimage"
+    sha256_file "$WORK/preimage"
+}
+
+# GNU coreutils can hash every regular dirty file in one process and stat every
+# extant path in one process.  The portable implementation above spawned both
+# tools once per file; on a 200-file working overlay that consumed ~0.75 s per
+# identity, and a verify cycle needs at least capture + compare.  Keep the
+# canonical preimage byte-for-byte identical while removing that process storm.
+capture_batched()
+{
+    local path target digest record emitted mode raw_mode native legacy
+    local path_i=0 existing_i=0 regular_i=0 hash_i=0 batch_start=0
+    local batch_size=128
+    local -a paths=() types=() existing_paths=() existing_modes=()
+    local -a regular_paths=() regular_digests=() batch=()
+    local native_tokens=0 shadow=0
+    if [ -n "$SOURCE_IDENTITY_BATCH" ] &&
+        [ "${ZCL_SOURCE_IDENTITY_FORCE_PORTABLE:-0}" != 1 ]; then
+        native_tokens=1
+    fi
+    [ "${ZCL_SOURCE_IDENTITY_BATCH_SHADOW:-0}" = 1 ] && shadow=1
+
+    # One-pass native capture: the helper classifies, hashes, and emits the
+    # identity preimage for the whole path set in a single process, under the
+    # same per-file snapshot race checks the two-step pipeline applied.  Every
+    # shell loop below then feeds only the portable fallback and the shadow
+    # oracle, neither of which runs on the authoritative path.
+    if [ "$native_tokens" -eq 1 ] && [ "$shadow" -eq 0 ]; then
+        write_gitlink_sidecar
+        "$SOURCE_IDENTITY_BATCH" token capture-identity \
+            "$WORK/native-identity-preimage" "$WORK/gitlink-sidecar" \
+            < "$WORK/source-paths" ||
+            fail_racy "source changed while capturing native identity preimage"
+        return 0
+    fi
+
+    while IFS= read -r -d '' path; do
+        paths+=("$path")
+        if [ "${GITLINK_STATE[$path]+known}" = known ]; then
+            types+=(G)
+        elif [ -L "$path" ]; then
+            types+=(L)
+            existing_paths+=("$path")
+        elif [ -f "$path" ]; then
+            types+=(F)
+            existing_paths+=("$path")
+            regular_paths+=("$path")
+        elif [ ! -e "$path" ]; then
+            types+=(D)
+        else
+            fail "unsupported dirty source type: $path"
+        fi
+    done < "$WORK/source-paths"
+
+    # The native `token identity` pass re-derives each file's canonical mode
+    # from its own lstat and resolves digests through its strict table parser,
+    # so the mode batch and the per-record digest validation below feed only
+    # the legacy preimage loop and the shadow oracle.  When neither consumer
+    # runs, both blocks are dead work: one shell loop over every source path.
+    if [ "$native_tokens" -eq 0 ] || [ "$shadow" -eq 1 ]; then
+    if [ "${#existing_paths[@]}" -gt 0 ]; then
+        : > "$WORK/modes"
+        if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+            printf '%s\0' "${existing_paths[@]}" > "$WORK/mode-paths"
+            "$SOURCE_IDENTITY_BATCH" mode < "$WORK/mode-paths" \
+                > "$WORK/modes" ||
+                fail_racy "dirty source changed while collecting file modes"
+            if [ "${ZCL_SOURCE_IDENTITY_BATCH_SHADOW:-0}" = 1 ]; then
+                : > "$WORK/modes.legacy"
+                for ((batch_start = 0;
+                      batch_start < ${#existing_paths[@]};
+                      batch_start += batch_size)); do
+                    batch=("${existing_paths[@]:batch_start:batch_size}")
+                    stat -c '%f' -- "${batch[@]}" \
+                        >> "$WORK/modes.legacy" 2>/dev/null ||
+                        fail "legacy file-mode shadow failed"
+                done
+                cmp -s "$WORK/modes" "$WORK/modes.legacy" ||
+                    fail "native and legacy file-mode batches differ"
+            fi
+        else
+            for ((batch_start = 0; batch_start < ${#existing_paths[@]};
+                  batch_start += batch_size)); do
+                batch=("${existing_paths[@]:batch_start:batch_size}")
+                stat -c '%f' -- "${batch[@]}" >> "$WORK/modes" \
+                    2>/dev/null ||
+                    fail_racy "dirty source changed while collecting file modes"
+            done
+        fi
+        mapfile -t existing_modes < "$WORK/modes"
+        [ "${#existing_modes[@]}" -eq "${#existing_paths[@]}" ] ||
+            fail_racy "file-mode batch was incomplete"
+    fi
+    fi
+
+    if [ "${#regular_paths[@]}" -gt 0 ]; then
+        : > "$WORK/hashes"
+        if [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+            printf '%s\0' "${regular_paths[@]}" > "$WORK/hash-paths"
+            "$SOURCE_IDENTITY_BATCH" hash < "$WORK/hash-paths" \
+                > "$WORK/hashes" ||
+                fail_racy "dirty source changed while hashing regular files"
+            if [ "${ZCL_SOURCE_IDENTITY_BATCH_SHADOW:-0}" = 1 ]; then
+                : > "$WORK/hashes.legacy"
+                for ((batch_start = 0;
+                      batch_start < ${#regular_paths[@]};
+                      batch_start += batch_size)); do
+                    batch=("${regular_paths[@]:batch_start:batch_size}")
+                    sha256sum --zero -- "${batch[@]}" \
+                        >> "$WORK/hashes.legacy" ||
+                        fail "legacy regular-file hash shadow failed"
+                done
+                cmp -s "$WORK/hashes" "$WORK/hashes.legacy" ||
+                    fail "native and legacy regular-file hash batches differ"
+            fi
+        else
+            for ((batch_start = 0; batch_start < ${#regular_paths[@]};
+                  batch_start += batch_size)); do
+                batch=("${regular_paths[@]:batch_start:batch_size}")
+                sha256sum --zero -- "${batch[@]}" >> "$WORK/hashes" ||
+                    fail_racy "dirty source changed while hashing regular files"
+            done
+        fi
+        if [ "$native_tokens" -eq 0 ] || [ "$shadow" -eq 1 ]; then
+        while IFS= read -r -d '' record; do
+            [ "$hash_i" -lt "${#regular_paths[@]}" ] ||
+                fail_racy "regular-file hash batch returned extra rows"
+            digest="${record:0:64}"
+            emitted="${record:66}"
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] &&
+                [[ "${record:64:2}" = "  " ||
+                   "${record:64:2}" = " *" ]] &&
+                [ "$emitted" = "${regular_paths[$hash_i]}" ] ||
+                fail_racy "regular-file hash batch was malformed or reordered"
+            regular_digests+=("$digest")
+            hash_i=$((hash_i + 1))
+        done < "$WORK/hashes"
+        [ "$hash_i" -eq "${#regular_paths[@]}" ] ||
+            fail_racy "regular-file hash batch was incomplete"
+        fi
+    fi
+
+    if [ "$native_tokens" -eq 1 ]; then
+        write_gitlink_sidecar
+        native="$("$SOURCE_IDENTITY_BATCH" token capture-identity \
+            "$WORK/native-identity-preimage" "$WORK/gitlink-sidecar" \
+            < "$WORK/source-paths")" ||
+            fail_racy "source changed while capturing native identity preimage"
+        if [ "$shadow" -eq 1 ]; then
+            legacy="$(identity_preimage_loop)" ||
+                fail "legacy identity preimage failed under shadow"
+            [ "$native" = "$legacy" ] ||
+                fail "native and legacy identity tokens differ"
+        fi
+        printf '%s\n' "$native"
+        return 0
+    fi
+    identity_preimage_loop
+}
+
+# The shell half of capture_batched: consumes the classification, mode, and
+# digest batches this process already collected. Kept as the portable
+# fallback and as the shadow oracle for the native token identity pass; it
+# sees the caller's locals through bash's dynamic scoping.
+identity_preimage_loop()
+{
+    local path digest mode raw_mode
+    local path_i=0 existing_i=0 regular_i=0
+    {
+        printf 'zcl.dev_source_identity.v2\0'
+        for ((path_i = 0; path_i < ${#paths[@]}; path_i++)); do
+            path="${paths[$path_i]}"
+            printf 'P\0%s\0' "$path"
+            case "${types[$path_i]}" in
+                G)
+                    printf 'G\0%s\0' "${GITLINK_STATE[$path]}"
+                    ;;
+                L)
+                    raw_mode="${existing_modes[$existing_i]}"
+                    existing_i=$((existing_i + 1))
+                    canonical_source_mode L "$raw_mode" mode ||
+                        fail "noncanonical symlink mode: $path"
+                    read_symlink_target "$path" target ||
+                        fail "could not read symlink: $path"
+                    digest="$(printf '%s' "$target" | sha256_stream)" ||
+                        fail "could not hash symlink: $path"
+                    printf 'L\0%s\0%s\0' "$mode" "$digest"
+                    ;;
+                F)
+                    raw_mode="${existing_modes[$existing_i]}"
+                    existing_i=$((existing_i + 1))
+                    canonical_source_mode F "$raw_mode" mode ||
+                        fail "noncanonical regular-file mode: $path"
+                    digest="${regular_digests[$regular_i]}"
+                    regular_i=$((regular_i + 1))
+                    printf 'F\0%s\0%s\0' "$mode" "$digest"
+                    ;;
+                D)
+                    printf 'D\0'
+                    ;;
+                *)
+                    fail "internal dirty-source classification failure: $path"
+                    ;;
+            esac
+        done
+    } > "$WORK/preimage"
+    [ "$existing_i" -eq "${#existing_modes[@]}" ] &&
+        [ "$regular_i" -eq "${#regular_digests[@]}" ] ||
+        fail "dirty-source batch consumption was incomplete"
+    sha256_file "$WORK/preimage"
+}
+
+capture()
+{
+    local help
+    if [ "${ZCL_SOURCE_IDENTITY_FORCE_PORTABLE:-0}" != 1 ] &&
+       [ -n "$SOURCE_IDENTITY_BATCH" ]; then
+        capture_batched
+        return
+    fi
+    if [ "${ZCL_SOURCE_IDENTITY_FORCE_PORTABLE:-0}" != 1 ] &&
+       command -v sha256sum >/dev/null 2>&1; then
+        help="$(sha256sum --help 2>/dev/null || true)"
+        if [[ "$help" == *"--zero"* ]]; then
+            capture_batched
+            return
+        fi
+    fi
+    capture_portable
+}
+
+# Build-session mutation token. Unlike the portable content identity, this is
+# deliberately host-local and short-lived: inode + nanosecond mtime/ctime make
+# an edit/revert (ABA) visible between pre-build capture and post-link verify.
+# It is never baked as a release/source identifier.
+mutation_token()
+{
+    local native legacy
+    if [ -n "$SOURCE_IDENTITY_BATCH" ] &&
+        [ "${ZCL_SOURCE_IDENTITY_FORCE_PORTABLE:-0}" != 1 ]; then
+        write_gitlink_sidecar
+        native="$("$SOURCE_IDENTITY_BATCH" token mutation \
+            "$WORK/native-mutation-preimage" "$WORK/gitlink-sidecar" \
+            < "$WORK/source-paths")" ||
+            fail_racy "source changed while collecting native mutation token"
+        mv -f -- "$WORK/native-mutation-preimage.record" \
+            "$WORK/mutation-record" ||
+            fail "could not publish native mutation record"
+        if [ "${ZCL_SOURCE_IDENTITY_BATCH_SHADOW:-0}" = 1 ]; then
+            legacy="$(mutation_token_legacy)"
+            [ "$native" = "$legacy" ] ||
+                fail "native and legacy mutation tokens differ"
+        fi
+        printf '%s\n' "$native"
+        return 0
+    fi
+    mutation_token_legacy
+}
+
+mutation_token_legacy()
+{
+    local path record path_i=0 existing_i=0 batch_start=0
+    local batch_size=128
+    local -a paths=() types=() existing_paths=() metadata=() batch=()
+    while IFS= read -r -d '' path; do
+        paths+=("$path")
+        if [ "${GITLINK_STATE[$path]+known}" = known ]; then
+            types+=(G)
+        elif [ -L "$path" ] || [ -f "$path" ]; then
+            types+=(E)
+            existing_paths+=("$path")
+        elif [ ! -e "$path" ]; then
+            types+=(D)
+        else
+            fail "unsupported source type while capturing mutation token: $path"
+        fi
+    done < "$WORK/source-paths"
+
+    : > "$WORK/mutation-metadata"
+    for ((batch_start = 0; batch_start < ${#existing_paths[@]};
+          batch_start += batch_size)); do
+        batch=("${existing_paths[@]:batch_start:batch_size}")
+        stat --printf='%d:%i:%s:%f:%y:%z\0' -- "${batch[@]}" \
+            >> "$WORK/mutation-metadata" 2>/dev/null ||
+            fail_racy "source changed while collecting mutation metadata"
+    done
+    mapfile -d '' -t metadata < "$WORK/mutation-metadata"
+    [ "${#metadata[@]}" -eq "${#existing_paths[@]}" ] ||
+        fail_racy "mutation metadata batch was incomplete"
+
+    # rec_meta pairs 1:1 with paths/types so a mismatch between two calls in
+    # the same process (same fixed $WORK/source-paths) can be diffed
+    # positionally afterward by report_mutation_diff() -- see mutation-record
+    # below, snapshotted by capture_record() before the second call
+    # overwrites it.
+    local -a rec_meta=()
+    {
+        printf 'zcl.dev_source_mutation.v1\0'
+        for ((path_i = 0; path_i < ${#paths[@]}; path_i++)); do
+            path="${paths[$path_i]}"
+            printf 'P\0%s\0' "$path"
+            case "${types[$path_i]}" in
+                G)
+                    printf 'G\0%s\0' "${GITLINK_STATE[$path]}"
+                    rec_meta+=("${GITLINK_STATE[$path]}")
+                    ;;
+                E)
+                    record="${metadata[$existing_i]}"
+                    existing_i=$((existing_i + 1))
+                    printf 'E\0%s\0' "$record"
+                    rec_meta+=("$record")
+                    ;;
+                D)
+                    printf 'D\0'
+                    rec_meta+=("")
+                    ;;
+                *) fail "internal mutation-token classification failure" ;;
+            esac
+        done
+    } > "$WORK/mutation-preimage"
+    [ "$existing_i" -eq "${#metadata[@]}" ] ||
+        fail_racy "mutation metadata consumption was incomplete"
+    {
+        for ((path_i = 0; path_i < ${#paths[@]}; path_i++)); do
+            printf '%s\0%s\0%s\0' "${paths[$path_i]}" "${types[$path_i]}" \
+                "${rec_meta[$path_i]}"
+        done
+    } > "$WORK/mutation-record"
+    sha256_file "$WORK/mutation-preimage"
+}
+
+# Hash the enumerated source set and gitlink presence separately from
+# file bytes. The normal mutation token deliberately operates on the captured
+# path set; this guard lets capture-record detect a new untracked file, newly
+# selected ignored archive, or submodule inventory change that appeared after
+# that set was collected.
+#
+# Both token builders have a native fast path through the source-identity-batch
+# helper: the per-path shell loops were the dominant cost of every Make parse
+# (two full token passes per capture-record, and capture-record itself runs in
+# both the outer and the checkout-locked inner parse of every focused test
+# goal). The helper consumes the same $WORK/source-paths order and the same
+# GITLINK_STATE membership and emits byte-identical preimages; shadow mode
+# computes both and refuses on any digest difference.
+write_gitlink_sidecar()
+{
+    local path
+    : > "$WORK/gitlink-sidecar"
+    for path in "${!GITLINK_STATE[@]}"; do
+        printf '%s\0%s\0' "$path" "${GITLINK_STATE[$path]}" \
+            >> "$WORK/gitlink-sidecar"
+    done
+}
+
+inventory_token()
+{
+    local path native legacy
+    if [ -n "$SOURCE_IDENTITY_BATCH" ] &&
+        [ "${ZCL_SOURCE_IDENTITY_FORCE_PORTABLE:-0}" != 1 ]; then
+        write_gitlink_sidecar
+        native="$("$SOURCE_IDENTITY_BATCH" token inventory \
+            "$WORK/native-inventory-preimage" "$WORK/gitlink-sidecar" \
+            < "$WORK/source-paths")" ||
+            fail "native inventory token failed on the captured path set"
+        if [ "${ZCL_SOURCE_IDENTITY_BATCH_SHADOW:-0}" = 1 ]; then
+            legacy="$(inventory_token_legacy)"
+            [ "$native" = "$legacy" ] ||
+                fail "native and legacy inventory tokens differ"
+        fi
+        printf '%s\n' "$native"
+        return 0
+    fi
+    inventory_token_legacy
+}
+
+inventory_token_legacy()
+{
+    local path
+    {
+        printf 'zcl.dev_source_inventory.v1\0'
+        while IFS= read -r -d '' path; do
+            printf 'S\0%s\0' "$path"
+            if [ "${GITLINK_STATE[$path]+known}" = known ]; then
+                printf 'G\0%s\0' "${GITLINK_STATE[$path]}"
+            fi
+        done < "$WORK/source-paths"
+    } > "$WORK/inventory-preimage"
+    sha256_file "$WORK/inventory-preimage"
+}
+
+# Files created after an inventory walk has passed their directory are absent
+# from that walk's path set. Bind the complete rescan to the metadata epoch of
+# every recursive compiler directory, every current input ancestor, and the
+# worktree index. This token is local to one verifier call: unlike the file
+# mutation token it is not compared with the pre-operation record, so a test
+# that creates and removes a fixture before verification does not self-refuse.
+inventory_epoch_token()
+{
+    local batch_start=0 batch_size=128 path_i index_i
+    local -a paths=() metadata=() indexes=() index_metadata=() batch=()
+    mapfile -d '' -t paths < "$WORK/source-dirs"
+    : > "$WORK/inventory-epoch-metadata"
+    for ((batch_start = 0; batch_start < ${#paths[@]};
+          batch_start += batch_size)); do
+        batch=("${paths[@]:batch_start:batch_size}")
+        stat --printf='%d:%i:%s:%f:%y:%z\0' -- "${batch[@]}" \
+            >> "$WORK/inventory-epoch-metadata" 2>/dev/null ||
+            fail "source directory changed during inventory verification"
+    done
+    mapfile -d '' -t metadata < "$WORK/inventory-epoch-metadata"
+    [ "${#metadata[@]}" -eq "${#paths[@]}" ] ||
+        fail "source directory metadata batch was incomplete"
+    mapfile -d '' -t indexes < "$WORK/epoch-indexes"
+    : > "$WORK/inventory-index-metadata"
+    if [ "${#indexes[@]}" -gt 0 ]; then
+        stat --printf='%d:%i:%s:%f:%y:%z\0' -- "${indexes[@]}" \
+            > "$WORK/inventory-index-metadata" 2>/dev/null ||
+            fail "Git index changed during inventory verification"
+    fi
+    mapfile -d '' -t index_metadata < "$WORK/inventory-index-metadata"
+    [ "${#index_metadata[@]}" -eq "${#indexes[@]}" ] ||
+        fail "Git index metadata batch was incomplete"
+    {
+        printf 'zcl.dev_source_inventory_epoch.v1\0'
+        for ((index_i = 0; index_i < ${#indexes[@]}; index_i++)); do
+            printf 'I\0%s\0%s\0' "${indexes[$index_i]}" \
+                "${index_metadata[$index_i]}"
+        done
+        for ((path_i = 0; path_i < ${#paths[@]}; path_i++)); do
+            printf 'D\0%s\0%s\0' "${paths[$path_i]}" \
+                "${metadata[$path_i]}"
+        done
+    } > "$WORK/inventory-epoch-preimage"
+    sha256_file "$WORK/inventory-epoch-preimage"
+}
+
+append_selector_file()
+{
+    local label="$1" path="$2" output="$3" digest
+    printf 'F\0%s\0%s\0' "$label" "$path" >> "$output"
+    if [ -f "$path" ]; then
+        digest="$(sha256_file "$path")" ||
+            fail "could not hash Git exclude selector: $path"
+        printf 'P\0%s\0' "$digest" >> "$output"
+    elif [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        printf 'M\0' >> "$output"
+    else
+        fail "unsupported Git exclude selector: $path"
+    fi
+}
+
+# `--exclude-standard` is itself an inventory selector. Bind the effective Git
+# configuration, every traversable directory's .gitignore, and every
+# repo/gitlink's info/exclude and resolved global excludes file; changing
+# policy can reveal pre-existing bytes without touching any worktree directory
+# or index.
+selector_policy_token()
+{
+    local directory repo physical info_exclude global_exclude config_digest
+    local rc seq=0
+    local -a configured=()
+    : > "$WORK/selector-policy-preimage"
+    printf 'zcl.dev_source_selector_policy.v1\0' \
+        >> "$WORK/selector-policy-preimage"
+
+    # An untracked .gitignore may ignore itself as well as another pre-existing
+    # path, so it need not appear in source-paths. selector-dirs is the bounded
+    # superset of directories Git can traverse for the superproject and
+    # initialized gitlinks, plus compressed ignored-directory boundaries; bind
+    # presence and bytes even for a self-hidden selector.
+    while IFS= read -r -d '' directory; do
+        append_selector_file directory-gitignore "$directory/.gitignore" \
+            "$WORK/selector-policy-preimage"
+    done < "$WORK/selector-dirs"
+
+    while IFS= read -r -d '' repo; do
+        physical="$(cd "$repo" && pwd -P)" ||
+            fail "could not canonicalize selector repository: $repo"
+        printf 'R\0%s\0' "$repo" >> "$WORK/selector-policy-preimage"
+        git -C "$repo" config --null --list \
+            > "$WORK/selector-config-$seq" ||
+            fail "could not read effective Git configuration: $repo"
+        config_digest="$(sha256_file "$WORK/selector-config-$seq")" ||
+            fail "could not hash effective Git configuration: $repo"
+        printf 'C\0%s\0' "$config_digest" \
+            >> "$WORK/selector-policy-preimage"
+
+        info_exclude="$(git -C "$repo" rev-parse --git-path info/exclude \
+            2>/dev/null)" ||
+            fail "could not resolve info/exclude: $repo"
+        case "$info_exclude" in
+            /*) ;;
+            *) info_exclude="$physical/$info_exclude" ;;
+        esac
+        append_selector_file info-exclude "$info_exclude" \
+            "$WORK/selector-policy-preimage"
+
+        configured=()
+        if git -C "$repo" config --path --null --get core.excludesFile \
+                > "$WORK/selector-global-$seq" 2>/dev/null; then
+            mapfile -d '' -t configured < "$WORK/selector-global-$seq"
+            [ "${#configured[@]}" -eq 1 ] ||
+                fail "core.excludesFile did not resolve exactly once: $repo"
+            global_exclude="${configured[0]}"
+        else
+            rc=$?
+            [ "$rc" -eq 1 ] ||
+                fail "could not resolve core.excludesFile: $repo"
+            if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+                global_exclude="$XDG_CONFIG_HOME/git/ignore"
+            elif [ -n "${HOME:-}" ]; then
+                global_exclude="$HOME/.config/git/ignore"
+            else
+                fail "HOME/XDG_CONFIG_HOME unavailable for global Git excludes"
+            fi
+        fi
+        case "$global_exclude" in
+            /*) ;;
+            *) global_exclude="$physical/$global_exclude" ;;
+        esac
+        append_selector_file global-excludes "$global_exclude" \
+            "$WORK/selector-policy-preimage"
+        seq=$((seq + 1))
+    done < "$WORK/epoch-repos"
+    sha256_file "$WORK/selector-policy-preimage"
+}
+
+# Print the one-line failure `msg` exactly as fail_racy() would (so existing
+# callers that grep the first line keep working), then run the given diagnostic
+# report command before exiting with the same racy exit code. Isolated from
+# fail_racy() itself because a plain call site (e.g. mutation_token()'s own
+# internal batch checks) has no before/after snapshot to diff yet.
+fail_racy_diag()
+{
+    local msg="$1"
+    shift
+    echo "source-identity: $msg" >&2
+    "$@" || true
+    exit $RACY_EXIT
+}
+
+# Diff two "path\0type\0meta\0" mutation-record snapshots that were both
+# derived from the SAME unchanged $WORK/source-paths (so they list identical
+# paths in identical order) and report up to 20 differing entries, naming
+# each as added (absent -> extant), removed (extant -> absent), or changed
+# (extant in both, metadata differs). `meta` for an extant path is the
+# `stat --printf='%d:%i:%s:%f:%y:%z'` record; fields 3 and 5 are size and
+# mtime.
+report_mutation_diff()
+{
+    local before="$1" after="$2"
+    local -a before_flat=() after_flat=()
+    mapfile -d '' -t before_flat < "$before"
+    mapfile -d '' -t after_flat < "$after"
+    local n=$(( ${#before_flat[@]} / 3 ))
+    local i path bt bm at am differ=0 shown=0
+    for ((i = 0; i < n; i++)); do
+        path="${before_flat[$((i * 3))]}"
+        bt="${before_flat[$((i * 3 + 1))]}"
+        bm="${before_flat[$((i * 3 + 2))]}"
+        at="${after_flat[$((i * 3 + 1))]}"
+        am="${after_flat[$((i * 3 + 2))]}"
+        [ "$bt" = "$at" ] && [ "$bm" = "$am" ] && continue
+        differ=$((differ + 1))
+        [ "$shown" -ge 20 ] && continue
+        shown=$((shown + 1))
+        if [ "$bt" != E ] && [ "$at" = E ]; then
+            echo "source-identity:   added $path" >&2
+        elif [ "$bt" = E ] && [ "$at" != E ]; then
+            echo "source-identity:   removed $path" >&2
+        else
+            # The stat record is "dev:inode:size:mode:mtime:ctime", but the
+            # mtime/ctime fields are themselves "YYYY-MM-DD HH:MM:SS.N +ZZZZ"
+            # -- two more embedded colons apiece -- so mtime is fields 5-7,
+            # not field 5 alone.
+            local old_size old_mtime new_size new_mtime
+            old_size="$(cut -d: -f3 <<< "$bm")"
+            old_mtime="$(cut -d: -f5-7 <<< "$bm")"
+            new_size="$(cut -d: -f3 <<< "$am")"
+            new_mtime="$(cut -d: -f5-7 <<< "$am")"
+            echo "source-identity:   changed $path ($old_size:$old_mtime -> $new_size:$new_mtime)" >&2
+        fi
+    done
+    [ "$differ" -gt "$shown" ] &&
+        echo "source-identity:   $differ entries differ" >&2
+    return 0
+}
+
+# Diff two NUL-delimited path lists (the "before" enumeration this process
+# already opened, and an "after" re-enumeration from a fresh process) and
+# report up to 20 added/removed paths, plus a trailing count when more
+# differ. Unlike report_mutation_diff(), the two lists need not share length
+# or order -- a genuinely new/vanished path is exactly what inventory
+# mismatch means -- so this pairs them by content via comm() instead of
+# position.
+report_inventory_diff()
+{
+    local before="$1" after="$2"
+    local -a lines=()
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] && lines+=("added $line")
+    done < <(LC_ALL=C comm -13 \
+        <(LC_ALL=C sort -z -- "$before" | LC_ALL=C tr '\0' '\n') \
+        <(LC_ALL=C sort -z -- "$after" | LC_ALL=C tr '\0' '\n'))
+    while IFS= read -r line; do
+        [ -n "$line" ] && lines+=("removed $line")
+    done < <(LC_ALL=C comm -23 \
+        <(LC_ALL=C sort -z -- "$before" | LC_ALL=C tr '\0' '\n') \
+        <(LC_ALL=C sort -z -- "$after" | LC_ALL=C tr '\0' '\n'))
+    local n=${#lines[@]} i shown=0
+    for ((i = 0; i < n && i < 20; i++)); do
+        echo "source-identity:   ${lines[$i]}" >&2
+        shown=$((shown + 1))
+    done
+    [ "$n" -gt "$shown" ] &&
+        echo "source-identity:   $n entries differ" >&2
+    return 0
+}
+
+capture_record()
+{
+    local identity clean inventory_before inventory_after
+    local mutation_before mutation_after
+    inventory_before="$(inventory_token)" || exit $?
+    mutation_before="$(mutation_token)" || exit $?
+    cp -- "$WORK/mutation-record" "$WORK/mutation-record.before" ||
+        fail "could not snapshot mutation record"
+    identity="$(capture)" || exit $?
+    mutation_after="$(mutation_token)" || exit $?
+    [ "$mutation_before" = "$mutation_after" ] ||
+        fail_racy_diag "source mutated during identity capture" \
+            report_mutation_diff "$WORK/mutation-record.before" \
+                "$WORK/mutation-record"
+    inventory_after="$("$SELF" inventory-token)" || exit $?
+    if [ "$inventory_before" != "$inventory_after" ]; then
+        "$SELF" list-source-paths > "$WORK/inventory-paths-after" \
+            2>/dev/null || : > "$WORK/inventory-paths-after"
+        fail_racy_diag "source inventory changed during identity capture" \
+            report_inventory_diff "$WORK/source-paths" \
+                "$WORK/inventory-paths-after"
+    fi
+    # The legacy-named `clean` slot is a v2 capture-completeness bit, not a Git
+    # cleanliness claim. Exact current bytes already identify dirty worktrees;
+    # deriving authority from Git HEAD/gitlink object ids would reintroduce the
+    # legacy object-hash dependency this v2 record removes.
+    clean=1
+    printf '%s %s %s\n' "$identity" "$clean" "$mutation_after"
+}
+
+# Post-operation source CAS. A caller that already captured the complete byte
+# identity before doing work only needs to prove that exact source epoch did
+# not move while the work ran. The mutation token covers the canonical path set
+# plus device/inode/size/mode and nanosecond mtime+ctime for every extant input;
+# ctime makes edit/revert ABA visible even when bytes and mtime are restored.
+# Re-scan inventory in a fresh process so a newly selected untracked/ignored
+# input cannot hide behind the path set this invocation opened at startup.
+verify_mutation()
+{
+    local expected="$1" inventory_before inventory_after
+    local mutation_before mutation_after epoch_before epoch_after
+    local policy_before policy_after
+    inventory_before="$(inventory_token)" || exit $?
+    mutation_before="$(mutation_token)" || exit $?
+    epoch_before="$(inventory_epoch_token)" || exit $?
+    policy_before="$(selector_policy_token)" || exit $?
+    inventory_after="$(ZCL_SOURCE_IDENTITY_POST_RESCAN=1 \
+        "$SELF" inventory-token)" || exit $?
+    mutation_after="$(mutation_token)" || exit $?
+    epoch_after="$(inventory_epoch_token)" || exit $?
+    policy_after="$(selector_policy_token)" || exit $?
+    [ "$inventory_before" = "$inventory_after" ] ||
+        fail "source inventory changed during post-proof verification"
+    [ "$mutation_before" = "$mutation_after" ] ||
+        fail "source mutated during post-proof verification"
+    [ "$epoch_before" = "$epoch_after" ] ||
+        fail "source directory or index changed during post-proof verification"
+    [ "$policy_before" = "$policy_after" ] ||
+        fail "source exclude policy changed during post-proof verification"
+    if [ "${mutation_after,,}" != "${expected,,}" ]; then
+        fail "source epoch superseded: expected mutation=${expected,,} actual=${mutation_after,,}"
+    fi
+    printf '%s\n' "${mutation_after,,}"
+}
+
+# See ZCL_SOURCE_IDENTITY_SESSION above. Returns the cache file path for a
+# token, or fails (caller falls back to an uncached capture) when the token is
+# unset or does not match the exact `pid:start` shape this script mints --
+# never trust an unrecognized shape as a cache key.
+session_cache_path()
+{
+    local token="$1"
+    [[ "$token" =~ ^[1-9][0-9]*:[0-9a-f]+$ ]] || return 1
+    printf '%s/build/identity/.session-cache/capture.%s.record' \
+        "$ROOT" "${token/:/.}"
+}
+
+# A session's cache entry outlives the Make process that minted it (a new
+# token every invocation), so entries for dead sessions would otherwise
+# accumulate forever. Prune any entry whose encoded pid is no longer the
+# exact live process that token identifies -- the same liveness test
+# tools/dev/build-epoch-session.sh uses for its epoch leases.
+prune_session_cache()
+{
+    local dir="$1" f base token pid start actual
+    [ -d "$dir" ] || return 0
+    for f in "$dir"/capture.*.record; do
+        [ -e "$f" ] || continue
+        base="$(basename -- "$f")"
+        token="${base#capture.}"
+        token="${token%.record}"
+        pid="${token%%.*}"
+        start="${token#*.}"
+        actual=""
+        if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [[ "$start" =~ ^[0-9a-f]+$ ]]; then
+            actual="$(tools/dev/process-start-token.sh "$pid" 2>/dev/null)" || actual=""
+        fi
+        [ -n "$actual" ] && [ "$actual" = "$start" ] && continue
+        rm -f -- "$f" 2>/dev/null || true
+    done
+}
+
+# One capture attempt is a compare-and-swap against a live checkout, and a CAS
+# that cannot be retried is not a safety property -- it is an outage. Every
+# `make` in this tree opens by capturing the whole-source identity, so a single
+# file created or removed anywhere under the build roots during those seconds
+# used to stop the build outright, having run nothing. Ask again in a FRESH
+# process instead: a new process re-enumerates the path set from scratch, so a
+# successful attempt still proves the identity it returns was bracketed by an
+# unchanged inventory and mutation token. Nothing is admitted that a single
+# attempt would have admitted; only the verdict "the tree moved, try once more"
+# stops being fatal. A tree that never holds still fails exactly as before.
+CAPTURE_RECORD_ATTEMPTS="${ZCL_SOURCE_IDENTITY_CAPTURE_ATTEMPTS:-4}"
+[[ "$CAPTURE_RECORD_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] ||
+    fail "ZCL_SOURCE_IDENTITY_CAPTURE_ATTEMPTS must be a positive integer"
+
+capture_record_converged()
+{
+    local attempt record rc=0
+    for ((attempt = 1; attempt <= CAPTURE_RECORD_ATTEMPTS; attempt++)); do
+        if [ "$attempt" -eq 1 ]; then
+            if record="$(capture_record)"; then
+                printf '%s\n' "$record"
+                return 0
+            else
+                rc=$?
+            fi
+        elif record="$("$SELF" capture-record-attempt)"; then
+            printf '%s\n' "$record"
+            return 0
+        else
+            rc=$?
+        fi
+        [ "$rc" -eq "$RACY_EXIT" ] || return "$rc"
+    done
+    fail "source did not hold still across $CAPTURE_RECORD_ATTEMPTS whole-tree capture attempts; another writer is still changing this checkout (see the per-attempt reasons above)"
+}
+
+# Read-through memoization wrapper around capture_record(). The FIRST call in
+# a given ZCL_SOURCE_IDENTITY_SESSION pays the full walk and caches it; every
+# later call in the SAME session (the same live Make process) reads the cache
+# instead of re-walking. A new session (a new `make` invocation) always misses
+# and re-derives from scratch, so this never weakens cross-invocation
+# supersession detection -- it only removes repeat work within one process.
+capture_record_cached()
+{
+    local cache tmp record
+    cache="$(session_cache_path "$ZCL_SOURCE_IDENTITY_SESSION")" || {
+        capture_record_converged
+        return
+    }
+    if [ -f "$cache" ]; then
+        cat -- "$cache"
+        return
+    fi
+    record="$(capture_record_converged)" || return $?
+    if mkdir -p "$(dirname -- "$cache")" 2>/dev/null; then
+        prune_session_cache "$(dirname -- "$cache")"
+        tmp="$(mktemp "$(dirname -- "$cache")/.tmp.XXXXXX" 2>/dev/null)" || tmp=""
+        if [ -n "$tmp" ]; then
+            printf '%s\n' "$record" > "$tmp" && mv -f -- "$tmp" "$cache" ||
+                rm -f -- "$tmp"
+        fi
+    fi
+    printf '%s\n' "$record"
+}
+
+case "$MODE" in
+    paths)
+        emit_paths
+        ;;
+    session-cache-drop)
+        # A Makefile parse/restart boundary (the vendor/view bootstrap
+        # includes) establishes or repairs build inputs AFTER this session's
+        # first capture may already have cached a record that cannot see them.
+        # Drop the pre-boundary record so the post-restart parse re-derives
+        # the identity from the final input bytes. Best-effort by design: an
+        # unset/malformed session token means there is no cache to drop, and
+        # a failed removal still leaves every later verify-record fail-closed.
+        if cache="$(session_cache_path "$ZCL_SOURCE_IDENTITY_SESSION")"; then
+            rm -f -- "$cache" ||
+                echo "source-identity: could not drop session cache: $cache" >&2
+        fi
+        exit 0
+        ;;
+    capture)
+        capture
+        ;;
+    capture-record)
+        capture_record_cached
+        ;;
+    capture-record-attempt)
+        # Internal: exactly ONE capture attempt, never memoized and never
+        # retried. capture_record_converged() re-invokes the script this way so
+        # each retry re-enumerates the inventory in a process that has not yet
+        # opened a path set. Callers outside this file want capture-record.
+        capture_record
+        ;;
+    inventory-token)
+        inventory_token
+        ;;
+    list-source-paths)
+        # Internal: used only by capture_record()'s inventory-mismatch
+        # diagnostic to name which path was added or removed. Emits the same
+        # NUL-delimited enumeration as $WORK/source-paths from a fresh
+        # process; never a stable public interface.
+        cat -- "$WORK/source-paths"
+        ;;
+    verify)
+        [[ "$EXPECTED" =~ ^[0-9a-fA-F]{64}$ ]] ||
+            fail "verify requires a 64-hex expected identity"
+        actual="$(capture)" || exit $?
+        if [ "${actual,,}" != "${EXPECTED,,}" ]; then
+            fail "source epoch superseded: expected=${EXPECTED,,} actual=${actual,,}"
+        fi
+        printf '%s\n' "${actual,,}"
+        ;;
+    verify-record)
+        [[ "$EXPECTED" =~ ^[0-9a-fA-F]{64}$ ]] ||
+            fail "verify-record requires a 64-hex expected identity"
+        [ "$EXPECTED_CLEAN" = 1 ] ||
+            fail "verify-record requires v2 capture-completeness bit 1"
+        [[ "$EXPECTED_MUTATION" =~ ^[0-9a-fA-F]{64}$ ]] ||
+            fail "verify-record requires a 64-hex mutation token"
+        actual_record="$(capture_record_cached)" || exit $?
+        read -r actual actual_clean actual_mutation <<< "$actual_record"
+        if [ "${actual,,}" != "${EXPECTED,,}" ] ||
+           [ "$actual_clean" != "$EXPECTED_CLEAN" ] ||
+           [ "${actual_mutation,,}" != "${EXPECTED_MUTATION,,}" ]; then
+            fail "source build superseded: expected=${EXPECTED,,}/clean=${EXPECTED_CLEAN}/mutation=${EXPECTED_MUTATION,,} actual=${actual,,}/clean=${actual_clean}/mutation=${actual_mutation,,}"
+        fi
+        printf '%s %s %s\n' "${actual,,}" "$actual_clean" \
+            "${actual_mutation,,}"
+        ;;
+    verify-mutation)
+        [[ "$EXPECTED" =~ ^[0-9a-fA-F]{64}$ ]] ||
+            fail "verify-mutation requires a 64-hex mutation token"
+        verify_mutation "$EXPECTED"
+        ;;
+    *)
+        echo "usage: tools/dev/source-identity.sh paths|capture|capture-record|session-cache-drop|verify EXPECTED|verify-record EXPECTED CLEAN MUTATION|verify-mutation EXPECTED_MUTATION" >&2
+        exit 2
+        ;;
+esac

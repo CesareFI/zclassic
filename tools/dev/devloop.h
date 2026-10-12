@@ -1,0 +1,1399 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0 */
+
+#ifndef ZCL_TOOLS_DEVLOOP_H
+#define ZCL_TOOLS_DEVLOOP_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Changed-set ceiling for the PROOF and PLAN path. A landing batch is now ten
+ * or more lanes at once, so one proof legitimately covers thousands of paths.
+ * Every table that scales with this number is heap-allocated, so raising it
+ * grows no stack frame; anything above it is refused with a typed reason that
+ * names the observed count.
+ */
+#define ZCL_DEVLOOP_MAX_FILES 4096
+/* Separate, deliberately smaller ceiling for the file-watcher overlay, whose
+ * coalescing tables stay resident in the watcher frame. Overflow there is not
+ * an error: the watcher collapses the edit to a full rebuild rather than
+ * silently dropping paths, so the small table stays correct. */
+#define ZCL_DEVLOOP_WATCH_MAX_FILES 256
+#define ZCL_DEVLOOP_PATH_MAX 1024
+#define ZCL_DEVLOOP_OUTPUT_MAX 65536
+#define ZCL_DEVLOOP_RESTART_SOURCE_MAX 32
+/* A graph plan can legitimately reach hundreds of registered proof owners
+ * through a central header. Retain a measured 512-group envelope while the
+ * per-path accumulator remains separate; overflow widens the plan to the
+ * whole catalog (closure_universal).
+ * The rendered command document has an independent byte ceiling. */
+#define ZCL_DEVLOOP_MAX_PLAN_GROUPS 512
+#define ZCL_DEVLOOP_GROUP_MAX 64
+/* Union across every dimension: the path floor plus the closure additions,
+ * so a full path set and a full closure set both fit without either evicting
+ * the other. Not a raised cap — it is the sum of the two that already exist. */
+#define ZCL_DEVLOOP_MAX_PLAN_SELECTIONS (ZCL_DEVLOOP_MAX_PLAN_GROUPS * 2)
+/* The intermediate file a selection came through. Repo-relative; the longest
+ * tracked path is well under this. */
+#define ZCL_DEVLOOP_VIA_MAX 160
+/* One dimension's refusal evidence (zcl_devloop_dim_state.cause). Matches
+ * CODEINDEX_INCLUDE_UNSAFE_CAUSE_MAX, and with "closure-truncated: " in front
+ * it still fits the 256-byte proof failure record. */
+#define ZCL_DEVLOOP_CAUSE_MAX 192
+/* Byte ceiling the composed plan DOCUMENT renders into, independent of how
+ * large a buffer the caller happens to hand us.
+ *
+ * The plan is served by the `dev.test.plan` native leaf, which declares
+ * ZCL_COMMAND_LIST_BUDGET (8192) for the WHOLE zcl.result.v1 envelope, and the
+ * registry hard-fails the reply (RESPONSE_BUDGET_EXCEEDED, empty document)
+ * rather than truncating it. The envelope around `data` measured 340 bytes on
+ * this tree; 512 is the rounded-up reserve. Writing past this number does not
+ * produce a longer reply, it produces NO reply — which is why the renderer
+ * abridges the explanation list against this ceiling instead of against the
+ * caller's 16 KB stack buffer.
+ *
+ * Pinned mechanically: test_impact_composition asserts the leaf's declared
+ * budget still covers this number, so raising one without the other fails. */
+#define ZCL_DEVLOOP_PLAN_WIRE_MAX 7680
+#define ZCL_DEVLOOP_FIRST_ERROR_MAX 512
+#define ZCL_DEVLOOP_CYCLE_JSON_MAX 8192
+#define ZCL_DEVLOOP_WATCH_LOCK_REL ".cache/zcl-dev-watch.lock"
+/* Non-landing watchers exit after this much idle (no source event, no
+ * pending proof request, no proof in flight). One hour; compile-time only. */
+#define ZCL_DEVLOOP_WATCH_IDLE_BUDGET_MS (60 * 60 * 1000)
+
+/* ── the three dependency dimensions a plan is the UNION of ─────────────
+ *
+ * They are unioned, never intersected: a group named by any one of them is in
+ * the plan. They exist as separate names for two reasons — so a reader can be
+ * told WHICH one put a given test in the plan, and so incompleteness can be
+ * reported per dimension instead of collapsing into one boolean that means
+ * "something, somewhere, might be missing".
+ *
+ * OPAQUE   the hand-authored mappings in agent_impact_rules.def for artifacts
+ *          NO graph can reach: X-macro registries, lint gates, docs, lint
+ *          baselines, unit files — plus the hardcoded consensus-surface
+ *          prefixes. These are human judgement about which proof covers which
+ *          behaviour and are not derivable from any index; that is exactly why
+ *          they are labelled, so a reader knows no graph could have found them.
+ * SEMANTIC the call-graph blast radius: the changed file's own rule match plus
+ *          the rules matched by every file in its reverse-caller closure.
+ * INCLUDE  the compiler-depfile blast radius: the rules matched by every
+ *          translation unit that reads the changed file. This is the dimension
+ *          that answers a macro-only header or an X-macro table, which have no
+ *          call edges and therefore no SEMANTIC radius at all. */
+enum zcl_devloop_dim {
+    ZCL_DEVLOOP_DIM_OPAQUE = 0,
+    ZCL_DEVLOOP_DIM_SEMANTIC,
+    ZCL_DEVLOOP_DIM_INCLUDE,
+    ZCL_DEVLOOP_DIM__COUNT
+};
+
+/* Per-dimension completeness. The PRESERVE/FAIL-CLOSED split lives here:
+ * whatever a dimension found is always kept (INCOMPLETE never means EMPTY),
+ * and the verdict rides alongside so a caller that needs completeness can
+ * refuse while a caller that just wants tests to run still gets them. */
+enum zcl_devloop_dim_status {
+    ZCL_DEVLOOP_DIM_COMPLETE = 0,   /* ran to completion; the answer is whole */
+    ZCL_DEVLOOP_DIM_INCOMPLETE,     /* a bound fired; partial evidence RETAINED */
+    ZCL_DEVLOOP_DIM_UNAVAILABLE,    /* the dimension's source is absent */
+    ZCL_DEVLOOP_DIM_NOT_APPLICABLE  /* the file is outside this dimension's
+                                     * universe — nothing to find, and that is
+                                     * a complete answer, not a missing one */
+};
+
+struct zcl_devloop_dim_state {
+    enum zcl_devloop_dim_status status;
+    /* Stable label naming WHY, "" when COMPLETE. Deliberately shares wording
+     * with testcache_reason_label() ("closure-truncated", "no-include-graph")
+     * so the plan and the result cache never describe the same incompleteness
+     * with two different words. */
+    const char *reason;
+    /* The evidence behind `reason`, "" when there is none: for an INCLUDE
+     * refusal, a graph rule or the queried input that could not be verified
+     * (codeindex_include_query_unsafe_cause). Observability only. */
+    char cause[ZCL_DEVLOOP_CAUSE_MAX];
+};
+
+/* One selected proof group and the evidence that selected it. */
+struct zcl_devloop_selection {
+    char group[ZCL_DEVLOOP_GROUP_MAX];
+    /* The file whose rule match named this group: the changed file itself for
+     * OPAQUE and for a direct SEMANTIC match, otherwise the intermediate the
+     * closure walk reached. Never empty. */
+    char via[ZCL_DEVLOOP_VIA_MAX];
+    enum zcl_devloop_dim dim;
+};
+
+/* Stable names for the JSON surface and for report text. */
+const char *zcl_devloop_dim_name(enum zcl_devloop_dim dim);
+const char *zcl_devloop_dim_status_name(enum zcl_devloop_dim_status status);
+/* Stable progressive reactor vocabulary. `detail` retains the legacy
+ * compiler/probe/proof substage; the return value is the event humans and
+ * agents schedule against. */
+const char *zcl_devloop_progress_phase(const char *status,
+                                       const char *detail);
+
+/* Bind downstream resident receipts to the immutable edit epoch currently
+ * owned by the watcher thread. Empty clears the context; standalone callers
+ * naturally emit no edit_epoch field. */
+bool zcl_devloop_event_edit_epoch_set(const char *edit_epoch);
+const char *zcl_devloop_event_edit_epoch(void);
+
+enum zcl_devloop_state_lookup {
+    ZCL_DEVLOOP_STATE_INVALID = -1,
+    ZCL_DEVLOOP_STATE_ABSENT = 0,
+    ZCL_DEVLOOP_STATE_FOUND = 1
+};
+
+enum zcl_devloop_action {
+    ZCL_DEVLOOP_CHECK = 0,
+    ZCL_DEVLOOP_HOTSWAP,
+    ZCL_DEVLOOP_RELOAD,
+};
+
+/* Publication intent is an explicit caller decision.  Persistent watchers use
+ * VERIFY_ONLY by default; only an operator-invoked apply/auto path may select
+ * APPLY.  Keeping this separate from the file-classification action prevents a
+ * consensus/reload classification from bypassing watcher containment. */
+enum zcl_devloop_publish_mode {
+    ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY = 0,
+    ZCL_DEVLOOP_PUBLISH_APPLY,
+};
+
+struct zcl_devloop_plan {
+    enum zcl_devloop_action action;
+    const char *action_name;
+    const char *reason;
+    const char *probe_tool;
+    const char *proof_group;
+    char proof_group_storage[64];
+    bool consensus_risk;
+    bool docs_only;
+    /* True iff any changed file lives under the SEALED consensus core (core/
+     * — the surface core/MANIFEST.sha3 pins). Sealed files are always
+     * consensus_risk too (heaviest proof), and the fast loop structurally
+     * REFUSES to auto-publish them unless the owner unseal token is present.
+     * See zcl_devloop_path_is_sealed_core() / zcl_devloop_refusal_json(). */
+    bool sealed_core;
+    size_t file_count;
+
+    /* ── proof-group sets (F3: path floor + symbol-closure additions) ──
+     * proof_group above stays the PRIMARY route (path-derived, consensus-safe).
+     * These sets are ADDITIVE reporting only — nothing here changes proof_group.
+     *
+     * path_groups: the union of every shared-impact-rule group matched by the
+     * changed files themselves (the path-glob FLOOR). Deterministic insertion
+     * order; proof_group is normally path_groups[0] (or the consensus override).
+     *
+     * closure_groups: groups reached ONLY through the blast radius — every
+     * file in the changed set's reverse-caller closure (SEMANTIC) and every
+     * translation unit that reads it (INCLUDE), each mapped through the SAME
+     * shared impact rules, minus anything already in path_groups. Populated by
+     * zcl_devloop_plan_add_closure(); empty until then.
+     *
+     * A BOUND FIRING NO LONGER EMPTIES THIS SET. A partial walk is real
+     * evidence and every group it found is kept; what a bound changes is the
+     * per-dimension completeness verdict in `dims` below, which is what a
+     * caller needing PROOF must read. The old behaviour discarded the
+     * evidence AND let the caller believe the remainder was sufficient —
+     * fail-closed by design, fail-open in effect. */
+    char path_groups[ZCL_DEVLOOP_MAX_PLAN_GROUPS][ZCL_DEVLOOP_GROUP_MAX];
+    size_t path_groups_len;
+    char closure_groups[ZCL_DEVLOOP_MAX_PLAN_GROUPS][ZCL_DEVLOOP_GROUP_MAX];
+    size_t closure_groups_len;
+    bool closure_attempted;   /* zcl_devloop_plan_add_closure() ran */
+    bool closure_snapshot;    /* resident used existing graph + current bytes */
+    /* Back-compat boolean: true iff an applicable SEMANTIC or INCLUDE
+     * dimension is INCOMPLETE/UNAVAILABLE. NOT_APPLICABLE is sufficient. It
+     * no longer implies closure_groups is empty — read `dims`. */
+    bool closure_truncated;
+
+    /* CAPACITY, not missing evidence. A bound firing on a graph dimension
+     * says "this change reaches more than the plan can enumerate" — which is
+     * a fact about the plan's size, not about the index's ability to answer.
+     * The sound, fail-closed reading of that fact is the UNIVERSAL closure:
+     * every group in the catalog is impacted. The dimension is then COMPLETE
+     * with reason "closure-universal" and this flag is set, and a proof
+     * consumer must run the whole catalog rather than the group arrays above.
+     * UNAVAILABLE — no index, query error — is a different fact and still
+     * refuses proof. */
+    bool closure_universal;
+    /* The path floor named more groups than path_groups holds. Capacity like
+     * the closure bound: closure_universal is set, the OPAQUE dimension is
+     * COMPLETE with reason "path-group-cap", and closing the plan keeps it
+     * universal. */
+    bool path_universal;
+
+    /* ── C5: why every selected group is here ── */
+    struct zcl_devloop_selection selections[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS];
+    size_t selections_len;
+    bool selections_truncated;   /* the selection ledger itself overflowed */
+
+    /* ── C4: per-dimension completeness, indexed by enum zcl_devloop_dim ── */
+    struct zcl_devloop_dim_state dims[ZCL_DEVLOOP_DIM__COUNT];
+};
+
+/* Is this plan admissible as PROOF that a change is covered?
+ *
+ * TRUE only when every dimension is COMPLETE or NOT_APPLICABLE. An INCOMPLETE
+ * or UNAVAILABLE dimension means the union may be missing a group nobody can
+ * name, so any consumer that would treat the plan as sufficient evidence —
+ * proof reuse, test-cache admission, an "is this change proven" gate — must
+ * refuse. This is deliberately the same standard tests/harness/src/testcache.c
+ * already applies to its own closure (TESTCACHE_R_TRUNCATED /
+ * TESTCACHE_R_NO_INCLUDE_GRAPH => UNCACHEABLE, and an UNCACHEABLE group always
+ * runs), and *out_reason receives the same label vocabulary so the two never
+ * describe one incompleteness with two different words. They cannot share a
+ * symbol: testcache is a test-binary-only module and is never linked into the
+ * node, so the shared thing is the vocabulary and the test that pins them.
+ *
+ * `out_reason` (may be NULL) receives the first refusing dimension's reason,
+ * or "" when admissible. Never NULL-terminated garbage; always a literal. */
+bool zcl_devloop_plan_proof_admissible(const struct zcl_devloop_plan *plan,
+                                       const char **out_reason);
+
+/* The same refusal as one line of evidence for a proof failure record and
+ * `dev land status`: the reason zcl_devloop_plan_proof_admissible() names,
+ * followed by ": <cause>" when the refusing dimension recorded one, e.g.
+ * "closure-truncated: prereq_not_regular build/obj/x.d -> net/gone.h".
+ * Writes "" when the plan is admissible. The text is clipped below 256 bytes
+ * so it always fits the proof failure record. Returns the length written. */
+size_t zcl_devloop_plan_refusal_text(const struct zcl_devloop_plan *plan,
+                                     char *out, size_t cap);
+
+#if defined(ZCL_TESTING)
+/* Pure capacity seam for the corpus-sized closure regression. */
+int zcl_devloop_test_closure_file_cap(int indexed, size_t changed_count);
+/* Test-only ceiling on closure_groups, so the group-cap path can be reached
+ * from a fixture of a few dozen files instead of one that must out-name the
+ * whole catalog. 0 (the default) means the production cap. Values outside
+ * (0, ZCL_DEVLOOP_MAX_PLAN_GROUPS) are ignored. */
+extern size_t zcl_devloop_test_plan_group_cap;
+/* Test-only fault: the facts walk resolves no seed to its canonical id, so
+ * the "seed-unresolved" fallback is reachable from the fixture. */
+extern bool zcl_devloop_test_facts_unresolved;
+/* Test-only consumer mutants: each drops one rule of the declaration-
+ * identity consumer, so the fixture proves that rule is load-bearing. */
+enum zcl_devloop_consumer_mutant {
+    ZCL_DEVLOOP_MUTANT_NONE = 0,
+    ZCL_DEVLOOP_MUTANT_NO_TYPE_CLOSURE,  /* typedef/tag edges dropped */
+    ZCL_DEVLOOP_MUTANT_NO_MACRO_CLOSURE, /* macro-body edges dropped */
+    ZCL_DEVLOOP_MUTANT_NO_POSITION,      /* header positions and moved __LINE__ users ignored */
+    ZCL_DEVLOOP_MUTANT_NO_TAG_ALIAS,     /* s:N no longer reaches s:<path>:N */
+    ZCL_DEVLOOP_MUTANT_NO_CODEGEN_CLOSURE, /* seeds are the changed functions only */
+    ZCL_DEVLOOP_MUTANT_NO_OUTSIDER,      /* TUs reading no changed file never drift */
+    ZCL_DEVLOOP_MUTANT_NO_SDIR_REPLAY,   /* a search-dir-only identity change never moves a lookup */
+    ZCL_DEVLOOP_MUTANT_NO_ASSERT,        /* no static_assert site makes a TU compile */
+    ZCL_DEVLOOP_MUTANT_NO_UNBOUND,       /* a lookup with no negative claim never reaches a changed path */
+};
+extern enum zcl_devloop_consumer_mutant zcl_devloop_test_consumer_mutant;
+/* Test-only: whether the last facts-narrowed walk folded `path` into its
+ * plan (the reached-file set, not its size); reset forgets every walk. */
+bool zcl_devloop_test_reached_has(const char *path);
+/* Test-only: whether the last facts-narrowed walk started from `path`
+ * (the fold the obligations handed it: changed files and the TUs whose
+ * tests they obligate), whatever the walk reached from there. */
+bool zcl_devloop_test_folded_has(const char *path);
+void zcl_devloop_test_reached_reset(void);
+/* Watcher stop fixture: a stop requested before the proof fork starts no
+ * worker, and a SIGTERM sent the instant fork() returns must reach the
+ * worker's cancel state instead of being erased by the child's reset. */
+bool zcl_dev_proof_test_edit_stop_cancels(const char *root);
+#endif
+
+/* The forked child's own convention for a pre-exec setup failure (setsid,
+ * the ready-pipe write, chdir(cwd), dup2) — never the command's exit code.
+ * 127 stays "exec failed"; this runner never changes either number. */
+#define ZCL_DEVLOOP_PROCESS_EXIT_SETUP_FAILED 126
+
+struct zcl_devloop_process_result {
+    int exit_code;
+    int term_signal;
+    bool timed_out;
+    bool cancelled;
+    int64_t elapsed_ms;
+    int64_t startup_us;
+    int64_t body_us;
+    int64_t first_output_us;
+    char output[ZCL_DEVLOOP_OUTPUT_MAX];
+    size_t output_len;
+    bool output_truncated;
+};
+
+/* One resident-authority module build. The authority is the long-lived
+ * zclassic23-dev watcher; only the compiler and linker are child processes.
+ * Make, a shell, and a throwaway CLI are absent from the edit path. */
+struct zcl_devloop_hotswap_build_receipt {
+    char source_tu[256];
+    char artifact_path[4096];
+    /* SHA-256 of the exact compiler-produced relocatable object.  This is
+     * distinct from the linked candidate module root below and survives an
+     * exact-input cache hit. */
+    char candidate_object_sha256[65];
+    char artifact_sha256[65];
+    char artifact_cache_key[65];
+    int64_t plan_load_us;
+    int64_t compile_us;
+    int64_t link_us;
+    int64_t publish_us;
+    int64_t total_us;
+    /* Stage costs of one resident action, monotonic microseconds; zero when
+     * the stage was not reached. key_us runs from the build start through
+     * the artifact cache key (plan, generated inputs, dependency hashing);
+     * lookup_us covers the per-key lock, byte verification and worktree
+     * materialization of a verified cached module. */
+    int64_t inputs_us;
+    int64_t dependency_hash_us;
+    int64_t key_us;
+    int64_t lookup_us;
+    int64_t verify_us;
+    int64_t materialize_us;
+    bool plan_cache_hit;
+    bool artifact_cache_hit;
+    uint32_t dependency_count;
+    uint32_t compiler_processes;
+    uint32_t linker_processes;
+    /* zcl.action_preimage.v2 identity of this compile (devloop_action_root.h),
+     * derived after the build from its published depfile. Exactly one of
+     * action_root / action_root_miss is set after a build attempt: a miss
+     * carries a stable reason code and a detail, never a guessed root. */
+    char action_root[65];
+    char action_root_cause[24];
+    char action_root_miss[40];
+    char action_root_miss_detail[192];
+    int64_t action_root_us;
+    int64_t action_root_store_us;
+    uint32_t action_root_probes;
+    uint32_t action_root_present;
+    uint64_t action_root_harness_read_bytes;
+    uint32_t action_root_harness_hashes;
+    uint32_t action_root_harness_cache_hits;
+    /* The artifact cache key (zcl.dev_artifact_cache.hotswap.v2) binds the
+     * action root derived before compiling over the baseline (or discovery)
+     * depfile. A build whose root cannot be derived completely is unkeyed:
+     * it carries the miss code, compiles, and shares nothing through the
+     * cache. cache_key_us sums every key derivation of this build. */
+    char cache_key_action_root[65];
+    char cache_key_miss[40];
+    int64_t cache_key_us;
+};
+
+/* Build exactly one compiled-allowlist source TU under the cached action plan
+ * written by the authoritative Make configuration. A warm build snapshots
+ * the previous compiler depfile and re-stats after compilation. A cold build
+ * discovers the closure, then verifies it with a second compile in the same
+ * action; any dependency mutation or expansion refuses publication. No shell
+ * or Make process is launched. */
+bool zcl_devloop_hotswap_build(
+    const char *repo_root, const char *source_tu,
+    struct zcl_devloop_hotswap_build_receipt *receipt,
+    struct zcl_devloop_process_result *process,
+    char *why, size_t why_len);
+
+/* Write member includes followed by the owner include to an open stream.
+ * All arguments must be non-NULL. Members use the plain whitespace split
+ * contract in util/spawn.h. Empty lists, text exceeding 2047 bytes, and
+ * lists exceeding 63 tokens return false without writing to the stream.
+ * Other failures may leave partial output; the caller must discard it. */
+bool zcl_devloop_hotswap_unity_members(
+    FILE *f, const char *root, const char *members, const char *owner);
+
+/* Pure fallback diagnosis for one resident hot-swap receipt. `why_not_live`
+ * preserves the exact bounded refusal; `next_command` names one deterministic
+ * action instead of the old generic "repair the refusal" instruction. */
+void zcl_devloop_hotswap_guidance(
+    const char *status, const char *phase, const char *why,
+    char *why_not_live, size_t why_not_live_size,
+    char *next_command, size_t next_command_size);
+struct json_value;
+bool zcl_devloop_hotswap_response_error(
+    const struct json_value *response, char *out, size_t out_size);
+
+/* One non-LTO process-restart candidate produced directly by the resident
+ * watcher from Make's frozen action plan. This is a candidate command-runtime
+ * proof, never release/deployment authority and never a live-node restart. */
+struct zcl_devloop_restart_build_receipt {
+    char artifact_path[4096];
+    char artifact_sha256[65];
+    char artifact_cache_key[65];
+    char source_cas_sha3[65];
+    char probe[64];
+    int64_t plan_load_us;
+    int64_t compile_us;
+    int64_t compile_startup_us;
+    int64_t compile_body_us;
+    int64_t link_us;
+    int64_t link_startup_us;
+    int64_t link_body_us;
+    int64_t probe_us;
+    int64_t probe_startup_us;
+    int64_t probe_body_us;
+    int64_t total_us;
+    uint32_t changed_sources;
+    uint32_t compiler_processes;
+    uint32_t linker_processes;
+    uint32_t complete_graph_linker_processes;
+    uint32_t probe_processes;
+    uint32_t source_guard_captures;
+    bool plan_cache_hit;
+    bool artifact_cache_hit;
+    bool source_identity_overlay;
+    bool candidate_probe_passed;
+};
+
+/* Exact affected-proof execution against a test binary linked from the same
+ * changed source bytes as the process candidate. A green exit alone is not
+ * proof: the receipt is complete only when the runner's summary accounts for
+ * every selected group as a fresh execution or a verified content-addressed
+ * PASS, with zero failures or self-skips. */
+struct zcl_devloop_restart_proof_receipt {
+    char artifact_path[4096];
+    char artifact_sha256[65];
+    char artifact_cache_key[65];
+    char source_cas_sha3[65];
+    char groups[4096];
+    char groups_sha256[65];
+    char deferred_groups[4096];
+    char deferred_groups_sha256[65];
+    char priority_group[128];
+    char priority_reason[64];
+    int64_t selection_us;
+    int64_t compile_us;
+    int64_t compile_startup_us;
+    int64_t compile_body_us;
+    int64_t link_us;
+    int64_t link_startup_us;
+    int64_t link_body_us;
+    int64_t test_us;
+    int64_t test_startup_us;
+    int64_t test_body_us;
+    int64_t priority_test_us;
+    int64_t total_us;
+    uint32_t group_count;
+    uint32_t deferred_group_count;
+    uint32_t groups_ran;
+    uint32_t groups_cached;
+    uint32_t groups_failed;
+    uint32_t self_skips;
+    uint32_t compiler_processes;
+    uint32_t linker_processes;
+    uint32_t complete_graph_linker_processes;
+    uint32_t test_processes;
+    uint32_t source_guard_captures;
+    /* Every exact group the complete plan selects, integration-only groups
+     * included; group_count is the part this receipt executed. */
+    uint32_t groups_selected;
+    /* The non-integration part of groups_selected. A complete focused run
+     * has group_count == groups_immediate_selected. */
+    uint32_t groups_immediate_selected;
+    /* Identity of the executed candidate at its rehash, rechecked after the
+     * run: device, inode, size and status-change time (0 where the platform
+     * has no stable inode). */
+    uint64_t artifact_dev;
+    uint64_t artifact_ino;
+    uint64_t artifact_size;
+    int64_t artifact_ctime_sec;
+    int64_t artifact_ctime_nsec;
+    bool artifact_cache_hit;
+    bool source_identity_overlay;
+    bool bounded_proof_deferred;
+    bool immediate_proof_complete;
+    bool integration_proof_deferred;
+    bool proof_complete;
+    /* True iff the link response resolved any per-TU object token to its
+     * base (pre-overlay) bytes even though a persistent overlay and marker
+     * physically existed for it from an earlier generation: the marker did
+     * not verify (wrong generation or a source-hash mismatch), so its proof
+     * from that generation cannot be trusted here. A token that never had
+     * an overlay at all is unaffected and never sets this. */
+    bool source_overlay_unresolved;
+};
+
+bool zcl_devloop_restart_build(
+    const char *repo_root, const char *const *source_tus, size_t source_count,
+    struct zcl_devloop_restart_build_receipt *receipt,
+    struct zcl_devloop_process_result *process,
+    char *why, size_t why_len);
+
+bool zcl_devloop_restart_prove(
+    const char *repo_root, const char *const *source_tus, size_t source_count,
+    const struct zcl_devloop_plan *plan,
+    struct zcl_devloop_restart_proof_receipt *receipt,
+    struct zcl_devloop_process_result *process,
+    char *why, size_t why_len);
+
+/* Save-cycle tier: executes every selected group except exact integration-only
+ * groups. If a reverse-caller closure exceeds the resident bound, it executes
+ * the complete explicit path floor and hash-binds the broader closure into the
+ * deferred set; a closure too wide to enumerate still runs the complete path
+ * floor and records only its size. bounded_proof_deferred then marks the run
+ * as partial: group_count of groups_selected executed. proof_complete remains
+ * false until every deferred group runs. */
+bool zcl_devloop_restart_prove_immediate(
+    const char *repo_root, const char *const *source_tus, size_t source_count,
+    const struct zcl_devloop_plan *plan,
+    struct zcl_devloop_restart_proof_receipt *receipt,
+    struct zcl_devloop_process_result *process,
+    char *why, size_t why_len);
+
+enum zcl_devloop_restart_event_result {
+    ZCL_DEVLOOP_RESTART_EVENT_ERROR = -1,
+    ZCL_DEVLOOP_RESTART_EVENT_NOT_APPLICABLE = 0,
+    ZCL_DEVLOOP_RESTART_EVENT_FINAL = 1,
+    ZCL_DEVLOOP_RESTART_EVENT_CANCELLED = 2,
+    ZCL_DEVLOOP_RESTART_EVENT_PROOF_PENDING = 3,
+    ZCL_DEVLOOP_RESTART_EVENT_FALLBACK_PENDING = 4,
+    /* A static authority shell compiled but nothing executed its bytes; the
+     * caller must still run the restart candidate lane for this epoch. */
+    ZCL_DEVLOOP_RESTART_EVENT_SHELL_COMPILED = 5,
+};
+
+/* Try the resident process-candidate lane for a bounded set of changed C TUs.
+ * The result distinguishes final failures from green affected feedback and
+ * from resident-cap fallbacks that still require conservative proof. */
+int zcl_devloop_restart_event(const char *repo_root,
+                              const char *const *source_tus,
+                              size_t source_count,
+                              enum zcl_devloop_publish_mode publish_mode);
+
+/* zcl_devloop_restart_event, also reporting through `focused_complete`
+ * whether the event published FOCUSED_GREEN: every immediate group its plan
+ * selects ran green against a candidate built from the current bytes of
+ * every one of `source_tus`. Anything else (partial, red, superseded,
+ * cancelled, refused) leaves it false. */
+int zcl_devloop_restart_event_proving(const char *repo_root,
+                                      const char *const *source_tus,
+                                      size_t source_count,
+                                      enum zcl_devloop_publish_mode publish_mode,
+                                      bool *focused_complete);
+
+/* Continue a green owner-bound story into exact affected proof without
+ * rebuilding or re-probing the runtime candidate. This is deliberately an
+ * asynchronous post-reflex lane: STORY_GREEN is already observable before
+ * this function compiles/links the isolated test candidate. */
+int zcl_devloop_restart_story_prove_event(
+    const char *repo_root, const char *const *source_tus,
+    size_t source_count, enum zcl_devloop_publish_mode publish_mode);
+
+/* Try the resident fast lane for one watcher epoch. Returns 0 when the file
+ * is not a hot-swap island (caller must use the conservative path), 1 when a
+ * machine-readable pass/refusal receipt was emitted and persisted, and -1 on
+ * an internal receipt-publication failure. APPLY is honored only here; the
+ * caller must downgrade every non-island edit to VERIFY_ONLY. */
+int zcl_devloop_hotswap_event(const char *repo_root, const char *source_tu,
+                              enum zcl_devloop_publish_mode publish_mode);
+
+/* Admit one debounced edit batch only when every path maps to the exact same
+ * island owner. The owner is compiled once and one generation is published;
+ * a cross-island or public-contract batch returns 0 for DEV_RESTART. */
+int zcl_devloop_hotswap_batch_event(
+    const char *repo_root, const char *const *paths, size_t path_count,
+    enum zcl_devloop_publish_mode publish_mode);
+
+/* Development-only capsule lane for an exact module-ABI fallback. The
+ * resident parent never loads the candidate; a disposable sandboxed child
+ * loads it, executes its owner-bound story, reports one bounded observation,
+ * and exits. */
+int zcl_devloop_hotfork_batch_event(
+    const char *repo_root, const char *const *paths, size_t path_count,
+    enum zcl_devloop_publish_mode publish_mode);
+struct zcl_hotfork_capsule_v1;
+bool zcl_devloop_hotfork_descriptor_validate(
+    const char *source_tu, const char *candidate_object_root,
+    const struct zcl_hotfork_capsule_v1 *capsule);
+bool zcl_devloop_hotfork_registry_validate(void);
+
+/* Complete current source identity: byte inventory plus the ABA mutation
+ * token. Shared by the watcher/cycle and focused native execution so neither
+ * can admit an artifact built from a superseded checkout. */
+struct dev_source_record {
+    char source_id[65];
+    char mutation_id[65];
+    /* Native, content-addressed identity for the public C23 source roots.
+     * A CAS-only capture derives source_id/mutation_id as domain-separated
+     * SHA-256 records for isolated resident candidates. A full capture
+     * overwrites those two fields with publication-authoritative v2 values. */
+    char cas_root_sha3[65];
+    uint32_t cas_files_total;
+    uint32_t cas_files_read;
+    uint32_t cas_nodes_hashed;
+    uint64_t cas_bytes_total;
+    uint64_t cas_bytes_read;
+    int64_t cas_elapsed_us;
+    bool cas_present;
+};
+
+/* Refresh the persistent native source Merkle tree and attach its SHA3 root
+ * and measured work to `out`. Project/source publication authority is not
+ * changed by this shadow capture. */
+bool zcl_dev_source_cas_capture(const char *repo_root,
+                                struct dev_source_record *out);
+/* Hash the ordered namespace of explicitly observed compiler include roots.
+ * File contents belong in the positive depfile closure; this root binds
+ * absence/presence, including __has_include decisions. `roots` must be the
+ * complete compiler-observed search list before this can seal an action.
+ * The path spelling is local; only ordered relative entries enter the root.
+ * Missing search directories have a distinct canonical marker. Unreadable,
+ * racing, cyclic, or special entries refuse instead of being skipped. */
+bool zcl_dev_include_namespace_v1_root(
+    const char *cwd, const char *const roots[], size_t count,
+    uint8_t out[32], char *why, size_t why_len);
+bool zcl_dev_source_identity_capture(const char *repo_root,
+                                     struct dev_source_record *out,
+                                     char *why, size_t why_len);
+/* Classify a failed source-identity child process into one specific evidence
+ * token (timeout, signal, nonzero exit, truncated output) rather than the
+ * single undifferentiated source_identity_command_failed. Exposed so tests
+ * can drive the mapping directly without paying for a real 30s+ capture. */
+bool zcl_dev_source_identity_classify_failure(
+    const struct zcl_devloop_process_result *result, char *why,
+    size_t why_len);
+/* Whether a source-identity failure token names a transient, load-shaped
+ * condition (timeout/signal/truncation) worth retrying the capture for, as
+ * opposed to a deterministic content or tool-path defect. */
+bool zcl_dev_source_identity_failure_retryable(const char *why);
+bool zcl_dev_source_identity_verify(const char *repo_root,
+                                    const struct dev_source_record *expected,
+                                    char *why, size_t why_len);
+/* Post-proof/preflight CAS: verifies inventory + ABA mutation metadata without
+ * a full byte rehash. Admission may compare it with a dev/test executable's
+ * publication-verified build receipt; publication/release authority remains
+ * the full portable byte identity. */
+bool zcl_dev_source_mutation_verify(const char *repo_root,
+                                    const struct dev_source_record *expected,
+                                    char *why, size_t why_len);
+
+enum zcl_dev_source_admission {
+    ZCL_DEV_SOURCE_ADMISSION_ERROR = -1,
+    ZCL_DEV_SOURCE_ADMISSION_STALE = 0,
+    ZCL_DEV_SOURCE_ADMISSION_BUILD_MUTATION = 1,
+    ZCL_DEV_SOURCE_ADMISSION_FULL_BYTES = 2
+};
+
+/* Admit one already-open dev/test executable against the current checkout.
+ * The common path compares its publication-verified source+mutation receipt
+ * with a bounded current mutation CAS. A receipt mismatch falls back to full
+ * byte capture, preserving safe edit/revert and copied-checkout reuse. */
+enum zcl_dev_source_admission zcl_dev_executable_source_admit(
+    const char *repo_root, int executable_fd, const char *display_path,
+    struct dev_source_record *out, char *why, size_t why_len);
+bool zcl_dev_executable_source_record_read(
+    const char *repo_root, int executable_fd, const char *display_path,
+    struct dev_source_record *out, char *why, size_t why_len);
+const char *zcl_dev_source_admission_name(
+    enum zcl_dev_source_admission admission);
+
+bool zcl_devloop_is_method(const char *method);
+int zcl_devloop_cli_main(const char **args, int nargs);
+int zcl_devloop_watch_worker_main(uintptr_t inherited, const char *root,
+                                  const char *mode, const char image_sha256[65]);
+
+bool zcl_devloop_plan_files(const char *const *files, size_t file_count,
+                            struct zcl_devloop_plan *out);
+size_t zcl_devloop_plan_json(const char *const *files, size_t file_count,
+                             char *out, size_t out_sz);
+
+/* Augment `plan` (already produced by zcl_devloop_plan_files for the same
+ * `files`) with blast-radius-derived proof groups across BOTH graph
+ * dimensions. For applicable source shapes, opens the codeindex at
+ * `repo_root` and computes
+ *   SEMANTIC — codeindex_impact_closure(): the reverse-caller file set, and
+ *   INCLUDE  — codeindex_reverse_includes(): every translation unit whose
+ *              compiler depfile lists a changed file,
+ * A dimension structurally unable to contain an edge for the changed shape
+ * is NOT_APPLICABLE and does not open/query the index. Maps each reached file
+ * through the SAME shared impact rules the path floor
+ * uses, and fills plan->closure_groups with the groups NOT already in
+ * plan->path_groups. The primary proof_group route is left untouched.
+ *
+ * PRESERVE, then FAIL CLOSED. Whatever a dimension found is always kept — a
+ * bound firing marks that dimension INCOMPLETE and never empties the group set.
+ * An index that will not open marks both graph dimensions UNAVAILABLE. Either
+ * way the plan still runs the tests it found; what changes is
+ * zcl_devloop_plan_proof_admissible(), which then refuses.
+ *
+ * Sets closure_attempted=true and fills plan->dims + plan->selections.
+ * Returns true unless an argument is invalid. */
+bool zcl_devloop_plan_add_closure(const char *repo_root,
+                                  const char *const *files, size_t file_count,
+                                  struct zcl_devloop_plan *plan);
+bool zcl_devloop_plan_add_closure_snapshot(
+    const char *repo_root, const char *const *files, size_t file_count,
+    struct zcl_devloop_plan *plan);
+
+/* Like zcl_devloop_plan_json but also runs the symbol closure at `repo_root`
+ * and emits the additional "path_groups", "closure_groups", and
+ * "closure_truncated" fields. Returns bytes written, or 0 on overflow/bad
+ * args. */
+size_t zcl_devloop_plan_json_closure(const char *repo_root,
+                                     const char *const *files,
+                                     size_t file_count, char *out,
+                                     size_t out_sz);
+
+/* zcl_devloop_plan_json_closure() plus, when `selects` is non-NULL, the two
+ * members "selects" (the id as given) and "selects_answer". */
+size_t zcl_devloop_plan_json_closure_selects(const char *repo_root,
+                                             const char *const *files,
+                                             size_t file_count,
+                                             const char *selects, char *out,
+                                             size_t out_sz);
+
+/* The answer to "does this plan's proof run test group `id`?", computed over
+ * the COMPLETE plan, never the abridged JSON lists. Exactly one of:
+ *   "selected"      the complete plan runs that group.
+ *   "not_selected"  the complete, valid plan does not contain that group.
+ *   "unknown_group" the id is not in the test catalog (a typo is never
+ *                   "not_selected").
+ *   "plan_invalid"  the plan's execution set is not valid
+ *                   (execution_set_valid:false), so no group can be ruled
+ *                   out. */
+const char *zcl_devloop_plan_selects_answer(const struct zcl_devloop_plan *plan,
+                                            const char *id);
+
+/* The same document, rendered from a plan the caller ALREADY ran the closure
+ * on. zcl_devloop_plan_json_closure() has to open the code index and walk the
+ * whole reverse-caller graph again to rebuild a plan its caller is usually
+ * still holding; on a proof that walk is the single most expensive thing in
+ * the run. A caller that has a closed plan renders it here instead and pays
+ * for the index once. Byte-identical output for the same plan and file set. */
+size_t zcl_devloop_plan_json_render(const struct zcl_devloop_plan *plan,
+                                    const char *const *files,
+                                    size_t file_count, char *out,
+                                    size_t out_sz);
+
+/* ── facts-narrowed closure (devloop_facts.c) ──────────────────────────────
+ * The same SEMANTIC walk as zcl_devloop_plan_add_closure(), seeded by the
+ * functions whose compiled tokens changed instead of by every symbol of the
+ * changed file. Evidence: a before/after semantic manifest with the facts
+ * extension (tools/sensors, `make clang-facts`) for every changed .c, and the
+ * before source bytes. Any change the manifests cannot attribute to one
+ * function body (headers, macros, declarations, layouts, identity, lookups,
+ * file-scope text, a function added or removed, a truncated manifest, two
+ * producers, an after manifest the tree no longer matches) or any
+ * seed with an unresolved effect or an address taken falls back to the
+ * file-seeded closure and names why. So does a pair whose FACTS producer
+ * digests are zero or differ ("producer-unknown", "producer-changed"), a
+ * definition whose head (attributes, storage class, signature) changed
+ * ("function-head-changed"), a seed that resolves to no FUNCTIONS record
+ * ("seed-unresolved") and any change to the producer's own sources
+ * ("producer-source-changed"). A narrowed plan is feedback only: its
+ * SEMANTIC dimension is INCOMPLETE ("facts-narrowed"), so
+ * zcl_devloop_plan_proof_admissible() refuses it. Token or AST similarity
+ * never authorizes proof reuse. */
+struct zcl_devloop_facts_tu {
+    const char *source; /* repo-relative changed .c */
+    const uint8_t *before, *after; /* semantic manifests */
+    size_t before_len, after_len;
+    const uint8_t *before_src, *after_src; /* the source bytes they bind */
+    size_t before_src_len, after_src_len;
+};
+
+#define ZCL_DEVLOOP_FACTS_MAX_SEEDS 64
+#define ZCL_DEVLOOP_FACTS_NAME_MAX 128
+/* A canonical id wider than this is not kept: its walk filters nothing. */
+#define ZCL_DEVLOOP_FACTS_ID_MAX 256
+struct zcl_devloop_facts_verdict {
+    bool narrowed;
+    const char *reason; /* "" when narrowed, else the fallback label */
+    char detail[192];
+    char seeds[ZCL_DEVLOOP_FACTS_MAX_SEEDS][ZCL_DEVLOOP_FACTS_NAME_MAX];
+    /* The canonical id of each seed ("" when unknown or too wide). */
+    char seed_ids[ZCL_DEVLOOP_FACTS_MAX_SEEDS][ZCL_DEVLOOP_FACTS_ID_MAX];
+    size_t seeds_len;
+    size_t seeds_total; /* seeds walked; seeds_len lists the first ones */
+    size_t reached_files;
+};
+
+/* Fills `plan` (already produced by zcl_devloop_plan_files for `files`) and
+ * `verdict`. Returns false only for invalid arguments or an index error. */
+bool zcl_devloop_plan_add_closure_facts(
+    const char *repo_root, const char *const *files, size_t file_count,
+    const struct zcl_devloop_facts_tu *tus, size_t tu_count,
+    struct zcl_devloop_plan *plan, struct zcl_devloop_facts_verdict *verdict);
+
+/* The dev.change.plan document for `files`, narrowed by the evidence in
+ * `facts_dir` (relative to repo_root): <facts_dir>/<file>.before.zsm,
+ * <file>.after.zsm and <file>.before per changed file; the after source is
+ * the working tree. Adds a "facts" object naming the verdict, the
+ * obligations with their reasons and the TU universe with its identities
+ * (the entries from tu_offset that fit one page). Returns bytes
+ * written, or 0 on overflow, bad arguments or malformed UTF-8 anywhere in
+ * the complete reply. Byte truncation of report text that splits a UTF-8
+ * character also refuses the complete reply; dev.change.plan reports
+ * INVALID_FILE_SET when this function returns 0. */
+size_t zcl_devloop_plan_json_facts(const char *repo_root,
+                                   const char *const *files, size_t file_count,
+                                   const char *facts_dir, size_t tu_offset,
+                                   char *out, size_t out_sz);
+
+#ifdef ZCL_TESTING
+struct zcl_devloop_facts_report;
+/* Render a fixture report; false clears a non-NULL out when out_sz > 0. */
+bool zcl_devloop_test_facts_json(const struct zcl_devloop_facts_report *r,
+                                const struct zcl_devloop_plan *p,
+                                char *out, size_t out_sz);
+#endif
+
+/* Planner internals the facts walk shares (devloop_plan.c). */
+bool zcl_devloop_plan_fold_file(struct zcl_devloop_plan *plan,
+                                const char *reached, enum zcl_devloop_dim dim);
+bool zcl_devloop_plan_proof_owner(const char *path);
+
+/* True iff the persistent watcher should react to a change at `path`
+ * (repo-relative): a .c/.h/.def/.md/.mk/.service source or the Makefile,
+ * excluding editor temp files, build/, .git/, and — critically — the
+ * transient `_*fixture*` lint/shape-gate fixtures that
+ * test_make_lint_gates.c writes under app/, lib/, and domain/ then deletes.
+ * Reacting to those fixtures fires a phantom reload cycle on every
+ * test-suite run (they no longer exist by the time the cycle rebuilds), so
+ * the watcher must ignore them. Pure: no I/O. Shared by the watcher and its
+ * unit test. */
+bool zcl_devloop_path_is_relevant(const char *path);
+
+/* Accumulated C translation units whose source bytes have diverged from the
+ * resident restart base during this watcher lifetime. Service-private header
+ * edits map to their one island owner. Overflow fails closed so a later
+ * restart cannot silently link stale base objects. `proven[i]` is true only
+ * while a FOCUSED_GREEN verdict has executed the current bytes of
+ * sources[i]; adding the source again (a newer save) clears it. */
+struct zcl_devloop_restart_source_set {
+    char sources[ZCL_DEVLOOP_RESTART_SOURCE_MAX][ZCL_DEVLOOP_PATH_MAX];
+    bool proven[ZCL_DEVLOOP_RESTART_SOURCE_MAX];
+    size_t count;
+    bool overflow;
+};
+
+bool zcl_devloop_restart_source_set_add(
+    struct zcl_devloop_restart_source_set *set,
+    const char *const *paths, size_t path_count);
+
+/* Mark each accumulated source named in `paths` proven. Call only with the
+ * exact source list of a restart event that reported focused_complete. */
+void zcl_devloop_restart_source_set_mark_proven(
+    struct zcl_devloop_restart_source_set *set,
+    const char *const *paths, size_t path_count);
+
+/* Write every accumulated source that is not proven to `out` (in set
+ * order) and return how many; 0 when the set overflowed or `cap` is too
+ * small. After adding an epoch, this is that epoch's restart sources plus
+ * every earlier save no FOCUSED_GREEN verdict has executed. */
+size_t zcl_devloop_restart_source_set_unproven(
+    const struct zcl_devloop_restart_source_set *set,
+    const char **out, size_t cap);
+
+/* The lanes one watcher epoch tries, in order. The watcher passes the
+ * production handlers; tests pass fakes. */
+struct zcl_devloop_epoch_lanes {
+    int (*hotfork)(const char *root, const char *const *files, size_t count,
+                   enum zcl_devloop_publish_mode mode);
+    int (*hotswap)(const char *root, const char *const *files, size_t count,
+                   enum zcl_devloop_publish_mode mode);
+    int (*service_contract)(const char *root, const char *const *files,
+                            size_t count);
+    int (*restart)(const char *root, const char *const *files, size_t count,
+                   enum zcl_devloop_publish_mode mode, bool *focused_complete);
+};
+
+/* The complete-proof set an epoch hands on: `files` points either at the
+ * epoch's own paths or at `sources`, which borrows from the source set. */
+struct zcl_devloop_epoch_proof {
+    const char *sources[ZCL_DEVLOOP_RESTART_SOURCE_MAX];
+    const char *const *files;
+    size_t count;
+};
+
+/* Run one watcher epoch's reflex lanes and return the deciding lane's
+ * zcl_devloop_restart_event_result (0 when none applied). A static authority
+ * shell (SHELL_COMPILED) skips the service-contract handler and runs the
+ * restart lane over exactly the set's unproven sources, so its verdict
+ * covers the edited owner and every earlier save still unproven, and never
+ * one already executed by a FOCUSED_GREEN verdict. A declined restart lane,
+ * or a source set that cannot be trusted, leaves the shell PROOF_PENDING. */
+int zcl_devloop_epoch_reflex(
+    const char *root, const char *const *files, size_t count,
+    enum zcl_devloop_publish_mode mode,
+    struct zcl_devloop_restart_source_set *set,
+    const struct zcl_devloop_epoch_lanes *lanes,
+    struct zcl_devloop_epoch_proof *proof);
+
+/* True iff `path` is under the sealed consensus core (the `core/` prefix —
+ * the exact surface `core/MANIFEST.sha3` seals). Broader than the
+ * consensus-risk prefix list: it covers ALL of core/ (incl. core/math). */
+bool zcl_devloop_path_is_sealed_core(const char *path);
+
+/* True iff an owner-minted one-shot unseal token (`.core-unseal-token`, the
+ * file `make core-unseal` writes) is present at `repo_root`. READ-ONLY: this
+ * never mints or consumes the token — `make core-seal` is the sole consumer,
+ * so one unseal authorizes one LANDED COMMIT, not one dev-cycle. */
+bool zcl_devloop_unseal_token_present(const char *repo_root);
+
+/* Build the structured sealed-core refusal envelope (a zcl.dev_cycle.v1
+ * document with status "refused") into `out`. `files` lists the full changed
+ * set; the envelope's "paths" array carries only the sealed-core members that
+ * triggered the refusal. Returns the byte count, or 0 on overflow/bad args.
+ * Sealed != frozen: the envelope always names the elevated procedure. */
+size_t zcl_devloop_refusal_json(const char *const *files, size_t file_count,
+                                char *out, size_t out_sz);
+
+/* Emit a registry menu or an unknown-path error, returning its JSON byte count.
+ * Failed unknown-path encoding returns 0 with an empty output when out is
+ * non-NULL and out_sz is positive. NULL or empty paths select "dev". */
+size_t zcl_devloop_menu_json(const char *path, char *out, size_t out_sz);
+size_t zcl_devloop_menu_search_json(const char *query,
+                                    char *out, size_t out_sz);
+
+bool zcl_devloop_process_run(const char *cwd,
+                             const char *const argv[],
+                             int timeout_ms,
+                             struct zcl_devloop_process_result *out);
+/* Test fixtures include intentionally large stack frames. Raise only the
+ * test child's soft stack limit to its inherited hard limit before exec. */
+bool zcl_devloop_process_run_test(const char *cwd,
+                                  const char *const argv[], int timeout_ms,
+                                  struct zcl_devloop_process_result *out);
+/* The same bounded run with exactly `envp` (NULL-terminated NAME=value) as
+ * the child's environment instead of this process's own. */
+bool zcl_devloop_process_run_env(const char *cwd,
+                                 const char *const argv[],
+                                 const char *const envp[], int timeout_ms,
+                                 struct zcl_devloop_process_result *out);
+/* Execute the already-open regular executable at `exec_fd`. The caller owns
+ * and closes the fd after return. This pins one inode across identity query +
+ * execution even when a stable build/bin alias is atomically republished. */
+bool zcl_devloop_process_run_fd(const char *cwd, int exec_fd,
+                                const char *const argv[], int timeout_ms,
+                                struct zcl_devloop_process_result *out);
+#if defined(__APPLE__)
+/* Start a proof step suspended, compare the already-open Mach-O's
+ * CodeDirectory with the child's mapped CodeDirectory, then resume it.
+ * The caller owns exec_fd and reaps the returned session leader. */
+bool zcl_devloop_process_spawn_fd_attested(const char *cwd, int exec_fd,
+                                            const char *const argv[],
+                                            const char *log_path,
+                                            int64_t *pid_out);
+#endif
+/* Async-signal-safe cancellation owned by the resident watcher. A request
+ * terminates the active bounded child process group; clear only when the
+ * watcher begins a new ownership lifetime. */
+void zcl_devloop_process_cancel_request(void);
+void zcl_devloop_process_cancel_clear(void);
+bool zcl_devloop_process_cancel_requested(void);
+/* Bind a forked proof worker to its original watcher. Linux also receives a
+ * kernel parent-death signal; this check covers systems without that signal
+ * and the interval before the worker observes it. */
+void zcl_devloop_process_cancel_bind_parent(uint64_t expected_parent);
+#ifdef ZCL_TESTING
+/* Test-only stopped child fixture, inherited by fork before exec. */
+void zcl_devloop_process_test_preexec_notify_fd_set(int fd);
+#endif
+typedef bool (*zcl_devloop_process_cancel_poll_fn)(void *opaque);
+void zcl_devloop_process_cancel_poll_set(
+    zcl_devloop_process_cancel_poll_fn poll_fn, void *opaque);
+void zcl_devloop_process_cancel_poll_clear(void);
+/* POSIX: signal (sig > 0) or only count (sig == 0) the live processes of
+ * session `session` — its leader's process group plus, where /proc exists,
+ * members that moved to another group. Returns the members observed. */
+size_t zcl_devloop_process_session_members(int64_t session, int sig);
+/* Linux: the live (non-zombie) members of `session`, up to `cap` of them in
+ * `out`. `complete` is true only when /proc was listed and every member fit;
+ * without /proc nothing is listed and `complete` stays false. */
+size_t zcl_devloop_process_session_list(int64_t session, int64_t *out,
+                                        size_t cap, bool *complete);
+#if defined(ZCL_TESTING) && !defined(_WIN32)
+/* Deterministic process-backed KAT for exact-commit scheduling priority. */
+bool zcl_devloop_watch_commit_preemption_selftest(void);
+/* Real bounded-stream KAT for watcher-local queue backpressure. */
+bool zcl_devloop_watch_stream_backpressure_selftest(const char *repo_root);
+/* The watcher's persistent journal sealer against a real workspace. Returns
+ * NULL on success or the first broken property: stop seals every published
+ * event; a backlog over the bound and a dead sealer each seal inline; rapid
+ * saves past the ring's capacity lose nothing; a proof worker fork keeps
+ * neither the request pipe nor the deferral; a sealer killed inside a batch
+ * leaves a journal that a watcher restart continues without a gap; and no
+ * child process or descriptor outlives the sealer. */
+const char *zcl_devloop_watch_sealer_selftest(const char *repo_root);
+/* Idle-budget exit, landing-root exemption, and stopped-heartbeat reason. */
+bool zcl_devloop_watch_root_is_landing(const char *root);
+bool zcl_devloop_watch_idle_exit_selftest(void);
+/* The foreground edit cycle's cancel rule, against a real repository in
+ * `repo_root`: a queued exact commit proof for current HEAD on a clean tree
+ * cancels the obsolete cycle holding the reactor, a dirty checkout keeps its
+ * edit feedback, and the poll the reactor installs answers a real bounded
+ * child through the real process seam without ever spawning one itself. */
+bool zcl_devloop_watch_foreground_yield_selftest(const char *repo_root);
+#endif
+#if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
+bool zcl_devloop_deterministic_compile_failure(
+    const struct zcl_devloop_process_result *result,
+    char out[ZCL_DEVLOOP_FIRST_ERROR_MAX]);
+#endif
+
+/* Launch the generation-neutral initial ZVCS baseline. POSIX uses a detached
+ * double-fork/setsid grandchild. Until a qualified native detached-process
+ * seam exists, Windows runs synchronously to preserve VCS state isolation.
+ * Completion is appended to <repo_root>/.zvcs/bootstrap.log. Returns true iff
+ * work started successfully (the detached baseline may still have failed; check
+ * .zvcs/bootstrap.log or the next vcs_devloop_anchor_cycle() call). Dev-only
+ * (tools/dev/devloop_baseline.c); a release build never links this. */
+bool zcl_devloop_baseline_launch(const char *repo_root);
+
+int zcl_devloop_run_cycle(const char *repo_root,
+                          const char *const *files,
+                          size_t file_count);
+int zcl_devloop_run_cycle_mode(const char *repo_root,
+                               const char *const *files,
+                               size_t file_count,
+                               enum zcl_devloop_publish_mode publish_mode);
+bool zcl_devloop_publish_mode_applies(
+    enum zcl_devloop_publish_mode publish_mode);
+/* True only for a completed conservative source-wide verify cycle. A
+ * deferred, superseded, rejected, probe-only, or publication cycle is never
+ * reusable proof. Kept public so the receipt contract has a tiny KAT. */
+bool zcl_devloop_cycle_proof_complete(const char *status, const char *phase);
+const char *zcl_devloop_publish_mode_name(
+    enum zcl_devloop_publish_mode publish_mode);
+enum zcl_devloop_publish_mode zcl_devloop_default_watch_publish_mode(void);
+bool zcl_devloop_publication_target_port_supported(int rpc_port);
+/* Stable watcher-status vocabulary shared by the native status/ensure
+ * surface and its tests. The returned next action is deliberately the same
+ * idempotent command whether it starts a watcher or reports an existing one. */
+const char *zcl_devloop_watcher_freshness(bool active, bool source_ready,
+                                          bool runtime_ready);
+const char *zcl_devloop_watcher_next_action(
+    bool active, bool source_ready, bool runtime_ready,
+    enum zcl_devloop_publish_mode publish_mode);
+/* Pure path builder shared by the native watcher's flock acquisition and its
+ * regression tests.  repo_root must already identify the worktree whose lane
+ * is being watched; distinct worktrees consequently receive distinct locks. */
+bool zcl_devloop_watch_lock_path(const char *repo_root,
+                                 char *out, size_t out_sz);
+/* Content/directory-entry mutations wake the loop. Metadata-only access-time
+ * changes from compilers and indexers do not constitute a source save. */
+bool zcl_devloop_watch_event_is_mutation(uint32_t inotify_mask);
+bool zcl_devloop_watch_dir_is_ignored(const char *name);
+/* Path of the landing queue.lock that sits beside a landing worktree
+ * (`<root>/../queue.lock`). Shared by the watcher and the proof worker so
+ * they cannot disagree about the sibling; each caller tests existence with
+ * its own filesystem capability. */
+static inline bool zcl_devloop_landing_queue_lock_path(const char *root,
+                                                      char *out, size_t out_sz)
+{
+    int n;
+    if (!root || !*root || !out || out_sz == 0)
+        return false;
+    n = snprintf(out, out_sz, "%s/../queue.lock", root);
+    return n > 0 && (size_t)n < out_sz;
+}
+/* Canonical-worktree identity and SHA3-sealed cycle state.  Readers never
+ * create state. ABSENT is an honest empty result; INVALID must fail closed. */
+bool zcl_devloop_workspace_id(const char *repo_root, char out[65]);
+#if !defined(_WIN32)
+/* The watcher's bound stop endpoint for session `nonce` (64 hex): a FIFO
+ * private to this user, which the watcher creates and the stop writes. */
+bool zcl_devloop_watch_stop_endpoint_path(const char *nonce, char path[320]);
+#endif
+bool zcl_devloop_workspace_resolve(const char *repo_root, char out_id[65],
+                                   char *out_dir, size_t out_dir_len);
+bool zcl_devloop_workspace_state_dir(const char *repo_root,
+                                     char *out, size_t out_len);
+/* Journal one new event. While the ring is live it goes through the ring
+ * under the seal lock, taking the ring's next epoch and sealing after every
+ * earlier ring event, so journal and ring never disagree on an epoch. It is
+ * durable on return, except under a resident sealing owner (the watcher),
+ * which seals it off the caller's path as it does every ring event. */
+bool zcl_devloop_cycle_state_write(const char *repo_root,
+                                   const char *cycle_json, size_t cycle_len,
+                                   char *why, size_t why_len);
+/* Volatile bounded reflex stream. The watcher resets it from the durable
+ * journal's latest epoch, publishes without fsync/storage acknowledgement,
+ * then persists the same reserved epoch asynchronously. It is an observation
+ * cache only; the sealed append-only journal remains evidence authority. */
+bool zcl_devloop_cycle_stream_reset(const char *repo_root,
+                                    int64_t durable_epoch,
+                                    char *why, size_t why_len);
+/* Under the seal lock: heal (sweeping staging files left by dead writers),
+ * seal any valid ring events past the journal tail, then reset the ring after
+ * the tail. durable_out (optional) receives that tail epoch. A tail the ring
+ * no longer holds intact (evicted, torn or missing) does not fail the
+ * restart; `why` then names the lost epoch range. A tail the journal cannot
+ * take (ENOSPC, EIO, permissions, a lock failure) refuses the restart and
+ * leaves the ring untouched. */
+bool zcl_devloop_cycle_stream_restart(const char *repo_root,
+                                      int64_t *durable_out,
+                                      char *why, size_t why_len);
+bool zcl_devloop_cycle_stream_publish(const char *repo_root,
+                                      const char *cycle_json,
+                                      size_t cycle_len, int64_t *epoch_out,
+                                      char *why, size_t why_len);
+/* Seal every volatile event through `through_epoch` in epoch order. Producers
+ * call this only after the action-changing event is visible; storage latency
+ * therefore cannot delay reflex feedback. Flushers serialize on a workspace
+ * seal lock; each event is durable before the next, and the latest pointer
+ * moves once, at the batch's last event. */
+bool zcl_devloop_cycle_stream_flush_through(const char *repo_root,
+                                            int64_t through_epoch,
+                                            char *why, size_t why_len);
+/* A resident owner may accept responsibility for sealing (returns true) so
+ * its reflex loop never waits on journal fsyncs; returning false seals now.
+ * Producers call zcl_devloop_cycle_stream_seal after their event is visible;
+ * without an accepting owner it is exactly flush_through. */
+typedef bool (*zcl_devloop_cycle_seal_defer_fn)(void *opaque,
+                                                const char *repo_root,
+                                                int64_t through_epoch);
+void zcl_devloop_cycle_stream_seal_defer(zcl_devloop_cycle_seal_defer_fn fn,
+                                         void *opaque);
+bool zcl_devloop_cycle_stream_seal(const char *repo_root,
+                                   int64_t through_epoch,
+                                   char *why, size_t why_len);
+/* The ring's newest published epoch and its durable watermark (the newest
+ * epoch already sealed into the journal). */
+bool zcl_devloop_cycle_stream_marks(const char *repo_root,
+                                    int64_t *latest_out, int64_t *durable_out);
+#if defined(ZCL_TESTING)
+/* Test seam: this process SIGKILLs itself after sealing `events` more
+ * journal events (0 disarms), to crash a sealer inside a batch. */
+void zcl_devloop_cycle_stream_test_kill_after(int events);
+/* Test seam: SIGKILL halfway through writing the `records`-th journal record
+ * from now (0 disarms), before it is linked under its final name. */
+void zcl_devloop_cycle_stream_test_kill_in_write(int records);
+/* Test seam: pause `ms` between reserving a ring epoch and writing its slot,
+ * holding the ring publication lock (0 disarms). */
+void zcl_devloop_cycle_stream_test_publish_pause_ms(int ms);
+/* Test seam: make the no-replace rename report EINVAL, as on a filesystem
+ * without one, so journal records take the link-then-unlink path. */
+void zcl_devloop_cycle_stream_test_force_link(bool on);
+#endif
+/* Move a latest pointer left behind the journal tail (a flusher died inside
+ * a batch) onto the tail event. A no-op when they already agree. The
+ * directory is scanned for dead writers' staging files only when the tail
+ * walk refuses an event, since one can be a second link to it. */
+bool zcl_devloop_cycle_state_heal(const char *repo_root, char *why,
+                                  size_t why_len);
+bool zcl_devloop_cycle_state_write_epoch(const char *repo_root,
+                                         int64_t reserved_epoch,
+                                         const char *cycle_json,
+                                         size_t cycle_len,
+                                         char *why, size_t why_len);
+enum zcl_devloop_state_lookup zcl_devloop_cycle_state_read(
+    const char *repo_root, char *out, size_t out_len, size_t *len_out,
+    int64_t *epoch_out, char *why, size_t why_len);
+/* Read the first sealed event strictly newer than after_epoch. Unlike the
+ * latest-value compatibility surface above, this never skips an available
+ * intermediate event. A missing link in an otherwise newer journal is
+ * INVALID, not permission to jump ahead. */
+enum zcl_devloop_state_lookup zcl_devloop_cycle_state_read_after(
+    const char *repo_root, int64_t after_epoch, char *out, size_t out_len,
+    size_t *len_out, int64_t *epoch_out, char *why, size_t why_len);
+
+/* Wait for the first exact event after `after_epoch`. The directory watch is
+ * armed before the first read, closing the check/sleep race; producers wake it
+ * through the bounded volatile ring. A sealer holding the cycle lock never
+ * delays it: a busy lock reads the sealed event file without the lock once
+ * the ring marks that epoch durable; anything else is not yet published. On timeout, epoch_out retains the exact
+ * caller anchor so recovery evidence cannot regress to zero. */
+enum zcl_devloop_state_lookup zcl_devloop_cycle_state_wait_after(
+    const char *repo_root, int64_t after_epoch, int timeout_ms,
+    char *out, size_t out_len, size_t *len_out, int64_t *epoch_out,
+    char *why, size_t why_len);
+int zcl_devloop_watch(const char *repo_root);
+int zcl_devloop_watch_mode(const char *repo_root,
+                           enum zcl_devloop_publish_mode publish_mode);
+typedef bool (*zcl_devloop_stop_predicate)(void *opaque);
+int zcl_devloop_watch_mode_until(const char *repo_root,
+    enum zcl_devloop_publish_mode publish_mode,
+    zcl_devloop_stop_predicate stop, void *opaque);
+#if !defined(_WIN32) && (defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING))
+#define ZCL_DEVLOOP_WATCH_PATH_EVENT 1
+/* Write and flush one changed or queued source-path record to a writable stream.
+ * NULL or invalid UTF-8 paths return false and write no event bytes.
+ * Output failure returns false and may leave a partial record.
+ * Watch callers must stop on false, drain ordered teardown, and exit nonzero. */
+bool zcl_devloop_watch_path_event(FILE *stream, const char *path, size_t count,
+    uint64_t sequence, bool rescan, bool queued);
+#if defined(ZCL_TESTING)
+/* Isolated watcher fixture: replace only foreground build/proof execution.
+ * The callback runs after the changed record; the real backend then collects
+ * edits it made before the queued caller and ordered teardown run.
+ * The stopped observer runs immediately before the stopped heartbeat.
+ * NULL restores execution. Install only in a private fixture child. */
+typedef void (*zcl_devloop_watch_test_foreground_fn)(void *opaque);
+void zcl_devloop_watch_test_foreground_set(
+    zcl_devloop_watch_test_foreground_fn fn, void *opaque);
+void zcl_devloop_watch_test_stopped_set(
+    zcl_devloop_watch_test_foreground_fn fn, void *opaque);
+#endif
+#endif
+int zcl_devloop_print_status(void);
+int zcl_devloop_run_sim(const char *repo_root);
+int zcl_devloop_app_describe(const char *repo_root, const char *app_id);
+int zcl_devloop_app_plan(const char *repo_root, const char *app_id,
+                         const char *resource);
+int zcl_devloop_app_simulate(const char *app_id, uint64_t seed);
+
+/* True for a conventional resource name: lowercase snake_case, starting with
+ * a letter, no doubled or trailing underscore, within the App manifest's
+ * resource-name bound. The one admission rule dev.app.plan and
+ * dev.app.scaffold share. */
+bool zcl_devloop_app_resource_valid(const char *name);
+
+/* Release-safe bounded JSON buffer producers backing both the stdout print
+ * wrappers above and the Wave 2.2 registry dev handlers. Return bytes written,
+ * or 0 on invalid arguments / overflow. */
+size_t zcl_devloop_app_describe_json(const char *repo_root, const char *app_id,
+                                     char *out, size_t out_sz);
+size_t zcl_devloop_app_plan_json(const char *repo_root, const char *app_id,
+                                 const char *resource, char *out, size_t out_sz);
+size_t zcl_devloop_app_simulate_json(const char *app_id, uint64_t seed,
+                                     char *out, size_t out_sz);
+
+/* ── App resource slice (dev.app.plan / dev.app.scaffold) ──────────────
+ *
+ * ONE declaration of what a conventional App resource slice is. dev.app.plan
+ * renders it as a preview; dev.app.scaffold materialises exactly the same
+ * slice on disk. Neither re-derives the other's answer. Two kinds of entry:
+ *
+ *   CREATE — a whole new source file, written atomically (temp + rename).
+ *   ROW    — one exact registry line appended to an existing .def file if,
+ *            and only if, that line is not already present.
+ */
+enum {
+    ZCL_DEVLOOP_APP_SLICE_MAX_FILES = 8,
+    ZCL_DEVLOOP_APP_SLICE_PATH_MAX = 192,
+    ZCL_DEVLOOP_APP_SLICE_NAME_MAX = 96,
+    ZCL_DEVLOOP_APP_SLICE_BODY_MAX = 8192
+};
+
+enum zcl_devloop_app_slice_kind {
+    ZCL_DEVLOOP_APP_SLICE_CREATE = 0,
+    ZCL_DEVLOOP_APP_SLICE_ROW = 1
+};
+
+struct zcl_devloop_app_slice_file {
+    char path[ZCL_DEVLOOP_APP_SLICE_PATH_MAX];
+    enum zcl_devloop_app_slice_kind kind;
+    size_t body_len;
+    char body[ZCL_DEVLOOP_APP_SLICE_BODY_MAX];
+};
+
+struct zcl_devloop_app_slice {
+    char root[ZCL_DEVLOOP_PATH_MAX];
+    char app_id[ZCL_DEVLOOP_APP_SLICE_NAME_MAX];
+    char resource[ZCL_DEVLOOP_APP_SLICE_NAME_MAX];
+    char group[ZCL_DEVLOOP_APP_SLICE_NAME_MAX];
+    size_t file_count;
+    struct zcl_devloop_app_slice_file files[ZCL_DEVLOOP_APP_SLICE_MAX_FILES];
+};
+
+/* Build the slice for one (app_id, resource) pair against the checkout at
+ * repo_root. Returns a heap-owned slice, or NULL when the root, the App
+ * manifest, or the resource name is not admissible. Reads only; writes
+ * nothing. Free with zcl_devloop_app_slice_free(). */
+struct zcl_devloop_app_slice *zcl_devloop_app_slice_build(
+    const char *repo_root, const char *app_id, const char *resource);
+void zcl_devloop_app_slice_free(struct zcl_devloop_app_slice *slice);
+
+/* Materialize the slice. Fail-closed and idempotent: it refuses, having
+ * written nothing, when any CREATE target already exists with different
+ * content or any ROW registry is missing; a target that already matches is
+ * left alone and reported unchanged. Returns bytes written to out, or 0 on
+ * overflow / invalid arguments. */
+size_t zcl_devloop_app_scaffold_json(const char *repo_root, const char *app_id,
+                                     const char *resource, char *out,
+                                     size_t out_sz);
+int zcl_devloop_app_scaffold(const char *repo_root, const char *app_id,
+                             const char *resource);
+
+/* ── Wave 3.2 native activation engine — dev-lane wiring ───────────────
+ *
+ * The implementation remains testable while all public callers are hard-
+ * contained. A future complete publication transaction may decide whether to
+ * drive the native transactional activation
+ * engine (tools/dev/dev_activation.h: dev_activation_run() /
+ * dev_activation_activate_generation()) or keep shelling out to the proven
+ * backend or a replacement. The three helpers below are pure (no process
+ * exec, no disk I/O beyond getenv()) glue used to build/interpret its request and
+ * result -- see docs/work/HOTSWAP.md "Transactional reload: native engine".
+ *
+ * Guarded the same way dev_activation.h's own entry points are
+ * (ZCL_DEV_BUILD || ZCL_TESTING): a release build sees no declaration at
+ * all, and the hermetic ZCL_TESTING harness can unit-test the pure builders
+ * directly (no fake ops vtable needed -- they never call one). */
+#if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
+#include <limits.h>
+
+#include "dev_activation.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* True iff ZCL_DEV_NATIVE_ACTIVATION selects the retained native engine in
+ * code paths that already possess internal test authority. This runtime
+ * selector is NOT activation authority: public watcher/apply entrypoints
+ * refuse before consulting it, and deploy-dev-lane.sh accepts machinery tests
+ * only through its inherited-FD, fixture-bound self-test capability. */
+bool dev_activation_native_enabled(void);
+
+/* Caller-owned storage backing a struct dev_activation_request built by
+ * dev_activation_request_from_cycle() below -- the struct's string fields
+ * point directly into these buffers (and, for repo_root/build_commit, into
+ * the caller's own arguments), so `out` must outlive any use of out->req. */
+struct dev_activation_cycle_request {
+    struct dev_activation_request req;
+    char artifact_path[PATH_MAX];
+    char gen_root[PATH_MAX];
+    char datadir[PATH_MAX];
+};
+
+/* Build *out from the dev lane's fixed constants -- the exact values
+ * tools/dev/deploy-dev-lane.sh hard-codes (GEN_ROOT defaulting to
+ * ~/.local/lib/zclassic23-dev, DEV_DATADIR ~/.zclassic-c23-dev, UNIT
+ * zcl23-dev.service, DEV_RPCPORT 18252, build_type "fast") plus the
+ * fast-lane artifact at <repo_root>/build/bin/zclassic23-dev. Pure: reads
+ * only HOME and ZCL_DEV_GENERATION_ROOT, never touches disk beyond that and
+ * never spawns a process. `repo_root` and display-only `build_commit` are
+ * stored by pointer (not copied) and must outlive `out`; `build_commit` may
+ * be "" but not NULL. It is never a preflight or activation decision input.
+ * The caller binds req.source_identity separately before activation. Returns
+ * false, leaving *out unusable, iff HOME is unset/empty or an argument is
+ * NULL/oversized. */
+bool dev_activation_request_from_cycle(const char *repo_root,
+                                       const char *build_commit,
+                                       struct dev_activation_cycle_request *out);
+
+/* Outcome of a completed dev_activation_result, mapped into the shape
+ * finish_cycle()/the vcs.vcs.revert reply need: pass/fail plus a short
+ * human-readable failure capsule and the candidate's generation hex (the
+ * ZVCS auto-anchor's generation binding -- see devloop_cycle.c:finish_cycle
+ * and vcs.h's generation_sha256). */
+struct dev_activation_cycle_outcome {
+    bool ok;
+    char capsule[256];
+    char generation_hex[65];
+};
+
+/* Pure: maps `r` into `out`. `r` NULL => *out zeroed (ok=false). */
+void dev_activation_map_result(const struct dev_activation_result *r,
+                               struct dev_activation_cycle_outcome *out);
+
+/* Testable wrapper over devloop_cycle.c's static distill_first_error(): scan
+ * [out, out+len) FORWARD for the first actionable line — a compiler
+ * diagnostic (contains ": error:") or a test failure (contains "FAIL",
+ * "Assertion", or "EXPECT") — and copy it (newline stripped, bounded by
+ * dstcap, always NUL-terminated) into dst. Returns true iff one was found.
+ * Backs the dense output_capsule "first_error=" prefix. Pure: no I/O. */
+bool zcl_devloop_distill_first_error(const char *out, size_t len,
+                                     char *dst, size_t dstcap);
+#endif /* ZCL_DEV_BUILD || ZCL_TESTING */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ZCL_TOOLS_DEVLOOP_H */

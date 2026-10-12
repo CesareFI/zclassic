@@ -1,0 +1,671 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Purpose: The fleet fact table answers every seeded row, and answers an ask
+ *          it has no row for without guessing.
+ *
+ * Two surfaces, one group: cognition/modules/fleetfacts (the table and the
+ * query) and dev.know (the leaf), called in process through the real registry
+ * so an input key the .def never declared fails here rather than from a shell.
+ *
+ * NOT proven here, and deliberately: that the lint gate rejects a bad row.
+ * tools/lint/check_fleet_facts.sh carries its own `--selftest` over a fixture
+ * table — an undeclared object, an undeclared relation, an UNKNOWN
+ * confidence, a duplicated row, an empty why and an unused term each have to
+ * fail before the gate will report on the real table — and `make
+ * check-fleet-facts` runs that selftest before the scan on every lint cycle.
+ * Reimplementing it here would be a second oracle over the same fixture. */
+#include "test/test_core.h"
+
+#include "command/native_command.h"
+#include "config/command_catalog.h"
+#include "fleetfacts/fleet_facts.h"
+#include "base/hex.h"
+#include "base/safe_alloc.h"
+#include "sha3/sha3.h"
+#include "json/json.h"
+#include "kernel/command_registry.h"
+
+#include <string.h>
+
+#define FFT_PATH "dev.fleet.know"
+
+static bool fft_root_matches(const struct zcl_fleet_fact_v1 *row)
+{
+    static const char domain[] = "zcl.fleet_fact.v1";
+    const char *const fields[] = {
+        row->subject, row->relation, row->object, row->context
+    };
+    struct sha3_256_ctx hash;
+    uint8_t digest[32];
+    char expected[65];
+    sha3_256_init(&hash);
+    sha3_256_write(&hash, (const uint8_t *)domain, sizeof(domain));
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+        sha3_256_write(&hash, (const uint8_t *)fields[i], strlen(fields[i]) + 1);
+    sha3_256_finalize(&hash, digest);
+    zcl_hex_encode(digest, sizeof(digest), expected);
+    return strcmp(row->provenance, expected) == 0;
+}
+
+/* ── one in-process invocation of the leaf ─────────────────────────────── */
+
+struct fft_call {
+    const char *setup_error;
+    unsigned invocations;
+    struct json_value input;
+    struct zcl_command_request request;
+    struct zcl_command_reply reply;
+};
+
+static void fft_begin(struct fft_call *c)
+{
+    c->setup_error = NULL;
+    c->invocations = 0;
+    json_init(&c->input);
+    json_set_object(&c->input);
+    memset(&c->request, 0, sizeof(c->request));
+    c->request.input = &c->input;
+    c->request.spec =
+        zcl_command_registry_find(zcl_command_catalog(), FFT_PATH, NULL);
+    zcl_command_reply_init(&c->reply, "zcl.dev_know.v1");
+}
+
+static void fft_end(struct fft_call *c);
+
+static void fft_input_str(struct fft_call *c, const char *key, const char *value)
+{
+    if (c->setup_error) return;
+    bool ok = json_push_kv_str(&c->input, key, value);
+    const struct json_value *v = json_get(&c->input, key);
+    if (!ok || !v || v->type != JSON_STR ||
+        strcmp(json_get_str(v), value) != 0)
+        c->setup_error = key;
+}
+
+static void fft_input_int(struct fft_call *c, const char *key, int64_t value)
+{
+    if (c->setup_error) return;
+    bool ok = json_push_kv_int(&c->input, key, value);
+    const struct json_value *v = json_get(&c->input, key);
+    if (!ok || !v || v->type != JSON_INT || json_get_int(v) != value)
+        c->setup_error = key;
+}
+
+static bool fft_run(struct fft_call *c)
+{
+    char why[192];
+
+    if (c->setup_error) {
+        printf("[input setup failed: %s] ", c->setup_error);
+        fft_end(c);
+        return false;
+    }
+
+    if (c->request.spec &&
+        !zcl_command_registry_input_validate(c->request.spec, &c->input, why,
+                                             sizeof(why))) {
+        printf("[input rejected: %s] ", why);
+        return false;
+    }
+    c->invocations++;
+    zcl_native_handle_dev_know(&c->request, &c->reply);
+    return true;
+}
+
+static void fft_end(struct fft_call *c)
+{
+    zcl_command_reply_free(&c->reply);
+    json_free(&c->input);
+}
+
+static const struct json_value *fft_get(const struct fft_call *c,
+                                        const char *key)
+{
+    return json_get(&c->reply.data, key);
+}
+
+static bool fft_bool(const struct fft_call *c, const char *key)
+{
+    const struct json_value *v = fft_get(c, key);
+    return v && v->type == JSON_BOOL && json_get_bool(v);
+}
+
+static int64_t fft_int(const struct fft_call *c, const char *key)
+{
+    const struct json_value *v = fft_get(c, key);
+    return v && v->type == JSON_INT ? json_get_int(v) : -1;
+}
+
+static const char *fft_row_str(const struct fft_call *c, size_t index,
+                               const char *key)
+{
+    const struct json_value *rows = fft_get(c, "rows");
+    const struct json_value *row = rows ? json_at(rows, index) : NULL;
+    const struct json_value *v = row ? json_get(row, key) : NULL;
+    return v && v->type == JSON_STR && json_get_str(v) ? json_get_str(v) : "";
+}
+
+/* ── the table ─────────────────────────────────────────────────────────── */
+
+static int test_fleet_facts_table(void)
+{
+    int failures = 0;
+
+    TEST("fleet_facts: every seeded row resolves through its own subject") {
+        size_t count = zcl_fleet_facts_row_count();
+        ASSERT(count >= 20);
+        for (size_t i = 0; i < count; i++) {
+            struct zcl_fleet_fact_v1 row;
+            struct zcl_fleet_facts_answer_v1 answer;
+            bool found = false;
+
+            ASSERT(zcl_fleet_facts_get(i, &row));
+            /* Every stored row is asserted, never unknown, and carries a
+             * root and a reason: a row that cannot say why it is here is
+             * indistinguishable from a guess. */
+            ASSERT(row.confidence == ZCL_FLEET_CONFIDENCE_DOCTRINE ||
+                   row.confidence == ZCL_FLEET_CONFIDENCE_OBSERVED);
+            ASSERT(strlen(row.provenance) == 64);
+            ASSERT(row.why[0] != '\0');
+            ASSERT(row.subject[0] != '\0' && row.object[0] != '\0');
+
+            ASSERT(zcl_fleet_facts_query(row.subject, row.relation,
+                                         row.context,
+                                         ZCL_FLEET_FACTS_MAX_ROWS, &answer));
+            ASSERT(!answer.unknown);
+            for (size_t j = 0; j < answer.row_count; j++)
+                if (strcmp(answer.rows[j].provenance, row.provenance) == 0)
+                    found = true;
+            ASSERT(found);
+        }
+        PASS();
+    }
+
+    TEST("fleet_facts: the row root is the row, not the position") {
+        struct zcl_fleet_fact_v1 a, b;
+        ASSERT(zcl_fleet_facts_get(0, &a));
+        ASSERT(zcl_fleet_facts_get(1, &b));
+        ASSERT(strcmp(a.provenance, b.provenance) != 0);
+        ASSERT(fft_root_matches(&a));
+        ASSERT(fft_root_matches(&b));
+        PASS();
+    }
+
+    TEST("fleet_facts: an unknown subject answers one UNKNOWN row, never none") {
+        struct zcl_fleet_facts_answer_v1 answer;
+        ASSERT(zcl_fleet_facts_query("no-such-subject", NULL, NULL, 8,
+                                     &answer));
+        ASSERT(answer.unknown);
+        ASSERT_EQ(answer.row_count, (size_t)1);
+        ASSERT_EQ(answer.total, (size_t)1);
+        ASSERT(!answer.truncated);
+        ASSERT(answer.rows[0].confidence == ZCL_FLEET_CONFIDENCE_UNKNOWN);
+        ASSERT_STR_EQ(answer.rows[0].subject, "no-such-subject");
+        ASSERT_STR_EQ(answer.rows[0].relation, "");
+        ASSERT_STR_EQ(answer.rows[0].context, "");
+        ASSERT_STR_EQ(answer.rows[0].object, "");
+        ASSERT_STR_EQ(answer.rows[0].provenance,
+                      "00000000000000000000000000000000"
+                      "00000000000000000000000000000000");
+        ASSERT(strstr(answer.rows[0].why, "doctrine nor observations") != NULL);
+        ASSERT(strstr(answer.rows[0].why,
+                      "Check relation and context against the exposed vocabularies") != NULL);
+        ASSERT(strstr(answer.rows[0].why,
+                      "retry with optional filters cleared") != NULL);
+        PASS();
+    }
+
+    TEST("fleet_facts: an unknown filtered ask retains inputs and recovery guidance") {
+        struct zcl_fleet_facts_answer_v1 answer;
+        ASSERT(zcl_fleet_facts_query("no-such-subject", "trap_signature",
+                                     "doctrine", 8, &answer));
+        ASSERT(answer.unknown);
+        ASSERT_EQ(answer.row_count, (size_t)1);
+        ASSERT_EQ(answer.total, (size_t)1);
+        ASSERT(!answer.truncated);
+        ASSERT(answer.rows[0].confidence == ZCL_FLEET_CONFIDENCE_UNKNOWN);
+        ASSERT_STR_EQ(answer.rows[0].subject, "no-such-subject");
+        ASSERT_STR_EQ(answer.rows[0].relation, "trap_signature");
+        ASSERT_STR_EQ(answer.rows[0].context, "doctrine");
+        ASSERT_STR_EQ(answer.rows[0].object, "");
+        ASSERT_STR_EQ(answer.rows[0].provenance,
+                      "00000000000000000000000000000000"
+                      "00000000000000000000000000000000");
+        ASSERT(strstr(answer.rows[0].why, "doctrine nor observations") != NULL);
+        ASSERT(strstr(answer.rows[0].why,
+                      "Check relation and context against the exposed vocabularies") != NULL);
+        ASSERT(strstr(answer.rows[0].why,
+                      "retry with optional filters cleared") != NULL);
+        PASS();
+    }
+
+    TEST("fleet_facts: a matching ask retains its doctrine reason") {
+        struct zcl_fleet_facts_answer_v1 answer;
+        ASSERT(zcl_fleet_facts_query("test_boot_phase", "trap_signature",
+                                     "lane_state:proof", 16, &answer));
+        ASSERT(!answer.unknown);
+        ASSERT_EQ(answer.row_count, (size_t)1);
+        ASSERT_EQ(answer.total, (size_t)1);
+        ASSERT(!answer.truncated);
+        ASSERT(answer.rows[0].confidence == ZCL_FLEET_CONFIDENCE_DOCTRINE);
+        ASSERT_STR_EQ(answer.rows[0].subject, "test_boot_phase");
+        ASSERT_STR_EQ(answer.rows[0].relation, "trap_signature");
+        ASSERT_STR_EQ(answer.rows[0].context, "lane_state:proof");
+        ASSERT_STR_EQ(answer.rows[0].object, "ram-generation-root");
+        ASSERT_STR_EQ(answer.rows[0].why,
+                      "its block-I/O probe burns under the suite tmpdir inside the "
+                      "generation, and fsync on tmpfs never moves ru_oublock; "
+                      "not load, not a flake");
+        PASS();
+    }
+
+    TEST("fleet_facts: a malformed ask is refused, not answered") {
+        struct zcl_fleet_facts_answer_v1 answer;
+        ASSERT(!zcl_fleet_facts_query(NULL, NULL, NULL, 8, &answer));
+        ASSERT(!zcl_fleet_facts_query("", NULL, NULL, 8, &answer));
+        ASSERT(!zcl_fleet_facts_query("sonnet", NULL, NULL, 8, NULL));
+        PASS();
+    }
+
+    TEST("fleet_facts: the relation filter narrows, and narrows exactly") {
+        struct zcl_fleet_facts_answer_v1 all, well;
+        ASSERT(zcl_fleet_facts_query("sonnet", NULL, NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &all));
+        ASSERT(!all.unknown);
+        ASSERT(all.total >= 2);
+        ASSERT(zcl_fleet_facts_query("sonnet", "handles_well", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &well));
+        ASSERT(!well.unknown);
+        ASSERT(well.total <= all.total);
+        static const char *const objects[] = {
+            "verification", "gate-fixing", "finishing-rebase",
+            "scoped-implementation",
+        };
+        ASSERT_EQ(well.total, (size_t)4);
+        ASSERT_EQ(well.row_count, (size_t)4);
+        ASSERT(!well.truncated);
+        for (size_t i = 0; i < well.row_count; i++) {
+            ASSERT_STR_EQ(well.rows[i].relation, "handles_well");
+            ASSERT_STR_EQ(well.rows[i].object, objects[i]);
+        }
+        /* A relation the subject has no row for is UNKNOWN, not empty. */
+        struct zcl_fleet_facts_answer_v1 none;
+        ASSERT(zcl_fleet_facts_query("sonnet", "lives_at", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &none));
+        ASSERT(none.unknown);
+        ASSERT_EQ(none.row_count, (size_t)1);
+        PASS();
+    }
+
+    TEST("fleet_facts: grok handles_well a pinned test and handles_poorly seam-finding") {
+        struct zcl_fleet_facts_answer_v1 well, poorly;
+        bool saw_pinned = false;
+        bool saw_seam = false;
+
+        ASSERT(zcl_fleet_facts_query("grok", "handles_well", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &well));
+        ASSERT(!well.unknown);
+        for (size_t i = 0; i < well.row_count; i++) {
+            ASSERT(well.rows[i].confidence == ZCL_FLEET_CONFIDENCE_DOCTRINE);
+            if (strcmp(well.rows[i].object, "single-file-pinned-test") == 0)
+                saw_pinned = true;
+        }
+        ASSERT(saw_pinned);
+
+        ASSERT(zcl_fleet_facts_query("grok", "handles_poorly", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &poorly));
+        ASSERT(!poorly.unknown);
+        for (size_t i = 0; i < poorly.row_count; i++) {
+            if (strcmp(poorly.rows[i].object, "seam-finding") == 0)
+                saw_seam = true;
+        }
+        ASSERT(saw_seam);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+static int test_fleet_facts_traps(void)
+{
+    int failures = 0;
+
+    TEST("fleet_facts: proof-lock trap_signature is stray-lane-watcher and landing-worktree trap_signature is stale-installed-hook") {
+        struct zcl_fleet_facts_answer_v1 lock, hook;
+        bool saw_watcher = false;
+        bool saw_hook = false;
+
+        ASSERT(zcl_fleet_facts_query("proof-lock", "trap_signature", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &lock));
+        ASSERT(!lock.unknown);
+        for (size_t i = 0; i < lock.row_count; i++) {
+            ASSERT(lock.rows[i].confidence == ZCL_FLEET_CONFIDENCE_DOCTRINE);
+            if (strcmp(lock.rows[i].object, "stray-lane-watcher") == 0)
+                saw_watcher = true;
+        }
+        ASSERT(saw_watcher);
+
+        ASSERT(zcl_fleet_facts_query("landing-worktree", "trap_signature", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &hook));
+        ASSERT(!hook.unknown);
+        for (size_t i = 0; i < hook.row_count; i++) {
+            if (strcmp(hook.rows[i].object, "stale-installed-hook") == 0)
+                saw_hook = true;
+        }
+        ASSERT(saw_hook);
+        PASS();
+    }
+
+    TEST("fleet_facts: source-identity trap_signature is ctime-bump and make-prerequisite trap_signature is later-defined-variable") {
+        struct zcl_fleet_facts_answer_v1 ident, makeprereq;
+        bool saw_ctime = false;
+        bool saw_later = false;
+
+        ASSERT(zcl_fleet_facts_query("source-identity", "trap_signature", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &ident));
+        ASSERT(!ident.unknown);
+        for (size_t i = 0; i < ident.row_count; i++) {
+            ASSERT(ident.rows[i].confidence == ZCL_FLEET_CONFIDENCE_DOCTRINE);
+            if (strcmp(ident.rows[i].object, "ctime-bump") == 0)
+                saw_ctime = true;
+        }
+        ASSERT(saw_ctime);
+
+        ASSERT(zcl_fleet_facts_query("make-prerequisite", "trap_signature", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &makeprereq));
+        ASSERT(!makeprereq.unknown);
+        for (size_t i = 0; i < makeprereq.row_count; i++) {
+            if (strcmp(makeprereq.rows[i].object, "later-defined-variable") == 0)
+                saw_later = true;
+        }
+        ASSERT(saw_later);
+        PASS();
+    }
+
+    TEST("fleet_facts: full-lint trap_signature is standalone-tools-cold-build and test_hotswap_rollback trap_signature is stale-seal-fixture") {
+        struct zcl_fleet_facts_answer_v1 full_lint, hotswap;
+        bool saw_standalone = false;
+        bool saw_stale_seal = false;
+
+        ASSERT(zcl_fleet_facts_query("full-lint", "trap_signature", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &full_lint));
+        ASSERT(!full_lint.unknown);
+        for (size_t i = 0; i < full_lint.row_count; i++) {
+            ASSERT(full_lint.rows[i].confidence == ZCL_FLEET_CONFIDENCE_DOCTRINE);
+            if (strcmp(full_lint.rows[i].object, "standalone-tools-cold-build") == 0)
+                saw_standalone = true;
+        }
+        ASSERT(saw_standalone);
+
+        ASSERT(zcl_fleet_facts_query("test_hotswap_rollback", "trap_signature", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &hotswap));
+        ASSERT(!hotswap.unknown);
+        for (size_t i = 0; i < hotswap.row_count; i++) {
+            if (strcmp(hotswap.rows[i].object, "stale-seal-fixture") == 0)
+                saw_stale_seal = true;
+        }
+        ASSERT(saw_stale_seal);
+        PASS();
+    }
+
+    TEST("fleet_facts: the context filter selects one microtheory") {
+        struct zcl_fleet_facts_answer_v1 proof, doctrine;
+        ASSERT(zcl_fleet_facts_query("test_boot_phase", NULL, "lane_state:proof",
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &proof));
+        ASSERT(!proof.unknown);
+        for (size_t i = 0; i < proof.row_count; i++)
+            ASSERT_STR_EQ(proof.rows[i].context, "lane_state:proof");
+        ASSERT(zcl_fleet_facts_query("test_boot_phase", NULL, "doctrine",
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &doctrine));
+        ASSERT(doctrine.unknown);
+        PASS();
+    }
+
+    TEST("fleet_facts: a row budget truncates loudly, never silently") {
+        struct zcl_fleet_facts_answer_v1 full, cut;
+        ASSERT(zcl_fleet_facts_query("sonnet", NULL, NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &full));
+        ASSERT(full.total >= 2);
+        ASSERT(!full.truncated);
+        ASSERT(zcl_fleet_facts_query("sonnet", NULL, NULL, 1, &cut));
+        ASSERT_EQ(cut.row_count, (size_t)1);
+        ASSERT_EQ(cut.total, full.total);
+        ASSERT(cut.truncated);
+        PASS();
+    }
+
+    TEST("fleet_facts: the vocabularies are closed and non-empty") {
+        ASSERT(zcl_fleet_facts_relation_count() >= 4);
+        ASSERT(zcl_fleet_facts_context_count() >= 4);
+        ASSERT(zcl_fleet_facts_term_count() >= 20);
+        ASSERT(zcl_fleet_facts_relation_at(0) != NULL);
+        ASSERT(zcl_fleet_facts_relation_at(
+                   zcl_fleet_facts_relation_count()) == NULL);
+        ASSERT(zcl_fleet_facts_context_at(
+                   zcl_fleet_facts_context_count()) == NULL);
+        ASSERT(zcl_fleet_facts_term_at(zcl_fleet_facts_term_count()) == NULL);
+        ASSERT_STR_EQ(zcl_fleet_facts_confidence_name(
+                          ZCL_FLEET_CONFIDENCE_DOCTRINE), "doctrine");
+        ASSERT_STR_EQ(zcl_fleet_facts_confidence_name(
+                          ZCL_FLEET_CONFIDENCE_UNKNOWN), "unknown");
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+/* ── the leaf ──────────────────────────────────────────────────────────── */
+
+static int test_fleet_facts_leaf(void)
+{
+    int failures = 0;
+
+    TEST("dev.know: registered read-only, dev-only, operator authority") {
+        const struct zcl_command_spec *spec =
+            zcl_command_registry_find(zcl_command_catalog(), FFT_PATH, NULL);
+        ASSERT(spec != NULL);
+        /* `z23 dev know` is the ask an agent is told to make, and it reaches
+         * this leaf through the declared alias, not a second registration. */
+        ASSERT(spec->aliases && strcmp(spec->aliases, "dev.know") == 0);
+        ASSERT(spec->handler == zcl_native_handle_dev_know);
+        ASSERT_EQ((int)spec->effect, (int)ZCL_COMMAND_EFFECT_READ);
+        ASSERT_EQ((int)spec->authority, (int)ZCL_COMMAND_AUTH_OPERATOR);
+        ASSERT((spec->traits & ZCL_COMMAND_TRAIT_DEV_ONLY) != 0);
+        PASS();
+    }
+
+    TEST("dev.know: --subject sonnet answers what Sonnet handles well") {
+        struct fft_call c;
+        bool saw_handles_well = false;
+
+        fft_begin(&c);
+        fft_input_str(&c, "subject", "sonnet");
+        ASSERT(fft_run(&c));
+        ASSERT_EQ((int)c.reply.status, (int)ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(!fft_bool(&c, "unknown"));
+        ASSERT(fft_int(&c, "row_count") >= 2);
+        for (int64_t i = 0; i < fft_int(&c, "row_count"); i++) {
+            ASSERT_STR_EQ(fft_row_str(&c, (size_t)i, "subject"), "sonnet");
+            ASSERT_STR_EQ(fft_row_str(&c, (size_t)i, "confidence"), "doctrine");
+            ASSERT(strlen(fft_row_str(&c, (size_t)i, "provenance")) == 64);
+            ASSERT(fft_row_str(&c, (size_t)i, "why")[0] != '\0');
+            if (strcmp(fft_row_str(&c, (size_t)i, "relation"),
+                       "handles_well") == 0)
+                saw_handles_well = true;
+        }
+        ASSERT(saw_handles_well);
+        fft_end(&c);
+        PASS();
+    }
+
+    TEST("dev.know: a trap signature names its trap") {
+        struct fft_call c;
+
+        fft_begin(&c);
+        fft_input_str(&c, "subject", "test_boot_phase");
+        fft_input_str(&c, "relation", "trap_signature");
+        ASSERT(fft_run(&c));
+        ASSERT_EQ((int)c.reply.status, (int)ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(!fft_bool(&c, "unknown"));
+        ASSERT_EQ(fft_int(&c, "row_count"), (int64_t)1);
+        ASSERT_STR_EQ(fft_row_str(&c, 0, "object"), "ram-generation-root");
+        fft_end(&c);
+        PASS();
+    }
+
+    TEST("dev.know: an unanswered subject returns one unknown row") {
+        struct fft_call c;
+
+        fft_begin(&c);
+        fft_input_str(&c, "subject", "no-such-subject");
+        ASSERT(fft_run(&c));
+        ASSERT_EQ((int)c.reply.status, (int)ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(fft_bool(&c, "unknown"));
+        ASSERT_EQ(fft_int(&c, "row_count"), (int64_t)1);
+        ASSERT_STR_EQ(fft_row_str(&c, 0, "confidence"), "unknown");
+        ASSERT(!fft_bool(&c, "truncated"));
+        fft_end(&c);
+        PASS();
+    }
+
+    TEST("dev.know: no subject, and a relation outside the vocabulary, "
+              "are both refused") {
+        struct fft_call c;
+
+        fft_begin(&c);
+        ASSERT(fft_run(&c));
+        ASSERT(c.reply.status != ZCL_COMMAND_STATUS_PASSED);
+        ASSERT_STR_EQ(c.reply.error.code, "SUBJECT_REQUIRED");
+        fft_end(&c);
+
+        fft_begin(&c);
+        fft_input_str(&c, "subject", "sonnet");
+        fft_input_str(&c, "relation", "handles_wel");
+        ASSERT(fft_run(&c));
+        ASSERT(c.reply.status != ZCL_COMMAND_STATUS_PASSED);
+        ASSERT_STR_EQ(c.reply.error.code, "UNKNOWN_VOCABULARY");
+        /* The refusal teaches the whole closed set rather than the miss. */
+        ASSERT(strstr(c.reply.error.message, "handles_well") != NULL);
+        fft_end(&c);
+        PASS();
+    }
+
+    TEST("dev.know: a budget cut is typed, and still reports the total") {
+        struct fft_call c;
+
+        fft_begin(&c);
+        fft_input_str(&c, "subject", "sonnet");
+        fft_input_int(&c, "budget_bytes", 256);
+        ASSERT(fft_run(&c));
+        ASSERT_EQ((int)c.reply.status, (int)ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(fft_bool(&c, "truncated"));
+        ASSERT_EQ(fft_int(&c, "row_count"), (int64_t)1);
+        ASSERT(fft_int(&c, "total") > fft_int(&c, "row_count"));
+        ASSERT_EQ(fft_int(&c, "budget_bytes"), (int64_t)256);
+        fft_end(&c);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+/* json_copy packs this one-field object to capacity one. The next append
+ * must therefore enter the checked json_children allocation path. */
+static bool fft_compact_input(struct fft_call *c)
+{
+    struct json_value packed;
+    json_init(&packed);
+    json_copy(&packed, &c->input);
+    json_free(&c->input);
+    c->input = packed;
+    return c->input.num_children == 1 && c->input.children_cap == 1 &&
+        strcmp(json_get_str(json_get(&c->input, "subject")),
+               "test_boot_phase") == 0;
+}
+
+static int fft_setup_failure_test(void)
+{
+    int failures = 0;
+
+    TEST("dev.know: failed relation setup never invokes the leaf") {
+        struct fft_call c;
+        size_t baseline = json_test_live_blocks();
+        fft_begin(&c);
+        fft_input_str(&c, "subject", "test_boot_phase");
+        bool prepared = fft_compact_input(&c);
+        zcl_alloc_fault_fail_next("json_children");
+        fft_input_str(&c, "relation", "trap_signature");
+        bool consumed = zcl_alloc_fault_armed_label() == NULL;
+        zcl_alloc_fault_clear();
+        bool ran = fft_run(&c);
+        size_t after_run = json_test_live_blocks();
+        fft_end(&c);
+        ASSERT(prepared);
+        ASSERT(consumed);
+        ASSERT(!ran);
+        ASSERT(c.setup_error != NULL);
+        ASSERT_STR_EQ(c.setup_error, "relation");
+        ASSERT_EQ(c.invocations, 0u);
+        ASSERT_EQ(after_run, baseline);
+        ASSERT_EQ(json_test_live_blocks(), baseline);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+static int test_fleet_historical_limits(void)
+{
+    int failures = 0;
+    static const char *const subjects[] = {"train", "box", "muse"};
+    static const char *const objects[] = {"four-lanes", "one-proof", "finisher"};
+
+    TEST("fleet_facts: old fleet limits are observations, not current authority") {
+        for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+            struct zcl_fleet_facts_answer_v1 answer;
+            bool found = false;
+            ASSERT(zcl_fleet_facts_query(subjects[i], NULL, NULL,
+                                        ZCL_FLEET_FACTS_MAX_ROWS, &answer));
+            ASSERT(!answer.unknown);
+            for (size_t j = 0; j < answer.row_count; j++) {
+                const struct zcl_fleet_fact_v1 *row = &answer.rows[j];
+                if (strcmp(row->object, objects[i]) != 0)
+                    continue;
+                ASSERT(row->confidence == ZCL_FLEET_CONFIDENCE_OBSERVED);
+                ASSERT_STR_EQ(row->context, "observation");
+                ASSERT(strstr(row->why, "Historical 2026-09-03") != NULL);
+                found = true;
+            }
+            ASSERT(found);
+        }
+        PASS();
+    }
+
+    TEST("fleet_facts: watcher diagnosis requires native scoped stop authority") {
+        struct zcl_fleet_facts_answer_v1 answer;
+        ASSERT(zcl_fleet_facts_query("proof-lock", "trap_signature", NULL,
+                                    ZCL_FLEET_FACTS_MAX_ROWS, &answer));
+        ASSERT_EQ(answer.row_count, (size_t)1);
+        ASSERT(strstr(answer.rows[0].why, "lockfile is not ownership evidence") != NULL);
+        ASSERT(strstr(answer.rows[0].why, "dev.loop.stop") != NULL);
+        ASSERT(strstr(answer.rows[0].why, "kill by exact pid") == NULL);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+int test_fleet_facts(void)
+{
+    int failures = 0;
+    failures += test_fleet_facts_table();
+    failures += test_fleet_facts_traps();
+    failures += test_fleet_facts_leaf();
+    failures += fft_setup_failure_test();
+    failures += test_fleet_historical_limits();
+    return failures;
+}

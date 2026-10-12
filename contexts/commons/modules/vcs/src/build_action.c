@@ -1,0 +1,1037 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * purpose: Canonical SHA3 identities for toolchains and fixed C23 actions. */
+
+#if !defined(_WIN32)
+#define _GNU_SOURCE
+#endif
+
+#include "vcs/build_action.h"
+
+#include "crypto/sha3.h"
+#include "platform/positioned_file.h"
+#include "util/spawn.h"
+#include "util/sync.h"
+#include "vcs/zcode_dev.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#define BUILD_TOOLCHAIN_FILE_BASE_COUNT 9
+#define BUILD_TOOLCHAIN_FILE_COUNT \
+    (BUILD_TOOLCHAIN_FILE_BASE_COUNT + ZCL_TOOLCHAIN_LINK_COUNT)
+
+struct build_toolchain_file {
+    char path[PATH_MAX];
+    struct platform_positioned_file_snapshot stamp;
+};
+
+struct build_toolchain_cache {
+    struct vcs_toolchain_capsule_v1 capsule;
+    struct platform_toolchain_descriptor descriptor;
+    struct build_toolchain_file files[BUILD_TOOLCHAIN_FILE_COUNT];
+#if defined(__APPLE__)
+    char developer_selection[PATH_MAX];
+#endif
+    uint8_t environment_root[32];
+    uint64_t fresh_captures;
+    uint64_t cache_hits;
+    bool valid;
+};
+
+static zcl_mutex_t g_toolchain_cache_mu;
+static zcl_once_t g_toolchain_cache_once = ZCL_ONCE_INIT;
+static struct build_toolchain_cache g_toolchain_cache;
+
+static void build_toolchain_cache_init(void)
+{
+    zcl_mutex_init(&g_toolchain_cache_mu);
+}
+
+static bool build_toolchain_cache_lock(void)
+{
+    if (!zcl_once_call(&g_toolchain_cache_once, build_toolchain_cache_init))
+        return false;
+    zcl_mutex_lock(&g_toolchain_cache_mu);
+    return true;
+}
+
+void vcs_source_manifest_id(const uint8_t *wire, size_t len, uint8_t out[32])
+{
+    static const char domain[] = VCS_SOURCE_MANIFEST_ID_SCHEMA;
+    struct sha3_256_ctx sha;
+
+    if (!out)
+        return;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    if (wire && len > 0)
+        sha3_256_write(&sha, wire, len);
+    sha3_256_finalize(&sha, out);
+}
+
+static void build_hash_text(struct sha3_256_ctx *sha, const char *value)
+{
+    uint64_t length = value ? strlen(value) : 0;
+    uint8_t le[8];
+    for (unsigned i = 0; i < sizeof(le); i++)
+        le[i] = (uint8_t)((length >> (8U * i)) & 0xffU);
+    sha3_256_write(sha, le, sizeof(le));
+    if (length)
+        sha3_256_write(sha, (const uint8_t *)value, (size_t)length);
+}
+
+static void build_hash_u64(struct sha3_256_ctx *sha, uint64_t value)
+{
+    uint8_t le[8];
+    for (unsigned i = 0; i < sizeof(le); i++)
+        le[i] = (uint8_t)((value >> (8U * i)) & 0xffU);
+    sha3_256_write(sha, le, sizeof(le));
+}
+
+static bool build_text_valid(const char *value, size_t cap)
+{
+    return value && value[0] && strnlen(value, cap) < cap;
+}
+
+static bool build_root_present(const uint8_t root[32])
+{
+    uint8_t any = 0;
+    for (size_t i = 0; i < 32; i++) any |= root[i];
+    return any != 0;
+}
+
+bool vcs_build_input_closure_v1_root(
+    const struct vcs_build_input_closure_v1 *closure, uint8_t out[32])
+{
+    if (!closure || !out ||
+        !build_root_present(closure->positive_sha3) ||
+        !build_root_present(closure->negative_sha3) ||
+        !build_root_present(closure->generated_sha3) ||
+        !build_root_present(closure->build_graph_sha3) ||
+        !build_root_present(closure->harness_sha3) ||
+        !build_root_present(closure->policy_sha3))
+        return false;
+    static const char domain[] = "zcl.build_input_closure.v1";
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    sha3_256_write(&sha, closure->positive_sha3, 32);
+    sha3_256_write(&sha, closure->negative_sha3, 32);
+    sha3_256_write(&sha, closure->generated_sha3, 32);
+    sha3_256_write(&sha, closure->build_graph_sha3, 32);
+    sha3_256_write(&sha, closure->harness_sha3, 32);
+    sha3_256_write(&sha, closure->policy_sha3, 32);
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+static bool build_stat_equal(
+    const struct platform_positioned_file_snapshot *a,
+    const struct platform_positioned_file_snapshot *b)
+{
+    return a->size == b->size && a->volume == b->volume &&
+           a->file_low == b->file_low && a->file_high == b->file_high &&
+           a->modified_seconds == b->modified_seconds &&
+           a->modified_nanoseconds == b->modified_nanoseconds &&
+           a->changed_seconds == b->changed_seconds &&
+           a->changed_nanoseconds == b->changed_nanoseconds;
+}
+
+static bool build_sha3_file(const char *path, uint8_t out[32],
+                            struct platform_positioned_file_snapshot *stable_stamp)
+{
+    struct platform_positioned_file file;
+    struct platform_positioned_file_snapshot before, after;
+    platform_positioned_file_init(&file);
+    if (!platform_positioned_file_open(&file, path) ||
+        !platform_positioned_file_snapshot(&file, &before)) {
+        platform_positioned_file_close(&file);
+        return false;
+    }
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    uint8_t buf[65536];
+    uint64_t offset = 0;
+    bool ok = true;
+    while (offset < before.size) {
+        size_t want = before.size - offset > sizeof(buf) ? sizeof(buf) :
+                      (size_t)(before.size - offset);
+        int64_t got = platform_positioned_file_read(&file, buf, want, offset);
+        if (got <= 0) { ok = false; break; }
+        sha3_256_write(&sha, buf, (size_t)got);
+        offset += (uint64_t)got;
+    }
+    ok = ok && platform_positioned_file_snapshot(&file, &after) &&
+         build_stat_equal(&before, &after);
+    platform_positioned_file_close(&file);
+    if (!ok) return false;
+    sha3_256_finalize(&sha, out);
+    if (stable_stamp) *stable_stamp = after;
+    return true;
+}
+
+/* Resolve a TOOL path to the real file it names, and report that file's
+ * canonical path and handle-bound stamp.
+ *
+ * This must FOLLOW symlinks. Every path reaching here is a compiled-in or
+ * compiler-reported tool location, and on a Debian-family host those are
+ * links by design: /usr/bin/cc points into /etc/alternatives, and the
+ * assembler fallback /usr/bin/as points at x86_64-linux-gnu-as. This used
+ * to be realpath(), which followed them. Binding the identity to a handle
+ * swapped in platform_positioned_file_open(), whose O_NOFOLLOW refuses a
+ * symlink outright — so the very first step of a capture, resolving
+ * VCS_BUILD_COMPILER_V1, returned ELOOP and NO host with an alternatives-
+ * managed cc could capture a toolchain capsule at all.
+ *
+ * platform_positioned_file_open_resolved() restores realpath()'s reach
+ * without touching the no-follow refusal that datadir and market content
+ * depend on. The bytes hashed and the stamp compared still come from the
+ * handle this opened, so the identity stays handle-bound. */
+static bool build_resolve_file(const char *candidate, char resolved[PATH_MAX],
+                               struct platform_positioned_file_snapshot *stamp)
+{
+    if (!candidate)
+        return false;
+#if !defined(_WIN32)
+    char canonical[PATH_MAX];
+    if (!realpath(candidate, canonical))
+        return false;
+    candidate = canonical;
+#endif
+    struct platform_positioned_file file;
+    platform_positioned_file_init(&file);
+    bool ok = candidate &&
+              platform_positioned_file_open_resolved(&file, candidate) &&
+              platform_positioned_file_path(&file, resolved, PATH_MAX) &&
+              (!stamp || platform_positioned_file_snapshot(&file, stamp));
+    platform_positioned_file_close(&file);
+    return ok;
+}
+
+static bool build_toolchain_query(void *ctx, const char *const argv[],
+                                  char *out, size_t cap)
+{
+    (void)ctx;
+#if defined(__linux__)
+    if (!argv || !argv[0] || !argv[1] || argv[2]) return false;
+    const char *const fixed_argv[] = {
+        "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LC_ALL=C",
+        argv[0], argv[1], NULL
+    };
+    const char *const *query_argv = fixed_argv;
+#else
+    const char *const *query_argv = argv;
+#endif
+    if (zcl_spawn_capture(query_argv, out, cap, 10000) != 0 || !out[0])
+        return false;
+    out[strcspn(out, "\r\n")] = '\0';
+    return out[0] != '\0';
+}
+
+static void build_hash_pair(struct sha3_256_ctx *sha, const char *label,
+                            const uint8_t digest[32])
+{
+    build_hash_text(sha, label);
+    sha3_256_write(sha, digest, 32);
+}
+
+static bool build_hash_aggregate(const char *domain,
+                                 const char *const labels[], size_t count,
+                                 const char paths[][ZCL_TOOLCHAIN_PATH_SIZE],
+                                 uint8_t out[32],
+                                 struct build_toolchain_file files[],
+                                 size_t *file_count)
+{
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, strlen(domain) + 1u);
+    for (size_t i = 0; i < count; i++) {
+        uint8_t digest[32];
+        if (!files || !file_count ||
+            *file_count >= BUILD_TOOLCHAIN_FILE_COUNT ||
+            !build_resolve_file(paths[i], files[*file_count].path,
+                                &files[*file_count].stamp) ||
+            !build_sha3_file(files[*file_count].path, digest,
+                             &files[*file_count].stamp))
+            return false;
+        (*file_count)++;
+        build_hash_pair(&sha, labels[i], digest);
+    }
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+/* Assembler identity is the driver's --version output, not the assembler file
+ * bytes.  Distro patch levels of the same GNU as / Apple Clang assembler
+ * change the binary and would otherwise refuse an independent worker on an
+ * ordinary second machine.  The file stamp still participates in the capture
+ * cache so an assembler upgrade recaptures. */
+static bool build_assembler_identity(const char *assembler, uint8_t out[32],
+                                     struct build_toolchain_file *file)
+{
+    if (!file || !build_resolve_file(assembler, file->path, &file->stamp))
+        return false;
+    char version[512];
+    const char *const argv[] = { file->path, "--version", NULL };
+    if (zcl_spawn_capture(argv, version, sizeof(version), 10000) != 0 ||
+        !version[0])
+        return false;
+    version[strcspn(version, "\r\n")] = '\0';
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    static const char domain[] = "zcl.toolchain.assembler_identity.v1";
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    build_hash_text(&sha, version);
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+static void build_toolchain_environment_root(uint8_t out[32])
+{
+    static const char *const names[] = {
+        "PATH", "LANG", "LC_ALL", "LC_MESSAGES", "GCC_EXEC_PREFIX",
+        "COMPILER_PATH", "LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH",
+        "CPLUS_INCLUDE_PATH", "GCC_SPECS", "DEVELOPER_DIR", "SDKROOT",
+        "TOOLCHAINS",
+    };
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    static const char domain[] = "zcl.toolchain.capture_environment.v1";
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        build_hash_text(&sha, names[i]);
+        build_hash_text(&sha, getenv(names[i]));
+    }
+    sha3_256_finalize(&sha, out);
+}
+
+#if defined(__APPLE__)
+static bool build_toolchain_developer_selection(char out[PATH_MAX])
+{
+    const char *const argv[] = { "/usr/bin/xcode-select", "-p", NULL };
+    if (zcl_spawn_capture(argv, out, PATH_MAX, 10000) != 0 || !out[0])
+        return false;
+    out[strcspn(out, "\r\n")] = '\0';
+    return out[0] != '\0';
+}
+#endif
+
+static const char *build_toolchain_descriptor_file(
+    const struct platform_toolchain_descriptor *desc, size_t index)
+{
+    if (index == 0) return desc->compiler_driver;
+    if (index == 1) return desc->compiler_backend;
+    if (index == 2) return desc->assembler;
+    if (index < 3 + ZCL_TOOLCHAIN_SYSROOT_COUNT)
+        return desc->sysroot_files[index - 3];
+    if (index < BUILD_TOOLCHAIN_FILE_BASE_COUNT)
+        return desc->abi_files[index - 3 - ZCL_TOOLCHAIN_SYSROOT_COUNT];
+    size_t link_index = index - BUILD_TOOLCHAIN_FILE_BASE_COUNT;
+    if (link_index < desc->link_file_count)
+        return desc->link_files[link_index];
+    return NULL;
+}
+
+/* The runtime dimensions of the identity: ABI/runtime files, then the link
+ * tools whose bytes can alter linked output — a linker, link-wrapper, or
+ * LTO-backend swap must move the capsule root before any build or
+ * reproduction runs. A platform that names no link tool fails the capture:
+ * the class is never silently absent from the preimage. */
+static bool build_toolchain_runtime_identity(
+    const struct platform_toolchain_descriptor *desc,
+    struct vcs_toolchain_capsule_v1 *out,
+    struct build_toolchain_file files[], size_t *file_count)
+{
+    static const char *const abi_labels[ZCL_TOOLCHAIN_ABI_COUNT] = {
+        "abi0", "abi1", "abi2",
+    };
+    if (!build_hash_aggregate("zcl.toolchain.abi_files.v1", abi_labels,
+                              ZCL_TOOLCHAIN_ABI_COUNT, desc->abi_files,
+                              out->abi_files_sha3, files, file_count))
+        return false;
+    static const char *const link_labels[ZCL_TOOLCHAIN_LINK_COUNT] = {
+        "link0", "link1", "link2",
+    };
+    return desc->link_file_count > 0 &&
+        desc->link_file_count <= ZCL_TOOLCHAIN_LINK_COUNT &&
+        build_hash_aggregate("zcl.toolchain.link_files.v1", link_labels,
+                             desc->link_file_count, desc->link_files,
+                             out->link_files_sha3, files, file_count) &&
+        *file_count == BUILD_TOOLCHAIN_FILE_BASE_COUNT + desc->link_file_count;
+}
+
+static bool build_toolchain_cache_current(
+    const struct build_toolchain_cache *cache,
+    const uint8_t environment_root[32])
+{
+    if (!cache->valid ||
+        memcmp(cache->environment_root, environment_root, 32) != 0)
+        return false;
+#if defined(__APPLE__)
+    char selection[PATH_MAX];
+    if (!build_toolchain_developer_selection(selection) ||
+        strcmp(selection, cache->developer_selection) != 0)
+        return false;
+#endif
+    char driver_path[PATH_MAX];
+    if (!build_resolve_file(VCS_BUILD_COMPILER_V1, driver_path, NULL) ||
+        strcmp(driver_path, cache->files[0].path) != 0)
+        return false;
+    for (size_t i = 0; i < BUILD_TOOLCHAIN_FILE_COUNT; i++) {
+        /* Platforms fill different link-tool counts; absent slots do not
+         * participate in the staleness comparison. */
+        const char *path =
+            build_toolchain_descriptor_file(&cache->descriptor, i);
+        if (!path) continue;
+        char resolved[PATH_MAX];
+        struct platform_positioned_file_snapshot current;
+        if (!build_resolve_file(path, resolved, &current) ||
+            strcmp(resolved, cache->files[i].path) != 0 ||
+            !build_stat_equal(&cache->files[i].stamp, &current))
+            return false;
+    }
+    return true;
+}
+
+static bool build_toolchain_capture_uncached(
+    struct vcs_toolchain_capsule_v1 *out,
+    struct build_toolchain_file files[BUILD_TOOLCHAIN_FILE_COUNT],
+    struct platform_toolchain_descriptor *descriptor)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    memset(files, 0,
+           sizeof(struct build_toolchain_file) * BUILD_TOOLCHAIN_FILE_COUNT);
+
+    struct platform_toolchain_descriptor desc;
+    if (!platform_toolchain_capture_descriptor(
+            build_toolchain_query, NULL, &desc))
+        return false;
+
+    size_t file_count = 0;
+    if (!build_resolve_file(desc.compiler_driver, files[file_count].path,
+                            &files[file_count].stamp) ||
+        !build_sha3_file(files[file_count].path, out->compiler_driver_sha3,
+                         &files[file_count].stamp))
+        return false;
+    file_count++;
+
+    if (!build_resolve_file(desc.compiler_backend, files[file_count].path,
+                            &files[file_count].stamp) ||
+        !build_sha3_file(files[file_count].path, out->compiler_backend_sha3,
+                         &files[file_count].stamp))
+        return false;
+    file_count++;
+
+    if (!build_assembler_identity(desc.assembler, out->assembler_sha3,
+                                  &files[file_count]))
+        return false;
+    file_count++;
+
+    static const char *const sysroot_labels[ZCL_TOOLCHAIN_SYSROOT_COUNT] = {
+        "sysroot0", "sysroot1", "sysroot2",
+    };
+    if (!build_hash_aggregate("zcl.toolchain.sysroot.v1", sysroot_labels,
+                              ZCL_TOOLCHAIN_SYSROOT_COUNT,
+                              desc.sysroot_files,
+                              out->sysroot_sha3, files, &file_count))
+        return false;
+
+    struct sha3_256_ctx probes;
+    sha3_256_init(&probes);
+    static const char probe_domain[] = "zcl.toolchain.target_probes.v1";
+    sha3_256_write(&probes, (const uint8_t *)probe_domain,
+                   sizeof(probe_domain));
+    build_hash_text(&probes, desc.host_triple);
+    build_hash_text(&probes, desc.full_version);
+    build_hash_text(&probes, desc.short_version);
+    build_hash_text(&probes, desc.target);
+    if (desc.platform_contract[0] != '\0') {
+        static const char contract_label[] = "platform-contract";
+        build_hash_text(&probes, contract_label);
+        build_hash_text(&probes, desc.platform_contract);
+    }
+    sha3_256_finalize(&probes, out->target_probes_sha3);
+
+    if (!build_toolchain_runtime_identity(&desc, out, files, &file_count))
+        return false;
+
+    (void)snprintf(out->target, sizeof(out->target), "%s", desc.target);
+    if (descriptor) *descriptor = desc;
+    return true;
+}
+
+bool vcs_toolchain_capsule_v1_cached(
+    struct vcs_toolchain_capsule_v1 *out,
+    struct platform_toolchain_descriptor *descriptor)
+{
+    if (!out || !descriptor) return false;
+    uint8_t environment_root[32];
+    build_toolchain_environment_root(environment_root);
+    if (!build_toolchain_cache_lock()) return false;
+    bool current = build_toolchain_cache_current(&g_toolchain_cache,
+                                                  environment_root);
+    if (current) {
+        *out = g_toolchain_cache.capsule;
+        *descriptor = g_toolchain_cache.descriptor;
+        g_toolchain_cache.cache_hits++;
+    }
+    zcl_mutex_unlock(&g_toolchain_cache_mu);
+    return current;
+}
+
+bool vcs_toolchain_capsule_v1_capture(
+    struct vcs_toolchain_capsule_v1 *out)
+{
+    if (!out) return false;
+    uint8_t environment_root[32];
+    build_toolchain_environment_root(environment_root);
+    if (!build_toolchain_cache_lock()) return false;
+    if (build_toolchain_cache_current(&g_toolchain_cache,
+                                      environment_root)) {
+        *out = g_toolchain_cache.capsule;
+        g_toolchain_cache.cache_hits++;
+        zcl_mutex_unlock(&g_toolchain_cache_mu);
+        return true;
+    }
+    struct vcs_toolchain_capsule_v1 captured;
+    struct build_toolchain_file files[BUILD_TOOLCHAIN_FILE_COUNT];
+    struct platform_toolchain_descriptor descriptor;
+#if defined(__APPLE__)
+    char selection_before[PATH_MAX], selection_after[PATH_MAX];
+    if (!build_toolchain_developer_selection(selection_before)) {
+        zcl_mutex_unlock(&g_toolchain_cache_mu);
+        return false;
+    }
+#endif
+    bool ok = build_toolchain_capture_uncached(&captured, files,
+                                                &descriptor);
+#if defined(__APPLE__)
+    ok = ok && build_toolchain_developer_selection(selection_after) &&
+        strcmp(selection_before, selection_after) == 0;
+#endif
+    g_toolchain_cache.valid = false;
+    if (ok) {
+        g_toolchain_cache.capsule = captured;
+        g_toolchain_cache.descriptor = descriptor;
+        memcpy(g_toolchain_cache.files, files, sizeof(files));
+#if defined(__APPLE__)
+        (void)snprintf(g_toolchain_cache.developer_selection,
+                       sizeof(g_toolchain_cache.developer_selection), "%s",
+                       selection_after);
+#endif
+        memcpy(g_toolchain_cache.environment_root, environment_root, 32);
+        g_toolchain_cache.fresh_captures++;
+        g_toolchain_cache.valid = true;
+        *out = captured;
+    }
+    zcl_mutex_unlock(&g_toolchain_cache_mu);
+    return ok;
+}
+
+#ifdef ZCL_TESTING
+void vcs_toolchain_capsule_v1_cache_reset_for_test(void)
+{
+    if (!build_toolchain_cache_lock()) return;
+    memset(&g_toolchain_cache, 0, sizeof(g_toolchain_cache));
+    zcl_mutex_unlock(&g_toolchain_cache_mu);
+}
+
+void vcs_toolchain_capsule_v1_cache_stats_for_test(
+    uint64_t *fresh_captures, uint64_t *cache_hits)
+{
+    if (!build_toolchain_cache_lock()) return;
+    if (fresh_captures)
+        *fresh_captures = g_toolchain_cache.fresh_captures;
+    if (cache_hits)
+        *cache_hits = g_toolchain_cache.cache_hits;
+    zcl_mutex_unlock(&g_toolchain_cache_mu);
+}
+#endif
+
+bool vcs_build_action_v1_compile_argv(char arch_flag[128],
+                                      const char *argv[14], size_t *argc)
+{
+    if (!arch_flag || !argv || !argc ||
+        !platform_toolchain_architecture_flag(arch_flag, 128))
+        return false;
+    size_t n = 0;
+    argv[n++] = VCS_BUILD_COMPILER_V1;
+    argv[n++] = "-x";
+    argv[n++] = "cpp-output";
+    argv[n++] = "-std=c23";
+    argv[n++] = "-O2";
+    char *p = arch_flag;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        if (n >= 8) return false;
+        argv[n++] = p;
+        while (*p && *p != ' ') p++;
+        if (*p) *p++ = '\0';
+    }
+    argv[n++] = "-fno-ident";
+    argv[n++] = "-c";
+    argv[n++] = VCS_BUILD_INPUT_ARG_V1;
+    argv[n++] = "-o";
+    argv[n++] = VCS_BUILD_OUTPUT_ARG_V1;
+    argv[n] = NULL;
+    *argc = n;
+    return true;
+}
+
+void vcs_build_action_v1_fixed_flags_root(uint8_t out[32])
+{
+    static const char domain[] = "zcl.build_action.fixed_flags.v1";
+    char arch_flag[128];
+    const char *argv[14];
+    size_t argc = 0;
+    if (!out) return;
+    if (!vcs_build_action_v1_compile_argv(arch_flag, argv, &argc)) {
+        memset(out, 0, 32);
+        return;
+    }
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    for (size_t i = 0; i < argc; i++) build_hash_text(&sha, argv[i]);
+    sha3_256_finalize(&sha, out);
+}
+
+void vcs_build_action_v1_fixed_environment_root(uint8_t out[32])
+{
+    static const char domain[] = "zcl.build_action.fixed_environment.v1";
+    static const char *const values[] = {
+        "PATH=" VCS_BUILD_ENV_PATH_VALUE_V1,
+        "LC_ALL=" VCS_BUILD_ENV_LC_ALL_VALUE_V1,
+        VCS_BUILD_ENV_TMPDIR_V1, VCS_BUILD_ENV_HOME_V1,
+        VCS_BUILD_ENV_LANG_V1, VCS_BUILD_ENV_TZ_V1,
+        VCS_BUILD_ENV_SOURCE_DATE_EPOCH_V1,
+    };
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++)
+        build_hash_text(&sha, values[i]);
+    sha3_256_finalize(&sha, out);
+}
+
+void vcs_build_input_screen_v1_init(struct vcs_build_input_screen_v1 *screen)
+{
+    if (!screen) return;
+    memset(screen, 0, sizeof(*screen));
+    screen->line_start = true;
+}
+
+static bool build_screen_splice(const struct vcs_build_input_screen_v1 *s,
+                                uint8_t c)
+{
+    size_t n = s->tail_len;
+    return c == '\n' && n >= 1 && s->tail[n - 1] == '\\';
+}
+
+static bool build_screen_escape(const struct vcs_build_input_screen_v1 *s,
+                                uint8_t c)
+{
+    size_t n = s->tail_len;
+    bool trigraph = n >= 2 && s->tail[n - 2] == '?' &&
+        s->tail[n - 1] == '?' && c == '/';
+    bool ucn = n >= 1 && s->tail[n - 1] == '\\' &&
+        (c == 'u' || c == 'U');
+    bool control = c < 0x20u && c != '\t' && c != '\n';
+    return control || build_screen_splice(s, c) || trigraph || ucn;
+}
+
+static bool build_screen_keyword(const struct vcs_build_input_screen_v1 *s,
+                                 uint8_t c)
+{
+    size_t n = s->tail_len;
+    bool asm_word = n >= 2 && s->tail[n - 2] == 'a' &&
+        s->tail[n - 1] == 's' && c == 'm';
+    bool pragma = n >= 6 && memcmp(s->tail + n - 6, "_Pragm", 6) == 0 &&
+        c == 'a';
+    /* GCC emits section attribute text into assembly; embedded newlines can
+     * introduce .incbin without an asm token in the preprocessed C input. */
+    bool section = n >= 6 && memcmp(s->tail + n - 6, "sectio", 6) == 0 &&
+        c == 'n';
+    return !s->marker_line && (asm_word || pragma || section);
+}
+
+static bool build_screen_directive(struct vcs_build_input_screen_v1 *s,
+                                   uint8_t c)
+{
+    if (s->after_hash && c != ' ' && c != '\t') {
+        if (c < '0' || c > '9') return false;
+        s->after_hash = false;
+        s->marker_line = true;
+    } else if (s->line_start && c == '#') {
+        s->after_hash = true;
+        s->line_start = false;
+    } else if (c != ' ' && c != '\t') {
+        s->line_start = false;
+    }
+    return true;
+}
+
+static bool build_screen_byte(struct vcs_build_input_screen_v1 *s, uint8_t c)
+{
+    if (build_screen_escape(s, c) || build_screen_keyword(s, c))
+        return false;
+    if (c == '\n') {
+        s->line_start = true;
+        s->after_hash = false;
+        s->marker_line = false;
+        s->tail_len = 0;
+        return true;
+    }
+    if (!build_screen_directive(s, c)) return false;
+    if (s->tail_len == sizeof(s->tail)) {
+        memmove(s->tail, s->tail + 1, sizeof(s->tail) - 1);
+        s->tail_len--;
+    }
+    s->tail[s->tail_len++] = (char)c;
+    return true;
+}
+
+bool vcs_build_input_screen_v1_update(struct vcs_build_input_screen_v1 *screen,
+                                      const uint8_t *bytes, size_t len)
+{
+    if (!screen || (!bytes && len) || screen->refused) return false;
+    for (size_t i = 0; i < len; i++) {
+        if (!build_screen_byte(screen, bytes[i])) {
+            screen->refused = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool vcs_build_input_screen_v1_finish(
+    const struct vcs_build_input_screen_v1 *screen)
+{
+    return screen && !screen->refused && !screen->after_hash;
+}
+
+static bool build_compile_key_closure(
+    const struct vcs_fixed_compile_proof_inputs *in,
+    struct vcs_component_proof_key_v1 *key)
+{
+    memcpy(key->roots[VCS_CPK_SOURCE_CLOSURE], in->input_bytes_sha3, 32);
+    return vcs_component_proof_field_root(VCS_CPK_KIND,
+               VCS_BUILD_ACTION_KIND_V1, strlen(VCS_BUILD_ACTION_KIND_V1),
+               key->roots[VCS_CPK_KIND]) &&
+           vcs_component_proof_field_root(VCS_CPK_UNIT_ID, "unit.i", 6,
+               key->roots[VCS_CPK_UNIT_ID]) &&
+           vcs_component_proof_field_root(VCS_CPK_DEPENDENCY_CLOSURE, "", 0,
+               key->roots[VCS_CPK_DEPENDENCY_CLOSURE]) &&
+           vcs_component_proof_ordered_root(VCS_CPK_NEGATIVE_LOOKUPS,
+               NULL, 0, key->roots[VCS_CPK_NEGATIVE_LOOKUPS]) &&
+           vcs_component_proof_generated_root(NULL, 0,
+               key->roots[VCS_CPK_GENERATED_INPUTS]) &&
+           vcs_component_integration_edges_root(NULL, 0,
+               key->roots[VCS_CPK_INTEGRATION_EDGES]);
+}
+
+static bool build_compile_key_toolchain(
+    const struct vcs_fixed_compile_proof_inputs *in,
+    struct vcs_component_proof_key_v1 *key)
+{
+    uint8_t capsule_root[32], tool_bytes[160], abi_bytes[64];
+    if (!vcs_toolchain_capsule_v1_root(in->capsule, capsule_root))
+        return false;
+    memcpy(tool_bytes, capsule_root, 32);
+    memcpy(tool_bytes + 32, in->driver_bytes_sha3, 32);
+    memcpy(tool_bytes + 64, in->backend_bytes_sha3, 32);
+    memcpy(tool_bytes + 96, in->assembler_bytes_sha3, 32);
+    memcpy(tool_bytes + 128, in->runtime_bytes_sha3, 32);
+    memcpy(abi_bytes, in->capsule->abi_files_sha3, 32);
+    memcpy(abi_bytes + 32, in->capsule->target_probes_sha3, 32);
+    memcpy(key->roots[VCS_CPK_SYSROOT], in->capsule->sysroot_sha3, 32);
+    return vcs_component_proof_field_root(VCS_CPK_TOOLCHAIN, tool_bytes,
+               sizeof(tool_bytes), key->roots[VCS_CPK_TOOLCHAIN]) &&
+           vcs_component_proof_field_root(VCS_CPK_LINKER, "", 0,
+               key->roots[VCS_CPK_LINKER]) &&
+           vcs_component_proof_field_root(VCS_CPK_ABI_GENERATION, abi_bytes,
+               sizeof(abi_bytes), key->roots[VCS_CPK_ABI_GENERATION]);
+}
+
+static bool build_compile_key_execution(
+    const struct vcs_fixed_compile_proof_inputs *in,
+    struct vcs_component_proof_key_v1 *key)
+{
+    char arch_flag[128];
+    const char *argv[14];
+    size_t argc = 0;
+    static const struct vcs_component_proof_env env[] = {
+        { "HOME", "../src/.home" }, { "LANG", "C" },
+        { "LC_ALL", VCS_BUILD_ENV_LC_ALL_VALUE_V1 },
+        { "PATH", VCS_BUILD_ENV_PATH_VALUE_V1 },
+        { "SOURCE_DATE_EPOCH", "0" }, { "TMPDIR", "." },
+        { "TZ", "UTC" },
+    };
+    return vcs_build_action_v1_compile_argv(arch_flag, argv, &argc) &&
+           vcs_component_proof_field_root(VCS_CPK_TARGET, in->target,
+               strlen(in->target), key->roots[VCS_CPK_TARGET]) &&
+           vcs_component_proof_ordered_root(VCS_CPK_FLAGS, argv, argc,
+               key->roots[VCS_CPK_FLAGS]) &&
+           vcs_component_proof_environment_root(env,
+               sizeof(env) / sizeof(env[0]),
+               key->roots[VCS_CPK_ENVIRONMENT]);
+}
+
+static bool build_compile_key_policy(
+    const struct vcs_fixed_compile_proof_inputs *in,
+    struct vcs_component_proof_key_v1 *key)
+{
+    static const char graph[] = "cpp-output:../src/unit.i->unit.o";
+    static const char invariant[] =
+        "regular canonical input; assembler file-read syntax refused; "
+        "before-after bytes; one read-only object";
+    struct sha3_256_ctx sha;
+    uint8_t policy_bytes[32];
+    sha3_256_init(&sha);
+    build_hash_text(&sha, in->resource_policy);
+    sha3_256_write(&sha, in->proof_policy_root, 32);
+    build_hash_text(&sha, "full package isolation; no network");
+    sha3_256_finalize(&sha, policy_bytes);
+    return vcs_component_proof_field_root(VCS_CPK_BUILD_GRAPH, graph,
+               sizeof(graph) - 1, key->roots[VCS_CPK_BUILD_GRAPH]) &&
+           vcs_component_proof_field_root(VCS_CPK_HARNESS,
+               in->verifier_bytes_sha3, 32,
+               key->roots[VCS_CPK_HARNESS]) &&
+           vcs_component_proof_field_root(VCS_CPK_FIXTURES, "", 0,
+               key->roots[VCS_CPK_FIXTURES]) &&
+           vcs_component_proof_field_root(VCS_CPK_INVARIANTS, invariant,
+               sizeof(invariant) - 1, key->roots[VCS_CPK_INVARIANTS]) &&
+           vcs_component_proof_field_root(VCS_CPK_POLICY, policy_bytes,
+               sizeof(policy_bytes), key->roots[VCS_CPK_POLICY]);
+}
+
+static bool build_compile_key_tools_present(
+    const struct vcs_fixed_compile_proof_inputs *in)
+{
+    return in && in->capsule && in->driver_bytes_sha3 &&
+        in->backend_bytes_sha3 && in->assembler_bytes_sha3 &&
+        in->runtime_bytes_sha3 && in->verifier_bytes_sha3 &&
+        build_root_present(in->driver_bytes_sha3) &&
+        build_root_present(in->backend_bytes_sha3) &&
+        build_root_present(in->assembler_bytes_sha3) &&
+        build_root_present(in->runtime_bytes_sha3) &&
+        build_root_present(in->verifier_bytes_sha3);
+}
+
+static bool build_compile_key_inputs_valid(
+    const struct vcs_fixed_compile_proof_inputs *in)
+{
+    return build_compile_key_tools_present(in) && in->input_bytes_sha3 &&
+        in->proof_policy_root && in->target && in->resource_policy &&
+        build_root_present(in->input_bytes_sha3) &&
+        strcmp(in->target, VCS_BUILD_TARGET_V1) == 0 &&
+        strcmp(in->target, in->capsule->target) == 0 &&
+        strcmp(in->resource_policy, VCS_BUILD_RESOURCE_POLICY_V1) == 0;
+}
+
+bool vcs_build_action_v1_compile_proof_key(
+    const struct vcs_fixed_compile_proof_inputs *in,
+    struct vcs_component_proof_key_v1 *out)
+{
+    if (!out || !build_compile_key_inputs_valid(in))
+        return false;
+    memset(out, 0, sizeof(*out));
+    return build_compile_key_closure(in, out) &&
+           build_compile_key_toolchain(in, out) &&
+           build_compile_key_execution(in, out) &&
+           build_compile_key_policy(in, out) &&
+           vcs_component_proof_key_valid(out);
+}
+
+uint8_t vcs_build_action_v1_work_kind(const char *kind)
+{
+    if (!kind) return 0;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_V1) == 0)
+        return VCS_ZCODE_WORK_BUILD;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_PACKAGE_V1) == 0)
+        return VCS_ZCODE_WORK_BUILD;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_TEST_V1) == 0)
+        return VCS_ZCODE_WORK_TEST;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_FUZZ_V1) == 0)
+        return VCS_ZCODE_WORK_FUZZ;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_BENCHMARK_V1) == 0)
+        return VCS_ZCODE_WORK_TEST;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_BENCHMARK_REPRODUCE_V1) == 0)
+        return VCS_ZCODE_WORK_REPRODUCE;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_REVIEW_V1) == 0)
+        return VCS_ZCODE_WORK_REVIEW;
+    return 0;
+}
+
+bool vcs_build_action_v1_descriptors(
+    const char *kind, const char **workdir, const char **output,
+    const char **resource)
+{
+    bool resident_proof = kind &&
+        strcmp(kind, VCS_BUILD_ACTION_KIND_RESIDENT_PROOF_CHILD_V1) == 0;
+    if (!resident_proof && vcs_build_action_v1_work_kind(kind) == 0)
+        return false;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_V1) == 0) {
+        *workdir = VCS_BUILD_VIRTUAL_ROOT_V1;
+        *output = VCS_BUILD_OUTPUT_V1;
+        *resource = VCS_BUILD_RESOURCE_POLICY_V1;
+    } else if (strcmp(kind, VCS_BUILD_ACTION_KIND_PACKAGE_V1) == 0) {
+        *workdir = VCS_BUILD_PACKAGE_VIRTUAL_ROOT_V1;
+        *output = VCS_BUILD_PACKAGE_OUTPUT_V1;
+        *resource = VCS_BUILD_PACKAGE_RESOURCE_POLICY_V1;
+    } else if (strcmp(kind, VCS_BUILD_ACTION_KIND_TEST_V1) == 0) {
+        *workdir = VCS_BUILD_PACKAGE_VIRTUAL_ROOT_V1;
+        *output = VCS_BUILD_TEST_OUTPUT_V1;
+        *resource = VCS_BUILD_TEST_RESOURCE_POLICY_V1;
+    } else if (strcmp(kind, VCS_BUILD_ACTION_KIND_FUZZ_V1) == 0) {
+        *workdir = VCS_BUILD_PACKAGE_VIRTUAL_ROOT_V1;
+        *output = VCS_BUILD_FUZZ_OUTPUT_V1;
+        *resource = VCS_BUILD_FUZZ_RESOURCE_POLICY_V1;
+    } else if (strcmp(kind, VCS_BUILD_ACTION_KIND_BENCHMARK_V1) == 0) {
+        *workdir = VCS_BUILD_PACKAGE_VIRTUAL_ROOT_V1;
+        *output = VCS_BUILD_BENCHMARK_OUTPUT_V1;
+        *resource = VCS_BUILD_BENCHMARK_RESOURCE_POLICY_V1;
+    } else if (strcmp(kind,
+                      VCS_BUILD_ACTION_KIND_BENCHMARK_REPRODUCE_V1) == 0) {
+        *workdir = VCS_BUILD_PACKAGE_VIRTUAL_ROOT_V1;
+        *output = VCS_BUILD_BENCHMARK_REPRODUCE_OUTPUT_V1;
+        *resource = VCS_BUILD_BENCHMARK_REPRODUCE_RESOURCE_POLICY_V1;
+    } else if (strcmp(kind, VCS_BUILD_ACTION_KIND_REVIEW_V1) == 0) {
+        *workdir = VCS_BUILD_REVIEW_VIRTUAL_ROOT_V1;
+        *output = VCS_BUILD_REVIEW_OUTPUT_V1;
+        *resource = VCS_BUILD_REVIEW_RESOURCE_POLICY_V1;
+    } else if (resident_proof) {
+        *workdir = VCS_BUILD_RESIDENT_PROOF_VIRTUAL_ROOT_V1;
+        *output = VCS_BUILD_RESIDENT_PROOF_OUTPUT_V1;
+        *resource = VCS_BUILD_RESIDENT_PROOF_RESOURCE_POLICY_V1;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static void build_action_kind_descriptor_root(
+    const char *domain, const char *kind, uint8_t out[32])
+{
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, strlen(domain) + 1u);
+    build_hash_text(&sha, kind);
+    sha3_256_finalize(&sha, out);
+}
+
+bool vcs_build_action_v1_fixed_flags_root_for_kind(
+    const char *kind, uint8_t out[32])
+{
+    if (!out || vcs_build_action_v1_work_kind(kind) == 0) return false;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_V1) == 0) {
+        vcs_build_action_v1_fixed_flags_root(out);
+        return build_root_present(out);
+    }
+    build_action_kind_descriptor_root(
+        "zcl.build_action.fixed_flags.v1", kind, out);
+    return true;
+}
+
+bool vcs_build_action_v1_fixed_environment_root_for_kind(
+    const char *kind, uint8_t out[32])
+{
+    if (!out || vcs_build_action_v1_work_kind(kind) == 0) return false;
+    if (strcmp(kind, VCS_BUILD_ACTION_KIND_V1) == 0) {
+        vcs_build_action_v1_fixed_environment_root(out);
+        return true;
+    }
+    build_action_kind_descriptor_root(
+        "zcl.build_action.fixed_environment.v1", kind, out);
+    return true;
+}
+
+bool vcs_toolchain_capsule_v1_root(
+    const struct vcs_toolchain_capsule_v1 *capsule, uint8_t out[32])
+{
+    if (!capsule || !out ||
+        !build_text_valid(capsule->target, sizeof(capsule->target)) ||
+        strcmp(capsule->target, VCS_BUILD_TARGET_V1) != 0)
+        return false;
+    static const char domain[] = "zcl.toolchain_capsule.v1";
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    sha3_256_write(&sha, capsule->compiler_driver_sha3, 32);
+    sha3_256_write(&sha, capsule->compiler_backend_sha3, 32);
+    sha3_256_write(&sha, capsule->assembler_sha3, 32);
+    sha3_256_write(&sha, capsule->sysroot_sha3, 32);
+    sha3_256_write(&sha, capsule->target_probes_sha3, 32);
+    sha3_256_write(&sha, capsule->abi_files_sha3, 32);
+    sha3_256_write(&sha, capsule->link_files_sha3, 32);
+    build_hash_text(&sha, capsule->target);
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+static bool build_action_roots_present(const struct vcs_build_action_v1 *action)
+{
+    return build_root_present(action->source_sha256) &&
+           build_root_present(action->source_cas_sha3) &&
+           build_root_present(action->input_root_sha3) &&
+           build_root_present(action->toolchain_capsule_sha3) &&
+           build_root_present(action->flags_sha3) &&
+           build_root_present(action->environment_sha3);
+}
+
+bool vcs_build_action_v1_root_for_kind(
+    const char *kind, const struct vcs_build_action_v1 *action,
+    uint8_t out[32])
+{
+    const char *workdir = NULL, *output = NULL, *resource = NULL;
+    if (!action || !out ||
+        !vcs_build_action_v1_descriptors(
+            kind, &workdir, &output, &resource) ||
+        !build_action_roots_present(action) ||
+        !build_text_valid(action->target, sizeof(action->target)) ||
+        !build_text_valid(action->profile, sizeof(action->profile)) ||
+        !build_text_valid(action->virtual_workdir,
+                          sizeof(action->virtual_workdir)) ||
+        !build_text_valid(action->declared_outputs,
+                          sizeof(action->declared_outputs)) ||
+        !build_text_valid(action->resource_policy,
+                          sizeof(action->resource_policy)) ||
+        strcmp(action->target, VCS_BUILD_TARGET_V1) != 0 ||
+        strcmp(action->virtual_workdir, workdir) != 0 ||
+        strcmp(action->declared_outputs, output) != 0 ||
+        strcmp(action->resource_policy, resource) != 0)
+        return false;
+    static const char domain[] = "zcl.build_action.v1";
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    build_hash_text(&sha, kind);
+    sha3_256_write(&sha, action->source_sha256, 32);
+    sha3_256_write(&sha, action->source_cas_sha3, 32);
+    sha3_256_write(&sha, action->input_root_sha3, 32);
+    sha3_256_write(&sha, action->toolchain_capsule_sha3, 32);
+    sha3_256_write(&sha, action->flags_sha3, 32);
+    sha3_256_write(&sha, action->environment_sha3, 32);
+    build_hash_text(&sha, action->target);
+    build_hash_text(&sha, action->profile);
+    build_hash_text(&sha, action->virtual_workdir);
+    build_hash_text(&sha, action->declared_outputs);
+    build_hash_text(&sha, action->resource_policy);
+    build_hash_u64(&sha, action->sequence);
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+bool vcs_build_action_v1_root(const struct vcs_build_action_v1 *action,
+                              uint8_t out[32])
+{
+    return vcs_build_action_v1_root_for_kind(
+        VCS_BUILD_ACTION_KIND_V1, action, out);
+}

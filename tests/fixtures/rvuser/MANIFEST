@@ -1,0 +1,31 @@
+# rvuser fixtures: freestanding riscv64 FreeBSD-convention programs. Sources are ours (Apache-2.0), in src/.
+# Convention verified against FreeBSD sys/riscv/riscv/trap.c (syscall number in t0, args a0..a5) and
+# sys/riscv/riscv/vm_machdep.c (t0 = 0 ok / 1 error, a0 = value or errno); see rvuser README.
+# Regenerate (authoring time only, no toolchain at test time; LLVM 20 at /usr/lib/llvm-20/bin, OBJ is any scratch dir):
+#   F="--target=riscv64-unknown-freebsd -march=rv64imac -mabi=lp64 -ffreestanding -nostdlib -static -fno-pic -Os -fno-builtin -fno-stack-protector"
+#   clang $F -c src/crt0.S -o $OBJ/crt0.o
+#   for n in hello args mmap exit7 badsys cat fdhog badpath fileops; do clang $F -c src/$n.c -o $OBJ/$n.o && ld.lld -static -nostdlib -o $n.elf $OBJ/crt0.o $OBJ/$n.o; done
+# lp64d fixture (fp), the same recipe with the hard-float ABI and no errno math:
+#   D="--target=riscv64-unknown-freebsd -march=rv64imafdc -mabi=lp64d -ffreestanding -nostdlib -static -fno-pic -Os -fno-builtin -fno-math-errno -fno-stack-protector"
+#   clang $D -c src/crt0.S -o $OBJ/crt0d.o; clang $D -c src/fp.c -o $OBJ/fp.o; ld.lld -static -nostdlib -o fp.elf $OBJ/crt0d.o $OBJ/fp.o
+# spin: the ET_EXEC recipe on src/spin.c (host abort and budget tests).
+# offguard: the ET_EXEC recipe on src/offguard.c (file offsets at INT64_MAX).
+# static-PIE fixtures (pie_hello, pie_data): -fPIE, our crt0_pie.S relocates R_RISCV_RELATIVE itself:
+#   P="--target=riscv64-unknown-freebsd -march=rv64imac -mabi=lp64 -ffreestanding -nostdlib -fPIE -Os -fno-builtin -fno-stack-protector"
+#   clang $P -c src/crt0_pie.S -o $OBJ/crt0p.o
+#   for n in pie_hello pie_data; do clang $P -c src/$n.c -o $OBJ/$n.o && ld.lld -pie --no-dynamic-linker -static -nostdlib -o $n.elf $OBJ/crt0p.o $OBJ/$n.o; done
+# name sha256(name.elf)
+hello ea036da9f723ce1999788ab3904dd094987d2af2bd5ee99e9349b2b1d5cd9c4a
+args 83717dc865ff38d1a397e6a3c5035b13aeba8eb2272e73b928fbb710b6f2917d
+mmap f382dfebbffa4bcb858864653f0cc8c4ed31167fada54bb4bf8267b58149f3fc
+exit7 311e2bdba8aa0106bed6fcdbf9051c1653ae5a9e366e2c800f230e2bc72a62a3
+badsys a47500b54de21c3d34eaa388541c3946b0d47c5a24fcb93fadd88abdd3d238de
+cat 7ccf039fef981554bf7edfdf9bf90d9d5fef003f1612375255446b1188970c94
+fdhog 5be749dfc34ede15b5408cc122467bbcc9323942274ccf84e0b0927fdbeca68a
+badpath de46e0d73773173affa18b2ded8c1520c2ae099fb20f734a7b9c92b590556860
+fileops 27370ee74c3dccbbc2eff8bdab653eb65ba0c077944b8ef49c232af0198c000e
+fp cf00041b324812c6e7ad6e9b9b1f8525ddf21d085405d47282fb51778f4b9a61
+spin dfa18ad739a897ad62e3c13b8aec10167b6fdf8540a31896a95372495c71c741
+pie_hello ef17d27674098ad3e688a7ae4d0da5665a70aeebbafa76a8b0dd3a6765717e98
+pie_data db7728e0c9feeace115b785102b9dec42f72bb4385f979bcb3edb7e444297158
+offguard eb36eff3bfc71386b21cb4bbc13cb839296597c761cd1e3a957508e7cbb61875

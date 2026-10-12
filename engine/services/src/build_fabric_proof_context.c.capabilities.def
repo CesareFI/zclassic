@@ -1,0 +1,3 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Source-owned capability declaration for worker-start proof state. */
+ZCL_MODULE_CAPABILITY("engine/services/src/build_fabric_proof_context.c", CAP_FS_WRITE, "opens the proof content store and completes a staged publication at worker start")

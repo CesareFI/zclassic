@@ -1,0 +1,27 @@
+# Lint gate #12 (ENFORCED tier) baseline — grandfathered over-cap functions
+# under engine/controllers/src/, engine/services/src/, and engine/composition/src/.
+#
+# check-long-functions (tools/scripts/check_long_functions.sh) is an
+# ENFORCED RATCHET (not advisory): it flags any function in this tier whose
+# body exceeds the cap (500 lines). Functions pre-dating this baseline's
+# introduction are recorded here so the ratchet does not regress. Each
+# entry is '<relative path> <function-name> <max-lines>'. The gate FAILS
+# (nonzero exit) when:
+#   - a NEW function (not listed here) exceeds the cap, OR
+#   - a listed function grows ABOVE its recorded baseline length.
+# Shrinking a function below the cap lets you delete its baseline line —
+# the gate suggests this automatically when a baselined function's live
+# length is below its recorded number. Re-baselining to a LOWER count for
+# a function that shrank but is still over the cap is always welcome;
+# raising a recorded count requires an ADR (this is a ratchet, not a
+# target).
+#
+# Format: <relative-path> <function-name> <max-lines>   (# = comment)
+# Sorted by path.
+
+# lane/sapling-tree-persist: app_init threads sapling_tree_saved_height
+# through the tier-2 load + mismatch-check blocks and calls the new
+# sapling_tree_verify_at_saved_height / sapling_tree_attempt_fold_forward
+# helpers instead of unconditionally deferring or full-rebuilding.
+# 2026-07-21: merged #7 node.db gate call-site (+1) and -full-fold dispatch (+6).
+engine/composition/src/boot.c app_init 2823

@@ -1,0 +1,378 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Purpose: zcsv test suite.  Exits nonzero on the first failure. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#include "zcsv/zcsv.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
+static int failures = 0;
+
+#define CHECK(cond)                                                          \
+  do {                                                                       \
+    if (!(cond)) {                                                           \
+      fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);        \
+      failures++;                                                            \
+    }                                                                        \
+  } while (0)
+
+/* Row collector: copies every field of every row into one flat buffer. */
+typedef struct {
+  char text[8192];
+  size_t text_len;
+  zcsv_field fields[256];
+  size_t row_of_field[256];
+  size_t nfields_total;
+  size_t nrows;
+} collector;
+
+static void collect(void *vctx, const zcsv_field *fields, size_t n) {
+  collector *c = vctx;
+  for (size_t i = 0; i < n; i++) {
+    size_t slot = c->nfields_total;
+    memcpy(c->text + c->text_len, fields[i].ptr, fields[i].len);
+    c->fields[slot].ptr = c->text + c->text_len;
+    c->fields[slot].len = fields[i].len;
+    c->row_of_field[slot] = c->nrows;
+    c->text_len += fields[i].len;
+    c->nfields_total++;
+  }
+  c->nrows++;
+}
+
+/* Parse `input` in `chunk` sized pieces and collect all rows. */
+static zcsv_status parse_chunked(const char *input, size_t chunk,
+                                 collector *c) {
+  static char row_data[4096];
+  static zcsv_field row_fields[64];
+  zcsv_parser p;
+  memset(c, 0, sizeof(*c));
+  zcsv_init(&p, row_data, sizeof(row_data), row_fields,
+            sizeof(row_fields) / sizeof(row_fields[0]), collect, c);
+  size_t len = strlen(input);
+  for (size_t at = 0; at < len; at += chunk) {
+    size_t n = len - at < chunk ? len - at : chunk;
+    zcsv_status st = zcsv_feed(&p, input + at, n);
+    if (st != ZCSV_OK)
+      return st;
+  }
+  return zcsv_finish(&p);
+}
+
+/* Field (row, col) from a collector as a C string view compare. */
+static bool field_is(const collector *c, size_t row, size_t col,
+                     const char *want) {
+  size_t idx = 0;
+  for (size_t i = 0; i < c->nfields_total; i++) {
+    if (c->row_of_field[i] == row) {
+      if (idx == col)
+        return zcsv_field_equals(&c->fields[i], want);
+      idx++;
+    }
+  }
+  return false;
+}
+
+static void test_basic_rows(void) {
+  collector c;
+  CHECK(parse_chunked("a,b,c\n1,2,3\n", 4096, &c) == ZCSV_OK);
+  CHECK(c.nrows == 2);
+  CHECK(field_is(&c, 0, 0, "a") && field_is(&c, 0, 2, "c"));
+  CHECK(field_is(&c, 1, 0, "1") && field_is(&c, 1, 2, "3"));
+
+  /* Same input fed one byte at a time must give identical rows. */
+  collector c1;
+  CHECK(parse_chunked("a,b,c\n1,2,3\n", 1, &c1) == ZCSV_OK);
+  CHECK(c1.nrows == c.nrows && c1.nfields_total == c.nfields_total);
+  CHECK(c1.text_len == c.text_len &&
+        memcmp(c1.text, c.text, c.text_len) == 0);
+}
+
+static void test_no_trailing_newline(void) {
+  collector c;
+  CHECK(parse_chunked("x,y", 4096, &c) == ZCSV_OK);
+  CHECK(c.nrows == 1);
+  CHECK(field_is(&c, 0, 0, "x") && field_is(&c, 0, 1, "y"));
+}
+
+static void test_empty_input_no_rows(void) {
+  collector c;
+  CHECK(parse_chunked("", 4096, &c) == ZCSV_OK);
+  CHECK(c.nrows == 0);
+}
+
+static void test_crlf_and_mixed_endings(void) {
+  collector c;
+  CHECK(parse_chunked("a,b\r\nc,d\ne,f\r\ng,h", 1, &c) == ZCSV_OK);
+  CHECK(c.nrows == 4);
+  CHECK(field_is(&c, 3, 1, "h"));
+}
+
+static void test_empty_fields_and_empty_line(void) {
+  collector c;
+  CHECK(parse_chunked(",,\n\na,,b\n", 4096, &c) == ZCSV_OK);
+  CHECK(c.nrows == 3);
+  CHECK(field_is(&c, 0, 0, "") && field_is(&c, 0, 2, ""));
+  /* An empty line is a record of one empty field. */
+  CHECK(field_is(&c, 1, 0, ""));
+  CHECK(field_is(&c, 2, 1, ""));
+}
+
+static void test_quoted_fields(void) {
+  collector c;
+  CHECK(parse_chunked("\"hello, world\",\"say \"\"hi\"\"\",\"multi\nline\"\n", 1,
+                      &c) == ZCSV_OK);
+  CHECK(c.nrows == 1);
+  CHECK(field_is(&c, 0, 0, "hello, world"));
+  CHECK(field_is(&c, 0, 1, "say \"hi\""));
+  CHECK(field_is(&c, 0, 2, "multi\nline"));
+}
+
+static void test_quoted_crlf_inside_field(void) {
+  collector c;
+  CHECK(parse_chunked("\"a\r\nb\",c\r\n", 4096, &c) == ZCSV_OK);
+  CHECK(c.nrows == 1);
+  CHECK(field_is(&c, 0, 0, "a\r\nb"));
+}
+
+static void test_quote_only_at_field_start(void) {
+  collector c;
+  CHECK(parse_chunked("\"x\" ,y\n", 4096, &c) == ZCSV_ERR_STRAY_QUOTE);
+  /* A quote in the middle of a plain field is also malformed. */
+  CHECK(parse_chunked("ab\"cd,e\n", 4096, &c) == ZCSV_ERR_STRAY_QUOTE);
+}
+
+static void test_unterminated_quote(void) {
+  collector c;
+  CHECK(parse_chunked("\"abc,def\n", 4096, &c) == ZCSV_ERR_UNTERMINATED);
+}
+
+static void test_row_data_bound(void) {
+  static char row_data[8];
+  static zcsv_field row_fields[16];
+  zcsv_parser p;
+  zcsv_init(&p, row_data, sizeof(row_data), row_fields, 16, collect,
+            &(collector){0});
+  CHECK(zcsv_feed(&p, "012345678", 9) == ZCSV_ERR_FIELD_TOO_LONG);
+  /* Exactly at the bound is fine. */
+  collector c;
+  memset(&c, 0, sizeof(c));
+  zcsv_init(&p, row_data, sizeof(row_data), row_fields, 16, collect, &c);
+  CHECK(zcsv_feed(&p, "01234567\n", 9) == ZCSV_OK);
+  CHECK(zcsv_finish(&p) == ZCSV_OK);
+}
+
+static void test_field_count_bound(void) {
+  static char row_data[64];
+  static zcsv_field row_fields[2];
+  collector c;
+  memset(&c, 0, sizeof(c));
+  zcsv_parser p;
+  zcsv_init(&p, row_data, sizeof(row_data), row_fields, 2, collect, &c);
+  CHECK(zcsv_feed(&p, "a,b,c\n", 6) == ZCSV_ERR_TOO_MANY_FIELDS);
+}
+
+static void test_header_index(void) {
+  collector c;
+  CHECK(parse_chunked("name,age,city\nann,31,oslo\n", 4096, &c) == ZCSV_OK);
+  zcsv_field hdr[3];
+  size_t n = 0;
+  for (size_t i = 0; i < c.nfields_total; i++)
+    if (c.row_of_field[i] == 0)
+      hdr[n++] = c.fields[i];
+  CHECK(n == 3);
+  CHECK(zcsv_header_index(hdr, n, "age") == 1);
+  CHECK(zcsv_header_index(hdr, n, "city") == 2);
+  CHECK(zcsv_header_index(hdr, n, "missing") == SIZE_MAX);
+}
+
+static void test_writer_quoting(void) {
+  char buf[64];
+  /* Plain field: no quotes. */
+  CHECK(zcsv_write_field(buf, sizeof(buf), "abc", 3) == 3);
+  CHECK(memcmp(buf, "abc", 3) == 0);
+  /* Comma forces quotes. */
+  CHECK(zcsv_write_field(buf, sizeof(buf), "a,b", 3) == 5);
+  CHECK(memcmp(buf, "\"a,b\"", 5) == 0);
+  /* Embedded quote doubles. */
+  CHECK(zcsv_write_field(buf, sizeof(buf), "a\"b", 3) == 6);
+  CHECK(memcmp(buf, "\"a\"\"b\"", 6) == 0);
+  /* Newline forces quotes. */
+  CHECK(zcsv_write_field(buf, sizeof(buf), "a\nb", 3) == 5);
+  /* Short buffer: required length is still reported. */
+  CHECK(zcsv_write_field(buf, 2, "a,b", 3) == 5);
+}
+
+static void test_writer_row_and_roundtrip(void) {
+  const char *fields[] = {"plain", "has,comma", "has\"quote", "has\ncrlf"};
+  const size_t lens[] = {5, 9, 9, 8};
+  char buf[128];
+  size_t need = zcsv_write_row(buf, sizeof(buf), fields, lens, 4);
+  CHECK(need < sizeof(buf));
+  const char *want = "plain,\"has,comma\",\"has\"\"quote\",\"has\ncrlf\"\r\n";
+  CHECK(need == strlen(want) && memcmp(buf, want, need) == 0);
+
+  /* Round-trip: parsing the written row yields the original fields. */
+  collector c;
+  char row_data[256];
+  zcsv_field row_fields[8];
+  memset(&c, 0, sizeof(c));
+  zcsv_parser p;
+  zcsv_init(&p, row_data, sizeof(row_data), row_fields, 8, collect, &c);
+  CHECK(zcsv_feed(&p, buf, need) == ZCSV_OK);
+  CHECK(zcsv_finish(&p) == ZCSV_OK);
+  CHECK(c.nrows == 1);
+  for (size_t i = 0; i < 4; i++) {
+    size_t idx = 0;
+    for (size_t k = 0; k < c.nfields_total; k++) {
+      if (c.row_of_field[k] == 0) {
+        if (idx == i)
+          CHECK(c.fields[k].len == lens[i] &&
+                memcmp(c.fields[k].ptr, fields[i], lens[i]) == 0);
+        idx++;
+      }
+    }
+  }
+}
+
+static FILE *csvtab_fixture_stdin;
+#undef stdin
+#define stdin csvtab_fixture_stdin
+#define main csvtab_fixture_main
+#include "../app/main.c"
+#undef main
+#undef stdin
+
+static void test_cli_args(void) {
+#if !defined(_WIN32)
+  const char *extra[] = {"ignored", "--stats", "--unknown"};
+  for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++) {
+    char data[] = "a,b\n";
+    FILE *input = fmemopen(data, sizeof(data) - 1, "r");
+    CHECK(input != NULL);
+    if (!input) continue;
+    csvtab_fixture_stdin = input;
+    char *argv[] = {"csvtab", "--stats", (char *)extra[i], NULL};
+    CHECK(csvtab_fixture_main(3, argv) == 2);
+    CHECK(ftell(input) == 0); /* Argument refusal precedes input consumption. */
+    CHECK(fclose(input) == 0);
+    csvtab_fixture_stdin = NULL;
+  }
+#endif
+}
+
+static void test_input_bound(void) {
+#if !defined(_WIN32)
+  char data[] = "a\nb\nx";
+  for (size_t bytes = 0; bytes <= 5; bytes++) {
+    FILE *in = fmemopen(data, bytes, "r");
+    CHECK(in != NULL);
+    if (!in) continue;
+    char input[6];
+    memset(input, '?', sizeof(input));
+    size_t len = 0;
+    CHECK(read_input(in, input + 1, 4, &len) == (bytes <= 4 ? 0 : 2));
+    CHECK(len == (bytes <= 4 ? bytes : 4));
+    CHECK(memcmp(input + 1, data, len) == 0);
+    CHECK(input[0] == '?' && input[5] == '?');
+    CHECK(fclose(in) == 0);
+  }
+  FILE *in = fopen("/dev/null", "w");
+  CHECK(in != NULL);
+  if (in) {
+    char input[4];
+    size_t len = 0;
+    CHECK(read_input(in, input, sizeof(input), &len) == 2);
+    CHECK(fclose(in) == 0);
+  }
+#endif
+}
+
+static void test_output_errors(void) {
+#if !defined(_WIN32)
+  /* /dev/null is already permitted by the package verifier. Closing the
+   * stream's descriptor makes libc report a real write error without
+   * needing a device or filesystem grant outside the package sandbox. */
+  for (unsigned mode = 0; mode < 3; mode++) {
+    FILE *out = fopen("/dev/null", "w");
+    CHECK(out != NULL);
+    if (!out) continue;
+    char buffer[BUFSIZ];
+    CHECK(setvbuf(out, buffer, _IOFBF, sizeof(buffer)) == 0);
+    CHECK(fputc('x', out) == 'x');
+    CHECK(ferror(out) == 0);
+    if (mode != 0) CHECK(close(fileno(out)) == 0);
+    if (mode == 2) {
+      CHECK(fflush(out) == EOF);
+      CHECK(ferror(out) != 0);
+    }
+    CHECK(finish_output(out) == (mode == 0 ? 0 : 2));
+    (void)fclose(out);
+  }
+#endif
+}
+
+static void test_table_layout(void) {
+  const struct { const char *input; const char *display; } cases[] = {
+    {"", ""}, {"ordinary,\"text\"", "ordinary,\"text\""},
+    {"first\nsecond", "first\\nsecond"}, {"a\r\nb", "a\\r\\nb"},
+    {"tab\tand\\n", "tab\tand\\n"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    zcsv_field field = {cases[i].input, strlen(cases[i].input)};
+    char cell[COL_WIDTH_MAX];
+    size_t len = layout_field(&field, cell);
+    CHECK(len == strlen(cases[i].display));
+    CHECK(memcmp(cell, cases[i].display, len) == 0);
+  }
+  char input[42], guarded[COL_WIDTH_MAX + 2];
+  memset(input, 'a', sizeof(input));
+  memset(guarded, '?', sizeof(guarded));
+  zcsv_field field = {input, 40};
+  CHECK(layout_field(&field, guarded + 1) == 40);
+  CHECK(memcmp(guarded + 1, input, 40) == 0);
+  field.len = 41;
+  CHECK(layout_field(&field, guarded + 1) == 40);
+  CHECK(guarded[40] == '+');
+  input[38] = '\n';
+  field.len = 39;
+  CHECK(layout_field(&field, guarded + 1) == 40);
+  CHECK(guarded[39] == '\\' && guarded[40] == 'n');
+  field.len = 40;
+  CHECK(layout_field(&field, guarded + 1) == 39);
+  CHECK(guarded[39] == '+');
+  CHECK(guarded[0] == '?' && guarded[COL_WIDTH_MAX + 1] == '?');
+}
+
+int main(void) {
+  test_basic_rows();
+  test_no_trailing_newline();
+  test_empty_input_no_rows();
+  test_crlf_and_mixed_endings();
+  test_empty_fields_and_empty_line();
+  test_quoted_fields();
+  test_quoted_crlf_inside_field();
+  test_quote_only_at_field_start();
+  test_unterminated_quote();
+  test_row_data_bound();
+  test_field_count_bound();
+  test_header_index();
+  test_writer_quoting();
+  test_writer_row_and_roundtrip();
+  test_table_layout();
+  test_output_errors();
+  test_input_bound();
+  test_cli_args();
+  if (failures) {
+    fprintf(stderr, "zcsv: %d failure(s)\n", failures);
+    return 1;
+  }
+  puts("zcsv: all tests passed");
+  return 0;
+}

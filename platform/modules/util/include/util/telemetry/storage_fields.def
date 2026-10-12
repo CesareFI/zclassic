@@ -1,0 +1,329 @@
+/* Canonical field table for the `storage` telemetry domain. Data only.
+ *
+ * Row grammar and what each row generates: util/telemetry_field_table.h.
+ * Every field name in this domain is spelled here and nowhere else.
+ *
+ * Lane ownership: this file belongs to the storage domain alone. Append groups
+ * below the `meta` group; do not reorder or reword existing rows, and keep
+ * each group's rows contiguous. */
+
+TL_DOMAIN_META(storage, "zcl.telemetry.storage.v1",
+    "databases, block index, projections, cache and disk headroom")
+
+TL_GROUP(meta, "how and when this snapshot itself was taken")
+
+TL_LEAF(meta, collected_unix, TLC_I64, TFU_UNIX_TIME, TLV_NORMAL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "wall-clock second at which the provider began filling this snapshot; "
+    "every other leaf's observed_unix is at or after this instant",
+    "", "")
+
+TL_GROUP_END(meta)
+
+/* ── storage groups start here (owned by this domain's lane) ──
+ *
+ * WHAT IS DELIBERATELY NOT HERE. Nothing in this table is produced by a scan.
+ * Every leaf is a value one of the storage subsystems already publishes O(1),
+ * because the one moment an operator needs a storage answer is the moment the
+ * node is busiest, and a COUNT(*) over the block or UTXO tables at tip would
+ * queue the reply behind the fold. Two counts an operator might expect are
+ * therefore absent on purpose: the block_index row count (only available as
+ * `SELECT COUNT(*) FROM block_index`, several million rows) and the datadir's
+ * on-disk size (only available as a directory walk). The cheap proxies that
+ * ARE here say in their `means` what they approximate.
+ *
+ * Thresholds. Only two rows carry an absolute number, and both are the node's
+ * OWN configured default rather than a number invented here:
+ *   free_bytes       >= 1073741824 — DISK_MONITOR_DEFAULT_REFUSE_BYTES, the
+ *                     level at which the node itself starts refusing writes.
+ *   poll_age_seconds <= 600 — ten times DISK_MONITOR_DEFAULT_POLL_SECONDS.
+ * Everywhere else a healthy range could not be established from a compile-time
+ * constant, the row is TFR_INFO and its `means` names what to compare against.
+ * A wrong threshold fires and sends a reader at the wrong subsystem, which is
+ * worse than sending them at nothing. */
+
+TL_GROUP(database, "the SQLite stores and the block index this node's whole "
+                   "history is recorded in")
+
+TL_LEAF(database, progress_store_open, TLC_BOOL, TFU_BOOL, TLV_SUMMARY,
+    TFR_EXPECT_TRUE, TL_NONE, 0, TFS_CRITICAL,
+    "whether progress.kv — the store holding every reducer stage cursor — has "
+    "an open sqlite3 handle in this process",
+    "the reducer cannot record that it advanced, so chain progress stops "
+    "being durable even while blocks are still being folded; on restart the "
+    "node resumes from the last cursor that DID land",
+    "z23 ops state --subsystem=progress")
+
+TL_LEAF(database, stage_cursor_rows, TLC_I64, TFU_GAUGE, TLV_NORMAL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "rows in the stage_cursor table, read from the O(1) published counter "
+    "(stage_cursor_rows_value) and never from a COUNT(*). Compare against the "
+    "eight reducer stages: one row per stage that has ever recorded a cursor, "
+    "so a value below the stage count means a stage has never run",
+    "", "")
+
+TL_LEAF(database, projection_store_open, TLC_BOOL, TFU_BOOL, TLV_NORMAL,
+    TFR_EXPECT_TRUE, TL_NONE, 0, TFS_WARN,
+    "whether projection.kv's own sqlite3 handle — the Wave A2 second handle "
+    "on the same physical file — is open",
+    "projection reads fall back to the kernel's handle or fail outright, and "
+    "every projection query then contends with the reducer's write "
+    "transaction",
+    "z23 ops state --subsystem=projection_store")
+
+TL_LEAF(database, projection_handle_independent, TLC_BOOL, TFU_BOOL,
+    TLV_NORMAL, TFR_EXPECT_TRUE, TL_NONE, 0, TFS_WARN,
+    "whether the projection handle is a DIFFERENT sqlite3 connection from the "
+    "reducer kernel's handle; this is the Wave A2 split, proved by pointer "
+    "inequality rather than asserted",
+    "the split has collapsed back to one connection, so a projection read on "
+    "the RPC thread can be queued behind the reducer's open write transaction "
+    "— the RPC-dark-under-load failure the split exists to prevent",
+    "z23 ops state --subsystem=projection_store")
+
+TL_LEAF(database, block_index_degraded, TLC_BOOL, TFU_BOOL, TLV_SUMMARY,
+    TFR_EXPECT_FALSE, TL_NONE, 0, TFS_CRITICAL,
+    "whether the last block_index.bin sidecar verification left the node "
+    "running on an index it could not prove intact",
+    "block_index.bin is the SOLE copy of the below-seed block coordinates — "
+    "no header, no projection and no peer carries them — so a degraded index "
+    "means those heights may be unrecoverable from this datadir alone. Do not "
+    "prune, do not reseal, and copy the datadir before any repair",
+    "z23 ops state --subsystem=block_index_integrity")
+
+TL_LEAF(database, block_index_unsafe_override, TLC_BOOL, TFU_BOOL, TLV_NORMAL,
+    TFR_EXPECT_FALSE, TL_NONE, 0, TFS_CRITICAL,
+    "whether this boot passed a failed block_index.bin integrity check "
+    "because ZCL_ALLOW_CORRUPT_INDEX=1 was set",
+    "the integrity gate was answered by an environment variable rather than "
+    "by the sidecar, so every downstream claim about below-seed heights rests "
+    "on an operator override instead of a digest",
+    "z23 ops state --subsystem=block_index_integrity")
+
+TL_LEAF(database, block_index_verdict, TLC_TEXT, TFU_ENUM, TLV_NORMAL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "the last block_index.bin verification verdict, one of ok / "
+    "sidecar_missing / sidecar_stale / hash_mismatch / tip_height_mismatch / "
+    "tip_missing_in_sql / body_missing / body_unreadable / sidecar_bad_magic "
+    "/ sidecar_unsupported. Only `ok` and `sidecar_missing` (the first-run "
+    "upgrade path) are accepted without quarantine",
+    "", "")
+
+TL_LEAF(database, block_index_heights_repaired, TLC_BOOL, TFU_BOOL, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "whether this boot rewrote heights into block index entries that were "
+    "missing them. Not a fault on its own — it is the normal repair path — "
+    "but it means the in-memory heights are derived rather than loaded, so "
+    "read it together with block_index_verdict",
+    "", "")
+
+TL_LEAF(database, block_index_verified_unix, TLC_I64, TFU_UNIX_TIME, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "wall-clock second of the last block_index.bin verification. Verification "
+    "runs at boot, so compare this against the process start time: a value "
+    "much older than the boot means this field is reporting a previous run",
+    "", "")
+
+TL_LEAF(database, txn_trace_enabled, TLC_BOOL, TFU_BOOL, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "whether the opt-in node.db transaction tracer is on (ZCL_DB_TXN_TRACE=1 "
+    "at process start). When off, the two txn_* leaves below are unreadable "
+    "rather than zero",
+    "", "")
+
+TL_LEAF(database, txn_open_holders, TLC_I64, TFU_GAUGE, TLV_NORMAL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "registered sqlite3 connections currently inside a transaction, from the "
+    "tracer's seqlock-published snapshot. Compare against "
+    "txn_traced_connections and, more usefully, against this field on a "
+    "second call: the reducer legitimately holds one open write transaction "
+    "through a fold, but a holder that persists across calls while nothing "
+    "advances is the write-wedge signature",
+    "", "")
+
+TL_LEAF(database, txn_traced_connections, TLC_I64, TFU_GAUGE, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "registered sqlite3 connections the tracer is watching — the denominator "
+    "for txn_open_holders, not a health signal on its own",
+    "", "")
+
+TL_GROUP_END(database)
+
+TL_GROUP(disk, "free space under the datadir, and the maintenance worker "
+               "that reclaims it")
+
+TL_LEAF(disk, free_bytes, TLC_I64, TFU_BYTES, TLV_SUMMARY,
+    TFR_MIN_ABS, TL_NONE, 1073741824, TFS_CRITICAL,
+    "free bytes on the filesystem holding the datadir at the last poll. The "
+    "threshold is DISK_MONITOR_DEFAULT_REFUSE_BYTES (1 GiB), the node's own "
+    "default refuse level; an operator who raised refuse_free_bytes will see "
+    "below_refuse_threshold fire before this row does",
+    "a node that runs out of disk stops: SQLite starts returning I/O errors "
+    "mid-transaction, and the write may land in a half-applied fold",
+    "z23 ops state --subsystem=disk_monitor")
+
+TL_LEAF(disk, below_refuse_threshold, TLC_BOOL, TFU_BOOL, TLV_SUMMARY,
+    TFR_EXPECT_FALSE, TL_NONE, 0, TFS_CRITICAL,
+    "the disk monitor's OWN verdict that free space is under the configured "
+    "refuse threshold, whatever that threshold was configured to. Read "
+    "lock-free from the monitor's atomic level, so it survives a poll that "
+    "the descriptive numbers below could not be read for",
+    "write-heavy paths — mempool admission, the block processor, db_txn — are "
+    "already refusing new work; the node is not making progress and will not "
+    "until space is freed",
+    "z23 ops state --subsystem=disk_monitor")
+
+TL_LEAF(disk, below_warn_threshold, TLC_BOOL, TFU_BOOL, TLV_SUMMARY,
+    TFR_EXPECT_FALSE, TL_NONE, 0, TFS_WARN,
+    "the disk monitor's own verdict that free space is under the configured "
+    "warn threshold (5 GiB by default). True whenever "
+    "below_refuse_threshold is true, since refuse is the lower of the two",
+    "there is still headroom, but the node is on the path to refusing writes; "
+    "this is the last point at which freeing space is routine rather than an "
+    "incident",
+    "z23 ops state --subsystem=disk_monitor")
+
+TL_LEAF(disk, warn_free_bytes, TLC_I64, TFU_BYTES, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "the resolved warn threshold this node is actually using, after defaults "
+    "— the number below_warn_threshold was decided against",
+    "", "")
+
+TL_LEAF(disk, refuse_free_bytes, TLC_I64, TFU_BYTES, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "the resolved refuse threshold this node is actually using, after "
+    "defaults — the number below_refuse_threshold was decided against, and "
+    "the number free_bytes should be read against when it differs from 1 GiB",
+    "", "")
+
+TL_LEAF(disk, monitor_running, TLC_BOOL, TFU_BOOL, TLV_NORMAL,
+    TFR_EXPECT_TRUE, TL_NONE, 0, TFS_WARN,
+    "whether the disk monitor's polling thread is alive",
+    "nothing is watching free space: free_bytes stops advancing and the "
+    "refuse flag can never flip, so the node would run the disk to zero "
+    "without ever refusing a write",
+    "z23 ops state --subsystem=supervisor")
+
+TL_LEAF(disk, last_poll_unix, TLC_I64, TFU_UNIX_TIME, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "wall-clock second of the last completed statvfs poll; the instant "
+    "free_bytes describes. Unreadable rather than zero when no poll has "
+    "completed yet",
+    "", "")
+
+TL_LEAF(disk, poll_age_seconds, TLC_I64, TFU_SECONDS, TLV_NORMAL,
+    TFR_MAX_ABS, TL_NONE, 600, TFS_WARN,
+    "seconds since the last completed poll. The threshold is ten times "
+    "DISK_MONITOR_DEFAULT_POLL_SECONDS (60 s); an operator who set a longer "
+    "poll_seconds should read this against that value instead",
+    "the poll loop is wedged even though the thread is registered, so "
+    "free_bytes is a stale number being presented as current",
+    "z23 ops state --subsystem=disk_monitor")
+
+TL_LEAF(disk, maintenance_worker_running, TLC_BOOL, TFU_BOOL, TLV_NORMAL,
+    TFR_EXPECT_TRUE, TL_NONE, 0, TFS_WARN,
+    "whether the WAL-checkpoint / ANALYZE / VACUUM worker thread is alive",
+    "the write-ahead log is never truncated and the query planner's "
+    "statistics go stale, so the datadir grows without bound and reads get "
+    "slower with no other symptom",
+    "z23 ops state --subsystem=db_maintenance")
+
+TL_LEAF(disk, maintenance_failures_total, TLC_I64, TFU_COUNT_TOTAL,
+    TLV_SUMMARY, TFR_EXPECT_ZERO, TL_NONE, 0, TFS_WARN,
+    "maintenance operations that returned an error since this process "
+    "started, across all three ops",
+    "a checkpoint, ANALYZE or VACUUM is failing; reclamation is not happening "
+    "and the reason is in the worker's last_error, which this table does not "
+    "carry because it is free-form prose",
+    "z23 ops state --subsystem=db_maintenance")
+
+TL_LEAF(disk, maintenance_runs_total, TLC_I64, TFU_COUNT_TOTAL, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "maintenance operations completed since this process started — the "
+    "denominator for maintenance_failures_total. Zero on a freshly started "
+    "node is normal: the first WAL checkpoint is 15 minutes in by default",
+    "", "")
+
+TL_LEAF(disk, wal_checkpoint_age_seconds, TLC_I64, TFU_SECONDS, TLV_NORMAL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "seconds since the last WAL checkpoint by ANY of this node's "
+    "checkpointers — the 5-minute periodic thread, the maintenance worker's "
+    "interval and size-cap passes, and the shutdown drain. It used to be "
+    "sourced from the maintenance worker alone, which reported "
+    "\"never checkpointed\" on every node while the periodic thread was in "
+    "fact checkpointing every 5 minutes. This row carries no threshold "
+    "because the intervals are runtime settings no worker publishes",
+    "", "")
+
+TL_LEAF(disk, wal_checkpointer_armed, TLC_BOOL, TFU_BOOL, TLV_SUMMARY,
+    TFR_EXPECT_TRUE, TL_NONE, 0, TFS_WARN,
+    "whether the periodic WAL checkpoint thread (zcl_db_ckpt, one pass every "
+    "5 minutes) is running. False is a DECLARED state, never an assumed one: "
+    "the thread publishes armed/not-armed and why, so a checkpointer that "
+    "failed to start can never be mistaken for one with nothing to do",
+    "nothing is folding the write-ahead log back into node.db on a schedule, "
+    "so the WAL grows until an autocheckpoint happens to fire — and an "
+    "unclean exit then leaves a giant WAL for the next boot to recover, which "
+    "is minutes of blocked startup on a slow disk",
+    "z23 ops state --subsystem=db_maintenance")
+
+TL_LEAF(disk, wal_checkpoint_attempts_total, TLC_I64, TFU_COUNT_TOTAL,
+    TLV_FULL, TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "WAL checkpoints attempted since this process started, from every "
+    "checkpointer combined — the denominator for the three outcome counters "
+    "below",
+    "", "")
+
+TL_LEAF(disk, wal_checkpoint_noop_total, TLC_I64, TFU_COUNT_TOTAL, TLV_SUMMARY,
+    TFR_EXPECT_ZERO, TL_NONE, 0, TFS_WARN,
+    "checkpoints that COMPLETED and moved zero frames — the outcome a "
+    "success/failure return cannot express. The WAL was not empty and not one "
+    "page of it was reclaimed, usually because a reader still holds the "
+    "oldest frame",
+    "checkpoints are running and reclaiming nothing, so the WAL is growing "
+    "even though every checkpoint reports success; compare against "
+    "wal_checkpoint_attempts_total to see what fraction of passes are futile",
+    "z23 ops state --subsystem=db_maintenance")
+
+TL_LEAF(disk, wal_checkpoint_busy_total, TLC_I64, TFU_COUNT_TOTAL, TLV_NORMAL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "checkpoints a lock refused or deferred, so they never ran at all. A few "
+    "against a busy database are normal — the checkpointer retries on its "
+    "next pass — and this row is descriptive rather than judged for that "
+    "reason; it is the RATIO to wal_checkpoint_attempts_total that matters",
+    "", "")
+
+TL_LEAF(disk, wal_checkpoint_frames_moved_total, TLC_I64, TFU_COUNT_TOTAL,
+    TLV_FULL, TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "write-ahead-log frames folded back into node.db since this process "
+    "started. This is the one number that goes up only when reclamation "
+    "actually happened; a climbing attempts count beside a flat frames count "
+    "is a checkpointer that is running and achieving nothing",
+    "", "")
+
+TL_LEAF(disk, wal_checkpoint_queue_wait_us, TLC_I64, TFU_MICROSECONDS,
+    TLV_FULL, TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "microseconds the last periodic checkpoint spent QUEUED behind other "
+    "writes before the serialized DB writer ran it. Read together with "
+    "wal_checkpoint_exec_us: this pair is what separates a checkpointer "
+    "starved by write traffic (fix the queue) from one grinding on a slow "
+    "disk (fix the cadence). Neither can be inferred from a stall report",
+    "", "")
+
+TL_LEAF(disk, wal_checkpoint_exec_us, TLC_I64, TFU_MICROSECONDS, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "microseconds the last periodic checkpoint spent INSIDE the database "
+    "engine moving frames to disk, excluding any time it waited in the "
+    "writer queue. The other half of the pair described in "
+    "wal_checkpoint_queue_wait_us",
+    "", "")
+
+TL_LEAF(disk, vacuum_age_seconds, TLC_I64, TFU_SECONDS, TLV_FULL,
+    TFR_INFO, TL_NONE, 0, TFS_INFO,
+    "seconds since the last VACUUM. Compare against the configured "
+    "vacuum_days (7 by default); a VACUUM is also skipped whenever the "
+    "caller-supplied idle gate says the node is busy, so an age well past the "
+    "interval on a syncing node is expected rather than a fault",
+    "", "")
+
+TL_GROUP_END(disk)

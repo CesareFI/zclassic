@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="780" viewBox="0 0 960 780" role="img" aria-labelledby="whole-title whole-desc">
+  <title id="whole-title">Z23: the whole picture and the status of each part</title>
+  <desc id="whole-desc">Nested boxes show one Z23 program inside your machine's local-authority boundary: a full node, the C23 Commons with an ML-KEM-768 module that no caller uses yet, and an emulated RISC-V machine, built into the developer binary z23-dev, that contains a FreeBSD guest and a post-quantum key exchange, with mesh tunnels and an onion transport below. Every element carries one of four status labels: ON MAIN, CANDIDATE, EXPERIMENT or TARGET. The guest and the post-quantum exchange are experiment-level. Two dashed target boxes name goals: a guest-to-guest tunnel between machines, and warm compile and focused proof, p95 within 10 seconds on a frozen small-change corpus. The landing path lists edit, focused proof, integrate current main, gates and push.</desc>
+  <defs>
+    <linearGradient id="whole-node" x1="0" x2="1">
+      <stop offset="0" stop-color="#10243b"/>
+      <stop offset="0.5" stop-color="#111923"/>
+      <stop offset="1" stop-color="#241a3d"/>
+    </linearGradient>
+    <pattern id="whole-grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#202836" stroke-width="1"/>
+    </pattern>
+    <marker id="whole-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#3ddc97"/>
+    </marker>
+  </defs>
+  <rect width="960" height="780" fill="#090c11"/>
+  <rect width="960" height="780" fill="url(#whole-grid)" opacity="0.34"/>
+  <g font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="30" y="60" font-size="30" font-weight="780" letter-spacing="2" fill="#e9eef6">Z23 · THE WHOLE PICTURE</text>
+    <text x="30" y="90" font-size="16" fill="#97a3b6">one program you build and run yourself; every part labelled by what is true today</text>
+
+    <rect x="30" y="108" width="900" height="500" rx="24" fill="#0c1118" stroke="#3ddc97" stroke-width="3"/>
+    <text x="54" y="132" font-size="13" font-weight="760" letter-spacing="2" fill="#3ddc97">YOUR MACHINE · LOCAL AUTHORITY</text>
+
+    <rect x="50" y="148" width="860" height="364" rx="16" fill="url(#whole-node)" stroke="#303a4b" stroke-width="1.5"/>
+    <text x="70" y="173" font-size="16" font-weight="780" fill="#e9eef6">Z23 program (C23)</text>
+    <rect x="828" y="158" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="863" y="171" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
+
+    <rect x="70" y="188" width="190" height="190" rx="10" fill="#0d1419" stroke="#303a4b" stroke-width="1.5"/>
+    <text x="84" y="216" font-size="16" font-weight="780" fill="#e9eef6">Full node</text>
+    <path d="M84 226H144" stroke="#5ea8ff" stroke-width="3"/>
+    <text x="84" y="246" font-size="13" fill="#b9d9ff">checks every block</text>
+    <text x="84" y="262" font-size="13" fill="#b9d9ff">itself; keeps</text>
+    <text x="84" y="278" font-size="13" fill="#b9d9ff">transparent and</text>
+    <text x="84" y="294" font-size="13" fill="#b9d9ff">shielded wallet state</text>
+    <text x="84" y="318" font-size="12" fill="#97a3b6">v1 criteria status:</text>
+    <text x="84" y="334" font-size="12" fill="#97a3b6">see MVP.md</text>
+    <rect x="84" y="344" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="119" y="357" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
+
+    <rect x="272" y="188" width="190" height="190" rx="10" fill="#0d1419" stroke="#303a4b" stroke-width="1.5"/>
+    <text x="286" y="216" font-size="16" font-weight="780" fill="#e9eef6">C23 Commons</text>
+    <path d="M286 226H346" stroke="#a78bfa" stroke-width="3"/>
+    <text x="286" y="252" font-size="13" fill="#d8cdfd">exact package root,</text>
+    <text x="286" y="270" font-size="13" fill="#d8cdfd">fetched and rebuilt</text>
+    <text x="286" y="288" font-size="13" fill="#d8cdfd">byte-identically</text>
+    <rect x="286" y="296" width="162" height="42" rx="6" fill="#171421" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="294" y="311" font-size="13" font-weight="760" fill="#e9eef6">ML-KEM-768 module</text>
+    <rect x="294" y="316" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="329" y="329" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
+    <text x="372" y="329" font-size="12" fill="#97a3b6">unused yet</text>
+    <rect x="286" y="344" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="321" y="357" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
+
+    <rect x="474" y="188" width="416" height="190" rx="10" fill="#0d1419" stroke="#303a4b" stroke-width="1.5"/>
+    <text x="488" y="216" font-size="16" font-weight="780" fill="#e9eef6">Emulated RISC-V machine</text>
+    <text x="706" y="216" font-size="12" fill="#97a3b6">in z23-dev</text>
+    <path d="M488 226H548" stroke="#f2708a" stroke-width="3"/>
+    <rect x="808" y="200" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="843" y="213" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
+
+    <rect x="490" y="236" width="384" height="132" rx="8" fill="#111923" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="504" y="258" font-size="15" font-weight="760" fill="#e9eef6">FreeBSD guest</text>
+    <rect x="770" y="245" width="94" height="18" rx="9" fill="#27203c" stroke="#a78bfa"/><text x="817" y="258" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#d8cdfd">EXPERIMENT</text>
+    <text x="504" y="278" font-size="12" fill="#97a3b6">operator-run boots reach a shell; no network device</text>
+
+    <rect x="506" y="290" width="352" height="66" rx="6" fill="#171421" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="520" y="311" font-size="14" font-weight="760" fill="#e9eef6">Post-quantum key exchange</text>
+    <rect x="754" y="298" width="94" height="18" rx="9" fill="#27203c" stroke="#a78bfa"/><text x="801" y="311" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#d8cdfd">EXPERIMENT</text>
+    <text x="520" y="332" font-size="12" fill="#97a3b6">hybrid exchange on guest loopback;</text>
+    <text x="520" y="348" font-size="12" fill="#97a3b6">identities classical</text>
+
+    <rect x="70" y="392" width="820" height="58" rx="8" fill="#0d1419" stroke="#303a4b" stroke-width="1.5"/>
+    <text x="84" y="414" font-size="14" font-weight="760" fill="#e9eef6">Mesh tunnels between paired machines</text>
+    <text x="400" y="414" font-size="12" fill="#97a3b6">loopback TCP over the mesh stream</text>
+    <rect x="810" y="400" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="845" y="413" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
+    <rect x="84" y="424" width="236" height="20" rx="10" fill="#0c1118" stroke="#5ea8ff"/><text x="202" y="438" text-anchor="middle" font-size="11" fill="#b9d9ff">entrances that survive restart</text>
+    <rect x="330" y="425" width="86" height="18" rx="9" fill="#14243a" stroke="#5ea8ff"/><text x="373" y="438" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#b9d9ff">CANDIDATE</text>
+
+    <rect x="70" y="460" width="820" height="40" rx="8" fill="#0d1419" stroke="#303a4b" stroke-width="1.5"/>
+    <text x="84" y="485" font-size="14" font-weight="760" fill="#e9eef6">Onion transport</text>
+    <text x="224" y="485" font-size="12" fill="#97a3b6">embedded Tor is the default build; a stub must be asked for by name</text>
+    <rect x="810" y="471" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="845" y="484" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
+
+    <rect x="50" y="524" width="860" height="72" rx="12" fill="#111923" stroke="#303a4b" stroke-width="1.5"/>
+    <text x="70" y="545" font-size="15" font-weight="780" fill="#e9eef6">How a change lands</text>
+    <rect x="828" y="532" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="863" y="545" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
+    <g font-size="12" font-weight="650" fill="#c3ccd9" text-anchor="middle">
+      <rect x="70" y="556" width="54" height="28" rx="6" fill="#0d1419" stroke="#5ea8ff"/><text x="97" y="574">edit</text>
+      <rect x="184" y="556" width="118" height="28" rx="6" fill="#0d1419" stroke="#5ea8ff"/><text x="243" y="574">focused proof</text>
+      <rect x="362" y="556" width="182" height="28" rx="6" fill="#0d1419" stroke="#5ea8ff"/><text x="453" y="574">integrate current main</text>
+      <rect x="604" y="556" width="60" height="28" rx="6" fill="#0d1419" stroke="#5ea8ff"/><text x="634" y="574">gates</text>
+      <rect x="724" y="556" width="54" height="28" rx="6" fill="#123027" stroke="#3ddc97"/><text x="751" y="574" fill="#86edbd">push</text>
+    </g>
+    <g stroke="#3ddc97" stroke-width="2" marker-end="url(#whole-arrow)">
+      <path d="M124 570H182"/><path d="M302 570H360"/><path d="M544 570H602"/><path d="M664 570H722"/>
+    </g>
+
+    <path d="M40 628V421H70M480 628V596" fill="none" stroke="#f0b44c" stroke-width="1.5" stroke-dasharray="5 6"/>
+    <circle cx="70" cy="421" r="3.5" fill="#f0b44c"/><circle cx="480" cy="596" r="3.5" fill="#f0b44c"/>
+    <g fill="#111923" stroke="#f0b44c" stroke-width="2" stroke-dasharray="6 5">
+      <rect x="30" y="628" width="280" height="56" rx="10"/>
+      <rect x="340" y="628" width="280" height="56" rx="10"/>
+    </g>
+    <g font-size="13" fill="#f7d28a">
+      <text x="44" y="652">guest-to-guest tunnel</text><text x="44" y="670">between machines</text>
+      <g font-size="12">
+        <text x="354" y="646">warm compile, focused proof</text><text x="354" y="661">p95 within 10 s on a frozen</text><text x="354" y="675">small-change corpus</text>
+      </g>
+    </g>
+    <rect x="236" y="647" width="64" height="18" rx="9" fill="#352918" stroke="#f0b44c"/><text x="268" y="660" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#f7d28a">TARGET</text>
+    <rect x="546" y="647" width="64" height="18" rx="9" fill="#352918" stroke="#f0b44c"/><text x="578" y="660" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#f7d28a">TARGET</text>
+
+    <text x="30" y="711" font-size="12" letter-spacing="1" fill="#69748a">STATUS KEY</text>
+    <rect x="30" y="720" width="70" height="18" rx="9" fill="#123027" stroke="#3ddc97"/><text x="65" y="733" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#86edbd">ON MAIN</text>
+    <text x="110" y="733" font-size="13" fill="#c3ccd9">in the tracked source</text>
+    <rect x="490" y="720" width="86" height="18" rx="9" fill="#14243a" stroke="#5ea8ff"/><text x="533" y="733" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#b9d9ff">CANDIDATE</text>
+    <text x="586" y="733" font-size="13" fill="#c3ccd9">delivered for review, not landed</text>
+    <rect x="30" y="746" width="94" height="18" rx="9" fill="#27203c" stroke="#a78bfa"/><text x="77" y="759" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#d8cdfd">EXPERIMENT</text>
+    <text x="134" y="759" font-size="13" fill="#c3ccd9">one recorded run, not a product claim</text>
+    <rect x="490" y="746" width="64" height="18" rx="9" fill="#352918" stroke="#f0b44c"/><text x="522" y="759" text-anchor="middle" font-size="10.5" font-weight="800" letter-spacing="1" fill="#f7d28a">TARGET</text>
+    <text x="564" y="759" font-size="13" fill="#c3ccd9">stated goal</text>
+  </g>
+</svg>

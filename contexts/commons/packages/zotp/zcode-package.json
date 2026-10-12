@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "zotp/zotp",
+  "semver": "0.1.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "name": "zsha1/zsha1",
+      "root": "50b75f37b3b6e0e9d5077d3290001dac75bc8754523c147e3d24510712b568e3",
+      "semver": "0.1.0"
+    }
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zotp/zotp.h",
+    "src/zotp.c",
+    "tests/test_zotp.c",
+    "zcode-package.json"
+  ]
+}

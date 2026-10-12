@@ -1,0 +1,592 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * The broker: the privileged side of the confined-agent boundary.
+ *
+ * The privileged side is four files: this one (the request pipeline and the
+ * listening socket), agent_broker_peer.c (peer identity), agent_broker_spawn.c
+ * (the confined fork/execve), and agent_broker_status.c (the operator-facing
+ * report).
+ *
+ * THE ORDERING THAT MAKES THE BOUNDARY REAL — read this before editing
+ * agent_broker_spawn_confined() (agent_broker_spawn.c) or
+ * agent_broker_mode_main() (agent_broker_modes.c):
+ *
+ *   1. The child is confined by the PARENT, before execve. rlimits,
+ *      no_new_privs, Landlock and the stage-1 seccomp filter are all applied in
+ *      the forked child while it is still our code, and all four survive
+ *      execve. A hostile agent therefore cannot decline to be sandboxed: by the
+ *      time its own first instruction runs, the kernel is already refusing.
+ *      The child narrows itself further (stage-2 seccomp drops execve) but that
+ *      is defence in depth, not the boundary.
+ *
+ *   2. The grant is constructed AFTER the fork. A forked child shares a
+ *      copy-on-write image of the parent's address space, so anything the
+ *      broker is holding at fork time is readable in the child's memory. The
+ *      grant is therefore not built until the child already exists — and
+ *      execve then replaces that image entirely, along with the inherited
+ *      environment, which is why /proc/<child>/environ is empty rather than a
+ *      copy of the operator's session.
+ *
+ *   3. The grant is never an argument to the child. It is not in argv (mode,
+ *      script, scratch dir, and at most a canary path), not in envp (empty),
+ *      and not in any file the child's Landlock domain can open. The child
+ *      cannot present, forward, or leak an authority it has no way to name.
+ *
+ * The peer is identified once per connection, before any verb is dispatched,
+ * from the kernel's own attribution — the how and the why of that live next
+ * door in agent_broker_peer.c.
+ */
+#if !defined(_WIN32)
+#define _GNU_SOURCE  /* struct ucred, execvpe — must precede every include */
+#endif
+#include "session/agent_broker.h"
+#include "agent_broker_internal.h"
+#include "session/agent_broker_vocab.h"
+#include "base/hex.h"
+#include "base/log_macros.h"
+#include "crypto/sha3.h"
+#include "platform/clock.h"
+#include <errno.h>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <poll.h>
+#endif
+#include <stdio.h>
+#include <string.h>
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
+#define BROKER_TAG "agent.broker"
+/* Fixed descriptor keeps it off the child's command line. */
+#define AGENT_CHILD_SOCKET_FD 3
+/* ── fd helpers (EINTR-safe, exact-length) ──────────────────────────────── */
+
+#if !defined(_WIN32)
+static bool read_full(int fd, uint8_t *buf, size_t n, bool *peer_closed)
+{
+    size_t got = 0;
+    if (peer_closed)
+        *peer_closed = false;
+    while (got < n) {
+        ssize_t r = read(fd, buf + got, n - got);
+        if (r == 0) {
+            if (peer_closed)
+                *peer_closed = true;
+            return false;
+        }
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        got += (size_t)r;
+    }
+    return true;
+}
+static bool write_full(int fd, const uint8_t *buf, size_t n)
+{
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t w = write(fd, buf + sent, n - sent);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        sent += (size_t)w;
+    }
+    return true;
+}
+#endif
+
+/* ── the real property surface (registered by the composition root) ─────── */
+
+static const struct agent_broker_provider *g_provider;
+
+void agent_broker_provider_install(const struct agent_broker_provider *p)
+{
+    g_provider = p;
+}
+
+const struct agent_broker_provider *agent_broker_provider_get(void)
+{
+    return g_provider;
+}
+
+/* THE ONE PLACE A SESSION ACQUIRES AUTHORITY. It exists so that "bind" is not
+ * a recipe each caller retypes: forgetting to record `provider`/`provider_ctx`
+ * on the reference would leave a reference that names a grant and cannot reach
+ * it, which authorize_live() correctly refuses — silently, and for a reason
+ * nobody would guess. Doing it here means no caller can get it half right.
+ *
+ * A refusal is a STATE, not an error to recover from: the session stays
+ * ungranted, `ref->bound` stays false, and every request is refused by name. */
+bool agent_broker_session_bind(struct agent_broker_session *s,
+                               struct agent_authority_ref *ref, char *why,
+                               size_t why_cap)
+{
+    if (why && why_cap)
+        why[0] = '\0';
+    if (!s || !ref)
+        LOG_FAIL(BROKER_TAG, "bind: null session or authority reference");
+    memset(ref, 0, sizeof(*ref));
+    s->authority = ref;
+
+#if defined(_WIN32)
+    if (why && why_cap)
+        snprintf(why, why_cap,
+                 "Windows agent execution is disabled until restricted-token, "
+                 "Job Object, low-integrity, and network-denial sandbox "
+                 "acceptance passes");
+    return false;
+#else
+
+    const struct agent_broker_provider *p = g_provider;
+    if (!p) {
+        if (why && why_cap)
+            snprintf(why, why_cap,
+                     "no property provider is registered: this broker has no "
+                     "authority and no property surface");
+        return false;
+    }
+    if (p->ops)
+        s->ops = p->ops(p->ctx);
+    if (!p->bind || !p->bind(p->ctx, ref, why, why_cap)) {
+        memset(ref, 0, sizeof(*ref));
+        if (why && why_cap && !why[0])
+            snprintf(why, why_cap, "provider '%s' refused to bind",
+                     p->name ? p->name : "(unnamed)");
+        return false;
+    }
+    ref->provider     = p;
+    ref->provider_ctx = p->ctx;
+    return true;
+#endif
+}
+
+/* ── the request pipeline ───────────────────────────────────────────────── */
+
+/* Replay protection lives in agent_broker_idem.c — the digest, the ring, and
+ * the replay label. What is left in this file is WHERE it is consulted, and
+ * that is exactly TWO places: a claim before anything is dispatched, and a
+ * commit after a mutation has actually happened. Every refusal in between
+ * simply returns, leaving the id claimed and nothing cached under it. */
+
+/* ── the live authority ─────────────────────────────────────────────────── */
+
+/* THE ONE PLACE A REQUEST IS AUTHORIZED, and it reads no session state that
+ * could be stale: the verdict comes from the provider, which consults the
+ * store as it is at this instant, and the session contributes only the
+ * narrowing (agent_broker_scope_check, which can refuse and cannot allow).
+ *
+ * THERE IS NO FALLBACK. An unbound reference, a provider that vanished, or a
+ * provider with no authorize entry point all produce DENIED_NO_GRANT. That is
+ * the whole reason the session stopped holding a grant: with a copy present,
+ * "the authority is unreachable" would silently become "use the copy", which
+ * is exactly how a revoked grant keeps working. */
+#if !defined(_WIN32)
+static int32_t authorize_live(const struct agent_broker_session *s,
+                              const struct mvap_request *req, int64_t now_ms)
+{
+    const struct agent_authority_ref *a = s->authority;
+    if (!a || !a->bound || !a->provider || !a->provider->authorize)
+        return MVAP_ERR_DENIED_NO_GRANT;
+    int32_t verdict =
+        a->provider->authorize(a->provider_ctx, a, req, now_ms);
+    if (verdict != MVAP_OK)
+        return verdict;
+    return agent_broker_scope_check(&a->scope, req);
+}
+
+static const char *session_grant_id(const struct agent_broker_session *session)
+{
+    return (session->authority && session->authority->bound)
+               ? session->authority->canonical_grant_id
+               : "";
+}
+
+#endif
+
+void agent_broker_handle(struct agent_broker_session *s,
+                         const struct mvap_request *req,
+                         struct mvap_response *out)
+{
+    if (!s || !req || !out)
+        return;
+
+    s->requests_served++;
+
+#if defined(_WIN32)
+    resp_init(out, req, MVAP_ERR_DENIED_NO_GRANT);
+    resp_body(out,
+              "{\"denied\":\"WINDOWS_SANDBOX_UNQUALIFIED\","
+              "\"stage\":\"broker_disabled\"}");
+    s->requests_denied++;
+    return;
+#else
+
+    /* Queries and actions are two different pipelines from here on. A QUERY
+     * resolves and answers; it can reach neither PLAN/COMMIT nor a receipt,
+     * because those calls are not on its path at all.
+     *
+     * The class is decided BEFORE the ring is consulted: an unknown verb names
+     * no operation, so it has no identity worth remembering and never claims
+     * an id. */
+    const bool is_action = mvap_verb_is_action(req->verb);
+    if (!is_action && !mvap_verb_is_query(req->verb)) {
+        resp_init(out, req, MVAP_ERR_UNKNOWN_VERB);
+        resp_body(out, "{\"denied\":\"UNKNOWN_VERB\"}");
+        s->requests_denied++;
+        return;
+    }
+
+    /* THE REQUEST'S IDENTITY: every field that can change what it asks for,
+     * plus the authority it is asked under — carried as fields, and hashed
+     * into the key the ring indexes by. Everything the ring does is a
+     * comparison of both, never of the request_id alone and never of the
+     * digest alone. */
+    struct agent_idem_identity ident;
+    mvap_request_identity(req, session_grant_id(s), &ident);
+    uint8_t digest[32];
+    mvap_identity_digest(&ident, digest);
+
+    const struct agent_idem_slot *slot = NULL;
+    enum agent_idem_verdict remembered =
+        agent_broker_idem_lookup(s, &ident, digest, &slot);
+    if (remembered == AGENT_IDEM_CONFLICT) {
+        /* The id already names a different request. The first request's record
+         * is left exactly as it was — a second, unrelated ask must not be able
+         * to evict or repoint it. */
+        resp_init(out, req, MVAP_ERR_REQUEST_ID_REUSED);
+        resp_body(out, "{\"denied\":\"REQUEST_ID_REUSED\","
+                       "\"stage\":\"idempotency\",\"request_id\":%u,"
+                       "\"detail\":\"this id already names a different "
+                       "request\"}", req->request_id);
+        s->requests_denied++;
+        s->idempotency_conflicts++;
+        broker_receipt(s, req, out,
+                       "refused: request_id already names a different request",
+                       NULL);
+        return;
+    }
+    if (remembered == AGENT_IDEM_REPLAY) {
+        /* A committed mutation, asked for again. Return the ORIGINAL response
+         * and the ORIGINAL receipt, execute nothing, and say so on the wire. */
+        *out = slot->resp;
+        agent_broker_idem_label_replay(out);
+        s->replays_served++;
+        broker_replay_receipt(s, req, out, slot);
+        return;
+    }
+    /* FRESH or CLAIMED both proceed. CLAIMED means this exact request was
+     * dispatched before and cached nothing — a query, or a mutation that was
+     * refused — so there is nothing to return and everything to re-decide
+     * against the authority as it stands NOW.
+     *
+     * The claim is taken HERE, before any authorization or catalog work, so
+     * the id is bound to this request no matter which of the outcomes below it
+     * reaches. Every refusal from this point simply returns. */
+    agent_broker_idem_claim(s, &ident, digest);
+
+    int64_t now = clock_now_wall_ms();
+    resp_init(out, req, MVAP_OK);
+
+    /* 1. Authorization, on what the agent CLAIMED. The verdict comes from the
+     *    LIVE authority through the provider; the session narrows it. */
+    int32_t verdict = authorize_live(s, req, now);
+    if (verdict != MVAP_OK) {
+        resp_init(out, req, verdict);
+        resp_body(out, "{\"denied\":\"%s\",\"stage\":\"authorize\"}",
+                  mvap_status_name(verdict));
+        s->requests_denied++;
+        broker_receipt(s, req, out, "denied at pre-plan authorize", NULL);
+        return;
+    }
+
+    /* 2. Resolve the property through the node seam — `query` for a query,
+     *    `plan` for an action. */
+    struct agent_plan plan;
+    bool (*resolve)(void *, const struct mvap_request *, struct agent_plan *) =
+        is_action ? s->ops.plan
+                  : (s->ops.query ? s->ops.query : s->ops.plan);
+    if (!resolve || !resolve(s->ops.ctx, req, &plan)) {
+        resp_init(out, req, MVAP_ERR_PLAN_FAILED);
+        resp_body(out, "{\"denied\":\"PLAN_FAILED\"}");
+        s->requests_denied++;
+        broker_receipt(s, req, out, "plan refused", NULL);
+        return;
+    }
+    if (!plan.found) {
+        resp_init(out, req, MVAP_ERR_NOT_FOUND);
+        resp_body(out, "{\"denied\":\"NOT_FOUND\",\"detail\":\"%s\"}",
+                  plan.detail);
+        s->requests_denied++;
+        return;
+    }
+
+    /* 3. Re-authorize against the CATALOG's kind, not the agent's claim. A
+     *    request that understated its kind to slip past the mask dies here.
+     *    Skipped only when the request named no property at all, where there
+     *    is no catalog kind to disagree with.
+     *
+     *    This is a SECOND read of the live authority, not a re-run over the
+     *    first verdict: the resolve above did real datadir work, and a revoke
+     *    that landed during it must be seen here. */
+    if (!mvap_property_id_is_zero(req->property_id)) {
+        struct mvap_request authoritative = *req;
+        authoritative.kind = plan.kind;
+        verdict = authorize_live(s, &authoritative, now);
+        if (verdict != MVAP_OK) {
+            resp_init(out, req, verdict);
+            resp_body(out, "{\"denied\":\"%s\",\"stage\":\"recheck\","
+                           "\"actual_kind\":\"%s\"}",
+                      mvap_status_name(verdict), mvap_kind_name(plan.kind));
+            s->requests_denied++;
+            broker_receipt(s, req, out, "denied at post-plan kind recheck",
+                           NULL);
+            return;
+        }
+    }
+
+    /* 4. A query answers from what it resolved. It mutates nothing, debits
+     *    nothing, and mints no receipt — on either side.
+     *
+     *    A query is NOT remembered: it reads live authority and live property
+     *    state, so a replayed request_id must be re-authorized. */
+    if (!is_action) {
+        resp_init(out, req, MVAP_OK);
+        resp_body(out,
+                  "{\"kind\":\"%s\",\"revision\":%llu,\"owner_matches\":%s,"
+                  "\"detail\":\"%s\"}",
+                  mvap_kind_name(plan.kind),
+                  (unsigned long long)plan.revision,
+                  plan.owner_matches ? "true" : "false", plan.detail);
+        return;
+    }
+
+    /* 5. COMMIT — rechecks ownership and revision inside the seam. */
+    struct agent_commit_outcome outcome;
+    memset(&outcome, 0, sizeof(outcome));
+    if (!plan.owner_matches) {
+        resp_init(out, req, MVAP_ERR_DENIED_PROPERTY);
+        resp_body(out, "{\"denied\":\"DENIED_PROPERTY\",\"stage\":\"commit\","
+                       "\"detail\":\"controller is not the grant principal\"}");
+        s->requests_denied++;
+        broker_receipt(s, req, out, "commit refused: owner mismatch", NULL);
+        return;
+    }
+    if (!s->ops.commit ||
+        !s->ops.commit(s->ops.ctx, req, &plan, &outcome)) {
+        resp_init(out, req, MVAP_ERR_COMMIT_FAILED);
+        resp_body(out, "{\"denied\":\"COMMIT_FAILED\"}");
+        s->requests_denied++;
+        broker_receipt(s, req, out, "commit refused by the node seam", NULL);
+        return;
+    }
+
+    /* The debit lands on the LIVE authority, so a budget spent here is spent
+     * for every other reader of that grant — not in a session-local copy that
+     * dies with the connection. */
+    if (s->authority && s->authority->provider &&
+        s->authority->provider->debit &&
+        !s->authority->provider->debit(s->authority->provider_ctx,
+                                       s->authority, req, now))
+        LOG_WARN(BROKER_TAG,
+                 "grant %s: the live authority refused a debit that authorize "
+                 "had already allowed (verb=%s value=%llu)",
+                 session_grant_id(s), mvap_verb_name(req->verb),
+                 (unsigned long long)req->value_zats);
+    resp_init(out, req, MVAP_OK);
+    resp_body(out, "%s", outcome.body);
+    /* The confinement envelope commits to the canonical action receipt rather
+     * than restating what the action was. */
+    char detail[AGENT_RECEIPT_DETAIL_MAX + 1];
+    char action_hex[65];
+    zcl_hex_encode(outcome.action_receipt_id, 32, action_hex);
+    bool have_action_receipt = false;
+    for (size_t i = 0; i < 32; i++)
+        have_action_receipt |= outcome.action_receipt_id[i] != 0;
+    snprintf(detail, sizeof(detail), "%.79s action_receipt=%s", plan.detail,
+             have_action_receipt ? action_hex : "none");
+    broker_receipt(s, req, out, detail, outcome.action_receipt_id);
+    /* THE ONLY THING THAT PUTS AN ANSWER IN THE RING. A mutation that actually
+     * committed: an identical repeat now replays this response and this
+     * receipt and executes nothing. Stored with the canonical action receipt
+     * it commits to, so the replay's audit row can name it too. */
+    agent_broker_idem_commit(s, &ident, digest, out,
+                             outcome.action_receipt_id);
+#endif
+}
+
+/* ── serving ────────────────────────────────────────────────────────────── */
+
+int agent_broker_serve_once(struct agent_broker_session *s, int fd)
+{
+#if defined(_WIN32)
+    (void)s;
+    (void)fd;
+    return -1;
+#else
+    if (!s || fd < 0)
+        LOG_ERR(BROKER_TAG, "bad session=%p fd=%d", (void *)s, fd);
+
+    uint8_t prefix[MVAP_FRAME_PREFIX];
+    bool closed = false;
+    if (!read_full(fd, prefix, sizeof(prefix), &closed)) {
+        if (closed)
+            return 0;
+        LOG_ERR(BROKER_TAG, "reading frame prefix failed: %s", strerror(errno));
+    }
+    uint32_t rec = mvap_frame_length(prefix, sizeof(prefix));
+    if (rec == 0)
+        LOG_ERR(BROKER_TAG, "peer declared an out-of-bounds frame length");
+
+    uint8_t buf[MVAP_MAX_FRAME];
+    if (!read_full(fd, buf, rec, &closed))
+        LOG_ERR(BROKER_TAG, "short read of a %u-byte frame%s", rec,
+                closed ? " (peer closed mid-frame)" : "");
+
+    struct mvap_request req;
+    struct mvap_response resp;
+    if (!mvap_request_decode(buf, rec, &req)) {
+        memset(&req, 0, sizeof(req));
+        resp_init(&resp, &req, MVAP_ERR_BAD_REQUEST);
+        resp_body(&resp, "{\"denied\":\"BAD_REQUEST\"}");
+    } else {
+        agent_broker_handle(s, &req, &resp);
+    }
+
+    uint8_t out[MVAP_FRAME_PREFIX + MVAP_MAX_FRAME];
+    size_t n = mvap_response_encode(&resp, out, sizeof(out));
+    if (n == 0)
+        LOG_ERR(BROKER_TAG, "could not encode the response for request_id=%u",
+                resp.request_id);
+    if (!write_full(fd, out, n))
+        LOG_ERR(BROKER_TAG, "writing the response failed: %s", strerror(errno));
+    return 1;
+#endif
+}
+
+int agent_broker_serve_fd(struct agent_broker_session *s, int fd,
+                          uint64_t max_requests)
+{
+#if defined(_WIN32)
+    (void)s;
+    (void)fd;
+    (void)max_requests;
+    return -1;
+#else
+    if (!s || fd < 0)
+        LOG_ERR(BROKER_TAG, "bad session=%p fd=%d", (void *)s, fd);
+
+    /* The credential check happens ONCE, here, before a single verb is
+     * dispatched. A peer that fails it never reaches agent_broker_handle. */
+    if (!agent_broker_identify_peer(fd, &s->peer))
+        LOG_ERR(BROKER_TAG, "no peer credentials on fd=%d", fd);
+
+    char why[160];
+    if (!agent_broker_peer_authorized(&s->peer, &s->expect, why, sizeof(why))) {
+        struct mvap_request empty = { .verb = MVAP_VERB_INSPECT };
+        struct mvap_response resp;
+        resp_init(&resp, &empty, MVAP_ERR_DENIED_PEER_IDENTITY);
+        resp_body(&resp, "{\"denied\":\"DENIED_PEER_IDENTITY\",\"why\":\"%s\"}",
+                  why);
+        s->requests_denied++;
+        broker_receipt(s, &empty, &resp, why, NULL);
+        uint8_t out[MVAP_FRAME_PREFIX + MVAP_MAX_FRAME];
+        size_t n = mvap_response_encode(&resp, out, sizeof(out));
+        if (n)
+            (void)write_full(fd, out, n);
+        LOG_ERR(BROKER_TAG, "peer refused: %s", why);
+    }
+
+    uint64_t served = 0;
+    for (;;) {
+        int r = agent_broker_serve_once(s, fd);
+        if (r <= 0)
+            return r == 0 ? (int)served : -1;
+        served++;
+        if (max_requests && served >= max_requests)
+            return (int)served;
+    }
+#endif
+}
+
+int agent_broker_listen(const char *path)
+{
+#if defined(_WIN32)
+    (void)path;
+    return -1;
+#else
+    if (!path || !path[0])
+        LOG_ERR(BROKER_TAG, "null socket path");
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    if (strnlen(path, sizeof(sa.sun_path)) >= sizeof(sa.sun_path))
+        LOG_ERR(BROKER_TAG, "socket path too long (%zu >= %zu): %s",
+                strnlen(path, 4096), sizeof(sa.sun_path), path);
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM
+#if defined(SOCK_CLOEXEC)
+                    | SOCK_CLOEXEC
+#endif
+                    , 0);
+    if (fd < 0)
+        LOG_ERR(BROKER_TAG, "socket(AF_UNIX) failed: %s", strerror(errno));
+#if !defined(SOCK_CLOEXEC)
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        (void)close(fd);
+        LOG_ERR(BROKER_TAG, "socket CLOEXEC failed: %s", strerror(errno));
+    }
+#endif
+    (void)unlink(path);
+
+    /* 0700 before bind: the filesystem permission is a coarse first gate, and
+     * SO_PEERCRED is the exact one. Neither replaces the other. */
+    mode_t old = umask(0077);
+    bool bound = bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0;
+    (void)umask(old);
+    if (!bound) {
+        (void)close(fd);
+        LOG_ERR(BROKER_TAG, "bind %s failed: %s", path, strerror(errno));
+    }
+    if (listen(fd, 4) != 0) {
+        (void)close(fd);
+        LOG_ERR(BROKER_TAG, "listen on %s failed: %s", path, strerror(errno));
+    }
+    return fd;
+#endif
+}
+
+int agent_broker_accept_once(struct agent_broker_session *s, int listen_fd,
+                             int timeout_ms)
+{
+#if defined(_WIN32)
+    (void)s;
+    (void)listen_fd;
+    (void)timeout_ms;
+    return -1;
+#else
+    if (!s || listen_fd < 0)
+        LOG_ERR(BROKER_TAG, "bad session=%p listen_fd=%d", (void *)s,
+                listen_fd);
+    struct pollfd p = { .fd = listen_fd, .events = POLLIN };
+    int pr = poll(&p, 1, timeout_ms);
+    if (pr == 0)
+        return 0;
+    if (pr < 0)
+        LOG_ERR(BROKER_TAG, "poll on the listener failed: %s", strerror(errno));
+
+    int cfd = accept(listen_fd, NULL, NULL);
+    if (cfd < 0)
+        LOG_ERR(BROKER_TAG, "accept failed: %s", strerror(errno));
+    int served = agent_broker_serve_fd(s, cfd, 0);
+    (void)close(cfd);
+    return served < 0 ? -1 : 1;
+#endif
+}

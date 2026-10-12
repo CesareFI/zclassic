@@ -1,0 +1,1128 @@
+#!/usr/bin/env bash
+# Copyright 2026 Rhett Creighton - Apache License 2.0
+#
+# ship_selftest.sh — hermetic proof that tools/ship.sh never rolls a good
+# binary off a slow machine, and still rolls a broken one back.
+#
+# tools/ship.sh had NO selftest of any kind, and the loop it needed one for
+# spans two machines: an inline ssh heredoc that runs on the target box plus a
+# local polling loop that re-checks it from here. A botched edit there rolls
+# back good binaries across the whole fleet in one command, so the seam came
+# first and the behaviour change second.
+#
+# THE SEAM is ZCL_SHIP_REMOTE_EXEC (tools/scripts/ship_progress_lib.sh,
+# ship_remote_sh / ship_remote_script). When it is set it replaces ssh
+# entirely and receives exactly what ssh would have: for `sh`, the one-shot
+# observer program text; for `script`, the activation/rollback script on stdin
+# plus its arguments. A fixture can therefore
+#
+#   * EXECUTE the program it was handed, in a sandbox with a mocked systemctl
+#     and a real fixture process, so the whole chain — observer program text ->
+#     ship_observe -> /proc -> observation line -> classifier — is exercised
+#     with no host anywhere; or
+#   * script a canned answer, so states a sandbox cannot manufacture (a kernel
+#     with no CONFIG_TASK_DELAY_ACCT, a box wedged for ten minutes) are still
+#     covered in seconds; or
+#   * refuse to answer at all, which is the case the old code got backwards.
+#
+# Everything here runs in a mktemp sandbox, needs no node, no root, no
+# network, and writes nothing tracked.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=tools/scripts/ship_progress_lib.sh
+. "$ROOT/tools/scripts/ship_progress_lib.sh"
+SHIP_LIB_TEXT="$(cat "$ROOT/tools/scripts/ship_progress_lib.sh")"
+
+SANDBOX="$(mktemp -d "${ZCL_SCRATCH_DIR:-${TMPDIR:-/tmp}}/zcl-ship-selftest.XXXXXX")"
+FAILS=0
+cleanup() {
+    # Kill by RECORDED pid, never by `pkill -f <pattern>`: pgrep/pkill -f match
+    # the shell that is running them, and that has wedged a wait loop on this
+    # box before.
+    if [ -s "$SANDBOX/fixture.pids" ]; then
+        while IFS= read -r p; do
+            [ -n "$p" ] && kill "$p" 2>/dev/null
+        done < "$SANDBOX/fixture.pids"
+    fi
+    rm -rf "$SANDBOX"
+}
+trap cleanup EXIT HUP INT TERM
+
+pass() { printf 'ship-selftest:   ok  %s\n' "$*"; }
+fail() { printf 'ship-selftest: FAIL %s\n' "$*" >&2; FAILS=$((FAILS + 1)); }
+
+WANT_SHA="$(printf 'a%.0s' {1..64})"
+SELFTEST_SOURCE_ID="$(printf 'b%.0s' {1..64})"
+SELFTEST_COMMIT="selftest-commit-$(printf 'c%.0s' {1..8})"
+
+# ── 1. the classifier ───────────────────────────────────────────────────────
+# args: qualified observed exists silent silence unstable crash unknown
+#       unknown_n window_expired advances
+check_verdict() {
+    local want="$1"; shift
+    local got; got="$(ship_verdict "$@")"
+    if [ "$got" = "$want" ]; then
+        pass "verdict $want <- $*"
+    else
+        fail "verdict wanted $want got $got <- $*"
+    fi
+}
+
+printf '\nship-selftest: 1. the classifier — five machine states, five words\n'
+# Exact bytes + identity + an answer. Nothing else can produce this word.
+check_verdict QUALIFIED  1 1 1 0 300 0 3 0 5 0 0
+# THE DEFECT THIS REPLACES. The reporting window has expired on a box that is
+# demonstrably still moving. Under the old code this was `healthy=0`, which
+# meant ROLL BACK. It must be SLOW, and SLOW must never share an exit code
+# with a fault.
+check_verdict SLOW       0 1 1 10 300 0 3 0 5 1 7
+# Window expired, nothing observed either way, silence not yet established.
+# Refusing to guess is its own answer.
+check_verdict UNVERIFIED 0 1 1 10 300 0 3 0 5 1 0
+# Proven stillness. This is the only slowness-shaped input that convicts, and
+# it is not slowness at all: nothing moved for the entire silence limit.
+check_verdict WEDGED     0 1 1 300 300 0 3 0 5 0 0
+check_verdict WEDGED     0 1 1 999 300 0 3 0 5 1 4
+# A process that will not stay up. Not a slow machine.
+check_verdict CRASHED    0 1 0 0 300 3 3 0 5 0 0
+# One absent sample is a suspicion, never a verdict.
+check_verdict WATCHING   0 1 0 0 300 1 3 0 5 0 0
+check_verdict WATCHING   0 1 0 0 300 2 3 0 5 0 0
+# No evidence at all. An unreachable host is UNKNOWN, and UNKNOWN is not a
+# failed deploy — this is the fail-safe direction that matters most here.
+check_verdict UNKNOWN    0 0 0 0 300 0 3 5 5 0 0
+# ...and one unanswered probe is not that either.
+check_verdict WATCHING   0 0 0 0 300 0 3 1 5 0 0
+# Ordering: a positive crash observation outranks missing evidence, and
+# missing evidence outranks a silence claim (a box we cannot see has not been
+# proven still).
+check_verdict CRASHED    0 1 0 999 300 3 3 5 5 1 0
+check_verdict UNKNOWN    0 0 0 999 300 0 3 5 5 1 0
+# Silence cannot be claimed from a sample that observed nothing.
+check_verdict WATCHING   0 0 0 999 300 0 3 1 5 0 0
+# THE NODE4 DEFECT, at the classifier: an absent pid whose disappearance the
+# unit manager is managing must not convict, so the caller stops counting it
+# toward CRASH_SAMPLES and the streak stays 0. The restart columns are the
+# only other thing that may convict such a sample.
+check_verdict WATCHING   0 1 0 0 300 0 3 0 5 0 0 0 3
+# A crash loop too fast to ever show a pid: systemd's own restart count is the
+# only witness, and past the bound it is CRASHED just as it always was.
+check_verdict CRASHED    0 1 0 0 300 0 3 0 5 0 0 4 3
+# AT the bound is not past it — the restart we asked for, plus backoff, must
+# not spend the whole budget in one poll.
+check_verdict WATCHING   0 1 0 0 300 0 3 0 5 0 0 3 3
+# A bound of 0 means no restart evidence was supplied, never "one convicts".
+check_verdict WATCHING   0 1 0 0 300 0 3 0 5 0 0 9 0
+# A box that is up, exact and answering is QUALIFIED however much it restarted
+# getting there: the columns are evidence about a fault, not a punishment.
+check_verdict QUALIFIED  1 1 1 0 300 0 3 0 5 0 0 9 3
+# The eleven-argument form is still answered exactly as before — the remote
+# leg and the local leg are the same file, but a transcript is not.
+check_verdict CRASHED    0 1 0 0 300 3 3 0 5 0 0
+
+printf '\nship-selftest: 2. the exit-code contract\n'
+for pair in "QUALIFIED 0" "CRASHED 1" "WEDGED 1" "SLOW 3" "UNVERIFIED 3" "UNKNOWN 4"; do
+    set -- $pair
+    got="$(ship_verdict_code "$1")"
+    if [ "$got" = "$2" ]; then pass "$1 -> exit $2"; else fail "$1 -> exit $got, wanted $2"; fi
+done
+# No two verdicts that mean different things may share an exit code, and the
+# two non-failures must never collide with the fault code.
+if [ "$(ship_verdict_code SLOW)" = "$(ship_verdict_code WEDGED)" ]; then
+    fail "SLOW and WEDGED share an exit code"
+else
+    pass "SLOW and WEDGED cannot be confused by exit code"
+fi
+if [ "$(ship_verdict_code UNKNOWN)" = "$(ship_verdict_code CRASHED)" ]; then
+    fail "UNKNOWN and CRASHED share an exit code"
+else
+    pass "UNKNOWN and CRASHED cannot be confused by exit code"
+fi
+for v in SLOW UNVERIFIED UNKNOWN QUALIFIED; do
+    if ship_verdict_is_destructive "$v"; then
+        fail "$v is allowed to trigger a rollback"
+    else
+        pass "$v can never trigger a rollback"
+    fi
+done
+for v in WEDGED CRASHED; do
+    if ship_verdict_is_destructive "$v"; then
+        pass "$v is allowed to trigger a rollback"
+    else
+        fail "$v cannot trigger a rollback — a fix that never rolls back is not a fix"
+    fi
+done
+
+printf '\nship-selftest: 2b. the local deploy verdict-file contract\n'
+# GNU make's own exit status for a failed recipe is a flat 2 no matter what
+# the recipe itself returned, so `make deploy`'s own `exit 3` (UNVERIFIED) is
+# unobservable from ship.sh's $rc. The `deploy` recipe writes
+# build/bin/.deploy-verdict right before every exit instead, and
+# ship_deploy_local_verdict_rc() is the pure reader that turns that file back
+# into rc=3 — but ONLY for the candidate ship actually froze.
+verdict_sha_want="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+verdict_sha_other="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+printf 'verify_rc=3 source_id=%s\n' "$verdict_sha_want" > "$SANDBOX/deploy-verdict.match"
+if [ "$(ship_deploy_local_verdict_rc "$SANDBOX/deploy-verdict.match" "$verdict_sha_want")" = "3" ]; then
+    pass "verify_rc=3 for THIS candidate's source id maps to rc 3"
+else
+    fail "verify_rc=3 for this candidate's source id did not map to rc 3"
+fi
+# A verdict for a DIFFERENT candidate must never be honoured — a stale file
+# from a prior run naming an old source id is not evidence about this one.
+if ship_deploy_local_verdict_rc "$SANDBOX/deploy-verdict.match" "$verdict_sha_other" >/dev/null; then
+    fail "a verdict naming a different candidate's source id was honoured"
+else
+    pass "a verdict naming a different candidate's source id is refused"
+fi
+# A successful deploy's own verdict (verify_rc=0) must never be reinterpreted
+# as UNVERIFIED — this reader answers one question only.
+printf 'verify_rc=0 source_id=%s\n' "$verdict_sha_want" > "$SANDBOX/deploy-verdict.success"
+if ship_deploy_local_verdict_rc "$SANDBOX/deploy-verdict.success" "$verdict_sha_want" >/dev/null; then
+    fail "verify_rc=0 was mapped to UNVERIFIED"
+else
+    pass "verify_rc=0 is never mapped to UNVERIFIED"
+fi
+# A missing file — the case where the deploy recipe never got far enough to
+# write one, i.e. a genuine failure — must fail closed, not pass silently.
+if ship_deploy_local_verdict_rc "$SANDBOX/deploy-verdict.absent" "$verdict_sha_want" >/dev/null; then
+    fail "a missing verdict file was honoured"
+else
+    pass "a missing verdict file fails closed"
+fi
+
+# ── 3. the /proc parsers ────────────────────────────────────────────────────
+printf '\nship-selftest: 3. /proc parsers — the slow-disk signal must be legible\n'
+# proc(5) after the "pid (comm) " strip: utime $12, stime $13, starttime $20,
+# delayacct_blkio_ticks $40.
+STAT_A="1 (z23 node) D 1 1 1 0 -1 0 0 0 0 0 11 22 0 0 20 0 9 0 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 777 0 0"
+STAT_B="1 (z23 node) D 1 1 1 0 -1 0 0 0 0 0 11 22 0 0 20 0 9 0 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 9999 0 0"
+[ "$(ship_cpu_ticks_from_text "$STAT_A")" = 33 ]    && pass "cpu ticks"    || fail "cpu ticks"
+[ "$(ship_start_ticks_from_text "$STAT_A")" = 4242 ] && pass "start ticks"  || fail "start ticks"
+[ "$(ship_blkio_ticks_from_text "$STAT_A")" = 777 ]  && pass "blkio ticks"  || fail "blkio ticks"
+# THE SAMPLE THE WHOLE MECHANISM TURNS ON: identical CPU, identical I/O bytes,
+# moving delayacct_blkio_ticks. That is a process blocked on a spinning
+# platter, burning no CPU, and it is WORKING. If these two compared equal the
+# slow box would be indistinguishable from a wedged one.
+if [ "$(ship_blkio_ticks_from_text "$STAT_A")" != "$(ship_blkio_ticks_from_text "$STAT_B")" ]; then
+    pass "blocked-on-disk progress is visible with flat CPU"
+else
+    fail "blocked-on-disk progress is INVISIBLE — a slow box reads as wedged"
+fi
+# A comm containing spaces and parentheses must not shift the field numbering.
+STAT_UGLY="7 (z23 (node) x) D 1 1 1 0 -1 0 0 0 0 0 11 22 0 0 20 0 9 0 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 777 0 0"
+[ "$(ship_blkio_ticks_from_text "$STAT_UGLY")" = 777 ] && pass "comm with spaces/parens" \
+    || fail "comm with spaces/parens shifts the fields"
+# Kernels without CONFIG_TASK_DELAY_ACCT: the field is short or zero. It must
+# read 0 rather than aborting, and CPU + I/O then carry the signal (proved
+# end-to-end in scenario `io-only-kernel` below).
+STAT_SHORT="1 (z23) S 1 1 1 0 -1 0 0 0 0 0 11 22 0 0 20 0 9 0 4242"
+[ "$(ship_blkio_ticks_from_text "$STAT_SHORT")" = 0 ] && pass "no delayacct -> 0, not an error" \
+    || fail "no delayacct did not degrade to 0"
+[ "$(ship_cpu_ticks_from_text "")" = 0 ] && pass "empty stat -> 0" || fail "empty stat"
+[ "$(ship_blkio_ticks_from_text "")" = 0 ] && pass "empty blkio -> 0" || fail "empty blkio"
+IOTXT='rchar: 100
+wchar: 20
+read_bytes: 4096
+write_bytes: 8192
+cancelled_write_bytes: 999999
+syscr: 5'
+[ "$(ship_io_bytes_from_text "$IOTXT")" = 12408 ] && pass "io bytes (counted fields only)" \
+    || fail "io bytes"
+
+# The darwin-side parsers are pure text->token too, so they are pinned on BOTH
+# hosts: the same library travels over the wire to a Linux box, where these
+# functions are dead code but still have to parse and still have to answer.
+# cputime is `[dd-]hh:mm:ss.ss`. The classifier consumes only the delta between
+# polls, and the parser answers exactly anyway, so both are pinned here.
+printf '\nship-selftest: 3b. darwin-side parsers — pinned on this host, parsed on both\n'
+[ "$(ship_cpu_centisecs_from_text "0:00.00")" = 0 ] && pass "cputime zero" || fail "cputime zero"
+[ "$(ship_cpu_centisecs_from_text "  1:02.03")" = 6203 ] && pass "cputime m:ss.cc" \
+    || fail "cputime m:ss.cc (wanted 6203)"
+[ "$(ship_cpu_centisecs_from_text "1:02:03.04")" = 372304 ] && pass "cputime h:mm:ss.cc" \
+    || fail "cputime h:mm:ss.cc (wanted 372304)"
+[ "$(ship_cpu_centisecs_from_text "3-01:02:03.04")" = 26292304 ] && pass "cputime d-hh:mm:ss.cc" \
+    || fail "cputime d-hh:mm:ss.cc (wanted 26292304)"
+[ "$(ship_cpu_centisecs_from_text "")" = 0 ] && pass "empty cputime -> 0" || fail "empty cputime"
+[ "$(ship_cpu_centisecs_from_text "garbage")" = 0 ] && pass "garbage cputime -> 0" || fail "garbage cputime"
+# A still process and a working one must not be able to share a token: the
+# whole darwin advance signal is this number moving.
+[ "$(ship_cpu_centisecs_from_text "0:00.07")" != "$(ship_cpu_centisecs_from_text "0:00.08")" ] \
+    && pass "one centisecond of CPU is a visible advance" \
+    || fail "centisecond resolution lost — a busy box reads as wedged"
+# lstart is a date with spaces; the observation line may not carry any.
+[ "$(ship_start_token_from_text "Thu Aug 27 14:48:20 2026   ")" = "ThuAug2714:48:202026" ] \
+    && pass "lstart squeezes to a space-free token" || fail "lstart token"
+# The digest helper must agree with itself whichever binary answers, and the
+# fixture's WANT_SHA logic leans on it on a host with no coreutils.
+[ "$(printf 'abc' | ship_sha256_stream)" = \
+  "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" ] \
+    && pass "sha256 helper (sha256sum/shasum/openssl agree)" || fail "sha256 helper digest"
+
+printf '\nship-selftest: 4. observation-line field extraction\n'
+LINE="observed=1 exists=1 pid=9 start=5 sha=$WANT_SHA ident=yes rpc=no cpu=0 blkio=5000 io=12"
+# `io` is a substring of `blkio` — the leading-space anchor is what stops the
+# slow-disk counter from being read as the I/O byte count.
+[ "$(ship_field "$LINE" io)" = 12 ]      && pass "io is not read out of blkio" || fail "io/blkio confusion"
+[ "$(ship_field "$LINE" blkio)" = 5000 ] && pass "blkio"  || fail "blkio field"
+[ "$(ship_field "$LINE" pid)" = 9 ]      && pass "pid"    || fail "pid field"
+[ -z "$(ship_field "$LINE" nosuch)" ]    && pass "absent field is empty" || fail "absent field"
+[ "$(ship_field_num "$LINE" nosuch)" = 0 ] && pass "absent numeric field is 0" || fail "absent numeric"
+[ "$(ship_field_num "garbage" observed)" = 0 ] && pass "garbled transcript reads as no-evidence" \
+    || fail "garbled transcript"
+# ── 4b. the unit-state fields ───────────────────────────────────────────────
+# systemd prints Key=Value in an order it chooses and omits what it does not
+# know, so every field is looked up by name and every absence has a value that
+# cannot be mistaken for an answer.
+printf '\nship-selftest: 4b. unit state — restarting must be legible as restarting\n'
+SHOW_RESTARTING='Type=notify
+NRestarts=7
+ActiveState=activating
+SubState=auto-restart'
+[ "$(ship_unit_state_fields_from_text "$SHOW_RESTARTING")" = \
+  "state=activating sub=auto-restart nrestarts=7" ] \
+    && pass "unit state parses whatever order systemd chose" \
+    || fail "unit state parse (got $(ship_unit_state_fields_from_text "$SHOW_RESTARTING"))"
+[ "$(ship_unit_state_fields_from_text "")" = "state=- sub=- nrestarts=0" ] \
+    && pass "no manager answer -> no state, and a restart count of 0" \
+    || fail "empty show output did not degrade"
+# A manager too old for NRestarts, and a fixture that answers something else
+# entirely, must both read as "this field was not answered" rather than as a
+# number nobody said.
+[ "$(ship_unit_state_fields_from_text 'ActiveState=failed
+SubState=failed')" = "state=failed sub=failed nrestarts=0" ] \
+    && pass "absent NRestarts reads 0, not garbage" || fail "absent NRestarts"
+[ "$(ship_unit_state_fields_from_text '12345')" = "state=- sub=- nrestarts=0" ] \
+    && pass "an unrelated answer is not a unit state" || fail "unrelated answer parsed"
+# The observation line is space separated, so no field may carry a space even
+# if a manager somehow emitted one.
+[ "$(ship_unit_state_fields_from_text 'ActiveState=active and then some')" = \
+  "state=active sub=- nrestarts=0" ] \
+    && pass "a spaced value is truncated, never allowed into the line" \
+    || fail "a spaced value reached the observation line"
+# Only systemd's own transitional words excuse an absent pid. `active` with no
+# main process is a unit whose process died under a manager that is NOT
+# bringing it back, and it must still convict.
+for st in activating reloading refreshing; do
+    if ship_state_is_pending "$st"; then pass "$st is a managed restart"
+    else fail "$st was not treated as a managed restart"; fi
+done
+for st in failed inactive active deactivating maintenance - '' garbage; do
+    if ship_state_is_pending "$st"; then
+        fail "'$st' was excused as a managed restart"
+    else
+        pass "'$st' can never excuse an absent pid"
+    fi
+done
+# The extension is append-only: the fields ride the same line, and a line
+# written before they existed still parses to the same five process facts.
+LINE_R="$LINE state=activating sub=auto-restart nrestarts=2"
+[ "$(ship_field "$LINE_R" state)" = activating ] && pass "state field" || fail "state field"
+[ "$(ship_field "$LINE_R" sub)" = auto-restart ] && pass "sub field" || fail "sub field"
+[ "$(ship_field_num "$LINE_R" nrestarts)" = 2 ] && pass "nrestarts field" || fail "nrestarts field"
+[ "$(ship_field "$LINE_R" io)" = 12 ] && pass "the appended fields shift nothing" \
+    || fail "appending unit state shifted an existing field"
+[ -z "$(ship_field "$LINE" state)" ] && pass "a pre-extension line reports no state" \
+    || fail "a pre-extension line invented a state"
+
+# Escalating patience: a late answer is an ANSWER, and the list sticks rather
+# than growing without bound.
+[ "$(ship_rpc_budget 1 "5 20 60")" = 5 ]  && pass "rpc budget 1" || fail "rpc budget 1"
+[ "$(ship_rpc_budget 2 "5 20 60")" = 20 ] && pass "rpc budget 2" || fail "rpc budget 2"
+[ "$(ship_rpc_budget 9 "5 20 60")" = 60 ] && pass "rpc budget sticks at the last" || fail "rpc budget sticks"
+
+# ── 5. scripted observers driven through the real loop ──────────────────────
+# Each writes ONE observation line per call, exactly as the box would.
+mk_observer() {
+    local name="$1"; shift
+    cat > "$SANDBOX/$name"
+    chmod +x "$SANDBOX/$name"
+}
+
+mk_observer fast-healthy <<EOF
+#!/bin/sh
+echo "observed=1 exists=1 pid=9 start=5 sha=$WANT_SHA ident=yes rpc=ok cpu=1 blkio=1 io=1"
+EOF
+
+# A node answering only on a later, more patient probe. A late answer is an
+# answer; under a single fixed timeout this box was a failed deploy.
+mk_observer late-answer <<EOF
+#!/bin/sh
+n=\$(cat "\$COUNTER" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "\$COUNTER"
+if [ "\$n" -ge 3 ]; then rpc=ok; else rpc=no; fi
+echo "observed=1 exists=1 pid=9 start=5 sha=$WANT_SHA ident=yes rpc=\$rpc cpu=\$n blkio=0 io=0"
+EOF
+
+# THE CASE THIS LANE EXISTS FOR: a box blocked on a 7200rpm disk. It answers
+# no RPC at all, burns NO CPU and moves NO I/O bytes — only
+# delayacct_blkio_ticks climbs. It is working the entire time.
+mk_observer blocked-on-disk <<EOF
+#!/bin/sh
+n=\$(cat "\$COUNTER" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "\$COUNTER"
+echo "observed=1 exists=1 pid=9 start=5 sha=$WANT_SHA ident=yes rpc=no cpu=7 blkio=\$((n * 1000)) io=3"
+EOF
+
+# The same box on a kernel with no CONFIG_TASK_DELAY_ACCT: blkio is stuck at
+# 0 forever and the I/O byte counter has to carry the signal on its own.
+mk_observer io-only-kernel <<EOF
+#!/bin/sh
+n=\$(cat "\$COUNTER" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "\$COUNTER"
+echo "observed=1 exists=1 pid=9 start=5 sha=$WANT_SHA ident=yes rpc=no cpu=7 blkio=0 io=\$((n * 65536))"
+EOF
+
+# A genuinely wedged process: it exists, and NOTHING about it moves.
+mk_observer wedged <<EOF
+#!/bin/sh
+echo "observed=1 exists=1 pid=9 start=5 sha=$WANT_SHA ident=yes rpc=no cpu=7 blkio=7 io=7"
+EOF
+
+# A crash loop: a new incarnation every time we look.
+mk_observer restart-loop <<EOF
+#!/bin/sh
+n=\$(cat "\$COUNTER" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "\$COUNTER"
+echo "observed=1 exists=1 pid=\$((100 + n)) start=\$((500 + n)) sha=$WANT_SHA ident=yes rpc=no cpu=1 blkio=1 io=1"
+EOF
+
+# The service is up but its MainPID is gone: the box looked and found nothing.
+mk_observer no-process <<'EOF'
+#!/bin/sh
+echo "observed=1 exists=0 pid=0 start=0 sha=- ident=no rpc=no cpu=0 blkio=0 io=0"
+EOF
+
+# THE NODE4 SEQUENCE, poll for poll (7200rpm box, 2026-09-10 22:03Z). The old
+# process is observed, systemd stops it for the candidate, and for three polls
+# the unit has no MainPID at all while it is `activating` — then the candidate
+# comes up under a new pid, boots, and answers. Under the old code the three
+# absent polls were CRASHED at 30s and a healthy node was rolled back. It must
+# reach QUALIFIED, and the three managed-restart polls must be reported as
+# what they were.
+mk_observer managed-restart <<EOF
+#!/bin/sh
+n=\$(cat "\$COUNTER" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "\$COUNTER"
+if [ "\$n" -le 2 ]; then
+    echo "observed=1 exists=1 pid=9 start=5 sha=$WANT_SHA ident=yes rpc=no cpu=\$n blkio=0 io=0 state=active sub=running nrestarts=0"
+elif [ "\$n" -le 5 ]; then
+    echo "observed=1 exists=0 pid=0 start=0 sha=- ident=no rpc=no cpu=0 blkio=0 io=0 state=activating sub=auto-restart nrestarts=1"
+elif [ "\$n" -le 7 ]; then
+    echo "observed=1 exists=1 pid=77 start=91 sha=$WANT_SHA ident=yes rpc=no cpu=\$n blkio=\$((n * 100)) io=0 state=activating sub=start nrestarts=1"
+else
+    echo "observed=1 exists=1 pid=77 start=91 sha=$WANT_SHA ident=yes rpc=ok cpu=\$n blkio=\$((n * 100)) io=0 state=active sub=running nrestarts=1"
+fi
+EOF
+
+# The same absent pid, and the manager says the unit FAILED. Nothing is
+# bringing it back, so this is a death and it must still convict.
+mk_observer failed-unit <<EOF
+#!/bin/sh
+n=\$(cat "\$COUNTER" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "\$COUNTER"
+if [ "\$n" -le 1 ]; then
+    echo "observed=1 exists=1 pid=9 start=5 sha=$WANT_SHA ident=yes rpc=no cpu=1 blkio=0 io=0 state=active sub=running nrestarts=0"
+else
+    echo "observed=1 exists=0 pid=0 start=0 sha=- ident=no rpc=no cpu=0 blkio=0 io=0 state=failed sub=failed nrestarts=1"
+fi
+EOF
+
+# A crash loop fast enough that no poll ever catches a pid: `activating` every
+# time we look, so neither the absent-pid streak nor a changing pid can see
+# it. systemd's own restart count is the only witness, and past the bound it
+# is CRASHED — the true-crash detection that the PENDING rule must not cost.
+mk_observer restart-storm <<'EOF'
+#!/bin/sh
+n=$(cat "$COUNTER" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$COUNTER"
+echo "observed=1 exists=0 pid=0 start=0 sha=- ident=no rpc=no cpu=0 blkio=0 io=0 state=activating sub=auto-restart nrestarts=$((n - 1))"
+EOF
+
+# Nobody answered at all. Distinct from no-process by construction.
+mk_observer no-evidence <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+
+# Right bytes, right identity, answering — but the WRONG bytes. Qualification
+# is still exact; nothing here loosened it.
+mk_observer wrong-bytes <<'EOF'
+#!/bin/sh
+echo "observed=1 exists=1 pid=9 start=5 sha=deadbeef ident=yes rpc=ok cpu=7 blkio=7 io=7"
+EOF
+
+# Right bytes and answering, but the deploy identity is not in its environment.
+mk_observer no-identity <<EOF
+#!/bin/sh
+echo "observed=1 exists=1 pid=9 start=5 sha=$WANT_SHA ident=no rpc=ok cpu=7 blkio=7 io=7"
+EOF
+
+# Every scenario below waits on a real clock, because the thing under test IS
+# a clock policy. Run sequentially they add up to most of the gate's runtime,
+# and they are completely independent of each other — separate observer,
+# separate counter, separate shell. So they are started together and judged
+# afterwards; the wall time becomes the longest one rather than their sum.
+#
+# A bare `wait` is WRONG here and was a real bug for one revision: it also
+# waits on the long-lived fixture daemons started with `&` further down, which
+# never exit, so the harness hung instead of finishing. Every spawn records
+# its pid and the collection phase waits on exactly those.
+AWAIT_N=0
+AWAIT_PIDS=""
+
+# spawn_await <tag> <want-verdict> <want-rc> <observer> <window> <silence>
+#             <crash-n> <unknown-n> [poll]
+spawn_await() {
+    local tag="$1"
+    printf '%s\n' "$2 $3 $4" > "$SANDBOX/$tag.want"
+    rm -f "$SANDBOX/$tag.counter"
+    (
+        rc=0
+        out="$(COUNTER="$SANDBOX/$tag.counter" \
+            SHIP_AWAIT_WINDOW="$5" SHIP_AWAIT_SILENCE="$6" \
+            SHIP_AWAIT_CRASH_SAMPLES="$7" SHIP_AWAIT_UNKNOWN_SAMPLES="$8" \
+            SHIP_AWAIT_POLL="${9:-1}" SHIP_AWAIT_RPC_BUDGETS="1 1 1" \
+            bash -c '. "$1"; ship_await fixture "$2" "$3"' _ \
+                "$ROOT/tools/scripts/ship_progress_lib.sh" \
+                "$SANDBOX/$4" "$WANT_SHA" 2>&1)" || rc=$?
+        printf '%s\n' "$rc" > "$SANDBOX/$tag.rc"
+        printf '%s\n' "$out" > "$SANDBOX/$tag.out"
+    ) &
+    AWAIT_PIDS="$AWAIT_PIDS $!"
+    AWAIT_N=$((AWAIT_N + 1))
+}
+
+# wait_await_pids — waits on the recorded scenario pids only, never bare.
+wait_await_pids() {
+    local p
+    for p in $AWAIT_PIDS; do wait "$p" 2>/dev/null || true; done
+    AWAIT_PIDS=""
+}
+
+judge_await() {
+    local tag="$1" want_v want_rc obs rc out
+    read -r want_v want_rc obs < "$SANDBOX/$tag.want"
+    rc="$(cat "$SANDBOX/$tag.rc" 2>/dev/null || echo missing)"
+    out="$(cat "$SANDBOX/$tag.out" 2>/dev/null || true)"
+    # NEVER judge through a pipe, and never grep a captured transcript for a
+    # decision: str_contains is a case pattern and cannot invert under pipefail.
+    if [ "$rc" = "$want_rc" ] && str_contains "$out" ": $want_v after"; then
+        pass "$obs -> $want_v (exit $rc)"
+    else
+        fail "$obs wanted $want_v/exit $want_rc, got exit $rc: $out"
+    fi
+    # Evidence must accompany EVERY verdict, not only the destructive ones.
+    if str_lacks "$out" "last observation:"; then
+        fail "$obs printed a verdict with no observation to justify it"
+    fi
+}
+
+# str_contains / str_lacks: `printf | grep -q` under pipefail returns 141 on a
+# match once the payload outgrows the pipe buffer, which inverts the decision.
+# shellcheck source=tools/scripts/sh_str.sh
+. "$ROOT/tools/scripts/sh_str.sh"
+
+printf '\nship-selftest: 5. the loop, end to end, through the observer seam\n'
+#          tag    verdict     rc  observer        window silence crash unknown poll
+spawn_await s1    QUALIFIED   0   fast-healthy       30     10      3     5     1
+spawn_await s2    QUALIFIED   0   late-answer        30     10      3     5     1
+# ── BAR 1 ── a slow-but-progressing box must NEVER be rolled back. The window
+# expires while blkio climbs; the verdict is SLOW and the exit code is 3,
+# which no destructive branch in ship.sh reads. Six seconds rather than three
+# because the property under test is "still advancing when the window
+# expires", which needs TWO observations to have landed: on a loaded host a
+# first poll can stall for seconds, and a window sized to the bare minimum
+# would measure the host's scheduler instead of the classifier.
+spawn_await s3    SLOW        3   blocked-on-disk     6     60      3     5     1
+spawn_await s4    SLOW        3   io-only-kernel      6     60      3     5     1
+# ── BAR 2 ── a genuinely wedged box must STILL be rolled back. Same observer
+# shape, nothing moving: WEDGED, exit 1.
+spawn_await s5    WEDGED      1   wedged             60      3      3     5     1
+# A crash loop and a vanished process are both faults, and both are named.
+spawn_await s6    CRASHED     1   restart-loop       60     60      3     5     1
+spawn_await s7    CRASHED     1   no-process         60     60      3     5     1
+# ── BAR 5 ── evidence unavailable must NOT default to rolling back.
+spawn_await s8    UNKNOWN     4   no-evidence        60     60      3     3     1
+# Window expired with nothing observed either way: refuse to guess, and still
+# do not roll back.
+spawn_await s9    UNVERIFIED  3   wedged              3    600      3     5     1
+# Qualification stayed exact: wrong bytes or a missing identity never pass.
+spawn_await s10   UNVERIFIED  3   wrong-bytes         3    600      3     5     1
+spawn_await s11   UNVERIFIED  3   no-identity         3    600      3     5     1
+# ── BAR 6 ── a candidate that is RESTARTING is not a candidate that CRASHED.
+# Three consecutive absent polls while systemd says `activating` (the measured
+# node4 sequence) must reach QUALIFIED, not roll a healthy node back.
+spawn_await s12   QUALIFIED   0   managed-restart    60     60      3     5     1
+# ...and every true-crash detection the old absent-pid streak provided is still
+# in place: a unit the manager reports FAILED still convicts on the same
+# streak, and a crash loop too fast to ever show a pid convicts on systemd's
+# restart count.
+spawn_await s13   CRASHED     1   failed-unit        60     60      3     5     1
+spawn_await s14   CRASHED     1   restart-storm      60    600      3     5     1
+wait_await_pids
+for tag in s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14; do judge_await "$tag"; done
+[ "$AWAIT_N" -eq 14 ] || fail "expected 14 loop scenarios, spawned $AWAIT_N"
+# A verdict that cannot show the restart it forgave is a verdict nobody can
+# audit: the summary has to name both the restart count and how many polls
+# were excused, or the next reader is back to guessing "restarting" from
+# "gone". This also proves s12 really went through the PENDING path rather
+# than never observing an absent pid at all.
+s12_out="$(cat "$SANDBOX/s12.out" 2>/dev/null || true)"
+if str_contains "$s12_out" "1 restarts and 3 managed-restart observations"; then
+    pass "the restart count and the excused polls are both reported"
+else
+    fail "the verdict did not report the restarts it forgave: $s12_out"
+fi
+if str_contains "$s12_out" "state=active sub=running nrestarts=1"; then
+    pass "the unit state travels on the observation line"
+else
+    fail "the observation line lost the unit state: $s12_out"
+fi
+
+# ── 6. the two-machine loop, with no second machine ─────────────────────────
+# This is the leg that had a hard-coded 300 and no override: ship.sh polling a
+# remote box over ssh. The fixture below stands in for ssh at the
+# ZCL_SHIP_REMOTE_EXEC seam and either EXECUTES the observer program it was
+# handed (full chain, real /proc, real classifier) or refuses to answer.
+printf '\nship-selftest: 6. the local polling loop, no remote host\n'
+
+mkdir -p "$SANDBOX/mockbin"
+cat > "$SANDBOX/mockbin/systemctl" <<'EOF'
+#!/bin/sh
+# Mock user manager: MainPID comes from a file the fixture controls, and the
+# unit's ActiveState/SubState/NRestarts from another one when the scenario
+# supplies it. The state query is recognised by the property name in argv
+# rather than by position, exactly as the observer asks it, so a scenario that
+# supplies no state file gets a plainly running unit and the pid file remains
+# the only thing it has to control.
+for _arg in "$@"; do
+    [ "$_arg" = ActiveState ] || continue
+    if [ -r "${ZCL_SHIP_TEST_STATEFILE:-}" ]; then
+        cat "$ZCL_SHIP_TEST_STATEFILE"
+    else
+        printf 'ActiveState=active\nSubState=running\nNRestarts=0\n'
+    fi
+    exit 0
+done
+cat "$ZCL_SHIP_TEST_PIDFILE" 2>/dev/null || exit 1
+EOF
+chmod +x "$SANDBOX/mockbin/systemctl"
+
+# A fixture "daemon". It has to be a COMPILED binary, not a shell script: the
+# observer hashes the running binary and re-invokes it as `<exe> status`. On
+# Linux that exe is /proc/<pid>/exe and on darwin it is the path `ps` reports,
+# but a script fixture breaks both the same way — the identity the kernel
+# exposes is the interpreter's, so the hash would be /bin/sh's and the status
+# probe would run `sh status`. A script fixture would prove nothing about the
+# path being tested on either host.
+#
+# `status` succeeds only when ZCL_SHIP_TEST_STATUS_OK is in the PROBE's
+# environment, so one binary plays both a healthy node and a node whose RPC
+# front door has not opened yet. ZCL_SHIP_TEST_BUSY, read once at startup,
+# decides whether it burns CPU — that is the difference between a box working
+# through a cold datadir and a box that is wedged.
+#
+# The busy loop is sized against the SAMPLER, not against politeness: cputime
+# is read at whole centiseconds, and a duty cycle under one centisecond per
+# poll is indistinguishable from a still process. Two million adds per cycle
+# measures ~10 centiseconds of CPU per 1s poll on the reference Mac — ten
+# times the resolution — while the quiet loop holds 0:00.00 for as long as it
+# runs, so the delta really is the classification signal and not rounding
+# luck. Measured, not assumed: it is re-pinned by every run of this selftest.
+cat > "$SANDBOX/node.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+/* An EMPTY environment variable is still a SET one: getenv returns a non-NULL
+ * pointer to "". Testing the pointer alone made `FOO= ./node status` succeed,
+ * so the fixture answered RPC in every scenario and three slow/wedged cases
+ * silently qualified instead of testing what they were written for. */
+static int flag(const char *name)
+{
+    const char *v = getenv(name);
+    return v != NULL && *v != '\0';
+}
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "status") == 0)
+        return flag("ZCL_SHIP_TEST_STATUS_OK") ? 0 : 1;
+    if (flag("ZCL_SHIP_TEST_BUSY")) {
+        volatile unsigned long sink = 0;
+        for (;;) {
+            int i;
+            for (i = 0; i < 2000000; ++i) sink += (unsigned long)i;
+            usleep(6000);
+        }
+    }
+    for (;;) pause();
+}
+EOF
+if ! cc -O0 "$SANDBOX/node.c" -o "$SANDBOX/node" 2>"$SANDBOX/cc.err"; then
+    fail "could not build the fixture daemon: $(cat "$SANDBOX/cc.err")"
+fi
+
+# The ssh stand-in. $1 is the mode ship_remote_sh/ship_remote_script passes.
+cat > "$SANDBOX/fake-ssh" <<'EOF'
+#!/bin/bash
+mode="$1"; shift
+case "${FIXTURE_TRANSPORT:-up}" in
+    down) exit 255 ;;          # ssh could not connect at all
+    empty) exit 0 ;;           # connected, said nothing — also not evidence
+esac
+if [ "$mode" = sh ]; then
+    # Run the exact program text ssh would have run, on this box, with the
+    # mocked systemctl in front. This is the whole chain under test.
+    PATH="$FIXTURE_MOCKBIN:$PATH" \
+    ZCL_SHIP_TEST_PIDFILE="$FIXTURE_PIDFILE" \
+    ZCL_SHIP_TEST_STATEFILE="${FIXTURE_STATEFILE:-}" \
+    ZCL_SHIP_TEST_STATUS_OK="${FIXTURE_STATUS_OK:-}" \
+        sh -c "$1"
+    exit $?
+fi
+exit 0
+EOF
+chmod +x "$SANDBOX/fake-ssh"
+
+# Each scenario gets its OWN fixture daemon and its own MainPID file, so they
+# are independent and can be observed at the same time. `busy` decides whether
+# the daemon burns CPU — the difference between a box working through a cold
+# datadir and a wedged one. `identified` starts it carrying the deploy
+# identity in its real environment, which is the only way to prove the
+# identity leg end to end: on Linux it is read out of /proc/<pid>/environ, on
+# darwin out of `ps -E`, and until now the selftest only ever passed an empty
+# want_src, so the identity check was trivially yes in every scenario here.
+# start_fixture_daemon <tag> [busy] [identified]
+start_fixture_daemon() {
+    if [ "${3:-}" = identified ]; then
+        ZCL_SHIP_TEST_BUSY="${2:-}" \
+        ZCL_AGENT_EXPECT_SOURCE_ID="$SELFTEST_SOURCE_ID" \
+        ZCL_AGENT_EXPECT_BUILD_COMMIT="$SELFTEST_COMMIT" \
+        ZCL_AGENT_EXPECT_BUILD_SOURCE=ship \
+            "$SANDBOX/node" >/dev/null 2>&1 &
+    else
+        ZCL_SHIP_TEST_BUSY="${2:-}" "$SANDBOX/node" >/dev/null 2>&1 &
+    fi
+    echo "$!" >> "$SANDBOX/fixture.pids"
+    printf '%s\n' "$!" > "$SANDBOX/mainpid.$1"
+}
+
+# spawn_remote_await <tag> <want-verdict> <want-rc> <transport> <window>
+#                    <silence> <crash-n> <unknown-n> <want-sha> [status-ok]
+#                    [want-src] [want-commit]
+#
+# Empty want-src (the default) means "this leg has no identity to check", so
+# ident comes back yes without being tested. The `identified` scenario passes
+# both and demands a REAL match from a REAL environment.
+spawn_remote_await() {
+    local tag="$1"
+    printf '%s\n' "$2 $3 $4" > "$SANDBOX/r.$tag.want"
+    (
+        rc=0
+        out="$(FIXTURE_TRANSPORT="$4" \
+            FIXTURE_MOCKBIN="$SANDBOX/mockbin" \
+            FIXTURE_PIDFILE="$SANDBOX/mainpid.$tag" \
+            FIXTURE_STATEFILE="$SANDBOX/state.$tag" \
+            FIXTURE_STATUS_OK="${10:-}" \
+            ZCL_SHIP_REMOTE_EXEC="$SANDBOX/fake-ssh" \
+            SHIP_LIB_TEXT="$SHIP_LIB_TEXT" \
+            SHIP_OBS_UNIT=zclassic23 SHIP_OBS_SHA="$9" \
+            SHIP_OBS_SRC="${11:-}" SHIP_OBS_COMMIT="${12:-}" \
+            SHIP_SSH_OPTS= SHIP_REMOTE_HOST=fixture-host \
+            SHIP_AWAIT_WINDOW="$5" SHIP_AWAIT_SILENCE="$6" \
+            SHIP_AWAIT_CRASH_SAMPLES="$7" SHIP_AWAIT_UNKNOWN_SAMPLES="$8" \
+            SHIP_AWAIT_POLL=1 SHIP_AWAIT_RPC_BUDGETS="1 2 3" \
+            bash -c '. "$1"; ship_await fixture-host ship_remote_observe "$2"' _ \
+                "$ROOT/tools/scripts/ship_progress_lib.sh" "$9" 2>&1)" || rc=$?
+        printf '%s\n' "$rc" > "$SANDBOX/r.$tag.rc"
+        printf '%s\n' "$out" > "$SANDBOX/r.$tag.out"
+    ) &
+    AWAIT_PIDS="$AWAIT_PIDS $!"
+}
+
+judge_remote_await() {
+    local tag="$1" want_v want_rc transport rc out
+    read -r want_v want_rc transport < "$SANDBOX/r.$tag.want"
+    rc="$(cat "$SANDBOX/r.$tag.rc" 2>/dev/null || echo missing)"
+    out="$(cat "$SANDBOX/r.$tag.out" 2>/dev/null || true)"
+    if [ "$rc" = "$want_rc" ] && str_contains "$out" ": $want_v after"; then
+        pass "remote leg / $tag (transport=$transport) -> $want_v (exit $rc)"
+    else
+        fail "remote leg / $tag (transport=$transport) wanted $want_v/exit $want_rc, got exit $rc: $out"
+    fi
+}
+
+FIXTURE_SHA="$(ship_sha256_stream < "$SANDBOX/node")"
+: > "$SANDBOX/fixture.pids"
+start_fixture_daemon healthy
+start_fixture_daemon slow busy
+start_fixture_daemon quiet
+start_fixture_daemon frozen
+start_fixture_daemon stamped '' identified
+start_fixture_daemon unstamp '' identified
+start_fixture_daemon pinned
+# The far side's service names a MainPID that no longer exists.
+printf '999999\n' > "$SANDBOX/mainpid.gone"
+# The far side is between incarnations: no MainPID at all, and its manager
+# says so — `activating`, in auto-restart backoff. This is the node4 shape,
+# over the wire, through the real observer program.
+printf '0\n' > "$SANDBOX/mainpid.restarting"
+printf 'ActiveState=activating\nSubState=auto-restart\nNRestarts=1\n' \
+    > "$SANDBOX/state.restarting"
+# The same absent pid under a manager that has given up. NRestarts is already
+# 4 when the window opens, which must NOT convict: the candidate is on trial
+# for what happens from the first observation on, not for the unit's history.
+printf '999999\n' > "$SANDBOX/mainpid.failed"
+printf 'ActiveState=failed\nSubState=failed\nNRestarts=4\n' \
+    > "$SANDBOX/state.failed"
+# The transport-failure cases never reach a daemon at all.
+printf '1\n' > "$SANDBOX/mainpid.down"
+printf '1\n' > "$SANDBOX/mainpid.empty"
+
+# The observer program really does travel over the seam and really is executed
+# on the far side, against a real process, through whatever the host running
+# this selftest exposes — /proc on Linux, ps on darwin: a live fixture daemon
+# whose exact bytes match and which answers `status` QUALIFIES.
+#            tag     verdict     rc transport window silence crash unknown sha            status-ok
+spawn_remote_await healthy QUALIFIED  0  up        30     20      3     5   "$FIXTURE_SHA" 1
+# ── BAR 5, over the wire ── ssh cannot connect. The old code read that as
+# "did not come back healthy" and ROLLED BACK. It is UNKNOWN, and UNKNOWN is
+# not a failed deploy. Connected-but-silent is not evidence either.
+spawn_remote_await down    UNKNOWN    4  down      60     60      3     3   "$FIXTURE_SHA"
+spawn_remote_await empty   UNKNOWN    4  empty     60     60      3     3   "$FIXTURE_SHA"
+# ── BAR 1, over the wire, against a REAL process ── the far side is up, has
+# the right bytes, is burning CPU, and its `status` never answers: a node
+# working through a cold datadir with its RPC front door still shut. The old
+# local loop timed out on exactly this and rolled the fleet back. It is SLOW.
+# Eight seconds so a loaded host still lands the two observations the verdict
+# needs — same reasoning as s3/s4 on the local leg.
+spawn_remote_await slow    SLOW       3  up         8    600      3     5   "$FIXTURE_SHA"
+# The same box with nothing moving at all, judged before silence is
+# established: the window produces UNVERIFIED, which is still not a rollback.
+spawn_remote_await quiet   UNVERIFIED 3  up         4    600      3     5   "$FIXTURE_SHA"
+# ── BAR 2, over the wire ── nothing moving for the whole silence limit on a
+# process that demonstrably exists. That is a wedge and it MUST roll back.
+spawn_remote_await frozen  WEDGED     1  up       600      4      3     5   "$FIXTURE_SHA"
+# The far side LOOKED and found no process, under a manager that is not
+# restarting anything. A fault, reachable over the seam.
+spawn_remote_await gone    CRASHED    1  up        60    600      3     5   "$FIXTURE_SHA"
+# ── BAR 6, over the wire ── the measured node4 regression. Every poll finds no
+# MainPID and every poll is told the unit is `activating`. The old code called
+# that CRASHED in three polls and rolled back a node that was booting; the
+# window must expire on a non-destructive word instead. Four seconds, because
+# the property is "the absent-pid streak never convicts", and it is the streak
+# limit of 3 that would have.
+spawn_remote_await restarting UNVERIFIED 3 up       4    600      3     5   "$FIXTURE_SHA"
+# ...and the manager saying `failed` about the same absent pid still convicts,
+# with a lifetime restart count already past the bound that must not decide it.
+spawn_remote_await failed  CRASHED    1  up        60    600      3     5   "$FIXTURE_SHA"
+# The identity leg, end to end: the `stamped` daemon was STARTED carrying
+# ZCL_AGENT_EXPECT_* in its real environment, and this leg demands exactly
+# those values. Linux reads them out of /proc/<pid>/environ, darwin out of
+# `ps -E`. A WRONG value has to read as no identity — which is what `unstamp`
+# is: the same src with a commit the fixture never saw, so qualification must
+# stay out of reach and the window must expire UNVERIFIED. Until these two
+# legs existed the selftest only ever passed an empty want_src, so ident=yes
+# proved nothing here.
+spawn_remote_await stamped QUALIFIED  0  up        30     20      3     5   "$FIXTURE_SHA" 1 \
+    "$SELFTEST_SOURCE_ID" "$SELFTEST_COMMIT"
+spawn_remote_await unstamp UNVERIFIED 3  up         4    600      3     5   "$FIXTURE_SHA" 1 \
+    "$SELFTEST_SOURCE_ID" "a-commit-the-fixture-never-saw"
+# The shadowed-drop-in shape, over the wire: a perfectly healthy box that is
+# running bytes OTHER than the ones this ship installed. No amount of waiting
+# fixes it, and the observer cannot tell it apart from a slow box on its own —
+# every poll simply reports sha != want until the window closes. Section 6c
+# turns this scenario's own last observation into the words the report says.
+spawn_remote_await pinned  UNVERIFIED 3  up         4    600      3     5   "$WANT_SHA" 1
+wait_await_pids
+for tag in healthy down empty slow quiet frozen gone restarting failed stamped unstamp pinned; do
+    judge_remote_await "$tag"
+done
+
+# ── 6b. the effective-ExecStart guard ───────────────────────────────────────
+# A drop-in says what the ship WANTS the unit to run. systemd merges the unit
+# file with every drop-in in file-NAME order, last one wins, so a file named
+# after the ship's own silently outranks it — which is what happened to a
+# fleet box on 2026-09-11 (zzzzzz-node-first.conf beside
+# zzzzz-z23-ship-release.conf, pinning an old release). The functions below
+# are pure text in / text out precisely so this proves them with no systemd.
+printf '\nship-selftest: 6b. the effective-ExecStart guard\n'
+
+SHIP_DROPIN=/h/systemd/user/zclassic23.service.d/zzzzz-z23-ship-release.conf
+SHADOW_DROPIN=/h/systemd/user/zclassic23.service.d/zzzzzz-node-first.conf
+EARLIER_DROPIN=/h/systemd/user/zclassic23.service.d/90-build-identity.conf
+
+check_exec_path() {
+    local want="$1" text="$2" got
+    got="$(ship_exec_path_from_show_text "$text")"
+    if [ "$got" = "$want" ]; then
+        pass "effective ExecStart path [$want]"
+    else
+        fail "effective ExecStart wanted [$want] got [$got] <- $text"
+    fi
+}
+# One surviving record: the ordinary case, and the one a reset leaves.
+check_exec_path /rel/new/z23 \
+    '{ path=/rel/new/z23 ; argv[]=/rel/new/z23 -datadir=/d ; ignore_errors=no }'
+# Two records survive when nothing reset ExecStart=; systemd runs them in
+# order, so the LAST is the one this ship's drop-in meant to be.
+check_exec_path /rel/new/z23 \
+    '{ path=/rel/old/z23 ; argv[]=/rel/old/z23 ; ignore_errors=no }
+{ path=/rel/new/z23 ; argv[]=/rel/new/z23 ; ignore_errors=no }'
+# No executable at all is not "match by accident".
+check_exec_path '' ''
+
+# Ordering is by file NAME across every drop-in directory.
+after="$(ship_dropins_after_from_text "$SHIP_DROPIN" \
+    "$EARLIER_DROPIN $SHIP_DROPIN $SHADOW_DROPIN")"
+if [ "$after" = "$SHADOW_DROPIN" ]; then
+    pass "only the later-sorting drop-in is named as a shadow"
+else
+    fail "shadow list wanted [$SHADOW_DROPIN] got [$after]"
+fi
+if [ -z "$(ship_dropins_after_from_text "$SHIP_DROPIN" "$EARLIER_DROPIN $SHIP_DROPIN")" ]; then
+    pass "a drop-in that sorts before the ship's own is not a shadow"
+else
+    fail "an earlier-sorting drop-in was reported as a shadow"
+fi
+
+# The guard itself: silent on agreement, refusing and NAMING on disagreement.
+if guard_ok="$(ship_exec_guard_check /rel/new/z23 /rel/new/z23 "$SHIP_DROPIN" \
+        "$EARLIER_DROPIN $SHIP_DROPIN")" && [ -z "$guard_ok" ]; then
+    pass "the guard passes silently when the unit will run the release just written"
+else
+    fail "the guard refused a unit that will run the release just written: $guard_ok"
+fi
+guard_out="$(ship_exec_guard_check /rel/new/z23 /rel/old/z23 "$SHIP_DROPIN" \
+    "$EARLIER_DROPIN $SHIP_DROPIN $SHADOW_DROPIN")" && guard_rc=0 || guard_rc=$?
+if [ "$guard_rc" -ne 0 ]; then
+    pass "a shadowed ExecStart is a refusal, not a slow box"
+else
+    fail "a shadowed ExecStart was accepted"
+fi
+for want in 'REFUSE: the unit will not run the release this ship installed' \
+            /rel/new/z23 /rel/old/z23 "$SHADOW_DROPIN" 'Nothing was restarted'; do
+    if str_contains "$guard_out" "$want"; then
+        pass "the refusal names $want"
+    else
+        fail "the refusal does not name $want: $guard_out"
+    fi
+done
+if str_contains "$guard_out" "$EARLIER_DROPIN"; then
+    fail "the refusal blames a drop-in that cannot override the ship's own"
+else
+    pass "the refusal blames only the drop-ins that sort after the ship's own"
+fi
+# Naming is the whole fix: a tool that deleted somebody else's pin would be a
+# worse incident than the one it prevents.
+if str_contains "$SHIP_LIB_TEXT" 'rm -f "$_ship_guard' ||
+   str_contains "$SHIP_LIB_TEXT" 'mv "$_ship_guard'; then
+    fail "the guard removes or renames another drop-in"
+else
+    pass "the guard never removes or renames another drop-in"
+fi
+
+# Both activation paths must actually ask. The remote leg is the heredoc in
+# ship.sh; the local leg is the Makefile deploy recipe.
+for site in "$ROOT/tools/ship.sh" "$ROOT/Makefile"; do
+    if grep -q 'ship_exec_guard_check' "$site"; then
+        pass "${site##*/} checks the effective ExecStart before restarting"
+    else
+        fail "${site##*/} restarts without checking the effective ExecStart"
+    fi
+done
+
+# ── 6c. naming an unverified candidate ──────────────────────────────────────
+# rc 3 means the window closed with NO fault proven. The rollout used to
+# flatten that into 1, whose only caller-side word is "remote activation
+# failed" — so a box that had the candidate installed and running ended the
+# run with a sentence that was wrong about the deploy AND about the box. The
+# input here is not hand-written: it is the `pinned` scenario's own last
+# observation, produced by the real observer over the real seam.
+printf '\nship-selftest: 6c. naming an unverified candidate\n'
+
+pinned_line="$(sed -n 's/^fixture-host: last observation: //p' \
+    "$SANDBOX/r.pinned.out" | tail -1)"
+if [ -n "$pinned_line" ]; then
+    pass "the pinned scenario produced a real observation line"
+else
+    fail "no observation line to name: $(cat "$SANDBOX/r.pinned.out" 2>/dev/null)"
+fi
+pinned_reason="$(ship_unverified_reason "$pinned_line" "$WANT_SHA")"
+if [ "$pinned_reason" = "last observation sha $(printf '%.8s' "$FIXTURE_SHA"), wanted aaaaaaaa" ]; then
+    pass "the reason names the bytes actually running: $pinned_reason"
+else
+    fail "the reason drifted: [$pinned_reason]"
+fi
+pinned_note="$(ship_unverified_binary_note "$pinned_line" "$WANT_SHA")"
+if [ "$pinned_note" = "the unit restarted on a different binary ($(printf '%.8s' "$FIXTURE_SHA") != aaaaaaaa) — check the unit drop-ins" ]; then
+    pass "a different binary is said in as many words"
+else
+    fail "the different-binary note drifted: [$pinned_note]"
+fi
+# The healthy leg qualified, so the same helper must stay silent about it: a
+# note that fired on every unverified ending would be noise, not evidence.
+healthy_line="$(sed -n 's/^fixture-host: last observation: //p' \
+    "$SANDBOX/r.healthy.out" | tail -1)"
+if [ -z "$(ship_unverified_binary_note "$healthy_line" "$FIXTURE_SHA")" ]; then
+    pass "no different-binary note when the running bytes are the wanted bytes"
+else
+    fail "the different-binary note fired on matching bytes"
+fi
+# The other three reasons, each the one fact qualification was still missing.
+check_reason() {
+    local want="$1" line="$2" got
+    got="$(ship_unverified_reason "$line" "$WANT_SHA")"
+    if [ "$got" = "$want" ]; then
+        pass "reason [$want]"
+    else
+        fail "reason wanted [$want] got [$got]"
+    fi
+}
+check_reason 'no evidence: the host produced no observation' \
+    "$(ship_no_evidence_line)"
+check_reason 'last observation ident=no: the running process does not carry this deploy identity' \
+    "observed=1 exists=1 sha=$WANT_SHA ident=no rpc=ok"
+check_reason 'last observation rpc=timeout: the process has not answered status yet' \
+    "observed=1 exists=1 sha=$WANT_SHA ident=yes rpc=timeout"
+
+# The two words that prove NO fault must reach the report as themselves.
+if grep -qF 'UNVERIFIED: $SHIP_ROLLOUT_HOST is running the candidate' "$ROOT/tools/ship.sh"; then
+    pass "the fleet report names an installed-but-unqualified candidate as UNVERIFIED"
+else
+    fail "the fleet report still has no word for an installed-but-unqualified candidate"
+fi
+rollout_arm="$(grep -A4 'case "$rollout_rc" in' "$ROOT/tools/ship.sh" |
+    grep '3|4)' || true)"
+if [ -n "$rollout_arm" ]; then
+    pass "rc 3 and rc 4 have their own arm in the rollout report"
+else
+    fail "rc 3 and rc 4 still fall through to the failure arm"
+fi
+
+# ── 7. the shipped script text ──────────────────────────────────────────────
+# ship.sh's two remote scripts are extracted the same way
+# tools/lint/check_ship_remote_transaction.sh extracts them, and must still
+# parse once the library is prepended — that concatenation IS the wire format.
+printf '\nship-selftest: 7. the wire format\n'
+awk '
+    /<<'\''REMOTE_SCRIPT'\''$/ { copying=1; next }
+    copying && /^REMOTE_SCRIPT$/ { exit }
+    copying { print }
+' "$ROOT/tools/ship.sh" > "$SANDBOX/activate.sh"
+awk '
+    /<<'\''ROLLBACK_SCRIPT'\''/ { copying=1; next }
+    copying && /^ROLLBACK_SCRIPT$/ { exit }
+    copying { print }
+' "$ROOT/tools/ship.sh" > "$SANDBOX/rollback.sh"
+for f in activate rollback; do
+    if [ ! -s "$SANDBOX/$f.sh" ]; then
+        fail "$f heredoc did not extract — the gate that runs it is now vacuous"
+        continue
+    fi
+    cat "$ROOT/tools/scripts/ship_progress_lib.sh" "$SANDBOX/$f.sh" > "$SANDBOX/$f.full.sh"
+    if bash -n "$SANDBOX/$f.full.sh" 2>"$SANDBOX/$f.err"; then
+        pass "$f heredoc parses with the library prepended"
+    else
+        fail "$f heredoc does not parse over the wire: $(cat "$SANDBOX/$f.err")"
+    fi
+done
+# Staging crosses three separate SSH sessions. Parse every shipped program so
+# a quoting edit cannot make the fleet barrier fail only on real hosts.
+for marker in PREPARE FINALIZE DISCARD; do
+    awk -v begin="REMOTE_STAGE_$marker" '
+        index($0, "<<\047" begin "\047") { copying=1; next }
+        copying && $0 == begin { exit }
+        copying { print }
+    ' "$ROOT/tools/ship.sh" > "$SANDBOX/stage-$marker.sh"
+    if [ ! -s "$SANDBOX/stage-$marker.sh" ]; then
+        fail "stage $marker heredoc did not extract"
+    elif sh -n "$SANDBOX/stage-$marker.sh" 2>"$SANDBOX/stage-$marker.err"; then
+        pass "stage $marker heredoc parses under POSIX sh"
+    else
+        fail "stage $marker heredoc does not parse: $(cat "$SANDBOX/stage-$marker.err")"
+    fi
+done
+# The observer program is exactly the library plus one call, and it must run
+# on a plain /bin/sh — the target box's shell is not ours to choose.
+PROG="$(ship_observer_program "$SHIP_LIB_TEXT" zclassic23 abc '' '' 5)"
+printf '%s' "$PROG" > "$SANDBOX/observer.sh"
+if sh -n "$SANDBOX/observer.sh"; then
+    pass "observer program parses under POSIX sh"
+else
+    fail "observer program is not POSIX sh"
+fi
+if sh -n "$ROOT/tools/scripts/ship_progress_lib.sh"; then
+    pass "library parses under POSIX sh"
+else
+    fail "library is not POSIX sh — the remote leg cannot run it"
+fi
+# Host-neutrality must not be a replacement: every procfs read the Linux leg
+# depends on is still required to be in the library, asserted by construction
+# because a Mac cannot notice their absence — on this host the darwin branch
+# answers every scenario and the Linux reader could rot invisibly.
+lib_text="$(cat "$ROOT/tools/scripts/ship_progress_lib.sh")"
+for procsrc in stat io exe environ; do
+    if str_contains "$lib_text" "/proc/\$_ship_pid/$procsrc"; then
+        pass "linux reader still reads /proc/\\\$_ship_pid/$procsrc"
+    else
+        fail "linux reader lost /proc/\\\$_ship_pid/$procsrc — host-neutrality ate the original"
+    fi
+done
+# The unit-state evidence is the whole difference between "restarting" and
+# "gone", and no scenario here could notice its removal: the mocked manager
+# answers whatever the library asks it, so a library that stopped asking would
+# simply see no state and go back to convicting a restart. Named by
+# construction, the same way the procfs reads above are.
+for want in 'ship_state_is_pending' 'ship_unit_state_fields' '-p ActiveState'; do
+    if str_contains "$lib_text" "$want"; then
+        pass "the observer still asks the unit manager: $want"
+    else
+        fail "the observer lost $want — a managed restart reads as a crash again"
+    fi
+done
+# ...and the darwin branch must exist and be reachable, not merely compile.
+if str_contains "$lib_text" "ship_observe_darwin" && str_contains "$lib_text" "kill -0"; then
+    pass "darwin reader is present and dispatches on the kernel"
+else
+    fail "darwin reader missing — this host's remote legs prove nothing again"
+fi
+# No duration may decide a health verdict in ship.sh any more. All four sites
+# were `deadline=$(( $(date +%s) + N ))` followed by a `while ... -lt
+# "$deadline"` poll whose expiry meant ROLL BACK; the shape is named here by
+# construction so a fifth one cannot be added quietly. Counting is done with
+# grep -c into a variable, never with a status-carrying pipeline.
+SHIP_TEXT="$(cat "$ROOT/tools/ship.sh")"
+deadline_sites="$(grep -c 'deadline=\$(( \$(date +%s)' "$ROOT/tools/ship.sh" || true)"
+if [ "$deadline_sites" = 0 ]; then
+    pass "no health verdict in ship.sh is decided by a countdown"
+else
+    fail "ship.sh has $deadline_sites countdown-deadline health loops left"
+fi
+# ...and every one of the four subjects is judged by ship_await instead. Two
+# on the remote leg (candidate, restore-inside-the-transaction), one on the
+# local leg, one in the fallback rollback script.
+await_sites="$(grep -c 'ship_await ' "$ROOT/tools/ship.sh" || true)"
+if [ "$await_sites" -ge 4 ]; then
+    pass "all four health sites go through ship_await ($await_sites call sites)"
+else
+    fail "only $await_sites ship_await call sites in ship.sh, expected at least 4"
+fi
+# The old `|| true` that turned an ssh failure into "not healthy" — and
+# therefore into a fleet-wide rollback — must not come back. There is exactly
+# one place allowed to decide what an unanswered host means, and it is
+# ship_remote_observe in the library.
+if str_contains "$SHIP_TEXT" 'remote did not come back healthy'; then
+    fail "ship.sh still collapses an unanswered host into a failed deploy"
+else
+    pass "an unanswered host is no longer a failed deploy"
+fi
+if str_contains "$SHIP_TEXT" 'hotswap_module=|HOTSWAP MODULE' &&
+   str_contains "$SHIP_TEXT" 'linked candidate remains unproven'; then
+    pass "shipping rejects a hot-swap-stamped suite transcript"
+else
+    fail "shipping can mistake a hot-swap module run for linked-binary proof"
+fi
+
+printf '\n'
+if [ "$FAILS" -eq 0 ]; then
+    echo "ship-selftest: PASS (slow never rolls back; wedged and crashed still do; unknown is neither)"
+    exit 0
+fi
+echo "ship-selftest: FAIL ($FAILS checks)" >&2
+exit 1

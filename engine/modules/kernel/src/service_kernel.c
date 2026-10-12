@@ -1,0 +1,276 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0 */
+
+#include "kernel/service_kernel.h"
+#include "base/log_macros.h"
+#include "platform/time_compat.h"
+#include <stdio.h>
+#include <string.h>
+
+static bool service_spec_valid(const struct zcl_service_spec *spec)
+{
+    return spec && spec->name && spec->name[0] && spec->start && spec->stop;
+}
+
+static void service_mark_failed(struct zcl_service_entry *entry,
+                                const char *reason)
+{
+    if (!entry)
+        return;
+    entry->state = ZCL_SERVICE_FAILED;
+    entry->failure_reason = reason ? reason : "failed";
+}
+
+static bool service_optional(const struct zcl_service_entry *entry)
+{
+    return entry && (entry->spec.flags & ZCL_SERVICE_OPTIONAL) != 0;
+}
+
+static bool service_independent(const struct zcl_service_entry *entry)
+{
+    return entry && (entry->spec.flags & ZCL_SERVICE_INDEPENDENT) != 0;
+}
+
+static void service_publish_starting(struct zcl_service_kernel *kernel,
+                                     const char *name, int64_t since_us)
+{
+    atomic_store(&kernel->starting_since_us, since_us);
+    atomic_store(&kernel->starting_name, name);
+}
+
+/* Run one start hook, timed and named. Returns what the hook returned. */
+static bool service_start_entry(struct zcl_service_kernel *kernel,
+                                struct zcl_service_entry *entry)
+{
+    int64_t began = platform_time_monotonic_us();
+    service_publish_starting(kernel, entry->spec.name, began);
+    bool ok = entry->spec.start(entry->spec.ctx);
+    entry->start_us = platform_time_monotonic_us() - began;
+    service_publish_starting(kernel, NULL, 0);
+
+    /* stderr on purpose, exactly like the stop half below: it survives a
+     * block-buffered stdout, and this line is the boot-time evidence of
+     * which service spent the time and which one failed. */
+    fprintf(stderr, "[service-kernel] %s service=%s elapsed_ms=%lld\n",
+            ok ? "started" : "START FAILED", entry->spec.name,
+            (long long)(entry->start_us / 1000));
+    if (!ok) {
+        service_mark_failed(entry, "start failed");
+        return false;
+    }
+    entry->state = ZCL_SERVICE_STARTED;
+    entry->failure_reason = NULL;
+    return true;
+}
+
+/* Stop everything that started before index `upto`, newest first. */
+static void service_unwind(struct zcl_service_kernel *kernel, size_t upto)
+{
+    for (size_t j = upto; j > 0; j--) {
+        struct zcl_service_entry *started = &kernel->services[j - 1];
+        if (started->state == ZCL_SERVICE_STARTED) {
+            started->spec.stop(started->spec.ctx);
+            started->state = ZCL_SERVICE_STOPPED;
+        }
+    }
+}
+
+void zcl_service_kernel_init(struct zcl_service_kernel *kernel)
+{
+    if (!kernel)
+        return;
+    memset(kernel, 0, sizeof(*kernel));
+}
+
+void zcl_service_kernel_reset(struct zcl_service_kernel *kernel)
+{
+    zcl_service_kernel_init(kernel);
+}
+
+bool zcl_service_kernel_register(struct zcl_service_kernel *kernel,
+                                 const struct zcl_service_spec *spec)
+{
+    if (!kernel || !service_spec_valid(spec))
+        return false;
+    if (kernel->initialized || kernel->started)
+        LOG_RETURN(false, "service-kernel", "registration refused after initialization: service=%s", spec->name);
+    if (kernel->count >= ZCL_SERVICE_KERNEL_MAX_SERVICES)
+        return false;
+    if (zcl_service_kernel_find(kernel, spec->name))
+        return false;
+
+    struct zcl_service_entry *entry = &kernel->services[kernel->count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->spec = *spec;
+    entry->state = ZCL_SERVICE_REGISTERED;
+    return true;
+}
+
+bool zcl_service_kernel_init_all(struct zcl_service_kernel *kernel)
+{
+    if (!kernel)
+        return false;
+    if (kernel->initialized)
+        return true;
+
+    for (size_t i = 0; i < kernel->count; i++) {
+        struct zcl_service_entry *entry = &kernel->services[i];
+        if (entry->spec.init && !entry->spec.init(kernel, entry->spec.ctx)) {
+            service_mark_failed(entry, "init failed");
+            if (!service_optional(entry))
+                return false;
+            continue;
+        }
+        entry->state = ZCL_SERVICE_INITIALIZED;
+        entry->failure_reason = NULL;
+    }
+
+    kernel->initialized = true;
+    return true;
+}
+
+static bool service_required_entries_healthy(const struct zcl_service_kernel *kernel)
+{
+    for (size_t i = 0; i < kernel->count; i++) {
+        const struct zcl_service_entry *entry = &kernel->services[i];
+        if (!service_optional(entry) && entry->state == ZCL_SERVICE_FAILED)
+            return false;
+    }
+    return true;
+}
+
+bool zcl_service_kernel_start_all(struct zcl_service_kernel *kernel)
+{
+    if (!kernel)
+        return false;
+    if (kernel->started)
+        return service_required_entries_healthy(kernel);
+    if (!zcl_service_kernel_init_all(kernel))
+        return false;
+
+    bool degraded = false;
+    for (size_t i = 0; i < kernel->count; i++) {
+        struct zcl_service_entry *entry = &kernel->services[i];
+        if (entry->state == ZCL_SERVICE_FAILED && service_optional(entry))
+            continue;
+        if (service_start_entry(kernel, entry))
+            continue;
+        if (service_optional(entry))
+            continue;
+        if (service_independent(entry)) {
+            /* Named, reported, and NOT allowed to take its siblings with
+             * it. See ZCL_SERVICE_INDEPENDENT in the header for the outage
+             * that made this distinction necessary. */
+            degraded = true;
+            continue;
+        }
+        service_unwind(kernel, i);
+        return false;
+    }
+
+    kernel->started = true;
+    return !degraded;
+}
+
+bool zcl_service_kernel_retry_failed(struct zcl_service_kernel *kernel,
+                                     const char *name)
+{
+    if (!kernel || !kernel->started || !name)
+        return false;
+    for (size_t i = 0; i < kernel->count; i++) {
+        struct zcl_service_entry *entry = &kernel->services[i];
+        if (strcmp(entry->spec.name, name) != 0)
+            continue;
+        if (entry->state != ZCL_SERVICE_FAILED ||
+            !service_independent(entry))
+            return false;
+        return service_start_entry(kernel, entry);
+    }
+    return false;
+}
+
+void zcl_service_kernel_stop_all(struct zcl_service_kernel *kernel)
+{
+    if (!kernel)
+        return;
+
+    for (size_t i = kernel->count; i > 0; i--) {
+        struct zcl_service_entry *entry = &kernel->services[i - 1];
+        if (entry->state == ZCL_SERVICE_STARTED) {
+            /* Stop hooks may join threads or wait on a subsystem lock.  Name
+             * the hook before entering it and after it returns so a shutdown
+             * watchdog report identifies the exact service that held the
+             * stage, rather than only the kernel-wide stage name.  stderr is
+             * intentional: it remains visible when stdout is block-buffered
+             * by a Windows service or redirected sync lane. */
+            fprintf(stderr, "[service-kernel] stopping service=%s\n",
+                    entry->spec.name);
+            entry->spec.stop(entry->spec.ctx);
+            entry->state = ZCL_SERVICE_STOPPED;
+            fprintf(stderr, "[service-kernel] stopped service=%s\n",
+                    entry->spec.name);
+        }
+    }
+
+    kernel->started = false;
+}
+
+size_t zcl_service_kernel_count(const struct zcl_service_kernel *kernel)
+{
+    return kernel ? kernel->count : 0;
+}
+
+const struct zcl_service_entry *zcl_service_kernel_find(
+    const struct zcl_service_kernel *kernel,
+    const char *name)
+{
+    if (!kernel || !name)
+        return NULL;
+    for (size_t i = 0; i < kernel->count; i++) {
+        if (strcmp(kernel->services[i].spec.name, name) == 0)
+            return &kernel->services[i];
+    }
+    return NULL;
+}
+
+bool zcl_service_kernel_status(const struct zcl_service_kernel *kernel,
+                               const char *name,
+                               struct zcl_service_status *out)
+{
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+
+    const struct zcl_service_entry *entry =
+        zcl_service_kernel_find(kernel, name);
+    if (!entry)
+        return false;
+
+    out->state = entry->state;
+    out->reason = entry->failure_reason;
+    if (entry->spec.status)
+        return entry->spec.status(entry->spec.ctx, out);
+    return true;
+}
+
+bool zcl_service_kernel_describe_starting(
+    const struct zcl_service_kernel *kernel, const char *prefix,
+    int64_t now_us, int64_t slow_us, char *out, size_t cap)
+{
+    if (!out || cap == 0)
+        return false;
+    out[0] = '\0';
+    if (!kernel || !prefix)
+        return false;
+
+    const char *name = atomic_load(&kernel->starting_name);
+    int64_t since = atomic_load(&kernel->starting_since_us);
+    if (!name || since == 0)
+        return false;
+    int64_t elapsed = now_us - since;
+    if (elapsed < slow_us)
+        return false;
+
+    snprintf(out, cap, "%s=%s %llds", prefix, name,
+             (long long)(elapsed / 1000000));
+    return true;
+}

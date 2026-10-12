@@ -1,0 +1,152 @@
+/* Copyright 2026 Rhett Creighton. Licensed under Apache-2.0. */
+#include "blue_review_protocol.h"
+#include "zcl_tx_review.h"
+
+#include <string.h>
+
+void blue_review_abort(blue_review_state *state) {
+    if (!state) return;
+    volatile uint8_t *bytes = (volatile uint8_t *)state;
+    for (size_t i = 0; i < sizeof *state; ++i) bytes[i] = 0;
+}
+
+static void put_u32(uint8_t *output, uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i) output[i] = (uint8_t)(value >> (8 * i));
+}
+
+static void put_u64(uint8_t *output, uint64_t value) {
+    for (unsigned i = 0; i < 8; ++i) output[i] = (uint8_t)(value >> (8 * i));
+}
+
+void blue_review_encode_summary(const zcl_tx_review *review,
+                                uint8_t reply[44]) {
+    put_u32(reply, review->transparent_inputs);
+    put_u32(reply + 4, review->transparent_outputs);
+    put_u32(reply + 8, review->sapling_spends);
+    put_u32(reply + 12, review->sapling_outputs);
+    put_u32(reply + 16, review->sprout_joinsplits);
+    put_u64(reply + 20, review->transparent_output_zat);
+    put_u64(reply + 28, (uint64_t)review->value_balance_zat);
+    put_u32(reply + 36, review->lock_time);
+    put_u32(reply + 40, review->expiry_height);
+}
+
+static uint16_t begin_review(blue_review_state *state, const uint8_t *data,
+                             size_t length) {
+    blue_review_abort(state);
+    if (length != 2) return 0x6700;
+    uint16_t expected = (uint16_t)(data[0] | ((uint16_t)data[1] << 8));
+    if (expected < 29 || expected > ZCL_BLUE_REVIEW_MAX_BYTES) return 0x6a80;
+    state->expected = expected;
+    return 0x9000;
+}
+
+static uint16_t append_chunk(blue_review_state *state, const uint8_t *data,
+                              size_t length) {
+    if (state->expected == 0) return 0x6985;
+    if (length == 0 || length > (size_t)(state->expected - state->received))
+        return 0x6a80;
+    memcpy(state->wire + state->received, data, length);
+    state->received = (uint16_t)(state->received + length);
+    return 0x9000;
+}
+
+static uint16_t finish_review(blue_review_state *state, size_t length,
+                              uint8_t *reply, size_t capacity,
+                              size_t *reply_length,
+                              blue_review_digest_fn digest) {
+    if (length != 0) return 0x6700;
+    if (!state->expected || state->received != state->expected) return 0x6985;
+    zcl_tx_review review;
+    int parsed = zcl_tx_review_parse(state->wire, state->received, &review);
+    if (parsed < 0 || !digest) return 0x6a80;
+    if (capacity < 76) return 0x6700;
+    blue_review_encode_summary(&review, reply);
+    bool hashed = digest(state->wire, state->received, reply + 44);
+    state->reviewed_length = hashed ? state->received : 0;
+    state->expected = state->received = 0;
+    if (!hashed) return 0x6a80;
+    *reply_length = 76;
+    return 0x9000;
+}
+
+static uint16_t identify(size_t length, uint8_t *reply, size_t capacity,
+                         size_t *reply_length) {
+    if (length || capacity < 5) return 0x6700;
+    memcpy(reply, "ZCL", 3);
+    reply[3] = 6;
+    reply[4] = 0x40;
+    *reply_length = 5;
+    return 0x9000;
+}
+
+static uint16_t clear_review(blue_review_state *state, size_t length) {
+    if (length) return 0x6700;
+    blue_review_abort(state);
+    return 0x9000;
+}
+
+static uint16_t shielded_digest(blue_review_state *state,
+                                 const uint8_t *data, size_t length,
+                                 uint8_t *reply, size_t capacity,
+                                 size_t *reply_length,
+                                 const zcl_zip243_hasher *hasher) {
+    if (length != 4 || capacity < 32) return 0x6700;
+    if (!state->expected || state->received != state->expected) return 0x6985;
+    uint32_t branch_id = (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+                         ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+    if (zcl_zip243_shielded_digest(state->wire, state->received, branch_id,
+                                    hasher, reply) < 0)
+        return 0x6a80;
+    *reply_length = 32;
+    return 0x9000;
+}
+
+static uint16_t request_status(const uint8_t *apdu, size_t length) {
+    if (length < 5 || length != 5 + (size_t)apdu[4]) return 0x6700;
+    if (apdu[0] != 0xa5) return 0x6e00;
+    if (apdu[2] != 0 || apdu[3] != 0) return 0x6b00;
+    return 0x9000;
+}
+
+uint16_t blue_review_handle(blue_review_state *state,
+                            const uint8_t *apdu, size_t apdu_length,
+                            uint8_t *reply, size_t reply_capacity,
+                            size_t *reply_length,
+                            blue_review_digest_fn digest,
+                            const zcl_zip243_hasher *zip243_hasher) {
+    if (!state || !apdu || !reply || !reply_length) {
+        blue_review_abort(state);
+        if (reply_length) *reply_length = 0;
+        return 0x6a80;
+    }
+    *reply_length = 0;
+    uint16_t status = request_status(apdu, apdu_length);
+    if (status == 0x9000) {
+        const uint8_t *data = apdu + 5;
+        size_t length = apdu[4];
+        switch (apdu[1]) {
+        case 0x01:
+            status = identify(length, reply, reply_capacity, reply_length);
+            break;
+        case 0x10: status = begin_review(state, data, length); break;
+        case 0x11: status = append_chunk(state, data, length); break;
+        case 0x12:
+            status = finish_review(state, length, reply,
+                                   reply_capacity, reply_length, digest);
+            break;
+        case 0x13: status = clear_review(state, length); break;
+        case 0x14:
+            status = shielded_digest(state, data, length, reply,
+                                     reply_capacity, reply_length,
+                                     zip243_hasher);
+            break;
+        default: status = 0x6d00; break;
+        }
+    }
+    if (status != 0x9000) {
+        blue_review_abort(state);
+        *reply_length = 0;
+    }
+    return status;
+}

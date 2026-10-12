@@ -1,0 +1,385 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * HOST NEEDS — the one place a registered test group declares the input its
+ * host must already carry for the group to observe anything.
+ *
+ * These rows exist because a proof generation is a deliberately narrow tree:
+ * it never builds the node runtime binaries, and it carries none of an
+ * operator's multi-gigabyte fixtures. A group whose only honest verdict in
+ * such a tree is SKIP or UNOBSERVED must be left OUT of the universal
+ * closure selector, so the runner counts it as gated instead of forcing the
+ * whole proof to refuse on `test_accounting_incomplete`.
+ *
+ * This is a SELECTION rule and nothing else:
+ *   - the group still runs everywhere its input exists (a dev box with
+ *     build/bin/z23, an operator with the fold fixture exported);
+ *   - an exact impact plan that names the group still selects it, and a SKIP
+ *     or UNOBSERVED there still refuses the proof;
+ *   - every gated group is NAMED in the attempt test-selection log, so
+ *     nothing is quietly dropped.
+ *
+ * Include with ZCL_TEST_GROUP_NEED(full_id, kind, value):
+ *   ZCL_HOST_NEED_FILE  value is a path relative to the tree the runner execs
+ *                       in; the need is met when that path exists there.
+ *   ZCL_HOST_NEED_ENV   value is an environment variable name; the need is
+ *                       met when it is set to a non-empty string.
+ *   ZCL_HOST_NEED_C23_TOOLCHAIN checks the exact root-owned Clang/GCC route
+ *                       against the C23 syntax the fuzz group generates.
+ * A group may carry one FILE, ENV, or C23_TOOLCHAIN gate alongside BUILD
+ * rows. The gate is resolved for universal selection before build targets;
+ * an exact selection still runs and must produce a complete verdict.
+ * The id is the canonical full catalog id (`test_`/`spec_` prefix included),
+ * exactly as zcl_test_group_catalog_at() spells it. An unregistered group or
+ * an unknown kind is a refusal, never a silently ignored row.
+ *
+ * ZCL_TEST_GROUP_BUILD_NEED(full_id, value, target) declares the other shape:
+ * an optional tool no default build reaches, which the proof builds itself.
+ * `value` is the path the group execs, relative to the tree, and `target`
+ * the Make target that builds it from that tree's own sources. A proof whose
+ * selection carries the group runs `make target` in its generation before
+ * the test dimension, binds the built bytes into the test receipt, and fails
+ * by name (test_need_unbuildable_<target>) when the build cannot produce
+ * `value`. The group is never gated out and never left to self-skip; a
+ * proof that selects no such group builds nothing extra. A need the proof
+ * already provides -- a path it admits content-checked
+ * (build/bin/zclassic23) or a target its prefork step always builds (fbsh)
+ * -- is left as provided rather than rebuilt. Local `make t`, `make t-fast`,
+ * `make t-fast-exact` and `make test-parallel` read the same rows through
+ * `test_parallel --list-build-needs` and build exactly the targets their own
+ * selection needs before the run, failing by the same name.
+ * A group may declare several BUILD rows with distinct targets and at most
+ * one host gate. A BUILD target is not evidence that its host compiler can
+ * parse the fixture language.
+ */
+
+/* The admitted runner executes without rebuilding test-binary prerequisites.
+ * Build each consumed fixture in the proof generation and bind its bytes. */
+#if defined(__linux__)
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_canary.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_canary.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_green.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_green.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_regress.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_regress.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_loop.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_loop.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_segv.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_segv.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_socket.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_socket.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_wx.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_wx.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_pidfd.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_pidfd.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_killparent.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_killparent.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_forkctor.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_forkctor.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_forkstory.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_forkstory.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_execctor.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_execctor.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_execstory.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_execstory.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_dupframe.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_dupframe.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_reapclose.so",
+    "build/fixtures/reflex_runner/zcl_reflex_fixture_reapclose.so")
+#if defined(__x86_64__)
+/* Distinct real targets bind both the image and its consumed story object. */
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so.story.o",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so.story.o")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_2.so",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_2.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_reflex_runner",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_2.so.story.o",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_2.so.story.o")
+ZCL_TEST_GROUP_BUILD_NEED("test_zcode_swarm_net",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_zcode_swarm_net",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so.story.o",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so.story.o")
+ZCL_TEST_GROUP_BUILD_NEED("test_zcode_swarm_net_shard_01",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so")
+ZCL_TEST_GROUP_BUILD_NEED("test_zcode_swarm_net_shard_01",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so.story.o",
+    "build/fixtures/reflex_runner/zcl_reflex_pure_1.so.story.o")
+#endif
+#endif
+
+#if !defined(_WIN32)
+ZCL_TEST_GROUP_BUILD_NEED("test_resident_confined_run",
+    "build/fixtures/rcc_child", "build/fixtures/rcc_child")
+ZCL_TEST_GROUP_BUILD_NEED("test_resident_confined_run",
+    "build/fixtures/rcc_child_dyn", "build/fixtures/rcc_child_dyn")
+#endif
+
+/* The generator is exercised through its built binary on fixture trees. */
+#if !defined(_WIN32)
+ZCL_TEST_GROUP_BUILD_NEED("test_toolgen", "build/bin/z23-toolgen",
+                          "build/bin/z23-toolgen")
+#endif
+
+/* Exercise the game's actual aircraft object without window-system headers. */
+ZCL_TEST_GROUP_BUILD_NEED("test_skycombat_fp_contract",
+                          "build/bin/skycombat-fp-contract", "skycombat-fp-contract")
+
+/* Actual playable entrypoint with inert window/draw and model fixtures. */
+ZCL_TEST_GROUP_BUILD_NEED("test_skycombat_qa_frames",
+                          "build/bin/skycombat-qa-entrypoint", "skycombat-qa-entrypoint")
+
+/* The operator-contract acceptance runs the public claim command against
+ * disposable Git ledgers. Build the candidate-owned dev binary rather than
+ * relying on a developer's preexisting tool. It belongs to the real-root
+ * read-only lane; the script creates and removes only its own fixtures. */
+ZCL_TEST_GROUP_BUILD_NEED("test_make_lint_gates_realroot",
+                          "build/bin/z23-dev", "dev-bin")
+
+/* These groups execute the fixed confined package verifier directly, through
+ * package lifecycle commit/reproduction, or through build_fabric_worker.
+ * Use ensure, not binary existence: source-stamp freshness remains mandatory.
+ * Windows has no qualified package verifier; its ensure target is a no-op.
+ * Do not promise an unbuildable helper there. Existing group verdicts and
+ * proof accounting still apply; omission does not qualify execution.
+ * The swarm graph builder belongs to zwn_t_package_lifecycle, whose static
+ * partition owner is shard_01; the other shards do not execute this helper. */
+#if !defined(_WIN32)
+#define ZCL_PACKAGE_VERIFIER_NEED(id_)                                        \
+    ZCL_TEST_GROUP_BUILD_NEED(id_, "build/bin/zclassic23-package-verify-dev",   \
+                              "dev-package-verifier-ensure")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_verify")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_package_registry")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_package_dev")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_package_dev_shard_01")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_package_dev_shard_02")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_package_dev_shard_03")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_add")
+ZCL_PACKAGE_VERIFIER_NEED("test_resident_launch_contract")
+ZCL_PACKAGE_VERIFIER_NEED("test_build_fabric")
+ZCL_PACKAGE_VERIFIER_NEED("test_build_fabric_attach")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_dev_objects")
+ZCL_PACKAGE_VERIFIER_NEED("test_fastobj_carrier")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_swarm_net")
+ZCL_PACKAGE_VERIFIER_NEED("test_zcode_swarm_net_shard_01")
+#undef ZCL_PACKAGE_VERIFIER_NEED
+#endif
+
+/* tests/harness/src/test_onion_persistence.c drives -tor argv paths that
+ * fail-closed Tor admission refuses at parse time unless the binary linked
+ * real Tor, so the group cannot pass in a stub-linked tree by design. The
+ * keccak archive is the sentinel: it is one of the four archives the link
+ * consumes and it never exists in a stub-linked tree, while a lone stale
+ * libtor.a left over from an aborted build must NOT satisfy the gate. */
+ZCL_TEST_GROUP_NEED("test_onion_persistence",
+                    ZCL_HOST_NEED_FILE,
+                    "vendor/tor/src/ext/keccak-tiny/libkeccak-tiny.a")
+
+/* tests/harness/src/test_onion_pair_watch_live.c reports
+ * PAIR_PROBE=ENV_MISSING_BINARY (UNOBSERVED) when the tree it runs in has no
+ * z23/zclassic23/zcl-rpc runtime binary to pair. A proof generation never
+ * builds those, by design. */
+ZCL_TEST_GROUP_NEED("test_onion_pair_watch_live",
+                    ZCL_HOST_NEED_FILE, "build/bin/z23")
+
+/* tests/harness/src/test_self_folded_anchor.c's heavy leg prints SKIP unless
+ * ZCL_SELF_FOLD_ANCHOR_FIXTURE names a real `-mint-anchor` artifact. Nothing
+ * inside a proof can produce one; it is provisioned by an operator. */
+ZCL_TEST_GROUP_NEED("test_self_folded_anchor_heavy", ZCL_HOST_NEED_ENV,
+                    "ZCL_SELF_FOLD_ANCHOR_FIXTURE")
+
+/* Only engine's end-to-end cases need this executable fixture. */
+ZCL_TEST_GROUP_BUILD_NEED("test_engine", "build/bin/zclassic23-engine-unit",
+                         "engine-unit")
+
+/* Request-boundary acceptance executes both real CLI entry points. */
+ZCL_TEST_GROUP_BUILD_NEED("test_rpc", "build/bin/zclassic-cli", "zclassic-cli")
+ZCL_TEST_GROUP_BUILD_NEED("test_rpc", "build/bin/zclassic23", "zclassic23")
+/* Native nonsecret private-volume writer and independent restart reader. */
+ZCL_TEST_GROUP_BUILD_NEED("test_dev_machine_boot", "build/bin/zclassic23-package-verify-dev",
+                          "dev-bin")
+ZCL_TEST_GROUP_BUILD_NEED("test_dev_machine_boot", "build/bin/z23-machine-volume-fixture",
+                          "machine-volume-fixture")
+ZCL_TEST_GROUP_BUILD_NEED("test_rvmachine_geli_volume", "build/bin/z23-machine-geli-volume",
+                          "machine-geli-volume-fixture")
+ZCL_TEST_GROUP_NEED("test_rvmachine_geli_volume", ZCL_HOST_NEED_ENV,
+                    "ZCL_TEST_GELI_FIXTURE_PACKET")
+ZCL_TEST_GROUP_BUILD_NEED("test_rvmachine_freebsd_ports", "build/bin/z23-machine-freebsd-ports",
+                          "machine-freebsd-port-fixture")
+ZCL_TEST_GROUP_NEED("test_rvmachine_freebsd_ports", ZCL_HOST_NEED_ENV,
+                    "ZCL_TEST_FREEBSD_PORT_FIXTURE_KERNEL")
+ZCL_TEST_GROUP_NEED("test_rvmachine_freebsd_release", ZCL_HOST_NEED_ENV,
+                    "ZCL_TEST_FREEBSD_RELEASE_KERNEL")
+
+/* tests/harness/src/test_utxo_root_ladder.c execs the one-shot generator
+ * build/bin/gen_utxo_root_ladder against a crafted source db. No default
+ * test prerequisite builds it; a proof that selects the group builds
+ * `make tools/gen_utxo_root_ladder` in its generation. */
+ZCL_TEST_GROUP_BUILD_NEED("test_utxo_root_ladder",
+                          "build/bin/gen_utxo_root_ladder",
+                          "tools/gen_utxo_root_ladder")
+
+/* tests/harness/src/test_semantic_manifest.c (group semantic_sensor),
+ * test_semantic_facts_live.c, test_semantic_consumer_live.c and
+ * test_semantic_facts_fuzz.c exec the optional libclang sensor
+ * build/bin/z23-clang-manifest and self-skip where it is absent. It links
+ * libclang, so no default target builds it; a proof that selects any of the
+ * four builds `make clang-manifest` in its generation. */
+ZCL_TEST_GROUP_BUILD_NEED("test_semantic_sensor",
+                          "build/bin/z23-clang-manifest", "clang-manifest")
+ZCL_TEST_GROUP_BUILD_NEED("test_semantic_facts_live",
+                          "build/bin/z23-clang-manifest", "clang-manifest")
+ZCL_TEST_GROUP_BUILD_NEED("test_semantic_consumer_live",
+                          "build/bin/z23-clang-manifest", "clang-manifest")
+/* The fuzz generator emits C23 constexpr, typeof, static_assert, the digit
+ * separator, #embed and __has_embed (GCC preprocessing only the common
+ * core), all under -std=c23. The need is met when the clang the group will
+ * run compiles that source: the bin/clang of the first existing
+ * /usr/lib/llvm-{20,21,19,18}/include/clang-c/Index.h (the Makefile's
+ * CLANG_MANIFEST_LLVM_DIR order), or the system libclang 18 route when none
+ * exists, and the default /usr/bin/gcc accepts it too. An existing sensor
+ * must be bound to that same clang; a stale one is not ready until the build
+ * relinks it. The value string below is kept for the selection logs. On a
+ * host that fails this, a universal run names the unavailable capability
+ * instead of counting the group's self-skip as evidence. Exact selection
+ * still runs and refuses. */
+ZCL_TEST_GROUP_NEED("test_semantic_facts_fuzz", ZCL_HOST_NEED_C23_TOOLCHAIN,
+                    "bound-libclang18-full-c23")
+ZCL_TEST_GROUP_BUILD_NEED("test_semantic_facts_fuzz",
+                          "build/bin/z23-clang-manifest", "clang-manifest")
+
+/* tests/harness/src/test_fleet_gateway.c: every shard spawns the gateway
+ * build/bin/z23-fleet-gateway, which fork/execs the node by its
+ * compatibility name build/bin/zclassic23 for each tool call. Neither is a
+ * default test prerequisite, and a shard without them can only fail. A proof
+ * generation admits the dev node at build/bin/zclassic23, content-checked,
+ * so the proof's test-needs step leaves it alone and builds only the
+ * gateway; a local run builds both. The base group fleet_gateway only checks
+ * the shard partition and needs neither. */
+#define ZCL_FLEET_GATEWAY_SHARD_NEEDS(id_)                                   \
+    ZCL_TEST_GROUP_BUILD_NEED(id_, "build/bin/z23-fleet-gateway",            \
+                              "fleet-gateway")                               \
+    ZCL_TEST_GROUP_BUILD_NEED(id_, "build/bin/zclassic23", "zclassic23")
+ZCL_FLEET_GATEWAY_SHARD_NEEDS("test_fleet_gateway_shard_01")
+ZCL_FLEET_GATEWAY_SHARD_NEEDS("test_fleet_gateway_shard_02")
+ZCL_FLEET_GATEWAY_SHARD_NEEDS("test_fleet_gateway_shard_03")
+ZCL_FLEET_GATEWAY_SHARD_NEEDS("test_fleet_gateway_shard_04")
+ZCL_FLEET_GATEWAY_SHARD_NEEDS("test_fleet_gateway_shard_05")
+ZCL_FLEET_GATEWAY_SHARD_NEEDS("test_fleet_gateway_shard_06")
+#undef ZCL_FLEET_GATEWAY_SHARD_NEEDS
+
+/* These exec the node by its compatibility name build/bin/zclassic23 (the
+ * `z23` product symlinked by `make zclassic23`) and self-skip where it is
+ * absent. A proof generation admits the dev node at that path, so only a
+ * local run builds it. */
+ZCL_TEST_GROUP_BUILD_NEED("test_cli_auth_robust", "build/bin/zclassic23",
+                          "zclassic23")
+ZCL_TEST_GROUP_BUILD_NEED("test_cli_argv_strict", "build/bin/zclassic23",
+                          "zclassic23")
+ZCL_TEST_GROUP_BUILD_NEED("test_cli_argv_strict", "build/bin/zcl-rpc",
+                          "zcl-rpc")
+ZCL_TEST_GROUP_BUILD_NEED("test_importblockindex_cli_dispatch",
+                          "build/bin/zclassic23", "zclassic23")
+
+/* tests/harness/src/test_freebsd_sh.c execs build/bin/fbsh and self-skips
+ * where it is absent. The proof's prefork step builds fbsh for every test
+ * selection, so only a local run needs this row. */
+ZCL_TEST_GROUP_BUILD_NEED("test_freebsd_sh", "build/bin/fbsh", "fbsh")
+
+/* The registered snapshot acceptance requires this exact locally built helper;
+ * it fails when absent. A selected proof builds it before either dimension. */
+ZCL_TEST_GROUP_BUILD_NEED("test_export_snapshot", "build/bin/export_snapshot",
+                          "export_snapshot")
+
+/* tests/harness/src/test_sqlq.c requires build/bin/sqlq.
+ * The proof's prefork step builds sqlq only when this group
+ * is selected; a local run builds it via the same row. */
+ZCL_TEST_GROUP_BUILD_NEED("test_sqlq", "build/bin/sqlq", "sqlq")
+/* tests/harness/src/test_p2_invariant_check.c execs
+ * build/bin/p2_invariant_check and self-skips where it is absent. The
+ * proof's prefork step builds p2_invariant_check only when this group is
+ * selected. */
+ZCL_TEST_GROUP_BUILD_NEED("test_p2_invariant_check",
+                          "build/bin/p2_invariant_check", "p2_invariant_check")
+
+/* The registered fixture executes this exact host artifact; absence fails. */
+ZCL_TEST_GROUP_BUILD_NEED("test_jsonq", "build/bin/jsonq", "jsonq")
+ZCL_TEST_GROUP_BUILD_NEED("test_replay_canary_verdict", "build/bin/jsonq", "jsonq")
+ZCL_TEST_GROUP_BUILD_NEED("test_mvp_c8_judge", "build/bin/jsonq", "jsonq")
+
+/* The CLI fixture requires the POSIX soak runner before execution. */
+#if !defined(_WIN32)
+ZCL_TEST_GROUP_BUILD_NEED("test_soak_runner", "build/bin/soak_runner", "soak_runner")
+#endif
+
+/* tests/harness/src/test_crash_recovery.c execs the crash-recovery
+ * harness it regresses; absence fails. Selected local runs and the proof's
+ * prefork build it through this row. */
+ZCL_TEST_GROUP_BUILD_NEED("test_crash_recovery", "build/bin/crash_recovery_test", "crash_recovery_test")
+/* tests/harness/src/test_inspect_html.c execs build/bin/inspect_html and
+ * self-skips where it is absent. The proof's prefork step builds the tool
+ * for every selection that includes this group. */
+ZCL_TEST_GROUP_BUILD_NEED("test_inspect_html", "build/bin/inspect_html",
+                          "tools/inspect_html")
+
+/* tests/harness/src/test_process_group_exec.c execs the fixture launcher
+ * build/bin/process-group-exec for both its arms. No default target builds
+ * it; without this row a focused lane fails at the first ASSERT instead of
+ * building the tool it proves. */
+ZCL_TEST_GROUP_BUILD_NEED("test_process_group_exec",
+                          "build/bin/process-group-exec",
+                          "process-group-exec")
+
+/* tests/harness/src/test_consensus_rule_sweep.c's "exec the standalone tool"
+ * arm execs build/bin/consensus_rule_sweep and reports that arm NOT RUN,
+ * not a group failure, where the tool is absent or stale (the other arms
+ * still run in-process). No default target builds it; a proof that selects
+ * this group builds it in its generation. */
+ZCL_TEST_GROUP_BUILD_NEED("test_consensus_rule_sweep",
+                          "build/bin/consensus_rule_sweep",
+                          "tools/consensus_rule_sweep")
+
+/* tests/harness/src/test_dev_platform.c runs the built dev binary on a
+ * fixture checkout to observe `dev hotswap probe` with a source_tu end to end
+ * (the dlopen half is a release stub in the test binary). The shard that
+ * carries that case builds the binary itself. */
+ZCL_TEST_GROUP_BUILD_NEED("test_dev_platform_shard_06", "build/bin/z23-dev",
+                          "dev-bin")
+ZCL_TEST_GROUP_BUILD_NEED("test_dev_platform", "build/bin/z23-dev", "dev-bin")
+
+/* Bounded native pipe preparation; actual guest SSH route remains refused. */
+ZCL_TEST_GROUP_BUILD_NEED("test_rvmachine_freebsd_ssh_fd", "build/bin/z23-machine-freebsd-ssh",
+                          "machine-freebsd-ssh-fixture")
+
+/* The registered group runs the shipped launcher source, not a copied argv.
+ * One target builds both the observer and the shipped launcher binary. */
+ZCL_TEST_GROUP_BUILD_NEED("test_guest_ssh_fixture", "build/bin/test-guest-ssh-fixture",
+                          "guest-ssh-fixture-testbin")
+
+/* Headless z23-dev must not list GTK or WebKit, and -gui must still map them. */
+ZCL_TEST_GROUP_BUILD_NEED("test_wallet_gui_load", "build/bin/z23-dev", "dev-bin")
+
+/* Exact PUBLIC copied kernel, no guest execution. */
+ZCL_TEST_GROUP_NEED("test_guest_image_admission", ZCL_HOST_NEED_ENV,
+                    "ZCL_TEST_PUBLIC_GUEST_IMAGE_KERNEL")

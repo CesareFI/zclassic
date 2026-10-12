@@ -1,0 +1,329 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0 */
+/*
+ * fleet_facts.def — the ONE table of what this fleet knows about ITSELF:
+ * which executor handles which unit kind, what the landing rules are, and
+ * which proof failure signature names which trap. `z23 dev know` answers
+ * from these rows and from nothing else.
+ *
+ * Four X-macro families. Define the ones you want before including; each
+ * undeclared family expands to nothing, so a consumer never has to define a
+ * macro it does not read.
+ *
+ *   FLEET_RELATION(name)   the CLOSED set of relations a row may use.
+ *   FLEET_CONTEXT(name)    the CLOSED set of contexts (microtheories). A
+ *                          context with no rows today is still schema: it
+ *                          says where a future row would belong.
+ *   FLEET_TERM(name)       the CLOSED vocabulary every subject and object is
+ *                          drawn from. A term containing '/' is a tracked
+ *                          repository path; every other term is a lowercase
+ *                          token. There is no free text on either side of a
+ *                          relation, so no pasted prose can become a fact.
+ *   FLEET_FACT(subject, relation, object, context, confidence, why)
+ *                          confidence is "DOCTRINE" (asserted by this table)
+ *                          or "OBSERVED" (derived from a gate or a ledger).
+ *                          "UNKNOWN" is never written here: it is what the
+ *                          query synthesizes when it has no row, so that an
+ *                          ask is answered rather than met with silence.
+ *                          `why` is the row's justification for a reader —
+ *                          it is prose, and it is never an object.
+ *
+ * tools/lint/check_fleet_facts.sh is the price of writing this table: every
+ * subject and object must be a declared term, every path term must be a
+ * tracked file, every relation and context must be declared, no row may
+ * repeat another, and no declared term may go unused. Writing a row here
+ * without that backing is a false statement about the fleet.
+ */
+
+#ifndef FLEET_RELATION
+#define FLEET_RELATION(name_)
+#define ZCL_FLEET_RELATION_LOCAL_
+#endif
+#ifndef FLEET_CONTEXT
+#define FLEET_CONTEXT(name_)
+#define ZCL_FLEET_CONTEXT_LOCAL_
+#endif
+#ifndef FLEET_TERM
+#define FLEET_TERM(name_)
+#define ZCL_FLEET_TERM_LOCAL_
+#endif
+#ifndef FLEET_FACT
+#define FLEET_FACT(subject_, relation_, object_, context_, confidence_, why_)
+#define ZCL_FLEET_FACT_LOCAL_
+#endif
+
+/* ── relations ─────────────────────────────────────────────────────────── */
+FLEET_RELATION("is_a")
+FLEET_RELATION("handles_well")
+FLEET_RELATION("handles_poorly")
+FLEET_RELATION("refuses_when")
+FLEET_RELATION("lives_at")
+FLEET_RELATION("requires")
+FLEET_RELATION("max")
+FLEET_RELATION("trap_signature")
+/* MEASURED relations — never written as a FLEET_FACT row below. They are
+ * the closed vocabulary tools/dev/fleet_observe.c emits into
+ * engine/composition/fleet_observations.def, declared here only so
+ * dev.fleet.know accepts them as a --relation filter; see that file and
+ * cognition/modules/fleetfacts for where the rows actually live. */
+FLEET_RELATION("routable_for")
+FLEET_RELATION("refused_for")
+FLEET_RELATION("probe_for")
+FLEET_RELATION("observed_for")
+FLEET_RELATION("handles_with_finisher")
+
+/* ── contexts ──────────────────────────────────────────────────────────── */
+FLEET_CONTEXT("platform:linux")
+FLEET_CONTEXT("platform:macos")
+FLEET_CONTEXT("platform:windows")
+FLEET_CONTEXT("box:any")
+FLEET_CONTEXT("lane_state:train")
+FLEET_CONTEXT("lane_state:proof")
+FLEET_CONTEXT("lane_state:board")
+FLEET_CONTEXT("doctrine")
+FLEET_CONTEXT("observation")
+
+/* ── vocabulary ────────────────────────────────────────────────────────── */
+FLEET_TERM("audit-only")
+FLEET_TERM("base-relative-diff")
+FLEET_TERM("box")
+FLEET_TERM("branch-budget")
+FLEET_TERM("bulk-copy-while-serving")
+FLEET_TERM("check-capability-closure")
+FLEET_TERM("check-windows-acceptance")
+FLEET_TERM("closure-truncated")
+FLEET_TERM("cold-attempt-stray")
+FLEET_TERM("commit")
+FLEET_TERM("cross-filesystem-hardlink")
+FLEET_TERM("ctime-bump")
+FLEET_TERM("dependency-unavailable")
+FLEET_TERM("dev-describe-branch")
+FLEET_TERM("docs/agent/TRAIN_PROTOCOL.md")
+FLEET_TERM("engine/composition/fleet_facts.def")
+FLEET_TERM("executor-routing")
+FLEET_TERM("fifteen-hundred-lines")
+FLEET_TERM("file-size-ceiling")
+FLEET_TERM("finisher")
+FLEET_TERM("finishing-rebase")
+FLEET_TERM("fixture-line-reading")
+FLEET_TERM("four-lanes")
+FLEET_TERM("full-build-epoch")
+FLEET_TERM("full-lint")
+FLEET_TERM("gate-fixing")
+FLEET_TERM("gate-port-pair")
+FLEET_TERM("generation-flavour-mismatch")
+FLEET_TERM("git-stash")
+FLEET_TERM("glm-5.3")
+FLEET_TERM("glm-5.3-flash")
+FLEET_TERM("grok")
+FLEET_TERM("grok-queue-judge")
+FLEET_TERM("haiku")
+FLEET_TERM("hard-implementation")
+FLEET_TERM("identity-refusal")
+FLEET_TERM("impact-planner-refusal")
+FLEET_TERM("landing-failure")
+FLEET_TERM("landing-worktree")
+FLEET_TERM("lane")
+FLEET_TERM("later-defined-variable")
+FLEET_TERM("lint-fast-green")
+FLEET_TERM("live-datadir")
+FLEET_TERM("long-wall-implementation")
+FLEET_TERM("main")
+FLEET_TERM("make-prerequisite")
+FLEET_TERM("mechanical-rows")
+FLEET_TERM("missing-gate-binary")
+FLEET_TERM("multi-file-implementation")
+FLEET_TERM("muse")
+FLEET_TERM("not-fast-forward")
+FLEET_TERM("one-driver")
+FLEET_TERM("one-make")
+FLEET_TERM("one-proof")
+FLEET_TERM("one-worktree")
+FLEET_TERM("opus")
+FLEET_TERM("permission-prompt-hang")
+FLEET_TERM("pinned-test")
+FLEET_TERM("private-inodes")
+FLEET_TERM("proof")
+FLEET_TERM("proof-accounting")
+FLEET_TERM("proof-failed-marker")
+FLEET_TERM("proof-generation-root")
+FLEET_TERM("proof-lock")
+FLEET_TERM("push")
+FLEET_TERM("ram-backed-filesystem")
+FLEET_TERM("ram-generation-root")
+FLEET_TERM("rebase-onto-origin-main-tip")
+FLEET_TERM("root-temp-file")
+FLEET_TERM("scoped-implementation")
+FLEET_TERM("seam-finding")
+FLEET_TERM("self-skip")
+FLEET_TERM("shared-inode")
+FLEET_TERM("ship-box-toolchain")
+FLEET_TERM("signature")
+FLEET_TERM("single-file-pinned-test")
+FLEET_TERM("sonnet")
+FLEET_TERM("source-identity")
+FLEET_TERM("stale-generation")
+FLEET_TERM("stale-installed-hook")
+FLEET_TERM("stale-seal-fixture")
+FLEET_TERM("standalone-tools-cold-build")
+FLEET_TERM("stray-lane-watcher")
+FLEET_TERM("tests/harness/src/test_boot_phase.c")
+FLEET_TERM("test_boot_phase")
+FLEET_TERM("test_hotswap_rollback")
+FLEET_TERM("train")
+FLEET_TERM("train-protocol")
+FLEET_TERM("uncommitted-exit")
+FLEET_TERM("unexplained-links")
+FLEET_TERM("unobserved-leg")
+FLEET_TERM("unsigned-commit")
+FLEET_TERM("verification")
+
+/* ── who handles what ──────────────────────────────────────────────────── */
+FLEET_FACT("opus", "handles_well", "hard-implementation", "doctrine", "DOCTRINE",
+           "deep debugging and design judgement; read its refusal, a brief that duplicates a landed subsystem is correctly declined")
+FLEET_FACT("sonnet", "handles_well", "verification", "doctrine", "DOCTRINE",
+           "reads a diff, runs the named gates, answers LAND or HOLD; keep it in the foreground, it stalls waiting on a background notification")
+FLEET_FACT("sonnet", "handles_well", "gate-fixing", "doctrine", "DOCTRINE",
+           "give it the exact gate name; a gate is never turned green by raising a baseline")
+FLEET_FACT("sonnet", "handles_well", "finishing-rebase", "doctrine", "DOCTRINE",
+           "finishes an unfinished unit and resolves a rebase conflict; the brief must forbid git stash explicitly")
+FLEET_FACT("sonnet", "handles_well", "scoped-implementation", "doctrine", "DOCTRINE",
+           "one well-scoped change with a named test group and a stated acceptance bar")
+FLEET_FACT("sonnet", "handles_poorly", "fixture-line-reading", "doctrine", "DOCTRINE",
+           "a verifier reading a gate's selftest transcript reports the fixture's FAIL lines as a red gate although the exit is zero; the brief says only the exit and the final summary line count, and names the fixture lines in advance")
+FLEET_FACT("sonnet", "trap_signature", "permission-prompt-hang", "doctrine", "DOCTRINE",
+           "no-result Bash, no live process: permission-prompt hang; two verifiers sat 2h after rm -rf * and a write at root; forbid wildcard rm and writes outside the lane worktree and scratch; stop and redispatch, keep the worktree")
+FLEET_FACT("haiku", "handles_well", "mechanical-rows", "doctrine", "DOCTRINE",
+           "row edits, doc counts, log triage; state the commit trailer literally or it goes missing")
+FLEET_FACT("glm-5.3", "handles_well", "audit-only", "doctrine", "DOCTRINE",
+           "answers is-this-stale honestly, including an honest negative result")
+FLEET_FACT("glm-5.3", "handles_well", "scoped-implementation", "doctrine", "DOCTRINE",
+           "takes a brief that invites planning, which the flash tier cannot")
+FLEET_FACT("glm-5.3-flash", "handles_well", "single-file-pinned-test", "doctrine", "DOCTRINE",
+           "one file, one registered group that actually runs, and a per-file change ceiling")
+FLEET_FACT("glm-5.3-flash", "handles_poorly", "multi-file-implementation", "doctrine", "DOCTRINE",
+           "writes outside the worktree, merges a foreign branch into its lane, rewrites a whole file when asked for one row")
+FLEET_FACT("glm-5.3-flash", "requires", "pinned-test", "doctrine", "DOCTRINE",
+           "a registered group in tools/dev/test_group_catalog.def that runs, not a test file that merely exists")
+FLEET_FACT("grok", "handles_well", "single-file-pinned-test", "doctrine", "DOCTRINE",
+           "one function, one table row, one test: the lint-gate ports and the bip page cache each landed in one round; brief it with file:line, the literal output strings, and the mutation check")
+FLEET_FACT("grok", "handles_well", "gate-port-pair", "doctrine", "DOCTRINE",
+           "two small self-contained lint gates in one job land in one round at the cost of one; pair gates that source no helper script and pin both output strings")
+FLEET_FACT("grok", "handles_poorly", "seam-finding", "doctrine", "DOCTRINE",
+           "a brief that says find where X is registered burns every round; name the seam yourself (file, function, table row) before queueing")
+FLEET_FACT("grok", "requires", "finisher", "doctrine", "DOCTRINE",
+           "a rounds-exhausted verdict is judged, not trusted: rerun the judged group in the unit worktree first; two of two such verdicts were stale judge logs over a fix already committed")
+FLEET_FACT("grok", "trap_signature", "uncommitted-exit", "doctrine", "DOCTRINE",
+           "a queue run can exit nonzero after the work when the final commit refuses, unsigned or unquoted acceptance; the worktree still holds the diff, so the verifier applies git diff as a patch and commits under its own signature")
+FLEET_FACT("grok-queue-judge", "requires", "base-relative-diff", "doctrine", "DOCTRINE",
+           "a judge that diffs only the dirty tree reports a committed second-round fix as no change and hands the verifier a stale log; count commits since BASE plus dirty files, and rebuild dev-bin before the judged group")
+FLEET_FACT("muse", "handles_well", "long-wall-implementation", "doctrine", "DOCTRINE",
+           "the only tier given a two-hour wall; specify interfaces (file, flags, error names, fixtures), never goals")
+FLEET_FACT("muse", "requires", "finisher", "observation", "OBSERVED",
+           "Historical 2026-09-03 experiment: a separate finisher completed timed-out units; current completion requires exact checkpoints and non-author acceptance, not a permanent central role")
+
+/* ── how work lands ────────────────────────────────────────────────────── */
+FLEET_FACT("train", "max", "four-lanes", "observation", "OBSERVED",
+           "Historical 2026-09-03 train protocol used at most four lanes in fixed order; current concurrency follows host admission and native ownership, not that recorded limit")
+FLEET_FACT("train", "requires", "lint-fast-green", "lane_state:train", "DOCTRINE",
+           "run lint-fast and affected acceptance before submission; it is a subset, and native exact proof still requires the complete policy-selected gates")
+FLEET_FACT("train", "requires", "rebase-onto-origin-main-tip", "lane_state:train", "DOCTRINE",
+           "a changed landing base requires exact revalidation; only receiver-qualified reuse can avoid repeated work while preserving the complete current candidate/base proof")
+FLEET_FACT("box", "max", "one-proof", "observation", "OBSERVED",
+           "Historical 2026-09-03 workflow ran one proof per box; current host admission and native proof/build locks govern concurrency without a fleet-wide monopoly")
+FLEET_FACT("lane", "max", "one-worktree", "doctrine", "DOCTRINE",
+           "one worktree per lane, and never two lanes in one checkout")
+FLEET_FACT("lane", "max", "one-make", "box:any", "DOCTRINE",
+           "two make invocations running at once in one worktree rebuild objects under a live test group and report failures the code does not have; an agent that sees an unexplained engine failure first checks for its own second make")
+FLEET_FACT("commit", "requires", "signature", "doctrine", "DOCTRINE",
+           "every commit is signed; git log --format=%G? must show no N before anything is proven")
+FLEET_FACT("main", "refuses_when", "unsigned-commit", "doctrine", "DOCTRINE",
+           "the remote rejects an unsigned commit, so an unsigned lane discovers it at push time with the proof already spent")
+FLEET_FACT("main", "requires", "full-lint", "doctrine", "DOCTRINE",
+           "lint-fast is a subset; run affected gates and the current native landing policy's complete exact lint proof through devbuild --wait; publication never grants deployment authority")
+FLEET_FACT("make-prerequisite", "trap_signature", "later-defined-variable", "doctrine", "DOCTRINE",
+           "make expands prerequisites at parse time, so a later-defined var is empty and the target loses it; t-fast naming the lint-tool var got no lint binary; name BIN_DIR or define it above first use; prove with make --debug=v -n")
+FLEET_FACT("push", "refuses_when", "not-fast-forward", "doctrine", "DOCTRINE",
+           "fast-forward only; never force-push")
+FLEET_FACT("lane", "refuses_when", "git-stash", "doctrine", "DOCTRINE",
+           "the stash is shared across every worktree of one checkout, so one lane's stash pops into another's tree")
+FLEET_FACT("lane", "refuses_when", "root-temp-file", "doctrine", "DOCTRINE",
+           "a temp at checkout root, as generate-compdb.sh did with mktemp, trips check-no-stray-root-files in every overlapping proof; temps live under build, .cache or the state scratch directory, never at a proof-scanned tree root")
+FLEET_FACT("check-capability-closure", "requires", "full-build-epoch", "lane_state:train", "DOCTRINE",
+           "the closure and inventory checks read the whole package epoch (build/bin/zclassic23-package-verify-dev), not dev-bin; on a dev-bin-only tree they report a stale epoch, which is not a closure failure")
+FLEET_FACT("landing-worktree", "max", "one-driver", "lane_state:train", "DOCTRINE",
+           "native queue and step locks serialize landing mutations; preserve active leases and the frozen landing tree, use a candidate-qualified producer, and never infer authority from a host or permanent lead")
+FLEET_FACT("live-datadir", "refuses_when", "bulk-copy-while-serving", "box:any", "DOCTRINE",
+           "a 34 GB cp -a of a live datadir on the box serving it stalled the projection worker past its deadline and the watchdog killed the public node; copy from a stopped node or from a leaf")
+FLEET_FACT("dev-describe-branch", "max", "branch-budget", "doctrine", "DOCTRINE",
+           "ZCL_COMMAND_BRANCH_BUDGET caps one describe branch at 3072 bytes and the dev branch sat 14 bytes under it on 2026-09-06; a new dev.* command needs a trimmed summary or a regrouping first")
+FLEET_FACT("file-size-ceiling", "max", "fifteen-hundred-lines", "doctrine", "DOCTRINE",
+           "check-file-size-ceiling fails any source file above 1500 lines and the baseline shrinks, so a three-hundred-line feature in a thirteen-hundred-line file needs the author to split along a seam before a verifier can say LAND")
+
+/* ── proof traps: a failure signature, and what it actually means ──────── */
+FLEET_FACT("proof", "refuses_when", "self-skip", "lane_state:proof", "DOCTRINE",
+           "a self-skipped group is refused by the accounting; skip is not the same answer as unobserved")
+FLEET_FACT("proof-generation-root", "is_a", "ram-backed-filesystem", "lane_state:proof", "DOCTRINE",
+           "tools/dev/dev_proof.c materialises a generation under a RAM-backed root, which is a different filesystem from the checkout")
+FLEET_FACT("ram-generation-root", "refuses_when", "stale-generation", "observation", "OBSERVED",
+           "Historical RAM reserve incident involved unswept ninety-minute generations; age grants no retirement authority. Current cleanup must qualify exact native ownership and preserve live leases and proofs")
+FLEET_FACT("test_boot_phase", "trap_signature", "ram-generation-root", "lane_state:proof", "DOCTRINE",
+           "its block-I/O probe burns under the suite tmpdir inside the generation, and fsync on tmpfs never moves ru_oublock; not load, not a flake")
+FLEET_FACT("test_boot_phase", "lives_at", "tests/harness/src/test_boot_phase.c", "lane_state:proof", "DOCTRINE",
+           "read bp_burn_block_io before classifying this group's failure")
+FLEET_FACT("dependency-unavailable", "trap_signature", "cross-filesystem-hardlink", "lane_state:proof", "DOCTRINE",
+           "the dependency exists; link() answered EXDEV because the generation root is not the checkout's filesystem. make vendor does nothing for it")
+FLEET_FACT("closure-truncated", "trap_signature", "impact-planner-refusal", "lane_state:proof", "DOCTRINE",
+           "tools/dev/devloop_plan.c refuses a dimension whose impact walk truncated; that is the planner or the index, never the train")
+FLEET_FACT("check-windows-acceptance", "trap_signature", "ship-box-toolchain", "platform:windows", "DOCTRINE",
+           "one box's mingw resolves clock_gettime and another's does not; a green acceptance on the assembling box proves nothing about the shipping box, so the gate that counts runs where make ship runs")
+FLEET_FACT("shared-inode", "trap_signature", "identity-refusal", "lane_state:proof", "DOCTRINE",
+           "replacing a hardlinked vendor input bumps the shared inode's ctime and every in-flight proof whose seal covered it refuses on identity; dedupe only between landings, and copy with reflink, never link")
+FLEET_FACT("source-identity", "trap_signature", "ctime-bump", "platform:linux", "DOCTRINE",
+           "source-build superseded, only mutation digest differs on a clean tree: ctime moved; identity hashes ctime of tracked sources and transients under source roots; before ship, find vendor -xdev -type f -links +1 prints nothing")
+FLEET_FACT("landing-worktree", "trap_signature", "stale-installed-hook", "lane_state:train", "DOCTRINE",
+           "landing-worktree pre-push is a symlink into build/githooks; proof rebuild of z23-git-hook trips check_git_hooks_installed and test_make_lint_gates_realroot; check out the tip and make install-hooks before every submit")
+FLEET_FACT("landing-worktree", "trap_signature", "unexplained-links", "lane_state:train", "DOCTRINE",
+           "prebuild proof_generation_dependency_unexplained_links: landing vendor file has two links, partner not the train's copy; leftover disk generation hardlinked it; between landings replace via a temp name, never cp -al or ln")
+FLEET_FACT("landing-worktree", "trap_signature", "cold-attempt-stray", "lane_state:proof", "DOCTRINE",
+           "test_make_lint_gates failing only on check-no-stray-root-files (baseline_rc=0): 4/7 proofs, first cold never warm resubmit; one resubmit per train for that signature, name the stray from its transcript and root listing")
+FLEET_FACT("proof-accounting", "refuses_when", "self-skip", "lane_state:proof", "DOCTRINE",
+           "test_log_account admits a landing only when ran+reused=selected and failed, skipped, unobserved are zero; SKIP because the host lacks a feature fails the landing, so observe what the host offers instead of skipping")
+FLEET_FACT("proof-accounting", "refuses_when", "unobserved-leg", "lane_state:proof", "DOCTRINE",
+           "an UNOBSERVED leg (tor bootstrap missed its window at load thirty) counts like a failure; the runner reruns an UNOBSERVED-only pass once and never caches it, and a load-sensitive probe says so in its own output")
+FLEET_FACT("proof-lock", "trap_signature", "stray-lane-watcher", "lane_state:proof", "DOCTRINE",
+           "a persistent watcher lockfile is not ownership evidence; keep watchers disabled, inspect native session and kernel ownership, and stop only an authorized exact authenticated session through dev.loop.stop")
+FLEET_FACT("landing-failure", "trap_signature", "proof-failed-marker", "lane_state:train", "DOCTRINE",
+           "the reason is .cache/zcl-dev-proof/<tip>-<base>.failed, the step and exit are in the newest attempts/phases.txt, and failed groups with their repro line are in logs/*.test.log; read those three before touching the train")
+FLEET_FACT("lane", "requires", "private-inodes", "box:any", "DOCTRINE",
+           "cp -al of a lane/scratch/liveness tree shares checkout inodes; each link bumps shared ctime, fails check-no-hardlink-seeding past two and supersedes a running ship gate; copy cp -a --reflink=auto via lane_new.sh or bundle")
+FLEET_FACT("lane", "trap_signature", "missing-gate-binary", "lane_state:proof", "DOCTRINE",
+           "a check-* gate via make in a lane can fail only because its binary was never built, as check-fleet-observations without build/bin/z23-fleet-observe; parallel lint builds nothing, so build that binary and rerun first")
+FLEET_FACT("test_hotswap_rollback", "trap_signature", "stale-seal-fixture", "box:any", "DOCTRINE",
+           "module consensus core seal does not match this node on a passing suite means zcl_rollback_fixture_a.so and _b.so predate core_seal_root.h via -MMD so make never rebuilt them; delete two fixtures or make them by name, rerun")
+FLEET_FACT("full-lint", "trap_signature", "standalone-tools-cold-build", "lane_state:proof", "DOCTRINE",
+           "14-min silent gap in a proof generation's full lint is check-standalone-tools-link, the only lint gate that runs make, cold-building every standalone tool in a fresh generation; not check-onion-pair-watch (selftest 1/40 s)")
+FLEET_FACT("full-lint", "refuses_when", "generation-flavour-mismatch", "lane_state:proof", "DOCTRINE",
+           "full lint disagrees on check-doc-no-false-deleted (dev 1.5x release) and check-generated-artifact-contradictions (stale inventory, no package epoch); carry root flavour, epoch and standalone tools, or report unobserved")
+
+/* ── where the rest of the doctrine is written down ────────────────────── */
+FLEET_FACT("executor-routing", "lives_at", "engine/composition/fleet_facts.def", "doctrine", "DOCTRINE",
+           "this table is the source; docs/agent/EXECUTOR_HEURISTICS.md renders it and never restates it")
+FLEET_FACT("train-protocol", "lives_at", "docs/agent/TRAIN_PROTOCOL.md", "doctrine", "DOCTRINE",
+           "historical train state and board records; current ownership and receipt-gated landing procedure live in docs/DEVELOPING.md")
+
+#ifdef ZCL_FLEET_RELATION_LOCAL_
+#undef FLEET_RELATION
+#undef ZCL_FLEET_RELATION_LOCAL_
+#endif
+#ifdef ZCL_FLEET_CONTEXT_LOCAL_
+#undef FLEET_CONTEXT
+#undef ZCL_FLEET_CONTEXT_LOCAL_
+#endif
+#ifdef ZCL_FLEET_TERM_LOCAL_
+#undef FLEET_TERM
+#undef ZCL_FLEET_TERM_LOCAL_
+#endif
+#ifdef ZCL_FLEET_FACT_LOCAL_
+#undef FLEET_FACT
+#undef ZCL_FLEET_FACT_LOCAL_
+#endif

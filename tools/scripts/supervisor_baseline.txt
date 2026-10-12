@@ -1,0 +1,76 @@
+# Lint gate #15 baseline — grandfathered long-running services that
+# do not yet register a supervisor liveness contract.
+#
+# Each entry is a long-running service (originally scoped to
+# engine/services/src/, widened 2026-07-21 to engine/controllers/src,
+# engine/conditions/src, engine/jobs/src, engine/composition/src, and the audited core/modules/net,
+# engine/modules/health, engine/modules/rpc production daemons — see check_supervisor_registration.sh)
+# that spawns threads or subscribes to engine/modules/health periodic callbacks but
+# was not migrated to supervisor_register() in Round 5. Future rounds
+# will pick these off one by one; the gate fails on any NEW long-
+# running file that isn't in this list and isn't supervised.
+#
+# How to remove an entry:
+#   1. In the service's start function, after the existing health/
+#      pthread setup, declare a static liveness_contract, init it,
+#      and call supervisor_register(). See chain_tip_watchdog.c
+#      for the canonical pattern (contract + on_tick + on_stall).
+#   2. Decide whether the contract drives the work (period_secs > 0)
+#      or just observes a heartbeat the service already emits.
+#   3. Wire a meaningful on_stall — log + emit an event + try a local
+#      remediation; do NOT panic or block.
+#   4. Delete the matching line below.
+#   5. Re-run `make lint` to confirm.
+#
+# Format: one file path per line. Blank lines and # comments ignored.
+#
+# ── 2026-07-21 fresh baseline seeded on scope widen (Task D/E) ───────────
+# These 12 are pre-existing gaps the widened scan newly discovered — none
+# introduced by this change. Each already terminates (bounded/joined worker
+# pool) or is cross-checked by an adjacent mechanism (see the comment above
+# each entry); none is a new unaccounted-for infinite loop. Pick these off
+# same as any other baseline entry.
+#
+# bounded: one-shot snapshot block-index/UTXO/wallet import workers
+# (zcl_snap_idx/zcl_snap_utxo/zcl_snap_wallet — already in
+# tools/lint/thread_supervision_baseline.txt Gate #23)
+engine/controllers/src/snapshot_controller_import.c
+# bounded: one-shot snapshot tx-index import worker (zcl_snap_txidx —
+# Gate #23 baseline)
+engine/controllers/src/snapshot_controller_txindex.c
+# bounded: one-shot catch-up sync + legacy-db import jobs
+# (zcl_catchup/zcl_db_import — Gate #23 baseline)
+engine/controllers/src/sync_controller_catchup_jobs.c
+# bounded: parallel-fold worker pool, joined at range-fold end (dynamic
+# per-worker thread names)
+engine/jobs/src/psc_range_fold.c
+# bounded: header-validation worker pool, joined at pool shutdown (dynamic
+# per-worker thread names)
+engine/jobs/src/validate_headers_pool.c
+# bounded: PoW-validation worker pool, joined at pool shutdown (dynamic
+# per-worker thread names)
+engine/jobs/src/validate_work_pool.c
+# bounded: one-shot boot-time block-file scan worker, joined (zcl_blk_scan
+# — Gate #23 baseline)
+engine/composition/src/boot_block_file_scan.c
+# bounded: one-shot boot-time fast-restart quick check, joined
+# (bg_quick_check — Gate #23 baseline)
+engine/composition/src/boot_fast_restart.c
+# observer: systemd WATCHDOG=1 heartbeat pinger; reads (does not drive) the
+# root supervisor's own sweep heartbeat as its liveness gate — see its
+# file-header "Pillar 7" note; a wedge here stops the ping and lets
+# systemd's WatchdogSec timer restart the unit, an independent recovery path
+engine/composition/src/boot_sd_watchdog.c
+# bounded: one-shot ROM parallel-fetch + verify worker pools
+# (zcl_romfetch/zcl_romver), joined at job end
+core/modules/net/src/rom_fetch.c
+#
+# ── 2026-07-24 (wf/supervision) two entries RETIRED, not exempted ────────
+# engine/modules/health/src/heartbeat.c and engine/modules/rpc/src/rpc_timeout.c are gone from
+# this list because they are genuinely supervised, not because the bar
+# moved: both register through thread_liveness_register_restartable(),
+# which calls thread_liveness_register() and lands the child on the root
+# liveness tree. The gate's cover regex was anchored to the plain form and
+# did not see the `_restartable` variant, so it billed two paid-off files
+# as debt. Widening the regex (check_supervisor_registration.sh COVER_RE)
+# is what let these two go; nothing about either daemon changed.

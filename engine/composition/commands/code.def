@@ -1,0 +1,754 @@
+/* Copyright 2026 Rhett Creighton. Licensed under Apache-2.0. */
+/* Hierarchical source-code navigator. Local, read-only, deterministic leaves
+ * backed by the in-binary cognition/modules/codeindex index (self-rebuilds on open if the
+ * source tree is stale). Bounded output — a token-cheap alternative to reading
+ * whole files. Native transport only. */
+
+ZCL_COMMAND_BRANCH("code", "", "Source-code navigator",
+                   ZCL_COMMAND_LAYER_CODE)
+
+ZCL_COMMAND_READY_READ(
+    "code.guide", "code", "",
+    "Edit and prove a checkout change",
+    "The inner coding-agent loop: check the generated capability inventory, "
+    "inspect with code impact/tests, then prove with t-fast ONLY and lint-fast; "
+    "push admission checks the exact sealed receipt. It reads no checkout "
+    "state and never runs a compiler, test, or live-node command.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,guide,develop,proof,lint,t-fast,impact,agent",
+    "zcl.code_guide.input.v1", "zcl.code_guide.v1", "", "",
+    "z23 code guide",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_guide)
+
+ZCL_COMMAND_READY_READ(
+    "code.group", "code", "",
+    "Browse source groups and files",
+    "Subgroups and files of one navigator group (top groups when none given), "
+    "from the in-binary code index which self-rebuilds if the tree is stale; "
+    "complete for that group.", 0,
+    "code,group,shape,module,map", "zcl.code_group_input.v1",
+    "zcl.code_group.v1", "group", "group",
+    "z23 code group app/services",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_group)
+
+ZCL_COMMAND_READY_READ(
+    "code.map", "code", "",
+    "Count root groups and app shapes",
+    "The whole tree's root groups with aggregate file counts and the eight app "
+    "shapes, from the in-binary code index; a complete overview at index-build "
+    "time.", 0,
+    "code,map,tree,overview,groups,shapes", "zcl.command.empty_input.v1",
+    "zcl.code_map.v1", "", "",
+    "z23 code map",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_map)
+
+ZCL_COMMAND_READY_READ(
+    "code.coverage", "code", "",
+    "Reconcile source with the code index",
+    "Compares Git's exact tracked manifest for every maintained .c, .h, and "
+    ".def node with the current verified code-index generation. Reports the "
+    "indexed/tracked ratio and names bounded missing paths; GREEN is earned "
+    "only at 100%. Vendored source is outside the maintained source roots.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,coverage,index,tracked,git,complete,missing",
+    "zcl.command.empty_input.v1", "zcl.code_coverage.v1", "", "",
+    "z23 code coverage",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_coverage)
+
+/* First-hour sub-branch. The parent `code` menu is at its
+ * ZCL_COMMAND_BRANCH_BUDGET byte cap (the reason code.provenance exists), so
+ * the M3/M4 leaves hang off this one-child branch instead of `code`
+ * directly. Their PATHS stay flat — code.owner / code.cost / code.recent /
+ * code.fetch — because word resolution is by dotted path, not by parent:
+ * `z23 code owner <path>` spells the same either way, and the menu pays for
+ * one child. */
+ZCL_COMMAND_BRANCH("code.firsthour", "code",
+                   "First-hour: owner, cost, recent, fetch",
+                   ZCL_COMMAND_LAYER_CODE)
+
+ZCL_COMMAND_READY_READ(
+    "code.owner", "code.firsthour", "",
+    "Name the room that owns a path",
+    "The physical authority that owns one repo-relative path: the first path "
+    "component, whether it sits under the consensus-sealed core/ (edits need "
+    "the unseal ritual), the bounded context/shape/basis classification, the "
+    "code index's group and its purpose, and the nearest owning module "
+    "directory. `exists` is tracked-or-on-disk (index row or lstat); a path "
+    "the index does not know is UNOWNED, never an error. The tree carries no "
+    "per-file human-owner metadata — the room IS the owner.", 0,
+    "code,owner,authority,room,sealed,context,module,focus",
+    "zcl.code_path_input.v1",
+    "zcl.code_owner.v1", "path", "path",
+    "z23 code owner contexts/wallet/modules/wallet/src/wallet.c",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_owner)
+
+ZCL_COMMAND_READY_READ(
+    "code.cost", "code.firsthour", "",
+    "Price the proof of a change",
+    "What proving a change to one path costs: the focused test route and full "
+    "group list `code tests` derives, joined with the last suite run's timing "
+    "artifact (.cache/test-timing/last-run.json, schema zcl.test_timing.v1) "
+    "into per-group ms/rc/cached rows. A group missing from the artifact is "
+    "measured=false — never a fabricated number. Reflects the LAST run, so "
+    "idempotent but not deterministic.", 0,
+    "code,cost,tests,timing,proof,price,ms",
+    "zcl.code_path_input.v1",
+    "zcl.code_cost.v1", "path", "path",
+    "z23 code cost cognition/modules/codeindex/src/codeindex_build.c",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_cost)
+
+ZCL_COMMAND_READY_READ(
+    "code.recent", "code.firsthour", "",
+    "List what changed under a path lately",
+    "The commits touching one path since a commit-ish, newest first, from "
+    "`git log --format=%H%x1f%ad%x1f%s <since>..HEAD -- <path>` run in the "
+    "source root; bounded to 32 rows with `truncated`/`total` when more "
+    "exist. A bad ref or a non-repo root fails closed naming the range and "
+    "git's exit status.", ZCL_COMMAND_LIST_BUDGET,
+    "code,recent,history,git,log,changed,churn",
+    "zcl.code_recent_input.v1",
+    "zcl.code_recent.v1", "path,since", "path,since",
+    "z23 code recent cognition/modules/codeindex HEAD~5",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_recent)
+
+/* `code.fetch` is the second code.* leaf that WRITES (after code.kpi), and it
+ * is classed MUTATE for that reason rather than dressed as a read: it
+ * installs a verified generation at <root>/.codeindex/index.kv through the
+ * rebuild path's own publication ritual. The risk class is DEV_MUTATION and
+ * the scope LOCAL because the only thing it can touch is developer-local
+ * derived state in a gitignored directory — it reaches no node, no datadir,
+ * no wallet and no consensus surface, and what it writes is adopted only
+ * after the fetched image's sealed source roots equal a fresh local
+ * computation (VERIFY, DON'T TRUST: fetched bytes are inert until locally
+ * verified). */
+ZCL_COMMAND_READY_COMMAND(
+    "code.fetch", "code.firsthour", "",
+    "Install another checkout's verified code index",
+    "Adopts the published codeindex generation named by `from` (a checkout "
+    "root, a .codeindex directory, or an index.kv file) so this checkout "
+    "skips the cold index build. The image must pass the canonical open's "
+    "ownership/mode/nlink checks, its store_format and ci_schema_version must "
+    "equal this binary's constants, and its sealed source_root_sha3 AND "
+    "source_merkle_root_sha3 must equal freshly computed values for THIS "
+    "checkout — any mismatch is a refusal naming the key and both digests. "
+    "An existing FRESH local store is never overwritten; a missing or stale "
+    "one is replaced. After content verification the stat-bound depfile "
+    "freshness keys are re-stamped to this checkout's observation so the "
+    "first open here does not rebuild; the sealed source roots and the "
+    "cold-build receipt are carried verbatim. `adopted` reports that a "
+    "post-install open sees the store as fresh.", 0,
+    "code,fetch,index,codeindex,install,verify,warm,checkout,worktree",
+    "zcl.code_fetch_input.v1",
+    "zcl.code_fetch.v1", "from", "",
+    "z23 code fetch --from=/path/to/other-checkout",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_BACKGROUND, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_code_fetch)
+
+/* Nested under firsthour so the parent `code` menu stays inside
+ * ZCL_COMMAND_BRANCH_BUDGET. Path stays code.index.metrics. */
+ZCL_COMMAND_BRANCH("code.index", "code.firsthour",
+                   "Code-index self metrics",
+                   ZCL_COMMAND_LAYER_CODE)
+
+ZCL_COMMAND_READY_READ(
+    "code.index.metrics", "code.index", "",
+    "Report the code index's own numbers",
+    "The published image's cold-build receipt, on-disk byte sizes, one timed "
+    "source-only freshness check, and row counts from the existing store. "
+    "Never rebuilds: a stale image reports stale=true with the numbers it "
+    "already holds. freshness_check_ms is a measurement, never a gate.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,index,metrics,freshness,size,build,receipt",
+    "zcl.command.empty_input.v1",
+    "zcl.code_index_metrics.v1", "", "",
+    "z23 code index metrics",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_index_metrics)
+
+ZCL_COMMAND_READY_READ(
+    "code.tests", "code", "",
+    "Route a file to focused tests",
+    "The focused test group(s) a change to one file routes to, derived from the "
+    "code index's file-to-proof mapping; deterministic, empty if the path maps "
+    "to no focused group.", 0,
+    "code,tests,route,impact,proof", "zcl.code_path_input.v1",
+    "zcl.code_tests.v1", "path", "path",
+    "z23 code tests core/modules/net/src/download.c",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_tests)
+
+ZCL_COMMAND_READY_READ(
+    "code.room", "code", "",
+    "Open a file or command room",
+    "For a source path, its shape, purpose, siblings and proof route; for an "
+    "exact command branch, its catalog subtree joined to registered handler "
+    "definitions, proof routes and mixed-file coupling. Command-feature "
+    "implementation scope is explicit and does not claim indirect or "
+    "unregistered dependencies.", ZCL_COMMAND_LIST_BUDGET,
+    "code,room,feature,shape,neighbors,tests,commands,unified", "zcl.code_path_input.v1",
+    "zcl.code_room.v1", "path", "path",
+    "z23 code room app.messaging",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_room)
+
+ZCL_COMMAND_READY_READ(
+    "code.context-map", "code", "",
+    "Map contexts, shapes, and coupling",
+    "A deterministic source-derived classification of every indexed production "
+    "file into the ten bounded contexts and one architectural shape, plus "
+    "explicit orphan/overlap violations and observed compiler-depfile "
+    "cross-context include edges. The map is navigation evidence, never "
+    "runtime or acceptance authority.", ZCL_COMMAND_LIST_BUDGET,
+    "code,context,map,shape,orphan,overlap,coupling,architecture",
+    "zcl.command.empty_input.v1", "zcl.code_context_map.v1", "", "",
+    "z23 code context-map",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_context_map)
+
+ZCL_COMMAND_READY_READ(
+    "code.file", "code", "",
+    "Show a file's symbols and includes",
+    "One file's symbol table and its in-tree include dependencies from the code "
+    "index; complete for symbols the indexer parsed, in-tree includes only.", 0,
+    "code,file,symbols,includes,deps", "zcl.code_path_input.v1",
+    "zcl.code_file.v1", "path", "path",
+    "z23 code file contexts/commons/modules/vcs/src/vcs_index.c",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_file)
+
+ZCL_COMMAND_READY_READ(
+    "code.sym", "code", "",
+    "Show one symbol's definition and contract",
+    "One symbol's card — kind, signature, definition/declaration sites, doc, "
+    "guard, and group — from the code index; complete for the symbol the "
+    "indexer resolved.", 0,
+    "code,symbol,signature,definition,card", "zcl.code_name_input.v1",
+    "zcl.code_symbol.v1", "name", "name",
+    "z23 code sym codeindex_open",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_sym)
+
+ZCL_COMMAND_READY_READ(
+    "code.body", "code", "",
+    "Print one function's source",
+    "One function's source text from its definition line through its closing "
+    "brace, read from the checkout; capped at 16384 bytes and 400 lines, cut at "
+    "a line boundary with truncated=true when either cap fires.", 65536,
+    "code,body,source,function,text,print", "zcl.code_name_input.v1",
+    "zcl.code_body.v1", "name", "name",
+    "z23 code body code_limit",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_body)
+
+ZCL_COMMAND_READY_READ(
+    "code.capsule", "code", "",
+    "Join one symbol's code and proof surface",
+    "One symbol's identity (id/def/decl/signature/group), direct callers and "
+    "callees (each capped), compiler-depfile includes, exact .def command "
+    "bindings for that handler, evidence labels, likely change files, and "
+    "explicit empty/unknown semantic sections when fields, ownership, locks, "
+    "database, events, or blockers are not indexed; budget-aware "
+    "self-shrinking drops includes then callees then callers (never "
+    "identity/def/route) to fit the reply budget — `dropped_sections` names "
+    "what was cut.", 0,
+    "code,capsule,symbol,callers,callees,commands,graph", "zcl.code_name_input.v1",
+    "zcl.code_capsule.v1", "name", "name",
+    "z23 code capsule sovereignty_guard_allow",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_capsule)
+
+ZCL_COMMAND_READY_READ(
+    "code.change-plan", "code", "",
+    "Plan evidence-backed edits and tests",
+    "A small evidence-labelled plan of files to read/edit, boundaries to "
+    "avoid, affected compilation, and focused tests. Stable symbol ids resolve "
+    "exactly; intent resolution is explicitly heuristic; patch paths are read "
+    "from bounded unified-diff headers.", 0,
+    "code,change,plan,edit,compile,test,impact", "zcl.code_change_plan_input.v1",
+    "zcl.code_change_plan.v1", "name,symbol,intent,patch", "name",
+    "z23 code change-plan codeindex_open",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_change_plan)
+
+ZCL_COMMAND_READY_READ(
+    "code.refs", "code", "",
+    "List references to one symbol",
+    "Call sites and references to one symbol from the code index, capped by "
+    "`limit`; bounded — may be a partial view of all references when the cap is "
+    "hit.", ZCL_COMMAND_LIST_BUDGET,
+    "code,refs,callers,references,uses", "zcl.code_refs_input.v1",
+    "zcl.code_refs.v1", "name,limit", "name",
+    "z23 code refs zcl_malloc",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_refs)
+
+ZCL_COMMAND_READY_READ(
+    "code.impact", "code", "",
+    "Measure one file's reverse dependencies",
+    "The reverse-dependency closure of one changed file — every file "
+    "transitively downstream via the call graph (codeindex_impact_closure) — "
+    "plus the downstream focused test groups from the same shared-rule "
+    "resolver code.tests uses; capped and truncation-flagged, so an "
+    "incomplete closure is never silently trusted.", ZCL_COMMAND_LIST_BUDGET,
+    "code,impact,blast,radius,dependency,closure", "zcl.code_path_input.v1",
+    "zcl.code_impact.v1", "path", "path",
+    "z23 code impact platform/modules/util/include/util/safe_alloc.h",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_impact)
+
+ZCL_COMMAND_READY_READ(
+    "code.find", "code", "",
+    "Rank symbols by name",
+    "At most `limit` symbols ranked by name match, one context line each, from "
+    "the code index; a bounded ranked slice, not every match.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,find,search,grep,symbol", "zcl.code_find_input.v1",
+    "zcl.code_find.v1", "text,limit", "text",
+    "z23 code find hotswap",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_find)
+
+ZCL_COMMAND_READY_READ(
+    "code.have", "code", "",
+    "Find existing capabilities first",
+    "Capabilities matching a CONCEPT, not a symbol name: the query is stemmed "
+    "(\"validation\" reaches `validates_*`, \"hashing\" reaches the hash "
+    "primitives) and matched against symbol names, doc comments, file "
+    "purposes, paths and groups. Each hit names the header that owns the API, "
+    "the matching symbols, and `used_by_files` — how many files hold a "
+    "recorded CALL SITE of it, which is what separates a live capability from "
+    "dead code. `verdict` (ALREADY EXISTS / PARTIAL / NOT FOUND) is derived "
+    "from those same rendered numbers, so it cannot claim more than the "
+    "evidence shown. A candidate must match every query term or it is not "
+    "returned at all; NOT FOUND means the recorded text does not say so, and "
+    "`searched` reports exactly what was looked at. Blind spots: usage through "
+    "function pointers or dlopen is not a recorded call site, and a header "
+    "with no comment and opaque symbol names has no text to match.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,have,already,exists,capability,reuse,duplicate,search",
+    "zcl.code_have_input.v1",
+    "zcl.code_have.v1", "text,limit", "text",
+    "z23 code have validation",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_have)
+
+ZCL_COMMAND_READY_READ(
+    "code.territory", "code", "",
+    "Score one module's evidence surface",
+    "One module's inventory, generated per call and stored nowhere: the files "
+    "and bytes it owns, its purpose, the registered groups its files ROUTE to, "
+    "and — a different fact, never summed with routing — how many of its "
+    "public functions a registered test entry point actually REACHES through "
+    "the call graph. reached + unreached + unknown always equals "
+    "public_symbols; `unknown` is the walk refusing to answer (a bounded walk, "
+    "or a symbol referenced only at file scope, i.e. an indirect dispatch a "
+    "source call graph cannot follow) and is never folded into either "
+    "neighbour. Also reports include-edge dependencies both ways and the "
+    "weak spots: unreached public functions and files no rule routes anywhere. "
+    "With no argument, lists every territory the tree declares. The "
+    "entry-point closure is memoized against the code index's sealed source "
+    "generation, so the first call after an edit pays for the walk and the "
+    "rest do not. The reply's `cost` block reports what THIS call spent per "
+    "phase; a large territory (core/modules/net: 209 files, 79 public headers) exceeds "
+    "the latency bucket and says so in the envelope rather than hiding it — "
+    "the two costs are one router call per file and one symbol query per "
+    "public header, both bounded by the file count.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,territory,module,inventory,owns,proves,reached,routed,coverage,weak",
+    "zcl.code_territory_input.v1",
+    "zcl.code_territory.v1", "name", "name",
+    "z23 code territory core/modules/net",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_territory)
+
+ZCL_COMMAND_READY_READ(
+    "code.focus", "code", "",
+    "Rank a specialist's next work",
+    "A ranked list of files in one specialist's territory, scored only from "
+    "recorded evidence: routed test groups that failed in "
+    ".cache/test-timing/last-run.json, the lane's own lint gates that "
+    "failed in .cache/lint-timing/last-run.json, git-log churn, open "
+    "lessons in docs/agent/LESSONS.md, files no impact rule routes, and "
+    "paths named in checked-in docs/ issue bodies. A missing artifact is "
+    "`no run recorded`, never a clean score; unreadable or corrupt "
+    "artifacts fail FOCUS_EVIDENCE. Every reason cites its source. Ties "
+    "break by path. `--list` or no specialist lists the rows in "
+    "engine/composition/specialists.def. An unknown name is UNKNOWN_SPECIALIST. "
+    "The answer grants no authority and never decides what to merge.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,focus,specialist,lane,rank,evidence,next",
+    "zcl.code_focus_input.v1",
+    "zcl.code_focus.v1", "specialist,list", "specialist",
+    "z23 code focus net",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_focus)
+
+/* `code.kpi` is the one code.* leaf that WRITES, and it is classed MUTATE for
+ * that reason rather than dressed as a read. Every run appends one frame to
+ * <root>/.codeindex/kpi.chainlog, which is exactly the point: a ledger that
+ * only reported would have no history to report against. The risk class is
+ * DEV_MUTATION and the scope LOCAL because the only thing it can touch is
+ * developer-local derived state in a gitignored directory — it reaches no
+ * node, no datadir, no wallet and no consensus surface. Calling it a READ
+ * would put it in the READY-read latency contract, which dispatches every
+ * code.* read leaf four times per run, and those dispatches would silently
+ * become ledger entries. */
+ZCL_COMMAND_READY_COMMAND(
+    "code.kpi", "code", "",
+    "Track measured build outcomes",
+    "One canonical frame per run, appended to a hash-chained ledger at "
+    ".codeindex/kpi.chainlog, holding numbers this build ALREADY produces: "
+    "capabilities, duplicate candidates and untested invariants from the "
+    "generated capability inventory; territories and files owned from the "
+    "code index; registered test groups from the parallel-test catalog; lint "
+    "gates from the Makefile's own list; and determinism debt from the "
+    "ratchet baseline. Each is reported with its previous value, its delta, "
+    "which direction is better, a verdict, and the EXACT command that shows "
+    "the rows behind the number. A metric whose artifact is missing, "
+    "unreadable, or whose parse recognised nothing is UNAVAILABLE and is "
+    "NEVER reported as 0 — those are different facts, and a ledger that "
+    "conflated them would make every delta across that boundary a fiction. "
+    "Such a run still writes its frame, because the unavailability is itself "
+    "the fact being recorded, and the summary says how many were unavailable. "
+    "`previous` is the most recent PRIOR frame, never the one just written; "
+    "with no prior frame the verdict is no_baseline, never unchanged. The "
+    "frame payload is canonical bytes with no timestamp, path or pid, so two "
+    "honest runs over one tree produce identical bytes and the ledger stays "
+    "comparable; ordering comes from the chainlog sequence number. It grants "
+    "nothing and gates nothing: a frame is a measurement, never an approval.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,kpi,metrics,ledger,progress,trend,delta,inventory,debt",
+    "zcl.command.empty_input.v1",
+    "zcl.code_kpi.v1", "", "",
+    "z23 code kpi",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_BACKGROUND, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_code_kpi)
+ZCL_COMMAND_READY_READ(
+    "code.corpus", "code", "",
+    "Measure the reusable C23 corpus",
+    "Two independent readings of the same tree, reported side by side and "
+    "never blended into one score. The LINE half is a walk of the maintained "
+    "C23 roots, now: lines, files, bytes, and what fraction of the "
+    "100,000,000-line goal that is — a line count, which says nothing about "
+    "proof. The PROOF half is read from the generated capability inventory: "
+    "how many public symbols a REGISTERED TEST actually reaches, how many are "
+    "unproven, how many duplicate-body candidates exist, and how many declared "
+    "invariants nothing asserts. `headline` leads with the UNPROVEN count on "
+    "purpose; a progress bar that hides its denominator is exactly the "
+    "self-flattery this leaf exists to refuse. The proven fraction is over "
+    "PUBLIC SYMBOLS and says so — `proof.lines_proven` is reported as "
+    "unmeasured, because nothing in this tree attributes proof at line "
+    "granularity and inventing a number would be a fabrication. Because the "
+    "two halves come from two different walks, `scope.agrees` compares the "
+    "file counts: when they differ the inventory is stale, the reply says so, "
+    "and the proof figures describe an older tree. With no inventory present "
+    "the proof figures are absent rather than zero — nobody measured is not "
+    "the same fact as nothing is proven.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,corpus,lines,proven,tested,duplicate,goal,100m,honest,coverage",
+    "zcl.code_corpus_input.v1",
+    "zcl.code_corpus.v1", "", "",
+    "z23 code corpus",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_corpus)
+
+/* `code.general` carries the bare `general` alias, so `z23 general core/modules/net`
+ * works without a fourth word. It is a code.* child and NOT a new root: the
+ * registry has exactly twelve roots and the root menu has a byte budget, both
+ * asserted by test_command_registry_catalog and test_zcode_node_command. The
+ * bare alias is the same mechanism `explain`, `profile`, `join` and `update`
+ * already use (see zcl_native_command_is_root) — a one-word entry point that
+ * costs the root menu nothing. That matters here: an agent should reach the
+ * inventory it keeps mis-remembering in one word, not four.
+ *
+ * A GENERAL GRANTS NO AUTHORITY. It reports and never decides. "No referee, no
+ * authority — everyone runs a full node" is the project's oldest rule, and
+ * metaverse_grant_check() remains the only answer to what anything may do. The
+ * leaf is AUTH_PUBLIC/SCOPE_LOCAL/TRANSPORT_NATIVE like every other source
+ * read: reading the tree you are checked out on is a developer action, and no
+ * stranger drives it — nothing here reaches the node. */
+ZCL_COMMAND_READY_READ(
+    "code.general", "code", "general",
+    "Brief one territory or rank evidence gaps",
+    "The brief for whoever is about to work in one territory, generated per "
+    "call and stored nowhere: what it OWNS (files, bytes, public functions, "
+    "types, macros), what PROVES it (the groups its files route to, and — a "
+    "different fact, never summed with routing — how many public functions a "
+    "registered test entry point actually reaches), what it TRUSTS (whether a "
+    "result from those groups is reproducible: currently UNKNOWN for every "
+    "group, reported rather than omitted because the determinism ledger has "
+    "not landed and an omitted field reads as 'fine'), where it is WEAK "
+    "(public functions no test reaches, files no rule routes anywhere, and a "
+    "duplicate-code answer reported UNKNOWN because cognition/modules/fingerprint has not "
+    "landed), and "
+    "what it REFUSES (the lint gates that bind it, derived from run_lint.sh's "
+    "gate table, each gate script's own text and the baseline ledgers those "
+    "scripts name; a gate that names no territory path lands in an explicit "
+    "scope_unknown bucket and is never guessed either way). With no argument, "
+    "the roll-up: every territory ranked by unproven public surface — where "
+    "the evidence is weakest, not the biggest or the first alphabetically. "
+    "Scoring every territory routes every file in the tree, which costs "
+    "seconds, so the roll-up is memoized against the code index's sealed "
+    "source generation and digest-verified on read; `cost.source` says whether "
+    "this answer was memoized or worked out, and the first call after an edit "
+    "is the one that pays. This leaf reports and never decides: it grants no "
+    "authority, approves nothing, and blocks nothing.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "general,brief,territory,inventory,owns,proves,reached,weak,refuses,"
+    "rollup,dispatch",
+    "zcl.general_input.v1",
+    "zcl.general_brief.v1", "name", "name",
+    "z23 general core/modules/net",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_general)
+
+/* Provenance sub-branch. Every leaf here answers "what produced this?" about
+ * the codebase itself rather than reading it: which tree state produced an
+ * answer (merkle), which code writes a durable fact (facts), which code
+ * formatted a string the node emitted (emitter). They are nested rather than
+ * flat because the parent `code` menu is bounded by ZCL_COMMAND_BRANCH_BUDGET
+ * (2048) and three more siblings do not fit in it — a sub-branch costs the
+ * parent one child entry no matter how many leaves it grows. Do not raise the
+ * budget; add provenance leaves here. */
+ZCL_COMMAND_BRANCH("code.provenance", "code",
+                   "Attribute output to its producing code",
+                   ZCL_COMMAND_LAYER_CODE)
+
+ZCL_COMMAND_READY_READ(
+    "code.provenance.merkle", "code.provenance", "",
+    "Give the SHA3 Merkle root of the tree or a subtree",
+    "One 32-byte SHA3-256 identity: the whole indexed source tree by default, "
+    "one directory's subtree root when `path` names a directory, or one file's "
+    "leaf digest when it names a file. Leaves bind (repo-relative path, length, "
+    "bytes); internal nodes bind the directory path and its children's "
+    "kind/name/digest in a fixed order, so two checkouts of the same content in "
+    "different directories produce the same root. `children` lists the direct "
+    "subtree roots (16-hex prefixes, capped — `children_total` is the true "
+    "count) so a changed subtree can be located by comparison instead of "
+    "rescanning. `build` reports what THIS call cost: files_read of "
+    "files_total, bytes_read, nodes_hashed of nodes_total. A `path` outside the "
+    "indexed set is reported as found=false, never an error. The digests are a "
+    "derived cache over the files on disk, which remain the only authority.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,merkle,tree,digest,identity,root,subtree,changed,hash",
+    "zcl.code_path_input.v1",
+    "zcl.code_merkle.v1", "path", "path",
+    "z23 code provenance merkle core/modules/net",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_merkle)
+
+ZCL_COMMAND_READY_READ(
+    "code.provenance.facts", "code.provenance", "",
+    "Census durable named-slot mutation surfaces without claiming ownership",
+    "Each durable named slot (a key in progress_meta / stage_cursor / "
+    "node_state) resolved by the declared derivations, with the count of "
+    "distinct FILES carrying resolved mutation sites, ranked so multi-surface "
+    "slots come first; with a `key`, each resolved site as file:line via the "
+    "write function or SQL verb. Derived from the tree — "
+    "there is no recorded finding set. `sites_unresolved` is the "
+    "census's own blind spot: writes whose key argument is not a literal, "
+    "counted rather than dropped. Completeness, runtime reachability, "
+    "authority roles, target database identity, serialization, and duplicate "
+    "fact homes remain UNPROVEN. Re-derived when the code index's exact "
+    "source root changes; repeated reads memoize that immutable generation.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,facts,writers,duplication,drift,ledger,slots",
+    "zcl.code_facts_input.v1",
+    "zcl.code_facts.v1", "key,store", "key",
+    "z23 code provenance facts coins_applied_height",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_facts)
+
+ZCL_COMMAND_READY_READ(
+    "code.provenance.relations", "code.provenance", "",
+    "Expose typed source, command-locus, and proof-requirement relations",
+    "A bounded predicate-shaped projection for one exact C23 declaration. "
+    "It binds isa, definition/declaration occurrence, source group, native "
+    "command scope/lane/authority/effect/transport, and required focused-test "
+    "relations to the current source and command-registry roots. Runtime "
+    "observations and accepted receipts are named gaps, never inferred from "
+    "reachability or a test route.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,ontology,relations,predicate,isa,locus,proof,context",
+    "zcl.code_name_input.v1",
+    "zcl.code_relations.v1", "name", "name",
+    "z23 code provenance relations zcl_native_handle_code_sym",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_relations)
+
+ZCL_COMMAND_READY_READ(
+    "code.provenance.emitter", "code.provenance", "",
+    "Resolve emitted text to its emitting code",
+    "The source site that formatted a string the node emitted, joined across "
+    "four registries that already own the answer: the source text (which "
+    "literal or format string), the code index (enclosing function + callers), "
+    "blocker_remedy_bindings.def (which blocker-id pattern owns it and whether "
+    "any auto-remedy exists), and diagnostics_dumpers.def (owner .c + declared "
+    "test). Every field is re-derived per call — no stored mapping. A miss "
+    "names WHICH join missed and the next move, and is never an empty result.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "code,emitter,blocker,reason,origin,who,said,attribute",
+    "zcl.code_text_input.v1",
+    "zcl.code_emitter.v1", "text", "text",
+    "z23 code provenance emitter 'address_index.below_snapshot_seed'",
+    ZCL_COMMAND_LAYER_CODE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_code_emitter)

@@ -1,0 +1,585 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * Existing-file node.db schema preflight.  This unit has one job: classify an
+ * on-disk database before the normal READWRITE|CREATE open is allowed to run.
+ * It never creates, journals, checkpoints, migrates, quarantines or renames.
+ *
+ * ar-validate-skip:connection-schema-classifier-not-a-row
+ *   This file classifies a database connection before any model row exists.
+ *   Row validation remains owned by the models using the admitted handle.
+ */
+
+#include "models/database_internal.h"
+#include "platform/fd_path.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <sqlite3.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if defined(_WIN32)
+#include <io.h>
+#include <windows.h>
+#endif
+
+#define NODE_DB_PREFLIGHT_URI_MAX 128
+
+struct preflight_sidecars {
+    bool wal;
+    bool shm;
+    off_t wal_size;
+};
+
+static struct node_db_schema_preflight preflight_result(
+    enum node_db_schema_preflight_state state, int32_t version,
+    const char *detail)
+{
+    return (struct node_db_schema_preflight) {
+        .state = state,
+        .version = version,
+        .detail = detail,
+    };
+}
+
+static bool read_header(int fd, unsigned char header[20])
+{
+    size_t off = 0;
+    while (off < 20) {
+#if defined(_WIN32)
+        int n = _read(fd, header + off, (unsigned int)(20 - off));
+#else
+        ssize_t n = pread(fd, header + off, 20 - off, (off_t)off);
+#endif
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return false;
+    }
+    return memcmp(header, "SQLite format 3", 16) == 0;
+}
+
+static bool probe_one_sidecar(const char *path, const char *suffix,
+                              bool *present, off_t *size_out)
+{
+    char side[1400];
+    int n = snprintf(side, sizeof(side), "%s%s", path, suffix);
+    if (n <= 0 || (size_t)n >= sizeof(side))
+        return false;
+    struct stat st;
+    if (stat(side, &st) == 0) {
+        if (!S_ISREG(st.st_mode))
+            return false; // raw-return-ok:nonregular-sidecar-is-unknown
+        *present = true;
+        if (size_out)
+            *size_out = st.st_size;
+        return true;
+    }
+    if (errno != ENOENT)
+        return false;
+    *present = false;
+    if (size_out)
+        *size_out = -1;
+    return true;
+}
+
+static bool probe_sidecars(const char *path, struct preflight_sidecars *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->wal_size = -1;
+    return probe_one_sidecar(path, "-wal", &out->wal, &out->wal_size) &&
+           probe_one_sidecar(path, "-shm", &out->shm, NULL);
+}
+
+/* A cleanly closed WAL database retains header byte 18 == 2 but has no
+ * wal-index. Plain SQLITE_OPEN_READONLY would create -wal/-shm in that state.
+ * Bind immutable SQLite to the already-open inode through the platform's
+ * magic fd-reopen path instead; this cannot follow a later path replacement
+ * and deliberately ignores sidecars. The caller only selects it when no
+ * non-empty WAL and no SHM exists. */
+#if defined(_WIN32)
+/* Windows has no /proc/self/fd. GetFinalPathNameByHandleW names the file the
+ * descriptor itself has open (handle-bound, never a caller-supplied string),
+ * so the result cannot be a different pre-existing file; a rename between
+ * this call and SQLite's re-open remains possible — the same residual class
+ * the Darwin F_GETPATH mismatch guard documents in platform/fd_path.h.
+ * Same idiom as directory_compat.c's canonicalization arm. */
+static bool preflight_fd_real_path(char *out, size_t out_size, int fd)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    wchar_t wbuf[32768];
+    DWORD count = GetFinalPathNameByHandleW(
+        h, wbuf, 32768, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!count || count >= 32768)
+        return false;
+    const wchar_t *plain = wcsncmp(wbuf, L"\\\\?\\", 4) == 0
+                               ? wbuf + 4 : wbuf;
+    int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                     plain, -1, NULL, 0, NULL, NULL);
+    return needed > 0 && (size_t)needed <= out_size &&
+           WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, plain,
+                               -1, out, (int)out_size, NULL, NULL) > 0;
+}
+#endif
+
+static int open_quiet_wal_immutable(int fd, sqlite3 **db_out)
+{
+#if defined(_WIN32)
+    char fd_path[4096];
+    char uri[4096 + 32];
+    if (!preflight_fd_real_path(fd_path, sizeof(fd_path), fd))
+        return SQLITE_CANTOPEN;
+#else
+    char fd_path[64];
+    char uri[NODE_DB_PREFLIGHT_URI_MAX];
+    if (!platform_fd_path(fd_path, sizeof(fd_path), fd, NULL))
+        return SQLITE_CANTOPEN;
+#endif
+    int n = snprintf(uri, sizeof(uri), "file:%s?mode=ro&immutable=1",
+                     fd_path);
+    if (n <= 0 || (size_t)n >= sizeof(uri))
+        return SQLITE_CANTOPEN;
+    return sqlite3_open_v2(uri, db_out,
+                           SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
+                           SQLITE_OPEN_URI,
+                           NULL);
+}
+
+static int open_preflight_database(const char *path, int fd, bool wal_mode,
+                                   const struct preflight_sidecars *sidecars,
+                                   sqlite3 **db_out, const char **branch_out)
+{
+    *db_out = NULL;
+    errno = 0;
+    if (wal_mode && !sidecars->shm &&
+        (!sidecars->wal || sidecars->wal_size == 0)) {
+        *branch_out = "clean-wal-immutable";
+        return open_quiet_wal_immutable(fd, db_out);
+    }
+    *branch_out = wal_mode ? "live-wal-readonly" : "delete-readonly";
+    return sqlite3_open_v2(path, db_out,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL);
+}
+
+static void log_preflight_open_failure(const char *path, int fd,
+                                       const char *branch, int rc,
+                                       int open_errno, sqlite3 *db,
+                                       const struct preflight_sidecars *sidecars)
+{
+    struct stat opened = { 0 };
+    struct stat named = { 0 };
+    bool opened_ok = fstat(fd, &opened) == 0;
+    bool named_ok = stat(path, &named) == 0;
+    const char *identity = !opened_ok || !named_ok ? "unavailable" :
+        opened.st_dev == named.st_dev && opened.st_ino == named.st_ino
+            ? "match" : "mismatch";
+    int extended_rc = db ? sqlite3_extended_errcode(db) : rc;
+    int system_errno = db ? sqlite3_system_errno(db) : open_errno;
+    const char *message = db ? sqlite3_errmsg(db) : sqlite3_errstr(rc);
+    LOG_WARN("db.schema_preflight",
+             "read-only SQLite open failed branch=%s rc=%d primary_rc=%d "
+             "extended_rc=%d errno=%d system_errno=%d detail=%s fd=%d "
+             "identity=%s fd_stat=%d fd_dev=%" PRIuMAX " fd_ino=%" PRIuMAX
+             " path_stat=%d path_dev=%" PRIuMAX " path_ino=%" PRIuMAX
+             " wal=%d shm=%d wal_size=%" PRIdMAX,
+             branch ? branch : "(unknown)", rc, rc & 0xff, extended_rc,
+             open_errno, system_errno, message ? message : "(none)", fd,
+             identity, opened_ok ? 0 : -1, (uintmax_t)opened.st_dev,
+             (uintmax_t)opened.st_ino, named_ok ? 0 : -1,
+             (uintmax_t)named.st_dev, (uintmax_t)named.st_ino,
+             sidecars->wal ? 1 : 0, sidecars->shm ? 1 : 0,
+             (intmax_t)sidecars->wal_size);
+}
+
+static int count_tables(sqlite3 *db, int *count_out)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM sqlite_master WHERE type='table'",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK && stmt) {
+        rc = sqlite3_step(stmt); // raw-sql-ok:read-only-schema-preflight
+        if (rc == SQLITE_ROW) {
+            *count_out = sqlite3_column_int(stmt, 0);
+            rc = SQLITE_OK;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static int table_exists(sqlite3 *db, const char *name, bool *exists_out)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK && stmt)
+        rc = sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(stmt); // raw-sql-ok:read-only-schema-preflight
+        if (rc == SQLITE_ROW) {
+            *exists_out = sqlite3_column_int(stmt, 0) == 1;
+            rc = SQLITE_OK;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static bool parse_migration_version(const unsigned char *text, int bytes,
+                                    int *version_out)
+{
+    if (!text || bytes <= 0 || bytes > 10)
+        return false;
+    char buf[12];
+    memcpy(buf, text, (size_t)bytes);
+    buf[bytes] = '\0';
+    for (int i = 0; i < bytes; i++) {
+        if (buf[i] < '0' || buf[i] > '9')
+            return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(buf, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || value < 0 || value > INT_MAX)
+        return false;
+    *version_out = (int)value;
+    return true;
+}
+
+/* Read the schema_compat_floor node_state key the same way schema_version
+ * itself is read: exactly one 4-byte blob. Absence is NOT an error — it is
+ * the expected shape of any database written before the compat floor
+ * existed — so the caller supplies `marker` (the already-validated
+ * schema_version) as the conservative default: no downgrade is assumed
+ * safe for a database this binary never classified itself. */
+static bool read_compat_floor(sqlite3 *db, int32_t marker, int32_t *floor_out,
+                              const char **detail_out)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT value FROM node_state WHERE key='schema_compat_floor'",
+        -1, &stmt, NULL);
+    if (rc != SQLITE_OK || !stmt) {
+        sqlite3_finalize(stmt);
+        *detail_out = "SCHEMA_VERSION_UNKNOWN: compat floor marker is unreadable";
+        return false;
+    }
+
+    int rows = 0;
+    int32_t value = 0;
+    bool malformed = false;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) { // raw-sql-ok:read-only-schema-preflight
+        rows++;
+        if (rows != 1 || sqlite3_column_type(stmt, 0) != SQLITE_BLOB ||
+            sqlite3_column_bytes(stmt, 0) != (int)sizeof(value) ||
+            !sqlite3_column_blob(stmt, 0)) {
+            malformed = true;
+            continue;
+        }
+        memcpy(&value, sqlite3_column_blob(stmt, 0), sizeof(value));
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        *detail_out = "SCHEMA_VERSION_UNKNOWN: compat floor marker read failed";
+        return false;
+    }
+    if (rows == 0) {
+        /* No floor was ever recorded for this database. Never guess a lower
+         * floor than its own schema_version. */
+        *floor_out = marker;
+        return true;
+    }
+    if (malformed) {
+        *detail_out =
+            "SCHEMA_VERSION_UNKNOWN: compat floor marker is not one 4-byte blob";
+        return false;
+    }
+    *floor_out = value;
+    return true;
+}
+
+static bool migration_ledger_consistent(sqlite3 *db, int32_t marker,
+                                        const char **detail_out)
+{
+    bool present = false;
+    if (table_exists(db, "schema_migrations", &present) != SQLITE_OK) {
+        *detail_out = "SCHEMA_VERSION_UNKNOWN: cannot inspect migration ledger";
+        return false;
+    }
+    if (!present)
+        return true;
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT version FROM schema_migrations", -1, &stmt, NULL);
+    if (rc != SQLITE_OK || !stmt) {
+        sqlite3_finalize(stmt);
+        *detail_out = "SCHEMA_VERSION_UNKNOWN: migration ledger unreadable";
+        return false;
+    }
+    bool ok = true;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) { // raw-sql-ok:read-only-schema-preflight
+        int version = 0;
+        const unsigned char *text = sqlite3_column_text(stmt, 0);
+        int bytes = sqlite3_column_bytes(stmt, 0);
+        if (sqlite3_column_type(stmt, 0) != SQLITE_TEXT ||
+            !parse_migration_version(text, bytes, &version)) {
+            *detail_out = "SCHEMA_VERSION_UNKNOWN: malformed migration ledger";
+            ok = false;
+            break;
+        }
+        if (version > marker) {
+            *detail_out = "SCHEMA_VERSION_UNKNOWN: marker contradicts migration ledger";
+            ok = false;
+            break;
+        }
+    }
+    if (ok && rc != SQLITE_DONE) {
+        *detail_out = "SCHEMA_VERSION_UNKNOWN: migration ledger read failed";
+        ok = false;
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+/* version is newer than this binary knows. Whether that is refused
+ * outright or opened READ-COMPATIBLE depends entirely on the database's
+ * own compat floor — never on this binary guessing. Split out of
+ * inspect_schema() to keep that already-pinned function's own cyclomatic
+ * complexity from growing. */
+static struct node_db_schema_preflight inspect_schema_newer_than_binary(
+    sqlite3 *db, int32_t version)
+{
+    int32_t floor = version;
+    const char *floor_detail = NULL;
+    if (!read_compat_floor(db, version, &floor, &floor_detail))
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, version,
+                                floor_detail);
+    if (floor > NODE_DB_MAX_SCHEMA) {
+        struct node_db_schema_preflight out = preflight_result(
+            NODE_DB_SCHEMA_PREFLIGHT_NEWER, version,
+            "newer schema marker above this binary's compat floor");
+        out.floor = floor;
+        return out;
+    }
+    const char *ledger_detail = NULL;
+    if (!migration_ledger_consistent(db, version, &ledger_detail)) {
+        struct node_db_schema_preflight out = preflight_result(
+            NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, version, ledger_detail);
+        out.floor = floor;
+        return out;
+    }
+    struct node_db_schema_preflight out = preflight_result(
+        NODE_DB_SCHEMA_PREFLIGHT_READ_COMPATIBLE, version,
+        "newer schema marker within this binary's compat floor");
+    out.floor = floor;
+    return out;
+}
+
+static struct node_db_schema_preflight inspect_schema(sqlite3 *db)
+{
+    int tables = 0;
+    if (count_tables(db, &tables) != SQLITE_OK)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: SQLite schema is unreadable");
+    if (tables == 0)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_FRESH, 0,
+            "empty SQLite database");
+
+    bool node_state = false;
+    if (table_exists(db, "node_state", &node_state) != SQLITE_OK)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: cannot inspect node_state");
+    if (!node_state)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: recognized tables exist without node_state");
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT value FROM node_state WHERE key='schema_version'",
+        -1, &stmt, NULL);
+    if (rc != SQLITE_OK || !stmt) {
+        sqlite3_finalize(stmt);
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: schema marker is unreadable");
+    }
+
+    int rows = 0;
+    int32_t version = 0;
+    bool malformed = false;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) { // raw-sql-ok:read-only-schema-preflight
+        rows++;
+        if (rows != 1 || sqlite3_column_type(stmt, 0) != SQLITE_BLOB ||
+            sqlite3_column_bytes(stmt, 0) != (int)sizeof(version) ||
+            !sqlite3_column_blob(stmt, 0)) {
+            malformed = true;
+            continue;
+        }
+        memcpy(&version, sqlite3_column_blob(stmt, 0), sizeof(version));
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: schema marker read failed");
+    if (rows != 1)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            rows == 0
+                ? "SCHEMA_VERSION_UNKNOWN: schema marker missing"
+                : "SCHEMA_VERSION_UNKNOWN: contradictory schema markers");
+    if (malformed)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: schema marker is not one 4-byte blob");
+    if (version <= 0)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, version,
+            "SCHEMA_VERSION_UNKNOWN: schema marker is unsupported");
+
+    if (version > NODE_DB_MAX_SCHEMA)
+        return inspect_schema_newer_than_binary(db, version);
+
+    const char *detail = NULL;
+    if (!migration_ledger_consistent(db, version, &detail))
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, version,
+                                detail);
+    struct node_db_schema_preflight out = preflight_result(
+        NODE_DB_SCHEMA_PREFLIGHT_SUPPORTED, version, "supported schema marker");
+    out.floor = version;
+    return out;
+}
+
+struct node_db_schema_preflight node_db_schema_preflight_existing(
+    const char *path)
+{
+    if (!path || path[0] == '\0')
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: database path missing");
+    if (strcmp(path, ":memory:") == 0)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_FRESH, 0,
+                                "in-memory database");
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        if (errno == ENOENT)
+            return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_FRESH, 0,
+                                    "database path absent");
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: database path cannot be inspected");
+    }
+    if (!S_ISREG(st.st_mode))
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: database path is not a regular file");
+    if (st.st_size == 0)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_FRESH, 0,
+                                "empty database file");
+
+#if defined(_WIN32)
+    int fd = _open(path, _O_RDONLY | _O_BINARY);
+#else
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+#endif
+    if (fd < 0)
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: database file cannot be read");
+    unsigned char header[20] = { 0 };
+    if (!read_header(fd, header)) {
+        close(fd);
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: invalid or unreadable SQLite header");
+    }
+
+    bool wal_mode = header[18] == 2;
+    struct preflight_sidecars sidecars;
+    if (!probe_sidecars(path, &sidecars)) {
+        close(fd);
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: database sidecars cannot be inspected");
+    }
+
+    sqlite3 *db = NULL;
+    if (wal_mode && !(sidecars.wal && sidecars.shm) &&
+        !(!sidecars.shm && (!sidecars.wal || sidecars.wal_size == 0))) {
+        close(fd);
+        return preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            sidecars.wal && sidecars.wal_size > 0
+                ? "SCHEMA_VERSION_UNKNOWN: unrecovered WAL has no wal-index"
+                : "SCHEMA_VERSION_UNKNOWN: contradictory WAL sidecars");
+    }
+
+    const char *open_branch = NULL;
+    int rc = open_preflight_database(path, fd, wal_mode, &sidecars, &db,
+                                     &open_branch);
+    int open_errno = errno;
+
+    struct node_db_schema_preflight out;
+    if (rc != SQLITE_OK || !db) {
+        log_preflight_open_failure(path, fd, open_branch, rc, open_errno, db,
+                                   &sidecars);
+        out = preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: read-only SQLite open failed");
+    } else if (sqlite3_busy_timeout(db, 10000) != SQLITE_OK) {
+        out = preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: cannot bound preflight lock wait");
+    } else if (sqlite3_exec(db, "PRAGMA query_only=ON", NULL, NULL, NULL) !=
+               SQLITE_OK) {
+        out = preflight_result(NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN, 0,
+            "SCHEMA_VERSION_UNKNOWN: cannot enforce query-only preflight");
+    } else {
+        out = inspect_schema(db);
+    }
+    if (db)
+        sqlite3_close(db);
+    close(fd);
+    return out;
+}
+
+bool node_db_schema_report_for_path(const char *path,
+                                    struct node_db_schema_report *out)
+{
+    if (!path || !out)
+        return false;
+    memset(out, 0, sizeof(*out));
+
+    struct node_db_schema_preflight pf = node_db_schema_preflight_existing(path);
+    switch (pf.state) {
+    case NODE_DB_SCHEMA_PREFLIGHT_FRESH:
+        out->fresh = true;
+        out->detail = pf.detail;
+        return true;
+    case NODE_DB_SCHEMA_PREFLIGHT_UNKNOWN:
+        out->unknown = true;
+        out->detail = pf.detail;
+        return true;
+    case NODE_DB_SCHEMA_PREFLIGHT_SUPPORTED:
+    case NODE_DB_SCHEMA_PREFLIGHT_READ_COMPATIBLE:
+    case NODE_DB_SCHEMA_PREFLIGHT_NEWER:
+        out->schema_version = pf.version;
+        out->schema_compat_floor = pf.floor;
+        out->detail = pf.detail;
+        if (pf.version < NODE_DB_MAX_SCHEMA)
+            out->verdict = NODE_DB_SCHEMA_VERDICT_UPGRADE;
+        else if (pf.version == NODE_DB_MAX_SCHEMA)
+            out->verdict = NODE_DB_SCHEMA_VERDICT_SAME;
+        else if (pf.floor <= NODE_DB_MAX_SCHEMA)
+            out->verdict = NODE_DB_SCHEMA_VERDICT_DOWNGRADE_OK;
+        else
+            out->verdict = NODE_DB_SCHEMA_VERDICT_DOWNGRADE_REFUSED;
+        return true;
+    default:
+        out->unknown = true;
+        out->detail = "SCHEMA_VERSION_UNKNOWN: unrecognized preflight state";
+        return true;
+    }
+}

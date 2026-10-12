@@ -1,0 +1,60 @@
+# check_proc_self_shim.sh baseline — grandfathered raw /proc/self or
+# /proc/uptime reads outside platform/modules/platform/. RATCHET, shrink-only: a file
+# here may be removed once migrated onto platform/os_proc.h; no new file
+# may be added. engine/modules/sim/src/postmortem.c:1040 is the one PERMANENT
+# exemption (async-signal-safe crash handler — the shim is not
+# signal-safe) rather than a migration debt; see its in-code comment.
+engine/composition/src/consensus_state_snapshot_export_fd_io.c
+engine/composition/src/consensus_state_snapshot_candidate_output.c
+engine/composition/src/consensus_state_snapshot_export.c
+engine/composition/src/consensus_state_snapshot_output_seal.c
+# consensus_state_producer_receipt.c hashes /proc/self/exe through an open file
+# descriptor so the receipt names the executing bytes without a path race.
+engine/composition/src/consensus_state_producer_receipt.c
+
+engine/composition/src/consensus_state_snapshot_export_proof.c
+platform/modules/util/src/thread_profile.c
+engine/modules/sim/src/postmortem.c
+tests/harness/src/test_replay_canary_verdict.c
+tests/harness/src/test_make_lint_gates.c
+tests/harness/src/test_consensus_state_snapshot_export.c
+engine/modules/metrics/src/metrics.c
+engine/modules/hotswap/src/hotswap_activate.c
+engine/modules/hotswap/src/hotswap_loader.c
+tests/harness/src/test_wallet_persistence_cycle.c
+# Reconciled at gate-landing (files predate the gate on main; the lane forked
+# earlier). The next four are PERMANENT-exemption class, not migration debt:
+# direct open("/proc/self/exe") is the race-free way to hash the running
+# binary (a path readlink reintroduces TOCTOU), and "/proc/self/fd/N/…" is
+# capability-relative path construction (openat semantics), not a proc read.
+# platform/modules/util/src/authority_receipt.c generalizes exactly that race-free
+# running-binary digest (PERMANENT-exemption class, same reason).
+platform/modules/util/src/authority_receipt.c
+engine/services/src/canary_sentinel_watch.c
+engine/composition/src/consensus_state_replay_receipt.c
+engine/controllers/src/anchor_controller.c
+tests/harness/src/test_canary_sentinel_watch.c
+engine/composition/src/consensus_state_snapshot_install_activate.c
+engine/modules/storage/src/progress_store.c
+engine/modules/storage/src/projection_store.c
+# newly scanned 2026-09-06: root list was dead since the tree rename
+# (check-proc-self-shim walked "app config lib tools" — only "tools" was
+# real — so the gate scanned tools/ alone and reported clean; re-rooted
+# onto core/engine/contexts/cognition/platform/tools). This is CREATING
+# coverage, not raising a baseline: bench_system_uptime_seconds() wants raw
+# system uptime, not os_proc_uptime_seconds()'s process-age-since-boot
+# value, so the two are not a drop-in swap; pinning until a raw-uptime
+# accessor exists on the platform seam.
+engine/entry/main_cli_modes.c
+# tools/dev/devloop_reflex_runner.c: open("/proc/self/exe", O_CLOEXEC) is the
+# race-free way to get a descriptor for the clean-zygote reflex runner's
+# fork+exec — the same PERMANENT-exemption class as
+# platform/modules/util/src/authority_receipt.c above (race-free
+# running-binary access), plus a second, stronger reason platform/os_proc.h's
+# os_proc_open_self_exe() cannot satisfy: it returns a FILE* from a plain
+# fopen(), whose fd is not close-on-exec, so it can leak into an unrelated
+# exec() from another thread in this (possibly multithreaded) resident
+# during the window before this fd is used. The whole point of this file is
+# fd hygiene into the runner, so the O_CLOEXEC atomicity has to be at the
+# open() call itself.
+tools/dev/devloop_reflex_runner.c

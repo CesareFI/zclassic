@@ -1,0 +1,4 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * The Linux dev-build arm opens one shared library. Release and Windows
+ * compile the refusal stub and reach no loader symbol. */
+ZCL_MODULE_CAPABILITY("engine/modules/hotswap/src/dev_library.c", CAP_DYNLOAD, "opens one dev-only shared library after an explicit GUI launch; a release build compiles the refusal stub")

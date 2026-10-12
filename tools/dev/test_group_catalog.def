@@ -1,0 +1,1682 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * Canonical parallel-test registry. Include with ZCL_TEST_GROUP(name) and
+ * ZCL_SPEC_GROUP(name) defined; either macro may be a no-op. Registry order
+ * is transcript order and therefore stable evidence. */
+
+ZCL_TEST_GROUP(hex_codec)
+ZCL_TEST_GROUP(build_profile)
+ZCL_TEST_GROUP(code_inventory)
+ZCL_TEST_GROUP(code_ontology)
+ZCL_TEST_GROUP(code_semantic_candidate)
+ZCL_TEST_GROUP(code_vector_hint)
+ZCL_TEST_GROUP(base_foundation)
+ZCL_TEST_GROUP(script_tail_poison)
+ZCL_TEST_GROUP(byte_order_codec)
+ZCL_TEST_GROUP(codec_cursor)
+ZCL_TEST_GROUP(rvemu)
+ZCL_TEST_GROUP(rvuser)
+ZCL_TEST_GROUP(test_fdt)
+ZCL_TEST_GROUP(rvvirtio)
+ZCL_TEST_GROUP(determinism)
+ZCL_TEST_GROUP(zcode_creation_attribution)
+ZCL_TEST_GROUP(zcode_shadow_policy)
+ZCL_TEST_GROUP(zcode_score_receipt)
+ZCL_TEST_GROUP(zcode_score_receipt_packages)
+ZCL_TEST_GROUP(zcode_score_receipt_rejections)
+ZCL_TEST_GROUP(zcode_score_receipt_creation)
+ZCL_TEST_GROUP(zcode_score_receipt_patronage)
+ZCL_TEST_GROUP(zcode_score_receipt_reproduction)
+ZCL_TEST_GROUP(zcode_score_receipt_shadow)
+ZCL_TEST_GROUP(rvplat)
+ZCL_TEST_GROUP(zcode_package_registry)
+ZCL_TEST_GROUP(zcode_patronage)
+ZCL_TEST_GROUP(zcode_continuity)
+ZCL_TEST_GROUP(zcode_commons_projection)
+ZCL_TEST_GROUP(zcode_epoch_schedule)
+ZCL_TEST_GROUP(game)
+ZCL_TEST_GROUP(crypto)
+ZCL_TEST_GROUP(crypto_registry)
+ZCL_TEST_GROUP(encoding)
+ZCL_TEST_GROUP(test_str_money_codecs)
+ZCL_TEST_GROUP(chain)
+ZCL_TEST_GROUP(equihash_oom)
+ZCL_TEST_GROUP(pprev_walk)
+ZCL_TEST_GROUP(chain_tip)
+ZCL_TEST_GROUP(checkpoint)
+ZCL_TEST_GROUP(anchor_finality)
+ZCL_TEST_GROUP(keys)
+ZCL_TEST_GROUP(test_key_io_codec)
+ZCL_TEST_GROUP(test_png_writer)
+ZCL_TEST_GROUP(arena_view)
+ZCL_TEST_GROUP(skycombat_models)
+ZCL_TEST_GROUP(skycombat_expr)
+ZCL_TEST_GROUP(skycombat_input)
+ZCL_TEST_GROUP(skycombat_qa_frames)
+ZCL_TEST_GROUP(skycombat_fp_contract)
+ZCL_TEST_GROUP(skycombat_parts)
+ZCL_TEST_GROUP(skycombat_macho_parts)
+ZCL_TEST_GROUP(qr)
+ZCL_TEST_GROUP(shared_validators_zcl_address)
+ZCL_TEST_GROUP(script)
+ZCL_TEST_GROUP(net)
+ZCL_TEST_GROUP(netbase_split_host_port)
+/* The install front door's release-pin judgement (platform/modules/install), which used to
+ * live twice in shell and PowerShell and so was proved by neither runner. */
+ZCL_TEST_GROUP(z23_front_door)
+ZCL_TEST_GROUP(engine)
+ZCL_TEST_GROUP(engine_rules)
+ZCL_TEST_GROUP(engine_escalate)
+ZCL_TEST_GROUP(engine_claude)
+ZCL_TEST_GROUP(acme_b64url)
+ZCL_TEST_GROUP(acme_challenge)
+ZCL_TEST_GROUP(acme_renewal)
+ZCL_TEST_GROUP(acme_worker)
+ZCL_TEST_GROUP(acme_selfsigned)
+ZCL_TEST_GROUP(acme_cert_reload)
+ZCL_TEST_GROUP(https_sni_select)
+ZCL_TEST_GROUP(nat_route_dump)
+ZCL_TEST_GROUP(peer_strategy_worker)
+ZCL_TEST_GROUP(transaction)
+ZCL_TEST_GROUP(mempool)
+ZCL_TEST_GROUP(accept_to_mempool)
+ZCL_TEST_GROUP(rpc)
+ZCL_TEST_GROUP(sqlite)
+ZCL_TEST_GROUP(activerecord)
+ZCL_TEST_GROUP(activerecord_query_builder)
+ZCL_TEST_GROUP(validation)
+ZCL_TEST_GROUP(sapling_lazy_init)
+ZCL_TEST_GROUP(sapling)
+ZCL_TEST_GROUP(sapling_crypto)
+ZCL_TEST_GROUP(groth16_msm_parity)
+ZCL_TEST_GROUP(bn254)
+ZCL_TEST_GROUP(merkle_tree)
+ZCL_TEST_GROUP(merkle_malleability)
+ZCL_TEST_GROUP(slp)
+ZCL_TEST_GROUP(models)
+ZCL_TEST_GROUP(core)
+ZCL_TEST_GROUP(overlay)
+ZCL_TEST_GROUP(overlay_parse_parity)
+ZCL_TEST_GROUP(znam)
+ZCL_TEST_GROUP(znam_site)
+ZCL_TEST_GROUP(zanc)
+ZCL_TEST_GROUP(zid)
+ZCL_TEST_GROUP(zid_identity)
+ZCL_TEST_GROUP(zid_seniority)
+ZCL_TEST_GROUP(zid_seniority_binding)
+ZCL_TEST_GROUP(boot_seniority_epoch_roll)
+ZCL_TEST_GROUP(zdir)
+ZCL_TEST_GROUP(zdir_write_path)
+ZCL_TEST_GROUP(identity_command)
+ZCL_TEST_GROUP(zdesc)
+ZCL_TEST_GROUP(zendp)
+ZCL_TEST_GROUP(zendp_records)
+ZCL_TEST_GROUP(zendp_revocation)
+ZCL_TEST_GROUP(zendp_window)
+ZCL_TEST_GROUP(proof_chain)
+ZCL_TEST_GROUP(htlc)
+ZCL_TEST_GROUP(swap_settlement)
+ZCL_TEST_GROUP(file_market)
+ZCL_TEST_GROUP(file_market_moderation)
+ZCL_TEST_GROUP(strong_params)
+ZCL_TEST_GROUP(json)
+ZCL_TEST_GROUP(robustness)
+ZCL_TEST_GROUP(wallet)
+ZCL_TEST_GROUP(primitives)
+ZCL_TEST_GROUP(bloom)
+ZCL_TEST_GROUP(coins)
+ZCL_TEST_GROUP(store)
+ZCL_TEST_GROUP(store_listing)
+ZCL_TEST_GROUP(store_buyer)
+ZCL_TEST_GROUP(store_transparent_pay)
+ZCL_TEST_GROUP(shop)
+ZCL_TEST_GROUP(shop_reputation)
+ZCL_TEST_GROUP(shop_want)
+ZCL_TEST_GROUP(shop_fulfill)
+ZCL_TEST_GROUP(blog)
+ZCL_TEST_GROUP(api)
+ZCL_TEST_GROUP(explorer)
+ZCL_TEST_GROUP(explorer_rpc_call)
+ZCL_TEST_GROUP(explorer_index)
+ZCL_TEST_GROUP(format_helpers_codec)
+ZCL_TEST_GROUP(mining)
+ZCL_TEST_GROUP(utxo_commitment)
+ZCL_TEST_GROUP(mmr)
+ZCL_TEST_GROUP(mmb)
+ZCL_TEST_GROUP(sha3_windows)
+ZCL_TEST_GROUP(sha3_stream)
+ZCL_TEST_GROUP(mlkem)
+ZCL_TEST_GROUP(sha3_256_x4)
+ZCL_TEST_GROUP(sha3_512_x4)
+ZCL_TEST_GROUP(sha256_isa_parity)
+ZCL_TEST_GROUP(sha512_isa_parity)
+ZCL_TEST_GROUP(chacha20_isa_parity)
+ZCL_TEST_GROUP(keystone_utxo_binding)
+ZCL_TEST_GROUP(self_folded_anchor)
+ZCL_TEST_GROUP(self_folded_anchor_heavy)
+ZCL_TEST_GROUP(utxo_root_ladder)
+ZCL_TEST_GROUP(utxo_root_ladder_tripwire)
+ZCL_TEST_GROUP(golden_staleness_canary)
+ZCL_TEST_GROUP(flyclient)
+ZCL_TEST_GROUP(flyclient_chainwork_floor)
+ZCL_TEST_GROUP(test_zmsg_memo_codec)
+ZCL_TEST_GROUP(zpay)
+ZCL_TEST_GROUP(zses)
+ZCL_TEST_GROUP(mesh_pairing)
+ZCL_TEST_GROUP(mesh_pairing_list)
+ZCL_TEST_GROUP(mesh_route)
+ZCL_TEST_GROUP(mesh_capability_grant)
+ZCL_TEST_GROUP(mesh_capability_proto)
+ZCL_TEST_GROUP(mesh_pairing_controller)
+ZCL_TEST_GROUP(mesh_status_proto)
+ZCL_TEST_GROUP(state_offer)
+ZCL_TEST_GROUP(state_offer_store)
+ZCL_TEST_GROUP(stale_offers_only)
+/* mesh terminal open/receipt/data/resize/close wire codec and receipt proof */
+ZCL_TEST_GROUP(mesh_terminal_proto)
+ZCL_TEST_GROUP(mesh_private_object_proto)
+ZCL_TEST_GROUP(mesh_private_object_crypto)
+ZCL_TEST_GROUP(mesh_private_object_grant_pipeline)
+ZCL_TEST_GROUP(mesh_private_object_root)
+ZCL_TEST_GROUP(mesh_private_object_frame)
+ZCL_TEST_GROUP(mesh_private_object_stage)
+ZCL_TEST_GROUP(mesh_private_object_schedule)
+ZCL_TEST_GROUP(mesh_private_object_receiver)
+ZCL_TEST_GROUP(mesh_private_object_admission)
+ZCL_TEST_GROUP(mesh_status_wire)
+ZCL_TEST_GROUP(mesh_status_begin)
+ZCL_TEST_GROUP(mind)
+ZCL_TEST_GROUP(wallet_metadata_encryption)
+ZCL_TEST_GROUP(transaction_intent)
+ZCL_TEST_GROUP(scan_util)
+ZCL_TEST_GROUP(tor)
+ZCL_TEST_GROUP(tor_watch)
+ZCL_TEST_GROUP(onion_bootstrap)
+ZCL_TEST_GROUP(onion_directory)
+ZCL_TEST_GROUP(onion_persistence)
+ZCL_TEST_GROUP(onion_stream)
+ZCL_TEST_GROUP(onion_bridge)
+ZCL_TEST_GROUP(onion_pair_watch_live)
+ZCL_TEST_GROUP(cold_start_sync)
+ZCL_TEST_GROUP(cold_join_sovereign)
+ZCL_TEST_GROUP(kill9_recovery)
+ZCL_TEST_GROUP(shielded_payment_gate)
+ZCL_TEST_GROUP(simnet_shielded_wallet_e2e)
+ZCL_TEST_GROUP(store_e2e_gate)
+ZCL_TEST_GROUP(store_e2e_shielded)
+ZCL_TEST_GROUP(soak_harness)
+/* POSIX path-argument refusal; the host-needs table supplies the runner. */
+ZCL_TEST_GROUP(soak_runner)
+/* crash-recovery harness CLI regressions (tools/crash_recovery_test.c ->
+ * build/bin/crash_recovery_test): an over-long --datadir/--connect is
+ * refused with exit 2 naming the flag instead of silently truncating
+ * into a fixed buffer (the chopped datadir reached sqlite3_open_v2,
+ * popen's stderr redirect and the spawned node's -datadir). Requires the
+ * binary; absence fails. The selected runner and
+ * proof build it through the BUILD_NEED row in test_group_host_needs.def. */
+ZCL_TEST_GROUP(crash_recovery)
+ZCL_TEST_GROUP(event)
+ZCL_TEST_GROUP(download)
+ZCL_TEST_GROUP(download_contention)
+ZCL_TEST_GROUP(download_enqueue_profile)
+ZCL_TEST_GROUP(download_speed_contract)
+ZCL_TEST_GROUP(body_coverage)
+ZCL_TEST_GROUP(body_history)
+ZCL_TEST_GROUP(consensus)
+ZCL_TEST_GROUP(consensus_parity)
+ZCL_TEST_GROUP(rom_state_checkpoint)
+ZCL_TEST_GROUP(policy)
+ZCL_TEST_GROUP(wallet_view)
+ZCL_TEST_GROUP(fast_sync)
+ZCL_TEST_GROUP(fast_sync_coins_export)
+ZCL_TEST_GROUP(fast_sync_coins_artifact)
+ZCL_TEST_GROUP(block_scan)
+ZCL_TEST_GROUP(node_config_file)
+ZCL_TEST_GROUP(node_health_service)
+ZCL_TEST_GROUP(chain_state_repo)
+ZCL_TEST_GROUP(recovery_policy)
+ZCL_TEST_GROUP(chain_evidence_controller)
+ZCL_TEST_GROUP(chain_evidence_store_load)
+ZCL_TEST_GROUP(chain_evidence_live_advance)
+ZCL_TEST_GROUP(long_op)
+ZCL_TEST_GROUP(agent_copy_prove)
+ZCL_TEST_GROUP(agent_test)
+ZCL_TEST_GROUP(source_identity_authority)
+ZCL_TEST_GROUP(db_txn)
+ZCL_TEST_GROUP(model_fields)
+ZCL_TEST_GROUP(sync_service)
+ZCL_TEST_GROUP(node_db_catchup_service)
+ZCL_TEST_GROUP(catchup_lifecycle_service)
+ZCL_TEST_GROUP(utxo_mirror_sync)
+ZCL_TEST_GROUP(snapshot_sync_service)
+ZCL_TEST_GROUP(snapshot_serve_loopback)
+ZCL_TEST_GROUP(block_swarm_loopback)
+ZCL_TEST_GROUP(file_controller)
+ZCL_TEST_GROUP(file_ops)
+ZCL_TEST_GROUP(file_service_pow_gate)
+ZCL_TEST_GROUP(puzzle)
+ZCL_TEST_GROUP(rom_seed)
+ZCL_TEST_GROUP(rom_fetch)
+ZCL_TEST_GROUP(rom_fetch_orphan_sweep)
+ZCL_TEST_GROUP(rom_fetch_controller)
+ZCL_TEST_GROUP(rom_fetch_onion)
+ZCL_TEST_GROUP(rom_bundle_admission)
+ZCL_TEST_GROUP(source_bundle_fetch)
+ZCL_TEST_GROUP(source_bundle_publish)
+ZCL_TEST_GROUP(sync_reduce)
+ZCL_TEST_GROUP(sync_reduce_invariants)
+ZCL_TEST_GROUP(sync_reduce_fuzz)
+ZCL_TEST_GROUP(sync_reduce_adapter)
+ZCL_TEST_GROUP(sync_shadow)
+ZCL_TEST_GROUP(zcl_ids)
+ZCL_TEST_GROUP(rom_manifest)
+ZCL_TEST_GROUP(rom_journal_resume)
+ZCL_TEST_GROUP(sync_trust_policy)
+ZCL_TEST_GROUP(code_capsule)
+ZCL_TEST_GROUP(code_have)
+ZCL_TEST_GROUP(code_focus)
+ZCL_TEST_GROUP(code_impact)
+ZCL_TEST_GROUP(code_closure)
+ZCL_TEST_GROUP(code_merkle)
+ZCL_TEST_GROUP(code_merkle_proof)
+ZCL_TEST_GROUP(core_seal)
+ZCL_TEST_GROUP(core_seal_interop)
+ZCL_TEST_GROUP(code_emitter)
+ZCL_TEST_GROUP(fact_writers)
+ZCL_TEST_GROUP(fleet_board)
+ZCL_TEST_GROUP(fleet_board_bridge)
+ZCL_TEST_GROUP(fleet_steer)
+ZCL_TEST_GROUP(fleet_gateway)
+ZCL_TEST_GROUP(fleet_gateway_shard_01)
+ZCL_TEST_GROUP(fleet_gateway_shard_02)
+ZCL_TEST_GROUP(fleet_gateway_shard_03)
+ZCL_TEST_GROUP(fleet_gateway_shard_04)
+ZCL_TEST_GROUP(fleet_gateway_shard_05)
+ZCL_TEST_GROUP(fleet_gateway_shard_06)
+ZCL_TEST_GROUP(board_site)
+ZCL_TEST_GROUP(fleet_enrol)
+ZCL_TEST_GROUP(fleet_objectives)
+ZCL_TEST_GROUP(file_tree_ops)
+ZCL_TEST_GROUP(spawn)
+ZCL_TEST_GROUP(integrity)
+ZCL_TEST_GROUP(rolling_anchor_service)
+ZCL_TEST_GROUP(protocols)
+ZCL_TEST_GROUP(chain_restore_planner)
+ZCL_TEST_GROUP(chain_restore_service)
+ZCL_TEST_GROUP(chain_activation_controller)
+ZCL_TEST_GROUP(hotswap_loader)
+ZCL_TEST_GROUP(hotswap_simnet)
+ZCL_TEST_GROUP(hotswap_module)
+ZCL_TEST_GROUP(hotswap_module_v2)
+ZCL_TEST_GROUP(hotswap_policy_module)
+ZCL_TEST_GROUP(hotswap_service_registry)
+ZCL_TEST_GROUP(hotswap_shelf)
+ZCL_TEST_GROUP(hotswap_rollback)
+ZCL_TEST_GROUP(dev_platform)
+ZCL_TEST_GROUP(dev_platform_shard_01)
+ZCL_TEST_GROUP(dev_platform_shard_02)
+ZCL_TEST_GROUP(dev_platform_shard_03)
+ZCL_TEST_GROUP(dev_platform_shard_04)
+ZCL_TEST_GROUP(dev_platform_shard_05)
+ZCL_TEST_GROUP(dev_platform_shard_06)
+ZCL_TEST_GROUP(dev_platform_shard_07)
+ZCL_TEST_GROUP(dev_platform_shard_08)
+ZCL_TEST_GROUP(reflex_runner)
+ZCL_TEST_GROUP(dev_app_scaffold)
+/* One dapp's signed App events crossing between two node databases through
+ * the real pull wire, and every way that crossing is refused. */
+ZCL_TEST_GROUP(app_event_sync)
+ZCL_TEST_GROUP(impact_composition)
+/* Signer identity for push-proof receipts: per-box key custody, the
+ * signers.allow trust list, and the pre-push admission decision over both. */
+ZCL_TEST_GROUP(dev_proof_signer)
+/* dev.vcs.ports: a contributor branch classified commit by commit against a
+ * private temporary index, and its typed refusals. */
+ZCL_TEST_GROUP(dev_port_table)
+/* Separate-account compile attestations: the signed record, the root-pinned
+ * verifier key, and the admission decision that refuses every other signer. */
+ZCL_TEST_GROUP(verify_attest)
+ZCL_TEST_GROUP(verify_store)
+/* The z23verify.fixed_result.v2 byte contract: pins, request, packet,
+ * receipt and record binding, each refusal named, plus key v2. */
+ZCL_TEST_GROUP(verify_contract)
+/* The fixed-result signer (UID 60092) and root publisher: a no-root dress
+ * rehearsal to a receiver HIT, and every custody and conflict refusal. */
+ZCL_TEST_GROUP(verify_signer)
+/* The fixed result.c receiver inside a landing proof: admission before
+ * make, zcc serving only admitted bytes, and HIT, COLD or BLOCK after. */
+ZCL_TEST_GROUP(verify_receiver)
+ZCL_TEST_GROUP(proof_ticket_reuse)
+ZCL_TEST_GROUP(proof_ticket_measure)
+/* Queued CHECK derives its closure and asks admission before the test child. */
+ZCL_TEST_GROUP(proof_ticket_check_seam)
+/* The fixed-result verifier images and seccomp filter: pinned roots, the
+ * no-root completeness proof, kernel enforcement, and the RED fixtures. */
+ZCL_TEST_GROUP(verifier_images)
+ZCL_TEST_GROUP(dev_shadow_select)
+ZCL_TEST_GROUP(dev_activation)
+ZCL_TEST_GROUP(devagent_surface)
+ZCL_TEST_GROUP(dev_fleet)
+ZCL_TEST_GROUP(dev_fleet_start)
+ZCL_TEST_GROUP(fleet_agents)
+ZCL_TEST_GROUP(dev_orient)
+/* dev.beta6.verify: the real beta6_bs_arm() preflight against a candidate
+ * serve tree, called from this process only. */
+ZCL_TEST_GROUP(dev_beta6_verify)
+ZCL_TEST_GROUP(devagent_situation)
+ZCL_TEST_GROUP(devagent_rules)
+ZCL_TEST_GROUP(devagent_start)
+ZCL_TEST_GROUP(devagent_claim)
+ZCL_TEST_GROUP(devagent_done)
+ZCL_TEST_GROUP(devagent_triage)
+ZCL_TEST_GROUP(devagent_ceiling)
+ZCL_TEST_GROUP(devagent_pace)
+ZCL_TEST_GROUP(devagent_hot)
+ZCL_TEST_GROUP(devagent_outcomes)
+ZCL_TEST_GROUP(devagent_reviewscore)
+ZCL_TEST_GROUP(devagent_ticketkey)
+ZCL_TEST_GROUP(devagent_queue)
+ZCL_TEST_GROUP(devagent_queue_order)
+ZCL_TEST_GROUP(devagent_liveness)
+ZCL_TEST_GROUP(devagent_queue_guard)
+ZCL_TEST_GROUP(devagent_worker)
+ZCL_TEST_GROUP(devagent_worker_guards)
+ZCL_TEST_GROUP(muse_session)
+ZCL_TEST_GROUP(muse_hex40)
+ZCL_TEST_GROUP(devagent_muse_run)
+ZCL_TEST_GROUP(devagent_receive)
+ZCL_TEST_GROUP(devagent_boardmail)
+ZCL_TEST_GROUP(devagent_mail)
+ZCL_TEST_GROUP(devagent_mail_wait)
+ZCL_TEST_GROUP(dev_factory)
+ZCL_TEST_GROUP(dev_machine_boot)
+ZCL_TEST_GROUP(dev_builtin_kernel)
+ZCL_TEST_GROUP(dev_machine_shell)
+ZCL_TEST_GROUP(guest_image_admission)
+ZCL_TEST_GROUP(rvmachine)
+ZCL_TEST_GROUP(rvmachine_snapshot)
+ZCL_TEST_GROUP(rvmachine_data_disk)
+ZCL_TEST_GROUP(rvmachine_geli_volume)
+ZCL_TEST_GROUP(rvmachine_freebsd_ports)
+ZCL_TEST_GROUP(rvmachine_freebsd_release)
+ZCL_TEST_GROUP(rvmachine_freebsd_ssh_fd)
+ZCL_TEST_GROUP(guest_ssh_fixture)
+ZCL_TEST_GROUP(wallet_gui_load)
+ZCL_TEST_GROUP(dev_train)
+ZCL_TEST_GROUP(dev_train_keep)
+ZCL_TEST_GROUP(dev_fast_plan)
+ZCL_TEST_GROUP(dev_index)
+ZCL_TEST_GROUP(mutation_harness)
+ZCL_TEST_GROUP(command_registry_catalog)
+ZCL_TEST_GROUP(command_registry_latency)
+ZCL_TEST_GROUP(metaverse_agent_broker)
+ZCL_TEST_GROUP(metaverse_vocabulary)
+ZCL_TEST_GROUP(metaverse_view_state)
+ZCL_TEST_GROUP(metaverse_broker_authority)
+ZCL_TEST_GROUP(metaverse_broker_idempotency)
+ZCL_TEST_GROUP(status_readiness_truth)
+ZCL_TEST_GROUP(native_api_contract)
+ZCL_TEST_GROUP(principal_authz)
+ZCL_TEST_GROUP(auth_login)
+ZCL_TEST_GROUP(command_authority)
+ZCL_TEST_GROUP(command_handler_snapshot)
+ZCL_TEST_GROUP(metric_alerts)
+ZCL_TEST_GROUP(db_validators)
+ZCL_TEST_GROUP(peer_scoring)
+ZCL_TEST_GROUP(peer_dos_fairness)
+ZCL_TEST_GROUP(peer_bandwidth)
+ZCL_TEST_GROUP(single_peer_ban_recovery)
+ZCL_TEST_GROUP(peer_identity_hostkey)
+ZCL_TEST_GROUP(secrets_hygiene)
+ZCL_TEST_GROUP(block_index_integrity)
+ZCL_TEST_GROUP(block_map_grow_phashblock)
+ZCL_TEST_GROUP(block_successor)
+ZCL_TEST_GROUP(key_hostile_wif)
+ZCL_TEST_GROUP(keys_hostile_derive)
+ZCL_TEST_GROUP(block_locator_bounds)
+ZCL_TEST_GROUP(block_map_grow_collision)
+ZCL_TEST_GROUP(connect_node_locked)
+ZCL_TEST_GROUP(stream_read_no_overflow)
+ZCL_TEST_GROUP(fast_sync_serve_chunk_db_clamps)
+ZCL_TEST_GROUP(connman_node_count_locked)
+ZCL_TEST_GROUP(transaction_deserialize_count_amplification)
+ZCL_TEST_GROUP(block_deserialize_txcount_amplification)
+ZCL_TEST_GROUP(block_index_node_db_topup)
+ZCL_TEST_GROUP(lcc_write_rules)
+ZCL_TEST_GROUP(seal_rewind)
+ZCL_TEST_GROUP(fees_oom)
+ZCL_TEST_GROUP(fees_oom_inject)
+ZCL_TEST_GROUP(multisig_consensus_branches)
+ZCL_TEST_GROUP(parse_script_oversize_hex)
+ZCL_TEST_GROUP(script_num_minimal_encoding)
+ZCL_TEST_GROUP(domain_consensus_pow_seal_matrix)
+ZCL_TEST_GROUP(domain_consensus_pow_seal_powlimit_floor)
+ZCL_TEST_GROUP(domain_consensus_pow_seal_malformed_paths)
+ZCL_TEST_GROUP(domain_consensus_pow_seal_deterministic)
+ZCL_TEST_GROUP(checkpoints_progress_boundary_crossover)
+ZCL_TEST_GROUP(checkpoints_progress_zero_defenses)
+ZCL_TEST_GROUP(checkpoints_progress_sigcheck_factor)
+ZCL_TEST_GROUP(checkpoints_progress_regression_seal)
+ZCL_TEST_GROUP(regtest_generate)
+ZCL_TEST_GROUP(generatetoaddress)
+ZCL_TEST_GROUP(equihash_null_guards)
+ZCL_TEST_GROUP(equihash_solution_size_demux)
+ZCL_TEST_GROUP(equihash_blake2b_state_seal)
+ZCL_TEST_GROUP(equihash_serialization_matches_independent_rebuild)
+ZCL_TEST_GROUP(equihash_legacy_wrapper_regression_seal)
+ZCL_TEST_GROUP(coins_amount_codec_roundtrip)
+ZCL_TEST_GROUP(coins_amount_codec_boundary_exponents)
+ZCL_TEST_GROUP(coins_amount_codec_digit_preservation)
+ZCL_TEST_GROUP(coins_amount_codec_regression_seal)
+ZCL_TEST_GROUP(hkdf_sha256_rfc5869)
+ZCL_TEST_GROUP(hkdf_sha3_256)
+ZCL_TEST_GROUP(x25519_safe)
+ZCL_TEST_GROUP(noise_nk_handshake)
+ZCL_TEST_GROUP(noise_xx_handshake)
+ZCL_TEST_GROUP(noise_xxhfs_handshake)
+ZCL_TEST_GROUP(session_transport)
+ZCL_TEST_GROUP(noise_transport_parity)
+ZCL_TEST_GROUP(hmac_sha512_kat_rfc4231_jefe)
+ZCL_TEST_GROUP(hmac_sha512_kat_oversized_key)
+ZCL_TEST_GROUP(hmac_sha512_empty_message)
+ZCL_TEST_GROUP(hmac_sha512_multiblock_stateful_write)
+ZCL_TEST_GROUP(hmac_sha512_key_len_128_boundary)
+ZCL_TEST_GROUP(pbkdf2_sha512_rfc_vector)
+ZCL_TEST_GROUP(pbkdf2_sha512_multiblock)
+ZCL_TEST_GROUP(pbkdf2_sha512_high_iterations)
+ZCL_TEST_GROUP(pbkdf2_sha512_empty_inputs)
+ZCL_TEST_GROUP(pbkdf2_sha512_one_byte_output)
+ZCL_TEST_GROUP(sapling_address_hash_fields)
+ZCL_TEST_GROUP(sprout_address_hash_fields)
+ZCL_TEST_GROUP(sapling_sprout_hash_idempotence_and_distinct)
+ZCL_TEST_GROUP(sprout_spending_key_viewing_key)
+ZCL_TEST_GROUP(note_encryption_kdf_domain_separation)
+ZCL_TEST_GROUP(note_encryption_prf_ock_known_answer)
+ZCL_TEST_GROUP(note_encryption_sapling_kdf_arg_order_distinct)
+ZCL_TEST_GROUP(note_encryption_sapling_kdf_avalanche)
+ZCL_TEST_GROUP(note_encryption_sapling_kdf_known_answer)
+ZCL_TEST_GROUP(note_encryption_sprout_kdf_avalanche)
+ZCL_TEST_GROUP(note_encryption_sprout_kdf_known_answer)
+ZCL_TEST_GROUP(note_encryption_sprout_kdf_nonce_sweep)
+ZCL_TEST_GROUP(zip32_default_diversifier_deterministic)
+ZCL_TEST_GROUP(zip32_default_diversifier_is_ff1_of_settled_index)
+ZCL_TEST_GROUP(zip32_diversifier_advances_index_in_place)
+ZCL_TEST_GROUP(zip32_diversifier_distinct_keys_distinct_output)
+ZCL_TEST_GROUP(zip32_diversifier_index_boundaries)
+ZCL_TEST_GROUP(zip32_diversifier_skips_invalid_indices)
+ZCL_TEST_GROUP(zip32_ff1_radix2_deterministic)
+ZCL_TEST_GROUP(script_interp_altstack_conditional)
+ZCL_TEST_GROUP(script_interp_op2rot_order)
+ZCL_TEST_GROUP(script_interp_oppick_bounds)
+ZCL_TEST_GROUP(script_interp_oproll_semantics)
+ZCL_TEST_GROUP(script_interp_optuck_insert)
+ZCL_TEST_GROUP(script_interp_overflow_boundary)
+ZCL_TEST_GROUP(wallet_backup)
+ZCL_TEST_GROUP(wallet_rescan_coverage)
+ZCL_TEST_GROUP(wallet_restore)
+ZCL_TEST_GROUP(wallet_destruction_drill)
+ZCL_TEST_GROUP(wallet_canary)
+ZCL_TEST_GROUP(wallet_persistence_cycle)
+ZCL_TEST_GROUP(dbquery_secret_denylist)
+ZCL_TEST_GROUP(wallet_flush_rollback)
+ZCL_TEST_GROUP(log_json)
+ZCL_TEST_GROUP(http_middleware)
+ZCL_TEST_GROUP(rpc_timeout)
+ZCL_TEST_GROUP(wallet_keystore)
+ZCL_TEST_GROUP(wallet_sqlite_enc)
+ZCL_TEST_GROUP(zcl_result)
+ZCL_TEST_GROUP(netaddr_classify)
+ZCL_TEST_GROUP(wallet_sqlite_open_errors)
+ZCL_TEST_GROUP(watch_only)
+ZCL_TEST_GROUP(coin_selection)
+ZCL_TEST_GROUP(disk_monitor)
+ZCL_TEST_GROUP(binary_staleness)
+ZCL_TEST_GROUP(binary_ab_fallback)
+ZCL_TEST_GROUP(network_monitor)
+ZCL_TEST_GROUP(netsplit_detector)
+ZCL_TEST_GROUP(directory_influence_policy)
+ZCL_TEST_GROUP(network_crawler)
+ZCL_TEST_GROUP(db_maintenance)
+ZCL_TEST_GROUP(storage_housekeeping)
+ZCL_TEST_GROUP(mempool_limits)
+ZCL_TEST_GROUP(addrman_integrity)
+ZCL_TEST_GROUP(anchor_peers)
+ZCL_TEST_GROUP(peer_memory)
+ZCL_TEST_GROUP(zdir_selection)
+ZCL_TEST_GROUP(ibd_throttle)
+ZCL_TEST_GROUP(consensus_reject_events)
+ZCL_TEST_GROUP(consensus_reject_index)
+ZCL_TEST_GROUP(blocker_history)
+ZCL_TEST_GROUP(chain_rollback)
+ZCL_TEST_GROUP(alerts)
+ZCL_TEST_GROUP(ws_events)
+ZCL_TEST_GROUP(trace)
+ZCL_TEST_GROUP(phgr13_fix)
+ZCL_TEST_GROUP(sprout_phgr13_kat)
+ZCL_TEST_GROUP(sprout_groth16_kat)
+ZCL_TEST_GROUP(transaction_wire_evidence)
+ZCL_TEST_GROUP(rescanwitnesses_diverge_guard)
+ZCL_TEST_GROUP(gap_fill_frontier_window)
+ZCL_TEST_GROUP(groth16_selfverify)
+ZCL_TEST_GROUP(groth16_r1cs_oracle)
+ZCL_TEST_GROUP(native_spend_proof)
+ZCL_TEST_GROUP(snark_kat)
+ZCL_TEST_GROUP(bls12_381_adversarial)
+ZCL_TEST_GROUP(verify_bench_selftest)
+ZCL_TEST_GROUP(crypto_perf_selftest)
+ZCL_TEST_GROUP(sapling_prover_rng_determinism)
+ZCL_TEST_GROUP(no_hardcoded_home)
+ZCL_TEST_GROUP(cookie_rotation)
+ZCL_TEST_GROUP(cli_auth_robust)
+ZCL_TEST_GROUP(cli_argv_strict)
+ZCL_TEST_GROUP(reorg_safety)
+ZCL_TEST_GROUP(reorg_parity)
+ZCL_TEST_GROUP(stage_reorg_unwind_parity)
+ZCL_TEST_GROUP(coins_wipe_rebuild_reorg)
+ZCL_TEST_GROUP(coins_applied_frontier)
+ZCL_TEST_GROUP(utxo_apply_value_balance)
+ZCL_TEST_GROUP(utxo_apply_unspendable)
+ZCL_TEST_GROUP(utxo_apply_coinbase_maturity)
+ZCL_TEST_GROUP(connect_block_self_write)
+ZCL_TEST_GROUP(connect_block_sapling_root)
+ZCL_TEST_GROUP(connect_block_checkdatasig_sigops)
+ZCL_TEST_GROUP(invalidateblock)
+ZCL_TEST_GROUP(most_work_selector)
+ZCL_TEST_GROUP(key_scrub)
+ZCL_TEST_GROUP(block_index_loader)
+ZCL_TEST_GROUP(block_index_flat_probe)
+ZCL_TEST_GROUP(chain_state_validator)
+ZCL_TEST_GROUP(utxo_recovery_service)
+ZCL_TEST_GROUP(utxo_reimport_flag)
+ZCL_TEST_GROUP(self_heal_scan_fallback)
+ZCL_TEST_GROUP(rpc_error_envelope)
+ZCL_TEST_GROUP(rpc_frontdoor_slots)
+ZCL_TEST_GROUP(tx_property)
+ZCL_TEST_GROUP(workpool)
+ZCL_TEST_GROUP(bip113_bip65)
+ZCL_TEST_GROUP(block_timestamp_adversarial)
+ZCL_TEST_GROUP(mempool_orphan)
+ZCL_TEST_GROUP(fee_estimation)
+ZCL_TEST_GROUP(header_sync)
+ZCL_TEST_GROUP(header_sync_stall)
+ZCL_TEST_GROUP(header_range_sched)
+ZCL_TEST_GROUP(sync_throughput)
+ZCL_TEST_GROUP(hd_keychain)
+ZCL_TEST_GROUP(mnemonic)
+ZCL_TEST_GROUP(bip44)
+ZCL_TEST_GROUP(compact_blocks)
+ZCL_TEST_GROUP(dandelion)
+ZCL_TEST_GROUP(addrman_rebalance)
+ZCL_TEST_GROUP(addrman_eclipse)
+ZCL_TEST_GROUP(chain_reorg_uncorroborated)
+ZCL_TEST_GROUP(addrman_shutdown_race)
+ZCL_TEST_GROUP(block_pruning)
+ZCL_TEST_GROUP(schema_migration)
+ZCL_TEST_GROUP(db_migration_idempotent)
+ZCL_TEST_GROUP(coins_view_atomicity)
+ZCL_TEST_GROUP(coins_anchor_reconcile_all)
+ZCL_TEST_GROUP(coins_best_derivation)
+ZCL_TEST_GROUP(boot_coins_anchor_dual_store_recovery)
+ZCL_TEST_GROUP(make_lint_gates)
+ZCL_TEST_GROUP(multisig)
+ZCL_TEST_GROUP(rpc_auth_hardening)
+ZCL_TEST_GROUP(disk_block_io)
+ZCL_TEST_GROUP(msg_handlers)
+ZCL_TEST_GROUP(process_headers_adversarial)
+ZCL_TEST_GROUP(getheaders_serve_fallback)
+ZCL_TEST_GROUP(getheaders_serve_pow_dedup)
+ZCL_TEST_GROUP(getheaders_serve_receipt)
+ZCL_TEST_GROUP(net_msg_dos)
+ZCL_TEST_GROUP(net_framing_dos)
+ZCL_TEST_GROUP(net_frame_hardening)
+ZCL_TEST_GROUP(net_handshake_adversarial)
+ZCL_TEST_GROUP(net_ban_persistence)
+ZCL_TEST_GROUP(net_census)
+ZCL_TEST_GROUP(peer_disconnect_log)
+ZCL_TEST_GROUP(block_source_policy)
+ZCL_TEST_GROUP(chain_advance_atomicity)
+ZCL_TEST_GROUP(block_source_policy_status_json)
+ZCL_TEST_GROUP(lag_slo)
+ZCL_TEST_GROUP(boot_phase)
+ZCL_TEST_GROUP(boot_status)
+ZCL_TEST_GROUP(boot_odelta_scan)
+ZCL_TEST_GROUP(sysinit)
+ZCL_TEST_GROUP(path_check)
+ZCL_TEST_GROUP(parse_num)
+ZCL_TEST_GROUP(boot_progress)
+ZCL_TEST_GROUP(supervisor)
+ZCL_TEST_GROUP(supervisor_domains)
+ZCL_TEST_GROUP(supervisor_production_tree)
+ZCL_TEST_GROUP(supervisor_backstop)
+ZCL_TEST_GROUP(self_heal_supervisor)
+ZCL_TEST_GROUP(supervisor_progress_policy)
+ZCL_TEST_GROUP(sd_notify)
+ZCL_TEST_GROUP(condition_engine)
+ZCL_TEST_GROUP(utxo_activation_paused)
+ZCL_TEST_GROUP(sync_watchdog_conditions)
+ZCL_TEST_GROUP(sticky_conditions)
+ZCL_TEST_GROUP(sticky_escalator)
+ZCL_TEST_GROUP(mem_pressure)
+ZCL_TEST_GROUP(validation_pack_conditions)
+ZCL_TEST_GROUP(stall_totality_matrix)
+ZCL_TEST_GROUP(blocker_meta_detector)
+ZCL_TEST_GROUP(peer_snapshot_conditions)
+ZCL_TEST_GROUP(snapshot_receive_stalled_condition)
+ZCL_TEST_GROUP(snapshot_negotiation_stalled_condition)
+ZCL_TEST_GROUP(snapshot_failed_reset_condition)
+ZCL_TEST_GROUP(snapshot_complete_resume_condition)
+ZCL_TEST_GROUP(chain_integrity_failed_condition)
+ZCL_TEST_GROUP(orphan_utxo_above_tip)
+ZCL_TEST_GROUP(tip_fork_stale)
+ZCL_TEST_GROUP(tip_stall_oracle_rebuild_condition)
+ZCL_TEST_GROUP(body_fetch_missing_have_data_condition)
+ZCL_TEST_GROUP(stale_validate_headers_repair_condition)
+ZCL_TEST_GROUP(reducer_drive_watchdog)
+ZCL_TEST_GROUP(stage_step_budget_exceeded)
+ZCL_TEST_GROUP(sync_rate_below_floor)
+ZCL_TEST_GROUP(active_chain_extend)
+ZCL_TEST_GROUP(rebuild_recent)
+ZCL_TEST_GROUP(torn_index_blocks_tip)
+ZCL_TEST_GROUP(have_data_unreadable)
+ZCL_TEST_GROUP(chain_tip_watchdog_bounded_restart)
+ZCL_TEST_GROUP(blocker)
+ZCL_TEST_GROUP(blocker_handoff)
+ZCL_TEST_GROUP(blocker_reason_truncation)
+ZCL_TEST_GROUP(blocker_remedy_dispatch)
+ZCL_TEST_GROUP(cpu_topology)
+ZCL_TEST_GROUP(hw_profile)
+ZCL_TEST_GROUP(platform_toolchain)
+ZCL_TEST_GROUP(hw_bench)
+ZCL_TEST_GROUP(storage_pacing)
+ZCL_TEST_GROUP(log_level)
+ZCL_TEST_GROUP(service_state)
+ZCL_TEST_GROUP(service_state_driver)
+ZCL_TEST_GROUP(storage_coins_utxo)
+ZCL_TEST_GROUP(clock)
+ZCL_TEST_GROUP(time_authority)
+ZCL_TEST_GROUP(time_select)
+ZCL_TEST_GROUP(rng)
+ZCL_TEST_GROUP(os_proc)
+ZCL_TEST_GROUP(os_sandbox)
+ZCL_TEST_GROUP(process_group_exec)
+ZCL_TEST_GROUP(sandbox_process_budget)
+ZCL_TEST_GROUP(package_verify_materialize)
+ZCL_TEST_GROUP(os_sandbox_hotswap_interaction)
+/* terminal worker cage: attacks against os_sandbox_terminal_worker_profile */
+ZCL_TEST_GROUP(terminal_worker_sandbox)
+/* live confined terminal worker: PTY pump, budgets, named endings */
+ZCL_TEST_GROUP(mesh_terminal_worker)
+/* mesh terminal wire: the responder decision, receipts, session table */
+ZCL_TEST_GROUP(boot_mesh_terminal)
+/* mesh terminal requester: receipt binding, DATA sequence, credit, watchdogs */
+ZCL_TEST_GROUP(mesh_terminal_client)
+/* multiplexed streams: frames, credit, per-peer cap, named refusals */
+ZCL_TEST_GROUP(mesh_stream)
+/* mesh tunnels: the two admission gates, bytes both ways, back-pressure */
+ZCL_TEST_GROUP(mesh_tunnel)
+/* fleet-vs-fleet wire: the five game frames, order, identity, overflow */
+ZCL_TEST_GROUP(mesh_game)
+/* The unreliable-sequenced UDP datagram channel between two paired peers:
+ * two real loopback sockets, an injected clock, and every way a datagram
+ * does not become a delivery. The group exists for the property the whole
+ * transport rests on — a nonce is never reused, so the session refuses to
+ * send at the top of the sequence space rather than wrapping, and a replay,
+ * a stale packet and a tampered byte are three different counters that
+ * never become a delivery and never take the session down. */
+ZCL_TEST_GROUP(gamelink)
+/* Direct-link policy: scope settings, default-off, named refusals. */
+ZCL_TEST_GROUP(directlink_policy)
+/* Observed-address codec and the reflexive-address aggregator. */
+ZCL_TEST_GROUP(directlink_addr)
+/* Punch-coordination message codec and replay cache. */
+ZCL_TEST_GROUP(directlink_offer)
+/* The deterministic datagram network and its NAT models. */
+ZCL_TEST_GROUP(directlink_net)
+/* Punch state machine through the NAT models. */
+ZCL_TEST_GROUP(directlink_punch)
+/* gamelink sessions over the datagram seam and the simulated network. */
+ZCL_TEST_GROUP(gamelink_ops)
+/* The direct channel: derivation, pairing secret, confirmation, hostile paths. */
+ZCL_TEST_GROUP(directlink_channel)
+/* The channel over two real loopback UDP sockets, with measured sizes and throughput. */
+ZCL_TEST_GROUP(directlink_channel_wire)
+/* what a fleet node's facts earn, and what a self-reported one does not */
+ZCL_TEST_GROUP(fleet_airship_rules)
+/* The owner's private fleet ledger: what a row means, how two statements
+ * about the same thing combine, and every way a batch is refused. The group
+ * exists for one distinction the whole design rests on — a refused batch
+ * leaves the replica exactly where it was, so a forged, tampered or
+ * unpaired row can never plant a prefix of itself. */
+ZCL_TEST_GROUP(fleet_ledger)
+ZCL_TEST_GROUP(fleet_roles)
+/* z23's own reactions to its local event sources (engine/composition/
+ * triggers.def): a run-once evaluator over landing outcomes, this box's
+ * board file, and the experiment TSV. The group exists for the property a
+ * daemon-free "check once" design rests on — the byte cursor survives two
+ * runs without double-firing, a dry run never advances it, a shrunk source
+ * restarts from zero, and a field a row does not carry never matches. */
+ZCL_TEST_GROUP(fleet_triggers)
+/* The two doors another machine's signed bytes come through, and what each
+ * does when the signing key holds no role here. The group exists for the
+ * case a permission gate usually gets wrong: a process with NOTHING
+ * installed to answer must refuse, because a gate that is only closed when
+ * somebody remembered to close it is not a gate. */
+ZCL_TEST_GROUP(fleet_role_enforcement)
+ZCL_TEST_GROUP(confine)
+ZCL_TEST_GROUP(seed_tape)
+ZCL_TEST_GROUP(postmortem)
+ZCL_TEST_GROUP(simnet)
+ZCL_TEST_GROUP(simnet_cluster)
+ZCL_TEST_GROUP(simnet_cluster_reorg)
+ZCL_TEST_GROUP(simnet_wire)
+ZCL_TEST_GROUP(simnet_wire_ibd)
+ZCL_TEST_GROUP(simnet_byzantine)
+ZCL_TEST_GROUP(simnet_txkit)
+ZCL_TEST_GROUP(simnet_contract)
+ZCL_TEST_GROUP(simnet_doublespend)
+ZCL_TEST_GROUP(simnet_chained_tx)
+ZCL_TEST_GROUP(simnet_wallet_reorg)
+ZCL_TEST_GROUP(simnet_mempool_adv)
+ZCL_TEST_GROUP(simnet_block_sigops)
+ZCL_TEST_GROUP(simnet_duplicate_input)
+ZCL_TEST_GROUP(simnet_value_inflation)
+ZCL_TEST_GROUP(simnet_fee_range)
+ZCL_TEST_GROUP(simnet_empty_vin_vout)
+ZCL_TEST_GROUP(simnet_input_value_range)
+ZCL_TEST_GROUP(simnet_sapling_activation)
+ZCL_TEST_GROUP(simnet_sapling_shielded_send)
+ZCL_TEST_GROUP(simnet_wallet_import_backup)
+ZCL_TEST_GROUP(simnet_zmsg_onchain)
+ZCL_TEST_GROUP(coinbase_subsidy_adversarial)
+ZCL_TEST_GROUP(simnet_fuzz)
+ZCL_TEST_GROUP(simnet_perf)
+ZCL_TEST_GROUP(simnet_byzantine_cluster)
+ZCL_TEST_GROUP(util_signal_handler)
+ZCL_TEST_GROUP(chaos_harness)
+ZCL_TEST_GROUP(simnet_trace)
+ZCL_TEST_GROUP(postmortem_to_scenario)
+ZCL_TEST_GROUP(stage)
+ZCL_TEST_GROUP(stage_anchor)
+ZCL_TEST_GROUP(mailbox)
+ZCL_TEST_GROUP(mailbox_adoption)
+ZCL_TEST_GROUP(projection)
+ZCL_TEST_GROUP(projection_adoption)
+ZCL_TEST_GROUP(projection_consumer)
+ZCL_TEST_GROUP(progress_store)
+ZCL_TEST_GROUP(coins_kv_read_snapshot)
+ZCL_TEST_GROUP(event_log)
+ZCL_TEST_GROUP(event_log_kill9)
+ZCL_TEST_GROUP(event_log_benchmark)
+ZCL_TEST_GROUP(mempool_projection)
+ZCL_TEST_GROUP(peers_projection)
+ZCL_TEST_GROUP(topology_store)
+ZCL_TEST_GROUP(znam_projection)
+ZCL_TEST_GROUP(wallet_projection)
+ZCL_TEST_GROUP(small_projections)
+ZCL_TEST_GROUP(coins_view_kv)
+ZCL_TEST_GROUP(block_index_projection)
+ZCL_TEST_GROUP(block_index_projection_shard_01)
+ZCL_TEST_GROUP(block_index_projection_shard_02)
+ZCL_TEST_GROUP(block_index_projection_shard_03)
+ZCL_TEST_GROUP(block_index_projection_shard_04)
+ZCL_TEST_GROUP(block_index_projection_shard_05)
+ZCL_TEST_GROUP(block_index_projection_shard_06)
+ZCL_TEST_GROUP(block_index_projection_shard_07)
+ZCL_TEST_GROUP(block_index_projection_shard_08)
+ZCL_TEST_GROUP(block_index_rebuild)
+ZCL_TEST_GROUP(block_index_topup)
+ZCL_TEST_GROUP(projection_replay_invariant)
+ZCL_TEST_GROUP(block_status_event_restart_proof)
+ZCL_TEST_GROUP(header_admit_stage)
+ZCL_TEST_GROUP(header_probe_poll)
+ZCL_TEST_GROUP(validate_headers_stage)
+ZCL_TEST_GROUP(body_fetch_stage)
+ZCL_TEST_GROUP(body_persist_stage)
+ZCL_TEST_GROUP(created_outputs_index)
+ZCL_TEST_GROUP(address_index)
+ZCL_TEST_GROUP(txindex_projection)
+ZCL_TEST_GROUP(consensus_db_migrate)
+ZCL_TEST_GROUP(consensus_db_flip)
+ZCL_TEST_GROUP(coins_kv)
+ZCL_TEST_GROUP(coins_ram)
+ZCL_TEST_GROUP(coin_reader_chain)
+ZCL_TEST_GROUP(seal_kv)
+ZCL_TEST_GROUP(sha3_sidecar_io)
+ZCL_TEST_GROUP(seal_ratify)
+ZCL_TEST_GROUP(vcs_core)
+ZCL_TEST_GROUP(vcs_release)
+ZCL_TEST_GROUP(vcs_accept)
+/* The receiver's own re-derivation of a package capability claim: what a
+ * node that never met the publisher can check for itself. */
+ZCL_TEST_GROUP(package_capability_claim)
+ZCL_TEST_GROUP(zcode_store)
+ZCL_TEST_GROUP(zcode_publish)
+ZCL_TEST_GROUP(zcode_package_dev)
+ZCL_TEST_GROUP(zcode_package_dev_shard_01)
+ZCL_TEST_GROUP(zcode_package_dev_shard_02)
+ZCL_TEST_GROUP(zcode_package_dev_shard_03)
+ZCL_TEST_GROUP(zcode_node_command)
+ZCL_TEST_GROUP(zcode_node_verify)
+ZCL_TEST_GROUP(node_reproduce)
+ZCL_TEST_GROUP(zcode_dev_product)
+ZCL_TEST_GROUP(zcode_recipe)
+ZCL_TEST_GROUP(zcode_contributor)
+ZCL_TEST_GROUP(zcode_verify)
+ZCL_TEST_GROUP(zcode_attest_transport)
+ZCL_TEST_GROUP(zcode_score)
+ZCL_TEST_GROUP(zcode_reward)
+ZCL_TEST_GROUP(zcode_rank)
+ZCL_TEST_GROUP(zcode_discovery_rank)
+ZCL_TEST_GROUP(zcode_attention_bid)
+ZCL_TEST_GROUP(zcode_attention_lineage)
+ZCL_TEST_GROUP(zcode_attention_verified)
+ZCL_TEST_GROUP(zcode_heuristic_lifecycle)
+ZCL_TEST_GROUP(zcode_heuristic_replication)
+ZCL_TEST_GROUP(experience_compilation)
+ZCL_TEST_GROUP(zcode_seed_election)
+ZCL_TEST_GROUP(wordfreq)
+ZCL_TEST_GROUP(zcode_commons)
+ZCL_TEST_GROUP(zcode_c23_corpus_projection)
+ZCL_TEST_GROUP(zcode_c23_corpus_census)
+ZCL_TEST_GROUP(zcode_family_admission)
+ZCL_TEST_GROUP(zcode_moderation_attestation)
+ZCL_TEST_GROUP(zcode_dht)
+ZCL_TEST_GROUP(zcode_dht_acceptance_peer)
+ZCL_TEST_GROUP(zcode_dht_delegation)
+ZCL_TEST_GROUP(zcode_dht_msgs)
+ZCL_TEST_GROUP(zcode_dht_record)
+ZCL_TEST_GROUP(zcode_sovereignty_policy)
+ZCL_TEST_GROUP(zcode_dht_service)
+ZCL_TEST_GROUP(zcode_dht_lookup)
+ZCL_TEST_GROUP(zcode_dht_model)
+ZCL_TEST_GROUP(zcode_dht_frame_auth)
+ZCL_TEST_GROUP(zcode_badge)
+ZCL_TEST_GROUP(zcode_policy)
+ZCL_TEST_GROUP(zcode_public_shape)
+ZCL_TEST_GROUP(zcode_swarm)
+ZCL_TEST_GROUP(zcode_swarm_net)
+ZCL_TEST_GROUP(zcode_swarm_net_shard_01)
+ZCL_TEST_GROUP(zcode_swarm_net_shard_02)
+ZCL_TEST_GROUP(zcode_swarm_net_shard_03)
+ZCL_TEST_GROUP(zcode_swarm_net_shard_04)
+ZCL_TEST_GROUP(zcode_swarm_net_shard_05)
+ZCL_TEST_GROUP(zcode_swarm_complete)
+ZCL_TEST_GROUP(zcode_swarm_dht)
+ZCL_TEST_GROUP(zcode_fetch)
+ZCL_TEST_GROUP(zcode_site)
+ZCL_TEST_GROUP(zcode_add)
+ZCL_TEST_GROUP(fastobj_carrier)
+ZCL_TEST_GROUP(zcode_dev_objects)
+ZCL_TEST_GROUP(zcode_focus)
+ZCL_TEST_GROUP(zcode_science)
+ZCL_TEST_GROUP(zcode_science_store)
+ZCL_TEST_GROUP(ontology)
+ZCL_TEST_GROUP(ontology_horn_evaluator)
+ZCL_TEST_GROUP(ontology_manifest_rules)
+ZCL_TEST_GROUP(ontology_vocabulary)
+ZCL_TEST_GROUP(fleet_facts)
+ZCL_TEST_GROUP(fleet_observe)
+ZCL_TEST_GROUP(mvp_ledger)
+ZCL_TEST_GROUP(lint_selection)
+ZCL_TEST_GROUP(story_graph)
+ZCL_TEST_GROUP(zcode_benchmark_exec)
+ZCL_TEST_GROUP(zcode_discovery_projection)
+ZCL_TEST_GROUP(vcs_devloop)
+ZCL_TEST_GROUP(action_root)
+/* z23-sem-replay, proved on a throwaway git fixture: a planted facts
+ * omission exits 3 and names the TU, and a narrowing plan's counts are
+ * exact. The replay itself is a reporting tool no gate runs. */
+ZCL_TEST_GROUP(sem_replay)
+ZCL_TEST_GROUP(codeindex)
+ZCL_TEST_GROUP(codeindex_stale)
+ZCL_TEST_GROUP(codeindex_empty_dep_paths)
+ZCL_TEST_GROUP(codeindex_scale)
+ZCL_TEST_GROUP(codeindex_projection_integrity)
+ZCL_TEST_GROUP(codeindex_incremental)
+ZCL_TEST_GROUP(codeindex_static_callers)
+/* Cold-open seeding: a fresh worktree adopts the nearest sibling checkout's
+ * published generation and rescans only the files that differ, and refuses
+ * every donor it cannot reconcile. */
+ZCL_TEST_GROUP(codeindex_seed)
+/* M3 first-hour questions: the code.owner / code.cost / code.recent leaves a
+ * fresh agent asks to find where to focus in seconds. */
+ZCL_TEST_GROUP(code_firsthour)
+/* M4 verified index fetch: code.fetch verifies a published generation from
+ * another checkout against this checkout's sealed source roots and installs
+ * it, so a fresh worktree skips the cold build. */
+ZCL_TEST_GROUP(code_fetch)
+ZCL_TEST_GROUP(fingerprint)
+ZCL_TEST_GROUP(territory)
+/* BM25 ranked retrieval. The group exists for the properties a ranking has
+ * to have before one node can quote it to another: the same corpus and the
+ * same query give the same list, ties included; a rarer term outranks a
+ * common one; and an index that failed an insertion answers nothing at all
+ * rather than answering from a corpus with holes in it. */
+ZCL_TEST_GROUP(retrieval)
+/* One relevance-free retrieval experiment over a sealed BM25 baseline.
+ * An immutable profile can use only features observed by the exact snapshot;
+ * the first live extractor exposes context bytes and refuses all other
+ * features as INCOMPLETE. Candidate set and configured top-k byte ceiling are
+ * preserved without seeing reviewed gold or scope labels. */
+ZCL_TEST_GROUP(retrieval_experiment)
+/* One relevance-free profile specialization changes only context_byte_scale,
+ * projects parent and child against the same exact feature snapshot, and
+ * binds both outcomes into immutable immediate-parent heuristic lineage. It
+ * grants no evaluation, attention, lifecycle, or activation authority. */
+ZCL_TEST_GROUP(retrieval_profile_evolution)
+/* Exact paired retrieval evaluation binds task/source/projection generation,
+ * ordered workloads, and both complete ranked arms before invoking the
+ * maintained evaluator. Unknown scope remains distinct from false. */
+ZCL_TEST_GROUP(retrieval_paired_evaluation)
+/* A preregistered retrieval comparison is a pure observation over two exact
+ * existing result roots.  Threshold boundaries, missing metrics, and failed
+ * preservation guards remain distinct; the verdict grants no lifecycle,
+ * replication, attention, or activation authority. */
+ZCL_TEST_GROUP(retrieval_comparison)
+/* Workload-preregistered comparison v2 binds the exact later paired result,
+ * both immutable observations, and every maintained evaluator metric without
+ * changing or accepting the post-arm v1 policy format. */
+ZCL_TEST_GROUP(retrieval_comparison_v2)
+/* Derived profile-pair measurement admits no caller ranking, metric, guard,
+ * result, or verdict: it projects both arms from one exact snapshot, evaluates
+ * them, and joins the result to the preregistered workload policy. */
+ZCL_TEST_GROUP(retrieval_profile_pair_measure)
+/* The retrieval-science seam reruns one exact workload-v2 pair, derives its
+ * fixed action, typed observation, result status, and reproduction verdict,
+ * and refuses stale generations or caller-controlled evidence. */
+ZCL_TEST_GROUP(retrieval_science_adapter)
+/* The profile-comparison service joins that arithmetic to one exact immediate
+ * SPECIALIZE edge, frozen task/source/study/preregistration/evaluator roots,
+ * and each heuristic's exact proposal and observation roots. */
+ZCL_TEST_GROUP(retrieval_profile_comparison)
+/* One exact retrieval evaluator observation is rooted, structurally bound to
+ * its heuristic/proposal/batch/evaluator, and used only as attributed input
+ * to the non-authoritative attention frontier. */
+ZCL_TEST_GROUP(retrieval_attention_evidence)
+/* Deterministic composition schedule for the dev retrieval ranker's VCS /
+ * code-index generation join. */
+ZCL_TEST_GROUP(retrieval_generation)
+/* A proof receipt: one node's claim that a named group reached a named
+ * verdict over an exactly identified tree, and the rule a receiver applies.
+ * The group exists for the refusals: only a PASS carrying a measured vector
+ * publishes as a pass, an ineligible group produces no receipt at all rather
+ * than an empty one, and belief is never read off the wire. */
+/* A durable hash-chained log. The group exists for the distinction the
+ * module is built around: an interrupted append leaves an uncommitted tail
+ * that recovery may discard, and an altered frame is refused and left
+ * exactly where it is. Confusing the two would either lose history or
+ * destroy the evidence that history was changed. */
+ZCL_TEST_GROUP(chainlog)
+/* The build's own numbers, recorded rather than remembered. The group exists
+ * for one distinction: a metric whose artifact could not be read is
+ * UNAVAILABLE and encodes differently from a metric that honestly measured
+ * zero. Collapsing those two would make every delta computed across the
+ * boundary a fiction, so the encoding is asserted directly rather than
+ * inferred from a rendered number. */
+ZCL_TEST_GROUP(kpi)
+/* Exact daily maintained C23 history. Git numstat is only accepted when the
+ * reconstructed final totals agree with a fresh source-tree census. */
+ZCL_TEST_GROUP(code_growth)
+/* Exact live Z23 C23 ecosystem snapshot. Every displayed package, source,
+ * context, capability, dependency, reuse, test, and growth fact is derived
+ * at call time; missing evidence is named unavailable rather than zero. */
+ZCL_TEST_GROUP(ecosystem)
+/* The claim register. The group exists for one refusal and one derivation:
+ * a claim that does not say how it could be shown wrong is refused by the
+ * field that is missing, and a claim's status is COMPUTED from its trials
+ * with no path by which a caller could assert it. The lopsided-but-untested
+ * case is the load-bearing one — a huge-looking effect on three trials is
+ * still UNTESTED, and skipping that check is how a register of measurements
+ * becomes a register of impressions. */
+ZCL_TEST_GROUP(science)
+/* The batching landing queue. The group exists for one distinction and one
+ * guarantee. The distinction: "the gate did not run" and "the gate passed"
+ * are different facts, so four cases try to fabricate a landing through the
+ * four ways that could collapse — no gate run, a run that did not contain
+ * this submission, a red run, and a run that skipped its groups — and each
+ * must refuse by name. The guarantee: a red batch refuses ONLY the culprit,
+ * because a batch that rejected an agent's work over a stranger's bug would
+ * be worse than not batching at all. */
+ZCL_TEST_GROUP(land_queue)
+/* The landing SERVICE: dev.land submit/status/step/cancel. The group
+ * exists for one property — nothing waits. It proves submit refuses an
+ * unsigned or unknown tip, that a step over an empty queue returns at
+ * once, that the step which asks for a proof RETURNS before any proof
+ * could finish, that a later step pushes a passing tip to a real bare
+ * origin and records landed, that a failing one records the dimension and
+ * a log path, and that a base which moved mid-proof re-rebases instead of
+ * landing evidence about a base nobody is on. */
+ZCL_TEST_GROUP(dev_land)
+ZCL_TEST_GROUP(dev_land_window)
+/* dev.ci: the one read-only screen over this host's CI and landing state.
+ * The group exists for one property -- absent evidence never reads as a
+ * pass or as an idle zero. It proves all nine views render from the
+ * siblings' own answers, that an unmeasured worker reads unknown rather
+ * than healthy, that a stale claim reads stale, that a commit with no
+ * receipt reports no receipt instead of a verdict, and that the cancel and
+ * retry views NAME the sibling command without running it. */
+ZCL_TEST_GROUP(dev_ci)
+ZCL_TEST_GROUP(dev_ship)
+/* Agent worktree construction: detached git worktree plus the proof's
+ * vendored dependencies cloned onto independent inodes (never hardlinked). */
+ZCL_TEST_GROUP(dev_lane)
+/* ops.host.gc: the host janitor over dev-proof worktree pools. The group
+ * exists for one property — the sweep never deletes work. Three real git
+ * worktree generations (one with a live process cwd'd inside, one locked,
+ * one back-dated orphan) must classify as in_use / locked / reapable, a
+ * dry run must move nothing, an apply must reclaim only the orphan, and a
+ * canonical datadir must be refused by name. It must also never ABANDON
+ * space: a generation git unregisters but leaves on disk is finished off,
+ * and one nothing can remove is named in refusals[]. */
+ZCL_TEST_GROUP(host_gc)
+ZCL_TEST_GROUP(receipt)
+ZCL_TEST_GROUP(testcache)
+/* The push proof's test dimension must set ZCL_STRESS_TESTS=1 in its own
+ * environ (execvp reuses it, unconditionally, regardless of what a
+ * resident daemon's first environment held) or ~16 stress-marked groups
+ * self-skip and testcache caches the SKIP as a PASS. See
+ * tools/dev/dev_proof.c's proof_stress_tests_env_prepare(). */
+ZCL_TEST_GROUP(dev_proof_stress_env)
+/* The push proof's test dimension runs the runner with
+ * --cold-audit --emit-observations; the worker must point the verdict store
+ * and the signed-observation CAS at per-pair private directories (never a
+ * shared or candidate-writable store) and unset both on worker exit, or a
+ * resident daemon's environment carries one proof's stores into the next.
+ * See tools/dev/dev_proof.c's proof_observation_env_open(). */
+ZCL_TEST_GROUP(dev_proof_observation_env)
+/* The coverage manifest binds a pair receipt's executed test groups to
+ * eligible signed observations in a per-pair CAS, or names them
+ * unqualified: a producer derives and signs it; a receiver re-verifies it,
+ * refusing missing coverage, ineligible listed roots, tampered wires,
+ * wrong bindings, another executed-group count, and preserved conflicts
+ * by name. Not yet wired into the proof worker or the pre-push hook.
+ * See tools/dev/dev_proof_coverage.c. */
+ZCL_TEST_GROUP(dev_proof_coverage)
+/* The box-level receiver index folds each pair's durable signed
+ * observations into one verified, sorted, contradiction-preserving basis
+ * under the state root; reuse classification and coverage queries read it.
+ * See tools/dev/dev_proof_observation_index.c. */
+ZCL_TEST_GROUP(dev_proof_observation_index)
+ZCL_TEST_GROUP(test_group_selector)
+ZCL_TEST_GROUP(metaverse_catalog)
+ZCL_TEST_GROUP(node_character)
+/* A node's character with a birthday, in the fixed 128-byte form it travels
+ * in, and the rule a receiving node applies to it. The assertion the group
+ * exists for is that verify() accepts EXACTLY the self-consistent frames —
+ * driven against an independent oracle over every single-bit mutation — and
+ * that a claimed standing never becomes a believed one: a stranger recomputes
+ * form and chart, refuses any disagreement, and still believes zero energy
+ * however much the sheet claims. */
+ZCL_TEST_GROUP(node_character_wire)
+/* A role-playing character held as content-addressed property, whose six
+ * attributes are derived from a birth chart. The assertion the group exists
+ * for is that the attribute TOTAL is identical for every character over many
+ * thousands of seeds — the anti-grinding property, since the owner picks the
+ * birth moment — while the chart still decides a genuinely varying spread. */
+ZCL_TEST_GROUP(character_sheet)
+ZCL_TEST_GROUP(metaverse_site)
+ZCL_TEST_GROUP(site_routes)
+ZCL_TEST_GROUP(install_sh_site)
+ZCL_TEST_GROUP(space)
+ZCL_TEST_GROUP(space_scout)
+ZCL_TEST_GROUP(chain_segment)
+ZCL_TEST_GROUP(segment_sealer)
+ZCL_TEST_GROUP(segment_corruption)
+ZCL_TEST_GROUP(rom_dump)
+ZCL_TEST_GROUP(golden_revert_roundtrip)
+ZCL_TEST_GROUP(golden_dev_cycle)
+ZCL_TEST_GROUP(nullifier_kv)
+ZCL_TEST_GROUP(nullifier_backfill_service)
+ZCL_TEST_GROUP(body_crosscheck)
+ZCL_TEST_GROUP(shielded_history_import)
+ZCL_TEST_GROUP(shielded_history_promote)
+ZCL_TEST_GROUP(shielded_import_cured_tip_anchor)
+ZCL_TEST_GROUP(shielded_bind_guard)
+ZCL_TEST_GROUP(shielded_gap_remedy)
+ZCL_TEST_GROUP(utxo_recovery_shielded_backfill)
+ZCL_TEST_GROUP(reducer_drive_guard)
+ZCL_TEST_GROUP(sapling_nullifier_adversarial)
+ZCL_TEST_GROUP(script_validate_stage)
+ZCL_TEST_GROUP(script_validate_contextual_gate)
+ZCL_TEST_GROUP(proof_validate_stage)
+ZCL_TEST_GROUP(validate_parallel_determinism)
+ZCL_TEST_GROUP(pv_lookahead)
+ZCL_TEST_GROUP(bn254_accel)
+ZCL_TEST_GROUP(fr_mont_parity)
+ZCL_TEST_GROUP(blake2b_batch_parity)
+ZCL_TEST_GROUP(blake3_kat)
+ZCL_TEST_GROUP(fr_accel)
+ZCL_TEST_GROUP(mont_adx_honest)
+ZCL_TEST_GROUP(simd_os_support)
+ZCL_TEST_GROUP(secp256k1_differential)
+ZCL_TEST_GROUP(secp256k1_constant_time)
+ZCL_TEST_GROUP(ed25519_differential)
+ZCL_TEST_GROUP(mint_skip_crypto)
+ZCL_TEST_GROUP(mint_anchor_preflight)
+ZCL_TEST_GROUP(utxo_apply_stage)
+ZCL_TEST_GROUP(utxo_apply_crash_replay)
+ZCL_TEST_GROUP(commit_invariants)
+ZCL_TEST_GROUP(tip_finalize_stage)
+ZCL_TEST_GROUP(tip_finalize_post_step)
+ZCL_TEST_GROUP(reducer_frontier)
+ZCL_TEST_GROUP(reducer_frontier_self_anchor)
+ZCL_TEST_GROUP(offline_datadir_query)
+ZCL_TEST_GROUP(onion_vanity)
+ZCL_TEST_GROUP(read_leaf_no_datadir_write)
+ZCL_TEST_GROUP(wallet_phrase_never_logged)
+ZCL_TEST_GROUP(wallet_recovery_safety)
+ZCL_TEST_GROUP(hstar_integrity)
+ZCL_TEST_GROUP(install_verb_warm)
+ZCL_TEST_GROUP(always_sync_chaos)
+ZCL_TEST_GROUP(always_sync_lifecycle)
+ZCL_TEST_GROUP(waitforheight_provable)
+ZCL_TEST_GROUP(refold_progress_floor)
+ZCL_TEST_GROUP(refold_cadence)
+ZCL_TEST_GROUP(validate_headers_tuning)
+ZCL_TEST_GROUP(catchup_cadence)
+ZCL_TEST_GROUP(stage_dump_trylock)
+ZCL_TEST_GROUP(refold_premature_clear)
+ZCL_TEST_GROUP(agent_posture_trylock)
+ZCL_TEST_GROUP(subsystem_snapshot)
+ZCL_TEST_GROUP(status_frontdoor)
+ZCL_TEST_GROUP(operator_needed_policy)
+ZCL_TEST_GROUP(rom_compile_status)
+ZCL_TEST_GROUP(rom_watch_loop)
+ZCL_TEST_GROUP(mesh_terminal_attach)
+ZCL_TEST_GROUP(refold_from_anchor_fatal)
+ZCL_TEST_GROUP(refold_from_anchor_artifact_reachable)
+ZCL_TEST_GROUP(refold_auto_arm)
+ZCL_TEST_GROUP(anchor_selfmint)
+ZCL_TEST_GROUP(loader_owns_seed_gate)
+ZCL_TEST_GROUP(boot_snapshot_failure_memory)
+ZCL_TEST_GROUP(boot_snapshot_drop_bodiless)
+ZCL_TEST_GROUP(boot_datadir_lock)
+ZCL_TEST_GROUP(boot_shutdown_marker)
+ZCL_TEST_GROUP(boot_stale_locks)
+ZCL_TEST_GROUP(boot_blocktree_cleanup)
+ZCL_TEST_GROUP(boot_legacy_blocks)
+ZCL_TEST_GROUP(boot_flyclient)
+ZCL_TEST_GROUP(boot_memory_guard)
+ZCL_TEST_GROUP(boot_flight_recorder)
+ZCL_TEST_GROUP(boot_self_respawn)
+ZCL_TEST_GROUP(boot_refold_window_extend)
+ZCL_TEST_GROUP(refold_retro_validate)
+ZCL_TEST_GROUP(refold_body_span_contiguous)
+ZCL_TEST_GROUP(contaminated_coin_above_anchor)
+ZCL_TEST_GROUP(boot_reindex_terminates)
+ZCL_TEST_GROUP(reindex_sparse_bodies)
+ZCL_TEST_GROUP(chain_linkage_check)
+ZCL_TEST_GROUP(invariant_sentinel)
+ZCL_TEST_GROUP(seed_integrity_gate)
+ZCL_TEST_GROUP(mirror_divergence_locator)
+ZCL_TEST_GROUP(log_throttle)
+ZCL_TEST_GROUP(reducer_frontier_reconcile_light)
+ZCL_TEST_GROUP(stage_db_fault)
+ZCL_TEST_GROUP(reducer_stage_fuzz)
+ZCL_TEST_GROUP(mint_proof_harness)
+ZCL_TEST_GROUP(reducer_ingest_e2e)
+ZCL_TEST_GROUP(stage_reducer_unwedge)
+ZCL_TEST_GROUP(stage_repair)
+ZCL_TEST_GROUP(repair_marker)
+ZCL_TEST_GROUP(recovery_coordinator)
+ZCL_TEST_GROUP(always_sync_selfheal)
+ZCL_TEST_GROUP(stage_repair_coin_backfill)
+ZCL_TEST_GROUP(stage_anchor_frontier_cap)
+ZCL_TEST_GROUP(sapling_anchor_frontier_condition)
+ZCL_TEST_GROUP(shielded_sync_strength)
+ZCL_TEST_GROUP(stage_repair_script_refill)
+ZCL_TEST_GROUP(validate_script_hash_split_repair)
+ZCL_TEST_GROUP(stage_repair_tipfin_backfill)
+ZCL_TEST_GROUP(reorg_residue_tipfin_replace)
+ZCL_TEST_GROUP(stage_rederive_range)
+ZCL_TEST_GROUP(rewind_driver)
+ZCL_TEST_GROUP(utxo_apply_upstream_hole)
+ZCL_TEST_GROUP(reducer_reconcile_witness)
+ZCL_TEST_GROUP(reducer_step_drain_harness)
+ZCL_TEST_GROUP(reducer_ondemand_genesis_seed)
+ZCL_TEST_GROUP(mint_fold_livelock)
+ZCL_TEST_GROUP(mint_anchor_fresh_datadir)
+ZCL_TEST_GROUP(no_state_source)
+ZCL_TEST_GROUP(fold_inram_crash_proof)
+ZCL_TEST_GROUP(stage_crash_sweep)
+ZCL_TEST_GROUP(reducer_body_fsync_crash)
+ZCL_TEST_GROUP(coins_kv_read_cache)
+ZCL_TEST_GROUP(parallel_range_fold)
+ZCL_TEST_GROUP(psc_real_range)
+ZCL_TEST_GROUP(boot_matrix)
+ZCL_TEST_GROUP(reducer_drain_spin_contract)
+ZCL_TEST_GROUP(domain_consensus_verify)
+ZCL_TEST_GROUP(domain_consensus_subsidy)
+ZCL_TEST_GROUP(domain_consensus_pow)
+ZCL_TEST_GROUP(domain_consensus_sigops)
+ZCL_TEST_GROUP(domain_consensus_script_standard)
+ZCL_TEST_GROUP(domain_consensus_tx_structural)
+ZCL_TEST_GROUP(domain_consensus_sapling_structural)
+ZCL_TEST_GROUP(domain_consensus_sighash)
+ZCL_TEST_GROUP(domain_consensus_check_block)
+ZCL_TEST_GROUP(domain_consensus_equihash)
+ZCL_TEST_GROUP(domain_consensus_script_interp)
+ZCL_TEST_GROUP(domain_consensus_coins_math)
+ZCL_TEST_GROUP(domain_consensus_checkpoints)
+ZCL_TEST_GROUP(domain_consensus_locktime)
+ZCL_TEST_GROUP(domain_consensus_upgrades)
+ZCL_TEST_GROUP(domain_consensus_coinbase)
+ZCL_TEST_GROUP(domain_consensus_header_accept)
+ZCL_TEST_GROUP(domain_wallet_key_derivation)
+ZCL_TEST_GROUP(domain_wallet_mnemonic)
+ZCL_TEST_GROUP(domain_encoding_base58)
+ZCL_TEST_GROUP(domain_encoding_bech32)
+ZCL_TEST_GROUP(block_log_file)
+ZCL_TEST_GROUP(block_log_legacy)
+ZCL_TEST_GROUP(replay_verify)
+ZCL_TEST_GROUP(utxo_snapshot_inmem)
+ZCL_TEST_GROUP(snapshot_apply_coins_kv)
+ZCL_TEST_GROUP(consensus_state_snapshot_install)
+ZCL_TEST_GROUP(checkpoint_rom_authority)
+ZCL_TEST_GROUP(consensus_state_install_runtime)
+ZCL_TEST_GROUP(checkpoint_header_solution_repair)
+ZCL_TEST_GROUP(boot_bundle_fetch)
+ZCL_TEST_GROUP(boot_header_seed_import)
+ZCL_TEST_GROUP(bundle_publish_serve)
+ZCL_TEST_GROUP(consensus_state_snapshot_export)
+ZCL_TEST_GROUP(ratify_mint_anchor)
+ZCL_TEST_GROUP(sovereign_promotion)
+ZCL_TEST_GROUP(consensus_state_producer_receipt)
+ZCL_TEST_GROUP(authority_receipt)
+ZCL_TEST_GROUP(consensus_state_chain_binding)
+ZCL_TEST_GROUP(consensus_state_publication_cas)
+ZCL_TEST_GROUP(hodl_history_port)
+ZCL_TEST_GROUP(node_health_store_port)
+ZCL_TEST_GROUP(db_maintenance_port)
+ZCL_TEST_GROUP(wallet_backup_port)
+ZCL_TEST_GROUP(snapshot_store_port)
+ZCL_TEST_GROUP(block_index_sidecar_port)
+ZCL_TEST_GROUP(wallet_view_port)
+ZCL_TEST_GROUP(bg_hash_verify_store_port)
+ZCL_TEST_GROUP(bg_validation_store_port)
+ZCL_TEST_GROUP(bg_validation_reverify)
+ZCL_TEST_GROUP(bg_validation_delta_undo)
+ZCL_TEST_GROUP(zslp_store_port)
+ZCL_TEST_GROUP(zswap_quote)
+ZCL_TEST_GROUP(zswap_yardsale)
+ZCL_TEST_GROUP(zswap_ceremony)
+ZCL_TEST_GROUP(yardsale_app)
+ZCL_TEST_GROUP(yardsale_wallet)
+ZCL_TEST_GROUP(sapling_tree)
+ZCL_TEST_GROUP(sapling_ckpt_persist)
+ZCL_TEST_GROUP(shutdown_marker)
+ZCL_TEST_GROUP(shutdown_stagewatch)
+ZCL_TEST_GROUP(cold_start_driver)
+ZCL_TEST_GROUP(heartbeat)
+ZCL_TEST_GROUP(syncdiag_rpc)
+ZCL_TEST_GROUP(peer_lifecycle)
+ZCL_TEST_GROUP(telemetry_ontology)
+ZCL_TEST_GROUP(telemetry_render)
+ZCL_TEST_GROUP(telemetry_sync)
+ZCL_TEST_GROUP(telemetry_sync_compat)
+ZCL_TEST_GROUP(telemetry_watch)
+ZCL_TEST_GROUP(telemetry_runtime)
+ZCL_TEST_GROUP(telemetry_network)
+ZCL_TEST_GROUP(telemetry_storage)
+ZCL_TEST_GROUP(telemetry_wallet)
+ZCL_TEST_GROUP(telemetry_agents)
+ZCL_TEST_GROUP(telemetry_zcode)
+ZCL_TEST_GROUP(telemetry_metaverse)
+ZCL_TEST_GROUP(telemetry_rollup)
+ZCL_TEST_GROUP(chainstate_legacy_reader)
+ZCL_TEST_GROUP(importblockindex_roundtrip)
+ZCL_TEST_GROUP(importblockindex_cli_dispatch)
+ZCL_TEST_GROUP(e2e_cold_start)
+ZCL_TEST_GROUP(chainstate_sapling_anchor)
+ZCL_TEST_GROUP(utxo_import_pipeline)
+ZCL_TEST_GROUP(ccoins_decoder_kat)
+ZCL_TEST_GROUP(coins_record_codec)
+ZCL_TEST_GROUP(blob_read_bounds)
+ZCL_TEST_GROUP(ldb_snapshot)
+ZCL_TEST_GROUP(ldb_reader)
+ZCL_TEST_GROUP(utxo_snapshot_loader)
+ZCL_TEST_GROUP(snapshot_shielded)
+ZCL_TEST_GROUP(load_verify_boot)
+ZCL_TEST_GROUP(chain_stall_repro)
+ZCL_TEST_GROUP(connect_tip_hot_loop_exit)
+ZCL_TEST_GROUP(connman_addnode_fallback)
+ZCL_TEST_GROUP(peer_eviction)
+ZCL_TEST_GROUP(net_bootstrap)
+ZCL_TEST_GROUP(failed_child_cap)
+ZCL_TEST_GROUP(header_probe)
+ZCL_TEST_GROUP(header_probe_p2p_fallback)
+ZCL_TEST_GROUP(power_node_contract_spec)
+ZCL_TEST_GROUP(process_block_revalidate)
+ZCL_TEST_GROUP(rpc_safety)
+ZCL_TEST_GROUP(rpc_service_restart)
+ZCL_TEST_GROUP(app_context)
+ZCL_TEST_GROUP(service_kernel)
+ZCL_TEST_GROUP(payment_shutdown_owner)
+ZCL_TEST_GROUP(service_manifest)
+ZCL_TEST_GROUP(service_binding)
+ZCL_TEST_GROUP(service_binding_names)
+ZCL_TEST_GROUP(app_checkpoint_manifest)
+ZCL_TEST_GROUP(thread_registry)
+ZCL_TEST_GROUP(thread_qos)
+ZCL_TEST_GROUP(self_backtrace)
+ZCL_TEST_GROUP(sync_state_fsm)
+ZCL_TEST_GROUP(unclean_shutdown_advance)
+ZCL_TEST_GROUP(utxo_audit)
+ZCL_TEST_GROUP(utxo_parity_service)
+ZCL_TEST_GROUP(soak_attestation)
+ZCL_TEST_GROUP(zclassicd_oracle)
+ZCL_TEST_GROUP(oracle_policy)
+ZCL_TEST_GROUP(quorum_oracle)
+ZCL_TEST_GROUP(mesh_observation)
+ZCL_TEST_GROUP(mesh_observation_compose)
+ZCL_TEST_GROUP(mesh_observation_dump)
+ZCL_TEST_GROUP(script_interp_edge)
+ZCL_TEST_GROUP(script_interp_edges)
+ZCL_TEST_GROUP(sighash_edge)
+ZCL_TEST_GROUP(sighash_malleability)
+ZCL_TEST_GROUP(sigops_edge)
+ZCL_TEST_GROUP(check_tx_edge)
+ZCL_TEST_GROUP(check_block_edge)
+ZCL_TEST_GROUP(amount_subsidy_edge)
+ZCL_TEST_GROUP(consensus_rule_sweep)
+ZCL_TEST_GROUP(clientversion_format)
+ZCL_TEST_GROUP(locktime_edge)
+ZCL_TEST_GROUP(tx_expiry_locktime_adversarial)
+ZCL_TEST_GROUP(pow_diffadj_precedence)
+ZCL_TEST_GROUP(bip34_coinbase_height_parity)
+ZCL_TEST_GROUP(difficulty_adjustment_adversarial)
+ZCL_TEST_GROUP(reducer_block_ingest_gate)
+ZCL_TEST_GROUP(onion_bootstrap_slice)
+ZCL_TEST_GROUP(shielded_receive_slice)
+ZCL_TEST_GROUP(shielded_receive_persist)
+ZCL_TEST_GROUP(reducer_forward_progress_gate)
+ZCL_TEST_GROUP(parity_slice)
+ZCL_TEST_GROUP(parity_lockin_anchor_membership)
+ZCL_TEST_GROUP(parity_lockin_contextual_header)
+ZCL_TEST_GROUP(coins_kv_reset_for_reseed)
+ZCL_TEST_GROUP(coins_kv_sovereign_gate)
+ZCL_TEST_GROUP(reindex_epilogue)
+ZCL_TEST_GROUP(ckpt_recheck)
+ZCL_TEST_GROUP(sovereignty_guard)
+ZCL_TEST_GROUP(snapshot_boot_seed)
+ZCL_TEST_GROUP(replay_canary_verdict)
+ZCL_TEST_GROUP(mvp_c8_judge)
+ZCL_TEST_GROUP(canary_sentinel_watch)
+ZCL_TEST_GROUP(stopwatch_skip_watch)
+ZCL_TEST_GROUP(stopwatch_peer_gate)
+ZCL_TEST_GROUP(slo_ledger_summary)
+ZCL_TEST_GROUP(tip_agreement_watch)
+ZCL_TEST_GROUP(seed_torn_import_gate)
+ZCL_TEST_GROUP(shielded_spend_slice)
+ZCL_TEST_GROUP(atomic_commit_ordering)
+ZCL_TEST_GROUP(coldimport_restart_fragility)
+ZCL_TEST_GROUP(wallet_funds_safety)
+ZCL_TEST_GROUP(wallet_reservation_stored_class)
+ZCL_TEST_GROUP(bundle_staleness)
+ZCL_TEST_GROUP(block_parse_cache)
+ZCL_TEST_GROUP(block_prefetch)
+ZCL_TEST_GROUP(storage_reclaim)
+ZCL_TEST_GROUP(chain_frontier_snapshot_service)
+ZCL_TEST_GROUP(health_rollup)
+ZCL_TEST_GROUP(debug_bundle)
+ZCL_TEST_GROUP(operator_ux)
+ZCL_TEST_GROUP(cli_render)
+ZCL_TEST_GROUP(command_input_bounds)
+ZCL_TEST_GROUP(op_return_index)
+ZCL_TEST_GROUP(rom_seed_policy)
+ZCL_TEST_GROUP(rom_seed_ledger)
+ZCL_TEST_GROUP(catalog_completeness)
+ZCL_TEST_GROUP(zslp_ledger)
+ZCL_TEST_GROUP(catalog_lag_exceeded)
+ZCL_TEST_GROUP(op_return_index_legacy_state)
+ZCL_TEST_GROUP(catalog_coverage)
+ZCL_TEST_GROUP(parity_slo)
+ZCL_TEST_GROUP(state_auditor)
+ZCL_TEST_GROUP(recovery_no_worse)
+ZCL_TEST_GROUP(vault_read)
+ZCL_TEST_GROUP(vault_dispatch)
+ZCL_TEST_GROUP(agent_session)
+ZCL_TEST_GROUP(build_fabric)
+ZCL_TEST_GROUP(build_fabric_attach)
+ZCL_TEST_GROUP(agent_spend_policy)
+ZCL_TEST_GROUP(vault_session)
+ZCL_TEST_GROUP(epoch)
+ZCL_TEST_GROUP(zcode_release)
+ZCL_TEST_GROUP(metaverse_grant)
+ZCL_TEST_GROUP(make_lint_gates_shard_01)
+ZCL_TEST_GROUP(make_lint_gates_shard_02)
+ZCL_TEST_GROUP(make_lint_gates_shard_03)
+ZCL_TEST_GROUP(make_lint_gates_shard_04)
+ZCL_TEST_GROUP(make_lint_gates_shard_05)
+ZCL_TEST_GROUP(make_lint_gates_shard_06)
+ZCL_TEST_GROUP(make_lint_gates_shard_07)
+ZCL_TEST_GROUP(make_lint_gates_shard_08)
+ZCL_TEST_GROUP(make_lint_gates_realroot)
+ZCL_TEST_GROUP(make_lint_gates_partition)
+ZCL_TEST_GROUP(make_lint_gates_heavy_01)
+ZCL_TEST_GROUP(make_lint_gates_heavy_02)
+ZCL_TEST_GROUP(make_lint_gates_heavy_03)
+/* lane: seed-doors + onion gossip — appended at the end of the
+ * ZCL_TEST_GROUP block; keep both sides on conflict. */
+ZCL_TEST_GROUP(seed_bootstrap_doors)
+/* Concurrent first-usable onion-seed fetch: a dead door must not delay a
+ * live one. Injected fetch, no network. */
+ZCL_TEST_GROUP(onion_seed_race)
+/* params-sovereignty lane: compiled-in verifying keys, and the boundary
+ * between validating shielded proofs and creating them. */
+ZCL_TEST_GROUP(params_vk_embedded)
+/* params-sovereignty lane: the publish/release invariant for all FOUR
+ * shielded verifying keys — they must arm and disarm together, so the
+ * published-pointer set is one honest answer to "is validation armed?". */
+ZCL_TEST_GROUP(params_vk_publish_symmetry)
+/* params-sovereignty lane: obtaining the PROVING parameters over the peer
+ * network, with every chunk checked against compiled-in digests. Keep both
+ * sides on conflict. */
+ZCL_TEST_GROUP(params_fetch)
+/* arm64 crypto lane: FEAT_SHA256 / FEAT_CRC32 tiers must actually reach the
+ * dispatch when the OS reports them — the arm64 mirror of sha256_isa_parity's
+ * reachability leg. */
+ZCL_TEST_GROUP(arm_hw_tiers)
+/* platform-seam lane: the acceptance programs that used to live under
+ * tools/tests/ and executed ONLY when a human ran the now-deleted
+ * tools/scripts/winacceptance.sh by hand. The Windows-refusal members of that
+ * set are cross-linked by platform/modules/platform/tests/windows_acceptance.mk; these are
+ * the members that run natively, so they belong in the suite where every run
+ * executes them. */
+ZCL_TEST_GROUP(socket_resolve)
+ZCL_TEST_GROUP(private_link_no_clobber)
+ZCL_TEST_GROUP(running_image_positioned)
+ZCL_TEST_GROUP(read_mapping_positioned)
+ZCL_TEST_GROUP(file_ops_copy)
+ZCL_TEST_GROUP(boot_refusal_identity)
+ZCL_TEST_GROUP(boot_shutdown_marker_persistence)
+ZCL_TEST_GROUP(replay_receipt_root)
+/* Dev-loop watcher lane: directory_watcher and watcher_record rehome the two
+ * native probe programs that arrived with no reader. watcher_lease adds the
+ * parent/child launch-capability path that previously ran only in the Windows
+ * acceptance program. Together they directly drive the directory watcher,
+ * watcher-record codec, and authenticated launch lifecycle on native hosts. */
+ZCL_TEST_GROUP(directory_watcher)
+ZCL_TEST_GROUP(watcher_record)
+ZCL_TEST_GROUP(watcher_lease)
+/* Exact resident-launch seam: the launcher half of the app-run path. Proves
+ * acceptance-record refusal before any process exists, the mapped-image
+ * receipt (Linux fexecve/proc triple, macOS suspended CodeDirectory), the
+ * nonce-authenticated IPC frame codec with stale-launch rejection, and a
+ * launch/cancel cycle that leaves neither descriptors nor children behind.
+ * Windows asserts the named platform refusal. */
+ZCL_TEST_GROUP(resident_launch)
+ZCL_TEST_GROUP(resident_capability_image)
+/* Product acceptance contract for the resident-launch CONSUMER, driven
+ * against C's landed app.invoke.package slice: installs REAL packages
+ * (C's shipped ztasks from its repo bytes, plus a parking candidate)
+ * through the production zcode lifecycle and drives the six product
+ * stages (production accepted-artifact record, verified launch, fd-3
+ * frame protocol, observable result, bounded cancel/reap, rollback).
+ * Stages a–e assert C's bounded one-shot invocation semantics; stage f
+ * is the born-RED acceptance TRAP for C's coming serving-generation
+ * supersession + atomic-rollback landing (nine named checks f1–f9:
+ * serving record, activate, READY-before-switch, atomic switch, stale
+ * refusal, pending supersession, failure containment, EXACT-A rollback,
+ * restart persistence). resident_launch covers the platform seam. */
+ZCL_TEST_GROUP(resident_launch_contract)
+/* Confined native run: pinned image under the manifest-derived Landlock +
+ * seccomp + rlimits profile; red twin, SIGSYS, exit status, named refusal,
+ * and the <=5%+20ms CPU overhead bound. */
+ZCL_TEST_GROUP(resident_confined_run)
+ZCL_TEST_GROUP(package_resident_record)
+ZCL_TEST_GROUP(task_document)
+ZCL_TEST_GROUP(package_local)
+/* astro lane: platform/modules/astro's exact fixed-grid arithmetic and the birth chart
+ * built on it. The determinism cases are the point — a chart another node
+ * recomputes must match bit for bit, so the group asserts that property by
+ * construction against a `double` control rather than against golden
+ * numbers. */
+ZCL_TEST_GROUP(astro)
+/* vendored FreeBSD /bin/sh smoke acceptance: execs build/bin/fbsh (a
+ * standalone `make fbsh` artifact, deliberately not a prerequisite of
+ * the test binaries) and skips when it is absent. */
+ZCL_TEST_GROUP(freebsd_sh)
+/* inspect_html build-check helper regressions (tools/inspect_html.c ->
+ * build/bin/inspect_html): an empty --count pattern counts zero matches
+ * instead of spinning forever (strstr(p, "") == p, so the old
+ * advance-by-nlen loop never progressed), and ordinary --count/--has keep
+ * their contracts. The binary is a standalone tool artifact; the group
+ * self-skips when it is absent, and the proof's prefork step builds it
+ * through the test_freebsd_sh-shaped BUILD_NEED row below. */
+ZCL_TEST_GROUP(inspect_html)
+/* Snapshot exporter: exact public tables, literal paths and read-only source
+ * attachment, live WAL visibility, and argument refusal before output deletion.
+ * The required helper is built through the declared BUILD_NEED; absence fails. */
+ZCL_TEST_GROUP(export_snapshot)
+/* sqlq read-only sqlite query CLI regressions (tools/sqlq.c ->
+ * build/bin/sqlq): TSV rows, NULL/BLOB spelling, and the read-only refusal
+ * contract. The binary is a standalone `make sqlq` artifact; the group
+ * is required through its declared BUILD need. */
+ZCL_TEST_GROUP(sqlq)
+/* p2_invariant_check P2 self-heal invariant diagnostic regressions
+ * (tools/p2_invariant_check.c -> build/bin/p2_invariant_check): the
+ * HOLDS/drift/malformed/absent/missing-cursor exit contract, the LE
+ * frontier wire, consensus.db preference, --immutable, and refusal
+ * paths. The binary is a standalone `make p2_invariant_check` artifact;
+ * the group skips when absent. */
+ZCL_TEST_GROUP(p2_invariant_check)
+/* Execute the actual stdin JSON query helper, including binary stdin and
+ * direct-member count/keys contracts. A missing helper fails the group. */
+ZCL_TEST_GROUP(jsonq)
+/* beta6 bootstrap serve lane: the zclassicd v2.1.2-beta6 snapshot server this
+ * node offers legacy clients. The manifest cases compare against byte vectors
+ * written out from the beta6 C++ serializer definitions rather than captured
+ * from this encoder, because a stock beta6 binary — which nobody here can
+ * change — is the only consumer that matters. */
+ZCL_TEST_GROUP(beta6_bootstrap)
+/* Semantic manifest v1 (contexts/commons/modules/vcs/src/semantic_manifest*.c):
+ * the libclang-free reader. Pins the hand-built golden vector (bytes, exact
+ * root, candidate-match hint root), proves the builder canonicalizes and the
+ * decoder refuses non-canonical bytes, and replays every adversarial seed
+ * over the sensor manifests checked in under tests/fixtures/semantic_manifest. */
+ZCL_TEST_GROUP(semantic_manifest)
+/* The optional libclang sensor (build/bin/z23-clang-manifest) run live:
+ * identical roots before/after git commit and at two absolute roots, and
+ * every adversarial seed changes exactly its sections. The warm session
+ * (`z23-clang-manifest session`) must write bytes equal to a cold emit after
+ * body, macro, header, shadowing and flag edits, recreate its TU where the
+ * contract says, and never write warm bytes the oracle rejected
+ * (tests/harness/src/semantic_sensor_session.c). Self-skips, visibly, where
+ * the sensor is not built. */
+ZCL_TEST_GROUP(semantic_sensor)
+/* Semantic facts extension (zcl.semantic_facts.v1) and the facts-narrowed
+ * change closure (tools/dev/devloop_facts*.c), without clang: symbols,
+ * references and UNKNOWN effects in the checked-in sensor manifests under
+ * tests/fixtures/semantic_facts, truncation at a producer cap, absence proved
+ * from a ZVCS tree vs UNKNOWN without one, and a narrowing verdict per edit
+ * (a body-only edit reaches fewer files; layout, field-type, macro,
+ * declaration, typedef, include-form, shadowing-header, search-order,
+ * file-scope, definition-head attribute, unknown-effect, address-taken,
+ * unresolved-seed, producer, producer-source and stale-tree edits fall back,
+ * each to exactly the file-seeded plan). */
+ZCL_TEST_GROUP(semantic_facts)
+/* The libclang sensor (build/bin/z23-clang-manifest emit --facts), the only
+ * facts producer, run live: every fixture edit yields a manifest that names
+ * its producer and is byte-identical across two runs, across git commit and
+ * at two roots; the edit table's verdicts hold on the live manifests; a
+ * sensor one byte different names a different producer and its pairs never
+ * narrow; snapshot-proved probes. Self-skips, visibly, where the sensor has
+ * not been built. */
+ZCL_TEST_GROUP(semantic_facts_live)
+/* The declaration-identity consumer (tools/dev/devloop_facts_consumer.c),
+ * without clang: on the checked-in five-TU manifests under
+ * tests/fixtures/semantic_consumer every header, macro, conditional,
+ * typedef, comment, signature, static-body, address, shadow and flag edit
+ * affects exactly the TUs its declaration identities reach, each with its
+ * reason; dropping the type, macro or position rule misses an affected TU;
+ * a reader without facts or without the depfile graph falls back; and
+ * dev.change.plan pages the universe. */
+ZCL_TEST_GROUP(semantic_consumer)
+/* The same consumer against the live sensor and cc: the edit table holds on
+ * live manifests, and every TU it calls unaffected compiles to identical
+ * object bytes (a changed object it did not predict is a missed
+ * dependency). Self-skips, visibly, where the sensor has not been built. */
+ZCL_TEST_GROUP(semantic_consumer_live)
+/* The early feedback stage of the resident restart proof
+ * (tools/dev/devloop_early.c): on a candidate a real cc compiles and links,
+ * the facts-narrowed groups run first, uncached, as feedback that is never
+ * admissible; the full plan then selects and runs byte-identical groups; a
+ * red early stage leaves the full plan unchanged; and missing, outside,
+ * absent or empty facts skip the stage and name why. */
+ZCL_TEST_GROUP(devloop_early)
+/* fxc_build_inputs()'s non-C/H build-input rule in isolation, with hand-built
+ * identity+files manifests (no libclang, no checked-in fixture): a changed
+ * path no TU reads and no Makefile names where make can change an object
+ * (only a .PHONY-only recipe, an echo, an $(if) condition) narrows the
+ * compile but keeps the plain plan's own path groups as a test obligation;
+ * a path the Makefile text names there, or the include graph cannot answer
+ * for, still widens to the whole catalog; a path some TU's manifest lists
+ * as read goes through the existing header path instead. */
+ZCL_TEST_GROUP(semantic_build_inputs)
+/* The facts-narrowed closure against a cold compiler, as a differential
+ * fuzzer: random multi-TU C23 projects from a fixed seed list (and every
+ * minimized reproducer, always) are compiled with the sensor's clang and
+ * sensed before and after one mutation, planned in process from the facts,
+ * and judged: an unaffected TU's object is byte-identical, and every
+ * function with new bytes (beyond a relocation addend) is a seed or covered.
+ * A fast default seed list keeps this under a minute standalone;
+ * ZCL_STRESS_TESTS=1 runs the full seed list, and
+ * ZCL_SEMANTIC_FUZZ_SEEDS=FIRST:COUNT[:PROFILE] runs a long range instead.
+ * Self-skips, visibly, where the sensor has not been built. */
+ZCL_TEST_GROUP(semantic_facts_fuzz)
+ZCL_SPEC_GROUP(wallet_dashboard)
+ZCL_SPEC_GROUP(wallet_send)
+ZCL_SPEC_GROUP(wallet_receive)
+ZCL_SPEC_GROUP(wallet_shield)
+ZCL_SPEC_GROUP(wallet_node)
+ZCL_SPEC_GROUP(wallet_history)
+ZCL_SPEC_GROUP(wallet_coins)
+ZCL_SPEC_GROUP(wallet_pulse)
+ZCL_SPEC_GROUP(wallet_tx_detail)
+ZCL_SPEC_GROUP(wallet_navigation)
+ZCL_SPEC_GROUP(wallet_errors)
+ZCL_SPEC_GROUP(wallet_privacy)
+ZCL_SPEC_GROUP(wallet_sovereignty)
+ZCL_SPEC_GROUP(wallet_celebration)
+ZCL_SPEC_GROUP(wallet_empowerment)
+ZCL_SPEC_GROUP(wallet_flow)
+ZCL_SPEC_GROUP(wallet_accessibility)
+ZCL_SPEC_GROUP(data_hooks)
+ZCL_SPEC_GROUP(event_observers)
+ZCL_SPEC_GROUP(state_machine)
+ZCL_SPEC_GROUP(ux_sierra)
+ZCL_SPEC_GROUP(html_quality)
+ZCL_SPEC_GROUP(user_journeys)
+ZCL_SPEC_GROUP(e2e_wallet)
+ZCL_SPEC_GROUP(render_audit)
+ZCL_SPEC_GROUP(smoke)
+ZCL_SPEC_GROUP(100_stories)
+ZCL_SPEC_GROUP(consensus_compat)
+ZCL_TEST_GROUP(guest_service)
+ZCL_TEST_GROUP(mesh_guest_chan)
+/* z23-toolgen:begin test-groups - generated, do not edit */
+ZCL_TEST_GROUP(fleet_nodes_table)
+/* z23-toolgen:end test-groups */
+ZCL_TEST_GROUP(toolgen)
+ZCL_TEST_GROUP(zssh)

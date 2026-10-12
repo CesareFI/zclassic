@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "name": "zclassic23/zssh",
+  "semver": "0.1.0-alpha.1",
+  "language": "c23",
+  "license": "MIT",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "root": "5ed73f266819c98c6ebb871c3c6c3b73ac713e000008251fe2f1f7d92671c218",
+      "name": "zclassic23/base",
+      "semver": "0.1.0-dev.1"
+    },
+    {
+      "root": "2bdab8c22334369b3120af8983b08e9af4c78df59ac5295786f9fd19dd517c97",
+      "name": "zclassic23/crypto-sha3",
+      "semver": "0.1.0-alpha.1"
+    },
+    {
+      "root": "e9cd92c72e510241a20edf85e6babd923bb8dafd13d376f00b469e033f00e6ad",
+      "name": "zclassic23/mlkem",
+      "semver": "0.1.0-dev.1"
+    }
+  ],
+  "capabilities": [],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "include/zssh/zssh.h",
+    "src/zssh_auth.c",
+    "src/zssh_channel.c",
+    "src/zssh_conn.c",
+    "src/zssh_internal.h",
+    "src/zssh_kex.c",
+    "src/zssh_packet.c",
+    "tests/test_zssh.c",
+    "tests/test_zssh_e2e.inc",
+    "tests/test_zssh_auth.c",
+    "tests/test_zssh_channel.c",
+    "tests/test_zssh_kex.c",
+    "tests/test_zssh_packet.c",
+    "zcode-package.json"
+  ]
+}

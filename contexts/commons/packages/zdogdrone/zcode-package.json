@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "name": "zdogdrone/zdogdrone",
+  "semver": "0.1.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "name": "zdogfight/zdogfight",
+      "root": "3dedb336d99602a5ef3a924e1c3b9d256423d9db00b510ef853a4071cadccff8",
+      "semver": "0.1.0"
+    },
+    {
+      "name": "zprng/zprng",
+      "root": "83d7a4e0afa5060737d81040d81ebe3855a72a2d7ce300f1dab22ab07144c304",
+      "semver": "0.1.0"
+    }
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zdogdrone/zdogdrone.h",
+    "src/zdogdrone.c",
+    "tests/test_zdogdrone.c",
+    "zcode-package.json"
+  ]
+}

@@ -1,0 +1,366 @@
+# Content-addressed per-group test result cache
+
+Bazel-style caching for `make test-parallel`: a test **group** is returned from
+cache — never forked — when its exact transitive **input closure** is
+byte-identical to the last time that group passed. Editing one leaf re-runs only
+the handful of groups downstream of it; every unrelated group is a ~0-time cache
+hit.
+
+## The invariant: a run says what it actually did
+
+The cache is **OFF by default** today. That default is scheduled to flip to ON
+everywhere, so "the gate is cold by construction" is being replaced by "a run
+cannot misreport whether it was cold."
+
+Every run prints one machine-greppable line **before** any verdict word:
+
+```
+SUITE VERDICT mode=<cold|cached> groups_total=N groups_ran=N groups_cached=N \
+  groups_gated=N groups_failed=N self_skips=N env_unobserved=N load_flaky=N \
+  toolkey=<hex12>
+```
+
+`groups_ran` is the count actually forked, and it is the first number to read.
+Only a skip-free fresh PASS is stored; a zero-exit group that prints `SKIP (`
+never becomes a reusable PASS. The v5 key domain also retires records that
+did not bind the shared runner and cache-policy source inputs.
+
+`load_flaky` counts groups that FAILed or were WEDGED once under the shared,
+contended worker pool and then PASSED alone, with the pool otherwise idle
+(the rerun-alone policy, `rerun_load_flaky_groups` in test_parallel.c). Such a
+group counts as a real PASS for the suite verdict — its own code proved
+itself — but it is never allowed to look like an ordinary, uncontended pass:
+a `LOAD-FLAKY <group> first=<FAIL|WEDGED> alone=PASS first_log=<path>
+alone_log=<path>` line is printed the run it happens, the stored cache record
+carries the same flag, and every later cache HIT on that record reprints
+`LOAD-FLAKY <group> first=CACHED alone=PASS ...` instead of serving it as a
+silent, indistinguishable hit. A group that fails again on its alone rerun
+stays FAIL exactly as before — the policy gives a real regression no extra
+cover, it only removes the box's own contention as a false accusation. A
+group that stays FAIL after being killed by the per-group deadline reports
+that distinctly in the "Failed groups:" list — `timed out after <n>s under
+the shared pool; retried alone, still signaled signal=<n>` — instead of a
+plain `signaled signal=<n>`, so a reader does not chase a hang that was
+actually the box's own load.
+
+"WEDGED once" above means the harness's own per-group deadline watchdog
+killed it (`wedged`, set only where that kill fires) — never inferred from
+the signal number alone. A group SIGNALED for any other reason (SIGSEGV,
+SIGABRT, SIGBUS, SIGFPE, or a SIGKILL nobody in the harness sent) is a real
+crash, not a load casualty: it gets no rerun and stays a hard failure.
+Only a **cold** run prints the bare token `ALL TESTS PASSED`; a cached run prints
+`ALL TESTS PASSED (CACHED)`. `tools/scripts/gate-and-report.sh` reads the
+`SUITE VERDICT` line, rejects anything whose `mode` is not `cold`, and rejects
+the `(CACHED)` headline explicitly.
+
+This matters because the old headline printed `ALL TESTS PASSED — 0/743 groups
+failed` whether 743 groups ran or 1 ran and 742 came from cache: `pre_skipped`
+counted only `--only` filtering and the params gate, never cache hits. The gate
+grepped exactly that string, so a run that executed nothing reported `GATE OK`.
+
+The runner also prints, **before dispatch**, the cache plan and a histogram of
+uncacheable reasons — that histogram is how a whole-run degradation (an absent
+include graph making every group uncacheable, say) becomes visible instead of
+looking like a normal cold run.
+
+The resident save loop uses the narrower internal form
+`--cache --cache-snapshot --changed-source=<path>`. It opens the already
+verified code-index snapshot instead of rebuilding it in the feedback process.
+That is safe only under a fail-closed rule: if a group's old forward closure
+contains any changed translation unit, that group is uncacheable and runs
+fresh (`changed-input-runs-fresh`). Only an old closure that excludes every
+changed source may reuse an exact PASS. A missing snapshot, an empty changed
+set, or an invalid path disables the cache; it never falls back to a smaller
+key. This form is resident-loop plumbing, not a substitute for the ordinary
+fresh-index and cold-audit gates.
+
+`make ci`'s single retry on a `test_parallel` failure runs `--no-cache`. Its
+justification — "a real regression fails BOTH passes" — holds only while both
+passes execute the same groups. With the cache on, pass 1 would store a `PASS`
+for the ~742 groups that succeeded, pass 2 would skip those and re-run the
+failing group alone on an unloaded box, and a lucky result would be stored — so
+the group would be skipped forever. Forcing the retry cold keeps it an
+independent second opinion instead of a flake-laundering machine.
+
+## Landing proofs never admit a cached verdict
+
+A landing proof (`z23-dev dev proof`, `tools/dev/dev_proof.c`) runs its test
+dimension with `--no-cache`, the runner's explicit cold mode. It outranks
+`ZCL_TEST_CACHE`, so no inherited or planted environment can turn reuse back
+on: every selected group executes, and the runner opens no verdict store and
+stores nothing. The proof worker also clears `ZCL_TEST_CACHE`,
+`ZCL_TEST_CACHE_DUMP` and `ZCL_TESTCACHE_STORE_ROOT` before any child runs,
+does not copy the submitting checkout's `.zvcs/objects` into the proof
+generation, and refuses a test log whose `SUITE VERDICT` reports any
+`groups_cached`; the receipt's test dimension therefore always records
+`reused=0`.
+
+The reason is the trust boundary, not the cache's soundness. A PASS record is
+unsigned and lives in a directory any process of this uid can write, and the
+candidate being proved runs as that same uid. Its tests could plant a PASS at
+a group's exact key, and a proof that honoured the store would then count that
+group as passing without running it. Reused verdicts may shape acceptance only
+when a separate account, outside the candidate's trust domain, reproduced and
+signed them. No such verifier exists for test verdicts yet, so every proof
+writes
+
+    test_reuse_admit=test-reuse: unqualified(no_verifier_account)
+
+to its `phases.txt`. What re-enables reuse is qualifying that separate-uid
+verifier, the same boundary the lint result cache waits on; widening the
+same-user cache does not.
+
+The proof still runs one probe before the test dimension
+(`--cache --cache-probe-only` against the generation's own store) and records
+it as `test_preflight=advisory groups=N would_reuse=N must_run=N
+uncacheable=N admitted=0 capsule=...`. It is a measurement only: nothing in
+the dimension reads the probe or its capsule. When the generation's
+`.zvcs/objects` holds no entry besides `tmp/` (the usual cold case), the probe
+could only count zero, so the spawn is skipped and the line reads
+`test_preflight=advisory skipped reason=empty_verdict_store`; any stored
+object or unreadable store runs the probe as before.
+
+## Using it (inner dev loop)
+
+```bash
+ZCL_TEST_CACHE=1 make test-parallel   # opt in: skip unchanged groups, store passes
+make test-parallel                    # default: cold, runs everything
+make test-parallel TEST_PARALLEL_ARGS=--no-cache   # force cold even if ZCL_TEST_CACHE set
+```
+
+The canonical full suite remains cold by default. The mapped `make pre-push-ci`
+lane deliberately enables the cache for its exact focused set and then
+validates the runner's machine verdict: every selected group must be accounted
+for as freshly run or reused, failures and runtime SKIPs must both be zero, and
+the toolchain key must be present. `z23-dev dev begin` can populate those exact
+receipts asynchronously during editing; `z23 dev status` shows the native cycle
+receipt. Unbounded-input and stale/missing dependency-graph groups are never
+reused.
+
+The final summary gains one line: `cached N / ran M`, and the run reports its
+plan and reason histogram up front. `.cache/test-timing/last-run.json` carries
+`mode`, `groups_ran`, `groups_cached`, `groups_cacheable`, `toolkey`, and a
+per-group `cached` flag.
+
+### Where the include graph comes from
+
+Every depfile the build writes lands in a per-build compile epoch,
+`build/*/epochs/<epoch>/`. Each build mints a new epoch and the previous few are
+retained, so the directory holds immutable receipts of trees that are no longer
+checked out; reading them all duplicates every edge and inflates a warm lookup
+to tens of thousands of files.
+
+`tools/dev/build-epoch-session.sh` names the live generation in
+`<object-root>/.current-epoch` while holding the lock that mints the epoch
+directory and hands out the compile lease. Every profile reaches a compiler only
+through that acquire, so the name and the build cannot disagree, and
+`collect_dep_paths()` in `cognition/modules/codeindex/src/codeindex_deps.c` reads an
+epoch-managed object root through that name and through nothing else — retained
+generations stay out, and so do the pre-epoch `.d` files still sitting loose in
+the old flat object roots.
+
+This is what used to break the cache. The collector skipped any directory called
+`epochs`, which by then was where the whole graph lived: measured in a worktree
+after `make build-only` plus `make -j`, **0 of 3,111** depfiles were visible and
+every group reported `no-include-graph`. The cache failed **closed** on it
+(`no-include-graph` / `input-newer-than-include-graph`, both in the histogram),
+so it never produced a wrong skip — it just never produced a hit either.
+
+The cache asks the graph for its own inventory
+(`codeindex_depfile_graph()`) instead of walking `build/` a second time. The
+private copy it used to keep is what let the two answers drift apart in the
+first place.
+
+Inspect what a group keys on (the operator/proof lens):
+
+```bash
+ZCL_TEST_CACHE_DUMP=test_hkdf_sha256_rfc5869 <test_parallel binary>
+# prints the toolchain key, the content key, cacheable=yes/no, and the closure
+```
+
+## How the key is computed
+
+For group `test_<x>` the key is `SHA3-256` over, in order: a domain tag; the
+compiled-in **toolchain + compile-flags fingerprint**; the **coverage-gating
+environment digest**; the group name; the source and compiler-reported
+transitive prerequisites of `test_parallel.c` and `testcache.c`; and, for every
+file in the group's **forward (callee) input closure** sorted by path, the
+file's path and its `SHA3-256` content hash. The two common translation units
+affect every group's execution or cache policy but do not appear in its callee
+closure. Their include edges are paged to an exact end witness; a missing or
+unreadable common input, absent depfile edge set, or truncated page refuses
+reuse. A group name beyond the signed observation leaf's 127-byte bound also
+refuses a reusable key. Fixture-reading groups remain uncacheable until their external inputs
+have a complete declared closure.
+
+The forward closure is `codeindex_forward_closure()`
+(`cognition/modules/codeindex/src/codeindex_impact.c`) — the mirror of the `code impact`
+reverse-closure engine. From the entry symbol it walks the callee call graph and
+collects every in-tree file that **defines** a reachable symbol, plus every
+in-tree prerequisite those files pull in (compiler depfile edges — headers *and*
+the `*.def` X-macro registries, which are prerequisites exactly like headers). A
+stored `PASS` record addressed by the key lives in the `.zvcs` object store
+(`vcs_object_put_addressed`); only `PASS` is ever stored.
+
+### The toolkey binds the FLAGS, not just the compiler
+
+`BUILD_COMPILER_ID` (`tools/dev/build-epoch-key.sh compiler-id`) fingerprints the
+`CC`/`CXX` argv and the tool bytes — **never the flags**. `TEST_FAST_CFLAGS`
+compiles at `-O1` and `TEST_REL_CFLAGS` at `-O3`, so using it alone put both
+profiles in ONE keyspace and a `PASS` recorded by `make t-fast` was honored,
+unexecuted, by the release gate binary. The toolkey is now a digest over the
+compiler id **plus the profile name plus that profile's effective compile
+flags**, injected per-object as `-DZCL_TESTCACHE_TOOLKEY` for the fast, release
+and ASan trees (the ASan tree used to get no define at all and silently fell back
+to `__VERSION__`).
+
+The epoch machinery's own digest (`zcl_compile_epoch`) is deliberately **not**
+reused as the toolkey: it binds `BUILD_SOURCE_ID` and `BUILD_MUTATION`, so it
+changes on every source edit and would bust the entire cache every time.
+
+### The environment is in the key
+
+About 16 groups `return 0` from a `SKIP (set ZCL_STRESS_TESTS=1 ...)` path. Their
+source bytes are identical whether the stress lane ran or not, so a normal run
+stored a `PASS` for the *skipping* variant and a later `ZCL_STRESS_TESTS=1` run
+got a cache HIT and never executed the stress lane — reporting green for coverage
+that did not run. Every `ZCL_`-prefixed variable (plus `HOME`, `EQUIHASH_TEST`,
+`REDUCER_FUZZ_SEED`) is therefore hashed into the key. Hashing beats denylisting
+those 16 groups: it is exhaustive by construction and cannot rot when someone adds
+the 17th gate. The cache's own controls (`ZCL_TEST_CACHE`,
+`ZCL_TEST_CACHE_DUMP`) and the `ZCL_FAST_*` orchestration namespace are excluded.
+Fast-CI's frozen source identity, changed-path hints, compiler selection and
+scheduling knobs change no group's verdict; source bytes and toolchain/flags are
+already bound directly. Folding those controls into the environment digest
+would globally invalidate every unrelated receipt after any edit or docs-only
+rebase.
+
+## Soundness: a cached SKIP is provably equivalent to a fresh PASS
+
+A group is **UNCACHEABLE (always runs)** when its inputs cannot be bounded:
+
+- the forward closure came back `truncated` (a cap / fan-out / depth limit, or a
+  closure path too long for the caller's row),
+- the entry symbol does not resolve in the code index,
+- the group is on the **external-input denylist** — it reads fixtures, the live
+  node DB, an external `zclassicd`, `~/.zcash-params`, a legacy datadir, or (the
+  load-bearing case) **execs a built binary**, whose behavior comes from the
+  whole link and which the forward source closure never reaches
+  (`group_reads_external_inputs()` in `tests/harness/src/testcache.c`). Matching is on
+  the **exact** group name — the previous `strstr()` form could not list `net`
+  without also swallowing `netmask`/`subnet`/`net_bootstrap`, which is exactly
+  why `test_net` went uncovered,
+- **the probe-time exec rail fires a refuse-class signal** — the group's own
+  entry file or a harness helper it links (scope: `trc_rail_scans_file()`)
+  contains a comment-stripped exec signal that reaches inputs no key can
+  bound: a `tools/…​.sh` script (interpreted: its behavior is its bytes plus
+  everything it invokes), `make` (reads the Makefile), a self re-exec through
+  `argv[0]`/`os_proc_exe_path`, or a parameterized/overflowing artifact
+  literal. The denylist above is hand-maintained; the rail
+  (`trc_rail_refuses()`) scans at probe time and refuses automatically, so a
+  new group with an unbindable exec is uncacheable from its first probe
+  without anyone adding a row. Other groups' entry files and
+  platform/tools/core machinery are out of scope: the name-resolved closure
+  carries passengers that would false-positive the whole suite. A plain
+  `build/bin/…` artifact literal is **bound, not refused**: the artifact's
+  content hash joins the group key (key domain `zcl.testcache.key.v6`), so an
+  edited binary moves the key, an untouched one keeps the hit, and an absent
+  or unreadable artifact refuses fail-closed,
+- **the include graph is absent** — no depfiles under `build/`. Zero include
+  edges is not "a closure with no headers", it is *no closure*: a strictly
+  smaller set that is never flagged `truncated` and therefore looks complete. On
+  a fresh clone or after `make clean`, every key would otherwise cover zero
+  headers,
+- **the common harness graph is incomplete** — either runner-policy translation
+  unit lacks compiler-reported prerequisite edges, even if unrelated depfiles
+  make the overall graph look present,
+- **an input is newer than the include graph** — if any closure file's mtime is
+  newer than the newest depfile the graph was built from, the graph cannot
+  describe that file, so an include added since is invisible to the key.
+- **the resident snapshot closure reaches an edited translation unit** — its
+  prior edges cannot describe the edited body, so that group runs fresh. The
+  snapshot may serve only groups proven unrelated by the prior closure.
+
+The one residual assumption is the standard one for any source-based
+"affected-tests" analysis: the call graph captures a test's dependency edges by
+name (an indirect/function-pointer/dlopen edge is invisible to source scanning,
+exactly as it is to `code impact`). That assumption is backed by:
+
+**`--cold-audit`** — runs *every* group fresh (cache disabled for execution) and
+asserts that every group carrying a stored `PASS` at its current key also passes
+the fresh run. A divergence is a closure/cache soundness bug and fails the run
+loudly:
+
+   ```bash
+   ZCL_TEST_CACHE=1 make test-parallel                        # populate
+   make test-parallel TEST_PARALLEL_ARGS=--cold-audit         # verify: 0 divergences
+   ```
+
+## Cold open in proof generations (STRETCH decision: rebuild stands)
+
+Since landing proofs stopped admitting cached verdicts (above), only the
+advisory preflight probe still opens the code index inside a generation, and
+the test dimension no longer consumes a capsule. The analysis below still
+governs any future reuse path.
+
+A proof generation is a fresh checkout (`generation_prepare` re-checkouts
+every cycle), so no verified code-index snapshot exists under its root and
+`codeindex_open` pays the full cold rebuild (~5.4 s). Reusing the parent
+checkout's snapshot via `codeindex_open_existing` plus a worker-supplied
+changed set was evaluated and **rejected** for the proof path:
+
+- There is no *existing* snapshot to reuse — provisioning one (copying the
+  parent store) is new topology-sharing infra, not a read of verified state.
+- On a fresh checkout + fresh build every source mtime predates every
+  depfile mtime, so the "input newer than include graph" backstop
+  (`TESTCACHE_R_GRAPH_STALE`) is blind there by construction. Changed-set
+  completeness would be the *sole* guard against a topologically
+  incomplete key.
+- That completeness (added + deleted + modified vs the snapshot's exact
+  tree) is not computed by the proof worker today, and a gap in it fails
+  in the worst direction: a false HIT skips a test the proof then vouches
+  for. The resident loop keeps the mtime defense because it runs in place
+  on a live store; that safety case does not transfer to fresh generations.
+
+So the cold rebuild stays: 5.4 s buys content-Merkle-verified call/include
+topology (`codeindex_is_stale`), and no stale topology is used to save it.
+The per-cycle win stands one level up instead — the probe capsule removes
+the *second* warm open, so a proof cycle pays graph/index setup once.
+
+Consume-time revalidation: a capsule's structural checks (SHA3, toolenv,
+sealed bindings) never re-read the verdict store, so a capsule consumed
+after its backing PASS records vanished still ACCEPTs with stale HIT bits.
+`testcache_capsule_apply` therefore re-verifies every consumed HIT against
+the store (magic/PASS/key-echo, the same check a fresh probe performs) and
+demotes an unbacked HIT to MISS — the group runs instead of skipping on
+dead evidence. Demonstrated by the `tc_capsule_reverify` phase and the
+backing-removed lifecycle (sealed → capsule → wipe store → consume →
+dimension runs, no skip).
+Live-key revalidation: the store re-read alone still echoes a slot whose
+key is stale, because slot and record agree with each other but neither
+is recomputed from live bytes. A content-drift lifecycle (sealed →
+capsule → edit one source with the mtime frozen → consume same bindings)
+skipped on dead evidence (`groups_cached=1`, rc=0) while a fresh probe on
+the same bytes MISSED. Consumption therefore revalidates every HIT
+against a live key as well (`testcache_capsule_revalidate`, opening the
+same handle a fresh probe would use): unchanged inputs keep the skip, any
+divergence — changed content, stale graph, unreadable input, vanished
+record — demotes to the live probe, so the group runs. A NULL handle
+demotes every HIT (fail closed). Demonstrated by the
+`tc_capsule_live_revalidate` phase (including a mutation probe: with the
+revalidation neutered, exactly the demotion checks FAIL) and the
+content-drift lifecycle both ways (dirty → MISS + `ran 1`; restored →
+HIT). The honest price is that capsule consumption now costs about one
+fresh probe: the "pays graph/index setup once" win above no longer holds
+for consume-side opens. The capsule keeps its batch-coordination role —
+one mint, many coordinated consumers — but no longer its graph-open
+saving. Never shortcut this with mtime: a frozen-mtime edit re-keys to
+MISS, so timestamps are not trust inputs.
+
+## Files
+
+- `cognition/modules/codeindex/src/codeindex_impact.c` — `codeindex_forward_closure()`.
+- `tests/harness/src/testcache.c` + `tests/harness/include/test/testcache.h` — the cache.
+- `tests/harness/src/test_parallel.c` — dispatch wiring, `--cache/--no-cache/--cold-audit`.
+- `tests/harness/src/test_testcache.c` — the cache's own contract test group.
+- `Makefile` — bakes `BUILD_COMPILER_ID` into `testcache.o` as the toolchain key.

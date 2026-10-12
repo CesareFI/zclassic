@@ -1,0 +1,46 @@
+# Thread-supervision baseline (Gate #23 — check_thread_supervision.sh).
+#
+# Long-running threads spawned via thread_registry_spawn that are NOT yet on
+# the supervisor liveness tree. Each line: "<thread-name>  <disposition>
+# <one-line justification>". The FIRST token (the thread name literal, as
+# passed to thread_registry_spawn) is what the gate matches; the rest is
+# documentation for humans.
+#
+# RATCHET: this list may only SHRINK. To remove an entry, give the thread a
+# liveness contract via util/thread_liveness.h (exemplar:
+# engine/modules/health/src/heartbeat.c) or an inline // supervised: / //
+# thread-supervision-ok: marker at the spawn site, then delete the line. A
+# stale entry (thread renamed/removed/now-covered) fails the gate, forcing
+# the count down.
+#
+# ── disposition: bounded ──────────────────────────────────────────────────
+# One-shot / bounded-lifetime background jobs. They TERMINATE on their own;
+# a hang surfaces as a thread_registry straggler at the shutdown join and via
+# the job's own progress logging, so a per-job liveness contract would be
+# churn. Register-on-start/retire-on-join is future work if any proves flaky.
+zcl_snap_idx     bounded  one-shot snapshot block-index import (snapshot_controller_import.c)
+zcl_snap_utxo    bounded  one-shot snapshot UTXO import (snapshot_controller_import.c)
+zcl_snap_wallet  bounded  one-shot snapshot wallet import (snapshot_controller_import.c)
+zcl_snap_txidx   bounded  one-shot snapshot tx-index import (snapshot_controller_txindex.c)
+zcl_catchup      bounded  one-shot catch-up sync job (sync_controller_catchup_jobs.c)
+zcl_db_import    bounded  one-shot legacy-db import job (sync_controller_catchup_jobs.c)
+zcl_utxo_dec     bounded  bounded UTXO-decode worker, joined at import end (node_db_import_service.c)
+zcl_utxo_wr      bounded  bounded UTXO-writer, joined at import end (node_db_import_service.c)
+zcl_hodl_ref     bounded  one-shot explorer HODL-page refresh per task (explorer_pages_hodl_snapshot.c)
+zcl_blk_scan     bounded  boot-time block-file scan worker, joined (boot_block_file_scan.c)
+bg_quick_check   bounded  boot-time fast-restart quick check, joined (boot_fast_restart.c)
+#
+# ── (2026-07-15, watchdogd-drain lane) ─────────────────────────────────────
+# The former "io-blocking" and "cpu-bound" cohorts (zcl_dns_seed,
+# zcl_connman_sock, zcl_connman_open, zcl_connman_msg, zcl_fs_wkr,
+# zcl_fs_server, zcl_fs_manifest, zcl_https_wkr, zcl_https_listen,
+# zcl_http_listen, zcl_p2p_ingest, zcl_tor_monitor, zcl_tor, zcl_ws_pump,
+# zcl_async_rpc, zcl_rpc_worker, zcl_rpc_listen, zcl_rpc_tls,
+# zcl_rpc_cookie, zcl_miner) are now all on the supervisor liveness tree via
+# util/thread_liveness.h — LIVENESS-ONLY contracts (deadline=0,
+# progress_quiet_us=0) heartbeating at each accept/dispatch/work-item
+# boundary, except zcl_connman_sock (a real 30s deadline — it wakes on a
+# deterministic 50ms poll() timeout) and zcl_tor (never instrumented
+# directly — opaque vendored Tor code; beaten as a proxy from
+# zcl_tor_monitor's own poll loop). What remains below are the genuine
+# bounded one-shots.

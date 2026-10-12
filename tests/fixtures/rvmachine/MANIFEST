@@ -1,0 +1,91 @@
+# rvmachine fixtures: freestanding RV64 supervisor guests, flat images entered at 0x80200000 (preload also 0x30 further in, once a test has wrapped it as an ELF).
+# Sources are ours (Apache-2.0), in src/; written from the RISC-V privileged and SBI specifications.
+#   tiny      firmware console, timer, wfi, serial port, power-off
+#   paging    Sv39 turned on through the stvec fault, as a kernel does
+#   uclock    user-mode read of the time CSR
+#   rfence    one page remapped and made visible by firmware remote-fence calls
+#   diskwait  wfi until the block device interrupt or a far timer
+#   echo      console input read through the firmware console, then the serial port
+#   entropy   forty bytes asked of the virtio entropy device in slot 1, printed as hex
+#   ticker    four timed sleeps in wfi, with serial input echoed from the interrupt handler
+#   rearm     a timer armed s1 time units ahead and a wfi, in an endless loop
+#   masked    serial input against the gates the embedder sets: sie in s3, port enables in s4, controller enables in s5; timed wfi with s2
+#   preload   the metadata list of the loader entry (0x30 into the image, a0 = its address) printed record by record, the last module summed and zeroed
+#   conport   masked virtio-console binary RX/TX echo; length header and actual driver repost
+# Regenerate (authoring time only, no toolchain at test time; LLVM 20 at /usr/lib/llvm-20/bin, OBJ is any scratch dir):
+#   for n in tiny paging uclock rfence diskwait echo entropy ticker rearm masked preload conport; do
+#     clang --target=riscv64-unknown-elf -march=rv64imafdc -mno-relax -Isrc -c src/$n.S -o $OBJ/$n.o &&
+#     ld.lld -N -Ttext=0x80200000 -e _start $OBJ/$n.o -o $OBJ/$n.elf && llvm-objcopy -O binary $OBJ/$n.elf $n.bin; done
+# name sha256(name.bin)
+tiny cf69105a626e6676de0d7d2edce20a22ae489ede5015f5ada230528147dd5001
+paging 532e9b5b2ff844d6fc33dab5015af7e7f89c8af7cb70bb8e187d56aeebedabf8
+uclock 37ad6d798704c6221c099a14c557f928ed4bf2dc650116720e6acaeb47f5e51d
+rfence 445e20e67f1e7c33d1f6524c7e93edbace2bb144c79d2e1f4c8a7724a49ebe19
+diskwait d5682a43b803a42364658ac2682fe7650fbf9e224c214630f95c1f2ae7a3b01a
+echo d439dd20fa7a558232d29a0a50bff82b4e25c9298198320e515f24e361dada09
+entropy ae1952fff37400be1f373371fe53550c55fc490c35e078673861eabe992c937a
+ticker 35000fa11a127296ba8aeb92795e7bf8ae6696046b47eb02316558cc6b3b556e
+rearm 4a44fa6a43cd8af797f5636d47c78aeafc3eff1b35e20cb9a28f97acf0cf60dd
+masked fa39f58963e76b40749597c7bcf475964962f38c8fcd0f9817480df8ca3ecce2
+preload fa507fe45feaee3445cd3fd21c30da60b301e455636e6bb5ed0ecd6d66ec19b0
+conport a04cef28c8311513de009646c45be44c866211efb0d0e801f8fc10d56221f06d
+# geli_flush.c is a fixed-device FreeBSD userland PUBLIC acceptance helper,
+# not a freestanding flat-image entry. Reproduce with the existing qualified
+# FreeBSD15.1 world sysroot and LLVM20.1.8:
+# clang --target=riscv64-unknown-freebsd15 --sysroot=OBJ/tmp -fuse-ld=lld \
+#   -std=gnu23 -O2 -Wall -Wextra -Werror -o geli-public-flush src/geli_flush.c -lgeom
+# Retained image recipe: build/handoff/rvboot-resume-20261011/geli-public-flush-image.command.sh
+# Base reviewed public UFS1: 9131c7162ab5d51486f29b1ebb187d6105f0eeb8e86e1fc1169c69d1a56b2193
+# Only new image entry: /sbin/geli-public-flush (0555); no startup changes.
+# Final UFS1: b7041a9af7aaf4ec2a80471f793f1b1366996e9130a29768f59b4344db5a3bfd
+# Kernel: fae34637f859502e4bcc529fe8591b08ad5cbb72b0e3c82f0570e394bda70a48
+# PUBLIC credential source literal: PUBLIC_TEST_ONLY_GELI_KEY_0000001 + LF
+# Wrong credential source literal: PUBLIC_TEST_ONLY_WRONG_KEY_00001 + LF
+# Payload source: 4096 ASCII A bytes; no real identities/keys are qualified.
+# freebsd_port_bytes.c is a PUBLIC FreeBSD userland fixture, not a flat image.
+# Fixed named aliases: z23.l0.t and z23.l0.p. Roles T/P/BOTH exchange4097
+# binary bytes; CLOSE observes completed-not-reposted RX before guest close,
+# host rebind, and an exact fresh pattern. No credentials or SSH are qualified.
+# Build with LLVM20.1.8 and the retained FreeBSD15.1 sysroot, default BSD
+# feature visibility, and exact externally reviewed guest_port.h:
+#   clang --target=riscv64-unknown-freebsd15 --sysroot=OBJ/tmp -fuse-ld=lld \
+#     -std=gnu23 -O2 -Wall -Wextra -Werror -IHEADER_DIR \
+#     -o public-port-bytes src/freebsd_port_bytes.c
+# Header sha256: f7e427757608cb9a18c9b9c329bb1a745077b3abc83cf33ad9eaf4fb47bac559
+# Guest source sha256: c03782cf4042de8dd4ef2905cc2f3a5dae654fe9fc51a1d3f727976fc549101f
+# Guest binary sha256: a09193d9d3a682328b93074ad3c19fe031bb483fec42112e0ecd33e04dbd7ded
+# Kernel sha256: 464e0c3d10c110746b20a588625857f1943d7533085c370b600b909c2380c142
+# Embedded UFS1 sha256: e78e7bbeb8a8270bdc41045f82d4b9fb422ca5ad05eff07b377699f7f619a3c6
+# Retained recipe: build/handoff/rvboot-resume-20261011/freebsd-public-ports-close-build.command.sh
+# Packet: build/handoff/freebsd-public-ports-close-20261011
+# Driver patch: build/handoff/rvboot-resume-20261011/vtcon-lossless-draft3.patch
+# Upstream96841ea08dcfa84b954a32dc5ae1a26c28966cf4; existing READY-order
+# delta retained; source-after sha2566930f127e5a6302c0a6369f696cabd41fbf5e488ed65a4c9e7d6585275a6fdd9.
+# geli_bootstrap_public.c and geli_mounted_flush.c are fixed PUBLIC FreeBSD
+# acceptance helpers, not flat images or production credential receivers.
+# Retained receiver source sha256: a2d488246043c2dbc53853095c7b09a3da455325ee2dcf7857a18c441ec5c254
+# Receiver binary sha256: 274880bbfd8a46a278d78c5e765a76c4299d107ced67f583e676993b826c8e5f
+# Attached-provider flush source sha256: bb814dcb163ade43da67d67d12d476484aacfbc2332a9ca8b09bedf9377393ee
+# Flush binary sha256: 333fb75c07be8cd47d897d29db4c13ee8ca46c13c343d19306f09c52c6490d49
+# Fixed PUBLIC key bytes: 1..32; sha256 ae216c2ef5247a3782c135efa279a3e4cdc61094270f5d2be58c6204b7a612c9
+# Mounted kernel sha256: 2445a0ca747bb28eac52c8c2bb861ee9be06f3c7353587d88e3c3fcbb832b2f4
+# Embedded UFS1 sha256: 5e1205cf0ff719d207264826bd88393eb0e65add633fb5889f90d55be6280d06
+# Retained recipe: build/handoff/rvboot-resume-20261011/geli-bootstrap-public-image-v3-inert.sh
+# Retained packet: build/handoff/rvboot-resume-20261011/geli-bootstrap-image-v3-receiver
+# LLVM20.1.8/FreeBSD15.1 sysroot inputs and static ELF closure are observed;
+# complete toolchain runtime closure is unavailable: fully_qualified_action=false.
+# Existing original GELI kernel/root and startup/account files remain unchanged.
+# Mounted acceptance checks cold readback, wrong key and authenticated DATA
+# corruption at the primary superblock; it does not qualify private unlock/SSH.
+# V7 prepared INITIAL helper (separate from the retained V6 image above):
+# src/geli_bootstrap_public.c sha256 c7d847ca4575d3532b9d6f855843612601ceef40cc89593d25ce3c3181a1b637
+# src/geli_public_prepare.inc sha256 2ecf0019818d58bbf97d54f85e156f4a0c5a88186a29df17dc9bf60d99b0c083
+# Compile packets must copy and hash both sources plus the pinned guest_port.h.
+# --public-initial-prepare adds fixed five-page preparation after attach proof;
+# no-argument recovery remains attach-only. Native FreeBSD/RISC-V compile passed.
+# Helper sha256: 716e739adbd37ca284765790267cc1e973f82686359a6cbe7993d060ac91e9f4
+# V7 UFS1: ae126a37ac11db4203992f905c5a4a14ceb2668bb67fd3b861f704cdcde0e7a8
+# V7 kernel: ac1dd2f5260aa64d2ba9cf30c13927709ff7f427709571dd65521051cf44b57c
+# Assembly replaced only the V6 helper; other root bytes/metadata, non-MFS
+# kernel bytes and program headers matched. Full action closure is unqualified.
+# Native confinement and actual V7 INITIAL/RECOVER execution remain unqualified.

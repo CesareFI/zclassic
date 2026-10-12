@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="600" viewBox="0 0 960 600" role="img" aria-labelledby="journey-title journey-desc">
+  <title id="journey-title">Describe, reuse, create and build, see, reproduce, accept</title>
+  <desc id="journey-desc">A continuous path carries a user's description through reuse and creation into a dominant live viewport. The viewport shows a real prompt-to-pixel result before the path continues to reproduction on another node and then accepting and using one exact version.</desc>
+  <defs>
+    <linearGradient id="journey-path" x1="0" x2="1">
+      <stop offset="0" stop-color="#5ea8ff"/>
+      <stop offset="0.42" stop-color="#a78bfa"/>
+      <stop offset="0.58" stop-color="#f0b44c"/>
+      <stop offset="1" stop-color="#3ddc97"/>
+    </linearGradient>
+    <pattern id="journey-pixels" width="18" height="18" patternUnits="userSpaceOnUse">
+      <rect width="18" height="18" fill="#0d1219"/>
+      <path d="M18 0H0V18" fill="none" stroke="#1d2633" stroke-width="1"/>
+    </pattern>
+    <marker id="journey-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#3ddc97"/>
+    </marker>
+  </defs>
+  <rect width="960" height="600" fill="#090c11"/>
+  <g font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="54" y="61" font-size="17" font-weight="750" letter-spacing="2.2" fill="#f0b44c">THE PRODUCT JOURNEY</text>
+    <text x="54" y="105" font-size="36" font-weight="780" fill="#e9eef6">See the consequence before you accept it.</text>
+
+    <path d="M76 293C134 293 132 193 202 193S240 387 309 387H666C735 387 728 227 798 227S830 365 898 365" fill="none" stroke="#1c2431" stroke-width="13" stroke-linecap="round"/>
+    <path d="M76 293C134 293 132 193 202 193S240 387 309 387H666C735 387 728 227 798 227S830 365 898 365" fill="none" stroke="url(#journey-path)" stroke-width="4" stroke-linecap="round" marker-end="url(#journey-arrow)"/>
+
+    <g font-size="14" font-weight="780" letter-spacing="1.3">
+      <circle cx="76" cy="293" r="8" fill="#5ea8ff"/>
+      <text x="57" y="328" fill="#b9d9ff">01 · DESCRIBE</text>
+      <text x="57" y="349" font-size="13" font-weight="500" letter-spacing="0" fill="#97a3b6">what should happen</text>
+
+      <circle cx="202" cy="193" r="8" fill="#3ddc97"/>
+      <text x="202" y="146" text-anchor="middle" fill="#86edbd">02 · REUSE</text>
+      <text x="202" y="167" text-anchor="middle" font-size="13" font-weight="500" letter-spacing="0" fill="#97a3b6">existing C23 first</text>
+
+      <circle cx="279" cy="357" r="8" fill="#a78bfa"/>
+      <text x="255" y="443" text-anchor="middle" fill="#d8cdfd">03 · CREATE</text>
+      <text x="255" y="466" text-anchor="middle" font-size="13" font-weight="500" letter-spacing="0" fill="#97a3b6">build what is missing</text>
+
+      <circle cx="798" cy="227" r="8" fill="#f2708a"/>
+      <text x="798" y="180" text-anchor="middle" fill="#fac0cc">05 · REPRODUCE</text>
+      <text x="798" y="201" text-anchor="middle" font-size="13" font-weight="500" letter-spacing="0" fill="#97a3b6">on another node</text>
+
+      <circle cx="898" cy="365" r="8" fill="#3ddc97"/>
+      <text x="898" y="412" text-anchor="end" fill="#86edbd">06 · ACCEPT</text>
+      <text x="898" y="435" text-anchor="end" font-size="13" font-weight="500" letter-spacing="0" fill="#97a3b6">use the exact version</text>
+    </g>
+
+    <rect x="308" y="145" width="359" height="289" rx="8" fill="#111722" stroke="#f0b44c" stroke-width="4"/>
+    <rect x="321" y="158" width="333" height="42" fill="#171f2c"/>
+    <circle cx="341" cy="179" r="5" fill="#f2708a"/>
+    <circle cx="359" cy="179" r="5" fill="#f0b44c"/>
+    <circle cx="377" cy="179" r="5" fill="#3ddc97"/>
+    <text x="635" y="184" text-anchor="end" font-size="12" font-weight="720" letter-spacing="1.2" fill="#97a3b6">ILLUSTRATED RESULT</text>
+    <rect x="321" y="200" width="333" height="221" fill="url(#journey-pixels)"/>
+
+    <text x="344" y="235" font-size="13" font-weight="720" fill="#5ea8ff">PROMPT</text>
+    <text x="344" y="261" font-size="15" fill="#c3ccd9">make a window that says hello</text>
+    <rect x="598" y="246" width="3" height="18" fill="#5ea8ff"/>
+
+    <g transform="translate(361 289)">
+      <rect width="254" height="104" rx="5" fill="#e9eef6"/>
+      <rect width="254" height="24" rx="5" fill="#5ea8ff"/>
+      <circle cx="236" cy="12" r="4" fill="#e9eef6" opacity="0.9"/>
+      <rect x="18" y="42" width="44" height="44" fill="#f0b44c"/>
+      <rect x="27" y="51" width="9" height="9" fill="#090c11"/>
+      <rect x="44" y="51" width="9" height="9" fill="#090c11"/>
+      <rect x="27" y="68" width="26" height="7" fill="#090c11"/>
+      <text x="78" y="69" font-size="21" font-weight="760" fill="#111722">hello, you.</text>
+    </g>
+    <rect x="443" y="407" width="89" height="27" fill="#f0b44c"/>
+    <text x="487.5" y="426" text-anchor="middle" font-size="13" font-weight="850" letter-spacing="1.4" fill="#090c11">04 · SEE</text>
+
+    <text x="480" y="526" text-anchor="middle" font-size="20" font-weight="700" fill="#e9eef6">Describe → reuse → create → <tspan fill="#f0b44c">see</tspan> → reproduce → accept</text>
+    <text x="480" y="557" text-anchor="middle" font-size="15" fill="#97a3b6">The visible result—not the worker's confidence—is the decision point.</text>
+  </g>
+</svg>

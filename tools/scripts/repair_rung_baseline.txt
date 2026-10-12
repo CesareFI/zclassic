@@ -1,0 +1,27 @@
+# Grandfathered repair-ladder rungs (TENACITY I3 ratchet baseline).
+# Generated 2026-06-13 from the existing ladder. SHRINK-ONLY: remove a
+# line when its rung is deleted; never add a new one (mark new code with
+# '// repair-rung-ok:<test>' instead). Gate: tools/scripts/check_no_new_repair_rung.sh
+engine/reducer/conditions/src/reducer_frontier_reconcile_light.c
+engine/conditions/src/stale_validate_headers_repair.c
+engine/controllers/src/repair_controller.c
+engine/controllers/src/repair_controller_rebuild.c
+engine/controllers/src/repair_controller_utxo.c
+contexts/wallet/controllers/src/wallet_diagnostic_repair.c
+engine/jobs/src/stage_repair_body_fetch.c
+engine/jobs/src/stage_repair.c
+engine/jobs/src/stage_repair_coin_backfill.c
+engine/jobs/src/stage_repair_coin_backfill_scan.c
+engine/jobs/src/stage_repair_coin_backfill_util.c
+engine/jobs/src/stage_repair_header_solution.c
+engine/reducer/jobs/src/stage_repair_reducer_frontier.c
+engine/reducer/jobs/src/stage_repair_reducer_frontier_coin.c
+engine/reducer/jobs/src/stage_repair_reducer_frontier_purge.c
+engine/reducer/jobs/src/stage_repair_reducer_frontier_refill.c
+engine/reducer/jobs/src/stage_repair_reducer_frontier_tipfin.c
+engine/jobs/src/stage_repair_rewind.c
+engine/jobs/src/utxo_apply_delta_repair.c
+engine/services/src/chain_restore_disk_repair.c
+engine/services/src/chain_restore_repair.c
+engine/services/src/utxo_recovery_backfill.c
+engine/supervisors/src/self_heal.c

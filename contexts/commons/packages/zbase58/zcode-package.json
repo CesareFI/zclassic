@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "name": "zbase58/zbase58",
+  "semver": "0.1.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [],
+  "programs": ["app/main.c"],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zbase58/zbase58.h",
+    "src/zbase58.c",
+    "tests/test_zbase58.c",
+    "zcode-package.json"
+  ]
+}

@@ -1,0 +1,42 @@
+diff --git a/evutil_rand.c b/evutil_rand.c
+--- a/evutil_rand.c
++++ b/evutil_rand.c
+@@ -190,14 +190,17 @@ evutil_secure_rng_get_bytes(void *buf, size_t n)
+ 	ev_arc4random_buf(buf, n);
+ }
+ 
+-#if !defined(EVENT__HAVE_ARC4RANDOM) || defined(EVENT__HAVE_ARC4RANDOM_ADDRANDOM)
+ void
+ evutil_secure_rng_add_bytes(const char *buf, size_t n)
+ {
++#if !defined(EVENT__HAVE_ARC4RANDOM) || defined(EVENT__HAVE_ARC4RANDOM_ADDRANDOM)
+ 	arc4random_addrandom((unsigned char*)buf,
+ 	    n>(size_t)INT_MAX ? INT_MAX : (int)n);
++#else
++	(void)buf;
++	(void)n;
++#endif
+ }
+-#endif
+ 
+ void
+ evutil_free_secure_rng_globals_(void)
+diff --git a/include/event2/util.h b/include/event2/util.h
+--- a/include/event2/util.h
++++ b/include/event2/util.h
+@@ -862,7 +862,6 @@
+ EVENT2_EXPORT_SYMBOL
+ int evutil_secure_rng_set_urandom_device_file(char *fname);
+ 
+-#if !defined(EVENT__HAVE_ARC4RANDOM) || defined(EVENT__HAVE_ARC4RANDOM_ADDRANDOM)
+ /** Seed the random number generator with extra random bytes.
+ 
+     You should almost never need to call this function; it should be
+@@ -879,7 +878,6 @@
+  */
+ EVENT2_EXPORT_SYMBOL
+ void evutil_secure_rng_add_bytes(const char *dat, size_t datlen);
+-#endif
+ 
+ #ifdef __cplusplus
+ }

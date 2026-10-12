@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Z23
+Comment=Z23 native presentation window
+Exec=z23 discover help
+Icon=org.zclassic.ZClassic23
+StartupNotify=true
+StartupWMClass=org.zclassic.ZClassic23
+Terminal=true
+NoDisplay=true

@@ -1,0 +1,876 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * purpose: Deterministic specialist-focus ranking from recorded evidence. */
+
+#include "codeindex/codeindex_focus.h"
+#include "codeindex/codeindex.h"
+
+#include "base/safe_alloc.h"
+#include "json/json.h"
+#include "platform/glob_match.h"
+#include "util/log_macros.h"
+#include "util/spawn.h"
+
+#include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define FOCUS_TAG "codeindex.focus"
+
+#define FOCUS_W_FAILED 100000
+#define FOCUS_W_GATE 50000
+#define FOCUS_W_ISSUE 10000
+#define FOCUS_W_LESSON 1000
+#define FOCUS_W_UNROUTED 100
+#define FOCUS_W_CHURN 1
+#define FOCUS_CHURN_MAX 99
+#define FOCUS_REASON_PART 8
+#define FOCUS_REASON_PART_MAX 160
+#define FOCUS_FILE_CAP (256u * 1024u)
+#define FOCUS_GIT_CAP (256u * 1024u)
+#define FOCUS_PAGE 64
+#define FOCUS_ROUTE_CAP 12
+#define FOCUS_OWNED_GATE_CAP 4
+#define FOCUS_TEST_LAST_RUN ".cache/test-timing/last-run.json"
+#define FOCUS_LINT_LAST_RUN ".cache/lint-timing/last-run.json"
+
+enum focus_read {
+    FOCUS_READ_OK = 0,
+    FOCUS_READ_MISSING,
+    FOCUS_READ_ERR
+};
+
+static const struct specialist k_specialists[] = {
+#define SPECIALIST(name_, terr_, gates_, groups_, facts_) \
+    { name_, terr_, gates_, groups_, facts_ },
+#include "../../../../engine/composition/specialists.def"
+#undef SPECIALIST
+};
+
+const struct specialist *specialist_table(size_t *count)
+{
+    if (count)
+        *count = sizeof(k_specialists) / sizeof(k_specialists[0]);
+    return k_specialists;
+}
+
+const struct specialist *specialist_find(const char *name)
+{
+    if (!name || !name[0])
+        return NULL;
+    size_t n = sizeof(k_specialists) / sizeof(k_specialists[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(k_specialists[i].name, name) == 0)
+            return &k_specialists[i];
+    }
+    return NULL;
+}
+
+static bool focus_has_glob_meta(const char *pat)
+{
+    for (const char *p = pat; *p; p++) {
+        if (*p == '*' || *p == '?' || *p == '[')
+            return true;
+    }
+    return false;
+}
+
+static bool focus_prefix_match(const char *prefix, const char *path)
+{
+    size_t n = strlen(prefix);
+    if (n == 0)
+        return false;
+    if (strncmp(path, prefix, n) != 0)
+        return false;
+    return path[n] == '\0' || path[n] == '/';
+}
+
+static bool focus_one_territory(const char *pat, size_t len, const char *path)
+{
+    char buf[512];
+    if (!pat || !path || len == 0 || len >= sizeof(buf))
+        return false;
+    memcpy(buf, pat, len);
+    buf[len] = '\0';
+    if (focus_has_glob_meta(buf))
+        return platform_glob_match(buf, path, false);
+    return focus_prefix_match(buf, path);
+}
+
+bool specialist_path_in_territory(const struct specialist *spec,
+                                  const char *path)
+{
+    if (!spec || !spec->territories || !path || !path[0])
+        return false;
+    const char *start = spec->territories;
+    while (*start) {
+        const char *bar = strchr(start, '|');
+        size_t len = bar ? (size_t)(bar - start) : strlen(start);
+        if (focus_one_territory(start, len, path))
+            return true;
+        if (!bar)
+            break;
+        start = bar + 1;
+    }
+    return false;
+}
+
+static bool focus_gate_owned(const struct specialist *spec, const char *gate)
+{
+    if (!spec || !spec->gates || !gate || !gate[0])
+        return false;
+    size_t glen = strlen(gate);
+    const char *start = spec->gates;
+    while (*start) {
+        const char *bar = strchr(start, '|');
+        size_t len = bar ? (size_t)(bar - start) : strlen(start);
+        if (len == glen && strncmp(start, gate, len) == 0)
+            return true;
+        if (!bar)
+            break;
+        start = bar + 1;
+    }
+    return false;
+}
+
+size_t specialist_focus_owned_failed_gates(
+    const struct specialist *spec,
+    const struct specialist_focus_evidence *ev,
+    char (*out)[SPECIALIST_GROUP_MAX], size_t cap)
+{
+    if (!spec || !ev)
+        return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < ev->failed_gate_count; i++) {
+        if (!focus_gate_owned(spec, ev->failed_gates[i]))
+            continue;
+        if (out && n < cap) {
+            int w = snprintf(out[n], SPECIALIST_GROUP_MAX, "%s",
+                             ev->failed_gates[i]);
+            if (w < 0 || (size_t)w >= SPECIALIST_GROUP_MAX) {
+                LOG_ERROR(FOCUS_TAG, "owned gate name too long: %s",
+                          ev->failed_gates[i]);
+                return n;
+            }
+        }
+        n++;
+    }
+    return n;
+}
+
+void specialist_focus_evidence_clear(struct specialist_focus_evidence *ev)
+{
+    if (!ev)
+        return;
+    memset(ev, 0, sizeof(*ev));
+}
+
+static bool focus_join(char *dst, size_t cap, const char *root,
+                       const char *rel)
+{
+    int n = snprintf(dst, cap, "%s/%s", root && root[0] ? root : ".", rel);
+    if (n < 0 || (size_t)n >= cap) {
+        LOG_ERROR(FOCUS_TAG, "path too long: %s/%s",
+                  root ? root : ".", rel);
+        return false;
+    }
+    return true;
+}
+
+static int focus_read_file(const char *path, size_t cap, char **buf_out,
+                           size_t *len_out)
+{
+    if (buf_out)
+        *buf_out = NULL;
+    if (len_out)
+        *len_out = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (errno == ENOENT)
+            return FOCUS_READ_MISSING;
+        LOG_ERROR(FOCUS_TAG, "open %s: %s", path, strerror(errno));
+        return FOCUS_READ_ERR;
+    }
+    char *buf = zcl_calloc(1, cap + 1u, "codeindex.focus.file");
+    if (!buf) {
+        fclose(f);
+        LOG_ERROR(FOCUS_TAG, "allocate %zu bytes for %s", cap, path);
+        return FOCUS_READ_ERR;
+    }
+    size_t n = fread(buf, 1, cap, f);
+    int extra = fgetc(f);
+    int err = ferror(f);
+    fclose(f);
+    if (err || extra != EOF) {
+        free(buf);
+        LOG_ERROR(FOCUS_TAG, "read incomplete or exceeds %zu bytes: %s", cap, path);
+        return FOCUS_READ_ERR;
+    }
+    buf[n] = '\0';
+    if (buf_out)
+        *buf_out = buf;
+    if (len_out)
+        *len_out = n;
+    return FOCUS_READ_OK;
+}
+
+static bool focus_add_name(char (*table)[SPECIALIST_GROUP_MAX], size_t cap,
+                           size_t *count, const char *name)
+{
+    if (!name || !name[0])
+        return true;
+    for (size_t i = 0; i < *count; i++) {
+        if (strcmp(table[i], name) == 0)
+            return true;
+    }
+    if (*count >= cap) {
+        LOG_ERROR(FOCUS_TAG, "recorded name table full (%zu): %s", cap, name);
+        return false;
+    }
+    int n = snprintf(table[*count], SPECIALIST_GROUP_MAX, "%s", name);
+    if (n < 0 || (size_t)n >= SPECIALIST_GROUP_MAX) {
+        LOG_ERROR(FOCUS_TAG, "recorded name too long: %s", name);
+        return false;
+    }
+    (*count)++;
+    return true;
+}
+
+/* One honesty contract over both timing artifacts: ENOENT is a missing run
+ * (true, *run set MISSING, names untouched — never a clean score), while a
+ * present file is RECORDED even when every rc is 0. Unreadable, OOM after
+ * open, or corrupt JSON fails closed. */
+static bool focus_load_failed_artifact(
+    const char *root, const char *rel, const char *array_key,
+    char (*table)[SPECIALIST_GROUP_MAX], size_t cap, size_t *count,
+    enum specialist_focus_artifact *run)
+{
+    *run = SPECIALIST_FOCUS_ARTIFACT_MISSING;
+    char path[4096];
+    if (!focus_join(path, sizeof(path), root, rel))
+        LOG_FAIL(FOCUS_TAG, "evidence path");
+    char *raw = NULL;
+    size_t len = 0;
+    int st = focus_read_file(path, FOCUS_FILE_CAP, &raw, &len);
+    if (st == FOCUS_READ_MISSING)
+        return true;
+    if (st != FOCUS_READ_OK)
+        LOG_FAIL(FOCUS_TAG, "unreadable %s at %s", rel, path);
+    struct json_value doc;
+    json_init(&doc);
+    if (!json_read(&doc, raw, len) || doc.type != JSON_OBJ) {
+        json_free(&doc);
+        free(raw);
+        LOG_FAIL(FOCUS_TAG, "corrupt %s at %s", rel, path);
+    }
+    free(raw);
+    *run = SPECIALIST_FOCUS_ARTIFACT_RECORDED;
+    const struct json_value *rows = json_get(&doc, array_key);
+    if (!rows || rows->type != JSON_ARR) {
+        json_free(&doc);
+        return true;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < rows->num_children && ok; i++) {
+        const struct json_value *row = &rows->children[i];
+        const char *name = json_get_str(json_get(row, "name"));
+        int64_t rc = json_get_int(json_get(row, "rc"));
+        if (rc != 0)
+            ok = focus_add_name(table, cap, count, name);
+    }
+    json_free(&doc);
+    if (!ok)
+        LOG_FAIL(FOCUS_TAG, "%s table overflowed a name", rel);
+    return true;
+}
+
+bool specialist_focus_load_failed_groups(const char *root,
+                                          struct specialist_focus_evidence *ev)
+{
+    if (!ev)
+        LOG_FAIL(FOCUS_TAG, "evidence is NULL");
+    return focus_load_failed_artifact(root, FOCUS_TEST_LAST_RUN, "groups",
+                                      ev->failed, SPECIALIST_FOCUS_FAILED_CAP,
+                                      &ev->failed_count, &ev->tests_run);
+}
+
+bool specialist_focus_load_failed_gates(const char *root,
+                                         struct specialist_focus_evidence *ev)
+{
+    if (!ev)
+        LOG_FAIL(FOCUS_TAG, "evidence is NULL");
+    return focus_load_failed_artifact(root, FOCUS_LINT_LAST_RUN, "gates",
+                                      ev->failed_gates,
+                                      SPECIALIST_FOCUS_GATE_CAP,
+                                      &ev->failed_gate_count, &ev->gates_run);
+}
+
+static bool focus_is_path_char(unsigned char c)
+{
+    return isalnum(c) || c == '_' || c == '.' || c == '/' || c == '-';
+}
+
+static bool focus_looks_like_path(const char *s, size_t n)
+{
+    if (n < 3 || n >= SPECIALIST_PATH_MAX)
+        return false;
+    bool slash = false;
+    for (size_t i = 0; i < n; i++) {
+        if (!focus_is_path_char((unsigned char)s[i]))
+            return false;
+        if (s[i] == '/')
+            slash = true;
+    }
+    if (!slash)
+        return false;
+    if (n >= 2 && s[n - 2] == '.' &&
+        (s[n - 1] == 'c' || s[n - 1] == 'h'))
+        return true;
+    if (n >= 4 && s[n - 4] == '.' &&
+        ((s[n - 3] == 'd' && s[n - 2] == 'e' && s[n - 1] == 'f') ||
+         (s[n - 3] == 's' && s[n - 2] == 'h')))
+        return true;
+    return false;
+}
+
+static bool focus_line_is_open(const char *line)
+{
+    for (const char *p = line; *p; p++) {
+        if ((p == line || !isalnum((unsigned char)p[-1])) &&
+            (strncmp(p, "CLOSED", 6) == 0 || strncmp(p, "closed", 6) == 0 ||
+             strncmp(p, "DONE", 4) == 0 || strncmp(p, "done", 4) == 0) &&
+            !isalnum((unsigned char)p[p[0] == 'D' || p[0] == 'd' ? 4 : 6]))
+            return false;
+    }
+    return true;
+}
+
+static bool focus_add_binding(struct specialist_focus_binding *rows,
+                              size_t *count, size_t cap, const char *path,
+                              const char *source)
+{
+    if (!path || !path[0] || !source)
+        return true;
+    for (size_t i = 0; i < *count; i++) {
+        if (strcmp(rows[i].path, path) == 0)
+            return true;
+    }
+    if (*count >= cap)
+        return true;
+    int n = snprintf(rows[*count].path, SPECIALIST_PATH_MAX, "%s", path);
+    if (n < 0 || (size_t)n >= SPECIALIST_PATH_MAX) {
+        LOG_ERROR(FOCUS_TAG, "binding path too long: %s", path);
+        return false;
+    }
+    n = snprintf(rows[*count].source, SPECIALIST_SOURCE_MAX, "%s", source);
+    if (n < 0 || (size_t)n >= SPECIALIST_SOURCE_MAX) {
+        LOG_ERROR(FOCUS_TAG, "binding source too long: %s", source);
+        return false;
+    }
+    (*count)++;
+    return true;
+}
+
+static bool focus_scan_paths(const char *text, bool require_open,
+                             struct specialist_focus_binding *rows,
+                             size_t *count, size_t cap, const char *source)
+{
+    if (!text)
+        return true;
+    const char *line = text;
+    while (*line) {
+        const char *eol = strchr(line, '\n');
+        size_t linelen = eol ? (size_t)(eol - line) : strlen(line);
+        if (!require_open || focus_line_is_open(line)) {
+            for (size_t i = 0; i < linelen; ) {
+                while (i < linelen &&
+                       (line[i] == '`' || line[i] == '"' ||
+                        !focus_is_path_char((unsigned char)line[i])))
+                    i++;
+                size_t start = i;
+                while (i < linelen &&
+                       focus_is_path_char((unsigned char)line[i]))
+                    i++;
+                if (focus_looks_like_path(line + start, i - start)) {
+                    char path[SPECIALIST_PATH_MAX];
+                    memcpy(path, line + start, i - start);
+                    path[i - start] = '\0';
+                    if (!focus_add_binding(rows, count, cap, path, source))
+                        return false;
+                }
+            }
+        }
+        line = eol ? eol + 1 : line + linelen;
+    }
+    return true;
+}
+
+bool specialist_focus_load_notes(const char *root,
+                                 struct specialist_focus_evidence *ev)
+{
+    if (!ev)
+        LOG_FAIL(FOCUS_TAG, "evidence is NULL");
+    char path[4096];
+    if (!focus_join(path, sizeof(path), root, "docs/agent/LESSONS.md"))
+        LOG_FAIL(FOCUS_TAG, "lessons path");
+    char *raw = NULL;
+    size_t len = 0;
+    int st = focus_read_file(path, FOCUS_FILE_CAP, &raw, &len);
+    if (st == FOCUS_READ_MISSING)
+        return true;
+    if (st != FOCUS_READ_OK)
+        LOG_FAIL(FOCUS_TAG, "unreadable lessons at %s", path);
+    bool ok = focus_scan_paths(raw, true, ev->notes, &ev->notes_count,
+                               SPECIALIST_FOCUS_NOTE_CAP,
+                               "docs/agent/LESSONS.md");
+    free(raw);
+    if (!ok)
+        LOG_FAIL(FOCUS_TAG, "lessons path token overflowed");
+    return true;
+}
+
+static bool focus_ci_issue_name(const char *path)
+{
+    char lower[SPECIALIST_PATH_MAX];
+    size_t n = 0;
+    for (; path && path[n] && n + 1 < sizeof lower; n++)
+        lower[n] = (char)tolower((unsigned char)path[n]);
+    lower[n] = '\0';
+    return strstr(lower, "issue") != NULL;
+}
+
+bool specialist_focus_load_issues(const char *root,
+                                  struct specialist_focus_evidence *ev)
+{
+    if (!ev)
+        LOG_FAIL(FOCUS_TAG, "evidence is NULL");
+    char *buf = zcl_calloc(1, FOCUS_GIT_CAP, "codeindex.focus.issues");
+    if (!buf)
+        LOG_FAIL(FOCUS_TAG, "allocate git ls-files buffer");
+    const char *argv[] = { "git", "-C", root && root[0] ? root : ".",
+                           "ls-files", "--", "docs", NULL };
+    int rc = zcl_spawn_capture(argv, buf, FOCUS_GIT_CAP, 15000);
+    if (rc != 0) {
+        free(buf);
+        return true;
+    }
+    bool ok = true;
+    char *p = buf;
+    while (ok && *p) {
+        char *eol = strchr(p, '\n');
+        if (eol)
+            *eol = '\0';
+        size_t n = strlen(p);
+        if (n && p[n - 1] == '\r')
+            p[n - 1] = '\0';
+        if (p[0] && focus_ci_issue_name(p)) {
+            char full[4096];
+            if (!focus_join(full, sizeof(full), root, p)) {
+                ok = false;
+                break;
+            }
+            char *raw = NULL;
+            size_t len = 0;
+            int st = focus_read_file(full, FOCUS_FILE_CAP, &raw, &len);
+            if (st == FOCUS_READ_ERR) {
+                ok = false;
+                break;
+            }
+            if (raw) {
+                ok = focus_scan_paths(raw, true, ev->issues,
+                                      &ev->issues_count,
+                                      SPECIALIST_FOCUS_ISSUE_CAP, p);
+                free(raw);
+            }
+        }
+        if (!eol)
+            break;
+        p = eol + 1;
+    }
+    free(buf);
+    if (!ok)
+        LOG_FAIL(FOCUS_TAG, "issue body load failed");
+    return true;
+}
+
+bool specialist_focus_load_churn(const char *root,
+                                 struct specialist_focus_evidence *ev)
+{
+    if (!ev)
+        LOG_FAIL(FOCUS_TAG, "evidence is NULL");
+    char *buf = zcl_calloc(1, FOCUS_GIT_CAP, "codeindex.focus.churn");
+    if (!buf)
+        LOG_FAIL(FOCUS_TAG, "allocate git log buffer");
+    const char *argv[] = {
+        "git", "-C", root && root[0] ? root : ".", "log", "--name-only",
+        "--pretty=format:%ct", "--max-count=200", "--", NULL
+    };
+    int rc = zcl_spawn_capture(argv, buf, FOCUS_GIT_CAP, 20000);
+    if (rc != 0) {
+        free(buf);
+        return true;
+    }
+    int commit = -1;
+    char *p = buf;
+    while (*p) {
+        char *eol = strchr(p, '\n');
+        if (eol)
+            *eol = '\0';
+        size_t n = strlen(p);
+        if (n && p[n - 1] == '\r')
+            p[--n] = '\0';
+        bool digits = n > 0;
+        for (size_t i = 0; digits && i < n; i++)
+            digits = isdigit((unsigned char)p[i]) != 0;
+        if (digits) {
+            commit++;
+        } else if (p[0] && commit >= 0 &&
+                   ev->churn_count < SPECIALIST_FOCUS_CHURN_CAP) {
+            bool seen = false;
+            for (size_t i = 0; i < ev->churn_count; i++) {
+                if (strcmp(ev->churn[i].path, p) == 0) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                int w = snprintf(ev->churn[ev->churn_count].path,
+                                 SPECIALIST_PATH_MAX, "%s", p);
+                if (w < 0 || (size_t)w >= SPECIALIST_PATH_MAX) {
+                    LOG_ERROR(FOCUS_TAG, "churn path too long: %s", p);
+                    free(buf);
+                    LOG_FAIL(FOCUS_TAG, "churn path");
+                }
+                int rec = FOCUS_CHURN_MAX - commit;
+                if (rec < 1)
+                    rec = 1;
+                ev->churn[ev->churn_count].recency = (uint32_t)rec;
+                ev->churn_count++;
+            }
+        }
+        if (!eol)
+            break;
+        p = eol + 1;
+    }
+    free(buf);
+    return true;
+}
+
+static bool focus_groups_equal(const char *a, const char *b)
+{
+    if (!a || !b)
+        return false;
+    if (strcmp(a, b) == 0)
+        return true;
+    if (strncmp(a, "test_", 5) == 0 && strcmp(a + 5, b) == 0)
+        return true;
+    if (strncmp(b, "test_", 5) == 0 && strcmp(b + 5, a) == 0)
+        return true;
+    if (strncmp(a, "spec_", 5) == 0 && strcmp(a + 5, b) == 0)
+        return true;
+    if (strncmp(b, "spec_", 5) == 0 && strcmp(b + 5, a) == 0)
+        return true;
+    return false;
+}
+
+static int focus_reason_cmp(const void *a, const void *b)
+{
+    return strcmp((const char *)a, (const char *)b);
+}
+
+static int focus_hit_cmp(const void *a, const void *b)
+{
+    const struct specialist_focus_hit *ha = a;
+    const struct specialist_focus_hit *hb = b;
+    if (ha->score > hb->score)
+        return -1;
+    if (ha->score < hb->score)
+        return 1;
+    return strcmp(ha->path, hb->path);
+}
+
+/* True when a ranks strictly below b in the emitted order (score desc,
+ * path asc): the entry to evict first when the bounded work set is full. */
+static bool focus_hit_ranks_below(const struct specialist_focus_hit *a,
+                                  const struct specialist_focus_hit *b)
+{
+    if (a->score != b->score)
+        return a->score < b->score;
+    return strcmp(a->path, b->path) > 0;
+}
+
+static bool focus_add_reason(char parts[][FOCUS_REASON_PART_MAX], int *n,
+                             const char *text)
+{
+    if (*n >= FOCUS_REASON_PART)
+        return true;
+    for (int i = 0; i < *n; i++) {
+        if (strcmp(parts[i], text) == 0)
+            return true;
+    }
+    int w = snprintf(parts[*n], FOCUS_REASON_PART_MAX, "%s", text);
+    if (w < 0 || (size_t)w >= FOCUS_REASON_PART_MAX) {
+        LOG_ERROR(FOCUS_TAG, "reason too long: %s", text);
+        return false;
+    }
+    (*n)++;
+    return true;
+}
+
+static bool focus_join_reasons(char *dst, size_t cap,
+                               char parts[][FOCUS_REASON_PART_MAX], int n)
+{
+    qsort(parts, (size_t)n, FOCUS_REASON_PART_MAX, focus_reason_cmp);
+    dst[0] = '\0';
+    size_t used = 0;
+    for (int i = 0; i < n; i++) {
+        int w = snprintf(dst + used, cap - used, "%s%s",
+                         i ? "; " : "", parts[i]);
+        if (w < 0 || (size_t)w >= cap - used) {
+            LOG_ERROR(FOCUS_TAG, "joined reason overflowed");
+            return false;
+        }
+        used += (size_t)w;
+    }
+    return true;
+}
+
+/* What the evidence says about one territory file. */
+struct focus_signals {
+    int failed;
+    char fail_name[SPECIALIST_GROUP_MAX];
+    uint32_t recency;
+    const char *note_src;
+    const char *issue_src;
+    bool unrouted;
+};
+
+static const char *focus_binding_source(
+    const struct specialist_focus_binding *arr, size_t count, const char *path)
+{
+    for (size_t i = 0; i < count; i++)
+        if (strcmp(arr[i].path, path) == 0)
+            return arr[i].source;
+    return NULL;
+}
+
+static void focus_gather_signals(
+    const struct specialist_focus_evidence *ev, const char *path,
+    char groups[][SPECIALIST_GROUP_MAX], size_t ng, struct focus_signals *sg)
+{
+    memset(sg, 0, sizeof(*sg));
+    for (size_t g = 0; g < ng; g++) {
+        for (size_t f = 0; f < ev->failed_count; f++) {
+            if (!focus_groups_equal(groups[g], ev->failed[f]))
+                continue;
+            sg->failed++;
+            if (!sg->fail_name[0])
+                (void)snprintf(sg->fail_name, sizeof sg->fail_name, "%s",
+                               ev->failed[f]);
+        }
+    }
+    for (size_t c = 0; c < ev->churn_count; c++) {
+        if (strcmp(ev->churn[c].path, path) == 0) {
+            sg->recency = ev->churn[c].recency;
+            break;
+        }
+    }
+    sg->note_src = focus_binding_source(ev->notes, ev->notes_count, path);
+    sg->issue_src = focus_binding_source(ev->issues, ev->issues_count, path);
+    sg->unrouted = ng == 0;
+}
+
+static bool focus_collect_reasons(
+    char parts[][FOCUS_REASON_PART_MAX], int *nparts,
+    const struct focus_signals *sg, size_t gate_fails,
+    char owned_gates[][SPECIALIST_GROUP_MAX])
+{
+    char line[FOCUS_REASON_PART_MAX];
+    if (sg->failed > 0) {
+        (void)snprintf(line, sizeof line,
+                       "failed-group:%s (.cache/test-timing/last-run.json)",
+                       sg->fail_name);
+        if (!focus_add_reason(parts, nparts, line)) return false;
+    }
+    if (gate_fails > 0) {
+        (void)snprintf(line, sizeof line,
+                       "failed-gate:%s (.cache/lint-timing/last-run.json)",
+                       owned_gates[0]);
+        if (!focus_add_reason(parts, nparts, line)) return false;
+    }
+    if (sg->recency > 0) {
+        (void)snprintf(line, sizeof line, "churn:git-log recency=%u",
+                       sg->recency);
+        if (!focus_add_reason(parts, nparts, line)) return false;
+    }
+    if (sg->note_src) {
+        (void)snprintf(line, sizeof line, "lesson:%s", sg->note_src);
+        if (!focus_add_reason(parts, nparts, line)) return false;
+    }
+    if (sg->unrouted &&
+        !focus_add_reason(parts, nparts, "unrouted:agent_impact_rules"))
+        return false;
+    if (sg->issue_src) {
+        (void)snprintf(line, sizeof line, "issue:%s", sg->issue_src);
+        if (!focus_add_reason(parts, nparts, line)) return false;
+    }
+    return true;
+}
+
+/* Builds the hit for one territory file. Returns -1 on error, 0 when the
+ * evidence has nothing to say about the file, 1 when *cand is filled. */
+static int focus_build_hit(
+    const struct specialist_focus_evidence *ev, const char *path,
+    char groups[][SPECIALIST_GROUP_MAX], size_t ng, size_t gate_fails,
+    char owned_gates[][SPECIALIST_GROUP_MAX], struct specialist_focus_hit *cand)
+{
+    struct focus_signals sg;
+    focus_gather_signals(ev, path, groups, ng, &sg);
+    if (sg.failed == 0 && gate_fails == 0 && sg.recency == 0 &&
+        !sg.note_src && !sg.issue_src && !sg.unrouted)
+        return 0;
+    char parts[FOCUS_REASON_PART][FOCUS_REASON_PART_MAX];
+    int nparts = 0;
+    if (!focus_collect_reasons(parts, &nparts, &sg, gate_fails, owned_gates))
+        return -1;
+    int w = snprintf(cand->path, sizeof cand->path, "%s", path);
+    if (w < 0 || (size_t)w >= sizeof cand->path)
+        LOG_ERR(FOCUS_TAG, "hit path too long: %s", path);
+    if (!focus_join_reasons(cand->reason, sizeof cand->reason, parts, nparts))
+        return -1;
+    cand->score = sg.failed * FOCUS_W_FAILED +
+                  (int)gate_fails * FOCUS_W_GATE +
+                  (sg.issue_src ? FOCUS_W_ISSUE : 0) +
+                  (sg.note_src ? FOCUS_W_LESSON : 0) +
+                  (sg.unrouted ? FOCUS_W_UNROUTED : 0) +
+                  (int)sg.recency * FOCUS_W_CHURN;
+    return 1;
+}
+
+/* Bounded top-K by the emitted order: keep filling until the work set is
+ * full, then keep the exact worst slot and let a strictly better candidate
+ * evict it. Index order (path ASC) cannot hide a later failed-group or issue
+ * file behind a full set of low-score unrouted paths. */
+static void focus_keep_top(struct specialist_focus_hit *work, int *nwork,
+                           bool *overflow,
+                           const struct specialist_focus_hit *cand)
+{
+    if (*nwork < SPECIALIST_FOCUS_WORK_CAP) {
+        work[(*nwork)++] = *cand;
+        return;
+    }
+    *overflow = true;
+    int worst = 0;
+    for (int i = 1; i < *nwork; i++) {
+        if (focus_hit_ranks_below(&work[i], &work[worst]))
+            worst = i;
+    }
+    if (focus_hit_ranks_below(&work[worst], cand))
+        work[worst] = *cand;
+}
+
+/* Everything one rank call carries between files. */
+struct focus_rank {
+    const struct specialist *spec;
+    const struct specialist_focus_evidence *ev;
+    specialist_focus_route_fn route;
+    void *route_user;
+    size_t gate_fails;
+    char owned_gates[FOCUS_OWNED_GATE_CAP][SPECIALIST_GROUP_MAX];
+    struct specialist_focus_hit *work;
+    int nwork;
+    bool overflow;
+};
+
+/* Ranks one indexed page into the work set; false on error. */
+static bool focus_rank_page(struct focus_rank *fr, const struct ci_file *page,
+                            int got)
+{
+    for (int i = 0; i < got; i++) {
+        const char *path = page[i].path;
+        if (!specialist_path_in_territory(fr->spec, path))
+            continue;
+        char groups[FOCUS_ROUTE_CAP][SPECIALIST_GROUP_MAX];
+        size_t ng = fr->route(path, groups, FOCUS_ROUTE_CAP, fr->route_user);
+        struct specialist_focus_hit cand;
+        int built = focus_build_hit(fr->ev, path, groups, ng, fr->gate_fails,
+                                    fr->owned_gates, &cand);
+        if (built < 0)
+            return false;
+        if (built > 0)
+            focus_keep_top(fr->work, &fr->nwork, &fr->overflow, &cand);
+    }
+    return true;
+}
+
+/* Walks every indexed file page by page into the work set; false on error. */
+static bool focus_rank_all(struct codeindex *ci, struct focus_rank *fr)
+{
+    int total = codeindex_file_count(ci);
+    if (total < 0)
+        LOG_FAIL(FOCUS_TAG, "codeindex_file_count failed");
+    struct ci_file page[FOCUS_PAGE];
+    for (int off = 0; off < total; off += FOCUS_PAGE) {
+        int got = codeindex_files_page(ci, off, page, FOCUS_PAGE);
+        if (got < 0)
+            LOG_FAIL(FOCUS_TAG, "codeindex_files_page failed at %d", off);
+        if (!focus_rank_page(fr, page, got))
+            return false;
+        if (got < FOCUS_PAGE)
+            break;
+    }
+    return true;
+}
+
+int specialist_focus_rank(struct codeindex *ci,
+                          const struct specialist *spec,
+                          const struct specialist_focus_evidence *ev,
+                          specialist_focus_route_fn route, void *route_user,
+                          struct specialist_focus_hit *out, int cap,
+                          bool *truncated)
+{
+    if (truncated)
+        *truncated = false;
+    if (!ci || !spec || !ev || !route || !out || cap < 0) {
+        LOG_ERROR(FOCUS_TAG, "rank missing argument");
+        return -1;
+    }
+    if (cap == 0)
+        return 0;
+
+    struct specialist_focus_hit *work =
+        zcl_calloc((size_t)SPECIALIST_FOCUS_WORK_CAP,
+                   sizeof(*work), "codeindex.focus.work");
+    if (!work)
+        LOG_ERR(FOCUS_TAG, "allocate rank working set");
+
+    struct focus_rank fr = {
+        .spec = spec, .ev = ev, .route = route, .route_user = route_user,
+        .work = work,
+    };
+    /* A failed gate the lane owns is lane-level evidence: the artifact names
+     * the lane, not a file, so every territory file gains the same weight
+     * and a reason citing the artifact. File-level signals still stack on
+     * top and keep their relative order. */
+    fr.gate_fails = specialist_focus_owned_failed_gates(
+        spec, ev, fr.owned_gates, FOCUS_OWNED_GATE_CAP);
+    if (!focus_rank_all(ci, &fr)) {
+        free(work);
+        return -1;
+    }
+
+    qsort(work, (size_t)fr.nwork, sizeof(work[0]), focus_hit_cmp);
+    int emit = fr.nwork;
+    if (emit > cap) {
+        fr.overflow = true;
+        emit = cap;
+    }
+    for (int i = 0; i < emit; i++)
+        out[i] = work[i];
+    free(work);
+    if (truncated)
+        *truncated = fr.overflow;
+    return emit;
+}

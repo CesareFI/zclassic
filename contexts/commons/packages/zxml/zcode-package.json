@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "zxml/zxml",
+  "semver": "0.1.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "name": "zutf8/zutf8",
+      "root": "af83b6a944a42d26ad7af42e18ec0d67119bfda96c539baca0091a6a1d76b6b6",
+      "semver": "0.1.0"
+    }
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zxml/zxml.h",
+    "src/zxml.c",
+    "tests/test_zxml.c",
+    "zcode-package.json"
+  ]
+}

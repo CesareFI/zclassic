@@ -1,0 +1,1191 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * Node-mode flag/argv parsing (split out of engine/entry/main.c, pure code motion).
+ *
+ * Three surfaces, all called from engine/entry/main.c's main():
+ *   - print_usage()              — the -help / --help text
+ *   - apply_argv_loglevel()      — the -loglevel= floor (Phase E3)
+ *   - args_parse_node_options()  — the strcmp(argv) ladder that fills the
+ *     app_context options struct for a node boot
+ *
+ * The silent-ignore-unknown-flags behavior (with the loud unknown-flag
+ * WARNING) is a DOCUMENTED trap and is preserved byte-for-byte from main.c.
+ */
+
+#include "config/args.h"
+#include "config/boot.h"
+#include "config/boot_error.h"
+#include "controllers/agent_controller.h"  /* agent_print_native_usage (print_usage) */
+#include "hotswap/hotswap_module.h"
+#include "kernel/command_registry.h"
+#include "platform/environment_compat.h"
+#include "util/hw_profile.h"
+#include "util/log_level.h"
+#include "util/log_macros.h"
+#include "util/util.h"
+#include "util/clientversion.h"
+#include <stdatomic.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+void print_usage(const char *prog)
+{
+    printf("Usage:\n");
+    printf("  %s [node options]          Run full node\n", prog);
+    printf("\nAgent/operator API commands (from agent_contracts.def):\n");
+    agent_print_native_usage(stdout, prog);
+    printf("  %s --agent                 Same compact status\n", prog);
+    printf("  %s dev [branch...]         Native shallow LLM development tree\n", prog);
+    printf("  %s <method> [params...]    RPC client\n\n", prog);
+    printf("Node options:\n");
+    printf("  -datadir=<dir>      Data directory\n");
+    printf("  -paramsdir=<dir>    Params directory\n");
+    printf("  -port=<port>        P2P port (default: 8033)\n");
+    printf("  -rpcport=<port>     RPC port (default: 18232; 8232 is legacy zclassicd)\n");
+    printf("  -addnode=<ip>       Add peer\n");
+    printf("  -externalip=<ip[:port]>  Advertise this public P2P endpoint\n");
+    printf("  -gen                Enable mining\n");
+    printf("  -txindex            Transaction index\n");
+    printf("  -tor                Redundant: a build that linked real Tor\n");
+    printf("                      (`--version` prints `tor: full`) starts the\n");
+    printf("                      hidden service and routes dialling through\n");
+    printf("                      Tor with no flag. Still accepted so existing\n");
+    printf("                      units keep booting; REFUSED on a `tor: stub`\n");
+    printf("                      build, which has no Tor to start.\n");
+    printf("  -no-tor             Turn Tor off: no hidden service, clearnet\n");
+    printf("                      dialling only. REFUSED on a network-serving\n");
+    printf("                      operator lane (-operator-lane=canonical,\n");
+    printf("                      soak or standby) — losing the onion there is\n");
+    printf("                      an outage, not a local preference.\n");
+    printf("  -allow-tor-stub-dev  Let a `tor: stub` binary boot even though\n");
+    printf("                      Tor was asked for, for offline unit tests\n");
+    printf("                      that need no network. Tor still does not\n");
+    printf("                      start. REFUSED on canonical/soak/standby.\n");
+    printf("  -onion-persist[=0]  When Tor runs, keep a persistent .onion identity\n");
+    printf("                      in <datadir>/tor_data/onion_service instead of a\n");
+    printf("                      fresh ephemeral address every boot. Default: ON\n");
+    printf("                      when Tor is running combined with at least one\n");
+    printf("                      -addnode=<x>.onion peer (a node pinning fleet\n");
+    printf("                      peers by onion needs its own to stay fixed\n");
+    printf("                      too); OFF otherwise. -onion-persist=0 forces\n");
+    printf("                      ephemeral even with pinned onion peers.\n");
+    printf("  -onion-rotate       With -onion-persist: archive the current\n");
+    printf("                      identity and mint a fresh one (logs old+new\n");
+    printf("                      addresses)\n");
+    printf("  -gui                Launch the WebKit wallet GUI instead of the\n");
+    printf("                      headless node (needs a display; default is\n");
+    printf("                      headless node + REST/onion)\n");
+    printf("  -httpsdomain=<dom>  TLS servername / HTTPS-redirect host for the\n");
+    printf("                      clearnet explorer (optional; defaults to the\n");
+    printf("                      request Host header with a single cert)\n");
+    printf("  -profile=<name>     Service profile: full, zclassic-only, explorer, onion-node, legacy-compat\n");
+    printf("  -operator-lane=<name>  Operator lane: canonical, soak, dev, test,\n");
+    printf("                      copy, standby. canonical, soak and standby\n");
+    printf("                      serve the network, so the Tor escape\n");
+    printf("                      hatches above are refused on them.\n");
+    printf("  -utxomirror=auto|off  Derived UTXO mirror policy (default: auto)\n");
+    printf("  -bodyhistorybackfill=throttled|off|normal  Below-tip body policy\n");
+    printf("                      (default: throttled; forward work always wins)\n");
+    printf("  -legacyoracle=off|auto  Co-located legacy oracle policy (default: auto)\n");
+    printf("  -nolegacyimport     Do not auto-read/link ~/.zclassic during boot\n");
+    printf("  -packagehost=0|1    Host ZCODE package content from <datadir>/zcode\n");
+    printf("                      (default 0, hosting off; local store only)\n");
+    printf("  -noisetransport        Enable authenticated Noise XX peer transport\n");
+    printf("                      (required for the ZCODE DHT; default off)\n");
+    printf("  -v2transport        Deprecated alias for -noisetransport\n");
+    printf("  -terminalshell=PATH Absolute path of the shell binary granted to\n");
+    printf("                      paired-machine confined terminals (default:\n");
+    printf("                      none; terminal OPENs are refused\n");
+    printf("                      confinement-unavailable without it)\n");
+    printf("  -terminalacceptunconfined\n");
+    printf("                      Windows only: let the terminal lane run the\n");
+    printf("                      shell as the node's own user, with all of its\n");
+    printf("                      rights (default off; refused on other platforms)\n");
+    printf("  -packagequota=<n>   Package store quota in bytes (default 10737418240;\n");
+    printf("                      20%% pins / 40%% hot / 30%% rare / 10%% staging)\n");
+    printf("  -confine            After boot reaches activation-ready, apply strict\n");
+    printf("                      kernel confinement: Landlock (read+write under the\n");
+    printf("                      datadir, read-only for the few extra paths the node\n");
+    printf("                      opens) + a seccomp-BPF ALLOW-list whose default\n");
+    printf("                      action is KILL_PROCESS, so a network-facing parser\n");
+    printf("                      compromise cannot touch keys/files outside the\n");
+    printf("                      datadir and any unexpected syscall kills the\n");
+    printf("                      process loudly. Default OFF; flipping the default\n");
+    printf("                      is a later soak decision. Degrades (logs + skips)\n");
+    printf("                      on kernels without Landlock/seccomp; an apply\n");
+    printf("                      failure runs UNCONFINED and raises the named\n");
+    printf("                      blocker 'confine.apply_failed' rather than\n");
+    printf("                      half-applying. Mutually exclusive with\n");
+    printf("                      -sandbox=steady.\n");
+    printf("  -confine=serving    Same as -confine, but the seccomp allow-list\n");
+    printf("                      also covers the socket family (socket/bind/\n");
+    printf("                      listen/accept/connect/send*/recv*/\n");
+    printf("                      get|setsockopt/shutdown/select) so a node\n");
+    printf("                      actively doing P2P/HTTPS/onion I/O is not\n");
+    printf("                      SIGSYS-killed at its first accept()/recv()/\n");
+    printf("                      connect() after entering confinement. Plain\n");
+    printf("                      -confine deliberately omits sockets and\n");
+    printf("                      suits a status/storage-only steady state.\n");
+    printf("  -hotswap-activate   Arm Tier-1 live hot-swap ACTIVATION (dev only;\n");
+    printf("                      also needs ZCL_HOTSWAP_ACTIVATE=1 and the exact\n");
+    printf("                      ~/.zclassic-c23-dev datadir; canonical refused).\n");
+    printf("  -buildworker[=0|1]  Opt in to confined C23 compile work and advertise\n");
+    printf("                      it to package peers (bare flag or =1; =0 clears).\n");
+    printf("                      Independent proof also needs -packagehost=1.\n");
+    printf("  -allow-plaintext-wallet  Create a new wallet UNENCRYPTED at rest\n");
+    printf("                      (loud opt-in; otherwise set ZCL_WALLET_PASSPHRASE\n");
+    printf("                      or first-run wallet creation refuses).\n");
+    printf("  -wallet-no-phrase-backup  Create a first-run wallet with NO recovery\n");
+    printf("                      phrase when stdout is not a terminal (the words\n");
+    printf("                      would only reach node.log). Nothing is printed and\n");
+    printf("                      no phrase is drawn; back it up as a file instead.\n");
+    printf("  -db-backup-before-migrate  Copy node.db to node.db.schema<N>.bak\n");
+    printf("                      beside it before this boot applies any BREAKING\n");
+    printf("                      schema step (default OFF: node.db is routinely\n");
+    printf("                      too large to casually double; opt in for one\n");
+    printf("                      upgrade you want a rollback copy of). Refuses to\n");
+    printf("                      start the migration if free space is short.\n");
+    printf("  -backfill-nullifiers  One-shot owner-gated C-3 nullifier history backfill\n");
+    printf("  -enforce-sapling-root  Reject ANY hashFinalSaplingRoot mismatch\n");
+    printf("                      (default OFF: only all-zeros is rejected).\n");
+    printf("                      DO NOT use on the live node until a full-history\n");
+    printf("                      replay confirms zero false-rejects (h=478544).\n");
+    printf("  -enforce-coinbase-maturity  Reject a live-path spend of a coinbase\n");
+    printf("                      output younger than 100 blocks (default OFF).\n");
+    printf("                      DO NOT use on the live node until a full-history\n");
+    printf("                      replay confirms zero false-rejects (h=478544).\n");
+    printf("  -enforce-checkdatasig-sigops  Count OP_CHECKDATASIG toward the\n");
+    printf("                      per-block sigop ceiling in connect_block (default OFF).\n");
+    printf("                      DO NOT use on the live node until a full-history\n");
+    printf("                      replay confirms zero false-rejects (h=478544).\n");
+    printf("  -rebuildfromlog     Rebuild block index + tip from the event-log\n");
+    printf("                      projection (cold-start opt-in)\n");
+    printf("  -bench              Run all five user benchmark probes\n");
+    printf("  -bench-crypto-verify Bench Groth16 + Equihash-200,9 consensus verify (ns/op)\n");
+    printf("  -bench-crypto-vs-rust Bench every consensus crypto primitive vs pinned Rust (ns/op)\n");
+    printf("  -bench-regress      Fail if bench-history numeric rows regress >20%%\n");
+    printf("  --decrypt-wallet-backup <src.enc> <dst.sqlite>\n");
+    printf("                      Restore an encrypted wallet backup (password\n");
+    printf("                      from WALLET_BACKUP_PASSWORD)\n");
+    printf("  -help               This help\n\n");
+    printf("RPC examples:\n");
+    printf("  %s getblockcount\n", prog);
+    printf("  %s getbalance\n", prog);
+    printf("  %s z_gettotalbalance\n", prog);
+    printf("  %s chainview 100 5\n", prog);
+    printf("  %s z_sendmany \"zs1...\" '[{\"address\":\"zs1...\",\"amount\":0.001}]'\n", prog);
+}
+
+/* Opt-in log-level filter (Phase E3). -loglevel=<all|info|warn|error|fatal|off>
+ * raises the floor the LOG_ and GUARD macros (log_macros.h) emit at. Default
+ * stays ZCL_LOG_ALL (zero behavior change) unless the flag is present. An
+ * unrecognized value is a warning, never a boot abort — see
+ * zcl_log_level_from_string()'s contract in util/log_level.h. */
+void apply_argv_loglevel(void)
+{
+    const char *raw = GetArg("-loglevel", NULL);
+    if (!raw || !raw[0])
+        return;
+
+    enum zcl_log_level level;
+    if (zcl_log_level_from_string(raw, &level)) {
+        zcl_log_level_set(level);
+    } else {
+        LOG_WARN("boot", "unrecognized -loglevel=%s (want "
+                 "all|info|warn|error|fatal|off) — keeping ALL", raw);
+    }
+}
+
+/* Flags read via GetArg()/GetBoolArg() (platform/modules/util/src/util.c mapArgs) rather
+ * than the node-mode strncmp chain below — kept as an explicit list so the
+ * unrecognized-flag WARNING added there does not false-positive on them.
+ * Includes each flag's "-no<flag>" negation form where ParseParameters'
+ * auto-negation (-noX -> -X=0) is meaningful for that specific flag (i.e.
+ * the positive form is looked up via GetBoolArg somewhere). Regenerate by
+ * grepping `Get(Bool)?Arg\("-[a-zA-Z0-9_-]+"` across the tree and excluding
+ * test-only fixture keys (test_encoding.c's "-foo"/"-noexist"/"-debug"). */
+static const char *const k_extra_getarg_flags[] = {
+    "-beta6-bootstrap-source", "-beta6-bootstrap-listen",
+    "-pin-reducer", "-nopin-reducer",
+    "-rombundlereplicadir",
+    "-romseed", "-noromseed",
+    "-netcrawl", "-nonetcrawl",
+    "-addressindex", "-noaddressindex",
+    "-loglevel",
+    "-debug", "-nodebug",
+    "-txindex", "-notxindex", /* also GetBoolArg'd in txindex_projection.c */
+    "-packagehost", "-nopackagehost", "-packagequota",
+    "-buildworker", "-nobuildworker",
+    "-noisetransport", "-nonoisetransport",
+    "-v2transport", "-nov2transport",
+    "-terminalshell",
+    "-terminalacceptunconfined", "-noterminalacceptunconfined",
+};
+
+static bool main_flag_is_known_extra(const char *arg)
+{
+    char key[64];
+    const char *eq = strchr(arg, '=');
+    size_t klen = eq ? (size_t)(eq - arg) : strlen(arg);
+    if (klen >= sizeof(key)) return false;
+    memcpy(key, arg, klen);
+    key[klen] = '\0';
+    for (size_t i = 0; i < sizeof(k_extra_getarg_flags) / sizeof(k_extra_getarg_flags[0]); i++)
+        if (strcmp(key, k_extra_getarg_flags[i]) == 0) return true;
+    return false;
+}
+
+/* The seven operator-target flags (see config/args.h's doc comment on
+ * cli_flag_kind): the ones that pick WHICH node/instance an invocation
+ * means. Each row spells out its own single-dash bare/prefix and
+ * double-dash bare/prefix forms explicitly rather than building them with
+ * snprintf, so classification is a handful of strcmp/strncmp calls with no
+ * runtime string assembly. */
+struct cli_target_flag {
+    const char *single_bare;   /* "-rpcport"    (missing "=value") */
+    const char *single_prefix; /* "-rpcport="   (correct form)     */
+    const char *double_bare;   /* "--rpcport"   (double-dash typo) */
+    const char *double_prefix; /* "--rpcport="  (double-dash typo) */
+    const char *placeholder;   /* "-rpcport=PORT" (suggestion text) */
+};
+
+static const struct cli_target_flag k_cli_target_flags[] = {
+    { "-datadir",       "-datadir=",       "--datadir",       "--datadir=",       "-datadir=DIR"        },
+    { "-rpcport",       "-rpcport=",       "--rpcport",       "--rpcport=",       "-rpcport=PORT"       },
+    { "-port",          "-port=",          "--port",          "--port=",          "-port=PORT"          },
+    { "-httpsport",     "-httpsport=",     "--httpsport",     "--httpsport=",     "-httpsport=PORT"     },
+    { "-fsport",        "-fsport=",        "--fsport",        "--fsport=",        "-fsport=PORT"        },
+    { "-operator-lane", "-operator-lane=", "--operator-lane", "--operator-lane=", "-operator-lane=NAME" },
+    { "-profile",       "-profile=",       "--profile",       "--profile=",       "-profile=NAME"       },
+};
+#define CLI_TARGET_FLAG_COUNT \
+    (sizeof(k_cli_target_flags) / sizeof(k_cli_target_flags[0]))
+
+enum cli_flag_kind cli_flag_classify(const char *arg, char *suggest,
+                                     size_t suggest_cap)
+{
+    if (!arg || arg[0] != '-')
+        return CLI_FLAG_OK;
+    for (size_t i = 0; i < CLI_TARGET_FLAG_COUNT; i++) {
+        const struct cli_target_flag *f = &k_cli_target_flags[i];
+        bool double_dash =
+            strcmp(arg, f->double_bare) == 0 ||
+            strncmp(arg, f->double_prefix, strlen(f->double_prefix)) == 0;
+        if (double_dash) {
+            if (suggest && suggest_cap)
+                snprintf(suggest, suggest_cap, "%s", f->placeholder);
+            return CLI_FLAG_DOUBLE_DASH_TYPO;
+        }
+        if (strcmp(arg, f->single_bare) == 0) {
+            if (suggest && suggest_cap)
+                snprintf(suggest, suggest_cap, "%s", f->placeholder);
+            return CLI_FLAG_MISSING_VALUE;
+        }
+    }
+    return CLI_FLAG_OK;
+}
+
+const char *cli_flag_client_whitelist_csv(void)
+{
+    static char buf[256];
+    if (buf[0])
+        return buf;
+    size_t pos = 0;
+    for (size_t i = 0; i < CLI_TARGET_FLAG_COUNT; i++) {
+        int n = snprintf(buf + pos, sizeof(buf) - pos, "%s%s",
+                         pos ? "," : "", k_cli_target_flags[i].placeholder);
+        if (n > 0 && (size_t)n < sizeof(buf) - pos)
+            pos += (size_t)n;
+    }
+    return buf;
+}
+
+bool cli_flag_value_overflows_path_buffer(const char *arg)
+{
+    return strncmp(arg, "-datadir=", 9) == 0 &&
+           strlen(arg + 9) >= CLI_TARGET_DATADIR_CAP;
+}
+
+int cli_refuse_overlong_datadir(const char *arg)
+{
+    fprintf(stderr,
+            "error=DATADIR_TOO_LONG detail=flag '%s' names a directory "
+            "that exceeds the %zu-byte path buffer — refusing (no silent "
+            "truncation): a chopped cookie path can authenticate against "
+            "the wrong node try=use a shorter -datadir=DIR path\n",
+            arg, (size_t)CLI_TARGET_DATADIR_CAP);
+    return ZCL_COMMAND_EXIT_INVALID;
+}
+
+/* Bare boolean flags whose entire effect is "set this one env var to '1'".
+ * Routed through one table lookup (one branch in the args_parse_node_options
+ * ladder) instead of a dedicated strcmp/setenv else-if per flag, so a new
+ * bare-boolean flag never grows that already-pinned function's cyclomatic
+ * complexity. A flag whose handling does more than setenv (validates a
+ * value, mutates ctx directly, etc.) does NOT belong in this table — keep
+ * those as their own else-if arm. */
+struct cli_bare_bool_flag {
+    const char *flag;
+    const char *env_var;
+};
+
+static const struct cli_bare_bool_flag k_cli_bare_bool_flags[] = {
+    { "-wallet-no-phrase-backup", "ZCL_WALLET_NO_PHRASE_BACKUP" },
+    { "-db-backup-before-migrate", "ZCL_DB_BACKUP_BEFORE_MIGRATE" },
+};
+#define CLI_BARE_BOOL_FLAG_COUNT \
+    (sizeof(k_cli_bare_bool_flags) / sizeof(k_cli_bare_bool_flags[0]))
+
+/* Returns true and setenv()s the matching row's env var (never overwriting
+ * a running boot's own re-exec) when arg names one of k_cli_bare_bool_flags;
+ * returns false, touching nothing, otherwise. */
+static bool args_try_bare_bool_flag(const char *arg)
+{
+    for (size_t i = 0; i < CLI_BARE_BOOL_FLAG_COUNT; i++) {
+        if (strcmp(arg, k_cli_bare_bool_flags[i].flag) == 0) {
+            platform_environment_set(k_cli_bare_bool_flags[i].env_var, "1",
+                                     1);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool args_should_auto_add_local_peer(bool connect_only, int own_p2p_port,
+                                     int legacy_p2p_port,
+                                     bool already_listed)
+{
+    return !connect_only && !already_listed && own_p2p_port > 0 &&
+           legacy_p2p_port > 0 && own_p2p_port != legacy_p2p_port;
+}
+
+/* Whether the -onion-persist default (no explicit -onion-persist or
+ * -onion-persist=0/1 given) should resolve to ON. There is no dedicated
+ * "-fleet"/devfleet profile flag in this binary (checked: neither args.c nor
+ * any engine/composition/src/boot*.c file names one), so the signal used
+ * here is the one already on the command line that means the same thing: a
+ * node dials at least one PINNED peer by its .onion address. That is
+ * exactly what fleet members do to find each other (-addnode=<peer>.onion
+ * :port), and it is reciprocal — if OTHER nodes are meant to keep dialling
+ * this one at a fixed address, this node's own address must stop rotating
+ * too. A plain -tor node with no pinned onion peer (an ordinary privacy
+ * user, or an outbound-only client) gets no benefit from a fixed address
+ * and keeps the more private ephemeral default. Pure and exported so the
+ * default is covered without booting Tor. */
+bool args_onion_persist_default(bool tor, const char *const *addnode_peers,
+                                int n_addnode_peers)
+{
+    if (!tor || !addnode_peers)
+        return false;
+    for (int i = 0; i < n_addnode_peers; i++)
+        if (addnode_peers[i] && strstr(addnode_peers[i], ".onion"))
+            return true;
+    return false;
+}
+
+/* ── Tor admission: the words for a refusal the pure policy decided ────
+ *
+ * app_tor_policy_refusal_code() (engine/composition/src/app_context.c) owns
+ * the DECISION and is pure, so a unit test asserts the code without a
+ * datadir, a linker choice, or captured stderr. This function owns only the
+ * operator-facing rendering: the message, the measured evidence, and next
+ * steps that actually run in the state the refusal leaves behind. */
+#define ARGS_TOR_PHASE "tor_policy"
+
+static void args_report_tor_refusal(const struct app_context *ctx,
+                                    const char *code, bool real_tor_linked)
+{
+    const char *lane = app_operator_lane_name(ctx->operator_lane);
+    const char *build = real_tor_linked ? "full" : "stub";
+
+    if (strcmp(code, APP_TOR_REFUSE_DISABLE_ON_SERVING_LANE) == 0) {
+        const struct boot_error_next next[] = {
+            { "zclassic23 --version",
+              "confirm which Tor this binary linked; -no-tor only means "
+              "anything on a build that prints `tor: full`" },
+            { "zclassic23 -operator-lane=dev -datadir=<dev datadir> -no-tor",
+              "run the clearnet-only experiment on a dev lane, where taking "
+              "Tor down costs nobody their reachability" },
+        };
+        boot_error_report(BOOT_ERROR_FATAL, code, ARGS_TOR_PHASE,
+                          "-no-tor would take a network-serving node off "
+                          "Tor; this lane's peers reach it by its onion",
+                          next, 2,
+                          "flag=-no-tor operator_lane=%s tor_build=%s",
+                          lane, build);
+        return;
+    }
+
+    if (strcmp(code, APP_TOR_REFUSE_STUB_ESCAPE_ON_SERVING_LANE) == 0) {
+        /* The dev-lane move leads because it is right on EITHER build
+         * identity; `make tor-full` only helps the reader who is holding a
+         * stub, and a first next step that no-ops for everyone else teaches
+         * them to stop reading these. */
+        const struct boot_error_next next[] = {
+            { "zclassic23 -operator-lane=dev -datadir=<dev datadir> "
+              "-allow-tor-stub-dev",
+              "use the escape where it belongs — an offline dev/test datadir "
+              "that serves nobody" },
+            { "make tor-full",
+              "if this binary prints `tor: stub`, build one that links real "
+              "Tor; a serving lane then needs no escape at all" },
+        };
+        boot_error_report(BOOT_ERROR_FATAL, code, ARGS_TOR_PHASE,
+                          "-allow-tor-stub-dev is a development escape for "
+                          "offline tests and must not run a network-serving "
+                          "lane",
+                          next, 2,
+                          "flag=-allow-tor-stub-dev operator_lane=%s "
+                          "tor_build=%s", lane, build);
+        return;
+    }
+
+    if (strcmp(code, APP_TOR_REFUSE_STUB_BUILD_ASKED_FOR_TOR) == 0) {
+        const struct boot_error_next next[] = {
+            { "make tor-full",
+              "build a binary that links real Tor — this is the fix; "
+              "`zclassic23 --version` then prints `tor: full`" },
+            { "zclassic23 --version",
+              "read the Tor identity of the binary you are actually running; "
+              "it prints `tor: stub` today" },
+            { "zclassic23 -allow-tor-stub-dev -operator-lane=dev "
+              "-datadir=<dev datadir>",
+              "boot this stub binary anyway for an offline test; Tor still "
+              "does not start, and the escape is refused on canonical, soak "
+              "and standby" },
+        };
+        boot_error_report(BOOT_ERROR_FATAL, code, ARGS_TOR_PHASE,
+                          "this binary linked the Tor stub, so it cannot "
+                          "open the onion this argv asked for",
+                          next, 3,
+                          "tor_build=%s operator_lane=%s tor=%d "
+                          "onion_persist=%d onion_rotate=%d profile=%s",
+                          build, lane, ctx->tor ? 1 : 0,
+                          ctx->onion_persist ? 1 : 0,
+                          ctx->onion_rotate ? 1 : 0,
+                          app_runtime_profile_name(ctx->runtime_profile));
+        return;
+    }
+
+    /* No arm matched: report the code anyway rather than returning quietly.
+     * A policy code with no words is a bug in THIS function, and a boot that
+     * continued because of it would be the exact fail-open this whole path
+     * exists to prevent. */
+    boot_error_report(BOOT_ERROR_FATAL, code, ARGS_TOR_PHASE,
+                      "Tor policy refused this argv and args.c has no "
+                      "wording for the code it returned (fail closed)",
+                      NULL, 0, "operator_lane=%s tor_build=%s", lane, build);
+}
+
+/* ── The argv ladder, one themed arm per contiguous flag group ─────────
+ *
+ * args_parse_node_options() used to carry this whole mutually-exclusive
+ * else-if chain inline. The arms below are pure code motion out of that
+ * chain, in the SAME source order, dispatched by k_args_arms[] from the top
+ * with first-match-wins — exactly what the else-if chain did. Every flag
+ * pattern lives in EXACTLY ONE arm and no two arms can match the same argv
+ * string, which is what makes the dispatch equivalent to the flat chain.
+ *
+ * Return contract:
+ *   ARGS_ARM_NOMATCH — this arm does not know the flag; try the next arm.
+ *   ARGS_ARM_TAKEN   — matched and handled; move on to the next argv word.
+ *   0 or 1           — matched, and args_parse_node_options() must return
+ *                      that exit code IMMEDIATELY (help/version/refusals),
+ *                      skipping every later argv word AND the post-loop
+ *                      onion-persist default + Tor admission, as before.
+ */
+#define ARGS_ARM_NOMATCH (-2)
+#define ARGS_ARM_TAKEN   (-1)
+
+struct args_arm_state {
+    struct app_context *ctx;
+    bool *show_metrics;
+    char **argv;              /* argv[0] only, for print_usage() */
+};
+
+static int args_arm_core_identity(const char *arg,
+                                  struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strncmp(arg, "-datadir=", 9) == 0) ctx->datadir = arg + 9;
+    else if (strncmp(arg, "-paramsdir=", 11) == 0) ctx->params_dir = arg + 11;
+    else if (strcmp(arg, "-testnet") == 0) ctx->testnet = true;
+    else if (strcmp(arg, "-regtest") == 0) ctx->regtest = true;
+    else if (strcmp(arg, "-regtestshielded") == 0) ctx->regtest_shielded = true;
+    else if (strcmp(arg, "-txindex") == 0) ctx->tx_index = true;
+    else if (strcmp(arg, "-gen") == 0) ctx->gen = true;
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static bool args_parse_port(const char *text, bool bounded, int *out)
+{
+    const char *digits = text;
+    if (*digits == '+' || *digits == '-') digits++;
+    if (!*digits || digits[strspn(digits, "0123456789")] != '\0')
+        return false;
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (errno == ERANGE || *end || value < INT_MIN || value > INT_MAX)
+        return false;
+    if (bounded && (value < 0 || value > 65535)) return false;
+    *out = (int)value;
+    return true;
+}
+
+static int args_arm_ports(const char *arg,
+                          struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    int *port = NULL;
+    const char *text = NULL;
+    if (strncmp(arg, "-port=", 6) == 0) { port = &ctx->p2p_port; text = arg+6; }
+    else if (strncmp(arg, "-rpcport=", 9) == 0) { port = &ctx->rpc_port; text = arg+9; }
+    else if (strncmp(arg, "-httpsport=", 11) == 0) { port = &ctx->https_port; text = arg+11; }
+    else if (strncmp(arg, "-fsport=", 8) == 0) { port = &ctx->fs_port; text = arg+8; }
+    else if (strncmp(arg, "-rpcuser=", 9) == 0) ctx->rpc_user = arg+9;
+    else if (strncmp(arg, "-rpcpassword=", 13) == 0) ctx->rpc_password = arg+13;
+    else if (strcmp(arg, "-listen") == 0) ctx->listen = true;
+    else return ARGS_ARM_NOMATCH;
+    if (port) {
+        int value = 0;
+        if (!args_parse_port(text, port != &ctx->https_port, &value)) {
+            fprintf(stderr, "Invalid port option: %s\n", arg);
+            return 1;
+        }
+        *port = value;
+        if (port == &ctx->p2p_port) ctx->listen = true;
+    }
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_peer_wiring(const char *arg,
+                                struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strncmp(arg, "-addnode=", 9) == 0) {
+        /* P2P wiring happens after init. Preserve bounded argv-owned
+         * values here so the instant-on weld can reuse operator-named
+         * peers without changing normal discovery. */
+        if (ctx->n_addnode_peers < APP_CONNECT_PEERS_MAX)
+            ctx->addnode_peers[ctx->n_addnode_peers++] = arg + 9;
+    }
+    else if (strncmp(arg, "-connect=", 9) == 0) {
+        ctx->connect_only = true; /* peer wiring happens after init */
+        /* Record the peer host so the instant-on weld can use the ONLY
+         * peers a connect-only node is permitted to reach as its
+         * file-service seed set (see app_context.connect_peers). Excess
+         * peers past the cap are still wired for P2P below — only the
+         * bootstrap seed list is bounded. */
+        if (ctx->n_connect_peers < APP_CONNECT_PEERS_MAX)
+            ctx->connect_peers[ctx->n_connect_peers++] = arg + 9;
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_mining_build(const char *arg,
+                                 struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strncmp(arg, "-mineraddress=", 14) == 0) ctx->miner_address = arg+14;
+    else if (strncmp(arg, "-genproclimit=", 14) == 0) ctx->gen_threads = atoi(arg+14);
+    else if (strncmp(arg, "-par=", 5) == 0) ctx->par_workers = atoi(arg+5);
+    else if (strncmp(arg, "-snapshot=", 10) == 0) ctx->snapshot_dir = arg+10;
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_chain_repair(const char *arg,
+                                 struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strcmp(arg, "-saplingscan") == 0) ctx->sapling_scan = true;
+    else if (strcmp(arg, "-reindex-chainstate") == 0) ctx->reindex_chainstate = true;
+    else if (strcmp(arg, "-refold-staged") == 0) ctx->refold_staged = true;
+    else if (strcmp(arg, "-refold-from-anchor") == 0) ctx->refold_from_anchor = true;
+    else if (strcmp(arg, "-load-verify-boot") == 0) ctx->load_verify_boot = true;
+    else if (strncmp(arg, "-load-snapshot-at-own-height=",
+                     sizeof("-load-snapshot-at-own-height=") - 1) == 0)
+        ctx->load_snapshot_at_own_height =
+            arg + sizeof("-load-snapshot-at-own-height=") - 1;
+    else if (strcmp(arg, "-coldstart-seed-oneshot") == 0) {
+        /* Internal cold-start driver handshake (boot_cold_start.c): apply
+         * the -load-snapshot-at-own-height seed, then exit cleanly BEFORE
+         * services so the next cold-start stage (bundle/serve) runs on a
+         * clean-stopped datadir. Never set on an operator-driven boot. The
+         * seed reset + finalize run inline in app_init; no_services makes it
+         * return right after finalize (before P2P/RPC), and the
+         * cold_start_seed_oneshot branch below shuts down offline + exits. */
+        ctx->cold_start_seed_oneshot = true;
+        ctx->no_services = true;
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_consensus_bundle(const char *arg,
+                                     struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strncmp(arg, "-install-consensus-bundle=",
+                sizeof("-install-consensus-bundle=") - 1) == 0)
+        ctx->install_consensus_bundle =
+            arg + sizeof("-install-consensus-bundle=") - 1;
+    else if (strncmp(arg, "-verify-consensus-bundle=",
+                     sizeof("-verify-consensus-bundle=") - 1) == 0)
+        ctx->verify_consensus_bundle =
+            arg + sizeof("-verify-consensus-bundle=") - 1;
+    else if (strcmp(arg, "-ratify-mint-anchor") == 0)
+        ctx->ratify_mint_anchor = true;
+    else if (strcmp(arg, "-verify-rom") == 0)
+        ctx->verify_rom = true;
+    else if (strcmp(arg, "-export-consensus-bundle") == 0)
+        ctx->export_consensus_bundle = true;
+    else if (strncmp(arg, "-promote-shielded-history=",
+                     sizeof("-promote-shielded-history=") - 1) == 0)
+        ctx->promote_shielded_history =
+            arg + sizeof("-promote-shielded-history=") - 1;
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_fold(const char *arg,
+                         struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strcmp(arg, "-fold-inram") == 0) {
+        /* Bulk-fold in-RAM UTXO hot store (storage/coins_ram.h). The
+         * storage layer reads ZCL_FOLD_INRAM as the single source of truth
+         * (decided once, cached), so the flag just sets the env before any
+         * coins_ram_* call. STRICTLY for the bulk fold (from-genesis mint /
+         * -refold-from-anchor catch-up): the at-tip steady state (1 block /
+         * 2.5 min) does NOT benefit and should run plain SQLite coins_kv. */
+        platform_environment_set("ZCL_FOLD_INRAM", "1", 1);
+    }
+    else if (strcmp(arg, "-mint-anchor") == 0) ctx->mint_anchor = true;
+    else if (strcmp(arg, "-mint-anchor-fast") == 0) ctx->mint_anchor_fast = true;
+    else if (strcmp(arg, "-full-fold") == 0) {
+        /* GENESIS-FOLD-TO-TIP: reuse the whole -mint-anchor offline driver
+         * (genesis reset OR resume, reducer_kick_unbudgeted self-drive, no
+         * P2P) but target the local header TIP instead of the compiled SHA3
+         * checkpoint, and skip the terminal checkpoint ceremony. full_fold
+         * IMPLIES mint_anchor so every existing mint_anchor gate fires; the
+         * target override + ceremony skip live behind ctx->full_fold. */
+        ctx->full_fold = true;
+        ctx->mint_anchor = true;
+        /* Defect A: skip ONLY the legacy LevelDB UTXO seed import (the fold
+         * builds the set from genesis), while KEEPING the ~/.zclassic body
+         * link so a fresh datadir gets its bodies. Narrower than
+         * -nolegacyimport, which would also drop the body link. */
+        ctx->no_legacy_utxo_import = true;
+    }
+    else if (strncmp(arg, "-full-fold-target=", 18) == 0) {
+        /* Pin the -full-fold ceiling at H instead of the local header
+         * tip (config/boot.h's ctx->full_fold_target doc). Validated the
+         * same way other numeric flags in this ladder reject garbage:
+         * a non-numeric value, trailing junk, or H <= 0 is refused here
+         * rather than silently coerced by atoi() to 0. Whether H exceeds
+         * the local header tip is not knowable yet (no datadir is open
+         * during argv parsing), so that check — and the "-full-fold-
+         * target requires -full-fold" cross-flag check — happen later,
+         * once the header tip is readable (boot_full_fold.c). */
+        const char *v = arg + 18;
+        char *end = NULL;
+        long h = strtol(v, &end, 10);
+        if (end == v || *end != '\0' || h <= 0 || h > INT32_MAX) {
+            fprintf(stderr,
+                    "invalid -full-fold-target=%s (must be a positive "
+                    "height, e.g. -full-fold-target=1234)\n", v);
+            return 1;
+        }
+        ctx->full_fold_target = (int32_t)h;
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_reindex_backfill(const char *arg,
+                                     struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strcmp(arg, "-reindex-explorer") == 0) ctx->reindex_explorer = true;
+    else if (strcmp(arg, "-backfill-zslp") == 0) ctx->backfill_zslp = true;
+    else if (strcmp(arg, "-backfill-nullifiers") == 0) ctx->backfill_nullifiers = true;
+    else if (strcmp(arg, "-reimport-utxos") == 0) ctx->reimport_utxos = true;
+    else if (strcmp(arg, "-allow-degraded") == 0) ctx->allow_degraded = true;
+    else if (strncmp(arg, "-showmetrics=", 13) == 0) *st->show_metrics = atoi(arg+13) != 0;
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_tor(const char *arg,
+                        struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strcmp(arg, "-tor") == 0) ctx->tor = true;
+    else if (strcmp(arg, "-no-tor") == 0) ctx->no_tor = true;
+    else if (strcmp(arg, "-allow-tor-stub-dev") == 0)
+        ctx->allow_tor_stub_dev = true;
+    else if (strcmp(arg, "-onion-persist") == 0 ||
+             strcmp(arg, "-onion-persist=1") == 0)
+        ctx->onion_persist = true;
+    else if (strcmp(arg, "-onion-persist=0") == 0) {
+        ctx->onion_persist = false;
+        ctx->onion_persist_forced_off = true;
+    }
+    else if (strcmp(arg, "-onion-rotate") == 0) ctx->onion_rotate = true;
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_enum_env_modes(const char *arg,
+                                   struct args_arm_state *st)
+{
+    (void)st;
+    if (strncmp(arg, "-utxomirror=", 12) == 0) {
+        const char *mode = arg + 12;
+        if (strcmp(mode, "auto") != 0 && strcmp(mode, "off") != 0) {
+            fprintf(stderr, "invalid -utxomirror=%s (accepted: auto, off)\n",
+                    mode);
+            return 1;
+        }
+        platform_environment_set("ZCL_UTXO_MIRROR_MODE", mode, 1);
+    }
+    else if (strncmp(arg, "-bodyhistorybackfill=", 21) == 0) {
+        const char *mode = arg + 21;
+        if (strcmp(mode, "throttled") != 0 && strcmp(mode, "off") != 0 &&
+            strcmp(mode, "normal") != 0) {
+            fprintf(stderr, "invalid -bodyhistorybackfill=%s "
+                    "(accepted: throttled, off, normal)\n", mode);
+            return 1;
+        }
+        platform_environment_set("ZCL_BODY_HISTORY_BACKFILL_MODE", mode,
+                                 1);
+    }
+    else if (strncmp(arg, "-legacyoracle=", 14) == 0) {
+        const char *mode = arg + 14;
+        if (strcmp(mode, "off") != 0 && strcmp(mode, "auto") != 0) {
+            fprintf(stderr, "invalid -legacyoracle=%s (accepted: off, auto)\n",
+                    mode);
+            return 1;
+        }
+        platform_environment_set("ZCL_LEGACY_ORACLE_MODE", mode, 1);
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_profile_lane(const char *arg,
+                                 struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strncmp(arg, "-profile=", 9) == 0) {
+        if (!app_runtime_profile_parse(arg + 9,
+                                       &ctx->runtime_profile)) {
+            /* The typed registry answers an unknown subsystem by printing
+             * the whole valid set (diagnostics_registry.c). Match that
+             * here: "Unknown runtime profile: X" alone made the reader go
+             * read app_runtime_profile_parse to find out what IS valid. */
+            boot_error_report(BOOT_ERROR_FATAL,
+                              "BOOT_UNKNOWN_RUNTIME_PROFILE", "argv",
+                              "-profile= names a runtime profile this "
+                              "binary does not have",
+                              NULL, 0, "given=%s accepted=%s",
+                              arg + 9,
+                              app_runtime_profile_accepted_csv());
+            return 1;
+        }
+    }
+    else if (strncmp(arg, "-operator-lane=", 15) == 0) {
+        if (!app_operator_lane_parse(arg + 15,
+                                     &ctx->operator_lane)) {
+            boot_error_report(BOOT_ERROR_FATAL,
+                              "BOOT_UNKNOWN_OPERATOR_LANE", "argv",
+                              "-operator-lane= names a lane this binary "
+                              "does not have",
+                              NULL, 0, "given=%s accepted=%s",
+                              arg + 15,
+                              app_operator_lane_accepted_csv());
+            return 1;
+        }
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_validation_filesync(const char *arg,
+                                        struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strncmp(arg, "-assumevalid", 12) == 0) {
+        fprintf(stderr,
+                "-assumevalid has been removed; use "
+                "-deferproofvalidationbelow=<blockhash|0>\n");
+        return 1;
+    }
+    else if (strncmp(arg, "-deferproofvalidationbelow=",
+                     sizeof("-deferproofvalidationbelow=") - 1) == 0) {
+        ctx->defer_proof_validation_below =
+            arg + sizeof("-deferproofvalidationbelow=") - 1;
+    }
+    else if (strncmp(arg, "-filesync=", 10) == 0) { /* handled above */ }
+    else if (strncmp(arg, "-fileservice=", 13) == 0) ctx->file_service_peer = arg+13;
+    else if (strcmp(arg, "-nofilesync") == 0) ctx->no_file_sync = true;
+    else if (strcmp(arg, "-allow-clearnet-snapshot-fetch") == 0) ctx->allow_clearnet_snapshot_fetch = true;
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_consensus_tightening(const char *arg,
+                                         struct args_arm_state *st)
+{
+    (void)st;
+    if (strcmp(arg, "-enforce-sapling-root") == 0) {
+        /* DEFAULT-OFF Sapling-root parity reject (project_sapling_root
+         * _parity_hole). Default behavior rejects ONLY an all-zeros
+         * hashFinalSaplingRoot; this flag additionally rejects ANY
+         * mismatch vs the locally-recomputed Sapling tree root, matching
+         * zclassicd. ⚠ Do NOT pass on the live node until a full-history
+         * replay confirms ZERO false-rejects (h=478544 lesson — see
+         * validation/connect_block.h). */
+        extern _Atomic _Bool g_enforce_sapling_root;
+        atomic_store(&g_enforce_sapling_root, true);
+    }
+    else if (strcmp(arg, "-enforce-coinbase-maturity") == 0) {
+        /* DEFAULT-OFF coinbase-maturity parity reject on the live reducer
+         * fold. Default behavior does NOT reject a spend of a coinbase
+         * output younger than COINBASE_MATURITY (100) on that path; this
+         * flag adds the reject, matching zclassicd CheckTxInputs
+         * (zclassic-cpp/src/main.cpp:2056-2060). ⚠ This is a tightening
+         * predicate — do NOT pass on the live node until a full-history
+         * replay confirms ZERO false-rejects (h=478544 lesson — see
+         * jobs/utxo_apply_delta.h). */
+        extern _Atomic _Bool g_enforce_coinbase_maturity;
+        atomic_store(&g_enforce_coinbase_maturity, true);
+    }
+    else if (strcmp(arg, "-enforce-checkdatasig-sigops") == 0) {
+        /* DEFAULT-OFF CHECKDATASIG_SIGOPS parity. Default connect_block
+         * flags are P2SH | CHECKLOCKTIMEVERIFY; this flag also ORs in
+         * SCRIPT_VERIFY_CHECKDATASIG_SIGOPS, matching zclassicd
+         * ConnectBlock (zclassic-cpp/src/main.cpp:2567), which counts
+         * OP_CHECKDATASIG[VERIFY] toward the per-block sigop ceiling.
+         * ⚠ Tightening predicate — do NOT pass on the live node until a
+         * full-history replay confirms ZERO false-rejects (h=478544
+         * lesson — see validation/connect_block.h). */
+        extern _Atomic _Bool g_enforce_checkdatasig_sigops;
+        atomic_store(&g_enforce_checkdatasig_sigops, true);
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_perf_levers(const char *arg,
+                                struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strcmp(arg, "-nobgvalidation") == 0) ctx->no_bg_validation = true;
+    else if (strcmp(arg, "-buildworker") == 0 ||
+             strcmp(arg, "-buildworker=1") == 0)
+        ctx->build_worker = true;
+    else if (strcmp(arg, "-buildworker=0") == 0)
+        ctx->build_worker = false;
+    /* K3 throughput levers, default OFF (see boot.h / hw_profile.h). The
+     * derive gate is set here (pre-boot) so the reducer activation fold sees
+     * the derived cadence. */
+    else if (strcmp(arg, "-prefetch-blocks") == 0) ctx->prefetch_blocks = true;
+    else if (strcmp(arg, "-pv-lookahead") == 0 ||
+             strcmp(arg, "-pv-lookahead=1") == 0) ctx->pv_lookahead = true;
+    else if (strcmp(arg, "-pv-lookahead=0") == 0) ctx->pv_lookahead = false;
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_sandbox_confine(const char *arg,
+                                    struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strcmp(arg, "-derive-drain-batch") == 0) hw_profile_set_derive_drain_batch(true);
+    else if (strcmp(arg, "-sandbox=steady") == 0) ctx->sandbox_steady = true;
+    else if (strcmp(arg, "-sandbox=off") == 0) ctx->sandbox_steady = false;
+    else if (strcmp(arg, "-confine") == 0) ctx->confine = true;
+    else if (strcmp(arg, "-confine=serving") == 0) {
+        /* Same strict Landlock + seccomp ALLOW-list boundary as -confine,
+         * but the allow-set also covers the socket family a SERVING node
+         * needs (see os_sandbox_node_confine_serving_profile). Sets
+         * ctx->confine too so the -sandbox=steady mutual-exclusion check
+         * below and the sr_confine_enter() dispatch both see it. */
+        ctx->confine = true;
+        ctx->confine_serving = true;
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_hotswap_wallet(const char *arg,
+                                   struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strcmp(arg, "-hotswap-activate") == 0) {
+        /* Arm Tier-1 live hot-swap ACTIVATION for this resident node. This
+         * is only ONE of the two required gates: a live swap also needs
+         * ZCL_HOTSWAP_ACTIVATE=1 in the environment AND the exact dev
+         * datadir (~/.zclassic-c23-dev). The canonical datadir is refused
+         * unconditionally. Without this flag every hot-swap is verify-only.
+         * See hotswap_activation_authorized() (engine/modules/hotswap). */
+        hotswap_set_activate_flag(true);
+    }
+    else if (strcmp(arg, "-nolegacyimport") == 0) ctx->no_legacy_auto_import = true;
+    else if (strcmp(arg, "-nolegacyutxoimport") == 0) ctx->no_legacy_utxo_import = true;
+    else if (strcmp(arg, "-allow-plaintext-wallet") == 0) {
+        /* Explicit, loud opt-in to a plaintext wallet at rest. Read
+         * by the wallet at-rest creation policy at boot (see
+         * contexts/wallet/modules/wallet/src/wallet_keystore.c). Without this flag AND
+         * without ZCL_WALLET_PASSPHRASE, first-run wallet creation
+         * refuses rather than silently minting unencrypted keys. */
+        platform_environment_set("ZCL_ALLOW_PLAINTEXT_WALLET", "1",
+                                 1);
+    }
+    /* "-wallet-no-phrase-backup": "I accept a wallet with no written
+     * backup." A new wallet's twelve recovery words are shown once, on
+     * stdout, and under a systemd unit stdout is node.log — so when
+     * stdout is not a terminal the node refuses to create a spendable
+     * wallet at all. This flag is the operator saying that is fine
+     * here: the wallet is created, NO phrase is drawn, and every boot
+     * that creates one says so loudly. Read by
+     * boot_wallet_phrase_backup_waived() (config/boot_wallet_phrase.h).
+     *
+     * "-db-backup-before-migrate": opt-in pre-migration safety net.
+     * node.db is routinely too large to casually copy before every
+     * upgrade "just in case" — that size is exactly why a newer binary
+     * opening an older database now has a read-compatible path instead
+     * of a hard refusal (see database_migrate.c). This flag is the
+     * opposite choice for the one upgrade an operator judges worth the
+     * wait and the disk: before this boot applies any BREAKING schema
+     * step, it copies node.db to node.db.schema<N>.bak beside it via
+     * SQLite's online backup API, and refuses to proceed with that step
+     * at all if free space is short. Read by
+     * node_db_backup_before_breaking_migration()
+     * (engine/models/src/database_backup.c). Default OFF.
+     *
+     * Both are bare booleans whose entire effect is one setenv, so both
+     * route through k_cli_bare_bool_flags/args_try_bare_bool_flag above
+     * instead of their own else-if arm. */
+    else if (args_try_bare_bool_flag(arg)) {
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_misc_network(const char *arg,
+                                 struct args_arm_state *st)
+{
+    struct app_context *ctx = st->ctx;
+    if (strcmp(arg, "-rebuildfromlog") == 0) ctx->boot_from_log = true;
+    else if (strcmp(arg, "-leveldb-no-verify-checksums") == 0) {
+        /* Turns off LevelDB checksum verification for both point
+         * reads and iteration.  Use only when chasing a suspected
+         * corruption issue — silent truncation returns. */
+        platform_environment_set("ZCL_LEVELDB_NO_VERIFY_CHECKSUMS", "1",
+                                 1);
+    }
+    else if (strncmp(arg, "-externalip=", 12) == 0) ctx->external_ip = arg + 12;
+    else if (strncmp(arg, "-httpsdomain=", 13) == 0) ctx->https_domain = arg + 13;
+    else if (strncmp(arg, "-httpsaltdomain=", 16) == 0) {
+        /* An additional name on the SAME listener, served its own
+         * certificate by TLS SNI (see app_context.https_alt_domains).
+         * Repeatable. Past the cap the flag is refused loudly rather
+         * than silently dropped — a name nobody serves is a name whose
+         * clients get a certificate mismatch, which is invisible from
+         * the server side. */
+        if (ctx->n_https_alt_domains < APP_HTTPS_ALT_DOMAINS_MAX)
+            ctx->https_alt_domains[ctx->n_https_alt_domains++] = arg + 16;
+        else
+            fprintf(stderr,
+                    "Warning: at most %d -httpsaltdomain= names are "
+                    "served; '%s' was ignored\n",
+                    APP_HTTPS_ALT_DOMAINS_MAX, arg + 16);
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+static int args_arm_gui_help_version(const char *arg,
+                                     struct args_arm_state *st)
+{
+    if (strcmp(arg, "-gui") == 0 || strcmp(arg, "--gui") == 0) {
+        /* Opt-in to the WebKit wallet GUI. Consumed earlier (the GUI
+         * launch returns before node mode); recognized here so it is
+         * an intentional flag, not silently dropped node-mode noise. */
+    }
+    else if (strcmp(arg, "-help") == 0 || strcmp(arg, "--help") == 0 ||
+             strcmp(arg, "-h") == 0 || strcmp(arg, "-?") == 0) {
+        print_usage(st->argv[0]); return 0;
+    }
+    else if (strcmp(arg, "--version") == 0 || strcmp(arg, "-version") == 0 ||
+             strcmp(arg, "-v") == 0 || strcmp(arg, "-V") == 0) {
+        /* Print version + exit. Without this, `z23 --version` (a
+         * judge's reflex) falls through as an unknown flag and silently
+         * boots a full node against the default datadir. */
+        printf("z23 v%d.%d.%d (source %.12s)\n",
+               CLIENT_VERSION_MAJOR, CLIENT_VERSION_MINOR,
+               CLIENT_VERSION_REVISION,
+               zcl_build_source_id_sha256());
+        /* Which Tor this binary linked, on its own greppable line. The
+         * two spellings are exactly "tor: full" and "tor: stub" so a
+         * deploy script can decide with one grep instead of running the
+         * node and reading its boot log. */
+        printf("tor: %s\n",
+               app_tor_real_build_linked() ? "full" : "stub");
+        return 0;
+    }
+    else return ARGS_ARM_NOMATCH;
+    return ARGS_ARM_TAKEN;
+}
+
+/* Loud unknown-flag WARNING, LAST in the ladder: reached only when no arm
+ * above claimed this word. The guard is the negation of the original
+ * `argv[i][0] == '-' && !main_flag_is_known_extra(argv[i])` arm condition,
+ * evaluated in the same order, so a non-flag word still never reaches
+ * main_flag_is_known_extra(). */
+static void args_warn_unknown_flag(const char *arg)
+{
+    if (arg[0] != '-' || main_flag_is_known_extra(arg))
+        return;
+    /* Loud unknown-flag WARNING: this loop must never accept ANY
+     * unrecognized "-flag" silently (a documented footgun — see
+     * docs/SYNC.md and CLAUDE.md "Skipping step 1 is a footgun"). A
+     * typo'd or removed flag (e.g. the old -cold-import/-fastimport) must not
+     * silently no-op; it must say so, every boot, at WARN. This is
+     * advisory only — it does not FATAL, since some recognized
+     * flags are intentionally consumed by an earlier or later pass
+     * in this loop (e.g. -gui/--self-test above,
+     * -addnode=/-connect=/-filesync= below) or read independently
+     * via GetArg()/GetBoolArg() (main_flag_is_known_extra() above)
+     * rather than this loop's own strncmp branches.
+     *
+     * Daemon mode stays tolerant (CLAUDE.md)
+     * — it does not FATAL here even for a double-dash
+     * typo of one of the seven operator-target flags (that hard
+     * refusal is CLI-client-only, engine/entry/main_cli_modes.c). But when
+     * cli_flag_classify() recognizes the shape, name the exact
+     * single-dash correction instead of a generic "check spelling"
+     * — the same suggestion the CLI-client path would give for the
+     * identical typo. */
+    char suggest[24] = {0};
+    if (cli_flag_classify(arg, suggest, sizeof(suggest)) !=
+        CLI_FLAG_OK) {
+        fprintf(stderr,
+                "Warning: unrecognized flag '%s' (ignored) — "
+                "zclassic23 flags use a single dash with '=' "
+                "joining the value; did you mean %s?\n",
+                arg, suggest);
+    } else {
+        fprintf(stderr,
+                "Warning: unrecognized flag '%s' (ignored) — check "
+                "spelling or docs/RUNBOOK.md; this is not a supported "
+                "zclassic23 flag.\n", arg);
+    }
+}
+
+typedef int (*args_arm_fn)(const char *arg, struct args_arm_state *st);
+
+/* Arm order is the original else-if order, top to bottom. */
+static const args_arm_fn k_args_arms[] = {
+    args_arm_core_identity,
+    args_arm_ports,
+    args_arm_peer_wiring,
+    args_arm_mining_build,
+    args_arm_chain_repair,
+    args_arm_consensus_bundle,
+    args_arm_fold,
+    args_arm_reindex_backfill,
+    args_arm_tor,
+    args_arm_enum_env_modes,
+    args_arm_profile_lane,
+    args_arm_validation_filesync,
+    args_arm_consensus_tightening,
+    args_arm_perf_levers,
+    args_arm_sandbox_confine,
+    args_arm_hotswap_wallet,
+    args_arm_misc_network,
+    args_arm_gui_help_version,
+};
+#define ARGS_ARM_COUNT (sizeof(k_args_arms) / sizeof(k_args_arms[0]))
+
+static void args_apply_buildworker_config(int argc, char **argv,
+                                          struct app_context *ctx)
+{
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (arg[0] == '-' && arg[1] == '-') ++arg;
+        size_t keylen = strcspn(arg, "=");
+        if ((keylen == 12 && strncmp(arg, "-buildworker", 12) == 0) ||
+            (keylen == 14 && strncmp(arg, "-nobuildworker", 14) == 0))
+            return;
+    }
+    const char *worker = GetArg("-buildworker", NULL);
+    if (worker && (strcmp(worker, "0") == 0 || strcmp(worker, "1") == 0))
+        ctx->build_worker = worker[0] == '1';
+}
+
+int args_parse_node_options(int argc, char **argv, struct app_context *ctx,
+                            bool *show_metrics)
+{
+    struct args_arm_state st = { ctx, show_metrics, argv };
+    args_apply_buildworker_config(argc, argv, ctx);
+    for (int i = 1; i < argc; i++) {
+        int rc = ARGS_ARM_NOMATCH;
+        for (size_t a = 0; a < ARGS_ARM_COUNT && rc == ARGS_ARM_NOMATCH; a++)
+            rc = k_args_arms[a](argv[i], &st);
+        if (rc >= 0)
+            return rc; /* help / version / a refused flag: exit now */
+        if (rc == ARGS_ARM_NOMATCH)
+            args_warn_unknown_flag(argv[i]);
+    }
+    /* Automatic legacy sources under ~/.zclassic belong to mainnet. */
+    if (ctx->regtest || ctx->testnet)
+        ctx->no_legacy_auto_import = true;
+    /* The -v2transport spelling is a deprecated alias for
+     * -noisetransport (kept so existing Noise operators keep booting;
+     * connman_init() honors it and repeats this notice where the flag
+     * takes effect). Say so HERE, at parse time, instead of ~30 s deep
+     * in P2P init: an operator typo or stale runbook deserves its
+     * answer in milliseconds, and waiting for connman couples the
+     * diagnostic to full boot latency. GetArg-based: every spelling
+     * (-v2transport, -v2transport=0/1) is one check, printed once. */
+    if (GetArg("-v2transport", NULL) != NULL) {
+        const bool noise_new_set = GetArg("-noisetransport", NULL) != NULL;
+        fprintf(stderr,
+                "-v2transport is deprecated; use -noisetransport%s\n",
+                noise_new_set ? " (new spelling takes precedence)" : "");
+    }
+    /* Resolve the -onion-persist default AFTER the whole loop so flag order
+     * never matters (-addnode=/-tor/-onion-persist can appear in any
+     * order). Only applies when the operator did not name either explicit
+     * form above — see args_onion_persist_default(). */
+    if (!ctx->onion_persist && !ctx->onion_persist_forced_off)
+        ctx->onion_persist = args_onion_persist_default(
+            ctx->tor, ctx->addnode_peers, ctx->n_addnode_peers);
+    /* Fail-closed Tor admission, LAST in the ladder so every flag it reads
+     * has been parsed, and still at parse time so a refused argv never
+     * reaches a datadir. The link-time fact is read HERE and injected, which
+     * is what lets the policy itself stay pure and testable on both build
+     * identities from one test binary. */
+    {
+        const bool real_tor_linked = app_tor_real_build_linked();
+        const char *tor_refusal =
+            app_tor_policy_refusal_code(ctx, real_tor_linked);
+        if (tor_refusal) {
+            args_report_tor_refusal(ctx, tor_refusal, real_tor_linked);
+            return 1;
+        }
+    }
+
+    return -1; /* parsed OK — caller continues booting */
+}

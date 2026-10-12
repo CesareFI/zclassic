@@ -1,0 +1,939 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * core.status.brief body — split out of status_native_handlers.c (E1 file
+ * size ceiling) so it can grow its own field list without pushing the other
+ * read compositions over the 800-line cap.
+ *
+ * A compact FLAT projection of the sync/serving fields an operator or AI
+ * checks on every call. The running node already maintains those facts in
+ * its bounded cached `agent` document, so this projection performs one RPC
+ * and validates that document strictly. Unsupported methods, RPC errors,
+ * wrong schemas, and missing required fields fail closed; they never become
+ * a passing result full of "unknown" values.
+ */
+
+#include "controllers/status_native_handlers.h"
+#include "controllers/agent_operator_contracts.h"
+#include "controllers/native_handler_body.h"
+#include "controllers/status_native_helpers.h"
+#include "status_brief_readiness_read.h"
+
+#include "json/json.h"
+#include "controllers/rpc_client.h"
+#include "util/log_macros.h"
+
+#include <limits.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static bool status_schema_is(const struct json_value *obj,
+                             const char *expected)
+{
+    const char *schema = obj && obj->type == JSON_OBJ
+        ? json_get_str(json_get(obj, "schema")) : NULL;
+    return schema && expected && strcmp(schema, expected) == 0;
+}
+
+/* The two versions this handler validates STRICTLY: the current one it
+ * produces (v3) and the previous one it still fully reads (v2). The v3
+ * additions are optional on the read side, so one SCHECK() chain serves both
+ * — a v2 document from an older node still yields a complete brief, minus
+ * only the v3 readiness facts. */
+static bool status_schema_is_strictly_read(const struct json_value *obj)
+{
+    return status_schema_is(obj, ZCL_PUBLIC_STATUS_SCHEMA) ||
+           status_schema_is(obj, ZCL_PUBLIC_STATUS_SCHEMA_V2);
+}
+
+/* Name the contract version the document actually declared, so a v2 node's
+ * strict-validation error says v2 and not the version this build happens to
+ * target. Only ever echoes a version this build strictly reads — never
+ * arbitrary text from the response — so the message stays a fixed token. */
+static const char *status_schema_seen(const struct json_value *obj)
+{
+    if (status_schema_is(obj, ZCL_PUBLIC_STATUS_SCHEMA_V2))
+        return ZCL_PUBLIC_STATUS_SCHEMA_V2;
+    return ZCL_PUBLIC_STATUS_SCHEMA;
+}
+
+/* True for any schema string in the known zcl.public_status.* family that is
+ * NOT one of the versions this handler validates strictly (e.g. an older
+ * node's "zcl.public_status.v1", or a future "...v4"). This is the
+ * present-but-different-version case: a real document from a real status
+ * producer, just not one the CLI's strict validator was written against.
+ * See status_brief_build_schema_skew_body(). */
+static bool status_schema_known_family_mismatch(const struct json_value *obj,
+                                                 const char **schema_out)
+{
+    const char *schema = obj && obj->type == JSON_OBJ
+        ? json_get_str(json_get(obj, "schema")) : NULL;
+    if (!schema || !schema[0])
+        return false;
+    if (status_schema_is_strictly_read(obj))
+        return false;
+    if (strncmp(schema, ZCL_PUBLIC_STATUS_SCHEMA_FAMILY,
+               strlen(ZCL_PUBLIC_STATUS_SCHEMA_FAMILY)) != 0)
+        return false;
+    if (schema_out)
+        *schema_out = schema;
+    return true;
+}
+
+/* Front-door deadline for core.status.brief's one RPC ("agent"): the whole
+ * point of a flagless `z23 status` is to answer almost immediately,
+ * even against a busy/wedged node — never ride the generic 10s
+ * (ZCL_RPC_DEADLINE_MS) ceiling every other command tolerates. Overridable
+ * for tests; clamped to a sane floor/ceiling like every other RPC deadline
+ * knob in rpc_client.c. */
+#define ZCL_STATUS_DEADLINE_MS_DEFAULT 250
+
+static long status_front_door_deadline_ms(void)
+{
+    const char *v = getenv("ZCL_STATUS_DEADLINE_MS");
+    if (v && v[0]) {
+        char *end = NULL;
+        long parsed = strtol(v, &end, 10);
+        if (end && *end == 0 && parsed >= 10 && parsed <= 60000)
+            return parsed;
+    }
+    return ZCL_STATUS_DEADLINE_MS_DEFAULT;
+}
+
+/* zcl.public_status.v2 carries a numeric sentinel beside an explicit
+ * `<field>_known` bit.  The bit is authoritative: an unavailable height is a
+ * valid status fact and projects as null, while `known=true` with a negative
+ * sentinel is malformed source/runtime skew. */
+static bool status_read_known_height(const struct json_value *obj,
+                                     const char *value_key,
+                                     const char *known_key,
+                                     int64_t *value_out, bool *known_out)
+{
+    const struct json_value *value = obj ? json_get(obj, value_key) : NULL;
+    bool known = false;
+    if (!value || value->type != JSON_INT || value->val.i < -1 ||
+        value->val.i > INT_MAX ||
+        !status_read_bool(obj, known_key, &known) ||
+        (known && value->val.i < 0))
+        return false;
+    if (value_out)
+        *value_out = value->val.i;
+    if (known_out)
+        *known_out = known;
+    return true;
+}
+
+static bool status_read_optional_nonnegative(const struct json_value *obj,
+                                             const char *key,
+                                             int64_t *value_out,
+                                             bool *known_out)
+{
+    const struct json_value *value = obj ? json_get(obj, key) : NULL;
+    if (!value || value->type != JSON_INT || value->val.i < -1)
+        return false;
+    if (value_out)
+        *value_out = value->val.i;
+    if (known_out)
+        *known_out = value->val.i >= 0;
+    return true;
+}
+
+/* Status prose is a one-line machine surface.  Reject runtime-skew strings
+ * that could inject whitespace/control text into key=value output. */
+static bool status_machine_token(const char *value)
+{
+    if (!value || !value[0])
+        return false;
+    size_t n = strlen(value);
+    if (n > 127)
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+              c == '.' || c == ':'))
+            return false;
+    }
+    return true;
+}
+
+/* ── Named-predicate validation ────────────────────────────────────
+ *
+ * zcl.public_status.v2 is validated by a long ordered list of
+ * predicates. A single giant `&&` chain is unsafe here: whichever
+ * predicate fails, the operator/AI would only ever see one
+ * opaque message ("RPC agent returned an error or invalid
+ * zcl.public_status.v2") with no clue which field was the problem —
+ * including the common case of an older node binary whose `agent` RPC
+ * predates a field the CLI now requires.
+ *
+ * `status_validate` tracks the FIRST predicate that fails: its field
+ * name (for the error message) and whether the underlying JSON key
+ * was entirely ABSENT (as opposed to present-but-malformed). Absent +
+ * schema-matches is schema/version skew — the node binary predates
+ * the CLI contract; present-but-wrong is a malformed/self-contradictory
+ * document. The SCHECK() macro below turns each conjunct of the
+ * former `&&` chain into a named, order-preserving, short-circuiting
+ * check: once one predicate has failed, every later SCHECK() is a
+ * no-op that does not evaluate its condition (so it stays safe to
+ * dereference sub-objects the earlier checks proved exist). */
+struct status_validate {
+    bool failed;
+    bool version_skew; /* first failing key was absent, not malformed */
+    char field[96];
+};
+
+static bool status_key_missing(const struct json_value *obj, const char *key)
+{
+    return !obj || obj->type != JSON_OBJ || json_get(obj, key) == NULL;
+}
+
+static bool status_note_fail(struct status_validate *v, const char *field,
+                             bool missing)
+{
+    if (!v->failed) {
+        v->failed = true;
+        v->version_skew = missing;
+        (void)snprintf(v->field, sizeof(v->field), "%s", field);
+    }
+    return false;
+}
+
+/* `missing`/`cond` are only evaluated once v->failed is false, so this
+ * is safe to chain even when later conds read through an object an
+ * earlier failed check would have left NULL. */
+#define SCHECK(v, field, missing, cond) \
+    ((v)->failed ? false : ((cond) ? true : status_note_fail((v), (field), (missing))))
+
+/* ── Shared body composition ───────────────────────────────────────
+ *
+ * Both the strict zcl.public_status.v2 path and the degraded schema-skew
+ * path (a present-but-different-version schema, see
+ * status_schema_known_family_mismatch) end up emitting the same flat
+ * thirteen-field brief. This is that one shared composer, plus the typed-
+ * blocker-registry sub-read both paths reuse — the schema-skew path just
+ * populates every field with lenient/optional reads instead of the strict
+ * SCHECK() chain above. */
+
+struct status_brief_blocker_registry {
+    bool known;
+    int64_t active_blockers;
+    const char *head;      /* points into the source `agent` document */
+    bool overdue_known;
+    int64_t overdue_count;
+    const char *overdue_id; /* points into the source `agent` document */
+};
+
+/* Typed-blocker-registry head + count, from the same authority as
+ * `dumpstate blocker`. Read OPTIONALLY (an older node predating this
+ * contract simply omits the sub-object) so the two operator surfaces
+ * always agree on the registry head instead of naming disjoint truths. */
+static void status_brief_blocker_registry_read(
+    const struct json_value *agent,
+    struct status_brief_blocker_registry *out)
+{
+    *out = (struct status_brief_blocker_registry){0};
+    const struct json_value *blocker_registry =
+        json_get(agent, "blocker_registry");
+    if (!blocker_registry || blocker_registry->type != JSON_OBJ)
+        return;
+    out->known = status_read_nonnegative_int(blocker_registry,
+                                             "active_count",
+                                             &out->active_blockers);
+    const char *head =
+        json_get_str(json_get(blocker_registry, "dominant_id"));
+    if (head && head[0])
+        out->head = head;
+    /* POINT 3.4: overdue_transient_count surfaces the same registry truth
+     * for TRANSIENT/DEPENDENCY blockers stuck past their deadline/TTL (see
+     * agent_blocker_is_overdue_transient in event_agent_summary.c). A
+     * TRANSIENT never becomes `primary_blocker`, so without this an
+     * overdue transient could sit invisible behind a "healthy" brief. */
+    out->overdue_known = status_read_nonnegative_int(
+        blocker_registry, "overdue_transient_count", &out->overdue_count);
+    const char *odom = json_get_str(
+        json_get(blocker_registry, "overdue_transient_dominant_id"));
+    if (odom && odom[0] && strcmp(odom, "none") != 0)
+        out->overdue_id = odom;
+}
+
+/* Trust-tier surface, OPTIONAL on both `agent` sub-objects it reads:
+ *   - agent.trust_tier (event_agent_summary.c, schema "zcl.trust_tier.v1") —
+ *     trust_mode and the comma-joined denied-capability list.
+ *   - agent.security_posture.{snapshot_anchor_height,
+ *     background_validation_height} — the same two heights the posture
+ *     surface already carries, read here as "install_height"/
+ *     "verified_height" for the flat brief.
+ * An older node predating either field simply omits it — `known` stays
+ * false and status_brief_compose_body omits the flattened key, same
+ * optional-sub-object contract as status_brief_blocker_registry_read. */
+struct status_brief_trust_tier {
+    bool known;                  /* agent.trust_tier sub-object was present */
+    const char *tier;            /* trust_tier.trust_mode; points into agent */
+    int64_t install_height; bool install_known;
+    int64_t verified_height; bool verified_known;
+    const char *capabilities_locked; /* trust_tier.capabilities_denied */
+};
+
+static void status_brief_trust_tier_read(const struct json_value *agent,
+                                         const struct json_value *security,
+                                         struct status_brief_trust_tier *out)
+{
+    *out = (struct status_brief_trust_tier){0};
+    const struct json_value *tt = json_get(agent, "trust_tier");
+    if (tt && tt->type == JSON_OBJ) {
+        out->known = true;
+        const char *tier = json_get_str(json_get(tt, "trust_mode"));
+        if (tier && status_machine_token(tier))
+            out->tier = tier;
+        const char *locked =
+            json_get_str(json_get(tt, "capabilities_denied"));
+        if (locked)
+            out->capabilities_locked = locked;
+    }
+    (void)status_read_optional_nonnegative(security, "snapshot_anchor_height",
+                                           &out->install_height,
+                                           &out->install_known);
+    (void)status_read_optional_nonnegative(security,
+                                           "background_validation_height",
+                                           &out->verified_height,
+                                           &out->verified_known);
+}
+
+struct status_brief_fields {
+    int64_t served_height; bool served_known;
+    int64_t header_height; bool header_known;
+    int64_t gap; bool gap_known;
+    int64_t peer_best; bool peer_best_known;
+    const char *sync_state;
+    bool serving;
+    bool healthy;
+    int64_t peer_count;
+    const char *primary_blocker;
+    int64_t active_conditions;
+    int64_t rss_mb; bool rss_known;
+    int64_t tip_advance_age_seconds; bool tip_age_known;
+    struct status_brief_blocker_registry registry;
+    struct status_brief_trust_tier trust_tier;
+    struct status_brief_readiness_facts readiness;
+    /* NULL on the strict-v2 path; the mismatched schema string on the
+     * degraded schema-skew path — adds `partial_result`/`schema_skew` to
+     * the emitted body so the operator/AI can tell "old/new but fine"
+     * from "actually broken". */
+    const char *schema_skew;
+};
+
+/* Registry head/count beside primary_blocker so the brief and
+ * `dumpstate blocker` never present disjoint truths. Both fields are
+ * OMITTED (never null) when the node predates the registry export — the
+ * documented optional-sub-object contract. */
+static void status_push_registry_fields(
+    struct json_value *root,
+    const struct status_brief_blocker_registry *reg)
+{
+    if (reg->known)
+        json_push_kv_int(root, "active_blockers", reg->active_blockers);
+    if (reg->head)
+        json_push_kv_str(root, "blocker_head", reg->head);
+    if (reg->overdue_known)
+        json_push_kv_int(root, "overdue_transient_count",
+                         reg->overdue_count);
+    if (reg->overdue_count > 0) {
+        char note[128];
+        (void)snprintf(note, sizeof(note),
+                      "%lld transient blockers overdue: %s",
+                      (long long)reg->overdue_count,
+                      reg->overdue_id ? reg->overdue_id
+                                      : "unknown");
+        json_push_kv_str(root, "overdue_transient_note", note);
+    }
+}
+
+/* Trust-tier surface: OMITTED (never null), same convention as the
+ * blocker_registry sub-fields above, on an older node that predates
+ * agent.trust_tier / the two security_posture heights — these are a
+ * newer optional facet, not part of the always-present v2 core (unlike
+ * hstar/header_height/gap, which use status_push_int_if_known's
+ * always-present-possibly-null convention because the v2 schema has
+ * always carried them). */
+static void status_push_trust_tier_fields(
+    struct json_value *root, const struct status_brief_trust_tier *tt)
+{
+    if (tt->tier)
+        json_push_kv_str(root, "tier", tt->tier);
+    if (tt->install_known)
+        json_push_kv_int(root, "install_height", tt->install_height);
+    if (tt->verified_known)
+        json_push_kv_int(root, "verified_height", tt->verified_height);
+    if (tt->capabilities_locked)
+        json_push_kv_str(root, "capabilities_locked",
+                         tt->capabilities_locked);
+}
+
+/* The v3 readiness facts, each emitted separately and only when the
+ * producer actually reported it. They are never combined into a single
+ * verdict here — that collapse is the bug this surface exists to fix. */
+static void status_push_readiness_fields(
+    struct json_value *root,
+    const struct status_brief_readiness_facts *rd)
+{
+    if (rd->tip_follow_known)
+        json_push_kv_bool(root, "tip_follow", rd->tip_follow);
+    if (rd->wallet_view_known)
+        json_push_kv_bool(root, "wallet_view_ready", rd->wallet_view_ready);
+    if (rd->wallet_spend_known)
+        json_push_kv_bool(root, "wallet_spend_allowed",
+                          rd->wallet_spend_allowed);
+    if (rd->archive_complete)
+        json_push_kv_str(root, "archive_complete", rd->archive_complete);
+    if (rd->full_replay_known)
+        json_push_kv_bool(root, "full_replay_verified",
+                          rd->full_replay_verified);
+}
+
+static char *status_brief_compose_body(const struct status_brief_fields *f,
+                                       struct zcl_native_body_err *err)
+{
+    struct json_value root;
+    json_init(&root);
+    json_set_object(&root);
+    status_push_int_if_known(&root, "hstar", f->served_known,
+                             f->served_height);
+    status_push_int_if_known(&root, "header_height", f->header_known,
+                             f->header_height);
+    status_push_int_if_known(&root, "gap", f->gap_known, f->gap);
+    status_push_int_if_known(&root, "peer_best", f->peer_best_known,
+                             f->peer_best);
+    json_push_kv_str(&root, "sync_state", f->sync_state);
+    json_push_kv_bool(&root, "serving", f->serving);
+    json_push_kv_bool(&root, "healthy", f->healthy);
+    json_push_kv_int(&root, "peer_count", f->peer_count);
+    json_push_kv_str(&root, "primary_blocker", f->primary_blocker);
+    /* The full agent contract does not yet export the dominant blocker's
+     * capture age. Tip-stall age is a different fact and must not be passed
+     * off as blocker age. */
+    status_push_int_if_known(&root, "blocker_age_s", false, 0);
+    status_push_registry_fields(&root, &f->registry);
+    json_push_kv_int(&root, "active_conditions", f->active_conditions);
+    status_push_int_if_known(&root, "rss_mb", f->rss_known, f->rss_mb);
+    status_push_int_if_known(&root, "tip_advance_age_seconds",
+                             f->tip_age_known, f->tip_advance_age_seconds);
+    status_push_trust_tier_fields(&root, &f->trust_tier);
+    status_push_readiness_fields(&root, &f->readiness);
+    if (f->schema_skew) {
+        json_push_kv_bool(&root, "partial_result", true);
+        json_push_kv_str(&root, "schema_skew", f->schema_skew);
+    }
+
+    char *out = zcl_json_value_to_body(&root, "status_brief_body");
+    json_free(&root);
+    if (!out) {
+        err->status = ZCL_NATIVE_BODY_INTERNAL;
+        snprintf(err->message, sizeof(err->message),
+                 "malloc failed for %s", "status brief response");
+        LOG_NULL("native.ops", "malloc failed for %s", "status brief response");
+    }
+    return out;
+}
+
+
+/* A present schema in the known zcl.public_status.* family, but not the
+ * exact version the SCHECK() chain above validates strictly (an older
+ * node's v1, a newer node's v3, ...). Every field here is read LENIENTLY
+ * with the same optional-field readers the strict path uses for genuinely-
+ * optional sub-objects (status_read_known_height, status_read_nonnegative_int,
+ * status_json_bool, ...): a field that fails to parse is simply "unknown",
+ * never a hard fail. This is a best-effort degraded view of a document from
+ * a status contract this CLI build doesn't fully recognize — not the
+ * validated zcl.public_status.v2 contract, so it never enforces that
+ * contract's cross-field arithmetic (e.g. gap == header - served). */
+static char *status_brief_build_schema_skew_body(
+    const struct json_value *agent, const char *schema,
+    struct zcl_native_body_err *err)
+{
+    struct status_brief_fields f = {0};
+    f.served_height = -1;
+    f.header_height = -1;
+
+    (void)status_read_known_height(agent, "served_height",
+                                   "served_height_known", &f.served_height,
+                                   &f.served_known);
+    (void)status_read_known_height(agent, "header_height",
+                                   "header_height_known", &f.header_height,
+                                   &f.header_known);
+    (void)status_read_known_height(agent, "peer_best_height",
+                                   "peer_best_height_known", &f.peer_best,
+                                   &f.peer_best_known);
+    f.gap_known = status_read_nonnegative_int(agent, "gap", &f.gap);
+
+    const char *sync_state = json_get_str(json_get(agent, "sync_state"));
+    f.sync_state = status_machine_token(sync_state) ? sync_state : NULL;
+    const char *primary_blocker =
+        json_get_str(json_get(agent, "primary_blocker"));
+    f.primary_blocker = status_machine_token(primary_blocker)
+        ? primary_blocker : NULL;
+
+    f.serving = status_json_bool(agent, "serving", false);
+    f.healthy = status_json_bool(agent, "healthy", false);
+
+    (void)status_read_nonnegative_int(json_get(agent, "peers"), "total",
+                                      &f.peer_count);
+    (void)status_read_nonnegative_int(json_get(agent, "conditions"),
+                                      "active_count", &f.active_conditions);
+    (void)status_read_optional_nonnegative(json_get(agent, "resources"),
+                                           "rss_mb", &f.rss_mb,
+                                           &f.rss_known);
+    (void)status_read_optional_nonnegative(json_get(agent, "reducer"),
+                                           "tip_advance_age_seconds",
+                                           &f.tip_advance_age_seconds,
+                                           &f.tip_age_known);
+    status_brief_blocker_registry_read(agent, &f.registry);
+    status_brief_trust_tier_read(agent, json_get(agent, "security_posture"),
+                                 &f.trust_tier);
+    status_brief_readiness_facts_read(agent, &f.readiness);
+    f.schema_skew = schema;
+
+    return status_brief_compose_body(&f, err);
+}
+
+/* ── Strict zcl.public_status.v2/v3 validation ─────────────────────
+ *
+ * The raw facts the SCHECK() chain extracts out of the `agent` document,
+ * bundled so the ordered validation groups below can share one out-param
+ * instead of twenty. Mirrors the struct status_brief_fields pattern above;
+ * zcl_native_status_brief_body() projects one into the other once the whole
+ * chain has passed. */
+struct status_brief_raw {
+    int64_t served_height; bool served_known;
+    int64_t header_height; bool header_known;
+    int64_t gap; bool gap_known;
+    int64_t target_height; bool target_known;
+    int64_t peer_best; bool peer_best_known;
+    int64_t peer_count;
+    int64_t active_conditions;
+    int64_t rss_mb; bool rss_known;
+    int64_t tip_advance_age_seconds; bool tip_age_known;
+    int64_t first_call_budget_ms;
+    bool chain_evidence_consistent;
+    bool partial_result;
+    bool first_call_partial;
+    bool budget_exceeded;
+    bool serving;
+    bool healthy;
+    bool anchor_gap;
+    bool nullifier_gap;
+    const char *sync_state;       /* points into the source `agent` document */
+    const char *reported_blocker; /* points into the source `agent` document */
+};
+
+/* The `agent` sub-objects every validation group reads. Resolved ONCE, then
+ * passed to every group as the same pointers — never re-fetched, so a group
+ * can never disagree with an earlier group's shape verdict. */
+struct status_brief_objs {
+    const struct json_value *peers;
+    const struct json_value *conditions;
+    const struct json_value *resources;
+    const struct json_value *reducer;
+    const struct json_value *security;
+    const struct json_value *first_call;
+};
+
+static void status_brief_read_agent_views(const struct json_value *agent,
+                                          struct status_brief_objs *o,
+                                          struct status_brief_raw *r,
+                                          bool parsed)
+{
+    *o = (struct status_brief_objs){0};
+    if (!parsed)
+        return;
+    o->peers = json_get(agent, "peers");
+    o->conditions = json_get(agent, "conditions");
+    o->resources = json_get(agent, "resources");
+    o->reducer = json_get(agent, "reducer");
+    o->security = json_get(agent, "security_posture");
+    o->first_call = json_get(agent, "first_call");
+    r->sync_state = json_get_str(json_get(agent, "sync_state"));
+    r->reported_blocker = json_get_str(json_get(agent, "primary_blocker"));
+}
+
+/* Evaluated BEFORE the SCHECK() chain (it fills rss_mb/rss_known for the
+ * projection either way); the chain's own `resources` predicate then decides
+ * whether a bad shape is fatal or an allowed partial_result omission. */
+static bool status_brief_resources_shape_ok(
+    struct status_brief_raw *r, const struct json_value *resources)
+{
+    return resources && resources->type == JSON_OBJ &&
+           status_schema_is(resources, "zcl.node_resources.v1") &&
+           status_read_optional_nonnegative(resources, "rss_mb", &r->rss_mb,
+                                            &r->rss_known);
+}
+
+/* Group 1/6 — schema plus the five height facts and the chain-evidence bit.
+ * Every group below keeps its SCHECK() calls in the exact left-to-right
+ * order of the original single chain: SCHECK() records only the FIRST
+ * failure, so the reported field name (and its version-skew verdict) is
+ * positional. */
+static bool status_validate_core_heights(struct status_validate *v,
+                                         const struct json_value *agent,
+                                         struct status_brief_raw *r)
+{
+    return SCHECK(v, "schema", status_key_missing(agent, "schema"),
+                  status_schema_is_strictly_read(agent)) &&
+        SCHECK(v, "served_height_known",
+              status_key_missing(agent, "served_height") ||
+                  status_key_missing(agent, "served_height_known"),
+              status_read_known_height(agent, "served_height",
+                                       "served_height_known",
+                                       &r->served_height,
+                                       &r->served_known)) &&
+        SCHECK(v, "header_height_known",
+              status_key_missing(agent, "header_height") ||
+                  status_key_missing(agent, "header_height_known"),
+              status_read_known_height(agent, "header_height",
+                                       "header_height_known",
+                                       &r->header_height,
+                                       &r->header_known)) &&
+        SCHECK(v, "gap", status_key_missing(agent, "gap"),
+              status_read_nonnegative_int(agent, "gap", &r->gap)) &&
+        SCHECK(v, "peer_best_height_known",
+              status_key_missing(agent, "peer_best_height") ||
+                  status_key_missing(agent, "peer_best_height_known"),
+              status_read_known_height(agent, "peer_best_height",
+                                       "peer_best_height_known",
+                                       &r->peer_best,
+                                       &r->peer_best_known)) &&
+        SCHECK(v, "target_height_known",
+              status_key_missing(agent, "target_height") ||
+                  status_key_missing(agent, "target_height_known"),
+              status_read_known_height(agent, "target_height",
+                                       "target_height_known",
+                                       &r->target_height,
+                                       &r->target_known)) &&
+        SCHECK(v, "chain_evidence_consistent",
+              status_key_missing(agent, "chain_evidence_consistent"),
+              status_read_bool(agent, "chain_evidence_consistent",
+                               &r->chain_evidence_consistent));
+}
+
+/* Group 2/6 — the top-level booleans and the two machine-token strings. */
+static bool status_validate_flags_and_tokens(struct status_validate *v,
+                                             const struct json_value *agent,
+                                             struct status_brief_raw *r)
+{
+    return SCHECK(v, "partial_result",
+                  status_key_missing(agent, "partial_result"),
+                  status_read_bool(agent, "partial_result",
+                                   &r->partial_result)) &&
+        SCHECK(v, "serving", status_key_missing(agent, "serving"),
+              status_read_bool(agent, "serving", &r->serving)) &&
+        SCHECK(v, "healthy", status_key_missing(agent, "healthy"),
+              status_read_bool(agent, "healthy", &r->healthy)) &&
+        SCHECK(v, "sync_state", status_key_missing(agent, "sync_state"),
+              status_machine_token(r->sync_state)) &&
+        SCHECK(v, "primary_blocker",
+              status_key_missing(agent, "primary_blocker"),
+              status_machine_token(r->reported_blocker));
+}
+
+/* Group 3/6 — presence and schema of the five required sub-objects. Every
+ * later group dereferences these, which is safe only because SCHECK() stops
+ * evaluating conditions once this group has recorded a failure. */
+static bool status_validate_subobject_shapes(
+    struct status_validate *v, const struct json_value *agent,
+    const struct status_brief_objs *o)
+{
+    return SCHECK(v, "peers", status_key_missing(agent, "peers"),
+                  o->peers && o->peers->type == JSON_OBJ) &&
+        SCHECK(v, "conditions", status_key_missing(agent, "conditions"),
+              o->conditions && o->conditions->type == JSON_OBJ) &&
+        SCHECK(v, "conditions.schema",
+              status_key_missing(o->conditions, "schema"),
+              status_schema_is(o->conditions,
+                               "zcl.condition_engine_summary.v2")) &&
+        SCHECK(v, "reducer", status_key_missing(agent, "reducer"),
+              o->reducer && o->reducer->type == JSON_OBJ) &&
+        SCHECK(v, "security_posture",
+              status_key_missing(agent, "security_posture"),
+              o->security && o->security->type == JSON_OBJ) &&
+        SCHECK(v, "security_posture.schema",
+              status_key_missing(o->security, "schema"),
+              status_schema_is(o->security, "zcl.security_posture.v1")) &&
+        SCHECK(v, "first_call", status_key_missing(agent, "first_call"),
+              o->first_call && o->first_call->type == JSON_OBJ) &&
+        SCHECK(v, "first_call.schema",
+              status_key_missing(o->first_call, "schema"),
+              status_schema_is(o->first_call,
+                               "zcl.first_call_contract.v1"));
+}
+
+/* Group 4/6 — the counted facts carried by the sub-objects. */
+static bool status_validate_counts(struct status_validate *v,
+                                   const struct status_brief_objs *o,
+                                   struct status_brief_raw *r)
+{
+    return SCHECK(v, "peers.total", status_key_missing(o->peers, "total"),
+                  status_read_nonnegative_int(o->peers, "total",
+                                              &r->peer_count)) &&
+        SCHECK(v, "conditions.active_count",
+              status_key_missing(o->conditions, "active_count"),
+              status_read_nonnegative_int(o->conditions, "active_count",
+                                          &r->active_conditions)) &&
+        SCHECK(v, "reducer.tip_advance_age_seconds",
+              status_key_missing(o->reducer, "tip_advance_age_seconds"),
+              status_read_optional_nonnegative(
+                  o->reducer, "tip_advance_age_seconds",
+                  &r->tip_advance_age_seconds, &r->tip_age_known)) &&
+        SCHECK(v, "security_posture.anchor_backfill_gap",
+              status_key_missing(o->security, "anchor_backfill_gap"),
+              status_read_bool(o->security, "anchor_backfill_gap",
+                               &r->anchor_gap)) &&
+        SCHECK(v, "security_posture.nullifier_backfill_gap",
+              status_key_missing(o->security, "nullifier_backfill_gap"),
+              status_read_bool(o->security, "nullifier_backfill_gap",
+                               &r->nullifier_gap));
+}
+
+/* Group 5/6 — the first_call budget triple plus its one cross-check. */
+static bool status_validate_first_call(struct status_validate *v,
+                                       const struct status_brief_objs *o,
+                                       struct status_brief_raw *r)
+{
+    return SCHECK(v, "first_call.budget_ms",
+                  status_key_missing(o->first_call, "budget_ms"),
+                  status_read_nonnegative_int(o->first_call, "budget_ms",
+                                              &r->first_call_budget_ms)) &&
+        SCHECK(v, "first_call.budget_ms", false,
+              r->first_call_budget_ms > 0) &&
+        SCHECK(v, "first_call.partial_result",
+              status_key_missing(o->first_call, "partial_result"),
+              status_read_bool(o->first_call, "partial_result",
+                               &r->first_call_partial)) &&
+        SCHECK(v, "first_call.budget_exceeded",
+              status_key_missing(o->first_call, "budget_exceeded"),
+              status_read_bool(o->first_call, "budget_exceeded",
+                               &r->budget_exceeded)) &&
+        /* budget_exceeded is a pure timing fact (elapsed > budget_ms) and is
+         * ORTHOGONAL to completeness: a busy node whose cached-field collect
+         * contends cs_main can overrun 250ms while still gathering every
+         * field, so budget_exceeded=true with partial_result=false is a
+         * truthful slow-but-complete result, not self-contradiction. (This
+         * false coupling made the flagless status of a folding node fail with
+         * a cryptic "missing/invalid field first_call.budget_exceeded" after
+         * several seconds instead of returning the real, complete brief.)
+         * Data completeness is enforced independently by the resources check
+         * in status_validate_cross_fields(), so no budget-vs-partial
+         * cross-check is needed or correct here. */
+        SCHECK(v, "first_call.partial_result", false,
+              r->first_call_partial == r->partial_result);
+}
+
+/* Group 6/6 — resources/partial_reason presence and the self-consistency
+ * cross-checks between served/serving/healthy and the backfill gaps. */
+static bool status_validate_cross_fields(
+    struct status_validate *v, const struct json_value *agent,
+    const struct status_brief_raw *r, bool resources_shape_ok,
+    const struct json_value *resources)
+{
+    return SCHECK(v, "resources", status_key_missing(agent, "resources"),
+                  resources_shape_ok ||
+                      (r->partial_result && !resources)) &&
+        SCHECK(v, "partial_reason",
+              status_key_missing(agent, "partial_reason"),
+              !r->partial_result ||
+                  (json_get_str(json_get(agent, "partial_reason")) != NULL &&
+                   json_get_str(json_get(agent, "partial_reason"))[0])) &&
+        SCHECK(v, "served_height_known", false,
+              !r->serving || r->served_known) &&
+        SCHECK(v, "healthy", false, !r->healthy || r->serving) &&
+        SCHECK(v, "security_posture.anchor_backfill_gap", false,
+              (!r->anchor_gap && !r->nullifier_gap) || !r->healthy);
+}
+
+/* Runs only once the six ordered groups above all passed, because it reads
+ * gap_known — derived from chain_evidence_consistent in group 1. */
+static bool status_validate_gap_arithmetic(struct status_validate *v,
+                                           struct status_brief_raw *r)
+{
+    r->gap_known = r->chain_evidence_consistent;
+    /* A consistent local chain has target==header and an exact arithmetic
+     * gap.  An inconsistent/unknown chain is emitted as null and the
+     * producer's sentinel gap must remain zero. */
+    return SCHECK(v, "gap", false,
+                  r->gap_known
+                      ? r->served_known && r->header_known &&
+                        r->target_known &&
+                        r->target_height == r->header_height &&
+                        r->header_height >= r->served_height &&
+                        r->gap == r->header_height - r->served_height
+                      : r->gap == 0);
+}
+
+/* Fills err for the failed-validation path. Transport absence is transient;
+ * a parsed document that violates this build's strict contract is an
+ * internal producer/consumer mismatch and must not invite a blind retry. The
+ * native bridge maps these two statuses into retryable:true vs false. */
+static void status_brief_fill_invalid_error(struct zcl_native_body_err *err,
+                                            const struct json_value *agent,
+                                            const struct status_validate *v,
+                                            bool parsed)
+{
+    err->status = parsed ? ZCL_NATIVE_BODY_INTERNAL
+                         : ZCL_NATIVE_BODY_UNAVAILABLE;
+    if (!parsed) {
+        /* `parsed` is false for two very different situations that must
+         * not both read as a schema fault: an unparsable byte stream, or
+         * a well-formed transport/RPC error object (node not running,
+         * connect refused/timed out, response deadline exceeded, cookie
+         * unreadable). Surface the transport reason verbatim when we have
+         * one -- that is the honest "no live node / node busy" answer the
+         * operator needs, not "invalid zcl.public_status.vN". */
+        const char *rpc_err = NULL;
+        if (agent->type == JSON_OBJ) {
+            const struct json_value *e = json_get(agent, "error");
+            rpc_err = json_get_str(json_get(
+                e && e->type == JSON_OBJ ? e : agent, "message"));
+        }
+        if (rpc_err && rpc_err[0])
+            (void)snprintf(err->message, sizeof(err->message),
+                          "node status unavailable: %s", rpc_err);
+        else
+            (void)snprintf(err->message, sizeof(err->message),
+                          "node status unavailable: RPC agent returned an "
+                          "unparsable response");
+    } else if (v->version_skew) {
+        (void)snprintf(err->message, sizeof(err->message),
+                      "invalid %s: node binary "
+                      "predates the CLI contract (missing field %s)",
+                      status_schema_seen(agent), v->field);
+    } else {
+        (void)snprintf(err->message, sizeof(err->message),
+                      "invalid %s: missing/invalid "
+                      "field %s", status_schema_seen(agent), v->field);
+    }
+}
+
+/* Permanent independently-diagnosed shielded-history incompleteness is
+ * causal. Rank it above downstream queue/download symptoms from the
+ * general operator latch. */
+static const char *status_brief_primary_blocker(
+    const struct status_brief_raw *r)
+{
+    return r->anchor_gap
+        ? "utxo_apply.anchor_backfill_gap"
+        : r->nullifier_gap ? "utxo_apply.nullifier_backfill_gap"
+        : r->reported_blocker;
+}
+
+static struct status_brief_fields status_brief_project(
+    const struct status_brief_raw *r)
+{
+    struct status_brief_fields f = {
+        .served_height = r->served_height,
+        .served_known = r->served_known,
+        .header_height = r->header_height,
+        .header_known = r->header_known,
+        .gap = r->gap, .gap_known = r->gap_known,
+        .peer_best = r->peer_best, .peer_best_known = r->peer_best_known,
+        .sync_state = r->sync_state,
+        .serving = r->serving,
+        .healthy = r->healthy,
+        .peer_count = r->peer_count,
+        .primary_blocker = status_brief_primary_blocker(r),
+        .active_conditions = r->active_conditions,
+        .rss_mb = r->rss_mb, .rss_known = r->rss_known,
+        .tip_advance_age_seconds = r->tip_advance_age_seconds,
+        .tip_age_known = r->tip_age_known,
+        .schema_skew = NULL,
+    };
+    return f;
+}
+
+char *zcl_native_status_brief_body(const struct json_value *args,
+                                   struct zcl_native_body_err *err)
+{
+    (void)args;
+    if (!err)
+        LOG_NULL("native.status", "status brief missing error sink");
+
+    /* The flagless front door: always answer fast, even against a busy/
+     * wedged node, rather than ride the generic 10s RPC ceiling every other
+     * command tolerates (see status_front_door_deadline_ms()). */
+    long deadline_ms = status_front_door_deadline_ms();
+    char *raw = node_rpc_call_deadline("agent", NULL, deadline_ms,
+                                       deadline_ms);
+    struct json_value agent;
+    json_init(&agent);
+    bool parsed = status_parse_rpc_json(&agent, raw, JSON_OBJ);
+
+    /* A PRESENT schema that names the known zcl.public_status.* family but
+     * isn't the exact version validated below (an older node's v1, a
+     * newer node's v3, ...) is version skew, not corruption — degrade
+     * gracefully instead of hard-failing with "missing/invalid field
+     * schema". An ABSENT schema, or one outside the family entirely, falls
+     * through to the strict validator unchanged. */
+    const char *schema_skew = NULL;
+    if (parsed && status_schema_known_family_mismatch(&agent, &schema_skew)) {
+        char *out = status_brief_build_schema_skew_body(&agent, schema_skew,
+                                                         err);
+        json_free(&agent);
+        free(raw);
+        return out;
+    }
+
+    struct status_brief_objs o;
+    struct status_brief_raw r = {0};
+    r.served_height = -1;
+    r.header_height = -1;
+    r.target_height = -1;
+    r.budget_exceeded = true;
+    status_brief_read_agent_views(&agent, &o, &r, parsed);
+
+    bool resources_shape_ok =
+        status_brief_resources_shape_ok(&r, o.resources);
+
+    /* One ordered chain, split into six groups that each keep their own
+     * SCHECK() calls in the original left-to-right order; `&&` between the
+     * groups reproduces the original short-circuit exactly. */
+    struct status_validate v = {0};
+    bool valid = parsed &&
+        status_validate_core_heights(&v, &agent, &r);
+    valid = valid && status_validate_flags_and_tokens(&v, &agent, &r);
+    valid = valid && status_validate_subobject_shapes(&v, &agent, &o);
+    valid = valid && status_validate_counts(&v, &o, &r);
+    valid = valid && status_validate_first_call(&v, &o, &r);
+    valid = valid && status_validate_cross_fields(&v, &agent, &r,
+                                                  resources_shape_ok,
+                                                  o.resources);
+
+    if (valid)
+        valid = status_validate_gap_arithmetic(&v, &r);
+
+    if (!valid) {
+        status_brief_fill_invalid_error(err, &agent, &v, parsed);
+        /* err->message now owns a copy of any rpc_err text, so the source
+         * document is safe to release before LOG_NULL returns NULL. */
+        json_free(&agent);
+        free(raw);
+        LOG_NULL("native.status", "%s", err->message);
+    }
+
+    struct status_brief_fields f = status_brief_project(&r);
+    /* `f.registry.head`/`overdue_id`/`f.trust_tier.*` point into `agent`,
+     * which stays alive until after status_brief_compose_body() serializes
+     * them below (json_push_kv_str copies the string). Both reads are
+     * lenient/OPTIONAL — never part of the strict SCHECK() chain above, so
+     * an older node missing either sub-object does not fail validation. */
+    status_brief_blocker_registry_read(&agent, &f.registry);
+    status_brief_trust_tier_read(&agent, o.security, &f.trust_tier);
+    /* v3 facts, OPTIONAL: a strictly-valid v2 document omits all five and
+     * still produces a complete brief — that is the retained v2 reader. */
+    status_brief_readiness_facts_read(&agent, &f.readiness);
+
+    char *out = status_brief_compose_body(&f, err);
+    json_free(&agent);
+    free(raw);
+    return out;
+}

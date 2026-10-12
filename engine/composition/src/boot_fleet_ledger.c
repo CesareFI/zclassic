@@ -1,0 +1,914 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * purpose: The "ledger" mesh stream service and its pull lane (see the
+ * header). One registration serves both halves; the primitive tells them
+ * apart by which side opened the stream.
+ */
+
+// one-result-type-ok:closed-security-verdict — the callbacks return the
+// stream primitive's bounded refusal enum; no diagnostic text crosses the
+// wire. Failure logging happens here, with the refusal named.
+
+#include "config/boot_fleet_ledger.h"
+
+#include "config/boot_internal.h"
+#include "config/boot_zcode_dht.h"
+#include "config/mesh_stream.h"
+#include "config/runtime.h"
+#include "boot_mesh_status_internal.h"
+
+#include "util/fleet_role_check.h"
+#include "base/safe_alloc.h"
+#include "base/serialize_le.h"
+#include "fleetledger/fleet_ledger.h"
+#include "models/mesh_pairing.h"
+#include "net/net.h"
+#include "platform/time_compat.h"
+#include "services/mesh_pairing_service.h"
+#include "supervisors/domains.h"
+#include "util/log_macros.h"
+#include "util/supervisor.h"
+#include "util/sync.h"
+#include "vcs/zcode_dht_identity.h"
+
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define FLEET_LEDGER_PAIRINGS_MAX 64u
+
+/* The initiator's per-stream state: who we asked, and what came back. */
+struct fleet_pull_state {
+    uint8_t peer_box_id[32];
+    uint8_t peer_signer[32];
+    size_t len;
+    uint8_t rows[FLEET_LEDGER_ANSWER_MAX];
+};
+
+/* The acceptor's per-stream state: one bounded answer, read once at open. */
+struct fleet_serve_state {
+    size_t len;
+    size_t sent;
+    uint8_t rows[FLEET_LEDGER_ANSWER_MAX];
+};
+
+/* A verified-nothing batch waiting for the tick to commit it. The stream
+ * lane only ever moves a pointer into here; every byte of verification and
+ * every fsync happens in the tick, with no lock held. */
+struct fleet_inbox_slot {
+    bool used;
+    uint8_t peer_box_id[32];
+    uint8_t peer_signer[32];
+    size_t len;
+    uint8_t *rows;
+};
+
+static zcl_mutex_t g_ledger_lock;
+static _Atomic int g_ledger_lock_state;
+static struct boot_svc_ctx *g_ledger_svc; /* borrowed; set by wire() */
+static struct zcl_fleet_ledger *g_ledger;
+static uint8_t g_self_box_id[32];
+static uint8_t g_self_signer[32];
+static struct fleet_inbox_slot g_inbox[FLEET_LEDGER_INBOX_MAX];
+static struct liveness_contract g_ledger_contract;
+static supervisor_child_id g_ledger_child = SUPERVISOR_INVALID_ID;
+static int64_t g_last_pull;
+/* Counted refusals. All three are facts an operator has to be able to see:
+ * the first says a paired peer's identity is no longer current, the second
+ * says this box could not keep up with what it asked for, and the third
+ * says a peer whose signature is good holds no role to write here. None
+ * names the peer. */
+static _Atomic uint64_t g_delegation_refused;
+static _Atomic uint64_t g_inbox_full;
+static _Atomic uint64_t g_role_refused;
+
+#ifdef ZCL_TESTING
+/* See boot_fleet_ledger_test_bind_authority: the DHT composition root this
+ * test group cannot host, and nothing else. */
+static bool g_test_authority;
+static struct vcs_zcode_dht_delegation g_test_delegation;
+static uint8_t g_test_genesis[32];
+static int64_t g_test_now;
+#endif
+
+static void ledger_lock(void)
+{
+    if (atomic_load_explicit(&g_ledger_lock_state, memory_order_acquire) != 2) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(
+                &g_ledger_lock_state, &expected, 1, memory_order_acq_rel,
+                memory_order_acquire)) {
+            zcl_mutex_init(&g_ledger_lock);
+            atomic_store_explicit(&g_ledger_lock_state, 2,
+                                  memory_order_release);
+        } else {
+            while (atomic_load_explicit(&g_ledger_lock_state,
+                                        memory_order_acquire) != 2)
+                ;
+        }
+    }
+    zcl_mutex_lock(&g_ledger_lock);
+}
+
+/* ── the PULL frame ──────────────────────────────────────────────────── */
+
+static size_t pull_encode(uint64_t since_seq, uint8_t out[FLEET_LEDGER_PULL_BYTES])
+{
+    out[0] = (uint8_t)FLEET_LEDGER_MSG_PULL;
+    out[1] = 1u; /* protocol version */
+    zcl_write_u64_be(out + 2, since_seq);
+    return FLEET_LEDGER_PULL_BYTES;
+}
+
+static bool pull_decode(const uint8_t *in, size_t len, uint64_t *since_out)
+{
+    if (!in || len != FLEET_LEDGER_PULL_BYTES ||
+        in[0] != (uint8_t)FLEET_LEDGER_MSG_PULL || in[1] != 1u)
+        return false;
+    *since_out = zcl_read_u64_be(in + 2);
+    return true;
+}
+
+/* ── the delegation a pairing row cannot vouch for ───────────────────── */
+
+/* A pairing row states its OWN window and its own revocation. It cannot
+ * state whether the peer's master identity is still ACTIVE on chain: a
+ * master that has been revoked or superseded leaves every local row it was
+ * ever written into untouched. So the two questions are asked separately,
+ * exactly as boot_mesh_status_requester.c and boot_mesh_terminal_client.c
+ * already ask them, and a peer must pass both.
+ *
+ * The three helpers below name the composition roots this decision reads,
+ * so the test group can stand in for the one it cannot host without ever
+ * standing in for the authority itself. */
+
+static bool ledger_peer_delegation(const struct db_mesh_pairing *row,
+                                   struct vcs_zcode_dht_delegation *out)
+{
+#ifdef ZCL_TESTING
+    if (g_test_authority) {
+        if (memcmp(row->peer_noise_pubkey,
+                   g_test_delegation.noise_static_pubkey, 32) != 0)
+            return false;
+        *out = g_test_delegation;
+        return true;
+    }
+#endif
+    return boot_mesh_peer_delegation(row, out);
+}
+
+static bool ledger_network_genesis(uint8_t out[32])
+{
+#ifdef ZCL_TESTING
+    if (g_test_authority) {
+        memcpy(out, g_test_genesis, 32);
+        return true;
+    }
+#endif
+    return boot_zcode_dht_network_genesis(out);
+}
+
+static int64_t ledger_now(void)
+{
+#ifdef ZCL_TESTING
+    if (g_test_authority)
+        return g_test_now;
+#endif
+    return (int64_t)platform_time_wall_time_t();
+}
+
+/* Is this peer's delegation still current, on top of its pairing row being
+ * unexpired? A refusal is counted and named; it never names the peer,
+ * because who this box is paired with is the owner's business and a log is
+ * not private. */
+static bool ledger_delegation_current(
+    struct node_db *ndb, const struct db_mesh_pairing *row,
+    const struct vcs_zcode_dht_delegation *peer,
+    const uint8_t session_noise_static[32], int64_t now)
+{
+    uint8_t network_genesis[32];
+    enum mesh_pairing_reason reason = MESH_PAIRING_BAD_ARGUMENT;
+    if (ledger_network_genesis(network_genesis))
+        reason = mesh_pairing_service_authorize_status(
+            ndb, network_genesis, row->pairing_id, peer,
+            session_noise_static, now);
+    if (reason == MESH_PAIRING_OK)
+        return true;
+    atomic_fetch_add_explicit(&g_delegation_refused, 1, memory_order_relaxed);
+    LOG_WARN("fleet.ledger", "%s: %s",
+             zcl_fleet_status_label(ZCL_FLEET_DELEGATION_EXPIRED),
+             mesh_pairing_reason_token(reason));
+    return false;
+}
+
+/* The pairing row for one Noise static, scanned the way the stream
+ * primitive scans it (mesh_stream.c, stream_peer_pairing_allows): bounded,
+ * and fail-closed on an unreadable list. */
+static bool ledger_pairing_for_peer(struct node_db *ndb,
+                                    const uint8_t peer_noise_static[32],
+                                    struct db_mesh_pairing *out)
+{
+    struct db_mesh_pairing *rows =
+        zcl_calloc(FLEET_LEDGER_PAIRINGS_MAX, sizeof *rows,
+                   "fleet_ledger_pairing_lookup");
+    if (!rows)
+        return false;
+    int count = db_mesh_pairing_list(ndb, rows, FLEET_LEDGER_PAIRINGS_MAX);
+    bool found = false;
+    for (int i = 0; i < count && !found; i++) {
+        if (memcmp(rows[i].peer_noise_pubkey, peer_noise_static, 32) != 0)
+            continue;
+        *out = rows[i];
+        found = true;
+    }
+    free(rows);
+    return found;
+}
+
+/* Everything the accept side has to prove about a peer that is already
+ * through the primitive's Noise and capability gates. */
+static bool ledger_accept_authorized(const uint8_t peer_noise_static[32])
+{
+    struct node_db *ndb = app_runtime_node_db();
+    if (!ndb || !app_runtime_node_db_handle_open(ndb))
+        return false;
+    struct db_mesh_pairing row;
+    struct vcs_zcode_dht_delegation peer;
+    if (!ledger_pairing_for_peer(ndb, peer_noise_static, &row) ||
+        !ledger_peer_delegation(&row, &peer)) {
+        atomic_fetch_add_explicit(&g_delegation_refused, 1,
+                                  memory_order_relaxed);
+        LOG_WARN("fleet.ledger", "%s: delegation_unresolved",
+                 zcl_fleet_status_label(ZCL_FLEET_DELEGATION_EXPIRED));
+        return false;
+    }
+    return ledger_delegation_current(ndb, &row, &peer, peer_noise_static,
+                                     ledger_now());
+}
+
+/* ── the service callbacks ───────────────────────────────────────────── */
+
+/* An inbound OPEN. The primitive has already proven an established Noise
+ * session and a pairing row granting the capability; this lane additionally
+ * proves the peer's delegation is still current, which the primitive's
+ * pairing check cannot say, and only then reads the answer once, here, so
+ * the tick never has to touch a file. */
+static enum mesh_stream_refusal ledger_service_open(struct mesh_stream *st,
+                                                    const uint8_t *payload,
+                                                    size_t len, uint8_t *reply,
+                                                    size_t reply_cap,
+                                                    size_t *reply_len,
+                                                    void *ctx)
+{
+    (void)ctx;
+    (void)reply;
+    (void)reply_cap;
+    if (reply_len)
+        *reply_len = 0;
+    uint64_t since = 0;
+    if (!pull_decode(payload, len, &since))
+        return MESH_STREAM_REFUSED_MALFORMED;
+
+    /* Before ANY file is read: a peer whose delegation is no longer current
+     * may not use this service, which is what REFUSED_PEER_UNPAIRED already
+     * means. Nothing is read and nothing is answered. */
+    if (!ledger_accept_authorized(st->peer_static))
+        return MESH_STREAM_REFUSED_PEER_UNPAIRED;
+
+    ledger_lock();
+    struct zcl_fleet_ledger *ledger = g_ledger;
+    uint8_t self[32];
+    memcpy(self, g_self_box_id, 32);
+    zcl_mutex_unlock(&g_ledger_lock);
+    if (!ledger)
+        return MESH_STREAM_REFUSED_UNAVAILABLE;
+
+    struct fleet_serve_state *s =
+        zcl_calloc(1, sizeof *s, "fleet_ledger_serve");
+    if (!s)
+        return MESH_STREAM_REFUSED_UNAVAILABLE;
+    uint64_t last = 0;
+    if (zcl_fleet_ledger_read_since(ledger, self, since, s->rows,
+                                    sizeof s->rows, &s->len,
+                                    &last) != ZCL_FLEET_OK) {
+        free(s);
+        return MESH_STREAM_REFUSED_UNAVAILABLE;
+    }
+    st->service_state = s;
+    return MESH_STREAM_OK;
+}
+
+/* The initiator receives the answer. Bytes are copied and credit is given
+ * back; nothing is verified and nothing is written here. */
+static void ledger_service_data(struct mesh_stream *st, const uint8_t *payload,
+                                size_t len, void *ctx)
+{
+    (void)ctx;
+    if (!st->local_initiator)
+        return; /* the acceptor is a writer on this stream, never a reader */
+    struct fleet_pull_state *p = st->service_state;
+    if (!p || !payload || len == 0)
+        return;
+    if (p->len + len > sizeof p->rows) {
+        /* More than one answer's worth. The peer is not following the
+         * protocol, so the stream ends rather than the buffer growing. */
+        mesh_stream_close(st, MESH_STREAM_CLOSED_BY_SERVICE, NULL, 0);
+        return;
+    }
+    memcpy(p->rows + p->len, payload, len);
+    p->len += len;
+    (void)mesh_stream_grant(st, (uint32_t)len);
+}
+
+/* The acceptor's drain: one answer, within the credit it holds, then the
+ * stream is done. A pull that had nothing to say closes immediately, which
+ * is what makes a second pull free. */
+static void ledger_service_tick(struct mesh_stream *st, int64_t now, void *ctx)
+{
+    (void)now;
+    (void)ctx;
+    if (st->local_initiator)
+        return;
+    struct fleet_serve_state *s = st->service_state;
+    if (!s) {
+        mesh_stream_close(st, MESH_STREAM_CLOSED_BY_SERVICE, NULL, 0);
+        return;
+    }
+    size_t remaining = s->len - s->sent;
+    if (remaining == 0) {
+        mesh_stream_close(st, MESH_STREAM_CLOSED_BY_SERVICE, NULL, 0);
+        return;
+    }
+    if (st->send_credit < remaining)
+        return; /* wait for the window; never split a batch across frames */
+    if (mesh_stream_send(st, s->rows + s->sent, remaining))
+        s->sent += remaining;
+}
+
+/* The stream ended. The initiator hands its buffer to the tick by moving a
+ * pointer into the inbox — no verification and no I/O under this lock. */
+static void ledger_service_close(struct mesh_stream *st,
+                                 enum mesh_stream_refusal reason,
+                                 const uint8_t *payload, size_t len, void *ctx)
+{
+    (void)payload;
+    (void)len;
+    (void)ctx;
+    if (!st->local_initiator)
+        return;
+    struct fleet_pull_state *p = st->service_state;
+    if (!p || p->len == 0)
+        return;
+    if (reason != MESH_STREAM_CLOSED_BY_SERVICE && reason != MESH_STREAM_OK) {
+        /* An answer that did not finish is not a short answer: the rows
+         * that did arrive may be a prefix of a batch, and a prefix has no
+         * standing. The next pull asks for the same range again. */
+        return;
+    }
+    uint8_t *rows = zcl_malloc(p->len, "fleet_ledger_inbox");
+    if (!rows)
+        return;
+    memcpy(rows, p->rows, p->len);
+
+    ledger_lock();
+    struct fleet_inbox_slot *slot = NULL;
+    for (size_t i = 0; i < FLEET_LEDGER_INBOX_MAX && !slot; i++)
+        if (!g_inbox[i].used)
+            slot = &g_inbox[i];
+    if (slot) {
+        slot->used = true;
+        memcpy(slot->peer_box_id, p->peer_box_id, 32);
+        memcpy(slot->peer_signer, p->peer_signer, 32);
+        slot->len = p->len;
+        slot->rows = rows;
+    }
+    zcl_mutex_unlock(&g_ledger_lock);
+    if (!slot) {
+        /* The inbox is full; the next pull asks for the same range again,
+         * so no row is lost — only delayed. That is still a fact about
+         * this box keeping up, so it is counted and said out loud rather
+         * than dropped in silence. */
+        free(rows);
+        atomic_fetch_add_explicit(&g_inbox_full, 1, memory_order_relaxed);
+        LOG_WARN("fleet.ledger",
+                 "replica batch deferred: inbox full (%u slots)",
+                 (unsigned)FLEET_LEDGER_INBOX_MAX);
+    }
+}
+
+static void ledger_service_release(struct mesh_stream *st, void *ctx)
+{
+    (void)ctx;
+    free(st->service_state);
+    st->service_state = NULL;
+}
+
+bool boot_fleet_ledger_register_service(void)
+{
+    struct mesh_stream_service service;
+    memset(&service, 0, sizeof(service));
+    service.name = FLEET_LEDGER_SERVICE_NAME;
+    /* The same grant a mesh status read needs. A ledger pull asks a paired
+     * machine about itself, which is what that capability already means;
+     * demanding a new bit would leave the service dead on every pairing
+     * this fleet has already committed, and a pairing record is
+     * insert-only, so those bits can never be added afterwards. */
+    service.required_pairing_capability = MESH_PAIRING_CAP_STATUS_READ;
+    service.on_open = ledger_service_open;
+    service.on_data = ledger_service_data;
+    service.on_close = ledger_service_close;
+    service.on_tick = ledger_service_tick;
+    service.on_release = ledger_service_release;
+    return mesh_stream_service_register(&service);
+}
+
+/* ── the pull lane ───────────────────────────────────────────────────── */
+
+/* Commit whatever the streams left behind. Runs on this lane's own tick
+ * with no lock held over the file work, so two fsyncs per row cannot stall
+ * the stream pump every service shares. */
+static void ledger_drain_inbox(struct zcl_fleet_ledger *ledger)
+{
+    for (size_t i = 0; i < FLEET_LEDGER_INBOX_MAX; i++) {
+        ledger_lock();
+        struct fleet_inbox_slot slot = g_inbox[i];
+        if (slot.used) {
+            g_inbox[i].used = false;
+            g_inbox[i].rows = NULL;
+            g_inbox[i].len = 0;
+        }
+        zcl_mutex_unlock(&g_ledger_lock);
+        if (!slot.used)
+            continue;
+        size_t accepted = 0;
+        enum zcl_fleet_status st =
+            zcl_fleet_ledger_replicate(ledger, slot.peer_box_id,
+                                       slot.peer_signer, slot.rows, slot.len,
+                                       &accepted);
+        if (st != ZCL_FLEET_OK) {
+            /* The refusal is named, and NOTHING about the rows is: this is
+             * the owner's private data and a log is not private. */
+            LOG_WARN("fleet.ledger", "replica batch refused: %s",
+                     zcl_fleet_status_label(st));
+            if (st == ZCL_FLEET_ROLE_REFUSED)
+                atomic_fetch_add_explicit(&g_role_refused, 1,
+                                          memory_order_relaxed);
+        }
+        (void)accepted;
+        free(slot.rows);
+    }
+}
+
+/* Is a ledger stream to this peer already live? Two pulls to one peer at
+ * once would ask the same question twice and answer it twice. */
+struct fleet_live_probe {
+    uint8_t peer_static[32];
+    bool found;
+};
+
+static bool ledger_live_visitor(struct mesh_stream *st, void *ctx)
+{
+    struct fleet_live_probe *probe = ctx;
+    if (st->local_initiator && !st->ended &&
+        memcmp(st->peer_static, probe->peer_static, 32) == 0) {
+        probe->found = true;
+        return false;
+    }
+    return true;
+}
+
+/* Compose the one PULL this protocol has and put it on the wire toward a
+ * peer whose identity the caller has already verified. Both the lane and
+ * the loopback test enter here, so a test drives the exact frame and the
+ * exact per-stream state production does. */
+static bool ledger_open_pull(const uint8_t peer_noise[32],
+                             const uint8_t peer_box_id[32],
+                             const uint8_t peer_signer[32], uint64_t since_seq)
+{
+    struct fleet_pull_state *p = zcl_calloc(1, sizeof *p, "fleet_ledger_pull");
+    if (!p)
+        return false;
+    memcpy(p->peer_box_id, peer_box_id, 32);
+    memcpy(p->peer_signer, peer_signer, 32);
+    uint8_t frame[FLEET_LEDGER_PULL_BYTES];
+    size_t frame_len = pull_encode(since_seq, frame);
+    uint64_t stream_id = 0;
+    enum mesh_stream_refusal refusal =
+        mesh_stream_open(FLEET_LEDGER_SERVICE_NAME, peer_noise, 0, frame,
+                         frame_len, p, &stream_id);
+    if (refusal != MESH_STREAM_OK) {
+        /* A peer that is simply not connected is the ordinary case on a
+         * mesh and is not worth a line; anything else is. */
+        if (refusal != MESH_STREAM_REFUSED_PEER_NOT_CONNECTED)
+            LOG_WARN("fleet.ledger", "pull not opened: %s",
+                     mesh_stream_refusal_string(refusal));
+        free(p);
+        return false;
+    }
+    return true;
+}
+
+/* Open one pull toward every paired peer that is due one. The pairing check
+ * is this lane's own: the primitive would refuse an inbound open from an
+ * unpaired peer, but nothing would stop this side dialing one, and a row
+ * must never be asked for over a link that is not a pairing. */
+static void ledger_pull_paired_peers(struct zcl_fleet_ledger *ledger,
+                                     int64_t now)
+{
+    struct node_db *ndb = app_runtime_node_db();
+    if (!ndb || !app_runtime_node_db_handle_open(ndb))
+        return;
+    struct db_mesh_pairing *rows =
+        zcl_calloc(FLEET_LEDGER_PAIRINGS_MAX, sizeof *rows,
+                   "fleet_ledger_pairings");
+    if (!rows)
+        return;
+    int count = db_mesh_pairing_list(ndb, rows, FLEET_LEDGER_PAIRINGS_MAX);
+    for (int i = 0; i < count; i++) {
+        if (!mesh_pairing_allows(&rows[i], MESH_PAIRING_CAP_STATUS_READ, now))
+            continue;
+        /* The peer's own delegation names both halves of its identity. A
+         * peer whose delegation cannot be resolved is not asked: an answer
+         * we could not attribute is an answer we could not accept. */
+        struct vcs_zcode_dht_delegation peer;
+        if (!ledger_peer_delegation(&rows[i], &peer))
+            continue;
+        /* And that delegation must still be CURRENT. The pairing row's own
+         * window says nothing about a master identity revoked or
+         * superseded on chain, so a stale peer is neither asked nor
+         * answered — the same question the accept side asks. */
+        if (!ledger_delegation_current(ndb, &rows[i], &peer,
+                                       rows[i].peer_noise_pubkey, now))
+            continue;
+        struct fleet_live_probe probe;
+        memset(&probe, 0, sizeof probe);
+        memcpy(probe.peer_static, rows[i].peer_noise_pubkey, 32);
+        mesh_stream_visit(FLEET_LEDGER_SERVICE_NAME, ledger_live_visitor,
+                          &probe);
+        if (probe.found)
+            continue;
+
+        (void)ledger_open_pull(
+            rows[i].peer_noise_pubkey, peer.doc.master_pubkey,
+            peer.online_pubkey,
+            zcl_fleet_ledger_peer_seq(ledger, peer.doc.master_pubkey));
+    }
+    free(rows);
+}
+
+static void ledger_tick(struct liveness_contract *contract)
+{
+    (void)contract;
+    ledger_lock();
+    struct zcl_fleet_ledger *ledger = g_ledger;
+    struct boot_svc_ctx *svc = g_ledger_svc;
+    int64_t last = g_last_pull;
+    zcl_mutex_unlock(&g_ledger_lock);
+    if (!ledger || !svc) {
+        supervisor_progress_idle(g_ledger_child);
+        return;
+    }
+    ledger_drain_inbox(ledger);
+
+    int64_t now = (int64_t)platform_time_wall_time_t();
+    if (now <= 0 || (last != 0 && now - last < FLEET_LEDGER_PULL_INTERVAL_S)) {
+        supervisor_progress_idle(g_ledger_child);
+        return;
+    }
+    ledger_lock();
+    g_last_pull = now;
+    zcl_mutex_unlock(&g_ledger_lock);
+    ledger_pull_paired_peers(ledger, now);
+}
+
+uint64_t boot_fleet_ledger_delegation_refused_count(void)
+{
+    return atomic_load_explicit(&g_delegation_refused, memory_order_relaxed);
+}
+
+uint64_t boot_fleet_ledger_inbox_full_count(void)
+{
+    return atomic_load_explicit(&g_inbox_full, memory_order_relaxed);
+}
+
+uint64_t boot_fleet_ledger_role_refused_count(void)
+{
+    return atomic_load_explicit(&g_role_refused, memory_order_relaxed);
+}
+
+/* ── grandfathering ──────────────────────────────────────────────────── */
+
+/* At most one signer per box, plus room for boxes that rotated their online
+ * key while this replica was following them. Reaching this bound is not a
+ * silent prefix: the walk says so, counts it, and the keys it did not reach
+ * keep being refused until an operator grants them by name. */
+#define LEDGER_GRANDFATHER_KEYS 64u
+/* Reads per chain. Bounded so a long chain cannot turn boot into a walk of
+ * history — and, like the bound above, reported when it stops the walk
+ * early rather than quietly shortening it. */
+#define LEDGER_GRANDFATHER_BATCHES 64u
+
+/* Walks that stopped before the end of what they were reading, since this
+ * process started. Reported by `fleet ledger status` as
+ * `grandfather_truncated`: a number above zero means some peer's key was
+ * never looked at, and its rows are being refused for that reason. */
+static _Atomic uint64_t g_grandfather_truncated;
+
+uint64_t boot_fleet_ledger_grandfather_truncated_count(void)
+{
+    return atomic_load_explicit(&g_grandfather_truncated, memory_order_relaxed);
+}
+
+struct ledger_signers {
+    uint8_t keys[LEDGER_GRANDFATHER_KEYS][ZCL_FLEET_ID_BYTES];
+    size_t count;
+};
+
+/* False when `key` did not fit, which is the caller's cue to stop and say
+ * so — never to carry on with a set it knows is short. */
+static bool ledger_signer_add(struct ledger_signers *set,
+                              const uint8_t key[ZCL_FLEET_ID_BYTES])
+{
+    for (size_t i = 0; i < set->count; i++) {
+        if (memcmp(set->keys[i], key, ZCL_FLEET_ID_BYTES) == 0)
+            return true;
+    }
+    if (set->count >= LEDGER_GRANDFATHER_KEYS)
+        return false;
+    memcpy(set->keys[set->count++], key, ZCL_FLEET_ID_BYTES);
+    return true;
+}
+
+/* Every key that signed a row in one peer's chain. The rows were verified
+ * when they were replicated in — this only reads back what was stored.
+ * Returns false when the walk stopped early: the key set filled up, the
+ * batch bound ran out, or a stored row would not decode. Each of those
+ * leaves keys unseen, and unseen keys are refused keys. */
+static bool ledger_signers_of_box(struct zcl_fleet_ledger *ledger,
+                                  const uint8_t box_id[ZCL_FLEET_ID_BYTES],
+                                  uint8_t *buf, size_t cap,
+                                  struct ledger_signers *set)
+{
+    uint64_t since = 0;
+    for (unsigned pass = 0; pass < LEDGER_GRANDFATHER_BATCHES; pass++) {
+        size_t len = 0;
+        uint64_t last = 0;
+        if (zcl_fleet_ledger_read_since(ledger, box_id, since, buf, cap, &len,
+                                        &last) != ZCL_FLEET_OK)
+            return false;
+        if (len == 0)
+            return true; /* the end of this chain, not a bound */
+        size_t offset = 0;
+        while (offset < len) {
+            struct zcl_fleet_row row;
+            size_t used = 0;
+            if (zcl_fleet_row_decode(buf + offset, len - offset, &row,
+                                     &used) != ZCL_FLEET_OK ||
+                used == 0)
+                return false;
+            if (!ledger_signer_add(set, row.signer))
+                return false;
+            offset += used;
+        }
+        if (last <= since)
+            return true;
+        since = last;
+    }
+    return false; /* the batch bound, not the end of the chain */
+}
+
+size_t boot_fleet_ledger_grandfather(struct zcl_fleet_ledger *ledger)
+{
+    struct zcl_fleet_box_status boxes[ZCL_FLEET_BOXES_MAX];
+    struct ledger_signers set;
+    bool whole = true;
+    memset(&set, 0, sizeof set);
+    if (!ledger)
+        return 0;
+    size_t nboxes = zcl_fleet_ledger_boxes(ledger, boxes, ZCL_FLEET_BOXES_MAX);
+    uint8_t *buf = zcl_calloc(1, FLEET_LEDGER_ANSWER_MAX,
+                              "fleet_ledger_grandfather");
+    if (!buf)
+        return 0;
+    for (size_t i = 0; i < nboxes; i++) {
+        if (boxes[i].is_self || boxes[i].rows == 0)
+            continue;
+        if (!ledger_signers_of_box(ledger, boxes[i].box_id, buf,
+                                   FLEET_LEDGER_ANSWER_MAX, &set))
+            whole = false;
+    }
+    free(buf);
+    if (!whole) {
+        (void)atomic_fetch_add_explicit(&g_grandfather_truncated, 1,
+                                        memory_order_relaxed);
+        LOG_WARN("fleet.ledger",
+                 "role bootstrap read only part of the stored chains: %zu "
+                 "signer key(s) collected, bound is %u keys and %u batches "
+                 "per chain. Keys it did not reach hold no role, so their "
+                 "rows are refused until `z23 fleet roles grant` names them",
+                 set.count, (unsigned)LEDGER_GRANDFATHER_KEYS,
+                 (unsigned)LEDGER_GRANDFATHER_BATCHES);
+    }
+    size_t held = 0;
+    for (size_t i = 0; i < set.count; i++) {
+        if (zcl_fleet_role_grandfather(set.keys[i],
+                                       ZCL_FLEET_ROLE_ORIGIN_LEDGER))
+            held++;
+    }
+    return held;
+}
+
+/* ── lifecycle ───────────────────────────────────────────────────────── */
+
+void boot_fleet_ledger_wire(struct boot_svc_ctx *svc)
+{
+    if (!svc || !svc->datadir) {
+        LOG_ERROR("fleet.ledger", "wire: no datadir");
+        return;
+    }
+    ledger_lock();
+    bool already = g_ledger_svc != NULL;
+    zcl_mutex_unlock(&g_ledger_lock);
+    if (already) {
+        LOG_ERROR("fleet.ledger", "wire: already wired");
+        return;
+    }
+
+    /* This node's own identity, from the one place the mesh lanes already
+     * take it: the filed delegation plus its ACTIVE master and online key.
+     * Without it this box has nothing to sign with and no name to write
+     * under, so the lane stays dark rather than inventing one. */
+    struct node_db *ndb = app_runtime_node_db();
+    uint8_t master[32];
+    uint8_t online_pub[32];
+    uint8_t online_seed[32];
+    if (!ndb || !app_runtime_node_db_handle_open(ndb) ||
+        !boot_mesh_local_identity(ndb, svc->datadir, master, online_pub,
+                                  online_seed)) {
+        LOG_WARN("fleet.ledger",
+                 "identity unavailable; the fleet ledger stays closed");
+        return;
+    }
+    memset(online_seed, 0, sizeof online_seed); /* this lane never signs */
+
+    char dir[512];
+    if ((size_t)snprintf(dir, sizeof dir, "%s/fleet_ledger", svc->datadir) >=
+        sizeof dir) {
+        LOG_ERROR("fleet.ledger", "wire: datadir path too long");
+        return;
+    }
+    struct zcl_fleet_report report;
+    struct zcl_fleet_ledger *ledger =
+        zcl_fleet_ledger_open(dir, master, online_pub, &report);
+    if (!ledger) {
+        LOG_ERROR("fleet.ledger", "store refused to open: %s",
+                  zcl_fleet_status_label(report.status));
+        return;
+    }
+
+    ledger_lock();
+    g_ledger_svc = svc;
+    g_ledger = ledger;
+    memcpy(g_self_box_id, master, 32);
+    memcpy(g_self_signer, online_pub, 32);
+    memset(g_inbox, 0, sizeof g_inbox);
+    g_last_pull = 0;
+    zcl_mutex_unlock(&g_ledger_lock);
+
+    /* The role bootstrap, on the evidence this box already holds: every
+     * key that signed a row in a chain this replica is carrying was a
+     * key this box accepted rows from before roles existed, so it keeps
+     * that standing rather than being refused at a gate that came
+     * later. Before the service is registered: no peer is served until
+     * the keys this node already trusted are written down. */
+    size_t held = boot_fleet_ledger_grandfather(ledger);
+    if (held)
+        LOG_INFO("fleet.ledger",
+                 "role bootstrap: %zu key(s) whose rows this node already"
+                 " holds carry the worker role", held);
+
+    if (!boot_fleet_ledger_register_service()) {
+        LOG_ERROR("fleet.ledger", "ledger stream service refused");
+        return;
+    }
+
+    liveness_contract_init(&g_ledger_contract, "fleet.ledger_pull");
+    g_ledger_contract.on_tick = ledger_tick;
+    supervisor_domains_init();
+    g_ledger_child = supervisor_register_in_domain(g_net_sup,
+                                                   &g_ledger_contract);
+    if (g_ledger_child == SUPERVISOR_INVALID_ID) {
+        LOG_ERROR("fleet.ledger", "pull supervisor register failed");
+        return;
+    }
+    supervisor_set_period(g_ledger_child, 1);
+    g_ledger_contract.period_us = 1000000;
+    supervisor_set_deadline(g_ledger_child, 120);
+    supervisor_set_progress_exempt(g_ledger_child,
+                                   "paired peers may have nothing new to say");
+}
+
+void boot_fleet_ledger_shutdown(void)
+{
+    mesh_stream_service_unregister(FLEET_LEDGER_SERVICE_NAME);
+    supervisor_child_id child;
+    ledger_lock();
+    child = g_ledger_child;
+    g_ledger_child = SUPERVISOR_INVALID_ID;
+    struct zcl_fleet_ledger *ledger = g_ledger;
+    g_ledger = NULL;
+    g_ledger_svc = NULL;
+    for (size_t i = 0; i < FLEET_LEDGER_INBOX_MAX; i++) {
+        free(g_inbox[i].rows);
+        g_inbox[i].rows = NULL;
+        g_inbox[i].used = false;
+    }
+    zcl_mutex_unlock(&g_ledger_lock);
+    if (child != SUPERVISOR_INVALID_ID)
+        supervisor_unregister(child);
+    /* Barrier with a callback the supervisor already snapshotted, so the
+     * store is closed only once nothing can still be reading it. */
+    ledger_lock();
+    zcl_mutex_unlock(&g_ledger_lock);
+    zcl_fleet_ledger_close(ledger);
+}
+
+#ifdef ZCL_TESTING
+void boot_fleet_ledger_test_bind(struct zcl_fleet_ledger *ledger,
+                                 const uint8_t box_id[32],
+                                 const uint8_t signer[32])
+{
+    ledger_lock();
+    g_ledger = ledger;
+    if (ledger && box_id && signer) {
+        memcpy(g_self_box_id, box_id, 32);
+        memcpy(g_self_signer, signer, 32);
+    } else {
+        memset(g_self_box_id, 0, 32);
+        memset(g_self_signer, 0, 32);
+    }
+    for (size_t i = 0; i < FLEET_LEDGER_INBOX_MAX; i++) {
+        free(g_inbox[i].rows);
+        g_inbox[i].rows = NULL;
+        g_inbox[i].used = false;
+        g_inbox[i].len = 0;
+    }
+    g_last_pull = 0;
+    zcl_mutex_unlock(&g_ledger_lock);
+}
+
+bool boot_fleet_ledger_test_pull(const uint8_t peer_noise[32],
+                                 const uint8_t peer_box_id[32],
+                                 const uint8_t peer_signer[32],
+                                 uint64_t since_seq)
+{
+    return ledger_open_pull(peer_noise, peer_box_id, peer_signer, since_seq);
+}
+
+void boot_fleet_ledger_test_bind_authority(
+    const struct vcs_zcode_dht_delegation *peer_delegation,
+    const uint8_t network_genesis[32], int64_t now)
+{
+    ledger_lock();
+    if (peer_delegation && network_genesis && now > 0) {
+        g_test_delegation = *peer_delegation;
+        memcpy(g_test_genesis, network_genesis, 32);
+        g_test_now = now;
+        g_test_authority = true;
+    } else {
+        memset(&g_test_delegation, 0, sizeof g_test_delegation);
+        memset(g_test_genesis, 0, sizeof g_test_genesis);
+        g_test_now = 0;
+        g_test_authority = false;
+    }
+    zcl_mutex_unlock(&g_ledger_lock);
+}
+
+void boot_fleet_ledger_test_pull_paired(struct zcl_fleet_ledger *ledger,
+                                        int64_t now)
+{
+    if (ledger && now > 0)
+        ledger_pull_paired_peers(ledger, now);
+}
+
+/* The acceptor's drain, run once, from inside the lane lock — which is
+ * exactly where and how the shared stream pump runs it. */
+static bool ledger_serve_visitor(struct mesh_stream *st, void *ctx)
+{
+    (void)ctx;
+    if (!st->local_initiator && !st->ended)
+        ledger_service_tick(st, (int64_t)platform_time_wall_time_t(), NULL);
+    return true;
+}
+
+void boot_fleet_ledger_test_serve(void)
+{
+    mesh_stream_visit(FLEET_LEDGER_SERVICE_NAME, ledger_serve_visitor, NULL);
+}
+
+void boot_fleet_ledger_test_drain_into(struct zcl_fleet_ledger *ledger)
+{
+    if (ledger)
+        ledger_drain_inbox(ledger);
+}
+#endif

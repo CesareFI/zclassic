@@ -1,0 +1,2382 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * Content-addressed storage of zcl.action_preimage.v2 objects, the per-unit
+ * "what changed since last time" cause, and the hotload compile hook that
+ * reports an action_root in every hot-swap build receipt, and the same
+ * derivation (never stored) that the hot-swap artifact cache key binds.
+ * Nothing here changes what the build runs.
+ */
+
+#if !defined(_WIN32)
+#define _GNU_SOURCE
+#endif
+
+#include "devloop_action_root.h"
+
+#include "devloop.h"
+
+#include "base/hex.h"
+#include "base/safe_alloc.h"
+#include "hotswap/hotfork_capsule.h"
+#include "hotswap/hotswap.h"
+#include "hotswap/hotswap_module.h"
+#include "hotswap/hotswap_service.h"
+#include "json/json.h"
+#include "platform/directory_compat.h"
+#include "platform/path_compat.h"
+#include "platform/os_proc.h"
+#include "platform/time_compat.h"
+#include "sha3/sha3.h"
+#include "util/spawn.h"
+
+#include <ctype.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if defined(__linux__) && ATOMIC_INT_LOCK_FREE == 2
+#define ARS_HARNESS_CACHE 1
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+#define ARS_ARG_MAX 512
+#define ARS_SYSTEM_DIR_MAX 32
+#define ARS_BACKEND_MAX 8
+#define ARS_PREFIX_MAX 16
+#define ARS_HASH_OUT_MAX 65536
+
+static void ars_why(char *why, size_t len, const char *what, const char *arg)
+{
+    if (why && len && !why[0])
+        (void)snprintf(why, len, "%s%s%.150s", what, arg ? ": " : "",
+                       arg ? arg : "");
+}
+
+/* ---- content store ----------------------------------------------------- */
+
+static bool ars_mkdirs(char *path)
+{
+    for (char *p = path + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        bool ok = platform_directory_ensure(path, 0700);
+        *p = '/';
+        if (!ok)
+            return false;
+    }
+    return platform_directory_ensure(path, 0700);
+}
+
+bool zcl_action_root_store_dir(char *out, size_t cap)
+{
+    const char *configured = getenv("ZCL_DEV_ARTIFACT_CACHE");
+#if defined(_WIN32)
+    const char *home = getenv("USERPROFILE");
+#else
+    const char *home = getenv("HOME");
+#endif
+    int n = -1;
+    if (configured && configured[0]) {
+        if (platform_path_is_absolute(configured) && !strstr(configured, ".."))
+            n = snprintf(out, cap, "%s/%s", configured,
+                         ZCL_ACTION_ROOT_STORE_LANE);
+    } else if (home && platform_path_is_absolute(home)) {
+        n = snprintf(out, cap, "%s/.cache/zclassic23/dev-artifacts/%s", home,
+                     ZCL_ACTION_ROOT_STORE_LANE);
+    }
+    return n > 0 && (size_t)n < cap && ars_mkdirs(out);
+}
+
+/* Write-then-rename so a reader never sees a partial object. */
+static bool ars_write_atomic(const char *path, const void *data, size_t len)
+{
+    char temp[PATH_MAX];
+    if (snprintf(temp, sizeof(temp), "%s.tmp-XXXXXX", path) >=
+        (int)sizeof(temp))
+        return false;
+    int fd = mkstemp(temp);
+    if (fd < 0)
+        return false;
+    const uint8_t *p = data;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t w = write(fd, p + done, len - done);
+        if (w <= 0)
+            break;
+        done += (size_t)w;
+    }
+    bool ok = close(fd) == 0 && done == len && rename(temp, path) == 0;
+    if (!ok)
+        (void)unlink(temp);
+    return ok;
+}
+
+static uint8_t *ars_read(const char *path, size_t max, size_t *len)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat st;
+    if (fd < 0)
+        return NULL;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (uint64_t)st.st_size > max) {
+        close(fd);
+        return NULL;
+    }
+    size_t want = (size_t)st.st_size, done = 0;
+    uint8_t *buf = zcl_malloc(want, "action root stored object");
+    while (buf && done < want) {
+        ssize_t r = read(fd, buf + done, want - done);
+        if (r <= 0)
+            break;
+        done += (size_t)r;
+    }
+    close(fd);
+    if (!buf || done != want) {
+        free(buf);
+        return NULL;
+    }
+    *len = want;
+    return buf;
+}
+
+static bool ars_hex64(const char *hex)
+{
+    uint8_t raw[32];
+    return hex && strlen(hex) == 64 && zcl_hex_decode_lower(hex, raw, 32);
+}
+
+static bool ars_object_path(const char *store_dir, const char *root_hex,
+                            char out[PATH_MAX])
+{
+    return ars_hex64(root_hex) &&
+           snprintf(out, PATH_MAX, "%s/%s.preimage", store_dir, root_hex) <
+               PATH_MAX;
+}
+
+bool zcl_action_root_load(const char *store_dir, const char *root_hex,
+                          uint8_t **bytes, size_t *len,
+                          char *why, size_t why_len)
+{
+    char path[PATH_MAX];
+    uint8_t root[32];
+    char derived[65];
+    *bytes = NULL;
+    *len = 0;
+    if (!store_dir || !ars_object_path(store_dir, root_hex, path)) {
+        ars_why(why, why_len, "stored preimage name is invalid", root_hex);
+        return false;
+    }
+    uint8_t *data = ars_read(path, VCS_ACTION_PREIMAGE_V2_MAX_BYTES, len);
+    if (!data || !vcs_action_root_v2_from_bytes(data, *len, root, why,
+                                                why_len)) {
+        free(data);
+        ars_why(why, why_len, "stored preimage is unreadable or invalid",
+                root_hex);
+        return false;
+    }
+    zcl_hex_encode(root, 32, derived);
+    if (strcmp(derived, root_hex) != 0) {
+        free(data);
+        ars_why(why, why_len, "stored preimage does not re-derive its name",
+                root_hex);
+        return false;
+    }
+    *bytes = data;
+    return true;
+}
+
+/* Map a repo-relative unit path to one safe file-name component. */
+static bool ars_safe_name(const char *unit, char safe[256])
+{
+    size_t n = unit ? strlen(unit) : 0;
+    if (n == 0 || n >= 256)
+        return false;
+    for (size_t i = 0; i <= n; i++) {
+        unsigned char c = (unsigned char)unit[i];
+        bool keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '-' || !c;
+        safe[i] = keep ? (char)c : '_';
+    }
+    return true;
+}
+
+/* Safe single-component file name for one unit (repo-relative path). */
+static bool ars_unit_file(const char *store_dir, const char *unit,
+                          char out[PATH_MAX])
+{
+    char safe[256], dir[PATH_MAX];
+    return ars_safe_name(unit, safe) &&
+           snprintf(dir, sizeof(dir), "%s/last", store_dir) <
+               (int)sizeof(dir) && ars_mkdirs(dir) &&
+           snprintf(out, PATH_MAX, "%s/%s.root", dir, safe) < PATH_MAX;
+}
+
+static void ars_cause(const char *store_dir, const char *previous,
+                      const struct zcl_action_root_result *result,
+                      char *cause, size_t cause_len)
+{
+    uint8_t *old = NULL;
+    size_t old_len = 0;
+    enum vcs_action_field_v2 field = VCS_ACTION_FIELD_V2_NONE;
+    const char *text = "previous_unreadable";
+    if (!previous[0])
+        text = "first";
+    else if (strcmp(previous, result->root_hex) == 0)
+        text = "hit";
+    else if (zcl_action_root_load(store_dir, previous, &old, &old_len, NULL,
+                                  0) &&
+             vcs_action_preimage_v2_first_diff(old, old_len,
+                                               result->preimage,
+                                               result->preimage_len, &field) &&
+             vcs_action_field_v2_name(field))
+        text = vcs_action_field_v2_name(field);
+    free(old);
+    (void)snprintf(cause, cause_len, "%s", text);
+}
+
+bool zcl_action_root_record(const char *store_dir, const char *unit,
+                            const struct zcl_action_root_result *result,
+                            char *cause, size_t cause_len,
+                            char *why, size_t why_len)
+{
+    char object[PATH_MAX], last[PATH_MAX], previous[65] = {0};
+    struct stat st;
+    if (!store_dir || !result || !result->preimage || !cause ||
+        !ars_object_path(store_dir, result->root_hex, object) ||
+        !ars_unit_file(store_dir, unit, last)) {
+        ars_why(why, why_len, "action root store path unavailable", unit);
+        return false;
+    }
+    if (stat(object, &st) != 0 &&
+        !ars_write_atomic(object, result->preimage, result->preimage_len)) {
+        ars_why(why, why_len, "could not store action preimage", object);
+        return false;
+    }
+    size_t prev_len = 0;
+    uint8_t *prev = ars_read(last, 65, &prev_len);
+    if (prev && prev_len == 65 && prev[64] == '\n') {
+        memcpy(previous, prev, 64);
+        if (!ars_hex64(previous))
+            previous[0] = '\0';
+    }
+    free(prev);
+    ars_cause(store_dir, previous, result, cause, cause_len);
+    char line[66];
+    (void)snprintf(line, sizeof(line), "%s\n", result->root_hex);
+    if (!ars_write_atomic(last, line, 65)) {
+        ars_why(why, why_len, "could not record latest action root", last);
+        return false;
+    }
+    return true;
+}
+
+/* ---- hotload compile hook ---------------------------------------------- */
+
+/* What the compiler driver reports about itself, asked once per driver:
+ * its built-in #include <...> list, its sysroot, and the ld / collect2 it
+ * runs for a link. */
+#define ARS_TARGETS_MAX 1024
+#define ARS_FLAGS_MAX 16384
+
+/* Libraries a -shared link pulls in without naming them; their bytes are
+ * bound beside the capsule's crt/libgcc/libc.so.6. */
+static const char *const k_ars_implicit[] = {
+    "libc.so", "libc.so.6", "libc_nonshared.a", "libgcc.a", "libgcc_s.so",
+    "libgcc_s.so.1",
+};
+#define ARS_IMPLICIT_N (sizeof(k_ars_implicit) / sizeof(k_ars_implicit[0]))
+
+struct ars_driver {
+    char driver[512];
+    char targets[ARS_TARGETS_MAX]; /* the plan's target flags, asked with */
+    /* The plan's full compile flags and checkout root: -### is asked with
+     * every flag, and each command line it prints is bound canonically
+     * (lines_sha3): an inner driver behind a wrapper, a specs file or a
+     * -march=native expansion changes a line even when no program does. */
+    char flags[ARS_FLAGS_MAX];
+    char root[PATH_MAX];
+    uint8_t lines_sha3[32];
+    uint8_t bytes[32]; /* ars_driver_bytes of `driver` when captured */
+    char dirs[ARS_SYSTEM_DIR_MAX][PATH_MAX];
+    size_t count;
+    /* Built-in dirs the driver skipped as nonexistent: one appearing moves
+     * the search list, so it forces a re-capture. */
+    char absent[ARS_SYSTEM_DIR_MAX][PATH_MAX];
+    size_t absent_n;
+    char implicit[ARS_IMPLICIT_N][PATH_MAX]; /* "" when not found */
+    char sysroot[PATH_MAX];
+    char cc1_sysroot[PATH_MAX]; /* exact -### fallback when -print-sysroot is absent */
+    char ld_word[PATH_MAX]; /* `-print-prog-name=ld` exactly as answered */
+    char ld[PATH_MAX];      /* ld_word resolved as the driver would run it */
+    char collect2[PATH_MAX];
+    /* What a compile runs (`-###`): each program as the driver names it,
+     * absolute or bare (run from PATH), and the driver's own program
+     * prefixes (COMPILER_PATH). */
+    char backend[ARS_BACKEND_MAX][PATH_MAX];
+    size_t backend_n;
+    char prefixes[ARS_PREFIX_MAX][PATH_MAX];
+    size_t prefix_n;
+    /* Which same-name executables the prefixes held at capture: one
+     * appearing or going forces a re-capture. */
+    uint8_t shadow[32];
+    /* The child environment the driver was asked under. */
+    uint8_t env_sha3[32];
+    /* Set only while capturing: every driver query runs under it. */
+    const struct zcl_action_root_child_env *ask_env;
+    bool valid;
+};
+
+/* One driver-facts question: the plan's driver command, its target flags
+ * (asked with -E -v and -print-*), its full compile flags (asked with
+ * -###), the checkout root lines are canonical against, and the child
+ * environment every query runs under. */
+struct ars_ask {
+    const char *cc, *targets, *flags, *root;
+    const struct zcl_action_root_child_env *env;
+};
+
+static pthread_mutex_t g_driver_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct ars_driver g_driver;
+
+/* Admit one built-in search entry of `n` bytes at `p`, or name why not:
+ * an entry that will not fit a path buffer or the caller's array is an
+ * overflow, one the lexer would rewrite is noncanonical. Either refuses
+ * the whole list rather than drop or approximate one entry, since a root
+ * derived from a partial or rewritten search list is not the real one. */
+static const char *ars_builtin_entry(const char *p, size_t n,
+                                     char dirs[][PATH_MAX], size_t dirs_cap,
+                                     size_t *count)
+{
+    char dir[PATH_MAX];
+    if (n >= PATH_MAX || *count >= dirs_cap)
+        return "builtin_dir_overflow";
+    (void)snprintf(dir, sizeof(dir), "%.*s", (int)n, p);
+    if (!zcl_action_root_builtin_dir_canonical(dir))
+        return "builtin_dir_noncanonical";
+    memcpy(dirs[(*count)++], dir, n + 1);
+    return NULL;
+}
+
+/* Step `*cursor` (a newline inside the search list) to the next non-empty
+ * entry before `end`: its first byte and its length without leading spaces
+ * or a " (framework directory)" suffix. False once the list is exhausted. */
+static bool ars_builtin_next(const char **cursor, const char *end,
+                             const char **line, size_t *len)
+{
+    const char *p = *cursor;
+    while (p && p < end) {
+        p++;
+        while (*p == ' ')
+            p++;
+        size_t n = strcspn(p, "\r\n");
+        const char *framework = strstr(p, " (framework directory)");
+        if (framework && (size_t)(framework - p) < n)
+            n = (size_t)(framework - p);
+        const char *at = p;
+        p = strchr(p, '\n');
+        if (at < end && n > 0) {
+            *cursor = p;
+            *line = at;
+            *len = n;
+            return true;
+        }
+    }
+    *cursor = p;
+    return false;
+}
+
+bool zcl_action_root_parse_builtin_dirs(const char *out,
+                                        char dirs[][PATH_MAX],
+                                        size_t dirs_cap, size_t *count_out,
+                                        char *miss)
+{
+    size_t count = 0;
+    const char *refused = NULL;
+    if (miss)
+        miss[0] = '\0';
+    if (count_out)
+        *count_out = 0;
+    const char *p = strstr(out, "#include <...> search starts here:");
+    const char *end = strstr(out, "End of search list.");
+    if (!p || !end || end < p)
+        return false;
+    p = strchr(p, '\n');
+    const char *line = NULL;
+    size_t n = 0;
+    while (!refused && ars_builtin_next(&p, end, &line, &n))
+        refused = ars_builtin_entry(line, n, dirs, dirs_cap, &count);
+    if (refused) {
+        if (miss)
+            (void)snprintf(miss, 40, "%s", refused);
+        return false;
+    }
+    if (count_out)
+        *count_out = count;
+    return count > 0;
+}
+
+static void ars_absent_parse(const char *out, const char *end,
+                             struct ars_driver *sd)
+{
+    static const char mark[] = "ignoring nonexistent directory \"";
+    sd->absent_n = 0;
+    for (const char *p = strstr(out, mark);
+         p && p < end && sd->absent_n < ARS_SYSTEM_DIR_MAX;
+         p = strstr(p, mark)) {
+        p += sizeof(mark) - 1;
+        size_t n = strcspn(p, "\"\r\n");
+        if (p[n] == '"' && n > 0 && n < PATH_MAX && p[0] == '/')
+            (void)snprintf(sd->absent[sd->absent_n++], PATH_MAX, "%.*s",
+                           (int)n, p);
+    }
+}
+
+/* The nonexistent dirs the driver skipped, then the surviving search list
+ * through the testable, refusing parser above. */
+static bool ars_system_parse(const char *out, struct ars_driver *sd,
+                             char miss[40])
+{
+    ars_absent_parse(out, out + strlen(out), sd);
+    return zcl_action_root_parse_builtin_dirs(out, sd->dirs,
+                                              ARS_SYSTEM_DIR_MAX, &sd->count,
+                                              miss);
+}
+
+/* ---- the programs the driver runs --------------------------------------- */
+
+/* The first word of one `-###` command line (quotes stripped). A word with
+ * a backslash or an unterminated quote has no plain spelling: refused. */
+static bool ars_prog_word(const char *p, char out[PATH_MAX])
+{
+    size_t n;
+    if (*p == '"') {
+        p++;
+        n = strcspn(p, "\"\r\n");
+        if (p[n] != '"')
+            return false;
+    } else {
+        n = strcspn(p, " \t\r\n");
+    }
+    if (n == 0 || n >= PATH_MAX || memchr(p, '\\', n))
+        return false;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
+}
+
+/* Append `word` unless already listed; false when the list is full. */
+static bool ars_list_add(char list[][PATH_MAX], size_t cap, size_t *n,
+                         const char *word)
+{
+    for (size_t i = 0; i < *n; i++)
+        if (strcmp(list[i], word) == 0)
+            return true;
+    if (*n >= cap)
+        return false;
+    (void)snprintf(list[(*n)++], PATH_MAX, "%s", word);
+    return true;
+}
+
+/* COMPILER_PATH=dir:dir:... (every dir absolute). */
+static bool ars_prefix_line(const char *p, char prefixes[][PATH_MAX],
+                            size_t cap, size_t *n)
+{
+    size_t end = strcspn(p, "\r\n");
+    for (size_t i = 0; i < end;) {
+        size_t len = strcspn(p + i, ":\r\n");
+        if (len > end - i)
+            len = end - i;
+        char dir[PATH_MAX];
+        if (len > 0) {
+            if (len >= PATH_MAX || p[i] != '/')
+                return false;
+            memcpy(dir, p + i, len);
+            dir[len] = '\0';
+            if (!ars_list_add(prefixes, cap, n, dir))
+                return false;
+        }
+        i += len + 1;
+    }
+    return true;
+}
+
+/* One output line: a command line names a program, COMPILER_PATH= names
+ * the program prefixes, anything else is informational. */
+static bool ars_program_line(const char *line, char progs[][PATH_MAX],
+                             size_t progs_cap, size_t *progs_n,
+                             char prefixes[][PATH_MAX], size_t prefixes_cap,
+                             size_t *prefixes_n)
+{
+    static const char path_mark[] = "COMPILER_PATH=";
+    if (strncmp(line, path_mark, sizeof(path_mark) - 1) == 0)
+        return ars_prefix_line(line + sizeof(path_mark) - 1, prefixes,
+                               prefixes_cap, prefixes_n);
+    if (line[0] != ' ')
+        return true;
+    const char *p = line + strspn(line, " ");
+    if (strchr("\r\n", *p) || strncmp(p, "(in-process)", 12) == 0)
+        return true;
+    char word[PATH_MAX];
+    return ars_prog_word(p, word) &&
+           ars_list_add(progs, progs_cap, progs_n, word);
+}
+
+bool zcl_action_root_parse_driver_programs(const char *out,
+                                           char progs[][PATH_MAX],
+                                           size_t progs_cap, size_t *progs_n,
+                                           char prefixes[][PATH_MAX],
+                                           size_t prefixes_cap,
+                                           size_t *prefixes_n)
+{
+    size_t np = 0, nx = 0;
+    bool ok = out != NULL;
+    for (const char *line = out; ok && line && *line;) {
+        ok = ars_program_line(line, progs, progs_cap, &np, prefixes,
+                              prefixes_cap, &nx);
+        line = strchr(line, '\n');
+        if (line)
+            line++;
+    }
+    ok = ok && np > 0;
+    if (progs_n)
+        *progs_n = ok ? np : 0;
+    if (prefixes_n)
+        *prefixes_n = ok ? nx : 0;
+    return ok;
+}
+
+static bool ars_cc1_space(char ch)
+{
+    return ch == ' ' || ch == '\t' || ch == '\r';
+}
+
+static bool ars_cc1_text(const char *line, const char *end)
+{
+    for (const char *p = line; end - p >= 4; p++)
+        if (memcmp(p, "-cc1", 4) == 0)
+            return true;
+    return false;
+}
+
+static bool ars_cc1_copy_word(const char *start, size_t n,
+                             char word[PATH_MAX])
+{
+    if (!n || n >= PATH_MAX || memchr(start, '\\', n))
+        return false;
+    memcpy(word, start, n);
+    word[n] = '\0';
+    return true;
+}
+
+/* 0 means end of line, 1 a canonical word, -1 a malformed word. */
+static int ars_cc1_next_word(const char **cursor, const char *end,
+                            char word[PATH_MAX])
+{
+    const char *p = *cursor;
+    while (p < end && ars_cc1_space(*p))
+        p++;
+    if (p == end)
+        return 0;
+    bool quoted = *p == '"';
+    p += quoted;
+    const char *start = p;
+    if (quoted) {
+        while (p < end && *p != '"' && *p != '\r')
+            p++;
+        if (p == end || *p != '"')
+            return -1;
+    } else {
+        while (p < end && !ars_cc1_space(*p))
+            p++;
+    }
+    size_t n = (size_t)(p - start);
+    if (!ars_cc1_copy_word(start, n, word))
+        return -1;
+    p += quoted;
+    if (p < end && !ars_cc1_space(*p))
+        return -1;
+    *cursor = p;
+    return 1;
+}
+
+static bool ars_cc1_line_sysroot(const char *line, const char *end,
+                                char path[PATH_MAX], bool *cc1)
+{
+    const char *p = line;
+    bool pending = false, found = false;
+    *cc1 = false;
+    path[0] = '\0';
+    char word[PATH_MAX];
+    int step;
+    while ((step = ars_cc1_next_word(&p, end, word)) > 0) {
+        if (pending) {
+            if (found || word[0] != '/')
+                return false;
+            (void)snprintf(path, PATH_MAX, "%s", word);
+            pending = false;
+            found = true;
+        } else if (strcmp(word, "-isysroot") == 0) {
+            if (found)
+                return false;
+            pending = true;
+        } else if (strcmp(word, "-cc1") == 0) {
+            *cc1 = true;
+        }
+    }
+    return step == 0 && !pending && (!*cc1 || found);
+}
+
+/* Parse only driver command lines. Every cc1 must name exactly one SDK. */
+bool zcl_action_root_parse_cc1_sysroot(const char *out,
+                                      char sysroot[PATH_MAX])
+{
+    if (!out || !sysroot)
+        return false;
+    sysroot[0] = '\0';
+    size_t cc1_count = 0;
+    for (const char *line = out; line && *line;) {
+        const char *end = strchr(line, '\n');
+        if (!end)
+            end = line + strlen(line);
+        if (line[0] == ' ' && ars_cc1_text(line, end)) {
+            bool cc1;
+            char path[PATH_MAX];
+            if (!ars_cc1_line_sysroot(line, end, path, &cc1))
+                return false;
+            if (!cc1)
+                return false;
+            if (cc1) {
+                if (++cc1_count != 1)
+                    return false;
+                (void)snprintf(sysroot, PATH_MAX, "%s", path);
+            }
+        }
+        line = *end ? end + 1 : NULL;
+    }
+    return cc1_count == 1;
+}
+
+/* gcc's temporary: cc + 6 alphanumerics, then the suffix. */
+static bool ars_gcc_temp_stem(const char *base, size_t stem)
+{
+    if (stem != 8 || strncmp(base, "cc", 2) != 0)
+        return false;
+    for (size_t i = 2; i < 8; i++)
+        if (!isalnum((unsigned char)base[i]))
+            return false;
+    return true;
+}
+
+/* Clang's temporary: <stem>-<6 or more lowercase hex>, then the suffix. */
+static bool ars_clang_temp_stem(const char *base, const char *dot)
+{
+    const char *dash = NULL;
+    for (const char *p = base; p < dot; p++)
+        if (*p == '-')
+            dash = p;
+    if (!dash || dash == base || dot - dash - 1 < 6)
+        return false;
+    for (const char *p = dash + 1; p < dot; p++)
+        if (!isxdigit((unsigned char)*p) || isupper((unsigned char)*p))
+            return false;
+    return true;
+}
+
+/* A driver temporary's basename: gcc's or Clang's pattern plus a suffix. */
+static bool ars_driver_temp_name(const char *base)
+{
+    const char *dot = strrchr(base, '.');
+    if (!dot || !dot[1] || dot == base)
+        return false;
+    return ars_gcc_temp_stem(base, (size_t)(dot - base)) ||
+           ars_clang_temp_stem(base, dot);
+}
+
+/* `dir` (the `n` bytes before a basename) is where a driver may put its
+ * temporaries: the child's TMPDIR, or the fallbacks gcc and Clang use when
+ * TMPDIR names no directory. */
+static bool ars_temp_dir(const char *dir, size_t n, const char *tmp)
+{
+    const char *const dirs[] = { tmp, "/tmp", "/var/tmp" };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+        if (dirs[i][0] && strlen(dirs[i]) == n &&
+            memcmp(dir, dirs[i], n) == 0)
+            return true;
+    return false;
+}
+
+bool zcl_action_root_canon_driver_word(const char *word, const char *root,
+                                       const char *tmp, char *out,
+                                       size_t cap)
+{
+    size_t rn = strlen(root);
+    const char *base = strrchr(word, '/');
+    if (base && ars_temp_dir(word, (size_t)(base - word), tmp) &&
+        ars_driver_temp_name(base + 1))
+        return snprintf(out, cap, "@tmp%s", strrchr(base, '.')) < (int)cap;
+    size_t o = 0;
+    for (const char *p = word; *p;) {
+        bool at_root = rn && strncmp(p, root, rn) == 0;
+        const char *piece = at_root ? "@root" : p;
+        size_t n = at_root ? 5 : 1;
+        if (o + n >= cap)
+            return false;
+        memcpy(out + o, piece, n);
+        o += n;
+        p += at_root ? rn : 1;
+    }
+    out[o] = '\0';
+    return true;
+}
+
+#if !defined(_WIN32)
+/* A driver that prints a bare program name runs it from PATH; resolve it
+ * the same way. The answer is recorded by content, so PATH itself never
+ * enters the preimage. */
+static bool ars_resolve_program(char path[PATH_MAX])
+{
+    if (strchr(path, '/'))
+        return path[0] == '/' && access(path, X_OK) == 0;
+    const char *env = getenv("PATH");
+    char name[256];
+    if (!env || !path[0] || snprintf(name, sizeof(name), "%s", path) >=
+                                (int)sizeof(name))
+        return false;
+    for (const char *p = env; *p;) {
+        size_t n = strcspn(p, ":");
+        char candidate[PATH_MAX];
+        struct stat st;
+        if (n > 0 && p[0] == '/' &&
+            snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)n, p,
+                     name) < (int)sizeof(candidate) &&
+            stat(candidate, &st) == 0 && S_ISREG(st.st_mode) &&
+            access(candidate, X_OK) == 0) {
+            (void)snprintf(path, PATH_MAX, "%s", candidate);
+            return true;
+        }
+        p += n + (p[n] == ':');
+    }
+    return false;
+}
+
+/* `env -i <child environment...>`: every driver query runs under exactly
+ * the environment the compile child gets, never the parent's. */
+static size_t ars_ask_env_argv(const struct ars_driver *d, const char **argv,
+                               char env_path[PATH_MAX])
+{
+    const struct zcl_action_root_child_env *env = d->ask_env;
+    (void)snprintf(env_path, PATH_MAX, "env");
+    if (!env || !ars_resolve_program(env_path)) {
+        fprintf(stderr, "[action-root] driver query has no child "
+                        "environment or no env program\n");
+        return 0;
+    }
+    size_t argc = 0;
+    argv[argc++] = env_path;
+    argv[argc++] = "-i";
+    for (size_t i = 0; i < env->n; i++)
+        argv[argc++] = env->v[i];
+    return argc;
+}
+
+/* Run `cc <flags...> <args...>` under the child environment and capture
+ * merged output. Flags that would not all fit the argv, and output that
+ * fills the buffer, are refused, never used truncated. */
+static bool ars_driver_ask_with(const struct ars_driver *d, const char *flags,
+                                const char *const *args, char *capture,
+                                size_t cap)
+{
+    char text[512], env_path[PATH_MAX];
+    char *words = zcl_malloc(ARS_FLAGS_MAX, "driver query flags");
+    const char *argv[ARS_ARG_MAX];
+    (void)snprintf(text, sizeof(text), "%s", d->driver);
+    size_t base = words ? ars_ask_env_argv(d, argv, env_path) : 0;
+    size_t driver_n = base ? zcl_argv_split(text, argv + base,
+                                            ARS_ARG_MAX / 4) : 0;
+    size_t argc = base + driver_n, room = ARS_ARG_MAX - argc - 16;
+    bool fits = driver_n > 0 && snprintf(words, ARS_FLAGS_MAX, "%s", flags) <
+                                    ARS_FLAGS_MAX;
+    size_t flag_n = fits ? zcl_argv_split(words, argv + argc, room) : 0;
+    fits = fits && flag_n + 1 < room;
+    argc += flag_n;
+    for (size_t i = 0; fits && args[i] && argc < ARS_ARG_MAX - 1; i++)
+        argv[argc++] = args[i];
+    argv[argc] = NULL;
+    bool timed_out = false;
+    capture[0] = '\0';
+    bool ok = fits &&
+              zcl_spawn_capture_merged_observed(argv, capture, cap, 10000,
+                                                &timed_out) == 0 &&
+              !timed_out && strlen(capture) + 1 < cap;
+    if (!ok)
+        fprintf(stderr, "[action-root] driver query failed or overflowed: "
+                        "%.200s %s\n", d->driver, args[0] ? args[0] : "");
+    free(words);
+    return ok;
+}
+
+/* The same with the plan's target flags only. */
+static bool ars_driver_ask(const struct ars_driver *d, const char *const *args,
+                           char *capture, size_t cap)
+{
+    return ars_driver_ask_with(d, d->targets, args, capture, cap);
+}
+
+/* First output line of `cc <arg>`, trimmed; "" when the line is empty. */
+static bool ars_driver_line(const struct ars_driver *d, const char *arg,
+                            char out[PATH_MAX])
+{
+    char capture[PATH_MAX];
+    const char *args[] = { arg, NULL };
+    if (!ars_driver_ask(d, args, capture, sizeof(capture)))
+        return false;
+    size_t n = strcspn(capture, "\r\n");
+    while (n > 0 && capture[n - 1] == ' ')
+        n--;
+    return snprintf(out, PATH_MAX, "%.*s", (int)n, capture) < PATH_MAX;
+}
+
+/* Ask under the compile's actual flags. Apple Clang has no -print-sysroot;
+ * its already-bound -### cc1 line supplies the effective SDK instead. */
+static bool ars_sysroot_capture(struct ars_driver *d, char miss[40])
+{
+    if (d->cc1_sysroot[0]) {
+        (void)snprintf(d->sysroot, sizeof(d->sysroot), "%s",
+                       d->cc1_sysroot);
+        return true;
+    }
+    const char *args[] = { "-print-sysroot", NULL };
+    char capture[PATH_MAX];
+    if (ars_driver_ask_with(d, d->flags, args, capture, sizeof(capture))) {
+        size_t n = strcspn(capture, "\r\n");
+        while (n > 0 && capture[n - 1] == ' ')
+            n--;
+        if ((n == 0 || capture[0] == '/') &&
+            snprintf(d->sysroot, sizeof(d->sysroot), "%.*s", (int)n,
+                     capture) < (int)sizeof(d->sysroot))
+            return true;
+    }
+    if (miss)
+        (void)snprintf(miss, 40, "driver_sysroot_unavailable");
+    return false;
+}
+
+/* `cc -print-file-name=X` echoes X back when it finds nothing. */
+static bool ars_implicit_capture(struct ars_driver *d)
+{
+    for (size_t i = 0; i < ARS_IMPLICIT_N; i++) {
+        char arg[64];
+        (void)snprintf(arg, sizeof(arg), "-print-file-name=%s",
+                       k_ars_implicit[i]);
+        if (!ars_driver_line(d, arg, d->implicit[i]))
+            return false;
+        if (d->implicit[i][0] != '/')
+            d->implicit[i][0] = '\0';
+    }
+    return true;
+}
+
+static const char *ars_basename(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+/* The executable `name` would be in prefix dir `dir`, if one is there. */
+static bool ars_prefix_program(const char *dir, const char *name,
+                               struct stat *st)
+{
+    char candidate[PATH_MAX];
+    size_t n = strlen(dir);
+    const char *sep = n && dir[n - 1] == '/' ? "" : "/";
+    return snprintf(candidate, sizeof(candidate), "%s%s%s", dir, sep, name) <
+               (int)sizeof(candidate) &&
+           stat(candidate, st) == 0 && S_ISREG(st->st_mode) &&
+           access(candidate, X_OK) == 0;
+}
+
+/* True when a program the driver named bare (run from PATH) has a
+ * same-name executable in one of its own prefixes: which one runs is then
+ * the driver's choice, not what PATH resolves. */
+static bool ars_prefix_shadows(const struct ars_driver *d, const char *word)
+{
+    struct stat st;
+    if (strchr(word, '/'))
+        return false;
+    for (size_t i = 0; i < d->prefix_n; i++)
+        if (ars_prefix_program(d->prefixes[i], word, &st))
+            return true;
+    return false;
+}
+
+/* Which same-name executables every prefix holds for every program the
+ * driver runs (backend words and ld), by identity. */
+static void ars_shadow_state(const struct ars_driver *d, uint8_t out[32])
+{
+    static const char domain[] = "zcl.action_root.hotload_prefix_state.v1";
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    for (size_t w = 0; w <= d->backend_n; w++) {
+        const char *name = ars_basename(w < d->backend_n ? d->backend[w]
+                                                         : d->ld_word);
+        for (size_t i = 0; i < d->prefix_n; i++) {
+            struct stat st;
+            uint64_t rec[3] = {0};
+            if (ars_prefix_program(d->prefixes[i], name, &st))
+                rec[0] = 1, rec[1] = (uint64_t)st.st_dev,
+                rec[2] = (uint64_t)st.st_ino;
+            sha3_256_write(&sha, (const uint8_t *)rec, sizeof(rec));
+        }
+    }
+    sha3_256_finalize(&sha, out);
+}
+
+
+/* One command line of -### output: each word (quoted or bare) canonical and
+ * hashed with its terminator. A word with an escape is refused. */
+static bool ars_line_sha3(struct sha3_256_ctx *sha, const char *p,
+                          const char *root, const char *tmp)
+{
+    for (;;) {
+        p += strspn(p, " \t");
+        if (!*p || strchr("\r\n", *p))
+            break;
+        bool quoted = *p == '"';
+        p += quoted;
+        size_t n = strcspn(p, quoted ? "\"\r\n" : " \t\r\n");
+        char word[PATH_MAX], canon[PATH_MAX + 64];
+        if ((quoted && p[n] != '"') || n >= sizeof(word) ||
+            memchr(p, '\\', n))
+            return false;
+        memcpy(word, p, n);
+        word[n] = '\0';
+        p += n + quoted;
+        if (!zcl_action_root_canon_driver_word(word, root, tmp, canon,
+                                               sizeof(canon)))
+            return false;
+        sha3_256_write(sha, (const uint8_t *)canon, strlen(canon) + 1);
+    }
+    sha3_256_write(sha, (const uint8_t *)"\n", 1);
+    return true;
+}
+
+/* The child's TMPDIR, where the driver writes its temporaries. */
+static const char *ars_ask_tmpdir(const struct ars_driver *d)
+{
+    for (size_t i = 0; d->ask_env && i < d->ask_env->n; i++)
+        if (strncmp(d->ask_env->v[i], "TMPDIR=", 7) == 0 &&
+            d->ask_env->v[i][7] == '/')
+            return d->ask_env->v[i] + 7;
+    return "/tmp";
+}
+
+/* SHA3 over every command line of -### output (lines that start with a
+ * space and are not "(in-process)"). A "Configuration file:" line (Clang)
+ * names flags the root does not bind: backend_config_unbound. */
+static bool ars_lines_capture(const struct ars_driver *d, const char *out,
+                              uint8_t lines_sha3[32], char miss[40])
+{
+    static const char domain[] = "zcl.action_root.hotload_backend_lines.v1";
+    static const char config[] = "Configuration file:";
+    struct sha3_256_ctx sha;
+    const char *tmp = ars_ask_tmpdir(d);
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    for (const char *line = out; line && *line;) {
+        if (strncmp(line, config, sizeof(config) - 1) == 0) {
+            fprintf(stderr, "[action-root] driver %.200s reads a "
+                            "configuration file\n", d->driver);
+            if (miss)
+                (void)snprintf(miss, 40, "backend_config_unbound");
+            return false;
+        }
+        const char *p = line + strspn(line, " ");
+        bool command = line[0] == ' ' && !strchr("\r\n", *p) &&
+                       strncmp(p, "(in-process)", 12) != 0;
+        if (command && !ars_line_sha3(&sha, p, d->root, tmp))
+            return false;
+        line = strchr(line, '\n');
+        line += line != NULL;
+    }
+    sha3_256_finalize(&sha, lines_sha3);
+    return true;
+}
+
+/* What one -### query says a compile runs: the canonical lines and the
+ * program words and prefixes. */
+struct ars_programs {
+    uint8_t lines_sha3[32];
+    char cc1_sysroot[PATH_MAX];
+    char backend[ARS_BACKEND_MAX][PATH_MAX];
+    size_t backend_n;
+    char prefixes[ARS_PREFIX_MAX][PATH_MAX];
+    size_t prefix_n;
+};
+
+/* Ask `cc <every plan flag> -### -c` under d->ask_env into `p`. */
+static bool ars_programs_ask(const struct ars_driver *d,
+                             struct ars_programs *p, char miss[40])
+{
+    static const char *const hash[] = { "-fPIC", "-###", "-c", "-xc",
+                                        "/dev/null", "-o", "/dev/null",
+                                        NULL };
+    char *capture = zcl_malloc(ARS_HASH_OUT_MAX, "driver -### output");
+    bool ok = capture &&
+              ars_driver_ask_with(d, d->flags, hash, capture,
+                                  ARS_HASH_OUT_MAX) &&
+              ars_lines_capture(d, capture, p->lines_sha3, miss) &&
+              zcl_action_root_parse_driver_programs(
+                  capture, p->backend, ARS_BACKEND_MAX, &p->backend_n,
+                  p->prefixes, ARS_PREFIX_MAX, &p->prefix_n);
+    if (ok && !zcl_action_root_parse_cc1_sysroot(capture, p->cc1_sysroot)) {
+        p->cc1_sysroot[0] = '\0';
+        if (strstr(capture, "-cc1") != NULL) {
+            if (miss)
+                (void)snprintf(miss, 40, "driver_sysroot_unavailable");
+            ok = false;
+        }
+    }
+    free(capture);
+    return ok;
+}
+
+/* What a compile runs, asked as `cc <every plan flag> -### -c`: the program
+ * words are resolved per derivation (ars_backend_sha3), never here, and
+ * every command line is bound canonically (ars_lines_capture). */
+static bool ars_programs_capture(struct ars_driver *d, char miss[40])
+{
+    struct ars_programs *p = zcl_calloc(1, sizeof(*p), "driver programs");
+    bool ok = p && ars_programs_ask(d, p, miss);
+    if (ok) {
+        memcpy(d->lines_sha3, p->lines_sha3, sizeof(d->lines_sha3));
+        (void)snprintf(d->cc1_sysroot, sizeof(d->cc1_sysroot), "%s",
+                       p->cc1_sysroot);
+        memcpy(d->backend, p->backend, sizeof(d->backend));
+        memcpy(d->prefixes, p->prefixes, sizeof(d->prefixes));
+        d->backend_n = p->backend_n;
+        d->prefix_n = p->prefix_n;
+    }
+    free(p);
+    if (!ok && miss && !miss[0])
+        (void)snprintf(miss, 40, "backend_unresolved");
+    return ok;
+}
+
+/* The driver, asked -### again under `env`, still prints the same lines and
+ * names the same programs and prefixes. A driver behind a see-through
+ * wrapper can be replaced in place (update-alternatives, a rewritten exec
+ * target) with no change to the words, flags or environment the cache
+ * checks; a failed query is a mismatch (the caller re-captures, and that
+ * misses). */
+static bool ars_programs_same(struct ars_driver *d,
+                              const struct zcl_action_root_child_env *env)
+{
+    struct ars_programs *p = zcl_calloc(1, sizeof(*p), "driver programs");
+    d->ask_env = env;
+    bool ok = p && ars_programs_ask(d, p, NULL) &&
+              memcmp(p->lines_sha3, d->lines_sha3, 32) == 0 &&
+              p->backend_n == d->backend_n && p->prefix_n == d->prefix_n;
+    for (size_t i = 0; ok && i < p->backend_n; i++)
+        ok = strcmp(p->backend[i], d->backend[i]) == 0;
+    for (size_t i = 0; ok && i < p->prefix_n; i++)
+        ok = strcmp(p->prefixes[i], d->prefixes[i]) == 0;
+    d->ask_env = NULL;
+    free(p);
+    return ok;
+}
+
+static bool ars_linker_capture(struct ars_driver *d)
+{
+    if (!ars_driver_line(d, "-print-prog-name=ld", d->ld_word))
+        return false;
+    (void)snprintf(d->ld, sizeof(d->ld), "%s", d->ld_word);
+    if (!ars_resolve_program(d->ld) ||
+        !ars_driver_line(d, "-print-prog-name=collect2", d->collect2))
+        return false;
+    /* Only an absolute answer is a collect2 this driver runs; a driver
+     * without one (Clang) echoes the bare name back. */
+    if (d->collect2[0] != '/' || access(d->collect2, X_OK) != 0)
+        d->collect2[0] = '\0';
+    return true;
+}
+
+static bool ars_driver_capture(const struct ars_ask *q, struct ars_driver *d,
+                               char miss[40])
+{
+    static const char *const search[] = { "-xc", "-E", "-v", "/dev/null",
+                                          NULL };
+    char capture[16384];
+    memset(d, 0, sizeof(*d));
+    if (miss)
+        miss[0] = '\0';
+    (void)snprintf(d->driver, sizeof(d->driver), "%s", q->cc);
+    (void)snprintf(d->targets, sizeof(d->targets), "%s", q->targets);
+    (void)snprintf(d->root, sizeof(d->root), "%s", q->root);
+    d->ask_env = q->env;
+    bool ok = snprintf(d->flags, sizeof(d->flags), "%s", q->flags) <
+                  (int)sizeof(d->flags) &&
+              ars_driver_ask(d, search, capture, sizeof(capture)) &&
+              ars_system_parse(capture, d, miss) &&
+              ars_programs_capture(d, miss) &&
+              ars_sysroot_capture(d, miss) &&
+              ars_linker_capture(d) && ars_implicit_capture(d);
+    d->ask_env = NULL;
+    if (ok)
+        ars_shadow_state(d, d->shadow);
+    return ok;
+}
+
+/* The captured facts still describe the disk: every listed built-in dir
+ * exists and every skipped one is still absent, every program named by
+ * path is still there, and the prefixes hold the same programs. */
+static bool ars_driver_fresh(const struct ars_driver *d)
+{
+    uint8_t shadow[32];
+    for (size_t i = 0; i < d->count; i++)
+        if (access(d->dirs[i], F_OK) != 0)
+            return false;
+    for (size_t i = 0; i < d->absent_n; i++)
+        if (access(d->absent[i], F_OK) == 0)
+            return false;
+    for (size_t i = 0; i < d->backend_n; i++)
+        if (strchr(d->backend[i], '/') && access(d->backend[i], X_OK) != 0)
+            return false;
+    ars_shadow_state(d, shadow);
+    return memcmp(shadow, d->shadow, sizeof(shadow)) == 0;
+}
+
+/* Every program a compile runs, resolved as the driver would and bound by
+ * its bytes (never its --version text), beside its name. A word that does
+ * not resolve, or a bare one a prefix shadows, names itself in `bad`. */
+static bool ars_backend_sha3(const struct ars_driver *d, uint8_t out[32],
+                             const char **bad)
+{
+    static const char domain[] = "zcl.action_root.hotload_backend.v1";
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    *bad = NULL;
+    for (size_t i = 0; i < d->backend_n && !*bad; i++) {
+        char path[PATH_MAX];
+        uint8_t digest[32];
+        const char *base = ars_basename(d->backend[i]);
+        (void)snprintf(path, sizeof(path), "%s", d->backend[i]);
+        if (ars_prefix_shadows(d, d->backend[i]) ||
+            !ars_resolve_program(path) ||
+            !zcl_action_root_file_sha3(path, digest)) {
+            *bad = d->backend[i];
+            break;
+        }
+        sha3_256_write(&sha, (const uint8_t *)base, strlen(base) + 1);
+        sha3_256_write(&sha, digest, sizeof(digest));
+    }
+    if (!*bad && ars_prefix_shadows(d, d->ld_word))
+        *bad = d->ld_word;
+    sha3_256_finalize(&sha, out);
+    return !*bad && d->backend_n > 0;
+}
+#endif
+
+/* SHA3 over the implicit link libraries, re-read every derivation (the
+ * digest memo keys on stat, so an unchanged file is not re-hashed). */
+static bool ars_implicit_sha3(const struct ars_driver *d, uint8_t out[32])
+{
+    static const char domain[] = "zcl.action_root.hotload_implicit_libs.v1";
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    for (size_t i = 0; i < ARS_IMPLICIT_N; i++) {
+        uint8_t digest[32] = {0};
+        uint8_t found = d->implicit[i][0] != '\0';
+        if (found && !zcl_action_root_file_sha3(d->implicit[i], digest))
+            return false;
+        sha3_256_write(&sha, (const uint8_t *)k_ars_implicit[i],
+                       strlen(k_ars_implicit[i]) + 1);
+        sha3_256_write(&sha, &found, 1);
+        sha3_256_write(&sha, digest, sizeof(digest));
+    }
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+/* The plan's flags that can move the driver's built-in dirs, sysroot or
+ * linker (-m..., --target=, -target X), asked with every driver query. */
+static bool ars_targets(const char *cflags, const char *ldflags,
+                        char out[ARS_TARGETS_MAX])
+{
+    const char *const lists[] = { cflags, ldflags };
+    size_t o = 0;
+    out[0] = '\0';
+    for (size_t l = 0; l < 2; l++) {
+        char text[16384];
+        const char *w[ARS_ARG_MAX];
+        if (snprintf(text, sizeof(text), "%s", lists[l] ? lists[l] : "") >=
+            (int)sizeof(text))
+            return false;
+        size_t n = zcl_argv_split(text, w, ARS_ARG_MAX);
+        for (size_t i = 0; i < n; i++) {
+            bool pair = strcmp(w[i], "-target") == 0 && i + 1 < n;
+            if (strncmp(w[i], "-m", 2) != 0 &&
+                strncmp(w[i], "--target", 8) != 0 && !pair)
+                continue;
+            int k = snprintf(out + o, ARS_TARGETS_MAX - o, "%s%s%s%s",
+                             o ? " " : "", w[i], pair ? " " : "",
+                             pair ? w[i + 1] : "");
+            if (k < 0 || (size_t)k >= ARS_TARGETS_MAX - o)
+                return false;
+            o += (size_t)k;
+            i += pair;
+        }
+    }
+    return true;
+}
+
+/* The compile query can see an explicit SDK, but the implicit link-library
+ * query and toolchain capsule do not yet bind an independently steered link
+ * sysroot. Refuse these flags rather than cache against the default SDK. */
+static bool ars_sysroot_override(const char *flags)
+{
+    if (!flags)
+        return false;
+    char text[ARS_FLAGS_MAX];
+    if (snprintf(text, sizeof(text), "%s", flags) >= (int)sizeof(text))
+        return true;
+    const char *w[ARS_ARG_MAX];
+    size_t n = zcl_argv_split(text, w, ARS_ARG_MAX);
+    for (size_t i = 0; i < n; i++)
+        if (strncmp(w[i], "-isysroot", 9) == 0 ||
+            strncmp(w[i], "--sysroot", 9) == 0 ||
+            strncmp(w[i], "-sysroot", 8) == 0 ||
+            strstr(w[i], "-syslibroot") != NULL)
+            return true;
+    return false;
+}
+
+#if !defined(_WIN32)
+/* A compile cache or remote compiler in the driver command answers from
+ * state the root cannot see (its store, another host). zcc and ccache are
+ * seen through: every keyed child runs with their fixed off switches
+ * (zcl_action_root_child_env), so they exec the driver behind them. These
+ * have no such switch; a word naming one, or a symlink to one (the
+ * masquerade install), misses. A wrapper script is still bound only by its
+ * bytes: what it runs is asked through -### below. */
+static bool ars_cache_opaque(const char *word, const char *resolved)
+{
+    static const char *const names[] = {
+        "sccache", "distcc", "distccd", "icecc", "icerun", "buildcache",
+        "pump", "cachecc1", "clcache", "firebuild", "ccache-swig",
+    };
+    char real[PATH_MAX];
+    const char *bases[2] = { word, realpath(resolved, real) ? real : "" };
+    for (size_t b = 0; b < 2; b++) {
+        const char *slash = strrchr(bases[b], '/');
+        const char *base = slash ? slash + 1 : bases[b];
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+            if (strcmp(base, names[i]) == 0)
+                return true;
+    }
+    return false;
+}
+
+/* The plan's compiler command may be a wrapper ("zcc cc", a script): every
+ * program word it names is resolved as execvp would and bound by the SHA3 of
+ * its bytes, so new bytes at the same path move the toolchain root. A word
+ * that is not an option and does not resolve to a program misses; one that
+ * is an opaque compile cache misses as driver_cache_opaque. */
+static bool ars_driver_bytes(const char *cc, uint8_t out[32], char miss[40])
+{
+    static const char domain[] = "zcl.action_root.hotload_driver.v1";
+    char text[512];
+    const char *argv[ARS_ARG_MAX];
+    if (snprintf(text, sizeof(text), "%s", cc) >= (int)sizeof(text))
+        return false;
+    size_t argc = zcl_argv_split(text, argv, ARS_ARG_MAX);
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    size_t programs = 0;
+    for (size_t i = 0; i < argc; i++) {
+        char path[PATH_MAX];
+        uint8_t digest[32];
+        if (argv[i][0] == '-')
+            continue;
+        if (snprintf(path, sizeof(path), "%s", argv[i]) >= (int)sizeof(path) ||
+            !ars_resolve_program(path))
+            return false;
+        if (ars_cache_opaque(argv[i], path)) {
+            fprintf(stderr, "[action-root] driver command word %.200s is a "
+                            "compile cache the root cannot see through\n",
+                    argv[i]);
+            if (miss)
+                (void)snprintf(miss, 40, "driver_cache_opaque");
+            return false;
+        }
+        if (!zcl_action_root_file_sha3(path, digest))
+            return false;
+        sha3_256_write(&sha, digest, sizeof(digest));
+        programs++;
+    }
+    sha3_256_finalize(&sha, out);
+    return programs > 0;
+}
+#endif
+
+#if !defined(_WIN32)
+/* SHA3 of the child environment the driver is asked under. */
+static void ars_env_sha3(const struct zcl_action_root_child_env *env,
+                         uint8_t out[32])
+{
+    static const char domain[] = "zcl.action_root.hotload_driver_env.v1";
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    for (size_t i = 0; i < env->n; i++)
+        sha3_256_write(&sha, (const uint8_t *)env->v[i],
+                       strlen(env->v[i]) + 1);
+    sha3_256_finalize(&sha, out);
+}
+#endif
+
+#if !defined(_WIN32)
+/* g_driver (held under g_driver_mu) still answers `q`, and the driver,
+ * asked -### again, still prints the same lines and programs. */
+static bool ars_driver_cached(const struct ars_ask *q, const uint8_t bytes[32],
+                              const uint8_t env_sha3[32])
+{
+    return g_driver.valid && strcmp(g_driver.driver, q->cc) == 0 &&
+           strcmp(g_driver.targets, q->targets) == 0 &&
+           strcmp(g_driver.flags, q->flags) == 0 &&
+           strcmp(g_driver.root, q->root) == 0 &&
+           memcmp(g_driver.bytes, bytes, 32) == 0 &&
+           memcmp(g_driver.env_sha3, env_sha3, 32) == 0 &&
+           ars_driver_fresh(&g_driver) &&
+           ars_programs_same(&g_driver, q->env);
+}
+#endif
+
+/* Driver facts are re-captured whenever the driver's bytes, the plan's
+ * flags, the root or the child environment change, a built-in dir it
+ * skipped as nonexistent appears, a program it names by path goes, or its
+ * program prefixes gain or lose a same-name program; `miss` names the
+ * refusal. */
+static bool ars_driver_facts(const struct ars_ask *q, struct ars_driver *out,
+                             char miss[40])
+{
+#if defined(_WIN32)
+    (void)q;
+    (void)out;
+    if (miss)
+        miss[0] = '\0';
+    return false;
+#else
+    if (miss)
+        miss[0] = '\0';
+    uint8_t bytes[32], env_sha3[32];
+    if (!ars_driver_bytes(q->cc, bytes, miss))
+        return false;
+    ars_env_sha3(q->env, env_sha3);
+    pthread_mutex_lock(&g_driver_mu);
+    bool ok = ars_driver_cached(q, bytes, env_sha3);
+    if (!ok) {
+        ok = ars_driver_capture(q, &g_driver, miss);
+        memcpy(g_driver.bytes, bytes, sizeof(bytes));
+        memcpy(g_driver.env_sha3, env_sha3, sizeof(env_sha3));
+        g_driver.valid = ok;
+    }
+    if (ok)
+        *out = g_driver;
+    pthread_mutex_unlock(&g_driver_mu);
+    return ok;
+#endif
+}
+
+/* The first prerequisite of a depfile is the compiled input. */
+static bool ars_depfile_input(const char *depfile, char out[PATH_MAX])
+{
+    char text[PATH_MAX * 2];
+    FILE *f = fopen(depfile, "r");
+    size_t n = f ? fread(text, 1, sizeof(text) - 1, f) : 0;
+    if (f)
+        fclose(f);
+    text[n] = '\0';
+    for (size_t i = 0; i + 1 < n; i++)
+        if (text[i] == '\\' && (text[i + 1] == '\n' || text[i + 1] == '\r'))
+            text[i] = text[i + 1] = ' ';
+    char *colon = strchr(text, ':');
+    while (colon && colon[1] && !strchr(" \t\r\n", colon[1]))
+        colon = strchr(colon + 1, ':');
+    if (!colon)
+        return false;
+    char *p = colon + 1 + strspn(colon + 1, " \t\r\n");
+    size_t len = strcspn(p, " \t\r\n");
+    return len > 0 && len < PATH_MAX &&
+           snprintf(out, PATH_MAX, "%.*s", (int)len, p) > 0;
+}
+
+struct ars_argv {
+    char cc[512];
+    char cflags[16384];
+    char source_define[320];
+    char service_define[320];
+    char input[PATH_MAX];
+    char unity_token[320];
+    const char *v[ARS_ARG_MAX];
+    size_t n;
+    char link_cc[512];
+    char ldflags[4096];
+    const char *link[ARS_ARG_MAX];
+    size_t link_n;
+};
+
+/* Mirror of hs_run_compile() in devloop_hotswap_build.c: the same driver,
+ * flags and appended arguments, with the temporary object and depfile
+ * replaced by their declared virtual outputs. */
+static bool ars_hotswap_argv(const char *owner, const char *cc,
+                             const char *cflags, const char *depfile,
+                             struct ars_argv *a)
+{
+    (void)snprintf(a->cc, sizeof(a->cc), "%s", cc);
+    (void)snprintf(a->cflags, sizeof(a->cflags), "%s", cflags);
+    (void)snprintf(a->source_define, sizeof(a->source_define),
+                   "-DZCL_HOTSWAP_MODULE_SOURCE_TU=\"%s\"", owner);
+    (void)snprintf(a->service_define, sizeof(a->service_define),
+                   "-DZCL_HOTSWAP_SERVICE_SOURCE_TU=\"%s\"", owner);
+    if (!ars_depfile_input(depfile, a->input))
+        return false;
+    a->n = zcl_argv_split(a->cc, a->v, ARS_ARG_MAX);
+    size_t flagc = zcl_argv_split(a->cflags, a->v + a->n,
+                                  ARS_ARG_MAX - a->n);
+    a->n += flagc;
+    static const char *const tail[] = {
+        "-fPIC", "-DZCL_HOTSWAP_MODULE_GEN", "-DZCL_HOTSWAP_SERVICE_GEN",
+    };
+    if (a->n == 0 || a->n + 16 >= ARS_ARG_MAX)
+        return false;
+    for (size_t i = 0; i < sizeof(tail) / sizeof(tail[0]); i++)
+        a->v[a->n++] = tail[i];
+    a->v[a->n++] = a->source_define;
+    a->v[a->n++] = a->service_define;
+    a->v[a->n++] = "-MD";
+    a->v[a->n++] = "-MF";
+    a->v[a->n++] = "@out/depfile";
+    a->v[a->n++] = "-c";
+    a->v[a->n++] = "-o";
+    a->v[a->n++] = "@out/object";
+    a->v[a->n++] = a->input;
+    a->v[a->n] = NULL;
+    return true;
+}
+
+/* Mirror of hs_run_link(): driver, link flags, -o module, the object. */
+static bool ars_hotswap_link_argv(const char *cc, const char *ldflags,
+                                  struct ars_argv *a)
+{
+    (void)snprintf(a->link_cc, sizeof(a->link_cc), "%s", cc);
+    if (snprintf(a->ldflags, sizeof(a->ldflags), "%s", ldflags) >=
+        (int)sizeof(a->ldflags))
+        return false;
+    a->link_n = zcl_argv_split(a->link_cc, a->link, ARS_ARG_MAX);
+    a->link_n += zcl_argv_split(a->ldflags, a->link + a->link_n,
+                                ARS_ARG_MAX - a->link_n);
+    if (a->link_n == 0 || a->link_n + 4 >= ARS_ARG_MAX)
+        return false;
+    a->link[a->link_n++] = "-o";
+    a->link[a->link_n++] = "@out/module";
+    a->link[a->link_n++] = "@out/object";
+    a->link[a->link_n] = NULL;
+    return true;
+}
+
+/* Mirror of hs_run_hotfork_compile(): the capsule unity is compiled from a
+ * temporary .resident-* spelling, recorded under the stable token
+ * build/hotswap-fast/<owner>.hotfork-unity.c (a virtual generated input). */
+static bool ars_hotfork_argv(const char *root, const char *owner,
+                             const char *cc, const char *cflags,
+                             struct ars_argv *a)
+{
+    char safe[256];
+    (void)snprintf(a->cc, sizeof(a->cc), "%s", cc);
+    (void)snprintf(a->cflags, sizeof(a->cflags), "%s", cflags);
+    if (!ars_safe_name(owner, safe) ||
+        snprintf(a->unity_token, sizeof(a->unity_token),
+                 "build/hotswap-fast/%s.hotfork-unity.c", safe) >=
+            (int)sizeof(a->unity_token) ||
+        snprintf(a->input, sizeof(a->input), "%s/%s", root, a->unity_token) >=
+            (int)sizeof(a->input))
+        return false;
+    a->n = zcl_argv_split(a->cc, a->v, ARS_ARG_MAX);
+    a->n += zcl_argv_split(a->cflags, a->v + a->n, ARS_ARG_MAX - a->n);
+    static const char *const tail[] = {
+        "-fPIC", "-fvisibility=hidden", "-MD", "-MF", "@out/depfile",
+        "-c", "-o", "@out/object",
+    };
+    size_t tail_n = sizeof(tail) / sizeof(tail[0]);
+    if (a->n == 0 || a->n + tail_n + 2 >= ARS_ARG_MAX)
+        return false;
+    for (size_t i = 0; i < tail_n; i++)
+        a->v[a->n++] = tail[i];
+    a->v[a->n++] = a->input;
+    a->v[a->n] = NULL;
+    return true;
+}
+
+/* Mirror of hs_run_hotfork_link(): no plan link flags; the version script,
+ * module, candidate object and descriptor object are declared outputs. */
+static bool ars_hotfork_link_argv(const char *cc, struct ars_argv *a)
+{
+    (void)snprintf(a->link_cc, sizeof(a->link_cc), "%s", cc);
+    a->link_n = zcl_argv_split(a->link_cc, a->link, ARS_ARG_MAX);
+    static const char *const tail[] = {
+        "-shared", "-nostartfiles", "-Wl,--build-id=none", "-Wl,-z,relro",
+        "-Wl,-z,noexecstack", "-Wl,-Bsymbolic",
+        "-Wl,--version-script=@out/version-script", "-o", "@out/module",
+        "@out/object", "@out/descriptor",
+    };
+    size_t tail_n = sizeof(tail) / sizeof(tail[0]);
+    if (a->link_n == 0 || a->link_n + tail_n + 1 >= ARS_ARG_MAX)
+        return false;
+    for (size_t i = 0; i < tail_n; i++)
+        a->link[a->link_n++] = tail[i];
+    a->link[a->link_n] = NULL;
+    return true;
+}
+
+/* What differs between the hot-swap module action and the HOT_FORK capsule
+ * action: stage, the ABI the artifact is loaded against, and the policy. */
+struct ars_stage {
+    const char *kind;
+    uint32_t version;
+    uint32_t abi_generation;
+    const struct vcs_action_abi_v2 *abi;
+    size_t abi_count;
+    const char *policy;
+    size_t policy_len;
+};
+
+/* The generation a hotload module is loaded against is the host ABI; the
+ * module and service ABIs are listed by name beside it. */
+static const struct vcs_action_abi_v2 g_hotswap_abi[] = {
+    { "hotswap_host", ZCL_HOTSWAP_HOST_ABI_V4 },
+    { "hotswap_module", ZCL_HOTSWAP_MODULE_ABI_V3 },
+    { "hotswap_service", ZCL_HOTSWAP_SERVICE_ABI_V1 },
+};
+static const struct vcs_action_abi_v2 g_hotfork_abi[] = {
+    { "hotfork_capsule", ZCL_HOTFORK_CAPSULE_ABI_V1 },
+};
+static const char g_hotswap_policy[] =
+    "zcl.action_policy.v2\0hotswap.compile+link;timeout_ms=30000;"
+    "env=constructed-allowlist+PATH,HOME,TMPDIR+CCACHE_DISABLE=1,"
+    "ZCC_DISABLE=1;network=ambient";
+static const char g_hotfork_policy[] =
+    "zcl.action_policy.v2\0hotfork.compile+descriptor+link;timeout_ms=30000;"
+    "env=constructed-allowlist+PATH,HOME,TMPDIR+CCACHE_DISABLE=1,"
+    "ZCC_DISABLE=1;network=ambient";
+
+static const struct ars_stage g_hotswap_stage = {
+    ZCL_ACTION_ROOT_STAGE_HOTSWAP, ZCL_ACTION_ROOT_STAGE_HOTSWAP_VERSION,
+    ZCL_HOTSWAP_HOST_ABI_V4, g_hotswap_abi,
+    sizeof(g_hotswap_abi) / sizeof(g_hotswap_abi[0]), g_hotswap_policy,
+    sizeof(g_hotswap_policy),
+};
+static const struct ars_stage g_hotfork_stage = {
+    ZCL_ACTION_ROOT_STAGE_HOTFORK, ZCL_ACTION_ROOT_STAGE_HOTFORK_VERSION,
+    ZCL_HOTFORK_CAPSULE_ABI_V1, g_hotfork_abi,
+    sizeof(g_hotfork_abi) / sizeof(g_hotfork_abi[0]), g_hotfork_policy,
+    sizeof(g_hotfork_policy),
+};
+
+struct ars_hook {
+    struct ars_argv argv;
+    struct ars_driver driver;
+    const char *system_dirs[ARS_SYSTEM_DIR_MAX];
+    struct vcs_toolchain_capsule_v1 capsule;
+    struct zcl_action_root_request req;
+    FILE *harness_image; /* Retained until the action request is derived. */
+    int harness_fd;
+    struct stat harness_stamp;
+    bool harness_pinned;
+    uint64_t harness_read_bytes;
+    uint32_t harness_hashes;
+    uint32_t harness_cache_hits;
+    struct zcl_action_root_child_env env; /* built here when none is given */
+    const struct zcl_action_root_child_env *envp; /* the child's, exactly */
+};
+
+struct ars_compile {
+    const char *root, *owner, *cc, *cflags, *ldflags, *depfile;
+    const char *unity; /* HOT_FORK: the live unity file; NULL for hot-swap */
+    const struct zcl_action_root_t0 *t0; /* the compile start, or NULL */
+    /* The environment the build spawned the compile under, or NULL. */
+    const struct zcl_action_root_child_env *env;
+};
+
+/* The first miss wins: a stable code plus a human detail. */
+struct ars_miss {
+    char code[40];
+    char why[192];
+};
+
+static void ars_miss_set(struct ars_miss *m, const char *code,
+                         const char *what, const char *arg)
+{
+    if (!m->code[0])
+        (void)snprintf(m->code, sizeof(m->code), "%s", code);
+    ars_why(m->why, sizeof(m->why), what, arg);
+}
+
+static bool ars_hook_argv(struct ars_hook *h, const struct ars_compile *k)
+{
+    if (k->unity)
+        return ars_hotfork_argv(k->root, k->owner, k->cc, k->cflags,
+                                &h->argv) &&
+               ars_hotfork_link_argv(k->cc, &h->argv);
+    return ars_hotswap_argv(k->owner, k->cc, k->cflags, k->depfile,
+                            &h->argv) &&
+           ars_hotswap_link_argv(k->cc, k->ldflags, &h->argv);
+}
+
+/* A plan word "@file" makes the driver read more arguments from a file the
+ * root does not hash ("@out/..." are the derivation's own declared outputs,
+ * so a plan that spells one is refused too). */
+static bool ars_response_file(const char *words)
+{
+    for (const char *p = words; p && *p; p++)
+        if (*p == '@' && (p == words || strchr(" \t\"'", p[-1])))
+            return true;
+    return false;
+}
+
+/* Plan flags follow the driver words in argv; one that does not start with
+ * '-' would read as another driver word. Empty flags are fine. */
+static bool ars_options_first(const char *words)
+{
+    const char *p = words ? words + strspn(words, " \t") : "";
+    return !*p || *p == '-';
+}
+
+/* The compile child sees only the bound set (zcl_action_root_child_env).
+ * A parent variable that would steer it misses by name: dropping it
+ * silently would key a build the operator did not ask for. Only the
+ * variable's name enters the detail, never its value. The key binds the
+ * very environment object the build spawned under when one is given, so
+ * "the root binds exactly the child's environment" holds by construction. */
+static bool ars_hook_env(struct ars_hook *h, const struct ars_compile *k,
+                         struct ars_miss *m)
+{
+    const char *const *parent = zcl_action_root_parent_env();
+    const char *entry = NULL;
+    const char *refusal = zcl_action_root_env_refusal(parent, &entry);
+    if (refusal) {
+        char name[128];
+        (void)snprintf(name, sizeof(name), "%.*s",
+                       (int)strcspn(entry, "="), entry);
+        ars_miss_set(m, refusal,
+                     "the parent environment sets a variable that steers "
+                     "the compiler, linker, loader or program lookup", name);
+        return false;
+    }
+    h->envp = k->env;
+    if (!h->envp && zcl_action_root_child_env(parent, &h->env))
+        h->envp = &h->env;
+    if (!h->envp) {
+        ars_miss_set(m, "env_unbound",
+                     "the child environment will not fit its bound", NULL);
+        return false;
+    }
+    return true;
+}
+
+/* The detail for a driver-facts miss code (ars_driver_facts). */
+static const char *ars_driver_miss_why(const char *code)
+{
+    static const struct {
+        const char *code, *why;
+    } k[] = {
+        { "backend_unresolved",
+          "the driver would not say which programs a compile runs" },
+        { "backend_config_unbound",
+          "the driver reads a configuration file the root does not bind" },
+        { "driver_cache_opaque",
+          "the driver command runs a compile cache or remote compiler the "
+          "root cannot see through" },
+        { "driver_sysroot_unavailable",
+          "the compiler did not report one effective sysroot for this "
+          "compile invocation" },
+        { "driver_sysroot_override_unbound",
+          "an explicit sysroot can steer the compile or implicit linker "
+          "inputs outside the bound toolchain capsule" },
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++)
+        if (strcmp(code, k[i].code) == 0)
+            return k[i].why;
+    return "compiler driver's built-in include search is not a canonical, "
+           "capacity-fitting list";
+}
+
+/* The plan's driver facts under the child environment, then the bytes of
+ * every program a compile runs. */
+static bool ars_hook_driver(struct ars_hook *h, const struct ars_compile *k,
+                            uint8_t implicit[32], uint8_t backend[32],
+                            struct ars_miss *m)
+{
+    char targets[ARS_TARGETS_MAX];
+    char driver_miss[40] = {0};
+    if (ars_sysroot_override(k->cflags) ||
+        ars_sysroot_override(k->ldflags)) {
+        ars_miss_set(m, "driver_sysroot_override_unbound",
+                     ars_driver_miss_why("driver_sysroot_override_unbound"),
+                     k->cc);
+        return false;
+    }
+    if (!ars_targets(k->cflags, k->unity ? NULL : k->ldflags, targets) ||
+        !ars_driver_facts(&(const struct ars_ask){ k->cc, targets, k->cflags,
+                                                   k->root, h->envp },
+                          &h->driver, driver_miss) ||
+        !ars_implicit_sha3(&h->driver, implicit)) {
+        if (driver_miss[0])
+            ars_miss_set(m, driver_miss, ars_driver_miss_why(driver_miss),
+                         k->cc);
+        else
+            ars_miss_set(m, "driver_facts_unavailable",
+                         "compiler driver facts, program bytes or implicit "
+                         "libraries unavailable", k->cc);
+        return false;
+    }
+#if defined(_WIN32)
+    (void)backend;
+    return false;
+#else
+    const char *bad = NULL;
+    if (!ars_backend_sha3(&h->driver, backend, &bad)) {
+        ars_miss_set(m, "backend_unresolved",
+                     "a program the driver runs does not resolve to one "
+                     "file, or its own prefix holds a same-name program",
+                     bad ? bad : k->cc);
+        return false;
+    }
+    return true;
+#endif
+}
+
+#if defined(__APPLE__)
+/* The capsule hashes SDK startup objects and stubs selected by xcrun. A
+ * Clang driver using another SDK cannot borrow that capsule's digest. */
+static bool ars_sdk_matches_capsule(const struct ars_hook *h)
+{
+    if (!h->driver.cc1_sysroot[0])
+        return true;
+    struct vcs_toolchain_capsule_v1 current;
+    struct platform_toolchain_descriptor desc;
+    uint8_t current_root[32], captured_root[32];
+    if ((!vcs_toolchain_capsule_v1_cached(&current, &desc) &&
+         (!vcs_toolchain_capsule_v1_capture(&current) ||
+          !vcs_toolchain_capsule_v1_cached(&current, &desc))) ||
+        !vcs_toolchain_capsule_v1_root(&current, current_root) ||
+        !vcs_toolchain_capsule_v1_root(&h->capsule, captured_root) ||
+        memcmp(current_root, captured_root, 32) != 0)
+        return false;
+    static const char suffix[] = "/usr/lib/crt1.o";
+    const char *file = desc.sysroot_files[0];
+    size_t n = strlen(file), tail = sizeof(suffix) - 1;
+    if (n <= tail || strcmp(file + n - tail, suffix) != 0)
+        return false;
+    char sdk[PATH_MAX], capsule_sdk[PATH_MAX], driver_sdk[PATH_MAX];
+    if (n - tail >= sizeof(sdk))
+        return false;
+    memcpy(sdk, file, n - tail);
+    sdk[n - tail] = '\0';
+    return realpath(sdk, capsule_sdk) &&
+           realpath(h->driver.cc1_sysroot, driver_sdk) &&
+           strcmp(capsule_sdk, driver_sdk) == 0;
+}
+#endif
+
+struct ars_capsule_capture {
+    struct vcs_toolchain_capsule_v1 capsule;
+    bool ok;
+};
+
+static void *ars_capsule_capture_run(void *opaque)
+{
+    struct ars_capsule_capture *capture = opaque;
+    capture->ok = vcs_toolchain_capsule_v1_capture(&capture->capsule);
+    return NULL;
+}
+
+/* Capture independent host and action facts together. The joined worker's
+ * bytes and the driver's exact child-environment answers are both required. */
+static bool ars_hook_capture_pair(struct ars_hook *h,
+    const struct ars_compile *k, struct ars_miss *m, uint8_t capsule_root[32],
+    uint8_t implicit[32], uint8_t backend[32])
+{
+    struct ars_capsule_capture *capture = zcl_calloc(1, sizeof(*capture),
+                                                    "toolchain capture");
+    if (!capture) {
+        ars_miss_set(m, "out_of_memory", "toolchain capture allocation failed",
+                     NULL);
+        return false;
+    }
+    pthread_t worker;
+    // raw-pthread-ok:joined before the key uses either capture result
+    bool started = pthread_create(&worker, NULL,
+                                  ars_capsule_capture_run, capture) == 0;
+    bool driver_ok = ars_hook_driver(h, k, implicit, backend, m);
+    if (started && pthread_join(worker, NULL) != 0) {
+        /* The worker might still own capture; do not free or read it. */
+        ars_miss_set(m, "toolchain_unavailable",
+                     "toolchain capture join failed", NULL);
+        return false;
+    }
+    if (!started)
+        (void)ars_capsule_capture_run(capture);
+    bool capsule_ok = capture->ok &&
+        vcs_toolchain_capsule_v1_root(&capture->capsule, capsule_root);
+    if (capsule_ok)
+        h->capsule = capture->capsule;
+    free(capture);
+    if (!driver_ok)
+        return false;
+    if (!capsule_ok) {
+        ars_miss_set(m, "toolchain_unavailable",
+                     "toolchain capsule unavailable", NULL);
+        return false;
+    }
+    return true;
+}
+
+static bool ars_hook_inputs(struct ars_hook *h, const struct ars_compile *k,
+                            struct ars_miss *m)
+{
+    struct zcl_action_root_request *r = &h->req;
+    uint8_t capsule_root[32], implicit[32], backend[32];
+    if (ars_response_file(k->cc) || ars_response_file(k->cflags) ||
+        ars_response_file(k->ldflags) || !ars_options_first(k->cflags) ||
+        !ars_options_first(k->ldflags)) {
+        ars_miss_set(m, "argv_unrecognised",
+                     "the plan names a response file, or its flags start "
+                     "with a word the driver would take as an input", NULL);
+        return false;
+    }
+    if (!ars_hook_env(h, k, m) ||
+        !ars_hook_capture_pair(h, k, m, capsule_root, implicit, backend))
+        return false;
+#if defined(__APPLE__)
+    if (!ars_sdk_matches_capsule(h)) {
+        ars_miss_set(m, "driver_sysroot_capsule_mismatch",
+                     "the compiler selected an SDK outside the bound "
+                     "toolchain capsule", h->driver.cc1_sysroot);
+        return false;
+    }
+#endif
+    /* The capsule is the host toolchain; the plan's own driver command (a
+     * wrapper, a cache, another compiler) is bound by its program bytes,
+     * the programs it runs for a compile by theirs, and the libraries its
+     * links pull in unnamed by theirs. */
+    static const char domain[] = "zcl.action_root.hotload_toolchain.v4";
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    sha3_256_write(&sha, capsule_root, sizeof(capsule_root));
+    sha3_256_write(&sha, h->driver.bytes, sizeof(h->driver.bytes));
+    sha3_256_write(&sha, backend, sizeof(backend));
+    sha3_256_write(&sha, h->driver.lines_sha3, sizeof(h->driver.lines_sha3));
+    sha3_256_write(&sha, implicit, sizeof(implicit));
+    sha3_256_finalize(&sha, r->toolchain_root);
+    if (!ars_hook_argv(h, k)) {
+        ars_miss_set(m, "argv_unavailable",
+                     "compile argv or depfile input unavailable", k->depfile);
+        return false;
+    }
+    return true;
+}
+
+static void ars_hook_request(struct ars_hook *h, const struct ars_compile *k)
+{
+    const struct ars_stage *st = k->unity ? &g_hotfork_stage
+                                          : &g_hotswap_stage;
+    struct zcl_action_root_request *r = &h->req;
+    for (size_t i = 0; i < h->driver.count; i++)
+        h->system_dirs[i] = h->driver.dirs[i];
+    r->root = k->root;
+    r->stage_kind = st->kind;
+    r->stage_version = st->version;
+    r->argv = h->argv.v;
+    r->argc = h->argv.n;
+    r->depfile = k->depfile;
+    r->virtual_input_token = k->unity ? h->argv.unity_token : NULL;
+    r->virtual_input_path = k->unity;
+    r->system_dirs = h->system_dirs;
+    r->system_dir_count = h->driver.count;
+    r->sysroot = h->driver.sysroot;
+    memcpy(r->sysroot_objects_sha3, h->capsule.sysroot_sha3, 32);
+    r->linker = (struct zcl_action_root_linker){
+        .links = true, .ld = h->driver.ld,
+        .collect2 = h->driver.collect2[0] ? h->driver.collect2 : NULL,
+        .argv = h->argv.link, .argc = h->argv.link_n,
+    };
+    r->environ = h->envp->v;
+    if (k->t0)
+        r->compile_t0 = *k->t0;
+    r->abi_generation = st->abi_generation;
+    r->abi = st->abi;
+    r->abi_count = st->abi_count;
+    r->policy.present = true;
+    zcl_sha3_256((const unsigned char *)st->policy, st->policy_len,
+                 r->policy.root);
+}
+
+/* A build that did not complete never observed this attempt's closure, and
+ * a depfile that is gone names nothing: both are misses, not roots. */
+static bool ars_hook_closure_known(const struct ars_compile *k,
+                                   struct ars_miss *m)
+{
+    if (!k->root || !k->owner || !k->cc || !k->cflags || !k->ldflags) {
+        ars_miss_set(m, "request_incomplete",
+                     "hotload compile identity is incomplete", NULL);
+        return false;
+    }
+    if (!k->depfile) {
+        ars_miss_set(m, "closure_unobserved",
+                     "the build did not complete, so this attempt's "
+                     "dependency closure was never observed", k->owner);
+        return false;
+    }
+    if (access(k->depfile, F_OK) != 0) {
+        ars_miss_set(m, "depfile_missing", "dependency file is absent",
+                     k->owner);
+        return false;
+    }
+    return true;
+}
+
+static bool ars_harness_stable(const struct stat *a, const struct stat *b)
+{
+    bool same = a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+        a->st_size == b->st_size && a->st_mode == b->st_mode &&
+        a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime;
+#if defined(__linux__)
+    same = same && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+        a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+#endif
+    return same;
+}
+
+static bool ars_harness_hash(FILE *image, uint8_t out[32], uint64_t *bytes)
+{
+    static const char domain[] = "zcl.module_builder.running_image.v1";
+    struct sha3_256_ctx sha;
+    uint8_t buffer[16384];
+    sha3_256_init(&sha);
+    sha3_256_write(&sha, (const uint8_t *)domain, sizeof(domain));
+    *bytes = 0;
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), image)) != 0) {
+        if (UINT64_MAX - *bytes < n)
+            return false;
+        *bytes += n;
+        sha3_256_write(&sha, buffer, n);
+    }
+    if (ferror(image))
+        return false;
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+static bool ars_harness_read(struct ars_hook *h, FILE *image, uint8_t out[32])
+{
+    h->harness_hashes++;
+    return ars_harness_hash(image, out, &h->harness_read_bytes);
+}
+
+/* Input identity only: these bytes need not match the edited source tree. */
+#ifndef ARS_HARNESS_CACHE
+static bool ars_harness_uncached(struct ars_hook *h, struct ars_miss *m)
+{
+    if (os_proc_self_exe_identity() != OS_PROC_IMAGE_IDENTITY_RUNNING_IMAGE)
+        return true; /* A pathname provides no executing-image evidence. */
+    h->harness_image = os_proc_open_self_exe();
+    struct stat before, after;
+    int fd = h->harness_image ? fileno(h->harness_image) : -1;
+    bool ok = fd >= 0 && fstat(fd, &before) == 0 &&
+        S_ISREG(before.st_mode) && before.st_size > 0 &&
+        ars_harness_read(h, h->harness_image, h->req.harness.root) &&
+        fstat(fd, &after) == 0 && ars_harness_stable(&before, &after) &&
+        h->harness_read_bytes == (uint64_t)before.st_size;
+    if (!ok) {
+        ars_miss_set(m, "harness_image_unavailable",
+                     "executing builder image could not be stably captured", NULL);
+        return false;
+    }
+    h->req.harness.present = true;
+    h->harness_fd = fd;
+    h->harness_stamp = after;
+    h->harness_pinned = true;
+    return true;
+}
+#endif
+
+#ifdef ARS_HARNESS_CACHE
+static struct {
+    pthread_mutex_t lock;
+    atomic_uint creator;
+    FILE *image;
+    struct stat stamp;
+    uint8_t root[32];
+    bool ready;
+} g_ars_harness = { .lock = PTHREAD_MUTEX_INITIALIZER, .creator = 0 };
+
+static bool ars_harness_pid_matches(void)
+{
+    unsigned owner = atomic_load_explicit(&g_ars_harness.creator,
+                                          memory_order_relaxed);
+    return !owner || owner == (unsigned)getpid();
+}
+
+static bool ars_harness_cache_open(struct ars_miss *m)
+{
+    if (g_ars_harness.image)
+        return true;
+    FILE *image = os_proc_open_self_exe();
+    int fd = image ? fileno(image) : -1;
+    int flags = fd >= 0 ? fcntl(fd, F_GETFD) : -1;
+    if (flags < 0) {
+        if (image)
+            (void)fclose(image);
+        ars_miss_set(m, "harness_image_unavailable",
+                     "running-image descriptor or custody flags are unavailable", NULL);
+        return false;
+    }
+    if (!(flags & FD_CLOEXEC)) {
+        if (image)
+            (void)fclose(image);
+        ars_miss_set(m, "harness_image_inheritable",
+                     "running-image opener lacks close-on-exec custody", NULL);
+        return false;
+    }
+    g_ars_harness.image = image;
+    return true;
+}
+
+static bool ars_harness_cache_read(struct ars_hook *h, struct ars_miss *m)
+{
+    struct stat before, after;
+    int fd = fileno(g_ars_harness.image);
+    if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) ||
+        before.st_size <= 0) {
+        g_ars_harness.ready = false;
+        ars_miss_set(m, "harness_image_unavailable",
+                     "retained builder image metadata is unavailable", NULL);
+        return false;
+    }
+    if (g_ars_harness.ready &&
+        ars_harness_stable(&before, &g_ars_harness.stamp)) {
+        h->harness_cache_hits = 1;
+        return true;
+    }
+    g_ars_harness.ready = false;
+    bool ok = fseeko(g_ars_harness.image, 0, SEEK_SET) == 0;
+    clearerr(g_ars_harness.image);
+    ok = ok && ars_harness_read(h, g_ars_harness.image, g_ars_harness.root) &&
+        fstat(fd, &after) == 0 && ars_harness_stable(&before, &after) &&
+        h->harness_read_bytes == (uint64_t)before.st_size;
+    if (!ok) {
+        ars_miss_set(m, "harness_image_unavailable",
+                     "retained builder image could not be stably recaptured", NULL);
+        return false;
+    }
+    g_ars_harness.stamp = after;
+    g_ars_harness.ready = true;
+    return true;
+}
+
+static bool ars_harness_cached(struct ars_hook *h, struct ars_miss *m)
+{
+    unsigned pid = (unsigned)getpid(), unset = 0;
+    (void)atomic_compare_exchange_strong_explicit(&g_ars_harness.creator,
+        &unset, pid, memory_order_relaxed, memory_order_relaxed);
+    if (!ars_harness_pid_matches() ||
+        pthread_mutex_lock(&g_ars_harness.lock) != 0) {
+        ars_miss_set(m, "harness_cache_unavailable",
+                     "builder image cache is unavailable in this process", NULL);
+        return false;
+    }
+    bool ok = ars_harness_cache_open(m) && ars_harness_cache_read(h, m);
+    if (ok) {
+        memcpy(h->req.harness.root, g_ars_harness.root, 32);
+        h->req.harness.present = true;
+        h->harness_fd = fileno(g_ars_harness.image);
+        h->harness_stamp = g_ars_harness.stamp;
+        h->harness_pinned = true;
+    }
+    if (pthread_mutex_unlock(&g_ars_harness.lock) != 0) {
+        ars_miss_set(m, "harness_cache_unavailable",
+                     "builder image cache unlock failed", NULL);
+        return false;
+    }
+    return ok;
+}
+#else
+static bool ars_harness_pid_matches(void) { return true; }
+#endif
+
+static bool ars_harness_capture(struct ars_hook *h, struct ars_miss *m)
+{
+    if (os_proc_self_exe_identity() != OS_PROC_IMAGE_IDENTITY_RUNNING_IMAGE)
+        return true;
+#ifdef ARS_HARNESS_CACHE
+    return ars_harness_cached(h, m);
+#else
+    return ars_harness_uncached(h, m);
+#endif
+}
+
+static bool ars_harness_finish(const struct ars_hook *h, struct ars_miss *m)
+{
+    if (!h->harness_pinned)
+        return true;
+    struct stat after;
+    if (fstat(h->harness_fd, &after) == 0 &&
+        ars_harness_stable(&h->harness_stamp, &after))
+        return true;
+    ars_miss_set(m, "harness_image_changed",
+                 "builder image metadata changed during action derivation", NULL);
+    return false;
+}
+
+static bool ars_harness_child_receipt(
+    struct zcl_devloop_hotswap_build_receipt *r)
+{
+    if (ars_harness_pid_matches())
+        return false;
+    r->action_root[0] = r->action_root_cause[0] = '\0';
+    memcpy(r->action_root_miss, "harness_fork_unavailable",
+           sizeof("harness_fork_unavailable"));
+    memcpy(r->action_root_miss_detail, "inherited builder cache requires exec",
+           sizeof("inherited builder cache requires exec"));
+    r->action_root_us = r->action_root_store_us = 0;
+    r->action_root_probes = r->action_root_present = 0;
+    r->action_root_harness_read_bytes = 0;
+    r->action_root_harness_hashes = r->action_root_harness_cache_hits = 0;
+    return true;
+}
+
+static bool ars_hook_derive(const struct ars_compile *k,
+                            struct zcl_action_root_result *result,
+                            struct ars_miss *m)
+{
+    if (!ars_hook_closure_known(k, m))
+        return false;
+    struct ars_hook *h = zcl_calloc(1, sizeof(*h), "action root hook");
+    if (!h) {
+        ars_miss_set(m, "out_of_memory", "action root hook allocation failed",
+                     NULL);
+        return false;
+    }
+    bool ok = ars_hook_inputs(h, k, m);
+    if (ok) {
+        ars_hook_request(h, k);
+        ok = ars_harness_capture(h, m);
+        if (ok) {
+            ok = zcl_action_root_derive(&h->req, result);
+            if (!ok)
+                ars_miss_set(m, result->miss[0] ? result->miss : "encode_refused",
+                             result->why[0] ? result->why : "action root refused",
+                             NULL);
+            if (ok)
+                ok = ars_harness_finish(h, m);
+        }
+    }
+    result->harness_read_bytes = h->harness_read_bytes;
+    result->harness_hashes = h->harness_hashes;
+    result->harness_cache_hits = h->harness_cache_hits;
+    if (h->harness_image)
+        (void)fclose(h->harness_image);
+    free(h);
+    return ok;
+}
+
+static void ars_hook_store(const char *unit,
+                           const struct zcl_action_root_result *result,
+                           struct zcl_devloop_hotswap_build_receipt *receipt,
+                           struct ars_miss *m)
+{
+    char store[PATH_MAX];
+    if (zcl_action_root_store_dir(store, sizeof(store)) &&
+        zcl_action_root_record(store, unit, result,
+                               receipt->action_root_cause,
+                               sizeof(receipt->action_root_cause), m->why,
+                               sizeof(m->why)))
+        (void)snprintf(receipt->action_root, sizeof(receipt->action_root),
+                       "%s", result->root_hex);
+    else
+        ars_miss_set(m, "store_unavailable", "action root store unavailable",
+                     NULL);
+}
+
+static void ars_hook_run(const struct ars_compile *k, const char *unit,
+                         struct zcl_devloop_hotswap_build_receipt *receipt)
+{
+    receipt->action_root[0] = '\0';
+    receipt->action_root_cause[0] = '\0';
+    receipt->action_root_miss[0] = '\0';
+    receipt->action_root_miss_detail[0] = '\0';
+    struct ars_miss m = {0};
+    struct zcl_action_root_result result = {0};
+    int64_t started = platform_time_monotonic_us();
+    bool derived = ars_hook_derive(k, &result, &m);
+    receipt->action_root_us = platform_time_monotonic_us() - started;
+    receipt->action_root_probes = result.probes;
+    receipt->action_root_present = result.present;
+    receipt->action_root_harness_read_bytes = result.harness_read_bytes;
+    receipt->action_root_harness_hashes = result.harness_hashes;
+    receipt->action_root_harness_cache_hits = result.harness_cache_hits;
+    int64_t store_started = platform_time_monotonic_us();
+    if (derived)
+        ars_hook_store(unit, &result, receipt, &m);
+    receipt->action_root_store_us =
+        platform_time_monotonic_us() - store_started;
+    if (!receipt->action_root[0]) {
+        receipt->action_root_cause[0] = '\0';
+        if (!m.code[0])
+            ars_miss_set(&m, "unclassified", "action root missed", NULL);
+        (void)snprintf(receipt->action_root_miss,
+                       sizeof(receipt->action_root_miss), "%s", m.code);
+        (void)snprintf(receipt->action_root_miss_detail,
+                       sizeof(receipt->action_root_miss_detail), "%s", m.why);
+    }
+    zcl_action_root_result_free(&result);
+}
+
+void zcl_devloop_action_root_hotswap(
+    const char *root, const char *owner, const char *cc, const char *cflags,
+    const char *ldflags, const char *depfile,
+    const struct zcl_action_root_t0 *t0,
+    const struct zcl_action_root_child_env *env,
+    struct zcl_devloop_hotswap_build_receipt *receipt)
+{
+    if (!receipt || ars_harness_child_receipt(receipt))
+        return;
+    const struct ars_compile k = { root, owner, cc, cflags, ldflags, depfile,
+                                   NULL, t0, env };
+    ars_hook_run(&k, owner, receipt);
+}
+
+void zcl_devloop_action_root_hotfork(
+    const char *root, const char *owner, const char *cc, const char *cflags,
+    const char *unity, const char *depfile,
+    const struct zcl_action_root_t0 *t0,
+    const struct zcl_action_root_child_env *env,
+    struct zcl_devloop_hotswap_build_receipt *receipt)
+{
+    if (!receipt || ars_harness_child_receipt(receipt))
+        return;
+    char unit[320];
+    (void)snprintf(unit, sizeof(unit), "hotfork:%s", owner ? owner : "");
+    const struct ars_compile k = { root, owner, cc, cflags, "",
+                                   depfile, unity ? unity : "", t0, env };
+    ars_hook_run(&k, unit, receipt);
+}
+
+bool zcl_devloop_action_root_key(
+    const char *root, const char *owner, const char *cc, const char *cflags,
+    const char *ldflags, const char *unity, const char *depfile,
+    const struct zcl_action_root_t0 *t0,
+    const struct zcl_action_root_child_env *env, char root_hex[65],
+    char miss[40])
+{
+    if (!root_hex || !miss)
+        return false;
+    root_hex[0] = '\0';
+    miss[0] = '\0';
+    if (!ars_harness_pid_matches()) {
+        memcpy(miss, "harness_fork_unavailable",
+               sizeof("harness_fork_unavailable"));
+        return false;
+    }
+    const struct ars_compile k = { root, owner, cc, cflags,
+                                   unity ? "" : ldflags, depfile, unity, t0,
+                                   env };
+    struct ars_miss m = {0};
+    struct zcl_action_root_result result = {0};
+    bool ok = ars_hook_derive(&k, &result, &m);
+    if (ok)
+        (void)snprintf(root_hex, 65, "%s", result.root_hex);
+    else
+        (void)snprintf(miss, 40, "%s", m.code[0] ? m.code : "unclassified");
+    zcl_action_root_result_free(&result);
+    return ok;
+}
+
+void zcl_devloop_action_root_emit(
+    struct json_value *receipt_json,
+    const struct zcl_devloop_hotswap_build_receipt *build)
+{
+    if (!receipt_json || !build)
+        return;
+    if (build->cache_key_action_root[0] || build->cache_key_miss[0]) {
+        (void)json_push_kv_str(receipt_json, "artifact_cache_key_schema",
+                               "zcl.dev_artifact_cache.hotswap.v2");
+        if (build->cache_key_action_root[0])
+            (void)json_push_kv_str(receipt_json,
+                                   "artifact_cache_key_action_root",
+                                   build->cache_key_action_root);
+        else
+            (void)json_push_kv_str(receipt_json, "artifact_cache_key_miss",
+                                   build->cache_key_miss);
+        (void)json_push_kv_int(receipt_json, "artifact_cache_key_us",
+                               build->cache_key_us);
+    }
+    if (!build->action_root[0] && !build->action_root_miss[0])
+        return;
+    (void)json_push_kv_str(receipt_json, "action_root_schema",
+                           VCS_ACTION_PREIMAGE_V2_MAGIC);
+    if (build->action_root[0]) {
+        (void)json_push_kv_str(receipt_json, "action_root",
+                               build->action_root);
+        (void)json_push_kv_str(receipt_json, "action_root_cause",
+                               build->action_root_cause);
+    } else {
+        struct json_value none;
+        json_init(&none);
+        json_set_null(&none);
+        (void)json_push_kv(receipt_json, "action_root", &none);
+        json_free(&none);
+        (void)json_push_kv_str(receipt_json, "action_root_cause", "miss");
+        (void)json_push_kv_str(receipt_json, "action_root_miss_reason",
+                               build->action_root_miss);
+        (void)json_push_kv_str(receipt_json, "action_root_miss_detail",
+                               build->action_root_miss_detail);
+    }
+    (void)json_push_kv_int(receipt_json, "action_root_ms",
+                           build->action_root_us / 1000);
+    (void)json_push_kv_int(receipt_json, "action_root_us",
+                           build->action_root_us);
+    (void)json_push_kv_int(receipt_json, "action_root_store_us",
+                           build->action_root_store_us);
+    (void)json_push_kv_int(receipt_json, "action_root_probes",
+                           build->action_root_probes);
+    (void)json_push_kv_int(receipt_json, "action_root_present",
+                           build->action_root_present);
+    (void)json_push_kv_int(receipt_json, "action_root_harness_read_bytes",
+                           (int64_t)build->action_root_harness_read_bytes);
+    (void)json_push_kv_int(receipt_json, "action_root_harness_hashes",
+                           build->action_root_harness_hashes);
+    (void)json_push_kv_int(receipt_json, "action_root_harness_cache_hits",
+                           build->action_root_harness_cache_hits);
+}

@@ -1,0 +1,68 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * purpose: Private recheck surface shared by the confined worker and its
+ * binding-currency/ZCODE-context verifier. */
+
+#ifndef ZCL_SERVICES_BUILD_FABRIC_WORKER_INTERNAL_H
+#define ZCL_SERVICES_BUILD_FABRIC_WORKER_INTERNAL_H
+
+#if !defined(_WIN32)
+
+#include "models/build_fabric.h"
+#include "util/result.h"
+#include "util/spawn.h"
+#include "vcs/zcode_dev.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+
+/* Resolve the exact verifier executable selected for a physical action. */
+struct zcl_result bfw_worker_path(const char *workspace, char *out,
+                                  size_t cap);
+
+#ifdef ZCL_TESTING
+void build_fabric_worker_test_before_owner_check(void (*hook)(void *),
+                                                void *context);
+#endif
+
+struct build_fabric_executor_identity;
+struct vcs_package_store;
+void bfw_attach_publish_checked(
+    bool stable, const char *workspace, struct vcs_package_store *store,
+    const struct db_build_job *job,
+    const struct db_build_action *action, const uint8_t input_root[32],
+    const struct build_fabric_executor_identity *identity);
+int bfw_attach_spawn(
+    const char *workspace, const char *selected_verifier,
+    uint8_t work_kind, bool package_action, const char *const argv[],
+    char *capture, size_t capture_cap, int timeout_ms,
+    zcl_spawn_cancel_fn should_cancel, void *cancel_ctx, bool *cancelled,
+    struct build_fabric_executor_identity *identity, bool *stable,
+    struct zcl_spawn_measure *measure);
+
+/* The source tree named by `root_hex` is still exactly in the workspace CAS
+ * and still hashes to its own name. */
+bool bfw_input_root_current(const char *workspace, const char *root_hex);
+
+/* This host's gcc capsule still roots to the toolchain the job was bound to. */
+bool bfw_toolchain_current(const struct db_build_job *job);
+
+/* The database still holds the exact job/action/lease binding this worker
+ * captured, and both ids still re-derive from their stored roots. */
+bool bfw_binding_current(
+    struct node_db *ndb, const struct db_build_job *expected_job,
+    const struct db_build_action *expected_action, const char *lease_id);
+
+/* Load the action's ZCODE task/candidate/proof-policy from the workspace CAS
+ * and refuse unless every root, patch, toolchain, and source binding still
+ * verifies. `*present` stays false for an action with no ZCODE context. */
+struct zcl_result bfw_load_zcode_context(
+    const char *workspace, const struct db_build_job *job,
+    const struct db_build_action *action, int64_t now,
+    struct vcs_zcode_task_v1 *task,
+    struct vcs_zcode_candidate_v1 *candidate,
+    struct vcs_zcode_proof_policy_v1 *policy, bool *present);
+
+#endif /* !_WIN32 */
+
+#endif /* ZCL_SERVICES_BUILD_FABRIC_WORKER_INTERNAL_H */

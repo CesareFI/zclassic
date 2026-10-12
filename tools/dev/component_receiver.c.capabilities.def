@@ -1,0 +1,5 @@
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0
+ * Declare the component receiver's direct assembly and diagnostic writes. */
+ZCL_MODULE_CAPABILITY("tools/dev/component_receiver.c", CAP_FS_WRITE,
+    "Writes verified component chunks only to its owned anonymous assembly "
+    "memfd and emits checked-allocation and refusal diagnostics.")

@@ -1,0 +1,6786 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Purpose: hermetic preparation, capsule, and detached sealing proofs. */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
+#include "test/test_core.h"
+#include "base/hex.h"
+#include "base/cleanse.h"
+#include "base/safe_alloc.h"
+#include "command/native_command.h"
+#include "command/native_zcode_discovery.h"
+#include "command/native_zcode_join.h"
+#include "command/native_zcode_work_map.h"
+#include "sha3/sha3.h"
+#include "config/command_catalog.h"
+#include "config/boot_zcode_async_proof.h"
+#include "controllers/rpc_client.h"
+#include "controllers/agent_impact_rules.h"
+#include "crypto/ed25519.h"
+#include "json/json.h"
+#include "models/build_fabric.h"
+#include "models/database.h"
+#include "platform/directory_compat.h"
+#include "platform/environment_compat.h"
+#include "platform/state_root.h"
+#include "platform/time_compat.h"
+#include "services/build_fabric_service.h"
+#include "services/build_fabric_worker.h"
+#include "services/zcode_lane_service.h"
+#include "services/zcode_agent_context_service.h"
+#include "rpc/server.h"
+#include "storage/event_log.h"
+#include "dev/devloop.h"
+#include "util/file_tree_ops.h"
+#include "util/util.h"
+#include "chain/chainparams.h"
+#include "vcs/package_accept.h"
+#include "vcs/package_capsule.h"
+#include "vcs/package_prepare.h"
+#include "vcs/package_mapping.h"
+#include "vcs/package_reuse.h"
+#include "vcs/package_swarm_node.h"
+#include "vcs/vcs.h"
+#include "vcs/vcs_devloop.h"
+#include "vcs/vcs_object.h"
+#include "vcs/zcode_app_run_observation.h"
+#include "vcs/zcode_dev.h"
+#include "vcs/zcode_task_context.h"
+#include "vcs/zcode_agent_context.h"
+#include "vcs/package_store.h"
+#include "vcs/package_content.h"
+#include "vcs/zcode_task_authority_bundle.h"
+#include "vcs/zcode_write_scope.h"
+#include "vcs/zcode_task_index.h"
+#include "vcs/zcode_work_pull_receipt.h"
+
+#include <secp256k1.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#endif
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+struct zpd_preflight_case { const char *key, *raw, *code; };
+struct zpd_preflight_reference { char wire[1024]; size_t bytes; };
+
+static bool zpd_preflight_select_work(const char *root, struct json_value *input)
+{
+    /* Empty/missing work selects greatest expiry, then greatest root, not
+     * necessarily the saved ready task: map fixtures also store task wires
+     * with altered goals. Compare its packet with that exact root's packet. */
+    struct vcs_zcode_task_index *index = vcs_zcode_task_index_build(
+        root, platform_time_wall_unix());
+    size_t count = index ? vcs_zcode_task_index_task_count(index) : 0;
+    const struct vcs_zcode_task_index_entry *best = count
+        ? vcs_zcode_task_index_task_at(index, 0) : NULL;
+    for (size_t i = 1; i < count; i++) {
+        const struct vcs_zcode_task_index_entry *at =
+            vcs_zcode_task_index_task_at(index, i);
+        if (at->expires_unix > best->expires_unix ||
+            (at->expires_unix == best->expires_unix &&
+             strcmp(at->task_root_hex, best->task_root_hex) > 0)) best = at;
+    }
+    bool selected = best && json_push_kv_str(input, "workspace", root) &&
+        json_push_kv_str(input, "work", best->task_root_hex);
+    vcs_zcode_task_index_free(index);
+    return selected;
+}
+
+static bool zpd_preflight_no_model(const struct zcl_command_reply *reply)
+{
+    const struct json_value *attempted = json_get(
+        &reply->data, "model_request_attempted");
+    return attempted && attempted->type == JSON_BOOL && !json_get_bool(attempted);
+}
+
+static bool zpd_preflight_reference_packet(const char *root,
+    struct zpd_preflight_reference *reference)
+{
+    struct json_value selected_input;
+    json_init(&selected_input); json_set_object(&selected_input);
+    bool selected = zpd_preflight_select_work(root, &selected_input);
+    struct zcl_command_request selected_request = { .input = &selected_input };
+    struct zcl_command_reply selected_reply;
+    zcl_command_reply_init(&selected_reply, "zcl.zcode_work_preflight.v1");
+    if (selected) zcl_native_handle_zcode_work_preflight(
+        &selected_request, &selected_reply);
+    const struct json_value *packet = json_get(
+        json_get(&selected_reply.data, "checks"), "packet");
+    reference->bytes = packet
+        ? json_write(packet, reference->wire, sizeof(reference->wire)) : 0;
+    selected = selected && selected_reply.status == ZCL_COMMAND_STATUS_PASSED &&
+        selected_reply.exit_code == ZCL_COMMAND_EXIT_OK &&
+        zpd_preflight_no_model(&selected_reply) &&
+        reference->bytes > 0 && reference->bytes < sizeof(reference->wire);
+    zcl_command_reply_free(&selected_reply); json_free(&selected_input);
+    if (!selected)
+        fprintf(stderr, "preflight default work reference packet unavailable\n");
+    return selected;
+}
+
+static bool zpd_preflight_case_cwd(const struct zpd_preflight_case *row,
+    const char *root, char *saved, size_t cap, bool *changed)
+{
+    if (row->code || strcmp(row->key, "workspace") != 0) return true;
+    if (!getcwd(saved, cap)) return false;
+    *changed = chdir(root) == 0;
+    return *changed;
+}
+
+static bool zpd_preflight_case_input(const struct zpd_preflight_case *row,
+    const char *root, const char *work, struct json_value *input,
+    struct json_value *value)
+{
+    bool built = (strcmp(row->key, "workspace") == 0 ||
+                  json_push_kv_str(input, "workspace", root)) &&
+                 (strcmp(row->key, "work") == 0 ||
+                  json_push_kv_str(input, "work", work));
+    if (row->raw)
+        built = built && json_read(value, row->raw, strlen(row->raw)) &&
+                json_push_kv(input, row->key, value);
+    return built;
+}
+
+static bool zpd_preflight_refusal(const struct zpd_preflight_case *row,
+    const struct zcl_command_reply *reply)
+{
+    return reply->status == ZCL_COMMAND_STATUS_FAILED &&
+        reply->exit_code == ZCL_COMMAND_EXIT_INVALID &&
+        strcmp(reply->error.code, row->code) == 0 &&
+        strstr(reply->error.message, row->key) != NULL &&
+        !reply->error.mutated && json_get(&reply->data, "checks") == NULL &&
+        zpd_preflight_no_model(reply);
+}
+
+static bool zpd_preflight_default_packet(const struct zpd_preflight_case *row,
+    const struct zcl_command_reply *reply,
+    const struct zpd_preflight_reference *reference)
+{
+    const struct json_value *packet = json_get(
+        json_get(&reply->data, "checks"), "packet");
+    if (strcmp(row->key, "work") == 0) {
+        char wire[1024];
+        size_t bytes = packet ? json_write(packet, wire, sizeof(wire)) : 0;
+        return bytes == reference->bytes && bytes < sizeof(wire) &&
+            memcmp(wire, reference->wire, reference->bytes) == 0;
+    }
+    const struct json_value *ready = json_get(packet, "ready");
+    return ready && ready->type == JSON_BOOL && json_get_bool(ready);
+}
+
+static bool zpd_preflight_case_reply(const struct zpd_preflight_case *row,
+    const struct zcl_command_reply *reply,
+    const struct zpd_preflight_reference *reference)
+{
+    if (row->code) return zpd_preflight_refusal(row, reply);
+    return reply->status == ZCL_COMMAND_STATUS_PASSED &&
+        reply->exit_code == ZCL_COMMAND_EXIT_OK && zpd_preflight_no_model(reply) &&
+        zpd_preflight_default_packet(row, reply, reference);
+}
+
+static bool zpd_preflight_case_run(const struct zpd_preflight_case *row,
+    const char *root, const char *work,
+    const struct zpd_preflight_reference *reference, size_t i, bool cwd_ready)
+{
+    struct json_value input, value;
+    json_init(&input); json_set_object(&input); json_init(&value);
+    bool built = cwd_ready && zpd_preflight_case_input(
+        row, root, work, &input, &value);
+    struct zcl_command_request request = { .input = &input };
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.zcode_work_preflight.v1");
+    if (built) zcl_native_handle_zcode_work_preflight(&request, &reply);
+    bool matched = built && zpd_preflight_case_reply(row, &reply, reference);
+    if (!matched)
+        fprintf(stderr, "preflight type case=%zu key=%s raw=%s error=%s\n",
+                i, row->key, row->raw ? row->raw : "omitted", reply.error.code);
+    zcl_command_reply_free(&reply); json_free(&value); json_free(&input);
+    return matched;
+}
+
+static bool zpd_preflight_input_types(const char *root, const char *work)
+{
+    static const struct zpd_preflight_case cases[] = {
+        { "workspace", "null", "BAD_WORKSPACE" },
+        { "workspace", "true", "BAD_WORKSPACE" },
+        { "workspace", "42", "BAD_WORKSPACE" },
+        { "workspace", "0.5", "BAD_WORKSPACE" },
+        { "workspace", "[]", "BAD_WORKSPACE" },
+        { "workspace", "{}", "BAD_WORKSPACE" },
+        { "datadir", "null", "BAD_DATADIR" },
+        { "datadir", "true", "BAD_DATADIR" },
+        { "datadir", "42", "BAD_DATADIR" },
+        { "datadir", "0.5", "BAD_DATADIR" },
+        { "datadir", "[]", "BAD_DATADIR" },
+        { "datadir", "{}", "BAD_DATADIR" },
+        { "work", "null", "BAD_WORK" },
+        { "work", "true", "BAD_WORK" },
+        { "work", "0.5", "BAD_WORK" },
+        { "work", "[]", "BAD_WORK" },
+        { "work", "{}", "BAD_WORK" },
+        { "work", "42", "BAD_WORK" },
+        { "datadir", NULL, NULL },
+        { "datadir", "\"\"", NULL },
+        { "workspace", NULL, NULL },
+        { "workspace", "\"\"", NULL },
+        { "work", NULL, NULL },
+        { "work", "\"\"", NULL },
+    };
+    struct zpd_preflight_reference reference;
+    if (!zpd_preflight_reference_packet(root, &reference)) return false;
+    bool all = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char saved_cwd[4400];
+        bool changed_cwd = false;
+        bool cwd_ready = zpd_preflight_case_cwd(&cases[i], root, saved_cwd,
+                                              sizeof(saved_cwd), &changed_cwd);
+        bool matched = zpd_preflight_case_run(&cases[i], root, work,
+                                             &reference, i, cwd_ready);
+        all = all && matched;
+        /* No early return after chdir: restore even on construction/refusal
+         * failure, before reporting failure to the caller's fixture cleanup. */
+        if (changed_cwd && chdir(saved_cwd) != 0) {
+            fprintf(stderr, "preflight workspace case=%zu cwd restoration failed\n", i);
+            all = false;
+            break;
+        }
+    }
+    return all;
+}
+
+bool zpd_real_focus_preedit_acceptance(
+    const char *workspace, const char *work_id,
+    const struct json_value *focus_data,
+    const struct json_value *duplicate_data,
+    uint8_t out_focus_root[32], int64_t *out_observed_us);
+bool zpd_real_focus_handoff_acceptance(
+    const char *workspace, const char *work_id,
+    const struct json_value *focus_data,
+    const uint8_t source_receipt_root[32],
+    const uint8_t preedit_focus_root[32], int64_t preedit_observed_us,
+    int64_t edit_started_us);
+int zpd_focus_worker_role(const char *role);
+bool zpd_user_session_resume(const char *workspace,
+                             const struct json_value *data);
+bool zpd_user_session_scope_refusals(const char *workspace,
+                                     const struct json_value *data);
+
+static bool zpd_symlink_create(const char *target, const char *link,
+                               bool directory)
+{
+#if defined(_WIN32)
+    DWORD flags = (directory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0) |
+                  SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    if (CreateSymbolicLinkA(link, target, flags) != 0)
+        return true;
+    flags &= ~SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    return GetLastError() == ERROR_INVALID_PARAMETER &&
+           CreateSymbolicLinkA(link, target, flags) != 0;
+#else
+    (void)directory;
+    return symlink(target, link) == 0;
+#endif
+}
+
+static bool zpd_symlink_remove(const char *path, bool directory)
+{
+#if defined(_WIN32)
+    return directory ? RemoveDirectoryA(path) != 0 : DeleteFileA(path) != 0;
+#else
+    (void)directory;
+    return unlink(path) == 0;
+#endif
+}
+
+static bool zpd_special_create(const char *path)
+{
+#if defined(_WIN32)
+    return platform_directory_create(path, 0700) == 0;
+#else
+    return mkfifo(path, 0600) == 0;
+#endif
+}
+
+static bool zpd_special_remove(const char *path)
+{
+#if defined(_WIN32)
+    return rmdir(path) == 0;
+#else
+    return unlink(path) == 0;
+#endif
+}
+
+#if !defined(_WIN32)
+static const char *zpd_accept_rpc_wire;
+static const char *zpd_publish_rpc_wire;
+static unsigned zpd_accept_rpc_calls, zpd_publish_rpc_calls;
+
+static char *zpd_publication_rpc_response(const char *method, const char *params)
+{
+    struct json_value input;
+    json_init(&input);
+    bool exact = json_read(&input, params, strlen(params)) &&
+        input.type == JSON_ARR && json_size(&input) == 1 &&
+        json_get_str(json_get(json_at(&input, 0), "work")) != NULL;
+    json_free(&input);
+    if (!exact) return NULL;
+    if (strcmp(method, "zcode_work_accept") == 0) {
+        zpd_accept_rpc_calls++;
+        return strdup(zpd_accept_rpc_wire);
+    }
+    if (strcmp(method, "zcode_work_publish") == 0) {
+        zpd_publish_rpc_calls++;
+        return strdup(zpd_publish_rpc_wire);
+    }
+    return NULL;
+}
+
+/* Serialize actual registered RPC results first, then consume them through
+ * a separate process's real live-ledger forwarding path. This exercises both
+ * envelope adapters without needing a listening network endpoint. */
+static bool zpd_publication_rpc_roundtrip(
+    const struct json_value *accept_input,
+    const struct json_value *publish_input, const char *db_path,
+    const char *job_hex)
+{
+    struct rpc_table table;
+    rpc_table_init(&table);
+    boot_zcode_async_proof_register_rpc(&table);
+    const struct rpc_command *accept = rpc_table_find(&table, "zcode_work_accept");
+    const struct rpc_command *publish = rpc_table_find(&table, "zcode_work_publish");
+    if (!accept || !publish) return false;
+    struct json_value params, result;
+    json_init(&params); json_set_array(&params);
+    json_init(&result);
+    char accept_wire[16384], publish_wire[16384];
+    bool ok = json_push_back(&params, accept_input) &&
+        accept->actor(&params, false, &result) &&
+        json_get_bool(json_get(&result, "ok"));
+    size_t len = ok ? json_write(&result, accept_wire, sizeof(accept_wire)) : 0;
+    ok = ok && len > 0 && len < sizeof(accept_wire);
+    json_free(&params); json_set_array(&params);
+    json_free(&result);
+    ok = ok && json_push_back(&params, publish_input) &&
+        publish->actor(&params, false, &result) &&
+        json_get_bool(json_get(&result, "ok"));
+    len = ok ? json_write(&result, publish_wire, sizeof(publish_wire)) : 0;
+    ok = ok && len > 0 && len < sizeof(publish_wire);
+    json_free(&params); json_free(&result);
+    struct node_db resident = {0};
+    ok = ok && node_db_open(&resident, db_path);
+    pid_t child = ok ? fork() : -1;
+    if (child == 0) {
+        zpd_accept_rpc_wire = accept_wire;
+        zpd_publish_rpc_wire = publish_wire;
+        zpd_accept_rpc_calls = zpd_publish_rpc_calls = 0;
+        node_rpc_client_set_test_hook(zpd_publication_rpc_response);
+        struct zcl_command_request request = {.input = accept_input};
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_accept.v1");
+        zcl_native_handle_zcode_work_accept(&request, &reply);
+        bool roundtrip = reply.status == ZCL_COMMAND_STATUS_PASSED &&
+            reply.next_count == 1 &&
+            strcmp(reply.next[0].command, "zcode.work.publish") == 0 &&
+            json_get_int(json_get(&reply.data, "live_rpc_response_bytes")) > 0;
+        struct json_value next;
+        json_init(&next);
+        roundtrip = roundtrip && json_read(&next, reply.next[0].input_json,
+                                          strlen(reply.next[0].input_json));
+        const char *forwarded_job = json_get_str(json_get(&next, "job_root"));
+        roundtrip = roundtrip && forwarded_job && strcmp(forwarded_job, job_hex) == 0;
+        zcl_command_reply_free(&reply);
+        request.input = &next;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_publish.v1");
+        if (roundtrip) zcl_native_handle_zcode_work_publish(&request, &reply);
+        roundtrip = roundtrip && reply.status == ZCL_COMMAND_STATUS_PASSED &&
+            reply.next_count == 1 &&
+            strcmp(reply.next[0].command, "discover.schema") == 0 &&
+            json_get_int(json_get(&reply.data, "live_rpc_response_bytes")) > 0 &&
+            zpd_accept_rpc_calls == 1 && zpd_publish_rpc_calls == 1;
+        zcl_command_reply_free(&reply);
+        zpd_publish_rpc_wire = "{\"ok\":true,\"data\":{},\"next\":["
+            "{\"command\":\"nonexistent.command\",\"input_json\":\"{}\",\"reason\":\"bad\"}]}";
+        zcl_command_reply_init(&reply, "zcl.zcode_work_publish.v1");
+        if (roundtrip) zcl_native_handle_zcode_work_publish(&request, &reply);
+        roundtrip = roundtrip && reply.status == ZCL_COMMAND_STATUS_FAILED &&
+            strcmp(reply.error.code, "LIVE_CONTINUATION_INVALID") == 0 &&
+            reply.next_count == 0;
+        zcl_command_reply_free(&reply);
+        json_free(&next);
+        _exit(roundtrip ? 0 : 1);
+    }
+    int status = 0;
+    bool waited = child > 0 && waitpid(child, &status, 0) == child;
+    if (resident.open) node_db_close(&resident);
+    return ok && waited && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+#endif
+
+static bool zpd_publication_bad_predecessors(
+    const char *workspace, const struct json_value *input,
+    const struct vcs_devloop_publication_receipt *mapping,
+    const uint8_t original_progress_root[32])
+{
+    struct vcs_devloop_publication_receipt accepted;
+    uint8_t *accepted_wire = NULL, *waiting_wire = NULL;
+    size_t accepted_len = 0, waiting_len = 0;
+    bool ok = vcs_devloop_publication_receipt_load(
+        workspace, mapping->predecessor_receipt_root, &accepted) &&
+        accepted.phase == VCS_DEVLOOP_PUBLICATION_PHASE_ACCEPTED_LANE_BOUND &&
+        vcs_object_get(workspace, mapping->predecessor_receipt_root,
+                       VCS_TAG_PUBLICATION_RECEIPT, &accepted_wire, &accepted_len) == 0 &&
+        vcs_object_get(workspace, accepted.predecessor_receipt_root,
+                       VCS_TAG_PUBLICATION_RECEIPT, &waiting_wire, &waiting_len) == 0 &&
+        accepted_len >= 112 && waiting_len >= 112;
+    char log_path[4600];
+    int n = snprintf(log_path, sizeof(log_path),
+                     "%s/.zvcs/publication.receipts.log", workspace);
+    event_log_t *log = ok && n > 0 && (size_t)n < sizeof(log_path)
+        ? event_log_open(log_path) : NULL;
+    ok = ok && log != NULL;
+    for (unsigned variant = 0; ok && variant < 2; variant++) {
+        uint8_t bad_prior[32], bad_accepted[32];
+        if (variant == 0) {
+            memcpy(bad_prior, accepted.predecessor_receipt_root, 32);
+            bad_prior[0] ^= 1u; /* absent root in an otherwise canonical receipt */
+        } else {
+            waiting_wire[16] ^= 1u; /* canonical WAITING receipt for another job */
+            ok = vcs_object_put(workspace, waiting_wire, waiting_len,
+                                 VCS_TAG_PUBLICATION_RECEIPT, bad_prior);
+        }
+        if (!ok) break;
+        memcpy(accepted_wire + 48, bad_prior, 32);
+        ok = vcs_object_put(workspace, accepted_wire, accepted_len,
+                             VCS_TAG_PUBLICATION_RECEIPT, bad_accepted) &&
+            event_log_append(log, EV_VCS_PUBLICATION_RECEIPT,
+                              bad_accepted, 32) != UINT64_MAX;
+        if (!ok) break;
+        struct zcl_command_request request = {.input = input};
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_publish.v1");
+        zcl_native_handle_zcode_work_publish(&request, &reply);
+        bool refused = reply.status == ZCL_COMMAND_STATUS_FAILED &&
+            strcmp(reply.error.code, "WORK_PUBLICATION_MISMATCH") == 0;
+        zcl_command_reply_free(&reply);
+        bool restored = event_log_append(log, EV_VCS_PUBLICATION_RECEIPT,
+                                         original_progress_root, 32) != UINT64_MAX;
+        ok = refused && restored;
+    }
+    if (log) event_log_close(log);
+    free(accepted_wire); free(waiting_wire);
+    return ok;
+}
+
+static bool zpd_write(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    size_t len = strlen(text);
+    bool ok = fwrite(text, 1, len, f) == len;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+static bool zpd_write_bytes(const char *path, const uint8_t *bytes,
+                            size_t len)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(bytes, 1, len, f) == len;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+static char *zpd_read_bounded(const char *path, size_t maximum_bytes)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < 0 ||
+        (uint64_t)st.st_size > maximum_bytes)
+        return NULL;
+    size_t len = (size_t)st.st_size;
+    char *text = zcl_malloc(len + 1u, "zcode.packet.test");
+    if (!text) return NULL;
+    FILE *f = fopen(path, "rb");
+    bool ok = f && fread(text, 1, len, f) == len;
+    if (f && fclose(f) != 0) ok = false;
+    if (!ok) {
+        free(text);
+        return NULL;
+    }
+    text[len] = '\0';
+    return text;
+}
+
+#if !defined(_WIN32)
+static bool zpd_cli_work_status_stage(const char *workspace,
+                                      const char *work_id,
+                                      const char *datadir, bool explicit_datadir,
+                                      char *stage, size_t stage_size)
+{
+    char input[4600], path[256];
+    (void)snprintf(input, sizeof(input),
+                   "--input={\"workspace\":\"%s\",\"work\":\"%s\"}",
+                   workspace, work_id);
+    (void)snprintf(path, sizeof(path), "test-tmp/zcode-status-cli-%ld-%d",
+                   (long)getpid(), explicit_datadir ? 1 : 0);
+    pid_t child = fork();
+    if (child == 0) {
+        FILE *output = freopen(path, "wb", stdout);
+        if (!output) _exit(1);
+        const char *args[] = { "work", "status", input };
+        int rc = zcl_native_command_main("zcode", args, 3, datadir, 0,
+                                         CHAIN_MAIN, explicit_datadir);
+        (void)fflush(stdout);
+        _exit(rc);
+    }
+    if (child < 0) return false;
+    int status = 0;
+    bool ok = waitpid(child, &status, 0) == child &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    char *wire = ok ? zpd_read_bounded(path, 65536) : NULL;
+    struct json_value result;
+    json_init(&result);
+    ok = wire && json_read(&result, wire, strlen(wire));
+    const char *value = ok ? json_get_str(json_get(
+        json_get(&result, "data"), "stage")) : NULL;
+    ok = value && strlen(value) < stage_size;
+    if (ok) (void)snprintf(stage, stage_size, "%s", value);
+    json_free(&result);
+    free(wire);
+    (void)unlink(path);
+    return ok;
+}
+#endif
+
+static bool zpd_array_has_string(const struct json_value *array,
+                                 const char *expected)
+{
+    if (!array || array->type != JSON_ARR || !expected) return false;
+    for (size_t i = 0; i < json_size(array); i++) {
+        const struct json_value *item = json_at(array, i);
+        if (item && item->type == JSON_STR &&
+            strcmp(json_get_str(item), expected) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool zpd_next_is(const struct zcl_command_reply *reply,
+                        const char *command, const char *workspace,
+                        const char *work_id, const char *adapter)
+{
+    if (!reply || reply->next_count != 1 ||
+        strcmp(reply->next[0].command, command) != 0)
+        return false;
+    struct json_value input;
+    json_init(&input);
+    bool ok = json_read(&input, reply->next[0].input_json,
+                        strlen(reply->next[0].input_json)) &&
+        input.type == JSON_OBJ &&
+        strcmp(json_get_str(json_get(&input, "workspace")), workspace) == 0 &&
+        strcmp(json_get_str(json_get(&input, "work")), work_id) == 0 &&
+        (!adapter || strcmp(json_get_str(json_get(&input, "adapter")),
+                            adapter) == 0) &&
+        (adapter || json_get(&input, "adapter") == NULL) &&
+        json_get(&input, "task_root") == NULL &&
+        json_get(&input, "package_root") == NULL &&
+        json_get(&input, "candidate_root") == NULL;
+    const struct zcl_command_spec *spec = ok
+        ? zcl_command_registry_find(zcl_command_catalog(), command, NULL)
+        : NULL;
+    char why[160] = {0};
+    ok = ok && spec && zcl_command_registry_input_validate(
+        spec, &input, why, sizeof(why));
+    if (!ok)
+        printf("next mismatch: count=%zu command=%s input=%s why=%s\n",
+               reply->next_count,
+               reply->next_count ? reply->next[0].command : "<none>",
+               reply->next_count ? reply->next[0].input_json : "<none>",
+               why);
+    json_free(&input);
+    return ok;
+}
+
+static bool zpd_coordination_next_is(
+    const struct zcl_command_reply *reply, const char *workspace,
+    const char *task_root)
+{
+    if (!reply || !workspace || !task_root || reply->next_count != 1u ||
+        strcmp(reply->next[0].command, "zcode.tasks") != 0)
+        return false;
+    struct json_value input;
+    json_init(&input);
+    bool ok = json_read(&input, reply->next[0].input_json,
+                        strlen(reply->next[0].input_json)) &&
+        input.type == JSON_OBJ && input.num_children == 3u &&
+        strcmp(json_get_str(json_get(&input, "workspace")), workspace) == 0 &&
+        strcmp(json_get_str(json_get(&input, "task_root")), task_root) == 0 &&
+        json_get_bool(json_get(&input, "details"));
+    const struct zcl_command_spec *spec = ok
+        ? zcl_command_registry_find(zcl_command_catalog(), "zcode.tasks",
+                                    NULL)
+        : NULL;
+    char why[160] = {0};
+    ok = ok && spec && zcl_command_registry_input_validate(
+        spec, &input, why, sizeof(why));
+    json_free(&input);
+    return ok;
+}
+
+static bool zpd_plant_build_output(const char *root)
+{
+    char path[320];
+    (void)snprintf(path, sizeof(path), "%s/build", root);
+    if (platform_directory_create(path, 0700) != 0) return false;
+    (void)snprintf(path, sizeof(path), "%s/build/obj.o", root);
+    return zpd_write(path, "not source\n");
+}
+
+static bool zpd_next_init_plan_is(const struct zcl_command_reply *reply,
+                                  const char *workspace)
+{
+    if (!reply || reply->next_count != 1 ||
+        strcmp(reply->next[0].command, "zcode.project.init.plan") != 0)
+        return false;
+    struct json_value input;
+    json_init(&input);
+    bool ok = json_read(&input, reply->next[0].input_json,
+                        strlen(reply->next[0].input_json)) &&
+        input.type == JSON_OBJ &&
+        strcmp(json_get_str(json_get(&input, "workspace")), workspace) == 0 &&
+        json_get(&input, "work") == NULL &&
+        json_get(&input, "task_root") == NULL &&
+        json_get(&input, "package_root") == NULL;
+    const struct zcl_command_spec *spec = ok
+        ? zcl_command_registry_find(zcl_command_catalog(),
+                                    "zcode.project.init.plan", NULL)
+        : NULL;
+    char why[160] = {0};
+    ok = ok && spec && zcl_command_registry_input_validate(
+        spec, &input, why, sizeof(why));
+    if (!ok)
+        printf("init-plan next mismatch: count=%zu command=%s input=%s why=%s\n",
+               reply->next_count,
+               reply->next_count ? reply->next[0].command : "<none>",
+               reply->next_count ? reply->next[0].input_json : "<none>",
+               why);
+    json_free(&input);
+    return ok;
+}
+
+static bool zpd_next_datadir_is(const struct zcl_command_reply *reply,
+                                const char *command, const char *workspace,
+                                const char *work_id, const char *datadir)
+{
+    if (!zpd_next_is(reply, command, workspace, work_id, NULL))
+        return false;
+    struct json_value input;
+    json_init(&input);
+    bool ok = json_read(&input, reply->next[0].input_json,
+                        strlen(reply->next[0].input_json)) &&
+        strcmp(json_get_str(json_get(&input, "datadir")), datadir) == 0;
+    json_free(&input);
+    return ok;
+}
+
+static bool zpd_pubkey(secp256k1_context *ctx, const uint8_t secret[32],
+                       uint8_t pubkey[33])
+{
+    secp256k1_pubkey parsed;
+    size_t len = 33;
+    return secp256k1_ec_pubkey_create(ctx, &parsed, secret) == 1 &&
+           secp256k1_ec_pubkey_serialize(ctx, pubkey, &len, &parsed,
+                                        SECP256K1_EC_COMPRESSED) == 1 &&
+           len == 33;
+}
+
+static bool zpd_signature(secp256k1_context *ctx, const uint8_t secret[32],
+                          const uint8_t digest[32], uint8_t out[64])
+{
+    secp256k1_ecdsa_signature signature, normalized;
+    if (secp256k1_ecdsa_sign(ctx, &signature, digest, secret, NULL, NULL) != 1)
+        return false;
+    (void)secp256k1_ecdsa_signature_normalize(ctx, &normalized, &signature);
+    return secp256k1_ecdsa_signature_serialize_compact(ctx, out,
+                                                       &normalized) == 1;
+}
+
+static void zpd_fixture_cleanup(const char *root)
+{
+    static const char *const files[] = {
+        "link", "special", "LICENSE", "zcode-package.json", "src/x.c",
+        "src/unused.c", "app/main.c", "app/fixture.c", "app/util/helper.c",
+        "include/x.h", "tests/test.c",
+        ".zvcs/control", ".codeindex/control", "build/obj.o",
+    };
+    char path[512];
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        (void)snprintf(path, sizeof(path), "%s/%s", root, files[i]);
+        (void)unlink(path);
+    }
+    static const char *const dirs[] = {
+        "src", "app/util", "app", "include", "tests", ".zvcs", ".codeindex",
+        "build",
+    };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        (void)snprintf(path, sizeof(path), "%s/%s", root, dirs[i]);
+        (void)rmdir(path);
+    }
+    (void)rmdir(root);
+}
+
+static bool zpd_fixture(const char *root, bool unknown_key)
+{
+    char path[512];
+    zpd_fixture_cleanup(root);
+    if (platform_directory_create(root, 0700) != 0) return false;
+    static const char *const dirs[] = { "src", "app", "include", "tests" };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        (void)snprintf(path, sizeof(path), "%s/%s", root, dirs[i]);
+        if (platform_directory_create(path, 0700) != 0) return false;
+    }
+    (void)snprintf(path, sizeof(path), "%s/LICENSE", root);
+    if (!zpd_write(path, "MIT\n")) return false;
+    (void)snprintf(path, sizeof(path), "%s/src/x.c", root);
+    if (!zpd_write(path, "int x(void) { return 1; }\n")) return false;
+    (void)snprintf(path, sizeof(path), "%s/app/main.c", root);
+    if (!zpd_write(path,
+            "static int fixture_parse_options(void) { return 0; }\n"))
+        return false;
+    (void)snprintf(path, sizeof(path), "%s/include/x.h", root);
+    if (!zpd_write(path, "int x(void);\n")) return false;
+    (void)snprintf(path, sizeof(path), "%s/tests/test.c", root);
+    if (!zpd_write(path, "int main(void) { return 0; }\n")) return false;
+    (void)snprintf(path, sizeof(path), "%s/zcode-package.json", root);
+    return zpd_write(path, unknown_key
+        ? "{\"schema\":1,\"name\":\"zclassic23/fixture\",\"semver\":\"0.1.0-dev.1\",\"language\":\"c23\",\"license\":\"MIT\",\"include_dir\":\"include\",\"source_dir\":\"src\",\"dependencies\":[],\"smuggled\":true}\n"
+        : "{\"schema\":1,\"name\":\"zclassic23/fixture\",\"semver\":\"0.1.0-dev.1\",\"language\":\"c23\",\"license\":\"MIT\",\"include_dir\":\"include\",\"source_dir\":\"src\",\"dependencies\":[]}\n");
+}
+
+static bool zpd_offer_context(const char *workspace, const char *datadir,
+                              const char *task_root, uint8_t context_root[32],
+                              uint8_t inputs_digest[32])
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    bool ok = json_push_kv_str(&input, "workspace", workspace) &&
+        json_push_kv_str(&input, "datadir", datadir) &&
+        json_push_kv_str(&input, "task_root", task_root);
+    struct zcl_command_request request = { .input = &input };
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.zcode_task_offer.v1");
+    if (ok)
+        zcl_native_handle_zcode_task_offer(&request, &reply);
+    const char *root = json_get_str(json_get(&reply.data, "context_root"));
+    const char *inputs_root = json_get_str(
+        json_get(&reply.data, "adoption_inputs_root"));
+    ok = ok && reply.status == ZCL_COMMAND_STATUS_PASSED && root &&
+        zcl_hex_decode_lower(root, context_root, 32) &&
+        inputs_root && zcl_hex_decode_lower(inputs_root, inputs_digest, 32) &&
+        json_get_bool(json_get(&reply.data, "adoption_inputs_available")) &&
+        json_get(&reply.data, "adoption_inputs_provider_publish_input") &&
+        json_get(&reply.data, "provider_publish_input") &&
+        json_get(&reply.data, "pointer_publish_input");
+    zcl_command_reply_free(&reply);
+    json_free(&input);
+    return ok;
+}
+
+static bool zpd_offer_admit(const char *datadir, const char *task_hex,
+                            const uint8_t context_root[32])
+{
+    uint8_t expected[32], derived[32], goal[16];
+    size_t goal_len = 0;
+    if (!zcl_hex_decode_lower(task_hex, expected, 32))
+        return false;
+    struct vcs_package_store *store =
+        vcs_package_store_open(datadir, vcs_package_store_quota_bytes());
+    if (!store)
+        return false;
+    bool ok = vcs_zcode_task_context_admit(store, context_root, expected,
+        (int64_t)platform_time_wall_unix(), NULL, NULL, goal, sizeof(goal),
+        &goal_len, derived) == VCS_ZCODE_TASK_CONTEXT_OK &&
+        memcmp(expected, derived, 32) == 0 && goal_len == 5 &&
+        memcmp(goal, "Fix x", 5) == 0;
+    vcs_package_store_close(store);
+    return ok;
+}
+
+static bool zpd_offer_scope_matches(const uint8_t *wire, size_t len,
+    const struct vcs_zcode_task_v1 *task)
+{
+    struct vcs_zcode_write_scope_v1 scope;
+    uint8_t check[32];
+    return vcs_zcode_write_scope_parse(wire, len, &scope) ==
+        VCS_ZCODE_WRITE_SCOPE_OK &&
+        vcs_zcode_write_scope_root(&scope, check) == VCS_ZCODE_WRITE_SCOPE_OK &&
+        memcmp(check, task->write_scope_root, 32) == 0;
+}
+
+static bool zpd_offer_authority_matches(const char *datadir,
+    const struct vcs_zcode_task_v1 *task, const uint8_t *wire, size_t len,
+    const uint8_t *expected, size_t expected_len)
+{
+    bool ok = len == expected_len && memcmp(wire, expected, len) == 0 &&
+        vcs_zcode_task_authority_bundle_import(datadir, task, wire, len) ==
+            VCS_ZCODE_TASK_AUTHORITY_OK;
+    if (ok) {
+        struct vcs_zcode_task_v1 wrong_task = *task;
+        wrong_task.dependency_lock_root[0] ^= 1;
+        ok = vcs_zcode_task_authority_bundle_import(datadir, &wrong_task,
+            wire, len) != VCS_ZCODE_TASK_AUTHORITY_OK;
+    }
+    return ok;
+}
+
+static bool zpd_offer_members(struct vcs_package_store *store,
+    const uint8_t inputs_root[32], const struct vcs_package_manifest *manifest,
+    const char *datadir, const struct vcs_zcode_task_v1 *task,
+    const uint8_t *expected, size_t expected_len)
+{
+    bool ok = true, saw_scope = false, saw_authority = false;
+    for (uint32_t i = 0; ok && i < manifest->count; ++i) {
+        uint8_t *wire = NULL;
+        size_t len = 0;
+        ok = vcs_package_content_get_file_at(store, inputs_root, manifest,
+            i, &wire, &len) == VCS_PACKAGE_STORE_OK;
+        if (ok && strcmp(manifest->files[i].path, "zcode-write-scope.v1") == 0) {
+            ok = !saw_scope && zpd_offer_scope_matches(wire, len, task);
+            saw_scope = true;
+        } else if (ok && strcmp(manifest->files[i].path,
+                VCS_ZCODE_TASK_AUTHORITY_BUNDLE_PATH) == 0) {
+            ok = !saw_authority && zpd_offer_authority_matches(datadir, task,
+                wire, len, expected, expected_len);
+            saw_authority = true;
+        } else {
+            ok = false;
+        }
+        free(wire);
+    }
+    return ok && saw_scope && saw_authority;
+}
+
+static bool zpd_offer_inputs_readback(const char *workspace, const char *datadir,
+    const char *task_hex, const uint8_t inputs_root[32])
+{
+    uint8_t task_root[32], check[32];
+    uint8_t *task_wire = NULL, *manifest_wire = NULL, *expected = NULL;
+    size_t task_len = 0, manifest_len = 0, expected_len = 0;
+    struct vcs_zcode_task_v1 task;
+    struct vcs_package_manifest manifest;
+    vcs_package_manifest_init(&manifest);
+    struct vcs_package_store *store = vcs_package_store_open(
+        datadir, vcs_package_store_quota_bytes());
+    bool ok = store && zcl_hex_decode_lower(task_hex, task_root, 32) &&
+        vcs_object_load_raw_bounded(workspace, task_root,
+            VCS_ZCODE_TASK_WIRE_BYTES, &task_wire, &task_len) == 0 &&
+        vcs_zcode_task_parse(task_wire, task_len, &task) == VCS_ZCODE_DEV_OK &&
+        vcs_zcode_task_root(&task, check) == VCS_ZCODE_DEV_OK &&
+        memcmp(check, task_root, 32) == 0 &&
+        vcs_package_store_get_manifest_wire(store, inputs_root,
+            &manifest_wire, &manifest_len) == VCS_PACKAGE_STORE_OK &&
+        vcs_package_manifest_parse(manifest_wire, manifest_len, &manifest) &&
+        vcs_package_manifest_root(&manifest, check) &&
+        memcmp(check, inputs_root, 32) == 0 && manifest.count == 2 &&
+        vcs_zcode_task_authority_bundle_export(workspace, &task,
+            &expected, &expected_len) == VCS_ZCODE_TASK_AUTHORITY_OK;
+    ok = ok && zpd_offer_members(store, inputs_root, &manifest, datadir,
+        &task, expected, expected_len);
+    free(task_wire);
+    free(manifest_wire);
+    free(expected);
+    vcs_package_manifest_free(&manifest);
+    vcs_package_store_close(store);
+    return ok;
+}
+
+static bool zpd_offer_invalid_workspace(const char *datadir, const char *task_root)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    bool ok = json_push_kv_int(&input, "workspace", 42) &&
+        json_push_kv_str(&input, "datadir", datadir) &&
+        json_push_kv_str(&input, "task_root", task_root);
+    struct zcl_command_request request = { .input = &input };
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.zcode_task_offer.v1");
+    if (ok)
+        zcl_native_handle_zcode_task_offer(&request, &reply);
+    ok = ok && reply.status == ZCL_COMMAND_STATUS_FAILED &&
+        strcmp(reply.error.code, "BAD_WORKSPACE") == 0;
+    zcl_command_reply_free(&reply);
+    json_free(&input);
+    return ok;
+}
+
+static bool zpd_adoption_result(const char *rendered, size_t len,
+    enum zcl_command_exit exit_code, const char *task_root,
+    uint8_t adopted_context[32], bool *refusal_mutated)
+{
+    struct json_value envelope;
+    json_init(&envelope);
+    if (len && exit_code != ZCL_COMMAND_EXIT_OK)
+        printf("receiver adoption refusal: %.*s\n", (int)len, rendered);
+    bool ok = len && json_read(&envelope, rendered, len);
+    if (refusal_mutated)
+        *refusal_mutated = ok && json_get_bool(json_get(
+            json_get(&envelope, "error"), "mutated"));
+    const struct json_value *data = json_get(&envelope, "data");
+    const char *returned_task = json_get_str(json_get(data, "task_root"));
+    const char *returned_context = json_get_str(json_get(data, "context_root"));
+    ok = ok && exit_code == ZCL_COMMAND_EXIT_OK && returned_task &&
+        strcmp(returned_task, task_root) == 0 && returned_context &&
+        zcl_hex_decode_lower(returned_context, adopted_context, 32);
+    json_free(&envelope);
+    return ok;
+}
+
+static bool zpd_receiver_adopt_once(const char *workspace, const char *datadir,
+    const char *task_root, const uint8_t carrier[32], const uint8_t inputs[32],
+    const char *query, uint8_t adopted_context[32], bool *refusal_mutated)
+{
+    const struct zcl_command_registry *registry = zcl_command_catalog();
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        registry, "zcode.task.adopt", NULL);
+    if (!spec) {
+        fprintf(stderr, "receiver adoption: zcode.task.adopt is unavailable\n");
+        return false;
+    }
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    char carrier_hex[65], inputs_hex[65], rendered[16384];
+    zcl_hex_encode(carrier, 32, carrier_hex);
+    zcl_hex_encode(inputs, 32, inputs_hex);
+    bool ok = json_push_kv_str(&input, "workspace", workspace) &&
+        json_push_kv_str(&input, "datadir", datadir) &&
+        json_push_kv_str(&input, "task_root", task_root) &&
+        json_push_kv_str(&input, "context_root", carrier_hex) &&
+        json_push_kv_str(&input, "inputs_root", inputs_hex) &&
+        json_push_kv_str(&input, "context_symbol", query);
+    struct zcl_command_context context = { .registry = registry,
+        .granted_capabilities = ~(uint64_t)0,
+        .authority_ceiling = ZCL_COMMAND_AUTH_OWNER };
+    enum zcl_command_exit exit_code = ZCL_COMMAND_EXIT_OK;
+    size_t len = ok ? zcl_command_registry_execute_json(registry, spec,
+        &context, &input, false, spec->path, "normal", 0, 0, NULL,
+        rendered, sizeof(rendered), &exit_code) : 0;
+    ok = ok && zpd_adoption_result(rendered, len, exit_code, task_root,
+        adopted_context, refusal_mutated);
+    json_free(&input);
+    return ok;
+}
+
+static bool zpd_enlarge_context_source(const char *workspace,
+    struct vcs_zcode_task_v1 *task)
+{
+    char path[600], padding[8192];
+    static const char prefix[] =
+        "static int fixture_parse_options(void) { return 0; }\n/*";
+    memset(padding, ' ', sizeof(padding));
+    memcpy(padding, prefix, sizeof(prefix) - 1);
+    memcpy(padding + sizeof(padding) - 4, "*/\n", 4);
+    /* Enlarge the selected symbol's file, not an unrelated source file. */
+    int n = snprintf(path, sizeof(path), "%s/app/main.c", workspace);
+    return n > 0 && (size_t)n < sizeof(path) && zpd_write(path, padding) &&
+        vcs_tree_capture_path(workspace, task->source_root) == VCS_OK;
+}
+
+static bool zpd_context_budget_row(const char *workspace,
+    const struct vcs_zcode_task_v1 *task, const uint8_t root[32], size_t overhead)
+{
+    struct zcode_agent_context_status captured, empty;
+    memset(&captured, 0xa5, sizeof(captured));
+    memset(&empty, 0, sizeof(empty));
+    struct zcl_result refused = zcode_agent_context_capture_complete(
+        workspace, task, root, "fixture_parse_options", &captured);
+    char budget_detail[64], overhead_detail[64];
+    (void)snprintf(budget_detail, sizeof(budget_detail), "max_context_bytes=%llu",
+                   (unsigned long long)task->max_context_bytes);
+    (void)snprintf(overhead_detail, sizeof(overhead_detail), "overhead=%zu", overhead);
+    bool ok = !refused.ok && refused.code == -1 &&
+        strstr(refused.message, budget_detail) &&
+        strstr(refused.message, overhead_detail) &&
+        strstr(refused.message, "replan") &&
+        !strstr(refused.message, "changed") &&
+        !strstr(refused.message, "could not be read") &&
+        memcmp(&captured, &empty, sizeof(captured)) == 0;
+    if (!ok) printf("context budget refusal: budget=%llu detail=%s\n",
+                    (unsigned long long)task->max_context_bytes, refused.message);
+    return ok;
+}
+
+static bool zpd_context_budget_refuses(const char *workspace,
+    struct vcs_zcode_task_v1 task, const uint8_t root[32])
+{
+    /* The fixture symbol has one definition file, no callers or includes. */
+    const size_t overhead = VCS_ZCODE_AGENT_CONTEXT_FIXED_BYTES +
+        strlen("fixture_parse_options") + VCS_ZCODE_AGENT_CONTEXT_ENTRY_FIXED_BYTES +
+        VCS_ZCODE_AGENT_CONTEXT_PATH_MAX;
+    const size_t budgets[] = {0, 1, overhead - 1};
+    for (size_t i = 0; i < sizeof(budgets) / sizeof(budgets[0]); i++) {
+        /* Exercise the direct service shape, including an invalid zero
+         * budget, while retaining the source-matching task root. */
+        task.max_context_bytes = budgets[i];
+        if (!zpd_context_budget_row(workspace, &task, root, overhead)) return false;
+    }
+    struct vcs_zcode_task_index *index = vcs_zcode_task_index_build(workspace,
+        1);
+    char root_hex[65]; zcl_hex_encode(root, 32, root_hex);
+    bool ambiguous = false;
+    bool ok = index && vcs_zcode_task_index_complete(index) &&
+        !vcs_zcode_task_index_context_for_task(index, root_hex, &ambiguous) &&
+        !ambiguous;
+    vcs_zcode_task_index_free(index);
+    return ok;
+}
+
+static bool zpd_context_mapping_path(const char *path)
+{
+    struct agent_impact_acc impact = {0};
+    struct zcl_devloop_plan plan;
+    if (!agent_impact_apply_shared_rules(path, &impact) ||
+        !zcl_devloop_plan_files(&path, 1, &plan) ||
+        plan.closure_groups_len != 0) return false;
+    bool regression = false, lint = false, site = false, wallet = false;
+    for (size_t i = 0; i < impact.groups_len; i++) {
+        regression |= strcmp(impact.groups[i], "zcode_package_dev") == 0;
+        lint |= strcmp(impact.groups[i], "make_lint_gates") == 0;
+        site |= strcmp(impact.groups[i], "site_routes") == 0;
+        wallet |= strcmp(impact.groups[i], "wallet") == 0;
+    }
+    bool planned = false;
+    for (size_t i = 0; i < plan.path_groups_len; i++)
+        planned |= strcmp(plan.path_groups[i], "zcode_package_dev") == 0;
+    if (strstr(path, "/src/")) {
+        if (!site || !wallet) return false;
+    }
+    return regression && lint && planned;
+}
+
+static bool zpd_context_proof_mapping(void)
+{
+    return zpd_context_mapping_path(
+        "cognition/services/src/zcode_agent_context_service.c") &&
+        zpd_context_mapping_path(
+        "cognition/services/include/services/zcode_agent_context_service.h");
+}
+
+static bool zpd_context_budget_prepare(const char *workspace,
+    struct vcs_zcode_task_v1 *task, uint8_t root[32])
+{
+    task->max_context_bytes = 4096;
+    return zpd_context_proof_mapping() &&
+        zpd_enlarge_context_source(workspace, task) &&
+        vcs_zcode_task_root(task, root) == VCS_ZCODE_DEV_OK &&
+        zpd_context_budget_refuses(workspace, *task, root);
+}
+
+static bool zpd_capture_truncation_refuses(const char *workspace,
+    const char *task_workspace, const char *task_hex)
+{
+    uint8_t root[32], *wire = NULL;
+    size_t len = 0;
+    struct vcs_zcode_task_v1 task;
+    bool ok = zcl_hex_decode_lower(task_hex, root, 32) &&
+        vcs_object_load_raw_bounded(task_workspace, root,
+            VCS_ZCODE_TASK_WIRE_BYTES, &wire, &len) == 0 &&
+        vcs_zcode_task_parse(wire, len, &task) == VCS_ZCODE_DEV_OK;
+    free(wire);
+    ok = ok && zpd_context_budget_prepare(workspace, &task, root);
+    struct zcode_agent_context_status captured;
+    if (ok) {
+        struct zcl_result strict = zcode_agent_context_capture_complete(
+            workspace, &task, root, "fixture_parse_options", &captured);
+        ok = !strict.ok && strstr(strict.message, "no context stored") != NULL;
+        if (!ok) printf("strict context refusal: ok=%d detail=%s\n",
+                         strict.ok, strict.message);
+    }
+    struct vcs_zcode_task_index *index = vcs_zcode_task_index_build(workspace,
+        1);
+    char root_hex[65]; zcl_hex_encode(root, 32, root_hex);
+    bool ambiguous = false;
+    ok = ok && index && vcs_zcode_task_index_complete(index) &&
+        !vcs_zcode_task_index_context_for_task(index, root_hex, &ambiguous) &&
+        !ambiguous;
+    vcs_zcode_task_index_free(index);
+    if (ok) {
+        struct zcl_result legacy = zcode_agent_context_capture(workspace,
+            &task, root, "fixture_parse_options", &captured);
+        ok = legacy.ok && captured.truncated;
+        if (!ok) printf("legacy context truncation: ok=%d truncated=%d detail=%s\n",
+                         legacy.ok, captured.truncated, legacy.message);
+    }
+    return ok;
+}
+
+static bool zpd_plant_unverified_context(const char *sender,
+    const char *receiver, const char *task_hex)
+{
+    struct vcs_zcode_task_index *index = vcs_zcode_task_index_build(sender,
+        (int64_t)platform_time_wall_unix());
+    bool ambiguous = false;
+    const struct vcs_zcode_task_context_entry *entry =
+        vcs_zcode_task_index_context_for_task(index, task_hex, &ambiguous);
+    uint8_t root[32], *wire = NULL; size_t len = 0;
+    bool ok = index && entry && !ambiguous &&
+        zcl_hex_decode_lower(entry->context_root_hex, root, 32) &&
+        vcs_object_load_raw_bounded(sender, root, 1048576, &wire, &len) == 0;
+    vcs_zcode_task_index_free(index);
+    struct vcs_zcode_agent_context_v1 context;
+    vcs_zcode_agent_context_init(&context);
+    ok = ok && vcs_zcode_agent_context_parse(wire, len, len, &context) ==
+        VCS_ZCODE_AGENT_CONTEXT_OK;
+    free(wire); wire = NULL;
+    if (ok) {
+        (void)snprintf(context.query, sizeof(context.query), "%s",
+                       "fixture_parse_options");
+        printf("preexisting context witness: flags=%u query=%s\n",
+               (unsigned)context.flags, context.query);
+        context.source_tree_root[0] ^= 1;
+        size_t mutated_len = 0;
+        ok = vcs_zcode_agent_context_serialize(&context, len, &wire,
+                &mutated_len) == VCS_ZCODE_AGENT_CONTEXT_OK &&
+            vcs_zcode_agent_context_root(&context, len, root) ==
+                VCS_ZCODE_AGENT_CONTEXT_OK &&
+            vcs_object_store_init(receiver) &&
+            vcs_object_put_addressed(receiver, root, wire, mutated_len);
+    }
+    free(wire); vcs_zcode_agent_context_free(&context);
+    return ok;
+}
+
+static bool zpd_receiver_empty(const char *receiver)
+{
+    struct vcs_zcode_task_index *index = vcs_zcode_task_index_build(receiver,
+        (int64_t)platform_time_wall_unix());
+    bool ok = index && vcs_zcode_task_index_complete(index) &&
+        vcs_zcode_task_index_task_count(index) == 0;
+    vcs_zcode_task_index_free(index);
+    return ok;
+}
+
+static bool zpd_receiver_accepted(const char *receiver, const char *task_root)
+{
+    struct vcs_zcode_task_index *index = vcs_zcode_task_index_build(receiver,
+        (int64_t)platform_time_wall_unix());
+    bool ambiguous = false;
+    const struct vcs_zcode_task_context_entry *context =
+        vcs_zcode_task_index_context_for_task(index, task_root, &ambiguous);
+    bool ok = index && vcs_zcode_task_index_complete(index) &&
+        vcs_zcode_task_index_task_count(index) == 1 &&
+        vcs_zcode_task_index_candidate_count(index) == 0 &&
+        vcs_zcode_task_index_lane_count(index) == 0 && context && !ambiguous;
+    vcs_zcode_task_index_free(index);
+    return ok;
+}
+
+static bool zpd_receiver_unverified_refuses(const char *workspace,
+    const char *receiver, const char *datadir, const char *task_root,
+    const uint8_t carrier[32], const uint8_t inputs[32])
+{
+    bool ok = zpd_fixture(receiver, false) &&
+        zpd_plant_unverified_context(workspace, receiver, task_root);
+    if (ok) {
+        uint8_t context[32];
+        bool refusal_mutated = false;
+        bool accepted = zpd_receiver_adopt_once(receiver, datadir, task_root,
+            carrier, inputs, "fixture_parse_options", context, &refusal_mutated);
+        if (accepted) printf("adoption accepted an unverified source-tree context\n");
+        if (!refusal_mutated) printf("adoption refusal hid retained inert writes\n");
+        ok = !accepted && refusal_mutated && zpd_receiver_empty(receiver);
+    }
+    return ok;
+}
+
+/* A node that has pulled work holds work-pull receipts, their locator
+ * objects and the confinement statement in the same CAS adoption indexes.
+ * None of them may make that index incomplete or conflict a task. */
+static bool zpd_plant_pull_receipt(const char *receiver)
+{
+    uint8_t seed[32], secret[32], pubkey[32];
+    memset(seed, 0x5d, sizeof(seed));
+    ed25519_keypair(pubkey, secret, seed);
+    struct vcs_zcode_work_receipt_v1 r;
+    memset(&r, 0, sizeof(r));
+    r.schema_version = VCS_ZCODE_DEV_VERSION;
+    uint8_t *roots[] = {
+        r.task_root, r.candidate_root, r.input_root, r.output_root,
+        r.proof_policy_root, r.toolchain_capsule_root, r.lease_id,
+        r.evidence_root,
+    };
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++)
+        memset(roots[i], 0x70 + (int)i, 32);
+    static const char statement[] = VCS_ZCODE_WORK_PULL_CONFINEMENT;
+    sha3_256((const uint8_t *)statement, sizeof(statement) - 1u,
+             r.confinement_root);
+    r.work_kind = VCS_ZCODE_WORK_REPRODUCE;
+    r.status = VCS_ZCODE_WORK_PASS;
+    r.started_unix = 1000;
+    r.finished_unix = 1001;
+    uint8_t root[32], locator[32], wire[VCS_ZCODE_WORK_RECEIPT_WIRE_BYTES];
+    uint8_t pointer[VCS_ZCODE_WORK_PULL_LOCATOR_BYTES];
+    static const char magic[] = VCS_ZCODE_WORK_PULL_LOCATOR_MAGIC;
+    bool ok = vcs_zcode_work_pull_action_root(r.task_root, r.input_root,
+                                              r.lease_id, r.action_root) &&
+        vcs_zcode_work_receipt_seal(&r, secret, pubkey) == VCS_ZCODE_DEV_OK &&
+        vcs_zcode_work_pull_receipt_check(&r) ==
+            VCS_ZCODE_WORK_PULL_RECEIPT_OK &&
+        vcs_zcode_work_receipt_id(&r, root) == VCS_ZCODE_DEV_OK &&
+        vcs_zcode_work_receipt_serialize(&r, wire) == VCS_ZCODE_DEV_OK &&
+        vcs_object_store_init(receiver);
+    memory_cleanse(secret, sizeof(secret));
+    vcs_zcode_work_pull_locator_address(&r, locator);
+    memcpy(pointer, magic, sizeof(magic));
+    memcpy(pointer + sizeof(magic), root, 32);
+    return ok && vcs_object_put_addressed(receiver, root, wire, sizeof(wire)) &&
+        vcs_object_put_addressed(receiver, locator, pointer,
+                                 sizeof(pointer)) &&
+        vcs_object_put_addressed(receiver, r.confinement_root,
+                                 (const uint8_t *)statement,
+                                 sizeof(statement) - 1u) &&
+        zpd_receiver_empty(receiver);
+}
+
+static bool zpd_receiver_retry(const char *receiver, const char *datadir,
+    const char *task_root, const uint8_t carrier[32], const uint8_t inputs[32])
+{
+    uint8_t first_context[32], repeated_context[32];
+    return zpd_fixture(receiver, false) && zpd_plant_pull_receipt(receiver) &&
+        !zpd_receiver_adopt_once(receiver, datadir, task_root, carrier, inputs,
+            "missing_receiver_symbol", first_context, NULL) &&
+        zpd_receiver_empty(receiver) &&
+        zpd_receiver_adopt_once(receiver, datadir, task_root, carrier, inputs,
+            "fixture_parse_options", first_context, NULL) &&
+        zpd_receiver_adopt_once(receiver, datadir, task_root, carrier, inputs,
+            "fixture_parse_options", repeated_context, NULL) &&
+        memcmp(first_context, repeated_context, 32) == 0 &&
+        zpd_receiver_accepted(receiver, task_root);
+}
+
+static bool zpd_offer_repeat(const char *workspace, const char *datadir,
+    const char *task_root, uint8_t first[32], uint8_t first_inputs[32])
+{
+    uint8_t repeated[32], repeated_inputs[32];
+    return zpd_offer_context(workspace, datadir, task_root, first,
+                               first_inputs) &&
+        zpd_offer_inputs_readback(workspace, datadir, task_root, first_inputs) &&
+        zpd_offer_admit(datadir, task_root, first) &&
+        zpd_offer_context(workspace, datadir, task_root, repeated,
+                          repeated_inputs) &&
+        memcmp(first, repeated, 32) == 0 &&
+        memcmp(first_inputs, repeated_inputs, 32) == 0 &&
+        !zpd_offer_context(datadir, datadir, task_root, repeated,
+                           repeated_inputs) &&
+        zpd_offer_invalid_workspace(datadir, task_root);
+}
+
+static bool zpd_workspace_task_offer(const char *workspace, const char *task_root)
+{
+    char datadir[4600];
+    uint8_t first[32], first_inputs[32];
+    int n = snprintf(datadir, sizeof(datadir), "%s-offer-store", workspace);
+    if (n < 0 || (size_t)n >= sizeof(datadir) ||
+        !platform_directory_ensure(datadir, 0700))
+        return false;
+    bool ok = zpd_offer_repeat(workspace, datadir, task_root, first, first_inputs);
+    char receiver[512];
+    n = snprintf(receiver, sizeof(receiver), "%s-receiver", workspace);
+    if (ok && n > 0 && (size_t)n < sizeof(receiver)) {
+        ok = zpd_fixture(receiver, false) &&
+            zpd_capture_truncation_refuses(receiver, workspace, task_root);
+        /* Capture created real index/CAS directories. Retire this isolated
+         * truncation fixture before constructing the fresh adoption receiver. */
+        test_rm_rf(receiver);
+        ok = ok && zpd_receiver_unverified_refuses(workspace, receiver, datadir,
+            task_root, first, first_inputs);
+        test_rm_rf(receiver);
+        ok = ok && zpd_receiver_retry(receiver, datadir, task_root, first,
+            first_inputs);
+        zpd_fixture_cleanup(receiver);
+    } else {
+        ok = false;
+    }
+    test_rm_rf(datadir);
+    return ok;
+}
+
+/* Rewrite the fixture's zcode-package.json with an optional "programs"
+ * array. `programs` is the array body, e.g. "\"app/main.c\"", or NULL for a
+ * configuration that declares no program at all — the two cases this
+ * fixture exists to tell apart. */
+static bool zpd_meta_programs(const char *root, const char *programs)
+{
+    char path[512], meta[1024];
+    int n = snprintf(meta, sizeof(meta),
+        "{\"schema\":1,\"name\":\"zclassic23/fixture\","
+        "\"semver\":\"0.1.0-dev.1\",\"language\":\"c23\",\"license\":\"MIT\","
+        "\"include_dir\":\"include\",\"source_dir\":\"src\","
+        "\"dependencies\":[]%s%s%s}\n",
+        programs ? ",\"programs\":[" : "", programs ? programs : "",
+        programs ? "]" : "");
+    if (n <= 0 || (size_t)n >= sizeof(meta))
+        return false;
+    (void)snprintf(path, sizeof(path), "%s/zcode-package.json", root);
+    return zpd_write(path, meta);
+}
+
+static bool zpd_reuse_package_fixture(const char *root, const char *license,
+                                      const char *license_text)
+{
+    char path[512], metadata[512];
+    if (!zpd_fixture(root, false)) return false;
+    (void)snprintf(path, sizeof(path), "%s/LICENSE", root);
+    if (!zpd_write(path, license_text)) return false;
+    int n = snprintf(
+        metadata, sizeof(metadata),
+        "{\"schema\":1,\"name\":\"zclassic23/license-choice\","
+        "\"semver\":\"1.0.0\",\"language\":\"c23\",\"license\":\"%s\","
+        "\"include_dir\":\"include\",\"source_dir\":\"src\","
+        "\"dependencies\":[]}\n",
+        license);
+    if (n <= 0 || (size_t)n >= sizeof(metadata)) return false;
+    (void)snprintf(path, sizeof(path), "%s/zcode-package.json", root);
+    return zpd_write(path, metadata);
+}
+
+static bool zpd_store_reuse_release(
+    const char *zcode_dir, secp256k1_context *ctx, const uint8_t secret[32],
+    struct vcs_package_release *release,
+    const struct vcs_package_prepared *prepared)
+{
+    uint8_t release_id[32], signature[64];
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    char hex[65], path[512];
+    if (memcmp(release->package_root, prepared->package_root, 32) != 0 ||
+        memcmp(release->recipe_root, prepared->recipe_root, 32) != 0 ||
+        vcs_package_release_id(release, release_id) != VCS_PACKAGE_RELEASE_OK ||
+        !zpd_signature(ctx, secret, release_id, signature))
+        return false;
+    memcpy(release->signature, signature, sizeof(signature));
+    if (vcs_package_release_verify(release) != VCS_PACKAGE_RELEASE_OK ||
+        vcs_package_release_serialize(release, &wire, &wire_len) !=
+            VCS_PACKAGE_RELEASE_OK)
+        return false;
+    zcl_hex_encode(release_id, sizeof(release_id), hex);
+    int n = snprintf(path, sizeof(path), "%s/releases/%s", zcode_dir, hex);
+    bool ok = n > 0 && (size_t)n < sizeof(path) &&
+        zpd_write_bytes(path, wire, wire_len);
+    free(wire);
+    zcl_hex_encode(prepared->package_root, 32, hex);
+    n = snprintf(path, sizeof(path), "%s/manifests/%s", zcode_dir, hex);
+    ok = ok && n > 0 && (size_t)n < sizeof(path) &&
+        zpd_write_bytes(path, prepared->manifest_wire,
+                        prepared->manifest_wire_len);
+    zcl_hex_encode(prepared->recipe_root, 32, hex);
+    n = snprintf(path, sizeof(path), "%s/recipes/%s", zcode_dir, hex);
+    return ok && n > 0 && (size_t)n < sizeof(path) &&
+        zpd_write_bytes(path, prepared->recipe_wire,
+                        prepared->recipe_wire_len);
+}
+
+static bool zpd_store_reuse_package(
+    const char *zcode_dir, secp256k1_context *ctx, const uint8_t secret[32],
+    struct vcs_package_prepared *prepared)
+{
+    return zpd_store_reuse_release(zcode_dir, ctx, secret,
+                                   &prepared->release, prepared);
+}
+
+static bool zpd_benchmark_project(const char *root, const char *name,
+                                  int value)
+{
+    ZCL_IGNORE_RESULT(zcl_tree_remove(root), "benchmark fixture reset");
+    if (platform_directory_create(root, 0700) != 0) return false;
+    char path[512], text[512];
+    static const char *const dirs[] = {"src", "include", "tests"};
+    for (size_t i = 0; i < 3; i++) {
+        (void)snprintf(path, sizeof(path), "%s/%s", root, dirs[i]);
+        if (platform_directory_create(path, 0700) != 0) return false;
+    }
+    (void)snprintf(path, sizeof(path), "%s/LICENSE", root);
+    if (!zpd_write(path, "MIT\n")) return false;
+    (void)snprintf(path, sizeof(path), "%s/include/x.h", root);
+    if (!zpd_write(path, "int x(void);\n")) return false;
+    (void)snprintf(text, sizeof(text), "int x(void) { return %d; }\n", value);
+    (void)snprintf(path, sizeof(path), "%s/src/x.c", root);
+    if (!zpd_write(path, text)) return false;
+    (void)snprintf(path, sizeof(path), "%s/tests/test.c", root);
+    if (!zpd_write(path, "int main(void) { return 0; }\n")) return false;
+    (void)snprintf(text, sizeof(text),
+        "{\"schema\":1,\"name\":\"fixture/%s\",\"semver\":\"0.1.0\","
+        "\"language\":\"c23\",\"license\":\"MIT\",\"include_dir\":"
+        "\"include\",\"source_dir\":\"src\",\"dependencies\":[]}\n",
+        name);
+    (void)snprintf(path, sizeof(path), "%s/zcode-package.json", root);
+    return zpd_write(path, text);
+}
+
+static bool zpd_expert_root(const struct json_value *expert,
+                            const char *key, uint8_t out[32])
+{
+    const struct json_value *value = expert ? json_get(expert, key) : NULL;
+    return value && value->type == JSON_STR &&
+           zcl_hex_decode_lower(json_get_str(value), out, 32);
+}
+
+static bool zpd_find_build_receipt(
+    const char *workspace, const char *candidate_workspace,
+    const struct json_value *expert,
+    struct vcs_zcode_work_receipt_v1 *out, uint8_t out_root[32])
+{
+    uint8_t checked[32], expected_task[32];
+    uint8_t expected_candidate[32], expected_policy[32], expected_toolchain[32];
+    uint8_t expected_action[32];
+    if (!workspace || !candidate_workspace || !out || !out_root ||
+        !zpd_expert_root(expert, "task_root", expected_task) ||
+        !zpd_expert_root(expert, "candidate_root", expected_candidate) ||
+        !zpd_expert_root(expert, "proof_policy_root", expected_policy) ||
+        !zpd_expert_root(expert, "toolchain_capsule_root",
+                         expected_toolchain) ||
+        !zpd_expert_root(expert, "proof_action_root", expected_action))
+        return false;
+    char proof_db[4608];
+    int n = snprintf(proof_db, sizeof(proof_db), "%s", candidate_workspace);
+    char *attempt = n > 0 && (size_t)n < sizeof(proof_db)
+        ? strrchr(proof_db, '/') : NULL;
+    size_t remaining = attempt
+        ? (size_t)(proof_db + sizeof(proof_db) - attempt) : 0;
+    int replaced = attempt
+        ? snprintf(attempt, remaining, "/zbuild/node.db") : -1;
+    if (!attempt || replaced <= 0 || (size_t)replaced >= remaining)
+        return false;
+    struct node_db ndb = {0};
+    if (!node_db_open_existing_runtime(
+            &ndb, proof_db, "zcode.benchmark.app-run"))
+        return false;
+    char task_hex[65], candidate_hex[65], policy_hex[65];
+    zcl_hex_encode(expected_task, 32, task_hex);
+    zcl_hex_encode(expected_candidate, 32, candidate_hex);
+    zcl_hex_encode(expected_policy, 32, policy_hex);
+    struct db_build_receipt rows[64];
+    int receipt_count = db_build_candidate_receipts(
+        &ndb, task_hex, candidate_hex, policy_hex,
+        rows, sizeof(rows) / sizeof(rows[0]));
+    node_db_close(&ndb);
+    if (receipt_count <= 0) return false;
+    char action_hex[65];
+    zcl_hex_encode(expected_action, 32, action_hex);
+    for (int i = 0; i < receipt_count; i++) {
+        if (rows[i].exit_status != 0 ||
+            strcmp(rows[i].action_id, action_hex) != 0 ||
+            !zcl_hex_decode_lower(rows[i].work_receipt_sha3, out_root, 32))
+            continue;
+        uint8_t *wire = NULL;
+        size_t wire_len = 0;
+        struct vcs_zcode_work_receipt_v1 receipt;
+        bool ok = vcs_object_load_raw_bounded(
+                 workspace, out_root,
+                 VCS_ZCODE_WORK_RECEIPT_WIRE_BYTES, &wire, &wire_len) == 0 &&
+             vcs_zcode_work_receipt_parse(wire, wire_len, &receipt) ==
+                 VCS_ZCODE_DEV_OK &&
+             vcs_zcode_work_receipt_id(&receipt, checked) ==
+                 VCS_ZCODE_DEV_OK &&
+             memcmp(checked, out_root, 32) == 0 &&
+             vcs_zcode_work_receipt_verify(
+                 &receipt, receipt.signer_pubkey) == VCS_ZCODE_DEV_OK;
+        free(wire);
+        if (!ok || receipt.work_kind != VCS_ZCODE_WORK_BUILD ||
+            receipt.status != VCS_ZCODE_WORK_PASS || receipt.exit_status != 0 ||
+            memcmp(receipt.task_root, expected_task, 32) != 0 ||
+            memcmp(receipt.candidate_root, expected_candidate, 32) != 0 ||
+            memcmp(receipt.proof_policy_root, expected_policy, 32) != 0 ||
+            memcmp(receipt.toolchain_capsule_root,
+                   expected_toolchain, 32) != 0 ||
+            memcmp(receipt.action_root, expected_action, 32) != 0)
+            continue;
+        *out = receipt;
+        return true;
+    }
+    return false;
+}
+
+static bool zpd_store_app_run_evidence(
+    const char *workspace, const char *candidate_workspace,
+    const struct json_value *expert, uint8_t out_build_receipt_root[32])
+{
+    struct vcs_zcode_work_receipt_v1 build;
+    uint8_t build_root[32];
+    if (!zpd_find_build_receipt(workspace, candidate_workspace, expert,
+                                &build, build_root) ||
+        build.finished_unix > INT64_MAX - 2)
+        return false;
+    char app_source[4608], app_binary[4608];
+    int source_n = snprintf(app_source, sizeof(app_source),
+                            "%s/.story-app.c", candidate_workspace);
+    int binary_n = snprintf(app_binary, sizeof(app_binary),
+                            "%s/.story-app", candidate_workspace);
+    static const char app_source_text[] =
+        "#include <stdio.h>\n#include \"x.h\"\n"
+        "int main(void) { printf(\"x=%d\\n\", x()); return 0; }\n";
+    if (source_n <= 0 || (size_t)source_n >= sizeof(app_source) ||
+        binary_n <= 0 || (size_t)binary_n >= sizeof(app_binary) ||
+        !zpd_write(app_source, app_source_text))
+        return false;
+    const char *compile_argv[] = {
+        "cc", "-std=c23", "-O1", "-Iinclude", ".story-app.c", "src/x.c",
+        "-o", ".story-app", NULL,
+    };
+    struct zcl_devloop_process_result compiled = {0};
+    int64_t compile_started_unix = platform_time_wall_unix();
+    bool compile_ok = zcl_devloop_process_run(
+        candidate_workspace, compile_argv, 30000, &compiled) &&
+        !compiled.timed_out && !compiled.cancelled &&
+        compiled.term_signal == 0 && compiled.exit_code == 0 &&
+        !compiled.output_truncated;
+    int64_t compile_finished_unix = platform_time_wall_unix();
+    compile_ok = compile_ok && compile_started_unix >= build.finished_unix &&
+        compile_finished_unix >= compile_started_unix;
+    char *artifact = compile_ok
+        ? zpd_read_bounded(app_binary, 16u * 1024u * 1024u) : NULL;
+    struct stat artifact_stat;
+    bool artifact_ok = artifact && stat(app_binary, &artifact_stat) == 0 &&
+        artifact_stat.st_size > 0 &&
+        (uint64_t)artifact_stat.st_size <= 16u * 1024u * 1024u;
+    uint8_t artifact_root[32];
+    artifact_ok = artifact_ok && vcs_object_put(
+        workspace, (const uint8_t *)artifact, (size_t)artifact_stat.st_size,
+        VCS_TAG_BLOB, artifact_root);
+    free(artifact);
+    if (!artifact_ok) {
+        (void)unlink(app_source);
+        (void)unlink(app_binary);
+        return false;
+    }
+    static const uint8_t compile_invocation[] =
+        "cc -std=c23 -O1 -Iinclude .story-app.c src/x.c -o .story-app";
+    static const uint8_t compile_confinement[] =
+        "fixture compiler; timeout=30000ms; network state unclaimed";
+    static const uint8_t compile_silent[] = "compiler produced no output";
+    const uint8_t *compile_evidence = compiled.output_len
+        ? (const uint8_t *)compiled.output : compile_silent;
+    size_t compile_evidence_len = compiled.output_len
+        ? compiled.output_len : sizeof(compile_silent) - 1u;
+    uint8_t compile_invocation_root[32], compile_output_root[32];
+    uint8_t compile_confinement_root[32];
+    if (!vcs_object_put(workspace, compile_invocation,
+                        sizeof(compile_invocation) - 1u, VCS_TAG_BLOB,
+                        compile_invocation_root) ||
+        !vcs_object_put(workspace, compile_evidence,
+                        compile_evidence_len, VCS_TAG_BLOB,
+                        compile_output_root) ||
+        !vcs_object_put(workspace, compile_confinement,
+                        sizeof(compile_confinement) - 1u, VCS_TAG_BLOB,
+                        compile_confinement_root)) {
+        (void)unlink(app_source);
+        (void)unlink(app_binary);
+        return false;
+    }
+    struct vcs_zcode_work_receipt_v1 app_build = {
+        .schema_version = VCS_ZCODE_DEV_VERSION,
+        .work_kind = VCS_ZCODE_WORK_BUILD,
+        .status = VCS_ZCODE_WORK_PASS,
+        .exit_status = 0,
+        .started_unix = compile_started_unix,
+        .finished_unix = compile_finished_unix,
+    };
+    memcpy(app_build.task_root, build.task_root, 32);
+    memcpy(app_build.candidate_root, build.candidate_root, 32);
+    memcpy(app_build.action_root, compile_invocation_root, 32);
+    memcpy(app_build.input_root, build.input_root, 32);
+    memcpy(app_build.output_root, artifact_root, 32);
+    memcpy(app_build.proof_policy_root, build.proof_policy_root, 32);
+    memcpy(app_build.toolchain_capsule_root,
+           build.toolchain_capsule_root, 32);
+    memcpy(app_build.lease_id, compile_confinement_root, 32);
+    memcpy(app_build.evidence_root, compile_output_root, 32);
+    memcpy(app_build.confinement_root, compile_confinement_root, 32);
+    uint8_t seed[32], secret[64], pubkey[32];
+    memset(seed, 0xb7, sizeof(seed));
+    ed25519_keypair(pubkey, secret, seed);
+    bool sealed = vcs_zcode_work_receipt_seal(
+        &app_build, secret, pubkey) == VCS_ZCODE_DEV_OK;
+    uint8_t build_wire[VCS_ZCODE_WORK_RECEIPT_WIRE_BYTES];
+    sealed = sealed && vcs_zcode_work_receipt_serialize(
+        &app_build, build_wire) == VCS_ZCODE_DEV_OK &&
+        vcs_zcode_work_receipt_id(&app_build, build_root) ==
+            VCS_ZCODE_DEV_OK &&
+        vcs_object_put_addressed(workspace, build_root, build_wire,
+                                 sizeof(build_wire));
+    static const uint8_t invocation[] = "./.story-app";
+    struct zcl_devloop_process_result ran = {0};
+    const char *run_argv[] = {"./.story-app", NULL};
+    int64_t run_started_unix = platform_time_wall_unix();
+    bool ran_ok = sealed && zcl_devloop_process_run(
+        candidate_workspace, run_argv, 10000, &ran) &&
+        !ran.timed_out && !ran.cancelled && ran.term_signal == 0 &&
+        ran.exit_code == 0 && !ran.output_truncated &&
+        strcmp(ran.output, "x=10\n") == 0;
+    int64_t run_finished_unix = platform_time_wall_unix();
+    ran_ok = ran_ok && run_started_unix >= app_build.finished_unix &&
+        run_finished_unix >= run_started_unix;
+    (void)unlink(app_source);
+    (void)unlink(app_binary);
+    static const uint8_t stream_note[] =
+        "stderr is merged into the complete captured process stream";
+    static const uint8_t confinement[] =
+        "fixture executor; timeout=10000ms; network state unclaimed; streams merged";
+    uint8_t invocation_root[32], stdout_root[32], stderr_root[32];
+    uint8_t confinement_root[32];
+    if (!ran_ok ||
+        !vcs_object_put(workspace, invocation, sizeof(invocation) - 1u,
+                        VCS_TAG_BLOB, invocation_root) ||
+        !vcs_object_put(workspace, (const uint8_t *)ran.output,
+                        ran.output_len, VCS_TAG_BLOB, stdout_root) ||
+        !vcs_object_put(workspace, stream_note, sizeof(stream_note) - 1u,
+                        VCS_TAG_BLOB, stderr_root) ||
+        !vcs_object_put(workspace, confinement, sizeof(confinement) - 1u,
+                        VCS_TAG_BLOB, confinement_root)) {
+        memset(secret, 0, sizeof(secret));
+        return false;
+    }
+    struct vcs_zcode_app_run_observation_v1 observation = {
+        .schema_version = VCS_ZCODE_APP_RUN_OBSERVATION_VERSION,
+        .flags = VCS_ZCODE_APP_RUN_PROVED_FLAGS,
+        .exit_status = 0,
+        .started_unix = run_started_unix,
+        .finished_unix = run_finished_unix,
+    };
+    memcpy(observation.task_root, build.task_root, 32);
+    memcpy(observation.candidate_root, build.candidate_root, 32);
+    memcpy(observation.build_receipt_root, build_root, 32);
+    memcpy(observation.artifact_root, artifact_root, 32);
+    memcpy(observation.invocation_root, invocation_root, 32);
+    memcpy(observation.stdout_root, stdout_root, 32);
+    memcpy(observation.stderr_root, stderr_root, 32);
+    memcpy(observation.confinement_root, confinement_root, 32);
+    uint8_t observation_wire[VCS_ZCODE_APP_RUN_OBSERVATION_WIRE_BYTES];
+    uint8_t observation_root[32];
+    if (vcs_zcode_app_run_observation_v1_serialize(
+            &observation, observation_wire) != VCS_ZCODE_APP_RUN_OK ||
+        vcs_zcode_app_run_observation_v1_root(
+            &observation, observation_root) != VCS_ZCODE_APP_RUN_OK ||
+        !vcs_object_put_addressed(
+            workspace, observation_root, observation_wire,
+            sizeof(observation_wire)))
+        return false;
+    struct vcs_zcode_work_receipt_v1 receipt = {
+        .schema_version = VCS_ZCODE_DEV_VERSION,
+        .work_kind = VCS_ZCODE_WORK_APP_RUN,
+        .status = VCS_ZCODE_WORK_PASS,
+        .exit_status = 0,
+        .started_unix = observation.started_unix,
+        .finished_unix = observation.finished_unix,
+    };
+    memcpy(receipt.task_root, build.task_root, 32);
+    memcpy(receipt.candidate_root, build.candidate_root, 32);
+    memcpy(receipt.action_root, invocation_root, 32);
+    memcpy(receipt.input_root, invocation_root, 32);
+    memcpy(receipt.output_root, observation_root, 32);
+    memcpy(receipt.proof_policy_root, build.proof_policy_root, 32);
+    memcpy(receipt.toolchain_capsule_root,
+           build.toolchain_capsule_root, 32);
+    memcpy(receipt.lease_id, confinement_root, 32);
+    memcpy(receipt.evidence_root, observation_root, 32);
+    memcpy(receipt.confinement_root, confinement_root, 32);
+    bool ok = vcs_zcode_work_receipt_seal(&receipt, secret, pubkey) ==
+              VCS_ZCODE_DEV_OK;
+    memset(secret, 0, sizeof(secret));
+    uint8_t receipt_wire[VCS_ZCODE_WORK_RECEIPT_WIRE_BYTES];
+    uint8_t receipt_root[32];
+    bool stored = ok &&
+        vcs_zcode_work_receipt_serialize(&receipt, receipt_wire) ==
+            VCS_ZCODE_DEV_OK &&
+        vcs_zcode_work_receipt_id(&receipt, receipt_root) ==
+            VCS_ZCODE_DEV_OK &&
+        vcs_object_put_addressed(workspace, receipt_root, receipt_wire,
+                                 sizeof(receipt_wire));
+    if (stored && out_build_receipt_root)
+        memcpy(out_build_receipt_root, build_root, 32);
+    return stored;
+}
+
+struct zpd_benchmark_case {
+    const char *kind;
+    const char *goal;
+    uint8_t project;
+    bool refused;
+};
+
+static __attribute__((unused)) int zpd_test_twelve_task_benchmark(void)
+{
+    static const struct zpd_benchmark_case cases[] = {
+        {"seeded_repair", "Repair seeded parser branch A", 0, false},
+        {"seeded_repair", "Repair seeded parser branch B", 1, false},
+        {"seeded_repair", "Repair seeded parser branch C", 2, false},
+        {"seeded_repair", "Repair seeded return regression", 0, false},
+        {"bounded_api", "Add bounded API behavior A", 1, false},
+        {"bounded_api", "Add bounded API behavior B", 2, false},
+        {"bounded_api", "Add bounded API behavior C", 0, false},
+        {"malformed_ub", "Repair malformed input handling", 1, false},
+        {"malformed_ub", "Repair portability boundary", 2, false},
+        {"malformed_ub", "Repair undefined behavior guard", 0, false},
+        {"impossible", "Modify LICENSE outside the write scope", 1, true},
+        {"impossible", "Replace package identity outside scope", 2, true},
+    };
+    int failures = 0;
+    TEST("zcode development benchmark: 12 frozen tasks across 3 projects") {
+        int64_t benchmark_started = platform_time_monotonic_us();
+        char roots[3][256];
+        for (int p = 0; p < 3; p++) {
+            (void)snprintf(roots[p], sizeof(roots[p]),
+                           "test-tmp/zcode-benchmark-%ld-%d",
+                           (long)getpid(), p);
+            char name[32];
+            /* Candidate paths are host-global by task root. Give concurrent
+             * checkouts distinct fixture source identities so an identical
+             * frozen case cannot adopt another process's partial attempt. */
+            (void)snprintf(name, sizeof(name), "benchmark-%ld-%d",
+                           (long)getpid(), p);
+            ASSERT(zpd_benchmark_project(roots[p], name, p + 1));
+        }
+        uint8_t source_roots[3][32], source_after[32];
+        for (int p = 0; p < 3; p++)
+            ASSERT(vcs_tree_capture_path(roots[p], source_roots[p]) == VCS_OK);
+        size_t compiling = 0, profile = 0, refused = 0, accepted = 0;
+        uint64_t selected_bytes = 0, total_bytes = 0, context_us = 0;
+        uint64_t model_context_bytes = 0;
+        size_t story_projection_bytes = 0, story_full_bytes = 0;
+        size_t story_full_envelope_bytes = 0;
+        size_t story_source_status_bytes = 0, story_focus_bytes = 0;
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            uint8_t preedit_focus_root[32] = {0};
+            int64_t preedit_observed_us = 0;
+            int64_t edit_started_us = 0;
+            struct json_value input;
+            json_init(&input); json_set_object(&input);
+            ASSERT(json_push_kv_str(&input, "workspace",
+                                    roots[cases[i].project]));
+            ASSERT(json_push_kv_str(&input, "goal", cases[i].goal));
+            ASSERT(json_push_kv_str(&input, "profile", "quick"));
+            struct zcl_command_request request = {.input = &input};
+            struct zcl_command_reply reply;
+            zcl_command_reply_init(&reply, "zcl.zcode_benchmark_start.v1");
+            zcl_native_handle_zcode_work_start(&request, &reply);
+            if (reply.status != ZCL_COMMAND_STATUS_PASSED)
+                printf("benchmark case %zu start: %s %s\n", i,
+                       reply.error.code, reply.error.message);
+            ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+            const struct json_value *context =
+                json_get(&reply.data, "selected_context");
+            ASSERT(context && context->type == JSON_OBJ);
+            selected_bytes += (uint64_t)json_get_int(
+                json_get(context, "selected_context_bytes"));
+            total_bytes += (uint64_t)json_get_int(
+                json_get(context, "total_source_bytes"));
+            context_us += (uint64_t)json_get_int(
+                json_get(context, "generation_us"));
+            char work_id[32];
+            (void)snprintf(work_id, sizeof(work_id), "%s",
+                json_get_str(json_get(&reply.data, "work_id")));
+            zcl_command_reply_free(&reply); json_free(&input);
+
+            json_init(&input); json_set_object(&input);
+            ASSERT(json_push_kv_str(&input, "workspace",
+                                    roots[cases[i].project]));
+            ASSERT(json_push_kv_str(&input, "work", work_id));
+            ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+            request.input = &input;
+            zcl_command_reply_init(&reply, "zcl.zcode_benchmark_run.v1");
+            zcl_native_handle_zcode_work_run(&request, &reply);
+            if (reply.status != ZCL_COMMAND_STATUS_PASSED)
+                printf("benchmark case %zu handoff: %s %s\n", i,
+                       reply.error.code, reply.error.message);
+            ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+            model_context_bytes += (uint64_t)json_get_int(
+                json_get(&reply.data, "model_context_bytes"));
+            char candidate[4500];
+            (void)snprintf(candidate, sizeof(candidate), "%s",
+                json_get_str(json_get(&reply.data, "candidate_workspace")));
+            zcl_command_reply_free(&reply); json_free(&input);
+            if (i == 0) {
+                struct json_value duplicate_input;
+                json_init(&duplicate_input);
+                json_set_object(&duplicate_input);
+                ASSERT(json_push_kv_str(&duplicate_input, "workspace",
+                                        roots[cases[i].project]));
+                ASSERT(json_push_kv_str(&duplicate_input, "goal",
+                                        cases[i].goal));
+                ASSERT(json_push_kv_str(&duplicate_input, "profile",
+                                        "standard"));
+                struct zcl_command_request duplicate_request = {
+                    .input = &duplicate_input,
+                };
+                struct zcl_command_reply duplicate_reply;
+                zcl_command_reply_init(
+                    &duplicate_reply, "zcl.zcode_benchmark_duplicate.v1");
+                zcl_native_handle_zcode_work_start(
+                    &duplicate_request, &duplicate_reply);
+                ASSERT(duplicate_reply.status == ZCL_COMMAND_STATUS_BLOCKED);
+                ASSERT(strcmp(duplicate_reply.error.code,
+                              "ACTIVE_TASK_CONFLICT") == 0);
+                ASSERT(strcmp(json_get_str(json_get(
+                                  &duplicate_reply.data, "conflict_kind")),
+                              "DUPLICATE_ACTIVE_WORK") == 0);
+
+                struct json_value focus_input;
+                json_init(&focus_input);
+                json_set_object(&focus_input);
+                ASSERT(json_push_kv_str(&focus_input, "workspace",
+                                        roots[cases[i].project]));
+                ASSERT(json_push_kv_str(&focus_input, "work", work_id));
+                struct zcl_command_request focus_request = {
+                    .input = &focus_input,
+                };
+                struct zcl_command_reply focus_reply;
+                zcl_command_reply_init(
+                    &focus_reply, "zcl.zcode_benchmark_preedit_focus.v1");
+                zcl_native_handle_story_focus(&focus_request, &focus_reply);
+                ASSERT(focus_reply.status == ZCL_COMMAND_STATUS_PASSED);
+                ASSERT(strcmp(json_get_str(json_get(
+                                  &focus_reply.data, "focus_schema")),
+                              "focus.v1") == 0);
+                ASSERT(strcmp(json_get_str(json_get(
+                                  &focus_reply.data, "orientation_status")),
+                              "PROVED") == 0);
+                ASSERT(strcmp(json_get_str(json_get(
+                                  &focus_reply.data, "candidate_root")), "") == 0);
+                ASSERT(json_size(json_get(&focus_reply.data,
+                                          "allowed_write_scopes")) > 0);
+                ASSERT(zpd_real_focus_preedit_acceptance(
+                    roots[cases[i].project], work_id, &focus_reply.data,
+                    &duplicate_reply.data, preedit_focus_root,
+                    &preedit_observed_us));
+                zcl_command_reply_free(&focus_reply);
+                json_free(&focus_input);
+                zcl_command_reply_free(&duplicate_reply);
+                json_free(&duplicate_input);
+                edit_started_us = platform_time_monotonic_us();
+                ASSERT(preedit_observed_us > 0 &&
+                       edit_started_us >= preedit_observed_us);
+            }
+            char changed[4600], contents[128];
+            if (cases[i].refused) {
+                (void)snprintf(changed, sizeof(changed), "%s/LICENSE",
+                               candidate);
+                ASSERT(zpd_write(changed, "Proprietary\n"));
+            } else {
+                (void)snprintf(changed, sizeof(changed), "%s/src/x.c",
+                               candidate);
+                (void)snprintf(contents, sizeof(contents),
+                               "int x(void) { return %zu; }\n", i + 10u);
+                ASSERT(zpd_write(changed, contents));
+            }
+            json_init(&input); json_set_object(&input);
+            ASSERT(json_push_kv_str(&input, "workspace",
+                                    roots[cases[i].project]));
+            ASSERT(json_push_kv_str(&input, "work", work_id));
+            ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+            request.input = &input;
+            zcl_command_reply_init(&reply, "zcl.zcode_benchmark_admit.v1");
+            zcl_native_handle_zcode_work_run(&request, &reply);
+            if (cases[i].refused) {
+                ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+                ASSERT(strcmp(reply.error.code, "PATCH_OUTSIDE_SCOPE") == 0);
+                refused++;
+            } else {
+                ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                              "EVIDENCE_READY") == 0);
+                ASSERT(json_get(&reply.data, "candidate_root") == NULL);
+                ASSERT(json_get(&reply.data, "expert") == NULL);
+                ASSERT(json_get_bool(json_get(
+                    &reply.data, "details_available")));
+                compiling++;
+            }
+            zcl_command_reply_free(&reply); json_free(&input);
+
+            if (!cases[i].refused) {
+                uint8_t app_build_receipt_root[32] = {0};
+                if (i == 0) {
+                    /* One independently authorized fixture executor records
+                     * the exact built artifact and bounded invocation before
+                     * the human acceptance transition.  StoryGraph reads the
+                     * resulting CAS objects; it does not own this fact. */
+                    json_init(&input); json_set_object(&input);
+                    ASSERT(json_push_kv_str(&input, "workspace",
+                                            roots[cases[i].project]));
+                    ASSERT(json_push_kv_str(&input, "work", work_id));
+                    ASSERT(json_push_kv_bool(&input, "details", true));
+                    request.input = &input;
+                    zcl_command_reply_init(
+                        &reply, "zcl.zcode_benchmark_app_status.v1");
+                    zcl_native_handle_zcode_work_status(&request, &reply);
+                    ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                    const struct json_value *expert =
+                        json_get(&reply.data, "expert");
+                    ASSERT(expert && expert->type == JSON_OBJ);
+                    const char *process_env =
+                        getenv("ZCL_DEVLOOP_TEST_PROCESS");
+                    char *saved_process_env = process_env
+                        ? strdup(process_env) : NULL;
+                    ASSERT(!process_env || saved_process_env);
+                    ASSERT(platform_environment_set(
+                               "ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+                    bool app_evidence = zpd_store_app_run_evidence(
+                        roots[cases[i].project], candidate, expert,
+                        app_build_receipt_root);
+                    ASSERT(platform_environment_set(
+                               "ZCL_DEVLOOP_TEST_PROCESS",
+                               saved_process_env ? saved_process_env : "",
+                               1) == 0);
+                    free(saved_process_env);
+                    ASSERT(app_evidence);
+                    zcl_command_reply_free(&reply); json_free(&input);
+                    json_init(&input); json_set_object(&input);
+                    ASSERT(json_push_kv_str(&input, "workspace",
+                                            roots[cases[i].project]));
+                    ASSERT(json_push_kv_str(&input, "work", work_id));
+                    request.input = &input;
+                    zcl_command_reply_init(&reply, "zcl.story_focus.v1");
+                    zcl_native_handle_story_focus(&request, &reply);
+                    ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                    ASSERT(zpd_user_session_scope_refusals(
+                        roots[cases[i].project], &reply.data));
+#if !defined(_WIN32)
+                    ASSERT(zpd_user_session_resume(roots[cases[i].project],
+                                                   &reply.data));
+#endif
+                    zcl_command_reply_free(&reply); json_free(&input);
+                }
+                json_init(&input); json_set_object(&input);
+                ASSERT(json_push_kv_str(&input, "workspace",
+                                        roots[cases[i].project]));
+                ASSERT(json_push_kv_str(&input, "work", work_id));
+                request.input = &input;
+                zcl_command_reply_init(&reply,
+                                       "zcl.zcode_benchmark_accept.v1");
+                zcl_native_handle_zcode_work_accept(&request, &reply);
+                ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                              "PROVEN") == 0);
+                profile++; accepted++;
+                zcl_command_reply_free(&reply); json_free(&input);
+
+                json_init(&input); json_set_object(&input);
+                ASSERT(json_push_kv_str(&input, "workspace",
+                                        roots[cases[i].project]));
+                ASSERT(json_push_kv_str(&input, "work", work_id));
+                if (i == 0)
+                    ASSERT(json_push_kv_bool(&input, "details", true));
+                request.input = &input;
+                zcl_command_reply_init(&reply,
+                                       "zcl.zcode_benchmark_status.v1");
+                zcl_native_handle_zcode_work_status(&request, &reply);
+                ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                ASSERT(strcmp(json_get_str(json_get(&reply.data, "goal")),
+                              cases[i].goal) == 0);
+                ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                              "PROVEN") == 0);
+                ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                              "Accepted") == 0);
+                ASSERT(json_get(&reply.data, "next_safe_command") != NULL);
+                if (i == 0)
+                    story_source_status_bytes = json_write(
+                        &reply.data, NULL, 0);
+                zcl_command_reply_free(&reply); json_free(&input);
+
+                if (i == 0) {
+                    json_init(&input); json_set_object(&input);
+                    ASSERT(json_push_kv_str(&input, "workspace",
+                                            roots[cases[i].project]));
+                    ASSERT(json_push_kv_str(&input, "work", work_id));
+                    request.input = &input; request.view = "normal";
+                    zcl_command_reply_init(&reply,
+                                           "zcl.story_focus_test.v1");
+                    zcl_native_handle_story_focus(&request, &reply);
+                    ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                    ASSERT(strcmp(json_get_str(json_get(&reply.data, "goal")),
+                                  cases[i].goal) == 0);
+                    const struct json_value *resume_scope = json_get(
+                        &reply.data, "allowed_write_scopes");
+                    ASSERT(resume_scope);
+                    ASSERT(resume_scope->type == JSON_ARR);
+                    ASSERT(json_size(resume_scope) > 0);
+                    const struct json_value *resume_candidate = json_get(
+                        &reply.data, "candidate_root");
+                    ASSERT(resume_candidate);
+                    ASSERT(resume_candidate->type == JSON_STR);
+                    ASSERT(strlen(json_get_str(resume_candidate)) == 64);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &reply.data, "context_status")),
+                                  "PROVED") == 0);
+                    ASSERT(json_get_int(json_get(
+                               &reply.data, "selected_source_count")) > 0);
+                    ASSERT(json_size(json_get(
+                               &reply.data, "selected_sources")) > 0);
+                    ASSERT(json_get(&reply.data, "proved_relations") != NULL);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &reply.data, "focus_schema")),
+                                  "focus.v1") == 0);
+                    ASSERT(strlen(json_get_str(json_get(
+                                      &reply.data, "focus_root"))) == 64);
+                    ASSERT(strlen(json_get_str(json_get(
+                                      &reply.data,
+                                      "focus_situation_root"))) == 64);
+                    ASSERT(strlen(json_get_str(json_get(
+                                      &reply.data, "claim_set_root"))) == 64);
+                    ASSERT(json_get_int(json_get(
+                               &reply.data, "claim_count")) == 0);
+                    ASSERT(strlen(json_get_str(json_get(
+                                      &reply.data,
+                                      "required_evidence_root"))) == 64);
+                    ASSERT(strlen(json_get_str(json_get(
+                                      &reply.data,
+                                      "authority_limits_root"))) == 64);
+                    ASSERT(json_get(&reply.data, "next_action") != NULL);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &reply.data, "orientation_status")),
+                                  "PROVED") == 0);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &reply.data, "orientation_reason")),
+                                  "task_source_and_context_identifier_reverified") == 0);
+                    ASSERT(strlen(json_get_str(json_get(
+                                      &reply.data,
+                                      "orientation_source_root"))) == 64);
+                    const struct json_value *change_plan =
+                        json_get(&reply.data, "change_plan");
+                    ASSERT(change_plan && change_plan->type == JSON_OBJ);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      change_plan, "resolution")),
+                                  "exact_stable_id") == 0);
+                    ASSERT(json_get_bool(json_get(
+                               change_plan, "symbol_found")));
+                    ASSERT(json_size(json_get(change_plan, "edit")) > 0);
+                    const struct json_value *plan_groups =
+                        json_get(change_plan, "test_groups");
+                    bool has_package_dev = false;
+                    for (size_t g = 0; g < json_size(plan_groups); g++)
+                        if (strcmp(json_get_str(&plan_groups->children[g]),
+                                   "zcode_package_dev") == 0)
+                            has_package_dev = true;
+                    ASSERT(has_package_dev);
+                    story_focus_bytes = json_write(&reply.data, NULL, 0);
+                    ASSERT(story_focus_bytes < ZCL_COMMAND_LIST_BUDGET);
+                    ASSERT(zpd_real_focus_handoff_acceptance(
+                        roots[cases[i].project], work_id, &reply.data,
+                        app_build_receipt_root, preedit_focus_root,
+                        preedit_observed_us, edit_started_us));
+                    zcl_command_reply_free(&reply); json_free(&input);
+
+                    char stale_path[512];
+                    (void)snprintf(stale_path, sizeof(stale_path),
+                                   "%s/src/x.c", roots[0]);
+                    ASSERT(zpd_write(stale_path,
+                                     "int x(void) { return 99; }\n"));
+                    json_init(&input); json_set_object(&input);
+                    ASSERT(json_push_kv_str(&input, "workspace", roots[0]));
+                    ASSERT(json_push_kv_str(&input, "work", work_id));
+                    request.input = &input;
+                    zcl_command_reply_init(&reply,
+                                           "zcl.story_focus_stale_test.v1");
+                    zcl_native_handle_story_focus(&request, &reply);
+                    ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &reply.data, "orientation_status")),
+                                  "INCOMPLETE") == 0);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &reply.data, "orientation_reason")),
+                                  "workspace_source_root_mismatch") == 0);
+                    ASSERT(json_get(&reply.data, "change_plan") == NULL);
+                    zcl_command_reply_free(&reply); json_free(&input);
+                    ASSERT(zpd_write(stale_path,
+                                     "int x(void) { return 1; }\n"));
+
+                    json_init(&input); json_set_object(&input);
+                    ASSERT(json_push_kv_str(&input, "workspace",
+                                            roots[cases[i].project]));
+                    ASSERT(json_push_kv_str(&input, "work", work_id));
+                    request.input = &input; request.view = "normal";
+                    zcl_command_reply_init(&reply, "zcl.story_show_test.v1");
+                    zcl_native_handle_story_show(&request, &reply);
+                    ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                    ASSERT(strcmp(json_get_str(json_get(&reply.data, "status")),
+                                  "PROVED") == 0);
+                    ASSERT(json_get_bool(json_get(&reply.data, "complete")));
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &reply.data, "largest_missing_relation")),
+                                  "none") == 0);
+                    ASSERT(json_size(json_get(&reply.data, "events")) == 7);
+                    story_projection_bytes = json_write(
+                        &reply.data, NULL, 0);
+                    ASSERT(story_projection_bytes < ZCL_COMMAND_LIST_BUDGET);
+                    zcl_command_reply_free(&reply); json_free(&input);
+
+                    json_init(&input); json_set_object(&input);
+                    ASSERT(json_push_kv_str(&input, "workspace",
+                                            roots[cases[i].project]));
+                    ASSERT(json_push_kv_str(&input, "work", work_id));
+                    request.input = &input; request.view = "full";
+                    zcl_command_reply_init(&reply,
+                                           "zcl.story_show_full_test.v1");
+                    zcl_native_handle_story_show(&request, &reply);
+                    ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                    const struct json_value *journey = json_get(
+                        &reply.data, "journey");
+                    ASSERT(journey && journey->type == JSON_ARR);
+                    ASSERT(json_size(journey) == 9);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &journey->children[6], "stage")),
+                                  "reproduce") == 0);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &journey->children[6], "status")),
+                                  "UNKNOWN") == 0);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &journey->children[7], "status")),
+                                  "PROVED") == 0);
+                    ASSERT(strcmp(json_get_str(json_get(
+                                      &reply.data, "journey_next_stage")),
+                                  "inspection_required") == 0);
+                    ASSERT(json_get_bool(json_get(
+                               &reply.data, "journey_actionable_complete")));
+                    ASSERT(json_get_bool(json_get(
+                               &reply.data, "journey_inspection_required")));
+                    story_full_bytes = json_write(&reply.data, NULL, 0);
+                    ASSERT(story_full_bytes > story_projection_bytes);
+                    ASSERT(story_full_bytes < ZCL_COMMAND_LIST_BUDGET);
+                    {
+                        const struct zcl_command_registry *registry =
+                            zcl_command_catalog();
+                        const struct zcl_command_spec *spec =
+                            zcl_command_registry_find(
+                                registry, "story.show", NULL);
+                        struct zcl_command_context command_context = {
+                            .registry = registry,
+                            .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+                            .granted_capabilities = ~(uint64_t)0,
+                        };
+                        char envelope[ZCL_COMMAND_LIST_BUDGET + 1u];
+                        enum zcl_command_exit exit_code =
+                            ZCL_COMMAND_EXIT_INTERNAL;
+                        ASSERT(spec != NULL);
+                        size_t envelope_bytes =
+                            zcl_command_registry_execute_json(
+                                registry, spec, &command_context, &input,
+                                false, spec->path, "full", 0, 0, NULL,
+                                envelope, sizeof(envelope), &exit_code);
+                        story_full_envelope_bytes = envelope_bytes;
+                        ASSERT(exit_code == ZCL_COMMAND_EXIT_OK);
+                        ASSERT(envelope_bytes > 0 &&
+                               envelope_bytes <= ZCL_COMMAND_LIST_BUDGET);
+                        /* Production-valid status/list/next-hint growth is
+                         * <=192 bytes; bounded read authority adds 7 and both
+                         * elapsed counters add <=36: reserve 256 for <=235.
+                         * The goal/workspace are not emitted in this view. */
+                        ASSERT(envelope_bytes + 256u <
+                               ZCL_COMMAND_LIST_BUDGET);
+                        ASSERT(strstr(envelope,
+                                      "RESPONSE_BUDGET_EXCEEDED") == NULL);
+                        struct json_value serialized;
+                        json_init(&serialized);
+                        ASSERT(json_read(&serialized, envelope,
+                                         envelope_bytes));
+                        ASSERT(json_size(json_get(json_get(
+                                   &serialized, "data"), "journey")) == 9);
+                        json_free(&serialized);
+                    }
+                    zcl_command_reply_free(&reply); json_free(&input);
+
+                    json_init(&input); json_set_object(&input);
+                    ASSERT(json_push_kv_str(&input, "workspace",
+                                            roots[cases[i].project]));
+                    ASSERT(json_push_kv_str(&input, "work", work_id));
+                    ASSERT(json_push_kv_str(&input, "event",
+                                            "user_accepts"));
+                    request.input = &input; request.view = "normal";
+                    zcl_command_reply_init(&reply, "zcl.story_why_test.v1");
+                    zcl_native_handle_story_why(&request, &reply);
+                    ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                    ASSERT(strcmp(json_get_str(json_get(&reply.data, "status")),
+                                  "PROVED") == 0);
+                    ASSERT(json_get_bool(json_get(&reply.data, "complete")));
+                    ASSERT(json_size(json_get(&reply.data, "causal_chain")) ==
+                           7);
+                    zcl_command_reply_free(&reply); json_free(&input);
+
+                    json_init(&input); json_set_object(&input);
+                    ASSERT(json_push_kv_str(&input, "workspace",
+                                            roots[cases[i].project]));
+                    ASSERT(json_push_kv_str(&input, "before", work_id));
+                    ASSERT(json_push_kv_str(&input, "after", work_id));
+                    request.input = &input; request.view = "normal";
+                    zcl_command_reply_init(&reply, "zcl.story_diff_test.v1");
+                    zcl_native_handle_story_diff(&request, &reply);
+                    ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                    ASSERT(strcmp(json_get_str(json_get(&reply.data, "status")),
+                                  "PROVED") == 0);
+                    ASSERT(json_size(json_get(
+                               &reply.data, "added_event_roots")) == 0);
+                    ASSERT(json_size(json_get(
+                               &reply.data, "removed_event_roots")) == 0);
+                    ASSERT(json_size(json_get(
+                               &reply.data, "changed_event_roots")) == 0);
+                    zcl_command_reply_free(&reply); json_free(&input);
+                }
+
+                /* One lifecycle fact, one interpretation: with the work
+                 * PROVEN, run is an idempotent observation of the accepted
+                 * state — never a fresh candidate attempt. */
+                json_init(&input); json_set_object(&input);
+                ASSERT(json_push_kv_str(&input, "workspace",
+                                        roots[cases[i].project]));
+                ASSERT(json_push_kv_str(&input, "work", work_id));
+                ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+                request.input = &input;
+                zcl_command_reply_init(&reply,
+                                       "zcl.zcode_benchmark_rerun.v1");
+                zcl_native_handle_zcode_work_run(&request, &reply);
+                ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+                ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                              "PROVEN") == 0);
+                ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                              "Accepted") == 0);
+                ASSERT(strcmp(json_get_str(
+                                  json_get(&reply.data, "build_result")),
+                              "passed") == 0);
+                ASSERT(json_get(&reply.data, "candidate_workspace") == NULL);
+                zcl_command_reply_free(&reply); json_free(&input);
+            }
+            char *attempt = strrchr(candidate, '/');
+            ASSERT(attempt != NULL); *attempt = '\0';
+            ASSERT(zcl_tree_remove(candidate).ok);
+        }
+        ASSERT(compiling == 10);
+        ASSERT(profile == 10);
+        ASSERT(accepted == 10);
+        ASSERT(refused == 2);
+        ASSERT(selected_bytes > 0 && selected_bytes < total_bytes);
+        ASSERT(model_context_bytes > selected_bytes);
+        ASSERT(context_us > 0);
+        ASSERT(story_projection_bytes > 0 && story_full_bytes > 0 &&
+               story_source_status_bytes > 0 && story_focus_bytes > 0);
+        ASSERT(story_focus_bytes <
+               story_projection_bytes + story_source_status_bytes);
+        int64_t benchmark_elapsed =
+            platform_time_monotonic_us() - benchmark_started;
+        ASSERT(benchmark_elapsed > 0);
+        printf("benchmark: tasks=12 projects=3 compiling=%zu profile=%zu "
+               "accepted=%zu refused=%zu context=%llu/%llu bytes "
+               "model_context_bytes=%llu context_us=%llu "
+               "story_bytes=%zu story_full_bytes=%zu "
+               "story_full_envelope_bytes=%zu "
+               "story_context_saved_pct=%zu "
+               "story_focus_bytes=%zu story_focus_join_saved_pct=%zu "
+               "story_source_status_bytes=%zu "
+               "elapsed_us=%llu\n",
+               compiling, profile, accepted, refused,
+               (unsigned long long)selected_bytes,
+               (unsigned long long)total_bytes,
+               (unsigned long long)model_context_bytes,
+               (unsigned long long)context_us,
+               story_projection_bytes, story_full_bytes,
+               story_full_envelope_bytes,
+               (story_full_bytes - story_projection_bytes) * 100u /
+                   story_full_bytes,
+               story_focus_bytes,
+               (story_projection_bytes + story_source_status_bytes -
+                story_focus_bytes) * 100u /
+                   (story_projection_bytes + story_source_status_bytes),
+               story_source_status_bytes,
+               (unsigned long long)benchmark_elapsed);
+        for (int p = 0; p < 3; p++) {
+            ASSERT(vcs_tree_capture_path(roots[p], source_after) == VCS_OK);
+            ASSERT(memcmp(source_roots[p], source_after,
+                          sizeof(source_after)) == 0);
+            ASSERT(zcl_tree_remove(roots[p]).ok);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_test_base(secp256k1_context *ctx, const uint8_t secret[32],
+                         const uint8_t pubkey[33])
+{
+    int failures = 0;
+    TEST("zcode package dev prepare: base tree derives all canonical roots") {
+        struct vcs_package_prepare_options options = {
+            .dir = "platform/modules/base", .publisher_sequence = 1,
+            .reward_address = "", .chain_id = "zclassic-main",
+        };
+        memcpy(options.publisher_pubkey, pubkey, 33);
+        struct vcs_package_prepared prepared;
+        char detail[256];
+        ASSERT(vcs_package_prepare(&options, &prepared, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(prepared.manifest.count > 10);
+        ASSERT(prepared.recipe.sources.count > 0);
+        ASSERT(prepared.capsule.count > 0);
+        ASSERT(prepared.lock.count == 1 &&
+               prepared.lock.nodes[0].depth == 0 &&
+               prepared.lock.nodes[0].direct_deps == 0);
+        ASSERT(prepared.release_body_len > 64);
+        char root_hex[65];
+        zcl_hex_encode(prepared.package_root, 32, root_hex);
+        printf("base package root: %s\n", root_hex);
+
+        char pubkey_hex[67];
+        zcl_hex_encode(pubkey, 33, pubkey_hex);
+        struct json_value prepare_input;
+        json_init(&prepare_input); json_set_object(&prepare_input);
+        ASSERT(json_push_kv_str(&prepare_input, "dir", "platform/modules/base"));
+        ASSERT(json_push_kv_str(&prepare_input, "publisher_pubkey",
+                                pubkey_hex));
+        ASSERT(json_push_kv_int(&prepare_input, "publisher_sequence", 1));
+        struct zcl_command_request prepare_request = {
+            .input = &prepare_input,
+        };
+        struct zcl_command_reply prepare_reply;
+        zcl_command_reply_init(&prepare_reply,
+                               "zcl.zcode_package_dev_test.v1");
+        zcl_native_handle_zcode_package_dev_prepare(&prepare_request,
+                                                    &prepare_reply);
+        ASSERT(prepare_reply.status == ZCL_COMMAND_STATUS_PASSED);
+        const struct json_value *prepared_root =
+            json_get(&prepare_reply.data, "package_root");
+        ASSERT(prepared_root &&
+               strcmp(json_get_str(prepared_root), root_hex) == 0);
+        zcl_command_reply_free(&prepare_reply);
+        json_free(&prepare_input);
+
+        struct vcs_package_capsule parsed;
+        ASSERT(vcs_package_capsule_parse(prepared.capsule_wire,
+                                         prepared.capsule_wire_len,
+                                         &parsed) == VCS_PACKAGE_CAPSULE_OK);
+        uint8_t parsed_root[32];
+        ASSERT(vcs_package_capsule_root(&parsed, parsed_root) ==
+               VCS_PACKAGE_CAPSULE_OK);
+        ASSERT(memcmp(parsed_root, prepared.capsule_root, 32) == 0);
+        for (size_t n = 0; n < prepared.capsule_wire_len; n++)
+            ASSERT(vcs_package_capsule_parse(prepared.capsule_wire, n,
+                                             &parsed) !=
+                   VCS_PACKAGE_CAPSULE_OK);
+        uint8_t *trailing = malloc(prepared.capsule_wire_len + 1u); // raw-alloc-ok:test-fixture
+        ASSERT(trailing != NULL);
+        memcpy(trailing, prepared.capsule_wire, prepared.capsule_wire_len);
+        trailing[prepared.capsule_wire_len] = 0;
+        ASSERT(vcs_package_capsule_parse(trailing,
+                                         prepared.capsule_wire_len + 1u,
+                                         &parsed) ==
+               VCS_PACKAGE_CAPSULE_ERR_TRAILING);
+        free(trailing);
+
+        uint8_t signature[64];
+        ASSERT(zpd_signature(ctx, secret, prepared.signing_digest, signature));
+        char *body_hex = malloc(prepared.release_body_len * 2u + 1u); // raw-alloc-ok:test-fixture
+        char signature_hex[129];
+        ASSERT(body_hex != NULL);
+        zcl_hex_encode(prepared.release_body, prepared.release_body_len,
+                       body_hex);
+        zcl_hex_encode(signature, sizeof(signature), signature_hex);
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "release_body_hex", body_hex));
+        ASSERT(json_push_kv_str(&input, "signature_hex", signature_hex));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_package_dev_test.v1");
+        zcl_native_handle_zcode_package_dev_seal(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        const struct json_value *status = json_get(&reply.data,
+                                                    "signature_status");
+        ASSERT(status && strcmp(json_get_str(status), "verified") == 0);
+        zcl_command_reply_free(&reply); json_free(&input); free(body_hex);
+
+        struct vcs_package_prepare_options sha_options = {
+            .dir = "platform/modules/sha3", .publisher_sequence = 2,
+            .reward_address = "", .chain_id = "zclassic-main",
+        };
+        memcpy(sha_options.publisher_pubkey, pubkey, 33);
+        struct vcs_package_prepared sha_prepared;
+        ASSERT(vcs_package_prepare(&sha_options, &sha_prepared, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(sha_prepared.lock.count == 2);
+        ASSERT(sha_prepared.lock.nodes[0].depth == 1 &&
+               sha_prepared.lock.nodes[0].direct_deps == 0 &&
+               memcmp(sha_prepared.lock.nodes[0].root,
+                      prepared.package_root, 32) == 0);
+        ASSERT(sha_prepared.lock.nodes[1].depth == 0 &&
+               sha_prepared.lock.nodes[1].direct_deps == 1);
+        zcl_hex_encode(sha_prepared.package_root, 32, root_hex);
+        printf("sha3 package root: %s\n", root_hex);
+        vcs_package_prepared_free(&sha_prepared);
+        vcs_package_prepared_free(&prepared);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_test_control_stores(const uint8_t pubkey[33])
+{
+    int failures = 0;
+    TEST("zcode package dev prepare: local control stores do not alter package roots") {
+        char root[256], path[320];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-package-control-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        struct vcs_package_prepare_options options = {
+            .dir = root, .publisher_sequence = 1,
+            .reward_address = "", .chain_id = "zclassic-main",
+        };
+        memcpy(options.publisher_pubkey, pubkey, 33);
+        struct vcs_package_prepared before, after;
+        char detail[256];
+        ASSERT(vcs_package_prepare(&options, &before, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        (void)snprintf(path, sizeof(path), "%s/.zvcs", root);
+        ASSERT(platform_directory_create(path, 0700) == 0);
+        (void)snprintf(path, sizeof(path), "%s/.zvcs/control", root);
+        ASSERT(zpd_write(path, "local vcs state\n"));
+        (void)snprintf(path, sizeof(path), "%s/.codeindex", root);
+        ASSERT(platform_directory_create(path, 0700) == 0);
+        (void)snprintf(path, sizeof(path), "%s/.codeindex/control", root);
+        ASSERT(zpd_write(path, "derived index state\n"));
+        ASSERT(zpd_plant_build_output(root));
+        ASSERT(vcs_package_prepare(&options, &after, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(memcmp(before.package_root, after.package_root, 32) == 0);
+        vcs_package_prepared_free(&after);
+        vcs_package_prepared_free(&before);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A release prepared without an explicit chain_id must name the chain this
+ * node is on. The default was the literal "zclassic-main", so on a testnet or
+ * regtest node `zcode package dev prepare` produced a release that
+ * vcs_package_accept — the very next thing to touch it — could only refuse as
+ * wrong-chain-id, on the publishing node as much as on any peer that fetched
+ * the carrier. It cost the two-node commons journey a whole fetch-and-import
+ * round to find, and it was invisible to every existing test because they all
+ * pass chain_id explicitly. This one does not, and it asserts under regtest,
+ * where the literal and the truth differ. It goes through the leaf on
+ * purpose: vcs_package_prepare is deliberately free of chainparams (several
+ * standalone tools link it without them), so the leaf owns the default. */
+static int zpd_test_default_chain_id(const uint8_t pubkey[33])
+{
+    int failures = 0;
+    TEST("zcode package dev prepare: an unstated chain_id is the active chain") {
+        char root[256], pubkey_hex[67];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-package-chain-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        zcl_hex_encode(pubkey, 33, pubkey_hex);
+        chain_params_select(CHAIN_REGTEST);
+        char want[VCS_PACKAGE_RELEASE_CHAIN_ID_MAX + 1u];
+        ASSERT(vcs_package_accept_chain_id(want, sizeof(want)));
+        ASSERT(strcmp(want, "zclassic-main") != 0);
+
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "dir", root));
+        ASSERT(json_push_kv_str(&input, "publisher_pubkey", pubkey_hex));
+        ASSERT(json_push_kv_int(&input, "publisher_sequence", 1));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_package_dev_test.v1");
+        zcl_native_handle_zcode_package_dev_prepare(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        const struct json_value *got = json_get(&reply.data, "chain_id");
+        ASSERT(got && strcmp(json_get_str(got), want) == 0);
+        zcl_command_reply_free(&reply);
+
+        /* An explicit chain_id still wins: preparing a release for another
+         * chain stays possible on purpose. */
+        ASSERT(json_push_kv_str(&input, "chain_id", "zclassic-main"));
+        zcl_command_reply_init(&reply, "zcl.zcode_package_dev_test.v1");
+        zcl_native_handle_zcode_package_dev_prepare(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        got = json_get(&reply.data, "chain_id");
+        ASSERT(got && strcmp(json_get_str(got), "zclassic-main") == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        chain_params_select(CHAIN_MAIN);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_test_exact_file_selection(const uint8_t pubkey[33])
+{
+    int failures = 0;
+    TEST("zcode package dev prepare: exact file selection is closed and root-bound") {
+        char root[256], path[320];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-package-files-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        (void)snprintf(path, sizeof(path), "%s/src/unused.c", root);
+        ASSERT(zpd_write(path, "int unused(void) { return 1; }\n"));
+        (void)snprintf(path, sizeof(path), "%s/zcode-package.json", root);
+        ASSERT(zpd_write(path,
+            "{\"schema\":1,\"name\":\"zclassic23/fixture\","
+            "\"semver\":\"0.1.0-dev.1\",\"language\":\"c23\","
+            "\"license\":\"MIT\",\"include_dir\":\"include\","
+            "\"source_dir\":\"src\",\"dependencies\":[],"
+            "\"files\":[\"LICENSE\",\"include/x.h\",\"src/x.c\","
+            "\"tests/test.c\",\"zcode-package.json\"]}\n"));
+        struct vcs_package_prepare_options options = {
+            .dir = root, .publisher_sequence = 1,
+            .reward_address = "", .chain_id = "zclassic-main",
+        };
+        memcpy(options.publisher_pubkey, pubkey, 33);
+        struct vcs_package_prepared before, after;
+        char detail[256];
+        ASSERT(vcs_package_prepare(&options, &before, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(before.manifest.count == 5);
+        ASSERT(before.recipe.public_headers.count == 1);
+        ASSERT(before.recipe.sources.count == 1);
+        ASSERT(before.recipe.test_sources.count == 1);
+        (void)snprintf(path, sizeof(path), "%s/src/unused.c", root);
+        ASSERT(zpd_write(path, "int unused(void) { return 2; }\n"));
+        ASSERT(vcs_package_prepare(&options, &after, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(memcmp(before.package_root, after.package_root, 32) == 0);
+        ASSERT(memcmp(before.recipe_root, after.recipe_root, 32) == 0);
+        vcs_package_prepared_free(&after);
+        vcs_package_prepared_free(&before);
+
+        (void)snprintf(path, sizeof(path), "%s/zcode-package.json", root);
+        ASSERT(zpd_write(path,
+            "{\"schema\":1,\"name\":\"zclassic23/fixture\","
+            "\"semver\":\"0.1.0-dev.1\",\"language\":\"c23\","
+            "\"license\":\"MIT\",\"include_dir\":\"include\","
+            "\"source_dir\":\"src\",\"dependencies\":[],"
+            "\"files\":[\"src/missing.c\",\"zcode-package.json\"]}\n"));
+        ASSERT(vcs_package_prepare(&options, &after, detail,
+                                   sizeof(detail)) ==
+               VCS_PACKAGE_PREPARE_ERR_META);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_test_fail_closed(const uint8_t pubkey[33])
+{
+    int failures = 0;
+    TEST("zcode package dev prepare: symlink, special and unknown fields fail closed") {
+        char root[256], path[320];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-package-dev-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        struct vcs_package_prepare_options options = {
+            .dir = root, .publisher_sequence = 1,
+            .reward_address = "", .chain_id = "zclassic-main",
+        };
+        memcpy(options.publisher_pubkey, pubkey, 33);
+        struct vcs_package_prepared prepared;
+        char detail[256];
+#if defined(_WIN32)
+        /* CreateSymbolicLinkA fails with ERROR_PRIVILEGE_NOT_HELD without
+         * Developer Mode / SeCreateSymbolicLinkPrivilege, and mkfifo does
+         * not exist: the non-regular-file refusal fixtures cannot be built
+         * here. The portable ERR_META case below still runs. */
+        (void)path;
+        printf("zcode_package_dev: SKIP (Windows): symlink/FIFO file-type "
+               "refusal fixtures (symlink privilege unavailable; no mkfifo)\n");
+#else
+        (void)snprintf(path, sizeof(path), "%s/link", root);
+        ASSERT(zpd_symlink_create("src/x.c", path, false));
+        (void)snprintf(path, sizeof(path), "%s/.zvcs", root);
+        ASSERT(zpd_symlink_create("src", path, true));
+        ASSERT(vcs_package_prepare(&options, &prepared, detail,
+                                   sizeof(detail)) ==
+               VCS_PACKAGE_PREPARE_ERR_FILE_TYPE);
+        ASSERT(zpd_symlink_remove(path, true));
+        (void)snprintf(path, sizeof(path), "%s/build", root);
+        ASSERT(zpd_symlink_create("src", path, true));
+        ASSERT(vcs_package_prepare(&options, &prepared, detail,
+                                   sizeof(detail)) ==
+               VCS_PACKAGE_PREPARE_ERR_FILE_TYPE);
+        ASSERT(zpd_symlink_remove(path, true));
+        (void)snprintf(path, sizeof(path), "%s/link", root);
+        ASSERT(vcs_package_prepare(&options, &prepared, detail,
+                                   sizeof(detail)) ==
+               VCS_PACKAGE_PREPARE_ERR_FILE_TYPE);
+        ASSERT(zpd_symlink_remove(path, false));
+        (void)snprintf(path, sizeof(path), "%s/special", root);
+        ASSERT(zpd_special_create(path));
+        ASSERT(vcs_package_prepare(&options, &prepared, detail,
+                                   sizeof(detail)) ==
+               VCS_PACKAGE_PREPARE_ERR_FILE_TYPE);
+        ASSERT(zpd_special_remove(path));
+#endif
+        zpd_fixture_cleanup(root);
+        ASSERT(zpd_fixture(root, true));
+        ASSERT(vcs_package_prepare(&options, &prepared, detail,
+                                   sizeof(detail)) ==
+               VCS_PACKAGE_PREPARE_ERR_META);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+
+/* The recipe root of the fixture as a LIBRARY — no program declared, even
+ * though app/main.c is on disk. This is the regression that matters: adding
+ * schema 2 must not move the encoding of a package that ships no program,
+ * and inferring programs from the tree would move this value for every
+ * package that merely carries an app/ directory. */
+#define ZPD_LIBRARY_RECIPE_ROOT \
+    "11f72f390a50a4e3b8016ce0558721633d30691c97f2f15e5ab50de7b9642495"
+
+static bool zpd_manifest_has(const struct vcs_package_manifest *manifest,
+                             const char *path)
+{
+    for (size_t i = 0; i < manifest->count; i++)
+        if (strcmp(manifest->files[i].path, path) == 0)
+            return true;
+    return false;
+}
+
+static bool zpd_array_has(const struct json_value *array, const char *text)
+{
+    if (!array || array->type != JSON_ARR)
+        return false;
+    for (size_t i = 0; i < array->num_children; i++) {
+        const char *entry = json_get_str(json_at(array, i));
+        if (entry && strcmp(entry, text) == 0)
+            return true;
+    }
+    return false;
+}
+
+static int zpd_test_prepare_programs(const uint8_t pubkey[33])
+{
+    int failures = 0;
+    TEST("zcode package dev prepare: programs are declared, never inferred") {
+        char root[256], path[320], hex[65], output[VCS_PACKAGE_PATH_MAX];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-package-programs-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        struct vcs_package_prepare_options options = {
+            .dir = root, .publisher_sequence = 1,
+            .reward_address = "", .chain_id = "zclassic-main",
+        };
+        memcpy(options.publisher_pubkey, pubkey, 33);
+        char detail[256];
+
+        /* The fixture carries app/main.c on disk and declares nothing. */
+        struct vcs_package_prepared plain;
+        ASSERT(vcs_package_prepare(&options, &plain, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(plain.recipe.schema_version == VCS_PACKAGE_RECIPE_VERSION);
+        ASSERT(plain.recipe.programs.count == 0);
+        ASSERT(zpd_manifest_has(&plain.manifest, "app/main.c"));
+        zcl_hex_encode(plain.recipe_root, 32, hex);
+        ASSERT(strcmp(hex, ZPD_LIBRARY_RECIPE_ROOT) == 0);
+
+        /* Declaring it is what installs an executable — and only then does
+         * the recipe root move. */
+        ASSERT(zpd_meta_programs(root, "\"app/main.c\""));
+        struct vcs_package_prepared declared;
+        ASSERT(vcs_package_prepare(&options, &declared, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(declared.recipe.schema_version ==
+               VCS_PACKAGE_RECIPE_VERSION_PROGRAMS);
+        ASSERT(declared.recipe.programs.count == 1 &&
+               strcmp(declared.recipe.programs.items[0], "app/main.c") == 0);
+        ASSERT(memcmp(declared.recipe_root, plain.recipe_root, 32) != 0);
+        ASSERT(vcs_package_recipe_program_output("app/main.c", "fixture",
+                                                 output, sizeof(output)) &&
+               strcmp(output, "bin/fixture") == 0);
+        vcs_package_prepared_free(&declared);
+
+        /* A nested app/util/helper.c is not a program: undeclared it stays
+         * an ordinary package file and the recipe stays schema 1. */
+        (void)snprintf(path, sizeof(path), "%s/app/util", root);
+        ASSERT(platform_directory_create(path, 0700) == 0);
+        (void)snprintf(path, sizeof(path), "%s/app/util/helper.c", root);
+        ASSERT(zpd_write(path, "int helper(void) { return 0; }\n"));
+        ASSERT(zpd_meta_programs(root, NULL));
+        struct vcs_package_prepared nested;
+        ASSERT(vcs_package_prepare(&options, &nested, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(nested.recipe.schema_version == VCS_PACKAGE_RECIPE_VERSION &&
+               nested.recipe.programs.count == 0 &&
+               zpd_manifest_has(&nested.manifest, "app/util/helper.c"));
+        vcs_package_prepared_free(&nested);
+
+        /* Every refusal names the entry and the rule it broke, so the
+         * publisher can fix it without reading this code. */
+        (void)snprintf(path, sizeof(path), "%s/app/fixture.c", root);
+        ASSERT(zpd_write(path, "int main(void) { return 0; }\n"));
+        static const struct {
+            const char *programs;
+            const char *detail;
+        } refusals[] = {
+            { "\"app/util/helper.c\"",
+              "programs[0] is not app/<stem>.c: app/util/helper.c" },
+            { "\"app/absent.c\"",
+              "programs[0] is not in files: app/absent.c" },
+            { "\"app/main.c\", \"app/main.c\"",
+              "programs[1] repeats: app/main.c" },
+            /* app/main.c installs under the package's own short name, so
+             * app/fixture.c in package zclassic23/fixture emits the same
+             * bin/fixture — a duplicate the verifier could only discover
+             * after a full compile. */
+            { "\"app/fixture.c\", \"app/main.c\"",
+              "program output collision: app/fixture.c and app/main.c both "
+              "emit bin/fixture" },
+        };
+        for (size_t i = 0; i < sizeof(refusals) / sizeof(refusals[0]); i++) {
+            ASSERT(zpd_meta_programs(root, refusals[i].programs));
+            struct vcs_package_prepared refused;
+            detail[0] = '\0';
+            ASSERT(vcs_package_prepare(&options, &refused, detail,
+                                       sizeof(detail)) ==
+                   VCS_PACKAGE_PREPARE_ERR_RECIPE);
+            if (strcmp(detail, refusals[i].detail) != 0)
+                printf("programs refusal %zu detail: %s\n", i, detail);
+            ASSERT(strcmp(detail, refusals[i].detail) == 0);
+            vcs_package_prepared_free(&refused);
+        }
+
+        vcs_package_prepared_free(&plain);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+static int zpd_test_project_inspect(void)
+{
+    int failures = 0;
+    TEST("zcode project inspect: human summary is read-only and root-free by default") {
+        char root[256], hidden[320];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-project-inspect-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        (void)snprintf(hidden, sizeof(hidden), "%s/.zvcs", root);
+        ASSERT(access(hidden, F_OK) != 0);
+
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_project_inspect_test.v1");
+        zcl_native_handle_zcode_project_inspect(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(access(hidden, F_OK) != 0);
+
+        const struct json_value *name = json_get(&reply.data, "name");
+        const struct json_value *layout = json_get(&reply.data, "layout");
+        const struct json_value *headers = layout
+            ? json_get(layout, "public_headers") : NULL;
+        const struct json_value *sources = layout
+            ? json_get(layout, "sources") : NULL;
+        const struct json_value *tests = layout
+            ? json_get(layout, "tests") : NULL;
+        const struct json_value *profile =
+            json_get(&reply.data, "suggested_profile");
+        const struct json_value *profile_detail =
+            json_get(&reply.data, "proof_profile");
+        const struct json_value *exact_policy = profile_detail
+            ? json_get(profile_detail, "exact_policy") : NULL;
+        const struct json_value *expert = json_get(&reply.data, "expert");
+        ASSERT(name && strcmp(json_get_str(name), "zclassic23/fixture") == 0);
+        ASSERT(layout && layout->type == JSON_OBJ);
+        ASSERT(headers && headers->type == JSON_ARR &&
+               headers->num_children == 1);
+        ASSERT(sources && sources->type == JSON_ARR &&
+               sources->num_children == 1);
+        ASSERT(tests && tests->type == JSON_ARR && tests->num_children == 1);
+        ASSERT(profile && strcmp(json_get_str(profile), "standard") == 0);
+        ASSERT(profile_detail && profile_detail->type == JSON_OBJ);
+        ASSERT(json_get(profile_detail, "warning_fatal") &&
+               json_get_bool(json_get(profile_detail, "warning_fatal")));
+        ASSERT(json_get(profile_detail, "sanitizers") &&
+               json_get_bool(json_get(profile_detail, "sanitizers")));
+        ASSERT(exact_policy && exact_policy->type == JSON_OBJ);
+        ASSERT(json_get(exact_policy, "root") != NULL);
+        ASSERT(json_get_int(json_get(exact_policy,
+                                     "minimum_compile_receipts")) == 2);
+        ASSERT(json_get(&reply.data, "recipe_hex") == NULL);
+        ASSERT(json_get(&reply.data, "dependency_lock_hex") == NULL);
+        ASSERT(expert && expert->type == JSON_OBJ);
+        ASSERT(json_get(expert, "package_root") != NULL);
+        ASSERT(json_get(&reply.data, "read_only") &&
+               json_get_bool(json_get(&reply.data, "read_only")));
+        /* app/main.c is on disk but undeclared, so this package installs no
+         * executable: both program lists are empty and app/ is not a write
+         * scope. */
+        const struct json_value *programs =
+            layout ? json_get(layout, "programs") : NULL;
+        const struct json_value *outputs =
+            layout ? json_get(layout, "program_outputs") : NULL;
+        const struct json_value *scopes =
+            json_get(&reply.data, "likely_write_scopes");
+        ASSERT(programs && programs->type == JSON_ARR &&
+               programs->num_children == 0);
+        ASSERT(outputs && outputs->type == JSON_ARR &&
+               outputs->num_children == 0);
+        ASSERT(scopes && !zpd_array_has(scopes, "app"));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        /* Declared: inspect names the translation unit AND the command a
+         * person will actually be able to run — app/main.c installs under
+         * the package's own short name, so "programs" alone would not
+         * answer that. app/ joins the write scopes the way tests/ does. */
+        ASSERT(zpd_meta_programs(root, "\"app/main.c\""));
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_project_inspect_test.v1");
+        zcl_native_handle_zcode_project_inspect(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        layout = json_get(&reply.data, "layout");
+        programs = layout ? json_get(layout, "programs") : NULL;
+        outputs = layout ? json_get(layout, "program_outputs") : NULL;
+        scopes = json_get(&reply.data, "likely_write_scopes");
+        ASSERT(programs && programs->num_children == 1 &&
+               strcmp(json_get_str(json_at(programs, 0)), "app/main.c") == 0);
+        ASSERT(outputs && outputs->num_children == 1 &&
+               strcmp(json_get_str(json_at(outputs, 0)), "bin/fixture") == 0);
+        ASSERT(zpd_array_has(scopes, "app"));
+        ASSERT(zpd_array_has(scopes, "src") && zpd_array_has(scopes, "tests"));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        zpd_fixture_cleanup(root);
+
+        char absent[256];
+        (void)snprintf(absent, sizeof(absent),
+                       "test-tmp/zcode-project-absent-%ld", (long)getpid());
+        ASSERT(access(absent, F_OK) != 0);
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", absent));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_project_inspect_test.v1");
+        zcl_native_handle_zcode_project_inspect(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(access(absent, F_OK) != 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_test_project_init(void)
+{
+    int failures = 0;
+    TEST("zcode project init: plan is read-only and commit is exact and exclusive") {
+        char root[256], meta[320], added[320];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-project-init-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        (void)snprintf(meta, sizeof(meta), "%s/zcode-package.json", root);
+        ASSERT(unlink(meta) == 0);
+
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_project_inspect_test.v1");
+        zcl_native_handle_zcode_project_inspect(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(json_get(&reply.data, "existing_package_config") &&
+               !json_get_bool(json_get(&reply.data,
+                                       "existing_package_config")));
+        ASSERT(access(meta, F_OK) != 0);
+        zcl_command_reply_free(&reply);
+
+        zcl_command_reply_init(&reply, "zcl.zcode_project_init_plan_test.v1");
+        zcl_native_handle_zcode_project_init_plan(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        const char *plan_id = json_get_str(json_get(&reply.data, "plan_id"));
+        const char *config =
+            json_get_str(json_get(&reply.data, "configuration_text"));
+        ASSERT(plan_id && strlen(plan_id) == 64);
+        ASSERT(config && strstr(config, "\"name\": \"local/zcode-project-init-") != NULL);
+        /* prepare never infers a program from the tree, so the plan — the
+         * one step a person reads before anything is written — is where
+         * app/main.c is proposed as the package's executable. */
+        ASSERT(strstr(config, "\"programs\": [\"app/main.c\"]") != NULL);
+        ASSERT(access(meta, F_OK) != 0);
+        char saved_plan[65];
+        (void)snprintf(saved_plan, sizeof(saved_plan), "%s", plan_id);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "name", "example/parser"));
+        ASSERT(json_push_kv_str(&input, "semver", "1.2.3"));
+        ASSERT(json_push_kv_str(&input, "license", "MIT"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_project_init_plan_test.v1");
+        zcl_native_handle_zcode_project_init_plan(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "name")),
+                      "example/parser") == 0);
+        plan_id = json_get_str(json_get(&reply.data, "plan_id"));
+        ASSERT(plan_id && strlen(plan_id) == 64);
+        (void)snprintf(saved_plan, sizeof(saved_plan), "%s", plan_id);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "name", "example/parser"));
+        ASSERT(json_push_kv_str(&input, "semver", "1.2.3"));
+        ASSERT(json_push_kv_str(&input, "license", "MIT"));
+        ASSERT(json_push_kv_str(&input, "plan_id", saved_plan));
+        ASSERT(json_push_kv_bool(&input, "confirm", true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_project_init_commit_test.v1");
+        zcl_native_handle_zcode_project_init_commit(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(access(meta, F_OK) == 0);
+        ASSERT(json_get(&reply.data, "created") &&
+               json_get_bool(json_get(&reply.data, "created")));
+        zcl_command_reply_free(&reply);
+
+        /* Commit wrote the proposed key: the initialized project prepares
+         * to a schema-2 recipe whose one program installs as bin/parser,
+         * the package's own short name. */
+        zcl_command_reply_init(&reply, "zcl.zcode_project_inspect_test.v1");
+        zcl_native_handle_zcode_project_inspect(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        const struct json_value *committed = json_get(&reply.data, "layout");
+        const struct json_value *committed_programs =
+            committed ? json_get(committed, "programs") : NULL;
+        const struct json_value *committed_outputs =
+            committed ? json_get(committed, "program_outputs") : NULL;
+        ASSERT(committed_programs && committed_programs->num_children == 1 &&
+               strcmp(json_get_str(json_at(committed_programs, 0)),
+                      "app/main.c") == 0);
+        ASSERT(committed_outputs && committed_outputs->num_children == 1 &&
+               strcmp(json_get_str(json_at(committed_outputs, 0)),
+                      "bin/parser") == 0);
+        zcl_command_reply_free(&reply);
+
+        zcl_command_reply_init(&reply, "zcl.zcode_project_status_test.v1");
+        zcl_native_handle_zcode_project_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")), "READY") == 0);
+        zcl_command_reply_free(&reply);
+
+        zcl_command_reply_init(&reply, "zcl.zcode_project_init_commit_test.v1");
+        zcl_native_handle_zcode_project_init_commit(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        ASSERT(unlink(meta) == 0);
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_project_init_plan_test.v1");
+        zcl_native_handle_zcode_project_init_plan(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        plan_id = json_get_str(json_get(&reply.data, "plan_id"));
+        ASSERT(plan_id && strlen(plan_id) == 64);
+        (void)snprintf(saved_plan, sizeof(saved_plan), "%s", plan_id);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        (void)snprintf(added, sizeof(added), "%s/src/added.c", root);
+        ASSERT(zpd_write(added, "int added(void) { return 0; }\n"));
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "plan_id", saved_plan));
+        ASSERT(json_push_kv_bool(&input, "confirm", true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_project_init_commit_test.v1");
+        zcl_native_handle_zcode_project_init_commit(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(access(meta, F_OK) != 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        ASSERT(unlink(added) == 0);
+
+#if defined(_WIN32)
+        /* Same constraint as the prepare fail-closed fixtures: no symlink
+         * privilege here, so the "symlink in workspace fails init plan"
+         * probe cannot be built. */
+        printf("zcode_package_dev: SKIP (Windows): init-plan symlink "
+               "refusal fixture (symlink privilege unavailable)\n");
+#else
+        char link[320];
+        (void)snprintf(link, sizeof(link), "%s/link", root);
+        ASSERT(zpd_symlink_create("LICENSE", link, false));
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_project_init_plan_test.v1");
+        zcl_native_handle_zcode_project_init_plan(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(access(meta, F_OK) != 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+#endif
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static void zpd_reuse_entry(struct vcs_package_index_entry *entry,
+                            const char *name, const char *semver, char root)
+{
+    memset(entry, 0, sizeof(*entry));
+    (void)snprintf(entry->name, sizeof(entry->name), "%s", name);
+    (void)snprintf(entry->semver, sizeof(entry->semver), "%s", semver);
+    memset(entry->package_root_hex, root, 64);
+    entry->package_root_hex[64] = '\0';
+}
+
+static int zpd_test_reuse_plan(void)
+{
+    int failures = 0;
+    TEST("zcode reuse plan: exact, partial, absent, incompatible and conflict") {
+        struct vcs_package_index_entry entries[3];
+        zpd_reuse_entry(&entries[0], "zclassic23/json", "1.0.0", 'a');
+        zpd_reuse_entry(&entries[1], "zclassic23/codec", "1.0.0", 'b');
+        zpd_reuse_entry(&entries[2], "other/json", "1.0.0", 'c');
+        static const char *json_apis[] = {
+            "include/json/json.h", "json_read", "json_write",
+        };
+        static const char *codec_apis[] = {
+            "include/codec/cursor.h", "zcl_cursor_read_u32",
+        };
+        struct vcs_package_reuse_input inputs[3] = {
+            {.package = &entries[0],
+             .apis = {json_apis[0], json_apis[1], json_apis[2]},
+             .api_count = 3, .locked = true, .installed = true,
+             .compatible = true},
+            {.package = &entries[1],
+             .apis = {codec_apis[0], codec_apis[1]}, .api_count = 2,
+             .installed = true, .compatible = true},
+            {.package = &entries[2], .apis = {json_apis[0]}, .api_count = 1,
+             .compatible = true},
+        };
+        struct vcs_package_reuse_plan plan;
+        ASSERT(vcs_package_reuse_plan_build(
+            "use zclassic23/json@1.0.0", inputs, 2, &plan));
+        ASSERT(plan.disposition == VCS_PACKAGE_REUSE_COMPLETE);
+        ASSERT(!plan.new_code_required);
+        ASSERT(plan.selected_count == 1);
+        ASSERT(plan.selected[0].input_index == 0);
+
+        ASSERT(vcs_package_reuse_plan_build(
+            "Parse JSON with bounded cursor reads", inputs, 2, &plan));
+        ASSERT(plan.disposition == VCS_PACKAGE_REUSE_PARTIAL);
+        ASSERT(plan.new_code_required);
+        ASSERT(plan.selected_count == 2);
+        ASSERT(plan.selected[0].input_index == 0);
+
+        ASSERT(vcs_package_reuse_plan_build(
+            "Make harness compose zclassic23/json", inputs, 2, &plan));
+        ASSERT(plan.disposition == VCS_PACKAGE_REUSE_PARTIAL);
+        ASSERT(plan.selected_count == 1);
+        ASSERT(plan.selected[0].input_index == 0);
+
+        ASSERT(vcs_package_reuse_plan_build(
+            "Render a deterministic flight replay", inputs, 2, &plan));
+        ASSERT(plan.disposition == VCS_PACKAGE_REUSE_NONE);
+        ASSERT(plan.selected_count == 0);
+
+        ASSERT(vcs_package_reuse_plan_build(
+            "use zclassic23/json@2.0.0", inputs, 2, &plan));
+        ASSERT(plan.disposition == VCS_PACKAGE_REUSE_INCOMPATIBLE);
+        ASSERT(plan.incompatible_matches == 1);
+
+        ASSERT(vcs_package_reuse_plan_build("use json", inputs, 3, &plan));
+        ASSERT(plan.disposition == VCS_PACKAGE_REUSE_AMBIGUOUS);
+        ASSERT(plan.new_code_required);
+        ASSERT(plan.selected_count == 2);
+
+        struct vcs_package_reuse_input peer_tie[2] = {
+            {.package = &entries[0], .compatible = true,
+             .peer_advertisers = 1},
+            {.package = &entries[2], .compatible = true,
+             .peer_advertisers = 3},
+        };
+        ASSERT(vcs_package_reuse_plan_build(
+            "Render json", peer_tie, 2, &plan));
+        ASSERT(plan.disposition == VCS_PACKAGE_REUSE_PARTIAL);
+        ASSERT(plan.selected_count == 2);
+        ASSERT(plan.selected[0].input_index == 1);
+
+        inputs[1].peer_advertisers = UINT32_MAX;
+        ASSERT(vcs_package_reuse_plan_build(
+            "Render a deterministic flight replay", inputs, 2, &plan));
+        ASSERT(plan.disposition == VCS_PACKAGE_REUSE_NONE);
+        ASSERT(plan.selected_count == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static char zpd_peer_semantic_root[65];
+static char zpd_peer_transport_root[65];
+
+static bool zpd_peer_pointer_board(
+    struct json_value *selector, struct json_value *result)
+{
+    const char *kind = json_get_str(json_get(selector, "kind"));
+    const char *namespace_name =
+        json_get_str(json_get(selector, "namespace"));
+    if (!kind || strcmp(kind, "pointer") != 0 || !namespace_name ||
+        strcmp(namespace_name, "zclassic23.package") != 0 ||
+        !json_get_bool_or(selector, "board", false))
+        return false;
+    json_init(result); json_set_object(result);
+    struct json_value records, row;
+    json_init(&records); json_set_array(&records);
+    json_init(&row); json_set_object(&row);
+    bool ok = json_push_kv_bool(result, "ok", true) &&
+        json_push_kv_bool(result, "truncated", false) &&
+        json_push_kv_str(&row, "semantic_root", zpd_peer_semantic_root) &&
+        json_push_kv_str(&row, "transport_root", zpd_peer_transport_root) &&
+        json_push_back(&records, &row) &&
+        json_push_kv(result, "records", &records);
+    json_free(&row); json_free(&records);
+    return ok;
+}
+
+static bool zpd_future_acceptance(const char *workspace, const char *datadir,
+    const struct zcode_accepted_work_status *accepted, int64_t now, char root_hex[65])
+{
+    struct db_build_worker worker;
+    uint8_t secret[32] = {0}, pubkey[32] = {0}, root[32];
+    struct vcs_zcode_lane_receipt_v1 future = accepted->accepted.proven;
+    future.created_unix = now + 3600;
+    bool sealed = build_fabric_worker_identity_load(
+        datadir, &worker, secret, pubkey).ok &&
+        vcs_zcode_lane_receipt_seal(&future, secret, pubkey) == VCS_ZCODE_DEV_OK;
+    memory_cleanse(secret, sizeof(secret));
+    uint8_t wire[VCS_ZCODE_LANE_WIRE_BYTES];
+    if (!sealed || vcs_zcode_lane_receipt_id(&future, root) != VCS_ZCODE_DEV_OK ||
+        vcs_zcode_lane_receipt_serialize(&future, wire) != VCS_ZCODE_DEV_OK ||
+        !vcs_object_put_addressed(workspace, root, wire, sizeof(wire))) return false;
+    struct vcs_zcode_accepted_work_v1 checked;
+    if (!vcs_zcode_accepted_work_resolve(workspace, root, now, &checked)) return false;
+    zcl_hex_encode(root, sizeof(root), root_hex);
+    return true;
+}
+
+static bool zpd_exact_acceptance_refuses(
+    struct node_db *ndb, const char *workspace,
+    const struct zcode_accepted_work_status *expected, int tamper, int64_t now)
+{
+    char tuple[5][65];
+    zcl_hex_encode(expected->accepted.accepted_work_root, 32, tuple[0]);
+    zcl_hex_encode(expected->accepted.task_root, 32, tuple[1]);
+    zcl_hex_encode(expected->accepted.candidate_root, 32, tuple[2]);
+    zcl_hex_encode(expected->accepted.proof_policy_root, 32, tuple[3]);
+    memcpy(tuple[4], expected->action_id, sizeof(tuple[4]));
+    if (tamper >= 0 && tamper < 5)
+        tuple[tamper][0] = tuple[tamper][0] == '0' ? '1' : '0';
+    struct zcode_accepted_work_status result, empty = {0};
+    memset(&result, 0xa5, sizeof(result));
+    int changes = sqlite3_total_changes(ndb->db);
+    struct zcl_result qualified = zcode_accepted_work_qualify_readonly(
+        ndb, workspace, tuple[0], tuple[1], tuple[2], tuple[3], tuple[4], now, &result);
+    return !qualified.ok && memcmp(&result, &empty, sizeof(result)) == 0 &&
+        sqlite3_total_changes(ndb->db) == changes;
+}
+
+static bool zpd_exact_tuple_refuses(struct node_db *ndb, const char *workspace,
+    const struct zcode_accepted_work_status *expected)
+{
+    for (int tamper = 0; tamper < 5; tamper++)
+        if (!zpd_exact_acceptance_refuses(ndb, workspace, expected, tamper,
+                                        (int64_t)platform_time_wall_unix())) return false;
+    return true;
+}
+
+static bool zpd_future_path(char *path, size_t capacity,
+    const char *workspace, const char *root)
+{
+    int n = snprintf(path, capacity, "%s/.zvcs/objects/%.2s/%s",
+                     workspace, root, root + 2);
+    return n > 0 && (size_t)n < capacity;
+}
+
+static bool zpd_exact_projection_refuses(struct node_db *ndb, const char *workspace,
+    const struct zcode_accepted_work_status *expected, const char *mutation)
+{
+    if (!node_db_begin(ndb)) return false;
+    bool changed = node_db_exec(ndb, mutation);
+    bool refused = changed && zpd_exact_acceptance_refuses(ndb, workspace,
+        expected, -1, (int64_t)platform_time_wall_unix());
+    bool restored = node_db_rollback(ndb);
+    return restored && refused;
+}
+
+static bool zpd_exact_proof_drift_refuses(struct node_db *ndb, const char *workspace,
+    const struct zcode_accepted_work_status *expected)
+{
+    if (!node_db_begin(ndb)) return false;
+    bool changed = node_db_exec(ndb,
+        "UPDATE build_receipts SET work_receipt_sha3='' WHERE action_id IN "
+        "(SELECT action_id FROM build_actions WHERE kind='c23.review.v1')");
+    struct build_fabric_proof_evaluation proof = {0};
+    int64_t now = (int64_t)platform_time_wall_unix();
+    struct zcl_result result = build_fabric_proof_evaluate_readonly(
+        ndb, workspace, expected->action_id, now, &proof);
+    char accepted_proof[65];
+    zcl_hex_encode(expected->accepted.proof_set_root, 32, accepted_proof);
+    bool different_qualified = changed && result.ok && proof.policy_satisfied &&
+        proof.proof_set_root_sha3[0] &&
+        strcmp(accepted_proof, proof.proof_set_root_sha3) != 0;
+    bool refused = zpd_exact_acceptance_refuses(ndb, workspace, expected, -1, now);
+    bool restored = node_db_rollback(ndb);
+    return restored && different_qualified && refused;
+}
+
+static bool zpd_accepted_map_store(const char *workspace,
+    const struct zcode_accepted_work_status *accepted, char root_hex[65])
+{
+    struct zcl_work_map_node nodes[ZCL_WORK_MAP_MAX_NODES] = {0};
+    for (size_t i = 0; i < ZCL_WORK_MAP_MAX_NODES; i++) {
+        struct vcs_zcode_task_v1 task = accepted->accepted.task;
+        if (i != 2) memset(task.goal_root, (int)(i + 1), 32);
+        uint8_t task_wire[VCS_ZCODE_TASK_WIRE_BYTES];
+        if (vcs_zcode_task_root(&task, nodes[i].task_root) != VCS_ZCODE_DEV_OK ||
+            vcs_zcode_task_serialize(&task, task_wire) != VCS_ZCODE_DEV_OK ||
+            !vcs_object_put_addressed(workspace, nodes[i].task_root,
+                task_wire, sizeof(task_wire))) return false;
+        nodes[i].kind = i < 2 ? (uint16_t)(i + 1) : ZCL_WORK_MAP_LOOP;
+        nodes[i].parent = i == 0 ? ZCL_WORK_MAP_NO_PARENT : i == 1 ? 0 : 1;
+        if (i >= 2 && i < 6) {
+            nodes[i].dependency_count = 16;
+            for (size_t j = 0; j < 16; j++) nodes[i].dependencies[j] = (uint16_t)(180 + j);
+        }
+    }
+    uint8_t wire[ZCL_WORK_MAP_WIRE_MAX], root[32];
+    size_t length = 0;
+    if (zcl_work_map_serialize(nodes, ZCL_WORK_MAP_MAX_NODES,
+            wire, sizeof(wire), &length) != ZCL_WORK_MAP_OK)
+        return false;
+    sha3_256(wire, length, root);
+    if (!vcs_object_put_addressed(workspace, root, wire, length)) return false;
+    zcl_hex_encode(root, sizeof(root), root_hex);
+    return true;
+}
+
+static bool zpd_accepted_map_input(struct json_value *input,
+    const char *workspace, const char *datadir,
+    const char *map_root, const char *accepted_root, const char *action_id, int mode)
+{
+    bool ok = json_push_kv_str(input, "workspace", workspace) &&
+        json_push_kv_str(input, "map_root", map_root) &&
+        json_push_kv_int(input, "offset", 2);
+    if (mode != 0)
+        ok = ok && json_push_kv_str(input, "action_id", action_id) &&
+            json_push_kv_int(input, "node_index", 2);
+    if (mode == 1)
+        ok = ok && json_push_kv_int(input, "accepted_work_root", 7);
+    else
+        ok = ok && json_push_kv_str(input, "accepted_work_root",
+            mode == 2 ? "bad-root" : mode == 3 ? map_root : accepted_root);
+    if (mode != 4)
+        ok = ok && json_push_kv_str(input, "proof_datadir", datadir);
+    return ok;
+}
+
+static bool zpd_accepted_map_refusal(const char *workspace, const char *datadir,
+    const char *map_root, const char *accepted_root, const char *action_id, int mode)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    bool ok = zpd_accepted_map_input(&input, workspace, datadir,
+        map_root, accepted_root, action_id, mode);
+    struct zcl_command_request request = { .input = &input };
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.zcode_work_map.v1");
+    if (ok) zcl_native_handle_zcode_work_map(&request, &reply);
+    if (mode < 3) {
+        ok = ok && reply.status == ZCL_COMMAND_STATUS_FAILED;
+    } else {
+        const struct json_value *selected = json_get(&reply.data, "selected_evidence");
+        const struct json_value *observed = json_get(selected, "accepted_work");
+        ok = ok && reply.status == ZCL_COMMAND_STATUS_PASSED && observed &&
+            json_get_bool(json_get(observed, "qualified")) == (mode == 6) &&
+            (mode == 6 ? json_get(observed, "root") != NULL :
+                !json_get(observed, "root") && json_get(observed, "reason")) &&
+            !json_get_bool(json_get(selected, "acceptance_qualified"));
+    }
+    zcl_command_reply_free(&reply);
+    json_free(&input);
+    return ok;
+}
+
+static bool zpd_accepted_map_invalidation(struct node_db *ndb,
+    const char *workspace, const char *datadir, const char *map_root,
+    const char *accepted_root, const struct zcode_accepted_work_status *accepted)
+{
+    struct db_build_worker worker;
+    if (!db_build_worker_find(ndb, accepted->worker_id, &worker)) return false;
+    int64_t now = (int64_t)platform_time_wall_unix();
+    if (!build_fabric_worker_revoke(ndb, worker.worker_id, now).ok) return false;
+    bool refused = zpd_accepted_map_refusal(workspace, datadir, map_root,
+        accepted_root, accepted->action_id, 5);
+    bool restored = build_fabric_worker_approve(ndb, &worker, now).ok;
+    return restored && refused && zpd_accepted_map_refusal(workspace, datadir,
+        map_root, accepted_root, accepted->action_id, 6);
+}
+
+static bool zpd_accepted_map_page_input(struct json_value *page,
+    const struct json_value *input, size_t offset)
+{
+    bool copied = true;
+    for (size_t i = 0; copied && i < json_size(input); i++) {
+        if (strcmp(input->keys[i], "offset") == 0) continue;
+        copied = json_push_kv(page, input->keys[i], &input->children[i]);
+    }
+    return copied && json_push_kv_int(page, "offset", (int64_t)offset);
+}
+
+static bool zpd_accepted_map_page_valid(const struct zcl_command_reply *reply,
+    size_t returned, size_t visited)
+{
+    const struct json_value *selected = json_get(&reply->data, "selected_evidence");
+    return reply->status == ZCL_COMMAND_STATUS_PASSED &&
+        json_write(&reply->data, NULL, 0) < 4096 && returned > 0 && returned <= 4 &&
+        returned <= ZCL_WORK_MAP_MAX_NODES - visited &&
+        json_get_bool(json_get(json_get(selected, "accepted_work"), "qualified")) &&
+        !json_get_bool(json_get(selected, "acceptance_qualified"));
+}
+
+static bool zpd_accepted_map_pages(struct json_value *input)
+{
+    size_t visited = 0;
+    while (visited < ZCL_WORK_MAP_MAX_NODES) {
+        struct json_value page_input;
+        json_init(&page_input); json_set_object(&page_input);
+        bool copied = zpd_accepted_map_page_input(&page_input, input, visited);
+        if (!copied) { json_free(&page_input); return false; }
+        struct zcl_command_request request = { .input = &page_input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_map.v1");
+        zcl_native_handle_zcode_work_map(&request, &reply);
+        json_free(&page_input);
+        const struct json_value *rows = json_get(&reply.data, "nodes");
+        size_t returned = json_size(rows);
+        bool ok = zpd_accepted_map_page_valid(&reply, returned, visited);
+        for (size_t i = 0; ok && i < returned; i++)
+            ok = json_get_int(json_get(json_at(rows, i), "index")) == (int64_t)(visited + i);
+        visited += returned;
+        ok = ok && json_get_int(json_get(&reply.data, "next_offset")) ==
+            (visited == ZCL_WORK_MAP_MAX_NODES ? -1 : (int64_t)visited);
+        zcl_command_reply_free(&reply);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static int zpd_accepted_map_observation(struct node_db *ndb, const char *workspace,
+    const char *datadir, const struct zcode_accepted_work_status *accepted)
+{
+    int failures = 0;
+    TEST("work map qualifies the exact selected acceptance without awarding loop completion") {
+        char map_root[65], accepted_root[65];
+        ASSERT(zpd_accepted_map_store(workspace, accepted, map_root));
+        zcl_hex_encode(accepted->accepted.accepted_work_root, 32, accepted_root);
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", workspace));
+        ASSERT(json_push_kv_str(&input, "proof_datadir", datadir));
+        ASSERT(json_push_kv_str(&input, "map_root", map_root));
+        ASSERT(json_push_kv_str(&input, "action_id", accepted->action_id));
+        ASSERT(json_push_kv_str(&input, "accepted_work_root", accepted_root));
+        ASSERT(json_push_kv_int(&input, "node_index", 2));
+        ASSERT(json_push_kv_int(&input, "offset", 2));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_map.v1");
+        int changes = sqlite3_total_changes(ndb->db);
+        zcl_native_handle_zcode_work_map(&request, &reply);
+        ASSERT_EQ(reply.status, ZCL_COMMAND_STATUS_PASSED);
+        const struct json_value *selected = json_get(&reply.data, "selected_evidence");
+        const struct json_value *observation = json_get(selected, "accepted_work");
+        ASSERT(json_get_bool(json_get(observation, "qualified")));
+        ASSERT_STR_EQ(json_get_str(json_get(observation, "root")), accepted_root);
+        ASSERT(!json_get_bool(json_get(selected, "acceptance_qualified")));
+        ASSERT_STR_EQ(json_get_str(json_get(json_at(json_get(&reply.data, "nodes"), 0), "status")), "UNKNOWN");
+        ASSERT(json_write(&reply.data, NULL, 0) < 4096);
+        ASSERT_EQ(sqlite3_total_changes(ndb->db), changes);
+        zcl_command_reply_free(&reply);
+        ASSERT(zpd_accepted_map_pages(&input));
+        json_free(&input);
+        for (int mode = 0; mode < 5; mode++)
+            ASSERT(zpd_accepted_map_refusal(workspace, datadir, map_root,
+                accepted_root, accepted->action_id, mode));
+        ASSERT_EQ(sqlite3_total_changes(ndb->db), changes);
+        ASSERT(zpd_accepted_map_invalidation(ndb, workspace, datadir, map_root,
+            accepted_root, accepted));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_exact_acceptance_checks(struct node_db *acceptance_db,
+    const char *root, const char *candidate_source_hex, const char *accepted_root_hex,
+    const char *zbuild_datadir, const struct zcode_accepted_work_status *accepted_status)
+{
+    int failures = 0;
+    TEST("exact acceptance is bounded, readonly and current") {
+        /* A map observation must qualify existing acceptance without writes. */
+        int acceptance_changes = sqlite3_total_changes(acceptance_db->db);
+        ASSERT(node_db_exec(acceptance_db, "PRAGMA query_only=ON"));
+        struct zcode_accepted_work_status readonly_accepted;
+        struct zcl_result readonly_found = zcode_accepted_work_find(
+            acceptance_db, root, candidate_source_hex,
+            (int64_t)platform_time_wall_unix(), false, &readonly_accepted);
+        bool query_only_restored = node_db_exec(
+            acceptance_db, "PRAGMA query_only=OFF");
+        ASSERT(query_only_restored);
+        ASSERT(readonly_found.ok);
+        ASSERT_EQ(sqlite3_total_changes(acceptance_db->db), acceptance_changes);
+
+        char exact_task[65], exact_candidate[65], exact_policy[65];
+        zcl_hex_encode(accepted_status->accepted.task_root, 32, exact_task);
+        zcl_hex_encode(accepted_status->accepted.candidate_root, 32, exact_candidate);
+        zcl_hex_encode(accepted_status->accepted.proof_policy_root, 32, exact_policy);
+        ASSERT(node_db_exec(acceptance_db, "PRAGMA query_only=ON"));
+        readonly_found = zcode_accepted_work_qualify_readonly(
+            acceptance_db, root, accepted_root_hex, exact_task, exact_candidate,
+            exact_policy, accepted_status->action_id,
+            (int64_t)platform_time_wall_unix(), &readonly_accepted);
+        query_only_restored = node_db_exec(acceptance_db, "PRAGMA query_only=OFF");
+        ASSERT(query_only_restored);
+        ASSERT(readonly_found.ok);
+        ASSERT_EQ(sqlite3_total_changes(acceptance_db->db), acceptance_changes);
+        ASSERT(!readonly_accepted.projection_rebuilt);
+        ASSERT_STR_EQ(readonly_accepted.action_id, accepted_status->action_id);
+        const struct zcode_accepted_work_status exact_accepted = readonly_accepted;
+        failures += zpd_accepted_map_observation(acceptance_db, root,
+            zbuild_datadir, &exact_accepted);
+        char future_root[65];
+        int64_t exact_now = (int64_t)platform_time_wall_unix();
+        ASSERT(zpd_future_acceptance(root, zbuild_datadir,
+            &exact_accepted, exact_now, future_root));
+        char future_path[1024];
+        ASSERT(zpd_future_path(future_path, sizeof(future_path), root, future_root));
+        memset(&readonly_accepted, 0xa5, sizeof(readonly_accepted));
+        readonly_found = zcode_accepted_work_qualify_readonly(acceptance_db, root,
+            future_root, exact_task, exact_candidate, exact_policy,
+            exact_accepted.action_id, exact_now, &readonly_accepted);
+        int future_removed = unlink(future_path);
+        ASSERT_EQ(future_removed, 0);
+        ASSERT(!readonly_found.ok);
+        ASSERT_STR_EQ(readonly_found.message, "accepted-work-exact-context-mismatch");
+        const struct zcode_accepted_work_status empty_accepted = {0};
+        ASSERT(memcmp(&readonly_accepted, &empty_accepted, sizeof(readonly_accepted)) == 0);
+        ASSERT(zpd_exact_tuple_refuses(acceptance_db, root, &exact_accepted));
+        ASSERT(zpd_exact_projection_refuses(acceptance_db, root, &exact_accepted,
+            "UPDATE build_workers SET expires_at=1"));
+        ASSERT(zpd_exact_projection_refuses(acceptance_db, root, &exact_accepted,
+            "DELETE FROM zcode_lane_receipts WHERE lane=1"));
+        ASSERT(zpd_exact_projection_refuses(acceptance_db, root, &exact_accepted,
+            "UPDATE build_receipts SET work_receipt_sha3=''"));
+        ASSERT(zpd_exact_proof_drift_refuses(acceptance_db, root, &exact_accepted));
+        ASSERT(exact_accepted.accepted.task.expires_unix > 0);
+        ASSERT(zpd_exact_acceptance_refuses(acceptance_db, root,
+            &exact_accepted, -1, exact_accepted.accepted.task.expires_unix));
+
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_test_work_start_license_filter(
+    secp256k1_context *ctx, const uint8_t secret[32],
+    const uint8_t pubkey[33])
+{
+    int failures = 0;
+    struct vcs_swarm_engine *previous_engine = vcs_swarm_engine_global();
+    struct vcs_swarm_engine *peer_engine = NULL;
+    TEST("zcode work start: exact SPDX filter selects one root-bound reuse") {
+        char base[256], zcode_dir[320], path[512];
+        char workspace[256], mit_dir[256], apache_dir[256];
+        (void)snprintf(base, sizeof(base),
+                       "test-tmp/zcode-work-license-%ld", (long)getpid());
+        (void)snprintf(workspace, sizeof(workspace),
+                       "test-tmp/zcode-work-license-target-%ld",
+                       (long)getpid());
+        (void)snprintf(mit_dir, sizeof(mit_dir),
+                       "test-tmp/zcode-work-license-mit-%ld", (long)getpid());
+        (void)snprintf(apache_dir, sizeof(apache_dir),
+                       "test-tmp/zcode-work-license-apache-%ld",
+                       (long)getpid());
+        ZCL_IGNORE_RESULT(zcl_tree_remove(base), "license fixture reset");
+        zpd_fixture_cleanup(workspace);
+        zpd_fixture_cleanup(mit_dir);
+        zpd_fixture_cleanup(apache_dir);
+        ASSERT(platform_directory_create(base, 0700) == 0);
+        (void)snprintf(zcode_dir, sizeof(zcode_dir), "%s/zcode", base);
+        ASSERT(platform_directory_create(zcode_dir, 0700) == 0);
+        static const char *const store_dirs[] = {
+            "releases", "manifests", "recipes",
+        };
+        for (size_t i = 0; i < sizeof(store_dirs) / sizeof(store_dirs[0]); i++) {
+            (void)snprintf(path, sizeof(path), "%s/%s", zcode_dir,
+                           store_dirs[i]);
+            ASSERT(platform_directory_create(path, 0700) == 0);
+        }
+        ASSERT(zpd_fixture(workspace, false));
+        ASSERT(zpd_reuse_package_fixture(
+            mit_dir, "MIT",
+            "Permission is hereby granted, free of charge\n"));
+        ASSERT(zpd_reuse_package_fixture(
+            apache_dir, "Apache-2.0",
+            "Apache License\nVersion 2.0\n"));
+
+        struct vcs_package_prepare_options options = {
+            .dir = mit_dir, .publisher_sequence = 1,
+            .reward_address = "", .chain_id = "zclassic-main",
+        };
+        memcpy(options.publisher_pubkey, pubkey, 33);
+        struct vcs_package_prepared mit, apache;
+        char detail[256];
+        ASSERT(vcs_package_prepare(&options, &mit, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        options.dir = apache_dir;
+        options.publisher_sequence = 2;
+        ASSERT(vcs_package_prepare(&options, &apache, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(memcmp(mit.package_root, apache.package_root, 32) != 0);
+        ASSERT(zpd_store_reuse_package(zcode_dir, ctx, secret, &mit));
+        ASSERT(zpd_store_reuse_package(zcode_dir, ctx, secret, &apache));
+        char mit_root[65], apache_root[65];
+        zcl_hex_encode(mit.package_root, 32, mit_root);
+        zcl_hex_encode(apache.package_root, 32, apache_root);
+        uint8_t transport_root[32];
+        memset(transport_root, 0x7a, sizeof(transport_root));
+        zcl_hex_encode(transport_root, sizeof(transport_root),
+                       zpd_peer_transport_root);
+        (void)snprintf(zpd_peer_semantic_root,
+                       sizeof(zpd_peer_semantic_root), "%s", mit_root);
+        zcl_native_zcode_discovery_test_backend(
+            zpd_peer_pointer_board, NULL);
+        peer_engine = vcs_swarm_engine_create(NULL, NULL, NULL, NULL, NULL);
+        ASSERT(peer_engine);
+        uint8_t peer_key[33] = {0x02, 0x51};
+        ASSERT(vcs_swarm_engine_peer_add(peer_engine, 51, peer_key));
+        ASSERT(vcs_swarm_engine_peer_offer(
+            peer_engine, 51, transport_root, 200, 100));
+        vcs_swarm_engine_set_global(peer_engine);
+
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", workspace));
+        ASSERT(json_push_kv_str(
+            &input, "goal", "use zclassic23/license-choice@1.0.0"));
+        ASSERT(json_push_kv_str(&input, "profile", "quick"));
+        ASSERT(json_push_kv_str(&input, "license", "MIT"));
+        ASSERT(json_push_kv_str(&input, "datadir", base));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        struct zcl_command_request request = {.input = &input};
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply,
+                               "zcl.zcode_work_license_filter_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "REUSE_READY") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "work_id")), "") ==
+               0);
+        const struct json_value *reuse = json_get(&reply.data, "reuse_plan");
+        ASSERT(reuse && strcmp(json_get_str(json_get(
+                          reuse, "license_filter")), "MIT") == 0);
+        ASSERT(strcmp(json_get_str(json_get(reuse, "network_discovery")),
+                      "signed_pointer_peer_inventory_consulted") == 0);
+        ASSERT(json_get_bool(json_get(reuse, "license_filter_applied")));
+        const struct json_value *reused = json_get(reuse, "reused");
+        const struct json_value *selected = reused ? json_at(reused, 0) : NULL;
+        ASSERT(reused && json_size(reused) == 1u && selected);
+        ASSERT(strcmp(json_get_str(json_get(selected, "name")),
+                      "zclassic23/license-choice") == 0);
+        ASSERT(strcmp(json_get_str(json_get(selected, "semver")),
+                      "1.0.0") == 0);
+        ASSERT(strcmp(json_get_str(json_get(selected, "license")), "MIT") ==
+               0);
+        ASSERT(json_get_int(json_get(selected, "peer_advertisers")) == 1);
+        const struct json_value *expert = json_get(&reply.data, "expert");
+        ASSERT(expert);
+        ASSERT(json_get_int(json_get(expert, "packages_indexed")) == 2);
+        ASSERT(json_get_int(json_get(
+                   expert, "packages_filter_matched")) == 1);
+        ASSERT(json_get_int(json_get(expert, "packages_scanned")) == 1);
+        ASSERT(json_get_int(json_get(expert, "peer_roots_seen")) == 1);
+        ASSERT(json_get_int(json_get(expert, "peer_roots_matched")) == 1);
+        ASSERT(!json_get_bool(json_get(expert, "peer_inventory_truncated")));
+        ASSERT(!json_get_bool(json_get(expert, "packages_truncated")));
+        const struct json_value *selected_roots =
+            json_get(expert, "selected_roots");
+        const struct json_value *selected_root = selected_roots
+            ? json_at(selected_roots, 0) : NULL;
+        ASSERT(selected_roots && json_size(selected_roots) == 1u &&
+               selected_root);
+        ASSERT(strcmp(json_get_str(json_get(selected_root, "package_root")),
+                      mit_root) == 0);
+        ASSERT(strcmp(mit_root, apache_root) != 0);
+
+        ASSERT(reply.next_count == 1);
+        ASSERT(strcmp(reply.next[0].command, "zcode.use") == 0);
+        struct json_value next_input;
+        json_init(&next_input);
+        ASSERT(json_read(&next_input, reply.next[0].input_json,
+                         strlen(reply.next[0].input_json)));
+        const char *next_root = json_get_str(json_get(
+            &next_input, "name_or_root"));
+        uint8_t checked_root[32];
+        ASSERT(next_root && strlen(next_root) == 64u &&
+               zcl_hex_decode_lower(next_root, checked_root, 32));
+        ASSERT(strcmp(next_root, mit_root) == 0);
+        ASSERT(strcmp(next_root, apache_root) != 0);
+        ASSERT(strcmp(json_get_str(json_get(&next_input, "datadir")), base) ==
+               0);
+        const struct zcl_command_spec *next_spec =
+            zcl_command_registry_find(zcl_command_catalog(), "zcode.use",
+                                      NULL);
+        char why[160] = {0};
+        ASSERT(next_spec && zcl_command_registry_input_validate(
+            next_spec, &next_input, why, sizeof(why)));
+        (void)snprintf(path, sizeof(path), "%s/.zvcs", workspace);
+        ASSERT(access(path, F_OK) != 0);
+
+        json_free(&next_input);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        vcs_package_prepared_free(&apache);
+        vcs_package_prepared_free(&mit);
+        ASSERT(zcl_tree_remove(base).ok);
+        zpd_fixture_cleanup(apache_dir);
+        zpd_fixture_cleanup(mit_dir);
+        zpd_fixture_cleanup(workspace);
+        PASS();
+    } _test_next:;
+    zcl_native_zcode_discovery_test_backend(NULL, NULL);
+    vcs_swarm_engine_set_global(previous_engine);
+    vcs_swarm_engine_free(peer_engine);
+    return failures;
+}
+
+static int zpd_test_work_start_license_lifecycle(
+    secp256k1_context *ctx, const uint8_t secret[32],
+    const uint8_t pubkey[33])
+{
+    int failures = 0;
+    TEST("zcode work start: license filter cannot hand off a superseded root") {
+        char base[256], zcode_dir[320], path[512];
+        char package_dir[256], mit_workspace[256], apache_workspace[256];
+        (void)snprintf(base, sizeof(base),
+                       "test-tmp/zcode-work-license-life-%ld",
+                       (long)getpid());
+        (void)snprintf(package_dir, sizeof(package_dir),
+                       "test-tmp/zcode-work-license-life-pkg-%ld",
+                       (long)getpid());
+        (void)snprintf(mit_workspace, sizeof(mit_workspace),
+                       "test-tmp/zcode-work-license-life-mit-%ld",
+                       (long)getpid());
+        (void)snprintf(apache_workspace, sizeof(apache_workspace),
+                       "test-tmp/zcode-work-license-life-apache-%ld",
+                       (long)getpid());
+        ZCL_IGNORE_RESULT(zcl_tree_remove(base), "license lifecycle reset");
+        ZCL_IGNORE_RESULT(zcl_tree_remove(mit_workspace),
+                          "MIT workspace reset");
+        ZCL_IGNORE_RESULT(zcl_tree_remove(apache_workspace),
+                          "Apache workspace reset");
+        zpd_fixture_cleanup(package_dir);
+        ASSERT(platform_directory_create(base, 0700) == 0);
+        (void)snprintf(zcode_dir, sizeof(zcode_dir), "%s/zcode", base);
+        ASSERT(platform_directory_create(zcode_dir, 0700) == 0);
+        static const char *const store_dirs[] = {
+            "releases", "manifests", "recipes",
+        };
+        for (size_t i = 0; i < sizeof(store_dirs) / sizeof(store_dirs[0]); i++) {
+            (void)snprintf(path, sizeof(path), "%s/%s", zcode_dir,
+                           store_dirs[i]);
+            ASSERT(platform_directory_create(path, 0700) == 0);
+        }
+        ASSERT(zpd_fixture(mit_workspace, false));
+        ASSERT(zpd_fixture(apache_workspace, false));
+        ASSERT(zpd_reuse_package_fixture(
+            package_dir, "MIT",
+            "Permission is hereby granted, free of charge\n"));
+
+        struct vcs_package_prepare_options options = {
+            .dir = package_dir, .publisher_sequence = 1,
+            .reward_address = "", .chain_id = "zclassic-main",
+        };
+        memcpy(options.publisher_pubkey, pubkey, 33);
+        struct vcs_package_prepared prepared;
+        char detail[256];
+        ASSERT(vcs_package_prepare(&options, &prepared, detail,
+                                   sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+        ASSERT(zpd_store_reuse_package(zcode_dir, ctx, secret, &prepared));
+        struct vcs_package_release apache = prepared.release;
+        apache.publisher_sequence = 2;
+        ASSERT(snprintf(apache.license, sizeof(apache.license),
+                        "Apache-2.0") == 10);
+        memset(apache.signature, 0, sizeof(apache.signature));
+        ASSERT(zpd_store_reuse_release(zcode_dir, ctx, secret, &apache,
+                                       &prepared));
+        char package_root[65];
+        zcl_hex_encode(prepared.package_root, 32, package_root);
+
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", mit_workspace));
+        ASSERT(json_push_kv_str(
+            &input, "goal", "use zclassic23/license-choice@1.0.0"));
+        ASSERT(json_push_kv_str(&input, "profile", "quick"));
+        ASSERT(json_push_kv_str(&input, "license", "MIT"));
+        ASSERT(json_push_kv_str(&input, "datadir", base));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        struct zcl_command_request request = {.input = &input};
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply,
+                               "zcl.zcode_work_license_lifecycle_mit.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        const char *state = json_get_str(json_get(&reply.data, "state"));
+        ASSERT(state && strcmp(state, "REUSE_READY") != 0);
+        const struct json_value *reuse = json_get(&reply.data, "reuse_plan");
+        ASSERT(reuse);
+        ASSERT(strcmp(json_get_str(json_get(reuse, "license_filter_scope")),
+                      "selected_top_level_release_only") == 0);
+        ASSERT(!json_get_bool(json_get(
+            reuse, "dependency_closure_filtered")));
+        ASSERT(!json_get_bool(json_get(
+            reuse, "new_source_license_constrained")));
+        const struct json_value *reused = json_get(reuse, "reused");
+        ASSERT(reused && json_size(reused) == 0u);
+        const struct json_value *expert = json_get(&reply.data, "expert");
+        const struct json_value *reuse_expert = expert
+            ? json_get(expert, "reuse") : NULL;
+        const struct json_value *selected_roots = reuse_expert
+            ? json_get(reuse_expert, "selected_roots") : NULL;
+        ASSERT(reuse_expert && selected_roots &&
+               json_size(selected_roots) == 0u);
+        ASSERT(json_get_int(json_get(
+                   reuse_expert,
+                   "lifecycle_nonselected_release_rows")) == 1);
+        for (size_t i = 0; i < reply.next_count; i++) {
+            ASSERT(strcmp(reply.next[i].command, "zcode.use") != 0);
+            ASSERT(reply.next[i].input_json[0] == '\0' ||
+                   strstr(reply.next[i].input_json, package_root) == NULL);
+        }
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", apache_workspace));
+        ASSERT(json_push_kv_str(
+            &input, "goal", "use zclassic23/license-choice@1.0.0"));
+        ASSERT(json_push_kv_str(&input, "profile", "quick"));
+        ASSERT(json_push_kv_str(&input, "license", "Apache-2.0"));
+        ASSERT(json_push_kv_str(&input, "datadir", base));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        request.input = &input;
+        zcl_command_reply_init(
+            &reply, "zcl.zcode_work_license_lifecycle_apache.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "REUSE_READY") == 0);
+        reuse = json_get(&reply.data, "reuse_plan");
+        ASSERT(reuse);
+        ASSERT(strcmp(json_get_str(json_get(reuse, "license_filter_scope")),
+                      "selected_top_level_release_only") == 0);
+        ASSERT(!json_get_bool(json_get(
+            reuse, "dependency_closure_filtered")));
+        ASSERT(!json_get_bool(json_get(
+            reuse, "new_source_license_constrained")));
+        reused = json_get(reuse, "reused");
+        const struct json_value *selected = reused ? json_at(reused, 0) : NULL;
+        ASSERT(reused && json_size(reused) == 1u && selected);
+        ASSERT(strcmp(json_get_str(json_get(selected, "license")),
+                      "Apache-2.0") == 0);
+        expert = json_get(&reply.data, "expert");
+        selected_roots = expert ? json_get(expert, "selected_roots") : NULL;
+        const struct json_value *selected_root = selected_roots
+            ? json_at(selected_roots, 0) : NULL;
+        ASSERT(expert && selected_roots && json_size(selected_roots) == 1u &&
+               selected_root);
+        ASSERT(json_get_int(json_get(
+                   expert, "lifecycle_nonselected_release_rows")) == 0);
+        ASSERT(strcmp(json_get_str(json_get(selected_root, "package_root")),
+                      package_root) == 0);
+        ASSERT(reply.next_count == 1u);
+        ASSERT(strcmp(reply.next[0].command, "zcode.use") == 0);
+        struct json_value next_input;
+        json_init(&next_input);
+        ASSERT(json_read(&next_input, reply.next[0].input_json,
+                         strlen(reply.next[0].input_json)));
+        ASSERT(strcmp(json_get_str(json_get(&next_input, "name_or_root")),
+                      package_root) == 0);
+
+        json_free(&next_input);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        vcs_package_prepared_free(&prepared);
+        ASSERT(zcl_tree_remove(base).ok);
+        ASSERT(zcl_tree_remove(mit_workspace).ok);
+        ASSERT(zcl_tree_remove(apache_workspace).ok);
+        zpd_fixture_cleanup(package_dir);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_test_work_start_package_bounds(void)
+{
+    int failures = 0;
+    TEST("zcode work start: missing package config names init; local build output is ignored") {
+        char root[256];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-work-init-%ld", (long)getpid());
+        zpd_fixture_cleanup(root);
+        ASSERT(platform_directory_create(root, 0700) == 0);
+        char path[320];
+        (void)snprintf(path, sizeof(path), "%s/src", root);
+        ASSERT(platform_directory_create(path, 0700) == 0);
+        (void)snprintf(path, sizeof(path), "%s/src/x.c", root);
+        ASSERT(zpd_write(path, "int x(void) { return 1; }\n"));
+        ASSERT(zpd_plant_build_output(root));
+        char absolute_root[4400];
+        ASSERT(platform_directory_canonical_real(
+            root, absolute_root, sizeof(absolute_root)));
+
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Fix x"));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_start_init_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "work_id")), "") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "goal")),
+                      "Fix x") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "INITIALIZATION_REQUIRED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Initialize C23 package") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "next_safe_command")),
+                      "zcode project init plan") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "authoritative_workspace")),
+                      "unchanged") == 0);
+        ASSERT(json_get(&reply.data, "details_available") &&
+               !json_get_bool(json_get(&reply.data, "details_available")));
+        ASSERT(zpd_next_init_plan_is(&reply, absolute_root));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        zpd_fixture_cleanup(root);
+
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-work-build-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        ASSERT(zpd_plant_build_output(root));
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Fix x"));
+        ASSERT(json_push_kv_str(&input, "profile", "quick"));
+        ASSERT(json_push_kv_str(&input, "license", "MIT"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_start_build_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "AWAITING_CANDIDATE") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "next_safe_command")),
+                      "zcode work run") == 0);
+        ASSERT(json_get(&reply.data, "expert") == NULL);
+        ASSERT(json_get_bool(json_get(&reply.data, "details_available")));
+        const struct json_value *reuse = json_get(&reply.data, "reuse_plan");
+        ASSERT(reuse && strcmp(json_get_str(json_get(
+                          reuse, "license_filter")), "MIT") == 0);
+        ASSERT(!json_get_bool(json_get(reuse, "license_filter_applied")));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        static const char *const invalid_licenses[] = {"", "mit"};
+        for (size_t i = 0;
+             i < sizeof(invalid_licenses) / sizeof(invalid_licenses[0]); i++) {
+            json_init(&input); json_set_object(&input);
+            ASSERT(json_push_kv_str(&input, "workspace", root));
+            ASSERT(json_push_kv_str(&input, "goal", "Fix x"));
+            ASSERT(json_push_kv_str(&input, "license", invalid_licenses[i]));
+            request.input = &input;
+            zcl_command_reply_init(
+                &reply, "zcl.zcode_work_start_bad_license_test.v1");
+            zcl_native_handle_zcode_work_start(&request, &reply);
+            ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+            ASSERT(strcmp(reply.error.code, "BAD_LICENSE_FILTER") == 0);
+            ASSERT(!reply.error.mutated);
+            zcl_command_reply_free(&reply);
+            json_free(&input);
+        }
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Fix x"));
+        ASSERT(json_push_kv_int(&input, "license", 1));
+        request.input = &input;
+        zcl_command_reply_init(
+            &reply, "zcl.zcode_work_start_bad_license_type_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "BAD_LICENSE_FILTER") == 0);
+        ASSERT(!reply.error.mutated);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static void zpd_report_work_accept(const struct zcl_command_reply *reply)
+{
+    if (reply->status != ZCL_COMMAND_STATUS_PASSED)
+        fprintf(stderr, "work accept refused: code=%s message=%s\n",
+                reply->error.code, reply->error.message);
+}
+
+static int zpd_assert_work_envelopes(struct json_value *input,
+    const struct json_value *expected_data, const char *absolute_root,
+    const char *zbuild_datadir, const char *action_id)
+{
+    int failures = 0;
+    /* The real journey reached EVIDENCE_READY but its detailed show
+     * could not serialize. Checking the data object alone misses invalid
+     * continuations and the complete command envelope. Exercise both
+     * public read leaves through that boundary and retain proof identity. */
+    {
+    ASSERT(json_push_kv_str(input, "datadir", zbuild_datadir));
+    const char *paths[] = { "zcode.work.show", "zcode.work.status" };
+    const struct zcl_command_registry *registry =
+        zcl_command_catalog();
+    struct zcl_command_context context = {
+        .registry = registry,
+        .granted_capabilities = ~(uint64_t)0,
+        .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        const struct zcl_command_spec *spec =
+            zcl_command_registry_find(registry, paths[i], NULL);
+        ASSERT(spec != NULL);
+        struct {
+            char rendered[ZCL_COMMAND_LIST_BUDGET + 1u];
+            unsigned char fence[16];
+        } bounded;
+        memset(&bounded, 0xa5, sizeof(bounded));
+        char *rendered = bounded.rendered;
+        enum zcl_command_exit rendered_exit = ZCL_COMMAND_EXIT_OK;
+        size_t rendered_bytes = zcl_command_registry_execute_json(
+            registry, spec, &context, input, false, spec->path,
+            "normal", 0, 0, NULL, rendered, sizeof(bounded.rendered),
+            &rendered_exit);
+        ASSERT(rendered_bytes > 0u &&
+               rendered_bytes <= ZCL_COMMAND_LIST_BUDGET);
+        printf("work envelope: path=%s data_bytes=%zu bytes=%zu capacity=%zu leaf_budget=%d exit=%d\n",
+               paths[i], json_write(expected_data, NULL, 0), rendered_bytes,
+               sizeof(bounded.rendered), spec->budget_bytes, (int)rendered_exit);
+        ASSERT(rendered[rendered_bytes] == '\0');
+        for (size_t j = 0; j < sizeof(bounded.fence); ++j)
+            ASSERT(bounded.fence[j] == 0xa5);
+        ASSERT(rendered_exit == ZCL_COMMAND_EXIT_OK);
+        struct json_value envelope;
+        json_init(&envelope);
+        ASSERT(json_read(&envelope, rendered, rendered_bytes));
+        ASSERT(json_get_bool(json_get(&envelope, "ok")));
+        const struct json_value *data = json_get(&envelope, "data");
+        ASSERT(data != NULL);
+        printf("work serialized data: path=%s bytes=%zu\n",
+               paths[i], json_write(data, NULL, 0));
+        ASSERT_STR_EQ(json_get_str(json_get(data, "state")),
+                      "EVIDENCE_READY");
+        ASSERT(json_get_bool(json_get(data, "confirmation_ready")));
+        ASSERT_STR_EQ(
+            json_get_str(json_get(data, "confirmation_identity")),
+            json_get_str(json_get(expected_data,
+                                  "confirmation_identity")));
+        const struct json_value *next =
+            json_at(json_get(&envelope, "next"), 0);
+        ASSERT(next != NULL);
+        ASSERT_STR_EQ(json_get_str(json_get(next, "command")),
+                      "app.presentation.release-confirm");
+        const struct json_value *next_input = json_get(next, "input");
+        ASSERT(next_input != NULL);
+        ASSERT_STR_EQ(json_get_str(json_get(next_input, "workspace")),
+                      absolute_root);
+        ASSERT_STR_EQ(json_get_str(json_get(next_input, "datadir")),
+                      zbuild_datadir);
+        ASSERT_STR_EQ(json_get_str(json_get(next_input, "work")),
+                      json_get_str(json_get(input, "work")));
+        const struct json_value *expert = json_get(data, "expert");
+        ASSERT(expert != NULL);
+        ASSERT_STR_EQ(json_get_str(json_get(expert,
+                                            "proof_action_root")),
+                      action_id);
+        json_free(&envelope);
+    }
+    }
+_test_next:
+    return failures == 0;
+}
+
+/* Omission is permitted only for the exact task-derived default when adding
+ * its explicit spelling would exceed the existing complete input budget. */
+static bool zpd_compact_default_continuation(
+    const struct json_value *next, const char *datadir, const char *task_hex)
+{
+    struct json_value expanded;
+    json_init(&expanded);
+    char wire[1024], expected[4400], canonical[4400];
+    size_t compact = json_write(next, wire, sizeof(wire));
+#if defined(_WIN32)
+    char state[4400];
+    int n = platform_state_root(state, sizeof(state))
+        ? snprintf(expected, sizeof(expected), "%s/zcode-workspaces/%.64s/zbuild",
+                   state, task_hex) : -1;
+#else
+    int n = snprintf(expected, sizeof(expected),
+                     "/tmp/zclassic23-zcode-workspaces/%lu/%.64s/zbuild",
+                     (unsigned long)getuid(), task_hex);
+#endif
+    bool ok = json_get(next, "datadir") == NULL &&
+        compact > 0 && compact < sizeof(((struct zcl_command_next *)0)->input_json) &&
+        n > 0 && (size_t)n < sizeof(expected) &&
+        platform_directory_canonical_real(expected, canonical, sizeof(canonical)) &&
+        strcmp(canonical, datadir) == 0 &&
+        json_read(&expanded, wire, compact) &&
+        json_push_kv_str(&expanded, "datadir", datadir);
+    size_t complete = ok ? json_write(&expanded, NULL, 0) : 0;
+    ok = ok && complete >= sizeof(((struct zcl_command_next *)0)->input_json);
+    printf("work continuation compact=%zu explicit=%zu capacity=%zu exact_default=%d\n",
+           compact, complete, sizeof(((struct zcl_command_next *)0)->input_json), ok);
+    json_free(&expanded);
+    return ok;
+}
+
+static bool zpd_explicit_publication_next(
+    const struct zcl_command_reply *reply, const char *datadir,
+    const char *work, const char *job)
+{
+    struct json_value next;
+    json_init(&next);
+    bool parsed = reply->next_count == 1 &&
+        strcmp(reply->next[0].command, "zcode.work.publish") == 0 &&
+        json_read(&next, reply->next[0].input_json,
+                  strlen(reply->next[0].input_json));
+    const char *actual_datadir = json_get_str(json_get(&next, "datadir"));
+    const char *actual_work = json_get_str(json_get(&next, "work"));
+    const char *actual_job = json_get_str(json_get(&next, "job_root"));
+    bool ok = parsed && actual_datadir && actual_work && actual_job &&
+        strcmp(actual_datadir, datadir) == 0 && strcmp(actual_work, work) == 0 &&
+        strcmp(actual_job, job) == 0;
+    json_free(&next);
+    return ok;
+}
+
+static bool zpd_custom_ledger_continuation(
+    const struct json_value *accept_input, const char *default_datadir,
+    const char *custom, const char *job, bool fits)
+{
+    char canonical[4400];
+    bool copied = zcl_tree_copy(default_datadir, custom, 0, NULL, NULL).ok;
+    bool prepared = copied && platform_directory_canonical_real(
+        custom, canonical, sizeof(canonical));
+    struct json_value input;
+    json_init(&input); json_copy(&input, accept_input);
+    struct json_value *selected_datadir =
+        (struct json_value *)json_get(&input, "datadir");
+    prepared = prepared && selected_datadir && selected_datadir->type == JSON_STR;
+    if (prepared) json_set_str(selected_datadir, canonical);
+    struct zcl_command_request request = {.input = &input};
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.zcode_custom_continuation.v1");
+    if (prepared) zcl_native_handle_zcode_work_accept(&request, &reply);
+    bool ok;
+    if (fits)
+        ok = prepared && reply.status == ZCL_COMMAND_STATUS_PASSED &&
+            zpd_explicit_publication_next(&reply, canonical,
+                json_get_str(json_get(accept_input, "work")), job);
+    else
+        ok = prepared && reply.status == ZCL_COMMAND_STATUS_FAILED &&
+            strcmp(reply.error.code, "ACCEPT_OUTPUT_FAILED") == 0 &&
+            reply.next_count == 0;
+    printf("work continuation custom fits=%d preserved_or_refused=%d code=%s\n",
+           fits, ok, reply.error.code);
+    zcl_command_reply_free(&reply); json_free(&input);
+    bool removed = zcl_tree_remove(custom).ok;
+    return ok && removed;
+}
+
+static bool zpd_custom_ledger_cases(
+    const struct json_value *accept_input, const char *datadir, const char *job)
+{
+    /* Both custom dirs are FIXED-LENGTH absolute /tmp paths, like the
+     * work-start workspace above: the fits/refuse expectations sit on
+     * opposite sides of the continuation's 512-byte capacity, and any
+     * checkout-relative dir made the shorter side's budget depend on the
+     * checkout depth — which is unbounded in a land-loop proof generation
+     * (its worktree root carries the 81-char commit-pair tag). A short
+     * custom dir (~20 bytes) and a long one (~200 bytes) pin both sides
+     * from every depth. */
+    char short_dir[256], long_dir[256];
+    (void)snprintf(short_dir, sizeof(short_dir), "/tmp/zpd-custom-short-%ld",
+                   (long)getpid());
+    (void)snprintf(long_dir, sizeof(long_dir),
+        "/tmp/zpd-custom-ledger-must-remain-explicit-and-must-never-silently-resolve-to-task-default-when-complete-continuation-exceeds-the-fixed-bound-preserving-exact-work-job-source-and-custody-owner-%ld",
+        (long)getpid());
+    return zpd_custom_ledger_continuation(accept_input, datadir, short_dir, job, true) &&
+        zpd_custom_ledger_continuation(accept_input, datadir, long_dir, job, false);
+}
+
+static __attribute__((unused)) int zpd_test_work_start(void)
+{
+    int failures = 0;
+    TEST("zcode work start: goal and profile compose existing task owners") {
+        char root[512];
+        /* The workspace path is a FIXED-LENGTH absolute /tmp path, not a
+         * path under the checkout. The continuation's 512-byte compaction
+         * boundary is tuned against this workspace's length, so a relative
+         * root made the whole family checkout-depth-dependent: the same
+         * tree passed from a ~45-char checkout and failed deterministically
+         * from shallower ones (compact=509, explicit datadir retained) —
+         * and no relative padding could fix it, because the custom-ledger
+         * cases share these fields and sit on the OTHER side of the same
+         * bound. A constant-length workspace (277 bytes, like this test
+         * family's own /tmp/zclassic23-zcode-workspaces roots) pins every
+         * boundary from any checkout depth. */
+        /* 274 bytes total ("/tmp/" + 130 + "/" + 130 + "-" + pid), split
+         * across two components so no filename part approaches NAME_MAX.
+         * Measured anchors: explicit continuation = workspace + 243 (must
+         * reach 512 to trigger default-datadir omission), compact =
+         * workspace + 121 (must stay under 512 once omitted), custom
+         * continuation = workspace + custom + 134 — 274 sits inside every
+         * margin from any checkout depth. */
+        char ws_a[131], ws_b[131];
+        memset(ws_a, 'w', sizeof(ws_a) - 1); ws_a[sizeof(ws_a) - 1] = '\0';
+        memset(ws_b, 'w', sizeof(ws_b) - 1); ws_b[sizeof(ws_b) - 1] = '\0';
+        (void)snprintf(root, sizeof(root), "/tmp/%s/%s-%ld", ws_a, ws_b,
+                       (long)getpid());
+        {   /* directory_create is one level; zpd_fixture must create root itself */
+            char parent[300];
+            (void)snprintf(parent, sizeof(parent), "/tmp/%s", ws_a);
+            ASSERT(platform_directory_ensure(parent, 0700));
+        }
+        ASSERT(zpd_fixture(root, false));
+        char absolute_root[4400];
+        ASSERT(platform_directory_canonical_real(
+            root, absolute_root, sizeof(absolute_root)));
+        uint8_t source_before[32], source_after[32];
+        ASSERT(vcs_tree_capture_path(root, source_before) == VCS_OK);
+
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Fix x"));
+        ASSERT(json_push_kv_str(&input, "profile", "quick"));
+        ASSERT(json_push_kv_str(&input, "context_symbol",
+                                "fixture_parse_options"));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_start_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(vcs_tree_capture_path(root, source_after) == VCS_OK);
+        ASSERT(memcmp(source_before, source_after, sizeof(source_before)) == 0);
+        const struct json_value *work_id = json_get(&reply.data, "work_id");
+        const struct json_value *state = json_get(&reply.data, "state");
+        const struct json_value *context =
+            json_get(&reply.data, "selected_context");
+        const struct json_value *reuse =
+            json_get(&reply.data, "reuse_plan");
+        const struct json_value *expert = json_get(&reply.data, "expert");
+        ASSERT(work_id && strncmp(json_get_str(work_id), "work-", 5) == 0);
+        char saved_work_id[32];
+        (void)snprintf(saved_work_id, sizeof(saved_work_id), "%s",
+                       json_get_str(work_id));
+        ASSERT(state && strcmp(json_get_str(state),
+                               "AWAITING_CANDIDATE") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Creating missing code") == 0);
+        ASSERT(context && context->type == JSON_OBJ);
+        ASSERT(strcmp(json_get_str(json_get(context, "symbol")),
+                      "fixture_parse_options") == 0);
+        ASSERT(json_get(context, "symbol_id") != NULL);
+        ASSERT(reuse && reuse->type == JSON_OBJ);
+        ASSERT(strcmp(json_get_str(json_get(reuse, "search_status")),
+                      "datadir_not_provided") == 0);
+        ASSERT(json_get_bool(json_get(reuse, "new_code_required")));
+        const char *detailed_task_root = expert
+            ? json_get_str(json_get(expert, "task_root")) : NULL;
+        const char *detailed_source_root = expert
+            ? json_get_str(json_get(expert, "source_root")) : NULL;
+        const char *detailed_scope_root = expert
+            ? json_get_str(json_get(expert, "write_scope_root")) : NULL;
+        ASSERT(detailed_task_root &&
+               strncmp(saved_work_id + 5, detailed_task_root, 12) == 0);
+        ASSERT(detailed_source_root && strlen(detailed_source_root) == 64u);
+        ASSERT(detailed_scope_root && strlen(detailed_scope_root) == 64u);
+        char saved_task_root[65], saved_source_root[65], saved_scope_root[65];
+        (void)snprintf(saved_task_root, sizeof(saved_task_root), "%s",
+                       detailed_task_root);
+        (void)snprintf(saved_source_root, sizeof(saved_source_root), "%s",
+                       detailed_source_root);
+        (void)snprintf(saved_scope_root, sizeof(saved_scope_root), "%s",
+                       detailed_scope_root);
+        ASSERT(zpd_workspace_task_offer(absolute_root, saved_task_root));
+        ASSERT(json_get_bool(json_get(&reply.data, "details_available")));
+        ASSERT(reply.next_count == 1);
+        ASSERT(strcmp(reply.next[0].command, "zcode.work.run") == 0);
+        struct json_value next_input;
+        json_init(&next_input);
+        ASSERT(json_read(&next_input, reply.next[0].input_json,
+                         strlen(reply.next[0].input_json)));
+        ASSERT(strcmp(json_get_str(json_get(&next_input, "workspace")),
+                      absolute_root) == 0);
+        ASSERT(strcmp(json_get_str(json_get(&next_input, "work")),
+                      saved_work_id) == 0);
+        ASSERT(json_get(&next_input, "task_root") == NULL);
+        ASSERT(json_get(&next_input, "package_root") == NULL);
+        const struct zcl_command_spec *next_spec =
+            zcl_command_registry_find(zcl_command_catalog(),
+                                      reply.next[0].command, NULL);
+        char next_why[160] = {0};
+        ASSERT(next_spec && zcl_command_registry_input_validate(
+            next_spec, &next_input, next_why, sizeof(next_why)));
+        json_free(&next_input);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        /* A distinct task identity for the same exact source and goal must
+         * carry improve's rooted duplicate evidence through the normal
+         * human-first entry point. Authorship still is not assignment or an
+         * observation of active execution. */
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Fix x"));
+        ASSERT(json_push_kv_str(&input, "profile", "standard"));
+        request.input = &input;
+        zcl_command_reply_init(&reply,
+                               "zcl.zcode_work_start_duplicate_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_BLOCKED);
+        ASSERT(reply.exit_code == ZCL_COMMAND_EXIT_BLOCKED);
+        ASSERT(strcmp(reply.error.code, "ACTIVE_TASK_CONFLICT") == 0);
+        ASSERT(reply.error.mutated);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "conflict_kind")),
+                      "DUPLICATE_ACTIVE_WORK") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "task_root")),
+                      saved_task_root) == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "source_root")),
+                      saved_source_root) == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "write_scope_root")),
+                      saved_scope_root) == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "assignment_status")),
+                      "UNOBSERVED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "active_execution")),
+                      "UNOBSERVED") == 0);
+        ASSERT(zpd_coordination_next_is(
+            &reply, absolute_root, saved_task_root));
+        {
+            const struct zcl_command_registry *registry =
+                zcl_command_catalog();
+            const struct zcl_command_spec *spec =
+                zcl_command_registry_find(
+                    registry, "zcode.work.start", NULL);
+            struct zcl_command_context command_context = {
+                .registry = registry,
+                .granted_capabilities = ~(uint64_t)0,
+                .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+            };
+            char rendered[ZCL_COMMAND_RESULT_BUDGET + 1u];
+            enum zcl_command_exit exit_code = ZCL_COMMAND_EXIT_OK;
+            ASSERT(spec != NULL);
+            size_t rendered_bytes = zcl_command_registry_execute_json(
+                registry, spec, &command_context, &input, false, spec->path,
+                "normal", 0, 0, NULL, rendered, sizeof(rendered),
+                &exit_code);
+            ASSERT(rendered_bytes > 0u &&
+                   rendered_bytes <= ZCL_COMMAND_RESULT_BUDGET);
+            ASSERT(exit_code == ZCL_COMMAND_EXIT_BLOCKED);
+            ASSERT(strstr(rendered, "RESPONSE_BUDGET_EXCEEDED") == NULL);
+            ASSERT(strstr(rendered, "ACTIVE_TASK_CONFLICT") != NULL);
+            ASSERT(strstr(rendered, saved_task_root) != NULL);
+            ASSERT(strstr(rendered, "\"command\":\"zcode.tasks\"") != NULL);
+        }
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        /* A different goal over the same component-bounded source surface is
+         * the separate overlap class, with the same exact existing task
+         * handoff and no invented owner. */
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Change x"));
+        ASSERT(json_push_kv_str(&input, "profile", "quick"));
+        request.input = &input;
+        zcl_command_reply_init(&reply,
+                               "zcl.zcode_work_start_overlap_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_BLOCKED);
+        ASSERT(reply.exit_code == ZCL_COMMAND_EXIT_BLOCKED);
+        ASSERT(reply.error.mutated);
+        ASSERT(strcmp(reply.error.code, "ACTIVE_TASK_CONFLICT") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "conflict_kind")),
+                      "WRITE_SCOPE_OVERLAP") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "task_root")),
+                      saved_task_root) == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "source_root")),
+                      saved_source_root) == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "assignment_status")),
+                      "UNOBSERVED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "active_execution")),
+                      "UNOBSERVED") == 0);
+        ASSERT(zpd_coordination_next_is(
+            &reply, absolute_root, saved_task_root));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        /* A recognized task wire under a false CAS address makes the scan
+         * incomplete. Preserve that refusal without fabricating a conflicting
+         * task root or a targeted continuation. */
+        uint8_t task_root_bytes[32], false_root[32];
+        uint8_t *task_wire = NULL;
+        size_t task_wire_len = 0;
+        memset(false_root, 0xa5, sizeof(false_root));
+        ASSERT(zcl_hex_decode_lower(
+            saved_task_root, task_root_bytes, sizeof(task_root_bytes)));
+        ASSERT(vcs_object_load_raw(
+            root, task_root_bytes, &task_wire, &task_wire_len) == 0);
+        ASSERT(vcs_object_put_addressed(
+            root, false_root, task_wire, task_wire_len));
+        free(task_wire);
+        char false_hex[65], false_path[512];
+        zcl_hex_encode(false_root, sizeof(false_root), false_hex);
+        ASSERT(snprintf(false_path, sizeof(false_path),
+                        "%s/.zvcs/objects/%c%c/%s", root,
+                        false_hex[0], false_hex[1], false_hex + 2) > 0);
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Refactor x"));
+        ASSERT(json_push_kv_str(&input, "profile", "quick"));
+        request.input = &input;
+        zcl_command_reply_init(&reply,
+                               "zcl.zcode_work_start_incomplete_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        int false_removed = unlink(false_path);
+        ASSERT(false_removed == 0);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_BLOCKED);
+        ASSERT(reply.exit_code == ZCL_COMMAND_EXIT_BLOCKED);
+        ASSERT(reply.error.mutated);
+        ASSERT(strcmp(reply.error.code,
+                      "TASK_CONFLICT_SCAN_INCOMPLETE") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "conflict_kind")),
+                      "INCOMPLETE") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "task_root")), "") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "assignment_status")),
+                      "UNOBSERVED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "active_execution")),
+                      "UNOBSERVED") == 0);
+        ASSERT(reply.next_count == 0u);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_status_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "goal")),
+                      "Fix x") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "AWAITING_CANDIDATE") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Creating missing code") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "build_result")),
+                      "not_started") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "sanitizer_result")),
+                      "not_required") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "reproduction_grade")),
+                      "none") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "next_safe_command")),
+                      "zcode work run") == 0);
+        ASSERT(!json_get_bool(json_get(&reply.data, "confirmation_ready")));
+        ASSERT(json_get(&reply.data, "confirmation_identity") == NULL);
+        ASSERT(json_get(&reply.data, "proof") == NULL);
+        ASSERT(json_get(&reply.data, "expert") == NULL);
+        ASSERT(json_get_bool(json_get(&reply.data, "details_available")));
+        ASSERT(zpd_next_is(&reply, "zcode.work.run", absolute_root,
+                           saved_work_id, NULL));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        if (reply.status != ZCL_COMMAND_STATUS_PASSED)
+            printf("work admission failed: %s: %s\n", reply.error.code,
+                   reply.error.message);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        const struct json_value *candidate_workspace =
+            json_get(&reply.data, "candidate_workspace");
+        const struct json_value *packet_path =
+            json_get(&reply.data, "adapter_packet_path");
+        ASSERT(candidate_workspace &&
+               json_get_str(candidate_workspace)[0] == '/');
+        char saved_candidate_workspace[4400];
+        (void)snprintf(saved_candidate_workspace,
+                       sizeof(saved_candidate_workspace), "%s",
+                       json_get_str(candidate_workspace));
+        ASSERT(packet_path && json_get_str(packet_path)[0] == '/');
+        ASSERT(strncmp(json_get_str(packet_path),
+                       saved_candidate_workspace,
+                       strlen(saved_candidate_workspace)) == 0);
+        ASSERT(access(json_get_str(packet_path), F_OK) == 0);
+        ASSERT(json_get_int(json_get(
+                   &reply.data, "model_context_bytes")) > 0);
+        ASSERT(json_get(&reply.data, "adapter_packet_bytes") == NULL);
+        ASSERT(json_get(&reply.data, "workspace_created") == NULL);
+        ASSERT(json_get(&reply.data, "next_safe_command") == NULL);
+        char *packet_text = zpd_read_bounded(json_get_str(packet_path),
+                                             2u * 1024u * 1024u);
+        ASSERT(packet_text != NULL);
+        ASSERT(strstr(packet_text, "\"Write C23 only.") != NULL);
+        ASSERT(strstr(packet_text,
+                      "\"selected_dependency_context\"") != NULL);
+        ASSERT(strstr(packet_text, "\"selected_excerpts\"") != NULL);
+        ASSERT(strstr(packet_text, "\"allowed_write_scopes\"") != NULL);
+        ASSERT(strstr(packet_text, "\"dependency_lock_root\"") != NULL);
+        ASSERT(strstr(packet_text, "\"max_changed_files\"") != NULL);
+        ASSERT(strstr(packet_text, "\"max_patch_bytes\"") != NULL);
+        ASSERT(strstr(packet_text, "\"candidate_workspace\"") == NULL);
+        ASSERT(strstr(packet_text, "\"dependency_context_bytes\"") == NULL);
+        ASSERT(strstr(packet_text,
+                      "\"dependency_context_headers\"") == NULL);
+        ASSERT(strstr(packet_text, "\"max_context_bytes\"") == NULL);
+        ASSERT(strstr(packet_text, "\"max_cpu_seconds\"") == NULL);
+        ASSERT(strstr(packet_text, "\"max_memory_bytes\"") == NULL);
+        ASSERT(strstr(packet_text, "\"max_output_bytes\"") == NULL);
+        ASSERT(strstr(packet_text, "\"task_root\"") == NULL);
+        ASSERT(strstr(packet_text, "\"source_root\"") == NULL);
+        ASSERT(strstr(packet_text, "\"context_root\"") == NULL);
+        ASSERT(strstr(packet_text, "\"write_scope_root\"") == NULL);
+        ASSERT(strstr(packet_text, "\"package_recipe_root\"") == NULL);
+        ASSERT(strstr(packet_text, "\"proof_policy_root\"") == NULL);
+        ASSERT(strstr(packet_text, "\"toolchain_capsule_root\"") == NULL);
+        struct json_value packet;
+        json_init(&packet);
+        ASSERT(json_read(&packet, packet_text, strlen(packet_text)));
+        const struct json_value *allowed =
+            json_get(&packet, "allowed_write_scopes");
+        ASSERT(zpd_array_has_string(allowed, "app"));
+        ASSERT(zpd_array_has_string(allowed, "include"));
+        ASSERT(zpd_array_has_string(allowed, "src"));
+        ASSERT(zpd_array_has_string(allowed, "tests"));
+        json_free(&packet);
+        free(packet_text);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "authority")),
+                      "NONE_MANUAL_HANDOFF") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Creating missing code") == 0);
+        ASSERT(json_get_bool(json_get(&reply.data, "details_available")));
+        ASSERT(zpd_next_is(&reply, "zcode.work.status", absolute_root,
+                           saved_work_id, NULL));
+        {
+            const struct zcl_command_registry *registry =
+                zcl_command_catalog();
+            const struct zcl_command_spec *run_spec =
+                zcl_command_registry_find(registry, "zcode.work.run", NULL);
+            struct zcl_command_context context = {
+                .registry = registry,
+                .granted_capabilities = ~(uint64_t)0,
+                .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+            };
+            char rendered[ZCL_COMMAND_RESULT_BUDGET + 1u];
+            enum zcl_command_exit exit_code = ZCL_COMMAND_EXIT_OK;
+            ASSERT(run_spec != NULL);
+            size_t rendered_bytes = zcl_command_registry_execute_json(
+                registry, run_spec, &context, &input, false, run_spec->path,
+                "normal", 0, 0, NULL, rendered, sizeof(rendered),
+                &exit_code);
+            ASSERT(rendered_bytes > 0);
+            ASSERT(exit_code == ZCL_COMMAND_EXIT_OK);
+            ASSERT(strstr(rendered, "RESPONSE_BUDGET_EXCEEDED") == NULL);
+            ASSERT(strstr(rendered,
+                          "\"command\":\"zcode.work.status\"") != NULL);
+        }
+        ASSERT(vcs_tree_capture_path(root, source_after) == VCS_OK);
+        ASSERT(memcmp(source_before, source_after, sizeof(source_before)) == 0);
+        struct stat candidate_stat;
+        ASSERT(stat(json_get_str(candidate_workspace), &candidate_stat) == 0 &&
+               S_ISDIR(candidate_stat.st_mode));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        char candidate_license[4500];
+        (void)snprintf(candidate_license, sizeof(candidate_license),
+                       "%s/LICENSE", saved_candidate_workspace);
+        ASSERT(zpd_write(candidate_license, "proprietary\n"));
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "PATCH_OUTSIDE_SCOPE") == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        ASSERT(zpd_write(candidate_license, "MIT\n"));
+
+        char candidate_source[4500];
+        (void)snprintf(candidate_source, sizeof(candidate_source), "%s/src/x.c",
+                       saved_candidate_workspace);
+        ASSERT(zpd_write(candidate_source,
+                         "int x(void) { return ; broken }\n"));
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_run_test.v1");
+        /* The operator's default node is not candidate authority. Omission of
+         * datadir must retain the closed scratch worker even when the native
+         * bridge has a default node bound. */
+        zcl_native_bridge_bind_rpc(absolute_root, 0);
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        zcl_native_bridge_bind_rpc("", 0);
+        if (reply.status != ZCL_COMMAND_STATUS_PASSED)
+            printf("failed-candidate admission failed: %s: %s\n", reply.error.code,
+                   reply.error.message);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "REPAIR_NEEDED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Creating missing code") == 0);
+        ASSERT(json_get(&reply.data, "changed_files") &&
+               json_get_int(json_get(&reply.data, "changed_files")) == 1);
+        ASSERT(json_get(&reply.data, "candidate_root") != NULL);
+        ASSERT(json_get(&reply.data, "work_receipt_root") != NULL);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "build_result")),
+                      "failed") == 0);
+        const struct json_value *repair_packet =
+            json_get(&reply.data, "repair_packet");
+        ASSERT(repair_packet && repair_packet->type == JSON_OBJ);
+        ASSERT(strcmp(json_get_str(json_get(repair_packet, "goal")),
+                      "Fix x") == 0);
+        ASSERT(json_get(repair_packet, "parent_candidate_root") == NULL);
+        ASSERT(json_get(repair_packet, "prior_patch_root") == NULL);
+        ASSERT(json_get(repair_packet, "selected_excerpts") != NULL);
+        const struct json_value *repair_diagnostic =
+            json_get(repair_packet, "diagnostic");
+        ASSERT(json_get(repair_diagnostic, "evidence_root") == NULL);
+        ASSERT(json_get(repair_diagnostic, "work_receipt_root") == NULL);
+        const struct json_value *compiler_feedback = repair_diagnostic
+            ? json_get(repair_diagnostic, "compiler_feedback") : NULL;
+        ASSERT(compiler_feedback &&
+               json_get_bool(json_get(compiler_feedback, "available")));
+        ASSERT(strcmp(json_get_str(json_get(compiler_feedback, "stage")),
+                      "compile") == 0);
+        ASSERT(strstr(json_get_str(json_get(compiler_feedback, "path")),
+                      "src/x.c") != NULL);
+        ASSERT(json_get_int(json_get(compiler_feedback, "line")) > 0);
+        ASSERT(json_get_str(json_get(compiler_feedback, "message"))[0]);
+        const struct json_value *repair_workspace =
+            json_get(&reply.data, "candidate_workspace");
+        const struct json_value *repair_packet_path =
+            json_get(&reply.data, "repair_packet_path");
+        ASSERT(repair_workspace && strstr(json_get_str(repair_workspace),
+                                           "/attempt-2") != NULL);
+        ASSERT(repair_packet_path &&
+               access(json_get_str(repair_packet_path), F_OK) == 0);
+        ASSERT(json_get_int(json_get(&reply.data,
+                                     "model_context_bytes")) > 0);
+        ASSERT(zpd_next_is(&reply, "zcode.work.status", absolute_root,
+                           saved_work_id, NULL));
+        (void)snprintf(saved_candidate_workspace,
+                       sizeof(saved_candidate_workspace), "%s",
+                       json_get_str(repair_workspace));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_status_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "REPAIR_NEEDED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "build_result")),
+                      "failed") == 0);
+        const struct json_value *status_proof =
+            json_get(&reply.data, "proof");
+        ASSERT(status_proof &&
+               json_get_bool(json_get(status_proof, "facts_available")));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "remaining_risks")),
+                      "latest candidate failed confined package build or tests") == 0);
+        ASSERT(zpd_next_is(&reply, "zcode.work.run", absolute_root,
+                           saved_work_id, NULL));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "REPAIR_NEEDED") == 0);
+        ASSERT(zpd_next_is(&reply, "zcode.work.status", absolute_root,
+                           saved_work_id, NULL));
+        repair_packet_path = json_get(&reply.data, "adapter_packet_path");
+        ASSERT(repair_packet_path != NULL);
+        char *repair_packet_text = zpd_read_bounded(
+            json_get_str(repair_packet_path), 2u * 1024u * 1024u);
+        ASSERT(repair_packet_text != NULL);
+        ASSERT(strstr(repair_packet_text, "\"diagnostic\"") != NULL);
+        ASSERT(strstr(repair_packet_text,
+                      "\"compiler_feedback\"") != NULL);
+        ASSERT(strstr(repair_packet_text, "\"parent_candidate_root\"") ==
+               NULL);
+        ASSERT(strstr(repair_packet_text, "\"prior_patch_root\"") == NULL);
+        ASSERT(strstr(repair_packet_text, "\"evidence_root\"") == NULL);
+        ASSERT(strstr(repair_packet_text, "\"work_receipt_root\"") == NULL);
+        free(repair_packet_text);
+        char staged_repair_path[4500];
+        (void)snprintf(staged_repair_path, sizeof(staged_repair_path), "%s",
+                       json_get_str(repair_packet_path));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        ASSERT(chmod(staged_repair_path, 0644) == 0);
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "REPAIR_CONTEXT_REFUSED") == 0);
+        ASSERT(access(staged_repair_path, F_OK) != 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        (void)snprintf(candidate_source, sizeof(candidate_source), "%s/src/x.c",
+                       saved_candidate_workspace);
+        ASSERT(zpd_write(candidate_source,
+                         "int x(void) { return 2; }\n"));
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "EVIDENCE_READY") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Showing result") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "build_result")),
+                      "passed") == 0);
+        ASSERT(zpd_next_is(&reply, "zcode.work.status", absolute_root,
+                           saved_work_id, NULL));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "async_proof_state")), "REQUESTED") == 0);
+        ASSERT(strlen(json_get_str(json_get(
+                          &reply.data, "async_proof_event_root"))) == 64);
+        ASSERT(json_get_int(json_get(
+                   &reply.data, "remote_request_id")) > 0);
+        ASSERT(json_get_int(json_get(&reply.data, "local_submit_us")) >= 0);
+        ASSERT(json_get_int(
+            json_get(&reply.data, "local_first_feedback_us")) >= 0);
+        const struct json_value *run_expert = json_get(&reply.data, "expert");
+        const struct json_value *run_action = run_expert
+            ? json_get(run_expert, "action_id") : NULL;
+        ASSERT(run_action && strlen(json_get_str(run_action)) == 64);
+        ASSERT(json_write(&reply.data, NULL, 0) < 4096u);
+        char saved_action_id[65];
+        (void)snprintf(saved_action_id, sizeof(saved_action_id), "%s",
+                       json_get_str(run_action));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_status_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "EVIDENCE_READY") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Ready for your decision") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "build_result")),
+                      "passed") == 0);
+        ASSERT(json_get_int(json_get(&reply.data, "changed_files")) == 1);
+        ASSERT(json_get_int(json_get(&reply.data, "added_lines")) == 1);
+        ASSERT(json_get_int(json_get(&reply.data, "deleted_lines")) == 1);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data,
+                                            "public_api_changes")),
+                      "none") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "sanitizer_result")),
+                      "not_required") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "next_safe_command")),
+                      "ask user to confirm exact candidate") == 0);
+        ASSERT(json_get_bool(json_get(&reply.data, "confirmation_ready")));
+        ASSERT(zpd_next_is(&reply, "app.presentation.release-confirm",
+                           absolute_root, saved_work_id, NULL));
+        ASSERT(strlen(json_get_str(json_get(
+                   &reply.data, "confirmation_identity"))) == 64);
+        status_proof = json_get(&reply.data, "proof");
+        ASSERT(status_proof &&
+               json_get_bool(json_get(status_proof, "facts_available")));
+        ASSERT(json_get_bool(json_get(status_proof, "compile_satisfied")));
+        ASSERT(json_get_bool(json_get(status_proof, "test_satisfied")));
+        ASSERT(json_get_bool(json_get(status_proof, "policy_satisfied")));
+        ASSERT(json_get_int(json_get(status_proof, "compile_receipts")) > 0);
+        ASSERT(json_get_int(json_get(status_proof, "test_receipts")) > 0);
+        const struct json_value *proof_expert =
+            json_get(&reply.data, "expert");
+        const char *proof_action_root = proof_expert
+            ? json_get_str(json_get(proof_expert, "proof_action_root"))
+            : NULL;
+        const char *build_output_root = proof_expert
+            ? json_get_str(json_get(proof_expert, "build_output_root"))
+            : NULL;
+        ASSERT(proof_action_root && strlen(proof_action_root) == 64);
+        ASSERT(build_output_root && strlen(build_output_root) == 64);
+        ASSERT(strcmp(proof_action_root, saved_action_id) == 0);
+        ASSERT(json_write(&reply.data, NULL, 0) < 4096u);
+        char zbuild_datadir[4400];
+        (void)snprintf(zbuild_datadir, sizeof(zbuild_datadir), "%s",
+                       saved_candidate_workspace);
+        char *attempt_dir = strrchr(zbuild_datadir, '/');
+        ASSERT(attempt_dir != NULL);
+        (void)snprintf(attempt_dir,
+                       (size_t)(zbuild_datadir + sizeof(zbuild_datadir) -
+                                attempt_dir), "/zbuild");
+        ASSERT(zpd_assert_work_envelopes(&input, &reply.data, absolute_root,
+                                         zbuild_datadir, saved_action_id));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "datadir", zbuild_datadir));
+        ASSERT(json_push_kv_str(&input, "action_id", saved_action_id));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_evidence_test.v1");
+        zcl_native_handle_zcode_evidence(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(json_get_bool(json_get(&reply.data, "compile_satisfied")));
+        ASSERT(json_get_bool(json_get(&reply.data, "test_satisfied")));
+        ASSERT(json_get_bool(json_get(&reply.data, "policy_satisfied")));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        ASSERT(json_push_kv_str(&input, "verdict", "approve"));
+        ASSERT(json_push_kv_str(&input, "findings",
+                                "Declared build and tests support approval."));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_review_test.v1");
+        zcl_native_handle_zcode_work_review(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "verdict")),
+                      "approve") == 0);
+        ASSERT(json_get_bool(json_get(&reply.data,
+                                      "independent_reviewer")));
+        ASSERT(json_get_int(json_get(&reply.data, "review_receipts")) == 1);
+        ASSERT(strlen(json_get_str(json_get(&reply.data,
+                                            "review_root"))) == 64);
+        ASSERT(strlen(json_get_str(json_get(&reply.data,
+                                            "work_receipt_root"))) == 64);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_status_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "review_verdict")),
+                      "approve") == 0);
+        status_proof = json_get(&reply.data, "proof");
+        ASSERT(status_proof &&
+               json_get_bool(json_get(status_proof, "facts_available")));
+        ASSERT(json_get_int(json_get(status_proof, "review_receipts")) == 1);
+        ASSERT(json_get_bool(json_get(status_proof, "review_satisfied")));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "next_safe_command")),
+                      "ask user to confirm exact candidate") == 0);
+        ASSERT(zpd_next_is(&reply, "app.presentation.release-confirm",
+                           absolute_root, saved_work_id, NULL));
+        const char *status_confirmation = json_get_str(json_get(
+            &reply.data, "confirmation_identity"));
+        ASSERT(status_confirmation && strlen(status_confirmation) == 64);
+        char status_confirmation_identity[65];
+        (void)snprintf(status_confirmation_identity,
+                       sizeof(status_confirmation_identity), "%s",
+                       status_confirmation);
+        const struct json_value *status_expert =
+            json_get(&reply.data, "expert");
+        const struct json_value *proof_receipt_roots =
+            json_get(status_proof, "receipt_roots");
+        ASSERT(json_get_bool(json_get(status_proof,
+                                      "receipt_roots_available")));
+        ASSERT(proof_receipt_roots &&
+               proof_receipt_roots->type == JSON_ARR &&
+               json_size(proof_receipt_roots) > 0);
+        uint8_t status_receipt_roots[VCS_ZCODE_PROOF_SET_MAX_RECEIPTS][32];
+        size_t status_receipt_count = json_size(proof_receipt_roots);
+        ASSERT(status_receipt_count <= VCS_ZCODE_PROOF_SET_MAX_RECEIPTS);
+        for (size_t i = 0; i < status_receipt_count; i++) {
+            const char *root_text = json_get_str(
+                json_at(proof_receipt_roots, i));
+            ASSERT(root_text && strlen(root_text) == 64);
+            ASSERT(zcl_hex_decode_lower(root_text,
+                                        status_receipt_roots[i], 32));
+            ASSERT(i == 0 || memcmp(status_receipt_roots[i - 1],
+                                    status_receipt_roots[i], 32) < 0);
+        }
+        uint8_t projected_proof_root[32], status_proof_root_bytes[32];
+        ASSERT(vcs_zcode_proof_set_root(
+                   (const uint8_t (*)[32])status_receipt_roots,
+                   status_receipt_count, projected_proof_root) ==
+               VCS_ZCODE_DEV_OK);
+        ASSERT(zcl_hex_decode_lower(json_get_str(json_get(
+                   status_expert, "proof_set_root")),
+                   status_proof_root_bytes, 32));
+        ASSERT(memcmp(projected_proof_root,
+                      status_proof_root_bytes, 32) == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          status_expert, "accepted_work_root")), "") == 0);
+        ASSERT(strlen(json_get_str(json_get(
+                   status_expert, "review_root"))) == 64);
+        const char *status_action = json_get_str(json_get(
+            status_expert, "action_id"));
+        const char *status_task = json_get_str(json_get(
+            status_expert, "task_root"));
+        const char *status_candidate = json_get_str(json_get(
+            status_expert, "candidate_root"));
+        const char *status_policy = json_get_str(json_get(
+            status_expert, "proof_policy_root"));
+        ASSERT(status_action && status_task && status_candidate &&
+               status_policy);
+        char status_action_saved[65], status_task_saved[65];
+        char status_candidate_saved[65], status_policy_saved[65];
+        (void)snprintf(status_action_saved, sizeof(status_action_saved),
+                       "%s", status_action);
+        (void)snprintf(status_task_saved, sizeof(status_task_saved),
+                       "%s", status_task);
+        (void)snprintf(status_candidate_saved,
+                       sizeof(status_candidate_saved), "%s",
+                       status_candidate);
+        (void)snprintf(status_policy_saved, sizeof(status_policy_saved),
+                       "%s", status_policy);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        uint8_t candidate_source_root[32];
+        char candidate_source_hex[65];
+        ASSERT(vcs_tree_capture_path(
+                   saved_candidate_workspace, candidate_source_root) ==
+               VCS_OK);
+        zcl_hex_encode(candidate_source_root, 32, candidate_source_hex);
+        char zbuild_db[4500];
+        (void)snprintf(zbuild_db, sizeof(zbuild_db), "%s/node.db",
+                       zbuild_datadir);
+        struct node_db acceptance_db = {0};
+        ASSERT(node_db_open(&acceptance_db, zbuild_db));
+        struct zcode_accepted_work_status accepted_status;
+        struct build_fabric_proof_evaluation confirmation_facts;
+        ASSERT(build_fabric_proof_evaluate_readonly(
+                   &acceptance_db, root, status_action_saved,
+                   (int64_t)platform_time_wall_unix(),
+                   &confirmation_facts).ok);
+        ASSERT(confirmation_facts.policy_satisfied);
+        uint8_t status_task_root[32], status_candidate_root[32];
+        uint8_t status_policy_root[32], status_proof_root[32];
+        uint8_t confirmation_root[32];
+        ASSERT(zcl_hex_decode_lower(status_task_saved,
+                                    status_task_root, 32));
+        ASSERT(zcl_hex_decode_lower(status_candidate_saved,
+                                    status_candidate_root, 32));
+        ASSERT(zcl_hex_decode_lower(status_policy_saved,
+                                    status_policy_root, 32));
+        ASSERT(zcl_hex_decode_lower(confirmation_facts.proof_set_root_sha3,
+                                    status_proof_root, 32));
+        ASSERT(vcs_zcode_acceptance_plan_root(
+                   status_task_root, status_candidate_root,
+                   status_policy_root, status_proof_root,
+                   confirmation_root) == VCS_ZCODE_DEV_OK);
+        char confirmation_identity[65];
+        zcl_hex_encode(confirmation_root, 32, confirmation_identity);
+        ASSERT(strcmp(confirmation_identity,
+                      status_confirmation_identity) == 0);
+        struct json_value release_confirm_input;
+        json_init(&release_confirm_input);
+        json_set_object(&release_confirm_input);
+        ASSERT(json_push_kv_str(&release_confirm_input, "workspace", root));
+        ASSERT(json_push_kv_str(&release_confirm_input, "work",
+                                saved_work_id));
+        ASSERT(json_push_kv_str(&release_confirm_input, "output", "text"));
+        struct zcl_command_request release_confirm_request = {
+            .input = &release_confirm_input,
+        };
+        struct zcl_command_reply release_confirm_reply;
+        zcl_command_reply_init(
+            &release_confirm_reply,
+            "zcl.app_presentation_release_confirm.v1");
+        zcl_native_handle_presentation_release_confirm(
+            &release_confirm_request, &release_confirm_reply);
+        ASSERT(release_confirm_reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(!json_get_bool(json_get(
+            &release_confirm_reply.data, "launched")));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &release_confirm_reply.data,
+                          "confirmation_identity")),
+                      confirmation_identity) == 0);
+        ASSERT(!json_get_bool(json_get(
+            &release_confirm_reply.data, "candidate_accepted")));
+        ASSERT(!json_get_bool(json_get(
+            &release_confirm_reply.data, "publication_performed")));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &release_confirm_reply.data, "authority")),
+                      "display-only") == 0);
+        ASSERT(release_confirm_reply.next_count == 1);
+        ASSERT(strcmp(release_confirm_reply.next[0].command,
+                      "zcode.work.accept") == 0);
+        struct json_value accept_next;
+        json_init(&accept_next);
+        ASSERT(json_read(
+            &accept_next, release_confirm_reply.next[0].input_json,
+            strlen(release_confirm_reply.next[0].input_json)));
+        ASSERT(strcmp(json_get_str(json_get(&accept_next, "workspace")),
+                      absolute_root) == 0);
+        ASSERT(strcmp(json_get_str(json_get(&accept_next, "work")),
+                      saved_work_id) == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &accept_next, "confirmation_identity")),
+                      confirmation_identity) == 0);
+        ASSERT(json_get(&accept_next, "task_root") == NULL);
+        ASSERT(json_get(&accept_next, "candidate_root") == NULL);
+        ASSERT(json_get(&accept_next, "proof_set_root") == NULL);
+        const struct zcl_command_spec *accept_next_spec =
+            zcl_command_registry_find(
+                zcl_command_catalog(),
+                release_confirm_reply.next[0].command, NULL);
+        char accept_next_why[160] = {0};
+        ASSERT(accept_next_spec && zcl_command_registry_input_validate(
+            accept_next_spec, &accept_next, accept_next_why,
+            sizeof(accept_next_why)));
+        json_free(&accept_next);
+        zcl_command_reply_free(&release_confirm_reply);
+        json_free(&release_confirm_input);
+        struct zcl_result before_accept = zcode_accepted_work_find(
+            &acceptance_db, root, candidate_source_hex,
+            (int64_t)platform_time_wall_unix(), false, &accepted_status);
+        ASSERT(!before_accept.ok);
+        node_db_close(&acceptance_db);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "job_root", confirmation_identity));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_publish_test.v1");
+        zcl_native_handle_zcode_work_publish(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "WORK_NOT_ACCEPTED") == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        char stale_confirmation[65];
+        (void)snprintf(stale_confirmation, sizeof(stale_confirmation), "%s",
+                       confirmation_identity);
+        stale_confirmation[0] = stale_confirmation[0] == '0' ? '1' : '0';
+        ASSERT(json_push_kv_str(&input, "confirmation_identity",
+                                stale_confirmation));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_accept_test.v1");
+        zcl_native_handle_zcode_work_accept(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "CONFIRMATION_IDENTITY_STALE") == 0);
+        zcl_command_reply_free(&reply);
+        json_set_str((struct json_value *)json_get(
+                         &input, "confirmation_identity"),
+                     confirmation_identity);
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        zcl_command_reply_init(&reply, "zcl.zcode_work_accept_test.v1");
+        zcl_native_handle_zcode_work_accept(&request, &reply);
+        zpd_report_work_accept(&reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "PROVEN") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Accepted") == 0);
+        ASSERT(json_get_bool(json_get(
+            &reply.data, "confirmation_identity_checked")));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "confirmation_identity")),
+                      confirmation_identity) == 0);
+        const char *accepted_root_text = json_get_str(json_get(
+            json_get(&reply.data, "expert"), "lane_receipt_root"));
+        ASSERT(accepted_root_text && strlen(accepted_root_text) == 64);
+        ASSERT(strcmp(json_get_str(json_get(
+                          json_get(&reply.data, "expert"),
+                          "accepted_work_root")),
+                      accepted_root_text) == 0);
+        char accepted_root_hex[65];
+        (void)snprintf(accepted_root_hex, sizeof(accepted_root_hex), "%s",
+                       accepted_root_text);
+        const char *publication_workspace_text = json_get_str(json_get(
+            &reply.data, "publication_workspace"));
+        const char *publication_job_text = json_get_str(json_get(
+            &reply.data, "publication_job_root"));
+        const char *accepted_candidate_workspace = json_get_str(json_get(
+            &reply.data, "candidate_workspace"));
+        ASSERT(publication_workspace_text && publication_job_text &&
+               accepted_candidate_workspace);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "publication_status")),
+                      "ACCEPTED_LANE_BOUND") == 0);
+        ASSERT(!json_get_bool(json_get(
+            &reply.data, "publication_reused")));
+        ASSERT(json_get_bool(json_get(
+            &reply.data, "details_available")));
+        ASSERT(strlen(json_get_str(json_get(
+                   &reply.data, "publication_progress_root"))) == 64);
+        char accepted_publication_workspace[4400];
+        char publication_job_hex[65];
+        (void)snprintf(accepted_publication_workspace,
+                       sizeof(accepted_publication_workspace), "%s",
+                       publication_workspace_text);
+        (void)snprintf(publication_job_hex, sizeof(publication_job_hex), "%s",
+                       publication_job_text);
+        char resolved_authority_workspace[4400];
+        ASSERT(platform_directory_canonical_real(
+            root, resolved_authority_workspace,
+            sizeof(resolved_authority_workspace)));
+        ASSERT(reply.next_count == 1);
+        ASSERT(strcmp(reply.next[0].command,
+                      "zcode.work.publish") == 0);
+        struct json_value publication_next;
+        json_init(&publication_next);
+        ASSERT(json_read(&publication_next, reply.next[0].input_json,
+                         strlen(reply.next[0].input_json)));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &publication_next, "workspace")),
+                      resolved_authority_workspace) == 0);
+        ASSERT(zpd_compact_default_continuation(
+            &publication_next, zbuild_datadir, saved_task_root));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &publication_next, "job_root")),
+                      publication_job_hex) == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &publication_next, "work")), saved_work_id) == 0);
+        ASSERT(json_get(&publication_next, "task_root") == NULL);
+        ASSERT(json_get(&publication_next, "candidate_root") == NULL);
+        const struct zcl_command_spec *publication_next_spec =
+            zcl_command_registry_find(
+                zcl_command_catalog(), reply.next[0].command, NULL);
+        char publication_next_why[160] = {0};
+        ASSERT(publication_next_spec && zcl_command_registry_input_validate(
+            publication_next_spec, &publication_next,
+            publication_next_why, sizeof(publication_next_why)));
+        json_free(&publication_next);
+        ASSERT(strcmp(accepted_publication_workspace,
+                      resolved_authority_workspace) == 0);
+        ASSERT(strcmp(accepted_candidate_workspace,
+                      saved_candidate_workspace) == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        ASSERT(vcs_tree_capture_path(root, source_after) == VCS_OK);
+        ASSERT(memcmp(source_before, source_after, sizeof(source_before)) == 0);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "datadir", zbuild_datadir));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_status_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Accepted") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "next_action")),
+                      "Continue publishing this accepted version.") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "next_safe_command")),
+                      "zcode work accept") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "remaining_risks")),
+                      "accepted version is not fully published") == 0);
+        ASSERT(!json_get_bool(json_get(
+            &reply.data, "confirmation_ready")));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "confirmation_effect")),
+                      "none") == 0);
+        ASSERT(zpd_next_datadir_is(
+            &reply, "zcode.work.accept", absolute_root,
+            saved_work_id, zbuild_datadir));
+        struct json_value accepted_next;
+        json_init(&accepted_next);
+        ASSERT(json_read(&accepted_next, reply.next[0].input_json,
+                         strlen(reply.next[0].input_json)));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        request.input = &accepted_next;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_accept_test.v1");
+        zcl_native_handle_zcode_work_accept(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(json_get_bool(json_get(&reply.data, "idempotent")));
+        ASSERT(json_get_bool(json_get(
+            &reply.data, "publication_reused")));
+        ASSERT(reply.next_count == 1);
+        ASSERT(strcmp(reply.next[0].command,
+                      "zcode.work.publish") == 0);
+        struct json_value guided_publication_next;
+        json_init(&guided_publication_next);
+        ASSERT(json_read(&guided_publication_next,
+                         reply.next[0].input_json,
+                         strlen(reply.next[0].input_json)));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &guided_publication_next, "job_root")),
+                      publication_job_hex) == 0);
+        ASSERT(zpd_compact_default_continuation(
+            &guided_publication_next, zbuild_datadir, saved_task_root));
+        ASSERT(json_get(&guided_publication_next, "task_root") == NULL);
+        ASSERT(json_get(&guided_publication_next,
+                        "candidate_root") == NULL);
+        zcl_command_reply_free(&reply);
+        request.input = &guided_publication_next;
+
+        char mismatched_job[65];
+        (void)snprintf(mismatched_job, sizeof(mismatched_job), "%s",
+                       publication_job_hex);
+        mismatched_job[0] = mismatched_job[0] == '0' ? '1' : '0';
+        json_set_str((struct json_value *)json_get(
+            &guided_publication_next, "job_root"), mismatched_job);
+        zcl_command_reply_init(&reply, "zcl.zcode_work_publish_test.v1");
+        zcl_native_handle_zcode_work_publish(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "WORK_PUBLICATION_MISMATCH") == 0);
+        zcl_command_reply_free(&reply);
+        json_set_str((struct json_value *)json_get(
+            &guided_publication_next, "job_root"), publication_job_hex);
+        json_set_str((struct json_value *)json_get(
+            &guided_publication_next, "work"), "work-000000000000");
+        zcl_command_reply_init(&reply, "zcl.zcode_work_publish_test.v1");
+        zcl_native_handle_zcode_work_publish(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "WORK_NOT_ACCEPTED") == 0);
+        zcl_command_reply_free(&reply);
+        json_set_str((struct json_value *)json_get(
+            &guided_publication_next, "work"), saved_work_id);
+        zcl_command_reply_init(
+            &reply, "zcl.zcode_work_publish_test.v1");
+        zcl_native_handle_zcode_work_publish(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "status")),
+                      "PACKAGE_MAPPING_READY") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Publishing") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "next_action")),
+                      "Choose the publisher identity and prepare offline signing.") == 0);
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "next_safe_command")),
+                      "zcode package dev publish plan") == 0);
+        ASSERT(json_get_bool(json_get(
+            &reply.data, "details_available")));
+        ASSERT(json_get(&reply.data, "publication_job_root") == NULL);
+        ASSERT(json_get(&reply.data, "progress_receipt_root") == NULL);
+        ASSERT(json_get(&reply.data, "lane_receipt_root") == NULL);
+        ASSERT(json_get(&reply.data, "proof_set_root") == NULL);
+        ASSERT(json_get(&reply.data, "package_mapping_root") == NULL);
+        ASSERT(json_get(&reply.data, "expert") == NULL);
+        ASSERT(json_get_bool(json_get(&reply.data, "acceptance_reverified")));
+        ASSERT(reply.next_count == 1);
+        ASSERT(strcmp(reply.next[0].command, "discover.schema") == 0);
+        struct json_value publish_schema_input;
+        json_init(&publish_schema_input);
+        ASSERT(json_read(&publish_schema_input, reply.next[0].input_json,
+                         strlen(reply.next[0].input_json)));
+        ASSERT(strcmp(json_get_str(json_get(&publish_schema_input, "path")),
+                      "zcode.package.dev.publish.plan") == 0);
+        const struct zcl_command_spec *publish_schema_spec =
+            zcl_command_registry_find(zcl_command_catalog(),
+                                      reply.next[0].command, NULL);
+        ASSERT(publish_schema_spec && zcl_command_registry_input_validate(
+            publish_schema_spec, &publish_schema_input,
+            publication_next_why, sizeof(publication_next_why)));
+        json_free(&publish_schema_input);
+        zcl_command_reply_free(&reply);
+
+        /* Retry uses the same immutable job and mapping receipt. No source
+         * capture or new application identity is needed by publication. */
+        ASSERT(json_push_kv_bool(&guided_publication_next, "details", true));
+        uint8_t publish_job_root[32], first_progress_root[32];
+        struct vcs_devloop_publication_receipt first_progress;
+        ASSERT(zcl_hex_decode_lower(publication_job_hex, publish_job_root, 32));
+        ASSERT(vcs_devloop_publication_progress_load(
+            root, publish_job_root, &first_progress, first_progress_root));
+        zcl_command_reply_init(&reply, "zcl.zcode_work_publish_test.v1");
+        zcl_native_handle_zcode_work_publish(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "status")),
+                      "PACKAGE_MAPPING_READY") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "publication_job_root")),
+                      publication_job_hex) == 0);
+        ASSERT(json_get_bool(json_get(&reply.data, "receipt_reused")));
+        const struct json_value *publish_expert = json_get(&reply.data, "expert");
+        ASSERT(publish_expert != NULL);
+        char first_progress_hex[65];
+        zcl_hex_encode(first_progress_root, 32, first_progress_hex);
+        ASSERT(strcmp(json_get_str(json_get(publish_expert, "progress_receipt_root")),
+                      first_progress_hex) == 0);
+        ASSERT(strcmp(json_get_str(json_get(publish_expert, "lane_receipt_root")),
+                      accepted_root_hex) == 0);
+        ASSERT(!json_get_bool(json_get(&reply.data, "network_called")));
+        zcl_command_reply_free(&reply);
+        ASSERT(zpd_publication_bad_predecessors(
+            root, &guided_publication_next, &first_progress, first_progress_root));
+#if !defined(_WIN32)
+        ASSERT(zpd_publication_rpc_roundtrip(
+            &accepted_next, &guided_publication_next, zbuild_db, publication_job_hex));
+#endif
+        ASSERT(zpd_custom_ledger_cases(
+            &accepted_next, zbuild_datadir, publication_job_hex));
+        {
+            const struct zcl_command_registry *registry = zcl_command_catalog();
+            const struct zcl_command_spec *spec =
+                zcl_command_registry_find(registry, "zcode.work.publish", NULL);
+            ASSERT(spec != NULL);
+            const char *internal_keys[] = {
+                "path", "kind", "namespace", "transport_root",
+                "include_evidence_wires", "board", "action_id",
+            };
+            for (size_t i = 0;
+                 i < sizeof(internal_keys) / sizeof(internal_keys[0]); i++) {
+                struct json_value invalid;
+                json_init(&invalid);
+                json_copy(&invalid, &guided_publication_next);
+                ASSERT(json_push_kv_str(&invalid, internal_keys[i], "private"));
+                char why[160] = {0};
+                ASSERT(!zcl_command_registry_input_validate(
+                    spec, &invalid, why, sizeof(why)));
+                ASSERT(strstr(why, "unknown input key") != NULL);
+                json_free(&invalid);
+            }
+            struct zcl_command_context context = {
+                .registry = registry,
+                .source_root = root,
+                .granted_capabilities = spec->required_capabilities,
+                .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+                .dev_build = false,
+            };
+            json_set_bool((struct json_value *)json_get(
+                &guided_publication_next, "details"), false);
+            char rendered[ZCL_COMMAND_RESULT_BUDGET + 1u];
+            enum zcl_command_exit exit_code;
+            size_t len = zcl_command_registry_execute_json(
+                registry, spec, &context, &guided_publication_next,
+                false, spec->path, "normal", 0, 0, NULL,
+                rendered, sizeof(rendered), &exit_code);
+            ASSERT(len > 0 && len <= ZCL_COMMAND_RESULT_BUDGET);
+            ASSERT(exit_code == ZCL_COMMAND_EXIT_OK);
+            struct json_value envelope;
+            json_init(&envelope);
+            ASSERT(json_read(&envelope, rendered, len));
+            ASSERT(json_get_bool(json_get(&envelope, "ok")));
+            const struct json_value *next = json_get(&envelope, "next");
+            ASSERT(json_size(next) == 1);
+            for (size_t i = 0; i < json_size(next); i++)
+                ASSERT(strcmp(json_get_str(json_get(json_at(next, i), "command")),
+                              spec->path) != 0);
+            ASSERT(strcmp(json_get_str(json_get(json_at(next, 0), "command")),
+                          "discover.schema") == 0);
+            ASSERT(json_get(json_get(&envelope, "data"), "expert") == NULL);
+            json_free(&envelope);
+            context.authority_ceiling = ZCL_COMMAND_AUTH_OPERATOR;
+            len = zcl_command_registry_execute_json(
+                registry, spec, &context, &guided_publication_next,
+                false, spec->path, "normal", 0, 0, NULL,
+                rendered, sizeof(rendered), &exit_code);
+            ASSERT(len > 0);
+            ASSERT(exit_code == ZCL_COMMAND_EXIT_DENIED);
+            ASSERT(strstr(rendered, "AUTHORITY_DENIED") != NULL);
+        }
+        json_free(&guided_publication_next);
+        json_free(&accepted_next);
+
+        ASSERT(node_db_open(&acceptance_db, zbuild_db));
+        struct zcl_result accepted_found = zcode_accepted_work_find(
+            &acceptance_db, root, candidate_source_hex,
+            (int64_t)platform_time_wall_unix(), false, &accepted_status);
+        ASSERT(accepted_found.ok);
+        char resolved_acceptance_hex[65];
+        zcl_hex_encode(accepted_status.accepted.accepted_work_root, 32,
+                       resolved_acceptance_hex);
+        ASSERT(strcmp(resolved_acceptance_hex, accepted_root_hex) == 0);
+
+        failures += zpd_exact_acceptance_checks(&acceptance_db, root,
+            candidate_source_hex, accepted_root_hex, zbuild_datadir, &accepted_status);
+        const struct zcode_accepted_work_status exact_accepted = accepted_status;
+
+        char accepted_worker_id[65];
+        (void)snprintf(accepted_worker_id, sizeof(accepted_worker_id), "%s",
+                       accepted_status.worker_id);
+        ASSERT(build_fabric_worker_revoke(
+                   &acceptance_db, accepted_worker_id,
+                   (int64_t)platform_time_wall_unix()).ok);
+        ASSERT(zpd_exact_acceptance_refuses(&acceptance_db, root,
+            &exact_accepted, -1, (int64_t)platform_time_wall_unix()));
+        ASSERT(!zcode_accepted_work_find(
+                    &acceptance_db, root, candidate_source_hex,
+                    (int64_t)platform_time_wall_unix(), false,
+                    &accepted_status).ok);
+        struct db_build_worker accepted_worker;
+        ASSERT(db_build_worker_find(
+            &acceptance_db, accepted_worker_id, &accepted_worker));
+        ASSERT(build_fabric_worker_approve(
+                   &acceptance_db, &accepted_worker,
+                   (int64_t)platform_time_wall_unix()).ok);
+
+        ASSERT(node_db_exec(&acceptance_db,
+            "UPDATE zcode_lane_receipts SET task_root_sha3="
+            "'0101010101010101010101010101010101010101010101010101010101010101' "
+            "WHERE lane=2"));
+        ASSERT(zpd_exact_acceptance_refuses(&acceptance_db, root,
+            &exact_accepted, -1, (int64_t)platform_time_wall_unix()));
+        ASSERT(!zcode_accepted_work_find(
+                    &acceptance_db, root, candidate_source_hex,
+                    (int64_t)platform_time_wall_unix(), false,
+                    &accepted_status).ok);
+        ASSERT(node_db_exec(
+            &acceptance_db, "DELETE FROM zcode_lane_receipts"));
+        ASSERT(zpd_exact_acceptance_refuses(&acceptance_db, root,
+            &exact_accepted, -1, (int64_t)platform_time_wall_unix()));
+        ASSERT(!zcode_accepted_work_find(
+                    &acceptance_db, root, candidate_source_hex,
+                    (int64_t)platform_time_wall_unix(), false,
+                    &accepted_status).ok);
+        ASSERT(zcode_accepted_work_find(
+                   &acceptance_db, root, candidate_source_hex,
+                   (int64_t)platform_time_wall_unix(), true,
+                   &accepted_status).ok);
+        ASSERT(accepted_status.projection_rebuilt);
+        zcl_hex_encode(accepted_status.accepted.accepted_work_root, 32,
+                       resolved_acceptance_hex);
+        ASSERT(strcmp(resolved_acceptance_hex, accepted_root_hex) == 0);
+        node_db_close(&acceptance_db);
+        ASSERT(node_db_open(&acceptance_db, zbuild_db));
+        ASSERT(zcode_accepted_work_find(
+                   &acceptance_db, root, candidate_source_hex,
+                   (int64_t)platform_time_wall_unix(), false,
+                   &accepted_status).ok);
+        zcl_hex_encode(accepted_status.accepted.accepted_work_root, 32,
+                       resolved_acceptance_hex);
+        ASSERT(strcmp(resolved_acceptance_hex, accepted_root_hex) == 0);
+        node_db_close(&acceptance_db);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "job_root", publication_job_hex));
+        ASSERT(json_push_kv_str(&input, "datadir", zbuild_datadir));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        struct zcl_command_context publication_context = {
+            .source_root = accepted_publication_workspace,
+            .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+            .dev_build = true,
+        };
+        request = (struct zcl_command_request) {
+            .context = &publication_context, .input = &input,
+        };
+        zcl_command_reply_init(
+            &reply, "zcl.dev_publication_advance_test.v1");
+        zcl_native_handle_dev_publication_advance(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "status")),
+                      "PACKAGE_MAPPING_READY") == 0);
+        ASSERT(json_get_bool(json_get(
+            &reply.data, "acceptance_reverified")));
+        ASSERT(strcmp(json_get_str(json_get(
+                          &reply.data, "lane_receipt_root")),
+                      accepted_root_hex) == 0);
+        const char *mapping_text = json_get_str(json_get(
+            &reply.data, "package_mapping_root"));
+        ASSERT(mapping_text && strlen(mapping_text) == 64);
+        uint8_t mapping_root[32];
+        ASSERT(zcl_hex_decode_lower(mapping_text, mapping_root, 32));
+        struct vcs_package_mapping_set mapping;
+        ASSERT(vcs_package_mapping_set_load(
+            accepted_publication_workspace, mapping_root, &mapping));
+        ASSERT(memcmp(mapping.lane_receipt_root,
+                      accepted_status.accepted.accepted_work_root, 32) == 0);
+        vcs_package_mapping_set_free(&mapping);
+        zcl_command_reply_free(&reply); json_free(&input);
+        ASSERT(vcs_tree_capture_path(root, source_after) == VCS_OK);
+        ASSERT(memcmp(source_before, source_after, 32) == 0);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_accept_test.v1");
+        zcl_native_handle_zcode_work_accept(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "PROVEN") == 0);
+        ASSERT(json_get_bool(json_get(&reply.data, "idempotent")));
+        ASSERT(json_get_bool(json_get(
+            &reply.data, "publication_reused")));
+        ASSERT(json_get(&reply.data, "publication_job_root") == NULL);
+        ASSERT(json_get(&reply.data, "publication_progress_root") == NULL);
+        ASSERT(json_get(&reply.data, "expert") == NULL);
+        ASSERT(json_get_bool(json_get(&reply.data, "details_available")));
+        ASSERT(reply.next_count == 1);
+        ASSERT(strcmp(reply.next[0].command,
+                      "zcode.work.publish") == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        {
+            const struct zcl_command_registry *registry =
+                zcl_command_catalog();
+            const struct zcl_command_spec *spec =
+                zcl_command_registry_find(
+                    registry, "zcode.work.preflight", NULL);
+            struct zcl_command_context command_context = {
+                .registry = registry,
+                .granted_capabilities = ~(uint64_t)0,
+                .authority_ceiling = ZCL_COMMAND_AUTH_OWNER,
+            };
+            char rendered[ZCL_COMMAND_RESULT_BUDGET + 1u];
+            enum zcl_command_exit exit_code = ZCL_COMMAND_EXIT_OK;
+            ASSERT(spec != NULL);
+            size_t rendered_bytes = zcl_command_registry_execute_json(
+                registry, spec, &command_context, &input, false, spec->path,
+                "normal", 0, 0, NULL, rendered, sizeof(rendered),
+                &exit_code);
+            ASSERT(rendered_bytes > 0);
+            ASSERT(exit_code == ZCL_COMMAND_EXIT_OK);
+            struct json_value envelope;
+            json_init(&envelope);
+            ASSERT(json_read(&envelope, rendered, rendered_bytes));
+            const struct json_value *data = json_get(&envelope, "data");
+            const struct json_value *checks = json_get(data, "checks");
+            const struct json_value *packet = json_get(checks, "packet");
+            const struct json_value *sandbox = json_get(
+                checks, "filesystem_sandbox");
+            ASSERT(strcmp(json_get_str(json_get(&envelope, "data_schema")),
+                          "zcl.zcode_work_preflight.v1") == 0);
+            ASSERT(!json_get_bool(json_get(
+                data, "model_request_attempted")));
+            ASSERT(packet && json_get_bool(json_get(packet, "ready")));
+            ASSERT(json_get_int(json_get(packet, "bytes")) > 0);
+            ASSERT(sandbox && !json_get_bool(json_get(
+                sandbox, "model_request_attempted")));
+            ASSERT(strcmp(json_get_str(json_get(data, "blocker")),
+                          json_get_str(json_get(data, "error_code"))) == 0);
+            ASSERT(json_get_str(json_get(data, "current_state"))[0]);
+            ASSERT(json_get_str(json_get(data, "next_action"))[0]);
+            json_free(&envelope);
+        }
+        json_free(&input);
+
+        ASSERT(zpd_preflight_input_types(root, saved_work_id));
+        ASSERT(unlink(zbuild_db) == 0);
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_status_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "PROVEN") == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "codex"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "ADAPTER_UNAVAILABLE") == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", saved_work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "shell"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_work_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "ADAPTER_REFUSED") == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        char session_root[4400];
+        (void)snprintf(session_root, sizeof(session_root), "%s",
+                       saved_candidate_workspace);
+        char *attempt = strrchr(session_root, '/');
+        ASSERT(attempt != NULL);
+        *attempt = '\0';
+        ASSERT(zcl_tree_remove(session_root).ok);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static __attribute__((unused)) int zpd_test_standard_profile(void)
+{
+    int failures = 0;
+    TEST("zcode work standard: warning-fatal sanitizer evidence reaches acceptance") {
+        char root[256];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-standard-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Make x return two"));
+        ASSERT(json_push_kv_str(&input, "profile", "standard"));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_standard_start_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        char work_id[32];
+        (void)snprintf(work_id, sizeof(work_id), "%s",
+                       json_get_str(json_get(&reply.data, "work_id")));
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_standard_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        if (reply.status != ZCL_COMMAND_STATUS_PASSED)
+            fprintf(stderr, "standard admission failed: %s: %s\n",
+                    reply.error.code, reply.error.message);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        char candidate[4400];
+        (void)snprintf(candidate, sizeof(candidate), "%s",
+                       json_get_str(json_get(&reply.data,
+                                             "candidate_workspace")));
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        char source[4500];
+        (void)snprintf(source, sizeof(source), "%s/src/x.c", candidate);
+        ASSERT(zpd_write(source, "int x(void) { return 2; }\n"));
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_standard_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        if (reply.status != ZCL_COMMAND_STATUS_PASSED)
+            fprintf(stderr, "standard execution failed: %s: %s\n",
+                    reply.error.code, reply.error.message);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(json_get_int(json_get(&reply.data,
+                                     "compile_receipts")) == 2);
+        ASSERT(json_get_int(json_get(&reply.data,
+                                     "test_receipts")) == 2);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data,
+                                            "sanitizer_result")),
+                      "passed_asan_ubsan") == 0);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", work_id));
+        ASSERT(json_push_kv_bool(&input, "details", true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_standard_status_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data,
+                                            "sanitizer_result")),
+                      "passed_asan_ubsan") == 0);
+        const struct json_value *standard_proof =
+            json_get(&reply.data, "proof");
+        ASSERT(standard_proof && json_get_bool(json_get(
+            standard_proof, "sanitizer_satisfied")));
+        ASSERT(json_get_int(json_get(
+            standard_proof, "sanitizer_receipts")) == 2);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", work_id));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_standard_accept_test.v1");
+        zcl_native_handle_zcode_work_accept(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "PROVEN") == 0);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        char session_root[4400];
+        (void)snprintf(session_root, sizeof(session_root), "%s", candidate);
+        char *attempt = strrchr(session_root, '/');
+        ASSERT(attempt != NULL);
+        *attempt = '\0';
+        char ledger[4500];
+        (void)snprintf(ledger, sizeof(ledger), "%s/zbuild/node.db",
+                       session_root);
+        ASSERT(unlink(ledger) == 0);
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", work_id));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_standard_status_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "PROVEN") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data,
+                                            "sanitizer_result")),
+                      "unknown") == 0);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        ASSERT(zcl_tree_remove(session_root).ok);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_test_admitted_single_interpretation(void)
+{
+    int failures = 0;
+    TEST("zcode work: one admitted candidate reads identically from run and status") {
+        char root[256];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-admitted-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        char absolute_root[4400];
+        ASSERT(platform_directory_canonical_real(
+            root, absolute_root, sizeof(absolute_root)));
+        char datadir[256];
+        (void)snprintf(datadir, sizeof(datadir),
+                       "test-tmp/zcode-admitted-node-%ld", (long)getpid());
+        ZCL_IGNORE_RESULT(zcl_tree_remove(datadir), "datadir fixture reset");
+        ASSERT(platform_directory_create(datadir, 0700) == 0);
+        char absolute_datadir[4400];
+        ASSERT(platform_directory_canonical_real(
+            datadir, absolute_datadir, sizeof(absolute_datadir)));
+
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Fix x"));
+        ASSERT(json_push_kv_str(&input, "profile", "quick"));
+        ASSERT(json_push_kv_str(&input, "datadir", datadir));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_admitted_start_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        char work_id[32];
+        (void)snprintf(work_id, sizeof(work_id), "%s",
+                       json_get_str(json_get(&reply.data, "work_id")));
+        ASSERT(zpd_next_datadir_is(&reply, "zcode.work.run", absolute_root,
+                                    work_id, absolute_datadir));
+        char continuation[sizeof(reply.next[0].input_json)];
+        (void)snprintf(continuation, sizeof(continuation), "%s",
+                       reply.next[0].input_json);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        json_init(&input);
+        ASSERT(json_read(&input, continuation, strlen(continuation)));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_admitted_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(zpd_next_datadir_is(&reply, "zcode.work.status", absolute_root,
+                                    work_id, absolute_datadir));
+        char candidate[4400];
+        (void)snprintf(candidate, sizeof(candidate), "%s",
+                       json_get_str(json_get(&reply.data,
+                                             "candidate_workspace")));
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        char source[4500];
+        (void)snprintf(source, sizeof(source), "%s/src/x.c", candidate);
+        ASSERT(zpd_write(source, "int x(void) { return 2; }\n"));
+
+        /* Live admission: the named datadir owns the immutable action and
+         * the outstanding REQUESTED proof chain; no receipt exists yet. */
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        ASSERT(json_push_kv_str(&input, "datadir", datadir));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_admitted_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        if (reply.status != ZCL_COMMAND_STATUS_PASSED)
+            printf("admitted async admission failed: %s: %s\n",
+                   reply.error.code, reply.error.message);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "CANDIDATE_ADMITTED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "build_result")),
+                      "background_pending") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data,
+                                            "async_proof_state")),
+                      "REQUESTED") == 0);
+        ASSERT(zpd_next_datadir_is(&reply, "zcode.work.status", absolute_root,
+                                    work_id, absolute_datadir));
+        (void)snprintf(continuation, sizeof(continuation), "%s",
+                       reply.next[0].input_json);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        /* Regression: repeating run on the same admitted fact used to fail
+         * CANDIDATE_EXECUTION_INCOMPLETE while status called the same fact
+         * healthy waiting.  One lifecycle fact, one interpretation. */
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        ASSERT(json_push_kv_str(&input, "datadir", datadir));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_admitted_rerun_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "CANDIDATE_ADMITTED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Waiting for independent reproduction") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "build_result")),
+                      "background_pending") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data,
+                                            "async_proof_state")),
+                      "REQUESTED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data,
+                                            "next_safe_command")),
+                      "zcode work status") == 0);
+        ASSERT(zpd_next_datadir_is(&reply, "zcode.work.status", absolute_root,
+                                    work_id, absolute_datadir));
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        /* Follow the emitted continuation without reconstructing its ledger
+         * context: waiting, background build, identical async proof state. */
+        json_init(&input);
+        ASSERT(json_read(&input, continuation, strlen(continuation)));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_admitted_status_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "CANDIDATE_ADMITTED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Waiting for independent reproduction") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "build_result")),
+                      "background_pending") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "test_result")),
+                      "background_pending") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data,
+                                            "async_proof_state")),
+                      "REQUESTED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "next_action")),
+                      "Run zcode work toolchain here and on the proving node; independent compile evidence needs the same capsule_root.") == 0);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+#if !defined(_WIN32)
+        /* The CLI's explicit datadir must reach the same ledger as the JSON
+         * continuation; an implicit process default grants no such scope. */
+        char cli_stage[80];
+        ASSERT(zpd_cli_work_status_stage(root, work_id, datadir, true,
+                                         cli_stage, sizeof(cli_stage)));
+        ASSERT(strcmp(cli_stage, "Waiting for independent reproduction") == 0);
+        ASSERT(zpd_cli_work_status_stage(root, work_id, datadir, false,
+                                         cli_stage, sizeof(cli_stage)));
+        ASSERT(strcmp(cli_stage, "Proof status unknown") == 0);
+#endif
+
+        /* Without the admitting datadir both surfaces stay blind, not
+         * contradictory: status names the missing ledger, and run stays
+         * fail-closed because no supervised proof is visible. */
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", work_id));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_admitted_blind_test.v1");
+        zcl_native_handle_zcode_work_status(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "stage")),
+                      "Proof status unknown") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "state")),
+                      "CANDIDATE_ADMITTED") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "build_result")),
+                      "unknown") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "next_action")),
+                      "No proof ledger reachable here shows this candidate's proof; pass the admitting node's datadir.") == 0);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "work", work_id));
+        ASSERT(json_push_kv_str(&input, "adapter", "manual"));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_admitted_blind_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "CANDIDATE_EXECUTION_INCOMPLETE") == 0);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        char session_root[4400];
+        (void)snprintf(session_root, sizeof(session_root), "%s", candidate);
+        char *attempt = strrchr(session_root, '/');
+        ASSERT(attempt != NULL);
+        *attempt = '\0';
+        ASSERT(zcl_tree_remove(session_root).ok);
+        ASSERT(zcl_tree_remove(datadir).ok);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int zpd_test_work_toolchain(void)
+{
+    int failures = 0;
+    TEST("zcode work toolchain: names capsule and whether this binary can prove") {
+        struct json_value extra;
+        json_init(&extra); json_set_object(&extra);
+        ASSERT(json_push_kv_str(&extra, "unexpected", "1"));
+        struct zcl_command_request request = { .input = &extra };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_toolchain_show.v1");
+        zcl_native_handle_zcode_toolchain_show(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code, "BAD_TOOLCHAIN_SHOW_INPUT") == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&extra);
+
+        request.input = NULL;
+        zcl_command_reply_init(&reply, "zcl.zcode_toolchain_show.v1");
+        zcl_native_handle_zcode_toolchain_show(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        const char *capsule = json_get_str(json_get(&reply.data, "capsule_root"));
+        const char *blocker = json_get_str(json_get(&reply.data, "blocker"));
+        const char *next = json_get_str(json_get(&reply.data, "next_action"));
+        bool present = json_get_bool(json_get(&reply.data, "verifier_present"));
+        bool can_prove = json_get_bool(json_get(&reply.data, "can_prove"));
+        ASSERT(capsule && strlen(capsule) == 64);
+        ASSERT(blocker && (strcmp(blocker, "NONE") == 0 ||
+                           strcmp(blocker, "VERIFIER_MISSING") == 0 ||
+                           strcmp(blocker, "NOT_JOINED") == 0));
+        ASSERT(present == can_prove);
+        ASSERT(strcmp(json_get_str(json_get(&reply.data, "join_flags")),
+                      "-packagehost=1 -buildworker=1") == 0);
+        ASSERT(!json_get_bool(json_get(&reply.data, "joined")));
+        ASSERT(next && strstr(next, "z23 join") != NULL);
+        ASSERT(strstr(next, "-packagehost=1 -buildworker=1") == NULL);
+        if (!present)
+            ASSERT(strcmp(blocker, "VERIFIER_MISSING") == 0);
+        zcl_command_reply_free(&reply);
+        PASS();
+    }
+    TEST("zcode work toolchain: package hosting alone does not prove a "
+         "restart will enable compile work") {
+        const char *argv[] = { "z23", "-packagehost=1" };
+        ParseParameters(2, argv);
+        struct zcl_command_request request = { .input = NULL };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_toolchain_show.v1");
+        zcl_native_handle_zcode_toolchain_show(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(json_get_bool(json_get(&reply.data, "package_hosting")));
+        ASSERT(!json_get_bool(json_get(&reply.data, "joined")));
+        {
+            const char *next =
+                json_get_str(json_get(&reply.data, "next_action"));
+            ASSERT(next && strcmp(next, "z23 join") == 0);
+            ASSERT(strstr(next, "restart") == NULL);
+            ASSERT(strstr(next, "-buildworker=1") == NULL);
+            ASSERT(strcmp(json_get_str(json_get(&reply.data,
+                                                "next_safe_command")),
+                          "join") == 0);
+        }
+        zcl_command_reply_free(&reply);
+        PASS();
+    }
+    TEST("zcode work toolchain: join next names this datadir") {
+        const char *reset[] = { "z23" };
+        ParseParameters(1, reset);
+        char dir[256], abs[4096];
+        test_make_tmpdir(dir, sizeof(dir), "zcode_package_dev",
+                         "toolchain-join-dd");
+        ASSERT(platform_directory_canonical_real(dir, abs, sizeof(abs)));
+        zcl_native_bridge_bind_rpc(abs, 0);
+        struct zcl_command_request request = { .input = NULL };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_toolchain_show.v1");
+        zcl_native_handle_zcode_toolchain_show(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        const char *next = json_get_str(json_get(&reply.data, "next_action"));
+        ASSERT(next && strstr(next, "z23 join") != NULL);
+        ASSERT(strstr(next, "-datadir=") != NULL);
+        ASSERT(strstr(next, abs) != NULL);
+        ASSERT(strstr(next, "-packagehost") == NULL);
+        ASSERT(strstr(next, "-buildworker") == NULL);
+        zcl_command_reply_free(&reply);
+        zcl_native_bridge_bind_rpc("", 0);
+        test_rm_rf(dir);
+        PASS();
+    } _test_next:;
+    {
+        const char *reset[] = { "z23" };
+        ParseParameters(1, reset);
+        zcl_native_bridge_bind_rpc("", 0);
+    }
+    return failures;
+}
+
+static int zpd_test_commons_join_front_doors(void)
+{
+    int failures = 0;
+    TEST("commons join posture is the same on toolchain, offered, and guide") {
+        struct zcl_zcode_join_posture join;
+        ASSERT(zcl_zcode_join_posture_fill(&join));
+        ASSERT(strcmp(join.join_flags, "-packagehost=1 -buildworker=1") == 0);
+        ASSERT(strcmp(join.hosting_requirement,
+                      "run the full node with -packagehost=1 -buildworker=1")
+               == 0);
+        ASSERT(!join.joined);
+        ASSERT(!join.package_hosting);
+        ASSERT(!join.build_worker);
+        ASSERT(join.offline_next_command &&
+               strcmp(join.offline_next_command, "z23 join") == 0);
+
+        struct zcl_command_request request = { .input = NULL };
+        struct zcl_command_reply toolchain;
+        zcl_command_reply_init(&toolchain, "zcl.zcode_toolchain_show.v1");
+        zcl_native_handle_zcode_toolchain_show(&request, &toolchain);
+        ASSERT(toolchain.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&toolchain.data, "join_flags")),
+                      "-packagehost=1 -buildworker=1") == 0);
+        ASSERT(!json_get_bool(json_get(&toolchain.data, "joined")));
+        ASSERT(!json_get_bool(json_get(&toolchain.data, "package_hosting")));
+        ASSERT(!json_get_bool(json_get(&toolchain.data, "build_worker")));
+        {
+            const char *next =
+                json_get_str(json_get(&toolchain.data, "next_action"));
+            ASSERT(next && strcmp(next, "z23 join") == 0);
+            ASSERT(strcmp(json_get_str(json_get(&toolchain.data,
+                                                "next_safe_command")),
+                          "join") == 0);
+        }
+
+        char dd[1024];
+        test_make_tmpdir(dd, sizeof(dd), "zcode_package_dev", "join-offered");
+        struct json_value offered_input;
+        json_init(&offered_input);
+        json_set_object(&offered_input);
+        ASSERT(json_push_kv_str(&offered_input, "datadir", dd));
+        struct zcl_command_request offered_request = {
+            .input = &offered_input
+        };
+        struct zcl_command_reply offered;
+        zcl_command_reply_init(&offered, "zcl.zcode_package_offered.v1");
+        zcl_native_handle_zcode_package_offered(&offered_request, &offered);
+        ASSERT(offered.status == ZCL_COMMAND_STATUS_PASSED);
+        ASSERT(strcmp(json_get_str(json_get(&offered.data, "join_flags")),
+                      "-packagehost=1 -buildworker=1") == 0);
+        ASSERT(!json_get_bool(json_get(&offered.data, "joined")));
+        ASSERT(!json_get_bool(json_get(&offered.data, "package_hosting")));
+        ASSERT(!json_get_bool(json_get(&offered.data, "build_worker")));
+        ASSERT(!json_get_bool(json_get(&offered.data, "live")));
+        {
+            const char *next =
+                json_get_str(json_get(&offered.data, "next_command"));
+            ASSERT(next && strstr(next, "z23 join") != NULL);
+            ASSERT(strstr(next, dd) != NULL);
+            ASSERT(strstr(next, "-packagehost=1 -buildworker=1") == NULL);
+        }
+
+        struct json_value guide_input;
+        json_init(&guide_input);
+        json_set_object(&guide_input);
+        struct zcl_command_request guide_request = { .input = &guide_input };
+        struct zcl_command_reply guide;
+        zcl_command_reply_init(&guide, "zcl.zcode_package_guide.v1");
+        zcl_native_handle_zcode_package_guide(&guide_request, &guide);
+        ASSERT(guide.exit_code == ZCL_COMMAND_EXIT_OK);
+        ASSERT(strcmp(json_get_str(json_get(&guide.data, "join_flags")),
+                      "-packagehost=1 -buildworker=1") == 0);
+        ASSERT(strcmp(json_get_str(json_get(&guide.data,
+                                            "hosting_requirement")),
+                      "run the full node with -packagehost=1 -buildworker=1")
+               == 0);
+        ASSERT(!json_get_bool(json_get(&guide.data, "joined")));
+        ASSERT(!json_get_bool(json_get(&guide.data, "package_hosting")));
+        ASSERT(!json_get_bool(json_get(&guide.data, "build_worker")));
+        ASSERT(strcmp(json_get_str(json_get(&toolchain.data, "join_flags")),
+                      json_get_str(json_get(&offered.data, "join_flags")))
+               == 0);
+        ASSERT(strcmp(json_get_str(json_get(&toolchain.data, "join_flags")),
+                      json_get_str(json_get(&guide.data, "join_flags")))
+               == 0);
+        {
+            static const char datadir[] =
+                "/unused/z23 commons'$(touch SHOULD_NOT_EXIST)\nsecond line";
+            static const char expected[] =
+                "z23 join -datadir='/unused/z23 commons'\\''$(touch "
+                "SHOULD_NOT_EXIST)\nsecond line'";
+            struct json_value input;
+            json_init(&input);
+            json_set_object(&input);
+            ASSERT(json_push_kv_str(&input, "datadir", datadir));
+            struct zcl_command_request request = { .input = &input };
+            struct zcl_command_reply reply;
+            zcl_command_reply_init(&reply, "zcl.zcode_package_offered.v1");
+            zcl_native_handle_zcode_package_offered(&request, &reply);
+            ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+            const char *next = json_get_str(json_get(&reply.data,
+                                                     "next_command"));
+            ASSERT(next && strcmp(next, expected) == 0);
+            zcl_command_reply_free(&reply);
+            json_free(&input);
+        }
+        {
+            enum { DATADIR_LEN = 4393 };
+            char datadir[DATADIR_LEN + 1];
+            memset(datadir, 'a', DATADIR_LEN);
+            datadir[0] = '/';
+            datadir[DATADIR_LEN] = '\0';
+            struct json_value input;
+            json_init(&input);
+            json_set_object(&input);
+            ASSERT(json_push_kv_str(&input, "datadir", datadir));
+            struct zcl_command_request request = { .input = &input };
+            struct zcl_command_reply reply;
+            zcl_command_reply_init(&reply, "zcl.zcode_package_offered.v1");
+            zcl_native_handle_zcode_package_offered(&request, &reply);
+            ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+            const char *next = json_get_str(json_get(&reply.data,
+                                                     "next_command"));
+            static const char prefix[] = "z23 join -datadir='";
+            ASSERT(next && strncmp(next, prefix, sizeof(prefix) - 1u) == 0);
+            ASSERT(memcmp(next + sizeof(prefix) - 1u, datadir,
+                          DATADIR_LEN) == 0);
+            ASSERT(next[sizeof(prefix) - 1u + DATADIR_LEN] == '\'');
+            ASSERT(next[sizeof(prefix) + DATADIR_LEN] == '\0');
+            zcl_command_reply_free(&reply);
+            json_free(&input);
+        }
+        zcl_command_reply_free(&toolchain);
+        zcl_command_reply_free(&offered);
+        json_free(&offered_input);
+        zcl_command_reply_free(&guide);
+        json_free(&guide_input);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool zpd_work_request(struct json_value *input, const char *root,
+                             const char *work_id, bool adapter)
+{
+    json_init(input); json_set_object(input);
+    return json_push_kv_str(input, "workspace", root) &&
+        json_push_kv_str(input, "work", work_id) &&
+        (!adapter || json_push_kv_str(input, "adapter", "manual"));
+}
+
+/* Acceptance belongs to the task author. A candidate that edits a test the
+ * task's recipe names is refused by name at admission, so no proof and no
+ * PROVEN lane can exist for it; a source-only edit is still admitted. */
+static int zpd_test_candidate_cannot_edit_acceptance_tests(void)
+{
+    int failures = 0;
+    TEST("zcode work: a candidate cannot edit the acceptance tests it is judged by") {
+        char root[256];
+        (void)snprintf(root, sizeof(root),
+                       "test-tmp/zcode-acctests-%ld", (long)getpid());
+        ASSERT(zpd_fixture(root, false));
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "workspace", root));
+        ASSERT(json_push_kv_str(&input, "goal", "Fix x"));
+        ASSERT(json_push_kv_str(&input, "profile", "quick"));
+        struct zcl_command_request request = { .input = &input };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.zcode_acctests_start_test.v1");
+        zcl_native_handle_zcode_work_start(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        char work_id[32];
+        (void)snprintf(work_id, sizeof(work_id), "%s",
+                       json_get_str(json_get(&reply.data, "work_id")));
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        ASSERT(zpd_work_request(&input, root, work_id, true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_acctests_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        char candidate[4400];
+        (void)snprintf(candidate, sizeof(candidate), "%s",
+                       json_get_str(json_get(&reply.data,
+                                             "candidate_workspace")));
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        char path[4500];
+        (void)snprintf(path, sizeof(path), "%s/src/x.c", candidate);
+        ASSERT(zpd_write(path, "int x(void) { return 2; }\n"));
+        (void)snprintf(path, sizeof(path), "%s/tests/test.c", candidate);
+        ASSERT(zpd_write(path, "int main(void) { return 0; /* weak */ }\n"));
+        ASSERT(zpd_work_request(&input, root, work_id, true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_acctests_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        if (reply.status == ZCL_COMMAND_STATUS_PASSED ||
+            strcmp(reply.error.code, "CANDIDATE_MODIFIED_ACCEPTANCE_TESTS"))
+            printf("acceptance-test edit: %s: %s\n", reply.error.code,
+                   reply.error.message);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(strcmp(reply.error.code,
+                      "CANDIDATE_MODIFIED_ACCEPTANCE_TESTS") == 0);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        ASSERT(zpd_work_request(&input, root, work_id, false));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_acctests_accept_test.v1");
+        zcl_native_handle_zcode_work_accept(&request, &reply);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        /* Restoring the task's exact test bytes admits the same source
+         * edit: the refusal is about the tests, nothing else. */
+        ASSERT(zpd_write(path, "int main(void) { return 0; }\n"));
+        ASSERT(zpd_work_request(&input, root, work_id, true));
+        request.input = &input;
+        zcl_command_reply_init(&reply, "zcl.zcode_acctests_run_test.v1");
+        zcl_native_handle_zcode_work_run(&request, &reply);
+        if (reply.status != ZCL_COMMAND_STATUS_PASSED)
+            printf("source-only edit: %s: %s\n", reply.error.code,
+                   reply.error.message);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_PASSED);
+        zcl_command_reply_free(&reply); json_free(&input);
+
+        char session_root[4400];
+        (void)snprintf(session_root, sizeof(session_root), "%s", candidate);
+        char *attempt = strrchr(session_root, '/');
+        ASSERT(attempt != NULL);
+        *attempt = '\0';
+        ASSERT(zcl_tree_remove(session_root).ok);
+        zpd_fixture_cleanup(root);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── Umbrella and shards ─────────────────────────────────────────────────
+ *
+ * test_zcode_package_dev is an umbrella (tools/dev/test_group_umbrellas.def).
+ * One table names every sub-suite and the shard that owns it; row order is
+ * the order the umbrella runs them in. Named exactly, the umbrella runs every
+ * row itself, so each consumer of the historic id (make test-full,
+ * t-fast-exact, the macOS package_execution evidence, the focus worker's
+ * --exact re-exec, which still enters here and takes the fork-role branch)
+ * keeps every sub-suite. In a full run, an --only substring, a proof or a
+ * plan expansion it is subsumed and its shards run instead, each its own
+ * catalog group and its own process with its own signing context, its
+ * fixtures under per-pid test-tmp and /tmp roots.
+ *
+ * Owners are balanced by measured wall ([zcode-package-dev-case] ms=, printed
+ * per row by every run): the twelve-task benchmark, work start and the
+ * standard profile are each one indivisible sub-suite and each anchors a
+ * shard. A task's zbuild workspace is host-global by task root, so rows that
+ * start the same goal on the same fixture ("Fix x": work start, package
+ * bounds, single interpretation, acceptance-test edits; the license-choice
+ * goal: both license rows) share one owner and stay serial. Every run --
+ * umbrella or shard -- first proves the partition: the rows are exactly the
+ * sub-suite list written down below, each owned by one shard, every shard
+ * owns a row, and the catalog registers exactly those shards under the
+ * umbrella. */
+#include "test_group_catalog.h"
+#include <time.h>
+
+struct zpd_keys {
+    secp256k1_context *ctx;
+    uint8_t secret[32];
+    uint8_t pubkey[33];
+};
+
+static int zpd_row_base(const struct zpd_keys *k)
+{
+    return zpd_test_base(k->ctx, k->secret, k->pubkey);
+}
+static int zpd_row_control_stores(const struct zpd_keys *k)
+{
+    return zpd_test_control_stores(k->pubkey);
+}
+static int zpd_row_default_chain_id(const struct zpd_keys *k)
+{
+    return zpd_test_default_chain_id(k->pubkey);
+}
+static int zpd_row_exact_file_selection(const struct zpd_keys *k)
+{
+    return zpd_test_exact_file_selection(k->pubkey);
+}
+static int zpd_row_fail_closed(const struct zpd_keys *k)
+{
+    return zpd_test_fail_closed(k->pubkey);
+}
+static int zpd_row_prepare_programs(const struct zpd_keys *k)
+{
+    return zpd_test_prepare_programs(k->pubkey);
+}
+static int zpd_row_project_inspect(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_project_inspect();
+}
+static int zpd_row_project_init(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_project_init();
+}
+static int zpd_row_reuse_plan(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_reuse_plan();
+}
+static int zpd_row_work_start_license_filter(const struct zpd_keys *k)
+{
+    return zpd_test_work_start_license_filter(k->ctx, k->secret, k->pubkey);
+}
+static int zpd_row_work_start_license_lifecycle(const struct zpd_keys *k)
+{
+    return zpd_test_work_start_license_lifecycle(k->ctx, k->secret,
+                                                 k->pubkey);
+}
+static int zpd_row_work_start_package_bounds(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_work_start_package_bounds();
+}
+static int zpd_row_work_toolchain(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_work_toolchain();
+}
+static int zpd_row_commons_join_front_doors(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_commons_join_front_doors();
+}
+static int zpd_row_admitted_single_interpretation(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_admitted_single_interpretation();
+}
+static int zpd_row_candidate_cannot_edit_acceptance_tests(
+    const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_candidate_cannot_edit_acceptance_tests();
+}
+/* The qualified package verifier runs on every supported host. Darwin uses
+ * Seatbelt and rlimits; full isolation remains required. */
+static int zpd_row_work_start(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_work_start();
+}
+static int zpd_row_standard_profile(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_standard_profile();
+}
+static int zpd_row_twelve_task_benchmark(const struct zpd_keys *k)
+{
+    (void)k;
+    return zpd_test_twelve_task_benchmark();
+}
+
+struct zpd_case {
+    const char *name;
+    int (*run)(const struct zpd_keys *k);
+    unsigned shard;
+};
+#define ZPD_CASE(fn, owner) {#fn, fn, owner}
+static const struct zpd_case g_zpd_cases[] = {
+    ZPD_CASE(zpd_row_base, 2),
+    ZPD_CASE(zpd_row_control_stores, 2),
+    ZPD_CASE(zpd_row_default_chain_id, 2),
+    ZPD_CASE(zpd_row_exact_file_selection, 2),
+    ZPD_CASE(zpd_row_fail_closed, 2),
+    ZPD_CASE(zpd_row_prepare_programs, 2),
+    ZPD_CASE(zpd_row_project_inspect, 2),
+    ZPD_CASE(zpd_row_project_init, 2),
+    ZPD_CASE(zpd_row_reuse_plan, 2),
+    ZPD_CASE(zpd_row_work_start_license_filter, 2),
+    ZPD_CASE(zpd_row_work_start_license_lifecycle, 2),
+    ZPD_CASE(zpd_row_work_start_package_bounds, 1),
+    ZPD_CASE(zpd_row_work_toolchain, 2),
+    ZPD_CASE(zpd_row_commons_join_front_doors, 2),
+    ZPD_CASE(zpd_row_admitted_single_interpretation, 1),
+    ZPD_CASE(zpd_row_candidate_cannot_edit_acceptance_tests, 1),
+    ZPD_CASE(zpd_row_work_start, 1),
+    ZPD_CASE(zpd_row_standard_profile, 2),
+    ZPD_CASE(zpd_row_twelve_task_benchmark, 0),
+};
+#undef ZPD_CASE
+#define ZPD_CASE_COUNT (sizeof(g_zpd_cases) / sizeof(g_zpd_cases[0]))
+#define ZPD_SHARD_COUNT 3u
+/* The row filter that selects every row: the umbrella's exact run. */
+#define ZPD_ALL_SHARDS ZPD_SHARD_COUNT
+#define ZPD_UMBRELLA "test_zcode_package_dev"
+
+/* The sub-suites the unsharded group ran, written down independently of the
+ * table: a row dropped from the table, or a sub-suite added to it without an
+ * owner, fails the partition instead of silently going unrun. */
+static const char *const g_zpd_original[] = {
+    "zpd_row_base", "zpd_row_control_stores", "zpd_row_default_chain_id",
+    "zpd_row_exact_file_selection", "zpd_row_fail_closed",
+    "zpd_row_prepare_programs", "zpd_row_project_inspect",
+    "zpd_row_project_init", "zpd_row_reuse_plan",
+    "zpd_row_work_start_license_filter",
+    "zpd_row_work_start_license_lifecycle",
+    "zpd_row_work_start_package_bounds", "zpd_row_work_toolchain",
+    "zpd_row_commons_join_front_doors",
+    "zpd_row_admitted_single_interpretation",
+    "zpd_row_candidate_cannot_edit_acceptance_tests", "zpd_row_work_start",
+    "zpd_row_standard_profile", "zpd_row_twelve_task_benchmark",
+};
+#define ZPD_ORIGINAL_COUNT (sizeof(g_zpd_original) / sizeof(g_zpd_original[0]))
+
+/* Row wall for the balance log only; no assertion reads it. Its clock
+ * variables carry file-unique names: the wall-clock assertion gate taints
+ * identifiers by name across the whole file. */
+static long long zpd_elapsed_ms(const struct timespec *row_started)
+{
+    struct timespec row_ended;
+    if (clock_gettime(CLOCK_MONOTONIC, &row_ended) != 0)
+        return -1;
+    return (long long)(row_ended.tv_sec - row_started->tv_sec) * 1000 +
+           (row_ended.tv_nsec - row_started->tv_nsec) / 1000000;
+}
+
+/* How many rows name `name`. */
+static size_t zpd_owners_of(const char *name)
+{
+    size_t owners = 0;
+    for (size_t i = 0; i < ZPD_CASE_COUNT; i++)
+        if (strcmp(name, g_zpd_cases[i].name) == 0)
+            owners++;
+    return owners;
+}
+
+/* Every row names a real shard, every shard owns a row, and every original
+ * sub-suite is owned exactly once by a table exactly that long. */
+static bool zpd_partition_valid(void)
+{
+    unsigned counts[ZPD_SHARD_COUNT] = {0};
+    bool ok = ZPD_CASE_COUNT == ZPD_ORIGINAL_COUNT;
+    for (size_t i = 0; i < ZPD_CASE_COUNT; i++) {
+        if (g_zpd_cases[i].shard >= ZPD_SHARD_COUNT)
+            ok = false;
+        else
+            counts[g_zpd_cases[i].shard]++;
+    }
+    for (unsigned s = 0; s < ZPD_SHARD_COUNT; s++)
+        if (counts[s] == 0)
+            ok = false;
+    for (size_t k = 0; k < ZPD_ORIGINAL_COUNT; k++)
+        if (zpd_owners_of(g_zpd_original[k]) != 1)
+            ok = false;
+    return ok;
+}
+
+/* The catalog declares this group an umbrella whose registered shards are
+ * exactly test_zcode_package_dev_shard_01..NN. */
+static bool zpd_umbrella_registered(void)
+{
+    if (!zcl_test_group_is_umbrella(ZPD_UMBRELLA) ||
+        zcl_test_group_umbrella_shard_count(ZPD_UMBRELLA) != ZPD_SHARD_COUNT)
+        return false;
+    for (unsigned s = 1; s <= ZPD_SHARD_COUNT; s++) {
+        char id[ZCL_TEST_GROUP_FULL_MAX];
+        (void)snprintf(id, sizeof(id), ZPD_UMBRELLA "_shard_%02u", s);
+        if (!zcl_test_group_is_umbrella_shard(ZPD_UMBRELLA, id))
+            return false;
+    }
+    return true;
+}
+
+static int zpd_partition_check(void)
+{
+    int failures = 0;
+    TEST("shard partition: every sub-suite is owned by exactly one "
+         "registered shard of the umbrella") {
+        ASSERT(zpd_partition_valid());
+        ASSERT(zpd_umbrella_registered());
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The rows `shard` owns, in table order; ZPD_ALL_SHARDS runs every row. */
+static int zpd_run_rows(const struct zpd_keys *keys, unsigned shard)
+{
+    int failures = 0;
+    size_t ran = 0;
+    for (size_t i = 0; i < ZPD_CASE_COUNT; i++) {
+        struct timespec zpd_row_started;
+        if (shard != ZPD_ALL_SHARDS && g_zpd_cases[i].shard != shard)
+            continue;
+        (void)clock_gettime(CLOCK_MONOTONIC, &zpd_row_started);
+        int added = g_zpd_cases[i].run(keys);
+        failures += added;
+        ran++;
+        printf("[zcode-package-dev-case] shard=%u name=%s ms=%lld "
+               "failures=%d\n", g_zpd_cases[i].shard + 1u,
+               g_zpd_cases[i].name, zpd_elapsed_ms(&zpd_row_started),
+               added);
+    }
+    printf("zcode_package_dev: ran %zu of %zu sub-suites (%s), %d failed\n",
+           ran, ZPD_CASE_COUNT,
+           shard == ZPD_ALL_SHARDS ? "umbrella" : "one shard", failures);
+    return failures;
+}
+
+/* One run: the partition, a private signing context, the owned rows. */
+static int zpd_run_shard(unsigned shard)
+{
+    struct zpd_keys keys = {0};
+    int failures = zpd_partition_check();
+    keys.ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN |
+                                        SECP256K1_CONTEXT_VERIFY);
+    keys.secret[31] = 1;
+    if (!keys.ctx || !zpd_pubkey(keys.ctx, keys.secret, keys.pubkey)) {
+        if (keys.ctx) secp256k1_context_destroy(keys.ctx);
+        return failures + 1;
+    }
+    failures += zpd_run_rows(&keys, shard);
+    secp256k1_context_destroy(keys.ctx);
+    return failures;
+}
+
+#if !defined(_WIN32)
+/* The registered shards below are already proven independent: each owns a
+ * disjoint slice of the row table, keys its own fixture paths by its own
+ * pid (test_fmt_tmpdir), and the shard table exists precisely so CI can run
+ * them as separate processes. Calling the umbrella by its bare name ran
+ * every shard back to back in one process, so its wall time was the SUM of
+ * all three instead of the MAX of one. Fork one child per shard here so
+ * `ONLY=test_zcode_package_dev` pays for the slowest shard, not all three
+ * in series; test_zcode_package_dev_shard_01..03 (used by any caller that
+ * already runs shards as separate processes) are untouched. */
+static int zpd_run_umbrella_parallel(void)
+{
+    /* Flush whatever this process already buffered on stdout/stderr before
+     * forking, so a prior group's unflushed output in a full run is not
+     * duplicated once per child. */
+    (void)fflush(NULL);
+    pid_t child[ZPD_SHARD_COUNT];
+    for (unsigned s = 0; s < ZPD_SHARD_COUNT; s++) {
+        child[s] = fork();
+        if (child[s] == 0) {
+            int rc = zpd_run_shard(s);
+            (void)fflush(NULL);
+            _exit(rc < 0 ? 1 : (rc > 125 ? 125 : rc));
+        }
+    }
+    int failures = 0;
+    for (unsigned s = 0; s < ZPD_SHARD_COUNT; s++) {
+        int status = 0;
+        if (child[s] < 0 || waitpid(child[s], &status, 0) != child[s] ||
+            !WIFEXITED(status)) {
+            failures++;
+            continue;
+        }
+        failures += WEXITSTATUS(status);
+    }
+    return failures;
+}
+#endif
+
+int test_zcode_package_dev(void)
+{
+    const char *fork_role = getenv("ZCL_TEST_FORK_ROLE");
+    if (fork_role && fork_role[0])
+        return zpd_focus_worker_role(fork_role);
+#if defined(_WIN32)
+    return zpd_run_shard(ZPD_ALL_SHARDS);
+#else
+    return zpd_run_umbrella_parallel();
+#endif
+}
+
+/* The registered shard groups, one per owner in the table above. */
+int test_zcode_package_dev_shard_01(void)
+{
+    return zpd_run_shard(0u);
+}
+
+int test_zcode_package_dev_shard_02(void)
+{
+    return zpd_run_shard(1u);
+}
+
+int test_zcode_package_dev_shard_03(void)
+{
+    return zpd_run_shard(2u);
+}
+
+/* Local-only accepted source and no-clobber publication regression. */
+#include "services/package_local.h"
+#include "platform/private_directory.h"
+#include "platform/private_file.h"
+#include "platform/temp_directory.h"
+#include "vcs/package_store.h"
+#include "vcs/package_transport.h"
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <limits.h>
+#endif
+
+#define LOCAL_CHECK(label, expression) do { \
+    if (!(expression)) { \
+        fprintf(stderr, "package_local: %s failed at line %d\n", label, __LINE__); \
+        ++failures; goto cleanup; \
+    } \
+} while (0)
+
+#if !defined(_WIN32)
+static bool zpd_local_publish_preserves(const char *root)
+{
+    char staging[768], destination[768];
+    (void)snprintf(staging, sizeof(staging), "%s/publication-stage", root);
+    (void)snprintf(destination, sizeof(destination), "%s/publication-destination", root);
+    if (!platform_private_directory_create(staging) ||
+        !platform_private_directory_create(destination)) return false;
+    struct stat before, after;
+    if (lstat(destination, &before) != 0 ||
+        platform_private_directory_publish_no_clobber(staging, destination) ||
+        lstat(destination, &after) != 0 || before.st_ino != after.st_ino ||
+        before.st_dev != after.st_dev) return false;
+    if (!platform_private_directory_remove_empty(destination) ||
+        !platform_private_directory_publish_no_clobber(staging, destination)) return false;
+    return platform_private_path_absent(staging) &&
+        platform_private_directory_remove_empty(destination);
+}
+#endif
+
+int test_package_local(void)
+{
+#if defined(_WIN32)
+    printf("package_local: Windows install lifecycle unavailable\n");
+    return 0;
+#else
+    int failures = 0;
+    char root[PLATFORM_TEMP_PATH_MAX] = {0};
+    char source_dir[768], base[768], private_dir[800], public_zcode[800];
+    char unmarked_base[768], unmarked[800], sentinel[832], zcode[832], marker[864];
+    struct vcs_package_prepared prepared;
+    vcs_package_prepared_init(&prepared);
+    struct package_local_plan *plan = zcl_calloc(1, sizeof(*plan), "test.package.local");
+    struct vcs_package_store *store = NULL;
+    struct vcs_swarm_engine *engine = NULL;
+    struct vcs_package_store *public_before = vcs_package_store_global();
+    uint8_t *release_wire = NULL;
+    size_t release_size = 0;
+    secp256k1_context *ctx = NULL;
+    LOCAL_CHECK("plan allocation", plan);
+    LOCAL_CHECK("private fixture root", platform_temp_directory_create("z23-local-plan-", root, sizeof(root)));
+    char canonical[PATH_MAX];
+    LOCAL_CHECK("canonical fixture root", realpath(root, canonical) && strlen(canonical) < sizeof(root));
+    memcpy(root, canonical, strlen(canonical) + 1);
+    LOCAL_CHECK("existing empty publication destination preserved", zpd_local_publish_preserves(root));
+    (void)snprintf(source_dir, sizeof(source_dir), "%s/source", root);
+    (void)snprintf(base, sizeof(base), "%s/owner", root);
+    (void)snprintf(private_dir, sizeof(private_dir), "%s/local-apps", base);
+    (void)snprintf(public_zcode, sizeof(public_zcode), "%s/zcode", base);
+    (void)snprintf(unmarked_base, sizeof(unmarked_base), "%s/unmarked-owner", root);
+    (void)snprintf(unmarked, sizeof(unmarked), "%s/local-apps", unmarked_base);
+    (void)snprintf(sentinel, sizeof(sentinel), "%s/keep", unmarked);
+    LOCAL_CHECK("source fixture", zpd_fixture(source_dir, false));
+    LOCAL_CHECK("base fixture", platform_private_directory_create(base));
+    LOCAL_CHECK("unmarked base", platform_private_directory_create(unmarked_base));
+    LOCAL_CHECK("unrelated destination", mkdir(unmarked, 0755) == 0 && chmod(unmarked, 0755) == 0);
+    LOCAL_CHECK("unrelated sentinel", zpd_write(sentinel, "preserve me\n"));
+
+    ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    LOCAL_CHECK("signing context", ctx);
+    uint8_t secret[32] = {1}; /* Public deterministic test key; never custody. */
+    struct vcs_package_prepare_options options = {
+        .dir = source_dir, .publisher_sequence = 1,
+        .reward_address = "", .chain_id = "zclassic-main",
+    };
+    LOCAL_CHECK("test public key", zpd_pubkey(ctx, secret, options.publisher_pubkey));
+    char detail[256];
+    LOCAL_CHECK("prepare signed source", vcs_package_prepare(&options, &prepared, detail, sizeof(detail)) == VCS_PACKAGE_PREPARE_OK);
+    LOCAL_CHECK("sign exact release", zpd_signature(ctx, secret, prepared.signing_digest, prepared.release.signature));
+    LOCAL_CHECK("release signature verifies", vcs_package_release_verify(&prepared.release) == VCS_PACKAGE_RELEASE_OK);
+    LOCAL_CHECK("release serialization", vcs_package_release_serialize(&prepared.release, &release_wire, &release_size) == VCS_PACKAGE_RELEASE_OK);
+    struct package_local_source source = {
+        .directory = source_dir, .release_wire = release_wire, .release_size = release_size,
+        .manifest_wire = prepared.manifest_wire, .manifest_size = prepared.manifest_wire_len,
+        .recipe_wire = prepared.recipe_wire, .recipe_size = prepared.recipe_wire_len,
+    };
+    memcpy(source.expected_root, prepared.package_root, 32);
+    source.expected_root[0] ^= 1;
+    LOCAL_CHECK("wrong exact root refused", !package_local_plan(base, &source, 1700000000, plan).ok);
+    LOCAL_CHECK("wrong root creates no destination", platform_private_path_absent(private_dir));
+    source.expected_root[0] ^= 1;
+
+    LOCAL_CHECK("unmarked destination refused", !package_local_plan(unmarked_base, &source, 1700000000, plan).ok);
+    struct stat before;
+    LOCAL_CHECK("unrelated mode preserved", stat(unmarked, &before) == 0 && (before.st_mode & 0777) == 0755);
+    (void)snprintf(zcode, sizeof(zcode), "%s/zcode", unmarked);
+    LOCAL_CHECK("unmarked destination not populated", platform_private_path_absent(zcode));
+    FILE *saved = fopen(sentinel, "rb");
+    char saved_text[32] = {0};
+    bool preserved = saved && fread(saved_text, 1, sizeof(saved_text), saved) == strlen("preserve me\n");
+    if (saved && fclose(saved) != 0) preserved = false;
+    LOCAL_CHECK("unrelated contents preserved", preserved && strcmp(saved_text, "preserve me\n") == 0);
+
+    struct zcl_result admitted = package_local_plan(base, &source, 1700000000, plan);
+    if (!admitted.ok) fprintf(stderr, "package_local admission: %s\n", admitted.message);
+    LOCAL_CHECK("local source admitted", admitted.ok);
+    LOCAL_CHECK("exact root plan", memcmp(plan->lifecycle.plan.target_root, prepared.package_root, 32) == 0);
+    LOCAL_CHECK("private destination selected", strcmp(plan->datadir, private_dir) == 0);
+    LOCAL_CHECK("public datadir untouched", platform_private_path_absent(public_zcode));
+    LOCAL_CHECK("global store unchanged", vcs_package_store_global() == public_before);
+    store = vcs_package_store_open(plan->datadir, vcs_package_store_quota_bytes());
+    LOCAL_CHECK("private store opens", store);
+    struct vcs_package_store_status status;
+    LOCAL_CHECK("source closure present", vcs_package_store_package_status(store, prepared.package_root, &status) && status.complete);
+    LOCAL_CHECK("private store cannot host", !vcs_package_store_network_allowed(store));
+    engine = vcs_swarm_engine_create(store, NULL, NULL, NULL, NULL);
+    LOCAL_CHECK("marked store swarm refused", engine == NULL);
+    vcs_package_store_close(store); store = NULL;
+    LOCAL_CHECK("repeat local plan", package_local_plan(base, &source, 1700000001, plan).ok);
+
+    /* A malformed marker must remain nonhosting and must not be rewritten
+     * into a grant by another local admission. */
+    (void)snprintf(marker, sizeof(marker), "%s/zcode/local-only", private_dir);
+    LOCAL_CHECK("malformed marker fixture", zpd_write(marker, "invalid\n"));
+    LOCAL_CHECK("malformed marker local refusal", !package_local_plan(base, &source, 1700000002, plan).ok);
+    store = vcs_package_store_open(private_dir, vcs_package_store_quota_bytes());
+    LOCAL_CHECK("malformed marker fails closed", store && !vcs_package_store_network_allowed(store));
+    engine = vcs_swarm_engine_create(store, NULL, NULL, NULL, NULL);
+    LOCAL_CHECK("malformed marker swarm refused", engine == NULL);
+cleanup:
+    if (engine) vcs_swarm_engine_free(engine);
+    vcs_package_store_close(store);
+    if (ctx) secp256k1_context_destroy(ctx);
+    free(release_wire);
+    vcs_package_prepared_free(&prepared);
+    free(plan);
+    if (root[0]) {
+        struct zcl_result removed = zcl_tree_remove(root);
+        if (!removed.ok) { fprintf(stderr, "package_local cleanup: %s\n", removed.message); ++failures; }
+    }
+    return failures;
+#endif
+}
+#undef LOCAL_CHECK

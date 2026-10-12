@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "name": "zclassic23/rvmachine",
+  "semver": "0.1.0-dev.1",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "root": "5ed73f266819c98c6ebb871c3c6c3b73ac713e000008251fe2f1f7d92671c218",
+      "name": "zclassic23/base",
+      "semver": "0.1.0-dev.1"
+    },
+    {
+      "root": "1244acdf15f4ce75b953f8a357d63fb8473568d78916f928a3f7810375402ca6",
+      "name": "zclassic23/fdt",
+      "semver": "0.1.0-dev.1"
+    },
+    {
+      "root": "274370b431274f53dec7597e0d6696c7aae7ebed1cba588b2c3872e8cdbd4259",
+      "name": "zclassic23/rvemu",
+      "semver": "0.1.0-dev.1"
+    },
+    {
+      "root": "0fdc418cd5e882c029e9f7a74f94d9c63060a56d0f3d476a034bd449d57ab2f5",
+      "name": "zclassic23/rvplat",
+      "semver": "0.1.0-dev.1"
+    },
+    {
+      "root": "ebbe62ad94efb922b68d8e3d324c5f694a89e3bc96c7f7969c0bc61588ddc534",
+      "name": "zclassic23/rvvirtio",
+      "semver": "0.1.0-dev.1"
+    }
+  ],
+  "capabilities": ["CAP_FS_WRITE"]
+}

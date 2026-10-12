@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "zini/zini",
+  "semver": "0.1.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "root": "22f06857b16c6bce140af7884485cfe431fa90c17f7ef8c794d4caaa7980dfc6",
+      "name": "zmap/zmap",
+      "semver": "0.1.0"
+    }
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zini/zini.h",
+    "src/zini.c",
+    "tests/test_zini.c",
+    "zcode-package.json"
+  ]
+}

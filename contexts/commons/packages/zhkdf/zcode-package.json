@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "zhkdf/zhkdf",
+  "semver": "0.1.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "name": "zsha256/zsha256",
+      "root": "061ca24e84e53d73c0181273c02a53488b31b5300327f95d26a8ee004860cccd",
+      "semver": "0.1.0"
+    }
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zhkdf/zhkdf.h",
+    "src/zhkdf.c",
+    "tests/test_zhkdf.c",
+    "zcode-package.json"
+  ]
+}

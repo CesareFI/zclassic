@@ -1,0 +1,490 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * The closed vocabularies a row is written in, and the one place a name is
+ * turned into a wire value or back.
+ *
+ * Every table here is CLOSED. That is the property the whole store rests
+ * on: a subject nobody declared cannot be stored, so a number in this
+ * ledger always has a unit and a meaning somebody wrote down. A denylist
+ * over a growing vocabulary would be default-permit; these are allowlists,
+ * and an id that is not in one is refused by name.
+ *
+ * The vitals half is not written here at all. It is pasted from
+ * engine/composition/fleet_vitals.def, which is the one declaration of what
+ * a fleet metric is, so this file cannot drift from it: there is no second
+ * copy to forget to update. cognition/modules/codeindex pastes
+ * lib_module_order.def the same way and for the same reason.
+ */
+
+#include "fleetledger/fleet_ledger.h"
+
+#include <string.h>
+
+/* One stable token per status, as a table rather than a switch: this
+ * vocabulary only ever grows, and a switch grew a branch per value. The
+ * static_assert keeps exactly the safety -Wswitch gave — a value appended
+ * to the enum with no row here leaves the array the size it already was,
+ * and the build stops. */
+static const char *const k_status_labels[] = {
+    [ZCL_FLEET_OK]                 = "ok",
+    [ZCL_FLEET_ARGUMENT]           = "ledger_argument",
+    [ZCL_FLEET_IO]                 = "ledger_io",
+    [ZCL_FLEET_MALFORMED]          = "ledger_row_malformed",
+    [ZCL_FLEET_KIND_UNKNOWN]       = "ledger_kind_unknown",
+    [ZCL_FLEET_KIND_NOT_WRITABLE]  = "ledger_kind_not_writable",
+    [ZCL_FLEET_SUBJECT_UNKNOWN]    = "ledger_subject_unknown",
+    [ZCL_FLEET_VITAL_UNKNOWN]      = "vital_unknown",
+    [ZCL_FLEET_PAIR_UNKNOWN]       = "ledger_pair_unknown",
+    [ZCL_FLEET_CHAIN_BROKEN]       = "ledger_chain_broken",
+    [ZCL_FLEET_SIG_INVALID]        = "ledger_sig_invalid",
+    [ZCL_FLEET_PEER_UNPAIRED]      = "ledger_peer_unpaired",
+    [ZCL_FLEET_NOT_OWNER]          = "ledger_not_owner",
+    [ZCL_FLEET_DELEGATION_EXPIRED] = "ledger_delegation_expired",
+    [ZCL_FLEET_SEQUENCE]           = "ledger_sequence",
+    [ZCL_FLEET_WINDOW]             = "ledger_window_exceeded",
+    [ZCL_FLEET_FULL]               = "ledger_full",
+    [ZCL_FLEET_EXPERIMENT_ENUM]    = "experiment_enum",
+    [ZCL_FLEET_ROLE_REFUSED]       = "ledger_role_refused",
+};
+static_assert(sizeof k_status_labels / sizeof k_status_labels[0] ==
+                  (size_t)ZCL_FLEET_ROLE_REFUSED + 1u,
+              "every zcl_fleet_status value needs its own stable token");
+
+const char *zcl_fleet_status_label(enum zcl_fleet_status s)
+{
+    size_t i = (size_t)s;
+    if (i >= sizeof k_status_labels / sizeof k_status_labels[0] ||
+        !k_status_labels[i])
+        return "ledger_argument";
+    return k_status_labels[i];
+}
+
+/* ── kinds ───────────────────────────────────────────────────────────── */
+
+struct kind_row {
+    uint8_t value;
+    const char *name;
+    bool writable;
+};
+
+/* attest and reward are declared and NOT writable. Reserving their wire
+ * values now costs nothing; discovering later that something else took
+ * value 3 costs a migration of chains that are already signed. */
+static const struct kind_row k_kinds[] = {
+    { ZCL_FLEET_KIND_USAGE,      "usage",      true },
+    { ZCL_FLEET_KIND_TASK,       "task",       true },
+    { ZCL_FLEET_KIND_ATTEST,     "attest",     false },
+    { ZCL_FLEET_KIND_REWARD,     "reward",     false },
+    { ZCL_FLEET_KIND_VITALS,     "vitals",     true },
+    { ZCL_FLEET_KIND_EXPERIMENT, "experiment", true },
+};
+
+static const struct kind_row *kind_row(uint8_t kind)
+{
+    for (size_t i = 0; i < sizeof k_kinds / sizeof k_kinds[0]; i++)
+        if (k_kinds[i].value == kind)
+            return &k_kinds[i];
+    return NULL;
+}
+
+const char *zcl_fleet_kind_name(uint8_t kind)
+{
+    const struct kind_row *row = kind_row(kind);
+    return row ? row->name : NULL;
+}
+
+bool zcl_fleet_kind_from_name(const char *name, uint8_t *kind_out)
+{
+    if (!name || !kind_out)
+        return false;
+    for (size_t i = 0; i < sizeof k_kinds / sizeof k_kinds[0]; i++) {
+        if (strcmp(k_kinds[i].name, name) == 0) {
+            *kind_out = k_kinds[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool zcl_fleet_kind_writable(uint8_t kind)
+{
+    const struct kind_row *row = kind_row(kind);
+    return row && row->writable;
+}
+
+/* ── subjects, scoped by kind ────────────────────────────────────────── */
+
+/* Order is identity: an index here is the subject value on the wire and in
+ * every chain already written. Append, never reorder. */
+static const char *const k_providers[] = {
+    "claude-fable", "claude-opus", "claude-sonnet", "claude-haiku",
+    "grok", "glm", "codex", "muse", "mac",
+};
+
+static const char *const k_task_subjects[] = {
+    "quota", "lane", "unit", "train", "proof",
+};
+
+static const char *const k_experiment_subjects[] = {
+    "predict", "result",
+};
+
+/* The vitals catalog, pasted from its one declaration. */
+struct vital_row {
+    const char *id;
+    const char *unit;
+    const char *agg;
+    int64_t cadence_s;
+    const char *why;
+};
+
+static const struct vital_row k_vitals[] = {
+#define FLEET_VITAL(id_, unit_, agg_, cadence_s_, why_) \
+    { id_, unit_, agg_, (int64_t)(cadence_s_), why_ },
+#include "../../../composition/fleet_vitals.def"
+#undef FLEET_VITAL
+};
+
+size_t zcl_fleet_vital_count(void)
+{
+    return sizeof k_vitals / sizeof k_vitals[0];
+}
+
+const char *zcl_fleet_vital_id(uint16_t index)
+{
+    return index < zcl_fleet_vital_count() ? k_vitals[index].id : NULL;
+}
+
+const char *zcl_fleet_vital_unit(uint16_t index)
+{
+    return index < zcl_fleet_vital_count() ? k_vitals[index].unit : NULL;
+}
+
+const char *zcl_fleet_vital_agg(uint16_t index)
+{
+    return index < zcl_fleet_vital_count() ? k_vitals[index].agg : NULL;
+}
+
+int64_t zcl_fleet_vital_cadence_s(uint16_t index)
+{
+    return index < zcl_fleet_vital_count() ? k_vitals[index].cadence_s : -1;
+}
+
+static bool subject_table(uint8_t kind, const char *const **table_out,
+                          size_t *count_out)
+{
+    switch (kind) {
+    case ZCL_FLEET_KIND_USAGE:
+        *table_out = k_providers;
+        *count_out = sizeof k_providers / sizeof k_providers[0];
+        return true;
+    case ZCL_FLEET_KIND_TASK:
+        *table_out = k_task_subjects;
+        *count_out = sizeof k_task_subjects / sizeof k_task_subjects[0];
+        return true;
+    case ZCL_FLEET_KIND_EXPERIMENT:
+        *table_out = k_experiment_subjects;
+        *count_out = sizeof k_experiment_subjects / sizeof k_experiment_subjects[0];
+        return true;
+    default:
+        return false;
+    }
+}
+
+const char *zcl_fleet_subject_name(uint8_t kind, uint16_t subject)
+{
+    if (kind == ZCL_FLEET_KIND_VITALS)
+        return zcl_fleet_vital_id(subject);
+    const char *const *table = NULL;
+    size_t count = 0;
+    if (!subject_table(kind, &table, &count) || subject >= count)
+        return NULL;
+    return table[subject];
+}
+
+bool zcl_fleet_subject_from_name(uint8_t kind, const char *name,
+                                 uint16_t *subject_out)
+{
+    if (!name || !subject_out)
+        return false;
+    if (kind == ZCL_FLEET_KIND_VITALS) {
+        for (size_t i = 0; i < zcl_fleet_vital_count(); i++) {
+            if (strcmp(k_vitals[i].id, name) == 0) {
+                *subject_out = (uint16_t)i;
+                return true;
+            }
+        }
+        return false;
+    }
+    const char *const *table = NULL;
+    size_t count = 0;
+    if (!subject_table(kind, &table, &count))
+        return false;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(table[i], name) == 0) {
+            *subject_out = (uint16_t)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ── pair keys ───────────────────────────────────────────────────────── */
+
+/* Indexed by the enum value, so slot 0 is deliberately absent: key 0 is not
+ * a key, and a caller that forgot to set one gets a refusal rather than the
+ * first entry in a table.
+ *
+ * Meanings worth stating: tokens_in is the whole input side and INCLUDES
+ * cached input; tokens_cached is the cache-read part of it; cost_micro_usd
+ * is the vendor-reported spend in millionths of a dollar. */
+static const char *const k_pair_names[ZCL_FLEET_PAIR_KEY_MAX + 1] = {
+    NULL,
+    "tokens_in", "tokens_out", "tokens_cached", "tokens_reasoning",
+    "wall_ms", "turns", "tool_uses", "cost_micro_usd",
+    "value", "count", "bytes", "limit",
+    "wall_s", "lines_added", "lines_removed", "defects",
+    "task_class", "harness", "outcome", "model", "effort", "executor",
+};
+
+/* The declared merge class of each key, in the same order. `value` is the
+ * one key whose class is not fixed here: under a `vitals` row it is decided
+ * by the metric's own aggregation, which the catalog already states, and a
+ * second declaration in this table could only ever disagree with it. */
+static const uint8_t k_pair_merge[ZCL_FLEET_PAIR_KEY_MAX + 1] = {
+    ZCL_FLEET_MERGE_OWNER_ONLY,  /* 0 is not a key */
+    ZCL_FLEET_MERGE_COUNTER,     /* tokens_in */
+    ZCL_FLEET_MERGE_COUNTER,     /* tokens_out */
+    ZCL_FLEET_MERGE_COUNTER,     /* tokens_cached */
+    ZCL_FLEET_MERGE_COUNTER,     /* tokens_reasoning */
+    ZCL_FLEET_MERGE_COUNTER,     /* wall_ms */
+    ZCL_FLEET_MERGE_COUNTER,     /* turns */
+    ZCL_FLEET_MERGE_COUNTER,     /* tool_uses */
+    ZCL_FLEET_MERGE_COUNTER,     /* cost_micro_usd */
+    ZCL_FLEET_MERGE_OWNER_ONLY,  /* value — resolved per vitals metric */
+    ZCL_FLEET_MERGE_COUNTER,     /* count */
+    ZCL_FLEET_MERGE_COUNTER,     /* bytes */
+    /* A cap is the latest cap the owner declared, never a running total of
+     * every cap ever declared. */
+    ZCL_FLEET_MERGE_LWW,         /* limit */
+    ZCL_FLEET_MERGE_COUNTER,     /* wall_s */
+    ZCL_FLEET_MERGE_COUNTER,     /* lines_added */
+    ZCL_FLEET_MERGE_COUNTER,     /* lines_removed */
+    ZCL_FLEET_MERGE_COUNTER,     /* defects */
+    ZCL_FLEET_MERGE_LWW,         /* task_class */
+    ZCL_FLEET_MERGE_LWW,         /* harness */
+    ZCL_FLEET_MERGE_LWW,         /* outcome */
+    ZCL_FLEET_MERGE_LWW,         /* model */
+    ZCL_FLEET_MERGE_LWW,         /* effort */
+    ZCL_FLEET_MERGE_LWW,         /* executor */
+};
+
+const char *zcl_fleet_merge_name(enum zcl_fleet_merge merge)
+{
+    switch (merge) {
+    case ZCL_FLEET_MERGE_IMMUTABLE:  return "immutable";
+    case ZCL_FLEET_MERGE_COUNTER:    return "counter";
+    case ZCL_FLEET_MERGE_LWW:        return "lww";
+    case ZCL_FLEET_MERGE_OWNER_ONLY: return "owner_only";
+    }
+    return "owner_only";
+}
+
+enum zcl_fleet_merge zcl_fleet_pair_merge(uint8_t kind, uint16_t subject,
+                                          uint8_t key)
+{
+    if (key < 1 || key > ZCL_FLEET_PAIR_KEY_MAX)
+        return ZCL_FLEET_MERGE_OWNER_ONLY;
+    if (kind == ZCL_FLEET_KIND_VITALS && key == ZCL_FLEET_PAIR_VALUE) {
+        const char *agg = zcl_fleet_vital_agg(subject);
+        if (agg && strcmp(agg, "sum") == 0)
+            return ZCL_FLEET_MERGE_COUNTER;
+        /* A gauge is the value AT a moment. Adding two of them produces a
+         * number that measures nothing, so the latest one wins. */
+        return ZCL_FLEET_MERGE_LWW;
+    }
+    return (enum zcl_fleet_merge)k_pair_merge[key];
+}
+
+const char *zcl_fleet_pair_name(uint8_t key)
+{
+    return key >= 1 && key <= ZCL_FLEET_PAIR_KEY_MAX ? k_pair_names[key]
+                                                     : NULL;
+}
+
+bool zcl_fleet_pair_from_name(const char *name, uint8_t *key_out)
+{
+    if (!name || !key_out)
+        return false;
+    for (uint8_t k = 1; k <= ZCL_FLEET_PAIR_KEY_MAX; k++) {
+        if (strcmp(k_pair_names[k], name) == 0) {
+            *key_out = k;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ── experiment enums ────────────────────────────────────────────────── */
+
+struct exp_enum_row {
+    uint8_t value;
+    const char *name;
+    bool stored;
+};
+
+static const struct exp_enum_row k_task_class[] = {
+    { 0, "unknown", false },
+    { 1, "read", true },
+    { 2, "verify", true },
+    { 3, "unit_docs", true },
+    { 4, "unit_c23_one_file", true },
+    { 5, "lane_multi_file", true },
+    { 6, "rebase_land", true },
+    { 7, "diagnose", true },
+    { 8, "land_train", true },
+};
+
+static const struct exp_enum_row k_harness[] = {
+    { 0, "agent-tool", true },
+    { 1, "grok-cli-queue", true },
+    { 2, "opencode-remote", true },
+    { 3, "codex-exec", true },
+    { 4, "manual", true },
+    { 5, "stack-loop", true },
+    { 6, "dev-land", true },
+    { 7, "engine-unit", true },
+};
+
+static const struct exp_enum_row k_outcome[] = {
+    { 0, "unknown", false },
+    { 1, "LAND", true },
+    { 2, "FIX_LAND", true },
+    { 3, "FIX", true },
+    { 4, "HOLD", true },
+    { 5, "READY", true },
+    { 6, "blocked", true },
+    { 7, "timeout", true },
+    { 8, "wrong", true },
+    { 9, "landed", true },
+    { 10, "failed", true },
+};
+
+static const struct exp_enum_row k_model[] = {
+    { 0, "unknown", false },
+    { 1, "opus", true },
+    { 2, "sonnet", true },
+    { 3, "haiku", true },
+    { 4, "grok", true },
+    { 5, "glm", true },
+    { 6, "codex", true },
+};
+
+static const struct exp_enum_row k_effort[] = {
+    { 0, "unknown", false },
+    { 1, "low", true },
+    { 2, "medium", true },
+    { 3, "high", true },
+};
+
+/* Matches exp.sh's EXECUTOR list (tools/exp.sh line 12) member for member.
+ * `unknown` is not a member there either — exp.sh's check_enum refuses any
+ * other name outright, same as here. */
+static const struct exp_enum_row k_executor[] = {
+    { 0, "claude-fable", true },
+    { 1, "claude-opus", true },
+    { 2, "claude-sonnet", true },
+    { 3, "claude-haiku", true },
+    { 4, "grok", true },
+    { 5, "glm", true },
+    { 6, "codex", true },
+    { 7, "muse", true },
+    { 8, "mac", true },
+    { 9, "kimi", true },
+};
+
+static const struct exp_enum_row *exp_table(const char *field, size_t *n)
+{
+    if (!field || !n)
+        return NULL;
+    if (strcmp(field, "task_class") == 0) {
+        *n = sizeof k_task_class / sizeof k_task_class[0];
+        return k_task_class;
+    }
+    if (strcmp(field, "harness") == 0) {
+        *n = sizeof k_harness / sizeof k_harness[0];
+        return k_harness;
+    }
+    if (strcmp(field, "outcome") == 0) {
+        *n = sizeof k_outcome / sizeof k_outcome[0];
+        return k_outcome;
+    }
+    if (strcmp(field, "model") == 0) {
+        *n = sizeof k_model / sizeof k_model[0];
+        return k_model;
+    }
+    if (strcmp(field, "effort") == 0) {
+        *n = sizeof k_effort / sizeof k_effort[0];
+        return k_effort;
+    }
+    if (strcmp(field, "executor") == 0) {
+        *n = sizeof k_executor / sizeof k_executor[0];
+        return k_executor;
+    }
+    return NULL;
+}
+
+bool zcl_fleet_experiment_enum_from_name(const char *field, const char *name,
+                                         uint8_t *out)
+{
+    size_t n = 0;
+    const struct exp_enum_row *t = exp_table(field, &n);
+    if (!t || !name || !out)
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(t[i].name, name) == 0) {
+            *out = t[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *zcl_fleet_experiment_enum_name(const char *field, uint8_t value)
+{
+    size_t n = 0;
+    const struct exp_enum_row *t = exp_table(field, &n);
+    if (!t)
+        return NULL;
+    for (size_t i = 0; i < n; i++)
+        if (t[i].value == value)
+            return t[i].name;
+    return NULL;
+}
+
+bool zcl_fleet_experiment_enum_stored(const char *field, uint8_t value)
+{
+    size_t n = 0;
+    const struct exp_enum_row *t = exp_table(field, &n);
+    if (!t)
+        return false;
+    for (size_t i = 0; i < n; i++)
+        if (t[i].value == value)
+            return t[i].stored;
+    return false;
+}
+
+bool zcl_fleet_experiment_enum_key(uint8_t key)
+{
+    return key == ZCL_FLEET_PAIR_TASK_CLASS || key == ZCL_FLEET_PAIR_HARNESS ||
+           key == ZCL_FLEET_PAIR_OUTCOME || key == ZCL_FLEET_PAIR_MODEL ||
+           key == ZCL_FLEET_PAIR_EFFORT || key == ZCL_FLEET_PAIR_EXECUTOR;
+}
+
+bool zcl_fleet_experiment_enum_pair_ok(uint8_t key, int64_t value)
+{
+    if (value < 0 || value > 255)
+        return false;
+    const char *field = zcl_fleet_pair_name(key);
+    return field && zcl_fleet_experiment_enum_stored(field, (uint8_t)value);
+}

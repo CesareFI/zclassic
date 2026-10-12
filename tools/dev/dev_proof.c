@@ -1,0 +1,12385 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * purpose: Admit exact commit/base pairs from the resident development proof. */
+
+#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+/* nftw()/FTW_DEPTH/FTW_PHYS (the orphan-generation recursive delete) are an
+ * XSI extension glibc's <ftw.h> gates on this; _DEFAULT_SOURCE above puts
+ * every GNU/BSD extension back regardless, so this widens nothing else. */
+#if !defined(_WIN32) && !defined(_XOPEN_SOURCE)
+#define _XOPEN_SOURCE 700
+#endif
+
+#include "dev_proof.h"
+#include "dependency_links.h"
+#include "dev_proof_budget.h"
+#include "dev_proof_observation.h"
+#include "devloop.h"
+#include "test_group_catalog.h"
+#include "test_group_host_need.h"
+#include "verify_receiver.h"
+
+#include "base/hex.h"
+#include "base/safe_alloc.h"
+#include "base/serialize_le.h"
+#include "codeindex/codeindex.h"
+#include "json/json.h"
+#include "platform/directory_compat.h"
+#include "platform/disk_space.h"
+#include "platform/file_clone.h"
+#include "platform/logical_cpu.h"
+#include "platform/os_proc.h"
+#include "platform/private_directory.h"
+#include "platform/ram_scratch.h"
+#include "platform/time_compat.h"
+#include "util/spawn.h"
+#include "util/clientversion.h"
+#include "base/safe_alloc.h"
+#include "sha3/sha3.h"
+#include "vcs/build_action.h"
+#include "vcs/proof_admission.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#if !defined(_WIN32)
+#include <ftw.h>
+#endif
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#if !defined(_WIN32)
+#include <stdarg.h>
+#include <sys/stat.h>
+#include <sys/file.h>
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* v2 of these three roots: v1 was three domain tags over one file that baked
+ * the absolute checkout path, so no two boxes ever agreed. A v1 root can
+ * never collide with a v2 root, and a receipt carrying v1 roots is refused
+ * by policy version rather than compared (dev_proof_receipt.c). */
+#define PROOF_ENV_DOMAIN "zcl.dev_proof_environment.v2"
+#define PROOF_FLAGS_DOMAIN "zcl.dev_proof_flags.v2"
+/* The local inode/timestamp token is verified against its own source tree;
+ * it is not a portable dependency-graph input. Policy 3 preserves that
+ * separate mutation binding while canonicalising its place in the graph. */
+#define PROOF_BUILD_GRAPH_DOMAIN "zcl.dev_proof_build_graph.v3"
+/* The directory the build tells the compiler to record instead of this
+ * checkout: Makefile ZCL_REPRO_ROOT, fed to -ffile-prefix-map. */
+#define PROOF_PLAN_VIRTUAL_ROOT "/zclassic23"
+#define PROOF_PLAN_MAX_BYTES 65536u
+#if defined(__linux__) && defined(__x86_64__)
+#define PROOF_CLANG_DEBIAN_LIB "/lib/x86_64-linux-gnu/libclang-18.so.18"
+#define PROOF_CLANG_ARCH_LIB "/usr/lib/libclang.so.22.1"
+#define PROOF_CLANG_ARCH_LLVM "/usr/lib/libLLVM.so.22.1"
+static const char *proof_clang_runtime_path(void);
+#endif
+
+struct proof_paths {
+    char root[PATH_MAX];
+    char cache[PATH_MAX];
+    char state[PATH_MAX];
+    char receipts[PATH_MAX];
+    char children[PATH_MAX];
+    char logs[PATH_MAX];
+    char requests[PATH_MAX];
+    char attempts[PATH_MAX];
+    char leases[PATH_MAX];
+    char key[132];
+    char receipt[PATH_MAX];
+    char lock[PATH_MAX];
+    char request[PATH_MAX];
+    char lease[PATH_MAX];
+    char queue_lock[PATH_MAX];
+    char failure[PATH_MAX];
+    char changed[PATH_MAX];
+    char bundle_log[PATH_MAX];
+    char prefork_log[PATH_MAX];
+    char test_needs_log[PATH_MAX];
+    char attempt[PATH_MAX];
+    char attempt_token[192];
+    char phases[PATH_MAX];
+    int64_t attempt_worker;
+    char warmstart[PATH_MAX];
+};
+
+/* Warm-start outcome for one generation, carried from generation_prepare()
+ * to the proof worker so the receipt sidecar can say what the build reused.
+ * Cold is always correct; every field here is advisory. `cold_reason` is a
+ * short typed string (never prose), set only on the cold path, so the one
+ * status line a developer reads never has to guess why. */
+struct proof_warmstart {
+    char donor[33];
+    char donor_local[65];
+    uint64_t files_linked;
+    uint64_t bytes_linked;
+    bool armed;
+    char cold_reason[32];
+};
+
+static void proof_why(char *why, size_t why_len, const char *message)
+{
+    if (why && why_len)
+        (void)snprintf(why, why_len, "%s", message ? message : "unknown");
+}
+
+static bool proof_source_id_valid(const char *source)
+{
+    if (!source || strlen(source) != 64) return false;
+    bool nonzero = false;
+    for (size_t i = 0; i < 64; i++) {
+        char c = source[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+        nonzero |= c != '0';
+    }
+    return nonzero;
+}
+
+/* Exact pre-test producer refusals only. Candidate failures, malformed
+ * source identity, cancellation and unknown failures remain distinct. */
+[[maybe_unused]] static bool dp_failure_no_verdict(const char *detail)
+{
+    return detail &&
+        (strcmp(detail, "proof_producer_source_mismatch") == 0 ||
+         strcmp(detail, "proof_producer_source_id_unavailable") == 0);
+}
+
+bool zcl_dev_proof_producer_source_qualified(const char *candidate_source,
+    const char *producer_source, char *why, size_t why_len)
+{
+    const char *reason = NULL;
+    if (!proof_source_id_valid(candidate_source))
+        reason = "proof_candidate_source_id_invalid";
+    else if (!proof_source_id_valid(producer_source))
+        reason = "proof_producer_source_id_unavailable";
+    else if (strcmp(candidate_source, producer_source) != 0)
+        reason = "proof_producer_source_mismatch";
+    if (reason) {
+        fprintf(stderr, "[devproof] producer source qualification refused: %s\n",
+                reason);
+        proof_why(why, why_len, reason);
+        return false;
+    }
+    proof_why(why, why_len, "");
+    return true;
+}
+
+static bool proof_root_nonzero(const uint8_t root[32])
+{
+    uint8_t any = 0;
+    if (!root) return false;
+    for (size_t i = 0; i < 32; i++) any |= root[i];
+    return any != 0;
+}
+
+static const char *proof_dimension_operation(
+    enum zcl_dev_proof_dimension_id dimension)
+{
+    static const char *const operations[ZCL_DEV_PROOF_DIMENSIONS] = {
+        "capability-inventory-generated",
+        "build-only",
+        "lint-full",
+        "test-exact-cache-proof-contracts",
+    };
+    return dimension >= ZCL_DEV_PROOF_GENERATED &&
+        dimension <= ZCL_DEV_PROOF_TEST ? operations[dimension] : NULL;
+}
+
+static void proof_action_hash_text(struct sha3_256_ctx *sha,
+                                   const char *text)
+{
+    uint8_t len_wire[4];
+    size_t len = strlen(text);
+    zcl_write_u32_le(len_wire, (uint32_t)len);
+    sha3_256_write(sha, len_wire, sizeof(len_wire));
+    sha3_256_write(sha, (const uint8_t *)text, len);
+}
+
+/* Everything the child action requires of its inputs. A selector belongs to
+ * the test dimension and to no other, and every one of the four identity
+ * roots must be present: an all-zero root would let two different builds
+ * seal the same action. */
+static bool dp_child_inputs_ok(
+    const struct zcl_dev_proof_child_action_inputs_v1 *inputs,
+    enum zcl_dev_proof_dimension_id dimension, const char *operation,
+    const char *selector, size_t selector_len)
+{
+    return inputs && operation && inputs->source_sha256_hex &&
+           inputs->source_cas_sha3_hex && selector &&
+           inputs->selected != 0 && selector_len <= UINT32_MAX &&
+           (dimension == ZCL_DEV_PROOF_TEST) == (selector_len != 0) &&
+           proof_root_nonzero(inputs->toolchain_capsule_root) &&
+           proof_root_nonzero(inputs->flags_root) &&
+           proof_root_nonzero(inputs->environment_root) &&
+           proof_root_nonzero(inputs->build_graph_root);
+}
+
+static bool dp_child_action_sources(
+    const struct zcl_dev_proof_child_action_inputs_v1 *inputs,
+    struct vcs_build_action_v1 *action)
+{
+    return zcl_hex_decode_lower(inputs->source_sha256_hex,
+                                action->source_sha256, 32) &&
+           zcl_hex_decode_lower(inputs->source_cas_sha3_hex,
+                                action->source_cas_sha3, 32) &&
+           proof_root_nonzero(action->source_sha256) &&
+           proof_root_nonzero(action->source_cas_sha3);
+}
+
+/* The action's input root, over the dimension, the build graph, the count
+ * this child was handed, and the operation and selector it will run. */
+static void dp_child_action_seal(
+    const struct zcl_dev_proof_child_action_inputs_v1 *inputs,
+    enum zcl_dev_proof_dimension_id dimension, const char *operation,
+    const char *selector, struct vcs_build_action_v1 *action)
+{
+    struct sha3_256_ctx input;
+    uint8_t number[4];
+    static const uint8_t domain[] =
+        "zcl.dev_proof_child_action_input.v1";
+    sha3_256_init(&input);
+    sha3_256_write(&input, domain, sizeof(domain));
+    zcl_write_u32_le(number, (uint32_t)dimension);
+    sha3_256_write(&input, number, sizeof(number));
+    sha3_256_write(&input, inputs->build_graph_root, 32);
+    zcl_write_u32_le(number, inputs->selected);
+    sha3_256_write(&input, number, sizeof(number));
+    proof_action_hash_text(&input, operation);
+    proof_action_hash_text(&input, selector);
+    sha3_256_finalize(&input, action->input_root_sha3);
+    memcpy(action->toolchain_capsule_sha3,
+           inputs->toolchain_capsule_root, 32);
+    memcpy(action->flags_sha3, inputs->flags_root, 32);
+    memcpy(action->environment_sha3, inputs->environment_root, 32);
+}
+
+/* The workdir, declared outputs and resource policy this action kind
+ * carries, taken from the one place that defines them. */
+static bool dp_child_action_descriptors(struct vcs_build_action_v1 *action)
+{
+    const char *workdir = NULL, *output = NULL, *resource = NULL;
+    if (!vcs_build_action_v1_descriptors(
+            VCS_BUILD_ACTION_KIND_RESIDENT_PROOF_CHILD_V1,
+            &workdir, &output, &resource))
+        return false;
+    (void)snprintf(action->virtual_workdir,
+                   sizeof(action->virtual_workdir), "%s", workdir);
+    (void)snprintf(action->declared_outputs,
+                   sizeof(action->declared_outputs), "%s", output);
+    (void)snprintf(action->resource_policy,
+                   sizeof(action->resource_policy), "%s", resource);
+    return true;
+}
+
+bool zcl_dev_proof_child_action_v1(
+    const struct zcl_dev_proof_child_action_inputs_v1 *inputs,
+    enum zcl_dev_proof_dimension_id dimension,
+    struct vcs_build_action_v1 *action, uint8_t action_root[32])
+{
+    const char *operation = proof_dimension_operation(dimension);
+    const char *selector = inputs ? inputs->selector : NULL;
+    size_t selector_len = selector ? strlen(selector) : 0;
+    if (!action || !action_root ||
+        !dp_child_inputs_ok(inputs, dimension, operation, selector,
+                            selector_len))
+        return false;
+    memset(action, 0, sizeof(*action));
+    if (!dp_child_action_sources(inputs, action)) return false;
+    dp_child_action_seal(inputs, dimension, operation, selector, action);
+    (void)snprintf(action->target, sizeof(action->target), "%s",
+                   VCS_BUILD_TARGET_V1);
+    (void)snprintf(action->profile, sizeof(action->profile),
+                   "resident-proof-child-v1");
+    if (!dp_child_action_descriptors(action)) return false;
+    action->sequence = (uint64_t)dimension + 1u;
+    return vcs_build_action_v1_root_for_kind(
+        VCS_BUILD_ACTION_KIND_RESIDENT_PROOF_CHILD_V1,
+        action, action_root);
+}
+
+/* Same contract as proof_why, for a refusal that can name the exact thing it
+ * refused over. A bare code makes the reader open this file and hand-check a
+ * twenty-entry list; the missing path plus the command that produces it is the
+ * whole diagnosis. */
+#if !defined(_WIN32)
+static void proof_whyf(char *why, size_t why_len, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+static void proof_whyf(char *why, size_t why_len, const char *fmt, ...)
+{
+    if (!why || !why_len)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    (void)vsnprintf(why, why_len, fmt, ap);
+    va_end(ap);
+}
+#endif
+
+static size_t cycle_key_count(const struct json_value *cycle, const char *key,
+                              const struct json_value **value)
+{
+    size_t count = 0;
+    if (value) *value = NULL;
+    if (!cycle || cycle->type != JSON_OBJ || !key) return 0;
+    for (size_t i = 0; i < cycle->num_children; i++) {
+        if (!cycle->keys[i] || strcmp(cycle->keys[i], key) != 0) continue;
+        if (count == 0 && value) *value = &cycle->children[i];
+        count++;
+    }
+    return count;
+}
+
+static bool cycle_field_text_once(const struct json_value *cycle,
+                                  const char *key, const char *expected)
+{
+    const struct json_value *value = NULL;
+    return expected && cycle_key_count(cycle, key, &value) == 1 &&
+           value->type == JSON_STR &&
+           strcmp(json_get_str(value), expected) == 0;
+}
+
+static bool cycle_field_true_once(const struct json_value *cycle,
+                                  const char *key)
+{
+    const struct json_value *value = NULL;
+    return cycle_key_count(cycle, key, &value) == 1 &&
+           value->type == JSON_BOOL && json_get_bool(value);
+}
+
+static bool cycle_root_nonzero(const uint8_t root[ZCL_DEV_PROOF_ROOT_BYTES])
+{
+    uint8_t any = 0;
+    if (!root) return false;
+    for (size_t i = 0; i < ZCL_DEV_PROOF_ROOT_BYTES; i++) any |= root[i];
+    return any != 0;
+}
+
+static const char *cycle_dimension_root_key(size_t id)
+{
+    static const char *const keys[ZCL_DEV_PROOF_DIMENSIONS] = {
+        "proof_generated_root_sha3",
+        "proof_compile_root_sha3",
+        "proof_lint_root_sha3",
+        "proof_test_root_sha3",
+    };
+    return id < ZCL_DEV_PROOF_DIMENSIONS ? keys[id] : NULL;
+}
+
+static bool cycle_dimension_roots_exact(
+    const struct json_value *cycle,
+    const struct zcl_dev_proof_dimension
+        dimensions[ZCL_DEV_PROOF_DIMENSIONS])
+{
+    if (!dimensions) return false;
+    for (size_t i = 0; i < ZCL_DEV_PROOF_DIMENSIONS; i++) {
+        const char *key = cycle_dimension_root_key(i);
+        size_t count = cycle_key_count(cycle, key, NULL);
+        if (dimensions[i].selected == 0) {
+            if (count != 0 || cycle_root_nonzero(dimensions[i].receipt_root))
+                return false;
+            continue;
+        }
+        if (count != 1 ||
+            !cycle_root_nonzero(dimensions[i].receipt_root))
+            return false;
+        char expected[ZCL_DEV_PROOF_ROOT_BYTES * 2u + 1u];
+        zcl_hex_encode(dimensions[i].receipt_root,
+                       ZCL_DEV_PROOF_ROOT_BYTES, expected);
+        if (!cycle_field_text_once(cycle, key, expected)) return false;
+        for (size_t prior = 0; prior < i; prior++) {
+            if (dimensions[prior].selected != 0 &&
+                memcmp(dimensions[prior].receipt_root,
+                       dimensions[i].receipt_root,
+                       ZCL_DEV_PROOF_ROOT_BYTES) == 0)
+                return false;
+        }
+    }
+    return true;
+}
+
+/* Both digests must decode as lowercase hex before any of the body is
+ * parsed: a digest this reader cannot decode can never be compared. */
+static bool dp_cycle_inputs_ok(
+    const char *body, size_t body_len, const char *source_cas,
+    const char *proof_inputs_sha3,
+    const struct zcl_dev_proof_dimension *dimensions)
+{
+    uint8_t root[32];
+    return body && body_len != 0 && source_cas && proof_inputs_sha3 &&
+           dimensions &&
+           zcl_hex_decode_lower(source_cas, root, sizeof(root)) &&
+           zcl_hex_decode_lower(proof_inputs_sha3, root, sizeof(root));
+}
+
+/* Every field the cycle must carry, each exactly once. */
+static bool dp_cycle_fields_admitted(
+    const struct json_value *cycle, const char *source_cas,
+    const char *proof_inputs_sha3,
+    const struct zcl_dev_proof_dimension
+        dimensions[ZCL_DEV_PROOF_DIMENSIONS])
+{
+    return cycle_field_true_once(cycle, "proof_complete") &&
+           cycle_field_text_once(cycle, "schema", "zcl.dev_cycle.v1") &&
+           cycle_field_text_once(cycle, "status", "passed") &&
+           cycle_field_text_once(cycle, "phase", "verify") &&
+           cycle_field_text_once(cycle, "proof_scope",
+                                 "source_wide_compile_tests_lint_fast") &&
+           cycle_field_text_once(cycle, "source_cas_sha3", source_cas) &&
+           cycle_field_text_once(cycle, "proof_inputs_sha3",
+                                 proof_inputs_sha3) &&
+           cycle_dimension_roots_exact(cycle, dimensions);
+}
+
+bool zcl_dev_proof_cycle_reuse_admissible(
+    const char *body, size_t body_len, const char *source_cas,
+    const char *proof_inputs_sha3,
+    const struct zcl_dev_proof_dimension
+        dimensions[ZCL_DEV_PROOF_DIMENSIONS])
+{
+    struct json_value cycle = {0};
+    if (!dp_cycle_inputs_ok(body, body_len, source_cas, proof_inputs_sha3,
+                            dimensions) ||
+        !json_read(&cycle, body, body_len) || cycle.type != JSON_OBJ) {
+        json_free(&cycle);
+        return false;
+    }
+    bool admitted = dp_cycle_fields_admitted(&cycle, source_cas,
+                                             proof_inputs_sha3, dimensions);
+    json_free(&cycle);
+    return admitted;
+}
+
+#if defined(_WIN32)
+
+/* The proof worker currently depends on fork/setsid, descriptor inheritance,
+ * POSIX hard-link/symlink inspection, and process-group termination.  Native
+ * Windows must not approximate those authority boundaries with CRT path
+ * calls or a detached shell.  Keep the typed command available, but refuse
+ * before creating proof state until it is ported onto retained directories
+ * and platform_process Job Objects. */
+static void proof_windows_unavailable(struct zcl_dev_proof_status *out)
+{
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        out->state = ZCL_DEV_PROOF_STATE_INVALID;
+        (void)snprintf(out->detail, sizeof(out->detail), "%s",
+                       "windows_native_proof_worker_unavailable");
+    }
+}
+
+static bool proof_resolve_pair_platform(const char *repo_root,
+                                        const char *requested_local,
+                                        const char *requested_base,
+                                        char local_commit[65],
+                                        char remote_base[65],
+                                        char *why, size_t why_len)
+{
+    (void)repo_root;
+    (void)requested_local;
+    (void)requested_base;
+    if (local_commit) local_commit[0] = 0;
+    if (remote_base) remote_base[0] = 0;
+    proof_why(why, why_len, "windows_native_proof_worker_unavailable");
+    return false;
+}
+
+static bool proof_status_read_platform(const char *repo_root,
+                                       const char *local_commit,
+                                       const char *remote_base,
+                                       struct zcl_dev_proof_status *out)
+{
+    (void)repo_root;
+    (void)local_commit;
+    (void)remote_base;
+    proof_windows_unavailable(out);
+    return true;
+}
+
+static bool proof_ensure_platform(const char *repo_root,
+                                  const char *local_commit,
+                                  const char *remote_base,
+                                  struct zcl_dev_proof_status *out)
+{
+    (void)repo_root;
+    (void)local_commit;
+    (void)remote_base;
+    proof_windows_unavailable(out);
+    return false;
+}
+
+static bool proof_queue_has_pending_platform(const char *repo_root)
+{
+    (void)repo_root;
+    return false;
+}
+
+static bool proof_retry_platform(const char *repo_root,
+                                 const char *local_commit,
+                                 const char *remote_base,
+                                 struct zcl_dev_proof_status *out)
+{
+    return proof_ensure_platform(repo_root, local_commit, remote_base, out);
+}
+
+static int proof_queue_run_next_platform(const char *repo_root,
+                                         char *why, size_t why_len)
+{
+    (void)repo_root;
+    proof_why(why, why_len, "windows_native_proof_worker_unavailable");
+    return -1;
+}
+
+static bool proof_wait_platform(const char *repo_root,
+                                const char *local_commit,
+                                const char *remote_base,
+                                int timeout_ms,
+                                struct zcl_dev_proof_status *out)
+{
+    (void)repo_root;
+    (void)local_commit;
+    (void)remote_base;
+    (void)timeout_ms;
+    proof_windows_unavailable(out);
+    return false;
+}
+
+#else
+
+static bool proof_oid_text(const char *value)
+{
+    uint8_t decoded[ZCL_DEV_PROOF_OID_MAX], len = 0;
+    return zcl_dev_proof_oid_decode(value, decoded, &len);
+}
+
+/* The proof path set is filled in four named steps -- the pair identity and
+ * the canonical checkout root, the state directories under it, the files
+ * named after this exact commit/base pair, and that pair's log files. Every
+ * step refuses on the first truncation, exactly as the single chain it
+ * replaces did, and a step that refuses leaves the later ones unexecuted. */
+static bool dp_paths_root(const char *repo_root, const char *local,
+                          const char *base, struct proof_paths *out)
+{
+    return repo_root && local && base && out && proof_oid_text(local) &&
+           proof_oid_text(base) &&
+           platform_directory_canonical_real(repo_root, out->root,
+                                             sizeof(out->root));
+}
+
+static bool dp_paths_state_dirs(struct proof_paths *out)
+{
+    return snprintf(out->cache, sizeof(out->cache), "%s/.cache",
+                    out->root) < (int)sizeof(out->cache) &&
+           snprintf(out->state, sizeof(out->state), "%s/zcl-dev-proof",
+                    out->cache) < (int)sizeof(out->state) &&
+           snprintf(out->receipts, sizeof(out->receipts), "%s/receipts",
+                    out->state) < (int)sizeof(out->receipts) &&
+           snprintf(out->children, sizeof(out->children), "%s/children",
+                    out->state) < (int)sizeof(out->children) &&
+           snprintf(out->logs, sizeof(out->logs), "%s/logs",
+                    out->state) < (int)sizeof(out->logs) &&
+           snprintf(out->requests, sizeof(out->requests), "%s/requests",
+                    out->state) < (int)sizeof(out->requests) &&
+           snprintf(out->attempts, sizeof(out->attempts), "%s/attempts",
+                    out->state) < (int)sizeof(out->attempts) &&
+           snprintf(out->leases, sizeof(out->leases), "%s/leases",
+                    out->state) < (int)sizeof(out->leases);
+}
+
+static bool dp_paths_pair_files(struct proof_paths *out, const char *local,
+                                const char *base)
+{
+    return snprintf(out->key, sizeof(out->key), "%s-%s", local,
+                    base) < (int)sizeof(out->key) &&
+           snprintf(out->receipt, sizeof(out->receipt), "%s/%s.receipt",
+                    out->receipts, out->key) < (int)sizeof(out->receipt) &&
+           snprintf(out->lock, sizeof(out->lock), "%s/%s.running",
+                    out->state, out->key) < (int)sizeof(out->lock) &&
+           snprintf(out->request, sizeof(out->request), "%s/%s.request",
+                    out->requests, out->key) < (int)sizeof(out->request) &&
+           snprintf(out->lease, sizeof(out->lease), "%s/%s.lease",
+                    out->leases, out->key) < (int)sizeof(out->lease) &&
+           snprintf(out->queue_lock, sizeof(out->queue_lock), "%s/queue.lock",
+                    out->state) < (int)sizeof(out->queue_lock) &&
+           snprintf(out->failure, sizeof(out->failure), "%s/%s.failed",
+                    out->state, out->key) < (int)sizeof(out->failure) &&
+           snprintf(out->changed, sizeof(out->changed), "%s/%s.files",
+                    out->state, out->key) < (int)sizeof(out->changed);
+}
+
+static bool dp_paths_log_files(struct proof_paths *out)
+{
+    return snprintf(out->bundle_log, sizeof(out->bundle_log),
+                    "%s/%s.bundle.log", out->logs,
+                    out->key) < (int)sizeof(out->bundle_log) &&
+           snprintf(out->prefork_log, sizeof(out->prefork_log),
+                    "%s/%s.prefork.log", out->logs,
+                    out->key) < (int)sizeof(out->prefork_log) &&
+           snprintf(out->test_needs_log, sizeof(out->test_needs_log),
+                    "%s/%s.test-needs.log", out->logs,
+                    out->key) < (int)sizeof(out->test_needs_log) &&
+           snprintf(out->phases,sizeof(out->phases), "%s/%s.phases.txt",
+                    out->state, out->key) < (int)sizeof(out->phases) &&
+           snprintf(out->warmstart, sizeof(out->warmstart), "%s/%s.warmstart",
+                    out->state, out->key) < (int)sizeof(out->warmstart);
+}
+
+static bool proof_paths_fill(const char *repo_root, const char *local,
+                             const char *base, struct proof_paths *out)
+{
+    return dp_paths_root(repo_root, local, base, out) &&
+           dp_paths_state_dirs(out) &&
+           dp_paths_pair_files(out, local, base) &&
+           dp_paths_log_files(out);
+}
+
+static bool proof_state_prepare(const struct proof_paths *paths)
+{
+    return paths && platform_private_directory_ensure(paths->cache) &&
+           platform_private_directory_ensure(paths->state) &&
+           platform_private_directory_ensure(paths->receipts) &&
+           platform_private_directory_ensure(paths->children) &&
+           platform_private_directory_ensure(paths->logs) &&
+           platform_private_directory_ensure(paths->requests) &&
+           platform_private_directory_ensure(paths->attempts) &&
+           platform_private_directory_ensure(paths->leases);
+}
+
+static bool process_ok(const struct zcl_devloop_process_result *result)
+{
+    return result && !result->timed_out && !result->output_truncated &&
+           result->term_signal == 0 && result->exit_code == 0;
+}
+
+/* Preserve a process result for the small number of Git reads whose failure
+ * becomes proof evidence.  The ordinary wrappers below keep their compact
+ * Boolean interfaces for the remaining Git queries. */
+static bool git_capture_observed(const char *root, const char *const argv[],
+                                 int timeout_ms, char *out, size_t out_size,
+                                 struct zcl_devloop_process_result *observed)
+{
+    struct zcl_devloop_process_result result = {0};
+    bool ran = root && argv && out && out_size > 0 &&
+               zcl_devloop_process_run(root, argv, timeout_ms, &result);
+    if (observed)
+        *observed = result;
+    if (!ran || !process_ok(&result) || result.output_len >= out_size)
+        return false;
+    size_t len = result.output_len;
+    while (len > 0 && (result.output[len - 1] == '\n' ||
+                       result.output[len - 1] == '\r'))
+        len--;
+    memcpy(out, result.output, len);
+    out[len] = 0;
+    return true;
+}
+
+static bool git_capture_within(const char *root, const char *const argv[],
+                               int timeout_ms, char *out, size_t out_size)
+{
+    return git_capture_observed(root, argv, timeout_ms, out, out_size, NULL);
+}
+
+/* Every git query in this file answers within seconds or is not worth
+ * waiting on. Only the generation reaper's recursive delete needs a budget
+ * of its own, so it names one and everything else keeps the shared bound. */
+static bool git_capture(const char *root, const char *const argv[],
+                        char *out, size_t out_size)
+{
+    return git_capture_within(root, argv, 30000, out, out_size);
+}
+
+static void git_capture_why(const char *operation,
+                            const struct zcl_devloop_process_result *result,
+                            size_t output_capacity, char *why,
+                            size_t why_len)
+{
+    if (!operation || !result || !why || why_len == 0)
+        return;
+    if (result->timed_out) {
+        proof_whyf(why, why_len, "%s_timeout", operation);
+    } else if (result->cancelled) {
+        proof_whyf(why, why_len, "%s_cancelled", operation);
+    } else if (result->term_signal != 0) {
+        proof_whyf(why, why_len, "%s_signal_%d", operation,
+                   result->term_signal);
+    } else if (result->exit_code != 0) {
+        proof_whyf(why, why_len, "%s_exit_%d", operation,
+                   result->exit_code);
+    } else if (result->output_truncated) {
+        proof_whyf(why, why_len, "%s_truncated", operation);
+    } else if (result->output_len >= output_capacity) {
+        proof_whyf(why, why_len, "%s_oversize", operation);
+    } else {
+        proof_whyf(why, why_len, "%s_launch_failed", operation);
+    }
+}
+
+/* One side of the pair: a caller-supplied commit is only checked for shape,
+ * an omitted one is read from git. The two refusal strings differ per side
+ * and per cause, so both are named by the caller rather than derived. */
+static bool dp_resolve_commit(const char *repo_root, const char *requested,
+                              const char *const argv[],
+                              const char *invalid_why,
+                              const char *unavailable_why,
+                              char out[65], char *why, size_t why_len)
+{
+    if (requested && requested[0]) {
+        if (!proof_oid_text(requested)) {
+            proof_why(why, why_len, invalid_why);
+            return false;
+        }
+        (void)snprintf(out, 65, "%s", requested);
+        return true;
+    }
+    if (!git_capture(repo_root, argv, out, 65) || !proof_oid_text(out)) {
+        proof_why(why, why_len, unavailable_why);
+        return false;
+    }
+    return true;
+}
+
+static bool proof_resolve_pair_platform(const char *repo_root,
+                                        const char *requested_local,
+                                        const char *requested_base,
+                                        char local_commit[65],
+                                        char remote_base[65],
+                                        char *why, size_t why_len)
+{
+    if (!repo_root || !local_commit || !remote_base) {
+        proof_why(why, why_len, "proof_pair_input_invalid");
+        return false;
+    }
+    const char *local_argv[] = {"git", "rev-parse", "--verify", "HEAD", NULL};
+    const char *base_argv[] = {"git", "rev-parse", "--verify",
+                               "refs/remotes/origin/main", NULL};
+    if (!dp_resolve_commit(repo_root, requested_local, local_argv,
+                           "local_commit_invalid", "local_commit_unavailable",
+                           local_commit, why, why_len))
+        return false;
+    if (!dp_resolve_commit(repo_root, requested_base, base_argv,
+                           "remote_base_invalid", "origin_main_unavailable",
+                           remote_base, why, why_len))
+        return false;
+    if (why && why_len) why[0] = 0;
+    return true;
+}
+
+/* A shaped OID is not proof that the candidate or base exists locally.
+ * Check both as commit objects before publishing a new request, so an absent
+ * object never occupies a worker slot. Synthetic
+ * queue fixtures in the test binary intentionally use non-repository roots;
+ * only roots carrying their private fixture marker skip the Git check. */
+static bool dp_pair_commit_objects_present(const char *root,
+                                            const char *local,
+                                            const char *base,
+                                            char *why, size_t why_len)
+{
+#if defined(ZCL_TESTING)
+    char fixture[PATH_MAX];
+    int fixture_len = root
+        ? snprintf(fixture, sizeof(fixture), "%s/.cache/fixture", root) : -1;
+    if (fixture_len > 0 && fixture_len < (int)sizeof(fixture) &&
+        access(fixture, F_OK) == 0)
+        return true;
+#endif
+    char kind[32];
+    const char *local_argv[] = {"git", "cat-file", "-t", local, NULL};
+    const char *base_argv[] = {"git", "cat-file", "-t", base, NULL};
+    if (!git_capture(root, local_argv, kind, sizeof(kind)) ||
+        strcmp(kind, "commit") != 0) {
+        proof_why(why, why_len, "local_commit_object_missing");
+        return false;
+    }
+    if (!git_capture(root, base_argv, kind, sizeof(kind)) ||
+        strcmp(kind, "commit") != 0) {
+        proof_why(why, why_len, "remote_base_object_missing");
+        return false;
+    }
+    return true;
+}
+
+static bool read_exact_file(const char *path, uint8_t *out, size_t size)
+{
+    struct stat st;
+    if (!path || !out || lstat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+        S_ISLNK(st.st_mode) || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        st.st_size != (off_t)size)
+        return false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    size_t off = 0;
+    while (off < size) {
+        ssize_t n = read(fd, out + off, size - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); return false; }
+        off += (size_t)n;
+    }
+    uint8_t extra;
+    ssize_t tail = read(fd, &extra, 1);
+    close(fd);
+    return tail == 0;
+}
+
+static bool receipt_load(const struct proof_paths *paths, const char *local,
+                         const char *base,
+                         struct zcl_dev_acceptance_receipt_v1 *out,
+                         char *why, size_t why_len)
+{
+    uint8_t wire[ZCL_DEV_PROOF_WIRE_BYTES];
+    if (!read_exact_file(paths->receipt, wire, sizeof(wire))) {
+        proof_why(why, why_len, "receipt_missing_or_unsafe");
+        return false;
+    }
+    if (!zcl_dev_proof_receipt_parse(wire, sizeof(wire), out)) {
+        proof_why(why, why_len, "receipt_parse_failed");
+        return false;
+    }
+    return zcl_dev_proof_receipt_validate(out, local, base, why, why_len);
+}
+
+static bool proof_read_text(const char *path, char *out, size_t out_size)
+{
+    if (!path || !out || out_size == 0) return false;
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    size_t n = fread(out, 1, out_size - 1, f);
+    bool ok = !ferror(f) && !(!feof(f) && n == out_size - 1) &&
+              memchr(out, '\0', n) == NULL;
+    fclose(f);
+    out[n] = 0;
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+        out[--n] = 0;
+    return ok;
+}
+
+/* One line for `dev proof status`/`dev proof wait` to show beside an
+ * admitted receipt: what the compile step actually reused, or the typed
+ * reason it did not. Reads the sidecar warm_sidecar_write() leaves beside
+ * the receipt (schema "zcl.dev_proof_warmstart.v1", defined next to the
+ * writer further down as PROOF_WARM_SIDECAR_SCHEMA -- duplicated here as a
+ * literal because this reader sits well above that definition in the file
+ * and the project avoids forward declarations). Any I/O or parse failure
+ * -- older receipt, a cycle-reused receipt with no fresh sidecar, a
+ * corrupt file -- leaves `out` untouched so the caller's existing fallback
+ * detail stands; this is display-only and can never affect admission. */
+/* One sidecar line, assigned to whichever of the three fields it names.
+ * An unrecognised key is ignored, as it always was. */
+static void dp_warm_sidecar_field(const char *line, char *warm_flag,
+                                  char donor[33], char reason[32])
+{
+    if (strncmp(line, "warm=", 5) == 0)
+        *warm_flag = line[5];
+    else if (strncmp(line, "donor=", 6) == 0)
+        (void)snprintf(donor, 33, "%s", line + 6);
+    else if (strncmp(line, "reason=", 7) == 0)
+        (void)snprintf(reason, 32, "%s", line + 7);
+}
+
+static bool warm_status_line(const char *warmstart_path, char *out,
+                             size_t out_len)
+{
+    char body[1024];
+    if (!warmstart_path || !out || out_len == 0 ||
+        !proof_read_text(warmstart_path, body, sizeof(body)))
+        return false;
+    char *save = NULL;
+    char *line = strtok_r(body, "\n", &save);
+    if (!line || strcmp(line, "zcl.dev_proof_warmstart.v1") != 0)
+        return false;
+    char warm_flag = 0;
+    char donor[33] = {0}, reason[32] = {0};
+    while ((line = strtok_r(NULL, "\n", &save)))
+        dp_warm_sidecar_field(line, &warm_flag, donor, reason);
+    if (warm_flag == '1' && donor[0] && strcmp(donor, "-") != 0)
+        return snprintf(out, out_len, "warm-start from donor %s", donor) > 0;
+    if (warm_flag == '0')
+        return snprintf(out, out_len, "cold: %s",
+                        reason[0] ? reason : "unknown") > 0;
+    return false;
+}
+
+static bool proof_log_contains(const char *path, const char *needle)
+{
+    if (!path || !needle || !needle[0])
+        return false;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+    char line[1024];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, needle)) {
+            found = true;
+            break;
+        }
+    }
+    bool ok = found && !ferror(f);
+    fclose(f);
+    return ok;
+}
+
+static bool proof_running(const char *path, int64_t *pid_out,
+                          int64_t *started_out)
+{
+    char text[128];
+    long long pid = 0, started = 0;
+    if (!proof_read_text(path, text, sizeof(text)) ||
+        sscanf(text, "%lld %lld", &pid, &started) != 2 || pid <= 1 ||
+        kill((pid_t)pid, 0) != 0)
+        return false;
+    if (pid_out) *pid_out = (int64_t)pid;
+    if (started_out) *started_out = (int64_t)started;
+    return true;
+}
+
+static bool proof_private_regular(const char *path)
+{
+    struct stat st;
+    return path && lstat(path, &st) == 0 && S_ISREG(st.st_mode) &&
+           !S_ISLNK(st.st_mode) && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+static bool proof_lease_read(const char *path, char *token, size_t token_len,
+                             int64_t *pid_out, int64_t *started_out)
+{
+    char text[384], parsed[192];
+    long long pid = 0, started = 0;
+    if (!token || token_len == 0 || !proof_private_regular(path) ||
+        !proof_read_text(path, text, sizeof(text)) ||
+        sscanf(text, "%191s %lld %lld", parsed, &pid, &started) != 3 ||
+        strlen(parsed) >= token_len || pid <= 1 || started <= 0)
+        return false;
+    (void)snprintf(token, token_len, "%s", parsed);
+    if (pid_out) *pid_out = (int64_t)pid;
+    if (started_out) *started_out = (int64_t)started;
+    return true;
+}
+
+static bool proof_lease_running(const char *path, int64_t *pid_out,
+                                int64_t *started_out)
+{
+    char token[192];
+    int64_t pid = 0;
+    if (!proof_lease_read(path, token, sizeof(token), &pid, started_out) ||
+        (kill((pid_t)pid, 0) != 0 && errno != EPERM))
+        return false;
+    if (pid_out) *pid_out = pid;
+    return true;
+}
+
+/* A request file is exactly five lines: the schema, the two commit ids, and
+ * the two clocks. Splitting, shape-checking and clock-parsing are three
+ * separate refusals, so a caller reading this code can see which of the
+ * three a malformed request tripped. */
+static size_t dp_request_split(char *text, char *lines[5])
+{
+    size_t count = 0;
+    for (;;) {
+        if (count == 5) return 6;
+        lines[count++] = text;
+        char *end = strchr(text, '\n');
+        if (!end) break;
+        *end = 0;
+        text = end + 1;
+    }
+    return count;
+}
+
+static bool dp_request_text_read(const char *path, char text[320])
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    size_t n = fread(text, 1, 320, file);
+    bool ok = !ferror(file) && n < 320 && !memchr(text, 0, n);
+    if (fclose(file) != 0) ok = false;
+    if (!ok) return false;
+    text[n] = 0;
+    if (n && text[n - 1] == '\n') text[--n] = 0;
+    if (n && text[n - 1] == '\r') text[--n] = 0;
+    return true;
+}
+
+static bool dp_request_shape_ok(char *const lines[5], size_t count)
+{
+    return count == 5 &&
+           strcmp(lines[0], "zcl.dev_proof_request.v1") == 0 &&
+           proof_oid_text(lines[1]) && proof_oid_text(lines[2]);
+}
+
+static bool dp_request_stamps(const char *wall_text, const char *mono_text,
+                              int64_t *wall_out, int64_t *monotonic_out)
+{
+    char *wall_end = NULL, *mono_end = NULL;
+    errno = 0;
+    long long wall = strtoll(wall_text, &wall_end, 10);
+    bool wall_ok = errno == 0 && wall_end && *wall_end == 0 && wall > 0;
+    errno = 0;
+    long long mono = strtoll(mono_text, &mono_end, 10);
+    if (!wall_ok || errno != 0 || !mono_end || *mono_end != 0 || mono <= 0)
+        return false;
+    if (wall_out) *wall_out = (int64_t)wall;
+    if (monotonic_out) *monotonic_out = (int64_t)mono;
+    return true;
+}
+
+static bool proof_request_read(const char *path, char local[65], char base[65],
+                               int64_t *wall_out, int64_t *monotonic_out)
+{
+    char text[320], *lines[5];
+    if (!proof_private_regular(path) ||
+        !dp_request_text_read(path, text))
+        return false;
+    size_t count = dp_request_split(text, lines);
+    if (!dp_request_shape_ok(lines, count)) return false;
+    int64_t wall = 0, mono = 0;
+    if (!dp_request_stamps(lines[3], lines[4], &wall, &mono)) return false;
+    (void)snprintf(local, 65, "%s", lines[1]);
+    (void)snprintf(base, 65, "%s", lines[2]);
+    if (wall_out) *wall_out = wall;
+    if (monotonic_out) *monotonic_out = mono;
+    return true;
+}
+
+static bool proof_request_matches_pair(const char *path, const char *local,
+                                       const char *base)
+{
+    char request_local[65], request_base[65], expected[PATH_MAX];
+    int n = path && local && base
+        ? snprintf(expected, sizeof(expected), "%s-%s.request", local, base)
+        : -1;
+    const char *leaf = path ? strrchr(path, '/') : NULL;
+    return n > 0 && n < (int)sizeof(expected) && leaf &&
+        strcmp(leaf + 1, expected) == 0 &&
+        proof_request_read(path, request_local, request_base, NULL, NULL) &&
+        strcmp(request_local, local) == 0 && strcmp(request_base, base) == 0;
+}
+
+/* Each proof attempt gets its own throwaway directory
+ * (`.cache/zcl-dev-proof/attempts/<local>-<base>.XXXXXX`, see
+ * proof_attempt_paths_prepare) holding that attempt's real logs
+ * (lint.log/test.log/bundle.log/helpers.log under its own `logs/`
+ * subdirectory) — the flat `.cache/zcl-dev-proof/logs` directory is never
+ * written to. A settled `.failed` marker's first line is the failing reason
+ * token; any lines after it are the bounded evidence digest
+ * dp_failure_evidence() lifted from the failing step's log, ending with a
+ * `logs:` pointer at the attempt. A caller that needs the whole log still
+ * needs the newest attempt directory for this exact pair. mkdtemp's
+ * suffix is random, not time-ordered, so "newest" means highest mtime,
+ * not lexicographic order. */
+#define DP_FAILURE_RECORD_MAX 2048
+static bool proof_failure_bytes(const char *path,
+                                uint8_t bytes[DP_FAILURE_RECORD_MAX],
+                                size_t *size)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0 || st.st_size <= 0 ||
+        st.st_size > DP_FAILURE_RECORD_MAX ||
+        !read_exact_file(path, bytes, (size_t)st.st_size))
+        return false;
+    *size = (size_t)st.st_size;
+    return true;
+}
+
+/* The settled record: its first line is the failure token every reader
+ * classifies by, and any lines after it are the evidence digest. A first
+ * line too long for `detail` is refused, as it always was. */
+static bool dp_failure_record_read(const char *path,
+                                   struct zcl_dev_proof_status *out)
+{
+    char record[DP_FAILURE_RECORD_MAX + 1];
+    if (!proof_read_text(path, record, sizeof(record))) return false;
+    size_t first = strcspn(record, "\n");
+    const char *rest = record[first] ? record + first + 1 : "";
+    record[first] = '\0';
+    if (first > 0 && record[first - 1] == '\r') record[first - 1] = '\0';
+    if (strlen(record) >= sizeof(out->detail)) return false;
+    (void)snprintf(out->detail, sizeof(out->detail), "%s", record);
+    (void)snprintf(out->evidence, sizeof(out->evidence), "%s", rest);
+    return true;
+}
+
+/* Any existing archive, including unreadable/unsafe evidence, disallows a
+ * legacy mtime guess. A crash may leave newer attempt logs or an archive
+ * without ever updating the pair marker. Only matching bytes bind them. */
+static bool dp_attempt_failure_matches(const char *attempt,
+                                        const uint8_t *failure, size_t size,
+                                        bool *archives_seen)
+{
+    char logs[PATH_MAX], archive[PATH_MAX];
+    struct stat st;
+    if (snprintf(logs, sizeof(logs), "%s/logs", attempt) >= (int)sizeof(logs) ||
+        lstat(logs, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        snprintf(archive, sizeof(archive), "%s/failure.txt", logs) >=
+            (int)sizeof(archive)) {
+        *archives_seen = true;
+        return false;
+    }
+    if (lstat(archive, &st) != 0 && errno == ENOENT) return false;
+    *archives_seen = true;
+    uint8_t bytes[DP_FAILURE_RECORD_MAX];
+    return read_exact_file(archive, bytes, size) &&
+           memcmp(bytes, failure, size) == 0;
+}
+
+/* Highest-mtime matching attempt. With no failure filter, this is the
+ * legacy selection used only when no archived failure records exist. */
+static bool dp_attempt_dir_pick(DIR *dir, const char *attempts,
+                                const char *prefix, size_t prefix_len,
+                                const uint8_t *failure, size_t failure_size,
+                                bool *archives_seen,
+                                char newest[PATH_MAX])
+{
+    bool found = false;
+    struct timespec newest_mtime = {0};
+    for (struct dirent *entry = readdir(dir); entry; entry = readdir(dir)) {
+        if (strncmp(entry->d_name, prefix, prefix_len) != 0)
+            continue;
+        char candidate[PATH_MAX];
+        if (snprintf(candidate, sizeof(candidate), "%s/%s", attempts,
+                    entry->d_name) >= (int)sizeof(candidate))
+            continue;
+        struct stat st;
+        if (lstat(candidate, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (failure && !dp_attempt_failure_matches(candidate, failure,
+                                                    failure_size, archives_seen))
+            continue;
+        if (!found || st.st_mtim.tv_sec > newest_mtime.tv_sec ||
+            (st.st_mtim.tv_sec == newest_mtime.tv_sec &&
+             st.st_mtim.tv_nsec > newest_mtime.tv_nsec)) {
+            found = true;
+            newest_mtime = st.st_mtim;
+            (void)snprintf(newest, PATH_MAX, "%s", candidate);
+        }
+    }
+    return found;
+}
+
+static bool proof_failure_attempt_logs(const struct proof_paths *paths,
+                                       char *out, size_t out_len,
+                                       bool *archive_conflict)
+{
+    if (archive_conflict) *archive_conflict = false;
+    if (!paths || !out || out_len == 0) return false;
+    uint8_t failure[DP_FAILURE_RECORD_MAX];
+    size_t size = 0;
+    if (!proof_failure_bytes(paths->failure, failure, &size)) return false;
+    char prefix[160];
+    int prefix_len = snprintf(prefix, sizeof(prefix), "%s.", paths->key);
+    if (prefix_len <= 0 || prefix_len >= (int)sizeof(prefix)) return false;
+    DIR *dir = opendir(paths->attempts);
+    if (!dir) return false;
+    char newest[PATH_MAX] = {0};
+    bool archives_seen = false;
+    bool found = dp_attempt_dir_pick(dir, paths->attempts, prefix,
+                                     (size_t)prefix_len, failure, size,
+                                     &archives_seen, newest);
+    if (!found && !archives_seen) {
+        rewinddir(dir);
+        found = dp_attempt_dir_pick(dir, paths->attempts, prefix,
+                                    (size_t)prefix_len, NULL, 0,
+                                    &archives_seen, newest);
+    }
+    (void)closedir(dir);
+    if (!found) {
+        if (archive_conflict) *archive_conflict = archives_seen;
+        return false;
+    }
+    char logs[PATH_MAX];
+    if (snprintf(logs, sizeof(logs), "%s/logs", newest) >= (int)sizeof(logs))
+        return false;
+    (void)snprintf(out, out_len, "%s", logs);
+    return true;
+}
+
+static bool dp_failure_status_read(const struct proof_paths *paths,
+                                   struct zcl_dev_proof_status *out)
+{
+    if (!dp_failure_record_read(paths->failure, out)) return false;
+    out->state = dp_failure_no_verdict(out->detail)
+        ? ZCL_DEV_PROOF_STATE_NO_VERDICT : ZCL_DEV_PROOF_STATE_FAILED;
+    (void)proof_failure_attempt_logs(paths, out->log_dir,
+                                     sizeof(out->log_dir), NULL);
+    return true;
+}
+
+static bool proof_status_read_platform(const char *repo_root,
+                                       const char *local_commit,
+                                       const char *remote_base,
+                                       struct zcl_dev_proof_status *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    char local[65], base[65], why[160] = {0};
+    if (!zcl_dev_proof_resolve_pair(repo_root, local_commit, remote_base,
+                                    local, base, why, sizeof(why))) {
+        out->state = ZCL_DEV_PROOF_STATE_INVALID;
+        (void)snprintf(out->detail, sizeof(out->detail), "%s", why);
+        return false;
+    }
+    (void)snprintf(out->local_commit, sizeof(out->local_commit), "%s", local);
+    (void)snprintf(out->remote_base, sizeof(out->remote_base), "%s", base);
+    struct proof_paths paths;
+    if (!proof_paths_fill(repo_root, local, base, &paths)) {
+        out->state = ZCL_DEV_PROOF_STATE_INVALID;
+        (void)snprintf(out->detail, sizeof(out->detail), "%s",
+                       "proof_state_path_invalid");
+        return false;
+    }
+    (void)snprintf(out->receipt_path, sizeof(out->receipt_path), "%s",
+                   paths.receipt);
+    (void)snprintf(out->root, sizeof(out->root), "%s", paths.root);
+    (void)snprintf(out->log_dir, sizeof(out->log_dir), "%s", paths.logs);
+    struct zcl_dev_acceptance_receipt_v1 receipt;
+    if (receipt_load(&paths, local, base, &receipt, why, sizeof(why))) {
+        out->state = ZCL_DEV_PROOF_STATE_PASSED;
+        /* The compile step's own sidecar says what it reused in one line;
+         * fall back to the fixed status word only when there is none (an
+         * older receipt, or one settled by cycle reuse with no fresh
+         * compile of its own). */
+        if (!warm_status_line(paths.warmstart, out->detail,
+                              sizeof(out->detail)))
+            (void)snprintf(out->detail, sizeof(out->detail), "%s",
+                           "exact_receipt_admitted");
+        return true;
+    }
+    int64_t pid = 0, started = 0;
+    if (proof_lease_running(paths.lease, &pid, &started) ||
+        proof_running(paths.lock, &pid, &started)) {
+        int64_t now = platform_time_wall_unix();
+        int64_t elapsed_ms = now > started ? (now - started) * 1000 : 0;
+        out->state = ZCL_DEV_PROOF_STATE_RUNNING;
+        out->worker_id = pid;
+        out->started_unix = started;
+        int64_t ceiling_ms = zcl_dev_proof_ceiling_ms();
+        out->eta_ms = elapsed_ms < ceiling_ms ? ceiling_ms - elapsed_ms : 0;
+        (void)snprintf(out->detail, sizeof(out->detail), "%s",
+                       "background_verification_running");
+        return true;
+    }
+    if (proof_request_matches_pair(paths.request, local, base)) {
+        out->state = ZCL_DEV_PROOF_STATE_RUNNING;
+        out->eta_ms = zcl_dev_proof_ceiling_ms();
+        (void)snprintf(out->detail, sizeof(out->detail), "%s",
+                       "resident_proof_request_queued");
+        /* The request is still in the queue directory, so no worker ever
+         * claimed it (a claim renames it into the attempt directory). Age
+         * since its write is the honest "how long has nothing consumed
+         * this" number — the difference between a freshly queued request
+         * and one that has sat for hours behind a silent resident, which
+         * the RUNNING state alone cannot express. */
+        struct stat request_st;
+        if (stat(paths.request, &request_st) == 0) {
+            int64_t now = platform_time_wall_unix();
+            int64_t written = (int64_t)request_st.st_mtime;
+            out->request_age_s = now > written ? now - written : 0;
+        }
+        return true;
+    }
+    if (proof_private_regular(paths.request)) {
+        out->state = ZCL_DEV_PROOF_STATE_FAILED;
+        (void)snprintf(out->detail, sizeof(out->detail), "%s",
+                       "proof_request_invalid");
+        return true;
+    }
+    if (dp_failure_status_read(&paths, out)) return true;
+    out->state = ZCL_DEV_PROOF_STATE_MISSING;
+    (void)snprintf(out->detail, sizeof(out->detail), "%s",
+                   "exact_receipt_missing");
+    return true;
+}
+
+static void hash_begin(struct sha3_256_ctx *sha, const char *domain)
+{
+    sha3_256_init(sha);
+    sha3_256_write(sha, (const uint8_t *)domain, strlen(domain) + 1);
+}
+
+static bool hash_file(const char *domain, const char *path, uint8_t out[32])
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    struct sha3_256_ctx sha;
+    hash_begin(&sha, domain);
+    uint8_t buffer[65536];
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), f)) > 0)
+        sha3_256_write(&sha, buffer, n);
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok) return false;
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+static void hash_text(const char *domain, const void *text, size_t text_len,
+                      uint8_t out[32])
+{
+    struct sha3_256_ctx sha;
+    hash_begin(&sha, domain);
+    sha3_256_write(&sha, text, text_len);
+    sha3_256_finalize(&sha, out);
+}
+
+static bool write_all(int fd, const void *data, size_t size)
+{
+    const uint8_t *p = data;
+    while (size > 0) {
+        ssize_t n = write(fd, p, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n;
+        size -= (size_t)n;
+    }
+    return true;
+}
+
+static bool write_atomic(const char *path, const void *data, size_t size,
+                         mode_t mode)
+{
+    char temp[PATH_MAX];
+    if (snprintf(temp, sizeof(temp), "%s.tmp.XXXXXX", path) >=
+        (int)sizeof(temp))
+        return false;
+    int fd = mkstemp(temp);
+    if (fd < 0) return false;
+    bool ok = fchmod(fd, mode) == 0 && write_all(fd, data, size) &&
+              fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    if (ok && rename(temp, path) != 0) ok = false;
+    if (!ok) {
+        (void)unlink(temp);
+    }
+    return ok;
+}
+
+static bool proof_request_body(const char *local, const char *base,
+                               char out[320], size_t *len_out)
+{
+    int n = local && base
+        ? snprintf(out, 320,
+                   "zcl.dev_proof_request.v1\n%s\n%s\n%lld\n%lld\n",
+                   local, base,
+                   (long long)platform_time_wall_unix(),
+                   (long long)platform_time_monotonic_us())
+        : -1;
+    if (n <= 0 || n >= 320) return false;
+    if (len_out) *len_out = (size_t)n;
+    return true;
+}
+
+/* The per-attempt step logs, each under the attempt's own logs/. */
+static bool proof_attempt_log_paths(struct proof_paths *attempt)
+{
+    return snprintf(attempt->bundle_log, sizeof(attempt->bundle_log),
+                    "%s/logs/bundle.log", attempt->attempt) <
+               (int)sizeof(attempt->bundle_log) &&
+           snprintf(attempt->prefork_log, sizeof(attempt->prefork_log),
+                    "%s/logs/prefork.log", attempt->attempt) <
+               (int)sizeof(attempt->prefork_log) &&
+           snprintf(attempt->test_needs_log, sizeof(attempt->test_needs_log),
+                    "%s/logs/test-needs.log", attempt->attempt) <
+               (int)sizeof(attempt->test_needs_log);
+}
+
+static bool proof_attempt_paths_prepare(const struct proof_paths *pair,
+                                        struct proof_paths *attempt)
+{
+    if (!pair || !attempt) return false;
+    *attempt = *pair;
+    char temporary[PATH_MAX];
+    if (snprintf(temporary, sizeof(temporary), "%s/%s.XXXXXX",
+                 pair->attempts, pair->key) >= (int)sizeof(temporary) ||
+        !mkdtemp(temporary) ||
+        snprintf(attempt->attempt, sizeof(attempt->attempt), "%s",
+                 temporary) >= (int)sizeof(attempt->attempt))
+        return false;
+    const char *leaf = strrchr(attempt->attempt, '/');
+    if (!leaf || !leaf[1] || strlen(leaf + 1) >= sizeof(attempt->attempt_token))
+        return false;
+    (void)snprintf(attempt->attempt_token, sizeof(attempt->attempt_token),
+                   "%s", leaf + 1);
+    attempt->attempt_worker = (int64_t)getpid();
+    if (snprintf(attempt->logs, sizeof(attempt->logs), "%s/logs",
+                 attempt->attempt) >= (int)sizeof(attempt->logs) ||
+        snprintf(attempt->changed, sizeof(attempt->changed),
+                 "%s/changed.files", attempt->attempt) >=
+            (int)sizeof(attempt->changed) ||
+        !proof_attempt_log_paths(attempt) ||
+        snprintf(attempt->phases, sizeof(attempt->phases), "%s/phases.txt",
+                 attempt->attempt) >= (int)sizeof(attempt->phases) ||
+        !platform_private_directory_ensure(attempt->logs))
+        return false;
+    return true;
+}
+
+static bool proof_lease_publish(const struct proof_paths *paths)
+{
+    char body[320];
+    int n = paths
+        ? snprintf(body, sizeof(body), "%s %ld %lld\n",
+                   paths->attempt_token, (long)paths->attempt_worker,
+                   (long long)platform_time_wall_unix())
+        : -1;
+    return n > 0 && n < (int)sizeof(body) &&
+           write_atomic(paths->lease, body, (size_t)n, 0600);
+}
+
+static bool proof_lease_current(const struct proof_paths *paths)
+{
+    char token[192];
+    int64_t pid = 0;
+    return paths && paths->attempt_token[0] && paths->attempt_worker > 1 &&
+        proof_lease_read(paths->lease, token, sizeof(token), &pid, NULL) &&
+        strcmp(token, paths->attempt_token) == 0 &&
+        pid == (int64_t)paths->attempt_worker;
+}
+
+static int proof_queue_lock_acquire(const struct proof_paths *paths)
+{
+    if (!paths) return -1;
+    int fd = open(paths->queue_lock, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX) != 0) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void proof_queue_lock_release(int fd)
+{
+    if (fd < 0) return;
+    (void)flock(fd, LOCK_UN);
+    (void)close(fd);
+}
+
+static bool proof_write_if_current(const struct proof_paths *paths,
+                                   const char *target, const void *data,
+                                   size_t size, mode_t mode)
+{
+    int fd = proof_queue_lock_acquire(paths);
+    if (fd < 0) return false;
+    bool ok = proof_lease_current(paths) &&
+              write_atomic(target, data, size, mode);
+    proof_queue_lock_release(fd);
+    return ok;
+}
+
+static void proof_unlink_if_current(const struct proof_paths *paths,
+                                    const char *target)
+{
+    int fd = proof_queue_lock_acquire(paths);
+    if (fd < 0) return;
+    if (proof_lease_current(paths)) (void)unlink(target);
+    proof_queue_lock_release(fd);
+}
+
+static void proof_lease_release(const struct proof_paths *paths)
+{
+    int fd = proof_queue_lock_acquire(paths);
+    if (fd < 0) return;
+    if (proof_lease_current(paths)) (void)unlink(paths->lease);
+    proof_queue_lock_release(fd);
+}
+
+/* Longest repo-relative path a changed-set row may carry. Unchanged from the
+ * fixed-table era; only the NUMBER of rows became heap-resident. */
+#define PROOF_CHANGED_PATH_MAX 256
+/* Byte ceiling on the captured list itself: the row ceiling times the row
+ * length. Exceeding it is refused with the observed size, never truncated. */
+#define PROOF_CHANGED_BYTES_MAX \
+    ((size_t)ZCL_DEVLOOP_MAX_FILES * (size_t)PROOF_CHANGED_PATH_MAX)
+
+void zcl_dev_proof_changed_set_release(struct zcl_dev_proof_changed_set *set)
+{
+    if (!set)
+        return;
+    free(set->bytes);
+    free((void *)set->files);
+    set->bytes = NULL;
+    set->files = NULL;
+    set->count = 0;
+    set->current_files = NULL;
+    set->current_count = 0;
+    set->structural_path = NULL;
+    set->structural_count = 0;
+}
+
+/* Read a captured list whole. Refuses with the observed byte count rather than
+ * returning a shorter, still-plausible list. */
+static char *changed_set_read(const char *path, size_t *len_out,
+                              char *why, size_t why_len)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        proof_why(why, why_len, "changed_set_unavailable_or_truncated");
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        (void)close(fd);
+        proof_why(why, why_len, "changed_set_unavailable_or_truncated");
+        return NULL;
+    }
+    if ((uint64_t)st.st_size > (uint64_t)PROOF_CHANGED_BYTES_MAX) {
+        (void)close(fd);
+        proof_whyf(why, why_len,
+                   "changed_set_unavailable_or_truncated bytes=%llu max=%zu",
+                   (unsigned long long)st.st_size, PROOF_CHANGED_BYTES_MAX);
+        return NULL;
+    }
+    size_t size = (size_t)st.st_size;
+    char *bytes = zcl_calloc(size + 1, 1, "proof changed-set capture");
+    if (!bytes) {
+        (void)close(fd);
+        proof_why(why, why_len, "changed_set_allocation_failed");
+        return NULL;
+    }
+    size_t used = 0;
+    while (used < size) {
+        ssize_t n = read(fd, bytes + used, size - used);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        used += (size_t)n;
+    }
+    (void)close(fd);
+    if (used != size) {
+        free(bytes);
+        proof_whyf(why, why_len,
+                   "changed_set_unavailable_or_truncated read=%zu of %zu",
+                   used, size);
+        return NULL;
+    }
+    bytes[size] = 0;
+    *len_out = size;
+    return bytes;
+}
+
+/* Ask git for the changed list and read it back whole. Returns the buffer
+ * the caller owns, or NULL with `why` already set. */
+static char *dp_changed_set_fetch(const char *repo_root, const char *base,
+                                  const char *local, const char *scratch_path,
+                                  size_t *len_out, char *why, size_t why_len)
+{
+    if (!repo_root || !base || !local || !scratch_path || !scratch_path[0]) {
+        proof_why(why, why_len, "changed_set_request_invalid");
+        return NULL;
+    }
+    const char *ancestor[] = {"git", "merge-base", "--is-ancestor", base,
+                              local, NULL};
+    char ignored[2];
+    if (!git_capture(repo_root, ancestor, ignored, sizeof(ignored))) {
+        proof_why(why, why_len, "remote_base_not_ancestor");
+        return NULL;
+    }
+    /* `--output` sends the list to a file instead of the fixed-size process
+     * capture buffer, so a batch of thousands of paths cannot arrive as a
+     * shorter list that still parses. */
+    char output_arg[PATH_MAX + 16];
+    if (snprintf(output_arg, sizeof(output_arg), "--output=%s", scratch_path) >=
+        (int)sizeof(output_arg)) {
+        proof_why(why, why_len, "changed_set_request_invalid");
+        return NULL;
+    }
+    (void)unlink(scratch_path);
+    const char *argv[] = {"git", "diff", "--name-status", "--no-renames",
+                          output_arg, base, local, "--", NULL};
+    if (!git_capture(repo_root, argv, ignored, sizeof(ignored))) {
+        (void)unlink(scratch_path);
+        proof_why(why, why_len, "changed_set_unavailable_or_truncated");
+        return NULL;
+    }
+    char *bytes = changed_set_read(scratch_path, len_out, why, why_len);
+    (void)unlink(scratch_path);
+    return bytes;
+}
+
+/* How many rows the buffer holds, counted before anything is stored so an
+ * over-ceiling batch is refused with its real size. */
+static size_t dp_changed_set_count(const char *bytes, size_t len)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (bytes[i] == '\n')
+            continue;
+        count++;
+        while (i < len && bytes[i] != '\n')
+            i++;
+    }
+    return count;
+}
+
+static bool dp_changed_set_path_invalid(const char *path, size_t path_len)
+{
+    return path_len == 0 || path_len >= PROOF_CHANGED_PATH_MAX ||
+           path[0] == '/' || strstr(path, "..") || strchr(path, '\\') ||
+           strchr(path, '\t');
+}
+
+static bool dp_changed_set_structural_change(char status)
+{
+    /* __has_include may probe any filename, including .txt or a source.
+     * No old depfile can establish an edge for a formerly absent path. */
+    return status == 'A' || status == 'D' || status == 'T';
+}
+
+/* Point one path reference per status row into the buffer. Presence changes
+ * to headers can flip __has_include without leaving any old depfile edge, so
+ * an added, deleted or type-changed row is kept and marked in `mark`: it
+ * widens the proof to its full closure rather than refusing it. An unknown
+ * status, an unsafe path or a short list still refuses the whole set. */
+static bool dp_changed_set_rows(char *bytes, size_t len, size_t count, const char **refs,
+                                size_t *persist_len,
+                                struct zcl_dev_proof_changed_set *mark,
+                                char *why, size_t why_len)
+{
+    if (memchr(bytes, '\0', len)) {
+        proof_why(why, why_len, "changed_set_invalid_or_truncated embedded_nul");
+        return false;
+    }
+    size_t stored = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(bytes, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        char status = line[0];
+        if (line[1] != '\t' || !strchr("ACMRDT", status)) {
+            proof_whyf(why, why_len,
+                       "changed_set_invalid_status row=%zu", stored + 1);
+            return false;
+        }
+        char *path = line + 2;
+        size_t path_len = strlen(path);
+        if (stored >= count || dp_changed_set_path_invalid(path, path_len)) {
+            proof_whyf(why, why_len,
+                       "changed_set_invalid_or_truncated row=%zu", stored + 1);
+            return false;
+        }
+        if (dp_changed_set_structural_change(status)) {
+            if (!mark->structural_path) mark->structural_path = path;
+            mark->structural_count++;
+        }
+        refs[stored++] = path;
+        if (status != 'D' && mark->current_files)
+            mark->current_files[mark->current_count++] = path;
+        *persist_len += path_len + 1;
+    }
+    if (stored != count) {
+        proof_whyf(why, why_len,
+                   "changed_set_invalid_or_truncated rows=%zu of %zu", stored,
+                   count);
+        return false;
+    }
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_changed_set_bytes(char *bytes, size_t len,
+                                         char *why, size_t why_len)
+{
+    const char *refs[2] = {0};
+    size_t count = dp_changed_set_count(bytes, len), persist_len = 0;
+    struct zcl_dev_proof_changed_set mark = {0};
+    return count > 0 && count <= 2 &&
+           dp_changed_set_rows(bytes, len, count, refs, &persist_len, &mark,
+                               why, why_len);
+}
+#endif
+
+/* Write the accepted list beside the proof state, newline-terminated and
+ * read-only. No persist path asked for means nothing to do. */
+static bool dp_changed_set_persist(const char *persist_path,
+                                   const char **refs, size_t count,
+                                   size_t persist_len, char *why,
+                                   size_t why_len)
+{
+    if (!persist_path || !persist_path[0]) return true;
+    char *persisted = zcl_calloc(persist_len, 1, "proof changed-set record");
+    if (!persisted) {
+        proof_why(why, why_len, "changed_set_allocation_failed");
+        return false;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t path_len = strlen(refs[i]);
+        memcpy(persisted + used, refs[i], path_len);
+        used += path_len;
+        persisted[used++] = '\n';
+    }
+    bool written = write_atomic(persist_path, persisted, used, 0400);
+    free(persisted);
+    if (!written) {
+        proof_why(why, why_len, "changed_set_persist_failed");
+        return false;
+    }
+    return true;
+}
+
+bool zcl_dev_proof_changed_set_capture(const char *repo_root, const char *base,
+                                       const char *local,
+                                       const char *scratch_path,
+                                       const char *persist_path,
+                                       struct zcl_dev_proof_changed_set *out,
+                                       char *why, size_t why_len)
+{
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    size_t len = 0;
+    char *bytes = dp_changed_set_fetch(repo_root, base, local, scratch_path,
+                                       &len, why, why_len);
+    if (!bytes)
+        return false;
+    size_t count = dp_changed_set_count(bytes, len);
+    if (count == 0) {
+        free(bytes);
+        proof_why(why, why_len, "changed_set_empty");
+        return false;
+    }
+    if (count > (size_t)ZCL_DEVLOOP_MAX_FILES) {
+        free(bytes);
+        proof_whyf(why, why_len,
+                   "changed_set_invalid_or_truncated files=%zu max=%d",
+                   count, ZCL_DEVLOOP_MAX_FILES);
+        return false;
+    }
+    const char **refs = zcl_calloc(count * 2u, sizeof(*refs),
+                                   "proof changed-set rows");
+    if (!refs) {
+        free(bytes);
+        proof_why(why, why_len, "changed_set_allocation_failed");
+        return false;
+    }
+    size_t persist_len = 0;
+    out->current_files = refs + count;
+    if (!dp_changed_set_rows(bytes, len, count, refs, &persist_len, out, why,
+                             why_len) ||
+        !dp_changed_set_persist(persist_path, refs, count, persist_len, why,
+                                why_len)) {
+        free((void *)refs);
+        free(bytes);
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    out->bytes = bytes;
+    out->files = refs;
+    out->count = count;
+    return true;
+}
+
+static bool worktree_exact(const char *root, const char *local,
+                           bool include_untracked, char *why, size_t why_len)
+{
+    char head[65], status[ZCL_DEVLOOP_OUTPUT_MAX];
+    struct zcl_devloop_process_result head_result = {0};
+    struct zcl_devloop_process_result status_result = {0};
+    const char *head_argv[] = {"git", "rev-parse", "--verify", "HEAD", NULL};
+    const char *status_argv[] = {
+        "git", "status", "--porcelain=v1",
+        include_untracked ? "--untracked-files=normal" : "--untracked-files=no",
+        NULL};
+    if (!git_capture_observed(root, head_argv, 30000, head, sizeof(head),
+                              &head_result)) {
+        git_capture_why("head_capture", &head_result, sizeof(head), why,
+                        why_len);
+        return false;
+    }
+    if (!proof_oid_text(head)) {
+        proof_why(why, why_len, "head_capture_output_invalid");
+        return false;
+    }
+    if (strcmp(head, local) != 0) {
+        proof_why(why, why_len, "head_changed_during_proof");
+        return false;
+    }
+    if (!git_capture_observed(root, status_argv, 30000, status,
+                              sizeof(status), &status_result)) {
+        git_capture_why("worktree_status_capture", &status_result,
+                        sizeof(status), why, why_len);
+        return false;
+    }
+    if (status[0]) {
+        proof_why(why, why_len, "worktree_not_clean");
+        return false;
+    }
+    return true;
+}
+
+static bool dependency_parent_ensure(const char *path)
+{
+    char parent[PATH_MAX];
+    if (!path || snprintf(parent, sizeof(parent), "%s", path) >=
+                     (int)sizeof(parent))
+        return false;
+    char *leaf = strrchr(parent, '/');
+    if (!leaf || leaf == parent) return false;
+    *leaf = 0;
+    for (char *p = parent + 1;; p++) {
+        if (*p != '/' && *p != 0) continue;
+        char saved = *p;
+        *p = 0;
+        struct stat st;
+        bool ok = lstat(parent, &st) == 0
+            ? S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)
+            : errno == ENOENT && mkdir(parent, 0700) == 0;
+        *p = saved;
+        if (!ok || saved == 0) return ok;
+    }
+}
+
+/* A refusal a reader can act on names the failure, not a number. */
+/* The names split by what the failure is about: the first group is the
+ * path -- how it is spelled, what it resolves to, what may be done with it
+ * -- and the second is the store behind it. Neither group knows the
+ * fallback text; only proof_errno_name below names it. */
+static const char *dp_errno_name_path(int value)
+{
+    switch (value) {
+    case EACCES: return "EACCES";
+    case EEXIST: return "EEXIST";
+    case EINVAL: return "EINVAL";
+    case EISDIR: return "EISDIR";
+    case ELOOP: return "ELOOP";
+    case EMLINK: return "EMLINK";
+    case ENAMETOOLONG: return "ENAMETOOLONG";
+    case ENOENT: return "ENOENT";
+    case ENOTDIR: return "ENOTDIR";
+    case EPERM: return "EPERM";
+    default: return NULL;
+    }
+}
+
+static const char *dp_errno_name_store(int value)
+{
+    switch (value) {
+    case EDQUOT: return "EDQUOT";
+    case EIO: return "EIO";
+    case ENOMEM: return "ENOMEM";
+    case ENOSPC: return "ENOSPC";
+    case EROFS: return "EROFS";
+    case EXDEV: return "EXDEV";
+    default: return NULL;
+    }
+}
+
+static const char *proof_errno_name(int value)
+{
+    if (value == 0) return "no errno";
+    const char *name = dp_errno_name_path(value);
+    if (!name) name = dp_errno_name_store(value);
+    return name ? name : "unrecognised errno";
+}
+
+/* Every generation owns independent dependency inodes. Creating another
+ * hardlink changes the shared inode's ctime, invalidating an in-flight proof
+ * even when its source bytes are unchanged. Clone when the platform supports
+ * it, otherwise copy bytes; never link a donor into a live generation.
+ * The mode carries: a hook or a .so that arrived without its executable
+ * bit fails far away from here, where the cause is no longer visible.
+ *
+ * The MODIFICATION TIME carries for the same reason. A copy that stamps the
+ * target with the time of the copy hands the
+ * generation an artifact that is newer than every source it was built from,
+ * and make inside the generation then declares a stale artifact up to date
+ * and never rebuilds it. That is not a hypothetical: a hot-swap fixture image
+ * copied this way kept the consensus core seal of an older build and every
+ * activation in the generation was rejected on shape. */
+/* `<target>.tmp.XXXXXX`, opened. Every copy in this file lands on a
+ * temporary beside its target and is renamed over it, so a reader never
+ * sees a half-written dependency. */
+static bool dp_copy_temp_open(const char *target, char temporary[PATH_MAX],
+                              int *output)
+{
+    int temporary_len = snprintf(temporary, PATH_MAX, "%s.tmp.XXXXXX",
+                                 target);
+    bool ok = temporary_len > 0 && temporary_len < PATH_MAX;
+    *output = ok ? mkstemp(temporary) : -1;
+    return *output >= 0;
+}
+
+/* Read-to-write until end of file. A short read is not an error and EINTR
+ * is not a short read. */
+static bool dp_copy_bytes(int input, int output)
+{
+    unsigned char buffer[65536];
+    for (;;) {
+        ssize_t got = read(input, buffer, sizeof(buffer));
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) return false;
+        if (got == 0) return true;
+        if (!write_all(output, buffer, (size_t)got)) return false;
+    }
+}
+
+/* Carry the source's mode and timestamps onto the copy, then close it. All
+ * three are attempted whatever the first one does, so the descriptor is
+ * never left open on a partial failure. */
+static bool dp_copy_stamp_close(int output, const struct stat *source_st)
+{
+    bool ok = true;
+    if (fchmod(output, source_st->st_mode & 07777) != 0) ok = false;
+    const struct timespec times[2] = {
+        source_st->st_atim, source_st->st_mtim,
+    };
+    if (futimens(output, times) != 0) ok = false;
+    if (close(output) != 0) ok = false;
+    return ok;
+}
+
+/* A fresh copy owns no source metadata: it gets the caller's owner-only
+ * mode and the time of the copy. Both steps run whatever the first does. */
+static bool dp_copy_mode_close(int output, mode_t mode)
+{
+    bool ok = true;
+    if (fchmod(output, mode) != 0) ok = false;
+    if (close(output) != 0) ok = false;
+    return ok;
+}
+
+/* Drop the temporary and restore the errno that named the real cause: the
+ * cleanup itself must not become the diagnosis. */
+static void dp_copy_temp_discard(int output, const char *temporary, int saved)
+{
+    if (output >= 0) (void)unlink(temporary);
+    if (errno == 0) errno = saved;
+}
+
+static bool dependency_copy_stat(const char *source, const char *target,
+                                 const struct stat *source_st)
+{
+    int input = open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (input < 0) return false;
+    char temporary[PATH_MAX];
+    int output = -1;
+    bool ok = dp_copy_temp_open(target, temporary, &output);
+    enum platform_file_clone_result cloned = PLATFORM_FILE_CLONE_UNAVAILABLE;
+    if (ok) cloned = platform_file_clone_fd(input, output);
+    if (cloned == PLATFORM_FILE_CLONE_REFUSED) {
+        errno = EIO;
+        ok = false;
+    }
+    if (ok && cloned == PLATFORM_FILE_CLONE_UNAVAILABLE)
+        ok = dp_copy_bytes(input, output);
+    int saved = errno;
+    if (close(input) != 0) ok = false;
+    if (output >= 0 && !dp_copy_stamp_close(output, source_st)) ok = false;
+    if (ok && rename(temporary, target) != 0) ok = false;
+    if (!ok) dp_copy_temp_discard(output, temporary, saved);
+    return ok;
+}
+
+static int dependency_seed(const char *source, const char *target,
+                           const struct stat *source_st)
+{
+#if defined(ZCL_TESTING)
+    /* Exercise the real fallback without requiring a second filesystem. */
+    const char *failure = getenv("ZCL_DEV_PROOF_TEST_LINK_ERRNO");
+    if (failure && (strcmp(failure, "EXDEV") == 0 ||
+                    strcmp(failure, "EACCES") == 0)) {
+        errno = strcmp(failure, "EXDEV") == 0 ? EXDEV : EACCES;
+        return -1;
+    }
+#endif
+    return dependency_copy_stat(source, target, source_st) ? 0 : -1;
+}
+
+/* `<dir>/<name>` for both sides of a recursive walk, refusing rather than
+ * truncating either. */
+static bool dp_child_paths(const char *source, const char *target,
+                           const char *name, char child_source[PATH_MAX],
+                           char child_target[PATH_MAX])
+{
+    return snprintf(child_source, PATH_MAX, "%s/%s", source,
+                    name) < PATH_MAX &&
+           snprintf(child_target, PATH_MAX, "%s/%s", target,
+                    name) < PATH_MAX;
+}
+
+/* A symlink standing where a real dependency belongs is removed first: a
+ * copy through it would write outside the generation. */
+static bool dp_materialize_clear_link(const char *target,
+                                      const struct stat *target_st,
+                                      bool *target_exists)
+{
+    if (!*target_exists || !S_ISLNK(target_st->st_mode)) return true;
+    if (unlink(target) != 0) return false;
+    *target_exists = false;
+    return true;
+}
+
+static bool dp_materialize_regular(const char *source, const char *target,
+                                   const struct stat *source_st)
+{
+    /* The temporary copy replaces an old shared inode only
+     * after the source is open and the independent copy is complete. */
+    if (dependency_seed(source, target, source_st) == 0) return true;
+    /* Same filesystem is the fast path; a cross-device generation root is
+     * not a missing dependency, so copy rather than refuse. */
+    if (errno != EXDEV && errno != EPERM && errno != EMLINK) return false;
+    return dependency_copy_stat(source, target, source_st);
+}
+
+static bool dp_source_parent(const char *source, char parent[PATH_MAX])
+{
+    size_t len = strlen(source);
+    if (len >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    memcpy(parent, source, len + 1);
+    char *slash = strrchr(parent, '/');
+    if (!slash) strcpy(parent, ".");
+    else if (slash == parent) slash[1] = 0;
+    else *slash = 0;
+    return true;
+}
+
+static bool dp_path_inside_root(const char *root, const char *path)
+{
+    size_t len = strlen(root);
+    return strcmp(root, "/") == 0 ||
+           (strncmp(root, path, len) == 0 &&
+            (path[len] == 0 || path[len] == '/'));
+}
+
+/* Check every resolved prefix, not just the endpoint: a relative link can
+ * leave the selected tree and reenter it, then point back into the submitting
+ * checkout when its original spelling is recreated in the generation.
+ * Resolving prefixes also accounts for directory aliases changing the depth
+ * at which a subsequent `..` is interpreted. */
+static bool dp_link_directory_suffix(const char *path, const char *link_text)
+{
+    size_t len = strlen(link_text);
+    if (len == 0 || link_text[len - 1] != '/') return true;
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return false;
+    }
+    return true;
+}
+
+static bool dp_link_prefixes_inside(const char *source, const char *link_text,
+                                    const char *source_root)
+{
+    char prefix[PATH_MAX], resolved[PATH_MAX];
+    if (!dp_source_parent(source, prefix)) return false;
+    for (const char *part = link_text; *part;) {
+        size_t len = strcspn(part, "/");
+        if (len == 0) { part++; continue; }
+        size_t used = strlen(prefix);
+        int added = snprintf(prefix + used, sizeof(prefix) - used,
+                              "/%.*s", (int)len, part);
+        if (added < 0 || (size_t)added >= sizeof(prefix) - used) {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+        if (!realpath(prefix, resolved)) return false;
+        if (!dp_path_inside_root(source_root, resolved)) {
+            errno = EACCES;
+            return false;
+        }
+        part += len;
+    }
+    /* Check the suffix explicitly: Darwin realpath can normalize away a
+     * symlink target's trailing slash instead of requiring a directory. */
+    if (!dp_link_directory_suffix(prefix, link_text)) return false;
+    if (!realpath(source, resolved)) return false;
+    if (!dp_path_inside_root(source_root, resolved)) {
+        errno = EACCES;
+        return false;
+    }
+    return true;
+}
+
+/* Preserve relative link bytes only after their resolution has been checked
+ * against the original selected dependency root, retained across recursion.
+ * This remains a pathname snapshot; proof input identity checks still guard
+ * source mutation before and after the generation's work. */
+static bool dp_materialize_symlink(const char *source, const char *target,
+                                   bool target_exists, const char *source_root)
+{
+    char link_target[PATH_MAX];
+    ssize_t len = readlink(source, link_target, sizeof(link_target) - 1);
+    if (len < 0) return false;
+    if (len == 0 || (size_t)len >= sizeof(link_target) - 1) {
+        errno = len == 0 ? EINVAL : ENAMETOOLONG;
+        return false;
+    }
+    link_target[len] = 0;
+    if (link_target[0] == '/') {
+        errno = EACCES;
+        return false;
+    }
+    if (!dp_link_prefixes_inside(source, link_target, source_root)) return false;
+    if (target_exists && unlink(target) != 0) return false;
+    return symlink(link_target, target) == 0;
+}
+
+static bool dp_materialize_dir_ensure(const struct stat *source_st,
+                                      const char *target,
+                                      const struct stat *target_st,
+                                      bool target_exists)
+{
+    return S_ISDIR(source_st->st_mode) &&
+           (!target_exists || S_ISDIR(target_st->st_mode)) &&
+           (target_exists || mkdir(target, 0700) == 0);
+}
+
+static bool dependency_materialize_at(const char *source, const char *target,
+                                      const char *source_root)
+{
+    struct stat source_st, target_st;
+    if (lstat(source, &source_st) != 0) return false;
+    bool target_exists = lstat(target, &target_st) == 0;
+    if (!dp_materialize_clear_link(target, &target_st, &target_exists))
+        return false;
+    if (S_ISREG(source_st.st_mode))
+        return dp_materialize_regular(source, target, &source_st);
+    if (S_ISLNK(source_st.st_mode))
+        return dp_materialize_symlink(source, target, target_exists, source_root);
+    if (!dp_materialize_dir_ensure(&source_st, target, &target_st,
+                                   target_exists))
+        return false;
+    DIR *dir = opendir(source);
+    if (!dir) return false;
+    bool ok = true;
+    for (struct dirent *entry = readdir(dir); ok && entry;
+         entry = readdir(dir)) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        char child_source[PATH_MAX], child_target[PATH_MAX];
+        if (!dp_child_paths(source, target, entry->d_name, child_source,
+                            child_target) ||
+            !dependency_materialize_at(child_source, child_target, source_root)) {
+            ok = false;
+            break;
+        }
+    }
+    int saved = errno;
+    int closed = closedir(dir);
+    if (!ok) errno = saved;
+    return closed == 0 && ok;
+}
+
+static bool dependency_materialize(const char *source, const char *target)
+{
+    struct stat source_st;
+    char source_root[PATH_MAX], parent[PATH_MAX];
+    if (lstat(source, &source_st) != 0) return false;
+    const char *root = source;
+    if (!S_ISDIR(source_st.st_mode)) {
+        if (!dp_source_parent(source, parent)) return false;
+        root = parent;
+    }
+    if (!realpath(root, source_root)) return false;
+    return dependency_materialize_at(source, target, source_root);
+}
+
+/* Testing seam: one generation dependency materialized exactly the way the
+ * proof does it. No proof, lease, or admission authority — it exists so the
+ * cross-filesystem path can be pinned by a test instead of only by a live
+ * RAM-backed proof run. */
+bool zcl_dev_proof_dependency_materialize(const char *source,
+                                          const char *target)
+{
+    return dependency_materialize(source, target);
+}
+
+static bool dependency_copy_fresh(const char *source, const char *target)
+{
+    int input = open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (input < 0) return false;
+    struct stat st;
+    char temporary[PATH_MAX];
+    int output = -1;
+    bool ok = fstat(input, &st) == 0 && S_ISREG(st.st_mode) &&
+        dp_copy_temp_open(target, temporary, &output);
+    if (ok) ok = dp_copy_bytes(input, output);
+    if (close(input) != 0) ok = false;
+    if (output >= 0 && !dp_copy_mode_close(output, 0600)) ok = false;
+    if (ok && rename(temporary, target) != 0) ok = false;
+    if (!ok && output >= 0) (void)unlink(temporary);
+    return ok;
+}
+
+/* The mirror directory this level of the walk copies into. */
+static bool dp_depfile_dir_ensure(const char *target)
+{
+    if (!dependency_parent_ensure(target)) return false;
+    struct stat target_st;
+    if (lstat(target, &target_st) != 0)
+        return errno == ENOENT && mkdir(target, 0700) == 0;
+    return S_ISDIR(target_st.st_mode) && !S_ISLNK(target_st.st_mode);
+}
+
+static bool dp_depfile_name(const char *name)
+{
+    return strlen(name) > 2 && strcmp(name + strlen(name) - 2, ".d") == 0;
+}
+
+/* Copy one depfile and fold its repo-relative path and content digest into
+ * the running root, in that order. Nothing is folded in unless the copy and
+ * the hash both succeeded. */
+static bool dp_depfile_take(const char *child_source, const char *child_target,
+                            size_t source_root_len, struct sha3_256_ctx *root,
+                            size_t *count)
+{
+    uint8_t digest[32];
+    if (!dependency_copy_fresh(child_source, child_target) ||
+        !hash_file("zcl.dev_proof_depfile.v1", child_source, digest))
+        return false;
+    const char *relative = child_source + source_root_len;
+    if (*relative == '/') relative++;
+    sha3_256_write(root, (const uint8_t *)relative, strlen(relative) + 1);
+    sha3_256_write(root, digest, sizeof(digest));
+    (*count)++;
+    return true;
+}
+
+/* One directory entry: recurse, take a depfile, or ignore it. */
+static bool dp_depfile_entry(const char *child_source,
+                            const char *child_target, const char *name,
+                            size_t source_root_len, struct sha3_256_ctx *root,
+                            size_t *count, bool *recurse)
+{
+    *recurse = false;
+    struct stat st;
+    if (lstat(child_source, &st) != 0) return false;
+    if (S_ISDIR(st.st_mode)) {
+        *recurse = true;
+        return true;
+    }
+    if (S_ISREG(st.st_mode) && dp_depfile_name(name))
+        return dp_depfile_take(child_source, child_target, source_root_len,
+                               root, count);
+    return true;
+}
+
+static bool depfile_tree_copy(const char *source, const char *target,
+                              size_t source_root_len,
+                              struct sha3_256_ctx *root, size_t *count)
+{
+    if (!dp_depfile_dir_ensure(target)) return false;
+    DIR *dir = opendir(source);
+    if (!dir) return false;
+    bool ok = true;
+    for (struct dirent *entry = readdir(dir); ok && entry;
+         entry = readdir(dir)) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        char child_source[PATH_MAX], child_target[PATH_MAX];
+        if (!dp_child_paths(source, target, entry->d_name, child_source,
+                            child_target)) {
+            ok = false;
+            break;
+        }
+        bool recurse = false;
+        ok = dp_depfile_entry(child_source, child_target, entry->d_name,
+                              source_root_len, root, count, &recurse);
+        if (ok && recurse)
+            ok = depfile_tree_copy(child_source, child_target, source_root_len,
+                                   root, count);
+    }
+    return closedir(dir) == 0 && ok;
+}
+
+/* ── Warm-start proof generations ────────────────────────────────────────
+ *
+ * A generation is a detached worktree plus its build tree, one per
+ * (checkout, local commit) pair. A fresh generation compiles every
+ * translation unit because git stamps every source with the checkout time,
+ * even when the commit changed one line. zcc cannot fill that gap: a proof
+ * compiles through a store of its own that starts empty (see
+ * proof_zcc_private_open), so a new generation hard-links the last complete
+ * generation's immutable compiler outputs and repairs make's timestamp
+ * graph around the exact changed set. Make then recompiles exactly the
+ * changed translation units and relinks; everything else is reused byte
+ * for byte.
+ *
+ * Safety rests on four properties, each checked where it is used rather
+ * than asserted here:
+ *
+ * 1. Seeded files are never rewritten in place. Objects and depfiles are
+ *    published by staging plus rename (tools/dev/compile-epoch-object.sh,
+ *    tools/zcc.c epoch-object publish), so a rebuild replaces the new
+ *    generation's link and the donor keeps its bytes. The classifier below
+ *    links only object and depfile outputs; everything else is skipped,
+ *    except the small compiler-wrapper binary which is copied, never
+ *    linked, because it is executed and must not share an inode across
+ *    generations.
+ * 2. Seeded objects are byte-valid in the new generation. Depfiles carry
+ *    relative paths, -ffile-prefix-map removes the absolute build root
+ *    from objects (Makefile REPRO_CFLAGS), and -frandom-seed takes the
+ *    relative TU path, so identical sources compile to identical bytes.
+ *    The epoch key already refuses reuse across toolchain, flag, or
+ *    build-system moves: seeded objects under a stale epoch name are dead
+ *    weight make never addresses.
+ * 3. Freshness is content-derived, not trusted. Seeded outputs are stamped
+ *    at seed time; then every path git names as changed between the donor
+ *    commit and the new commit is stamped strictly later. Unchanged
+ *    sources stay older than the seeds (reuse), changed sources and
+ *    headers are newer (rebuild, with header dependents found through the
+ *    seeded depfiles). Any failure before the repair completes unlinks the
+ *    seeds, which degrades to the cold build, never to a stale reuse.
+ * 4. The donor is stable. Only a generation carrying a build-complete
+ *    marker for the checkout's own root, still checked out at the marked
+ *    commit, with no live proof lease, may donate. Its build tree cannot
+ *    change under the reader: the proof runs no make in a generation after
+ *    the marker is written, and epoch publishers replace rather than
+ *    mutate.
+ *
+ * Cold is always correct; warm start is only an optimisation. Every step
+ * below refuses rather than guesses. */
+
+#define PROOF_WARM_MARKER_REL "build/.proof-build-complete"
+#define PROOF_WARM_MARKER_SCHEMA "zcl.proof_build_complete.v1"
+#define PROOF_WARM_SIDECAR_SCHEMA "zcl.dev_proof_warmstart.v1"
+#define PROOF_WARM_TAG_LEN 32
+/* `git worktree remove` is a recursive delete of a multi-gigabyte tree.
+ * The 30 s budget the short git queries share would abandon it half-done,
+ * and a half-deleted generation is one the reapability check can never
+ * approve again. */
+#define PROOF_WARM_REMOVE_TIMEOUT_MS 600000
+#define PROOF_WARM_REAP_MAX 8
+/* How many candidates the pressure pass below may take to git. It runs on
+ * the proof's hot path and stops the moment the pool has room, so the cap
+ * only bounds the pathological case of a pool where nothing will delete. */
+#define PROOF_POOL_PRESSURE_MAX 32
+/* An active proof stamps its generation when it takes it and builds for up
+ * to an hour on a loaded host, so anything touched within the hour may
+ * still be working. Marker-less generations get a full day: without a
+ * marker there is no pair lease to consult, and age is the only signal. */
+#define PROOF_WARM_IDLE_ACTIVE_SECONDS (60 * 60)
+/* A complete generation nobody has touched in half a day is not a donor
+ * being kept for the next proof, it is an abandoned lane's leftover. Being
+ * superseded used to be the only way one could ever be reclaimed, so a
+ * lane that proved once and stopped held its entire tree forever:
+ * nineteen such generations held 34 GiB of a 47 GiB tmpfs and the next
+ * proof was refused its RAM reservation. Long enough that an overnight
+ * pause keeps its donor, short enough that a dead lane does not outlive
+ * the day. */
+#define PROOF_WARM_IDLE_ABANDONED_SECONDS (12 * 60 * 60)
+#define PROOF_WARM_IDLE_UNMARKED_SECONDS (24 * 60 * 60)
+
+static bool warm_tag_name(const char *name)
+{
+    /* The pool holds exactly one shape of entry: the 32-character
+     * lowercase hex tag generation_prepare() derives. Anything else under
+     * .z23p was put there by something that is not this code, and is
+     * therefore not this code's to seed from or delete. */
+    size_t len = name ? strlen(name) : 0;
+    if (len != PROOF_WARM_TAG_LEN) return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = name[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+/* How many generation directories the pool already holds. Read only when a
+ * RAM reservation was refused: the log line names the count so a full pool
+ * is diagnosable from the log alone instead of a manual `ls` weeks later. */
+static size_t generation_dir_count(const char *parent)
+{
+    DIR *dir = opendir(parent);
+    if (!dir) return 0;
+    size_t count = 0;
+    for (struct dirent *entry = readdir(dir); entry; entry = readdir(dir)) {
+        if (warm_tag_name(entry->d_name)) count++;
+    }
+    (void)closedir(dir);
+    return count;
+}
+
+enum warm_seed_class {
+    WARM_SEED_SKIP,
+    WARM_SEED_LINK,
+    WARM_SEED_COPY,
+};
+
+static bool warm_path_hidden(const char *rel)
+{
+    /* Any hidden component (lease, session, lock, admission, staging, or
+     * marker state) is live build machinery, never a reusable output. */
+    if (!rel || !rel[0]) return true;
+    if (rel[0] == '.') return true;
+    for (const char *p = rel; *p; p++) {
+        if (p[0] == '/' && p[1] == '.') return true;
+    }
+    return false;
+}
+
+static bool warm_has_suffix(const char *rel, const char *suffix)
+{
+    size_t rel_len = rel ? strlen(rel) : 0;
+    size_t suffix_len = suffix ? strlen(suffix) : 0;
+    return suffix_len > 0 && rel_len > suffix_len &&
+           strcmp(rel + rel_len - suffix_len, suffix) == 0;
+}
+
+/* The bootstrap compiler wrapper. Named once because two decisions ask about
+ * it: what class it seeds as, and whether the caller's wrapper gate applies. */
+static bool warm_seed_is_wrapper(const char *rel)
+{
+    return rel && strcmp(rel, "bin/zcc") == 0;
+}
+
+/* LINK: immutable compiler outputs, replaced rather than rewritten by the
+ * epoch publishers, so sharing an inode with the donor is safe. COPY: the
+ * small executed wrapper binary, which must not share an inode across
+ * generations, every file inside a dependency room, and every regular file
+ * under bin/. SKIP: everything else, including anything rewritten in place
+ * (archives, session stamps, locks). `rel` is relative to the generation's
+ * build/ directory.
+ *
+ * The dependency rooms (build/hotswap, build/githooks — the table lives in
+ * tools/dev/dependency_links.c) are graded by the hardlink-isolation gate,
+ * which requires every regular file in them to own its inode: a shared inode
+ * there carries one generation's ctime into another's sealed dependency set.
+ * The suffix rule alone admitted the rollback fixtures' own .d files, so a
+ * warm proof seeded exactly the two paths that gate then refused. Nothing
+ * else about a room changes here: a file the suffix rule would not have
+ * seeded at all is still skipped.
+ *
+ * bin/ holds the executed tools and admitted executables. They are COPY, not
+ * LINK, for the same reason as the wrapper: a copy owns its inode, so a
+ * relink in either tree replaces its own bytes and never the other tree's.
+ * Seeding them is what lets a landing proof — whose compile dimension reused
+ * the checkout's z23-dev and never built build/obj — donate its prefork
+ * bundle: linking those ~70 standalone tools is half of a cold bundle's
+ * wall clock. Make still decides freshness from the restamped graph, so a
+ * tool whose inputs changed is rebuilt rather than trusted. */
+static enum warm_seed_class warm_classify_rel(const char *rel, bool is_reg)
+{
+    if (!rel || !rel[0] || !is_reg || warm_path_hidden(rel))
+        return WARM_SEED_SKIP;
+    /* Fuzz objects belong to a different Make profile. A seeded fuzz depfile
+     * becomes stale when this generation retimes changed source and poisons
+     * the proof's include graph before the fuzz profile can rebuild it. */
+    if (strncmp(rel, "fuzz-obj/", 9) == 0)
+        return WARM_SEED_SKIP;
+    if (warm_seed_is_wrapper(rel))
+        return WARM_SEED_COPY;
+    if (warm_has_suffix(rel, ".o") || warm_has_suffix(rel, ".d"))
+        return zcl_dependency_build_room_path(rel) ? WARM_SEED_COPY
+                                                   : WARM_SEED_LINK;
+    if (strncmp(rel, "bin/", 4) == 0)
+        return WARM_SEED_COPY;
+    return WARM_SEED_SKIP;
+}
+
+static bool generation_gitlink_prepare(const struct proof_paths *paths,
+                                       const char *generation,
+                                       char *why, size_t why_len)
+{
+    char source[PATH_MAX], config[PATH_MAX + 32];
+    if (snprintf(source, sizeof(source), "%s/vendor/tor", paths->root) >=
+            (int)sizeof(source) ||
+        snprintf(config, sizeof(config), "submodule.vendor/tor.url=%s",
+                 source) >= (int)sizeof(config)) {
+        proof_why(why, why_len, "proof_generation_gitlink_path_invalid");
+        return false;
+    }
+    struct stat st;
+    if (lstat(source, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        proof_why(why, why_len, "proof_generation_gitlink_source_unavailable");
+        return false;
+    }
+    const char *argv[] = {
+        "git", "-c", "protocol.file.allow=always", "-c", config,
+        "submodule", "update", "--init", "--no-fetch", "--", "vendor/tor",
+        NULL};
+    char output[ZCL_DEVLOOP_OUTPUT_MAX];
+    if (!git_capture(generation, argv, output, sizeof(output))) {
+        proof_why(why, why_len, "proof_generation_gitlink_checkout_failed");
+        return false;
+    }
+    return true;
+}
+
+#define PROOF_RAM_RESERVE_BYTES (6ull * 1024ull * 1024ull * 1024ull)
+
+/* ZCL_PROOF_RAM_RESERVE_BYTES may only RAISE the reservation, never shrink
+ * it. A crowded machine may refuse RAM backing outright; a spacious one may
+ * promise more than the shipped default, but no host gets to pack proofs
+ * tighter than the guard they were proved with. */
+static uint64_t proof_ram_reserve_bytes(void)
+{
+    const char *text = getenv("ZCL_PROOF_RAM_RESERVE_BYTES");
+    if (!text || !*text) return PROOF_RAM_RESERVE_BYTES;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (errno || !end || *end || value == 0) return PROOF_RAM_RESERVE_BYTES;
+    if (value < PROOF_RAM_RESERVE_BYTES) return PROOF_RAM_RESERVE_BYTES;
+    return (uint64_t)value;
+}
+
+
+static bool warm_touch_one(const char *path, const struct timespec *stamp)
+{
+    /* Preserve atime; the timestamp graph only reads mtime. utimensat
+     * follows the final component, but every caller stats first and only
+     * ever names regular files, never symlinks. */
+    const struct timespec times[2] = {
+        {.tv_nsec = UTIME_OMIT},
+        {.tv_sec = stamp->tv_sec, .tv_nsec = stamp->tv_nsec},
+    };
+    return path && stamp && utimensat(AT_FDCWD, path, times, 0) == 0;
+}
+
+static bool warm_timespec_after(const struct timespec *a,
+                                const struct timespec *b)
+{
+    return a->tv_sec > b->tv_sec ||
+           (a->tv_sec == b->tv_sec && a->tv_nsec > b->tv_nsec);
+}
+
+/* Byte copy through a temp file plus rename: the target is replaced, never
+ * truncated in place, so a concurrent reader keeps coherent bytes. Mode
+ * 0700, not 0600: this carries the compiler wrapper, and the bootstrap
+ * declines a binary it cannot execute. Private directory already bars
+ * group and other. */
+static bool warm_copy_file(const char *source, const char *target)
+{
+    int input = open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (input < 0) return false;
+    struct stat st;
+    char temporary[PATH_MAX];
+    int output = -1;
+    bool ok = fstat(input, &st) == 0 && S_ISREG(st.st_mode) &&
+        dp_copy_temp_open(target, temporary, &output);
+    if (ok) ok = dp_copy_bytes(input, output);
+    if (close(input) != 0) ok = false;
+    if (output >= 0 && !dp_copy_mode_close(output, 0700)) ok = false;
+    if (ok && rename(temporary, target) != 0) ok = false;
+    if (!ok && output >= 0) (void)unlink(temporary);
+    return ok;
+}
+
+struct warm_seed_accum {
+    char **rels;
+    size_t count;
+    size_t capacity;
+    uint64_t files;
+    uint64_t bytes;
+    bool failed;
+};
+
+static void warm_seed_accum_free(struct warm_seed_accum *accum)
+{
+    if (!accum) return;
+    for (size_t i = 0; i < accum->count; i++) free(accum->rels[i]);
+    free(accum->rels);
+    memset(accum, 0, sizeof(*accum));
+}
+
+static bool warm_seed_remember(struct warm_seed_accum *accum, const char *rel)
+{
+    if (accum->failed || !rel) {
+        accum->failed = true;
+        return false;
+    }
+    if (accum->count == accum->capacity) {
+        size_t next = accum->capacity ? accum->capacity * 2 : 256;
+        char **rels =
+            zcl_realloc(accum->rels, next * sizeof(*rels), "proof_warm_seed");
+        if (!rels) {
+            accum->failed = true;
+            return false;
+        }
+        accum->rels = rels;
+        accum->capacity = next;
+    }
+    size_t len = strlen(rel);
+    char *copy = zcl_malloc(len + 1, "proof_warm_seed");
+    if (!copy) {
+        accum->failed = true;
+        return false;
+    }
+    memcpy(copy, rel, len + 1);
+    accum->rels[accum->count++] = copy;
+    return true;
+}
+
+/* One regular donor file: link it (immutable output) or copy it (small
+ * executed wrapper). macOS copies both classes so a writable generation
+ * cannot mutate a donor through a shared inode. Before linking, unlink
+ * the target so link() never follows
+ * a stale symlink and never fails with EEXIST. Any single-file failure
+ * skips that file and moves on: a missing seed only costs a recompile. */
+static void warm_seed_file(const char *donor_file, const char *gen_file,
+                           const char *rel, enum warm_seed_class class,
+                           const struct stat *donor_st,
+                           struct warm_seed_accum *accum)
+{
+    struct stat gen_st;
+    bool gen_exists = lstat(gen_file, &gen_st) == 0;
+    if (gen_exists && S_ISLNK(gen_st.st_mode)) {
+        if (unlink(gen_file) != 0) return;
+        gen_exists = false;
+    }
+    if (class == WARM_SEED_LINK) {
+#if defined(__APPLE__)
+        if (!dependency_copy_stat(donor_file, gen_file, donor_st)) return;
+#else
+        if (gen_exists && unlink(gen_file) != 0) return;
+        if (link(donor_file, gen_file) != 0) return;
+#endif
+    } else if (class == WARM_SEED_COPY) {
+        if (!warm_copy_file(donor_file, gen_file)) return;
+    } else {
+        return;
+    }
+    if (!warm_seed_remember(accum, rel)) {
+        /* The file is seeded but untracked, so a later repair failure
+         * could not roll it back; unlink it now instead of risking a
+         * half-repaired tree. */
+        (void)unlink(gen_file);
+        return;
+    }
+    accum->files++;
+    accum->bytes += (uint64_t)donor_st->st_size;
+}
+
+/* The walk creates its own target directory chain: readdir order is
+ * unspecified, so a file may precede its directory, and the caller
+ * may hand down a root whose own parents do not exist yet (the seam
+ * test seeds into a bare fixture). dependency_parent_ensure builds
+ * the ancestors; the mkdir takes the directory itself. */
+static bool dp_seed_dir_ensure(const char *gen_dir)
+{
+    struct stat gen_dir_st;
+    if (lstat(gen_dir, &gen_dir_st) != 0) {
+        char probe[PATH_MAX];
+        if (errno != ENOENT ||
+            snprintf(probe, sizeof(probe), "%s/_", gen_dir) >=
+                (int)sizeof(probe) ||
+            !dependency_parent_ensure(probe) ||
+            (mkdir(gen_dir, 0700) != 0 && errno != EEXIST) ||
+            lstat(gen_dir, &gen_dir_st) != 0)
+            return false;
+    }
+    return S_ISDIR(gen_dir_st.st_mode) && !S_ISLNK(gen_dir_st.st_mode);
+}
+
+/* The three names one entry needs: its path relative to the seed root, and
+ * the donor and generation sides of it. Truncation fails the whole seed. */
+static bool dp_seed_child_paths(const char *rel_prefix, const char *name,
+                                const char *donor_dir, const char *gen_dir,
+                                char rel[PATH_MAX], char donor_child[PATH_MAX],
+                                char gen_child[PATH_MAX])
+{
+    int rel_len = rel_prefix && rel_prefix[0]
+        ? snprintf(rel, PATH_MAX, "%s/%s", rel_prefix, name)
+        : snprintf(rel, PATH_MAX, "%s", name);
+    return rel_len > 0 && rel_len < PATH_MAX &&
+           snprintf(donor_child, PATH_MAX, "%s/%s", donor_dir,
+                    name) < PATH_MAX &&
+           snprintf(gen_child, PATH_MAX, "%s/%s", gen_dir, name) < PATH_MAX;
+}
+
+/* Whether the generation side of a donor subdirectory is a real directory
+ * this walk may descend into. */
+static bool dp_seed_subdir_ready(const char *gen_child)
+{
+    struct stat gen_st;
+    if (lstat(gen_child, &gen_st) != 0)
+        return errno == ENOENT && mkdir(gen_child, 0700) == 0;
+    return S_ISDIR(gen_st.st_mode) && !S_ISLNK(gen_st.st_mode);
+}
+
+/* The dev profile maps dev-obj/epochs/<key>/<source>.{o,d} to
+ * <generation>/<source>.c. A retired source has no make target, so its
+ * donor depfile would survive the bundle and make the include graph refuse.
+ * Check the generation, not the donor, before importing either output. */
+static bool dp_seed_dev_source_present(const char *gen_src, const char *rel)
+{
+    static const char prefix[] = "dev-obj/epochs/";
+    if (strncmp(rel, "dev-obj/", 8) != 0 ||
+        (!warm_has_suffix(rel, ".o") && !warm_has_suffix(rel, ".d")))
+        return true;
+    if (strncmp(rel, prefix, sizeof(prefix) - 1) != 0) return false;
+    const char *epoch = rel + sizeof(prefix) - 1;
+    const char *slash = strchr(epoch, '/');
+    if (!slash || slash == epoch || !slash[1]) return false;
+    const char *stem = slash + 1;
+    size_t stem_len = strlen(stem) - 2;
+    char source[PATH_MAX];
+    if (stem_len == 0 || stem_len > INT_MAX ||
+        snprintf(source, sizeof(source), "%s/%.*s.c", gen_src,
+                 (int)stem_len, stem) >= (int)sizeof(source))
+        return false;
+    struct stat st;
+    return lstat(source, &st) == 0 && S_ISREG(st.st_mode) &&
+           !S_ISLNK(st.st_mode);
+}
+
+/* A pool slot may have been used before this donor was chosen. Walk its
+ * existing dev objects as well as the donor: an orphan absent from the donor
+ * would otherwise keep its old depfile and poison the exact include graph.
+ * Directory descriptors and O_NOFOLLOW keep the cleanup inside the private
+ * generation even if an ignored build path has been replaced by a symlink. */
+#if !defined(_WIN32)
+static bool dp_prune_dev_orphans_dir(int fd, const char *gen_src,
+                                     const char *prefix);
+
+static bool dp_prune_dev_orphans_entry(int fd, const char *gen_src,
+                                       const char *prefix, const char *name)
+{
+    char rel[PATH_MAX];
+    if (snprintf(rel, sizeof(rel), "%s/%s", prefix, name) >=
+        (int)sizeof(rel)) return false;
+    struct stat st;
+    if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) return false;
+    if (S_ISDIR(st.st_mode)) {
+        int child = openat(fd, name,
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        return child >= 0 && dp_prune_dev_orphans_dir(child, gen_src, rel);
+    }
+    if ((S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) &&
+        (warm_has_suffix(rel, ".o") || warm_has_suffix(rel, ".d")) &&
+        (S_ISLNK(st.st_mode) ||
+         !dp_seed_dev_source_present(gen_src, rel)))
+        return unlinkat(fd, name, 0) == 0;
+    return true;
+}
+
+static bool dp_prune_dev_orphans_dir(int fd, const char *gen_src,
+                                     const char *prefix)
+{
+    DIR *dir = fdopendir(fd);
+    if (!dir) {
+        (void)close(fd);
+        return false;
+    }
+    bool ok = true;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (!entry) {
+            if (errno != 0) ok = false;
+            break;
+        }
+        if (entry->d_name[0] == '.') continue;
+        if (!dp_prune_dev_orphans_entry(dirfd(dir), gen_src, prefix,
+                                        entry->d_name)) {
+            ok = false;
+            break;
+        }
+    }
+    if (closedir(dir) != 0) ok = false;
+    return ok;
+}
+
+static bool dp_prune_dev_orphans(const char *gen_build, const char *gen_src)
+{
+    if (!gen_build || !gen_src) return false;
+    struct stat st;
+    if (lstat(gen_build, &st) != 0) return errno == ENOENT;
+    if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) return false;
+    int build_fd = open(gen_build,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (build_fd < 0) return false;
+    if (fstatat(build_fd, "dev-obj", &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        bool missing = errno == ENOENT;
+        (void)close(build_fd);
+        return missing;
+    }
+    if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) {
+        (void)close(build_fd);
+        return false;
+    }
+    int fd = openat(build_fd, "dev-obj",
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    (void)close(build_fd);
+    return fd >= 0 && dp_prune_dev_orphans_dir(fd, gen_src, "dev-obj");
+}
+#else
+static bool dp_prune_dev_orphans(const char *gen_build, const char *gen_src)
+{
+    (void)gen_build;
+    (void)gen_src;
+    return false;
+}
+#endif
+
+static void dp_seed_regular(const char *donor_child, const char *gen_child,
+                            const char *gen_src, const char *rel,
+                            bool copy_wrapper,
+                            const struct stat *donor_st,
+                            struct warm_seed_accum *accum)
+{
+    enum warm_seed_class class = warm_classify_rel(rel, true);
+    if (class == WARM_SEED_SKIP) return;
+    if (!dp_seed_dev_source_present(gen_src, rel)) {
+        /* A reused private generation can already hold this old output.
+         * Remove the matching regular file too; never follow a symlink. */
+        struct stat st;
+        if (lstat(gen_child, &st) == 0 &&
+            (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) &&
+            unlink(gen_child) != 0)
+            accum->failed = true;
+        return;
+    }
+    /* The wrapper copy is caller-gated: bin/zcc is a bootstrap input this
+     * generation may inherit only while the inputs that built it are
+     * unchanged. A dependency room file is also COPY class, but for an
+     * unrelated reason — the isolation gate requires it to own its inode —
+     * so it must not inherit that gate and go silently unseeded whenever the
+     * wrapper happens to be stale. Link-class outputs need no gate beyond
+     * the epoch. */
+    if (!copy_wrapper && warm_seed_is_wrapper(rel)) return;
+    if (!dependency_parent_ensure(gen_child)) return;
+    warm_seed_file(donor_child, gen_child, rel, class, donor_st, accum);
+}
+
+/* One donor entry. Returns false only when the whole seed must fail;
+ * `*descend` says the caller should recurse into the paths it filled in. */
+static bool dp_seed_entry(const char *donor_dir, const char *gen_dir,
+                          const char *gen_src, const char *rel_prefix,
+                          const char *name,
+                          bool copy_wrapper, struct warm_seed_accum *accum,
+                          char rel[PATH_MAX], char donor_child[PATH_MAX],
+                          char gen_child[PATH_MAX], bool *descend)
+{
+    *descend = false;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return true;
+    if (!dp_seed_child_paths(rel_prefix, name, donor_dir, gen_dir, rel,
+                             donor_child, gen_child))
+        return false;
+    struct stat donor_st;
+    if (lstat(donor_child, &donor_st) != 0) return true;
+    if (S_ISLNK(donor_st.st_mode)) return true;
+    if (S_ISDIR(donor_st.st_mode)) {
+        /* Hidden directories (.leases, staging, admission) are live
+         * machinery: do not recreate them, do not descend. */
+        if (warm_path_hidden(rel) || strcmp(rel, "fuzz-obj") == 0)
+            return true;
+        *descend = dp_seed_subdir_ready(gen_child);
+        return true;
+    }
+    if (!S_ISREG(donor_st.st_mode)) return true;
+    dp_seed_regular(donor_child, gen_child, gen_src, rel, copy_wrapper, &donor_st,
+                    accum);
+    return true;
+}
+
+static void warm_seed_walk(const char *donor_dir, const char *gen_dir,
+                           const char *gen_src, const char *rel_prefix,
+                           bool copy_wrapper,
+                           struct warm_seed_accum *accum)
+{
+    if (!accum || accum->failed) return;
+    if (!dp_seed_dir_ensure(gen_dir)) {
+        accum->failed = true;
+        return;
+    }
+    DIR *dir = opendir(donor_dir);
+    if (!dir) return;
+    for (struct dirent *entry = readdir(dir); entry;
+         entry = readdir(dir)) {
+        char rel[PATH_MAX], donor_child[PATH_MAX], gen_child[PATH_MAX];
+        bool descend = false;
+        if (accum->failed) break;
+        if (!dp_seed_entry(donor_dir, gen_dir, gen_src, rel_prefix,
+                           entry->d_name,
+                           copy_wrapper, accum, rel, donor_child, gen_child,
+                           &descend)) {
+            accum->failed = true;
+            break;
+        }
+        if (descend)
+            warm_seed_walk(donor_child, gen_child, gen_src, rel, copy_wrapper,
+                           accum);
+    }
+    (void)closedir(dir);
+}
+
+/* Undo a seed: unlink every tracked file. Best effort; a leftover seed
+ * with untouched mtimes only costs a recompile, but a leftover seed after
+ * a partial repair could mislead make, so the repair calls this before it
+ * reports cold. */
+static void warm_seed_rollback(const char *gen_build,
+                               struct warm_seed_accum *accum)
+{
+    for (size_t i = 0; i < accum->count; i++) {
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof(path), "%s/%s", gen_build,
+                     accum->rels[i]) < (int)sizeof(path))
+            (void)unlink(path);
+    }
+}
+
+/* Is `s` the start of a 64-character lowercase hex digest? Stops at the
+ * terminator, so a shorter tail is simply not one. */
+static bool proof_epoch_digest(const char *s)
+{
+    for (size_t i = 0; i < 64; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+/* Hash one build-plan value with every trace of WHERE this checkout lives
+ * taken out, so the same tree at two absolute paths hashes equal.
+ *
+ * Two rewrites, and a reason for each:
+ *  - the checkout root becomes the constant the build already tells the
+ *    compiler to record in its place (-ffile-prefix-map=$(CURDIR)=/zclassic23,
+ *    Makefile REPRO_CFLAGS). Hashing the real path keyed the receipt on a
+ *    string the compiler had itself erased.
+ *  - the epoch segment of an object directory becomes a fixed token. The
+ *    epoch is a cache-partition name derived from the compiler fingerprint
+ *    and the flag text (Makefile zcl_compile_epoch), and that fingerprint
+ *    hashes the CC command string, which spells the checkout out loud
+ *    (tools/dev/build-epoch-key.sh). It is a digest, so no later rewrite can
+ *    reach the path inside it -- and what it stood for is a receipt root in
+ *    its own right now: the compiler by content in compiler_root, the flags
+ *    in flags_root. */
+static void proof_hash_plan_value(struct sha3_256_ctx *sha, const char *root,
+                                  size_t root_len, const char *value)
+{
+    static const char epochs[] = "epochs/";
+    static const char epoch_token[] = "<epoch>";
+    for (const char *p = value; *p;) {
+        if (strncmp(p, root, root_len) == 0) {
+            sha3_256_write(sha, (const uint8_t *)PROOF_PLAN_VIRTUAL_ROOT,
+                           sizeof(PROOF_PLAN_VIRTUAL_ROOT) - 1);
+            p += root_len;
+        } else if (strncmp(p, epochs, sizeof(epochs) - 1) == 0 &&
+                   proof_epoch_digest(p + sizeof(epochs) - 1)) {
+            sha3_256_write(sha, (const uint8_t *)epochs, sizeof(epochs) - 1);
+            sha3_256_write(sha, (const uint8_t *)epoch_token,
+                           sizeof(epoch_token) - 1);
+            p += sizeof(epochs) - 1 + 64;
+        } else {
+            sha3_256_write(sha, (const uint8_t *)p, 1);
+            p++;
+        }
+    }
+    sha3_256_write(sha, (const uint8_t *)"", 1);
+}
+
+/* Which half of the build plan a key belongs to. A key this build has never
+ * heard of goes to the build graph rather than nowhere: a line added to
+ * build/dev-loop/restart.env tomorrow must change the identity, never slip
+ * past it. */
+static bool proof_plan_key_is_flag(const char *key)
+{
+    static const char *const flag_keys[] = {
+        "CC", "DEV_CFLAGS", "DEV_LDFLAGS", "DEV_LIBS",
+        "TEST_CFLAGS", "TEST_LDFLAGS", "TEST_LIBS",
+    };
+    for (size_t i = 0; i < sizeof(flag_keys) / sizeof(flag_keys[0]); i++)
+        if (strcmp(key, flag_keys[i]) == 0)
+            return true;
+    return false;
+}
+
+/* The flag and build-graph roots, from one read of the build plan.
+ *
+ * COMPILER_ID is the one line dropped rather than hashed. It is a digest of
+ * the CC command string, which contains this checkout's absolute path, so
+ * nothing can neutralise it after the fact -- and the toolchain capsule now
+ * says by content what COMPILER_ID said by name, including the header and
+ * library redirections, which environment_root binds. Dropping it is the
+ * whole reason two boxes can compare receipts at all. BASE_GENERATION is
+ * retained canonically in the graph and returned separately for verification
+ * against its own tree: inode/timestamp identity cannot survive a copy. */
+/* `make dev-bin` is the sole writer of the plan file (dev-linker-select.sh
+ * plus the dev build's restart-env generator); a fresh `git worktree
+ * add` checkout never ran it, and ten proof attempts folding this into
+ * "proof_toolchain_or_policy_unavailable" never said so. Name the path
+ * and the exact command the same way the vendor dependency check
+ * further down names its own missing input. */
+static void dp_plan_missing_why(const char *path, int saved, char *why,
+                                size_t why_len)
+{
+    if (saved == ENOENT)
+        proof_whyf(why, why_len, "restart_env_missing:%s (make dev-bin)",
+                   path);
+    else
+        proof_whyf(why, why_len, "restart_env_unreadable:%s (%s)", path,
+                   proof_errno_name(saved));
+}
+
+/* The build plan, whole. An empty read or one that filled the buffer is
+ * refused rather than hashed. */
+static bool dp_plan_body_read(const char *path, char *body, size_t body_size,
+                              char *why, size_t why_len)
+{
+    errno = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        dp_plan_missing_why(path, errno, why, why_len);
+        return false;
+    }
+    size_t n = fread(body, 1, body_size - 1, f);
+    bool ok = !ferror(f) && n > 0 && n < body_size - 1 &&
+              memchr(body, 0, n) == NULL;
+    fclose(f);
+    if (!ok) return false;
+    body[n] = 0;
+    return true;
+}
+
+/* The local mutation token, which must appear exactly once and must be a
+ * 64-character lowercase hex digest. */
+static bool dp_plan_mutation_take(const char *value, bool *mutation_seen,
+                                  char *mutation)
+{
+    uint8_t decoded[32];
+    if (*mutation_seen || strlen(value) != 64 ||
+        !zcl_hex_decode_lower(value, decoded, sizeof(decoded))) {
+        fprintf(stderr, "[devproof] build plan: invalid or duplicate local mutation token\n");
+        return false;
+    }
+    *mutation_seen = true;
+    if (mutation) memcpy(mutation, value, 65);
+    return true;
+}
+
+/* One KEY=VALUE plan line, folded into whichever of the two roots owns it.
+ * The mutation token is folded in by name only; its value is verified
+ * against its own tree, never carried into a portable root. */
+static bool dp_plan_line(char *line, const char *root, size_t root_len,
+                         struct sha3_256_ctx *flags_sha,
+                         struct sha3_256_ctx *graph_sha, char *mutation,
+                         bool *mutation_seen)
+{
+    char *eq = strchr(line, '=');
+    if (!eq) return false; /* a plan line that is not KEY=VALUE */
+    *eq = 0;
+    if (strcmp(line, "COMPILER_ID") == 0) return true;
+    struct sha3_256_ctx *sha =
+        proof_plan_key_is_flag(line) ? flags_sha : graph_sha;
+    sha3_256_write(sha, (const uint8_t *)line, strlen(line) + 1);
+    if (strcmp(line, "BASE_GENERATION") != 0) {
+        proof_hash_plan_value(sha, root, root_len, eq + 1);
+        return true;
+    }
+    if (!dp_plan_mutation_take(eq + 1, mutation_seen, mutation)) return false;
+    proof_hash_plan_value(sha, root, root_len, "<local-mutation>");
+    return true;
+}
+
+static bool proof_plan_roots(const char *root, uint8_t flags[32],
+                             uint8_t build_graph[32], char mutation[65], char *why,
+                             size_t why_len)
+{
+    char path[PATH_MAX], body[PROOF_PLAN_MAX_BYTES];
+    size_t root_len = root ? strlen(root) : 0;
+    /* A root of "" or "/" would rewrite the head of every absolute path in
+     * the plan, including the sysroot library paths. Refuse instead of
+     * modelling it, exactly as zcc's prefix-map reader does. */
+    if (!flags || !build_graph || root_len < 2u || root[0] != '/' ||
+        snprintf(path, sizeof(path), "%s/build/dev-loop/restart.env", root) >=
+            (int)sizeof(path))
+        return false;
+    if (!dp_plan_body_read(path, body, sizeof(body), why, why_len))
+        return false;
+    struct sha3_256_ctx flags_sha, graph_sha;
+    hash_begin(&flags_sha, PROOF_FLAGS_DOMAIN);
+    hash_begin(&graph_sha, PROOF_BUILD_GRAPH_DOMAIN);
+    bool mutation_seen = false;
+    char *save = NULL;
+    for (char *line = strtok_r(body, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save))
+        if (!dp_plan_line(line, root, root_len, &flags_sha, &graph_sha,
+                          mutation, &mutation_seen))
+            return false;
+    if (!mutation_seen) {
+        fprintf(stderr, "[devproof] build plan: missing local mutation token\n");
+        return false;
+    }
+    sha3_256_finalize(&flags_sha, flags);
+    sha3_256_finalize(&graph_sha, build_graph);
+    return true;
+}
+
+/* The variables a receipt binds, and why each is here rather than in a flag:
+ * every one changes what the resolved compiler is handed without appearing
+ * in the plan's argv text -- header and library search redirection, the
+ * driver's subprogram prefix, the SDK root, the build clock. CC/CXX/CFLAGS/
+ * CPPFLAGS/LDFLAGS are here because they are the operator's stated intent;
+ * their effect on the objects is already in flags_root, since Make bakes
+ * them into the plan.
+ *
+ * PATH is deliberately absent, and its absence is the point. Hashing the
+ * literal search path made two boxes with one toolchain disagree about a
+ * variable that resolves nothing this build compiles with: the toolchain
+ * capsule reads the driver at its absolute path
+ * (platform/modules/platform/src/toolchain.c) and hashes the driver, the
+ * backend, the assembler version, the sysroot and the ABI libraries by
+ * content. A reordered PATH now moves no root; a different compiler binary
+ * still moves compiler_root. Locale is absent for the same reason -- it
+ * moves diagnostics, never produced bytes. */
+static bool proof_environment_root(uint8_t out[32])
+{
+    static const char *const names[] = {
+        "CC", "CXX", "CFLAGS", "CPPFLAGS", "LDFLAGS",
+        "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "COMPILER_PATH",
+        "LIBRARY_PATH", "GCC_EXEC_PREFIX", "SDKROOT", "SOURCE_DATE_EPOCH",
+    };
+    struct sha3_256_ctx sha;
+    hash_begin(&sha, PROOF_ENV_DOMAIN);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const char *value = getenv(names[i]);
+        /* Set-to-empty and unset are different facts; a bare value would
+         * make them hash the same. */
+        static const char set_tag[] = "set", unset_tag[] = "unset";
+        const char *tag = value ? set_tag : unset_tag;
+        sha3_256_write(&sha, (const uint8_t *)names[i], strlen(names[i]) + 1);
+        sha3_256_write(&sha, (const uint8_t *)tag, strlen(tag) + 1);
+        if (value)
+            sha3_256_write(&sha, (const uint8_t *)value, strlen(value) + 1);
+    }
+    sha3_256_finalize(&sha, out);
+    return true;
+}
+
+/* The one derivation of a proof's four toolchain roots. The receipt writes
+ * them into compiler_root/flags_root/environment_root/build_graph_root, and
+ * the warm-start build-complete marker seals the same four from the same
+ * call -- so a donor whose build identity does not match this proof's own is
+ * exactly as inadmissible as a receipt would be, and there is no second
+ * derivation for the two to drift apart on. That matters because a compiler
+ * upgrade, a changed CFLAGS, or a vendor archive rebuilt in place leaves no
+ * source diff the wrapper-inputs check would catch.
+ *
+ * None of the four carries this checkout's location, so the same tree at two
+ * absolute paths yields the same four values. That is what makes a receipt
+ * mean anything on a second box. */
+static bool proof_build_identity_capture(
+    const char *repo_root, struct zcl_dev_proof_build_identity_v1 *out,
+    char mutation[65], char *why, size_t why_len)
+{
+    struct vcs_toolchain_capsule_v1 capsule;
+    if (why && why_len) why[0] = 0;
+    if (!repo_root || !out) return false;
+    memset(out, 0, sizeof(*out));
+    return vcs_toolchain_capsule_v1_capture(&capsule) &&
+           vcs_toolchain_capsule_v1_root(&capsule, out->compiler) &&
+           proof_plan_roots(repo_root, out->flags, out->build_graph, mutation, why,
+                            why_len) &&
+           proof_environment_root(out->environment);
+}
+
+bool zcl_dev_proof_build_identity_v1_capture(
+    const char *repo_root, struct zcl_dev_proof_build_identity_v1 *out,
+    char *why, size_t why_len)
+{
+    return proof_build_identity_capture(repo_root, out, NULL, why, why_len);
+}
+
+bool zcl_dev_proof_build_plan_verify(
+    const char *root, const struct zcl_dev_proof_build_identity_v1 *expected,
+    const char *expected_mutation, char *why, size_t why_len)
+{
+    uint8_t flags[32], graph[32], decoded[32];
+    char mutation[65], plan_why[PATH_MAX + 160] = {0};
+    const char *reason = NULL;
+    if (!expected || !expected_mutation || strlen(expected_mutation) != 64 ||
+        !zcl_hex_decode_lower(expected_mutation, decoded, sizeof(decoded)) ||
+        !proof_plan_roots(root, flags, graph, mutation, plan_why,
+                          sizeof(plan_why)))
+        reason = "proof_offline_build_plan_unavailable";
+    else if (strcmp(mutation, expected_mutation) != 0)
+        reason = "proof_offline_build_mutation_changed";
+    else if (memcmp(flags, expected->flags, sizeof(flags)) != 0)
+        reason = "proof_offline_build_flags_changed";
+    else if (memcmp(graph, expected->build_graph, sizeof(graph)) != 0)
+        reason = "proof_offline_build_graph_changed";
+    if (reason) {
+        fprintf(stderr, "[devproof] build plan verification: %s\n", reason);
+        if (plan_why[0])
+            proof_whyf(why, why_len, "%s:%s", reason, plan_why);
+        else
+            proof_why(why, why_len, reason);
+        return false;
+    }
+    return true;
+}
+
+static bool proof_build_identity_equal(
+    const struct zcl_dev_proof_build_identity_v1 *a,
+    const struct zcl_dev_proof_build_identity_v1 *b)
+{
+    return a && b && memcmp(a->compiler, b->compiler, 32) == 0 &&
+           memcmp(a->flags, b->flags, 32) == 0 &&
+           memcmp(a->environment, b->environment, 32) == 0 &&
+           memcmp(a->build_graph, b->build_graph, 32) == 0;
+}
+
+/* The build-complete marker is the donor gate: it says this generation's
+ * build finished for the marked commit under the sealed `identity` — a full
+ * `make build-only` when the compile dimension builds, or the prefork bundle
+ * when the compile dimension reused the checkout's admitted z23-dev (a
+ * landing proof's only build). Written best effort after whichever of the
+ * two ran; a missing marker only costs a cold build. */
+static bool warm_marker_write_at(const char *generation, const char *root,
+                                   const char *local, const char *base,
+                                   int64_t completed,
+                                   const struct zcl_dev_proof_build_identity_v1 *identity)
+{
+    char path[PATH_MAX], body[PATH_MAX + 512];
+    char compiler_hex[65], flags_hex[65], environment_hex[65];
+    char build_graph_hex[65];
+    if (identity) {
+        zcl_hex_encode(identity->compiler, 32, compiler_hex);
+        zcl_hex_encode(identity->flags, 32, flags_hex);
+        zcl_hex_encode(identity->environment, 32, environment_hex);
+        zcl_hex_encode(identity->build_graph, 32, build_graph_hex);
+    }
+    int path_len = generation ? snprintf(path, sizeof(path), "%s/%s",
+                                         generation, PROOF_WARM_MARKER_REL)
+                              : -1;
+    int body_len = path_len > 0 && root && local && base && completed > 0 &&
+            identity
+        ? snprintf(body, sizeof(body), "%s\nroot=%s\nlocal=%s\nbase=%s\n"
+                   "completed=%lld\ncompiler=%s\nflags=%s\nenvironment=%s\n"
+                   "build_graph=%s\n",
+                   PROOF_WARM_MARKER_SCHEMA, root, local, base,
+                   (long long)completed, compiler_hex, flags_hex,
+                   environment_hex, build_graph_hex)
+        : -1;
+    return path_len > 0 && path_len < (int)sizeof(path) && body_len > 0 &&
+           body_len < (int)sizeof(body) &&
+           write_atomic(path, body, (size_t)body_len, 0600);
+}
+
+static bool warm_marker_write(const char *generation, const char *root,
+                              const char *local, const char *base)
+{
+    struct zcl_dev_proof_build_identity_v1 identity;
+    if (!zcl_dev_proof_build_identity_v1_capture(root, &identity, NULL, 0))
+        return false;
+    return warm_marker_write_at(generation, root, local, base,
+                                platform_time_wall_unix(), &identity);
+}
+
+static bool warm_marker_line(const char *line, const char *key,
+                             char *out, size_t out_size)
+{
+    size_t key_len = strlen(key);
+    if (!line || strncmp(line, key, key_len) != 0 || line[key_len] != '=')
+        return false;
+    const char *value = line + key_len + 1;
+    size_t len = strlen(value);
+    return len > 0 && len < out_size &&
+           snprintf(out, out_size, "%s", value) > 0;
+}
+
+/* The eight text fields a donor marker carries, before any of them has been
+ * checked. Nothing here is trusted until dp_marker_identity, dp_marker_root
+ * and dp_marker_completed have each had their say. */
+struct dp_marker_fields {
+    char root[PATH_MAX];
+    char local[65];
+    char base[65];
+    char completed[32];
+    char compiler[65];
+    char flags[65];
+    char environment[65];
+    char build_graph[65];
+};
+
+/* The marker file, whole. A short read, an empty file, or one that filled
+ * the buffer is refused rather than parsed. */
+static bool dp_marker_body_read(const char *generation, char *body,
+                                size_t body_size)
+{
+    char path[PATH_MAX];
+    if (!generation ||
+        snprintf(path, sizeof(path), "%s/%s", generation,
+                 PROOF_WARM_MARKER_REL) >= (int)sizeof(path))
+        return false;
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    size_t n = fread(body, 1, body_size - 1, f);
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok || n == 0 || n == body_size - 1) return false;
+    body[n] = 0;
+    return true;
+}
+
+/* Every remaining line must name exactly one known field. An unrecognised
+ * line refuses the marker; it is never skipped. */
+static bool dp_marker_collect(char **save, struct dp_marker_fields *got,
+                              int *fields)
+{
+    char *line;
+    while ((line = strtok_r(NULL, "\n", save))) {
+        if (warm_marker_line(line, "root", got->root, sizeof(got->root)) ||
+            warm_marker_line(line, "local", got->local, sizeof(got->local)) ||
+            warm_marker_line(line, "base", got->base, sizeof(got->base)) ||
+            warm_marker_line(line, "completed", got->completed,
+                             sizeof(got->completed)) ||
+            warm_marker_line(line, "compiler", got->compiler,
+                             sizeof(got->compiler)) ||
+            warm_marker_line(line, "flags", got->flags, sizeof(got->flags)) ||
+            warm_marker_line(line, "environment", got->environment,
+                             sizeof(got->environment)) ||
+            warm_marker_line(line, "build_graph", got->build_graph,
+                             sizeof(got->build_graph)))
+            (*fields)++;
+        else
+            return false;
+    }
+    return true;
+}
+
+/* proof_oid_text rejects anything that is not a lowercase hex object
+ * id; dp_marker_root_ok bars escapes. Any shortfall refuses -- a
+ * marker from before the identity fields existed is exactly the
+ * shortfall this rejects, so an old marker degrades to cold rather
+ * than being adopted unverified. */
+static bool dp_marker_identity(
+    const struct dp_marker_fields *got, int fields,
+    struct zcl_dev_proof_build_identity_v1 *identity)
+{
+    return fields == 8 && proof_oid_text(got->local) &&
+           proof_oid_text(got->base) &&
+           zcl_hex_decode_lower(got->compiler, identity->compiler, 32) &&
+           zcl_hex_decode_lower(got->flags, identity->flags, 32) &&
+           zcl_hex_decode_lower(got->environment, identity->environment, 32) &&
+           zcl_hex_decode_lower(got->build_graph, identity->build_graph, 32);
+}
+
+static bool dp_marker_root_ok(const char *got_root)
+{
+    return got_root[0] == '/' && !strstr(got_root, "..") &&
+           !strchr(got_root, '\\');
+}
+
+static bool dp_marker_completed(const char *text, int64_t *out)
+{
+    char *end = NULL;
+    errno = 0;
+    long long completed = strtoll(text, &end, 10);
+    if (errno != 0 || !end || *end != 0 || completed <= 0) return false;
+    *out = (int64_t)completed;
+    return true;
+}
+
+static bool warm_marker_read(const char *generation, char root[PATH_MAX],
+                             char local[65], char base[65],
+                             int64_t *completed_out,
+                             struct zcl_dev_proof_build_identity_v1 *identity_out)
+{
+    char body[2048];
+    if (!dp_marker_body_read(generation, body, sizeof(body))) return false;
+    char *save = NULL, *line = strtok_r(body, "\n", &save);
+    if (!line || strcmp(line, PROOF_WARM_MARKER_SCHEMA) != 0) return false;
+    struct dp_marker_fields got = {0};
+    int fields = 0;
+    if (!dp_marker_collect(&save, &got, &fields)) return false;
+    struct zcl_dev_proof_build_identity_v1 identity;
+    if (!dp_marker_identity(&got, fields, &identity)) return false;
+    if (!dp_marker_root_ok(got.root)) return false;
+    int64_t completed = 0;
+    if (!dp_marker_completed(got.completed, &completed)) return false;
+    if (root) (void)snprintf(root, PATH_MAX, "%s", got.root);
+    if (local) (void)snprintf(local, 65, "%s", got.local);
+    if (base) (void)snprintf(base, 65, "%s", got.base);
+    if (completed_out) *completed_out = completed;
+    if (identity_out) *identity_out = identity;
+    return true;
+}
+
+/* Same path hygiene as the proof's own changed-set capture: a diff line
+ * must be a relative tracked path, never an escape. */
+static bool warm_changed_path_ok(const char *line)
+{
+    size_t len = line ? strlen(line) : 0;
+    return len > 0 && len < 256 && line[0] != '/' &&
+           !strstr(line, "..") && !strchr(line, '\\');
+}
+
+/* One entry of a restamped subtree: a regular file is stamped, a
+ * subdirectory is pushed onto the caller's stack for the walk to reach,
+ * and everything else is left alone. Symlinks are never followed. Returns
+ * false only for a failure that must stop the whole restamp. */
+static bool dp_touch_entry(const char *dir_path, const char *name,
+                           const struct timespec *stamp, char **stack,
+                           size_t stack_cap, size_t *depth)
+{
+    char child[PATH_MAX];
+    struct stat child_st;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+        snprintf(child, sizeof(child), "%s/%s", dir_path, name) >=
+            (int)sizeof(child) ||
+        lstat(child, &child_st) != 0)
+        return true;
+    if (S_ISLNK(child_st.st_mode)) return true;
+    if (S_ISDIR(child_st.st_mode)) {
+        if (*depth >= stack_cap) return true;
+        char *held = zcl_malloc(strlen(child) + 1, "proof_warm_touch");
+        if (!held) return false;
+        (void)snprintf(held, strlen(child) + 1, "%s", child);
+        stack[(*depth)++] = held;
+        return true;
+    }
+    return !S_ISREG(child_st.st_mode) || warm_touch_one(child, stamp);
+}
+
+/* Restamp every regular file under one directory, iteratively: the stack
+ * holds at most 64 pending directories and deeper ones are left alone,
+ * because an unstamped file only costs a recompile. `top` is the caller's
+ * buffer and is the one entry that must never be freed. */
+static void dp_touch_subtree(const char *path, const struct timespec *stamp,
+                             bool *ok)
+{
+    char *stack[64];
+    size_t depth = 0;
+    char top[PATH_MAX];
+    if (snprintf(top, sizeof(top), "%s", path) >= (int)sizeof(top)) {
+        *ok = false;
+        return;
+    }
+    stack[depth++] = top;
+    while (depth > 0 && *ok) {
+        char *dir_path = stack[--depth];
+        DIR *dir = opendir(dir_path);
+        if (!dir) {
+            *ok = false;
+            break;
+        }
+        for (struct dirent *entry = readdir(dir); entry && *ok;
+             entry = readdir(dir))
+            if (!dp_touch_entry(dir_path, entry->d_name, stamp, stack,
+                                sizeof(stack) / sizeof(stack[0]), &depth))
+                *ok = false;
+        (void)closedir(dir);
+        if (dir_path != top) free(dir_path);
+    }
+    while (depth > 0) free(stack[--depth]);
+}
+
+/* Stamp one changed path: a regular file gets the source stamp, a
+ * directory (a moved submodule pointer) stamps every regular file under
+ * it, and anything else is skipped. Symlinks are never followed. */
+static void warm_touch_changed(const char *generation, const char *rel,
+                               const struct timespec *stamp, bool *ok)
+{
+    char path[PATH_MAX];
+    struct stat st;
+    if (!ok || !*ok || !warm_changed_path_ok(rel) ||
+        snprintf(path, sizeof(path), "%s/%s", generation, rel) >=
+            (int)sizeof(path) ||
+        lstat(path, &st) != 0) {
+        return;
+    }
+    if (S_ISREG(st.st_mode)) {
+        if (!warm_touch_one(path, stamp)) *ok = false;
+        return;
+    }
+    if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) return;
+    /* Submodule pointer move: conservatively restamp the whole subtree so
+     * no translation unit including those headers is missed. Over-broad
+     * only costs recompiles, never a stale reuse. */
+    dp_touch_subtree(path, stamp, ok);
+}
+
+/* Donor survey record: the public seam type from dev_proof.h, so the
+ * harness proves the pick policy against the exact struct production
+ * surveys. The pick reads only the policy fields (completed, touched,
+ * head_ok, live); path and local ride along for the caller. */
+
+/* Newest completed, verifiable, idle generation wins; ties keep the
+ * earlier candidate, which keeps repeated scans stable. */
+static int warm_pick_donor(const struct zcl_dev_proof_warm_candidate
+                               *candidates,
+                           size_t count)
+{
+    int best = -1;
+    for (size_t i = 0; i < count; i++) {
+        if (!candidates || !candidates[i].head_ok || candidates[i].live)
+            continue;
+        if (best < 0 ||
+            candidates[i].completed > candidates[best].completed ||
+            (candidates[i].completed == candidates[best].completed &&
+             candidates[i].touched > candidates[best].touched))
+            best = (int)i;
+    }
+    return best;
+}
+
+static bool warm_generation_touched(const char *generation, int64_t *touched)
+{
+    struct stat st;
+    if (!generation || lstat(generation, &st) != 0 ||
+        !S_ISDIR(st.st_mode))
+        return false;
+    if (touched) *touched = (int64_t)st.st_mtime;
+    return true;
+}
+
+/* A donor counts as in use while its proof lease or running lock is live.
+ * The marker names the pair, so the checkout's own lease directory
+ * answers exactly; anything lease-less falls back to the idle rule in the
+ * caller. */
+static bool warm_donor_live(const char *root, const char *local,
+                            const char *base)
+{
+    char lease[PATH_MAX], lock[PATH_MAX];
+    if (!root || !local || !base ||
+        snprintf(lease, sizeof(lease),
+                 "%s/.cache/zcl-dev-proof/leases/%s-%s.lease", root, local,
+                 base) >= (int)sizeof(lease) ||
+        snprintf(lock, sizeof(lock), "%s/.cache/zcl-dev-proof/%s-%s.running",
+                 root, local, base) >= (int)sizeof(lock))
+        return true;
+    return proof_lease_running(lease, NULL, NULL) ||
+           proof_running(lock, NULL, NULL);
+}
+
+/* Stamp every seeded output to the seed instant. Unchanged sources keep
+ * their checkout mtime (older: reuse); changed sources are stamped later
+ * by warm_retime_sources (newer: rebuild). */
+/* Advance the wall clock past the seed stamp without inventing a
+ * future time: spins a bounded number of reads until the clock moves.
+ * Nanosecond clocks exit on the first read; a stuck clock refuses, which
+ * the caller turns into a cold build. */
+static bool warm_stamp_after(const struct timespec *seed_stamp,
+                             struct timespec *source_stamp)
+{
+    if (!seed_stamp || !source_stamp) return false;
+    for (int spins = 0; spins < 1000000; spins++) {
+        if (platform_time_realtime_timespec(source_stamp) != 0)
+            return false;
+        if (warm_timespec_after(source_stamp, seed_stamp)) return true;
+    }
+    return warm_timespec_after(source_stamp, seed_stamp);
+}
+
+/* Stamp every seeded output to the seed instant. Unchanged sources keep
+ * their checkout mtime (older: reuse); changed sources are stamped later
+ * by warm_retime_sources (newer: rebuild). */
+static bool warm_retime_outputs(const char *gen_build,
+                                struct warm_seed_accum *accum,
+                                struct timespec *seed_stamp)
+{
+    /* The platform wall clock is millisecond-granular; filesystem creation
+     * timestamps can be finer. A stamp from the current tick could precede
+     * a source just materialized in that tick. Wait for the next real tick
+     * before stamping seeds, so unchanged sources remain strictly older. */
+    struct timespec began;
+    if (platform_time_realtime_timespec(&began) != 0 ||
+        !warm_stamp_after(&began, seed_stamp))
+        return false;
+    for (size_t i = 0; i < accum->count; i++) {
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof(path), "%s/%s", gen_build,
+                     accum->rels[i]) >= (int)sizeof(path) ||
+            !warm_touch_one(path, seed_stamp))
+            return false;
+    }
+    return true;
+}
+
+/* Stamp the exact changed set strictly after the seeds. Spins the wall
+ * clock forward rather than inventing a future time: both stamps stay at
+ * or below the real now, so no later make ever sees a file from the
+ * future. A changed path that is gone (deleted) or unstatable is skipped;
+ * its absence already forces make to rebuild whatever named it. */
+static bool warm_retime_sources(const char *generation,
+                                const char *donor_local, const char *local,
+                                const struct timespec *seed_stamp)
+{
+    const char *argv[] = {"git", "diff", "--name-only", "--no-renames",
+                          donor_local, local, "--", NULL};
+    char output[ZCL_DEVLOOP_OUTPUT_MAX];
+    if (!generation || !donor_local || !local || !seed_stamp ||
+        !git_capture(generation, argv, output, sizeof(output)))
+        return false;
+    struct timespec source_stamp = *seed_stamp;
+    if (!warm_stamp_after(seed_stamp, &source_stamp)) return false;
+    bool ok = true;
+    char *save = NULL;
+    for (char *line = strtok_r(output, "\n", &save); line && ok;
+         line = strtok_r(NULL, "\n", &save)) {
+        if (line[0] == 0) continue;
+        warm_touch_changed(generation, line, &source_stamp, &ok);
+    }
+    return ok;
+}
+
+/* The seeded wrapper binary is trusted only when its build inputs are
+ * byte-identical between the donor commit and the new commit. The epoch
+ * key moves when the toolchain or flags move, which already strands
+ * seeded objects; the wrapper has no epoch of its own, so this diff is
+ * its freshness. The catalog and its reader script are inputs too: a
+ * changed catalog could silently narrow the checked set. --quiet turns
+ * the diff into a boolean; any failure (including "different") refuses. */
+/* The vocabulary a catalog path may be spelled in. Anything outside it
+ * refuses the catalog rather than being quoted into a git argument. */
+static bool dp_wrapper_word_char(char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+           c == '/' || c == '-';
+}
+
+static bool dp_wrapper_input_clean(const char *line, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+        if (!dp_wrapper_word_char(line[i])) return false;
+    return strstr(line, "..") == NULL;
+}
+
+/* 1 = complete record (including valid EOF tail), 0 = EOF, -1 = refusal. */
+static int dp_wrapper_record_read(FILE *f, char line[256], size_t *len)
+{
+    size_t n = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF && c != '\n') {
+        if (c == 0 || n == 255) return -1;
+        line[n++] = (char)c;
+    }
+    if (ferror(f)) return -1;
+    bool eof = c == EOF && n == 0;
+    while (n > 0 && line[n - 1] == '\r') n--;
+    line[n] = 0;
+    *len = n;
+    return eof ? 0 : 1;
+}
+
+/* Read the bootstrap-input catalog into a fixed table. A line that is too
+ * long, spelled outside the path vocabulary, or one too many for the table
+ * refuses the whole catalog: a catalog this reader cannot fully account for
+ * must never silently narrow the checked set. */
+static bool dp_wrapper_catalog_read(FILE *f, char inputs[][128],
+                                    size_t input_cap, size_t *input_count)
+{
+    char line[256];
+    size_t len, count = *input_count;
+    int record;
+    while ((record = dp_wrapper_record_read(f, line, &len)) > 0) {
+        if (len == 0 || strncmp(line, "license=", 8) == 0) continue;
+        if (len >= sizeof(inputs[0])) return false;
+        if (!dp_wrapper_input_clean(line, len) || count >= input_cap)
+            return false;
+        (void)snprintf(inputs[count++], sizeof(inputs[0]), "%s", line);
+    }
+    if (record < 0) return false;
+    *input_count = count;
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_wrapper_catalog(FILE *, char (*)[128], size_t, size_t *);
+bool zcl_dev_proof_test_wrapper_catalog(FILE *f, char inputs[][128], size_t cap,
+                                       size_t *count)
+{
+    return dp_wrapper_catalog_read(f, inputs, cap, count);
+}
+#endif
+
+static bool warm_wrapper_inputs_unchanged(const char *root,
+                                          const char *donor_local,
+                                          const char *local)
+{
+    char catalog[PATH_MAX];
+    if (!root || !donor_local || !local ||
+        snprintf(catalog, sizeof(catalog), "%s/tools/dev/"
+                 "zcc-bootstrap-inputs.list", root) >= (int)sizeof(catalog))
+        return false;
+    FILE *f = fopen(catalog, "r");
+    if (!f) return false;
+    char inputs[12][128];
+    size_t input_count = 0;
+    bool ok = dp_wrapper_catalog_read(f, inputs,
+                                      sizeof(inputs) / sizeof(inputs[0]),
+                                      &input_count);
+    bool complete = !ferror(f);
+    fclose(f);
+    if (!ok || !complete || input_count == 0) return false;
+    const char *fixed[] = {
+        "tools/dev/zcc-bootstrap-inputs.list",
+        "tools/dev/zcc_bootstrap.sh",
+    };
+    size_t fixed_count = sizeof(fixed) / sizeof(fixed[0]);
+    const char *argv[6 + 12 + 2 + 1];
+    size_t argc = 0;
+    argv[argc++] = "git";
+    argv[argc++] = "diff";
+    argv[argc++] = "--quiet";
+    argv[argc++] = "--no-renames";
+    argv[argc++] = donor_local;
+    argv[argc++] = local;
+    argv[argc++] = "--";
+    for (size_t i = 0; i < fixed_count; i++) argv[argc++] = fixed[i];
+    for (size_t i = 0; i < input_count; i++) argv[argc++] = inputs[i];
+    argv[argc] = NULL;
+    char ignored[8];
+    return git_capture(root, argv, ignored, sizeof(ignored));
+}
+
+struct warm_donor {
+    char path[PATH_MAX];
+    char local[65];
+    char base[65];
+};
+
+/* Why one pool entry could not donate, in the order the survey tests it.
+ * A later stage means the entry got further, so the furthest verdict any
+ * entry reached is the most useful single cold reason: "donor_live" says a
+ * matching donor existed and was busy, "donor_no_marker" says nothing in
+ * the pool ever finished a build. Each name fits the sidecar's reason
+ * field, and every rejected entry is named with its verdict in phases.txt,
+ * so a cold proof is diagnosable from the attempt alone. The two trust
+ * verdicts come last because an entry reaches them only after matching on
+ * everything else: "donor_untrusted_same_uid" says the one thing standing
+ * between this proof and a warm start is who built the donor. */
+enum dp_donor_verdict {
+    DP_DONOR_NOT_CANDIDATE = 0, /* foreign tag, or the caller's own */
+    DP_DONOR_NO_MARKER,
+    DP_DONOR_ROOT_DIFFERS,
+    DP_DONOR_IDENTITY_DIFFERS,
+    DP_DONOR_NO_BUILD_TREE,
+    DP_DONOR_HEAD_MOVED,
+    DP_DONOR_LIVE,
+    DP_DONOR_UNTRUSTED_SAME_UID,
+    DP_DONOR_VERIFIER_UNQUALIFIED,
+    DP_DONOR_ELIGIBLE,
+};
+
+static const char *dp_donor_verdict_name(enum dp_donor_verdict verdict)
+{
+    switch (verdict) {
+    case DP_DONOR_NO_MARKER: return "donor_no_marker";
+    case DP_DONOR_ROOT_DIFFERS: return "donor_root_differs";
+    case DP_DONOR_IDENTITY_DIFFERS: return "donor_identity_differs";
+    case DP_DONOR_NO_BUILD_TREE: return "donor_no_build_tree";
+    case DP_DONOR_HEAD_MOVED: return "donor_head_moved";
+    case DP_DONOR_LIVE: return "donor_live";
+    case DP_DONOR_UNTRUSTED_SAME_UID: return "donor_untrusted_same_uid";
+    case DP_DONOR_VERIFIER_UNQUALIFIED: return "donor_verifier_unqualified";
+    case DP_DONOR_ELIGIBLE: return "donor_eligible";
+    case DP_DONOR_NOT_CANDIDATE: break;
+    }
+    return "no_eligible_donor";
+}
+
+/* Whether an account other than the candidate's is qualified to vouch for
+ * the objects it built. None is: this is the warm-start twin of the test
+ * dimension's `test-reuse: unqualified(no_verifier_account)`. Qualifying a
+ * verifier here -- a separate uid that built, and alone can write, every
+ * seeded file -- is the one change that turns warm start back on for
+ * authoritative proofs; the seeding below it is kept intact for that. */
+static bool dp_warm_verifier_qualified(uid_t producer)
+{
+    (void)producer;
+    return false;
+}
+
+/* An authoritative proof may build on a donor's objects only when a signer
+ * outside the candidate trust domain produced them. Every generation this
+ * uid built ran candidate code as this uid, which could plant an object
+ * its source never compiles to (stamped ahead so make never rebuilds it)
+ * or write one in place through the hard link a warm seed shares, so a
+ * same-uid donor is refused outright and the proof builds cold. */
+static enum dp_donor_verdict dp_donor_trust_verdict(const char *candidate_path)
+{
+    struct stat st;
+    if (lstat(candidate_path, &st) != 0 || st.st_uid == geteuid())
+        return DP_DONOR_UNTRUSTED_SAME_UID;
+    return dp_warm_verifier_qualified(st.st_uid)
+               ? DP_DONOR_ELIGIBLE
+               : DP_DONOR_VERIFIER_UNQUALIFIED;
+}
+
+/* The verdicts the pick policy weighs: the eligible, plus the two it must
+ * see to skip (a moved checkout, a leased proof). A trust refusal is never
+ * a candidate, so no pick can fall back to it. */
+static bool dp_donor_pickable(enum dp_donor_verdict verdict)
+{
+    return verdict == DP_DONOR_HEAD_MOVED || verdict == DP_DONOR_LIVE ||
+           verdict == DP_DONOR_ELIGIBLE;
+}
+
+/* The marker, read and matched against this proof's root and build
+ * identity. Anything short of a full match is typed, never guessed. */
+static enum dp_donor_verdict dp_donor_marker_verdict(
+    const char *candidate_path, const char *root,
+    const struct zcl_dev_proof_build_identity_v1 *current,
+    char marker_local[65], char marker_base[65], int64_t *completed)
+{
+    char marker_root[PATH_MAX];
+    struct zcl_dev_proof_build_identity_v1 candidate_identity;
+    if (!warm_marker_read(candidate_path, marker_root, marker_local,
+                          marker_base, completed, &candidate_identity))
+        return DP_DONOR_NO_MARKER;
+    if (strcmp(marker_root, root) != 0) return DP_DONOR_ROOT_DIFFERS;
+    if (!proof_build_identity_equal(current, &candidate_identity))
+        return DP_DONOR_IDENTITY_DIFFERS;
+    return DP_DONOR_ELIGIBLE;
+}
+
+/* A landing proof reuses the checkout's admitted z23-dev, so its
+ * generation runs the prefork bundle but never `make build-only`: it
+ * carries build/bin and the dev/test/lint object rooms and has no
+ * build/obj at all. Either subtree is a build tree worth donating; the
+ * marker already proved the build completed, and whatever a donor simply
+ * does not have seeds nothing. */
+static bool dp_donor_build_tree(const char *candidate_path, int64_t *touched)
+{
+    char obj[PATH_MAX], bin[PATH_MAX];
+    return snprintf(obj, sizeof(obj), "%s/build/obj", candidate_path) <
+               (int)sizeof(obj) &&
+           snprintf(bin, sizeof(bin), "%s/build/bin", candidate_path) <
+               (int)sizeof(bin) &&
+           (warm_generation_touched(obj, NULL) ||
+            warm_generation_touched(bin, NULL)) &&
+           warm_generation_touched(candidate_path, touched);
+}
+
+/* Survey one generation directory against this proof's build identity, and
+ * fill the pick policy's fields for it. Returns the entry's verdict:
+ * NOT_CANDIDATE for a foreign tag or the caller's own generation (neither
+ * is reported), a typed refusal for anything the pool holds that cannot
+ * donate, and HEAD_MOVED / LIVE / ELIGIBLE with `slot` filled. An
+ * `authoritative` survey also refuses, last, any donor built inside the
+ * candidate trust domain. */
+static enum dp_donor_verdict dp_donor_survey(
+    const char *parent, const char *root, const char *in_use,
+    const char *name,
+    const struct zcl_dev_proof_build_identity_v1 *current,
+    bool authoritative, struct zcl_dev_proof_warm_candidate *slot)
+{
+    char candidate_path[PATH_MAX];
+    if (!warm_tag_name(name) ||
+        snprintf(candidate_path, sizeof(candidate_path), "%s/%s",
+                 parent, name) >= (int)sizeof(candidate_path) ||
+        strcmp(candidate_path, in_use) == 0)
+        return DP_DONOR_NOT_CANDIDATE;
+    char marker_local[65], marker_base[65];
+    int64_t completed = 0, touched = 0;
+    enum dp_donor_verdict verdict = dp_donor_marker_verdict(
+        candidate_path, root, current, marker_local, marker_base, &completed);
+    if (verdict != DP_DONOR_ELIGIBLE) return verdict;
+    if (!dp_donor_build_tree(candidate_path, &touched))
+        return DP_DONOR_NO_BUILD_TREE;
+    char head[65];
+    const char *head_argv[] = {"git", "-C", candidate_path, "rev-parse",
+                              "--verify", "HEAD", NULL};
+    bool head_ok = git_capture(root, head_argv, head, sizeof(head)) &&
+                   strcmp(head, marker_local) == 0;
+    memset(slot, 0, sizeof(*slot));
+    (void)snprintf(slot->tag, sizeof(slot->tag), "%s", name);
+    (void)snprintf(slot->path, sizeof(slot->path), "%s", candidate_path);
+    (void)snprintf(slot->local, sizeof(slot->local), "%s", marker_local);
+    slot->completed = completed;
+    slot->touched = touched;
+    slot->head_ok = head_ok;
+    /* A generation whose checkout moved since its build finished, or
+     * whose proof is still leased, cannot donate: the first may hold
+     * objects for another commit, the second is still writing. */
+    slot->live = !head_ok ||
+                 warm_donor_live(root, marker_local, marker_base);
+    if (!head_ok) return DP_DONOR_HEAD_MOVED;
+    if (slot->live) return DP_DONOR_LIVE;
+    return authoritative ? dp_donor_trust_verdict(candidate_path)
+                         : DP_DONOR_ELIGIBLE;
+}
+
+/* Room for one more surveyed candidate. */
+static bool dp_donor_reserve(struct zcl_dev_proof_warm_candidate **candidates,
+                             size_t count, size_t *capacity)
+{
+    if (count < *capacity) return true;
+    size_t next = *capacity ? *capacity * 2 : 16;
+    struct zcl_dev_proof_warm_candidate *grown = zcl_realloc(
+        *candidates, next * sizeof(*grown), "proof_warm_donor");
+    if (!grown) return false;
+    *candidates = grown;
+    *capacity = next;
+    return true;
+}
+
+/* Re-read the marker now the survey is done. A sibling lane can
+ * finish a build in this generation while the scan runs; if the
+ * marker or the identity it was sealed under moved, the surveyed
+ * choice is stale and cold is safe. */
+static bool dp_donor_confirm(
+    const struct zcl_dev_proof_warm_candidate *best,
+    const struct zcl_dev_proof_build_identity_v1 *current,
+    struct warm_donor *donor)
+{
+    char marker_root[PATH_MAX], marker_local[65], marker_base[65];
+    int64_t completed = 0;
+    struct zcl_dev_proof_build_identity_v1 recheck_identity;
+    return warm_marker_read(best->path, marker_root, marker_local,
+                            marker_base, &completed, &recheck_identity) &&
+           strcmp(marker_local, best->local) == 0 &&
+           proof_build_identity_equal(current, &recheck_identity) &&
+           snprintf(donor->path, sizeof(donor->path), "%s",
+                    best->path) < (int)sizeof(donor->path) &&
+           snprintf(donor->local, sizeof(donor->local), "%s",
+                    best->local) < (int)sizeof(donor->local) &&
+           snprintf(donor->base, sizeof(donor->base), "%s",
+                    marker_base) < (int)sizeof(donor->base);
+}
+
+/* One rejected pool entry, on the record: which generation and the first
+ * predicate it failed. Display only, like every other phases.txt note. */
+static void dp_donor_rejection_note(const char *phases, const char *name,
+                                    enum dp_donor_verdict verdict)
+{
+    if (!phases || !phases[0]) return;
+    char note[96];
+    (void)snprintf(note, sizeof(note), "%s %s", name,
+                   dp_donor_verdict_name(verdict));
+    (void)zcl_dev_proof_phase_note(phases, "warm_donor_rejected", note);
+}
+
+/* The whole pool, surveyed. Every candidate that reached the pick is kept;
+ * `furthest` is the furthest verdict any entry reached, which becomes the
+ * cold reason when nothing is picked. */
+static bool dp_donor_collect(DIR *dir, const char *parent, const char *root,
+                             const char *in_use, const char *phases,
+                             const struct zcl_dev_proof_build_identity_v1 *current,
+                             bool authoritative,
+                             struct zcl_dev_proof_warm_candidate **candidates,
+                             size_t *count, enum dp_donor_verdict *furthest)
+{
+    size_t capacity = 0;
+    for (struct dirent *entry = readdir(dir); entry;
+         entry = readdir(dir)) {
+        struct zcl_dev_proof_warm_candidate surveyed;
+        enum dp_donor_verdict verdict =
+            dp_donor_survey(parent, root, in_use, entry->d_name, current,
+                            authoritative, &surveyed);
+        if (verdict == DP_DONOR_NOT_CANDIDATE) continue;
+        if (verdict > *furthest) *furthest = verdict;
+        if (verdict != DP_DONOR_ELIGIBLE)
+            dp_donor_rejection_note(phases, entry->d_name, verdict);
+        if (!dp_donor_pickable(verdict)) continue;
+        if (!dp_donor_reserve(candidates, *count, &capacity)) return false;
+        (*candidates)[(*count)++] = surveyed;
+    }
+    return true;
+}
+
+/* Newest verifiable idle generation for this root, skipping the caller's
+ * own. Fills nothing and reports false when there is no donor -- cold is
+ * the ordinary path, not an error -- with `reason` naming why. */
+static bool warm_donor_scan(const char *parent, const char *root,
+                            const char *in_use, const char *phases,
+                            bool authoritative, struct warm_donor *donor,
+                            char reason[32])
+{
+    (void)snprintf(reason, 32, "%s", "no_eligible_donor");
+    /* No verifiable identity for THIS proof means no safe comparison for
+     * any candidate: fail closed to cold rather than adopt objects this
+     * scan cannot prove match. */
+    struct zcl_dev_proof_build_identity_v1 current;
+    if (!zcl_dev_proof_build_identity_v1_capture(root, &current, NULL, 0)) {
+        (void)snprintf(reason, 32, "%s", "identity_unavailable");
+        return false;
+    }
+    DIR *dir = opendir(parent);
+    if (!dir || !parent || !root || !in_use || !donor) {
+        if (dir) (void)closedir(dir);
+        return false;
+    }
+    struct zcl_dev_proof_warm_candidate *candidates = NULL;
+    size_t count = 0;
+    enum dp_donor_verdict furthest = DP_DONOR_NOT_CANDIDATE;
+    bool collected = dp_donor_collect(dir, parent, root, in_use, phases,
+                                      &current, authoritative, &candidates,
+                                      &count, &furthest);
+    (void)closedir(dir);
+    int best = collected ? warm_pick_donor(candidates, count) : -1;
+    bool found = candidates && best >= 0 &&
+                 dp_donor_confirm(&candidates[best], &current, donor);
+    free(candidates);
+    if (found)
+        reason[0] = 0;
+    else if (furthest != DP_DONOR_ELIGIBLE)
+        (void)snprintf(reason, 32, "%s", dp_donor_verdict_name(furthest));
+    return found;
+}
+
+/* Opt-out for honest cold-vs-warm measurement and for a pool under
+ * suspicion. Advisory only: the variable is outside the sealed proof
+ * environment allowlist, so it changes no proof input and warm and cold
+ * receipts for the same pair stay comparable. */
+static bool warm_start_disabled(void)
+{
+    const char *value = getenv("ZCL_DEV_PROOF_WARM");
+    return value && (strcmp(value, "0") == 0 || strcmp(value, "off") == 0 ||
+                     strcmp(value, "no") == 0);
+}
+
+/* The scan's typed cold reason, on the record as the same "cold: <reason>"
+ * the status line shows. Display only, like every other phases.txt note. */
+static void warm_cold_note(const char *phases, const char *reason)
+{
+    char cold[sizeof("cold: ") + 32];
+    if (phases && phases[0] && reason &&
+        snprintf(cold, sizeof(cold), "cold: %s", reason) < (int)sizeof(cold))
+        (void)zcl_dev_proof_phase_note(phases, "warm_start", cold);
+}
+
+/* Seed one generation's build tree from the donor and repair the
+ * timestamp graph. Reports true only when the full repair completed; any
+ * earlier failure rolls the seeds back and reports false (cold). An
+ * `authoritative` start admits only a donor from outside the candidate
+ * trust domain; a scan that finds none leaves `warm_start=cold: <reason>`
+ * in phases.txt beside each entry's own rejection row. */
+static bool warm_start_generation(const struct proof_paths *paths,
+                                  const char *parent,
+                                  const char *generation, const char *local,
+                                  bool authoritative,
+                                  struct proof_warmstart *warm)
+{
+    struct warm_donor donor;
+    if (!paths || !parent || !generation || !local || !warm) return false;
+    memset(&donor, 0, sizeof(donor));
+    memset(warm, 0, sizeof(*warm));
+    char donor_build[PATH_MAX], gen_build[PATH_MAX];
+    if (snprintf(gen_build, sizeof(gen_build), "%s/build", generation) >=
+            (int)sizeof(gen_build) ||
+        !dp_prune_dev_orphans(gen_build, generation)) {
+        (void)snprintf(warm->cold_reason, sizeof(warm->cold_reason), "%s",
+                       "orphan_cleanup_failed");
+        return false;
+    }
+    if (!warm_donor_scan(parent, paths->root, generation, paths->phases,
+                         authoritative, &donor, warm->cold_reason)) {
+        warm_cold_note(paths->phases, warm->cold_reason);
+        return false;
+    }
+    if (snprintf(donor_build, sizeof(donor_build), "%s/build", donor.path) >=
+            (int)sizeof(donor_build)) {
+        (void)snprintf(warm->cold_reason, sizeof(warm->cold_reason), "%s",
+                       "seed_failed");
+        return false;
+    }
+    struct warm_seed_accum accum = {0};
+    /* Every build profile's epoch tree, not just build-only's: the test
+     * phase's dev-proof-bundle compiles the full harness, and its
+     * objects publish through the same staging-plus-rename publishers.
+     * The classifier admits only object and depfile outputs plus the
+     * wrapper copy; binaries, archives, stamps, leases, and locks stay
+     * skipped, so the wider root adds reuse without adding risk. The
+     * wrapper binary keeps make's prerequisite graph honest only when
+     * its inputs are unchanged; otherwise the bootstrap rebuilds it and
+     * its new mtime correctly invalidates every object. */
+    bool copy_wrapper =
+        warm_wrapper_inputs_unchanged(paths->root, donor.local, local);
+    warm_seed_walk(donor_build, gen_build, generation, "", copy_wrapper,
+                   &accum);
+    struct timespec seed_stamp = {0};
+    bool armed = !accum.failed && accum.files > 0 &&
+                 warm_retime_outputs(gen_build, &accum, &seed_stamp) &&
+                 warm_retime_sources(generation, donor.local, local,
+                                     &seed_stamp);
+    if (!armed) {
+        (void)snprintf(warm->cold_reason, sizeof(warm->cold_reason), "%s",
+                       "seed_failed");
+        warm_seed_rollback(gen_build, &accum);
+        warm_seed_accum_free(&accum);
+        return false;
+    }
+    const char *tag = strrchr(donor.path, '/');
+    tag = tag ? tag + 1 : donor.path;
+    (void)snprintf(warm->donor, sizeof(warm->donor), "%s", tag);
+    (void)snprintf(warm->donor_local, sizeof(warm->donor_local), "%s",
+                   donor.local);
+    warm->files_linked = accum.files;
+    warm->bytes_linked = accum.bytes;
+    warm->armed = true;
+    warm_seed_accum_free(&accum);
+    return true;
+}
+
+/* Only git's own answer counts a generation as disposable. Detached HEAD
+ * proves nobody parked a branch here to work in, and an empty tracked
+ * status proves no edit would be lost. Untracked files are excluded on
+ * purpose: a generation is full of build output by construction, and that
+ * output is both what makes the tree large and what nobody would miss. */
+static bool warm_reapable(const char *generation)
+{
+    char head[256], status[4];
+    const char *head_argv[] = {"git", "rev-parse", "--symbolic-full-name",
+                               "HEAD", NULL};
+    const char *status_argv[] = {"git", "status", "--porcelain=v1",
+                                 "--untracked-files=no", NULL};
+    if (!git_capture(generation, head_argv, head, sizeof(head)) ||
+        strcmp(head, "HEAD") != 0)
+        return false;
+    /* A clean tree prints nothing. The shortest porcelain v1 line is
+     * longer than this buffer, so a dirty tree overflows the capture
+     * instead of fitting it: both spellings of "not clean" refuse, and a
+     * git that cannot answer at all refuses too. */
+    return git_capture(generation, status_argv, status, sizeof(status)) &&
+           status[0] == 0;
+}
+
+struct warm_reap_entry {
+    char tag[PROOF_WARM_TAG_LEN + 1];
+    char path[PATH_MAX];
+    char root[PATH_MAX];
+    int64_t completed;
+    int64_t touched;
+    bool complete;
+    /* Touched within its idle window; see dp_reap_survey(). */
+    bool young;
+};
+
+/* Apparent size of every regular file under `dir`, summed recursively.
+ * Advisory only, for a hygiene log line: a read error or a sibling lane
+ * mutating the tree mid-walk just undercounts, it never fails the sweep
+ * that called this. */
+static uint64_t directory_bytes_sum(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    uint64_t total = 0;
+    for (struct dirent *entry = readdir(d); entry; entry = readdir(d)) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        char child[PATH_MAX];
+        if (snprintf(child, sizeof(child), "%s/%s", dir, entry->d_name) >=
+                (int)sizeof(child))
+            continue;
+        struct stat st;
+        if (lstat(child, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) total += directory_bytes_sum(child);
+        else if (S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    (void)closedir(d);
+    return total;
+}
+
+/* With warm start, old generations are valuable donors, so the reaper
+ * keeps the newest complete generation per root and may reap the rest.
+ * Hygiene, never correctness: a pool that fails to shrink costs disk while
+ * a proof that failed over a delete would cost every lane on this host its
+ * push. `max_attempts` bounds how many candidates reach git (the prepare
+ * path's own call keeps its tight PROOF_WARM_REAP_MAX budget; an explicit
+ * sweep triggered off the proof's hot path can afford a larger one).
+ * `removed_out`/`bytes_out`, when non-NULL, are INCREMENTED (never reset)
+ * by what this call actually deleted, so a caller sweeping more than one
+ * pool root can accumulate one total across calls.
+ *
+ * A donor being seeded from while it is reaped degrades gracefully: the
+ * seed walk skips files that vanish, and hard links already created keep
+ * their inodes after the donor names are unlinked. */
+/* Is this pool entry an idle generation the reaper may consider, and what
+ * does its marker say? Returns false for a foreign tag, the caller's own
+ * generation, an untimestampable tree, or one still in use. An entry held
+ * only by its idle window (touched within it, no live lease on its marked
+ * pair) is returned as `young` when `take_young` asks for it, so the
+ * pressure pass can prove it unclaimed some other way; otherwise it is
+ * refused as in use. */
+static bool dp_reap_survey(const char *parent, const char *in_use,
+                           const char *name, int64_t now, bool take_young,
+                           struct warm_reap_entry *slot)
+{
+    char candidate[PATH_MAX];
+    int64_t touched = 0;
+    if (!warm_tag_name(name) ||
+        snprintf(candidate, sizeof(candidate), "%s/%s", parent,
+                 name) >= (int)sizeof(candidate) ||
+        strcmp(candidate, in_use) == 0 ||
+        !warm_generation_touched(candidate, &touched))
+        return false;
+    char marker_root[PATH_MAX] = {0}, marker_local[65] = {0};
+    char marker_base[65] = {0};
+    int64_t completed = 0;
+    /* Cross-root generations stay in the pool under their own root's
+     * newest-complete rule below; the grouping, not this read,
+     * decides whose donor survives. */
+    bool complete = warm_marker_read(candidate, marker_root,
+                                     marker_local, marker_base,
+                                     &completed, NULL);
+    /* The lease lives under the marked root, which may be a sibling
+     * checkout sharing this pool; the marker root is validated absolute
+     * and escape-free on read. Marker-less generations have no pair lease
+     * to consult, and age is the only signal. */
+    if (complete && warm_donor_live(marker_root, marker_local, marker_base))
+        return false;
+    int64_t window = complete ? PROOF_WARM_IDLE_ACTIVE_SECONDS
+                              : PROOF_WARM_IDLE_UNMARKED_SECONDS;
+    bool young = now - touched <= window;
+    if (young && !take_young) return false;
+    memset(slot, 0, sizeof(*slot));
+    (void)snprintf(slot->tag, sizeof(slot->tag), "%s", name);
+    (void)snprintf(slot->path, sizeof(slot->path), "%s", candidate);
+    (void)snprintf(slot->root, sizeof(slot->root), "%s",
+                   complete ? marker_root : "");
+    slot->completed = completed;
+    slot->touched = touched;
+    slot->complete = complete;
+    slot->young = young;
+    return true;
+}
+
+/* Survey the whole pool. An allocation failure abandons the survey whole:
+ * a partial list could reap a generation whose siblings were never seen. */
+static bool dp_reap_collect(DIR *dir, const char *parent, const char *in_use,
+                            int64_t now, bool take_young,
+                            struct warm_reap_entry **entries, size_t *count)
+{
+    size_t capacity = 0;
+    for (struct dirent *entry = readdir(dir); entry;
+         entry = readdir(dir)) {
+        struct warm_reap_entry surveyed;
+        if (!dp_reap_survey(parent, in_use, entry->d_name, now, take_young,
+                            &surveyed))
+            continue;
+        if (*count == capacity) {
+            size_t next = capacity ? capacity * 2 : 16;
+            struct warm_reap_entry *grown = zcl_realloc(
+                *entries, next * sizeof(*grown), "proof_warm_reap");
+            if (!grown) {
+                free(*entries);
+                *entries = NULL;
+                *count = 0;
+                return false;
+            }
+            *entries = grown;
+            capacity = next;
+        }
+        (*entries)[(*count)++] = surveyed;
+    }
+    return true;
+}
+
+/* Keep the newest complete generation per root: reap this
+ * one when a same-root sibling wins the donor pick. The pick
+ * is the tested policy; the reaper only groups by root. */
+static bool dp_reap_superseded(const struct warm_reap_entry *entries,
+                               size_t count, size_t i)
+{
+    struct zcl_dev_proof_warm_candidate *group = NULL;
+    size_t group_count = 0, group_cap = 0;
+    size_t self = 0;
+    bool group_ok = true;
+    for (size_t j = 0; j < count; j++) {
+        if (!entries[j].complete ||
+            strcmp(entries[j].root, entries[i].root) != 0)
+            continue;
+        if (group_count == group_cap) {
+            size_t next = group_cap ? group_cap * 2 : 8;
+            struct zcl_dev_proof_warm_candidate *grown =
+                zcl_realloc(group, next * sizeof(*grown),
+                            "proof_warm_reap");
+            if (!grown) {
+                group_ok = false;
+                break;
+            }
+            group = grown;
+            group_cap = next;
+        }
+        struct zcl_dev_proof_warm_candidate *slot =
+            &group[group_count];
+        memset(slot, 0, sizeof(*slot));
+        (void)snprintf(slot->tag, sizeof(slot->tag), "%s",
+                       entries[j].tag);
+        slot->completed = entries[j].completed;
+        slot->touched = entries[j].touched;
+        slot->head_ok = true;
+        slot->live = false;
+        if (j == i) self = group_count;
+        group_count++;
+    }
+    bool reap = false;
+    if (group_ok && group_count > 0) {
+        int best = warm_pick_donor(group, group_count);
+        reap = best >= 0 && (size_t)best != self;
+    }
+    free(group);
+    return reap;
+}
+
+/* Directories the unlock walk below could not read on this pass. A callback
+ * has no context argument, and one proof worker never runs two walks at
+ * once. */
+static _Thread_local size_t dp_unlock_unread;
+
+static int dp_unlock_cb(const char *path, const struct stat *st, int type,
+                        struct FTW *ftwbuf)
+{
+    (void)ftwbuf;
+    if (type != FTW_D && type != FTW_DNR) return 0;
+    mode_t mode = st ? (st->st_mode & 07777) : 0;
+    (void)chmod(path, mode | S_IRUSR | S_IWUSR | S_IXUSR);
+    if (type == FTW_DNR) dp_unlock_unread++;
+    return 0;
+}
+
+/* Grant the owner read+write+execute on every directory under `path`
+ * (path included) that is reached without following a symlink. Proof test
+ * fixtures leave read-only (0555) directories inside a generation, which
+ * stops git's own recursive worktree delete partway through; this runs
+ * first so the delete that follows can finish. The walk has no width or
+ * depth bound: a bounded one skipped the children of every directory past
+ * its queue, and a generation's test scratch is wider than any fixed queue,
+ * so each proof's retire deleted git's admin dir and then left the tree. A
+ * directory that was unreadable is opened up on one pass and descended on
+ * the next. Advisory, never fatal: what stays locked fails the delete that
+ * follows exactly as it would without this helper. */
+static void dp_generation_unlock(const char *path)
+{
+    struct stat top_st;
+    if (!path || lstat(path, &top_st) != 0 || !S_ISDIR(top_st.st_mode))
+        return;
+    for (int pass = 0; pass < 8; pass++) {
+        dp_unlock_unread = 0;
+        if (nftw(path, dp_unlock_cb, 32, FTW_PHYS | FTW_MOUNT) != 0 ||
+            dp_unlock_unread == 0)
+            return;
+    }
+}
+
+/* Delete one superseded generation, re-proving it is still idle first. */
+static void dp_reap_remove(const struct proof_paths *paths,
+                           const struct warm_reap_entry *entry,
+                           size_t *removed_out, uint64_t *bytes_out)
+{
+    if (!warm_reapable(entry->path)) return;
+    /* Re-read the stamp now the git queries are done. The pool is
+     * shared by every checkout under this parent, so a sibling lane
+     * can claim this generation while it is examined; if it did, it
+     * moved the mtime out of range. */
+    int64_t touched_again = 0;
+    if (!warm_generation_touched(entry->path, &touched_again) ||
+        touched_again != entry->touched)
+        return;
+    /* Measured before the delete: afterward there is nothing left to
+     * walk. Advisory only, so a size that changes mid-measurement
+     * just makes the log line approximate, never wrong enough to act
+     * on -- nothing downstream reads these numbers back. */
+    uint64_t freed = directory_bytes_sum(entry->path);
+    /* Read-only fixture directories a proof test left behind stop git's
+     * own recursive delete partway through, leaving a half-deleted
+     * generation warm_reapable() can never approve again. Grant owner
+     * write first so the delete below can finish. */
+    dp_generation_unlock(entry->path);
+    /* --force is safe only because detached and clean were just
+     * proven. What it overrides is git's refusal to delete a tree
+     * that still holds untracked files, and a generation's untracked
+     * files are its build scratch. */
+    const char *argv[] = {"git", "worktree", "remove", "--force",
+                          entry->path, NULL};
+    char output[1024];
+    if (git_capture_within(paths->root, argv,
+                           PROOF_WARM_REMOVE_TIMEOUT_MS, output,
+                           sizeof(output))) {
+        if (removed_out) (*removed_out)++;
+        if (bytes_out) *bytes_out += freed;
+    }
+}
+
+/* May the reaper take this surveyed entry? Everything the survey returned
+ * is already idle and unclaimed; this is the policy on top of that. An
+ * entry without a marker is here only because it aged past the unmarked
+ * window, so it goes. A complete one goes when a newer same-root sibling
+ * supersedes it as donor -- and, the abandoned-lane case, when nothing has
+ * touched it for half a day, because a lane that stopped proving leaves a
+ * sole complete generation no sibling will ever supersede. */
+static bool dp_reap_eligible(const struct warm_reap_entry *entries,
+                             size_t count, size_t i, int64_t now)
+{
+    if (!entries[i].complete) return true;
+    if (now - entries[i].touched > PROOF_WARM_IDLE_ABANDONED_SECONDS)
+        return true;
+    return dp_reap_superseded(entries, count, i);
+}
+
+/* Is `s` (exactly `len` bytes of it) 32 lowercase hex characters? Shared by
+ * both orphan shapes below: warm_tag_name() itself demands a NUL right at
+ * that length, which the lint-sandbox shape never has (its tag is a
+ * prefix, not the whole name). */
+static bool dp_hex32(const char *s, size_t len)
+{
+    if (len != PROOF_WARM_TAG_LEN) return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+/* `<32hex>.lint_sb_<digits>` or `<32hex>.lint_meta_<digits>` -- exactly
+ * what test_make_lint_gates.c plants beside a generation it sandboxes.
+ * On a match, the pid substring is parsed into `*pid_out`. */
+static bool dp_orphan_lint_shape(const char *name, long *pid_out)
+{
+    static const char *const suffixes[] = {".lint_sb_", ".lint_meta_"};
+    size_t nlen = name ? strlen(name) : 0;
+    if (nlen <= PROOF_WARM_TAG_LEN || !dp_hex32(name, PROOF_WARM_TAG_LEN))
+        return false;
+    const char *rest = name + PROOF_WARM_TAG_LEN;
+    for (size_t i = 0; i < 2; i++) {
+        size_t slen = strlen(suffixes[i]);
+        if (strncmp(rest, suffixes[i], slen) != 0) continue;
+        char *end = NULL;
+        long pid = strtol(rest + slen, &end, 10);
+        if (!end || *end != 0 || end == rest + slen || pid <= 0) continue;
+        if (pid_out) *pid_out = pid;
+        return true;
+    }
+    return false;
+}
+
+/* A positive decimal field of `s` followed by `stop`; *next is past the
+ * stop byte. A sign or leading blank is not the shape strtol would accept. */
+static bool dp_orphan_decimal(const char *s, char stop, long *out,
+                              const char **next)
+{
+    char *end = NULL;
+    if (s[0] < '0' || s[0] > '9') return false;
+    long value = strtol(s, &end, 10);
+    if (!end || *end != stop || value <= 0) return false;
+    *out = value;
+    *next = end + 1;
+    return true;
+}
+
+/* mkdtemp's six-character [A-Za-z0-9] suffix, and nothing after it. */
+static bool dp_orphan_mkdtemp_suffix(const char *s)
+{
+    size_t i = 0;
+    for (; s[i]; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+              (c >= 'A' && c <= 'Z')))
+            return false;
+    }
+    return i == 6;
+}
+
+/* `<32hex>.dp_shard_<pid>_<shard>_<6 mkdtemp chars>` -- the private root a
+ * dev_platform test shard (test_dev_platform.c dp_run_shard) makes beside
+ * the generation it runs in. A shard removes it on a normal exit; a proof
+ * cancelled mid-test (a superseded base, a budget kill) kills the shard
+ * first, so without this shape every cancelled test run left one behind.
+ * On a match, the pid substring is parsed into `*pid_out`. */
+static bool dp_orphan_shard_shape(const char *name, long *pid_out)
+{
+    static const char marker[] = ".dp_shard_";
+    size_t nlen = name ? strlen(name) : 0;
+    if (nlen <= PROOF_WARM_TAG_LEN || !dp_hex32(name, PROOF_WARM_TAG_LEN) ||
+        strncmp(name + PROOF_WARM_TAG_LEN, marker, sizeof(marker) - 1) != 0)
+        return false;
+    const char *rest = name + PROOF_WARM_TAG_LEN + sizeof(marker) - 1;
+    long pid = 0, shard = 0;
+    if (!dp_orphan_decimal(rest, '_', &pid, &rest) ||
+        !dp_orphan_decimal(rest, '_', &shard, &rest) ||
+        !dp_orphan_mkdtemp_suffix(rest))
+        return false;
+    if (pid_out) *pid_out = pid;
+    return true;
+}
+
+/* Is this sandbox's owner gone? Dead (kill fails ESRCH) is the only
+ * eligible answer -- alive, or owned by someone else (EPERM), is left be,
+ * exactly lint_purge_stale_sandboxes()'s own rule for the current root's
+ * siblings. */
+static bool dp_orphan_lint_dead(long pid)
+{
+    errno = 0;
+    return kill((pid_t)pid, 0) != 0 && errno == ESRCH;
+}
+
+static bool dp_orphan_gitdir_record_read(FILE *f, char *line, size_t cap)
+{
+    size_t len = fread(line, 1, cap, f);
+    bool complete = len < cap && !ferror(f);
+    int close_rc = fclose(f);
+    if (!complete || close_rc != 0 || memchr(line, '\0', len) != NULL)
+        return false;
+    if (len > 0 && line[len - 1] == '\n') len--;
+    if (len > 0 && line[len - 1] == '\r') len--;
+    if (memchr(line, '\n', len) != NULL || memchr(line, '\r', len) != NULL)
+        return false;
+    line[len] = '\0';
+    return true;
+}
+
+/* `entry/.git` is a regular file reading `gitdir: <path>` where `<path>`
+ * does not exist and its basename is this entry's own tag: git's worktree
+ * remove deleted the admin dir but not the tree, so warm_reapable()'s own
+ * `git rev-parse` can never approve this generation again. A `.git` that
+ * is a directory, missing, unreadable, whose target still exists, or
+ * whose basename differs is not this shape. */
+static bool dp_orphan_gitdir_pruned(const char *entry_path, const char *tag)
+{
+    char gitfile[PATH_MAX];
+    struct stat st;
+    if (snprintf(gitfile, sizeof(gitfile), "%s/.git", entry_path) >=
+            (int)sizeof(gitfile) ||
+        lstat(gitfile, &st) != 0 || !S_ISREG(st.st_mode))
+        return false;
+    FILE *f = fopen(gitfile, "r");
+    if (!f) return false;
+    char line[PATH_MAX + 16];
+    if (!dp_orphan_gitdir_record_read(f, line, sizeof(line))) return false;
+    static const char prefix[] = "gitdir: ";
+    if (strncmp(line, prefix, sizeof(prefix) - 1) != 0) return false;
+    const char *target = line + sizeof(prefix) - 1;
+    struct stat target_st;
+    if (!target[0] || lstat(target, &target_st) == 0 || errno != ENOENT)
+        return false;
+    const char *base = strrchr(target, '/');
+    base = base ? base + 1 : target;
+    return strcmp(base, tag) == 0;
+}
+
+/* One phases.txt row for an orphan the survey above never reaches: name,
+ * why, and what it gave back. Display only, like every other note. */
+static void dp_orphan_note(const struct proof_paths *paths, const char *name,
+                           const char *reason, uint64_t bytes)
+{
+    if (!paths || !paths->phases[0]) return;
+    char note[PATH_MAX + 96];
+    (void)snprintf(note, sizeof(note), "name=%s reason=%s bytes=%llu", name,
+                   reason, (unsigned long long)bytes);
+    (void)zcl_dev_proof_phase_note(paths->phases,
+                                   "generation_pool_orphan_reaped", note);
+}
+
+static int dp_orphan_unlink_cb(const char *path, const struct stat *st,
+                               int type, struct FTW *ftwbuf)
+{
+    (void)ftwbuf;
+    if (type == FTW_NS || type == FTW_DNR) return -1;
+    if (st && S_ISDIR(st->st_mode)) return rmdir(path);
+    return unlink(path);
+}
+
+/* Recursively remove one eligible orphan. FTW_PHYS means a symlink inside
+ * is unlinked itself and never followed, and FTW_MOUNT keeps the walk off
+ * any filesystem mounted inside the entry, so it cannot leave the entry's
+ * own tree. */
+static bool dp_orphan_remove_tree(const char *path)
+{
+    dp_generation_unlock(path);
+    return nftw(path, dp_orphan_unlink_cb, 32,
+                FTW_DEPTH | FTW_PHYS | FTW_MOUNT) == 0;
+}
+
+/* The shape a pool entry's name and contents match, as its reap reason, or
+ * NULL. A pid-owned shape (a lint sandbox, a test shard) matches only while
+ * its owner is dead. */
+static const char *dp_orphan_shape(const char *name, const char *path)
+{
+    long pid = 0;
+    if (dp_orphan_lint_shape(name, &pid))
+        return dp_orphan_lint_dead(pid) ? "dead_sandbox" : NULL;
+    if (dp_orphan_shard_shape(name, &pid))
+        return dp_orphan_lint_dead(pid) ? "dead_test_shard" : NULL;
+    if (warm_tag_name(name) && dp_orphan_gitdir_pruned(path, name))
+        return "pruned_gitdir";
+    return NULL;
+}
+
+/* Does this pool entry match one of the orphan shapes, and has it aged
+ * past PROOF_WARM_IDLE_ACTIVE_SECONDS? Never the caller's own `in_use`
+ * generation. Returns the reason string on a match, else NULL. */
+static const char *dp_orphan_reason(const char *in_use, const char *name,
+                                    const char *path, int64_t now)
+{
+    if (strcmp(path, in_use) == 0) return NULL;
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
+    const char *reason = dp_orphan_shape(name, path);
+    if (!reason) return NULL;
+    int64_t touched = (int64_t)st.st_mtime;
+    (void)warm_generation_touched(path, &touched);
+    return now - touched > PROOF_WARM_IDLE_ACTIVE_SECONDS ? reason : NULL;
+}
+
+/* Reap three shapes of leftover dp_reap_survey() will never see, because
+ * none is warm_tag_name()'s bare 32-hex shape: a killed lint shard's
+ * sandbox base (test_make_lint_gates.c's own purge only ever reaches
+ * siblings of the CURRENT run's root, so one left under an old generation
+ * tag is never seen again), a killed dev_platform test shard's private
+ * root (a proof cancelled mid-test never runs the shard's own cleanup),
+ * and a generation whose `.git` worktree admin
+ * dir git already deleted while a read-only fixture inside it (planted by
+ * a proof test) blocked the rest of the recursive delete -- without this,
+ * warm_reapable()'s `git rev-parse` can never approve it again and it
+ * leaks forever. Advisory throughout: any read, stat, or delete failure
+ * just skips that entry. */
+static void dp_reap_orphans(const struct proof_paths *paths,
+                            const char *parent, const char *in_use,
+                            size_t *removed_out, uint64_t *bytes_out)
+{
+    DIR *dir = opendir(parent);
+    if (!dir) return;
+    int64_t now = platform_time_wall_unix();
+    for (struct dirent *entry = readdir(dir); entry; entry = readdir(dir)) {
+        char path[PATH_MAX];
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0 ||
+            snprintf(path, sizeof(path), "%s/%s", parent,
+                     entry->d_name) >= (int)sizeof(path))
+            continue;
+        const char *reason = dp_orphan_reason(in_use, entry->d_name, path,
+                                              now);
+        if (!reason) continue;
+        uint64_t freed = directory_bytes_sum(path);
+        if (!dp_orphan_remove_tree(path)) continue;
+        if (removed_out) (*removed_out)++;
+        if (bytes_out) *bytes_out += freed;
+        dp_orphan_note(paths, entry->d_name, reason, freed);
+    }
+    (void)closedir(dir);
+}
+
+static void generation_pool_reap_ex(const struct proof_paths *paths,
+                                    const char *parent, const char *in_use,
+                                    size_t max_attempts, size_t *removed_out,
+                                    uint64_t *bytes_out)
+{
+    DIR *dir = opendir(parent);
+    if (!dir || !paths || !parent || !in_use) {
+        if (dir) (void)closedir(dir);
+        return;
+    }
+    dp_reap_orphans(paths, parent, in_use, removed_out, bytes_out);
+    int64_t now = platform_time_wall_unix();
+    struct warm_reap_entry *entries = NULL;
+    size_t count = 0;
+    bool collect_ok = dp_reap_collect(dir, parent, in_use, now, false,
+                                      &entries, &count);
+    (void)closedir(dir);
+    size_t attempts = 0;
+    for (size_t i = 0; collect_ok && entries && i < count &&
+             attempts < max_attempts;
+         i++) {
+        if (!dp_reap_eligible(entries, count, i, now)) continue;
+        /* The cap counts candidates that reach git, not directory
+         * entries: the queries plus the delete are the only expensive
+         * part, and bounding them is what keeps a fast proof fast. */
+        attempts++;
+        dp_reap_remove(paths, &entries[i], removed_out, bytes_out);
+    }
+    free(entries);
+}
+
+static void generation_pool_reap(const struct proof_paths *paths,
+                                 const char *parent, const char *in_use)
+{
+    generation_pool_reap_ex(paths, parent, in_use, PROOF_WARM_REAP_MAX, NULL,
+                            NULL);
+}
+
+/* Free bytes a RAM pool must still show for dp_generation_pool()'s
+ * reservation to be granted: what this proof asks to reserve, on top of the
+ * platform floor the reservation refuses to spend below. Reading the same
+ * two numbers the reservation reads is what makes the pass below evict
+ * under real pressure only, never as a matter of course. */
+static uint64_t dp_pool_pressure_need(void)
+{
+    return proof_ram_reserve_bytes() + PLATFORM_RAM_SCRATCH_MIN_FREE_BYTES;
+}
+
+/* The idlest surveyed generation not yet considered, or `count` when none
+ * is left. A considered entry has had its path cleared by the caller. */
+static size_t dp_pressure_oldest(const struct warm_reap_entry *entries,
+                                 size_t count)
+{
+    size_t best = count;
+    for (size_t i = 0; i < count; i++) {
+        if (!entries[i].path[0]) continue;
+        if (best == count || entries[i].touched < entries[best].touched)
+            best = i;
+    }
+    return best;
+}
+
+/* One eviction's row in phases.txt: which generation went, how long it had
+ * been idle, and what it gave back. Display only, like every other note. */
+static void dp_pressure_note(const struct proof_paths *paths,
+                             const struct warm_reap_entry *entry, int64_t now,
+                             uint64_t freed)
+{
+    if (!paths->phases[0]) return;
+    char note[PATH_MAX + 96];
+    (void)snprintf(note, sizeof(note),
+                   "generation=%s idle_seconds=%lld bytes=%llu", entry->path,
+                   (long long)(now - entry->touched),
+                   (unsigned long long)freed);
+    (void)zcl_dev_proof_phase_note(paths->phases, "generation_pool_evicted",
+                                   note);
+}
+
+static void dp_generation_tag(const char *root, const char *local,
+                              char generation_tag[33]);
+static bool dp_retry_worker_settled(const char *path, bool lease);
+
+/* Which checkout made this generation, and for which commit. The tag is a
+ * digest over exactly that pair (dp_generation_tag()), so the answer is
+ * proven, not guessed: the commit is git's HEAD for the tree, and the
+ * checkout is whichever worktree of the same repository hashes back to the
+ * tag with it. A tree git cannot read, or a tag nothing hashes back to,
+ * has no proven owner. */
+static bool dp_generation_owner(const struct warm_reap_entry *entry,
+                                char root[PATH_MAX], char local[65])
+{
+    const char *head_argv[] = {"git", "rev-parse", "--verify", "HEAD", NULL};
+    const char *list_argv[] = {"git", "worktree", "list", "--porcelain",
+                               NULL};
+    char *list = zcl_malloc(ZCL_DEVLOOP_OUTPUT_MAX, "proof_pool_owner");
+    bool found = false;
+    if (list && git_capture(entry->path, head_argv, local, 65) &&
+        proof_oid_text(local) &&
+        git_capture(entry->path, list_argv, list, ZCL_DEVLOOP_OUTPUT_MAX)) {
+        char *save = NULL;
+        for (char *line = strtok_r(list, "\n", &save); line && !found;
+             line = strtok_r(NULL, "\n", &save)) {
+            char tag[33];
+            if (strncmp(line, "worktree ", 9) != 0 ||
+                !platform_directory_canonical_real(line + 9, root,
+                                                   PATH_MAX))
+                continue;
+            dp_generation_tag(root, local, tag);
+            found = strcmp(tag, entry->tag) == 0;
+        }
+    }
+    free(list);
+    return found;
+}
+
+/* Does `dir` hold an entry named `<local>-<anything><suffix>` that is not
+ * provably finished? A request is claimed by its presence alone; a lease
+ * or running lock only while dp_retry_worker_settled() cannot prove its
+ * worker dead. A directory that is not there holds nothing; one that
+ * cannot be read might hold anything. */
+static bool dp_owner_pair_claimed(const char *dir, const char *local,
+                                  const char *suffix, bool worker, bool lease)
+{
+    DIR *d = opendir(dir);
+    if (!d) return errno != ENOENT;
+    size_t local_len = strlen(local), suffix_len = strlen(suffix);
+    bool claimed = false;
+    for (struct dirent *e = readdir(d); e && !claimed; e = readdir(d)) {
+        size_t len = strlen(e->d_name);
+        char path[PATH_MAX];
+        if (len <= local_len + 1 + suffix_len ||
+            strncmp(e->d_name, local, local_len) != 0 ||
+            e->d_name[local_len] != '-' ||
+            strcmp(e->d_name + len - suffix_len, suffix) != 0)
+            continue;
+        claimed = !worker ||
+                  snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >=
+                      (int)sizeof(path) ||
+                  !dp_retry_worker_settled(path, lease);
+    }
+    (void)closedir(d);
+    return claimed;
+}
+
+/* Is any proof of `local` from checkout `root` live or queued, whatever its
+ * base? The generation is named by (checkout, commit) alone, so a proof of
+ * the same commit against another base takes the same tree. */
+static bool dp_owner_claimed(const char *state, const char *local)
+{
+    char leases[PATH_MAX], requests[PATH_MAX];
+    if (snprintf(leases, sizeof(leases), "%s/leases", state) >=
+            (int)sizeof(leases) ||
+        snprintf(requests, sizeof(requests), "%s/requests", state) >=
+            (int)sizeof(requests))
+        return true;
+    return dp_owner_pair_claimed(leases, local, ".lease", true, true) ||
+           dp_owner_pair_claimed(state, local, ".running", true, false) ||
+           dp_owner_pair_claimed(requests, local, ".request", false, false);
+}
+
+/* Evict a generation still inside its idle window, which only the pressure
+ * pass ever asks for. The window exists because a proof that is working a
+ * generation looks exactly like one that stopped. The pair lease tells them
+ * apart: every proof worker publishes it under its checkout's queue.lock
+ * before it touches its generation (dp_queue_claim_locked()) and unlinks it
+ * under the same lock only after retiring that generation
+ * (proof_lease_release()). So while this holds the owning checkout's
+ * queue.lock, an owner with no live lease, running lock, or queued request
+ * for the generation's commit has no proof on it, and none can claim one
+ * until the delete is done. Never waits for the lock, never creates it:
+ * a busy or absent lock keeps the generation. The delete itself is still
+ * dp_reap_remove(), run from the owning checkout. */
+static void dp_pressure_remove_young(const struct warm_reap_entry *entry,
+                                     size_t *removed_out, uint64_t *bytes_out)
+{
+    struct proof_paths owner;
+    char local[65], state[PATH_MAX], lock[PATH_MAX];
+    memset(&owner, 0, sizeof(owner));
+    if (!dp_generation_owner(entry, owner.root, local) ||
+        snprintf(state, sizeof(state), "%s/.cache/zcl-dev-proof",
+                 owner.root) >= (int)sizeof(state) ||
+        snprintf(lock, sizeof(lock), "%s/queue.lock", state) >=
+            (int)sizeof(lock))
+        return;
+    int fd = open(lock, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return;
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        if (!dp_owner_claimed(state, local))
+            dp_reap_remove(&owner, entry, removed_out, bytes_out);
+        (void)flock(fd, LOCK_UN);
+    }
+    (void)close(fd);
+}
+
+/* One turn of the pressure pass below: evict `entry` by whichever route its
+ * idle state allows, note what went, and mark it considered -- a generation
+ * git declined to delete is not a candidate a later turn should retry. */
+static void dp_pressure_evict(const struct proof_paths *paths,
+                              struct warm_reap_entry *entry, int64_t now,
+                              size_t *removed_out, uint64_t *reclaimed)
+{
+    size_t removed = 0;
+    uint64_t before = *reclaimed;
+    if (entry->young)
+        dp_pressure_remove_young(entry, &removed, reclaimed);
+    else
+        dp_reap_remove(paths, entry, &removed, reclaimed);
+    if (removed) dp_pressure_note(paths, entry, now, *reclaimed - before);
+    if (removed && removed_out) (*removed_out)++;
+    entry->path[0] = 0;
+}
+
+/* Reclaim RAM before asking for it. The reaper above is hygiene that runs
+ * after this proof has already taken its generation, and by then the
+ * reservation has been granted or refused; a pool full of abandoned donors
+ * therefore refuses today's proof and only tidies itself for tomorrow's.
+ * This pass runs first, and ONLY when the pool cannot currently satisfy the
+ * reservation: it evicts idle donors oldest-touched first and stops the
+ * moment enough is free, so a pool with room keeps every donor it has.
+ *
+ * It borrows the reaper's safety whole rather than restating it. Every
+ * entry it can see survived dp_reap_survey(), which already excluded the
+ * caller's own generation and anything holding a live proof lease on its
+ * marked pair. One touched within its idle window is taken only through
+ * dp_pressure_remove_young(), which proves under the owning checkout's
+ * queue lock that no proof of its commit is live or queued: a proof killed
+ * before it could retire its generation (a superseded run, a crash) would
+ * otherwise hold the RAM the next proof needs for the whole window. Every
+ * delete still goes through dp_reap_remove(), which re-proves detached,
+ * clean, and unchanged-since-surveyed before it runs. Advisory throughout:
+ * a delete that refuses leaves the pool exactly as full as it found it, and
+ * the reservation then refuses as it does today. */
+static void dp_pool_pressure_reap(const struct proof_paths *paths,
+                                  const char *parent, const char *in_use,
+                                  uint64_t free_bytes, uint64_t need_bytes,
+                                  size_t *removed_out, uint64_t *bytes_out)
+{
+    if (free_bytes >= need_bytes) return;
+    /* Orphans the survey below will never see (dead lint sandboxes, half-
+     * deleted generations with a pruned gitdir) are free bytes nobody is
+     * using; reclaiming them first may satisfy the reservation without
+     * evicting a donor anything might still want tomorrow. */
+    size_t orphan_removed = 0;
+    uint64_t orphan_bytes = 0;
+    dp_reap_orphans(paths, parent, in_use, &orphan_removed, &orphan_bytes);
+    if (removed_out) *removed_out += orphan_removed;
+    if (bytes_out) *bytes_out += orphan_bytes;
+    free_bytes += orphan_bytes;
+    if (free_bytes >= need_bytes) return;
+    DIR *dir = opendir(parent);
+    if (!dir) return;
+    int64_t now = platform_time_wall_unix();
+    struct warm_reap_entry *entries = NULL;
+    size_t count = 0;
+    bool collect_ok = dp_reap_collect(dir, parent, in_use, now, true,
+                                      &entries, &count);
+    (void)closedir(dir);
+    uint64_t reclaimed = 0;
+    for (size_t attempts = 0;
+         collect_ok && entries && attempts < PROOF_POOL_PRESSURE_MAX &&
+             free_bytes + reclaimed < need_bytes;
+         attempts++) {
+        size_t victim = dp_pressure_oldest(entries, count);
+        if (victim == count) break;
+        dp_pressure_evict(paths, &entries[victim], now, removed_out,
+                          &reclaimed);
+    }
+    if (bytes_out) *bytes_out += reclaimed;
+    free(entries);
+}
+
+/* Ask the RAM pool for room before the reservation asks the kernel. Only
+ * the RAM pool is ever under this pressure -- the disk pool never refuses
+ * -- so the path is resolved here rather than taken from
+ * dp_generation_pool(), which has not run yet and which would answer "no
+ * RAM root at all" for exactly the full pool this exists to relieve: its
+ * default guard is the same floor the pool has fallen below. Asking for one
+ * byte of headroom asks only whether the root is there. The generation this
+ * proof is about to take is named in use, so it can never be its own
+ * victim. */
+static void dp_generation_pool_relieve(const struct proof_paths *paths,
+                                       const char *generation_tag)
+{
+    char ram_root[PATH_MAX];
+    if (!platform_ram_scratch_root(ram_root, sizeof(ram_root), 1)) return;
+    char parent[PATH_MAX], in_use[PATH_MAX];
+    if (snprintf(parent, sizeof(parent), "%s/z23p", ram_root) >=
+            (int)sizeof(parent) ||
+        snprintf(in_use, sizeof(in_use), "%s/%s", parent, generation_tag) >=
+            (int)sizeof(in_use))
+        return;
+    uint64_t free_bytes = 0;
+    if (!platform_disk_space_available(ram_root, &free_bytes)) return;
+    dp_pool_pressure_reap(paths, parent, in_use, free_bytes,
+                          dp_pool_pressure_need(), NULL, NULL);
+}
+
+/* An explicit sweep of both this checkout's own generation pools (disk
+ * beside the landing worktree, and this host's RAM root when it offers
+ * one), unbounded by the tight per-prepare budget: triggered off the
+ * proof's hot path (attempt end, next submit), it can afford to look at
+ * more than eight candidates. Reports what it actually removed so the
+ * caller can log it; `why` carries a reason only when both pool paths
+ * were unusable to compute, never for "found nothing to remove" (that is
+ * success, not a refusal). */
+#define PROOF_POOL_SWEEP_MAX 512
+bool zcl_dev_proof_generation_pool_sweep(const char *repo_root,
+                                         size_t *removed_out,
+                                         uint64_t *bytes_out, char *why,
+                                         size_t why_len)
+{
+    if (why && why_len) why[0] = 0;
+    if (removed_out) *removed_out = 0;
+    if (bytes_out) *bytes_out = 0;
+    if (!repo_root || !repo_root[0]) {
+        proof_why(why, why_len, "proof_generation_pool_sweep_root_invalid");
+        return false;
+    }
+    char root_parent[PATH_MAX];
+    if (snprintf(root_parent, sizeof(root_parent), "%s", repo_root) >=
+            (int)sizeof(root_parent)) {
+        proof_why(why, why_len, "proof_generation_pool_sweep_root_invalid");
+        return false;
+    }
+    char *slash = strrchr(root_parent, '/');
+    if (!slash || slash == root_parent) {
+        proof_why(why, why_len, "proof_generation_pool_sweep_root_invalid");
+        return false;
+    }
+    *slash = 0;
+    char disk_parent[PATH_MAX];
+    if (snprintf(disk_parent, sizeof(disk_parent), "%s/.z23p", root_parent) >=
+            (int)sizeof(disk_parent)) {
+        proof_why(why, why_len, "proof_generation_pool_sweep_path_invalid");
+        return false;
+    }
+    struct proof_paths paths;
+    memset(&paths, 0, sizeof(paths));
+    (void)snprintf(paths.root, sizeof(paths.root), "%s", repo_root);
+    size_t removed = 0;
+    uint64_t bytes = 0;
+    generation_pool_reap_ex(&paths, disk_parent, "", PROOF_POOL_SWEEP_MAX,
+                            &removed, &bytes);
+    char ram_root[PATH_MAX];
+    if (platform_ram_scratch_root(ram_root, sizeof(ram_root), 0)) {
+        char ram_parent[PATH_MAX];
+        if (snprintf(ram_parent, sizeof(ram_parent), "%s/z23p", ram_root) <
+                (int)sizeof(ram_parent))
+            generation_pool_reap_ex(&paths, ram_parent, "",
+                                    PROOF_POOL_SWEEP_MAX, &removed, &bytes);
+    }
+    if (removed_out) *removed_out = removed;
+    if (bytes_out) *bytes_out = bytes;
+    return true;
+}
+
+/* Testable wrappers over the warm-start predicates. The ZCL_TESTING
+ * harness proves the donor policy and the link/copy decision against
+ * fixture trees — the refusals (unmarked generation, moved checkout,
+ * live lease) and the publisher semantics (replace, never rewrite in
+ * place) are the safety property, and neither is proven by reading it.
+ * Guarded so the harness (ZCL_TESTING) and the dev binary
+ * (ZCL_DEV_BUILD) compile the same seam; a release build sees none of
+ * it. POSIX-only because the warm start itself lives in the POSIX arm
+ * above. */
+#if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
+void zcl_dev_proof_test_generation_pool_reap(const char *repo_root,
+                                             const char *parent,
+                                             const char *in_use,
+                                             size_t *removed_out,
+                                             uint64_t *bytes_out)
+{
+    struct proof_paths paths;
+    memset(&paths, 0, sizeof(paths));
+    (void)snprintf(paths.root, sizeof(paths.root), "%s", repo_root);
+    generation_pool_reap_ex(&paths, parent, in_use, PROOF_POOL_SWEEP_MAX,
+                            removed_out, bytes_out);
+}
+
+void zcl_dev_proof_test_pool_pressure_reap(const char *repo_root,
+                                           const char *parent,
+                                           const char *in_use,
+                                           uint64_t free_bytes,
+                                           uint64_t need_bytes,
+                                           const char *phases,
+                                           size_t *removed_out,
+                                           uint64_t *bytes_out)
+{
+    struct proof_paths paths;
+    memset(&paths, 0, sizeof(paths));
+    (void)snprintf(paths.root, sizeof(paths.root), "%s", repo_root);
+    if (phases)
+        (void)snprintf(paths.phases, sizeof(paths.phases), "%s", phases);
+    dp_pool_pressure_reap(&paths, parent, in_use, free_bytes, need_bytes,
+                          removed_out, bytes_out);
+}
+
+void zcl_dev_proof_test_generation_tag(const char *root, const char *local,
+                                       char tag[33])
+{
+    dp_generation_tag(root, local, tag);
+}
+
+bool zcl_dev_proof_warm_tag(const char *name)
+{
+    return warm_tag_name(name);
+}
+
+bool zcl_dev_proof_warm_disabled(void)
+{
+    return warm_start_disabled();
+}
+
+enum zcl_dev_proof_warm_seed_class zcl_dev_proof_warm_classify(
+    const char *rel, bool is_reg)
+{
+    switch (warm_classify_rel(rel, is_reg)) {
+    case WARM_SEED_LINK: return ZCL_DEV_PROOF_WARM_LINK;
+    case WARM_SEED_COPY: return ZCL_DEV_PROOF_WARM_COPY;
+    default: break;
+    }
+    return ZCL_DEV_PROOF_WARM_SKIP;
+}
+
+int zcl_dev_proof_warm_pick(const struct zcl_dev_proof_warm_candidate *c,
+                            size_t n)
+{
+    return warm_pick_donor(c, n);
+}
+
+bool zcl_dev_proof_warm_marker_write(
+    const char *generation, const char *root, const char *local,
+    const char *base, int64_t completed,
+    const struct zcl_dev_proof_build_identity_v1 *identity)
+{
+    return warm_marker_write_at(generation, root, local, base, completed,
+                                identity);
+}
+
+bool zcl_dev_proof_warm_marker_read(
+    const char *generation, char root[PATH_MAX], char local[65],
+    char base[65], int64_t *completed,
+    struct zcl_dev_proof_build_identity_v1 *identity)
+{
+    return warm_marker_read(generation, root, local, base, completed,
+                            identity);
+}
+
+bool zcl_dev_proof_warm_seed_and_retime(const char *donor_build,
+                                        const char *gen_build,
+                                        const char *gen_src,
+                                        bool copy_wrapper,
+                                        const char *const *changed,
+                                        size_t nchanged,
+                                        struct zcl_dev_proof_warm_stats *stats)
+{
+    if (!donor_build || !gen_build || !gen_src || !stats) return false;
+    memset(stats, 0, sizeof(*stats));
+    if (!dp_prune_dev_orphans(gen_build, gen_src)) return false;
+    struct warm_seed_accum accum = {0};
+    warm_seed_walk(donor_build, gen_build, gen_src, "", copy_wrapper,
+                   &accum);
+    struct timespec seed_stamp = {0}, source_stamp = {0};
+    bool ok = !accum.failed && accum.files > 0 &&
+              warm_retime_outputs(gen_build, &accum, &seed_stamp) &&
+              warm_stamp_after(&seed_stamp, &source_stamp);
+    for (size_t i = 0; ok && changed && i < nchanged; i++) {
+        if (!changed[i]) {
+            ok = false;
+            break;
+        }
+        warm_touch_changed(gen_src, changed[i], &source_stamp, &ok);
+    }
+    if (ok) {
+        stats->files_linked = accum.files;
+        stats->bytes_linked = accum.bytes;
+    } else {
+        warm_seed_rollback(gen_build, &accum);
+    }
+    warm_seed_accum_free(&accum);
+    return ok;
+}
+
+/* The whole production warm start -- survey, pick, seed, retime -- against
+ * a fixture checkout and pool. With `authoritative` it is exactly what
+ * generation_prepare() runs; without it, the seeding a qualified verifier
+ * account would re-enable, so that path stays proven while it is off.
+ * Declared by the harness itself rather than in dev_proof.h. `donor` gets
+ * the picked tag and `reason` the typed cold reason; `phases` (may be NULL)
+ * receives one warm_donor_rejected row per pool entry that could not
+ * donate. */
+bool zcl_dev_proof_test_warm_start(const char *root, const char *parent,
+                                   const char *generation, const char *local,
+                                   const char *phases, bool authoritative,
+                                   char donor[33], char reason[32],
+                                   uint64_t *files_linked);
+bool zcl_dev_proof_test_warm_start(const char *root, const char *parent,
+                                   const char *generation, const char *local,
+                                   const char *phases, bool authoritative,
+                                   char donor[33], char reason[32],
+                                   uint64_t *files_linked)
+{
+    struct proof_paths paths;
+    struct proof_warmstart warm;
+    memset(&paths, 0, sizeof(paths));
+    memset(&warm, 0, sizeof(warm));
+    if (!root || !donor || !reason || !files_linked) return false;
+    (void)snprintf(paths.root, sizeof(paths.root), "%s", root);
+    if (phases)
+        (void)snprintf(paths.phases, sizeof(paths.phases), "%s", phases);
+    bool ok = warm_start_generation(&paths, parent, generation, local,
+                                    authoritative, &warm);
+    (void)snprintf(donor, 33, "%s", warm.donor);
+    (void)snprintf(reason, 32, "%s", warm.cold_reason);
+    *files_linked = warm.files_linked;
+    return ok;
+}
+#endif /* ZCL_DEV_BUILD || ZCL_TESTING */
+
+/* A fresh generation checkout never carries build/bin/zcc: it is a build
+ * artifact, deliberately absent from the `dependencies[]` list above so every
+ * generation self-hosts its own compile cache from source. Left unbootstrapped
+ * here, the FIRST `make` invocation that touches $(CC) builds it lazily at
+ * Makefile parse time (tools/dev/zcc_bootstrap.sh). The lint and test
+ * dimensions below are launched as two independent `make` child processes
+ * before either is waited on (by design — see the comment at their call
+ * site), and each reparses the Makefile and re-runs that same parse-time
+ * bootstrap independently. Two such parses racing their first-ever bootstrap
+ * of this generation observed BUILD_COMPILER_ID diverge between the epoch a
+ * session was acquired under and the epoch verified against it later
+ * (`compiler/toolchain changed during build`), even though the underlying
+ * zcc bytes end up identical: the race is over which parse's view of
+ * $(CC) — bare `cc` because its bootstrap had not yet completed, or the
+ * fully wrapped `zcc cc` — gets recorded first.
+ *
+ * Bootstrap once, synchronously, right here, before any make process for
+ * this generation exists. Every later parse-time freshness check then finds
+ * zcc already newer than every one of its own inputs and does nothing, so
+ * there is no first-mover race left to lose. Advisory only, exactly like the
+ * script's own contract ("never fails a build"): a failure here is not a
+ * generation-prepare failure, it just falls back to the previous lazy,
+ * single-caller bootstrap the first make invocation still performs. */
+static void generation_zcc_bootstrap(const char *generation)
+{
+    char bin_dir[PATH_MAX];
+    if (!generation ||
+        snprintf(bin_dir, sizeof(bin_dir), "%s/build/bin", generation) >=
+            (int)sizeof(bin_dir))
+        return;
+    if (setenv("ZCL_BIN_DIR", bin_dir, 1) != 0) return;
+    const char *argv[] = {"tools/dev/zcc_bootstrap.sh", NULL};
+    struct zcl_devloop_process_result result = {0};
+    (void)zcl_devloop_process_run(generation, argv, 60000, &result);
+    (void)unsetenv("ZCL_BIN_DIR");
+}
+
+/* `git worktree add` copies the submitting checkout's worktree-scoped
+ * core.hooksPath verbatim into a fresh generation's own config.worktree, so
+ * a freshly materialized generation still names the checkout's
+ * build/githooks rather than the copy generation_prepare() just
+ * materialized. check-git-hooks-installed then compares
+ * expected=<generation>/build/githooks against
+ * actual=<submitting checkout>/build/githooks and fails closed on every
+ * proof that runs the full gate set. A generation must be judged against
+ * the hooks it carries, so point its own worktree config at its own copy;
+ * failing that reconfiguration fails the generation closed rather than
+ * judging it against someone else's checkout. */
+static bool generation_hooks_configure(const char *generation, char *why,
+                                       size_t why_len)
+{
+    char hooks_path[PATH_MAX];
+    if (snprintf(hooks_path, sizeof(hooks_path), "%s/build/githooks",
+                 generation) >= (int)sizeof(hooks_path)) {
+        proof_why(why, why_len, "proof_generation_hooks_path_too_long");
+        return false;
+    }
+    const char *hooks_argv[] = {"git", "config", "--worktree",
+                                "core.hooksPath", hooks_path, NULL};
+    char hooks_output[ZCL_DEVLOOP_OUTPUT_MAX];
+    if (!git_capture(generation, hooks_argv, hooks_output,
+                     sizeof(hooks_output))) {
+        proof_why(why, why_len, "proof_generation_hooks_path_not_reconfigured");
+        return false;
+    }
+    return true;
+}
+
+/* The directory the generation pool sits beside: the checkout's own
+ * parent, with the checkout name trimmed off. */
+static bool dp_generation_parent_dir(const char *root,
+                                     char root_parent[PATH_MAX], char *why,
+                                     size_t why_len)
+{
+    if (snprintf(root_parent, PATH_MAX, "%s", root) >= PATH_MAX) {
+        proof_why(why, why_len, "proof_generation_path_invalid");
+        return false;
+    }
+    char *slash = strrchr(root_parent, '/');
+    if (!slash || slash == root_parent) {
+        proof_why(why, why_len, "proof_generation_path_invalid");
+        return false;
+    }
+    *slash = 0;
+    return true;
+}
+
+/* One generation per (checkout, local commit) pair, named by a digest over
+ * both so two checkouts never collide in a shared pool. */
+static void dp_generation_tag(const char *root, const char *local,
+                              char generation_tag[33])
+{
+    uint8_t generation_hash[ZCL_DEV_PROOF_ROOT_BYTES];
+    struct sha3_256_ctx generation_identity;
+    hash_begin(&generation_identity, "zcl.dev_proof_generation_root.v2");
+    sha3_256_write(&generation_identity, (const uint8_t *)root,
+                   strlen(root) + 1);
+    sha3_256_write(&generation_identity, (const uint8_t *)local,
+                   strlen(local) + 1);
+    sha3_256_finalize(&generation_identity, generation_hash);
+    zcl_hex_encode(generation_hash, 16, generation_tag);
+}
+
+/* Build and test work here is dominated by fsync, and on a RAM-backed
+ * filesystem fsync costs nothing. When the machine offers one with room to
+ * spare the whole generation — checkout, build tree and test scratch —
+ * lives there; otherwise it stays exactly where it was. The choice is
+ * written to phases.txt so a slow proof can be read against where it ran.
+ * It is deliberately NOT sealed into the receipt: two proofs of the same
+ * source must admit each other whatever storage they happened to use.
+ *
+ * Free space seen is not free space kept: N proofs asking at once each
+ * saw the same headroom and together filled the tmpfs. A reservation
+ * held for the life of the generation is what makes this one's yes true
+ * for this one alone. Refusal is not an error — the generation falls
+ * back to disk exactly as if no RAM root had been offered. */
+static bool dp_generation_pool(const char *root_parent,
+                               struct platform_ram_scratch_lease *ram_lease,
+                               char parent[PATH_MAX], char ram_root[PATH_MAX],
+                               bool *ram_backed, bool *ram_reserve_refused)
+{
+    *ram_backed = platform_ram_scratch_root(ram_root, PATH_MAX, 0);
+    *ram_reserve_refused = false;
+    if (*ram_backed &&
+        !platform_ram_scratch_reserve(ram_root, proof_ram_reserve_bytes(),
+                                      ram_lease)) {
+        *ram_backed = false;
+        *ram_reserve_refused = true;
+    }
+    int parent_len = *ram_backed
+        ? snprintf(parent, PATH_MAX, "%s/z23p", ram_root)
+        : snprintf(parent, PATH_MAX, "%s/.z23p", root_parent);
+    return parent_len > 0 && (size_t)parent_len < PATH_MAX;
+}
+
+/* Where this proof ran, for a reader comparing a slow proof against its
+ * storage. Display only; nothing downstream reads it back. */
+static void dp_generation_storage_note(const struct proof_paths *paths,
+                                       const char *ram_root, bool ram_backed,
+                                       bool ram_reserve_refused,
+                                       const char *generation)
+{
+    if (!paths->phases[0]) return;
+    char storage_note[192];
+    if (ram_reserve_refused) {
+        uint64_t ram_free_bytes = 0;
+        (void)platform_disk_space_available(ram_root, &ram_free_bytes);
+        char ram_pool[PATH_MAX];
+        size_t ram_pool_count = 0;
+        if (snprintf(ram_pool, sizeof(ram_pool), "%s/z23p", ram_root) <
+            (int)sizeof(ram_pool))
+            ram_pool_count = generation_dir_count(ram_pool);
+        (void)snprintf(storage_note, sizeof(storage_note),
+                       "disk reason=ram_reserve_refused "
+                       "requested_bytes=%llu free_bytes=%llu "
+                       "generations=%zu",
+                       (unsigned long long)proof_ram_reserve_bytes(),
+                       (unsigned long long)ram_free_bytes,
+                       ram_pool_count);
+    } else {
+        (void)snprintf(storage_note, sizeof(storage_note), "%s",
+                       ram_backed ? "ram" : "disk");
+    }
+    (void)zcl_dev_proof_phase_note(paths->phases, "generation_storage",
+                                   storage_note);
+    (void)zcl_dev_proof_phase_note(paths->phases, "generation_root",
+                                   generation);
+}
+
+/* A generation directory this pair left behind whose worktree registration
+ * git already deleted: the retire after an earlier attempt removed the admin
+ * dir and then failed on the tree. Reusing it refuses every later attempt of
+ * the same pair at the first git call inside it, and dp_reap_orphans() never
+ * takes the caller's own generation. This worker holds the pair's lease, so
+ * the leftover is its own to clear before a fresh checkout. Returns false
+ * only when it is that shape and could not be removed. */
+static bool dp_generation_is_pruned(const char *generation)
+{
+    const char *tag = strrchr(generation, '/');
+    tag = tag ? tag + 1 : generation;
+    return warm_tag_name(tag) && dp_orphan_gitdir_pruned(generation, tag);
+}
+
+static bool dp_generation_clear_pruned(const struct proof_paths *paths,
+                                       const char *generation)
+{
+    if (!dp_generation_is_pruned(generation)) return true;
+    const char *tag = strrchr(generation, '/');
+    tag = tag ? tag + 1 : generation;
+    uint64_t freed = directory_bytes_sum(generation);
+    if (!dp_orphan_remove_tree(generation)) return false;
+    dp_orphan_note(paths, tag, "pruned_gitdir_own_pair", freed);
+    return true;
+}
+
+/* Check the generation out when it is not already there. */
+static bool dp_generation_checkout(const struct proof_paths *paths,
+                                   const char *generation, const char *local,
+                                   char *why, size_t why_len)
+{
+    struct stat st;
+    if (!dp_generation_clear_pruned(paths, generation)) {
+        proof_why(why, why_len, "proof_generation_stale_unremovable");
+        return false;
+    }
+    if (lstat(generation, &st) == 0) return true;
+    if (errno != ENOENT) {
+        proof_why(why, why_len, "proof_generation_inspection_failed");
+        return false;
+    }
+    /* A RAM-backed generation does not survive a reboot, and git still
+     * holds its registration. Drop registrations whose directory is gone
+     * before adding, or the add fails on a name the tmpfs already lost. */
+    const char *prune_argv[] = {"git", "worktree", "prune", NULL};
+    char pruned[ZCL_DEVLOOP_OUTPUT_MAX];
+    (void)git_capture(paths->root, prune_argv, pruned, sizeof(pruned));
+    const char *argv[] = {"git", "worktree", "add", "--detach",
+                          generation, local, NULL};
+    char output[ZCL_DEVLOOP_OUTPUT_MAX];
+    if (!git_capture(paths->root, argv, output, sizeof(output))) {
+        proof_why(why, why_len, "proof_generation_checkout_failed");
+        return false;
+    }
+    return true;
+}
+
+/* A retried exact pair reuses its private generation. Fuzz depfiles are not
+ * proof inputs, but an earlier test can leave them there; retiming a changed
+ * header then makes the include index refuse the unrelated stale depfile.
+ * Discard only this generated profile before closing the proof graph. */
+static bool dp_generation_discard_fuzz_outputs(const char *generation,
+                                               char *why, size_t why_len)
+{
+    struct stat st;
+    char top[PATH_MAX];
+    const char *top_argv[] = {"git", "rev-parse", "--show-toplevel", NULL};
+    if (lstat(generation, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        !git_capture(generation, top_argv, top, sizeof(top)) ||
+        strcmp(top, generation) != 0) {
+        proof_why(why, why_len, "proof_generation_fuzz_cleanup_unsafe_root");
+        return false;
+    }
+    const char *argv[] = {"git", "clean", "-q", "-f", "-d", "-x", "--",
+                          "build/fuzz-obj", NULL};
+    char output[ZCL_DEVLOOP_OUTPUT_MAX];
+    if (git_capture(generation, argv, output, sizeof(output))) return true;
+    proof_why(why, why_len, "proof_generation_fuzz_cleanup_failed");
+    return false;
+}
+
+/* The generation's own build tree. Distinct from the dependency copy
+ * below: nothing is missing from the checkout here, the generation's own
+ * build tree could not be created. Conflating the two sent a reader
+ * hunting a vendored archive that was present all along. */
+static bool dp_generation_build_dirs(const char *generation, char *why,
+                                     size_t why_len)
+{
+    char build_dir[PATH_MAX], bin_dir[PATH_MAX];
+    if (snprintf(build_dir, sizeof(build_dir), "%s/build", generation) >=
+            (int)sizeof(build_dir) ||
+        snprintf(bin_dir, sizeof(bin_dir), "%s/build/bin", generation) >=
+            (int)sizeof(bin_dir) ||
+        !platform_private_directory_ensure(build_dir) ||
+        !platform_private_directory_ensure(bin_dir)) {
+        proof_whyf(why, why_len, "proof_generation_build_dir_unwritable:%s",
+                   build_dir);
+        return false;
+    }
+    return true;
+}
+
+/* These cross-target outputs and download caches are not native compiler
+ * inputs. Carry them when present so a Windows acceptance run can reuse
+ * them, but do not require a native checkout to have built a cross target. */
+static bool dp_generation_dependency_optional(const char *dependency)
+{
+    return strcmp(dependency, "vendor/.build-x86_64-w64-mingw32") == 0 ||
+           strcmp(dependency, "vendor/.cache") == 0 ||
+           strcmp(dependency, "vendor/cross") == 0;
+}
+
+/* Absence must agree on both sides. A reused generation with old cross
+ * inputs refuses instead of silently proving against bytes its source no
+ * longer carries. Inspection errors are not evidence of absence. */
+static bool dp_generation_optional_absent(const char *target,
+                                          const char *dependency,
+                                          char *why, size_t why_len)
+{
+    struct stat st;
+    if (lstat(target, &st) == 0) {
+        proof_whyf(why, why_len,
+                   "proof_generation_optional_dependency_stale:%s",
+                   dependency);
+        return false;
+    }
+    if (errno == ENOENT) return true;
+    proof_whyf(why, why_len,
+               "proof_generation_dependency_inspection_failed:%s (%s)",
+               dependency, proof_errno_name(errno));
+    return false;
+}
+
+/* One generation dependency, copied in with its own inode. */
+static bool dp_generation_dependency(const char *root, const char *generation,
+                                     const char *dependency, char *why,
+                                     size_t why_len)
+{
+    char source[PATH_MAX], target[PATH_MAX];
+    if (snprintf(source, sizeof(source), "%s/%s", root,
+                 dependency) >= (int)sizeof(source) ||
+        snprintf(target, sizeof(target), "%s/%s", generation,
+                 dependency) >= (int)sizeof(target)) {
+        proof_whyf(why, why_len,
+                   "proof_generation_dependency_path_too_long:%s",
+                   dependency);
+        return false;
+    }
+    struct stat source_st;
+    if (lstat(source, &source_st) != 0) {
+        if (errno != ENOENT) {
+            proof_whyf(why, why_len,
+                       "proof_generation_dependency_inspection_failed:%s (%s)",
+                       dependency, proof_errno_name(errno));
+            return false;
+        }
+        if (dp_generation_dependency_optional(dependency))
+            return dp_generation_optional_absent(target, dependency, why,
+                                                  why_len);
+        /* Checker binaries for the sealed generated-docs gate come from
+         * the submitting checkout's own build, named as the exact make
+         * target that produces them. */
+        char make_target[512] = {0};
+        bool make_target_ok =
+            snprintf(make_target, sizeof(make_target), "make %s",
+                     dependency) < (int)sizeof(make_target);
+        /* vendor/ entries come from the vendored-archive build; the
+         * installed hooks come from arming the clone; the hotswap
+         * fixture images come from any test-binary build. Naming the
+         * target turns a class into one command the reader can run. */
+        const char *fix = strncmp(dependency, "vendor/", 7) == 0
+                              ? "make vendor"
+                              : strncmp(dependency, "build/hotswap/",
+                                        14) == 0
+                                    ? "make build/hotswap/zcl_rollback_fixture_a.so "
+                                      "build/hotswap/zcl_rollback_fixture_b.so"
+                                    : strncmp(dependency, "build/fixtures/",
+                                              15) == 0
+                                        ? "make build/fixtures/rlc_child_v1 "
+                                          "build/fixtures/rlc_child_broken "
+                                          "build/fixtures/otlp_startup_probe"
+                                        : strncmp(dependency, "build/bin/",
+                                                  10) == 0 &&
+                                              make_target_ok
+                                            ? make_target
+                                            : "make install-hooks";
+        proof_whyf(why, why_len,
+                   "proof_generation_dependency_unavailable:%s (%s)",
+                   dependency, fix);
+        return false;
+    }
+    /* The source is right there. Telling the reader to rebuild it sent
+     * ten proof attempts hunting a vendored archive that was present all
+     * along; say what actually failed and why. */
+    errno = 0;
+    if (!dependency_parent_ensure(target) ||
+        !dependency_materialize(source, target)) {
+        proof_whyf(why, why_len,
+                   "proof_generation_dependency_copy_failed:%s (%s)",
+                   dependency, proof_errno_name(errno));
+        return false;
+    }
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_generation_dependency(const char *root,
+                                              const char *generation,
+                                              const char *dependency,
+                                              char *why, size_t why_len)
+{
+    return dp_generation_dependency(root, generation, dependency, why, why_len);
+}
+#endif
+
+/* Warm start is advisory: it fills `warm` for the receipt sidecar and
+ * never fails the prepare. Any refusal inside degrades to the cold
+ * build the proof has always run. ZCL_DEV_PROOF_WARM=0 forces that
+ * cold path for measurement. Every generation this prepares backs a
+ * receipt, and the receipt is the admission, so the start is always
+ * authoritative: a donor from the candidate trust domain is refused. */
+static void dp_generation_warm(const struct proof_paths *paths,
+                               const char *parent, const char *generation,
+                               const char *local, struct proof_warmstart *warm)
+{
+    if (!warm) return;
+    if (warm_start_disabled()) {
+        char gen_build[PATH_MAX];
+        if (snprintf(gen_build, sizeof(gen_build), "%s/build", generation) >=
+                (int)sizeof(gen_build) ||
+            !dp_prune_dev_orphans(gen_build, generation)) {
+            (void)snprintf(warm->cold_reason, sizeof(warm->cold_reason), "%s",
+                           "orphan_cleanup_failed");
+            return;
+        }
+        (void)snprintf(warm->cold_reason, sizeof(warm->cold_reason), "%s",
+                       "disabled");
+        return;
+    }
+    memset(warm, 0, sizeof(*warm));
+    (void)warm_start_generation(paths, parent, generation, local, true, warm);
+}
+
+static bool dp_generation_dependencies(const char *root,
+                                        const char *generation,
+                                        char *why, size_t why_len)
+{
+    /* Preserve the complete ignored compiler-input sets that source identity
+     * seals. Copying a fixed archive/header subset lets a host-specific input
+     * (for example libsecp256k1-darwin.a) appear during `make build-only`,
+     * superseding an otherwise exact isolated proof generation. Provenance
+     * stamps travel with vendor/lib so already verified inputs are not
+     * needlessly rebuilt after the source checkpoint. */
+    static const char *const dependencies[] = {
+        "vendor/lib", "vendor/include",
+        /* The untracked amalgamated C source beside those two. No native
+         * build compiles it, so its absence looks like nothing at all --
+         * until the Windows acceptance link inside a full lint dies with
+         * "No rule to make target 'vendor/sqlite3.c'", naming a missing file
+         * rather than a missing priming step. The Makefile's worktree-prime
+         * comment names this exact trap for hand-primed worktrees; a proof
+         * generation is one more of them. */
+        "vendor/sqlite3.c",
+        "vendor/tor/libtor.a",
+        /* The manifest must travel with the archives it attests: a
+         * generation without it sees archives but no provenance, rebuilds
+         * Tor from source in RAM, and the next warm restart then re-copies
+         * the original libtor.a under a manifest that no longer matches it. */
+        "vendor/tor/.provenance",
+        /* The generated Tor Makefile records the CC= string provenance
+         * binds. Copying archives and .provenance without it makes
+         * check-tor-provenance fall back to ${CC:-cc}, a different
+         * compiler identity than the gcc that wrote the archives. */
+        "vendor/tor/Makefile",
+        /* Preserve optional cross-build outputs and download caches when
+         * present so a generation can reuse the submitting checkout's
+         * prepared target inputs without rebuilding or downloading them. */
+        "vendor/.cache",
+        /* The explicit Windows release target's staged lib/include.
+         * The acceptance catalog builds SQLite separately from
+         * vendor/sqlite3.c. build_vendor.sh removes its transient
+         * .build-<target> workspace after successful verification; that
+         * scratch directory is not a compiler input or a prerequisite. */
+        "vendor/cross",
+        "vendor/tor/src/ext/ed25519/donna/libed25519_donna.a",
+        "vendor/tor/src/ext/ed25519/ref10/libed25519_ref10.a",
+        "vendor/tor/src/ext/keccak-tiny/libkeccak-tiny.a",
+        "build/githooks",
+        /* Checker binaries the sealed generated-docs gate execs before any
+         * dimension builds inside the generation: without them every fresh
+         * proof fails the gate with a misleading "stale" verdict for what
+         * is actually a missing prerequisite. Copied from the submitting
+         * checkout (required: absence refuses with the exact make target
+         * above). The later lint dimension rebuilds and re-checks with
+         * binaries built from sealed source, so a stale submitter binary
+         * can only add fail-closed friction here, never false admission. */
+        "build/bin/z23-lint",
+        "build/bin/z23-fleet-observe",
+        "build/bin/gen_capability_inventory",
+#if defined(__linux__)
+        /* Order-only test-binary prerequisites that no admitted executable
+         * links against: the rollback group dlopens these fixture images by
+         * name on Linux. Other hosts report fixture_required=false, matching
+         * the Makefile's Linux-only prerequisites. */
+        "build/hotswap/zcl_rollback_fixture_a.so",
+        "build/hotswap/zcl_rollback_fixture_b.so",
+#endif
+#if !defined(_WIN32)
+        /* Same class: the resident-launch contract group execs these
+         * fixture children by name on every POSIX host (the Makefile guards
+         * the pair on ZCL_HOST_WINDOWS only), and the test dimension runs no
+         * make that could build them inside the generation. */
+        "build/fixtures/rlc_child_v1",
+        "build/fixtures/rlc_child_broken",
+        /* test_trace execs this start-up probe by name (Makefile guards it
+         * on ZCL_HOST_WINDOWS only, like the pair above). */
+        "build/fixtures/otlp_startup_probe",
+#endif
+    };
+    if (!dp_generation_build_dirs(generation, why, why_len))
+        return false;
+    for (size_t i = 0; i < sizeof(dependencies) / sizeof(dependencies[0]); i++)
+        if (!dp_generation_dependency(root, generation,
+                                      dependencies[i], why, why_len))
+            return false;
+    /* The submitting checkout's test-verdict store (.zvcs/objects) is
+     * deliberately not in the list above. Its records are unsigned PASS
+     * entries that any process running as this uid can write, and the
+     * candidate being proved runs as this uid: its tests could plant a PASS
+     * at the exact key a later proof looks up, and that group would count
+     * as passing without executing. Reused verdicts may shape acceptance
+     * only when a separate account, outside the candidate's trust domain,
+     * reproduced and signed them. Until such a verifier is qualified the
+     * test dimension runs every selected group fresh
+     * (dp_test_dimension_argv), so nothing is carried over. */
+    return true;
+}
+
+#if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
+bool zcl_dev_proof_test_generation_dependencies(const char *root,
+                                                const char *generation,
+                                                char *why, size_t why_len)
+{
+    return dp_generation_dependencies(root, generation, why, why_len);
+}
+#endif
+
+/* Freshness of the closed generated-doc set, verified read-only inside the
+ * sealed generation before any expensive dimension runs. A stale generated
+ * file fails the proof's own lint dimension minutes later; refusing here
+ * names the exact file and its regen command in seconds, without touching
+ * a byte of the candidate. The tracked paths mirror DLRG_ARTIFACTS (the
+ * land queue regenerates them pre-proof); the worker only ever VERIFIES,
+ * so a refusal can never be caused by something this proof wrote. */
+struct dp_docs_fresh_artifact {
+    const char *rel;
+    const char *check;
+    const char *regen;
+    const char *tool_arg;
+};
+
+static const struct dp_docs_fresh_artifact DP_DOCS_FRESH[] = {
+    { "docs/CAPABILITY_INVENTORY.jsonl",
+      "tools/lint/check_capability_inventory_generated.sh",
+      "make docs-capability-inventory", "build/bin/gen_capability_inventory" },
+    { "docs/agent/EXECUTOR_HEURISTICS.md",
+      "tools/lint/check_fleet_facts.sh",
+      "make docs-executor-routing", NULL },
+    { "docs/agent/EXECUTOR_HEURISTICS.md",
+      "tools/lint/check_fleet_observations.sh",
+      "make docs-executor-routing", NULL },
+    { "docs/CODEBASE_MAP.md",
+      "tools/scripts/check_doc_counts.sh",
+      "make fix-doc-counts", NULL },
+};
+#define DP_DOCS_FRESH_N (sizeof(DP_DOCS_FRESH) / sizeof(DP_DOCS_FRESH[0]))
+
+/* The checker binaries a sealed generation must carry before any checker
+ * above may run: check_fleet_facts.sh execs z23-lint,
+ * check_fleet_observations.sh execs z23-fleet-observe, and the inventory
+ * checker takes the already-built generator. This list gates the fresh
+ * check and mirrors the docs-proof-tools Make prerequisite set. */
+static const char *const DP_DOCS_TOOLS[] = {
+    "build/bin/z23-lint",
+    "build/bin/z23-fleet-observe",
+    "build/bin/gen_capability_inventory",
+};
+#define DP_DOCS_TOOLS_N (sizeof(DP_DOCS_TOOLS) / sizeof(DP_DOCS_TOOLS[0]))
+
+/* Merged-output markers that prove a checker failed on its toolchain or
+ * inputs rather than on drifted docs. Every checker above reports genuine
+ * drift with FAIL and reserves FATAL for a broken environment, so these
+ * markers never match a real stale verdict. */
+static const char *const DP_DOCS_TOOL_MARKERS[] = {
+    "No such file or directory",
+    "not found",
+    "command not found",
+    "Permission denied",
+    "FATAL",
+    "is missing",
+    "ENOENT",
+};
+
+static bool dp_docs_output_signals_tool_failure(const char *out, int rc)
+{
+    /* 126/127 are exec failures. rc=2 is the hollow/toolchain code every
+     * docs-fresh checker documents (z23-lint die(), an unreadable table,
+     * a generator that did not compile). Drift is exit 1. An rc=2 whose
+     * text lacks a marker must not be told to the operator as stale docs. */
+    if (rc == 2 || rc == 126 || rc == 127) return true;
+    if (!out) return false;
+    for (size_t i = 0; i < sizeof(DP_DOCS_TOOL_MARKERS) /
+                                sizeof(DP_DOCS_TOOL_MARKERS[0]);
+         i++) {
+        if (strstr(out, DP_DOCS_TOOL_MARKERS[i])) return true;
+    }
+    return false;
+}
+
+/* Measured 11 s for the inventory check on a loaded host; ten times that
+ * still fails two orders of magnitude faster than the proof it guards. */
+#define DP_DOCS_FRESH_TIMEOUT_MS 120000
+
+/* The provisioning step builds these before any checker runs, but the
+ * gate must not assume it: a checker that exec-fails on a missing binary
+ * exits 127 with the shell's ENOENT text, which is a broken toolchain,
+ * never doc drift. Refuse here with the missing binary named instead of
+ * running checkers that cannot run. */
+static bool dp_docs_tools_present(const char *generation,
+                                  char *why, size_t why_len)
+{
+    for (size_t i = 0; i < DP_DOCS_TOOLS_N; i++) {
+        char tool[PATH_MAX];
+        if (!generation || !generation[0] ||
+            snprintf(tool, sizeof(tool), "%s/%s", generation,
+                     DP_DOCS_TOOLS[i]) >= (int)sizeof(tool) ||
+            access(tool, X_OK) != 0) {
+            proof_whyf(why, why_len, "proof_generated_docs_tools_missing:%s",
+                       DP_DOCS_TOOLS[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The checkers read only the sealed generation and write only their own
+ * temporaries, so they need not hold the proof's serial path. They start
+ * together as proof steps at the very end of generation_prepare(), after
+ * the last write it makes into the generation, and are joined before the
+ * first step that builds in it (the closure refresh build, or the
+ * dimensions). Between those points the proof writes into the generation
+ * only untracked files no checker reads: the native source snapshot under
+ * .codeindex/ (a directory the inventory scanner prunes) and the
+ * source-identity batch tool under build/bin/; every other checker reads
+ * tracked files or named docs. Nothing about the verdict moves:
+ *   - a watcher thread polls the steps from the moment they start, so a
+ *     checker still running at its deadline is killed then and refused as
+ *     a timeout, exactly as the serial capture's own deadline did, even
+ *     when the join comes later; if no watcher can be started the checkers
+ *     are waited for at once, which is the serial order;
+ *   - the join judges the checkers in list order, so the first checker
+ *     that is not clean names the refusal;
+ *   - a checker whose script is absent refuses at its own position, and
+ *     none after it is started, because no later result could change that
+ *     answer. */
+enum dp_docs_fresh_slot {
+    DP_DOCS_FRESH_UNSTARTED = 0,
+    DP_DOCS_FRESH_PATH_INVALID,
+    DP_DOCS_FRESH_SCRIPT_MISSING,
+    DP_DOCS_FRESH_START_FAILED,
+    DP_DOCS_FRESH_STARTED,
+};
+
+struct dp_docs_fresh_run {
+    struct zcl_dev_proof_step steps[DP_DOCS_FRESH_N];
+    enum dp_docs_fresh_slot slots[DP_DOCS_FRESH_N];
+    char log_dir[PATH_MAX];
+    int64_t started_us;
+    int64_t timeout_ms;
+    bool active;
+    /* While set, the watcher owns `steps`; nothing else touches them until
+     * dp_docs_fresh_join() has joined it. */
+    bool watching;
+    pthread_t watcher;
+};
+
+/* The step log that stands in for the serial capture buffer. Dot-named and
+ * removed by the join, so an attempt's log directory keeps its file set. */
+static bool dp_docs_fresh_log_path(const struct dp_docs_fresh_run *run,
+                                   size_t index, char *out, size_t out_len)
+{
+    return snprintf(out, out_len, "%s/.generation-docs-fresh-%zu.log",
+                    run->log_dir, index) < (int)out_len;
+}
+
+/* The same bytes the serial capture judged: the head of the merged
+ * stdout+stderr, NUL-terminated. */
+static bool dp_docs_fresh_log_head(const char *path, char *out,
+                                   size_t out_len)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    size_t used = 0;
+    while (used + 1 < out_len) {
+        ssize_t n = read(fd, out + used, out_len - 1 - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            (void)close(fd);
+            return false;
+        }
+        if (n == 0) break;
+        used += (size_t)n;
+    }
+    out[used] = '\0';
+    return close(fd) == 0;
+}
+
+static enum dp_docs_fresh_slot dp_docs_fresh_start_one(
+    struct dp_docs_fresh_run *run, const char *generation, size_t index)
+{
+    const struct dp_docs_fresh_artifact *artifact = &DP_DOCS_FRESH[index];
+    char script[PATH_MAX], log_path[PROOF_LOG_PATH_MAX];
+    if (snprintf(script, sizeof(script), "%s/%s", generation,
+                 artifact->check) >= (int)sizeof(script) ||
+        !dp_docs_fresh_log_path(run, index, log_path, sizeof(log_path)))
+        return DP_DOCS_FRESH_PATH_INVALID;
+    /* The generation's own copy: the check script resolves its tree
+     * from its own location, so this binds the verdict to the sealed
+     * bytes rather than the submitting checkout. */
+    struct stat st;
+    if (stat(script, &st) != 0 || !S_ISREG(st.st_mode))
+        return DP_DOCS_FRESH_SCRIPT_MISSING;
+    const char *argv[] = { script, artifact->tool_arg, NULL };
+    /* The serial capture's wall deadline, exactly: killed at `timeout_ms`
+     * whatever it prints, with no host ceiling to shorten it. */
+    const struct zcl_dev_proof_budget budget = {
+        .budget_ms = run->timeout_ms,
+        .ceiling_ms = 0,
+        .no_progress_ms = 0,
+    };
+    return zcl_dev_proof_step_start(&run->steps[index], generation, log_path,
+                                    argv, &budget)
+               ? DP_DOCS_FRESH_STARTED
+               : DP_DOCS_FRESH_START_FAILED;
+}
+
+/* Poll every started checker until all have finished, killing each at its
+ * deadline. Touches only the steps (waitpid, stat, kill, sleep), never the
+ * allocator or stdio, so the proof may fork its own children meanwhile. */
+static void *dp_docs_fresh_watch(void *opaque)
+{
+    struct dp_docs_fresh_run *run = opaque;
+    (void)zcl_dev_proof_steps_wait(run->steps, DP_DOCS_FRESH_N);
+    return NULL;
+}
+
+static bool dp_docs_fresh_start(struct dp_docs_fresh_run *run,
+                                const char *generation, const char *log_dir,
+                                int64_t timeout_ms, char *why, size_t why_len)
+{
+    memset(run, 0, sizeof(*run));
+    if (!dp_docs_tools_present(generation, why, why_len)) return false;
+    if (!log_dir || !log_dir[0] || timeout_ms <= 0 ||
+        snprintf(run->log_dir, sizeof(run->log_dir), "%s", log_dir) >=
+            (int)sizeof(run->log_dir)) {
+        proof_why(why, why_len, "proof_generated_docs_path_invalid");
+        return false;
+    }
+    run->timeout_ms = timeout_ms;
+    run->started_us = platform_time_monotonic_us();
+    run->active = true;
+    for (size_t i = 0; i < DP_DOCS_FRESH_N; i++) {
+        run->slots[i] = dp_docs_fresh_start_one(run, generation, i);
+        if (run->slots[i] != DP_DOCS_FRESH_STARTED) break;
+    }
+    // raw-pthread-ok:bounded watcher, always joined by dp_docs_fresh_join()
+    run->watching = pthread_create(&run->watcher, NULL, dp_docs_fresh_watch,
+                                   run) == 0;
+    /* No watcher, no overlap: wait for the checkers here, the serial order,
+     * so no deadline is ever left unenforced. */
+    if (!run->watching)
+        (void)zcl_dev_proof_steps_wait(run->steps, DP_DOCS_FRESH_N);
+    return true;
+}
+
+/* One started checker's verdict, worded exactly as the serial capture
+ * worded it. */
+static bool dp_docs_fresh_step_verdict(const struct dp_docs_fresh_run *run,
+                                       size_t index, char *why,
+                                       size_t why_len)
+{
+    const struct dp_docs_fresh_artifact *artifact = &DP_DOCS_FRESH[index];
+    const struct zcl_dev_proof_step_report *report =
+        &run->steps[index].report;
+    if (report->cause == ZCL_DEV_PROOF_KILL_CANCELLED) {
+        proof_whyf(why, why_len, "proof_generated_docs_check_cancelled:%s",
+                   artifact->rel);
+        return false;
+    }
+    if (report->cause != ZCL_DEV_PROOF_KILL_NONE) {
+        proof_whyf(why, why_len, "proof_generated_docs_check_timeout:%s",
+                   artifact->rel);
+        return false;
+    }
+    if (report->rc < 0) {
+        proof_whyf(why, why_len, "proof_generated_docs_checker_missing:%s",
+                   artifact->check);
+        return false;
+    }
+    if (report->rc == 0) return true;
+    char log_path[PROOF_LOG_PATH_MAX], out[4096];
+    if (!dp_docs_fresh_log_path(run, index, log_path, sizeof(log_path)) ||
+        !dp_docs_fresh_log_head(log_path, out, sizeof(out))) {
+        proof_whyf(why, why_len,
+                   "proof_generated_docs_checker_log_unreadable:%s",
+                   artifact->check);
+        return false;
+    }
+    /* A checker that dies on its toolchain (exec-failure rc, the
+     * shell's ENOENT text, or a FATAL over a missing input) keeps
+     * its rc and check identity in a typed tool failure. Only a
+     * checker that ran and reported drift refuses as stale. */
+    if (dp_docs_output_signals_tool_failure(out, report->rc)) {
+        proof_whyf(why, why_len,
+                   "proof_generated_docs_checker_tool_failure:%s:rc_%d",
+                   artifact->check, report->rc);
+        return false;
+    }
+    proof_whyf(why, why_len, "proof_generated_docs_stale:%s (%s)",
+               artifact->rel, artifact->regen);
+    return false;
+}
+
+static bool dp_docs_fresh_slot_verdict(const struct dp_docs_fresh_run *run,
+                                       size_t index, char *why,
+                                       size_t why_len)
+{
+    switch (run->slots[index]) {
+    case DP_DOCS_FRESH_STARTED:
+        return dp_docs_fresh_step_verdict(run, index, why, why_len);
+    case DP_DOCS_FRESH_PATH_INVALID:
+        proof_why(why, why_len, "proof_generated_docs_path_invalid");
+        return false;
+    case DP_DOCS_FRESH_START_FAILED:
+        /* A cancel that lands before the checker could start is still a
+         * cancellation, named as one, never a missing checker. */
+        if (run->steps[index].report.cause == ZCL_DEV_PROOF_KILL_CANCELLED) {
+            proof_whyf(why, why_len,
+                       "proof_generated_docs_check_cancelled:%s",
+                       DP_DOCS_FRESH[index].rel);
+            return false;
+        }
+        proof_whyf(why, why_len, "proof_generated_docs_checker_missing:%s",
+                   DP_DOCS_FRESH[index].check);
+        return false;
+    case DP_DOCS_FRESH_SCRIPT_MISSING:
+        proof_whyf(why, why_len, "proof_generated_docs_checker_missing:%s",
+                   DP_DOCS_FRESH[index].check);
+        return false;
+    case DP_DOCS_FRESH_UNSTARTED:
+        break;
+    }
+    /* Unreachable: the start loop stops only after a refusing slot. */
+    proof_why(why, why_len, "proof_generated_docs_path_invalid");
+    return false;
+}
+
+/* Wait for every started checker, then judge them in list order. Always
+ * reaps and always removes the step logs, whatever the verdict. */
+static bool dp_docs_fresh_join(struct dp_docs_fresh_run *run,
+                               char *why, size_t why_len)
+{
+    if (!run->active) return true;
+    run->active = false;
+    bool joined = true;
+    if (run->watching) {
+        joined = pthread_join(run->watcher, NULL) == 0;
+        run->watching = false;
+    }
+    if (!joined) {
+        /* The watcher may still own the steps; judge nothing from them. */
+        proof_why(why, why_len, "proof_generated_docs_check_join_failed");
+        return false;
+    }
+    (void)zcl_dev_proof_steps_wait(run->steps, DP_DOCS_FRESH_N);
+    bool ok = true;
+    for (size_t i = 0; i < DP_DOCS_FRESH_N && ok; i++)
+        ok = dp_docs_fresh_slot_verdict(run, i, why, why_len);
+    for (size_t i = 0; i < DP_DOCS_FRESH_N; i++) {
+        char log_path[PROOF_LOG_PATH_MAX];
+        if (run->slots[i] == DP_DOCS_FRESH_STARTED &&
+            dp_docs_fresh_log_path(run, i, log_path, sizeof(log_path)))
+            (void)unlink(log_path);
+    }
+    return ok;
+}
+
+#if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
+/* The whole gate in one call, start then join, with the checker logs in
+ * the generation itself: what generation_prepare() and the proof's join
+ * points do together, without a proof around them. */
+bool zcl_dev_proof_test_generation_docs_fresh(const char *generation,
+                                              char *why, size_t why_len)
+{
+    struct dp_docs_fresh_run run;
+    return dp_docs_fresh_start(&run, generation, generation,
+                               DP_DOCS_FRESH_TIMEOUT_MS, why, why_len) &&
+           dp_docs_fresh_join(&run, why, why_len);
+}
+#endif
+
+/* Cap for the docs-tools build argv below: make, --no-print-directory,
+ * jobs, the proof-tools target, NULL. */
+#define DP_DOCS_TOOLS_ARGV_CAP 8
+
+/* Build the three standalone checkers in one lean Make graph. The array
+ * above is also the freshness gate's required-tool list. `jobs` is stored
+ * by pointer and must outlive argv. */
+static bool dp_docs_tools_argv(const char *jobs, const char **argv,
+                               size_t argv_cap)
+{
+    size_t n = 0;
+    _Static_assert(5 <= DP_DOCS_TOOLS_ARGV_CAP,
+                   "docs-tools argv cap covers make, jobs, target, NULL");
+    if (!jobs || !*jobs || !argv || argv_cap < DP_DOCS_TOOLS_ARGV_CAP)
+        return false;
+    argv[n++] = "make";
+    argv[n++] = "--no-print-directory";
+    argv[n++] = jobs;
+    argv[n++] = "docs-proof-tools";
+    argv[n] = NULL;
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+/* Seam for the docs-tools build argv, so a test can prove the freshness
+ * gate's checker binaries are provisioned -- and exactly which ones --
+ * without driving a proof cycle. */
+bool zcl_dev_proof_test_docs_tools_argv(const char *jobs, const char **argv,
+                                        size_t argv_cap)
+{
+    return dp_docs_tools_argv(jobs, argv, argv_cap);
+}
+#endif
+
+static bool dp_generation_docs_tools(const struct proof_paths *paths,
+                                     const char *generation,
+                                     char *why, size_t why_len);
+
+static void dp_generation_stage_note(const struct proof_paths *paths,
+                                     const char *stage, int64_t started_us)
+{
+    if (!paths || !stage) return;
+    char value[32];
+    int64_t elapsed_us = platform_time_monotonic_us() - started_us;
+    int n = snprintf(value, sizeof(value), "%lld", (long long)elapsed_us);
+    if (n > 0 && (size_t)n < sizeof(value))
+        (void)zcl_dev_proof_phase_note(paths->phases, stage, value);
+}
+
+/* Join the docs-fresh checkers generation_prepare() started, noting in
+ * phases.txt how long they ran and how much of that the proof waited on.
+ * A run that never started, or was already joined, passes through. */
+static bool dp_docs_fresh_settle(struct dp_docs_fresh_run *run,
+                                 const struct proof_paths *paths,
+                                 char *why, size_t why_len)
+{
+    if (!run || !run->active) return true;
+    int64_t wait_started_us = platform_time_monotonic_us();
+    bool ok = dp_docs_fresh_join(run, why, why_len);
+    if (paths && paths->phases[0]) {
+        dp_generation_stage_note(paths, "generation_docs_fresh_us",
+                                 run->started_us);
+        dp_generation_stage_note(paths, "generation_docs_fresh_wait_us",
+                                 wait_started_us);
+    }
+    return ok;
+}
+
+/* proof_worker()'s last word on the checkers, on every path after
+ * generation_prepare(): serially they finished before any later step
+ * began, so a refusal a later step took while they ran is reported only
+ * when they are clean, and theirs replaces it otherwise. `ok` and `why`
+ * are the worker's verdict so far. */
+static bool dp_worker_docs_verdict(struct dp_docs_fresh_run *docs,
+                                   const struct proof_paths *paths, bool ok,
+                                   char *why, size_t why_len)
+{
+    char docs_why[512] = {0};
+    if (dp_docs_fresh_settle(docs, paths, docs_why, sizeof(docs_why)))
+        return ok;
+    proof_why(why, why_len, docs_why);
+    return false;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_docs_fresh_overlapped(const char *generation,
+                                              int64_t timeout_ms,
+                                              int64_t overlap_ms,
+                                              bool later_ok,
+                                              const char *later_why,
+                                              char *why, size_t why_len)
+{
+    if (!why || why_len == 0) return false;
+    why[0] = '\0';
+    struct proof_paths paths;
+    memset(&paths, 0, sizeof(paths));
+    struct dp_docs_fresh_run run;
+    if (!dp_docs_fresh_start(&run, generation, generation, timeout_ms, why,
+                             why_len))
+        return false;
+    /* The proof's own steps between the start and the join. */
+    if (overlap_ms > 0) platform_sleep_ms((int)overlap_ms);
+    if (!later_ok)
+        (void)snprintf(why, why_len, "%s", later_why ? later_why : "");
+    return dp_worker_docs_verdict(&run, &paths, later_ok, why, why_len);
+}
+#endif
+
+/* What a settled proof means for its generation. The generation is named by
+ * (checkout, local commit), and after a verdict only one thing ever proves
+ * that exact commit again from that checkout: a re-run of an INTERRUPTED
+ * pair or a producer NO_VERDICT. Both retain the generation for a distinct
+ * attempt through the existing locked retry. Candidate failures remain
+ * settled: ensure replays their `.failed` record instead of re-proving it, and a
+ * host-load or supersede retry in dev land rebases first and so proves a
+ * new local commit in a new generation. */
+enum dp_retire_verdict {
+    DP_RETIRE_PASSED = 0,
+    DP_RETIRE_FAILED,
+    DP_RETIRE_INTERRUPTED,
+    DP_RETIRE_NO_VERDICT,
+};
+
+/* The same predicate dp_failure_settle() applies when it writes the settled
+ * text: a cancel request, or a refusal already spelled as an interruption. */
+static enum dp_retire_verdict dp_retire_verdict_of(bool ok, const char *why)
+{
+    if (ok) return DP_RETIRE_PASSED;
+    if (!zcl_devloop_process_cancel_requested() && dp_failure_no_verdict(why))
+        return DP_RETIRE_NO_VERDICT;
+    return zcl_devloop_process_cancel_requested() ||
+                   zcl_dev_proof_failure_interrupted(why)
+               ? DP_RETIRE_INTERRUPTED
+               : DP_RETIRE_FAILED;
+}
+
+/* After its own proof, a generation whose pair is settled has nothing left
+ * to give. A passed pair's receipt is reused, not re-proven; a failed pair's
+ * record is replayed, not re-proven (see enum dp_retire_verdict). It could
+ * seed a later proof only through dp_donor_trust_verdict(), which refuses
+ * every generation this uid built for as long as no separate verifier is
+ * qualified. Left in the pool it counts as recently touched for the
+ * reaper's idle hour, holding the room the next proof's RAM reservation
+ * asks for, so that proof prepares on disk instead. So a settled generation
+ * is retired here, while this worker still holds the pair's lease, through
+ * the reaper's own detached-and-clean check and delete. Everything else
+ * stays exactly as the reaper would leave it: an interrupted generation for
+ * the re-run that reuses it, a generation that could donate, and one git
+ * will not call detached and clean. Hygiene only: the verdict is already
+ * published and nothing here reads back into it. `trust` is
+ * dp_donor_trust_verdict() in every proof; only the test seam below passes
+ * anything else. */
+static const char *dp_generation_keep_reason(enum dp_retire_verdict verdict)
+{
+    switch (verdict) {
+    case DP_RETIRE_INTERRUPTED: return "kept_interrupted";
+    case DP_RETIRE_NO_VERDICT: return "kept_no_verdict";
+    default: return NULL;
+    }
+}
+
+static const char *dp_generation_retire_with(
+    const struct proof_paths *paths, const char *generation,
+    enum dp_retire_verdict verdict,
+    enum dp_donor_verdict (*trust)(const char *))
+{
+    if (!paths || !paths->root[0] || !generation || !generation[0] || !trust)
+        return "kept_invalid";
+    int64_t started_us = platform_time_monotonic_us();
+    const char *outcome = dp_generation_keep_reason(verdict);
+    if (outcome) {
+        /* Kept for the exact re-run that reuses it; no git call at all. */
+    } else if (trust(generation) == DP_DONOR_ELIGIBLE) {
+        outcome = "kept_donor";
+    } else {
+        outcome = "kept_not_clean";
+        if (warm_reapable(generation)) {
+            /* Read-only fixture directories a proof test left behind
+             * would stop git's recursive delete partway through, exactly
+             * as in dp_reap_remove(). --force is safe only because
+             * detached and clean were just proven: what it overrides is
+             * git's refusal to delete untracked build scratch. */
+            dp_generation_unlock(generation);
+            const char *argv[] = {"git", "worktree", "remove", "--force",
+                                  generation, NULL};
+            char output[1024];
+            bool removed = git_capture_within(paths->root, argv,
+                                              PROOF_WARM_REMOVE_TIMEOUT_MS,
+                                              output, sizeof(output));
+            /* git deletes its admin dir even when the tree delete fails,
+             * and what is left then answers no git query: finish the delete
+             * here rather than leave the pair's next attempt a directory it
+             * cannot use. */
+            if (!removed && dp_generation_is_pruned(generation))
+                removed = dp_orphan_remove_tree(generation);
+            outcome = !removed ? "remove_failed"
+                      : verdict == DP_RETIRE_PASSED ? "removed"
+                                                    : "removed_failed";
+        }
+    }
+    if (paths->phases[0]) {
+        (void)zcl_dev_proof_phase_note(paths->phases, "generation_retired",
+                                       outcome);
+        dp_generation_stage_note(paths, "generation_retire_us", started_us);
+    }
+    return outcome;
+}
+
+static void dp_generation_retire(const struct proof_paths *paths,
+                                 const char *generation, bool ok,
+                                 const char *why)
+{
+    (void)dp_generation_retire_with(paths, generation,
+                                    dp_retire_verdict_of(ok, why),
+                                    dp_donor_trust_verdict);
+}
+
+#if defined(ZCL_TESTING)
+static enum dp_donor_verdict dp_test_donor_eligible(const char *path)
+{
+    (void)path;
+    return DP_DONOR_ELIGIBLE;
+}
+
+/* The name dp_donor_trust_verdict() returns for one path. Production calls
+ * that verdict before any warm seed; this seam only reports it. */
+const char *zcl_dev_proof_test_donor_trust_name(const char *path)
+{
+    if (!path || !path[0]) return NULL;
+    return dp_donor_verdict_name(dp_donor_trust_verdict(path));
+}
+
+bool zcl_dev_proof_test_generation_retire(
+    const char *repo_root, const char *generation,
+    enum zcl_dev_proof_retire_verdict verdict, bool donor_eligible,
+    char *outcome, size_t outcome_len)
+{
+    struct proof_paths paths;
+    memset(&paths, 0, sizeof(paths));
+    if (repo_root &&
+        snprintf(paths.root, sizeof(paths.root), "%s", repo_root) >=
+            (int)sizeof(paths.root))
+        return false;
+    enum dp_retire_verdict internal =
+        verdict == ZCL_DEV_PROOF_RETIRE_PASSED   ? DP_RETIRE_PASSED
+        : verdict == ZCL_DEV_PROOF_RETIRE_FAILED ? DP_RETIRE_FAILED
+        : verdict == ZCL_DEV_PROOF_RETIRE_NO_VERDICT ? DP_RETIRE_NO_VERDICT
+                                                 : DP_RETIRE_INTERRUPTED;
+    const char *result = dp_generation_retire_with(
+        &paths, generation, internal,
+        donor_eligible ? dp_test_donor_eligible : dp_donor_trust_verdict);
+    if (outcome && outcome_len)
+        (void)snprintf(outcome, outcome_len, "%s", result);
+    return strncmp(result, "removed", 7) == 0;
+}
+#endif
+
+#if defined(ZCL_TESTING)
+/* The checkout generation_prepare() runs for one pair, for the test that
+ * plants a leftover there first. */
+bool zcl_dev_proof_test_generation_checkout(const char *repo_root,
+                                            const char *generation,
+                                            const char *local, char *why,
+                                            size_t why_len)
+{
+    struct proof_paths paths;
+    memset(&paths, 0, sizeof(paths));
+    if (!why || why_len == 0) return false;
+    why[0] = '\0';
+    if (!repo_root || !generation || !local ||
+        snprintf(paths.root, sizeof(paths.root), "%s", repo_root) >=
+            (int)sizeof(paths.root))
+        return false;
+    return dp_generation_checkout(&paths, generation, local, why, why_len);
+}
+#endif
+
+static bool generation_prepare(const struct proof_paths *paths,
+                               const char *local,
+                               struct platform_ram_scratch_lease *ram_lease,
+                               struct proof_warmstart *warm,
+                               struct dp_docs_fresh_run *docs,
+                               char generation[PATH_MAX],
+                               char *why, size_t why_len)
+{
+    char root_parent[PATH_MAX], parent[PATH_MAX], generation_tag[33];
+    int64_t stage_started_us = platform_time_monotonic_us();
+    if (!dp_generation_parent_dir(paths->root, root_parent, why, why_len))
+        return false;
+    dp_generation_tag(paths->root, local, generation_tag);
+    /* Before the reservation rather than after it; see
+     * dp_pool_pressure_reap() for why both passes exist. */
+    dp_generation_pool_relieve(paths, generation_tag);
+    char ram_root[PATH_MAX];
+    bool ram_backed = false, ram_reserve_refused = false;
+    if (!dp_generation_pool(root_parent, ram_lease, parent, ram_root,
+                            &ram_backed, &ram_reserve_refused) ||
+        snprintf(generation, PATH_MAX, "%s/%s", parent, generation_tag) >=
+            PATH_MAX ||
+        !platform_private_directory_ensure(parent)) {
+        proof_why(why, why_len, "proof_generation_path_invalid");
+        return false;
+    }
+    dp_generation_stage_note(paths, "generation_pool_setup_us",
+                             stage_started_us);
+    dp_generation_storage_note(paths, ram_root, ram_backed,
+                               ram_reserve_refused, generation);
+    stage_started_us = platform_time_monotonic_us();
+    if (!dp_generation_checkout(paths, generation, local, why, why_len))
+        return false;
+    dp_generation_stage_note(paths, "generation_checkout_us",
+                             stage_started_us);
+    stage_started_us = platform_time_monotonic_us();
+    if (!generation_gitlink_prepare(paths, generation, why, why_len))
+        return false;
+    if (!dp_generation_dependencies(paths->root, generation, why, why_len))
+        return false;
+    if (!generation_hooks_configure(generation, why, why_len))
+        return false;
+    dp_generation_stage_note(paths, "generation_dependencies_us",
+                             stage_started_us);
+    stage_started_us = platform_time_monotonic_us();
+    if (!worktree_exact(generation, local, false, why, why_len)) {
+        proof_why(why, why_len, "proof_generation_not_exact");
+        return false;
+    }
+    if (!dp_generation_discard_fuzz_outputs(generation, why, why_len))
+        return false;
+    dp_generation_stage_note(paths, "generation_exactness_us",
+                             stage_started_us);
+    /* The sealed bytes are exactly what the dimensions would prove. Refuse
+     * stale generated docs here — read-only, with the file and its regen
+     * command named — rather than after the minutes-long proof the lint
+     * dimension would fail for the same staleness. The gate scripts exec
+     * checker binaries no fresh generation carries (binaries are never
+     * warm-seeded), so provision exactly those two tools first; without
+     * them every script exec-fails and every proof refuses as stale docs.
+     * Only untracked build outputs are written, never the sealed bytes.
+     * The checkers themselves start at the end of this function, after
+     * its last write into the generation, and run beside the proof steps
+     * that follow until dp_docs_fresh_settle() joins them (see the
+     * dp_docs_fresh_run comment); their refusal outranks any refusal taken
+     * meanwhile, the order this serial check used to impose. */
+    stage_started_us = platform_time_monotonic_us();
+    if (!dp_generation_docs_tools(paths, generation, why, why_len))
+        return false;
+    dp_generation_stage_note(paths, "generation_docs_tools_us",
+                             stage_started_us);
+    /* Close the lazy-bootstrap race before any dimension's `make` process
+     * exists for this generation (see generation_zcc_bootstrap). */
+    stage_started_us = platform_time_monotonic_us();
+    generation_zcc_bootstrap(generation);
+    /* Stamp the generation as taken before the slow preparation below.
+     * The .z23p pool is shared by every checkout under this parent, so a
+     * sibling lane's reaper may look at this directory at any moment;
+     * this stamp, not a lock, is what tells it the generation is a
+     * working set rather than abandoned scratch. Reusing a generation
+     * touches only files deep inside it, so without this the directory's
+     * own mtime would keep aging as if idle. Failure is ignored: a missed
+     * stamp costs at worst one premature reap and one recheckout, and
+     * nothing in the reaping path may fail a proof. */
+    const struct timespec taken[2] = {
+        {.tv_nsec = UTIME_OMIT},
+        {.tv_nsec = UTIME_NOW},
+    };
+    (void)utimensat(AT_FDCWD, generation, taken, AT_SYMLINK_NOFOLLOW);
+    dp_generation_warm(paths, parent, generation, local, warm);
+    /* Last, so it can only ever run against a generation that is stamped
+     * and therefore cannot be the thing reclaimed, and so it sits after
+     * every statement that can set `why` but the read-only checker start
+     * after it. Placed here it has no reachable way to change what this
+     * function returns or reports. */
+    generation_pool_reap(paths, parent, generation);
+    dp_generation_stage_note(paths, "generation_warm_and_reap_us",
+                             stage_started_us);
+    /* Only now, after the last write this function makes into the
+     * generation (the zcc bootstrap, the taken stamp, any warm seed), do
+     * the docs-fresh checkers start; dp_docs_fresh_settle() joins them. */
+    return dp_docs_fresh_start(docs, generation, paths->logs,
+                               DP_DOCS_FRESH_TIMEOUT_MS, why, why_len);
+}
+
+/* Every proof step runs under a budget it earned, watched by its own log.
+ * `step` names the row written to phases.txt and the key its wall time is
+ * remembered under, so the next proof on this checkout plans from what this
+ * one actually took. */
+static int run_step(const struct proof_paths *paths, const char *root,
+                    const char *log_path, const char *const argv[],
+                    const char *step,
+                    const struct zcl_dev_proof_budget *budget,
+                    struct zcl_dev_proof_step_report *report)
+{
+    struct zcl_dev_proof_step_report local = {0};
+    if (!report) report = &local;
+    int rc = zcl_dev_proof_run_watched(root, log_path, argv, budget, report);
+    if (paths && paths->phases[0])
+        (void)zcl_dev_proof_phase_record(paths->phases, step, report);
+    char key[PROOF_TIMING_KEY_MAX];
+    if (rc == 0 && paths && step &&
+        snprintf(key, sizeof(key), "step.%s", step) < (int)sizeof(key))
+        (void)zcl_dev_proof_timing_note(paths->state, key, report->elapsed_ms);
+    return rc;
+}
+
+/* Say why a step was killed in the same sentence that says it was killed, so
+ * `z23 dev proof status` can explain the verdict without a log dive. */
+static void run_step_why(char *why, size_t why_len, const char *step,
+                         const struct zcl_dev_proof_step_report *report)
+{
+    if (!why || !why_len || !report) return;
+    if (report->cause == ZCL_DEV_PROOF_KILL_NONE) {
+        (void)snprintf(why, why_len, "child_proof_failed_exit_%d", report->rc);
+        return;
+    }
+    (void)snprintf(why, why_len,
+                   "child_proof_%s_%s_budget_ms_%lld_elapsed_ms_%lld_idle_ms_%lld",
+                   zcl_dev_proof_kill_cause_name(report->cause), step,
+                   (long long)report->budget_ms,
+                   (long long)report->elapsed_ms,
+                   (long long)report->last_progress_age_ms);
+}
+
+/* A step's budget is what this checkout has measured it needing, and the
+ * compiled-in figure only until it has. */
+static struct zcl_dev_proof_budget proof_step_budget(
+    const struct proof_paths *paths, const char *step, int64_t fallback_ms)
+{
+    char key[PROOF_TIMING_KEY_MAX];
+    if (!paths || !step ||
+        snprintf(key, sizeof(key), "step.%s", step) >= (int)sizeof(key))
+        return zcl_dev_proof_budget_make(fallback_ms, PROOF_STEP_FLOOR_MS);
+    return zcl_dev_proof_step_budget(paths->state, key, fallback_ms);
+}
+
+#define PROOF_GENERATED_DEFAULT_MS 300000
+#define PROOF_COMPILE_DEFAULT_MS 900000
+#define PROOF_BUNDLE_DEFAULT_MS 1800000
+#define PROOF_PREFLIGHT_DEFAULT_MS 120000
+#define PROOF_LINT_ARGV_CAP 7u
+
+/* Every exact receipt can authorize publication, regardless of the scratch
+ * directory that requested it. Run the same full lint contract everywhere;
+ * lint-fast remains the separate edit-feedback target. The lint umbrella's
+ * LINT_GATES already includes check-windows-acceptance. Naming that gate as
+ * a second Make goal makes it a prerequisite of lint and serializes its
+ * cross-links before the parallel gate runner, adding their wall times.
+ * `jobs` must outlive argv. */
+static bool proof_lint_prepare(const char *root, const char *jobs,
+                               const char **argv, size_t argv_cap,
+                               int64_t *fallback_ms, const char **targets)
+{
+    (void)root;
+    if (!jobs || !*jobs || !argv || argv_cap < PROOF_LINT_ARGV_CAP ||
+        !fallback_ms || !targets)
+        return false;
+    /* The per-TU cache starts empty in this private generation, so its
+     * hashing and result stores are wasted work. Scope the cold setting to
+     * lint: testcache hashes ZCL_ variables, and exporting this lint-only
+     * knob from the shared worker would invalidate unrelated test hits. */
+    argv[0] = "env";
+    argv[1] = "ZCL_LINT_TU_CACHE=0";
+    argv[2] = "make";
+    argv[3] = "--no-print-directory";
+    argv[4] = jobs;
+    argv[5] = "lint";
+    argv[6] = NULL;
+    *fallback_ms = PROOF_LINT_LANDING_MS;
+    *targets = "lint";
+    return true;
+}
+
+
+/* True when the lint dimension is running the whole gate set rather than
+ * the fast subset. Read off the targets proof_lint_prepare() just produced
+ * so there is one decision, not two that can drift: only the full set
+ * reads built artifacts, so only it needs the admitted executables. */
+static bool proof_lint_targets_are_full(const char *targets)
+{
+    return targets && strncmp(targets, "lint", 4) == 0 &&
+           (targets[4] == '\0' || targets[4] == ' ');
+}
+
+/* Credentials the invoking session exported: an agent's API keys, a forge
+ * token, an ssh-agent socket. The proof worker's environment is what every
+ * build, lint gate and test of the candidate inherits, and candidate code
+ * must never be able to read or use the operator's credentials. Z23's own
+ * knobs (ZCL_*) are registered in engine/composition/flags.def and are the
+ * harness's to set, so they are left alone. */
+static bool proof_env_name_is_credential(const char *name, size_t len)
+{
+    static const char *const exact[] = {
+        "SSH_AUTH_SOCK", "GPG_AGENT_INFO", "CLAUDE_CODE_MESSAGING_SOCKET",
+    };
+    static const char *const suffixes[] = {
+        "_API_KEY", "_TOKEN", "_SECRET", "_SECRET_KEY", "_PASSWORD",
+        "_PASSPHRASE", "_ACCESS_KEY", "_PRIVATE_KEY",
+    };
+    if (len >= 4 && memcmp(name, "ZCL_", 4) == 0) return false;
+    for (size_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++)
+        if (strlen(exact[i]) == len && memcmp(name, exact[i], len) == 0)
+            return true;
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        size_t n = strlen(suffixes[i]);
+        if (len > n && memcmp(name + len - n, suffixes[i], n) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Unset every credential-named variable. unsetenv() rewrites environ, so
+ * each removal restarts the scan; every pass removes one, so it ends. */
+static bool proof_scrub_credentials(void)
+{
+    extern char **environ;
+    for (;;) {
+        char name[256];
+        bool found = false;
+        for (char **e = environ; e && *e && !found; e++) {
+            const char *eq = strchr(*e, '=');
+            size_t len = eq ? (size_t)(eq - *e) : 0;
+            if (len == 0 || len >= sizeof(name) ||
+                !proof_env_name_is_credential(*e, len))
+                continue;
+            memcpy(name, *e, len);
+            name[len] = 0;
+            found = true;
+        }
+        if (!found) return true;
+        if (unsetenv(name) != 0) return false;
+    }
+}
+
+/* This runs in the isolated proof worker before any generation build. An
+ * interactive Make dry run, replacement gate list, diagnostic dump, or
+ * unsigned lint or test cache must never become a signed publication
+ * observation. The test runner's own switches go too: ZCL_TEST_CACHE would
+ * turn reuse on for any runner started without an explicit mode,
+ * ZCL_TEST_CACHE_DUMP makes the runner print one group's key and exit
+ * without running anything, and ZCL_TESTCACHE_STORE_ROOT names a verdict
+ * store the candidate can write. ZCC_ADMITTED and ZCC_LOG belong to the
+ * driver alone (dp_receiver_begin): an inherited admitted directory would
+ * hand zcc bytes no receiver admitted. */
+static bool proof_prepare_environment(void)
+{
+    static const char *const unset_names[] = {
+        "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKEOVERRIDES", "MAKEFILES",
+        "ZCL_LINT_CACHE_DUMP", "ZCL_LINT_GATES_DIR_X", "ZCL_REPO_SHAPE_ROOT",
+        "ZCL_LINT_MODE", "ZCL_LINT_TU_CACHE", "ZCL_LINT_TU_CACHE_DIR",
+        "ZCL_LINT_TU_CACHE_GENERATIONS", "ZCL_TEST_CACHE",
+        "ZCL_TEST_CACHE_DUMP", "ZCL_TESTCACHE_STORE_ROOT",
+        ZCL_DEV_OBSERVATION_STORE_ENV,
+        ZCL_VERIFY_RECEIVER_ENV, "ZCC_LOG",
+    };
+    for (size_t i = 0; i < sizeof(unset_names) / sizeof(unset_names[0]); i++)
+        if (unsetenv(unset_names[i]) != 0) return false;
+    return proof_scrub_credentials() && setenv("ZCL_LINT_CACHE", "0", 1) == 0;
+}
+
+/* The compile cache a proof builds through. zcc's shared store
+ * (~/.cache/zcc, or wherever ZCC_DIR points) is keyed with the build root
+ * prefix-mapped away (tools/zcc.c recorded_cwd), so every worktree of this
+ * uid reads and writes one set of entries, and zcc's serve() copies a hit's
+ * object out without reading it. Any process of this uid can overwrite an
+ * entry, including a candidate's own Makefile or tests during an earlier
+ * proof. So an authoritative proof compiles against a store of its own,
+ * <state>/zcc.<pair>: created empty before the first make, emptied again if
+ * a killed worker left one behind, and removed when the worker ends.
+ * Compiles inside one proof still share it (the original-plan build feeds
+ * the generation's), and nothing crosses proofs. ccache, the Makefile's
+ * fallback wrapper when zcc cannot bootstrap, keeps the same kind of shared
+ * store and is switched off.
+ *
+ * The seam for getting cross-proof reuse back is a zcc store owned by a
+ * separate verifier uid, which the proof reads through that verifier and
+ * cannot write: the compile-cache twin of dp_warm_verifier_qualified().
+ * Until such an account exists, every proof compiles against an empty
+ * store. */
+#define PROOF_ZCC_REMOVE_DEPTH_MAX 32
+
+static bool proof_zcc_store_path(const char *state, const char *key,
+                                 char out[PATH_MAX])
+{
+    return state && state[0] && key && key[0] && !strchr(key, '/') &&
+           snprintf(out, PATH_MAX, "%s/zcc.%s", state, key) < PATH_MAX;
+}
+
+/* Remove `name` under `parent_fd` and everything below it, in process and
+ * without following a link: a symlink is unlinked as itself. zcc's layout
+ * is a few levels deep, so the depth cap only bounds a hostile tree, and
+ * anything left behind fails the final rmdir and so fails closed. */
+static bool proof_zcc_remove_at(int parent_fd, const char *name, int depth)
+{
+    if (unlinkat(parent_fd, name, 0) == 0 || errno == ENOENT) return true;
+    if ((errno != EISDIR && errno != EPERM) ||
+        depth > PROOF_ZCC_REMOVE_DEPTH_MAX)
+        return false;
+    int fd = openat(parent_fd, name,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return false;
+    DIR *dir = fdopendir(fd);
+    if (!dir) {
+        (void)close(fd);
+        return false;
+    }
+    bool ok = true;
+    for (struct dirent *e = readdir(dir); ok && e; e = readdir(dir)) {
+        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+            ok = proof_zcc_remove_at(dirfd(dir), e->d_name, depth + 1);
+    }
+    (void)closedir(dir);
+    return ok && unlinkat(parent_fd, name, AT_REMOVEDIR) == 0;
+}
+
+static bool proof_zcc_store_remove(const char *state, const char *store)
+{
+    int fd = open(state, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool ok = proof_zcc_remove_at(fd, store + strlen(state) + 1, 0);
+    (void)close(fd);
+    return ok;
+}
+
+static bool proof_zcc_private_open(const char *state, const char *key)
+{
+    char store[PATH_MAX];
+    return proof_zcc_store_path(state, key, store) &&
+           proof_zcc_store_remove(state, store) &&
+           platform_private_directory_create(store) &&
+           setenv("ZCC_DIR", store, 1) == 0 &&
+           setenv("ZCC_VERIFIED", "1", 1) == 0 &&
+           setenv("CCACHE_DISABLE", "1", 1) == 0;
+}
+
+/* Runs on every worker exit, pass or fail. The resident daemon keeps its
+ * environment across cycles, so ZCC_DIR goes too. */
+static bool proof_zcc_private_close(const char *state, const char *key)
+{
+    char store[PATH_MAX];
+    bool removed = proof_zcc_store_path(state, key, store) &&
+                   proof_zcc_store_remove(state, store);
+    return unsetenv("ZCC_VERIFIED") == 0 &&
+           unsetenv("ZCC_DIR") == 0 && removed;
+}
+
+#if defined(ZCL_TESTING)
+/* Fixture-only lifecycle for explicit observation runs. Automatic worker
+ * collection is deferred until all required input closures qualify. */
+/* Explicit-run fixtures keep unsigned verdict scratch separate from durable
+ * signed observations, using per-pair paths that cannot collide. */
+static bool proof_testcache_store_path(const char *state, const char *key,
+                                       char out[PATH_MAX])
+{
+    return state && state[0] && key && key[0] && !strchr(key, '/') &&
+           snprintf(out, PATH_MAX, "%s/testcache.%s", state, key) < PATH_MAX;
+}
+
+static bool proof_observation_store_path(const char *state, const char *key,
+                                         char out[PATH_MAX])
+{
+    return state && state[0] && key && key[0] && !strchr(key, '/') &&
+           snprintf(out, PATH_MAX, "%s/observations.%s", state, key) < PATH_MAX;
+}
+
+static bool proof_observation_env_open(const char *state, const char *key)
+{
+    /* The runner's store open creates only the leaf it needs; the per-pair
+     * directories must already exist. Start the verdict store empty the
+     * same way proof_zcc_private_open does -- a killed worker can leave one
+     * behind. The observation CAS is durable across runs of this pair, so
+     * it must tolerate already existing (a retried proof re-arms the same
+     * directory); _ensure is the idempotent variant. */
+    char scratch[PATH_MAX], observations[PATH_MAX];
+    if (!proof_testcache_store_path(state, key, scratch) ||
+        !proof_observation_store_path(state, key, observations))
+        return false;
+    if (proof_zcc_store_remove(state, scratch) &&
+        platform_private_directory_create(scratch) &&
+        setenv("ZCL_TESTCACHE_STORE_ROOT", scratch, 1) == 0 &&
+        platform_private_directory_ensure(observations) &&
+        setenv(ZCL_DEV_OBSERVATION_STORE_ENV, observations, 1) == 0)
+        return true;
+    /* A partial open owns no durable observation bytes. Remove only its
+     * scratch store and clear both child controls before returning. */
+    (void)proof_zcc_store_remove(state, scratch);
+    (void)unsetenv("ZCL_TESTCACHE_STORE_ROOT");
+    (void)unsetenv(ZCL_DEV_OBSERVATION_STORE_ENV);
+    return false;
+}
+
+/* Fixture restore clears both controls and verdict scratch. Durable signed
+ * observation bytes remain available to an explicit retry. */
+static bool proof_observation_env_close(const char *state, const char *key)
+{
+    char store[PATH_MAX];
+    bool removed = proof_testcache_store_path(state, key, store) &&
+                   proof_zcc_store_remove(state, store);
+    bool verdict_unset = unsetenv("ZCL_TESTCACHE_STORE_ROOT") == 0;
+    bool observation_unset = unsetenv(ZCL_DEV_OBSERVATION_STORE_ENV) == 0;
+    return verdict_unset && observation_unset && removed;
+}
+
+#endif
+
+/* Fill the pre-fork make argv: everything EITHER dimension can build, built
+ * once, before either starts.
+ *
+ * The two dimensions share one generation worktree. The test dimension runs
+ * no make at all -- it execs the admitted runner and reads build outputs
+ * (each lint-gate shard copies build/bin/z23-lint and
+ * build/bin/file_size_policy into its sandbox and execs them). The lint
+ * dimension does run make: `lint`'s own built prerequisites, and the
+ * standalone tool targets exported by check_standalone_tools_link.sh into
+ * the same prefork Make graph -- a set that includes z23-lint,
+ * zcl-nodectl, fbsh, file_size_policy, fleet-board-bridge and
+ * zclassic23-engine-unit, i.e. the very executables the test dimension is
+ * reading. A relink unlinks the output before it writes it, and on
+ * 2026-09-06 a landing proof's shard exec'd build/bin/z23-lint inside that
+ * window and got "No such file or directory" twice.
+ *
+ * So both target sets are built here, sequentially, and after the fork
+ * neither dimension has anything left to link. The helper targets are named
+ * literally because their hashes are folded into the
+ * zcl.dev_proof_test_helpers.v1 digest one by one; the lint side is a single
+ * Makefile target (proof-lint-prebuild) that names `lint`'s own prerequisite
+ * list, so the two can never drift apart. `jobs` is stored by pointer and
+ * must outlive argv. */
+static const char *const proof_prefork_helpers[] = {
+    "zcl-nodectl", "zclassic23-acme", "fbsh", "engine-unit",
+    "tools/file_size_policy", "fleet-board-bridge", "git-hook",
+    "build/bin/z23-lint",
+};
+
+#define PROOF_PREFORK_HELPER_COUNT \
+    (sizeof(proof_prefork_helpers) / sizeof(proof_prefork_helpers[0]))
+
+static bool proof_prefork_argv(const char *jobs, bool lint_full,
+                               const char **argv, size_t argv_cap)
+{
+    size_t n = 0;
+    if (!jobs || !*jobs || !argv || argv_cap < PROOF_PREFORK_ARGV_CAP)
+        return false;
+    argv[n++] = "make";
+    argv[n++] = "--no-print-directory";
+    argv[n++] = jobs;
+    for (size_t i = 0; i < PROOF_PREFORK_HELPER_COUNT; i++)
+        argv[n++] = proof_prefork_helpers[i];
+    if (lint_full) argv[n++] = "proof-lint-prebuild";
+    argv[n] = NULL;
+    return true;
+}
+
+/* Does the prefork step build `target` for every test-selected proof? */
+static bool proof_prefork_builds(const char *target)
+{
+    for (size_t i = 0; i < PROOF_PREFORK_HELPER_COUNT; i++)
+        if (strcmp(proof_prefork_helpers[i], target) == 0) return true;
+    return false;
+}
+
+static bool proof_admitted_target(const char *rel);
+
+bool zcl_dev_proof_need_already_provided(const char *target, const char *value)
+{
+    if (target != NULL && proof_prefork_builds(target))
+        return true;
+    return value != NULL && proof_admitted_target(value);
+}
+
+/* Does the test-needs argv already name `target` past its make prefix? */
+static bool dp_argv_names(const char **argv, size_t n, const char *target)
+{
+    for (size_t i = 3; i < n; i++)
+        if (strcmp(argv[i], target) == 0) return true;
+    return false;
+}
+
+/* Resolve one selected group's declared BUILD needs and append each target
+ * the argv does not already name (and the path it builds, in the parallel
+ * `values`). A need the proof already provides is left out: a path the
+ * generation carries as an admitted executable (proof_admitted_executables),
+ * content-checked against the sealed source, and a target the prefork step
+ * builds for every test-selected proof (proof_prefork_helpers). Both are
+ * already bound into the test receipt by test_helpers_hash(), so clearing
+ * and relinking them here would only build the same source twice and bind
+ * the same bytes twice.
+ * Refuses an unregistered group and an argv with no room: a need dropped
+ * here would leave its group to fail on a missing tool. */
+static bool dp_test_need_add(const char *id, const char **argv,
+                             const char **values, size_t argv_cap, size_t *n)
+{
+    char full[ZCL_TEST_GROUP_FULL_MAX];
+    struct zcl_test_group_host_need needs[PROOF_TEST_NEEDS_ARGV_CAP];
+    size_t count = 0;
+    if (!zcl_test_group_resolve_exact(id, full) ||
+        !zcl_test_group_build_needs_add(full, needs, PROOF_TEST_NEEDS_ARGV_CAP,
+                                        &count))
+        return false;
+    for (size_t k = 0; k < count; k++) {
+        if (zcl_dev_proof_need_already_provided(needs[k].target,
+                                                needs[k].value) ||
+            dp_argv_names(argv, *n, needs[k].target))
+            continue;
+        if (*n + 1 >= argv_cap) return false;
+        values[*n] = needs[k].value;
+        argv[(*n)++] = needs[k].target;
+    }
+    return true;
+}
+
+/* Fill the test-needs make argv: every Make target a selected group declares
+ * as a ZCL_HOST_NEED_BUILD need (tools/dev/test_group_host_needs.def), each
+ * once, in selection order. `groups` is the exact comma-separated selector.
+ * `values[i]` is the path argv[i] builds, relative to the generation.
+ * `*targets` is 0, with argv[0] NULL, when no selected group needs a build:
+ * an ordinary proof runs no step and pays nothing. */
+static bool dp_test_needs_scan(const char *groups, const char **argv,
+                               const char **values, size_t argv_cap,
+                               size_t *n)
+{
+    for (const char *scan = groups; *scan;) {
+        const char *end = strchr(scan, ',');
+        size_t len = end ? (size_t)(end - scan) : strlen(scan);
+        char id[256];
+        if (len == 0 || len >= sizeof(id)) return false;
+        memcpy(id, scan, len);
+        id[len] = '\0';
+        if (!dp_test_need_add(id, argv, values, argv_cap, n)) return false;
+        scan = end ? end + 1 : scan + len;
+    }
+    return true;
+}
+
+static bool proof_test_needs_argv(const char *jobs, const char *groups,
+                                  const char **argv, const char **values,
+                                  size_t argv_cap, size_t *targets)
+{
+    if (!jobs || !*jobs || !groups || !argv || !values || !targets ||
+        argv_cap < 4)
+        return false;
+    size_t n = 0;
+    argv[n++] = "make";
+    argv[n++] = "--no-print-directory";
+    argv[n++] = jobs;
+    if (!dp_test_needs_scan(groups, argv, values, argv_cap, &n)) return false;
+    *targets = n - 3;
+    argv[*targets ? n : 0] = NULL;
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+/* Seam for the pre-fork argv, so a test can prove what the step builds --
+ * and that no dimension is left a target the other one also builds --
+ * without driving a proof cycle. */
+bool zcl_dev_proof_test_prefork_argv(const char *jobs, bool lint_full,
+                                     const char **argv, size_t argv_cap)
+{
+    return proof_prefork_argv(jobs, lint_full, argv, argv_cap);
+}
+
+bool zcl_dev_proof_test_needs_argv(const char *jobs, const char *groups,
+                                   const char **argv, size_t argv_cap,
+                                   size_t *targets)
+{
+    const char *values[PROOF_TEST_NEEDS_ARGV_CAP];
+    if (argv_cap > PROOF_TEST_NEEDS_ARGV_CAP) argv_cap = PROOF_TEST_NEEDS_ARGV_CAP;
+    return proof_test_needs_argv(jobs, groups, argv, values, argv_cap,
+                                 targets);
+}
+#endif
+static bool inventory_output_only(const char *const *files, size_t count)
+{
+    return count == 1 &&
+           strcmp(files[0], "docs/CAPABILITY_INVENTORY.jsonl") == 0;
+}
+
+/* Record the test-selection shape beside the dimension logs. "universal" is
+ * the whole catalog, chosen because the plan's closure was capacity-bounded
+ * (reason closure-universal), because its path floor outgrew the group cap
+ * (reason path-group-cap), or because an input was added, deleted or
+ * type-changed (reason changed-input-structure);
+ * "exact" is the enumerated plan. `host_gated` names every catalog group the
+ * universal selector left out because this tree cannot meet the group's
+ * declared host need, and which need it was -- so a reader of this file never
+ * has to infer a smaller run from a count. "-" means nothing was left out. */
+static bool proof_note_test_selection(const struct proof_paths *paths,
+                                      const struct zcl_devloop_plan *plan,
+                                      bool widened, uint32_t selected,
+                                      const char *host_gated)
+{
+    bool universal = plan->closure_universal;
+    const char *reason = widened               ? "changed-input-structure"
+                         : plan->path_universal ? "path-group-cap"
+                         : universal            ? "closure-universal"
+                                                : "impact-plan";
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s.test-selection.log", paths->logs,
+                 paths->key) >= (int)sizeof(path))
+        return false;
+    FILE *f = fopen(path, "w");
+    if (!f) return false;
+    (void)fprintf(f, "test_selection=%s reason=%s groups_selected=%u\n",
+                  universal ? "universal" : "exact", reason,
+                  (unsigned)selected);
+    (void)fprintf(f, "host_gated=%s\n",
+                  (host_gated && host_gated[0]) ? host_gated : "-");
+    return fclose(f) == 0;
+}
+
+/* Append one resolved group name to the comma-separated selector, refusing
+ * rather than truncating: a selector that lost its tail would run a
+ * narrower suite than the plan asked for. */
+static bool dp_selector_append(char *out, size_t out_size, size_t *pos,
+                               const char *full)
+{
+    int n = snprintf(out + *pos, out_size - *pos, "%s%s",
+                     *pos ? "," : "", full);
+    if (n <= 0 || (size_t)n >= out_size - *pos) return false;
+    *pos += (size_t)n;
+    return true;
+}
+
+/* Is this group already in the selector? Compares whole comma-separated
+ * items, so no name is a prefix match for another. */
+static bool dp_selector_has(const char *out, const char *full)
+{
+    bool duplicate = false;
+    const char *scan = out;
+    size_t full_len = strlen(full);
+    while (*scan) {
+        const char *end = strchr(scan, ',');
+        size_t item_len = end ? (size_t)(end - scan) : strlen(scan);
+        if (item_len == full_len && memcmp(scan, full, full_len) == 0)
+            duplicate = true;
+        if (!end) break;
+        scan = end + 1;
+    }
+    return duplicate;
+}
+
+/* Name one host-gated group in the selection note: which group, which kind of
+ * need, and the exact path or environment name that was missing. Refuses
+ * rather than truncating -- a half-written explanation is worse than none. */
+static bool dp_gated_note(char *gated, size_t gated_size, size_t *gated_pos,
+                          const struct zcl_test_group_host_need *need)
+{
+    const char *kind = zcl_test_group_host_need_kind_name(need->kind);
+    if (!kind || !gated || gated_size == 0) return false;
+    int n = snprintf(gated + *gated_pos, gated_size - *gated_pos,
+                     "%s%s:%s:%s", *gated_pos ? "," : "", need->group, kind,
+                     need->value);
+    if (n <= 0 || (size_t)n >= gated_size - *gated_pos) return false;
+    *gated_pos += (size_t)n;
+    return true;
+}
+
+/* Should the universal closure carry this group on this host? A group whose
+ * declared input this tree does not have can only report SKIP or UNOBSERVED,
+ * which the suite accounting refuses -- so it is left out here and counted as
+ * gated by the runner. Leaving it out is a SELECTION decision only: an exact
+ * plan that names the group still runs it, and a SKIP there still refuses.
+ * A BUILD need is never a reason to leave a group out: the proof builds it
+ * (dp_worker_test_needs) or fails.
+ * `included` is only meaningful when the call returns true; a false is a
+ * refusal (unregistered group or malformed need row), never an exclusion. */
+static bool dp_selector_host_admits(const char *root, const char *full,
+                                    char *gated, size_t gated_size,
+                                    size_t *gated_pos, bool *included)
+{
+    struct zcl_test_group_host_need need;
+    *included = true;
+    if (!zcl_test_group_host_need(full, &need)) return false;
+    if (zcl_test_group_host_need_selectable(root, &need)) return true;
+    *included = false;
+    return dp_gated_note(gated, gated_size, gated_pos, &need);
+}
+
+/* Whether the universal closure carries a group on this host, asked of an
+ * umbrella's shards without recording anything in the gated note. */
+struct dp_host_tree {
+    const char *root;
+};
+
+static bool dp_selector_host_runs(const char *full, void *ctx)
+{
+    const struct dp_host_tree *tree = ctx;
+    struct zcl_test_group_host_need need;
+    if (!zcl_test_group_host_need(full, &need)) return false;
+    /* BUILD needs are promises this proof must materialize before execution.
+     * Folding uses the same admission predicate as the universal selector,
+     * so an absent helper does not run both an umbrella and its shards. */
+    return zcl_test_group_host_need_selectable(tree->root, &need);
+}
+
+/* A capacity-bounded plan reaches more groups than it can enumerate. The
+ * plan already turned that into the universal closure, so the proof runs
+ * the whole catalog: a large run is the honest price of a change whose
+ * blast radius does not fit in a list. The subtractions are a group whose
+ * declared host need this tree cannot meet, every such group named in
+ * `gated`, and an umbrella whose shards all run: they are its body, so it is
+ * not run a second time, serially. `root` is the tree the test runner will
+ * exec in, so the question asked is about that tree and not about the
+ * submitting checkout. */
+static bool dp_selector_universal(const char *root, char *out, size_t out_size,
+                                  size_t *pos, uint32_t *count, char *gated,
+                                  size_t gated_size)
+{
+    size_t gated_pos = 0;
+    struct dp_host_tree tree = {root};
+    if (!gated || gated_size == 0) return false;
+    gated[0] = '\0';
+    for (size_t i = 0; i < zcl_test_group_catalog_count(); i++) {
+        const char *full = zcl_test_group_catalog_at(i);
+        bool included = false;
+        if (zcl_test_group_umbrella_subsumed(full, dp_selector_host_runs,
+                                             &tree))
+            continue;
+        if (!dp_selector_host_admits(root, full, gated, gated_size, &gated_pos,
+                                     &included))
+            return false;
+        if (!included) continue;
+        if (!dp_selector_append(out, out_size, pos, full)) return false;
+        (*count)++;
+    }
+    return true;
+}
+
+/* Where one token's expansion lands. */
+struct dp_selector_sink {
+    char *out;
+    size_t out_size;
+    size_t *pos;
+    uint32_t *count;
+};
+
+static bool dp_selector_visit(const char *full, void *ctx)
+{
+    struct dp_selector_sink *sink = ctx;
+    if (dp_selector_has(sink->out, full)) return true;
+    if (!dp_selector_append(sink->out, sink->out_size, sink->pos, full))
+        return false;
+    (*sink->count)++;
+    return true;
+}
+
+/* One of the plan's two group lists, EXPANDED and appended without repeating
+ * anything the selector already carries.
+ *
+ * Exact resolution alone used to be the whole rule, and that is how a README
+ * rewrite reached main having run zero README-reading checks: the impact rule
+ * names the umbrella token `make_lint_gates`, exact resolution turned it into
+ * the single group test_make_lint_gates -- whose body is the root-file check
+ * and the sandbox cleanup -- and every contract that actually reads README.md
+ * sits in a shard the token never selected. main was red on
+ * test_make_lint_gates_shard_08 and test_make_lint_gates_realroot for six
+ * hours until the full suite caught it.
+ *
+ * The expansion is zcl_test_group_family_expand(), the same one the plan
+ * builder admits tokens with, so what a plan accepts and what the proof runs
+ * are one decision. A token that is neither a group nor a family still
+ * refuses here, exactly as before. */
+static bool dp_selector_groups(const char (*groups)[ZCL_DEVLOOP_GROUP_MAX],
+                               size_t len, char *out, size_t out_size,
+                               size_t *pos, uint32_t *count)
+{
+    struct dp_selector_sink sink = {out, out_size, pos, count};
+    for (size_t i = 0; i < len; i++)
+        if (!zcl_test_group_family_expand(groups[i], dp_selector_visit,
+                                          &sink))
+            return false;
+    return true;
+}
+
+/* `root` is the tree the test dimension execs in -- the proof generation, not
+ * the submitting checkout -- because that is the tree whose contents decide
+ * whether a host-gated group could observe anything. `gated_out` receives the
+ * comma-separated host-gated list for the selection note; it is emptied on
+ * every path, so an exact selection reports no gating rather than stale text. */
+static bool build_test_selector(const struct zcl_devloop_plan *plan,
+                                const char *root, bool inventory_only,
+                                char *out, size_t out_size,
+                                uint32_t *count_out, char *gated_out,
+                                size_t gated_size)
+{
+    if (!plan || !out || out_size == 0 || !count_out || !gated_out ||
+        gated_size == 0)
+        return false;
+    gated_out[0] = '\0';
+    if (inventory_only) {
+        (void)snprintf(out, out_size, "%s", "code_inventory");
+        *count_out = 1;
+        return true;
+    }
+    size_t pos = 0;
+    uint32_t count = 0;
+    if (plan->closure_universal) {
+        if (!dp_selector_universal(root, out, out_size, &pos, &count,
+                                   gated_out, gated_size) ||
+            count == 0)
+            return false;
+        *count_out = count;
+        return true;
+    }
+    if (!dp_selector_groups(plan->path_groups, plan->path_groups_len, out,
+                            out_size, &pos, &count) ||
+        !dp_selector_groups(plan->closure_groups, plan->closure_groups_len,
+                            out, out_size, &pos, &count))
+        return false;
+    *count_out = count;
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_build_test_selector(
+    const struct zcl_devloop_plan *plan, const char *root, bool inventory_only,
+    char *out, size_t out_size, uint32_t *count_out, char *gated_out,
+    size_t gated_size)
+{
+    return build_test_selector(plan, root, inventory_only, out, out_size,
+                               count_out, gated_out, gated_size);
+}
+#endif
+
+/* An added, deleted or type-changed input cannot be narrowed: no old depfile
+ * holds an edge for a formerly absent path, and __has_include may probe any
+ * name. Such a set runs the full closure -- every catalog group the universal
+ * selector admits, beside the full lint gate set every proof runs -- and
+ * never the inventory-only or docs-only shortcut. */
+static bool dp_changed_set_widen(const struct zcl_dev_proof_changed_set *set,
+                                 struct zcl_devloop_plan *plan,
+                                 bool *inventory_only)
+{
+    if (!set || !set->structural_path) return false;
+    plan->closure_universal = true;
+    plan->docs_only = false;
+    *inventory_only = false;
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_changed_set_selector(
+    const struct zcl_dev_proof_changed_set *set, const char *root, char *out,
+    size_t out_size, uint32_t *count_out, bool *universal_out,
+    char *gated_out, size_t gated_size)
+{
+    if (!set || !set->files || set->count == 0 || !universal_out)
+        return false;
+    struct zcl_devloop_plan plan;
+    if (!zcl_devloop_plan_files(set->files, set->count, &plan)) return false;
+    bool inventory_only = inventory_output_only(set->files, set->count);
+    (void)dp_changed_set_widen(set, &plan, &inventory_only);
+    *universal_out = plan.closure_universal;
+    return build_test_selector(&plan, root, inventory_only, out, out_size,
+                               count_out, gated_out, gated_size);
+}
+#endif
+
+/* One PROBE-SUMMARY line, strictly: the four counts and nothing else.
+ * A line that is too long to be a summary, lacks the prefix, or carries
+ * trailing garbage is not a summary. */
+static bool dp_preflight_summary(const char *line, size_t len, unsigned *g,
+                                 unsigned *r, unsigned *m, unsigned *u)
+{
+    char buf[256];
+    char over[2];
+    if (!line || !g || !r || !m || !u) return false;
+    if (len <= 14 || len >= sizeof(buf)) return false;
+    if (memcmp(line, "PROBE-SUMMARY ", 14) != 0) return false;
+    memcpy(buf, line, len);
+    buf[len] = '\0';
+    return sscanf(buf, "PROBE-SUMMARY groups=%u would_reuse=%u "
+                       "must_run=%u uncacheable=%u%1s",
+                  g, r, m, u, over) == 4;
+}
+
+/* Read the runner's --cache-probe-only output into the preflight account.
+ * The SUMMARY carries the counts and the PROBE lines check it: exactly one
+ * summary, a self-consistent split, and a line count equal to the summary's
+ * group count. Anything else (truncated log, doubled summary, a summary
+ * that does not describe its own lines) refuses, and the caller falls back
+ * to "the runner decides". */
+static bool dp_preflight_parse(const char *bytes, size_t len,
+                               struct zcl_dev_proof_preflight *out)
+{
+    uint32_t lines = 0, summaries = 0;
+    unsigned groups = 0, reuse = 0, must = 0, unc = 0;
+    size_t i = 0;
+    if (!bytes || !out) return false;
+    memset(out, 0, sizeof(*out));
+    /* A bent SUMMARY line simply parses as "not a summary": with no valid
+     * summary the final check refuses, and a valid summary beside a bent
+     * line still has to describe every PROBE line to be accepted. */
+    while (i < len) {
+        size_t eol = i;
+        unsigned g = 0, r = 0, m = 0, u = 0;
+        while (eol < len && bytes[eol] != '\n') eol++;
+        if (eol - i > 6 && memcmp(bytes + i, "PROBE ", 6) == 0) lines++;
+        if (dp_preflight_summary(bytes + i, eol - i, &g, &r, &m, &u)) {
+            groups = g;
+            reuse = r;
+            must = m;
+            unc = u;
+            summaries++;
+        }
+        i = eol + 1;
+    }
+    if (summaries != 1 || lines != groups || must != groups - reuse ||
+        unc > groups)
+        return false;
+    out->groups = groups;
+    out->would_reuse = reuse;
+    out->must_run = must;
+    out->uncacheable = unc;
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_preflight_parse(const char *bytes, size_t len,
+                                        struct zcl_dev_proof_preflight *out)
+{
+    return dp_preflight_parse(bytes, len, out);
+}
+
+#endif
+
+/* True only when the verdict store the preflight would probe provably holds
+ * no verdict. Every probe HIT needs a PASS record at
+ * <store>/.zvcs/objects/<hh>/<62hex> (trc_record_verifies in the runner's
+ * testcache), so an objects directory holding nothing but the writer's
+ * tmp/, or no objects directory under a real store directory, can only
+ * answer would_reuse=0. Any other entry, any read error, or a store root
+ * that is not a real directory answers false. Stops at the first entry
+ * that is not ".", ".." or "tmp", so it reads at most four entries. */
+static bool dp_verdict_store_empty(const char *store_root)
+{
+    char objects[PATH_MAX];
+    struct stat st;
+    struct dirent *entry;
+    bool empty = true;
+    DIR *dir;
+    if (!store_root || !store_root[0] || lstat(store_root, &st) != 0 ||
+        !S_ISDIR(st.st_mode) ||
+        snprintf(objects, sizeof(objects), "%s/.zvcs/objects", store_root) >=
+            (int)sizeof(objects))
+        return false;
+    dir = opendir(objects);
+    if (!dir) return errno == ENOENT;
+    errno = 0;
+    while (empty && (entry = readdir(dir)) != NULL)
+        empty = strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0 ||
+                strcmp(entry->d_name, "tmp") == 0;
+    if (errno != 0) empty = false;
+    (void)closedir(dir);
+    return empty;
+}
+
+/* Skip the advisory probe when its store provably holds no verdict: the
+ * runner could only report would_reuse=0, and the cold test dimension
+ * reads nothing from it. Same note key, so phases.txt readers still find
+ * the line. Returns true when the spawn is skipped. */
+static bool dp_preflight_skip_empty(const char *store_root,
+                                    const char *phases)
+{
+    if (!dp_verdict_store_empty(store_root)) return false;
+    if (phases && phases[0])
+        (void)zcl_dev_proof_phase_note(
+            phases, "test_preflight",
+            "advisory skipped reason=empty_verdict_store");
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_preflight_skip(const char *store_root,
+                                       const char *phases_path)
+{
+    return dp_preflight_skip_empty(store_root, phases_path);
+}
+#endif
+
+/* Capsule scratch path beside the proof logs: ephemeral cycle state, never
+ * published, never executed, and never read back by the cold test
+ * dimension. Takes plain strings so the helper stays above the worker
+ * struct. */
+static bool dp_capsule_path(const char *logs, const char *key,
+                            char out[PATH_MAX])
+{
+    int n;
+    if (!logs || !logs[0] || !key || !key[0] || !out) return false;
+    n = snprintf(out, PATH_MAX, "%s/%s.probe-capsule", logs, key);
+    return n > 0 && n < PATH_MAX;
+}
+
+/* The five capsule arguments a runner child takes. All values are
+ * fixed-length sealed bindings, so fixed buffers with one upfront length
+ * gate cannot truncate. */
+static int dp_capsule_argv(struct zcl_dev_proof_capsule_argv *o, bool write,
+                           const char *capsule_path, const char *source_id,
+                           const char *mutation_id, const char *source_cas,
+                           const char *graph_root)
+{
+    if (!o || !capsule_path || !capsule_path[0] || !source_id ||
+        !source_id[0] || !mutation_id || !mutation_id[0] || !source_cas ||
+        !graph_root || strlen(capsule_path) > 128)
+        return 0;
+    snprintf(o->capsule, sizeof(o->capsule), "%s=%s",
+             write ? "--write-capsule" : "--use-capsule", capsule_path);
+    snprintf(o->sid, sizeof(o->sid), "--capsule-source-id=%s", source_id);
+    snprintf(o->mid, sizeof(o->mid), "--capsule-mutation-id=%s",
+             mutation_id);
+    snprintf(o->cas, sizeof(o->cas), "--capsule-source-cas=%s", source_cas);
+    snprintf(o->graph, sizeof(o->graph), "--capsule-graph-root=%s",
+             graph_root);
+    o->argv[0] = o->capsule;
+    o->argv[1] = o->sid;
+    o->argv[2] = o->mid;
+    o->argv[3] = o->cas;
+    o->argv[4] = o->graph;
+    o->argv[5] = NULL;
+    return 5;
+}
+
+#if defined(ZCL_TESTING)
+int zcl_dev_proof_test_capsule_argv(bool write, const char *capsule_path,
+                                    const char *source_id,
+                                    const char *mutation_id,
+                                    const char *source_cas,
+                                    const char *graph_root,
+                                    const char **argv, size_t argv_cap)
+{
+    static struct zcl_dev_proof_capsule_argv held;
+    if (argv_cap < 6) return 0;
+    if (dp_capsule_argv(&held, write, capsule_path, source_id, mutation_id,
+                        source_cas, graph_root) != 5)
+        return 0;
+    memcpy(argv, held.argv, sizeof(held.argv));
+    return 5;
+}
+#endif
+
+static bool parse_uint_field(const char *line, const char *key, uint32_t *out)
+{
+    const char *p = strstr(line, key);
+    if (!p) return false;
+    p += strlen(key);
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(p, &end, 10);
+    if (errno || end == p || value > UINT32_MAX) return false;
+    *out = (uint32_t)value;
+    return true;
+}
+
+/* Every count the suite verdict line carries. */
+struct dp_test_counts {
+    uint32_t total;
+    uint32_t ran;
+    uint32_t reused;
+    uint32_t gated;
+    uint32_t failed;
+    uint32_t skipped;
+    uint32_t unobserved;
+};
+
+/* The one SUITE VERDICT line the run must have written. Exactly one, whole:
+ * a truncated line or a second one is a log this reader cannot account
+ * from, so it refuses instead of reading the last one it saw. */
+static bool dp_test_verdict_read(const char *path, char *verdict,
+                                 size_t verdict_size)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[4096];
+    uint32_t verdict_count = 0;
+    bool truncated = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "SUITE VERDICT ", 14) == 0) {
+            verdict_count++;
+            if (!strchr(line, '\n'))
+                truncated = true;
+            (void)snprintf(verdict, verdict_size, "%s", line);
+        }
+    }
+    bool ok = !ferror(f) && !truncated && verdict_count == 1;
+    fclose(f);
+    return ok && verdict[0];
+}
+
+static bool dp_test_verdict_counts(const char *verdict,
+                                   struct dp_test_counts *counts)
+{
+    return parse_uint_field(verdict, "groups_total=", &counts->total) &&
+           parse_uint_field(verdict, "groups_ran=", &counts->ran) &&
+           parse_uint_field(verdict, "groups_cached=", &counts->reused) &&
+           parse_uint_field(verdict, "groups_gated=", &counts->gated) &&
+           parse_uint_field(verdict, "groups_failed=", &counts->failed) &&
+           parse_uint_field(verdict, "self_skips=", &counts->skipped) &&
+           parse_uint_field(verdict, "env_unobserved=", &counts->unobserved);
+}
+
+static bool test_log_account(const char *path,
+                             struct zcl_dev_proof_dimension *dim)
+{
+    char verdict[4096] = {0};
+    if (!dp_test_verdict_read(path, verdict, sizeof(verdict))) return false;
+    struct dp_test_counts counts = {0};
+    if (!dp_test_verdict_counts(verdict, &counts)) return false;
+    dim->ran = counts.ran;
+    dim->reused = counts.reused;
+    dim->failed = counts.failed;
+    dim->skipped = counts.skipped;
+    /* groups_cached must be zero: the runner is started cold, so a nonzero
+     * count means some verdict was admitted without executing, and no
+     * verifier outside the candidate's trust domain exists to vouch for
+     * it. Refuse rather than record it as reuse. */
+    return (uint64_t)counts.total ==
+               (uint64_t)counts.ran + counts.reused + counts.gated &&
+           counts.reused == 0 && counts.ran == dim->selected &&
+           counts.failed == 0 && counts.skipped == 0 &&
+           counts.unobserved == 0;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_log_account(const char *path,
+                                    struct zcl_dev_proof_dimension *dim)
+{
+    return path && dim && test_log_account(path, dim);
+}
+#endif
+
+/* One dimension in flight. Dimensions that do not feed each other are started
+ * together and finished together; each keeps its own log, budget, receipt root
+ * and accounting exactly as when they ran one after another. */
+struct proof_dimension_run {
+    enum zcl_dev_proof_dimension_id id;
+    const char *name;
+    struct zcl_dev_proof_dimension *dim;
+    bool parse_test;
+    char log[PATH_MAX];
+    struct zcl_dev_proof_step step;
+};
+
+static bool dimension_start(const struct proof_paths *paths,
+                            const char *root,
+                            struct proof_dimension_run *run,
+                            enum zcl_dev_proof_dimension_id id,
+                            const char *const argv[],
+                            struct zcl_dev_proof_dimension *dim,
+                            bool parse_test,
+                            const struct zcl_dev_proof_budget *budget,
+                            char *why, size_t why_len)
+{
+    memset(run, 0, sizeof(*run));
+    run->id = id;
+    run->name = zcl_dev_proof_dimension_name(id);
+    run->dim = dim;
+    run->parse_test = parse_test;
+    if (snprintf(run->log, sizeof(run->log), "%s/%s.%s.log", paths->logs,
+                 paths->key, run->name) >= (int)sizeof(run->log)) {
+        proof_why(why, why_len, "child_log_path_invalid");
+        return false;
+    }
+    /* The child truncates its log once it runs; a log left by an earlier
+     * attempt must not be read as this child's output in the meantime. */
+    if (unlink(run->log) != 0 && errno != ENOENT) {
+        proof_why(why, why_len, "child_log_stale_unremovable");
+        return false;
+    }
+    if (!zcl_dev_proof_step_start(&run->step, root, run->log, argv, budget)) {
+        proof_whyf(why, why_len, "child_proof_%s_could_not_start", run->name);
+        return false;
+    }
+    return true;
+}
+
+static bool dimension_finish(const struct proof_paths *paths,
+                             struct proof_dimension_run *run,
+                             char *why, size_t why_len)
+{
+    const struct zcl_dev_proof_step_report *report = &run->step.report;
+    if (paths->phases[0])
+        (void)zcl_dev_proof_phase_record(paths->phases, run->name, report);
+    char key[PROOF_TIMING_KEY_MAX];
+    if (report->rc == 0 &&
+        snprintf(key, sizeof(key), "step.%s", run->name) < (int)sizeof(key))
+        (void)zcl_dev_proof_timing_note(paths->state, key, report->elapsed_ms);
+    if (!hash_file(run->name, run->log, run->dim->receipt_root)) {
+        proof_why(why, why_len, "child_receipt_hash_failed");
+        return false;
+    }
+    if (report->rc != 0) {
+        run->dim->failed = 1;
+        run_step_why(why, why_len, run->name, report);
+        return false;
+    }
+    if (run->parse_test) {
+        /* Fold this run's per-group wall times back into the table before
+         * accounting, so the next proof plans from what just happened even
+         * when the accounting then refuses the run. */
+        (void)zcl_dev_proof_timing_ingest_test_log(paths->state, run->log);
+        if (!test_log_account(run->log, run->dim)) {
+            proof_why(why, why_len,
+                      run->dim->reused
+                          ? "test_reuse_unqualified_no_verifier_account"
+                          : "test_accounting_incomplete");
+            return false;
+        }
+    } else {
+        run->dim->ran = run->dim->selected;
+    }
+    return true;
+}
+
+/* Wait for every dimension in flight. Each keeps its own watch, so a
+ * concurrent set is killed by exactly the rules a lone step would have met. */
+static void dimension_runs_wait(struct proof_dimension_run *runs, size_t count)
+{
+    for (;;) {
+        bool pending = false;
+        for (size_t i = 0; i < count; i++) {
+            if (!runs[i].step.started || runs[i].step.finished) continue;
+            if (!zcl_dev_proof_step_poll(&runs[i].step)) pending = true;
+        }
+        if (!pending) break;
+        platform_sleep_ms(20);
+    }
+}
+
+static bool run_dimension(const struct proof_paths *paths,
+                          enum zcl_dev_proof_dimension_id id,
+                          const char *const argv[],
+                          struct zcl_dev_proof_dimension *dim,
+                          bool parse_test,
+                          const struct zcl_dev_proof_budget *budget,
+                          char *why, size_t why_len)
+{
+    struct proof_dimension_run run;
+    if (!dimension_start(paths, paths->root, &run, id, argv, dim, parse_test,
+                         budget, why, why_len))
+        return false;
+    (void)zcl_dev_proof_steps_wait(&run.step, 1);
+    return dimension_finish(paths, &run, why, why_len);
+}
+
+static void unused_dimension(enum zcl_dev_proof_dimension_id id,
+                             struct zcl_dev_proof_dimension *dim)
+{
+    hash_text(zcl_dev_proof_dimension_name(id), "not_selected", 12,
+              dim->receipt_root);
+}
+
+static bool cycle_proof_reuse(
+    const struct proof_paths *paths, const char *source_cas,
+    struct zcl_dev_proof_dimension dimensions[ZCL_DEV_PROOF_DIMENSIONS])
+{
+    char body[16384], why[160] = {0};
+    size_t body_len = 0;
+    enum zcl_devloop_state_lookup lookup = zcl_devloop_cycle_state_read(
+        paths->root, body, sizeof(body), &body_len, NULL, why, sizeof(why));
+    if (lookup != ZCL_DEVLOOP_STATE_FOUND) return false;
+    /* Legacy cycle records bind source bytes but not the full proof action
+     * inputs or dimension-specific child roots. Until the producer and
+     * consumer independently derive all of them, a cycle is a safe cache miss
+     * rather than authority for child receipts. */
+    if (!zcl_dev_proof_cycle_reuse_admissible(
+            body, body_len, source_cas, NULL, dimensions))
+        return false;
+    for (size_t i = 0; i < ZCL_DEV_PROOF_DIMENSIONS; i++) {
+        if (dimensions[i].selected) {
+            dimensions[i].reused = dimensions[i].selected;
+        } else {
+            unused_dimension((enum zcl_dev_proof_dimension_id)i,
+                             &dimensions[i]);
+        }
+    }
+    return true;
+}
+
+/* The test dimension's runner is exec'd with execvp(), which reuses this
+ * process's own `environ` -- there is no separate envp built per child, so
+ * whatever this process last set is exactly what every forked test child
+ * inherits. A resident proof daemon forks many cycles from one long-lived
+ * process and keeps the environment it started with; roughly sixteen
+ * registered groups carry `if (!getenv("ZCL_STRESS_TESTS")) { SKIP(...) }`
+ * (tests/harness/src/test_kill9_recovery.c and friends), and testcache.c
+ * keys a cached verdict on that variable being present. Without this call
+ * the daemon's first environment silently outlives the setting: those
+ * groups self-skip and testcache happily caches the SKIP as a PASS, so a
+ * push proof admits a commit having never run its stress lane. Set it here,
+ * unconditionally, right before the test dimension launches -- not once at
+ * daemon start, and not left to whatever exported the hook that invoked
+ * this binary. */
+static bool proof_stress_tests_env_prepare(char *why, size_t why_len)
+{
+    if (setenv("ZCL_STRESS_TESTS", "1", 1) != 0) {
+        proof_why(why, why_len, "stress_tests_env_unavailable");
+        return false;
+    }
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_stress_env_prepare(char *why, size_t why_len)
+{
+    return proof_stress_tests_env_prepare(why, why_len);
+}
+
+/* Fixture-only seam for explicit observation store lifecycle. These tests
+ * do not imply that the default worker arms observation stores. */
+bool zcl_dev_proof_test_observation_env_prepare(const char *state,
+                                                const char *key,
+                                                char *why, size_t why_len)
+{
+    if (!proof_observation_env_open(state, key)) {
+        proof_why(why, why_len, "observation_env_unavailable");
+        return false;
+    }
+    if (why && why_len) why[0] = 0;
+    return true;
+}
+
+bool zcl_dev_proof_test_observation_env_restore(const char *state,
+                                                const char *key)
+{
+    return proof_observation_env_close(state, key);
+}
+
+bool zcl_dev_proof_test_warm_status_line(const char *warmstart_path,
+                                         char *out, size_t out_len)
+{
+    return warm_status_line(warmstart_path, out, out_len);
+}
+
+bool zcl_dev_proof_test_lint_argv(const char *root, const char *jobs,
+                                  const char **argv, size_t argv_cap,
+                                  size_t *argc_out, int64_t *fallback_ms,
+                                  const char **targets_out)
+{
+    const char *targets = NULL;
+    size_t n = 0;
+    if (!argc_out || !proof_lint_prepare(root, jobs, argv, argv_cap,
+                                         fallback_ms, &targets))
+        return false;
+    while (argv[n]) n++;
+    *argc_out = n;
+    if (targets_out) *targets_out = targets;
+    return true;
+}
+/* Seam for the generation-hooks regression: the exact reconfiguration
+ * generation_prepare() applies after copying build/githooks into a fresh
+ * generation, so a test can prove a generation whose worktree config still
+ * names the submitting checkout's hooks gets pointed at its own copy. */
+bool zcl_dev_proof_test_generation_hooks_configure(const char *generation,
+                                                   char *why, size_t why_len)
+{
+    return generation_hooks_configure(generation, why, why_len);
+}
+
+/* Seam for the lint-target split: true when the recorded target list is the
+ * whole gate set rather than the fast subset. The proof asks this exact
+ * question to decide whether the generation needs the admitted set. */
+bool zcl_dev_proof_test_lint_targets_are_full(const char *targets)
+{
+    return proof_lint_targets_are_full(targets);
+}
+
+bool zcl_dev_proof_test_prepare_environment(void)
+{
+    return proof_prepare_environment();
+}
+
+/* The zcc store a compile started from this process would use: ZCC_DIR,
+ * else $XDG_CACHE_HOME/zcc, else $HOME/.cache/zcc, the order tools/zcc.c
+ * cache_open() reads them in. */
+static bool proof_zcc_effective_store(char *out, size_t out_len)
+{
+    const char *dir = getenv("ZCC_DIR");
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    const char *home = getenv("HOME");
+    int n;
+    if (dir && dir[0])
+        n = snprintf(out, out_len, "%s", dir);
+    else if (xdg && xdg[0])
+        n = snprintf(out, out_len, "%s/zcc", xdg);
+    else if (home && home[0])
+        n = snprintf(out, out_len, "%s/.cache/zcc", home);
+    else
+        return false;
+    return n > 0 && (size_t)n < out_len;
+}
+
+bool zcl_dev_proof_test_compile_store(const char *state, const char *key,
+                                      char *store, size_t store_len)
+{
+    return proof_zcc_private_open(state, key) &&
+           proof_zcc_effective_store(store, store_len);
+}
+
+bool zcl_dev_proof_test_compile_store_close(const char *state,
+                                            const char *key)
+{
+    return proof_zcc_private_close(state, key);
+}
+#endif
+
+/* The proof spawns make through the one repository-wide derivation; see
+ * platform/logical_cpu.h. It used to clamp to a compiled-in 16 that carried
+ * no reason, on a host granting 28. */
+static bool proof_make_jobs_arg(char out[16])
+{
+    return platform_build_jobs_arg(out);
+}
+
+/* Build the three checker binaries the docs-fresh gate execs, inside the
+ * sealed generation and before the read-only verification runs. A bare
+ * generation carries none, and the gate scripts have no fallback. The tools
+ * build from the sealed sources, so the verdict
+ * still binds to the sealed bytes; only untracked build outputs change.
+ * A build failure is its own typed refusal, never a pass. */
+static bool dp_generation_docs_tools(const struct proof_paths *paths,
+                                     const char *generation,
+                                     char *why, size_t why_len)
+{
+    char jobs[16];
+    const char *argv[DP_DOCS_TOOLS_ARGV_CAP];
+    char log_path[PATH_MAX];
+    struct zcl_dev_proof_budget budget;
+    struct zcl_dev_proof_step_report report = {0};
+    if (!proof_make_jobs_arg(jobs)) {
+        proof_why(why, why_len, "proof_docs_tools_job_count_unavailable");
+        return false;
+    }
+    if (!dp_docs_tools_argv(jobs, argv, DP_DOCS_TOOLS_ARGV_CAP)) {
+        proof_why(why, why_len, "proof_docs_tools_argv_invalid");
+        return false;
+    }
+    if (!paths ||
+        snprintf(log_path, sizeof(log_path), "%s/generation-docs-tools.log",
+                 paths->logs) >= (int)sizeof(log_path)) {
+        proof_why(why, why_len, "proof_docs_tools_log_path_invalid");
+        return false;
+    }
+    budget = proof_step_budget(paths, "generation-docs-tools",
+                               PROOF_GENERATED_DEFAULT_MS);
+    if (run_step(paths, generation, log_path, argv, "generation-docs-tools",
+                 &budget, &report) != 0) {
+        if (report.cause == ZCL_DEV_PROOF_KILL_NONE)
+            proof_whyf(why, why_len, "proof_docs_tools_build_exit_%d",
+                       report.rc);
+        else
+            run_step_why(why, why_len, "generation-docs-tools", &report);
+        return false;
+    }
+    return true;
+}
+
+static bool executable_reuse(const struct proof_paths *paths,
+                             const char *artifact,
+                             const struct dev_source_record *expected_source,
+                             struct zcl_dev_proof_dimension *dimension,
+                             char *why, size_t why_len)
+{
+    if (!paths || !artifact || !expected_source ||
+        !expected_source->source_id[0] || !dimension || dimension->selected == 0) {
+        proof_why(why, why_len, "proof_executable_reuse_input_invalid");
+        return false;
+    }
+    int fd = open(artifact, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        proof_whyf(why, why_len, "proof_executable_open_failed_errno_%d",
+                   errno);
+        return false;
+    }
+    struct dev_source_record source = {0};
+    char source_why[160] = {0};
+    bool admitted = zcl_dev_executable_source_record_read(
+        paths->root, fd, artifact, &source, source_why, sizeof(source_why));
+    if (close(fd) != 0) {
+        proof_whyf(why, why_len, "proof_executable_close_failed_errno_%d",
+                   errno);
+        return false;
+    }
+    if (!admitted) {
+        proof_whyf(why, why_len, "proof_executable_%s",
+                   source_why[0] ? source_why : "source_record_failed");
+        return false;
+    }
+    if (strcmp(source.source_id, expected_source->source_id) != 0) {
+        proof_whyf(why, why_len,
+                   "proof_executable_source_identity_mismatch_actual_%.16s_expected_%.16s",
+                   source.source_id, expected_source->source_id);
+        return false;
+    }
+    if (!hash_file("zcl.dev_proof_executable_reuse.v1", artifact,
+                   dimension->receipt_root)) {
+        proof_why(why, why_len, "proof_executable_hash_failed");
+        return false;
+    }
+    dimension->reused = dimension->selected;
+    return true;
+}
+
+static bool admitted_executable_materialize(
+    const struct proof_paths *paths, const char *generation,
+    const char *source, const char *relative_target,
+    const struct dev_source_record *expected_source, char target[PATH_MAX],
+    char *why, size_t why_len)
+{
+    struct zcl_dev_proof_dimension artifact = {.selected = 1};
+    int target_len = generation && relative_target && target
+        ? snprintf(target, PATH_MAX, "%s/%s", generation, relative_target)
+        : -1;
+    if (!paths || !source || !expected_source || !target || target_len <= 0 ||
+        target_len >= PATH_MAX) {
+        proof_why(why, why_len, "proof_executable_target_path_invalid");
+        return false;
+    }
+    if (!executable_reuse(paths, source, expected_source, &artifact,
+                          why, why_len))
+        return false;
+    if (!dependency_materialize(source, target)) {
+        proof_why(why, why_len, "proof_executable_materialize_failed");
+        return false;
+    }
+    return true;
+}
+
+static bool admitted_executable_mark_fresh(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    const struct timespec times[2] = {
+        {.tv_nsec = UTIME_OMIT},
+        {.tv_nsec = UTIME_NOW},
+    };
+    bool ok = futimens(fd, times) == 0;
+    if (close(fd) != 0) ok = false;
+    return ok;
+}
+
+/* The executables a generation is handed rather than rebuilt, and the one
+ * table both the lint and the test dimension read. Handing the lint
+ * dimension a different set from the test dimension is what let a landing
+ * proof judge `make lint` against artifacts the submitting checkout's own
+ * `make lint` never saw: the full gate set reads build/bin/z23-dev
+ * (check-capability-closure's nm closure, and the `lint:` umbrella's own
+ * prerequisite at Makefile:13323) and the confined package verifier
+ * alongside it. Every entry is admitted through
+ * admitted_executable_materialize(), so each one is content-checked --
+ * the source binary must report the exact source identity this proof
+ * sealed -- before it is copied in; there is no weaker path.
+ *
+ * build/bin/zclassic23 is the compatibility alias (Makefile:642), and the
+ * dev node is what a generation can admit: the release node exposes no
+ * --source-record seam (engine/entry/main.c:196 guards it on
+ * ZCL_DEV_BUILD), so it cannot be content-checked and is never admitted.
+ * gate_doc_no_false_deleted reads the release binary by its own name for
+ * exactly that reason. */
+struct proof_admitted_executable {
+    const char *source;  /* relative to the submitting checkout */
+    const char *target;  /* relative to the generation */
+};
+
+static const struct proof_admitted_executable proof_admitted_executables[] = {
+    {"build/bin/zclassic23-package-verify-dev",
+     "build/bin/zclassic23-package-verify-dev"},
+    {"build/bin/z23-dev", "build/bin/z23-dev"},
+    {"build/bin/z23-dev", "build/bin/zclassic23"},
+};
+
+#define PROOF_ADMITTED_EXECUTABLE_COUNT \
+    (sizeof(proof_admitted_executables) / sizeof(proof_admitted_executables[0]))
+
+/* Does a test-selected generation carry `rel` as an admitted executable? */
+static bool proof_admitted_target(const char *rel)
+{
+    for (size_t i = 0; i < PROOF_ADMITTED_EXECUTABLE_COUNT; i++)
+        if (strcmp(proof_admitted_executables[i].target, rel) == 0)
+            return true;
+    return false;
+}
+
+/* Index each entry by name: a caller that wants one path out of the set
+ * must not have to count rows. */
+enum {
+    PROOF_ADMITTED_PACKAGE_VERIFY = 0,
+    PROOF_ADMITTED_DEV_NODE = 1,
+    PROOF_ADMITTED_NODE_ALIAS = 2,
+};
+
+/* Materialize that whole set into `generation`, marking each one fresh so
+ * the generation's own `make` treats it as up to date instead of relinking
+ * the whole dev object graph inside a gate. Both dimensions call this, so
+ * neither can drift on to its own private set.
+ *
+ * Idempotent by content, not by flag: an entry the generation already
+ * carries is re-read through the same executable_reuse() identity check
+ * and kept, so a second call costs three `--source-record` execs rather
+ * than three whole-binary copies, and a generation that rebuilt its own
+ * bundle keeps the bytes it just built rather than being overwritten by a
+ * submitting checkout whose binaries are older than the commit under
+ * proof. */
+static bool proof_admitted_executables_prepare(
+    const struct proof_paths *paths, const char *generation,
+    const struct dev_source_record *expected_source,
+    char targets[PROOF_ADMITTED_EXECUTABLE_COUNT][PATH_MAX],
+    char *why, size_t why_len)
+{
+    struct proof_paths carried = *paths;
+    if ((size_t)snprintf(carried.root, sizeof(carried.root), "%s",
+                         generation) >= sizeof(carried.root)) {
+        proof_why(why, why_len, "proof_admitted_generation_path_too_long");
+        return false;
+    }
+    for (size_t i = 0; i < PROOF_ADMITTED_EXECUTABLE_COUNT; i++) {
+        char source[PATH_MAX];
+        struct stat carried_st;
+        if (snprintf(source, sizeof(source), "%s/%s", paths->root,
+                     proof_admitted_executables[i].source) >=
+                (int)sizeof(source) ||
+            snprintf(targets[i], PATH_MAX, "%s/%s", generation,
+                     proof_admitted_executables[i].target) >= PATH_MAX) {
+            proof_whyf(why, why_len, "proof_admitted_path_too_long:%s",
+                       proof_admitted_executables[i].target);
+            return false;
+        }
+        struct zcl_dev_proof_dimension carried_artifact = {.selected = 1};
+        char carried_why[160] = {0};
+        if (lstat(targets[i], &carried_st) == 0 &&
+            S_ISREG(carried_st.st_mode) &&
+            executable_reuse(&carried, targets[i], expected_source,
+                             &carried_artifact, carried_why,
+                             sizeof(carried_why))) {
+            if (!admitted_executable_mark_fresh(targets[i])) {
+                proof_whyf(why, why_len,
+                           "proof_admitted_freshness_failed:%s",
+                           proof_admitted_executables[i].target);
+                return false;
+            }
+            continue;
+        }
+        if (!admitted_executable_materialize(
+                paths, generation, source,
+                proof_admitted_executables[i].target, expected_source,
+                targets[i], why, why_len)) {
+            if (!why || !why[0])
+                proof_whyf(why, why_len, "proof_admitted_refused:%s",
+                           proof_admitted_executables[i].target);
+            return false;
+        }
+        if (!admitted_executable_mark_fresh(targets[i])) {
+            proof_whyf(why, why_len, "proof_admitted_freshness_failed:%s",
+                       proof_admitted_executables[i].target);
+            return false;
+        }
+    }
+    return true;
+}
+#if defined(ZCL_TESTING)
+/* Seam for the shared admitted-executable set: the exact table both the
+ * lint and the test dimension materialize into a generation, so a test can
+ * prove the two dimensions are handed the same executables without driving
+ * a proof cycle. Returns the number of entries written. */
+size_t zcl_dev_proof_test_admitted_executables(const char **sources,
+                                               const char **targets,
+                                               size_t cap)
+{
+    size_t n = PROOF_ADMITTED_EXECUTABLE_COUNT;
+    if (n > cap) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (sources) sources[i] = proof_admitted_executables[i].source;
+        if (targets) targets[i] = proof_admitted_executables[i].target;
+    }
+    return n;
+}
+#endif
+
+static bool test_object_dir_relative(const struct proof_paths *paths,
+                                     char object_dir[PATH_MAX])
+{
+    char plan[PATH_MAX];
+    if (snprintf(plan, sizeof(plan), "%s/build/dev-loop/restart.env",
+                 paths->root) >= (int)sizeof(plan))
+        return false;
+    FILE *file = fopen(plan, "r");
+    if (!file) return false;
+    char line[PATH_MAX];
+    object_dir[0] = 0;
+    while (fgets(line, sizeof(line), file)) {
+        static const char prefix[] = "TEST_OBJ_DIR=";
+        if (strncmp(line, prefix, sizeof(prefix) - 1) != 0) continue;
+        size_t len = strcspn(line + sizeof(prefix) - 1, "\r\n");
+        if (len == 0 || len >= PATH_MAX) break;
+        memcpy(object_dir, line + sizeof(prefix) - 1, len);
+        object_dir[len] = 0;
+        break;
+    }
+    bool read_ok = !ferror(file) && fclose(file) == 0;
+    static const char prefix[] = "build/test-obj/epochs/";
+    return read_ok && strncmp(object_dir, prefix, sizeof(prefix) - 1) == 0 &&
+        object_dir[sizeof(prefix) - 1] != 0 && !strstr(object_dir, "..") &&
+        !strchr(object_dir, '\\');
+}
+
+static bool test_binary_path(const struct proof_paths *paths,
+                             char out[PATH_MAX])
+{
+    char object_dir[PATH_MAX];
+    if (!test_object_dir_relative(paths, object_dir)) return false;
+    const char *epoch = strrchr(object_dir, '/');
+    if (!epoch || !epoch[1] || strchr(epoch + 1, '/')) return false;
+    int n = snprintf(out, PATH_MAX,
+                     "%s/build/bin/test-fast/epochs/%s/test_parallel_fast",
+                     paths->root, epoch + 1);
+    return n > 0 && n < PATH_MAX && access(out, X_OK) == 0;
+}
+
+/* Copy the checkout's current test-object epoch pointer into the
+ * generation. The epoch name must be one path segment: anything else is a
+ * pointer this proof cannot reason about. */
+static bool dp_epoch_pointer_copy(const struct proof_paths *paths,
+                                  const char *generation, const char *epoch,
+                                  char target[PATH_MAX])
+{
+    char source[PATH_MAX];
+    return epoch && epoch[1] && !strchr(epoch + 1, '/') &&
+           snprintf(source, PATH_MAX, "%s/build/test-obj/.current-epoch",
+                    paths->root) < PATH_MAX &&
+           snprintf(target, PATH_MAX, "%s/build/test-obj/.current-epoch",
+                    generation) < PATH_MAX &&
+           dependency_parent_ensure(target) &&
+           dependency_copy_fresh(source, target);
+}
+
+/* The pointer's value, trimmed of its line ending. A read that filled the
+ * buffer is refused: the epoch would be indistinguishable from a longer
+ * one that happens to share its first bytes. */
+static bool dp_epoch_value_read(const char *target, char *value,
+                                size_t value_size, size_t *len_out)
+{
+    int fd = open(target, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    ssize_t got;
+    do {
+        got = read(fd, value, value_size);
+    } while (got < 0 && errno == EINTR);
+    bool ok = close(fd) == 0 && got > 0 && got < (ssize_t)value_size;
+    size_t len = ok ? (size_t)got : 0;
+    while (len > 0 && (value[len - 1] == '\n' || value[len - 1] == '\r'))
+        len--;
+    *len_out = len;
+    return ok;
+}
+
+static bool test_epoch_pointer_prepare(const struct proof_paths *paths,
+                                       const char *generation,
+                                       const char *object_dir,
+                                       uint8_t pointer_root[32])
+{
+    const char *epoch = strrchr(object_dir, '/');
+    char target[PATH_MAX];
+    if (!dp_epoch_pointer_copy(paths, generation, epoch, target))
+        return false;
+    char value[72];
+    size_t len = 0;
+    if (!dp_epoch_value_read(target, value, sizeof(value), &len))
+        return false;
+    return strlen(epoch + 1) == len &&
+        memcmp(value, epoch + 1, len) == 0 &&
+        hash_file("zcl.dev_proof_epoch_pointer.v1", target, pointer_root);
+}
+
+static bool test_depfiles_prepare(const struct proof_paths *paths,
+                                  const char *generation,
+                                  uint8_t depfile_root[32],
+                                  char *why, size_t why_len)
+{
+    char relative[PATH_MAX], source[PATH_MAX], target[PATH_MAX];
+    uint8_t pointer_root[32];
+    if (!test_object_dir_relative(paths, relative)) {
+        proof_why(why, why_len, "proof_test_restart_plan_invalid");
+        return false;
+    }
+    if (snprintf(source, sizeof(source), "%s/%s", paths->root, relative) >=
+            (int)sizeof(source) ||
+        snprintf(target, sizeof(target), "%s/%s", generation, relative) >=
+            (int)sizeof(target)) {
+        proof_why(why, why_len, "proof_test_depfile_path_invalid");
+        return false;
+    }
+    struct sha3_256_ctx root;
+    hash_begin(&root, "zcl.dev_proof_depfiles.v1");
+    size_t count = 0;
+    if (!depfile_tree_copy(source, target, strlen(source), &root, &count)) {
+        proof_why(why, why_len, "proof_test_depfile_copy_failed");
+        return false;
+    }
+    if (count == 0) {
+        proof_why(why, why_len, "proof_test_depfile_tree_empty");
+        return false;
+    }
+    if (!test_epoch_pointer_prepare(paths, generation, relative,
+                                    pointer_root)) {
+        proof_why(why, why_len, "proof_test_epoch_pointer_failed");
+        return false;
+    }
+    uint8_t count_le[8];
+    zcl_write_u64_le(count_le, (uint64_t)count);
+    sha3_256_write(&root, count_le, sizeof(count_le));
+    sha3_256_write(&root, pointer_root, sizeof(pointer_root));
+    sha3_256_finalize(&root, depfile_root);
+    return true;
+}
+
+/* Everything either dimension needs COPIED into the generation, admitted
+ * once, before anything builds. Split out of the old test_helpers_prepare()
+ * so the admission, the single build and the hashing are three ordered
+ * steps rather than one function that interleaved them: the admitted set is
+ * now materialized before the pre-fork make rather than half before and
+ * half after, and no dimension ever sees a generation mid-admission.
+ *
+ * want_test admits the test runner and the depfile tree; want_lint_artifacts
+ * says the lint dimension is running the full gate set, which reads
+ * build/bin/z23-dev and the confined package verifier. The shared table is
+ * materialized whenever EITHER is true, so the two dimensions cannot drift
+ * on to their own sets, and every entry still goes through
+ * admitted_executable_materialize()'s --source-record content check. */
+static bool proof_generation_inputs_prepare(
+    const struct proof_paths *paths, const char *generation,
+    const struct dev_source_record *expected_source,
+    bool want_test, bool want_lint_artifacts, const char *runner_source,
+    char runner_target[PATH_MAX],
+    char admitted[PROOF_ADMITTED_EXECUTABLE_COUNT][PATH_MAX],
+    uint8_t depfile_root[32], char *why, size_t why_len)
+{
+    if (want_test &&
+        !admitted_executable_materialize(
+            paths, generation, runner_source, "build/bin/test_parallel_fast",
+            expected_source, runner_target, why, why_len)) {
+        if (!why || !why[0])
+            proof_why(why, why_len, "proof_test_runner_admission_failed");
+        return false;
+    }
+    /* The one admitted set, shared by both dimensions: same sources, same
+     * content check, same generation paths.
+     *
+     * Idempotent by content: an entry the generation already carries is
+     * re-read through the same executable_reuse() identity check and kept,
+     * so a generation that rebuilt its own bundle keeps the bytes it just
+     * built rather than being overwritten by a submitting checkout whose
+     * binaries are older than the commit under proof. */
+    if ((want_test || want_lint_artifacts) &&
+        !proof_admitted_executables_prepare(paths, generation,
+                                            expected_source, admitted,
+                                            why, why_len)) {
+        if (!why || !why[0])
+            proof_why(why, why_len, "proof_lint_admission_failed");
+        return false;
+    }
+    if (want_test &&
+        !test_depfiles_prepare(paths, generation, depfile_root, why, why_len))
+        return false;
+    return true;
+}
+
+/* The ONE build step both dimensions share, run alone before either starts.
+ * See proof_prefork_argv() for why it has to be one step and what it covers. */
+static bool proof_prefork_build(const struct proof_paths *paths,
+                                const char *generation, const char *make_jobs,
+                                bool lint_full, char *why, size_t why_len)
+{
+    const char *argv[PROOF_PREFORK_ARGV_CAP];
+    if (!proof_prefork_argv(make_jobs, lint_full, argv,
+                            PROOF_PREFORK_ARGV_CAP)) {
+        proof_why(why, why_len, "proof_prefork_argv_invalid");
+        return false;
+    }
+    struct zcl_dev_proof_budget budget = proof_step_budget(
+        paths, "prefork",
+        lint_full ? PROOF_PREFORK_LANDING_MS : PROOF_PREFORK_DEFAULT_MS);
+    if (run_step(paths, generation, paths->prefork_log, argv, "prefork",
+                 &budget, NULL) != 0) {
+        proof_why(why, why_len, "proof_prefork_build_failed");
+        return false;
+    }
+    return true;
+}
+
+/* Hash what the pre-fork step admitted and built into the one
+ * zcl.dev_proof_test_helpers.v1 digest the test receipt is bound to. Same
+ * eleven artifacts, same order, same domains as before the split: the
+ * receipt says exactly what it always said. */
+/* The seven helper executables the generation builds for itself, in the
+ * order they fold into the digest. */
+#define PROOF_HELPER_BUILT_COUNT 7
+/* Eleven artifacts fold into the test helper digest: the four the pre-fork
+ * step admitted, plus the seven above. */
+#define PROOF_HELPER_INPUT_COUNT 11
+
+struct dp_helper_input {
+    const char *domain;
+    const char *path;
+};
+
+/* A path is usable only when it was spelled whole into its buffer. */
+static bool dp_path_written(int n)
+{
+    return n > 0 && n < PATH_MAX;
+}
+
+static bool dp_helper_built_paths(
+    const char *generation, char t[PROOF_HELPER_BUILT_COUNT][PATH_MAX])
+{
+    return dp_path_written(snprintf(t[0], PATH_MAX,
+                                    "%s/build/bin/zcl-nodectl", generation)) &&
+           dp_path_written(snprintf(t[1], PATH_MAX,
+                                    "%s/build/bin/zclassic23-acme",
+                                    generation)) &&
+           dp_path_written(snprintf(t[2], PATH_MAX,
+                                    "%s/build/bin/fbsh", generation)) &&
+           dp_path_written(snprintf(t[3], PATH_MAX,
+                                    "%s/build/bin/file_size_policy",
+                                    generation)) &&
+           dp_path_written(snprintf(t[4], PATH_MAX,
+                                    "%s/build/bin/fleet-board-bridge",
+                                    generation)) &&
+           dp_path_written(snprintf(t[5], PATH_MAX,
+                                    "%s/build/bin/z23-git-hook",
+                                    generation)) &&
+           dp_path_written(snprintf(t[6], PATH_MAX,
+                                    "%s/build/bin/z23-lint", generation));
+}
+
+/* Each artifact under its own domain, so the same bytes carried by two
+ * different executables can never hash alike. */
+static bool dp_helper_roots(const struct dp_helper_input *inputs,
+                            size_t count, uint8_t roots[][32])
+{
+    for (size_t i = 0; i < count; i++)
+        if (!hash_file(inputs[i].domain, inputs[i].path, roots[i]))
+            return false;
+    return true;
+}
+
+/* Hash what the pre-fork step admitted and built into the one
+ * zcl.dev_proof_test_helpers.v1 digest the test receipt is bound to. Same
+ * eleven artifacts, same order, same domains as before the split: the
+ * receipt says exactly what it always said. */
+static bool test_helpers_hash(
+    const char *generation, const char *runner_target,
+    const char admitted[PROOF_ADMITTED_EXECUTABLE_COUNT][PATH_MAX],
+    const uint8_t depfile_root[32], uint8_t helper_root[32],
+    char *why, size_t why_len)
+{
+    char built[PROOF_HELPER_BUILT_COUNT][PATH_MAX];
+    if (!dp_helper_built_paths(generation, built)) {
+        proof_why(why, why_len, "proof_test_helper_path_invalid");
+        return false;
+    }
+    const struct dp_helper_input inputs[PROOF_HELPER_INPUT_COUNT] = {
+        {"zcl.dev_proof_test_runner.v1", runner_target},
+        {"zcl.dev_proof_package_verifier.v1",
+         admitted[PROOF_ADMITTED_PACKAGE_VERIFY]},
+        {"zcl.dev_proof_test_node.v1", admitted[PROOF_ADMITTED_NODE_ALIAS]},
+        {"zcl.dev_proof_dev_node.v1", admitted[PROOF_ADMITTED_DEV_NODE]},
+        {"zcl.dev_proof_nodectl.v1", built[0]},
+        {"zcl.dev_proof_acme_worker.v1", built[1]},
+        {"zcl.dev_proof_fbsh.v1", built[2]},
+        {"zcl.dev_proof_file_size_policy.v1", built[3]},
+        {"zcl.dev_proof_board_bridge.v1", built[4]},
+        {"zcl.dev_proof_git_hook.v1", built[5]},
+        {"zcl.dev_proof_lint_tool.v1", built[6]},
+    };
+    uint8_t roots[PROOF_HELPER_INPUT_COUNT][32];
+    if (!dp_helper_roots(inputs, PROOF_HELPER_INPUT_COUNT, roots)) {
+        proof_why(why, why_len, "proof_test_helper_hash_failed");
+        return false;
+    }
+    /* Named, because the digest's membership is the contract: a reader --
+     * and the lint-gate self-test that pins this block -- must be able to
+     * see each artifact go in by name, not by index. */
+    const uint8_t *runner_root = roots[0], *verifier_root = roots[1];
+    const uint8_t *node_root = roots[2], *dev_node_root = roots[3];
+    const uint8_t *nodectl_root = roots[4], *acme_root = roots[5];
+    const uint8_t *fbsh_root = roots[6], *file_size_policy_root = roots[7];
+    const uint8_t *board_bridge_root = roots[8], *git_hook_root = roots[9];
+    const uint8_t *lint_tool_root = roots[10];
+    struct sha3_256_ctx helpers;
+    hash_begin(&helpers, "zcl.dev_proof_test_helpers.v1");
+    sha3_256_write(&helpers, runner_root, 32);
+    sha3_256_write(&helpers, verifier_root, 32);
+    sha3_256_write(&helpers, node_root, 32);
+    sha3_256_write(&helpers, dev_node_root, 32);
+    sha3_256_write(&helpers, nodectl_root, 32);
+    sha3_256_write(&helpers, acme_root, 32);
+    sha3_256_write(&helpers, fbsh_root, 32);
+    sha3_256_write(&helpers, file_size_policy_root, 32);
+    sha3_256_write(&helpers, board_bridge_root, 32);
+    sha3_256_write(&helpers, git_hook_root, 32);
+    sha3_256_write(&helpers, lint_tool_root, 32);
+    sha3_256_write(&helpers, depfile_root, 32);
+    sha3_256_finalize(&helpers, helper_root);
+    return true;
+}
+
+static void test_receipt_bind_helpers(
+    struct zcl_dev_proof_dimension *test, const uint8_t helper_root[32])
+{
+    uint8_t test_root[32];
+    memcpy(test_root, test->receipt_root, sizeof(test_root));
+    struct sha3_256_ctx receipt;
+    hash_begin(&receipt, "zcl.dev_proof_test_child_with_helpers.v1");
+    sha3_256_write(&receipt, test_root, sizeof(test_root));
+    sha3_256_write(&receipt, helper_root, 32);
+    sha3_256_finalize(&receipt, test->receipt_root);
+}
+
+static bool receipt_store(const struct proof_paths *paths,
+                          struct zcl_dev_acceptance_receipt_v1 *receipt)
+{
+    uint8_t wire[ZCL_DEV_PROOF_WIRE_BYTES];
+    if (!proof_lease_current(paths)) return false;
+    for (size_t i = 0; i < ZCL_DEV_PROOF_DIMENSIONS; i++) {
+        struct zcl_dev_proof_dimension *dimension = &receipt->dimensions[i];
+        if (!dimension->selected) continue;
+        uint8_t child[ZCL_DEV_PROOF_CHILD_WIRE_BYTES];
+        if (!zcl_dev_proof_child_receipt_create(
+                (enum zcl_dev_proof_dimension_id)i, dimension, child))
+            return false;
+        char root[65], path[PATH_MAX];
+        zcl_hex_encode(dimension->receipt_root, ZCL_DEV_PROOF_ROOT_BYTES, root);
+        if (snprintf(path, sizeof(path), "%s/%s.child", paths->children,
+                     root) >= (int)sizeof(path))
+            return false;
+        struct stat st;
+        if (lstat(path, &st) == 0) {
+            uint8_t existing[ZCL_DEV_PROOF_CHILD_WIRE_BYTES];
+            if (!read_exact_file(path, existing, sizeof(existing)) ||
+                memcmp(existing, child, sizeof(child)) != 0)
+                return false;
+        } else if (errno != ENOENT ||
+                   !write_atomic(path, child, sizeof(child), 0400)) {
+            return false;
+        }
+    }
+    return proof_lease_current(paths) &&
+           zcl_dev_proof_receipt_child_set_root(
+               receipt, receipt->child_set_root) &&
+           zcl_dev_proof_receipt_seal(receipt) &&
+           zcl_dev_proof_receipt_serialize(receipt, wire) &&
+           proof_write_if_current(paths, paths->receipt, wire, sizeof(wire),
+                                  0400);
+}
+/* Every phase before the first dimension ran with no clock on it, so a proof
+ * that spent six minutes somewhere reported only that it took six minutes.
+ * These marks cost one gettime and one appended line each, and they name the
+ * phase that actually holds the wall — which is how a "the build is slow"
+ * report becomes a fixable defect instead of a feeling. */
+struct proof_phase_clock {
+    char     path[PATH_MAX];
+    int64_t  started_us;
+    int64_t  last_us;
+    bool     open;
+};
+
+static void proof_phase_begin(struct proof_phase_clock *clock,
+                              const struct proof_paths *paths)
+{
+    if (!clock) return;
+    memset(clock, 0, sizeof(*clock));
+    clock->started_us = platform_time_monotonic_us();
+    clock->last_us = clock->started_us;
+    if (!paths || snprintf(clock->path, sizeof(clock->path),
+                           "%s/phases.txt", paths->logs) >=
+                      (int)sizeof(clock->path))
+        return;
+    clock->open = true;
+}
+
+/* Best effort by design: a proof must never fail because it could not write
+ * its own stopwatch. A lost line costs the next reader one measurement. */
+static void proof_phase_mark(struct proof_phase_clock *clock, const char *name)
+{
+    if (!clock || !clock->open || !name) return;
+    int64_t now = platform_time_monotonic_us();
+    int64_t phase_ms = (now - clock->last_us) / 1000;
+    int64_t total_ms = (now - clock->started_us) / 1000;
+    clock->last_us = now;
+    FILE *out = fopen(clock->path, "ae");
+    if (!out) return;
+    (void)fprintf(out, "zcl.dev_proof_phase.v1 %-28s %8lld ms  (cumulative %8lld ms)\n",
+                  name, (long long)phase_ms, (long long)total_ms);
+    (void)fclose(out);
+}
+
+/* The warm-start sidecar: what the build reused, in flat grep-able
+ * lines beside the fixed-width receipt. The receipt wire schema is
+ * untouched — additive by a new artifact, not by repurposed fields: the
+ * seal still covers exactly the dimension roots, and old readers ignore
+ * the file. compile_mode is one of built, reused, skipped, failed. */
+static void warm_sidecar_write(const struct proof_paths *paths,
+                               const struct proof_warmstart *warm,
+                               const char *compile_mode,
+                               uint64_t compile_ms, uint64_t bundle_ms)
+{
+    char body[1024];
+    int len = paths && warm && compile_mode
+        ? snprintf(body, sizeof(body),
+                   "%s\nwarm=%d\ndonor=%s\ndonor_local=%s\nfiles_linked=%llu\n"
+                   "bytes_linked=%llu\ncompile_mode=%s\ncompile_ms=%llu\n"
+                   "bundle_ms=%llu\nreason=%s\n",
+                   PROOF_WARM_SIDECAR_SCHEMA, warm->armed ? 1 : 0,
+                   warm->armed ? warm->donor : "-",
+                   warm->armed ? warm->donor_local : "-",
+                   (unsigned long long)warm->files_linked,
+                   (unsigned long long)warm->bytes_linked, compile_mode,
+                   (unsigned long long)compile_ms,
+                   (unsigned long long)bundle_ms,
+                   warm->armed ? "-"
+                               : (warm->cold_reason[0] ? warm->cold_reason
+                                                        : "unknown"))
+        : -1;
+    if (len > 0 && len < (int)sizeof(body))
+        (void)write_atomic(paths->warmstart, body, (size_t)len, 0400);
+}
+
+/* The remainder of one proof worker, after the immutable generation and the
+ * changed set exist. Split out so the heap-resident changed set has exactly
+ * one owner and one release point across every refusal below. Takes the
+ * phase clock the outer worker already opened so build/capture and the rest
+ * of the proof share one cumulative timer, and the warm-start survey filled
+ * by generation_prepare() so the compile dimension can publish it. */
+#define PROOF_GROUPS_MAX \
+    (ZCL_DEVLOOP_MAX_PLAN_SELECTIONS * (ZCL_TEST_GROUP_FULL_MAX + 1))
+
+/* Everything one proof's steps hand each other. `paths` names the
+ * submitting checkout and `execution` the same path set with its root
+ * swapped for the generation, so each step can say which tree it means --
+ * the distinction that decides whether a `make` runs in the isolated
+ * generation or in the developer's own checkout. Nothing here is authority:
+ * the receipt is what this file publishes, and every field below is an
+ * input to it. */
+struct dp_worker {
+    const struct proof_paths *paths;
+    struct proof_paths execution;
+    const char *local;
+    const char *base;
+    const char *generation;
+    struct proof_phase_clock *phases;
+    const struct proof_warmstart *warm;
+    const struct zcl_dev_proof_changed_set *changed;
+    /* The docs-fresh checkers still running beside the read-only steps. */
+    struct dp_docs_fresh_run *docs;
+    bool inventory_only;
+    bool structure_widened;
+    struct zcl_devloop_plan plan;
+    char plan_json[ZCL_DEVLOOP_PLAN_WIRE_MAX];
+    size_t plan_len;
+    struct dev_source_record source_before;
+    char sealed_source_id[65];
+    char sealed_mutation_id[65];
+    struct zcl_dev_proof_build_identity_v1 identity;
+    struct zcl_dev_acceptance_receipt_v1 receipt;
+    char make_jobs[16];
+    char groups[PROOF_GROUPS_MAX];
+    char only[PROOF_GROUPS_MAX + 8];
+    /* Warm-start sidecar inputs, held here so the bundle step can rewrite
+     * the sidecar with both build phases timed. */
+    const char *warm_compile_mode;
+    uint64_t warm_compile_ms;
+    char binary[PATH_MAX];
+    char generation_binary[PATH_MAX];
+    char admitted[PROOF_ADMITTED_EXECUTABLE_COUNT][PATH_MAX];
+    uint8_t depfile_root[32];
+    uint8_t helper_root[32];
+    const char *lint_argv[PROOF_LINT_ARGV_CAP];
+    const char *lint_targets;
+    struct zcl_dev_proof_budget lint_budget;
+    bool lint_reads_artifacts;
+    bool bundle_built_prefork;
+    /* Observation authority. Null until dp_check_resolve derives a
+     * receiver, domain, and policy from the closure and this attempt's
+     * signer, or a caller already holds a store (the seam). */
+    const struct vcs_proof_receiver *check_receiver;
+    const struct vcs_proof_candidate_domain *check_domain;
+    const struct vcs_proof_reuse_policy *check_policy;
+    bool check_derived;
+    bool check_local_signer;
+    uint8_t check_derived_policy[32];
+    uint8_t check_derived_author[32];
+    char check_trust[64];
+    char check_admit_reason[160];
+    struct zcl_dev_proof_check_inputs check_inputs;
+    uint32_t test_children_started;
+};
+
+/* A warm generation may carry depfiles for inputs just retimed to force a
+ * rebuild. On an include-graph refusal, build the existing full bundle once
+ * before asking again; the resulting current epochs describe these bytes. */
+static bool dp_worker_refresh_include_graph(struct dp_worker *w,
+                                            char *why, size_t why_len)
+{
+    /* This build writes into the generation the checkers are reading. */
+    if (!dp_docs_fresh_settle(w->docs, w->paths, why, why_len)) return false;
+    char jobs[16];
+    if (!proof_make_jobs_arg(jobs)) {
+        proof_why(why, why_len, "proof_job_count_unavailable");
+        return false;
+    }
+    const char *argv[] = {"make", "--no-print-directory", jobs,
+                          "dev-proof-bundle-prefork", NULL};
+    struct zcl_dev_proof_budget budget =
+        proof_step_budget(w->paths, "bundle", PROOF_BUNDLE_DEFAULT_MS);
+    if (run_step(w->paths, w->generation, w->paths->bundle_log,
+                 argv, "bundle", &budget, NULL) != 0) {
+        proof_why(why, why_len, "proof_closure_refresh_build_failed");
+        return false;
+    }
+    w->bundle_built_prefork = true;
+    proof_phase_mark(w->phases, "closure_refresh_build");
+    return true;
+}
+
+/* A structural change widens the closed plan to the full closure before it
+ * is rendered, so the plan digest in the receipt says what actually ran, and
+ * phases.txt names the row that forced it, or the path-group cap the plan
+ * already widened on. */
+static void dp_worker_widen(struct dp_worker *w, size_t file_count)
+{
+    w->structure_widened =
+        dp_changed_set_widen(w->changed, &w->plan, &w->inventory_only);
+    if (!w->paths->phases[0]) return;
+    char note[PROOF_CHANGED_PATH_MAX + 96];
+    if (w->structure_widened)
+        (void)snprintf(note, sizeof(note),
+                       "widened reason=changed_input_structure path=%s "
+                       "rows=%zu", w->changed->structural_path,
+                       w->changed->structural_count);
+    else if (w->plan.path_universal)
+        (void)snprintf(note, sizeof(note),
+                       "widened reason=path_group_cap rows=%zu cap=%d",
+                       file_count, ZCL_DEVLOOP_MAX_PLAN_GROUPS);
+    else
+        return;
+    (void)zcl_dev_proof_phase_note(w->paths->phases, "changed_set", note);
+}
+
+/* Deletion is authority from the exact Git diff, not from a failed stat.
+ * Even an all-deleted set must establish a current trustworthy include graph.
+ * The full changed path floor and structural full-catalog selector remain. */
+static void dp_deleted_graph_check(const char *root, struct zcl_devloop_plan *plan)
+{
+    struct codeindex *ci = codeindex_open(root);
+    struct zcl_devloop_dim_state *dim = &plan->dims[ZCL_DEVLOOP_DIM_INCLUDE];
+    const char *reason = NULL;
+    enum zcl_devloop_dim_status status = ZCL_DEVLOOP_DIM_UNAVAILABLE;
+    char cause[ZCL_DEVLOOP_CAUSE_MAX] = "";
+    if (!ci) reason = "no-code-index";
+    else if (codeindex_include_unsafe_cause(ci, cause, sizeof cause)) {
+        reason = "closure-truncated";
+        status = ZCL_DEVLOOP_DIM_INCOMPLETE;
+    } else if (codeindex_include_edge_count(ci) <= 0) reason = "no-include-graph";
+    if (ci) codeindex_close(ci);
+    if (!reason) return;
+    dim->status = status;
+    dim->reason = reason;
+    (void)snprintf(dim->cause, sizeof dim->cause, "%s", cause);
+    plan->closure_truncated = true;
+}
+
+static bool dp_changed_set_close(const char *root,
+    const struct zcl_dev_proof_changed_set *set,
+    struct zcl_devloop_plan *plan, const char **reason)
+{
+    const char *const *current = set->current_files
+        ? set->current_files : set->files;
+    size_t count = set->current_files ? set->current_count : set->count;
+    if (!zcl_devloop_plan_add_closure(root, current, count, plan)) return false;
+    if (set->current_files && count < set->count)
+        dp_deleted_graph_check(root, plan);
+    return zcl_devloop_plan_proof_admissible(plan, reason);
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_changed_set_close(const char *root,
+    const struct zcl_dev_proof_changed_set *set,
+    struct zcl_devloop_plan *plan, const char **reason)
+{
+    if (!set || !zcl_devloop_plan_files(set->files, set->count, plan))
+        return false;
+    bool admitted = dp_changed_set_close(root, set, plan, reason);
+    bool inventory_only = false;
+    if (admitted) (void)dp_changed_set_widen(set, plan, &inventory_only);
+    return admitted;
+}
+#endif
+
+/* The impact plan, closed and rendered once after any needed graph refresh. */
+static bool dp_worker_plan(struct dp_worker *w, const char *const *files,
+                           size_t file_count, char *why, size_t why_len)
+{
+    const struct zcl_dev_proof_changed_set legacy = {
+        .files = (const char **)files, .count = file_count
+    };
+    const struct zcl_dev_proof_changed_set *changed =
+        w->changed ? w->changed : &legacy;
+    if (!zcl_devloop_plan_files(files, file_count, &w->plan)) {
+        proof_why(why, why_len, "impact_plan_invalid");
+        return false;
+    }
+    const char *admission_reason = "";
+    bool admitted = dp_changed_set_close(w->generation, changed,
+                                         &w->plan, &admission_reason);
+    if (!admitted && admission_reason &&
+        (strcmp(admission_reason, "closure-truncated") == 0 ||
+         strcmp(admission_reason, "no-include-graph") == 0)) {
+        if (!dp_worker_refresh_include_graph(w, why, why_len)) return false;
+        if (!zcl_devloop_plan_files(files, file_count, &w->plan)) {
+            proof_why(why, why_len, "impact_plan_invalid_after_refresh");
+            return false;
+        }
+        admission_reason = "";
+        admitted = dp_changed_set_close(w->generation, changed,
+                                        &w->plan, &admission_reason);
+    }
+    if (!admitted) {
+        /* Report the final plan, including any graph refresh, rather than
+         * replacing its exact refusal with a generic failure. */
+        char refusal[256] = "";
+        if (admission_reason && admission_reason[0])
+            (void)zcl_devloop_plan_refusal_text(&w->plan, refusal,
+                                                sizeof refusal);
+        proof_why(why, why_len,
+                  refusal[0] ? refusal : "impact_plan_incomplete");
+        return false;
+    }
+    proof_phase_mark(w->phases, "impact_plan_closure");
+    dp_worker_widen(w, file_count);
+    /* Render the plan we just closed. The _closure spelling would open the
+     * code index and re-walk the whole reverse-caller graph to rebuild the
+     * plan sitting in this frame -- the most expensive phase of the proof,
+     * paid twice for one answer. */
+    w->plan_len = zcl_devloop_plan_json_render(
+        &w->plan, files, file_count, w->plan_json, sizeof(w->plan_json));
+    if (!w->plan_len) {
+        proof_why(why, why_len, "impact_plan_render_failed");
+        return false;
+    }
+    proof_phase_mark(w->phases, "impact_plan_render");
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+/* Exercise planning after admission, without the submitting-checkout guards
+ * or publishing proof evidence. The real docs checker lifecycle is retained. */
+bool zcl_dev_proof_test_worker_plan(const char *submit, const char *generation,
+    const char *const *files, size_t count, bool check_docs,
+    char *json, size_t json_cap, char *why, size_t why_len)
+{
+    struct dp_worker *w = zcl_calloc(1, sizeof(*w), "proof_plan_seam");
+    if (!w) {
+        proof_why(why, why_len, "proof_plan_seam_allocation_failed");
+        return false;
+    }
+    struct proof_paths paths = {0};
+    struct dp_docs_fresh_run docs = {0};
+    (void)snprintf(paths.root, sizeof(paths.root), "%s", submit);
+    (void)snprintf(paths.bundle_log, sizeof(paths.bundle_log),
+                   "%s/closure-refresh.log", generation);
+    w->paths = &paths;
+    w->generation = generation;
+    w->docs = &docs;
+    bool ok = !check_docs || dp_docs_fresh_start(&docs, generation, generation,
+        DP_DOCS_FRESH_TIMEOUT_MS, why, why_len);
+    if (ok) ok = dp_worker_plan(w, files, count, why, why_len);
+    ok = dp_worker_docs_verdict(&docs, &paths, ok, why, why_len);
+    if (ok && w->plan_len < json_cap)
+        memcpy(json, w->plan_json, w->plan_len + 1);
+    else if (ok) {
+        proof_why(why, why_len, "proof_plan_seam_output_small");
+        ok = false;
+    }
+    free(w);
+    return ok;
+}
+#endif
+
+/* The source identity this proof is about, sealed so every later step can
+ * be checked against the same answer. */
+static bool dp_worker_seal_source(struct dp_worker *w, char *why,
+                                  size_t why_len)
+{
+    if (!worktree_exact(w->paths->root, w->local, true, why, why_len))
+        return false;
+    proof_phase_mark(w->phases, "worktree_exact_recheck");
+    if (!zcl_dev_source_identity_capture(w->generation, &w->source_before, why,
+                                         why_len)) {
+        if (!why || !why[0])
+            proof_why(why, why_len, "source_identity_capture_failed");
+        return false;
+    }
+    if (!w->source_before.cas_present) {
+        proof_why(why, why_len, "source_cas_capture_failed");
+        return false;
+    }
+    proof_phase_mark(w->phases, "source_identity_capture");
+    memcpy(w->sealed_source_id, w->source_before.source_id,
+           sizeof(w->sealed_source_id));
+    memcpy(w->sealed_mutation_id, w->source_before.mutation_id,
+           sizeof(w->sealed_mutation_id));
+    return true;
+}
+
+/* The commit pair, the source roots and the changed set, into the receipt. */
+static bool dp_worker_receipt_identity(struct dp_worker *w, char *why,
+                                       size_t why_len)
+{
+    struct zcl_dev_acceptance_receipt_v1 *receipt = &w->receipt;
+    if (!zcl_dev_proof_oid_decode(w->local, receipt->local_commit,
+                                  &receipt->local_commit_len) ||
+        !zcl_dev_proof_oid_decode(w->base, receipt->remote_base,
+                                  &receipt->remote_base_len) ||
+        !zcl_hex_decode_lower(w->source_before.cas_root_sha3,
+                              receipt->source_cas_root, 32) ||
+        !zcl_hex_decode_lower(w->source_before.mutation_id,
+                              receipt->mutation_root, 32)) {
+        proof_why(why, why_len, "proof_identity_decode_failed");
+        return false;
+    }
+    hash_text("zcl.dev_proof_git_source.v1", w->local, strlen(w->local),
+              receipt->source_root);
+    if (!hash_file("zcl.dev_proof_changed_set.v1", w->paths->changed,
+                   receipt->changed_set_root)) {
+        proof_why(why, why_len, "changed_set_hash_failed");
+        return false;
+    }
+    return true;
+}
+
+/* The impact policy, the four build-identity roots, and the impact plan
+ * digest that binds the policy to the plan this proof actually ran. */
+static bool dp_worker_build_identity(struct dp_worker *w, char *why,
+                                     size_t why_len)
+{
+    char policy_path[PATH_MAX];
+    struct dev_source_record original_plan_source = {0};
+    if (snprintf(policy_path, sizeof(policy_path),
+                 "%s/cognition/controllers/include/controllers/agent_impact_rules.def",
+                 w->generation) >= (int)sizeof(policy_path) ||
+        !hash_file("zcl.dev_proof_impact_policy.v1", policy_path,
+                   w->receipt.impact_policy_root)) {
+        proof_why(why, why_len, "proof_toolchain_or_policy_unavailable");
+        return false;
+    }
+    if (!proof_build_identity_capture(w->paths->root, &w->identity,
+                                       original_plan_source.mutation_id,
+                                       why, why_len)) {
+        /* Keep the exact restart-plan diagnostic when capture supplied it. */
+        if (!why || !why[0])
+            proof_why(why, why_len, "proof_toolchain_or_policy_unavailable");
+        return false;
+    }
+    /* BASE_GENERATION names this plan's own source metadata, not the
+     * independent generation's inode/timestamp token. Check it locally
+     * before accepting the portable flags and graph as requested inputs. */
+    if (!zcl_dev_source_mutation_verify(w->paths->root, &original_plan_source,
+                                        why, why_len)) {
+        fprintf(stderr, "[devproof] original build plan: source mutation no longer matches\n");
+        proof_why(why, why_len, "proof_original_build_plan_source_changed");
+        return false;
+    }
+    /* The same four roots the warm-start donor marker seals, from the same
+     * call: the receipt and the donor gate cannot disagree about what this
+     * build was. */
+    memcpy(w->receipt.compiler_root, w->identity.compiler, 32);
+    memcpy(w->receipt.flags_root, w->identity.flags, 32);
+    memcpy(w->receipt.environment_root, w->identity.environment, 32);
+    memcpy(w->receipt.build_graph_root, w->identity.build_graph, 32);
+    struct sha3_256_ctx impact;
+    hash_begin(&impact, "zcl.dev_proof_impact_plan.v1");
+    sha3_256_write(&impact, w->receipt.impact_policy_root, 32);
+    sha3_256_write(&impact, (const uint8_t *)w->plan_json, w->plan_len);
+    sha3_256_finalize(&impact, w->receipt.impact_policy_root);
+    return true;
+}
+
+/* Which dimensions this proof runs, and the exact test selector. */
+static bool dp_worker_select(struct dp_worker *w, char *why, size_t why_len)
+{
+    struct zcl_dev_proof_dimension *dims = w->receipt.dimensions;
+    if (!proof_make_jobs_arg(w->make_jobs)) {
+        proof_why(why, why_len, "proof_job_count_unavailable");
+        return false;
+    }
+    dims[ZCL_DEV_PROOF_GENERATED].selected = w->inventory_only ? 1 : 0;
+    bool compile_selected = !w->inventory_only && !w->plan.docs_only;
+    dims[ZCL_DEV_PROOF_COMPILE].selected = compile_selected ? 1 : 0;
+    dims[ZCL_DEV_PROOF_LINT].selected = 1;
+    uint32_t test_count = 0;
+    char host_gated[PROOF_HOST_GATED_MAX] = {0};
+    /* w->execution.root is the generation the test dimension execs in; the
+     * host needs must be asked of that tree, never of the submitting
+     * checkout, or a dev box's binaries would excuse a generation that has
+     * none. */
+    if (!build_test_selector(&w->plan, w->execution.root, w->inventory_only,
+                             w->groups, sizeof(w->groups), &test_count,
+                             host_gated, sizeof(host_gated))) {
+        proof_why(why, why_len, "test_selection_invalid_or_truncated");
+        return false;
+    }
+    dims[ZCL_DEV_PROOF_TEST].selected = test_count;
+    /* Say why the run is this large, in a file a reader finds beside the test
+     * log. Without this a universal selection looks like an unexplained
+     * whole-catalog run. */
+    if (!proof_note_test_selection(&w->execution, &w->plan,
+                                   w->structure_widened, test_count,
+                                   host_gated)) {
+        proof_why(why, why_len, "test_selection_note_unwritable");
+        return false;
+    }
+    return true;
+}
+
+static bool dp_dim_generated(struct dp_worker *w,
+                             struct zcl_dev_proof_dimension *generated,
+                             char *why, size_t why_len)
+{
+    if (!generated->selected) {
+        unused_dimension(ZCL_DEV_PROOF_GENERATED, generated);
+        return true;
+    }
+    const char *argv[] = {"make", "--no-print-directory", w->make_jobs,
+                          "check-capability-inventory-generated", NULL};
+    struct zcl_dev_proof_budget budget = proof_step_budget(
+        w->paths, "generated", PROOF_GENERATED_DEFAULT_MS);
+    return run_dimension(&w->execution, ZCL_DEV_PROOF_GENERATED, argv,
+                         generated, false, &budget, why, why_len);
+}
+
+/* Reuse the submitting checkout's executable when its content matches the
+ * sealed source; otherwise build in the generation and publish the donor
+ * marker. Either way the sidecar says which happened. */
+static bool dp_dim_compile(struct dp_worker *w,
+                           struct zcl_dev_proof_dimension *compile,
+                           char *why, size_t why_len)
+{
+    if (!compile->selected) {
+        unused_dimension(ZCL_DEV_PROOF_COMPILE, compile);
+        warm_sidecar_write(w->paths, w->warm, "skipped", 0, 0);
+        return true;
+    }
+    char artifact[PATH_MAX];
+    w->warm_compile_mode = "reused";
+    int artifact_len = snprintf(artifact, sizeof(artifact),
+                                "%s/build/bin/z23-dev", w->paths->root);
+    if (artifact_len <= 0 || (size_t)artifact_len >= sizeof(artifact) ||
+        !executable_reuse(w->paths, artifact,
+                          &w->source_before, compile, NULL, 0)) {
+        w->warm_compile_mode = "built";
+        int64_t build_us0 = platform_time_monotonic_us();
+        const char *argv[] = {"make", "--no-print-directory", w->make_jobs,
+                              "build-only", NULL};
+        struct zcl_dev_proof_budget budget = proof_step_budget(
+            w->paths, "compile", PROOF_COMPILE_DEFAULT_MS);
+        bool built = run_dimension(&w->execution, ZCL_DEV_PROOF_COMPILE,
+                                   argv, compile, false, &budget, why,
+                                   why_len);
+        w->warm_compile_ms = (uint64_t)((platform_time_monotonic_us() -
+                                         build_us0) / 1000);
+        if (!built) {
+            warm_sidecar_write(w->paths, w->warm, "failed",
+                               w->warm_compile_ms, 0);
+            return false;
+        }
+        /* The build finished for this commit: publish the donor
+         * marker for the next generation. Best effort: a missing
+         * marker only costs the next proof a cold build. */
+        (void)warm_marker_write(w->generation, w->paths->root, w->local,
+                                w->base);
+    }
+    warm_sidecar_write(w->paths, w->warm, w->warm_compile_mode,
+                       w->warm_compile_ms, 0);
+    return true;
+}
+
+/* The lint dimension's argv, budget and targets, and the two dimensions
+ * that are not selected marked unused. */
+static bool dp_worker_lint_plan(struct dp_worker *w,
+                                struct zcl_dev_proof_dimension *lint,
+                                struct zcl_dev_proof_dimension *test,
+                                char *why, size_t why_len)
+{
+    int64_t lint_fallback_ms = PROOF_LINT_LANDING_MS;
+    w->lint_targets = "lint";
+    if (!proof_lint_prepare(w->paths->root, w->make_jobs, w->lint_argv,
+                            PROOF_LINT_ARGV_CAP, &lint_fallback_ms,
+                            &w->lint_targets)) {
+        proof_why(why, why_len, "lint_argv_invalid");
+        return false;
+    }
+    w->lint_budget = proof_step_budget(w->paths, "lint", lint_fallback_ms);
+    if (lint->selected && w->paths->phases[0])
+        (void)zcl_dev_proof_phase_note(w->paths->phases, "lint_targets",
+                                       w->lint_targets);
+    if (!lint->selected) unused_dimension(ZCL_DEV_PROOF_LINT, lint);
+    if (!test->selected) unused_dimension(ZCL_DEV_PROOF_TEST, test);
+    /* Only the full gate set reads built artifacts (check-capability-
+     * closure walks the undefined symbols of build/bin/z23-dev, and the
+     * `lint:` umbrella names it and the confined package verifier as its
+     * own prerequisites), so every publishable proof needs the admitted
+     * executables, including a proof with no selected tests. */
+    w->lint_reads_artifacts =
+        lint->selected && proof_lint_targets_are_full(w->lint_targets);
+    return true;
+}
+
+/* Everything that must still be true of the source before a test runner is
+ * launched, plus the environment and the --exact argument it runs under.
+ * The two identity rechecks are the reason a source edit during a proof
+ * cannot be admitted by it. */
+static bool dp_worker_test_env(struct dp_worker *w, char *why, size_t why_len)
+{
+    if (strcmp(w->source_before.source_id, w->sealed_source_id) != 0 ||
+        strcmp(w->source_before.mutation_id, w->sealed_mutation_id) != 0) {
+        proof_whyf(
+            why, why_len,
+            "proof_saved_source_identity_changed_source_actual_%.16s_sealed_%.16s"
+            "_mutation_actual_%.16s_sealed_%.16s",
+            w->source_before.source_id, w->sealed_source_id,
+            w->source_before.mutation_id, w->sealed_mutation_id);
+        return false;
+    }
+    struct dev_source_record generation_checkpoint = {0};
+    char checkpoint_why[160] = {0};
+    if (!zcl_dev_source_identity_capture(
+            w->generation, &generation_checkpoint, checkpoint_why,
+            sizeof(checkpoint_why))) {
+        proof_whyf(why, why_len,
+                   "proof_generation_source_checkpoint_%s",
+                   checkpoint_why[0] ? checkpoint_why : "failed");
+        return false;
+    }
+    if (strcmp(generation_checkpoint.source_id, w->sealed_source_id) != 0 ||
+        strcmp(generation_checkpoint.mutation_id,
+               w->sealed_mutation_id) != 0) {
+        proof_whyf(
+            why, why_len,
+            "proof_generation_source_identity_changed_source_actual_%.16s_sealed_%.16s"
+            "_mutation_actual_%.16s_sealed_%.16s",
+            generation_checkpoint.source_id, w->sealed_source_id,
+            generation_checkpoint.mutation_id, w->sealed_mutation_id);
+        return false;
+    }
+    if (!proof_stress_tests_env_prepare(why, why_len)) return false;
+    /* No ZCL_TESTCACHE_STORE_ROOT: pointing the runner at the submitting
+     * checkout's store let every proof read, and admit, PASS records the
+     * candidate's own tests could write. proof_prepare_environment() has
+     * already removed any inherited value. */
+    if (snprintf(w->only, sizeof(w->only), "--exact=%s", w->groups) >=
+        (int)sizeof(w->only)) {
+        proof_why(why, why_len, "test_selection_invalid_or_truncated");
+        return false;
+    }
+    return true;
+}
+
+/* The fixed result.c receiver (tools/dev/verify_receiver.h) around the one
+ * make that compiles the test-fast tree. This driver, not the candidate's
+ * zcc or Makefile, admits a separate-account observation, and after make
+ * rehashes what was published. With no installed verifier it costs one
+ * missing-key check and records object_reuse_admit=cold(no_verifier_key).
+ * A contradiction (a signed FAIL, conflicting observations, served bytes
+ * that are not the admitted ones) fails the step: block(<token>). */
+static bool dp_receiver_end(const struct dp_worker *w,
+                            struct zcl_verify_receiver *rx,
+                            char *why, size_t why_len)
+{
+    bool env_ok = zcl_verify_receiver_env_clear();
+    zcl_verify_receiver_finish(rx);
+    (void)zcl_verify_receiver_phases_write(rx, w->paths->phases);
+    bool blocked = rx->verdict == ZCL_VERIFY_RECEIVER_BLOCK;
+    if (blocked)
+        proof_whyf(why, why_len, "object_reuse_blocked_%s", rx->reason);
+    else if (!env_ok)
+        proof_why(why, why_len, "object_reuse_environment_unavailable");
+    zcl_verify_receiver_release(rx);
+    return env_ok && !blocked;
+}
+
+static bool dp_receiver_begin(const struct dp_worker *w,
+                              struct zcl_verify_receiver *rx,
+                              char *why, size_t why_len)
+{
+    char work[PATH_MAX];
+    struct zcl_verify_attest_box_key box;
+    zcl_verify_receiver_box_key(&box);
+    if (snprintf(work, sizeof(work), "%s/receiver.%s", w->paths->state,
+                 w->paths->key) >= (int)sizeof(work))
+        work[0] = 0;
+    zcl_verify_receiver_prepare(w->generation, work, &box, rx);
+    if (rx->verdict != ZCL_VERIFY_RECEIVER_BLOCK &&
+        zcl_verify_receiver_env_apply(rx))
+        return true;
+    (void)dp_receiver_end(w, rx, why, why_len);
+    if (why && !why[0])
+        proof_why(why, why_len, "object_reuse_environment_unavailable");
+    return false;
+}
+
+/* The bundle make, retried once after a recovery-admission race. `*rc` is
+ * make's status; `*first_ms` times the first attempt only (a recovery
+ * rerun is rare and stays visible in the retry log). False, with `why`
+ * set, only when the retry log path does not fit. */
+static bool dp_worker_bundle_make(struct dp_worker *w, int *rc,
+                                  uint64_t *first_ms, char *why,
+                                  size_t why_len)
+{
+    /* Both sets are needed before either dimension starts. One Make goal
+     * schedules the independent lint tools alongside the test bundle with
+     * the same dev/test-fast epochs and depfiles as dev-proof-bundle. */
+    const char *bundle_argv[] = {
+        "make", "--no-print-directory", w->make_jobs,
+        "dev-proof-bundle-prefork", NULL};
+    struct zcl_dev_proof_budget bundle_budget =
+        proof_step_budget(w->paths, "bundle", PROOF_BUNDLE_DEFAULT_MS);
+    int64_t bundle_us0 = platform_time_monotonic_us();
+    *rc = run_step(w->paths, w->generation, w->paths->bundle_log,
+                   bundle_argv, "bundle", &bundle_budget, NULL);
+    *first_ms = (uint64_t)((platform_time_monotonic_us() - bundle_us0) /
+                           1000);
+    if (*rc == 0 || !proof_log_contains(
+            w->paths->bundle_log,
+            "unverified compile epoch appeared after recovery "
+            "admission; rerun make"))
+        return true;
+    char retry_log[PATH_MAX];
+    if (snprintf(retry_log, sizeof(retry_log), "%s.retry",
+                 w->paths->bundle_log) >= (int)sizeof(retry_log)) {
+        proof_why(why, why_len, "proof_bundle_retry_log_invalid");
+        return false;
+    }
+    *rc = run_step(w->paths, w->generation, retry_log, bundle_argv, "bundle",
+                   &bundle_budget, NULL);
+    return true;
+}
+
+/* The submitting checkout could not supply an admissible runner
+ * or helper set: build one in the generation and re-admit. */
+static bool dp_worker_bundle(struct dp_worker *w, bool test_selected,
+                             char *why, size_t why_len)
+{
+    if (why && why_len > 0) why[0] = 0;
+    struct zcl_verify_receiver rx;
+    if (!dp_receiver_begin(w, &rx, why, why_len)) return false;
+    int bundle_rc = 0;
+    uint64_t bundle_ms = 0;
+    bool made = dp_worker_bundle_make(w, &bundle_rc, &bundle_ms, why, why_len);
+    bool received = dp_receiver_end(w, &rx, made ? why : NULL,
+                                    made ? why_len : 0);
+    if (!made) return false;
+    if (bundle_rc != 0) {
+        proof_why(why, why_len, "proof_bundle_build_failed");
+        return false;
+    }
+    if (!received) return false;
+    w->bundle_built_prefork = true;
+#if defined(__APPLE__)
+    /* Compare the executed bundle's plan to the requested
+     * flags and graph, binding its mutation token to this
+     * generation's own source metadata. */
+    if (!zcl_dev_proof_build_plan_verify(
+            w->generation, &w->identity, w->sealed_mutation_id,
+            why, why_len)) {
+        return false;
+    }
+#endif
+    if (!test_binary_path(&w->execution, w->binary) ||
+        !proof_generation_inputs_prepare(
+            &w->execution, w->generation, &w->source_before,
+            test_selected, w->lint_reads_artifacts, w->binary,
+            w->generation_binary, w->admitted, w->depfile_root, why,
+            why_len)) {
+        if (!why || !why[0])
+            proof_why(why, why_len, "proof_bundle_admission_failed");
+        return false;
+    }
+    /* A landing proof reaches here with the compile dimension reused, so
+     * its build-only branch never ran and never wrote the donor marker —
+     * without this write no land-lane generation could donate and every
+     * measured landing seeded cold (warm=0 reason=no_eligible_donor). The
+     * bundle just built this generation's tree for this commit under the
+     * sealed identity, which is exactly what the marker certifies. Best
+     * effort, same as the compile dimension's own write. */
+    (void)warm_marker_write(w->generation, w->paths->root, w->local,
+                            w->base);
+    /* Both build phases are timed now: refresh the sidecar so the
+     * receipt directory carries the full compile story. */
+    warm_sidecar_write(w->paths, w->warm, w->warm_compile_mode,
+                       w->warm_compile_ms, bundle_ms);
+    return true;
+}
+
+/* EVERYTHING EITHER DIMENSION BUILDS OR IS HANDED HAPPENS HERE,
+ * BEFORE THE FORK, IN ONE SEQUENCE: the shared admitted executables,
+ * the test runner, the depfile tree, and then a single `make` that
+ * builds the helper executables and -- for a landing, whose lint
+ * dimension runs the whole gate set -- every target that gate set
+ * can build. After the fork the lint dimension's make has nothing
+ * left to link and the test dimension runs no make at all, so
+ * neither can relink a file the other is reading. Two makes in one
+ * generation worktree race each other's build epochs, and a relink
+ * unlinks its output before writing it: that is how a landing
+ * proof's lint-gate shard exec'd a half-written build/bin/z23-lint
+ * and got rc=127 twice.
+ *
+ * Admission is content-checked against the sealed source identity and
+ * marks each entry fresh. If the bundle is missing, its single build
+ * also prepares lint tools before either child forks. A reusable bundle
+ * still takes the separate prefork build path below. */
+static void dp_stage_timing_note(const struct proof_paths *paths,
+                                  const char *field, int64_t started_us)
+{
+    if (!paths || !paths->phases[0]) return;
+    int64_t elapsed_ms =
+        (platform_time_monotonic_us() - started_us) / 1000;
+    char value[32];
+    int n = snprintf(value, sizeof(value), "%lld", (long long)elapsed_ms);
+    if (elapsed_ms >= 0 && n > 0 && (size_t)n < sizeof(value))
+        (void)zcl_dev_proof_phase_note(paths->phases, field, value);
+}
+
+/* Name the failed need where `z23 dev proof status` and phases.txt show it:
+ * test_need_unbuildable_<target>, never a skip the accounting would refuse
+ * later under a vaguer name. */
+static void dp_test_need_unbuildable(const struct dp_worker *w,
+                                     const char *target, char *why,
+                                     size_t why_len)
+{
+    (void)snprintf(why, why_len, "test_need_unbuildable_%s", target);
+    if (w->paths->phases[0])
+        (void)zcl_dev_proof_phase_note(w->paths->phases,
+                                       "test_need_unbuildable", target);
+}
+
+/* Is the built need present in the generation as a regular file? */
+static bool dp_test_need_present(const char *generation, const char *value)
+{
+    char path[PATH_MAX];
+    struct stat st;
+    return dp_path_written(snprintf(path, sizeof(path), "%s/%s", generation,
+                                    value)) &&
+           stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* Unlink a need's path in the generation; already absent counts as done. */
+static bool dp_test_need_clear(const char *generation, const char *value)
+{
+    char path[PATH_MAX];
+    if (!dp_path_written(snprintf(path, sizeof(path), "%s/%s", generation,
+                                  value)))
+        return false;
+    return unlink(path) == 0 || errno == ENOENT;
+}
+
+#define PROOF_TEST_NEEDS_DEFAULT_MS 600000
+
+/* Build, in the generation and from its own sources, every Make target a
+ * selected group declares as a BUILD need (test_group_host_needs.def), alone
+ * and before the fork like the prefork step. A tool never copied in from
+ * another tree is the only kind a receipt may bind. A build that fails, or
+ * that exits 0 without producing the path the group execs, fails the proof
+ * by name. When no selected group declares one, nothing runs. */
+static bool dp_worker_test_needs(struct dp_worker *w, char *why,
+                                 size_t why_len)
+{
+    const char *argv[PROOF_TEST_NEEDS_ARGV_CAP];
+    const char *values[PROOF_TEST_NEEDS_ARGV_CAP];
+    size_t targets = 0;
+    if (!proof_test_needs_argv(w->make_jobs, w->groups, argv, values,
+                               PROOF_TEST_NEEDS_ARGV_CAP, &targets)) {
+        proof_why(why, why_len, "proof_test_needs_argv_invalid");
+        return false;
+    }
+    if (targets == 0) return true;
+    /* A warm generation seeds build/bin by COPY from the submitting checkout
+     * (warm_classify_rel), and these rules name only their own sources as
+     * prerequisites, so a seeded tool could read as fresh. Remove it: what
+     * the receipt binds is linked here, from this tree, or nothing is. */
+    for (size_t i = 3; i < 3 + targets; i++) {
+        if (dp_test_need_clear(w->generation, values[i])) continue;
+        proof_why(why, why_len, "proof_test_need_clear_failed");
+        return false;
+    }
+    struct zcl_dev_proof_budget budget = proof_step_budget(
+        w->paths, "test-needs", PROOF_TEST_NEEDS_DEFAULT_MS);
+    int rc = run_step(w->paths, w->generation, w->paths->test_needs_log, argv,
+                      "test-needs", &budget, NULL);
+    for (size_t i = 3; i < 3 + targets; i++) {
+        if (rc == 0 && dp_test_need_present(w->generation, values[i]))
+            continue;
+        dp_test_need_unbuildable(w, argv[i], why, why_len);
+        return false;
+    }
+    return true;
+}
+
+/* Fold every built need into the helper digest the test receipt is bound
+ * to, under its own domain and target name, so the receipt says which
+ * sensor bytes the selected groups exec'd. A selection with no BUILD need
+ * leaves the digest exactly as test_helpers_hash() wrote it. */
+static bool dp_test_needs_bind(const struct dp_worker *w,
+                               uint8_t helper_root[32], char *why,
+                               size_t why_len)
+{
+    const char *argv[PROOF_TEST_NEEDS_ARGV_CAP];
+    const char *values[PROOF_TEST_NEEDS_ARGV_CAP];
+    size_t targets = 0;
+    if (!proof_test_needs_argv(w->make_jobs, w->groups, argv, values,
+                               PROOF_TEST_NEEDS_ARGV_CAP, &targets)) {
+        proof_why(why, why_len, "proof_test_needs_argv_invalid");
+        return false;
+    }
+    if (targets == 0) return true;
+    struct sha3_256_ctx sha;
+    hash_begin(&sha, "zcl.dev_proof_test_helpers_with_needs.v1");
+    sha3_256_write(&sha, helper_root, 32);
+    for (size_t i = 3; i < 3 + targets; i++) {
+        char path[PATH_MAX];
+        uint8_t root[32];
+        if (!dp_path_written(snprintf(path, sizeof(path), "%s/%s",
+                                      w->generation, values[i])) ||
+            !hash_file("zcl.dev_proof_test_need.v1", path, root)) {
+            proof_why(why, why_len, "proof_test_need_hash_failed");
+            return false;
+        }
+        sha3_256_write(&sha, (const uint8_t *)argv[i], strlen(argv[i]) + 1);
+        sha3_256_write(&sha, root, sizeof(root));
+#if defined(__linux__) && defined(__x86_64__)
+        if (strcmp(argv[i], "clang-manifest") == 0) {
+            const char *lib = proof_clang_runtime_path();
+            if (lib) {
+                if (!hash_file("zcl.dev_proof_clang_runtime.v1", lib, root)) {
+                    proof_why(why, why_len, "proof_clang_runtime_hash_failed");
+                    return false;
+                }
+                sha3_256_write(&sha, (const uint8_t *)lib,
+                               strlen(lib) + 1);
+                sha3_256_write(&sha, root, sizeof(root));
+                if (strcmp(lib, PROOF_CLANG_ARCH_LIB) == 0) {
+                    if (!hash_file("zcl.dev_proof_clang_runtime.v1",
+                                   PROOF_CLANG_ARCH_LLVM, root)) {
+                        proof_why(why, why_len,
+                                  "proof_clang_runtime_hash_failed");
+                        return false;
+                    }
+                    sha3_256_write(&sha,
+                                   (const uint8_t *)PROOF_CLANG_ARCH_LLVM,
+                                   sizeof(PROOF_CLANG_ARCH_LLVM));
+                    sha3_256_write(&sha, root, sizeof(root));
+                }
+            }
+        }
+#endif
+    }
+    sha3_256_finalize(&sha, helper_root);
+    return true;
+}
+
+static bool dp_worker_prefork(struct dp_worker *w, bool test_selected,
+                              char *why, size_t why_len)
+{
+    int64_t stage_us = platform_time_monotonic_us();
+    bool inputs_ready = !test_selected || test_binary_path(w->paths, w->binary);
+    inputs_ready = inputs_ready &&
+        proof_generation_inputs_prepare(
+            w->paths, w->generation, &w->source_before, test_selected,
+            w->lint_reads_artifacts, w->binary, w->generation_binary,
+            w->admitted, w->depfile_root, why, why_len);
+    if (!inputs_ready) {
+        if (!dp_worker_bundle(w, test_selected, why, why_len)) return false;
+    }
+    dp_stage_timing_note(w->paths, "prefork_admission_ms", stage_us);
+    /* A reusable bundle may still need these tools. A newly built bundle
+     * already prepared them in the same Make graph. */
+    stage_us = platform_time_monotonic_us();
+    if (!w->bundle_built_prefork && (test_selected || w->lint_reads_artifacts) &&
+        !proof_prefork_build(w->paths, w->generation, w->make_jobs,
+                             w->lint_reads_artifacts, why, why_len))
+        return false;
+    dp_stage_timing_note(w->paths, "prefork_make_ms", stage_us);
+    stage_us = platform_time_monotonic_us();
+    if (test_selected && !dp_worker_test_needs(w, why, why_len)) return false;
+    dp_stage_timing_note(w->paths, "prefork_test_needs_ms", stage_us);
+    stage_us = platform_time_monotonic_us();
+    if (test_selected &&
+        (!test_helpers_hash(w->generation, w->generation_binary, w->admitted,
+                            w->depfile_root, w->helper_root, why, why_len) ||
+         !dp_test_needs_bind(w, w->helper_root, why, why_len)))
+        return false;
+    dp_stage_timing_note(w->paths, "prefork_helper_hash_ms", stage_us);
+    proof_phase_mark(w->phases, "prefork_inputs_and_build");
+    return true;
+}
+
+/* Say how long lint actually took, beside the targets it ran. The
+ * full gate set's cold cost inside a fresh generation -- dominated
+ * by check-standalone-tools-link, which is the one gate that runs
+ * `make` and links ~47 one-shot tools no compile dimension ever
+ * built -- is the number the landing budget is set against, so the
+ * next reader measures it instead of guessing. */
+static void dp_worker_lint_wall_note(const struct dp_worker *w,
+                                     const struct proof_dimension_run *runs,
+                                     size_t run_count)
+{
+    for (size_t i = 0; i < run_count; i++) {
+        char wall[32];
+        if (runs[i].id != ZCL_DEV_PROOF_LINT || !w->paths->phases[0])
+            continue;
+        if (snprintf(wall, sizeof(wall), "%lld",
+                     (long long)runs[i].step.report.elapsed_ms) <
+            (int)sizeof(wall))
+            (void)zcl_dev_proof_phase_note(w->paths->phases, "lint_wall_ms",
+                                           wall);
+    }
+}
+
+/* The test dimension's runner argv. `--no-cache` is the runner's explicit
+ * cold mode and outranks ZCL_TEST_CACHE, so no inherited or planted
+ * environment can turn verdict reuse back on: every selected group
+ * executes in this proof, and the runner opens no verdict store and stores
+ * nothing. A reused test verdict may shape acceptance only once a separate
+ * account outside the candidate's trust domain reproduces and signs it.
+ * With no such account the proof records
+ * `test-reuse: unqualified(no_verifier_account)` and runs cold. When the
+ * attempt holds that account, the worker derives this closure and asks
+ * admission before the child starts. Returns the argc written (argv
+ * NULL-terminated), or 0 when argv_cap is too small. */
+#define DP_TEST_DIMENSION_ARGC 4u
+static size_t dp_test_dimension_argv(const char *binary, const char *only,
+                                     const char **argv, size_t argv_cap)
+{
+    if (!binary || !binary[0] || !only || !only[0] || !argv ||
+        argv_cap < DP_TEST_DIMENSION_ARGC + 1)
+        return 0;
+    argv[0] = binary;
+    argv[1] = only;
+    argv[2] = "--no-cache";
+    argv[3] = "--activate-proof-contracts";
+    argv[4] = NULL;
+    return DP_TEST_DIMENSION_ARGC;
+}
+
+#if defined(ZCL_TESTING)
+size_t zcl_dev_proof_test_dimension_argv(const char *binary, const char *only,
+                                         const char **argv, size_t argv_cap)
+{
+    return dp_test_dimension_argv(binary, only, argv, argv_cap);
+}
+#endif
+
+/* The phases.txt line naming whether this proof may admit reused test
+ * verdicts. There is no verifier account for test verdicts yet, so the
+ * answer is always the same refusal; the line exists so a reader of
+ * phases.txt sees why the test dimension ran every group. */
+#define DP_TEST_REUSE_UNQUALIFIED \
+    "test-reuse: unqualified(no_verifier_account)"
+
+/* The longest lint is held back for the test runner's run-alone pass. That
+ * pass is about a minute for the whole exclusive set on a quiet box; the cap
+ * only bounds a runner that never prints its line, so lint cannot be held
+ * for the whole test run. */
+#define DP_LINT_HOLD_MAX_MS 180000
+
+/* Hosts with fewer available CPUs than this finish tests before lint. */
+#define DP_LINT_OVERLAP_MIN_CPUS 24u
+
+static bool dp_lint_waits_for_tests(uint32_t available_cpus)
+{
+    return available_cpus < DP_LINT_OVERLAP_MIN_CPUS;
+}
+
+/* Where the scan of a growing test log stands between polls. */
+struct dp_log_scan {
+    long offset;
+    bool mid_line;
+};
+
+/* True once the log holds a line starting with `prefix`. Only whole lines
+ * are consumed; a tail still being written is read again on the next poll. */
+static bool dp_log_line_seen(const char *path, const char *prefix,
+                             struct dp_log_scan *scan)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    bool seen = false;
+    char line[256];
+    bool placed = fseek(f, scan->offset, SEEK_SET) == 0;
+    while (placed && !seen && fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        bool whole = n > 0 && line[n - 1] == '\n';
+        if (!whole && n + 1 < sizeof(line)) break;
+        seen = !scan->mid_line && strncmp(line, prefix, strlen(prefix)) == 0;
+        scan->offset += (long)n;
+        scan->mid_line = !whole;
+    }
+    fclose(f);
+    return seen;
+}
+
+/* Why lint started when it did, and how long it was held. */
+struct dp_lint_hold {
+    const char *reason;
+    int64_t held_ms;
+};
+
+/* Hold lint while the test child runs. With `finish_tests_first` the whole
+ * test child finishes first; otherwise lint starts when the runner says its
+ * run-alone pass is over, the runner has finished, or the cap is reached. */
+static struct dp_lint_hold dp_lint_hold_wait(struct proof_dimension_run *test,
+                                             int64_t hold_max_ms,
+                                             bool finish_tests_first)
+{
+    int64_t began = platform_time_monotonic_ms();
+    struct dp_lint_hold hold = {.reason = "cap"};
+    if (finish_tests_first) {
+        dimension_runs_wait(test, 1);
+        hold.reason = "test_finished";
+        hold.held_ms = platform_time_monotonic_ms() - began;
+        return hold;
+    }
+    struct dp_log_scan scan = {0};
+    for (;;) {
+        if (dp_log_line_seen(test->log, ZCL_TEST_EXCLUSIVE_PASS_DONE, &scan)) {
+            hold.reason = "exclusive_pass_done";
+            break;
+        }
+        if (zcl_dev_proof_step_poll(&test->step)) {
+            hold.reason = "test_finished";
+            break;
+        }
+        if (platform_time_monotonic_ms() - began >= hold_max_ms) break;
+        platform_sleep_ms(20);
+    }
+    hold.held_ms = platform_time_monotonic_ms() - began;
+    return hold;
+}
+
+/* Everything one proof needs to start its lint and test children. */
+struct dp_dimension_plan {
+    const struct proof_paths *paths;
+    const char *root;
+    const char *const *lint_argv;
+    struct zcl_dev_proof_dimension *lint;
+    const struct zcl_dev_proof_budget *lint_budget;
+    const char *const *test_argv;
+    struct zcl_dev_proof_dimension *test;
+    const struct zcl_dev_proof_budget *test_budget;
+    int64_t hold_max_ms;
+    bool finish_tests_first;
+};
+
+/* Lint proves the source; the test dimension proves the built runner.
+ * Neither feeds the other. The runner starts first. On a host with enough
+ * CPUs lint overlaps the runner once its run-alone pass is over, so the proof
+ * pays for about the longer of the two; a smaller host finishes the runner
+ * before lint starts. runs[] keeps lint first, preserving the fail-closed
+ * order. On failure every child that did start has been waited on. */
+static bool dp_dimensions_launch(const struct dp_dimension_plan *p,
+                                 struct proof_dimension_run runs[2],
+                                 size_t *run_count, struct dp_lint_hold *hold,
+                                 char *why, size_t why_len)
+{
+    bool with_test = p->test->selected != 0;
+    struct proof_dimension_run *test = &runs[p->lint->selected ? 1 : 0];
+    *run_count = 0;
+    *hold = (struct dp_lint_hold){.reason = "no_test"};
+    if (with_test &&
+        !dimension_start(p->paths, p->root, test, ZCL_DEV_PROOF_TEST,
+                         p->test_argv, p->test, true, p->test_budget, why,
+                         why_len))
+        return false;
+    if (!p->lint->selected) {
+        *run_count = with_test ? 1 : 0;
+        return true;
+    }
+    if (with_test)
+        *hold = dp_lint_hold_wait(test, p->hold_max_ms, p->finish_tests_first);
+    if (!dimension_start(p->paths, p->root, &runs[0], ZCL_DEV_PROOF_LINT,
+                         p->lint_argv, p->lint, false, p->lint_budget, why,
+                         why_len)) {
+        if (with_test) {
+            dimension_runs_wait(test, 1);
+            (void)dimension_finish(p->paths, test, NULL, 0);
+        }
+        return false;
+    }
+    *run_count = with_test ? 2 : 1;
+    return true;
+}
+
+static void dp_lint_hold_note(const char *phases, const struct dp_lint_hold *h)
+{
+    char note[96];
+    if (phases && phases[0] &&
+        snprintf(note, sizeof(note), "%s ms=%lld", h->reason,
+                 (long long)h->held_ms) < (int)sizeof(note))
+        (void)zcl_dev_proof_phase_note(phases, "lint_hold", note);
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_lint_waits_for_tests(uint32_t available_cpus)
+{
+    return dp_lint_waits_for_tests(available_cpus);
+}
+
+bool zcl_dev_proof_dimensions_run_for_test(const char *logs_dir,
+                                           const char *const lint_argv[],
+                                           const char *const test_argv[],
+                                           int64_t hold_max_ms,
+                                           bool finish_tests_first,
+                                           int rcs[2], char *hold,
+                                           size_t hold_size)
+{
+    if (!logs_dir || !lint_argv || !test_argv || !rcs || !hold) return false;
+    struct proof_paths *paths =
+        zcl_calloc(1, sizeof(*paths), "dev_proof_dimension_seam_paths");
+    if (!paths) return false;
+    (void)snprintf(paths->logs, sizeof(paths->logs), "%s", logs_dir);
+    (void)snprintf(paths->key, sizeof(paths->key), "seam");
+    struct zcl_dev_proof_dimension lint = {.selected = 1}, test = {.selected = 1};
+    struct zcl_dev_proof_budget budget = {
+        .budget_ms = 60000, .ceiling_ms = 60000, .no_progress_ms = 60000};
+    struct dp_dimension_plan plan = {
+        .paths = paths, .root = ".", .lint_argv = lint_argv, .lint = &lint,
+        .lint_budget = &budget, .test_argv = test_argv, .test = &test,
+        .test_budget = &budget, .hold_max_ms = hold_max_ms,
+        .finish_tests_first = finish_tests_first};
+    struct proof_dimension_run runs[2];
+    size_t count = 0;
+    struct dp_lint_hold held;
+    char why[160] = {0};
+    bool ok = dp_dimensions_launch(&plan, runs, &count, &held, why,
+                                   sizeof(why)) && count == 2;
+    if (ok) {
+        dimension_runs_wait(runs, count);
+        rcs[0] = runs[0].step.report.rc;
+        rcs[1] = runs[1].step.report.rc;
+        (void)snprintf(hold, hold_size, "%s", held.reason);
+    }
+    free(paths);
+    return ok;
+}
+#endif
+
+/* One admitted CHECK obligation. `skip` holds the test child back only
+ * after admission vouches exactly one selected group. */
+struct dp_check_hold {
+    uint32_t selected;
+    bool skip;
+    uint8_t observation[32];
+};
+
+enum dp_check_choice {
+    DP_CHECK_LAUNCH = 0,
+    DP_CHECK_SKIP,
+    DP_CHECK_BLOCK
+};
+
+static void dp_check_bind(struct dp_worker *w)
+{
+    struct zcl_dev_proof_check_inputs *in = &w->check_inputs;
+    if (in->active) return;
+    in->unit = w->only;
+    in->source_cas = w->receipt.source_cas_root;
+    in->dependency = w->depfile_root;
+    in->harness = w->helper_root;
+    in->flags = w->receipt.flags_root;
+    in->environment = w->receipt.environment_root;
+    in->build_graph = w->receipt.build_graph_root;
+    in->toolchain = w->receipt.compiler_root;
+    in->policy = w->receipt.impact_policy_root;
+    in->changed = w->receipt.changed_set_root;
+    in->active = true;
+}
+
+/* Hash the attempt's sealed bytes into the key admission already accepts.
+ * A required field whose pointer is null is an incomplete closure. */
+static bool dp_check_derive(const struct zcl_dev_proof_check_inputs *in,
+                            struct vcs_component_proof_key_v1 *key)
+{
+    const uint8_t *fixed[VCS_CPK_FIELD_COUNT] = {0};
+    bool required[VCS_CPK_FIELD_COUNT] = {0};
+    const char *unit = in->unit ? in->unit : "";
+    size_t unit_len = strlen(unit);
+    uint8_t digest[32];
+    fixed[VCS_CPK_SOURCE_CLOSURE] = in->source_cas;
+    fixed[VCS_CPK_DEPENDENCY_CLOSURE] = in->dependency;
+    fixed[VCS_CPK_HARNESS] = in->harness;
+    fixed[VCS_CPK_FLAGS] = in->flags;
+    fixed[VCS_CPK_ENVIRONMENT] = in->environment;
+    fixed[VCS_CPK_BUILD_GRAPH] = in->build_graph;
+    fixed[VCS_CPK_TOOLCHAIN] = in->toolchain;
+    fixed[VCS_CPK_POLICY] = in->policy;
+    fixed[VCS_CPK_INTEGRATION_EDGES] = in->changed;
+    required[VCS_CPK_SOURCE_CLOSURE] = true;
+    required[VCS_CPK_DEPENDENCY_CLOSURE] = true;
+    required[VCS_CPK_HARNESS] = true;
+    required[VCS_CPK_FLAGS] = true;
+    required[VCS_CPK_ENVIRONMENT] = true;
+    required[VCS_CPK_BUILD_GRAPH] = true;
+    required[VCS_CPK_TOOLCHAIN] = true;
+    required[VCS_CPK_POLICY] = true;
+    required[VCS_CPK_INTEGRATION_EDGES] = true;
+    memset(key, 0, sizeof(*key));
+    for (int f = 0; f < (int)VCS_CPK_FIELD_COUNT; f++) {
+        const void *bytes = "";
+        size_t len = 0;
+        if (f == (int)VCS_CPK_UNIT_ID) {
+            bytes = unit;
+            len = unit_len;
+        } else if (fixed[f]) {
+            bytes = fixed[f];
+            len = 32;
+        } else if (required[f]) {
+            return false;
+        }
+        if (!vcs_component_proof_field_root((enum vcs_component_proof_field)f,
+                                            bytes, len, key->roots[f]))
+            return false;
+    }
+    return vcs_component_proof_key_valid(key) &&
+           vcs_component_proof_key_derive(key, digest);
+}
+
+static void dp_check_note(const struct dp_worker *w, const char *reason)
+{
+    if (!w->paths || !w->paths->phases[0] || !reason || !reason[0]) return;
+    (void)zcl_dev_proof_phase_note(w->paths->phases, "test_reuse_admit",
+                                   reason);
+}
+
+static enum dp_check_choice dp_check_from_admission(
+    const struct vcs_proof_admission_result *result, uint32_t selected,
+    uint8_t observation[32], const char **reason)
+{
+    if (result->status == VCS_PROOF_ADMIT_REFUSED ||
+        result->decision.outcome == VCS_PROOF_REUSE_HIT_FAIL) {
+        *reason = result->reason ? result->reason
+                                 : VCS_PROOF_REUSE_WHY_ARGUMENTS;
+        return DP_CHECK_BLOCK;
+    }
+    if (result->status != VCS_PROOF_ADMIT_REUSED ||
+        result->decision.outcome != VCS_PROOF_REUSE_HIT_PASS ||
+        selected != 1u) {
+        *reason = result->reason ? result->reason : VCS_PROOF_REUSE_WHY_NONE;
+        return DP_CHECK_LAUNCH;
+    }
+    if (result->decision.used_count == 0 ||
+        !proof_root_nonzero(result->decision.used[0])) {
+        *reason = "test_reuse_receipt_empty";
+        return DP_CHECK_BLOCK;
+    }
+    memcpy(observation, result->decision.used[0], 32);
+    *reason = VCS_PROOF_REUSE_WHY_HIT;
+    return DP_CHECK_SKIP;
+}
+
+static enum dp_check_choice dp_check_admit(
+    const struct dp_worker *w, const struct vcs_component_proof_key_v1 *key,
+    uint32_t selected, uint8_t observation[32], const char **reason)
+{
+    const char *unit = w->check_inputs.unit;
+    struct vcs_proof_admission_context ctx = {
+        .receiver = w->check_receiver,
+        .domain = w->check_domain,
+        .policy = w->check_policy,
+    };
+    struct vcs_proof_change change = {0};
+    struct vcs_proof_obligation obligation = {0};
+    struct vcs_proof_admission_result result;
+    struct vcs_proof_admission_report report;
+    if (!unit || !unit[0]) unit = "proof-check";
+    change.component_id = unit;
+    change.scope_known = true;
+    memcpy(change.contract_root_before,
+           key->roots[VCS_CPK_INTEGRATION_EDGES], 32);
+    memcpy(change.contract_root_after,
+           key->roots[VCS_CPK_INTEGRATION_EDGES], 32);
+    obligation.name = unit;
+    obligation.component_id = unit;
+    obligation.action_class = VCS_PROOF_ACTION_CHECK;
+    obligation.preimage = key;
+    obligation.in_reach = true;
+    if (!vcs_proof_admission_run(&ctx, &change, &obligation, 1, &result,
+                                 &report)) {
+        *reason = VCS_PROOF_REUSE_WHY_ARGUMENTS;
+        return DP_CHECK_BLOCK;
+    }
+    return dp_check_from_admission(&result, selected, observation, reason);
+}
+
+static void dp_check_token(char *dst, size_t cap, const char *token)
+{
+    if (!dst || cap == 0) return;
+    dst[0] = 0;
+    if (!token || !token[0]) return;
+    (void)snprintf(dst, cap, "%s", token);
+}
+
+/* Authority this attempt owns when the caller did not supply a store.
+ * The policy root is copied from the closure this worker just hashed. */
+struct dp_check_owned {
+    struct vcs_proof_receiver *receiver;
+    struct vcs_proof_candidate_domain domain;
+    struct vcs_proof_reuse_policy policy;
+    char trust[64];
+};
+
+static void dp_check_owned_clear(struct dp_check_owned *owned)
+{
+    if (!owned) return;
+    vcs_proof_receiver_free(owned->receiver);
+    owned->receiver = NULL;
+}
+
+/* Ask the root-pinned verifier loader, then build a domain whose local
+ * signer is this box. A loaded compile verifier is not a test-verdict
+ * signer: dp_warm_verifier_qualified stays false until a separate uid is
+ * installed, so the policy's verifier set stays empty. */
+static bool dp_check_owned_derive(const struct vcs_component_proof_key_v1 *key,
+                                  struct dp_check_owned *owned)
+{
+    struct zcl_verify_attest_box_key box;
+    struct zcl_verify_attest_trust_root root;
+    const char *trust_why = NULL;
+    static const uint8_t zero[32];
+    memset(owned, 0, sizeof(*owned));
+    zcl_verify_receiver_box_key(&box);
+    if (!zcl_verify_attest_trust_root_load(NULL, &box, &root, &trust_why))
+        dp_check_token(owned->trust, sizeof(owned->trust),
+                       trust_why ? trust_why
+                                 : ZCL_VERIFY_ATTEST_WHY_NO_VERIFIER_KEY);
+    else
+        dp_check_token(owned->trust, sizeof(owned->trust),
+                       "verifier_unqualified");
+    if (!box.known || !box.present ||
+        memcmp(box.pubkey, zero, sizeof(zero)) == 0)
+        return false;
+    memcpy(owned->domain.author_pubkey, box.pubkey, 32);
+    owned->domain.has_local_signer = true;
+    memcpy(owned->domain.local_signer_pubkey, box.pubkey, 32);
+    memcpy(owned->policy.policy_root, key->roots[VCS_CPK_POLICY], 32);
+    owned->policy.quorum = 1;
+    owned->receiver = vcs_proof_receiver_new();
+    return owned->receiver != NULL;
+}
+
+/* The supplied or derived policy has to name the closure this worker
+ * hashed. A mismatched root is not forwarded into a skip. */
+static const char *dp_check_authority_closure(
+    const struct vcs_proof_candidate_domain *domain,
+    const struct vcs_proof_reuse_policy *policy,
+    const struct vcs_component_proof_key_v1 *key)
+{
+    static const uint8_t zero[32];
+    if (!domain || !policy || !key) return VCS_PROOF_REUSE_WHY_ARGUMENTS;
+    if (memcmp(domain->author_pubkey, zero, sizeof(zero)) == 0)
+        return VCS_PROOF_REUSE_WHY_DOMAIN;
+    if (policy->quorum == 0 || (!policy->verifiers && policy->verifier_count) ||
+        (!policy->revoked && policy->revoked_count))
+        return VCS_PROOF_REUSE_WHY_POLICY;
+    if (memcmp(policy->policy_root, key->roots[VCS_CPK_POLICY], 32) != 0)
+        return VCS_PROOF_REUSE_WHY_POLICY_ROOT;
+    return NULL;
+}
+
+static void dp_check_remember(struct dp_worker *w,
+                              const struct dp_check_owned *owned,
+                              bool derived)
+{
+    w->check_derived = derived;
+    w->check_local_signer = derived && owned->domain.has_local_signer;
+    if (derived) {
+        memcpy(w->check_derived_policy, owned->policy.policy_root, 32);
+        memcpy(w->check_derived_author, owned->domain.author_pubkey, 32);
+    } else {
+        memset(w->check_derived_policy, 0, sizeof(w->check_derived_policy));
+        memset(w->check_derived_author, 0, sizeof(w->check_derived_author));
+    }
+    dp_check_token(w->check_trust, sizeof(w->check_trust), owned->trust);
+}
+
+/* Any null among receiver, domain, and policy replaces all three with
+ * one owned set. A supplied store is never paired with an owned policy.
+ * An unqualified derivation launches. A skip from that empty verifier
+ * set is refused. */
+static enum dp_check_choice dp_check_resolve(
+    struct dp_worker *w, const struct vcs_component_proof_key_v1 *key,
+    uint32_t selected, uint8_t observation[32], const char **reason)
+{
+    struct dp_check_owned owned;
+    const struct vcs_proof_receiver *held_rx = w->check_receiver;
+    const struct vcs_proof_candidate_domain *held_domain = w->check_domain;
+    const struct vcs_proof_reuse_policy *held_policy = w->check_policy;
+    const char *bad;
+    enum dp_check_choice choice;
+    bool derived = false;
+    memset(&owned, 0, sizeof(owned));
+    if (!held_rx || !held_domain || !held_policy) {
+        if (!dp_check_owned_derive(key, &owned)) {
+            dp_check_remember(w, &owned, false);
+            dp_check_owned_clear(&owned);
+            *reason = DP_TEST_REUSE_UNQUALIFIED;
+            return DP_CHECK_LAUNCH;
+        }
+        w->check_receiver = owned.receiver;
+        w->check_domain = &owned.domain;
+        w->check_policy = &owned.policy;
+        derived = true;
+        dp_check_remember(w, &owned, true);
+    }
+    bad = dp_check_authority_closure(w->check_domain, w->check_policy, key);
+    if (bad)
+        choice = DP_CHECK_BLOCK;
+    else
+        choice = dp_check_admit(w, key, selected, observation, reason);
+    if (bad) *reason = bad;
+    if (derived && choice == DP_CHECK_SKIP) {
+        *reason = DP_TEST_REUSE_UNQUALIFIED;
+        choice = DP_CHECK_BLOCK;
+    } else if (derived && choice == DP_CHECK_LAUNCH &&
+               !dp_warm_verifier_qualified(0)) {
+        *reason = DP_TEST_REUSE_UNQUALIFIED;
+    }
+    if (derived) {
+        w->check_receiver = held_rx;
+        w->check_domain = held_domain;
+        w->check_policy = held_policy;
+        dp_check_owned_clear(&owned);
+    }
+    return choice;
+}
+
+/* Derive and validate the closure, then derive or check receiver, domain,
+ * and policy before admission. An incomplete closure launches. Refusal
+ * and an eligible failure block. One vouched group may skip only when
+ * authority was already held and the closure matches it. */
+static enum dp_check_choice dp_check_decide(struct dp_worker *w,
+                                            uint32_t selected,
+                                            uint8_t observation[32],
+                                            const char **reason)
+{
+    struct vcs_component_proof_key_v1 key;
+    dp_check_bind(w);
+    if (!dp_check_derive(&w->check_inputs, &key)) {
+        *reason = "test_reuse_closure_incomplete";
+        return DP_CHECK_LAUNCH;
+    }
+    return dp_check_resolve(w, &key, selected, observation, reason);
+}
+
+static bool dp_check_prepare(struct dp_worker *w,
+                             struct zcl_dev_proof_dimension *test,
+                             struct dp_check_hold *hold, char *why,
+                             size_t why_len)
+{
+    const char *reason = NULL;
+    uint8_t observation[32] = {0};
+    enum dp_check_choice choice;
+    hold->selected = test->selected;
+    if (!test->selected) return true;
+    choice = dp_check_decide(w, test->selected, observation, &reason);
+    dp_check_token(w->check_admit_reason, sizeof(w->check_admit_reason),
+                   reason);
+    dp_check_note(w, reason);
+    if (choice == DP_CHECK_BLOCK) {
+        proof_why(why, why_len, reason ? reason : "test_reuse_refused");
+        return false;
+    }
+    if (choice == DP_CHECK_SKIP) {
+        hold->skip = true;
+        memcpy(hold->observation, observation, 32);
+        test->selected = 0;
+    }
+    return true;
+}
+
+static uint32_t dp_test_children_started(const struct proof_dimension_run *runs,
+                                         size_t count)
+{
+    uint32_t n = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (runs[i].id == ZCL_DEV_PROOF_TEST && runs[i].step.started &&
+            runs[i].step.child > 0)
+            n++;
+    }
+    return n;
+}
+
+static bool dp_check_finish(struct dp_worker *w,
+                            struct zcl_dev_proof_dimension *test,
+                            const struct dp_check_hold *hold,
+                            bool dimensions_ok, char *why, size_t why_len)
+{
+    if (hold->skip) test->selected = hold->selected;
+    if (!dimensions_ok) return false;
+    if (!hold->skip) {
+        if (test->selected)
+            test_receipt_bind_helpers(test, w->helper_root);
+        return true;
+    }
+    if (w->test_children_started != 0) {
+        proof_why(why, why_len, "test_reuse_child_started");
+        return false;
+    }
+    memcpy(test->receipt_root, hold->observation, 32);
+    test->ran = 0;
+    test->failed = 0;
+    test->skipped = 0;
+    test->reused = 1;
+    return true;
+}
+
+static bool dp_worker_dimensions_run_clean(struct dp_worker *w,
+                                     struct zcl_dev_proof_dimension *lint,
+                                     struct zcl_dev_proof_dimension *test,
+                                     char *why, size_t why_len)
+{
+    struct proof_dimension_run runs[2];
+    size_t run_count = 0;
+    struct dp_check_hold admitted = {0};
+    /* The preflight probe is not consumed. Admission below is the only
+     * path that can hold this test child back. */
+    const char *test_argv[DP_TEST_DIMENSION_ARGC + 1] = {0};
+    bool launched;
+    bool dimensions_ok = true;
+    if (!dp_check_prepare(w, test, &admitted, why, why_len)) return false;
+    if (test->selected &&
+        dp_test_dimension_argv(w->generation_binary, w->only, test_argv,
+                               sizeof(test_argv) / sizeof(test_argv[0])) !=
+            DP_TEST_DIMENSION_ARGC) {
+        proof_why(why, why_len, "test_runner_argv_invalid");
+        if (admitted.skip) test->selected = admitted.selected;
+        return false;
+    }
+    struct zcl_dev_proof_budget test_budget =
+        zcl_dev_proof_test_budget(w->paths->state, w->groups, test->selected);
+    struct dp_dimension_plan plan = {
+        .paths = &w->execution, .root = w->execution.root,
+        .lint_argv = w->lint_argv, .lint = lint,
+        .lint_budget = &w->lint_budget, .test_argv = test_argv,
+        .test = test, .test_budget = &test_budget,
+        .hold_max_ms = DP_LINT_HOLD_MAX_MS,
+        .finish_tests_first = dp_lint_waits_for_tests(
+            platform_available_cpu_count())};
+    struct dp_lint_hold hold;
+    launched = dp_dimensions_launch(&plan, runs, &run_count, &hold, why,
+                                    why_len);
+    if (launched) {
+        dp_lint_hold_note(w->paths->phases, &hold);
+        dimension_runs_wait(runs, run_count);
+        dp_worker_lint_wall_note(w, runs, run_count);
+        w->test_children_started = dp_test_children_started(runs, run_count);
+        /* Fail closed on the first dimension that failed, in the order they
+         * would have run sequentially, and always finish every child so each
+         * one's log, receipt root and phases row survive the failure. */
+        for (size_t i = 0; i < run_count; i++) {
+            char step_why[160] = {0};
+            if (dimension_finish(&w->execution, &runs[i], step_why,
+                                 sizeof(step_why)))
+                continue;
+            if (dimensions_ok) proof_why(why, why_len, step_why);
+            dimensions_ok = false;
+        }
+    } else if (admitted.skip) {
+        test->selected = admitted.selected;
+    }
+    if (!launched) return false;
+    return dp_check_finish(w, test, &admitted, dimensions_ok, why, why_len);
+}
+
+/* These settings select how a BUILD need is linked in dp_worker_test_needs(),
+ * which has finished before these children launch. They must not become test
+ * or lint inputs: action roots correctly refuse an unbound compiler or loader
+ * environment, while a resident worker needs the settings restored for its
+ * next generation. The built helper's exact executable bytes are included
+ * in the test receipt by dp_test_needs_bind(). */
+static bool dp_worker_dimensions_run(struct dp_worker *w,
+                                     struct zcl_dev_proof_dimension *lint,
+                                     struct zcl_dev_proof_dimension *test,
+                                     char *why, size_t why_len)
+{
+    static const char *const names[] = {
+        "CLANG_MANIFEST_LLVM_DIR", "CLANG_MANIFEST_SYSTEM_LIB"
+    };
+    char saved[2][PATH_MAX];
+    bool present[2] = {false, false};
+    for (size_t i = 0; i < 2; i++) {
+        const char *value = getenv(names[i]);
+        if (!value) continue;
+        size_t n = strlen(value);
+        if (n >= sizeof(saved[i])) {
+            proof_why(why, why_len, "clang_manifest_setting_too_long");
+            return false;
+        }
+        memcpy(saved[i], value, n + 1);
+        present[i] = true;
+    }
+    for (size_t i = 0; i < 2; i++) {
+        if (!present[i]) continue;
+        if (unsetenv(names[i]) == 0) continue;
+        for (size_t j = 0; j < i; j++)
+            if (present[j]) (void)setenv(names[j], saved[j], 1);
+        proof_why(why, why_len, "clang_manifest_setting_unset_failed");
+        return false;
+    }
+    bool ok = dp_worker_dimensions_run_clean(w, lint, test, why, why_len);
+    for (size_t i = 0; i < 2; i++)
+        if (present[i] && setenv(names[i], saved[i], 1) != 0) {
+            proof_why(why, why_len, "clang_manifest_setting_restore_failed");
+            ok = false;
+        }
+    return ok;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_check_closure_derive(
+    const struct zcl_dev_proof_check_inputs *in,
+    struct vcs_component_proof_key_v1 *key)
+{
+    struct zcl_dev_proof_check_inputs local;
+    if (!in || !key) return false;
+    local = *in;
+    local.active = true;
+    return dp_check_derive(&local, key);
+}
+
+static bool dp_check_export_ready(const struct zcl_dev_proof_check_inputs *in,
+                                  const char *logs_dir, const char *root,
+                                  const char *binary,
+                                  struct zcl_dev_proof_check_result *out)
+{
+    if (!out || !in) return false;
+    if (!logs_dir || !logs_dir[0] || !root || !root[0]) return false;
+    return binary && binary[0];
+}
+
+static bool dp_check_export_paths(struct proof_paths *paths,
+                                  const char *logs_dir, const char *root)
+{
+    if (snprintf(paths->logs, sizeof(paths->logs), "%s", logs_dir) >=
+        (int)sizeof(paths->logs))
+        return false;
+    if (snprintf(paths->key, sizeof(paths->key), "seam") >=
+        (int)sizeof(paths->key))
+        return false;
+    return snprintf(paths->root, sizeof(paths->root), "%s", root) <
+           (int)sizeof(paths->root);
+}
+
+static bool dp_check_export_names(struct dp_worker *w,
+                                  const struct zcl_dev_proof_check_inputs *in,
+                                  const char *root, const char *binary)
+{
+    const char *unit = in->unit ? in->unit : "";
+    if (snprintf(w->execution.root, sizeof(w->execution.root), "%s", root) >=
+        (int)sizeof(w->execution.root))
+        return false;
+    if (snprintf(w->only, sizeof(w->only), "%s", unit) >= (int)sizeof(w->only))
+        return false;
+    if (snprintf(w->generation_binary, sizeof(w->generation_binary), "%s",
+                 binary) >= (int)sizeof(w->generation_binary))
+        return false;
+    w->check_inputs = *in;
+    w->check_inputs.active = true;
+    if (!w->check_inputs.unit) w->check_inputs.unit = w->only;
+    if (in->harness) memcpy(w->helper_root, in->harness, 32);
+    if (in->dependency) memcpy(w->depfile_root, in->dependency, 32);
+    return true;
+}
+
+static void dp_check_export_result(struct zcl_dev_proof_check_result *out,
+                                   const struct dp_worker *w,
+                                   const struct zcl_dev_proof_dimension *test,
+                                   const char *why, const char *logs_dir)
+{
+    char log[PATH_MAX];
+    out->test_children = w->test_children_started;
+    out->selected = test->selected;
+    out->ran = test->ran;
+    out->reused = test->reused;
+    out->failed = test->failed;
+    out->skipped = test->skipped;
+    memcpy(out->receipt_root, test->receipt_root, 32);
+    out->authority_derived = w->check_derived;
+    out->authority_local_signer = w->check_local_signer;
+    memcpy(out->derived_policy_root, w->check_derived_policy, 32);
+    memcpy(out->derived_author, w->check_derived_author, 32);
+    (void)snprintf(out->authority_trust, sizeof(out->authority_trust), "%s",
+                   w->check_trust);
+    if (!why || !why[0]) why = w->check_admit_reason;
+    (void)snprintf(out->why, sizeof(out->why), "%s", why ? why : "");
+    if (snprintf(log, sizeof(log), "%s/seam.test.log", logs_dir) <
+        (int)sizeof(log))
+        out->log_present = access(log, F_OK) == 0;
+}
+
+bool zcl_dev_proof_check_dimensions(
+    const struct zcl_dev_proof_check_inputs *in, const char *logs_dir,
+    const char *root, const char *generation_binary, uint32_t selected,
+    const struct vcs_proof_receiver *receiver,
+    const struct vcs_proof_candidate_domain *domain,
+    const struct vcs_proof_reuse_policy *policy,
+    struct zcl_dev_proof_check_result *out)
+{
+    struct dp_worker *w;
+    struct proof_paths *paths;
+    struct zcl_dev_proof_dimension *test;
+    char why[160] = {0};
+    if (!dp_check_export_ready(in, logs_dir, root, generation_binary, out))
+        return false;
+    memset(out, 0, sizeof(*out));
+    w = zcl_calloc(1, sizeof(*w), "check_dimensions");
+    paths = zcl_calloc(1, sizeof(*paths), "check_dimensions_paths");
+    if (!w || !paths) {
+        free(w);
+        free(paths);
+        return false;
+    }
+    if (!dp_check_export_paths(paths, logs_dir, root)) {
+        free(w);
+        free(paths);
+        return false;
+    }
+    w->paths = paths;
+    w->execution = *paths;
+    if (!dp_check_export_names(w, in, root, generation_binary)) {
+        free(w);
+        free(paths);
+        return false;
+    }
+    w->check_receiver = receiver;
+    w->check_domain = domain;
+    w->check_policy = policy;
+    test = &w->receipt.dimensions[ZCL_DEV_PROOF_TEST];
+    test->selected = selected;
+    out->ok = dp_worker_dimensions_run(
+        w, &w->receipt.dimensions[ZCL_DEV_PROOF_LINT], test, why, sizeof(why));
+    dp_check_export_result(out, w, test, why, logs_dir);
+    free(w);
+    free(paths);
+    return true;
+}
+#endif
+
+/* Bounded log read for the preflight account: the runner's probe-only
+ * output is ~100 bytes per group, so 2 MiB covers the whole catalog with
+ * room; anything larger is a log this reader cannot account from. */
+#define DP_PREFLIGHT_LOG_MAX (2u * 1024u * 1024u)
+
+static bool dp_preflight_log_read(const char *path, char **bytes, size_t *len)
+{
+    FILE *f;
+    char *buf;
+    size_t n;
+    bool err;
+    if (!path || !bytes || !len) return false;
+    f = fopen(path, "rb");
+    if (!f) return false;
+    buf = zcl_malloc(DP_PREFLIGHT_LOG_MAX + 1, "proof_preflight_log");
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+    n = fread(buf, 1, DP_PREFLIGHT_LOG_MAX + 1, f);
+    err = ferror(f) != 0;
+    fclose(f);
+    if (err || n > DP_PREFLIGHT_LOG_MAX) {
+        free(buf);
+        return false;
+    }
+    buf[n] = '\0';
+    *bytes = buf;
+    *len = n;
+    return true;
+}
+
+/* The routed-group preflight: probe the candidate's whole required set
+ * through the runner's batch path and record what a verdict cache WOULD
+ * reuse. Advisory only: the test dimension below runs cold
+ * (dp_test_dimension_argv) and never consumes this probe or its capsule,
+ * so would_reuse is a measurement for the day a separate-uid verifier
+ * qualifies, not a count of skipped groups. The probe reads only the
+ * generation's own store, never the submitting checkout's. A missing
+ * binary, a failed spawn, or an unparseable log costs one phase note
+ * ("unavailable") and never the proof. Runs after the prefork step so the
+ * generation's depfiles and admitted runner are exactly what the dimension
+ * below will see. The capsule stays in scratch with its sealed bindings;
+ * nothing reads it back. A store that provably holds no verdict skips the
+ * spawn (dp_preflight_skip_empty): the probe could only count zero. */
+static void dp_worker_test_preflight(struct dp_worker *w)
+{
+    const char *argv[13];
+    char log[PATH_MAX];
+    char capsule[PATH_MAX];
+    char store_env[PATH_MAX + 32];
+    char graph_hex[65];
+    char note[192];
+    char *bytes = NULL;
+    size_t len = 0, n = 0;
+    struct zcl_dev_proof_preflight pf;
+    struct zcl_dev_proof_budget budget;
+    struct zcl_dev_proof_capsule_argv cap;
+    int cap_argc = 0;
+    size_t i;
+    if (!w || !w->generation_binary[0] || !w->only[0]) return;
+    if (dp_preflight_skip_empty(w->generation, w->paths->phases)) return;
+    if (snprintf(log, sizeof(log), "%s/%s.test-preflight.log",
+                 w->execution.logs, w->execution.key) >= (int)sizeof(log))
+        return;
+    /* Pin the probe to the generation's own store: an inherited
+     * ZCL_DEV_SOURCE_ROOT would otherwise aim it at the checkout's. */
+    if (snprintf(store_env, sizeof(store_env), "ZCL_TESTCACHE_STORE_ROOT=%s",
+                 w->generation) >= (int)sizeof(store_env))
+        return;
+    argv[n++] = "env";
+    argv[n++] = store_env;
+    argv[n++] = w->generation_binary;
+    argv[n++] = w->only;
+    argv[n++] = "--cache";
+    argv[n++] = "--activate-proof-contracts";
+    argv[n++] = "--cache-probe-only";
+    if (dp_capsule_path(w->execution.logs, w->execution.key, capsule)) {
+        zcl_hex_encode(w->depfile_root, 32, graph_hex);
+        cap_argc = dp_capsule_argv(&cap, true, capsule,
+                                   w->sealed_source_id,
+                                   w->sealed_mutation_id,
+                                   w->source_before.cas_root_sha3, graph_hex);
+    }
+    if (cap_argc == 5) {
+        for (i = 0; i < 5; i++)
+            argv[n++] = cap.argv[i];
+    }
+    argv[n] = NULL;
+    budget = proof_step_budget(w->paths, "test_preflight",
+                               PROOF_PREFLIGHT_DEFAULT_MS);
+    (void)run_step(&w->execution, w->execution.root, log, argv,
+                   "test_preflight", &budget, NULL);
+    if (!dp_preflight_log_read(log, &bytes, &len) ||
+        !dp_preflight_parse(bytes, len, &pf)) {
+        (void)zcl_dev_proof_phase_note(w->paths->phases, "test_preflight",
+                                       "advisory unavailable");
+        free(bytes);
+        return;
+    }
+    free(bytes);
+    (void)snprintf(note, sizeof(note),
+                   "advisory groups=%u would_reuse=%u must_run=%u "
+                   "uncacheable=%u admitted=0 capsule=%s",
+                   pf.groups, pf.would_reuse, pf.must_run, pf.uncacheable,
+                   cap_argc == 5 && access(capsule, F_OK) == 0 ? "written"
+                                                               : "absent");
+    (void)zcl_dev_proof_phase_note(w->paths->phases, "test_preflight", note);
+}
+
+/* Every dimension this proof actually runs, in order. */
+static bool dp_worker_dimensions(struct dp_worker *w, char *why,
+                                 size_t why_len)
+{
+    struct zcl_dev_proof_dimension *dims = w->receipt.dimensions;
+    struct zcl_dev_proof_dimension *lint = &dims[ZCL_DEV_PROOF_LINT];
+    struct zcl_dev_proof_dimension *test = &dims[ZCL_DEV_PROOF_TEST];
+    if (!dp_dim_generated(w, &dims[ZCL_DEV_PROOF_GENERATED], why, why_len))
+        return false;
+    proof_phase_mark(w->phases, "dimension_generated");
+    if (!dp_dim_compile(w, &dims[ZCL_DEV_PROOF_COMPILE], why, why_len))
+        return false;
+    proof_phase_mark(w->phases, "dimension_compile");
+    if (!dp_worker_lint_plan(w, lint, test, why, why_len)) return false;
+    w->only[0] = 0;
+    if (test->selected && !dp_worker_test_env(w, why, why_len)) return false;
+    if (!dp_worker_prefork(w, test->selected != 0, why, why_len)) return false;
+    if (test->selected) dp_worker_test_preflight(w);
+    if (!dp_worker_dimensions_run(w, lint, test, why, why_len)) return false;
+    proof_phase_mark(w->phases, "dimension_lint_and_test");
+    return true;
+}
+
+/* Prove the source never moved under the run, then publish the receipt.
+ * Nothing after this point may fail: the receipt IS the admission. */
+static bool dp_worker_publish(struct dp_worker *w, int64_t started_us,
+                              char *why, size_t why_len)
+{
+    struct dev_source_record source_after = {0};
+    if (!worktree_exact(w->generation, w->local, false, why, why_len))
+        return false;
+    if (!zcl_dev_source_cas_capture(w->generation, &source_after) ||
+        !source_after.cas_present) {
+        proof_why(why, why_len, "source_cas_recapture_failed");
+        return false;
+    }
+    if (strcmp(w->source_before.cas_root_sha3,
+               source_after.cas_root_sha3) != 0) {
+        proof_why(why, why_len, "source_epoch_superseded");
+        return false;
+    }
+    if (!zcl_dev_source_mutation_verify(w->generation, &w->source_before,
+                                        why, why_len)) {
+        fprintf(stderr, "[devproof] generation source mutation changed before receipt publication\n");
+        proof_why(why, why_len, "proof_generation_mutation_changed");
+        return false;
+    }
+    w->receipt.created_unix = (uint64_t)platform_time_wall_unix();
+    w->receipt.elapsed_ms =
+        (uint64_t)((platform_time_monotonic_us() - started_us) / 1000);
+    w->receipt.policy_version = ZCL_DEV_PROOF_POLICY_VERSION;
+    w->receipt.complete = 1;
+    if (!receipt_store(w->paths, &w->receipt)) {
+        proof_why(why, why_len, "receipt_publication_failed");
+        return false;
+    }
+    proof_unlink_if_current(w->paths, w->paths->failure);
+    return true;
+}
+
+static bool proof_worker_body(const struct proof_paths *paths,
+                              const char *local, const char *base,
+                              const char *generation, int64_t started_us,
+                              struct proof_phase_clock *phases,
+                              const struct proof_warmstart *warm,
+                              const struct zcl_dev_proof_changed_set *changed,
+                              struct dp_docs_fresh_run *docs,
+                              char *why, size_t why_len)
+{
+    struct dp_worker w = {0};
+    w.paths = paths;
+    w.execution = *paths;
+    (void)snprintf(w.execution.root, sizeof(w.execution.root), "%s",
+                   generation);
+    w.local = local;
+    w.base = base;
+    w.generation = generation;
+    w.phases = phases;
+    w.warm = warm;
+    w.changed = changed;
+    w.docs = docs;
+    w.inventory_only = inventory_output_only(changed->files, changed->count);
+    w.warm_compile_mode = "skipped";
+    if (!dp_worker_seal_source(&w, why, why_len)) return false;
+    /* The loaded producer owns selection and impact policy. Admitting a
+     * candidate test runner alone cannot qualify that compiled metadata. */
+    if (!zcl_dev_proof_producer_source_qualified(w.source_before.source_id,
+            zcl_build_source_id_sha256(), why, why_len)) return false;
+    if (!dp_worker_plan(&w, changed->files, changed->count, why, why_len))
+        return false;
+    if (!dp_worker_receipt_identity(&w, why, why_len)) return false;
+    if (!dp_worker_build_identity(&w, why, why_len)) return false;
+    if (!dp_worker_select(&w, why, why_len)) return false;
+    /* Index writes above are derived files the docs checkers do not read;
+     * the dimensions can change their inputs and must wait for the verdict. */
+    if (!dp_docs_fresh_settle(docs, paths, why, why_len)) return false;
+    proof_phase_mark(phases, "docs_fresh_join");
+    bool cycle_reused =
+        !w.receipt.dimensions[ZCL_DEV_PROOF_GENERATED].selected &&
+        cycle_proof_reuse(paths, w.source_before.cas_root_sha3,
+                          w.receipt.dimensions);
+    if (!cycle_reused && !dp_worker_dimensions(&w, why, why_len))
+        return false;
+    return dp_worker_publish(&w, started_us, why, why_len);
+}
+
+/* A post-merge hook can queue before the submitting checkout has rebuilt its
+ * restart.env. Prepare through the canonical build before copying or sealing
+ * compiler inputs; preparation is not evidence and never relaxes the checks
+ * that follow it. */
+static bool proof_original_plan_prepare(const struct proof_paths *paths,
+                                        const char *root, const char *local,
+                                        const char *log_path,
+                                        char *why, size_t why_len)
+{
+    int64_t stage_us = platform_time_monotonic_us();
+    char jobs[16];
+    if (!proof_make_jobs_arg(jobs)) {
+        proof_why(why, why_len, "proof_job_count_unavailable");
+        return false;
+    }
+    const char *argv[] = {
+        "make", "--no-print-directory", jobs, "dev-bin",
+#if defined(__linux__)
+        "build/hotswap/zcl_rollback_fixture_a.so",
+        "build/hotswap/zcl_rollback_fixture_b.so",
+#endif
+#if !defined(_WIN32)
+        /* Same class as the rollback images above: order-only test-binary
+         * prerequisites the resident-launch contract group execs by name.
+         * A cold generation has no other builder for them, and without them
+         * the group's first check fails on absence, not on behaviour. */
+        "build/fixtures/rlc_child_v1",
+        "build/fixtures/rlc_child_broken",
+        "build/fixtures/otlp_startup_probe",
+#endif
+        NULL,
+    };
+    struct zcl_dev_proof_budget budget = proof_step_budget(
+        paths, "original-plan", PROOF_COMPILE_DEFAULT_MS);
+    struct zcl_dev_proof_step_report report = {0};
+    if (run_step(paths, root, log_path, argv, "original-plan", &budget,
+                  &report) != 0) {
+        if (report.cause == ZCL_DEV_PROOF_KILL_NONE)
+            proof_whyf(why, why_len, "proof_original_plan_prepare_exit_%d",
+                        report.rc);
+        else
+            run_step_why(why, why_len, "original-plan", &report);
+        return false;
+    }
+    dp_stage_timing_note(paths, "original_make_ms", stage_us);
+    stage_us = platform_time_monotonic_us();
+    if (!worktree_exact(root, local, true, why, why_len)) return false;
+    uint8_t flags[32], graph[32];
+    struct dev_source_record plan_source = {0};
+    if (!proof_plan_roots(root, flags, graph, plan_source.mutation_id,
+                           why, why_len) ||
+        !zcl_dev_source_mutation_verify(root, &plan_source, why, why_len)) {
+        fprintf(stderr, "[devproof] prepared build plan does not match source\n");
+        proof_why(why, why_len, "proof_prepared_build_plan_source_changed");
+        return false;
+    }
+    dp_stage_timing_note(paths, "original_plan_verify_ms", stage_us);
+    return true;
+}
+
+#if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
+bool zcl_dev_proof_test_original_plan_prepare(const char *root,
+                                              const char *local,
+                                              const char *log_path,
+                                              char *why, size_t why_len)
+{
+    return proof_original_plan_prepare(NULL, root, local, log_path, why, why_len);
+}
+#endif
+
+/* How long the admitted request sat before this worker began, and how long
+ * the queue's claim lock itself took. The request's monotonic stamp was
+ * written by the submitting process against this host's same monotonic
+ * clock, so the delta is the exact queue wait: every pre-claim deferral
+ * (reactor offer interval, landing-step guard, execution slot, queue lock)
+ * is inside it. Best effort, exactly like the phase clock: a request that
+ * cannot be read costs one measurement line, never the proof. */
+static void proof_queue_wait_note(const struct proof_paths *paths,
+                                  int64_t queue_lock_wait_ms)
+{
+    char request[PATH_MAX];
+    char local[65], base[65];
+    int64_t monotonic = 0;
+    if (!paths || paths->attempt[0] == 0 ||
+        snprintf(request, sizeof(request), "%s/request", paths->attempt) >=
+            (int)sizeof(request))
+        return;
+    if (proof_request_read(request, local, base, NULL, &monotonic)) {
+        int64_t waited = (platform_time_monotonic_us() - monotonic) / 1000;
+        char value[32];
+        int n = snprintf(value, sizeof(value), "%lld",
+                         (long long)(waited > 0 ? waited : 0));
+        if (n > 0 && n < (int)sizeof(value))
+            (void)zcl_dev_proof_phase_note(paths->phases, "queue_wait_ms",
+                                           value);
+    }
+    if (queue_lock_wait_ms >= 0) {
+        char value[32];
+        int n = snprintf(value, sizeof(value), "%lld",
+                         (long long)queue_lock_wait_ms);
+        if (n > 0 && n < (int)sizeof(value))
+            (void)zcl_dev_proof_phase_note(paths->phases,
+                                           "queue_lock_wait_ms", value);
+    }
+}
+
+/* user+system milliseconds between two rusage samples. */
+static int64_t dp_rusage_ms(const struct rusage *before,
+                            const struct rusage *after)
+{
+    int64_t user = (int64_t)(after->ru_utime.tv_sec -
+                             before->ru_utime.tv_sec) * 1000 +
+        (after->ru_utime.tv_usec - before->ru_utime.tv_usec) / 1000;
+    int64_t sys = (int64_t)(after->ru_stime.tv_sec -
+                            before->ru_stime.tv_sec) * 1000 +
+        (after->ru_stime.tv_usec - before->ru_stime.tv_usec) / 1000;
+    return user + sys;
+}
+
+/* The proof's CPU bill beside its wall: the worker's own and everything it
+ * reaped (compiler, lint, test children). Wall alone cannot separate a busy
+ * proof from a parked one; this pair can. Same best-effort rule as the
+ * phase clock. */
+static void proof_cpu_note(const struct proof_paths *paths,
+                           const struct rusage *self_before,
+                           const struct rusage *children_before)
+{
+    struct rusage self_after, children_after;
+    if (!paths || getrusage(RUSAGE_SELF, &self_after) != 0 ||
+        getrusage(RUSAGE_CHILDREN, &children_after) != 0)
+        return;
+    char value[32];
+    int n = snprintf(value, sizeof(value), "%lld",
+                     (long long)dp_rusage_ms(self_before, &self_after));
+    if (n > 0 && n < (int)sizeof(value))
+        (void)zcl_dev_proof_phase_note(paths->phases, "proof_cpu_self_ms",
+                                       value);
+    n = snprintf(value, sizeof(value), "%lld",
+                 (long long)dp_rusage_ms(children_before, &children_after));
+    if (n > 0 && n < (int)sizeof(value))
+        (void)zcl_dev_proof_phase_note(paths->phases,
+                                       "proof_cpu_children_ms", value);
+}
+
+/* The test dimension holds a group whose memory-limit leg needs a child
+ * cgroup under an ancestor that delegates the memory controller and that
+ * this uid may write. From a login session scope every such ancestor is
+ * root-owned: the leg reports UNOBSERVED, the suite still exits 0, and the
+ * proof refuses test_accounting_incomplete — after the whole compile, lint
+ * and test run. The same question answers in microseconds before any of
+ * that work, from the same two facts the leg reads: which ancestors list
+ * `memory` in cgroup.subtree_control, and whether one of them is writable.
+ * Read-only; nothing is created. UNKNOWN (no unified hierarchy to read)
+ * never refuses: the test accounting stays the authority. */
+static bool dp_cgroup_delegates_memory(const char *cg)
+{
+    char control[PATH_MAX], line[256];
+    if (snprintf(control, sizeof(control), "%s/cgroup.subtree_control", cg) >=
+        (int)sizeof(control))
+        return false;
+    FILE *f = fopen(control, "r");
+    bool delegates = f && fgets(line, sizeof(line), f) &&
+                     strstr(line, "memory") != NULL;
+    if (f) (void)fclose(f);
+    return delegates;
+}
+
+/* Step to the parent cgroup; false once the mount root was examined. */
+static bool dp_cgroup_parent(char *cg, size_t floor)
+{
+    char *slash = strrchr(cg, '/');
+    if (strlen(cg) <= floor || !slash || (size_t)(slash - cg) < floor)
+        return false;
+    *slash = '\0';
+    return true;
+}
+
+enum zcl_dev_proof_memory_scope zcl_dev_proof_memory_scope_verdict(
+    const char *mount, const char *self)
+{
+    char cg[PATH_MAX];
+    struct stat st;
+    if (!mount || !self || self[0] != '/' || lstat(mount, &st) != 0 ||
+        !S_ISDIR(st.st_mode) ||
+        snprintf(cg, sizeof(cg), "%s%s", mount, self) >= (int)sizeof(cg))
+        return ZCL_DEV_PROOF_MEMORY_SCOPE_UNKNOWN;
+    size_t floor = strlen(mount);
+    do {
+        size_t len = strlen(cg);
+        while (len > floor && cg[len - 1] == '/') cg[--len] = '\0';
+        if (dp_cgroup_delegates_memory(cg) && access(cg, W_OK | X_OK) == 0)
+            return ZCL_DEV_PROOF_MEMORY_SCOPE_QUALIFIED;
+    } while (dp_cgroup_parent(cg, floor));
+    return ZCL_DEV_PROOF_MEMORY_SCOPE_UNQUALIFIED;
+}
+
+[[maybe_unused]] static bool proof_memory_scope_check(char *why,
+                                                      size_t why_len)
+{
+#if defined(__linux__) && !defined(ZCL_TESTING)
+    static const char mount[] = "/sys/fs/cgroup";
+    char dir[PATH_MAX];
+    if (!os_proc_cgroup_dir(dir, sizeof(dir)) ||
+        strncmp(dir, mount, sizeof(mount) - 1) != 0)
+        return true;
+    if (zcl_dev_proof_memory_scope_verdict(mount, dir + sizeof(mount) - 1) ==
+        ZCL_DEV_PROOF_MEMORY_SCOPE_UNQUALIFIED) {
+        proof_why(why, why_len,
+                  "proof_host_memory_scope_unqualified:"
+                  "run_the_step_in_a_user_manager_scope");
+        return false;
+    }
+#else
+    (void)why;
+    (void)why_len;
+#endif
+    return true;
+}
+
+static bool proof_loader_environment_check(char *why, size_t why_len)
+{
+#if defined(__linux__)
+    /* A loader redirect could replace a test helper's runtime library after
+     * its executable bytes were hashed. It is not a proof input closure. */
+    if (getenv("LD_LIBRARY_PATH") != NULL ||
+        getenv("LD_PRELOAD") != NULL || getenv("LD_AUDIT") != NULL ||
+        getenv("LD_RUN_PATH") != NULL) {
+        proof_why(why, why_len, "proof_loader_environment_unbound");
+        return false;
+    }
+#elif defined(__APPLE__)
+    extern char **environ;
+    for (char **entry = environ; entry && *entry; entry++) {
+        if (strncmp(*entry, "DYLD_", 5) == 0) {
+            proof_why(why, why_len, "proof_loader_environment_unbound");
+            return false;
+        }
+    }
+#endif
+    return true;
+}
+
+#if defined(__linux__) && defined(__x86_64__)
+static bool proof_clang_system_path_trusted(const char *path, bool directory)
+{
+    struct stat sb;
+    return stat(path, &sb) == 0 && sb.st_uid == 0 &&
+           (sb.st_mode & 022) == 0 &&
+           (directory ? S_ISDIR(sb.st_mode) : S_ISREG(sb.st_mode));
+}
+
+static bool proof_clang_arch_files_trusted(const char *lib)
+{
+    return proof_clang_system_path_trusted("/usr/include", true) &&
+           proof_clang_system_path_trusted("/usr/include/clang-c", true) &&
+           proof_clang_system_path_trusted(
+               "/usr/include/clang-c/Index.h", false) &&
+           proof_clang_system_path_trusted("/usr/lib/clang", true) &&
+           proof_clang_system_path_trusted("/usr/lib/clang/22", true) &&
+           proof_clang_system_path_trusted(
+               "/usr/lib/clang/22/include", true) &&
+           proof_clang_system_path_trusted(
+               "/usr/lib/clang/22/include/stddef.h", false) &&
+           proof_clang_system_path_trusted(lib, false) &&
+           proof_clang_system_path_trusted(PROOF_CLANG_ARCH_LLVM, false);
+}
+
+static bool proof_clang_system_lib_trusted(const char *lib)
+{
+    if (!proof_clang_system_path_trusted("/", true) ||
+        !proof_clang_system_path_trusted("/usr", true) ||
+        !proof_clang_system_path_trusted("/usr/lib", true))
+        return false;
+    if (strcmp(lib, PROOF_CLANG_DEBIAN_LIB) == 0)
+        return proof_clang_system_path_trusted("/lib", true) &&
+               proof_clang_system_path_trusted("/lib/x86_64-linux-gnu", true) &&
+               proof_clang_system_path_trusted(lib, false);
+    if (strcmp(lib, PROOF_CLANG_ARCH_LIB) == 0)
+        return proof_clang_arch_files_trusted(lib);
+    return false;
+}
+
+static const char *proof_clang_runtime_path(void)
+{
+    const char *selected = getenv("CLANG_MANIFEST_SYSTEM_LIB");
+    if (selected) return selected;
+    static const char *installed_headers[] = {
+        "/usr/lib/llvm-20/include/clang-c/Index.h",
+        "/usr/lib/llvm-21/include/clang-c/Index.h",
+        "/usr/lib/llvm-19/include/clang-c/Index.h",
+        "/usr/lib/llvm-18/include/clang-c/Index.h"
+    };
+    for (size_t i = 0; i < sizeof(installed_headers) /
+                                sizeof(installed_headers[0]); i++)
+        if (access(installed_headers[i], F_OK) == 0) return NULL;
+    if (access(PROOF_CLANG_DEBIAN_LIB, F_OK) == 0)
+        return PROOF_CLANG_DEBIAN_LIB;
+    if (access("/usr/include/clang-c/Index.h", F_OK) == 0 &&
+        access(PROOF_CLANG_ARCH_LIB, F_OK) == 0)
+        return PROOF_CLANG_ARCH_LIB;
+    return NULL;
+}
+
+static bool proof_clang_auto_runtime_check(char *why, size_t why_len)
+{
+    const char *paths[] = {PROOF_CLANG_DEBIAN_LIB,
+                           PROOF_CLANG_ARCH_LIB};
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (i == 1 && access("/usr/include/clang-c/Index.h", F_OK) != 0)
+            continue;
+        struct stat sb;
+        int rc = stat(paths[i], &sb);
+        if (rc == 0 && !proof_clang_system_lib_trusted(paths[i])) {
+            proof_why(why, why_len, "proof_clang_system_lib_untrusted");
+            return false;
+        }
+        if (rc != 0 && errno != ENOENT) {
+            proof_why(why, why_len, "proof_clang_system_lib_unavailable");
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+static bool proof_clang_runtime_check(char *why, size_t why_len)
+{
+#if defined(__linux__) && defined(__x86_64__)
+    const char *clang_prefix = getenv("CLANG_MANIFEST_LLVM_DIR");
+    const char *clang_lib = getenv("CLANG_MANIFEST_SYSTEM_LIB");
+    if (clang_prefix && !clang_lib) {
+        proof_why(why, why_len, "proof_clang_runtime_unpinned");
+        return false;
+    }
+    if (clang_lib) {
+        if (!clang_prefix ||
+            (strcmp(clang_lib, PROOF_CLANG_ARCH_LIB) == 0 &&
+             strcmp(clang_prefix, "/usr") != 0) ||
+            !proof_clang_system_lib_trusted(clang_lib)) {
+            proof_why(why, why_len, "proof_clang_system_lib_untrusted");
+            return false;
+        }
+    } else if (!clang_prefix) {
+        /* The source-header fallback is a Make choice, so no environment
+         * selection reaches us. Refuse a present mutable system library
+         * before the candidate Makefile can build the test helper. */
+        return proof_clang_auto_runtime_check(why, why_len);
+    }
+#elif defined(__linux__) || defined(__APPLE__)
+    /* Unsupported custom prefixes may load same-user runtime libraries.
+     * The Mach-O helper binding also lacks its loaded dylib bytes. */
+    if (getenv("CLANG_MANIFEST_LLVM_DIR") != NULL ||
+        getenv("CLANG_MANIFEST_SYSTEM_LIB") != NULL) {
+        proof_why(why, why_len, "proof_clang_runtime_unpinned");
+        return false;
+    }
+#endif
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_clang_runtime_check(char *why, size_t why_len)
+{
+    return proof_clang_runtime_check(why, why_len);
+}
+
+const char *zcl_dev_proof_test_clang_runtime_path(void)
+{
+#if defined(__linux__) && defined(__x86_64__)
+    return proof_clang_runtime_path();
+#else
+    return NULL;
+#endif
+}
+#endif
+static bool proof_worker_generation(const struct proof_paths *paths,
+                                    const char *local, const char *base,
+                                    const char *generation,
+                                    int64_t started_us,
+                                    struct proof_phase_clock *phases,
+                                    const struct proof_warmstart *warm,
+                                    struct dp_docs_fresh_run *docs,
+                                    char *why, size_t why_len);
+
+static bool proof_worker(const struct proof_paths *paths,
+                         const char *local, const char *base,
+                         struct platform_ram_scratch_lease *ram_lease,
+                         int64_t queue_lock_wait_ms,
+                         char *why, size_t why_len)
+{
+    if (!proof_memory_scope_check(why, why_len) ||
+        !proof_loader_environment_check(why, why_len) ||
+        !proof_clang_runtime_check(why, why_len)) return false;
+    if (!proof_prepare_environment()) {
+        proof_why(why, why_len, "proof_execution_environment_unavailable");
+        return false;
+    }
+    if (!proof_zcc_private_open(paths->state, paths->key)) {
+        proof_why(why, why_len, "proof_private_compile_cache_unavailable");
+        return false;
+    }
+    int64_t started_us = platform_time_monotonic_us();
+    struct proof_phase_clock phases;
+    proof_phase_begin(&phases, paths);
+    if (paths->phases[0]) (void)remove(paths->phases);
+    proof_queue_wait_note(paths, queue_lock_wait_ms);
+    if (!worktree_exact(paths->root, local, true, why, why_len)) return false;
+    proof_phase_mark(&phases, "worktree_exact_root");
+    char prepare_log[PATH_MAX];
+    if (snprintf(prepare_log, sizeof(prepare_log), "%s/original-plan.log",
+                  paths->logs) >= (int)sizeof(prepare_log)) {
+        proof_why(why, why_len, "proof_original_plan_log_path_invalid");
+        return false;
+    }
+    if (!proof_original_plan_prepare(paths, paths->root, local, prepare_log,
+                                      why, why_len))
+        return false;
+    proof_phase_mark(&phases, "original_plan_prepare");
+    char generation[PATH_MAX];
+    struct proof_warmstart warm = {0};
+    struct dp_docs_fresh_run docs = {0};
+    bool generation_ready = generation_prepare(paths, local, ram_lease,
+                                               &warm, &docs, generation,
+                                               why, why_len);
+    bool ok = generation_ready;
+    if (ok) {
+        proof_phase_mark(&phases, "generation_prepare");
+        ok = proof_worker_generation(paths, local, base, generation,
+                                     started_us, &phases, &warm, &docs, why,
+                                     why_len);
+    }
+    ok = dp_worker_docs_verdict(&docs, paths, ok, why, why_len);
+    /* A PASS or a final refusal retires the generation; only an
+     * interrupted run keeps it for its exact re-run
+     * (dp_generation_retire_with()). */
+    if (generation_ready)
+        dp_generation_retire(paths, generation, ok, why);
+    return ok;
+}
+
+/* The generation-bound half of the worker: the changed set, then the body.
+ * Split out so proof_worker() has one place that joins the docs-fresh
+ * checkers on every refusal below. */
+static bool proof_worker_generation(const struct proof_paths *paths,
+                                    const char *local, const char *base,
+                                    const char *generation,
+                                    int64_t started_us,
+                                    struct proof_phase_clock *phases,
+                                    const struct proof_warmstart *warm,
+                                    struct dp_docs_fresh_run *docs,
+                                    char *why, size_t why_len)
+{
+    char scratch[PATH_MAX];
+    if (snprintf(scratch, sizeof(scratch), "%s.capture", paths->changed) >=
+        (int)sizeof(scratch)) {
+        proof_why(why, why_len, "changed_set_request_invalid");
+        return false;
+    }
+    /* `generation` — not `paths->root` — is what this reads: a private git
+     * worktree generation_prepare() just worktree_exact()'d to exactly
+     * `local`, sharing paths->root's object database so `base` still
+     * resolves. paths->root is the shared landing worktree a concurrent
+     * `dev land step` can rebase out from under a still-running proof; a
+     * changed-set capture that read it there could TOCTOU between this
+     * call and the source-identity checkpoint proof_worker_body() takes on
+     * `generation` moments later, refusing with remote_base_not_ancestor
+     * for a base that was real when this request was queued. `generation`
+     * is sealed by worktree_exact() above and touched by nothing else. */
+    struct zcl_dev_proof_changed_set changed = {0};
+    if (!zcl_dev_proof_changed_set_capture(generation, base, local, scratch,
+                                           paths->changed, &changed, why,
+                                           why_len))
+        return false;
+    proof_phase_mark(phases, "changed_files_capture");
+    bool ok = proof_worker_body(paths, local, base, generation, started_us,
+                                phases, warm, &changed, docs, why, why_len);
+    zcl_dev_proof_changed_set_release(&changed);
+    return ok;
+}
+
+/* ── Failure evidence ─────────────────────────────────────────────────────
+ *
+ * A failed attempt used to settle as a bare `child_proof_failed_exit_N`,
+ * and the one line saying what failed sat in a multi-megabyte log. This
+ * lifts a bounded digest from the attempt's own persisted files: the
+ * failing step from phases.txt, then up to DP_EVIDENCE_LINES distinct
+ * `FAIL at file:line (expr)`, `... FAIL`, `FAIL check-*` lines or the first
+ * compiler error from that step's log, with absolute checkout and
+ * generation prefixes removed, and a `logs:` pointer at the attempt. It is
+ * observation only: nothing here reads back into a verdict or a retry. */
+#define DP_EVIDENCE_MAX 1024
+#define DP_EVIDENCE_LINES 5
+#define DP_EVIDENCE_LINE_MAX 200
+#define DP_EVIDENCE_UNIT_MAX 96
+#define DP_EVIDENCE_STEPS 64
+#define DP_EVIDENCE_FOLLOW 2
+
+struct dp_evidence {
+    const char *step;
+    bool test_step;
+    bool lint_step;
+    const char *strip[2];
+    char unit[DP_EVIDENCE_UNIT_MAX];
+    char lines[DP_EVIDENCE_LINES][DP_EVIDENCE_LINE_MAX];
+    size_t count;
+    char fallback_unit[DP_EVIDENCE_UNIT_MAX];
+    char fallback[DP_EVIDENCE_LINE_MAX];
+    bool error_kept;
+    bool in_fail_group;
+    bool in_failed_list;
+    int follow;
+};
+
+struct dp_evidence_step {
+    char name[48];
+    bool failed;
+};
+
+/* One `step=NAME ... cause=C exit=N` row of phases.txt. */
+static bool dp_evidence_step_parse(const char *line,
+                                   struct dp_evidence_step *step)
+{
+    if (strncmp(line, "step=", 5) != 0) return false;
+    size_t n = strcspn(line + 5, " \n");
+    if (n == 0 || n >= sizeof(step->name)) return false;
+    memcpy(step->name, line + 5, n);
+    step->name[n] = '\0';
+    const char *cause = strstr(line, " cause=");
+    const char *exit_field = strstr(line, " exit=");
+    step->failed =
+        (cause && strncmp(cause + 7, "none", 4) != 0) ||
+        (exit_field && strtol(exit_field + 6, NULL, 10) != 0);
+    return true;
+}
+
+/* The first step that failed and was never followed by a success of the
+ * same name (a recovered bundle retry is not the failure). The advisory
+ * test preflight never fails a proof, so it is never the answer. */
+static bool dp_evidence_step_pick(const struct dp_evidence_step *steps,
+                                  size_t count, char *out, size_t out_len)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (!steps[i].failed || strcmp(steps[i].name, "test_preflight") == 0)
+            continue;
+        bool recovered = false;
+        for (size_t j = i + 1; j < count && !recovered; j++)
+            recovered = !steps[j].failed &&
+                        strcmp(steps[j].name, steps[i].name) == 0;
+        if (recovered) continue;
+        (void)snprintf(out, out_len, "%s", steps[i].name);
+        return true;
+    }
+    return false;
+}
+
+/* The failing step and the generation root, both from phases.txt. */
+static bool dp_evidence_phases(const char *phases, char *step, size_t step_len,
+                               char generation[PATH_MAX])
+{
+    FILE *f = phases && phases[0] ? fopen(phases, "r") : NULL;
+    if (!f) return false;
+    struct dp_evidence_step steps[DP_EVIDENCE_STEPS];
+    size_t count = 0;
+    char line[1024];
+    static const char root_key[] = "generation_root=";
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, root_key, sizeof(root_key) - 1) == 0) {
+            (void)snprintf(generation, PATH_MAX, "%s",
+                           line + sizeof(root_key) - 1);
+            generation[strcspn(generation, "\r\n")] = '\0';
+        } else if (count < DP_EVIDENCE_STEPS &&
+                   dp_evidence_step_parse(line, &steps[count])) {
+            count++;
+        }
+    }
+    fclose(f);
+    return dp_evidence_step_pick(steps, count, step, step_len);
+}
+
+/* A proof dimension logs as `<key>.<name>.log`; every other step as
+ * `<name>.log`, and a bundle that was re-run left its answer in `.retry`. */
+static bool dp_evidence_log_path(const struct proof_paths *paths,
+                                 const char *step, char out[PATH_MAX])
+{
+    bool dimension = false;
+    for (size_t i = 0; i < ZCL_DEV_PROOF_DIMENSIONS && !dimension; i++)
+        dimension = strcmp(step, zcl_dev_proof_dimension_name(
+                                     (enum zcl_dev_proof_dimension_id)i)) == 0;
+    int n = dimension
+        ? snprintf(out, PATH_MAX, "%s/%s.%s.log", paths->logs, paths->key, step)
+        : snprintf(out, PATH_MAX, "%s/%s.log", paths->logs, step);
+    if (n <= 0 || n >= PATH_MAX) return false;
+    char retry[PATH_MAX];
+    if (strcmp(step, "bundle") == 0 &&
+        snprintf(retry, sizeof(retry), "%s.retry", out) < (int)sizeof(retry) &&
+        access(retry, R_OK) == 0)
+        (void)snprintf(out, PATH_MAX, "%s", retry);
+    return true;
+}
+
+/* Remove every `<prefix>/` occurrence, so a path reads repo-relative. */
+static void dp_evidence_strip(char *text, const char *prefix)
+{
+    size_t plen = prefix ? strlen(prefix) : 0;
+    if (plen < 2) return;
+    for (char *hit = strstr(text, prefix); hit; hit = strstr(hit, prefix)) {
+        size_t cut = plen + (hit[plen] == '/' ? 1 : 0);
+        memmove(hit, hit + cut, strlen(hit + cut) + 1);
+    }
+}
+
+/* Never end on a partial UTF-8 sequence after truncation. */
+static void dp_evidence_utf8_trim(char *text)
+{
+    size_t n = strlen(text), back = 0;
+    while (back < n && back < 4 &&
+           ((unsigned char)text[n - 1 - back] & 0xC0) == 0x80)
+        back++;
+    if (back >= n) return;
+    unsigned char lead = (unsigned char)text[n - 1 - back];
+    size_t want = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+    if (lead >= 0xC0 && want != back + 1) text[n - 1 - back] = '\0';
+}
+
+/* Clean one candidate: no control bytes, no absolute prefixes, runs of
+ * blanks collapsed, bounded. */
+static void dp_evidence_clean(const struct dp_evidence *e, const char *in,
+                              char out[DP_EVIDENCE_LINE_MAX])
+{
+    char work[1024];
+    size_t w = 0;
+    bool blank = true;
+    for (const unsigned char *p = (const unsigned char *)in;
+         *p && w + 1 < sizeof(work); p++) {
+        bool space = *p < 0x20 || *p == 0x7f || *p == ' ';
+        if (space && blank) continue;
+        work[w++] = space ? ' ' : (char)*p;
+        blank = space;
+    }
+    while (w > 0 && work[w - 1] == ' ') w--;
+    work[w] = '\0';
+    for (size_t i = 0; i < 2; i++) dp_evidence_strip(work, e->strip[i]);
+    (void)snprintf(out, DP_EVIDENCE_LINE_MAX, "%s", work);
+    dp_evidence_utf8_trim(out);
+}
+
+static void dp_evidence_keep(struct dp_evidence *e, const char *text)
+{
+    char clean[DP_EVIDENCE_LINE_MAX];
+    if (e->count >= DP_EVIDENCE_LINES) return;
+    dp_evidence_clean(e, text, clean);
+    if (!clean[0]) return;
+    for (size_t i = 0; i < e->count; i++)
+        if (strcmp(e->lines[i], clean) == 0) return;
+    (void)snprintf(e->lines[e->count++], DP_EVIDENCE_LINE_MAX, "%s", clean);
+}
+
+/* The test runner's per-group banner and its closing failed-group list:
+ * only a failing group's own output is evidence, never a passing group's
+ * log that merely prints the word FAIL. */
+static bool dp_evidence_test_frame(struct dp_evidence *e, const char *line)
+{
+    static const char banner[] = "==================== ";
+    if (strncmp(line, banner, sizeof(banner) - 1) == 0) {
+        const char *name = line + sizeof(banner) - 1;
+        size_t n = strcspn(name, " ");
+        e->in_fail_group = strstr(name, " (FAIL") ||
+                           strstr(name, " (SIGNALED") ||
+                           strstr(name, " (WEDGED");
+        if (e->in_fail_group && !e->unit[0] && n < sizeof(e->unit))
+            (void)snprintf(e->unit, sizeof(e->unit), "%.*s", (int)n, name);
+        return true;
+    }
+    if (strncmp(line, "Failed groups:", 14) == 0) {
+        e->in_failed_list = true;
+        e->in_fail_group = false;
+        return true;
+    }
+    if (e->in_failed_list && strncmp(line, "  - ", 4) == 0) {
+        const char *name = line + 4;
+        size_t n = strcspn(name, ":");
+        if (!e->fallback_unit[0] && name[n] == ':' &&
+            n < sizeof(e->fallback_unit)) {
+            (void)snprintf(e->fallback_unit, sizeof(e->fallback_unit),
+                           "%.*s", (int)n, name);
+            const char *rest = name + n + 1;
+            (void)snprintf(e->fallback, sizeof(e->fallback), "%.*s",
+                           (int)strcspn(rest, "\r\n"), rest);
+            char *log = strstr(e->fallback, " log=");
+            if (log) *log = '\0';
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool dp_evidence_ends_fail(const char *text)
+{
+    size_t n = strcspn(text, "\r\n");
+    return n >= 5 && memcmp(text + n - 5, " FAIL", 5) == 0;
+}
+
+static bool dp_evidence_compiler_error(const char *text)
+{
+    return strstr(text, ": error:") || strstr(text, "fatal error:") ||
+           strncmp(text, "error:", 6) == 0 ||
+           strstr(text, "undefined reference to");
+}
+
+/* A lint gate's summary row, `FAIL check-x ...`, names the unit. */
+static bool dp_evidence_lint_row(struct dp_evidence *e, const char *text)
+{
+    if (!e->lint_step || strncmp(text, "FAIL check-", 11) != 0) return false;
+    size_t n = strcspn(text + 5, " \t\r\n");
+    if (!e->unit[0] && n < sizeof(e->unit))
+        (void)snprintf(e->unit, sizeof(e->unit), "%.*s", (int)n, text + 5);
+    return true;
+}
+
+/* A gate's own verdict line, `check_x: FAIL ...`, and the few indented
+ * lines that name its violations. */
+static bool dp_evidence_lint_verdict(struct dp_evidence *e, const char *text)
+{
+    const char *colon = strstr(text, ": FAIL");
+    if (!e->lint_step || strncmp(text, "check_", 6) != 0 || !colon ||
+        (size_t)(colon - text) != strcspn(text, " :"))
+        return false;
+    e->follow = DP_EVIDENCE_FOLLOW;
+    return true;
+}
+
+/* After a gate's verdict line, keep its next few indented lines. True
+ * when this line was consumed that way. */
+static bool dp_evidence_follow(struct dp_evidence *e, const char *line,
+                               const char *text)
+{
+    if (e->follow <= 0) return false;
+    bool indented = text != line && *text && *text != '\n';
+    e->follow = indented ? e->follow - 1 : 0;
+    if (indented) dp_evidence_keep(e, text);
+    return indented;
+}
+
+static void dp_evidence_line(struct dp_evidence *e, const char *line)
+{
+    if (e->test_step && dp_evidence_test_frame(e, line)) return;
+    const char *text = line + strspn(line, " \t");
+    if (dp_evidence_follow(e, line, text)) return;
+    if (e->test_step && !e->in_fail_group) return;
+    const char *fail_at = strstr(text, "FAIL at ");
+    if (fail_at) {
+        dp_evidence_keep(e, fail_at);
+    } else if (dp_evidence_lint_row(e, text) ||
+               dp_evidence_lint_verdict(e, text) ||
+               dp_evidence_ends_fail(text)) {
+        dp_evidence_keep(e, text);
+    } else if (dp_evidence_compiler_error(text)) {
+        if (!e->error_kept) dp_evidence_keep(e, text);
+        e->error_kept = true;
+    } else if (!e->fallback[0] && strncmp(text, "make: *** ", 10) == 0) {
+        (void)snprintf(e->fallback, sizeof(e->fallback), "%.*s",
+                       (int)strcspn(text, "\r\n"), text);
+    }
+}
+
+static void dp_evidence_scan(struct dp_evidence *e, const char *log)
+{
+    FILE *f = fopen(log, "r");
+    if (!f) return;
+    char line[4096];
+    while (e->count < DP_EVIDENCE_LINES && fgets(line, sizeof(line), f))
+        dp_evidence_line(e, line);
+    fclose(f);
+}
+
+/* Append one line to the digest when the whole line still fits. */
+static bool dp_evidence_append(char *out, size_t out_len, size_t *used,
+                               const char *line)
+{
+    int n = snprintf(out + *used, out_len - *used, "%s%s",
+                     *used ? "\n" : "", line);
+    if (n < 0 || (size_t)n >= out_len - *used) {
+        out[*used] = '\0';
+        return false;
+    }
+    *used += (size_t)n;
+    return true;
+}
+
+/* The pair key is `<change>-<base>`, both 40 hex digits. */
+static bool dp_evidence_change(const char *key, char out[41])
+{
+    if (!key) return false;
+    for (size_t i = 0; i < 40; i++) {
+        char c = key[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    if (key[40] != '-') return false;
+    memcpy(out, key, 40);
+    out[40] = '\0';
+    return true;
+}
+
+/* A FAIL-at line or a compiler diagnostic names one repo-relative file. */
+static bool dp_evidence_file_of(const char *line, char *out, size_t cap)
+{
+    const char *mark = line ? strstr(line, "FAIL at ") : NULL;
+    const char *start = mark ? mark + 8 : line;
+    const char *colon;
+    size_t n;
+    if (!start || start[0] == '/' || start[0] == '\0') return false;
+    colon = strchr(start, ':');
+    if (!colon || colon == start) return false;
+    n = (size_t)(colon - start);
+    if (n == 0 || n >= cap) return false;
+    memcpy(out, start, n);
+    out[n] = '\0';
+    return true;
+}
+
+/* One line the lander keeps beside the step digest: the change, the file,
+ * and the gate. Absent when any of the three cannot be named. */
+static bool dp_evidence_cause(const struct dp_evidence *e,
+                              const struct proof_paths *paths,
+                              const char *first, char *out, size_t cap)
+{
+    char change[41], file[160];
+    int n;
+    if (!e || !e->step || !e->step[0] || !first) return false;
+    if (!dp_evidence_change(paths->key, change)) return false;
+    if (!dp_evidence_file_of(first, file, sizeof(file))) return false;
+    n = snprintf(out, cap, "cause change=%s file=%s gate=%s",
+                 change, file, e->step);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* `<step>[ <unit>]: <first line>`, the cause, the rest one per line, then `logs:`. */
+static void dp_evidence_render(const struct dp_evidence *e,
+                               const struct proof_paths *paths, char *out,
+                               size_t out_len)
+{
+    char head[DP_EVIDENCE_LINE_MAX + DP_EVIDENCE_UNIT_MAX + 64];
+    char fallback[DP_EVIDENCE_LINE_MAX];
+    const char *unit = e->unit[0] ? e->unit : e->fallback_unit;
+    const char *first = e->count ? e->lines[0] : NULL;
+    if (!first && e->fallback[0]) {
+        dp_evidence_clean(e, e->fallback, fallback);
+        first = fallback;
+    }
+    (void)snprintf(head, sizeof(head), "%s%s%s: %s", e->step,
+                   unit[0] ? " " : "", unit,
+                   first && first[0] ? first : "no FAIL line in its log");
+    size_t used = 0;
+    char cause[256];
+    out[0] = '\0';
+    (void)dp_evidence_append(out, out_len, &used, head);
+    if (dp_evidence_cause(e, paths, first, cause, sizeof(cause)))
+        (void)dp_evidence_append(out, out_len, &used, cause);
+    for (size_t i = 1; i < e->count; i++)
+        (void)dp_evidence_append(out, out_len, &used, e->lines[i]);
+    size_t root_len = strlen(paths->root);
+    const char *logs = paths->logs;
+    if (strncmp(logs, paths->root, root_len) == 0 && logs[root_len] == '/')
+        logs += root_len + 1;
+    char pointer[PATH_MAX + 8];
+    (void)snprintf(pointer, sizeof(pointer), "logs: %s", logs);
+    (void)dp_evidence_append(out, out_len, &used, pointer);
+}
+
+/* The bounded digest for a failed attempt, or false when no step failed
+ * (a refusal before any child ran has nothing to lift). */
+static bool dp_failure_evidence(const struct proof_paths *paths, char *out,
+                                size_t out_len)
+{
+    char step[48], generation[PATH_MAX] = {0}, log[PATH_MAX];
+    if (!paths || !out || out_len == 0) return false;
+    out[0] = '\0';
+    if (!dp_evidence_phases(paths->phases, step, sizeof(step), generation) ||
+        !dp_evidence_log_path(paths, step, log))
+        return false;
+    struct dp_evidence e = {0};
+    e.step = step;
+    e.test_step = strcmp(step, "test") == 0;
+    e.lint_step = strcmp(step, "lint") == 0;
+    e.strip[0] = generation;
+    e.strip[1] = paths->root;
+    dp_evidence_scan(&e, log);
+    dp_evidence_render(&e, paths, out, out_len);
+    return out[0] != '\0';
+}
+
+/* Settle a failed attempt: the pair's `.failed` record and the attempt's
+ * own `logs/failure.txt` archive carry the same bytes. The first line is
+ * the failure token, byte for byte what it always was; the evidence digest
+ * follows it when the failing step left one. */
+static void dp_failure_settle(const struct proof_paths *paths, const char *why)
+{
+    const char *message = why && why[0]
+        ? why : "background_verification_failed";
+    /* A run cancelled from outside (requester signal, or the base
+     * probe) says so in its settled text, whichever phase it was in,
+     * so the lander can tell an interrupted run from a verdict on the
+     * candidate. Still a failure: nothing here can read as PASS. */
+    char interrupted[256];
+    if (zcl_devloop_process_cancel_requested() &&
+        !zcl_dev_proof_failure_interrupted(message) &&
+        snprintf(interrupted, sizeof(interrupted), "%s%s",
+                 ZCL_DEV_PROOF_INTERRUPTED_PREFIX, message) > 0)
+        message = interrupted;
+    char record[DP_FAILURE_RECORD_MAX], evidence[DP_EVIDENCE_MAX];
+    int n = dp_failure_evidence(paths, evidence, sizeof(evidence))
+        ? snprintf(record, sizeof(record), "%s\n%s", message, evidence)
+        : -1;
+    if (n > 0 && (size_t)n < sizeof(record)) message = record;
+    char failure_log[PATH_MAX];
+    if (snprintf(failure_log, sizeof(failure_log), "%s/failure.txt",
+                 paths->logs) < (int)sizeof(failure_log))
+        (void)proof_write_if_current(paths, failure_log, message,
+                                     strlen(message), 0600);
+    (void)proof_write_if_current(paths, paths->failure, message,
+                                 strlen(message), 0600);
+}
+
+#if defined(ZCL_TESTING)
+/* Run one stub child as dimension `id` of a fresh attempt for the exact
+ * pair under `repo_root`, then settle its failure exactly as
+ * proof_worker_run() does. Returns true when the child failed and the
+ * failure was settled. No generation, receipt, or admission is involved. */
+bool zcl_dev_proof_test_settle_child(const char *repo_root, const char *local,
+                                     const char *base,
+                                     enum zcl_dev_proof_dimension_id id,
+                                     const char *const argv[], char *why,
+                                     size_t why_len)
+{
+    struct proof_paths pair, attempt;
+    if (!argv || !why || why_len == 0 ||
+        !proof_paths_fill(repo_root, local, base, &pair) ||
+        !proof_state_prepare(&pair) ||
+        !proof_attempt_paths_prepare(&pair, &attempt) ||
+        !proof_lease_publish(&attempt))
+        return false;
+    why[0] = '\0';
+    struct zcl_dev_proof_dimension dim = {0};
+    dim.selected = 1;
+    struct zcl_dev_proof_budget budget =
+        zcl_dev_proof_budget_make(60000, PROOF_STEP_FLOOR_MS);
+    bool passed = run_dimension(&attempt, id, argv, &dim, false, &budget,
+                                why, why_len);
+    if (!passed) dp_failure_settle(&attempt, why);
+    proof_lease_release(&attempt);
+    return !passed;
+}
+#endif
+
+static bool proof_worker_run(const struct proof_paths *paths,
+                             const char *local, const char *base,
+                             int64_t queue_lock_wait_ms,
+                             char *why, size_t why_len)
+{
+    struct sigaction child_action = {0};
+    child_action.sa_handler = SIG_DFL;
+    sigemptyset(&child_action.sa_mask);
+    struct platform_ram_scratch_lease ram_lease = {0};
+    struct rusage self_before, children_before;
+    bool cpu_timed = getrusage(RUSAGE_SELF, &self_before) == 0 &&
+                     getrusage(RUSAGE_CHILDREN, &children_before) == 0;
+    bool ok = sigaction(SIGCHLD, &child_action, NULL) == 0 &&
+              proof_worker(paths, local, base, &ram_lease,
+                           queue_lock_wait_ms, why, why_len);
+    (void)proof_zcc_private_close(paths->state, paths->key);
+    if (cpu_timed) proof_cpu_note(paths, &self_before, &children_before);
+    if (!ok && (!why || !why[0]))
+        proof_why(why, why_len, "proof_child_reaping_unavailable");
+    if (!ok) dp_failure_settle(paths, why);
+    proof_lease_release(paths);
+    /* This attempt is the generation's life where RAM scratch is concerned:
+     * its reserved room goes back to the pool the moment the worker is done,
+     * every failure path included. */
+    platform_ram_scratch_release(&ram_lease);
+    return ok;
+}
+
+static bool proof_queue_directories(const char *repo_root,
+                                    char state[PATH_MAX],
+                                    char requests[PATH_MAX],
+                                    char attempts[PATH_MAX])
+{
+    char root[PATH_MAX];
+    if (!repo_root ||
+        !platform_directory_canonical_real(repo_root, root, sizeof(root)))
+        return false;
+    int state_len = snprintf(state, PATH_MAX, "%s/.cache/zcl-dev-proof", root);
+    int request_len = state_len > 0 && state_len < PATH_MAX
+        ? snprintf(requests, PATH_MAX, "%s/requests", state) : -1;
+    int attempt_len = request_len > 0 && request_len < PATH_MAX
+        ? snprintf(attempts, PATH_MAX, "%s/attempts", state) : -1;
+    return state_len > 0 && state_len < PATH_MAX && request_len > 0 &&
+           request_len < PATH_MAX && attempt_len > 0 && attempt_len < PATH_MAX;
+}
+
+static bool proof_request_name(const char *name)
+{
+    static const char suffix[] = ".request";
+    size_t len = name ? strlen(name) : 0;
+    return len > sizeof(suffix) - 1 &&
+        strcmp(name + len - (sizeof(suffix) - 1), suffix) == 0 &&
+        !strchr(name, '/') && !strchr(name, '\\');
+}
+
+static bool proof_queue_has_pending_platform(const char *repo_root)
+{
+    char state[PATH_MAX], requests[PATH_MAX], attempts[PATH_MAX];
+    if (!proof_queue_directories(repo_root, state, requests, attempts))
+        return false;
+    DIR *dir = opendir(requests);
+    if (!dir) return false;
+    bool found = false;
+    for (struct dirent *entry = readdir(dir); entry; entry = readdir(dir)) {
+        char path[PATH_MAX], local[65], base[65];
+        if (!proof_request_name(entry->d_name) ||
+            snprintf(path, sizeof(path), "%s/%s", requests,
+                     entry->d_name) >= (int)sizeof(path))
+            continue;
+        if (proof_request_read(path, local, base, NULL, NULL) &&
+            proof_request_matches_pair(path, local, base)) {
+            found = true;
+            break;
+        }
+    }
+    (void)closedir(dir);
+    return found;
+}
+
+static bool proof_queue_select(const char *requests, char selected[PATH_MAX],
+                               char local[65], char base[65])
+{
+    DIR *dir = opendir(requests);
+    if (!dir) return false;
+    int64_t newest_wall = INT64_MIN, newest_monotonic = INT64_MIN;
+    selected[0] = 0;
+    for (struct dirent *entry = readdir(dir); entry; entry = readdir(dir)) {
+        char path[PATH_MAX], candidate_local[65], candidate_base[65];
+        int64_t wall = 0, monotonic = 0;
+        if (!proof_request_name(entry->d_name) ||
+            snprintf(path, sizeof(path), "%s/%s", requests,
+                     entry->d_name) >= (int)sizeof(path) ||
+            !proof_request_read(path, candidate_local, candidate_base,
+                                &wall, &monotonic) ||
+            !proof_request_matches_pair(path, candidate_local,
+                                        candidate_base))
+            continue;
+        if (wall < newest_wall ||
+            (wall == newest_wall && monotonic < newest_monotonic) ||
+            (wall == newest_wall && monotonic == newest_monotonic &&
+             selected[0] && strcmp(path, selected) <= 0))
+            continue;
+        newest_wall = wall;
+        newest_monotonic = monotonic;
+        (void)snprintf(selected, PATH_MAX, "%s", path);
+        (void)snprintf(local, 65, "%s", candidate_local);
+        (void)snprintf(base, 65, "%s", candidate_base);
+    }
+    bool ok = closedir(dir) == 0 && selected[0];
+    return ok;
+}
+
+static bool proof_pair_superseded(const char *root,
+                                  const char *candidate_local,
+                                  const char *candidate_base,
+                                  const char *selected_local,
+                                  const char *selected_base)
+{
+    char ignored[2];
+    const char *local_argv[] = {
+        "git", "merge-base", "--is-ancestor", candidate_local,
+        selected_local, NULL};
+    const char *base_argv[] = {
+        "git", "merge-base", "--is-ancestor", candidate_base,
+        selected_base, NULL};
+    return git_capture(root, local_argv, ignored, sizeof(ignored)) &&
+           git_capture(root, base_argv, ignored, sizeof(ignored));
+}
+
+static void proof_queue_coalesce(const char *root, const char *requests,
+                                 const char *selected, const char *attempts,
+                                 const char *selected_local,
+                                 const char *selected_base)
+{
+    char superseded[PATH_MAX];
+    if (snprintf(superseded, sizeof(superseded), "%s/superseded", attempts) >=
+            (int)sizeof(superseded) ||
+        !platform_private_directory_ensure(superseded))
+        return;
+    char batch[PATH_MAX];
+    if (snprintf(batch, sizeof(batch), "%s/batch.XXXXXX", superseded) >=
+            (int)sizeof(batch) ||
+        !mkdtemp(batch))
+        return;
+    DIR *dir = opendir(requests);
+    if (!dir) return;
+    for (struct dirent *entry = readdir(dir); entry; entry = readdir(dir)) {
+        char source[PATH_MAX], target[PATH_MAX], local[65], base[65];
+        if (!proof_request_name(entry->d_name) ||
+            snprintf(source, sizeof(source), "%s/%s", requests,
+                     entry->d_name) >= (int)sizeof(source) ||
+            strcmp(source, selected) == 0 ||
+            !proof_request_read(source, local, base, NULL, NULL) ||
+            !proof_request_matches_pair(source, local, base) ||
+            !proof_pair_superseded(root, local, base, selected_local,
+                                   selected_base) ||
+            snprintf(target, sizeof(target), "%s/%s", batch,
+                     entry->d_name) >= (int)sizeof(target))
+            continue;
+        (void)rename(source, target);
+    }
+    (void)closedir(dir);
+}
+
+static bool dp_queue_select_exact(const char *root, const char *requested_local,
+                                   const char *requested_base, char selected[PATH_MAX],
+                                   char local[65], char base[65], struct proof_paths *pair)
+{
+    if (!proof_paths_fill(root, requested_local, requested_base, pair)) return false;
+    (void)snprintf(selected, PATH_MAX, "%s", pair->request);
+    return proof_request_read(selected, local, base, NULL, NULL) &&
+           strcmp(local, requested_local) == 0 && strcmp(base, requested_base) == 0 &&
+           proof_request_matches_pair(selected, local, base);
+}
+
+/* Everything the queue lock protects, in one step: pick the oldest pending
+ * request, build its paths, publish a lease, move the request into this
+ * attempt, and fold away the requests it supersedes. Returns 0 when the
+ * queue was empty, 1 when this attempt now owns a pair, -1 when the claim
+ * failed. The caller holds and releases the lock. */
+static int dp_queue_claim_locked(const char *repo_root, const char *requests,
+                                 const char *attempts,
+                                 const char *requested_local,
+                                 const char *requested_base,
+                                 char selected[PATH_MAX], char local[65],
+                                 char base[65], struct proof_paths *pair,
+                                 struct proof_paths *attempt)
+{
+    if (requested_local) {
+        if (!dp_queue_select_exact(repo_root, requested_local, requested_base,
+                                     selected, local, base, pair))
+            return -1;
+    } else if (!proof_queue_select(requests, selected, local, base)) return 0;
+    char claimed[PATH_MAX];
+    bool prepared = proof_paths_fill(repo_root, local, base, pair) &&
+        proof_state_prepare(pair) &&
+        proof_attempt_paths_prepare(pair, attempt) &&
+        snprintf(claimed, sizeof(claimed), "%s/request", attempt->attempt) <
+            (int)sizeof(claimed) && proof_lease_publish(attempt);
+    if (prepared && rename(selected, claimed) != 0) {
+        if (proof_lease_current(attempt)) (void)unlink(attempt->lease);
+        prepared = false;
+    }
+    if (!prepared) return -1;
+    if (!requested_local)
+        proof_queue_coalesce(pair->root, requests, selected, attempts, local,
+                             base);
+    return 1;
+}
+
+/* A sibling queue.lock is the existing landing-root marker. Inspect it
+ * without following links so a broken marker cannot turn a landing proof
+ * into an ordinary unguarded proof. The row lock itself is never held here. */
+static int dp_landing_step_path(const char *root, char step[PATH_MAX])
+{
+    char marker[PATH_MAX];
+    struct stat st;
+    if (!zcl_devloop_landing_queue_lock_path(root, marker, sizeof(marker)))
+        return -1;
+    if (lstat(marker, &st) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISREG(st.st_mode) || st.st_uid != geteuid()) return -1;
+    int len = snprintf(step, PATH_MAX, "%s/../step.lock", root);
+    return len > 0 && len < PATH_MAX ? 1 : -1;
+}
+
+/* Open the same persistent inode used by native_dev_land's exclusive step
+ * writer. Only this private regular lock is trusted; a replaced path or
+ * symlink must not give the worker an unrelated lock to hold. */
+static int dp_landing_step_open(const char *step)
+{
+    int fd = open(step, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+                   0600);
+    if (fd < 0) return -1;
+    struct stat held, named;
+    bool valid = fstat(fd, &held) == 0 && lstat(step, &named) == 0 &&
+        S_ISREG(held.st_mode) && S_ISREG(named.st_mode) &&
+        held.st_uid == geteuid() &&
+        (held.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+        held.st_dev == named.st_dev && held.st_ino == named.st_ino;
+    if (valid) return fd;
+    (void)close(fd);
+    return -1;
+}
+
+/* How long a resident proof worker waits for landing preparation to release
+ * the step lock before deferring back to the reactor, and how often it
+ * re-tries inside that window.
+ *
+ * WHY A WAIT AT ALL. flock() gives a non-blocking waiter no fairness and no
+ * wake on release, and the reactor offers this lock once per loop iteration
+ * (~1 s). Every `dev land step` takes LOCK_EX for its whole run whatever
+ * phase it reports — including the sub-second steps that only read proof
+ * state — so a keeper stepping in a loop keeps an exclusive holder present
+ * most of the time and the once-a-second sample keeps landing on one.
+ * Measured on train 53's first landing attempt: the request was queued at
+ * 11:17:50Z, every step after it answered ok in about half a second with
+ * phase=prove, and the attempt directory was not created until 11:32:54Z —
+ * 15 of the 27 minutes spent starving on this lock while nothing reported a
+ * problem. Re-trying inside the worker turns a 1 Hz sample into a 20 Hz one,
+ * so the proof takes the lock at the release rather than behind the next
+ * holder.
+ *
+ * WHY IT IS STILL BOUNDED. A proof deferred behind REAL preparation should
+ * wait — but not in this slot: the reactor holds one commit-proof worker at
+ * a time, so a worker parked here indefinitely is a worse outage than the
+ * delay. Preparation's longest single step measured on this box is a
+ * lint-fast pass at about 124 s; the window is deliberately shorter, so a
+ * genuinely busy checkout still returns "deferred" and the reactor re-offers
+ * the work a second later. */
+#define DP_LANDING_STEP_WAIT_MS 30000
+#define DP_LANDING_STEP_RETRY_MS 50
+
+/* 1 acquired, 0 still held when the window ran out, -1 the lock itself is
+ * unusable. `wait_ms` of 0 is the old single non-blocking attempt. */
+static int dp_landing_step_share(int fd, int wait_ms)
+{
+    int64_t deadline = platform_time_monotonic_us() +
+                       (int64_t)(wait_ms > 0 ? wait_ms : 0) * 1000;
+    for (;;) {
+        if (flock(fd, LOCK_SH | LOCK_NB) == 0) return 1;
+        if (errno != EWOULDBLOCK && errno != EAGAIN) return -1;
+        if (platform_time_monotonic_us() >= deadline) return 0;
+        platform_sleep_ms(DP_LANDING_STEP_RETRY_MS);
+    }
+}
+
+/* Preparation owns LOCK_EX on step.lock. A proof shares that same lock
+ * from before claim until all worker evidence and lease cleanup settle.
+ * Contention is deferred work, never a failed proof observation. */
+static int dp_landing_proof_guard(const char *root, int *guard,
+                                  char *why, size_t why_len)
+{
+    *guard = -1;
+    char step[PATH_MAX];
+    int landing = dp_landing_step_path(root, step);
+    if (landing == 0) return 1;
+    if (landing < 0) {
+        proof_why(why, why_len, "proof_landing_queue_lock_invalid");
+        return -1;
+    }
+    int fd = dp_landing_step_open(step);
+    if (fd < 0) {
+        proof_why(why, why_len, "proof_landing_step_lock_failed");
+        return -1;
+    }
+    int shared = dp_landing_step_share(fd, DP_LANDING_STEP_WAIT_MS);
+    if (shared == 1) {
+        *guard = fd;
+        return 1;
+    }
+    (void)close(fd);
+    if (shared == 0) {
+        proof_why(why, why_len, "proof_landing_preparation_busy");
+        return 0;
+    }
+    proof_why(why, why_len, "proof_landing_step_lock_failed");
+    return -1;
+}
+
+#if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
+/* The step-lock share a resident proof worker performs, against a caller
+ * named lock file and window, so the registered group can measure what the
+ * window buys without a landing worktree and a real proof. Returns what
+ * dp_landing_step_share() returns; the descriptor (and with it the shared
+ * lock) is released before returning, because the caller is measuring the
+ * acquisition, not holding it. */
+int zcl_dev_proof_landing_step_share(const char *step_path, int wait_ms)
+{
+    int fd = dp_landing_step_open(step_path);
+    int shared;
+    if (fd < 0) return -1;
+    shared = dp_landing_step_share(fd, wait_ms);
+    (void)close(fd);
+    return shared;
+}
+#endif
+
+static int dp_proof_queue_run_guarded(const char *repo_root,
+                                         const char *requested_local,
+                                         const char *requested_base,
+                                         char *why, size_t why_len)
+{
+    char state[PATH_MAX], requests[PATH_MAX], attempts[PATH_MAX];
+    char queue_lock[PATH_MAX], selected[PATH_MAX], local[65], base[65];
+    if (!proof_queue_directories(repo_root, state, requests, attempts) ||
+        snprintf(queue_lock, sizeof(queue_lock), "%s/queue.lock", state) >=
+            (int)sizeof(queue_lock)) {
+        proof_why(why, why_len, "proof_queue_path_invalid");
+        return -1;
+    }
+    int64_t queue_lock_begin = platform_time_monotonic_us();
+    int fd = open(queue_lock, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX) != 0) {
+        if (fd >= 0) close(fd);
+        proof_why(why, why_len, "proof_queue_lock_failed");
+        return -1;
+    }
+    int64_t queue_lock_wait_ms =
+        (platform_time_monotonic_us() - queue_lock_begin) / 1000;
+    struct proof_paths pair, attempt;
+    int claimed = dp_queue_claim_locked(repo_root, requests, attempts,
+                                        requested_local, requested_base,
+                                        selected, local, base, &pair,
+                                        &attempt);
+    (void)flock(fd, LOCK_UN);
+    close(fd);
+    if (claimed == 0) return 0;
+    if (claimed < 0) {
+        proof_why(why, why_len, "proof_queue_claim_failed");
+        return -1;
+    }
+    if (why && why_len) why[0] = 0;
+    (void)proof_worker_run(&attempt, local, base, queue_lock_wait_ms,
+                           why, why_len);
+    return 1;
+}
+
+static int proof_queue_run_next_platform(const char *repo_root,
+                                         char *why, size_t why_len)
+{
+    char root[PATH_MAX];
+    if (!repo_root || !platform_directory_canonical_real(repo_root, root,
+                                                         sizeof(root))) {
+        proof_why(why, why_len, "proof_queue_path_invalid");
+        return -1;
+    }
+    int guard = -1;
+    int ready = dp_landing_proof_guard(root, &guard, why, why_len);
+    if (ready <= 0) return ready;
+    int execution = -1;
+    int result = zcl_dev_proof_execution_acquire(root, &execution, why, why_len);
+    if (result > 0) {
+        result = dp_proof_queue_run_guarded(root, NULL, NULL, why, why_len);
+        zcl_dev_proof_execution_release(execution);
+    }
+    proof_queue_lock_release(guard);
+    return result;
+}
+
+static bool proof_retry_platform(const char *repo_root,
+                                 const char *local_commit,
+                                 const char *remote_base,
+                                 struct zcl_dev_proof_status *out);
+
+static bool dp_environment_requeue(const char *root, const char *local,
+                                   const char *base,
+                                   struct zcl_dev_proof_status *out)
+{
+    return proof_retry_platform(root, local, base, out) ||
+           out->state == ZCL_DEV_PROOF_STATE_RUNNING ||
+           out->state == ZCL_DEV_PROOF_STATE_PASSED;
+}
+
+static bool proof_ensure_platform(const char *repo_root,
+                                  const char *local_commit,
+                                  const char *remote_base,
+                                  struct zcl_dev_proof_status *out)
+{
+    char local[65], base[65], why[160] = {0};
+    if (!out || !zcl_dev_proof_resolve_pair(repo_root, local_commit,
+                                             remote_base, local, base,
+                                             why, sizeof(why))) {
+        if (out) {
+            memset(out, 0, sizeof(*out));
+            out->state = ZCL_DEV_PROOF_STATE_INVALID;
+            (void)snprintf(out->detail, sizeof(out->detail), "%s", why);
+        }
+        return false;
+    }
+    if (!zcl_dev_proof_status_read(repo_root, local, base, out)) return false;
+    if (out->state == ZCL_DEV_PROOF_STATE_PASSED) {
+        out->receipt_reused = true;
+        return true;
+    }
+    if (out->state == ZCL_DEV_PROOF_STATE_RUNNING) return true;
+    /* A wrong producer did not test this candidate. The existing locked
+     * retry archives the old observation and queues a distinct attempt;
+     * it cannot manufacture a receipt or overwrite the prior archive. */
+    if (out->state == ZCL_DEV_PROOF_STATE_NO_VERDICT)
+        return dp_environment_requeue(repo_root, local, base, out);
+    /* A `.failed` marker settles the latest attempt for this exact pair.
+     * Automatic re-enqueueing here would spend a worker slot repeating an
+     * unrepaired failure and would leave
+     * a caller that only checks for MISSING/RUNNING believing work is
+     * still in flight. Only explicit retry after prerequisite repair may
+     * queue another attempt; ordinary ensure preserves the settled status. */
+    if (out->state == ZCL_DEV_PROOF_STATE_FAILED) return true;
+    if (!dp_pair_commit_objects_present(repo_root, local, base, out->detail,
+                                        sizeof(out->detail))) {
+        out->state = ZCL_DEV_PROOF_STATE_INVALID;
+        return false;
+    }
+    struct proof_paths paths;
+    if (!proof_paths_fill(repo_root, local, base, &paths) ||
+        !proof_state_prepare(&paths)) {
+        out->state = ZCL_DEV_PROOF_STATE_INVALID;
+        (void)snprintf(out->detail, sizeof(out->detail), "%s",
+                       "proof_state_unavailable");
+        return false;
+    }
+    char body[320];
+    size_t body_len = 0;
+    if (!proof_request_body(local, base, body, &body_len) ||
+        !write_atomic(paths.request, body, body_len, 0600)) {
+        out->state = ZCL_DEV_PROOF_STATE_INVALID;
+        (void)snprintf(out->detail, sizeof(out->detail), "%s",
+                       "resident_proof_enqueue_failed");
+        return false;
+    }
+    return zcl_dev_proof_status_read(repo_root, local, base, out);
+}
+
+/* Unknown marker contents are not evidence that a worker has stopped. A
+ * valid stale marker is harmless only when the kernel confirms ESRCH. */
+static bool dp_retry_worker_settled(const char *path, bool lease)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0) return errno == ENOENT;
+    if (!proof_private_regular(path)) return false;
+    int64_t pid = 0;
+    if (lease) {
+        char token[192];
+        if (!proof_lease_read(path, token, sizeof(token), &pid, NULL))
+            return false;
+    } else {
+        char body[128];
+        long long parsed_pid = 0, started = 0;
+        if (!proof_read_text(path, body, sizeof(body)) ||
+            sscanf(body, "%lld %lld", &parsed_pid, &started) != 2 ||
+            parsed_pid <= 1 || started <= 0)
+            return false;
+        pid = (int64_t)parsed_pid;
+    }
+    if ((int64_t)(pid_t)pid != pid) return false;
+    return kill((pid_t)pid, 0) != 0 && errno == ESRCH;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_text_reader(const char *path, unsigned reader)
+{
+    char text[192], local[65], base[65];
+    struct zcl_dev_proof_status status = {0};
+    switch (reader) {
+    case 0: return warm_status_line(path, text, sizeof(text));
+    case 1: return proof_running(path, NULL, NULL);
+    case 2: return proof_lease_read(path, text, sizeof(text), NULL, NULL);
+    case 3: return proof_request_read(path, local, base, NULL, NULL);
+    case 4: return dp_failure_record_read(path, &status);
+    case 5: return dp_retry_worker_settled(path, false);
+    default: return false;
+    }
+}
+#endif
+
+static bool dp_retry_absent(const char *path)
+{
+    struct stat st;
+    return lstat(path, &st) != 0 && errno == ENOENT;
+}
+
+/* Keep exact bytes, including any trailing newline, beside the failed
+ * attempt's logs. Existing archived evidence is checked, never replaced.
+ * Older marker-only failures have no attributable attempt and refuse. */
+static bool dp_retry_archive_failure(const struct proof_paths *paths,
+                                      char *why, size_t why_len)
+{
+    char logs[PATH_MAX], archive[PATH_MAX];
+    struct stat st;
+    uint8_t failure[DP_FAILURE_RECORD_MAX], prior[DP_FAILURE_RECORD_MAX];
+    size_t size = 0;
+    if (!proof_failure_bytes(paths->failure, failure, &size)) {
+        proof_why(why, why_len, "proof_retry_failure_evidence_invalid");
+        return false;
+    }
+    bool conflict = false;
+    if (!proof_failure_attempt_logs(paths, logs, sizeof(logs), &conflict)) {
+        proof_why(why, why_len, conflict ? "proof_retry_failure_archive_conflict"
+                                         : "proof_retry_failure_attempt_missing");
+        return false;
+    }
+    if (lstat(logs, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        snprintf(archive, sizeof(archive), "%s/failure.txt", logs) >=
+            (int)sizeof(archive)) {
+        proof_why(why, why_len, "proof_retry_failure_attempt_missing");
+        return false;
+    }
+    if (!dp_retry_absent(archive)) {
+        if (read_exact_file(archive, prior, size) &&
+            memcmp(prior, failure, size) == 0)
+            return true;
+        proof_why(why, why_len, "proof_retry_failure_archive_conflict");
+        return false;
+    }
+    if (write_atomic(archive, failure, size, 0600)) return true;
+    proof_why(why, why_len, "proof_retry_failure_archive_failed");
+    return false;
+}
+
+/* Called only while holding the queue's existing claim/publication lock.
+ * The old pair marker remains until the normal worker replaces it; a
+ * queued request already takes precedence in the status projection. */
+static bool dp_retry_locked(const struct proof_paths *paths,
+                             const char *local, const char *base,
+                             struct zcl_dev_proof_status *out)
+{
+    if (!zcl_dev_proof_status_read(paths->root, local, base, out)) return false;
+    const char *refusal = NULL;
+    if (out->state != ZCL_DEV_PROOF_STATE_FAILED &&
+        out->state != ZCL_DEV_PROOF_STATE_NO_VERDICT)
+        refusal = "proof_retry_requires_settled_failure";
+    else if (!dp_retry_absent(paths->receipt))
+        refusal = "proof_retry_receipt_present";
+    else if (!dp_retry_absent(paths->request))
+        refusal = "proof_retry_request_present";
+    else if (!dp_retry_worker_settled(paths->lease, true) ||
+             !dp_retry_worker_settled(paths->lock, false))
+        refusal = "proof_retry_worker_not_settled";
+    if (refusal) {
+        proof_why(out->detail, sizeof(out->detail), refusal);
+        return false;
+    }
+    if (!dp_retry_archive_failure(paths, out->detail, sizeof(out->detail)))
+        return false;
+    char body[320];
+    size_t body_len = 0;
+    if (!proof_request_body(local, base, body, &body_len) ||
+        !write_atomic(paths->request, body, body_len, 0600)) {
+        proof_why(out->detail, sizeof(out->detail), "resident_proof_enqueue_failed");
+        return false;
+    }
+    return zcl_dev_proof_status_read(paths->root, local, base, out);
+}
+
+static bool proof_retry_platform(const char *repo_root,
+                                 const char *local_commit,
+                                 const char *remote_base,
+                                 struct zcl_dev_proof_status *out)
+{
+    if (!out || !zcl_dev_proof_status_read(repo_root, local_commit,
+                                           remote_base, out))
+        return false;
+    if (out->state != ZCL_DEV_PROOF_STATE_FAILED &&
+        out->state != ZCL_DEV_PROOF_STATE_NO_VERDICT) {
+        proof_why(out->detail, sizeof(out->detail),
+                   "proof_retry_requires_settled_failure");
+        return false;
+    }
+    char local[65], base[65];
+    (void)snprintf(local, sizeof(local), "%s", out->local_commit);
+    (void)snprintf(base, sizeof(base), "%s", out->remote_base);
+    if (!dp_pair_commit_objects_present(repo_root, local, base, out->detail,
+                                        sizeof(out->detail))) {
+        out->state = ZCL_DEV_PROOF_STATE_INVALID;
+        return false;
+    }
+    struct proof_paths paths;
+    if (!proof_paths_fill(repo_root, local, base, &paths) ||
+        !proof_state_prepare(&paths)) {
+        proof_why(out->detail, sizeof(out->detail), "proof_state_unavailable");
+        return false;
+    }
+    int fd = proof_queue_lock_acquire(&paths);
+    if (fd < 0) {
+        proof_why(out->detail, sizeof(out->detail), "proof_queue_lock_failed");
+        return false;
+    }
+    bool queued = dp_retry_locked(&paths, local, base, out);
+    proof_queue_lock_release(fd);
+    return queued;
+}
+
+static bool proof_wait_platform(const char *repo_root,
+                                const char *local_commit,
+                                const char *remote_base,
+                                int timeout_ms,
+                                struct zcl_dev_proof_status *out)
+{
+    if (!out || timeout_ms < 1 || timeout_ms > 900000) return false;
+    int64_t deadline = platform_time_monotonic_us() + (int64_t)timeout_ms * 1000;
+    bool ensured = false;
+    for (;;) {
+        if (!zcl_dev_proof_status_read(repo_root, local_commit, remote_base, out))
+            return false;
+        if (!ensured && out->state == ZCL_DEV_PROOF_STATE_MISSING) {
+            ensured = true;
+            if (!zcl_dev_proof_ensure(repo_root, local_commit, remote_base, out))
+                return false;
+        }
+        if (out->state != ZCL_DEV_PROOF_STATE_RUNNING &&
+            out->state != ZCL_DEV_PROOF_STATE_MISSING)
+            return true;
+        if (platform_time_monotonic_us() >= deadline) return true;
+        platform_sleep_ms(20);
+    }
+}
+
+#endif /* _WIN32 */
+
+int zcl_dev_proof_execution_acquire(const char *root, int *guard,
+                                    char *why, size_t why_len)
+{
+    if (!guard) return -1;
+    *guard = -1;
+#if defined(_WIN32)
+    (void)root;
+    proof_why(why, why_len, "windows_native_proof_worker_unavailable");
+    return -1;
+#else
+    char state[PATH_MAX], requests[PATH_MAX], attempts[PATH_MAX], lock[PATH_MAX];
+    char cache[PATH_MAX];
+    if (!proof_queue_directories(root, state, requests, attempts) ||
+        snprintf(cache, sizeof(cache), "%s/.cache", root) >= (int)sizeof(cache) ||
+        !platform_private_directory_ensure(cache) ||
+        !platform_private_directory_ensure(state) ||
+        snprintf(lock, sizeof(lock), "%s/execution.lock", state) >= (int)sizeof(lock)) {
+        proof_why(why, why_len, "proof_execution_path_invalid");
+        return -1;
+    }
+    int fd = dp_landing_step_open(lock);
+    if (fd < 0) {
+        proof_why(why, why_len, "proof_execution_lock_invalid");
+        return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        *guard = fd;
+        return 1;
+    }
+    int saved = errno;
+    (void)close(fd);
+    proof_why(why, why_len, "proof_execution_busy");
+    return saved == EWOULDBLOCK || saved == EAGAIN ? 0 : -1;
+#endif
+}
+
+void zcl_dev_proof_execution_release(int guard)
+{
+#if defined(_WIN32)
+    (void)guard;
+#else
+    proof_queue_lock_release(guard);
+#endif
+}
+
+#if !defined(_WIN32)
+static int dp_foreground_unarmed(const char *root, int *watch,
+                                 char *why, size_t why_len)
+{
+    char path[PATH_MAX];
+    struct stat state;
+    if (!watch) return -1;
+    *watch = -1;
+    if (!zcl_devloop_watch_lock_path(root, path, sizeof(path))) {
+        proof_why(why, why_len, "proof_watcher_state_unavailable");
+        return -1;
+    }
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 || fstat(fd, &state) != 0 || !S_ISREG(state.st_mode)) {
+        if (fd >= 0) (void)close(fd);
+        proof_why(why, why_len, "proof_watcher_state_unavailable");
+        return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int saved = errno;
+        (void)close(fd);
+        if (saved != EWOULDBLOCK && saved != EAGAIN) {
+            proof_why(why, why_len, "proof_watcher_state_unavailable");
+            return -1;
+        }
+        proof_why(why, why_len, "proof_foreground_requires_unarmed_checkout");
+        return 0;
+    }
+    *watch = fd;
+    return 1;
+}
+
+static volatile sig_atomic_t dp_foreground_signal;
+
+static void dp_foreground_cancel(int signal_number)
+{
+    dp_foreground_signal = signal_number;
+    zcl_devloop_process_cancel_request();
+}
+
+static const int dp_foreground_signals[] = {SIGINT, SIGTERM, SIGCHLD};
+
+static void dp_foreground_restore(const struct sigaction saved[3], size_t count)
+{
+    while (count > 0) {
+        count--;
+        (void)sigaction(dp_foreground_signals[count], &saved[count], NULL);
+    }
+}
+
+static bool dp_foreground_handlers(struct sigaction saved[3])
+{
+    struct sigaction action = {0};
+    sigemptyset(&action.sa_mask);
+    dp_foreground_signal = 0;
+    for (size_t i = 0; i < 3; i++) {
+        action.sa_handler = i == 2 ? SIG_DFL : dp_foreground_cancel;
+        if (sigaction(dp_foreground_signals[i], &action, &saved[i]) != 0) {
+            dp_foreground_restore(saved, i);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int64_t dp_base_probe_interval_us(
+    const struct zcl_dev_proof_base_probe *probe)
+{
+    int ms = probe && probe->interval_ms > 0 ? probe->interval_ms
+                                             : ZCL_DEV_PROOF_BASE_PROBE_MS;
+    return (int64_t)ms * 1000;
+}
+
+/* A proof whose base is no longer the remote tip can only be discarded:
+ * the lander re-checks the base after PASS and cuts a successor. Asking
+ * while it runs lets the doomed run end within one probe interval instead
+ * of at its natural end. Only an affirmative SUPERSEDED acts; the worker is
+ * then cancelled through the same SIGTERM path a requester signal takes. */
+static bool dp_base_probe_superseded(const struct zcl_dev_proof_base_probe *probe,
+                                     int64_t *next_us)
+{
+    if (!probe || !probe->observe) return false;
+    int64_t now = platform_time_monotonic_us();
+    if (now < *next_us) return false;
+    enum zcl_dev_proof_base_observation seen = probe->observe(probe->ctx);
+    *next_us = platform_time_monotonic_us() + dp_base_probe_interval_us(probe);
+    return seen == ZCL_DEV_PROOF_BASE_SUPERSEDED;
+}
+
+static int dp_foreground_wait(pid_t worker,
+                              const struct zcl_dev_proof_base_probe *probe,
+                              bool *superseded)
+{
+    bool forwarded = false;
+    int64_t next_probe_us =
+        platform_time_monotonic_us() + dp_base_probe_interval_us(probe);
+    for (;;) {
+        if (dp_foreground_signal && !forwarded) {
+            (void)kill(worker, SIGTERM);
+            forwarded = true;
+        }
+        int status = 0;
+        pid_t got = waitpid(worker, &status, WNOHANG);
+        if (got == worker)
+            return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 1 : -1;
+        if (got < 0 && errno != EINTR) return -1;
+        if (!forwarded && dp_base_probe_superseded(probe, &next_probe_us)) {
+            if (superseded) *superseded = true;
+            (void)kill(worker, SIGTERM);
+            forwarded = true;
+        }
+        platform_sleep_ms(20);
+    }
+}
+
+#if defined(ZCL_TESTING)
+int zcl_dev_proof_test_foreground_wait(
+    int worker_pid, const struct zcl_dev_proof_base_probe *probe,
+    bool *superseded)
+{
+    dp_foreground_signal = 0;
+    return dp_foreground_wait((pid_t)worker_pid, probe, superseded);
+}
+#endif
+
+/* The bounded worker owns inherited guards, even if its waiting requester
+ * is killed. Hard death of this worker itself frees both guards through the
+ * kernel and leaves the pair MISSING with the dead attempt's evidence
+ * preserved (qualified in impact_composition); containment of arbitrary
+ * escaped descendants remains a separate, unclaimed boundary. */
+static int dp_foreground_run(const char *root, const char *local, const char *base,
+                              int *execution, int *landing, int *watch,
+                              const struct zcl_dev_proof_base_probe *probe,
+                              bool *superseded, char *why, size_t why_len)
+{
+    struct sigaction saved[3];
+    if (zcl_devloop_process_cancel_requested() || !dp_foreground_handlers(saved)) {
+        proof_why(why, why_len, "proof_foreground_signal_setup_failed");
+        return -1;
+    }
+    pid_t worker = fork();
+    if (worker == 0) {
+        zcl_devloop_process_cancel_poll_clear();
+        int result = dp_proof_queue_run_guarded(root, local, base, why, why_len);
+        _exit(result == 1 ? 0 : 1);
+    }
+    if (worker < 0) {
+        dp_foreground_restore(saved, 3);
+        proof_why(why, why_len, "proof_foreground_fork_failed");
+        return -1;
+    }
+    (void)close(*execution);
+    if (*landing >= 0) (void)close(*landing);
+    (void)close(*watch);
+    *execution = -1;
+    *landing = -1;
+    *watch = -1;
+    int result = dp_foreground_wait(worker, probe, superseded);
+    dp_foreground_restore(saved, 3);
+    if (dp_foreground_signal) zcl_devloop_process_cancel_clear();
+    if (result < 0) proof_why(why, why_len, "proof_foreground_worker_interrupted");
+    return result;
+}
+
+static int dp_proof_step_owned(const char *root, const char *local,
+                                const char *base, struct zcl_dev_proof_status *out,
+                                int *execution, int *landing, int *watch,
+                                const struct zcl_dev_proof_base_probe *probe,
+                                bool *superseded)
+{
+    if (!proof_ensure_platform(root, local, base, out)) return -1;
+    if (out->state == ZCL_DEV_PROOF_STATE_PASSED ||
+        out->state == ZCL_DEV_PROOF_STATE_FAILED) return 1;
+    char why[256] = {0};
+    if (strcmp(out->detail, "resident_proof_request_queued") != 0) {
+        proof_why(out->detail, sizeof(out->detail), "proof_execution_busy");
+        return 0;
+    }
+    int claimed = dp_foreground_run(root, local, base, execution, landing,
+                                    watch, probe, superseded, why,
+                                    sizeof(why));
+    if (claimed < 0) {
+        proof_why(out->detail, sizeof(out->detail), why);
+        return -1;
+    }
+    return zcl_dev_proof_status_read(root, local, base, out) ? claimed : -1;
+}
+#endif
+
+int zcl_dev_proof_step(const char *root, const char *local, const char *base,
+                        struct zcl_dev_proof_status *out)
+{
+    return zcl_dev_proof_step_watched(root, local, base, NULL, out, NULL);
+}
+
+int zcl_dev_proof_step_watched(const char *root, const char *local,
+                               const char *base,
+                               const struct zcl_dev_proof_base_probe *probe,
+                               struct zcl_dev_proof_status *out,
+                               bool *superseded)
+{
+    if (superseded) *superseded = false;
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    if (!local || !local[0] || !base || !base[0]) {
+        out->state = ZCL_DEV_PROOF_STATE_INVALID;
+        proof_why(out->detail, sizeof(out->detail), "proof_step_requires_explicit_pair");
+        return -1;
+    }
+#if defined(_WIN32)
+    (void)root;
+    (void)probe;
+    proof_windows_unavailable(out);
+    return -1;
+#else
+    if (!zcl_dev_proof_status_read(root, local, base, out)) return -1;
+    int landing = -1, execution = -1, watch = -1;
+    int result = dp_landing_proof_guard(out->root, &landing,
+                                        out->detail, sizeof(out->detail));
+    if (result <= 0) return result;
+    result = zcl_dev_proof_execution_acquire(out->root, &execution,
+                                             out->detail, sizeof(out->detail));
+    if (result > 0) {
+        result = dp_foreground_unarmed(out->root, &watch,
+                                        out->detail, sizeof(out->detail));
+        if (result > 0)
+            result = dp_proof_step_owned(root, local, base, out, &execution,
+                                         &landing, &watch, probe, superseded);
+        zcl_dev_proof_execution_release(execution);
+    }
+    proof_queue_lock_release(landing);
+    if (watch >= 0) (void)close(watch);
+    return result;
+#endif
+}
+
+/* One public definition per API keeps platform arms from silently drifting
+ * as separate external symbols. The active arm remains a private, typed
+ * implementation selected above. */
+bool zcl_dev_proof_resolve_pair(const char *repo_root,
+                                const char *requested_local,
+                                const char *requested_base,
+                                char local_commit[65],
+                                char remote_base[65],
+                                char *why, size_t why_len)
+{
+    return proof_resolve_pair_platform(repo_root, requested_local,
+                                       requested_base, local_commit,
+                                       remote_base, why, why_len);
+}
+
+bool zcl_dev_proof_status_read(const char *repo_root,
+                               const char *local_commit,
+                               const char *remote_base,
+                               struct zcl_dev_proof_status *out)
+{
+    return proof_status_read_platform(repo_root, local_commit, remote_base,
+                                      out);
+}
+
+bool zcl_dev_proof_ensure(const char *repo_root,
+                          const char *local_commit,
+                          const char *remote_base,
+                          struct zcl_dev_proof_status *out)
+{
+    return proof_ensure_platform(repo_root, local_commit, remote_base, out);
+}
+
+bool zcl_dev_proof_queue_has_pending(const char *repo_root)
+{
+    return proof_queue_has_pending_platform(repo_root);
+}
+
+bool zcl_dev_proof_retry(const char *repo_root,
+                         const char *local_commit,
+                         const char *remote_base,
+                         struct zcl_dev_proof_status *out)
+{
+    return proof_retry_platform(repo_root, local_commit, remote_base, out);
+}
+
+int zcl_dev_proof_queue_run_next(const char *repo_root,
+                                 char *why, size_t why_len)
+{
+    return proof_queue_run_next_platform(repo_root, why, why_len);
+}
+
+bool zcl_dev_proof_wait(const char *repo_root,
+                        const char *local_commit,
+                        const char *remote_base,
+                        int timeout_ms,
+                        struct zcl_dev_proof_status *out)
+{
+    return proof_wait_platform(repo_root, local_commit, remote_base,
+                               timeout_ms, out);
+}

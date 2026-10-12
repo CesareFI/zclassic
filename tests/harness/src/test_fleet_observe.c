@@ -1,0 +1,596 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Purpose: fleet_observe classifies at the exact named thresholds, refuses a
+ *          malformed ledger row and an unknown enum by line number, detects
+ *          a drifted committed .def, and the rows it emits answer dev.know.
+ *
+ * NOT proven here: that tools/lint/check_fleet_observations.sh's own
+ * --selftest rejects a hand-edited committed file end to end — that gate
+ * carries its own fixture-driven selftest, run before every scan by `make
+ * check-fleet-observations`. This group proves the library the gate and the
+ * CLI both call. */
+#include "test/test_core.h"
+
+#include "fleet_observe.h"
+#include "fleetfacts/fleet_facts.h"
+
+#include <string.h>
+
+/* ── classification thresholds ────────────────────────────────────────── */
+
+static struct fo_pair fo_pair(const char *ex, const char *tc, int64_t n,
+                              int64_t land, int64_t fix_land)
+{
+    struct fo_pair p;
+
+    memset(&p, 0, sizeof(p));
+    (void)snprintf(p.executor, sizeof(p.executor), "%s", ex);
+    (void)snprintf(p.task_class, sizeof(p.task_class), "%s", tc);
+    p.n = n;
+    p.land = land;
+    p.fix_land = fix_land;
+    return p;
+}
+
+static struct fo_row fo_result(const char *outcome)
+{
+    struct fo_row row;
+
+    memset(&row, 0, sizeof(row));
+    row.ts_unix = 1000;
+    (void)snprintf(row.kind, sizeof(row.kind), "result");
+    (void)snprintf(row.executor, sizeof(row.executor), "grok");
+    (void)snprintf(row.task_class, sizeof(row.task_class),
+                   "unit_c23_one_file");
+    (void)snprintf(row.outcome, sizeof(row.outcome), "%s", outcome);
+    return row;
+}
+
+static int test_fleet_observe_classify(void)
+{
+    int failures = 0;
+
+    TEST("classify: n>=3 and p>=0.8 is routable_for") {
+        struct fo_pair p = fo_pair("grok", "unit_c23_one_file", 3, 3, 0);
+        struct fo_observation out[2];
+        size_t k = fo_classify(&p, out);
+
+        ASSERT_EQ((int)k, 1);
+        ASSERT_STR_EQ(out[0].relation, "routable_for");
+        ASSERT_EQ(out[0].num, (int64_t)3);
+        ASSERT_EQ(out[0].den, (int64_t)3);
+        PASS();
+    }
+
+    TEST("classify: 0 of n>=2 is refused_for, even though n<3") {
+        struct fo_pair p = fo_pair("mac", "land_train", 2, 0, 0);
+        struct fo_observation out[2];
+        size_t k = fo_classify(&p, out);
+
+        ASSERT_EQ((int)k, 1);
+        ASSERT_STR_EQ(out[0].relation, "refused_for");
+        PASS();
+    }
+
+    TEST("classify: n<3 and not all-zero is probe_for") {
+        struct fo_pair p = fo_pair("grok", "unit_docs", 2, 2, 0);
+        struct fo_observation out[2];
+        size_t k = fo_classify(&p, out);
+
+        ASSERT_EQ((int)k, 1);
+        ASSERT_STR_EQ(out[0].relation, "probe_for");
+        PASS();
+    }
+
+    TEST("classify: n==1 and 0 landed is probe_for, not refused_for "
+              "(refused needs n>=2)") {
+        struct fo_pair p = fo_pair("claude-haiku", "diagnose", 1, 0, 0);
+        struct fo_observation out[2];
+        size_t k = fo_classify(&p, out);
+
+        ASSERT_EQ((int)k, 1);
+        ASSERT_STR_EQ(out[0].relation, "probe_for");
+        PASS();
+    }
+
+    TEST("classify: n=3, p=2/3 (0.67) clears neither routable nor probe nor "
+              "refused, so it is observed_for") {
+        struct fo_pair p = fo_pair("glm", "verify", 3, 2, 0);
+        struct fo_observation out[2];
+        size_t k = fo_classify(&p, out);
+
+        ASSERT_EQ((int)k, 1);
+        ASSERT_STR_EQ(out[0].relation, "observed_for");
+        ASSERT_EQ(out[0].num, (int64_t)2);
+        ASSERT_EQ(out[0].den, (int64_t)3);
+        PASS();
+    }
+
+    TEST("classify: n=4, p=0.75 is also observed_for (below the 0.8 floor)") {
+        struct fo_pair p = fo_pair("claude-sonnet", "rebase_land", 4, 3, 0);
+        struct fo_observation out[2];
+        size_t k = fo_classify(&p, out);
+
+        ASSERT_EQ((int)k, 1);
+        ASSERT_STR_EQ(out[0].relation, "observed_for");
+        PASS();
+    }
+
+    TEST("classify: FIX_LAND at half of n or more adds a second "
+              "handles_with_finisher row") {
+        struct fo_pair p = fo_pair("grok", "unit_c23_one_file", 3, 3, 2);
+        struct fo_observation out[2];
+        size_t k = fo_classify(&p, out);
+
+        ASSERT_EQ((int)k, 2);
+        ASSERT_STR_EQ(out[0].relation, "routable_for");
+        ASSERT_STR_EQ(out[1].relation, "handles_with_finisher");
+        ASSERT_EQ(out[1].num, (int64_t)2);
+        ASSERT_EQ(out[1].den, (int64_t)3);
+        PASS();
+    }
+
+    TEST("classify: FIX_LAND below half of n adds no second row") {
+        struct fo_pair p = fo_pair("claude-sonnet", "verify", 10, 10, 1);
+        struct fo_observation out[2];
+        size_t k = fo_classify(&p, out);
+
+        ASSERT_EQ((int)k, 1);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+static int test_fleet_observe_ready_accounting(void)
+{
+    int failures = 0;
+
+    TEST("land outcomes retain legacy spellings without promoting readiness") {
+        ASSERT(fo_outcome_is_land("LAND"));
+        ASSERT(fo_outcome_is_land("FIX_LAND"));
+        ASSERT(fo_outcome_is_land("landed"));
+        ASSERT(!fo_outcome_is_land("READY"));
+        ASSERT(!fo_outcome_is_land("FIX"));
+        ASSERT(!fo_outcome_is_land("HOLD"));
+        ASSERT(!fo_outcome_is_land(NULL));
+        PASS();
+    }
+
+    TEST("aggregate: READY results count as completed observations, not land") {
+        struct fo_row rows[3];
+        struct fo_pair pairs[1];
+        struct fo_observation out[2];
+
+        for (size_t i = 0; i < 3; i++)
+            rows[i] = fo_result("READY");
+        memset(pairs, 0, sizeof(pairs));
+        ASSERT_EQ((int)fo_aggregate(rows, 3, 1000, 7, pairs, 1), 1);
+        ASSERT_EQ(pairs[0].n, (int64_t)3);
+        ASSERT_EQ(pairs[0].land, (int64_t)0);
+        ASSERT_EQ((int)fo_classify(&pairs[0], out), 1);
+        ASSERT_STR_EQ(out[0].relation, "refused_for");
+        ASSERT_EQ(out[0].num, (int64_t)0);
+        ASSERT_EQ(out[0].den, (int64_t)3);
+        PASS();
+    }
+
+    TEST("aggregate: four LAND plus READY is routable at exactly 4/5") {
+        struct fo_row rows[5];
+        struct fo_pair pairs[1];
+        struct fo_observation out[2];
+
+        for (size_t i = 0; i < 4; i++)
+            rows[i] = fo_result("LAND");
+        rows[4] = fo_result("READY");
+        memset(pairs, 0, sizeof(pairs));
+        ASSERT_EQ((int)fo_aggregate(rows, 5, 1000, 7, pairs, 1), 1);
+        ASSERT_EQ(pairs[0].n, (int64_t)5);
+        ASSERT_EQ(pairs[0].land, (int64_t)4);
+        ASSERT_EQ((int)fo_classify(&pairs[0], out), 1);
+        ASSERT_STR_EQ(out[0].relation, "routable_for");
+        ASSERT_EQ(out[0].num, (int64_t)4);
+        ASSERT_EQ(out[0].den, (int64_t)5);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+/* ── ledger parsing: malformed rows and unknown enums ─────────────────── */
+
+static int test_fleet_observe_parse(void)
+{
+    int failures = 0;
+
+    TEST("parse: a well-formed result row parses clean") {
+        struct fo_row row;
+        char err[128];
+        const char *line =
+            "2026-09-01T09:00:00Z\tresult\tnode1\tt1\tverify\tstory\t"
+            "claude-sonnet\tagent-tool\tsonnet\tmedium\t1\t1\t1\t0\t1\t1\t"
+            "1\tLAND\t0\t0\t0\tnote";
+
+        ASSERT(fo_parse_line(line, 7, &row, err, sizeof(err)));
+        ASSERT_STR_EQ(row.executor, "claude-sonnet");
+        ASSERT_STR_EQ(row.task_class, "verify");
+        ASSERT_STR_EQ(row.outcome, "LAND");
+        PASS();
+    }
+
+    TEST("parse: READY remains a valid stored outcome") {
+        struct fo_row row;
+        char err[128];
+        const char *line =
+            "2026-09-01T09:00:00Z\tresult\tnode1\tt1\tverify\tstory\t"
+            "claude-sonnet\tagent-tool\tsonnet\tmedium\t1\t1\t1\t0\t1\t1\t"
+            "1\tREADY\t0\t0\t0\tnote";
+
+        ASSERT(fo_parse_line(line, 8, &row, err, sizeof(err)));
+        ASSERT_STR_EQ(row.outcome, "READY");
+        PASS();
+    }
+
+    TEST("parse: a row missing fields is refused and names its line") {
+        struct fo_row row;
+        char err[128];
+
+        ASSERT(!fo_parse_line("2026-09-01T09:00:00Z\tresult\tnode1", 42, &row,
+                              err, sizeof(err)));
+        ASSERT(strstr(err, "42") != NULL);
+        PASS();
+    }
+
+    TEST("parse: an unknown task_class is refused, named line included") {
+        struct fo_row row;
+        char err[128];
+        const char *line =
+            "2026-09-01T09:00:00Z\tresult\tnode1\tt1\tnot_a_class\tstory\t"
+            "grok\tgrok-cli-queue\tgrok-4.6\thigh\t1\t1\t1\t0\t1\t1\t1\t"
+            "LAND\t0\t0\t0\tnote";
+
+        ASSERT(!fo_parse_line(line, 5, &row, err, sizeof(err)));
+        ASSERT(strstr(err, "5") != NULL);
+        ASSERT(strstr(err, "task_class") != NULL);
+        PASS();
+    }
+
+    TEST("parse: an unknown executor is refused") {
+        struct fo_row row;
+        char err[128];
+        const char *line =
+            "2026-09-01T09:00:00Z\tresult\tnode1\tt1\tverify\tstory\t"
+            "not_an_executor\tagent-tool\tsonnet\tmedium\t1\t1\t1\t0\t1\t1\t"
+            "1\tLAND\t0\t0\t0\tnote";
+
+        ASSERT(!fo_parse_line(line, 9, &row, err, sizeof(err)));
+        ASSERT(strstr(err, "executor") != NULL);
+        PASS();
+    }
+
+    TEST("parse: an unknown outcome is refused") {
+        struct fo_row row;
+        char err[128];
+        const char *line =
+            "2026-09-01T09:00:00Z\tresult\tnode1\tt1\tverify\tstory\t"
+            "grok\tgrok-cli-queue\tgrok-4.6\thigh\t1\t1\t1\t0\t1\t1\t1\t"
+            "MAYBE\t0\t0\t0\tnote";
+
+        ASSERT(!fo_parse_line(line, 11, &row, err, sizeof(err)));
+        ASSERT(strstr(err, "outcome") != NULL);
+        PASS();
+    }
+
+    TEST("parse: a malformed ISO-8601 timestamp is refused") {
+        struct fo_row row;
+        char err[128];
+        const char *line =
+            "not-a-timestamp\tresult\tnode1\tt1\tverify\tstory\t"
+            "grok\tgrok-cli-queue\tgrok-4.6\thigh\t1\t1\t1\t0\t1\t1\t1\t"
+            "LAND\t0\t0\t0\tnote";
+
+        ASSERT(!fo_parse_line(line, 3, &row, err, sizeof(err)));
+        ASSERT(strstr(err, "3") != NULL);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+static int test_fleet_observe_calendar(void)
+{
+    int failures = 0;
+    static const struct {
+        const char *stamp;
+        bool valid;
+        int64_t unix_seconds;
+    } cases[] = {
+        {"2026-02-29T00:00:00Z", false, 0},
+        {"2026-04-31T00:00:00Z", false, 0},
+        {"2024-02-29T00:00:00Z", true, 1709164800},
+        {"2000-02-29T00:00:00Z", true, 951782400},
+        {"1900-02-29T00:00:00Z", false, 0},
+        {"2026-02-28T00:00:00Z", true, 1772236800},
+        {"2026-04-30T00:00:00Z", true, 1777507200},
+        {"1900-02-28T00:00:00Z", true, -2203977600LL},
+        {"2026-01-31T00:00:00Z", true, 1769817600},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        TEST(cases[i].stamp) {
+            int64_t seconds = -1;
+            struct fo_row row;
+            char line[256], err[128];
+            int n = snprintf(line, sizeof(line),
+                "%s\tresult\tnode1\tt1\tverify\tstory\t"
+                "mac\tharness\tfixture\thigh\t1\t1\t1\t0\t1\t1\t1\t"
+                "LAND\t0\t0\t0\tnote", cases[i].stamp);
+
+            ASSERT(n > 0 && (size_t)n < sizeof(line));
+            ASSERT_EQ(fo_parse_iso8601(cases[i].stamp, &seconds), cases[i].valid);
+            ASSERT_EQ(seconds, cases[i].valid ? cases[i].unix_seconds : -1);
+            ASSERT_EQ(fo_parse_line(line, 42, &row, err, sizeof(err)), cases[i].valid);
+            if (cases[i].valid) {
+                ASSERT_EQ(row.ts_unix, cases[i].unix_seconds);
+            } else {
+                ASSERT_EQ(row.ts_unix, (int64_t)0);
+                ASSERT(strstr(err, "rows.tsv:42: ts is not a valid") != NULL);
+            }
+            PASS();
+        }
+_test_next:;
+    }
+    return failures;
+}
+
+/* ── --check drift detection ──────────────────────────────────────────── */
+
+static int test_fleet_observe_check(void)
+{
+    int failures = 0;
+
+    TEST("render: two generations from the same rows are byte-identical, "
+              "and a mutated observation set renders differently") {
+        struct fo_observation obs[2];
+        char a[4096], b[4096];
+        size_t la, lb;
+
+        memset(obs, 0, sizeof(obs));
+        (void)snprintf(obs[0].subject, sizeof(obs[0].subject), "grok");
+        (void)snprintf(obs[0].relation, sizeof(obs[0].relation),
+                       "routable_for");
+        (void)snprintf(obs[0].object, sizeof(obs[0].object),
+                       "unit_c23_one_file");
+        obs[0].num = 3;
+        obs[0].den = 3;
+
+        la = fo_render_def(obs, 1, 7, 1788512400, "tests/fixtures/x", a,
+                           sizeof(a));
+        lb = fo_render_def(obs, 1, 7, 1788512400, "tests/fixtures/x", b,
+                           sizeof(b));
+        ASSERT_EQ((int)la, (int)lb);
+        ASSERT(strcmp(a, b) == 0);
+
+        obs[0].den = 4; /* a drifted committed file would look like this */
+        lb = fo_render_def(obs, 1, 7, 1788512400, "tests/fixtures/x", b,
+                           sizeof(b));
+        (void)lb;
+        ASSERT(strcmp(a, b) != 0);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+/* ── dev.know answers from the generated table ────────────────────────── */
+
+static int test_fleet_observe_dev_know(void)
+{
+    int failures = 0;
+
+    TEST("dev.know: a routable_for ask answers with num/den/window in why") {
+        struct zcl_fleet_facts_answer_v1 answer;
+        bool found = false;
+
+        ASSERT(zcl_fleet_facts_query("grok", "routable_for", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &answer));
+        ASSERT(!answer.unknown);
+        for (size_t i = 0; i < answer.row_count; i++) {
+            if (strcmp(answer.rows[i].object, "unit_c23_one_file") == 0) {
+                found = true;
+                ASSERT_EQ((int)answer.rows[i].confidence,
+                          (int)ZCL_FLEET_CONFIDENCE_OBSERVED);
+                ASSERT(strstr(answer.rows[i].why, "3/3") != NULL);
+                ASSERT(strstr(answer.rows[i].why, "7 days") != NULL);
+            }
+        }
+        ASSERT(found);
+        PASS();
+    }
+
+    TEST("dev.know: a probe_for ask answers too, distinctly from routable") {
+        struct zcl_fleet_facts_answer_v1 answer;
+        bool found = false;
+
+        ASSERT(zcl_fleet_facts_query("glm", "probe_for", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &answer));
+        ASSERT(!answer.unknown);
+        for (size_t i = 0; i < answer.row_count; i++) {
+            if (strcmp(answer.rows[i].object, "unit_c23_one_file") == 0)
+                found = true;
+        }
+        ASSERT(found);
+        PASS();
+    }
+
+    TEST("dev.know: an executor with no observed row for a relation "
+              "answers unknown, same as the doctrine table") {
+        struct zcl_fleet_facts_answer_v1 answer;
+
+        ASSERT(zcl_fleet_facts_query("codex", "routable_for", NULL,
+                                     ZCL_FLEET_FACTS_MAX_ROWS, &answer));
+        ASSERT(answer.unknown);
+        PASS();
+    }
+
+_test_next:;
+    return failures;
+}
+
+static bool fo_record_tail(FILE *f, int kind)
+{
+    if (kind == 2)
+        return fwrite("\0junk\n", 1, 6, f) == 6;
+    if (kind == 3) {
+        for (size_t i = 0; i < FO_LINE_CAP; i++)
+            if (fputc('x', f) == EOF)
+                return false;
+    }
+    if (kind == 4 && fputs("\textra", f) < 0)
+        return false;
+    if (kind == 5 && fputs("\nshort", f) < 0)
+        return false;
+    if (kind == 7)
+        return fputs("\r\n", f) >= 0;
+    if (kind == 1 || kind == 3 || kind == 4)
+        return fputc('\n', f) != EOF;
+    return true;
+}
+
+static bool fo_record_fixture(const char *path, int kind)
+{
+    const char row[] = "2026-09-01T09:00:00Z\tresult\tnode1\tt1\tverify\tstory\t"
+        "grok\tharness\tmodel\thigh\t1\t1\t1\t0\t1\t1\t1\tLAND\t0\t0\t0\tnote";
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+    bool ok = fputs("header\n", f) >= 0 &&
+        fwrite(row, 1, sizeof(row) - 1, f) == sizeof(row) - 1 &&
+        fo_record_tail(f, kind);
+    int closed = fclose(f);
+    return ok && closed == 0;
+}
+
+static int test_fleet_observe_record(int kind, bool expected, const char *location,
+                                     const char *name)
+{
+    int failures = 0;
+    char path[PATH_MAX] = "";
+
+    TEST(name) {
+        int fd = test_mkstemp(path, sizeof(path), "fo_records");
+        struct fo_row rows[2];
+        size_t count = 99;
+        char err[256];
+        ASSERT(fd >= 0);
+        ASSERT_EQ(close(fd), 0);
+        ASSERT(fo_record_fixture(path, kind));
+        bool ok = fo_read_ledger(path, rows, 2, &count, err, sizeof(err));
+        ASSERT_EQ(ok, expected);
+        ASSERT_EQ(count, expected ? (size_t)1 : (size_t)0);
+        if (location)
+            ASSERT(strstr(err, location) != NULL);
+        PASS();
+    }
+_test_next:;
+    if (path[0])
+        (void)unlink(path);
+    return failures;
+}
+
+static int test_fleet_observe_read_error(void)
+{
+    int failures = 0;
+    char path[PATH_MAX] = "";
+    TEST("ledger refuses a directory read without publishing a count") {
+        struct fo_row rows[2];
+        size_t count = 99;
+        char err[256];
+        ASSERT(test_mkdtemp(path, sizeof(path), "fo_read_error") != NULL);
+        ASSERT(!fo_read_ledger(path, rows, 2, &count, err, sizeof(err)));
+        ASSERT_EQ(count, (size_t)0);
+        ASSERT(err[0] != '\0');
+        PASS();
+    }
+_test_next:;
+    if (path[0])
+        (void)rmdir(path);
+    return failures;
+}
+
+static int test_fleet_observe_open_diagnostic(void)
+{
+    int failures = 0;
+    char path[PATH_MAX] = "";
+    TEST("ledger open failure identifies the requested path") {
+        struct fo_row row;
+        size_t count = 99;
+        char err[PATH_MAX + 64], expected[PATH_MAX + 64];
+        ASSERT(test_mkdtemp(path, sizeof(path), "fo_missing") != NULL);
+        ASSERT_EQ(rmdir(path), 0);
+        ASSERT(!fo_read_ledger(path, &row, 1, &count, err, sizeof(err)));
+        ASSERT_EQ(count, (size_t)0);
+        (void)snprintf(expected, sizeof(expected), "cannot open ledger '%s'", path);
+        ASSERT(strcmp(err, expected) == 0);
+        PASS();
+    }
+_test_next:;
+    if (path[0])
+        (void)rmdir(path);
+    return failures;
+}
+
+static int test_fleet_observe_cap_diagnostic(void)
+{
+    int failures = 0;
+    char path[PATH_MAX] = "";
+    TEST("ledger row-cap failure identifies the configured cap") {
+        int fd = test_mkstemp(path, sizeof(path), "fo_cap");
+        struct fo_row row;
+        size_t count = 99;
+        char err[256];
+        ASSERT(fd >= 0);
+        ASSERT_EQ(close(fd), 0);
+        ASSERT(fo_record_fixture(path, 1));
+        ASSERT(!fo_read_ledger(path, &row, 0, &count, err, sizeof(err)));
+        ASSERT_EQ(count, (size_t)0);
+        ASSERT(strcmp(err, "rows.tsv:2: more rows than the 0-row cap") == 0);
+        PASS();
+    }
+_test_next:;
+    if (path[0])
+        (void)unlink(path);
+    return failures;
+}
+
+static int test_fleet_observe_records(void)
+{
+    int failures = 0;
+    failures += test_fleet_observe_record(0, true, NULL, "ledger accepts complete EOF");
+    failures += test_fleet_observe_record(1, true, NULL, "ledger accepts LF");
+    failures += test_fleet_observe_record(7, true, NULL, "ledger accepts CRLF");
+    failures += test_fleet_observe_record(2, false, ":2:", "ledger refuses NUL");
+    failures += test_fleet_observe_record(3, false, ":2:", "ledger refuses overlong record");
+    failures += test_fleet_observe_record(4, false, ":2:", "ledger refuses extra field");
+    failures += test_fleet_observe_record(5, false, ":3:", "ledger refuses short row");
+    failures += test_fleet_observe_read_error();
+    failures += test_fleet_observe_open_diagnostic();
+    failures += test_fleet_observe_cap_diagnostic();
+    return failures;
+}
+
+int test_fleet_observe(void)
+{
+    int failures = 0;
+    failures += test_fleet_observe_classify();
+    failures += test_fleet_observe_ready_accounting();
+    failures += test_fleet_observe_parse();
+    failures += test_fleet_observe_calendar();
+    failures += test_fleet_observe_check();
+    failures += test_fleet_observe_records();
+    failures += test_fleet_observe_dev_know();
+    return failures;
+}

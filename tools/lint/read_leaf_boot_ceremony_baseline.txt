@@ -1,0 +1,34 @@
+# Baseline for tools/lint/check_read_leaf_no_boot_ceremony.sh — SHRINK-ONLY.
+#
+# One line per grandfathered violation:  <leaf-path> <banned-symbol>
+#
+# These are OPEN DEFECTS, not exemptions. Each line is a leaf whose declared
+# effect is READ that still reaches a code path which writes the datadir it
+# was pointed at. They are listed here only so the gate can refuse the NEXT
+# one; deleting a line is the fix, and a line whose violation is gone FAILS
+# the gate until it is removed.
+#
+# EMPTY, and it stays that way. Both original lines are gone because both
+# leaves were fixed, not exempted:
+#
+#   app.store.products         sn_open_db -> node_db_open_runtime
+#                              (READWRITE|CREATE + create_schema +
+#                              node_db_migrate) became
+#                              zcl_native_node_db_require_readonly. It was
+#                              installing the node's 67 tables into any real
+#                              SQLite file sitting at <datadir>/node.db and
+#                              answering "returned": 0.
+#   core.sync.frontier.offline progress_store_open on consensus.db (CREATE, a
+#                              rename migration, a schema ensure, and
+#                              quarantine-then-recreate on a failed integrity
+#                              check) became
+#                              zcl_native_kernel_store_open_readonly. It was
+#                              rename()ing the append-only fact log aside to
+#                              consensus.db.corrupt-<ts> when asked what H*
+#                              was in a copied datadir.
+#
+# A new line here is a last resort, not a workflow. The fix is
+# zcl_native_node_db_open_readonly() for node.db and
+# zcl_native_kernel_store_open_readonly() for consensus.db; a leaf that
+# genuinely must write is not a READ leaf and should be redeclared
+# ZCL_COMMAND_READY_COMMAND.

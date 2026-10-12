@@ -1,0 +1,4 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Source-owned capability declaration: the run loop writes refusals and
+ * allocation failures to the diagnostic log (stderr). */
+ZCL_MODULE_CAPABILITY("platform/modules/rvuser/src/rvuser_run.c", CAP_FS_WRITE, "Writes refusal and allocation-failure diagnostics to the log stream.")

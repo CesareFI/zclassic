@@ -1,0 +1,161 @@
+# Copyright 2026 Rhett Creighton. Licensed under Apache-2.0.
+# check_command_input_keys.sh — grandfathered read-but-not-declared keys.
+#
+# Format: "<leaf path> <input key>  # why this read cannot reach this leaf".
+# SHRINK-ONLY: a new violation not listed here FAILS the gate, and a line
+# whose violation has gone away FAILS too (delete it in the same commit).
+#
+# Every entry here is one shape: a leaf shares its implementation with
+# sibling leaves, the shared function reads a key on a branch this leaf can
+# never take, and a purely static per-leaf attribution cannot tell that. Each
+# line must name the branch. Anything that is NOT that shape is a real
+# uncallable-input bug — declare the key instead of listing it here.
+
+app.messaging.read confirm    # awn_run() (engine/controllers/src/app_write_native_handlers.c) reads confirm only under `leaf->plan_commit`; the message-read leaf sets .plan_commit = false, so the read is dead here. The ZNAM write leaves that DO set it all declare confirm.
+zcode.leaderboard.all day     # zl_leaderboard() (tools/command/native_zcode_leaderboard_command.c) reads day to pin "today" for the period window; the all-time period's window is unbounded, so day cannot move this leaf's answer. daily/weekly/monthly share the function and declare day.
+zcode.network.providers kind  # handler injects fixed kind=provider into a private RPC object; kind is never read from request->input.
+zcode.network.publish operation # handler injects fixed operation=publish into a private RPC object; operation is never read from request->input.
+app.presentation.publication-status root # handler injects package_root as root into its private package-show request; request->input never reaches the nested handler.
+app.presentation.publication-status datadir # nested package-show reads datadir only from the private object; publication-status replaces request->input before that call.
+app.presentation.publication-status operation # package-status discovery injects operation into a private RPC object; request->input never reaches that helper.
+app.presentation.release-confirm details # release confirmation injects details=true into its private work-status request so it can reverify the exact proof; request->input never reaches that nested object.
+story.focus details # story focus injects details=true into its private work-status request so roots and context identity can be reverified; request->input never reaches the nested object.
+story.focus symbol # story focus passes its reverified exact context identifier into a private code change-plan request; request->input never reaches the nested object.
+story.show details # story show injects details=true into its private work-status request so every projected relation has reverified roots; request->input never reaches that nested object.
+story.why details # story why injects details=true into its private work-status request so every causal link has reverified roots; request->input never reaches that nested object.
+story.diff work # story diff injects each separately declared before/after selector as work into two private work-status requests; request->input never reaches either nested work key.
+story.diff details # story diff injects details=true into both private work-status requests so changed evidence remains root-visible; request->input never reaches either nested object.
+zcode.science.fetch kind      # pointer resolver reads its private RPC selector built by fetch; request->input never reaches that helper.
+dev.agent.worker attempt    # worker sub-dispatches fixed claim inputs to dev.agent.queue; request->input never reaches the nested attempt key.
+dev.agent.worker priority  # worker sub-dispatches fixed claim inputs to dev.agent.queue; request->input never reaches the nested priority key.
+dev.agent.worker json       # worker sub-dispatches a fixed status+json object to dev.agent.queue; request->input never reaches the nested json key.
+dev.agent.worker terminate  # worker sub-dispatches fixed claim, reap, and status objects to dev.agent.queue; request->input never reaches the nested terminate key.
+dev.agent.worker body       # worker injects its own fixed result body into a private dev.agent.mail post; request->input never reaches that nested object.
+dev.agent.worker since      # dev.agent.mail reads since only on the pull branch; the worker only posts, so the read is dead here.
+fleet.steer.grant attempt   # grant revoke sub-dispatches a fixed cancel+name object to dev.agent.queue; request->input never reaches the nested attempt key.
+fleet.steer.grant priority # grant revoke sub-dispatches a fixed cancel+name object to dev.agent.queue; request->input never reaches the nested priority key.
+fleet.steer.grant json      # grant revoke sub-dispatches a fixed cancel+name object to dev.agent.queue; request->input never reaches the nested json key.
+fleet.steer.grant terminate # grant revoke injects terminate only into its private cancel object when the stored grant scopes name it; request->input never reaches that nested key.
+zcode.science.fetch namespace # pointer resolver reads its private RPC selector built by fetch; request->input never reaches that helper.
+zcode.science.fetch semantic_root # pointer resolver reads its private RPC selector built by fetch; request->input never reaches that helper.
+zcode.science.fetch transport_root # provider discovery reads its private RPC selector built by fetch; request->input never reaches that helper.
+zcode.science.fetch board # the records board arm lives in the nested handler; fetch builds its own private records selector and request->input never reaches that arm.
+zcode.science.publish mode    # discovery helper reads its private RPC object built by publish; request->input never reaches that helper.
+zcode.science.publish kind    # discovery helper reads its private RPC object built by publish; request->input never reaches that helper.
+zcode.science.publish namespace # discovery helper reads its private RPC object built by publish; request->input never reaches that helper.
+zcode.science.publish semantic_root # discovery helper reads its private RPC object built by publish; request->input never reaches that helper.
+zcode.science.publish transport_root # discovery helper reads its private RPC object built by publish; request->input never reaches that helper.
+zcode.science.publish sequence # discovery helper reads its private RPC object built by publish; request->input never reaches that helper.
+zcode.science.publish not_before # discovery helper reads its private RPC object built by publish; request->input never reaches that helper.
+zcode.science.publish expiry  # discovery helper reads its private RPC object built by publish; request->input never reaches that helper.
+zcode.science.publish plan_token # discovery helper reads its private RPC object built by publish; request->input never reaches that helper.
+zcode.science.publish operation # discovery helper injects operation into its private RPC object; request->input never reaches that helper.
+zcode.package.dev.publish.commit dir # accepted-lane commit injects its unique verified-CAS staging directory into a private package-publish request; request->input never reaches that helper.
+zcode.package.dev.publish.commit manifest_hex # accepted-lane commit injects its CAS-rederived manifest into a private package-publish request; request->input never reaches that helper.
+zcode.package.dev.publish.commit recipe_hex # accepted-lane commit injects its task-bound CAS recipe into a private package-publish request; request->input never reaches that helper.
+zcode.package.source.reproduce day # nested package fetch reads this only from the private fetch object; reproduce does not copy request->input day into that object.
+zcode.package.source.reproduce maximum_bytes # reproduce injects the fixed source-carrier ceiling into its private package-fetch request; request->input never reaches that helper.
+zcode.package.source.reproduce name # nested package fetch reads this only from the private fetch object; reproduce copies root, not a local library name, into that object.
+zcode.package.fetch board # the records board arm lives in the nested handler; fetch builds its own private records selector and request->input never reaches that arm.
+zcode.package.source.reproduce board # the records board arm lives in the nested handler; reproduce builds its own private records selector and request->input never reaches that arm.
+metaverse.space.plan delegation_wire # delegation authorization serializes a private RPC object; request->input never reaches that helper.
+metaverse.space.commit delegation_wire # delegation authorization serializes a private RPC object; request->input never reaches that helper.
+metaverse.space.show delegation_wire # delegation authorization serializes a private RPC object; request->input never reaches that helper.
+metaverse.space.status delegation_wire # identity readiness serializes the loaded public delegation into a private chain-authorization RPC object; request->input never reaches that helper.
+metaverse.space.status operation # status injects operation=records into private local-projection RPC selectors; request->input never reaches that helper.
+metaverse.space.publish delegation_wire # delegation authorization serializes a private RPC object; request->input never reaches that helper.
+metaverse.space.discover delegation_wire # delegation authorization serializes a private RPC object; request->input never reaches that helper.
+metaverse.space.discover lookup_id # bounded discovery creates this private lookup capability after begin; request->input never reaches it.
+metaverse.space.discover owner_token # bounded discovery creates this private owner capability after begin; request->input never reaches it.
+metaverse.space.discover board # the records board arm lives in the nested handler; discover builds its own private records selector and request->input never reaches that arm.
+metaverse.space.scout.run delegation_wire # observer/manifest chain checks serialize private public delegation RPC objects; request->input never reaches them.
+metaverse.space.scout.show delegation_wire # current observer chain status serializes a private public delegation RPC object; request->input never reaches it.
+metaverse.space.publish mode # DHT publication reads its private plan/commit RPC object; request->input never reaches that helper.
+metaverse.space.publish kind # DHT publication reads its private plan/commit RPC object; request->input never reaches that helper.
+metaverse.space.publish namespace # DHT publication reads its private plan/commit RPC object; request->input never reaches that helper.
+metaverse.space.publish semantic_root # DHT publication reads its private plan/commit RPC object; request->input never reaches that helper.
+metaverse.space.publish transport_root # DHT publication reads its private plan/commit RPC object; request->input never reaches that helper.
+metaverse.space.publish sequence # DHT publication reads its private plan/commit RPC object; request->input never reaches that helper.
+metaverse.space.publish not_before # DHT publication reads its private plan/commit RPC object; request->input never reaches that helper.
+metaverse.space.publish expiry # DHT publication reads its private plan/commit RPC object; request->input never reaches that helper.
+metaverse.space.publish plan_token # DHT publication reads its private plan/commit RPC object; request->input never reaches that helper.
+metaverse.space.publish operation # DHT publication injects operation into its private RPC object; request->input never reaches that helper.
+zcode.work.start mode # work start injects this into its private canonical improve-plan request; request->input never reaches the nested planner.
+zcode.work.start dependency_lock_hex # work start derives this from package preparation for its private improve-plan request; request->input never reaches the nested planner.
+zcode.work.start write_scope_csv # work start derives this from the inspected recipe for its private improve-plan request; request->input never reaches the nested planner.
+zcode.work.start acceptance_recipe_hex # work start derives this from package preparation for its private improve-plan request; request->input never reaches the nested planner.
+zcode.work.start model_policy_root # work start derives the fixed contained-adapter policy for its private improve-plan request; request->input never reaches the nested planner.
+zcode.work.start proof_policy_hex # work start expands the named profile for its private improve-plan request; request->input never reaches the nested planner.
+zcode.work.start expires_unix # work start derives a bounded expiry for its private improve-plan request; request->input never reaches the nested planner.
+zcode.work.start max_context_bytes # work start injects the product context cap into its private improve-plan request; request->input never reaches the nested planner.
+zcode.work.start planned_task_root # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start planned_context_root # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start action_kind # the nested improve handler applies its fixed compile default to the private plan; request->input never reaches it.
+zcode.work.start fixed_input_path # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start preprocessed_path # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start fixed_input_relpath # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start candidate_workspace # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start source_root # the nested improve handler reads this only as an optional expert cross-check; work start derives source authority itself.
+zcode.work.start dependency_lock_root # the nested improve handler reads this only as an optional expert cross-check; work start derives lock authority itself.
+zcode.work.start acceptance_tests_root # the nested improve handler reads this only as an optional expert cross-check; work start derives recipe authority itself.
+zcode.work.start write_scope_root # the nested improve handler reads this only as an optional expert cross-check; work start derives scope authority itself.
+zcode.work.start max_changed_files # the nested improve handler applies its fixed product default; request->input never reaches it.
+zcode.work.start max_patch_bytes # the nested improve handler applies its fixed product default; request->input never reaches it.
+zcode.work.start max_memory_bytes # the nested improve handler applies its fixed product default; request->input never reaches it.
+zcode.work.start max_output_bytes # the nested improve handler applies its fixed product default; request->input never reaches it.
+zcode.work.start candidate_sequence # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start candidate_created_unix # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start patch_root # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start candidate_source_root # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start candidate_source_sha256 # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start adapter_policy_root # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start author_pubkey # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start remote_peer # the nested improve handler reads this only on candidate admission; work start fixes mode=plan.
+zcode.work.start task_root # the coordination handoff reads task_root only from the inner blocked reply and its private next-action input; request->input never reaches either object.
+zcode.work.run mode # work run injects mode=admit into its private canonical admission request; request->input never reaches the nested handler.
+zcode.work.run goal # work run reloads the canonical goal and injects it into its private admission request; request->input never reaches it.
+zcode.work.run proof_policy_hex # work run reloads the task-bound policy wire for its private admission request; request->input never reaches it.
+zcode.work.run dependency_lock_hex # work run reloads the task-bound lock wire for its private admission request; request->input never reaches it.
+zcode.work.run acceptance_recipe_hex # work run reloads the task-bound recipe wire for its private admission request; request->input never reaches it.
+zcode.work.run write_scope_csv # work run reloads the canonical write scope for its private admission request; request->input never reaches it.
+zcode.work.run model_policy_root # work run reloads the task-bound model policy for its private admission request; request->input never reaches it.
+zcode.work.run context_symbol # work run reloads the exact canonical context query for its private admission request; request->input never reaches it.
+zcode.work.run planned_task_root # work run injects the reverified task root into its private admission request; request->input never reaches it.
+zcode.work.run planned_context_root # work run injects the unique reverified context root into its private admission request; request->input never reaches it.
+zcode.work.run candidate_workspace # work run derives the isolated task workspace for its private admission request; request->input never reaches it.
+zcode.work.run adapter_policy_root # work run derives the fixed manual-adapter commitment for its private admission request; request->input never reaches it.
+zcode.work.run author_pubkey # work run derives the scratch worker public key for its private admission request; request->input never reaches it.
+zcode.work.run action_kind # work run fixes the private admission action to the closed whole-package executor; request->input never reaches it.
+zcode.work.run profile # work run fixes the private build profile label; request->input never reaches it.
+zcode.work.run expires_unix # work run reloads the task expiry for its private admission request; request->input never reaches it.
+zcode.work.run max_changed_files # work run reloads the task limit for its private admission request; request->input never reaches it.
+zcode.work.run max_patch_bytes # work run reloads the task limit for its private admission request; request->input never reaches it.
+zcode.work.run max_context_bytes # work run reloads the task limit for its private admission request; request->input never reaches it.
+zcode.work.run max_cpu_seconds # work run reloads the task limit for its private admission request; request->input never reaches it.
+zcode.work.run max_memory_bytes # work run reloads the task limit for its private admission request; request->input never reaches it.
+zcode.work.run max_output_bytes # work run reloads the task limit for its private admission request; request->input never reaches it.
+zcode.work.run fixed_input_path # the nested handler reads this only for non-package expert actions; work run fixes a package action.
+zcode.work.run preprocessed_path # the nested handler reads this only for non-package expert actions; work run fixes a package action.
+zcode.work.run fixed_input_relpath # the nested handler reads this only for non-package expert actions; work run fixes a package action.
+zcode.work.run source_root # the nested handler reads this only as an optional expert cross-check; work run rederives source authority.
+zcode.work.run dependency_lock_root # the nested handler reads this only as an optional expert cross-check; work run rederives lock authority.
+zcode.work.run acceptance_tests_root # the nested handler reads this only as an optional expert cross-check; work run rederives recipe authority.
+zcode.work.run write_scope_root # the nested handler reads this only as an optional expert cross-check; work run rederives scope authority.
+zcode.work.run candidate_sequence # the nested handler applies the fixed first-attempt default; request->input never reaches it.
+zcode.work.run candidate_created_unix # the nested handler derives candidate time inside the private request; request->input never reaches it.
+zcode.work.run patch_root # the nested handler reads this only as an optional expert cross-check; work run derives the patch.
+zcode.work.run candidate_source_root # the nested handler reads this only as an optional expert cross-check; work run captures the candidate tree.
+zcode.work.run candidate_source_sha256 # the nested handler derives this from the candidate manifest for explicit admission; request->input never reaches it.
+zcode.work.run remote_peer # the nested handler reads this only for opt-in P2P execution; work run remains local scratch-only.
+zcode.work.accept source_root # work accept reloads the latest canonical candidate source for its private lane lookup; request->input never reaches it.
+zcode.work.accept action_id # work accept reloads the latest signed receipt action for private evidence/promotion calls; request->input never reaches it.
+zcode.workspace.manifest.plan signature # the shared manifest parser reads this only when the caller passes commit=true; plan fixes commit=false and rejects signature before that branch.
+dev.drive job_root # drive derives this from the SHA3-sealed cycle before privately invoking the existing publication-status verifier; request->input never reaches it.
+app.presentation.publication-status namespace # the model reads this only from the node's internal signed-record projection; request->input never reaches it.
+app.presentation.publication-status semantic_root # the model reads this only from the node's internal signed pointer projection; request->input never reaches it.
+zcode.task.board board  # handler injects fixed board=true into a private records request and forwards that object; zcode.task.board declares only datadir, so the kernel rejects board from an operator and request->input never reaches the nested read.
+dev.agent.receive since     # the receiver builds its own pull object {action,since,kind} for dev.agent.mail with since taken from its own intake cursor file (0 when none); request->input never reaches that nested since key.
+dev.agent.receive attempt   # the receiver sub-dispatches fixed post+status objects to dev.agent.queue, which reads attempt only on its claim/reap branches; request->input never reaches that nested key.
+dev.agent.receive priority  # the receiver composes its own post object from the muse-priority header; request->input never reaches the nested priority key.
+dev.agent.receive json      # the receiver sub-dispatches a fixed status+name object to dev.agent.queue; request->input never reaches the nested json key.
+dev.agent.receive terminate # the receiver sub-dispatches fixed post and status objects to dev.agent.queue; request->input never reaches the nested terminate key.

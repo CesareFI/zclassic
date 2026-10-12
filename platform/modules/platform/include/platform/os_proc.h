@@ -1,0 +1,375 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * os_proc — process/host introspection shim (Rung 1,
+ * docs/adr/0003-os-substrate-verdict.md + docs/work/os-substrate-plan.md §2).
+ *
+ * Why:
+ *   platform/modules/platform is the one blessed home for direct OS-introspection
+ *   syscalls/pseudo-files, mirroring platform/clock.h and platform/rng.h:
+ *   production code reads process/host state through this seam; tests
+ *   install a forced snapshot instead of faking /proc.
+ *
+ * Linux implementation:
+ *   - rss_bytes / vsize_bytes: VmRSS / VmSize from /proc/self/status.
+ *   - cgroup_current/high/max: cgroup v2 memory.current/memory.high/
+ *     memory.max under the directory named by /proc/self/cgroup's "0::"
+ *     line, -1 if cgroup v2 is unavailable or the value is "max"
+ *     (unlimited).
+ *   - sys_total_bytes / sys_avail_bytes: MemTotal / MemAvailable from
+ *     /proc/meminfo (MemAvailable, not a raw MemFree, already accounts for
+ *     reclaimable page cache — the correct denominator for "how much RAM
+ *     can this process actually grow into").
+ *   - os_proc_uptime_seconds(): system uptime (/proc/uptime) minus process
+ *     start time (field 22 of /proc/self/stat, in clock ticks since boot).
+ *   - os_proc_exe_path(): readlink("/proc/self/exe", ...).
+ *   - os_proc_open_self_exe(): open("/proc/self/exe", O_RDONLY|O_CLOEXEC)
+ *     then fdopen — the magic
+ *     self-referencing symlink into the kernel's exe_file reference.
+ *     Reading through the returned FILE* always yields the exact bytes of
+ *     the running image, even after the file at the resolved pathname has
+ *     been replaced by a later deploy (the running process keeps its old
+ *     inode open). Used by callers that need to hash/verify their own
+ *     in-memory image against what currently sits on disk (see
+ *     services/binary_staleness_service.h for the concrete consumer).
+ *
+ * Darwin implementation:
+ *   - process memory and start time: proc_pid_rusage/proc_pidinfo; virtual
+ *     size: Mach task_info; total RAM: sysctl hw.memsize; available RAM:
+ *     reclaimable free (already inclusive of speculative) + inactive pages
+ *     from HOST_VM_INFO64.
+ *   - executable path and argv: dyld and crt_externs APIs.
+ *   - os_proc_open_self_exe(): _NSGetExecutablePath() then fopen() of that
+ *     name. This is a PATHNAME reopen, so it reports
+ *     OS_PROC_IMAGE_IDENTITY_RESOLVED_PATH and not the Linux rung. Callers
+ *     must publish the rung alongside the digest, never the digest alone.
+ *   - cgroup fields remain -1 (unavailable).
+ *
+ * Windows implementation:
+ *   - os_proc_open_self_exe(): GetModuleFileNameW() then CreateFileW() with
+ *     FILE_SHARE_READ|FILE_SHARE_DELETE, adopted into a FILE* through
+ *     _open_osfhandle/_fdopen so the caller's fclose still owns it. Also
+ *     rung RESOLVED_PATH: GetModuleFileNameW returns a string cached in the
+ *     PEB, and no documented API hands out a handle to the file object the
+ *     loader actually mapped, so there is no inode-equivalent pin to be had.
+ *     The full reasoning, including why GetFileInformationByHandle does not
+ *     rescue it, is at the implementation.
+ *
+ * FreeBSD mapping (header comments only — no FreeBSD build in this repo,
+ * see docs/work/os-substrate-plan.md §2 "FreeBSD mapping"):
+ *   - rss_bytes/vsize_bytes/uptime: kinfo_getproc() (libutil) returns
+ *     struct kinfo_proc with ki_rssize (pages; multiply by getpagesize())
+ *     and ki_size (vsize, already bytes) and ki_start (struct timeval) —
+ *     no /proc parsing needed at all, which is the whole point of this
+ *     shim.
+ *   - cgroup_current/high/max: FreeBSD has no cgroups; always -1
+ *     ("unavailable"), same sentinel this header already uses for "no
+ *     limit configured".
+ *   - sys_total_bytes/sys_avail_bytes: sysctl hw.physmem (total) and
+ *     vm.stats.vm.v_free_count * pagesize (a rough avail analogue; FreeBSD
+ *     has no direct MemAvailable equivalent).
+ *   - os_proc_exe_path: sysctl({CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME,
+ *     -1}, ...) — NOT a readlink, this is a real behavioral fork a FreeBSD
+ *     backing must implement, not just a path string swap.
+ *
+ * Test seam:
+ *   os_proc_mem_set_override() mirrors platform_clock_set_source() /
+ *   platform_rng_set_source(): install a forced snapshot so tests can walk
+ *   os_proc_mem_read() through every threshold without touching the real
+ *   /proc filesystem. NULL clears the override and restores live reads.
+ *   Thread safety matches the clock/rng seams: the override pointer is an
+ *   atomic swap; the pointee must outlive every concurrent reader
+ *   (typically static/file-scope storage in the calling test).
+ */
+
+#ifndef ZCL_PLATFORM_OS_PROC_H
+#define ZCL_PLATFORM_OS_PROC_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* The cgroup v2 memory.stat rows the memory organ needs, in bytes; a row is
+ * -1 when it, or the whole file, is unavailable. `file` is the entire
+ * page-cache tier (v2 charges tmpfs/shm to it too). The other four name the
+ * parts of that tier the kernel cannot simply drop and reuse: `shmem` needs
+ * swap, `unevictable` is mlocked, and `file_dirty`/`file_writeback` must
+ * reach the disk before their pages are reclaimable at all — on a spinning
+ * disk a bulk block/WAL flush pins hundreds of MiB there for whole seconds.
+ * Read together (see os_proc_cgroup_mem_stat_read) because they are only
+ * meaningful subtracted from one another. */
+struct os_proc_cgroup_mem_stat {
+    int64_t file;
+    int64_t shmem;
+    int64_t unevictable;
+    int64_t file_dirty;
+    int64_t file_writeback;
+};
+
+/* Fields are -1 when unreadable or unavailable on the host. */
+struct os_proc_mem {
+    int64_t rss_bytes;         /* VmRSS */
+    int64_t vsize_bytes;       /* VmSize */
+    int64_t cgroup_current;    /* cgroup v2 memory.current, -1 if unavailable */
+    int64_t cgroup_high;       /* cgroup v2 memory.high, -1 if unset/unavailable */
+    int64_t cgroup_max;        /* cgroup v2 memory.max, -1 if unset/unavailable */
+    int64_t sys_total_bytes;   /* platform host-memory total */
+    int64_t sys_avail_bytes;   /* platform reclaimable/available memory */
+    /* memory.stat rows for the same cgroup the three fields above came
+     * from, all -1 off a cgroup v2 host. */
+    struct os_proc_cgroup_mem_stat cgroup_stat;
+};
+
+enum os_proc_environment {
+    OS_PROC_ENVIRONMENT_UNKNOWN = 0,
+    OS_PROC_ENVIRONMENT_NATIVE,
+    OS_PROC_ENVIRONMENT_WSL,
+    OS_PROC_ENVIRONMENT_WINE,
+};
+
+/* Classify a Linux kernel release without consulting ambient environment
+ * variables. Exposed so fixtures can prove WSL recognition deterministically. */
+enum os_proc_environment
+os_proc_environment_classify_kernel_release(const char *release);
+
+/* Observe the current runtime environment through the platform authority. */
+enum os_proc_environment os_proc_environment_observe(void);
+const char *os_proc_environment_string(enum os_proc_environment environment);
+
+/* Fill `out` with a fresh process/host memory snapshot. Returns true if at
+ * least the resident set was read; other fields are independently -1 on their own
+ * failure without failing the whole call. When a test override is
+ * installed, returns a copy of it and always true. */
+bool os_proc_mem_read(struct os_proc_mem *out);
+
+/* Process age in seconds: system uptime minus this process's start time.
+ * -1 on any read/parse failure. */
+int64_t os_proc_uptime_seconds(void);
+
+/* 1-minute load average in hundredths, or -1 if unreadable (never 0). */
+int64_t os_proc_load1_centi(void);
+
+/* Resolve this process's own executable path into `buf` (NUL-terminated,
+ * with failure if it does not fit `n`). Linux: readlink /proc/self/exe. Note this is the
+ * PATHNAME only — on Linux a `readlink` result whose original dentry was
+ * replaced by a create-new-file-at-same-name deploy gets a trailing
+ * " (deleted)" suffix from the kernel; callers that need the real
+ * pathname back (e.g. to `stat()`/`fopen()` it) must strip that suffix
+ * themselves. */
+bool os_proc_exe_path(char *buf, size_t n);
+
+/* The literal pathname that reaches the running image through kernel magic
+ * (Linux's self-referencing "/proc/self/exe" symlink), for a caller that
+ * must itself stat()/open() the running image BY NAME, repeatedly, rather
+ * than hold one os_proc_open_self_exe() FILE* across every read. The
+ * kernel re-resolves this name to the process's CURRENT running inode on
+ * every traversal, so — unlike a once-resolved os_proc_exe_path() string —
+ * a later replace-at-that-path deploy never makes a later stat()/open() of
+ * THIS name read the wrong file. Darwin and Windows have no such magic
+ * name, so there this reports the same resolved pathname os_proc_exe_path()
+ * would (the weaker RESOLVED_PATH rung; see os_proc_self_exe_identity()); a
+ * caller on those platforms that needs the stronger guarantee must use
+ * os_proc_open_self_exe() instead and keep its FILE* open across every
+ * read. False on any failure; `buf` is left untouched. */
+bool os_proc_self_exe_open_path(char *buf, size_t n);
+
+/* Resolve the executable image of a live process. Windows holds a process
+ * HANDLE while querying its UTF-16 image path, avoiding PID/path races during
+ * the query. POSIX uses the platform's process-image authority. */
+bool os_proc_pid_exe_path(uint64_t pid, char *buf, size_t n);
+
+/* How strongly the FILE* from os_proc_open_self_exe() is bound to the image
+ * this process is EXECUTING. This is the whole point of that call: an
+ * operator reads the resulting digest to decide what code a node is running,
+ * so the mechanism's strength has to travel with the digest instead of being
+ * assumed. Never widen a platform's rung without a new mechanism to justify
+ * it; an honest weaker rung is the correct answer, a flattering one is a
+ * false claim about custody. */
+enum os_proc_image_identity {
+    /* No running-image read at all: os_proc_open_self_exe() sets ENOTSUP
+     * and returns NULL. Read as "no evidence", never as "matches". */
+    OS_PROC_IMAGE_IDENTITY_UNAVAILABLE = 0,
+    /* Reopened BY PATHNAME (Darwin _NSGetExecutablePath, Windows
+     * GetModuleFileNameW). The bytes are whatever sat at the running
+     * image's name at open time; a deploy landing between the name lookup
+     * and the open is hashed instead of the running image. */
+    OS_PROC_IMAGE_IDENTITY_RESOLVED_PATH,
+    /* Kernel-pinned: the open goes straight at the running image's inode
+     * with no name resolution anywhere in it (Linux /proc/self/exe), so the
+     * bytes are the executing image whatever later replaced the file. */
+    OS_PROC_IMAGE_IDENTITY_RUNNING_IMAGE,
+};
+
+/* Open the exact executable image for reading. Linux holds the running inode
+ * via /proc/self/exe; Windows and Darwin re-open the running image's
+ * pathname (see os_proc_self_exe_identity()). Platforms with neither fail
+ * with ENOTSUP. Linux sets close-on-exec atomically while opening the image;
+ * this does not change the other platforms' inheritance behavior. Caller owns
+ * a successful FILE* and closes it with fclose. */
+FILE *os_proc_open_self_exe(void);
+
+/* The rung os_proc_open_self_exe() reaches on THIS build. Compile-time
+ * constant per platform, exposed as a call so that every reader shares one
+ * ladder instead of re-deriving it from its own #if -- a duplicated guard is
+ * how a published identity label drifts away from the mechanism it claims to
+ * describe. */
+enum os_proc_image_identity os_proc_self_exe_identity(void);
+
+/* True iff this process's command line contains `token` as a WHOLE argument
+ * (exact match, never a substring). */
+bool os_proc_cmdline_has_token(const char *token);
+
+/* Resolve this process's cgroup v2 directory (e.g.
+ * "/sys/fs/cgroup/user.slice/...") into `out`. Returns false if cgroup v2
+ * is unavailable — callers should treat that as "no cgroup limits to
+ * read", not a fatal error. Exposed separately from os_proc_mem_read() for
+ * callers that need finer-grained cgroup stats (e.g. memory.stat's
+ * anon/file/kernel/slab breakdown) than the three aggregate fields in
+ * struct os_proc_mem carry. */
+bool os_proc_cgroup_dir(char *out, size_t out_len);
+
+/* Fill `out` from this cgroup's memory.stat in ONE pass over ONE open of the
+ * file. Reading the rows through separate opens let them tear against each
+ * other under tmpfs churn — a `file` from before a burst against a `shmem`
+ * from after it is a subtraction of two different instants — so there is
+ * deliberately no single-row accessor. Every row starts at -1 and is taken
+ * only on a WHOLE-key match: "file" never reads "file_mapped", "file_dirty"
+ * or any other row that merely starts with it, because the key must be
+ * followed by the separating space. Returns false, every row left at -1,
+ * when the file cannot be opened at all. `dir` is an os_proc_cgroup_dir()
+ * result — or, in a test, a fixture directory holding a memory.stat-shaped
+ * file, which is the only way to drive this parser without a real cgroup. */
+bool os_proc_cgroup_mem_stat_read(const char *dir,
+                                  struct os_proc_cgroup_mem_stat *out);
+
+/* Test seam: force every subsequent os_proc_mem_read() call to return a
+ * copy of `forced` instead of reading /proc. NULL clears the override.
+ * Intended for tests and the simulator only. `forced` is copied at install
+ * time, so a stack-local struct is safe to pass. */
+void os_proc_mem_set_override(const struct os_proc_mem *forced);
+
+/* Count the descriptors this process currently has open, into `*out`.
+ * Returns false when the platform cannot answer, leaving `*out` untouched;
+ * a caller that cannot get a count must not treat zero as an answer.
+ *
+ * Exists for leak assertions: take a census either side of an operation and
+ * require the two to agree. The counting descriptor itself is excluded, so
+ * two censuses taken the same way are directly comparable. */
+bool os_proc_open_fd_count(size_t *out);
+
+/* Close every descriptor above stderr in a freshly forked, single-threaded
+ * child, before confinement and exec. The actual descriptor census includes
+ * handles above a lowered RLIMIT_NOFILE. Never call in a resident parent.
+ * Returns false with errno on an incomplete census or close; callers must
+ * refuse exec. Windows returns unavailable (its launchers use handle lists). */
+bool os_proc_close_inherited_fds(void);
+
+/* The same complete post-fork descriptor scrub, retaining one open report
+ * pipe descriptor above stderr. Invalid or closed keep_fd fails before any
+ * descriptor is closed. Use only in a freshly forked, single-threaded child;
+ * Windows reports unavailable. */
+bool os_proc_close_inherited_fds_except(int keep_fd);
+
+/* In a freshly forked child: ask the kernel to send `signal_number` when the
+ * parent exits, even by SIGKILL (Linux PR_SET_PDEATHSIG), then confirm the
+ * parent is still `expected_parent`, which closes the window where it died
+ * before the request took effect. False when the parent is already gone or
+ * the request failed; the child should then act as if signalled. Other
+ * POSIX systems run only the parent check; Windows reports unavailable. */
+bool os_proc_bind_parent_death(int signal_number, uint64_t expected_parent);
+
+/* This process's descriptor directory (/proc/self/fd) opened O_RDONLY |
+ * O_DIRECTORY | O_CLOEXEC, for a caller that walks it with getdents64
+ * without allocating. The call is one open(2), so it is async-signal-safe
+ * and usable between fork and exec. -1 with errno where unavailable
+ * (non-Linux). The caller owns and closes the descriptor. */
+int os_proc_fd_dir_open(void);
+
+/* Seccomp filter layers attached to `pid` (0 = this process): the
+ * Seccomp_filters field of /proc/<pid>/status, still readable for an exited
+ * child that has not been reaped. False where the field or the process
+ * cannot be read (non-Linux, or a kernel before 5.9). */
+bool os_proc_seccomp_filters(uint64_t pid, uint32_t *out);
+
+#if defined(ZCL_TESTING) && defined(__linux__)
+/* Test-only seam onto the Seccomp_filters status-text parser, so a test can
+ * feed it a crafted or truncated buffer without a real /proc/<pid>/status. */
+bool os_proc_parse_seccomp_filters_for_test(const char *status, uint32_t *out);
+#endif
+
+/* ── Per-THREAD kernel work counters ─────────────────────────────────────
+ *
+ * The counters a liveness check needs in order to tell a thread that is
+ * merely SLOW from one that is WEDGED. Every field is monotonic within a
+ * thread's life; only differences between two reads of the same tid mean
+ * anything, never the absolute values.
+ *
+ * Per-thread and never per-process on purpose: a process-wide counter stays
+ * warm off whichever threads are still running, so one deadlocked thread
+ * would read as healthy and the wedge detector built on it would be dead
+ * code that nobody noticed.
+ *
+ * Linux: utime+stime, majflt and read_bytes+write_bytes from
+ * /proc/self/task/<tid>/{stat,io}. Elsewhere: unavailable, and the caller
+ * must treat "cannot see" as "no evidence", never as "healthy". */
+struct os_proc_thread_work {
+    uint64_t cpu_ticks;     /* utime + stime, clock ticks */
+    uint64_t major_faults;  /* faults that needed a disk read */
+    uint64_t io_bytes;      /* bytes actually issued to a block device */
+};
+
+/* This thread's OS-level thread id, or 0 where the platform has none. */
+long os_proc_self_tid(void);
+
+/* Linux only: require all real/effective/saved UIDs non-root and all
+ * permitted, effective, and ambient capability sets empty. Missing kernel
+ * facts fail closed; other platforms return false. */
+bool os_proc_unprivileged_no_capabilities(void);
+
+/* Read `tid`'s work counters. `tid` must name a thread of THIS process.
+ * Returns false when the platform cannot answer, leaving `*out` zeroed.
+ * Reads only kernel-generated pseudo-files: no filesystem lock, no
+ * block-device I/O, so it is safe on a thread that must stay responsive
+ * while the rest of the process is stuck on storage. */
+bool os_proc_thread_work_read(long tid, struct os_proc_thread_work *out);
+
+enum os_proc_liveness {
+    OS_PROC_LIVENESS_UNKNOWN = 0,
+    OS_PROC_LIVENESS_RUNNING,
+    OS_PROC_LIVENESS_DEAD
+};
+
+/* Fail-closed process liveness. Access denial or an indeterminate platform
+ * error is UNKNOWN, never proof that a process is dead. */
+enum os_proc_liveness os_proc_pid_liveness(uint64_t pid);
+uint64_t os_proc_current_pid(void);
+/* Stable kernel process-birth token. Pair with PID to reject PID reuse.
+ * Darwin encodes proc_bsdinfo's kernel start timeval as microseconds. */
+bool os_proc_pid_start_token(uint64_t pid, uint64_t *token);
+
+/* Cumulative process filesystem I/O bytes suitable for progress evidence.
+ * Windows uses GetProcessIoCounters transfer bytes; Darwin uses the native
+ * proc_pid_rusage disk-I/O byte counters; other POSIX targets use getrusage
+ * block counts converted from their specified 512-byte units. */
+bool os_proc_io_bytes(uint64_t *out);
+
+/* This process's mapping table (Linux /proc/self/maps), read whole into a
+ * heap-allocated NUL-terminated buffer the caller frees. NULL when the read
+ * is more than `max` bytes, holds an embedded NUL, fails, or the platform
+ * keeps no such table (Darwin, Windows): callers must treat NULL as "no
+ * evidence", never as "no libraries mapped". `len_out` receives the byte
+ * count when non-NULL. Exists so a caller that enumerates the shared
+ * libraries mapped into this process — to bind a running image's exported
+ * ABI, for instance — reads through the platform seam instead of opening
+ * /proc/self/maps directly. */
+char *os_proc_self_maps_read(size_t max, size_t *len_out);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ZCL_PLATFORM_OS_PROC_H */

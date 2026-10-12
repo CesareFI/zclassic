@@ -1,0 +1,204 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * The CLOSED identifier set for the typed model query builder.
+ *
+ * This file is the ONLY place a table or column name may enter SQL text.
+ * models/query_builder.h turns each row here into an enum constant, and
+ * every builder entry point takes those enums — never a `const char *`
+ * identifier — so a caller has no expressible way to name a table or column
+ * that is not listed below. An out-of-range enum (an integer cast in from
+ * somewhere) fails the statement closed rather than reaching SQLite.
+ *
+ * Include with QB_TABLE(t) and QB_COLUMN(t, c) defined; either may be a
+ * no-op. The enum symbol and the SQL identifier are the SAME token — the
+ * builder stringizes `c` — so a row cannot say one thing and emit another.
+ *
+ * Rows are added only when a model is converted off literal SQL. Keep each
+ * table's columns in schema declaration order; that is the order a reader
+ * will compare against the CREATE TABLE in engine/models/src/database_*.c.
+ */
+
+/* peers — engine/models/src/database_schema.c */
+QB_TABLE(peers)
+QB_COLUMN(peers, id)
+QB_COLUMN(peers, ip)
+QB_COLUMN(peers, port)
+QB_COLUMN(peers, services)
+QB_COLUMN(peers, last_seen)
+QB_COLUMN(peers, last_try)
+QB_COLUMN(peers, attempts)
+QB_COLUMN(peers, source)
+QB_COLUMN(peers, bandwidth_score)
+QB_COLUMN(peers, is_zcl23)
+
+/* auth_challenges — schema v26, database_migrate_features.c */
+QB_TABLE(auth_challenges)
+QB_COLUMN(auth_challenges, nonce_hex)
+QB_COLUMN(auth_challenges, address)
+QB_COLUMN(auth_challenges, issued_at)
+QB_COLUMN(auth_challenges, expires_at)
+QB_COLUMN(auth_challenges, consumed)
+
+/* onion_announcements — schema v13, database_migrate.c */
+QB_TABLE(onion_announcements)
+QB_COLUMN(onion_announcements, onion_address)
+QB_COLUMN(onion_announcements, announced_at)
+QB_COLUMN(onion_announcements, script_hex)
+
+/* parity_samples — schema v33, database_migrate_features_v30_up.c */
+QB_TABLE(parity_samples)
+QB_COLUMN(parity_samples, id)
+QB_COLUMN(parity_samples, ts)
+QB_COLUMN(parity_samples, our_height)
+QB_COLUMN(parity_samples, oracle_height)
+QB_COLUMN(parity_samples, heights_equal_at)
+QB_COLUMN(parity_samples, hash_equal)
+QB_COLUMN(parity_samples, oracle_reachable)
+
+/* op_return_index — schema v31, database_migrate_features_v30_up.c */
+QB_TABLE(op_return_index)
+QB_COLUMN(op_return_index, txid)
+QB_COLUMN(op_return_index, vout_n)
+QB_COLUMN(op_return_index, height)
+QB_COLUMN(op_return_index, tag)
+QB_COLUMN(op_return_index, tag_text)
+QB_COLUMN(op_return_index, payload_len)
+QB_COLUMN(op_return_index, payload_sha3)
+
+/* zswap_ads — schema v48, database_migrate_features_v30_up.c */
+QB_TABLE(zswap_ads)
+QB_COLUMN(zswap_ads, quote_root)
+QB_COLUMN(zswap_ads, wire)
+QB_COLUMN(zswap_ads, seller_pubkey)
+QB_COLUMN(zswap_ads, token_id)
+QB_COLUMN(zswap_ads, token_amount)
+QB_COLUMN(zswap_ads, zcl_amount)
+QB_COLUMN(zswap_ads, issued_unix)
+QB_COLUMN(zswap_ads, expires_unix)
+QB_COLUMN(zswap_ads, first_seen_unix)
+QB_COLUMN(zswap_ads, last_seen_unix)
+QB_COLUMN(zswap_ads, seen_count)
+
+/* app_events — schema v49, database_migrate_features.c */
+QB_TABLE(app_events)
+QB_COLUMN(app_events, receive_cursor)
+QB_COLUMN(app_events, event_id)
+QB_COLUMN(app_events, app_id)
+QB_COLUMN(app_events, topic)
+QB_COLUMN(app_events, kind)
+QB_COLUMN(app_events, chain_id)
+QB_COLUMN(app_events, author_key_id)
+QB_COLUMN(app_events, author_pubkey)
+QB_COLUMN(app_events, sequence)
+QB_COLUMN(app_events, previous_event_id)
+QB_COLUMN(app_events, created_at)
+QB_COLUMN(app_events, payload)
+QB_COLUMN(app_events, signature)
+QB_COLUMN(app_events, signature_len)
+QB_COLUMN(app_events, received_at)
+
+/* peer_chain_observations — schema v27, database_migrate_features.c */
+QB_TABLE(peer_chain_observations)
+QB_COLUMN(peer_chain_observations, id)
+QB_COLUMN(peer_chain_observations, peer_id)
+QB_COLUMN(peer_chain_observations, addr)
+QB_COLUMN(peer_chain_observations, user_agent)
+QB_COLUMN(peer_chain_observations, version)
+QB_COLUMN(peer_chain_observations, best_height)
+QB_COLUMN(peer_chain_observations, tip_hash)
+QB_COLUMN(peer_chain_observations, latency_us)
+QB_COLUMN(peer_chain_observations, inbound)
+QB_COLUMN(peer_chain_observations, first_seen)
+QB_COLUMN(peer_chain_observations, last_seen)
+QB_COLUMN(peer_chain_observations, observed_at)
+
+/* fleet_board_posts — schema v84, database_migrate_features_v67_up.c */
+QB_TABLE(fleet_board_posts)
+QB_COLUMN(fleet_board_posts, id)
+QB_COLUMN(fleet_board_posts, seq)
+QB_COLUMN(fleet_board_posts, kind)
+QB_COLUMN(fleet_board_posts, created_at)
+QB_COLUMN(fleet_board_posts, ttl)
+QB_COLUMN(fleet_board_posts, expires_at)
+QB_COLUMN(fleet_board_posts, ref)
+QB_COLUMN(fleet_board_posts, host_pubkey)
+QB_COLUMN(fleet_board_posts, agent)
+QB_COLUMN(fleet_board_posts, slug)
+QB_COLUMN(fleet_board_posts, title)
+QB_COLUMN(fleet_board_posts, supersedes)
+QB_COLUMN(fleet_board_posts, receipt)
+QB_COLUMN(fleet_board_posts, text)
+QB_COLUMN(fleet_board_posts, body_bytes)
+QB_COLUMN(fleet_board_posts, signature)
+QB_COLUMN(fleet_board_posts, chain_prev)
+QB_COLUMN(fleet_board_posts, chain_hash)
+QB_COLUMN(fleet_board_posts, received_at)
+QB_COLUMN(fleet_board_posts, scope)
+QB_COLUMN(fleet_board_posts, room)
+QB_COLUMN(fleet_board_posts, arrival)
+
+/* Task contents belong to the user, independently of the serving program. */
+QB_TABLE(task_documents)
+QB_COLUMN(task_documents, app)
+QB_COLUMN(task_documents, payload)
+QB_COLUMN(task_documents, undo)
+#ifdef QB_SCHEMA_STATEMENT
+QB_SCHEMA_STATEMENT(task_documents_create,
+    "CREATE TABLE IF NOT EXISTS task_documents("
+    "app TEXT PRIMARY KEY NOT NULL,payload BLOB NOT NULL,undo BLOB NOT NULL)")
+#endif
+
+/* resident_serving — isolated Commons acceptance projection. */
+QB_TABLE(resident_serving)
+QB_COLUMN(resident_serving, id)
+QB_COLUMN(resident_serving, app)
+QB_COLUMN(resident_serving, revision)
+QB_COLUMN(resident_serving, generation)
+QB_COLUMN(resident_serving, root)
+QB_COLUMN(resident_serving, receipt)
+QB_COLUMN(resident_serving, digest)
+QB_COLUMN(resident_serving, program)
+QB_COLUMN(resident_serving, config)
+QB_COLUMN(resident_serving, prior_root)
+QB_COLUMN(resident_serving, prior_receipt)
+QB_COLUMN(resident_serving, prior_digest)
+QB_COLUMN(resident_serving, prior_program)
+QB_COLUMN(resident_serving, prior_config)
+QB_COLUMN(resident_serving, pending_root)
+QB_COLUMN(resident_serving, pending_receipt)
+QB_COLUMN(resident_serving, pending_digest)
+QB_COLUMN(resident_serving, pending_program)
+QB_COLUMN(resident_serving, pending_config)
+QB_COLUMN(resident_serving, pending_ticket)
+QB_COLUMN(resident_serving, pending_generation)
+QB_COLUMN(resident_serving, pending_nonce)
+QB_COLUMN(resident_serving, pending_token)
+QB_COLUMN(resident_serving, current_nonce)
+QB_COLUMN(resident_serving, current_token)
+QB_COLUMN(resident_serving, consumed_ticket)
+
+/* Fixed schema/migration operations have no caller-supplied SQL. Keep them
+ * alongside the closed identifiers; ordinary row access uses the builder. */
+#ifdef QB_SCHEMA_STATEMENT
+QB_SCHEMA_STATEMENT(resident_create,
+    "CREATE TABLE IF NOT EXISTS resident_serving("
+    "id INTEGER PRIMARY KEY,app TEXT NOT NULL UNIQUE,revision INTEGER NOT NULL,"
+    "generation INTEGER NOT NULL,root TEXT NOT NULL,receipt TEXT NOT NULL,"
+    "digest TEXT NOT NULL,program TEXT NOT NULL,config INTEGER NOT NULL,"
+    "prior_root TEXT NOT NULL,prior_receipt TEXT NOT NULL,prior_digest TEXT NOT NULL,"
+    "prior_program TEXT NOT NULL,prior_config INTEGER NOT NULL,"
+    "pending_root TEXT NOT NULL,pending_receipt TEXT NOT NULL,pending_digest TEXT NOT NULL,"
+    "pending_program TEXT NOT NULL,pending_config INTEGER NOT NULL,pending_ticket INTEGER NOT NULL,"
+    "pending_generation INTEGER NOT NULL,pending_nonce TEXT NOT NULL,pending_token INTEGER NOT NULL,"
+    "current_nonce TEXT NOT NULL,current_token INTEGER NOT NULL,consumed_ticket INTEGER NOT NULL)")
+QB_SCHEMA_STATEMENT(resident_columns, "PRAGMA table_info(resident_serving)")
+QB_SCHEMA_STATEMENT(resident_legacy_rename,
+    "ALTER TABLE resident_serving RENAME TO resident_serving_legacy")
+QB_SCHEMA_STATEMENT(resident_legacy_copy,
+    "INSERT INTO resident_serving SELECT id,'@legacy',revision,generation,"
+        "root,receipt,digest,program,config,prior_root,prior_receipt,prior_digest,"
+        "prior_program,prior_config,'','','','',0,0,0,'',0,'',0,generation FROM resident_serving_legacy")
+QB_SCHEMA_STATEMENT(resident_legacy_drop, "DROP TABLE resident_serving_legacy")
+QB_SCHEMA_STATEMENT(resident_durable_begin,
+    "PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; BEGIN IMMEDIATE")
+#endif

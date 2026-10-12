@@ -1,0 +1,4 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Source-owned capability declaration for the configured sync peer identity
+ * probe. */
+ZCL_MODULE_CAPABILITY("engine/services/src/configured_sync_peers.c", CAP_NETWORK|CAP_FS_WRITE, "the identity probe dials an operator-named target and completes Noise XX; checked allocation reports an injected failure on stderr")

@@ -1,0 +1,333 @@
+/* Copyright 2026 Rhett Creighton. Licensed under Apache-2.0. */
+#define _POSIX_C_SOURCE 200809L
+#include "ledger_hid.h"
+#include "blue_wallet_protocol.h"
+#include "zcl_address.h"
+
+#include <fcntl.h>
+#include <glob.h>
+#include <linux/hidraw.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+static const char *model_name(unsigned int product) {
+    switch (product) {
+    case 0x0000: return "Ledger Blue";
+    case 0x0004: return "Ledger Nano X";
+    default: return "Ledger device";
+    }
+}
+
+static void json_string(const uint8_t *value, size_t length) {
+    putchar('"');
+    for (size_t i = 0; i < length; ++i) {
+        if (value[i] == '"' || value[i] == '\\') putchar('\\');
+        putchar(value[i]);
+    }
+    putchar('"');
+}
+
+static int error_result(bool json, const char *code, const char *message) {
+    if (json) printf("{\"ok\":false,\"error\":\"%s\"}\n", code);
+    else fprintf(stderr, "%s\n", message);
+    return 1;
+}
+
+static bool hidraw_path(const char *path) {
+    static const char prefix[] = "/dev/hidraw";
+    if (strncmp(path, prefix, sizeof prefix - 1) != 0) return false;
+    const char *number = path + sizeof prefix - 1;
+    if (!*number) return false;
+    for (; *number; ++number) {
+        if (*number < '0' || *number > '9') return false;
+    }
+    return true;
+}
+
+static int list_devices(bool json) {
+    glob_t paths = {0};
+    int scan = glob("/dev/hidraw*", 0, NULL, &paths);
+    if (scan != 0 && scan != GLOB_NOMATCH) {
+        globfree(&paths);
+        return error_result(json, "device_scan_failed", "Cannot list HID devices.");
+    }
+    if (json) fputs("{\"ok\":true,\"devices\":[", stdout);
+    size_t found = 0;
+    for (size_t i = 0; i < paths.gl_pathc; ++i) {
+        const char *path = paths.gl_pathv[i];
+        if (!hidraw_path(path)) continue;
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        struct hidraw_devinfo info;
+        int identified = ioctl(fd, HIDIOCGRAWINFO, &info);
+        close(fd);
+        if (identified < 0 || info.vendor != 0x2c97) continue;
+        if (json) {
+            if (found) putchar(',');
+            fputs("{\"path\":", stdout);
+            json_string((const uint8_t *)path, strlen(path));
+            fputs(",\"model\":", stdout);
+            const char *model = model_name((unsigned int)info.product);
+            json_string((const uint8_t *)model, strlen(model));
+            printf(",\"vendor_id\":\"%04x\",\"product_id\":\"%04x\"}",
+                   (unsigned int)info.vendor, (unsigned int)info.product);
+        } else {
+            printf("%s  %s  (%04x:%04x)\n", path,
+                   model_name((unsigned int)info.product),
+                   (unsigned int)info.vendor, (unsigned int)info.product);
+        }
+        ++found;
+    }
+    if (json) fputs("]}\n", stdout);
+    else if (!found) puts("No accessible Ledger HID interfaces found.");
+    globfree(&paths);
+    return 0;
+}
+
+static bool printable_ascii(const uint8_t *data, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        if (data[i] < 0x20 || data[i] > 0x7e) return false;
+    }
+    return true;
+}
+
+static int show_app_info(int fd, bool json) {
+    static const uint8_t command[] = {0xb0, 0x01, 0, 0, 0};
+    uint8_t reply[LEDGER_HID_MAX_RESPONSE];
+    size_t size;
+    if (ledger_hid_exchange(fd, command, sizeof command, reply,
+                            sizeof reply, &size) < 0)
+        return error_result(json, "no_app_info_response",
+                            "Ledger did not answer the read-only app-info command.");
+    uint16_t status = (uint16_t)(((uint16_t)reply[size - 2] << 8) | reply[size - 1]);
+    if (status != 0x9000) {
+        if (json) printf("{\"ok\":false,\"error\":\"device_status\",\"status\":\"%04x\"}\n", status);
+        else fprintf(stderr, "Ledger returned status %04x.\n", status);
+        return 1;
+    }
+    size_t end = size - 2;
+    if (end < 5 || reply[0] != 1)
+        return error_result(json, "invalid_app_info", "Unexpected app-info format.");
+    size_t pos = 1;
+    size_t name_len = reply[pos++];
+    if (name_len > end - pos) goto invalid;
+    const uint8_t *name = reply + pos;
+    pos += name_len;
+    if (pos >= end) goto invalid;
+    size_t version_len = reply[pos++];
+    if (version_len > end - pos) goto invalid;
+    const uint8_t *version = reply + pos;
+    pos += version_len;
+    if (pos >= end) goto invalid;
+    size_t flags_len = reply[pos++];
+    if (flags_len != end - pos || !printable_ascii(name, name_len) ||
+        !printable_ascii(version, version_len)) goto invalid;
+    if (json) {
+        fputs("{\"ok\":true,\"name\":", stdout);
+        json_string(name, name_len);
+        fputs(",\"version\":", stdout);
+        json_string(version, version_len);
+        fputs("}\n", stdout);
+    } else {
+        printf("%.*s %.*s\n", (int)name_len, (const char *)name,
+               (int)version_len, (const char *)version);
+    }
+    return 0;
+invalid:
+    return error_result(json, "invalid_app_info", "Invalid app-info fields.");
+}
+
+static int app_info(const char *path, bool json) {
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return error_result(json, "open_failed", "Cannot open the selected HID device.");
+    struct hidraw_devinfo info;
+    if (ioctl(fd, HIDIOCGRAWINFO, &info) < 0 || info.vendor != 0x2c97) {
+        close(fd);
+        return error_result(json, "not_ledger", "The selected HID device is not a Ledger device.");
+    }
+    int result = show_app_info(fd, json);
+    close(fd);
+    return result;
+}
+
+static int probe_info(const char *path, bool json) {
+    static const uint8_t command[] = {0xa5, 0x01, 0, 0, 0};
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return error_result(json, "open_failed", "Cannot open the selected HID device.");
+    struct hidraw_devinfo info;
+    if (ioctl(fd, HIDIOCGRAWINFO, &info) < 0 || info.vendor != 0x2c97) {
+        close(fd);
+        return error_result(json, "not_ledger", "The selected HID device is not a Ledger device.");
+    }
+    uint8_t reply[LEDGER_HID_MAX_RESPONSE];
+    size_t reply_len = 0;
+    int exchanged = ledger_hid_exchange(fd, command, sizeof command, reply,
+                                        sizeof reply, &reply_len);
+    close(fd);
+    if (exchanged < 0)
+        return error_result(json, "no_probe_response", "ZCL Probe did not answer.");
+    if (ledger_probe_parse(reply, reply_len) < 0)
+        return error_result(json, "invalid_probe", "The running app is not ZCL Probe version 1.");
+    if (json) puts("{\"ok\":true,\"protocol\":\"zcl-probe\",\"version\":1,\"address\":false,\"signing\":false}");
+    else puts("ZCL Probe 1: address and signing unavailable");
+    return 0;
+}
+
+static int hex_digit(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+static int address_from_pubkey(const char *hex) {
+    if (strlen(hex) != ZCL_COMPRESSED_PUBKEY_SIZE * 2)
+        return error_result(false, "invalid_pubkey", "Expected a 33-byte compressed public key in hex.");
+    uint8_t pubkey[ZCL_COMPRESSED_PUBKEY_SIZE];
+    for (size_t i = 0; i < sizeof pubkey; ++i) {
+        int high = hex_digit(hex[2 * i]);
+        int low = hex_digit(hex[2 * i + 1]);
+        if (high < 0 || low < 0)
+            return error_result(false, "invalid_pubkey", "Public key contains non-hex characters.");
+        pubkey[i] = (uint8_t)((high << 4) | low);
+    }
+    char address[ZCL_ADDRESS_SIZE];
+    if (zcl_address_from_pubkey(pubkey, address) < 0)
+        return error_result(false, "invalid_pubkey", "Public key is not on secp256k1.");
+    puts(address);
+    return 0;
+}
+
+static bool parse_command(int argc, char **argv, const char *name,
+                          int base_argc, bool *json) {
+    if (argc != base_argc && argc != base_argc + 1) return false;
+    if (strcmp(argv[1], name) != 0) return false;
+    if (argc == base_argc + 1 && strcmp(argv[2], "--json") != 0) return false;
+    *json = argc == base_argc + 1;
+    return true;
+}
+
+static bool fixture_status_failed(const uint8_t *reply, size_t length,
+                                  bool json) {
+    if (length < 2 || (reply[length - 2] == 0x90 && reply[length - 1] == 0))
+        return false;
+    unsigned int status = ((unsigned int)reply[length - 2] << 8) |
+                          reply[length - 1];
+    if (json)
+        printf("{\"ok\":false,\"error\":\"device_status\",\"status\":\"%04x\"}\n",
+               status);
+    else fprintf(stderr, "Fixture APDU returned status %04x.\n", status);
+    return true;
+}
+
+static int fixture_info(const char *path, bool json) {
+    static const uint8_t probe[] = {0xa5, 0x01, 0, 0, 0};
+    static const uint8_t request[] = {0xa5, 0x02, 0, 0, 0};
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return error_result(json, "open_failed", "Cannot open the selected HID device.");
+    struct hidraw_devinfo info;
+    if (ioctl(fd, HIDIOCGRAWINFO, &info) < 0 ||
+        info.vendor != 0x2c97 || info.product != 0) {
+        close(fd);
+        return error_result(json, "not_blue", "The selected device is not a Ledger Blue.");
+    }
+    uint8_t reply[LEDGER_HID_MAX_RESPONSE];
+    size_t length = 0;
+    int matched = ledger_hid_exchange(fd, probe, sizeof probe, reply,
+                                      sizeof reply, &length) == 0 &&
+                  ledger_fixture_probe_parse(reply, length) == 0;
+    if (!matched) {
+        close(fd);
+        return error_result(json, "wrong_app", "Open ZCL Fixture on the Blue first.");
+    }
+    int received = ledger_hid_exchange(fd, request, sizeof request,
+                                       reply, sizeof reply, &length) == 0;
+    close(fd);
+    if (!received)
+        return error_result(json, "no_fixture_response", "Fixture APDU did not answer.");
+    if (fixture_status_failed(reply, length, json))
+        return 1;
+    char address[ZCL_ADDRESS_SIZE];
+    if (ledger_fixture_key_parse(reply, length) < 0 ||
+        zcl_address_from_pubkey(reply, address) < 0 ||
+        strcmp(address, "t1UYsZVJkLPeMjxEtACvSxfWuNmddpWfxzs") != 0)
+        return error_result(json, "invalid_fixture", "Unexpected fixture public key or address.");
+    if (json)
+        printf("{\"ok\":true,\"fixture\":true,\"address\":\"%s\",\"wallet_address\":false}\n",
+               address);
+    else printf("PUBLIC FIXTURE ONLY; not your wallet address: %s\n", address);
+    return 0;
+}
+
+static int receive_address(const char *path, bool json) {
+    if (!hidraw_path(path))
+        return error_result(json, "invalid_device_path", "Expected /dev/hidrawN.");
+    int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return error_result(json, "open_failed", "Cannot open the selected HID device.");
+    struct hidraw_devinfo info;
+    if (ioctl(fd, HIDIOCGRAWINFO, &info) < 0 ||
+        info.vendor != 0x2c97 || info.product != 0) {
+        close(fd);
+        return error_result(json, "not_blue", "The selected device is not a Ledger Blue.");
+    }
+    static const uint8_t identify[] = {0xa5, 1, 0, 0, 0};
+    static const uint8_t get_key[] = {0xa5, 2, 0, 0, 0};
+    uint8_t reply[LEDGER_HID_MAX_RESPONSE];
+    size_t length = 0;
+    bool identified = ledger_hid_exchange_timeout(
+        fd, identify, sizeof identify, reply, sizeof reply, &length, 2000) == 0 &&
+        blue_wallet_identity_matches(reply, length);
+    if (!identified) {
+        close(fd);
+        return error_result(json, "wrong_app", "Open ZCL Wallet on the Blue first.");
+    }
+    bool received = ledger_hid_exchange_timeout(
+        fd, get_key, sizeof get_key, reply, sizeof reply, &length, 2000) == 0;
+    close(fd);
+    if (!received || length != BLUE_WALLET_PUBLIC_KEY_SIZE + 2 ||
+        reply[length - 2] != 0x90 || reply[length - 1] != 0)
+        return error_result(json, "no_address", "The Blue did not return a receive key.");
+    char address[ZCL_ADDRESS_SIZE];
+    if (zcl_address_from_pubkey(reply, address) < 0)
+        return error_result(json, "invalid_key", "The Blue returned an invalid public key.");
+    if (json)
+        printf("{\"ok\":true,\"path\":\"m/44'/147'/0'/0/0\","
+               "\"address\":\"%s\",\"device_confirmation_required\":true,"
+               "\"signing\":false}\n", address);
+    else printf("%s\nCompare all 35 characters with the Blue screen before receiving ZCL.\n",
+                address);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    bool json;
+    if (parse_command(argc, argv, "receive-address", 3, &json))
+        return receive_address(argv[argc - 1], json);
+    if (parse_command(argc, argv, "fixture-address", 3, &json))
+        return fixture_info(argv[argc - 1], json);
+    if (argc == 3 && strcmp(argv[1], "address-from-pubkey") == 0)
+        return address_from_pubkey(argv[2]);
+    if (parse_command(argc, argv, "devices", 2, &json))
+        return list_devices(json);
+    if (parse_command(argc, argv, "app-info", 3, &json))
+        return app_info(argv[argc - 1], json);
+    if (parse_command(argc, argv, "probe", 3, &json))
+        return probe_info(argv[argc - 1], json);
+    if (argc == 3 && strcmp(argv[1], "quit") == 0)
+        return error_result(false, "unsupported",
+                            "USB quit froze the Blue in a live test. Use the app's touchscreen EXIT.");
+    fprintf(stderr, "Usage: %s fixture-address [--json] /dev/hidrawN\n"
+                    "       %s receive-address [--json] /dev/hidrawN\n"
+                    "       %s address-from-pubkey COMPRESSED_PUBKEY_HEX\n"
+                    "       %s devices [--json]\n"
+                    "       %s app-info [--json] /dev/hidrawN\n"
+                    "       %s probe [--json] /dev/hidrawN\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+    return 2;
+}

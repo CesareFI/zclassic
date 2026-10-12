@@ -1,0 +1,94 @@
+# ── GitHub Linguist: report this repo as ~100% C ─────────────────────────
+# The shipped product is ONE C binary (1000+ .c + 500+ .h). Everything else
+# in the tree — build/test/deploy scripts, docs, view templates, config, and
+# fixtures — is support material, not the artifact. These rules affect ONLY
+# GitHub's language bar; the build, lint, and CI never read .gitattributes,
+# so nothing here can change how the node compiles or behaves.
+#
+# linguist-vendored / -generated / -documentation = "don't count toward the
+# language stats" (the files are KEPT — most are load-bearing tooling).
+# linguist-language=C = "count this as C" (for C source with an odd extension).
+
+# Count C sources as C. Headers (*.h) are the important one: with no .cpp in
+# the tree, GitHub otherwise leaves *.h ambiguous and guesses C++ — forcing
+# linguist-language=C ASSIGNS them to C (it does NOT hide them), which removes
+# the phantom "C++" slice. *.inc is C source carried with an odd extension.
+*.c          linguist-language=C
+*.h          linguist-language=C
+*.inc        linguist-language=C
+
+# Docs / prose.
+*.md         linguist-documentation
+*.txt        linguist-documentation
+*.example    linguist-documentation
+LICENSE      linguist-documentation
+COPYING      linguist-documentation
+NOTICE       linguist-documentation
+
+# Build / test / deploy / ops tooling — load-bearing, kept, not the product.
+Makefile     linguist-vendored
+*.mk         linguist-vendored
+*.sh         linguist-vendored
+*.py         linguist-vendored
+tools/**     linguist-vendored
+deploy/**    linguist-vendored
+vendor/**    linguist-vendored
+.claude/**   linguist-vendored
+
+# Preserve pinned third-party source byte-for-byte. Several upstream files use
+# CRLF or intentional trailing tabs/spaces; disabling Git's patch whitespace
+# warning for only these exact vendor packages avoids rewriting authenticated
+# upstream bytes merely to satisfy this repository's house formatting.
+vendor/rgfw/**      -whitespace
+vendor/qrcodegen/** -whitespace
+vendor/typography/stb_truetype.h -whitespace
+# Seeded-bug patches for the shadow selector corpus. A blank context line in a
+# unified diff is a single space, and each patch is pinned by its SHA3 in
+# corpus.tsv, so the bytes cannot be trimmed.
+tools/dev/fixtures/shadow_select/*.patch -whitespace
+
+# Non-C assets (view templates, styles, config, fixtures, data).
+*.chtml      linguist-generated
+*.ccss       linguist-generated
+*.css        linguist-generated
+*.js         linguist-generated
+*.html       linguist-generated
+*.sql        linguist-generated
+*.json       linguist-generated
+*.yml        linguist-generated
+*.yaml       linguist-generated
+*.cfg        linguist-generated
+*.csv        linguist-generated
+*.supp       linguist-generated
+*.service    linguist-generated
+*.timer      linguist-generated
+*.scenario   linguist-generated
+*.fixture    linguist-generated
+apps/zcl-ledger/tests/fixtures/zcl-wallet-0.3.46.text binary
+
+# Impact rules are an unordered SET of independent mappings that every lane
+# appends to. Concurrent appends are not semantically conflicting, so take the
+# union rather than stopping the merge on a textual collision at EOF.
+cognition/controllers/include/controllers/agent_impact_rules.def merge=union
+
+# Build and operator entry points execute in MSYS2, WSL, Linux, and macOS.
+# Pin their working-tree bytes to LF even when a Windows-wide Git installation
+# enables core.autocrlf; CRLF makes an env-based shebang resolve "bash\r" and
+# prevents source identity, lint, and bootstrap from starting at all.
+*.sh         text eol=lf
+Makefile     text eol=lf
+*.mk         text eol=lf
+
+# The consensus seal hashes the exact working-tree bytes compiled by the node.
+# A Windows checkout must therefore materialize the complete sealed set with
+# the same LF bytes as Linux and macOS even when a machine-wide Git setting
+# requests CRLF conversion. Keep this list aligned with CORE_SEAL_PATHS.
+core/** text eol=lf
+core/modules/validation/src/connect_block.c text eol=lf
+core/modules/validation/src/chainstate.c text eol=lf
+core/modules/validation/include/validation/connect_block.h text eol=lf
+core/modules/validation/include/validation/chainstate.h text eol=lf
+
+# Preserve the pinned upstream clang-c source bytes, including its blank EOF.
+vendor/clang-c-18/LICENSE.TXT -whitespace
+vendor/clang-c-18/include/clang-c/*.h -whitespace

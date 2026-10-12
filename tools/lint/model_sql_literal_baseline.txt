@@ -1,0 +1,81 @@
+# check_model_sql_literals baseline — model files that still carry a hand-written
+# SQL statement instead of building it with
+# engine/models/include/models/query_builder.h.
+#
+# One path per line. THE LIST MAY ONLY SHRINK. Adding a row is
+# not a fix; a row whose file no longer carries literal SQL must
+# be DELETED, and this gate fails until it is.
+#
+# Fix a row by converting the model:
+#   1. add its table + columns to
+#      engine/models/include/models/query_schema.def
+#   2. replace each statement with qb_select/qb_insert/
+#      qb_update/qb_delete + qb_where_*/qb_value_*/qb_set_*
+#   3. run its existing test group, then delete the line here.
+#
+# Migration and schema files are ordinary rows: a query builder
+# cannot express CREATE TABLE, so those are expected to stay.
+#
+# Regenerate: ZCL_LINT_MODE=UPDATE tools/lint/check_model_sql_literals.sh
+cognition/models/src/agent_session.c
+engine/models/src/block.c
+engine/models/src/block_projection.c
+engine/models/src/blog_post.c
+engine/models/src/build_fabric.c
+engine/models/src/build_proof_event.c
+engine/models/src/contact.c
+engine/models/src/database.c
+engine/models/src/database_migrate.c
+engine/models/src/database_migrate_features.c
+engine/models/src/database_migrate_features_v30_up.c
+engine/models/src/database_migrate_features_v49_up.c
+engine/models/src/database_migrate_features_v67_up.c
+engine/models/src/database_modes.c
+engine/models/src/database_schema.c
+engine/models/src/database_schema_preflight.c
+contexts/explorer/models/src/explorer_index.c
+contexts/market/models/src/explorer_index_zslp.c
+engine/models/src/file_offer.c
+engine/models/src/file_service.c
+engine/models/src/header_admit_log.c
+engine/models/src/hodl_wave.c
+contexts/market/models/src/market_content.c
+contexts/market/models/src/market_download.c
+contexts/market/models/src/market_payment_claim.c
+contexts/market/models/src/market_seller_key.c
+engine/models/src/mempool_entry.c
+engine/models/src/mesh_capability_grant.c
+engine/models/src/mesh_machine_observation.c
+engine/models/src/mesh_pairing.c
+engine/models/src/onion_directory.c
+engine/models/src/principal.c
+engine/models/src/sapling_note.c
+engine/models/src/schema_migration.c
+contexts/market/models/src/shop_fulfill.c
+contexts/market/models/src/shop_want.c
+engine/models/src/store_blob.c
+engine/models/src/store.c
+engine/models/src/store_purchase.c
+engine/models/src/swap_contract.c
+engine/models/src/tx_index.c
+engine/models/src/utxo.c
+contexts/wallet/models/src/vault_intent.c
+contexts/wallet/models/src/wallet_backup_receipt.c
+contexts/wallet/models/src/wallet_identity.c
+contexts/wallet/models/src/wallet_key.c
+contexts/wallet/models/src/wallet_label.c
+contexts/wallet/models/src/wallet_metadata_crypto.c
+contexts/wallet/models/src/wallet_tx.c
+contexts/wallet/models/src/wallet_tx_reads.c
+contexts/wallet/models/src/wallet_tx_reorg.c
+contexts/market/models/src/yardsale_plan.c
+contexts/commons/models/src/zanc.c
+contexts/commons/models/src/zcode_lane.c
+cognition/models/src/zcode_science.c
+engine/models/src/zid_domain.c
+engine/models/src/zid_identity.c
+contexts/messaging/models/src/zmsg.c
+contexts/naming/models/src/znam.c
+contexts/market/models/src/zslp.c
+contexts/market/models/src/zslp_ledger.c
+contexts/market/models/src/zslp_validity.c

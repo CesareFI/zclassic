@@ -1,0 +1,478 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * purpose: shared declarations for the split C23 lint runtime (the gate
+ * table entry type and every gate family's run/selftest prototypes).
+ */
+#ifndef LINTC_H
+#define LINTC_H
+
+#include <regex.h>
+#include <stddef.h>
+#include <stdio.h>
+
+struct lint_gate {
+    const char *name;
+    int (*run)(int argc, char **argv);
+    int (*selftest)(void);
+};
+
+enum { RS_MAX = 256, RS_NAME = 64, RS_PATH = 192, RS_AUTH = 32, RS_SHAPE = 16,
+       CLK_MATCH = 65536 };
+enum { SR_ALLOW = 256, SR_NAME = 96, SR_STRAY = 128 };
+
+struct sr_set { char n[SR_ALLOW][SR_NAME]; int count; };
+
+/* Generic "<path>:<symbol>" shrink-only ratchet baseline, shared by gates
+ * that were re-rooted onto real scan roots and now see debt the dead roots
+ * hid: a row may only be REMOVED (the site fixed or the file deleted), never
+ * added — a NEW row FAILs, and a STALE row (baselined but no longer found)
+ * also FAILs, forcing the list down as sites are cleaned up. */
+enum { BLN_MAX = 512, BLN_ROW = RS_PATH + 64 };
+struct bln_set { char n[BLN_MAX][BLN_ROW]; int count; };
+int bln_has(const struct bln_set *s, const char *name);
+int bln_add(struct bln_set *s, const char *name);
+int bln_load(struct bln_set *s, const char *path);
+int bln_diff_report(FILE *out, const char *gate, const char *baseline_path,
+                    const struct bln_set *base, const struct bln_set *found);
+
+extern const char k_ls_all[];
+extern const char k_planted[];
+extern const char *const k_domain[2];
+extern const char *g_lint_argv0;
+extern int g_n_shapes;
+extern char g_shapes[RS_SHAPE][RS_NAME];
+extern int g_n_ctx;
+extern char g_ctx[RS_MAX][RS_NAME];
+extern int g_n_libs;
+extern char g_libs[RS_MAX][RS_NAME];
+extern int g_n_auth;
+extern char g_auth[RS_AUTH][RS_PATH];
+
+int die(const char *msg, const char *arg);
+int fin(FILE *f, char *line, const char *path, int rc);
+int reg_fail(regex_t *re, int err);
+int ovf(int n, size_t cap);
+int cmd_done(const char *cmd, int st, int allow_exit1);
+void drop2(regex_t *a, regex_t *b);
+void drop3(regex_t *a, regex_t *b, regex_t *c);
+int each_zpath_st(const char *cmd, int allow_exit1,
+                  int (*fn)(const char *, void *), void *ctx);
+int each_zpath(const char *cmd, int (*fn)(const char *, void *), void *ctx);
+int lint_git_index_foreach(int (*fn)(const char *, int, void *), void *ctx,
+                           char *badext);
+int want(const char *tag, const regex_t *re, const char *s, int w);
+int st_ok(int bad, const char *msg);
+int walk_src(const char *dir, int hdrs,
+             int (*scan)(const char *, void *), void *ctx);
+int require_scan_root(const char *gate, const char *root);
+int walk_src_root(const char *gate, const char *root, int hdrs,
+                  int (*scan)(const char *, void *), void *ctx);
+
+/* Shared comment/string-literal stripper for gates that regexec() raw
+ * source lines (see cstrip_line in lib.c). in_block persists across the
+ * getline() calls for one file (a block comment can span lines); reset
+ * to {0} per file. */
+struct cstrip { int in_block; };
+int cstrip_line(struct cstrip *st, const char *line, size_t n, char *out,
+               size_t cap);
+/* Shared stack-buffer size for the two callers above: large enough for any
+ * real source line, small enough to keep off the heap (raw malloc/calloc
+ * outside zcl_* wrappers is itself gated in tools/). */
+enum { CSTRIP_LINE_MAX = 8192 };
+
+int fcount_scan(const char *path, void *ctx);
+int walk_count_roots(const char *gate, const char *const *roots, size_t nroots,
+                     int hdrs, int *out);
+int compile_pat(regex_t *re, int flags, const char *a, const char *b,
+                const char *c, const char *d);
+int pair_comp(regex_t *a, int fa, const char *a0, const char *a1,
+              const char *a2, const char *a3, regex_t *b, int fb,
+              const char *b0, const char *b1, const char *b2, const char *b3);
+int miss(const char *path, FILE *out, const char *fmt);
+int scan_re(const char *path, const regex_t *re, int *hits, int show);
+int capture_cmd(const char *cmd, char *out, size_t cap, int *code);
+const char *env_or(const char *name, const char *fallback);
+int lint_self_exe(char *buf, size_t cap);
+int sh_single_quote(const char *in, char *out, size_t cap);
+int gate_require_scanned(int count, int floor, const char *name,
+                         const char *hint);
+int gate_count_and_report(const char *matches, int *out_count);
+int lint_annotate_stray(const char *path, FILE *out);
+int lint_filter_excluded(const char *in, char *out, size_t cap);
+int lint_path_is_excluded(const char *path);
+int excl_ensure(void);
+int lint_prod_scan(void);
+int rs_init(void);
+int repo_shape_dirs(const char *family, const char *leaf,
+                    char out[][RS_PATH], int max, int *n);
+int repo_shape_room_dirs(const char *shape, char out[][RS_PATH], int max,
+                         int *n);
+int sr_has(const struct sr_set *s, const char *name);
+int sr_add(struct sr_set *s, const char *name);
+int sr_load(struct sr_set *s, const char *path);
+int replay(FILE *out);
+int csr_mkdirs(const char *path);
+int csr_write(const char *path, const char *text);
+int csr_slurp(FILE *f, char *buf, size_t cap);
+int psp_st_reset(FILE *out);
+int rap_rm_rf(const char *root);
+int cic_repo_root(char *buf, size_t cap);
+int cic_invoke(const char *gate, int merge_err, char *out, size_t cap,
+               int *code);
+const char *clock_mode(void);
+int clock_grade(int v, const char *mode);
+
+/* The one family-file size ceiling. `z23-lint --families` reports each
+ * family's headroom against it and tools/lint/check_lint_gate_wiring.sh
+ * refuses a breach; the shell side reads this single definition out of
+ * this header, so the number exists exactly once. */
+#define LINT_FAMILY_CEILING 1500
+
+int lint_families_ledger(void);
+/* Shared shrink-only ratchet baseline. A ratchet gate measures one integer
+ * M per scanned item (complexity, lines, whatever its cap is on) and pins
+ * the legacy over-cap items in a baseline file, one `key:M` row per line
+ * (`#` comments and blank lines skipped; M is the text after the LAST
+ * colon, so keys may themselves contain colons, e.g. `path:function:M`).
+ * Exact-pin semantics: an over-cap item whose key is not pinned is NEW
+ * (the caller reports it, since only the caller knows its cap and line);
+ * a pin whose item grew or shrank fails lint_base_finish; a pin whose key
+ * was never observed fails as stale. Pins may only ever fall.
+ *
+ * Keys must be unique per scan. When a scan can legitimately produce the
+ * same logical name twice for one key scope (e.g. a function defined once
+ * per platform #ifdef branch in a single file), the scan side suffixes
+ * repeats `name#2`, `name#3`, ... in scan order so every pin stays an
+ * exact match; lint_base_load rejects duplicate rows fail-closed.
+ *
+ * Call flow: lint_base_load once; lint_base_observe for EVERY scanned item
+ * (any M — a pinned item that dropped under the cap must still be seen so
+ * the ratchet-down is named, not misreported as stale); the caller emits
+ * its own NEW-item diagnostics; lint_base_finish emits the grew/shrank/
+ * stale diagnostics and returns their count. Generation (the gate's
+ * --write-baseline upkeep path): lint_base_pin per over-cap item, then
+ * lint_base_write. Storage is caller-owned fixed buffers; declare the
+ * struct in static storage (it is ~2.5 MB).
+ *
+ * Presence-set mode (lint_base_load_set): gates ported from the shell
+ * gate_load_list_file() allowlists keep those semantics instead — the
+ * baseline is a SET of plain keys (no :M), `#` starts a comment anywhere
+ * on the line, whitespace is trimmed, duplicates collapse silently, and a
+ * missing file is an empty set, not an error. Membership is
+ * lint_base_observe(b, key, 1) >= 0. The set is superset-allowed: an
+ * entry no scan observed is unused, never stale, so lint_base_finish is
+ * not called on a set baseline. Choose this mode only when the gate's
+ * pre-existing baseline contract demands it; new shrink-only ratchets use
+ * the exact-pin flow above. */
+enum { LB_MAX = 8192, LB_KEY = 320 };
+struct lb_row { char key[LB_KEY]; int pinned, cur, seen; };
+struct lint_base { struct lb_row row[LB_MAX]; int n; };
+
+int lint_base_load(struct lint_base *b, const char *path, FILE *err);
+int lint_base_load_set(struct lint_base *b, const char *path);
+int lint_base_observe(struct lint_base *b, const char *key, int m);
+int lint_base_finish(const struct lint_base *b, FILE *out);
+int lint_base_pin(struct lint_base *b, const char *key, int m);
+int lint_base_write(struct lint_base *b, const char *path, const char *hdr);
+
+
+/* Extract the 1-based top-level comma argument span; quote/escape and
+ * parenthesis aware. Returns total argument count; outputs change only
+ * when the requested argument exists. Input length must fit INT_MAX. */
+int lint_macro_arg(const char *s, int want, int *off, int *len);
+int check_live_datadir_isolation_run(int argc, char **argv);
+int check_live_datadir_isolation_selftest(void);
+
+int check_no_python_run(int argc, char **argv);
+int check_no_python_selftest(void);
+int check_malloc_run(int argc, char **argv);
+int check_malloc_selftest(void);
+int check_dev_proof_native_fast_path_run(int argc, char **argv);
+int check_dev_proof_native_fast_path_selftest(void);
+int check_before_save_hooks_run(int argc, char **argv);
+int check_before_save_hooks_selftest(void);
+int check_pthread_create_run(int argc, char **argv);
+int check_pthread_create_selftest(void);
+int check_silent_error_returns_run(int argc, char **argv);
+int check_silent_error_returns_selftest(void);
+int check_no_gnu_va_args_run(int argc, char **argv);
+int check_no_gnu_va_args_selftest(void);
+int check_sysinit_ordering_run(int argc, char **argv);
+int check_sysinit_ordering_selftest(void);
+int check_no_raw_clock_outside_platform_run(int argc, char **argv);
+int check_no_raw_clock_outside_platform_selftest(void);
+int check_no_shellouts_run(int argc, char **argv);
+int check_no_shellouts_selftest(void);
+int check_command_contract_run(int argc, char **argv);
+int check_command_contract_selftest(void);
+int check_no_writer_below_sealed_frontier_run(int argc, char **argv);
+int check_no_writer_below_sealed_frontier_selftest(void);
+int check_no_stray_root_files_run(int argc, char **argv);
+int check_no_stray_root_files_selftest(void);
+int check_proc_self_shim_run(int argc, char **argv);
+int check_proc_self_shim_selftest(void);
+int check_simd_os_support_run(int argc, char **argv);
+int check_simd_os_support_selftest(void);
+int check_c23_only_run(int argc, char **argv);
+int check_c23_only_selftest(void);
+int check_hotswap_dev_only_run(int argc, char **argv);
+int check_hotswap_dev_only_selftest(void);
+int check_no_api_keys_run(int argc, char **argv);
+int check_no_api_keys_selftest(void);
+int check_error_doc_refs_run(int argc, char **argv);
+int check_error_doc_refs_selftest(void);
+int check_core_seal_root_mirror_run(int argc, char **argv);
+int check_core_seal_root_mirror_selftest(void);
+int check_peer_floor_single_source_run(int argc, char **argv);
+int check_peer_floor_single_source_selftest(void);
+int check_proof_server_pin_run(int argc, char **argv);
+int check_proof_server_pin_selftest(void);
+int check_tu_random_seed_run(int argc, char **argv);
+int check_tu_random_seed_selftest(void);
+int check_no_retired_agent_protocol_run(int argc, char **argv);
+int check_no_retired_agent_protocol_selftest(void);
+int check_stopwatch_skip_detector_run(int argc, char **argv);
+int check_stopwatch_skip_detector_selftest(void);
+int check_no_warning_suppression_run(int argc, char **argv);
+int check_no_warning_suppression_selftest(void);
+int check_privileged_transition_receipt_run(int argc, char **argv);
+int check_privileged_transition_receipt_selftest(void);
+int check_no_new_coin_backfill_caller_run(int argc, char **argv);
+int check_no_new_coin_backfill_caller_selftest(void);
+int check_mind_owns_rebuild_run(int argc, char **argv);
+int check_mind_owns_rebuild_selftest(void);
+int check_codeindex_coverage_run(int argc, char **argv);
+int check_codeindex_coverage_selftest(void);
+int check_asan_adx_exception_run(int argc, char **argv);
+int check_asan_adx_exception_selftest(void);
+int check_framework_filename_suffix_run(int argc, char **argv);
+int check_framework_filename_suffix_selftest(void);
+int check_no_stray_untracked_source_run(int argc, char **argv);
+int check_no_stray_untracked_source_selftest(void);
+int check_group_purpose_run(int argc, char **argv);
+int check_group_purpose_selftest(void);
+int check_no_new_borrowed_seed_run(int argc, char **argv);
+int check_no_new_borrowed_seed_selftest(void);
+int check_silent_errors_bool_run(int argc, char **argv);
+int check_silent_errors_bool_selftest(void);
+int check_no_raw_sqlite_in_controllers_run(int argc, char **argv);
+int check_no_raw_sqlite_in_controllers_selftest(void);
+int check_blob_read_bounds_run(int argc, char **argv);
+int check_blob_read_bounds_selftest(void);
+int check_posix_ere_only_run(int argc, char **argv);
+int check_posix_ere_only_selftest(void);
+int check_no_orphan_placement_run(int argc, char **argv);
+int check_no_orphan_placement_selftest(void);
+int check_architecture_tree_run(int argc, char **argv);
+int check_architecture_tree_selftest(void);
+int check_sandbox_wired_run(int argc, char **argv);
+int check_sandbox_wired_selftest(void);
+int check_hotswap_eligible_scope_run(int argc, char **argv);
+int check_hotswap_eligible_scope_selftest(void);
+int check_hotswap_static_state_run(int argc, char **argv);
+int check_hotswap_static_state_selftest(void);
+int check_hotswap_candidates_ledger_run(int argc, char **argv);
+int check_hotswap_candidates_ledger_selftest(void);
+int check_result_discard_run(int argc, char **argv);
+int check_result_discard_selftest(void);
+int check_wallet_raw_prepare_log_run(int argc, char **argv);
+int check_wallet_raw_prepare_log_selftest(void);
+int check_persona_resolves_run(int argc, char **argv);
+int check_persona_resolves_selftest(void);
+int check_prompt_templates_run(int argc, char **argv);
+int check_prompt_templates_selftest(void);
+int check_zcode_package_registry_run(int argc, char **argv);
+int check_zcode_package_registry_selftest(void);
+int check_zcode_package_standalone_run(int argc, char **argv);
+int check_zcode_package_standalone_selftest(void);
+int check_honest_witness_run(int argc, char **argv);
+int check_honest_witness_selftest(void);
+int check_mint_skip_crypto_offline_only_run(int argc, char **argv);
+int check_mint_skip_crypto_offline_only_selftest(void);
+int check_equihash_params_run(int argc, char **argv);
+int check_equihash_params_selftest(void);
+int check_arena_view_stub_run(int argc, char **argv);
+int check_arena_view_stub_selftest(void);
+int check_hotfork_stories_run(int argc, char **argv);
+int check_hotfork_stories_selftest(void);
+int check_cyclomatic_complexity_run(int argc, char **argv);
+int check_cyclomatic_complexity_selftest(void);
+int check_framework_shape_run(int argc, char **argv);
+int check_framework_shape_selftest(void);
+int check_zclassicd_reach_allowlist_run(int argc, char **argv);
+int check_zclassicd_reach_allowlist_selftest(void);
+int check_file_purpose_run(int argc, char **argv);
+int check_file_purpose_selftest(void);
+int check_route_command_parity_run(int argc, char **argv);
+int check_route_command_parity_selftest(void);
+int check_flag_registry_run(int argc, char **argv);
+int check_flag_registry_selftest(void);
+int check_rpc_registrar_run(int argc, char **argv);
+int check_rpc_registrar_selftest(void);
+int check_coins_lookup_nullcheck_run(int argc, char **argv);
+int check_coins_lookup_nullcheck_selftest(void);
+int check_wire_harness_security_gate_run(int argc, char **argv);
+int check_wire_harness_security_gate_selftest(void);
+int check_tor_dial_prewarm_run(int argc, char **argv);
+int check_tor_dial_prewarm_selftest(void);
+int check_describe_budget_run(int argc, char **argv);
+int check_describe_budget_selftest(void);
+int check_json_value_init_run(int argc, char **argv);
+int check_json_value_init_selftest(void);
+int check_one_write_path_run(int argc, char **argv);
+int check_one_write_path_selftest(void);
+int check_supervisor_domain_run(int argc, char **argv);
+int check_supervisor_domain_selftest(void);
+int check_controller_private_headers_run(int argc, char **argv);
+int check_controller_private_headers_selftest(void);
+int check_generated_artifact_contradictions_run(int argc, char **argv);
+int check_generated_artifact_contradictions_selftest(void);
+int check_model_column_drift_run(int argc, char **argv);
+int check_model_column_drift_selftest(void);
+int check_thread_supervision_run(int argc, char **argv);
+int check_thread_supervision_selftest(void);
+int check_model_validation_run(int argc, char **argv);
+int check_model_validation_selftest(void);
+int check_lag_slo_observable_run(int argc, char **argv);
+int check_lag_slo_observable_selftest(void);
+int check_vcs_no_git_run(int argc, char **argv);
+int check_vcs_no_git_selftest(void);
+int check_no_authoritative_ram_state_run(int argc, char **argv);
+int check_no_authoritative_ram_state_selftest(void);
+int check_operator_needed_sink_run(int argc, char **argv);
+int check_operator_needed_sink_selftest(void);
+int check_shape_includes_header_run(int argc, char **argv);
+int check_shape_includes_header_selftest(void);
+int check_no_utxo_projection_run(int argc, char **argv);
+int check_no_utxo_projection_selftest(void);
+int check_no_block_index_flat_run(int argc, char **argv);
+int check_no_block_index_flat_selftest(void);
+int check_projections_pure_run(int argc, char **argv);
+int check_projections_pure_selftest(void);
+int check_typed_blocker_run(int argc, char **argv);
+int check_typed_blocker_selftest(void);
+int check_core_include_boundary_run(int argc, char **argv);
+int check_core_include_boundary_selftest(void);
+int check_shape_include_direction_run(int argc, char **argv);
+int check_shape_include_direction_selftest(void);
+int check_no_silent_ready_run(int argc, char **argv);
+int check_no_silent_ready_selftest(void);
+int check_stage_advances_or_blocks_run(int argc, char **argv);
+int check_stage_advances_or_blocks_selftest(void);
+int check_lib_layering_run(int argc, char **argv);
+int check_lib_layering_selftest(void);
+int check_domain_purity_run(int argc, char **argv);
+int check_domain_purity_selftest(void);
+int check_one_result_type_run(int argc, char **argv);
+int check_one_result_type_selftest(void);
+int check_no_secret_printf_run(int argc, char **argv);
+int check_no_secret_printf_selftest(void);
+int check_long_functions_run(int argc, char **argv);
+int check_long_functions_selftest(void);
+int check_test_registration_run(int argc, char **argv);
+int check_test_registration_selftest(void);
+int check_consensus_parity_run(int argc, char **argv);
+int check_consensus_parity_selftest(void);
+int check_systemd_memory_budget_run(int argc, char **argv);
+int check_systemd_memory_budget_selftest(void);
+int check_dumper_never_blocks_run(int argc, char **argv);
+int check_dumper_never_blocks_selftest(void);
+int check_supervisor_registration_run(int argc, char **argv);
+int check_supervisor_registration_selftest(void);
+int check_vcs_no_sha1_run(int argc, char **argv);
+int check_vcs_no_sha1_selftest(void);
+int check_blocker_remedy_run(int argc, char **argv);
+int check_blocker_remedy_selftest(void);
+int check_stable_publish_containment_run(int argc, char **argv);
+int check_stable_publish_containment_selftest(void);
+int check_service_result_convergence_run(int argc, char **argv);
+int check_service_result_convergence_selftest(void);
+int check_frontier_single_writer_run(int argc, char **argv);
+int check_frontier_single_writer_selftest(void);
+int check_no_utxos_mirror_read_run(int argc, char **argv);
+int check_no_utxos_mirror_read_selftest(void);
+int check_no_dev_history_in_contracts_run(int argc, char **argv);
+int check_no_dev_history_in_contracts_selftest(void);
+int check_no_uncited_victory_run(int argc, char **argv);
+int check_no_uncited_victory_selftest(void);
+int check_model_ar_lifecycle_run(int argc, char **argv);
+int check_model_ar_lifecycle_selftest(void);
+int check_raw_malloc_run(int argc, char **argv);
+int check_raw_malloc_selftest(void);
+int check_no_new_repair_rung_run(int argc, char **argv);
+int check_no_new_repair_rung_selftest(void);
+int check_no_new_coordination_shell_run(int argc, char **argv);
+int check_no_new_coordination_shell_selftest(void);
+int check_no_bare_tmp_fixture_run(int argc, char **argv);
+int check_no_bare_tmp_fixture_selftest(void);
+int check_network_tool_hardening_run(int argc, char **argv);
+int check_network_tool_hardening_selftest(void);
+int check_object_reproducible_run(int argc, char **argv);
+int check_object_reproducible_selftest(void);
+int riscv64_universal_run(int argc, char **argv);
+int riscv64_universal_selftest(void);
+int check_tor_full_default_run(int argc, char **argv);
+int check_tor_full_default_selftest(void);
+int check_installed_acceptance_tools_run(int argc, char **argv);
+int check_installed_acceptance_tools_selftest(void);
+int check_hotswap_denied_leaves_run(int argc, char **argv);
+int check_hotswap_denied_leaves_run_io(FILE *out, FILE *err);
+int check_hotswap_denied_leaves_selftest(void);
+int check_command_availability_truthful_run(int argc, char **argv);
+int check_command_availability_truthful_selftest(void);
+int check_rule_vocabulary_run(int argc, char **argv);
+int check_rule_vocabulary_selftest(void);
+int check_blocker_escape_registered_run(int argc, char **argv);
+int check_blocker_escape_registered_selftest(void);
+int check_git_hooks_installed_run(int argc, char **argv);
+int check_git_hooks_installed_selftest(void);
+int check_fleet_facts_run(int argc, char **argv);
+int check_fleet_facts_selftest(void);
+int check_verification_coverage_run(int argc, char **argv);
+int check_verification_coverage_selftest(void);
+int check_no_real_clock_test_deadline_run(int argc, char **argv);
+int check_no_real_clock_test_deadline_selftest(void);
+int check_supervisor_progress_declared_run(int argc, char **argv);
+int check_supervisor_progress_declared_selftest(void);
+int check_no_unattended_publish_run(int argc, char **argv);
+int check_no_unattended_publish_selftest(void);
+int check_hex_codec_single_run(int argc, char **argv);
+int check_hex_codec_single_selftest(void);
+int check_specialists_run(int argc, char **argv);
+int check_specialists_selftest(void);
+int check_shell_host_assumptions_run(int argc, char **argv);
+int check_shell_host_assumptions_selftest(void);
+int check_doc_inline_paths_run(int argc, char **argv);
+int check_doc_inline_paths_selftest(void);
+int check_fleet_airship_rules_run(int argc, char **argv);
+int check_fleet_airship_rules_selftest(void);
+int check_source_identity_authority_run(int argc, char **argv);
+int check_source_identity_authority_selftest(void);
+int check_hotswap_package_receipt_is_not_authority_run(int argc, char **argv);
+int check_hotswap_package_receipt_is_not_authority_selftest(void);
+int check_byte_order_codec_single_run(int argc, char **argv);
+int check_byte_order_codec_single_selftest(void);
+int check_hotswap_swappable_shape_run(int argc, char **argv);
+int check_hotswap_swappable_shape_selftest(void);
+int check_no_snapshot_struct_memcmp_run(int argc, char **argv);
+int check_no_snapshot_struct_memcmp_selftest(void);
+int check_remote_command_classes_run(int argc, char **argv);
+int check_remote_command_classes_selftest(void);
+int check_no_runtime_abort_run(int argc, char **argv);
+int check_no_runtime_abort_selftest(void);
+int check_model_sql_literals_run(int argc, char **argv);
+int check_model_sql_literals_selftest(void);
+int check_windows_acceptance_guard_run(int argc, char **argv);
+int check_windows_acceptance_guard_selftest(void);
+int check_lint_gate_wiring_run(int argc, char **argv);
+int check_lint_gate_wiring_selftest(void);
+int check_package_capabilities_run(int argc, char **argv);
+int check_package_capabilities_selftest(void);
+int check_arm_symbol_single_run(int argc, char **argv);
+int check_arm_symbol_single_selftest(void);
+int check_macos_acceptance_run(int argc, char **argv);
+int check_macos_acceptance_selftest(void);
+int check_sqlite_cursor_lifetime_run(int argc, char **argv);
+int check_sqlite_cursor_lifetime_selftest(void);
+
+#endif

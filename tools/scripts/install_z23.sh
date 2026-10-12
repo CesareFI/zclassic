@@ -1,0 +1,2441 @@
+#!/usr/bin/env bash
+# Copyright 2026 Rhett Creighton - Apache License 2.0
+#
+# install_z23.sh — fetch a packaged Z23 runtime set, verify SHA256SUMS
+# fail-closed, install to ~/.local, install the native user service, and print
+# ONE next command. Linux uses systemd --user. macOS uses launchd with
+# immutable release generations and automatic rollback on failed readiness.
+#
+# Artifact source is taken from the first argument or Z23_RELEASE_SOURCE
+# (a node URL or a local directory). Never hardcoded: any node that serves
+# z23, zclassic23, zclassic23-package-verify, zclassic23-acme, and
+# SHA256SUMS is a valid source. There is no registry.
+#
+# Checksum mismatch is a loud refusal. Nothing is copied to the destination
+# until SHA256SUMS --strict passes.
+#
+# The expected SHA256SUMS digest may instead be learned from three
+# independent systems (see "Release pin" below): pass one --attest= or
+# --attest-unreachable= record per source and this script decides.
+#
+# Usage:
+#   install_z23.sh --source=<url> --manifest-sha256=<sha256-of-SHA256SUMS>
+#   install_z23.sh --source=<url> --attest=baked=<pin> --attest=dns=<pin> \
+#                  --attest-unreachable=repo=<reason>
+#   install_z23.sh --source=<local-dir>
+#   install_z23.sh <url> --manifest-sha256=<sha256-of-SHA256SUMS>
+#   install_z23.sh <local-dir>
+#   Z23_RELEASE_SOURCE=<url> Z23_RELEASE_MANIFEST_SHA256=<sha256> install_z23.sh
+#   Z23_RELEASE_SOURCE=<local-dir> install_z23.sh
+#   install_z23.sh --selftest
+#   install_z23.sh --generation-status=<generation-dir>
+#                        macOS only: print an installed generation's
+#                        directory name, the sha256 SHA256SUMS records for
+#                        its z23, the sha256 of the z23 bytes on disk, and a
+#                        `provenance: consistent|mismatch` verdict — reading
+#                        the installed tree alone, no fetch or rebuild.
+#
+# Env:
+#   Z23_RELEASE_MANIFEST_SHA256
+#                        expected SHA-256 of a remote SHA256SUMS (required
+#                        for http(s); obtain independently of the mirror)
+#   Z23_INSTALL_PREFIX   default $HOME/.local
+#   Z23_UNIT_DIR         default $HOME/.config/systemd/user
+#   Z23_LAUNCHD_DIR      default $HOME/Library/LaunchAgents
+#   Z23_DATADIR          default $HOME/.zclassic-c23
+#   Z23_SKIP_SYSTEMD=1   skip all service installation (tests/archives)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+die() { printf 'install_z23: REFUSE: %s\n' "$*" >&2; exit 1; }
+say() { printf 'install_z23: %s\n' "$*" >&2; }
+
+NEXT_COMMAND="z23 status"
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        die "no SHA-256 tool (sha256sum or shasum) is available"
+    fi
+}
+
+sha256_check_manifest() {
+    local manifest="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$(dirname "$manifest")" && sha256sum -c --strict "$(basename "$manifest")")
+    elif command -v shasum >/dev/null 2>&1; then
+        # validate_manifest_contract already proves the exact strict grammar
+        # and closed member set before this is reached. Stock macOS shasum
+        # has no GNU --strict switch, so it only has to check the bytes here.
+        (cd "$(dirname "$manifest")" && shasum -a 256 -c "$(basename "$manifest")")
+    else
+        die "no SHA-256 tool (sha256sum or shasum) is available"
+    fi
+}
+
+# Public fetch ceilings. The manifest has exactly five short checksum rows;
+# 1 KiB leaves ample format headroom. Node aliases are currently below 32 MiB,
+# the confined verifier below 96 MiB, and the certificate worker (a small
+# static-ish TLS client, currently ~5 MB) below 32 MiB; these limits allow
+# growth without permitting an untrusted mirror to stream without bound.
+# Deadlines apply to every HTTP transaction independently.
+REMOTE_MANIFEST_MAX_BYTES=1024
+REMOTE_NODE_MAX_BYTES=$((64 * 1024 * 1024))
+REMOTE_VERIFIER_MAX_BYTES=$((128 * 1024 * 1024))
+REMOTE_ACME_MAX_BYTES=$((32 * 1024 * 1024))
+REMOTE_CONNECT_TIMEOUT_SECONDS=10
+REMOTE_MANIFEST_MAX_TIME_SECONDS=30
+REMOTE_PAYLOAD_MAX_TIME_SECONDS=300
+CURL_MINIMUM_VERSION="8.4.0"
+
+# ── Release pin: three independent sources, or no install ──────────────────
+# A mirror is never the authority for its own checksum manifest. The expected
+# digest of SHA256SUMS is learned from three INDEPENDENT systems — a value
+# baked into the front-door script, a DNS TXT record on the domain, and the
+# source repository — and reaches this script as attestation records:
+#
+#   --attest=<origin>=z23-pin-v1:<manifest-sha256>:<installer-sha256>
+#   --attest-unreachable=<origin>=<reason>
+#
+# The GATHERER is the C23 front door (tools/install/z23_bootstrap.c over
+# platform/modules/install), which platform/packaging/install/install.sh fetches and digest-checks
+# before running. It classifies each source as answered-with-a-pin or
+# unreachable-for-<reason>. This script is the JUDGE. Judging here as well as
+# in the front door is deliberate duplication, not an oversight: this file is
+# fetched and run ALONE, so it cannot link platform/modules/install, and it must be able to
+# refuse on its own evidence rather than on the gatherer's word.
+#
+# POLICY, stated plainly so it can be argued with:
+#   * ANY two answered pins that differ -> REFUSE. We never majority-vote.
+#     A disagreement means a rollback, a half-finished publish, or a
+#     compromise; installing the "winner" would hide exactly the event this
+#     mechanism exists to surface.
+#   * FEWER THAN TWO answered pins -> REFUSE. One source is not corroboration,
+#     and quietly degrading to it hands back the whole property being bought.
+#   * EXACTLY TWO answered and agreeing -> PROCEED, and say on stderr which
+#     source was unreachable and why. Two independent systems still means
+#     taking over the web server alone does not change what a stranger
+#     installs. Demanding all three would give a veto to any corporate
+#     resolver that drops TXT or any network that blocks the repository host,
+#     and an installer that fails for honest strangers is not safer — it just
+#     pushes them onto a worse install path.
+#   * UNREACHABLE IS NOT DISAGREEMENT, and is never reported as one. A source
+#     that answers with something that is not a pin at all (a captive portal,
+#     an HTML error page) is recorded by the gatherer as unreachable with a
+#     reason. It cannot lower the quorum bar, and calling it a disagreement
+#     would teach people to click past the loudest refusal we have.
+ATTEST_ORIGINS_KNOWN=" baked dns repo "
+ATTEST_PIN_UNSET=0000000000000000000000000000000000000000000000000000000000000000
+ATTEST_SEEN=" "
+ATTEST_OK=""
+ATTEST_OK_COUNT=0
+ATTEST_DOWN=""
+ATTESTED_MANIFEST_SHA256=""
+
+# The one 64-lowercase-hex validator in this file; every hex check goes
+# through it (the pin halves above, and the --manifest-sha256 argument in
+# fetch_into below).
+# zcl-identity-parser-allow: this script ships ALONE — the C23 front door
+# fetches just this file into a mktemp dir and runs it there, so there is no
+# tools/scripts/source_identity_lib.sh beside it to source, and a second
+# shipped file would break the two-digest z23-pin-v1 release pin.
+attest_is_sha256() {
+    [ "${#1}" -eq 64 ] || return 1
+    case "$1" in *[!0-9a-f]*) return 1 ;; esac
+    return 0
+}
+
+# z23-pin-v1:<64 hex>:<64 hex> — no spaces, so a pin is one argv element and
+# one DNS TXT string, and needs no quoting anywhere in this pipeline.
+attest_valid_pin() {
+    local rest manifest installer
+    # The unset sentinel is a declaration that nothing is pinned, not a pin.
+    # A gatherer must report it as an unreachable source, never attest it.
+    case "$1" in
+        "z23-pin-v1:$ATTEST_PIN_UNSET:$ATTEST_PIN_UNSET") return 1 ;;
+    esac
+    rest="${1#z23-pin-v1:}"
+    [ "$rest" != "$1" ] || return 1
+    manifest="${rest%%:*}"
+    [ "$manifest" != "$rest" ] || return 1
+    installer="${rest#*:}"
+    case "$installer" in *:*) return 1 ;; esac
+    # Both pins are exactly 64 lowercase hex chars. Checked inline rather than
+    # through a shared helper: this script is fetched and run standalone, so
+    # it cannot source tools/scripts/source_identity_lib.sh (zcl_is_sha256).
+    [ "${#manifest}" -eq 64 ] && [ "${#installer}" -eq 64 ] || return 1
+    case "$manifest" in *[!0-9a-f]*) return 1 ;; esac
+    case "$installer" in *[!0-9a-f]*) return 1 ;; esac
+    return 0
+}
+
+attest_claim_origin() {
+    case "$ATTEST_ORIGINS_KNOWN" in
+        *" $1 "*) ;;
+        *) die "unknown attestation origin: $1" ;;
+    esac
+    case "$ATTEST_SEEN" in
+        *" $1 "*) die "attestation origin named twice: $1" ;;
+    esac
+    ATTEST_SEEN="$ATTEST_SEEN$1 "
+}
+
+attest_record() {
+    attest_claim_origin "$1"
+    attest_valid_pin "$2" \
+        || die "attestation from $1 is not a z23-pin-v1:<sha256>:<sha256> record"
+    ATTEST_OK="$ATTEST_OK$1 $2"$'\n'
+    ATTEST_OK_COUNT=$((ATTEST_OK_COUNT + 1))
+}
+
+attest_record_unreachable() {
+    attest_claim_origin "$1"
+    # The reason is text from a source we do not trust; keep it to a token so
+    # it cannot dress itself up as another line of our own output.
+    case "$2" in
+        ''|*[!a-z0-9-]*) die "unreachable reason for $1 must be lowercase-dash text" ;;
+    esac
+    ATTEST_DOWN="$ATTEST_DOWN$1 $2"$'\n'
+}
+
+# Sets ATTESTED_MANIFEST_SHA256, or dies. Deliberately not a subshell that
+# echoes a value: die() inside $(...) would exit only the subshell and leave
+# the caller carrying an empty digest.
+attest_resolve_manifest() {
+    local origin pin reason first_origin="" first_pin="" unreachable="" rest
+    while read -r origin reason; do
+        [ -n "$origin" ] || continue
+        unreachable="$unreachable${unreachable:+, }$origin=$reason"
+    done <<<"$ATTEST_DOWN"
+    while read -r origin pin; do
+        [ -n "$origin" ] || continue
+        if [ -z "$first_pin" ]; then
+            first_origin="$origin"
+            first_pin="$pin"
+            continue
+        fi
+        [ "$pin" = "$first_pin" ] && continue
+        say "attested pin $first_origin=$first_pin"
+        say "attested pin $origin=$pin"
+        die "release pin disagreement between $first_origin and $origin — refusing to install either"
+    done <<<"$ATTEST_OK"
+    if [ "$ATTEST_OK_COUNT" -lt 2 ]; then
+        die "release pin quorum: $ATTEST_OK_COUNT of 3 sources answered, two independent sources are required (unreachable: ${unreachable:-none})"
+    fi
+    [ "$ATTEST_OK_COUNT" -ge 3 ] \
+        || say "release pin agreed by $ATTEST_OK_COUNT of 3 sources (unreachable: ${unreachable:-none})"
+    rest="${first_pin#z23-pin-v1:}"
+    ATTESTED_MANIFEST_SHA256="${rest%%:*}"
+}
+
+INSTALL_STAGE=""
+INSTALL_STAGE_PARENT=""
+
+cleanup_install_stage() {
+    if [ -n "${MACOS_INCOMING:-}" ]; then
+        case "$MACOS_INCOMING" in
+            "${MACOS_GENERATIONS:-/invalid}"/.incoming.??????)
+                chmod u+w "$MACOS_INCOMING" 2>/dev/null || true
+                find "$MACOS_INCOMING" -xdev -depth -delete
+                ;;
+            *)
+                printf 'install_z23: REFUSE: internal macOS generation cleanup path escaped its parent\n' >&2
+                return 1
+                ;;
+        esac
+        MACOS_INCOMING=""
+    fi
+    [ -n "$INSTALL_STAGE" ] || return 0
+    case "$INSTALL_STAGE" in
+        "$INSTALL_STAGE_PARENT"/zcl-install-z23.??????) ;;
+        *)
+            printf 'install_z23: REFUSE: internal cleanup path escaped the install staging directory\n' >&2
+            return 1
+            ;;
+    esac
+    [ ! -e "$INSTALL_STAGE" ] \
+        || find "$INSTALL_STAGE" -xdev -depth -delete
+    INSTALL_STAGE=""
+}
+
+# The release is an EXACT CLOSED SET of five names. AGENT_CARD.md is in it
+# and is not "just documentation": its whole job is to tell a coding agent
+# which commands to run, so a tampered card is instruction injection into
+# whatever assistant installs the node. zclassic23-acme is in it because a
+# node that can obtain a certificate but never installs the one binary that
+# can renew it is a node that goes dark the day the certificate expires —
+# see write_cert_renew_units below. A release that claims everything is
+# verified does not get to ship one unverified file. The set stays exact —
+# never a wildcard — because "any file the manifest names" is how an
+# attacker adds a sixth.
+RELEASE_MEMBERS="AGENT_CARD.md z23 zclassic23 zclassic23-package-verify zclassic23-acme"
+REMOTE_CARD_MAX_BYTES=$((64 * 1024))
+
+payload_max_bytes() {
+    case "$1" in
+        z23|zclassic23) printf '%s\n' "$REMOTE_NODE_MAX_BYTES" ;;
+        zclassic23-package-verify) printf '%s\n' "$REMOTE_VERIFIER_MAX_BYTES" ;;
+        zclassic23-acme) printf '%s\n' "$REMOTE_ACME_MAX_BYTES" ;;
+        AGENT_CARD.md) printf '%s\n' "$REMOTE_CARD_MAX_BYTES" ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_manifest_contract() {
+    local manifest="$1" bytes lines matching names z23_digest alias_digest
+    [ -f "$manifest" ] || die "SHA256SUMS missing after fetch"
+    bytes="$(wc -c <"$manifest" | tr -d ' ')"
+    [ "$bytes" -le "$REMOTE_MANIFEST_MAX_BYTES" ] \
+        || die "SHA256SUMS exceeds $REMOTE_MANIFEST_MAX_BYTES bytes"
+    lines="$(wc -l <"$manifest" | tr -d ' ')"
+    matching="$(LC_ALL=C grep -Ec \
+        '^[0-9a-f]{64}  (AGENT_CARD\.md|z23|zclassic23|zclassic23-package-verify|zclassic23-acme)$' \
+        "$manifest" || true)"
+    [ "$lines" -eq 5 ] && [ "$matching" -eq 5 ] \
+        || die "SHA256SUMS must contain exactly five strict lowercase SHA-256 rows"
+    names="$(awk '{print $2}' "$manifest" | LC_ALL=C sort)"
+    [ "$names" = $'AGENT_CARD.md\nz23\nzclassic23\nzclassic23-acme\nzclassic23-package-verify' ] \
+        || die "SHA256SUMS must name each required release member exactly once"
+    # z23 and zclassic23 are one program under two names, and the release
+    # says so with one digest in two rows. If they ever differ this is not a
+    # release we understand: refuse rather than guess which name is the node.
+    z23_digest="$(manifest_digest_of "$(dirname "$manifest")" z23)"
+    alias_digest="$(manifest_digest_of "$(dirname "$manifest")" zclassic23)"
+    [ "$z23_digest" = "$alias_digest" ] \
+        || die "SHA256SUMS gives z23 and zclassic23 different digests — refusing to guess which one is the node"
+}
+
+validate_payload_sizes() {
+    local dir="$1" name bytes maximum
+    for name in $RELEASE_MEMBERS; do
+        [ -f "$dir/$name" ] || die "verified payload missing $name"
+        maximum="$(payload_max_bytes "$name")"
+        bytes="$(wc -c <"$dir/$name" | tr -d ' ')"
+        [ "$bytes" -le "$maximum" ] \
+            || die "$name exceeds its $maximum-byte release ceiling"
+    done
+}
+
+manifest_digest_of() {
+    awk -v want="$2" '$2 == want { print $1; exit }' "$1/SHA256SUMS"
+}
+
+# ── The duplicate third of the download ────────────────────────────────────
+# z23 and zclassic23 are one program under two names: build_release.sh emits
+# the same bytes twice (measured 2026-08-29: 27.8 MB each of a 79.9 MB set),
+# and validate_manifest_contract has already REFUSED any release where the
+# two rows disagree. A hard link in the release directory does not help the
+# stranger — a file server streams the full body per URL however the origin
+# stores it — so the second GET is skipped here instead, and the alias is
+# materialised locally from the bytes just verified.
+#
+# Nothing is verified less. The digest demanded of zclassic23 is the digest
+# that was checked against actually-transferred bytes for z23, SHA256SUMS
+# keeps both rows, and `sha256sum -c --strict` below still hashes every name
+# present on disk — including this one, through the link.
+materialize_alias() {
+    local dir="$1" name="$2" source_name="$3"
+    [ -f "$dir/$source_name" ] \
+        || die "release members are out of order: $name precedes $source_name"
+    ln -f -- "$dir/$source_name" "$dir/$name" 2>/dev/null \
+        || cp -f -- "$dir/$source_name" "$dir/$name" \
+        || die "could not materialize $name from the identical $source_name"
+}
+
+curl_bounded() {
+    local url="$1" dest="$2" maximum_bytes="$3" maximum_seconds="$4"
+    curl --connect-timeout "$REMOTE_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$maximum_seconds" --max-filesize "$maximum_bytes" \
+        -fsSL "$url" -o "$dest"
+}
+
+require_bounded_curl() {
+    local first version major minor
+    first="$(curl --version 2>/dev/null | sed -n '1p')" \
+        || die "curl $CURL_MINIMUM_VERSION or newer is required for bounded remote fetches"
+    version="${first#curl }"
+    [ "$version" != "$first" ] || die "could not parse curl version; $CURL_MINIMUM_VERSION or newer is required"
+    version="${version%% *}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || die "could not parse curl version '$version'; $CURL_MINIMUM_VERSION or newer is required"
+    IFS=. read -r major minor _ <<<"$version"
+    if [ "$major" -lt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -lt 4 ]; }; then
+        die "curl $version is too old; $CURL_MINIMUM_VERSION or newer is required for bounded remote fetches"
+    fi
+}
+
+fetch_into() {
+    local src="$1" dest="$2" expected_manifest_sha256="$3"
+    mkdir -p "$dest"
+    case "$src" in
+        http://*|https://*)
+            # Same 64-lowercase-hex rule as the release pin, so there is one
+            # validator in this file and not two that can drift apart.
+            attest_is_sha256 "$expected_manifest_sha256" \
+                || die "remote source requires --manifest-sha256=<64 lowercase hex>, obtained independently of the mirror"
+            command -v curl >/dev/null 2>&1 || die "curl is required to fetch $src"
+            require_bounded_curl
+            curl_bounded "$src/SHA256SUMS" "$dest/SHA256SUMS" \
+                "$REMOTE_MANIFEST_MAX_BYTES" \
+                "$REMOTE_MANIFEST_MAX_TIME_SECONDS" \
+                || die "could not fetch $src/SHA256SUMS"
+            [ -s "$dest/SHA256SUMS" ] || die "empty SHA256SUMS from $src"
+            local got_manifest_sha256 name
+            got_manifest_sha256="$(sha256_file "$dest/SHA256SUMS")"
+            [ "$got_manifest_sha256" = "$expected_manifest_sha256" ] \
+                || die "remote SHA256SUMS digest mismatch — refusing to fetch payloads"
+            validate_manifest_contract "$dest/SHA256SUMS"
+
+            while read -r _ name; do
+                if [ "$name" = zclassic23 ]; then
+                    materialize_alias "$dest" zclassic23 z23
+                    continue
+                fi
+                curl_bounded "$src/$name" "$dest/$name" \
+                    "$(payload_max_bytes "$name")" \
+                    "$REMOTE_PAYLOAD_MAX_TIME_SECONDS" \
+                    || die "could not fetch $src/$name"
+            done <"$dest/SHA256SUMS"
+            ;;
+        *)
+            [ -d "$src" ] || die "source is not a directory or http(s) URL: $src"
+            [ -f "$src/SHA256SUMS" ] || die "SHA256SUMS missing in $src"
+            cp -f -- "$src/SHA256SUMS" "$dest/SHA256SUMS"
+            validate_manifest_contract "$dest/SHA256SUMS"
+            # An independently obtained digest binds a local directory too:
+            # a staging tree on disk is no more authoritative about itself
+            # than a mirror is. Only checked when one was supplied, so the
+            # ssh bootstrap path (which transfers and re-verifies bytes it
+            # produced) is unaffected.
+            if [ -n "$expected_manifest_sha256" ]; then
+                local got_local_sha256
+                got_local_sha256="$(sha256_file "$dest/SHA256SUMS")"
+                [ "$got_local_sha256" = "$expected_manifest_sha256" ] \
+                    || die "SHA256SUMS digest mismatch in $src — refusing to install"
+            fi
+            local name
+            while read -r _ name; do
+                if [ "$name" = zclassic23 ]; then
+                    materialize_alias "$dest" zclassic23 z23
+                    continue
+                fi
+                [ -f "$src/$name" ] || die "listed file missing: $src/$name"
+                cp -f -- "$src/$name" "$dest/$name"
+            done <"$dest/SHA256SUMS"
+            # Sidecar is extra evidence, not a SHA256SUMS member. Copy it when
+            # the source carries one so a foreign-arch payload can still be
+            # refused or accepted without executing it.
+            if [ -f "$src/z23.tor-stamp" ]; then
+                cp -f -- "$src/z23.tor-stamp" "$dest/z23.tor-stamp" \
+                    || die "could not copy z23.tor-stamp from $src"
+            fi
+            ;;
+    esac
+}
+
+# The same sentence tools/scripts/tor_stamp_lib.sh carries. This script must
+# run standalone on a box with no checkout, so it cannot source that file; the
+# check-tor-full-default lint gate is what keeps the two copies identical.
+TOR_STUB_REFUSAL='refusing to package a tor=stub binary: it cannot reach the onion network; rebuild with make tor-full'
+
+# `z23 -version` prints exactly one of `tor: full` / `tor: stub`, derived from
+# a weak symbol that resolves only when the real Tor archives were linked. A
+# node that cannot reach the onion network is not a Z23 node, so a release
+# that does not prove `tor: full` is refused before anything is placed.
+#
+# Fail closed. An executable payload must print the exact stamp line; a
+# timeout, a missing line, a non-zero exit, or `tor: stub` are all refusals.
+# A payload this host cannot execute (cross-platform / Exec format error)
+# must carry <binary>.tor-stamp with that same line. "I could not look" is
+# not "it is fine".
+#
+# Running an arbitrary executable needs two bounds or it is a hang, not a
+# check: a deadline, and a stdin it cannot consume. The deadline is 10 s
+# unless Z23_INSTALL_TOR_STAMP_TIMEOUT is a positive integer (the selftest
+# sets 10 explicitly, and tightens it to 1 on the sleeping fixture alone,
+# so that one case is a timeout rather than a stall).
+verify_release_not_tor_stub() {
+    local dir="$1" node="$1/z23" sidecar="$1/z23.tor-stamp"
+    local stamp="" sidecar_binary_sha256="" rc=0 budget out err timeout_cmd="" line
+    [ -f "$node" ] || die "tor_stamp_unreadable: $TOR_STUB_REFUSAL (the release at $dir has no z23)"
+
+    refuse_tor_stamp() {
+        local reason="$1" detail="$2"
+        die "$reason: $TOR_STUB_REFUSAL ($detail)"
+    }
+
+    # Reads every line rather than stopping at the first match: the sidecar
+    # (unlike raw `-version` output) also carries a binary_sha256 line after
+    # its tor: line, and read_sidecar_stamp below needs both.
+    stamp_from_text() {
+        stamp=""
+        sidecar_binary_sha256=""
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            case "$line" in
+                'tor: full') stamp=full ;;
+                'tor: stub') stamp=stub ;;
+                'binary_sha256: '*) sidecar_binary_sha256="${line#binary_sha256: }" ;;
+            esac
+        done
+        return 0
+    }
+
+    # The sidecar is only ever consulted when this host cannot EXECUTE the
+    # payload (foreign arch), so nothing here can re-derive "tor: full" from
+    # the binary itself. What it CAN do is bind the sidecar's claim to the
+    # exact bytes SHA256SUMS already verified for z23 -- manifest_digest_of
+    # reads a value validate_manifest_contract + sha256_check_manifest have
+    # already authenticated by the time verify_strict calls this function.
+    # Without that binding, any hand-written sidecar saying `tor: full`
+    # would be accepted next to any payload this host cannot run.
+    read_sidecar_stamp() {
+        [ -f "$sidecar" ] || refuse_tor_stamp tor_stamp_sidecar_missing \
+            "the release at $dir is not executable here and carries no z23.tor-stamp sidecar"
+        stamp=""
+        stamp_from_text <"$sidecar"
+        case "$stamp" in
+            full)
+                local expected_sha256
+                expected_sha256="$(manifest_digest_of "$dir" z23)"
+                [ -n "$expected_sha256" ] || refuse_tor_stamp tor_stamp_unbound \
+                    "the release at $dir has no z23 row in SHA256SUMS to bind the sidecar to"
+                [ -n "$sidecar_binary_sha256" ] || refuse_tor_stamp tor_stamp_unbound \
+                    "the release at $dir sidecar has no binary_sha256 line, so nothing binds it to this payload"
+                [ "$sidecar_binary_sha256" = "$expected_sha256" ] || refuse_tor_stamp tor_stamp_unbound \
+                    "the release at $dir sidecar's binary_sha256 does not match the checksummed z23 payload"
+                return 0
+                ;;
+            stub)
+                refuse_tor_stamp tor_stamp_stub \
+                    "the release at $dir sidecar reports tor: stub"
+                ;;
+            *)
+                refuse_tor_stamp tor_stamp_unreadable \
+                    "the release at $dir sidecar is not an exact tor: full/stub line"
+                ;;
+        esac
+    }
+
+    chmod u+x "$node" 2>/dev/null || true
+
+    budget="${Z23_INSTALL_TOR_STAMP_TIMEOUT:-10}"
+    case "$budget" in
+        ''|*[!0-9]*|0) budget=10 ;;
+    esac
+
+    out="$(mktemp "$dir/.tor-stamp-out.XXXXXX")" \
+        || die "tor_stamp_unreadable: $TOR_STUB_REFUSAL (could not stage a stamp capture at $dir)"
+    err="$(mktemp "$dir/.tor-stamp-err.XXXXXX")" \
+        || die "tor_stamp_unreadable: $TOR_STUB_REFUSAL (could not stage a stamp capture at $dir)"
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout_cmd=timeout
+    elif command -v gtimeout >/dev/null 2>&1; then
+        # coreutils on macOS installs GNU timeout under this name.
+        timeout_cmd=gtimeout
+    fi
+
+    rc=0
+    if [ -n "$timeout_cmd" ]; then
+        "$timeout_cmd" "$budget" "$node" -version </dev/null >"$out" 2>"$err" \
+            || rc=$?
+    else
+        "$node" -version </dev/null >"$out" 2>"$err" &
+        local pid=$!
+        local waited=0
+        while [ "$waited" -lt "$budget" ]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid" || rc=$?
+                break
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            rc=124
+        fi
+    fi
+
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        rm -f -- "$out" "$err"
+        refuse_tor_stamp tor_stamp_timeout \
+            "the release at $dir did not print a tor stamp before the ${budget}s deadline"
+    fi
+
+    if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ] ||
+       grep -qiE 'Exec format error|cannot execute binary file' "$err"; then
+        rm -f -- "$out" "$err"
+        read_sidecar_stamp
+        return 0
+    fi
+
+    stamp_from_text <"$out"
+    case "$stamp" in
+        stub)
+            rm -f -- "$out" "$err"
+            refuse_tor_stamp tor_stamp_stub \
+                "the release at $dir reports tor: stub"
+            ;;
+        full)
+            if [ "$rc" -ne 0 ]; then
+                rm -f -- "$out" "$err"
+                refuse_tor_stamp tor_stamp_unreadable \
+                    "the release at $dir printed tor: full but -version exited $rc"
+            fi
+            rm -f -- "$out" "$err"
+            return 0
+            ;;
+        *)
+            rm -f -- "$out" "$err"
+            if [ "$rc" -ne 0 ]; then
+                refuse_tor_stamp tor_stamp_unreadable \
+                    "the release at $dir -version exited $rc with no tor stamp"
+            fi
+            refuse_tor_stamp tor_stamp_missing \
+                "the release at $dir printed no tor: stamp, so nothing proves it links real Tor"
+            ;;
+    esac
+}
+
+verify_strict() {
+    local dir="$1"
+    validate_payload_sizes "$dir"
+    sha256_check_manifest "$dir/SHA256SUMS" >/dev/null \
+        || die "SHA256SUMS mismatch — refusing to install"
+    verify_release_not_tor_stub "$dir"
+}
+
+atomic_relative_link() {
+    local target="$1" link="$2" tmp="$2.new.$$"
+    rm -f -- "$tmp"
+    ln -s "$target" "$tmp" || return 1
+    # GNU mv follows a destination symlink to a directory unless -T is used;
+    # BSD/macOS mv spells the same no-follow contract -h. Try both native
+    # dialects so `current` is replaced, never treated as a destination dir.
+    if mv -fT -- "$tmp" "$link" 2>/dev/null; then
+        return 0
+    fi
+    mv -fh -- "$tmp" "$link"
+}
+
+macos_generation_matches() {
+    local stage="$1" generation="$2" name
+    for name in z23 zclassic23-package-verify zclassic23-acme AGENT_CARD.md \
+        SHA256SUMS; do
+        cmp -s "$stage/$name" "$generation/$name" || return 1
+    done
+    [ -L "$generation/zclassic23" ] \
+        && [ "$(readlink "$generation/zclassic23")" = z23 ]
+}
+
+# ── Post-install provenance ─────────────────────────────────────────────────
+# The one question a fleet auditor, another agent, or a future upgrade asks
+# about an installed generation directory: "does this directory's NAME equal
+# the sha256 SHA256SUMS records for z23, and does that in turn equal the
+# sha256 of the z23 bytes actually sitting there?" This answers it from the
+# installed tree alone -- no network fetch, no rebuild -- because the
+# generation keeps its own verified SHA256SUMS copy (see
+# install_payload_macos_generation). Prints both quantities and one literal
+# verdict line so a caller can grep for it without parsing prose.
+generation_provenance() {
+    local generation="$1" name recorded actual
+    name="$(basename -- "$generation")"
+    [ -f "$generation/SHA256SUMS" ] \
+        || die "generation has no retained SHA256SUMS: $generation"
+    [ -f "$generation/z23" ] \
+        || die "generation has no z23 binary: $generation"
+    recorded="$(manifest_digest_of "$generation" z23)"
+    actual="$(sha256_file "$generation/z23")"
+    printf 'generation: %s\n' "$name"
+    printf 'sha256sums_z23: %s\n' "$recorded"
+    printf 'installed_z23_sha256: %s\n' "$actual"
+    if [ "$name" = "$recorded" ] && [ "$recorded" = "$actual" ]; then
+        printf 'provenance: consistent\n'
+        return 0
+    fi
+    printf 'provenance: mismatch\n'
+    return 1
+}
+
+MACOS_GENERATION=""
+MACOS_GENERATION_ID=""
+MACOS_GENERATIONS=""
+MACOS_INCOMING=""
+MACOS_PREVIOUS_TARGET=""
+MACOS_PLIST=""
+MACOS_LAUNCHD_DOMAIN=""
+MACOS_LAUNCHD_SESSION=""
+MACOS_ACTIVE_PREFIX=""
+MACOS_ACTIVATION_PENDING=0
+
+install_payload_macos_generation() {
+    local stage="$1" prefix="$2" root generations name
+    root="$prefix/lib/z23"
+    generations="$root/generations"
+    MACOS_GENERATIONS="$generations"
+    # The generation is named by the sha256 SHA256SUMS records for z23 --
+    # the same quantity `manifest_digest_of` already extracts to compare the
+    # z23/zclassic23 rows in validate_manifest_contract -- and NOT by hashing
+    # the SHA256SUMS file itself. Those are different numbers: one is "the
+    # digest of the installed binary", the other is "the digest of a file
+    # that lists digests". verify_strict() (sha256sum -c --strict) has
+    # already proven this generation's z23 bytes hash to exactly this
+    # recorded digest, so the directory name IS the binary's proven identity.
+    MACOS_GENERATION_ID="$(manifest_digest_of "$stage" z23)"
+    MACOS_GENERATION="$generations/$MACOS_GENERATION_ID"
+    mkdir -p "$generations" "$prefix/bin" "$prefix/share/z23"
+
+    if [ -e "$MACOS_GENERATION" ]; then
+        [ -d "$MACOS_GENERATION" ] \
+            || die "macOS generation path is not a directory: $MACOS_GENERATION"
+        macos_generation_matches "$stage" "$MACOS_GENERATION" \
+            || die "macOS generation $MACOS_GENERATION_ID does not match its verified manifest"
+    else
+        MACOS_INCOMING="$(mktemp -d "$generations/.incoming.XXXXXX")" \
+            || die "could not stage macOS release generation"
+        for name in z23 zclassic23-package-verify zclassic23-acme; do
+            install -m 555 "$stage/$name" "$MACOS_INCOMING/$name"
+        done
+        install -m 444 "$stage/AGENT_CARD.md" "$MACOS_INCOMING/AGENT_CARD.md"
+        # Retained beside the binary it names the generation after, so a
+        # later provenance check (generation_provenance) or fleet audit reads
+        # the installed tree alone -- no re-fetch, no rebuild -- to answer
+        # whether the directory name still equals what SHA256SUMS records.
+        install -m 444 "$stage/SHA256SUMS" "$MACOS_INCOMING/SHA256SUMS"
+        ln -s z23 "$MACOS_INCOMING/zclassic23" \
+            || die "could not create the macOS generation node alias"
+        # APFS refuses to rename the generation after its owner-write bit is
+        # removed. Commit its final name first, then make the directory inert.
+        mv -- "$MACOS_INCOMING" "$MACOS_GENERATION" \
+            || die "could not commit macOS release generation"
+        MACOS_INCOMING=""
+        chmod 555 "$MACOS_GENERATION"
+    fi
+
+    # These stable public names never contain release bytes. Each resolves
+    # through the one atomically replaced `current` link below.
+    atomic_relative_link ../lib/z23/current/z23 "$prefix/bin/z23" \
+        || die "could not link the current macOS z23 generation"
+    atomic_relative_link z23 "$prefix/bin/zclassic23" \
+        || die "could not link the current macOS node alias"
+    atomic_relative_link ../lib/z23/current/zclassic23-package-verify \
+        "$prefix/bin/zclassic23-package-verify" \
+        || die "could not link the current macOS package verifier"
+    atomic_relative_link ../lib/z23/current/zclassic23-acme \
+        "$prefix/bin/zclassic23-acme" \
+        || die "could not link the current macOS certificate worker"
+    atomic_relative_link ../../lib/z23/current/AGENT_CARD.md \
+        "$prefix/share/z23/AGENT_CARD.md" \
+        || die "could not link the current verified agent card"
+}
+
+install_payload() {
+    local stage="$1" prefix="$2" name
+    local bindir="$prefix/bin" carddir="$prefix/share/z23"
+    mkdir -p "$bindir" "$carddir"
+    for name in $RELEASE_MEMBERS; do
+        [ -f "$stage/$name" ] || die "verified payload missing $name"
+    done
+    install -m 755 "$stage/z23" "$bindir/z23"
+    # Same bytes, two names: install the alias as a RELATIVE symlink rather
+    # than a second 27.8 MB copy. A symlink and not a hard link on purpose —
+    # a later upgrade replaces the z23 inode, and a hard link would silently
+    # keep serving the old program under the old name. Nothing dispatches on
+    # argv[0]; /proc/self/exe resolves through the link to identical bytes,
+    # so the running-binary digest and self-respawn are unchanged.
+    rm -f -- "$bindir/zclassic23"
+    ln -s z23 "$bindir/zclassic23" || die "could not link zclassic23 to z23"
+    install -m 755 "$stage/zclassic23-package-verify" \
+        "$bindir/zclassic23-package-verify"
+    # zclassic23-acme is the ONLY binary that can renew a certificate this
+    # node obtains (see write_cert_renew_units). Installing it beside the
+    # verifier is what closes the "certificate obtained, never renewed" bug.
+    install -m 755 "$stage/zclassic23-acme" "$bindir/zclassic23-acme"
+    # The agent card is verified payload, so it is installed like payload:
+    # an assistant reading it is reading bytes SHA256SUMS covered.
+    install -m 644 "$stage/AGENT_CARD.md" "$carddir/AGENT_CARD.md"
+}
+
+xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+select_macos_launchd_context() {
+    local uid gui_service=0 user_service=0
+    command -v launchctl >/dev/null 2>&1 || die "launchctl is required for the native macOS service install"
+    uid="$(id -u)"
+    launchctl print "gui/$uid/org.z23.zclassic" >/dev/null 2>&1 && gui_service=1
+    launchctl print "user/$uid/org.z23.zclassic" >/dev/null 2>&1 && user_service=1
+    [ "$gui_service$user_service" != 11 ] \
+        || die "z23 service exists in both GUI and Background launchd domains; refusing ambiguous activation"
+    # Preserve the existing service's domain when a GUI login appears. Moving
+    # only the new generation could leave a second node using the same datadir.
+    if [ "$gui_service" = 1 ]; then
+        MACOS_LAUNCHD_DOMAIN="gui/$uid"
+        MACOS_LAUNCHD_SESSION="Aqua"
+    elif [ "$user_service" = 1 ]; then
+        MACOS_LAUNCHD_DOMAIN="user/$uid"
+        MACOS_LAUNCHD_SESSION="Background"
+    elif launchctl print "gui/$uid" >/dev/null 2>&1; then
+        MACOS_LAUNCHD_DOMAIN="gui/$uid"
+        MACOS_LAUNCHD_SESSION="Aqua"
+    elif launchctl print "user/$uid" >/dev/null 2>&1; then
+        MACOS_LAUNCHD_DOMAIN="user/$uid"
+        MACOS_LAUNCHD_SESSION="Background"
+    else
+        die "no accessible launchd GUI or Background user domain"
+    fi
+}
+
+write_launchd_plist() {
+    local prefix="$1" datadir="$2" launchd_dir="$3"
+    local plist_tmp bin_xml datadir_xml
+    command -v plutil >/dev/null 2>&1 \
+        || die "plutil is required for the native macOS service install"
+    mkdir -p "$launchd_dir" "$datadir"
+    MACOS_PLIST="$launchd_dir/org.z23.zclassic.plist"
+    plist_tmp="$(mktemp "$launchd_dir/.org.z23.zclassic.XXXXXX")" \
+        || die "could not stage the launchd plist"
+    bin_xml="$(xml_escape "$prefix/bin/z23")"
+    datadir_xml="$(xml_escape "$datadir")"
+    cat >"$plist_tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+         "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>org.z23.zclassic</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$bin_xml</string>
+        <string>-datadir=$datadir_xml</string>
+        <string>-operator-lane=canonical</string>
+        <string>-listen</string>
+        <string>-tor</string>
+        <string>-onion-persist</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>LimitLoadToSessionType</key><string>$MACOS_LAUNCHD_SESSION</string>
+    <key>KeepAlive</key><true/>
+    <!-- Match the canonical node service's bounded shutdown grace. -->
+    <key>ExitTimeOut</key><integer>300</integer>
+    <key>ProcessType</key><string>Background</string>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <key>StandardOutPath</key><string>$datadir_xml/z23.stdout.log</string>
+    <key>StandardErrorPath</key><string>$datadir_xml/z23.stderr.log</string>
+    <key>WorkingDirectory</key><string>$datadir_xml</string>
+    <key>Nice</key><integer>0</integer>
+    <key>LowPriorityIO</key><false/>
+</dict>
+</plist>
+EOF
+    if ! plutil -lint "$plist_tmp" >/dev/null; then
+        rm -f -- "$plist_tmp"
+        die "plutil rejected the generated launchd service"
+    fi
+    mv -f -- "$plist_tmp" "$MACOS_PLIST" \
+        || die "could not commit the launchd plist"
+}
+
+macos_switch_current() {
+    local prefix="$1" target="$2" root="$prefix/lib/z23"
+    atomic_relative_link "$target" "$root/current"
+}
+
+# lsof's txt pathname is only a locator: Darwin retains the old mapped vnode
+# after an atomic replacement at that name. Bind the process to an open file's
+# device and inode before comparing bytes. The first txt record is the main
+# executable; later txt records include dyld and loaded libraries.
+macos_lsof_first_vnode() {
+    lsof -a -p "$1" -d "$2" -FDi 2>/dev/null |
+        awk '
+            /^f/ { if (seen) exit; seen = 1; next }
+            seen && /^D0x[0-9A-Fa-f]+$/ { device = substr($0, 2); next }
+            seen && /^i[1-9][0-9]*$/ { inode = substr($0, 2); next }
+            END {
+                if (device != "" && inode != "") print device ":" inode
+                else exit 1
+            }'
+}
+
+macos_launchd_start_and_qualify() {
+    local prefix="$1" datadir="$2" domain service pid confirmed_pid
+    local pinned_digest expected_vnode mapped_vnode
+    local timeout_ms heartbeat_ms
+    domain="$MACOS_LAUNCHD_DOMAIN"
+    [ -n "$domain" ] || return 1
+    service="$domain/org.z23.zclassic"
+    timeout_ms="${Z23_LAUNCHD_READY_TIMEOUT_MS:-120000}"
+    heartbeat_ms="${Z23_LAUNCHD_READY_HEARTBEAT_MS:-250}"
+    command -v launchctl >/dev/null 2>&1 || return 1
+    command -v lsof >/dev/null 2>&1 || return 1
+
+    if launchctl print "$service" >/dev/null 2>&1; then
+        launchctl bootout "$service" >/dev/null || return 1
+    fi
+    launchctl bootstrap "$domain" "$MACOS_PLIST" >/dev/null || return 1
+    launchctl kickstart -k "$service" >/dev/null || return 1
+    "$prefix/bin/z23" core node bootwait -datadir="$datadir" \
+        --timeout_ms="$timeout_ms" --heartbeat_ms="$heartbeat_ms" \
+        >/dev/null || return 1
+    pid="$(launchctl print "$service" 2>/dev/null |
+        awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    attest_is_sha256 "$MACOS_GENERATION_ID" || return 1
+    # Reserved fd 9 pins this generation's vnode across lsof and hashing.
+    # /dev/fd/9 shares its offset, so hash it exactly once before closing.
+    exec 9<"$MACOS_GENERATION/z23" || return 1
+    expected_vnode="$(macos_lsof_first_vnode "$$" 9)" || {
+        exec 9<&-
+        return 1
+    }
+    mapped_vnode="$(macos_lsof_first_vnode "$pid" txt)" || {
+        exec 9<&-
+        return 1
+    }
+    pinned_digest="$(sha256_file /dev/fd/9)" || {
+        exec 9<&-
+        return 1
+    }
+    exec 9<&-
+    [ "$mapped_vnode" = "$expected_vnode" ] || return 1
+    [ "$pinned_digest" = "$MACOS_GENERATION_ID" ] || return 1
+    confirmed_pid="$(launchctl print "$service" 2>/dev/null |
+        awk '$1 == "pid" && $2 == "=" {print $3; exit}')"
+    [ "$confirmed_pid" = "$pid" ]
+}
+
+macos_restore_previous() {
+    local prefix="$1" domain service root="$prefix/lib/z23"
+    domain="$MACOS_LAUNCHD_DOMAIN"
+    [ -n "$domain" ] || return 1
+    service="$domain/org.z23.zclassic"
+    launchctl bootout "$service" >/dev/null 2>&1 || true
+    if [ -n "$MACOS_PREVIOUS_TARGET" ]; then
+        macos_switch_current "$prefix" "$MACOS_PREVIOUS_TARGET" || return 1
+        launchctl bootstrap "$domain" "$MACOS_PLIST" >/dev/null || return 1
+        launchctl kickstart -k "$service" >/dev/null || return 1
+    else
+        rm -f -- "$root/current" "$MACOS_PLIST"
+    fi
+}
+
+macos_abort_pending_activation() {
+    [ "$MACOS_ACTIVATION_PENDING" -eq 1 ] || return 0
+    MACOS_ACTIVATION_PENDING=0
+    macos_restore_previous "$MACOS_ACTIVE_PREFIX"
+}
+
+macos_activation_signal() {
+    local status="$1"
+    macos_abort_pending_activation || true
+    exit "$status"
+}
+
+activate_macos_generation() {
+    local prefix="$1" datadir="$2" root="$prefix/lib/z23"
+    # Keep one selected domain throughout activation and rollback, even if a
+    # GUI login appears while a headless install is being qualified.
+    select_macos_launchd_context
+    MACOS_PREVIOUS_TARGET=""
+    if [ -L "$root/current" ]; then
+        MACOS_PREVIOUS_TARGET="$(readlink "$root/current")"
+    elif [ -e "$root/current" ]; then
+        die "macOS current generation is not a symbolic link"
+    fi
+
+    write_launchd_plist "$prefix" "$datadir" \
+        "${Z23_LAUNCHD_DIR:-$HOME/Library/LaunchAgents}"
+    if [ -n "$MACOS_PREVIOUS_TARGET" ]; then
+        atomic_relative_link "$MACOS_PREVIOUS_TARGET" "$root/last-good" \
+            || die "could not preserve the last-good macOS generation"
+    fi
+    macos_switch_current "$prefix" "generations/$MACOS_GENERATION_ID" \
+        || die "could not activate the candidate macOS generation"
+    MACOS_ACTIVE_PREFIX="$prefix"
+    MACOS_ACTIVATION_PENDING=1
+    trap 'macos_abort_pending_activation' EXIT
+    trap 'macos_activation_signal 129' HUP
+    trap 'macos_activation_signal 130' INT
+    trap 'macos_activation_signal 143' TERM
+
+    if macos_launchd_start_and_qualify "$prefix" "$datadir"; then
+        if [ -z "$MACOS_PREVIOUS_TARGET" ]; then
+            atomic_relative_link "generations/$MACOS_GENERATION_ID" \
+                "$root/last-good" \
+                || die "could not record the first last-good macOS generation"
+        fi
+        MACOS_ACTIVATION_PENDING=0
+        trap - EXIT HUP INT TERM
+        return 0
+    fi
+
+    say "candidate macOS generation failed launchd readiness or running-image qualification; rolling back"
+    MACOS_ACTIVATION_PENDING=0
+    macos_restore_previous "$prefix" \
+        || die "candidate failed and the previous macOS generation could not be restored"
+    trap - EXIT HUP INT TERM
+    die "candidate macOS generation was rolled back"
+}
+
+activate_macos_generation_without_service() {
+    local prefix="$1" root="$prefix/lib/z23" previous=""
+    if [ -L "$root/current" ]; then
+        previous="$(readlink "$root/current")"
+    elif [ -e "$root/current" ]; then
+        die "macOS current generation is not a symbolic link"
+    fi
+    if [ -n "$previous" ]; then
+        atomic_relative_link "$previous" "$root/last-good" \
+            || die "could not preserve the last-good macOS generation"
+    fi
+    macos_switch_current "$prefix" "generations/$MACOS_GENERATION_ID" \
+        || die "could not select the installed macOS generation"
+    if [ -z "$previous" ]; then
+        atomic_relative_link "generations/$MACOS_GENERATION_ID" \
+            "$root/last-good" \
+            || die "could not record the first last-good macOS generation"
+    fi
+}
+
+write_unit() {
+    local prefix="$1" unit_dir="$2"
+    local bin="$prefix/bin/zclassic23"
+    mkdir -p "$unit_dir"
+    # z23.service — never overwrite the production zclassic23.service.
+    cat >"$unit_dir/z23.service" <<EOF
+[Unit]
+Description=Z23 node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# First-boot onion: -tor -onion-persist so a stranger is reachable, and
+# Type=notify holds activating until READY=1. READY waits for onion
+# DESCRIPTOR PUBLICATION (not hostname-only) so cold-boot clients do not
+# dial before HSDirs have the descriptor.
+ExecStart=$bin -datadir=%h/.zclassic-c23 -listen -tor -onion-persist
+# Restart=always (not on-failure): a new node clean-exits once to install the
+# checkpoint bundle (install-on-next-boot). on-failure would drop that boot.
+Restart=always
+RestartSec=5
+TimeoutStartSec=14400
+NotifyAccess=main
+
+[Install]
+WantedBy=default.target
+EOF
+    if [ "${Z23_SKIP_SYSTEMD:-0}" != "1" ]; then
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
+}
+
+install_from_source() {
+    local src="$1" expected_manifest_sha256="$2"
+    [ -n "$src" ] || die "no source: pass --source=<url-or-dir> or set Z23_RELEASE_SOURCE"
+    local prefix="${Z23_INSTALL_PREFIX:-$HOME/.local}"
+    local unit_dir="${Z23_UNIT_DIR:-$HOME/.config/systemd/user}"
+    local install_tmp="${TMPDIR:-/tmp}"
+    [ -d "$install_tmp" ] || die "temporary directory does not exist: $install_tmp"
+    INSTALL_STAGE_PARENT="$(cd "$install_tmp" && pwd -P)"
+    INSTALL_STAGE="$(mktemp -d "$INSTALL_STAGE_PARENT/zcl-install-z23.XXXXXX")" \
+        || die "mktemp failed"
+    trap 'cleanup_install_stage' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    fetch_into "$src" "$INSTALL_STAGE" "$expected_manifest_sha256"
+    verify_strict "$INSTALL_STAGE"
+    local install_platform
+    install_platform="${Z23_INSTALL_TEST_PLATFORM:-$(uname -s)}"
+    if [ "$install_platform" = Darwin ]; then
+        install_payload_macos_generation "$INSTALL_STAGE" "$prefix"
+        # Self-check, not re-verification: the ID above was already derived
+        # from, and verify_strict already proved against, this exact
+        # SHA256SUMS. A mismatch here means the naming/persistence logic
+        # itself is broken, not that anything is being re-trusted.
+        generation_provenance "$MACOS_GENERATION" >&2 \
+            || die "macOS generation provenance check failed for $MACOS_GENERATION"
+    else
+        install_payload "$INSTALL_STAGE" "$prefix"
+    fi
+    cleanup_install_stage
+    trap - EXIT HUP INT TERM
+    if [ "$install_platform" = Darwin ]; then
+        if [ "${Z23_SKIP_SYSTEMD:-0}" != "1" ]; then
+            activate_macos_generation "$prefix" \
+                "${Z23_DATADIR:-$HOME/.zclassic-c23}"
+        else
+            activate_macos_generation_without_service "$prefix"
+        fi
+    elif [ "${Z23_SKIP_SYSTEMD:-0}" != "1" ]; then
+            write_unit "$prefix" "$unit_dir"
+    fi
+    say "installed $prefix/bin/z23"
+    printf '%s\n' "$NEXT_COMMAND"
+}
+
+run_install() {
+    # Drive the shipped entry point in a child so die()/exit is the real path.
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$1" Z23_UNIT_DIR="$2" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$3"
+}
+
+SELFTEST_TMP=""
+SELFTEST_MANIFEST_SHA=""
+SELFTEST_TOR_CASES=""
+
+selftest_prepare() {
+    local tmp
+    tmp="$(mktemp -d /tmp/zcl-install-z23-selftest.XXXXXX)" || die "mktemp failed"
+    SELFTEST_TMP="$tmp"
+    trap 'chmod -R u+w "$SELFTEST_TMP" 2>/dev/null || true; rm -rf "$SELFTEST_TMP"' EXIT
+
+    mkdir -p "$tmp/good" "$tmp/bad" "$tmp/prefix" "$tmp/units" \
+        "$tmp/stages"
+    export TMPDIR="$tmp/stages"
+    # The generic installer contract below remains the Linux/systemd shape.
+    # A separate lifecycle proof exercises Darwin generations and launchd.
+    export Z23_INSTALL_TEST_PLATFORM=Linux
+
+    # A release is five names, and z23/zclassic23 are the same bytes.
+    # The node is a tiny executable that stamps tor: full so the fail-closed
+    # installer check has a positive control that is not the real binary.
+    printf '#!/bin/sh\nprintf "z23 v0.1.0 (source 000000000000)\\ntor: full\\n"\n' \
+        >"$tmp/good/z23"
+    chmod 755 "$tmp/good/z23"
+    ln -f -- "$tmp/good/z23" "$tmp/good/zclassic23"
+    printf 'confined-verifier\n' >"$tmp/good/zclassic23-package-verify"
+    printf 'cert-worker\n' >"$tmp/good/zclassic23-acme"
+    printf '# Z23 agent card\n\nRun `z23 status`.\n' >"$tmp/good/AGENT_CARD.md"
+    (cd "$tmp/good" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+
+    # Shell-only curl fixture: map https://mirror.invalid/<path> into the
+    # selftest tree and record every requested object. This proves a bad
+    # manifest pin is rejected before any executable payload is downloaded.
+    mkdir -p "$tmp/mockbin" "$tmp/http/good" "$tmp/http/replaced" \
+        "$tmp/http/oversized" "$tmp/http/oversized-payload" \
+        "$tmp/http/duplicate" "$tmp/http/malformed" "$tmp/http/signal" \
+        "$tmp/http/split-names" "$tmp/tampered-card"
+    cp -f -- "$tmp/good/"* "$tmp/http/good/"
+    cp -f -- "$tmp/good/"* "$tmp/http/signal/"
+
+    # A release whose two node names are NOT the same bytes. There is no
+    # honest way to pick one, so it is refused before anything is fetched.
+    printf 'payload-a\n' >"$tmp/http/split-names/z23"
+    printf 'payload-b-different\n' >"$tmp/http/split-names/zclassic23"
+    cp -f -- "$tmp/good/zclassic23-package-verify" "$tmp/good/zclassic23-acme" \
+        "$tmp/good/AGENT_CARD.md" "$tmp/http/split-names/"
+    (cd "$tmp/http/split-names" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+
+    # A release whose agent card was edited after the manifest was written.
+    # The card tells an assistant what to run, so this must refuse.
+    cp -f -- "$tmp/good/"* "$tmp/tampered-card/"
+    # Any edit at all is a mismatch; the text is a marker, deliberately not
+    # a real fetch-and-run line, so the fixture cannot trip our own
+    # supply-chain scanner while proving the card is covered.
+    printf '# Z23 agent card\n\nTAMPERED: attacker instructions.\n' \
+        >"$tmp/tampered-card/AGENT_CARD.md"
+
+    printf '#!/bin/sh\nprintf "z23 v0.1.0 (source 000000000000)\\ntor: full\\n"\n' \
+        >"$tmp/http/replaced/z23"
+    chmod 755 "$tmp/http/replaced/z23"
+    ln -f -- "$tmp/http/replaced/z23" "$tmp/http/replaced/zclassic23"
+    printf 'replacement-verifier\n' \
+        >"$tmp/http/replaced/zclassic23-package-verify"
+    printf 'replacement-acme\n' >"$tmp/http/replaced/zclassic23-acme"
+    printf '# replacement card\n' >"$tmp/http/replaced/AGENT_CARD.md"
+    (cd "$tmp/http/replaced" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    dd if=/dev/zero bs=1025 count=1 2>/dev/null | tr '\0' x \
+        >"$tmp/http/oversized/SHA256SUMS"
+    truncate -s $((REMOTE_NODE_MAX_BYTES + 1)) \
+        "$tmp/http/oversized-payload/z23"
+    ln -f -- "$tmp/http/oversized-payload/z23" \
+        "$tmp/http/oversized-payload/zclassic23"
+    cp -f -- "$tmp/good/zclassic23-package-verify" "$tmp/good/zclassic23-acme" \
+        "$tmp/good/AGENT_CARD.md" "$tmp/http/oversized-payload/"
+    (cd "$tmp/http/oversized-payload" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    {
+        sed -n '1p' "$tmp/good/SHA256SUMS"
+        sed -n '1p' "$tmp/good/SHA256SUMS"
+        sed -n '2p' "$tmp/good/SHA256SUMS"
+        sed -n '3p' "$tmp/good/SHA256SUMS"
+    } >"$tmp/http/duplicate/SHA256SUMS"
+    sed 's/  / /' "$tmp/good/SHA256SUMS" \
+        >"$tmp/http/malformed/SHA256SUMS"
+}
+
+selftest_prepare_curl_mock() {
+    local tmp="$SELFTEST_TMP"
+    cat >"$tmp/mockbin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = --version ]; then
+    printf 'curl %s mock\n' "${Z23_INSTALL_TEST_CURL_VERSION:-8.4.0}"
+    exit 0
+fi
+[ "$#" -eq 10 ] || exit 2
+[ "$1" = --connect-timeout ] && [ "$2" = 10 ] || exit 2
+[ "$3" = --max-time ] || exit 2
+[ "$5" = --max-filesize ] || exit 2
+[ "$7" = -fsSL ] && [ "$9" = -o ] || exit 2
+maximum_seconds="$4"; maximum_bytes="$6"; url="$8"; dest="${10}"
+case "$url" in https://mirror.invalid/*) ;; *) exit 3 ;; esac
+rel="${url#https://mirror.invalid/}"
+case "$rel" in
+    */SHA256SUMS)
+        [ "$maximum_seconds" = 30 ] && [ "$maximum_bytes" = 1024 ] || exit 4
+        ;;
+    */z23|*/zclassic23)
+        [ "$maximum_seconds" = 300 ] && \
+            [ "$maximum_bytes" = 67108864 ] || exit 4
+        ;;
+    */zclassic23-package-verify)
+        [ "$maximum_seconds" = 300 ] && \
+            [ "$maximum_bytes" = 134217728 ] || exit 4
+        ;;
+    */zclassic23-acme)
+        [ "$maximum_seconds" = 300 ] && \
+            [ "$maximum_bytes" = 33554432 ] || exit 4
+        ;;
+    */AGENT_CARD.md)
+        [ "$maximum_seconds" = 300 ] && [ "$maximum_bytes" = 65536 ] || exit 4
+        ;;
+    *) exit 4 ;;
+esac
+printf '%s connect=%s time=%s bytes=%s\n' \
+    "$rel" "$2" "$maximum_seconds" "$maximum_bytes" \
+    >>"$Z23_INSTALL_TEST_CURL_LOG"
+if [ "$rel" = signal/SHA256SUMS ]; then
+    : >"$Z23_INSTALL_TEST_SIGNAL_READY"
+    while [ ! -e "$Z23_INSTALL_TEST_SIGNAL_RELEASE" ]; do sleep 0.02; done
+fi
+actual_bytes="$(wc -c <"$Z23_INSTALL_TEST_HTTP_ROOT/$rel" | tr -d ' ')"
+[ "$actual_bytes" -le "$maximum_bytes" ] || exit 63
+cp -- "$Z23_INSTALL_TEST_HTTP_ROOT/$rel" "$dest"
+EOF
+    chmod 755 "$tmp/mockbin/curl"
+}
+
+selftest_local_refusals() {
+    local tmp="$SELFTEST_TMP" rc
+
+    # Missing source refuses.
+    rc=0
+    run_install "$tmp/prefix" "$tmp/units" "$tmp/no-such" \
+        >/dev/null 2>"$tmp/missing.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: missing source must exit 1"
+    grep -q 'not a directory' "$tmp/missing.err" \
+        || die "selftest: missing source must name the refusal"
+
+    # Missing SHA256SUMS refuses.
+    mkdir -p "$tmp/nosums"
+    printf 'x\n' >"$tmp/nosums/z23"
+    rc=0
+    run_install "$tmp/prefix" "$tmp/units" "$tmp/nosums" \
+        >/dev/null 2>"$tmp/nosums.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: missing SHA256SUMS must exit 1"
+    grep -q 'SHA256SUMS missing' "$tmp/nosums.err" \
+        || die "selftest: missing SHA256SUMS must be named"
+
+    # Mismatch: dest must stay empty.
+    cp -f -- "$tmp/good/"* "$tmp/bad/"
+    printf 'TAMPERED\n' >"$tmp/bad/z23"
+    rc=0
+    run_install "$tmp/empty-dest" "$tmp/units" "$tmp/bad" \
+        >/dev/null 2>"$tmp/mismatch.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: checksum mismatch must exit 1"
+    grep -qi 'mismatch' "$tmp/mismatch.err" \
+        || die "selftest: mismatch must be named"
+    if [ -e "$tmp/empty-dest/bin/z23" ]; then
+        die "selftest: mismatch installed z23 anyway"
+    fi
+
+    # Stamp-check fixtures share the four non-node members from the good
+    # release and only replace the node bytes + SHA256SUMS.
+    selftest_write_node_release() {
+        local dest="$1"
+        mkdir -p "$dest"
+        cat >"$dest/z23"
+        chmod 755 "$dest/z23"
+        ln -f -- "$dest/z23" "$dest/zclassic23"
+        cp -f -- "$tmp/good/zclassic23-package-verify" \
+            "$tmp/good/zclassic23-acme" "$tmp/good/AGENT_CARD.md" \
+            "$dest/"
+        (cd "$dest" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    }
+
+    selftest_expect_stamp_refuse() {
+        local src="$1" dest="$2" err="$3" reason="$4" label="$5"
+        rc=0
+        run_install "$dest" "$tmp/units" "$src" >/dev/null 2>"$err" || rc=$?
+        [ "$rc" -eq 1 ] || die "selftest: $label must exit 1"
+        grep -qF "$reason" "$err" \
+            || die "selftest: $label must name $reason"
+        grep -qF "$TOR_STUB_REFUSAL" "$err" \
+            || die "selftest: $label must carry the shared refusal sentence"
+        if [ -e "$dest/bin/z23" ]; then
+            die "selftest: $label was installed anyway"
+        fi
+        SELFTEST_TOR_CASES="${SELFTEST_TOR_CASES:+$SELFTEST_TOR_CASES }$reason"
+    }
+
+    # A release whose node admits it links the Tor stub is refused, with its
+    # checksums perfectly intact. This is the whole point: a stub release is
+    # not a corrupt release, it is an authentic one that cannot do the job.
+    selftest_write_node_release "$tmp/stub-release" <<'EOF'
+#!/bin/sh
+printf "z23 v0.1.0 (source 000000000000)\ntor: stub\n"
+EOF
+    selftest_expect_stamp_refuse \
+        "$tmp/stub-release" "$tmp/stub-dest" "$tmp/stub.err" \
+        tor_stamp_stub "a tor=stub release"
+
+    # Missing stamp line, clean exit: not stub, still not proof of real Tor.
+    selftest_write_node_release "$tmp/missing-stamp" <<'EOF'
+#!/bin/sh
+printf "z23 v0.1.0 (source 000000000000)\n"
+EOF
+    selftest_expect_stamp_refuse \
+        "$tmp/missing-stamp" "$tmp/missing-dest" "$tmp/missing-stamp.err" \
+        tor_stamp_missing "a release with no tor stamp"
+
+    # Keep the short deadline local to this deliberately sleeping fixture.
+    selftest_write_node_release "$tmp/timeout-stamp" <<'EOF'
+#!/bin/sh
+sleep 5
+printf "tor: full\n"
+EOF
+    Z23_INSTALL_TOR_STAMP_TIMEOUT=1 selftest_expect_stamp_refuse \
+        "$tmp/timeout-stamp" "$tmp/timeout-dest" "$tmp/timeout-stamp.err" \
+        tor_stamp_timeout "a release whose -version exceeds the stamp deadline"
+
+    # Runnable, but -version fails and prints no stamp.
+    selftest_write_node_release "$tmp/unreadable-stamp" <<'EOF'
+#!/bin/sh
+exit 2
+EOF
+    selftest_expect_stamp_refuse \
+        "$tmp/unreadable-stamp" "$tmp/unreadable-dest" \
+        "$tmp/unreadable-stamp.err" \
+        tor_stamp_unreadable "a release whose -version is unreadable"
+
+    # Foreign payload: not executable on this host, and no sidecar.
+    mkdir -p "$tmp/sidecar-missing"
+    printf '\177ELF\002\001\001\000not-runnable-on-this-host\n' \
+        >"$tmp/sidecar-missing/z23"
+    chmod 755 "$tmp/sidecar-missing/z23"
+    ln -f -- "$tmp/sidecar-missing/z23" "$tmp/sidecar-missing/zclassic23"
+    cp -f -- "$tmp/good/zclassic23-package-verify" \
+        "$tmp/good/zclassic23-acme" "$tmp/good/AGENT_CARD.md" \
+        "$tmp/sidecar-missing/"
+    (cd "$tmp/sidecar-missing" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    selftest_expect_stamp_refuse \
+        "$tmp/sidecar-missing" "$tmp/sidecar-missing-dest" \
+        "$tmp/sidecar-missing.err" \
+        tor_stamp_sidecar_missing \
+        "a non-executable release with no tor-stamp sidecar"
+
+    # Same foreign payload, sidecar says full but is NOT bound to this
+    # payload's bytes (no binary_sha256 line at all): refused. A bare
+    # `tor: full` sidecar next to any foreign-arch payload used to be enough
+    # to install — that is precisely the forgery this binding closes.
+    mkdir -p "$tmp/sidecar-full"
+    printf '\177ELF\002\001\001\000not-runnable-on-this-host\n' \
+        >"$tmp/sidecar-full/z23"
+    chmod 755 "$tmp/sidecar-full/z23"
+    ln -f -- "$tmp/sidecar-full/z23" "$tmp/sidecar-full/zclassic23"
+    cp -f -- "$tmp/good/zclassic23-package-verify" \
+        "$tmp/good/zclassic23-acme" "$tmp/good/AGENT_CARD.md" \
+        "$tmp/sidecar-full/"
+    printf 'tor: full\n' >"$tmp/sidecar-full/z23.tor-stamp"
+    (cd "$tmp/sidecar-full" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    selftest_expect_stamp_refuse \
+        "$tmp/sidecar-full" "$tmp/sidecar-full-dest" "$tmp/sidecar-full.err" \
+        tor_stamp_unbound "a non-executable release whose sidecar has no binary_sha256"
+
+    # Same shape, but the sidecar carries a binary_sha256 that does not match
+    # this payload's actual (checksummed) bytes: also refused, and for the
+    # same reason -- the binding is what is being checked, not merely its
+    # presence.
+    mkdir -p "$tmp/sidecar-wrong-hash"
+    printf '\177ELF\002\001\001\000not-runnable-on-this-host\n' \
+        >"$tmp/sidecar-wrong-hash/z23"
+    chmod 755 "$tmp/sidecar-wrong-hash/z23"
+    ln -f -- "$tmp/sidecar-wrong-hash/z23" "$tmp/sidecar-wrong-hash/zclassic23"
+    cp -f -- "$tmp/good/zclassic23-package-verify" \
+        "$tmp/good/zclassic23-acme" "$tmp/good/AGENT_CARD.md" \
+        "$tmp/sidecar-wrong-hash/"
+    printf 'tor: full\nbinary_sha256: %s\n' \
+        "$(printf 'a%.0s' {1..64})" >"$tmp/sidecar-wrong-hash/z23.tor-stamp"
+    (cd "$tmp/sidecar-wrong-hash" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    selftest_expect_stamp_refuse \
+        "$tmp/sidecar-wrong-hash" "$tmp/sidecar-wrong-hash-dest" "$tmp/sidecar-wrong-hash.err" \
+        tor_stamp_unbound "a non-executable release whose sidecar binary_sha256 does not match"
+
+    # Same foreign payload, sidecar correctly bound to this exact z23's
+    # checksummed bytes: that is what "enough to install" now requires.
+    mkdir -p "$tmp/sidecar-bound"
+    printf '\177ELF\002\001\001\000not-runnable-on-this-host\n' \
+        >"$tmp/sidecar-bound/z23"
+    chmod 755 "$tmp/sidecar-bound/z23"
+    ln -f -- "$tmp/sidecar-bound/z23" "$tmp/sidecar-bound/zclassic23"
+    cp -f -- "$tmp/good/zclassic23-package-verify" \
+        "$tmp/good/zclassic23-acme" "$tmp/good/AGENT_CARD.md" \
+        "$tmp/sidecar-bound/"
+    (cd "$tmp/sidecar-bound" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    printf 'tor: full\nbinary_sha256: %s\n' \
+        "$(manifest_digest_of "$tmp/sidecar-bound" z23)" \
+        >"$tmp/sidecar-bound/z23.tor-stamp"
+    rc=0
+    run_install "$tmp/sidecar-bound-dest" "$tmp/units" "$tmp/sidecar-bound" \
+        >/dev/null 2>"$tmp/sidecar-bound.err" || rc=$?
+    [ "$rc" -eq 0 ] || die "selftest: a non-executable release with a correctly bound sidecar must install"
+    SELFTEST_TOR_CASES="${SELFTEST_TOR_CASES:+$SELFTEST_TOR_CASES }tor_stamp_sidecar_bound"
+
+    # Positive control: the same shape, stamped full, must install.
+    selftest_write_node_release "$tmp/full-release" <<'EOF'
+#!/bin/sh
+printf "z23 v0.1.0 (source 000000000000)\ntor: full\n"
+EOF
+    rc=0
+    run_install "$tmp/full-dest" "$tmp/units" "$tmp/full-release" \
+        >/dev/null 2>"$tmp/full.err" || rc=$?
+    [ "$rc" -eq 0 ] || die "selftest: a tor=full release must install"
+    if grep -qF "$TOR_STUB_REFUSAL" "$tmp/full.err"; then
+        die "selftest: a tor=full release was refused as a stub"
+    fi
+    SELFTEST_TOR_CASES="${SELFTEST_TOR_CASES:+$SELFTEST_TOR_CASES }tor_stamp_full"
+}
+
+selftest_remote_authority() {
+    local tmp="$SELFTEST_TMP" rc curl_version
+
+    # A remote mirror is not the authority for its own checksum manifest.
+    # Missing expectation refuses before even fetching SHA256SUMS.
+    : >"$tmp/curl.log"
+    rc=0
+    PATH="$tmp/mockbin:$PATH" \
+    Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+    Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/remote-missing" \
+    Z23_UNIT_DIR="$tmp/units" \
+        "$SCRIPT_DIR/install_z23.sh" \
+        --source=https://mirror.invalid/good \
+        >/dev/null 2>"$tmp/remote-missing.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: remote source without manifest digest must exit 1"
+    [ ! -s "$tmp/curl.log" ] \
+        || die "selftest: missing remote manifest digest still made a request"
+    [ ! -e "$tmp/remote-missing/bin/z23" ] \
+        || die "selftest: unpinned remote source installed z23"
+
+    # curl 8.4.0 is the first release where --max-filesize also bounds
+    # responses without a known Content-Length. Refuse older or unreadable
+    # versions before making a transfer request.
+    for curl_version in 8.3.0 unreadable; do
+        : >"$tmp/curl.log"
+        rc=0
+        PATH="$tmp/mockbin:$PATH" \
+        Z23_INSTALL_TEST_CURL_VERSION="$curl_version" \
+        Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+        Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+        Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/curl-$curl_version" \
+        Z23_UNIT_DIR="$tmp/units" \
+            "$SCRIPT_DIR/install_z23.sh" \
+            --source=https://mirror.invalid/good \
+            --manifest-sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            >/dev/null 2>"$tmp/curl-$curl_version.err" || rc=$?
+        [ "$rc" -eq 1 ] || die "selftest: curl $curl_version must refuse"
+        [ ! -s "$tmp/curl.log" ] \
+            || die "selftest: curl $curl_version refusal made a request"
+    done
+}
+
+selftest_remote_pins() {
+    local tmp="$SELFTEST_TMP" rc
+
+    # A wrong expectation may fetch the manifest to compare it, but must not
+    # fetch any payload or install anything.
+    : >"$tmp/curl.log"
+    rc=0
+    PATH="$tmp/mockbin:$PATH" \
+    Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+    Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/remote-wrong" \
+    Z23_UNIT_DIR="$tmp/units" \
+        "$SCRIPT_DIR/install_z23.sh" \
+        --source=https://mirror.invalid/good \
+        --manifest-sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        >/dev/null 2>"$tmp/remote-wrong.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: wrong remote manifest digest must exit 1"
+    [ "$(cat "$tmp/curl.log")" = \
+        "good/SHA256SUMS connect=10 time=30 bytes=1024" ] \
+        || die "selftest: wrong manifest digest fetched a payload"
+    [ ! -e "$tmp/remote-wrong/bin/z23" ] \
+        || die "selftest: wrong manifest digest installed z23"
+
+    # Replacing both payloads and SHA256SUMS does not help a hostile mirror:
+    # the independently obtained digest still binds the selected manifest.
+    SELFTEST_MANIFEST_SHA="$(sha256sum "$tmp/http/good/SHA256SUMS" | awk '{print $1}')"
+    : >"$tmp/curl.log"
+    rc=0
+    PATH="$tmp/mockbin:$PATH" \
+    Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+    Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/remote-replaced" \
+    Z23_UNIT_DIR="$tmp/units" \
+        "$SCRIPT_DIR/install_z23.sh" \
+        --source=https://mirror.invalid/replaced \
+        --manifest-sha256="$SELFTEST_MANIFEST_SHA" \
+        >/dev/null 2>"$tmp/remote-replaced.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: replaced remote release must exit 1"
+    [ "$(cat "$tmp/curl.log")" = \
+        "replaced/SHA256SUMS connect=10 time=30 bytes=1024" ] \
+        || die "selftest: replaced manifest fetched a payload"
+    [ ! -e "$tmp/remote-replaced/bin/z23" ] \
+        || die "selftest: replaced remote release installed z23"
+}
+
+selftest_remote_success() {
+    local tmp="$SELFTEST_TMP" out
+
+    # Positive remote path: the selected manifest downloads and installs the
+    # same verified files regardless of which mirror served them.
+    : >"$tmp/curl.log"
+    out="$(PATH="$tmp/mockbin:$PATH" \
+        Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+        Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+        Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/remote-good" \
+        Z23_UNIT_DIR="$tmp/units" \
+        "$SCRIPT_DIR/install_z23.sh" \
+        --source=https://mirror.invalid/good \
+        --manifest-sha256="$SELFTEST_MANIFEST_SHA" 2>"$tmp/remote-good.err")" \
+        || die "selftest: correctly pinned remote release failed"
+    [ "$out" = "$NEXT_COMMAND" ] \
+        || die "selftest: pinned remote install next command drifted"
+    cmp -s "$tmp/good/z23" "$tmp/remote-good/bin/z23" \
+        || die "selftest: pinned remote z23 bytes differ"
+    # zclassic23 carries the SAME digest as z23 in this release, so it is
+    # NEVER requested: the third of the download that is a duplicate is not
+    # transferred at all. The request log is the proof.
+    [ "$(cat "$tmp/curl.log")" = \
+        $'good/SHA256SUMS connect=10 time=30 bytes=1024\ngood/AGENT_CARD.md connect=10 time=300 bytes=65536\ngood/z23 connect=10 time=300 bytes=67108864\ngood/zclassic23-package-verify connect=10 time=300 bytes=134217728\ngood/zclassic23-acme connect=10 time=300 bytes=33554432' ] \
+        || die "selftest: bounded remote request sequence drifted"
+    [ -L "$tmp/remote-good/bin/zclassic23" ] \
+        || die "selftest: duplicate remote alias must install as a symlink"
+    cmp -s "$tmp/good/zclassic23" "$tmp/remote-good/bin/zclassic23" \
+        || die "selftest: remote zclassic23 alias does not read as the release bytes"
+
+    # The other direction of the alias rule: a release whose two node names
+    # carry DIFFERENT digests is refused outright, before any payload is
+    # requested. There is no honest way to pick one of them.
+    local split_sha rc
+    split_sha="$(sha256sum "$tmp/http/split-names/SHA256SUMS" | awk '{print $1}')"
+    : >"$tmp/curl.log"
+    rc=0
+    PATH="$tmp/mockbin:$PATH" \
+    Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+    Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/remote-split" \
+    Z23_UNIT_DIR="$tmp/units" \
+        "$SCRIPT_DIR/install_z23.sh" \
+        --source=https://mirror.invalid/split-names \
+        --manifest-sha256="$split_sha" \
+        >/dev/null 2>"$tmp/remote-split.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: split z23/zclassic23 digests must exit 1"
+    grep -q 'different digests' "$tmp/remote-split.err" \
+        || die "selftest: split node digests must be named"
+    [ "$(cat "$tmp/curl.log")" = \
+        "split-names/SHA256SUMS connect=10 time=30 bytes=1024" ] \
+        || die "selftest: split node digests fetched a payload"
+    [ ! -e "$tmp/remote-split/bin/z23" ] \
+        || die "selftest: split node digests installed z23"
+}
+
+selftest_remote_bounds() {
+    local tmp="$SELFTEST_TMP" rc oversized_manifest_sha256
+    local oversized_payload_manifest_sha256
+
+    # The transport ceiling is enforced even when a mirror advertises no
+    # useful HTTP metadata: the fake curl applies the exact --max-filesize it
+    # received and refuses the 1025-byte manifest without copying it.
+    oversized_manifest_sha256="$(sha256sum "$tmp/http/oversized/SHA256SUMS" | awk '{print $1}')"
+    : >"$tmp/curl.log"
+    rc=0
+    PATH="$tmp/mockbin:$PATH" \
+    Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+    Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/remote-oversized" \
+    Z23_UNIT_DIR="$tmp/units" \
+        "$SCRIPT_DIR/install_z23.sh" \
+        --source=https://mirror.invalid/oversized \
+        --manifest-sha256="$oversized_manifest_sha256" \
+        >/dev/null 2>"$tmp/remote-oversized.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: oversized remote manifest must exit 1"
+    [ "$(cat "$tmp/curl.log")" = \
+        "oversized/SHA256SUMS connect=10 time=30 bytes=1024" ] \
+        || die "selftest: oversized manifest request was not bounded"
+    [ ! -e "$tmp/remote-oversized/bin/z23" ] \
+        || die "selftest: oversized remote manifest installed z23"
+
+    oversized_payload_manifest_sha256="$(sha256sum \
+        "$tmp/http/oversized-payload/SHA256SUMS" | awk '{print $1}')"
+    : >"$tmp/curl.log"
+    rc=0
+    PATH="$tmp/mockbin:$PATH" \
+    Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+    Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/remote-oversized-payload" \
+    Z23_UNIT_DIR="$tmp/units" \
+        "$SCRIPT_DIR/install_z23.sh" \
+        --source=https://mirror.invalid/oversized-payload \
+        --manifest-sha256="$oversized_payload_manifest_sha256" \
+        >/dev/null 2>"$tmp/remote-oversized-payload.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: oversized remote payload must exit 1"
+    [ "$(cat "$tmp/curl.log")" = \
+        $'oversized-payload/SHA256SUMS connect=10 time=30 bytes=1024\noversized-payload/AGENT_CARD.md connect=10 time=300 bytes=65536\noversized-payload/z23 connect=10 time=300 bytes=67108864' ] \
+        || die "selftest: oversized payload request was not bounded"
+    [ ! -e "$tmp/remote-oversized-payload/bin/z23" ] \
+        || die "selftest: oversized remote payload installed z23"
+}
+
+selftest_remote_manifest_and_signal() {
+    local tmp="$SELFTEST_TMP" rc invalid_kind invalid_sha
+
+    # Grammar and member-set checks happen after the pinned manifest fetch but
+    # before the first payload request.
+    for invalid_kind in duplicate malformed; do
+        invalid_sha="$(sha256sum "$tmp/http/$invalid_kind/SHA256SUMS" | awk '{print $1}')"
+        : >"$tmp/curl.log"
+        rc=0
+        PATH="$tmp/mockbin:$PATH" \
+        Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+        Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+        Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/remote-$invalid_kind" \
+        Z23_UNIT_DIR="$tmp/units" \
+            "$SCRIPT_DIR/install_z23.sh" \
+            --source="https://mirror.invalid/$invalid_kind" \
+            --manifest-sha256="$invalid_sha" \
+            >/dev/null 2>"$tmp/remote-$invalid_kind.err" || rc=$?
+        [ "$rc" -eq 1 ] \
+            || die "selftest: $invalid_kind remote manifest must exit 1"
+        [ "$(cat "$tmp/curl.log")" = \
+            "$invalid_kind/SHA256SUMS connect=10 time=30 bytes=1024" ] \
+            || die "selftest: $invalid_kind manifest fetched a payload"
+        [ ! -e "$tmp/remote-$invalid_kind/bin/z23" ] \
+            || die "selftest: $invalid_kind remote manifest installed z23"
+    done
+
+    # A signal while curl is active preserves the signal exit status and the
+    # validated EXIT trap removes the partially populated staging directory.
+    rm -f "$tmp/signal.ready" "$tmp/signal.release"
+    : >"$tmp/curl.log"
+    PATH="$tmp/mockbin:$PATH" \
+    Z23_INSTALL_TEST_HTTP_ROOT="$tmp/http" \
+    Z23_INSTALL_TEST_CURL_LOG="$tmp/curl.log" \
+    Z23_INSTALL_TEST_SIGNAL_READY="$tmp/signal.ready" \
+    Z23_INSTALL_TEST_SIGNAL_RELEASE="$tmp/signal.release" \
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/remote-signal" \
+    Z23_UNIT_DIR="$tmp/units" \
+        "$SCRIPT_DIR/install_z23.sh" \
+        --source=https://mirror.invalid/signal \
+        --manifest-sha256="$SELFTEST_MANIFEST_SHA" \
+        >/dev/null 2>"$tmp/remote-signal.err" &
+    local signal_pid=$! signal_wait=0
+    while [ ! -e "$tmp/signal.ready" ] && [ "$signal_wait" -lt 100 ]; do
+        sleep 0.02
+        signal_wait=$((signal_wait + 1))
+    done
+    [ -e "$tmp/signal.ready" ] || die "selftest: signal fixture did not enter curl"
+    kill -TERM "$signal_pid"
+    : >"$tmp/signal.release"
+    rc=0
+    wait "$signal_pid" || rc=$?
+    [ "$rc" -eq 143 ] || die "selftest: TERM must exit 143, got $rc"
+    [ ! -e "$tmp/remote-signal/bin/z23" ] \
+        || die "selftest: signalled install installed z23"
+}
+
+selftest_local_success() {
+    local tmp="$SELFTEST_TMP" rc out install_card
+
+    # Happy path: dest gets the files; stdout is exactly one next command.
+    out="$(run_install "$tmp/prefix" "$tmp/units" "$tmp/good" 2>"$tmp/ok.err")" \
+        || die "selftest: good install failed"
+    [ "$out" = "$NEXT_COMMAND" ] || die "selftest: stdout must be exactly '$NEXT_COMMAND', got '$out'"
+    cmp -s "$tmp/good/z23" "$tmp/prefix/bin/z23" || die "selftest: installed z23 bytes differ"
+    cmp -s "$tmp/good/zclassic23" "$tmp/prefix/bin/zclassic23" \
+        || die "selftest: installed zclassic23 bytes differ"
+    # The alias must be a RELATIVE symlink to z23 and must still read back as
+    # the release bytes (the cmp above follows it). A hard link would keep
+    # serving the pre-upgrade program after the next install.
+    [ -L "$tmp/prefix/bin/zclassic23" ] \
+        || die "selftest: duplicate zclassic23 must install as a symlink"
+    [ "$(readlink "$tmp/prefix/bin/zclassic23")" = z23 ] \
+        || die "selftest: zclassic23 must link to the relative name z23"
+    cmp -s "$tmp/good/zclassic23-package-verify" \
+        "$tmp/prefix/bin/zclassic23-package-verify" \
+        || die "selftest: installed zclassic23-package-verify bytes differ"
+    cmp -s "$tmp/good/zclassic23-acme" "$tmp/prefix/bin/zclassic23-acme" \
+        || die "selftest: installed zclassic23-acme bytes differ"
+
+    install_card="$tmp/prefix/share/z23/AGENT_CARD.md"
+    cmp -s "$tmp/good/AGENT_CARD.md" "$install_card" \
+        || die "selftest: the agent card must install as verified payload"
+
+    # A card edited after the manifest was written is instruction injection
+    # into whatever assistant reads it, so it refuses like any other payload.
+    rc=0
+    run_install "$tmp/card-dest" "$tmp/units" "$tmp/tampered-card" \
+        >/dev/null 2>"$tmp/card.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: a tampered agent card must exit 1"
+    grep -qi 'mismatch' "$tmp/card.err" \
+        || die "selftest: a tampered agent card must name the mismatch"
+    [ ! -e "$tmp/card-dest/bin/z23" ] \
+        || die "selftest: a tampered agent card installed z23"
+    [ ! -e "$tmp/card-dest/share/z23/AGENT_CARD.md" ] \
+        || die "selftest: a tampered agent card was installed anyway"
+
+    # A valid checksum manifest that omits the worker is still an incomplete
+    # release and must refuse before any payload reaches a fresh destination.
+    mkdir -p "$tmp/no-verifier"
+    cp -f -- "$tmp/good/z23" "$tmp/no-verifier/z23"
+    cp -f -- "$tmp/good/zclassic23" "$tmp/no-verifier/zclassic23"
+    (cd "$tmp/no-verifier" && sha256sum z23 zclassic23 >SHA256SUMS)
+    rc=0
+    run_install "$tmp/no-verifier-dest" "$tmp/units" "$tmp/no-verifier" \
+        >/dev/null 2>"$tmp/no-verifier.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: missing verifier must exit 1"
+    grep -Eq 'exactly five|exactly once' "$tmp/no-verifier.err" \
+        || die "selftest: missing verifier must name the strict manifest refusal"
+    if [ -e "$tmp/no-verifier-dest/bin/z23" ]; then
+        die "selftest: incomplete release installed z23 anyway"
+    fi
+
+    # The certificate worker is a release member on the same footing as the
+    # package verifier: a manifest naming every OTHER member but silently
+    # dropping zclassic23-acme is exactly the regression this task exists to
+    # close (a node that can get a certificate but never renew it), so it
+    # must refuse before any payload reaches a fresh destination too.
+    mkdir -p "$tmp/no-acme"
+    cp -f -- "$tmp/good/z23" "$tmp/good/zclassic23" \
+        "$tmp/good/zclassic23-package-verify" "$tmp/good/AGENT_CARD.md" \
+        "$tmp/no-acme/"
+    (cd "$tmp/no-acme" && \
+        sha256sum z23 zclassic23 zclassic23-package-verify AGENT_CARD.md \
+            >SHA256SUMS)
+    rc=0
+    run_install "$tmp/no-acme-dest" "$tmp/units" "$tmp/no-acme" \
+        >/dev/null 2>"$tmp/no-acme.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: missing zclassic23-acme must exit 1"
+    grep -Eq 'exactly five|exactly once' "$tmp/no-acme.err" \
+        || die "selftest: missing zclassic23-acme must name the strict manifest refusal"
+    if [ -e "$tmp/no-acme-dest/bin/z23" ]; then
+        die "selftest: a release silently missing zclassic23-acme installed z23 anyway"
+    fi
+
+    # Idempotent re-run.
+    out="$(run_install "$tmp/prefix" "$tmp/units" "$tmp/good" 2>"$tmp/ok2.err")" \
+        || die "selftest: second install failed"
+    [ "$out" = "$NEXT_COMMAND" ] || die "selftest: re-run stdout drifted"
+
+    # The shipped unit must Restart=always so checkpoint install-on-next-boot
+    # (a clean exit) is brought back. on-failure would strand a new node.
+    grep -qx 'Restart=always' "$0" \
+        || die "selftest: z23.service must Restart=always (install-on-next-boot)"
+
+    # Drive the shipped write_unit path (run_install skips it under
+    # Z23_SKIP_SYSTEMD=1). First-boot Type=notify READY must wait for onion
+    # DESCRIPTOR PUBLICATION: hostname-only readiness lets systemd declare
+    # started before HSDir upload, which is why "always connects" fails on
+    # cold boots.
+    write_unit "$tmp/prefix" "$tmp/units"
+    [ -f "$tmp/units/z23.service" ] || die "selftest: write_unit did not emit z23.service"
+    grep -q 'DESCRIPTOR PUBLICATION' "$tmp/units/z23.service" \
+        || die "selftest: unit must wait for onion DESCRIPTOR PUBLICATION before ready"
+    grep -q -- '-listen -tor -onion-persist' "$tmp/units/z23.service" \
+        || die "selftest: z23.service must boot with -listen -tor -onion-persist"
+}
+
+# Every branch of the three-place agreement, in both directions. A test that
+# only ever sees agreement would prove nothing about a refusal.
+selftest_release_pin() {
+    local tmp="$SELFTEST_TMP" rc out good_sha good_pin wrong_pin bad_installer
+    local fake_installer="1111111111111111111111111111111111111111111111111111111111111111"
+    good_sha="$(sha256sum "$tmp/good/SHA256SUMS" | awk '{print $1}')"
+    good_pin="z23-pin-v1:$good_sha:$fake_installer"
+    wrong_pin="z23-pin-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:$fake_installer"
+    bad_installer="z23-pin-v1:$good_sha:not-a-digest"
+
+    # PASS: all three sources answered and agreed.
+    out="$(Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/pin-three" \
+        Z23_UNIT_DIR="$tmp/units" "$SCRIPT_DIR/install_z23.sh" \
+        --source="$tmp/good" \
+        --attest="baked=$good_pin" --attest="dns=$good_pin" \
+        --attest="repo=$good_pin" 2>"$tmp/pin-three.err")" \
+        || die "selftest: three agreeing pins must install"
+    [ "$out" = "$NEXT_COMMAND" ] || die "selftest: agreeing pin install drifted"
+    [ -x "$tmp/pin-three/bin/z23" ] || die "selftest: agreeing pin did not install z23"
+
+    # REFUSE: three sources agree on a pin that does not describe this
+    # release. Agreement is not a substitute for the checksum.
+    rc=0
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/pin-wrong" \
+        Z23_UNIT_DIR="$tmp/units" "$SCRIPT_DIR/install_z23.sh" \
+        --source="$tmp/good" \
+        --attest="baked=$wrong_pin" --attest="dns=$wrong_pin" \
+        --attest="repo=$wrong_pin" >/dev/null 2>"$tmp/pin-wrong.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: an agreed pin for other bytes must exit 1"
+    grep -q 'SHA256SUMS digest mismatch' "$tmp/pin-wrong.err" \
+        || die "selftest: agreed-but-wrong pin must name the digest mismatch"
+    [ ! -e "$tmp/pin-wrong/bin/z23" ] \
+        || die "selftest: agreed-but-wrong pin installed z23"
+
+    # REFUSE: one source disagrees. Never majority-vote, even 2 against 1.
+    rc=0
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/pin-split" \
+        Z23_UNIT_DIR="$tmp/units" "$SCRIPT_DIR/install_z23.sh" \
+        --source="$tmp/good" \
+        --attest="baked=$good_pin" --attest="dns=$good_pin" \
+        --attest="repo=$wrong_pin" >/dev/null 2>"$tmp/pin-split.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: a disagreeing source must exit 1"
+    grep -q 'release pin disagreement between baked and repo' "$tmp/pin-split.err" \
+        || die "selftest: disagreement must name both origins"
+    [ ! -e "$tmp/pin-split/bin/z23" ] \
+        || die "selftest: a disagreeing source installed z23"
+
+    # PASS, loudly: two agreed, one was unreachable. Unreachable is reported
+    # as unreachable and never rendered as a disagreement.
+    out="$(Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/pin-two" \
+        Z23_UNIT_DIR="$tmp/units" "$SCRIPT_DIR/install_z23.sh" \
+        --source="$tmp/good" \
+        --attest="baked=$good_pin" --attest="repo=$good_pin" \
+        --attest-unreachable=dns=no-dns-tool 2>"$tmp/pin-two.err")" \
+        || die "selftest: two agreeing sources must install"
+    [ "$out" = "$NEXT_COMMAND" ] || die "selftest: two-source install drifted"
+    grep -q 'agreed by 2 of 3 sources (unreachable: dns=no-dns-tool)' "$tmp/pin-two.err" \
+        || die "selftest: a degraded quorum must say so on stderr"
+    if grep -q 'disagreement' "$tmp/pin-two.err"; then
+        die "selftest: an unreachable source must not be called a disagreement"
+    fi
+
+    # REFUSE: only one source answered. No silent degradation to one.
+    rc=0
+    Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/pin-one" \
+        Z23_UNIT_DIR="$tmp/units" "$SCRIPT_DIR/install_z23.sh" \
+        --source="$tmp/good" --attest="baked=$good_pin" \
+        --attest-unreachable=dns=no-dns-tool \
+        --attest-unreachable=repo=fetch-failed \
+        >/dev/null 2>"$tmp/pin-one.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: a single answering source must exit 1"
+    grep -q 'release pin quorum: 1 of 3 sources answered' "$tmp/pin-one.err" \
+        || die "selftest: quorum refusal must count the sources"
+    grep -q 'unreachable: dns=no-dns-tool, repo=fetch-failed' "$tmp/pin-one.err" \
+        || die "selftest: quorum refusal must name the unreachable sources"
+    [ ! -e "$tmp/pin-one/bin/z23" ] || die "selftest: one source installed z23"
+
+    # REFUSE: malformed pin, unknown origin, repeated origin, and an explicit
+    # --manifest-sha256 that contradicts the agreed pin.
+    local case_name case_args
+    local unset_pin="z23-pin-v1:$ATTEST_PIN_UNSET:$ATTEST_PIN_UNSET"
+    for case_name in malformed unset unknown-origin repeated-origin contradicted; do
+        case "$case_name" in
+            malformed) case_args=(--attest="baked=$bad_installer"
+                --attest="dns=$good_pin" --attest="repo=$good_pin") ;;
+            unset) case_args=(--attest="baked=$unset_pin"
+                --attest="dns=$good_pin" --attest="repo=$good_pin") ;;
+            unknown-origin) case_args=(--attest="mirror=$good_pin"
+                --attest="dns=$good_pin" --attest="repo=$good_pin") ;;
+            repeated-origin) case_args=(--attest="dns=$good_pin"
+                --attest="dns=$good_pin" --attest="repo=$good_pin") ;;
+            contradicted) case_args=(--attest="baked=$good_pin"
+                --attest="dns=$good_pin" --attest="repo=$good_pin"
+                --manifest-sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) ;;
+        esac
+        rc=0
+        Z23_SKIP_SYSTEMD=1 Z23_INSTALL_PREFIX="$tmp/pin-$case_name" \
+            Z23_UNIT_DIR="$tmp/units" "$SCRIPT_DIR/install_z23.sh" \
+            --source="$tmp/good" "${case_args[@]}" \
+            >/dev/null 2>"$tmp/pin-$case_name.err" || rc=$?
+        [ "$rc" -eq 1 ] || die "selftest: pin case $case_name must exit 1"
+        [ ! -e "$tmp/pin-$case_name/bin/z23" ] \
+            || die "selftest: pin case $case_name installed z23"
+    done
+    grep -q 'not a z23-pin-v1' "$tmp/pin-malformed.err" \
+        || die "selftest: a malformed pin must name the grammar"
+    grep -q 'not a z23-pin-v1' "$tmp/pin-unset.err" \
+        || die "selftest: the unset sentinel must never be accepted as a pin"
+    grep -q 'unknown attestation origin: mirror' "$tmp/pin-unknown-origin.err" \
+        || die "selftest: an unknown origin must be named"
+    grep -q 'attestation origin named twice: dns' "$tmp/pin-repeated-origin.err" \
+        || die "selftest: a repeated origin must be named"
+    grep -q 'disagrees with the pin' "$tmp/pin-contradicted.err" \
+        || die "selftest: a contradicted --manifest-sha256 must refuse"
+}
+
+# The front door served at the domain is proved by its own harness, which is
+# not shipped inside the served script: that script has to stay short enough
+# that a careful person reads it before piping it to a shell.
+selftest_front_door() {
+    local dir="$SCRIPT_DIR/../../platform/packaging/install"
+    # This installer also ships alone (the front door downloads just this
+    # file), and then there is no repository beside it to test. That is
+    # UNOBSERVED, not a pass — but inside the repository, where every gate
+    # runs, the directory is present and the harness is mandatory.
+    [ -d "$dir" ] || return 0
+    [ -f "$dir/install_selftest.sh" ] \
+        || die "selftest: packaging/install exists but its front-door harness is missing"
+    bash "$dir/install_selftest.sh" \
+        || die "selftest: packaging/install front door harness failed"
+}
+
+selftest_local_manifest_refusals() {
+    local tmp="$SELFTEST_TMP" rc
+    # Unexpected SHA256SUMS member refuses before copy.
+    mkdir -p "$tmp/extra"
+    printf 'x\n' >"$tmp/extra/z23"
+    printf 'x\n' >"$tmp/extra/zclassic23"
+    printf 'x\n' >"$tmp/extra/zclassic23-package-verify"
+    printf 'x\n' >"$tmp/extra/zclassic23-acme"
+    printf 'x\n' >"$tmp/extra/evil"
+    (cd "$tmp/extra" && \
+        sha256sum z23 zclassic23 zclassic23-package-verify zclassic23-acme evil \
+            >SHA256SUMS)
+    rc=0
+    run_install "$tmp/prefix2" "$tmp/units" "$tmp/extra" \
+        >/dev/null 2>"$tmp/extra.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: extra SHA256SUMS member must refuse"
+    grep -Eq 'exactly five|exactly once' "$tmp/extra.err" \
+        || die "selftest: extra member must name the strict manifest refusal"
+
+    [ -z "$(find "$tmp/stages" -mindepth 1 -maxdepth 1 \
+        -name 'zcl-install-z23.*' -print -quit)" ] \
+        || die "selftest: a negative install path leaked its staging directory"
+}
+
+selftest_macos_transaction() {
+    local tmp="$SELFTEST_TMP" mac="$SELFTEST_TMP/macos"
+    local prefix="$mac/prefix & native" launchd="$mac/LaunchAgents"
+    local datadir="$mac/data & chain" mock="$mac/mockbin" rc out
+    local v1_id v2_id current_target last_good_target
+    local v1_manifest_file_sha
+    mkdir -p "$mac/v1" "$mac/v2" "$mock" "$launchd" "$datadir"
+
+    # This host normally has Homebrew sha256sum, which would otherwise hide
+    # the stock-mac path forever. Constrain PATH to shasum + its parser and
+    # prove both the one-file digest and manifest checker without GNU tools.
+    mkdir -p "$mac/hashbin"
+
+    cat >"$mac/v1/z23" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-} ${2:-} ${3:-}" in
+    '-version  ') printf 'tor: full\n' ;;
+    'core node bootwait') [ "${Z23_INSTALL_TEST_READY_FAIL:-0}" != 1 ] ;;
+    *) exit 2 ;;
+esac
+EOF
+    cat >"$mac/v2/z23" <<'EOF'
+#!/usr/bin/env bash
+# Distinct candidate bytes: readiness stays the same, identity does not.
+case "${1:-} ${2:-} ${3:-}" in
+    '-version  ') printf 'tor: full\n' ;;
+    'core node bootwait') [ "${Z23_INSTALL_TEST_READY_FAIL:-0}" != 1 ] ;;
+    *) exit 2 ;;
+esac
+EOF
+    chmod 755 "$mac/v1/z23" "$mac/v2/z23"
+    local version
+    for version in v1 v2; do
+        ln -f -- "$mac/$version/z23" "$mac/$version/zclassic23"
+        printf '%s verifier\n' "$version" >"$mac/$version/zclassic23-package-verify"
+        printf '%s acme\n' "$version" >"$mac/$version/zclassic23-acme"
+        printf '# %s agent card\n' "$version" >"$mac/$version/AGENT_CARD.md"
+        chmod 755 "$mac/$version/zclassic23-package-verify" \
+            "$mac/$version/zclassic23-acme"
+        (cd "$mac/$version" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+    done
+    # The generation ID is the sha256 SHA256SUMS records for z23 -- the same
+    # quantity manifest_digest_of extracts in validate_manifest_contract --
+    # NOT the sha256 of the SHA256SUMS file itself. v1_manifest_file_sha
+    # holds that other, deliberately-different quantity purely to prove
+    # sha256_file's shasum fallback below; the two are asserted distinct
+    # immediately after, so a regression back to hashing the manifest file
+    # (which would silently rename every generation) fails loudly here
+    # rather than passing by accident.
+    v1_id="$(manifest_digest_of "$mac/v1" z23)"
+    v2_id="$(manifest_digest_of "$mac/v2" z23)"
+    v1_manifest_file_sha="$(sha256_file "$mac/v1/SHA256SUMS")"
+    [ "$v1_id" != "$v1_manifest_file_sha" ] \
+        || die "selftest: fixture's z23 digest collided with its manifest-file digest"
+    if command -v shasum >/dev/null 2>&1; then
+        ln -s "$(command -v shasum)" "$mac/hashbin/shasum"
+        ln -s "$(command -v awk)" "$mac/hashbin/awk"
+        ln -s "$(command -v dirname)" "$mac/hashbin/dirname"
+        ln -s "$(command -v basename)" "$mac/hashbin/basename"
+        [ "$(PATH="$mac/hashbin" sha256_file "$mac/v1/SHA256SUMS")" = "$v1_manifest_file_sha" ] \
+            || die "selftest: stock macOS shasum digest path drifted"
+        PATH="$mac/hashbin" sha256_check_manifest "$mac/v1/SHA256SUMS" >/dev/null \
+            || die "selftest: stock macOS shasum manifest check failed"
+    elif [ "$(uname -s)" = Darwin ]; then
+        die "selftest: stock macOS shasum is unavailable"
+    else
+        say "selftest: shasum fallback UNOBSERVED on this non-Darwin host"
+    fi
+
+    cat >"$mock/plutil" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = -lint ] && [ -s "$2" ]
+EOF
+    cat >"$mock/launchctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$Z23_INSTALL_TEST_LAUNCHCTL_LOG"
+service_state="$Z23_INSTALL_TEST_LAUNCHD_STATE"
+service_arg="${2:-}"
+[ "$1" != kickstart ] || service_arg="${3:-}"
+case "$service_arg" in
+    gui/*) service_state="$service_state.gui" ;;
+    user/*) service_state="$service_state.user" ;;
+esac
+case "$1" in
+    print)
+        [ "${Z23_INSTALL_TEST_NO_DOMAIN:-0}" != 1 ] || exit 3
+        case "$2" in
+            "gui/$(id -u)")
+                [ "${Z23_INSTALL_TEST_HEADLESS:-0}" != 1 ] &&
+                    [ "${Z23_INSTALL_TEST_NO_DOMAIN:-0}" != 1 ]
+                exit $? ;;
+            "user/$(id -u)")
+                [ "${Z23_INSTALL_TEST_NO_DOMAIN:-0}" != 1 ]
+                exit $? ;;
+        esac
+        [ -e "$service_state" ] || exit 3
+        printf '    pid = 4242\n'
+        ;;
+    bootout) rm -f -- "$service_state" ;;
+    bootstrap)
+        if [ "${Z23_INSTALL_TEST_HEADLESS:-0}" = 1 ]; then
+            [ "$2" = "user/$(id -u)" ] || exit 5
+            grep -q '<key>LimitLoadToSessionType</key><string>Background</string>' "$3" || exit 5
+        fi
+        : >"$service_state" ;;
+    kickstart) [ -e "$service_state" ] ;;
+    *) exit 2 ;;
+esac
+EOF
+    cat >"$mock/lsof" <<'EOF'
+#!/usr/bin/env bash
+root="$Z23_INSTALL_PREFIX/lib/z23"
+fd=''
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = -d ] && [ "$#" -gt 1 ]; then
+        fd="$2"
+        shift 2
+    else
+        shift
+    fi
+done
+if [ "$fd" != txt ]; then
+    printf 'p4242\nf%s\nD0x1\ni4242\n' "$fd"
+    exit 0
+fi
+inode=4242
+if [ "${Z23_INSTALL_TEST_WRONG_IMAGE:-0}" = 1 ]; then
+    target="$(readlink "$root/last-good")"
+    inode=4243
+else
+    target="$(readlink "$root/current")"
+    if [ "${Z23_INSTALL_TEST_REPLACED_IMAGE:-0}" = 1 ]; then
+        # The pathname now names v2, but launchd mapped the old v1 vnode.
+        inode=4243
+    fi
+fi
+printf 'p4242\nftxt\nD0x1\ni%s\nn%s/%s/z23\n' "$inode" "$root" "$target"
+EOF
+    chmod 755 "$mock/plutil" "$mock/launchctl" "$mock/lsof"
+    : >"$mac/launchctl.log"
+
+    out="$(PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
+        Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
+        Z23_LAUNCHD_DIR="$launchd" Z23_DATADIR="$datadir" \
+        Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/launchctl.log" \
+        Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/launchd.state" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$mac/v1" \
+        2>"$mac/v1.err")" || die "selftest: first macOS generation failed"
+    [ "$out" = "$NEXT_COMMAND" ] \
+        || die "selftest: macOS install did not print one next command"
+    current_target="$(readlink "$prefix/lib/z23/current")"
+    last_good_target="$(readlink "$prefix/lib/z23/last-good")"
+    [ "$current_target" = "generations/$v1_id" ] \
+        || die "selftest: first macOS generation is not current"
+    [ "$last_good_target" = "$current_target" ] \
+        || die "selftest: first macOS generation is not last-good"
+    [ -L "$prefix/bin/z23" ] && [ -x "$prefix/bin/z23" ] \
+        || die "selftest: stable macOS z23 name does not resolve to its generation"
+
+    # The defect this proves fixed: the directory name is the sha256
+    # SHA256SUMS records for z23, not the sha256 of the SHA256SUMS file.
+    cmp -s "$mac/v1/SHA256SUMS" "$prefix/lib/z23/generations/$v1_id/SHA256SUMS" \
+        || die "selftest: generation did not retain its verified SHA256SUMS"
+    generation_provenance "$prefix/lib/z23/generations/$v1_id" \
+        >"$mac/provenance.out" \
+        || die "selftest: generation_provenance reported mismatch for a freshly verified install"
+    grep -qx "generation: $v1_id" "$mac/provenance.out" \
+        || die "selftest: generation_provenance did not print the directory name"
+    grep -qx "sha256sums_z23: $v1_id" "$mac/provenance.out" \
+        || die "selftest: generation_provenance did not print the SHA256SUMS z23 digest"
+    grep -qx 'provenance: consistent' "$mac/provenance.out" \
+        || die "selftest: generation_provenance did not print the consistent verdict"
+    [ -f "$launchd/org.z23.zclassic.plist" ] \
+        || die "selftest: macOS install did not commit a launchd plist"
+    grep -q '<key>ExitTimeOut</key><integer>300</integer>' "$launchd/org.z23.zclassic.plist" \
+        || die "selftest: launchd shutdown grace differs from the node service policy"
+    grep -q '&amp; native/bin/z23' "$launchd/org.z23.zclassic.plist" \
+        || die "selftest: launchd binary path was not XML escaped"
+    grep -q -- '-tor' "$launchd/org.z23.zclassic.plist" \
+        || die "selftest: launchd node does not enable embedded Tor"
+    if [ "$(uname -s)" = Darwin ]; then
+        /usr/bin/plutil -lint "$launchd/org.z23.zclassic.plist" >/dev/null \
+            || die "selftest: Apple's plutil rejected the launchd plist"
+    fi
+
+    # Readiness can succeed while launchd is still running other bytes. The
+    # exact txt-vnode digest must catch that and restore v1 automatically.
+    rc=0
+    PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
+        Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
+        Z23_LAUNCHD_DIR="$launchd" Z23_DATADIR="$datadir" \
+        Z23_INSTALL_TEST_WRONG_IMAGE=1 \
+        Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/launchctl.log" \
+        Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/launchd.state" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$mac/v2" \
+        >/dev/null 2>"$mac/wrong-image.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: wrong running Mac image must refuse"
+    grep -q 'was rolled back' "$mac/wrong-image.err" \
+        || die "selftest: wrong running Mac image did not name rollback: $(tr '\n' ';' <"$mac/wrong-image.err")"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v1_id" ] \
+        || die "selftest: wrong running Mac image did not restore v1"
+
+    # lsof's txt pathname can be reused for new bytes while the old vnode
+    # remains mapped. A pathname digest of v2 would pass this case falsely.
+    rc=0
+    PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
+        Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
+        Z23_LAUNCHD_DIR="$launchd" Z23_DATADIR="$datadir" \
+        Z23_INSTALL_TEST_REPLACED_IMAGE=1 \
+        Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/launchctl.log" \
+        Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/launchd.state" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$mac/v2" \
+        >/dev/null 2>"$mac/replaced-image.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: replaced mapped Mac image must refuse"
+    grep -q 'was rolled back' "$mac/replaced-image.err" \
+        || die "selftest: replaced mapped Mac image did not name rollback"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v1_id" ] \
+        || die "selftest: replaced mapped Mac image did not restore v1"
+
+    # The mapped vnode may match the reopened generation after replacement,
+    # yet those bytes may differ from the release digest already verified.
+    # Calling the qualifier with the v1 manifest identity and v2 file makes
+    # pathname-to-pinned hashing agree falsely unless the manifest is bound.
+    rc=0
+    (
+        MACOS_GENERATION="$prefix/lib/z23/generations/$v2_id"
+        MACOS_GENERATION_ID="$v1_id"
+        MACOS_LAUNCHD_DOMAIN="gui/$(id -u)"
+        MACOS_PLIST="$launchd/org.z23.zclassic.plist"
+        PATH="$mock:$PATH"
+        export Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/launchctl.log"
+        export Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/launchd.state"
+        macos_launchd_start_and_qualify "$prefix" "$datadir"
+    ) >/dev/null 2>"$mac/outside-manifest.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: mapped Mac image outside manifest must refuse"
+
+    # A typed bootwait failure is the other rollback edge.
+    rc=0
+    PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
+        Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
+        Z23_LAUNCHD_DIR="$launchd" Z23_DATADIR="$datadir" \
+        Z23_INSTALL_TEST_READY_FAIL=1 \
+        Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/launchctl.log" \
+        Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/launchd.state" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$mac/v2" \
+        >/dev/null 2>"$mac/not-ready.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: unready Mac generation must refuse"
+    grep -q 'was rolled back' "$mac/not-ready.err" \
+        || die "selftest: unready Mac generation did not reach rollback"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v1_id" ] \
+        || die "selftest: unready Mac generation did not restore v1"
+
+    out="$(PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
+        Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
+        Z23_LAUNCHD_DIR="$launchd" Z23_DATADIR="$datadir" \
+        Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/launchctl.log" \
+        Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/launchd.state" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$mac/v2" \
+        2>"$mac/v2.err")" || die "selftest: ready macOS upgrade failed"
+    [ "$out" = "$NEXT_COMMAND" ] \
+        || die "selftest: macOS upgrade did not print one next command"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v2_id" ] \
+        || die "selftest: ready Mac upgrade did not activate v2"
+    [ "$(readlink "$prefix/lib/z23/last-good")" = "generations/$v1_id" ] \
+        || die "selftest: ready Mac upgrade did not retain v1 as last-good"
+    grep -q '^bootstrap gui/' "$mac/launchctl.log" \
+        || die "selftest: macOS lifecycle did not use launchctl bootstrap"
+    grep -q '^bootout gui/' "$mac/launchctl.log" \
+        || die "selftest: macOS lifecycle did not use launchctl bootout"
+    grep -q '^kickstart -k gui/' "$mac/launchctl.log" \
+        || die "selftest: macOS lifecycle did not use launchctl kickstart"
+
+    # SSH-only hosts have no GUI domain. Background agents require an
+    # explicit session type as well as a user-domain bootstrap; prove both
+    # the first install and rollback use that same selected domain.
+    prefix="$mac/headless-prefix"
+    launchd="$mac/headless-agents"
+    datadir="$mac/headless-data"
+    run_headless_install() {
+        PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
+            Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
+            Z23_LAUNCHD_DIR="$launchd" Z23_DATADIR="$datadir" \
+            Z23_INSTALL_TEST_HEADLESS=1 \
+            Z23_INSTALL_TEST_READY_FAIL="$1" \
+            Z23_INSTALL_TEST_NO_DOMAIN="$2" \
+            Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/headless-launchctl.log" \
+            Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/headless.state" \
+            "$SCRIPT_DIR/install_z23.sh" --source="$mac/$3"
+    }
+    run_headless_install 0 0 v1 >"$mac/headless.out" 2>"$mac/headless.err" \
+        || die "selftest: Background macOS install failed"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v1_id" ] \
+        || die "selftest: Background install did not activate v1"
+    rc=0
+    run_headless_install 1 0 v2 >/dev/null 2>"$mac/headless-rollback.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: unready Background generation must refuse"
+    grep -q 'was rolled back' "$mac/headless-rollback.err" \
+        || die "selftest: unready Background generation did not reach rollback"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v1_id" ] \
+        || die "selftest: Background rollback did not restore v1"
+    grep -q '^bootstrap user/' "$mac/headless-launchctl.log" \
+        || die "selftest: Background bootstrap did not use user domain"
+    grep -q '^bootout user/' "$mac/headless-launchctl.log" \
+        || die "selftest: Background rollback did not use user domain"
+    grep -q '^kickstart -k user/' "$mac/headless-launchctl.log" \
+        || die "selftest: Background activation did not use user domain"
+    : >"$mac/headless-launchctl.log"
+    rc=0
+    run_headless_install 0 1 v2 >/dev/null 2>"$mac/no-domain.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: missing launchd domains must refuse"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v1_id" ] \
+        || die "selftest: missing domain changed the current generation"
+    if grep -Eq '^(bootstrap|bootout|kickstart) ' "$mac/headless-launchctl.log"; then
+        die "selftest: missing domain attempted service mutation"
+    fi
+
+    # A GUI login must not create a second node beside the Background one.
+    : >"$mac/headless-launchctl.log"
+    PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
+        Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
+        Z23_LAUNCHD_DIR="$launchd" Z23_DATADIR="$datadir" \
+        Z23_INSTALL_TEST_HEADLESS=0 Z23_INSTALL_TEST_READY_FAIL=0 \
+        Z23_INSTALL_TEST_NO_DOMAIN=0 \
+        Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/headless-launchctl.log" \
+        Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/headless.state" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$mac/v2" \
+        >"$mac/gui-login.out" 2>"$mac/gui-login.err" \
+        || die "selftest: upgrade after GUI login failed"
+    [ -e "$mac/headless.state.user" ] && [ ! -e "$mac/headless.state.gui" ] \
+        || { cat "$mac/headless-launchctl.log" >&2; die "selftest: GUI login upgrade duplicated the existing user-domain service"; }
+    grep -q '^bootstrap user/' "$mac/headless-launchctl.log" \
+        || die "selftest: GUI login upgrade did not retain the existing user domain"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v2_id" ] \
+        || die "selftest: GUI login upgrade did not activate v2"
+    say "selftest: GUI login upgrade retained one user-domain service"
+
+    # An already ambiguous state must refuse before changing either service.
+    : >"$mac/headless.state.gui"
+    : >"$mac/headless-launchctl.log"
+    rc=0
+    PATH="$mock:$PATH" Z23_INSTALL_TEST_PLATFORM=Darwin \
+        Z23_SKIP_SYSTEMD=0 Z23_INSTALL_PREFIX="$prefix" \
+        Z23_LAUNCHD_DIR="$launchd" Z23_DATADIR="$datadir" \
+        Z23_INSTALL_TEST_HEADLESS=0 Z23_INSTALL_TEST_READY_FAIL=0 \
+        Z23_INSTALL_TEST_NO_DOMAIN=0 \
+        Z23_INSTALL_TEST_LAUNCHCTL_LOG="$mac/headless-launchctl.log" \
+        Z23_INSTALL_TEST_LAUNCHD_STATE="$mac/headless.state" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$mac/v1" \
+        >"$mac/dual-domain.out" 2>"$mac/dual-domain.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: dual-domain services must refuse"
+    grep -q 'refusing ambiguous activation' "$mac/dual-domain.err" \
+        || die "selftest: dual-domain refusal did not name ambiguity"
+    [ "$(readlink "$prefix/lib/z23/current")" = "generations/$v2_id" ] \
+        || die "selftest: dual-domain refusal changed current generation"
+    [ -e "$mac/headless.state.user" ] && [ -e "$mac/headless.state.gui" ] \
+        || die "selftest: dual-domain refusal changed existing service state"
+    if grep -Eq '^(bootstrap|bootout|kickstart) ' "$mac/headless-launchctl.log"; then
+        die "selftest: dual-domain refusal attempted service mutation"
+    fi
+    say "selftest: dual-domain ambiguity refused without service mutation"
+}
+
+# A fixture package into a scratch prefix, tampered so SHA256SUMS no longer
+# names the z23 bytes that actually sit beside it. verify_strict() must
+# refuse before install_payload_macos_generation ever runs, so this proves
+# the refusal happens BY NAME (a fixed, grep-able message) and BEFORE any
+# directory -- correctly or incorrectly named -- is created.
+selftest_macos_tampered_manifest() {
+    local mac="$SELFTEST_TMP/macos-tamper" prefix bogus_sha rc=0
+
+    prefix="$mac/prefix"
+    mkdir -p "$mac/release" "$prefix"
+    printf '#!/usr/bin/env bash\ntrue\n' >"$mac/release/z23"
+    chmod 755 "$mac/release/z23"
+    ln -f -- "$mac/release/z23" "$mac/release/zclassic23"
+    printf 'verifier\n' >"$mac/release/zclassic23-package-verify"
+    printf 'acme\n' >"$mac/release/zclassic23-acme"
+    printf '# agent card\n' >"$mac/release/AGENT_CARD.md"
+    chmod 755 "$mac/release/zclassic23-package-verify" \
+        "$mac/release/zclassic23-acme"
+    (cd "$mac/release" && sha256sum $RELEASE_MEMBERS >SHA256SUMS)
+
+    # Tamper: rewrite the z23 and zclassic23 rows' digests (they are the same
+    # hard-linked bytes, so both rows must move together or the EARLIER
+    # z23/zclassic23 alias-consistency check would refuse first, for a
+    # different reason than the one this test proves) to a different, still
+    # well-formed 64-lowercase-hex value. The bytes on disk are untouched --
+    # only what SHA256SUMS CLAIMS about them changes, which is exactly the
+    # shape of drift a directory-naming bug could otherwise hide.
+    bogus_sha="$(printf 'b%.0s' {1..64})"
+    local sums="$mac/release/SHA256SUMS" line hex64
+    hex64='????????????????????????????????????????????????????????????????'
+    while IFS= read -r line; do
+        case "$line" in
+            ${hex64}"  z23")
+                printf '%s  z23\n' "$bogus_sha" ;;
+            ${hex64}"  zclassic23")
+                printf '%s  zclassic23\n' "$bogus_sha" ;;
+            *)
+                printf '%s\n' "$line" ;;
+        esac
+    done <"$sums" >"$sums.tmp" && mv -f -- "$sums.tmp" "$sums"
+    grep -qx "${bogus_sha}  z23" "$mac/release/SHA256SUMS" \
+        || die "selftest: tamper fixture setup did not edit the z23 row"
+    grep -qx "${bogus_sha}  zclassic23" "$mac/release/SHA256SUMS" \
+        || die "selftest: tamper fixture setup did not edit the zclassic23 row"
+
+    Z23_INSTALL_TEST_PLATFORM=Darwin Z23_SKIP_SYSTEMD=1 \
+        Z23_INSTALL_PREFIX="$prefix" \
+        "$SCRIPT_DIR/install_z23.sh" --source="$mac/release" \
+        >/dev/null 2>"$mac/tamper.err" || rc=$?
+    [ "$rc" -eq 1 ] || die "selftest: tampered SHA256SUMS must refuse to install"
+    grep -q 'SHA256SUMS mismatch' "$mac/tamper.err" \
+        || die "selftest: tampered SHA256SUMS refusal did not name the mismatch"
+
+    # Refuses BY NAME: no generation is created under the tampered digest,
+    # the real one, or any other name -- naming never runs because
+    # verify_strict refuses first.
+    [ ! -e "$prefix/lib/z23/generations/$bogus_sha" ] \
+        || die "selftest: a generation was created under the tampered digest"
+    [ ! -d "$prefix/lib/z23/generations" ] \
+        || [ -z "$(ls -A "$prefix/lib/z23/generations" 2>/dev/null)" ] \
+        || die "selftest: a tampered manifest still produced a generation directory"
+}
+
+selftest() {
+    # Ordinary fixtures use the production deadline, including cold launches
+    # under parallel lint load. Only the timeout fixture shortens it to 1 s.
+    export Z23_INSTALL_TOR_STAMP_TIMEOUT=10
+    SELFTEST_TOR_CASES=""
+    selftest_prepare
+    selftest_prepare_curl_mock
+    selftest_local_refusals
+    selftest_remote_authority
+    selftest_remote_pins
+    selftest_remote_success
+    selftest_remote_bounds
+    selftest_remote_manifest_and_signal
+    selftest_local_success
+    selftest_local_manifest_refusals
+    selftest_release_pin
+    selftest_macos_transaction
+    selftest_macos_tampered_manifest
+    selftest_front_door
+
+    say "selftest PASS $SELFTEST_TOR_CASES"
+    trap - EXIT
+    chmod -R u+w "$SELFTEST_TMP" 2>/dev/null || true
+    rm -rf "$SELFTEST_TMP"
+    SELFTEST_TMP=""
+}
+
+SOURCE="${Z23_RELEASE_SOURCE:-}"
+EXPECTED_MANIFEST_SHA256="${Z23_RELEASE_MANIFEST_SHA256:-}"
+ATTEST_ARG=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --selftest) selftest; exit 0 ;;
+        --generation-status=*)
+            generation_provenance "${1#--generation-status=}"
+            exit $?
+            ;;
+        --source=*) SOURCE="${1#--source=}"; shift ;;
+        --source)
+            [ $# -ge 2 ] || die "--source needs a url or directory"
+            SOURCE="$2"
+            shift 2
+            ;;
+        --attest=*)
+            ATTEST_ARG="${1#--attest=}"
+            case "$ATTEST_ARG" in
+                *=*) ;;
+                *) die "--attest needs <origin>=<pin>" ;;
+            esac
+            attest_record "${ATTEST_ARG%%=*}" "${ATTEST_ARG#*=}"
+            shift
+            ;;
+        --attest-unreachable=*)
+            ATTEST_ARG="${1#--attest-unreachable=}"
+            case "$ATTEST_ARG" in
+                *=*) ;;
+                *) die "--attest-unreachable needs <origin>=<reason>" ;;
+            esac
+            attest_record_unreachable "${ATTEST_ARG%%=*}" "${ATTEST_ARG#*=}"
+            shift
+            ;;
+        --manifest-sha256=*) EXPECTED_MANIFEST_SHA256="${1#*=}"; shift ;;
+        --manifest-sha256)
+            [ $# -ge 2 ] || die "--manifest-sha256 needs a SHA-256 digest"
+            EXPECTED_MANIFEST_SHA256="$2"
+            shift 2
+            ;;
+        -h|--help)
+            sed -n '2,22p' "$0"
+            exit 0
+            ;;
+        --*) die "unknown argument: $1" ;;
+        *)
+            if [ -z "$SOURCE" ]; then
+                SOURCE="$1"
+                shift
+            else
+                die "unexpected extra argument: $1"
+            fi
+            ;;
+    esac
+done
+
+if [ "$ATTEST_OK_COUNT" -gt 0 ] || [ -n "$ATTEST_DOWN" ]; then
+    attest_resolve_manifest
+    if [ -n "$EXPECTED_MANIFEST_SHA256" ] \
+        && [ "$EXPECTED_MANIFEST_SHA256" != "$ATTESTED_MANIFEST_SHA256" ]; then
+        die "--manifest-sha256 disagrees with the pin the attesting sources agreed on"
+    fi
+    EXPECTED_MANIFEST_SHA256="$ATTESTED_MANIFEST_SHA256"
+fi
+
+install_from_source "$SOURCE" "$EXPECTED_MANIFEST_SHA256"

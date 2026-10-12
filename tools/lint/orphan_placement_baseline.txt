@@ -1,0 +1,26 @@
+# orphan_placement_baseline.txt
+#
+# Shrink-only baseline for tools/lint/check_no_orphan_placement.sh (Gate P3,
+# docs/work/palace-design.md §3). Each line is a tracked .c/.h that today
+# resolves to the catch-all "root" group in ci_group_for_path() — a top-level
+# file (src/) or a dir (examples/) outside the known navigator tops. The
+# gate runs RATCHET: any new violation NOT listed here fails the build. As
+# these files are relocated under a known top, DELETE their line here — this
+# file may only shrink. Goal: empty (gate graduates to FAIL).
+#
+# Format: one repo-relative path per line; lines starting with # are comments.
+docs/examples/01_mint_and_spend.c
+docs/examples/02_multi_io_p2sh.c
+docs/examples/03_op_return_overlay.c
+docs/examples/04_zslp_token.c
+docs/examples/05_znam_names.c
+docs/examples/06_htlc_swap.c
+docs/examples/07_cluster_reorg.c
+docs/examples/08_byzantine_blocks.c
+docs/examples/09_seed_replay.c
+docs/examples/10_wire_adversaries.c
+docs/examples/11_collectible_market.c
+engine/entry/cli.c
+engine/entry/main.c
+engine/entry/main_cli_modes.c
+engine/entry/main_cli_modes.h

@@ -1,0 +1,20 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * Umbrella test groups. Include with
+ * ZCL_TEST_GROUP_UMBRELLA(full_id, shard_glob).
+ *
+ * An umbrella is a registered group whose sub-suites are split across the
+ * registered groups its shard glob names. Named exactly (--exact, make
+ * t-fast-exact, make test-full, the macOS acceptance set, a fork re-exec) it
+ * still runs every sub-suite itself, so no consumer of the historic id loses
+ * coverage. In an expanded selection that already carries every one of its
+ * shards -- the default full run, an --only substring, the proof's universal
+ * set, a declared family, a plan expansion -- it is subsumed and only the
+ * shards run, concurrently, each on its own private state. The test file owns
+ * the partition: every shard proves that the union of shards is exactly the
+ * sub-suites the umbrella runs, each owned once.
+ */
+
+ZCL_TEST_GROUP_UMBRELLA("test_zcode_swarm_net", "test_zcode_swarm_net_shard_*")
+ZCL_TEST_GROUP_UMBRELLA("test_zcode_package_dev",
+                        "test_zcode_package_dev_shard_*")

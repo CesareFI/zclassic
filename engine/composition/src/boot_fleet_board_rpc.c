@@ -1,0 +1,766 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * purpose: The `fleet_board` RPC method — the node-side half of every board
+ * and wiki command.
+ *
+ * The CLI half runs in a separate one-shot process from a checkout and holds
+ * no node state, so every leaf asks the running node over this one method and
+ * fails closed when there is none. That is deliberate: a board a checkout
+ * could write privately would be a private notebook, not a fleet board, and
+ * two agents would silently diverge.
+ *
+ * One method, one `op` field, because the whole surface is small and a reader
+ * comparing the CLI against the node should be able to see both halves at
+ * once. Every op is bounded; no op takes a path, a command, or a key. */
+
+#include "config/boot_fleet_board.h"
+
+#include "config/runtime.h"
+#include "base/hex.h"
+#include "base/safe_alloc.h"
+#include "crypto/random_secret.h"
+#include "json/json.h"
+#include "models/fleet_board_post.h"
+#include "platform/time_compat.h"
+#include "rpc/server.h"
+#include "session/fleet_wiki_entry.h"
+#include "util/log_macros.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static const struct json_value *fb_input(const struct json_value *params)
+{
+    const struct json_value *first =
+        params && json_size(params) ? json_at(params, 0) : NULL;
+    return first && first->type == JSON_OBJ ? first : NULL;
+}
+
+static void fb_error(struct json_value *result, const char *code,
+                     const char *message)
+{
+    json_set_object(result);
+    json_push_kv_bool(result, "ok", false);
+    json_push_kv_str(result, "code", code);
+    json_push_kv_str(result, "message", message);
+}
+
+static void fb_refuse(struct json_value *result, enum fleet_board_result r)
+{
+    fb_error(result, r == FLEET_BOARD_ERR_BUSY ? "BOARD_BUSY" : "BOARD_REFUSED",
+             fleet_board_result_string(r));
+}
+
+static const char *fb_str(const struct json_value *in, const char *key,
+                          const char *fallback)
+{
+    /* json_get_str renders a missing key as "", never NULL: without the
+     * emptiness check the fallback would never fire. */
+    const char *v = json_get_str(json_get(in, key));
+    return v[0] ? v : fallback;
+}
+
+static int64_t fb_int(const struct json_value *in, const char *key,
+                      int64_t fallback)
+{
+    const struct json_value *v = json_get(in, key);
+    return v && v->type == JSON_INT ? json_get_int(v) : fallback;
+}
+
+static bool fb_bool(const struct json_value *in, const char *key)
+{
+    const struct json_value *v = json_get(in, key);
+    return v && v->type == JSON_BOOL && json_get_bool(v);
+}
+
+/* One post as a JSON object. Public projection: the host is rendered as its
+ * full public key hex, because a board reader must be able to check a
+ * signature themselves rather than trust this node's rendering of it. */
+static void fb_render_post(struct json_value *into,
+                           const struct db_fleet_board_post *row)
+{
+    char hex[65];
+    fleet_board_id_to_hex(row->post.id, hex);
+    (void)json_push_kv_str(into, "id", hex);
+    (void)json_push_kv_str(into, "kind", fleet_board_kind_name(row->post.kind));
+    (void)json_push_kv_int(into, "created_at", (int64_t)row->post.created_at);
+    (void)json_push_kv_int(into, "ttl", (int64_t)row->post.ttl);
+    (void)json_push_kv_int(into, "expires_at", row->expires_at);
+    fleet_board_id_to_hex(row->post.ref, hex);
+    (void)json_push_kv_str(into, "ref", hex);
+    fleet_board_id_to_hex(row->post.host_pubkey, hex);
+    (void)json_push_kv_str(into, "host", hex);
+    char signature_hex[FLEET_BOARD_SIG_BYTES * 2 + 1];
+    zcl_hex_encode(row->post.signature, FLEET_BOARD_SIG_BYTES, signature_hex);
+    (void)json_push_kv_str(into, "signature", signature_hex);
+    (void)json_push_kv_str(into, "agent", row->post.agent);
+    (void)json_push_kv_str(into, "scope",
+                           fleet_board_scope_name(row->post.scope));
+    if (row->post.scope != FLEET_BOARD_SCOPE_FLEET)
+        (void)json_push_kv_str(into, "room",
+                               fleet_board_room_name(&row->post));
+    (void)json_push_kv_str(into, "text", row->post.text);
+    (void)json_push_kv_int(into, "text_len", row->post.text_len);
+    if (row->post.slug[0]) {
+        (void)json_push_kv_str(into, "slug", row->post.slug);
+        (void)json_push_kv_str(into, "title", row->post.title);
+        fleet_board_id_to_hex(row->post.supersedes, hex);
+        (void)json_push_kv_str(into, "supersedes", hex);
+    }
+    if (row->post.receipt[0])
+        (void)json_push_kv_str(into, "receipt", row->post.receipt);
+    (void)json_push_kv_int(into, "seq", row->seq);
+    (void)json_push_kv_int(into, "received_at", row->received_at);
+}
+
+static void fb_render_list(struct json_value *result,
+                           const struct db_fleet_board_post *rows, int n)
+{
+    json_set_object(result);
+    json_push_kv_bool(result, "ok", true);
+    struct json_value arr;
+    json_init(&arr);
+    json_set_array(&arr);
+    for (int i = 0; i < n; i++) {
+        struct json_value item;
+        json_init(&item);
+        json_set_object(&item);
+        fb_render_post(&item, &rows[i]);
+        (void)json_push_back(&arr, &item);
+        json_free(&item);
+    }
+    (void)json_push_kv(result, "posts", &arr);
+    json_free(&arr);
+    json_push_kv_int(result, "returned", n);
+}
+
+/* The two signed times: ttl, and created_at. created_at defaults to this
+ * node's clock. A caller retrying the same content passes back the
+ * created_at it used the first time: every signed byte is then the same,
+ * Ed25519 is deterministic, so the retry derives the same post id and the
+ * store keeps one post, not two. It is bounded on both sides — never more
+ * than the skew a peer would accept ahead of now, and never so old that the
+ * post would already be expired when it is signed. */
+static bool fb_compose_time(const struct json_value *in,
+                            struct json_value *result, int64_t now,
+                            struct fleet_board_post *post)
+{
+    int64_t ttl = fb_int(in, "ttl", FLEET_BOARD_TTL_DEFAULT);
+    if (ttl <= 0 || ttl > FLEET_BOARD_TTL_MAX) {
+        fb_error(result, "BAD_TTL", "ttl must be 1..2592000 seconds");
+        return false;
+    }
+    post->ttl = (uint32_t)ttl;
+    const struct json_value *given = json_get(in, "created_at");
+    if (!given || given->type == JSON_NULL) {
+        post->created_at = (uint64_t)now;
+        return true;
+    }
+    int64_t created_at = given->type == JSON_INT ? json_get_int(given) : 0;
+    if (created_at <= 0 || created_at > now + FLEET_BOARD_FUTURE_SKEW_MAX) {
+        fb_error(result, "BAD_CREATED_AT",
+                 "created_at must be Unix seconds, at most 300 seconds "
+                 "ahead of this node's clock");
+        return false;
+    }
+    if (created_at + ttl <= now) {
+        fb_error(result, "CREATED_AT_EXPIRED",
+                 "created_at is older than the post's ttl: the post would "
+                 "already be expired");
+        return false;
+    }
+    post->created_at = (uint64_t)created_at;
+    return true;
+}
+
+static bool fb_compose_scope(const struct json_value *in,
+                             struct json_value *result,
+                             struct fleet_board_post *post)
+{
+    /* Everything signed today is scoped. The default is the public default
+     * room, which is where the pre-scope board already lives; "fleet" marks
+     * the post fleet-private, and a fleet post names no room. */
+    const char *scope_name = fb_str(in, "scope", "public");
+    if (!fleet_board_scope_from_name(scope_name, &post->scope)) {
+        fb_error(result, "BAD_SCOPE", "scope must be public or fleet");
+        return false;
+    }
+    const char *room = fb_str(in, "room",
+        post->scope == FLEET_BOARD_SCOPE_PUBLIC ? FLEET_BOARD_ROOM_DEFAULT
+                                                : "");
+    (void)snprintf(post->room, sizeof(post->room), "%s", room);
+    if (post->scope == FLEET_BOARD_SCOPE_FLEET && post->room[0]) {
+        fb_error(result, "BAD_ROOM", "a fleet-scoped post names no room");
+        return false;
+    }
+    if (post->scope == FLEET_BOARD_SCOPE_PUBLIC &&
+        !fleet_board_room_valid(room)) {
+        fb_error(result, "BAD_ROOM",
+                 "room must be 1..32 bytes of [a-z0-9-]");
+        return false;
+    }
+    return true;
+}
+
+/* `format: "entry"` on a wiki write asks for the body to be a valid
+ * zcl.fleet_wiki_entry.v1 object; any other format value is refused and an
+ * absent one leaves the page plain text. */
+static bool fb_check_entry_format(const struct json_value *in,
+                                  struct json_value *result,
+                                  const struct fleet_board_post *post)
+{
+    const char *format = fb_str(in, "format", NULL);
+    if (!format)
+        return true;
+    if (strcmp(format, "entry") != 0) {
+        fb_error(result, "BAD_FORMAT", "format must be entry when given");
+        return false;
+    }
+    struct json_value entry;
+    const char *why = NULL;
+    if (!fleet_wiki_entry_parse(post->text, post->text_len, &entry, &why)) {
+        fb_error(result, "BAD_ENTRY", why);
+        return false;
+    }
+    json_free(&entry);
+    return true;
+}
+
+/* The wiki-only fields of a post: slug, title, supersedes, and the optional
+ * entry-format check of the body. */
+static bool fb_compose_wiki(const struct json_value *in,
+                            struct json_value *result,
+                            struct fleet_board_post *post)
+{
+    (void)snprintf(post->slug, sizeof(post->slug), "%s",
+                   fb_str(in, "slug", ""));
+    (void)snprintf(post->title, sizeof(post->title), "%s",
+                   fb_str(in, "title", ""));
+    const char *sup = fb_str(in, "supersedes", NULL);
+    if (sup && sup[0] && !fleet_board_id_from_hex(sup, post->supersedes)) {
+        fb_error(result, "BAD_SUPERSEDES",
+                 "supersedes must be a 64-character post id");
+        return false;
+    }
+    return fb_check_entry_format(in, result, post);
+}
+
+/* `format` belongs to wiki writes; any other kind that carries it is
+ * refused rather than silently ignored. */
+static bool fb_compose_kind_fields(const struct json_value *in,
+                                   struct json_value *result,
+                                   struct fleet_board_post *post)
+{
+    if (post->kind == FLEET_BOARD_KIND_WIKI)
+        return fb_compose_wiki(in, result, post);
+    if (fb_str(in, "format", NULL)) {
+        fb_error(result, "FORMAT_NOT_WIKI",
+                 "format applies to wiki writes only");
+        return false;
+    }
+    return true;
+}
+
+/* Build an unsigned post from the request. Signing, storing, and announcing
+ * belong to boot_fleet_board_publish; this only reads caller input. */
+static bool fb_compose(const struct json_value *in, struct json_value *result,
+                       int64_t now, struct fleet_board_post *post)
+{
+    memset(post, 0, sizeof(*post));
+    const char *kind_name = fb_str(in, "kind", "note");
+    if (!fleet_board_kind_from_name(kind_name, &post->kind)) {
+        fb_error(result, "BAD_KIND",
+                 "kind must be one of problem, need, offer, claim, result, "
+                 "note, wiki, agents");
+        return false;
+    }
+    const char *text = fb_str(in, "text", NULL);
+    if (!text || !text[0]) {
+        fb_error(result, "MISSING_TEXT", "text is required");
+        return false;
+    }
+    size_t text_len = strlen(text);
+    if (text_len > fleet_board_text_max(post->kind)) {
+        fb_error(result, "TEXT_TOO_LONG",
+                 "text is over this kind's signed byte limit");
+        return false;
+    }
+    memcpy(post->text, text, text_len);
+    post->text[text_len] = '\0';
+    post->text_len = (uint32_t)text_len;
+
+    (void)snprintf(post->agent, sizeof(post->agent), "%s",
+                   fb_str(in, "agent", ""));
+    (void)snprintf(post->receipt, sizeof(post->receipt), "%s",
+                   fb_str(in, "receipt", ""));
+    if (!fb_compose_scope(in, result, post))
+        return false;
+    const char *ref = fb_str(in, "ref", NULL);
+    if (ref && ref[0] && !fleet_board_id_from_hex(ref, post->ref)) {
+        fb_error(result, "BAD_REF", "ref must be a 64-character post id");
+        return false;
+    }
+    if (!fb_compose_kind_fields(in, result, post))
+        return false;
+    if (!fb_compose_time(in, result, now, post))
+        return false;
+
+    enum fleet_board_result r = fleet_board_post_validate(post);
+    if (r != FLEET_BOARD_OK) {
+        fb_refuse(result, r);
+        return false;
+    }
+    return true;
+}
+
+static void fb_op_post(const struct json_value *in, struct json_value *result,
+                       int64_t now)
+{
+    struct fleet_board_post post;
+    if (!fb_compose(in, result, now, &post))
+        return;
+    enum fleet_board_result r = boot_fleet_board_publish(&post, now);
+    if (r != FLEET_BOARD_OK) {
+        fb_refuse(result, r);
+        return;
+    }
+    char hex[65];
+    fleet_board_id_to_hex(post.id, hex);
+    json_set_object(result);
+    json_push_kv_bool(result, "ok", true);
+    json_push_kv_str(result, "id", hex);
+    json_push_kv_str(result, "kind", fleet_board_kind_name(post.kind));
+    json_push_kv_int(result, "created_at", (int64_t)post.created_at);
+}
+
+static void fb_op_list(struct node_db *ndb, const struct json_value *in,
+                       struct json_value *result, int64_t now)
+{
+    struct fleet_board_filter filter;
+    memset(&filter, 0, sizeof(filter));
+    const char *kind = fb_str(in, "kind", NULL);
+    if (kind && kind[0] && !fleet_board_kind_from_name(kind, &filter.kind)) {
+        fb_error(result, "BAD_KIND", "unknown post kind");
+        return;
+    }
+    const char *host = fb_str(in, "host", NULL);
+    if (host && host[0]) {
+        if (!fleet_board_id_from_hex(host, filter.host_pubkey)) {
+            fb_error(result, "BAD_HOST",
+                     "host must be a 64-character public key hex");
+            return;
+        }
+        filter.host_set = true;
+    }
+    filter.since = fb_int(in, "since", 0);
+    filter.open_only = fb_bool(in, "open");
+    (void)snprintf(filter.slug, sizeof(filter.slug), "%s",
+                   fb_str(in, "slug", ""));
+    const char *scope = fb_str(in, "scope", NULL);
+    if (scope && scope[0]) {
+        /* "legacy" selects the pre-scope rows explicitly; the name "public"
+         * means the signed public scope, while a bare list sees both. */
+        if (strcmp(scope, "legacy") == 0) {
+            filter.scope_set = true;
+            filter.scope = FLEET_BOARD_SCOPE_LEGACY_PUBLIC;
+        } else if (fleet_board_scope_from_name(scope, &filter.scope)) {
+            filter.scope_set = true;
+        } else {
+            fb_error(result, "BAD_SCOPE",
+                     "scope must be public, fleet, or legacy");
+            return;
+        }
+    }
+    (void)snprintf(filter.room, sizeof(filter.room), "%s",
+                   fb_str(in, "room", ""));
+
+    int64_t limit = fb_int(in, "limit", 50);
+    if (limit <= 0 || limit > FLEET_BOARD_LIST_MAX)
+        limit = FLEET_BOARD_LIST_MAX;
+
+    struct db_fleet_board_post *rows =
+        zcl_calloc((size_t)limit, sizeof(*rows), "fleet_board.rpc.list");
+    if (!rows) {
+        fb_error(result, "BOARD_ALLOC_FAILED",
+                 "the bounded board result snapshot could not be allocated");
+        return;
+    }
+    int n = db_fleet_board_list(ndb, &filter, now, rows, (size_t)limit);
+    fb_render_list(result, rows, n);
+    free(rows);
+}
+
+static void fb_op_show(struct node_db *ndb, const struct json_value *in,
+                       struct json_value *result)
+{
+    uint8_t id[32];
+    const char *hex = fb_str(in, "id", NULL);
+    if (!hex || !fleet_board_id_from_hex(hex, id)) {
+        fb_error(result, "BAD_ID", "id must be a 64-character post id");
+        return;
+    }
+    struct db_fleet_board_post row;
+    if (!db_fleet_board_post_find(ndb, id, &row)) {
+        fb_error(result, "NOT_FOUND", "no post with that id is held here");
+        return;
+    }
+    json_set_object(result);
+    json_push_kv_bool(result, "ok", true);
+    fb_render_post(result, &row);
+}
+
+/* ── fleet_page: FLEET-scope posts in this store's arrival order ─────────
+ *
+ * The local reader's twin of the paired pull: the same arrival-ordered page
+ * (db_fleet_board_fleet_after) a paired box pulls, for a process on THIS
+ * box that consumes fleet posts, such as the agent-mail receiver. A
+ * created_at cursor would skip a post that arrives late with an older
+ * signed time; the arrival number never does. Every answer names this node
+ * process by a random epoch, because a restart may reuse the arrival number
+ * of a reclaimed row: a reader that sees a new epoch starts again from 0,
+ * which dedupe by post id makes free of effect. */
+
+#define FB_PAGE_DEFAULT 16
+
+static uint8_t g_fb_page_epoch[16];
+static bool g_fb_page_epoch_ready;
+
+static bool fb_page_epoch_hex(char out[33])
+{
+    if (!g_fb_page_epoch_ready)
+        g_fb_page_epoch_ready = zcl_random_secret_bytes(
+            g_fb_page_epoch, sizeof(g_fb_page_epoch), "fleet_board_page_epoch");
+    if (!g_fb_page_epoch_ready)
+        return false;
+    zcl_hex_encode(g_fb_page_epoch, sizeof(g_fb_page_epoch), out);
+    return true;
+}
+
+static bool fb_page_visit(const struct db_fleet_board_post *row, void *ctx)
+{
+    struct json_value *arr = ctx;
+    struct json_value item;
+    json_init(&item);
+    json_set_object(&item);
+    fb_render_post(&item, row);
+    (void)json_push_kv_int(&item, "arrival", row->arrival);
+    bool pushed = json_push_back(arr, &item);
+    json_free(&item);
+    return pushed;
+}
+
+static void fb_op_fleet_page(struct node_db *ndb, const struct json_value *in,
+                             struct json_value *result, int64_t now)
+{
+    int64_t after = fb_int(in, "after", 0);
+    int64_t limit = fb_int(in, "limit", FB_PAGE_DEFAULT);
+    char epoch[33];
+    if (after < 0) {
+        fb_error(result, "BAD_AFTER", "after is a non-negative arrival number");
+        return;
+    }
+    if (limit <= 0 || limit > (int64_t)FLEET_BOARD_FLEET_ANSWER_POSTS_MAX)
+        limit = FLEET_BOARD_FLEET_ANSWER_POSTS_MAX;
+    if (!fb_page_epoch_hex(epoch)) {
+        fb_error(result, "PAGE_UNAVAILABLE",
+                 "the CSPRNG did not yield this process's page epoch");
+        return;
+    }
+    struct json_value arr;
+    json_init(&arr);
+    json_set_array(&arr);
+    int64_t scanned = after;
+    int n = db_fleet_board_fleet_after(ndb, now, after, (unsigned)limit,
+                                       fb_page_visit, &arr, &scanned);
+    if (n < 0) {
+        json_free(&arr);
+        fb_error(result, "PAGE_UNAVAILABLE",
+                 "the fleet page could not be read from the board store");
+        return;
+    }
+    json_set_object(result);
+    json_push_kv_bool(result, "ok", true);
+    (void)json_push_kv(result, "posts", &arr);
+    json_free(&arr);
+    json_push_kv_int(result, "returned", n);
+    json_push_kv_int(result, "scanned", scanned);
+    json_push_kv_str(result, "epoch", epoch);
+}
+
+static void fb_op_status(struct node_db *ndb, struct json_value *result,
+                         int64_t now)
+{
+    struct fleet_board_status status;
+    if (!db_fleet_board_status(ndb, now, &status)) {
+        fb_error(result, "STATUS_UNAVAILABLE", "the board store did not answer");
+        return;
+    }
+    json_set_object(result);
+    json_push_kv_bool(result, "ok", true);
+    json_push_kv_int(result, "posts", status.posts);
+    json_push_kv_int(result, "bytes", status.bytes);
+    json_push_kv_int(result, "max_posts", FLEET_BOARD_STORE_MAX_POSTS);
+    json_push_kv_int(result, "max_bytes", FLEET_BOARD_STORE_MAX_BYTES);
+    json_push_kv_int(result, "oldest_created_at", status.oldest_created_at);
+    json_push_kv_int(result, "newest_created_at", status.newest_created_at);
+    json_push_kv_int(result, "open_questions", status.open_questions);
+    json_push_kv_int(result, "wiki_pages", status.wiki_pages);
+    if (status.head_chain_set) {
+        char hex[65];
+        fleet_board_id_to_hex(status.head_chain, hex);
+        json_push_kv_str(result, "head_chain", hex);
+    }
+    int64_t checked = 0;
+    json_push_kv_bool(result, "chain_intact",
+                      db_fleet_board_chain_verify(ndb, &checked));
+    json_push_kv_int(result, "chain_checked", checked);
+    /* Verified posts this node refused because their author holds no role
+     * here. Invisible in the counts above, because they were never stored. */
+    json_push_kv_int(result, "role_refused",
+                     (int64_t)boot_fleet_board_role_refused_count());
+    /* And keys the role bootstrap never reached because the host-scan
+     * bound stopped it: a refusal above may be that, not a decision. */
+    json_push_kv_int(result, "grandfather_truncated",
+                     (int64_t)boot_fleet_board_grandfather_truncated_count());
+    /* Status is read-only: inspecting the board must never create a signing
+     * identity or copy private key material into the RPC path. */
+    uint8_t pubkey[32];
+    if (boot_fleet_board_public_identity(pubkey)) {
+        char hex[65];
+        fleet_board_id_to_hex(pubkey, hex);
+        json_push_kv_str(result, "host", hex);
+    } else {
+        json_push_kv_str(result, "host_unavailable", "identity_not_loaded");
+    }
+}
+
+static void fb_op_wiki_read(struct node_db *ndb, const struct json_value *in,
+                            struct json_value *result)
+{
+    const char *slug = fb_str(in, "slug", NULL);
+    struct db_fleet_board_post row;
+    if (!slug || !db_fleet_board_wiki_read(ndb, slug, &row)) {
+        fb_error(result, "NO_PAGE", "no wiki page with that slug is held here");
+        return;
+    }
+    json_set_object(result);
+    json_push_kv_bool(result, "ok", true);
+    fb_render_post(result, &row);
+    struct json_value entry;
+    if (fleet_wiki_entry_parse(row.post.text, row.post.text_len, &entry, NULL)) {
+        (void)json_push_kv(result, "entry", &entry);
+        json_free(&entry);
+    }
+}
+
+static void fb_op_wiki_list(struct node_db *ndb, struct json_value *result)
+{
+    struct db_fleet_board_post *rows = zcl_calloc(
+        FLEET_BOARD_LIST_MAX, sizeof(*rows), "fleet_board.rpc.wiki_list");
+    if (!rows) {
+        fb_error(result, "BOARD_ALLOC_FAILED",
+                 "the bounded wiki result snapshot could not be allocated");
+        return;
+    }
+    int n = db_fleet_board_wiki_list(ndb, rows, FLEET_BOARD_LIST_MAX);
+    fb_render_list(result, rows, n);
+    free(rows);
+}
+
+static void fb_op_wiki_history(struct node_db *ndb,
+                               const struct json_value *in,
+                               struct json_value *result)
+{
+    const char *slug = fb_str(in, "slug", NULL);
+    if (!slug || !slug[0]) {
+        fb_error(result, "MISSING_SLUG", "slug is required");
+        return;
+    }
+    struct db_fleet_board_post *rows = zcl_calloc(
+        FLEET_BOARD_LIST_MAX, sizeof(*rows), "fleet_board.rpc.wiki_history");
+    if (!rows) {
+        fb_error(result, "BOARD_ALLOC_FAILED",
+                 "the bounded wiki result snapshot could not be allocated");
+        return;
+    }
+    int n = db_fleet_board_wiki_history(ndb, slug, rows,
+                                        FLEET_BOARD_LIST_MAX);
+    fb_render_list(result, rows, n);
+    free(rows);
+}
+
+/* Most entries one wiki_find returns, and the byte budget of its answer. */
+enum {
+    FB_FIND_MAX_ENTRIES = 8,
+    FB_FIND_BUDGET_BYTES = 16 * 1024,
+    /* Reserved for the answer's own keys and the separators. */
+    FB_FIND_ENVELOPE_BYTES = 192,
+    FB_FIND_Q_MAX = 128,
+};
+
+/* The compact view of one matching entry: topic, summary, slug, updated and
+ * the lessons' rule lines. Returns false when the row is not a valid entry
+ * or does not match the lower-cased needle. */
+static bool fb_find_item(const struct db_fleet_board_post *row,
+                         const char *needle, struct json_value *item)
+{
+    struct json_value entry;
+    if (!fleet_wiki_entry_parse(row->post.text, row->post.text_len, &entry,
+                                NULL))
+        return false;
+    bool match = fleet_wiki_entry_matches(&entry, needle);
+    if (match) {
+        json_set_object(item);
+        json_push_kv_str(item, "topic", json_get_str(json_get(&entry, "topic")));
+        json_push_kv_str(item, "summary",
+                         json_get_str(json_get(&entry, "summary")));
+        json_push_kv_str(item, "slug", row->post.slug);
+        json_push_kv_str(item, "updated",
+                         json_get_str(json_get(&entry, "updated")));
+        struct json_value rules;
+        json_init(&rules);
+        json_set_array(&rules);
+        const struct json_value *lessons = json_get(&entry, "lessons");
+        for (size_t i = 0; i < json_size(lessons); i++) {
+            struct json_value rule;
+            json_init(&rule);
+            json_set_str(&rule, json_get_str(json_get(json_at(lessons, i),
+                                                      "rule")));
+            (void)json_push_back(&rules, &rule);
+            json_free(&rule);
+        }
+        (void)json_push_kv(item, "rules", &rules);
+        json_free(&rules);
+    }
+    json_free(&entry);
+    return match;
+}
+
+/* Appends matching entries to `arr` until the entry cap or the byte budget
+ * is reached. Returns true when a match was left out. The budget starts at
+ * the envelope's own reserve so the whole answer stays inside it. */
+static bool fb_find_collect(const struct db_fleet_board_post *rows, int n,
+                            const char *needle, struct json_value *arr,
+                            int64_t *returned)
+{
+    size_t used = FB_FIND_ENVELOPE_BYTES;
+    for (int i = 0; i < n; i++) {
+        struct json_value item;
+        json_init(&item);
+        bool match = fb_find_item(&rows[i], needle, &item);
+        size_t size = match ? json_write(&item, NULL, 0) + 1 : 0;
+        bool full = match && (*returned >= FB_FIND_MAX_ENTRIES ||
+                              used + size > FB_FIND_BUDGET_BYTES);
+        if (match && !full) {
+            used += size;
+            (*returned)++;
+            (void)json_push_back(arr, &item);
+        }
+        json_free(&item);
+        if (full)
+            return true;
+    }
+    return false;
+}
+
+/* Local, read-only, never waits on a peer: scans the newest revision of every
+ * page this node holds (at most FLEET_BOARD_LIST_MAX pages, whoever signed
+ * them) and returns at most FB_FIND_MAX_ENTRIES matching entries inside
+ * FB_FIND_BUDGET_BYTES. `scanned` counts the pages examined; `truncated` is
+ * set when a match was left out or the scan reached its page cap. */
+static void fb_op_wiki_find(struct node_db *ndb, const struct json_value *in,
+                            struct json_value *result)
+{
+    const char *needle = fb_str(in, "q", "");
+    if (strlen(needle) > FB_FIND_Q_MAX) {
+        fb_error(result, "Q_TOO_LONG", "q is over 128 bytes");
+        return;
+    }
+    struct db_fleet_board_post *rows = zcl_calloc(
+        FLEET_BOARD_LIST_MAX, sizeof(*rows), "fleet_board.rpc.wiki_find");
+    if (!rows) {
+        fb_error(result, "BOARD_ALLOC_FAILED",
+                 "the bounded wiki result snapshot could not be allocated");
+        return;
+    }
+    int n = db_fleet_board_wiki_list(ndb, rows, FLEET_BOARD_LIST_MAX);
+    json_set_object(result);
+    json_push_kv_bool(result, "ok", true);
+    struct json_value arr;
+    json_init(&arr);
+    json_set_array(&arr);
+    int64_t returned = 0;
+    bool left_out = fb_find_collect(rows, n, needle, &arr, &returned);
+    free(rows);
+    (void)json_push_kv(result, "entries", &arr);
+    json_free(&arr);
+    json_push_kv_int(result, "returned", returned);
+    json_push_kv_int(result, "scanned", n);
+    json_push_kv_bool(result, "truncated",
+                      left_out || n >= FLEET_BOARD_LIST_MAX);
+}
+
+/* The wiki ops. Returns false when `op` is not one of them. */
+static bool fb_dispatch_wiki(struct node_db *ndb, const char *op,
+                             const struct json_value *in,
+                             struct json_value *result)
+{
+    if (strcmp(op, "wiki_read") == 0)
+        fb_op_wiki_read(ndb, in, result);
+    else if (strcmp(op, "wiki_list") == 0)
+        fb_op_wiki_list(ndb, result);
+    else if (strcmp(op, "wiki_find") == 0)
+        fb_op_wiki_find(ndb, in, result);
+    else if (strcmp(op, "wiki_history") == 0)
+        fb_op_wiki_history(ndb, in, result);
+    else
+        return false;
+    return true;
+}
+
+static bool rpc_fleet_board(const struct json_value *params, bool help,
+                            struct json_value *result)
+{
+    if (help) {
+        json_set_str(result,
+                     "fleet_board — the signed, gossiped AI message board and "
+                     "wiki every full node carries. ops: post, "
+                     "list, show, fleet_page, status, wiki_read, wiki_list, "
+                     "wiki_find, wiki_history. "
+                     "It carries requests, offers, and pointers to evidence; "
+                     "it is never an authority");
+        return true;
+    }
+    const struct json_value *in = fb_input(params);
+    const char *op = in ? fb_str(in, "op", NULL) : NULL;
+    if (!op || !op[0]) {
+        fb_error(result, "MISSING_OP", "op is required");
+        return true;
+    }
+    struct node_db *ndb = app_runtime_node_db();
+    if (!ndb || !ndb->open) {
+        fb_error(result, "NODE_DB_UNAVAILABLE",
+                 "the node database is not open; the board lives in it");
+        return true;
+    }
+    int64_t now = (int64_t)platform_time_wall_time_t();
+
+    if (strcmp(op, "post") == 0)            fb_op_post(in, result, now);
+    else if (strcmp(op, "list") == 0)       fb_op_list(ndb, in, result, now);
+    else if (strcmp(op, "show") == 0)       fb_op_show(ndb, in, result);
+    else if (strcmp(op, "fleet_page") == 0)
+        fb_op_fleet_page(ndb, in, result, now);
+    else if (strcmp(op, "status") == 0)     fb_op_status(ndb, result, now);
+    else if (!fb_dispatch_wiki(ndb, op, in, result))
+        fb_error(result, "UNKNOWN_OP", "no such board operation");
+    return true;
+}
+
+void boot_fleet_board_register_rpc(struct rpc_table *table)
+{
+    const struct rpc_command commands[] = {
+        {"fleet", "fleet_board", rpc_fleet_board, true},
+    };
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
+        rpc_table_must_append(table, &commands[i]);
+}

@@ -1,0 +1,1429 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * Unit tests for the block_index_projection
+ * (engine/modules/storage/src/block_index_projection.c).
+ *
+ * Coverage matrix (one run_* function below per numbered case):
+ *   1. open_close_clean       — open empty, close, reopen, offset=0
+ *   2. single_header_consumed — emit 1 header event; catch_up; get() returns it
+ *   3. get_by_height          — insert 3 entries at heights 100/200/300
+ *   4. iterate_canonical      — iterate returns entries in (height, hash) order
+ *   5. replay_idempotent      — second catch_up is a no-op
+ *   6. reorg_replace          — INSERT then INSERT (same hash, different
+ *                                nStatus); final state reflects second write
+ *   7. commitment_canonical   — 3 entries in scrambled insertion order;
+ *                                commitment matches a 4th projection that
+ *                                inserted in different order
+ *   8. resume_from_partial    — emit 1000 events; rewind last_consumed_offset
+ *                                to mid-stream; reopen; catch_up consumes only
+ *                                the suffix
+ *   9. collision_accounting_cached_stmt — re-inserting the SAME hash bumps
+ *                                replace_collisions_total; a fresh distinct
+ *                                hash right after does NOT (proves the
+ *                                was_present check isn't stuck on a stale
+ *                                cached statement)
+ *  10. payload_roundtrip     — EV_BLOCK_HEADER serialize/parse preserves
+ *                                every field, including the variable-length
+ *                                solution bytes
+ *  11. bound_dirty_delta     — exact flat identity admits only post-bind
+ *                                unique hashes; tamper falls back
+ *  12. catch_up_wal_budget   — enough headers to cross a lowered WAL budget
+ *                                more than once; peak -wal stays within one
+ *                                batch of the bound; final TRUNCATE still 0
+ *  13. catch_up_wal_reader   — get() from a second thread during catch-up;
+ *                                no deadlock, budget still held
+ *  14. page_cache_pragmas    — open applies PRAGMA cache_size=-BIP_PAGE_CACHE_KIB;
+ *                                ZCL_BIP_PAGE_CACHE_KIB=4096 → -4096;
+ *                                out-of-range override is ignored
+ *
+ * Scratch files live under ./test-tmp/bip_<pid>_<tag>/ in line with the
+ * project's no-/tmp convention. */
+
+#include "test/test_core.h"
+
+#include "platform/time_compat.h"
+#include "platform/os_proc.h"
+#include "util/storage_pacing.h"
+#include "storage/block_index_projection.h"
+#include "storage/event_log.h"
+#include "storage/event_log_payloads.h"
+#include "test_group_catalog.h"
+#include "../../../engine/modules/storage/src/block_index_projection_internal.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sqlite3.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define BIP_CHECK(name, expr) do { \
+    printf("block_index_projection: %s... ", (name)); \
+    if ((expr)) printf("OK\n"); \
+    else { printf("FAIL\n"); (*failures)++; } \
+} while (0)
+
+/* ── Tmpdir helpers ────────────────────────────────────────────────── */
+
+static int bip_mkdir_p(const char *p)
+{
+    if (mkdir(p, 0700) == 0) return 0;
+    if (errno == EEXIST) return 0;
+    return -1;
+}
+
+static void bip_ensure_root(void)
+{
+    bip_mkdir_p("./test-tmp");
+}
+
+static void bip_cleanup_dir(const char *dir)
+{
+    test_cleanup_tmpdir(dir);
+}
+
+static off_t bip_file_size(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 ? st.st_size : (off_t)-1;
+}
+
+/* Build a synthetic ev_block_header. `seed` differentiates every field
+ * so collisions are obvious. */
+static void make_header(struct ev_block_header *h, uint8_t *solution,
+                        size_t solution_size, uint32_t seed,
+                        int32_t height, uint32_t nStatus)
+{
+    memset(h, 0, sizeof(*h));
+    /* hash: seed in first 4 bytes, repeat for visual debug */
+    for (int i = 0; i < 32; i++)
+        h->hash[i] = (uint8_t)((seed >> ((i % 4) * 8)) & 0xFF);
+    for (int i = 0; i < 32; i++)
+        h->hashPrev[i] = (uint8_t)((seed + 1) >> ((i % 4) * 8) & 0xFF);
+    h->height        = height;
+    h->nStatus       = nStatus;
+    h->nFile         = (int32_t)(seed % 16);
+    h->nDataPos      = seed * 4 + 100;
+    h->nUndoPos      = seed * 4 + 200;
+    h->nTime         = 1700000000u + seed;
+    h->nBits         = 0x1d00ffffu;
+    for (int i = 0; i < 32; i++) h->nNonce[i] = (uint8_t)(seed + i);
+    for (int i = 0; i < 32; i++) h->hashMerkleRoot[i] = (uint8_t)(seed * 2 + i);
+    for (int i = 0; i < 32; i++) h->hashFinalSaplingRoot[i] = 0;
+    h->nVersion      = 4;
+    h->nTx           = 1;
+    h->nSolutionSize = (uint16_t)solution_size;
+    for (size_t i = 0; i < solution_size; i++)
+        solution[i] = (uint8_t)((seed + i) & 0xFF);
+}
+
+static bool emit_header(event_log_t *log, const struct ev_block_header *h,
+                        const uint8_t *solution)
+{
+    size_t bufcap = ev_block_header_wire_size(h->nSolutionSize);
+    uint8_t buf[256 + 1344];
+    if (bufcap > sizeof(buf)) return false;
+    size_t written = 0;
+    if (!ev_block_header_serialize(h, solution, buf, bufcap, &written))
+        return false;
+    return event_log_append(log, EV_BLOCK_HEADER, buf, written) != UINT64_MAX;
+}
+
+static bool emit_status(event_log_t *log, const struct ev_block_header *h)
+{
+    struct ev_block_status status = {
+        .nStatus = h->nStatus, .nFile = h->nFile,
+        .nDataPos = h->nDataPos, .nUndoPos = h->nUndoPos, .nTx = h->nTx,
+    };
+    memcpy(status.hash, h->hash, 32);
+    uint8_t wire[EV_BLOCK_STATUS_WIRE_LEN];
+    return ev_block_status_serialize(&status, wire) &&
+           event_log_append(log, EV_BLOCK_STATUS, wire, sizeof(wire)) !=
+               UINT64_MAX;
+}
+
+/* ── Test 1: open_close_clean ──────────────────────────────────────── */
+
+static bool store_cursor_text(const char *path, const char *text, int len)
+{
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_open_v2(path, &raw, SQLITE_OPEN_READWRITE, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(raw,
+            "INSERT OR REPLACE INTO projection_meta(k,v) "
+            "VALUES('last_consumed_offset',?)", -1, &stmt, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(stmt, 1, text, len, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    int close_rc = raw ? sqlite3_close(raw) : SQLITE_OK;
+    return rc == SQLITE_DONE && close_rc == SQLITE_OK;
+}
+
+static void check_cursor_text(const char *path, event_log_t *log, int *failures)
+{
+    static const struct {
+        const char *label, *text;
+        int len;
+        uint64_t expected;
+    } cases[] = {
+        {"cursor: trailing junk defaults", "7junk", 5, 0},
+        {"cursor: embedded NUL defaults", "7\0x", 3, 0},
+        {"cursor: negative defaults", "-1", 2, 0},
+        {"cursor: overflow defaults", "18446744073709551616", 20, 0},
+        {"cursor: empty defaults", "", 0, 0},
+        {"cursor: leading space defaults", " 7", 2, 0},
+        {"cursor: plus sign defaults", "+7", 2, 0},
+        {"cursor: trailing space defaults", "7 ", 2, 0},
+        {"cursor: leading zero retained", "007", 3, 7},
+        {"cursor: zero retained", "0", 1, 0},
+        {"cursor: nonzero retained", "7", 1, 7},
+        {"cursor: maximum retained", "18446744073709551615", 20, UINT64_MAX},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool stored = store_cursor_text(path, cases[i].text, cases[i].len);
+        BIP_CHECK("cursor: exact-length fixture stored", stored);
+        if (!stored) continue;
+        block_index_projection_t *p = block_index_projection_open(path, log);
+        BIP_CHECK("cursor: reopen succeeds", p != NULL);
+        if (p) {
+            /* Observe the production-restored cursor, not read_meta_u64. */
+            BIP_CHECK(cases[i].label, p->last_consumed_offset == cases[i].expected);
+            block_index_projection_close(p);
+        }
+    }
+}
+
+static int run_open_close_clean(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "open_close");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    BIP_CHECK("open_close: event log opens", log != NULL);
+    if (!log) goto done;
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    BIP_CHECK("open_close: projection opens cleanly", p != NULL);
+    if (!p) { event_log_close(log); goto done; }
+
+    BIP_CHECK("open_close: count=0 on fresh",
+              block_index_projection_count(p) == 0);
+
+    uint64_t off = block_index_projection_catch_up(p);
+    BIP_CHECK("open_close: catch_up returns 0 (empty log)", off == 0);
+
+    block_index_projection_close(p);
+
+    /* Reopen — cursor should still be 0. */
+    p = block_index_projection_open(db_path, log);
+    BIP_CHECK("open_close: reopen succeeds", p != NULL);
+    if (p) {
+        BIP_CHECK("open_close: reopen count=0",
+                  block_index_projection_count(p) == 0);
+        block_index_projection_close(p);
+    }
+    check_cursor_text(db_path, log, failures);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* ── Test 2: single_header_consumed ────────────────────────────────── */
+
+static int run_single_header_consumed(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "single");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    if (!log) { *failures += 1; printf("single: event_log_open FAIL\n"); goto done; }
+
+    struct ev_block_header h;
+    uint8_t sol[16];
+    make_header(&h, sol, sizeof(sol), 0xABCD, 42, 0x01);
+
+    BIP_CHECK("single: emit OK", emit_header(log, &h, sol));
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+
+    uint64_t off = block_index_projection_catch_up(p);
+    BIP_CHECK("single: catch_up returns non-zero", off > 0);
+    BIP_CHECK("single: count=1", block_index_projection_count(p) == 1);
+    char wal_path[336]; snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    BIP_CHECK("single: catch_up truncates committed WAL",
+              bip_file_size(wal_path) == 0);
+
+    struct disk_block_index got;
+    disk_block_index_init(&got);
+    BIP_CHECK("single: get(hash) succeeds",
+              block_index_projection_get(p, h.hash, &got));
+    BIP_CHECK("single: height matches", got.nHeight == 42);
+    BIP_CHECK("single: nStatus matches", got.nStatus == 0x01);
+    BIP_CHECK("single: nDataPos matches",
+              got.nDataPos == h.nDataPos);
+
+    block_index_projection_close(p);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* ── Test 3: get_by_height ─────────────────────────────────────────── */
+
+static int run_get_by_height(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "by_height");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    if (!log) { *failures += 1; goto done; }
+
+    int heights[3] = {100, 200, 300};
+    struct ev_block_header h[3];
+    uint8_t sol[3][8];
+    for (int i = 0; i < 3; i++) {
+        make_header(&h[i], sol[i], sizeof(sol[i]),
+                    (uint32_t)(0x1000 + i), heights[i], 0x40);
+        emit_header(log, &h[i], sol[i]);
+    }
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+    (void)block_index_projection_catch_up(p);
+    BIP_CHECK("by_height: count=3", block_index_projection_count(p) == 3);
+
+    struct disk_block_index got;
+    for (int i = 0; i < 3; i++) {
+        disk_block_index_init(&got);
+        BIP_CHECK("by_height: get_by_height succeeds",
+                  block_index_projection_get_by_height(p, heights[i], &got));
+        BIP_CHECK("by_height: returned height matches request",
+                  got.nHeight == heights[i]);
+        BIP_CHECK("by_height: returned nDataPos matches insertion",
+                  got.nDataPos == h[i].nDataPos);
+    }
+
+    /* Lookup of a height that wasn't inserted. */
+    disk_block_index_init(&got);
+    BIP_CHECK("by_height: missing height returns false",
+              !block_index_projection_get_by_height(p, 999, &got));
+
+    block_index_projection_close(p);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* ── Test 4: iterate_canonical ─────────────────────────────────────── */
+
+struct iter_ctx {
+    int n;
+    int heights[8];
+    uint8_t hashes[8][32];
+};
+
+static bool iter_cb(const uint8_t hash[32],
+                    const struct disk_block_index *idx, void *user)
+{
+    struct iter_ctx *c = (struct iter_ctx *)user;
+    if (c->n >= 8) return false;
+    c->heights[c->n] = idx->nHeight;
+    memcpy(c->hashes[c->n], hash, 32);
+    c->n++;
+    return true;
+}
+
+static int run_iterate_canonical(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "iterate");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    if (!log) { *failures += 1; goto done; }
+
+    /* Insert in scrambled order: heights 50, 10, 30. */
+    int order[3] = {50, 10, 30};
+    struct ev_block_header h[3];
+    uint8_t sol[3][8];
+    for (int i = 0; i < 3; i++) {
+        make_header(&h[i], sol[i], sizeof(sol[i]),
+                    (uint32_t)(0x2000 + order[i]), order[i], 0);
+        emit_header(log, &h[i], sol[i]);
+    }
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+    (void)block_index_projection_catch_up(p);
+
+    struct iter_ctx c = {0};
+    BIP_CHECK("iterate: returns 0",
+              block_index_projection_iterate(p, iter_cb, &c) == 0);
+    BIP_CHECK("iterate: visited all 3", c.n == 3);
+    BIP_CHECK("iterate: heights ascending h[0]<h[1]",
+              c.n >= 2 && c.heights[0] < c.heights[1]);
+    BIP_CHECK("iterate: heights ascending h[1]<h[2]",
+              c.n >= 3 && c.heights[1] < c.heights[2]);
+    BIP_CHECK("iterate: first height is 10",
+              c.n >= 1 && c.heights[0] == 10);
+    BIP_CHECK("iterate: last height is 50",
+              c.n >= 3 && c.heights[2] == 50);
+
+    struct iter_ctx storage = {0};
+    BIP_CHECK("storage-order iterate: returns 0",
+              block_index_projection_iterate_storage_order(
+                  p, iter_cb, &storage) == 0);
+    BIP_CHECK("storage-order iterate: visited all 3", storage.n == 3);
+
+    block_index_projection_close(p);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* ── Test 5: replay_idempotent ─────────────────────────────────────── */
+
+static int run_replay_idempotent(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "replay");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    if (!log) { *failures += 1; goto done; }
+
+    for (int i = 0; i < 10; i++) {
+        struct ev_block_header h;
+        uint8_t sol[8];
+        make_header(&h, sol, sizeof(sol),
+                    (uint32_t)(0x3000 + i), i, 0);
+        emit_header(log, &h, sol);
+    }
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+
+    uint64_t off1 = block_index_projection_catch_up(p);
+    uint64_t cnt1 = block_index_projection_count(p);
+    BIP_CHECK("replay: first catch_up has entries", cnt1 == 10);
+
+    /* Second catch_up — log unchanged, projection should not change. */
+    uint64_t off2 = block_index_projection_catch_up(p);
+    uint64_t cnt2 = block_index_projection_count(p);
+    BIP_CHECK("replay: offset stable across no-op catch_up", off1 == off2);
+    BIP_CHECK("replay: count stable across no-op catch_up", cnt1 == cnt2);
+
+    block_index_projection_close(p);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* ── Test 6: reorg_replace ─────────────────────────────────────────── */
+
+static int run_reorg_replace(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "reorg");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    if (!log) { *failures += 1; goto done; }
+
+    /* Emit same hash twice, different nStatus. */
+    struct ev_block_header h1, h2;
+    uint8_t sol[8] = {0};
+    make_header(&h1, sol, sizeof(sol), 0x4000, 500, 0x04);
+    make_header(&h2, sol, sizeof(sol), 0x4000, 500, 0x80);  /* same seed → same hash */
+    BIP_CHECK("reorg: hashes are equal",
+              memcmp(h1.hash, h2.hash, 32) == 0);
+    emit_header(log, &h1, sol);
+    emit_header(log, &h2, sol);
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+    (void)block_index_projection_catch_up(p);
+
+    BIP_CHECK("reorg: count=1 after replace",
+              block_index_projection_count(p) == 1);
+
+    struct disk_block_index got;
+    disk_block_index_init(&got);
+    BIP_CHECK("reorg: get succeeds",
+              block_index_projection_get(p, h1.hash, &got));
+    BIP_CHECK("reorg: nStatus is the SECOND write",
+              got.nStatus == 0x80);
+
+    block_index_projection_close(p);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* ── Test 7: commitment_canonical ──────────────────────────────────── */
+
+static int run_commitment_canonical(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "commitment");
+    char el_path1[320]; snprintf(el_path1, sizeof(el_path1), "%s/log1.bin", dir);
+    char el_path2[320]; snprintf(el_path2, sizeof(el_path2), "%s/log2.bin", dir);
+    char db_path1[320]; snprintf(db_path1, sizeof(db_path1), "%s/p1.db", dir);
+    char db_path2[320]; snprintf(db_path2, sizeof(db_path2), "%s/p2.db", dir);
+
+    /* Build the same 3 entries; insert in different orders into two
+     * separate projections; commitment must be identical. */
+    int orders1[3] = {7, 3, 5};   /* heights, scrambled */
+    int orders2[3] = {5, 7, 3};   /* same heights, different order */
+
+    event_log_t *log1 = event_log_open(el_path1);
+    event_log_t *log2 = event_log_open(el_path2);
+    if (!log1 || !log2) { *failures += 1; goto done; }
+
+    for (int i = 0; i < 3; i++) {
+        struct ev_block_header h;
+        uint8_t sol[8] = {0};
+        make_header(&h, sol, sizeof(sol),
+                    (uint32_t)(0x5000 + orders1[i]),
+                    orders1[i], 0x40);
+        emit_header(log1, &h, sol);
+    }
+    for (int i = 0; i < 3; i++) {
+        struct ev_block_header h;
+        uint8_t sol[8] = {0};
+        make_header(&h, sol, sizeof(sol),
+                    (uint32_t)(0x5000 + orders2[i]),
+                    orders2[i], 0x40);
+        emit_header(log2, &h, sol);
+    }
+
+    block_index_projection_t *p1 = block_index_projection_open(db_path1, log1);
+    block_index_projection_t *p2 = block_index_projection_open(db_path2, log2);
+    if (!p1 || !p2) {
+        if (p1) block_index_projection_close(p1);
+        if (p2) block_index_projection_close(p2);
+        event_log_close(log1); event_log_close(log2);
+        *failures += 1;
+        goto done;
+    }
+    (void)block_index_projection_catch_up(p1);
+    (void)block_index_projection_catch_up(p2);
+
+    uint8_t c1[32], c2[32];
+    BIP_CHECK("commitment: p1 commitment succeeds",
+              block_index_projection_commitment(p1, c1) == 0);
+    BIP_CHECK("commitment: p2 commitment succeeds",
+              block_index_projection_commitment(p2, c2) == 0);
+    BIP_CHECK("commitment: identical across insertion order",
+              memcmp(c1, c2, 32) == 0);
+
+    block_index_projection_close(p1);
+    block_index_projection_close(p2);
+    event_log_close(log1);
+    event_log_close(log2);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* ── Test 8: resume_from_partial ──────────────────────────────────── */
+
+static int run_resume_from_partial(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "resume");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    if (!log) { *failures += 1; goto done; }
+
+    /* Emit 200 events (faster than 1000 in test; same property). Track
+     * the offset of event index 100 so we can rewind to that point. */
+    uint64_t midpoint_offset = 0;
+    for (int i = 0; i < 200; i++) {
+        struct ev_block_header h;
+        uint8_t sol[8] = {0};
+        make_header(&h, sol, sizeof(sol),
+                    (uint32_t)(0x6000 + i), 1000 + i, 0x20);
+        /* event_log_append returns the offset of THIS event. The next
+         * event starts at offset + 16 + payload_len + 16. We want the
+         * offset AFTER event 99 (which is the start of event 100). */
+        size_t bufcap = ev_block_header_wire_size(h.nSolutionSize);
+        uint8_t buf[256 + 1344];
+        size_t written = 0;
+        ev_block_header_serialize(&h, sol, buf, bufcap, &written);
+        uint64_t off = event_log_append(log, EV_BLOCK_HEADER, buf, written);
+        if (i == 100) midpoint_offset = off;
+    }
+    BIP_CHECK("resume: midpoint offset captured", midpoint_offset > 0);
+
+    /* First projection: consume everything. */
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+    (void)block_index_projection_catch_up(p);
+    BIP_CHECK("resume: first catch_up has 200 entries",
+              block_index_projection_count(p) == 200);
+    block_index_projection_close(p);
+
+    /* Manually rewind last_consumed_offset to midpoint by editing
+     * projection_meta. We open a raw sqlite3 handle for this. */
+    sqlite3 *raw = NULL;
+    int rc = sqlite3_open_v2(db_path, &raw,
+                             SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        printf("resume: sqlite open for rewind FAIL: %s\n",
+               raw ? sqlite3_errmsg(raw) : sqlite3_errstr(rc));
+        if (raw) sqlite3_close(raw);
+        event_log_close(log);
+        *failures += 1;
+        goto done;
+    }
+    /* Also clear the block_index so we can prove catch_up only re-
+     * consumes the suffix (entries 100..199). */
+    sqlite3_exec(raw, "DELETE FROM block_index", NULL, NULL, NULL);
+    sqlite3_stmt *stmt = NULL;
+    char val[32];
+    snprintf(val, sizeof(val), "%" PRIu64, midpoint_offset);
+    sqlite3_prepare_v2(raw,
+        "INSERT OR REPLACE INTO projection_meta(k, v) "
+        "VALUES('last_consumed_offset', ?)", -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, val, -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    sqlite3_close(raw);
+
+    /* Reopen, catch_up — should consume only entries 100..199 (100 of them). */
+    p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+    BIP_CHECK("resume: reopen entry_count starts at 0 (we cleared)",
+              block_index_projection_count(p) == 0);
+    uint64_t off = block_index_projection_catch_up(p);
+    BIP_CHECK("resume: catch_up after rewind returns valid offset",
+              off != (uint64_t)-1 && off > midpoint_offset);
+    BIP_CHECK("resume: only suffix entries consumed (100 entries)",
+              block_index_projection_count(p) == 100);
+
+    block_index_projection_close(p);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* ── Test 9: collision_accounting_cached_stmt ──────────────────────── */
+
+/* The exists-check statement is prepared once per catch_up() call. Confirms
+ * replace_collisions_total accounting across calls: a fresh hash is not a
+ * collision, a re-inserted (same) hash is. */
+static uint64_t read_meta_u64(const char *db_path, const char *key)
+{
+    sqlite3 *raw = NULL;
+    if (sqlite3_open_v2(db_path, &raw, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (raw) sqlite3_close(raw);
+        return (uint64_t)-1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    uint64_t result = (uint64_t)-1;
+    if (sqlite3_prepare_v2(raw,
+            "SELECT v FROM projection_meta WHERE k = ?", -1, &stmt, NULL)
+            == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char *txt = sqlite3_column_text(stmt, 0);
+            if (txt) result = (uint64_t)strtoull((const char *)txt, NULL, 10);
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(raw);
+    return result;
+}
+
+static int run_collision_accounting_cached_stmt(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "collision");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    if (!log) { *failures += 1; goto done; }
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+
+    /* Round 1: one brand-new hash. Must NOT be counted as a collision. */
+    struct ev_block_header hA1;
+    uint8_t solA[8] = {0};
+    make_header(&hA1, solA, sizeof(solA), 0x7000, 700, 0x01);
+    BIP_CHECK("collision: emit A(v1) OK", emit_header(log, &hA1, solA));
+    (void)block_index_projection_catch_up(p);
+
+    BIP_CHECK("collision: count=1 after fresh insert",
+              block_index_projection_count(p) == 1);
+    BIP_CHECK("collision: collisions=0 after fresh insert",
+              read_meta_u64(db_path, "replace_collisions_total") == 0);
+    BIP_CHECK("collision: events_consumed_total=1 after fresh insert",
+              read_meta_u64(db_path, "events_consumed_total") == 1);
+
+    /* Round 2: same hash again (same seed => same hash), different
+     * nStatus — a genuine INSERT OR REPLACE collision. Must be counted. */
+    struct ev_block_header hA2;
+    uint8_t solA2[8] = {0};
+    make_header(&hA2, solA2, sizeof(solA2), 0x7000, 700, 0x80);
+    BIP_CHECK("collision: hashes match across rounds",
+              memcmp(hA1.hash, hA2.hash, 32) == 0);
+    BIP_CHECK("collision: emit A(v2) OK", emit_header(log, &hA2, solA2));
+    (void)block_index_projection_catch_up(p);
+
+    BIP_CHECK("collision: count stays 1 (same hash replaced)",
+              block_index_projection_count(p) == 1);
+    BIP_CHECK("collision: collisions=1 after re-inserting same hash",
+              read_meta_u64(db_path, "replace_collisions_total") == 1);
+
+    struct disk_block_index got;
+    disk_block_index_init(&got);
+    BIP_CHECK("collision: get reflects second write",
+              block_index_projection_get(p, hA1.hash, &got) &&
+              got.nStatus == 0x80);
+
+    /* Round 3: a fresh, distinct hash. Must NOT bump the collision
+     * counter (proves was_present isn't stuck true/false from a stale
+     * cached statement). */
+    struct ev_block_header hB;
+    uint8_t solB[8] = {0};
+    make_header(&hB, solB, sizeof(solB), 0x7001, 701, 0x01);
+    BIP_CHECK("collision: emit B OK", emit_header(log, &hB, solB));
+    (void)block_index_projection_catch_up(p);
+
+    BIP_CHECK("collision: count=2 after second fresh insert",
+              block_index_projection_count(p) == 2);
+    BIP_CHECK("collision: collisions stays 1 after fresh insert of B",
+              read_meta_u64(db_path, "replace_collisions_total") == 1);
+    BIP_CHECK("collision: events_consumed_total=3 across 3 catch_up calls",
+              read_meta_u64(db_path, "events_consumed_total") == 3);
+
+    block_index_projection_close(p);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* ── EV_BLOCK_HEADER round-trip (covers Task 1) ────────────────────── */
+
+static int run_payload_roundtrip(int *failures)
+{
+    int start_failures = *failures;
+
+    struct ev_block_header h;
+    uint8_t sol[64];
+    make_header(&h, sol, sizeof(sol), 0xDEAD, 12345, 0x05);
+
+    size_t cap = ev_block_header_wire_size(h.nSolutionSize);
+    uint8_t buf[256 + 1344];
+    size_t written = 0;
+    BIP_CHECK("payload: serialize OK",
+              ev_block_header_serialize(&h, sol, buf, cap, &written));
+    BIP_CHECK("payload: written == wire_size", written == cap);
+
+    struct ev_block_header h2;
+    const uint8_t *sol2 = NULL;
+    BIP_CHECK("payload: parse OK",
+              ev_block_header_parse(buf, written, &h2, &sol2));
+    BIP_CHECK("payload: hash roundtrips",
+              memcmp(h.hash, h2.hash, 32) == 0);
+    BIP_CHECK("payload: height roundtrips", h.height == h2.height);
+    BIP_CHECK("payload: nStatus roundtrips", h.nStatus == h2.nStatus);
+    BIP_CHECK("payload: nFile roundtrips", h.nFile == h2.nFile);
+    BIP_CHECK("payload: nDataPos roundtrips", h.nDataPos == h2.nDataPos);
+    BIP_CHECK("payload: nUndoPos roundtrips", h.nUndoPos == h2.nUndoPos);
+    BIP_CHECK("payload: nTime roundtrips", h.nTime == h2.nTime);
+    BIP_CHECK("payload: nBits roundtrips", h.nBits == h2.nBits);
+    BIP_CHECK("payload: nVersion roundtrips", h.nVersion == h2.nVersion);
+    BIP_CHECK("payload: nSolutionSize roundtrips",
+              h.nSolutionSize == h2.nSolutionSize);
+    BIP_CHECK("payload: solution roundtrips",
+              sol2 != NULL && memcmp(sol, sol2, h.nSolutionSize) == 0);
+
+    return *failures - start_failures;
+}
+
+struct dirty_count_ctx {
+    size_t count;
+};
+
+static bool count_dirty_cb(const uint8_t hash[32],
+                           const struct disk_block_index *idx, void *user)
+{
+    (void)hash;
+    (void)idx;
+    ((struct dirty_count_ctx *)user)->count++;
+    return true;
+}
+
+static int run_bound_dirty_delta(int *failures)
+{
+    int start_failures = *failures;
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "dirty_delta");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+    event_log_t *log = event_log_open(el_path);
+    block_index_projection_t *p = log
+        ? block_index_projection_open(db_path, log) : NULL;
+    if (!p) { *failures += 1; goto done; }
+
+    struct ev_block_header a, b, c;
+    uint8_t sol[8];
+    make_header(&a, sol, sizeof(sol), 101, 10, 1);
+    make_header(&b, sol, sizeof(sol), 102, 11, 1);
+    BIP_CHECK("dirty: initial headers emit",
+              emit_header(log, &a, sol) && emit_header(log, &b, sol));
+    BIP_CHECK("dirty: initial catch-up",
+              block_index_projection_catch_up(p) != UINT64_MAX);
+    uint8_t digest[32];
+    memset(digest, 0x5a, sizeof(digest));
+    BIP_CHECK("dirty: bind matching two-row flat",
+              block_index_projection_bind_flat(p, digest, 4096, 2));
+    struct dirty_count_ctx dc = {0};
+    BIP_CHECK("dirty: bound clean snapshot uses delta path",
+              block_index_projection_iterate_dirty_if_bound(
+                  p, digest, 4096, 2, count_dirty_cb, &dc) == 1 &&
+              dc.count == 0);
+    BIP_CHECK("dirty: size mismatch forces full fallback",
+              block_index_projection_iterate_dirty_if_bound(
+                  p, digest, 4097, 2, count_dirty_cb, &dc) == 0);
+    BIP_CHECK("dirty: count mismatch forces full fallback",
+              block_index_projection_iterate_dirty_if_bound(
+                  p, digest, 4096, 3, count_dirty_cb, &dc) == 0);
+
+    a.nStatus = 3;
+    make_header(&c, sol, sizeof(sol), 103, 12, 1);
+    BIP_CHECK("dirty: status patch and new header emit",
+              emit_status(log, &a) && emit_header(log, &c, sol));
+    BIP_CHECK("dirty: delta catch-up",
+              block_index_projection_catch_up(p) != UINT64_MAX);
+    dc.count = 0;
+    BIP_CHECK("dirty: two unique changed hashes iterated",
+              block_index_projection_iterate_dirty_if_bound(
+                  p, digest, 4096, 2, count_dirty_cb, &dc) == 1 &&
+              dc.count == 2);
+    uint8_t tampered[32];
+    memcpy(tampered, digest, sizeof(tampered));
+    tampered[0] ^= 1u;
+    BIP_CHECK("dirty: tampered flat identity falls back",
+              block_index_projection_iterate_dirty_if_bound(
+                  p, tampered, 4096, 2, count_dirty_cb, &dc) == 0);
+
+    block_index_projection_close(p);
+    p = block_index_projection_open(db_path, log);
+    dc.count = 0;
+    BIP_CHECK("dirty: delta survives reopen",
+              p && block_index_projection_iterate_dirty_if_bound(
+                  p, digest, 4096, 2, count_dirty_cb, &dc) == 1 &&
+              dc.count == 2);
+    if (p) block_index_projection_close(p);
+
+    sqlite3 *raw = NULL;
+    BIP_CHECK("dirty: raw handle opens for corruption probes",
+              sqlite3_open_v2(db_path, &raw, SQLITE_OPEN_READWRITE, NULL) ==
+                  SQLITE_OK);
+    if (raw) {
+        sqlite3_stmt *stmt = NULL;
+        int rc = sqlite3_prepare_v2(raw,
+            "UPDATE block_index SET blob=x'00' WHERE hash=?", -1,
+            &stmt, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_blob(stmt, 1, c.hash, 32, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt); // raw-sql-ok:test-fixture-corruption
+        }
+        sqlite3_finalize(stmt);
+        BIP_CHECK("dirty: malformed dirty blob injected", rc == SQLITE_DONE);
+        sqlite3_close(raw);
+    }
+    p = block_index_projection_open(db_path, log);
+    dc.count = 0;
+    BIP_CHECK("dirty: malformed bound row fails hard",
+              p && block_index_projection_iterate_dirty_if_bound(
+                  p, digest, 4096, 2, count_dirty_cb, &dc) == -1);
+    if (p) block_index_projection_close(p);
+
+    raw = NULL;
+    int missing_rc = SQLITE_ERROR;
+    if (sqlite3_open_v2(db_path, &raw, SQLITE_OPEN_READWRITE, NULL) ==
+        SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        missing_rc = sqlite3_prepare_v2(raw,
+            "DELETE FROM block_index WHERE hash=?", -1, &stmt, NULL);
+        if (missing_rc == SQLITE_OK) {
+            sqlite3_bind_blob(stmt, 1, c.hash, 32, SQLITE_TRANSIENT);
+            missing_rc = sqlite3_step(stmt); // raw-sql-ok:test-fixture-corruption
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(raw);
+    }
+    BIP_CHECK("dirty: projection row deletion injected",
+              missing_rc == SQLITE_DONE);
+    p = block_index_projection_open(db_path, log);
+    dc.count = 0;
+    BIP_CHECK("dirty: missing bound projection row fails hard",
+              p && block_index_projection_iterate_dirty_if_bound(
+                  p, digest, 4096, 2, count_dirty_cb, &dc) == -1);
+    if (p) block_index_projection_close(p);
+
+    raw = NULL;
+    if (sqlite3_open_v2(db_path, &raw, SQLITE_OPEN_READWRITE, NULL) ==
+        SQLITE_OK) {
+        (void)sqlite3_exec(raw, "UPDATE projection_meta SET v='4096junk' "
+                          "WHERE k='flat_payload_size'", NULL, NULL, NULL);
+        sqlite3_close(raw);
+    }
+    p = block_index_projection_open(db_path, log);
+    BIP_CHECK("dirty: numeric metadata trailing junk forces fallback",
+              p && block_index_projection_iterate_dirty_if_bound(
+                  p, digest, 4096, 2, count_dirty_cb, &dc) == 0);
+    if (p) block_index_projection_close(p);
+done:
+    if (log) event_log_close(log);
+    bip_cleanup_dir(dir);
+    return *failures - start_failures;
+}
+
+/* One batch of small-solution headers is far under the production 32 MiB
+ * bound, so tests lower wal_budget_bytes. Slack is one 1000-row batch of
+ * 4 KiB WAL frames plus headroom. */
+#define BIP_TEST_WAL_BUDGET_BYTES  (64u * 1024u)
+#define BIP_TEST_WAL_BATCH_SLACK   (8u * 1024u * 1024u)
+#define BIP_TEST_WAL_BATCHES       5
+
+
+static bool emit_n_headers(event_log_t *log, uint32_t seed0, int n)
+{
+    /* These records are projection input, not an event-log durability test.
+     * Publish the same complete wire once before catch_up instead of paying
+     * two fsync barriers for each of thousands of synthetic events. */
+    event_log_set_deferred_sync(log, true);
+    bool appended = true;
+    for (int i = 0; i < n; i++) {
+        struct ev_block_header h;
+        uint8_t sol[8] = {0};
+        make_header(&h, sol, sizeof(sol), seed0 + (uint32_t)i, i, 0x20);
+        if (!emit_header(log, &h, sol)) {
+            appended = false;
+            break;
+        }
+    }
+    bool flushed = event_log_flush(log);
+    event_log_set_deferred_sync(log, false);
+    return appended && flushed;
+}
+
+static int run_catch_up_wal_budget(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "wal_budget");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    if (!log) { *failures += 1; goto done; }
+
+    int n = BIP_TEST_WAL_BATCHES * BIP_BATCH_EVENTS;
+    BIP_CHECK("wal_budget: emit headers", emit_n_headers(log, 0xA000u, n));
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+    p->wal_budget_bytes = BIP_TEST_WAL_BUDGET_BYTES;
+
+    uint64_t off = block_index_projection_catch_up(p);
+    BIP_CHECK("wal_budget: catch_up succeeds", off != (uint64_t)-1);
+    BIP_CHECK("wal_budget: row count matches emitted headers",
+              block_index_projection_count(p) == (uint64_t)n);
+    BIP_CHECK("wal_budget: crossed the bound more than once",
+              p->wal_passive_checkpoints >= 2);
+    BIP_CHECK("wal_budget: peak WAL exceeded the lowered bound",
+              p->max_wal_bytes_seen > BIP_TEST_WAL_BUDGET_BYTES);
+    BIP_CHECK("wal_budget: peak WAL stayed within one batch of the bound",
+              p->max_wal_bytes_seen <= BIP_TEST_WAL_BUDGET_BYTES +
+                  BIP_TEST_WAL_BATCH_SLACK);
+
+    char wal_path[336]; snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    BIP_CHECK("wal_budget: final TRUNCATE still leaves WAL at 0",
+              bip_file_size(wal_path) == 0);
+
+    block_index_projection_close(p);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+struct wal_reader_arg {
+    block_index_projection_t *p;
+    uint8_t hash[32];
+    atomic_int stop;
+    atomic_uint_least64_t gets;
+};
+
+static void *wal_reader_main(void *user)
+{
+    struct wal_reader_arg *a = (struct wal_reader_arg *)user;
+    while (!atomic_load_explicit(&a->stop, memory_order_acquire)) {
+        struct disk_block_index got;
+        disk_block_index_init(&got);
+        (void)block_index_projection_get(a->p, a->hash, &got);
+        atomic_fetch_add_explicit(&a->gets, 1, memory_order_relaxed);
+    }
+    return NULL;
+}
+
+static int run_catch_up_wal_reader(int *failures)
+{
+    int start_failures = *failures;
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "wal_reader");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    if (!log) { *failures += 1; goto done; }
+
+    int n = 3 * BIP_BATCH_EVENTS;
+    BIP_CHECK("wal_reader: emit headers", emit_n_headers(log, 0xB000u, n));
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    if (!p) { event_log_close(log); *failures += 1; goto done; }
+    p->wal_budget_bytes = BIP_TEST_WAL_BUDGET_BYTES;
+
+    struct wal_reader_arg arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.p = p;
+    pthread_t th;
+    int th_rc = pthread_create(&th, NULL, wal_reader_main, &arg);
+    BIP_CHECK("wal_reader: reader thread starts", th_rc == 0);
+
+    int64_t t0 = 0;
+    {
+        struct timespec ts;
+        platform_time_monotonic_timespec(&ts);
+        t0 = (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+    }
+    uint64_t off = block_index_projection_catch_up(p);
+    {
+        struct timespec ts;
+        platform_time_monotonic_timespec(&ts);
+        int64_t elapsed = (int64_t)ts.tv_sec * 1000 +
+                          (int64_t)ts.tv_nsec / 1000000 - t0;
+        BIP_CHECK("wal_reader: catch_up did not block past 30s",
+                  elapsed < 30000);
+    }
+
+    atomic_store_explicit(&arg.stop, 1, memory_order_release);
+    if (th_rc == 0)
+        BIP_CHECK("wal_reader: reader joins", pthread_join(th, NULL) == 0);
+
+    BIP_CHECK("wal_reader: catch_up succeeds with a concurrent get()",
+              off != (uint64_t)-1);
+    BIP_CHECK("wal_reader: row count matches emitted headers",
+              block_index_projection_count(p) == (uint64_t)n);
+    BIP_CHECK("wal_reader: mid-run PASSIVE checkpoints still fired",
+              p->wal_passive_checkpoints >= 2);
+    BIP_CHECK("wal_reader: peak WAL stayed within one batch of the bound",
+              p->max_wal_bytes_seen <= BIP_TEST_WAL_BUDGET_BYTES +
+                  BIP_TEST_WAL_BATCH_SLACK);
+
+    char wal_path[336]; snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    BIP_CHECK("wal_reader: final TRUNCATE still leaves WAL at 0",
+              bip_file_size(wal_path) == 0);
+
+    block_index_projection_close(p);
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    return *failures - start_failures;
+}
+
+/* Read PRAGMA cache_size on the projection's own sqlite handle. Per-connection
+ * (a second sqlite3_open of the same file would see SQLite's default cache). */
+static int64_t bip_pragma_cache_size(block_index_projection_t *p)
+{
+    sqlite3_stmt *stmt = NULL;
+    int64_t v = 0;
+    if (!p || sqlite3_prepare_v2(p->db, "PRAGMA cache_size", -1, &stmt, NULL)
+            != SQLITE_OK)
+        return 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) // raw-sql-ok:test-pragma-read
+        v = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    return v;
+}
+
+static int run_page_cache_pragmas(int *failures)
+{
+    int start_failures = *failures;
+
+    char saved[64];
+    bool had = false;
+    {
+        const char *cur = getenv("ZCL_BIP_PAGE_CACHE_KIB");
+        if (cur) {
+            snprintf(saved, sizeof(saved), "%s", cur);
+            had = true;
+        }
+    }
+    unsetenv("ZCL_BIP_PAGE_CACHE_KIB");
+
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "page_cache");
+    char el_path[320]; snprintf(el_path, sizeof(el_path), "%s/log.bin", dir);
+    char db_path[320]; snprintf(db_path, sizeof(db_path), "%s/p.db", dir);
+
+    event_log_t *log = event_log_open(el_path);
+    BIP_CHECK("page_cache: event log opens", log != NULL);
+    if (!log) goto done;
+
+    block_index_projection_t *p = block_index_projection_open(db_path, log);
+    BIP_CHECK("page_cache: projection opens", p != NULL);
+    if (!p) { event_log_close(log); goto done; }
+    BIP_CHECK("page_cache: default cache_size",
+              bip_pragma_cache_size(p) == -(int64_t)BIP_PAGE_CACHE_KIB);
+    block_index_projection_close(p);
+
+    setenv("ZCL_BIP_PAGE_CACHE_KIB", "4096", 1);
+    p = block_index_projection_open(db_path, log);
+    BIP_CHECK("page_cache: override 4096",
+              p && bip_pragma_cache_size(p) == -4096);
+    if (p) block_index_projection_close(p);
+
+    setenv("ZCL_BIP_PAGE_CACHE_KIB", "1", 1);
+    p = block_index_projection_open(db_path, log);
+    BIP_CHECK("page_cache: out-of-range ignored",
+              p && bip_pragma_cache_size(p) == -(int64_t)BIP_PAGE_CACHE_KIB);
+    if (p) block_index_projection_close(p);
+
+    event_log_close(log);
+    bip_cleanup_dir(dir);
+done:
+    if (had)
+        setenv("ZCL_BIP_PAGE_CACHE_KIB", saved, 1);
+    else
+        unsetenv("ZCL_BIP_PAGE_CACHE_KIB");
+    return *failures - start_failures;
+}
+
+static int run_cache_budget(int *failures)
+{
+    int start = *failures;
+    const int64_t gib = INT64_C(1073741824);
+    struct os_proc_mem mem = {
+        .sys_total_bytes = 16 * gib, .sys_avail_bytes = 12 * gib,
+        .cgroup_high = -1, .cgroup_max = -1, .cgroup_current = -1,
+    };
+    BIP_CHECK("cache: bounded working set",
+              block_index_projection_cache_budget((uint64_t)gib, &mem)
+              == (uint64_t)(gib + gib / 4));
+    BIP_CHECK("cache: small file keeps baseline",
+              block_index_projection_cache_budget(4096, &mem) == 0);
+    BIP_CHECK("cache: oversized file skipped",
+              block_index_projection_cache_budget(UINT64_MAX, &mem) == 0);
+    BIP_CHECK("cache: missing memory skipped",
+              block_index_projection_cache_budget((uint64_t)gib, NULL) == 0);
+    mem.sys_avail_bytes = gib;
+    BIP_CHECK("cache: low available memory skipped",
+              block_index_projection_cache_budget((uint64_t)gib, &mem) == 0);
+    mem.sys_avail_bytes = 12 * gib;
+    mem.cgroup_max = 4 * gib;
+    mem.cgroup_current = gib;
+    BIP_CHECK("cache: cgroup headroom respected",
+              block_index_projection_cache_budget((uint64_t)gib, &mem) == 0);
+    mem.cgroup_max = -1;
+    mem.cgroup_high = 4 * gib;
+    BIP_CHECK("cache: cgroup high respected",
+              block_index_projection_cache_budget((uint64_t)gib, &mem) == 0);
+    mem.cgroup_current = -1;
+    BIP_CHECK("cache: unknown constrained usage skipped",
+              block_index_projection_cache_budget((uint64_t)gib, &mem) == 0);
+    return *failures - start;
+}
+
+typedef struct {
+    sqlite3_file file;
+    sqlite3_int64 next;
+    int reads;
+    int fail_read;
+    bool invalid;
+} bip_prefetch_fixture_t;
+
+static int bip_prefetch_read(sqlite3_file *file, void *buffer, int amount,
+                             sqlite3_int64 offset)
+{
+    bip_prefetch_fixture_t *f = (bip_prefetch_fixture_t *)file;
+    f->reads++;
+    if (offset != f->next || amount <= 0 || amount > 65536) {
+        f->invalid = true;
+        return SQLITE_IOERR;
+    }
+    if (f->reads == f->fail_read) return SQLITE_IOERR;
+    memset(buffer, 0, (size_t)amount);
+    f->next += amount;
+    return SQLITE_OK;
+}
+
+static int run_cache_prefetch(int *failures)
+{
+    int start = *failures;
+    const sqlite3_io_methods methods = { .iVersion = 1,
+                                         .xRead = bip_prefetch_read };
+    bip_prefetch_fixture_t f = { .file = { .pMethods = &methods } };
+    BIP_CHECK("prefetch: exact sequential reads and tail",
+              block_index_projection_cache_warm(&f.file, 131079) == 131079
+              && f.reads == 3 && f.next == 131079 && !f.invalid);
+    f.next = 0; f.reads = 0; f.fail_read = 2;
+    BIP_CHECK("prefetch: I/O error stops without retry storm",
+              block_index_projection_cache_warm(&f.file, 131079) == 65536
+              && f.reads == 2 && !f.invalid);
+    BIP_CHECK("prefetch: oversized input performs no I/O",
+              block_index_projection_cache_warm(&f.file, UINT64_MAX) == 0
+              && f.reads == 2);
+    BIP_CHECK("prefetch: absent handle falls back",
+              block_index_projection_cache_warm(NULL, 65536) == 0);
+    return *failures - start;
+}
+
+static int run_cache_file(int *failures)
+{
+    int start = *failures;
+    char dir[256]; test_make_tmpdir(dir, sizeof(dir), "bip", "prefetch");
+    char path[320]; snprintf(path, sizeof(path), "%s/p.db", dir);
+    sqlite3 *db = NULL;
+    BIP_CHECK("prefetch file: opens",
+              sqlite3_open(path, &db) == SQLITE_OK);
+    if (!db) return *failures - start;
+    int rc = sqlite3_exec(db,
+        "CREATE TABLE fixture(v BLOB);"
+        "INSERT INTO fixture VALUES(zeroblob(33554432));",
+        NULL, NULL, NULL);
+    BIP_CHECK("prefetch file: materialized pages", rc == SQLITE_OK);
+    if (rc == SQLITE_OK) {
+        struct os_proc_mem mem = {
+            .sys_total_bytes = INT64_C(17179869184),
+            .sys_avail_bytes = INT64_C(12884901888),
+            .cgroup_high = -1, .cgroup_max = -1, .cgroup_current = -1,
+        };
+        os_proc_mem_set_override(&mem);
+        storage_pacing_force_class_for_testing(PLATFORM_STORAGE_CLASS_ROTATIONAL);
+        block_index_projection_cache_prepare(db);
+        block_index_projection_t view = { .db = db };
+        BIP_CHECK("prefetch file: cache policy applied",
+                  bip_pragma_cache_size(&view) == -BIP_PAGE_CACHE_KIB);
+        sqlite3_stmt *stmt = NULL;
+        rc = sqlite3_prepare_v2(db, "SELECT length(v) FROM fixture",
+                                -1, &stmt, NULL);
+        BIP_CHECK("prefetch file: data preserved",
+                  rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW
+                  && sqlite3_column_int64(stmt, 0) == 33554432);
+        sqlite3_finalize(stmt);
+        os_proc_mem_set_override(NULL);
+        storage_pacing_reset_for_testing();
+    }
+    sqlite3_close(db);
+    bip_cleanup_dir(dir);
+    return *failures - start;
+}
+
+/* One case table is the coverage authority for the eight forked groups.
+ * Every case owns a PID-specific database directory; the process-local memory,
+ * storage and environment overrides cannot cross shard children. */
+#define BIP_SHARD_COUNT 8u
+struct bip_case {
+    const char *name;
+    int (*run)(int *failures);
+    unsigned shard;
+};
+
+static const struct bip_case g_bip_cases[] = {
+    {"payload_roundtrip", run_payload_roundtrip, 0},
+    {"open_close_clean", run_open_close_clean, 1},
+    {"page_cache_pragmas", run_page_cache_pragmas, 2},
+    {"cache_budget", run_cache_budget, 3},
+    {"cache_prefetch", run_cache_prefetch, 4},
+    {"cache_file", run_cache_file, 5},
+    {"single_header_consumed", run_single_header_consumed, 6},
+    {"get_by_height", run_get_by_height, 7},
+    {"iterate_canonical", run_iterate_canonical, 0},
+    {"replay_idempotent", run_replay_idempotent, 1},
+    {"reorg_replace", run_reorg_replace, 2},
+    {"commitment_canonical", run_commitment_canonical, 3},
+    {"resume_from_partial", run_resume_from_partial, 4},
+    {"collision_accounting_cached_stmt", run_collision_accounting_cached_stmt, 5},
+    {"bound_dirty_delta", run_bound_dirty_delta, 6},
+    {"catch_up_wal_budget", run_catch_up_wal_budget, 7},
+    {"catch_up_wal_reader", run_catch_up_wal_reader, 0},
+};
+
+#define BIP_CASE_COUNT (sizeof(g_bip_cases) / sizeof(g_bip_cases[0]))
+
+static const char *const g_bip_env_keys[] = {
+    "HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "TMPDIR",
+};
+
+struct bip_saved_env {
+    char *value[sizeof(g_bip_env_keys) / sizeof(g_bip_env_keys[0])];
+    bool present[sizeof(g_bip_env_keys) / sizeof(g_bip_env_keys[0])];
+};
+
+static bool bip_restore_env(struct bip_saved_env *saved)
+{
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(g_bip_env_keys) / sizeof(g_bip_env_keys[0]); i++) {
+        int rc = saved->present[i]
+            ? setenv(g_bip_env_keys[i], saved->value[i], 1)
+            : unsetenv(g_bip_env_keys[i]);
+        if (rc != 0) ok = false;
+        free(saved->value[i]);
+        saved->value[i] = NULL;
+    }
+    return ok;
+}
+
+static bool bip_private_env(struct bip_saved_env *saved, const char *root)
+{
+    for (size_t i = 0; i < sizeof(g_bip_env_keys) / sizeof(g_bip_env_keys[0]); i++) {
+        const char *value = getenv(g_bip_env_keys[i]);
+        saved->present[i] = value != NULL;
+        if (value) {
+            saved->value[i] = strdup(value);
+            if (!saved->value[i]) {
+                for (size_t j = 0; j < i; j++) free(saved->value[j]);
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0; i < sizeof(g_bip_env_keys) / sizeof(g_bip_env_keys[0]); i++) {
+        if (setenv(g_bip_env_keys[i], root, 1) != 0) {
+            (void)bip_restore_env(saved);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int bip_run_shard(unsigned shard)
+{
+    int failures = 0;
+    char private_root[PATH_MAX];
+    if (!test_mkdtemp(private_root, sizeof(private_root), "bip_shard")) {
+        perror("block_index_projection: private shard directory");
+        return 1;
+    }
+    struct bip_saved_env saved = {0};
+    if (!bip_private_env(&saved, private_root)) {
+        fprintf(stderr, "block_index_projection: private environment failed\n");
+        (void)test_rm_rf_recursive(private_root);
+        return 1;
+    }
+    printf("\n=== block_index_projection shard %u pid=%ld ===\n",
+           shard + 1u, (long)getpid());
+    bool private_ok = true;
+    for (size_t i = 0; i < sizeof(g_bip_env_keys) / sizeof(g_bip_env_keys[0]); i++) {
+        const char *value = getenv(g_bip_env_keys[i]);
+        if (!value || strcmp(value, private_root) != 0) private_ok = false;
+    }
+    printf("block_index_projection: private HOME/state/cache/config/TMPDIR... %s\n",
+           private_ok ? "OK" : "FAIL");
+    if (!private_ok) failures++;
+    bip_ensure_root();
+    for (size_t i = 0; i < BIP_CASE_COUNT; i++) {
+        if (g_bip_cases[i].shard != shard) continue;
+        int64_t start = platform_time_monotonic_ms();
+        (void)g_bip_cases[i].run(&failures);
+        int64_t end = platform_time_monotonic_ms();
+        printf("[bip-case] shard=%u name=%s ms=%" PRId64 " failures=%d\n",
+               shard + 1u, g_bip_cases[i].name,
+               end >= start ? end - start : -1, failures);
+    }
+    if (!bip_restore_env(&saved)) failures++;
+    if (test_rm_rf_recursive(private_root) != 0) failures++;
+    printf("block_index_projection shard %u: %d failures\n",
+           shard + 1u, failures);
+    return failures;
+}
+
+int test_block_index_projection(void)
+{
+    int failed = 0;
+    int *failures = &failed;
+    /* The exact group runs here; shard-only cases are not selected by it. */
+    (void)run_open_close_clean(failures);
+    unsigned counts[BIP_SHARD_COUNT] = {0};
+    bool unique = true;
+    for (size_t i = 0; i < BIP_CASE_COUNT; i++) {
+        if (g_bip_cases[i].shard >= BIP_SHARD_COUNT) {
+            unique = false;
+            continue;
+        }
+        counts[g_bip_cases[i].shard]++;
+        for (size_t j = 0; j < i; j++)
+            if (g_bip_cases[i].run == g_bip_cases[j].run ||
+                strcmp(g_bip_cases[i].name, g_bip_cases[j].name) == 0)
+                unique = false;
+    }
+    size_t owned = 0;
+    for (unsigned i = 0; i < BIP_SHARD_COUNT; i++) owned += counts[i];
+    BIP_CHECK("partition: all 17 cases have one owner",
+              BIP_CASE_COUNT == 17u && owned == BIP_CASE_COUNT && unique);
+    bool nonempty = true;
+    for (unsigned i = 0; i < BIP_SHARD_COUNT; i++) nonempty &= counts[i] > 0;
+    BIP_CHECK("partition: every shard carries work", nonempty);
+    const char *plans[] = {"block_index_projection"};
+    char expanded[BIP_SHARD_COUNT + 1u][ZCL_TEST_GROUP_FULL_MAX];
+    bool truncated = false;
+    size_t selected = zcl_test_group_expand_plan(plans, 1, expanded,
+                                                  BIP_SHARD_COUNT + 1u,
+                                                  &truncated);
+    BIP_CHECK("partition: proof plan names all eight registered shards",
+              selected == BIP_SHARD_COUNT + 1u && !truncated);
+    return failed;
+}
+
+int test_block_index_projection_shard_01(void) { return bip_run_shard(0); }
+int test_block_index_projection_shard_02(void) { return bip_run_shard(1); }
+int test_block_index_projection_shard_03(void) { return bip_run_shard(2); }
+int test_block_index_projection_shard_04(void) { return bip_run_shard(3); }
+int test_block_index_projection_shard_05(void) { return bip_run_shard(4); }
+int test_block_index_projection_shard_06(void) { return bip_run_shard(5); }
+int test_block_index_projection_shard_07(void) { return bip_run_shard(6); }
+int test_block_index_projection_shard_08(void) { return bip_run_shard(7); }

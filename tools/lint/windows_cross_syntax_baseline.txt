@@ -1,0 +1,16 @@
+# check_windows_cross_syntax baseline — SHRINK-ONLY.
+#
+# One repo-relative path per line. These files still fail
+# x86_64-w64-mingw32-gcc -std=c2x -fsyntax-only after generated/tools
+# headers are made findable (-Itools) and missing openssl/*.h is skipped
+# when vendor openssl is not built. They are not Windows-syntax-clean
+# today; they are recorded so the rest of the _WIN32 set can be gated.
+#
+# A NEW failure not listed here fails the gate. A listed file that starts
+# compiling clean (or becomes only a skippable missing header) also fails
+# the gate — delete the row. Counts may only go DOWN. Adding a row is a
+# review decision, not a convenience, and is not a fix.
+
+# Empty: lib/test inputs are graded with the same force-included test-only
+# compatibility header as the native Windows test-fast build; production
+# inputs never receive that header.

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Copyright 2026 Rhett Creighton - Apache License 2.0
+#
+# Pre-commit guard — refuses ONE accident, in ONE situation, and is otherwise
+# silent.
+#
+# The accident: this project runs parallel automated helpers, each in its own
+# additional checkout created with `git worktree add`. Those helpers merge
+# FROM the primary checkout. If the primary checkout is left sitting on a side
+# branch, the next merge picks up that side branch instead of `main`.
+#
+# The situation therefore requires ALL of:
+#   1. this is the PRIMARY checkout — git-dir == git-common-dir. An additional
+#      checkout has git-dir = <common>/worktrees/<name>, so committing on any
+#      branch from one of those is always allowed.
+#   2. the branch here is not `main` (a detached HEAD counts as not-main).
+#   3. this repository actually HAS additional checkouts — `git worktree list`
+#      reports more than one. A plain clone has exactly one, no helper can be
+#      running in it, and there is no accident available to prevent, so
+#      `git checkout -b fix/thing && git commit` is simply allowed. This is
+#      the same shape as cognition/controllers/src/agent_copy_prove_controller.c,
+#      which earns its safety by making the dangerous input not exist rather
+#      than by warning about it.
+#   4. ZCL_LANE_COMMIT_OK is unset/empty — the deliberate-override valve.
+#
+# Activate:  make install-hooks   (sets core.hooksPath=tools/githooks)
+set -euo pipefail
+trap '' PIPE
+
+if [ -n "${ZCL_LANE_COMMIT_OK:-}" ]; then
+    exit 0
+fi
+
+git_dir="$(cd "$(git rev-parse --absolute-git-dir)" && pwd)"
+common_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+
+# An additional checkout -> normal work, any branch allowed.
+if [ "$git_dir" != "$common_dir" ]; then
+    exit 0
+fi
+
+branch="$(git symbolic-ref --short -q HEAD || true)"
+
+# Committing on main in the primary checkout -> normal work.
+if [ "$branch" = "main" ]; then
+    exit 0
+fi
+
+# No additional checkouts -> no parallel helper -> nothing to protect.
+checkouts="$(git worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)"
+if [ "${checkouts:-1}" -le 1 ]; then
+    exit 0
+fi
+
+echo "pre-commit: this commit was refused. To make it anyway, run:" >&2 || true
+echo "pre-commit:     ZCL_LANE_COMMIT_OK=1 git commit ..." >&2 || true
+echo "pre-commit:" >&2 || true
+echo "pre-commit: Why: you are in this repository's PRIMARY checkout, on branch" >&2 || true
+echo "pre-commit: '${branch:-a detached HEAD}' rather than 'main', and this repository" >&2 || true
+echo "pre-commit: currently has $checkouts checkouts (see: git worktree list)." >&2 || true
+echo "pre-commit: Automated helpers run in those other checkouts and merge from this" >&2 || true
+echo "pre-commit: one, so a side-branch commit made here can be merged by mistake." >&2 || true
+echo "pre-commit:" >&2 || true
+echo "pre-commit: Either commit on 'main' here, or give your branch its own checkout:" >&2 || true
+echo "pre-commit:     git worktree add .claude/worktrees/my-change -b fix/my-change main" >&2 || true
+echo "pre-commit:     cd .claude/worktrees/my-change      # commit there instead" >&2 || true
+exit 1

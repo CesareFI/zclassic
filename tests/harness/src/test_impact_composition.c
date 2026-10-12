@@ -1,0 +1,12692 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * test_impact_composition — adversarial proof that the two impact-planning
+ * systems COMPOSE honestly.
+ *
+ * The two systems both stay. Neither is a cache of the other:
+ *   A = cognition/controllers/include/controllers/agent_impact_rules.def, hand-
+ *       authored judgement mapping a changed PATH to TEST GROUP NAMES. Not
+ *       derivable from any graph; ~40% of the file is the rationale.
+ *   B = cognition/modules/codeindex/, a scanned call graph plus the compiler's own depfiles,
+ *       mapping a changed FILE to downstream FILES.
+ *
+ * What this group pins is the COMPOSITION, and specifically the four ways it
+ * used to lie:
+ *   T1  a bound firing threw the ENTIRE partial closure away, so five of twelve
+ *       representative changes — every hub header, all consensus crypto, and
+ *       sealed core — planned exactly as if the graph had never been consulted,
+ *       while reporting a plan.
+ *   T2  a `*.def` registry had no reverse closure at all, so editing the file
+ *       CLAUDE.md instructs every agent to edit selected nothing.
+ *   T3  the call graph is the only graph that was walked, so a macro-only
+ *       header (no callable symbol, therefore no callers) had a blast radius
+ *       of exactly itself.
+ *   T4  and the plan that resulted was still handed to callers as if it were
+ *       sufficient proof.
+ * T5 and T6 pin the two properties that make the fix reviewable: every selected
+ * group can say which dimension named it, and the union can never lose a group
+ * system A alone would have named.
+ *
+ * Every fixture below is a self-contained tree under test-tmp/: real source
+ * files, real compiler-style depfiles, a real index build. Nothing here reads
+ * the live repository index or the live datadir. */
+
+/* realpath() is declared by glibc only through the fortify inline unless a
+ * feature-test macro asks for it; without this the file compiles today by
+ * accident of -O2 and is a hard C23 error at -O0 or on another libc. Must
+ * precede the first #include, which is where <features.h> is read. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
+#include "test/test_core.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <utime.h>
+
+#include "base/hex.h"
+#include "base/safe_alloc.h"
+#include "codeindex/codeindex.h"
+#include "command/native_command.h"
+#include "command/native_dev_proof_command.h"
+#include "config/command_catalog.h"
+#include "controllers/agent_impact_harness.h"
+#include "controllers/agent_impact_rules.h"
+#include "dependency_links.h"
+#include "dev_proof.h"
+#include "dev_proof_budget.h"
+#include "dev_proof_receipt.h"
+#include "devloop.h"
+#include "json/json.h"
+#include "platform/disk_space.h"
+#include "platform/file_clone.h"
+#include "platform/ram_scratch.h"
+#include "platform/time_compat.h"
+#include "kernel/command_registry.h"
+#include "test/selection_build_needs.h"
+#include "test/semantic_fuzz.h"
+#include "test/testcache.h"
+#include "vcs/vcs_object.h"
+#include "test_group_catalog.h"
+#include "test_group_host_need.h"
+#include "util/clientversion.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#if !defined(_WIN32)
+#include <dirent.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/file.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#define IC_FIX_ROOT   "test-tmp/impact_composition"
+#define IC_FIX_TRUNC  IC_FIX_ROOT "/trunc"
+#define IC_FIX_GROUP  IC_FIX_ROOT "/groupcap"
+#define IC_FIX_DEF    IC_FIX_ROOT "/registry"
+#define IC_FIX_MACRO  IC_FIX_ROOT "/macro"
+#define IC_FIX_NODEPS IC_FIX_ROOT "/nodeps"
+#define IC_FIX_SNAPSHOT IC_FIX_ROOT "/snapshot"
+/* Two stand-in execution trees for the host-need contract: one as bare as a
+ * proof generation, one carrying the runtime binary a dev box has. */
+#define IC_FIX_HOST_BARE IC_FIX_ROOT "/host_bare"
+#define IC_FIX_HOST_FULL IC_FIX_ROOT "/host_full"
+
+/* ── fixture helpers ──────────────────────────────────────────────────── */
+
+static bool ic_write(const char *dir, const char *rel, const char *content)
+{
+    char full[4096];
+    snprintf(full, sizeof(full), "%s/%s", dir, rel);
+    for (char *p = full + 1; *p; p++) {
+        if (*p == '/') { *p = '\0'; mkdir(full, 0755); *p = '/'; }
+    }
+    FILE *f = fopen(full, "wb");
+    if (!f) return false;
+    if (content && content[0]) fwrite(content, 1, strlen(content), f);
+    fclose(f);
+    return true;
+}
+
+/* Whole-item membership in a comma-separated selector. A substring test would
+ * find `test_onion_pair_watch` inside `test_onion_pair_watch_live` and call a
+ * gated group selected. */
+static bool ic_selector_has(const char *selector, const char *full)
+{
+    size_t full_len = strlen(full);
+    for (const char *scan = selector; *scan;) {
+        const char *end = strchr(scan, ',');
+        size_t item_len = end ? (size_t)(end - scan) : strlen(scan);
+        if (item_len == full_len && memcmp(scan, full, full_len) == 0)
+            return true;
+        if (!end) break;
+        scan = end + 1;
+    }
+    return false;
+}
+
+/* The universal selector carries every catalog group except an umbrella
+ * whose shards it all carries: the shards are the umbrella's body, run
+ * concurrently, and the umbrella itself runs whole only when named exactly.
+ * True when `selector` is exactly that set minus `gated` host-gated groups
+ * (none of which is a shard or an umbrella), each umbrella absent and each
+ * of its shards present. */
+static bool ic_selector_is_universal(const char *selector, uint32_t selected,
+                                     size_t gated)
+{
+    size_t umbrellas = 0;
+    for (size_t i = 0; i < zcl_test_group_catalog_count(); i++) {
+        const char *full = zcl_test_group_catalog_at(i);
+        if (!zcl_test_group_is_umbrella(full))
+            continue;
+        umbrellas++;
+        if (ic_selector_has(selector, full) ||
+            zcl_test_group_umbrella_shard_count(full) < 2)
+            return false;
+        for (size_t k = 0; k < zcl_test_group_catalog_count(); k++)
+            if (zcl_test_group_is_umbrella_shard(
+                    full, zcl_test_group_catalog_at(k)) &&
+                !ic_selector_has(selector, zcl_test_group_catalog_at(k)))
+                return false;
+    }
+    return umbrellas > 0 &&
+           (size_t)selected == zcl_test_group_catalog_count() - umbrellas -
+                                   gated;
+}
+
+/* A tree shaped like a proof generation: real enough to name as a root, with
+ * no build/bin/z23 in it. */
+static bool ic_host_need_bare_root(const char *dir)
+{
+    char rm[4096];
+    (void)snprintf(rm, sizeof(rm), "rm -rf %s", dir);
+ TEST_DISCARD(system(rm));
+    return ic_write(dir, "Makefile", "# bare execution tree\n");
+}
+
+/* A tree shaped like a dev box: the runtime binary the pairing group needs is
+ * present, so the group's host need is met. The sentinel archive behind
+ * test_onion_persistence's real-Tor gate is present too: a full host links
+ * real Tor, and without the file the "full" fixture would silently stop
+ * being full the moment the gate row landed. */
+static bool ic_host_need_full_root(const char *dir)
+{
+    char rm[4096];
+    (void)snprintf(rm, sizeof(rm), "rm -rf %s", dir);
+ TEST_DISCARD(system(rm));
+    return ic_write(dir, "Makefile", "# dev execution tree\n") &&
+           ic_write(dir, "build/bin/z23", "#!/bin/sh\n") &&
+           ic_write(dir,
+                    "vendor/tor/src/ext/keccak-tiny/libkeccak-tiny.a",
+                    "archive\n");
+}
+
+static bool ic_fuzz_host_ready(void)
+{
+    struct zcl_test_group_host_need need;
+    return zcl_test_group_host_need("test_semantic_facts_fuzz", &need) &&
+           need.kind == ZCL_HOST_NEED_C23_TOOLCHAIN &&
+           zcl_test_group_host_need_met(IC_FIX_HOST_FULL, &need);
+}
+
+static bool ic_geli_host_ready(void)
+{
+    const char *packet = getenv("ZCL_TEST_GELI_FIXTURE_PACKET");
+    return packet && packet[0];
+}
+
+static bool ic_ports_host_ready(void)
+{
+    const char *kernel = getenv("ZCL_TEST_FREEBSD_PORT_FIXTURE_KERNEL");
+    return kernel && kernel[0];
+}
+
+
+static bool ic_release_host_ready(void)
+{
+    const char *kernel = getenv("ZCL_TEST_FREEBSD_RELEASE_KERNEL");
+    return kernel && kernel[0];
+}
+
+static bool ic_image_host_ready(void)
+{
+    const char *kernel = getenv("ZCL_TEST_PUBLIC_GUEST_IMAGE_KERNEL");
+    return kernel && kernel[0];
+}
+
+static unsigned ic_guest_host_missing(void)
+{
+    return !ic_geli_host_ready() + !ic_ports_host_ready() +
+           !ic_release_host_ready() + !ic_image_host_ready();
+}
+
+/* A guest-fixture group the host cannot run: its environment variable is unset. */
+static bool ic_guest_group_absent(const char *group)
+{
+    return (!ic_geli_host_ready() && strcmp(group, "test_rvmachine_geli_volume") == 0) ||
+           (!ic_ports_host_ready() && strcmp(group, "test_rvmachine_freebsd_ports") == 0) ||
+           (!ic_release_host_ready() && strcmp(group, "test_rvmachine_freebsd_release") == 0) ||
+           (!ic_image_host_ready() && strcmp(group, "test_guest_image_admission") == 0);
+}
+
+/* Each guest-fixture group is selected exactly when its variable is set and
+ * is listed as gated on that variable exactly when it is unset. */
+static bool ic_guest_groups_gated(const char *selector, const char *gated)
+{
+    static const struct { const char *group; const char *gate; bool (*ready)(void); } rows[] = {
+        {"test_rvmachine_geli_volume", "test_rvmachine_geli_volume:env:ZCL_TEST_GELI_FIXTURE_PACKET", ic_geli_host_ready},
+        {"test_rvmachine_freebsd_ports", "test_rvmachine_freebsd_ports:env:ZCL_TEST_FREEBSD_PORT_FIXTURE_KERNEL", ic_ports_host_ready},
+        {"test_rvmachine_freebsd_release", "test_rvmachine_freebsd_release:env:ZCL_TEST_FREEBSD_RELEASE_KERNEL", ic_release_host_ready},
+        {"test_guest_image_admission", "test_guest_image_admission:env:ZCL_TEST_PUBLIC_GUEST_IMAGE_KERNEL", ic_image_host_ready},
+    };
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++)
+        if (ic_selector_has(selector, rows[i].group) != rows[i].ready() ||
+            (strstr(gated, rows[i].gate) != NULL) == rows[i].ready())
+            return false;
+    return true;
+}
+
+static bool ic_bare_host_excludes(const char *group, bool fuzz_ready)
+{
+    return zcl_test_group_is_umbrella(group) ||
+           strcmp(group, "test_onion_pair_watch_live") == 0 ||
+           strcmp(group, "test_onion_persistence") == 0 ||
+           strcmp(group, "test_self_folded_anchor_heavy") == 0 ||
+           ic_guest_group_absent(group) ||
+           (!fuzz_ready && strcmp(group, "test_semantic_facts_fuzz") == 0);
+}
+
+static bool ic_full_host_selects(const char *group, bool fuzz_ready)
+{
+    return !zcl_test_group_is_umbrella(group) &&
+           !ic_guest_group_absent(group) &&
+           (fuzz_ready || strcmp(group, "test_semantic_facts_fuzz") != 0);
+}
+
+static void ic_elf_u64(uint8_t *out, uint64_t v)
+{
+    for (unsigned i = 0; i < 8; i++)
+        out[i] = (uint8_t)(v >> (8 * i));
+}
+
+static bool ic_elf_write(const char *path, const uint8_t *wire, size_t n)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+    bool ok = fwrite(wire, 1, n, f) == n;
+    return fclose(f) == 0 && ok;
+}
+
+/* A minimal ELF64 section and program table exercise their exact dynamic
+ * range binding, bytes after DT_NULL, and an invalid RUNPATH. */
+static int test_ic_fuzz_sensor_binding_parser(void)
+{
+    int failures = 0;
+    TEST_CASE("fuzz host gate: exact needed precedes DT_NULL and no path tag") {
+        static const char path[] = IC_FIX_ROOT "/sensor-binding.elf";
+        uint8_t wire[640] = {0};
+        ASSERT(mkdir(IC_FIX_ROOT, 0755) == 0 || errno == EEXIST);
+        memcpy(wire, "\177ELF", 4);
+        wire[4] = 2; wire[5] = 1;
+        ic_elf_u64(wire + 32, 448); /* program table */
+        ic_elf_u64(wire + 40, 256); /* section table */
+        wire[54] = 56; wire[56] = 2;
+        wire[58] = 64; wire[60] = 3; wire[62] = 1;
+        memcpy(wire + 65, "libclang-18.so.18",
+               sizeof("libclang-18.so.18"));
+        wire[320 + 4] = 3; /* section 1: dynamic string table */
+        ic_elf_u64(wire + 320 + 16, 0x1040);
+        ic_elf_u64(wire + 320 + 24, 64);
+        ic_elf_u64(wire + 320 + 32, 32);
+        wire[384 + 4] = 6; /* section 2: dynamic table, linked to 1 */
+        ic_elf_u64(wire + 384 + 24, 128);
+        ic_elf_u64(wire + 384 + 32, 80);
+        wire[384 + 40] = 1;
+        wire[448] = 2; /* PT_DYNAMIC */
+        ic_elf_u64(wire + 448 + 8, 128);
+        ic_elf_u64(wire + 448 + 16, 0x1080);
+        ic_elf_u64(wire + 448 + 32, 80);
+        ic_elf_u64(wire + 448 + 40, 80);
+        wire[504] = 1; /* PT_LOAD */
+        ic_elf_u64(wire + 504 + 16, 0x1000);
+        ic_elf_u64(wire + 504 + 32, sizeof(wire));
+        ic_elf_u64(wire + 504 + 40, sizeof(wire));
+        ic_elf_u64(wire + 128, 1); /* DT_NEEDED */
+        ic_elf_u64(wire + 136, 1); /* string offset */
+        ic_elf_u64(wire + 144, 5); /* DT_STRTAB */
+        ic_elf_u64(wire + 152, 0x1040);
+        ic_elf_u64(wire + 160, 10); /* DT_STRSZ */
+        ic_elf_u64(wire + 168, 32);
+        ASSERT(ic_elf_write(path, wire, sizeof(wire)));
+        ASSERT(sfz_elf_needs_without_runpath(path, "libclang-18.so.18"));
+        ASSERT(!sfz_elf_needs_without_runpath(path, "libclang-20.so.20"));
+        wire[56] = 3; /* an extra malformed PT_LOAD must fail closed */
+        wire[560] = 1;
+        ic_elf_u64(wire + 560 + 32, 16);
+        ic_elf_u64(wire + 560 + 40, 8);
+        ASSERT(ic_elf_write(path, wire, sizeof(wire)));
+        ASSERT(!sfz_elf_needs_without_runpath(path, "libclang-18.so.18"));
+        wire[56] = 2;
+        ic_elf_u64(wire + 448 + 16, 0x1090); /* loader maps other bytes */
+        ASSERT(ic_elf_write(path, wire, sizeof(wire)));
+        ASSERT(!sfz_elf_needs_without_runpath(path, "libclang-18.so.18"));
+        ic_elf_u64(wire + 448 + 16, 0x1080);
+        uint8_t swapped[56];
+        memcpy(swapped, wire + 448, sizeof(swapped));
+        memcpy(wire + 448, wire + 504, sizeof(swapped));
+        memcpy(wire + 504, swapped, sizeof(swapped));
+        ic_elf_u64(wire + 504 + 16, 0x1090); /* PT_LOAD before PT_DYNAMIC */
+        ASSERT(ic_elf_write(path, wire, sizeof(wire)));
+        ASSERT(!sfz_elf_needs_without_runpath(path, "libclang-18.so.18"));
+        ic_elf_u64(wire + 504 + 16, 0x1080);
+        ASSERT(ic_elf_write(path, wire, sizeof(wire)));
+        ASSERT(sfz_elf_needs_without_runpath(path, "libclang-18.so.18"));
+        memcpy(wire + 504, wire + 448, sizeof(swapped));
+        memcpy(wire + 448, swapped, sizeof(swapped));
+        ic_elf_u64(wire + 448 + 8, 144); /* loader points elsewhere */
+        ASSERT(ic_elf_write(path, wire, sizeof(wire)));
+        ASSERT(!sfz_elf_needs_without_runpath(path, "libclang-18.so.18"));
+        ic_elf_u64(wire + 448 + 8, 128);
+        ic_elf_u64(wire + 128, 0); /* DT_NULL before planted dependency */
+        ic_elf_u64(wire + 192, 1);
+        ic_elf_u64(wire + 200, 1);
+        ASSERT(ic_elf_write(path, wire, sizeof(wire)));
+        ASSERT(!sfz_elf_needs_without_runpath(path, "libclang-18.so.18"));
+        ic_elf_u64(wire + 128, 1);
+        ic_elf_u64(wire + 144, 29); /* DT_RUNPATH, even malformed */
+        ASSERT(ic_elf_write(path, wire, sizeof(wire)));
+        ASSERT(!sfz_elf_needs_without_runpath(path, "libclang-18.so.18"));
+        unlink(path);
+    } TEST_END
+    return failures;
+}
+
+/* The operator-provisioned fold fixture, present or absent. The path never has
+ * to exist: the declared need is that the assignment is made at all, exactly
+ * as the heavy leg reads it. This case owns the variable only for its own
+ * duration -- ic_host_fixture_save()/restore() put back whatever an operator
+ * running the suite had set, so no later group loses its fixture. */
+static void ic_host_fixture_env(bool present)
+{
+    if (present)
+        setenv("ZCL_SELF_FOLD_ANCHOR_FIXTURE",
+               IC_FIX_ROOT "/anchor.snapshot", 1);
+    else
+        unsetenv("ZCL_SELF_FOLD_ANCHOR_FIXTURE");
+}
+
+static bool ic_host_fixture_save(char *saved, size_t saved_len)
+{
+    const char *current = getenv("ZCL_SELF_FOLD_ANCHOR_FIXTURE");
+    saved[0] = '\0';
+    if (!current) return false;
+    (void)snprintf(saved, saved_len, "%s", current);
+    return true;
+}
+
+static void ic_host_fixture_restore(const char *saved, bool was_set)
+{
+    if (was_set)
+        setenv("ZCL_SELF_FOLD_ANCHOR_FIXTURE", saved, 1);
+    else
+        unsetenv("ZCL_SELF_FOLD_ANCHOR_FIXTURE");
+}
+
+#if !defined(_WIN32)
+/* Proof state uses private write_atomic outputs, independent of the caller's
+ * umask. Fixtures must carry that same mode before testing trusted evidence. */
+static bool ic_proof_private_write(const char *dir, const char *rel,
+                                    const char *content)
+{
+    char path[4096];
+    int len = snprintf(path, sizeof(path), "%s/%s", dir, rel);
+    return len > 0 && (size_t)len < sizeof(path) &&
+           ic_write(dir, rel, content) && chmod(path, 0600) == 0;
+}
+#endif
+
+static bool ic_group_in(const char (*groups)[ZCL_DEVLOOP_GROUP_MAX],
+                        size_t len, const char *g)
+{
+    for (size_t i = 0; i < len; i++)
+        if (strcmp(groups[i], g) == 0)
+            return true;
+    return false;
+}
+
+/* Union membership across BOTH group arrays — the composed plan. */
+static bool ic_planned(const struct zcl_devloop_plan *p, const char *g)
+{
+    return ic_group_in(p->path_groups, p->path_groups_len, g) ||
+           ic_group_in(p->closure_groups, p->closure_groups_len, g);
+}
+
+static const struct zcl_devloop_selection *ic_selection(
+    const struct zcl_devloop_plan *p, const char *group)
+{
+    for (size_t i = 0; i < p->selections_len; i++)
+        if (strcmp(p->selections[i].group, group) == 0)
+            return &p->selections[i];
+    return NULL;
+}
+
+/* The two leaves every fixture shares: a definition site and one caller of it
+ * that carries its own distinct impact-rule group ("download"). */
+static bool ic_write_call_pair(const char *root)
+{
+    return ic_write(root, "core/modules/net/src/tor_integration.c",
+                    "/* tor fixture */\n"
+                    "#include \"net/clp.h\"\n"
+                    "int tor_leaf(int x) { return x + 1; }\n") &&
+           ic_write(root, "core/modules/net/src/download.c",
+                    "/* download fixture */\n"
+                    "#include \"net/clp.h\"\n"
+                    "int dl_top(int x) { return tor_leaf(x) * 2; }\n") &&
+           ic_write(root, "core/modules/net/include/net/clp.h",
+                    "#ifndef NET_CLP_H\n#define NET_CLP_H\n"
+                    "int tor_leaf(int x);\nint dl_top(int x);\n#endif\n");
+}
+
+/* Compiler-style depfiles. Prerequisite lists are transitively flattened by
+ * the real compiler, and these mirror that: the TU on the left, every byte it
+ * read on the right. */
+static bool ic_write_depfiles(const char *root)
+{
+    return ic_write(root, "build/obj/tor_integration.d",
+                    "build/obj/tor_integration.o: "
+                    "core/modules/net/src/tor_integration.c "
+                    "core/modules/net/include/net/clp.h\n") &&
+           ic_write(root, "build/obj/download.d",
+                    "build/obj/download.o: core/modules/net/src/download.c "
+                    "core/modules/net/include/net/clp.h\n");
+}
+
+/* ── T1: a truncated closure keeps what the partial walk found ────────── */
+
+/* Two independent bounds discard evidence, and BOTH used to zero the group
+ * set. This fixture fires the first: one symbol with more call sites than the
+ * engine's per-query fan-out batch, so codeindex_impact_closure reports
+ * truncated while still returning a real, useful impacted-file set. */
+static bool ic_write_fanout_caller(const char *root)
+{
+    /* Sorts AFTER download.c so the bounded caller query still reaches it —
+     * otherwise the fan-out file alone would fill the batch and the assertion
+     * below would be testing nothing. */
+    const size_t calls = 5000;
+    size_t cap = calls * 16 + 256;
+    char *body = malloc(cap);
+    if (!body) return false;
+    size_t pos = 0;
+    pos += (size_t)snprintf(body + pos, cap - pos,
+                            "/* fan-out fixture */\n"
+                            "#include \"net/clp.h\"\n"
+                            "int zbig(int x) { return x");
+    for (size_t i = 0; i < calls && pos + 32 < cap; i++)
+        pos += (size_t)snprintf(body + pos, cap - pos, "+tor_leaf(%d)", 1);
+    (void)snprintf(body + pos, cap - pos, "; }\n");
+    bool ok = ic_write(root, "core/modules/net/src/zbigfanout.c", body);
+    free(body);
+    return ok;
+}
+
+static int test_ic_truncated_closure_preserves_groups(void)
+{
+    int failures = 0;
+    TEST("impact composition: a truncated closure KEEPS the groups it found") {
+ TEST_DISCARD(system("rm -rf " IC_FIX_TRUNC));
+        ASSERT(ic_write_call_pair(IC_FIX_TRUNC));
+        ASSERT(ic_write_depfiles(IC_FIX_TRUNC));
+        ASSERT(ic_write_fanout_caller(IC_FIX_TRUNC));
+
+        const char *files[] = { "core/modules/net/src/tor_integration.c" };
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                           "test_tor"));
+
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_TRUNC, files, 1, &plan));
+        ASSERT(plan.closure_attempted);
+
+        /* The bound really fired — otherwise this whole case proves nothing.
+         * A capacity bound is answered by the universal closure, so the
+         * dimension is COMPLETE and says which answer it gave. */
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+               ZCL_DEVLOOP_DIM_COMPLETE);
+        ASSERT(strcmp(plan.dims[ZCL_DEVLOOP_DIM_SEMANTIC].reason,
+                      "closure-universal") == 0);
+        ASSERT(plan.closure_universal);
+        ASSERT(!plan.closure_truncated);
+
+        /* C1, the whole point: INCOMPLETE is not EMPTY. The partial walk
+         * reached download.c, so "download" is planned. Before this change the
+         * group set was zeroed the instant truncation was seen, and the plan
+         * silently degraded to the path floor. */
+        ASSERT(plan.closure_groups_len > 0);
+        ASSERT(ic_planned(&plan, "download"));
+
+        /* And the path floor is still whole. */
+        ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                           "test_tor"));
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_TRUNC));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_closure_capacity_follows_corpus(void)
+{
+    int failures = 0;
+    TEST("impact composition: planner capacity follows the verified corpus") {
+        ASSERT(zcl_devloop_test_closure_file_cap(2050, 1) == 2051);
+        ASSERT(zcl_devloop_test_closure_file_cap(0, 0) == 1);
+        ASSERT(zcl_devloop_test_closure_file_cap(
+                   CI_IMPACT_CLOSURE_MAX_FILES, 1) ==
+               CI_IMPACT_CLOSURE_MAX_FILES);
+        ASSERT(zcl_devloop_test_closure_file_cap(-1, 1) == -1);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A representative high-fanout graph plan must retain substantially more
+ * groups than the direct path floor without becoming incomplete. */
+static const char *const ic_many_group_files[] = {
+    "tests/harness/src/test_simnet_wire_ibd.c",
+    "tests/harness/src/test_importblockindex_roundtrip.c",
+    "tests/harness/src/test_validate_script_hash_split_repair.c",
+    "tests/harness/src/test_subsystem_snapshot.c",
+    "tests/harness/src/test_stage_crash_sweep.c",
+    "tests/harness/src/test_stage_anchor_frontier_cap.c",
+    "tests/harness/src/test_sqlite.c",
+    "tests/harness/src/test_simnet_wallet_reorg.c",
+    "tests/harness/src/test_simnet_value_inflation.c",
+    "tests/harness/src/test_simnet_mempool_adv.c",
+    "tests/harness/src/test_simnet_input_value_range.c",
+    "tests/harness/src/test_simnet_fee_range.c",
+    "tests/harness/src/test_simnet_empty_vin_vout.c",
+    "tests/harness/src/test_simnet_duplicate_input.c",
+    "tests/harness/src/test_simnet_doublespend.c",
+    "tests/harness/src/test_simnet_cluster_reorg.c",
+    "tests/harness/src/test_simnet_cluster.c",
+    "tests/harness/src/test_simnet_chained_tx.c",
+    "tests/harness/src/test_simnet_block_sigops.c",
+    "tests/harness/src/test_self_folded_anchor.c",
+    "tests/harness/src/test_rom_manifest.c",
+    "tests/harness/src/test_simnet_fuzz.c",
+    "tests/harness/src/test_command_handler_snapshot.c",
+    "tests/harness/src/test_pow_diffadj_precedence.c",
+    "tests/harness/src/test_always_sync_lifecycle.c",
+    "tests/harness/src/test_read_leaf_no_datadir_write.c",
+    "tests/harness/src/test_crypto_registry.c",
+    "tests/harness/src/test_sprout_groth16_kat.c",
+    "tests/harness/src/test_transaction_wire_evidence.c",
+    "tests/harness/src/test_net.c",
+    "tests/harness/src/test_api_query_filters.c",
+    "tests/harness/src/test_bip34_coinbase_height_parity.c",
+    "tests/harness/src/test_canary_sentinel_watch.c",
+    "tests/harness/src/test_block_locator_bounds.c",
+    "tests/harness/src/test_mint_anchor_preflight.c",
+    "tests/harness/src/test_contaminated_coin_above_anchor.c",
+    "tests/harness/src/test_reducer_frontier_reconcile_light.c",
+    "tests/harness/src/test_reducer_reconcile_witness.c",
+    "tests/harness/src/test_refold_progress_floor.c",
+    "tests/harness/src/test_refold_retro_validate.c",
+    "tests/harness/src/test_reorg_residue_tipfin_replace.c",
+    "tests/harness/src/test_kill9_recovery.c",
+    "tests/harness/src/test_block_swarm_loopback.c",
+    "tests/harness/src/test_test_zmsg_memo_codec.c",
+    "tests/harness/src/test_mesh_private_object_grant_pipeline.c",
+    "tests/harness/src/test_json.c",
+    "tests/harness/src/test_rpc.c",
+    "tests/harness/src/test_coinbase_subsidy_adversarial.c",
+    "tests/harness/src/test_accept_to_mempool.c",
+    "tests/harness/src/test_mempool.c",
+    "tests/harness/src/test_merkle_tree.c",
+    "tests/harness/src/test_parity_lockin_anchor_membership.c",
+    "tests/harness/src/test_sync_service.c",
+    "tests/harness/src/test_principal_authz.c",
+    "tests/harness/src/test_auth_login.c",
+    "tests/harness/src/test_command_authority.c",
+    "tests/harness/src/test_importblockindex_roundtrip.c",
+    "tests/harness/src/test_cli_auth_robust.c",
+    "tests/harness/src/test_chain.c",
+    "tests/harness/src/test_chain_evidence_controller.c",
+    "tests/harness/src/test_fast_sync.c",
+    "tests/harness/src/test_keystone_utxo_binding.c",
+    "tests/harness/src/test_loader_owns_seed_gate.c",
+    "tests/harness/src/test_mmb.c",
+    "tests/harness/src/test_utxo_snapshot_loader.c",
+    "tests/harness/src/test_code_capsule.c",
+    "tests/harness/src/test_zcode_commons_projection.c",
+    "tests/harness/src/test_zcode_family_admission.c",
+    "tests/harness/src/test_zcode_swarm_net.c",
+    "tests/harness/src/test_sprout_phgr13_kat.c",
+    "tests/harness/src/test_store_buyer.c",
+    "tests/harness/src/test_directory_watcher.c",
+    "tests/harness/src/test_watcher_record.c",
+    "tests/harness/src/test_read_mapping_positioned.c",
+    "tests/harness/src/test_running_image_positioned.c",
+    "tests/harness/src/test_socket_resolve.c",
+    "tests/harness/src/test_private_link_no_clobber.c",
+    "tests/harness/src/test_replay_receipt_root.c",
+    "tests/harness/src/test_file_ops_copy.c",
+    "tests/harness/src/test_boot_refusal_identity.c",
+    "tests/harness/src/test_boot_shutdown_marker_persistence.c",
+    "tests/harness/src/test_rom_fetch_onion.c",
+    "tests/harness/src/test_zcode_sovereignty_policy.c",
+    "tests/harness/src/test_script.c",
+    "tests/harness/src/test_zendp.c",
+    "tests/harness/src/test_node_character.c",
+    "tests/harness/src/test_metaverse_vocabulary_bits.c",
+    "tests/harness/src/test_code_have.c",
+    "tests/harness/src/test_mutation_harness.c",
+};
+
+static int test_ic_large_plan_preserves_groups(void)
+{
+    int failures = 0;
+    TEST("impact composition: a large graph plan keeps complete groups") {
+ TEST_DISCARD(system("rm -rf " IC_FIX_GROUP));
+        ASSERT(ic_write_call_pair(IC_FIX_GROUP));
+        ASSERT(ic_write_depfiles(IC_FIX_GROUP));
+
+        size_t n = sizeof(ic_many_group_files) /
+                   sizeof(ic_many_group_files[0]);
+        for (size_t i = 0; i < n; i++) {
+            char body[256];
+            (void)snprintf(body, sizeof(body),
+                           "/* many-group fixture */\n"
+                           "#include \"net/clp.h\"\n"
+                           "int mg_%zu(int x) { return tor_leaf(x); }\n", i);
+            ASSERT(ic_write(IC_FIX_GROUP, ic_many_group_files[i], body));
+        }
+
+        const char *files[] = { "core/modules/net/src/tor_integration.c" };
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_GROUP, files, 1, &plan));
+
+        ASSERT(plan.closure_groups_len > ZCL_AGENT_IMPACT_MAX_GROUPS);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+               ZCL_DEVLOOP_DIM_COMPLETE);
+        ASSERT(ic_planned(&plan, "download"));
+
+        struct zcl_devloop_plan direct;
+        ASSERT(zcl_devloop_plan_files(ic_many_group_files, n, &direct));
+        ASSERT(direct.path_groups_len > ZCL_AGENT_IMPACT_MAX_GROUPS);
+        ASSERT(direct.dims[ZCL_DEVLOOP_DIM_OPAQUE].status ==
+               ZCL_DEVLOOP_DIM_COMPLETE);
+
+        /* Regression: the exact execution list is droppable presentation,
+         * while the closure and completeness verdict are mandatory evidence.
+         * Rendering a high-fanout valid plan must abridge the former instead
+         * of returning an empty document/INVALID_FILE_SET. */
+        char body[ZCL_DEVLOOP_PLAN_WIRE_MAX + 1];
+        size_t body_len = zcl_devloop_plan_json_closure(
+            IC_FIX_GROUP, files, 1, body, sizeof(body));
+        ASSERT(body_len > 0 && body_len <= ZCL_DEVLOOP_PLAN_WIRE_MAX);
+        ASSERT(strstr(body, "\"closure_groups\":[") != NULL);
+        ASSERT(strstr(body, "\"dimensions\":[") != NULL);
+        ASSERT(strstr(body, "\"execution_groups_abridged\":") != NULL);
+
+        /* Rendering the plan the caller already closed must produce the SAME
+         * document byte for byte. It has to, because the only reason a proof
+         * may render instead of re-closing is that the two are the same
+         * answer -- and re-closing costs a second code-index open plus a
+         * second walk of the whole reverse-caller graph. */
+        char rendered[ZCL_DEVLOOP_PLAN_WIRE_MAX + 1];
+        size_t rendered_len = zcl_devloop_plan_json_render(
+            &plan, files, 1, rendered, sizeof(rendered));
+        ASSERT(rendered_len == body_len);
+        ASSERT(memcmp(rendered, body, body_len) == 0);
+
+        /* "selects": the answer is over the COMPLETE plan, so a group that
+         * only the unlisted tail of the abridged closure names is still
+         * "selected". (d) No question asked, no member in the reply. */
+        ASSERT(strstr(body, "\"closure_groups_abridged\":true") != NULL);
+        ASSERT(strstr(body, "\"selects") == NULL);
+        ASSERT(plan.closure_groups_len > 48);
+        const char *tail = plan.closure_groups[plan.closure_groups_len - 1];
+        char want[ZCL_DEVLOOP_PLAN_WIRE_MAX + 1];
+        char needle[ZCL_DEVLOOP_GROUP_MAX + 64];
+        /* (a) selected, and not among the 48 the reply lists. */
+        for (size_t i = 0; i < 48; i++)
+            ASSERT(strcmp(plan.closure_groups[i], tail) != 0);
+        size_t want_len = zcl_devloop_plan_json_closure_selects(
+            IC_FIX_GROUP, files, 1, tail, want, sizeof(want));
+        ASSERT(want_len > 0 && want_len <= ZCL_DEVLOOP_PLAN_WIRE_MAX);
+        (void)snprintf(needle, sizeof(needle),
+                       "\"selects\":\"%s\",\"selects_answer\":\"selected\"}",
+                       tail);
+        ASSERT(strcmp(want + want_len - strlen(needle), needle) == 0);
+        ASSERT(strcmp(zcl_devloop_plan_selects_answer(&plan, tail),
+                      "selected") == 0);
+        /* (b) a catalog group outside the plan, (c) a made-up id. */
+        const char *outside = NULL;
+        for (size_t i = 0; i < zcl_test_group_catalog_count() && !outside;
+             i++) {
+            const char *full = zcl_test_group_catalog_at(i);
+            bool in = false;
+            for (size_t g = 0; g < plan.path_groups_len && !in; g++)
+                in = zcl_test_group_plan_selects(plan.path_groups[g], full);
+            for (size_t g = 0; g < plan.closure_groups_len && !in; g++)
+                in = zcl_test_group_plan_selects(plan.closure_groups[g], full);
+            if (!in)
+                outside = full;
+        }
+        ASSERT(outside != NULL);
+        ASSERT(strcmp(zcl_devloop_plan_selects_answer(&plan, outside),
+                      "not_selected") == 0);
+        ASSERT(strcmp(zcl_devloop_plan_selects_answer(&plan,
+                                                      "no_such_group_xyz"),
+                      "unknown_group") == 0);
+        want_len = zcl_devloop_plan_json_closure_selects(
+            IC_FIX_GROUP, files, 1, "no_such_group_xyz", want, sizeof(want));
+        ASSERT(want_len > 0);
+        ASSERT(strstr(want, "\"selects\":\"no_such_group_xyz\","
+                            "\"selects_answer\":\"unknown_group\"}") != NULL);
+
+        /* An invalid execution set (a plan token no catalog group expands)
+         * is "plan_invalid" for a real catalog group, never "not_selected";
+         * an unknown id stays "unknown_group". Built directly on the plan
+         * struct: no fixture produces execution_set_valid:false. */
+        char saved[ZCL_DEVLOOP_GROUP_MAX];
+        memcpy(saved, plan.closure_groups[0], sizeof(saved));
+        (void)snprintf(plan.closure_groups[0], ZCL_DEVLOOP_GROUP_MAX, "%s",
+                       "no_such_plan_token_xyz");
+        ASSERT(strcmp(zcl_devloop_plan_selects_answer(&plan, outside),
+                      "plan_invalid") == 0);
+        ASSERT(strcmp(zcl_devloop_plan_selects_answer(&plan, tail),
+                      "plan_invalid") == 0);
+        ASSERT(strcmp(zcl_devloop_plan_selects_answer(&plan,
+                                                      "no_such_group_xyz"),
+                      "unknown_group") == 0);
+        memcpy(plan.closure_groups[0], saved, sizeof(saved));
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_GROUP));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_needs_have(const struct zcl_test_group_host_need *needs,
+                          size_t n, const char *target, const char *artifact);
+
+static int test_ic_jsonq_exec_contract(void)
+{
+    int failures = 0;
+    TEST("impact composition: jsonq source and adapter require real query execution") {
+        const char *paths[] = {
+            "tools/jsonq.c", "tests/harness/src/test_jsonq.c",
+            "tests/harness/include/test/jsonq_fixture_adapter.h"
+        };
+        for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+            struct zcl_devloop_plan plan;
+            ASSERT(zcl_devloop_plan_files(&paths[i], 1, &plan));
+            ASSERT(ic_planned(&plan, "jsonq"));
+            ASSERT(ic_planned(&plan, "make_lint_gates"));
+        }
+        struct zcl_test_group_host_need needs[16];
+        size_t n = 0;
+        ASSERT(zcl_test_selection_build_needs("test_jsonq", false, NULL,
+                                              needs, 16, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "jsonq", "build/bin/jsonq"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_command_latency_scope_is_precise(void)
+{
+    int failures = 0;
+    TEST("impact composition: command latency follows only latency owners") {
+        const char *code_files[] = { "cognition/modules/codeindex/src/codeindex.c" };
+        struct zcl_devloop_plan code_plan;
+        ASSERT(zcl_devloop_plan_files(code_files, 1, &code_plan));
+        ASSERT(ic_planned(&code_plan, "command_registry_catalog"));
+        ASSERT(ic_planned(&code_plan, "command_registry_latency"));
+
+        const char *zcode_files[] = {
+            "tools/command/native_zcode_dev_command.c"
+        };
+        struct zcl_devloop_plan zcode_plan;
+        ASSERT(zcl_devloop_plan_files(zcode_files, 1, &zcode_plan));
+        ASSERT(ic_planned(&zcode_plan, "command_registry_catalog"));
+        ASSERT(!ic_planned(&zcode_plan, "command_registry_latency"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── T2: a .def registry's dependents ARE found ───────────────────────── */
+
+static int test_ic_registry_def_has_dependents(void)
+{
+    int failures = 0;
+    TEST("impact composition: a .def registry reaches its dependents") {
+ TEST_DISCARD(system("rm -rf " IC_FIX_DEF));
+        ASSERT(ic_write_call_pair(IC_FIX_DEF));
+        /* A registry with the shape the tree actually uses: X-macro rows, no
+         * C declarations, `#include`d by exactly one translation unit. */
+        ASSERT(ic_write(IC_FIX_DEF,
+                        "engine/controllers/include/controllers/ic_rows.def",
+                        "/* registry fixture */\n"
+                        "IC_ROW(alpha, 1)\n"
+                        "IC_ROW(beta, 2)\n"));
+        /* The compiler read the registry while building download.c. */
+        ASSERT(ic_write(IC_FIX_DEF, "build/obj/tor_integration.d",
+                        "build/obj/tor_integration.o: "
+                        "core/modules/net/src/tor_integration.c "
+                        "core/modules/net/include/net/clp.h\n"));
+        ASSERT(ic_write(IC_FIX_DEF, "build/obj/download.d",
+                        "build/obj/download.o: core/modules/net/src/download.c "
+                        "core/modules/net/include/net/clp.h "
+                        "engine/controllers/include/controllers/ic_rows.def\n"));
+
+        struct codeindex *ci = codeindex_open(IC_FIX_DEF);
+        ASSERT(ci != NULL);
+
+        /* The call graph has nothing to say — a registry defines no callable
+         * symbol, so its reverse-caller closure is exactly itself. That is a
+         * correct answer to the wrong question, and used to be the ONLY
+         * question asked. */
+        char changed[1][256];
+        (void)snprintf(changed[0], sizeof(changed[0]),
+                       "engine/controllers/include/controllers/ic_rows.def");
+        static char impacted[64][256];
+        bool trunc = false;
+        int nc = codeindex_impact_closure(ci, changed, 1, 0, impacted, 64,
+                                          &trunc);
+        ASSERT(nc == 1);
+
+        /* The include dimension answers it. */
+        static char deps[64][256];
+        enum codeindex_include_dim dim = CODEINDEX_INCLUDE_DIM_UNAVAILABLE;
+        int nd = codeindex_reverse_includes(
+            ci, "engine/controllers/include/controllers/ic_rows.def", deps, 64,
+            &dim);
+        ASSERT(nd == 1);
+        ASSERT(dim == CODEINDEX_INCLUDE_DIM_COMPLETE);
+        ASSERT(strcmp(deps[0], "core/modules/net/src/download.c") == 0);
+        codeindex_close(ci);
+
+        /* And the composed plan selects download.c's group, through the
+         * INCLUDE dimension, naming the file it came through. */
+        const char *files[] = {
+            "engine/controllers/include/controllers/ic_rows.def"
+        };
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_DEF, files, 1, &plan));
+        ASSERT(ic_planned(&plan, "download"));
+        const struct zcl_devloop_selection *sel = ic_selection(&plan,
+                                                               "download");
+        ASSERT(sel != NULL);
+        ASSERT(sel->dim == ZCL_DEVLOOP_DIM_INCLUDE);
+        ASSERT(strcmp(sel->via, "core/modules/net/src/download.c") == 0);
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_DEF));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── T3: a macro-only header's dependents ARE found ───────────────────── */
+
+static int test_ic_macro_only_header_has_dependents(void)
+{
+    int failures = 0;
+    TEST("impact composition: a macro-only header reaches its dependents") {
+ TEST_DISCARD(system("rm -rf " IC_FIX_MACRO));
+        ASSERT(ic_write_call_pair(IC_FIX_MACRO));
+        /* No prototypes, no typedefs, no callable symbol of any kind: the call
+         * graph cannot see this file, by construction. */
+        ASSERT(ic_write(IC_FIX_MACRO, "core/modules/net/include/net/ic_macros.h",
+                        "#ifndef NET_IC_MACROS_H\n#define NET_IC_MACROS_H\n"
+                        "#define IC_WINDOW 4096\n"
+                        "#define IC_DOUBLE(x) ((x) * 2)\n"
+                        "#endif\n"));
+        ASSERT(ic_write(IC_FIX_MACRO, "build/obj/tor_integration.d",
+                        "build/obj/tor_integration.o: "
+                        "core/modules/net/src/tor_integration.c "
+                        "core/modules/net/include/net/clp.h\n"));
+        ASSERT(ic_write(IC_FIX_MACRO, "build/obj/download.d",
+                        "build/obj/download.o: core/modules/net/src/download.c "
+                        "core/modules/net/include/net/clp.h "
+                        "core/modules/net/include/net/ic_macros.h\n"));
+
+        struct codeindex *ci = codeindex_open(IC_FIX_MACRO);
+        ASSERT(ci != NULL);
+
+        char changed[1][256];
+        (void)snprintf(changed[0], sizeof(changed[0]),
+                       "core/modules/net/include/net/ic_macros.h");
+        static char impacted[64][256];
+        bool trunc = false;
+        int nc = codeindex_impact_closure(ci, changed, 1, 0, impacted, 64,
+                                          &trunc);
+        ASSERT(nc == 1);  /* call graph: the file and nothing else */
+
+        static char deps[64][256];
+        enum codeindex_include_dim dim = CODEINDEX_INCLUDE_DIM_UNAVAILABLE;
+        int nd = codeindex_reverse_includes(ci,
+                                            "core/modules/net/include/net/ic_macros.h",
+                                            deps, 64, &dim);
+        ASSERT(nd == 1);
+        ASSERT(dim == CODEINDEX_INCLUDE_DIM_COMPLETE);
+        ASSERT(strcmp(deps[0], "core/modules/net/src/download.c") == 0);
+        codeindex_close(ci);
+
+        const char *files[] = { "core/modules/net/include/net/ic_macros.h" };
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_MACRO, files, 1, &plan));
+        ASSERT(ic_planned(&plan, "download"));
+        const struct zcl_devloop_selection *sel = ic_selection(&plan,
+                                                               "download");
+        ASSERT(sel != NULL);
+        ASSERT(sel->dim == ZCL_DEVLOOP_DIM_INCLUDE);
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_MACRO));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── T4: an incomplete dimension makes the plan REFUSE to be proof ────── */
+
+static int test_ic_incomplete_dimension_refuses_proof(void)
+{
+    int failures = 0;
+    TEST("impact composition: an incomplete dimension refuses to be proof") {
+        /* (a) a complete fixture is admissible — the positive control, so a
+         * blanket "always refuse" cannot pass this case. */
+ TEST_DISCARD(system("rm -rf " IC_FIX_MACRO));
+        ASSERT(ic_write_call_pair(IC_FIX_MACRO));
+        ASSERT(ic_write_depfiles(IC_FIX_MACRO));
+        const char *files[] = { "core/modules/net/src/tor_integration.c" };
+        struct zcl_devloop_plan good;
+        ASSERT(zcl_devloop_plan_files(files, 1, &good));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_MACRO, files, 1, &good));
+        const char *why = "unset";
+        ASSERT(zcl_devloop_plan_proof_admissible(&good, &why));
+        ASSERT(strcmp(why, "") == 0);
+
+        /* (b) a CAPACITY-bounded closure is a different fact from a missing
+         * one: the index answered, and its answer was "more than this plan can
+         * list". The universal closure is the sound reading of that, so the
+         * plan stays admissible — and covers everything. */
+ TEST_DISCARD(system("rm -rf " IC_FIX_TRUNC));
+        ASSERT(ic_write_call_pair(IC_FIX_TRUNC));
+        ASSERT(ic_write_depfiles(IC_FIX_TRUNC));
+        ASSERT(ic_write_fanout_caller(IC_FIX_TRUNC));
+        struct zcl_devloop_plan cut;
+        ASSERT(zcl_devloop_plan_files(files, 1, &cut));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_TRUNC, files, 1, &cut));
+        why = "unset";
+        ASSERT(zcl_devloop_plan_proof_admissible(&cut, &why));
+        ASSERT(cut.closure_universal);
+        /* Widening did NOT cost the evidence the partial walk found. */
+        ASSERT(ic_planned(&cut, "download"));
+
+        /* (c) the vocabulary the result cache uses for a truncated closure is
+         * still the ONE word for that condition, and it is still spoken —
+         * codeindex reports it to the planner, which is what triggers the
+         * universal answer above. Pinned here so the two cannot drift. */
+        ASSERT(strcmp("closure-truncated",
+                      testcache_reason_label(TESTCACHE_R_TRUNCATED)) == 0);
+
+        /* (d) no depfiles at all: the include dimension was never answerable,
+         * which is a different fact from "nothing depends on this". Same
+         * refusal, and again the same word the result cache uses. */
+ TEST_DISCARD(system("rm -rf " IC_FIX_NODEPS));
+        ASSERT(ic_write_call_pair(IC_FIX_NODEPS));
+        const char *header_files[] = { "core/modules/net/include/net/net.h" };
+        ASSERT(ic_write(IC_FIX_NODEPS, header_files[0],
+                        "/* present input, no depfiles */\n"));
+        struct zcl_devloop_plan bare;
+        ASSERT(zcl_devloop_plan_files(header_files, 1, &bare));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_NODEPS, header_files, 1,
+                                            &bare));
+        why = "unset";
+        ASSERT(!zcl_devloop_plan_proof_admissible(&bare, &why));
+        ASSERT(strcmp(why, "no-include-graph") == 0);
+        ASSERT(strcmp(why,
+                      testcache_reason_label(TESTCACHE_R_NO_INCLUDE_GRAPH)) == 0);
+        /* Still runs the tests the path floor named. */
+        ASSERT(ic_group_in(bare.path_groups, bare.path_groups_len, "net"));
+
+        /* (e) a plan that never consulted the graph at all must not read as
+         * proof that it did. */
+        struct zcl_devloop_plan unasked;
+        ASSERT(zcl_devloop_plan_files(files, 1, &unasked));
+        why = "unset";
+        ASSERT(!zcl_devloop_plan_proof_admissible(&unasked, &why));
+        ASSERT(strcmp(why, "closure-not-attempted") == 0);
+
+        /* (f) the refusal reaches the wire: a consumer reading only the JSON
+         * gets the same verdict. */
+        char body[65536];
+        size_t n = zcl_devloop_plan_json_closure(IC_FIX_NODEPS, header_files, 1,
+                                                 body, sizeof(body));
+        ASSERT(n > 0 && n < sizeof(body));
+        ASSERT(strstr(body, "\"proof_admissible\":false") != NULL);
+        ASSERT(strstr(body, "\"proof_refusal\":\"no-include-graph\"") != NULL);
+        ASSERT(strstr(body, "\"live_eligible\":false") != NULL);
+        ASSERT(strstr(body, "\"closure_universal\":false") != NULL);
+
+        /* (g) and so does the capacity answer, which is NOT a refusal. */
+        n = zcl_devloop_plan_json_closure(IC_FIX_TRUNC, files, 1, body,
+                                          sizeof(body));
+        ASSERT(n > 0 && n < sizeof(body));
+        ASSERT(strstr(body, "\"proof_admissible\":true") != NULL);
+        ASSERT(strstr(body, "\"closure_universal\":true") != NULL);
+        ASSERT(strstr(body, "\"closure_truncated\":false") != NULL);
+        ASSERT(strstr(body, "\"execution_selector\":\"universal\"") != NULL);
+        ASSERT(strstr(body, "\"live_eligible\":false") != NULL);
+        ASSERT(strstr(body,
+                      "\"why_not_live\":\"consensus_or_chain_state_is_never_swappable\"")
+               != NULL);
+        ASSERT(strstr(body,
+                      "\"why_not_live_path\":\"core/modules/net/src/tor_integration.c\"")
+               != NULL);
+        ASSERT(strstr(body,
+                      "\"agent_next_action\":\"z23-dev dev begin\"")
+               != NULL);
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_TRUNC));
+ TEST_DISCARD(system("rm -rf " IC_FIX_MACRO));
+ TEST_DISCARD(system("rm -rf " IC_FIX_NODEPS));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── T4b: CAPACITY is answered by the universal closure ────────────────
+ *
+ * Two bounds mean "this change reaches more than the plan can enumerate":
+ * the reverse-caller walk filling a per-query batch, and the group array
+ * filling. Neither is missing evidence — the index answered both times. The
+ * sound, fail-closed reading is that EVERY group is impacted, and the proof
+ * runner must then run the whole catalog. What stays a refusal is the case
+ * where the index could not answer at all. */
+
+static int test_ic_capacity_bound_runs_everything(void)
+{
+    int failures = 0;
+    /* Function scope so the operator's own fixture assignment is put back even
+     * when an ASSERT below jumps straight to the case exit. */
+    static char ic_fixture_saved[4096];
+    bool ic_fixture_was_set =
+        ic_host_fixture_save(ic_fixture_saved, sizeof(ic_fixture_saved));
+    TEST("impact composition: a capacity bound runs the whole catalog") {
+        const char *files[] = { "core/modules/net/src/tor_integration.c" };
+
+        /* (a) the group array fills. The fixture names a few dozen real
+         * proof-owning test files; the seam lowers the ceiling so the cap is
+         * reachable without a fixture that has to out-name the catalog. */
+ TEST_DISCARD(system("rm -rf " IC_FIX_GROUP));
+        ASSERT(ic_write_call_pair(IC_FIX_GROUP));
+        ASSERT(ic_write_depfiles(IC_FIX_GROUP));
+        size_t n = sizeof(ic_many_group_files) /
+                   sizeof(ic_many_group_files[0]);
+        for (size_t i = 0; i < n; i++) {
+            char fbody[256];
+            (void)snprintf(fbody, sizeof(fbody),
+                           "/* many-group fixture */\n"
+                           "#include \"net/clp.h\"\n"
+                           "int mg_%zu(int x) { return tor_leaf(x); }\n", i);
+            ASSERT(ic_write(IC_FIX_GROUP, ic_many_group_files[i], fbody));
+        }
+        struct zcl_devloop_plan capped;
+        zcl_devloop_test_plan_group_cap = 8;
+        bool built = zcl_devloop_plan_files(files, 1, &capped) &&
+                     zcl_devloop_plan_add_closure(IC_FIX_GROUP, files, 1,
+                                                  &capped);
+        zcl_devloop_test_plan_group_cap = 0;
+        ASSERT(built);
+        ASSERT(capped.closure_universal);
+        ASSERT(!capped.closure_truncated);
+        ASSERT(capped.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+               ZCL_DEVLOOP_DIM_COMPLETE);
+        ASSERT(strcmp(capped.dims[ZCL_DEVLOOP_DIM_SEMANTIC].reason,
+                      "closure-universal") == 0);
+        const char *why = "unset";
+        ASSERT(zcl_devloop_plan_proof_admissible(&capped, &why));
+        ASSERT(strcmp(why, "") == 0);
+        /* The cap kept what fit; it did not throw the partial evidence away. */
+        ASSERT(capped.closure_groups_len > 0);
+
+        /* And the SAME fixture under the production ceiling enumerates
+         * normally — so (a) is testing the cap, not the fixture. */
+        struct zcl_devloop_plan roomy;
+        ASSERT(zcl_devloop_plan_files(files, 1, &roomy));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_GROUP, files, 1, &roomy));
+        ASSERT(!roomy.closure_universal);
+        ASSERT(roomy.closure_groups_len > capped.closure_groups_len);
+
+        /* (b) the proof runner turns a universal plan into the whole catalog
+         * MINUS the groups whose declared host need this tree cannot meet,
+         * and an ordinary plan into just its own groups.
+         *
+         * A proof generation carries no runtime binaries and no operator
+         * fixture, so onion_pair_watch_live and self_folded_anchor_heavy can
+         * only report UNOBSERVED/SKIP there -- verdicts the suite accounting
+         * refuses. They are left out of the universal selector and NAMED, not
+         * silently dropped. */
+        static char selector[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS *
+                             (ZCL_TEST_GROUP_FULL_MAX + 1)];
+        char gated[PROOF_HOST_GATED_MAX];
+        uint32_t selected = 0;
+        memset(selector, 0, sizeof(selector));
+        ASSERT(ic_host_need_bare_root(IC_FIX_HOST_BARE));
+        ic_host_fixture_env(false);
+        ASSERT(zcl_dev_proof_test_build_test_selector(
+                   &capped, IC_FIX_HOST_BARE, false, selector,
+                   sizeof(selector), &selected, gated, sizeof(gated)));
+        ASSERT(zcl_test_group_catalog_count() > 2);
+        bool fuzz_ready = ic_fuzz_host_ready();
+        ASSERT(ic_selector_is_universal(selector, selected,
+                                        3 + !fuzz_ready + ic_guest_host_missing()));
+        ASSERT(!ic_selector_has(selector, "test_onion_pair_watch_live"));
+        ASSERT(!ic_selector_has(selector, "test_onion_persistence"));
+        ASSERT(!ic_selector_has(selector, "test_self_folded_anchor_heavy"));
+        ASSERT(ic_selector_has(selector, "test_semantic_facts_fuzz") ==
+               fuzz_ready);
+        ASSERT(ic_guest_groups_gated(selector, gated));
+        for (size_t i = 0; i < zcl_test_group_catalog_count(); i++) {
+            const char *full = zcl_test_group_catalog_at(i);
+            if (ic_bare_host_excludes(full, fuzz_ready))
+                continue;
+            ASSERT(ic_selector_has(selector, full));
+        }
+        /* (b2) the selection note says exactly what was left out and why.
+         * Printed as the note itself reads, so this log is the evidence a
+         * reviewer needs without driving a proof cycle. */
+        printf("\n    test_selection=universal reason=closure-universal "
+               "groups_selected=%u\n    host_gated=%s\n  ",
+               (unsigned)selected, gated[0] ? gated : "-");
+        ASSERT(strstr(gated,
+                      "test_onion_pair_watch_live:file:build/bin/z23") != NULL);
+        ASSERT(strstr(gated,
+                      "test_onion_persistence:file:"
+                      "vendor/tor/src/ext/keccak-tiny/libkeccak-tiny.a") !=
+               NULL);
+        ASSERT(strstr(gated, "test_self_folded_anchor_heavy:env:"
+                             "ZCL_SELF_FOLD_ANCHOR_FIXTURE") != NULL);
+        ASSERT((strstr(gated, "test_semantic_facts_fuzz:toolchain:"
+                             "bound-libclang18-full-c23") != NULL) ==
+               !fuzz_ready);
+
+        /* (b3) give the tree the binary and the operator the fixture and both
+         * groups come straight back: this is a host fact, not a demotion. */
+        memset(selector, 0, sizeof(selector));
+        selected = 0;
+        ASSERT(ic_host_need_full_root(IC_FIX_HOST_FULL));
+        ic_host_fixture_env(true);
+        ASSERT(zcl_dev_proof_test_build_test_selector(
+                   &capped, IC_FIX_HOST_FULL, false, selector,
+                   sizeof(selector), &selected, gated, sizeof(gated)));
+        ASSERT(ic_selector_is_universal(selector, selected,
+                                        !fuzz_ready + ic_guest_host_missing()));
+        ASSERT((gated[0] == '\0') == (fuzz_ready && ic_guest_host_missing() == 0));
+        for (size_t i = 0; i < zcl_test_group_catalog_count(); i++)
+            ASSERT(zcl_test_group_is_umbrella(zcl_test_group_catalog_at(i)) ||
+                   (!fuzz_ready && strcmp(zcl_test_group_catalog_at(i),
+                                           "test_semantic_facts_fuzz") == 0) ||
+                   ic_guest_group_absent(zcl_test_group_catalog_at(i)) ||
+                   ic_selector_has(selector, zcl_test_group_catalog_at(i)));
+        ic_host_fixture_restore(ic_fixture_saved, ic_fixture_was_set);
+
+        uint32_t exact_selected = 0;
+        memset(selector, 0, sizeof(selector));
+        ASSERT(zcl_dev_proof_test_build_test_selector(
+                   &roomy, IC_FIX_HOST_BARE, false, selector, sizeof(selector),
+                   &exact_selected, gated, sizeof(gated)));
+        ASSERT(exact_selected > 0);
+        ASSERT((size_t)exact_selected < zcl_test_group_catalog_count());
+        /* An exact plan is never host-gated: the note stays empty. */
+        ASSERT(gated[0] == '\0');
+
+        /* (c) no index at all is NOT capacity. It is the planner failing to
+         * ask, and it still refuses. */
+        struct zcl_devloop_plan blind;
+        const char *header_files[] = {
+            "core/modules/net/include/net/net.h"
+        };
+        ASSERT(zcl_devloop_plan_files(header_files, 1, &blind));
+        ASSERT(zcl_devloop_plan_add_closure("test-tmp/no-such-impact-index",
+                                            header_files, 1, &blind));
+        ASSERT(!blind.closure_universal);
+        ASSERT(blind.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+               ZCL_DEVLOOP_DIM_UNAVAILABLE);
+        ASSERT(blind.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+               ZCL_DEVLOOP_DIM_UNAVAILABLE);
+        why = "unset";
+        ASSERT(!zcl_devloop_plan_proof_admissible(&blind, &why));
+        ASSERT(strcmp(why, "no-code-index") == 0);
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_GROUP));
+ TEST_DISCARD(system("rm -rf " IC_FIX_HOST_BARE));
+ TEST_DISCARD(system("rm -rf " IC_FIX_HOST_FULL));
+        PASS();
+    } _test_next:;
+    ic_host_fixture_restore(ic_fixture_saved, ic_fixture_was_set);
+    return failures;
+}
+
+/* ── T4c: the host-need table itself ──────────────────────────────────
+ *
+ * The selector above is only as honest as the table it reads. This pins the
+ * table's own contract: it validates, it resolves the two declared rows to
+ * the exact kind and value they claim, it answers NONE for an ordinary group,
+ * and asking about a group that is not registered is a REFUSAL rather than a
+ * quiet "no need" that would let a typo silently un-gate a group. */
+
+static int test_ic_host_need_table_is_closed(void)
+{
+    int failures = 0;
+    TEST("impact composition: the host-need table is closed and typed") {
+        struct zcl_test_group_host_need need;
+
+        ASSERT(zcl_test_group_host_needs_valid());
+
+        /* Both declared rows resolve to exactly what they declare. */
+        memset(&need, 0, sizeof(need));
+        ASSERT(zcl_test_group_host_need("test_onion_pair_watch_live", &need));
+        ASSERT(need.kind == ZCL_HOST_NEED_FILE);
+        ASSERT(strcmp(need.value, "build/bin/z23") == 0);
+        ASSERT(strcmp(zcl_test_group_host_need_kind_name(need.kind),
+                      "file") == 0);
+        /* The file need is asked of the tree handed in, not of the caller's
+         * own checkout: the same need is unmet in a bare tree and met in one
+         * that carries the binary. */
+        ASSERT(ic_host_need_bare_root(IC_FIX_HOST_BARE));
+        ASSERT(ic_host_need_full_root(IC_FIX_HOST_FULL));
+        ASSERT(!zcl_test_group_host_need_met(IC_FIX_HOST_BARE, &need));
+        ASSERT(zcl_test_group_host_need_met(IC_FIX_HOST_FULL, &need));
+
+        memset(&need, 0, sizeof(need));
+        ASSERT(zcl_test_group_host_need("test_self_folded_anchor_heavy",
+                                        &need));
+        ASSERT(need.kind == ZCL_HOST_NEED_ENV);
+        ASSERT(strcmp(need.value, "ZCL_SELF_FOLD_ANCHOR_FIXTURE") == 0);
+        ASSERT(strcmp(zcl_test_group_host_need_kind_name(need.kind),
+                      "env") == 0);
+        char saved[4096];
+        bool was_set = ic_host_fixture_save(saved, sizeof(saved));
+        ic_host_fixture_env(false);
+        ASSERT(!zcl_test_group_host_need_met(IC_FIX_HOST_FULL, &need));
+        ic_host_fixture_env(true);
+        ASSERT(zcl_test_group_host_need_met(IC_FIX_HOST_FULL, &need));
+        ic_host_fixture_restore(saved, was_set);
+
+        /* The live sensor groups declare a BUILD need: the proof builds the
+         * target itself, so the need is met only where the tool exists but
+         * never gates the group out of a selection. */
+        static const char *const sensor_groups[] = {
+            "test_semantic_sensor", "test_semantic_facts_live",
+            "test_semantic_consumer_live",
+        };
+        for (size_t i = 0; i < 3; i++) {
+            memset(&need, 0, sizeof(need));
+            ASSERT(zcl_test_group_host_need(sensor_groups[i], &need));
+            ASSERT(need.kind == ZCL_HOST_NEED_BUILD);
+            ASSERT(strcmp(need.value, "build/bin/z23-clang-manifest") == 0);
+            ASSERT(need.target && strcmp(need.target, "clang-manifest") == 0);
+            ASSERT(strcmp(zcl_test_group_host_need_kind_name(need.kind),
+                          "build") == 0);
+            ASSERT(!zcl_test_group_host_need_met(IC_FIX_HOST_BARE, &need));
+            ASSERT(zcl_test_group_host_need_selectable(IC_FIX_HOST_BARE,
+                                                       &need));
+        }
+        memset(&need, 0, sizeof(need));
+        ASSERT(zcl_test_group_host_need("test_semantic_facts_fuzz", &need));
+        ASSERT(need.kind == ZCL_HOST_NEED_C23_TOOLCHAIN);
+        ASSERT(strcmp(need.value, "bound-libclang18-full-c23") == 0);
+        ASSERT(need.target == NULL);
+        ASSERT(zcl_test_group_host_need_selectable(IC_FIX_HOST_BARE,
+                                                   &need) ==
+               ic_fuzz_host_ready());
+        /* FILE is selectable exactly when met; a FILE need never names a
+         * build target. */
+        memset(&need, 0, sizeof(need));
+        ASSERT(zcl_test_group_host_need("test_onion_pair_watch_live", &need));
+        ASSERT(need.target == NULL);
+        ASSERT(!zcl_test_group_host_need_selectable(IC_FIX_HOST_BARE, &need));
+        ASSERT(zcl_test_group_host_need_selectable(IC_FIX_HOST_FULL, &need));
+        ASSERT(!zcl_test_group_host_need_selectable(IC_FIX_HOST_FULL, NULL));
+        /* The real-Tor gate is the same FILE shape: a stub-linked bare host
+         * cannot run the group, a real-linked full host can. */
+        memset(&need, 0, sizeof(need));
+        ASSERT(zcl_test_group_host_need("test_onion_persistence", &need));
+        ASSERT(need.kind == ZCL_HOST_NEED_FILE);
+        ASSERT(need.target == NULL);
+        ASSERT(strcmp(need.value,
+                      "vendor/tor/src/ext/keccak-tiny/libkeccak-tiny.a") ==
+               0);
+        ASSERT(!zcl_test_group_host_need_selectable(IC_FIX_HOST_BARE, &need));
+        ASSERT(zcl_test_group_host_need_selectable(IC_FIX_HOST_FULL, &need));
+
+        /* An ordinary group declares nothing and is never gated. */
+        memset(&need, 0, sizeof(need));
+        ASSERT(zcl_test_group_host_need("test_impact_composition", &need));
+        ASSERT(need.kind == ZCL_HOST_NEED_NONE);
+        ASSERT(zcl_test_group_host_need_met(IC_FIX_HOST_BARE, &need));
+        ASSERT(zcl_test_group_host_need_selectable(IC_FIX_HOST_BARE, &need));
+
+        /* A group that is not in the catalog is a refusal, not an answer. */
+        memset(&need, 0, sizeof(need));
+        ASSERT(!zcl_test_group_host_need("test_no_such_group_at_all", &need));
+        ASSERT(!zcl_test_group_host_need("", &need));
+        ASSERT(!zcl_test_group_host_need(NULL, &need));
+        ASSERT(!zcl_test_group_host_need("test_onion_pair_watch_live", NULL));
+
+        /* An unknown kind cannot pass as met. */
+        struct zcl_test_group_host_need bogus = {
+            (enum zcl_test_group_host_need_kind)99,
+            "test_onion_pair_watch_live", "build/bin/z23", NULL
+        };
+        ASSERT(!zcl_test_group_host_need_met(IC_FIX_HOST_FULL, &bogus));
+        ASSERT(zcl_test_group_host_need_kind_name(bogus.kind) == NULL);
+        ASSERT(!zcl_test_group_host_need_met(IC_FIX_HOST_FULL, NULL));
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_HOST_BARE));
+ TEST_DISCARD(system("rm -rf " IC_FIX_HOST_FULL));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── T5: every selected group says why it is there ────────────────────── */
+
+static int test_ic_every_selection_has_a_reason(void)
+{
+    int failures = 0;
+    TEST("impact composition: every selected group names its dimension") {
+ TEST_DISCARD(system("rm -rf " IC_FIX_DEF));
+        ASSERT(ic_write_call_pair(IC_FIX_DEF));
+        ASSERT(ic_write(IC_FIX_DEF,
+                        "engine/controllers/include/controllers/ic_rows.def",
+                        "IC_ROW(alpha, 1)\n"));
+        ASSERT(ic_write(IC_FIX_DEF, "build/obj/tor_integration.d",
+                        "build/obj/tor_integration.o: "
+                        "core/modules/net/src/tor_integration.c "
+                        "core/modules/net/include/net/clp.h\n"));
+        ASSERT(ic_write(IC_FIX_DEF, "build/obj/download.d",
+                        "build/obj/download.o: core/modules/net/src/download.c "
+                        "core/modules/net/include/net/clp.h "
+                        "engine/controllers/include/controllers/ic_rows.def\n"));
+
+        /* One changed file per dimension in a single plan: a .c (semantic), a
+         * registry (include), and a doc (opaque — no graph could find it). */
+        const char *files[] = {
+            "core/modules/net/src/tor_integration.c",
+            "engine/controllers/include/controllers/ic_rows.def",
+            "docs/HANDOFF.md",
+        };
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 3, &plan));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_DEF, files, 3, &plan));
+
+        /* Every planned group — from EITHER array — carries an explanation
+         * with a real dimension name and a non-empty via file. */
+        ASSERT(plan.path_groups_len + plan.closure_groups_len > 0);
+        for (size_t i = 0; i < plan.path_groups_len; i++) {
+            const struct zcl_devloop_selection *s =
+                ic_selection(&plan, plan.path_groups[i]);
+            ASSERT(s != NULL);
+            ASSERT(s->via[0] != '\0');
+            ASSERT(strcmp(zcl_devloop_dim_name(s->dim), "unknown") != 0);
+        }
+        for (size_t i = 0; i < plan.closure_groups_len; i++) {
+            const struct zcl_devloop_selection *s =
+                ic_selection(&plan, plan.closure_groups[i]);
+            ASSERT(s != NULL);
+            ASSERT(s->via[0] != '\0');
+            ASSERT(strcmp(zcl_devloop_dim_name(s->dim), "unknown") != 0);
+        }
+
+        /* A doc's groups can only have come from a hand-authored mapping, and
+         * the ledger says so. Asked on its own: attribution is deduped on the
+         * group, and in the three-file plan above a .c file names the same
+         * group first, so that entry honestly reads "semantic" — a graph DID
+         * reach it. Alone, nothing but the .def rule can explain it. */
+        const char *doc_only[] = { "docs/HANDOFF.md" };
+        struct zcl_devloop_plan dplan;
+        ASSERT(zcl_devloop_plan_files(doc_only, 1, &dplan));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_DEF, doc_only, 1, &dplan));
+        ASSERT(dplan.path_groups_len > 0);
+        bool saw_opaque = false;
+        for (size_t i = 0; i < dplan.selections_len; i++) {
+            if (dplan.selections[i].dim == ZCL_DEVLOOP_DIM_OPAQUE &&
+                strcmp(dplan.selections[i].via, "docs/HANDOFF.md") == 0)
+                saw_opaque = true;
+        }
+        ASSERT(saw_opaque);
+        for (size_t i = 0; i < dplan.path_groups_len; i++)
+            ASSERT(ic_selection(&dplan, dplan.path_groups[i]) != NULL);
+
+        /* And the whole explanation reaches the wire, with the per-dimension
+         * completeness list beside it. */
+        char body[65536];
+        size_t n = zcl_devloop_plan_json_closure(IC_FIX_DEF, files, 3, body,
+                                                 sizeof(body));
+        ASSERT(n > 0 && n < sizeof(body));
+        struct json_value root = {0};
+        ASSERT(json_read(&root, body, n));
+        ASSERT(json_get(&root, "selections") != NULL);
+        ASSERT(json_get(&root, "dimensions") != NULL);
+        ASSERT(json_get(&root, "proof_admissible") != NULL);
+        json_free(&root);
+        ASSERT(strstr(body, "\"name\":\"include\"") != NULL);
+        ASSERT(strstr(body, "\"name\":\"opaque\"") != NULL);
+        ASSERT(strstr(body, "\"name\":\"semantic\"") != NULL);
+
+        char dbody[65536];
+        size_t dn = zcl_devloop_plan_json_closure(IC_FIX_DEF, doc_only, 1,
+                                                  dbody, sizeof(dbody));
+        ASSERT(dn > 0 && dn < sizeof(dbody));
+        ASSERT(strstr(dbody, "\"dimension\":\"opaque\"") != NULL);
+        ASSERT(strstr(dbody, "\"via\":\"docs/HANDOFF.md\"") != NULL);
+
+        /* The explanation is only worth writing if it can be DELIVERED. The
+         * command registry hard-fails (RESPONSE_BUDGET_EXCEEDED, empty
+         * document) any reply larger than the serving leaf's declared budget
+         * instead of truncating it, so a renderer that writes past that number
+         * does not produce a longer plan — it produces no plan at all, which
+         * is exactly the regression this assert exists to catch. Pin the two
+         * numbers to each other: the leaf must declare room for the document
+         * ceiling plus the zcl.result.v1 envelope around it (measured at 340
+         * bytes; 512 is the rounded reserve). */
+        const struct zcl_command_spec *plan_spec =
+            zcl_command_registry_find(zcl_command_catalog(), "dev.test.plan",
+                                      NULL);
+        ASSERT(plan_spec != NULL);
+        ASSERT(plan_spec->budget_bytes >= ZCL_DEVLOOP_PLAN_WIRE_MAX + 512);
+        const struct zcl_command_spec *change_plan_spec =
+            zcl_command_registry_find(zcl_command_catalog(),
+                                      "dev.change.plan", NULL);
+        ASSERT(change_plan_spec != NULL);
+        ASSERT(change_plan_spec->budget_bytes >=
+               ZCL_DEVLOOP_PLAN_WIRE_MAX + 512);
+        /* …and the renderer must actually honour that ceiling regardless of
+         * how large a buffer it is handed. */
+        ASSERT(n <= ZCL_DEVLOOP_PLAN_WIRE_MAX);
+        ASSERT(dn <= ZCL_DEVLOOP_PLAN_WIRE_MAX);
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_DEF));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── T6: the union is a strict superset of system A alone ─────────────── */
+
+/* The "do not replace either system" guarantee, made mechanical. Whatever the
+ * hand-authored rules name for a changed path, the composed plan still names.
+ * Run over the twelve representative change kinds plus the fixture paths, so a
+ * future "simplification" that drops A cannot pass. */
+static const char *const ic_superset_paths[] = {
+    "platform/modules/util/include/util/supervisor.h",
+    "platform/modules/util/src/supervisor.c",
+    "core/modules/net/src/zmsg.c",
+    "engine/controllers/include/controllers/diagnostics_dumpers.def",
+    "tools/lint/check_core_seal.sh",
+    "docs/HANDOFF.md",
+    "platform/modules/sha3/src/sha3.c",
+    "engine/models/src/store.c",
+    "cognition/modules/codeindex/src/codeindex_impact.c",
+    "core/consensus/src/pow.c",
+    "platform/modules/base/include/base/hex.h",
+    "engine/services/src/op_return_backfill_service.c",
+    "core/modules/net/src/tor_integration.c",
+    "core/modules/net/src/download.c",
+};
+
+static int test_ic_union_never_loses_a_rule_group(void)
+{
+    int failures = 0;
+    TEST("impact composition: the union never loses a group system A named") {
+ TEST_DISCARD(system("rm -rf " IC_FIX_MACRO));
+        ASSERT(ic_write_call_pair(IC_FIX_MACRO));
+        ASSERT(ic_write_depfiles(IC_FIX_MACRO));
+
+        size_t n = sizeof(ic_superset_paths) / sizeof(ic_superset_paths[0]);
+        size_t checked = 0;
+        for (size_t i = 0; i < n; i++) {
+            /* A alone, straight from the shared rule resolver. */
+            struct agent_impact_acc acc = {0};
+            (void)agent_impact_apply_shared_rules(ic_superset_paths[i], &acc);
+
+            const char *one[] = { ic_superset_paths[i] };
+            struct zcl_devloop_plan plan;
+            ASSERT(zcl_devloop_plan_files(one, 1, &plan));
+            ASSERT(zcl_devloop_plan_add_closure(IC_FIX_MACRO, one, 1, &plan));
+
+            for (size_t g = 0; g < acc.groups_len; g++) {
+                if (!ic_planned(&plan, acc.groups[g])) {
+                    fprintf(stderr,
+                            "  union LOST rule group '%s' for path '%s'\n",
+                            acc.groups[g], ic_superset_paths[i]);
+                    ASSERT(false);
+                }
+                checked++;
+            }
+        }
+        /* The corpus must actually exercise something. */
+        ASSERT(checked > 20);
+
+        /* Scalar SHA3 moved into its own module and now has an explicit
+         * path rule as well as the hard consensus-risk fallback.  The first
+         * selection is therefore semantic, while consensus_parity remains
+         * mandatory and visible in the composed plan. */
+        const char *crypto[] = { "platform/modules/sha3/src/sha3.c" };
+        struct zcl_devloop_plan cplan;
+        ASSERT(zcl_devloop_plan_files(crypto, 1, &cplan));
+        ASSERT(cplan.consensus_risk);
+        ASSERT(ic_planned(&cplan, "consensus_parity"));
+        const struct zcl_devloop_selection *s = ic_selection(&cplan,
+                                                             "consensus_parity");
+        ASSERT(s != NULL);
+        ASSERT(s->dim == ZCL_DEVLOOP_DIM_SEMANTIC);
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_MACRO));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_block_log_source_plan(void)
+{
+    int failures = 0;
+    char root[4096] = {0};
+    TEST("impact composition: a block-log source-only edit is admissible") {
+        const char *files[] = {
+            "platform/adapters/outbound/persistence/src/block_log_file.c"
+        };
+        ASSERT(test_mkdtemp(root, sizeof root, "impact_block_log") != NULL);
+        ASSERT(ic_write(root, files[0],
+                        "int blf_fixture_read(void) { return 1; }\n"));
+        ASSERT(ic_write(root, "build/obj/block_log_file.d",
+                        "build/obj/block_log_file.o: "
+                        "platform/adapters/outbound/persistence/src/block_log_file.c\n"));
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(plan.file_count == 1);
+        ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                           "block_log_file"));
+        ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                           "replay_verify"));
+        ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                           "make_lint_gates"));
+        ASSERT(zcl_devloop_plan_add_closure(root, files, 1, &plan));
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+               ZCL_DEVLOOP_DIM_COMPLETE);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+               ZCL_DEVLOOP_DIM_NOT_APPLICABLE);
+        ASSERT(!plan.closure_universal);
+        const char *why = "unset";
+        ASSERT(zcl_devloop_plan_proof_admissible(&plan, &why));
+        ASSERT_STR_EQ(why, "");
+        ASSERT(ic_planned(&plan, "block_log_file"));
+        PASS();
+    } _test_next:;
+    if (root[0]) failures += test_rm_rf_recursive(root) != 0;
+    return failures;
+}
+
+/* ── T7: query only graph dimensions that can contain an edge ─────────── */
+
+static int test_ic_dimension_applicability_and_exact_execution(void)
+{
+    int failures = 0;
+    TEST("impact composition: test leaves produce an exact admissible plan") {
+        const char *files[] = {
+            "tests/harness/src/test_stage_repair_coin_backfill.c",
+            "tools/agent_fast_ci.sh",
+        };
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 2, &plan));
+        /* No fixture/index exists at this path. Success proves the planner did
+         * not open an irrelevant graph merely to report an empty answer. */
+        ASSERT(zcl_devloop_plan_add_closure("test-tmp/no-such-impact-index",
+                                            files, 2, &plan));
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+               ZCL_DEVLOOP_DIM_NOT_APPLICABLE);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+               ZCL_DEVLOOP_DIM_NOT_APPLICABLE);
+        ASSERT(plan.closure_groups_len == 0);
+        ASSERT(!plan.closure_truncated);
+        const char *why = "unset";
+        ASSERT(zcl_devloop_plan_proof_admissible(&plan, &why));
+        ASSERT(strcmp(why, "") == 0);
+
+        char body[ZCL_DEVLOOP_PLAN_WIRE_MAX + 1];
+        size_t n = zcl_devloop_plan_json_closure(
+            "test-tmp/no-such-impact-index", files, 2, body, sizeof(body));
+        ASSERT(n > 0 && n <= ZCL_DEVLOOP_PLAN_WIRE_MAX);
+        ASSERT(strstr(body, "\"execution_selector\":\"exact\"") != NULL);
+        ASSERT(strstr(body, "\"test_stage_repair\"") == NULL);
+        ASSERT(strstr(body, "\"test_stage_repair_coin_backfill\"") != NULL);
+        ASSERT(strstr(body, "\"execution_set_valid\":true") != NULL);
+        ASSERT(strstr(body, "\"execution_set_sha3\":") != NULL);
+        ASSERT(strstr(body, "\"proof_admissible\":true") != NULL);
+
+        /* An unmapped code edit and a stale catalog token each refuse for the
+         * actionable reason before any graph availability can obscure it. */
+        const char *unmapped[] = { "lib/novel/src/unmapped_agentic.c" };
+        struct zcl_devloop_plan gap;
+        ASSERT(zcl_devloop_plan_files(unmapped, 1, &gap));
+        why = "unset";
+        ASSERT(!zcl_devloop_plan_proof_admissible(&gap, &why));
+        ASSERT(strcmp(why, "unmapped-code-change") == 0);
+
+        /* Pure C23 service islands are product code, not harness internals.
+         * Their direct path floor must name the product proof even when the
+         * reverse-call graph happens to find infrastructure coverage. */
+        const char *c23_services[] = {
+            "contexts/commons/services/src/zcode_c23_corpus_service.c",
+            "contexts/commons/services/src/zcode_c23_economics_service.c",
+        };
+        for (size_t i = 0;
+             i < sizeof(c23_services) / sizeof(c23_services[0]); i++) {
+            const char *service_files[] = { c23_services[i] };
+            struct zcl_devloop_plan service;
+            ASSERT(zcl_devloop_plan_files(service_files, 1, &service));
+            ASSERT(service.action == ZCL_DEVLOOP_HOTSWAP);
+            ASSERT(ic_group_in(service.path_groups,
+                               service.path_groups_len,
+                               "zcode_commons"));
+
+            char service_body[ZCL_DEVLOOP_PLAN_WIRE_MAX + 1];
+            size_t service_n = zcl_devloop_plan_json(
+                service_files, 1, service_body, sizeof(service_body));
+            ASSERT(service_n > 0);
+            ASSERT(strstr(service_body, "\"live_eligible\":true") != NULL);
+            ASSERT(strstr(service_body, "\"why_not_live\":\"\"") != NULL);
+            ASSERT(strstr(service_body, "\"why_not_live_path\":\"\"")
+                   != NULL);
+        }
+
+        const char *package_manifest[] = {
+            "contexts/commons/packages/zarg/zcode-package.json",
+        };
+        struct zcl_devloop_plan package_plan;
+        ASSERT(zcl_devloop_plan_files(package_manifest, 1, &package_plan));
+        ASSERT(ic_planned(&package_plan, "zcode_package_dev"));
+        ASSERT(ic_planned(&package_plan, "zcode_verify"));
+        ASSERT(ic_planned(&package_plan, "zcode_package_registry"));
+        ASSERT(ic_planned(&package_plan, "make_lint_gates"));
+        ASSERT(zcl_devloop_plan_add_closure("test-tmp/no-such-impact-index",
+                                            package_manifest, 1,
+                                            &package_plan));
+        why = "unset";
+        ASSERT(zcl_devloop_plan_proof_admissible(&package_plan, &why));
+        ASSERT(strcmp(why, "") == 0);
+
+        struct agent_impact_acc executor = {0};
+        (void)agent_impact_apply_shared_rules(
+            "contexts/commons/services/src/build_fabric_package_executor.c", &executor);
+        ASSERT(executor.shared_rule_hits > 0);
+        bool executor_has_build_proof = false;
+        for (size_t i = 0; i < executor.groups_len; i++)
+            if (strcmp(executor.groups[i], "build_fabric") == 0)
+                executor_has_build_proof = true;
+        ASSERT(executor_has_build_proof);
+
+        struct zcl_devloop_plan stale = plan;
+        snprintf(stale.path_groups[0], sizeof(stale.path_groups[0]),
+                 "missing_catalog_group");
+        why = "unset";
+        ASSERT(!zcl_devloop_plan_proof_admissible(&stale, &why));
+        ASSERT(strcmp(why, "unknown-test-group") == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The regression that cost main six red hours. A README edit plans exactly
+ * one token, `make_lint_gates`, and the proof selector used to resolve that
+ * token EXACTLY: it ran test_make_lint_gates, whose body is the repository
+ * root-file check plus the sandbox cleanup, and not one of the shards where
+ * the README-reading contracts actually live. The rewrite passed its proof
+ * and left test_make_lint_gates_shard_08 and test_make_lint_gates_realroot
+ * red on main until the ship gate's full suite found them.
+ *
+ * The shard a given contract lands in is decided by lint_owner_of()'s weight
+ * bin-packing at RUN time, so this asserts the WHOLE family from the catalog
+ * rather than a shard number: a shard added to the registry is covered here
+ * with no edit. */
+static int test_ic_lint_token_selects_every_shard(void)
+{
+    int failures = 0;
+    TEST("impact composition: a README edit proves every lint shard") {
+        const char *files[] = { "README.md" };
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(plan.docs_only);
+        ASSERT(!plan.closure_universal);
+        ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                           "make_lint_gates"));
+        /* No fixture index exists at this path; a docs-only change has no
+         * symbol closure to ask for, so the dimensions close and the plan
+         * becomes admissible without one. */
+        ASSERT(zcl_devloop_plan_add_closure("test-tmp/no-such-impact-index",
+                                            files, 1, &plan));
+        const char *why = "unset";
+        ASSERT(zcl_devloop_plan_proof_admissible(&plan, &why));
+        ASSERT(strcmp(why, "") == 0);
+
+        static char selector[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS *
+                             (ZCL_TEST_GROUP_FULL_MAX + 1)];
+        char gated[PROOF_HOST_GATED_MAX];
+        uint32_t selected = 0;
+        memset(selector, 0, sizeof(selector));
+        ASSERT(zcl_dev_proof_test_build_test_selector(
+                   &plan, ".", false, selector, sizeof(selector), &selected,
+                   gated, sizeof(gated)));
+        /* An exact plan is never host-gated; nothing here is dropped. */
+        ASSERT(gated[0] == '\0');
+        ASSERT(ic_selector_has(selector, "test_make_lint_gates"));
+        size_t family = 0;
+        for (size_t i = 0; i < zcl_test_group_catalog_count(); i++) {
+            const char *full = zcl_test_group_catalog_at(i);
+            if (strncmp(full, "test_make_lint_gates",
+                        strlen("test_make_lint_gates")) != 0)
+                continue;
+            family++;
+            ASSERT(ic_selector_has(selector, full));
+        }
+        ASSERT(family > 1);
+        ASSERT((size_t)selected == family);
+        /* Widened, not unfocused: a lint token still selects nothing outside
+         * its own family. */
+        ASSERT(!ic_selector_has(selector, "test_api"));
+        printf("\n    README.md test_selection=exact groups_selected=%u\n  ",
+               (unsigned)selected);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_snapshot_overlays_current_symbols(void)
+{
+    int failures = 0;
+    TEST("impact composition: resident snapshot overlays current changed symbols") {
+ TEST_DISCARD(system("rm -rf " IC_FIX_SNAPSHOT));
+        ASSERT(ic_write(IC_FIX_SNAPSHOT, "core/modules/net/src/tor_integration.c",
+                        "int old_unreferenced(void) { return 1; }\n"));
+        ASSERT(ic_write(IC_FIX_SNAPSHOT, "core/modules/net/src/download.c",
+                        "int future_leaf(void);\n"
+                        "int download_future(void) { return future_leaf(); }\n"));
+        ASSERT(ic_write_depfiles(IC_FIX_SNAPSHOT));
+
+        const char *files[] = { "core/modules/net/src/tor_integration.c" };
+        struct zcl_devloop_plan baseline;
+        ASSERT(zcl_devloop_plan_files(files, 1, &baseline));
+        ASSERT(zcl_devloop_plan_add_closure(
+            IC_FIX_SNAPSHOT, files, 1, &baseline));
+        ASSERT(!ic_planned(&baseline, "download"));
+
+        ASSERT(ic_write(IC_FIX_SNAPSHOT, "core/modules/net/src/tor_integration.c",
+                        "int future_leaf(void) { return 2; }\n"));
+        struct zcl_devloop_plan snapshot;
+        ASSERT(zcl_devloop_plan_files(files, 1, &snapshot));
+        ASSERT(zcl_devloop_plan_add_closure_snapshot(
+            IC_FIX_SNAPSHOT, files, 1, &snapshot));
+        ASSERT(snapshot.closure_snapshot);
+        ASSERT(ic_planned(&snapshot, "download"));
+        ASSERT(zcl_devloop_plan_proof_admissible(&snapshot, NULL));
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_SNAPSHOT));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_acc_has_group(const struct agent_impact_acc *acc,
+                             const char *group)
+{
+    for (size_t i = 0; i < acc->groups_len; i++)
+        if (strcmp(acc->groups[i], group) == 0)
+            return true;
+    return false;
+}
+
+static int test_ic_wallet_recovery_status_proof_mapping(void)
+{
+    int failures = 0;
+    TEST("impact composition: recovery status source selects recovery safety") {
+        const char *files[] = {
+            "contexts/wallet/controllers/src/wallet_recovery_native_handlers.c"
+        };
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(ic_planned(&plan, "wallet_recovery_safety"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_app_event_sync_proof_mapping(void)
+{
+    int failures = 0;
+    TEST("impact composition: app sync paths select their report regression") {
+        static const char *const paths[] = {
+            "engine/services/src/app_event_sync.c",
+            "engine/services/include/services/app_event_sync_service.h",
+            "tests/harness/src/test_app_event_sync.c",
+        };
+        for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+            struct agent_impact_acc impact = {0};
+            ASSERT(agent_impact_apply_shared_rules(paths[i], &impact));
+            ASSERT(ic_acc_has_group(&impact, "app_event_sync"));
+            ASSERT(ic_acc_has_group(&impact, "make_lint_gates"));
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_sqlq_proof_mapping(void)
+{
+    int failures = 0;
+    TEST("impact composition: sqlq source and fixture select sqlq proof") {
+        struct agent_impact_acc tool = {0}, fixture = {0};
+        (void)agent_impact_apply_shared_rules("tools/sqlq.c", &tool);
+        (void)agent_impact_apply_shared_rules(
+            "tests/harness/src/test_sqlq.c", &fixture);
+        ASSERT(ic_acc_has_group(&tool, "sqlq"));
+        ASSERT(ic_acc_has_group(&fixture, "sqlq"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_utxo_snapshot_proof_mapping(void)
+{
+    int failures = 0;
+    TEST("impact composition: UTXO snapshot paths select output regression") {
+        static const char *const paths[] = {
+            "engine/models/src/utxo.c",
+            "engine/models/include/models/utxo.h",
+            "engine/composition/src/boot_flyclient.c",
+            "engine/composition/include/config/boot_flyclient.h",
+            "tests/harness/src/test_boot_flyclient.c",
+        };
+        for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+            struct agent_impact_acc impact = {0};
+            ASSERT(agent_impact_apply_shared_rules(paths[i], &impact));
+            ASSERT(ic_acc_has_group(&impact, "boot_flyclient"));
+            ASSERT(ic_acc_has_group(&impact, "models"));
+            ASSERT(ic_acc_has_group(&impact, "make_lint_gates"));
+            struct zcl_devloop_plan plan;
+            ASSERT(zcl_devloop_plan_files(&paths[i], 1, &plan));
+            ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                               "boot_flyclient"));
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_fleet_ledger_proof_mapping(void)
+{
+    int failures = 0;
+    TEST("impact composition: fleet export paths select their regression without a graph") {
+        static const char *const paths[] = {
+            "tools/command/native_fleet_command.c",
+            "tests/harness/src/test_fleet_ledger.c",
+        };
+        for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+            struct agent_impact_acc impact = {0};
+            ASSERT(agent_impact_apply_shared_rules(paths[i], &impact));
+            ASSERT(ic_acc_has_group(&impact, "fleet_ledger"));
+            ASSERT(ic_acc_has_group(&impact, "make_lint_gates"));
+            struct zcl_devloop_plan plan;
+            ASSERT(zcl_devloop_plan_files(&paths[i], 1, &plan));
+            ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                               "fleet_ledger"));
+            ASSERT(plan.closure_groups_len == 0);
+            ASSERT(plan.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+                   ZCL_DEVLOOP_DIM_UNAVAILABLE);
+            ASSERT(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+                   ZCL_DEVLOOP_DIM_UNAVAILABLE);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_fleet_triggers_proof_mapping(void)
+{
+    int failures = 0;
+    TEST("impact composition: trigger paths select their regression without a graph") {
+        static const char *const paths[] = {
+            "tools/command/native_fleet_triggers_eval.c",
+            "tools/command/native_fleet_triggers_command.c",
+            "tools/command/native_fleet_triggers_catalog.c",
+            "tools/command/native_fleet_triggers.h",
+            "tests/harness/src/test_fleet_triggers.c",
+            "engine/composition/triggers.def",
+            "docs/FLEET_TRIGGERS.md",
+        };
+        for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+            struct agent_impact_acc impact = {0};
+            ASSERT(agent_impact_apply_shared_rules(paths[i], &impact));
+            ASSERT(ic_acc_has_group(&impact, "fleet_triggers"));
+            ASSERT(ic_acc_has_group(&impact, "make_lint_gates"));
+            /* Each changed set has exactly one path. No closure is asked
+             * for, so production-file selection cannot depend on a graph. */
+            struct zcl_devloop_plan plan;
+            ASSERT(zcl_devloop_plan_files(&paths[i], 1, &plan));
+            ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                               "fleet_triggers"));
+            ASSERT(plan.closure_groups_len == 0);
+            ASSERT(plan.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+                   ZCL_DEVLOOP_DIM_UNAVAILABLE);
+            ASSERT(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+                   ZCL_DEVLOOP_DIM_UNAVAILABLE);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_pr72_rpc_maps(const char *path, const char *group)
+{
+    struct agent_impact_acc acc = {0};
+    (void)agent_impact_apply_shared_rules(path, &acc);
+    return ic_acc_has_group(&acc, group);
+}
+
+static int test_ic_pr72_rpc_routes(void)
+{
+    int failures = 0;
+    TEST("request-size helper and both CLI entrypoints retain RPC acceptance") {
+        ASSERT(ic_pr72_rpc_maps("tests/harness/src/test_rpc_request_size.c", "rpc"));
+        ASSERT(ic_pr72_rpc_maps("engine/entry/cli.c", "rpc"));
+        ASSERT(ic_pr72_rpc_maps("engine/entry/main_cli_modes.c", "rpc"));
+        ASSERT(ic_pr72_rpc_maps("engine/entry/main_cli_modes.c", "cli_auth_robust"));
+        ASSERT(ic_pr72_rpc_maps("engine/entry/main_cli_modes.c", "cli_argv_strict"));
+        ASSERT(!ic_pr72_rpc_maps("tests/harness/src/unknown_request_size.c", "rpc"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_code_capsule_stays_with_code_owner(void)
+{
+    int failures = 0;
+    TEST("impact composition: code capsule proof stays with code commands") {
+        struct agent_impact_acc zcode = {0};
+        (void)agent_impact_apply_shared_rules(
+            "tools/command/native_zcode_dev_command.c", &zcode);
+        ASSERT(ic_acc_has_group(&zcode, "command_registry_catalog"));
+        ASSERT(!ic_acc_has_group(&zcode, "code_capsule"));
+
+        struct agent_impact_acc shared_header = {0};
+        (void)agent_impact_apply_shared_rules(
+            "tools/command/native_command.h", &shared_header);
+        ASSERT(ic_acc_has_group(&shared_header,
+                                "command_registry_catalog"));
+        ASSERT(!ic_acc_has_group(&shared_header, "codeindex"));
+        ASSERT(!ic_acc_has_group(&shared_header, "code_capsule"));
+        ASSERT(!ic_acc_has_group(&shared_header, "code_impact"));
+
+        struct agent_impact_acc code = {0};
+        (void)agent_impact_apply_shared_rules(
+            "tools/command/native_code_command.c", &code);
+        ASSERT(ic_acc_has_group(&code, "command_registry_catalog"));
+        ASSERT(ic_acc_has_group(&code, "code_capsule"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_generated_inventory_stays_focused(void)
+{
+    int failures = 0;
+    TEST("impact composition: generated inventory selects only its native proof") {
+        struct agent_impact_acc impact = {0};
+        ASSERT(agent_impact_apply_shared_rules(
+            "docs/CAPABILITY_INVENTORY.jsonl", &impact));
+        ASSERT(impact.shared_rule_hits == 1);
+        ASSERT(ic_acc_has_group(&impact, "code_inventory"));
+        ASSERT(!ic_acc_has_group(&impact, "make_lint_gates"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_fleet_task_projection_keeps_proof_owner(void)
+{
+    int failures = 0;
+    TEST("impact composition: exact fleet task paths retain steer proof owner") {
+        static const char *const paths[] = {
+            "tools/command/native_fleet_steer.c",
+            "tools/command/native_fleet_steer_tasks.c",
+            "tools/command/native_fleet_steer_tasks.h",
+            "tests/harness/src/test_fleet_steer.c",
+            "tests/harness/src/test_fleet_steer_tasks.c",
+        };
+        for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+            struct agent_impact_acc impact = {0};
+            ASSERT(agent_impact_apply_shared_rules(paths[i], &impact));
+            ASSERT(agent_impact_apply_shared_rules(paths[i], NULL));
+            ASSERT(ic_acc_has_group(&impact, "fleet_steer"));
+            ASSERT(ic_acc_has_group(&impact, "devagent_queue"));
+            ASSERT(ic_acc_has_group(&impact, "fleet_gateway"));
+            ASSERT(ic_acc_has_group(&impact, "make_lint_gates"));
+        }
+        static const char *const unrelated[] = {
+            "tools/command/native_fleet_steer_tasks_extra.c",
+            "tools/command/native_fleet_steer_tasks.h.extra",
+            "tests/harness/src/test_fleet_steer_tasks_extra.c",
+            "tests/harness/src/test_fleet_steer_tasks.c.extra",
+        };
+        for (size_t i = 0; i < sizeof(unrelated) / sizeof(unrelated[0]); i++) {
+            struct agent_impact_acc impact = {0};
+            (void)agent_impact_apply_shared_rules(unrelated[i], &impact);
+            ASSERT(!ic_acc_has_group(&impact, "fleet_steer"));
+            ASSERT(!ic_acc_has_group(&impact, "devagent_queue"));
+            ASSERT(!ic_acc_has_group(&impact, "fleet_gateway"));
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_dev_proof_contract_is_direct(void)
+{
+    int failures = 0;
+    TEST("impact composition: dev proof contract stops at its exact owner") {
+        static const char *const files[] = {
+#define AGENT_DIRECT_DEVELOPMENT_CONTRACT(path_) path_,
+#include "controllers/agent_direct_development_contracts.def"
+#undef AGENT_DIRECT_DEVELOPMENT_CONTRACT
+        };
+        for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+            struct agent_impact_acc impact = {0};
+            ASSERT(agent_impact_path_is_direct_development_contract(files[i]));
+            ASSERT(agent_impact_apply_shared_rules(files[i], &impact));
+            ASSERT(impact.groups_len > 0);
+        }
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files,
+            sizeof(files) / sizeof(files[0]), &plan));
+        ASSERT(zcl_devloop_plan_add_closure(
+            "test-tmp/no-dev-proof-index", files,
+            sizeof(files) / sizeof(files[0]), &plan));
+        ASSERT(plan.closure_groups_len == 0);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+               ZCL_DEVLOOP_DIM_NOT_APPLICABLE);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+               ZCL_DEVLOOP_DIM_NOT_APPLICABLE);
+        ASSERT(zcl_devloop_plan_proof_admissible(&plan, NULL));
+        ASSERT(agent_impact_path_is_direct_development_contract(
+            "tools/command/native_dev_loop_command.h"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_lint_helpers_exclude_onion_stress(void)
+{
+    int failures = 0;
+    TEST("impact composition: hermetic lint helpers exclude onion stress") {
+        struct agent_impact_acc lint = {0};
+        (void)agent_impact_apply_shared_rules(
+            "tests/harness/src/lint_gate_hygiene_selftests.c", &lint);
+        ASSERT(ic_acc_has_group(&lint, "make_lint_gates"));
+        ASSERT(ic_acc_has_group(&lint, "binary_ab_fallback"));
+        ASSERT(ic_acc_has_group(&lint, "self_backtrace"));
+        ASSERT(!ic_acc_has_group(&lint, "onion_bootstrap"));
+
+        struct agent_impact_acc onion = {0};
+        (void)agent_impact_apply_shared_rules(
+            "tests/harness/src/test_onion_bootstrap.c", &onion);
+        ASSERT(ic_acc_has_group(&onion, "make_lint_gates"));
+        ASSERT(ic_acc_has_group(&onion, "onion_bootstrap"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static struct zcl_dev_acceptance_receipt_v1 ic_valid_dev_proof_receipt(void)
+{
+    static const char local[] =
+        "1111111111111111111111111111111111111111";
+    static const char base[] =
+        "2222222222222222222222222222222222222222";
+    struct zcl_dev_acceptance_receipt_v1 receipt = {0};
+    (void)zcl_dev_proof_oid_decode(local, receipt.local_commit,
+                                   &receipt.local_commit_len);
+    (void)zcl_dev_proof_oid_decode(base, receipt.remote_base,
+                                   &receipt.remote_base_len);
+    uint8_t *roots[] = {
+        receipt.source_root, receipt.source_cas_root, receipt.mutation_root,
+        receipt.changed_set_root, receipt.impact_policy_root,
+        receipt.compiler_root, receipt.flags_root, receipt.environment_root,
+        receipt.build_graph_root, receipt.child_set_root,
+    };
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++)
+        memset(roots[i], (int)i + 1, ZCL_DEV_PROOF_ROOT_BYTES);
+    for (size_t i = 0; i < ZCL_DEV_PROOF_DIMENSIONS; i++) {
+        memset(receipt.dimensions[i].receipt_root, (int)i + 1,
+               ZCL_DEV_PROOF_ROOT_BYTES);
+        receipt.dimensions[i].selected = 1;
+        receipt.dimensions[i].reused = 1;
+    }
+    receipt.policy_version = ZCL_DEV_PROOF_POLICY_VERSION;
+    receipt.complete = 1;
+    (void)zcl_dev_proof_receipt_child_set_root(
+        &receipt, receipt.child_set_root);
+    (void)zcl_dev_proof_receipt_seal(&receipt);
+    return receipt;
+}
+
+static int test_ic_dev_proof_receipt_admission(void)
+{
+    int failures = 0;
+    static const char local[] =
+        "1111111111111111111111111111111111111111";
+    static const char base[] =
+        "2222222222222222222222222222222222222222";
+    struct zcl_dev_acceptance_receipt_v1 receipt =
+        ic_valid_dev_proof_receipt();
+    uint8_t wire[ZCL_DEV_PROOF_WIRE_BYTES];
+    uint8_t child[ZCL_DEV_PROOF_CHILD_WIRE_BYTES];
+    struct zcl_dev_acceptance_receipt_v1 parsed;
+    char why[128];
+    TEST("impact composition: exact proof rejects inadmissible receipts") {
+        ASSERT(zcl_dev_proof_receipt_serialize(&receipt, wire));
+        ASSERT(zcl_dev_proof_receipt_parse(wire, sizeof(wire), &parsed));
+        ASSERT(zcl_dev_proof_receipt_validate(&parsed, local, base,
+                                              why, sizeof(why)));
+        struct zcl_dev_proof_dimension child_dimension =
+            parsed.dimensions[ZCL_DEV_PROOF_TEST];
+        ASSERT(zcl_dev_proof_child_receipt_create(
+            ZCL_DEV_PROOF_TEST, &child_dimension, child));
+        ASSERT(zcl_dev_proof_child_receipt_validate(
+            child, sizeof(child), ZCL_DEV_PROOF_TEST, &child_dimension));
+        child[40] ^= 1u;
+        ASSERT(!zcl_dev_proof_child_receipt_validate(
+            child, sizeof(child), ZCL_DEV_PROOF_TEST, &child_dimension));
+        ASSERT(!zcl_dev_proof_receipt_validate(
+            &parsed, local,
+            "3333333333333333333333333333333333333333",
+            why, sizeof(why)));
+        parsed = receipt;
+        parsed.dimensions[ZCL_DEV_PROOF_TEST].skipped = 1;
+        ASSERT(!zcl_dev_proof_receipt_validate(&parsed, local, base,
+                                               why, sizeof(why)));
+        parsed = receipt;
+        parsed.child_set_root[0] ^= 1u;
+        ASSERT(zcl_dev_proof_receipt_seal(&parsed));
+        ASSERT(!zcl_dev_proof_receipt_validate(&parsed, local, base,
+                                               why, sizeof(why)));
+        parsed = receipt;
+        memset(parsed.compiler_root, 0, sizeof(parsed.compiler_root));
+        ASSERT(zcl_dev_proof_receipt_seal(&parsed));
+        ASSERT(!zcl_dev_proof_receipt_validate(&parsed, local, base,
+                                               why, sizeof(why)));
+        wire[100] ^= 1u;
+        ASSERT(zcl_dev_proof_receipt_parse(wire, sizeof(wire), &parsed));
+        ASSERT(!zcl_dev_proof_receipt_validate(&parsed, local, base,
+                                               why, sizeof(why)));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_dev_proof_receipt_requires_full_lint(void)
+{
+    int failures = 0;
+    static const char local[] =
+        "1111111111111111111111111111111111111111";
+    static const char base[] =
+        "2222222222222222222222222222222222222222";
+    TEST("proof policy: signed complete receipts require the lint dimension") {
+        struct zcl_dev_acceptance_receipt_v1 receipt =
+            ic_valid_dev_proof_receipt();
+        char why[128];
+        ASSERT(zcl_dev_proof_receipt_validate(&receipt, local, base,
+                                              why, sizeof(why)));
+        /* Keep the signature, child set and all remaining accounting valid:
+         * the only missing authority is mandatory lint coverage. */
+        memset(&receipt.dimensions[ZCL_DEV_PROOF_LINT], 0,
+               sizeof(receipt.dimensions[ZCL_DEV_PROOF_LINT]));
+        ASSERT(zcl_dev_proof_receipt_child_set_root(
+            &receipt, receipt.child_set_root));
+        ASSERT(zcl_dev_proof_receipt_seal(&receipt));
+        ASSERT(!zcl_dev_proof_receipt_validate(&receipt, local, base,
+                                               why, sizeof(why)));
+        ASSERT(strcmp(why, "receipt_lint_required") == 0);
+        receipt = ic_valid_dev_proof_receipt();
+        receipt.dimensions[ZCL_DEV_PROOF_LINT].selected = 2;
+        receipt.dimensions[ZCL_DEV_PROOF_LINT].reused = 2;
+        ASSERT(zcl_dev_proof_receipt_child_set_root(
+            &receipt, receipt.child_set_root));
+        ASSERT(zcl_dev_proof_receipt_seal(&receipt));
+        ASSERT(!zcl_dev_proof_receipt_validate(&receipt, local, base,
+                                               why, sizeof(why)));
+        ASSERT(strcmp(why, "receipt_lint_required") == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_dev_proof_child_action_identity(void)
+{
+    int failures = 0;
+    TEST("impact composition: proof child action is checkout-independent") {
+        char source[65], cas[65];
+        memset(source, '1', 64);
+        memset(cas, '2', 64);
+        source[64] = '\0';
+        cas[64] = '\0';
+        struct zcl_dev_proof_child_action_inputs_v1 inputs = {
+            .source_sha256_hex = source,
+            .source_cas_sha3_hex = cas,
+            .selector = "build_fabric,vcs_core",
+            .selected = 2,
+        };
+        memset(inputs.toolchain_capsule_root, 3, 32);
+        memset(inputs.flags_root, 4, 32);
+        memset(inputs.environment_root, 5, 32);
+        memset(inputs.build_graph_root, 6, 32);
+        struct vcs_build_action_v1 action_a = {0}, action_b = {0};
+        uint8_t root_a[32], root_b[32];
+        ASSERT(zcl_dev_proof_child_action_v1(
+            &inputs, ZCL_DEV_PROOF_TEST, &action_a, root_a));
+        ASSERT(zcl_dev_proof_child_action_v1(
+            &inputs, ZCL_DEV_PROOF_TEST, &action_b, root_b));
+        ASSERT(memcmp(root_a, root_b, sizeof(root_a)) == 0);
+        ASSERT(memcmp(&action_a, &action_b, sizeof(action_a)) == 0);
+        ASSERT(vcs_build_action_v1_work_kind(
+            VCS_BUILD_ACTION_KIND_RESIDENT_PROOF_CHILD_V1) == 0);
+
+        struct zcl_dev_proof_child_action_inputs_v1 changed = inputs;
+        changed.selected++;
+        ASSERT(zcl_dev_proof_child_action_v1(
+            &changed, ZCL_DEV_PROOF_TEST, &action_b, root_b));
+        ASSERT(memcmp(root_a, root_b, sizeof(root_a)) != 0);
+        changed = inputs;
+        changed.selector = "build_fabric";
+        ASSERT(zcl_dev_proof_child_action_v1(
+            &changed, ZCL_DEV_PROOF_TEST, &action_b, root_b));
+        ASSERT(memcmp(root_a, root_b, sizeof(root_a)) != 0);
+
+        uint8_t *mutable_roots[] = {
+            changed.toolchain_capsule_root, changed.flags_root,
+            changed.environment_root, changed.build_graph_root,
+        };
+        for (size_t i = 0; i < sizeof(mutable_roots) / sizeof(mutable_roots[0]);
+             i++) {
+            changed = inputs;
+            uint8_t *root = i == 0 ? changed.toolchain_capsule_root :
+                i == 1 ? changed.flags_root :
+                i == 2 ? changed.environment_root : changed.build_graph_root;
+            root[0] ^= 1u;
+            ASSERT(zcl_dev_proof_child_action_v1(
+                &changed, ZCL_DEV_PROOF_TEST, &action_b, root_b));
+            ASSERT(memcmp(root_a, root_b, sizeof(root_a)) != 0);
+        }
+        (void)mutable_roots;
+
+        char source_changed[65], cas_changed[65];
+        memcpy(source_changed, source, sizeof(source_changed));
+        memcpy(cas_changed, cas, sizeof(cas_changed));
+        source_changed[0] = '3';
+        changed = inputs;
+        changed.source_sha256_hex = source_changed;
+        ASSERT(zcl_dev_proof_child_action_v1(
+            &changed, ZCL_DEV_PROOF_TEST, &action_b, root_b));
+        ASSERT(memcmp(root_a, root_b, sizeof(root_a)) != 0);
+        cas_changed[0] = '3';
+        changed = inputs;
+        changed.source_cas_sha3_hex = cas_changed;
+        ASSERT(zcl_dev_proof_child_action_v1(
+            &changed, ZCL_DEV_PROOF_TEST, &action_b, root_b));
+        ASSERT(memcmp(root_a, root_b, sizeof(root_a)) != 0);
+
+        changed = inputs;
+        changed.selector = "";
+        ASSERT(!zcl_dev_proof_child_action_v1(
+            &changed, ZCL_DEV_PROOF_TEST, &action_b, root_b));
+        changed.selected = 0;
+        ASSERT(!zcl_dev_proof_child_action_v1(
+            &changed, ZCL_DEV_PROOF_COMPILE, &action_b, root_b));
+        changed.selected = 1;
+        ASSERT(zcl_dev_proof_child_action_v1(
+            &changed, ZCL_DEV_PROOF_COMPILE, &action_b, root_b));
+        ASSERT(memcmp(root_a, root_b, sizeof(root_a)) != 0);
+        ASSERT(zcl_dev_proof_child_action_v1(
+            &changed, ZCL_DEV_PROOF_LINT, &action_b, root_b));
+        char lint_input_hex[65];
+        zcl_hex_encode(action_b.input_root_sha3, 32, lint_input_hex);
+        /* Golden input root binds dimension 2, graph 0x06, selected 1,
+         * operation "lint-full", and the empty selector. */
+        ASSERT(strcmp(lint_input_hex,
+            "df01519d7e9678dce5f53ee2705c11d42c9b9078609b286b8a62df39d3caa011") == 0);
+        changed.selector = "unexpected";
+        ASSERT(!zcl_dev_proof_child_action_v1(
+            &changed, ZCL_DEV_PROOF_COMPILE, &action_b, root_b));
+        ASSERT(!zcl_dev_proof_child_action_v1(
+            NULL, ZCL_DEV_PROOF_COMPILE, &action_b, root_b));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* T7 pins the landing-machine defect found 2026-09-04: a `.failed` marker
+ * for the exact commit/base pair settled its outcome, yet `dev.proof.wait`
+ * reported the SAME status/BLOCKED exit 3 as "still proving" — a landing
+ * loop that treats exit 3 as "keep polling" then spins forever on a proof
+ * that already finished failing (observed: 44 rounds, 40 minutes of dead
+ * push-slot time against an idle child). The fix gives a settled failure
+ * its own terminal result (FAILED status, non-3 exit) so a caller can tell
+ * "still running" from "already lost" without parsing prose. It also pins
+ * that `dev.proof.ensure` does not re-queue a pair whose failure is
+ * already settled — an immutable commit/base identity would just re-derive
+ * the identical deterministic failure. */
+static int test_ic_proof_wait_reports_settled_failure(void)
+{
+    int failures = 0;
+    TEST("impact composition: proof wait reports a settled failure, not blocked") {
+#if !defined(_WIN32)
+        char root[4096];
+        static const char local[] =
+            "cccccccccccccccccccccccccccccccccccccccc";
+        static const char base[] =
+            "2222222222222222222222222222222222222222";
+        ASSERT(snprintf(root, sizeof(root),
+                        IC_FIX_ROOT "/proof_wait_failed_%ld",
+                        (long)getpid()) > 0);
+        ASSERT(ic_proof_private_write(root, "fixture", "proof wait fixture\n"));
+        char state_dir[4096], failure_rel[4096];
+        ASSERT(snprintf(state_dir, sizeof(state_dir),
+                        "%s/.cache/zcl-dev-proof", root) > 0);
+        ASSERT(snprintf(failure_rel, sizeof(failure_rel),
+                        ".cache/zcl-dev-proof/%s-%s.failed", local,
+                        base) > 0);
+        ASSERT(ic_proof_private_write(root, failure_rel, "child_proof_failed_exit_1"));
+
+        /* Two throwaway attempt directories for this exact pair, as a real
+         * failed proof leaves under attempts/<local>-<base>.XXXXXX/logs/
+         * (see proof_attempt_paths_prepare in tools/dev/dev_proof.c) — the
+         * flat .cache/zcl-dev-proof/logs/ directory is never written to.
+         * mkdtemp's suffix is random, not time-ordered, so pin distinct
+         * mtimes explicitly rather than relying on creation order. */
+        char older_marker[4096], newer_marker[4096];
+        char older_dir[4096], newer_dir[4096];
+        ASSERT(snprintf(older_marker, sizeof(older_marker),
+                        ".cache/zcl-dev-proof/attempts/%s-%s.older/logs/x",
+                        local, base) > 0);
+        ASSERT(snprintf(newer_marker, sizeof(newer_marker),
+                        ".cache/zcl-dev-proof/attempts/%s-%s.newer/logs/x",
+                        local, base) > 0);
+        ASSERT(ic_proof_private_write(root, older_marker, "stale attempt\n"));
+        ASSERT(ic_proof_private_write(root, newer_marker, "settled attempt\n"));
+        ASSERT(snprintf(older_dir, sizeof(older_dir),
+                        "%s/.cache/zcl-dev-proof/attempts/%s-%s.older",
+                        root, local, base) > 0);
+        ASSERT(snprintf(newer_dir, sizeof(newer_dir),
+                        "%s/.cache/zcl-dev-proof/attempts/%s-%s.newer",
+                        root, local, base) > 0);
+        struct utimbuf older_times = { .actime = 1700000000,
+                                       .modtime = 1700000000 };
+        struct utimbuf newer_times = { .actime = 1800000000,
+                                       .modtime = 1800000000 };
+        ASSERT(utime(older_dir, &older_times) == 0);
+        ASSERT(utime(newer_dir, &newer_times) == 0);
+        /* dev_proof.c canonicalizes repo_root to an absolute, symlink-
+         * resolved path (platform_directory_canonical_real) before it
+         * derives any state path, so the expected log dir must be built
+         * from that same canonical root, not the relative fixture path. */
+        char canonical_newer_dir[4096];
+        ASSERT(realpath(newer_dir, canonical_newer_dir) != NULL);
+        char expected_log_dir[4096];
+        ASSERT(snprintf(expected_log_dir, sizeof(expected_log_dir),
+                        "%s/logs", canonical_newer_dir) > 0);
+
+        /* Library layer: the settled pair reports FAILED immediately, no
+         * further wait or re-request. */
+        struct zcl_dev_proof_status status = {0};
+        ASSERT(zcl_dev_proof_wait(root, local, base, 50, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(strcmp(status.detail, "child_proof_failed_exit_1") == 0);
+        ASSERT(strcmp(status.log_dir, expected_log_dir) == 0);
+
+        /* Command-dispatch layer (tools/command/native_dev_proof_command.c):
+         * this is where the bug lived — proof_fail() hard-coded BLOCKED/
+         * exit 3 for every non-PASSED state, including a settled FAILED.
+         * zcl_dev_proof_wait_conclude() is the exact status/exit-code
+         * mapping `dev.proof.wait` applies to an already-resolved status;
+         * it is unconditional (no ZCL_DEV_BUILD dependency) precisely so
+         * this contract is directly testable here without a dev build. */
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.dev_proof_status.v1");
+        zcl_dev_proof_wait_conclude(&reply, &status);
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT(reply.exit_code == ZCL_COMMAND_EXIT_FAILED);
+        ASSERT(reply.exit_code != ZCL_COMMAND_EXIT_BLOCKED);
+        ASSERT(strcmp(reply.error.code, "PROOF_FAILED") == 0);
+        ASSERT(strcmp(reply.error.evidence, "child_proof_failed_exit_1") == 0);
+        const struct json_value *log_dir = json_get(&reply.data, "log_dir");
+        ASSERT(log_dir && log_dir->type == JSON_STR &&
+              json_get_str(log_dir)[0]);
+        ASSERT(strcmp(json_get_str(log_dir), expected_log_dir) == 0);
+        zcl_command_reply_free(&reply);
+
+        /* Regression guard on the other side of the same contract: a
+         * genuinely still-running proof stays BLOCKED/exit 3 — only a
+         * SETTLED failure gets the new terminal FAILED/exit-1 treatment. */
+        struct zcl_dev_proof_status running_status = {0};
+        running_status.state = ZCL_DEV_PROOF_STATE_RUNNING;
+        struct zcl_command_reply pending_reply;
+        zcl_command_reply_init(&pending_reply, "zcl.dev_proof_status.v1");
+        zcl_dev_proof_wait_conclude(&pending_reply, &running_status);
+        ASSERT(pending_reply.status == ZCL_COMMAND_STATUS_BLOCKED);
+        ASSERT(pending_reply.exit_code == ZCL_COMMAND_EXIT_BLOCKED);
+        zcl_command_reply_free(&pending_reply);
+
+        /* `dev.proof.ensure` must not re-queue a settled failure: no new
+         * request file should appear for this exact pair. */
+        struct zcl_dev_proof_status ensure_status = {0};
+        ASSERT(zcl_dev_proof_ensure(root, local, base, &ensure_status));
+        ASSERT(ensure_status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        char request_path[4096];
+        ASSERT(snprintf(request_path, sizeof(request_path),
+                        "%s/requests/%s-%s.request", state_dir, local,
+                        base) > 0);
+        ASSERT(access(request_path, F_OK) != 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_existing_watcher_input(void)
+{
+    int failures = 0;
+    TEST("proof ensure: attach-only ownership input is a typed boolean") {
+        const struct zcl_command_spec *spec = zcl_command_registry_find(
+            zcl_command_catalog(), "dev.proof.ensure", NULL);
+        ASSERT(spec != NULL);
+        ASSERT(strstr(spec->input_keys, "require_existing_watcher") != NULL);
+        const char *valid[] = {"{}", "{\"require_existing_watcher\":false}",
+                              "{\"require_existing_watcher\":true}"};
+        for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+            struct json_value input = {0};
+            char why[256];
+            ASSERT(json_read(&input, valid[i], strlen(valid[i])));
+            ASSERT(zcl_command_registry_input_validate(spec, &input, why, sizeof(why)));
+            json_free(&input);
+        }
+        const char *invalid[] = {"null", "1", "\"true\"", "[]", "{}"};
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            char raw[128];
+            snprintf(raw, sizeof(raw), "{\"require_existing_watcher\":%s}", invalid[i]);
+            struct json_value input = {0};
+            ASSERT(json_read(&input, raw, strlen(raw)));
+            struct zcl_command_request request = { .spec = spec, .input = &input };
+            struct zcl_command_reply reply;
+            zcl_command_reply_init(&reply, "zcl.dev_proof_status.v1");
+            zcl_native_dev_proof_dispatch(&request, &reply);
+            ASSERT(reply.exit_code == ZCL_COMMAND_EXIT_INVALID);
+            ASSERT(strcmp(reply.error.code, "BAD_INPUT") == 0);
+            ASSERT(!reply.error.mutated);
+            zcl_command_reply_free(&reply);
+            json_free(&input);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_retry_command_contract(void)
+{
+    int failures = 0;
+    TEST("proof retry: native command has local scheduling authority only") {
+        const struct zcl_command_spec *spec = zcl_command_registry_find(
+            zcl_command_catalog(), "dev.proof.retry", NULL);
+        ASSERT(spec != NULL);
+        ASSERT(spec->effect == ZCL_COMMAND_EFFECT_MUTATE);
+        ASSERT(spec->scope == ZCL_COMMAND_SCOPE_LOCAL);
+        ASSERT(spec->authority == ZCL_COMMAND_AUTH_OWNER);
+        ASSERT(spec->required_capabilities == ZCL_COMMAND_CAP_DEV_STATE_WRITE);
+        ASSERT(strcmp(spec->input_keys, "root,local_commit,remote_base") == 0);
+#ifndef ZCL_DEV_BUILD
+        struct zcl_command_request request = { .spec = spec };
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.dev_proof_status.v1");
+        zcl_native_dev_proof_dispatch(&request, &reply);
+        ASSERT(reply.exit_code == ZCL_COMMAND_EXIT_BLOCKED);
+        ASSERT(strcmp(reply.error.code, "DEV_BUILD_REQUIRED") == 0);
+        zcl_command_reply_free(&reply);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+static int test_ic_proof_next_preserves_root(void)
+{
+    int failures = 0;
+    TEST("proof next action: escaped checkout root survives status, retry and wait") {
+        static const char local[] = "1111111111111111111111111111111111111111";
+        static const char base[] = "2222222222222222222222222222222222222222";
+        char fixture[4096], root[4096], relative[256], canonical[4096];
+        test_make_tmpdir(fixture, sizeof(fixture), "impact_composition", "next-root");
+        ASSERT((size_t)snprintf(root, sizeof(root), "%s/checkout \"B\"\\leaf", fixture) < sizeof(root));
+        ASSERT((size_t)snprintf(relative, sizeof(relative),
+            ".cache/zcl-dev-proof/%s-%s.failed", local, base) < sizeof(relative));
+        ASSERT(ic_write(root, relative, "prerequisite_missing\n"));
+        ASSERT(realpath(root, canonical) != NULL);
+        struct zcl_dev_proof_status status = {0};
+        /* Query B while the test process still runs in the main checkout.
+         * The status must retain B's canonical root, not the caller's cwd. */
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(strcmp(status.root, canonical) == 0);
+        for (size_t i = 0; i < 2; i++) {
+            struct zcl_command_reply reply;
+            zcl_command_reply_init(&reply, "zcl.dev_proof_status.v1");
+            zcl_dev_proof_status_conclude(&reply, &status);
+            ASSERT(reply.next_count == 1);
+            ASSERT(strcmp(reply.next[0].command,
+                           i == 0 ? "dev.proof.retry" : "dev.proof.wait") == 0);
+            struct json_value input = {0};
+            ASSERT(json_read(&input, reply.next[0].input_json,
+                             strlen(reply.next[0].input_json)));
+            const struct json_value *next_root = json_get(&input, "root");
+            ASSERT(next_root != NULL && next_root->type == JSON_STR);
+            ASSERT(strcmp(json_get_str(next_root), canonical) == 0);
+            ASSERT(strcmp(json_get_str(json_get(&input, "local_commit")), local) == 0);
+            ASSERT(strcmp(json_get_str(json_get(&input, "remote_base")), base) == 0);
+            json_free(&input);
+            zcl_command_reply_free(&reply);
+            status.state = ZCL_DEV_PROOF_STATE_RUNNING;
+        }
+        /* The bounded next-action field cannot hold every legal root.
+         * Omit an oversized action instead of truncating or dropping root. */
+        memset(status.root, 'x', sizeof(status.root) - 1);
+        status.root[sizeof(status.root) - 1] = 0;
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.dev_proof_status.v1");
+        zcl_dev_proof_status_conclude(&reply, &status);
+        ASSERT(reply.next_count == 0);
+        zcl_command_reply_free(&reply);
+        ASSERT(test_rm_rf_recursive(fixture) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_bytes_equal(const char *path, const void *expected, size_t size)
+{
+    if (size > ZCL_DEV_PROOF_WIRE_BYTES) return false;
+    uint8_t body[ZCL_DEV_PROOF_WIRE_BYTES];
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    size_t got = fread(body, 1, sizeof(body), file);
+    bool ok = !ferror(file) && got == size && memcmp(body, expected, size) == 0;
+    return fclose(file) == 0 && ok;
+}
+
+static int test_ic_proof_environment_no_verdict(void)
+{
+    int failures = 0;
+    TEST("proof environment: stale producer has no candidate verdict and preserves attempt") {
+        static const char local[] = "1111111111111111111111111111111111111111";
+        static const char base[] = "2222222222222222222222222222222222222222";
+        static const char candidate[] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        static const char producer[] =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        char root[4096], state[4096], relative[256], attempt[4096];
+        char archived[4096], reason[128];
+        test_make_tmpdir(root, sizeof(root), "impact_composition", "environment");
+        ASSERT(ic_proof_private_write(root, ".cache/fixture", "isolated producer refusal\n"));
+        ASSERT(!zcl_dev_proof_producer_source_qualified(candidate, producer,
+                                                        reason, sizeof(reason)));
+        ASSERT_STR_EQ(reason, "proof_producer_source_mismatch");
+        ASSERT((size_t)snprintf(state, sizeof(state), "%s/.cache/zcl-dev-proof", root) < sizeof(state));
+        ASSERT((size_t)snprintf(relative, sizeof(relative), "%s-%s.failed", local, base) < sizeof(relative));
+        ASSERT(ic_proof_private_write(state, relative, reason));
+        ASSERT((size_t)snprintf(attempt, sizeof(attempt), "%s/attempts/%s-%s.prior", state, local, base) < sizeof(attempt));
+        ASSERT(ic_proof_private_write(attempt, "logs/failure.txt", reason));
+        ASSERT((size_t)snprintf(archived, sizeof(archived), "%s/logs/failure.txt", attempt) < sizeof(archived));
+        struct zcl_dev_proof_status status = {0};
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT_STR_EQ(zcl_dev_proof_state_name(status.state), "no_verdict");
+        ASSERT(!zcl_dev_proof_queue_has_pending(root));
+        ASSERT(zcl_dev_proof_ensure(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT(zcl_dev_proof_queue_has_pending(root));
+        ASSERT(ic_bytes_equal(archived, reason, strlen(reason)));
+        /* Consume only this private request through the actual native worker.
+         * This non-repository refuses before build and cannot admit a receipt. */
+        char why[256] = {0};
+        ASSERT(zcl_dev_proof_queue_run_next(root, why, sizeof(why)) == 1);
+        ASSERT(why[0]);
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(status.state != ZCL_DEV_PROOF_STATE_PASSED);
+        ASSERT(strstr(status.log_dir, ".prior/logs") == NULL);
+        ASSERT(ic_bytes_equal(archived, reason, strlen(reason)));
+        ASSERT(access(status.receipt_path, F_OK) != 0);
+        char first_logs[4096];
+        ASSERT((size_t)snprintf(first_logs, sizeof(first_logs), "%s", status.log_dir) < sizeof(first_logs));
+        /* A repeated environmental observation gets another identity; it
+         * never overwrites either earlier native attempt or its archive. */
+        ASSERT(ic_proof_private_write(state, relative, reason));
+        ASSERT(zcl_dev_proof_ensure(root, local, base, &status));
+        ASSERT(zcl_dev_proof_ensure(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT(zcl_dev_proof_queue_run_next(root, why, sizeof(why)) == 1);
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(strcmp(first_logs, status.log_dir) != 0);
+        ASSERT(access(first_logs, F_OK) == 0);
+        ASSERT(ic_bytes_equal(archived, reason, strlen(reason)));
+        ASSERT(access(status.receipt_path, F_OK) != 0);
+        /* Only exact known pre-test tokens qualify, never a prefix or
+         * arbitrary unknown candidate failure. */
+        ASSERT(ic_proof_private_write(state, relative, "proof_producer_source_mismatch:unknown"));
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(zcl_dev_proof_ensure(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(!zcl_dev_proof_queue_has_pending(root));
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_retry(void)
+{
+    int failures = 0;
+    TEST("proof retry: explicit settled retry preserves evidence and serializes requests") {
+        static const char local[] = "1111111111111111111111111111111111111111";
+        static const char base[] = "2222222222222222222222222222222222222222";
+        static const char reason[] = "proof_generation_dependency_unavailable:vendor/lib\n";
+        char root[4096], state[4096], key[160], failed[4096];
+        char attempt[4096], logs[4096], archived[4096], request[4096];
+        test_make_tmpdir(root, sizeof(root), "impact_composition", "retry");
+        ASSERT(ic_proof_private_write(root, ".cache/fixture", "isolated retry\n"));
+        ASSERT((size_t)snprintf(state, sizeof(state), "%s/.cache/zcl-dev-proof",
+                                root) < sizeof(state));
+        ASSERT((size_t)snprintf(key, sizeof(key), "%s-%s", local, base) < sizeof(key));
+        ASSERT((size_t)snprintf(failed, sizeof(failed), "%s/%s.failed", state, key) < sizeof(failed));
+        char relative[256];
+        ASSERT((size_t)snprintf(relative, sizeof(relative), "%s.failed", key) < sizeof(relative));
+        ASSERT(ic_proof_private_write(state, relative, reason));
+        struct zcl_dev_proof_status status = {0};
+        ASSERT((size_t)snprintf(request, sizeof(request), "%s/requests/%s.request", state, key) < sizeof(request));
+        ASSERT(chmod(failed, 0660) == 0);
+        ASSERT(!zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(strcmp(status.detail, "proof_retry_failure_evidence_invalid") == 0);
+        ASSERT(ic_bytes_equal(failed, reason, sizeof(reason) - 1));
+        ASSERT(access(request, F_OK) != 0);
+        ASSERT(chmod(failed, 0600) == 0);
+        ASSERT(!zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(strcmp(status.detail, "proof_retry_failure_attempt_missing") == 0);
+        ASSERT((size_t)snprintf(attempt, sizeof(attempt), "%s/attempts/%s.prior", state, key) < sizeof(attempt));
+        ASSERT(ic_proof_private_write(attempt, "logs/test.log", "original failed observation\n"));
+        ASSERT((size_t)snprintf(logs, sizeof(logs), "%s/logs/test.log", attempt) < sizeof(logs));
+        ASSERT((size_t)snprintf(archived, sizeof(archived), "%s/logs/failure.txt", attempt) < sizeof(archived));
+        struct utimbuf prior_time = { .actime = 1700000000, .modtime = 1700000000 };
+        ASSERT(utime(attempt, &prior_time) == 0);
+        ASSERT(zcl_dev_proof_ensure(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(access(request, F_OK) != 0);
+
+        /* A live lease or legacy running marker wins over the failure. */
+        char marker[4096], marker_body[256];
+        ASSERT((size_t)snprintf(relative, sizeof(relative), "leases/%s.lease", key) < sizeof(relative));
+        ASSERT((size_t)snprintf(marker, sizeof(marker), "%s/%s", state, relative) < sizeof(marker));
+        ASSERT((size_t)snprintf(marker_body, sizeof(marker_body), "prior %ld 1700000000\n", (long)getpid()) < sizeof(marker_body));
+        ASSERT(ic_proof_private_write(state, relative, marker_body));
+        ASSERT(!zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT(unlink(marker) == 0);
+        ASSERT((size_t)snprintf(relative, sizeof(relative), "%s.running", key) < sizeof(relative));
+        ASSERT((size_t)snprintf(marker, sizeof(marker), "%s/%s", state, relative) < sizeof(marker));
+        ASSERT((size_t)snprintf(marker_body, sizeof(marker_body), "%ld 1700000000\n", (long)getpid()) < sizeof(marker_body));
+        ASSERT(ic_proof_private_write(state, relative, marker_body));
+        ASSERT(!zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT(ic_proof_private_write(state, relative, "unparseable worker marker\n"));
+        ASSERT(!zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(strcmp(status.detail, "proof_retry_worker_not_settled") == 0);
+        ASSERT(unlink(marker) == 0);
+
+        ASSERT((size_t)snprintf(relative, sizeof(relative), "requests/%s.request", key) < sizeof(relative));
+        ASSERT(ic_proof_private_write(state, relative, "malformed pending request\n"));
+        ASSERT(!zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(strcmp(status.detail, "proof_retry_request_present") == 0);
+        ASSERT(unlink(request) == 0);
+        ASSERT(ic_proof_private_write(attempt, "logs/failure.txt", "conflicting evidence\n"));
+        ASSERT(!zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(strcmp(status.detail, "proof_retry_failure_archive_conflict") == 0);
+        ASSERT(ic_bytes_equal(archived, "conflicting evidence\n", strlen("conflicting evidence\n")));
+        ASSERT(access(request, F_OK) != 0);
+        ASSERT(unlink(archived) == 0);
+
+        int start[2];
+        ASSERT(pipe(start) == 0);
+        pid_t children[2];
+        for (size_t i = 0; i < 2; i++) {
+            children[i] = fork();
+            ASSERT(children[i] >= 0);
+            if (children[i] == 0) {
+                (void)close(start[1]);
+                char token;
+                if (read(start[0], &token, 1) != 1) _exit(3);
+                (void)close(start[0]);
+                struct zcl_dev_proof_status child_status = {0};
+                bool queued = zcl_dev_proof_retry(root, local, base, &child_status);
+                _exit(queued ? 0 : child_status.state == ZCL_DEV_PROOF_STATE_RUNNING ? 1 : 2);
+            }
+        }
+        ASSERT(close(start[0]) == 0);
+        ASSERT(write(start[1], "go", 2) == 2);
+        ASSERT(close(start[1]) == 0);
+        int queued_count = 0, refused_count = 0;
+        for (size_t i = 0; i < 2; i++) {
+            int child_status = 0;
+            ASSERT(waitpid(children[i], &child_status, 0) == children[i]);
+            ASSERT(WIFEXITED(child_status));
+            queued_count += WEXITSTATUS(child_status) == 0;
+            refused_count += WEXITSTATUS(child_status) == 1;
+        }
+        ASSERT(queued_count == 1 && refused_count == 1);
+        ASSERT(ic_bytes_equal(failed, reason, sizeof(reason) - 1));
+        ASSERT(ic_bytes_equal(archived, reason, sizeof(reason) - 1));
+        ASSERT(ic_bytes_equal(logs, "original failed observation\n", strlen("original failed observation\n")));
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT(strcmp(status.detail, "resident_proof_request_queued") == 0);
+        /* The queued status also carries the request's unclaimed age — the
+         * honest liveness number behind RUNNING. A freshly written request
+         * reads young; the same request backdated two hours reads its real
+         * age, so a silent resident can no longer masquerade as "a worker
+         * is coming" for a day (observed 36h, 2026-09-09). */
+        ASSERT(status.request_age_s >= 0 && status.request_age_s < 60);
+        struct timespec aged[2];
+        aged[0].tv_sec = time(NULL) - 7200;
+        aged[0].tv_nsec = 0;
+        aged[1] = aged[0];
+        ASSERT(utimensat(AT_FDCWD, request, aged, 0) == 0);
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT(status.request_age_s >= 7199);
+        ASSERT(!zcl_dev_proof_retry(root, local, base, &status));
+
+        /* Crash window 1: B claimed the request and produced logs, but
+         * exited before recording any failure. The pair marker still
+         * belongs to A, even though B is the newest attempt directory. */
+        char crashed[4096], claimed[4096], crash_archive[4096];
+        ASSERT((size_t)snprintf(crashed, sizeof(crashed), "%s/attempts/%s.crashed", state, key) < sizeof(crashed));
+        ASSERT(ic_proof_private_write(crashed, "logs/test.log", "interrupted attempt B\n"));
+        ASSERT((size_t)snprintf(claimed, sizeof(claimed), "%s/request", crashed) < sizeof(claimed));
+        ASSERT((size_t)snprintf(crash_archive, sizeof(crash_archive), "%s/logs/failure.txt", crashed) < sizeof(crash_archive));
+        ASSERT(rename(request, claimed) == 0);
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(strstr(status.log_dir, ".prior/logs") != NULL);
+        ASSERT(zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(access(crash_archive, F_OK) != 0);
+        ASSERT(ic_bytes_equal(archived, reason, sizeof(reason) - 1));
+
+        /* Crash window 2: B wrote its own failure archive, then exited
+         * before updating the flat marker. A still owns that marker;
+         * B's distinct evidence is retained without becoming a conflict. */
+        ASSERT(unlink(request) == 0);
+        ASSERT(ic_proof_private_write(crashed, "logs/failure.txt", "interrupted B failure\n"));
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(strstr(status.log_dir, ".prior/logs") != NULL);
+        ASSERT(zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(ic_bytes_equal(crash_archive, "interrupted B failure\n", strlen("interrupted B failure\n")));
+        ASSERT(ic_bytes_equal(failed, reason, sizeof(reason) - 1));
+
+        /* The actual queue claims a new attempt and runs the normal worker.
+         * This isolated non-repository fails exact-tree validation before
+         * any build, preserving the old attempt and creating no receipt. */
+        char why[256] = {0};
+        ASSERT(zcl_dev_proof_queue_run_next(root, why, sizeof(why)) == 1);
+        ASSERT(why[0]);
+        ASSERT(!zcl_dev_proof_queue_has_pending(root));
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(strstr(status.log_dir, ".prior/logs") == NULL);
+        ASSERT((size_t)snprintf(marker, sizeof(marker), "%s/failure.txt", status.log_dir) < sizeof(marker));
+        ASSERT(ic_bytes_equal(marker, why, strlen(why)));
+        ASSERT(ic_bytes_equal(archived, reason, sizeof(reason) - 1));
+        ASSERT(zcl_dev_proof_ensure(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(!zcl_dev_proof_queue_has_pending(root));
+
+        /* An admitted receipt is immutable even when an older failure
+         * marker remains beside it. */
+        struct zcl_dev_acceptance_receipt_v1 receipt = ic_valid_dev_proof_receipt();
+        uint8_t wire[ZCL_DEV_PROOF_WIRE_BYTES];
+        ASSERT(zcl_dev_proof_receipt_serialize(&receipt, wire));
+        FILE *file = fopen(status.receipt_path, "wb");
+        ASSERT(file != NULL);
+        ASSERT(fwrite(wire, 1, sizeof(wire), file) == sizeof(wire));
+        ASSERT(fclose(file) == 0);
+        ASSERT(chmod(status.receipt_path, 0600) == 0);
+        ASSERT(!zcl_dev_proof_retry(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_PASSED);
+        ASSERT(ic_bytes_equal(status.receipt_path, wire, sizeof(wire)));
+        ASSERT(!zcl_dev_proof_queue_has_pending(root));
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+/* Plants the admitted receipt for the pair at its receipt path, as the retry
+ * test does: the serialized fixture receipt, private mode. */
+static bool ic_plant_passing_receipt(const char *state, const char *key)
+{
+    char relative[256], path[4096];
+    uint8_t wire[ZCL_DEV_PROOF_WIRE_BYTES];
+    struct zcl_dev_acceptance_receipt_v1 receipt = ic_valid_dev_proof_receipt();
+    if (snprintf(relative, sizeof(relative), "receipts/%s.receipt", key) <= 0 ||
+        snprintf(path, sizeof(path), "%s/%s", state, relative) <= 0)
+        return false;
+    if (!zcl_dev_proof_receipt_serialize(&receipt, wire)) return false;
+    if (!ic_proof_private_write(state, relative, "")) return false;
+    FILE *file = fopen(path, "wb");
+    if (!file) return false;
+    bool written = fwrite(wire, 1, sizeof(wire), file) == sizeof(wire);
+    return fclose(file) == 0 && written && chmod(path, 0600) == 0;
+}
+
+static int test_ic_proof_ensure_passed_writes_no_request(void)
+{
+    int failures = 0;
+    TEST("ensure writes no request for a pair with a passing receipt") {
+        static const char local[] = "1111111111111111111111111111111111111111";
+        static const char base[] = "2222222222222222222222222222222222222222";
+        char root[4096], state[4096], key[160], request[4096];
+        test_make_tmpdir(root, sizeof(root), "impact_composition", "ensure-passed");
+        ASSERT(ic_proof_private_write(root, ".cache/fixture", "passing receipt\n"));
+        ASSERT((size_t)snprintf(state, sizeof(state), "%s/.cache/zcl-dev-proof",
+                                root) < sizeof(state));
+        ASSERT((size_t)snprintf(key, sizeof(key), "%s-%s", local, base) < sizeof(key));
+        ASSERT((size_t)snprintf(request, sizeof(request), "%s/requests/%s.request", state, key) < sizeof(request));
+        ASSERT(ic_plant_passing_receipt(state, key));
+        struct zcl_dev_proof_status status = {0};
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_PASSED);
+        ASSERT(access(request, F_OK) != 0);
+        ASSERT(zcl_dev_proof_ensure(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_PASSED);
+        ASSERT(access(request, F_OK) != 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_leftover_request_never_hides_passed(void)
+{
+    int failures = 0;
+    TEST("a leftover request never hides a passing receipt") {
+        static const char local[] = "1111111111111111111111111111111111111111";
+        static const char base[] = "2222222222222222222222222222222222222222";
+        char root[4096], state[4096], key[160], request[4096], relative[256];
+        char body[320];
+        test_make_tmpdir(root, sizeof(root), "impact_composition", "leftover-request");
+        ASSERT(ic_proof_private_write(root, ".cache/fixture", "passing receipt\n"));
+        ASSERT((size_t)snprintf(state, sizeof(state), "%s/.cache/zcl-dev-proof",
+                                root) < sizeof(state));
+        ASSERT((size_t)snprintf(key, sizeof(key), "%s-%s", local, base) < sizeof(key));
+        ASSERT((size_t)snprintf(request, sizeof(request), "%s/requests/%s.request", state, key) < sizeof(request));
+        ASSERT(ic_plant_passing_receipt(state, key));
+        ASSERT((size_t)snprintf(relative, sizeof(relative), "requests/%s.request", key) < sizeof(relative));
+        ASSERT((size_t)snprintf(body, sizeof(body), "zcl.dev_proof_request.v1\n%s\n%s\n1\n1\n", local, base) < sizeof(body));
+        ASSERT(ic_proof_private_write(state, relative, body));
+        ASSERT(access(request, F_OK) == 0);
+        struct zcl_dev_proof_status status = {0};
+        ASSERT(zcl_dev_proof_status_read(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_PASSED);
+        ASSERT(strcmp(status.detail, "resident_proof_request_queued") != 0);
+        ASSERT(zcl_dev_proof_ensure(root, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_PASSED);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+static int test_ic_resident_proof_queue(void)
+{
+    int failures = 0;
+    TEST("impact composition: resident proof queue preserves unknown ancestry") {
+#if defined(_WIN32)
+        static const char local[] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        static const char base[] =
+            "1111111111111111111111111111111111111111";
+        struct zcl_dev_proof_status status = {0};
+        ASSERT(!zcl_dev_proof_queue_has_pending(IC_FIX_ROOT));
+        ASSERT(zcl_dev_proof_status_read(IC_FIX_ROOT, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_INVALID);
+        ASSERT(strcmp(status.detail,
+                      "windows_native_proof_worker_unavailable") == 0);
+        ASSERT(!zcl_dev_proof_retry(IC_FIX_ROOT, local, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_INVALID);
+        ASSERT(strcmp(status.detail,
+                      "windows_native_proof_worker_unavailable") == 0);
+        memset(&status, 0, sizeof(status));
+        ASSERT(!zcl_dev_proof_wait(IC_FIX_ROOT, local, base, 300000, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_INVALID);
+        ASSERT(strcmp(status.detail,
+                      "windows_native_proof_worker_unavailable") == 0);
+#else
+        char root[4096];
+        static const char local_a[] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        static const char local_b[] =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        static const char base[] =
+            "1111111111111111111111111111111111111111";
+        ASSERT(snprintf(root, sizeof(root), IC_FIX_ROOT "/proof_queue_%ld",
+                        (long)getpid()) > 0);
+        ASSERT(ic_write(root, "fixture", "proof queue fixture\n"));
+        ASSERT(ic_write(root, ".cache/fixture", "private state parent\n"));
+        struct zcl_dev_proof_status status = {0};
+        ASSERT(zcl_dev_proof_ensure(root, local_a, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT(strcmp(status.detail, "resident_proof_request_queued") == 0);
+        ASSERT(zcl_dev_proof_ensure(root, local_b, base, &status));
+        ASSERT(zcl_dev_proof_queue_has_pending(root));
+        char why[256] = {0};
+        ASSERT(zcl_dev_proof_queue_run_next(root, why, sizeof(why)) == 1);
+        ASSERT(why[0]);
+        ASSERT(zcl_dev_proof_queue_has_pending(root));
+        ASSERT(zcl_dev_proof_status_read(root, local_a, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT(zcl_dev_proof_status_read(root, local_b, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        why[0] = 0;
+        ASSERT(zcl_dev_proof_queue_run_next(root, why, sizeof(why)) == 1);
+        ASSERT(why[0]);
+        ASSERT(!zcl_dev_proof_queue_has_pending(root));
+        ASSERT(zcl_dev_proof_status_read(root, local_a, base, &status));
+        ASSERT(status.state == ZCL_DEV_PROOF_STATE_FAILED);
+        char lease[4096];
+        ASSERT(snprintf(lease, sizeof(lease),
+                        "%s/.cache/zcl-dev-proof/leases/%s-%s.lease",
+                        root, local_b, base) > 0);
+        ASSERT(access(lease, F_OK) != 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_cycle_reuse_requires_exact_proof_inputs(void)
+{
+    int failures = 0;
+    static const char source[] =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    static const char inputs[] =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    static const char stale[] =
+        "3333333333333333333333333333333333333333333333333333333333333333";
+    static const char compile_root[] =
+        "4444444444444444444444444444444444444444444444444444444444444444";
+    static const char lint_root[] =
+        "5555555555555555555555555555555555555555555555555555555555555555";
+    static const char test_root[] =
+        "6666666666666666666666666666666666666666666666666666666666666666";
+    static const char shared_root[] =
+        "7777777777777777777777777777777777777777777777777777777777777777";
+    struct zcl_dev_proof_dimension dimensions[ZCL_DEV_PROOF_DIMENSIONS] = {0};
+    dimensions[ZCL_DEV_PROOF_COMPILE].selected = 1;
+    memset(dimensions[ZCL_DEV_PROOF_COMPILE].receipt_root, 0x44,
+           ZCL_DEV_PROOF_ROOT_BYTES);
+    dimensions[ZCL_DEV_PROOF_LINT].selected = 1;
+    memset(dimensions[ZCL_DEV_PROOF_LINT].receipt_root, 0x55,
+           ZCL_DEV_PROOF_ROOT_BYTES);
+    dimensions[ZCL_DEV_PROOF_TEST].selected = 2;
+    memset(dimensions[ZCL_DEV_PROOF_TEST].receipt_root, 0x66,
+           ZCL_DEV_PROOF_ROOT_BYTES);
+    char exact[1024];
+    int exact_len = snprintf(
+        exact, sizeof(exact),
+        "{\"schema\":\"zcl.dev_cycle.v1\",\"status\":\"passed\","
+        "\"phase\":\"verify\",\"proof_complete\":true,"
+        "\"proof_scope\":\"source_wide_compile_tests_lint_fast\","
+        "\"source_cas_sha3\":\"%s\",\"proof_inputs_sha3\":\"%s\","
+        "\"proof_compile_root_sha3\":\"%s\","
+        "\"proof_lint_root_sha3\":\"%s\","
+        "\"proof_test_root_sha3\":\"%s\"}",
+        source, inputs, compile_root, lint_root, test_root);
+    char missing[1024];
+    int missing_len = snprintf(
+        missing, sizeof(missing),
+        "{\"schema\":\"zcl.dev_cycle.v1\",\"status\":\"passed\","
+        "\"phase\":\"verify\",\"proof_complete\":true,"
+        "\"proof_scope\":\"source_wide_compile_tests_lint_fast\","
+        "\"source_cas_sha3\":\"%s\","
+        "\"proof_compile_root_sha3\":\"%s\","
+        "\"proof_lint_root_sha3\":\"%s\","
+        "\"proof_test_root_sha3\":\"%s\"}",
+        source, compile_root, lint_root, test_root);
+    char wrong_schema[1024];
+    int wrong_schema_len = snprintf(
+        wrong_schema, sizeof(wrong_schema),
+        "{\"schema\":\"zcl.dev_cycle.v2\",\"status\":\"passed\","
+        "\"phase\":\"verify\",\"proof_complete\":true,"
+        "\"proof_scope\":\"source_wide_compile_tests_lint_fast\","
+        "\"source_cas_sha3\":\"%s\",\"proof_inputs_sha3\":\"%s\","
+        "\"proof_compile_root_sha3\":\"%s\","
+        "\"proof_lint_root_sha3\":\"%s\","
+        "\"proof_test_root_sha3\":\"%s\"}",
+        source, inputs, compile_root, lint_root, test_root);
+    char duplicate_source[1152];
+    int duplicate_source_len = snprintf(
+        duplicate_source, sizeof(duplicate_source),
+        "{\"schema\":\"zcl.dev_cycle.v1\",\"status\":\"passed\","
+        "\"phase\":\"verify\",\"proof_complete\":true,"
+        "\"proof_scope\":\"source_wide_compile_tests_lint_fast\","
+        "\"source_cas_sha3\":\"%s\",\"source_cas_sha3\":\"%s\","
+        "\"proof_inputs_sha3\":\"%s\","
+        "\"proof_compile_root_sha3\":\"%s\","
+        "\"proof_lint_root_sha3\":\"%s\","
+        "\"proof_test_root_sha3\":\"%s\"}",
+        source, stale, inputs, compile_root, lint_root, test_root);
+    char duplicate_dimension[1152];
+    int duplicate_dimension_len = snprintf(
+        duplicate_dimension, sizeof(duplicate_dimension),
+        "{\"schema\":\"zcl.dev_cycle.v1\",\"status\":\"passed\","
+        "\"phase\":\"verify\",\"proof_complete\":true,"
+        "\"proof_scope\":\"source_wide_compile_tests_lint_fast\","
+        "\"source_cas_sha3\":\"%s\",\"proof_inputs_sha3\":\"%s\","
+        "\"proof_compile_root_sha3\":\"%s\","
+        "\"proof_compile_root_sha3\":\"%s\","
+        "\"proof_lint_root_sha3\":\"%s\","
+        "\"proof_test_root_sha3\":\"%s\"}",
+        source, inputs, compile_root, shared_root, lint_root, test_root);
+    char shared_dimensions[1024];
+    int shared_dimensions_len = snprintf(
+        shared_dimensions, sizeof(shared_dimensions),
+        "{\"schema\":\"zcl.dev_cycle.v1\",\"status\":\"passed\","
+        "\"phase\":\"verify\",\"proof_complete\":true,"
+        "\"proof_scope\":\"source_wide_compile_tests_lint_fast\","
+        "\"source_cas_sha3\":\"%s\",\"proof_inputs_sha3\":\"%s\","
+        "\"proof_compile_root_sha3\":\"%s\","
+        "\"proof_lint_root_sha3\":\"%s\","
+        "\"proof_test_root_sha3\":\"%s\"}",
+        source, inputs, shared_root, shared_root, shared_root);
+    TEST("impact composition: cycle reuse binds exact independent proof inputs") {
+        ASSERT(exact_len > 0 && (size_t)exact_len < sizeof(exact));
+        ASSERT(missing_len > 0 && (size_t)missing_len < sizeof(missing));
+        ASSERT(wrong_schema_len > 0 &&
+               (size_t)wrong_schema_len < sizeof(wrong_schema));
+        ASSERT(duplicate_source_len > 0 &&
+               (size_t)duplicate_source_len < sizeof(duplicate_source));
+        ASSERT(duplicate_dimension_len > 0 &&
+               (size_t)duplicate_dimension_len <
+                   sizeof(duplicate_dimension));
+        ASSERT(shared_dimensions_len > 0 &&
+               (size_t)shared_dimensions_len < sizeof(shared_dimensions));
+        ASSERT(zcl_dev_proof_cycle_reuse_admissible(
+            exact, (size_t)exact_len, source, inputs, dimensions));
+        ASSERT(!zcl_dev_proof_cycle_reuse_admissible(
+            exact, (size_t)exact_len, source, stale, dimensions));
+        ASSERT(!zcl_dev_proof_cycle_reuse_admissible(
+            missing, (size_t)missing_len, source, inputs, dimensions));
+        ASSERT(!zcl_dev_proof_cycle_reuse_admissible(
+            exact, (size_t)exact_len, source, NULL, dimensions));
+        ASSERT(!zcl_dev_proof_cycle_reuse_admissible(
+            wrong_schema, (size_t)wrong_schema_len, source, inputs,
+            dimensions));
+        ASSERT(!zcl_dev_proof_cycle_reuse_admissible(
+            duplicate_source, (size_t)duplicate_source_len, source, inputs,
+            dimensions));
+        ASSERT(!zcl_dev_proof_cycle_reuse_admissible(
+            duplicate_dimension, (size_t)duplicate_dimension_len,
+            source, inputs, dimensions));
+        struct zcl_dev_proof_dimension shared[ZCL_DEV_PROOF_DIMENSIONS] = {0};
+        shared[ZCL_DEV_PROOF_COMPILE].selected = 1;
+        shared[ZCL_DEV_PROOF_LINT].selected = 1;
+        shared[ZCL_DEV_PROOF_TEST].selected = 2;
+        memset(shared[ZCL_DEV_PROOF_COMPILE].receipt_root, 0x77,
+               ZCL_DEV_PROOF_ROOT_BYTES);
+        memset(shared[ZCL_DEV_PROOF_LINT].receipt_root, 0x77,
+               ZCL_DEV_PROOF_ROOT_BYTES);
+        memset(shared[ZCL_DEV_PROOF_TEST].receipt_root, 0x77,
+               ZCL_DEV_PROOF_ROOT_BYTES);
+        ASSERT(!zcl_dev_proof_cycle_reuse_admissible(
+            shared_dimensions, (size_t)shared_dimensions_len, source, inputs,
+            shared));
+        struct zcl_dev_proof_dimension mismatched[ZCL_DEV_PROOF_DIMENSIONS];
+        memcpy(mismatched, dimensions, sizeof(mismatched));
+        mismatched[ZCL_DEV_PROOF_TEST].receipt_root[0] ^= 1u;
+        ASSERT(!zcl_dev_proof_cycle_reuse_admissible(
+            exact, (size_t)exact_len, source, inputs, mismatched));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_native_compositor_selects_physical_proof(void)
+{
+    int failures = 0;
+    TEST("impact composition: every native compositor path selects UI proof") {
+        static const char *const paths[] = {
+            "contexts/explorer/views/src/ui_present_document.c",
+            "contexts/explorer/views/include/views/ui_present_document.h",
+            "contexts/explorer/views/src/ui_present_host.c",
+            "contexts/explorer/views/include/views/ui_present_host.h",
+        };
+        for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+            struct agent_impact_acc impact = {0};
+            ASSERT(agent_impact_apply_shared_rules(paths[i], &impact));
+            ASSERT(ic_acc_has_group(&impact, "qr"));
+            ASSERT(ic_acc_has_group(&impact, "spawn"));
+            ASSERT(ic_acc_has_group(&impact, "native_api_contract"));
+            ASSERT(ic_acc_has_group(&impact, "make_lint_gates"));
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_fast_sync_splits_keep_proof_lane(void)
+{
+    int failures = 0;
+    TEST("impact composition: new fast-sync splits keep focused proof lane") {
+        static const char *const paths[] = {
+            "core/modules/net/src/fast_sync_manifest_policy.c",
+            "core/modules/net/include/net/fast_sync_future_policy.h",
+        };
+        for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+            struct agent_impact_acc impact = {0};
+            ASSERT(agent_impact_apply_shared_rules(paths[i], &impact));
+            ASSERT(impact.shared_rule_hits > 0);
+            ASSERT(ic_acc_has_group(&impact, "fast_sync"));
+            ASSERT(ic_acc_has_group(&impact, "snapshot_sync_service"));
+            ASSERT(ic_acc_has_group(&impact, "make_lint_gates"));
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_merkle_verifier_selects_proof_lane(void)
+{
+    int failures = 0;
+    TEST("impact composition: Merkle verifier changes select proof tests") {
+        struct agent_impact_acc impact = {0};
+        ASSERT(agent_impact_apply_shared_rules(
+            "cognition/modules/codeindex/src/codeindex_merkle.c", &impact));
+        ASSERT(ic_acc_has_group(&impact, "code_merkle"));
+        ASSERT(ic_acc_has_group(&impact, "code_merkle_proof"));
+        ASSERT(ic_acc_has_group(&impact, "codeindex"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── Proof step budgets ───────────────────────────────────────────────────
+ *
+ * The wall these replace was one constant for every step. Under load the test
+ * dimension took 19 minutes against a 15-minute cap, the proof reported
+ * `child_proof_failed_exit_124`, and the run it had just killed finished green
+ * four minutes later. Every host hit it. These pin the replacement: a budget
+ * sized from the plan, a kill decided by whether the step is still writing,
+ * and a ceiling the environment may raise but never lower. */
+
+#define IC_FIX_BUDGET IC_FIX_ROOT "/budget"
+
+static void ic_budget_fixture(const char *sub, char out[4096])
+{
+    snprintf(out, 4096, "%s/%s", IC_FIX_BUDGET, sub);
+    (void)ic_write(out, ".keep", "");
+    char table[4096];
+    snprintf(table, sizeof(table), "%s/timing/table.tsv", out);
+    (void)remove(table);
+}
+
+static int test_ic_proof_budget_grows_with_groups(void)
+{
+    int failures = 0;
+    TEST("proof budget: the test dimension is sized by the groups it will run") {
+        char state[4096];
+        ic_budget_fixture("grows", state);
+        struct zcl_dev_proof_budget one =
+            zcl_dev_proof_test_budget(state, "alpha", 1);
+        struct zcl_dev_proof_budget three =
+            zcl_dev_proof_test_budget(state, "alpha,beta,gamma", 3);
+        struct zcl_dev_proof_budget ten = zcl_dev_proof_test_budget(
+            state, "a,b,c,d,e,f,g,h,i,j", 10);
+        ASSERT(one.budget_ms >= PROOF_TEST_FLOOR_MS);
+        ASSERT(three.budget_ms > one.budget_ms);
+        ASSERT(ten.budget_ms > three.budget_ms);
+        /* Never past the ceiling, however many groups the plan names. */
+        struct zcl_dev_proof_budget huge =
+            zcl_dev_proof_test_budget(state, "", 100000);
+        ASSERT(huge.budget_ms == huge.ceiling_ms);
+        ASSERT(huge.ceiling_ms == PROOF_TIMEOUT_MS);
+        /* A step with no history still gets the compiled-in allowance for
+         * every group the plan named, even when the selector is unreadable. */
+        ASSERT(one.budget_ms ==
+               PROOF_TEST_FLOOR_MS + PROOF_TEST_GROUP_DEFAULT_MS);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_budget_learns_from_this_checkout(void)
+{
+    int failures = 0;
+    TEST("proof budget: measured wall times lower and raise the allowance") {
+        char state[4096];
+        ic_budget_fixture("learns", state);
+        struct zcl_dev_proof_budget cold =
+            zcl_dev_proof_test_budget(state, "swift", 1);
+        /* A group this checkout measures in two seconds needs far less than
+         * the compiled default. */
+        for (int i = 0; i < 3; i++)
+            ASSERT(zcl_dev_proof_timing_note(state, "swift", 2000));
+        struct zcl_dev_proof_budget quick =
+            zcl_dev_proof_test_budget(state, "swift", 1);
+        ASSERT(quick.budget_ms < cold.budget_ms);
+        /* And a group measured at eight minutes needs far more. */
+        ASSERT(zcl_dev_proof_timing_note(state, "slow", 480000));
+        struct zcl_dev_proof_budget patient =
+            zcl_dev_proof_test_budget(state, "slow", 1);
+        ASSERT(patient.budget_ms > cold.budget_ms);
+        ASSERT(zcl_dev_proof_timing_allowance_ms(state, "slow", 1) > 480000);
+        /* An unknown key falls back to what the caller compiled in. */
+        ASSERT(zcl_dev_proof_timing_allowance_ms(state, "never_seen", 4242) ==
+               4242);
+        /* The table remembers a bounded window, not every run ever. */
+        for (int i = 0; i < (int)PROOF_HISTORY_MAX + 4; i++)
+            ASSERT(zcl_dev_proof_timing_note(state, "swift", 1000));
+        ASSERT(zcl_dev_proof_timing_allowance_ms(state, "swift", 1) ==
+               1000 * 2 + 60000);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_ceiling_env_raises_only(void)
+{
+    int failures = 0;
+    TEST("proof budget: the environment may raise the ceiling, never lower it") {
+        ASSERT(zcl_dev_proof_ceiling_ms() == PROOF_TIMEOUT_MS);
+        setenv("ZCL_PROOF_TIMEOUT_MS", "60000", 1);
+        ASSERT(zcl_dev_proof_ceiling_ms() == PROOF_TIMEOUT_MS);
+        setenv("ZCL_PROOF_TIMEOUT_MS", "5400000", 1);
+        ASSERT(zcl_dev_proof_ceiling_ms() == 5400000);
+        setenv("ZCL_PROOF_TIMEOUT_MS", "999999999", 1);
+        ASSERT(zcl_dev_proof_ceiling_ms() == PROOF_TIMEOUT_MAX_MS);
+        setenv("ZCL_PROOF_TIMEOUT_MS", "not-a-number", 1);
+        ASSERT(zcl_dev_proof_ceiling_ms() == PROOF_TIMEOUT_MS);
+        unsetenv("ZCL_PROOF_TIMEOUT_MS");
+        ASSERT(zcl_dev_proof_ceiling_ms() == PROOF_TIMEOUT_MS);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_verdict_watches_progress_not_the_clock(void)
+{
+    int failures = 0;
+    TEST("proof budget: a step still writing outlives the old fifteen-minute wall") {
+        struct zcl_dev_proof_budget budget = {
+            .budget_ms = 900000,
+            .ceiling_ms = PROOF_TIMEOUT_MS,
+            .no_progress_ms = PROOF_NO_PROGRESS_MS,
+        };
+        /* The exact run that was murdered: nineteen minutes in, still
+         * printing, budget long spent. It lives. */
+        ASSERT(zcl_dev_proof_budget_verdict(&budget, 19 * 60000, 1000) ==
+               ZCL_DEV_PROOF_KILL_NONE);
+        /* Silent for longer than the window, but inside its budget: also
+         * alive — the harness's own 300 s per-group watchdog speaks first. */
+        ASSERT(zcl_dev_proof_budget_verdict(&budget, 600000, 601000) ==
+               ZCL_DEV_PROOF_KILL_NONE);
+        /* Silent past the window with the budget spent: dead, and named. */
+        ASSERT(zcl_dev_proof_budget_verdict(&budget, 1500000, 601000) ==
+               ZCL_DEV_PROOF_KILL_NO_PROGRESS);
+        /* A chatty runaway still hits the ceiling. */
+        ASSERT(zcl_dev_proof_budget_verdict(&budget, PROOF_TIMEOUT_MS, 0) ==
+               ZCL_DEV_PROOF_KILL_HARD_CEILING);
+        ASSERT(strcmp(zcl_dev_proof_kill_cause_name(
+                          ZCL_DEV_PROOF_KILL_NO_PROGRESS), "no_progress") == 0);
+        ASSERT(strcmp(zcl_dev_proof_kill_cause_name(
+                          ZCL_DEV_PROOF_KILL_HARD_CEILING),
+                      "hard_ceiling") == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The test step's budget is pinned at the ceiling, and the ceiling is
+ * checked first, so a healthy test that prints nothing for many silence
+ * windows (the runner reports groups late) can only ever end as
+ * hard_ceiling, never as no_progress. */
+static int test_ic_proof_ceiling_speaks_before_silence(void)
+{
+    int failures = 0;
+    TEST("proof budget: a silent step at the ceiling budget ends as hard_ceiling, never no_progress") {
+        struct zcl_dev_proof_budget budget = zcl_dev_proof_budget_make(
+            zcl_dev_proof_ceiling_ms() * 2, PROOF_TEST_FLOOR_MS);
+        ASSERT_EQ(budget.budget_ms, budget.ceiling_ms);
+        ASSERT(zcl_dev_proof_budget_verdict(&budget, budget.ceiling_ms - 1,
+                                            10 * PROOF_NO_PROGRESS_MS) ==
+               ZCL_DEV_PROOF_KILL_NONE);
+        ASSERT(zcl_dev_proof_budget_verdict(&budget, budget.ceiling_ms,
+                                            10 * PROOF_NO_PROGRESS_MS) ==
+               ZCL_DEV_PROOF_KILL_HARD_CEILING);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* An interruption is not a verdict on the candidate; the budget's own
+ * kills and an ordinary failing exit are. */
+static int test_ic_proof_interruption_is_not_a_verdict(void)
+{
+    int failures = 0;
+    TEST("proof: interrupted runs are told apart from verdicts") {
+        char spelled[64];
+        (void)snprintf(spelled, sizeof(spelled), "child_proof_%s_",
+                       zcl_dev_proof_kill_cause_name(
+                           ZCL_DEV_PROOF_KILL_CANCELLED));
+        ASSERT_STR_EQ(spelled, ZCL_DEV_PROOF_STEP_CANCELLED_PREFIX);
+        ASSERT(zcl_dev_proof_failure_interrupted(
+            "child_proof_cancelled_test_budget_ms_3600000_elapsed_ms_215489"
+            "_idle_ms_213923"));
+        ASSERT(zcl_dev_proof_failure_interrupted(
+            ZCL_DEV_PROOF_INTERRUPTED_PREFIX "proof_generation_not_exact"));
+        ASSERT(!zcl_dev_proof_failure_interrupted(
+            "child_proof_no_progress_lint_budget_ms_1_elapsed_ms_2_idle_ms_3"));
+        ASSERT(!zcl_dev_proof_failure_interrupted(
+            "child_proof_hard_ceiling_test_budget_ms_1_elapsed_ms_2_idle_ms_3"));
+        ASSERT(!zcl_dev_proof_failure_interrupted("child_proof_failed_exit_2"));
+        ASSERT(!zcl_dev_proof_failure_interrupted(NULL));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+struct ic_base_script {
+    int calls;
+    int supersede_at; /* 0: never */
+    enum zcl_dev_proof_base_observation otherwise;
+    int release_fd;
+    int release_at;
+    bool released;
+};
+
+static enum zcl_dev_proof_base_observation ic_base_observe(void *ctx)
+{
+    struct ic_base_script *script = ctx;
+    script->calls++;
+    if (script->supersede_at > 0 && script->calls >= script->supersede_at)
+        return ZCL_DEV_PROOF_BASE_SUPERSEDED;
+    if (!script->released && script->release_at > 0 &&
+        script->calls >= script->release_at)
+        script->released = send(script->release_fd, "D", 1, MSG_NOSIGNAL) == 1;
+    return script->otherwise;
+}
+
+static volatile sig_atomic_t ic_fake_worker_termed;
+
+static void ic_fake_worker_term(int signal_number)
+{
+    (void)signal_number;
+    ic_fake_worker_termed = 1;
+}
+
+/* The flag is checked with SIGTERM blocked. pselect atomically installs the
+ * wait mask, so a pending SIGTERM interrupts the wait instead of being lost. */
+static bool ic_fake_worker_wait_setup(int fd, sigset_t *wait_mask)
+{
+    sigset_t term;
+    return fd < FD_SETSIZE && sigemptyset(&term) == 0 &&
+           sigaddset(&term, SIGTERM) == 0 &&
+           sigprocmask(SIG_BLOCK, &term, wait_mask) == 0 &&
+           sigdelset(wait_mask, SIGTERM) == 0;
+}
+
+/* Completion is causal: ready precedes observation; a release or SIGTERM
+ * must match the expected outcome. The 10s deadline is failure, not success. */
+[[noreturn]] static void ic_fake_worker(bool cancelled, int fd)
+{
+    sigset_t wait_mask;
+    if (!ic_fake_worker_wait_setup(fd, &wait_mask)) _exit(2);
+    struct sigaction action = {0};
+    action.sa_handler = ic_fake_worker_term;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGTERM, &action, NULL) != 0 ||
+        send(fd, "R", 1, MSG_NOSIGNAL) != 1) _exit(2);
+    bool released = false;
+    int64_t end = platform_time_monotonic_us() + 10000000;
+    while (!ic_fake_worker_termed && !released) {
+        int64_t remaining = end - platform_time_monotonic_us();
+        if (remaining <= 0) break;
+        fd_set input;
+        FD_ZERO(&input);
+        FD_SET(fd, &input);
+        struct timespec timeout = {.tv_sec = (time_t)(remaining / 1000000),
+                                   .tv_nsec = (long)(remaining % 1000000) * 1000};
+        int rc = pselect(fd + 1, &input, NULL, NULL, &timeout, &wait_mask);
+        if (rc > 0) {
+            char byte = 0;
+            released = read(fd, &byte, 1) == 1 && byte == 'D';
+            break;
+        }
+        if (rc < 0 && errno != EINTR) break;
+    }
+    bool expected = cancelled ? ic_fake_worker_termed != 0
+                              : released && !ic_fake_worker_termed;
+    if (close(fd) != 0) expected = false;
+    _exit(expected ? 0 : 2);
+}
+
+/* A successful production wait already reaped its child. Clean up a failed
+ * fixture or a waiter that returned early, and make either case non-PASS. */
+static bool ic_waiter_reaped(pid_t worker)
+{
+    if (worker <= 0) return false;
+    pid_t reaped;
+    do {
+        reaped = waitpid(worker, NULL, WNOHANG);
+    } while (reaped < 0 && errno == EINTR);
+    if (reaped < 0 && errno == ECHILD) return true;
+    fprintf(stderr, "proof probe fixture: waiter did not reap worker\n");
+    if (reaped == 0) {
+        (void)kill(worker, SIGKILL);
+        do {
+            reaped = waitpid(worker, NULL, 0);
+        } while (reaped < 0 && errno == EINTR);
+    }
+    return false;
+}
+
+static int64_t ic_waited_ms(bool cancelled, const struct zcl_dev_proof_base_probe *probe,
+                            int *result, bool *superseded)
+{
+    int64_t start = platform_time_monotonic_us();
+    int endpoints[2];
+    *result = -2;
+    *superseded = false;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, endpoints) != 0) {
+        fprintf(stderr, "proof probe fixture: socketpair failed errno=%d\n", errno);
+        return -1;
+    }
+    pid_t worker = fork();
+    if (worker == 0) {
+        if (close(endpoints[0]) != 0) _exit(2);
+        ic_fake_worker(cancelled, endpoints[1]);
+    }
+    bool ready = close(endpoints[1]) == 0 && worker > 0;
+    struct pollfd input = {.fd = endpoints[0], .events = POLLIN};
+    char byte = 0;
+    ready = ready && poll(&input, 1, 5000) > 0 &&
+            read(endpoints[0], &byte, 1) == 1 && byte == 'R';
+    if (ready && probe)
+        ((struct ic_base_script *)probe->ctx)->release_fd = endpoints[0];
+    if (ready && !probe)
+        ready = send(endpoints[0], "D", 1, MSG_NOSIGNAL) == 1;
+    if (ready)
+        *result = zcl_dev_proof_test_foreground_wait((int)worker, probe, superseded);
+    else
+        fprintf(stderr, "proof probe fixture: worker readiness failed errno=%d\n", errno);
+    if (!ic_waiter_reaped(worker)) *result = -2;
+    if (close(endpoints[0]) != 0) *result = -2;
+    return (platform_time_monotonic_us() - start) / 1000;
+}
+
+static int test_ic_proof_base_probe_cancels_superseded_worker(void)
+{
+    int failures = 0;
+    TEST("proof: superseded observation cancels; unknown observations permit only natural completion") {
+        struct ic_base_script moved = {.supersede_at = 2,
+                                       .otherwise = ZCL_DEV_PROOF_BASE_CURRENT};
+        struct ic_base_script silent = {.otherwise = ZCL_DEV_PROOF_BASE_UNKNOWN,
+                                        .release_at = 3};
+        struct zcl_dev_proof_base_probe moved_probe = {
+            .observe = ic_base_observe, .ctx = &moved, .interval_ms = 50};
+        struct zcl_dev_proof_base_probe silent_probe = {
+            .observe = ic_base_observe, .ctx = &silent, .interval_ms = 50};
+        int moved_rc = 0, silent_rc = 0, plain_rc = 0;
+        bool moved_flag = false, silent_flag = false, plain_flag = false;
+        int64_t moved_ms = ic_waited_ms(true, &moved_probe, &moved_rc,
+                                        &moved_flag);
+        (void)ic_waited_ms(false, &silent_probe, &silent_rc, &silent_flag);
+        (void)ic_waited_ms(false, NULL, &plain_rc, &plain_flag);
+        ASSERT_EQ(moved_rc, 1);
+        ASSERT(moved_flag && moved.calls == 2 && moved_ms < 5000);
+        ASSERT_EQ(silent_rc, 1);
+        ASSERT(!silent_flag && silent.calls >= 3 && silent.released);
+        ASSERT(plain_rc == 1 && !plain_flag);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+static int test_ic_proof_reads_the_harness_banners(void)
+{
+    int failures = 0;
+    TEST("proof budget: per-group wall times come from the harness's own log") {
+        char group[PROOF_TIMING_KEY_MAX];
+        int64_t ms = 0;
+        ASSERT(zcl_dev_proof_timing_parse_group_line(
+            "==================== core_net (PASS, 12s) ====================\n",
+            group, sizeof(group), &ms));
+        ASSERT(strcmp(group, "core_net") == 0 && ms == 12000);
+        /* A skip note sits between the status and the time. */
+        ASSERT(zcl_dev_proof_timing_parse_group_line(
+            "==================== wallet (PASS, 3 SKIP, 7s) ====================\n",
+            group, sizeof(group), &ms));
+        ASSERT(strcmp(group, "wallet") == 0 && ms == 7000);
+        /* Only a pass says how long the work takes. */
+        ASSERT(!zcl_dev_proof_timing_parse_group_line(
+            "==================== core_net (FAIL, 12s) ====================\n",
+            group, sizeof(group), &ms));
+        ASSERT(!zcl_dev_proof_timing_parse_group_line(
+            "==================== core_net (WEDGED-NO-OUTPUT, 12s) ====================\n",
+            group, sizeof(group), &ms));
+        ASSERT(!zcl_dev_proof_timing_parse_group_line(
+            "SUITE VERDICT groups_ran=4\n", group, sizeof(group), &ms));
+
+        const char *bad_status =
+            "==================== alpha (PASSING_BUT_FAILED, 12s) ====================\n";
+        ASSERT(!zcl_dev_proof_timing_parse_group_line(
+            bad_status, group, sizeof(group), &ms));
+
+        char state[4096], log[4096];
+        ic_budget_fixture("ingest", state);
+        snprintf(log, sizeof(log), "%s/test.log", state);
+        ASSERT(ic_write(state, "test.log", bad_status));
+        ASSERT(zcl_dev_proof_timing_ingest_test_log(state, log) == 0);
+        ASSERT(zcl_dev_proof_timing_allowance_ms(state, "alpha", 77) == 77);
+        char table[4096];
+        struct stat table_stat;
+        snprintf(table, sizeof(table), "%s/timing/table.tsv", state);
+        ASSERT(stat(table, &table_stat) == -1 && errno == ENOENT);
+        /* Valid PASS and PASS-with-skip records still populate this history. */
+        ASSERT(ic_write(
+            state, "test.log",
+            "noise before\n"
+            "==================== alpha (PASS, 40s) ====================\n"
+            "==================== beta (FAIL, 9s) ====================\n"
+            "==================== gamma (PASS, 2 SKIP, 5s) ====================\n"
+            "SUITE VERDICT groups_ran=3\n"));
+        ASSERT(zcl_dev_proof_timing_ingest_test_log(state, log) == 2);
+        ASSERT(zcl_dev_proof_timing_allowance_ms(state, "alpha", 1) ==
+               40000 * 2 + 60000);
+        ASSERT(zcl_dev_proof_timing_allowance_ms(state, "gamma", 1) ==
+               5000 * 2 + 60000);
+        ASSERT(zcl_dev_proof_timing_allowance_ms(state, "beta", 77) == 77);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+static int test_ic_proof_run_watched_kills_only_the_silent(void)
+{
+    int failures = 0;
+    TEST("proof budget: silence is killed, output is not, the ceiling is final") {
+        char state[4096], log[4096];
+        ic_budget_fixture("watched", state);
+        snprintf(log, sizeof(log), "%s/step.log", state);
+
+        /* A child that says nothing for longer than the window, with its
+         * budget spent, is killed and the cause is named. */
+        struct zcl_dev_proof_budget silent_budget = {
+            .budget_ms = 200, .ceiling_ms = 20000, .no_progress_ms = 400};
+        const char *quiet_argv[] = {"/bin/sh", "-c", "sleep 20", NULL};
+        struct zcl_dev_proof_step_report quiet = {0};
+        ASSERT(zcl_dev_proof_run_watched(".", log, quiet_argv, &silent_budget,
+                                         &quiet) == 124);
+        ASSERT(quiet.cause == ZCL_DEV_PROOF_KILL_NO_PROGRESS);
+        ASSERT(quiet.elapsed_ms < 5000);
+        ASSERT(quiet.budget_ms == 200);
+
+        /* A child that keeps writing runs past its budget untouched — the
+         * case the flat cap used to kill. */
+        struct zcl_dev_proof_budget chatty_budget = {
+            .budget_ms = 200, .ceiling_ms = 30000, .no_progress_ms = 3000};
+        const char *chatty_argv[] = {
+            "/bin/sh", "-c",
+            "i=0; while [ $i -lt 12 ]; do echo tick; sleep 0.1; "
+            "i=$((i+1)); done; exit 0", NULL};
+        struct zcl_dev_proof_step_report chatty = {0};
+        ASSERT(zcl_dev_proof_run_watched(".", log, chatty_argv, &chatty_budget,
+                                         &chatty) == 0);
+        ASSERT(chatty.cause == ZCL_DEV_PROOF_KILL_NONE);
+        ASSERT(chatty.elapsed_ms > chatty.budget_ms);
+
+        /* A chatty runaway still dies, at the ceiling, for that reason. */
+        struct zcl_dev_proof_budget capped = {
+            .budget_ms = 300, .ceiling_ms = 900, .no_progress_ms = 600000};
+        const char *runaway_argv[] = {
+            "/bin/sh", "-c", "while true; do echo tick; sleep 0.05; done",
+            NULL};
+        struct zcl_dev_proof_step_report runaway = {0};
+        ASSERT(zcl_dev_proof_run_watched(".", log, runaway_argv, &capped,
+                                         &runaway) == 124);
+        ASSERT(runaway.cause == ZCL_DEV_PROOF_KILL_HARD_CEILING);
+
+        /* Every step it ran is explained in phases.txt. */
+        char phases[4096];
+        snprintf(phases, sizeof(phases), "%s/phases.txt", state);
+        (void)remove(phases);
+        ASSERT(zcl_dev_proof_phase_record(phases, "test", &quiet));
+        ASSERT(zcl_dev_proof_phase_record(phases, "lint", &chatty));
+        char body[2048] = {0};
+        FILE *f = fopen(phases, "r");
+        ASSERT(f != NULL);
+        size_t read = fread(body, 1, sizeof(body) - 1, f);
+        fclose(f);
+        body[read] = '\0';
+        ASSERT(strstr(body, "step=test") != NULL);
+        ASSERT(strstr(body, "budget_ms=200") != NULL);
+        ASSERT(strstr(body, "elapsed_ms=") != NULL);
+        ASSERT(strstr(body, "last_progress_age_ms=") != NULL);
+        ASSERT(strstr(body, "cause=no_progress") != NULL);
+        ASSERT(strstr(body, "step=lint") != NULL);
+        ASSERT(strstr(body, "cause=none") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_proof_budget_started(const char *log)
+{
+    for (size_t i = 0; i < 250; i++) {
+        struct stat status;
+        if (stat(log, &status) == 0 && status.st_size > 0) return true;
+        platform_sleep_ms(20); /* real-clock: awaits output from a real spawned command before cancellation; virtual time cannot start it. */
+    }
+    return false;
+}
+
+static int test_ic_proof_budget_cancellation(void)
+{
+    int failures = 0;
+    TEST("proof budget: cancellation settles the command group and blocks another step") {
+        char state[4096], log[4096];
+        ic_budget_fixture("cancelled", state);
+        snprintf(log, sizeof(log), "%s/cancel.log", state);
+        (void)unlink(log);
+        const char *argv[] = {"/bin/sh", "-c", "echo ready; sleep 30", NULL};
+        struct zcl_dev_proof_budget budget = {
+            .budget_ms = 30000, .ceiling_ms = 60000, .no_progress_ms = 60000};
+        struct zcl_dev_proof_step step = {0}, refused = {0};
+        ASSERT(zcl_dev_proof_step_start(&step, ".", log, argv, &budget));
+        bool started = ic_proof_budget_started(log);
+        zcl_devloop_process_cancel_request();
+        bool settled = zcl_dev_proof_step_poll(&step);
+        bool restarted = zcl_dev_proof_step_start(&refused, ".", log, argv, &budget);
+        struct zcl_dev_proof_step_report report = {0};
+        int watched = zcl_dev_proof_run_watched(".", log, argv, &budget, &report);
+        zcl_devloop_process_cancel_clear();
+        ASSERT(started && settled && !restarted);
+        ASSERT_EQ(step.report.cause, ZCL_DEV_PROOF_KILL_CANCELLED);
+        ASSERT_EQ(step.report.rc, 130);
+        ASSERT_EQ(refused.report.cause, ZCL_DEV_PROOF_KILL_CANCELLED);
+        ASSERT_EQ(watched, 130);
+        ASSERT_EQ(report.cause, ZCL_DEV_PROOF_KILL_CANCELLED);
+        ASSERT(kill((pid_t)step.child, 0) != 0 && errno == ESRCH);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+#if !defined(_WIN32)
+static int test_ic_proof_steps_run_concurrently(void)
+{
+    int failures = 0;
+    TEST("proof budget: independent steps run at once and still fail closed") {
+        char state[4096], a[4096], b[4096];
+        ic_budget_fixture("concurrent", state);
+        snprintf(a, sizeof(a), "%s/a.log", state);
+        snprintf(b, sizeof(b), "%s/b.log", state);
+        struct zcl_dev_proof_budget budget = {
+            .budget_ms = 60000, .ceiling_ms = 60000, .no_progress_ms = 30000};
+        const char *busy_argv[] = {
+            "/bin/sh", "-c",
+            "i=0; while [ $i -lt 8 ]; do echo tick; sleep 0.1; "
+            "i=$((i+1)); done; exit 0", NULL};
+        struct zcl_dev_proof_step steps[2];
+        int64_t began = platform_time_monotonic_ms();
+        ASSERT(zcl_dev_proof_step_start(&steps[0], ".", a, busy_argv,
+                                        &budget));
+        ASSERT(zcl_dev_proof_step_start(&steps[1], ".", b, busy_argv,
+                                        &budget));
+        ASSERT(zcl_dev_proof_steps_wait(steps, 2) == 2);
+        int64_t wall = platform_time_monotonic_ms() - began;
+        /* Both took about 800 ms of their own; run together they cost about
+         * one of them, not both. */
+        ASSERT(steps[0].report.elapsed_ms >= 700);
+        ASSERT(steps[1].report.elapsed_ms >= 700);
+        ASSERT(wall < steps[0].report.elapsed_ms +
+                          steps[1].report.elapsed_ms);
+        /* Each keeps its own log. */
+        ASSERT(steps[0].report.rc == 0 && steps[1].report.rc == 0);
+        FILE *fa = fopen(a, "r");
+        ASSERT(fa != NULL);
+        char first[64] = {0};
+        ASSERT(fgets(first, sizeof(first), fa) != NULL);
+        fclose(fa);
+        ASSERT(strncmp(first, "tick", 4) == 0);
+
+        /* One failure in the set is the set's verdict, named by position. */
+        const char *bad_argv[] = {"/bin/sh", "-c", "echo boom; exit 3", NULL};
+        ASSERT(zcl_dev_proof_step_start(&steps[0], ".", a, busy_argv,
+                                        &budget));
+        ASSERT(zcl_dev_proof_step_start(&steps[1], ".", b, bad_argv, &budget));
+        ASSERT(zcl_dev_proof_steps_wait(steps, 2) == 1);
+        ASSERT(steps[1].report.rc == 3);
+        ASSERT(steps[0].report.rc == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_log_holds(const char *path, const char *needle)
+{
+    char body[4096] = {0};
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    size_t got = fread(body, 1, sizeof(body) - 1, f);
+    fclose(f);
+    body[got] = '\0';
+    return strstr(body, needle) != NULL;
+}
+
+/* Run the proof's lint/test launch over two shell children and report the
+ * lint exit, the test exit, and why lint was released. */
+static bool ic_lint_hold_run(const char *state, const char *lint_script,
+                             const char *test_script, int64_t hold_max_ms,
+                             bool finish_tests_first,
+                             int rcs[2], char hold[64])
+{
+    const char *lint_argv[] = {"/bin/sh", "-c", lint_script, NULL};
+    const char *test_argv[] = {"/bin/sh", "-c", test_script, NULL};
+    return zcl_dev_proof_dimensions_run_for_test(state, lint_argv, test_argv,
+                                                 hold_max_ms,
+                                                 finish_tests_first, rcs, hold,
+                                                 64);
+}
+
+/* The runner's run-alone pass exists so wall-clock contracts see an idle
+ * box; a proof's lint must not open its burst inside it. The fake runner
+ * marks its exclusive window with a file and then prints the runner's own
+ * done line. The fake lint waits until it can tell which side of that window
+ * it started on, and says so. The fake runner exits 0 only if lint started
+ * before it finished, so holding lint for the whole test run fails too. */
+static int test_ic_proof_lint_waits_for_exclusive_pass(void)
+{
+    int failures = 0;
+    TEST("proof launch: lint starts after the runner's run-alone pass, never during it") {
+        char state[4096], excl[4200], done[4200], ran[4200], log[4200];
+        ic_budget_fixture("lint_hold", state);
+        snprintf(excl, sizeof(excl), "%s/exclusive-active", state);
+        snprintf(done, sizeof(done), "%s/exclusive-done", state);
+        snprintf(ran, sizeof(ran), "%s/lint-ran", state);
+        snprintf(log, sizeof(log), "%s/seam.lint.log", state);
+        (void)remove(excl);
+        (void)remove(done);
+        (void)remove(ran);
+        char test_script[16384], lint_script[16384];
+        snprintf(test_script, sizeof(test_script),
+                 "touch '%s'; sleep 0.4; rm -f '%s'; touch '%s'; "
+                 "echo '%s groups=1'; i=0; "
+                 "while [ ! -e '%s' ] && [ $i -lt 200 ]; do sleep 0.05; "
+                 "i=$((i+1)); done; [ -e '%s' ]",
+                 excl, excl, done, ZCL_TEST_EXCLUSIVE_PASS_DONE, ran, ran);
+        snprintf(lint_script, sizeof(lint_script),
+                 "i=0; while [ ! -e '%s' ] && [ ! -e '%s' ] && "
+                 "[ $i -lt 500 ]; do sleep 0.02; i=$((i+1)); done; "
+                 "if [ -e '%s' ]; then echo lint=overlapped; "
+                 "else echo lint=clear; fi; touch '%s'",
+                 excl, done, excl, ran);
+        int rcs[2] = {-1, -1};
+        char hold[64] = {0};
+        ASSERT(ic_lint_hold_run(state, lint_script, test_script, 30000, false,
+                                rcs, hold));
+        ASSERT(!ic_log_holds(log, "lint=overlapped"));
+        ASSERT(ic_log_holds(log, "lint=clear"));
+        ASSERT_EQ(rcs[0], 0);
+        ASSERT_EQ(rcs[1], 0);
+        ASSERT(strcmp(hold, "exclusive_pass_done") == 0);
+
+        /* A runner that never prints the line still releases lint when it
+         * exits, and lint still runs to its own verdict. */
+        (void)remove(ran);
+        ASSERT(ic_lint_hold_run(state, "echo lint-ran", "echo no-line",
+                                30000, false, rcs, hold));
+        ASSERT(ic_log_holds(log, "lint-ran"));
+        ASSERT_EQ(rcs[0], 0);
+        ASSERT_EQ(rcs[1], 0);
+        ASSERT(strcmp(hold, "test_finished") == 0);
+
+        /* A silent runner that keeps running releases lint at the cap. */
+        snprintf(test_script, sizeof(test_script),
+                 "i=0; while [ ! -e '%s' ] && [ $i -lt 200 ]; do sleep 0.05; "
+                 "i=$((i+1)); done; [ -e '%s' ]", ran, ran);
+        snprintf(lint_script, sizeof(lint_script), "touch '%s'", ran);
+        ASSERT(ic_lint_hold_run(state, lint_script, test_script, 200, false,
+                                rcs, hold));
+        ASSERT_EQ(rcs[0], 0);
+        ASSERT_EQ(rcs[1], 0);
+        ASSERT(strcmp(hold, "cap") == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* On a small host lint waits for the whole test child, even after the runner
+ * prints its exclusive-pass marker while later groups still run. */
+static int test_ic_proof_lint_waits_for_test_completion(void)
+{
+    int failures = 0;
+    TEST("proof launch: a small host starts lint after all tests finish") {
+        char state[4096], excl[4200], done[4200], ran[4200], log[4200];
+        ic_budget_fixture("lint_hold", state);
+        snprintf(excl, sizeof(excl), "%s/exclusive-active", state);
+        snprintf(done, sizeof(done), "%s/exclusive-done", state);
+        snprintf(ran, sizeof(ran), "%s/lint-ran", state);
+        snprintf(log, sizeof(log), "%s/seam.lint.log", state);
+        (void)remove(excl);
+        (void)remove(done);
+        (void)remove(ran);
+        char test_script[16384], lint_script[16384];
+        snprintf(test_script, sizeof(test_script),
+                 "touch '%s'; echo '%s groups=1'; sleep 0.4; "
+                 "rm -f '%s'; touch '%s'",
+                 excl, ZCL_TEST_EXCLUSIVE_PASS_DONE, excl, done);
+        snprintf(lint_script, sizeof(lint_script),
+                 "if [ -e '%s' ] || [ ! -e '%s' ]; "
+                 "then echo lint=overlapped; "
+                 "else echo lint=clear; fi; touch '%s'",
+                 excl, done, ran);
+        int rcs[2] = {-1, -1};
+        char hold[64] = {0};
+        ASSERT(ic_lint_hold_run(state, lint_script, test_script, 30000, true,
+                                rcs, hold));
+        ASSERT(!ic_log_holds(log, "lint=overlapped"));
+        ASSERT(ic_log_holds(log, "lint=clear"));
+        ASSERT_EQ(rcs[0], 0);
+        ASSERT_EQ(rcs[1], 0);
+        ASSERT(strcmp(hold, "test_finished") == 0);
+
+        /* A runner without the marker still finishes before lint. */
+        (void)remove(ran);
+        ASSERT(ic_lint_hold_run(state, "echo lint-ran", "echo no-line",
+                                30000, true, rcs, hold));
+        ASSERT(ic_log_holds(log, "lint-ran"));
+        ASSERT_EQ(rcs[0], 0);
+        ASSERT_EQ(rcs[1], 0);
+        ASSERT(strcmp(hold, "test_finished") == 0);
+
+        /* A failed test still permits lint to record its own verdict. */
+        snprintf(test_script, sizeof(test_script),
+                 "echo test-fail; exit 7");
+        ASSERT(ic_lint_hold_run(state, "echo lint-after-failure", test_script,
+                                30000, true, rcs, hold));
+        ASSERT(ic_log_holds(log, "lint-after-failure"));
+        ASSERT_EQ(rcs[0], 0);
+        ASSERT_EQ(rcs[1], 7);
+        ASSERT(strcmp(hold, "test_finished") == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The launch overlaps lint with tests only on a host with enough CPUs. */
+static int test_ic_proof_lint_overlap_needs_cpus(void)
+{
+    int failures = 0;
+    TEST("proof launch: hosts under 24 CPUs finish tests before lint") {
+        ASSERT(zcl_dev_proof_test_lint_waits_for_tests(1));
+        ASSERT(zcl_dev_proof_test_lint_waits_for_tests(16));
+        ASSERT(zcl_dev_proof_test_lint_waits_for_tests(23));
+        ASSERT(!zcl_dev_proof_test_lint_waits_for_tests(24));
+        ASSERT(!zcl_dev_proof_test_lint_waits_for_tests(28));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A proof step runs candidate code. A descriptor the worker holds (a lock,
+ * a signer, a socket) must not reach it: the pathname sandbox cannot revoke
+ * an fd that is already open. Plant one without O_CLOEXEC at a fixed number
+ * and require the step to see neither it nor the worker's stdin. */
+static int test_ic_proof_step_inherits_no_extra_fd(void)
+{
+    int failures = 0;
+    TEST("proof budget: a step child inherits only its log streams and /dev/null stdin") {
+        char state[4096], log[4096], marker[4096];
+        ic_budget_fixture("fdhygiene", state);
+        snprintf(log, sizeof(log), "%s/fd.log", state);
+        snprintf(marker, sizeof(marker), "%s/planted-signer", state);
+        int planted_fd = 77;
+        ASSERT(fcntl(planted_fd, F_GETFD) == -1 && errno == EBADF);
+        int opened = open(marker, O_CREAT | O_RDWR, 0600);  /* no O_CLOEXEC */
+        ASSERT(opened >= 0);
+        ASSERT(dup2(opened, planted_fd) == planted_fd);
+        close(opened);
+        const char *argv[] = {
+            "/bin/sh", "-c",
+            "if [ -e /dev/fd/77 ]; then echo fd77=LEAKED; else echo fd77=closed; fi; "
+#if defined(__linux__)
+            "echo stdin=$(readlink /proc/$$/fd/0)"
+#else
+            "echo stdin=/dev/null"
+#endif
+            , NULL};
+        struct zcl_dev_proof_budget budget = {
+            .budget_ms = 30000, .ceiling_ms = 60000, .no_progress_ms = 30000};
+        struct zcl_dev_proof_step step = {0};
+        bool started = zcl_dev_proof_step_start(&step, ".", log, argv, &budget);
+        int settled = started ? (int)zcl_dev_proof_steps_wait(&step, 1) : -1;
+        close(planted_fd);
+        ASSERT(started && settled == 1 && step.report.rc == 0);
+        char body[512] = {0};
+        FILE *f = fopen(log, "r");
+        ASSERT(f != NULL);
+        size_t got = fread(body, 1, sizeof(body) - 1, f);
+        fclose(f);
+        body[got] = '\0';
+        ASSERT(strstr(body, "fd77=closed") != NULL);
+        ASSERT(strstr(body, "LEAKED") == NULL);
+        ASSERT(strstr(body, "stdin=/dev/null") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#endif
+
+static int test_ic_proof_generation_prefers_ram_when_it_fits(void)
+{
+    int failures = 0;
+    TEST("proof budget: RAM-backed scratch is used only when it really fits") {
+        char relative[4096], root[4096], probe[4096], cwd[2048];
+        ic_budget_fixture("ramscratch", relative);
+        ASSERT(getcwd(cwd, sizeof(cwd)) != NULL);
+        snprintf(root, sizeof(root), "%s/%s", cwd, relative);
+        /* Injected availability: the test pins the answer instead of asking
+         * whatever filesystem this machine happens to mount. */
+        setenv("ZCL_RAM_SCRATCH_ROOT", root, 1);
+        ASSERT(platform_ram_scratch_root(probe, sizeof(probe), 1));
+        ASSERT(strcmp(probe, root) == 0);
+        /* Not enough headroom is a refusal, not a squeeze. */
+        probe[0] = 'x';
+        ASSERT(!platform_ram_scratch_root(probe, sizeof(probe), UINT64_MAX));
+        ASSERT(probe[0] == '\0');
+        /* A buffer too small to hold the answer is a refusal too. */
+        char tiny[4];
+        ASSERT(!platform_ram_scratch_root(tiny, sizeof(tiny), 1));
+        ASSERT(tiny[0] == '\0');
+        /* A path that is not a directory, and one that does not exist. */
+        char file[4096];
+        snprintf(file, sizeof(file), "%s/notadir", root);
+        ASSERT(ic_write(relative, "notadir", "x"));
+        setenv("ZCL_RAM_SCRATCH_ROOT", file, 1);
+        ASSERT(!platform_ram_scratch_root(probe, sizeof(probe), 1));
+        setenv("ZCL_RAM_SCRATCH_ROOT", "/no/such/ram/root", 1);
+        ASSERT(!platform_ram_scratch_root(probe, sizeof(probe), 1));
+        /* An override that is empty, or relative, refuses RAM backing rather
+         * than quietly answering about /dev/shm instead. */
+        setenv("ZCL_RAM_SCRATCH_ROOT", "", 1);
+        ASSERT(!platform_ram_scratch_root(probe, sizeof(probe), 1));
+        setenv("ZCL_RAM_SCRATCH_ROOT", relative, 1);
+        ASSERT(!platform_ram_scratch_root(probe, sizeof(probe), 1));
+        unsetenv("ZCL_RAM_SCRATCH_ROOT");
+
+        /* The choice is a phases.txt fact, never a receipt field: two proofs
+         * of the same source must admit each other whatever storage they
+         * used. */
+        char phases[4096];
+        snprintf(phases, sizeof(phases), "%s/phases.txt", root);
+        (void)remove(phases);
+        ASSERT(zcl_dev_proof_phase_note(phases, "generation_storage", "ram"));
+        ASSERT(zcl_dev_proof_phase_note(phases, "generation_root", root));
+        char body[4096] = {0};
+        FILE *f = fopen(phases, "r");
+        ASSERT(f != NULL);
+        size_t read = fread(body, 1, sizeof(body) - 1, f);
+        fclose(f);
+        body[read] = '\0';
+        ASSERT(strstr(body, "generation_storage=ram") != NULL);
+        ASSERT(strstr(body, "generation_root=") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+
+static int test_ic_ram_scratch_reservations_hold_under_concurrency(void)
+{
+    int failures = 0;
+    TEST("proof budget: RAM scratch is reserved, not just measured") {
+        char relative[4096], root[4096], cwd[2048];
+        ic_budget_fixture("ramreserve", relative);
+        ASSERT(getcwd(cwd, sizeof(cwd)) != NULL);
+        snprintf(root, sizeof(root), "%s/%s", cwd, relative);
+        setenv("ZCL_RAM_SCRATCH_ROOT", root, 1);
+        /* Scale the churn margin to the room on this filesystem. A proof
+         * worktree may live on the shared RAM scratch mount, where the fixed
+         * 1 GiB margin used to demand 11 GiB free even though the production
+         * admission floor is 8 GiB. Keep enough headroom for concurrent
+         * activity while testing the same reservation inequality. */
+        const uint64_t min_free = PLATFORM_RAM_SCRATCH_MIN_FREE_BYTES;
+        uint64_t free_bytes = 0;
+        ASSERT(platform_disk_space_available(root, &free_bytes));
+        ASSERT(free_bytes > min_free + 4ull * 64ull * 1024ull * 1024ull);
+        uint64_t margin = (free_bytes - min_free) / 4u;
+        if (margin > 1024ull * 1024ull * 1024ull)
+            margin = 1024ull * 1024ull * 1024ull;
+        ASSERT(margin >= 64ull * 1024ull * 1024ull);
+        uint64_t first_bytes = free_bytes - min_free - margin;
+        uint64_t second_bytes = 2 * margin;
+        /* Two reservations that together exceed the room: the first is
+         * admitted, the second is refused while the first is live, and
+         * releasing the first gives the second its room back. */
+        struct platform_ram_scratch_lease first = {0};
+        ASSERT(platform_ram_scratch_reserve(root, first_bytes, &first));
+        ASSERT(first.held);
+        struct platform_ram_scratch_lease second = {0};
+        ASSERT(!platform_ram_scratch_reserve(root, second_bytes, &second));
+        ASSERT(!second.held);
+        platform_ram_scratch_release(&first);
+        ASSERT(!first.held);
+        ASSERT(platform_ram_scratch_reserve(root, second_bytes, &second));
+        ASSERT(second.held);
+        platform_ram_scratch_release(&second);
+        /* A released lease's room is hand-out-able again immediately. */
+        struct platform_ram_scratch_lease again = {0};
+        ASSERT(platform_ram_scratch_reserve(root, second_bytes, &again));
+        platform_ram_scratch_release(&again);
+        /* A lease under a dead pid is stale: its bytes do not count against
+         * the room, and taking the lock removes its file. */
+        pid_t child = fork();
+        ASSERT(child >= 0);
+        if (child == 0) _exit(0);
+        int status = 0;
+        ASSERT(waitpid(child, &status, 0) == child);
+        char stale_rel[128];
+        snprintf(stale_rel, sizeof(stale_rel), ".z23-leases/%ld-1",
+                 (long)child);
+        ASSERT(ic_write(relative, stale_rel, "1099511627777"));
+        struct platform_ram_scratch_lease third = {0};
+        ASSERT(platform_ram_scratch_reserve(root, second_bytes, &third));
+        char stale[4096];
+        snprintf(stale, sizeof(stale), "%s/%s", root, stale_rel);
+        ASSERT(access(stale, F_OK) != 0);
+        platform_ram_scratch_release(&third);
+        unsetenv("ZCL_RAM_SCRATCH_ROOT");
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#endif
+
+
+#if !defined(_WIN32)
+/* The generation root moved to tmpfs, and link() does not cross filesystems.
+ * For ten straight attempts the proof read EXDEV as "vendor/lib is missing"
+ * and told the reader to run `make vendor` on a tree where vendor/lib was
+ * present. This pins both halves of the cure: the copy happens, and it is
+ * faithful. */
+#if defined(__linux__)
+static int ic_empty_fd(const char *root, const char *name, int flags,
+                       char path[4096])
+{
+    if (snprintf(path, 4096, "%s/%s", root, name) >= 4096 ||
+        !ic_write(root, name, ""))
+        return -1;
+    return open(path, flags | O_CLOEXEC);
+}
+
+static bool ic_clone_refusal(const char *root, const char *source_path,
+                             const char *name, int source_flags,
+                             int destination_flags, bool same_inode)
+{
+    char destination_path[4096];
+    int destination = ic_empty_fd(root, name, destination_flags,
+                                  destination_path);
+    int source = open(same_inode ? destination_path : source_path,
+                      source_flags | O_CLOEXEC);
+    bool refused = source >= 0 && destination >= 0 &&
+                   platform_file_clone_fd(source, destination) ==
+                       PLATFORM_FILE_CLONE_REFUSED;
+    bool source_closed = source < 0 || close(source) == 0;
+    bool destination_closed = destination < 0 || close(destination) == 0;
+    return refused && source_closed && destination_closed;
+}
+
+static int test_ic_platform_file_clone_contract(void)
+{
+    int failures = 0;
+    TEST("platform file clone: capability fallback and descriptor contract") {
+        char root[4096], source_path[4096], destination_path[4096];
+        ic_budget_fixture("fileclone", root);
+        static const char body[] = "independent generation bytes\n";
+        ASSERT(ic_write(root, "source", body));
+        ASSERT(snprintf(source_path, sizeof source_path, "%s/source", root) <
+               (int)sizeof source_path);
+        int source = open(source_path, O_RDONLY | O_CLOEXEC);
+        int destination = ic_empty_fd(root, "destination", O_RDWR,
+                                      destination_path);
+        ASSERT(source >= 0 && destination >= 0);
+        ASSERT(lseek(source, 2, SEEK_SET) == 2);
+        ASSERT(lseek(destination, 0, SEEK_SET) == 0);
+        enum platform_file_clone_result result =
+            platform_file_clone_fd(source, destination);
+        ASSERT(result == PLATFORM_FILE_CLONE_CLONED ||
+               result == PLATFORM_FILE_CLONE_UNAVAILABLE);
+        struct stat source_st, destination_st;
+        ASSERT(fstat(source, &source_st) == 0);
+        ASSERT(fstat(destination, &destination_st) == 0);
+        ASSERT(source_st.st_dev != destination_st.st_dev ||
+               source_st.st_ino != destination_st.st_ino);
+        ASSERT(lseek(source, 0, SEEK_CUR) == 2);
+        ASSERT(lseek(destination, 0, SEEK_CUR) == 0);
+        if (result == PLATFORM_FILE_CLONE_CLONED) {
+            char copy[sizeof body] = {0};
+            ASSERT(destination_st.st_size == (off_t)(sizeof body - 1));
+            ASSERT(pread(destination, copy, sizeof body - 1, 0) ==
+                   (ssize_t)(sizeof body - 1));
+            ASSERT(memcmp(copy, body, sizeof body - 1) == 0);
+        } else {
+            ASSERT(destination_st.st_size == 0);
+        }
+        ASSERT(close(destination) == 0);
+        ASSERT(close(source) == 0);
+
+        struct {
+            const char *name;
+            int source_flags, destination_flags;
+            bool same_inode;
+        } refusals[] = {
+            { "writeonly-source", O_WRONLY, O_WRONLY, false },
+            { "readonly-destination", O_RDONLY, O_RDONLY, false },
+            { "append-destination", O_RDONLY, O_WRONLY | O_APPEND, false },
+            { "opath-source", O_PATH, O_WRONLY, false },
+            { "same-inode", O_RDONLY, O_RDWR, true },
+        };
+        for (size_t i = 0; i < sizeof refusals / sizeof refusals[0]; i++)
+            ASSERT(ic_clone_refusal(root, source_path, refusals[i].name,
+                                    refusals[i].source_flags,
+                                    refusals[i].destination_flags,
+                                    refusals[i].same_inode));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+static bool ic_generation_stat_equal(const struct stat *a,
+                                     const struct stat *b)
+{
+    if (a->st_dev != b->st_dev || a->st_ino != b->st_ino ||
+        a->st_size != b->st_size || a->st_mode != b->st_mode ||
+        a->st_mtim.tv_sec != b->st_mtim.tv_sec ||
+        a->st_mtim.tv_nsec != b->st_mtim.tv_nsec)
+        return false;
+#if defined(__APPLE__)
+    return a->st_ctimespec.tv_sec == b->st_ctimespec.tv_sec &&
+           a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec;
+#else
+    return a->st_ctim.tv_sec == b->st_ctim.tv_sec &&
+           a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+#endif
+}
+
+static int test_ic_proof_optional_dependencies(void)
+{
+    int failures = 0;
+    TEST("proof generation: optional cross inputs preserve exact absence and copies") {
+        char fixture[4096], source[4096], generation[4096];
+        ic_budget_fixture("optional-deps", fixture);
+        ASSERT((size_t)snprintf(source, sizeof(source), "%s/source", fixture) <
+               sizeof(source));
+        ASSERT((size_t)snprintf(generation, sizeof(generation),
+                                "%s/generation", fixture) < sizeof(generation));
+        ASSERT(ic_write(source, "vendor/.keep", "fixture\n"));
+        ASSERT(ic_write(generation, "vendor/.keep", "fixture\n"));
+        static const char *const optional[] = {
+            "vendor/.build-x86_64-w64-mingw32", "vendor/.cache", "vendor/cross",
+        };
+        char why[256] = {0};
+        for (size_t i = 0; i < sizeof(optional) / sizeof(optional[0]); i++) {
+            const char *dep = optional[i];
+            ASSERT(zcl_dev_proof_test_generation_dependency(
+                source, generation, dep, why, sizeof(why)));
+            char relative[128], src_dir[4096], dst_dir[4096];
+            char src_file[4096], dst_file[4096];
+            ASSERT((size_t)snprintf(relative, sizeof(relative),
+                                    "%s/archive.a", dep) < sizeof(relative));
+            ASSERT(ic_write(source, relative, "cross input\n"));
+            ASSERT((size_t)snprintf(src_dir, sizeof(src_dir), "%s/%s",
+                                    source, dep) < sizeof(src_dir));
+            ASSERT((size_t)snprintf(dst_dir, sizeof(dst_dir), "%s/%s",
+                                    generation, dep) < sizeof(dst_dir));
+            ASSERT((size_t)snprintf(src_file, sizeof(src_file), "%s/%s",
+                                    source, relative) < sizeof(src_file));
+            ASSERT((size_t)snprintf(dst_file, sizeof(dst_file), "%s/%s",
+                                    generation, relative) < sizeof(dst_file));
+            ASSERT(zcl_dev_proof_test_generation_dependency(
+                source, generation, dep, why, sizeof(why)));
+            struct stat src_st, dst_st;
+            ASSERT(stat(src_file, &src_st) == 0);
+            ASSERT(stat(dst_file, &dst_st) == 0);
+            ASSERT(src_st.st_dev != dst_st.st_dev ||
+                   src_st.st_ino != dst_st.st_ino);
+            ASSERT(dst_st.st_nlink == 1);
+            ASSERT(dst_st.st_size == src_st.st_size);
+            FILE *copied_file = fopen(dst_file, "rb");
+            ASSERT(copied_file != NULL);
+            char body[32] = {0};
+            size_t got = fread(body, 1, sizeof(body) - 1, copied_file);
+            ASSERT(fclose(copied_file) == 0);
+            ASSERT(got == strlen("cross input\n"));
+            ASSERT(strcmp(body, "cross input\n") == 0);
+            ASSERT(unlink(src_file) == 0);
+            ASSERT(rmdir(src_dir) == 0);
+            ASSERT(!zcl_dev_proof_test_generation_dependency(
+                source, generation, dep, why, sizeof(why)));
+            ASSERT(strstr(why, "proof_generation_optional_dependency_stale:") != NULL);
+            ASSERT(strstr(why, dep) != NULL);
+            ASSERT(stat(dst_file, &dst_st) == 0);
+            ASSERT(unlink(dst_file) == 0);
+            ASSERT(rmdir(dst_dir) == 0);
+            ASSERT(zcl_dev_proof_test_generation_dependency(
+                source, generation, dep, why, sizeof(why)));
+            ASSERT(symlink("/unavailable-z23-cross-input", dst_dir) == 0);
+            ASSERT(!zcl_dev_proof_test_generation_dependency(
+                source, generation, dep, why, sizeof(why)));
+            ASSERT(strstr(why, "proof_generation_optional_dependency_stale:") != NULL);
+            ASSERT(unlink(dst_dir) == 0);
+            /* lstat must see a dangling or escaping symlink as PRESENT,
+             * then the ordinary copy policy must refuse it. */
+            ASSERT(symlink("/unavailable-z23-cross-input", src_dir) == 0);
+            ASSERT(!zcl_dev_proof_test_generation_dependency(
+                source, generation, dep, why, sizeof(why)));
+            ASSERT(strstr(why, "proof_generation_dependency_copy_failed:") != NULL);
+            ASSERT(unlink(src_dir) == 0);
+            ASSERT(ic_write(source, relative, "cross input\n"));
+            ASSERT(setenv("ZCL_DEV_PROOF_TEST_LINK_ERRNO", "EACCES", 1) == 0);
+            bool copied = zcl_dev_proof_test_generation_dependency(
+                source, generation, dep, why, sizeof(why));
+            ASSERT(unsetenv("ZCL_DEV_PROOF_TEST_LINK_ERRNO") == 0);
+            ASSERT(!copied);
+            ASSERT(strstr(why, "proof_generation_dependency_copy_failed:") != NULL);
+            ASSERT(unlink(src_file) == 0);
+            ASSERT(rmdir(src_dir) == 0);
+            ASSERT(rmdir(dst_dir) == 0);
+        }
+        static const char *const required[] = {
+            "vendor/lib", "vendor/include", "vendor/sqlite3.c",
+            "vendor/tor/libtor.a", "build/githooks",
+        };
+        for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+            ASSERT(!zcl_dev_proof_test_generation_dependency(
+                source, generation, required[i], why, sizeof(why)));
+            ASSERT(strstr(why, "proof_generation_dependency_unavailable:") != NULL);
+            ASSERT(strstr(why, required[i]) != NULL);
+        }
+        /* ENOTDIR must not be mistaken for an optional ENOENT. */
+        ASSERT(ic_write(fixture, "bad-source/vendor", "not a directory\n"));
+        ASSERT((size_t)snprintf(source, sizeof(source), "%s/bad-source", fixture) <
+               sizeof(source));
+        ASSERT(!zcl_dev_proof_test_generation_dependency(
+            source, generation, "vendor/cross", why, sizeof(why)));
+        ASSERT(strstr(why, "proof_generation_dependency_inspection_failed:") != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_checker_binaries(void)
+{
+    int failures = 0;
+    TEST("proof generation: sealed docs-gate checker binaries copy from the submitting checkout") {
+        char fixture[4096], source[4096], generation[4096];
+        ic_budget_fixture("checker-bins", fixture);
+        /* Hermetic start and end: the budget fixture path is stable, so a
+         * previous run's binaries must never satisfy this run's
+         * absent-prerequisite assertions. */
+        ASSERT(test_rm_rf_recursive(fixture) == 0);
+        ASSERT((size_t)snprintf(source, sizeof(source), "%s/source", fixture) <
+               sizeof(source));
+        ASSERT((size_t)snprintf(generation, sizeof(generation),
+                                "%s/generation", fixture) < sizeof(generation));
+        ASSERT(ic_write(source, "vendor/.keep", "fixture\n"));
+        ASSERT(ic_write(generation, "vendor/.keep", "fixture\n"));
+        static const char *const checkers[] = {
+            "build/bin/z23-lint",
+            "build/bin/z23-fleet-observe",
+            "build/bin/gen_capability_inventory",
+        };
+        char why[256] = {0};
+        for (size_t i = 0; i < sizeof(checkers) / sizeof(checkers[0]); i++) {
+            const char *dep = checkers[i];
+            /* Absent is a named prerequisite, never an optional skip. */
+            ASSERT(!zcl_dev_proof_test_generation_dependency(
+                source, generation, dep, why, sizeof(why)));
+            ASSERT(strstr(why, "proof_generation_dependency_unavailable:") != NULL);
+            ASSERT(strstr(why, "optional") == NULL);
+            ASSERT(strstr(why, dep) != NULL);
+            char want[256];
+            ASSERT((size_t)snprintf(want, sizeof(want), "make %s", dep) <
+                   sizeof(want));
+            ASSERT(strstr(why, want) != NULL);
+            /* Present copies byte-identical under its own inode. */
+            ASSERT(ic_write(source, dep, "checker binary\n"));
+            ASSERT(zcl_dev_proof_test_generation_dependency(
+                source, generation, dep, why, sizeof(why)));
+            char src_file[4096], dst_file[4096];
+            ASSERT((size_t)snprintf(src_file, sizeof(src_file), "%s/%s",
+                                    source, dep) < sizeof(src_file));
+            ASSERT((size_t)snprintf(dst_file, sizeof(dst_file), "%s/%s",
+                                    generation, dep) < sizeof(dst_file));
+            struct stat src_st, dst_st;
+            ASSERT(stat(src_file, &src_st) == 0);
+            ASSERT(stat(dst_file, &dst_st) == 0);
+            ASSERT(src_st.st_dev != dst_st.st_dev ||
+                   src_st.st_ino != dst_st.st_ino);
+            ASSERT(dst_st.st_size == src_st.st_size);
+            FILE *copied_file = fopen(dst_file, "rb");
+            ASSERT(copied_file != NULL);
+            char body[32] = {0};
+            size_t got = fread(body, 1, sizeof(body) - 1, copied_file);
+            ASSERT(fclose(copied_file) == 0);
+            ASSERT(got == strlen("checker binary\n"));
+            ASSERT(strcmp(body, "checker binary\n") == 0);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_dependency_link(const char *target, const char *path)
+{
+    if (unlink(path) != 0 && errno != ENOENT) return false;
+    return symlink(target, path) == 0;
+}
+
+static int test_ic_proof_dependency_relative_links(void)
+{
+    int failures = 0;
+    TEST("proof generation: libtool parent links stay inside copied dependency root") {
+        char fixture[4096], source[4096], target[4096], link_path[4096];
+        ic_budget_fixture("deplinks", fixture);
+        ASSERT(ic_write(fixture, "source/libevent.la", "archive-metadata\n"));
+        ASSERT(ic_write(fixture, "source/.libs/keep", "fixture\n"));
+        snprintf(source, sizeof(source), "%s/source", fixture);
+        snprintf(target, sizeof(target), "%s/target", fixture);
+        snprintf(link_path, sizeof(link_path), "%s/.libs/libevent.la", source);
+        ASSERT(ic_dependency_link("../libevent.la", link_path));
+        snprintf(link_path, sizeof(link_path), "%s/.libs/chained.la", source);
+        ASSERT(ic_dependency_link("libevent.la", link_path));
+        ASSERT(zcl_dev_proof_dependency_materialize(source, target));
+        snprintf(link_path, sizeof(link_path), "%s/.libs/libevent.la", target);
+        char link_text[64] = {0};
+        ASSERT_EQ(readlink(link_path, link_text, sizeof(link_text) - 1), 14);
+        ASSERT_STR_EQ(link_text, "../libevent.la");
+        char content[64] = {0};
+        FILE *file = fopen(link_path, "rb");
+        ASSERT(file != NULL);
+        ASSERT_EQ(fread(content, 1, sizeof(content) - 1, file), 17);
+        ASSERT(fclose(file) == 0);
+        ASSERT_STR_EQ(content, "archive-metadata\n");
+        snprintf(link_path, sizeof(link_path), "%s/.libs/chained.la", target);
+        ASSERT(stat(link_path, &(struct stat){0}) == 0);
+        struct stat original, copied;
+        snprintf(link_path, sizeof(link_path), "%s/libevent.la", source);
+        ASSERT(stat(link_path, &original) == 0);
+        snprintf(link_path, sizeof(link_path), "%s/libevent.la", target);
+        ASSERT(stat(link_path, &copied) == 0);
+        ASSERT(original.st_ino != copied.st_ino || original.st_dev != copied.st_dev);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_dependency_link_refused(const char *source, const char *target,
+                                       const char *link_text, int expected)
+{
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/.libs/escape", source);
+    if (!ic_dependency_link(link_text, path)) return false;
+    errno = 0;
+    bool copied = zcl_dev_proof_dependency_materialize(source, target);
+    int copy_errno = errno;
+    if (unlink(path) != 0) return false;
+    return !copied && copy_errno == expected;
+}
+
+static int test_ic_proof_dependency_link_refusals(void)
+{
+    int failures = 0;
+    TEST("proof generation: dependency links cannot escape or hide missing inputs") {
+        char fixture[4096], source[4096], target[4096], link_path[4096];
+        ic_budget_fixture("deplinkrefuse", fixture);
+        ASSERT(ic_write(fixture, "source/.libs/keep", "fixture\n"));
+        ASSERT(ic_write(fixture, "source/libevent.la", "archive-metadata\n"));
+        ASSERT(ic_write(fixture, "outside", "external-input\n"));
+        ASSERT(ic_write(fixture, "source-neighbor/outside", "external-input\n"));
+        snprintf(source, sizeof(source), "%s/source", fixture);
+        snprintf(target, sizeof(target), "%s/target", fixture);
+        snprintf(link_path, sizeof(link_path), "%s/alias", source);
+        ASSERT(ic_dependency_link(".", link_path));
+        ASSERT(ic_dependency_link_refused(source, target, "../../outside", EACCES));
+        ASSERT(ic_dependency_link_refused(source, target, "../missing", ENOENT));
+        ASSERT(ic_dependency_link_refused(source, target, "../libevent.la/", ENOTDIR));
+        ASSERT(ic_dependency_link_refused(source, target,
+                                          "../../source/libevent.la", EACCES));
+        ASSERT(ic_dependency_link_refused(source, target,
+                                          "../alias/../source/libevent.la", EACCES));
+        ASSERT(ic_dependency_link_refused(source, target,
+                                          "../../source-neighbor/outside", EACCES));
+        ASSERT(ic_dependency_link_refused(source, target, "escape", ELOOP));
+        char outside[4096];
+        ASSERT(realpath(fixture, outside) != NULL);
+        ASSERT(ic_dependency_link_refused(source, target, outside, EACCES));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_dependency_crosses_filesystems(void)
+{
+    int failures = 0;
+    TEST("proof generation: a dependency crosses a filesystem boundary intact") {
+        char relative[4096], cwd[2048], source[4096], same[4096];
+        ic_budget_fixture("depcopy", relative);
+        ASSERT(getcwd(cwd, sizeof(cwd)) != NULL);
+        static const char body[] = "#!/bin/sh\nexec true\n";
+        ASSERT(ic_write(relative, "payload.sh", body));
+        snprintf(source, sizeof(source), "%s/%s/payload.sh", cwd, relative);
+        ASSERT(chmod(source, 0755) == 0);
+        /* Pin the source to a modification time that cannot be mistaken for
+         * "now". A copy that stamps the target with the time of the copy
+         * hands the generation an artifact newer than every source it was
+         * built from, and make inside the generation then declares a stale
+         * artifact up to date. link() preserves the time for free, so only a
+         * copy can lose it — and only a check like this one can see that. */
+        const struct timespec pinned[2] = {
+            { .tv_sec = 1000000000, .tv_nsec = 0 },
+            { .tv_sec = 1000000000, .tv_nsec = 123456000 },
+        };
+        ASSERT(utimensat(AT_FDCWD, source, pinned, 0) == 0);
+        struct stat source_st;
+        ASSERT(stat(source, &source_st) == 0);
+        ASSERT(source_st.st_mtim.tv_sec == 1000000000);
+
+        /* No proof generation may expose a donor's writable inode through an
+         * allowed generation pathname. A second concurrent generation must
+         * not change the first generation's mutation identity merely by
+         * materializing the same selected vendor dependency. */
+        snprintf(same, sizeof(same), "%s/%s/linked.sh", cwd, relative);
+#if defined(__APPLE__)
+        /* A generation made by an older worker may already share the inode. */
+        ASSERT(unlink(same) == 0 || errno == ENOENT);
+        ASSERT(link(source, same) == 0);
+#endif
+        ASSERT(zcl_dev_proof_dependency_materialize(source, same));
+        struct stat same_st;
+        ASSERT(stat(same, &same_st) == 0);
+        ASSERT(same_st.st_dev == source_st.st_dev);
+        ASSERT(same_st.st_ino != source_st.st_ino);
+        ASSERT(same_st.st_nlink == 1);
+        ASSERT((same_st.st_mode & 07777) == (source_st.st_mode & 07777));
+        ASSERT(same_st.st_mtim.tv_sec == source_st.st_mtim.tv_sec);
+        ASSERT(same_st.st_mtim.tv_nsec == source_st.st_mtim.tv_nsec);
+        ASSERT((size_t)same_st.st_size == sizeof(body) - 1);
+
+        char second[4096];
+        snprintf(second, sizeof(second), "%s/%s/second.sh", cwd, relative);
+        struct stat first_before_second, first_after_second;
+        ASSERT(stat(same, &first_before_second) == 0);
+        ASSERT(zcl_dev_proof_dependency_materialize(source, second));
+        struct stat second_st;
+        ASSERT(stat(second, &second_st) == 0);
+        ASSERT(second_st.st_ino != source_st.st_ino);
+        ASSERT(second_st.st_ino != same_st.st_ino);
+        ASSERT(second_st.st_nlink == 1);
+        ASSERT((second_st.st_mode & 07777) == (source_st.st_mode & 07777));
+        ASSERT(second_st.st_mtim.tv_sec == source_st.st_mtim.tv_sec);
+        ASSERT(second_st.st_mtim.tv_nsec == source_st.st_mtim.tv_nsec);
+        ASSERT((size_t)second_st.st_size == sizeof(body) - 1);
+        ASSERT(stat(same, &first_after_second) == 0);
+        ASSERT(ic_generation_stat_equal(&first_before_second,
+                                        &first_after_second));
+
+        /* A donor rebuilt in place must not rewrite either already-frozen
+         * generation. Restore the fixture before asserting so a born-red
+         * failure cannot leak changed bytes into later cases. */
+        int donor = open(source, O_WRONLY);
+        bool donor_changed = donor >= 0 && pwrite(donor, "X", 1, 0) == 1;
+        if (donor >= 0)
+            donor_changed = close(donor) == 0 && donor_changed;
+        char first_seen[sizeof(body)] = {0};
+        char second_seen[sizeof(body)] = {0};
+        int first = open(same, O_RDONLY);
+        bool first_read = first >= 0 &&
+                          read(first, first_seen, sizeof(body) - 1) ==
+                              (ssize_t)(sizeof(body) - 1);
+        if (first >= 0)
+            first_read = close(first) == 0 && first_read;
+        int second_fd = open(second, O_RDONLY);
+        bool second_read = second_fd >= 0 &&
+                           read(second_fd, second_seen, sizeof(body) - 1) ==
+                               (ssize_t)(sizeof(body) - 1);
+        if (second_fd >= 0)
+            second_read = close(second_fd) == 0 && second_read;
+        donor = open(source, O_WRONLY);
+        bool donor_restored = donor >= 0 &&
+                              pwrite(donor, body, 1, 0) == 1;
+        if (donor >= 0)
+            donor_restored = close(donor) == 0 && donor_restored;
+        donor_restored = utimensat(AT_FDCWD, source, pinned, 0) == 0 &&
+                           donor_restored;
+        struct stat first_after_donor;
+        bool first_stable = stat(same, &first_after_donor) == 0 &&
+                            ic_generation_stat_equal(&first_after_second,
+                                                     &first_after_donor);
+        ASSERT(donor_changed && first_read && second_read && donor_restored);
+        ASSERT(memcmp(first_seen, body, sizeof(body) - 1) == 0);
+        ASSERT(memcmp(second_seen, body, sizeof(body) - 1) == 0);
+        ASSERT(first_stable);
+
+        /* Pin the fallback on every native host, including those without
+         * /dev/shm. Only EXDEV is injected; copying and metadata are real. */
+        char forced[4096];
+        snprintf(forced, sizeof(forced), "%s/%s/copied.sh", cwd, relative);
+        ASSERT(setenv("ZCL_DEV_PROOF_TEST_LINK_ERRNO", "EXDEV", 1) == 0);
+        bool copied = zcl_dev_proof_dependency_materialize(source, forced);
+        int cleared = unsetenv("ZCL_DEV_PROOF_TEST_LINK_ERRNO");
+        ASSERT(cleared == 0);
+        ASSERT(copied);
+        struct stat forced_st;
+        ASSERT(stat(forced, &forced_st) == 0);
+        ASSERT(forced_st.st_dev == source_st.st_dev);
+        ASSERT(forced_st.st_ino != source_st.st_ino);
+        ASSERT((forced_st.st_mode & 07777) == (source_st.st_mode & 07777));
+        ASSERT(forced_st.st_mtim.tv_sec == source_st.st_mtim.tv_sec);
+        ASSERT(forced_st.st_mtim.tv_nsec == source_st.st_mtim.tv_nsec);
+        ASSERT((size_t)forced_st.st_size == sizeof(body) - 1);
+        char forced_body[sizeof(body)] = {0};
+        FILE *forced_file = fopen(forced, "rb");
+        ASSERT(forced_file != NULL);
+        size_t forced_len = fread(forced_body, 1, sizeof(forced_body),
+                                  forced_file);
+        int closed = fclose(forced_file);
+        ASSERT(closed == 0);
+        ASSERT(forced_len == sizeof(body) - 1);
+        ASSERT(memcmp(forced_body, body, sizeof(body) - 1) == 0);
+        ASSERT(unlink(forced) == 0);
+
+        /* An unrelated link error must retain its refusal and errno. */
+        ASSERT(setenv("ZCL_DEV_PROOF_TEST_LINK_ERRNO", "EACCES", 1) == 0);
+        bool denied = zcl_dev_proof_dependency_materialize(source, forced);
+        int denied_errno = errno;
+        cleared = unsetenv("ZCL_DEV_PROOF_TEST_LINK_ERRNO");
+        ASSERT(cleared == 0);
+        ASSERT(!denied);
+        ASSERT(denied_errno == EACCES);
+        ASSERT(lstat(forced, &forced_st) != 0 && errno == ENOENT);
+
+        /* /dev/shm is the RAM-backed generation root in production. A box
+         * without a writable one cannot observe the cross-device path at all,
+         * so say so out loud rather than passing as if it had. */
+        char ram_dir[4096], ram_target[4096];
+        snprintf(ram_dir, sizeof(ram_dir), "/dev/shm/z23-ic-depcopy-%ld",
+                 (long)getpid());
+        if (mkdir(ram_dir, 0700) != 0 && errno != EEXIST) {
+            printf("impact_composition: SKIP cross-filesystem dependency copy "
+                   "(no writable /dev/shm on this host)\n");
+            PASS();
+            goto _test_next;
+        }
+        snprintf(ram_target, sizeof(ram_target), "%s/payload.sh", ram_dir);
+        (void)unlink(ram_target);
+        struct stat ram_st;
+        if (stat(ram_dir, &ram_st) != 0 || ram_st.st_dev == source_st.st_dev) {
+            (void)rmdir(ram_dir);
+            printf("impact_composition: SKIP cross-filesystem dependency copy "
+                   "(/dev/shm shares the filesystem of this checkout)\n");
+            PASS();
+            goto _test_next;
+        }
+        ASSERT(zcl_dev_proof_dependency_materialize(source, ram_target));
+        struct stat copied_st;
+        ASSERT(stat(ram_target, &copied_st) == 0);
+        /* A copy, not a link: different filesystem, and the executable bit
+         * that a hook or a .so depends on survived. */
+        ASSERT(copied_st.st_dev != source_st.st_dev);
+        ASSERT((copied_st.st_mode & 07777) == (source_st.st_mode & 07777));
+        ASSERT((copied_st.st_mode & 0111) != 0);
+        /* The copy is as old as what it was copied from, to the nanosecond. */
+        ASSERT(copied_st.st_mtim.tv_sec == source_st.st_mtim.tv_sec);
+        ASSERT(copied_st.st_mtim.tv_nsec == source_st.st_mtim.tv_nsec);
+        ASSERT((size_t)copied_st.st_size == sizeof(body) - 1);
+        char read_back[128] = {0};
+        FILE *fh = fopen(ram_target, "rb");
+        ASSERT(fh != NULL);
+        size_t got = fread(read_back, 1, sizeof(read_back) - 1, fh);
+        ASSERT(fclose(fh) == 0);
+        ASSERT(got == sizeof(body) - 1);
+        ASSERT(memcmp(read_back, body, sizeof(body) - 1) == 0);
+        /* A directory recurses across the same boundary. */
+        char dir_source[4096], dir_target[4096], nested[4096];
+        snprintf(dir_source, sizeof(dir_source), "%s/%s/tree", cwd, relative);
+        ASSERT(ic_write(relative, "tree/inner.txt", "inner\n"));
+        snprintf(dir_target, sizeof(dir_target), "%s/tree", ram_dir);
+        ASSERT(zcl_dev_proof_dependency_materialize(dir_source, dir_target));
+        snprintf(nested, sizeof(nested), "%s/tree/inner.txt", ram_dir);
+        struct stat nested_st;
+        ASSERT(stat(nested, &nested_st) == 0);
+        ASSERT(nested_st.st_size == 6);
+        (void)unlink(nested);
+        (void)rmdir(dir_target);
+        (void)unlink(ram_target);
+        (void)rmdir(ram_dir);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#endif
+
+/* Sealing a receipt now needs this box's Ed25519 signing key, which lives
+ * under the resolved state root. Point that root into this group's own
+ * test-tmp tree for the whole group, so a test run creates a throwaway key
+ * instead of touching (or depending on) the operator's real one. The group
+ * runs in its own child process, so the environment change is contained. */
+static void ic_isolate_state_root(void)
+{
+    static char state[PATH_MAX];
+    char base[PATH_MAX - 64];
+    test_make_tmpdir(base, sizeof(base), "impact_composition", "state");
+    if (snprintf(state, sizeof(state), "%s/state", base) > 0)
+        setenv("XDG_STATE_HOME", state, 1);
+}
+
+/* ── the changed set a ten-lane landing batch actually produces ──────────
+ *
+ * A batch of ten-plus lanes is now the landing unit, so one proof legitimately
+ * covers thousands of paths. What is pinned here is that the capture path
+ * carries that many EXACTLY: it neither truncates a long list into a shorter
+ * one that still parses, nor grows a stack frame to hold it, and it refuses
+ * above its ceiling with the observed count in the reason. */
+
+#define IC_FIX_CHANGED IC_FIX_ROOT "/changedset"
+#define IC_CHANGED_REPO IC_FIX_CHANGED "/repo"
+
+static bool ic_changed_fixture_build(void)
+{
+    /* Base has 4097 files; the next commits modify 1000 and then all 4097.
+     * This exercises a real changed set without admitting added paths. */
+    int rc = system(
+        "set -e; rm -rf " IC_FIX_CHANGED "; mkdir -p " IC_CHANGED_REPO "; "
+        "cd " IC_CHANGED_REPO "; git init -q .; "
+        "git config user.email fixture@example.invalid; "
+        "git config user.name fixture; git config commit.gpgsign false; "
+        "i=0; while [ $i -lt 1000 ]; do echo x > f$i.c; i=$((i+1)); done; "
+        "while [ $i -lt 4097 ]; do echo x > f$i.c; i=$((i+1)); done; "
+        "echo base > base.txt; git add -A; git commit -qm base; "
+        "git rev-parse HEAD > ../base.sha; "
+        "i=0; while [ $i -lt 1000 ]; do echo y > f$i.c; i=$((i+1)); done; "
+        "git add -A; git commit -qm batch; git rev-parse HEAD > ../one.sha; "
+        "i=0; while [ $i -lt 4097 ]; do echo z > f$i.c; i=$((i+1)); done; "
+        "git add -A; git commit -qm over; git rev-parse HEAD > ../two.sha; "
+        "echo x > optional.h; git add -A; git commit -qm add_h; "
+        "git rev-parse HEAD > ../add_h.sha; "
+        "git rm -q optional.h; git commit -qm del_h; "
+        "git rev-parse HEAD > ../del_h.sha; "
+        "echo x > optional.def; git add -A; git commit -qm add_def; "
+        "git rev-parse HEAD > ../add_def.sha; "
+        "git rm -q optional.def; git commit -qm del_def; "
+        "git rev-parse HEAD > ../del_def.sha; "
+        "echo x > optional.inc; git add -A; git commit -qm add_inc; "
+        "git rev-parse HEAD > ../add_inc.sha; "
+        "git rm -q optional.inc; git commit -qm del_inc; "
+        "git rev-parse HEAD > ../del_inc.sha; "
+        "echo x > switch.txt; git add -A; git commit -qm add_txt; "
+        "git rev-parse HEAD > ../add_txt.sha; "
+        "git rm -q switch.txt; git commit -qm del_txt; "
+        "git rev-parse HEAD > ../del_txt.sha; "
+        "echo x > type.c; git add -A; git commit -qm regular_type; "
+        "git rev-parse HEAD > ../regular_type.sha; "
+        "rm type.c; ln -s target type.c; echo changed > f0.c; "
+        "git add -A; git commit -qm symlink_type; "
+        "git rev-parse HEAD > ../symlink_type.sha; "
+        "mkdir -p docs; echo x > docs/CAPABILITY_INVENTORY.jsonl; "
+        "git add -A; git commit -qm add_inventory; "
+        "git rev-parse HEAD > ../add_inventory.sha; "
+        "mkdir -p core/modules/net/include/net; "
+        "echo '/* fixture */' > core/modules/net/include/net/net.h; "
+        "git add -A; git commit -qm add_known; "
+        "git rev-parse HEAD > ../add_known.sha; "
+        "git rm -q core/modules/net/include/net/net.h; git commit -qm del_known; "
+        "git rev-parse HEAD > ../del_known.sha; "
+        "mkdir -p core/modules/net/include/net; "
+        "echo '/* fixture */' > core/modules/net/include/net/net.h; "
+        "git add -A; git commit -qm rename_base; "
+        "git rev-parse HEAD > ../rename_base.sha; "
+        "git mv core/modules/net/include/net/net.h core/modules/net/include/net/clp.h; "
+        "git commit -qm rename_known; git rev-parse HEAD > ../rename_known.sha; "
+        ">/dev/null 2>&1");
+    return rc == 0;
+}
+
+/* git writes --output relative to its own cwd, so the capture and record
+ * paths handed to the proof seam must be absolute. */
+static bool ic_changed_path(const char *rel, char *out, size_t out_len)
+{
+    char cwd[512];
+    if (!getcwd(cwd, sizeof(cwd)))
+        return false;
+    return snprintf(out, out_len, "%s/" IC_FIX_CHANGED "/%s", cwd, rel) <
+           (int)out_len;
+}
+
+static bool ic_read_sha(const char *rel, char out[65])
+{
+    char path[512];
+    if (snprintf(path, sizeof(path), "%s/%s", IC_FIX_CHANGED, rel) >=
+        (int)sizeof(path))
+        return false;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+    char line[128] = {0};
+    bool ok = fgets(line, sizeof(line), f) != NULL;
+    fclose(f);
+    if (!ok)
+        return false;
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+        line[--len] = 0;
+    if (len == 0 || len >= 65)
+        return false;
+    (void)snprintf(out, 65, "%s", line);
+    return true;
+}
+
+extern bool zcl_dev_proof_test_changed_set_bytes(char *bytes, size_t len,
+                                                char *why, size_t why_len);
+
+static int test_ic_changed_set_rejects_hidden_bytes(void)
+{
+    int failures = 0;
+    TEST("proof changed set: raw NUL refuses before path tokenization") {
+        char why[256] = {0};
+        char malformed[] = "M\tsrc.c\0suffix\n";
+        ASSERT(!zcl_dev_proof_test_changed_set_bytes(
+            malformed, sizeof(malformed) - 1, why, sizeof(why)));
+        ASSERT(strstr(why, "changed_set_invalid_or_truncated") != NULL);
+        char eof[] = "M\tsrc.c";
+        ASSERT(zcl_dev_proof_test_changed_set_bytes(
+            eof, sizeof(eof) - 1, why, sizeof(why)));
+        char lf[] = "M\tsrc.c\n";
+        ASSERT(zcl_dev_proof_test_changed_set_bytes(
+            lf, sizeof(lf) - 1, why, sizeof(why)));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_changed_set_carries_a_landing_batch(void)
+{
+    int failures = 0;
+    TEST("impact composition: a thousand-file changed set captures and plans") {
+        ASSERT(ic_changed_fixture_build());
+        char base[65], one[65];
+        ASSERT(ic_read_sha("base.sha", base));
+        ASSERT(ic_read_sha("one.sha", one));
+        char capture[640], record[640];
+        ASSERT(ic_changed_path("capture.txt", capture, sizeof(capture)));
+        ASSERT(ic_changed_path("changed", record, sizeof(record)));
+
+        struct zcl_dev_proof_changed_set set = {0};
+        char why[256] = {0};
+        /* This fixture is a throwaway repository under test-tmp/, so the
+         * bounded git invocation is opted in for exactly this case. */
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        bool captured = zcl_dev_proof_changed_set_capture(
+            IC_CHANGED_REPO, base, one, capture, record, &set, why,
+            sizeof(why));
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(captured);
+        ASSERT(set.count == 1000);
+        ASSERT(set.files != NULL && set.bytes != NULL);
+        for (size_t i = 0; i < set.count; i++)
+            ASSERT(set.files[i] && set.files[i][0] && set.files[i][0] != '/');
+
+        /* The persisted record holds every row, not a prefix of them. */
+        FILE *f = fopen(record, "r");
+        ASSERT(f != NULL);
+        size_t lines = 0;
+        int c, last = 0;
+        while ((c = fgetc(f)) != EOF) {
+            if (c == '\n')
+                lines++;
+            last = c;
+        }
+        fclose(f);
+        ASSERT(lines == 1000);
+        ASSERT(last == '\n');
+
+        /* And the plan path accepts the whole batch. */
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(set.files, set.count, &plan));
+        /* The fixture paths match no impact rule by design, so groups are
+         * proved separately: the same batch size with one real repo path in it
+         * still selects that path's groups, which is what shows the ceiling
+         * and not the rule table was the former limiter. */
+        const char **mixed = zcl_calloc(set.count, sizeof(*mixed), "ic mixed");
+        ASSERT(mixed != NULL);
+        for (size_t i = 0; i < set.count; i++)
+            mixed[i] = set.files[i];
+        mixed[set.count - 1] = "tools/dev/devloop.c";
+        bool mixed_planned = zcl_devloop_plan_files(mixed, set.count, &plan);
+        free((void *)mixed);
+        ASSERT(mixed_planned);
+        ASSERT(plan.path_groups_len > 0);
+
+        zcl_dev_proof_changed_set_release(&set);
+        ASSERT(set.bytes == NULL && set.files == NULL && set.count == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Presence changes can alter conditional includes without an old depfile
+ * edge; type changes can alter which source bytes the build reads. Neither
+ * can be narrowed, and neither may fail the proof: the capture keeps every
+ * row, names the first structural one, and the selector widens to the full
+ * closure -- every catalog group -- instead of the narrowed plan. */
+struct ic_structural_case {
+    const char *base;
+    const char *head;
+    const char *label;
+    const char *path;
+    size_t rows;
+};
+
+static const struct ic_structural_case ic_structural_cases[] = {
+    {"two.sha", "add_h.sha", "add_h", "optional.h", 1},
+    {"add_h.sha", "del_h.sha", "del_h", "optional.h", 1},
+    {"del_h.sha", "add_def.sha", "add_def", "optional.def", 1},
+    {"add_def.sha", "del_def.sha", "del_def", "optional.def", 1},
+    {"del_def.sha", "add_inc.sha", "add_inc", "optional.inc", 1},
+    {"add_inc.sha", "del_inc.sha", "del_inc", "optional.inc", 1},
+    {"del_inc.sha", "add_txt.sha", "add_txt", "switch.txt", 1},
+    {"add_txt.sha", "del_txt.sha", "del_txt", "switch.txt", 1},
+    {"regular_type.sha", "symlink_type.sha", "mixed_type_change", "type.c",
+     2},
+    {"symlink_type.sha", "add_inventory.sha", "add_inventory",
+     "docs/CAPABILITY_INVENTORY.jsonl", 1},
+};
+
+static bool ic_structural_capture(const struct ic_structural_case *c,
+                                  struct zcl_dev_proof_changed_set *set,
+                                  char *why, size_t why_len)
+{
+    char base[65], head[65], capture[640], record[640];
+    if (!ic_read_sha(c->base, base) || !ic_read_sha(c->head, head) ||
+        !ic_changed_path("capture_presence.txt", capture, sizeof(capture)) ||
+        !ic_changed_path("changed_presence", record, sizeof(record)) ||
+        setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) != 0)
+        return false;
+    bool captured = zcl_dev_proof_changed_set_capture(
+        IC_CHANGED_REPO, base, head, capture, record, set, why, why_len);
+    (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+    return captured;
+}
+
+static int test_ic_changed_set_widens_structural_changes(void)
+{
+    int failures = 0;
+    static char ic_fixture_saved[4096];
+    bool ic_fixture_was_set =
+        ic_host_fixture_save(ic_fixture_saved, sizeof(ic_fixture_saved));
+    TEST("proof changed set: structural changes widen to the full closure") {
+        ASSERT(ic_changed_fixture_build());
+        ASSERT(ic_host_need_full_root(IC_FIX_HOST_FULL));
+        ic_host_fixture_env(true);
+        size_t catalog = zcl_test_group_catalog_count();
+        ASSERT(catalog > 2);
+        static char selector[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS *
+                             (ZCL_TEST_GROUP_FULL_MAX + 1)];
+        char gated[PROOF_HOST_GATED_MAX];
+        size_t n = sizeof ic_structural_cases / sizeof ic_structural_cases[0];
+        for (size_t i = 0; i < n; i++) {
+            const struct ic_structural_case *c = &ic_structural_cases[i];
+            struct zcl_dev_proof_changed_set set = {0};
+            char why[256] = {0};
+            bool captured = ic_structural_capture(c, &set, why, sizeof(why));
+            uint32_t selected = 0;
+            bool universal = false;
+            memset(selector, 0, sizeof(selector));
+            bool chose = captured &&
+                zcl_dev_proof_test_changed_set_selector(
+                    &set, IC_FIX_HOST_FULL, selector, sizeof(selector),
+                    &selected, &universal, gated, sizeof(gated));
+            printf("invariant=structural_change case=%s captured=%d "
+                   "path=%s rows=%zu universal=%d selected=%u of %zu "
+                   "reason=%s\n", c->label, captured ? 1 : 0,
+                   set.structural_path ? set.structural_path : "-",
+                   set.count, universal ? 1 : 0, (unsigned)selected,
+                   catalog, why[0] ? why : "-");
+            /* Widened, not refused: every row kept, the structural one named. */
+            ASSERT(captured);
+            ASSERT(why[0] == '\0');
+            ASSERT(set.count == c->rows && set.files && set.bytes);
+            ASSERT(set.structural_count == 1);
+            ASSERT(set.structural_path &&
+                   strcmp(set.structural_path, c->path) == 0);
+            /* The full closure: the universal set (every catalog group, each
+             * umbrella carried by all of its shards), never a narrowed plan,
+             * never an inventory-only or empty selection. */
+            ASSERT(chose);
+            ASSERT(universal);
+            ASSERT((gated[0] == '\0') == (ic_fuzz_host_ready() && ic_guest_host_missing() == 0));
+            ASSERT(ic_selector_is_universal(selector, selected,
+                                            !ic_fuzz_host_ready() + ic_guest_host_missing()));
+            for (size_t g = 0; g < catalog; g++) {
+                const char *group = zcl_test_group_catalog_at(g);
+                if (ic_full_host_selects(group, ic_fuzz_host_ready()))
+                    ASSERT(ic_selector_has(selector, group));
+            }
+            /* The structural mark is what widens: the same rows without it
+             * plan the narrow selection, which is not the catalog. */
+            struct zcl_dev_proof_changed_set narrow = set;
+            narrow.structural_path = NULL;
+            narrow.structural_count = 0;
+            uint32_t narrow_selected = 0;
+            bool narrow_universal = true;
+            memset(selector, 0, sizeof(selector));
+            ASSERT(zcl_dev_proof_test_changed_set_selector(
+                &narrow, IC_FIX_HOST_FULL, selector, sizeof(selector),
+                &narrow_selected, &narrow_universal, gated, sizeof(gated)));
+            ASSERT(!narrow_universal);
+            ASSERT((size_t)narrow_selected < catalog);
+            zcl_dev_proof_changed_set_release(&set);
+            ASSERT(set.structural_path == NULL && set.structural_count == 0);
+        }
+        PASS();
+    } _test_next:;
+    ic_host_fixture_restore(ic_fixture_saved, ic_fixture_was_set);
+    return failures;
+}
+
+/* dev_proof's own worker never captures the changed set against the shared
+ * landing worktree: it captures against `generation`, the private
+ * `git worktree add --detach` copy generation_prepare() already pinned to
+ * exactly `local`, so a concurrent `dev land step` rebasing the shared
+ * worktree cannot TOCTOU the capture. This proves the half of that contract
+ * this seam owns: a repo_root that is a real git worktree sharing another
+ * checkout's object database (not the checkout itself) still resolves
+ * `base` and `local` and captures the exact changed set. */
+static int test_ic_changed_set_reads_a_private_generation_worktree(void)
+{
+    int failures = 0;
+    TEST("impact composition: changed-set capture reads a private "
+        "generation worktree sharing another checkout's object database") {
+        ASSERT(ic_changed_fixture_build());
+        char base[65], one[65];
+        ASSERT(ic_read_sha("base.sha", base));
+        ASSERT(ic_read_sha("one.sha", one));
+        char generation[640];
+        ASSERT(ic_changed_path("generation", generation, sizeof(generation)));
+
+        /* Exactly what generation_prepare() does to produce `generation`:
+         * a detached worktree of the submitting checkout, pinned to the
+         * proof's `local`. Its .git file points back at IC_CHANGED_REPO's
+         * gitdir rather than duplicating the object store. */
+        char cmd[1400];
+        ASSERT((size_t)snprintf(
+            cmd, sizeof(cmd),
+            "git -C " IC_CHANGED_REPO
+            " worktree add --quiet --detach %s %s >/dev/null 2>&1",
+            generation, one) < sizeof(cmd));
+        ASSERT(system(cmd) == 0);
+
+        char capture[640], record[640];
+        ASSERT(ic_changed_path("capture_gen.txt", capture, sizeof(capture)));
+        ASSERT(ic_changed_path("changed_gen", record, sizeof(record)));
+        struct zcl_dev_proof_changed_set set = {0};
+        char why[256] = {0};
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        /* The point under test: repo_root is the WORKTREE COPY, never
+         * IC_CHANGED_REPO itself. `base` still resolves through the
+         * shared object database this worktree was added from. */
+        bool captured = zcl_dev_proof_changed_set_capture(
+            generation, base, one, capture, record, &set, why, sizeof(why));
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(captured);
+        ASSERT(set.count == 1000);
+        ASSERT(set.files != NULL && set.bytes != NULL);
+        for (size_t i = 0; i < set.count; i++)
+            ASSERT(set.files[i] && set.files[i][0] && set.files[i][0] != '/');
+        zcl_dev_proof_changed_set_release(&set);
+
+        char rmcmd[700];
+        ASSERT((size_t)snprintf(rmcmd, sizeof(rmcmd),
+                                "git -C " IC_CHANGED_REPO
+                                " worktree remove --force %s >/dev/null 2>&1",
+                                generation) < sizeof(rmcmd));
+         TEST_DISCARD(system(rmcmd));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_changed_set_refuses_above_its_ceiling(void)
+{
+    int failures = 0;
+    TEST("impact composition: an over-ceiling changed set refuses with its count") {
+        ASSERT(ic_changed_fixture_build());
+        char base[65], two[65];
+        ASSERT(ic_read_sha("base.sha", base));
+        ASSERT(ic_read_sha("two.sha", two));
+        char capture[640], record[640];
+        ASSERT(ic_changed_path("capture.txt", capture, sizeof(capture)));
+        ASSERT(ic_changed_path("over", record, sizeof(record)));
+
+        struct zcl_dev_proof_changed_set set = {0};
+        char why[256] = {0};
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        /* 4097 changed paths is exactly one past ZCL_DEVLOOP_MAX_FILES. */
+        bool captured = zcl_dev_proof_changed_set_capture(
+            IC_CHANGED_REPO, base, two, capture, record, &set, why,
+            sizeof(why));
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(!captured);
+        ASSERT(set.count == 0 && set.files == NULL && set.bytes == NULL);
+        ASSERT(strstr(why, "changed_set_invalid_or_truncated") != NULL);
+        /* The refusal names the observed count — silence here is the defect
+         * this case exists for. */
+        ASSERT(strstr(why, "files=4097") != NULL);
+        ASSERT(strstr(why, "max=4096") != NULL);
+        /* A refused capture publishes no record. */
+        FILE *f = fopen(record, "r");
+        ASSERT(f == NULL);
+
+        /* The plan path refuses the same set for the same reason. */
+        const char **oversize = zcl_calloc((size_t)ZCL_DEVLOOP_MAX_FILES + 1,
+                                           sizeof(*oversize), "ic oversize");
+        ASSERT(oversize != NULL);
+        for (size_t i = 0; i <= (size_t)ZCL_DEVLOOP_MAX_FILES; i++)
+            oversize[i] = "tools/dev/devloop.c";
+        struct zcl_devloop_plan plan;
+        bool planned = zcl_devloop_plan_files(
+            oversize, (size_t)ZCL_DEVLOOP_MAX_FILES + 1, &plan);
+        free((void *)oversize);
+        ASSERT(!planned);
+ TEST_DISCARD(system("rm -rf " IC_FIX_CHANGED));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_watch_overlay_keeps_its_own_ceiling(void)
+{
+    int failures = 0;
+    TEST("impact composition: the watcher overlay keeps a ceiling of its own") {
+        /* The two ceilings are deliberately different names with different
+         * numbers: the proof/plan set is heap-resident and large, the inotify
+         * overlay stays resident in the watcher frame and small, collapsing to
+         * a full rebuild rather than dropping paths. Collapsing them back into
+         * one number is what this case refuses. */
+        ASSERT(ZCL_DEVLOOP_MAX_FILES == 4096);
+        ASSERT(ZCL_DEVLOOP_WATCH_MAX_FILES == 256);
+        ASSERT(ZCL_DEVLOOP_WATCH_MAX_FILES < ZCL_DEVLOOP_MAX_FILES);
+        /* The overlay table must stay small enough to live in a frame. */
+        ASSERT((size_t)ZCL_DEVLOOP_WATCH_MAX_FILES *
+                   (size_t)ZCL_DEVLOOP_PATH_MAX <= 512u * 1024u);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── proof generation warm start ──────────────────────────────────────
+ *
+ * Fresh proof generations compile every translation unit because git
+ * stamps every source with the checkout time. The warm start seeds the
+ * new generation's build tree from the newest complete generation for
+ * the same root (hard links for immutable object and depfile outputs, a
+ * copy for the small executed wrapper, nothing else) and repairs make's
+ * timestamp graph so exactly the changed set rebuilds. Every fixture
+ * below is a self-contained tree under test-tmp/; nothing here runs a
+ * real build. */
+
+static bool pw_read_all(const char *path, char *out, size_t out_size,
+                        size_t *len_out)
+{
+    FILE *f = fopen(path, "rb");
+    size_t n = 0;
+    int c;
+    if (!f || !out || out_size == 0) {
+        if (f) fclose(f);
+        return false;
+    }
+    while ((c = fgetc(f)) != EOF) {
+        if (n + 1 >= out_size) {
+            fclose(f);
+            return false;
+        }
+        out[n++] = (char)c;
+    }
+    if (ferror(f)) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    out[n] = 0;
+    if (len_out) *len_out = n;
+    return true;
+}
+
+static bool pw_stat_ino(const char *path, unsigned long long *ino_out)
+{
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return false;
+    if (ino_out) *ino_out = (unsigned long long)st.st_ino;
+    return true;
+}
+
+static long long pw_mtime_ns(const char *path, bool *ok_out)
+{
+    struct stat st;
+    long long ns = 0;
+    bool ok = path && stat(path, &st) == 0;
+    if (ok) {
+#if defined(__APPLE__)
+        ns = (long long)st.st_mtimespec.tv_sec * 1000000000LL +
+             (long long)st.st_mtimespec.tv_nsec;
+#else
+        ns = (long long)st.st_mtim.tv_sec * 1000000000LL +
+             (long long)st.st_mtim.tv_nsec;
+#endif
+    }
+    if (ok_out) *ok_out = ok;
+    return ns;
+}
+
+static int test_pw_tag_names_pool_entries(void)
+{
+    int failures = 0;
+    TEST("proof warm start: tag predicate admits only generation tags") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        ASSERT(zcl_dev_proof_warm_tag("0b1953e6da8f5d4cbfd25564f3c02f7e"));
+        ASSERT(zcl_dev_proof_warm_tag("00000000000000000000000000000000"));
+        ASSERT(!zcl_dev_proof_warm_tag(NULL));
+        ASSERT(!zcl_dev_proof_warm_tag(""));
+        ASSERT(!zcl_dev_proof_warm_tag("0b1953e6da8f5d4cbfd25564f3c02f7"));
+        ASSERT(!zcl_dev_proof_warm_tag(
+            "0b1953e6da8f5d4cbfd25564f3c02f7e00"));
+        ASSERT(!zcl_dev_proof_warm_tag("0B1953E6DA8F5DCBFD25564F3C02F7E"));
+        ASSERT(!zcl_dev_proof_warm_tag("0b1953e6da8f5d4cbfd25564f3c02f7g"));
+        ASSERT(!zcl_dev_proof_warm_tag("requests"));
+        ASSERT(!zcl_dev_proof_warm_tag("../escape"));
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_classify_link_copy_skip(void)
+{
+    int failures = 0;
+    TEST("proof warm start: classifier links outputs, copies wrapper") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        ASSERT(zcl_dev_proof_warm_classify("obj/epochs/e/a.o", true) ==
+               ZCL_DEV_PROOF_WARM_LINK);
+        ASSERT(zcl_dev_proof_warm_classify("obj/epochs/e/a.d", true) ==
+               ZCL_DEV_PROOF_WARM_LINK);
+        ASSERT(zcl_dev_proof_warm_classify("bin/zcc", true) ==
+               ZCL_DEV_PROOF_WARM_COPY);
+        /* A dependency room is graded by the hardlink-isolation gate, which
+         * requires an independent inode for every regular file in it. The
+         * two rollback fixture dependency files are exactly what a warm
+         * proof used to link there, and exactly what that gate refused. */
+        ASSERT(zcl_dev_proof_warm_classify("hotswap/zcl_rollback_fixture_a.d",
+                                           true) == ZCL_DEV_PROOF_WARM_COPY);
+        ASSERT(zcl_dev_proof_warm_classify("hotswap/zcl_rollback_fixture_b.d",
+                                           true) == ZCL_DEV_PROOF_WARM_COPY);
+        ASSERT(zcl_dev_proof_warm_classify("hotswap/x.o", true) ==
+               ZCL_DEV_PROOF_WARM_COPY);
+        ASSERT(zcl_dev_proof_warm_classify("githooks/hook.o", true) ==
+               ZCL_DEV_PROOF_WARM_COPY);
+        /* A room admits nothing the suffix rule would not have seeded, and
+         * a name that merely starts with a room's is a different directory. */
+        ASSERT(zcl_dev_proof_warm_classify("hotswap/fixture.so", true) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+        ASSERT(zcl_dev_proof_warm_classify("hotswaps/x.o", true) ==
+               ZCL_DEV_PROOF_WARM_LINK);
+        ASSERT(!zcl_dependency_build_room_path("hotswap"));
+        ASSERT(!zcl_dependency_build_room_path("hotswap/"));
+        ASSERT(!zcl_dependency_build_room_path(""));
+        ASSERT(!zcl_dependency_build_room_path(NULL));
+        ASSERT(zcl_dependency_build_room_path("hotswap/a.d"));
+        ASSERT(zcl_dependency_build_room_path("githooks/pre-push"));
+        /* Executed binaries are copied, never linked: the copy owns its
+         * inode in the new generation, so a relink there replaces the
+         * copy and can never reach the donor's bytes. Seeded under the
+         * donor's sealed build identity and retimed like any other seed,
+         * they let a warm proof skip the prefork bundle's standalone-tool
+         * compile+links while make still rebuilds what the candidate
+         * actually changed. */
+        ASSERT(zcl_dev_proof_warm_classify("bin/z23-dev", true) ==
+               ZCL_DEV_PROOF_WARM_COPY);
+        ASSERT(zcl_dev_proof_warm_classify("bin/gen_templates", true) ==
+               ZCL_DEV_PROOF_WARM_COPY);
+        ASSERT(zcl_dev_proof_warm_classify("bin/c3-mutex-probe.so", true) ==
+               ZCL_DEV_PROOF_WARM_COPY);
+        /* Rewritten in place or live: never shared across generations. */
+        ASSERT(zcl_dev_proof_warm_classify("obj/epochs/e/a.a", true) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+        ASSERT(zcl_dev_proof_warm_classify("obj/epochs/e/.build-session",
+                                           true) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+        ASSERT(zcl_dev_proof_warm_classify("obj/epochs/e/.leases/x", true) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+        ASSERT(zcl_dev_proof_warm_classify("obj/.hidden/x.o", true) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+        ASSERT(zcl_dev_proof_warm_classify(
+                   "obj/epochs/e/.stale.compile.9/p.o", true) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+        ASSERT(zcl_dev_proof_warm_classify(".proof-build-complete", true) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+        ASSERT(zcl_dev_proof_warm_classify("obj/epochs/e/a.o", false) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+        ASSERT(zcl_dev_proof_warm_classify(NULL, true) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+        ASSERT(zcl_dev_proof_warm_classify("", true) ==
+               ZCL_DEV_PROOF_WARM_SKIP);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_pick_newest_complete_idle(void)
+{
+    int failures = 0;
+    TEST("proof warm start: donor pick is newest verifiable idle") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        struct zcl_dev_proof_warm_candidate none[1];
+        memset(none, 0, sizeof(none));
+        ASSERT(zcl_dev_proof_warm_pick(NULL, 0) < 0);
+        ASSERT(zcl_dev_proof_warm_pick(none, 0) < 0);
+        struct zcl_dev_proof_warm_candidate two[2];
+        memset(two, 0, sizeof(two));
+        two[0].completed = 100;
+        two[0].touched = 100;
+        two[0].head_ok = true;
+        two[1].completed = 200;
+        two[1].touched = 50;
+        two[1].head_ok = true;
+        ASSERT(zcl_dev_proof_warm_pick(two, 2) == 1);
+        /* A live newest loses to an older idle generation. */
+        two[1].live = true;
+        ASSERT(zcl_dev_proof_warm_pick(two, 2) == 0);
+        two[1].live = false;
+        /* A moved checkout cannot donate even when newest. */
+        two[1].head_ok = false;
+        ASSERT(zcl_dev_proof_warm_pick(two, 2) == 0);
+        two[1].head_ok = true;
+        two[0].live = true;
+        two[1].live = true;
+        ASSERT(zcl_dev_proof_warm_pick(two, 2) < 0);
+        two[0].live = false;
+        two[1].live = false;
+        /* Completion beats recency; recency breaks completion ties;
+         * full ties keep the earlier candidate. */
+        two[0].completed = 200;
+        two[0].touched = 300;
+        two[1].completed = 200;
+        two[1].touched = 50;
+        ASSERT(zcl_dev_proof_warm_pick(two, 2) == 0);
+        two[0].touched = 50;
+        ASSERT(zcl_dev_proof_warm_pick(two, 2) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_marker_round_trip_and_refusals(void)
+{
+    int failures = 0;
+    TEST("proof warm start: build-complete marker round-trips") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096];
+        static const char local[] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        static const char base[] =
+            "1111111111111111111111111111111111111111";
+        test_make_tmpdir(root, sizeof(root), "proof_warm", "marker");
+        char gen[4096];
+        ASSERT(snprintf(gen, sizeof(gen), "%s/gen", root) > 0);
+        ASSERT(ic_write(root, "gen/build/.keep", "marker parent\n"));
+        struct zcl_dev_proof_build_identity_v1 identity_a;
+        memset(identity_a.compiler, 0xaa, 32);
+        memset(identity_a.flags, 0xbb, 32);
+        memset(identity_a.environment, 0xdd, 32);
+        memset(identity_a.build_graph, 0xcc, 32);
+        ASSERT(zcl_dev_proof_warm_marker_write(gen, "/fixtures/proof-warm",
+                                               local, base, 1700000000LL,
+                                               &identity_a));
+        char got_root[4096] = {0}, got_local[65] = {0}, got_base[65] = {0};
+        int64_t completed = 0;
+        struct zcl_dev_proof_build_identity_v1 got = {0};
+        ASSERT(zcl_dev_proof_warm_marker_read(gen, got_root, got_local,
+                                              got_base, &completed, &got));
+        ASSERT(strcmp(got_root, "/fixtures/proof-warm") == 0);
+        ASSERT(strcmp(got_local, local) == 0);
+        ASSERT(strcmp(got_base, base) == 0);
+        ASSERT(completed == 1700000000LL);
+        ASSERT(memcmp(&got, &identity_a, sizeof(got)) == 0);
+        /* Refusals: wrong schema, forged commit, missing file. */
+        ASSERT(ic_write(root, "gen/build/.proof-build-complete",
+                        "bogus-schema\nroot=/x\nlocal=aa\n"));
+        ASSERT(!zcl_dev_proof_warm_marker_read(gen, got_root, got_local,
+                                               got_base, &completed, &got));
+        ASSERT(ic_write(root, "gen/build/.proof-build-complete",
+                        "zcl.proof_build_complete.v1\nroot=/fixtures/"
+                        "proof-warm\nlocal=zzzz\nbase=111111111111111111111"
+                        "11111111111111111111\ncompleted=1700000000\n"));
+        ASSERT(!zcl_dev_proof_warm_marker_read(gen, got_root, got_local,
+                                               got_base, &completed, &got));
+        ASSERT(!zcl_dev_proof_warm_marker_read(NULL, got_root, got_local,
+                                               got_base, &completed, &got));
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_generation_pool_sweep(void)
+{
+    int failures = 0;
+    TEST("proof generation pool: a finished generation is swept, an "
+        "in-flight one is kept") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], repo[4096], gen_done[4096], gen_live[4096];
+        char tag_done[33], tag_live[33], cmd[8192], why[256] = {0};
+        memset(tag_done, '1', 32);
+        tag_done[32] = 0;
+        memset(tag_live, '2', 32);
+        tag_live[32] = 0;
+        test_make_tmpdir(root, sizeof(root), "proof_pool_sweep", "sweep");
+        ASSERT(snprintf(repo, sizeof(repo), "%s/checkout", root) > 0);
+        ASSERT(snprintf(cmd, sizeof(cmd),
+                       "mkdir -p '%s' && cd '%s' && git init -q && "
+                       "git -c user.name=t -c user.email=t@t.invalid "
+                       "commit --allow-empty -q -m init", repo, repo) > 0);
+        ASSERT(system(cmd) == 0);
+        ASSERT(snprintf(gen_done, sizeof(gen_done), "%s/.z23p/%s", root,
+                       tag_done) > 0);
+        ASSERT(snprintf(gen_live, sizeof(gen_live), "%s/.z23p/%s", root,
+                       tag_live) > 0);
+        ASSERT(snprintf(cmd, sizeof(cmd),
+                       "git -C '%s' worktree add --detach -q '%s' HEAD",
+                       repo, gen_done) > 0);
+        ASSERT(system(cmd) == 0);
+        ASSERT(snprintf(cmd, sizeof(cmd),
+                       "git -C '%s' worktree add --detach -q '%s' HEAD",
+                       repo, gen_live) > 0);
+        ASSERT(system(cmd) == 0);
+        /* gen_done looks finished: no warm marker (unmarked, like a
+         * generation from a build that never reached the marker write),
+         * backdated well past the unmarked-generation grace window.
+         * gen_live looks like it is still being worked: its just-created
+         * mtime alone keeps it, exactly like an in-flight generation with
+         * no marker yet. */
+        const struct timespec old_time[2] = {
+            { .tv_sec = 1000000000, .tv_nsec = 0 },
+            { .tv_sec = 1000000000, .tv_nsec = 0 },
+        };
+        ASSERT(utimensat(AT_FDCWD, gen_done, old_time, 0) == 0);
+        struct stat probe;
+        ASSERT(stat(gen_done, &probe) == 0);
+        ASSERT(stat(gen_live, &probe) == 0);
+
+        /* The sweep also walks this host's RAM pool. Point it at a
+         * private, empty one: the host's own pool holds other checkouts'
+         * idle donors and orphans, which the sweep is entitled to reap and
+         * count, and which this fixture must neither delete nor count. */
+        char ram[4200];
+        ASSERT(snprintf(ram, sizeof(ram), "%s/ram", root) > 0);
+        ASSERT(mkdir(ram, 0700) == 0);
+        ASSERT(setenv("ZCL_RAM_SCRATCH_ROOT", ram, 1) == 0);
+        size_t removed = 0;
+        uint64_t bytes = 0;
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        bool swept = zcl_dev_proof_generation_pool_sweep(repo, &removed,
+                                                         &bytes, why,
+                                                         sizeof(why));
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        (void)unsetenv("ZCL_RAM_SCRATCH_ROOT");
+        ASSERT(swept);
+        ASSERT(removed == 1);
+        ASSERT(stat(gen_done, &probe) != 0 && errno == ENOENT);
+        ASSERT(stat(gen_live, &probe) == 0);
+
+        /* Refusal contract: an unresolvable root reports a reason, touches
+         * nothing (the counters it zeroed on entry stay zero), and never
+         * crashes. */
+        size_t removed2 = 0;
+        uint64_t bytes2 = 0;
+        ASSERT(!zcl_dev_proof_generation_pool_sweep(
+            "relative-not-absolute", &removed2, &bytes2, why, sizeof(why)));
+        ASSERT(why[0] != 0);
+        ASSERT(removed2 == 0 && bytes2 == 0);
+        ASSERT(stat(gen_live, &probe) == 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+/* One detached worktree of `repo` at `<root>/.z23p/<tag>`, or, with a
+ * branch name, one checked out on that branch instead. */
+static bool ic_retire_generation(const char *root, const char *repo,
+                                 const char *tag, const char *branch,
+                                 char *out, size_t out_len)
+{
+    char cmd[12288];
+    if (snprintf(out, out_len, "%s/.z23p/%s", root, tag) >= (int)out_len)
+        return false;
+    int n = branch
+        ? snprintf(cmd, sizeof(cmd),
+                   "git -C '%s' worktree add -q -b '%s' '%s' HEAD", repo,
+                   branch, out)
+        : snprintf(cmd, sizeof(cmd),
+                   "git -C '%s' worktree add --detach -q '%s' HEAD", repo,
+                   out);
+    return n > 0 && (size_t)n < sizeof(cmd) && system(cmd) == 0;
+}
+#endif
+
+static int test_pw_generation_retire_passed(void)
+{
+    int failures = 0;
+    TEST("proof generation pool: a PASS or a final refusal retires its "
+         "generation, an interrupted run keeps it, and only a detached, "
+         "tracked-clean one that cannot donate is removed") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], repo[4096], cmd[8192], outcome[64];
+        char passed[4096], failed[4096], donor[4096], branch[4096];
+        char dirty[4096], locked[4096], interrupted[4096];
+        char failed_donor[4096], probe_path[4608];
+        test_make_tmpdir(root, sizeof(root), "proof_pool_retire", "retire");
+        ASSERT(snprintf(repo, sizeof(repo), "%s/checkout", root) > 0);
+        ASSERT(snprintf(cmd, sizeof(cmd),
+                        "mkdir -p '%s' && cd '%s' && git init -q && "
+                        "echo tracked > tracked && git add tracked && "
+                        "git -c user.name=t -c user.email=t@t.invalid "
+                        "commit -q -m init", repo, repo) > 0);
+        ASSERT(system(cmd) == 0);
+        ASSERT(ic_retire_generation(root, repo,
+                                    "11111111111111111111111111111111",
+                                    NULL, passed, sizeof(passed)));
+        ASSERT(ic_retire_generation(root, repo,
+                                    "22222222222222222222222222222222",
+                                    NULL, failed, sizeof(failed)));
+        ASSERT(ic_retire_generation(root, repo,
+                                    "33333333333333333333333333333333",
+                                    NULL, donor, sizeof(donor)));
+        ASSERT(ic_retire_generation(root, repo,
+                                    "44444444444444444444444444444444",
+                                    "parked", branch, sizeof(branch)));
+        ASSERT(ic_retire_generation(root, repo,
+                                    "55555555555555555555555555555555",
+                                    NULL, dirty, sizeof(dirty)));
+        ASSERT(ic_retire_generation(root, repo,
+                                    "66666666666666666666666666666666",
+                                    NULL, locked, sizeof(locked)));
+        ASSERT(ic_retire_generation(root, repo,
+                                    "77777777777777777777777777777777",
+                                    NULL, interrupted, sizeof(interrupted)));
+        ASSERT(ic_retire_generation(root, repo,
+                                    "88888888888888888888888888888888",
+                                    NULL, failed_donor,
+                                    sizeof(failed_donor)));
+        /* Untracked build output is what every generation holds and never
+         * keeps one; an edit to a tracked file always does. */
+        ASSERT(ic_write(passed, "build/obj/probe.o", "object\n"));
+        ASSERT(ic_write(failed, "build/obj/probe.o", "object\n"));
+        ASSERT(ic_write(interrupted, "build/obj/probe.o", "object\n"));
+        ASSERT(ic_write(dirty, "tracked", "edited\n"));
+        /* A read-only directory a proof test fixture left behind must not
+         * stop the delete partway and leak a half-deleted generation. */
+        ASSERT(ic_write(locked, "build/fixture/ro/inner", "x\n"));
+        ASSERT(snprintf(probe_path, sizeof(probe_path), "%s/build/fixture/ro",
+                        locked) > 0);
+        ASSERT(chmod(probe_path, 0555) == 0);
+        struct stat probe;
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+
+        /* A PASS by this uid: the generation can never donate, so it goes
+         * now instead of holding the pool for the reaper's idle hour. */
+        bool removed = zcl_dev_proof_test_generation_retire(
+            repo, passed, ZCL_DEV_PROOF_RETIRE_PASSED, false, outcome,
+            sizeof(outcome));
+        ASSERT(removed);
+        ASSERT_STR_EQ(outcome, "removed");
+        ASSERT(stat(passed, &probe) != 0 && errno == ENOENT);
+
+        /* A final refusal: its pair is replayed, never re-proven, so the
+         * same clean, detached shape goes too, under its own name. */
+        removed = zcl_dev_proof_test_generation_retire(
+            repo, failed, ZCL_DEV_PROOF_RETIRE_FAILED, false, outcome,
+            sizeof(outcome));
+        ASSERT(removed);
+        ASSERT_STR_EQ(outcome, "removed_failed");
+        ASSERT(stat(failed, &probe) != 0 && errno == ENOENT);
+
+        /* An interrupted run is re-run on the same pair, which reuses this
+         * exact tree, so it stays and git is never asked. */
+        removed = zcl_dev_proof_test_generation_retire(
+            repo, interrupted, ZCL_DEV_PROOF_RETIRE_INTERRUPTED, false,
+            outcome, sizeof(outcome));
+        ASSERT(!removed);
+        ASSERT_STR_EQ(outcome, "kept_interrupted");
+        ASSERT(stat(interrupted, &probe) == 0);
+
+        /* Producer refusal also retains the exact generation for a new
+         * attempt, without pretending the candidate was interrupted. */
+        removed = zcl_dev_proof_test_generation_retire(
+            repo, interrupted, ZCL_DEV_PROOF_RETIRE_NO_VERDICT, false,
+            outcome, sizeof(outcome));
+        ASSERT(!removed);
+        ASSERT_STR_EQ(outcome, "kept_no_verdict");
+        ASSERT(stat(interrupted, &probe) == 0);
+
+        /* A generation that could donate is left to the pool exactly as
+         * before, after a PASS and after a final refusal alike. */
+        removed = zcl_dev_proof_test_generation_retire(
+            repo, donor, ZCL_DEV_PROOF_RETIRE_PASSED, true, outcome,
+            sizeof(outcome));
+        ASSERT(!removed);
+        ASSERT_STR_EQ(outcome, "kept_donor");
+        ASSERT(stat(donor, &probe) == 0);
+        removed = zcl_dev_proof_test_generation_retire(
+            repo, failed_donor, ZCL_DEV_PROOF_RETIRE_FAILED, true, outcome,
+            sizeof(outcome));
+        ASSERT(!removed);
+        ASSERT_STR_EQ(outcome, "kept_donor");
+        ASSERT(stat(failed_donor, &probe) == 0);
+
+        /* Not detached (someone parked a branch there) or a tracked edit:
+         * git does not call it disposable, so it stays, whatever the
+         * verdict. */
+        removed = zcl_dev_proof_test_generation_retire(
+            repo, branch, ZCL_DEV_PROOF_RETIRE_PASSED, false, outcome,
+            sizeof(outcome));
+        ASSERT(!removed);
+        ASSERT_STR_EQ(outcome, "kept_not_clean");
+        ASSERT(stat(branch, &probe) == 0);
+        removed = zcl_dev_proof_test_generation_retire(
+            repo, branch, ZCL_DEV_PROOF_RETIRE_FAILED, false, outcome,
+            sizeof(outcome));
+        ASSERT(!removed);
+        ASSERT_STR_EQ(outcome, "kept_not_clean");
+        ASSERT(stat(branch, &probe) == 0);
+        removed = zcl_dev_proof_test_generation_retire(
+            repo, dirty, ZCL_DEV_PROOF_RETIRE_FAILED, false, outcome,
+            sizeof(outcome));
+        ASSERT(!removed);
+        ASSERT_STR_EQ(outcome, "kept_not_clean");
+        ASSERT(stat(dirty, &probe) == 0);
+
+        removed = zcl_dev_proof_test_generation_retire(
+            repo, locked, ZCL_DEV_PROOF_RETIRE_PASSED, false, outcome,
+            sizeof(outcome));
+        ASSERT(removed);
+        ASSERT_STR_EQ(outcome, "removed");
+        ASSERT(stat(locked, &probe) != 0 && errno == ENOENT);
+
+        /* Refusal contract: no root or no generation touches nothing. */
+        ASSERT(!zcl_dev_proof_test_generation_retire(
+            NULL, interrupted, ZCL_DEV_PROOF_RETIRE_FAILED, false, outcome,
+            sizeof(outcome)));
+        ASSERT_STR_EQ(outcome, "kept_invalid");
+        ASSERT(!zcl_dev_proof_test_generation_retire(
+            repo, "", ZCL_DEV_PROOF_RETIRE_FAILED, false, outcome,
+            sizeof(outcome)));
+        ASSERT_STR_EQ(outcome, "kept_invalid");
+        ASSERT(stat(interrupted, &probe) == 0);
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Every proof's test scratch holds more sibling directories than any fixed
+ * queue, with read-only fixture directories below them. */
+static int test_pw_generation_retire_wide_locked(void)
+{
+    int failures = 0;
+    TEST("proof generation pool: read-only fixture directories below a wide "
+         "scratch tree do not stop the retire") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], repo[4096], cmd[8192], outcome[64];
+        char wide[4096], rel[128], ro[4608];
+        test_make_tmpdir(root, sizeof(root), "proof_pool_retire", "wide");
+        ASSERT(snprintf(repo, sizeof(repo), "%s/checkout", root) > 0);
+        ASSERT(snprintf(cmd, sizeof(cmd),
+                        "mkdir -p '%s' && cd '%s' && git init -q && "
+                        "echo tracked > tracked && git add tracked && "
+                        "git -c user.name=t -c user.email=t@t.invalid "
+                        "commit -q -m init", repo, repo) > 0);
+        ASSERT(system(cmd) == 0);
+        ASSERT(ic_retire_generation(root, repo,
+                                    "99999999999999999999999999999999",
+                                    NULL, wide, sizeof(wide)));
+        for (int i = 0; i < 200; i++) {
+            ASSERT(snprintf(rel, sizeof(rel), "test-tmp/case_%03d/lib/ro/leaf",
+                            i) > 0);
+            ASSERT(ic_write(wide, rel, "x\n"));
+            ASSERT(snprintf(ro, sizeof(ro), "%s/test-tmp/case_%03d/lib/ro",
+                            wide, i) > 0);
+            ASSERT(chmod(ro, 0555) == 0);
+        }
+        struct stat probe;
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        bool removed = zcl_dev_proof_test_generation_retire(
+            repo, wide, ZCL_DEV_PROOF_RETIRE_PASSED, false, outcome,
+            sizeof(outcome));
+        ASSERT(removed);
+        ASSERT_STR_EQ(outcome, "removed");
+        ASSERT(stat(wide, &probe) != 0 && errno == ENOENT);
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* What an earlier attempt's failed retire leaves: the tree, with a `.git`
+ * naming an admin dir git already deleted. */
+static int test_pw_generation_checkout_clears_pruned(void)
+{
+    int failures = 0;
+    TEST("proof generation pool: a pair's own leftover whose registration "
+         "git deleted is cleared and checked out fresh, and a live "
+         "generation is reused untouched") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], repo[4096], cmd[12288], why[128], head[80];
+        char stale[4096], live[4096], marker[4608], foreign[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_pool_checkout", "stale");
+        ASSERT(snprintf(repo, sizeof(repo), "%s/checkout", root) > 0);
+        ASSERT(snprintf(cmd, sizeof(cmd),
+                        "mkdir -p '%s' && cd '%s' && git init -q && "
+                        "echo tracked > tracked && git add tracked && "
+                        "git -c user.name=t -c user.email=t@t.invalid "
+                        "commit -q -m init", repo, repo) > 0);
+        ASSERT(system(cmd) == 0);
+        ASSERT(snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse HEAD",
+                        repo) > 0);
+        FILE *pipe = popen(cmd, "r");
+        ASSERT(pipe != NULL);
+        ASSERT(fgets(head, sizeof(head), pipe) != NULL);
+        ASSERT(pclose(pipe) == 0);
+        head[strcspn(head, "\n")] = '\0';
+        ASSERT(ic_retire_generation(root, repo,
+                                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                    NULL, stale, sizeof(stale)));
+        ASSERT(ic_retire_generation(root, repo,
+                                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                                    NULL, live, sizeof(live)));
+        ASSERT(ic_write(stale, "build/obj/old.o", "old\n"));
+        ASSERT(ic_write(stale, "test-tmp/case/ro/leaf", "x\n"));
+        ASSERT(snprintf(marker, sizeof(marker), "%s/test-tmp/case/ro",
+                        stale) > 0);
+        ASSERT(chmod(marker, 0555) == 0);
+        ASSERT(ic_write(live, "build/obj/kept.o", "kept\n"));
+        /* git's own half-finished remove: the admin dir is gone, the tree
+         * is not. */
+        ASSERT(snprintf(cmd, sizeof(cmd),
+                        "rm -rf '%s/.git/worktrees/"
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'", repo) > 0);
+        ASSERT(system(cmd) == 0);
+        struct stat probe;
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+
+        ASSERT(zcl_dev_proof_test_generation_checkout(repo, stale, head, why,
+                                                      sizeof(why)));
+        ASSERT(snprintf(marker, sizeof(marker), "%s/build/obj/old.o",
+                        stale) > 0);
+        ASSERT(stat(marker, &probe) != 0 && errno == ENOENT);
+        ASSERT(snprintf(marker, sizeof(marker), "%s/tracked", stale) > 0);
+        ASSERT(stat(marker, &probe) == 0);
+        ASSERT(snprintf(cmd, sizeof(cmd),
+                        "test \"$(git -C '%s' rev-parse HEAD)\" = '%s'",
+                        stale, head) > 0);
+        ASSERT(system(cmd) == 0);
+
+        /* A registered generation is the interrupted re-run's tree. */
+        ASSERT(zcl_dev_proof_test_generation_checkout(repo, live, head, why,
+                                                      sizeof(why)));
+        ASSERT(snprintf(marker, sizeof(marker), "%s/build/obj/kept.o",
+                        live) > 0);
+        ASSERT(stat(marker, &probe) == 0);
+
+        /* A directory that is not this code's shape is never deleted. */
+        ASSERT(snprintf(foreign, sizeof(foreign), "%s/.z23p/not-a-tag",
+                        root) > 0);
+        ASSERT(ic_write(foreign, "keep", "x\n"));
+        ASSERT(zcl_dev_proof_test_generation_checkout(repo, foreign, head,
+                                                      why, sizeof(why)));
+        ASSERT(snprintf(marker, sizeof(marker), "%s/keep", foreign) > 0);
+        ASSERT(stat(marker, &probe) == 0);
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A cgroup v2 tree as a login session and a user-manager scope see it. */
+static int test_pw_memory_scope_verdict(void)
+{
+    int failures = 0;
+    TEST("proof worker: a scope with no writable memory-delegating ancestor "
+         "is named before the proof starts, and an unreadable hierarchy "
+         "never refuses") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], mount[4200], path[4608];
+        test_make_tmpdir(root, sizeof(root), "proof_memory_scope", "cg");
+        ASSERT(snprintf(mount, sizeof(mount), "%s/cg", root) > 0);
+        /* Root-owned levels are modelled read-only; the user manager's
+         * slice is the one this uid may write. */
+        ASSERT(ic_write(mount, "cgroup.subtree_control",
+                        "cpuset cpu io memory pids\n"));
+        ASSERT(ic_write(mount, "user.slice/cgroup.subtree_control",
+                        "cpu memory pids\n"));
+        ASSERT(ic_write(mount,
+                        "user.slice/user-1000.slice/cgroup.subtree_control",
+                        "cpu memory pids\n"));
+        ASSERT(ic_write(mount, "user.slice/user-1000.slice/session-52.scope/"
+                               "cgroup.subtree_control", "\n"));
+        ASSERT(ic_write(mount, "user.slice/user-1000.slice/user@1000.service/"
+                               "cgroup.subtree_control", "cpu memory pids\n"));
+        ASSERT(ic_write(mount, "user.slice/user-1000.slice/user@1000.service/"
+                               "development.slice/cgroup.subtree_control",
+                        "cpu memory pids\n"));
+        ASSERT(ic_write(mount, "user.slice/user-1000.slice/user@1000.service/"
+                               "development.slice/job.scope/"
+                               "cgroup.subtree_control", "\n"));
+        ASSERT(ic_write(mount, "user.slice/user-1000.slice/user@1000.service/"
+                               "plain.slice/cgroup.subtree_control",
+                        "cpu pids\n"));
+        static const char *const locked[] = {
+            "", "/user.slice", "/user.slice/user-1000.slice",
+            "/user.slice/user-1000.slice/user@1000.service/plain.slice",
+        };
+        for (size_t i = 0; i < sizeof(locked) / sizeof(locked[0]); i++) {
+            ASSERT(snprintf(path, sizeof(path), "%s%s", mount, locked[i]) >
+                   0);
+            ASSERT(chmod(path, 0555) == 0);
+        }
+        if (geteuid() != 0) {
+            ASSERT(zcl_dev_proof_memory_scope_verdict(
+                       mount, "/user.slice/user-1000.slice/session-52.scope")
+                   == ZCL_DEV_PROOF_MEMORY_SCOPE_UNQUALIFIED);
+            /* Writable, but it does not delegate memory, and nothing above
+             * it that does is writable... except the user manager itself. */
+            ASSERT(snprintf(path, sizeof(path), "%s/user.slice/"
+                            "user-1000.slice/user@1000.service", mount) > 0);
+            ASSERT(chmod(path, 0555) == 0);
+            ASSERT(zcl_dev_proof_memory_scope_verdict(
+                       mount, "/user.slice/user-1000.slice/"
+                              "user@1000.service/plain.slice")
+                   == ZCL_DEV_PROOF_MEMORY_SCOPE_UNQUALIFIED);
+            ASSERT(chmod(path, 0755) == 0);
+        }
+        ASSERT(zcl_dev_proof_memory_scope_verdict(
+                   mount, "/user.slice/user-1000.slice/user@1000.service/"
+                          "development.slice/job.scope")
+               == ZCL_DEV_PROOF_MEMORY_SCOPE_QUALIFIED);
+        ASSERT(zcl_dev_proof_memory_scope_verdict(
+                   mount, "/user.slice/user-1000.slice/user@1000.service/"
+                          "plain.slice")
+               == ZCL_DEV_PROOF_MEMORY_SCOPE_QUALIFIED);
+        /* Nothing to read is not a refusal. */
+        ASSERT(snprintf(path, sizeof(path), "%s/absent", root) > 0);
+        ASSERT(zcl_dev_proof_memory_scope_verdict(path, "/user.slice")
+               == ZCL_DEV_PROOF_MEMORY_SCOPE_UNKNOWN);
+        ASSERT(zcl_dev_proof_memory_scope_verdict(mount, "user.slice")
+               == ZCL_DEV_PROOF_MEMORY_SCOPE_UNKNOWN);
+        ASSERT(zcl_dev_proof_memory_scope_verdict(mount, NULL)
+               == ZCL_DEV_PROOF_MEMORY_SCOPE_UNKNOWN);
+        for (size_t i = 0; i < sizeof(locked) / sizeof(locked[0]); i++) {
+            ASSERT(snprintf(path, sizeof(path), "%s%s", mount, locked[i]) >
+                   0);
+            ASSERT(chmod(path, 0755) == 0);
+        }
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+
+/* ── generation-pool hygiene fixtures ─────────────────────────────────── */
+#if !defined(_WIN32)
+
+/* A checkout with one commit and an empty generation pool beside it, laid
+ * out exactly as the pool sits beside a real checkout. */
+static bool ic_pool_repo(const char *root, char *repo, size_t repo_len,
+                         char *pool, size_t pool_len)
+{
+    char cmd[8192];
+    if (snprintf(repo, repo_len, "%s/checkout", root) >= (int)repo_len ||
+        snprintf(pool, pool_len, "%s/.z23p", root) >= (int)pool_len)
+        return false;
+    if (snprintf(cmd, sizeof(cmd),
+                 "mkdir -p '%s' '%s' && cd '%s' && git init -q && "
+                 "git -c user.name=t -c user.email=t@t.invalid "
+                 "commit --allow-empty -q -m init", repo, pool, repo) >=
+            (int)sizeof(cmd))
+        return false;
+    return system(cmd) == 0;
+}
+
+/* One pool entry that looks exactly like a finished proof generation: a
+ * detached worktree carrying a build-complete marker, with the directory
+ * itself backdated to `idle_seconds` ago -- the same mtime the reaper
+ * reads. Each entry names its own marker root, so no entry is ever the
+ * superseded one: this is the abandoned-lane shape, a sole complete
+ * generation no sibling will replace. */
+static bool ic_pool_generation(const char *repo, const char *pool, char fill,
+                               const char *marker_root, int64_t idle_seconds,
+                               char *out, size_t out_len)
+{
+    static const char local[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char base[] = "1111111111111111111111111111111111111111";
+    char tag[33], cmd[8192], ballast[4096];
+    memset(tag, fill, 32);
+    tag[32] = 0;
+    if (snprintf(out, out_len, "%s/%s", pool, tag) >= (int)out_len ||
+        snprintf(cmd, sizeof(cmd),
+                 "git -C '%s' worktree add --detach -q '%s' HEAD", repo,
+                 out) >= (int)sizeof(cmd) ||
+        system(cmd) != 0)
+        return false;
+    memset(ballast, 'x', sizeof(ballast) - 1);
+    ballast[sizeof(ballast) - 1] = 0;
+    struct zcl_dev_proof_build_identity_v1 identity;
+    memset(&identity, 0x5a, sizeof(identity));
+    if (!ic_write(out, "build/ballast", ballast) ||
+        !zcl_dev_proof_warm_marker_write(out, marker_root, local, base,
+                                         1700000000LL, &identity))
+        return false;
+    int64_t when = platform_time_wall_unix() - idle_seconds;
+    const struct timespec stamp[2] = {
+        { .tv_sec = (time_t)when, .tv_nsec = 0 },
+        { .tv_sec = (time_t)when, .tv_nsec = 0 },
+    };
+    return utimensat(AT_FDCWD, out, stamp, 0) == 0;
+}
+
+static bool ic_file_has(const char *path, const char *needle)
+{
+    char buffer[65536];
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    size_t got = fread(buffer, 1, sizeof(buffer) - 1, f);
+    (void)fclose(f);
+    buffer[got] = 0;
+    return strstr(buffer, needle) != NULL;
+}
+
+#endif
+
+static int test_pw_abandoned_generation_reaped_by_age(void)
+{
+    int failures = 0;
+    TEST("proof generation pool: a complete generation nobody supersedes is "
+        "reaped once abandoned, and kept while it is not") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], repo[4096], pool[4096];
+        char gen_dead[4096], gen_recent[4096];
+        struct stat probe;
+        test_make_tmpdir(root, sizeof(root), "proof_pool_age", "age");
+        ASSERT(ic_pool_repo(root, repo, sizeof(repo), pool, sizeof(pool)));
+        /* Neither is superseded and neither holds a lease. Before the
+         * abandoned rule both lived forever; now age alone separates
+         * them, and nothing else about them differs. */
+        ASSERT(ic_pool_generation(repo, pool, 'a', "/fixtures/pool-dead",
+                                  13 * 60 * 60, gen_dead, sizeof(gen_dead)));
+        ASSERT(ic_pool_generation(repo, pool, 'b', "/fixtures/pool-recent",
+                                  11 * 60 * 60, gen_recent,
+                                  sizeof(gen_recent)));
+        size_t removed = 0;
+        uint64_t bytes = 0;
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        zcl_dev_proof_test_generation_pool_reap(repo, pool, "", &removed,
+                                                &bytes);
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(removed == 1);
+        ASSERT(bytes > 0);
+        ASSERT(stat(gen_dead, &probe) != 0);
+        ASSERT(stat(gen_recent, &probe) == 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_pressure_evicts_oldest_until_satisfied(void)
+{
+    int failures = 0;
+    TEST("proof generation pool: RAM pressure evicts the idlest donor "
+        "first, stops as soon as the reservation fits, and never takes a "
+        "generation still in use") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], repo[4096], pool[4096], phases[4096];
+        char gen_old[4096], gen_mid[4096], gen_hot[4096];
+        struct stat probe;
+        test_make_tmpdir(root, sizeof(root), "proof_pool_pressure", "press");
+        ASSERT(ic_pool_repo(root, repo, sizeof(repo), pool, sizeof(pool)));
+        ASSERT(snprintf(phases, sizeof(phases), "%s/phases.txt", root) > 0);
+        ASSERT(ic_pool_generation(repo, pool, 'a', "/fixtures/pool-old",
+                                  5 * 60 * 60, gen_old, sizeof(gen_old)));
+        ASSERT(ic_pool_generation(repo, pool, 'b', "/fixtures/pool-mid",
+                                  3 * 60 * 60, gen_mid, sizeof(gen_mid)));
+        ASSERT(ic_pool_generation(repo, pool, 'c', "/fixtures/pool-hot",
+                                  10 * 60, gen_hot, sizeof(gen_hot)));
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        /* A pool that already satisfies the reservation keeps every donor
+         * it has: the pass is pressure relief, not a policy. */
+        size_t removed = 0;
+        uint64_t bytes = 0;
+        zcl_dev_proof_test_pool_pressure_reap(repo, pool, "", 4096, 4096,
+                                              phases, &removed, &bytes);
+        ASSERT(removed == 0);
+        ASSERT(stat(gen_old, &probe) == 0);
+        /* One byte short. The idlest donor goes and the pass stops there,
+         * with a newer idle donor still standing beside it. */
+        zcl_dev_proof_test_pool_pressure_reap(repo, pool, "", 4096, 4097,
+                                              phases, &removed, &bytes);
+        ASSERT(removed == 1);
+        ASSERT(bytes > 0);
+        ASSERT(stat(gen_old, &probe) != 0);
+        ASSERT(stat(gen_mid, &probe) == 0);
+        ASSERT(stat(gen_hot, &probe) == 0);
+        /* A need nothing could satisfy still refuses the generation this
+         * proof is holding and the one touched within the hour. */
+        removed = 0;
+        zcl_dev_proof_test_pool_pressure_reap(repo, pool, gen_mid, 0,
+                                              UINT64_MAX, phases, &removed,
+                                              &bytes);
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(removed == 0);
+        ASSERT(stat(gen_mid, &probe) == 0);
+        ASSERT(stat(gen_hot, &probe) == 0);
+        /* Every eviction is on the record with its path and its cost. */
+        ASSERT(ic_file_has(phases, "generation_pool_evicted"));
+        ASSERT(ic_file_has(phases, gen_old));
+        ASSERT(ic_file_has(phases, "idle_seconds="));
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+/* Commit `rev` of `repo` checked out at the pool name a real proof of that
+ * commit from `canonical` (the checkout, as a proof resolves it) gives its
+ * generation, marked as a finished build or not, and backdated to
+ * `idle_seconds` ago. `local` receives the commit. */
+static bool ic_owned_generation(const char *repo, const char *canonical,
+                                const char *pool, const char *rev,
+                                bool marked, int64_t idle_seconds,
+                                char local[65], char *out, size_t out_len)
+{
+    static const char base[] = "1111111111111111111111111111111111111111";
+    char cmd[12288], sha_path[4200], tag[33];
+    if (snprintf(sha_path, sizeof(sha_path), "%s.sha", pool) >=
+            (int)sizeof(sha_path) ||
+        snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse '%s' > '%s'",
+                 repo, rev, sha_path) >= (int)sizeof(cmd) ||
+        system(cmd) != 0)
+        return false;
+    FILE *f = fopen(sha_path, "r");
+    if (!f) return false;
+    bool read = fgets(local, 65, f) != NULL;
+    (void)fclose(f);
+    if (!read) return false;
+    local[strcspn(local, "\r\n")] = 0;
+    if (strlen(local) != 40) return false;
+    zcl_dev_proof_test_generation_tag(canonical, local, tag);
+    if (snprintf(out, out_len, "%s/%s", pool, tag) >= (int)out_len ||
+        snprintf(cmd, sizeof(cmd),
+                 "git -C '%s' worktree add --detach -q '%s' '%s'", repo, out,
+                 local) >= (int)sizeof(cmd) ||
+        system(cmd) != 0)
+        return false;
+    struct zcl_dev_proof_build_identity_v1 identity;
+    memset(&identity, 0x5a, sizeof(identity));
+    if (!ic_write(out, "build/ballast", "built\n") ||
+        (marked && !zcl_dev_proof_warm_marker_write(out, canonical, local,
+                                                    base, 1700000000LL,
+                                                    &identity)))
+        return false;
+    int64_t when = platform_time_wall_unix() - idle_seconds;
+    const struct timespec stamp[2] = {
+        { .tv_sec = (time_t)when, .tv_nsec = 0 },
+        { .tv_sec = (time_t)when, .tv_nsec = 0 },
+    };
+    return utimensat(AT_FDCWD, out, stamp, 0) == 0;
+}
+
+/* One pair file under the checkout's proof state: a lease or running lock
+ * naming worker `pid`, or (pid 0) a queued request, for `local` against a
+ * base no marker names. */
+static bool ic_owner_pair_file(const char *state, const char *sub,
+                               const char *local, const char *suffix,
+                               long pid)
+{
+    static const char base[] = "2222222222222222222222222222222222222222";
+    char dir[4200], path[4400], body[128];
+    if (snprintf(dir, sizeof(dir), "%s%s%s", state, sub[0] ? "/" : "",
+                 sub) >= (int)sizeof(dir) ||
+        snprintf(path, sizeof(path), "%s/%s-%s%s", dir, local, base,
+                 suffix) >= (int)sizeof(path) ||
+        snprintf(body, sizeof(body), "attempt.token %ld %lld\n", pid,
+                 (long long)platform_time_wall_unix()) >= (int)sizeof(body))
+        return false;
+    (void)mkdir(dir, 0700);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    bool ok = write(fd, body, strlen(body)) == (ssize_t)strlen(body);
+    return close(fd) == 0 && ok;
+}
+#endif
+
+static int test_pw_pressure_evicts_unclaimed_young_generation(void)
+{
+    int failures = 0;
+    TEST("proof generation pool: RAM pressure evicts a generation inside "
+         "its idle window only when its own checkout's queue lock proves no "
+         "proof of its commit is live or queued") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], repo[4096], pool[4096], phases[4096];
+        char canonical[4096], state[4200], lock[4300], cmd[8192];
+        char g_stale[4096], g_unmarked[4096], g_leased[4096];
+        char g_queued[4096], g_busy[4096], g_foreign[4096];
+        char l_stale[65], l_unmarked[65], l_leased[65], l_queued[65];
+        char l_busy[65];
+        struct stat probe;
+        test_make_tmpdir(root, sizeof(root), "proof_pool_young", "young");
+        ASSERT(ic_pool_repo(root, repo, sizeof(repo), pool, sizeof(pool)));
+        ASSERT(realpath(repo, canonical) != NULL);
+        ASSERT(snprintf(phases, sizeof(phases), "%s/phases.txt", root) > 0);
+        ASSERT(snprintf(cmd, sizeof(cmd),
+                        "cd '%s' && for n in 1 2 3 4; do git -c user.name=t "
+                        "-c user.email=t@t.invalid commit --allow-empty -q "
+                        "-m c$n || exit 1; done", repo) > 0);
+        ASSERT(system(cmd) == 0);
+        /* A worker SIGKILLed mid-proof: its lease names a pid that is gone. */
+        pid_t dead = fork();
+        ASSERT(dead >= 0);
+        if (dead == 0) _exit(0);
+        int status = 0;
+        ASSERT(waitpid(dead, &status, 0) == dead);
+        /* Every one of these was touched well inside its idle window. */
+        ASSERT(ic_owned_generation(repo, canonical, pool, "HEAD~4", true,
+                                   10 * 60, l_stale, g_stale,
+                                   sizeof(g_stale)));
+        ASSERT(ic_owned_generation(repo, canonical, pool, "HEAD~3", false,
+                                   3 * 60 * 60, l_unmarked, g_unmarked,
+                                   sizeof(g_unmarked)));
+        ASSERT(ic_owned_generation(repo, canonical, pool, "HEAD~2", true,
+                                   10 * 60, l_leased, g_leased,
+                                   sizeof(g_leased)));
+        ASSERT(ic_owned_generation(repo, canonical, pool, "HEAD~1", false,
+                                   10 * 60, l_queued, g_queued,
+                                   sizeof(g_queued)));
+        ASSERT(ic_owned_generation(repo, canonical, pool, "HEAD", true,
+                                   10 * 60, l_busy, g_busy, sizeof(g_busy)));
+        /* A name nothing hashes back to has no provable owner. */
+        ASSERT(ic_pool_generation(repo, pool, 'c', "/fixtures/pool-foreign",
+                                  10 * 60, g_foreign, sizeof(g_foreign)));
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+
+        /* No queue lock at all: nothing can be proven, so nothing goes and
+         * nothing is created in the owner's checkout. */
+        size_t removed = 0;
+        uint64_t bytes = 0;
+        zcl_dev_proof_test_pool_pressure_reap(repo, pool, "", 0, UINT64_MAX,
+                                              phases, &removed, &bytes);
+        ASSERT(removed == 0);
+        ASSERT(snprintf(state, sizeof(state), "%s/.cache/zcl-dev-proof",
+                        canonical) > 0);
+        ASSERT(snprintf(lock, sizeof(lock), "%s/queue.lock", state) > 0);
+        ASSERT(stat(lock, &probe) != 0);
+
+        /* The owner's proof state: a dead worker's lease on the stale
+         * commit, a live one (this process) on another base of the leased
+         * commit, and a queued request for the queued commit. */
+        ASSERT(snprintf(cmd, sizeof(cmd), "mkdir -p '%s' && touch '%s'",
+                        state, lock) > 0);
+        ASSERT(system(cmd) == 0);
+        ASSERT(ic_owner_pair_file(state, "leases", l_stale, ".lease",
+                                  (long)dead));
+        ASSERT(ic_owner_pair_file(state, "leases", l_leased, ".lease",
+                                  (long)getpid()));
+        ASSERT(ic_owner_pair_file(state, "requests", l_queued, ".request",
+                                  0));
+
+        /* A claim in progress holds the queue lock: nothing waits on it
+         * and nothing goes. */
+        int held = open(lock, O_RDWR | O_CLOEXEC);
+        ASSERT(held >= 0);
+        ASSERT(flock(held, LOCK_EX) == 0);
+        removed = 0;
+        zcl_dev_proof_test_pool_pressure_reap(repo, pool, "", 0, UINT64_MAX,
+                                              phases, &removed, &bytes);
+        (void)flock(held, LOCK_UN);
+        (void)close(held);
+        ASSERT(removed == 0);
+        ASSERT(stat(g_stale, &probe) == 0);
+        ASSERT(stat(g_busy, &probe) == 0);
+
+        /* Lock free: the dead worker's generation, the unmarked one, and
+         * the unclaimed one go; the live lease, the queued request, and the
+         * unprovable name keep theirs. */
+        removed = 0;
+        bytes = 0;
+        zcl_dev_proof_test_pool_pressure_reap(repo, pool, "", 0, UINT64_MAX,
+                                              phases, &removed, &bytes);
+        ASSERT(removed == 3);
+        ASSERT(bytes > 0);
+        ASSERT(stat(g_stale, &probe) != 0 && errno == ENOENT);
+        ASSERT(stat(g_unmarked, &probe) != 0 && errno == ENOENT);
+        ASSERT(stat(g_busy, &probe) != 0 && errno == ENOENT);
+        ASSERT(stat(g_leased, &probe) == 0);
+        ASSERT(stat(g_queued, &probe) == 0);
+        ASSERT(stat(g_foreign, &probe) == 0);
+        ASSERT(ic_file_has(phases, "generation_pool_evicted"));
+        ASSERT(ic_file_has(phases, g_stale));
+
+        /* Once the lease's worker is gone and the request is consumed,
+         * those two are unclaimed as well. */
+        ASSERT(ic_owner_pair_file(state, "leases", l_leased, ".lease",
+                                  (long)dead));
+        char request[4400];
+        ASSERT(snprintf(request, sizeof(request),
+                        "%s/requests/%s-2222222222222222222222222222222222"
+                        "222222.request", state, l_queued) > 0);
+        ASSERT(unlink(request) == 0);
+        removed = 0;
+        zcl_dev_proof_test_pool_pressure_reap(repo, pool, "", 0, UINT64_MAX,
+                                              phases, &removed, &bytes);
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(removed == 2);
+        ASSERT(stat(g_leased, &probe) != 0 && errno == ENOENT);
+        ASSERT(stat(g_queued, &probe) != 0 && errno == ENOENT);
+        ASSERT(stat(g_foreign, &probe) == 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Fixed 32-lowercase-hex tag for the orphan fixtures below: distinct from
+ * ic_pool_generation()'s a/b/c fills so the two families of fixture never
+ * collide in one temp dir. */
+static void ic_orphan_tag(char *out, char fill)
+{
+    memset(out, fill, 32);
+    out[32] = 0;
+}
+
+static int test_pw_orphan_shapes_reaped(void)
+{
+    int failures = 0;
+    TEST("proof generation pool: a dead lint sandbox and a half-deleted "
+        "generation with a pruned gitdir, and a dead test shard are reaped; "
+        "a live sandbox or shard, a malformed shard, a "
+        "recent one, a resolvable gitdir, and a non-matching name are not") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], pool[4096];
+        ASSERT(test_mkdtemp(root, sizeof(root), "proof_pool_orphan") !=
+              NULL);
+        ASSERT(snprintf(pool, sizeof(pool), "%s/.z23p", root) > 0);
+        ASSERT(mkdir(pool, 0700) == 0);
+
+        /* A dead process to stand in for a lint shard SIGKILLed mid-run. */
+        pid_t dead_child = fork();
+        ASSERT(dead_child >= 0);
+        if (dead_child == 0) _exit(0);
+        int dead_status = 0;
+        ASSERT(waitpid(dead_child, &dead_status, 0) == dead_child);
+
+        char tag_dead[33], tag_live[33], tag_pruned_old[33];
+        char tag_pruned_recent[33], tag_resolvable[33];
+        ic_orphan_tag(tag_dead, 'a');
+        ic_orphan_tag(tag_live, 'b');
+        ic_orphan_tag(tag_pruned_old, 'c');
+        ic_orphan_tag(tag_pruned_recent, 'd');
+        ic_orphan_tag(tag_resolvable, 'e');
+
+        /* Cases 1/2/6: lint-sandbox-shaped directories, planted straight
+         * into the pool the way test_make_lint_gates.c leaves them. */
+        char path_dead[4096], path_live[4096], path_other[4096];
+        ASSERT(snprintf(path_dead, sizeof(path_dead), "%s/%s.lint_sb_%ld",
+                        pool, tag_dead, (long)dead_child) > 0);
+        ASSERT(snprintf(path_live, sizeof(path_live), "%s/%s.lint_sb_%ld",
+                        pool, tag_live, (long)getpid()) > 0);
+        ASSERT(snprintf(path_other, sizeof(path_other), "%s/notes.lint_sb_x",
+                        pool) > 0);
+        ASSERT(mkdir(path_dead, 0700) == 0);
+        ASSERT(mkdir(path_live, 0700) == 0);
+        ASSERT(mkdir(path_other, 0700) == 0);
+
+        /* Cases 7/8/9: dev_platform test-shard roots. A shard SIGKILLed by
+         * a cancelled proof never runs its own cleanup; only a dead owner's
+         * well-formed root is an orphan. */
+        char shard_dead[4096], shard_live[4096], shard_malformed[4096];
+        ASSERT(snprintf(shard_dead, sizeof(shard_dead),
+                        "%s/%s.dp_shard_%ld_3_AbC123", pool, tag_dead,
+                        (long)dead_child) > 0);
+        ASSERT(snprintf(shard_live, sizeof(shard_live),
+                        "%s/%s.dp_shard_%ld_1_XyZ789", pool, tag_live,
+                        (long)getpid()) > 0);
+        ASSERT(snprintf(shard_malformed, sizeof(shard_malformed),
+                        "%s/%s.dp_shard_%ld_2_too_long", pool, tag_dead,
+                        (long)dead_child) > 0);
+        ASSERT(mkdir(shard_dead, 0700) == 0);
+        ASSERT(mkdir(shard_live, 0700) == 0);
+        ASSERT(mkdir(shard_malformed, 0700) == 0);
+        ASSERT(ic_write(shard_dead, "home/partial", "x"));
+
+        /* Cases 3/4/5: a `.git` file naming a gitdir, with a read-only
+         * fixture directory inside standing in for what a proof test left
+         * behind. Cases 3 and 4 name a gitdir git already deleted (its
+         * basename is the tag); case 5 names one that still exists. */
+        char path_pruned_old[4096], path_pruned_recent[4096];
+        char path_resolvable[4096];
+        ASSERT(snprintf(path_pruned_old, sizeof(path_pruned_old), "%s/%s",
+                        pool, tag_pruned_old) > 0);
+        ASSERT(snprintf(path_pruned_recent, sizeof(path_pruned_recent),
+                        "%s/%s", pool, tag_pruned_recent) > 0);
+        ASSERT(snprintf(path_resolvable, sizeof(path_resolvable), "%s/%s",
+                        pool, tag_resolvable) > 0);
+
+        char gitdir_missing_old[4096], gitdir_missing_recent[4096];
+        char gitdir_present[4096];
+        ASSERT(snprintf(gitdir_missing_old, sizeof(gitdir_missing_old),
+                        "%s/gone/.git/worktrees/%s", root, tag_pruned_old) >
+              0);
+        ASSERT(snprintf(gitdir_missing_recent, sizeof(gitdir_missing_recent),
+                        "%s/gone/.git/worktrees/%s", root,
+                        tag_pruned_recent) > 0);
+        ASSERT(snprintf(gitdir_present, sizeof(gitdir_present),
+                        "%s/real_admin", root) > 0);
+        ASSERT(mkdir(gitdir_present, 0755) == 0);
+
+        char body_old[4160], body_recent[4160], body_present[4160];
+        ASSERT(snprintf(body_old, sizeof(body_old), "gitdir: %s\n",
+                        gitdir_missing_old) > 0);
+        ASSERT(snprintf(body_recent, sizeof(body_recent), "gitdir: %s\n",
+                        gitdir_missing_recent) > 0);
+        ASSERT(snprintf(body_present, sizeof(body_present), "gitdir: %s\n",
+                        gitdir_present) > 0);
+
+        ASSERT(mkdir(path_pruned_old, 0700) == 0);
+        ASSERT(mkdir(path_pruned_recent, 0700) == 0);
+        ASSERT(mkdir(path_resolvable, 0700) == 0);
+        ASSERT(ic_write(path_pruned_old, ".git", body_old));
+        ASSERT(ic_write(path_pruned_recent, ".git", body_recent));
+        ASSERT(ic_write(path_resolvable, ".git", body_present));
+        ASSERT(ic_write(path_pruned_old, "sub/f", "x"));
+        ASSERT(ic_write(path_pruned_recent, "sub/f", "x"));
+
+        char sub_dir_old[4096], sub_dir_recent[4096];
+        ASSERT(snprintf(sub_dir_old, sizeof(sub_dir_old), "%s/sub",
+                        path_pruned_old) > 0);
+        ASSERT(snprintf(sub_dir_recent, sizeof(sub_dir_recent), "%s/sub",
+                        path_pruned_recent) > 0);
+        ASSERT(chmod(sub_dir_old, 0555) == 0);
+        ASSERT(chmod(sub_dir_recent, 0555) == 0);
+
+        int64_t old_when = platform_time_wall_unix() - 2 * 60 * 60;
+        int64_t recent_when = platform_time_wall_unix() - 5 * 60;
+        const struct timespec stamp_old[2] = {
+            { .tv_sec = (time_t)old_when, .tv_nsec = 0 },
+            { .tv_sec = (time_t)old_when, .tv_nsec = 0 },
+        };
+        const struct timespec stamp_recent[2] = {
+            { .tv_sec = (time_t)recent_when, .tv_nsec = 0 },
+            { .tv_sec = (time_t)recent_when, .tv_nsec = 0 },
+        };
+        ASSERT(utimensat(AT_FDCWD, path_dead, stamp_old, 0) == 0);
+        ASSERT(utimensat(AT_FDCWD, path_live, stamp_old, 0) == 0);
+        ASSERT(utimensat(AT_FDCWD, path_other, stamp_old, 0) == 0);
+        ASSERT(utimensat(AT_FDCWD, shard_dead, stamp_old, 0) == 0);
+        ASSERT(utimensat(AT_FDCWD, shard_live, stamp_old, 0) == 0);
+        ASSERT(utimensat(AT_FDCWD, shard_malformed, stamp_old, 0) == 0);
+        ASSERT(utimensat(AT_FDCWD, path_pruned_old, stamp_old, 0) == 0);
+        ASSERT(utimensat(AT_FDCWD, path_pruned_recent, stamp_recent, 0) ==
+              0);
+        ASSERT(utimensat(AT_FDCWD, path_resolvable, stamp_old, 0) == 0);
+
+        size_t removed = 0;
+        uint64_t bytes = 0;
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        zcl_dev_proof_test_generation_pool_reap(root, pool, "", &removed,
+                                                &bytes);
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+
+        struct stat probe;
+        ASSERT(stat(path_dead, &probe) != 0);
+        ASSERT(stat(path_live, &probe) == 0);
+        ASSERT(stat(path_other, &probe) == 0);
+        ASSERT(stat(shard_dead, &probe) != 0);
+        ASSERT(stat(shard_live, &probe) == 0);
+        ASSERT(stat(shard_malformed, &probe) == 0);
+        ASSERT(stat(path_pruned_old, &probe) != 0);
+        ASSERT(stat(path_pruned_recent, &probe) == 0);
+        ASSERT(stat(path_resolvable, &probe) == 0);
+        ASSERT(removed >= 3);
+        /* path_pruned_recent survives on purpose; put its read-only
+         * fixture dir back to writable so cleanup (which does not chmod)
+         * can remove it. */
+        (void)chmod(sub_dir_recent, 0755);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_marker_identity_invalidates_stale_donor(void)
+{
+    int failures = 0;
+    TEST("proof warm start: a donor's marker binds the build identity it "
+        "was compiled under") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096];
+        static const char local[] =
+            "2222222222222222222222222222222222222222";
+        static const char base[] =
+            "3333333333333333333333333333333333333333";
+        test_make_tmpdir(root, sizeof(root), "proof_warm", "identity");
+        char gen[4096];
+        ASSERT(snprintf(gen, sizeof(gen), "%s/gen", root) > 0);
+        ASSERT(ic_write(root, "gen/build/.keep", "identity parent\n"));
+        /* The donor was built under identity A (say, today's compiler and
+         * flags). */
+        struct zcl_dev_proof_build_identity_v1 identity_a;
+        memset(identity_a.compiler, 0x11, 32);
+        memset(identity_a.flags, 0x22, 32);
+        memset(identity_a.environment, 0x77, 32);
+        memset(identity_a.build_graph, 0x33, 32);
+        ASSERT(zcl_dev_proof_warm_marker_write(gen, "/fixtures/proof-warm",
+                                               local, base, 1700000001LL,
+                                               &identity_a));
+        char got_root[4096] = {0}, got_local[65] = {0}, got_base[65] = {0};
+        int64_t completed = 0;
+        struct zcl_dev_proof_build_identity_v1 sealed = {0};
+        ASSERT(zcl_dev_proof_warm_marker_read(gen, got_root, got_local,
+                                              got_base, &completed, &sealed));
+        /* This proof's OWN identity (say, after a compiler upgrade, a
+         * CFLAGS change, or a vendor archive rebuilt in place -- none of
+         * which move a tracked source blob, so the wrapper-inputs diff
+         * would see no change) is B: every one of the four sealed roots
+         * must differ from A, which is exactly what a donor-scan compare
+         * (memcmp-equal across all four) is built to catch and refuse. */
+        struct zcl_dev_proof_build_identity_v1 identity_b;
+        memset(identity_b.compiler, 0x44, 32);
+        memset(identity_b.flags, 0x55, 32);
+        memset(identity_b.environment, 0x88, 32);
+        memset(identity_b.build_graph, 0x66, 32);
+        ASSERT(memcmp(sealed.compiler, identity_b.compiler, 32) != 0);
+        ASSERT(memcmp(sealed.flags, identity_b.flags, 32) != 0);
+        ASSERT(memcmp(sealed.environment, identity_b.environment, 32) != 0);
+        ASSERT(memcmp(sealed.build_graph, identity_b.build_graph, 32) != 0);
+        /* A single matching field is not enough to admit a donor: the same
+         * compiler with different flags is still a different build. */
+        ASSERT(memcmp(sealed.compiler, identity_a.compiler, 32) == 0);
+        ASSERT(memcmp(sealed.flags, identity_b.flags, 32) != 0);
+        /* A marker from before identity sealing existed (four fields
+         * short) is a shortfall the field count refuses, not a run of zero
+         * bytes an equality check could accidentally treat as a match. */
+        ASSERT(ic_write(root, "gen/build/.proof-build-complete",
+                        "zcl.proof_build_complete.v1\nroot=/fixtures/"
+                        "proof-warm\nlocal=2222222222222222222222222222222"
+                        "222222222\nbase=33333333333333333333333333333333"
+                        "33333333\ncompleted=1700000001\n"));
+        ASSERT(!zcl_dev_proof_warm_marker_read(gen, got_root, got_local,
+                                               got_base, &completed,
+                                               &sealed));
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+/* One build plan, written the way Make writes it for a checkout that lives
+ * at `root`. The values a second checkout cannot reproduce
+ * are part of it on purpose: the -ffile-prefix-map that names the checkout,
+ * the epoch digest, and the local mutation token over inodes/timestamps. */
+static bool ic_write_build_plan_mutation(
+    const char *root, const char *epoch, const char *compiler_id,
+    const char *cflags, const char *mutation, const char *extra_line)
+{
+    char plan[8192], base[160] = {0};
+    if (mutation) {
+        int n = snprintf(base, sizeof(base), "BASE_GENERATION=%s\n", mutation);
+        if (n <= 0 || (size_t)n >= sizeof(base)) return false;
+    }
+    int n = snprintf(plan, sizeof(plan),
+        "CC=%s/build/bin/zcc cc\n"
+        "COMPILER_ID=%s\n"
+        "%s"
+        "DEV_CFLAGS=-std=c23 %s -ffile-prefix-map=%s=/zclassic23\n"
+        "DEV_LDFLAGS=-pthread -pie\n"
+        "DEV_LIBS=vendor/lib/libsecp256k1.a -lm\n"
+        "DEV_OBJ_DIR=build/dev-obj/epochs/%s\n"
+        "DEV_LINK_RSP=build/dev-obj/epochs/%s/link-inputs.rsp\n"
+        "DEV_BASE_RELOC=build/dev-obj/epochs/%s/restart-base.o\n"
+        "TEST_CFLAGS=-std=c23 -g -ffile-prefix-map=%s=/zclassic23\n"
+        "TEST_LDFLAGS=-pthread -pie\n"
+        "TEST_LIBS=vendor/lib/libsecp256k1.a -lm\n"
+        "TEST_OBJ_DIR=build/test-obj/epochs/%s\n"
+        "TEST_LINK_RSP=build/test-obj/epochs/%s/link-inputs.rsp\n"
+        "TEST_BASE_RELOC=build/test-obj/epochs/%s/restart-base.o\n"
+        "%s",
+        root, compiler_id, base,
+        cflags, root, epoch, epoch, epoch, root, epoch, epoch, epoch,
+        extra_line ? extra_line : "");
+    return n > 0 && (size_t)n < (int)sizeof(plan) &&
+           ic_write(root, "build/dev-loop/restart.env", plan);
+}
+
+static bool ic_write_build_plan(const char *root, const char *epoch,
+                                const char *compiler_id, const char *cflags,
+                                const char *extra_line)
+{
+    return ic_write_build_plan_mutation(root, epoch, compiler_id, cflags,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        extra_line);
+}
+
+static bool ic_root_set(const uint8_t root[32])
+{
+    uint8_t any = 0;
+    for (size_t i = 0; i < 32; i++) any |= root[i];
+    return any != 0;
+}
+
+static bool ic_original_plan_fixture(const char *root, char local[65])
+{
+    static const char digest[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char makefile[] =
+        ".PHONY: dev-bin\ndev-bin:\n"
+        "\t@set -e; test ! -f build/fail; "
+        "if test -f build/no-op; then exit 0; fi; "
+        "if test -f build/change-source; then echo changed >> sample.c; fi; "
+        "set -- $$(tools/dev/source-identity.sh capture-record); "
+        "sed -i \"s/^BASE_GENERATION=.*/BASE_GENERATION=$$3/\" "
+        "build/dev-loop/restart.env\n"
+        "build/hotswap/zcl_rollback_fixture_%.so:\n"
+        "\t@mkdir -p build/hotswap; printf '%s\\n' '$*' > $@\n"
+        "build/fixtures/rlc_child_%:\n"
+        "\t@mkdir -p build/fixtures; printf '%s\\n' '$*' > $@\n"
+        "build/fixtures/otlp_startup_probe:\n"
+        "\t@mkdir -p build/fixtures; printf '%s\\n' probe > $@\n";
+    if (!ic_write(root, ".gitignore", "build/\n.cache/\n") ||
+        !ic_write(root, "sample.c", "int value = 1;\n") ||
+        !ic_write(root, "Makefile", makefile) ||
+        !ic_write(root, "tools/dev/source-identity.sh", "placeholder\n") ||
+        !ic_write_build_plan(root, digest, digest, "-O1", NULL))
+        return false;
+    char cmd[16384];
+    int n = snprintf(cmd, sizeof(cmd),
+        "cp .gitignore '%s/.gitignore' && "
+        "cp tools/dev/source-identity.sh '%s/tools/dev/source-identity.sh' && "
+        "cd '%s' && chmod 700 tools/dev/source-identity.sh && git init -q && "
+        "git config user.name fixture && git config user.email fixture@invalid && "
+        "git config commit.gpgsign false && git add -A && git commit -qm first && "
+        "make --no-print-directory dev-bin && "
+        "printf 'int value = 2;\\n' > sample.c && git add sample.c && "
+        "git commit -qm second", root, root, root);
+    if (n <= 0 || (size_t)n >= sizeof(cmd) || system(cmd) != 0) return false;
+    const char *argv[] = {"git", "rev-parse", "HEAD", NULL};
+    struct zcl_devloop_process_result result = {0};
+    if (!zcl_devloop_process_run(root, argv, 30000, &result) ||
+        result.exit_code != 0 || result.output_truncated)
+        return false;
+    size_t len = strcspn(result.output, "\r\n");
+    if (len != 40 && len != 64) return false;
+    memcpy(local, result.output, len);
+    local[len] = '\0';
+    return true;
+}
+
+#if defined(__linux__)
+static bool ic_original_plan_recovers_fixtures(
+    const char *root, const char *local, const char *log)
+{
+    static const char *const fixtures[] = {
+        "build/hotswap/zcl_rollback_fixture_a.so",
+        "build/hotswap/zcl_rollback_fixture_b.so",
+        "build/fixtures/rlc_child_v1",
+        "build/fixtures/rlc_child_broken",
+        "build/fixtures/otlp_startup_probe",
+    };
+    const size_t fixture_count = sizeof(fixtures) / sizeof(fixtures[0]);
+    char path[4096], generation[4096], why[512];
+    if (snprintf(generation, sizeof(generation), "%s/build/generation", root) >=
+        (int)sizeof(generation)) return false;
+    for (size_t i = 0; i < fixture_count; i++) {
+        if (snprintf(path, sizeof(path), "%s/%s", root, fixtures[i]) >=
+            (int)sizeof(path) || unlink(path) != 0)
+            return false;
+        if (zcl_dev_proof_test_generation_dependency(
+                root, generation, fixtures[i], why, sizeof(why)) ||
+            !strstr(why, "proof_generation_dependency_unavailable:"))
+            return false;
+    }
+    if (!zcl_dev_proof_test_original_plan_prepare(
+            root, local, log, why, sizeof(why))) return false;
+    for (size_t i = 0; i < fixture_count; i++) {
+        if (!zcl_dev_proof_test_generation_dependency(
+                root, generation, fixtures[i], why, sizeof(why)))
+            return false;
+    }
+    return true;
+}
+#endif
+
+static int test_pw_original_plan_refreshes_before_sealing(void)
+{
+    int failures = 0;
+    char *saved_process_env = NULL;
+    bool process_env_changed = false;
+    TEST("proof preparation: prior-commit plan refreshes without accepting stale or changed source") {
+        const char *process_env = getenv("ZCL_DEVLOOP_TEST_PROCESS");
+        if (process_env) {
+            saved_process_env = zcl_strdup(process_env, "proof fixture process environment");
+            ASSERT(saved_process_env != NULL);
+        }
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        process_env_changed = true;
+        char root[4096], local[65], log[4096], marker[4096], why[256];
+        test_make_tmpdir(root, sizeof(root), "proof_plan", "prior_commit");
+        ASSERT(ic_original_plan_fixture(root, local));
+        ASSERT(snprintf(log, sizeof(log), "%s/build/prepare.log", root) <
+               (int)sizeof(log));
+        /* A successful no-op cannot claim that the old commit's plan is
+         * current. The actual source-identity verifier must reject it. */
+        ASSERT(ic_write(root, "build/no-op", "1\n"));
+        ASSERT(!zcl_dev_proof_test_original_plan_prepare(root, local, log,
+                                                         why, sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_prepared_build_plan_source_changed");
+        ASSERT(snprintf(marker, sizeof(marker), "%s/build/no-op", root) <
+               (int)sizeof(marker));
+        ASSERT(unlink(marker) == 0);
+        ASSERT(zcl_dev_proof_test_original_plan_prepare(root, local, log,
+                                                        why, sizeof(why)));
+#if defined(__linux__)
+        ASSERT(ic_original_plan_recovers_fixtures(root, local, log));
+#endif
+        /* Idempotent preparation still obtains a verified current plan. */
+        ASSERT(zcl_dev_proof_test_original_plan_prepare(root, local, log,
+                                                        why, sizeof(why)));
+        /* Use the repository's actual ignore rules and real native admission:
+         * the persistent generated lock is output, nearby source is not. */
+        ASSERT(ic_write(root, "vendor/.build.lock", ""));
+        ASSERT(zcl_dev_proof_test_original_plan_prepare(root, local, log,
+                                                        why, sizeof(why)));
+        ASSERT(snprintf(marker, sizeof(marker), "%s/vendor/.build.lock", root) <
+               (int)sizeof(marker));
+        ASSERT(access(marker, F_OK) == 0);
+        static const char *const negatives[] = {
+            "vendor/.build.lock.c", "vendor/vendor_lock_input.h",
+            "unrelated/vendor/.build.lock", "unexpected-source.c"
+        };
+        for (size_t i = 0; i < sizeof(negatives) / sizeof(negatives[0]); ++i) {
+            ASSERT(ic_write(root, negatives[i], "fixture input\n"));
+            ASSERT(!zcl_dev_proof_test_original_plan_prepare(root, local, log,
+                                                             why, sizeof(why)));
+            ASSERT_STR_EQ(why, "worktree_not_clean");
+            ASSERT(snprintf(marker, sizeof(marker), "%s/%s", root, negatives[i]) <
+                   (int)sizeof(marker));
+            ASSERT(unlink(marker) == 0);
+        }
+        ASSERT(ic_write(root, "build/fail", "1\n"));
+        ASSERT(!zcl_dev_proof_test_original_plan_prepare(root, local, log,
+                                                         why, sizeof(why)));
+        ASSERT(strstr(why, "proof_original_plan_prepare_exit_") != NULL);
+        ASSERT(snprintf(marker, sizeof(marker), "%s/build/fail", root) <
+               (int)sizeof(marker));
+        ASSERT(unlink(marker) == 0);
+        /* Even a newly generated token for dirty source is not authority
+         * to replace the exact commit requested by the caller. */
+        ASSERT(ic_write(root, "build/change-source", "1\n"));
+        ASSERT(!zcl_dev_proof_test_original_plan_prepare(root, local, log,
+                                                         why, sizeof(why)));
+        ASSERT_STR_EQ(why, "worktree_not_clean");
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    if (process_env_changed) {
+        int restored = saved_process_env
+            ? setenv("ZCL_DEVLOOP_TEST_PROCESS", saved_process_env, 1)
+            : unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        if (restored != 0) {
+            fprintf(stderr, "proof fixture: cannot restore process environment\n");
+            failures++;
+        }
+    }
+    free(saved_process_env);
+    return failures;
+}
+#endif
+
+/* The property the whole receipt rests on: one tree at two absolute paths
+ * has one build identity. Until it did, a receipt was a statement about the
+ * directory that produced it and meant nothing anywhere else. */
+static int test_pw_identity_survives_a_second_checkout_path(void)
+{
+    int failures = 0;
+    TEST("proof identity: two checkout paths, one set of roots") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        static const char epoch_a[] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        static const char epoch_b[] =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        static const char compiler_id_a[] =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        static const char compiler_id_b[] =
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        static const char mutation_a[] =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+        static const char mutation_b[] =
+            "2222222222222222222222222222222222222222222222222222222222222222";
+        char root_a[4096], root_b[4096];
+        test_make_tmpdir(root_a, sizeof(root_a), "proof_identity",
+                         "checkout_a");
+        test_make_tmpdir(root_b, sizeof(root_b), "proof_identity",
+                         "checkout_b_longer_name");
+        ASSERT(strcmp(root_a, root_b) != 0);
+        ASSERT(ic_write_build_plan_mutation(root_a, epoch_a, compiler_id_a,
+                                            "-O2", mutation_a, NULL));
+        ASSERT(ic_write_build_plan_mutation(root_b, epoch_b, compiler_id_b,
+                                            "-O2", mutation_b, NULL));
+        struct zcl_dev_proof_build_identity_v1 a = {0}, b = {0};
+        ASSERT(zcl_dev_proof_build_identity_v1_capture(root_a, &a, NULL, 0));
+        ASSERT(zcl_dev_proof_build_identity_v1_capture(root_b, &b, NULL, 0));
+        ASSERT(memcmp(&a, &b, sizeof(a)) == 0);
+        /* Location-independent graph equality never authorizes the other
+         * checkout's inode/timestamp token. Each plan keeps its own binding. */
+        char why[160];
+        ASSERT(zcl_dev_proof_build_plan_verify(root_a, &a, mutation_a,
+                                                why, sizeof(why)));
+        ASSERT(zcl_dev_proof_build_plan_verify(root_b, &a, mutation_b,
+                                                why, sizeof(why)));
+        ASSERT(!zcl_dev_proof_build_plan_verify(root_a, &a, mutation_b,
+                                                 why, sizeof(why)));
+        ASSERT(strstr(why, "mutation_changed") != NULL);
+        ASSERT(!zcl_dev_proof_build_plan_verify(root_b, &a, mutation_a,
+                                                 why, sizeof(why)));
+        ASSERT(strstr(why, "mutation_changed") != NULL);
+        /* Equal-because-empty would satisfy the line above and prove
+         * nothing, so every root has to carry something. */
+        ASSERT(ic_root_set(a.compiler) && ic_root_set(a.flags) &&
+               ic_root_set(a.environment) && ic_root_set(a.build_graph));
+        /* compiler_root is the toolchain capsule, not a hash of the plan. */
+        struct vcs_toolchain_capsule_v1 capsule;
+        uint8_t capsule_root[32];
+        ASSERT(vcs_toolchain_capsule_v1_capture(&capsule));
+        ASSERT(vcs_toolchain_capsule_v1_root(&capsule, capsule_root));
+        ASSERT(memcmp(a.compiler, capsule_root, 32) == 0);
+        /* A checkout root a prefix rewrite cannot model is refused rather
+         * than half-applied. */
+        struct zcl_dev_proof_build_identity_v1 refused = {0};
+        ASSERT(!zcl_dev_proof_build_identity_v1_capture("/", &refused, NULL, 0));
+        ASSERT(!zcl_dev_proof_build_identity_v1_capture(root_a, NULL, NULL, 0));
+        const char *invalid_mutations[] = {
+            NULL, "", "not-a-mutation",
+            "111111111111111111111111111111111111111111111111111111111111111",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        };
+        for (size_t i = 0; i < sizeof(invalid_mutations) /
+                                  sizeof(invalid_mutations[0]); i++) {
+            ASSERT(ic_write_build_plan_mutation(root_a, epoch_a, compiler_id_a,
+                "-O2", invalid_mutations[i], NULL));
+            ASSERT(!zcl_dev_proof_build_identity_v1_capture(root_a, &refused,
+                                                           NULL, 0));
+            ASSERT(!zcl_dev_proof_build_plan_verify(root_a, &a, mutation_a,
+                                                     why, sizeof(why)));
+            ASSERT(strstr(why, "unavailable") != NULL);
+        }
+        /* Even identical duplicate bindings are ambiguous and refused. */
+        ASSERT(ic_write_build_plan_mutation(root_a, epoch_a, compiler_id_a,
+            "-O2", mutation_a,
+            "BASE_GENERATION=1111111111111111111111111111111111111111111111111111111111111111\n"));
+        ASSERT(!zcl_dev_proof_build_identity_v1_capture(root_a, &refused, NULL, 0));
+        ASSERT(!zcl_dev_proof_build_plan_verify(root_a, &a, mutation_a,
+                                                 why, sizeof(why)));
+        ASSERT(strstr(why, "unavailable") != NULL);
+        /* The four roots this box puts in a receipt, printed so two boxes
+         * can be compared without either running a proof. */
+        char compiler_hex[65], flags_hex[65], environment_hex[65];
+        char build_graph_hex[65];
+        zcl_hex_encode(a.compiler, 32, compiler_hex);
+        zcl_hex_encode(a.flags, 32, flags_hex);
+        zcl_hex_encode(a.environment, 32, environment_hex);
+        zcl_hex_encode(a.build_graph, 32, build_graph_hex);
+        printf("impact_composition: proof build identity compiler=%s "
+               "flags=%s environment=%s build_graph=%s\n",
+               compiler_hex, flags_hex, environment_hex, build_graph_hex);
+        ASSERT(test_rm_rf_recursive(root_a) == 0);
+        ASSERT(test_rm_rf_recursive(root_b) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Each root answers one question, and moving one input moves exactly one
+ * root. A root that moved for someone else's reason is a root nobody can
+ * read. */
+static int test_pw_identity_keeps_its_four_roots_apart(void)
+{
+    int failures = 0;
+    TEST("proof identity: one input moves exactly one root") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        static const char epoch[] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        static const char compiler_id[] =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        char root[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_identity", "separation");
+        struct zcl_dev_proof_build_identity_v1 baseline = {0}, moved = {0};
+        ASSERT(ic_write_build_plan(root, epoch, compiler_id, "-O2", NULL));
+        ASSERT(zcl_dev_proof_build_identity_v1_capture(root, &baseline, NULL, 0));
+        char why[160];
+
+        /* A flag the plan passes moves flags_root and nothing else. */
+        ASSERT(ic_write_build_plan(root, epoch, compiler_id, "-O0", NULL));
+        ASSERT(zcl_dev_proof_build_identity_v1_capture(root, &moved, NULL, 0));
+        ASSERT(memcmp(moved.flags, baseline.flags, 32) != 0);
+        ASSERT(memcmp(moved.compiler, baseline.compiler, 32) == 0);
+        ASSERT(memcmp(moved.environment, baseline.environment, 32) == 0);
+        ASSERT(memcmp(moved.build_graph, baseline.build_graph, 32) == 0);
+        ASSERT(!zcl_dev_proof_build_plan_verify(root, &baseline, compiler_id,
+                                                 why, sizeof(why)));
+        ASSERT(strstr(why, "flags_changed") != NULL);
+
+        /* A plan line this build has never heard of lands in the build
+         * graph. It must never be silently dropped: an input nobody hashes
+         * is an input nobody notices changing. */
+        ASSERT(ic_write_build_plan(root, epoch, compiler_id, "-O2",
+                                   "DEV_SOMETHING_NEW=1\n"));
+        ASSERT(zcl_dev_proof_build_identity_v1_capture(root, &moved, NULL, 0));
+        ASSERT(memcmp(moved.build_graph, baseline.build_graph, 32) != 0);
+        ASSERT(memcmp(moved.compiler, baseline.compiler, 32) == 0);
+        ASSERT(memcmp(moved.flags, baseline.flags, 32) == 0);
+        ASSERT(memcmp(moved.environment, baseline.environment, 32) == 0);
+
+        ASSERT(!zcl_dev_proof_build_plan_verify(root, &baseline, compiler_id,
+                                                 why, sizeof(why)));
+        ASSERT(strstr(why, "graph_changed") != NULL);
+
+        /* A plan line that is not KEY=VALUE is refused, not guessed at. */
+        ASSERT(ic_write_build_plan(root, epoch, compiler_id, "-O2",
+                                   "a line with no equals sign\n"));
+        ASSERT(!zcl_dev_proof_build_identity_v1_capture(root, &moved, NULL, 0));
+        ASSERT(ic_write_build_plan(root, epoch, compiler_id, "-O2", NULL));
+
+        /* An environment variable that reaches the compiler without going
+         * through a flag moves environment_root and nothing else. */
+        const char *saved_cflags = getenv("CFLAGS");
+        char restore_cflags[4096] = {0};
+        if (saved_cflags)
+            snprintf(restore_cflags, sizeof(restore_cflags), "%s",
+                     saved_cflags);
+        ASSERT(setenv("CFLAGS", "-fsanitize=undefined", 1) == 0);
+        ASSERT(zcl_dev_proof_build_identity_v1_capture(root, &moved, NULL, 0));
+        ASSERT(memcmp(moved.environment, baseline.environment, 32) != 0);
+        ASSERT(memcmp(moved.compiler, baseline.compiler, 32) == 0);
+        ASSERT(memcmp(moved.flags, baseline.flags, 32) == 0);
+        ASSERT(memcmp(moved.build_graph, baseline.build_graph, 32) == 0);
+        if (saved_cflags)
+            ASSERT(setenv("CFLAGS", restore_cflags, 1) == 0);
+        else
+            ASSERT(unsetenv("CFLAGS") == 0);
+
+        /* PATH moves nothing. It used to move environment_root, which is
+         * why two boxes with one toolchain could never agree; the compiler
+         * is identified by the bytes of the driver it resolves, not by the
+         * search order that would have found it. */
+        const char *saved_path = getenv("PATH");
+        char restore_path[8192] = {0}, reordered[8192];
+        ASSERT(saved_path != NULL);
+        snprintf(restore_path, sizeof(restore_path), "%s", saved_path);
+        ASSERT(snprintf(reordered, sizeof(reordered), "/nonexistent-probe:%s",
+                        restore_path) < (int)sizeof(reordered));
+        ASSERT(setenv("PATH", reordered, 1) == 0);
+        ASSERT(zcl_dev_proof_build_identity_v1_capture(root, &moved, NULL, 0));
+        ASSERT(setenv("PATH", restore_path, 1) == 0);
+        ASSERT(memcmp(&moved, &baseline, sizeof(moved)) == 0);
+
+        /* A different compiler binary still moves compiler_root: the
+         * capsule carries the driver's bytes, so replacing the driver
+         * changes the root even though no path changed. */
+        struct vcs_toolchain_capsule_v1 capsule, swapped;
+        uint8_t here[32], elsewhere[32];
+        ASSERT(vcs_toolchain_capsule_v1_capture(&capsule));
+        ASSERT(vcs_toolchain_capsule_v1_root(&capsule, here));
+        swapped = capsule;
+        swapped.compiler_driver_sha3[0] ^= 1u;
+        ASSERT(vcs_toolchain_capsule_v1_root(&swapped, elsewhere));
+        ASSERT(memcmp(here, elsewhere, 32) != 0);
+        ASSERT(memcmp(here, baseline.compiler, 32) == 0);
+
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A fresh `git worktree add` checkout never ran `make dev-bin`, so
+ * build/dev-loop/restart.env does not exist there yet. Two landing trains
+ * lost proof attempts to "proof_toolchain_or_policy_unavailable" without it
+ * ever naming that file or the command that produces it; this pins the
+ * exact refusal text so it cannot regress back into the umbrella reason. */
+static int test_pw_identity_names_missing_restart_env(void)
+{
+    int failures = 0;
+    TEST("proof identity: absent restart.env names the path and the fix") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_identity",
+                         "no_restart_env");
+        char expect_path[4096];
+        ASSERT(snprintf(expect_path, sizeof(expect_path),
+                        "%s/build/dev-loop/restart.env", root) <
+               (int)sizeof(expect_path));
+        struct zcl_dev_proof_build_identity_v1 identity = {0};
+        char why[256] = {0};
+        ASSERT(!zcl_dev_proof_build_identity_v1_capture(root, &identity, why,
+                                                        sizeof(why)));
+        char expect_why[512];
+        ASSERT(snprintf(expect_why, sizeof(expect_why),
+                        "restart_env_missing:%s (make dev-bin)",
+                        expect_path) < (int)sizeof(expect_why));
+        ASSERT(strcmp(why, expect_why) == 0);
+        /* A NULL why buffer must not crash the caller: it is the ordinary
+         * shape at the two donor/warm call sites that do not report why. */
+        ASSERT(!zcl_dev_proof_build_identity_v1_capture(root, &identity, NULL,
+                                                        0));
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A receipt whose roots were derived under the old meaning is named, not
+ * compared. Comparing it would ask whether a hash of a checkout path equals
+ * a hash of a toolchain. */
+static int test_ic_proof_producer_source_qualification(void)
+{
+    int failures = 0;
+    static const char candidate[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char stale[] =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    static const char zero[] =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    static const char upper[] =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    TEST("proof producer: complete source identity rejects stale selection policy") {
+        char why[128];
+        ASSERT(zcl_dev_proof_producer_source_qualified(candidate, candidate,
+                                                       why, sizeof(why)));
+        ASSERT_STR_EQ(why, "");
+        const char *compiled_source = zcl_build_source_id_sha256();
+        ASSERT(zcl_dev_proof_producer_source_qualified(compiled_source,
+            compiled_source, why, sizeof(why)));
+        /* A newly registered group and a same-ID family/impact change both
+         * change complete source identity; neither can use old metadata. */
+        ASSERT(!zcl_dev_proof_producer_source_qualified(candidate, stale,
+                                                        why, sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_producer_source_mismatch");
+        const char *invalid[] = {NULL, "", zero, upper, "abc"};
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            ASSERT(!zcl_dev_proof_producer_source_qualified(candidate,
+                invalid[i], why, sizeof(why)));
+            ASSERT_STR_EQ(why, "proof_producer_source_id_unavailable");
+        }
+        ASSERT(!zcl_dev_proof_producer_source_qualified(zero, candidate,
+                                                        why, sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_candidate_source_id_invalid");
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_proof_reply_serializes(const struct zcl_command_reply *reply);
+
+static int test_ic_proof_producer_recovery(void)
+{
+    int failures = 0;
+    TEST("proof producer: stale driver reports exact candidate producer recovery") {
+        struct zcl_dev_proof_status status = {0};
+        status.state = ZCL_DEV_PROOF_STATE_NO_VERDICT;
+        snprintf(status.root, sizeof(status.root), "/fixture/candidate");
+        snprintf(status.local_commit, sizeof(status.local_commit),
+                 "1111111111111111111111111111111111111111");
+        snprintf(status.remote_base, sizeof(status.remote_base),
+                 "2222222222222222222222222222222222222222");
+        snprintf(status.detail, sizeof(status.detail),
+                 "proof_producer_source_mismatch");
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.dev_proof_status.v1");
+        zcl_dev_proof_step_conclude(&reply, 1, &status);
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_BLOCKED);
+        ASSERT_STR_EQ(reply.error.code, "PROOF_NO_VERDICT");
+        ASSERT_STR_EQ(json_get_str(json_get(&reply.data, "status")), "no_verdict");
+        ASSERT_STR_EQ(json_get_str(json_get(&reply.data, "producer_executable")),
+                      "/fixture/candidate/build/bin/z23-dev");
+        ASSERT(strstr(reply.error.next_action, "devbuild --wait") != NULL);
+        ASSERT_STR_EQ(reply.next[0].command, "dev.proof.retry");
+        ASSERT(ic_proof_reply_serializes(&reply));
+        zcl_command_reply_free(&reply);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_receipt_refuses_an_older_root_policy(void)
+{
+    int failures = 0;
+    static const char local[] =
+        "1111111111111111111111111111111111111111";
+    static const char base[] =
+        "2222222222222222222222222222222222222222";
+    TEST("proof identity: a receipt from the old root policy is refused") {
+        struct zcl_dev_acceptance_receipt_v1 receipt =
+            ic_valid_dev_proof_receipt();
+        char why[128];
+        ASSERT(zcl_dev_proof_receipt_validate(&receipt, local, base,
+                                              why, sizeof(why)));
+        ASSERT(ZCL_DEV_PROOF_POLICY_VERSION >= 5u);
+        struct zcl_dev_acceptance_receipt_v1 old = receipt;
+        old.policy_version = 4u; /* did not qualify the compiled selector */
+        ASSERT(zcl_dev_proof_receipt_seal(&old));
+        ASSERT(!zcl_dev_proof_receipt_validate(&old, local, base,
+                                               why, sizeof(why)));
+        ASSERT(strcmp(why, "receipt_schema_old") == 0);
+        old.policy_version = 2u; /* graph still bound a host-local mutation */
+        ASSERT(zcl_dev_proof_receipt_seal(&old));
+        ASSERT(!zcl_dev_proof_receipt_validate(&old, local, base,
+                                               why, sizeof(why)));
+        ASSERT(strcmp(why, "receipt_schema_old") == 0);
+        struct zcl_dev_acceptance_receipt_v1 newer = receipt;
+        newer.policy_version = ZCL_DEV_PROOF_POLICY_VERSION + 1u;
+        ASSERT(zcl_dev_proof_receipt_seal(&newer));
+        ASSERT(!zcl_dev_proof_receipt_validate(&newer, local, base,
+                                               why, sizeof(why)));
+        ASSERT(strcmp(why, "receipt_schema_newer_than_this_build") == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The one line a developer reads beside an admitted receipt: what the
+ * sidecar warm_sidecar_write() left behind, turned into "warm-start from
+ * donor <id>" or "cold: <typed reason>" -- never prose, never a env-var
+ * name, and never silent about which of the two happened. */
+static int test_pw_status_line_reports_warm_or_typed_cold(void)
+{
+    int failures = 0;
+    TEST("proof warm start: the status line names the donor or the typed "
+        "cold reason") {
+        char root[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_warm", "statusline");
+        char sidecar[4096];
+        ASSERT(snprintf(sidecar, sizeof(sidecar), "%s/x.warmstart", root) >
+              0);
+        char line[256];
+        /* warm=1 with a donor tag reports the donor. */
+        ASSERT(ic_write(root, "x.warmstart",
+                        "zcl.dev_proof_warmstart.v1\nwarm=1\n"
+                        "donor=abc123donor\ndonor_local="
+                        "4444444444444444444444444444444444444444\n"
+                        "files_linked=12\nbytes_linked=4096\n"
+                        "compile_mode=reused\ncompile_ms=10\n"
+                        "bundle_ms=5\nreason=-\n"));
+        ASSERT(zcl_dev_proof_test_warm_status_line(sidecar, line,
+                                                   sizeof(line)));
+        ASSERT(strcmp(line, "warm-start from donor abc123donor") == 0);
+        /* warm=0 with a typed reason reports that reason, not prose. */
+        ASSERT(ic_write(root, "x.warmstart",
+                        "zcl.dev_proof_warmstart.v1\nwarm=0\ndonor=-\n"
+                        "donor_local=-\nfiles_linked=0\nbytes_linked=0\n"
+                        "compile_mode=built\ncompile_ms=9000\n"
+                        "bundle_ms=0\nreason=no_eligible_donor\n"));
+        ASSERT(zcl_dev_proof_test_warm_status_line(sidecar, line,
+                                                   sizeof(line)));
+        ASSERT(strcmp(line, "cold: no_eligible_donor") == 0);
+        /* The opt-out switch's own reason surfaces the same way. */
+        ASSERT(ic_write(root, "x.warmstart",
+                        "zcl.dev_proof_warmstart.v1\nwarm=0\ndonor=-\n"
+                        "donor_local=-\nfiles_linked=0\nbytes_linked=0\n"
+                        "compile_mode=built\ncompile_ms=9000\n"
+                        "bundle_ms=0\nreason=disabled\n"));
+        ASSERT(zcl_dev_proof_test_warm_status_line(sidecar, line,
+                                                   sizeof(line)));
+        ASSERT(strcmp(line, "cold: disabled") == 0);
+        /* A missing sidecar (no compile ran this cycle, e.g. a
+         * cycle-reused receipt) refuses rather than fabricating a line;
+         * the caller's own fixed fallback stands. */
+        char missing[4096];
+        ASSERT(snprintf(missing, sizeof(missing), "%s/none.warmstart",
+                        root) > 0);
+        ASSERT(!zcl_dev_proof_test_warm_status_line(missing, line,
+                                                     sizeof(line)));
+        /* A foreign or truncated file refuses the same way. */
+        ASSERT(ic_write(root, "x.warmstart", "not-the-right-schema\n"));
+        ASSERT(!zcl_dev_proof_test_warm_status_line(sidecar, line,
+                                                     sizeof(line)));
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The opt-out switch the production prepare gates on. Proves each
+ * spelling forces cold and that anything else (including unset) leaves
+ * warm start armed. Restores the prior value: the variable is
+ * process-global. */
+static int test_pw_disable_switch_forces_cold(void)
+{
+    int failures = 0;
+    TEST("proof warm start: opt-out switch forces cold") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        const char *prior = getenv("ZCL_DEV_PROOF_WARM");
+        char saved[256] = {0};
+        bool had = prior != NULL;
+        if (had) (void)snprintf(saved, sizeof(saved), "%s", prior);
+        unsetenv("ZCL_DEV_PROOF_WARM");
+        ASSERT(!zcl_dev_proof_warm_disabled());
+        ASSERT(setenv("ZCL_DEV_PROOF_WARM", "0", 1) == 0);
+        ASSERT(zcl_dev_proof_warm_disabled());
+        ASSERT(setenv("ZCL_DEV_PROOF_WARM", "off", 1) == 0);
+        ASSERT(zcl_dev_proof_warm_disabled());
+        ASSERT(setenv("ZCL_DEV_PROOF_WARM", "no", 1) == 0);
+        ASSERT(zcl_dev_proof_warm_disabled());
+        ASSERT(setenv("ZCL_DEV_PROOF_WARM", "1", 1) == 0);
+        ASSERT(!zcl_dev_proof_warm_disabled());
+        ASSERT(setenv("ZCL_DEV_PROOF_WARM", "", 1) == 0);
+        ASSERT(!zcl_dev_proof_warm_disabled());
+        if (had)
+            ASSERT(setenv("ZCL_DEV_PROOF_WARM", saved, 1) == 0);
+        else
+            ASSERT(unsetenv("ZCL_DEV_PROOF_WARM") == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The link/copy decision, proven against inodes. Linked outputs share the
+ * donor's inode; the test rebuilds one through staging plus rename (the
+ * epoch publisher's exact semantics) and proves the donor keeps its bytes
+ * and inode. The copied wrapper owns its inode; the test rewrites it in
+ * place and proves the donor is untouched. */
+static int test_pw_seed_links_replaces_and_copies(void)
+{
+    int failures = 0;
+    TEST("proof warm start: seed links, replace and rewrite spare donor") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], donor[4096], gen[4096], gen_src[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_warm", "seed");
+        ASSERT(snprintf(donor, sizeof(donor), "%s/donor/build", root) > 0);
+        ASSERT(snprintf(gen, sizeof(gen), "%s/gen/build", root) > 0);
+        ASSERT(snprintf(gen_src, sizeof(gen_src), "%s/gen", root) > 0);
+        ASSERT(ic_write(root, "donor/build/obj/epochs/E/mod/a.o",
+                        "OBJECT-A-V1"));
+        ASSERT(ic_write(root, "donor/build/obj/epochs/E/mod/a.d", "DEP-A"));
+        ASSERT(ic_write(root, "donor/build/obj/epochs/E/sub/b.o",
+                        "OBJECT-B-V1!"));
+        ASSERT(ic_write(root, "donor/build/bin/zcc", "WRAPPER-V1"));
+        /* Decoys the seed must never touch: live state, crash staging, and
+         * in-place outputs. The product binary is seeded — as a copy on its
+         * own inode, the executed-file rule, same as the wrapper. */
+        ASSERT(ic_write(root, "donor/build/obj/epochs/E/.build-session",
+                        "SESSION"));
+        ASSERT(ic_write(root, "donor/build/obj/epochs/E/.leases/L1",
+                        "LEASE"));
+        ASSERT(ic_write(root,
+                        "donor/build/obj/epochs/E/.stale.compile.9/p.o",
+                        "PARTIAL"));
+        ASSERT(ic_write(root, "donor/build/obj/epochs/E/mod/tool",
+                        "BINARY"));
+        ASSERT(ic_write(root, "donor/build/obj/epochs/E/mod/lib.a",
+                        "ARCHIVE"));
+        ASSERT(ic_write(root, "donor/build/obj/.hidden/x.o", "HIDDEN"));
+        ASSERT(ic_write(root, "donor/build/bin/z23-dev", "PRODUCT"));
+        ASSERT(ic_write(root, "donor/build/fuzz-obj/src/changed.d",
+                        "build/fuzz-obj/changed.o: src/changed.c\n"));
+        /* A dependency room: its dependency files must arrive on their own
+         * inodes, and its loadable module is not seeded at all. */
+        ASSERT(ic_write(root, "donor/build/hotswap/zcl_rollback_fixture_a.d",
+                        "ROOM-DEP-A"));
+        ASSERT(ic_write(root, "donor/build/hotswap/fixture.so", "MODULE"));
+        ASSERT(ic_write(root, "gen/src/changed.c",
+                        "int changed(void){return 1;}\n"));
+        ASSERT(ic_write(root, "gen/src/same.c", "int same(void){return 0;}\n"));
+        static const char *const changed[] = {"src/changed.c"};
+        struct zcl_dev_proof_warm_stats stats = {0};
+        ASSERT(zcl_dev_proof_warm_seed_and_retime(donor, gen, gen_src, true,
+                                                  changed, 1, &stats));
+        ASSERT(stats.files_linked == 6);
+        ASSERT(stats.bytes_linked == strlen("OBJECT-A-V1") +
+               strlen("DEP-A") + strlen("OBJECT-B-V1!") +
+               strlen("WRAPPER-V1") + strlen("ROOM-DEP-A") +
+               strlen("PRODUCT"));
+        char gen_fuzz[4096];
+        ASSERT(snprintf(gen_fuzz, sizeof(gen_fuzz),
+                        "%s/fuzz-obj/src/changed.d", gen) > 0);
+        ASSERT(access(gen_fuzz, F_OK) != 0);
+        char gen_a_o[4096], donor_a_o[4096], gen_zcc[4096], donor_zcc[4096];
+        ASSERT(snprintf(gen_a_o, sizeof(gen_a_o),
+                        "%s/obj/epochs/E/mod/a.o", gen) > 0);
+        ASSERT(snprintf(donor_a_o, sizeof(donor_a_o),
+                        "%s/obj/epochs/E/mod/a.o", donor) > 0);
+        ASSERT(snprintf(gen_zcc, sizeof(gen_zcc), "%s/bin/zcc", gen) > 0);
+        ASSERT(snprintf(donor_zcc, sizeof(donor_zcc), "%s/bin/zcc",
+                        donor) > 0);
+        unsigned long long gen_a_ino = 0, donor_a_ino = 0;
+        unsigned long long gen_zcc_ino = 0, donor_zcc_ino = 0;
+        ASSERT(pw_stat_ino(gen_a_o, &gen_a_ino));
+        ASSERT(pw_stat_ino(donor_a_o, &donor_a_ino));
+#if defined(__APPLE__)
+        ASSERT(gen_a_ino != donor_a_ino);
+#else
+        ASSERT(gen_a_ino == donor_a_ino);
+#endif
+        ASSERT(pw_stat_ino(gen_zcc, &gen_zcc_ino));
+        ASSERT(pw_stat_ino(donor_zcc, &donor_zcc_ino));
+        ASSERT(gen_zcc_ino != donor_zcc_ino);
+        char buf[64];
+        ASSERT(pw_read_all(gen_zcc, buf, sizeof(buf), NULL));
+        ASSERT(strcmp(buf, "WRAPPER-V1") == 0);
+        /* Hardlink isolation for the dependency room: same bytes, own inode.
+         * A shared inode here is what the landing proof's
+         * check-no-hardlink-seeding gate refused after every test group had
+         * already passed. */
+        char gen_room[4096], donor_room[4096];
+        unsigned long long gen_room_ino = 0, donor_room_ino = 0;
+        ASSERT(snprintf(gen_room, sizeof(gen_room),
+                        "%s/hotswap/zcl_rollback_fixture_a.d", gen) > 0);
+        ASSERT(snprintf(donor_room, sizeof(donor_room),
+                        "%s/hotswap/zcl_rollback_fixture_a.d", donor) > 0);
+        ASSERT(pw_stat_ino(gen_room, &gen_room_ino));
+        ASSERT(pw_stat_ino(donor_room, &donor_room_ino));
+        ASSERT(gen_room_ino != donor_room_ino);
+        ASSERT(pw_read_all(gen_room, buf, sizeof(buf), NULL));
+        ASSERT(strcmp(buf, "ROOM-DEP-A") == 0);
+        /* The product binary is copied too: seeded so a warm proof need not
+         * relink the admitted executables, owned so a relink in either tree
+         * can never reach the other's bytes. */
+        char gen_prod[4096], donor_prod[4096];
+        unsigned long long gen_prod_ino = 0, donor_prod_ino = 0;
+        ASSERT(snprintf(gen_prod, sizeof(gen_prod), "%s/bin/z23-dev",
+                        gen) > 0);
+        ASSERT(snprintf(donor_prod, sizeof(donor_prod), "%s/bin/z23-dev",
+                        donor) > 0);
+        ASSERT(pw_stat_ino(gen_prod, &gen_prod_ino));
+        ASSERT(pw_stat_ino(donor_prod, &donor_prod_ino));
+        ASSERT(gen_prod_ino != donor_prod_ino);
+        ASSERT(pw_read_all(gen_prod, buf, sizeof(buf), NULL));
+        ASSERT(strcmp(buf, "PRODUCT") == 0);
+        /* Decoys never arrive. */
+        char probe[4096];
+        static const char *const absent[] = {
+            "obj/epochs/E/.build-session",
+            "obj/epochs/E/.leases/L1",
+            "obj/epochs/E/.stale.compile.9/p.o",
+            "obj/epochs/E/mod/tool",
+            "obj/epochs/E/mod/lib.a",
+            "obj/.hidden/x.o",
+            "hotswap/fixture.so",
+        };
+        for (size_t i = 0; i < sizeof(absent) / sizeof(absent[0]); i++) {
+            ASSERT(snprintf(probe, sizeof(probe), "%s/%s", gen,
+                            absent[i]) > 0);
+            ASSERT(access(probe, F_OK) != 0);
+        }
+        /* Timestamp graph: changed is newer than the seeds, untouched
+         * sources are older. */
+        bool ok = false;
+        char changed_c[4096], same_c[4096];
+        ASSERT(snprintf(changed_c, sizeof(changed_c), "%s/src/changed.c",
+                        gen_src) > 0);
+        ASSERT(snprintf(same_c, sizeof(same_c), "%s/src/same.c",
+                        gen_src) > 0);
+        long long seed_ns = pw_mtime_ns(gen_a_o, &ok);
+        ASSERT(ok);
+        long long changed_ns = pw_mtime_ns(changed_c, &ok);
+        ASSERT(ok);
+        long long same_ns = pw_mtime_ns(same_c, &ok);
+        ASSERT(ok);
+        ASSERT(changed_ns > seed_ns);
+        ASSERT(seed_ns > same_ns);
+#if defined(__APPLE__)
+        /* A hostile build need not use the cooperative publisher. Writing
+         * the allowed path in place must still leave the donor intact. */
+        ASSERT(ic_write(root, "gen/build/obj/epochs/E/mod/a.o", "HOSTILE"));
+        ASSERT(pw_read_all(donor_a_o, buf, sizeof(buf), NULL));
+        ASSERT(strcmp(buf, "OBJECT-A-V1") == 0);
+#endif
+        /* Publisher semantics: rebuild through staging plus rename. The
+         * donor keeps its bytes and its inode; the new object diverges. */
+        ASSERT(ic_write(root, "gen/build/obj/epochs/E/mod/a.o.new",
+                        "OBJECT-A-V2"));
+        char gen_a_new[4096];
+        ASSERT(snprintf(gen_a_new, sizeof(gen_a_new),
+                        "%s/obj/epochs/E/mod/a.o.new", gen) > 0);
+        ASSERT(rename(gen_a_new, gen_a_o) == 0);
+        ASSERT(pw_read_all(donor_a_o, buf, sizeof(buf), NULL));
+        ASSERT(strcmp(buf, "OBJECT-A-V1") == 0);
+        ASSERT(pw_stat_ino(donor_a_o, &donor_a_ino));
+        ASSERT(pw_stat_ino(gen_a_o, &gen_a_ino));
+        ASSERT(gen_a_ino != donor_a_ino);
+        ASSERT(pw_read_all(gen_a_o, buf, sizeof(buf), NULL));
+        ASSERT(strcmp(buf, "OBJECT-A-V2") == 0);
+        /* Copy semantics: rewrite the new wrapper in place. The donor
+         * keeps its bytes on its own inode. */
+        FILE *rewrite = fopen(gen_zcc, "r+b");
+        ASSERT(rewrite != NULL);
+        ASSERT(fwrite("MUTATED!!!", 1, strlen("MUTATED!!!"), rewrite) ==
+               strlen("MUTATED!!!"));
+        ASSERT(fclose(rewrite) == 0);
+        ASSERT(pw_read_all(donor_zcc, buf, sizeof(buf), NULL));
+        ASSERT(strcmp(buf, "WRAPPER-V1") == 0);
+        ASSERT(pw_stat_ino(donor_zcc, &donor_zcc_ino));
+        ASSERT(pw_stat_ino(gen_zcc, &gen_zcc_ino));
+        ASSERT(gen_zcc_ino != donor_zcc_ino);
+        /* Same in-place rewrite proof for the seeded product binary. */
+        rewrite = fopen(gen_prod, "r+b");
+        ASSERT(rewrite != NULL);
+        ASSERT(fwrite("MUTATED!!!", 1, strlen("MUTATED!!!"), rewrite) ==
+               strlen("MUTATED!!!"));
+        ASSERT(fclose(rewrite) == 0);
+        ASSERT(pw_read_all(donor_prod, buf, sizeof(buf), NULL));
+        ASSERT(strcmp(buf, "PRODUCT") == 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+
+#if !defined(_WIN32)
+/* Hold an exclusive lock on `path` for `hold_ms` in a child, the way one
+ * `dev land step` holds the queue's step lock for its whole run. The pipe
+ * makes the hold observable: the parent reads one byte once the lock is
+ * actually taken, so the measurement below is never racing the fork. */
+static pid_t ic_step_lock_holder(const char *path, int hold_ms)
+{
+    int ready[2];
+    pid_t child;
+    char byte = 0;
+    if (pipe(ready) != 0) return -1;
+    child = fork();
+    if (child < 0) {
+        (void)close(ready[0]);
+        (void)close(ready[1]);
+        return -1;
+    }
+    if (child == 0) {
+        int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        (void)close(ready[0]);
+        if (fd < 0 || flock(fd, LOCK_EX) != 0) _exit(3);
+         TEST_DISCARD(write(ready[1], "1", 1));
+        (void)close(ready[1]);
+        platform_sleep_ms(hold_ms);
+        _exit(0);
+    }
+    (void)close(ready[1]);
+    if (read(ready[0], &byte, 1) != 1) byte = 0;
+    (void)close(ready[0]);
+    if (byte != '1') {
+        (void)waitpid(child, NULL, 0);
+        return -1;
+    }
+    return child;
+}
+#endif
+
+/* The resident proof worker shares the landing step lock before it claims a
+ * queued request. It used to make ONE non-blocking attempt per reactor
+ * iteration, about once a second, while every `dev land step` — including
+ * the sub-second ones that only read proof state — holds that lock
+ * exclusively for its whole run. flock() offers a non-blocking waiter no
+ * fairness and no wake on release, so a keeper stepping in a loop starved
+ * the queued proof: measured on train 53, 15 of a 27 minute landing sat
+ * between "request queued" and "attempt started" while every step answered
+ * ok. The worker now re-tries inside a bounded window and takes the lock at
+ * the release. */
+static int test_ic_landing_step_share_waits_out_a_step(void)
+{
+    int failures = 0;
+    TEST("landing proof: the step-lock share waits out a step instead of starving") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[1024], lock[1200];
+        pid_t holder;
+        int64_t started, elapsed_ms;
+        test_make_tmpdir(root, sizeof(root), "proof_step", "share");
+        ASSERT(snprintf(lock, sizeof(lock), "%s/step.lock", root) > 0 &&
+               (size_t)snprintf(lock, sizeof(lock), "%s/step.lock", root) <
+                   sizeof(lock));
+        /* An unheld lock is shared at once, whatever the window. */
+        ASSERT(zcl_dev_proof_landing_step_share(lock, 0) == 1);
+
+        /* THE DEFECT, reproduced: one non-blocking attempt against a step
+         * that is mid-run reports "busy" and hands the work back. Repeat it
+         * and it keeps reporting busy for as long as the step runs — which
+         * is what a once-a-second reactor sample did for fifteen minutes. */
+        holder = ic_step_lock_holder(lock, 700);
+        ASSERT(holder > 0);
+        ASSERT(zcl_dev_proof_landing_step_share(lock, 0) == 0);
+        ASSERT(zcl_dev_proof_landing_step_share(lock, 0) == 0);
+
+        /* THE FIX: with a window, the same call takes the lock when the step
+         * releases it. It must not return before the step is done (that
+         * would mean it never contended) and must not spend the window. */
+        started = platform_time_monotonic_us();
+        ASSERT(zcl_dev_proof_landing_step_share(lock, 30000) == 1);
+        elapsed_ms = (platform_time_monotonic_us() - started) / 1000;
+        ASSERT(elapsed_ms >= 100);
+        ASSERT(elapsed_ms < 5000);
+        ASSERT(waitpid(holder, NULL, 0) == holder);
+
+        /* A window that expires against a step still running is deferred
+         * work, not a failed proof: the reactor re-offers it. */
+        holder = ic_step_lock_holder(lock, 1500);
+        ASSERT(holder > 0);
+        ASSERT(zcl_dev_proof_landing_step_share(lock, 120) == 0);
+        ASSERT(waitpid(holder, NULL, 0) == holder);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+/* Exercise the production reader without a proof cycle or a live catalog. */
+extern bool zcl_dev_proof_test_wrapper_catalog(FILE *, char (*)[128], size_t,
+                                               size_t *);
+
+static int test_ic_wrapper_catalog_records(void)
+{
+    int failures = 0;
+    TEST("bootstrap catalog: account for complete physical records") {
+        static const char nul[] = "tools/zcc.c\0hidden bytes\n";
+        static const char license_nul[] = "license=x\0hidden bytes\n";
+        static const char partial[] = "tools/zcc.c\ntools/zcc.c\0hidden\n";
+        char continuation[267], many[13 * 12], path[129];
+        memset(continuation, 'x', 255);
+        memcpy(continuation, "license=", 8);
+        memcpy(continuation + 255, "tools/zcc.c\n", 12);
+        for (size_t i = 0; i < 13; i++)
+            memcpy(many + i * 12, "tools/zcc.c\n", 12);
+        memset(path, 'a', sizeof(path));
+        const struct { const char *bytes; size_t len; bool ok; size_t count; }
+        rows[] = {
+            {nul, sizeof(nul) - 1, false, 0},
+            {license_nul, sizeof(license_nul) - 1, false, 0},
+            {partial, sizeof(partial) - 1, false, 0},
+            {continuation, sizeof(continuation), false, 0},
+            {many, sizeof(many), false, 0},
+            {many, 12 * 12, true, 12},
+            {"license=x\r\n\r\ntools/zcc.c\r\n", 26, true, 1},
+            {"tools/zcc.c", 11, true, 1},
+            {path, 127, true, 1},
+            {path, 128, false, 0},
+            {continuation, 256, false, 0},
+            {continuation, 255, true, 0},
+            {"tools/zcc.c junk\n", 17, false, 0},
+        };
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            FILE *f = tmpfile();
+            ASSERT(f != NULL);
+            bool written = fwrite(rows[i].bytes, 1, rows[i].len, f) == rows[i].len;
+            rewind(f);
+            char inputs[12][128];
+            size_t count = 0;
+            bool ok = zcl_dev_proof_test_wrapper_catalog(f, inputs, 12, &count);
+            int closed = fclose(f);
+            ASSERT(written && closed == 0);
+            ASSERT(ok == rows[i].ok && count == rows[i].count);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The bootstrap wrapper and a dependency room file are both copy class, for
+ * two unrelated reasons: bin/zcc may only be inherited while the inputs that
+ * built it are unchanged, while a room file must be copied because the
+ * landing proof's hardlink-isolation gate requires it to own its inode. The
+ * caller's wrapper gate must therefore reach bin/zcc and nothing else: a
+ * stale wrapper is an ordinary state, and letting it also drop the room
+ * copies leaves the generation missing dependency files it never rebuilds. */
+static int test_pw_seed_room_copy_survives_a_stale_wrapper(void)
+{
+    int failures = 0;
+    TEST("proof warm start: a stale wrapper does not skip the room copies") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], donor[4096], gen[4096], gen_src[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_warm", "stale_wrapper");
+        ASSERT(snprintf(donor, sizeof(donor), "%s/donor/build", root) > 0);
+        ASSERT(snprintf(gen, sizeof(gen), "%s/gen/build", root) > 0);
+        ASSERT(snprintf(gen_src, sizeof(gen_src), "%s/gen", root) > 0);
+        ASSERT(ic_write(root, "donor/build/obj/epochs/E/mod/a.o",
+                        "OBJECT-A-V1"));
+        ASSERT(ic_write(root, "donor/build/bin/zcc", "WRAPPER-V1"));
+        ASSERT(ic_write(root, "donor/build/hotswap/zcl_rollback_fixture_a.d",
+                        "ROOM-DEP-A"));
+        ASSERT(ic_write(root, "gen/src/same.c", "int same(void){return 0;}\n"));
+        struct zcl_dev_proof_warm_stats stats = {0};
+        ASSERT(zcl_dev_proof_warm_seed_and_retime(donor, gen, gen_src, false,
+                                                  NULL, 0, &stats));
+        /* The object and the room file, and only those two. */
+        ASSERT(stats.files_linked == 2);
+        ASSERT(stats.bytes_linked ==
+               strlen("OBJECT-A-V1") + strlen("ROOM-DEP-A"));
+        char gen_zcc[4096], gen_room[4096], donor_room[4096];
+        ASSERT(snprintf(gen_zcc, sizeof(gen_zcc), "%s/bin/zcc", gen) > 0);
+        ASSERT(access(gen_zcc, F_OK) != 0);
+        ASSERT(snprintf(gen_room, sizeof(gen_room),
+                        "%s/hotswap/zcl_rollback_fixture_a.d", gen) > 0);
+        ASSERT(snprintf(donor_room, sizeof(donor_room),
+                        "%s/hotswap/zcl_rollback_fixture_a.d", donor) > 0);
+        char buf[64];
+        ASSERT(pw_read_all(gen_room, buf, sizeof(buf), NULL));
+        ASSERT(strcmp(buf, "ROOM-DEP-A") == 0);
+        unsigned long long gen_room_ino = 0, donor_room_ino = 0;
+        ASSERT(pw_stat_ino(gen_room, &gen_room_ino));
+        ASSERT(pw_stat_ino(donor_room, &donor_room_ino));
+        ASSERT(gen_room_ino != donor_room_ino);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_seed_cold_without_seedables(void)
+{
+    int failures = 0;
+    TEST("proof warm start: seed refuses empty donors") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], donor[4096], gen[4096], gen_src[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_warm", "cold");
+        ASSERT(snprintf(donor, sizeof(donor), "%s/donor/build", root) > 0);
+        ASSERT(snprintf(gen, sizeof(gen), "%s/gen/build", root) > 0);
+        ASSERT(snprintf(gen_src, sizeof(gen_src), "%s/gen", root) > 0);
+        ASSERT(ic_write(root, "donor/build/obj/epochs/E/tool", "BINARY"));
+        ASSERT(ic_write(root, "gen/src/same.c", "int same(void){return 0;}\n"));
+        struct zcl_dev_proof_warm_stats stats = {0};
+        ASSERT(!zcl_dev_proof_warm_seed_and_retime(donor, gen, gen_src, true,
+                                                   NULL, 0, &stats));
+        ASSERT(stats.files_linked == 0);
+        char probe[4096];
+        ASSERT(snprintf(probe, sizeof(probe), "%s/obj/epochs/E/tool",
+                        gen) > 0);
+        ASSERT(access(probe, F_OK) != 0);
+        ASSERT(!zcl_dev_proof_warm_seed_and_retime(NULL, gen, gen_src, true,
+                                                   NULL, 0, &stats));
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_seed_skips_removed_dev_source(void)
+{
+    int failures = 0;
+    TEST("proof warm start: removed dev source cannot donate object or depfile") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char root[4096], donor[4096], gen[4096], gen_src[4096];
+        char path[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_warm", "removed_dev");
+        ASSERT(snprintf(donor, sizeof(donor), "%s/donor/build", root) > 0);
+        ASSERT(snprintf(gen, sizeof(gen), "%s/gen/build", root) > 0);
+        ASSERT(snprintf(gen_src, sizeof(gen_src), "%s/gen", root) > 0);
+        ASSERT(ic_write(root,
+                        "donor/build/dev-obj/epochs/E/tools/dev/gone.o",
+                        "OLD-OBJECT"));
+        ASSERT(ic_write(root,
+                        "donor/build/dev-obj/epochs/E/tools/dev/gone.d",
+                        "gone.o: tools/dev/gone.c\n"));
+        ASSERT(ic_write(root,
+                        "donor/build/dev-obj/epochs/E/tools/dev/keep.o",
+                        "KEEP-OBJECT"));
+        ASSERT(ic_write(root,
+                        "donor/build/dev-obj/epochs/E/tools/dev/keep.d",
+                        "keep.o: tools/dev/keep.c\n"));
+        ASSERT(ic_write(root, "gen/tools/dev/keep.c", "int keep;\n"));
+        struct zcl_dev_proof_warm_stats stats = {0};
+        ASSERT(zcl_dev_proof_warm_seed_and_retime(donor, gen, gen_src, true,
+                                                  NULL, 0, &stats));
+        ASSERT(stats.files_linked == 2);
+        ASSERT(snprintf(path, sizeof(path),
+                        "%s/dev-obj/epochs/E/tools/dev/gone.o", gen) > 0);
+        ASSERT(access(path, F_OK) != 0);
+        ASSERT(snprintf(path, sizeof(path),
+                        "%s/dev-obj/epochs/E/tools/dev/gone.d", gen) > 0);
+        ASSERT(access(path, F_OK) != 0);
+        ASSERT(snprintf(path, sizeof(path),
+                        "%s/dev-obj/epochs/E/tools/dev/keep.o", gen) > 0);
+        ASSERT(access(path, F_OK) == 0);
+        ASSERT(snprintf(path, sizeof(path),
+                        "%s/dev-obj/epochs/E/tools/dev/keep.d", gen) > 0);
+        ASSERT(access(path, F_OK) == 0);
+        /* A reused generation can carry an orphan that the chosen donor
+         * does not have. Pruning only donor entries would miss this one. */
+        ASSERT(snprintf(path, sizeof(path),
+                        "%s/dev-obj/epochs/E/tools/dev/gone.o", donor) > 0);
+        ASSERT(unlink(path) == 0);
+        ASSERT(snprintf(path, sizeof(path),
+                        "%s/dev-obj/epochs/E/tools/dev/gone.d", donor) > 0);
+        ASSERT(unlink(path) == 0);
+        ASSERT(ic_write(root,
+                        "gen/build/dev-obj/epochs/E/tools/dev/gone.o",
+                        "STALE-OBJECT"));
+        ASSERT(ic_write(root,
+                        "gen/build/dev-obj/epochs/E/tools/dev/gone.d",
+                        "gone.o: tools/dev/gone.c\n"));
+        ASSERT(zcl_dev_proof_warm_seed_and_retime(donor, gen, gen_src, true,
+                                                  NULL, 0, &stats));
+        ASSERT(stats.files_linked == 2);
+        ASSERT(snprintf(path, sizeof(path),
+                        "%s/dev-obj/epochs/E/tools/dev/gone.o", gen) > 0);
+        ASSERT(access(path, F_OK) != 0);
+        ASSERT(snprintf(path, sizeof(path),
+                        "%s/dev-obj/epochs/E/tools/dev/gone.d", gen) > 0);
+        ASSERT(access(path, F_OK) != 0);
+        char saved_build[4096], outside_build[4096], outside_dep[4096];
+        ASSERT(snprintf(saved_build, sizeof(saved_build),
+                        "%s/gen/build-saved", root) > 0);
+        ASSERT(snprintf(outside_build, sizeof(outside_build),
+                        "%s/outside/build", root) > 0);
+        ASSERT(ic_write(root,
+                        "outside/build/dev-obj/epochs/E/tools/dev/gone.d",
+                        "OUTSIDE-DEPFILE"));
+        ASSERT(rename(gen, saved_build) == 0);
+        ASSERT(symlink(outside_build, gen) == 0);
+        ASSERT(!zcl_dev_proof_warm_seed_and_retime(donor, gen, gen_src, true,
+                                                   NULL, 0, &stats));
+        ASSERT(snprintf(outside_dep, sizeof(outside_dep),
+                        "%s/dev-obj/epochs/E/tools/dev/gone.d",
+                        outside_build) > 0);
+        ASSERT(access(outside_dep, F_OK) == 0);
+        ASSERT(unlink(gen) == 0);
+        ASSERT(rename(saved_build, gen) == 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+static bool ic_proof_environment_child(void)
+{
+    static const char *const cleared[] = {
+        "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKEOVERRIDES", "MAKEFILES",
+        "ZCL_LINT_CACHE_DUMP", "ZCL_LINT_GATES_DIR_X", "ZCL_REPO_SHAPE_ROOT",
+        "ZCL_LINT_TU_CACHE", "ZCL_LINT_TU_CACHE_DIR",
+        "ZCL_LINT_TU_CACHE_GENERATIONS", "ZCL_TEST_CACHE",
+        "ZCL_TEST_CACHE_DUMP", "ZCL_TESTCACHE_STORE_ROOT",
+    };
+    for (size_t i = 0; i < sizeof(cleared) / sizeof(cleared[0]); i++) {
+        if (setenv(cleared[i], "--just-print", 1) != 0) return false;
+    }
+    /* A value the runner would honour: reuse on, pointed at a store the
+     * candidate can write. The proof must drop both. */
+    if (setenv("ZCL_TEST_CACHE", "1", 1) != 0 ||
+        setenv("ZCL_TESTCACHE_STORE_ROOT", "/checkout", 1) != 0)
+        return false;
+    if (setenv("ZCL_LINT_CACHE", "1", 1) != 0 ||
+        setenv("ZCL_LINT_MODE", "UPDATE", 1) != 0 ||
+        !zcl_dev_proof_test_prepare_environment())
+        return false;
+    for (size_t i = 0; i < sizeof(cleared) / sizeof(cleared[0]); i++) {
+        if (getenv(cleared[i]) != NULL) return false;
+    }
+    const char *cache = getenv("ZCL_LINT_CACHE");
+    const char *mode = getenv("ZCL_LINT_MODE");
+    return cache && strcmp(cache, "0") == 0 && mode == NULL;
+}
+
+static int test_ic_proof_environment_refuses_inherited_shortcuts(void)
+{
+    int failures = 0;
+    TEST("proof environment: inherited dry-run, cache and update controls are removed") {
+        /* A child owns every injected setting, so assertion failures cannot
+         * leak make or lint controls into the harness or its sibling tests. */
+        pid_t child = fork();
+        ASSERT(child >= 0);
+        if (child == 0) _exit(ic_proof_environment_child() ? 0 : 1);
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        ASSERT(waited == child);
+        ASSERT(WIFEXITED(status));
+        ASSERT(WEXITSTATUS(status) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A store the proof may compile against: a fresh, empty, owner-only
+ * directory directly under the proof's own state directory. */
+static bool ic_private_empty_store(const char *store, const char *state)
+{
+    size_t n = strlen(state);
+    if (strncmp(store, state, n) != 0 || store[n] != '/' ||
+        strchr(store + n + 1, '/') != NULL)
+        return false;
+    struct stat st;
+    if (lstat(store, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != geteuid() || (st.st_mode & 077) != 0)
+        return false;
+    DIR *dir = opendir(store);
+    if (!dir) return false;
+    bool empty = true;
+    for (struct dirent *e = readdir(dir); e; e = readdir(dir))
+        if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0)
+            empty = false;
+    (void)closedir(dir);
+    return empty;
+}
+
+/* One proof's compile store, opened, checked and closed. Returns 0, or the
+ * step that failed so the parent can name it. */
+static bool ic_proof_compile_env_ok(void)
+{
+    const char *ccache = getenv("CCACHE_DISABLE");
+    const char *verified = getenv("ZCC_VERIFIED");
+    return ccache && strcmp(ccache, "1") == 0 && verified &&
+           strcmp(verified, "1") == 0;
+}
+
+static int ic_compile_store_round(const char *state, const char *key,
+                                  const char *shared, int step)
+{
+    char store[4096];
+    if (!zcl_dev_proof_test_prepare_environment() ||
+        !zcl_dev_proof_test_compile_store(state, key, store, sizeof(store)))
+        return step + 1;
+    if (strcmp(store, shared) == 0) return step + 2;
+    if (!ic_private_empty_store(store, state)) return step + 3;
+    if (!ic_proof_compile_env_ok()) return step + 4;
+    /* A retry of the same pair (a crashed worker's leftovers, or anything
+     * this uid wrote there since) must start from nothing again. */
+    if (!ic_write(store, "obj/ab/abcd.bin", "PLANTED") ||
+        !zcl_dev_proof_test_compile_store(state, key, store, sizeof(store)) ||
+        !ic_private_empty_store(store, state))
+        return step + 5;
+    if (!zcl_dev_proof_test_compile_store_close(state, key) ||
+        access(store, F_OK) == 0 || getenv("ZCC_DIR") != NULL ||
+        getenv("ZCC_VERIFIED") != NULL)
+        return step + 6;
+    return 0;
+}
+
+/* Both shared stores already hold an object some earlier process of this
+ * uid wrote; zcc would copy either out on a key match unread. */
+static bool ic_compile_store_fixture(const char *root, const char *home,
+                                     const char *state)
+{
+    return mkdir(state, 0700) == 0 &&
+           ic_write(root, "home/.cache/zcc/obj/ab/abcd.bin", "PLANTED") &&
+           ic_write(root, "shared-zcc/obj/ab/abcd.bin", "PLANTED") &&
+           setenv("HOME", home, 1) == 0 && unsetenv("XDG_CACHE_HOME") == 0 &&
+           unsetenv("ZCC_DIR") == 0 && unsetenv("ZCC_VERIFIED") == 0 &&
+           unsetenv("CCACHE_DISABLE") == 0;
+}
+
+/* The shared stores are someone else's to manage: left exactly as found. */
+static bool ic_shared_store_untouched(const char *store)
+{
+    char probe[4096];
+    return snprintf(probe, sizeof(probe), "%s/obj/ab/abcd.bin", store) > 0 &&
+           access(probe, F_OK) == 0;
+}
+
+static int ic_proof_compile_store_child(const char *root)
+{
+    char home[4096], state[4096], shared[4096], home_store[4096];
+    if (snprintf(home, sizeof(home), "%s/home", root) <= 0 ||
+        snprintf(state, sizeof(state), "%s/state", root) <= 0 ||
+        snprintf(shared, sizeof(shared), "%s/shared-zcc", root) <= 0 ||
+        snprintf(home_store, sizeof(home_store), "%s/.cache/zcc", home) <= 0)
+        return 1;
+    if (!ic_compile_store_fixture(root, home, state)) return 2;
+    int rc = ic_compile_store_round(state, "default", home_store, 10);
+    if (rc != 0) return rc;
+    if (setenv("ZCC_DIR", shared, 1) != 0) return 3;
+    rc = ic_compile_store_round(state, "inherited", shared, 20);
+    if (rc != 0) return rc;
+    return ic_shared_store_untouched(shared) &&
+           ic_shared_store_untouched(home_store) ? 0 : 4;
+}
+
+static int test_ic_proof_compiles_against_a_private_store(void)
+{
+    int failures = 0;
+    TEST("proof environment: compiles never read or write this uid's shared zcc store") {
+        /* The shared zcc store is keyed with the build root prefix-mapped
+         * away, so every worktree of this uid reads and writes one set of
+         * entries, and a hit is copied out unread. A candidate's Makefile
+         * or tests ran as this uid in an earlier proof and could have left
+         * an object its key's source never compiles to. */
+        char root[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_env", "zcc_store");
+        pid_t child = fork();
+        ASSERT(child >= 0);
+        if (child == 0) {
+            int rc = ic_proof_compile_store_child(root);
+            if (rc != 0)
+                fprintf(stderr, "compile store check failed at step %d\n", rc);
+            _exit(rc == 0 ? 0 : 1);
+        }
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        ASSERT(waited == child);
+        ASSERT(WIFEXITED(status));
+        ASSERT(WEXITSTATUS(status) == 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_candidate_zcc_stale_behavior_child(const char *root)
+{
+    if (setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) != 0) return false;
+    const char *argv[] = {
+        "bash", "tools/dev/fixtures/proof/stale_candidate_zcc.sh", root, NULL
+    };
+    struct zcl_devloop_process_result run = {0};
+    if (!zcl_devloop_process_run(".", argv, 30000, &run) ||
+        run.exit_code != 0 || run.output_truncated) {
+        fprintf(stderr, "candidate zcc witness execution failed: %s\n",
+                run.output);
+        return false;
+    }
+    fprintf(stderr, "%s", run.output);
+    return strstr(run.output, "RED stale candidate wrapper:") != NULL &&
+           strstr(run.output,
+               "baseline=<zcl_result: missing format> "
+               "stale=<zcl_result: missing format> "
+               "fresh=<zcl_result: missing format v2>") != NULL &&
+           strstr(run.output,
+               "RED transient link swap: final_object=fresh "
+               "executed=<zcl_result: missing format> "
+               "fresh=<zcl_result: missing format v2>") != NULL &&
+           strstr(run.output,
+               "baseline_compile=1 stale_compile=0 fresh_compile=1 "
+               "links=4 executions=4") != NULL;
+}
+
+static int test_ic_candidate_zcc_stale_behavior_red(void)
+{
+    int failures = 0;
+    TEST("proof compile: candidate wrapper can serve stale executed behavior despite ZCC_VERIFIED") {
+        char root[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_env", "candidate_zcc_red");
+        pid_t child = fork();
+        ASSERT(child >= 0);
+        if (child == 0)
+            _exit(ic_candidate_zcc_stale_behavior_child(root) ? 0 : 1);
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        ASSERT(waited == child);
+        ASSERT(WIFEXITED(status));
+        ASSERT(WEXITSTATUS(status) == 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_epoch_dep_stale_behavior_child(const char *root)
+{
+    if (setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) != 0) return false;
+    const char *argv[] = {
+        "bash", "tools/dev/fixtures/proof/stale_epoch_dep.sh", root, NULL
+    };
+    struct zcl_devloop_process_result run = {0};
+    if (!zcl_devloop_process_run(".", argv, 60000, &run) ||
+        run.exit_code != 0 || run.output_truncated) {
+        fprintf(stderr, "epoch dep witness execution failed: %s\n",
+                run.output);
+        return false;
+    }
+    fprintf(stderr, "%s", run.output);
+    return strstr(run.output,
+                  "RED donor dep substitution: epoch=") != NULL &&
+           strstr(run.output, " stale=7 fresh=9") != NULL &&
+           strstr(run.output,
+                  "donor_compile=1 stale_compile=0 "
+                  "current_preprocess=1 fresh_compile=1 "
+                  "links=2 executions=2") != NULL;
+}
+
+static int test_ic_epoch_dep_stale_behavior_red(void)
+{
+    int failures = 0;
+    TEST("proof compile: donor -MT dep substitution hides changed header from current epoch") {
+        char root[4096];
+        test_make_tmpdir(root, sizeof(root), "proof_env", "epoch_dep_red");
+        pid_t child = fork();
+        ASSERT(child >= 0);
+        if (child == 0)
+            _exit(ic_epoch_dep_stale_behavior_child(root) ? 0 : 1);
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        ASSERT(waited == child);
+        ASSERT(WIFEXITED(status));
+        ASSERT(WEXITSTATUS(status) == 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+static int test_ic_landing_proof_lint_argv(void)
+{
+    int failures = 0;
+    TEST("proof lint: landing and developer roots both run every gate") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char land[4096], wt[4096], jobs[] = "-j4";
+        const char *argv[8];
+        size_t argc = 0;
+        int64_t fallback_ms = 0;
+        const char *targets = NULL;
+
+        test_make_tmpdir(land, sizeof(land), "proof_lint", "landing");
+        ASSERT(snprintf(wt, sizeof(wt), "%s/wt", land) > 0);
+        ASSERT(mkdir(wt, 0755) == 0);
+        ASSERT(ic_write(land, "queue.lock", ""));
+        ASSERT(zcl_dev_proof_test_lint_argv(wt, jobs, argv, 8, &argc,
+                                            &fallback_ms, &targets));
+        ASSERT(argc == 6);
+        ASSERT(strcmp(argv[0], "env") == 0);
+        ASSERT(strcmp(argv[1], "ZCL_LINT_TU_CACHE=0") == 0);
+        ASSERT(strcmp(argv[2], "make") == 0);
+        ASSERT(strcmp(argv[3], "--no-print-directory") == 0);
+        ASSERT(strcmp(argv[4], jobs) == 0);
+        /* Publication coverage does not depend on a scheduling lock. */
+        ASSERT(strcmp(argv[5], "lint") == 0);
+        ASSERT(argv[6] == NULL);
+        ASSERT(fallback_ms == PROOF_LINT_LANDING_MS);
+        ASSERT(strcmp(targets, "lint") == 0);
+        ASSERT(zcl_dev_proof_test_lint_targets_are_full(targets));
+
+        char dev_parent[4096], dev[4096];
+        test_make_tmpdir(dev_parent, sizeof(dev_parent), "proof_lint", "dev");
+        ASSERT(snprintf(dev, sizeof(dev), "%s/wt", dev_parent) > 0);
+        ASSERT(mkdir(dev, 0755) == 0);
+        argc = 0;
+        fallback_ms = 0;
+        targets = NULL;
+        ASSERT(zcl_dev_proof_test_lint_argv(dev, jobs, argv, 8, &argc,
+                                            &fallback_ms, &targets));
+        ASSERT(argc == 6);
+        ASSERT(strcmp(argv[0], "env") == 0);
+        ASSERT(strcmp(argv[1], "ZCL_LINT_TU_CACHE=0") == 0);
+        ASSERT(strcmp(argv[2], "make") == 0);
+        ASSERT(strcmp(argv[3], "--no-print-directory") == 0);
+        ASSERT(strcmp(argv[4], jobs) == 0);
+        ASSERT(strcmp(argv[5], "lint") == 0);
+        ASSERT(argv[6] == NULL);
+        ASSERT(fallback_ms == PROOF_LINT_LANDING_MS);
+        ASSERT(strcmp(targets, "lint") == 0);
+        ASSERT(zcl_dev_proof_test_lint_targets_are_full(targets));
+
+        ASSERT(test_rm_rf_recursive(land) == 0);
+        ASSERT(test_rm_rf_recursive(dev_parent) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Full lint inside a generation reads built artifacts -- the `lint:`
+ * umbrella's own prerequisites and check-capability-closure's nm walk --
+ * so the lint dimension has to be handed the same executables the test
+ * dimension is handed. When the two sets drifted, a landing judged
+ * `make lint` against artifacts the submitting checkout's own lint never
+ * saw. One table serves both dimensions; this pins that it stays one. */
+static int test_ic_proof_lint_and_test_share_admitted_executables(void)
+{
+    int failures = 0;
+    TEST("proof admission: the lint dimension gets exactly the test "
+         "dimension's admitted executables") {
+        const char *sources[8] = {0};
+        const char *targets[8] = {0};
+        size_t count = zcl_dev_proof_test_admitted_executables(sources,
+                                                               targets, 8);
+        ASSERT(count == 3);
+        /* Both dimensions read this one table, so equality is structural:
+         * a second reader of the same table cannot see a different set. */
+        const char *again_sources[8] = {0};
+        const char *again_targets[8] = {0};
+        ASSERT(zcl_dev_proof_test_admitted_executables(again_sources,
+                                                       again_targets, 8) ==
+               count);
+        for (size_t i = 0; i < count; i++) {
+            ASSERT(strcmp(sources[i], again_sources[i]) == 0);
+            ASSERT(strcmp(targets[i], again_targets[i]) == 0);
+        }
+        /* The confined package verifier and build/bin/z23-dev are what
+         * check-capability-closure walks and what Makefile's `lint:` line
+         * names as prerequisites; build/bin/zclassic23 is the alias the
+         * CLI groups exec. Every one is a path under the generation, and
+         * every source is a path under the submitting checkout. */
+        bool has_verifier = false, has_dev_node = false, has_alias = false;
+        for (size_t i = 0; i < count; i++) {
+            ASSERT(strncmp(targets[i], "build/bin/", 10) == 0);
+            ASSERT(strncmp(sources[i], "build/bin/", 10) == 0);
+            ASSERT(strstr(targets[i], "..") == NULL);
+            if (strcmp(targets[i],
+                       "build/bin/zclassic23-package-verify-dev") == 0)
+                has_verifier = true;
+            if (strcmp(targets[i], "build/bin/z23-dev") == 0)
+                has_dev_node = true;
+            if (strcmp(targets[i], "build/bin/zclassic23") == 0)
+                has_alias = true;
+        }
+        ASSERT(has_verifier);
+        ASSERT(has_dev_node);
+        ASSERT(has_alias);
+        /* A caller with no room for the whole set is refused rather than
+         * handed a truncated one. */
+        ASSERT(zcl_dev_proof_test_admitted_executables(sources, targets,
+                                                       count - 1) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+
+/* Both proof dimensions live in ONE generation worktree, so any target both
+ * can build is a target both can LINK AT ONCE -- and a link unlinks its
+ * output before writing it. That is how a landing proof's lint-gate shard
+ * exec'd a half-written build/bin/z23-lint and got rc=127 twice: the lint
+ * dimension's nested standalone-tools make was relinking it while the test
+ * dimension was reading it. The fix is structural, so pin it structurally:
+ * one pre-fork step builds the whole shared set, and the lint dimension's
+ * argv names nothing the pre-fork step already built. */
+static bool ic_argv_has(const char *const *argv, const char *want)
+{
+    for (size_t i = 0; argv[i]; i++)
+        if (strcmp(argv[i], want) == 0) return true;
+    return false;
+}
+
+/* land seq187 touched tools/sensors/clang_manifest*.c, so its exact plan
+ * selected the three live sensor groups; the generation never built
+ * build/bin/z23-clang-manifest, all three self-skipped, and the suite
+ * accounting refused the proof -- correctly, and forever. A selection that
+ * carries a group whose declared need is a BUILD makes the proof build that
+ * target in its own generation before the test step; a selection without one
+ * builds nothing extra. */
+static int test_ic_proof_test_needs_build_the_sensor(void)
+{
+    int failures = 0;
+    TEST("proof test needs: a selected sensor group builds clang-manifest "
+         "in the generation; an ordinary selection builds nothing extra") {
+        const char *argv[PROOF_TEST_NEEDS_ARGV_CAP];
+        size_t targets = 99;
+        char jobs[] = "-j4";
+
+        ASSERT(zcl_dev_proof_test_needs_argv(
+            jobs, "test_impact_composition,test_semantic_sensor", argv,
+            PROOF_TEST_NEEDS_ARGV_CAP, &targets));
+        ASSERT(targets == 1);
+        ASSERT(argv[0] && strcmp(argv[0], "make") == 0);
+        ASSERT(argv[1] && strcmp(argv[1], "--no-print-directory") == 0);
+        ASSERT(argv[2] && strcmp(argv[2], jobs) == 0);
+        ASSERT(argv[3] && strcmp(argv[3], "clang-manifest") == 0);
+        ASSERT(argv[4] == NULL);
+
+        /* All three live sensor groups need the one target, named once. */
+        targets = 99;
+        ASSERT(zcl_dev_proof_test_needs_argv(
+            jobs,
+            "test_semantic_facts_live,test_semantic_sensor,"
+            "test_semantic_consumer_live",
+            argv, PROOF_TEST_NEEDS_ARGV_CAP, &targets));
+        ASSERT(targets == 1);
+        ASSERT(ic_argv_has(argv, "clang-manifest"));
+        ASSERT(argv[4] == NULL);
+
+        /* No selected group needs a build: no step, no extra cost. The
+         * clang-free sibling groups read checked-in manifests only. */
+        targets = 99;
+        ASSERT(zcl_dev_proof_test_needs_argv(
+            jobs, "test_impact_composition,test_semantic_manifest,"
+                  "test_semantic_facts,test_semantic_consumer",
+            argv, PROOF_TEST_NEEDS_ARGV_CAP, &targets));
+        ASSERT(targets == 0);
+        ASSERT(argv[0] == NULL);
+        /* The inventory-only selector spells its one group prefixless. */
+        targets = 99;
+        ASSERT(zcl_dev_proof_test_needs_argv(jobs, "code_inventory", argv,
+                                             PROOF_TEST_NEEDS_ARGV_CAP,
+                                             &targets));
+        ASSERT(targets == 0);
+
+        /* A group that is not registered is a refusal, never "no need". */
+        ASSERT(!zcl_dev_proof_test_needs_argv(
+            jobs, "test_semantic_sensor,test_no_such_group_at_all", argv,
+            PROOF_TEST_NEEDS_ARGV_CAP, &targets));
+        /* Refused, never truncated, when the caller has no room. */
+        ASSERT(!zcl_dev_proof_test_needs_argv(jobs, "test_semantic_sensor",
+                                              argv, 4, &targets));
+        ASSERT(!zcl_dev_proof_test_needs_argv(NULL, "test_semantic_sensor",
+                                              argv, PROOF_TEST_NEEDS_ARGV_CAP,
+                                              &targets));
+        ASSERT(!zcl_dev_proof_test_needs_argv(jobs, NULL, argv,
+                                              PROOF_TEST_NEEDS_ARGV_CAP,
+                                              &targets));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The fleet gateway shards exec two binaries the tree builds: the gateway
+ * and the node by its compatibility name. The proof admits the node at that
+ * path (content-checked) and its prefork step always builds fbsh, so its
+ * test-needs step builds only the gateway and never relinks either;
+ * test_freebsd_sh adds nothing; the strict CLI group also needs zcl-rpc. */
+static int test_ic_proof_test_needs_leave_provided_tools(void)
+{
+    int failures = 0;
+    TEST("proof test needs: fleet gateway shards build only the gateway; "
+         "admitted and prefork-built needs are never rebuilt") {
+        const char *argv[PROOF_TEST_NEEDS_ARGV_CAP];
+        size_t targets = 99;
+        char jobs[] = "-j4";
+
+        ASSERT(zcl_dev_proof_test_needs_argv(
+            jobs, "test_fleet_gateway_shard_01,test_fleet_gateway_shard_06",
+            argv, PROOF_TEST_NEEDS_ARGV_CAP, &targets));
+        ASSERT(targets == 1);
+        ASSERT(argv[3] && strcmp(argv[3], "fleet-gateway") == 0);
+        ASSERT(argv[4] == NULL);
+        ASSERT(!ic_argv_has(argv, "zclassic23"));
+
+        targets = 99;
+        ASSERT(zcl_dev_proof_test_needs_argv(
+            jobs,
+            "test_freebsd_sh,test_cli_auth_robust,test_cli_argv_strict,"
+            "test_importblockindex_cli_dispatch,test_fleet_gateway,test_engine",
+            argv, PROOF_TEST_NEEDS_ARGV_CAP, &targets));
+        ASSERT(targets == 1);
+        ASSERT(argv[3] && strcmp(argv[3], "zcl-rpc") == 0);
+        ASSERT(argv[4] == NULL);
+        ASSERT(!ic_argv_has(argv, "zclassic23"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Is `target` among needs[0..n)? */
+static bool ic_needs_have(const struct zcl_test_group_host_need *needs,
+                          size_t n, const char *target, const char *value)
+{
+    for (size_t k = 0; k < n; k++)
+        if (strcmp(needs[k].target, target) == 0 &&
+            strcmp(needs[k].value, value) == 0)
+            return true;
+    return false;
+}
+
+/* A BUILD row the proof argv must name: not a prefork helper and not an
+ * admitted executable. Both exclusions live in the producer. */
+static bool ic_proof_target_wanted(const struct zcl_test_group_host_need *row)
+{
+    return row->target != NULL && row->value != NULL &&
+           !zcl_dev_proof_need_already_provided(row->target, row->value);
+}
+
+static bool ic_argv_names_unique(const char *const *argv, size_t targets)
+{
+    for (size_t i = 0; i < targets; i++) {
+        if (argv[i + 3] == NULL)
+            return false;
+        for (size_t j = i + 1; j < targets; j++) {
+            if (argv[j + 3] == NULL)
+                return false;
+            if (strcmp(argv[i + 3], argv[j + 3]) == 0)
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool ic_need_in_proof_argv(const struct zcl_test_group_host_need *needs,
+                                  size_t n, const char *name)
+{
+    if (name == NULL)
+        return false;
+    for (size_t k = 0; k < n; k++) {
+        if (!ic_proof_target_wanted(&needs[k]))
+            continue;
+        if (strcmp(needs[k].target, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* The proof argv for the whole catalog is exactly the distinct BUILD targets
+ * the selector would build, minus needs the proof already provides. */
+static bool ic_catalog_matches_proof_argv(const char *const *argv,
+                                          size_t targets)
+{
+    struct zcl_test_group_host_need needs[PROOF_TEST_NEEDS_ARGV_CAP];
+    size_t n = 0;
+    size_t want = 0;
+    if (!zcl_test_selection_build_needs(NULL, false, NULL, needs,
+                                        PROOF_TEST_NEEDS_ARGV_CAP, &n))
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        if (!ic_proof_target_wanted(&needs[i]))
+            continue;
+        if (!ic_argv_has(argv, needs[i].target))
+            return false;
+        want++;
+    }
+    if (want != targets || !ic_argv_names_unique(argv, targets))
+        return false;
+    for (size_t i = 0; i < targets; i++) {
+        if (!ic_need_in_proof_argv(needs, n, argv[i + 3]))
+            return false;
+    }
+    return argv[targets + 3] == NULL;
+}
+
+/* Distinct BUILD targets in the whole catalog, including ones a proof argv
+ * leaves out because it already provides them. */
+static size_t ic_whole_catalog_build_count(void)
+{
+    struct zcl_test_group_host_need needs[PROOF_TEST_NEEDS_ARGV_CAP];
+    size_t n = 0;
+    if (!zcl_test_selection_build_needs(NULL, false, NULL, needs,
+                                        PROOF_TEST_NEEDS_ARGV_CAP, &n))
+        return 0;
+    return n;
+}
+
+/* A universal proof must fit every declared helper, not just the old eight
+ * target allowance. Exercise the producer's argv seam, including exclusions. */
+static int test_ic_proof_test_needs_whole_catalog(void)
+{
+    int failures = 0;
+    TEST("proof test needs: whole catalog has its exact helper closure and refuses truncation") {
+        static char selector[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS *
+                             (ZCL_TEST_GROUP_FULL_MAX + 1)];
+        size_t used = 0;
+        for (size_t i = 0; i < zcl_test_group_catalog_count(); i++) {
+            int n = snprintf(selector + used, sizeof(selector) - used,
+                             "%s%s", i ? "," : "",
+                             zcl_test_group_catalog_at(i));
+            ASSERT(n > 0 && (size_t)n < sizeof(selector) - used);
+            used += (size_t)n;
+        }
+        const char *argv[PROOF_TEST_NEEDS_ARGV_CAP];
+        size_t targets = 99;
+        size_t expected_count = 0;
+        ASSERT(zcl_dev_proof_test_needs_argv("-j4", selector, argv,
+                                           PROOF_TEST_NEEDS_ARGV_CAP, &targets));
+        ASSERT(ic_catalog_matches_proof_argv(argv, targets));
+        expected_count = targets;
+        ASSERT(strcmp(argv[0], "make") == 0);
+        ASSERT(strcmp(argv[1], "--no-print-directory") == 0);
+        ASSERT(strcmp(argv[2], "-j4") == 0);
+        ASSERT(argv[targets + 3] == NULL);
+        ASSERT(!ic_argv_has(argv, "dev-bin"));
+        ASSERT(!ic_argv_has(argv, "dev-package-verifier-ensure"));
+        ASSERT(!ic_argv_has(argv, "zclassic23"));
+        ASSERT(!ic_argv_has(argv, "engine-unit"));
+        ASSERT(!ic_argv_has(argv, "fbsh"));
+        ASSERT(zcl_dev_proof_test_needs_argv("-j4", selector, argv,
+                                           expected_count + 4, &targets));
+        ASSERT(targets == expected_count && argv[targets + 3] == NULL);
+        int repeated = snprintf(selector + used, sizeof(selector) - used,
+                                ",test_rpc,test_jsonq,test_semantic_sensor");
+        ASSERT(repeated > 0 && (size_t)repeated < sizeof(selector) - used);
+        ASSERT(zcl_dev_proof_test_needs_argv("-j4", selector, argv,
+                                           expected_count + 4, &targets));
+        ASSERT(targets == expected_count && argv[targets + 3] == NULL);
+        ASSERT(!zcl_dev_proof_test_needs_argv("-j4", selector, argv,
+                                            expected_count + 3, &targets));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_gate_everything(const char *group)
+{
+    (void)group;
+    return true;
+}
+
+/* The local runner's --list-build-needs: the Make targets a selection's
+ * groups declare, each once, from the table the proof reads -- and nothing
+ * at all for a selection that declares none, so an ordinary run pays no
+ * build. */
+static int test_ic_build_need_umbrella_fold(void)
+{
+    int failures = 0;
+    TEST("proof selection: shard folds its umbrella without a built helper") {
+        /* Supported hosts admit the missing BUILD need; Windows declares no
+         * verifier need. Both must retain the shard and fold its umbrella. */
+        ASSERT(ic_host_need_bare_root(IC_FIX_HOST_BARE));
+        struct zcl_devloop_plan plan = {0};
+        plan.closure_universal = true;
+        static char selector[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS *
+                             (ZCL_TEST_GROUP_FULL_MAX + 1)];
+        char gated[PROOF_HOST_GATED_MAX];
+        uint32_t selected = 0;
+        ASSERT(zcl_dev_proof_test_build_test_selector(
+            &plan, IC_FIX_HOST_BARE, false, selector, sizeof(selector),
+            &selected, gated, sizeof(gated)));
+        ASSERT(ic_selector_has(selector, "test_zcode_swarm_net_shard_01"));
+        ASSERT(strstr(gated, "test_zcode_swarm_net_shard_01") == NULL);
+        ASSERT(!ic_selector_has(selector, "test_zcode_swarm_net"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_pr69_sensor_maps(const char *path, const char *group)
+{
+    struct agent_impact_acc acc = {0};
+    if (!agent_impact_apply_shared_rules(path, &acc)) return false;
+    for (size_t i = 0; i < acc.groups_len; i++)
+        if (strcmp(acc.groups[i], group) == 0) return true;
+    return false;
+}
+
+static int test_ic_pr69_sensor_routes(void)
+{
+    int failures = 0;
+    TEST("semantic sensor helper changes retain their registered runtime floor") {
+        ASSERT(ic_pr69_sensor_maps("tests/harness/src/semantic_sensor_probe.c", "semantic_sensor"));
+        ASSERT(ic_pr69_sensor_maps("tests/harness/src/semantic_sensor_identity.c", "semantic_sensor"));
+        ASSERT(ic_pr69_sensor_maps("tests/harness/src/semantic_sensor_session.c", "semantic_sensor"));
+        ASSERT(ic_pr69_sensor_maps("tests/harness/src/semantic_sensor_session.c", "semantic_manifest"));
+        ASSERT(!ic_pr69_sensor_maps("tests/harness/src/unknown_sensor_probe.c", "semantic_sensor"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static bool ic_tool_path_maps(const char *path, const char *group)
+{
+    struct agent_impact_acc acc = {0};
+    if (!agent_impact_apply_shared_rules(path, &acc)) return false;
+    for (size_t i = 0; i < acc.groups_len; i++)
+        if (strcmp(acc.groups[i], group) == 0) return true;
+    return false;
+}
+
+static int test_ic_metaverse_view_state_routes(void)
+{
+    int failures = 0;
+    TEST("metaverse view source and header select the state contract") {
+        struct agent_impact_acc source = {0}, header = {0};
+        ASSERT(agent_impact_apply_shared_rules(
+            "contexts/commons/modules/metaverse/src/property_view.c", &source));
+        ASSERT(agent_impact_apply_shared_rules(
+            "contexts/commons/modules/metaverse/include/metaverse/property_view.h",
+            &header));
+        ASSERT(!source.groups_lost && !header.groups_lost);
+        ASSERT(ic_acc_has_group(&source, "metaverse_view_state"));
+        ASSERT(ic_acc_has_group(&header, "metaverse_view_state"));
+        ASSERT(ic_acc_has_group(&source, "metaverse_catalog"));
+        ASSERT(ic_acc_has_group(&source, "make_lint_gates"));
+        ASSERT(ic_acc_has_group(&header, "make_lint_gates"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_app_sync_wire_route(void)
+{
+    int failures = 0;
+    TEST("impact composition: an App sync wire edit selects its regression") {
+        const char *files[] = {
+            "engine/modules/appsync/src/app_event_sync_wire.c",
+        };
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(!plan.closure_universal);
+        ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                           "app_event_sync"));
+        static char selector[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS *
+                             (ZCL_TEST_GROUP_FULL_MAX + 1)];
+        char gated[PROOF_HOST_GATED_MAX];
+        uint32_t selected = 0;
+        ASSERT(zcl_dev_proof_test_build_test_selector(
+            &plan, ".", false, selector, sizeof(selector), &selected,
+            gated, sizeof(gated)));
+        ASSERT(ic_selector_has(selector, "test_app_event_sync"));
+        ASSERT(gated[0] == '\0');
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_app_sync_service_route(void)
+{
+    int failures = 0;
+    TEST("impact composition: a service-only App sync edit selects availability") {
+        const char *path = "engine/services/src/app_event_sync.c";
+        struct agent_impact_acc impact = {0};
+        bool consensus_risk = true;
+        ASSERT_STR_EQ(zcl_native_code_route_for_path(path, &impact,
+                                                    &consensus_risk),
+                      "app_event_sync");
+        ASSERT(!consensus_risk);
+        ASSERT(!impact.groups_lost);
+        ASSERT(ic_acc_has_group(&impact, "app_event_sync"));
+        ASSERT(ic_acc_has_group(&impact, "make_lint_gates"));
+        const char *files[] = {path};
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(!plan.closure_universal);
+        ASSERT(ic_group_in(plan.path_groups, plan.path_groups_len,
+                           "app_event_sync"));
+        static char selector[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS *
+                             (ZCL_TEST_GROUP_FULL_MAX + 1)];
+        char gated[PROOF_HOST_GATED_MAX];
+        uint32_t selected = 0;
+        ASSERT(zcl_dev_proof_test_build_test_selector(
+            &plan, ".", false, selector, sizeof(selector), &selected,
+            gated, sizeof(gated)));
+        ASSERT(ic_selector_has(selector, "test_app_event_sync"));
+        ASSERT(gated[0] == '\0');
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_snapshot_tool_routes(void)
+{
+    int failures = 0;
+    TEST("snapshot tool source and acceptance have an explicit group route") {
+        ASSERT(ic_tool_path_maps("engine/services/src/snapshot_offer.c",
+                                "snapshot_sync_service"));
+        ASSERT(ic_tool_path_maps("engine/services/src/snapshot_offer.c",
+                                "make_lint_gates"));
+        ASSERT(ic_tool_path_maps("tools/export_snapshot.c", "export_snapshot"));
+        ASSERT(ic_tool_path_maps("tests/harness/src/test_export_snapshot.c", "export_snapshot"));
+        ASSERT(!ic_tool_path_maps("tools/unknown_snapshot_tool.c", "export_snapshot"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_local_selection_build_needs(void)
+{
+    int failures = 0;
+    TEST("local build needs: a selection lists exactly its groups' BUILD "
+         "targets once; an ordinary selection lists none") {
+        struct zcl_test_group_host_need needs[PROOF_TEST_NEEDS_ARGV_CAP];
+        size_t n = 99;
+#if defined(_WIN32)
+        /* The ensure target is a no-op where no verifier is qualified. */
+        const size_t verifier_needs = 0;
+        const size_t soak_needs = 0;
+#else
+        const size_t verifier_needs = 1;
+        const size_t soak_needs = 1;
+#endif
+
+        static const char *const fixture_paths[] = {
+            NULL,
+#if defined(__linux__)
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_canary.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_green.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_regress.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_loop.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_segv.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_socket.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_wx.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_pidfd.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_killparent.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_forkctor.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_forkstory.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_execctor.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_execstory.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_dupframe.so",
+            "build/fixtures/reflex_runner/zcl_reflex_fixture_reapclose.so",
+#if defined(__x86_64__)
+            "build/fixtures/reflex_runner/zcl_reflex_pure_1.so",
+            "build/fixtures/reflex_runner/zcl_reflex_pure_1.so.story.o",
+            "build/fixtures/reflex_runner/zcl_reflex_pure_2.so",
+            "build/fixtures/reflex_runner/zcl_reflex_pure_2.so.story.o",
+#endif
+#endif
+#if !defined(_WIN32)
+            "build/fixtures/rcc_child",
+            "build/fixtures/rcc_child_dyn",
+#endif
+        };
+        const size_t fixture_needs = sizeof(fixture_paths) / sizeof(fixture_paths[0]) - 1;
+#if defined(__linux__) && defined(__x86_64__)
+        const size_t pure_needs = 2;
+#else
+        const size_t pure_needs = 0;
+#endif
+
+        static const char *const verifier_groups[] = {
+            "test_zcode_verify", "test_zcode_package_registry", "test_zcode_add",
+            "test_zcode_package_dev", "test_zcode_package_dev_shard_01",
+            "test_zcode_package_dev_shard_02", "test_zcode_package_dev_shard_03",
+            "test_resident_launch_contract", "test_build_fabric",
+            "test_build_fabric_attach", "test_zcode_dev_objects",
+            "test_fastobj_carrier", "test_zcode_swarm_net",
+            "test_zcode_swarm_net_shard_01"
+        };
+        ASSERT(zcl_test_selection_build_needs("test_zcode_store", true, NULL,
+                                              needs, 19, &n));
+        ASSERT(n == 0);
+        for (size_t i = 0; i < sizeof(verifier_groups) / sizeof(verifier_groups[0]); i++) {
+            ASSERT(zcl_test_selection_build_needs(verifier_groups[i], true,
+                                                  NULL, needs, 19, &n));
+            bool swarm = strcmp(verifier_groups[i], "test_zcode_swarm_net") == 0 ||
+                strcmp(verifier_groups[i], "test_zcode_swarm_net_shard_01") == 0;
+            ASSERT(n == verifier_needs + (swarm ? pure_needs : 0));
+            ASSERT(ic_needs_have(needs, n, "dev-package-verifier-ensure",
+                                 "build/bin/zclassic23-package-verify-dev") ==
+                   (verifier_needs != 0));
+        }
+        ASSERT(zcl_test_selection_build_needs(
+            "test_zcode_store,test_zcode_verify,test_zcode_add", true, NULL,
+            needs, 19, &n));
+        ASSERT(n == verifier_needs);
+
+        /* Static partition assigns the lifecycle builder to shard_01. */
+        ASSERT(zcl_test_selection_build_needs(
+            "test_zcode_swarm_net_shard_02,test_zcode_swarm_net_shard_03,"
+            "test_zcode_swarm_net_shard_04,test_zcode_swarm_net_shard_05",
+            true, NULL, needs, 19, &n));
+        ASSERT(n == 0);
+
+        ASSERT(zcl_test_selection_build_needs("test_engine", true, NULL,
+                                              needs, 19, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "engine-unit",
+                             "build/bin/zclassic23-engine-unit"));
+        n = 99;
+
+        /* The operator contract exercises the real native claim CLI. */
+        ASSERT(zcl_test_selection_build_needs("test_make_lint_gates_realroot",
+                                              true, NULL, needs, 19, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "dev-bin", "build/bin/z23-dev"));
+        n = 99;
+
+        ASSERT(zcl_test_selection_build_needs("test_fleet_gateway_shard_01",
+                                              false, NULL, needs, 19, &n));
+        ASSERT(n == 2);
+        ASSERT(ic_needs_have(needs, n, "fleet-gateway",
+                             "build/bin/z23-fleet-gateway"));
+        ASSERT(ic_needs_have(needs, n, "zclassic23", "build/bin/zclassic23"));
+
+        /* Six shards and the base group: still two targets, named once. */
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("fleet_gateway", false, NULL,
+                                              needs, 19, &n));
+        ASSERT(n == 2);
+
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs(
+            "test_semantic_sensor,test_freebsd_sh", true, NULL, needs, 19,
+            &n));
+        ASSERT(n == 2);
+        ASSERT(ic_needs_have(needs, n, "clang-manifest",
+                             "build/bin/z23-clang-manifest"));
+        ASSERT(ic_needs_have(needs, n, "fbsh", "build/bin/fbsh"));
+
+        /* The fuzz group's own sensor use is the same libclang tool, named
+         * once for this group alone: the stale-sensor trap the three live
+         * groups already closed. */
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_semantic_facts_fuzz",
+                                              true, NULL, needs, 19, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "clang-manifest",
+                             "build/bin/z23-clang-manifest"));
+
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_skycombat_qa_frames",
+                                              true, NULL, needs, 19, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "skycombat-qa-entrypoint",
+                             "build/bin/skycombat-qa-entrypoint"));
+
+        /* The POSIX CLI fixture needs exactly its runner. */
+#if !defined(_WIN32)
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_soak_runner", true, NULL,
+                                              needs, 19, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "soak_runner", "build/bin/soak_runner"));
+#endif
+
+        /* Ordinary selections: nothing to build. */
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_impact_composition", true,
+                                              NULL, needs, 19, &n));
+        ASSERT(n == 0);
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_fleet_gateway", true,
+                                              NULL, needs, 19, &n));
+        ASSERT(n == 0);
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("", false, NULL, needs, 19,
+                                              &n));
+        ASSERT(n == 0);
+
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_cli_argv_strict", true,
+                                              NULL, needs, 19, &n));
+        ASSERT(n == 2);
+        ASSERT(ic_needs_have(needs, n, "zclassic23", "build/bin/zclassic23"));
+        ASSERT(ic_needs_have(needs, n, "zcl-rpc", "build/bin/zcl-rpc"));
+
+        /* The whole catalog lists every declared target once; a gate that
+         * leaves every group out lists none. */
+        ASSERT(zcl_test_selection_build_needs("test_rvmachine_freebsd_ssh_fd",
+                                              true, NULL, needs, 1, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "machine-freebsd-ssh-fixture",
+                             "build/bin/z23-machine-freebsd-ssh"));
+        n = 99;
+        const size_t short_cap = 22 + verifier_needs + soak_needs + fixture_needs;
+        needs[short_cap] = (struct zcl_test_group_host_need){
+            .kind = ZCL_HOST_NEED_FILE, .group = "canary-group",
+            .value = "canary-value", .target = "canary-target"
+        };
+        unsigned char guard_before[sizeof needs[short_cap]];
+        memcpy(guard_before, &needs[short_cap], sizeof guard_before);
+        ASSERT(!zcl_test_selection_build_needs(NULL, false, NULL, needs, short_cap, &n));
+        ASSERT(memcmp(guard_before, &needs[short_cap], sizeof guard_before) == 0);
+        ASSERT(n == short_cap);
+        const size_t whole = ic_whole_catalog_build_count();
+        ASSERT(zcl_test_selection_build_needs(NULL, false, NULL, needs,
+                                              whole, &n));
+        ASSERT(n == whole);
+        for (size_t i = 1; i <= fixture_needs; i++)
+            ASSERT(ic_needs_have(needs, n, fixture_paths[i], fixture_paths[i]));
+        ASSERT(ic_needs_have(needs, n, "machine-freebsd-ssh-fixture",
+                             "build/bin/z23-machine-freebsd-ssh"));
+        ASSERT(ic_needs_have(needs, n, "machine-freebsd-port-fixture",
+                             "build/bin/z23-machine-freebsd-ports"));
+        ASSERT(ic_needs_have(needs, n, "machine-volume-fixture",
+                             "build/bin/z23-machine-volume-fixture"));
+        ASSERT(ic_needs_have(needs, n, "machine-geli-volume-fixture",
+                             "build/bin/z23-machine-geli-volume"));
+        ASSERT(ic_needs_have(needs, n, "soak_runner", "build/bin/soak_runner") ==
+               (soak_needs != 0));
+        ASSERT(ic_needs_have(needs, n, "dev-package-verifier-ensure",
+                             "build/bin/zclassic23-package-verify-dev") ==
+               (verifier_needs != 0));
+        ASSERT(ic_needs_have(needs, n, "dev-bin", "build/bin/z23-dev"));
+        ASSERT(ic_needs_have(needs, n, "engine-unit",
+                             "build/bin/zclassic23-engine-unit"));
+        ASSERT(ic_needs_have(needs, n, "zclassic23", "build/bin/zclassic23"));
+        ASSERT(ic_needs_have(needs, n, "tools/consensus_rule_sweep",
+                             "build/bin/consensus_rule_sweep"));
+        ASSERT(ic_needs_have(needs, n, "process-group-exec",
+                             "build/bin/process-group-exec"));
+        ASSERT(ic_needs_have(needs, n, "p2_invariant_check",
+                             "build/bin/p2_invariant_check"));
+        ASSERT(ic_needs_have(needs, n, "zclassic-cli", "build/bin/zclassic-cli"));
+        ASSERT(ic_needs_have(needs, n, "tools/gen_utxo_root_ladder",
+                             "build/bin/gen_utxo_root_ladder"));
+        ASSERT(ic_needs_have(needs, n, "export_snapshot",
+                             "build/bin/export_snapshot"));
+        ASSERT(ic_needs_have(needs, n, "jsonq", "build/bin/jsonq"));
+        ASSERT(ic_needs_have(needs, n, "sqlq", "build/bin/sqlq"));
+        ASSERT(ic_needs_have(needs, n, "crash_recovery_test",
+                             "build/bin/crash_recovery_test"));
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_crash_recovery", true,
+                                              NULL, needs, 19, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "crash_recovery_test",
+                             "build/bin/crash_recovery_test"));
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_export_snapshot", true,
+                                              NULL, needs, 19, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "export_snapshot",
+                             "build/bin/export_snapshot"));
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_sqlq", true, NULL,
+                                              needs, 19, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "sqlq", "build/bin/sqlq"));
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_rpc", true, NULL,
+                                              needs, 19, &n));
+        ASSERT(n == 2);
+        ASSERT(ic_needs_have(needs, n, "zclassic-cli", "build/bin/zclassic-cli"));
+        ASSERT(ic_needs_have(needs, n, "zclassic23", "build/bin/zclassic23"));
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs("test_utxo_root_ladder", true,
+                                              NULL, needs, 19, &n));
+        ASSERT(n == 1);
+        ASSERT(ic_needs_have(needs, n, "tools/gen_utxo_root_ladder",
+                             "build/bin/gen_utxo_root_ladder"));
+        n = 99;
+        ASSERT(zcl_test_selection_build_needs(NULL, false, ic_gate_everything,
+                                              needs, 19, &n));
+        ASSERT(n == 0);
+
+        /* Refused, never truncated, when there is no room. */
+        ASSERT(!zcl_test_selection_build_needs("test_fleet_gateway_shard_01",
+                                               false, NULL, needs, 1, &n));
+        ASSERT(!zcl_test_selection_build_needs("x", false, NULL, NULL, 16,
+                                               &n));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_prefork_builds_the_shared_targets(void)
+{
+    int failures = 0;
+    TEST("proof prefork: one step builds every target both dimensions share, "
+         "and the lint dimension is left none of them") {
+        /* Every executable the test dimension execs out of the generation,
+         * and the one lint-side target that names the rest. */
+        static const char *const helpers[] = {
+            "zcl-nodectl", "zclassic23-acme", "fbsh", "engine-unit",
+            "tools/file_size_policy", "fleet-board-bridge", "git-hook",
+            "build/bin/z23-lint",
+        };
+        const size_t helper_count = sizeof(helpers) / sizeof(helpers[0]);
+        const char *landing[PROOF_PREFORK_ARGV_CAP];
+        const char *lane[PROOF_PREFORK_ARGV_CAP];
+        char jobs[] = "-j4";
+
+        ASSERT(zcl_dev_proof_test_prefork_argv(jobs, true, landing,
+                                               PROOF_PREFORK_ARGV_CAP));
+        ASSERT(strcmp(landing[0], "make") == 0);
+        ASSERT(strcmp(landing[1], "--no-print-directory") == 0);
+        ASSERT(strcmp(landing[2], jobs) == 0);
+        size_t landing_argc = 0;
+        while (landing[landing_argc]) landing_argc++;
+        ASSERT(landing_argc == 3 + helper_count + 1);
+        for (size_t i = 0; i < helper_count; i++)
+            ASSERT(ic_argv_has(landing, helpers[i]));
+        /* The landing shape also builds what `make lint` itself would build:
+         * one Makefile target that names the umbrella's own prerequisite
+         * list, so the two can never drift apart. */
+        ASSERT(ic_argv_has(landing, "proof-lint-prebuild"));
+
+        ASSERT(zcl_dev_proof_test_prefork_argv(jobs, false, lane,
+                                               PROOF_PREFORK_ARGV_CAP));
+        size_t lane_argc = 0;
+        while (lane[lane_argc]) lane_argc++;
+        ASSERT(lane_argc == 3 + helper_count);
+        for (size_t i = 0; i < helper_count; i++)
+            ASSERT(ic_argv_has(lane, helpers[i]));
+        /* The helper's explicit no-lint shape remains bounded; ordinary
+         * publication proofs now request the full shape above. */
+        ASSERT(!ic_argv_has(lane, "proof-lint-prebuild"));
+
+        /* Refused, never truncated, when the caller has no room. */
+        ASSERT(!zcl_dev_proof_test_prefork_argv(jobs, true, landing,
+                                                PROOF_PREFORK_ARGV_CAP - 1));
+        ASSERT(!zcl_dev_proof_test_prefork_argv(NULL, true, landing,
+                                                PROOF_PREFORK_ARGV_CAP));
+        ASSERT(!zcl_dev_proof_test_prefork_argv("", true, landing,
+                                                PROOF_PREFORK_ARGV_CAP));
+        ASSERT(!zcl_dev_proof_test_prefork_argv(jobs, true, NULL,
+                                                PROOF_PREFORK_ARGV_CAP));
+#if !defined(_WIN32)
+        /* DISJOINT: after the fork, no make target the lint dimension names
+         * is a target the pre-fork step built. The test dimension's argv is
+         * the admitted runner binary and its flags -- it invokes no make at
+         * all -- so this is the whole overlap surface between the two. */
+        char land[4096], wt[4096], dev_parent[4096], dev[4096];
+        const char *lint_argv[8];
+        size_t lint_argc = 0;
+        int64_t fallback_ms = 0;
+        const char *targets = NULL;
+        ASSERT(zcl_dev_proof_test_prefork_argv(jobs, true, landing,
+                                               PROOF_PREFORK_ARGV_CAP));
+        test_make_tmpdir(land, sizeof(land), "proof_prefork", "landing");
+        ASSERT(snprintf(wt, sizeof(wt), "%s/wt", land) > 0);
+        ASSERT(mkdir(wt, 0755) == 0);
+        ASSERT(ic_write(land, "queue.lock", ""));
+        ASSERT(zcl_dev_proof_test_lint_argv(wt, jobs, lint_argv, 8, &lint_argc,
+                                            &fallback_ms, &targets));
+        for (size_t i = 5; i < lint_argc; i++)
+            ASSERT(!ic_argv_has(landing, lint_argv[i]));
+
+        test_make_tmpdir(dev_parent, sizeof(dev_parent), "proof_prefork",
+                         "dev");
+        ASSERT(snprintf(dev, sizeof(dev), "%s/wt", dev_parent) > 0);
+        ASSERT(mkdir(dev, 0755) == 0);
+        lint_argc = 0;
+        ASSERT(zcl_dev_proof_test_lint_argv(dev, jobs, lint_argv, 8, &lint_argc,
+                                            &fallback_ms, &targets));
+        ASSERT(zcl_dev_proof_test_prefork_argv(
+            jobs, zcl_dev_proof_test_lint_targets_are_full(targets), lane,
+            PROOF_PREFORK_ARGV_CAP));
+        ASSERT(ic_argv_has(lane, "proof-lint-prebuild"));
+        for (size_t i = 5; i < lint_argc; i++)
+            ASSERT(!ic_argv_has(lane, lint_argv[i]));
+
+        ASSERT(test_rm_rf_recursive(land) == 0);
+        ASSERT(test_rm_rf_recursive(dev_parent) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#if !defined(_WIN32)
+/* The full required prerequisite set dp_generation_dependencies refuses
+ * without, shared by the vendor-cleanup and verdict-seed generation tests. */
+static const char *const ic_gen_dep_files[] = {
+    "vendor/lib/libcrypto.a", "vendor/include/openssl/ssl.h",
+    "vendor/sqlite3.c", "vendor/tor/libtor.a", "vendor/tor/.provenance",
+    "vendor/tor/Makefile",
+    "vendor/.cache/input.tar",
+    "vendor/cross/x86_64-w64-mingw32/lib/libsqlite3.a",
+    "vendor/cross/x86_64-w64-mingw32/lib/.provenance/libsqlite3.a.stamp",
+    "vendor/tor/src/ext/ed25519/donna/libed25519_donna.a",
+    "vendor/tor/src/ext/ed25519/ref10/libed25519_ref10.a",
+    "vendor/tor/src/ext/keccak-tiny/libkeccak-tiny.a",
+    "build/githooks/pre-push",
+#if defined(__linux__)
+    "build/hotswap/zcl_rollback_fixture_a.so",
+    "build/hotswap/zcl_rollback_fixture_b.so",
+#endif
+#if !defined(_WIN32)
+    "build/fixtures/rlc_child_v1",
+    "build/fixtures/rlc_child_broken",
+    "build/fixtures/otlp_startup_probe",
+#endif
+    "build/bin/z23-lint",
+    "build/bin/z23-fleet-observe",
+    "build/bin/gen_capability_inventory",
+};
+
+static int test_ic_generation_dependencies_survive_vendor_cleanup(void)
+{
+    int failures = 0;
+    static const char *const *files = ic_gen_dep_files;
+    static const size_t n_files =
+        sizeof(ic_gen_dep_files) / sizeof(ic_gen_dep_files[0]);
+    TEST("proof generation: persistent vendor inputs survive successful cleanup") {
+        char donor[4096], generation[4096], source[4096], target[4096];
+        char hidden[4096], why[256] = {0};
+        test_make_tmpdir(donor, sizeof(donor), "gen_deps", "donor");
+        test_make_tmpdir(generation, sizeof(generation), "gen_deps", "copy");
+        for (size_t i = 0; i < n_files; ++i)
+            ASSERT(ic_write(donor, files[i], "fixture dependency bytes\n"));
+        /* Successful build_vendor.sh removes this directory. The fixture
+         * deliberately has only persistent outputs, including provenance. */
+        ASSERT(snprintf(source, sizeof(source), "%s/vendor/.build-x86_64-w64-mingw32",
+                        donor) < (int)sizeof(source));
+        ASSERT(access(source, F_OK) != 0);
+        ASSERT(zcl_dev_proof_test_generation_dependencies(
+            donor, generation, why, sizeof(why)));
+        for (size_t i = 0; i < n_files; ++i) {
+            struct stat before, after;
+            ASSERT(snprintf(source, sizeof(source), "%s/%s", donor, files[i]) <
+                   (int)sizeof(source));
+            ASSERT(snprintf(target, sizeof(target), "%s/%s", generation, files[i]) <
+                   (int)sizeof(target));
+            ASSERT(stat(source, &before) == 0);
+            ASSERT(stat(target, &after) == 0);
+            ASSERT(before.st_size == after.st_size);
+            ASSERT(before.st_ino != after.st_ino || before.st_dev != after.st_dev);
+            char bytes[64] = {0};
+            FILE *copied_file = fopen(target, "rb");
+            ASSERT(copied_file != NULL);
+            size_t count = fread(bytes, 1, sizeof(bytes) - 1, copied_file);
+            ASSERT(fclose(copied_file) == 0);
+            ASSERT(count == strlen("fixture dependency bytes\n"));
+            ASSERT_STR_EQ(bytes, "fixture dependency bytes\n");
+        }
+        /* No stale generation copy may stand in for a missing required
+         * donor input. Cryptographic archive checking remains the existing
+         * vendor-provenance gate's responsibility. */
+        static const char *const required[] = {
+            "vendor/tor/.provenance",
+            "vendor/tor/Makefile",
+        };
+        for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); ++i) {
+            ASSERT(snprintf(source, sizeof(source), "%s/%s", donor, required[i]) <
+                   (int)sizeof(source));
+            ASSERT(snprintf(hidden, sizeof(hidden), "%s-hidden", source) <
+                   (int)sizeof(hidden));
+            ASSERT(rename(source, hidden) == 0);
+            bool copied = zcl_dev_proof_test_generation_dependencies(
+                donor, generation, why, sizeof(why));
+            ASSERT(rename(hidden, source) == 0);
+            ASSERT(!copied);
+            ASSERT(strstr(why, "proof_generation_dependency_unavailable:") != NULL);
+            ASSERT(strstr(why, required[i]) != NULL);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A landing proof must fail closed on reused test verdicts. The candidate
+ * runs as the proof's own uid, so its tests can write the submitting
+ * checkout's verdict store; a PASS it plants at a group's exact key used to
+ * travel into the generation and be HIT there instead of executing. Forge
+ * exactly such a record (the testcache PASS layout: magic, status, key
+ * echo) and prove the generation receives no verdict store at all. */
+static int test_ic_generation_refuses_forged_verdict(void)
+{
+    int failures = 0;
+    TEST("proof generation: a forged checkout PASS record never reaches the generation") {
+        char donor[4096], generation[4096], vpath[4096];
+        char why[256] = {0};
+        uint8_t key[32], record[56];
+        test_make_tmpdir(donor, sizeof(donor), "gen_verdict", "donor");
+        test_make_tmpdir(generation, sizeof(generation), "gen_verdict",
+                         "copy");
+        for (size_t i = 0;
+             i < sizeof(ic_gen_dep_files) / sizeof(ic_gen_dep_files[0]);
+             ++i)
+            ASSERT(ic_write(donor, ic_gen_dep_files[i],
+                            "fixture dependency bytes\n"));
+        for (size_t i = 0; i < sizeof(key); ++i)
+            key[i] = (uint8_t)(0xa5u ^ (uint8_t)(i * 7u));
+        memset(record, 0, sizeof(record));
+        memcpy(record, "ZTCACHE1", 8);
+        record[8] = 1u; /* PASS */
+        memcpy(record + 16, key, sizeof(key));
+        ASSERT(vcs_object_store_init(donor));
+        ASSERT(vcs_object_put_addressed(donor, key, record, sizeof(record)));
+        ASSERT(vcs_object_has(donor, key));
+        ASSERT(zcl_dev_proof_test_generation_dependencies(
+            donor, generation, why, sizeof(why)));
+        ASSERT(!vcs_object_has(generation, key));
+        ASSERT(snprintf(vpath, sizeof(vpath), "%s/.zvcs", generation) <
+               (int)sizeof(vpath));
+        ASSERT(access(vpath, F_OK) != 0);
+        ASSERT(test_rm_rf_recursive(donor) == 0);
+        ASSERT(test_rm_rf_recursive(generation) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The test dimension's runner argv carries the runner's explicit cold mode,
+ * which outranks ZCL_TEST_CACHE, emits a signed observation leaf per
+ * executed group into the worker-private CAS, and nothing that would admit
+ * a cached verdict: no --cache, no probe-only, no capsule to consume. */
+static int test_ic_proof_test_dimension_runs_cold(void)
+{
+    int failures = 0;
+    TEST("proof test dimension: the runner starts cold, emits observations, admits no cached verdict") {
+        const char *argv[8];
+        const char *small[4];
+        size_t argc = zcl_dev_proof_test_dimension_argv(
+            "/gen/build/bin/test_parallel", "--exact=test_a,test_b", argv,
+            sizeof(argv) / sizeof(argv[0]));
+        ASSERT(argc == 4);
+        ASSERT(strcmp(argv[0], "/gen/build/bin/test_parallel") == 0);
+        ASSERT(strcmp(argv[1], "--exact=test_a,test_b") == 0);
+        ASSERT(strcmp(argv[2], "--no-cache") == 0);
+        ASSERT(strcmp(argv[3], "--activate-proof-contracts") == 0);
+        ASSERT(argv[4] == NULL);
+        for (size_t i = 0; i < argc; ++i) {
+            ASSERT(strcmp(argv[i], "--cache") != 0);
+            ASSERT(strcmp(argv[i], "--cold-audit") != 0);
+            ASSERT(strcmp(argv[i], "--emit-observations") != 0);
+            ASSERT(strcmp(argv[i], "--collect-observations") != 0);
+            ASSERT(strcmp(argv[i], "--cache-probe-only") != 0);
+            ASSERT(strncmp(argv[i], "--use-capsule", 13) != 0);
+        }
+        ASSERT(zcl_dev_proof_test_dimension_argv(
+                   "/gen/build/bin/test_parallel", "--exact=test_a", small,
+                   sizeof(small) / sizeof(small[0])) == 0);
+        ASSERT(zcl_dev_proof_test_dimension_argv(
+                   NULL, "--exact=test_a", argv,
+                   sizeof(argv) / sizeof(argv[0])) == 0);
+        ASSERT(zcl_dev_proof_test_dimension_argv(
+                   "/gen/build/bin/test_parallel", "", argv,
+                   sizeof(argv) / sizeof(argv[0])) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* One SUITE VERDICT fixture through the proof's own accounting. */
+static bool ic_test_log_case(const char *dir, const char *name,
+                             const char *verdict, uint32_t selected,
+                             struct zcl_dev_proof_dimension *dim)
+{
+    char path[4096];
+    if (!ic_write(dir, name, verdict) ||
+        snprintf(path, sizeof(path), "%s/%s", dir, name) >=
+            (int)sizeof(path))
+        return false;
+    memset(dim, 0, sizeof(*dim));
+    dim->selected = selected;
+    return zcl_dev_proof_test_log_account(path, dim);
+}
+
+/* The receipt's test dimension records reused == 0. A run that reports any
+ * cached group (a forged or inherited PASS served without executing) is
+ * refused, not counted as reuse, and a group that fails its fresh run fails
+ * the proof. */
+static int test_ic_proof_test_accounting_refuses_reuse(void)
+{
+    int failures = 0;
+    TEST("proof test accounting: cached groups and fresh failures both refuse") {
+        char dir[4096];
+        struct zcl_dev_proof_dimension dim;
+        test_make_tmpdir(dir, sizeof(dir), "proof_test_account", "logs");
+        ASSERT(ic_test_log_case(dir, "cold.log",
+            "SUITE VERDICT mode=cold groups_total=3 groups_ran=2 "
+            "groups_cached=0 groups_gated=1 groups_failed=0 self_skips=0 "
+            "env_unobserved=0 load_flaky=0 toolkey=t\n", 2, &dim));
+        ASSERT(dim.ran == 2);
+        ASSERT(dim.reused == 0);
+        ASSERT(dim.failed == 0);
+        /* Every other count is in order: only the served HIT refuses. */
+        ASSERT(!ic_test_log_case(dir, "cached.log",
+            "SUITE VERDICT mode=cached groups_total=3 groups_ran=1 "
+            "groups_cached=1 groups_gated=1 groups_failed=0 self_skips=0 "
+            "env_unobserved=0 load_flaky=0 toolkey=t\n", 2, &dim));
+        ASSERT(dim.reused == 1);
+        ASSERT(!ic_test_log_case(dir, "all_cached.log",
+            "SUITE VERDICT mode=cached groups_total=2 groups_ran=0 "
+            "groups_cached=2 groups_gated=0 groups_failed=0 self_skips=0 "
+            "env_unobserved=0 load_flaky=0 toolkey=t\n", 2, &dim));
+        ASSERT(!ic_test_log_case(dir, "fresh_fail.log",
+            "SUITE VERDICT mode=cold groups_total=2 groups_ran=2 "
+            "groups_cached=0 groups_gated=0 groups_failed=1 self_skips=0 "
+            "env_unobserved=0 load_flaky=0 toolkey=t\n", 2, &dim));
+        ASSERT(dim.failed == 1);
+        ASSERT(dim.reused == 0);
+        ASSERT(test_rm_rf_recursive(dir) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Routed-group preflight parser: the exact reader the proof worker runs on
+ * the runner's --cache-probe-only output before the test dimension decides
+ * what still needs execution. The SUMMARY carries the counts and the PROBE
+ * lines audit it — one bad line shape anywhere must refuse the whole
+ * account (fail closed to "the runner decides"), never mint a partial one.
+ * ASSERT jumps to the function's single _test_next label, so the eight
+ * shapes go through one TEST block via this table helper. */
+static bool ic_preflight_case(const char *bytes, size_t len, bool want,
+                              uint32_t g, uint32_t r, uint32_t m, uint32_t u)
+{
+    struct zcl_dev_proof_preflight pf;
+    bool got = zcl_dev_proof_test_preflight_parse(bytes, len, &pf);
+    if (got != want) {
+        printf("preflight case: verdict %d, want %d\n", (int)got,
+               (int)want);
+        return false;
+    }
+    if (want && (pf.groups != g || pf.would_reuse != r || pf.must_run != m ||
+                 pf.uncacheable != u)) {
+        printf("preflight case: got %u/%u/%u/%u, want %u/%u/%u/%u\n",
+               pf.groups, pf.would_reuse, pf.must_run, pf.uncacheable,
+               g, r, m, u);
+        return false;
+    }
+    return true;
+}
+
+static int test_ic_preflight_parse(void)
+{
+    int failures = 0;
+    TEST("proof preflight: summary-checked accounts pass, bent ones refuse") {
+        static const char good[] =
+            "test_parallel: cache PLAN — 3 cacheable, 1 cache HIT (will NOT run), 2 will run\n"
+            "PROBE test_a HIT cacheable 3895332c80a2\n"
+            "PROBE test_b MISS cacheable 77aa11c0ffee\n"
+            "PROBE test_c UNCACHEABLE external-input-denylist -\n"
+            "PROBE-SUMMARY groups=3 would_reuse=1 must_run=2 uncacheable=1\n"
+            "PROBE-STATS graph_opens=1 depfiles=5947 closure_queries=3 "
+            "file_hash_reads=40 memo_hits=11 sha3_bytes=9000 "
+            "verdict_lookups=2 verdict_hits=1\n";
+        static const char flaky[] =
+            "PROBE test_a HIT cacheable 3895332c80a2 flaky\n"
+            "PROBE-SUMMARY groups=1 would_reuse=1 must_run=0 uncacheable=0\n";
+        static const char nosum[] =
+            "PROBE test_a HIT cacheable 3895332c80a2\n";
+        static const char doubled[] =
+            "PROBE test_a HIT cacheable 3895332c80a2\n"
+            "PROBE-SUMMARY groups=1 would_reuse=1 must_run=0 uncacheable=0\n"
+            "PROBE-SUMMARY groups=1 would_reuse=1 must_run=0 uncacheable=0\n";
+        static const char miscount[] =
+            "PROBE test_a HIT cacheable 3895332c80a2\n"
+            "PROBE test_b MISS cacheable 77aa11c0ffee\n"
+            "PROBE-SUMMARY groups=1 would_reuse=1 must_run=0 uncacheable=0\n";
+        static const char badsplit[] =
+            "PROBE test_a HIT cacheable 3895332c80a2\n"
+            "PROBE-SUMMARY groups=1 would_reuse=1 must_run=1 uncacheable=0\n";
+        static const char garbage[] =
+            "PROBE test_a HIT cacheable 3895332c80a2\n"
+            "PROBE-SUMMARY groups=1 would_reuse=1 must_run=0 uncacheable=0 extra\n";
+        static const char empty_summary[] =
+            "PROBE-SUMMARY groups=0 would_reuse=0 must_run=0 uncacheable=0\n";
+        ASSERT(ic_preflight_case(good, sizeof(good) - 1, true, 3, 1, 2,
+                                 1));
+        ASSERT(ic_preflight_case(flaky, sizeof(flaky) - 1, true, 1, 1, 0,
+                                 0));
+        ASSERT(ic_preflight_case(nosum, sizeof(nosum) - 1, false, 0, 0, 0,
+                                 0));
+        ASSERT(ic_preflight_case(doubled, sizeof(doubled) - 1, false, 0, 0,
+                                 0, 0));
+        ASSERT(ic_preflight_case(miscount, sizeof(miscount) - 1, false, 0,
+                                 0, 0, 0));
+        ASSERT(ic_preflight_case(badsplit, sizeof(badsplit) - 1, false, 0,
+                                 0, 0, 0));
+        ASSERT(ic_preflight_case(garbage, sizeof(garbage) - 1, false, 0, 0,
+                                 0, 0));
+        ASSERT(ic_preflight_case("", 0, false, 0, 0, 0, 0));
+        ASSERT(ic_preflight_case(NULL, 0, false, 0, 0, 0, 0));
+        ASSERT(ic_preflight_case(empty_summary, sizeof(empty_summary) - 1,
+                                 true, 0, 0, 0, 0));
+        ASSERT(!zcl_dev_proof_test_preflight_parse(good, sizeof(good) - 1,
+                                                   NULL));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+#define IC_PREFLIGHT_SKIP_NOTE \
+    "test_preflight=advisory skipped reason=empty_verdict_store"
+
+/* One store shape through the preflight's skip decision: the verdict and
+ * whether phases.txt carries the skip note must agree with `want`. */
+static bool ic_preflight_skip_case(const char *label, const char *store,
+                                   const char *phases, bool want)
+{
+    bool got;
+    (void)remove(phases);
+    got = zcl_dev_proof_test_preflight_skip(store, phases);
+    if (got != want || ic_file_has(phases, IC_PREFLIGHT_SKIP_NOTE) != want) {
+        printf("preflight skip %s: skipped=%d note=%d, want %d\n", label,
+               (int)got, (int)ic_file_has(phases, IC_PREFLIGHT_SKIP_NOTE),
+               (int)want);
+        return false;
+    }
+    return true;
+}
+
+/* A testcache PASS record (magic, status, key echo) at its own address. */
+static bool ic_preflight_plant_verdict(const char *store)
+{
+    uint8_t key[32], record[56];
+    for (size_t i = 0; i < sizeof(key); ++i)
+        key[i] = (uint8_t)(0x3cu ^ (uint8_t)(i * 11u));
+    memset(record, 0, sizeof(record));
+    memcpy(record, "ZTCACHE1", 8);
+    record[8] = 1u; /* PASS */
+    memcpy(record + 16, key, sizeof(key));
+    return vcs_object_store_init(store) &&
+           vcs_object_put_addressed(store, key, record, sizeof(record));
+}
+#endif
+
+/* The advisory preflight probe is skipped only when the generation's
+ * verdict store provably holds no verdict: no .zvcs at all, or an objects
+ * directory holding only the writer's tmp/. A stored verdict, a stray
+ * entry, an unreadable store, or a store root that is missing or not a
+ * directory all keep the probe. */
+static int test_ic_preflight_skips_only_empty_store(void)
+{
+    int failures = 0;
+    TEST("proof preflight: only a provably empty verdict store skips the probe") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char dir[4096], store[4096], phases[4096], path[4096];
+        test_make_tmpdir(dir, sizeof(dir), "preflight_skip", "root");
+        ASSERT(snprintf(store, sizeof(store), "%s/gen", dir) <
+               (int)sizeof(store));
+        ASSERT(snprintf(phases, sizeof(phases), "%s/phases.txt", dir) <
+               (int)sizeof(phases));
+        ASSERT(mkdir(store, 0700) == 0);
+        /* (a) empty: a fresh generation has no .zvcs; an initialized
+         * store holds only objects/tmp. */
+        ASSERT(ic_preflight_skip_case("no .zvcs", store, phases, true));
+        ASSERT(vcs_object_store_init(store));
+        ASSERT(ic_preflight_skip_case("tmp only", store, phases, true));
+        /* (b) one verdict entry keeps the probe. */
+        ASSERT(ic_preflight_plant_verdict(store));
+        ASSERT(ic_preflight_skip_case("one verdict", store, phases, false));
+        ASSERT(test_rm_rf_recursive(store) == 0);
+        /* (c) ambiguous or unreadable stores keep the probe. */
+        ASSERT(ic_preflight_skip_case("missing root", store, phases, false));
+        ASSERT(ic_preflight_skip_case("null root", NULL, phases, false));
+        ASSERT(ic_preflight_skip_case("empty root", "", phases, false));
+        ASSERT(ic_write(dir, "gen", "not a directory\n"));
+        ASSERT(ic_preflight_skip_case("file root", store, phases, false));
+        ASSERT(remove(store) == 0);
+        ASSERT(ic_write(dir, "gen/.zvcs/objects", "not a directory\n"));
+        ASSERT(ic_preflight_skip_case("file objects", store, phases, false));
+        ASSERT(test_rm_rf_recursive(store) == 0);
+        ASSERT(mkdir(store, 0700) == 0);
+        ASSERT(vcs_object_store_init(store));
+        ASSERT(ic_write(dir, "gen/.zvcs/objects/stray", "?\n"));
+        ASSERT(ic_preflight_skip_case("stray entry", store, phases, false));
+        ASSERT(snprintf(path, sizeof(path), "%s/.zvcs/objects/stray",
+                        store) < (int)sizeof(path));
+        ASSERT(remove(path) == 0);
+        ASSERT(snprintf(path, sizeof(path), "%s/.zvcs/objects", store) <
+               (int)sizeof(path));
+        ASSERT(chmod(path, 0) == 0);
+        if (geteuid() != 0)
+            ASSERT(ic_preflight_skip_case("unreadable", store, phases,
+                                          false));
+        ASSERT(chmod(path, 0700) == 0);
+        ASSERT(test_rm_rf_recursive(dir) == 0);
+        PASS();
+#endif
+    } _test_next:;
+    return failures;
+}
+
+/* Capsule flag plumbing: the write and use forms carry the same five
+ * capsule arguments (write vs use + the four sealed bindings), so a
+ * consumer's acceptance check compares the capsule against the exact
+ * values that gated its launch. Only the advisory preflight takes the
+ * write form today; the proof's test dimension runs cold and takes
+ * neither. One TEST block per function — ASSERT jumps to the function's
+ * single _test_next label. */
+static int test_ic_capsule_argv_write(void)
+{
+    int failures = 0;
+    TEST("proof capsule: preflight argv carries write + bindings") {
+        const char *argv[8] = {0};
+        int argc = zcl_dev_proof_test_capsule_argv(
+            true, "/tmp/x.probe-capsule", "sid", "mid", "cas", "gr", argv,
+            8);
+        ASSERT(argc == 5);
+        ASSERT(strcmp(argv[0], "--write-capsule=/tmp/x.probe-capsule") == 0);
+        ASSERT(strcmp(argv[1], "--capsule-source-id=sid") == 0);
+        ASSERT(strcmp(argv[2], "--capsule-mutation-id=mid") == 0);
+        ASSERT(strcmp(argv[3], "--capsule-source-cas=cas") == 0);
+        ASSERT(strcmp(argv[4], "--capsule-graph-root=gr") == 0);
+        ASSERT(argv[5] == NULL);
+        ASSERT(zcl_dev_proof_test_capsule_argv(true, NULL, "sid", "mid",
+                                               "cas", "gr", argv, 8) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_capsule_argv_use(void)
+{
+    int failures = 0;
+    TEST("proof capsule: use-form argv carries use + same bindings") {
+        const char *argv[8] = {0};
+        int argc = zcl_dev_proof_test_capsule_argv(
+            false, "/tmp/x.probe-capsule", "sid", "mid", "cas", "gr", argv,
+            8);
+        ASSERT(argc == 5);
+        ASSERT(strcmp(argv[0], "--use-capsule=/tmp/x.probe-capsule") == 0);
+        ASSERT(strcmp(argv[1], "--capsule-source-id=sid") == 0);
+        ASSERT(strcmp(argv[2], "--capsule-mutation-id=mid") == 0);
+        ASSERT(strcmp(argv[3], "--capsule-source-cas=cas") == 0);
+        ASSERT(strcmp(argv[4], "--capsule-graph-root=gr") == 0);
+        ASSERT(argv[5] == NULL);
+        ASSERT(zcl_dev_proof_test_capsule_argv(false, "/tmp/x.probe-capsule",
+                                               "sid", "mid", "cas", "gr",
+                                               argv, 5) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+/* `git worktree add` copies the submitting checkout's worktree-scoped
+ * core.hooksPath verbatim into the new worktree's own config.worktree.
+ * generation_prepare() materializes its own build/githooks copy, then calls
+ * the seam under test to point the generation's worktree config at that
+ * copy instead. Without the reconfiguration, check-git-hooks-installed
+ * inside the generation compares expected=<generation>/build/githooks
+ * against actual=<submitting checkout>/build/githooks and fails every
+ * landing that runs the full gate set. */
+static int test_ic_generation_hooks_configure_points_at_its_own_copy(void)
+{
+    int failures = 0;
+    TEST("proof generation: hooks reconfiguration points a generation at "
+        "its own build/githooks, not the submitting checkout's") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char donor[4096], generation[4096], cmd[8192];
+        test_make_tmpdir(donor, sizeof(donor), "gen_hooks", "donor");
+        ASSERT(snprintf(generation, sizeof(generation), "%s-gen", donor) <
+              (int)sizeof(generation));
+
+        /* A real repo with a real worktree-scoped core.hooksPath, exactly
+         * what a submitting checkout arms via `make install-hooks`. */
+        ASSERT(ic_write(donor, "README", "seed\n"));
+        ASSERT((size_t)snprintf(
+            cmd, sizeof(cmd),
+            "cd %s && git init --quiet . && "
+            "git -c user.email=t@t -c user.name=t commit --quiet -m seed "
+            "--allow-empty && "
+            "git config extensions.worktreeConfig true && "
+            "git config --worktree core.hooksPath %s/build/githooks",
+            donor, donor) < sizeof(cmd));
+        ASSERT(system(cmd) == 0);
+
+        /* `git worktree add`: this is what carries the donor's hooksPath
+         * into the new worktree's own config.worktree. */
+        ASSERT((size_t)snprintf(
+            cmd, sizeof(cmd),
+            "git -C %s worktree add --quiet --detach %s >/dev/null 2>&1",
+            donor, generation) < sizeof(cmd));
+        ASSERT(system(cmd) == 0);
+
+        /* Before the fix runs, the generation still names the donor's
+         * hooks -- the defect this test exists for. */
+        char hooks_path[4096];
+        ASSERT(snprintf(hooks_path, sizeof(hooks_path),
+                        "%s/build/githooks", donor) > 0);
+        char before[4096];
+        ASSERT((size_t)snprintf(
+            cmd, sizeof(cmd),
+            "git -C %s config --worktree core.hooksPath", generation) <
+              sizeof(cmd));
+        FILE *p = popen(cmd, "r");
+        ASSERT(p != NULL);
+        ASSERT(fgets(before, sizeof(before), p) != NULL);
+        ASSERT(pclose(p) == 0);
+        size_t before_len = strlen(before);
+        while (before_len > 0 && (before[before_len - 1] == '\n' ||
+                                  before[before_len - 1] == '\r'))
+            before[--before_len] = 0;
+        ASSERT(strcmp(before, hooks_path) == 0);
+
+        /* The generation carries its own build/githooks copy -- exactly
+         * what generation_prepare() materializes before calling the seam
+         * under test. */
+        ASSERT(ic_write(generation, "build/githooks/pre-push", "#!/bin/sh\n"));
+
+        char why[256] = {0};
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        bool configured = zcl_dev_proof_test_generation_hooks_configure(
+            generation, why, sizeof(why));
+        (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        ASSERT(configured);
+
+        char gen_hooks_path[4096];
+        ASSERT(snprintf(gen_hooks_path, sizeof(gen_hooks_path),
+                        "%s/build/githooks", generation) > 0);
+        char after[4096];
+        ASSERT((size_t)snprintf(
+            cmd, sizeof(cmd),
+            "git -C %s config --worktree core.hooksPath", generation) <
+              sizeof(cmd));
+        p = popen(cmd, "r");
+        ASSERT(p != NULL);
+        ASSERT(fgets(after, sizeof(after), p) != NULL);
+        ASSERT(pclose(p) == 0);
+        size_t after_len = strlen(after);
+        while (after_len > 0 && (after[after_len - 1] == '\n' ||
+                                 after[after_len - 1] == '\r'))
+            after[--after_len] = 0;
+        /* The generation is now judged against the hooks it carries, not
+         * the submitting checkout's. */
+        ASSERT(strcmp(after, gen_hooks_path) == 0);
+        ASSERT(strcmp(after, hooks_path) != 0);
+
+        ASSERT((size_t)snprintf(
+            cmd, sizeof(cmd),
+            "git -C %s worktree remove --force %s >/dev/null 2>&1", donor,
+            generation) < sizeof(cmd));
+         TEST_DISCARD(system(cmd));
+        ASSERT(test_rm_rf_recursive(donor) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+#if !defined(_WIN32)
+struct ic_landing_proof_fixture {
+    char parent[4096], root[4096], step[4096];
+    char request[4096], failure[4096];
+    uint8_t request_bytes[320];
+    size_t request_size;
+};
+
+static bool ic_watcher_lock_unowned(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool unowned = flock(fd, LOCK_EX | LOCK_NB) == 0;
+    if (unowned) (void)flock(fd, LOCK_UN);
+    (void)close(fd);
+    return unowned;
+}
+
+static bool ic_landing_proof_prepare(struct ic_landing_proof_fixture *f,
+                                      const char *tag)
+{
+    static const char local[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char base[] = "1111111111111111111111111111111111111111";
+    test_make_tmpdir(f->parent, sizeof(f->parent), "impact_composition", tag);
+    if (!ic_proof_private_write(f->parent, "queue.lock", "") ||
+        !ic_proof_private_write(f->parent, "step.lock", "") ||
+        !ic_write(f->parent, "wt/.cache/fixture", "isolated landing proof\n"))
+        return false;
+    snprintf(f->root, sizeof(f->root), "%s/wt", f->parent);
+    snprintf(f->step, sizeof(f->step), "%s/step.lock", f->parent);
+    snprintf(f->request, sizeof(f->request),
+              "%s/.cache/zcl-dev-proof/requests/%s-%s.request", f->root, local, base);
+    snprintf(f->failure, sizeof(f->failure),
+              "%s/.cache/zcl-dev-proof/%s-%s.failed", f->root, local, base);
+    struct zcl_dev_proof_status status = {0};
+    if (!zcl_dev_proof_ensure(f->root, local, base, &status)) return false;
+    FILE *input = fopen(f->request, "rb");
+    if (!input) return false;
+    f->request_size = fread(f->request_bytes, 1, sizeof(f->request_bytes), input);
+    bool ok = !ferror(input) && f->request_size > 0 &&
+              f->request_size < sizeof(f->request_bytes);
+    return fclose(input) == 0 && ok;
+}
+
+static bool ic_landing_state_empty(const char *root, const char *name)
+{
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/.cache/zcl-dev-proof/%s", root, name);
+    DIR *directory = opendir(path);
+    if (!directory) return false;
+    bool empty = true;
+    for (struct dirent *entry = readdir(directory); entry; entry = readdir(directory)) {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+            empty = false;
+    }
+    return closedir(directory) == 0 && empty;
+}
+
+static bool ic_landing_request_unchanged(const struct ic_landing_proof_fixture *f)
+{
+    return ic_bytes_equal(f->request, f->request_bytes, f->request_size) &&
+           access(f->failure, F_OK) != 0 &&
+           zcl_dev_proof_queue_has_pending(f->root) &&
+           ic_landing_state_empty(f->root, "attempts") &&
+           ic_landing_state_empty(f->root, "leases") &&
+           ic_landing_state_empty(f->root, "receipts");
+}
+
+static int test_ic_generation_docs_fresh_refuses_stale(void)
+{
+    int failures = 0;
+    TEST("proof generation: stale generated docs refuse fast with a typed name") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        static const char *const stubs[] = {
+            "tools/lint/check_capability_inventory_generated.sh",
+            "tools/lint/check_fleet_facts.sh",
+            "tools/lint/check_fleet_observations.sh",
+            "tools/scripts/check_doc_counts.sh",
+        };
+        char generation[4096], bare[4096], script[4352], cmd[8704];
+        test_make_tmpdir(generation, sizeof(generation),
+                         "impact_composition", "docs-fresh");
+        test_make_tmpdir(bare, sizeof(bare),
+                         "impact_composition", "docs-fresh-bare");
+        for (size_t i = 0; i < sizeof(stubs) / sizeof(stubs[0]); i++) {
+            ASSERT(ic_write(generation, stubs[i], "#!/bin/sh\nexit 0\n"));
+            ASSERT(snprintf(script, sizeof(script), "%s/%s", generation,
+                            stubs[i]) < (int)sizeof(script));
+            ASSERT(chmod(script, 0755) == 0);
+        }
+        ASSERT(ic_write(generation, stubs[0],
+                        "#!/bin/sh\n"
+                        "test \"$#\" -eq 1 && "
+                        "test \"$1\" = build/bin/gen_capability_inventory\n"));
+        /* The provisioned checker binaries a sealed generation carries
+         * after the docs-tools step; without them no fresh verdict below
+         * could be told apart from a missing toolchain. */
+        static const char *const tools[] = {
+            "build/bin/z23-lint",
+            "build/bin/z23-fleet-observe",
+            "build/bin/gen_capability_inventory",
+        };
+        for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
+            ASSERT(ic_write(generation, tools[i], ""));
+            ASSERT(snprintf(script, sizeof(script), "%s/%s", generation,
+                            tools[i]) < (int)sizeof(script));
+            ASSERT(chmod(script, 0755) == 0);
+            /* The bare dir below tests the checker layer, not the
+             * toolchain layer, so it carries the same binaries. */
+            ASSERT(ic_write(bare, tools[i], ""));
+            ASSERT(snprintf(script, sizeof(script), "%s/%s", bare,
+                            tools[i]) < (int)sizeof(script));
+            ASSERT(chmod(script, 0755) == 0);
+        }
+        /* All fresh: the seam passes and names nothing. */
+        char why[256] = {0};
+        ASSERT(zcl_dev_proof_test_generation_docs_fresh(generation, why,
+                                                        sizeof(why)));
+        ASSERT(why[0] == '\0');
+        /* Stale inventory plus a second stale checker: the FIRST failure
+         * is named (deterministic order), with its regen command. */
+        ASSERT(ic_write(generation, stubs[0],
+                        "#!/bin/sh\necho FAIL >&2\nexit 1\n"));
+        ASSERT(ic_write(generation, stubs[2],
+                        "#!/bin/sh\necho FAIL >&2\nexit 1\n"));
+        memset(why, 0, sizeof(why));
+        ASSERT(!zcl_dev_proof_test_generation_docs_fresh(generation, why,
+                                                         sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_stale:"
+                      "docs/CAPABILITY_INVENTORY.jsonl "
+                      "(make docs-capability-inventory)");
+        /* The checkers run together as steps; the join still names the
+         * earliest refusal in list order when a later one fails first,
+         * and removes every step log it judged. */
+        ASSERT(ic_write(generation, stubs[0],
+                        "#!/bin/sh\nsleep 1\necho FAIL >&2\nexit 1\n"));
+        memset(why, 0, sizeof(why));
+        ASSERT(!zcl_dev_proof_test_generation_docs_fresh(generation, why,
+                                                         sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_stale:"
+                      "docs/CAPABILITY_INVENTORY.jsonl "
+                      "(make docs-capability-inventory)");
+        for (size_t i = 0; i < sizeof(stubs) / sizeof(stubs[0]); i++) {
+            ASSERT(snprintf(script, sizeof(script),
+                            "%s/.generation-docs-fresh-%zu.log", generation,
+                            i) < (int)sizeof(script));
+            ASSERT(access(script, F_OK) != 0);
+        }
+        /* A generation without the checkers is a distinct refusal,
+         * never a pass. */
+        memset(why, 0, sizeof(why));
+        ASSERT(!zcl_dev_proof_test_generation_docs_fresh(bare, why,
+                                                         sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_checker_missing:"
+                      "tools/lint/check_capability_inventory_generated.sh");
+        ASSERT((size_t)snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'",
+                                generation, bare) < sizeof(cmd));
+        ASSERT(system(cmd) == 0);
+        PASS();
+#endif
+    } _test_next:;
+    return failures;
+}
+
+/* A generation carrying the four docs-fresh checker scripts (each `exit 0`
+ * unless overwritten) and the three provisioned checker binaries. */
+static bool ic_docs_fresh_fixture(char *generation, size_t len,
+                                  const char *name)
+{
+    static const char *const stubs[] = {
+        "tools/lint/check_capability_inventory_generated.sh",
+        "tools/lint/check_fleet_facts.sh",
+        "tools/lint/check_fleet_observations.sh",
+        "tools/scripts/check_doc_counts.sh",
+        "build/bin/z23-lint",
+        "build/bin/z23-fleet-observe",
+        "build/bin/gen_capability_inventory",
+    };
+    char path[4352];
+    test_make_tmpdir(generation, len, "impact_composition", name);
+    for (size_t i = 0; i < sizeof(stubs) / sizeof(stubs[0]); i++) {
+        if (!ic_write(generation, stubs[i], "#!/bin/sh\nexit 0\n") ||
+            snprintf(path, sizeof(path), "%s/%s", generation, stubs[i]) >=
+                (int)sizeof(path) ||
+            chmod(path, 0755) != 0)
+            return false;
+    }
+    return true;
+}
+
+/* Planning seam deliberately omits the earlier submitting-checkout admission
+ * guards: a missing checkout there remains a legitimate refusal. */
+extern bool zcl_dev_proof_test_worker_plan(const char *, const char *,
+    const char *const *, size_t, bool, char *, size_t, char *, size_t);
+
+static int test_ic_worker_plan_generation(void)
+{
+    int failures = 0;
+    TEST("proof closure: sealed generation owns planning after checkout moves") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char generation[4096], submit[4096], missing[4352], why[512];
+        static char expected[ZCL_DEVLOOP_PLAN_WIRE_MAX];
+        static char actual[ZCL_DEVLOOP_PLAN_WIRE_MAX];
+        const char *files[] = {"core/modules/net/src/tor_integration.c"};
+        ASSERT(ic_docs_fresh_fixture(generation, sizeof(generation),
+                                     "plan-generation"));
+        ASSERT(ic_write_call_pair(generation));
+        ASSERT(ic_write_depfiles(generation));
+        test_make_tmpdir(submit, sizeof(submit), "impact_composition",
+                         "plan-submit");
+        ASSERT(ic_write_call_pair(submit));
+        ASSERT(ic_write_depfiles(submit));
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(zcl_devloop_plan_add_closure(generation, files, 1, &plan));
+        const char *reason = "";
+        ASSERT(zcl_devloop_plan_proof_admissible(&plan, &reason));
+        ASSERT(ic_planned(&plan, "download"));
+        ASSERT(zcl_devloop_plan_json_render(&plan, files, 1, expected,
+                                            sizeof(expected)) > 0);
+        /* The submit graph is now valid for different bytes, with no caller. */
+        ASSERT(ic_write(submit, "core/modules/net/src/download.c",
+                        "int dl_top(int x) { return x * 2; }\n"));
+        /* Re-emit depfiles AFTER the rewrite: on macOS an older depfile
+         * rightly refuses instead of exposing the competing valid graph. */
+        ASSERT(ic_write_depfiles(submit));
+        /* Negative control for the pre-fix root choice, without weakening
+         * the production seam: bind both its roots to the submit tree. */
+        why[0] = '\0';
+        ASSERT(zcl_dev_proof_test_worker_plan(submit, submit, files, 1,
+            false, actual, sizeof(actual), why, sizeof(why)));
+        ASSERT(strcmp(actual, expected) != 0);
+        why[0] = '\0';
+        ASSERT(zcl_dev_proof_test_worker_plan(submit, generation, files, 1,
+            true, actual, sizeof(actual), why, sizeof(why)));
+        ASSERT_STR_EQ(actual, expected);
+        ASSERT(snprintf(missing, sizeof(missing), "%s/moved-away", submit)
+               < (int)sizeof(missing));
+        why[0] = '\0';
+        ASSERT(zcl_dev_proof_test_worker_plan(missing, generation, files, 1,
+            true, actual, sizeof(actual), why, sizeof(why)));
+        ASSERT_STR_EQ(actual, expected);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_worker_plan_docs_before_refresh(void)
+{
+    int failures = 0;
+    TEST("proof closure: stale docs refuse before bundle refresh") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char generation[4096], marker[4352], why[512];
+        static char json[ZCL_DEVLOOP_PLAN_WIRE_MAX];
+        const char *files[] = {"core/modules/net/include/net/clp.h"};
+        ASSERT(ic_docs_fresh_fixture(generation, sizeof(generation),
+                                     "plan-docs-order"));
+        ASSERT(ic_write_call_pair(generation));
+        /* Missing includes require bundle refresh. Its write must remain
+         * forbidden when docs are stale; index writes are permitted. */
+        ASSERT(ic_write(generation, "Makefile",
+            ".PHONY: dev-proof-bundle-prefork\n"
+            "dev-proof-bundle-prefork:\n"
+            "\t@touch refresh-attempted\n"));
+        ASSERT(ic_write(generation,
+            "tools/lint/check_capability_inventory_generated.sh",
+            "#!/bin/sh\necho FAIL >&2\nexit 1\n"));
+        ASSERT(snprintf(marker, sizeof(marker), "%s/refresh-attempted",
+                        generation) < (int)sizeof(marker));
+        why[0] = '\0';
+        ASSERT(!zcl_dev_proof_test_worker_plan(generation, generation, files,
+            1, true, json, sizeof(json), why, sizeof(why)));
+        ASSERT(strstr(why, "proof_generated_docs_stale:") == why);
+        ASSERT(access(marker, F_OK) != 0);
+        /* A complete graph still cannot turn stale docs into success. */
+        ASSERT(ic_write_depfiles(generation));
+        why[0] = '\0';
+        ASSERT(!zcl_dev_proof_test_worker_plan(generation, generation, files,
+            1, true, json, sizeof(json), why, sizeof(why)));
+        ASSERT(strstr(why, "proof_generated_docs_stale:") == why);
+        ASSERT(access(marker, F_OK) != 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_worker_plan_graph_refresh_refuses(void)
+{
+    int failures = 0;
+    TEST("proof closure: generation include epochs refresh or refuse") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char generation[4096], submit[4096], marker[4352], why[512];
+        static char json[ZCL_DEVLOOP_PLAN_WIRE_MAX];
+        static const char epoch[] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const char *files[] = {"core/modules/net/include/net/clp.h"};
+        test_make_tmpdir(submit, sizeof(submit), "impact_composition",
+                         "plan-refresh-submit");
+        ASSERT(ic_write_call_pair(submit));
+        ASSERT(ic_write_depfiles(submit));
+        /* A valid submitting graph must not mask either broken generation. */
+        for (int mode = 0; mode < 4; mode++) {
+            static const char *const names[] = {
+                "plan-refresh-missing", "plan-refresh-dangling",
+                "plan-refresh-old-dep", "plan-refresh-no-epoch"
+            };
+            ASSERT(ic_docs_fresh_fixture(generation, sizeof(generation),
+                                         names[mode]));
+            ASSERT(ic_write_call_pair(generation));
+            if (mode != 0) {
+                ASSERT(ic_write_depfiles(generation));
+            }
+            if (mode == 1) {
+                ASSERT(ic_write(generation, "build/obj/download.d",
+                    "build/obj/download.o: core/modules/net/src/download.c "
+                    "core/modules/net/include/net/clp.h missing.h\n"));
+            }
+            if (mode == 2) {
+                /* Explicit whole-second separation avoids depending on
+                 * filesystem timestamp granularity or sleeping on macOS. */
+                struct stat source;
+                ASSERT(snprintf(marker, sizeof(marker),
+                    "%s/core/modules/net/src/download.c", generation)
+                    < (int)sizeof(marker));
+                ASSERT(stat(marker, &source) == 0);
+                struct utimbuf old = {source.st_mtime - 2, source.st_mtime - 2};
+                ASSERT(snprintf(marker, sizeof(marker),
+                    "%s/build/obj/download.d", generation)
+                    < (int)sizeof(marker));
+                ASSERT(utime(marker, &old) == 0);
+            }
+            if (mode == 3) {
+                char rel[160];
+                ASSERT(snprintf(rel, sizeof(rel), "build/obj/epochs/%s/fixture",
+                                epoch) < (int)sizeof(rel));
+                ASSERT(ic_write(generation, rel, ""));
+                /* Valid loose depfiles cannot stand in for the missing
+                 * current-epoch pointer once this root is epoch-managed. */
+            }
+            /* Local fixture Makefile observes refresh and deliberately
+             * refuses. No real bundle or evidence is built/published. */
+            ASSERT(ic_write(generation, "Makefile",
+                ".PHONY: dev-proof-bundle-prefork\n"
+                "dev-proof-bundle-prefork:\n"
+                "\t@touch refresh-attempted\n\t@exit 1\n"));
+            why[0] = '\0';
+            ASSERT(!zcl_dev_proof_test_worker_plan(submit, generation, files,
+                1, true, json, sizeof(json), why, sizeof(why)));
+            ASSERT_STR_EQ(why, "proof_closure_refresh_build_failed");
+            ASSERT(snprintf(marker, sizeof(marker), "%s/refresh-attempted",
+                            generation) < (int)sizeof(marker));
+            ASSERT(access(marker, F_OK) == 0);
+            ASSERT(unlink(marker) == 0);
+            /* A successful refresh command is not graph evidence. A no-op
+             * leaves every invalid input above invalid and must refuse. */
+            ASSERT(ic_write(generation, "Makefile",
+                ".PHONY: dev-proof-bundle-prefork\n"
+                "dev-proof-bundle-prefork:\n\t@touch refresh-attempted\n"));
+            why[0] = '\0';
+            ASSERT(!zcl_dev_proof_test_worker_plan(submit, generation, files,
+                1, true, json, sizeof(json), why, sizeof(why)));
+            ASSERT(strstr(why, "no-include-graph") == why ||
+                   strstr(why, "closure-truncated") == why);
+            ASSERT(access(marker, F_OK) == 0);
+            if (mode == 3) {
+                char makefile[512];
+                ASSERT(unlink(marker) == 0);
+                ASSERT(snprintf(makefile, sizeof(makefile),
+                    ".PHONY: dev-proof-bundle-prefork\n"
+                    "dev-proof-bundle-prefork:\n"
+                    "\t@touch refresh-attempted\n"
+                    "\t@cp build/obj/*.d build/obj/epochs/%s/\n"
+                    "\t@printf '%%s\\n' '%s' > build/obj/.current-epoch\n",
+                    epoch, epoch) < (int)sizeof(makefile));
+                ASSERT(ic_write(generation, "Makefile", makefile));
+                why[0] = '\0';
+                ASSERT(zcl_dev_proof_test_worker_plan(submit, generation,
+                    files, 1, true, json, sizeof(json), why, sizeof(why)));
+                ASSERT(access(marker, F_OK) == 0);
+                ASSERT(strstr(json, "\"proof_admissible\":true") != NULL);
+            }
+        }
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_generation_docs_fresh_overlapped(void)
+{
+    int failures = 0;
+    TEST("proof generation: overlapped docs checks keep the serial deadline, "
+         "cancel name and precedence") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        char generation[4096], why[256], cmd[4200];
+        ASSERT(ic_docs_fresh_fixture(generation, sizeof(generation),
+                                     "docs-fresh-overlap"));
+        /* Clean and within the deadline: the later verdict stands. */
+        ASSERT(zcl_dev_proof_test_docs_fresh_overlapped(
+            generation, 20000, 0, true, NULL, why, sizeof(why)));
+        ASSERT(why[0] == '\0');
+        ASSERT(!zcl_dev_proof_test_docs_fresh_overlapped(
+            generation, 20000, 0, false, "impact_plan_incomplete", why,
+            sizeof(why)));
+        ASSERT_STR_EQ(why, "impact_plan_incomplete");
+
+        /* A checker that outlives its deadline and then exits 0 before
+         * the join refuses as a timeout, exactly as the serial capture's
+         * deadline refused it -- never as a pass. */
+        ASSERT(ic_write(generation,
+                        "tools/lint/check_capability_inventory_generated.sh",
+                        "#!/bin/sh\nsleep 1\nexit 0\n"));
+        int64_t begun = platform_time_monotonic_us();
+        ASSERT(!zcl_dev_proof_test_docs_fresh_overlapped(
+            generation, 300, 2500, true, NULL, why, sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_check_timeout:"
+                      "docs/CAPABILITY_INVENTORY.jsonl");
+        ASSERT(platform_time_monotonic_us() - begun >= 2500 * 1000);
+        /* Joined at once instead, it is the same refusal. */
+        ASSERT(!zcl_dev_proof_test_docs_fresh_overlapped(
+            generation, 300, 0, true, NULL, why, sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_check_timeout:"
+                      "docs/CAPABILITY_INVENTORY.jsonl");
+
+        /* Stale docs outrank a refusal a later proof step took while the
+         * checkers ran, the order the serial check imposed. */
+        ASSERT(ic_write(generation,
+                        "tools/lint/check_capability_inventory_generated.sh",
+                        "#!/bin/sh\necho FAIL >&2\nexit 1\n"));
+        ASSERT(!zcl_dev_proof_test_docs_fresh_overlapped(
+            generation, 20000, 200, false, "impact_plan_incomplete", why,
+            sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_stale:"
+                      "docs/CAPABILITY_INVENTORY.jsonl "
+                      "(make docs-capability-inventory)");
+        ASSERT(!zcl_dev_proof_test_docs_fresh_overlapped(
+            generation, 20000, 0, true, NULL, why, sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_stale:"
+                      "docs/CAPABILITY_INVENTORY.jsonl "
+                      "(make docs-capability-inventory)");
+
+        /* A cancel that lands before the first checker starts is named a
+         * cancellation, never a missing checker. */
+        zcl_devloop_process_cancel_request();
+        bool cancelled_ok = zcl_dev_proof_test_docs_fresh_overlapped(
+            generation, 20000, 0, true, NULL, why, sizeof(why));
+        zcl_devloop_process_cancel_clear();
+        ASSERT(!cancelled_ok);
+        ASSERT_STR_EQ(why, "proof_generated_docs_check_cancelled:"
+                      "docs/CAPABILITY_INVENTORY.jsonl");
+        ASSERT((size_t)snprintf(cmd, sizeof(cmd), "rm -rf '%s'",
+                                generation) < sizeof(cmd));
+        ASSERT(system(cmd) == 0);
+#endif
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_generation_docs_fresh_refuses_missing_tools(void)
+{
+    int failures = 0;
+    TEST("proof generation: missing checker binaries refuse as tool failure, "
+         "never stale docs") {
+#if defined(_WIN32)
+        ASSERT(true);
+#else
+        static const char *const stubs[] = {
+            "tools/lint/check_capability_inventory_generated.sh",
+            "tools/lint/check_fleet_facts.sh",
+            "tools/lint/check_fleet_observations.sh",
+            "tools/scripts/check_doc_counts.sh",
+        };
+        static const char *const tools[] = {
+            "build/bin/z23-lint",
+            "build/bin/z23-fleet-observe",
+            "build/bin/gen_capability_inventory",
+        };
+        char generation[4096], script[4352], cmd[8704];
+        test_make_tmpdir(generation, sizeof(generation),
+                         "impact_composition", "docs-tools-missing");
+        for (size_t i = 0; i < sizeof(stubs) / sizeof(stubs[0]); i++) {
+            ASSERT(ic_write(generation, stubs[i], "#!/bin/sh\nexit 0\n"));
+            ASSERT(snprintf(script, sizeof(script), "%s/%s", generation,
+                            stubs[i]) < (int)sizeof(script));
+            ASSERT(chmod(script, 0755) == 0);
+        }
+        /* Fresh checkers but an empty build/bin: a typed tool refusal that
+         * names the first missing binary, never doc drift. */
+        char why[256] = {0};
+        ASSERT(!zcl_dev_proof_test_generation_docs_fresh(generation, why,
+                                                         sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_tools_missing:"
+                      "build/bin/z23-lint");
+        /* Provisioned binaries, but the checker exec-fails exactly the way
+         * a missing z23-lint fails in a fresh generation (rc=127 plus the
+         * shell's ENOENT text): the rc is preserved in a typed tool
+         * failure, never reported as stale docs. */
+        for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
+            ASSERT(ic_write(generation, tools[i], ""));
+            ASSERT(snprintf(script, sizeof(script), "%s/%s", generation,
+                            tools[i]) < (int)sizeof(script));
+            ASSERT(chmod(script, 0755) == 0);
+        }
+        ASSERT(ic_write(generation, stubs[1],
+                        "#!/bin/sh\necho \"$0: line 1: build/bin/z23-lint: "
+                        "No such file or directory\" >&2\nexit 127\n"));
+        memset(why, 0, sizeof(why));
+        ASSERT(!zcl_dev_proof_test_generation_docs_fresh(generation, why,
+                                                         sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_checker_tool_failure:"
+                      "tools/lint/check_fleet_facts.sh:rc_127");
+        /* A checker that refuses with FATAL over a missing input (rc=2, the
+         * way check_fleet_observations.sh reports a missing generator
+         * binary) is likewise a tool failure, not drift. */
+        ASSERT(ic_write(generation, stubs[1], "#!/bin/sh\nexit 0\n"));
+        ASSERT(ic_write(generation, stubs[2],
+                        "#!/bin/sh\necho \"[check_fleet_observations] FATAL "
+                        "-- build/bin/z23-fleet-observe is missing\" >&2\n"
+                        "exit 2\n"));
+        memset(why, 0, sizeof(why));
+        ASSERT(!zcl_dev_proof_test_generation_docs_fresh(generation, why,
+                                                         sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_checker_tool_failure:"
+                      "tools/lint/check_fleet_observations.sh:rc_2");
+        /* rc=2 with no toolchain marker is still not drift. z23-lint's
+         * die() and an unreadable fleet table use that code and text
+         * that names neither FATAL nor a missing file. */
+        ASSERT(ic_write(generation, stubs[2], "#!/bin/sh\nexit 0\n"));
+        ASSERT(ic_write(generation, stubs[1],
+                        "#!/bin/sh\necho \"z23-lint: cannot resolve "
+                        "executable path\" >&2\nexit 2\n"));
+        memset(why, 0, sizeof(why));
+        ASSERT(!zcl_dev_proof_test_generation_docs_fresh(generation, why,
+                                                         sizeof(why)));
+        ASSERT_STR_EQ(why, "proof_generated_docs_checker_tool_failure:"
+                      "tools/lint/check_fleet_facts.sh:rc_2");
+        ASSERT((size_t)snprintf(cmd, sizeof(cmd), "rm -rf '%s'",
+                                generation) < sizeof(cmd));
+        ASSERT(system(cmd) == 0);
+        PASS();
+#endif
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_generation_docs_tools_builds_the_checker_binaries(void)
+{
+    int failures = 0;
+    TEST("proof generation: docs-fresh checker binaries are provisioned "
+         "before the read-only verification") {
+        const char *argv[8];
+        char jobs[] = "-j4";
+
+        ASSERT(zcl_dev_proof_test_docs_tools_argv(jobs, argv, 8));
+        ASSERT(strcmp(argv[0], "make") == 0);
+        ASSERT(strcmp(argv[1], "--no-print-directory") == 0);
+        ASSERT(strcmp(argv[2], jobs) == 0);
+        size_t argc = 0;
+        while (argv[argc]) argc++;
+        ASSERT(argc == 4);
+        ASSERT(strcmp(argv[3], "docs-proof-tools") == 0);
+
+        /* Refused, never truncated, when the caller has no room. */
+        ASSERT(!zcl_dev_proof_test_docs_tools_argv(jobs, argv, 7));
+        ASSERT(!zcl_dev_proof_test_docs_tools_argv(NULL, argv, 8));
+        ASSERT(!zcl_dev_proof_test_docs_tools_argv("", argv, 8));
+        ASSERT(!zcl_dev_proof_test_docs_tools_argv(jobs, NULL, 8));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_landing_proof_defers_preparation(void)
+{
+    int failures = 0;
+    TEST("landing proof: preparation lock defers claim without losing request bytes") {
+        struct ic_landing_proof_fixture f = {0};
+        ASSERT(ic_landing_proof_prepare(&f, "landing_defer"));
+        int lock = open(f.step, O_RDWR | O_CLOEXEC);
+        ASSERT(lock >= 0);
+        ASSERT(flock(lock, LOCK_EX | LOCK_NB) == 0);
+        char why[256] = {0};
+        int claimed = zcl_dev_proof_queue_run_next(f.root, why, sizeof(why));
+        bool unchanged = ic_landing_request_unchanged(&f);
+        ASSERT(flock(lock, LOCK_UN) == 0);
+        ASSERT(close(lock) == 0);
+        ASSERT_EQ(claimed, 0);
+        ASSERT_STR_EQ(why, "proof_landing_preparation_busy");
+        ASSERT(unchanged);
+        ASSERT_EQ(zcl_dev_proof_queue_run_next(f.root, why, sizeof(why)), 1);
+        ASSERT(access(f.request, F_OK) != 0);
+        ASSERT(access(f.failure, F_OK) == 0);
+        ASSERT(test_rm_rf_recursive(f.parent) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_landing_proof_refuses_unsafe_lock(void)
+{
+    int failures = 0;
+    TEST("landing proof: unsafe step lock refuses before publishing an attempt") {
+        struct ic_landing_proof_fixture f = {0};
+        ASSERT(ic_landing_proof_prepare(&f, "landing_lock_shape"));
+        ASSERT(unlink(f.step) == 0);
+        ASSERT(symlink("queue.lock", f.step) == 0);
+        char why[256] = {0};
+        ASSERT_EQ(zcl_dev_proof_queue_run_next(f.root, why, sizeof(why)), -1);
+        ASSERT_STR_EQ(why, "proof_landing_step_lock_failed");
+        ASSERT(ic_landing_request_unchanged(&f));
+        ASSERT(unlink(f.step) == 0);
+        ASSERT(mkdir(f.step, 0700) == 0);
+        ASSERT_EQ(zcl_dev_proof_queue_run_next(f.root, why, sizeof(why)), -1);
+        ASSERT_STR_EQ(why, "proof_landing_step_lock_failed");
+        ASSERT(ic_landing_request_unchanged(&f));
+        ASSERT(test_rm_rf_recursive(f.parent) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Fake Git pauses the real worker at its first source check, after queue
+ * claim. FIFOs synchronize the observation without a timing sleep. */
+static bool ic_landing_blocking_git(const char *root, int channels[2],
+                                    char path[8192])
+{
+    if (!ic_write(root, "bin/git", "#!/bin/sh\nprintf r > .proof-ready\n"
+                  "IFS= read -r release < .proof-release\nexit 1\n"))
+        return false;
+    char file[4096], canonical[4096];
+    snprintf(file, sizeof(file), "%s/bin/git", root);
+    if (chmod(file, 0700) != 0 || !realpath(root, canonical)) return false;
+    const char *prior = getenv("PATH");
+    int len = snprintf(path, 8192, "%s/bin:%s", canonical, prior ? prior : "");
+    if (len <= 0 || len >= 8192) return false;
+    static const char *const names[] = {".proof-ready", ".proof-release"};
+    for (size_t i = 0; i < 2; i++) {
+        snprintf(file, sizeof(file), "%s/%s", root, names[i]);
+        if (mkfifo(file, 0600) != 0) return false;
+        channels[i] = open(file, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (channels[i] < 0) return false;
+    }
+    return true;
+}
+
+static pid_t ic_landing_worker_start(const char *root, const char *path,
+                                     const int channels[2])
+{
+    pid_t worker = fork();
+    if (worker != 0) return worker;
+    (void)close(channels[0]);
+    (void)close(channels[1]);
+    if (setpgid(0, 0) != 0 || setenv("PATH", path, 1) != 0 ||
+        setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) != 0) _exit(2);
+    char why[256] = {0};
+    _exit(zcl_dev_proof_queue_run_next(root, why, sizeof(why)) == 1 ? 0 : 3);
+}
+
+struct ic_landing_worker_observation {
+    bool ready, released, settled;
+    int during, during_errno, after, status, execution_during;
+};
+
+static bool ic_landing_worker_observe(const char *root, const char *step, pid_t worker,
+                                       const int channels[2],
+                                       struct ic_landing_worker_observation *out)
+{
+    struct pollfd ready = {.fd = channels[0], .events = POLLIN};
+    out->ready = poll(&ready, 1, 10000) == 1 && (ready.revents & POLLIN);
+    int execution = -1;
+    char why[160] = {0};
+    out->execution_during = zcl_dev_proof_execution_acquire(root, &execution,
+                                                             why, sizeof(why));
+    if (out->execution_during > 0) zcl_dev_proof_execution_release(execution);
+    int lock = open(step, O_RDWR | O_CLOEXEC);
+    out->during = lock >= 0 ? flock(lock, LOCK_EX | LOCK_NB) : -1;
+    out->during_errno = errno;
+    if (out->during == 0) (void)flock(lock, LOCK_UN);
+    out->released = write(channels[1], "done\n", 5) == 5;
+    if (!out->ready) {
+        (void)kill(-worker, SIGTERM);
+        (void)kill(worker, SIGTERM);
+    }
+    out->settled = waitpid(worker, &out->status, 0) == worker;
+    (void)close(channels[0]);
+    (void)close(channels[1]);
+    out->after = lock >= 0 ? flock(lock, LOCK_EX | LOCK_NB) : -1;
+    if (out->after == 0) (void)flock(lock, LOCK_UN);
+    if (lock >= 0) (void)close(lock);
+    return lock >= 0;
+}
+
+static int test_ic_landing_proof_holds_lock_through_worker(void)
+{
+    int failures = 0;
+    TEST("landing proof: shared step lock survives claim through worker completion") {
+        struct ic_landing_proof_fixture f = {0};
+        ASSERT(ic_landing_proof_prepare(&f, "landing_lifetime"));
+        int channels[2] = {-1, -1};
+        char path[8192];
+        ASSERT(ic_landing_blocking_git(f.root, channels, path));
+        pid_t worker = ic_landing_worker_start(f.root, path, channels);
+        ASSERT(worker >= 0);
+        struct ic_landing_worker_observation observed = {0};
+        ASSERT(ic_landing_worker_observe(f.root, f.step, worker, channels, &observed));
+        ASSERT(observed.ready);
+        ASSERT_EQ(observed.execution_during, 0);
+        ASSERT(observed.during != 0 && (observed.during_errno == EWOULDBLOCK ||
+                                        observed.during_errno == EAGAIN));
+        ASSERT(observed.released && observed.settled &&
+                WIFEXITED(observed.status) && WEXITSTATUS(observed.status) == 0);
+        ASSERT_EQ(observed.after, 0);
+        ASSERT(access(f.failure, F_OK) == 0);
+        ASSERT(test_rm_rf_recursive(f.parent) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+#if !defined(_WIN32)
+static bool ic_foreground_ancestry(struct ic_landing_proof_fixture *f,
+                                    char local[41], char other[41], char base[41])
+{
+    char command[8192];
+    if (snprintf(command, sizeof(command),
+        "git -C %s init -q && git -C %s -c user.name=fixture "
+        "-c user.email=fixture@example.invalid -c commit.gpgsign=false "
+        "commit -qm base --allow-empty && "
+        "git -C %s rev-parse HEAD && git -C %s "
+        "-c user.name=fixture -c user.email=fixture@example.invalid "
+        "-c commit.gpgsign=false commit -qm older --allow-empty && "
+        "git -C %s rev-parse HEAD && git -C %s "
+        "-c user.name=fixture -c user.email=fixture@example.invalid "
+        "-c commit.gpgsign=false commit -qm selected --allow-empty && "
+        "git -C %s rev-parse HEAD", f->root, f->root, f->root, f->root,
+        f->root, f->root, f->root) >= (int)sizeof(command)) return false;
+    FILE *input = popen(command, "r");
+    if (!input) return false;
+    bool ok = fscanf(input, "%40s\n%40s\n%40s", base, other, local) == 3;
+    return pclose(input) == 0 && ok;
+}
+
+static int test_ic_proof_enqueue_requires_commit_objects(void)
+{
+    int failures = 0;
+    TEST("proof enqueue: malformed and missing commit objects never enter the queue") {
+        static const char missing_local[] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        static const char missing_base[] =
+            "1111111111111111111111111111111111111111";
+        struct ic_landing_proof_fixture f = {0};
+        struct zcl_dev_proof_status status = {0};
+        char local[41], other[41], base[41], tree[41], request[4096];
+        test_make_tmpdir(f.parent, sizeof(f.parent), "impact_composition",
+                         "enqueue-object-identity");
+        ASSERT(snprintf(f.root, sizeof(f.root), "%s/repo", f.parent) <
+               (int)sizeof(f.root));
+        ASSERT(mkdir(f.root, 0700) == 0);
+        ASSERT(ic_foreground_ancestry(&f, local, other, base));
+        char command[4096];
+        ASSERT(snprintf(command, sizeof(command),
+                        "git -C %s rev-parse HEAD^{tree}", f.root) <
+               (int)sizeof(command));
+        FILE *input = popen(command, "r");
+        ASSERT(input != NULL);
+        bool tree_read = fscanf(input, "%40s", tree) == 1;
+        ASSERT(pclose(input) == 0 && tree_read);
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        ASSERT(!zcl_dev_proof_ensure(f.root, "not-an-oid", base, &status));
+        ASSERT_STR_EQ(status.detail, "local_commit_invalid");
+        ASSERT(!zcl_dev_proof_ensure(f.root, missing_local, base, &status));
+        ASSERT_STR_EQ(status.detail, "local_commit_object_missing");
+        ASSERT(!zcl_dev_proof_ensure(f.root, tree, base, &status));
+        ASSERT_STR_EQ(status.detail, "local_commit_object_missing");
+        ASSERT(!zcl_dev_proof_ensure(f.root, local, missing_base, &status));
+        ASSERT_STR_EQ(status.detail, "remote_base_object_missing");
+        ASSERT(snprintf(request, sizeof(request),
+                        "%s/.cache/zcl-dev-proof/requests/%s-%s.request",
+                        f.root, local, missing_base) < (int)sizeof(request));
+        ASSERT(access(request, F_OK) != 0);
+        ASSERT(zcl_dev_proof_ensure(f.root, local, base, &status));
+        ASSERT_EQ(status.state, ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT_STR_EQ(status.detail, "resident_proof_request_queued");
+        ASSERT(unsetenv("ZCL_DEVLOOP_TEST_PROCESS") == 0);
+        ASSERT(test_rm_rf_recursive(f.parent) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static const struct zcl_command_reply *ic_proof_captured_reply;
+
+static void ic_proof_captured_handler(const struct zcl_command_request *request,
+                                        struct zcl_command_reply *reply)
+{
+    (void)request;
+    json_free(&reply->data);
+    *reply = *ic_proof_captured_reply;
+    json_init(&reply->data);
+    json_copy(&reply->data, &ic_proof_captured_reply->data);
+}
+
+static bool ic_proof_reply_serializes(const struct zcl_command_reply *reply)
+{
+    const struct zcl_command_spec *registered = zcl_command_registry_find(
+        zcl_command_catalog(), "dev.proof.step", NULL);
+    if (!registered) return false;
+    struct zcl_command_spec spec = *registered;
+    spec.handler = ic_proof_captured_handler;
+    struct json_value input, doc;
+    json_init(&input);
+    json_init(&doc);
+    json_set_object(&input);
+    bool ready = json_push_kv_str(&input, "root", json_get_str(json_get(&reply->data, "root"))) &&
+        json_push_kv_str(&input, "local_commit", json_get_str(json_get(&reply->data, "local_commit"))) &&
+        json_push_kv_str(&input, "remote_base", json_get_str(json_get(&reply->data, "remote_base")));
+    char wire[8192];
+    enum zcl_command_exit code;
+    ic_proof_captured_reply = reply;
+    size_t len = ready ? zcl_command_registry_execute_json(zcl_command_catalog(),
+        &spec, NULL, &input, false, spec.path, NULL, 0, 0, NULL,
+        wire, sizeof(wire), &code) : 0;
+    ic_proof_captured_reply = NULL;
+    bool ok = len > 0 && code == reply->exit_code && json_read(&doc, wire, len);
+    const char *error = json_get_str(json_get(json_get(&doc, "error"), "code"));
+    ok = ok && error && strcmp(error, reply->error.code) == 0;
+    json_free(&doc);
+    json_free(&input);
+    return ok;
+}
+
+static int test_ic_foreground_selected_pair(void)
+{
+    int failures = 0;
+    char *saved_process_env = NULL;
+    bool process_env_changed = false;
+    TEST("proof step: only selected pair runs; failed worker stays failed without watcher") {
+        const char *process_env = getenv("ZCL_DEVLOOP_TEST_PROCESS");
+        if (process_env) {
+            saved_process_env = zcl_strdup(process_env, "foreground fixture process environment");
+            ASSERT(saved_process_env != NULL);
+        }
+        ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+        process_env_changed = true;
+        struct ic_landing_proof_fixture f = {0};
+        ASSERT(ic_landing_proof_prepare(&f, "foreground-selected"));
+        ASSERT(unlink(f.request) == 0);
+        char local[41], other[41], base[41];
+        ASSERT(ic_foreground_ancestry(&f, local, other, base));
+        const char *ancestor_argv[] = {"git", "merge-base", "--is-ancestor", other, local, NULL};
+        struct zcl_devloop_process_result ancestor = {0};
+        ASSERT(zcl_devloop_process_run(f.root, ancestor_argv, 5000, &ancestor));
+        ASSERT_EQ(ancestor.exit_code, 0);
+        snprintf(f.request, sizeof(f.request),
+                 "%s/.cache/zcl-dev-proof/requests/%s-%s.request", f.root, local, base);
+        snprintf(f.failure, sizeof(f.failure),
+                 "%s/.cache/zcl-dev-proof/%s-%s.failed", f.root, local, base);
+        struct zcl_dev_proof_status status = {0};
+        ASSERT(zcl_dev_proof_ensure(f.root, other, base, &status));
+        char request[4096], watcher[4096];
+        snprintf(request, sizeof(request), "%s/.cache/zcl-dev-proof/requests/%s-%s.request", f.root, other, base);
+        uint8_t bytes[320];
+        FILE *input = fopen(request, "rb");
+        ASSERT(input != NULL);
+        size_t size = fread(bytes, 1, sizeof(bytes), input);
+        ASSERT(fclose(input) == 0 && size > 0 && size < sizeof(bytes));
+        ASSERT_EQ(zcl_dev_proof_step(f.root, local, base, &status), 1);
+        ASSERT_EQ(status.state, ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(access(f.failure, F_OK) == 0 && access(f.request, F_OK) != 0);
+        ASSERT(ic_bytes_equal(request, bytes, size));
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.dev_proof_status.v1");
+        zcl_dev_proof_step_conclude(&reply, 1, &status);
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_FAILED);
+        ASSERT_STR_EQ(reply.error.code, "PROOF_FAILED");
+        ASSERT_STR_EQ(reply.next[0].command, "dev.proof.retry");
+        ASSERT(ic_proof_reply_serializes(&reply));
+        zcl_command_reply_free(&reply);
+        ASSERT_EQ(zcl_dev_proof_step(f.root, local, base, &status), 1);
+        ASSERT_EQ(status.state, ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(access(f.request, F_OK) != 0);
+        ASSERT(zcl_dev_proof_retry(f.root, local, base, &status));
+        ASSERT_EQ(zcl_dev_proof_step(f.root, local, base, &status), 1);
+        ASSERT_EQ(status.state, ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(ic_bytes_equal(request, bytes, size));
+        snprintf(watcher, sizeof(watcher), "%s/.cache/zcl-dev-watch.lock", f.root);
+        ASSERT(ic_watcher_lock_unowned(watcher));
+        ASSERT(test_rm_rf_recursive(f.parent) == 0);
+        PASS();
+    } _test_next:;
+    if (process_env_changed) {
+        int restored = saved_process_env
+            ? setenv("ZCL_DEVLOOP_TEST_PROCESS", saved_process_env, 1)
+            : unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+        if (restored != 0) {
+            fprintf(stderr, "foreground fixture: cannot restore process environment\n");
+            failures++;
+        }
+    }
+    free(saved_process_env);
+    return failures;
+}
+
+/* The proof worker must not hand the operator's credentials to candidate
+ * code: API keys, tokens and the ssh-agent socket are unset, while Z23's own
+ * registered knobs and ordinary variables survive. */
+static int test_ic_proof_env_scrubs_credentials(void)
+{
+    int failures = 0;
+    TEST("proof step: worker environment drops operator credentials") {
+        static const char *const gone[] = {
+            "IC_FAKE_API_KEY", "IC_FAKE_TOKEN", "IC_FAKE_SECRET",
+            "IC_FAKE_PASSWORD", "SSH_AUTH_SOCK",
+        };
+        static const char *const kept[] = {
+            "ZCL_PROCESS_START_TOKEN", "IC_FAKE_TOKENIZER", "IC_PLAIN_VALUE",
+        };
+        char *saved_sock = getenv("SSH_AUTH_SOCK")
+            ? strdup(getenv("SSH_AUTH_SOCK")) : NULL;
+        char *saved_start = getenv("ZCL_PROCESS_START_TOKEN")
+            ? strdup(getenv("ZCL_PROCESS_START_TOKEN")) : NULL;
+        for (size_t i = 0; i < sizeof(gone) / sizeof(gone[0]); i++)
+            ASSERT_EQ(setenv(gone[i], "secret", 1), 0);
+        for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); i++)
+            ASSERT_EQ(setenv(kept[i], "keep", 1), 0);
+        ASSERT(zcl_dev_proof_test_prepare_environment());
+        for (size_t i = 0; i < sizeof(gone) / sizeof(gone[0]); i++)
+            ASSERT(getenv(gone[i]) == NULL);
+        for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); i++)
+            ASSERT(getenv(kept[i]) != NULL);
+        ASSERT_STR_EQ(getenv("ZCL_LINT_CACHE"), "0");
+        (void)unsetenv("IC_FAKE_TOKENIZER");
+        (void)unsetenv("IC_PLAIN_VALUE");
+        (void)unsetenv("ZCL_LINT_CACHE");
+        if (saved_start) (void)setenv("ZCL_PROCESS_START_TOKEN", saved_start, 1);
+        else (void)unsetenv("ZCL_PROCESS_START_TOKEN");
+        if (saved_sock) (void)setenv("SSH_AUTH_SOCK", saved_sock, 1);
+        free(saved_start);
+        free(saved_sock);
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_foreground_execution_busy(void)
+{
+    int failures = 0;
+    TEST("proof step: foreground and resident consumers share execution exclusion") {
+        struct ic_landing_proof_fixture f = {0};
+        ASSERT(ic_landing_proof_prepare(&f, "foreground-busy"));
+        int execution = -1;
+        char why[256] = {0};
+        ASSERT_EQ(zcl_dev_proof_execution_acquire(f.root, &execution, why, sizeof(why)), 1);
+        struct zcl_dev_proof_status status = {0};
+        int result = zcl_dev_proof_step(f.root,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1111111111111111111111111111111111111111", &status);
+        int resident = zcl_dev_proof_queue_run_next(f.root, why, sizeof(why));
+        bool edit_deferred = zcl_dev_proof_test_edit_busy(f.root);
+        zcl_dev_proof_execution_release(execution);
+        ASSERT(edit_deferred);
+        ASSERT_EQ(result, 0);
+        ASSERT_EQ(resident, 0);
+        ASSERT_STR_EQ(status.detail, "proof_execution_busy");
+        ASSERT_STR_EQ(why, "proof_execution_busy");
+        ASSERT(zcl_dev_proof_test_edit_lifetime(f.root));
+        ASSERT(zcl_dev_proof_test_edit_stop_cancels(f.root));
+        ASSERT(ic_landing_request_unchanged(&f));
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.dev_proof_status.v1");
+        zcl_dev_proof_step_conclude(&reply, result, &status);
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_BLOCKED);
+        ASSERT(reply.error.retryable && !reply.error.mutated);
+        ASSERT_STR_EQ(reply.error.code, "PROOF_STEP_BUSY");
+        ASSERT_EQ(reply.next_count, 0);
+        ASSERT(strstr(reply.error.next_action, "retry dev.proof.step") != NULL);
+        ASSERT(ic_proof_reply_serializes(&reply));
+        zcl_command_reply_free(&reply);
+        ASSERT(test_rm_rf_recursive(f.parent) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_foreground_refuses_watcher(void)
+{
+    int failures = 0;
+    TEST("proof step: live watcher refuses; stale lock file can resume proof") {
+        struct ic_landing_proof_fixture f = {0};
+        ASSERT(ic_landing_proof_prepare(&f, "foreground-watcher"));
+        const char marker[] = "123 verify ready proofq1\n";
+        ASSERT(ic_write(f.root, ".cache/zcl-dev-watch.lock", marker));
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/.cache/zcl-dev-watch.lock", f.root);
+        int watcher = open(path, O_RDWR | O_CLOEXEC);
+        ASSERT(watcher >= 0);
+        ASSERT(flock(watcher, LOCK_EX | LOCK_NB) == 0);
+        struct zcl_dev_proof_status status = {0};
+        int result = zcl_dev_proof_step(f.root,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1111111111111111111111111111111111111111", &status);
+        ASSERT_EQ(result, 0);
+        ASSERT_STR_EQ(status.detail, "proof_foreground_requires_unarmed_checkout");
+        ASSERT(ic_landing_request_unchanged(&f));
+        ASSERT(ic_bytes_equal(path, (const uint8_t *)marker, sizeof(marker) - 1));
+        struct zcl_command_reply reply;
+        zcl_command_reply_init(&reply, "zcl.dev_proof_status.v1");
+        zcl_dev_proof_step_conclude(&reply, result, &status);
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_BLOCKED);
+        ASSERT_STR_EQ(reply.error.code, "PROOF_STEP_WATCHER_PRESENT");
+        ASSERT(ic_proof_reply_serializes(&reply));
+        zcl_command_reply_free(&reply);
+        ASSERT(flock(watcher, LOCK_UN) == 0);
+        ASSERT(close(watcher) == 0);
+        ASSERT_EQ(zcl_dev_proof_step(f.root,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1111111111111111111111111111111111111111", &status), 1);
+        ASSERT_EQ(status.state, ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(access(f.request, F_OK) != 0);
+        ASSERT(access(f.failure, F_OK) == 0);
+        ASSERT(ic_bytes_equal(path, (const uint8_t *)marker, sizeof(marker) - 1));
+        struct stat before, after;
+        ASSERT(stat(f.failure, &before) == 0);
+        ASSERT_EQ(zcl_dev_proof_step(f.root,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1111111111111111111111111111111111111111", &status), 1);
+        ASSERT_EQ(status.state, ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(stat(f.failure, &after) == 0);
+        ASSERT(before.st_ino == after.st_ino &&
+               before.st_size == after.st_size);
+        ASSERT(test_rm_rf_recursive(f.parent) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static pid_t ic_foreground_requester(const char *root, const char *path,
+                                       const int channels[2], bool independent)
+{
+    pid_t requester = fork();
+    if (requester != 0) return requester;
+    (void)close(channels[0]);
+    (void)close(channels[1]);
+    if (setpgid(0, 0) != 0 || setenv("PATH", path, 1) != 0 ||
+        (independent && (setenv("HOME", root, 1) != 0 ||
+                         setenv("XDG_STATE_HOME", root, 1) != 0)) ||
+        setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) != 0) _exit(2);
+    struct zcl_dev_proof_status status = {0};
+    int result = zcl_dev_proof_step(root,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "1111111111111111111111111111111111111111", &status);
+    _exit(result == 1 && status.state == ZCL_DEV_PROOF_STATE_FAILED ? 0 : 3);
+}
+
+static int ic_foreground_guard(const char *root)
+{
+    int guard = -1;
+    char why[160] = {0};
+    int result = zcl_dev_proof_execution_acquire(root, &guard, why, sizeof(why));
+    if (result > 0) zcl_dev_proof_execution_release(guard);
+    return result;
+}
+
+static bool ic_foreground_settled(const char *root)
+{
+    for (size_t i = 0; i < 250; i++) {
+        if (ic_foreground_guard(root) == 1) return true;
+        platform_sleep_ms(20); /* real-clock: observes kernel flock release by the surviving worker; virtual time cannot settle it. */
+    }
+    return false;
+}
+
+static bool ic_foreground_landing_locked(const char *path)
+{
+    int guard = open(path, O_RDWR | O_CLOEXEC);
+    if (guard < 0) return false;
+    int result = flock(guard, LOCK_EX | LOCK_NB);
+    bool held = result < 0 && (errno == EWOULDBLOCK || errno == EAGAIN);
+    if (result == 0) (void)flock(guard, LOCK_UN);
+    (void)close(guard);
+    return held;
+}
+
+static bool ic_foreground_reap(pid_t requester, int *status)
+{
+    for (size_t i = 0; i < 500; i++) {
+        if (waitpid(requester, status, WNOHANG) == requester) return true;
+        platform_sleep_ms(20); /* real-clock: bounds waitpid observation after signal delivery; virtual time cannot reap the process. */
+    }
+    (void)kill(-requester, SIGKILL);
+    (void)kill(requester, SIGKILL);
+    (void)waitpid(requester, status, 0);
+    return false;
+}
+
+static bool ic_foreground_owner_observe(const struct ic_landing_proof_fixture *f,
+                                          pid_t requester, int ready_fd,
+                                          int signal_number)
+{
+    struct pollfd ready = {.fd = ready_fd, .events = POLLIN};
+    bool observed = poll(&ready, 1, 10000) == 1;
+    int before = ic_foreground_guard(f->root);
+    bool landing_before = ic_foreground_landing_locked(f->step);
+    bool sent = kill(requester, signal_number) == 0;
+    int status = 0;
+    bool reaped = ic_foreground_reap(requester, &status);
+    bool outcome = signal_number == SIGKILL
+        ? WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL
+        : WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    int guard_after = ic_foreground_guard(f->root);
+    bool landing_after = ic_foreground_landing_locked(f->step);
+    bool lifetime = signal_number == SIGKILL
+        ? guard_after == 0 && landing_after : guard_after == 1 && !landing_after;
+    return observed && before == 0 && landing_before && sent && reaped &&
+           outcome && lifetime;
+}
+
+static bool ic_foreground_owner_case(int signal_number)
+{
+    struct ic_landing_proof_fixture f = {0};
+    if (!ic_landing_proof_prepare(&f, "foreground-owner")) return false;
+    int channels[2] = {-1, -1};
+    char path[8192];
+    if (!ic_landing_blocking_git(f.root, channels, path)) return false;
+    pid_t requester = ic_foreground_requester(f.root, path, channels, false);
+    if (requester < 0) return false;
+    bool observed = ic_foreground_owner_observe(&f, requester, channels[0], signal_number);
+    bool released = write(channels[1], "done\n", 5) == 5;
+    bool settled = ic_foreground_settled(f.root);
+    if (!settled) (void)kill(-requester, SIGKILL);
+    (void)close(channels[0]);
+    (void)close(channels[1]);
+    bool cleaned = test_rm_rf_recursive(f.parent) == 0;
+    return observed && released && settled && cleaned;
+}
+
+static int test_ic_foreground_owner_lifetime(void)
+{
+    int failures = 0;
+    TEST("proof step: requester cancellation settles worker; requester death preserves its guard") {
+        ASSERT(ic_foreground_owner_case(SIGTERM));
+        ASSERT(ic_foreground_owner_case(SIGKILL));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int ic_proof_state_entries(const char *root, const char *name)
+{
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/.cache/zcl-dev-proof/%s", root,
+                 name) >= (int)sizeof(path))
+        return -1;
+    DIR *directory = opendir(path);
+    if (!directory) return -1;
+    int count = 0;
+    for (struct dirent *entry = readdir(directory); entry;
+         entry = readdir(directory)) {
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0)
+            count++;
+    }
+    return closedir(directory) == 0 ? count : -1;
+}
+
+struct ic_competing_proof_observation {
+    bool ready, released, owner_reaped, failure_persisted, watcher_unowned;
+    int attempts_during, attempts_after, loser_result, retry_result;
+    int loser_state, retry_state, owner_status;
+    char loser_detail[128];
+    bool cleaned;
+};
+
+static void ic_competing_proof_case(struct ic_competing_proof_observation *o)
+{
+    static const char local[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char base[] = "1111111111111111111111111111111111111111";
+    struct ic_landing_proof_fixture f = {0};
+    int channels[2] = {-1, -1};
+    char path[8192], watcher[4096];
+    pid_t worker = -1;
+    bool prepared = ic_landing_proof_prepare(&f, "competing-proof") &&
+                    ic_landing_blocking_git(f.root, channels, path);
+    if (prepared)
+        worker = ic_foreground_requester(f.root, path, channels, true);
+    if (worker > 0) {
+        struct pollfd ready = {.fd = channels[0], .events = POLLIN};
+        o->ready = poll(&ready, 1, 10000) == 1 &&
+                   (ready.revents & POLLIN) != 0;
+        if (o->ready) {
+            struct zcl_dev_proof_status status = {0};
+            o->attempts_during = ic_proof_state_entries(f.root, "attempts");
+            o->loser_result = zcl_dev_proof_step(f.root, local, base, &status);
+            o->loser_state = (int)status.state;
+            (void)snprintf(o->loser_detail, sizeof(o->loser_detail), "%s",
+                           status.detail);
+        }
+        o->released = write(channels[1], "done\n", 5) == 5;
+        o->owner_reaped = ic_foreground_reap(worker, &o->owner_status);
+        struct zcl_dev_proof_status status = {0};
+        o->retry_result = zcl_dev_proof_step(f.root, local, base, &status);
+        o->retry_state = (int)status.state;
+        o->attempts_after = ic_proof_state_entries(f.root, "attempts");
+        o->failure_persisted = access(f.failure, F_OK) == 0;
+        (void)snprintf(watcher, sizeof(watcher),
+                       "%s/.cache/zcl-dev-watch.lock", f.root);
+        o->watcher_unowned = ic_watcher_lock_unowned(watcher);
+    }
+    if (worker > 0) (void)kill(-worker, SIGKILL);
+    if (channels[0] >= 0) (void)close(channels[0]);
+    if (channels[1] >= 0) (void)close(channels[1]);
+    o->cleaned = prepared && test_rm_rf_recursive(f.parent) == 0;
+}
+
+static int test_ic_competing_fungible_proof_workers(void)
+{
+    int failures = 0;
+    TEST("proof step: independent worker owns one claim; loser retries terminal verdict") {
+        struct ic_competing_proof_observation o = {0};
+        ic_competing_proof_case(&o);
+        ASSERT(o.ready);
+        ASSERT_EQ(o.attempts_during, 1);
+        ASSERT_EQ(o.loser_result, 0);
+        ASSERT_EQ(o.loser_state, ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT_STR_EQ(o.loser_detail, "proof_execution_busy");
+        ASSERT(o.released && o.owner_reaped);
+        ASSERT(WIFEXITED(o.owner_status));
+        ASSERT_EQ(WEXITSTATUS(o.owner_status), 0);
+        ASSERT_EQ(o.retry_result, 1);
+        ASSERT_EQ(o.retry_state, ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT_EQ(o.attempts_after, 1);
+        ASSERT(o.failure_persisted && o.watcher_unowned && o.cleaned);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Hard death of the guard-owning worker itself: the requester stays alive
+ * while the forked worker named by the published pair lease takes SIGKILL at
+ * its first blocked source check — after claim, with both guards owned and
+ * the request already consumed into the attempt. An unrelated older pair
+ * sits in the same queue the whole time. Every post-condition is observed
+ * into the struct, then asserted one invariant per line; the driver always
+ * reaches its kill backstop and fixture cleanup, whatever fails. */
+struct ic_worker_death_observation {
+    bool ready, guard_busy_during, landing_held_during;
+    bool lease_read, lease_pid_alive;
+    long long worker_pid;
+    char token[192];
+    bool kill_sent, requester_reaped;
+    int requester_exit;
+    int guard_after;
+    bool landing_free_after, worker_gone, lease_intact;
+    bool attempt_request_preserved;
+    int killed_state;
+    bool receipt_absent, retry_refused;
+    char retry_detail[128];
+    bool unrelated_intact, requeued;
+    int requeued_state;
+    int held_consumer;
+    char held_why[64];
+    int first_drain, killed_settled;
+    bool killed_receipt_absent;
+    int second_drain;
+    bool unrelated_failed, leases_empty, attempt_request_preserved_end;
+    int queue_empty;
+    bool retry_admitted;
+    int retry_admitted_state, final_drain, final_state;
+    bool cleaned;
+};
+
+struct ic_worker_death_ctx {
+    struct ic_landing_proof_fixture f;
+    char other_request[4096], other_failure[4096], receipt[4096];
+    char dead_request[4096];
+    int channels[2];
+    pid_t requester;
+};
+
+/* Oldest admissible clocks: queue consumers always prefer pair A, so this
+ * unrelated request is never claimed until pair A has settled. */
+static const char ic_worker_other_body[] =
+    "zcl.dev_proof_request.v1\n"
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+    "2222222222222222222222222222222222222222\n1\n1\n";
+static const char ic_worker_other_leaf[] =
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-"
+    "2222222222222222222222222222222222222222";
+
+static bool ic_worker_lease_read(const char *root, char token[192],
+                                 long long *pid_out)
+{
+    char path[4096], text[384];
+    if (snprintf(path, sizeof(path),
+                 "%s/.cache/zcl-dev-proof/leases/"
+                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-"
+                 "1111111111111111111111111111111111111111.lease",
+                 root) >= (int)sizeof(path))
+        return false;
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    size_t size = fread(text, 1, sizeof(text) - 1, file);
+    bool ok = !ferror(file);
+    if (fclose(file) != 0) ok = false;
+    if (!ok || size == 0) return false;
+    text[size] = 0;
+    long long pid = 0, started = 0;
+    if (sscanf(text, "%191s %lld %lld", token, &pid, &started) != 3 ||
+        pid <= 1 || started <= 0)
+        return false;
+    *pid_out = pid;
+    return true;
+}
+
+static bool ic_worker_death_setup(struct ic_worker_death_ctx *c)
+{
+    c->channels[0] = -1;
+    c->channels[1] = -1;
+    c->requester = -1;
+    if (!ic_landing_proof_prepare(&c->f, "worker-hard-death")) return false;
+    char other_rel[4096];
+    snprintf(other_rel, sizeof(other_rel),
+             ".cache/zcl-dev-proof/requests/%s.request",
+             ic_worker_other_leaf);
+    snprintf(c->other_request, sizeof(c->other_request), "%s/%s",
+             c->f.root, other_rel);
+    snprintf(c->other_failure, sizeof(c->other_failure),
+             "%s/.cache/zcl-dev-proof/%s.failed", c->f.root,
+             ic_worker_other_leaf);
+    snprintf(c->receipt, sizeof(c->receipt),
+             "%s/.cache/zcl-dev-proof/receipts/"
+             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-"
+             "1111111111111111111111111111111111111111.receipt", c->f.root);
+    char path[8192];
+    if (!ic_proof_private_write(c->f.root, other_rel,
+                                ic_worker_other_body) ||
+        !ic_landing_blocking_git(c->f.root, c->channels, path))
+        return false;
+    c->requester = ic_foreground_requester(c->f.root, path, c->channels,
+                                           false);
+    return c->requester >= 0;
+}
+
+static void ic_worker_death_kill(struct ic_worker_death_ctx *c,
+                                 struct ic_worker_death_observation *o)
+{
+    struct pollfd ready = {.fd = c->channels[0], .events = POLLIN};
+    o->ready = poll(&ready, 1, 10000) == 1 && (ready.revents & POLLIN) != 0;
+    o->guard_busy_during = ic_foreground_guard(c->f.root) == 0;
+    o->landing_held_during = ic_foreground_landing_locked(c->f.step);
+    o->lease_read = ic_worker_lease_read(c->f.root, o->token, &o->worker_pid);
+    o->lease_pid_alive = o->lease_read && o->worker_pid > 1 &&
+        o->worker_pid != (long long)c->requester &&
+        kill((pid_t)o->worker_pid, 0) == 0;
+    if (o->ready && o->lease_pid_alive)
+        o->kill_sent = kill((pid_t)o->worker_pid, SIGKILL) == 0;
+     TEST_DISCARD(write(c->channels[1], "done\n", 5));
+    int status = 0;
+    o->requester_reaped = ic_foreground_reap(c->requester, &status);
+    o->requester_exit = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    (void)kill(-c->requester, SIGKILL);
+}
+
+static void ic_worker_death_observe(struct ic_worker_death_ctx *c,
+                                    struct ic_worker_death_observation *o)
+{
+    static const char local[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char base[] = "1111111111111111111111111111111111111111";
+    o->guard_after = ic_foreground_guard(c->f.root);
+    o->landing_free_after = !ic_foreground_landing_locked(c->f.step);
+    o->worker_gone = o->lease_read &&
+        kill((pid_t)o->worker_pid, 0) != 0 && errno == ESRCH;
+    char token_after[192] = {0};
+    long long pid_after = 0;
+    o->lease_intact = o->lease_read &&
+        ic_worker_lease_read(c->f.root, token_after, &pid_after) &&
+        strcmp(token_after, o->token) == 0 && pid_after == o->worker_pid;
+    snprintf(c->dead_request, sizeof(c->dead_request),
+             "%s/.cache/zcl-dev-proof/attempts/%s/request",
+             c->f.root, o->token);
+    o->attempt_request_preserved = o->lease_intact &&
+        ic_bytes_equal(c->dead_request, c->f.request_bytes,
+                       c->f.request_size);
+    struct zcl_dev_proof_status st;
+    memset(&st, 0, sizeof(st));
+    o->killed_state = zcl_dev_proof_status_read(c->f.root, local, base, &st)
+        ? (int)st.state : -1;
+    o->receipt_absent = access(c->receipt, F_OK) != 0;
+    memset(&st, 0, sizeof(st));
+    o->retry_refused = !zcl_dev_proof_retry(c->f.root, local, base, &st);
+    snprintf(o->retry_detail, sizeof(o->retry_detail), "%s", st.detail);
+    o->unrelated_intact = ic_bytes_equal(c->other_request,
+        (const uint8_t *)ic_worker_other_body,
+        sizeof(ic_worker_other_body) - 1);
+}
+
+static void ic_worker_death_recover(struct ic_worker_death_ctx *c,
+                                    struct ic_worker_death_observation *o)
+{
+    static const char local[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char base[] = "1111111111111111111111111111111111111111";
+    struct zcl_dev_proof_status st;
+    memset(&st, 0, sizeof(st));
+    o->requeued = zcl_dev_proof_ensure(c->f.root, local, base, &st);
+    o->requeued_state = (int)st.state;
+    int guard = -1;
+    char why[256] = {0};
+    bool held = zcl_dev_proof_execution_acquire(c->f.root, &guard, why,
+                                                sizeof(why)) == 1;
+    why[0] = 0;
+    o->held_consumer = held
+        ? zcl_dev_proof_queue_run_next(c->f.root, why, sizeof(why)) : -1;
+    snprintf(o->held_why, sizeof(o->held_why), "%s", why);
+    if (held) zcl_dev_proof_execution_release(guard);
+    why[0] = 0;
+    o->first_drain = zcl_dev_proof_queue_run_next(c->f.root, why,
+                                                  sizeof(why));
+    memset(&st, 0, sizeof(st));
+    o->killed_settled = zcl_dev_proof_status_read(c->f.root, local, base,
+                                                  &st)
+        ? (int)st.state : -1;
+    o->killed_receipt_absent = access(c->receipt, F_OK) != 0;
+    o->second_drain = zcl_dev_proof_queue_run_next(c->f.root, why,
+                                                   sizeof(why));
+    o->unrelated_failed = access(c->other_failure, F_OK) == 0;
+    o->queue_empty = zcl_dev_proof_queue_run_next(c->f.root, why,
+                                                  sizeof(why));
+    o->leases_empty = ic_landing_state_empty(c->f.root, "leases");
+    o->attempt_request_preserved_end =
+        ic_bytes_equal(c->dead_request, c->f.request_bytes,
+                       c->f.request_size);
+    memset(&st, 0, sizeof(st));
+    o->retry_admitted = zcl_dev_proof_retry(c->f.root, local, base, &st);
+    o->retry_admitted_state = (int)st.state;
+    o->final_drain = zcl_dev_proof_queue_run_next(c->f.root, why,
+                                                  sizeof(why));
+    memset(&st, 0, sizeof(st));
+    o->final_state = zcl_dev_proof_status_read(c->f.root, local, base, &st)
+        ? (int)st.state : -1;
+}
+
+static void ic_worker_hard_death(struct ic_worker_death_observation *o)
+{
+    struct ic_worker_death_ctx c;
+    memset(&c, 0, sizeof(c));
+    bool live = ic_worker_death_setup(&c);
+    if (live) {
+        ic_worker_death_kill(&c, o);
+        ic_worker_death_observe(&c, o);
+        ic_worker_death_recover(&c, o);
+    }
+    if (c.requester >= 0) (void)kill(-c.requester, SIGKILL);
+    if (c.channels[0] >= 0) (void)close(c.channels[0]);
+    if (c.channels[1] >= 0) (void)close(c.channels[1]);
+    o->cleaned = live && test_rm_rf_recursive(c.f.parent) == 0;
+}
+
+static int test_ic_worker_hard_death_containment(void)
+{
+    int failures = 0;
+    TEST("proof step: worker SIGKILL frees guards, preserves evidence, admits no completion") {
+        struct ic_worker_death_observation o = {0};
+        ic_worker_hard_death(&o);
+        ASSERT(o.ready);
+        ASSERT(o.guard_busy_during);
+        ASSERT(o.landing_held_during);
+        ASSERT(o.lease_read);
+        ASSERT(o.lease_pid_alive);
+        ASSERT(o.kill_sent);
+        ASSERT(o.requester_reaped);
+        ASSERT_EQ(o.requester_exit, 3);
+        ASSERT_EQ(o.guard_after, 1);
+        ASSERT(o.landing_free_after);
+        ASSERT(o.worker_gone);
+        ASSERT(o.lease_intact);
+        ASSERT(o.attempt_request_preserved);
+        ASSERT_EQ(o.killed_state, ZCL_DEV_PROOF_STATE_MISSING);
+        ASSERT(o.receipt_absent);
+        ASSERT(o.retry_refused);
+        ASSERT_STR_EQ(o.retry_detail, "proof_retry_requires_settled_failure");
+        ASSERT(o.unrelated_intact);
+        ASSERT(o.requeued);
+        ASSERT_EQ(o.requeued_state, ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT_EQ(o.held_consumer, 0);
+        ASSERT_STR_EQ(o.held_why, "proof_execution_busy");
+        ASSERT_EQ(o.first_drain, 1);
+        ASSERT_EQ(o.killed_settled, ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(o.killed_receipt_absent);
+        ASSERT_EQ(o.second_drain, 1);
+        ASSERT(o.unrelated_failed);
+        ASSERT_EQ(o.queue_empty, 0);
+        ASSERT(o.leases_empty);
+        ASSERT(o.attempt_request_preserved_end);
+        ASSERT(o.retry_admitted);
+        ASSERT_EQ(o.retry_admitted_state, ZCL_DEV_PROOF_STATE_RUNNING);
+        ASSERT_EQ(o.final_drain, 1);
+        ASSERT_EQ(o.final_state, ZCL_DEV_PROOF_STATE_FAILED);
+        ASSERT(o.cleaned);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+static int test_ic_foreground_proof_command(void)
+{
+    int failures = 0;
+    TEST("proof step: exact foreground execution is discoverable without a watcher") {
+        const struct zcl_command_spec *spec = zcl_command_registry_find(
+            zcl_command_catalog(), "dev.proof.step", NULL);
+        ASSERT(spec != NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── harness-file routing (agent_impact_harness.h) ──────────────────────
+ *
+ * The shared rule table above (agent_impact_rules.def) only fires on a
+ * compiled-source dependency edge or a hand-written glob; a file under
+ * tests/harness/src/ is never #included by anything, so it earns neither.
+ * These cover the three structural conventions agent_impact_harness.c
+ * resolves instead of a fourth per-file rule row: test_<group>.c naming,
+ * the Windows-acceptance sources table (including a helper two rows
+ * share), a string-literal name reference, and the genuine no-owner
+ * case that must stay unmatched rather than guess. */
+
+static int ic_landing_production_route(void)
+{
+    int failures = 0;
+    TEST("landing production-only impact retains its UTF-8 regression group") {
+        const char *files[] = { "tools/command/native_dev_land.c" };
+        struct agent_impact_acc impact = {0};
+        ASSERT(agent_impact_apply_shared_rules(files[0], &impact));
+        ASSERT(!impact.groups_lost);
+        ASSERT(ic_acc_has_group(&impact, "dev_land"));
+        ASSERT(ic_acc_has_group(&impact, "make_lint_gates"));
+        struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, 1, &plan));
+        ASSERT(ic_planned(&plan, "dev_land"));
+        ASSERT(ic_planned(&plan, "make_lint_gates"));
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_harness_test_group_naming(void)
+{
+    int failures = ic_landing_production_route();
+    TEST("harness routing: test_<group>.c resolves from the catalog, not a "
+         "listed AGENT_IMPACT_RULE row") {
+        char group[ZCL_AGENT_IMPACT_GROUP_MAX];
+        ASSERT(agent_impact_harness_test_group_name(
+            "tests/harness/src/test_dev_land.c", group));
+        ASSERT_STR_EQ(group, "dev_land");
+
+        struct zcl_command_reply reply;
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "path",
+                                "tests/harness/src/test_dev_land.c"));
+        struct zcl_command_request request = {
+            .input = &input, .view = "normal", .invoked_name = "code.tests",
+        };
+        zcl_command_reply_init(&reply, "zcl.code_tests.v1");
+        zcl_native_handle_code_tests(&request, &reply);
+        ASSERT_STR_EQ(json_get_str(json_get(&reply.data, "route")), "dev_land");
+        ASSERT(json_get_bool(json_get(&reply.data, "matched")));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_harness_windows_acceptance_table(void)
+{
+    int failures = 0;
+    TEST("harness routing: a Windows-acceptance SOURCES row is read from "
+         "the table — including a helper file two rows share") {
+        static const char synthetic_table[] =
+            "ZCL_WINDOWS_ACCEPTANCE_alpha_SOURCES := \\\n"
+            "\ttests/harness/src/alpha_windows_acceptance.c \\\n"
+            "\ttests/harness/src/shared_helper.c\n"
+            "ZCL_WINDOWS_ACCEPTANCE_beta_SOURCES := \\\n"
+            "\ttests/harness/src/beta_windows_acceptance.c \\\n"
+            "\ttests/harness/src/shared_helper.c\n";
+        ASSERT(agent_impact_windows_acceptance_table_lists(
+            synthetic_table, "tests/harness/src/alpha_windows_acceptance.c"));
+        ASSERT(agent_impact_windows_acceptance_table_lists(
+            synthetic_table, "tests/harness/src/beta_windows_acceptance.c"));
+        /* the shared helper is linked into BOTH rows. */
+        ASSERT(agent_impact_windows_acceptance_table_lists(
+            synthetic_table, "tests/harness/src/shared_helper.c"));
+        /* a file present nowhere in the table is not a false positive. */
+        ASSERT(!agent_impact_windows_acceptance_table_lists(
+            synthetic_table, "tests/harness/src/unrelated.c"));
+
+        /* the real table: process_group_exec_windows_acceptance.c carries
+         * no per-file AGENT_IMPACT_RULE row (unlike most of its acceptance
+         * siblings), yet code.tests now matches it via this table alone. */
+        struct zcl_command_reply reply;
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "path",
+            "tests/harness/src/process_group_exec_windows_acceptance.c"));
+        struct zcl_command_request request = {
+            .input = &input, .view = "normal", .invoked_name = "code.tests",
+        };
+        zcl_command_reply_init(&reply, "zcl.code_tests.v1");
+        zcl_native_handle_code_tests(&request, &reply);
+        ASSERT_STR_EQ(json_get_str(json_get(&reply.data, "route")),
+                     "make_lint_gates");
+        ASSERT(json_get_bool(json_get(&reply.data, "matched")));
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_harness_name_reference_secondary_candidate(void)
+{
+    int failures = 0;
+    TEST("harness routing: a string-literal reference to a tools/ source "
+         "file adds its referencer's own group as a secondary candidate") {
+        ASSERT(agent_impact_string_literal_contains(
+            "ASSERT(strstr(buf, \"zcl-rpc\") != NULL);\n", "zcl-rpc"));
+        ASSERT(agent_impact_string_literal_contains(
+            "fprintf(stderr, \"blocked \\\"binary_missing_zcl_rpc\\\"\");\n",
+            "zcl_rpc"));
+        /* an identifier or comment occurrence outside any string literal
+         * never counts — this is a name-REFERENCE signal, not a grep. */
+        ASSERT(!agent_impact_string_literal_contains(
+            "/* zcl-rpc is mentioned only here, in a comment */\n"
+            "int zcl_rpc_unrelated(void);\n", "zcl-rpc"));
+
+        struct zcl_command_reply reply;
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "path", "tools/zcl-rpc.c"));
+        struct zcl_command_request request = {
+            .input = &input, .view = "normal", .invoked_name = "code.tests",
+        };
+        zcl_command_reply_init(&reply, "zcl.code_tests.v1");
+        zcl_native_handle_code_tests(&request, &reply);
+        const struct json_value *groups = json_get(&reply.data, "test_groups");
+        ASSERT(groups && groups->type == JSON_ARR);
+        bool saw_no_hardcoded_home = false, saw_replay_canary = false;
+        for (size_t i = 0; i < groups->num_children; i++) {
+            const char *g = json_get_str(&groups->children[i]);
+            if (g && strcmp(g, "no_hardcoded_home") == 0)
+                saw_no_hardcoded_home = true;
+            if (g && strcmp(g, "replay_canary_verdict") == 0)
+                saw_replay_canary = true;
+        }
+        ASSERT(saw_no_hardcoded_home);
+        ASSERT(saw_replay_canary);
+        /* a secondary candidate never displaces the structural route. */
+        ASSERT_STR_EQ(json_get_str(json_get(&reply.data, "route")),
+                     "make_lint_gates");
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_name_reference_single_word_stem_is_bounded(void)
+{
+    int failures = 0;
+    TEST("harness routing: a single-word basename (no '-' or '_') only "
+         "counts a whole-token, full-path match — never an unbounded "
+         "substring of an unrelated identifier or the wrong extension") {
+        /* Synthetic needle/text pairs below (never a real repo path) so this
+         * test's own source cannot become a live self-match for a real
+         * query — see the split-literal note on the E2E path below. "gad"
+         * stands in for a query stem like "main": a substring of the
+         * unrelated word "domain" the same way "main" is a substring of
+         * "domain". An unbounded scan would wrongly treat the identifier
+         * "domain_gad" as a reference to some file named gad.c; the bounded
+         * form requires the query's own repo-relative path as a whole
+         * token, so this never matches at all. */
+        ASSERT(!agent_impact_string_literal_contains_whole_token(
+            "\"domain_gad_thing\"\n", "tools/soak/gad.c"));
+        /* the query's own full path, present verbatim and bounded by '/'
+         * on the left and the end of the literal on the right, matches. */
+        ASSERT(agent_impact_string_literal_contains_whole_token(
+            "\"a fixture lives at tools/soak/gad.c today\"\n",
+            "tools/soak/gad.c"));
+        /* a different extension must not count as the same file: the
+         * character right after the ".c" match is an identifier char. */
+        ASSERT(!agent_impact_string_literal_contains_whole_token(
+            "\"see tools/soak/gad.cpp for the C++ port\"\n",
+            "tools/soak/gad.c"));
+
+        /* Use a single-word source basename with no explicit product-group
+         * rule. The soak runner has its own declared groups. Split the path
+         * so this test does not create its own source match. */
+        struct zcl_command_reply reply;
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "path", "tools/lint/lintc/" "main.c"));
+        struct zcl_command_request request = {
+            .input = &input, .view = "normal", .invoked_name = "code.tests",
+        };
+        zcl_command_reply_init(&reply, "zcl.code_tests.v1");
+        zcl_native_handle_code_tests(&request, &reply);
+        const struct json_value *groups = json_get(&reply.data, "test_groups");
+        ASSERT(groups && groups->type == JSON_ARR && groups->num_children == 1);
+        ASSERT_STR_EQ(json_get_str(&groups->children[0]), "make_lint_gates");
+        ASSERT_STR_EQ(json_get_str(json_get(&reply.data, "route")),
+                     "make_lint_gates");
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_harness_no_owner_stays_unmatched(void)
+{
+    int failures = 0;
+    TEST("harness routing: a harness file with no test_<group> name, no "
+         "acceptance-table row, and no shared rule stays matched:false — "
+         "never a guess") {
+        char group[ZCL_AGENT_IMPACT_GROUP_MAX];
+        ASSERT(!agent_impact_harness_test_group_name(
+            "tests/harness/src/not_a_registered_group_at_all.c", group));
+
+        struct zcl_command_reply reply;
+        struct json_value input;
+        json_init(&input); json_set_object(&input);
+        ASSERT(json_push_kv_str(&input, "path",
+            "tests/harness/src/not_a_registered_group_at_all.c"));
+        struct zcl_command_request request = {
+            .input = &input, .view = "normal", .invoked_name = "code.tests",
+        };
+        zcl_command_reply_init(&reply, "zcl.code_tests.v1");
+        zcl_native_handle_code_tests(&request, &reply);
+        ASSERT(!json_get_bool(json_get(&reply.data, "matched")));
+        ASSERT_STR_EQ(json_get_str(json_get(&reply.data, "route")),
+                     "make_lint_gates");
+        const struct json_value *groups = json_get(&reply.data, "test_groups");
+        ASSERT(groups && groups->type == JSON_ARR && groups->num_children == 0);
+        zcl_command_reply_free(&reply);
+        json_free(&input);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* ── T4b2: the INCLUDE dimension's capacity bound is capacity too ──────
+ *
+ * codeindex_reverse_includes() says "closure-truncated" for two different
+ * facts: the dependent set outgrew the plan's cap, or the include graph cannot
+ * support a narrow answer at all (a stale, dangling, or incomplete depfile).
+ * Only the first is the index answering "too much to list", and it must widen
+ * exactly as the SEMANTIC bound does. The second is missing evidence and must
+ * keep refusing, including when both happen at once. */
+
+/* Defined in tools/dev/devloop_plan.c under ZCL_TESTING. */
+extern size_t zcl_devloop_test_closure_file_ceiling;
+
+#define IC_FIX_INCCAP IC_FIX_ROOT "/include_capacity"
+#define IC_INCCAP_DEF "engine/composition/zcode_package_registry.def"
+#define IC_MISSING_QUERY "core/modules/net/include/net/net.h"
+#define IC_MISSING_QUERY_CAUSE \
+    "query_input_regular_file_unverified " IC_MISSING_QUERY
+#define IC_GONE_CAUSE \
+    "prereq_not_regular build/obj/download.d -> " \
+    "core/modules/net/include/net/ic_gone.h"
+
+/* A registry both leaves were compiled against. `unsafe` adds a prerequisite
+ * the checkout does not hold, which makes the index refuse every narrow
+ * include answer for this tree. */
+static bool ic_write_include_fanout(const char *root, bool unsafe)
+{
+    char rm[4096];
+    (void)snprintf(rm, sizeof(rm), "rm -rf %s", root);
+ TEST_DISCARD(system(rm));
+    return ic_write_call_pair(root) &&
+           ic_write(root, IC_INCCAP_DEF, "/* registry fixture */\n"
+                                         "IC_ROW(alpha, 1)\n") &&
+           ic_write(root, "build/obj/tor_integration.d",
+                    "build/obj/tor_integration.o: "
+                    "core/modules/net/src/tor_integration.c "
+                    "core/modules/net/include/net/clp.h " IC_INCCAP_DEF
+                    "\n") &&
+           ic_write(root, "build/obj/download.d",
+                    unsafe ? "build/obj/download.o: "
+                             "core/modules/net/src/download.c "
+                             "core/modules/net/include/net/clp.h "
+                             IC_INCCAP_DEF " "
+                             "core/modules/net/include/net/ic_gone.h\n"
+                           : "build/obj/download.o: "
+                             "core/modules/net/src/download.c "
+                             "core/modules/net/include/net/clp.h "
+                             IC_INCCAP_DEF "\n");
+}
+
+static bool ic_include_plan(size_t ceiling, struct zcl_devloop_plan *plan)
+{
+    const char *files[] = { IC_INCCAP_DEF };
+    zcl_devloop_test_closure_file_ceiling = ceiling;
+    bool built = zcl_devloop_plan_files(files, 1, plan) &&
+                 zcl_devloop_plan_add_closure(IC_FIX_INCCAP, files, 1, plan);
+    zcl_devloop_test_closure_file_ceiling = 0;
+    return built;
+}
+
+static int test_ic_deleted_input_closes_current_graph(void)
+{
+    int failures = 0;
+    TEST("proof changed set: real deletion closes current graph and widens") {
+        ASSERT(ic_changed_fixture_build());
+        ASSERT(ic_write_include_fanout(IC_FIX_INCCAP, false));
+        struct zcl_dev_proof_changed_set set = {0};
+        char why[256] = {0};
+        const struct ic_structural_case removed = {
+            "add_known.sha", "del_known.sha", "del_known", IC_MISSING_QUERY, 1
+        };
+        ASSERT(ic_structural_capture(&removed, &set,
+                                     why, sizeof why));
+        static struct zcl_devloop_plan plan;
+        const char *reason = "";
+        bool admitted = zcl_dev_proof_test_changed_set_close(
+            IC_FIX_INCCAP, &set, &plan, &reason);
+        printf("invariant=deleted_input_current_graph admitted=%d reason=%s\n",
+               admitted, reason);
+        ASSERT(admitted);
+        ASSERT(plan.closure_universal);
+        ASSERT(set.current_files && set.current_count == 0);
+        ASSERT(set.count == 1 && strcmp(set.files[0], IC_MISSING_QUERY) == 0);
+        /* Missing path without authenticated D metadata still refuses. */
+        struct zcl_dev_proof_changed_set unknown = {
+            .files = set.files, .count = set.count
+        };
+        ASSERT(!zcl_dev_proof_test_changed_set_close(
+            IC_FIX_INCCAP, &unknown, &plan, &reason));
+        ASSERT_STR_EQ(reason, "closure-truncated");
+        ASSERT_STR_EQ(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].cause,
+                      IC_MISSING_QUERY_CAUSE);
+        /* A real deletion cannot hide a dangling current prerequisite. */
+        ASSERT(ic_write_include_fanout(IC_FIX_INCCAP, true));
+        ASSERT(!zcl_dev_proof_test_changed_set_close(
+            IC_FIX_INCCAP, &set, &plan, &reason));
+        ASSERT_STR_EQ(reason, "closure-truncated");
+        ASSERT_STR_EQ(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].cause, IC_GONE_CAUSE);
+        ASSERT(ic_write_include_fanout(IC_FIX_INCCAP, false));
+        ASSERT(unlink(IC_FIX_INCCAP "/build/obj/download.d") == 0);
+        ASSERT(unlink(IC_FIX_INCCAP "/build/obj/tor_integration.d") == 0);
+        ASSERT(!zcl_dev_proof_test_changed_set_close(
+            IC_FIX_INCCAP, &set, &plan, &reason));
+        ASSERT_STR_EQ(reason, "no-include-graph");
+        zcl_dev_proof_changed_set_release(&set);
+        ASSERT(set.current_files == NULL && set.current_count == 0);
+        /* Git --no-renames supplies D+A; the added current input is queried. */
+        const struct ic_structural_case moved = {
+            "rename_base.sha", "rename_known.sha", "rename_known",
+            IC_MISSING_QUERY, 2
+        };
+        ASSERT(ic_structural_capture(&moved, &set, why, sizeof why));
+        ASSERT(set.count == 2 && set.structural_count == 2);
+        ASSERT(set.current_count == 1);
+        ASSERT_STR_EQ(set.current_files[0], "core/modules/net/include/net/clp.h");
+        ASSERT(ic_write_include_fanout(IC_FIX_INCCAP, false));
+        ASSERT(zcl_dev_proof_test_changed_set_close(
+            IC_FIX_INCCAP, &set, &plan, &reason));
+        ASSERT(plan.closure_universal);
+        zcl_dev_proof_changed_set_release(&set);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_include_capacity_runs_everything(void)
+{
+    int failures = 0;
+    static char ic_fixture_saved[4096];
+    bool ic_fixture_was_set =
+        ic_host_fixture_save(ic_fixture_saved, sizeof(ic_fixture_saved));
+    TEST("impact composition: an include capacity bound runs the whole catalog") {
+        static struct zcl_devloop_plan plan;
+        const char *why = "unset";
+
+        /* Control: the same trustworthy graph under the production cap is an
+         * exact, complete answer that names both dependents. */
+        ASSERT(ic_write_include_fanout(IC_FIX_INCCAP, false));
+        ASSERT(ic_include_plan(0, &plan));
+        ASSERT(plan.path_groups_len > 0);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_SEMANTIC].status ==
+               ZCL_DEVLOOP_DIM_NOT_APPLICABLE);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+               ZCL_DEVLOOP_DIM_COMPLETE);
+        ASSERT(strcmp(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].reason, "") == 0);
+        ASSERT_STR_EQ(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].cause, "");
+        ASSERT(!plan.closure_universal);
+        ASSERT(ic_planned(&plan, "download"));
+        ASSERT(zcl_devloop_plan_proof_admissible(&plan, &why));
+
+        /* An absent changed input was never a prerequisite in this trusted
+         * graph. It must refuse with the query's actual cause, not capacity. */
+        {
+            const char *missing[] = { IC_MISSING_QUERY };
+            char refusal[256];
+            static char body[16384];
+            ASSERT(zcl_devloop_plan_files(missing, 1, &plan));
+            ASSERT(zcl_devloop_plan_add_closure(IC_FIX_INCCAP, missing, 1,
+                                                &plan));
+            ASSERT(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+                   ZCL_DEVLOOP_DIM_INCOMPLETE);
+            ASSERT_STR_EQ(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].cause,
+                          IC_MISSING_QUERY_CAUSE);
+            ASSERT(zcl_devloop_plan_refusal_text(&plan, refusal,
+                                                 sizeof refusal) > 0);
+            ASSERT_STR_EQ(refusal,
+                          "closure-truncated: " IC_MISSING_QUERY_CAUSE);
+            ASSERT(zcl_devloop_plan_json_render(&plan, missing, 1, body,
+                                                sizeof body) > 0);
+            ASSERT(strstr(body, "\"cause\":\"" IC_MISSING_QUERY_CAUSE
+                                "\"") != NULL);
+        }
+
+        /* (a) two dependents, room for one: capacity. The dimension answers
+         * with the universal closure and the plan is admissible proof. */
+        ASSERT(ic_include_plan(1, &plan));
+        ASSERT(plan.closure_universal);
+        ASSERT(!plan.closure_truncated);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+               ZCL_DEVLOOP_DIM_COMPLETE);
+        ASSERT(strcmp(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].reason,
+                      "closure-universal") == 0);
+        why = "unset";
+        ASSERT(zcl_devloop_plan_proof_admissible(&plan, &why));
+        ASSERT(strcmp(why, "") == 0);
+
+        /* ... and the proof runner turns it into every registered group. */
+        static char selector[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS *
+                             (ZCL_TEST_GROUP_FULL_MAX + 1)];
+        char gated[PROOF_HOST_GATED_MAX];
+        uint32_t selected = 0;
+        memset(selector, 0, sizeof(selector));
+        ASSERT(ic_host_need_full_root(IC_FIX_HOST_FULL));
+        ic_host_fixture_env(true);
+        ASSERT(zcl_dev_proof_test_build_test_selector(
+                   &plan, IC_FIX_HOST_FULL, false, selector, sizeof(selector),
+                   &selected, gated, sizeof(gated)));
+        ic_host_fixture_restore(ic_fixture_saved, ic_fixture_was_set);
+        ASSERT(ic_selector_is_universal(selector, selected,
+                                        !ic_fuzz_host_ready() + ic_guest_host_missing()));
+        ASSERT((gated[0] == '\0') == (ic_fuzz_host_ready() && ic_guest_host_missing() == 0));
+        for (size_t i = 0; i < zcl_test_group_catalog_count(); i++)
+            ASSERT(zcl_test_group_is_umbrella(zcl_test_group_catalog_at(i)) ||
+                   (!ic_fuzz_host_ready() &&
+                    strcmp(zcl_test_group_catalog_at(i),
+                           "test_semantic_facts_fuzz") == 0) ||
+                   ic_guest_group_absent(zcl_test_group_catalog_at(i)) ||
+                   ic_selector_has(selector, zcl_test_group_catalog_at(i)));
+
+        /* (b) an untrusted graph is missing evidence: it refuses. */
+        ASSERT(ic_write_include_fanout(IC_FIX_INCCAP, true));
+        ASSERT(ic_include_plan(0, &plan));
+        ASSERT(!plan.closure_universal);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].status ==
+               ZCL_DEVLOOP_DIM_INCOMPLETE);
+        why = "unset";
+        ASSERT(!zcl_devloop_plan_proof_admissible(&plan, &why));
+        ASSERT(strcmp(why, "closure-truncated") == 0);
+        /* ... and names the rule and file that made the graph unsafe: in the
+         * plan, in its JSON, and in the proof's refusal line. */
+        ASSERT_STR_EQ(plan.dims[ZCL_DEVLOOP_DIM_INCLUDE].cause, IC_GONE_CAUSE);
+        {
+            char refusal[256];
+            static char body[16384];
+            const char *files[] = { IC_INCCAP_DEF };
+            ASSERT(zcl_devloop_plan_refusal_text(&plan, refusal,
+                                                 sizeof refusal) > 0);
+            ASSERT_STR_EQ(refusal, "closure-truncated: " IC_GONE_CAUSE);
+            ASSERT(zcl_devloop_plan_json_render(&plan, files, 1, body,
+                                                sizeof body) > 0);
+            ASSERT(strstr(body, "\"reason\":\"closure-truncated\","
+                                "\"cause\":\"" IC_GONE_CAUSE "\"") != NULL);
+        }
+
+        /* (b2) and a capacity bound on that same untrusted graph does not
+         * erase the refusal: capacity is not allowed to launder it. */
+        ASSERT(ic_include_plan(1, &plan));
+        ASSERT(!plan.closure_universal);
+        ASSERT(plan.closure_truncated);
+        why = "unset";
+        ASSERT(!zcl_devloop_plan_proof_admissible(&plan, &why));
+        ASSERT(strcmp(why, "closure-truncated") == 0);
+
+        /* (b3) no include graph at all still refuses with its own word. */
+ TEST_DISCARD(system("rm -rf " IC_FIX_INCCAP));
+        ASSERT(ic_write_call_pair(IC_FIX_INCCAP));
+        ASSERT(ic_write(IC_FIX_INCCAP, IC_INCCAP_DEF, "IC_ROW(alpha, 1)\n"));
+        ASSERT(ic_include_plan(1, &plan));
+        ASSERT(!plan.closure_universal);
+        why = "unset";
+        ASSERT(!zcl_devloop_plan_proof_admissible(&plan, &why));
+        ASSERT(strcmp(why, "no-include-graph") == 0);
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_INCCAP));
+ TEST_DISCARD(system("rm -rf " IC_FIX_HOST_FULL));
+        PASS();
+    } _test_next:;
+    zcl_devloop_test_closure_file_ceiling = 0;
+    ic_host_fixture_restore(ic_fixture_saved, ic_fixture_was_set);
+    return failures;
+}
+
+/* A path floor naming more groups than the plan can hold is capacity, the
+ * same fact as a full closure: the plan widens to the whole catalog, names
+ * path-group-cap as the reason, and stays admissible proof. */
+#define IC_FIX_PATHCAP IC_FIX_ROOT "/path_capacity"
+#define IC_PATHCAP_MAX 1024
+
+static int test_ic_path_group_cap_runs_everything(void)
+{
+    int failures = 0;
+    static char ic_fixture_saved[4096];
+    bool ic_fixture_was_set =
+        ic_host_fixture_save(ic_fixture_saved, sizeof(ic_fixture_saved));
+    TEST("impact composition: a path floor over the group cap runs the whole catalog") {
+        /* A tests/harness sweep: one source per registered test group. */
+        static char paths[IC_PATHCAP_MAX][ZCL_TEST_GROUP_FULL_MAX + 32];
+        static const char *files[IC_PATHCAP_MAX];
+        size_t n = 0;
+        for (size_t i = 0; i < zcl_test_group_catalog_count() &&
+                           n < IC_PATHCAP_MAX; i++) {
+            const char *full = zcl_test_group_catalog_at(i);
+            if (strncmp(full, "test_", 5) != 0)
+                continue;
+            (void)snprintf(paths[n], sizeof(paths[n]),
+                           "tests/harness/src/%s.c", full);
+            files[n] = paths[n];
+            n++;
+        }
+        ASSERT(n > ZCL_DEVLOOP_MAX_PLAN_GROUPS);
+
+        static struct zcl_devloop_plan plan;
+        ASSERT(zcl_devloop_plan_files(files, n, &plan));
+        ASSERT(plan.path_groups_len == ZCL_DEVLOOP_MAX_PLAN_GROUPS);
+        ASSERT(plan.path_universal);
+        ASSERT(plan.closure_universal);
+        ASSERT(plan.dims[ZCL_DEVLOOP_DIM_OPAQUE].status ==
+               ZCL_DEVLOOP_DIM_COMPLETE);
+        ASSERT_STR_EQ(plan.dims[ZCL_DEVLOOP_DIM_OPAQUE].reason,
+                      "path-group-cap");
+        ASSERT(!plan.selections_truncated);
+
+        /* Closing the plan keeps the widening and asks no graph for groups
+         * the catalog already holds. */
+ TEST_DISCARD(system("rm -rf " IC_FIX_PATHCAP));
+        ASSERT(ic_write_call_pair(IC_FIX_PATHCAP));
+        ASSERT(ic_write_depfiles(IC_FIX_PATHCAP));
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_PATHCAP, files, n, &plan));
+        ASSERT(plan.closure_universal);
+        ASSERT(!plan.closure_truncated);
+        ASSERT_STR_EQ(plan.dims[ZCL_DEVLOOP_DIM_OPAQUE].reason,
+                      "path-group-cap");
+        const char *why = "unset";
+        ASSERT(zcl_devloop_plan_proof_admissible(&plan, &why));
+        ASSERT_STR_EQ(why, "");
+        char refusal[256];
+        ASSERT(zcl_devloop_plan_refusal_text(&plan, refusal,
+                                             sizeof refusal) == 0);
+
+        /* The plan document names the widening beside the universal
+         * selector, so the receipt's plan digest covers the reason. */
+        static char body[ZCL_DEVLOOP_PLAN_WIRE_MAX + 1];
+        ASSERT(zcl_devloop_plan_json_render(&plan, files, n, body,
+                                            sizeof body) > 0);
+        ASSERT(strstr(body, "\"name\":\"opaque\",\"status\":\"complete\","
+                            "\"reason\":\"path-group-cap\"") != NULL);
+        ASSERT(strstr(body, "\"path_universal\":true") != NULL);
+        ASSERT(strstr(body, "\"execution_selector\":\"universal\"") != NULL);
+        ASSERT(strstr(body, "\"proof_admissible\":true") != NULL);
+
+        /* The proof runner turns it into every registered group. */
+        static char selector[ZCL_DEVLOOP_MAX_PLAN_SELECTIONS *
+                             (ZCL_TEST_GROUP_FULL_MAX + 1)];
+        char gated[PROOF_HOST_GATED_MAX];
+        uint32_t selected = 0;
+        memset(selector, 0, sizeof(selector));
+        ASSERT(ic_host_need_full_root(IC_FIX_HOST_FULL));
+        ic_host_fixture_env(true);
+        ASSERT(zcl_dev_proof_test_build_test_selector(
+                   &plan, IC_FIX_HOST_FULL, false, selector, sizeof(selector),
+                   &selected, gated, sizeof(gated)));
+        ic_host_fixture_restore(ic_fixture_saved, ic_fixture_was_set);
+        ASSERT(ic_selector_is_universal(selector, selected,
+                                        !ic_fuzz_host_ready() + ic_guest_host_missing()));
+
+        /* Control: under the cap the same sweep plans exactly. */
+        static struct zcl_devloop_plan small;
+        ASSERT(zcl_devloop_plan_files(files, 16, &small));
+        ASSERT(small.path_groups_len > 0);
+        ASSERT(small.path_groups_len < ZCL_DEVLOOP_MAX_PLAN_GROUPS);
+        ASSERT(!small.closure_universal);
+        ASSERT(!small.path_universal);
+        ASSERT(small.dims[ZCL_DEVLOOP_DIM_OPAQUE].status ==
+               ZCL_DEVLOOP_DIM_COMPLETE);
+        ASSERT_STR_EQ(small.dims[ZCL_DEVLOOP_DIM_OPAQUE].reason, "");
+        ASSERT(zcl_devloop_plan_add_closure(IC_FIX_PATHCAP, files, 16,
+                                            &small));
+        ASSERT(!small.closure_universal);
+        ASSERT(!small.path_universal);
+
+ TEST_DISCARD(system("rm -rf " IC_FIX_PATHCAP));
+ TEST_DISCARD(system("rm -rf " IC_FIX_HOST_FULL));
+        PASS();
+    } _test_next:;
+    ic_host_fixture_restore(ic_fixture_saved, ic_fixture_was_set);
+    return failures;
+}
+
+#if !defined(_WIN32)
+/* ── proof warm start, end to end ────────────────────────────────────────
+ * The production warm start (survey, pick, seed, retime) driven against a
+ * fixture checkout and pool. The seam is declared here, not in dev_proof.h. */
+bool zcl_dev_proof_test_warm_start(const char *root, const char *parent,
+                                   const char *generation, const char *local,
+                                   const char *phases, bool authoritative,
+                                   char donor[33], char reason[32],
+                                   uint64_t *files_linked);
+
+/* Objects live under a compile epoch the repository's own key tool derives
+ * from flags that spell the checkout root, exactly like the real Makefile's
+ * epochs. a.c includes h.h and b.c includes nothing; an object is its
+ * source followed by the headers it includes, so its bytes say which
+ * header it saw. Every output is staged and renamed, like the real epoch
+ * publishers, so a rebuild never writes through a seeded inode. */
+static const char ic_warm_makefile[] =
+    "Z := 0000000000000000000000000000000000000000000000000000000000000000\n"
+    "EPOCH := $(shell tools/dev/build-epoch-key.sh key $(Z) fixture-v1 "
+    "'-O2 -ffile-prefix-map=$(CURDIR)=/zclassic23' no-link $(Z))\n"
+    "$(if $(EPOCH),,$(error no compile epoch))\n"
+    "OBJ := build/obj/epochs/$(EPOCH)\n"
+    "all: $(OBJ)/a.o $(OBJ)/b.o\n"
+    "$(OBJ)/%.o: %.c\n"
+    "\t@mkdir -p $(OBJ)\n"
+    "\t@inc=$$(sed -n 's/^#include \"\\(.*\\)\"$$/\\1/p' $<); "
+    "cat $< $$inc > $@.tmp && mv -f $@.tmp $@ && "
+    "printf '%s: %s %s\\n' $@ $< \"$$inc\" > $(@:.o=.d).tmp && "
+    "mv -f $(@:.o=.d).tmp $(@:.o=.d)\n"
+    "-include $(wildcard $(OBJ)/*.d)\n";
+
+struct ic_warm_tree {
+    char root[4096], repo[4096], pool[4096], phases[4096];
+    char donor[4096], gen[4096];
+    char c1[65], c2[65];
+    struct zcl_dev_proof_build_identity_v1 identity;
+};
+
+static bool ic_warm_run(const char *cmd, int len, size_t cap)
+{
+    return len > 0 && (size_t)len < cap && system(cmd) == 0;
+}
+
+/* First line of a command's output, trailing newline removed. */
+static bool ic_warm_line(const char *cmd, char *out, size_t out_len)
+{
+    FILE *p = popen(cmd, "r");
+    if (!p) return false;
+    bool ok = fgets(out, (int)out_len, p) != NULL;
+    int rc = pclose(p);
+    size_t len = ok ? strlen(out) : 0;
+    while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r'))
+        out[--len] = 0;
+    return ok && rc == 0 && len > 0;
+}
+
+/* `make` in a fixture tree, isolated from the harness's own make. */
+static bool ic_warm_make(const struct ic_warm_tree *t, const char *dir)
+{
+    char cmd[8192];
+    int len = snprintf(cmd, sizeof(cmd),
+                       "cd '%s' && env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL "
+                       "-u MAKEOVERRIDES TMPDIR='%s' make -s", dir, t->root);
+    return ic_warm_run(cmd, len, sizeof(cmd));
+}
+
+static bool ic_warm_worktree(const struct ic_warm_tree *t, const char *path,
+                             const char *commit)
+{
+    char cmd[8192];
+    int len = snprintf(cmd, sizeof(cmd),
+                       "git -C '%s' worktree add --detach -q '%s' %s",
+                       t->repo, path, commit);
+    return ic_warm_run(cmd, len, sizeof(cmd));
+}
+
+/* The one epoch directory a generation's object tree holds; a second one
+ * beside it (the seeds under a name this tree's make never addresses)
+ * refuses. */
+static bool ic_warm_epoch(const char *generation, char out[65])
+{
+    char cmd[8192];
+    return snprintf(cmd, sizeof(cmd),
+                    "set -- $(ls '%s/build/obj/epochs') && "
+                    "[ $# -eq 1 ] && printf '%%s\\n' \"$1\"",
+                    generation) < (int)sizeof(cmd) &&
+           ic_warm_line(cmd, out, 65) && strlen(out) == 64;
+}
+
+static bool ic_warm_setup_repo(struct ic_warm_tree *t)
+{
+    char cmd[8192];
+    int len = snprintf(cmd, sizeof(cmd),
+                       "mkdir -p '%s/tools/dev' '%s' && "
+                       "cp tools/dev/build-epoch-key.sh '%s/tools/dev/' && "
+                       "cd '%s' && git init -q && git add -A && "
+                       "git -c user.name=t -c user.email=t@t.invalid "
+                       "commit -q -m c1 && printf 'header v2\\n' > h.h && "
+                       "git -c user.name=t -c user.email=t@t.invalid "
+                       "commit -qam c2", t->repo, t->pool, t->repo, t->repo);
+    return ic_write(t->repo, "Makefile", ic_warm_makefile) &&
+           ic_write(t->repo, "a.c", "#include \"h.h\"\nint a;\n") &&
+           ic_write(t->repo, "b.c", "int b;\n") &&
+           ic_write(t->repo, "h.h", "header v1\n") &&
+           ic_write(t->repo, ".gitignore", "build/\n") &&
+           ic_warm_run(cmd, len, sizeof(cmd)) &&
+           snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse HEAD~1",
+                    t->repo) < (int)sizeof(cmd) &&
+           ic_warm_line(cmd, t->c1, sizeof(t->c1)) &&
+           snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse HEAD",
+                    t->repo) < (int)sizeof(cmd) &&
+           ic_warm_line(cmd, t->c2, sizeof(t->c2));
+}
+
+/* A checkout at c2 whose previous proof (c1) finished in `donor`: built,
+ * and sealed with a marker naming `marker_identity`. The next proof's own
+ * generation `gen` is checked out at c2 and empty. */
+static bool ic_warm_setup(struct ic_warm_tree *t, const char *tag,
+                          const struct zcl_dev_proof_build_identity_v1
+                              *marker_identity)
+{
+    char why[256] = {0};
+    memset(t, 0, sizeof(*t));
+    test_make_tmpdir(t->root, sizeof(t->root), "proof_warm_e2e", tag);
+    if (snprintf(t->repo, sizeof(t->repo), "%s/checkout", t->root) >=
+            (int)sizeof(t->repo) ||
+        snprintf(t->pool, sizeof(t->pool), "%s/.z23p", t->root) >=
+            (int)sizeof(t->pool) ||
+        snprintf(t->phases, sizeof(t->phases), "%s/phases.txt", t->root) >=
+            (int)sizeof(t->phases) ||
+        snprintf(t->donor, sizeof(t->donor), "%s/%s", t->pool,
+                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") >= (int)sizeof(t->donor) ||
+        snprintf(t->gen, sizeof(t->gen), "%s/%s", t->pool,
+                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") >= (int)sizeof(t->gen) ||
+        !ic_warm_setup_repo(t) ||
+        !ic_write_build_plan(t->repo,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "-O2", NULL) ||
+        !zcl_dev_proof_build_identity_v1_capture(t->repo, &t->identity, why,
+                                                 sizeof(why)) ||
+        !ic_warm_worktree(t, t->donor, t->c1) ||
+        !ic_warm_make(t, t->donor) ||
+        !ic_warm_worktree(t, t->gen, t->c2))
+        return false;
+    return zcl_dev_proof_warm_marker_write(
+        t->donor, t->repo, t->c1, t->c1, platform_time_wall_unix(),
+        marker_identity ? marker_identity : &t->identity);
+}
+
+static bool ic_warm_obj(const char *generation, const char *epoch,
+                        const char *name, char *out, size_t out_len)
+{
+    return snprintf(out, out_len, "%s/build/obj/epochs/%s/%s", generation,
+                    epoch, name) < (int)out_len;
+}
+
+/* The next proof's warm start into `gen`. The fixture opts in to the git
+ * queries the survey and the retime run, as the pool fixtures above do.
+ * `authoritative` is what every real proof runs; the fixture donor was
+ * built by this uid, so only a non-authoritative start may seed from it. */
+static bool ic_warm_start(const struct ic_warm_tree *t, bool authoritative,
+                          char donor[33], char reason[32], uint64_t *files)
+{
+    if (setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) != 0) return false;
+    bool ok = zcl_dev_proof_test_warm_start(t->repo, t->pool, t->gen, t->c2,
+                                            t->phases, authoritative, donor,
+                                            reason, files);
+    (void)unsetenv("ZCL_DEVLOOP_TEST_PROCESS");
+    return ok;
+}
+
+static int test_pw_next_proof_seeds_from_the_finished_generation(void)
+{
+    int failures = 0;
+    TEST("proof warm start: the next proof seeds from the last finished "
+         "generation, finds the seeds under its own epoch, and rebuilds "
+         "only what changed") {
+        struct ic_warm_tree t;
+        char donor[33] = {0}, reason[32] = {0};
+        char donor_epoch[65] = {0}, gen_epoch[65] = {0};
+        char donor_a[8192], donor_b[8192], gen_a[8192], gen_b[8192];
+        uint64_t files = 0;
+        struct stat seed_a_st, seed_b_st, gen_a_st, gen_b_st, donor_b_st;
+        ASSERT(ic_warm_setup(&t, "next", NULL));
+        ASSERT(ic_warm_epoch(t.donor, donor_epoch));
+        /* Non-authoritative: the seeding a qualified verifier account would
+         * turn back on, kept proven while authoritative proofs refuse it. */
+        ASSERT(ic_warm_start(&t, false, donor, reason, &files));
+        ASSERT(strcmp(donor, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == 0);
+        ASSERT(reason[0] == 0);
+        ASSERT(files == 4); /* a.o, a.d, b.o, b.d */
+        ASSERT(ic_warm_obj(t.gen, donor_epoch, "a.o", gen_a, sizeof(gen_a)));
+        ASSERT(ic_warm_obj(t.gen, donor_epoch, "b.o", gen_b, sizeof(gen_b)));
+        ASSERT(stat(gen_a, &seed_a_st) == 0);
+        ASSERT(stat(gen_b, &seed_b_st) == 0);
+        ASSERT(ic_warm_make(&t, t.gen));
+        /* One tree, two checkout paths, one epoch: the generation's own
+         * make addresses the directory it was seeded into. */
+        ASSERT(ic_warm_epoch(t.gen, gen_epoch));
+        ASSERT(strcmp(gen_epoch, donor_epoch) == 0);
+        ASSERT(ic_warm_obj(t.donor, donor_epoch, "a.o", donor_a,
+                           sizeof(donor_a)));
+        ASSERT(ic_warm_obj(t.donor, donor_epoch, "b.o", donor_b,
+                           sizeof(donor_b)));
+        ASSERT(ic_warm_obj(t.gen, gen_epoch, "a.o", gen_a, sizeof(gen_a)));
+        ASSERT(ic_warm_obj(t.gen, gen_epoch, "b.o", gen_b, sizeof(gen_b)));
+        ASSERT(stat(donor_b, &donor_b_st) == 0);
+        ASSERT(stat(gen_a, &gen_a_st) == 0);
+        ASSERT(stat(gen_b, &gen_b_st) == 0);
+        /* Reuse preserves this generation's seed, whether it was linked or
+         * privately copied. Identity is device+inode, not donor inode alone. */
+        ASSERT(ic_generation_stat_equal(&seed_b_st, &gen_b_st));
+#if !defined(__APPLE__)
+        /* The non-Apple seed path hard-links immutable objects. */
+        ASSERT(gen_b_st.st_dev == donor_b_st.st_dev);
+        ASSERT(gen_b_st.st_ino == donor_b_st.st_ino);
+#endif
+        ASSERT(gen_b_st.st_size == (off_t)(sizeof("int b;\n") - 1));
+        ASSERT(donor_b_st.st_size == gen_b_st.st_size);
+        ASSERT(ic_file_has(gen_b, "int b;\n"));
+        ASSERT(ic_file_has(donor_b, "int b;\n"));
+        /* h.h changed between the two commits, so the seeded depfile makes
+         * a.o stale: it was rebuilt against the new header, into a new
+         * inode, and the donor's copy kept the old header's bytes. */
+        ASSERT(gen_a_st.st_dev != seed_a_st.st_dev ||
+               gen_a_st.st_ino != seed_a_st.st_ino);
+        ASSERT(ic_file_has(gen_a, "header v2"));
+        ASSERT(!ic_file_has(gen_a, "header v1"));
+        ASSERT(ic_file_has(donor_a, "header v1"));
+        ASSERT(!ic_file_has(donor_a, "header v2"));
+        ASSERT(test_rm_rf_recursive(t.root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_identity_mismatch_stays_cold_with_its_reason(void)
+{
+    int failures = 0;
+    TEST("proof warm start: a donor built under other flags or another "
+         "compiler stays cold, and says so") {
+        static const char *const which[] = {"flags", "compiler"};
+        for (size_t i = 0; i < 2; i++) {
+            struct ic_warm_tree t;
+            struct zcl_dev_proof_build_identity_v1 other;
+            char donor[33] = {0}, reason[32] = {0}, rejected[128];
+            char gen_obj[8192];
+            uint64_t files = 0;
+            struct stat st;
+            ASSERT(ic_warm_setup(&t, which[i], NULL));
+            other = t.identity;
+            if (i == 0) other.flags[0] ^= 1;
+            else other.compiler[0] ^= 1;
+            ASSERT(zcl_dev_proof_warm_marker_write(
+                t.donor, t.repo, t.c1, t.c1, platform_time_wall_unix(),
+                &other));
+            ASSERT(!ic_warm_start(&t, true, donor, reason, &files));
+            ASSERT(strcmp(reason, "donor_identity_differs") == 0);
+            ASSERT(donor[0] == 0 && files == 0);
+            ASSERT(snprintf(rejected, sizeof(rejected),
+                            "warm_donor_rejected=%s donor_identity_differs",
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") > 0);
+            ASSERT(ic_file_has(t.phases, rejected));
+            ASSERT(snprintf(gen_obj, sizeof(gen_obj), "%s/build/obj",
+                            t.gen) > 0);
+            ASSERT(stat(gen_obj, &st) != 0 && errno == ENOENT);
+            ASSERT(test_rm_rf_recursive(t.root) == 0);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_pw_live_donor_is_never_seeded_from(void)
+{
+    int failures = 0;
+    TEST("proof warm start: a donor whose proof still holds its lease is "
+         "not used") {
+        struct ic_warm_tree t;
+        char donor[33] = {0}, reason[32] = {0}, lease_rel[256], lease[64];
+        char rejected[128], gen_obj[8192];
+        uint64_t files = 0;
+        struct stat st;
+        ASSERT(ic_warm_setup(&t, "live", NULL));
+        ASSERT(snprintf(lease_rel, sizeof(lease_rel),
+                        ".cache/zcl-dev-proof/leases/%s-%s.lease", t.c1,
+                        t.c1) < (int)sizeof(lease_rel));
+        ASSERT(snprintf(lease, sizeof(lease), "fixture-token %lld 1\n",
+                        (long long)getpid()) < (int)sizeof(lease));
+        ASSERT(ic_proof_private_write(t.repo, lease_rel, lease));
+        ASSERT(!ic_warm_start(&t, true, donor, reason, &files));
+        ASSERT(strcmp(reason, "donor_live") == 0);
+        ASSERT(donor[0] == 0 && files == 0);
+        ASSERT(snprintf(rejected, sizeof(rejected),
+                        "warm_donor_rejected=%s donor_live",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") > 0);
+        ASSERT(ic_file_has(t.phases, rejected));
+        ASSERT(snprintf(gen_obj, sizeof(gen_obj), "%s/build/obj", t.gen) >
+               0);
+        ASSERT(stat(gen_obj, &st) != 0 && errno == ENOENT);
+        ASSERT(test_rm_rf_recursive(t.root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Every generation in the pool ran candidate code as this uid, so any of
+ * them can hold an object its source never compiled to -- stamped in the
+ * future so make's mtime test never finds it stale -- or have one written
+ * in place through a hard link. Reuse may shape an authoritative proof
+ * only when a signer outside the candidate trust domain produced it, and
+ * no such verifier is qualified: the proof must build from source. */
+static int test_pw_authoritative_proof_refuses_same_uid_donor(void)
+{
+    int failures = 0;
+    TEST("proof warm start: an authoritative proof never builds on an "
+         "object planted in a donor from its own trust domain") {
+        struct ic_warm_tree t;
+        char donor[33] = {0}, reason[32] = {0}, rejected[128];
+        char donor_epoch[65] = {0}, gen_epoch[65] = {0}, planted_rel[256];
+        char donor_b[8192], gen_b[8192], gen_obj[8192];
+        uint64_t files = 0;
+        struct stat st, donor_b_st, gen_b_st;
+        ASSERT(ic_warm_setup(&t, "planted", NULL));
+        ASSERT(ic_warm_epoch(t.donor, donor_epoch));
+        ASSERT(ic_warm_obj(t.donor, donor_epoch, "b.o", donor_b,
+                           sizeof(donor_b)));
+        /* b.c is identical at c1 and c2, so a warm seed keeps this object
+         * as-is: bytes b.c never compiles to, a day newer than any
+         * source. */
+        ASSERT(snprintf(planted_rel, sizeof(planted_rel),
+                        "build/obj/epochs/%s/b.o", donor_epoch) <
+               (int)sizeof(planted_rel));
+        ASSERT(ic_write(t.donor, planted_rel, "planted object\n"));
+        const struct timespec future[2] = {
+            {.tv_sec = (time_t)platform_time_wall_unix() + 86400},
+            {.tv_sec = (time_t)platform_time_wall_unix() + 86400},
+        };
+        ASSERT(utimensat(AT_FDCWD, donor_b, future, 0) == 0);
+        ASSERT(!ic_warm_start(&t, true, donor, reason, &files));
+        ASSERT(strcmp(reason, "donor_untrusted_same_uid") == 0);
+        ASSERT(donor[0] == 0 && files == 0);
+        ASSERT(snprintf(rejected, sizeof(rejected),
+                        "warm_donor_rejected=%s donor_untrusted_same_uid",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") > 0);
+        ASSERT(ic_file_has(t.phases, rejected));
+        ASSERT(ic_file_has(t.phases, "cold: donor_untrusted_same_uid"));
+        ASSERT(snprintf(gen_obj, sizeof(gen_obj), "%s/build/obj", t.gen) >
+               0);
+        ASSERT(stat(gen_obj, &st) != 0 && errno == ENOENT);
+        /* Cold: the generation's own build compiles b.c from source. */
+        ASSERT(ic_warm_make(&t, t.gen));
+        ASSERT(ic_warm_epoch(t.gen, gen_epoch));
+        ASSERT(ic_warm_obj(t.gen, gen_epoch, "b.o", gen_b, sizeof(gen_b)));
+        ASSERT(stat(donor_b, &donor_b_st) == 0);
+        ASSERT(stat(gen_b, &gen_b_st) == 0);
+        ASSERT(gen_b_st.st_ino != donor_b_st.st_ino);
+        ASSERT(ic_file_has(gen_b, "int b;"));
+        ASSERT(!ic_file_has(gen_b, "planted object"));
+        ASSERT(test_rm_rf_recursive(t.root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+#if !defined(_WIN32)
+static bool ic_text_record_write(const char *path, const char *prefix,
+                                 bool hidden_suffix)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    size_t n = strlen(prefix);
+    bool ok = fwrite(prefix, 1, n, f) == n;
+    if (hidden_suffix) {
+        static const char suffix[] = "\0extra record\n";
+        ok = fwrite(suffix, 1, sizeof(suffix) - 1, f) == sizeof(suffix) - 1 && ok;
+    }
+    return fclose(f) == 0 && chmod(path, 0600) == 0 && ok;
+}
+
+static int test_ic_proof_text_readers_refuse_nul(void)
+{
+    int failures = 0, child_status = 0;
+    pid_t child = fork();
+    if (child == 0) _exit(0);
+    if (child < 0 || waitpid(child, &child_status, 0) != child ||
+        !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
+        fprintf(stderr, "proof text: could not reap fixture worker\n");
+        return 1;
+    }
+    char root[PATH_MAX], path[PATH_MAX], running[64], lease[96], settled[64];
+    test_make_tmpdir(root, sizeof(root), "proof_text", "nul");
+    if (snprintf(path, sizeof(path), "%s/record", root) >= (int)sizeof(path)) {
+        fprintf(stderr, "proof text: fixture path exceeds capacity\n");
+        (void)test_rm_rf_recursive(root);
+        return 1;
+    }
+    (void)snprintf(running, sizeof(running), "%lld 1", (long long)getpid());
+    (void)snprintf(lease, sizeof(lease), "fixture-token %lld 1", (long long)getpid());
+    (void)snprintf(settled, sizeof(settled), "%lld 1", (long long)child);
+    const struct { const char *name, *prefix; } cases[] = {
+        {"proof text: warm status refuses NUL suffix",
+         "zcl.dev_proof_warmstart.v1\nwarm=0\nreason=fixture"},
+        {"proof text: running marker refuses NUL suffix", running},
+        {"proof text: lease marker refuses NUL suffix", lease},
+        {"proof text: request refuses NUL suffix",
+         "zcl.dev_proof_request.v1\n"
+         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n1\n1"},
+        {"proof text: failure status refuses NUL suffix", "fixture_failure\nevidence"},
+        {"proof text: settled worker refuses NUL suffix", settled},
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        TEST(cases[i].name) {
+            ASSERT(ic_text_record_write(path, cases[i].prefix, true));
+            ASSERT(!zcl_dev_proof_test_text_reader(path, i));
+            ASSERT(ic_text_record_write(path, cases[i].prefix, false));
+            ASSERT(zcl_dev_proof_test_text_reader(path, i));
+            PASS();
+        } _test_next:;
+    }
+    if (test_rm_rf_recursive(root) != 0) {
+        fprintf(stderr, "proof text: fixture cleanup failed\n");
+        failures++;
+    }
+    return failures;
+}
+#endif
+
+#if !defined(_WIN32)
+static int test_pw_plan_rejects_hidden_fields(void)
+{
+    int failures = 0;
+    TEST("proof plan: reject fields hidden after a NUL") {
+        static const char mutation[] =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        char root[4096], path[4096], plan[128], why[160];
+        test_make_tmpdir(root, sizeof(root), "proof_plan", "hidden_fields");
+        ASSERT(snprintf(plan, sizeof(plan), "BASE_GENERATION=%s", mutation) == 80);
+        ASSERT(ic_write(root, "build/dev-loop/restart.env", plan));
+        struct zcl_dev_proof_build_identity_v1 identity = {0};
+        ASSERT(zcl_dev_proof_build_identity_v1_capture(root, &identity, why,
+                                                      sizeof(why)));
+        ASSERT(zcl_dev_proof_build_plan_verify(root, &identity, mutation, why,
+                                              sizeof(why)));
+        ASSERT(snprintf(path, sizeof(path), "%s/build/dev-loop/restart.env",
+                        root) < (int)sizeof(path));
+        FILE *file = fopen(path, "ab");
+        ASSERT(file != NULL);
+        static const char hidden[] = "\0\nDEV_CFLAGS=changed\n";
+        bool written = fwrite(hidden, 1, sizeof(hidden) - 1, file) == sizeof(hidden) - 1;
+        ASSERT(fclose(file) == 0);
+        ASSERT(written);
+        ASSERT(!zcl_dev_proof_build_plan_verify(root, &identity, mutation, why,
+                                               sizeof(why)));
+        ASSERT(strcmp(why, "proof_offline_build_plan_unavailable") == 0);
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_proof_request_exact_extent(void)
+{
+    int failures = 0;
+    TEST("proof request: refuse sixth line and trailing bytes") {
+        static const char local[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        static const char base[] = "1111111111111111111111111111111111111111";
+        static const char *const tails[] = {
+            "\ngarbage\n", "", "\n", "\r\n", "\n\n", "junk", "\n\0garbage"
+        };
+        static const size_t tail_sizes[] = {9, 0, 1, 2, 2, 4, 9};
+        static const bool accepted[] = {false, true, true, true, false, false, false};
+        char root[4096], relative[256], path[4096], body[320];
+        ASSERT(snprintf(root, sizeof(root), IC_FIX_ROOT "/request_extent_%ld",
+                        (long)getpid()) > 0);
+        ASSERT(snprintf(relative, sizeof(relative),
+                        ".cache/zcl-dev-proof/requests/%s-%s.request", local, base) > 0);
+        ASSERT(ic_proof_private_write(root, relative, ""));
+        ASSERT(snprintf(path, sizeof(path), "%s/%s", root, relative) > 0);
+        int n = snprintf(body, sizeof(body), "zcl.dev_proof_request.v1\n%s\n%s\n1\n1",
+                         local, base);
+        ASSERT(n > 0 && (size_t)n + 9 < sizeof(body));
+        for (size_t i = 0; i < sizeof(tails) / sizeof(tails[0]); i++) {
+            FILE *file = fopen(path, "wb");
+            ASSERT(file != NULL);
+            ASSERT(fwrite(body, 1, (size_t)n, file) == (size_t)n);
+            ASSERT(fwrite(tails[i], 1, tail_sizes[i], file) == tail_sizes[i]);
+            ASSERT(fclose(file) == 0);
+            ASSERT(zcl_dev_proof_queue_has_pending(root) == accepted[i]);
+        }
+        ASSERT(test_rm_rf_recursive(root) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+#if !defined(_WIN32)
+static bool ic_orphan_gitdir_record_write(const char *gitfile, const char *root,
+                                         const char *tag, const char *tail,
+                                         size_t tail_len, bool oversized)
+{
+    char body[8192];
+    int n = snprintf(body, sizeof(body), "gitdir: %s/missing/%s", root, tag);
+    if (n <= 0 || (size_t)n >= sizeof(body)) return false;
+    size_t len = (size_t)n;
+    if (tail_len > sizeof(body) - len) return false;
+    memcpy(body + len, tail, tail_len);
+    len += tail_len;
+    if (oversized) {
+        memset(body + len, 'x', sizeof(body) - len);
+        len = sizeof(body);
+    }
+    FILE *f = fopen(gitfile, "wb");
+    if (!f) return false;
+    size_t wrote = fwrite(body, 1, len, f);
+    int close_rc = fclose(f);
+    return wrote == len && close_rc == 0;
+}
+
+static int test_pw_orphan_gitdir_record_framing(void)
+{
+    int failures = 0;
+    TEST("proof pool: malformed gitdir records retain the generation; "
+         "exact final records qualify with or without a newline") {
+        static const char hidden[] = "\0unverified-suffix\n";
+        static const struct {
+            const char *tail;
+            size_t len;
+        } cases[] = {
+            { "", 0 }, { "\n", 1 }, { "\r\n", 2 },
+            { hidden, sizeof(hidden) - 1 }, { "\nextra\n", 7 }, { "\n", 1 }
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char root[4096], pool[4096], entry[4096], gitfile[4096];
+            char tag[33];
+            ASSERT(test_mkdtemp(root, sizeof(root), "orphan_gitdir_record") != NULL);
+            int n = snprintf(pool, sizeof(pool), "%s/.z23p", root);
+            ASSERT(n > 0 && (size_t)n < sizeof(pool));
+            ASSERT(mkdir(pool, 0700) == 0);
+            ic_orphan_tag(tag, 'a');
+            n = snprintf(entry, sizeof(entry), "%s/%s", pool, tag);
+            ASSERT(n > 0 && (size_t)n < sizeof(entry));
+            ASSERT(mkdir(entry, 0700) == 0);
+            n = snprintf(gitfile, sizeof(gitfile), "%s/.git", entry);
+            ASSERT(n > 0 && (size_t)n < sizeof(gitfile));
+            ASSERT(ic_orphan_gitdir_record_write(gitfile, root, tag,
+                                                  cases[i].tail, cases[i].len,
+                                                  i == 5));
+            const struct timespec old[2] = {
+                { .tv_sec = (time_t)1 },
+                { .tv_sec = (time_t)1 }
+            };
+            ASSERT(utimensat(AT_FDCWD, entry, old, 0) == 0);
+            size_t removed = 0;
+            uint64_t bytes = 0;
+            ASSERT(setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) == 0);
+            zcl_dev_proof_test_generation_pool_reap(root, pool, "", &removed, &bytes);
+            ASSERT(unsetenv("ZCL_DEVLOOP_TEST_PROCESS") == 0);
+            struct stat st;
+            int exists = lstat(entry, &st);
+            ASSERT(i < 3 ? (exists != 0 && errno == ENOENT && removed == 1)
+                         : (exists == 0 && removed == 0));
+            ASSERT(test_rm_rf_recursive(root) == 0);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+#endif
+
+static int test_ic_rule_group_capacity(void)
+{
+    int failures = 0;
+    TEST("impact composition: rule group loss distinguishes duplicates from overflow") {
+        for (int list = 0; list < 2; list++) {
+            struct agent_impact_acc acc = {0};
+            for (size_t i = 0; i < ZCL_AGENT_IMPACT_MAX_GROUPS; i++) {
+                char group[16];
+                snprintf(group, sizeof(group), "group_%zu", i);
+                agent_impact_add_group(&acc, group);
+                ASSERT(strcmp(acc.groups[i], group) == 0);
+            }
+            ASSERT(acc.groups_len == ZCL_AGENT_IMPACT_MAX_GROUPS);
+            ASSERT(!acc.groups_lost);
+            agent_impact_add_group(NULL, "ignored");
+            agent_impact_add_group(&acc, "");
+            agent_impact_add_group_list(&acc, NULL);
+            if (list) agent_impact_add_group_list(&acc, " ,\tgroup_0,group_31 ");
+            else agent_impact_add_group(&acc, "group_0");
+            ASSERT(!acc.groups_lost);
+            if (list) agent_impact_add_group_list(&acc, "group_32");
+            else agent_impact_add_group(&acc, "group_32");
+            ASSERT(acc.groups_lost);
+            ASSERT(acc.groups_len == ZCL_AGENT_IMPACT_MAX_GROUPS);
+            ASSERT(strcmp(acc.groups[31], "group_31") == 0);
+            agent_impact_add_group(&acc, "group_0");
+            ASSERT(acc.groups_lost);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_ic_rule_group_length(void)
+{
+    int failures = 0;
+    TEST("impact composition: direct and parsed overlong groups report sticky loss") {
+        char group[ZCL_AGENT_IMPACT_GROUP_MAX + 1];
+        memset(group, 'x', sizeof(group) - 1);
+        group[sizeof(group) - 1] = 0;
+        for (int list = 0; list < 2; list++) {
+            struct agent_impact_acc acc = {0};
+            group[ZCL_AGENT_IMPACT_GROUP_MAX - 1] = 0;
+            if (list) agent_impact_add_group_list(&acc, group);
+            else agent_impact_add_group(&acc, group);
+            ASSERT(acc.groups_len == 1 && !acc.groups_lost);
+            group[ZCL_AGENT_IMPACT_GROUP_MAX - 1] = 'x';
+            if (list) agent_impact_add_group_list(&acc, group);
+            else agent_impact_add_group(&acc, group);
+            ASSERT(acc.groups_len == 1 && acc.groups_lost);
+            ASSERT(strlen(acc.groups[0]) == ZCL_AGENT_IMPACT_GROUP_MAX - 1);
+            char tokens[sizeof(group) + 16];
+            snprintf(tokens, sizeof(tokens), "%s ,\tvalid,valid ", group);
+            agent_impact_add_group_list(&acc, tokens);
+            ASSERT(acc.groups_len == 2 && acc.groups_lost);
+            ASSERT(strcmp(acc.groups[1], "valid") == 0);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The fuzz toolchain decision is a pure function of host facts: the build
+ * binds the first present of llvm-20, -21, -19, -18 headers (the Makefile's
+ * CLANG_MANIFEST_LLVM_DIR) and only that LLVM's clang is judged; with none
+ * present the system libclang-18 fallback decides. gcc must always accept. */
+static int test_ic_fuzz_toolchain_decision_table(void)
+{
+    int failures = 0;
+    struct row {
+        const char *name;
+        struct zcl_c23_fuzz_facts f;
+        bool want;
+    };
+    /* header order: 20, 21, 19, 18; then sel file, sel c23, lib, fb c23, gcc */
+    static const struct row rows[] = {
+#define H19 {false, false, true, true}
+#define H2018 {true, false, false, true}
+#define HNONE {false, false, false, false}
+/* header, sel file, sel c23, fallback lib, fallback c23, gcc, sensor present,
+ * sensor bound matches */
+#define F(h, sf, sc, fl, fc, g, sp, sm) \
+    {h, sf, sc, fl, fc, g, sp, sm}
+        {"llvm19 bound, its clang good, no good fallback",
+         F(H19, true, true, false, false, true, false, false), true},
+        {"llvm19 bound, clang missing, fallback all good",
+         F(H19, false, false, true, true, true, false, false), false},
+        {"llvm19 bound, clang rejects C23, fallback all good",
+         F(H19, true, false, true, true, true, false, false), false},
+        {"llvm20 and llvm18 present: judged on 20's clang, good",
+         F(H2018, true, true, false, false, true, false, false), true},
+        {"llvm20 and llvm18 present: 20's clang bad, 18 fallback good",
+         F(H2018, true, false, true, true, true, false, false), false},
+        {"no headers, fallback all good",
+         F(HNONE, false, false, true, true, true, false, false), true},
+        {"no headers, fallback library bad",
+         F(HNONE, false, false, false, true, true, false, false), false},
+        {"no headers, fallback clang rejects",
+         F(HNONE, false, false, true, false, true, false, false), false},
+        {"no headers, selected-clang facts are ignored",
+         F(HNONE, true, true, false, false, true, false, false), false},
+        {"gcc rejects, llvm19 bound and good",
+         F(H19, true, true, true, true, false, false, false), false},
+        {"gcc rejects, no headers, fallback good",
+         F(HNONE, false, false, true, true, false, false, false), false},
+        {"sensor present and bound to the selected clang",
+         F(H19, true, true, false, false, true, true, true), true},
+        {"sensor present but bound elsewhere (stale), all else good",
+         F(H19, true, true, true, true, true, true, false), false},
+        {"no headers, stale sensor present, fallback good",
+         F(HNONE, false, false, true, true, true, true, false), false},
+        {"no headers, sensor present and bound to the fallback clang",
+         F(HNONE, false, false, true, true, true, true, true), true},
+    };
+#undef F
+#undef HNONE
+#undef H2018
+#undef H19
+    TEST_CASE("fuzz host gate: toolchain decision follows the bound LLVM") {
+        ASSERT(!zcl_c23_fuzz_toolchain_decide(NULL));
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            bool got = zcl_c23_fuzz_toolchain_decide(&rows[i].f);
+            if (got != rows[i].want)
+                fprintf(stderr, "row failed: %s\n", rows[i].name);
+            ASSERT(got == rows[i].want);
+        }
+    } TEST_END
+    return failures;
+}
+
+/* A minimal ELF64 little-endian x86-64 image for the sensor reader: header,
+ * a string table at 64, a dynamic section at 320, section headers at 448
+ * (null, strtab, dynamic). No compiler is involved. */
+struct ic_sensor_img {
+    const char *name;
+    uint8_t cls;            /* ELFCLASS byte; 0: 64-bit */
+    uint16_t machine;       /* 0: x86-64 */
+    bool no_dynamic;        /* omit the dynamic section */
+    const char *str;        /* string table bytes */
+    size_t strn;
+    uint64_t ent[4][2];     /* dynamic entries {tag, value} */
+    unsigned nent;
+    uint64_t dsz;           /* dynamic size override, 0: nent * 16 */
+    uint32_t link;          /* linked section override, 0: 1 */
+    uint32_t strtype;       /* string table type override, 0: 3 */
+    size_t cut;             /* file length override, 0: whole image */
+    bool want_bound;
+    const char *want_path;  /* the expected bound clang, or NULL */
+    bool fifo;              /* mkfifo at the path instead of an image */
+};
+
+static size_t ic_sensor_build(const struct ic_sensor_img *s, uint8_t *w)
+{
+    memset(w, 0, 704);
+    memcpy(w, "\177ELF", 4);
+    w[4] = s->cls ? s->cls : 2;
+    w[5] = 1;
+    w[18] = (uint8_t)(s->machine ? s->machine : 62);
+    ic_elf_u64(w + 40, 448);
+    w[58] = 64;
+    w[60] = s->no_dynamic ? 2 : 3;
+    memcpy(w + 64, s->str, s->strn);
+    for (unsigned i = 0; i < s->nent; i++) {
+        ic_elf_u64(w + 320 + i * 16, s->ent[i][0]);
+        ic_elf_u64(w + 320 + i * 16 + 8, s->ent[i][1]);
+    }
+    w[448 + 64 + 4] = (uint8_t)(s->strtype ? s->strtype : 3);
+    ic_elf_u64(w + 448 + 64 + 24, 64);
+    ic_elf_u64(w + 448 + 64 + 32, s->strn);
+    w[448 + 128 + 4] = 6;
+    ic_elf_u64(w + 448 + 128 + 24, 320);
+    ic_elf_u64(w + 448 + 128 + 32, s->dsz ? s->dsz : s->nent * 16u);
+    w[448 + 128 + 40] = (uint8_t)(s->link ? s->link : 1);
+    return s->cut ? s->cut : 448 + (s->no_dynamic ? 128 : 192);
+}
+
+/* The sensor reader fails closed on every malformed image, and follows the
+ * test group's own reader: a later RUNPATH wins and an empty one is refused. */
+static int test_ic_sensor_bound_clang_reader(void)
+{
+    int failures = 0;
+#define IC_RP IC_FIX_ROOT "/rp"
+    static const struct ic_sensor_img rows[] = {
+        {.name = "zero-length file", .str = "\0", .strn = 1, .cut = 0,
+         .want_bound = false},
+        {.name = "truncated header", .str = "\0", .strn = 1, .cut = 30,
+         .want_bound = false},
+        {.name = "32-bit class", .cls = 1, .str = "\0" IC_RP "/lib",
+         .strn = sizeof("\0" IC_RP "/lib"), .ent = {{29, 1}}, .nent = 1,
+         .want_bound = false},
+        {.name = "wrong machine", .machine = 40, .str = "\0" IC_RP "/lib",
+         .strn = sizeof("\0" IC_RP "/lib"), .ent = {{29, 1}}, .nent = 1,
+         .want_bound = false},
+        {.name = "no dynamic section", .no_dynamic = true, .str = "\0",
+         .strn = 1, .want_bound = false},
+        {.name = "runpath whose clang does not exist", .str = "\0/x/lib",
+         .strn = sizeof("\0/x/lib"), .ent = {{29, 1}}, .nent = 1,
+         .want_bound = false},
+        {.name = "runpath whose clang exists", .str = "\0" IC_RP "/lib",
+         .strn = sizeof("\0" IC_RP "/lib"), .ent = {{29, 1}}, .nent = 1,
+         .want_bound = true, .want_path = IC_RP "/bin/clang"},
+        {.name = "runpath offset past the table", .str = "\0" IC_RP "/lib",
+         .strn = sizeof("\0" IC_RP "/lib"), .ent = {{29, 500}}, .nent = 1,
+         .want_bound = false},
+        {.name = "unterminated last string", .str = "\0" IC_RP "/lib",
+         .strn = sizeof("\0" IC_RP "/lib") - 1, .ent = {{29, 1}}, .nent = 1,
+         .want_bound = false},
+        {.name = "dynamic size not a multiple of 16",
+         .str = "\0" IC_RP "/lib", .strn = sizeof("\0" IC_RP "/lib"),
+         .ent = {{29, 1}, {0, 0}}, .nent = 2, .dsz = 24,
+         .want_bound = false},
+        {.name = "link index out of range", .str = "\0" IC_RP "/lib",
+         .strn = sizeof("\0" IC_RP "/lib"), .ent = {{29, 1}}, .nent = 1,
+         .link = 9, .want_bound = false},
+        {.name = "linked section is not a string table",
+         .str = "\0" IC_RP "/lib", .strn = sizeof("\0" IC_RP "/lib"),
+         .ent = {{29, 1}}, .nent = 1, .strtype = 1, .want_bound = false},
+        {.name = "empty runpath", .str = "\0", .strn = 1,
+         .ent = {{29, 0}}, .nent = 1, .want_bound = false},
+        {.name = "empty runpath beside a libclang-18 need",
+         .str = "\0libclang-18.so.18", .strn = sizeof("\0libclang-18.so.18"),
+         .ent = {{29, 0}, {1, 1}}, .nent = 2, .want_bound = false},
+        {.name = "two runpaths: the last wins (good last)",
+         .str = "\0/nope/lib\0" IC_RP "/lib",
+         .strn = sizeof("\0/nope/lib\0" IC_RP "/lib"),
+         .ent = {{29, 1}, {29, 11}}, .nent = 2, .want_bound = true,
+         .want_path = IC_RP "/bin/clang"},
+        {.name = "two runpaths: the last wins (bad last)",
+         .str = "\0" IC_RP "/lib\0/nope/lib",
+         .strn = sizeof("\0" IC_RP "/lib\0/nope/lib"),
+         .ent = {{29, 1}, {29, sizeof("\0" IC_RP "/lib") }}, .nent = 2,
+         .want_bound = false},
+        {.name = "no runpath, needs libclang-18: the system clang",
+         .str = "\0libclang-18.so.18", .strn = sizeof("\0libclang-18.so.18"),
+         .ent = {{1, 1}}, .nent = 1, .want_bound = true,
+         .want_path = "/usr/lib/llvm-18/bin/clang"},
+        {.name = "no runpath, needs another libclang",
+         .str = "\0libclang-19.so.19", .strn = sizeof("\0libclang-19.so.19"),
+         .ent = {{1, 1}}, .nent = 1, .want_bound = false},
+        {.name = "DT_RPATH only, its clang exists",
+         .str = "\0" IC_RP "/lib", .strn = sizeof("\0" IC_RP "/lib"),
+         .ent = {{15, 1}}, .nent = 1, .want_bound = true,
+         .want_path = IC_RP "/bin/clang"},
+        {.name = "DT_RPATH good then DT_RUNPATH bad: the runpath wins",
+         .str = "\0" IC_RP "/lib\0/nope/lib",
+         .strn = sizeof("\0" IC_RP "/lib\0/nope/lib"),
+         .ent = {{15, 1}, {29, sizeof("\0" IC_RP "/lib")}}, .nent = 2,
+         .want_bound = false},
+        {.name = "no runpath, needs a prefix of libclang-18.so.18",
+         .str = "\0libclang-18.so.1", .strn = sizeof("\0libclang-18.so.1"),
+         .ent = {{1, 1}}, .nent = 1, .want_bound = false},
+        {.name = "FIFO at the sensor path: present, unbound, returns",
+         .str = "\0", .strn = 1, .fifo = true, .want_bound = false},
+    };
+    TEST_CASE("sensor reader: crafted ELF images bind or refuse") {
+        static const char path[] = IC_FIX_ROOT "/sensor-img.elf";
+        uint8_t w[704];
+        bool present = false;
+        char out[PATH_MAX];
+        /* Start clean: a failed earlier run leaves the rp tree and sensor. */
+        (void)test_rm_rf_recursive(IC_RP);
+        (void)unlink(path);
+        (void)mkdir("test-tmp", 0755);
+        ASSERT(mkdir(IC_FIX_ROOT, 0755) == 0 || errno == EEXIST);
+        ASSERT(mkdir(IC_RP, 0755) == 0 || errno == EEXIST);
+        ASSERT(mkdir(IC_RP "/bin", 0755) == 0 || errno == EEXIST);
+        ASSERT(ic_elf_write(IC_RP "/bin/clang", (const uint8_t *)"x", 1));
+        ASSERT(chmod(IC_RP "/bin/clang", 0755) == 0);
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            size_t n = ic_sensor_build(&rows[i], w);
+            if (strcmp(rows[i].name, "zero-length file") == 0)
+                n = 0;
+            (void)unlink(path);
+            if (rows[i].fifo) {
+#if defined(_WIN32)
+                continue; /* no mkfifo here: the FIFO row is POSIX-only */
+#else
+                ASSERT(mkfifo(path, 0600) == 0);
+#endif
+            } else {
+                ASSERT(ic_elf_write(path, w, n));
+            }
+            out[0] = '\0';
+            bool got = zcl_c23_fuzz_sensor_bound_clang_for_test(
+                path, out, sizeof(out), &present);
+            bool ok = present && got == rows[i].want_bound &&
+                      (!rows[i].want_path ||
+                       strcmp(out, rows[i].want_path) == 0);
+            if (!ok)
+                fprintf(stderr, "sensor row failed: %s (got %d '%s')\n",
+                        rows[i].name, (int)got, out);
+            ASSERT(ok);
+        }
+        present = true;
+        ASSERT(!zcl_c23_fuzz_sensor_bound_clang_for_test(
+            IC_FIX_ROOT "/no-such-sensor", out, sizeof(out), &present));
+        ASSERT(!present);
+        unlink(path);
+        (void)test_rm_rf_recursive(IC_RP);
+    } TEST_END
+#undef IC_RP
+    return failures;
+}
+
+static int test_ic_fuzz_llvm_selection_table(void)
+{
+    int failures = 0;
+    TEST_CASE("fuzz host gate: the bound LLVM is the first present header") {
+        static const struct {
+            bool h[ZCL_C23_FUZZ_LLVM_N];
+            int want;
+        } sel[] = {
+            {{false, false, false, true}, 3},  /* only 18 */
+            {{false, false, true, true}, 2},   /* 19 + 18 -> 19 */
+            {{true, false, false, true}, 0},   /* 20 + 18 -> 20 */
+            {{false, true, true, false}, 1},   /* 21 + 19 -> 21 */
+            {{true, true, false, false}, 0},   /* 20 + 21 -> 20 */
+            {{false, false, false, false}, -1},
+        };
+        for (size_t i = 0; i < sizeof(sel) / sizeof(sel[0]); i++) {
+            int got = zcl_c23_fuzz_select_llvm(sel[i].h);
+            if (got != sel[i].want)
+                fprintf(stderr, "selection row %zu: got %d\n", i, got);
+            ASSERT(got == sel[i].want);
+        }
+    } TEST_END
+    return failures;
+}
+
+int test_impact_composition(void)
+{
+    int failures = 0;
+    failures += test_ic_rule_group_capacity();
+    failures += test_ic_rule_group_length();
+    failures += test_ic_app_event_sync_proof_mapping();
+    ic_isolate_state_root();
+    failures += test_ic_fuzz_sensor_binding_parser();
+    failures += test_ic_foreground_proof_command();
+#if !defined(_WIN32)
+    failures += test_ic_foreground_selected_pair();
+    failures += test_ic_proof_env_scrubs_credentials();
+    failures += test_ic_foreground_execution_busy();
+    failures += test_ic_proof_enqueue_requires_commit_objects();
+    failures += test_ic_foreground_refuses_watcher();
+    failures += test_ic_foreground_owner_lifetime();
+    failures += test_ic_competing_fungible_proof_workers();
+    failures += test_ic_worker_hard_death_containment();
+#endif
+    failures += test_ic_truncated_closure_preserves_groups();
+    failures += test_ic_closure_capacity_follows_corpus();
+    failures += test_ic_large_plan_preserves_groups();
+    failures += test_ic_command_latency_scope_is_precise();
+    failures += test_ic_jsonq_exec_contract();
+    failures += test_ic_registry_def_has_dependents();
+    failures += test_ic_macro_only_header_has_dependents();
+    failures += test_ic_incomplete_dimension_refuses_proof();
+    failures += test_ic_capacity_bound_runs_everything();
+    failures += test_ic_include_capacity_runs_everything();
+    failures += test_ic_path_group_cap_runs_everything();
+    failures += test_ic_host_need_table_is_closed();
+    failures += test_ic_every_selection_has_a_reason();
+    failures += test_ic_union_never_loses_a_rule_group();
+    failures += test_ic_dimension_applicability_and_exact_execution();
+    failures += test_ic_block_log_source_plan();
+    failures += test_ic_lint_token_selects_every_shard();
+    failures += test_ic_snapshot_overlays_current_symbols();
+    failures += test_ic_pr72_rpc_routes();
+    failures += test_ic_sqlq_proof_mapping();
+    failures += test_ic_wallet_recovery_status_proof_mapping();
+    failures += test_ic_fleet_triggers_proof_mapping();
+    failures += test_ic_fleet_ledger_proof_mapping();
+    failures += test_ic_utxo_snapshot_proof_mapping();
+    failures += test_ic_code_capsule_stays_with_code_owner();
+    failures += test_ic_generated_inventory_stays_focused();
+    failures += test_ic_fleet_task_projection_keeps_proof_owner();
+    failures += test_ic_dev_proof_contract_is_direct();
+    failures += test_ic_lint_helpers_exclude_onion_stress();
+    failures += test_ic_dev_proof_receipt_admission();
+    failures += test_ic_dev_proof_receipt_requires_full_lint();
+    failures += test_ic_dev_proof_child_action_identity();
+    failures += test_ic_resident_proof_queue();
+    failures += test_ic_proof_wait_reports_settled_failure();
+    failures += test_ic_proof_existing_watcher_input();
+    failures += test_ic_proof_retry_command_contract();
+#if !defined(_WIN32)
+    failures += test_ic_landing_proof_defers_preparation();
+    failures += test_ic_landing_proof_refuses_unsafe_lock();
+    failures += test_ic_landing_proof_holds_lock_through_worker();
+    failures += test_ic_proof_environment_no_verdict();
+    failures += test_ic_proof_retry();
+    failures += test_ic_proof_ensure_passed_writes_no_request();
+    failures += test_ic_proof_leftover_request_never_hides_passed();
+    failures += test_ic_proof_next_preserves_root();
+#endif
+    failures += test_ic_cycle_reuse_requires_exact_proof_inputs();
+    failures += test_ic_native_compositor_selects_physical_proof();
+    failures += test_pw_tag_names_pool_entries();
+    failures += test_pw_classify_link_copy_skip();
+    failures += test_pw_pick_newest_complete_idle();
+    failures += test_pw_marker_round_trip_and_refusals();
+    failures += test_pw_generation_pool_sweep();
+    failures += test_pw_generation_retire_passed();
+    failures += test_pw_generation_retire_wide_locked();
+    failures += test_pw_memory_scope_verdict();
+    failures += test_pw_generation_checkout_clears_pruned();
+    failures += test_pw_abandoned_generation_reaped_by_age();
+    failures += test_pw_pressure_evicts_oldest_until_satisfied();
+    failures += test_pw_pressure_evicts_unclaimed_young_generation();
+    failures += test_pw_orphan_shapes_reaped();
+    failures += test_pw_marker_identity_invalidates_stale_donor();
+    failures += test_pw_identity_survives_a_second_checkout_path();
+    failures += test_pw_identity_keeps_its_four_roots_apart();
+    failures += test_pw_identity_names_missing_restart_env();
+    failures += test_pw_receipt_refuses_an_older_root_policy();
+    failures += test_ic_proof_producer_source_qualification();
+    failures += test_ic_proof_producer_recovery();
+    failures += test_pw_status_line_reports_warm_or_typed_cold();
+    failures += test_ic_landing_step_share_waits_out_a_step();
+    failures += test_pw_seed_links_replaces_and_copies();
+    failures += test_ic_wrapper_catalog_records();
+    failures += test_pw_seed_room_copy_survives_a_stale_wrapper();
+    failures += test_pw_seed_skips_removed_dev_source();
+    failures += test_pw_seed_cold_without_seedables();
+    failures += test_pw_disable_switch_forces_cold();
+    failures += test_ic_fast_sync_splits_keep_proof_lane();
+    failures += test_ic_merkle_verifier_selects_proof_lane();
+    failures += test_ic_landing_proof_lint_argv();
+#if !defined(_WIN32)
+    failures += test_ic_proof_environment_refuses_inherited_shortcuts();
+    failures += test_ic_proof_compiles_against_a_private_store();
+    failures += test_ic_candidate_zcc_stale_behavior_red();
+    failures += test_ic_epoch_dep_stale_behavior_red();
+#endif
+    failures += test_ic_proof_lint_and_test_share_admitted_executables();
+    failures += test_ic_proof_test_needs_build_the_sensor();
+    failures += test_ic_proof_test_needs_leave_provided_tools();
+    failures += test_ic_proof_test_needs_whole_catalog();
+    failures += test_ic_build_need_umbrella_fold();
+    failures += test_ic_metaverse_view_state_routes();
+    failures += test_ic_snapshot_tool_routes();
+    failures += test_ic_app_sync_wire_route();
+    failures += test_ic_app_sync_service_route();
+    failures += test_ic_pr69_sensor_routes();
+    failures += test_ic_local_selection_build_needs();
+    failures += test_ic_proof_prefork_builds_the_shared_targets();
+    failures += test_ic_generation_docs_tools_builds_the_checker_binaries();
+    failures += test_ic_generation_hooks_configure_points_at_its_own_copy();
+#if !defined(_WIN32)
+    failures += test_ic_generation_docs_fresh_refuses_stale();
+    failures += test_ic_generation_docs_fresh_overlapped();
+    int64_t closure_fixture_started_us = platform_time_monotonic_us();
+    failures += test_ic_worker_plan_generation();
+    failures += test_ic_worker_plan_docs_before_refresh();
+    failures += test_ic_worker_plan_graph_refresh_refuses();
+    printf("closure_generation_fixtures wall_us=%lld\n",
+           (long long)(platform_time_monotonic_us() - closure_fixture_started_us));
+    failures += test_ic_generation_docs_fresh_refuses_missing_tools();
+    failures += test_ic_generation_dependencies_survive_vendor_cleanup();
+    failures += test_ic_generation_refuses_forged_verdict();
+    failures += test_ic_proof_test_dimension_runs_cold();
+    failures += test_ic_proof_test_accounting_refuses_reuse();
+    failures += test_ic_preflight_parse();
+    failures += test_ic_preflight_skips_only_empty_store();
+    failures += test_ic_capsule_argv_write();
+    failures += test_ic_capsule_argv_use();
+    failures += test_pw_original_plan_refreshes_before_sealing();
+#endif
+    failures += test_ic_proof_budget_grows_with_groups();
+    failures += test_ic_proof_budget_learns_from_this_checkout();
+    failures += test_ic_proof_ceiling_env_raises_only();
+    failures += test_ic_proof_verdict_watches_progress_not_the_clock();
+    failures += test_ic_proof_ceiling_speaks_before_silence();
+    failures += test_ic_proof_interruption_is_not_a_verdict();
+    failures += test_ic_proof_reads_the_harness_banners();
+#if !defined(_WIN32)
+    failures += test_ic_proof_run_watched_kills_only_the_silent();
+    failures += test_ic_proof_budget_cancellation();
+    failures += test_ic_proof_base_probe_cancels_superseded_worker();
+    failures += test_ic_proof_steps_run_concurrently();
+    failures += test_ic_proof_lint_waits_for_exclusive_pass();
+    failures += test_ic_proof_lint_waits_for_test_completion();
+    failures += test_ic_proof_lint_overlap_needs_cpus();
+    failures += test_ic_proof_step_inherits_no_extra_fd();
+#endif
+    failures += test_ic_proof_generation_prefers_ram_when_it_fits();
+#if !defined(_WIN32)
+#if defined(__linux__)
+    failures += test_ic_platform_file_clone_contract();
+#endif
+    failures += test_ic_proof_dependency_crosses_filesystems();
+    failures += test_ic_proof_optional_dependencies();
+    failures += test_ic_proof_checker_binaries();
+    failures += test_ic_proof_dependency_relative_links();
+    failures += test_ic_proof_dependency_link_refusals();
+    failures += test_ic_ram_scratch_reservations_hold_under_concurrency();
+#endif
+    failures += test_ic_changed_set_rejects_hidden_bytes();
+    failures += test_ic_changed_set_carries_a_landing_batch();
+    failures += test_ic_changed_set_widens_structural_changes();
+    failures += test_ic_deleted_input_closes_current_graph();
+    failures += test_ic_changed_set_reads_a_private_generation_worktree();
+    failures += test_ic_changed_set_refuses_above_its_ceiling();
+    failures += test_ic_watch_overlay_keeps_its_own_ceiling();
+    failures += test_ic_harness_test_group_naming();
+    failures += test_ic_harness_windows_acceptance_table();
+    failures += test_ic_harness_name_reference_secondary_candidate();
+    failures += test_ic_name_reference_single_word_stem_is_bounded();
+    failures += test_ic_harness_no_owner_stays_unmatched();
+    failures += test_ic_fuzz_toolchain_decision_table();
+    failures += test_ic_fuzz_llvm_selection_table();
+    failures += test_ic_sensor_bound_clang_reader();
+#if !defined(_WIN32)
+    failures += test_pw_next_proof_seeds_from_the_finished_generation();
+    failures += test_pw_identity_mismatch_stays_cold_with_its_reason();
+    failures += test_pw_live_donor_is_never_seeded_from();
+    failures += test_pw_authoritative_proof_refuses_same_uid_donor();
+    failures += test_pw_orphan_gitdir_record_framing();
+    failures += test_ic_proof_request_exact_extent();
+    failures += test_ic_proof_text_readers_refuse_nul();
+    failures += test_pw_plan_rejects_hidden_fields();
+#endif
+    return failures;
+}

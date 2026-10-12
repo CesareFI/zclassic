@@ -1,0 +1,245 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * Gates: check-flag-registry
+ * Second file of the check-flag-registry family: the first-use pointer
+ * check. gate_flag_registry.c parses engine/composition/flags.def and
+ * scans the tree for reads of each flag; this file answers a narrower
+ * question the parser never asked — does the "first use <path>:<line>"
+ * note a row cites actually point at a line that reads that flag's name?
+ * Three port lanes cited a stale or wrong line this week and no gate
+ * caught any of it, so the pointer itself is now proved, not trusted.
+ */
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include "gate_flag_registry_priv.h"
+#include "lintc.h"
+
+/* True when tok parses as "<path>:<line>" or "<path>:auto". The auto form
+ * binds the row to a scanner-recognized real read in that exact tracked
+ * file (C, shell or Makefile — gate_flag_registry.c's fr_read_is_real says
+ * what "real" means per kind), so moving lines in that file cannot force an
+ * edit to the shared registry. A nonempty
+ * path and colon are required. "Makefile deploy:" (no
+ * digits after its colon) and a bare "Makefile" (no colon at all) both
+ * return 0 here, which is how a prose why_ clause that merely contains
+ * the words "first use" without a real pointer stays unaffected. */
+static int fru_token_is_pointer(const char *tok, char *path, size_t pathcap,
+                                int *line)
+{
+    const char *colon = strrchr(tok, ':');
+    if (!colon || colon == tok)
+        return 0;
+    const char *d = colon + 1;
+    if (!*d)
+        return 0;
+    int automatic = strcmp(d, "auto") == 0;
+    if (!automatic)
+        for (const char *q = d; *q; q++)
+            if (*q < '0' || *q > '9')
+                return 0;
+    size_t plen = (size_t)(colon - tok);
+    if (plen >= pathcap)
+        return 0;
+    memcpy(path, tok, plen);
+    path[plen] = '\0';
+    *line = automatic ? -1 : atoi(d);
+    return 1;
+}
+
+/* Finds "first use " anywhere in why (not just at its start — a row can
+ * say "documented at X; first use Y:Z" first) and hands the whitespace-
+ * or semicolon-delimited token right after it to fru_token_is_pointer. */
+int fru_parse_pointer(const char *why, char *path, size_t pathcap, int *line)
+{
+    static const char tag[] = "first use ";
+    const char *p = strstr(why, tag);
+    if (!p)
+        return 0;
+    p += sizeof tag - 1;
+    const char *end = p;
+    while (*end && *end != ' ' && *end != '\t' && *end != ';')
+        end++;
+    size_t tlen = (size_t)(end - p);
+    char tok[300];
+    if (tlen == 0 || tlen >= sizeof tok)
+        return 0;
+    memcpy(tok, p, tlen);
+    tok[tlen] = '\0';
+    return fru_token_is_pointer(tok, path, pathcap, line);
+}
+
+static int fru_ident_char(int c)
+{
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* True when name appears in line as a whole identifier token — bounded on
+ * both sides by a non-identifier byte (or the string's edge) — so a row
+ * for ZCL_FOO is never satisfied by a line that reads only ZCL_FOO_BAR. */
+static int fru_name_on_line(const char *line, const char *name)
+{
+    size_t nlen = strlen(name);
+    const char *p = line;
+    while ((p = strstr(p, name)) != NULL) {
+        int before_ok = (p == line) || !fru_ident_char((unsigned char)p[-1]);
+        int after_ok = !fru_ident_char((unsigned char)p[nlen]);
+        if (before_ok && after_ok)
+            return 1;
+        p++;
+    }
+    return 0;
+}
+
+/* The shared scan behind both fru_open_check and fru_pointer_status: reads
+ * every line of path once, and reports whether the cited line reads name
+ * (*hit: line existed; *found: it read the name), plus the line NUMBER
+ * nearest line that does read name anywhere in the file (*near, 0 if none —
+ * the repair target when the cited line drifted), and the file's total line
+ * count (*lines, for a "line past end" message). Returns 0 on a completed
+ * scan, 1 when the file is missing (stat failed — none of the out params
+ * are touched), or -1 when the file exists but can't be opened for read —
+ * the caller treats that as UNPROVEN and stops immediately rather than
+ * guessing. */
+static int fru_scan(const char *path, int line, const char *name, int *hit,
+                    int *found, int *near, int *lines)
+{
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 1;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    char *l = NULL;
+    size_t cap = 0;
+    ssize_t nread;
+    int lineno = 0;
+    *hit = *found = *near = 0;
+    /* The whole file is read: when the cited line is stale, the line
+     * NEAREST it that does read the name is found, so a pointer that only
+     * drifted (an insertion above it) is a copy-paste fix. */
+    while ((nread = getline(&l, &cap, f)) >= 0) {
+        lineno++;
+        int on = fru_name_on_line(l, name);
+        if (on && (!*near || abs(lineno - line) < abs(*near - line)))
+            *near = lineno;
+        if (lineno == line) {
+            *hit = 1;
+            *found = on;
+        }
+    }
+    free(l);
+    fclose(f);
+    *lines = lineno;
+    return 0;
+}
+
+/* Opens path (relative to the repo root, same convention as the rest of
+ * this gate) and checks whether its cited line reads name. Returns 0 when
+ * it does, 1 with reason filled in for a violation the caller reports and
+ * keeps scanning past, or -1 when the file exists but can't be read at
+ * all — the caller treats that as UNPROVEN and stops immediately rather
+ * than guessing. The gate itself stays exact: a drifted pointer still fails,
+ * even though the nearest read named in the reason is exactly what
+ * --fix-pointers would rewrite it to. */
+static int fru_open_check(const char *path, int line, const char *name,
+                          char *reason, size_t rcap)
+{
+    int hit, found, near, lines;
+    int rc = fru_scan(path, line, name, &hit, &found, &near, &lines);
+    if (rc != 0) {
+        if (rc == 1)
+            snprintf(reason, rcap, "file missing");
+        return rc == 1 ? 1 : -1;
+    }
+    if (hit && found)
+        return 0;
+    if (near)
+        snprintf(reason, rcap, "%s; nearest read now at %s:%d",
+                 hit ? "name absent" : "line past end", path, near);
+    else if (!hit)
+        snprintf(reason, rcap, "line past end (%d lines)", lines);
+    else
+        snprintf(reason, rcap, "name absent");
+    return 1;
+}
+
+/* See gate_flag_registry_priv.h for the contract. */
+int fru_pointer_status(const char *path, int line, const char *name, int *near)
+{
+    int hit, found, lines;
+    *near = 0;
+    int rc = fru_scan(path, line, name, &hit, &found, near, &lines);
+    if (rc == -1)
+        return -1;
+    if (rc == 1 || !(hit && found))
+        return (rc == 0 && *near) ? 1 : 2;
+    return 0;
+}
+
+static int fru_check_one(const struct fr_row *row, FILE *out)
+{
+    if (row->fu_line == -1) {
+        if (row->fu_read_seen)
+            return 0;
+        struct stat st;
+        int missing = stat(row->fu_path, &st) != 0;
+        return fprintf(out, "flag_registry: %s first use %s:auto has no "
+                       "scanner-recognized read in that tracked file%s\n",
+                       row->name, row->fu_path,
+                       missing ? " (file missing)" : "") < 0
+            ? die("z23-lint: write failed\n", "") : 1;
+    }
+    char reason[400];
+    int rc = fru_open_check(row->fu_path, row->fu_line, row->name, reason,
+                            sizeof reason);
+    if (rc < 0)
+        return die("z23-lint: flag_registry: first-use pointer file "
+                   "unreadable: %s\n", row->fu_path);
+    if (rc == 0)
+        return 0;
+    return fprintf(out, "flag_registry: %s first use %s:%d does not read it"
+                   " (%s)\n", row->name, row->fu_path, row->fu_line,
+                   reason) < 0
+        ? die("z23-lint: write failed\n", "") : 1;
+}
+
+/* Runs fru_check_one over every row that carries a first-use pointer,
+ * counts how many verified clean, and (when any failed) prints one
+ * summary line naming the count before returning 1. A -1 from
+ * fru_check_one (unreadable cited file) propagates as 2 immediately —
+ * die() already told the operator which path. */
+int fru_check_rows(const struct fr_row *rows, int n, FILE *out, int *verified)
+{
+    int violations = 0;
+    *verified = 0;
+    for (int i = 0; i < n; i++) {
+        if (!rows[i].fu_present)
+            continue;
+        int rc = fru_check_one(&rows[i], out);
+        if (rc == 2)
+            return 2;
+        if (rc == 1)
+            violations++;
+        else
+            (*verified)++;
+    }
+    if (violations == 0)
+        return 0;
+    return fprintf(out, "flag_registry: %d first-use pointer(s) do not"
+                   " read their flag — run `z23-lint check-flag-registry"
+                   " --fix-pointers` to repair a drifted pointer to the"
+                   " flag's nearest current read in the same file (a row"
+                   " whose flag is no longer read there at all is left for"
+                   " a human), or `--auto-pointers` to rebind every"
+                   " numeric pointer whose file really reads its flag to"
+                   " <path>:auto so line moves stop touching flags.def\n",
+                   violations) < 0
+        ? die("z23-lint: write failed\n", "") : 1;
+}

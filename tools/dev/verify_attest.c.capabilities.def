@@ -1,0 +1,2 @@
+/* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0 */
+ZCL_MODULE_CAPABILITY("tools/dev/verify_attest.c", CAP_FS_READ|CAP_FS_WRITE, "reads the root-pinned verifier public key file and lstats each parent directory to prove root owns the whole chain; writes only diagnostics to stderr")

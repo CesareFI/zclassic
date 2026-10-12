@@ -1,0 +1,5153 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0 */
+
+#define _GNU_SOURCE
+#include "devloop.h"
+#include "devloop_early.h"
+#include "dev_proof.h"
+#include "devloop_watch_classify.h"
+
+#include "base/safe_alloc.h"
+#include "base/hex.h"
+#include "base/serialize_le.h"
+#include "codeindex/codeindex.h"
+#include "codeindex/codeindex_merkle.h"
+#include "crypto/sha3.h"
+#include "hotswap/hotswap_service.h"
+#include "json/json.h"
+#include "zutf8/zutf8.h"
+#include "platform/file_watch_compat.h"
+#include "platform/directory_compat.h"
+#include "platform/directory_watcher.h"
+#include "platform/os_proc.h"
+#include "platform/private_directory.h"
+#include "platform/process_lock.h"
+#include "platform/rng.h"
+#include "platform/time_compat.h"
+#include "platform/clock.h"
+
+#if !defined(_WIN32)
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if !defined(_WIN32)
+#include <sys/file.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#else
+#include <process.h>
+#endif
+
+#if defined(ZCL_DEV_BUILD) || defined(ZCL_TESTING)
+
+#if defined(_WIN32)
+
+/* ReadDirectoryChangesW intentionally reports only that the retained tree
+ * changed.  Until the backend exposes a trustworthy relative-name batch,
+ * treat every notification as the conservative Makefile/full-source lane.
+ * This costs more work but cannot incorrectly qualify an unsafe hot swap. */
+static bool watch_windows_stop(void *opaque)
+{
+    struct {
+        zcl_devloop_stop_predicate stop;
+        void *opaque;
+    } *state = opaque;
+    return state && state->stop && state->stop(state->opaque);
+}
+
+int zcl_devloop_watch_mode_until(const char *repo_root,
+    enum zcl_devloop_publish_mode publish_mode,
+    zcl_devloop_stop_predicate stop, void *stop_opaque)
+{
+    char root[ZCL_DEVLOOP_PATH_MAX], cache[ZCL_DEVLOOP_PATH_MAX];
+    char lock_path[ZCL_DEVLOOP_PATH_MAX];
+    const char *requested = repo_root && repo_root[0] ? repo_root : ".";
+    const char *mode = zcl_devloop_publish_mode_name(publish_mode);
+    if (!mode || !platform_directory_canonical_real(requested, root,
+                                                     sizeof(root)))
+        return 2;
+    int n = snprintf(cache, sizeof(cache), "%s/.cache", root);
+    if (n <= 0 || (size_t)n >= sizeof(cache) ||
+        !platform_private_directory_ensure(cache) ||
+        !zcl_devloop_watch_lock_path(root, lock_path, sizeof(lock_path)))
+        return 1;
+    struct platform_process_lock lock;
+    platform_process_lock_init(&lock);
+    if (!platform_process_lock_try_acquire(&lock, lock_path, true))
+        return 1;
+    struct platform_directory_watcher watcher;
+    platform_directory_watcher_init(&watcher);
+    if (!platform_directory_watcher_open(&watcher, root)) {
+        platform_process_lock_release(&lock);
+        return 1;
+    }
+    struct { zcl_devloop_stop_predicate stop; void *opaque; } stop_state = {
+        stop, stop_opaque};
+    printf("{\"schema\":\"zcl.dev_watch_heartbeat.v1\","
+           "\"status\":\"watching\",\"pid\":%ld,\"root\":\"%s\","
+           "\"mode\":\"%s\",\"watch_backend\":\"ReadDirectoryChangesW\"}\n",
+           (long)_getpid(), root, mode);
+    fflush(stdout);
+    int rc = 0;
+    for (;;) {
+        enum platform_directory_watch_result changed =
+            platform_directory_watcher_wait(&watcher, 1000,
+                stop ? watch_windows_stop : NULL, &stop_state);
+        if (changed == PLATFORM_DIRECTORY_WATCH_TIMEOUT)
+            continue;
+        if (changed == PLATFORM_DIRECTORY_WATCH_STOPPED)
+            break;
+        if (changed == PLATFORM_DIRECTORY_WATCH_ERROR) {
+            rc = 1;
+            break;
+        }
+        const char *files[] = {"Makefile"};
+        (void)ci_merkle_forget(root);
+        if (zcl_devloop_run_cycle_mode(root, files, 1,
+                                      ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY) != 0) {
+            rc = 1;
+            break;
+        }
+    }
+    printf("{\"schema\":\"zcl.dev_watch_heartbeat.v1\","
+           "\"status\":\"stopped\",\"pid\":%ld}\n", (long)_getpid());
+    fflush(stdout);
+    platform_directory_watcher_close(&watcher);
+    platform_process_lock_release(&lock);
+    return rc;
+}
+
+int zcl_devloop_watch_mode(const char *repo_root,
+                           enum zcl_devloop_publish_mode publish_mode)
+{ return zcl_devloop_watch_mode_until(repo_root, publish_mode, NULL, NULL); }
+
+int zcl_devloop_watch(const char *repo_root)
+{ return zcl_devloop_watch_mode(repo_root,
+                                zcl_devloop_default_watch_publish_mode()); }
+
+#else
+
+#define DEVLOOP_INITIAL_WATCHES 512
+#define DEVLOOP_EDIT_EPOCH_MAX_FILES 16
+#if defined(__APPLE__)
+/* kqueue reports a directory mutation rather than one final child pathname.
+ * Give an editor's vnode burst one scheduler quantum to settle before the
+ * conservative full-source epoch starts, so its rename/write pair cannot
+ * supersede itself while the first impact event is still unflushed. */
+#define DEVLOOP_EDIT_QUIET_US 50000
+#else
+#define DEVLOOP_EDIT_QUIET_US 1000
+#endif
+#define DEVLOOP_MUTATION_MASK                                                \
+    (IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM | IN_CREATE | IN_DELETE)
+
+struct watched_dir {
+    int wd;
+    char rel[ZCL_DEVLOOP_PATH_MAX];
+};
+
+struct watch_blob_state {
+    char path[256];
+    struct zcl_sha3_digest digest;
+    uint64_t size;
+    bool present;
+};
+
+struct watch_edit_blob {
+    char path[256];
+    struct zcl_sha3_digest previous_digest;
+    struct zcl_sha3_digest new_digest;
+    uint64_t previous_size;
+    uint64_t new_size;
+    bool previous_present;
+    bool previous_known;
+    bool new_present;
+};
+
+struct watch_edit_epoch {
+    uint64_t sequence;
+    int64_t seen_us;
+    int64_t impact_ready_us;
+    int64_t immutable_epoch_creation_us;
+    int64_t impact_calculation_us;
+    uint64_t changed_bytes_read;
+    char id[65];
+    char parent[65];
+    char dependency_generation[65];
+    char dependency_generation_kind[32];
+    char owner[ZCL_DEVLOOP_GROUP_MAX];
+    char component[128];
+    size_t blob_count;
+    struct watch_edit_blob blobs[DEVLOOP_EDIT_EPOCH_MAX_FILES];
+};
+
+struct watch_pending_event {
+    int64_t epoch;
+    size_t len;
+    char body[ZCL_DEVLOOP_CYCLE_JSON_MAX];
+};
+
+enum watch_proof_worker_kind {
+    WATCH_PROOF_WORKER_NONE = 0,
+    WATCH_PROOF_WORKER_EDIT,
+    WATCH_PROOF_WORKER_COMMIT,
+};
+
+/* CPU accounting for one reflex cycle: the watcher itself, children it
+ * reaped (compiler, linker, story fork, proof worker), and CFS throttling of
+ * its cgroup and ancestors (Linux; zero elsewhere). */
+struct watch_cpu_sample {
+    int64_t self_user_us;
+    int64_t self_sys_us;
+    int64_t children_user_us;
+    int64_t children_sys_us;
+    int64_t throttled_us;
+    int64_t throttled_periods;
+};
+
+/* Monotonic stage marks of one reflex cycle, from the first relevant source
+ * event the watcher reads to its return to the idle wait. The cycle is
+ * reported on the next IMPACT_READY because its tail (journal flush, proof
+ * scheduling) runs after the story reply is already visible. */
+struct watch_cycle_trace {
+    char edit_epoch[65];
+    int64_t idle_wait_us;
+    int64_t fs_event_us;
+    int64_t impact_ready_us;
+    int64_t reflex_return_us;
+    int64_t stream_flushed_us;
+    int64_t proof_scheduled_us;
+    int64_t cycle_end_us;
+    struct watch_cpu_sample start;
+    struct watch_cpu_sample end;
+    uint32_t proof_workers_spawned;
+    int64_t sealer_pid;
+    uint32_t seals_deferred;
+    uint32_t seals_inline;
+    bool active;
+    bool complete;
+};
+
+/* The watcher's one persistent journal sealer child. Producers inside the
+ * watcher hand it epochs over a pipe instead of waiting on journal fsyncs.
+ * The watcher keeps its own read end open so a sealer that died turns a
+ * request into a full pipe (EAGAIN), never SIGPIPE. */
+struct watch_sealer {
+    pid_t owner;
+    pid_t pid;
+    int fd;
+    int read_fd;
+    int64_t requested;
+    uint32_t deferred;
+    uint32_t inline_backlog;
+    uint32_t inline_down;
+};
+
+/* One exited downstream proof worker, with its own rusage from wait4. */
+struct watch_proof_record {
+    char edit_epoch[65];
+    int64_t spawned_us;
+    int64_t cancel_us;
+    int64_t reaped_us;
+    int64_t user_us;
+    int64_t sys_us;
+    int exit_code;
+    int signal;
+};
+
+struct watch_context {
+    int fd;
+    int singleton_lock_fd;
+    int stop_fd;
+    bool stop_endpoint_ready;
+    char stop_nonce[65];
+    char stop_workspace[65];
+    uint64_t stop_start_token;
+#if defined(__APPLE__)
+    struct platform_directory_watcher directory_watcher;
+    bool watch_backend_failed;
+#endif
+    char root[PATH_MAX];
+    struct watched_dir *dirs;
+    size_t dir_count;
+    size_t dir_capacity;
+    char changed[ZCL_DEVLOOP_WATCH_MAX_FILES][ZCL_DEVLOOP_PATH_MAX];
+    size_t changed_count;
+    struct zcl_devloop_restart_source_set restart_sources;
+    bool force_full_source_rescan;
+    uint64_t mutation_sequence;
+    int64_t first_mutation_us;
+    int64_t idle_since_us;
+    bool edit_seen_emitted;
+    struct ci_merkle *verified_tree;
+    char verified_root[65];
+    char dependency_generation[65];
+    char dependency_generation_kind[32];
+    char parent_edit_epoch[65];
+    uint64_t edit_epoch_sequence;
+    bool snapshot_raced;
+    bool snapshot_exact;
+    struct watch_blob_state overlay[ZCL_DEVLOOP_WATCH_MAX_FILES];
+    size_t overlay_count;
+    struct watch_pending_event pending[4];
+    size_t pending_count;
+    struct watch_edit_epoch prepared_epoch;
+    bool prepared_epoch_ready;
+    bool prepared_full_rescan;
+    pid_t proof_worker_pid;
+    enum watch_proof_worker_kind proof_worker_kind;
+    char proof_pending[ZCL_DEVLOOP_RESTART_SOURCE_MAX]
+                      [ZCL_DEVLOOP_PATH_MAX];
+    size_t proof_pending_count;
+    enum zcl_devloop_publish_mode proof_pending_mode;
+    bool proof_pending_story;
+    char proof_worker_epoch[65];
+    int64_t proof_worker_spawned_us;
+    int64_t proof_worker_cancel_us;
+    /* When stop sent the worker SIGTERM; its kill deadline counts from here. */
+    int64_t proof_worker_stop_us;
+    struct watch_proof_record proof_reaped[4];
+    size_t proof_reaped_count;
+    struct watch_cycle_trace trace;
+    struct watch_cycle_trace trace_prior;
+    int64_t trace_next_fs_event_us;
+    struct watch_sealer sealer;
+    /* This iteration's exact-commit verdict, established at the reactor
+     * loop head and read (never recomputed) by the cancel poll. */
+    bool commit_preempts;
+    /* A request arriving during a synchronous edit cycle must get the loop
+     * head back. This is only a wake hint; the loop head still checks the
+     * exact pair, source cleanliness and ordinary proof locks. */
+    char request_hint_dir[PATH_MAX];
+    struct timespec request_hint_mtime;
+    bool request_hint_present;
+    bool request_hint_armed;
+    bool request_hint_changed;
+    int64_t request_hint_next_us;
+};
+
+static volatile sig_atomic_t g_watch_stop;
+
+static int64_t watch_timeval_us(struct timeval tv)
+{
+    return (int64_t)tv.tv_sec * 1000000 + (int64_t)tv.tv_usec;
+}
+
+#if defined(__linux__)
+#define WATCH_CGROUP_LEVELS 8
+
+/* cgroup v2 reports CFS throttling in the cgroup whose cpu.max bound it, so
+ * sum own and ancestor cpu.stat. Resolved once; forked workers inherit. */
+static size_t watch_cgroup_stat_paths(char paths[][PATH_MAX], size_t cap)
+{
+    static const char mount[] = "/sys/fs/cgroup";
+    char dir[PATH_MAX];
+    if (!os_proc_cgroup_dir(dir, sizeof(dir)) ||
+        strncmp(dir, mount, sizeof(mount) - 1) != 0)
+        return 0;
+    size_t count = 0;
+    while (count < cap && strlen(dir) > sizeof(mount) - 1) {
+        int n = snprintf(paths[count], PATH_MAX, "%s/cpu.stat", dir);
+        count += n > 0 && n < PATH_MAX;
+        *strrchr(dir, '/') = 0;
+    }
+    return count;
+}
+
+static int64_t watch_cpu_stat_field(const char *text, const char *key)
+{
+    const char *at = strstr(text, key);
+    long long value = 0;
+    return at && sscanf(at + strlen(key), "%lld", &value) == 1
+        ? (int64_t)value : 0;
+}
+
+static void watch_cgroup_throttle(struct watch_cpu_sample *sample)
+{
+    static char paths[WATCH_CGROUP_LEVELS][PATH_MAX];
+    static size_t count;
+    static bool resolved;
+    if (!resolved) {
+        count = watch_cgroup_stat_paths(paths, WATCH_CGROUP_LEVELS);
+        resolved = true;
+    }
+    for (size_t i = 0; i < count; i++) {
+        char text[1024];
+        FILE *f = fopen(paths[i], "re");
+        size_t n = f ? fread(text, 1, sizeof(text) - 1, f) : 0;
+        if (f)
+            fclose(f);
+        text[n] = 0;
+        sample->throttled_us += watch_cpu_stat_field(text, "\nthrottled_usec ");
+        sample->throttled_periods +=
+            watch_cpu_stat_field(text, "\nnr_throttled ");
+    }
+}
+#endif
+
+static void watch_cpu_sample_take(struct watch_cpu_sample *sample)
+{
+    memset(sample, 0, sizeof(*sample));
+    struct rusage self, children;
+    if (getrusage(RUSAGE_SELF, &self) == 0) {
+        sample->self_user_us = watch_timeval_us(self.ru_utime);
+        sample->self_sys_us = watch_timeval_us(self.ru_stime);
+    }
+    if (getrusage(RUSAGE_CHILDREN, &children) == 0) {
+        sample->children_user_us = watch_timeval_us(children.ru_utime);
+        sample->children_sys_us = watch_timeval_us(children.ru_stime);
+    }
+#if defined(__linux__)
+    watch_cgroup_throttle(sample);
+#endif
+}
+
+static void watch_trace_start(struct watch_context *ctx, int64_t fs_event_us)
+{
+    int64_t idle_wait_us = ctx->trace.idle_wait_us;
+    memset(&ctx->trace, 0, sizeof(ctx->trace));
+    ctx->trace.idle_wait_us = idle_wait_us;
+    ctx->trace.fs_event_us = fs_event_us;
+    ctx->trace.active = true;
+    watch_cpu_sample_take(&ctx->trace.start);
+}
+
+/* The first relevant mutation after a reset opens a cycle trace; one that
+ * arrives while a cycle is still running opens the next trace at its end. */
+static void watch_trace_event(struct watch_context *ctx, int64_t event_us)
+{
+    if (!ctx->trace.active)
+        watch_trace_start(ctx, event_us);
+    else if (ctx->trace_next_fs_event_us == 0)
+        ctx->trace_next_fs_event_us = event_us;
+}
+
+static void watch_trace_idle(struct watch_context *ctx)
+{
+    if (!ctx->trace.active && ctx->trace.idle_wait_us == 0)
+        ctx->trace.idle_wait_us = platform_time_monotonic_us();
+}
+
+static void watch_trace_mark(int64_t *mark)
+{
+    *mark = platform_time_monotonic_us();
+}
+
+static void watch_trace_end(struct watch_context *ctx)
+{
+    if (!ctx->trace.active)
+        return;
+    ctx->trace.cycle_end_us = platform_time_monotonic_us();
+    ctx->trace.sealer_pid = ctx->sealer.pid;
+    watch_cpu_sample_take(&ctx->trace.end);
+    (void)snprintf(ctx->trace.edit_epoch, sizeof(ctx->trace.edit_epoch),
+                   "%s", zcl_devloop_event_edit_epoch());
+    ctx->trace.active = false;
+    ctx->trace.complete = true;
+    ctx->trace_prior = ctx->trace;
+    int64_t next_event_us = ctx->trace_next_fs_event_us;
+    memset(&ctx->trace, 0, sizeof(ctx->trace));
+    ctx->trace_next_fs_event_us = 0;
+    if (next_event_us > 0)
+        watch_trace_start(ctx, next_event_us);
+}
+
+static void watch_proof_record_exit(struct watch_context *ctx, int status,
+                                    const struct rusage *usage)
+{
+    if (ctx->proof_worker_kind != WATCH_PROOF_WORKER_EDIT)
+        return;
+    size_t cap = sizeof(ctx->proof_reaped) / sizeof(ctx->proof_reaped[0]);
+    if (ctx->proof_reaped_count == cap) {
+        memmove(&ctx->proof_reaped[0], &ctx->proof_reaped[1],
+                (cap - 1) * sizeof(ctx->proof_reaped[0]));
+        ctx->proof_reaped_count--;
+    }
+    struct watch_proof_record *record =
+        &ctx->proof_reaped[ctx->proof_reaped_count++];
+    memset(record, 0, sizeof(*record));
+    (void)snprintf(record->edit_epoch, sizeof(record->edit_epoch), "%s",
+                   ctx->proof_worker_epoch);
+    record->spawned_us = ctx->proof_worker_spawned_us;
+    record->cancel_us = ctx->proof_worker_cancel_us;
+    record->reaped_us = platform_time_monotonic_us();
+    record->user_us = usage ? watch_timeval_us(usage->ru_utime) : -1;
+    record->sys_us = usage ? watch_timeval_us(usage->ru_stime) : -1;
+    record->exit_code = usage && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    record->signal = usage && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+}
+
+static bool watch_trace_push_cpu(struct json_value *doc,
+                                 const struct watch_cycle_trace *t)
+{
+    return json_push_kv_int(doc, "watcher_user_us",
+                            t->end.self_user_us - t->start.self_user_us) &&
+        json_push_kv_int(doc, "watcher_sys_us",
+                         t->end.self_sys_us - t->start.self_sys_us) &&
+        json_push_kv_int(doc, "children_user_us",
+                         t->end.children_user_us - t->start.children_user_us) &&
+        json_push_kv_int(doc, "children_sys_us",
+                         t->end.children_sys_us - t->start.children_sys_us) &&
+        json_push_kv_int(doc, "cgroup_throttled_us",
+                         t->end.throttled_us - t->start.throttled_us) &&
+        json_push_kv_int(doc, "cgroup_throttled_periods",
+                         t->end.throttled_periods -
+                             t->start.throttled_periods);
+}
+
+/* Which process sealed this cycle's events: the sealer (its pid lets a
+ * measurement read its CPU and I/O) or the watcher itself on fallback. */
+static bool watch_trace_push_seal(struct json_value *doc,
+                                  const struct watch_cycle_trace *t)
+{
+    return json_push_kv_int(doc, "sealer_pid", t->sealer_pid) &&
+        json_push_kv_int(doc, "seals_deferred", (int64_t)t->seals_deferred) &&
+        json_push_kv_int(doc, "seals_inline", (int64_t)t->seals_inline);
+}
+
+static bool watch_trace_push_cycle(struct json_value *doc,
+                                   const struct watch_cycle_trace *t)
+{
+    struct json_value cycle;
+    json_init(&cycle);
+    json_set_object(&cycle);
+    bool ok = json_push_kv_str(&cycle, "edit_epoch", t->edit_epoch) &&
+        json_push_kv_int(&cycle, "idle_wait_us", t->idle_wait_us) &&
+        json_push_kv_int(&cycle, "fs_event_us", t->fs_event_us) &&
+        json_push_kv_int(&cycle, "impact_ready_us", t->impact_ready_us) &&
+        json_push_kv_int(&cycle, "reflex_return_us", t->reflex_return_us) &&
+        json_push_kv_int(&cycle, "stream_flushed_us", t->stream_flushed_us) &&
+        json_push_kv_int(&cycle, "proof_scheduled_us",
+                         t->proof_scheduled_us) &&
+        json_push_kv_int(&cycle, "cycle_end_us", t->cycle_end_us) &&
+        json_push_kv_int(&cycle, "proof_workers_spawned",
+                         (int64_t)t->proof_workers_spawned) &&
+        watch_trace_push_seal(&cycle, t) &&
+        watch_trace_push_cpu(&cycle, t) &&
+        json_push_kv(doc, "prior_cycle", &cycle);
+    json_free(&cycle);
+    return ok;
+}
+
+static bool watch_trace_push_proofs(struct json_value *doc,
+                                    const struct watch_context *ctx)
+{
+    struct json_value list;
+    json_init(&list);
+    json_set_array(&list);
+    bool ok = true;
+    for (size_t i = 0; ok && i < ctx->proof_reaped_count; i++) {
+        const struct watch_proof_record *r = &ctx->proof_reaped[i];
+        struct json_value item;
+        json_init(&item);
+        json_set_object(&item);
+        ok = json_push_kv_str(&item, "edit_epoch", r->edit_epoch) &&
+            json_push_kv_int(&item, "spawned_us", r->spawned_us) &&
+            json_push_kv_int(&item, "cancel_us", r->cancel_us) &&
+            json_push_kv_int(&item, "reaped_us", r->reaped_us) &&
+            json_push_kv_int(&item, "user_us", r->user_us) &&
+            json_push_kv_int(&item, "sys_us", r->sys_us) &&
+            json_push_kv_int(&item, "exit_code", r->exit_code) &&
+            json_push_kv_int(&item, "signal", r->signal) &&
+            json_push_back(&list, &item);
+        json_free(&item);
+    }
+    ok = ok && json_push_kv(doc, "proof_workers_reaped", &list);
+    json_free(&list);
+    return ok;
+}
+
+/* Attach the last completed cycle and any reaped downstream proof workers
+ * to the next IMPACT_READY exactly once. */
+static bool watch_trace_emit(struct watch_context *ctx,
+                             struct json_value *doc, bool ok)
+{
+    if (!ok)
+        return false;
+    if (ctx->trace_prior.complete &&
+        !watch_trace_push_cycle(doc, &ctx->trace_prior))
+        return false;
+    if (ctx->proof_reaped_count > 0 && !watch_trace_push_proofs(doc, ctx))
+        return false;
+    ctx->trace_prior.complete = false;
+    ctx->proof_reaped_count = 0;
+    return true;
+}
+
+/* A public service contract header is intentionally outside the live island:
+ * changing ABI/schema/wire/KAT bytes invalidates the resident frozen contract.
+ * Persist a typed DEV_RESTART selection without falling through to the legacy
+ * make/shell proof path.  No proof is claimed and no node is restarted here. */
+static int service_contract_restart_event(
+    const char *root, const char *const *files, size_t count)
+{
+    const char *contract_path = NULL;
+    const char *service_source = NULL;
+    for (size_t i = 0; i < count && !service_source; i++) {
+        service_source =
+            zcl_hotswap_service_contract_source_for_path(files[i]);
+        if (service_source) contract_path = files[i];
+    }
+    if (!service_source)
+        return 0;
+    char body[4096];
+    int n = snprintf(
+        body, sizeof(body),
+        "{\"schema\":\"zcl.dev_cycle.v1\","
+        "\"producer\":\"resident-build-authority\","
+        "\"status\":\"blocked\",\"action\":\"reload\","
+        "\"reload_lane\":\"DEV_RESTART\","
+        "\"reason\":\"service_contract_changed\","
+        "\"phase\":\"dev_restart_selected\","
+        "\"runtime_published\":false,\"dev_restart\":true,"
+        "\"proof_complete\":false,\"immediate_proof_complete\":false,"
+        "\"integration_proof_deferred\":true,"
+        "\"bounded_proof_deferred\":true,"
+        "\"make_processes\":0,\"shell_processes\":0,"
+        "\"lto_processes\":0,\"compiler_processes\":0,"
+        "\"linker_processes\":0,\"test_processes\":0,"
+        "\"contract_path\":\"%s\",\"service_source\":\"%s\","
+        "\"failure_capsule\":\"frozen ABI/schema/wire/KAT contract changed; live service publication refused\","
+        "\"why_not_live\":\"frozen ABI/schema/wire/KAT contract changed; live service publication refused\","
+        "\"agent_next_action\":\"run make dev-bin to refresh the bounded DEV_RESTART plan, then rerun mapped proofs\"}",
+        contract_path, service_source);
+    if (n <= 0 || n >= (int)sizeof(body))
+        return -1;
+    char why[160] = {0};
+    if (!zcl_devloop_cycle_state_write(root, body, (size_t)n, why,
+                                       sizeof(why))) {
+        fprintf(stderr, "[devloop] contract restart receipt failed: %s\n",
+                why[0] ? why : "unknown");
+        return -1;
+    }
+    (void)fwrite(body, 1, (size_t)n, stdout);
+    (void)fputc('\n', stdout);
+    (void)fflush(stdout);
+    return 1;
+}
+
+static const struct zcl_devloop_epoch_lanes g_watch_epoch_lanes = {
+    .hotfork = zcl_devloop_hotfork_batch_event,
+    .hotswap = zcl_devloop_hotswap_batch_event,
+    .service_contract = service_contract_restart_event,
+    .restart = zcl_devloop_restart_event_proving,
+};
+
+static void mutation_sequence_advance(struct watch_context *ctx)
+{
+    if (ctx && ctx->mutation_sequence < UINT64_MAX)
+        ctx->mutation_sequence++;
+}
+
+static void watch_signal(int sig)
+{
+    (void)sig;
+    g_watch_stop = 1;
+    zcl_devloop_process_cancel_request();
+}
+
+/* Sealing ring events into the append-only journal costs several fsyncs per
+ * batch. Producers still request it right after their event is visible, but
+ * inside the watcher the request goes to one persistent sealer child, so the
+ * next source event is read without waiting on storage. The sealer is forked
+ * once at startup and runs until the watcher closes the request pipe. A
+ * backlog near the ring's capacity, or a sealer that has exited, seals in
+ * the watcher instead; the seal lock and the journal's gap refusal keep every
+ * epoch sealed exactly once, in order, whoever seals it. */
+#define WATCH_SEAL_BACKLOG_MAX 32
+/* The request that asks the sealer to drain what it holds and exit. */
+#define WATCH_SEAL_STOP UINT64_MAX
+
+static void watch_sealer_init(struct watch_sealer *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->fd = -1;
+    s->read_fd = -1;
+}
+
+static void watch_sealer_close_fds(struct watch_sealer *s)
+{
+    if (s->fd >= 0)
+        (void)close(s->fd);
+    if (s->read_fd >= 0)
+        (void)close(s->read_fd);
+    s->fd = -1;
+    s->read_fd = -1;
+}
+
+/* Reaps a sealer that exited; from then on the watcher seals inline. */
+static bool watch_sealer_alive(struct watch_sealer *s)
+{
+    if (s->pid <= 0)
+        return false;
+    int status = 0;
+    pid_t got = waitpid(s->pid, &status, WNOHANG);
+    if (got == 0 || (got < 0 && errno == EINTR))
+        return true;
+    fprintf(stderr,
+            "[devloop] event journal sealer %ld exited (wait status %d); "
+            "sealing in the watcher\n",
+            (long)s->pid, got > 0 ? status : -1);
+    s->pid = 0;
+    watch_sealer_close_fds(s);
+    return false;
+}
+
+/* Hands `through` to the sealer while the unsealed backlog stays well inside
+ * the 64-slot ring. A full pipe also declines, so the caller seals now. */
+static bool watch_sealer_request(const char *root, struct watch_sealer *s,
+                                 int64_t through)
+{
+    int64_t latest = 0, durable = 0;
+    unsigned char message[8];
+    zcl_write_u64_le(message, (uint64_t)through);
+    bool accepted = zcl_devloop_cycle_stream_marks(root, &latest, &durable) &&
+        through - durable <= WATCH_SEAL_BACKLOG_MAX &&
+        write(s->fd, message, sizeof(message)) == (ssize_t)sizeof(message);
+    if (!accepted) {
+        s->inline_backlog++;
+        return false;
+    }
+    if (through > s->requested)
+        s->requested = through;
+    s->deferred++;
+    return true;
+}
+
+static bool watch_seal_defer(void *opaque, const char *repo_root,
+                             int64_t through)
+{
+    struct watch_context *ctx = opaque;
+    struct watch_sealer *s = &ctx->sealer;
+    /* A forked child inherits this hook's memory image; it seals itself, as
+     * does any producer for a workspace this watcher does not own. */
+    if (s->owner != getpid() || !repo_root ||
+        strcmp(repo_root, ctx->root) != 0)
+        return false;
+    bool alive = watch_sealer_alive(s);
+    if (!alive)
+        s->inline_down++;
+    bool deferred = alive && watch_sealer_request(ctx->root, s, through);
+    if (deferred)
+        ctx->trace.seals_deferred++;
+    else
+        ctx->trace.seals_inline++;
+    return deferred;
+}
+
+static bool watch_sealer_take(const unsigned char *bytes, ssize_t n,
+                              int64_t *want, bool *stop)
+{
+    if (n <= 0 || n % 8 != 0)
+        return false;
+    for (ssize_t at = 0; at < n; at += 8) {
+        uint64_t epoch = zcl_read_u64_le(bytes + at);
+        if (epoch == WATCH_SEAL_STOP) {
+            *stop = true;
+            continue;
+        }
+        if (epoch == 0 || epoch > INT64_MAX)
+            return false;
+        if ((int64_t)epoch > *want)
+            *want = (int64_t)epoch;
+    }
+    return true;
+}
+
+/* Blocks for the next request, then coalesces every request already queued
+ * to the highest epoch. The stop request, or EOF when the watcher died
+ * without sending one, ends the loop after this batch. */
+static bool watch_sealer_collect(int fd, int64_t *want, bool *eof)
+{
+    unsigned char bytes[512];
+    int timeout_ms = -1;
+    for (;;) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        int ready = poll(&pfd, 1, timeout_ms);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0)
+            return ready == 0;
+        ssize_t n = read(fd, bytes, sizeof(bytes));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n == 0) {
+            *eof = true;
+            return true;
+        }
+        if (!watch_sealer_take(bytes, n, want, eof))
+            return false;
+        if (*eof)
+            return true;
+        timeout_ms = 0;
+    }
+}
+
+#if defined(ZCL_TESTING)
+/* Test seam: a sealer forked while this is set holds each batch until the
+ * gate's write end closes, so a test can kill its watcher mid-drain. */
+static int g_sealer_test_gate = -1;
+
+static void watch_sealer_test_gate_wait(void)
+{
+    char byte = 0;
+    while (g_sealer_test_gate >= 0) {
+        ssize_t n = read(g_sealer_test_gate, &byte, 1);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            (void)close(g_sealer_test_gate);
+            g_sealer_test_gate = -1;
+        }
+    }
+}
+#else
+static void watch_sealer_test_gate_wait(void) {}
+#endif
+
+static int watch_sealer_loop(const char *root, int fd)
+{
+    bool eof = false;
+    while (!eof) {
+        int64_t want = 0;
+        char why[160] = {0};
+        if (!watch_sealer_collect(fd, &want, &eof)) {
+            fprintf(stderr, "[devloop] event journal sealer request read "
+                            "failed: %s\n", strerror(errno));
+            return 1;
+        }
+        watch_sealer_test_gate_wait();
+        if (want > 0 && !zcl_devloop_cycle_stream_flush_through(
+                            root, want, why, sizeof(why))) {
+            fprintf(stderr, "[devloop] event journal sealer failed "
+                            "through=%lld: %s\n",
+                    (long long)want, why[0] ? why : "unknown");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The sealer drops the source watch, the watcher's stop endpoint and the
+ * request write end but keeps the inherited singleton lock until it exits: a
+ * sealer orphaned by a killed watcher still owns sealing, so no new watcher
+ * starts and restarts the ring until it has drained. Only the watcher's stop
+ * record on the request pipe, or pipe EOF when the watcher died, stops it;
+ * SIGINT and SIGTERM reach the watcher, whose stop then drains this child,
+ * and a kill mid-seal leaves no torn journal file (records are renamed into
+ * place whole). */
+static void watch_sealer_child(struct watch_context *ctx, const int fds[2],
+                               const sigset_t *mask)
+{
+#if defined(__APPLE__)
+    platform_directory_watcher_close(&ctx->directory_watcher);
+#else
+    if (ctx->fd >= 0)
+        (void)close(ctx->fd);
+#endif
+    if (ctx->stop_endpoint_ready)
+        (void)close(ctx->stop_fd);
+    (void)close(fds[1]);
+    (void)signal(SIGINT, SIG_IGN);
+    (void)signal(SIGTERM, SIG_IGN);
+    (void)signal(SIGHUP, SIG_IGN);
+    (void)pthread_sigmask(SIG_SETMASK, mask, NULL);
+    zcl_devloop_cycle_stream_seal_defer(NULL, NULL);
+    _exit(watch_sealer_loop(ctx->root, fds[0]));
+}
+
+static bool watch_sealer_pipe(int fds[2])
+{
+    if (pipe(fds) != 0)
+        return false;
+    int flags = fcntl(fds[1], F_GETFL);
+    if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) == 0 &&
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC) == 0 && flags >= 0 &&
+        fcntl(fds[1], F_SETFL, flags | O_NONBLOCK) == 0)
+        return true;
+    int saved = errno;
+    (void)close(fds[0]);
+    (void)close(fds[1]);
+    errno = saved;
+    return false;
+}
+
+/* Stop signals stay blocked across fork() until the child ignores them, so
+ * one sent the instant the sealer exists cannot kill it mid-batch. */
+static pid_t watch_sealer_fork(struct watch_context *ctx, const int fds[2])
+{
+    sigset_t stop_signals, previous;
+    (void)sigemptyset(&stop_signals);
+    (void)sigaddset(&stop_signals, SIGINT);
+    (void)sigaddset(&stop_signals, SIGTERM);
+    (void)sigaddset(&stop_signals, SIGHUP);
+    int masked = pthread_sigmask(SIG_BLOCK, &stop_signals, &previous);
+    if (masked != 0) {
+        errno = masked;
+        return -1;
+    }
+    pid_t child = fork();
+    if (child == 0)
+        watch_sealer_child(ctx, fds, &previous);
+    int saved = errno;
+    (void)pthread_sigmask(SIG_SETMASK, &previous, NULL);
+    errno = saved;
+    return child;
+}
+
+/* Without a sealer every seal stays synchronous in the watcher. */
+static bool watch_sealer_start(struct watch_context *ctx)
+{
+    int fds[2] = {-1, -1};
+    if (!watch_sealer_pipe(fds)) {
+        fprintf(stderr, "[devloop] event journal sealer pipe failed: %s; "
+                        "sealing in the watcher\n", strerror(errno));
+        return false;
+    }
+    pid_t child = watch_sealer_fork(ctx, fds);
+    if (child < 0) {
+        fprintf(stderr, "[devloop] event journal sealer fork failed: %s; "
+                        "sealing in the watcher\n", strerror(errno));
+        (void)close(fds[0]);
+        (void)close(fds[1]);
+        return false;
+    }
+    ctx->sealer.owner = getpid();
+    ctx->sealer.pid = child;
+    ctx->sealer.read_fd = fds[0];
+    ctx->sealer.fd = fds[1];
+    zcl_devloop_cycle_stream_seal_defer(watch_seal_defer, ctx);
+    return true;
+}
+
+/* How long stop gives a child it has asked to exit (a sealer that could not
+ * be sent its stop request, or a proof worker sent SIGTERM) before killing
+ * it. Two such joins stay inside the 5 s that `dev loop stop` waits for the
+ * singleton lock. */
+#define WATCH_CHILD_STOP_BUDGET_MS 2000
+
+/* Waits up to `budget_ms` for child `pid` to exit, then SIGKILLs it, and the
+ * process group too when the child leads one, and reaps it. Journal writes
+ * are kill-safe, so a child killed mid-seal leaves nothing the next seal
+ * does not recover. Returns waitpid's result; *killed says the budget ran
+ * out. */
+static pid_t watch_child_reap_bounded(pid_t pid, int budget_ms, int *status,
+                                      bool *killed)
+{
+    *killed = false;
+    int64_t deadline = platform_time_monotonic_us() +
+                       (int64_t)budget_ms * 1000;
+    for (;;) {
+        pid_t got = waitpid(pid, status, WNOHANG);
+        if (got != 0 && !(got < 0 && errno == EINTR))
+            return got;
+        if (platform_time_monotonic_us() >= deadline)
+            break;
+        (void)poll(NULL, 0, 10);
+    }
+    *killed = true;
+    if (getpgid(pid) == pid)
+        (void)kill(-pid, SIGKILL);
+    (void)kill(pid, SIGKILL);
+    pid_t got;
+    do {
+        got = waitpid(pid, status, 0);
+    } while (got < 0 && errno == EINTR);
+    return got;
+}
+
+/* Stop owns every published event: the stop message (then the pipe's close)
+ * lets the sealer drain what it was handed and exit, then anything still
+ * unsealed (a failed sealer's range, or an event published without a flush)
+ * is sealed here before the watcher reports itself stopped. The explicit
+ * message matters: a process forked without exec keeps a copy of the write
+ * end, which would otherwise hold back the EOF until it exits. A stop
+ * message that cannot be sent (a full pipe: the sealer is wedged) gets a
+ * bounded wait, then the sealer is killed. */
+static void watch_sealer_join(struct watch_sealer *s)
+{
+    bool asked = s->fd < 0;
+    if (s->fd >= 0) {
+        unsigned char stop[8];
+        zcl_write_u64_le(stop, WATCH_SEAL_STOP);
+        asked = write(s->fd, stop, sizeof(stop)) == (ssize_t)sizeof(stop);
+        if (!asked && s->pid > 0)
+            fprintf(stderr, "[devloop] could not send the event journal "
+                            "sealer %ld its stop request (%s); killing it "
+                            "if it has not exited within %d ms\n",
+                    (long)s->pid, strerror(errno),
+                    WATCH_CHILD_STOP_BUDGET_MS);
+        (void)close(s->fd);
+    }
+    s->fd = -1;
+    if (s->pid <= 0)
+        return;
+    int status = 0;
+    bool killed = false;
+    pid_t got;
+    if (asked) {
+        do {
+            got = waitpid(s->pid, &status, 0);
+        } while (got < 0 && errno == EINTR);
+    } else {
+        got = watch_child_reap_bounded(s->pid, WATCH_CHILD_STOP_BUDGET_MS,
+                                       &status, &killed);
+    }
+    if (got != s->pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        fprintf(stderr, "[devloop] event journal sealer %ld ended with wait "
+                        "status %d%s; sealing the remainder in the watcher\n",
+                (long)s->pid, got == s->pid ? status : -1,
+                killed ? " (killed at stop)" : "");
+    s->pid = 0;
+}
+
+/* Seals every event published to the ring so far. `when` names the point
+ * of stop in the log. False when the ring cannot be read or the seal fails. */
+static bool watch_seal_published(const char *root, const char *when)
+{
+    int64_t latest = 0, durable = 0;
+    char why[160] = {0};
+    if (!zcl_devloop_cycle_stream_marks(root, &latest, &durable)) {
+        fprintf(stderr, "[devloop] event stream unreadable %s; cannot "
+                        "prove every published event is sealed\n", when);
+        return false;
+    }
+    if (latest == durable || zcl_devloop_cycle_stream_flush_through(
+                                 root, latest, why, sizeof(why)))
+        return true;
+    fprintf(stderr, "[devloop] event journal seal %s failed "
+                    "through=%lld: %s\n",
+            when, (long long)latest, why[0] ? why : "unknown");
+    return false;
+}
+
+/* The join waits without a bound once the stop request is sent: a live
+ * sealer blocks only on the seal lock or a journal fsync, which the inline
+ * seal below would wait on equally, and returning first would report a stop
+ * the journal has not reached. False when an event published before stop is
+ * not sealed; the watcher then exits nonzero. */
+static bool watch_sealer_finish(struct watch_context *ctx)
+{
+    zcl_devloop_cycle_stream_seal_defer(NULL, NULL);
+    watch_sealer_join(&ctx->sealer);
+    watch_sealer_close_fds(&ctx->sealer);
+    return watch_seal_published(ctx->root, "at stop");
+}
+
+/* A forked proof worker neither keeps the request pipe nor defers: it seals
+ * synchronously, and first seals what the watcher already handed to the
+ * sealer, so the journal it reads is the one an inline flush gave it. */
+static bool watch_sealer_detach_worker(struct watch_context *ctx)
+{
+    struct watch_sealer *s = &ctx->sealer;
+    int64_t handed = s->pid > 0 ? s->requested : 0;
+    if (s->pid > 0)
+        watch_sealer_close_fds(s);
+    s->pid = 0;
+    s->owner = 0;
+    zcl_devloop_cycle_stream_seal_defer(NULL, NULL);
+    char why[160] = {0};
+    if (handed <= 0 || zcl_devloop_cycle_stream_flush_through(
+                           ctx->root, handed, why, sizeof(why)))
+        return true;
+    fprintf(stderr, "[devloop] proof worker journal catch-up failed "
+                    "through=%lld: %s\n",
+            (long long)handed, why[0] ? why : "unknown");
+    return false;
+}
+
+/* Complete proof is deliberately downstream of the reflex verdict. Run it
+ * in a sibling worker so source event ingestion never depends on where that
+ * slower cycle happens to reach its next cooperative process poll. The child
+ * closes both watcher-owned descriptors: it can neither consume source
+ * events nor retain singleton ownership after the reactor exits. */
+static void proof_worker_signal(int sig)
+{
+    (void)sig;
+    zcl_devloop_process_cancel_request();
+}
+
+/* A worker is asked to cancel when its watcher dies, even by SIGKILL: on
+ * Linux the kernel then sends it SIGTERM, and a watcher that died before
+ * that request took effect is caught by the parent check that follows. */
+static void watch_proof_worker_bind_parent(pid_t parent)
+{
+    zcl_devloop_process_cancel_bind_parent((uint64_t)parent);
+    if (!os_proc_bind_parent_death(SIGTERM, (uint64_t)parent))
+        zcl_devloop_process_cancel_request();
+}
+
+/* Stop and supersede signal a worker the moment fork() returns, usually
+ * before the child has run: a signal delivered there reached the inherited
+ * watcher handler, and the child's own cancel reset then erased it, so the
+ * obsolete proof ran to completion while the stopping reactor blocked in
+ * watch_proof_join(). Hold SIGINT/SIGTERM across fork() until the child has
+ * reset its cancel state and installed its own handler; a signal sent at any
+ * point after fork() then cancels the worker. Returns fork()'s result. */
+static pid_t watch_proof_worker_fork(struct watch_context *ctx,
+                                     int watcher_lock_fd)
+{
+    sigset_t stop_signals, previous;
+    (void)sigemptyset(&stop_signals);
+    (void)sigaddset(&stop_signals, SIGINT);
+    (void)sigaddset(&stop_signals, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &stop_signals, &previous) != 0)
+        return -1;
+    pid_t parent = getpid();
+    pid_t child = fork();
+    if (child == 0) {
+#if defined(__APPLE__)
+        platform_directory_watcher_close(&ctx->directory_watcher);
+#else
+        close(ctx->fd);
+#endif
+        if (ctx->stop_endpoint_ready) close(ctx->stop_fd);
+        close(watcher_lock_fd);
+        zcl_devloop_process_cancel_clear();
+        zcl_devloop_process_cancel_poll_clear();
+        signal(SIGINT, proof_worker_signal);
+        signal(SIGTERM, proof_worker_signal);
+        watch_proof_worker_bind_parent(parent);
+    }
+    (void)pthread_sigmask(SIG_SETMASK, &previous, NULL);
+    if (child == 0 && !watch_sealer_detach_worker(ctx))
+        _exit(1);
+    return child;
+}
+
+static void watch_proof_reap(struct watch_context *ctx)
+{
+    if (!ctx || ctx->proof_worker_pid <= 1)
+        return;
+    int status = 0;
+    struct rusage usage;
+    memset(&usage, 0, sizeof(usage));
+    pid_t got = wait4(ctx->proof_worker_pid, &status, WNOHANG, &usage);
+    if (got == ctx->proof_worker_pid || (got < 0 && errno == ECHILD)) {
+        watch_proof_record_exit(ctx, status,
+                                got == ctx->proof_worker_pid ? &usage : NULL);
+        ctx->proof_worker_pid = 0;
+        ctx->proof_worker_kind = WATCH_PROOF_WORKER_NONE;
+    }
+}
+
+static void watch_proof_cancel(struct watch_context *ctx)
+{
+    if (!ctx)
+        return;
+    ctx->proof_pending_count = 0;
+    watch_proof_reap(ctx);
+    if (ctx->proof_worker_pid <= 1 ||
+        ctx->proof_worker_kind == WATCH_PROOF_WORKER_COMMIT)
+        return;
+
+    /* Cancellation is a priority boundary, not a best-effort notification.
+     * The worker's handler immediately signals its exact active child session
+     * through devloop_process. Do not wait here: this function also runs on
+     * the first byte of a newer edit, whose reflex must start immediately. */
+    (void)kill(ctx->proof_worker_pid, SIGTERM);
+    ctx->proof_worker_cancel_us = platform_time_monotonic_us();
+}
+
+static void watch_proof_stop(struct watch_context *ctx)
+{
+    if (!ctx) return;
+    ctx->proof_pending_count = 0;
+    watch_proof_reap(ctx);
+    if (ctx->proof_worker_pid > 1) {
+        (void)kill(ctx->proof_worker_pid, SIGTERM);
+        ctx->proof_worker_stop_us = platform_time_monotonic_us();
+    }
+}
+
+/* What is left of the worker's stop budget: counted from stop's SIGTERM, so
+ * the sealer drain that runs between them does not extend it. */
+static int watch_proof_join_budget_ms(struct watch_context *ctx)
+{
+    int64_t since = ctx->proof_worker_stop_us;
+    ctx->proof_worker_stop_us = 0;
+    if (since <= 0)
+        return WATCH_CHILD_STOP_BUDGET_MS;
+    int64_t spent_ms = (platform_time_monotonic_us() - since) / 1000;
+    return spent_ms >= WATCH_CHILD_STOP_BUDGET_MS
+        ? 0 : WATCH_CHILD_STOP_BUDGET_MS - (int)spent_ms;
+}
+
+/* A worker sent SIGTERM normally exits at its next cancellation poll. One
+ * that does not (wedged in a system call, or ignoring the signal) is killed
+ * after a bounded wait, so stop never holds the singleton lock on it. */
+static void watch_proof_join(struct watch_context *ctx)
+{
+    if (!ctx || ctx->proof_worker_pid <= 1)
+        return;
+    pid_t worker = ctx->proof_worker_pid;
+    int status = 0;
+    bool killed = false;
+    pid_t got = watch_child_reap_bounded(worker,
+                                         watch_proof_join_budget_ms(ctx),
+                                         &status, &killed);
+    if (killed)
+        fprintf(stderr, "[devloop] proof worker %ld did not exit within %d "
+                        "ms of stop; killed it\n",
+                (long)worker, WATCH_CHILD_STOP_BUDGET_MS);
+    if (got == worker || (got < 0 && errno == ECHILD)) {
+        ctx->proof_worker_pid = 0;
+        ctx->proof_worker_kind = WATCH_PROOF_WORKER_NONE;
+    }
+}
+
+static bool watch_commit_request_current_clean(struct watch_context *ctx)
+{
+    if (!ctx || !zcl_dev_proof_queue_has_pending(ctx->root))
+        return false;
+    char local[65], base[65], why[160] = {0};
+    struct zcl_dev_proof_status status = {0};
+    if (!zcl_dev_proof_resolve_pair(ctx->root, NULL, NULL, local, base,
+                                    why, sizeof(why)) ||
+        !zcl_dev_proof_status_read(ctx->root, local, base, &status) ||
+        status.state != ZCL_DEV_PROOF_STATE_RUNNING ||
+        strcmp(status.detail, "resident_proof_request_queued") != 0)
+        return false;
+
+    const char *argv[] = {
+        "git", "status", "--porcelain=v1", "--untracked-files=normal", NULL};
+    struct zcl_devloop_process_result result = {0};
+    return zcl_devloop_process_run(ctx->root, argv, 30000, &result) &&
+        !result.timed_out && !result.output_truncated &&
+        result.term_signal == 0 && result.exit_code == 0 &&
+        result.output_len == 0;
+}
+
+/* An exact commit receipt subsumes the edit proof that led to the commit, but
+ * only after the request names current HEAD and the submitting worktree is
+ * clean enough for proof_worker() to admit it.  Drop an unstarted edit proof
+ * or signal its bounded worker; never disturb an already-running commit proof
+ * and never trade away feedback for newer dirty edits. */
+static void watch_commit_priority_apply(struct watch_context *ctx,
+                                        bool request_current_clean)
+{
+    if (!ctx || !request_current_clean)
+        return;
+    ctx->proof_pending_count = 0;
+    watch_proof_reap(ctx);
+    if (ctx->proof_worker_pid > 1 &&
+        ctx->proof_worker_kind == WATCH_PROOF_WORKER_EDIT) {
+        (void)kill(ctx->proof_worker_pid, SIGTERM);
+        watch_proof_join(ctx);
+    }
+}
+
+static bool watch_commit_proof_claimable(const struct watch_context *ctx)
+{
+    return ctx && ctx->proof_worker_pid <= 1 &&
+        ctx->proof_pending_count == 0;
+}
+
+static bool watch_root_is_landing(const char *root);
+
+/* True when the synchronous edit cycle at the bottom of the reactor must
+ * yield: an exact commit-proof request is queued for current HEAD on a tree
+ * clean enough for proof_worker() to admit, so the edit epoch this cycle is
+ * proving is already subsumed by the commit whose proof is waiting.
+ *
+ * The FORKED edit worker has had this rule since watch_commit_priority_apply().
+ * The foreground cycle did not, and it is the one that holds the reactor:
+ * while it runs, the loop head that reaps a deferred queue worker and starts
+ * the commit proof is not reached at all. A landing worktree's own
+ * preparation writes enough files to schedule exactly such a cycle, so a
+ * queued landing proof waited behind work that could no longer matter.
+ *
+ * The verdict is established HERE, at the loop head, and nowhere else. The
+ * probe opens the request directory, reads its files and runs bounded git
+ * children; the cancel poll may do none of that, because the process runner
+ * invokes a poll while holding its own non-recursive cancel-poll mutex
+ * (devloop_process.c) — a poll that ran a child would re-enter that mutex and
+ * wedge the watcher for good, which is permanently worse than the scheduling
+ * delay this rule removes. The loop head is also the only place that can act
+ * on the answer, so establishing it once per iteration loses nothing. */
+static bool watch_commit_proof_prioritize(struct watch_context *ctx)
+{
+    bool request_current_clean = watch_commit_request_current_clean(ctx);
+    watch_commit_priority_apply(ctx, request_current_clean);
+    if (ctx) {
+        ctx->commit_preempts = request_current_clean;
+        ctx->request_hint_armed = false;
+        ctx->request_hint_changed = false;
+    }
+    return request_current_clean;
+}
+
+/* Arm only on a clean landing tree. A request-directory mtime is cheap to
+ * observe from the process cancel poll and carries no proof authority. The
+ * later loop-head predicate remains the sole admission decision. */
+static void watch_request_hint_arm(struct watch_context *ctx)
+{
+    const char *argv[] = {
+        "git", "status", "--porcelain=v1", "--untracked-files=normal", NULL};
+    struct zcl_devloop_process_result result = {0};
+    struct stat st;
+    int n;
+    if (!ctx)
+        return;
+    ctx->request_hint_armed = false;
+    ctx->request_hint_changed = false;
+    if (!watch_root_is_landing(ctx->root))
+        return;
+    n = snprintf(ctx->request_hint_dir, sizeof(ctx->request_hint_dir),
+                 "%s/.cache/zcl-dev-proof/requests", ctx->root);
+    if (n <= 0 || (size_t)n >= sizeof(ctx->request_hint_dir) ||
+        !zcl_devloop_process_run(ctx->root, argv, 30000, &result) ||
+        result.timed_out || result.output_truncated || result.term_signal != 0 ||
+        result.exit_code != 0 || result.output_len != 0)
+        return;
+    ctx->request_hint_present = stat(ctx->request_hint_dir, &st) == 0 &&
+                                S_ISDIR(st.st_mode);
+    if (ctx->request_hint_present)
+        ctx->request_hint_mtime = st.st_mtim;
+    ctx->request_hint_next_us = 0;
+    ctx->request_hint_armed = true;
+    /* Close the gap between the loop-head decision and arming this hint.
+     * This full predicate runs before the cancel poll is installed. */
+    if (zcl_dev_proof_queue_has_pending(ctx->root) &&
+        watch_commit_request_current_clean(ctx))
+        ctx->request_hint_changed = true;
+}
+
+static bool watch_request_hint_poll(struct watch_context *ctx)
+{
+    struct stat st;
+    int64_t now;
+    bool present;
+    if (!ctx || !ctx->request_hint_armed)
+        return false;
+    if (ctx->request_hint_changed)
+        return true;
+    now = platform_time_monotonic_us();
+    if (now < ctx->request_hint_next_us)
+        return false;
+    ctx->request_hint_next_us = now + 50000;
+    present = stat(ctx->request_hint_dir, &st) == 0 && S_ISDIR(st.st_mode);
+    if (present != ctx->request_hint_present ||
+        (present &&
+         (st.st_mtim.tv_sec != ctx->request_hint_mtime.tv_sec ||
+          st.st_mtim.tv_nsec != ctx->request_hint_mtime.tv_nsec)))
+        ctx->request_hint_changed = true;
+    return ctx->request_hint_changed;
+}
+
+/* The foreground cycle yields for newer source events, an exact commit seen
+ * at the loop head, or a request-directory change observed by stat(2). The
+ * hint never parses a request or admits proof; the next loop head does that.
+ * The cancel poll runs under the process runner's non-recursive mutex, so it
+ * may not launch a child or run the full request predicate there. */
+static bool watch_cycle_should_yield(const struct watch_context *ctx,
+                                     bool changed)
+{
+    return zcl_devloop_watch_should_yield(
+        changed, ctx && ctx->commit_preempts,
+        ctx && ctx->request_hint_changed);
+}
+
+static bool mkdirs(const char *path);
+
+/* A landing worktree is <state_root>/land/wt; queue.lock lives in
+ * <state_root>/land, one segment above the watched root. Presence of that
+ * sibling lock is the exact land-state signal — not a "wt" name guess. */
+static bool watch_root_is_landing(const char *root)
+{
+    char lock_path[PATH_MAX];
+    int n;
+
+    if (!root || !root[0])
+        return false;
+    n = snprintf(lock_path, sizeof(lock_path), "%s/../queue.lock", root);
+    if (n <= 0 || (size_t)n >= sizeof(lock_path))
+        return true;
+    return access(lock_path, F_OK) == 0;
+}
+
+static void watch_idle_touch(struct watch_context *ctx)
+{
+    if (!ctx)
+        return;
+    ctx->idle_since_us = platform_time_monotonic_us();
+}
+
+/* True only when the idle wait observed no source work, no queued proof, no
+ * in-flight proof worker, and a non-landing root past the idle budget. */
+static bool watch_idle_poll_should_exit(struct watch_context *ctx)
+{
+    if (!ctx)
+        return false;
+    if (zcl_dev_proof_queue_has_pending(ctx->root) ||
+        ctx->proof_worker_pid > 1) {
+        watch_idle_touch(ctx);
+        return false;
+    }
+    if (watch_root_is_landing(ctx->root))
+        return false;
+    return platform_time_monotonic_us() - ctx->idle_since_us >=
+        (int64_t)ZCL_DEVLOOP_WATCH_IDLE_BUDGET_MS * 1000;
+}
+
+static bool watch_stopped_heartbeat_line(char *buf, size_t len, bool idle_exit)
+{
+    int n;
+
+    if (!buf || len == 0) {
+        fprintf(stderr,
+                "[devloop] watch: stopped heartbeat buffer missing\n");
+        return false;
+    }
+    if (idle_exit)
+        n = snprintf(buf, len,
+                     "{\"schema\":\"zcl.dev_watch_heartbeat.v1\","
+                     "\"status\":\"stopped\",\"pid\":%ld,"
+                     "\"reason\":\"idle_exit\"}\n",
+                     (long)getpid());
+    else
+        n = snprintf(buf, len,
+                     "{\"schema\":\"zcl.dev_watch_heartbeat.v1\","
+                     "\"status\":\"stopped\",\"pid\":%ld}\n",
+                     (long)getpid());
+    if (n < 0 || (size_t)n >= len) {
+        fprintf(stderr,
+                "[devloop] watch: stopped heartbeat could not be formatted\n");
+        return false;
+    }
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+static zcl_devloop_watch_test_foreground_fn watch_test_stopped;
+static void *watch_test_stopped_opaque;
+
+void zcl_devloop_watch_test_stopped_set(
+    zcl_devloop_watch_test_foreground_fn fn, void *opaque)
+{
+    watch_test_stopped = fn;
+    watch_test_stopped_opaque = opaque;
+}
+#endif
+
+static void watch_emit_stopped_heartbeat(bool idle_exit)
+{
+#if defined(ZCL_TESTING)
+    if (watch_test_stopped) watch_test_stopped(watch_test_stopped_opaque);
+#endif
+    char line[192];
+
+    if (!watch_stopped_heartbeat_line(line, sizeof(line), idle_exit))
+        return;
+    fputs(line, stdout);
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_devloop_watch_commit_preemption_selftest(void)
+{
+    struct watch_context ctx = {0};
+    ctx.proof_pending_count = 1;
+    pid_t edit = fork();
+    if (edit < 0)
+        return false;
+    if (edit == 0) {
+        signal(SIGTERM, SIG_DFL);
+        for (;;) pause();
+    }
+    ctx.proof_worker_pid = edit;
+    ctx.proof_worker_kind = WATCH_PROOF_WORKER_EDIT;
+    watch_commit_priority_apply(&ctx, true);
+    bool edit_retired = ctx.proof_pending_count == 0 &&
+        ctx.proof_worker_pid == 0 &&
+        ctx.proof_worker_kind == WATCH_PROOF_WORKER_NONE &&
+        watch_commit_proof_claimable(&ctx);
+
+    ctx.proof_pending_count = 1;
+    pid_t commit = fork();
+    if (commit < 0)
+        return false;
+    if (commit == 0) {
+        signal(SIGTERM, SIG_DFL);
+        for (;;) pause();
+    }
+    ctx.proof_worker_pid = commit;
+    ctx.proof_worker_kind = WATCH_PROOF_WORKER_COMMIT;
+    watch_commit_priority_apply(&ctx, true);
+    bool commit_preserved = kill(commit, 0) == 0 &&
+        ctx.proof_worker_pid == commit &&
+        ctx.proof_worker_kind == WATCH_PROOF_WORKER_COMMIT;
+    (void)kill(commit, SIGTERM);
+    watch_proof_join(&ctx);
+
+    ctx.proof_pending_count = 1;
+    pid_t dirty_edit = fork();
+    if (dirty_edit < 0)
+        return false;
+    if (dirty_edit == 0) {
+        signal(SIGTERM, SIG_DFL);
+        for (;;) pause();
+    }
+    ctx.proof_worker_pid = dirty_edit;
+    ctx.proof_worker_kind = WATCH_PROOF_WORKER_EDIT;
+    watch_commit_priority_apply(&ctx, false);
+    bool dirty_preserved = kill(dirty_edit, 0) == 0 &&
+        ctx.proof_pending_count == 1 &&
+        ctx.proof_worker_pid == dirty_edit &&
+        ctx.proof_worker_kind == WATCH_PROOF_WORKER_EDIT;
+    (void)kill(dirty_edit, SIGTERM);
+    watch_proof_join(&ctx);
+    return edit_retired && commit_preserved && dirty_preserved;
+}
+
+bool zcl_devloop_watch_root_is_landing(const char *root)
+{
+    return watch_root_is_landing(root);
+}
+
+struct watch_idle_clock {
+    int64_t mono_us;
+};
+
+static int64_t watch_idle_clock_mono_ns(void *self)
+{
+    struct watch_idle_clock *clock = self;
+    return clock ? clock->mono_us * 1000 : 0;
+}
+
+static int64_t watch_idle_clock_wall_ms(void *self)
+{
+    (void)self;
+    return 0;
+}
+
+static bool watch_idle_selftest_write_request(const char *root)
+{
+    char dir[PATH_MAX], path[PATH_MAX];
+    int n;
+    int fd;
+    ssize_t wrote;
+    static const char body[] =
+        "zcl.dev_proof_request.v1\n"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "1111111111111111111111111111111111111111\n"
+        "1\n"
+        "1\n";
+
+    if (!root)
+        return false;
+    n = snprintf(dir, sizeof(dir), "%s/.cache/zcl-dev-proof/requests", root);
+    if (n <= 0 || (size_t)n >= sizeof(dir) || !mkdirs(dir))
+        return false;
+    n = snprintf(path, sizeof(path),
+                 "%s/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-"
+                 "1111111111111111111111111111111111111111.request",
+                 dir);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        return false;
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return false;
+    wrote = write(fd, body, sizeof(body) - 1);
+    if (close(fd) != 0 || wrote != (ssize_t)(sizeof(body) - 1))
+        return false;
+    return zcl_dev_proof_queue_has_pending(root);
+}
+
+static void watch_idle_selftest_clear_request(const char *root)
+{
+    char path[PATH_MAX];
+    int n;
+
+    if (!root)
+        return;
+    n = snprintf(path, sizeof(path),
+                 "%s/.cache/zcl-dev-proof/requests/"
+                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-"
+                 "1111111111111111111111111111111111111111.request",
+                 root);
+    if (n > 0 && (size_t)n < sizeof(path))
+        (void)unlink(path);
+}
+
+struct idle_fixture {
+    struct watch_idle_clock clock;
+    int64_t budget_us;
+    char base[PATH_MAX], plain[PATH_MAX], land_parent[PATH_MAX];
+    char land_wt[PATH_MAX], queue_lock[PATH_MAX];
+    struct watch_context ctx;
+};
+
+static bool idle_join(char *dst, size_t cap, const char *dir, const char *tail)
+{
+    int n = snprintf(dst, cap, "%s%s", dir, tail);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* Builds the plain and landing-worktree directories under test-tmp. */
+static bool idle_fixture_setup(struct idle_fixture *f)
+{
+    char root[64];
+    snprintf(root, sizeof(root), "test-tmp/devloop_idle_%ld", (long)getpid());
+    if (!idle_join(f->base, sizeof(f->base), root, "") ||
+        !idle_join(f->plain, sizeof(f->plain), f->base, "/plain") ||
+        !idle_join(f->land_parent, sizeof(f->land_parent), f->base, "/land") ||
+        !idle_join(f->land_wt, sizeof(f->land_wt), f->land_parent, "/wt") ||
+        !idle_join(f->queue_lock, sizeof(f->queue_lock), f->land_parent,
+                   "/queue.lock"))
+        return false;
+    if (!mkdirs(f->plain) || !mkdirs(f->land_wt))
+        return false;
+    int lock_fd = open(f->queue_lock,
+                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (lock_fd < 0)
+        return false;
+    if (close(lock_fd) != 0)
+        return false;
+    return realpath(f->plain, f->ctx.root) != NULL;
+}
+
+/* Restarts the idle window at mono time 1000. */
+static void idle_restart(struct idle_fixture *f)
+{
+    f->clock.mono_us = 1000;
+    f->ctx.idle_since_us = platform_time_monotonic_us();
+}
+
+static bool idle_check_expiry(struct idle_fixture *f)
+{
+    char heartbeat[192];
+    bool ok = watch_root_is_landing(f->land_wt) &&
+              !watch_root_is_landing(f->plain) &&
+              !watch_root_is_landing(f->ctx.root) &&
+              !watch_root_is_landing(NULL) && !watch_root_is_landing("");
+    f->ctx.idle_since_us = platform_time_monotonic_us();
+    f->ctx.proof_worker_pid = 0;
+    f->clock.mono_us = 1000 + f->budget_us;
+    if (!watch_idle_poll_should_exit(&f->ctx))
+        ok = false;
+    if (!watch_stopped_heartbeat_line(heartbeat, sizeof(heartbeat), true) ||
+        !strstr(heartbeat, "\"schema\":\"zcl.dev_watch_heartbeat.v1\"") ||
+        !strstr(heartbeat, "\"status\":\"stopped\"") ||
+        !strstr(heartbeat, "\"reason\":\"idle_exit\""))
+        ok = false;
+    return ok;
+}
+
+/* Activity inside the window keeps the watcher alive. */
+static bool idle_check_touch(struct idle_fixture *f)
+{
+    idle_restart(f);
+    f->clock.mono_us = 1000 + f->budget_us / 2;
+    watch_idle_touch(&f->ctx);
+    f->clock.mono_us = 1000 + f->budget_us;
+    return !watch_idle_poll_should_exit(&f->ctx);
+}
+
+/* A pending proof request holds the watcher until it is cleared. */
+static bool idle_check_pending_request(struct idle_fixture *f)
+{
+    bool ok = true;
+    idle_restart(f);
+    f->clock.mono_us = 1000 + f->budget_us / 2;
+    if (!watch_idle_selftest_write_request(f->ctx.root) ||
+        !zcl_dev_proof_queue_has_pending(f->ctx.root) ||
+        watch_idle_poll_should_exit(&f->ctx))
+        ok = false;
+    watch_idle_selftest_clear_request(f->ctx.root);
+    f->clock.mono_us = 1000 + f->budget_us;
+    if (zcl_dev_proof_queue_has_pending(f->ctx.root) ||
+        watch_idle_poll_should_exit(&f->ctx))
+        ok = false;
+    return ok;
+}
+
+/* A live proof worker holds the watcher. */
+static bool idle_check_worker(struct idle_fixture *f)
+{
+    idle_restart(f);
+    f->ctx.proof_worker_pid = 2;
+    f->clock.mono_us = 1000 + f->budget_us;
+    bool ok = !watch_idle_poll_should_exit(&f->ctx);
+    f->ctx.proof_worker_pid = 0;
+    return ok;
+}
+
+/* A landing worktree never idles out. */
+static bool idle_check_landing(struct idle_fixture *f)
+{
+    bool ok = realpath(f->land_wt, f->ctx.root) != NULL;
+    idle_restart(f);
+    f->clock.mono_us = 1000 + f->budget_us * 2;
+    if (!watch_root_is_landing(f->ctx.root) ||
+        watch_idle_poll_should_exit(&f->ctx))
+        ok = false;
+    return ok;
+}
+
+bool zcl_devloop_watch_idle_exit_selftest(void)
+{
+    struct idle_fixture f = {.clock = {.mono_us = 1000},
+                             .budget_us = (int64_t)
+                                 ZCL_DEVLOOP_WATCH_IDLE_BUDGET_MS * 1000};
+    const clock_iface_t iface = {
+        .now_monotonic_ns = watch_idle_clock_mono_ns,
+        .now_wall_ms = watch_idle_clock_wall_ms,
+        .self = &f.clock,
+    };
+    if (!idle_fixture_setup(&f))
+        return false;
+
+    clock_set_default(&iface);
+    bool ok = idle_check_expiry(&f);
+    ok = idle_check_touch(&f) && ok;
+    ok = idle_check_pending_request(&f) && ok;
+    ok = idle_check_worker(&f) && ok;
+    ok = idle_check_landing(&f) && ok;
+
+    clock_reset_default();
+    watch_idle_selftest_clear_request(f.plain);
+    (void)unlink(f.queue_lock);
+    return ok;
+}
+
+/* One bounded git command in `root`, succeeding only on a clean exit. */
+static bool watch_fg_git(const char *root, const char *const *argv,
+                         char *out, size_t out_cap)
+{
+    struct zcl_devloop_process_result result = {0};
+    if (out && out_cap)
+        out[0] = '\0';
+    if (!zcl_devloop_process_run(root, argv, 60000, &result) ||
+        result.timed_out || result.term_signal != 0 || result.exit_code != 0 ||
+        result.output_truncated)
+        return false;
+    if (out && out_cap) {
+        size_t len = result.output_len;
+        while (len > 0 && (result.output[len - 1] == '\n' ||
+                           result.output[len - 1] == '\r'))
+            len--;
+        if (len >= out_cap)
+            return false;
+        memcpy(out, result.output, len);
+        out[len] = '\0';
+    }
+    return true;
+}
+
+static bool watch_fg_write(const char *root, const char *rel,
+                           const char *body)
+{
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, rel);
+    ssize_t wrote;
+    int fd;
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        return false;
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return false;
+    wrote = write(fd, body, strlen(body));
+    return close(fd) == 0 && wrote == (ssize_t)strlen(body);
+}
+
+/* A repository with one commit, an origin/main ref on it, and the proof
+ * cache ignored so a queued request never dirties the tree. */
+static const char *watch_fg_repo(const char *root, char head[65])
+{
+    const char *init[] = {"git", "init", "--quiet", "--initial-branch=main",
+                          ".", NULL};
+    const char *add[] = {"git", "add", "-A", NULL};
+    const char *commit[] = {"git", "-c", "user.name=watch", "-c",
+                            "user.email=watch@z23.invalid", "commit",
+                            "--quiet", "--no-verify", "--no-gpg-sign", "-m",
+                            "seed", NULL};
+    const char *rev[] = {"git", "rev-parse", "HEAD", NULL};
+    char ref[65];
+    if (!watch_fg_git(root, init, NULL, 0))
+        return "git init";
+    if (!watch_fg_write(root, ".gitignore", ".cache/\n") ||
+        !watch_fg_write(root, "seed.c", "int seed(void){return 0;}\n"))
+        return "seed files";
+    if (!watch_fg_git(root, add, NULL, 0))
+        return "git add";
+    if (!watch_fg_git(root, commit, NULL, 0))
+        return "git commit";
+    if (!watch_fg_git(root, rev, head, 65) || strlen(head) != 40)
+        return "git rev-parse";
+    (void)snprintf(ref, sizeof(ref), "%s", head);
+    {
+        const char *update[] = {"git", "update-ref",
+                                "refs/remotes/origin/main", ref, NULL};
+        if (!watch_fg_git(root, update, NULL, 0))
+            return "git update-ref";
+    }
+    return NULL;
+}
+
+/* The queued exact request the landing step leaves behind for the resident
+ * watcher: same shape proof_request_read() parses. */
+static bool watch_fg_request(const char *root, const char *pair)
+{
+    char dir[PATH_MAX], path[PATH_MAX], body[320], rel[PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%s/.cache/zcl-dev-proof/requests",
+                     root);
+    if (n <= 0 || (size_t)n >= sizeof(dir) || !mkdirs(dir))
+        return false;
+    n = snprintf(path, sizeof(path), "%s/%s-%s.request", dir, pair, pair);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        return false;
+    n = snprintf(body, sizeof(body),
+                 "zcl.dev_proof_request.v1\n%s\n%s\n1\n1\n", pair, pair);
+    if (n <= 0 || (size_t)n >= (int)sizeof(body))
+        return false;
+    n = snprintf(rel, sizeof(rel), ".cache/zcl-dev-proof/requests/%s-%s.request",
+                 pair, pair);
+    if (n <= 0 || (size_t)n >= (int)sizeof(rel))
+        return false;
+    return watch_fg_write(root, rel, body) &&
+           zcl_dev_proof_queue_has_pending(root);
+}
+
+/* The poll the reactor actually installs. Declared here so the seam phase
+ * below can install the real one rather than a stand-in. */
+static bool watch_cancel_poll(void *opaque);
+
+/* With an exact request queued for current HEAD on a clean tree, the loop
+ * head establishes the verdict and the cycle yields on it. */
+static const char *watch_fg_queued_phase(struct watch_context *ctx,
+                                         const char *head)
+{
+    if (!watch_fg_request(ctx->root, head))
+        return "queued request fixture";
+    if (!watch_commit_proof_prioritize(ctx) || !ctx->commit_preempts)
+        return "the loop head must see a runnable exact commit";
+    if (!watch_cycle_should_yield(ctx, false))
+        return "a runnable exact commit must cancel the cycle";
+    return NULL;
+}
+
+/* Exercise the real bounded process poll while the request arrives after
+ * the loop-head verdict. The disabled run is the old behavior on the same
+ * fixture: the child times out before the watcher gets back to the queue. */
+static bool watch_fg_midcycle_prepare(struct watch_context *ctx,
+                                      const char *head, bool hint)
+{
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path),
+                     "%s/.cache/zcl-dev-proof/requests/%s-%s.request",
+                     ctx->root, head, head);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        return false;
+    (void)unlink(path);
+    watch_request_hint_arm(ctx);
+    if (!ctx->request_hint_armed)
+        return false;
+    if (!hint)
+        ctx->request_hint_armed = false;
+    return true;
+}
+
+static const char *watch_fg_midcycle_result(bool ran, bool hint,
+                                            const struct zcl_devloop_process_result *result)
+{
+    if (!ran || (hint && (!result->cancelled || result->timed_out)) ||
+        (!hint && (!result->timed_out || result->cancelled)))
+        return hint ? "new request must cancel the obsolete cycle"
+                    : "old cycle must time out before seeing the request";
+    return NULL;
+}
+
+static const char *watch_fg_midcycle_once(struct watch_context *ctx,
+                                          const char *head, bool hint,
+                                          int64_t *elapsed_us)
+{
+    const char *argv[] = {"sleep", "30", NULL};
+    struct zcl_devloop_process_result result = {0};
+    int status = 0, saved_fd = ctx->fd;
+    if (!watch_fg_midcycle_prepare(ctx, head, hint))
+        return "clean landing hint arm";
+    pid_t writer = fork();
+    if (writer < 0)
+        return "request writer fork";
+    if (writer == 0) {
+        platform_sleep_ms(100);
+        _exit(watch_fg_request(ctx->root, head) ? 0 : 1);
+    }
+    ctx->fd = -1;
+    zcl_devloop_process_cancel_poll_set(watch_cancel_poll, ctx);
+    int64_t start = platform_time_monotonic_us();
+    bool ran = zcl_devloop_process_run(ctx->root, argv, 1500, &result);
+    *elapsed_us = platform_time_monotonic_us() - start;
+    zcl_devloop_process_cancel_poll_clear();
+    zcl_devloop_process_cancel_clear();
+    ctx->fd = saved_fd;
+    if (waitpid(writer, &status, 0) != writer || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0)
+        return "request writer";
+    return watch_fg_midcycle_result(ran, hint, &result);
+}
+
+static const char *watch_fg_midcycle_phase(struct watch_context *ctx,
+                                           const char *head)
+{
+    char parent[PATH_MAX], dir[PATH_MAX];
+    int64_t before_us = 0, after_us = 0;
+    int n = snprintf(parent, sizeof(parent), "%s/..", ctx->root);
+    if (n <= 0 || (size_t)n >= sizeof(parent) ||
+        !watch_fg_write(parent, "queue.lock", ""))
+        return "landing marker";
+    n = snprintf(dir, sizeof(dir), "%s/.cache/zcl-dev-proof/requests",
+                 ctx->root);
+    if (n <= 0 || (size_t)n >= sizeof(dir) || !mkdirs(dir))
+        return "request directory";
+    const char *failed = watch_fg_midcycle_once(ctx, head, false, &before_us);
+    if (!failed)
+        failed = watch_fg_midcycle_once(ctx, head, true, &after_us);
+    if (!failed && (after_us >= before_us || after_us > 1200000))
+        failed = "request hint did not shorten the same cycle";
+    fprintf(stderr,
+            "[devloop] midcycle request: before=%lld ms after=%lld ms\n",
+            (long long)(before_us / 1000), (long long)(after_us / 1000));
+    return failed;
+}
+
+/* A dirty checkout keeps its edit feedback: the queued proof could not be
+ * admitted there, so cancelling would trade feedback for nothing. */
+static const char *watch_fg_dirty_phase(struct watch_context *ctx)
+{
+    if (!watch_fg_write(ctx->root, "dirty.c",
+                        "int dirty(void){return 1;}\n"))
+        return "dirty fixture";
+    if (watch_commit_proof_prioritize(ctx) || ctx->commit_preempts)
+        return "a dirty checkout must clear the verdict";
+    if (watch_cycle_should_yield(ctx, false))
+        return "a dirty checkout must keep its edit feedback";
+    return NULL;
+}
+
+/* THE SEAM. zcl_devloop_process_run() calls the installed poll while it holds
+ * its own non-recursive cancel-poll mutex, so a poll that opened a directory,
+ * read a file or ran a child would re-enter that mutex and never return. This
+ * phase installs the real watch_cancel_poll through the real seam with the
+ * verdict already set and runs one bounded child: a poll that probes hangs
+ * here instead of answering, and the group's timeout reports it. ctx->fd is
+ * -1 and the Darwin directory watcher stays at its closed sentinel, so
+ * collect_events() observes no source events without touching a real
+ * descriptor. */
+static const char *watch_fg_seam_phase(struct watch_context *ctx)
+{
+    /* Long enough that the runner is guaranteed to poll before the child
+     * would exit on its own, so the assertion below is about the poll and
+     * not about a race the child happened to win. */
+    const char *argv[] = {"sleep", "30", NULL};
+    struct zcl_devloop_process_result result = {0};
+    int saved_fd = ctx->fd;
+    bool ran;
+    ctx->fd = -1;
+    ctx->commit_preempts = true;
+    zcl_devloop_process_cancel_poll_set(watch_cancel_poll, ctx);
+    ran = zcl_devloop_process_run(ctx->root, argv, 10000, &result);
+    zcl_devloop_process_cancel_poll_clear();
+    /* The cancellation this phase asked for is process-wide state; leaving it
+     * set would cancel the next unrelated bounded child in this binary. */
+    zcl_devloop_process_cancel_clear();
+    ctx->fd = saved_fd;
+    ctx->commit_preempts = false;
+    if (!ran || !result.cancelled || result.timed_out)
+        return "the installed poll must cancel the bounded child";
+    return NULL;
+}
+
+bool zcl_devloop_watch_foreground_yield_selftest(const char *repo_root)
+{
+    /* No injected clock here: the seam phase runs a real bounded child, and
+     * a frozen monotonic clock would stop the runner's own timeout from ever
+     * expiring. Nothing this selftest asserts is time dependent. */
+    struct watch_context ctx = {0};
+    char head[65] = {0};
+#if defined(__APPLE__)
+    /* The zeroed watcher is not the closed sentinel; collect_events() reads
+     * it through the real seam phase below. Give the context the same init
+     * the production watch entry point performs. */
+    platform_directory_watcher_init(&ctx.directory_watcher);
+#endif
+    const char *failed = NULL;
+
+    if (!repo_root || !realpath(repo_root, ctx.root))
+        failed = "fixture path";
+    else
+        failed = watch_fg_repo(ctx.root, head);
+    if (failed) {
+        fprintf(stderr, "[devloop] foreground-yield selftest: %s\n", failed);
+        return false;
+    }
+
+    /* Nothing is queued: the loop head establishes no verdict and the cycle
+     * runs. */
+    if (watch_commit_proof_prioritize(&ctx) || ctx.commit_preempts ||
+        watch_cycle_should_yield(&ctx, false))
+        failed = "an empty queue must not cancel the cycle";
+    /* A newer edit still cancels, whatever the verdict says. */
+    else if (!watch_cycle_should_yield(&ctx, true))
+        failed = "a newer edit must cancel the cycle";
+    /* THE PROPERTY: a queued exact commit proof for current HEAD on a clean
+     * tree cancels the obsolete foreground cycle, so the reactor reaches the
+     * loop head that starts it. */
+    else
+        failed = watch_fg_midcycle_phase(&ctx, head);
+    if (!failed)
+        failed = watch_fg_queued_phase(&ctx, head);
+    if (!failed)
+        failed = watch_fg_dirty_phase(&ctx);
+    if (!failed)
+        failed = watch_fg_seam_phase(&ctx);
+    if (failed)
+        fprintf(stderr, "[devloop] foreground-yield selftest: %s\n", failed);
+    return failed == NULL;
+}
+#endif
+
+#if defined(ZCL_TESTING)
+static int watch_test_edit_ready = -1;
+static int watch_test_edit_release = -1;
+#endif
+
+static int watch_edit_cycle(struct watch_context *ctx)
+{
+#if defined(ZCL_TESTING)
+    if (watch_test_edit_ready >= 0) {
+        char release = 0;
+        bool ok = write(watch_test_edit_ready, "r", 1) == 1 &&
+                  read(watch_test_edit_release, &release, 1) == 1;
+        /* Report whether a stop signal reached this worker's cancel state. */
+        const char *cancel = zcl_devloop_process_cancel_requested() ? "c" : "n";
+        return ok && write(watch_test_edit_ready, cancel, 1) == 1 ? 0 : 1;
+    }
+#endif
+    const char *files[ZCL_DEVLOOP_RESTART_SOURCE_MAX];
+    for (size_t i = 0; i < ctx->proof_pending_count; i++)
+        files[i] = ctx->proof_pending[i];
+    if (ctx->proof_pending_story) {
+        int ready = zcl_devloop_restart_story_prove_event(
+            ctx->root, files, ctx->proof_pending_count,
+            ctx->proof_pending_mode);
+        if (ready != ZCL_DEVLOOP_RESTART_EVENT_PROOF_PENDING &&
+            ready != ZCL_DEVLOOP_RESTART_EVENT_FALLBACK_PENDING)
+            return ready == ZCL_DEVLOOP_RESTART_EVENT_FINAL ? 0 : 1;
+    }
+    return zcl_devloop_run_cycle_mode(ctx->root, files, ctx->proof_pending_count,
+                                      ctx->proof_pending_mode);
+}
+
+static bool watch_proof_start(struct watch_context *ctx, int watcher_lock_fd)
+{
+    if (!ctx)
+        return false;
+    watch_proof_reap(ctx);
+    /* A stop that arrived during the reflex (for example while the journal
+     * flush waited on storage) must not be answered by forking the proof it
+     * is about to cancel. */
+    if (g_watch_stop || ctx->proof_worker_pid > 1 ||
+        ctx->proof_pending_count == 0)
+        return true;
+    int execution = -1;
+    char why[160] = {0};
+    int ready = zcl_dev_proof_execution_acquire(ctx->root, &execution,
+                                                why, sizeof(why));
+    if (ready <= 0) return ready == 0;
+    pid_t child = watch_proof_worker_fork(ctx, watcher_lock_fd);
+    if (child < 0) {
+        zcl_dev_proof_execution_release(execution);
+        return false;
+    }
+    if (child == 0) {
+        int rc = watch_edit_cycle(ctx);
+        zcl_dev_proof_execution_release(execution);
+        _exit(rc == 0 ? 0 : 1);
+    }
+    /* The child owns the inherited open description until cycle cleanup. */
+    (void)close(execution);
+    ctx->proof_worker_pid = child;
+    ctx->proof_worker_kind = WATCH_PROOF_WORKER_EDIT;
+    ctx->proof_worker_spawned_us = platform_time_monotonic_us();
+    ctx->proof_worker_cancel_us = 0;
+    (void)snprintf(ctx->proof_worker_epoch, sizeof(ctx->proof_worker_epoch),
+                   "%s", zcl_devloop_event_edit_epoch());
+    ctx->trace.proof_workers_spawned++;
+    ctx->proof_pending_count = 0;
+    ctx->proof_pending_story = false;
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+bool zcl_dev_proof_test_edit_busy(const char *root)
+{
+    struct watch_context ctx = {0};
+#if defined(__APPLE__)
+    /* The forked proof child closes the inherited watcher; a zeroed native
+     * handle is not the closed sentinel and crashes that close. */
+    platform_directory_watcher_init(&ctx.directory_watcher);
+#endif
+    if (!root || snprintf(ctx.root, sizeof(ctx.root), "%s", root) >=
+                     (int)sizeof(ctx.root)) return false;
+    ctx.proof_pending_count = 1;
+    return watch_proof_start(&ctx, -1) && ctx.proof_pending_count == 1 &&
+           ctx.proof_worker_pid == 0;
+}
+
+static bool watch_test_edit_observe(const char *root, pid_t child,
+                                      int ready, int release)
+{
+    struct pollfd channel = {.fd = ready, .events = POLLIN};
+    bool observed = poll(&channel, 1, 5000) == 1;
+    int guard = -1;
+    char why[160] = {0};
+    int held = zcl_dev_proof_execution_acquire(root, &guard, why, sizeof(why));
+    if (held > 0) zcl_dev_proof_execution_release(guard);
+    bool released = write(release, "r", 1) == 1;
+    int status = 0;
+    bool settled = waitpid(child, &status, 0) == child;
+    int after = zcl_dev_proof_execution_acquire(root, &guard, why, sizeof(why));
+    if (after > 0) zcl_dev_proof_execution_release(guard);
+    return observed && held == 0 && released && settled &&
+           WIFEXITED(status) && WEXITSTATUS(status) == 0 && after == 1;
+}
+
+bool zcl_dev_proof_test_edit_lifetime(const char *root)
+{
+    struct watch_context ctx = {.fd = -1};
+#if defined(__APPLE__)
+    platform_directory_watcher_init(&ctx.directory_watcher);
+#endif
+    if (!root || snprintf(ctx.root, sizeof(ctx.root), "%s", root) >=
+                     (int)sizeof(ctx.root)) return false;
+    int ready[2], release[2];
+    if (pipe(ready) != 0) return false;
+    if (pipe(release) != 0) {
+        (void)close(ready[0]);
+        (void)close(ready[1]);
+        return false;
+    }
+    watch_test_edit_ready = ready[1];
+    watch_test_edit_release = release[0];
+    ctx.proof_pending_count = 1;
+    bool started = watch_proof_start(&ctx, -1);
+    watch_test_edit_ready = watch_test_edit_release = -1;
+    bool ok = started && ctx.proof_worker_pid > 1 && ctx.proof_pending_count == 0;
+    if (ok) ok = watch_test_edit_observe(root, ctx.proof_worker_pid, ready[0], release[1]);
+    (void)close(ready[0]);
+    (void)close(ready[1]);
+    (void)close(release[0]);
+    (void)close(release[1]);
+    return ok;
+}
+
+/* One round of the stop race: start a worker under the watcher's own SIGTERM
+ * handler, signal it the instant fork() returns exactly as watch_proof_stop()
+ * does, and require the worker to report that the cancel reached it. */
+static bool watch_test_edit_stop_round(struct watch_context *ctx)
+{
+    int ready[2], release[2];
+    if (pipe(ready) != 0) return false;
+    if (pipe(release) != 0) {
+        (void)close(ready[0]);
+        (void)close(ready[1]);
+        return false;
+    }
+    watch_test_edit_ready = ready[1];
+    watch_test_edit_release = release[0];
+    ctx->proof_pending_count = 1;
+    bool ok = watch_proof_start(ctx, -1) && ctx->proof_worker_pid > 1;
+    watch_test_edit_ready = watch_test_edit_release = -1;
+    if (ok) {
+        watch_proof_stop(ctx);
+        struct pollfd channel = {.fd = ready[0], .events = POLLIN};
+        char first = 0, cancel = 0;
+        bool observed = poll(&channel, 1, 5000) == 1 &&
+                        read(ready[0], &first, 1) == 1;
+        bool released = write(release[1], "r", 1) == 1;
+        bool reported = poll(&channel, 1, 5000) == 1 &&
+                        read(ready[0], &cancel, 1) == 1;
+        watch_proof_join(ctx);
+        ok = observed && released && reported && cancel == 'c' &&
+             ctx->proof_worker_pid == 0;
+    }
+    (void)close(ready[0]);
+    (void)close(ready[1]);
+    (void)close(release[0]);
+    (void)close(release[1]);
+    return ok;
+}
+
+bool zcl_dev_proof_test_edit_stop_cancels(const char *root)
+{
+    struct watch_context ctx = {.fd = -1};
+#if defined(__APPLE__)
+    platform_directory_watcher_init(&ctx.directory_watcher);
+#endif
+    if (!root || snprintf(ctx.root, sizeof(ctx.root), "%s", root) >=
+                     (int)sizeof(ctx.root)) return false;
+    /* A stop requested before the fork starts no worker at all. */
+    ctx.proof_pending_count = 1;
+    g_watch_stop = 1;
+    bool ok = watch_proof_start(&ctx, -1) && ctx.proof_worker_pid == 0;
+    g_watch_stop = 0;
+    struct sigaction watcher = {.sa_handler = watch_signal}, previous;
+    (void)sigemptyset(&watcher.sa_mask);
+    watcher.sa_flags = SA_RESTART;
+    if (sigaction(SIGTERM, &watcher, &previous) != 0) return false;
+    for (int round = 0; ok && round < 16; round++)
+        ok = watch_test_edit_stop_round(&ctx);
+    (void)sigaction(SIGTERM, &previous, NULL);
+    zcl_devloop_process_cancel_clear();
+    return ok;
+}
+#endif
+
+static bool watch_commit_proof_start(struct watch_context *ctx,
+                                     int watcher_lock_fd)
+{
+    if (!ctx) return false;
+    watch_proof_reap(ctx);
+    if (g_watch_stop || !watch_commit_proof_claimable(ctx) ||
+        !zcl_dev_proof_queue_has_pending(ctx->root))
+        return true;
+    pid_t child = watch_proof_worker_fork(ctx, watcher_lock_fd);
+    if (child < 0) return false;
+    if (child == 0) {
+        char why[256] = {0};
+        int rc = zcl_dev_proof_queue_run_next(ctx->root, why, sizeof(why));
+        if (rc < 0)
+            fprintf(stderr, "[devloop] commit proof queue failed: %s\n",
+                    why[0] ? why : "unknown");
+        _exit(rc < 0 ? 1 : 0);
+    }
+    ctx->proof_worker_pid = child;
+    ctx->proof_worker_kind = WATCH_PROOF_WORKER_COMMIT;
+    return true;
+}
+
+static bool watch_proof_schedule(
+    struct watch_context *ctx, const char *const *files, size_t count,
+    enum zcl_devloop_publish_mode publish_mode, bool story_proof,
+    int watcher_lock_fd)
+{
+    if (!ctx || !files || count == 0 ||
+        count > ZCL_DEVLOOP_RESTART_SOURCE_MAX)
+        return false;
+    for (size_t i = 0; i < count; i++) {
+        if (!files[i] || strlen(files[i]) >= ZCL_DEVLOOP_PATH_MAX)
+            return false;
+        (void)snprintf(ctx->proof_pending[i],
+                       sizeof(ctx->proof_pending[i]), "%s", files[i]);
+    }
+    ctx->proof_pending_count = count;
+    ctx->proof_pending_mode = publish_mode;
+    ctx->proof_pending_story = story_proof;
+    return watch_proof_start(ctx, watcher_lock_fd);
+}
+
+static void print_json_string(FILE *stream, const char *value)
+{
+    (void)fputc('"', stream);
+    for (const unsigned char *p =
+             (const unsigned char *)(value ? value : ""); *p; p++) {
+        if (*p == '"' || *p == '\\')
+            (void)fprintf(stream, "\\%c", *p);
+        else if (*p < 0x20)
+            (void)fprintf(stream, "\\u%04x", *p);
+        else
+            (void)fputc(*p, stream);
+    }
+    (void)fputc('"', stream);
+}
+
+bool zcl_devloop_watch_path_event(FILE *stream, const char *path, size_t count,
+                                 uint64_t sequence, bool rescan, bool queued)
+{
+    if (!path || !zutf8_validate(path)) {
+        fprintf(stderr, "[devloop] source epoch path is not valid UTF-8\n");
+        return false;
+    }
+    if (queued)
+        fprintf(stream, "{\"schema\":\"zcl.dev_source_epoch.v1\","
+                        "\"status\":\"superseded\",\"queued_paths\":%zu,"
+                        "\"first_queued_path\":", count);
+    else
+        fprintf(stream, "{\"schema\":\"zcl.dev_source_epoch.v1\","
+                        "\"mutation_sequence\":%llu,\"full_rescan\":%s,"
+                        "\"changed_paths\":%zu,\"first_path\":",
+                (unsigned long long)sequence, rescan ? "true" : "false", count);
+    print_json_string(stream, path);
+    fputs(queued ? ",\"agent_next_action\":\"wait for latest verdict\"}\n" : "}\n", stream);
+    if (fflush(stream) != 0 || ferror(stream)) {
+        fprintf(stderr, "[devloop] source epoch output failed\n");
+        return false;
+    }
+    return true;
+}
+
+static void watch_hash_cstr(struct sha3_256_ctx *sha, const char *value)
+{
+    const char *text = value ? value : "";
+    sha3_256_write(sha, (const unsigned char *)text, strlen(text) + 1);
+}
+
+static void watch_hash_bool(struct sha3_256_ctx *sha, bool value)
+{
+    const unsigned char byte = value ? 1 : 0;
+    sha3_256_write(sha, &byte, 1);
+}
+
+static void watch_hash_u64(struct sha3_256_ctx *sha, uint64_t value)
+{
+    unsigned char bytes[8];
+    zcl_write_u64_le(bytes, value);
+    sha3_256_write(sha, bytes, sizeof(bytes));
+}
+
+static void watch_digest_hex(struct sha3_256_ctx *sha, char out[65])
+{
+    struct zcl_sha3_digest digest;
+    sha3_256_finalize(sha, digest.bytes);
+    ci_merkle_hex(&digest, out);
+}
+
+static struct watch_blob_state *watch_overlay_find(
+    struct watch_context *ctx, const char *path)
+{
+    for (size_t i = 0; i < ctx->overlay_count; i++)
+        if (strcmp(ctx->overlay[i].path, path) == 0)
+            return &ctx->overlay[i];
+    return NULL;
+}
+
+static bool watch_previous_blob(struct watch_context *ctx, const char *path,
+                                struct watch_edit_blob *blob)
+{
+    struct watch_blob_state *overlay = watch_overlay_find(ctx, path);
+    if (overlay) {
+        blob->previous_digest = overlay->digest;
+        blob->previous_size = overlay->size;
+        blob->previous_present = overlay->present;
+        blob->previous_known = true;
+        return true;
+    }
+    struct ci_merkle_leaf base;
+    bool found = false;
+    if (!ctx->verified_tree ||
+        !ci_merkle_leaf(ctx->verified_tree, path, &base, &found))
+        return false;
+    if (found) {
+        blob->previous_digest = base.digest;
+        blob->previous_size = base.size;
+        blob->previous_present = true;
+    }
+    /* Exact absence is knowledge too. A newly-created path has no prior blob,
+     * but the reconciled inventory proves that absence just as strongly as it
+     * proves a present leaf's digest. */
+    blob->previous_known = ctx->snapshot_exact && !ctx->snapshot_raced;
+    return true;
+}
+
+static bool watch_build_edit_epoch(struct watch_context *ctx,
+                                   const char *const *files, size_t count,
+                                   int64_t seen_us,
+                                   struct watch_edit_epoch *epoch)
+{
+    if (!ctx || !files || count == 0 ||
+        count > DEVLOOP_EDIT_EPOCH_MAX_FILES || !epoch)
+        return false;
+    const int64_t epoch_started_us = platform_time_monotonic_us();
+    memset(epoch, 0, sizeof(*epoch));
+    epoch->sequence = ctx->edit_epoch_sequence + 1;
+    epoch->seen_us = seen_us;
+    epoch->blob_count = count;
+    (void)snprintf(epoch->parent, sizeof(epoch->parent), "%s",
+                   ctx->parent_edit_epoch);
+    (void)snprintf(epoch->dependency_generation,
+                   sizeof(epoch->dependency_generation), "%s",
+                   ctx->dependency_generation);
+    (void)snprintf(epoch->dependency_generation_kind,
+                   sizeof(epoch->dependency_generation_kind), "%s",
+                   ctx->dependency_generation_kind);
+
+    struct zcl_devloop_plan plan;
+    const int64_t impact_started_us = platform_time_monotonic_us();
+    if (!zcl_devloop_plan_files(files, count, &plan))
+        return false;
+    epoch->impact_calculation_us =
+        platform_time_monotonic_us() - impact_started_us;
+    (void)snprintf(epoch->owner, sizeof(epoch->owner), "%s",
+                   plan.proof_group ? plan.proof_group : "make_lint_gates");
+    zcl_devloop_watch_component_for_files(files, count, epoch->component);
+
+    size_t new_overlay_slots = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct watch_edit_blob *blob = &epoch->blobs[i];
+        if (strlen(files[i]) >= sizeof(blob->path))
+            return false;
+        (void)snprintf(blob->path, sizeof(blob->path), "%s", files[i]);
+        if (!watch_previous_blob(ctx, files[i], blob))
+            return false;
+        struct ci_merkle_leaf current;
+        bool found = false;
+        if (!ci_merkle_hash_changed_leaf(ctx->root, files[i], &current,
+                                         &found))
+            return false;
+        blob->new_present = found;
+        if (found) {
+            blob->new_digest = current.digest;
+            blob->new_size = current.size;
+            epoch->changed_bytes_read += current.size;
+        }
+        if (!watch_overlay_find(ctx, files[i]))
+            new_overlay_slots++;
+    }
+    if (new_overlay_slots > ZCL_DEVLOOP_WATCH_MAX_FILES - ctx->overlay_count)
+        return false;
+
+    struct sha3_256_ctx sha;
+    sha3_256_init(&sha);
+    static const char domain[] = "zcl.dev_edit_epoch.v1";
+    watch_hash_cstr(&sha, domain);
+    watch_hash_u64(&sha, epoch->sequence);
+    watch_hash_cstr(&sha, epoch->parent);
+    watch_hash_cstr(&sha, epoch->dependency_generation);
+    watch_hash_cstr(&sha, epoch->owner);
+    watch_hash_cstr(&sha, epoch->component);
+    watch_hash_u64(&sha, epoch->blob_count);
+    for (size_t i = 0; i < count; i++) {
+        const struct watch_edit_blob *blob = &epoch->blobs[i];
+        watch_hash_cstr(&sha, blob->path);
+        watch_hash_bool(&sha, blob->previous_known);
+        watch_hash_bool(&sha, blob->previous_present);
+        sha3_256_write(&sha, blob->previous_digest.bytes, 32);
+        watch_hash_u64(&sha, blob->previous_size);
+        watch_hash_bool(&sha, blob->new_present);
+        sha3_256_write(&sha, blob->new_digest.bytes, 32);
+        watch_hash_u64(&sha, blob->new_size);
+    }
+    watch_digest_hex(&sha, epoch->id);
+    epoch->impact_ready_us = platform_time_monotonic_us();
+    epoch->immutable_epoch_creation_us =
+        epoch->impact_ready_us - epoch_started_us;
+
+    /* Commit the already-complete immutable epoch to the resident overlay.
+     * No repository discovery occurs here: one slot per known changed path. */
+    for (size_t i = 0; i < count; i++) {
+        const struct watch_edit_blob *blob = &epoch->blobs[i];
+        struct watch_blob_state *state = watch_overlay_find(ctx, blob->path);
+        if (!state) {
+            state = &ctx->overlay[ctx->overlay_count++];
+            memset(state, 0, sizeof(*state));
+            (void)snprintf(state->path, sizeof(state->path), "%s",
+                           blob->path);
+        }
+        state->digest = blob->new_digest;
+        state->size = blob->new_size;
+        state->present = blob->new_present;
+    }
+    ctx->edit_epoch_sequence = epoch->sequence;
+    (void)snprintf(ctx->parent_edit_epoch, sizeof(ctx->parent_edit_epoch),
+                   "%s", epoch->id);
+    ctx->snapshot_raced = false;
+    return true;
+}
+
+static bool watch_stream_flush(struct watch_context *ctx);
+
+static bool watch_stream_enqueue(struct watch_context *ctx, const char *body,
+                                 size_t len)
+{
+    if (!ctx || !body || len == 0 || len >= ZCL_DEVLOOP_CYCLE_JSON_MAX ||
+        ctx->pending_count > sizeof(ctx->pending) / sizeof(ctx->pending[0]))
+        return false;
+    /* Local buffer pressure is not stream corruption. Seal the already
+     * visible epochs in order before reserving another bounded slot. */
+    if (ctx->pending_count == sizeof(ctx->pending) / sizeof(ctx->pending[0]) &&
+        !watch_stream_flush(ctx))
+        return false;
+    struct watch_pending_event *event = &ctx->pending[ctx->pending_count];
+    char why[160] = {0};
+    if (!zcl_devloop_cycle_stream_publish(ctx->root, body, len,
+                                          &event->epoch, why, sizeof(why))) {
+        fprintf(stderr, "[devloop] volatile event publication failed: %s\n",
+                why[0] ? why : "unknown");
+        return false;
+    }
+    memcpy(event->body, body, len);
+    event->body[len] = 0;
+    event->len = len;
+    ctx->pending_count++;
+    return true;
+}
+
+static bool watch_stream_flush(struct watch_context *ctx)
+{
+    if (!ctx)
+        return false;
+    if (ctx->pending_count == 0)
+        return true;
+    int64_t through = ctx->pending[ctx->pending_count - 1].epoch;
+    char why[160] = {0};
+    if (!zcl_devloop_cycle_stream_seal(
+            ctx->root, through, why, sizeof(why))) {
+        fprintf(stderr,
+                "[devloop] async event journal flush failed through=%lld: %s\n",
+                (long long)through, why[0] ? why : "unknown");
+        return false;
+    }
+    ctx->pending_count = 0;
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+struct bp_test {
+    const char *repo_root;
+    struct watch_context ctx;
+    char events[5][256];
+    size_t lengths[5];
+    char why[160];
+    char out[512];
+    size_t out_len;
+    int64_t epoch;
+};
+
+static bool bp_events_build(struct bp_test *t)
+{
+    for (size_t i = 0; i < 5; i++) {
+        int n = snprintf(
+            t->events[i], sizeof(t->events[i]),
+            "{\"schema\":\"zcl.dev_cycle.v1\",\"producer\":\"watch-test\","
+            "\"status\":\"impact_ready\",\"action\":\"reflex\","
+            "\"reason\":\"event-%zu\",\"phase\":\"IMPACT_READY\","
+            "\"runtime_published\":false,\"elapsed_ms\":%zu,\"files\":[]}",
+            i + 1, i + 1);
+        if (n <= 0 || (size_t)n >= sizeof(t->events[i]))
+            return false;
+        t->lengths[i] = (size_t)n;
+    }
+    return true;
+}
+
+static bool bp_enqueue(struct bp_test *t, size_t i)
+{
+    return watch_stream_enqueue(&t->ctx, t->events[i], t->lengths[i]);
+}
+
+/* The newest published state is `want_epoch` and carries event `idx`. */
+static bool bp_latest_is(struct bp_test *t, int64_t want_epoch, size_t idx)
+{
+    return zcl_devloop_cycle_state_read(
+               t->repo_root, t->out, sizeof(t->out), &t->out_len, &t->epoch,
+               t->why, sizeof(t->why)) == ZCL_DEVLOOP_STATE_FOUND &&
+           t->epoch == want_epoch && t->out_len == t->lengths[idx] &&
+           memcmp(t->out, t->events[idx], t->out_len) == 0;
+}
+
+/* The newest published state is still `want_epoch`. */
+static bool bp_epoch_is(struct bp_test *t, int64_t want_epoch)
+{
+    return zcl_devloop_cycle_state_read(
+               t->repo_root, t->out, sizeof(t->out), &t->out_len, &t->epoch,
+               t->why, sizeof(t->why)) == ZCL_DEVLOOP_STATE_FOUND &&
+           t->epoch == want_epoch;
+}
+
+/* The state after `after` is the next epoch and carries event `idx`. */
+static bool bp_next_is(struct bp_test *t, int64_t after, int64_t want_epoch,
+                       size_t idx)
+{
+    return zcl_devloop_cycle_state_read_after(
+               t->repo_root, after, t->out, sizeof(t->out), &t->out_len,
+               &t->epoch, t->why, sizeof(t->why)) ==
+               ZCL_DEVLOOP_STATE_FOUND &&
+           t->epoch == want_epoch && t->out_len == t->lengths[idx] &&
+           memcmp(t->out, t->events[idx], t->out_len) == 0;
+}
+
+/* The fifth event is the born-red assertion: a full local queue must seal
+ * its first four exact epochs and retain the new event, not stop watching. */
+static bool bp_full_queue_seals(struct bp_test *t)
+{
+    for (size_t i = 0; i < 4; i++)
+        if (!bp_enqueue(t, i))
+            return false;
+    if (!bp_enqueue(t, 4) || t->ctx.pending_count != 1)
+        return false;
+    if (!bp_latest_is(t, 4, 3))
+        return false;
+    int64_t after = 0;
+    for (size_t i = 0; i < 4; i++) {
+        if (!bp_next_is(t, after, after + 1, i))
+            return false;
+        after = t->epoch;
+    }
+    return bp_next_is(t, after, 5, 4) && watch_stream_flush(&t->ctx) &&
+           t->ctx.pending_count == 0 && bp_latest_is(t, 5, 4);
+}
+
+/* Losing the volatile generation underneath a full pending queue makes the
+ * fifth enqueue's automatic flush fail closed. No pending body drops. */
+static bool bp_lost_generation_fails_closed(struct bp_test *t)
+{
+    for (size_t i = 0; i < 4; i++)
+        if (!bp_enqueue(t, i))
+            return false;
+    if (t->ctx.pending_count != 4 ||
+        !zcl_devloop_cycle_stream_reset(t->repo_root, 5, t->why,
+                                        sizeof(t->why)) ||
+        bp_enqueue(t, 4) || t->ctx.pending_count != 4)
+        return false;
+    if (!bp_epoch_is(t, 5))
+        return false;
+    size_t pending_before = t->ctx.pending_count;
+    if (watch_stream_enqueue(&t->ctx, "{}", ZCL_DEVLOOP_CYCLE_JSON_MAX) ||
+        t->ctx.pending_count != pending_before || !bp_epoch_is(t, 5))
+        return false;
+    t->ctx.pending_count = 5; /* impossible live state: guard before slot access */
+    return !bp_enqueue(t, 4) && t->ctx.pending_count == 5 &&
+           bp_epoch_is(t, 5);
+}
+
+bool zcl_devloop_watch_stream_backpressure_selftest(const char *repo_root)
+{
+    if (!repo_root || !repo_root[0])
+        return false;
+    struct bp_test t = {.repo_root = repo_root};
+    if (snprintf(t.ctx.root, sizeof(t.ctx.root), "%s", repo_root) <= 0 ||
+        strlen(repo_root) >= sizeof(t.ctx.root))
+        return false;
+    if (!zcl_devloop_cycle_stream_reset(repo_root, 0, t.why, sizeof(t.why)))
+        return false;
+    return bp_events_build(&t) && bp_full_queue_seals(&t) &&
+           bp_lost_generation_fails_closed(&t);
+}
+#endif
+
+static bool watch_edit_seen_header(struct json_value *doc,
+                                   const struct watch_context *ctx)
+{
+    return json_push_kv_str(doc, "schema", "zcl.dev_cycle.v1") &&
+        json_push_kv_str(doc, "producer", "reflex-reactor") &&
+        json_push_kv_str(doc, "status", "edit_seen") &&
+        json_push_kv_str(doc, "action", "reflex") &&
+        json_push_kv_str(doc, "reason", "source_mutation_observed") &&
+        json_push_kv_str(doc, "phase", "EDIT_SEEN") &&
+        json_push_kv_bool(doc, "runtime_published", false) &&
+        json_push_kv_bool(doc, "proof_complete", false) &&
+        json_push_kv_int(doc, "event_monotonic_us",
+                         platform_time_monotonic_us()) &&
+        json_push_kv_int(
+            doc, "elapsed_us",
+            ctx->first_mutation_us > 0
+                ? platform_time_monotonic_us() - ctx->first_mutation_us : 0) &&
+        json_push_kv_int(doc, "file_count", (int64_t)ctx->changed_count);
+}
+
+static bool watch_emit_edit_seen(struct watch_context *ctx)
+{
+    if (!ctx || ctx->changed_count == 0)
+        return false;
+    struct json_value doc, files;
+    json_init(&doc); json_set_object(&doc);
+    json_init(&files); json_set_array(&files);
+    bool ok = watch_edit_seen_header(&doc, ctx);
+    for (size_t i = 0; ok && i < ctx->changed_count; i++) {
+        struct json_value item;
+        json_init(&item); json_set_str(&item, ctx->changed[i]);
+        ok = json_push_back(&files, &item);
+        json_free(&item);
+    }
+    ok = ok && json_push_kv(&doc, "files", &files) &&
+        json_push_kv_str(&doc, "agent_next_action",
+                         "impact analysis is running in the resident reactor");
+    json_free(&files);
+    char body[16384];
+    size_t n = ok ? json_write(&doc, body, sizeof(body) - 1) : 0;
+    json_free(&doc);
+    if (!n)
+        return false;
+    body[n] = 0;
+    if (!watch_stream_enqueue(ctx, body, n)) {
+        fprintf(stderr, "[devloop] EDIT_SEEN stream publication failed\n");
+        return false;
+    }
+    (void)fwrite(body, 1, n, stdout);
+    (void)fputc('\n', stdout);
+    (void)fflush(stdout);
+    ctx->edit_seen_emitted = true;
+    watch_idle_touch(ctx);
+    return true;
+}
+
+static bool watch_impact_counters(struct json_value *doc)
+{
+    static const char *const names[] = {
+        "make_processes", "shell_processes", "git_operations",
+        "publication_operations", "remote_operations", "storage_ack_waits",
+        "full_program_links", "network_operations", "sqlite_operations",
+        "full_tree_scans",
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (!json_push_kv_int(doc, names[i], 0))
+            return false;
+    return true;
+}
+
+static bool watch_impact_identity(struct json_value *doc,
+                                 const struct watch_edit_epoch *epoch)
+{
+    return json_push_kv_str(doc, "edit_epoch", epoch->id) &&
+        json_push_kv_str(doc, "parent_epoch", epoch->parent) &&
+        json_push_kv_str(doc, "dependency_generation",
+                         epoch->dependency_generation) &&
+        json_push_kv_str(doc, "dependency_generation_kind",
+                         epoch->dependency_generation_kind) &&
+        json_push_kv_str(doc, "affected_owner", epoch->owner) &&
+        json_push_kv_str(doc, "affected_component", epoch->component);
+}
+
+static bool watch_impact_header(struct json_value *doc,
+                                const struct watch_edit_epoch *epoch)
+{
+    return json_push_kv_str(doc, "schema", "zcl.dev_cycle.v1") &&
+        json_push_kv_str(doc, "producer", "reflex-reactor") &&
+        json_push_kv_str(doc, "status", "impact_ready") &&
+        json_push_kv_str(doc, "action", "reflex") &&
+        json_push_kv_str(doc, "reason", "immutable_edit_epoch") &&
+        json_push_kv_str(doc, "phase", "IMPACT_READY") &&
+        json_push_kv_bool(doc, "runtime_published", false) &&
+        json_push_kv_bool(doc, "proof_complete", false) &&
+        json_push_kv_int(doc, "elapsed_us",
+                         epoch->impact_ready_us - epoch->seen_us) &&
+        json_push_kv_int(doc, "immutable_epoch_creation_us",
+                         epoch->immutable_epoch_creation_us) &&
+        json_push_kv_int(doc, "impact_calculation_us",
+                         epoch->impact_calculation_us) &&
+        json_push_kv_int(doc, "changed_bytes_read",
+                         (int64_t)epoch->changed_bytes_read) &&
+        json_push_kv_int(doc, "file_count", (int64_t)epoch->blob_count) &&
+        watch_impact_identity(doc, epoch) &&
+        watch_impact_counters(doc);
+}
+
+/* Appends one edited file's path to `files` and its blob summary to `blobs`. */
+static bool watch_impact_blob(struct json_value *files,
+                              struct json_value *blobs,
+                              const struct watch_edit_blob *blob)
+{
+    char previous_hex[65] = {0}, new_hex[65] = {0};
+    if (blob->previous_present)
+        ci_merkle_hex(&blob->previous_digest, previous_hex);
+    if (blob->new_present)
+        ci_merkle_hex(&blob->new_digest, new_hex);
+    struct json_value file, item;
+    json_init(&file); json_set_str(&file, blob->path);
+    bool ok = json_push_back(files, &file);
+    json_free(&file);
+    json_init(&item); json_set_object(&item);
+    ok = ok && json_push_kv_str(&item, "path", blob->path) &&
+        json_push_kv_bool(&item, "previous_known", blob->previous_known) &&
+        json_push_kv_bool(&item, "previous_present", blob->previous_present) &&
+        json_push_kv_str(&item, "previous_blob_sha3", previous_hex) &&
+        json_push_kv_int(&item, "previous_size",
+                         (int64_t)blob->previous_size) &&
+        json_push_kv_bool(&item, "new_present", blob->new_present) &&
+        json_push_kv_str(&item, "new_blob_sha3", new_hex) &&
+        json_push_kv_int(&item, "new_size", (int64_t)blob->new_size) &&
+        json_push_back(blobs, &item);
+    json_free(&item);
+    return ok;
+}
+
+static bool watch_emit_impact_ready(struct watch_context *ctx,
+                                    const struct watch_edit_epoch *epoch)
+{
+    if (!ctx || !epoch || epoch->blob_count == 0)
+        return false;
+    struct json_value doc, files, blobs;
+    json_init(&doc); json_set_object(&doc);
+    json_init(&files); json_set_array(&files);
+    json_init(&blobs); json_set_array(&blobs);
+    bool ok = watch_impact_header(&doc, epoch);
+    ok = watch_trace_emit(ctx, &doc, ok);
+    for (size_t i = 0; ok && i < epoch->blob_count; i++)
+        ok = watch_impact_blob(&files, &blobs, &epoch->blobs[i]);
+    ok = ok && json_push_kv(&doc, "files", &files) &&
+        json_push_kv(&doc, "blobs", &blobs) &&
+        json_push_kv_str(&doc, "agent_next_action",
+                         "compile diagnostics are running in the resident reactor");
+    json_free(&files);
+    json_free(&blobs);
+    char body[ZCL_DEVLOOP_CYCLE_JSON_MAX];
+    size_t n = ok ? json_write(&doc, body, sizeof(body) - 1) : 0;
+    json_free(&doc);
+    if (!n)
+        return false;
+    body[n] = 0;
+    if (!watch_stream_enqueue(ctx, body, n)) {
+        fprintf(stderr, "[devloop] IMPACT_READY stream publication failed\n");
+        return false;
+    }
+    (void)fwrite(body, 1, n, stdout);
+    (void)fputc('\n', stdout);
+    (void)fflush(stdout);
+    return true;
+}
+
+static bool watch_emit_proof_pending(struct watch_context *ctx,
+                                     const char *const *files, size_t count)
+{
+    if (!ctx || !files || count == 0)
+        return false;
+    struct json_value doc, paths;
+    json_init(&doc); json_set_object(&doc);
+    json_init(&paths); json_set_array(&paths);
+    bool ok = json_push_kv_str(&doc, "schema", "zcl.dev_cycle.v1") &&
+        json_push_kv_str(&doc, "producer", "reflex-reactor") &&
+        json_push_kv_str(&doc, "status", "proof_pending") &&
+        json_push_kv_str(&doc, "action", "verify") &&
+        json_push_kv_str(&doc, "reason", "integration_proof_deferred") &&
+        json_push_kv_str(&doc, "phase", "PROOF_PENDING") &&
+        json_push_kv_bool(&doc, "runtime_published", false) &&
+        json_push_kv_bool(&doc, "proof_complete", false) &&
+        json_push_kv_str(&doc, "edit_epoch",
+                         zcl_devloop_event_edit_epoch()) &&
+        json_push_kv_int(&doc, "file_count", (int64_t)count);
+    for (size_t i = 0; ok && i < count; i++) {
+        struct json_value item;
+        json_init(&item); json_set_str(&item, files[i]);
+        ok = json_push_back(&paths, &item);
+        json_free(&item);
+    }
+    ok = ok && json_push_kv(&doc, "files", &paths) &&
+        json_push_kv_str(&doc, "agent_next_action",
+                         "keep editing; complete reusable proof is running asynchronously");
+    json_free(&paths);
+    char body[ZCL_DEVLOOP_CYCLE_JSON_MAX];
+    size_t n = ok ? json_write(&doc, body, sizeof(body) - 1) : 0;
+    json_free(&doc);
+    if (!n)
+        return false;
+    body[n] = 0;
+    if (!watch_stream_enqueue(ctx, body, n))
+        return false;
+    (void)fwrite(body, 1, n, stdout);
+    (void)fputc('\n', stdout);
+    (void)fflush(stdout);
+    return watch_stream_flush(ctx);
+}
+
+static bool watch_emit_superseded(struct watch_context *ctx)
+{
+    if (!ctx || ctx->changed_count == 0)
+        return false;
+    struct json_value doc, paths;
+    json_init(&doc); json_set_object(&doc);
+    json_init(&paths); json_set_array(&paths);
+    bool ok = json_push_kv_str(&doc, "schema", "zcl.dev_cycle.v1") &&
+        json_push_kv_str(&doc, "producer", "reflex-reactor") &&
+        json_push_kv_str(&doc, "status", "superseded") &&
+        json_push_kv_str(&doc, "action", "cancel") &&
+        json_push_kv_str(&doc, "reason", "newer_edit_epoch") &&
+        json_push_kv_str(&doc, "phase", "SUPERSEDED") &&
+        json_push_kv_bool(&doc, "runtime_published", false) &&
+        json_push_kv_bool(&doc, "proof_complete", false) &&
+        json_push_kv_int(&doc, "queued_file_count",
+                         (int64_t)ctx->changed_count);
+    if (ok && zcl_devloop_event_edit_epoch()[0])
+        ok = json_push_kv_str(&doc, "edit_epoch",
+                              zcl_devloop_event_edit_epoch());
+    for (size_t i = 0; ok && i < ctx->changed_count; i++) {
+        struct json_value item;
+        json_init(&item); json_set_str(&item, ctx->changed[i]);
+        ok = json_push_back(&paths, &item);
+        json_free(&item);
+    }
+    ok = ok && json_push_kv(&doc, "queued_files", &paths) &&
+        json_push_kv_str(&doc, "agent_next_action",
+                         "ignore obsolete foreground work; latest edit starts next");
+    json_free(&paths);
+    char body[ZCL_DEVLOOP_CYCLE_JSON_MAX];
+    size_t n = ok ? json_write(&doc, body, sizeof(body) - 1) : 0;
+    json_free(&doc);
+    if (!n)
+        return false;
+    body[n] = 0;
+    if (!watch_stream_enqueue(ctx, body, n))
+        return false;
+    (void)fwrite(body, 1, n, stdout);
+    (void)fputc('\n', stdout);
+    (void)fflush(stdout);
+    return true;
+}
+
+static bool mkdirs(const char *path)
+{
+    char tmp[PATH_MAX];
+    if (!path || !path[0] || strlen(path) >= sizeof(tmp))
+        return false;
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = 0;
+        if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
+            return false;
+        *p = '/';
+    }
+    return mkdir(tmp, 0700) == 0 || errno == EEXIST;
+}
+
+static bool ignored_dir(const char *name)
+{
+    return zcl_devloop_watch_dir_is_ignored(name);
+}
+
+static bool relevant_file(const char *path)
+{
+    /* Shared with the dev-platform unit test — see
+     * zcl_devloop_path_is_relevant() in devloop_plan.c. Keeps the watcher's
+     * change filter (including the transient lint-fixture exclusion) in one
+     * testable, pure place. */
+    return zcl_devloop_path_is_relevant(path);
+}
+
+#if !defined(__APPLE__)
+static struct watched_dir *find_watch(struct watch_context *ctx, int wd)
+{
+    for (size_t i = 0; i < ctx->dir_count; i++) {
+        if (ctx->dirs[i].wd == wd)
+            return &ctx->dirs[i];
+    }
+    return NULL;
+}
+
+static bool reserve_watch(struct watch_context *ctx)
+{
+    if (!ctx)
+        return false;
+    if (ctx->dir_count < ctx->dir_capacity)
+        return true;
+    size_t capacity = ctx->dir_capacity
+        ? ctx->dir_capacity * 2u : DEVLOOP_INITIAL_WATCHES;
+    if (capacity < ctx->dir_capacity ||
+        capacity > SIZE_MAX / sizeof(*ctx->dirs))
+        return false;
+    struct watched_dir *dirs = zcl_realloc(
+        ctx->dirs, capacity * sizeof(*ctx->dirs), "devloop watcher table");
+    if (!dirs)
+        return false;
+    ctx->dirs = dirs;
+    ctx->dir_capacity = capacity;
+    return true;
+}
+
+static bool add_watch_recursive(struct watch_context *ctx, const char *rel)
+{
+    if (!reserve_watch(ctx))
+        return false;
+    char full[PATH_MAX];
+    int n = rel && rel[0]
+        ? snprintf(full, sizeof(full), "%s/%s", ctx->root, rel)
+        : snprintf(full, sizeof(full), "%s", ctx->root);
+    if (n <= 0 || (size_t)n >= sizeof(full))
+        return false;
+
+    int wd = inotify_add_watch(ctx->fd, full,
+        DEVLOOP_MUTATION_MASK | IN_DELETE_SELF | IN_MOVE_SELF);
+    if (wd < 0)
+        return false;
+    struct watched_dir *slot = &ctx->dirs[ctx->dir_count++];
+    slot->wd = wd;
+    snprintf(slot->rel, sizeof(slot->rel), "%s", rel ? rel : "");
+
+    DIR *dir = opendir(full);
+    if (!dir)
+        return true;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (ignored_dir(entry->d_name))
+            continue;
+        char child_full[PATH_MAX], child_rel[ZCL_DEVLOOP_PATH_MAX];
+        int fn = snprintf(child_full, sizeof(child_full), "%s/%s",
+                          full, entry->d_name);
+        int rn = rel && rel[0]
+            ? snprintf(child_rel, sizeof(child_rel), "%s/%s", rel,
+                       entry->d_name)
+            : snprintf(child_rel, sizeof(child_rel), "%s", entry->d_name);
+        if (fn <= 0 || (size_t)fn >= sizeof(child_full) ||
+            rn <= 0 || (size_t)rn >= sizeof(child_rel))
+            continue;
+        struct stat st;
+        if (lstat(child_full, &st) == 0 && S_ISDIR(st.st_mode) &&
+            !S_ISLNK(st.st_mode)) {
+            if (!add_watch_recursive(ctx, child_rel)) {
+                closedir(dir);
+                return false;
+            }
+        }
+    }
+    closedir(dir);
+    return true;
+}
+#endif
+
+static void add_changed(struct watch_context *ctx, const char *path)
+{
+    if (!ctx || !relevant_file(path))
+        return;
+    watch_idle_touch(ctx);
+    for (size_t i = 0; i < ctx->changed_count; i++) {
+        if (strcmp(ctx->changed[i], path) == 0)
+            return;
+    }
+    if (ctx->changed_count >= ZCL_DEVLOOP_WATCH_MAX_FILES) {
+        /* A broad/overflowing edit must fail toward reload, never silently
+         * drop paths and accidentally qualify for hot-swap. */
+        ctx->changed_count = 1;
+        snprintf(ctx->changed[0], sizeof(ctx->changed[0]), "%s", "Makefile");
+        return;
+    }
+    if (ctx->changed_count == 0) {
+        /* The first mutation after a reflex verdict invalidates any queued
+         * complete proof and cooperatively cancels its isolated worker. The
+         * watcher remains the sole producer of the replacement epoch. */
+        watch_proof_cancel(ctx);
+        ctx->first_mutation_us = platform_time_monotonic_us();
+        watch_trace_event(ctx, ctx->first_mutation_us);
+    }
+    snprintf(ctx->changed[ctx->changed_count],
+             sizeof(ctx->changed[ctx->changed_count]), "%s", path);
+    ctx->changed_count++;
+}
+
+#if defined(__APPLE__)
+#define DEVLOOP_MACOS_WATCH_FD_BUDGET 16384u
+
+static bool watch_macos_ensure_fd_budget(void)
+{
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0)
+        return false;
+    rlim_t target = (rlim_t)DEVLOOP_MACOS_WATCH_FD_BUDGET;
+    if (limit.rlim_cur >= target)
+        return true;
+    if (limit.rlim_max != RLIM_INFINITY && target > limit.rlim_max)
+        target = limit.rlim_max;
+    if (target <= limit.rlim_cur)
+        return true;
+    struct rlimit raised = limit;
+    raised.rlim_cur = target;
+    return setrlimit(RLIMIT_NOFILE, &raised) == 0;
+}
+
+static bool watch_macos_descend(const char *name, void *opaque)
+{
+    (void)opaque;
+    return !ignored_dir(name);
+}
+
+static bool watch_macos_include_file(const char *path, void *opaque)
+{
+    const struct watch_context *ctx = opaque;
+    size_t root_len = ctx ? strlen(ctx->root) : 0;
+    if (!ctx || root_len == 0 || strncmp(path, ctx->root, root_len) != 0 ||
+        path[root_len] != '/')
+        return false;
+    return relevant_file(path + root_len + 1);
+}
+
+static bool watch_macos_record_result(
+    struct watch_context *ctx, enum platform_directory_watch_result result)
+{
+    if (result == PLATFORM_DIRECTORY_WATCH_TIMEOUT ||
+        result == PLATFORM_DIRECTORY_WATCH_STOPPED)
+        return false;
+    if (result == PLATFORM_DIRECTORY_WATCH_ERROR) {
+        ctx->watch_backend_failed = true;
+        return false;
+    }
+    mutation_sequence_advance(ctx);
+    ctx->force_full_source_rescan = true;
+    size_t before = ctx->changed_count;
+    add_changed(ctx, "Makefile");
+    return ctx->changed_count != before;
+}
+#endif
+
+#if defined(__APPLE__)
+/* A watcher still at its closed sentinel is the fd=-1 case the Linux half
+ * below already has: no open backend, so no events and no failure. The
+ * foreground-yield seam phase runs the real cancel poll on exactly such a
+ * context. */
+static bool collect_events_macos(struct watch_context *ctx)
+{
+    if (ctx->directory_watcher.native == UINTPTR_MAX)
+        return false;
+    return watch_macos_record_result(
+        ctx, platform_directory_watcher_wait(&ctx->directory_watcher, 0,
+                                             NULL, NULL));
+}
+#endif
+
+static bool collect_events(struct watch_context *ctx)
+{
+#if defined(__APPLE__)
+    return collect_events_macos(ctx);
+#else
+    char buffer[64 * 1024];
+    bool saw = false;
+    for (;;) {
+        ssize_t n = read(ctx->fd, buffer, sizeof(buffer));
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break;
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        for (char *p = buffer; p < buffer + n; ) {
+            struct inotify_event *ev = (struct inotify_event *)p;
+            p += sizeof(*ev) + ev->len;
+            if (ev->mask & IN_Q_OVERFLOW) {
+                mutation_sequence_advance(ctx);
+                ctx->force_full_source_rescan = true;
+                add_changed(ctx, "Makefile");
+                saw = true;
+                continue;
+            }
+            struct watched_dir *dir = find_watch(ctx, ev->wd);
+            if (!dir)
+                continue;
+            if (ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) {
+                mutation_sequence_advance(ctx);
+                ctx->force_full_source_rescan = true;
+                add_changed(ctx, "Makefile");
+                saw = true;
+            }
+            if (ev->len == 0)
+                continue;
+            char rel[ZCL_DEVLOOP_PATH_MAX];
+            int rn = dir->rel[0]
+                ? snprintf(rel, sizeof(rel), "%s/%s", dir->rel, ev->name)
+                : snprintf(rel, sizeof(rel), "%s", ev->name);
+            if (rn <= 0 || (size_t)rn >= sizeof(rel))
+                continue;
+            if (ev->mask & IN_ISDIR) {
+                /* The recursive watch deliberately never enters generated,
+                 * dependency, or dot-prefixed scratch directories. Their
+                 * create/remove traffic is equally irrelevant: treating it
+                 * as a synthetic Makefile edit cancels the exact proof that
+                 * created a test scratch directory in the first place. */
+                if (ignored_dir(ev->name))
+                    continue;
+                mutation_sequence_advance(ctx);
+                add_changed(ctx, "Makefile");
+                saw = true;
+                if ((ev->mask & (IN_CREATE | IN_MOVED_TO)) &&
+                    !add_watch_recursive(ctx, rel)) {
+                    ctx->force_full_source_rescan = true;
+                }
+                if (ev->mask & (IN_DELETE | IN_MOVED_FROM))
+                    ctx->force_full_source_rescan = true;
+                continue;
+            }
+            if (!(ev->mask & IN_ISDIR) &&
+                zcl_devloop_watch_event_is_mutation(ev->mask)) {
+                mutation_sequence_advance(ctx);
+                size_t before = ctx->changed_count;
+                add_changed(ctx, rel);
+                saw = saw || ctx->changed_count != before;
+            }
+        }
+    }
+    return saw;
+#endif
+}
+
+static bool watch_owns_current_lock(const struct watch_context *ctx)
+{
+    char path[PATH_MAX];
+    struct stat held, current;
+    return ctx && ctx->singleton_lock_fd >= 0 &&
+        zcl_devloop_watch_lock_path(ctx->root, path, sizeof(path)) &&
+        fstat(ctx->singleton_lock_fd, &held) == 0 &&
+        lstat(path, &current) == 0 && S_ISREG(current.st_mode) &&
+        held.st_dev == current.st_dev && held.st_ino == current.st_ino;
+}
+
+static bool watch_stop_request_poll(struct watch_context *ctx)
+{
+    if (!ctx || !ctx->stop_endpoint_ready) return false;
+    if (!watch_owns_current_lock(ctx)) {
+        /* A replaced lock retires its former watcher independently of the
+         * stop request. The new lock owner is a separate session. */
+        watch_signal(SIGTERM);
+        return true;
+    }
+    char body[192], expected[192];
+    ssize_t got = read(ctx->stop_fd, body, sizeof(body));
+    int n = snprintf(expected, sizeof(expected), "%ld %llu %s %s\n",
+                     (long)getpid(),
+                     (unsigned long long)ctx->stop_start_token,
+                     ctx->stop_nonce, ctx->stop_workspace);
+    if (got > 0 && n > 0 && n < (int)sizeof(expected) &&
+        got == n && memcmp(body, expected, (size_t)n) == 0) {
+        watch_signal(SIGTERM);
+        return true;
+    }
+    return false;
+}
+
+static int watch_wait_for_events(struct watch_context *ctx, int timeout_ms)
+{
+#if defined(__APPLE__)
+    if (watch_stop_request_poll(ctx)) return 0;
+    if (ctx->stop_endpoint_ready && timeout_ms > 100) timeout_ms = 100;
+    enum platform_directory_watch_result result =
+        platform_directory_watcher_wait(
+            &ctx->directory_watcher,
+            timeout_ms > 0 ? (uint32_t)timeout_ms : 0, NULL, NULL);
+    bool changed = watch_macos_record_result(ctx, result);
+    (void)watch_stop_request_poll(ctx);
+    return ctx->watch_backend_failed ? -1 : (changed ? 1 : 0);
+#else
+    if (watch_stop_request_poll(ctx)) return 0;
+    struct pollfd pfd[2] = {
+        {.fd = ctx->fd, .events = POLLIN},
+        {.fd = ctx->stop_endpoint_ready ? ctx->stop_fd : -1,
+         .events = POLLIN}
+    };
+    int rc;
+    do { rc = poll(pfd, 2, timeout_ms); }
+    while (rc < 0 && errno == EINTR);
+    if (rc <= 0)
+        return rc;
+    if (pfd[1].revents & POLLIN) {
+        (void)watch_stop_request_poll(ctx);
+        if (g_watch_stop) return 0;
+    }
+    return collect_events(ctx) ? 1 : 0;
+#endif
+}
+
+static void watch_backend_close(struct watch_context *ctx)
+{
+    if (!ctx) return;
+#if defined(__APPLE__)
+    platform_directory_watcher_close(&ctx->directory_watcher);
+#else
+    if (ctx->fd >= 0)
+        close(ctx->fd);
+    ctx->fd = -1;
+#endif
+}
+
+/* Native watches are armed before this runs. The reconciled refresh validates the
+ * SHA3 seal, enumerates and stats the current policy inventory, and performs a
+ * complete byte pass only when the prior image is absent/invalid or its
+ * inventory moved. Any mutation racing that work is already queued by the
+ * platform backend and is drained before the image can be described as
+ * trusted. */
+static bool prime_source_snapshot(struct watch_context *ctx)
+{
+    int64_t started_us = platform_time_monotonic_us();
+    struct ci_merkle_cost cost = {0};
+    struct ci_merkle *tree =
+        ci_merkle_refresh_reconciled(ctx->root, &cost);
+    if (!tree)
+        return false;
+    struct ci_merkle_node root = {0};
+    bool ok = ci_merkle_root(tree, &root);
+    char root_hex[65] = {0};
+    if (ok)
+        ci_merkle_hex(&root.digest, root_hex);
+    if (!ok)
+        ci_merkle_free(tree);
+    if (!ok)
+        return false;
+
+    struct zcl_sha3_digest dependency_digest;
+    bool have_dependency_generation = false;
+    struct codeindex *dependency_index = codeindex_open_existing(ctx->root);
+    if (dependency_index) {
+        have_dependency_generation = codeindex_source_root_sha3(
+            dependency_index, dependency_digest.bytes);
+        codeindex_close(dependency_index);
+    }
+    if (have_dependency_generation) {
+        ci_merkle_hex(&dependency_digest, ctx->dependency_generation);
+        (void)snprintf(ctx->dependency_generation_kind,
+                       sizeof(ctx->dependency_generation_kind), "%s",
+                       "codeindex_source_root");
+    } else {
+        (void)snprintf(ctx->dependency_generation,
+                       sizeof(ctx->dependency_generation), "%s", root_hex);
+        (void)snprintf(ctx->dependency_generation_kind,
+                       sizeof(ctx->dependency_generation_kind), "%s",
+                       "source_merkle_fallback");
+    }
+    if (ctx->verified_tree)
+        ci_merkle_free(ctx->verified_tree);
+    ctx->verified_tree = tree;
+    ctx->snapshot_exact = true;
+    (void)snprintf(ctx->verified_root, sizeof(ctx->verified_root), "%s",
+                   root_hex);
+    if (ctx->edit_epoch_sequence == 0) {
+        struct sha3_256_ctx parent_sha;
+        sha3_256_init(&parent_sha);
+        watch_hash_cstr(&parent_sha, "zcl.dev_edit_epoch.base.v1");
+        watch_hash_cstr(&parent_sha, ctx->verified_root);
+        watch_hash_cstr(&parent_sha, ctx->dependency_generation);
+        watch_digest_hex(&parent_sha, ctx->parent_edit_epoch);
+    }
+
+    (void)collect_events(ctx);
+#if defined(__APPLE__)
+    if (ctx->watch_backend_failed)
+        return false;
+#endif
+    ctx->snapshot_raced = ctx->changed_count > 0;
+    int64_t elapsed_us = platform_time_monotonic_us() - started_us;
+#if defined(__APPLE__)
+    const char *watch_backend = "kqueue";
+    const char *inotify_armed = "false";
+#else
+    const char *watch_backend = "inotify";
+    const char *inotify_armed = "true";
+#endif
+    printf("{\"schema\":\"zcl.dev_source_snapshot.v1\","
+           "\"status\":\"reconciled\",\"inotify_armed\":%s,"
+           "\"watch_backend\":\"%s\","
+           "\"seal_verified\":%s,\"snapshot_used\":%s,"
+           "\"full_rescan\":%s,\"inventory_changed\":%s,"
+           "\"files_total\":%u,\"files_read\":%u,"
+           "\"bytes_read\":%llu,\"queued_paths\":%zu,"
+           "\"mutation_sequence\":%llu,\"elapsed_us\":%lld,"
+           "\"source_root\":\"%s\"}\n",
+           inotify_armed, watch_backend,
+           cost.snapshot_used ? "true" : "false",
+           cost.snapshot_used ? "true" : "false",
+           cost.full_rescan ? "true" : "false",
+           cost.inventory_changed ? "true" : "false",
+           (unsigned)cost.files_total, (unsigned)cost.files_read,
+           (unsigned long long)cost.bytes_read, ctx->changed_count,
+           (unsigned long long)ctx->mutation_sequence,
+           (long long)elapsed_us, root_hex);
+    fflush(stdout);
+    return true;
+}
+
+static bool watch_cancel_poll(void *opaque)
+{
+    struct watch_context *ctx = opaque;
+    g_watch_stop |= watch_stop_request_poll(ctx);
+    if (g_watch_stop)
+        return true;
+    bool changed = collect_events(ctx) && ctx->changed_count > 0;
+#if defined(__APPLE__)
+    if (ctx->watch_backend_failed) {
+        g_watch_stop = 1;
+        return true;
+    }
+#endif
+    if (changed && !ctx->edit_seen_emitted && !watch_emit_edit_seen(ctx)) {
+        g_watch_stop = 1;
+        return true;
+    }
+    if (changed && !ctx->prepared_epoch_ready) {
+        const char *files[ZCL_DEVLOOP_WATCH_MAX_FILES];
+        size_t count = ctx->changed_count;
+        int64_t seen_us = ctx->first_mutation_us > 0
+            ? ctx->first_mutation_us : platform_time_monotonic_us();
+        for (size_t i = 0; i < count; i++)
+            files[i] = ctx->changed[i];
+        struct watch_edit_epoch epoch;
+        if (watch_build_edit_epoch(ctx, files, count, seen_us, &epoch)) {
+            /* This event names the old foreground epoch. The new immutable
+             * epoch becomes current only after obsolete work is visibly
+             * superseded, so a drive consumer cannot confuse the two. */
+            if (!watch_emit_superseded(ctx) ||
+                !zcl_devloop_event_edit_epoch_set(epoch.id) ||
+                !watch_emit_impact_ready(ctx, &epoch)) {
+                g_watch_stop = 1;
+                return true;
+            }
+            ctx->prepared_epoch = epoch;
+            ctx->prepared_epoch_ready = true;
+            ctx->prepared_full_rescan = ctx->force_full_source_rescan;
+            ctx->changed_count = 0;
+            ctx->first_mutation_us = 0;
+            ctx->edit_seen_emitted = false;
+            ctx->force_full_source_rescan = false;
+        }
+    }
+    (void)watch_request_hint_poll(ctx);
+    return watch_cycle_should_yield(ctx, changed);
+}
+
+/* The ring restarts after the journal tail, which heal first moves the
+ * pointer to if a killed flusher left it behind, once any valid ring events
+ * past that tail are sealed. The restart holds the seal
+ * lock, so no batch of any other flusher interleaves with it; a previous
+ * watcher's sealer cannot be draining here because it keeps the singleton
+ * lock this watcher already took. */
+static bool watch_start_event_stream(struct watch_context *ctx)
+{
+    char why[160] = {0};
+    bool restarted = zcl_devloop_cycle_stream_restart(ctx->root, NULL, why,
+                                                      sizeof(why));
+    if (restarted && why[0])
+        fprintf(stderr, "[devloop] event stream restarted after sealing "
+                        "what it could; unsealable ring events lost: %s\n",
+                why);
+    if (restarted)
+        return true;
+    fprintf(stderr, "[devloop] event stream restart failed: %s\n",
+            why[0] ? why : "unknown");
+    return false;
+}
+
+/* Ordered teardown: cancel the proof worker, drain the journal sealer,
+ * report stopped, wait for the cancelled worker (killing it after a bounded
+ * wait), and only then release the singleton lock, so no new watcher
+ * attaches to this checkout while the watcher or its worker still runs.
+ * The cancelled worker may publish its verdict after the sealer drained and
+ * be killed before sealing it, so the ring is sealed once more after the
+ * join. True when every published event is sealed. */
+static bool watch_teardown(struct watch_context *ctx, int lock_fd,
+                           bool idle_exit)
+{
+    watch_proof_stop(ctx);
+    zcl_devloop_process_cancel_poll_clear();
+    bool sealed = watch_sealer_finish(ctx);
+    watch_emit_stopped_heartbeat(idle_exit);
+    watch_backend_close(ctx);
+    watch_proof_join(ctx);
+    if (!watch_seal_published(ctx->root, "after the proof worker exited"))
+        sealed = false;
+    if (lock_fd >= 0)
+        (void)close(lock_fd);
+    return sealed;
+}
+
+#if defined(ZCL_TESTING)
+static int watch_sealer_test_fd_count(void)
+{
+    DIR *dir = opendir("/dev/fd");
+    if (!dir)
+        return -1;
+    int count = 0;
+    while (readdir(dir))
+        count++;
+    (void)closedir(dir);
+    return count;
+}
+
+static const char *watch_sealer_test_open(struct watch_context *ctx,
+                                          const char *root)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->fd = -1;
+    watch_sealer_init(&ctx->sealer);
+#if defined(__APPLE__)
+    platform_directory_watcher_init(&ctx->directory_watcher);
+#endif
+    (void)snprintf(ctx->root, sizeof(ctx->root), "%s", root);
+    /* The watcher's own startup: heal the pointer, reset the ring from it. */
+    return watch_start_event_stream(ctx) ? NULL : "event stream start";
+}
+
+/* Publishes and seals `count` events exactly as the reflex producers do;
+ * event i carries the reason "<tag>save-<i>". */
+static const char *watch_sealer_test_publish_tagged(struct watch_context *ctx,
+                                                    const char *tag,
+                                                    size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        char body[256];
+        int n = snprintf(
+            body, sizeof(body),
+            "{\"schema\":\"zcl.dev_cycle.v1\",\"producer\":\"watch-test\","
+            "\"status\":\"impact_ready\",\"action\":\"reflex\","
+            "\"reason\":\"%ssave-%zu\",\"phase\":\"IMPACT_READY\","
+            "\"runtime_published\":false,\"elapsed_ms\":%zu,\"files\":[]}",
+            tag, i + 1, i + 1);
+        if (n <= 0 || (size_t)n >= sizeof(body))
+            return "event fixture";
+        if (!watch_stream_enqueue(ctx, body, (size_t)n) ||
+            !watch_stream_flush(ctx))
+            return "a published event could not be sealed";
+    }
+    return NULL;
+}
+
+static const char *watch_sealer_test_publish(struct watch_context *ctx,
+                                             size_t count)
+{
+    return watch_sealer_test_publish_tagged(ctx, "", count);
+}
+
+static int64_t watch_sealer_test_journal_files(const char *root)
+{
+    char dir[PATH_MAX], events[PATH_MAX];
+    if (!zcl_devloop_workspace_state_dir(root, dir, sizeof(dir)) ||
+        snprintf(events, sizeof(events), "%s/cycle-events", dir) >=
+            (int)sizeof(events))
+        return -1;
+    DIR *d = opendir(events);
+    if (!d)
+        return -1;
+    int64_t count = 0;
+    for (struct dirent *e = readdir(d); e; e = readdir(d))
+        count += e->d_name[0] != '.';
+    (void)closedir(d);
+    return count;
+}
+
+/* Every epoch 1..latest is sealed exactly once and in order, the ring is
+ * wholly durable, and the pointer names the journal tail. */
+static const char *watch_sealer_test_contiguous(const char *root)
+{
+    char out[ZCL_DEVLOOP_CYCLE_JSON_MAX], why[160] = {0};
+    size_t len = 0;
+    int64_t latest = 0, durable = 0, pointer = 0, epoch = 0;
+    if (!zcl_devloop_cycle_stream_marks(root, &latest, &durable) ||
+        durable != latest)
+        return "a published event is not sealed";
+    if (zcl_devloop_cycle_state_read(root, out, sizeof(out), &len, &pointer,
+                                     why, sizeof(why)) !=
+            ZCL_DEVLOOP_STATE_FOUND || pointer != latest)
+        return "the latest pointer is not the journal tail";
+    for (int64_t after = 0; after < latest; after++)
+        if (zcl_devloop_cycle_state_read_after(
+                root, after, out, sizeof(out), &len, &epoch, why,
+                sizeof(why)) != ZCL_DEVLOOP_STATE_FOUND ||
+            epoch != after + 1)
+            return "the journal has a gap";
+    if (zcl_devloop_cycle_state_read_after(
+            root, latest, out, sizeof(out), &len, &epoch, why,
+            sizeof(why)) != ZCL_DEVLOOP_STATE_ABSENT)
+        return "the journal runs past the ring";
+    return watch_sealer_test_journal_files(root) == latest
+        ? NULL : "the journal does not hold each epoch exactly once";
+}
+
+static const char *watch_sealer_test_stop(struct watch_context *ctx)
+{
+    bool sealed = watch_sealer_finish(ctx);
+    if (!sealed)
+        return "stop could not seal every published event";
+    if (ctx->sealer.pid != 0 || ctx->sealer.fd != -1 ||
+        ctx->sealer.read_fd != -1)
+        return "stop left the sealer or its pipe behind";
+    return watch_sealer_test_contiguous(ctx->root);
+}
+
+/* Handed-off seals are deferred, and stop returns only once they are all
+ * sealed. */
+static const char *watch_sealer_test_drain(struct watch_context *ctx,
+                                           const char *root)
+{
+    const char *failed = watch_sealer_test_open(ctx, root);
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer start";
+    if (!failed)
+        failed = watch_sealer_test_publish(ctx, 8);
+    if (!failed && (ctx->sealer.deferred != 8 || ctx->sealer.inline_backlog ||
+                    ctx->sealer.inline_down || ctx->trace.seals_inline))
+        failed = "a seal inside the bound was not handed to the sealer";
+    const char *stopped = watch_sealer_test_stop(ctx);
+    return failed ? failed : stopped;
+}
+
+/* Rapid saves past the ring's capacity with a stalled sealer: the backlog
+ * bound seals inline before the ring could evict an unsealed event. */
+static const char *watch_sealer_test_backlog(struct watch_context *ctx,
+                                             const char *root)
+{
+    const char *failed = watch_sealer_test_open(ctx, root);
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer start";
+    if (!failed && kill(ctx->sealer.pid, SIGSTOP) != 0)
+        failed = "sealer stall";
+    if (!failed)
+        failed = watch_sealer_test_publish(ctx, 70);
+    if (!failed && (ctx->sealer.inline_backlog == 0 ||
+                    ctx->trace.seals_inline == 0 ||
+                    ctx->sealer.deferred == 0))
+        failed = "a backlog over the bound did not seal inline";
+    if (ctx->sealer.pid > 0)
+        (void)kill(ctx->sealer.pid, SIGCONT);
+    const char *stopped = watch_sealer_test_stop(ctx);
+    return failed ? failed : stopped;
+}
+
+/* Waits for the child to die of `signal_number` without reaping it. */
+static bool watch_sealer_test_await_death(pid_t pid, int signal_number)
+{
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    int rc;
+    do {
+        rc = waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT);
+    } while (rc != 0 && errno == EINTR);
+    return rc == 0 && info.si_pid == pid && info.si_code == CLD_KILLED &&
+           info.si_status == signal_number;
+}
+
+/* A sealer that died turns every later seal into an inline one. */
+static const char *watch_sealer_test_dead(struct watch_context *ctx,
+                                          const char *root)
+{
+    const char *failed = watch_sealer_test_open(ctx, root);
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer start";
+    if (!failed && (kill(ctx->sealer.pid, SIGKILL) != 0 ||
+                    !watch_sealer_test_await_death(ctx->sealer.pid, SIGKILL)))
+        failed = "sealer kill";
+    if (!failed)
+        failed = watch_sealer_test_publish(ctx, 2);
+    int64_t latest = 0, durable = -1;
+    if (!failed && (ctx->sealer.inline_down != 2 || ctx->sealer.pid != 0 ||
+                    ctx->sealer.fd != -1 || ctx->trace.seals_inline != 2 ||
+                    !zcl_devloop_cycle_stream_marks(root, &latest,
+                                                    &durable) ||
+                    durable != latest))
+        failed = "a dead sealer did not force synchronous sealing";
+    const char *stopped = watch_sealer_test_stop(ctx);
+    return failed ? failed : stopped;
+}
+
+/* Runs in a forked proof worker: the pipe is gone, what the watcher handed
+ * the sealer is already sealed, and its own seal is synchronous. */
+static int watch_sealer_test_worker(const char *root, int write_fd,
+                                    int read_fd)
+{
+    int64_t latest = 0, durable = -1, epoch = 0;
+    char why[160] = {0};
+    static const char body[] =
+        "{\"schema\":\"zcl.dev_cycle.v1\",\"producer\":\"watch-test\","
+        "\"status\":\"passed\",\"action\":\"verify\",\"reason\":\"worker\","
+        "\"phase\":\"verify\",\"runtime_published\":false,\"files\":[]}";
+    if (fcntl(write_fd, F_GETFD) != -1 || fcntl(read_fd, F_GETFD) != -1)
+        return 10;
+    if (!zcl_devloop_cycle_stream_marks(root, &latest, &durable) ||
+        durable != latest)
+        return 11;
+    if (!zcl_devloop_cycle_stream_publish(root, body, sizeof(body) - 1,
+                                          &epoch, why, sizeof(why)) ||
+        !zcl_devloop_cycle_stream_seal(root, epoch, why, sizeof(why)) ||
+        !zcl_devloop_cycle_stream_marks(root, &latest, &durable) ||
+        durable != epoch)
+        return 12;
+    return 0;
+}
+
+static const char *watch_sealer_test_worker_fork(struct watch_context *ctx,
+                                                 const char *root)
+{
+    const char *failed = watch_sealer_test_open(ctx, root);
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer start";
+    if (!failed)
+        failed = watch_sealer_test_publish(ctx, 3);
+    int write_fd = ctx->sealer.fd, read_fd = ctx->sealer.read_fd;
+    pid_t worker = failed ? -1 : watch_proof_worker_fork(ctx, -1);
+    if (worker == 0)
+        _exit(watch_sealer_test_worker(root, write_fd, read_fd));
+    int status = 0;
+    if (!failed && (worker < 0 || waitpid(worker, &status, 0) != worker ||
+                    !WIFEXITED(status) || WEXITSTATUS(status) != 0))
+        failed = "a proof worker inherited the sealer pipe or deferral";
+    const char *stopped = watch_sealer_test_stop(ctx);
+    return failed ? failed : stopped;
+}
+
+/* Five ring events ("crash-save-1".."crash-save-5"), then one producer seal
+ * request covering all of them. */
+static const char *watch_sealer_test_batch(struct watch_context *ctx)
+{
+    int64_t epoch = 0;
+    char why[160] = {0};
+    for (int i = 1; i <= 5; i++) {
+        char body[256];
+        int n = snprintf(
+            body, sizeof(body),
+            "{\"schema\":\"zcl.dev_cycle.v1\",\"producer\":\"watch-test\","
+            "\"status\":\"impact_ready\",\"action\":\"reflex\","
+            "\"reason\":\"crash-save-%d\",\"phase\":\"IMPACT_READY\","
+            "\"runtime_published\":false,\"files\":[]}",
+            i);
+        if (n <= 0 || (size_t)n >= sizeof(body) ||
+            !zcl_devloop_cycle_stream_publish(ctx->root, body, (size_t)n,
+                                              &epoch, why, sizeof(why)))
+            return "crash batch publication";
+    }
+    if (!zcl_devloop_cycle_stream_seal(ctx->root, epoch, why, sizeof(why)) ||
+        ctx->sealer.deferred != 1)
+        return "the crash batch was not handed to the sealer";
+    return NULL;
+}
+
+/* The crash a restart must survive: the watcher, and a sealer killed two
+ * events into a five-event batch, so the pointer still lags the journal. */
+static const char *watch_sealer_test_crash(struct watch_context *ctx,
+                                           const char *root, int64_t *tail)
+{
+    int64_t base = 0, latest = 0, pointer = 0;
+    char out[ZCL_DEVLOOP_CYCLE_JSON_MAX], why[160] = {0};
+    size_t len = 0;
+    const char *failed = watch_sealer_test_open(ctx, root);
+    if (!failed && !zcl_devloop_cycle_stream_marks(root, &latest, &base))
+        failed = "ring marks";
+    zcl_devloop_cycle_stream_test_kill_after(2);
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer start";
+    zcl_devloop_cycle_stream_test_kill_after(0);
+    if (!failed)
+        failed = watch_sealer_test_batch(ctx);
+    if (!failed && !watch_sealer_test_await_death(ctx->sealer.pid, SIGKILL))
+        failed = "the sealer did not die inside its batch";
+    /* The watcher dies too: nothing it owned seals anything more. */
+    zcl_devloop_cycle_stream_seal_defer(NULL, NULL);
+    if (ctx->sealer.pid > 0)
+        (void)waitpid(ctx->sealer.pid, NULL, 0);
+    ctx->sealer.pid = 0;
+    watch_sealer_close_fds(&ctx->sealer);
+    if (!failed && (zcl_devloop_cycle_state_read(
+                        root, out, sizeof(out), &len, &pointer, why,
+                        sizeof(why)) != ZCL_DEVLOOP_STATE_FOUND ||
+                    pointer != base))
+        failed = "the killed batch moved the pointer";
+    /* The restart seals the batch's three unsealed ring events. */
+    *tail = base + 5;
+    return failed;
+}
+
+static const char *watch_sealer_test_reasons(const char *root, int64_t base,
+                                             const char *first_tag,
+                                             size_t first,
+                                             const char *second_tag,
+                                             size_t second);
+
+/* A restart after that crash: the pointer heals onto the journal tail, the
+ * batch's unsealed ring events are sealed rather than discarded, the fresh
+ * ring continues from them, and new saves seal with no gap refusal. The
+ * journal then holds the five crash events, in order, then the new saves. */
+static const char *watch_sealer_test_restart(struct watch_context *ctx,
+                                             const char *root, int64_t tail)
+{
+    int64_t latest = 0, durable = 0;
+    const char *failed = watch_sealer_test_open(ctx, root);
+    if (!failed && (!zcl_devloop_cycle_stream_marks(root, &latest,
+                                                    &durable) ||
+                    latest != tail || durable != tail))
+        failed = "the restarted ring does not continue the journal tail";
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer restart";
+    if (!failed)
+        failed = watch_sealer_test_publish(ctx, 3);
+    const char *stopped = watch_sealer_test_stop(ctx);
+    if (!failed)
+        failed = stopped;
+    if (!failed && watch_sealer_test_reasons(root, tail - 5, "crash-", 5, "",
+                                             3))
+        failed = "the restart did not seal the crash batch's own events";
+    return failed;
+}
+
+/* Waits (bounded) until the sealer has sealed everything published, which
+ * also proves it is past its startup and inside its request loop. */
+static bool watch_sealer_test_await_durable(const char *root)
+{
+    int64_t latest = 0, durable = -1;
+    for (int i = 0; i < 1000; i++) {
+        if (zcl_devloop_cycle_stream_marks(root, &latest, &durable) &&
+            durable == latest)
+            return true;
+        (void)poll(NULL, 0, 10);
+    }
+    return false;
+}
+
+/* True while `pid` has not exited (it is not reaped here). */
+static bool watch_sealer_test_running(pid_t pid)
+{
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    return pid > 0 &&
+           waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) ==
+               0 &&
+           info.si_pid == 0;
+}
+
+/* SIGTERM neither kills a running sealer nor turns its seals inline: only
+ * the stop request or pipe EOF stops it. A SIGSTOP sent right after shows
+ * the SIGTERM was ignored, because a fatal default action would already
+ * have ended the group when it was sent. */
+static const char *watch_sealer_test_term_signal(pid_t pid)
+{
+    if (kill(pid, SIGTERM) != 0 || kill(pid, SIGSTOP) != 0)
+        return "sealer signal";
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    int rc;
+    do {
+        rc = waitid(P_PID, (id_t)pid, &info, WEXITED | WSTOPPED | WNOWAIT);
+    } while (rc != 0 && errno == EINTR);
+    (void)kill(pid, SIGCONT);
+    return rc == 0 && info.si_code == CLD_STOPPED
+        ? NULL : "SIGTERM killed the journal sealer";
+}
+
+static const char *watch_sealer_test_term(struct watch_context *ctx,
+                                          const char *root)
+{
+    const char *failed = watch_sealer_test_open(ctx, root);
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer start";
+    if (!failed)
+        failed = watch_sealer_test_publish(ctx, 1);
+    if (!failed && !watch_sealer_test_await_durable(root))
+        failed = "the sealer never sealed its first event";
+    pid_t pid = ctx->sealer.pid;
+    if (!failed)
+        failed = watch_sealer_test_term_signal(pid);
+    if (!failed)
+        failed = watch_sealer_test_publish(ctx, 2);
+    if (!failed && !watch_sealer_test_await_durable(root))
+        failed = "a SIGTERM'd sealer stopped sealing";
+    if (!failed && (ctx->trace.seals_inline != 0 ||
+                    !watch_sealer_test_running(pid)))
+        failed = "a SIGTERM'd sealer stopped taking seals";
+    const char *stopped = watch_sealer_test_stop(ctx);
+    return failed ? failed : stopped;
+}
+
+/* Journal epochs (base, base + first + second] carry, in order, the reasons
+ * "<first_tag>save-1.." then "<second_tag>save-1..": each event sealed once,
+ * in the epoch the ring gave it. */
+static const char *watch_sealer_test_reasons(const char *root, int64_t base,
+                                             const char *first_tag,
+                                             size_t first,
+                                             const char *second_tag,
+                                             size_t second)
+{
+    char out[ZCL_DEVLOOP_CYCLE_JSON_MAX], why[160] = {0}, want[96];
+    for (size_t i = 0; i < first + second; i++) {
+        size_t len = 0;
+        int64_t epoch = 0;
+        bool early = i < first;
+        int n = snprintf(want, sizeof(want), "\"reason\":\"%ssave-%zu\"",
+                         early ? first_tag : second_tag,
+                         early ? i + 1 : i - first + 1);
+        if (n <= 0 || (size_t)n >= sizeof(want) ||
+            zcl_devloop_cycle_state_read_after(
+                root, base + (int64_t)i, out, sizeof(out), &len, &epoch, why,
+                sizeof(why)) != ZCL_DEVLOOP_STATE_FOUND ||
+            epoch != base + (int64_t)i + 1 || !strstr(out, want))
+            return "a journal epoch does not hold the event the ring gave it";
+    }
+    return NULL;
+}
+
+static int open_singleton_lock(const char *repo_root,
+                               enum zcl_devloop_publish_mode publish_mode);
+
+/* The killed watcher: its sealer is held at the gate with five events handed
+ * to it. Reports ready, then waits for SIGKILL. */
+static void watch_sealer_test_orphan_watcher(struct watch_context *ctx,
+                                             const char *root, int gate_fd,
+                                             int ready_fd)
+{
+    g_sealer_test_gate = gate_fd;
+    int lock_fd = open_singleton_lock(root, ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY);
+    bool ok = lock_fd >= 0 && !watch_sealer_test_open(ctx, root) &&
+              watch_sealer_start(ctx) &&
+              !watch_sealer_test_publish_tagged(ctx, "orphan-", 5) &&
+              ctx->trace.seals_inline == 0;
+    g_sealer_test_gate = -1;
+    if (write(ready_fd, ok ? "1" : "0", 1) != 1)
+        _exit(1);
+    for (;;)
+        (void)poll(NULL, 0, -1);
+}
+
+/* Waits (bounded) until nothing holds the watcher singleton lock. */
+static bool watch_sealer_test_await_unlock(const char *root)
+{
+    char path[PATH_MAX];
+    int fd = zcl_devloop_watch_lock_path(root, path, sizeof(path))
+        ? open(path, O_RDWR | O_CLOEXEC) : -1;
+    bool free_now = false;
+    for (int i = 0; fd >= 0 && i < 1000 && !free_now; i++) {
+        free_now = flock(fd, LOCK_EX | LOCK_NB) == 0;
+        if (!free_now)
+            (void)poll(NULL, 0, 10);
+    }
+    if (fd >= 0)
+        (void)close(fd);
+    return free_now;
+}
+
+/* The next watcher after the orphan drained: its ring continues after the
+ * orphan's seals and its own saves follow them in the journal. */
+static const char *watch_sealer_test_successor(struct watch_context *ctx,
+                                               const char *root, int64_t base)
+{
+    int64_t latest = 0, durable = 0;
+    int lock_fd = open_singleton_lock(root, ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY);
+    const char *failed = lock_fd >= 0
+        ? watch_sealer_test_open(ctx, root)
+        : "the drained orphan still held the watcher lock";
+    if (!failed && (!zcl_devloop_cycle_stream_marks(root, &latest,
+                                                    &durable) ||
+                    latest != base + 5 || durable != base + 5))
+        failed = "the new watcher's ring does not follow the orphan's seals";
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer start";
+    if (!failed)
+        failed = watch_sealer_test_publish_tagged(ctx, "new-", 3);
+    const char *stopped = watch_sealer_test_stop(ctx);
+    if (!failed)
+        failed = stopped;
+    if (!failed)
+        failed = watch_sealer_test_reasons(root, base, "orphan-", 5, "new-",
+                                           3);
+    if (lock_fd >= 0)
+        (void)close(lock_fd);
+    return failed;
+}
+
+/* Starts the doomed watcher, waits until its sealer holds five seals, then
+ * SIGKILLs and reaps it. Leaves the gate's write end open (the orphan stays
+ * held) and closes the ends the child took. */
+static const char *watch_sealer_test_orphan_kill(struct watch_context *ctx,
+                                                 const char *root,
+                                                 int gate[2], int ready[2])
+{
+    pid_t watcher = fork();
+    if (watcher == 0) {
+        (void)close(gate[1]);
+        (void)close(ready[0]);
+        watch_sealer_test_orphan_watcher(ctx, root, gate[0], ready[1]);
+    }
+    (void)close(gate[0]);
+    (void)close(ready[1]);
+    gate[0] = ready[1] = -1;
+    char byte = 0;
+    const char *failed = watcher > 0 && read(ready[0], &byte, 1) == 1 &&
+        byte == '1' ? NULL : "orphan watcher setup";
+    if (watcher > 0 && (kill(watcher, SIGKILL) != 0 ||
+                        waitpid(watcher, NULL, 0) != watcher) && !failed)
+        failed = "orphan watcher kill";
+    return failed;
+}
+
+/* A watcher is SIGKILLed while its sealer still owes five seals. No new
+ * watcher may start (and restart the ring) until that orphan has drained;
+ * afterwards the journal holds the orphan's events, then the new ones. */
+static const char *watch_sealer_test_orphan(struct watch_context *ctx,
+                                            const char *root)
+{
+    int gate[2] = {-1, -1}, ready[2] = {-1, -1};
+    int64_t base = 0, latest = 0;
+    const char *failed =
+        pipe(gate) == 0 && pipe(ready) == 0 &&
+        zcl_devloop_cycle_stream_marks(root, &latest, &base) &&
+        latest == base ? NULL : "orphan fixture";
+    if (!failed)
+        failed = watch_sealer_test_orphan_kill(ctx, root, gate, ready);
+    int intruder = failed ? -1 : open_singleton_lock(
+        root, ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY);
+    if (intruder >= 0) {
+        failed = "a new watcher started while an orphaned sealer owed seals";
+        (void)close(intruder);
+    }
+    for (int i = 0; i < 2; i++) {
+        (void)close(gate[i]);
+        (void)close(ready[i]);
+    }
+    if (!failed && !watch_sealer_test_await_unlock(root))
+        failed = "the orphaned sealer never drained";
+    return failed ? failed : watch_sealer_test_successor(ctx, root, base);
+}
+
+/* A stop that cannot seal what was published says so: events evicted from
+ * the ring before any seal make the stop's seal fail. */
+static const char *watch_sealer_test_stop_failure(struct watch_context *ctx,
+                                                  const char *root)
+{
+    static const char body[] =
+        "{\"schema\":\"zcl.dev_cycle.v1\",\"producer\":\"watch-test\","
+        "\"status\":\"impact_ready\",\"action\":\"reflex\","
+        "\"reason\":\"evicted\",\"phase\":\"IMPACT_READY\","
+        "\"runtime_published\":false,\"files\":[]}";
+    const char *failed = watch_sealer_test_open(ctx, root);
+    char why[160] = {0};
+    int64_t epoch = 0;
+    for (int i = 0; !failed && i < 70; i++)
+        if (!zcl_devloop_cycle_stream_publish(root, body, sizeof(body) - 1,
+                                              &epoch, why, sizeof(why)))
+            failed = "evicting publication";
+    if (!failed && watch_sealer_finish(ctx))
+        failed = "a stop that could not seal reported success";
+    return failed;
+}
+
+/* A child forked without exec keeps a copy of the request pipe's write end
+ * (a detached baseline worker once did); stop still drains the sealer and
+ * returns while that child still runs, instead of waiting for it to exit. */
+static const char *watch_sealer_test_held_pipe(struct watch_context *ctx,
+                                               const char *root)
+{
+    int release[2] = {-1, -1};
+    const char *failed = pipe(release) == 0
+        ? watch_sealer_test_open(ctx, root) : "held-pipe fixture";
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer start";
+    pid_t holder = failed ? -1 : fork();
+    if (holder == 0) {
+        (void)close(release[1]);
+        struct pollfd pfd = {.fd = release[0], .events = POLLIN};
+        (void)poll(&pfd, 1, 10000);
+        _exit(0);
+    }
+    if (!failed)
+        failed = watch_sealer_test_publish(ctx, 2);
+    const char *stopped = watch_sealer_test_stop(ctx);
+    if (!failed && (holder <= 0 || waitpid(holder, NULL, WNOHANG) != 0))
+        failed = "stop waited on a forked copy of the sealer pipe";
+    (void)close(release[0]);
+    (void)close(release[1]);
+    if (holder > 0)
+        (void)waitpid(holder, NULL, 0);
+    return failed ? failed : stopped;
+}
+
+/* Stops the sealer (SIGSTOP) once it has sealed what it holds, hands it two
+ * more events, then fills its request pipe until a write would block. */
+static const char *watch_sealer_test_wedge(struct watch_context *ctx,
+                                           const char *root)
+{
+    pid_t sealer = ctx->sealer.pid;
+    if (!watch_sealer_test_await_durable(root) || kill(sealer, SIGSTOP) != 0)
+        return "wedged sealer fixture";
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    int rc;
+    do {
+        rc = waitid(P_PID, (id_t)sealer, &info, WSTOPPED | WNOWAIT);
+    } while (rc != 0 && errno == EINTR);
+    const char *failed = rc == 0 && info.si_code == CLD_STOPPED
+        ? watch_sealer_test_publish(ctx, 2) : "wedged sealer stop";
+    int64_t latest = 0, durable = 0;
+    if (!failed && !zcl_devloop_cycle_stream_marks(root, &latest, &durable))
+        failed = "ring marks";
+    unsigned char message[8];
+    zcl_write_u64_le(message, (uint64_t)durable);
+    while (!failed && write(ctx->sealer.fd, message, sizeof(message)) ==
+                          (ssize_t)sizeof(message)) {
+    }
+    if (!failed && errno != EAGAIN)
+        failed = "the request pipe did not fill";
+    return failed;
+}
+
+/* Resumes `sealer` if the watcher's stop has not finished within five stop
+ * budgets; exits 3 when it had to. */
+static pid_t watch_sealer_test_watchdog(struct watch_context *ctx,
+                                        pid_t sealer, int cancel[2])
+{
+    pid_t watchdog = fork();
+    if (watchdog != 0)
+        return watchdog;
+    (void)close(ctx->sealer.fd);
+    (void)close(cancel[1]);
+    struct pollfd pfd = {.fd = cancel[0], .events = POLLIN};
+    if (poll(&pfd, 1, 5 * WATCH_CHILD_STOP_BUDGET_MS) != 0)
+        _exit(0);
+    (void)kill(sealer, SIGCONT);
+    _exit(3);
+}
+
+/* Cancels the watchdog; true when it had already resumed the sealer. */
+static bool watch_sealer_test_watchdog_fired(pid_t watchdog, int cancel[2])
+{
+    (void)close(cancel[0]);
+    (void)close(cancel[1]);
+    int status = 0;
+    return watchdog > 0 && waitpid(watchdog, &status, 0) == watchdog &&
+           WIFEXITED(status) && WEXITSTATUS(status) == 3;
+}
+
+/* A sealer that cannot be sent its stop request (wedged, with its request
+ * pipe full) is killed after a bounded wait; stop then seals its backlog in
+ * the watcher and completes. A watchdog that has to resume the sealer shows
+ * a stop that waited on it without bound, instead of hanging the test. */
+static const char *watch_sealer_test_wedged(struct watch_context *ctx,
+                                            const char *root)
+{
+    int cancel[2] = {-1, -1};
+    const char *failed = pipe(cancel) == 0
+        ? watch_sealer_test_open(ctx, root) : "wedged sealer fixture";
+    if (!failed && !watch_sealer_start(ctx))
+        failed = "sealer start";
+    if (!failed)
+        failed = watch_sealer_test_publish(ctx, 1);
+    pid_t sealer = ctx->sealer.pid;
+    if (!failed)
+        failed = watch_sealer_test_wedge(ctx, root);
+    if (failed && sealer > 0)
+        (void)kill(sealer, SIGCONT);
+    pid_t watchdog = failed ? -1
+                            : watch_sealer_test_watchdog(ctx, sealer, cancel);
+    const char *stopped = watch_sealer_test_stop(ctx);
+    if (watch_sealer_test_watchdog_fired(watchdog, cancel) && !failed)
+        failed = "stop waited without bound on a sealer it could not ask "
+                 "to stop";
+    if (!failed && (kill(sealer, 0) == 0 || errno != ESRCH))
+        failed = "a wedged sealer outlived its stop";
+    return failed ? failed : stopped;
+}
+
+/* A direct journal write inside the watcher (a verdict or a restart
+ * receipt) takes the ring's next epoch and is sealed by the sealer, not in
+ * the watcher. */
+static const char *watch_sealer_test_direct_write(struct watch_context *ctx,
+                                                  const char *root)
+{
+    static const char body[] =
+        "{\"schema\":\"zcl.dev_cycle.v1\",\"producer\":\"watch-test\","
+        "\"status\":\"passed\",\"action\":\"check\","
+        "\"reason\":\"direct-save-1\",\"phase\":\"verify\","
+        "\"runtime_published\":false,\"files\":[]}";
+    int64_t base = 0, latest = 0;
+    char why[160] = {0};
+    const char *failed = watch_sealer_test_open(ctx, root);
+    if (!failed && (!watch_sealer_start(ctx) ||
+                    !zcl_devloop_cycle_stream_marks(root, &latest, &base)))
+        failed = "sealer start";
+    if (!failed && !zcl_devloop_cycle_state_write(root, body,
+                                                  sizeof(body) - 1, why,
+                                                  sizeof(why)))
+        failed = "a direct journal write failed inside the watcher";
+    if (!failed && (ctx->trace.seals_deferred != 1 ||
+                    ctx->trace.seals_inline != 0))
+        failed = "a direct journal write sealed inside the watcher";
+    const char *stopped = watch_sealer_test_stop(ctx);
+    if (!failed)
+        failed = stopped;
+    return failed ? failed
+                  : watch_sealer_test_reasons(root, base, "direct-", 1, "",
+                                              0);
+}
+
+/* A stop that cannot read the ring cannot prove its events sealed. */
+static const char *watch_sealer_test_ring_gone(struct watch_context *ctx,
+                                               const char *root)
+{
+    char dir[PATH_MAX], ring[PATH_MAX];
+    const char *failed = watch_sealer_test_open(ctx, root);
+    if (!failed && (!zcl_devloop_workspace_state_dir(root, dir, sizeof(dir)) ||
+                    snprintf(ring, sizeof(ring), "%s/native-events.ring",
+                             dir) >= (int)sizeof(ring) ||
+                    unlink(ring) != 0))
+        failed = "ring removal";
+    if (!failed && watch_sealer_finish(ctx))
+        failed = "a stop that could not read the ring reported success";
+    return failed;
+}
+
+/* The stopping watcher's proof worker. Like a real one it holds no copy of
+ * the singleton lock; unlike one, SIGTERM does not cancel it. With
+ * `publish`, SIGTERM makes it publish a cancelled verdict to the ring well
+ * after its watcher's stop-time seal, and it is killed before sealing it. */
+static void watch_sealer_test_stuck_worker(const char *root, int release_fd,
+                                           int armed_fd, bool publish)
+{
+    static const char verdict[] =
+        "{\"schema\":\"zcl.dev_cycle.v1\",\"producer\":\"watch-test\","
+        "\"status\":\"cancelled\",\"action\":\"verify\","
+        "\"reason\":\"term-verdict\",\"phase\":\"verify\","
+        "\"runtime_published\":false,\"files\":[]}";
+    sigset_t term;
+    (void)sigemptyset(&term);
+    (void)sigaddset(&term, SIGTERM);
+    if (publish)
+        (void)pthread_sigmask(SIG_BLOCK, &term, NULL);
+    else
+        (void)signal(SIGTERM, SIG_IGN);
+    if (write(armed_fd, "1", 1) != 1)
+        _exit(1);
+    int64_t epoch = 0;
+    char why[160] = {0};
+    int received = 0;
+    if (publish && (sigwait(&term, &received) != 0 ||
+                    poll(NULL, 0, WATCH_CHILD_STOP_BUDGET_MS / 3) < 0 ||
+                    !zcl_devloop_cycle_stream_publish(
+                        root, verdict, sizeof(verdict) - 1, &epoch, why,
+                        sizeof(why))))
+        _exit(1);
+    char byte = 0;
+    for (;;) {
+        ssize_t n = read(release_fd, &byte, 1);
+        if (n <= 0 && !(n < 0 && errno == EINTR))
+            break;
+    }
+    _exit(0);
+}
+
+/* The stopping watcher (a forked process): holds the singleton lock and a
+ * proof worker that ignores SIGTERM and never exits by itself, reports the
+ * worker's pid, then tears down. */
+static void watch_sealer_test_teardown_watcher(struct watch_context *ctx,
+                                               const char *root,
+                                               int release_fd, int ready_fd,
+                                               bool publish)
+{
+    int lock_fd = open_singleton_lock(root, ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY);
+    int armed[2] = {-1, -1};
+    bool ok = lock_fd >= 0 && !watch_sealer_test_open(ctx, root) &&
+              pipe(armed) == 0;
+    pid_t worker = ok ? fork() : -1;
+    if (worker == 0) {
+        (void)close(lock_fd);
+        watch_sealer_test_stuck_worker(root, release_fd, armed[1], publish);
+    }
+    char byte = '0';
+    if (worker > 0 && read(armed[0], &byte, 1) != 1)
+        byte = '0';
+    pid_t reported = byte == '1' ? worker : 0;
+    ctx->proof_worker_pid = worker;
+    ctx->proof_worker_kind = WATCH_PROOF_WORKER_EDIT;
+    if (write(ready_fd, &reported, sizeof(reported)) !=
+        (ssize_t)sizeof(reported))
+        _exit(1);
+    _exit(watch_teardown(ctx, lock_fd, false) ? 0 : 1);
+}
+
+/* Forks the stopping watcher and waits until its worker is running. */
+static const char *watch_sealer_test_teardown_start(struct watch_context *ctx,
+                                                    const char *root,
+                                                    int release[2],
+                                                    int ready[2],
+                                                    pid_t *watcher,
+                                                    pid_t *worker,
+                                                    bool publish)
+{
+    *watcher = fork();
+    if (*watcher == 0) {
+        (void)close(release[1]);
+        (void)close(ready[0]);
+        watch_sealer_test_teardown_watcher(ctx, root, release[0], ready[1],
+                                           publish);
+    }
+    (void)close(release[0]);
+    (void)close(ready[1]);
+    release[0] = ready[1] = -1;
+    return *watcher > 0 &&
+                   read(ready[0], worker, sizeof(*worker)) ==
+                       (ssize_t)sizeof(*worker) &&
+                   *worker > 0
+        ? NULL : "teardown watcher setup";
+}
+
+/* Reaps the stopping watcher, killing it if it has not finished well after
+ * its own stop budget: a watcher that waits on its worker forever fails
+ * here instead of hanging the test. */
+static const char *watch_sealer_test_teardown_reap(pid_t watcher)
+{
+    int status = 0;
+    bool hung = false;
+    pid_t got = watcher > 0
+        ? watch_child_reap_bounded(watcher, 5 * WATCH_CHILD_STOP_BUDGET_MS,
+                                   &status, &hung)
+        : -1;
+    if (hung)
+        return "a stopping watcher hung on a proof worker that ignored "
+               "SIGTERM";
+    return got == watcher && WIFEXITED(status) && WEXITSTATUS(status) == 0
+        ? NULL : "teardown watcher exit";
+}
+
+/* A stopping watcher whose proof worker ignores SIGTERM kills it after a
+ * bounded wait, and releases the singleton lock only once it is gone: the
+ * lock is never free while the worker exists, and the stop completes. */
+static const char *watch_sealer_test_teardown_order(struct watch_context *ctx,
+                                                    const char *root,
+                                                    bool publish)
+{
+    int release[2] = {-1, -1}, ready[2] = {-1, -1};
+    pid_t watcher = -1, worker = -1;
+    const char *failed = pipe(release) == 0 && pipe(ready) == 0
+        ? watch_sealer_test_teardown_start(ctx, root, release, ready,
+                                           &watcher, &worker, publish)
+        : "teardown fixture";
+    int intruder = failed ? -1 : open_singleton_lock(
+        root, ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY);
+    if (intruder >= 0 && kill(worker, 0) == 0)
+        failed = "a stopping watcher released its lock while its proof "
+                 "worker still ran";
+    if (intruder >= 0)
+        (void)close(intruder);
+    const char *reaped = watch_sealer_test_teardown_reap(watcher);
+    if (!failed)
+        failed = reaped;
+    if (!failed && (kill(worker, 0) == 0 || errno != ESRCH))
+        failed = "a proof worker that ignored SIGTERM outlived its stopped "
+                 "watcher";
+    for (int i = 0; i < 2; i++) {
+        (void)close(release[i]);
+        (void)close(ready[i]);
+    }
+    if (!failed && !watch_sealer_test_await_unlock(root))
+        failed = "a stopped watcher kept its lock";
+    return failed;
+}
+
+/* A proof worker SIGTERMed at stop may publish its cancelled verdict after
+ * the stop-time seal and be killed before sealing it: the stop still seals
+ * that verdict before it releases the lock and reports success. */
+static const char *watch_sealer_test_teardown_unsealed(
+    struct watch_context *ctx, const char *root)
+{
+    const char *failed = watch_sealer_test_teardown_order(ctx, root, true);
+    if (!failed && watch_sealer_test_contiguous(root))
+        failed = "a verdict its SIGTERMed proof worker published during stop "
+                 "was left unsealed";
+    return failed;
+}
+
+/* A proof worker whose watcher is SIGKILLed right after forking it is asked
+ * to cancel instead of running on as an orphan. */
+static const char *watch_sealer_test_worker_orphan(struct watch_context *ctx)
+{
+    int report[2] = {-1, -1};
+    pid_t watcher = pipe(report) == 0 ? fork() : -1;
+    if (watcher == 0) {
+        (void)close(report[0]);
+        pid_t worker = watch_proof_worker_fork(ctx, -1);
+        if (worker == 0) {
+            bool cancelled = false;
+            for (int i = 0; i < 500 && !cancelled; i++) {
+                cancelled = zcl_devloop_process_cancel_requested();
+                if (!cancelled)
+                    (void)poll(NULL, 0, 10);
+            }
+            _exit(write(report[1], cancelled ? "c" : "t", 1) == 1 ? 0 : 1);
+        }
+        (void)kill(getpid(), SIGKILL);
+        _exit(1);
+    }
+    (void)close(report[1]);
+    char byte = 0;
+    bool reaped = watcher > 0 && waitpid(watcher, NULL, 0) == watcher;
+    bool reported = reaped && read(report[0], &byte, 1) == 1;
+    (void)close(report[0]);
+    if (!reported)
+        return "orphan proof worker fixture";
+    return byte == 'c' ? NULL
+                       : "a proof worker outlived its killed watcher";
+}
+
+/* The process poll must notice the same parent loss while a bounded child
+ * already runs, rather than only between proof steps. */
+static bool watch_sealer_test_child_started(void *opaque)
+{
+    int *fd = opaque;
+    if (*fd >= 0) {
+        pid_t pids[2] = {getpid(), 0};
+        { long ign_ = (long)write(*fd, pids, sizeof(pids)); (void)ign_; }
+        (void)close(*fd);
+        *fd = -1;
+    }
+    return false;
+}
+
+static void watch_sealer_test_orphan_worker(const char *root, int started_fd,
+                                             int report_fd, bool preexec)
+{
+    const char *const argv[] = {"/bin/sleep", "3", NULL};
+    struct zcl_devloop_process_result result;
+    if (setenv("ZCL_DEVLOOP_TEST_PROCESS", "1", 1) != 0)
+        _exit(1);
+    if (preexec) {
+#ifdef ZCL_TESTING
+        zcl_devloop_process_test_preexec_notify_fd_set(started_fd);
+#else
+        _exit(1);
+#endif
+    } else {
+        zcl_devloop_process_cancel_poll_set(
+            watch_sealer_test_child_started, &started_fd);
+    }
+    bool ran = zcl_devloop_process_run(root, argv, 5000, &result);
+    char verdict = result.cancelled && (ran != preexec) ? 'c' : 't';
+    { long ign_ = (long)write(report_fd, &verdict, 1); (void)ign_; }
+    _exit(0);
+}
+
+static pid_t watch_sealer_test_active_orphan_spawn(struct watch_context *ctx,
+                                               const char *root, int started[2],
+                                               int report[2], bool preexec)
+{
+    pid_t watcher = fork();
+    if (watcher == 0) {
+        (void)close(started[0]);
+        (void)close(report[0]);
+        pid_t worker = watch_proof_worker_fork(ctx, -1);
+        if (worker == 0)
+            watch_sealer_test_orphan_worker(root, started[1],
+                                             report[1], preexec);
+        (void)close(started[1]);
+        (void)close(report[1]);
+        if (worker < 0)
+            _exit(1);
+        for (;;)
+            pause();
+    }
+    return watcher;
+}
+
+static void watch_sealer_test_orphan_cleanup(bool cancelled, pid_t pids[2])
+{
+    if (cancelled)
+        return;
+    if (pids[1] > 1) {
+        (void)kill(-pids[1], SIGKILL);
+        (void)kill(pids[1], SIGKILL);
+    }
+    if (pids[0] > 1)
+        (void)kill(pids[0], SIGKILL);
+}
+
+static const char *watch_sealer_test_active_worker_orphan(
+    struct watch_context *ctx, const char *root, bool preexec)
+{
+    int started[2] = {-1, -1}, report[2] = {-1, -1};
+    if (pipe(started) != 0)
+        return "active orphan fixture pipes";
+    if (pipe(report) != 0) {
+        (void)close(started[1]);
+        (void)close(started[0]);
+        return "active orphan fixture pipes";
+    }
+    pid_t watcher = watch_sealer_test_active_orphan_spawn(ctx, root, started,
+                                                      report, preexec);
+    (void)close(started[1]);
+    (void)close(report[1]);
+    struct pollfd ready = {.fd = started[0], .events = POLLIN};
+    pid_t pids[2] = {0, 0};
+    char verdict = 0;
+    bool active = watcher > 0 && poll(&ready, 1, 5000) == 1 &&
+                  read(started[0], pids, sizeof(pids)) ==
+                      (ssize_t)sizeof(pids) && pids[0] > 1;
+    if (watcher > 0) {
+        (void)kill(watcher, SIGKILL);
+        (void)waitpid(watcher, NULL, 0);
+    }
+    ready.fd = report[0];
+    bool cancelled = active && poll(&ready, 1, 6000) == 1 &&
+                     read(report[0], &verdict, 1) == 1 && verdict == 'c';
+    watch_sealer_test_orphan_cleanup(cancelled, pids);
+    (void)close(started[0]);
+    (void)close(report[0]);
+    return cancelled ? NULL : preexec
+        ? "a pre-exec proof child outlived its killed watcher"
+        : "an active proof child outlived its killed watcher";
+}
+
+/* Appends a failed phase to the report; later phases still run, so one run
+ * shows every property that does not hold. */
+static void watch_sealer_test_note(char *report, size_t cap,
+                                   const char *failed)
+{
+    size_t used = strlen(report);
+    if (failed && used < cap)
+        (void)snprintf(report + used, cap - used, "%s%s",
+                       used ? "; " : "", failed);
+}
+
+static const char *watch_sealer_test_phases(struct watch_context *ctx,
+                                            const char *root)
+{
+    static char report[1024];
+    int64_t tail = 0;
+    report[0] = 0;
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_drain(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_backlog(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_dead(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_worker_fork(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_crash(ctx, root, &tail));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_restart(ctx, root, tail));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_term(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_orphan(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_held_pipe(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_wedged(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_direct_write(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_ring_gone(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_teardown_order(ctx, root, false));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_teardown_unsealed(ctx, root));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_worker_orphan(ctx));
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_active_worker_orphan(ctx, root,
+                                                                   false));
+#ifdef ZCL_TESTING
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_active_worker_orphan(ctx, root,
+                                                                   true));
+#endif
+    watch_sealer_test_note(report, sizeof(report),
+                           watch_sealer_test_stop_failure(ctx, root));
+    return report[0] ? report : NULL;
+}
+
+const char *zcl_devloop_watch_sealer_selftest(const char *repo_root)
+{
+    char root[PATH_MAX];
+    if (!repo_root || !realpath(repo_root, root))
+        return "fixture path";
+    int fds_before = watch_sealer_test_fd_count();
+    struct watch_context *ctx =
+        zcl_calloc(1, sizeof(*ctx), "devloop.watch.sealer_selftest");
+    if (!ctx)
+        return "watch context allocation";
+    const char *failed = watch_sealer_test_phases(ctx, root);
+    free(ctx);
+    if (!failed && (fds_before < 0 ||
+                    watch_sealer_test_fd_count() != fds_before))
+        failed = "a sealer descriptor outlived its watcher";
+    if (!failed && (waitpid(-1, NULL, WNOHANG) != -1 || errno != ECHILD))
+        failed = "a child process outlived its watcher";
+    return failed;
+}
+#endif
+
+static int open_singleton_lock(const char *repo_root,
+                               enum zcl_devloop_publish_mode publish_mode)
+{
+    char dir[PATH_MAX], path[PATH_MAX];
+    int dn = snprintf(dir, sizeof(dir), "%s/.cache", repo_root);
+    if (dn <= 0 || (size_t)dn >= sizeof(dir) ||
+        !zcl_devloop_watch_lock_path(repo_root, path, sizeof(path)))
+        return -1;
+    if (!mkdirs(dir))
+        return -1;
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    if (ftruncate(fd, 0) == 0)
+        dprintf(fd, "%ld %s starting proofq1\n", (long)getpid(),
+                zcl_devloop_publish_mode_name(publish_mode));
+    return fd;
+}
+
+/* One spelling of the stop endpoint path for the watcher, `dev loop stop`,
+ * and the tests. */
+bool zcl_devloop_watch_stop_endpoint_path(const char *nonce, char path[320])
+{
+    if (!nonce || !path || strlen(nonce) != 64)
+        return false;
+    int n = snprintf(path, 320, "/tmp/z23-watch-stop-%lu-%s",
+                     (unsigned long)geteuid(), nonce);
+    return n > 0 && n < 320;
+}
+
+static bool watch_stop_endpoint_open(struct watch_context *ctx,
+                                     char path[320])
+{
+    uint8_t bytes[32];
+    if (!ctx || !path ||
+        !rng_fill(bytes, sizeof(bytes)) ||
+        !os_proc_pid_start_token((uint64_t)getpid(),
+                                 &ctx->stop_start_token) ||
+        !zcl_devloop_workspace_id(ctx->root, ctx->stop_workspace))
+        return false;
+    zcl_hex_encode(bytes, sizeof(bytes), ctx->stop_nonce);
+    if (!zcl_devloop_watch_stop_endpoint_path(ctx->stop_nonce, path) ||
+        mkfifo(path, 0600) != 0)
+        return false;
+    int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    struct stat st;
+    bool ok = fd >= 0 && fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode) &&
+              st.st_uid == geteuid() && (st.st_mode & 0777) == 0600;
+    if (!ok) {
+        if (fd >= 0) close(fd);
+        (void)unlink(path);
+        return false;
+    }
+    ctx->stop_fd = fd;
+    ctx->stop_endpoint_ready = true;
+    return true;
+}
+
+static void watch_stop_endpoint_close(struct watch_context *ctx,
+                                      const char *path)
+{
+    if (!ctx || !ctx->stop_endpoint_ready) return;
+    (void)close(ctx->stop_fd);
+    ctx->stop_endpoint_ready = false;
+    if (path && path[0]) (void)unlink(path);
+}
+
+static bool mark_singleton_ready(
+    int fd, enum zcl_devloop_publish_mode publish_mode,
+    const struct watch_context *ctx)
+{
+    if (fd < 0 || !ctx || !ctx->stop_endpoint_ready ||
+        ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) < 0)
+        return false;
+    return dprintf(fd, "%ld %s ready proofq1 %llu %s\n",
+                            (long)getpid(),
+                            zcl_devloop_publish_mode_name(publish_mode),
+                            (unsigned long long)ctx->stop_start_token,
+                            ctx->stop_nonce) > 0;
+}
+
+static int watch_prepare_root(struct watch_context *ctx,
+                              const char *repo_root)
+{
+    const char *root = repo_root && repo_root[0] ? repo_root : ".";
+    if (!realpath(root, ctx->root)) {
+        fprintf(stderr, "[devloop] watch: cannot resolve repository root: %s\n",
+                strerror(errno));
+        return 2;
+    }
+    char reflex_ccache[PATH_MAX];
+    int cache_n = snprintf(reflex_ccache, sizeof(reflex_ccache),
+                           "%s/.cache/devloop-ccache-v1", ctx->root);
+    if (cache_n <= 0 || (size_t)cache_n >= sizeof(reflex_ccache) ||
+        setenv("CCACHE_DIR", reflex_ccache, 1) != 0 ||
+        setenv("CCACHE_MAXSIZE", "512M", 1) != 0) {
+        fprintf(stderr, "[devloop] watch: compiler cache isolation failed\n");
+        return 1;
+    }
+    char makefile[PATH_MAX];
+    snprintf(makefile, sizeof(makefile), "%s/Makefile", ctx->root);
+    if (access(makefile, R_OK) != 0) {
+        fprintf(stderr, "[devloop] watch: root has no readable Makefile\n");
+        return 2;
+    }
+    return 0;
+}
+
+/* Reactor helpers return -1 to stop, 0 to retry, and 1 to process an epoch. */
+static bool watch_backend_open(struct watch_context *ctx)
+{
+#if defined(__APPLE__)
+    if (!watch_macos_ensure_fd_budget()) {
+        fprintf(stderr,
+                "[devloop] watch: cannot raise bounded kqueue descriptor "
+                "budget: %s\n", strerror(errno));
+        return false;
+    }
+    if (!platform_directory_watcher_open_filtered(
+            &ctx->directory_watcher, ctx->root, watch_macos_descend,
+            watch_macos_include_file, ctx)) {
+        fprintf(stderr, "[devloop] watch: recursive kqueue setup failed: %s\n",
+                strerror(errno));
+        return false;
+    }
+#else
+    ctx->fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+    if (ctx->fd < 0 || !add_watch_recursive(ctx, "")) {
+        fprintf(stderr, "[devloop] watch: recursive inotify setup failed: %s\n",
+                strerror(errno));
+        return false;
+    }
+#endif
+    return true;
+}
+
+static bool watch_start_ready(struct watch_context *ctx,
+                              enum zcl_devloop_publish_mode publish_mode)
+{
+    if (!watch_backend_open(ctx)) return false;
+    if (!prime_source_snapshot(ctx)) {
+        fprintf(stderr, "[devloop] watch: source snapshot reconciliation failed\n");
+        return false;
+    }
+    if (!watch_start_event_stream(ctx)) {
+        fprintf(stderr, "[devloop] watch: bounded local event stream unavailable\n");
+        return false;
+    }
+    if (!mark_singleton_ready(ctx->singleton_lock_fd, publish_mode, ctx)) {
+        fprintf(stderr, "[devloop] watch: could not publish ready ownership\n");
+        return false;
+    }
+    return true;
+}
+
+static void watch_coalesce(struct watch_context *ctx,
+                            zcl_devloop_stop_predicate stop, void *stop_opaque)
+{
+    int64_t quiet_until =
+        platform_time_monotonic_us() + DEVLOOP_EDIT_QUIET_US;
+    while (!g_watch_stop && !(stop && stop(stop_opaque))) {
+        int64_t remain_us =
+            quiet_until - platform_time_monotonic_us();
+        if (remain_us <= 0)
+            break;
+        int wait_ms = (int)((remain_us + 999) / 1000);
+        if (stop && wait_ms > 100) wait_ms = 100;
+        int drc = watch_wait_for_events(ctx, wait_ms);
+        if (drc > 0)
+            quiet_until = platform_time_monotonic_us() +
+                DEVLOOP_EDIT_QUIET_US;
+        else if (drc < 0)
+            break;
+    }
+}
+
+static int watch_poll_ready(struct watch_context *ctx, int lock_fd,
+    zcl_devloop_stop_predicate stop, bool *idle_exit)
+{
+    if (watch_stop_request_poll(ctx)) return -1;
+    watch_commit_proof_prioritize(ctx);
+    if (!watch_proof_start(ctx, lock_fd)) {
+        fprintf(stderr, "[devloop] complete proof worker start failed\n");
+        return -1;
+    }
+    if (!watch_commit_proof_start(ctx, lock_fd)) {
+        fprintf(stderr, "[devloop] commit proof worker start failed\n");
+        return -1;
+    }
+    if (zcl_dev_proof_queue_has_pending(ctx->root) ||
+        ctx->proof_worker_pid > 1)
+        watch_idle_touch(ctx);
+    if (ctx->changed_count == 0 && !ctx->prepared_epoch_ready) {
+        watch_trace_idle(ctx);
+        int prc = watch_wait_for_events(ctx, stop ? 100 : 1000);
+        if (g_watch_stop) return -1;
+        if (prc < 0) {
+            fprintf(stderr, "[devloop] watch: event wait failed: %s\n",
+                    strerror(errno));
+            return -1;
+        }
+        if (prc == 0) {
+            if (watch_idle_poll_should_exit(ctx)) {
+                *idle_exit = true;
+                return -1;
+            }
+            return 0;
+        }
+        if (ctx->changed_count == 0)
+            return 0;
+    }
+    watch_idle_touch(ctx);
+    return 1;
+}
+
+static int watch_macos_cycle(struct watch_context *ctx, int lock_fd,
+    zcl_devloop_stop_predicate stop, void *stop_opaque)
+{
+#if !defined(__APPLE__)
+    (void)ctx; (void)lock_fd; (void)stop; (void)stop_opaque;
+#endif
+#if defined(__APPLE__)
+    /* EVFILT_VNODE identifies the directory that moved, not the final
+     * child pathname. Feeding a synthetic path into the path-qualified
+     * hot-reflex reactor would mint false blob evidence. Coalesce the
+     * vnode burst, then use the established conservative full-source
+     * cycle (the same safety posture as ReadDirectoryChangesW) until a
+     * filename-bearing Darwin backend exists. Proof-queue workers remain
+     * exact commit/base jobs and are started above this branch. */
+    if (ctx->changed_count > 0) {
+        if (!ctx->edit_seen_emitted &&
+            (!watch_emit_edit_seen(ctx) || !watch_stream_flush(ctx))) {
+            fprintf(stderr,
+                    "[devloop] watch: macOS edit acknowledgement failed\n");
+            return -1;
+        }
+        watch_coalesce(ctx, stop, stop_opaque);
+        if (g_watch_stop) return -1;
+        /* A commit can arrive while the Darwin vnode burst is being
+         * coalesced.  Do not enter the synchronous conservative EDIT
+         * cycle after that exact clean request becomes claimable: the
+         * top of the next loop iteration will start its stronger bound
+         * proof. */
+        if (watch_commit_proof_prioritize(ctx)) {
+            ctx->changed_count = 0;
+            ctx->first_mutation_us = 0;
+            ctx->force_full_source_rescan = false;
+            ctx->edit_seen_emitted = false;
+            return 0;
+        }
+        ctx->changed_count = 0;
+        ctx->first_mutation_us = 0;
+        ctx->force_full_source_rescan = false;
+        ctx->edit_seen_emitted = false;
+        const char *files[] = {"Makefile"};
+        if (!watch_proof_schedule(
+                ctx, files, 1, ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY,
+                false, lock_fd)) {
+            fprintf(stderr,
+                    "[devloop] watch: conservative macOS cycle could not "
+                    "be scheduled\n");
+            return -1;
+        }
+        return 0;
+    }
+#endif
+    return 1;
+}
+
+struct watch_run_epoch {
+    char epoch_changed[ZCL_DEVLOOP_WATCH_MAX_FILES][ZCL_DEVLOOP_PATH_MAX];
+    const char *files[ZCL_DEVLOOP_WATCH_MAX_FILES];
+    struct watch_edit_epoch edit_epoch;
+    bool impact_already_emitted;
+    bool full_rescan;
+    size_t epoch_count;
+    bool edit_epoch_ready;
+};
+
+static bool watch_prepare_epoch(struct watch_context *ctx,
+    struct watch_run_epoch *epoch,
+    zcl_devloop_stop_predicate stop, void *stop_opaque)
+{
+    epoch->impact_already_emitted = ctx->prepared_epoch_ready;
+    epoch->full_rescan = false;
+    epoch->epoch_count = 0;
+    epoch->edit_epoch_ready = false;
+    if (ctx->prepared_epoch_ready) {
+        epoch->edit_epoch = ctx->prepared_epoch;
+        epoch->epoch_count = epoch->edit_epoch.blob_count;
+        epoch->full_rescan = ctx->prepared_full_rescan;
+        for (size_t i = 0; i < epoch->epoch_count; i++) {
+            snprintf(epoch->epoch_changed[i], sizeof(epoch->epoch_changed[i]), "%s",
+                     epoch->edit_epoch.blobs[i].path);
+            epoch->files[i] = epoch->epoch_changed[i];
+        }
+        ctx->prepared_epoch_ready = false;
+        ctx->prepared_full_rescan = false;
+        epoch->edit_epoch_ready = true;
+    } else {
+        if (!ctx->edit_seen_emitted && !watch_emit_edit_seen(ctx))
+            return false;
+
+        /* Coalesce one editor's temp-file events into one save epoch.
+         * Separate saves may remain separate; supersession makes that
+         * cheaper and more exact than delaying their first impact. */
+        watch_coalesce(ctx, stop, stop_opaque);
+        if (g_watch_stop) return false;
+
+        epoch->epoch_count = ctx->changed_count;
+        int64_t epoch_seen_us = ctx->first_mutation_us > 0
+            ? ctx->first_mutation_us : platform_time_monotonic_us();
+        for (size_t i = 0; i < epoch->epoch_count; i++) {
+            snprintf(epoch->epoch_changed[i], sizeof(epoch->epoch_changed[i]), "%s",
+                     ctx->changed[i]);
+            epoch->files[i] = epoch->epoch_changed[i];
+        }
+        ctx->changed_count = 0;
+        ctx->first_mutation_us = 0;
+        ctx->edit_seen_emitted = false;
+        epoch->full_rescan = ctx->force_full_source_rescan;
+        ctx->force_full_source_rescan = false;
+        epoch->edit_epoch_ready = watch_build_edit_epoch(
+            ctx, epoch->files, epoch->epoch_count, epoch_seen_us, &epoch->edit_epoch);
+    }
+    return true;
+}
+
+static bool watch_announce_epoch(struct watch_context *ctx,
+    const struct watch_run_epoch *epoch, bool *path_events_ok)
+{
+    if (epoch->edit_epoch_ready) {
+        if (!zcl_devloop_event_edit_epoch_set(epoch->edit_epoch.id))
+            return false;
+        if (!epoch->impact_already_emitted &&
+            !watch_emit_impact_ready(ctx, &epoch->edit_epoch))
+            return false;
+        watch_trace_mark(&ctx->trace.impact_ready_us);
+        zcl_devloop_early_note_edit(epoch->edit_epoch.seen_us);
+    } else {
+        (void)zcl_devloop_event_edit_epoch_set("");
+        zcl_devloop_early_note_edit(0);
+        fprintf(stderr,
+                "[devloop] immutable edit epoch deferred; conservative "
+                "source reconciliation required\n");
+    }
+    /* The volatile events are now sufficient to start the reflex. Their
+     * ordered sealed copies are flushed only after useful feedback is
+     * visible, so storage acknowledgement is not a candidate prerequisite. */
+    if (epoch->full_rescan) {
+        ctx->snapshot_exact = false;
+        (void)ci_merkle_forget(ctx->root);
+    }
+    if (!zcl_devloop_watch_path_event(stdout, epoch->epoch_changed[0],
+            epoch->epoch_count, ctx->mutation_sequence, epoch->full_rescan, false)) {
+        *path_events_ok = false;
+        return false;
+    }
+    return true;
+}
+
+#if defined(ZCL_TESTING)
+static zcl_devloop_watch_test_foreground_fn watch_test_foreground;
+static void *watch_test_foreground_opaque;
+
+void zcl_devloop_watch_test_foreground_set(
+    zcl_devloop_watch_test_foreground_fn fn, void *opaque)
+{
+    watch_test_foreground = fn;
+    watch_test_foreground_opaque = opaque;
+}
+#endif
+
+static void watch_run_reflex(struct watch_context *ctx,
+    const struct watch_run_epoch *epoch,
+    enum zcl_devloop_publish_mode publish_mode, int lock_fd)
+{
+#if defined(ZCL_TESTING)
+    if (watch_test_foreground) {
+        watch_test_foreground(watch_test_foreground_opaque);
+        (void)collect_events(ctx);
+        return;
+    }
+#endif
+    watch_request_hint_arm(ctx);
+    zcl_devloop_process_cancel_poll_set(watch_cancel_poll, ctx);
+    struct zcl_devloop_epoch_proof epoch_proof;
+    int fast = zcl_devloop_epoch_reflex(
+        ctx->root, epoch->files, epoch->epoch_count, publish_mode, &ctx->restart_sources,
+        &g_watch_epoch_lanes, &epoch_proof);
+    const char *const *proof_files = epoch_proof.files;
+    size_t proof_count = epoch_proof.count;
+    watch_trace_mark(&ctx->trace.reflex_return_us);
+    /* Candidate emitters seal through their already-visible terminal
+     * reflex event. Retire the watcher's matching queue entries now so a
+     * save during asynchronous proof has the full bounded queue. */
+    if (fast != 0 && !watch_stream_flush(ctx)) {
+        g_watch_stop = 1;
+        fast = ZCL_DEVLOOP_RESTART_EVENT_FINAL;
+    }
+    watch_trace_mark(&ctx->trace.stream_flushed_us);
+    /* A green HOT_SHADOW story is already useful foreground knowledge.
+     * Only after publishing it do we build/run the exact affected proof.
+     * The ordinary restart lane reaches this same state after its focused
+     * receipt, so both converge here without duplicating scheduling. */
+    bool story_proof = fast == ZCL_DEVLOOP_RESTART_EVENT_PROOF_PENDING &&
+        epoch->epoch_count == 1 &&
+        strcmp(epoch->files[0],
+               "contexts/wallet/services/src/vault_intent_decision_service.c") == 0;
+    /* Keep the same warm owner moving through conservative complete proof
+     * after focused feedback. New filesystem activity cancels this work;
+     * stale epochs never anchor. */
+    if (fast == ZCL_DEVLOOP_RESTART_EVENT_PROOF_PENDING ||
+        fast == ZCL_DEVLOOP_RESTART_EVENT_FALLBACK_PENDING) {
+        if (!watch_emit_proof_pending(ctx, proof_files, proof_count)) {
+            fprintf(stderr,
+                    "[devloop] PROOF_PENDING event publication failed\n");
+            g_watch_stop = 1;
+        } else {
+            if (!watch_proof_schedule(
+                    ctx, proof_files, proof_count,
+                    ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY,
+                    story_proof, lock_fd)) {
+                fprintf(stderr,
+                        "[devloop] complete proof worker schedule failed\n");
+                g_watch_stop = 1;
+            }
+        }
+        fast = ZCL_DEVLOOP_RESTART_EVENT_FINAL;
+    }
+    watch_trace_mark(&ctx->trace.proof_scheduled_us);
+    if (fast == 0) {
+        /* APPLY authority is intentionally narrower than the generic
+         * cycle: only one compiled-allowlist island may publish live.
+         * Storage/reducers/network/consensus and ordinary reload edits
+         * remain on the verify-only contained path. */
+        (void)zcl_devloop_run_cycle_mode(
+            ctx->root, epoch->files, epoch->epoch_count,
+            ZCL_DEVLOOP_PUBLISH_VERIFY_ONLY);
+    }
+    zcl_devloop_process_cancel_poll_clear();
+}
+
+static bool watch_finish_epoch(struct watch_context *ctx,
+    zcl_devloop_stop_predicate stop, void *stop_opaque, bool *path_events_ok)
+{
+    if (g_watch_stop || (stop && stop(stop_opaque)))
+        return false;
+    bool superseded = ctx->changed_count > 0;
+    zcl_devloop_process_cancel_clear();
+    watch_trace_end(ctx);
+    if (superseded) {
+        if (!watch_emit_superseded(ctx) || !watch_stream_flush(ctx)) {
+            fprintf(stderr,
+                    "[devloop] SUPERSEDED event publication failed\n");
+            return false;
+        }
+        if (!zcl_devloop_watch_path_event(stdout, ctx->changed[0],
+                ctx->changed_count, 0, false, true)) {
+            *path_events_ok = false;
+            return false;
+        }
+    }
+    return true;
+}
+
+static void watch_run_loop(struct watch_context *ctx,
+    enum zcl_devloop_publish_mode publish_mode, int lock_fd,
+    zcl_devloop_stop_predicate stop, void *stop_opaque,
+    bool *idle_exit, bool *path_events_ok)
+{
+    ctx->idle_since_us = platform_time_monotonic_us();
+    while (!g_watch_stop && !(stop && stop(stop_opaque))) {
+        int ready = watch_poll_ready(ctx, lock_fd, stop, idle_exit);
+        if (ready < 0) break;
+        if (ready == 0) continue;
+        ready = watch_macos_cycle(ctx, lock_fd, stop, stop_opaque);
+        if (ready < 0) break;
+        if (ready == 0) continue;
+        struct watch_run_epoch epoch;
+        if (!watch_prepare_epoch(ctx, &epoch, stop, stop_opaque)) break;
+        if (!watch_announce_epoch(ctx, &epoch, path_events_ok)) break;
+        watch_run_reflex(ctx, &epoch, publish_mode, lock_fd);
+        if (!watch_finish_epoch(ctx, stop, stop_opaque, path_events_ok)) break;
+    }
+}
+
+int zcl_devloop_watch_mode_until(const char *repo_root,
+    enum zcl_devloop_publish_mode publish_mode,
+    zcl_devloop_stop_predicate stop, void *stop_opaque)
+{
+    struct watch_context ctx = {0};
+    ctx.fd = -1;
+    ctx.singleton_lock_fd = -1;
+    char stop_path[320] = {0};
+    watch_sealer_init(&ctx.sealer);
+#if defined(__APPLE__)
+    platform_directory_watcher_init(&ctx.directory_watcher);
+#endif
+    const char *mode_name = zcl_devloop_publish_mode_name(publish_mode);
+    if (!mode_name) {
+        fprintf(stderr, "[devloop] watch: invalid publication mode\n");
+        return 2;
+    }
+    /* The resident compiler must not share eviction/cleanup state with full
+     * builds on the host. A saturated global ccache inflated the protected
+     * story from ~90 ms to ~500 ms even though impact and the candidate were
+     * unchanged. This checkout-local bounded cache is warm-service state,
+     * outside Git and outside the immutable source epoch. */
+    int prepared = watch_prepare_root(&ctx, repo_root);
+    if (prepared != 0) return prepared;
+    int lock_fd = open_singleton_lock(ctx.root, publish_mode);
+    if (lock_fd < 0) {
+        fprintf(stderr,
+                "[devloop] watch: another watcher owns this worktree lane\n");
+        return 1;
+    }
+    ctx.singleton_lock_fd = lock_fd;
+    if (!watch_stop_endpoint_open(&ctx, stop_path)) {
+        fprintf(stderr, "[devloop] watch: stop endpoint unavailable\n");
+        close(lock_fd);
+        return 1;
+    }
+    if (!watch_start_ready(&ctx, publish_mode)) {
+        watch_backend_close(&ctx);
+        free(ctx.dirs);
+        watch_stop_endpoint_close(&ctx, stop_path);
+        ci_merkle_free(ctx.verified_tree);
+        close(lock_fd);
+        return 1;
+    }
+    /* After the ring reset and before any producer runs, and before the stop
+     * handlers exist: the sealer's lifetime is the request pipe's. */
+    (void)watch_sealer_start(&ctx);
+
+    g_watch_stop = 0;
+    zcl_devloop_process_cancel_clear();
+    zcl_devloop_process_cancel_poll_clear();
+    signal(SIGINT, watch_signal);
+    signal(SIGTERM, watch_signal);
+    printf("{\"schema\":\"zcl.dev_watch_heartbeat.v1\","
+           "\"status\":\"watching\",\"pid\":%ld,\"directories\":%zu,"
+           "\"root\":\"%s\",\"mode\":\"%s\","
+           "\"runtime_publication\":%s,"
+           "\"agent_next_action\":\"edit code\"}\n",
+           (long)getpid(), ctx.dir_count, ctx.root, mode_name,
+           zcl_devloop_publish_mode_applies(publish_mode) ? "true" : "false");
+    fflush(stdout);
+
+    bool idle_exit = false, path_events_ok = true;
+    watch_run_loop(&ctx, publish_mode, lock_fd, stop, stop_opaque,
+                   &idle_exit, &path_events_ok);
+
+    /* Every loop exit reaches this one ordered teardown. A stop that could
+     * not seal every published event exits nonzero. */
+    bool sealed = watch_teardown(&ctx, lock_fd, idle_exit);
+    /* The endpoint outlives teardown so a stop arriving during drain is delivered. */
+    watch_stop_endpoint_close(&ctx, stop_path);
+    ci_merkle_free(ctx.verified_tree);
+    free(ctx.dirs);
+    return (int)(!sealed || !path_events_ok);
+}
+
+int zcl_devloop_watch_mode(const char *repo_root,
+                           enum zcl_devloop_publish_mode publish_mode)
+{ return zcl_devloop_watch_mode_until(repo_root, publish_mode, NULL, NULL); }
+
+int zcl_devloop_watch(const char *repo_root)
+{
+    return zcl_devloop_watch_mode(repo_root,
+                                  zcl_devloop_default_watch_publish_mode());
+}
+
+#endif /* _WIN32 */
+
+#else
+
+int zcl_devloop_watch_mode(const char *repo_root,
+                           enum zcl_devloop_publish_mode publish_mode)
+{
+    (void)repo_root;
+    (void)publish_mode;
+    fprintf(stderr, "[devloop] watch is compiled out of release builds\n");
+    return 2;
+}
+int zcl_devloop_watch_mode_until(const char *repo_root,
+    enum zcl_devloop_publish_mode publish_mode,
+    zcl_devloop_stop_predicate stop, void *opaque)
+{ (void)stop; (void)opaque; return zcl_devloop_watch_mode(repo_root, publish_mode); }
+
+int zcl_devloop_watch(const char *repo_root)
+{
+    return zcl_devloop_watch_mode(repo_root,
+                                  zcl_devloop_default_watch_publish_mode());
+}
+
+#endif

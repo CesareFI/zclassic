@@ -1,0 +1,2643 @@
+/* Checkout-local development commands. Native transport only. */
+
+ZCL_COMMAND_READY_READ(
+    "dev.status", "dev", "", "Latest native cycle verdict",
+    "The most recent native compile/test/lint cycle verdict persisted by "
+    "the local dev-state store at call time, including exact ran, reused, "
+    "failed, and runtime-skip proof counts when present; reports "
+    "status=unavailable if no cycle has run yet.", 0,
+    "dev,status,cycle,verdict,receipt,cache,push", "zcl.command.empty_input.v1",
+    "zcl.dev_cycle.v1", "", "", "z23 dev status",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_status)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.begin", "dev", "", "Start or reattach the warm C23 dev service",
+    "Starts one checkout-local verify watcher by default, or reattaches "
+    "idempotently to the existing watcher. The response names the resident "
+    "watcher and one next command; it grants no canonical-node, wallet, "
+    "network, storage, transaction, publication or deployment authority.", 0,
+    "dev,begin,warm,watcher,verify,proof",
+    "zcl.dev_begin_input.v1", "zcl.dev_begin.v1", "root,mode", "",
+    "z23-dev dev begin", ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_begin,
+    "warm watcher ownership requires the dev-only executor",
+    "z23-dev dev begin")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.drive", "dev", "", "Wait for feedback, return the next action",
+    "The first action-changing result newer than after_epoch, compacted with "
+    "its live or fallback latency, proof state, ZVCS root and restart-safe publication "
+    "phase. If a publication job exists, drive verifies and renders that "
+    "existing receipt chain without moving roots manually or granting any "
+    "signing, network, wallet, transaction or human-acceptance authority. "
+    "EDIT_SEEN and IMPACT_READY remain available through dev.loop.wait but "
+    "one normal drive consumes them without extra commands.", 0,
+    "dev,drive,feedback,proof,zvcs,publication,next",
+    "zcl.dev_drive_input.v1", "zcl.dev_drive.v1",
+    "after_epoch,timeout_ms,wait_for_edit", "",
+    "z23-dev dev drive", ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_PERSISTENT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_drive,
+    "bounded warm-service driving requires the dev binary",
+    "z23-dev dev drive")
+
+ZCL_COMMAND_READY_READ(
+    "dev.ff", "dev", "", "Fail-fast: compile, test, lint",
+    "Pass/fail result of a freshly executed compile+focused-test+lint "
+    "ladder run synchronously against the current checkout via `make ff`; "
+    "not cached, dev build only.", 0,
+    "dev,ff,ladder,fast,verify", "zcl.command.empty_input.v1",
+    "zcl.dev_ff.v1", "", "", "z23 dev ff",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_ff)
+
+ZCL_COMMAND_BRANCH("dev.retrieval", "dev",
+                   "Retrieval quality for a source generation",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_DEV_READ(
+    "dev.retrieval.benchmark", "dev.retrieval", "",
+    "Compare literal, BM25, and identifier-graph file retrieval",
+    "An observational, native-only comparison over one exact ZVCS manifest "
+    "root. The unchanged production goal selector is projected to unique "
+    "files beside a BM25 index and a bounded rare identifier-atom/observed "
+    "reverse-reference "
+    "rerank of that same retained file set. It emits "
+    "rankings and exact full-file context byte costs only; a separate "
+    "evaluator may join reviewed gold after both rankings are sealed. No "
+    "result changes production ordering or authorizes promotion.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "dev,retrieval,benchmark,bm25,recall,mrr,context",
+    "zcl.dev_retrieval_benchmark_input.v1",
+    "zcl.dev_retrieval_benchmark.v3",
+    "workspace,expected_vcs_root,task_id,query,cursor", "",
+    "z23-dev dev retrieval benchmark --input='"
+    "{\"workspace\":\"<canonical-absolute-checkout>\","
+    "\"expected_vcs_root\":\"<64-lowercase-hex>\","
+    "\"task_id\":\"task\",\"query\":\"goal\"}'",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_PERSISTENT, ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_CHECKOUT_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_retrieval_benchmark,
+    "retrieval benchmarking requires the dev binary",
+    "z23-dev dev retrieval benchmark")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.retrieval.experiment", "dev.retrieval", "",
+    "Project one immutable direct-gold-input-free retrieval profile",
+    "Recompute and bind the exact BM25 baseline, derive a feature snapshot "
+    "from the same generation, then project one canonical retrieval_profile.v1. "
+    "This first live extractor observes exact full-file context bytes only; a "
+    "profile requesting any other feature fails INCOMPLETE instead of imputing "
+    "a value. The candidate preserves the baseline retained set and its "
+    "configured top-k full-file byte ceiling over the bounded observed rows. "
+    "ranking_complete states whether those rows cover the full ranking. "
+    "Opaque, nonzero study, "
+    "preregistration, and evaluator roots are bound into the proposal but their "
+    "objects and ordering are not verified by this command. They are emitted "
+    "for later independent evaluation; no direct gold input, "
+    "scope, quality, promotion, or acceptance claim is produced.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "dev,retrieval,experiment,heuristic,preregistration,ranking",
+    "zcl.dev_retrieval_experiment_input.v2",
+    "zcl.dev_retrieval_experiment.v3",
+    "workspace,expected_vcs_root,task_id,query,profile_hex,"
+    "study_root,preregistration_root,evaluator_root", "",
+    "z23-dev dev retrieval experiment --input='"
+    "{\"workspace\":\"<canonical-absolute-checkout>\","
+    "\"expected_vcs_root\":\"<64-lowercase-hex>\","
+    "\"task_id\":\"task\",\"query\":\"goal\","
+    "\"profile_hex\":\"<112-lowercase-hex>\","
+    "\"study_root\":\"<64-lowercase-hex>\","
+    "\"preregistration_root\":\"<64-lowercase-hex>\","
+    "\"evaluator_root\":\"<64-lowercase-hex>\"}'",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_PERSISTENT, ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_CHECKOUT_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_retrieval_experiment,
+    "retrieval experiments require the dev binary",
+    "z23-dev dev retrieval experiment")
+
+ZCL_COMMAND_BRANCH("dev.publication", "dev",
+                   "Inspect asynchronous proven-source publication",
+                   ZCL_COMMAND_LAYER_DEV)
+ZCL_COMMAND_BRANCH("dev.publication.mirror", "dev.publication",
+                   "Record optional non-authoritative mirror evidence",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_READY_READ(
+    "dev.publication.status", "dev.publication", "",
+    "Show one durable proof-to-publication job",
+    "The immutable ZVCS source, proof and generation roots bound by one "
+    "publication job, its durable local queue membership, and truthful "
+    "blockers for workspace, exact signed provider evidence, replication and "
+    "optional mirror phases. "
+    "This read grants no publication, signing, network, wallet or acceptance "
+    "authority.", 0,
+    "dev,publication,status,zvcs,proof,queue",
+    "zcl.dev_publication_status_input.v1",
+    "zcl.dev_publication_status.v1", "job_root", "job_root",
+    "z23-dev dev publication status --input='"
+    "{\"job_root\":\"<64-lowercase-hex>\"}'",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE,
+    zcl_native_handle_dev_publication_status)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.publication.advance", "dev.publication", "",
+    "Advance one proven-source job to its next durable blocker",
+    "Appends or reuses one immutable local scheduling receipt for the exact "
+    "job. WAITING_ACCEPTANCE performs no package action. Once the existing "
+    "accepted-work owner reports the exact PROVEN root produced by "
+    "zcode work accept, the background worker "
+    "builds one root-addressed ZVCS-blob to content.v2 chunk mapping set: "
+    "only cache misses read source bytes, and the receipt reports scanned "
+    "bytes plus new and reused chunks. The default response is human-first "
+    "and root-free; details=true exposes bound roots, receipts, and metrics. "
+    "It performs no release signature, "
+    "network, wallet, Git or canonical-node action. A separately verified "
+    "provider record may advance the same append-only job without granting "
+    "network authority, and cannot substitute "
+    "for the existing PROVEN-work publisher.", 0,
+    "dev,publication,advance,receipt,resume,idempotent",
+    "zcl.dev_publication_advance_input.v1",
+    "zcl.dev_publication_advance.v1",
+    "job_root,datadir,workspace,action_id,details", "job_root",
+    "z23-dev dev publication advance --input='"
+    "{\"job_root\":\"<64-lowercase-hex>\"}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_MODERATE, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_publication_advance,
+    "publication scheduling receipts require a dev checkout",
+    "z23-dev dev publication status")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.publication.collect", "dev.publication", "",
+    "Bind independent storage and source-reproduction evidence",
+    "Loads the exact provider-announced package target from one immutable "
+    "publication job, asks the authenticated local node for verified "
+    "STORAGE_ACK records, and appends one receipt only after locally "
+    "rechecking canonical wires, network genesis, validity windows, "
+    "signatures, package root, and distinct provider/owner groups. At least "
+    "two storage ACKs are required. It then discovers one signed "
+    "SOURCE_REPRODUCTION_ACK that binds the exact source and package roots "
+    "and requires a signer lineage and owner group distinct from the "
+    "publisher and storage witnesses. It never signs, publishes, spends, "
+    "deploys, infers physical off-host independence, or grants human "
+    "acceptance authority.", 0,
+    "dev,publication,storage-ack,reproduction,p2p,collect,evidence",
+    "zcl.dev_publication_status_input.v1",
+    "zcl.dev_publication_collect.v1", "job_root", "job_root",
+    "z23-dev dev publication collect --input='"
+    "{\"job_root\":\"<64-lowercase-hex>\"}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_MODERATE, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE | ZCL_COMMAND_CAP_CHAIN_READ |
+        ZCL_COMMAND_CAP_P2P_TOPIC,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_publication_collect,
+    "publication evidence collection requires the dev-only ZVCS receipt writer",
+    "z23-dev dev publication status")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.publication.mirror.record", "dev.publication.mirror", "",
+    "Record optional declared GitHub mirror evidence",
+    "Creates or reuses one immutable local receipt only after the existing "
+    "job has a verified provider-announced workspace. It copies the exact "
+    "ZVCS, source identity, proof, release, workspace and provider roots from "
+    "that chain and optionally binds an opaque Git object ID. It never invokes "
+    "Git, GitHub, a network or an API; absence or refusal remains "
+    "mirror_pending and never blocks development or P2P publication.", 0,
+    "dev,publication,mirror,github,receipt,optional",
+    "zcl.dev_publication_mirror_record_input.v1",
+    "zcl.dev_publication_mirror_record.v1", "job_root,git_oid", "job_root",
+    "z23-dev dev publication mirror record --input='"
+    "{\"job_root\":\"<64-lowercase-hex>\","
+    "\"git_oid\":\"<optional-40-or-64-lowercase-hex>\"}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_publication_mirror_record,
+    "optional mirror receipts require a dev checkout",
+    "z23-dev dev publication mirror record")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.verify-change", "dev", "",
+    "Compile changed code and run its focused proofs",
+    "A fresh changed-scope verification: exact compile_commands.json recipes "
+    "for changed C translation units (source-wide compile fallback for header "
+    "or build-graph edits), mapped focused tests, and lint-fast. Full logs are "
+    "retained under build/verify-change; failures return one dense first-error "
+    "capsule.", 0,
+    "dev,verify,change,affected,focused,concise", "zcl.command.empty_input.v1",
+    "zcl.dev_verify_change.v1", "", "",
+    "z23-dev dev verify-change", ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_LATENCY_BACKGROUND, ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_PROCESS_EXEC | ZCL_COMMAND_CAP_TEST_RUN,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_verify_change,
+    "changed-scope verification requires the dev-only process executor",
+    "make dev-bin, then z23-dev dev verify-change")
+
+ZCL_COMMAND_BRANCH("dev.core", "dev", "Core boundary and proof lanes",
+                   ZCL_COMMAND_LAYER_DEV)
+ZCL_COMMAND_BRANCH("dev.app", "dev", "Build capability-scoped C Apps",
+                   ZCL_COMMAND_LAYER_DEV)
+ZCL_COMMAND_BRANCH("dev.change", "dev", "Classify and apply changes",
+                   ZCL_COMMAND_LAYER_DEV)
+ZCL_COMMAND_BRANCH("dev.loop", "dev", "Persistent save-to-verdict loop",
+                   ZCL_COMMAND_LAYER_DEV)
+ZCL_COMMAND_BRANCH("dev.proof", "dev", "Exact local push-proof receipts",
+                   ZCL_COMMAND_LAYER_DEV)
+ZCL_COMMAND_BRANCH("dev.test", "dev", "Focused proof selection",
+                   ZCL_COMMAND_LAYER_DEV)
+ZCL_COMMAND_BRANCH("dev.generation", "dev", "Generation provenance",
+                   ZCL_COMMAND_LAYER_DEV)
+ZCL_COMMAND_BRANCH("dev.diagnose", "dev", "Failure capsule lookup",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_READY_READ(
+    "dev.core.boundary", "dev.core", "", "Show the enforced Core/App ownership law",
+    "A fixed, hardcoded Core/App capability boundary table baked into this "
+    "binary; identical on every call regardless of checkout state, not "
+    "derived from live code.", 0,
+    "core,app,boundary,consensus,capabilities",
+    "zcl.command.empty_input.v1", "zcl.core_app_boundary.v1", "", "",
+    "z23 dev core boundary",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_PUBLIC, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_TINY, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_core_boundary)
+
+ZCL_COMMAND_PLANNED_READ(
+    "dev.core.proof", "dev.core", "", "Run mandatory Core parity proof lanes",
+    "Will report pass/fail per mandatory Core parity proof lane against "
+    "the current checkout; today the handler is NULL and every call fails "
+    "closed with exit 3.", 0,
+    "core,consensus,parity,history,replay", "zcl.dev_core_proof_input.v1",
+    "zcl.dev_core_proof.v1", "files", "", "z23 dev core proof",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_TEST_RUN | ZCL_COMMAND_CAP_PROCESS_EXEC,
+    "native proof job extraction is not complete")
+
+ZCL_COMMAND_READY_READ(
+    "dev.app.list", "dev.app", "", "List checkout App manifests",
+    "Every App id compiled into this binary's built-in catalog at build "
+    "time; a complete, unpaged, static list unaffected by checkout edits "
+    "until rebuild.", ZCL_COMMAND_LIST_BUDGET,
+    "apps,manifest,checkout", "zcl.command.empty_input.v1",
+    "zcl.dev_app_index.v1", "", "", "z23 dev app list",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_APP_MANIFEST_READ,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_app_list)
+
+ZCL_COMMAND_READY_READ(
+    "dev.app.describe", "dev.app", "", "Describe an App manifest and its proofs",
+    "One App's manifest and proof-lane summary parsed fresh from its "
+    "checkout app.def file at call time; reflects on-disk source, not any "
+    "compiled or resident state.", 0,
+    "app,manifest,capabilities,simulations", "zcl.dev_app_ref_input.v1",
+    "zcl.dev_app.v1", "app_id", "app_id",
+    "z23 dev app describe social",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_APP_MANIFEST_READ,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_app_describe)
+
+ZCL_COMMAND_READY_READ(
+    "dev.app.plan", "dev.app", "", "Plan one conventional App resource slice",
+    "A deterministic file plan computed from the checkout's current App "
+    "manifest describing what a scaffold WOULD write; this call touches "
+    "no disk itself.", 0,
+    "app,resource,rails,plan", "zcl.dev_app_resource_input.v1",
+    "zcl.dev_app_plan.v1", "app_id,resource", "app_id,resource",
+    "z23 dev app plan social posts",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_TINY, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_CHECKOUT_READ,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_app_plan)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.app.scaffold", "dev.app", "", "Materialize a conventional App resource slice",
+    "The checkout files actually materialized for one App resource slice: "
+    "the model, its service, the slice test, and the test-group row that "
+    "makes the test run. Fail-closed and idempotent — it refuses, having "
+    "written nothing, if any target already exists with different content, "
+    "and reports an already-current slice as unchanged.", 0,
+    "app,resource,rails,scaffold", "zcl.dev_app_resource_input.v1",
+    "zcl.dev_app_scaffold.v1", "app_id,resource", "app_id,resource",
+    "z23 dev app scaffold social posts",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_MODERATE, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_CHECKOUT_WRITE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_app_scaffold,
+    "materializing checkout files requires a dev build",
+    "z23-dev dev app scaffold <app> <resource>")
+
+ZCL_COMMAND_READY_READ(
+    "dev.app.simulate", "dev.app", "", "Run deterministic App network scenarios",
+    "A deterministic simulation outcome for one App network scenario, "
+    "fully determined by app_id and the given seed; the same seed always "
+    "reproduces the same output.", 0,
+    "app,simulation,censorship,partition,replay,signature",
+    "zcl.dev_app_sim_input.v1", "zcl.dev_app_sim.v1",
+    "app_id,scenario,seed", "app_id",
+    "z23 dev app simulate social --seed=0x534f4349414c0001",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_MODERATE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_APP_SIMULATE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_app_simulate)
+
+ZCL_COMMAND_READY_COMMAND(
+    "dev.app.sync", "dev.app", "",
+    "Pull one App topic's signed events from a fleet peer",
+    "What this node holds for one (app_id, topic) and the frontier event id "
+    "it would ask a peer with, read live from the datadir's own table. With "
+    "--peer, the bounded pull itself: pulled/verified/refused counts and the "
+    "frontier after it. A checkout process holds no paired session, so a "
+    "call naming a peer is refused as NO_SESSION today and stores nothing; "
+    "the topic's byte budget comes from the App's own app.def and the chain "
+    "id from the selected network, never from anything a row claimed.", 0,
+    "app,events,sync,replicate,anti-entropy,peer",
+    "zcl.dev_app_sync_input.v1", "zcl.dev_app_sync.v1",
+    "app_id,topic,peer", "app_id,topic",
+    "z23 dev app sync social social.events.v1 --peer=node2",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_APP_MANIFEST_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_app_sync)
+
+ZCL_COMMAND_PLANNED_READ(
+    "dev.app.inspect", "dev.app", "", "Inspect a resident App generation",
+    "Will report one App's resident generation state and active leases "
+    "from the running dev process; today the handler is NULL and every "
+    "call fails closed with exit 3.", 0,
+    "app,generation,state,leases", "zcl.dev_app_ref_input.v1",
+    "zcl.dev_app_inspect.v1", "app_id", "app_id",
+    "z23 dev app inspect social", ZCL_COMMAND_LAYER_DEV,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    "public App ABI is not connected to resident generations yet")
+
+ZCL_COMMAND_PLANNED_COMMAND(
+    "dev.app.publish", "dev.app", "", "Atomically publish a proven App generation",
+    "Will report the atomic publication outcome of one proven App "
+    "generation into the resident dev process; today the handler is NULL "
+    "and every call fails closed with exit 3.", 0,
+    "app,publish,hotswap,generation,quiescence", "zcl.dev_app_publish_input.v1",
+    "zcl.dev_app_publish.v1", "app_id,idempotency_key", "app_id",
+    "z23 dev app publish social --idempotency-key=<key>",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_DEV_LANE,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_JOB,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_CONFIRM_IDEMPOTENCY, ZCL_COMMAND_LANE_DEV,
+    ZCL_COMMAND_CAP_COMPILER | ZCL_COMMAND_CAP_TEST_RUN |
+        ZCL_COMMAND_CAP_HOTSWAP,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    "App ABI generation publication is not wired yet")
+
+ZCL_COMMAND_READY_READ(
+    "dev.change.plan", "dev.change", "", "Classify files and select the smallest proof",
+    "A deterministic classification of the given file list into the "
+    "smallest sufficient proof lane, unioning static path rules with the "
+    "bounded source-index closure when available. "
+    "Optional \"selects\" names one test group id and adds selects_answer: "
+    "\"selected\" when the complete plan runs that group, \"not_selected\" "
+    "when the complete valid plan does not contain it, \"unknown_group\" "
+    "when the id is not in the test catalog, and \"plan_invalid\" when the "
+    "plan's execution set is not valid so no group can be ruled out.",
+    ZCL_COMMAND_EXTENDED_LIST_BUDGET,
+    "change,impact,classify,proof,hotswap,reload", "zcl.dev_change_input.v1",
+    "zcl.dev_plan.v1", "files,facts,facts_offset,selects", "", "z23 dev change plan --input='{\"files\":[\"contexts/commons/apps/social/app.def\"]}'",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_TINY, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_CHECKOUT_READ,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_change_plan)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.change.apply", "dev.change", "dev.change.cycle",
+    "Contained publication entrypoint: returns RUNTIME_PUBLICATION_CONTAINED",
+    "Reports the containment verdict RUNTIME_PUBLICATION_CONTAINED for "
+    "every call today; the transactional build+test+publish body past the "
+    "gate is unreachable code. Use dev.change.plan for real output.", 0,
+    "change,apply,build,hotswap,reload,rollback", "zcl.dev_change_input.v1",
+    "zcl.dev_cycle.v1", "files", "", "z23 dev change apply --input='{\"files\":[\"contexts/commons/apps/social/app.def\"]}'",
+    ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_DEV_LANE,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_JOB,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_DEV,
+    ZCL_COMMAND_CAP_PROCESS_EXEC | ZCL_COMMAND_CAP_TEST_RUN |
+        ZCL_COMMAND_CAP_COMPILER | ZCL_COMMAND_CAP_DEV_ACTIVATE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY, zcl_native_handle_dev_change_apply,
+    "change application requires the dev-only process/activation executor",
+    "z23-dev dev change cycle")
+
+ZCL_COMMAND_BRANCH("dev.vcs", "dev", "One-command source+binary revert",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.vcs.revert", "dev.vcs", "", "Restore the checkout to a prior ZVCS "
+    "commit; generation relinking is currently contained",
+    "The forward ZVCS commit id and reverted-to commit id from an actual "
+    "append-only source revert just applied to this checkout; generation "
+    "relinking is always refused today.", 0,
+    "vcs,revert,rollback,generation,relink", "zcl.dev_vcs_revert_input.v1",
+    "zcl.dev_vcs_revert.v1", "to,relink_generation", "to",
+    "z23 dev vcs revert --input='{\"to\":\"<64-hex commit id>\","
+    "\"relink_generation\":true}'",
+    ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_DEV_LANE,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_DEV,
+    ZCL_COMMAND_CAP_CHECKOUT_WRITE | ZCL_COMMAND_CAP_PROCESS_EXEC |
+        ZCL_COMMAND_CAP_DEV_ACTIVATE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_REVERSIBLE,
+    zcl_native_handle_dev_vcs_revert,
+    "one-command source+binary revert requires a dev build",
+    "z23-dev dev vcs revert <to> [--relink-generation]")
+
+ZCL_COMMAND_BRANCH("dev.vcs.seal", "dev.vcs",
+                   "Owner-run ZVCS unseal-token ritual", ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.vcs.seal.grant", "dev.vcs.seal", "", "Mint a one-shot ZVCS unseal "
+    "token authorizing the CURRENT worktree's sealed content for the next "
+    "green-cycle anchor",
+    "Confirms a one-shot ZVCS unseal token was minted and an audit record "
+    "appended to this checkout's index.kv just now; authorizes only the "
+    "CURRENT worktree's sealed content.", 0,
+    "vcs,seal,unseal,grant,owner,token", "zcl.dev_vcs_seal_grant_input.v1",
+    "zcl.dev_vcs_seal_grant.v1", "reason,confirm", "reason",
+    "z23 dev vcs seal grant --input='{\"reason\":\"post-baseline "
+    "app/jobs edits reviewed\",\"confirm\":true}'",
+    ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_DEV_LANE,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_DEV,
+    ZCL_COMMAND_CAP_CHECKOUT_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_vcs_seal_grant,
+    "granting a ZVCS unseal token requires a dev build",
+    "z23-dev dev vcs seal grant --input='{\"reason\":\"...\","
+    "\"confirm\":true}'")
+
+ZCL_COMMAND_BRANCH("dev.hotswap", "dev",
+                   "Tier-1 command-leaf hot-swap",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.hotswap.apply", "dev.hotswap", "", "Live module hot-swap: forwards to "
+    "the resident dev node; verify-only unless -hotswap-activate + "
+    "ZCL_HOTSWAP_ACTIVATE=1 on the dev datadir (canonical refused)",
+    "The activation report (ok, verify_only, activated, generation, "
+    "artifact hash) from the RESIDENT dev node's live registry, not this "
+    "CLI process; a real swap needs both activation flags set.", 0,
+    "hotswap,apply,leaves,generation,relink", "zcl.dev_hotswap_input.v1",
+    "zcl.dev_hotswap.v1", "so_path,probe_leaf", "so_path",
+    "z23-dev dev hotswap apply --input='{\"so_path\":\"/tmp/gen.so\","
+    "\"probe_leaf\":\"core.status\"}'",
+    ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_DEV_LANE,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_DEV,
+    ZCL_COMMAND_CAP_HOTSWAP | ZCL_COMMAND_CAP_DEV_ACTIVATE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY, zcl_native_handle_dev_hotswap_apply,
+    "in-process hot-swap requires a dev build",
+    "z23-dev dev hotswap apply --input='{\"so_path\":\"...\","
+    "\"probe_leaf\":\"...\"}'")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.hotswap.probe", "dev.hotswap", "", "Verify-only in-process: dlopen + "
+    "ABI-validate + self_test of a module .so, or of one source built first; "
+    "never commits",
+    "A dlopen/ABI-validate/self-test result for one module .so (so_path), or "
+    "for one swappable source (source_tu) this command first builds, then "
+    "probes; give exactly one. Runs in this CLI's own throwaway process; "
+    "proves a swap WOULD work but commits nothing to the resident node. A "
+    "failed build is refused at stage build with the compiler output.", 0,
+    "hotswap,probe,precommit,leaves,generation,build,source",
+    "zcl.dev_hotswap_input.v1",
+    "zcl.dev_hotswap.v1", "so_path,probe_leaf,source_tu", "",
+    "z23-dev dev hotswap probe --input='{\"source_tu\":"
+    "\"contexts/commons/services/src/zcode_passport_view_service.c\"}'",
+    ZCL_COMMAND_SCOPE_DEV_LANE, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_DEV,
+    ZCL_COMMAND_CAP_HOTSWAP,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_DRY_RUN,
+    zcl_native_handle_dev_hotswap_probe,
+    "resident hot-swap probing requires a dev build",
+    "z23-dev dev hotswap probe --input='{\"so_path\":\"...\","
+    "\"probe_leaf\":\"...\"}'")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.loop.ensure", "dev.loop", "dev.loop.watch",
+    "Ensure one resident watcher; auto publishes only stateless islands",
+    "Confirmation that one watcher process owns the checkout's singleton "
+    "lock. Verify is the default. Auto may publish exactly one allowlisted "
+    "stateless hot-swap island; every other edit is forced onto the contained "
+    "verify-only path.", 0,
+    "loop,ensure,watcher,inotify,verify,auto,hotswap,island",
+    "zcl.dev_loop_ensure_input.v1", "zcl.dev_loop_status.v1",
+    "root,mode", "", "z23 dev loop ensure --input='{\"root\":\".\",\"mode\":\"verify\"}'",
+    ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_loop_ensure,
+    "watcher ownership requires the dev-only executor",
+    "z23-dev dev loop ensure --input='{\"mode\":\"auto\"}'")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.loop.status", "dev.loop", "dev.loop.heartbeat",
+    "Read watcher identity, epoch, and latest verdict",
+    "The native watcher's live identity (active, pid, mode) read from its "
+    "lock file, the leaderless recorded sessions still running "
+    "(retiring_sessions: pid, born), plus the latest persisted cycle "
+    "verdict. Top-level freshness "
+    "is current only while that singleton lock is held; when absent, the "
+    "same idempotent ensure command is the one exact next action.", 0,
+    "loop,status,heartbeat,epoch", "zcl.command.empty_input.v1",
+    "zcl.dev_loop_status.v1", "", "", "z23 dev loop status",
+    ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_loop_status,
+    "watcher state is available through the dev binary",
+    "z23-dev dev loop heartbeat")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.loop.wait", "dev.loop", "", "Wait for one verdict after a cycle epoch",
+    "The next native cycle verdict newer than after_epoch, blocking up "
+    "to timeout_ms; on timeout returns a typed WAIT_TIMEOUT failure "
+    "instead of stale data.", ZCL_COMMAND_LIST_BUDGET,
+    "loop,wait,epoch,verdict", "zcl.dev_loop_wait_input.v1",
+    "zcl.dev_cycle.v1", "after_epoch,timeout_ms", "",
+    "z23 dev loop wait --input='{\"after_epoch\":41}'",
+    ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_PERSISTENT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_loop_wait,
+    "bounded verdict waiting is available through the dev binary",
+    "z23-dev dev loop wait")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.loop.events", "dev.loop", "", "Stream resumable source and cycle events",
+    "A resumable event subscription. The bounded native reply returns the "
+    "next event or heartbeat plus its cursor; --format=jsonl keeps one local "
+    "process attached and emits events continuously until the subscriber "
+    "disconnects. It reads the existing volatile/sealed stream and grants "
+    "no build, proof, storage, network or publication authority.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "loop,events,jsonl,cursor,epoch", "zcl.dev_loop_events_input.v1",
+    "zcl.dev_loop_event.v1", "after,heartbeat_ms", "",
+    "z23-dev dev loop events --after=41 --format=jsonl",
+    ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_PERSISTENT,
+    ZCL_COMMAND_COST_STREAM, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_loop_events,
+    "resumable event subscription is available through the dev binary",
+    "z23-dev dev loop events --format=jsonl")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.loop.stop", "dev.loop", "", "Stop one identified native watcher",
+    "Confirmation that the identified watcher session exited and what "
+    "became of its recorded session (session_retired: retired, none, "
+    "unrecorded or mismatch), plus the live loop-status snapshot. "
+    "watcher_id with watcher_session names the lock owner from one status "
+    "receipt; watcher_id with watcher_born names a leaderless "
+    "retiring_sessions row, accepted only while no watcher holds the "
+    "lock.", 0,
+    "loop,stop,watcher", "zcl.dev_loop_stop_input.v1",
+    "zcl.dev_loop_status.v1",
+    "watcher_id,watcher_session,watcher_born,root,group,owner,failure_id,to,relink_generation,reason,confirm",
+    "watcher_id",
+    "z23-dev dev loop stop --input='{\"watcher_id\":123,\"watcher_session\":\"<status-session>\"}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY, zcl_native_handle_dev_loop_stop,
+    "watcher shutdown requires the dev-only executor",
+    "z23-dev dev loop stop")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.proof.ensure", "dev.proof", "",
+    "Ensure background proof for one exact commit and remote base",
+    "Returns immediately after reusing or scheduling local verification for "
+    "the exact commit/base pair. The worker binds source, mutation, changed "
+    "set, impact policy, toolchain, build graph, generated-output, compile, "
+    "lint and test receipts; it grants no deployment or remote authority. "
+    "require_existing_watcher=true only notifies a kernel-qualified existing "
+    "proof queue owner and never starts a watcher; missing ownership returns "
+    "the exact foreground step.", 0,
+    "dev,proof,ensure,receipt,push,background",
+    "zcl.dev_proof_ensure_input.v1", "zcl.dev_proof_status.v1",
+    "root,local_commit,remote_base,mode,require_existing_watcher", "",
+    "z23-dev dev proof ensure",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_verify_change,
+    "background proof scheduling requires the dev binary",
+    "z23-dev dev proof status")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.proof.step", "dev.proof", "",
+    "Execute one explicit proof pair in the foreground without a watcher",
+    "Queues only the explicit local commit and remote base if missing, then "
+    "runs its normal full-policy worker under shared execution exclusion. "
+    "Requires an unarmed checkout: existing watcher state refuses admission. "
+    "Other requests stay untouched; settled failures require explicit retry. "
+    "Only an independently validated signed receipt returns PASS.", 0,
+    "dev,proof,step,foreground,receipt",
+    "zcl.dev_proof_step_input.v1", "zcl.dev_proof_status.v1",
+    "root,local_commit,remote_base", "local_commit,remote_base",
+    "z23-dev dev proof step --local_commit=<commit> --remote_base=<base>",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_verify_change,
+    "foreground proof requires the dev binary",
+    "z23-dev dev proof status")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.proof.retry", "dev.proof", "",
+    "Retry a settled failed proof after repairing its prerequisites",
+    "Preserves the failed attempt's evidence and queues a new complete proof "
+    "for the exact commit/base pair without starting a watcher; "
+    "refuses passed pairs, pending requests and live workers. Retry changes "
+    "scheduling only and grants no receipt or publication authority.", 0,
+    "dev,proof,retry,receipt,background",
+    "zcl.dev_proof_retry_input.v1", "zcl.dev_proof_status.v1",
+    "root,local_commit,remote_base", "",
+    "z23-dev dev proof retry",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_verify_change,
+    "proof retry requires the dev binary",
+    "z23-dev dev proof status")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.proof.status", "dev.proof", "",
+    "Read exact commit/base proof status",
+    "Validates the immutable local receipt seal and its complete generated, "
+    "compile, lint and test accounting. Missing, stale, incomplete and "
+    "tampered receipts remain explicit non-passing states.", 0,
+    "dev,proof,status,receipt,push",
+    "zcl.dev_proof_input.v1", "zcl.dev_proof_status.v1",
+    "root,local_commit,remote_base,mode", "",
+    "z23-dev dev proof status",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_INSTANT, ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_verify_change,
+    "proof receipt status requires the dev binary",
+    "z23-dev dev proof status")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.proof.wait", "dev.proof", "",
+    "Wait for one exact commit/base receipt",
+    "Schedules the exact local proof when it is missing, then waits without "
+    "running a push gate. A timeout or failed proof returns a typed refusal "
+    "with the same exact commit/base identity.", ZCL_COMMAND_LIST_BUDGET,
+    "dev,proof,wait,receipt,push",
+    "zcl.dev_proof_wait_input.v1", "zcl.dev_proof_status.v1",
+    "root,local_commit,remote_base,timeout_ms", "",
+    "z23-dev dev proof wait",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_PERSISTENT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_verify_change,
+    "proof receipt waiting requires the dev binary",
+    "z23-dev dev proof status")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.proof.signer", "dev.proof", "",
+    "Show this box's receipt signing key and who it trusts",
+    "Prints the Ed25519 public key this box signs push-proof receipts with, "
+    "the owner-private paths that hold it and the signers.allow trust list, "
+    "and how many trusted and malformed lines that list has. Creates "
+    "nothing: the first proof creates the key. Copy the printed key into "
+    "another box's signers.allow to let it admit receipts proved here.", 0,
+    "dev,proof,signer,key,allowlist,receipt,push",
+    "zcl.dev_proof_signer_input.v1", "zcl.dev_proof_signer.v1",
+    "", "",
+    "z23-dev dev proof signer",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_INSTANT, ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_verify_change,
+    "push-proof signer identity requires the dev binary",
+    "z23-dev dev proof signer")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.proof.coverage", "dev.proof", "",
+    "Query one pair's canonical coverage manifest",
+    "Reports what the pair's signed coverage manifest binds (child-set "
+    "root, impact policy, executed groups with their exact input keys), "
+    "which rows carry eligible PASS observation coverage, which are "
+    "missing or in conflict, which executed without a reusable "
+    "observation (unqualified, named as its own state), and the "
+    "observation projection this box has seen (totals, eligibility, "
+    "oldest and newest observation age). Read-only: it admits nothing "
+    "and changes nothing. A pair without an admitted receipt or manifest "
+    "stays an explicit non-passing state.", 0,
+    "dev,proof,coverage,manifest,receipt,observation",
+    "zcl.dev_proof_input.v1", "zcl.dev_proof_coverage.v1",
+    "root,local_commit,remote_base", "",
+    "z23-dev dev proof coverage",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_INSTANT, ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_verify_change,
+    "coverage queries require the dev binary",
+    "z23-dev dev proof status")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.proof.observations", "dev.proof", "",
+    "Query this box's receiver observation index",
+    "Reports what this box has observed across every proved pair: totals, "
+    "signature eligibility, the observed age range, and per (group, "
+    "exact input key) the newest eligible verdict with its observation "
+    "time and count. Eligible PASS/FAIL contradictions are preserved and "
+    "named, never collapsed. An empty index is a legitimate empty answer; "
+    "corrupt bytes refuse by name. Optional group input scopes every "
+    "count to one exact group. Read-only.", 0,
+    "dev,proof,observations,index,reuse,receiver",
+    "zcl.dev_proof_observations_input.v1", "zcl.dev_observations.v1",
+    "group", "",
+    "z23-dev dev proof observations",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_INSTANT, ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_verify_change,
+    "observation queries require the dev binary",
+    "z23-dev dev proof status")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.proof.observations.fold", "dev.proof", "",
+    "Fold one pair's durable observations into the box index",
+    "Merges the pair's durable signed-observation CAS into this box's "
+    "verified, sorted, contradiction-preserving observation index, so the "
+    "receiver basis grows as pairs prove. The pair must carry an admitted "
+    "receipt, exactly like the coverage query. Every merged row is "
+    "self-verifying: corrupt bytes refuse by name and nothing partial is "
+    "written. Re-folding the same pair is a union, so the command is "
+    "idempotent; it writes no admission state. Read the result back with "
+    "dev proof observations.", 0,
+    "dev,proof,observations,fold,index,reuse,receiver",
+    "zcl.dev_proof_input.v1", "zcl.dev_observations_fold.v1",
+    "local_commit,remote_base", "",
+    "z23-dev dev proof observations fold",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_verify_change,
+    "observation folds require the dev binary",
+    "z23-dev dev proof observations")
+
+ZCL_COMMAND_READY_READ(
+    "dev.test.plan", "dev.test", "", "Map changed files to mandatory proof groups",
+    "A deterministic mapping of the given file list to mandatory proof "
+    "groups, computed from static path-classification rules; no live "
+    "checkout scan is performed. Each selected group carries the dimension "
+    "and the file that pulled it in, and the reply states per dimension "
+    "whether that dimension's answer was complete. "
+    "Optional \"selects\" names one test group id and adds selects_answer: "
+    "\"selected\" when the complete plan runs that group, \"not_selected\" "
+    "when the complete valid plan does not contain it, \"unknown_group\" "
+    "when the id is not in the test catalog, and \"plan_invalid\" when the "
+    "plan's execution set is not valid so no group can be ruled out.", ZCL_COMMAND_LIST_BUDGET,
+    "test,plan,impact,groups", "zcl.dev_change_input.v1",
+    "zcl.dev_test_plan.v1", "files,selects", "", "z23 dev test plan --input='{\"files\":[]}'",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_TINY, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_CHECKOUT_READ,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_change_plan)
+
+ZCL_COMMAND_READY_READ(
+    "dev.vcs.ports", "dev.vcs", "", "Classify a contributor branch commit by commit",
+    "Read-only pull-request intake: for each non-merge commit in "
+    "merge-base(base,tip)..tip, oldest first, classify its patch against "
+    "the running result as APPLIES, ON_BASE (change already present), "
+    "CONFLICT (skipped) or EMPTY (no diff outside the generated docs). The "
+    "running result is a private temporary index; the checkout, index, refs "
+    "and config are never written.", 65536,
+    "port,table,intake,pull-request,apply,conflict", "zcl.dev_port_table_input.v1",
+    "zcl.dev_port_table.v1", "base,tip,limit", "",
+    "z23 dev vcs ports --base=origin/main --tip=contributor/branch --limit=64",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_CHECKOUT_READ,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_port_table)
+
+ZCL_COMMAND_DEV_READ(
+    "dev.test.run", "dev.test", "dev.test.focused",
+    "Run one exact prebuilt focused test group",
+    "Pass/fail result of a freshly executed prebuilt focused test binary "
+    "(`test_parallel_fast --exact=<canonical-group>`) run synchronously; requires "
+    "`make test_parallel_fast` to have built it first.", 0,
+    "test,focused,group",
+    "zcl.dev_test_run_input.v1", "zcl.dev_focused_test.v1", "group", "group",
+    "z23 dev test run hotswap_simnet", ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_LATENCY_BACKGROUND, ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_PROCESS_EXEC | ZCL_COMMAND_CAP_TEST_RUN,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_test_run,
+    "focused tests require the dev-only process executor",
+    "z23-dev dev test focused")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.test.story", "dev.test", "",
+    "Run one exact owner-bound fail-fast behavior story",
+    "A deterministic HOT_SHADOW result for the named owner, evaluated over "
+    "resident-frozen immutable fixtures by a proposal-only decision core. "
+    "The story has no wallet, database, network, signing, custody, reducer, "
+    "supervisor, deployment, or publication capability.", 0,
+    "test,story,shadow,owner,fail-fast",
+    "zcl.dev_test_story_input.v1", "zcl.vault_intent_decision_story.v1",
+    "owner", "owner",
+    "z23-dev dev test story --input='{\"owner\":\"transaction_intent\"}'",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_LATENCY_INSTANT, ZCL_COMMAND_COST_TINY,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_TEST_RUN,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_test_story,
+    "behavior stories require the dev-only frozen fixture registry",
+    "z23-dev dev test story")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.test.sim", "dev.test", "", "Run the generic hot-swap network proof",
+    "A deterministic hot-swap network simulation outcome computed fresh "
+    "in-process at call time; identical every run for the same checkout "
+    "state.", 0,
+    "test,simulation,hotswap,network", "zcl.dev_test_sim_input.v1",
+    "zcl.dev_sim.v1", "app_id", "", "z23 dev test sim",
+    ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_MODERATE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_PROCESS_EXEC | ZCL_COMMAND_CAP_TEST_RUN,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_test_sim,
+    "the simulation runner requires the dev-only process executor",
+    "z23-dev dev test sim")
+
+ZCL_COMMAND_PLANNED_READ(
+    "dev.test.replay", "dev.test", "", "Replay one deterministic failure seed",
+    "Will replay one deterministic failure seed and report pass/fail; "
+    "today the handler is NULL and every call fails closed with exit 3.", 0,
+    "test,replay,seed,deterministic", "zcl.dev_test_replay_input.v1",
+    "zcl.dev_test_replay.v1", "seed,scenario", "seed",
+    "z23 dev test replay 1234", ZCL_COMMAND_LAYER_DEV,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_APP_SIMULATE,
+    "generic seed replay registry is not implemented")
+
+ZCL_COMMAND_BRANCH("dev.test.background", "dev.test", "Background proof freshness",
+                   ZCL_COMMAND_LAYER_DEV)
+ZCL_COMMAND_PLANNED_READ(
+    "dev.test.background.status", "dev.test.background", "",
+    "Read lint, sanitizer, replay, and reproducibility freshness",
+    "Will report lint/sanitizer/replay/reproducibility freshness ages; "
+    "today the handler is NULL and every call fails closed with exit 3.", 0,
+    "test,background,quality,freshness", "zcl.command.empty_input.v1",
+    "zcl.dev_background_quality.v1", "", "",
+    "z23 dev test background status", ZCL_COMMAND_LAYER_DEV,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_INSTANT, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    "native background-quality projection is not implemented")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.generation.current", "dev.generation", "", "Show current and last-good generations",
+    "The current, last-good, and staged generation symlink targets read "
+    "live from the local dev generation root directory on disk at call "
+    "time.", 0,
+    "generation,current,last-good,hotswap", "zcl.command.empty_input.v1",
+    "zcl.dev_generation_status.v1", "", "", "z23 dev generation current",
+    ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_generation_current,
+    "generation state is available through the dev binary",
+    "z23-dev dev generation current")
+ZCL_COMMAND_DEV_READ(
+    "dev.generation.history", "dev.generation", "", "Page accepted and rejected generations",
+    "A paginated, disk-scanned list of accepted and rejected generation "
+    "markers under the local dev generation root, newest name first, "
+    "capped at 100 rows per page.", ZCL_COMMAND_LIST_BUDGET,
+    "generation,history,rejected,quarantine", "zcl.page_input.v1",
+    "zcl.dev_generation_history.v1", "cursor,max_items", "",
+    "z23 dev generation history", ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_generation_history,
+    "generation history is available through the dev binary",
+    "z23-dev dev generation history")
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.generation.activate", "dev.generation", "",
+    "Stage, preflight, and activate one exact dev generation",
+    "The first call stages the checkout's prebuilt dev binary into an immutable "
+    "generation and returns exact commit_input. The confirmed call requires "
+    "the same candidate, source identity, ABA mutation token, source CAS root, "
+    "resident generation, expiry, idempotency key, and effect digest. It then "
+    "installs the exact source-controlled dev unit (including on a fresh host), "
+    "uses the native activation engine's exact-process verification and "
+    "rollback-on-failure transaction. It is confined to zcl23-dev.service.", 0,
+    "generation,activate,plan,commit,rollback,dev",
+    "zcl.dev_generation_activate_input.v1",
+    "zcl.dev_generation_activate.v1",
+    "idempotency_key,expires_in_seconds,intent_id,effect_digest,candidate_sha256,source_id_sha256,source_mutation_sha256,source_cas_sha3,expected_current_generation,expires_unix,confirm",
+    "", "z23-dev dev generation activate "
+    "--input='{\"idempotency_key\":\"upgrade-001\"}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_DEV_LANE, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_JOB, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_DEV, ZCL_COMMAND_CAP_DEV_ACTIVATE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_REVERSIBLE,
+    zcl_native_handle_dev_generation_activate,
+    "generation activation requires the dev-only process executor",
+    "make dev-bin, then z23-dev dev generation activate")
+ZCL_COMMAND_PLANNED_COMMAND(
+    "dev.generation.rollback", "dev.generation", "", "Restore verified last-good in the dev lane",
+    "Will report the restored last-good generation after an "
+    "activation-engine rollback; today the handler is NULL and every "
+    "call fails closed with exit 3.", 0,
+    "generation,rollback,last-good,recovery", "zcl.dev_generation_rollback_input.v1",
+    "zcl.dev_generation_rollback.v1", "intent_id,effect_digest", "",
+    "z23 dev generation rollback --input='<intent>'", ZCL_COMMAND_LAYER_DEV,
+    ZCL_COMMAND_EFFECT_DESTRUCTIVE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_DEV_LANE, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_JOB, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_DEV, ZCL_COMMAND_CAP_DEV_ACTIVATE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_REVERSIBLE,
+    "native activation engine is not implemented")
+ZCL_COMMAND_PLANNED_COMMAND(
+    "dev.generation.compact", "dev.generation", "", "Compact unleased old generations",
+    "Will report which unleased old generations were compacted and "
+    "reclaimed; today the handler is NULL and every call fails closed "
+    "with exit 3.", 0,
+    "generation,compact,leases,retention", "zcl.dev_generation_compact_input.v1",
+    "zcl.dev_generation_compact.v1", "intent_id,effect_digest", "",
+    "z23 dev generation compact --input='<intent>'", ZCL_COMMAND_LAYER_DEV,
+    ZCL_COMMAND_EFFECT_DESTRUCTIVE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER,
+    ZCL_COMMAND_MODE_JOB, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_MODERATE, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    "native lease-aware compaction is not implemented")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.diagnose.latest", "dev.diagnose", "", "Read the latest compiler failure",
+    "Resolves the workspace-scoped most recently recorded deterministic "
+    "compiler failure and returns its ID, phase, first error, observation "
+    "count, and typed show action. found=false is valid only when no record "
+    "exists; integrity errors fail closed. It is not the current-cycle "
+    "authority.", 2048,
+    "diagnose,failure,capsule,latest", "zcl.command.empty_input.v1",
+    "zcl.dev_failure_latest_result.v1", "", "",
+    "z23 dev diagnose latest",
+    ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_diagnose_latest,
+    "failure capsules are available through the dev binary",
+    "z23-dev dev diagnose latest")
+ZCL_COMMAND_DEV_READ(
+    "dev.diagnose.show", "dev.diagnose", "", "Show one compiler failure record",
+    "Reads one workspace-scoped immutable first-observation record by its "
+    "SHA3 ID, verifies its seal/private inode, and returns a bounded summary "
+    "plus a typed dev.ff retry action. Normal view omits the capsule; full "
+    "view includes the bounded capsule and retry command. The observation "
+    "count includes executed and safely coalesced observations. It never "
+    "executes the retry.", 6144,
+    "diagnose,failure,artifact", "zcl.dev_failure_ref_input.v1",
+    "zcl.dev_failure_show.v1", "failure_id", "failure_id",
+    "z23-dev dev diagnose show <failure-id>",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_diagnose_show,
+    "durable failure artifacts are available through the dev binary",
+    "z23-dev dev diagnose show <failure-id>")
+
+/* ── dev.fleet ─────────────────────────────────────────────────────────────
+ * One local, node-free answer for every remote integration lane. Git owns
+ * membership and source identity; self-sealed gate receipts own lint claims.
+ * `truth` is the per-lane inventory; `start` is the whole fleet in one
+ * bounded packet for the session that dispatches lanes. */
+ZCL_COMMAND_BRANCH("dev.fleet", "dev",
+                   "Fleet truth and the opening packet",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_READY_READ(
+    "dev.fleet.truth", "dev.fleet", "",
+    "Show the Git and lint-receipt truth for every origin lane",
+    "Enumerates refs/remotes/origin/main and every refs/remotes/origin/agent/* "
+    "already present in this checkout, then reports each exact head, the "
+    "union of its remote delta, unpublished commits, staged, unstaged, and "
+    "untracked files, and current red lint gates with the first failing "
+    "commit in each uninterrupted failure run. check-core-seal and "
+    "check-git-hooks-installed are labeled owner_only. Receipt chains, logs, "
+    "HEAD, status, and diff fingerprints are independently checked; missing "
+    "or mismatched evidence is unobserved or stale, never green. It does not "
+    "fetch and never reads a node, RPC endpoint, or datadir.", 65536,
+    "fleet,git,branches,worktrees,lint,receipts,owner",
+    "zcl.command.empty_input.v1", "zcl.dev_fleet.v1", "", "",
+    "z23 dev fleet truth",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_fleet)
+
+ZCL_COMMAND_READY_READ(
+    "dev.fleet.start", "dev.fleet", "",
+    "One opening answer for an orchestrator: the whole fleet in one bounded "
+    "packet",
+    "Answers, in a packet whose size the caller sets, everything a session "
+    "that dispatches lanes reads before its first decision: whether this "
+    "checkout is stale against the local refs/remotes/origin/main, the "
+    "mission document pointers, every linked worktree sharing this git "
+    "common dir with its ahead, behind, dirty and mtime newest first, the "
+    "running executor units (activity, never a verdict), each fleet host's "
+    "last posted offer, the board needs and problems no later claim or "
+    "result answered, origin/main's head, subject, age and this checkout's "
+    "red lint gates, and the ordered next actions. Sections carry state, "
+    "count, total and truncated; a section cut by budget_bytes says so and "
+    "reports its total, so no row is ever dropped silently. budget_bytes is "
+    "1024..15360 and defaults to 6144, cwd names the checkout to read and "
+    "defaults to the process working directory, and include_units is the "
+    "systemd read. Pass the returned cursor back as since for the changes "
+    "alone. It never fetches and never reads a node, RPC endpoint, or "
+    "datadir.", 16384,
+    "fleet,orchestrator,start,orient,board,worktrees,units,cursor,budget",
+    "zcl.fleet_start_input.v1", "zcl.fleet_start.v1",
+    "since,budget_bytes,board_dir,include_units,cwd", "",
+    "z23 dev fleet start",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_fleet_start)
+
+/* ── dev.fleet.tunnel ──────────────────────────────────────────────────────
+ * A TCP tunnel between two paired machines, carried as a service on the
+ * mesh stream layer. The acceptor dials its own loopback and nothing else,
+ * and only a port one of its own allow rows names for that exact peer.
+ * Nothing is allowed by default: forwarding ssh is one row, written on the
+ * machine being reached. */
+ZCL_COMMAND_BRANCH("dev.fleet.tunnel", "dev.fleet",
+                   "Loopback TCP tunnels between paired machines",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_READY_COMMAND(
+    "dev.fleet.tunnel.open", "dev.fleet.tunnel", "",
+    "Open a local entrance to one port on a paired machine's loopback",
+    "Binds a listener on 127.0.0.1 and reports the port it got; every "
+    "connection accepted there becomes one stream to the peer, which dials "
+    "its own loopback at remote_port and refuses unless one of its allow "
+    "rows names this machine and that port. local_port 0 asks the OS for a "
+    "free port. Refusals are named: tunnel_peer_unpaired (no live pairing "
+    "row), tunnel_local_bind_failed, tunnel_cap. Whether anything is "
+    "carried is the far side's decision, not this one.",
+    ZCL_COMMAND_RESULT_BUDGET,
+    "tunnel,ssh,port,forward,mesh,stream,loopback",
+    "zcl.dev_fleet_tunnel_open.input.v1", "zcl.dev_fleet_tunnel.open.v1",
+    "peer,remote_port,local_port", "peer",
+    "z23 dev fleet tunnel open --peer=<id> --remote-port=22 --local-port=2222",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_dev_fleet_tunnel_open)
+
+ZCL_COMMAND_READY_COMMAND(
+    "dev.fleet.tunnel.close", "dev.fleet.tunnel", "",
+    "Close one local tunnel entrance and every connection on it",
+    "Drops the listener and ends each live stream it opened by name, so the "
+    "local programs holding those connections see them close. Idempotent "
+    "only in effect: closing an id that is not open is refused, never "
+    "reported as a close that happened.",
+    ZCL_COMMAND_RESULT_BUDGET, "tunnel,close,port,forward,mesh",
+    "zcl.dev_fleet_tunnel_close.input.v1", "zcl.dev_fleet_tunnel.close.v1",
+    "tunnel_id", "tunnel_id",
+    "z23 dev fleet tunnel close --tunnel-id=1",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_dev_fleet_tunnel_close)
+
+ZCL_COMMAND_READY_READ(
+    "dev.fleet.tunnel.list", "dev.fleet.tunnel", "",
+    "Show both directions: the entrances open here and what this node admits",
+    "Every local entrance with its peer, its local and remote port, the "
+    "connections live on it now and since it opened, bytes each way, and "
+    "its age; then this node's own allow rows, which are what it will let a "
+    "peer reach on its loopback. An empty allow list is the honest answer "
+    "that this node carries nothing for anyone.",
+    ZCL_COMMAND_RESULT_BUDGET, "tunnel,list,ports,allow,mesh",
+    "zcl.command.empty_input.v1", "zcl.dev_fleet_tunnel.list.v1", "", "",
+    "z23 dev fleet tunnel list",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_NODE,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_fleet_tunnel_list)
+
+ZCL_COMMAND_READY_COMMAND(
+    "dev.fleet.tunnel.allow", "dev.fleet.tunnel", "",
+    "Let one paired machine reach one port on this node's loopback",
+    "Writes one row naming a peer and a port into this node's allow table, "
+    "with the operator's own reason. This is the whole authority a tunnel "
+    "acceptor consults: no row, no tunnel, and a row admits that one port "
+    "for that one peer on 127.0.0.1 only. Forwarding ssh is this call with "
+    "port 22. Re-writing an existing row replaces its reason and widens "
+    "nothing.",
+    ZCL_COMMAND_RESULT_BUDGET, "tunnel,allow,ssh,port,authority,mesh",
+    "zcl.dev_fleet_tunnel_allow.input.v1", "zcl.dev_fleet_tunnel.allow.v1",
+    "peer,port,why", "peer",
+    "z23 dev fleet tunnel allow --peer=<id> --port=22 --why=ssh",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_dev_fleet_tunnel_allow)
+
+ZCL_COMMAND_READY_COMMAND(
+    "dev.fleet.tunnel.deny", "dev.fleet.tunnel", "",
+    "Take back one allow row",
+    "Removes the row naming that peer and that port, so the next open for "
+    "it is refused tunnel_target_not_allowed. Live streams the row already "
+    "admitted are ended by closing the entrance, not by this call. Removing "
+    "a row that is not there is refused, never reported as a removal.",
+    ZCL_COMMAND_RESULT_BUDGET, "tunnel,deny,revoke,port,authority,mesh",
+    "zcl.dev_fleet_tunnel_deny.input.v1", "zcl.dev_fleet_tunnel.deny.v1",
+    "peer,port", "peer",
+    "z23 dev fleet tunnel deny --peer=<id> --port=22",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_NODE,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL | ZCL_COMMAND_LANE_ALL_NODE,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_dev_fleet_tunnel_deny)
+
+/* `know` is the same family read from the other side: `truth` and `start`
+ * observe this checkout, and `know` answers from the doctrine rows in
+ * engine/composition/fleet_facts.def, so no specialist has to re-derive the
+ * routing table or the trap list from prose. It hangs here rather than
+ * directly under `dev` because the `dev` branch menu is near its
+ * ZCL_COMMAND_BRANCH_BUDGET; `z23 dev know` still resolves, through the
+ * alias. */
+ZCL_COMMAND_READY_READ(
+    "dev.fleet.know", "dev.fleet", "dev.know",
+    "Ask what the fleet knows about a subject before acting on it",
+    "Answers one subject from engine/composition/fleet_facts.def: which "
+    "executor handles which unit kind, what a train and a proof require, and "
+    "which proof-failure signature names which trap. Each row carries its "
+    "relation, its object, the context it holds in, the row's canonical root "
+    "as provenance, a confidence of doctrine or observed, and one sentence "
+    "saying why. relation and context are optional filters drawn from closed "
+    "vocabularies, and a value outside either is refused with the whole set "
+    "named rather than guessed at. A subject no row answers returns exactly "
+    "one row with confidence unknown, never an empty list. budget_bytes is "
+    "256..16384 and defaults to 4096; a reply cut by it reports truncated "
+    "with the full total, so no row is dropped silently. It reads this "
+    "table and nothing else: no file, no process, no node, no datadir.",
+    16384,
+    "know,facts,doctrine,executor,routing,trap,train,fleet,budget",
+    "zcl.dev_know_input.v1", "zcl.dev_know.v1",
+    "subject,relation,context,budget_bytes", "subject",
+    "z23 dev know --subject=sonnet",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_TINY, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_know)
+
+/* ── dev.train ─────────────────────────────────────────────────────────────
+ * Stacks lanes onto origin/main without waiting on lint. `build` fetches
+ * origin, opens a detached worktree at <checkout-parent>/z23-stack<name>,
+ * cherry-picks each source's origin/main..HEAD commits oldest-first
+ * (skipping doc-regen-only commits by subject), regenerates the generated
+ * docs once, and returns immediately — it never runs lint-fast itself.
+ * `check` is the one deliberate synchronous wait: `make lint-fast` under the
+ * checkout lock, bounded by --timeout. `status` reads every z23-stack*
+ * worktree without mutating anything. `drop` removes a stack worktree, and
+ * refuses one with commits origin/main does not have unless --force. */
+ZCL_COMMAND_BRANCH("dev.train", "dev",
+                   "Stack lanes onto main without waiting on lint",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.train.build", "dev.train", "",
+    "Stack one or more lanes' commits onto origin/main",
+    "Builds <checkout-parent>/z23-stack<name> detached at a freshly fetched "
+    "origin/main, cherry-picks each source's origin/main..HEAD commits "
+    "oldest-first (a source is a worktree directory or a branch resolved in "
+    "this checkout), skips commits whose subject is doc-regen-only, and "
+    "regenerates the generated docs once. Never runs lint-fast itself: on "
+    "success `next` names `dev train check`. A real cherry-pick conflict "
+    "returns state=conflict naming the source and sha and leaves the stack "
+    "worktree exactly as Git left it, mid-cherry-pick, for a human or agent "
+    "to resolve.", 65536,
+    "train,stack,lane,cherry-pick,worktree,land",
+    "zcl.train_build_input.v1", "zcl.train_build.v1", "name,sources", "",
+    "z23 dev train build --name q --source ~/github/z23-stackq2",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_train_build,
+    "stacked-lane construction requires the dev binary",
+    "z23-dev dev train build --name <n> --source <dir-or-ref>")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.train.check", "dev.train", "",
+    "Run lint-fast on a stack worktree and report the gates that failed",
+    "Runs `make lint-fast` synchronously in <checkout-parent>/z23-stack<name> "
+    "under the checkout-wide build lock, bounded by --timeout (default "
+    "900000 ms). Reports ok, the exact FAIL gate names from the run, and the "
+    "full log path. This is the caller's one deliberate wait; `dev train "
+    "build` never runs it inline.", 16384,
+    "train,stack,lint,gate,check",
+    "zcl.train_check_input.v1", "zcl.train_check.v1", "name,timeout_ms", "",
+    "z23 dev train check --name q",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_DEV_ONLY, zcl_native_handle_dev_train_check,
+    "stack lint verification requires the dev binary",
+    "z23-dev dev train check --name <n>")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.train.status", "dev.train", "",
+    "List stack worktrees, their base, and last check verdict",
+    "Every z23-stack* worktree beside this checkout (or just --name), each "
+    "with its base commit, commit count ahead of that base, the last `dev "
+    "train check` verdict recorded on disk (unavailable if check has not "
+    "run), whether dev.land's own queue file exists, and the path it was "
+    "read from -- the state root dev.land itself derives, never a second "
+    "hardcoded path. Reads only; nothing here is fetched or mutated.", 65536,
+    "train,stack,status,land,queue",
+    "zcl.train_status_input.v1", "zcl.train_status.v1", "name", "",
+    "z23 dev train status",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_train_status,
+    "stack status requires the dev binary", "z23-dev dev train status")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.train.drop", "dev.train", "",
+    "Remove a stack worktree",
+    "Removes <checkout-parent>/z23-stack<name> with `git worktree remove`. "
+    "Refuses when the stack carries commits origin/main does not have "
+    "unless --force is given, so a built-but-unlanded stack is never lost "
+    "silently.", 4096,
+    "train,stack,drop,cleanup,worktree",
+    "zcl.train_drop_input.v1", "zcl.train_drop.v1", "name,force", "",
+    "z23 dev train drop --name q",
+    ZCL_COMMAND_EFFECT_DESTRUCTIVE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_train_drop,
+    "stack removal requires the dev binary",
+    "z23-dev dev train drop --name <n>")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.train.keep", "dev.train", "",
+    "Advance one train's unattended state machine by exactly one step",
+    "One bounded pass over <scratch>/train<N>: read KEEP.json, do the single "
+    "step that state allows, persist the new state, return. There is no loop "
+    "and no wait, because the caller is a five-minute timer and the agent "
+    "that opened the train is usually dead by now. idle takes the LAND "
+    "verdicts out of late_picks.txt, refuses unless origin/main still equals "
+    "the queue's base, cherry-picks each lane's merge-base(base,sha)..sha "
+    "with -x -S, runs dev-bin/complexity/lint-gates/lint, regenerates the "
+    "generated docs as one signed commit, writes READY, then runs "
+    "land_pre.sh and launches land_unit.sh only on PRECHECK: OK. landing "
+    "reads dev.land's outcome ledger and, once the tip landed, retires the "
+    "refs named in picks.txt and opens the next train's queue. A conflict, a "
+    "failed gate or a refused precheck sets blocked and STOPS: blocked never "
+    "retries itself, so a broken train costs one message rather than a box. "
+    "--dry-run prints the plan and touches nothing.", 65536,
+    "train,keep,unattended,timer,land,queue,state-machine",
+    "zcl.train_keep_input.v1", "zcl.train_keep.v1", "train,once,dry_run", "",
+    "z23 dev train keep --train=48 --once",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_train_keep,
+    "the unattended train keeper requires the dev binary",
+    "z23-dev dev train keep --train=<N>")
+
+/* ── dev.index ─────────────────────────────────────────────────────────────
+ * Local data-source ingest/search over engine/composition/sources.def (the
+ * board, the experiment ledger, the landing outcomes ledger, and every
+ * *.log under the state root) into one sqlite+FTS5 file,
+ * ~/.local/state/zclassic23/index/index.db by default. `ingest` is
+ * incremental per source, keyed by row identity (a SHA3-256 hash of each
+ * row's raw bytes) so re-reading an already-seen line — a rename, a
+ * restart, a second `ingest` call — never duplicates it; a per-file cursor
+ * is only the optimisation for where to resume reading, verified against a
+ * hash of the file's own already-ingested prefix before it is trusted.
+ * `status` reports rows/newest-ts/bytes-behind/rows_skipped per source,
+ * read-only, and never creates the index if it does not exist yet. `search`
+ * runs one FTS5 MATCH query, optionally scoped to one source, newest-first,
+ * and likewise never creates a missing index. Every leaf accepts
+ * --index=<path> (moves the database) and --state-root=<dir> (moves where
+ * every declared source is read from), independent overrides — neither an
+ * environment variable. See docs/INDEX.md. */
+ZCL_COMMAND_BRANCH("dev.index", "dev",
+                   "Ingest and search local data sources (board/experiments/"
+                   "landing/logs)",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.index.ingest", "dev.index", "",
+    "Ingest new rows from one or every declared source",
+    "Reads each declared source (or just --source=<id>) from its saved "
+    "cursor to the last complete line, inserts one `rows` + `rows_fts` row "
+    "per line whose (source_id, content-hash) is new — an already-seen "
+    "line is silently skipped, never duplicated — and advances the cursor. "
+    "A source naming no files yet, or with no new bytes, is success with "
+    "rows_added=0. rows_skipped counts lines that failed to parse this run "
+    "(malformed, not fatal). A maintenance-tier leaf: it walks real files, "
+    "not already-loaded state, so it is budgeted slower than a read leaf "
+    "(measured ~3.1s over ~48k real rows). --index=<path> and "
+    "--state-root=<dir> override the database location and the sources "
+    "root independently; neither is an environment variable.",
+    65536, "index,ingest,sources,board,experiments,landing,logs,fts5",
+    "zcl.dev_index_ingest_input.v1", "zcl.dev_index_ingest.v1",
+    "source,index,state-root", "",
+    "z23 dev index ingest",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_MAINTENANCE,
+    ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_index_ingest,
+    "index ingest requires the dev binary", "z23-dev dev index ingest")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.index.status", "dev.index", "",
+    "Per-source row counts, newest timestamp, and bytes not yet ingested",
+    "Reads the index database only: for one source or every declared "
+    "source, its row count, the newest ts seen, seconds since that ts, "
+    "bytes_behind (current file size minus the saved cursor offset, summed "
+    "over every file the source currently names), and rows_skipped (lines "
+    "that failed to parse across every ingest so far). Never mutates the "
+    "index, and never creates one — if index.db does not exist yet this "
+    "reports index_exists=false with no per-source data, not an error. "
+    "--index=<path> and --state-root=<dir> override the database location "
+    "and the sources root independently; neither is an environment "
+    "variable.",
+    65536, "index,status,sources,cursor",
+    "zcl.dev_index_status_input.v1", "zcl.dev_index_status.v1",
+    "source,index,state-root", "",
+    "z23 dev index status",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_index_status,
+    "index status requires the dev binary", "z23-dev dev index status")
+
+ZCL_COMMAND_DEV_READ(
+    "dev.index.search", "dev.index", "",
+    "Full-text search over every ingested row, newest first",
+    "One FTS5 MATCH query against the ingested rows (optionally scoped to "
+    "--source=<id>), ordered newest ts first, each hit carrying source, ts, "
+    "and the original line. `key:value` matches the flattened key=value "
+    "tokens a log line or a structured row's fields were indexed under, "
+    "same as a bare word. --limit defaults to 20, capped at 50. Never "
+    "creates a missing index — reports index_exists=false with no hits "
+    "instead. --index=<path> and --state-root=<dir> override the database "
+    "location and the sources root independently; neither is an "
+    "environment variable.", 65536,
+    "index,search,fts5,query,logs",
+    "zcl.dev_index_search_input.v1", "zcl.dev_index_search.v1",
+    "query,source,limit,index,state-root", "query",
+    "z23 dev index search 'kind:result'",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_index_search,
+    "index search requires the dev binary", "z23-dev dev index search")
+
+/* ── dev.agent ─────────────────────────────────────────────────────────────
+ * The checkout questions an agent asks most often, each a native command
+ * instead of a shell recipe:
+ *
+ *   "can this checkout ship?"      — build z23, build jsonq, read
+ *                                    ops telemetry network tor through jsonq,
+ *                                    compare to real_tor
+ *   "run this one test group"      — `make test_parallel ONLY=x` BUILDS and
+ *                                    runs nothing; the runner is
+ *                                    build/bin/test_parallel --only=x
+ *   "does that test notice this?"  — hand-rolled edit/rebuild/run/restore
+ *
+ * These leaves are READY in the release binary: an agent has the plain `z23`
+ * it just built, and a compat leaf redirecting to a second binary would be a
+ * dead end. */
+ZCL_COMMAND_BRANCH("dev.agent", "dev",
+                   "Checkout questions without composing shell",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.ready", "dev.agent", "dev.agent.shippable",
+    "Can this checkout link real Tor and produce a shippable candidate",
+    "Per-check verdict for THIS checkout, read at call time: the vendor "
+    "archives and sqlite3 amalgam a link needs, the vendor/tor submodule and "
+    "its four archives, and which Tor the answering binary actually linked "
+    "(the same weak-symbol fact network telemetry reports as tor_build). "
+    "shippable is true only when all of them hold. It builds nothing and "
+    "contacts no node; blocker and next_action name the exact command that "
+    "fixes the first failing check.", 8192,
+    "ready,ship,tor,worktree,prime,vendor,link,candidate",
+    "zcl.command.empty_input.v1", "zcl.agent_ready.v1", "", "",
+    "z23 dev agent ready",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_ready)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.test", "dev.agent", "dev.agent.group",
+    "Run one registered test group and report what actually RAN",
+    "Freshly executed verdict from build/bin/test_parallel with --no-cache, "
+    "parsed from the runner's own SUITE VERDICT line: groups_ran, "
+    "groups_failed, groups_gated, groups_cached, self_skips and "
+    "env_unobserved. ok is true only when at least one group EXECUTED and "
+    "none failed — a selector that matched nothing, a run served from cache, "
+    "and a red group each refuse with the command that fixes them. The group "
+    "name is resolved against the registered catalog before anything runs.",
+    8192,
+    "test,group,run,parallel,suite,verdict,ran,proof",
+    "zcl.agent_test_input.v1", "zcl.agent_test_run.v1",
+    "group,exact,timeout_ms", "group",
+    "z23 dev agent test --group=hex_codec",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_test)
+
+ZCL_COMMAND_READY_COMMAND(
+    "dev.agent.mutate", "dev.agent", "dev.agent.mutation",
+    "Break one source line and prove a test group notices",
+    "Whether one registered test group FAILS when one named source line is "
+    "deterministically broken. The command establishes a green baseline "
+    "first, writes the original bytes to build/agent-mutate before editing, "
+    "rebuilds, runs the group, then restores the file and rebuilds again; "
+    "noticed_by is 'compiler', 'test_group', or 'nothing'. 'nothing' means "
+    "that line's coverage proves nothing. An interrupted run leaves a "
+    "pending backup and the next call refuses until --restore=true clears "
+    "it. It never touches a datadir, a wallet, or any file outside the "
+    "checkout.", 8192,
+    "mutate,mutation,coverage,assertion,proof,notice,restore",
+    "zcl.agent_mutate_input.v1", "zcl.agent_mutation_check.v1",
+    "file,line,group,restore", "file",
+    "z23 dev agent mutate --file=platform/modules/base/src/hex.c --line=42 "
+    "--group=hex_codec",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_PERSISTENT, ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_agent_mutate)
+
+/* ── dev.agent.* lane discipline ───────────────────────────────────────────
+ * Checkout questions whose right answer differs between a standalone clone
+ * and a linked worktree, so the situation is computed rather than assumed
+ * and the rules are a table
+ * (engine/composition/agent_rules.def) rather than prose. Each leaf takes an
+ * optional `cwd` so a fixture repository can be inspected instead of the
+ * process working directory, and every reply names its own `leaf`. */
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.situation", "dev.agent", "",
+    "Name this checkout's situation and how it was decided",
+    "Whether this directory is a standalone clone or one linked worktree "
+    "among several, decided by comparing the Git directory with the Git "
+    "common directory at call time. Reports both paths as Git prints them, "
+    "the worktree top level, the branch (empty when HEAD is detached), the "
+    "head commit, and the exact shell test that produced the verdict. It "
+    "reads Git only; it fetches nothing, writes nothing, and contacts no "
+    "node.", 4096,
+    "agent,situation,worktree,checkout,branch,head",
+    "zcl.agent_situation_input.v1", "zcl.agent_situation.v1", "cwd", "",
+    "z23 dev agent situation",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_situation)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.rules", "dev.agent", "",
+    "The rules that apply in one checkout situation",
+    "The compiled rule table in engine/composition/agent_rules.def, rendered "
+    "whole or filtered to one situation. Each row carries its topic, the "
+    "situation it applies in, a space-free machine value, and the whole "
+    "reason in the words the agent should read. An unknown situation is "
+    "refused by name rather than answered with an empty set. The table is "
+    "compiled in; nothing is read from disk.", 16384,
+    "agent,rules,situation,push,gate,history",
+    "zcl.agent_rules_input.v1", "zcl.agent_rules.v1", "cwd,situation", "",
+    "z23 dev agent rules --situation=standalone",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_rules)
+
+/* ── dev.agent.orient ──────────────────────────────────────────────────────
+ * The checkout's own answer to "what is already known about this?". Every row
+ * it returns carries the file it was read from and a literal anchor a lint
+ * gate re-proves on every commit, so an agent reads source only for the gap
+ * the table does not cover. See docs/zrc/0006-knowledge-in-the-checkout.md.
+ *
+ * It nests under dev.agent rather than becoming a new `dev` child because
+ * the top-level `dev` menu is at its ZCL_COMMAND_BRANCH_BUDGET (see
+ * tools/lint/check_describe_budget.sh); it sits next to dev.agent.rules and
+ * dev.agent.start. */
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.orient", "dev.agent", "",
+    "What this checkout already knows, as verified rows",
+    "The compiled fact table in engine/composition/facts/: the topic listing "
+    "with a row count each, one topic's rows, or the rows whose key, claim or "
+    "path contain a substring. Every row carries the repo-relative path it "
+    "was read from and a literal anchor that tools/lint/check_orient_facts.sh "
+    "proves still exists in that file, so a row that stopped being true fails "
+    "the build instead of misleading a reader. An undeclared topic is refused "
+    "by name; an empty query result is reported as a true count of zero. The "
+    "table is compiled in — nothing is read from disk and no process runs.",
+    65536,
+    "agent,orient,facts,knowledge,topic,query,rows",
+    "zcl.dev_orient_input.v1", "zcl.dev_orient.v1", "topic,query", "topic",
+    "z23-dev dev agent orient landing.proof",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_orient)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.start", "dev.agent", "",
+    "One opening answer: situation, rules, base, worktree",
+    "The whole opening read for a lane in one call: the situation, the rules "
+    "that apply in it, the base ref and its head (base_known=false when the "
+    "ref does not exist here), how many tracked files are dirty, how many are "
+    "untracked, whether a hooks path is configured and armed, whether each "
+    "named file exists, the ordered next actions, and one next_action equal " 
+    "to the gate_command value for this situation. It runs no test group, "
+    "builds nothing, and changes nothing.", 16384,
+    "agent,start,orient,base,hooks,next",
+    "zcl.agent_start_input.v1", "zcl.agent_start.v1", "cwd,files,base", "",
+    "z23 dev agent start",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_start)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.done", "dev.agent", "",
+    "Whether this lane is ready to hand back",
+    "A freshly read hand-back verdict for the current branch: whether the "
+    "tree is clean, how many commits it carries over the base, which of them "
+    "Git reports as unsigned, and whether the branch is main. ready is true "
+    "only when every one of those holds, and every false condition is named "
+    "in reasons instead of collapsing into one word. It pushes nothing and "
+    "gates nothing.", 8192,
+    "agent,done,handback,signed,ahead,clean",
+    "zcl.agent_done_input.v1", "zcl.agent_done.v1", "cwd,base", "",
+    "z23 dev agent done",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_done)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.triage", "dev.agent", "",
+    "Bin every local branch as land, rebase, or delete",
+    "One bin per local branch except main, decided from Git alone: commits "
+    "ahead and behind the base, the age of the last commit, and whether "
+    "merge-tree can merge it into the base without conflict. A branch with "
+    "nothing ahead, or an old branch far behind, is delete; a cleanly "
+    "merging branch is land; everything else is rebase. It merges nothing, "
+    "deletes nothing, and writes no ref.", 65536,
+    "agent,triage,branches,merge,stale,land",
+    "zcl.agent_triage_input.v1", "zcl.agent_triage.v1",
+    "cwd,base,max_age_days,limit", "",
+    "z23 dev agent triage --base=origin/main",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_triage)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.ceiling", "dev.agent", "",
+    "Refuse a diff that outgrew what was requested",
+    "Whether the working tree's whole change against a base stays inside the "
+    "scope it was given: every changed file measured in added and deleted "
+    "lines, marked as requested or not, as a new file or not, as a rewrite "
+    "when it deleted more than half of what the base held, and as over the "
+    "per-file line ceiling. The verdict is WITHIN_CEILING only when no file "
+    "violates any of those; otherwise every violation is named with its "
+    "reason.", 65536,
+    "agent,ceiling,diff,scope,rewrite,requested",
+    "zcl.agent_ceiling_input.v1", "zcl.agent_ceiling.v1",
+    "cwd,base,requested,ceiling_lines", "base",
+    "z23 dev agent ceiling --base=origin/main",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_ceiling)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.pace", "dev.agent", "",
+    "Read an executor run log and grade its pace",
+    "What a headless executor run actually DID, counted from its own log: "
+    "how many tool calls it made, how many of them came before its first "
+    "edit, how many edits it made and to which files, how many commits it "
+    "ran, and the exit code the log recorded. The verdict is WROTE_NOTHING "
+    "when no edit ever happened, SLOW_START when the first edit came after "
+    "the tenth tool call, and PACED otherwise. Terminal escape sequences are "
+    "stripped before anything is matched.", 32768,
+    "agent,pace,log,executor,edits,verdict",
+    "zcl.agent_pace_input.v1", "zcl.agent_pace.v1", "cwd,log", "log",
+    "z23 dev agent pace --log=build/scratch/run.out",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_pace)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.outcomes", "dev.agent", "",
+    "Route units to models from the unit-outcome ledger",
+    "Per-model executor evidence read at call time from a unit-outcome "
+    "JSONL ledger: attempts, pass and failure buckets, pass rate, total "
+    "completion tokens, and the failure-class histogram per model, plus one "
+    "routing recommendation per model with enough attempts and a constant "
+    "closing line stating verdicts come from receipts. A malformed ledger "
+    "line is counted and skipped, never fatal. With usage_log (a JSONL "
+    "file or directory) it also folds per-event model token usage from Muse "
+    "host session logs and Claude Code transcripts, deduplicated by event "
+    "id, keeping unreported counters explicit. It reads only the named "
+    "paths and writes nothing.", 32768,
+    "agent,outcomes,ledger,model,route,executor,receipt",
+    "zcl.agent_outcomes_input.v1", "zcl.agent_outcomes.v1",
+    "ledger,model,since,usage_log", "ledger",
+    "z23 dev agent outcomes --ledger=build/scratch/outcomes.jsonl",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_outcomes)
+
+ZCL_COMMAND_READY_READ(
+    "dev.agent.reviewscore", "dev.agent", "",
+    "Score reviews against known answers",
+    "Reads a JSONL set of cases labelled sound or defect (defects carry "
+    "file and line ranges) and a JSONL file of reviews, and returns integer "
+    "counts and num/den pairs: sound cases rejected, seeded defects "
+    "accepted, by defect class, plus unreviewed cases. A finding without a "
+    "file, a positive line or a kind of CHANGE or CLAIM is discarded and "
+    "counted. A finding hits a defect when file matches exactly, line is "
+    "within the range plus tolerance, and kind matches the locus (CHANGE "
+    "with code, CLAIM with claim). A duplicate case id or a malformed set "
+    "line refuses the set. It also reports whether the defect cases are "
+    "independent: at most 3 per base change and 8 per class. It reads only "
+    "the named paths and writes nothing. A review may carry a raw reply "
+    "instead of findings; its FINDING lines are parsed, and a reply that "
+    "cannot be read is counted and not scored.", 32768,
+    "agent,review,score,reviewscore,known-answer,defect,sound",
+    "zcl.agent_reviewscore_input.v1", "zcl.agent_reviewscore.v1",
+    "set,reviews", "set",
+    "z23 dev agent reviewscore --set=cases.jsonl --reviews=reviews.jsonl",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_reviewscore)
+
+/* claim WRITES a ledger line into the Git common directory, so it takes the
+ * same command shape dev.begin takes rather than the read shape above. */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.agent.claim", "dev.agent", "",
+    "Claim files for one story so lanes do not collide",
+    "Records this worktree's exclusive interest in a set of files as one "
+    "line in a ledger beside the shared object store, and refuses when any "
+    "of them is already live in another worktree's claim, naming the file, "
+    "that worktree, and its story. A second claim from the same worktree "
+    "replaces its own line rather than stacking, and release removes every "
+    "line this worktree owns. Explicit retire_worktree archives exact legacy "
+    "rows only for an absent, unregistered owner; leases remain protected. "
+    "It writes only development coordination state; it touches no "
+    "source file, ref, datadir, or wallet.", 16384,
+    "agent,claim,ledger,files,lane,conflict",
+    "zcl.agent_claim_input.v1", "zcl.agent_claim.v1",
+    "cwd,story,files,release,retire_worktree", "story",
+    "z23-dev dev agent claim hex-codec",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_agent_claim,
+    "the file-claim ledger is a development-lane coordination surface",
+    "z23-dev dev agent claim")
+
+/* ── dev.agent.hot ─────────────────────────────────────────────────────────
+ * Rung 1 of the evidence ladder: the cheapest check that can refute a
+ * change runs first. One saved file maps to the verdict of its owning test
+ * group — the same file-to-proof route code.tests reports — without the
+ * agent composing shell. When a resident dev loop owns this checkout it
+ * already built the changed module and hot-swapped it, so the group runs
+ * against that swap (mode hotswap); otherwise the runner is rebuilt first
+ * (mode rebuild). A file no rule owns is UNRESOLVED, never a silent pass. */
+ZCL_COMMAND_READY_READ(
+    "dev.agent.hot", "dev.agent", "",
+    "Run one saved file's owning test group, hot or rebuilt",
+    "A freshly executed verdict for the one group that owns the saved file: "
+    "the owning group resolved by the same file-to-proof route code.tests "
+    "reports (or the explicit override), the SUITE VERDICT counts from "
+    "build/bin/test_parallel --no-cache, whether the run executed a "
+    "hot-swapped module, and the whole-leaf wall clock. ok is true for a "
+    "verdict in every case — PASS, FAIL, NOSHA and UNRESOLVED alike — and "
+    "false only when no verdict exists: a missing path, a file outside the "
+    "inspected directory, or a runner that could not start.", 8192,
+    "agent,hot,evidence,ladder,proof,hotswap,rebuild,verdict",
+    "zcl.agent_hot_input.v1", "zcl.agent_hot.v1",
+    "path,group,cwd", "path",
+    "z23 dev agent hot --path=tools/command/native_devagent_hot.c",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_hot)
+
+/* ticketkey answers the commuting-ticket question from
+ * docs/agent/COMMUTING_TICKETS.md: the SHA3-256 key of one group's input
+ * closure (its test file, every source the shared-rule router assigns to
+ * it, their transitive headers, the toolchain epoch, the harness version)
+ * at one tip. A push that leaves the closure alone keeps the key, so only
+ * groups whose closure intersects the diff need re-proof. */
+ZCL_COMMAND_READY_READ(
+    "dev.agent.ticketkey", "dev.agent", "",
+    "Commuting-ticket key of one test group at one tip",
+    "The SHA3-256 ticket key of a test group's input closure at a tip: the "
+    "group's test file, every source file the shared-rule router assigns "
+    "to the group, the headers those files include transitively (vendor "
+    "headers by path only, system headers out), the toolchain epoch, and "
+    "the harness version. Reports the sorted closure paths, the resolved "
+    "tip, the epoch, and the key, plus the wall time. Reads Git only; it "
+    "fetches nothing, writes nothing, and contacts no node.", 65536,
+    "agent,ticketkey,commuting,closure,group,proof",
+    "zcl.agent_ticketkey_input.v1", "zcl.agent_ticketkey.v1",
+    "group,cwd,tip", "",
+    "z23 dev agent ticketkey --group=devagent_situation",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_agent_ticketkey)
+
+/* ── dev.ci ────────────────────────────────────────────────────────────────
+ * One read-only screen over this host's CI and landing state. It lives under
+ * `dev` because every source it reads already does: dev.land owns the landing
+ * queue, dev.agent.queue owns unit dispatch, dev.proof owns receipts. This
+ * leaf adds no state of its own — it calls those siblings in-process and
+ * renders their answers, and the two mutating views name the exact sibling
+ * command instead of running a second mutation path. */
+ZCL_COMMAND_DEV_READ(
+    "dev.ci", "dev", "",
+    "Answer every CI and landing question from one screen",
+    "Composition only: every fact is read in-process from dev.land "
+    "(action=status), dev.agent.queue (action=status) and dev.proof.status, "
+    "and `sources` names each sibling with whether it answered and how long "
+    "it took. --topic selects one of nine views -- status, queue, jobs, "
+    "last_pass, last_fail, worker, receipt, cancel, retry -- into `data` plus "
+    "one human `screen` unless json=true. This leaf creates no file, "
+    "directory, lock or ledger and runs nothing: cancel and retry NAME the "
+    "exact existing command (`dev land cancel --seq=`, `dev agent queue "
+    "cancel --name=`, `dev proof retry --local_commit= --remote_base=`). "
+    "Absent evidence is never a pass and never a zero. Worker health is "
+    "derived only from claim rows a worker itself wrote; no claim, an "
+    "unnamed claim or one older than an hour reads unknown or stale, never "
+    "healthy. receipt resolves the remote base a commit was proved against "
+    "from the proof cache's own receipt names and the landing row, then asks "
+    "dev.proof.status for each pair's validated verdict; a commit with no "
+    "receipt reports unknown, and a failing landing row whose base cannot be "
+    "resolved emits no retry command rather than guessing one.", 65536,
+    "ci,status,queue,jobs,receipt,worker,cancel,retry,land,proof",
+    "zcl.dev_ci_input.v1", "zcl.dev_ci.v1",
+    "topic,sha,root,json", "topic",
+    "z23-dev dev ci receipt --sha=9afd46726",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_ci,
+    "the landing and unit queues are development-lane state",
+    "z23-dev dev ci")
+
+/* ── dev.fleet.ship (alias dev.ship) ───────────────────────────────────────
+ * Native preflight and plan of a fleet deploy (tools/command/native_dev_ship.c),
+ * the first phase of retiring tools/ship.sh. It builds, stages and restarts
+ * nothing yet. */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.fleet.ship", "dev.fleet", "dev.ship",
+    "Preflight and plan a fleet deploy without touching any host",
+    "Runs tools/ship.sh's preflight in its order and returns the plan: "
+    "targets and configured SSH alias names (an address-shaped destination "
+    "reads target-<n>), clean tree, HEAD against freshly fetched "
+    "origin/main (behind refuses; ahead refuses because this leaf never "
+    "pushes), source id from tools/dev/source-identity.sh, the gate stamp "
+    "under ~/.cache/zcl-ship (banked only with skip_gate), and the "
+    "persistent-schema one-way verdict against origin/main with ship.sh's "
+    "0/1/2 contract. dry_run returns verdict ready or refuse with its class; "
+    "otherwise a refusal fails and a ready plan is BLOCKED, because phase 1 "
+    "deploys nothing. Its only write is the origin fetch.", 16384,
+    "ship,deploy,fleet,preflight,plan,gate,schema,dry_run",
+    "zcl.dev_ship_input.v1", "zcl.dev_ship.v1",
+    "targets,dry_run,skip_gate,accept_one_way,root", "",
+    "z23-dev dev ship --dry_run --targets=remote",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_PERSISTENT,
+    ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_ship,
+    "fleet deploy planning reads the development checkout",
+    "z23-dev dev ship")
+
+/* ── dev.land ──────────────────────────────────────────────────────────────
+ * The landing service: an agent submits a tip and returns in milliseconds,
+ * a driver steps the queue, and the agent learns the outcome by
+ * pulling. step drives
+ * one beat under a host-wide, non-blocking slot lock — rebase onto
+ * origin/main, lint, ASK for the exact proof, return — and a later step
+ * reads the proof's own answer and fast-forwards origin/main. */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.land", "dev", "",
+    "Queue a tip; attach signed Git intent, prove and push without waiting",
+    "attest_only reports bounded self-image/source, exact unsealed seq410 pair, "
+    "time and two fixture booleans; service origin stays UNKNOWN. It returns "
+    "before all mutations. submit queues a signed related tip; status reads "
+    "the queue and exact proof handoff. step serializes rebase, lint, proof "
+    "request and receipt-gated push in the private worktree. drive bounds that "
+    "sequence and releases its lock during proof. attach seals an exact proven "
+    "pair; attach_publish seals and performs its current-base publication beat "
+    "under one lock. Optional base/head pins refuse changed pairs; wait_ms "
+    "bounds explicit attach_publish proof waiting. hold/release retain a per-sequence "
+    "publication hold; held rows may prove but never seal or push. Both refuse "
+    "unknown or sealed rows. status exposes the hold. cancel refuses unresolved "
+    "push checkpoints. fence_replace binds an explicit paired successor. "
+    "Outcomes retain provenance and normal native mail receipts. No shell.", 65536,
+    "land,submit,attach,attach_publish,step,drive,status,hold,release,cancel,queue,proof,push,rebase,async",
+    "zcl.land_input.v1", "zcl.land.v1",
+    "action,tip,worktree,note,seq,base,head,wait_ms,json", "action",
+    "z23-dev dev land drive",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_PERSISTENT,
+    ZCL_COMMAND_COST_HIGH,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_land,
+    "the landing queue is a development-lane coordination surface",
+    "z23-dev dev land")
+
+/* ── dev.land.window ───────────────────────────────────────────────────────
+ * The two-lander LAND-WINDOW mail protocol
+ * (tools/command/native_dev_land_window.c). */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.land.window", "dev.proof", "",
+    "Read or announce the two-lander LAND-WINDOW proving windows",
+    "open reads the agent mail dir and lists windows another host announced "
+    "as 'LAND-WINDOW <host>, candidate <sha10> on base <sha10>, proving now, "
+    "expected done HH:MMZ.' that no later row from the same sender closed "
+    "with LANDED or RELEASED naming the candidate and whose expected-done "
+    "time is still ahead (next UTC day when earlier than the row), with "
+    "seconds_left and max_seconds_left (0 when none); unparsable rows are "
+    "skipped and counted. announce posts that row once as a note to * with "
+    "ref astra-board-runs through the dev.agent.mail post path; a second "
+    "announce of the same host, candidate and base finds its own prior "
+    "outbox row and reports already_announced. now overrides the clock for "
+    "tests. No shell, no network.", 16384,
+    "land,window,mail,lander,proof,coordination",
+    "zcl.land_window_input.v1", "zcl.land_window.v1",
+    "action,host,seq,candidate,base,expected_done,now,grace_s", "action",
+    "z23-dev dev land window --action=open --host=hosta",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_land_window,
+    "landing windows are a development-lane coordination surface",
+    "z23-dev dev land window")
+
+/* ── dev.lane ──────────────────────────────────────────────────────────────
+ * An agent worktree with the proof's vendored dependencies primed onto
+ * independent inodes. Hardlinks are forbidden: they bump the shared inode's
+ * ctime and refuse every in-flight proof whose seal covered that file. */
+ZCL_COMMAND_BRANCH("dev.lane", "dev",
+                   "Agent worktree with independent inodes",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.lane.new", "dev.lane", "",
+    "Create an agent worktree and clone proof dependencies onto new inodes",
+    "Creates a detached git worktree at --path from --base when <path>/.git "
+    "is absent, initialises vendor/tor when submodule status starts with '-', "
+    "and materialises vendor/tor/libtor.a, every vendor/tor/src/ext archive, "
+    "vendor/lib, vendor/include, build/githooks, and the hotswap rollback "
+    "fixtures from this checkout using file_clone (never link/linkat). "
+    "Runs make -s install-hooks in the worktree. Returns path, HEAD, the "
+    "count of newly materialised files, libtor_links (must be 1), and "
+    "hooks_installed.", 65536,
+    "lane,worktree,vendor,tor,proof,clone,inode",
+    "zcl.lane_new_input.v1", "zcl.lane_new.v1", "path,base", "",
+    "z23-dev dev lane new --path=$HOME/.z23/lanes/example --base=HEAD",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_lane_new,
+    "agent worktree construction requires the dev binary",
+    "z23-dev dev lane new --path=<abs> --base=<ref>")
+
+/* ── dev.agent.queue ───────────────────────────────────────────────────────
+ * The fleet's unit dispatch as a typed, non-blocking API instead of shell.
+ * A poster appends one durable row and returns; a scheduler step takes the
+ * oldest queued row, finds a free warm worktree in the pool, and launches
+ * the harness detached; a reaper collects receipts into outcomes and
+ * requeues rate-limit refusals; status renders one human screen. No verb
+ * blocks on a model, a build, or another process: a long-lived loop is the
+ * caller's business (a timer calling next+reap). */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.agent.queue", "dev.agent", "",
+    "Post, dispatch, reap, inspect async flash-unit runs",
+    "One durable unit queue over the owner-private state root: post appends "
+    "a row {seq, kind, name, group, path, brief, model, attempt} to "
+    "queue/queue.jsonl with a single O_APPEND write (refused QUEUE_FULL at "
+    "64 queued rows); next and claim take the READY queued row with the "
+    "lowest (priority 0..3, seq) whose depends_on row completed, under a "
+    "short flock; next finds a warm worktree in queue/pool.txt "
+    "that is free, and launches the unit harness detached with the same "
+    "argv the interim shell used; reap collects receipts newer than the "
+    "reap stamp into queue/outcomes.jsonl and requeues a rate-limit refusal "
+    "with attempt+1 up to 3; status reports queued, running, recent "
+    "outcomes, and pool occupancy. Bodies and paths are validated: no path "
+    "outside the repo or state dir, no name outside [A-Za-z0-9_.-]{1,64}. "
+    "It touches no network and never waits for a run.", 65536,
+    "agent,queue,post,dispatch,reap,status,async,worktree,flash",
+    "zcl.agent_queue_input.v1", "zcl.agent_queue.v1",
+    "action,kind,name,group,path,brief,model,attempt,priority,depends_on,json,cwd,worker,session,terminate",
+    "action",
+    "z23 dev agent queue post --kind=leaf --name=situation",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_agent_queue,
+    "the unit queue is a development-lane coordination surface",
+    "z23-dev dev agent queue")
+
+/* ── dev.agent.worker ──────────────────────────────────────────────────────
+ * The resident dev-only loop that consumes dev.agent.queue continuously.
+ * It claims ONE job (queue claim persists claim.json first), runs the
+ * wired executor bounded (CPU/memory/wall-clock/token caps), judges the
+ * outcome through the required gate (a model "completed" is never PASS),
+ * records receipt plus run.out for the existing reap, and posts a result
+ * mail row under the SAME ref. Restarts adopt un-submitted orphans and
+ * crash-record submitted ones without ever resubmitting. The production
+ * executor seam waits on C's muse_session; until then the leaf refuses
+ * to run a job. No consensus, wallet, deploy, or push authority. */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.agent.worker", "dev.agent", "",
+    "Consume the unit queue with a bounded worker",
+    "One active job per worker over the owner-private state root: claim "
+    "takes the oldest unfinished row and persists the claim identity "
+    "before any model submission; the executor runs forked under "
+    "RLIMIT_CPU/RLIMIT_AS with a wall-clock watchdog (on Windows: a "
+    "restricted low-integrity child in a kill-on-close Job Object with "
+    "the same memory and CPU caps, writing only its run dir and named "
+    "worktree; WORKER_CONFINEMENT_UNAVAILABLE names the missing "
+    "capability when that cannot arm, and nothing runs); the gate writes "
+    "receipt verdict pass only for the executor's own pass/PASS with rc "
+    "0, a present candidate, evidence, and fitting tokens; reap collects "
+    "the outcome and a result mail row carries the flat record under the "
+    "same ref. Restart adoption runs un-submitted orphans exactly once "
+    "and crash-records submitted ones. Queued cancel prevents claim; "
+    "grant revoke cancels queued rows and blocks later stages, while a "
+    "running row still needs its worker's explicit authority. It touches "
+    "no network and never polls a "
+    "model: only local queue files are waited on.\n\n"
+    "action=status answers READ-ONLY and creates nothing: resident is "
+    "held|free|unknown from a non-blocking flock probe of the EXISTING "
+    "worker.lock, opened without O_CREAT so a probe never creates it; queued "
+    "and running are counted from the ledger WITHOUT queue.lock, since a row "
+    "is one O_APPEND line and status must not delay the drive it describes; "
+    "job is set only when a running row and its claim.json prove one. A held "
+    "lock is liveness, not work. Degraded cases carry one closed token: "
+    "state-root-unavailable, worker-lock-absent, worker-lock-unreadable, "
+    "queue-ledger-absent, queue-ledger-unreadable, claim-unreadable. It "
+    "claims, reaps, mails, sleeps and runs nothing.",
+    16384,
+    "agent,worker,resident,claim,gate,result",
+    "zcl.agent_worker_input.v1", "zcl.agent_worker.v1",
+    "action,worker,session,model,deadline_s,idle_start_s,idle_limit_s,max_jobs,time_cap_s,cpu_s,mem_mb,token_cap",
+    "action",
+    "z23 dev agent worker status --worker=resident-a",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_MODERATE,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_agent_worker,
+    "the resident worker is a development-lane coordination surface",
+    "z23-dev dev agent worker")
+
+/* ── dev.agent.receive ─────────────────────────────────────────────────────
+ * The resident receiver that removes the human from cross-box work: a
+ * directive arriving in this box's agent mail wakes the loop, is admitted
+ * against the EXISTING owner-minted fleet.steer grant store, becomes a
+ * dev.agent.queue row under its own ref, and is answered to the sender
+ * under that same ref. It executes nothing — dev.agent.worker's separate
+ * resident loop runs the job and posts the result — so a long model turn
+ * can never block intake, status, or delivery. Admission means the owner
+ * has NAMED a sender: nothing in this tree signs or verifies a peer's mail
+ * row today, so this is not authenticated delivery.
+ * The preflight action decides ONE directive's admission (ref, from,
+ * sender_binding, body; to defaults to the receiver) through the same
+ * pipeline and reports PREPARED, decided, or the refused code, writing
+ * nothing: no mail, no queue row, no brief, no answer. The executor stays
+ * operator-determined, never preflight-verified. */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.agent.receive", "dev.agent", "",
+    "Turn agent-mail directives into queued work",
+    "Each beat, directive "
+    "pages are pulled in-process from a durable cursor (receive/intake."
+    "state), four a beat, advanced after each handled page; status shows "
+    "intake_failures and intake_last_error. "
+    "A row is admitted only when it is addressed to this receiver, carries "
+    "a ref matching [A-Za-z0-9_.-]{1,64}, names a sender a live "
+    "grant in steer/grants.jsonl labels with the send scope, and carries a "
+    "well-formed muse-workspace/muse-scope/muse-gate direction. THE WIRE "
+    "CARRIES A SELECTOR AND THIS BOX RESOLVES IT: muse-workspace is either "
+    "the selector `receiver` (or `.`), resolved to the ONE workspace "
+    "`workspace` names, or an absolute path, unchanged for the same-box "
+    "case. Anything else refuses SELECTOR_UNKNOWN; "
+    "with nothing configured a selector refuses UNCONFIGURED; "
+    "a workspace absent, not its own realpath (\"..\" or "
+    "a symlink escape), or not a git checkout with a resolvable HEAD "
+    "refuses MISSING, ESCAPE or NOT_A_CHECKOUT; an optional muse-sha must "
+    "name that HEAD or refuses SHA_MISMATCH; tracked paths diverging from "
+    "its index refuse DIRTY early. The RESOLVED path goes into the brief. "
+    "Resolution reads files, never spawns. Received bytes, brief "
+    "and record are stored "
+    "apart: a known ref reconciles when the RECEIVED body is "
+    "byte-identical, is a conflict when it differs, and is never "
+    "re-resolved, so restarting elsewhere cannot move decided work. Nothing "
+    "is queued or executed twice. An accept is posted only after the queue "
+    "took the row, carrying its seq, the brief digest and the workspace "
+    "record (selector, path digest, HEAD, tree id — never the path). run "
+    "holds one flock singleton, wakes on the mail watcher, stops on "
+    "SIGTERM; status surveys from the start and writes nothing; preflight "
+    "reports one directive's admission, writing nothing.", 16384,
+    "agent,receive,resident,mail,directive,admission,queue,ref,workspace",
+    "zcl.agent_receive_input.v1", "zcl.agent_receive.v1",
+    "action,receiver,workspace,deadline_s,wait_ms,max_beats,ref,from,"
+    "sender_binding,body,to",
+    "action",
+    "z23 dev agent receive status --receiver=box-a",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_agent_receive,
+    "the resident receiver is a development-lane coordination surface",
+    "z23-dev dev agent receive")
+
+/* ── dev.agent.mail ────────────────────────────────────────────────────────
+ * Async, non-blocking agent mail. A poster appends one JSON row to the local
+ * outbox and returns; a reader re-pulls past its cursor when it wants; ack
+ * persists the cursor. Nothing blocks on a peer or a model: no network, no
+ * sleep, no poll loop. Delivery between hosts is a transport's job (one
+ * inbox file per peer); this leaf only writes and reads local files. */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.agent.mail", "dev.agent", "",
+    "Post, pull, and ack async agent mail",
+    "One append-only, cursor-based mail primitive over the owner-private "
+    "state root: post appends a row {seq, ts, from, to, kind, body, ref} to "
+    "mail/outbox.jsonl with a single O_APPEND write, and returns delivery "
+    "(exported when the board carries the row to another box, else local, "
+    "with a hint when a name matches no roster box), plus the optional "
+    "sender_binding stamping which credential sent it, since from is a "
+    "claim and a reader that dispatches work needs more than a name; pull "
+    "returns board_post and board_signer (64 hex each, \"\" when absent) "
+    "that a board-carrying transport appended, for the receiver to verify; "
+    "pull reads every *.jsonl under mail/ in (ts, from, seq) order as ONE bounded "
+    "page (at most 64 rows, about 16 KiB) with truncated and a next_since "
+    "token; passing next_since back as since returns the next page, so "
+    "following it drains any history, every row exactly once; ack "
+    "persists the cursor. Bodies over 4 KiB or mentioning a key, an onion "
+    "address, an IP, ANY absolute path, or a path token climbing out with a "
+    "'..' segment are refused with a typed error, never a crash: a body "
+    "crosses hosts, so no root and no cwd is consulted and identical bytes "
+    "get one verdict everywhere. It touches no network and never waits.",
+    32768,
+    "agent,mail,post,pull,ack,async,cursor,fleet",
+    "zcl.agent_mail_input.v1", "zcl.agent_mail.v1",
+    "action,to,kind,body,since,from,cursor,agent,ref,sender_binding,cwd",
+    "action,cursor",
+    "z23 dev agent mail post --to=* --kind=note --body=hello",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_dev_agent_mail,
+    "agent mail is a development-lane coordination surface",
+    "z23-dev dev agent mail")
+
+/* ── dev.agent.mail.wait ───────────────────────────────────────────────────
+ * Bounded blocking companion of dev.agent.mail pull
+ * (tools/command/native_devagent_mail_wait.c). */
+ZCL_COMMAND_DEV_READ(
+    "dev.agent.mail.wait", "dev.agent", "",
+    "Wait for the next mail row after a cursor",
+    "Blocks up to timeout_ms for a mail row newer than since that matches "
+    "the to, ref, from and kind filters of dev.agent.mail pull, then "
+    "returns the same page and next_since token pull would; following "
+    "next_since never repeats a row. On timeout it returns a typed "
+    "WAIT_TIMEOUT failure carrying the unchanged since. It wakes on mail "
+    "directory changes, re-checks at least every 2 seconds, never posts and "
+    "never acks.", 32768,
+    "agent,mail,wait,cursor,fleet", "zcl.agent_mail_wait_input.v1",
+    "zcl.agent_mail.v1", "since,to,ref,from,kind,timeout_ms", "since",
+    "z23 dev agent mail wait --since=0 --to=me --timeout_ms=30000",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_PERSISTENT, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_agent_mail_wait,
+    "agent mail waiting is a development-lane coordination surface",
+    "z23-dev dev agent mail wait")
+
+/* ── dev.test.fast_plan ────────────────────────────────────────────────────
+ * Native plan-json of tools/agent_fast_ci.sh (tools/command/native_dev_fast_plan.c).
+ * Maps the changed-file set to focused test groups and the next command,
+ * under schema zcl.agent_fast_plan.v1. Read-only; spawns git only. Refuses
+ * the cache-enabled and affected-unit verdicts it does not yet derive. */
+ZCL_COMMAND_DEV_READ(
+    "dev.test.fast_plan", "dev.test", "",
+    "Plan the fast gate: changed files, test groups and next command",
+    "Reads the changed set the way agent_fast_ci.sh does (ZCL_FAST_CHANGED_FILES, "
+    "ZCL_FAST_CHANGED_FILES_FILE, and unless ZCL_FAST_CHANGED_FILES_ONLY is set "
+    "the ZCL_FAST_BASE range plus git diff, index and untracked lists), maps "
+    "each path through the compiled AGENT_IMPACT_RULE table and reports the "
+    "selected groups, unmapped code changes, the compile plan and the "
+    "recommended command. Requires ZCL_FAST_CACHE=0: the green-input cache "
+    "verdict needs source identity and is refused rather than guessed. "
+    "Creates no file and runs nothing but git.", 32768,
+    "fast,plan,gate,impact,test-groups,changed-files", "zcl.dev_fast_plan_input.v1",
+    "zcl.agent_fast_plan.v1", "", "",
+    "z23 dev test fast_plan",
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_fast_plan,
+    "the fast-gate plan is a development-lane surface",
+    "z23-dev dev test fast_plan")
+
+/* ── dev.factory ───────────────────────────────────────────────────────────
+ * Read-only factory waste report (tools/command/native_dev_factory.c). */
+ZCL_COMMAND_DEV_READ(
+    "dev.agent.factory", "dev.agent", "dev.factory",
+    "Report factory waste over a window",
+    "Reads the devbuild job ledger, the land outcomes ledger, the proof "
+    "attempt directories and the host pressure files for the last hours "
+    "(default 48, 1..720) and reports per job class counts, wait and run "
+    "percentiles, failures, duplicate non-land jobs, lander and lane busy "
+    "percentages, lane-side lint, land outcome counts with the top "
+    "non-landed details, short proof refusals, superseded proofs, "
+    "per test-selection cost, memory, io and cpu pressure and /dev/shm "
+    "use. A malformed ledger line is counted and skipped, an oversized one "
+    "is counted and refused, an absent source is reported as absent. It "
+    "reads only and writes nothing.", 32768,
+    "factory,waste,devbuild,land,proof,pressure,measure",
+    "zcl.dev_factory_input.v1", "zcl.dev_factory.v1", "hours", "",
+    "z23-dev dev factory --hours=48", ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_factory,
+    "factory measurement reads dev-lane state and needs the dev binary",
+    "z23-dev dev factory")
+
+/* ── dev.beta6 ─────────────────────────────────────────────────────────────
+ * Preflight for the optional beta6 bootstrap-snapshot server
+ * (engine/services/src/beta6_bootstrap_serve.c, docs/BOOTSTRAPPING.md). */
+ZCL_COMMAND_BRANCH("dev.beta6", "dev",
+                   "Preflight a beta6 bootstrap serve tree",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_READY_READ(
+    "dev.beta6.verify", "dev.beta6", "",
+    "Verify a beta6 serve tree without arming a running node",
+    "The exact beta6_bs_arm() preflight boot runs, called from this "
+    "standalone process only: refuses a top level holding anything besides "
+    "blocks/ and chainstate/ before touching the anchor or hashing a byte, "
+    "then arms, reports the resolved manifest (version, height, "
+    "block_tip_height, file_count, snapshot_bytes, which sidecar resolved "
+    "it, and its encoded size against the one-P2P-message cap), and "
+    "disarms. A running node's own armed state is a separate process's "
+    "memory and is never read or written.", 0,
+    "beta6,bootstrap,verify,serve,anchor,snapshot,fastsync",
+    "zcl.dev_beta6_verify_input.v1", "zcl.dev_beta6_verify.v1",
+    "source_dir,network", "source_dir",
+    "z23 dev beta6 verify /srv/beta6-serve --network=main",
+    ZCL_COMMAND_LAYER_DEV, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_MAINTENANCE,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_DETERMINISTIC | ZCL_COMMAND_TRAIT_IDEMPOTENT |
+        ZCL_COMMAND_TRAIT_DEV_ONLY,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_dev_beta6_verify)
+
+/* ── dev.app.machine ──────────────────────────────────
+ * The built-in RISC-V machine (platform/modules/rvmachine) as a command:
+ * tools/command/native_dev_machine_boot.c. It sits under dev.app as the
+ * machine tier an App can run in; dev.machine.boot stays as an alias. */
+ZCL_COMMAND_BRANCH("dev.app.machine", "dev.app",
+                   "Run a guest in the built-in RISC-V machine",
+                   ZCL_COMMAND_LAYER_DEV)
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.app.machine.boot", "dev.app.machine", "dev.machine.boot",
+    "Boot a RISC-V kernel in the built-in machine and report the run",
+    "Boot RV64 ELF/flat; disk optional. Report stop, work, console, "
+    "script/overlay/inputs. max_instr bounds retired+firmware+device "
+    "work, including started 4096-byte disk/entropy rounds. Ordinary runs use "
+    "no host clock. type_after sends [marker,text] on console suffixes; until "
+    "stops after its last step. Goals, faults, limits, input changes and "
+    "transcript errors fail with evidence. Transcripts need fresh paths. "
+    "No chain/network access. test_entropy_seed is repeatable, NOT secure; "
+    "early_seed test requires that seed and ELF, supplies 2048 insecure bytes "
+    "and reports clearing. entropy host uses OS RNG, excludes test seeds and "
+    "permits early_seed host; failure refuses. No source means no "
+    "entropy device. OS delivery proves neither guest RNG readiness nor key safety. "
+    "accepted_kernel checks installed output byte limits before/after; "
+    "guest recipes remain unqualified. public_kernel reads bounded fixed PUBLIC "
+    "copied CAS observations. protected_kernel selects separate "
+    "fixed protected image/evidence. Neither observation installs software or "
+    "proves licensing. public_unlock accepts only the PUBLIC literal fixture; "
+    "no arbitrary credential, private identity, transcript or SSH readiness. "
+    "protected_unlock requires current invocation authority and either native "
+    "OS-RNG INITIAL creation or an existing locked credential. Persisted "
+    "autostart configuration is separate. ports allows one/two test-only "
+    "regular input/expect pairs, 65536 total bytes: exact replies and consumption "
+    "within the work budget, no host transport or secrets. docs/RISCV_MACHINE.md.", 8192,
+    "machine,riscv,rv64,boot,kernel,emulator,freebsd,console,transcript,deterministic",
+    "zcl.dev_machine_boot_input.v1", "zcl.dev_machine_boot.v1",
+    "kernel,accepted_kernel,public_kernel,protected_kernel,builtin_kernel,disk,ram_mib,bootargs,max_instr,until,type_after,transcript,"
+    "test_entropy_seed,early_seed,ports,entropy,public_unlock,protected_unlock,data_disk,home", "",
+    "z23-dev dev app machine boot --input='{\"kernel\":\"<kernel>\","
+    "\"max_instr\":1000000000,\"until\":\"mountroot>\"}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_DETERMINISTIC,
+    zcl_native_handle_dev_machine_boot,
+    "booting a guest machine is a development-lane surface",
+    "z23-dev dev app machine boot")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.app.machine.snapshot", "dev.app.machine", "",
+    "Boot a RISC-V kernel to its goals and save the machine to a snapshot file",
+    "Boots exactly as dev.app.machine.boot (kernel, disk, ram_mib, bootargs, "
+    "max_instr, type_after, until, transcript, test_entropy_seed, entropy, "
+    "early_seed), then writes the machine to snapshot_out: a mode 0600 file "
+    "created under a temporary name, flushed and renamed; an existing path is "
+    "never replaced. The file holds the hart, interrupt controller, timer, "
+    "serial port, firmware state, console input queues, a per-slot device "
+    "table, the non-zero 4 KiB pages of RAM, the disk overlay blocks and a "
+    "SHA-256 trailer, bound to the sha256 of the kernel and disk. It never "
+    "holds the boot seed buffer or a host entropy source. Refused by name: "
+    "machines with byte ports, retained writable disks, private keyfile ports, "
+    "a boot seed still in guest memory, or no declared entropy mode. Take the "
+    "snapshot before any long-lived key exists in the guest. The file holds all "
+    "guest memory, including any keys present; mode 0600 is its only "
+    "protection. The trailer is an unkeyed SHA-256: it detects corruption, not "
+    "tampering. The guest resumes at the guest time of the snapshot; the "
+    "machine has no host clock. "
+    "docs/RISCV_MACHINE.md, Snapshots.", 8192,
+    "machine,riscv,rv64,snapshot,save,restore,freebsd,deterministic",
+    "zcl.dev_machine_snapshot_input.v1", "zcl.dev_machine_snapshot.v1",
+    "kernel,disk,ram_mib,bootargs,max_instr,until,type_after,transcript,"
+    "test_entropy_seed,early_seed,entropy,snapshot_out", "kernel,snapshot_out",
+    "z23-dev dev app machine snapshot --input='{\"kernel\":\"<kernel>\","
+    "\"disk\":\"<disk>\",\"snapshot_out\":\"<file>\",\"until\":\"# \"}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_DETERMINISTIC,
+    zcl_native_handle_dev_machine_snapshot,
+    "saving a guest machine is a development-lane surface",
+    "z23-dev dev app machine snapshot")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.app.machine.resume", "dev.app.machine", "",
+    "Continue a RISC-V guest from a snapshot file",
+    "Reads the snapshot file once, checks its format and machine model versions, "
+    "SHA-256 trailer (unkeyed: a corruption check, not authenticity), kernel "
+    "sha256 and disk binding before any state is used, builds the machine "
+    "without booting "
+    "and runs it on with type_now (typed at once), type_after, until, max_instr, "
+    "transcript (post-restore output only) and snapshot_out (the end state). disk_verify full (default) "
+    "hashes the whole disk image; size compares only its size and is named "
+    "size_only in the receipt; snapshot_out needs full. mode replay continues bit for bit and gives the "
+    "guest the random pool the snapshot holds: it is labelled NOT FOR USE WITH "
+    "SECRETS and is refused for snapshots taken with the host entropy device. "
+    "mode fresh (default) needs such a snapshot, taken after the guest attached "
+    "its entropy driver: it runs the guest until the device has delivered 4096 "
+    "new bytes (at most 60000 ms of guest time, else refused as "
+    "FRESH_NO_HARVEST) before any typed input, and reports the measured harvest. "
+    "It refreshes the kernel pool at the guest's next read only: processes "
+    "running at save time keep their generator state and kernel arc4random "
+    "users may repeat for up to 300 s, so the snapshot must predate every "
+    "long-running process that uses randomness. Restoring a snapshot you did "
+    "not make runs a guest someone else prepared. The receipt carries restored, mode, the "
+    "snapshot digest and the instructions executed since restore. The disk is "
+    "only read; guest writes stay in memory. docs/RISCV_MACHINE.md, "
+    "Snapshots.", 8192,
+    "machine,riscv,rv64,snapshot,resume,restore,freebsd,deterministic",
+    "zcl.dev_machine_resume_input.v1", "zcl.dev_machine_resume.v1",
+    "snapshot,kernel,disk,disk_verify,mode,type_now,type_after,until,max_instr,"
+    "transcript,snapshot_out", "snapshot,kernel",
+    "z23-dev dev app machine resume --input='{\"snapshot\":\"<file>\","
+    "\"kernel\":\"<kernel>\",\"disk\":\"<disk>\",\"mode\":\"replay\","
+    "\"type_now\":\"uname -a\\n\",\"until\":\"# \"}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY | ZCL_COMMAND_TRAIT_DETERMINISTIC,
+    zcl_native_handle_dev_machine_resume,
+    "resuming a guest machine is a development-lane surface",
+    "z23-dev dev app machine resume")
+
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.app.machine.data", "dev.app.machine", "",
+    "Create, grow or inspect an expandable guest data disk",
+    "Data disks are sparse files at home/.z23/guests/NAME/data.img (home "
+    "defaults to $HOME; directories 0700, file 0600) that dev app machine "
+    "boot attaches with data_disk. create makes NAME of size_mib; grow "
+    "extends it while no machine holds it (offline; smaller or equal sizes "
+    "are refused); status reports apparent and allocated bytes and a state of "
+    "free, locked (a run holds it) or unavailable (it cannot be opened). "
+    "Names match [a-z0-9][a-z0-9-]{0,31}; the limit is 1 TiB. "
+    "Refusals: DATA_DISK_NAME_INVALID, DATA_DISK_TOO_LARGE, DATA_DISK_EXISTS, "
+    "DATA_DISK_ABSENT, DATA_DISK_SHRINK_REFUSED, DATA_DISK_LOCKED, "
+    "DATA_DISK_DIRECTORY_REFUSED, DATA_DISK_NOT_REGULAR, DATA_DISK_OPEN_FAILED, "
+    "DATA_DISK_CREATE_FAILED, DATA_DISK_GROW_FAILED, DATA_DISK_ATTACH_FAILED, "
+    "DATA_DISK_NOT_AVAILABLE (boot with public_unlock). "
+    "docs/RISCV_MACHINE.md.", 2048,
+    "machine,riscv,guest,disk,storage,persistent",
+    "zcl.dev_machine_data_input.v1", "zcl.dev_machine_data.v1",
+    "action,name,size_mib,home", "",
+    "z23-dev dev app machine data --input='{\"action\":\"create\","
+    "\"name\":\"work\",\"size_mib\":1024}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_machine_data,
+    "guest storage is a development-lane surface",
+    "z23-dev dev app machine data")
+
+/* dev.app.machine.shell connects the machine's console to the caller's
+ * terminal: tools/command/native_dev_machine_shell.c. */
+ZCL_COMMAND_DEV_COMMAND(
+    "dev.app.machine.shell", "dev.app.machine", "",
+    "Boot a RISC-V kernel in the built-in machine and attach its console to this terminal",
+    "Interactive and not repeatable: stdin and stdout are the guest console "
+    "(raw terminal mode, restored on every exit) or, with stdio \"pipe\", plain "
+    "byte streams. Escape prefix (default Ctrl-]) then q ends the session; "
+    "the prefix twice sends it once. EOF ends it when console output is quiet "
+    "for eof_quiet_ms. Idle guest time follows the host clock; the entropy "
+    "device and ELF boot seed come from the host OS CSPRNG. max_instr is an "
+    "optional work cap. The envelope follows the console bytes on stdout; "
+    "receipt names a new file that also receives it. docs/RISCV_MACHINE.md.", 4096,
+    "machine,riscv,rv64,shell,console,terminal,interactive,freebsd",
+    "zcl.dev_machine_shell_input.v1", "zcl.dev_machine_shell.v1",
+    "kernel,disk,ram_mib,bootargs,max_instr,escape,stdio,eof_quiet_ms,receipt", "",
+    "z23-dev dev app machine shell --input='{\"kernel\":\"<kernel>\","
+    "\"disk\":\"<disk>\",\"bootargs\":\"-s vfs.root.mountfrom=ufs:/dev/vtbd0p3\"}'",
+    ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_DEV_MUTATION,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OPERATOR,
+    ZCL_COMMAND_MODE_SYNC, ZCL_COMMAND_LATENCY_BACKGROUND,
+    ZCL_COMMAND_COST_HIGH, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_DEV_ONLY,
+    zcl_native_handle_dev_machine_shell,
+    "an interactive guest console is a development-lane surface",
+    "z23-dev dev app machine shell")

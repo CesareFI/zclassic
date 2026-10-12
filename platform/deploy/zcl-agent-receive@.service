@@ -1,0 +1,223 @@
+# Copyright 2026 Rhett Creighton. Licensed under Apache-2.0.
+[Unit]
+Description=Z23 resident mail receiver for agent identity %i (admits directives, queues work, runs nothing itself)
+# ONE PER BOX, and the instance name is this box's OWN mail identity — the
+# name peers address their directives to — not a checkout name. A second
+# copy is not a second worker: it refuses at once, because the loop holds
+# <state>/receive/receive.lock exclusively with flock(2) and a second drive
+# reports RECEIVE_BUSY instead of waiting.
+#
+# WHAT IT DOES. It waits on the mail directory with a directory watcher, and
+# on every wake it pulls kind=directive rows addressed to %i, admits the ones
+# an owner-minted fleet.steer grant names, writes each admitted direction to
+# a brief file under the owner-private state root, posts it to the existing
+# dev.agent.queue under the directive's own ref, and answers the sender under
+# that same ref with the queue sequence and the brief digest. A refusal
+# answers under the same ref with its reason. That is the whole job.
+#
+# WHERE THE WORK HAPPENS. A remote sender cannot carry this box's paths — it
+# does not know them, and dev.agent.mail refuses a body naming ANY absolute
+# path, since a body crosses hosts and a sender's path means nothing here —
+# so a directive names the workspace logically (`muse-workspace: receiver`)
+# and THIS box resolves it to the one workspace the operator configured through
+# Z23_RECEIVE_WORKSPACE_FLAG below — which ships EMPTY, so a selector is
+# refused until someone chooses. The receiver writes the resolved absolute
+# path into the brief, so the worker and the Muse executor still receive a
+# real absolute path.
+#
+# WHAT IT DOES NOT DO. It does not execute anything, build anything, grade
+# anything, or spawn a process. Execution belongs to the dev.agent.worker
+# resident loop, which posts the result row under the same ref. This unit
+# runs NO node: no datadir, no P2P or RPC port, no wallet, no listener. It
+# therefore cannot touch the operator's live node or any lane's datadir.
+#
+# WHAT ADMISSION PROVES, PLAINLY. A grant of the owner's naming a sender
+# label. Nothing in the tree signs or verifies an agent-mail row today: an
+# inbox.<peer>.jsonl file's provenance is its filename plus whatever
+# transport wrote it. So "admitted" means "an owner-minted grant names this
+# sender", never "this sender was cryptographically authenticated". Signed
+# peer ingress exists only for fleet.ledger.replicate and fleet.board.post;
+# routing directives over that signed board is the future path, and until
+# then the honest threat model is: anyone who can write this box's mail
+# directory can speak as any granted label.
+#
+# Deliberately NOT installable at boot: there is no [Install] section, so
+# `systemctl --user enable` refuses until the operator adds one on purpose.
+#
+# Install (the operator does this, never an agent). Step one installs the
+# QUALIFIED image and is not optional: this unit runs ~/.local/bin/z23-dev,
+# not a checkout's build output, so that the receiver and the worker are one
+# candidate rather than two binaries that happen to share a tree. Point the
+# link at the exact binary that passed the gates:
+#   install -Dm755 build/bin/z23-dev \
+#     ~/.local/lib/z23/"$(sha256sum build/bin/z23-dev | cut -c1-64)"/z23-dev
+#   ln -sfn \
+#     ~/.local/lib/z23/"$(sha256sum build/bin/z23-dev | cut -c1-64)"/z23-dev \
+#     ~/.local/bin/z23-dev
+#   ls -l ~/.local/bin/z23-dev          # a symlink into the sha256 store
+#   cp platform/deploy/zcl-agent-receive@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start zcl-agent-receive@box-a
+#   systemctl --user status zcl-agent-receive@box-a
+#   journalctl --user -u zcl-agent-receive@box-a -f
+#   z23-dev dev agent receive status --receiver=box-a
+#
+# Grant a sender before starting it, or every directive is refused:
+#   z23 fleet steer grant --action=mint --scopes=send --label=<peer> --ttl_seconds=<seconds>
+#   z23 fleet steer grant --action=revoke --id=<id>   # effective on the next beat
+#
+# Linger, so the receiver survives logout like every other resident service:
+#   loginctl enable-linger "$USER"
+#
+# Remove completely:
+#   systemctl --user stop zcl-agent-receive@box-a
+#   rm ~/.config/systemd/user/zcl-agent-receive@.service
+#   systemctl --user daemon-reload
+#   rm -rf ~/.local/state/z23/dev/receive
+
+# A crashed receiver should come back, but one that cannot start must not
+# spin: five failures in ten minutes and systemd gives up. "Cannot start"
+# here is an honest refusal — another receiver holds the lock, the state root
+# is unwritable, or the mail directory cannot be watched — and none of those
+# is fixed by retrying.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# THE CWD DECIDES NOTHING, AND THAT IS NEW. It used to be load-bearing for
+# one reason only: dev.agent.mail resolved a checkout root from the process
+# working directory and allowed absolute paths under it, so the verdict on a
+# fixed directive body moved with the directory the process happened to run
+# in. That dependence is gone — a mail body crosses hosts, so every absolute
+# path in one is refused with no root and no cwd consulted — and nothing left
+# in this loop reads the cwd: the state root comes from platform_state_root(),
+# the workspace comes from the flag below, and both are absolute. The cwd is
+# therefore the filesystem root, where no relative path can resolve to
+# anything this unit may write, so a future relative path is a loud failure
+# instead of a quiet dependence on where systemd started the process.
+WorkingDirectory=/
+
+# One process that parks in a directory-watcher wait and, on each wake,
+# appends a few small files. It is neither a compile nor a scan, and it must
+# always lose to the live node and the dev lanes.
+CPUQuota=50%
+CPUWeight=10
+IOWeight=10
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+# Sized to fit under check-systemd-memory-budget beside the live node, the
+# mind and the dev lanes. A beat holds one mail pull's rows and one brief; if
+# a future direction format ever needs more, raise this on purpose and re-run
+# the budget gate rather than dropping the cap.
+MemoryHigh=256M
+MemoryMax=512M
+MemorySwapMax=128M
+TasksMax=32
+OOMScoreAdjust=500
+
+# THE ONE WORKSPACE THIS RECEIVER RESOLVES TO. A remote sender writes
+# `muse-workspace: receiver` — a logical selector, never a path — and this
+# box turns that into exactly this directory. The OPERATOR names it here,
+# because nothing a peer writes may ever name a local path. Point one
+# instance at one workspace; a second workspace is a second box's business,
+# not a routing table.
+#
+# It must be an absolute path with no ".." segment. The receiver
+# canonicalizes it with realpath and works from the canonical form, so a
+# workspace reached through a symlinked component resolves to the one real
+# directory (and that real path is what the brief, the pin and the evidence
+# record name). A path that will not resolve at all fails closed.
+#
+# SHIPPED EMPTY, ON PURPOSE. Nobody but the operator can choose which tree
+# an agent works in, so this unit ships choosing nothing: a selector
+# directive is then refused RECEIVE_WORKSPACE_UNCONFIGURED, detail
+# `no-workspace-configured`, which an operator reading the journal can match
+# to this paragraph. That is the honest answer to "you never configured a
+# workspace". A default pointing at a checkout would instead blame whatever
+# state that tree happens to be in — RECEIVE_WORKSPACE_DIRTY about a tree
+# the operator never chose. Same-box directives that name their own
+# absolute path keep working either way: that branch never consults this
+# setting.
+#
+# THE VARIABLE HOLDS THE WHOLE FLAG, not just the path, so that empty means
+# zero arguments. Measured on this host with systemd-run, printing one line
+# per argv entry:
+#   Environment=WSFLAG=              ... $WSFLAG   -> [A] [B]
+#   Environment=WSFLAG=              ... ${WSFLAG} -> [A] [] [B]
+#   Environment=WSFLAG=--workspace=/srv/wt ... $WSFLAG -> [--workspace=/srv/wt]
+# Braced ${VAR} keeps an EMPTY ARGUMENT, which would reach the leaf as
+# `--workspace=` and fail normalize with INVALID_INPUT ("invalid type or
+# range for input key 'workspace'") — so the shipped unit would crash-loop
+# to StartLimitBurst before it could refuse anything honestly. Unquoted
+# single-dollar $VAR word-splits and drops to nothing when empty, which is
+# why the line below is written that way. Absent flag: the leaf drives
+# normally and reports workspace:"".
+#
+# Configure one instance without editing this file:
+#   systemctl --user edit zcl-agent-receive@box-a
+#   [Service]
+#   Environment=Z23_RECEIVE_WORKSPACE_FLAG=--workspace=%h/.z23/lanes/yourlane
+Environment=Z23_RECEIVE_WORKSPACE_FLAG=
+
+# THE BINARY IS THE INSTALLED ONE, NEVER A CHECKOUT'S BUILD OUTPUT. The
+# receiver and the dev.agent.worker resident are ONE candidate: if they
+# resolve their executable through different paths, or through a path whose
+# contents change under them, the pair is not running one qualified image and
+# a proof about it says nothing. A checkout's build/bin/ is exactly such a
+# path — it is a working tree, so it is dirty and rebuilt whenever someone is
+# working — so both units run the installed binary instead.
+#
+# %h/.local/bin/ is the content-addressed install this host already uses.
+# `ls -l ~/.local/bin/z23` on this box shows a symlink, not a file: it points
+# at ~/.local/lib/z23/<64 hex chars>/z23, one directory per sha256 of the
+# image, so the link NAME stays put while its TARGET names the exact bytes.
+# Replacing the image is a relink, so a restart picks up the new one and
+# nothing is ever rewritten in place under a running process. Install z23-dev
+# the same way (below).
+#
+# The first token stays a literal absolute path: %h is a systemd specifier
+# and is expanded before argv is built, while an ${VAR} as the executable is
+# refused outright.
+#
+# deadline_s bounds a single drive. The drive exits 0 when that deadline
+# elapses, so Restart=on-failure leaves the unit dead and the box looks
+# idle while directives stay queued. Restart=always starts the next drive
+# after that exit. `systemctl stop` still stops the unit. The start limit
+# above still refuses a binary that exits in a tight loop. Every decision
+# is re-derived from files on the next drive, so a restart between beats
+# neither loses a ref nor executes one twice.
+ExecStart=%h/.local/bin/z23-dev dev agent receive run --receiver=%i $Z23_RECEIVE_WORKSPACE_FLAG --deadline_s=86400 --wait_ms=1000
+
+# The resident handles SIGTERM cooperatively: it stops taking new work at the
+# next check, the watcher wait returns within its stop-sample slice, and the
+# drive finishes the beat it is in. A ref's record cannot be torn by that —
+# the brief is installed by rename(2) and the queue row is the queue's own
+# single append.
+KillMode=control-group
+TimeoutStopSec=60
+
+Restart=always
+RestartSec=30
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Exactly the path a beat writes, and nothing else: this box's owner-private
+# dev state root, which holds mail, grants, briefs, received bodies, evidence
+# records, queue rows and answered markers. Every one of those goes through
+# platform_state_root(), so the dev binary writes nothing beside itself and
+# the install store stays read-only — the fail-closed answer for the image
+# this unit is running.
+#
+# The WORKSPACE is not here either. This loop only READS it (.git, HEAD, a
+# ref or packed-refs, and the index) to resolve a selector, pin a muse-sha
+# and check the pre-state; ProtectHome=read-only still allows every one of
+# those reads. Writing a workspace is the worker's job, under the worker's
+# own unit, which grants it there. A receiver that cannot write a checkout
+# cannot damage one. It never writes a datadir and never reads one.
+ReadWritePaths=%h/.local/state/z23
+
+StandardOutput=journal
+StandardError=journal

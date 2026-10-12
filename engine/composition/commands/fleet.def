@@ -1,0 +1,695 @@
+/* The owner's private fleet ledger. Consumer defines ZCL_COMMAND_*.
+ *
+ * Leaves under the existing `fleet` root (declared once, in
+ * engine/composition/commands/fleet_board.def, alongside the fleet board and
+ * wiki) rather than a root of its own: `fleet` already exists as a wire
+ * contract, and a second ZCL_COMMAND_BRANCH row for the same path is a
+ * path collision the registry refuses to build with.
+ *
+ * Every leaf here answers from local files. Nothing contacts a peer, and
+ * nothing prints a row's contents anywhere a row could leave this machine.
+ * See docs/FLEET_LEDGER.md. */
+
+ZCL_COMMAND_BRANCH("fleet.ledger", "fleet", "Write and inspect the ledger",
+                   ZCL_COMMAND_LAYER_OPS)
+
+ZCL_COMMAND_READY_COMMAND( /* a writer */
+    "fleet.ledger.add", "fleet.ledger", "",
+    "Append one signed row to this box's own chain",
+    "Appends one row to this machine's chain and returns its sequence "
+    "number. kind is usage, task or vitals; subject is that kind's own "
+    "closed vocabulary, so a vitals subject outside the declared catalog is "
+    "refused. Measurements are passed as named pairs; a pair that is not "
+    "passed is absent, which is a different fact from zero and is stored as "
+    "one. note is a short label such as a task id. The row is signed by this "
+    "node's delegated online key and carries its master key as the writer, "
+    "both read from the datadir; a box with no filed delegation cannot "
+    "write. It contacts no peer.", 0,
+    "fleet,ledger,usage,tokens,vitals,append,record",
+    "zcl.fleet_ledger_add.input.v1", "zcl.fleet_ledger_add.v1",
+    "kind,subject,note,tokens_in,tokens_out,tokens_cached,tokens_reasoning,"
+    "wall_ms,turns,tool_uses,cost_micro_usd,value,count,bytes,limit",
+    "kind,subject",
+    "z23 fleet ledger add --kind=usage --subject=grok --tokens_in=1200",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_fleet_ledger_add)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.ledger.status", "fleet.ledger", "",
+    "Per box: rows held, last sequence, and how stale the replica is",
+    "Reports every chain this machine holds — its own and one replica per "
+    "paired peer — with the rows held, the last sequence number, and the age "
+    "of the newest row in seconds. A replica answers instantly and that is "
+    "not the same as answering currently, so the age is always reported and "
+    "never rounded away. Also reports what the load cost, whether the index "
+    "had to fold any row out of its per-day window, how many peers the "
+    "replication lane refused because their delegation was no longer "
+    "current, and how many arriving batches found no free commit slot. It "
+    "contacts no peer and prints no row contents.", 8192,
+    "fleet,ledger,status,replica,freshness,boxes",
+    "zcl.command.empty_input.v1", "zcl.fleet_ledger_status.v1", "", "",
+    "z23 fleet ledger status",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_ledger_status)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.usage", "fleet", "",
+    "What every box spent, per provider, over the last days",
+    "Sums the usage rows every chain here holds over a window of whole UTC "
+    "days, grouped by box and provider, with cached tokens counted apart "
+    "from the rest. Absent measurements are reported absent, never as zero. "
+    "Where a quota row states a weekly cap for a provider, the share of it "
+    "already spent is reported too. No peer is asked. The ledger is opened "
+    "fresh on every call, which reads every chain from disk and re-verifies "
+    "every row's signature before the index is walked; the two costs are "
+    "reported separately as load_us and index_us so the claim can be "
+    "checked rather than believed. days is 1 to the index window and "
+    "defaults to 7; a longer "
+    "window is refused rather than answered from days the index does not "
+    "hold.", 16384,
+    "fleet,usage,tokens,spend,provider,quota,week",
+    "zcl.fleet_usage.input.v1", "zcl.fleet_usage.v1",
+    "days,provider,box", "",
+    "z23 fleet usage --days=7",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_usage)
+
+ZCL_COMMAND_BRANCH("fleet.vitals", "fleet", "Sample this box into the ledger",
+                   ZCL_COMMAND_LAYER_OPS)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.vitals.sample", "fleet.vitals", "",
+    "Measure this box and append one signed vitals row per catalog metric",
+    "Reads host facts through the platform seam once and appends one signed "
+    "vitals row per catalog metric. An unknown id is refused by name. A fact "
+    "this platform cannot measure is stored ABSENT, never as zero. Optional "
+    "id samples one metric. It contacts no peer.", 0,
+    "fleet,vitals,sample,load,memory,disk",
+    "zcl.fleet_vitals_sample.input.v1", "zcl.fleet_vitals_sample.v1",
+    "id", "",
+    "z23 fleet vitals sample",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_fleet_vitals_sample)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.objectives", "fleet", "",
+    "Every objective z23 optimizes, its current value, target, and status",
+    "Prints one row per id in the closed catalog "
+    "(engine/composition/objectives.def): the objective id, the one file or "
+    "command its value is read from, whether lower or higher is better, "
+    "the current value, the target, the unit, and a status of met, unmet, "
+    "or unmeasured(<reason>). landing_latency_s and "
+    "landing_attempts_per_train read the landing outcomes ledger; "
+    "proof_lint_wall_s and proof_test_wall_s read the newest landing "
+    "attempt's phases.txt; commits_landed_today runs a local `git log` "
+    "through the no-shell spawn seam; lint_families_over_ceiling counts "
+    "oversized files under tools/lint/lintc; "
+    "functions_over_complexity_cap counts the cyclomatic baseline's rows "
+    "when that file exists. A value this tree cannot measure today is "
+    "reported unmeasured with the reason named, never as a fabricated "
+    "zero. outcomes, attempts_dir, repo, lintc_dir and baseline override "
+    "the five paths a producer reads, for pointing the command at a "
+    "fixture. It contacts no peer and writes nothing.",
+    8192,
+    "fleet,objectives,goals,targets,status,catalog",
+    "zcl.fleet_objectives_input.v1", "zcl.fleet_objectives.v1",
+    "outcomes,attempts_dir,repo,lintc_dir,baseline", "",
+    "z23-dev fleet objectives",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_PROSE,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_objectives)
+
+ZCL_COMMAND_BRANCH("fleet.experiment", "fleet",
+                   "Record and query delegation experiments",
+                   ZCL_COMMAND_LAYER_OPS)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.experiment.predict", "fleet.experiment", "",
+    "Append one signed predict row for a delegated task",
+    "Appends one kind=experiment subject=predict row to this machine's chain "
+    "and returns its sequence number. task_id is the note two rows of one "
+    "delegation link by. task_class, harness, model and effort are closed "
+    "vocabularies; a name that is not in the field's table, or the named "
+    "member unknown, is refused by that field's name rather than stored. "
+    "tokens and wall_s are the predicted cost, absent when omitted. It "
+    "contacts no peer.", 0,
+    "fleet,experiment,predict,delegation,tokens",
+    "zcl.fleet_experiment_predict.input.v1", "zcl.fleet_experiment_predict.v1",
+    "task_id,task_class,story,executor,harness,model,effort,tokens,wall_s,"
+    "outcome,note",
+    "task_id",
+    "z23 fleet experiment predict --task_id=u1 --task_class=read "
+    "--harness=manual --model=grok --effort=low --tokens=1200 --wall_s=30",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_fleet_experiment_predict)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.experiment.result", "fleet.experiment", "",
+    "Append one signed result row for a delegated task",
+    "Appends one kind=experiment subject=result row to this machine's chain "
+    "and returns its sequence number. task_id is the note that pairs it with "
+    "the predict, when one was written. task_class, model and outcome are "
+    "closed vocabularies; a name that is not in the field's table, or the "
+    "named member unknown, is refused by that field's name rather than "
+    "stored. in, out, cache, reasoning, tool_uses, turns, wall_s, added, "
+    "removed and defects are the measured cost, absent when omitted. A "
+    "result with no matching predict is stored and later counted as "
+    "unpredicted. It contacts no peer.", 0,
+    "fleet,experiment,result,delegation,outcome",
+    "zcl.fleet_experiment_result.input.v1", "zcl.fleet_experiment_result.v1",
+    "task_id,task_class,story,executor,harness,model,effort,in,out,cache,"
+    "reasoning,tool_uses,turns,wall_s,outcome,added,removed,defects,note",
+    "task_id",
+    "z23 fleet experiment result --task_id=u1 --task_class=read "
+    "--model=grok --outcome=LAND --in=800 --out=200 --wall_s=28",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_fleet_experiment_result)
+
+ZCL_COMMAND_BRANCH("fleet.triggers", "fleet",
+                   "The closed registry of local-event reactions",
+                   ZCL_COMMAND_LAYER_OPS)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.triggers.list", "fleet.triggers", "",
+    "Print the closed trigger registry",
+    "Prints every declared trigger (engine/composition/triggers.def): its "
+    "id, the source it reads, the field/op/value it matches, the action it "
+    "performs, and why it exists. Reads only the compiled-in registry; it "
+    "touches no file and contacts no peer.", 16384,
+    "fleet,triggers,registry,list",
+    "zcl.command.empty_input.v1", "zcl.fleet_triggers_list.v1", "", "",
+    "z23-dev fleet triggers list",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_IDEMPOTENT | ZCL_COMMAND_TRAIT_PROSE,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_triggers_list)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.triggers.check", "fleet.triggers", "",
+    "Run every trigger once against whatever is new in its source",
+    "Reads each source (landing outcomes, this box's board file, the "
+    "experiment TSV, ingested GitHub comment rows) from its own saved byte "
+    "cursor, evaluates every registered trigger against every row that is "
+    "new since last time, performs the matched action (print, append to "
+    "triggers/fired.jsonl, or post a fleet board note), and advances the "
+    "cursor past what it read. since, in seconds, skips evaluating a row "
+    "whose own timestamp is older than that; dry-run performs the same "
+    "actions but never moves the cursor, so a re-run sees the same rows "
+    "again. It starts no daemon: one call reads what is new and returns. "
+    "A board_post action reaches the local running node the same way "
+    "`fleet board post` does and fails closed when none answers; every "
+    "other action stays purely local.",
+    0,
+    "fleet,triggers,check,run,evaluate",
+    "zcl.fleet_triggers_check.input.v1", "zcl.fleet_triggers_check.v1",
+    "since,dry-run", "",
+    "z23-dev fleet triggers check --since=3600",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ | ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_PROSE,
+    zcl_native_handle_fleet_triggers_check)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.triggers.ingest", "fleet.triggers", "",
+    "Append already-fetched GitHub discussion comment rows to the "
+    "github_comments trigger source",
+    "z23 has no outbound HTTP seam, so this never reaches GitHub itself: a "
+    "tiny external adapter fetches new comments (e.g. via `gh api`) and "
+    "writes them as one JSON object per line, and this leaf validates and "
+    "appends the ones that carry every field the github_comments source "
+    "needs (kind, owner, repo, number, comment_id, author, url, body, ts) "
+    "to <state>/zclassic23/triggers/github_comments.jsonl. A line missing "
+    "a field is skipped, not fatal, so re-feeding an overlapping fetch "
+    "costs nothing; the per-source byte cursor `fleet triggers check` "
+    "already keeps is what actually prevents re-firing after a restart. "
+    "source is closed to \"github\". It contacts no peer.",
+    0,
+    "fleet,triggers,ingest,github,comments",
+    "zcl.fleet_triggers_ingest.input.v1", "zcl.fleet_triggers_ingest.v1",
+    "source,file", "source,file",
+    "z23-dev fleet triggers ingest --source=github --file=/path/comments.jsonl",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_WRITE,
+    ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_fleet_triggers_ingest)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.experiment.stats", "fleet.experiment", "",
+    "Per task_class and model: counts, LAND rate, medians, predicted-vs-actual",
+    "Walks the experiment events this machine's index kept and prints one "
+    "line per (task_class, model) plus a total line. Each line reports "
+    "predict and result counts, LAND rate in basis points, median wall_s "
+    "and tokens of the results, predicted-versus-actual token ratio in "
+    "basis points, and how many results had no matching predict. task_class "
+    "and model, when passed, restrict the table; a name that is not in the "
+    "field's table is refused by that field's name. The answer comes from "
+    "the in-memory index alone: no peer is asked. Absent medians print as "
+    "absent, never as zero.", 16384,
+    "fleet,experiment,stats,delegation,model",
+    "zcl.fleet_experiment_stats.input.v1", "zcl.fleet_experiment_stats.v1",
+    "task_class,model", "",
+    "z23 fleet experiment stats --task_class=read --model=grok",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_experiment_stats)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.experiment.export", "fleet.experiment", "",
+    "Every kept experiment row as exp.sh's 22-column TSV, one line each",
+    "Walks the experiment events this machine's index kept and prints one "
+    "TSV line per predict or result row, in the exact column order and "
+    "header exp.sh writes: ts, kind, box, task_id, task_class, story, "
+    "executor, harness, model, effort, tokens_in, tokens_out, "
+    "tokens_cached, tokens_reasoning, tool_uses, turns, wall_s, outcome, "
+    "lines_added, lines_removed, defects, note. A column this build never "
+    "kept for that row (a closed-vocabulary field the row did not carry, "
+    "or `note`, which the leaf does not yet keep apart from task_id) "
+    "prints empty rather than a guess; an absent counter prints 0, same as "
+    "exp.sh's own convention. since, in hours, and box, a 64-hex-character "
+    "box id, both restrict which rows print; omitted, every kept row from "
+    "every box prints. The answer comes from the in-memory index alone: no "
+    "peer is asked and no file but this machine's own chains is read.",
+    65536,
+    "fleet,experiment,export,delegation,tsv",
+    "zcl.fleet_experiment_export.input.v1", "zcl.fleet_experiment_export.v1",
+    "since,box", "",
+    "z23 fleet experiment export --since=24",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_experiment_export)
+
+ZCL_COMMAND_BRANCH("fleet.roles", "fleet",
+                   "Which key may call which fleet leaf",
+                   ZCL_COMMAND_LAYER_OPS)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.roles.list", "fleet.roles", "",
+    "Every fingerprint this node has ever granted or revoked a role",
+    "Reads this node's own signed role/grant store (see "
+    "engine/composition/roles.def) and reports every (fingerprint, role) "
+    "pair it has ever seen, newest state first: whether it is currently "
+    "active, and when it last changed. This node's own operator key is "
+    "never listed — it holds every role implicitly and is checked by "
+    "identity, not by a grant row. It contacts no peer.", 16384,
+    "fleet,roles,grants,access,permissions",
+    "zcl.command.empty_input.v1", "zcl.fleet_roles_list.v1", "", "",
+    "z23 fleet roles list",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_roles_list)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.roles.grant", "fleet.roles", "",
+    "Sign a row granting one role to one key's fingerprint",
+    "Appends one signed row to this node's own role store, granting `role` "
+    "(a name from the closed catalog in engine/composition/roles.def, never "
+    "`operator`) to the key whose SHA3-256 fingerprint is `fp` (64 hex "
+    "characters). The row is signed by this node's own delegated online "
+    "key: a grant is always this node's own decision about a key, never a "
+    "statement accepted from a peer. A later revoke of the same pair "
+    "supersedes it on the next check.", 0,
+    "fleet,roles,grant,access,permissions",
+    "zcl.fleet_roles_grant.input.v1", "zcl.fleet_roles_grant.v1", "fp,role",
+    "fp,role", "z23 fleet roles grant --fp=<64-hex> --role=worker",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_fleet_roles_grant)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.roles.revoke", "fleet.roles", "",
+    "Sign a row revoking one role from one key's fingerprint",
+    "Appends one signed row to this node's own role store, revoking `role` "
+    "from the key whose fingerprint is `fp`. Nothing is deleted: the grant "
+    "row still exists, but the next check of this pair sees the revoke and "
+    "refuses. Revoking a role never granted is accepted and has no further "
+    "effect.", 0,
+    "fleet,roles,revoke,access,permissions",
+    "zcl.fleet_roles_revoke.input.v1", "zcl.fleet_roles_revoke.v1",
+    "fp,role", "fp,role",
+    "z23 fleet roles revoke --fp=<64-hex> --role=worker",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_NONE,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_DEV_STATE_READ,
+    ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_fleet_roles_revoke)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.roles.check", "fleet.roles", "",
+    "Would this key's roles allow this leaf (and board kind)?",
+    "Resolves every active role the key named by `fp` currently holds in "
+    "this node's own store and reports whether any of them grants `leaf` "
+    "(an exact `fleet.<a>.<b>` name), restricted to `kind` when the leaf is "
+    "a board post. `fp` equal to this node's own operator fingerprint is "
+    "always allowed, matching that every unsigned local CLI use by this "
+    "node's operator is unaffected by roles. A refusal names the exact "
+    "typed reason a caller would have seen. It contacts no peer.", 4096,
+    "fleet,roles,check,access,permissions",
+    "zcl.fleet_roles_check.input.v1", "zcl.fleet_roles_check.v1",
+    "fp,leaf,kind", "fp,leaf",
+    "z23 fleet roles check --fp=<64-hex> --leaf=fleet.board.post "
+    "--kind=result",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_INSTANT,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_roles_check)
+
+/* ── the low-latency datagram link between two fleet boxes ────────────
+ *
+ * `fleet link probe` is the operator surface over engine/modules/gamelink:
+ * it opens a real UDP session, pings it, and prints round-trip microseconds,
+ * jitter and loss. It is a measurement tool, not a node service — the node
+ * never calls it, it touches no datadir, and it shares no code and no socket
+ * with block relay. See docs/GAMELINK.md. */
+
+ZCL_COMMAND_BRANCH("fleet.link", "fleet", "Measure the datagram link to a peer",
+                   ZCL_COMMAND_LAYER_OPS)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.link.probe", "fleet.link", "",
+    "Round-trip time, jitter and loss over the UDP datagram link",
+    "Opens an authenticated UDP datagram session, pings it for `seconds`, and "
+    "reports round-trip microseconds, jitter, loss in parts per million, and "
+    "every counter that says why a datagram did not arrive. mode is loopback, "
+    "echo or probe. loopback is the default and needs nothing: it runs both "
+    "ends inside this process over 127.0.0.1 with freshly drawn key material, "
+    "which measures this box's own floor — the kernel's UDP path plus the "
+    "per-packet crypto. echo holds a port open and answers pings so another "
+    "box can measure the path; probe measures the path to a box running echo "
+    "and needs its ip:port in peer. Both of those need the shared 32-byte key "
+    "as 64 hex characters in key, because no pairing plumbing hands this leaf "
+    "a live session's material yet. A probe that hears no pong FAILS rather "
+    "than printing zeros, since an unreachable peer must never read as a fast "
+    "one. It writes nothing and contacts no peer but the one named.", 0,
+    "fleet,link,latency,rtt,jitter,loss,udp,game,probe",
+    "zcl.fleet_link_probe.input.v1", "zcl.fleet_link_probe.v1",
+    "mode,peer,bind,key,seconds", "",
+    "z23 fleet link probe --seconds=2",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_MAINTENANCE, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_fleet_link_probe)
+
+/* ── the thin remote-steering adapter ────────────────────────────────────
+ *
+ * One briefing call and one batch of instructions per steering cycle, over
+ * the leaves that already exist: dev.agent.mail, dev.agent.queue,
+ * fleet.board.list/show and fleet.ledger.status are called in-process with
+ * the caller's context, so each of them still enforces its own
+ * permissions. No new scheduler, ledger or workflow lives here. A `grant`
+ * key names an adapter bearer minted by the owner (fleet.steer.grant);
+ * without one the call is the local operator's own. */
+
+ZCL_COMMAND_BRANCH("fleet.steer", "fleet",
+                   "Brief, send and evidence for remote steering",
+                   ZCL_COMMAND_LAYER_OPS)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.steer.brief", "fleet.steer", "",
+    "One-call fleet brief: tasks, workers, blockers, capacity, candidates",
+    "Local fleet leaves compose workers, work, blockers, capacity, candidates, "
+    "evidence and changes. since is an integer mail floor or cursor_token "
+    "watermark; changes_truncated/changes_dropped report cuts. Source ages and "
+    "missing[] name unavailable observations. agents are names seen in "
+    "mail/board. workers: newest16, workers_total/exact/truncated; only "
+    "receiver=/worker= evidence or local resident. Fields: name/host/source(loca"
+    "l|mail)/self_reported/workspace_selector/workspace_head/current_ref/stage/l"
+    "ast_seen_ts/age_s/tokens_last_run/tokens_total/load1_centi/mem_avail_kib/di"
+    "sk_free_kib/resources_reason/state/reason. working requires running queue "
+    "or claimed ref without terminal result; blocked means refusal, unclaimable "
+    "queue or failed intake; idle requires evidence within alive_window_s=900 "
+    "and nothing open. Bare names/live processes imply no work. sessions: "
+    "state live|stale|UNKNOWN is freshness; activity active|completed|blocked|"
+    "stale|UNKNOWN is separate. sessions_active_reported counts bounded active "
+    "self-reports, not model-turn proof. Unknown numbers are null, never0; capacity has "
+    "known/reason; token usage needs run receipts. Message states: "
+    "queued/delivered/acknowledged/completed; reply: answered|acked|queued. Own "
+    "outbox proves no delivery: sent directive stays queued until recipient "
+    "reply/ack under its ref. queued_age_s>queued_stale_after_s=120 without "
+    "receiver evidence is a blocker(newest8,rest counted). tasks: bounded local "
+    "queue/landing attempts with exact identity/owner/dependency/proof/detail "
+    "selectors; review/publication unknown; no canonical joins. "
+    "tasks_inventory_complete=false; "
+    "tasks_sources_complete/tasks_shown/tasks_dropped report coverage. screen "
+    "uses these classifications; json=true omits it. Arrays trim to response "
+    "budget; budget_truncated names cuts. caller names the presented grant: "
+    "mode, sender label or null with a reason, scopes, expiry (local operator: "
+    "mode only); never the grant id. Read-only; no peer contact or waits. ", 65536,
+    "fleet,steer,brief,steering,chatgpt,cursor,agents,blockers,capacity",
+    "zcl.fleet_steer_brief.input.v1", "zcl.fleet_steer_brief.v1",
+    "grant,since,limit,json", "",
+    "z23 fleet steer brief",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_brief)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.steer.send", "fleet.steer", "",
+    "One bounded batch of directives to named fleet agents",
+    "Posts 1..8 directives to named agents through dev.agent.mail. The "
+    "sender is the presented grant's own label, so from must be stated and "
+    "must match it: a from that disagrees is refused rather than rewritten, "
+    "an unstated one is refused rather than defaulted, and the posted row "
+    "carries the grant's binding so a receiver admits on the credential "
+    "instead of on the name. Each item carries an "
+    "idempotency_key, checked after the sender: a retry returns the "
+    "recorded accept with "
+    "duplicate:true and posts nothing, so retries reconcile the same "
+    "request instead of duplicating work. Per-item states are queued or "
+    "refused with the sibling's typed reason. An item addressed to another "
+    "enrolled box travels as one signed fleet board note, so one whose "
+    "mail row could exceed that note's 2048 bytes is refused "
+    "STEER_REMOTE_BODY_TOO_LARGE before any mail is written. The batch "
+    "fails outright "
+    "only on bad batch input or a bad grant. Delivery, acknowledgement "
+    "and completion are observed later through brief and evidence, never "
+    "claimed here. It contacts no peer and never waits.", 65536,
+    "fleet,steer,send,steering,chatgpt,directive,idempotent",
+    "zcl.fleet_steer_send.input.v1", "zcl.fleet_steer_send.v1",
+    "grant,items,from", "items",
+    "z23 fleet steer send --items=[...]",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_fleet_steer_send)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.steer.evidence", "fleet.steer", "",
+    "One bounded evidence object by exact reference",
+    "Returns one object by exact reference (type mail|queue|board|land, ref "
+    "exact): queue accepts optional positive seq and attempt together to "
+    "bind one attempt; land requires both with the exact tip as ref. "
+    "Ref-only queue behavior is unchanged. Otherwise returns the mail row "
+    "carrying the ref, the queue row or outcome "
+    "named by it, or the one board post with the id — never a log or a "
+    "repository. Unknown refs are typed refusals; a board without a "
+    "local node is unavailable, never empty. It contacts no peer and "
+    "never waits.", 32768,
+    "fleet,steer,evidence,steering,chatgpt,reference",
+    "zcl.fleet_steer_evidence.input.v1", "zcl.fleet_steer_evidence.v1",
+    "grant,type,ref,seq,attempt", "type,ref",
+    "z23 fleet steer evidence --type=mail --ref=<ref>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_evidence)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.steer.deliver", "fleet.steer", "",
+    "Upload one C source file into the inert quarantine inbox",
+    "Needs the deliver scope, which no other scope implies. One call carries "
+    "one 16 KiB chunk (data_hex, canonical lowercase hex, exactly "
+    "min(16384,size-offset) bytes) of a file of size 1..262144 bytes at an "
+    "offset aligned to 16384. from must equal the grant's label; the upload "
+    "is bound to that grant, so two grants sharing a label never share an "
+    "upload. Offset 0 creates and freezes ref, name (.c or .h), size and "
+    "sha3_512 (128 lowercase hex over the whole file). Later chunks must "
+    "name the next durable offset; a byte-identical retry returns "
+    "duplicate:true. The final chunk verifies SHA3-512 and replies "
+    "upload_state quarantined with verified_sha3_512; a mismatch is "
+    "STEER_DELIVER_HASH_MISMATCH and never ready. Quarantined means stored "
+    "and hash-checked, never reviewed or accepted. Bytes land under the "
+    "owner-private steer inbox and are never compiled, executed, "
+    "dispatched or written to a checkout. Quotas: one receiving upload and "
+    "8 retained per grant, 64 total, 2 MiB per grant, 16 MiB total; a "
+    "partial expires after 24 hours, a failed upload after 1 hour; a verified "
+    "one stays until fleet.steer.drop. Refusals STEER_DELIVER_BAD_INPUT, SIZE, "
+    "PART, OFFSET, NOT_FOUND, CONFLICT, HASH_MISMATCH, BUSY, QUOTA, "
+    "UNSAFE_PATH, STORE, EXPIRED_UPLOAD, UNSUPPORTED, and the retryable RATE "
+    "(60 requests a minute per grant), BYTE_RATE (16 MiB an hour per grant) "
+    "and OUTSTANDING (32 receiving uploads in total), plus the "
+    "STEER_GRANT_* and sender refusals. Reply under 4 KiB.", 65536,
+    "fleet,steer,deliver,upload,source,quarantine,chatgpt",
+    "zcl.fleet_steer_deliver.input.v1", "zcl.fleet_steer_deliver.v1",
+    "grant,from,ref,upload_id,name,size,sha3_512,offset,data_hex",
+    "from,ref,upload_id,name,size,sha3_512,offset,data_hex",
+    "z23 fleet steer deliver --from=<label> --ref=<ref> --upload_id=<32 hex> ...",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_fleet_steer_deliver)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.steer.inbox", "fleet.steer", "",
+    "List quarantined uploads for the local reviewer",
+    "Lists the quarantine inbox: upload identity, binding prefix, ref, name, "
+    "size, SHA3-512 (16-hex prefix), state receiving|quarantined|failed and "
+    "age. show=<upload identity> returns that one upload with the full "
+    "SHA3-512 and the payload file path. Local only, read-only, never a "
+    "gateway tool; it reads no payload bytes.", 4096,
+    "fleet,steer,inbox,quarantine,review",
+    "zcl.fleet_steer_inbox.input.v1", "zcl.fleet_steer_inbox.v1",
+    "show", "",
+    "z23 fleet steer inbox [--show=<upload>]",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_inbox)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.steer.drop", "fleet.steer", "",
+    "Remove one retained quarantine upload (owner cleanup)",
+    "Removes the payload and manifest of the upload named by its identity "
+    "(as listed by fleet.steer.inbox), unless it is being written at that "
+    "moment (STEER_DELIVER_BUSY). Local, owner only, never a gateway tool; "
+    "it reads no payload bytes and touches nothing outside the inbox.", 4096,
+    "fleet,steer,drop,inbox,cleanup",
+    "zcl.fleet_steer_drop.input.v1", "zcl.fleet_steer_drop.v1",
+    "upload", "upload",
+    "z23 fleet steer drop --upload=<identity>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_fleet_steer_drop)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.steer.grant", "fleet.steer", "",
+    "Mint and revoke the adapter's scoped bearer grants",
+    "mint draws 128 CSPRNG bits for one bearer id scoped to a subset of "
+    "brief,send,evidence,terminate,deliver with a bounded lifetime (ttl_seconds 0..2592000, "
+    "0 means no expiry) and appends it to the owner-private grant store; "
+    "the id is returned exactly once and never echoed elsewhere. list "
+    "inventories the store so the owner can see what there is to revoke: "
+    "one row per grant with its label, scopes, created, expires, revoked "
+    "and state, newest 128 kept, and the id cut to an 8-character prefix "
+    "so the listing is never itself a credential file (revoke still needs "
+    "the whole 32). revoke "
+    "appends a superseding revoked row (revoking twice re-affirms). "
+    "Revoke drops queued work sent under the grant. A running row "
+    "continues unless the grant's scopes include terminate, which ends "
+    "that row's claim on later stages. "
+    "unknown ids are refused, never silently accepted. A revoked or "
+    "expired grant "
+    "fails every fleet.steer verb with STEER_GRANT_REVOKED or "
+    "STEER_GRANT_EXPIRED. peer=<roster name> (with a label and the send "
+    "scope) mints an admission record instead of a bearer: it lets the "
+    "receiver admit a directive that came over the signed fleet board from "
+    "that enrolled box under that label, and is refused as a bearer "
+    "(STEER_GRANT_PEER_ONLY). This governs only fleet.steer verbs: it is not "
+    "wallet authority and not a fleet key role. It contacts no peer.", 0,
+    "fleet,steer,grant,list,revoke,bearer,scope,expiry,chatgpt",
+    "zcl.fleet_steer_grant.input.v1", "zcl.fleet_steer_grant.v1",
+    "action,scopes,ttl_seconds,label,id,peer", "action",
+    "z23 fleet steer grant --action=mint --scopes=brief,send",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_fleet_steer_grant)
+
+/* z23-toolgen:begin commands - generated, do not edit */
+ZCL_COMMAND_BRANCH("fleet.nodes", "fleet",
+    "Inspect the recorded peers",
+    ZCL_COMMAND_LAYER_OPS)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.nodes.table", "fleet.nodes", "",
+    "The pairings recorded on this box, grouped by peer master fingerprint",
+    "Reads the local pairing store through the read-only seam in one "
+    "transaction: at most 64 recorded pairings, each with its state, "
+    "capability mask, delegation sequence and timestamps, grouped under "
+    "the full peer master fingerprint. Active, expired and revoked "
+    "pairings stay distinct, and masks are never combined. A row is a "
+    "recorded peer identity, not proof of a machine or that it is online. "
+    "An existing empty store answers with zero rows; a missing or "
+    "unreadable store, or more than 64 pairings, is refused. It contacts "
+    "no peer and writes nothing.",
+    65536,
+    "fleet,nodes,table,pairings,peers,master,fingerprint,owner",
+    "zcl.fleet_nodes_table_input.v1", "zcl.fleet_nodes_table.v1",
+    "datadir", "",
+    "z23 fleet nodes table",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_LATENCY_FAST,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_nodes_table)
+/* z23-toolgen:end commands */

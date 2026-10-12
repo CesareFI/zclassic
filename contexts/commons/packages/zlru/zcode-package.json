@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "zlru/zlru",
+  "semver": "0.1.0",
+  "language": "c23",
+  "license": "Apache-2.0",
+  "include_dir": "include",
+  "source_dir": "src",
+  "dependencies": [
+    {
+      "name": "zmap/zmap",
+      "root": "22f06857b16c6bce140af7884485cfe431fa90c17f7ef8c794d4caaa7980dfc6",
+      "semver": "0.1.0"
+    }
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "app/main.c",
+    "include/zlru/zlru.h",
+    "src/zlru.c",
+    "tests/test_zlru.c",
+    "zcode-package.json"
+  ]
+}

@@ -1,0 +1,35 @@
+# Recorded by `make commons-demo`. Every value was measured by that
+# run on the machine named below; nothing here is typed in by hand.
+recorded_utc          = 2026-09-02T09:06:56Z
+host_cpu              = AMD Ryzen 9 7950X3D 16-Core Processor (32 threads)
+host_os               = Linux 6.8.0-138-generic x86_64
+compiler              = cc (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0
+source_git_commit     = b0dba7b0c7edb03af3fa0fa30804c9179a5df689 (dirty: yes)
+z23_binary_sha3       = 45ed401fbc4b111c2ba7035de2bc91ea682ce3cb77e0d946d6f230ae65378f28
+journey_script_sha3   = 622a0311b68f8ad1caa179489ea7c332053b20158256592a199e7f85ac461af9
+conditions            = three fresh isolated regtest datadirs, one physical host, A process killed, C learned from B
+reused_package_root   = 7ef55909607130c54004049050628a3eb48908e39681018772a71d75336cbb60
+accepted_source_root  = 092c3a92ca9094c81b8e6e56d6efa32241a4cc16567ed26f96d88a5ac1cb8989
+accepted_app_root     = b608a96122e6405d2a9e85a7a8949ce8fcf3d6cc285dfc3f19f0c2f6a5147b83
+ask_to_visible_result = 45 s
+remote_reproduction   = 26 s
+bytes_over_the_wire   = 14960 (reused package) + 22074 (accepted application)
+reused_package_match  = byte-identical on both nodes (1766 bytes)
+accepted_package_root = 6667e538cebf21784d17d290b511d0642e1067fc6964bc77714ad30f6a7e58fb
+application_match     = byte-identical program on both nodes (16640 bytes)
+program_installed_by  = zcode use — recipe program app/main.c -> bin/wordcount, receipt-bound; this proof ran no compiler
+tamper_refused        = 4 of 4, each by name
+carrier_root          = c7a9251d75c6161b33cd4589361a90d74e767b3e439fb7729992421d6b11b110
+carrier_entries       = 1 objects, node-B cache exported as one content.v2 package
+carrier_rebuild       = node C reproduced with zero compilers, byte-identical receipt
+central_services      = 0
+changed_package       = zdogfight/zdogfight → pilot/zdogfight-quickturn
+changed_root_before   = 34dbb8ad4c23376ab2f9266b51c3341dd7756beff0be6cffa732cc2b8287d0b1
+changed_root_after    = aed689f4a4ddbd567843128c87e282c82d390b1fcf4b60ea1b3cb184e8d39e51
+turn_rate_before      = 143 deg/s (node A, the package as published)
+turn_rate_after       = 239 deg/s (node B, from the bytes it fetched)
+publisher_survival    = node A killed; node C reproduced and ran the exact accepted bytes from node B
+changed_survival      = host C measured 239 deg/s from host B, host A killed
+whole_journey         = 351 s
+verdict               = PASS — 12 of 12 steps · zcl.commons_journey_acceptance.v1
+evidence_root         = dab886993056dd2b0cfabef9138a99bba21479f74b0e525cafd380f3547d9600

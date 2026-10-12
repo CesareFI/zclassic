@@ -1,0 +1,159 @@
+/* Internal contracts shared by the contained consensus-state exporter. */
+
+#ifndef ZCL_CONSENSUS_STATE_SNAPSHOT_EXPORT_INTERNAL_H
+#define ZCL_CONSENSUS_STATE_SNAPSHOT_EXPORT_INTERNAL_H
+
+#include "config/consensus_state_snapshot_export.h"
+#include "base/format_attribute.h"
+#include "storage/consensus_state_bundle_codec.h"
+
+#include <sqlite3.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#define CONSENSUS_EXPORT_NAME_MAX 256
+
+struct consensus_export_output_binding {
+    int dirfd;
+    int temp_fd;
+    char final_name[CONSENSUS_EXPORT_NAME_MAX];
+    dev_t temp_dev;
+    ino_t temp_ino;
+    sqlite3_vfs vfs;
+    sqlite3_vfs *base_vfs;
+    char vfs_name[64];
+    bool vfs_registered;
+    bool abandon_on_close;
+};
+
+/* Private SQLite file object that performs all database I/O through the
+ * retained anonymous staging inode. */
+int consensus_export_fd_file_size(void);
+int consensus_export_fd_file_open(sqlite3_file *file, int retained_fd,
+                                  int flags, int *out_flags);
+/* Replace the last owned writable staging descriptor with an exact O_RDONLY
+ * description of the same anonymous inode.  Call only after every SQLite
+ * writer is strictly closed. */
+bool consensus_export_seal_readonly(
+    struct consensus_export_output_binding *output, struct stat *sealed);
+bool consensus_export_descriptor_digest(int fd, uint8_t out[32]);
+
+bool consensus_export_fail(struct consensus_state_export_result *result,
+                           enum consensus_state_export_status status,
+                           const char *fmt, ...);
+
+/* Cooperative cancel plumbing for request->cancel_requested.
+ * consensus_export_cancelled() reads the flag once (relaxed). The install
+ * helper arms a SQLite progress handler on a PRIVATE export connection (the
+ * live WAL snapshot, the anonymous staging destination, or the finalize-time
+ * re-validation handle) so every long prove/copy/validate statement aborts
+ * with SQLITE_INTERRUPT within ~CONSENSUS_EXPORT_CANCEL_POLL_OPS opcodes of
+ * the flag being set; a NULL flag installs nothing, and the handler dies with
+ * its connection. Never install on the OWNED progress.kv singleton handle —
+ * that connection is shared with the reducer. */
+bool consensus_export_cancelled(const _Atomic bool *cancel);
+void consensus_export_install_cancel_handler(sqlite3 *db,
+                                             const _Atomic bool *cancel);
+
+/* Observability-only: a monotonic millisecond clock plus a "[export] <msg>"
+ * stderr+LOG_INFO emitter, shared by the prove (consensus_state_snapshot_
+ * export_proof.c) and write (consensus_state_snapshot_export_write.c) passes
+ * so the long full-history -export-consensus-bundle run is never silent
+ * between named phases. Never used in any gate decision. */
+int64_t consensus_export_clock_ms(void);
+void consensus_export_progress_emit(const char *fmt, ...)
+    ZCL_PRINTF_LIKE(1, 2);
+
+bool consensus_export_prove_source(
+    sqlite3 *source,
+    const struct consensus_state_snapshot_export_request *request,
+    struct consensus_state_bundle_manifest *manifest,
+    struct consensus_state_source_receipt *receipt,
+    struct consensus_state_bundle_proof_summary
+        proofs[CONSENSUS_STATE_BUNDLE_PROOF_COUNT],
+    struct consensus_state_bundle_proof_parent *parent,
+    struct consensus_state_export_result *result);
+
+/* Reducer-stage row-scan proof descriptor + the fixed k_stages fixture table
+ * (validate_headers..tip_finalize) and the two O(H)-row scan proofs
+ * (consensus_export_prove_header_chain / consensus_export_prove_stage_rows).
+ * Defined in consensus_state_snapshot_export_proof_rows.c — split out of
+ * consensus_state_snapshot_export_proof.c along the file-size ceiling seam
+ * (E1); consensus_export_prove_source there orchestrates these two scans
+ * plus its own fast, non-scanning checks. */
+struct export_stage_proof {
+    const char *name;
+    const char *table;
+    bool served_tip_cursor;
+    const char *hash_column;
+    bool profile_bound;
+    bool source_epoch_bound;
+};
+#define CONSENSUS_EXPORT_STAGE_COUNT (CONSENSUS_STATE_BUNDLE_PROOF_COUNT - 1)
+extern const struct export_stage_proof k_stages[CONSENSUS_EXPORT_STAGE_COUNT];
+
+bool consensus_export_prove_header_chain(sqlite3 *db, int32_t height,
+                                         const uint8_t expected_hash[32],
+                                         uint8_t source_digest[32],
+                                         struct consensus_state_bundle_proof_parent
+                                             *parent);
+bool consensus_export_prove_stage_rows(
+    sqlite3 *db, const struct export_stage_proof *stage, int32_t height,
+    uint64_t cursor, uint8_t validation_profile,
+    const uint8_t source_epoch_digest[32],
+    struct consensus_state_bundle_proof_summary *summary,
+    struct consensus_state_bundle_proof_parent *parent, size_t ordinal);
+
+bool consensus_export_write_bundle(
+    sqlite3 *source, sqlite3 *destination,
+    struct consensus_state_bundle_manifest *manifest,
+    const struct consensus_state_source_receipt *receipt,
+    const struct consensus_state_bundle_proof_summary
+        proofs[CONSENSUS_STATE_BUNDLE_PROOF_COUNT],
+    const struct consensus_state_bundle_proof_parent *parent,
+    struct consensus_state_export_result *result);
+
+bool consensus_export_open_temp(struct consensus_export_output_binding *output,
+                                sqlite3 **destination,
+                                struct consensus_state_export_result *result);
+
+bool consensus_export_finalize_temp(
+    struct consensus_export_output_binding *output,
+    const struct consensus_state_bundle_manifest *manifest,
+    const _Atomic bool *cancel,
+    struct consensus_state_export_result *result);
+
+/* Shared by the offline-mint and live exporter entry TUs
+ * (consensus_state_snapshot_export.c + _live.c). */
+void consensus_export_output_init(struct consensus_export_output_binding *output);
+bool consensus_export_output_open(
+    const struct consensus_state_snapshot_export_request *request,
+    struct consensus_export_output_binding *output,
+    struct consensus_state_export_result *result);
+void consensus_export_output_close(struct consensus_export_output_binding *output);
+
+/* Install the private sqlite3_vfs that routes every database I/O to the
+ * binding's retained anonymous staging descriptor, registered under a
+ * process-unique name held in output->vfs_name. Defined in
+ * consensus_state_snapshot_export_output_vfs.c — split out of the exporter
+ * entry TU along the file-size ceiling seam (E1); this is the only symbol
+ * that crosses. Never registered on Windows. */
+bool output_vfs_register(struct consensus_export_output_binding *output);
+void consensus_export_run_after_bind_hook(void);
+
+/* Shared derive+write core used by BOTH exporter entries. Runs the proof,
+ * opens the anonymous staging inode, writes the bundle, and strictly closes
+ * the dest. The CALLER owns the SOURCE read transaction. */
+bool consensus_export_prove_write(
+    sqlite3 *source,
+    const struct consensus_state_snapshot_export_request *request,
+    struct consensus_export_output_binding *output,
+    struct consensus_state_bundle_manifest *manifest,
+    struct consensus_state_export_result *result);
+
+/* Fill the EXPORTED result on success — identical for both entries. */
+void consensus_export_fill_success(
+    const struct consensus_state_bundle_manifest *manifest,
+    struct consensus_state_export_result *result);
+
+#endif /* ZCL_CONSENSUS_STATE_SNAPSHOT_EXPORT_INTERNAL_H */

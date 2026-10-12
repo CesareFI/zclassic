@@ -1,0 +1,27 @@
+/* Canonical dumpstate subsystem descriptors.
+ *
+ * The including translation unit defines the DIAG_* category macros. Keep
+ * this file data-only: dispatcher order, statecatalog metadata, native advisory
+ * parameters, health rollup, and registry tests all consume these rows.
+ *
+ * This file is a pure aggregator: the 151 DIAG_* rows live in the 8
+ * per-domain files below, split by what the subsystem is ABOUT (not by
+ * DIAG_* category macro). Row order across the whole set is not significant
+ * (dumpers are looked up by name); order WITHIN each per-domain file is
+ * preserved from the original single file. Add a new row to the per-domain
+ * file it belongs to, or to diagnostics_dumpers_runtime.def if it's a
+ * cross-cutting node-runtime concern that doesn't fit a narrower domain. */
+
+#ifndef DIAG_ENTRY
+#error "define the DIAG_* descriptor macros before including diagnostics_dumpers.def"
+#endif
+
+#include "controllers/diagnostics_dumpers_runtime.def"
+#include "controllers/diagnostics_dumpers_sync.def"
+#include "controllers/diagnostics_dumpers_network.def"
+#include "controllers/diagnostics_dumpers_storage.def"
+#include "controllers/diagnostics_dumpers_wallet.def"
+#include "controllers/diagnostics_dumpers_agents.def"
+#include "controllers/diagnostics_dumpers_zcode.def"
+#include "controllers/diagnostics_dumpers_metaverse.def"
+

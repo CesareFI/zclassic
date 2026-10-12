@@ -1,0 +1,108 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * purpose: The rules a coding agent must follow in THIS checkout, as DATA.
+ *
+ * Git layout identifies a standalone clone or a linked worktree, not its
+ * writer or publication authority. Both layouts require current ownership,
+ * exact acceptance and eligible native receipt-gated landing. Linked
+ * worktrees additionally share an object store and a stash stack. Keep the
+ * situation in every row so those storage differences remain explicit.
+ *
+ * Include with both macros defined; either may be a no-op:
+ *
+ *   ZCL_AGENT_SITUATION(id, test_prose)
+ *       id         — the situation name a rule row selects on.
+ *       test_prose — the exact shell test that decides it, with the sentence
+ *                    that says what a TRUE result means.
+ *
+ *   ZCL_AGENT_RULE(id, situation, value, say)
+ *       id        — the topic (push_target, commit_scope, gate_command,
+ *                   gate_skip, force_push, history). Every topic carries one
+ *                   row per situation; a topic present for only one of them
+ *                   is a hole an agent falls through.
+ *       situation — one ZCL_AGENT_SITUATION id.
+ *       value     — the machine answer. Never contains a space, so a caller
+ *                   can compare it without parsing prose.
+ *       say       — the whole reason, in the words the agent should read.
+ *
+ * Row order is the order dev.agent.rules reports and is therefore stable
+ * evidence. Consumed by tools/command/native_devagent_rules.c and by
+ * tools/command/native_devagent_start.c; neither owns a second copy. */
+
+ZCL_AGENT_SITUATION(
+    standalone,
+    "[ \"$(git rev-parse --git-dir)\" = \"$(git rev-parse --git-common-dir)\" ]"
+    " — standalone Git layout; inspect current ownership before writes.")
+ZCL_AGENT_SITUATION(
+    shared_checkout_lane,
+    "the same comparison is FALSE — a linked worktree sharing an object "
+    "store; inspect current native claims before writes.")
+
+ZCL_AGENT_RULE(
+    push_target, standalone, "native_receipt_gated_land",
+    "origin/main is the shared integration blackboard. Preserve a signed "
+    "owned checkpoint, obtain non-author review, and publish only when "
+    "authorized and eligible through native receipt-gated land tools. "
+    "Checkout layout grants no publication authority. Independently verify "
+    "the exact remote commit and receipt.")
+ZCL_AGENT_RULE(
+    push_target, shared_checkout_lane, "native_receipt_gated_land",
+    "Preserve a signed owned lane checkpoint and hand off its branch and "
+    "exact head for non-author review. Publish only when authorized and "
+    "eligible through native receipt-gated land tools; no permanent lead is "
+    "required. Checkout layout grants no publication authority. "
+    "Independently verify the exact remote commit and receipt.")
+
+ZCL_AGENT_RULE(
+    commit_scope, standalone, "own_changes_only",
+    "Commit only your own changes. Never fold another agent's dirty work into "
+    "your commit, and never reset or overwrite it.")
+ZCL_AGENT_RULE(
+    commit_scope, shared_checkout_lane, "own_changes_only",
+    "Commit only your own changes. Never git stash: the stash stack is shared "
+    "across every worktree on this checkout.")
+
+ZCL_AGENT_RULE(
+    gate_command, standalone, "lint_fast_plus_impact_and_exact_proof",
+    "Run make lint-fast and source-impact acceptance through devbuild --wait. "
+    "Fetch origin/main and safely integrate only your owned checkpoint. "
+    "A changed base requires exact revalidation; only receiver-qualified "
+    "reuse may avoid repeated work. Native landing requires the current "
+    "policy's complete exact candidate/base proof and receipt.")
+ZCL_AGENT_RULE(
+    gate_command, shared_checkout_lane, "lint_fast_plus_impact_and_exact_proof",
+    "Inner loop is make lint-fast. It is NOT the whole gate set: full make "
+    "lint also runs check-doc-claims, check-doc-accuracy and "
+    "check-markdown-links, so a docs or skills change must run the doc gates "
+    "lint-fast skips. Run heavy gates through devbuild --wait. A changed "
+    "base requires exact revalidation; only receiver-qualified reuse may "
+    "avoid repeated work. Native landing requires the current policy's "
+    "complete exact candidate/base proof and receipt.")
+
+ZCL_AGENT_RULE(
+    gate_skip, standalone, "never",
+    "Never set ZCL_SKIP_PREPUSH=1. A refusing gate is right; fix the code. "
+    "Skipping it once put six red gates on main.")
+ZCL_AGENT_RULE(
+    gate_skip, shared_checkout_lane, "never",
+    "Never set ZCL_SKIP_PREPUSH=1, and never git commit --no-verify.")
+
+ZCL_AGENT_RULE(
+    force_push, standalone, "never",
+    "Never force-push. main is a shared blackboard and a force-push destroys "
+    "another agent's landed work.")
+ZCL_AGENT_RULE(
+    force_push, shared_checkout_lane, "never",
+    "Never force-push or rewrite an already published commit, and never "
+    "reset or rebase another worker's checkout or index.")
+
+ZCL_AGENT_RULE(
+    history, standalone, "never_flatten",
+    "Never flatten history or publish a squashed mirror. Publication is "
+    "fast-forward only; safe integration of your owned checkpoint preserves "
+    "protected refs and reruns affected acceptance.")
+ZCL_AGENT_RULE(
+    history, shared_checkout_lane, "never_flatten",
+    "Never flatten history or publish a squashed mirror. Publication is "
+    "fast-forward only; safe integration of your owned checkpoint preserves "
+    "protected refs and reruns affected acceptance.")

@@ -1,0 +1,79 @@
+/* Mutating native leaves which the transaction completeness gate examines but
+ * which cannot create, sign, submit, or confirm a chain transaction.
+ *
+ * TX_NONCHAIN_COMMAND(command_path, category, explanation)
+ *
+ * This is an explicit negative assertion, not a default.  An unlisted command
+ * remains UNCLASSIFIED; absence from the transaction catalog never proves a
+ * command is off-chain. */
+
+TX_NONCHAIN_COMMAND("core.wallet.security.encrypt", "wallet_security",
+    "Encrypts local wallet key material; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.security.unlock", "wallet_security",
+    "Unlocks local wallet key material for a bounded time; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.security.lock", "wallet_security",
+    "Locks local wallet key material; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.address.new", "wallet_key_management",
+    "Derives and persists a local transparent receive key; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.address.import", "wallet_key_management",
+    "Imports a watch-only address into local wallet state; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.address.export-key", "wallet_key_management",
+    "Discloses an existing private key to its owner; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.shielded.address", "wallet_key_management",
+    "Derives and persists a local Sapling receive key; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.backup.now", "wallet_backup",
+    "Writes an encrypted local wallet backup; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.backup.decrypt", "wallet_backup",
+    "Decrypts an owner-selected wallet backup locally; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.restore", "wallet_recovery",
+    "Restores local wallet state from a backup; it does not broadcast during restore.")
+TX_NONCHAIN_COMMAND("core.wallet.recovery.restore", "wallet_recovery",
+    "Runs the typed local wallet recovery path; it does not broadcast during restore.")
+TX_NONCHAIN_COMMAND("core.wallet.rescan-witnesses", "wallet_scan",
+    "Rebuilds local shielded witnesses from chain data; it creates no transaction.")
+TX_NONCHAIN_COMMAND("core.wallet.rescan", "wallet_scan",
+    "Replays existing chain history into the local wallet; it creates no transaction.")
+TX_NONCHAIN_COMMAND("vault.intent.issue", "receive_request",
+    "Creates a receive key and payment URI only; a later payer creates any transaction.")
+TX_NONCHAIN_COMMAND("vault.intent.cancel", "intent_lifecycle",
+    "Atomically terminates only an unclaimed durable plan and releases its reservation; it never constructs, signs, or relays a transaction.")
+TX_NONCHAIN_COMMAND("vault.session.create", "agent_authority",
+    "Creates a bounded local agent grant; the grant can authorize later commands but is not a transaction.")
+TX_NONCHAIN_COMMAND("vault.session.revoke", "agent_authority",
+    "Revokes a bounded local agent grant; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("zcode.endpoint.publish", "p2p_endpoint_record",
+    "Publishes a signed endpoint record to the ZCODE P2P swarm; no on-chain write exists in this flow.")
+TX_NONCHAIN_COMMAND("zcode.endpoint.accept", "p2p_endpoint_record",
+    "Accepts a signed endpoint record into local ZCODE state; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("zcode.patronage.fund.commit", "patronage_simulation",
+    "Stores a verified simulation-only funding receipt in the existing ZCODE CAS; it creates, signs, submits, and confirms no chain transaction.")
+TX_NONCHAIN_COMMAND("zcode.patronage.settle.commit", "patronage_simulation",
+    "Stores a revalidated proof-conditioned simulation settlement in the workspace CAS; it creates, signs, submits, and confirms no chain transaction.")
+TX_NONCHAIN_COMMAND("zcode.patronage.refund.commit", "patronage_simulation",
+    "Stores a revalidated expiry-conditioned simulation refund receipt in the workspace CAS; it creates, signs, submits, and confirms no chain transaction.")
+TX_NONCHAIN_COMMAND("zcode.commons.shadow.attribution.commit", "commons_simulation",
+    "Stores one verified creation-attribution wire in an explicit scratch CAS; it creates, signs, submits, and confirms no chain transaction.")
+TX_NONCHAIN_COMMAND("zcode.commons.shadow.epoch.commit", "commons_simulation",
+    "Stores one verified epoch-accounting wire in an explicit scratch CAS; it creates, signs, submits, and confirms no chain transaction.")
+TX_NONCHAIN_COMMAND("app.qr.show", "local_presentation",
+    "Shows inert QR pixels or text through the display-only presentation boundary; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("app.presentation.show", "local_presentation",
+    "Shows one bounded inert visual model and returns only bounded display input; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("app.presentation.status", "local_presentation",
+    "Shows canonical node facts through the display-only presentation boundary; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("app.presentation.corpus", "local_presentation",
+    "Shows canonical C23 corpus facts through the display-only presentation boundary; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("app.presentation.code-growth", "local_presentation",
+    "Shows exact Git-derived C23 growth through the display-only presentation boundary; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("app.presentation.code-change", "local_presentation",
+    "Shows an exact inert code-change model through the display-only presentation boundary; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("app.presentation.reproduction", "local_presentation",
+    "Shows exact reproduction progress through the display-only presentation boundary; it creates no chain transaction.")
+TX_NONCHAIN_COMMAND("app.presentation.publication-confirm", "local_presentation",
+    "Returns one bounded human display decision without committing or publishing the package and creates no chain transaction.")
+TX_NONCHAIN_COMMAND("app.presentation.publication-status", "local_presentation",
+    "Shows exact package publication facts without committing, publishing, fetching, or creating a chain transaction.")
+TX_NONCHAIN_COMMAND("app.market.offer", "p2p_market_offer",
+    "Builds, signs, persists, and gossips one self-authenticating paid file offer; settlement is the buyer's separate payment transaction, so this command creates no chain transaction.")
+TX_NONCHAIN_COMMAND("zcode.node.join", "local_node_config",
+    "Reads this node's join posture and writes the join flags into <datadir>/z23.conf; it starts nothing, signals nothing, and creates, signs, submits, and confirms no chain transaction. The optional DHT tier it reports does need an on-chain ZID anchor, but registering that anchor is a separate command with its own fee.")

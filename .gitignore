@@ -1,0 +1,148 @@
+# Ignoring a file is not the same as it being welcome. The repository ROOT is
+# a curated list — source areas, top-level docs, and a short set of generated
+# entries (build/, test-tmp/, compile_commands.json, tool caches). The rules
+# below are broad on purpose (`*.db`, `*.log`) so scratch inside a datadir or
+# a test's scratch dir stays out of `git status`; they do NOT bless a database
+# or a log sitting in the root. `make lint` fails on that
+# (check-no-stray-root-files) — fix it at the writer: tests write under
+# ./test-tmp/<prefix>_<pid>_<tag> (test_make_tmpdir), scripts write logs under
+# a state/log directory.
+
+# Build artifacts
+build/
+/dist/
+
+# Vendor (built from source by `make vendor`, not tracked)
+# Exception: libsecp256k1.a is committed (custom Bitcoin Core fork build).
+vendor/lib/
+!vendor/lib/libsecp256k1.a
+vendor/zclassic-ref/
+vendor/sqlite3.c
+vendor/tor/
+# `make vendor` scratch: pinned source downloads + per-lib build trees.
+vendor/.cache/
+vendor/.build/
+# Persistent regular-file kernel lock: retain its coordination inode across runs.
+# Generated control state, never a compiler input.
+/vendor/.build.lock
+vendor/.build-*/
+vendor/.build-*.lock/
+# Per-target archives + headers, built from the SAME pinned sources by
+# VENDOR_TARGET=<triple> tools/scripts/build_vendor.sh for a cross release
+# (e.g. vendor/cross/x86_64-w64-mingw32). vendor/lib holds exactly one target,
+# so another one needs its own tree; like vendor/lib it is generated, never
+# tracked.
+vendor/cross/
+# Vendored OpenSSL/zlib/libevent headers installed by `make vendor`
+# (regenerated). event2/ exists for the embedded Tor build (`make tor-full`),
+# which on macOS has no system libevent to discover.
+vendor/include/openssl/
+vendor/include/zlib.h
+vendor/include/zconf.h
+vendor/include/event2/
+
+# Data / runtime
+.zvcs/
+*.db
+*.db-wal
+*.db-shm
+*.log
+node.log
+crash_log.txt
+.cookie
+/core
+/core.*
+/vgcore.*
+# ...but the sealed consensus-core TREE (core/) is tracked (Wave 1.1 split).
+!/core/
+
+# Test artifacts (Tor integration temp dirs)
+zcl_torrc_hs_*/
+zcl_torrc_path_*/
+zcl_hostname_*/
+zcl_persist_*/
+.zcl_test_*/
+.zcl_blog_*/
+
+test-tmp/
+leak-*
+
+# Editor / OS
+.DS_Store
+.vscode/
+*.swp
+*~
+tags
+TAGS
+.idea/
+.zcl_test_render/
+
+# Claude Code agent worktrees (runtime)
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# Other AI tool local state
+.antigravitycli/
+.gemini/
+.aider*
+
+# Local developer/tool caches
+.cache/
+compile_commands.json
+
+# Claude Code scratch space — never track
+.claude/tmp/
+
+# chaos harness run artifacts
+chaos-output/
+
+# Sealed consensus-core unseal token (owner ritual; never tracked)
+.core-unseal-token
+.codeindex/
+
+# Scaffolded GUI apps are user-local content, never tree content. `make
+# new-app NAME=…` copies contexts/commons/packages/zhello into contexts/commons/packages/<name> (untracked by
+# construction) and registers the app here, which is what puts its targets on
+# the lean parse path; zhello itself stays tracked as the template of record.
+# Delete the line for an app you are contributing; keep this file gitignored.
+contexts/commons/apps/local_gui_apps.mk
+
+# Per-box operator config is local-only, never committed.
+deploy/devfleet/*.env
+
+# Operator mesh state is LOCAL, never committed. This repository ships no
+# fleet: the boxes an operator happens to run are their own business, and
+# their addresses, ports, running-source hashes, heartbeats, drill output and
+# install pins all live under
+# ${XDG_STATE_HOME:-$HOME/.local/state}/zclassic23/fleet/, not here. Only
+# platform/deploy/devfleet/README.md and *.example templates are tracked. These
+# patterns exist so a stray copy in the working tree can never come back.
+deploy/devfleet/*.txt
+deploy/devfleet/*.sync
+deploy/devfleet/*.status
+deploy/devfleet/*.identity
+deploy/devfleet/*.jsonl
+
+# Installed agent CLIs write their own per-directory state into the checkout
+# when they are dispatched to. `zai` drops .zai/settings.json on first run.
+# It is the CLI's state, not this project's, and a committed copy would pin
+# every operator to whatever model the last dispatch happened to use.
+.zai/
+
+# A worktree listed in the dev-agent queue's pool carries its warm marker and
+# its non-blocking occupancy lock at its own root (queue/pool.txt reads
+# <worktree>/.eu-warm, and the dispatcher flocks <worktree>/.eu-lock). The same
+# worktree is also a model workspace, and a model workspace must read CLEAN
+# before a turn or the run is refused for its own scaffolding. Untracked here
+# so being in the pool can never look like a change.
+.eu-warm
+.eu-lock
+
+# Whole additional lane checkouts parked at the root by parallel workers
+# (same class as .claude/worktrees/ above). Git reports an untracked nested
+# checkout as one bare `name/` entry, which the build's source-identity
+# capture cannot hash as a file and refuses. Ignoring them routes them
+# through the scanner's designed ignored-directory prune; their contents are
+# never compiler inputs.
+w-ed/
+w-gui/

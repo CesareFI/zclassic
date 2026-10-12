@@ -1,0 +1,145 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * purpose: Bounded canonical persistence for signed ZCODE DHT records. */
+
+#ifndef ZCL_VCS_ZCODE_DHT_RECORD_STORE_H
+#define ZCL_VCS_ZCODE_DHT_RECORD_STORE_H
+
+#include "vcs/zcode_dht_record.h"
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define VCS_ZCODE_DHT_RECORD_STORE_MAX_RECORDS 4096u
+#define VCS_ZCODE_DHT_RECORD_STORE_MAX_PER_ROOT 64u
+#define VCS_ZCODE_DHT_RECORD_STORE_MAX_PER_PROVIDER 256u
+#define VCS_ZCODE_DHT_RECORD_STORE_MAX_CONFLICTS 8u
+#define VCS_ZCODE_DHT_RECORD_STORE_FILE "zcode/dht/records.v1"
+#define VCS_ZCODE_DHT_RECORD_STORE_HEADER_BYTES 80u
+
+enum vcs_zcode_dht_record_store_result {
+  VCS_ZCODE_DHT_RECORD_STORE_OK = 0,
+  VCS_ZCODE_DHT_RECORD_STORE_ADDED,
+  VCS_ZCODE_DHT_RECORD_STORE_DUPLICATE,
+  VCS_ZCODE_DHT_RECORD_STORE_CONFLICT,
+  VCS_ZCODE_DHT_RECORD_STORE_STALE,
+  VCS_ZCODE_DHT_RECORD_STORE_EXPIRED,
+  VCS_ZCODE_DHT_RECORD_STORE_INVALID,
+  VCS_ZCODE_DHT_RECORD_STORE_ROOT_CAP,
+  VCS_ZCODE_DHT_RECORD_STORE_PROVIDER_CAP,
+  VCS_ZCODE_DHT_RECORD_STORE_CONFLICT_CAP,
+  VCS_ZCODE_DHT_RECORD_STORE_GLOBAL_CAP,
+  VCS_ZCODE_DHT_RECORD_STORE_IO,
+  VCS_ZCODE_DHT_RECORD_STORE_CORRUPT,
+  /* Not a record-store condition at all: the service's publication intent
+   * table is full of streams this publish neither belongs to nor beats.
+   * Distinct from GLOBAL_CAP so an operator reading a refusal is sent to
+   * the 16-slot intent table, not the 4096-record store cap. Appended last
+   * so the values ahead of it stay stable for any future numeric use. */
+  VCS_ZCODE_DHT_RECORD_STORE_NO_SLOT,
+  /* The record is a reserved authority kind whose required master-signed
+   * namespace credential is not implemented. Distinct from INVALID so an
+   * operator cannot mistake a valid shape for deployable authority.
+   * Appended last so preceding values remain stable. */
+  VCS_ZCODE_DHT_RECORD_STORE_SCOPE,
+};
+
+const char *vcs_zcode_dht_record_store_result_string(
+    enum vcs_zcode_dht_record_store_result result);
+
+struct vcs_zcode_dht_record_store;
+
+struct vcs_zcode_dht_record_store *vcs_zcode_dht_record_store_create(
+    const uint8_t network_genesis[32]);
+struct vcs_zcode_dht_record_store *vcs_zcode_dht_record_store_clone(
+    const struct vcs_zcode_dht_record_store *store);
+void vcs_zcode_dht_record_store_free(
+    struct vcs_zcode_dht_record_store *store);
+
+/* Input must already have passed vcs_zcode_dht_record_parse. Newer sequence
+ * replaces older records in the same publisher slot, EXCEPT observations a
+ * newer sequence cannot resolve: a SOURCE_REPRODUCTION_ACK stream asserting
+ * a different semantic_root is retained beside the earlier claim (a
+ * preserved contradiction, returned as CONFLICT) instead of superseding it.
+ * The same exception applies to an OLDER sequence contradicting the
+ * stream's live top claim — that is preserved evidence, not stale replay,
+ * in whatever order gossip or a wire-sorted reload delivers the rows.
+ * Same-sequence conflicts and retained contradictions share the explicit
+ * conflict cap. */
+enum vcs_zcode_dht_record_store_result vcs_zcode_dht_record_store_put(
+    struct vcs_zcode_dht_record_store *store,
+    const struct vcs_zcode_dht_record *record, uint64_t now_unix);
+
+/* Drop every record whose expiry has passed, in place, preserving the
+ * canonical order load() verifies; returns how many rows were freed.
+ * Same predicate load() applies on restart, so this is a mid-session
+ * reload of exactly the live set. */
+size_t vcs_zcode_dht_record_store_collect(
+    struct vcs_zcode_dht_record_store *store, uint64_t now_unix);
+
+size_t vcs_zcode_dht_record_store_count(
+    const struct vcs_zcode_dht_record_store *store);
+size_t vcs_zcode_dht_record_store_query(
+    const struct vcs_zcode_dht_record_store *store,
+    enum vcs_zcode_dht_record_kind kind, const char *namespace_name,
+    const uint8_t root[32], uint64_t now_unix,
+    struct vcs_zcode_dht_record *out, size_t out_capacity);
+
+/* Namespace-wide seen-set listing: every live record of `kind` in
+ * `namespace_name` this store holds, in the store's canonical order —
+ * the local half of a task board. store_query answers "who names this
+ * root"; scan answers "what roots does this node know in the namespace",
+ * which no root-filtered query can. Records reach a node only through the
+ * ordinary paths (publish, exact-root discovery merges, replication), so
+ * a cold node honestly reports what it has SEEN, never a network
+ * promise. The return value is the total live count; `out` collects the
+ * first out_capacity of them (NULL out counts only). */
+size_t vcs_zcode_dht_record_store_scan(
+    const struct vcs_zcode_dht_record_store *store,
+    enum vcs_zcode_dht_record_kind kind, const char *namespace_name,
+    uint64_t now_unix, struct vcs_zcode_dht_record *out,
+    size_t out_capacity);
+
+void vcs_zcode_dht_record_store_digest(
+    const struct vcs_zcode_dht_record_store *store, uint8_t out[32]);
+
+/* Hash only records that can supersede/conflict with `record`. Publication
+ * plan tokens use this narrower snapshot: unrelated DHT gossip must not
+ * invalidate an operator's plan, while a concurrent change to the same
+ * kind/namespace/root/master/provider stream still does. */
+void vcs_zcode_dht_record_store_stream_digest(
+    const struct vcs_zcode_dht_record_store *store,
+    const struct vcs_zcode_dht_record *record, uint8_t out[32]);
+
+/* Highest sequence currently held in `record`'s stream (0 when the stream is
+ * empty). Publish-plan auto-sequencing derives max+1 from THIS, under the
+ * caller's service lock, so two operators renewing the same stream through
+ * one node can never both commit the same derived sequence: the second
+ * commit's rebuild lands on a different token and refuses STALE. Client-side
+ * max+1 derivations raced the store's visibility lag and produced exactly
+ * that duplicate-sequence collision (both records conflicted, zero usable). */
+uint64_t vcs_zcode_dht_record_store_max_sequence(
+    const struct vcs_zcode_dht_record_store *store,
+    const struct vcs_zcode_dht_record *record);
+
+/* Stream identity: same kind, namespace, genesis, provider, delegation
+ * master key, and content root (transport for provider records, semantic
+ * for pointers). Records of one stream supersede each other by sequence;
+ * records of different streams never do. Publication slots key on this so
+ * an out-of-band renewal of a live stream replaces its intention instead
+ * of leaking a second permanent slot. */
+bool vcs_zcode_dht_record_stream_equal(const struct vcs_zcode_dht_record *a,
+                                       const struct vcs_zcode_dht_record *b);
+
+/* Save is temp + file fsync + rename + directory fsync, mode 0600. Load
+ * verifies the complete image into a temporary store before replacing the
+ * destination, so malformed/cross-network/torn images leave memory intact. */
+enum vcs_zcode_dht_record_store_result vcs_zcode_dht_record_store_save(
+    const struct vcs_zcode_dht_record_store *store, const char *datadir,
+    char *error_out, size_t error_capacity);
+enum vcs_zcode_dht_record_store_result vcs_zcode_dht_record_store_load(
+    struct vcs_zcode_dht_record_store *store, const char *datadir,
+    const struct vcs_zcode_dht_record_verify_context *verify,
+    char *error_out, size_t error_capacity);
+
+#endif /* ZCL_VCS_ZCODE_DHT_RECORD_STORE_H */

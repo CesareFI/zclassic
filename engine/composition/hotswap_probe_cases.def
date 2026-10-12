@@ -1,0 +1,104 @@
+/* Resident-owned hot-swap probe cases.
+ *
+ * Consumer defines:
+ *   HOTSWAP_PROBE_CASE(case_id, kind, operation, canonical_input_json,
+ *                      expected_schema, byte_budget)
+ *
+ * Candidates name neither a case nor any of its limits. The resident maps a
+ * candidate's owning source/service through the eligibility manifests and
+ * resolves that fixed operation here. JSON object keys stay lexicographically
+ * ordered so byte identity is reviewable and cacheable. */
+
+HOTSWAP_PROBE_CASE("command.core.status.default.v1", "command",
+    "core.status", "{}", "zcl.core_status.v2", 4096)
+HOTSWAP_PROBE_CASE("command.wallet.address.list.default.v1", "command",
+    "core.wallet.address.list", "{}", "zcl.wallet_addresses.v1", 8192)
+HOTSWAP_PROBE_CASE("command.network.incidents.default.v1", "command",
+    "core.network.peers.incidents", "{}", "zcl.peer_incidents.v2", 8192)
+HOTSWAP_PROBE_CASE("command.ops.metrics.default.v1", "command",
+    "ops.metrics", "{}", "zcl.ops_metrics.v1", 8192)
+HOTSWAP_PROBE_CASE("command.utxo.audit.default.v1", "command",
+    "core.consensus.utxo.audit", "{}", "zcl.utxo_audit.v1", 4096)
+HOTSWAP_PROBE_CASE("command.names.list.default.v1", "command",
+    "app.names.list", "{}", "zcl.app_name_index.v1", 8192)
+HOTSWAP_PROBE_CASE("command.metaverse.property.list.default.v1", "command",
+    "metaverse.property.list", "{}", "zcl.metaverse_property_list.v1", 8192)
+HOTSWAP_PROBE_CASE("command.ops.dash.summary.default.v1", "command",
+    "ops.debug.dash.summary", "{}", "zcl.operator_summary.v1", 8192)
+HOTSWAP_PROBE_CASE("command.ops.logs.bounded.v1", "command",
+    "ops.logs",
+    "{\"level\":\"all\",\"max_lines\":1,\"pattern\":\"hotswap\",\"since_secs\":1}",
+    "zcl.ops_logs.v1", 2048)
+HOTSWAP_PROBE_CASE("service.corpus.show.rules.v1", "service",
+    "zcode.commons.corpus.show",
+    "{\"root\":\"ae0c059c8c925464a7d9376b17687b207027833f5337dc49944bcd1b55d3be23\"}",
+    "zcl.zcode_commons_corpus_show.v1", 2048)
+HOTSWAP_PROBE_CASE("service.economics.status.default.v1", "service",
+    "zcode.commons.economics.status", "{}",
+    "zcl.zcode_commons_economics_status.v2", 4096)
+HOTSWAP_PROBE_CASE("service.market.purchase.guide.default.v1", "service",
+    "app.market.purchase.guide", "{}",
+    "zcl.app_market_purchase_guide.v1", 4096)
+HOTSWAP_PROBE_CASE("service.market.moderation.guide.default.v1", "service",
+    "app.market.moderation.guide", "{}",
+    "zcl.app_market_moderation_guide.v1", 4096)
+HOTSWAP_PROBE_CASE("service.package.guide.default.v1", "service",
+    "zcode.package.guide", "{}",
+    "zcl.zcode_package_guide.v1", 5120)
+HOTSWAP_PROBE_CASE("service.zcode.moderation.status.default.v1", "service",
+    "zcode.moderation.status", "{}",
+    "zcl.zcode_moderation_status.v1", 4096)
+HOTSWAP_PROBE_CASE("service.zcode.passport.status.default.v1", "service",
+    "zcode.passport.status", "{}",
+    "zcl.zcode_passport_status.v1", 2048)
+HOTSWAP_PROBE_CASE("service.zcode.work.context.default.v1", "service",
+    "zcode.work.context", "{}",
+    "zcl.zcode_work_context.v1", 2048)
+HOTSWAP_PROBE_CASE("service.zcode.lane.guide.default.v1", "service",
+    "zcode.package.dev.promotion-guide", "{}",
+    "zcl.zcode_lane_guide.v1", 2048)
+HOTSWAP_PROBE_CASE("service.zcode.workspace.status.default.v1", "service",
+    "zcode.workspace.status", "{}",
+    "zcl.zcode_workspace_status.v1", 2048)
+HOTSWAP_PROBE_CASE("service.shop.reputation.empty.v1", "service",
+    "app.shop.reputation",
+    "{\"publisher\":\"020000000000000000000000000000000000000000000000000000000000000000\"}",
+    "zcl.shop_reputation.v1", 16384)
+HOTSWAP_PROBE_CASE("service.shop.status.default.v1", "service",
+    "app.shop.status", "{}", "zcl.shop_status.v1", 16384)
+HOTSWAP_PROBE_CASE("service.shop.want.list.default.v1", "service",
+    "app.shop.want.list", "{}", "zcl.shop_want_list.v1", 8192)
+HOTSWAP_PROBE_CASE("service.vault.intent.decision.story.v1", "service",
+    "dev.test.story", "{\"owner\":\"transaction_intent\"}",
+    "zcl.vault_intent_decision_story.v1", 2048)
+/* The hermetic case. Unlike every command case above, dispatching this one
+ * needs no resident node and no datadir: the empty input derives the NEW_USER
+ * row — the free allowance — from compiled-in constants alone. */
+HOTSWAP_PROBE_CASE("command.zcode.package.policy.limits.free.v1", "command",
+    "zcode.package.policy.limits", "{}",
+    "zcl.zcode_package_policy_limits.v1", 4096)
+/* Wave 2 probes. Each dispatches its file's declared probe leaf with the empty
+ * input its catalog row accepts, and is budgeted at or under that row's
+ * byte budget. */
+HOTSWAP_PROBE_CASE("command.store.catalog.default.v1", "command",
+    "app.store.catalog", "{}", "zcl.store_catalog.v1", 8192)
+HOTSWAP_PROBE_CASE("command.wallet.security.status.default.v1", "command",
+    "core.wallet.security.status", "{}", "zcl.wallet_security.v1", 2048)
+HOTSWAP_PROBE_CASE("command.status.journey.default.v1", "command",
+    "status", "{}", "zcl.status_journey.v1", 4096)
+/* Wave 3 probes. Every one dispatches a leaf whose catalog row declares
+ * zcl.command.empty_input.v1, so {} is the only input it accepts. */
+HOTSWAP_PROBE_CASE("command.account.list.default.v1", "command",
+    "app.account.list", "{}", "zcl.account_index.v1", 8192)
+HOTSWAP_PROBE_CASE("command.market.moderation.status.default.v1", "command",
+    "app.market.moderation.status", "{}", "zcl.market_moderation_status.v1", 4096)
+HOTSWAP_PROBE_CASE("command.rom_fetch.status.default.v1", "command",
+    "ops.debug.rom_fetch.status", "{}", "zcl.rom_fetch_status.v1", 4096)
+HOTSWAP_PROBE_CASE("command.rom_seed.status.default.v1", "command",
+    "ops.debug.rom_seed.status", "{}", "zcl.rom_seed_status.v1", 4096)
+/* Wave 4 probes. purchase.guide and want.list already had resident cases and
+ * are deliberately not duplicated here -- the rule wants exactly one. */
+HOTSWAP_PROBE_CASE("command.shop.want.fulfill.list.default.v1", "command",
+    "app.shop.want.fulfill.list", "{}", "zcl.shop_fulfill_list.v1", 8192)
+HOTSWAP_PROBE_CASE("command.wallet.recovery.status.default.v1", "command",
+    "core.wallet.recovery.status", "{}", "zcl.wallet_recovery_status.v1", 4096)

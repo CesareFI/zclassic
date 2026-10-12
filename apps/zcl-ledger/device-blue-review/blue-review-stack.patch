@@ -1,0 +1,10 @@
+# Copyright 2026 Rhett Creighton. Licensed under Apache-2.0.
+# Preserve the Ledger copyright and Apache-2.0 notice in script.ld.
+diff --git a/script.ld b/script.ld
+--- a/script.ld
++++ b/script.ld
+@@ -31,3 +31,3 @@
+ PAGE_SIZE  = 256;
+-STACK_SIZE = 1024;
++STACK_SIZE = 2048;
+ END_STACK  = ORIGIN(SRAM) + LENGTH(SRAM);
