@@ -393,6 +393,57 @@ static int test_local_header_refill_rotation_counter_saturates(void)
     return ok ? 0 : 1;
 }
 
+static int test_download_queue_refill_restarts_starvation_interval(void)
+{
+    int failures = 0;
+    struct fake_clock clock;
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    struct p2p_node peer = {0};
+    struct p2p_node *peers[1] = { &peer };
+    struct uint256 hash = {0};
+    int32_t height = 77;
+
+    fake_clock_install(&clock, 6000);
+    reset_sync_watchdog(&cm, &dm, &ms);
+    zcl_mutex_destroy(&dm.cs);
+    dl_init(&dm);
+    sync_monitor_set_context(&cm, &dm, &ms);
+    register_download_queue_starved();
+    cm.manager.nodes = peers;
+    cm.manager.num_nodes = 1;
+    hash.data[0] = 0xd8;
+    bool ok = dl_queue_blocks(&dm, &hash, &height, 1) == 1;
+    ok = ok && sync_set_state(SYNC_HEADERS_DOWNLOAD, "setup refill interval");
+    ok = ok && sync_set_state(SYNC_BLOCKS_DOWNLOAD, "test refill interval");
+
+    condition_engine_tick();
+    fake_clock_set(&clock, 6121);
+    condition_engine_tick();
+    ok = ok && download_queue_starved_test_remedy_calls() == 1;
+    ok = ok && condition_engine_get_active_count() == 1;
+
+    /* The queue remains nonempty after a real request is issued. That
+     * advances the witness counter, clears this episode, and must restart
+     * the 120-second starvation interval rather than immediately kick again. */
+    ok = ok && dl_mark_requested(&dm, &hash, height, 1);
+    fake_clock_set(&clock, 6122);
+    condition_engine_tick();
+    ok = ok && condition_engine_get_active_count() == 0;
+    fake_clock_set(&clock, 6123);
+    condition_engine_tick();
+    ok = ok && download_queue_starved_test_remedy_calls() == 1;
+    ok = ok && condition_engine_get_active_count() == 0;
+
+    SYNC_WATCHDOG_CHECK(
+        "download queue refill restarts the starvation interval", ok);
+    dl_free(&dm);
+    zcl_mutex_destroy(&dm.cs);
+    cleanup_sync_watchdog();
+    return failures;
+}
+
 int test_sync_watchdog_conditions(void)
 {
     printf("\n=== sync watchdog condition tests ===\n");
@@ -404,6 +455,7 @@ int test_sync_watchdog_conditions(void)
     failures += test_download_queue_starved_detail_counter_saturation();
     failures += test_local_header_refill_retry_counter_saturates();
     failures += test_local_header_refill_rotation_counter_saturates();
+    failures += test_download_queue_refill_restarts_starvation_interval();
 
     {
         /* C3: verified reducer progress must reach the network backpressure

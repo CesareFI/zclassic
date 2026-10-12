@@ -3,6 +3,8 @@
 #ifndef ZCL_CONDITIONS_DOWNLOAD_QUEUE_STARVED_H
 #define ZCL_CONDITIONS_DOWNLOAD_QUEUE_STARVED_H
 
+#include <stdbool.h>
+
 /* SYMPTOM: in SYNC_BLOCKS_DOWNLOAD with peers and pending download work
  *   (queued, in-flight, or unsettled requests), in_flight stays below
  *   DL_MAX_IN_FLIGHT_TOTAL_IBD/QUEUE_STARVED_RATIO_DEN for >= 120s.
@@ -15,6 +17,7 @@ void register_download_queue_starved(void);
 #ifdef ZCL_TESTING
 void download_queue_starved_test_reset(void);
 int download_queue_starved_test_remedy_calls(void);
+bool download_queue_starved_test_witness_refill(void);
 #endif
 
 #endif /* ZCL_CONDITIONS_DOWNLOAD_QUEUE_STARVED_H */

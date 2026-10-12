@@ -174,8 +174,18 @@ static bool witness_download_queue_starved(int64_t target_at_detect)
     atomic_store(&g_last_witness_timed_out, timed_out);
     atomic_store(&g_last_witness_inflight, inflight);
     atomic_store(&g_last_witness_queued, queued);
-    return requested > atomic_load(&g_requested_at_detect) ||
-           !download_work_pending(inflight, queued);
+    bool recovered = requested > atomic_load(&g_requested_at_detect) ||
+        !download_work_pending(inflight, queued);
+
+    /* A newly issued request is real recovery evidence, but it is not proof
+     * that every queued body arrived. Start a fresh starvation interval for
+     * any remaining work instead of immediately re-opening this condition
+     * from the old pre-refill timestamp on the next poll. */
+    if (recovered) {
+        atomic_store(&g_first_seen_mono_s, -1);
+        atomic_store(&g_first_seen_unix, 0);
+    }
+    return recovered;
 }
 
 static bool detail_download_queue_starved(struct json_value *out)
@@ -387,5 +397,15 @@ void download_queue_starved_test_reset(void)
 int download_queue_starved_test_remedy_calls(void)
 {
     return atomic_load(&g_test_remedy_calls);
+}
+
+bool download_queue_starved_test_witness_refill(void)
+{
+    atomic_store(&g_first_seen_mono_s, 1);
+    atomic_store(&g_first_seen_unix, 1);
+    atomic_store(&g_requested_at_detect, 0);
+    return witness_download_queue_starved(0) &&
+           atomic_load(&g_first_seen_mono_s) == -1 &&
+           atomic_load(&g_first_seen_unix) == 0;
 }
 #endif
