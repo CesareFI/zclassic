@@ -458,8 +458,10 @@ static int fsd_t_unsafe(void)
                                 sizeof(buf)), "STEER_DELIVER_UNSAFE_PATH");
         f = fopen(other, "r");
         ASSERT(f != NULL);
-        (void)fread(seen, 1, 4, f);
-        (void)fclose(f);
+        size_t seen_bytes = fread(seen, 1, 4, f);
+        int close_status = fclose(f);
+        ASSERT_EQ(seen_bytes, 4);
+        ASSERT_EQ(close_status, 0);
         ASSERT_STR_EQ(seen, "keep");
         ASSERT(unlink(pay) == 0);
         ASSERT(mkfifo(pay, 0600) == 0);
@@ -853,9 +855,10 @@ static bool fsd_manifest_has(const char *updir, const char *needle)
     f = fopen(path, "r");
     if (!f)
         return false;
-    (void)fread(text, 1, sizeof(text) - 1, f);
-    (void)fclose(f);
-    return strstr(text, needle) != NULL;
+    size_t read_bytes = fread(text, 1, sizeof(text) - 1, f);
+    bool read_ok = read_bytes > 0 && !ferror(f);
+    int close_status = fclose(f);
+    return read_ok && close_status == 0 && strstr(text, needle) != NULL;
 }
 
 static int fsd_t_faults(void)
@@ -1102,9 +1105,10 @@ static bool fsd_rate_read(const char *uid, long long *minute, long long *count)
     f = fopen(path, "r");
     if (!f)
         return false;
-    (void)fread(text, 1, sizeof(text) - 1, f);
-    (void)fclose(f);
-    return sscanf(text, "m=%lld n=%lld h=%lld b=%lld", minute, count, &hour,
+    size_t read_bytes = fread(text, 1, sizeof(text) - 1, f);
+    bool read_ok = read_bytes > 0 && !ferror(f);
+    int close_status = fclose(f);
+    return read_ok && close_status == 0 && sscanf(text, "m=%lld n=%lld h=%lld b=%lld", minute, count, &hour,
                   &bytes) == 4;
 }
 

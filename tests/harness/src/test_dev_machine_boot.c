@@ -2572,7 +2572,9 @@ static int tmb_provision_existing_refusal(void)
         ASSERT(memcmp(before,after,sizeof before)==0);PASS();
     } _test_next:;
     platform_private_file_close(&st.owner.credential);memory_cleanse(before,sizeof before);memory_cleanse(after,sizeof after);
-    if(dir[0])test_cleanup_tmpdir(dir);return failures;
+    if (dir[0])
+        test_cleanup_tmpdir(dir);
+    return failures;
 }
 static int tmb_provision_symlink_refusal(void)
 {
@@ -2587,7 +2589,9 @@ static int tmb_provision_symlink_refusal(void)
         ASSERT(memcmp(before,after,sizeof before)==0);PASS();
     } _test_next:;
     platform_private_file_close(&st.owner.credential);memory_cleanse(before,sizeof before);memory_cleanse(after,sizeof after);
-    if(dir[0])test_cleanup_tmpdir(dir);return failures;
+    if (dir[0])
+        test_cleanup_tmpdir(dir);
+    return failures;
 }
 static int tmb_provision_mode_refusal(void)
 {
@@ -2599,7 +2603,9 @@ static int tmb_provision_mode_refusal(void)
         ASSERT(platform_private_path_absent(path));ASSERT(!st.owner.mutated);PASS();
     } _test_next:;
     platform_private_file_close(&st.owner.credential);
-    if(dir[0])test_cleanup_tmpdir(dir);return failures;
+    if (dir[0])
+        test_cleanup_tmpdir(dir);
+    return failures;
 }
 static int tmb_provision_file_controls(void)
 {
@@ -2672,7 +2678,9 @@ static int tmb_provision_preflight_controls(void)
         PASS();
     } _test_next:;
     platform_private_file_close(&st.owner.credential);
-    if(dir[0])test_cleanup_tmpdir(dir);return failures;
+    if (dir[0])
+        test_cleanup_tmpdir(dir);
+    return failures;
 }
 static int tmb_provision_controls(void)
 {
@@ -2711,7 +2719,9 @@ static int tmb_provision_fault_controls(void)
     } _test_next:;
     tmb_provision_fault=TMB_PF_NONE;tmb_provision_target=NULL;tmb_provision_parent=NULL;
     platform_private_file_close(&st.owner.credential);tmb_host_fail_call=0;
-    if(dir[0])test_cleanup_tmpdir(dir);return failures;
+    if (dir[0])
+        test_cleanup_tmpdir(dir);
+    return failures;
 }
 
 static int t_protected_identity_comment(void)
