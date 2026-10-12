@@ -36,6 +36,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 
 #ifdef ZCL_TESTING
 static snapsync_reset_gate_fn g_snapsync_end_finalize_gate = NULL;
@@ -79,6 +80,28 @@ static bool snapsync_decode_money(const uint8_t bytes[8], int64_t *out)
 
     *out = (int64_t)value;
     return true;
+}
+
+static bool snapsync_decode_height(const uint8_t bytes[4], int *out)
+{
+    uint32_t height = 0;
+
+    if (!bytes || !out)
+        return false;
+    for (size_t i = 0; i < 4; i++)
+        height |= (uint32_t)bytes[i] << (i * 8);
+    if (height > INT_MAX)
+        return false;
+
+    *out = (int)height;
+    return true;
+}
+
+static bool snapsync_decode_entry_scalars(const uint8_t bytes[12],
+                                          int64_t *value, int *height)
+{
+    return snapsync_decode_money(bytes, value) &&
+           snapsync_decode_height(bytes + 8, height);
 }
 
 /* ── Staging helpers ─────────────────────────────────────── */
@@ -383,14 +406,11 @@ static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
                   (chunk_data[pos+2] << 16) | (chunk_data[pos+3] << 24));
         pos += 4;
 
-        if (!snapsync_decode_money(chunk_data + pos, &u.value))
+        if (!snapsync_decode_entry_scalars(chunk_data + pos,
+                                           &u.value, &u.height))
             LOG_ERR("snapshot_sync",
-                    "apply_chunk: value outside money range entry %u", i);
-        pos += 8;
-
-        u.height = (int)(chunk_data[pos] | (chunk_data[pos+1] << 8) |
-                    (chunk_data[pos+2] << 16) | (chunk_data[pos+3] << 24));
-        pos += 4;
+                    "apply_chunk: value or height outside range entry %u", i);
+        pos += 12;
 
         if (pos >= chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated at coinbase flag, entry %u pos %zu", i, pos);
         u.is_coinbase = (chunk_data[pos++] != 0);
