@@ -536,10 +536,41 @@ static void *quota_admit_once(void *opaque)
     return NULL;
 }
 
+struct anchor_hammer {
+    pthread_barrier_t start;
+    atomic_bool failed;
+};
+
+static void *anchor_read_once(void *opaque)
+{
+    struct anchor_hammer *hammer = opaque;
+    size_t count = 0;
+
+    (void)pthread_barrier_wait(&hammer->start);
+    if (!beta6_bs_anchors(&count) || count != 1)
+        atomic_store(&hammer->failed, true);
+    return NULL;
+}
+
 int test_beta6_bootstrap(void);
 int test_beta6_bootstrap(void)
 {
     int failures = 0;
+
+    TEST("compiled beta6 anchors initialize once under concurrent lookup") {
+        struct anchor_hammer hammer = {0};
+        pthread_t first;
+        pthread_t second;
+
+        ASSERT_EQ(pthread_barrier_init(&hammer.start, NULL, 2), 0);
+        ASSERT_EQ(pthread_create(&first, NULL, anchor_read_once, &hammer), 0);
+        ASSERT_EQ(pthread_create(&second, NULL, anchor_read_once, &hammer), 0);
+        ASSERT_EQ(pthread_join(first, NULL), 0);
+        ASSERT_EQ(pthread_join(second, NULL), 0);
+        ASSERT(!atomic_load(&hammer.failed));
+        ASSERT_EQ(pthread_barrier_destroy(&hammer.start), 0);
+        PASS();
+    }
 
     /* ─────────────────────────── wire codec ─────────────────────────── */
 

@@ -12,6 +12,7 @@
 
 #include "platform/directory_compat.h"
 #include "platform/positioned_file.h"
+#include "util/sync.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -36,12 +37,10 @@ static const struct {
     (sizeof(k_beta6_anchor_text) / sizeof(k_beta6_anchor_text[0]))
 
 static struct beta6_bs_anchor g_anchors[BETA6_ANCHOR_COUNT];
-static bool g_anchors_ready;
+static zcl_once_t g_anchors_once = ZCL_ONCE_INIT;
 
 static void anchors_build_once(void)
 {
-    if (g_anchors_ready)
-        return;
     for (size_t i = 0; i < BETA6_ANCHOR_COUNT; i++) {
         g_anchors[i].height = k_beta6_anchor_text[i].height;
         uint256_set_hex(&g_anchors[i].hash_block, k_beta6_anchor_text[i].hash_block);
@@ -52,12 +51,11 @@ static void anchors_build_once(void)
         uint256_set_hex(&g_anchors[i].hash_chainstate,
                         k_beta6_anchor_text[i].hash_chainstate);
     }
-    g_anchors_ready = true;
 }
 
 const struct beta6_bs_anchor *beta6_bs_anchors(size_t *count)
 {
-    anchors_build_once();
+    (void)zcl_once_call(&g_anchors_once, anchors_build_once);
     if (count)
         *count = BETA6_ANCHOR_COUNT;
     return g_anchors;
@@ -68,7 +66,7 @@ const struct beta6_bs_anchor *beta6_bs_find_anchor(int32_t height,
 {
     if (!hash_block)
         return NULL;
-    anchors_build_once();
+    (void)zcl_once_call(&g_anchors_once, anchors_build_once);
     for (size_t i = 0; i < BETA6_ANCHOR_COUNT; i++) {
         if (g_anchors[i].height == height &&
             uint256_eq(&g_anchors[i].hash_block, hash_block))
