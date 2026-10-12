@@ -152,6 +152,7 @@ void snapsync_test_set_staging_count_gate(snapsync_reset_gate_fn fn,
                                           void *ctx);
 void snapsync_test_run_staging_count_gate(void);
 bool snapsync_test_service_lock_is_held(void);
+uint64_t snapsync_test_serve_puzzle_counter_increment(uint64_t value);
 #endif
 
 /* ── Failure helpers (snapshot_verify.c) ───────────────────────── */

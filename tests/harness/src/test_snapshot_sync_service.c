@@ -1079,6 +1079,22 @@ static int test_snapshot_serve_request_requires_exact_pow_frame(void)
     return failures;
 }
 
+static int test_snapshot_serve_census_counter_saturates(void)
+{
+    int failures = 0;
+
+    TEST("snapshot serve census counters saturate instead of wrapping") {
+        ASSERT(snapsync_test_serve_puzzle_counter_increment(0) == 1);
+        ASSERT(snapsync_test_serve_puzzle_counter_increment(UINT64_MAX - 1) ==
+               UINT64_MAX);
+        ASSERT(snapsync_test_serve_puzzle_counter_increment(UINT64_MAX) ==
+               UINT64_MAX);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_snapshot_sync_service_stream_helpers(void)
 {
     int failures = 0;
@@ -3737,6 +3753,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_offer_seed_cap_matches_self_derived();
     failures += test_snapshot_sync_service_builds_pow();
     failures += test_snapshot_serve_request_requires_exact_pow_frame();
+    failures += test_snapshot_serve_census_counter_saturates();
     failures += test_snapshot_sync_service_stream_helpers();
     failures += test_snapshot_manifest_contract();
     failures += test_snapshot_manifest_recovery_contract();

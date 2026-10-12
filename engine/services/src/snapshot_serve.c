@@ -112,6 +112,30 @@ static _Atomic uint64_t g_snapsync_serve_offered     = 0;
 static _Atomic uint64_t g_snapsync_serve_first_sight = 0;
 static _Atomic uint64_t g_snapsync_serve_duplicates  = 0;
 
+/* The serve census is operational evidence, not a wrapping odometer. A
+ * saturated total remains truthful under sustained hostile request traffic. */
+static uint64_t snapsync_serve_counter_increment(_Atomic uint64_t *counter)
+{
+    uint64_t value = atomic_load_explicit(counter, memory_order_relaxed);
+
+    while (value != UINT64_MAX) {
+        if (atomic_compare_exchange_weak_explicit(
+                counter, &value, value + 1, memory_order_relaxed,
+                memory_order_relaxed)) {
+            return value + 1;
+        }
+    }
+    return UINT64_MAX;
+}
+
+#ifdef ZCL_TESTING
+uint64_t snapsync_test_serve_puzzle_counter_increment(uint64_t value)
+{
+    _Atomic uint64_t counter = value;
+    return snapsync_serve_counter_increment(&counter);
+}
+#endif
+
 void snapsync_get_serve_puzzle_census(struct snapsync_serve_puzzle_census *out)
 {
     if (!out) return;
@@ -150,16 +174,18 @@ static void snapsync_serve_note_puzzle(const struct fast_sync_pow *pow)
     sha3_256_write(&ctx, (const unsigned char *)&pow->nonce, 8);
     sha3_256_finalize(&ctx, digest);
 
-    atomic_fetch_add(&g_snapsync_serve_offered, 1);
+    (void)snapsync_serve_counter_increment(&g_snapsync_serve_offered);
     if (puzzle_gate_admit_external(&g_snapsync_serve_load_gate, digest)) {
-        atomic_fetch_add(&g_snapsync_serve_first_sight, 1);
+        (void)snapsync_serve_counter_increment(
+            &g_snapsync_serve_first_sight);
         return;
     }
     /* A byte-identical proof. Loud, because this is the exact event that
      * decides whether the protocol revision above can drop its
      * compatibility window — and it is NOT a refusal: the request is
      * served anyway. */
-    uint64_t dups = atomic_fetch_add(&g_snapsync_serve_duplicates, 1) + 1;
+    uint64_t dups = snapsync_serve_counter_increment(
+        &g_snapsync_serve_duplicates);
     LOG_WARN("snapsync",
              "serve puzzle census: byte-identical zsnapreq proof "
              "(ts=%lld nonce=%llu) — served anyway, admission unchanged; "
