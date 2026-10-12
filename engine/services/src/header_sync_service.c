@@ -23,6 +23,7 @@ enum { SYNC_HEADER_CHAIN_WALK_CAP = 100000 };
 #include "util/safe_alloc.h"
 
 static atomic_uint g_getheaders_log_count = 0;
+static atomic_uint g_accepted_headers_log_count = 0;
 static atomic_bool g_block_file_scan_triggered = false;
 
 /* Fold stale-peer backoffs into one 60s summary; atomic state keeps the
@@ -215,18 +216,25 @@ void syncsvc_build_header_processing_activation(
 bool syncsvc_should_log_accepted_headers(const struct p2p_node *node,
                                          const struct block_index *header_tip)
 {
-    static int headers_log_count = 0;
-
     if (!header_tip)
         return true;
 
     if (node && node->starting_height > 0 &&
         header_tip->nHeight < node->starting_height - 2000) {
-        return (headers_log_count++ % 10 == 0);
+        return (atomic_fetch_add_explicit(&g_accepted_headers_log_count, 1U,
+                                          memory_order_relaxed) % 10U == 0U);
     }
 
     return true;
 }
+
+#ifdef ZCL_TESTING
+void syncsvc_accepted_headers_log_reset_for_testing(void)
+{
+    atomic_store_explicit(&g_accepted_headers_log_count, 0U,
+                          memory_order_relaxed);
+}
+#endif
 
 bool syncsvc_is_initial_block_download(const struct p2p_node *node,
                                        int our_height)

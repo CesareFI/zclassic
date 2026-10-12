@@ -33,6 +33,7 @@ extern void syncsvc_stale_warning_reset_for_testing(void);
 extern void syncsvc_stall_recovery_reset_for_testing(void);
 extern void syncsvc_block_file_scan_reset_for_testing(void);
 extern void syncsvc_header_log_reset_for_testing(void);
+extern void syncsvc_accepted_headers_log_reset_for_testing(void);
 
 struct stale_warning_hammer {
     pthread_mutex_t lock;
@@ -398,6 +399,7 @@ static int test_sync_service_headers_log_throttle(void)
         tip.phashBlock = &h;
         tip.nHeight = 2000;
 
+        syncsvc_accepted_headers_log_reset_for_testing();
         ASSERT(syncsvc_should_log_accepted_headers(&node, &tip));
         ASSERT(!syncsvc_should_log_accepted_headers(&node, &tip));
         ASSERT(!syncsvc_should_log_accepted_headers(&node, &tip));
@@ -405,6 +407,80 @@ static int test_sync_service_headers_log_throttle(void)
         tip.nHeight = 4999;
         ASSERT(syncsvc_should_log_accepted_headers(&node, &tip));
         ASSERT(syncsvc_should_log_accepted_headers(&node, NULL));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+struct accepted_headers_log_hammer {
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    pthread_cond_t release;
+    size_t waiting;
+    bool go;
+    bool should_log[2];
+};
+
+struct accepted_headers_log_worker {
+    struct accepted_headers_log_hammer *hammer;
+    size_t slot;
+};
+
+static void *syncsvc_choose_accepted_headers_log(void *opaque)
+{
+    struct accepted_headers_log_worker *worker = opaque;
+    struct p2p_node node = { .starting_height = 5000 };
+    struct block_index tip = { .nHeight = 2000 };
+    struct uint256 hash = {0};
+
+    tip.phashBlock = &hash;
+    (void)pthread_mutex_lock(&worker->hammer->lock);
+    worker->hammer->waiting++;
+    (void)pthread_cond_signal(&worker->hammer->ready);
+    while (!worker->hammer->go)
+        (void)pthread_cond_wait(&worker->hammer->release,
+                                &worker->hammer->lock);
+    (void)pthread_mutex_unlock(&worker->hammer->lock);
+    worker->hammer->should_log[worker->slot] =
+        syncsvc_should_log_accepted_headers(&node, &tip);
+    return NULL;
+}
+
+static int test_sync_service_accepted_headers_log_throttle_is_atomic(void)
+{
+    int failures = 0;
+
+    TEST("sync_service emits one accepted-header IBD log concurrently") {
+        struct accepted_headers_log_hammer hammer = {0};
+        struct accepted_headers_log_worker workers[2] = {
+            { .hammer = &hammer, .slot = 0 },
+            { .hammer = &hammer, .slot = 1 },
+        };
+        pthread_t threads[2];
+
+        syncsvc_accepted_headers_log_reset_for_testing();
+        ASSERT_EQ(pthread_mutex_init(&hammer.lock, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&hammer.ready, NULL), 0);
+        ASSERT_EQ(pthread_cond_init(&hammer.release, NULL), 0);
+        ASSERT_EQ(pthread_create(&threads[0], NULL,
+                                 syncsvc_choose_accepted_headers_log,
+                                 &workers[0]), 0);
+        ASSERT_EQ(pthread_create(&threads[1], NULL,
+                                 syncsvc_choose_accepted_headers_log,
+                                 &workers[1]), 0);
+        ASSERT_EQ(pthread_mutex_lock(&hammer.lock), 0);
+        while (hammer.waiting < 2)
+            ASSERT_EQ(pthread_cond_wait(&hammer.ready, &hammer.lock), 0);
+        hammer.go = true;
+        ASSERT_EQ(pthread_cond_broadcast(&hammer.release), 0);
+        ASSERT_EQ(pthread_mutex_unlock(&hammer.lock), 0);
+        ASSERT_EQ(pthread_join(threads[0], NULL), 0);
+        ASSERT_EQ(pthread_join(threads[1], NULL), 0);
+        ASSERT_EQ(pthread_cond_destroy(&hammer.release), 0);
+        ASSERT_EQ(pthread_cond_destroy(&hammer.ready), 0);
+        ASSERT_EQ(pthread_mutex_destroy(&hammer.lock), 0);
+        ASSERT(hammer.should_log[0] != hammer.should_log[1]);
         PASS();
     } _test_next:;
 
@@ -2993,6 +3069,7 @@ int test_sync_service(void)
     failures += test_sync_service_periodic_getheaders_action();
     failures += test_sync_service_invalid_block_getheaders_action();
     failures += test_sync_service_headers_log_throttle();
+    failures += test_sync_service_accepted_headers_log_throttle_is_atomic();
     failures += test_sync_service_header_batch_followup();
     failures += test_sync_service_reject_probe_rate_limit();
     failures += test_sync_service_rejects_unrepresentable_body_target();
