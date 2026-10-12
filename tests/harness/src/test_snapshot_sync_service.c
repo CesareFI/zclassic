@@ -35,6 +35,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+bool snapsync_test_read_compact_size(const uint8_t *data, size_t len,
+                                     size_t *pos, uint64_t *out);
+
 struct reset_gate {
     pthread_mutex_t mutex;
     pthread_cond_t entered;
@@ -248,6 +251,31 @@ static void build_snapshot_chunk(struct byte_stream *s)
     stream_write_u8(s, 0);
     stream_write_u8(s, (uint8_t)sizeof(script));
     stream_write_bytes(s, script, sizeof(script));
+}
+
+static int test_snapshot_sync_service_script_length_decode(void)
+{
+    int failures = 0;
+
+    TEST("snapshot sync consumes full CompactSize script lengths") {
+        const uint8_t compact_255[9] = { 255, 255, 0, 0, 0, 0, 0, 0, 0 };
+        const uint8_t truncated_255[8] = { 255, 0, 0, 0, 0, 0, 0, 0 };
+        size_t pos = 0;
+        uint64_t size = 0;
+
+        ASSERT(snapsync_test_read_compact_size(compact_255,
+                                                sizeof(compact_255),
+                                                &pos, &size));
+        ASSERT(pos == sizeof(compact_255));
+        ASSERT(size == 255);
+        pos = 0;
+        ASSERT(!snapsync_test_read_compact_size(truncated_255,
+                                                 sizeof(truncated_255),
+                                                 &pos, &size));
+        PASS();
+    } _test_next:;
+
+    return failures;
 }
 
 static void build_out_of_range_value_snapshot_chunk(struct byte_stream *s)
@@ -3685,6 +3713,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_db_service_chunk_contained();
     failures += test_snapshot_sync_service_containment_preserves_canonical_state();
     failures += test_snapshot_sync_service_boot_discards_staging();
+    failures += test_snapshot_sync_service_script_length_decode();
     failures += test_snapshot_sync_service_finalize_mismatch();
     failures += test_snapshot_sync_service_chunk_apply_failure_fails_closed();
     failures += test_snapshot_sync_service_out_of_range_value_fails_closed();

@@ -104,6 +104,39 @@ static bool snapsync_decode_entry_scalars(const uint8_t bytes[12],
            snapsync_decode_height(bytes + 8, height);
 }
 
+static bool snapsync_read_compact_size(const uint8_t *data, size_t len,
+                                       size_t *pos, uint64_t *out)
+{
+    uint8_t marker;
+    size_t width;
+    uint64_t value = 0;
+
+    if (!data || !pos || !out || *pos >= len)
+        return false;
+    marker = data[(*pos)++];
+    if (marker < 253) {
+        *out = marker;
+        return true;
+    }
+
+    width = marker == 253 ? 2 : marker == 254 ? 4 : 8;
+    if (width > len - *pos)
+        return false;
+    for (size_t i = 0; i < width; i++)
+        value |= (uint64_t)data[*pos + i] << (i * 8);
+    *pos += width;
+    *out = value;
+    return true;
+}
+
+#ifdef ZCL_TESTING
+bool snapsync_test_read_compact_size(const uint8_t *data, size_t len,
+                                     size_t *pos, uint64_t *out)
+{
+    return snapsync_read_compact_size(data, len, pos, out);
+}
+#endif
+
 /* ── Staging helpers ─────────────────────────────────────── */
 
 struct zcl_result snapsync_discard_staging_internal(struct node_db *ndb,
@@ -415,19 +448,15 @@ static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
         if (pos >= chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated at coinbase flag, entry %u pos %zu", i, pos);
         u.is_coinbase = (chunk_data[pos++] != 0);
 
-        if (pos >= chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated at script varint, entry %u pos %zu", i, pos);
-        uint64_t slen = chunk_data[pos++];
-        if (slen == 253) {
-            if (pos + 2 > chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated at 2-byte varint, entry %u pos %zu", i, pos);
-            slen = chunk_data[pos] | (chunk_data[pos+1] << 8);
-            pos += 2;
-        } else if (slen == 254) {
-            if (pos + 4 > chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: truncated at 4-byte varint, entry %u pos %zu", i, pos);
-            slen = chunk_data[pos] | ((uint32_t)chunk_data[pos+1] << 8) |
-                   ((uint32_t)chunk_data[pos+2] << 16) | ((uint32_t)chunk_data[pos+3] << 24);
-            pos += 4;
-        }
-        if (pos + slen > chunk_len) LOG_ERR("snapshot_sync", "apply_chunk: script overflows chunk, entry %u pos %zu slen %llu", i, pos, (unsigned long long)slen);
+        uint64_t slen = 0;
+        if (!snapsync_read_compact_size(chunk_data, chunk_len, &pos, &slen))
+            LOG_ERR("snapshot_sync",
+                    "apply_chunk: truncated compact size, entry %u pos %zu",
+                    i, pos);
+        if (slen > chunk_len - pos)
+            LOG_ERR("snapshot_sync",
+                    "apply_chunk: script overflows chunk, entry %u pos %zu slen %llu",
+                    i, pos, (unsigned long long)slen);
 
         u.script = (uint8_t *)(chunk_data + pos);
         u.script_len = (size_t)slen;
