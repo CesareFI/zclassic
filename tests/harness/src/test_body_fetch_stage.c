@@ -228,6 +228,12 @@ static bool dump_observed_total_is(int64_t expected)
     return matches;
 }
 
+static bool body_fetch_counter_saturates(void)
+{
+    return body_fetch_stage_test_counter_saturates(UINT64_MAX - 1) &&
+           body_fetch_stage_test_counter_saturates(UINT64_MAX);
+}
+
 /* Flip the ok flag on a validate_headers_log row (for testing the
  * skipped_invalid path without rewiring the vh stub validator). */
 static bool vh_log_force_ok(sqlite3 *db, int height, int ok)
@@ -754,6 +760,8 @@ static int test_body_fetch_stage_platform_arm(void)
         BF_CHECK("dump: saturates unsigned observed_total",
                  dump_observed_total_is(INT64_MAX));
         body_fetch_stage_test_set_observed_total(0);
+        BF_CHECK("diagnostics: uint64 counters do not wrap",
+                 body_fetch_counter_saturates());
 
         bf_teardown(dir, &ms, &sc);
     }

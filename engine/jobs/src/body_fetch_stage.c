@@ -61,6 +61,19 @@ enum body_fetch_idle_reason {
 static _Atomic int g_last_idle_reason = BF_IDLE_NONE;
 static _Atomic uint64_t g_idle_reason_total[BF_IDLE_REASON_COUNT];
 
+/* Diagnostics must remain monotonic for the process lifetime.  A wrapping
+ * counter can make a persistent body-fetch failure look newly healthy. */
+static void body_fetch_counter_increment(_Atomic uint64_t *counter)
+{
+    uint64_t current = atomic_load_explicit(counter, memory_order_relaxed);
+
+    while (current != UINT64_MAX &&
+           !atomic_compare_exchange_weak_explicit(
+               counter, &current, current + 1, memory_order_relaxed,
+               memory_order_relaxed)) {
+    }
+}
+
 static const char *body_fetch_idle_reason_name(enum body_fetch_idle_reason r)
 {
     static const char *const names[BF_IDLE_REASON_COUNT] = {
@@ -81,7 +94,7 @@ static job_result_t body_fetch_idle(enum body_fetch_idle_reason reason)
     atomic_store(&g_last_blocked_unix, platform_time_wall_unix());
     atomic_store(&g_last_idle_reason, reason);
     if (reason > BF_IDLE_NONE && reason < BF_IDLE_REASON_COUNT)
-        atomic_fetch_add(&g_idle_reason_total[reason], 1u);
+        body_fetch_counter_increment(&g_idle_reason_total[reason]);
     return JOB_IDLE;
 }
 
@@ -391,7 +404,7 @@ static job_result_t step_body_fetch(struct stage_step_ctx *c)
                                    "skipped_invalid", 0, false,
                                    "header_validation_failed"))
             return JOB_FATAL;
-        atomic_fetch_add(&g_skipped_total, 1);
+        body_fetch_counter_increment(&g_skipped_total);
         atomic_store(&g_last_advance_height, (int64_t)next_h);
         atomic_store(&g_last_idle_reason, BF_IDLE_NONE);
         c->cursor_out = c->cursor_in + 1;
@@ -418,7 +431,7 @@ static job_result_t step_body_fetch(struct stage_step_ctx *c)
     if (!body_fetch_log_insert(db, next_h, &vh_hash, "disk", 0, true, NULL))
         return JOB_FATAL;
 
-    atomic_fetch_add(&g_observed_total, 1);
+    body_fetch_counter_increment(&g_observed_total);
     atomic_store(&g_last_advance_height, (int64_t)next_h);
     atomic_store(&g_last_idle_reason, BF_IDLE_NONE);
     c->cursor_out = c->cursor_in + 1;
@@ -525,6 +538,14 @@ uint64_t body_fetch_stage_skipped_total(void)
 void body_fetch_stage_test_set_observed_total(uint64_t value)
 {
     atomic_store(&g_observed_total, value);
+}
+
+bool body_fetch_stage_test_counter_saturates(uint64_t initial)
+{
+    _Atomic uint64_t counter = initial;
+
+    body_fetch_counter_increment(&counter);
+    return atomic_load(&counter) == UINT64_MAX;
 }
 
 void body_fetch_stage_test_install_stage(stage_t *stage)
