@@ -1390,6 +1390,15 @@ static int test_snapshot_sync_service_prepare_serve_step(void)
 
         ASSERT(snapsync_prepare_serve_step(&step, &node, buf, (int64_t)pos).ok);
         ASSERT(step.action == SNAPSYNC_SERVE_ACTION_SEND_END);
+
+        node.zsync_file_offset = 0;
+        node.zsync_offset = UINT64_MAX;
+        node.zsync_sent = UINT64_MAX;
+        ASSERT(snapsync_prepare_serve_step(&step, &node, buf,
+                                           (int64_t)pos).ok);
+        ASSERT(step.action == SNAPSYNC_SERVE_ACTION_SEND_CHUNK);
+        ASSERT(node.zsync_offset == UINT64_MAX);
+        ASSERT(node.zsync_sent == UINT64_MAX);
         PASS();
     } _test_next:;
 

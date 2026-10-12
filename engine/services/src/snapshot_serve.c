@@ -199,6 +199,11 @@ static bool snapsync_serve_offset_is_negative(int64_t offset)
     return offset < 0;
 }
 
+static uint64_t snapsync_serve_counter_add(uint64_t value, uint64_t add)
+{
+    return value > UINT64_MAX - add ? UINT64_MAX : value + add;
+}
+
 static bool snapsync_serve_skip_bytes(int64_t *scan, int64_t buf_size,
                                       uint64_t count)
 {
@@ -316,7 +321,8 @@ struct zcl_result snapsync_prepare_serve_step(struct snapsync_serve_step *step,
     step->entries = entries;
 
     node->zsync_file_offset = scan;
-    node->zsync_offset += entries;
-    node->zsync_sent++;
+    node->zsync_offset = snapsync_serve_counter_add(node->zsync_offset,
+                                                     entries);
+    node->zsync_sent = snapsync_serve_counter_add(node->zsync_sent, 1);
     return ZCL_OK;
 }
