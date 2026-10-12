@@ -97,6 +97,12 @@ static bool snapsync_decode_height(const uint8_t bytes[4], int *out)
     return true;
 }
 
+static uint32_t snapsync_decode_vout(const uint8_t bytes[4])
+{
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
 static bool snapsync_decode_entry_scalars(const uint8_t bytes[12],
                                           int64_t *value, int *height)
 {
@@ -134,6 +140,11 @@ bool snapsync_test_read_compact_size(const uint8_t *data, size_t len,
                                      size_t *pos, uint64_t *out)
 {
     return snapsync_read_compact_size(data, len, pos, out);
+}
+
+uint32_t snapsync_test_decode_vout(const uint8_t bytes[4])
+{
+    return snapsync_decode_vout(bytes);
 }
 #endif
 
@@ -435,8 +446,7 @@ static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
         memset(&u, 0, sizeof(u));
         memcpy(u.txid, chunk_data + pos, 32); pos += 32;
 
-        u.vout = (uint32_t)(chunk_data[pos] | (chunk_data[pos+1] << 8) |
-                  (chunk_data[pos+2] << 16) | (chunk_data[pos+3] << 24));
+        u.vout = snapsync_decode_vout(chunk_data + pos);
         pos += 4;
 
         if (!snapsync_decode_entry_scalars(chunk_data + pos,

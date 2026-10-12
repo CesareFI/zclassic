@@ -37,6 +37,7 @@
 
 bool snapsync_test_read_compact_size(const uint8_t *data, size_t len,
                                      size_t *pos, uint64_t *out);
+uint32_t snapsync_test_decode_vout(const uint8_t bytes[4]);
 
 struct reset_gate {
     pthread_mutex_t mutex;
@@ -272,6 +273,20 @@ static int test_snapshot_sync_service_script_length_decode(void)
         ASSERT(!snapsync_test_read_compact_size(truncated_255,
                                                  sizeof(truncated_255),
                                                  &pos, &size));
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
+static int test_snapshot_sync_service_vout_decode(void)
+{
+    int failures = 0;
+
+    TEST("snapshot sync decodes high-bit vouts as unsigned") {
+        const uint8_t high_bit_vout[4] = { 0, 0, 0, 0x80 };
+
+        ASSERT(snapsync_test_decode_vout(high_bit_vout) == UINT32_C(0x80000000));
         PASS();
     } _test_next:;
 
@@ -3714,6 +3729,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_containment_preserves_canonical_state();
     failures += test_snapshot_sync_service_boot_discards_staging();
     failures += test_snapshot_sync_service_script_length_decode();
+    failures += test_snapshot_sync_service_vout_decode();
     failures += test_snapshot_sync_service_finalize_mismatch();
     failures += test_snapshot_sync_service_chunk_apply_failure_fails_closed();
     failures += test_snapshot_sync_service_out_of_range_value_fails_closed();
