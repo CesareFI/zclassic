@@ -88,6 +88,17 @@ static struct {
  * releasing cs_nodes, so the two never nest. */
 static pthread_mutex_t g_local_recovery_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void sync_monitor_counter_increment(_Atomic uint64_t *counter)
+{
+    uint64_t value = atomic_load_explicit(counter, memory_order_relaxed);
+
+    while (value != UINT64_MAX &&
+           !atomic_compare_exchange_weak_explicit(
+               counter, &value, value + 1, memory_order_relaxed,
+               memory_order_relaxed)) {
+    }
+}
+
 void sync_monitor_init(void)
 {
     g_condition_cm = NULL;
@@ -273,7 +284,7 @@ struct zcl_result sync_monitor_evaluate_tip_state(void)
         served_height, local_height, header_height, peer_height, peer_count,
         queued, in_flight, intake_pending, body_history_status_now());
 
-    atomic_fetch_add(&g_tip_state_evaluations, 1);
+    sync_monitor_counter_increment(&g_tip_state_evaluations);
     atomic_store(&g_tip_eval_served_height, served_height);
     atomic_store(&g_tip_eval_local_height, local_height);
     atomic_store(&g_tip_eval_header_height, header_height);
@@ -302,7 +313,7 @@ struct zcl_result sync_monitor_evaluate_tip_state(void)
                        sync_state_name(observed));
     }
 
-    atomic_fetch_add(&g_tip_state_transitions, 1);
+    sync_monitor_counter_increment(&g_tip_state_transitions);
     /* Preserve the side effects the old synchronous block-acceptance edge
      * owned.  These are operational policy only; no consensus state changes. */
     set_flush_policy(3600, 500000, 100);

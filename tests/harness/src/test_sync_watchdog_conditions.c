@@ -10,6 +10,7 @@
 #include "json/json.h"
 #include "jobs/reducer_frontier.h"
 #include "net/download.h"
+#include "net/msgprocessor.h"
 #include "net/protocol.h"
 #include "net/tip_watchdog.h"
 #include "platform/clock.h"
@@ -101,6 +102,7 @@ static void cleanup_sync_watchdog(void)
 {
     condition_engine_reset_for_testing();
     blocker_reset_for_testing();
+    sync_monitor_set_msg_processor(NULL);
     sync_monitor_set_context(NULL, NULL, NULL);
     clock_reset_default();
 }
@@ -132,6 +134,30 @@ static int test_sync_monitor_download_counter_saturation(void)
     json_free(&state);
     printf("sync_watchdog_conditions: sync monitor saturates unsigned "
            "download counters... %s\n", ok ? "OK" : "FAIL");
+    cleanup_sync_watchdog();
+    return ok ? 0 : 1;
+}
+
+static int test_sync_monitor_evaluation_counter_saturation(void)
+{
+    struct connman cm;
+    struct download_manager dm;
+    struct main_state ms;
+    struct msg_processor mp = {0};
+    struct json_value state;
+
+    reset_sync_watchdog(&cm, &dm, &ms);
+    sync_monitor_set_msg_processor(&mp);
+    sync_monitor_test_set_tip_state_counters(UINT64_MAX, 0, 0);
+    bool ok = sync_monitor_evaluate_tip_state().ok;
+    json_init(&state);
+    ok = ok && sync_monitor_dump_state_json(&state, NULL);
+    ok = ok && json_get_int(json_get(&state, "tip_state_evaluations")) ==
+        INT64_MAX;
+    json_free(&state);
+    printf("sync_watchdog_conditions: tip-state evaluation counter "
+           "saturates on the production evaluator... %s\n",
+           ok ? "OK" : "FAIL");
     cleanup_sync_watchdog();
     return ok ? 0 : 1;
 }
@@ -374,6 +400,7 @@ int test_sync_watchdog_conditions(void)
 
     failures += test_download_queue_uses_monotonic_timeout();
     failures += test_sync_monitor_download_counter_saturation();
+    failures += test_sync_monitor_evaluation_counter_saturation();
     failures += test_download_queue_starved_detail_counter_saturation();
     failures += test_local_header_refill_retry_counter_saturates();
     failures += test_local_header_refill_rotation_counter_saturates();
