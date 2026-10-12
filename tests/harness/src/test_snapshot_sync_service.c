@@ -258,6 +258,20 @@ static void build_out_of_range_value_snapshot_chunk(struct byte_stream *s)
     s->data[4 + 32 + 4 + 7] = 0x80;
 }
 
+static void build_two_entry_snapshot_chunk(struct byte_stream *s)
+{
+    uint8_t entry[128];
+
+    build_snapshot_chunk(s);
+    size_t entry_len = s->size - 4;
+    memcpy(entry, s->data + 4, entry_len);
+    s->data[0] = 2;
+    s->data[1] = 0;
+    s->data[2] = 0;
+    s->data[3] = 0;
+    (void)stream_write_bytes(s, entry, entry_len);
+}
+
 static void snapshot_reset_fixture_cleanup(struct snapshot_reset_fixture *f)
 {
     if (f->thread_started) {
@@ -2821,6 +2835,48 @@ static int test_snapshot_sync_service_out_of_range_value_fails_closed(void)
     return failures;
 }
 
+static int test_snapshot_sync_service_excess_entries_fail_before_staging(void)
+{
+    int failures = 0;
+
+    TEST("snapshot sync rejects chunk entries beyond its accepted offer") {
+        struct snapshot_sync_service svc;
+        struct node_db ndb;
+        struct db_service dbsvc;
+        struct app_runtime_context runtime;
+        struct byte_stream chunk;
+
+        memset(&svc, 0, sizeof(svc));
+        memset(&runtime, 0, sizeof(runtime));
+        ASSERT(node_db_open(&ndb, ":memory:"));
+        db_service_init(&dbsvc);
+        ASSERT(db_service_attach(&dbsvc, &ndb));
+        ASSERT(db_service_start(&dbsvc));
+        runtime.db_service = &dbsvc;
+        app_runtime_set_current(&runtime);
+        snapsync_init(&svc, &ndb);
+        svc.state = SNAPSYNC_NEGOTIATING;
+        svc.start_time_us = 1;
+        svc.offered_count = 1;
+        svc.serving_peer_id = 7;
+
+        ASSERT(snapsync_begin_receive(&svc).ok);
+        build_two_entry_snapshot_chunk(&chunk);
+        ASSERT(snapsync_apply_chunk(&svc, chunk.data, chunk.size) < 0);
+        ASSERT(svc.received_utxos == 0);
+        ASSERT(svc.state == SNAPSYNC_FAILED);
+        ASSERT(count_table_rows(ndb.db, "snapshot_staging_utxos") == 0);
+
+        stream_free(&chunk);
+        app_runtime_set_current(NULL);
+        db_service_stop(&dbsvc);
+        node_db_close(&ndb);
+        PASS();
+    } _test_next:;
+
+    return failures;
+}
+
 static int test_snapshot_accept_offer_with_few_utxos(void)
 {
     int failures = 0;
@@ -3583,6 +3639,7 @@ int test_snapshot_sync_service(void)
     failures += test_snapshot_sync_service_finalize_mismatch();
     failures += test_snapshot_sync_service_chunk_apply_failure_fails_closed();
     failures += test_snapshot_sync_service_out_of_range_value_fails_closed();
+    failures += test_snapshot_sync_service_excess_entries_fail_before_staging();
     failures += test_snapshot_accept_offer_with_few_utxos();
     failures += test_snapshot_busy_offer_skips_utxo_count();
     failures += test_snapshot_accept_offer_with_real_utxos();

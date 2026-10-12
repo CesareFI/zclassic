@@ -331,6 +331,26 @@ bool snapsync_rollback_receive_write_internal(struct node_db *ndb, void *ctx)
     return node_db_rollback(ndb);
 }
 
+static bool snapsync_chunk_fits_offer(struct snapshot_sync_service *svc,
+                                      uint32_t entries)
+{
+    uint64_t received = 0;
+    uint64_t offered = 0;
+
+    snapsync_service_lock_internal();
+    received = svc->received_utxos;
+    offered = svc->offered_count;
+    snapsync_service_unlock_internal();
+    if (received > offered || (uint64_t)entries > offered - received) {
+        LOG_ERROR("snapshot_sync",
+                  "apply_chunk: entries exceed offer received=%llu entries=%u offered=%llu",
+                  (unsigned long long)received, entries,
+                  (unsigned long long)offered);
+        return false;
+    }
+    return true;
+}
+
 static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
                                       const uint8_t *chunk_data,
                                       size_t chunk_len)
@@ -436,10 +456,18 @@ static int snapsync_apply_chunk_local(struct snapshot_sync_service *svc,
 static bool snapsync_apply_chunk_write(struct node_db *ndb, void *ctx)
 {
     struct snapsync_apply_chunk_ctx *apply = ctx;
+    uint32_t entries;
 
     (void)ndb;
     if (!apply || !apply->svc || !apply->chunk_data)
         LOG_FAIL("snapshot_sync", "apply_chunk_write: null context apply=%p", (void*)apply);
+    entries = apply->chunk_data[0] | ((uint32_t)apply->chunk_data[1] << 8) |
+              ((uint32_t)apply->chunk_data[2] << 16) |
+              ((uint32_t)apply->chunk_data[3] << 24);
+    if (!snapsync_chunk_fits_offer(apply->svc, entries)) {
+        apply->applied = -1;
+        return false;
+    }
     apply->applied = snapsync_apply_chunk_local(apply->svc,
                                                 apply->chunk_data,
                                                 apply->chunk_len);
