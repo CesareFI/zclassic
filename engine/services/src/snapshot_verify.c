@@ -404,9 +404,11 @@ struct zcl_result snapsync_write_fc_challenge(const struct snapshot_sync_service
     memcpy(&challenge, &svc->fc_challenge, sizeof(challenge));
     snapsync_service_unlock_internal();
 
-    stream_write_bytes(s, challenge.seed, 32);
-    stream_write_u64_le(s, challenge.chain_length);
-    stream_write_bytes(s, challenge.mmb_root, 32);
+    bool wrote = stream_write_bytes(s, challenge.seed, 32);
+    wrote &= stream_write_u64_le(s, challenge.chain_length);
+    wrote &= stream_write_bytes(s, challenge.mmb_root, 32);
+    if (!wrote)
+        return ZCL_ERR(-2, "write_fc_challenge: stream write failed");
     return ZCL_OK;
 }
 
@@ -518,26 +520,28 @@ struct zcl_result snapsync_write_fc_response(struct byte_stream *s,
                  (void*)s, (void*)resp, resp ? resp->num_samples : 0);
     }
 
-    stream_write_u32_le(s, resp->num_samples);
+    bool wrote = stream_write_u32_le(s, resp->num_samples);
     for (uint32_t i = 0; i < resp->num_samples; i++) {
         const struct fc_sample *sample = &resp->samples[i];
-        stream_write_bytes(s, sample->leaf.block_hash, 32);
-        stream_write_u32_le(s, sample->leaf.height);
-        stream_write_u32_le(s, sample->leaf.timestamp);
-        stream_write_u32_le(s, sample->leaf.nBits);
-        stream_write_bytes(s, sample->leaf.sapling_root, 32);
-        stream_write_bytes(s, sample->leaf.chain_work, 32);
-        stream_write_u64_le(s, sample->proof.leaf_index);
-        stream_write_bytes(s, sample->proof.leaf_hash, 32);
-        stream_write_u32_le(s, sample->proof.num_siblings);
+        wrote &= stream_write_bytes(s, sample->leaf.block_hash, 32);
+        wrote &= stream_write_u32_le(s, sample->leaf.height);
+        wrote &= stream_write_u32_le(s, sample->leaf.timestamp);
+        wrote &= stream_write_u32_le(s, sample->leaf.nBits);
+        wrote &= stream_write_bytes(s, sample->leaf.sapling_root, 32);
+        wrote &= stream_write_bytes(s, sample->leaf.chain_work, 32);
+        wrote &= stream_write_u64_le(s, sample->proof.leaf_index);
+        wrote &= stream_write_bytes(s, sample->proof.leaf_hash, 32);
+        wrote &= stream_write_u32_le(s, sample->proof.num_siblings);
         for (uint32_t j = 0; j < sample->proof.num_siblings; j++)
-            stream_write_bytes(s, sample->proof.siblings[j], 32);
-        stream_write_u32_le(s, sample->proof.num_peaks);
+            wrote &= stream_write_bytes(s, sample->proof.siblings[j], 32);
+        wrote &= stream_write_u32_le(s, sample->proof.num_peaks);
         for (uint32_t j = 0; j < sample->proof.num_peaks; j++)
-            stream_write_bytes(s, sample->proof.peaks[j], 32);
-        stream_write_u64_le(s, sample->proof.mmb_size);
+            wrote &= stream_write_bytes(s, sample->proof.peaks[j], 32);
+        wrote &= stream_write_u64_le(s, sample->proof.mmb_size);
     }
 
+    if (!wrote)
+        return ZCL_ERR(-2, "write_fc_response: stream write failed");
     return ZCL_OK;
 }
 

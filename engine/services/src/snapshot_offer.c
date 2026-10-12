@@ -457,10 +457,12 @@ struct zcl_result snapsync_write_snapshot_request(struct byte_stream *s,
                            pr.message);
     }
 
-    stream_write_i32_le(s, our_height);
-    stream_write_bytes(s, pow.peer_id, 32);
-    stream_write_i64_le(s, pow.timestamp);
-    stream_write_u64_le(s, pow.nonce);
+    bool wrote = stream_write_i32_le(s, our_height);
+    wrote &= stream_write_bytes(s, pow.peer_id, 32);
+    wrote &= stream_write_i64_le(s, pow.timestamp);
+    wrote &= stream_write_u64_le(s, pow.nonce);
+    if (!wrote)
+        return ZCL_ERR(-3, "write_snapshot_request: stream write failed");
     return ZCL_OK;
 }
 
