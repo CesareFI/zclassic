@@ -21,6 +21,29 @@ static bool api_download_limits_snapshots_match(
            thin->max_in_flight_per_peer > 0;
 }
 
+static int api_download_stats_saturate_json(void)
+{
+    struct download_stats_snapshot snapshot = {0};
+    struct json_value json = {0};
+    snapshot.requested = UINT64_MAX;
+    snapshot.bytes_downloaded = UINT64_MAX;
+    snapshot.diag.assign_attempts = UINT64_MAX;
+    snapshot.msg_stats.cycles = UINT64_MAX;
+    json_set_object(&json);
+    download_stats_push_json(&json, &snapshot, true);
+    bool ok = json_get_int(json_get(&json, "requested")) == INT64_MAX &&
+              json_get_int(json_get(&json, "bytes_downloaded")) ==
+                  INT64_MAX &&
+              json_get_int(json_get(&json, "assign_attempts")) ==
+                  INT64_MAX &&
+              json_get_int(json_get(&json, "message_cycles")) ==
+                  INT64_MAX;
+    json_free(&json);
+    printf("api: download statistics saturate unsigned JSON counters... %s\n",
+           ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int api_status_focused_tests(void)
 {
     int failures = 0;
@@ -233,27 +256,7 @@ int api_status_focused_tests(void)
         else { printf("FAIL\n"); failures++; }
     }
 
-    printf("api: download statistics saturate unsigned JSON counters... ");
-    {
-        struct download_stats_snapshot snapshot = {0};
-        struct json_value json = {0};
-        snapshot.requested = UINT64_MAX;
-        snapshot.bytes_downloaded = UINT64_MAX;
-        snapshot.diag.assign_attempts = UINT64_MAX;
-        snapshot.msg_stats.cycles = UINT64_MAX;
-        json_set_object(&json);
-        download_stats_push_json(&json, &snapshot, true);
-        bool ok = json_get_int(json_get(&json, "requested")) == INT64_MAX &&
-                  json_get_int(json_get(&json, "bytes_downloaded")) ==
-                      INT64_MAX &&
-                  json_get_int(json_get(&json, "assign_attempts")) ==
-                      INT64_MAX &&
-                  json_get_int(json_get(&json, "message_cycles")) ==
-                      INT64_MAX;
-        json_free(&json);
-        if (ok) printf("OK\n");
-        else { printf("FAIL\n"); failures++; }
-    }
+    failures += api_download_stats_saturate_json();
 
     printf("api: node identity exposes source SHA-256 + Git trace; "
            "bootstrapstatus keeps client_name... ");
