@@ -101,6 +101,14 @@ The same fleet view covers Z23, QEDC and gate_computer. Native task and lease
 objects own work; the dashboard groups those objects by project, machine and
 component without moving source or changing ownership merely to organize rows.
 
+Discover membership through the native admitted roster and authenticated peer
+observations. Do not hard-code hostnames, machine counts, addresses, capacities
+or platform capabilities. A newly paired Windows node must appear through the
+same paginated discovery path; show pending admission separately from usable
+capacity. Read versioned capability and resource observations with provenance
+and expiry. Enable only operations the receiver actually advertises and
+authorizes; the OS name alone never qualifies execution or transport.
+
 | View | Information and permitted interaction |
 |---|---|
 | Fleet | Admitted machines, connection state, last observation, exact running source/artifact identity and platform |
