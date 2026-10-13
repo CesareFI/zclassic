@@ -90,6 +90,105 @@ separate claims. Compare native and guest startup, command latency, transfer
 throughput, CPU, memory and complete accepted-task cost under matched policies
 before claiming a measured performance advantage.
 
+### Keyboard-controlled fleet terminal
+
+The primary interactive fleet console is a live terminal dashboard backed by
+native Z23 APIs. A browser console may reuse those APIs later. This is an
+implementation contract, not a delivered interface. Do not add a second
+scheduler, SSH polling daemon, task database or per-project dashboard.
+
+The same fleet view covers Z23, QEDC and gate_computer. Native task and lease
+objects own work; the dashboard groups those objects by project, machine and
+component without moving source or changing ownership merely to organize rows.
+
+| View | Information and permitted interaction |
+|---|---|
+| Fleet | Admitted machines, connection state, last observation, exact running source/artifact identity and platform |
+| Connections | Z23-native, host SSH or guest route; peer identity, negotiated key exchange, primary/backup paths, refusal and recovery evidence |
+| Development | Project, task, owner, leased paths, exact base, phase, admission hold, candidate, review and acceptance references |
+| Storage | Filesystem and path scope, available bytes, local reserve, admitted growth, active output and proposed retirement with restoration evidence |
+| Evidence | Selected action, receipt, bounded logs, missing observations and the relevant wiki procedure |
+
+Keep a persistent footer with refresh state, observation age, selected machine
+and help. Use arrows or j/k to move, Tab/Shift-Tab to switch panes, 1–5 to
+switch views, Enter for detail, Esc to return, / to filter, r to request a
+bounded refresh, ? for help and q to quit. These bindings are acceptance
+targets, not commands supported by the current binary. Selection remains bound
+to stable identity when sorting or updates move a row. Closing the dashboard
+does not stop fleet services, workers or the user's task.
+
+Render the first available snapshot immediately. Refresh work asynchronously
+with bounded outstanding requests, timeouts and backoff; failed peers must not
+block input or healthy peers. Consume the existing resumable telemetry feed
+where applicable. Preserve cursor, epoch, gap, dropped-record and coverage
+fields; resnapshot after a gap or epoch change. An unchanged feed is not a
+fresh remote observation. Distinguish fresh, stale, unreachable, unavailable
+and unpaired; never replace missing measurements with zero or healthy.
+
+Target local key-to-render latency below 100 ms and observation-to-display
+latency below 2 seconds on the measured reference fleet. Record actual sampling
+and network delay separately; these are unmeasured targets. Show pagination
+and omitted machines rather than silently presenting a partial fleet as whole.
+
+Treat remote labels, errors and log excerpts as untrusted display data.
+Escape terminal control sequences and bound text before rendering so a peer
+cannot forge prompts, selection or status. An explicitly attached shell uses
+its own terminal protocol and is not rendered as dashboard text.
+
+Actions use existing receiver-owned plan/commit, task, action and receipt
+interfaces. Render exact target identities, scope, preconditions and expected
+effects before commit. Recheck authority and generations at the receiver.
+Repeated keys and lost acknowledgements reconcile one action identity; they do
+not dispatch duplicate work. Opening or refreshing a view never starts a
+worker, installs a service, deploys a binary or deletes output. Cleanup retains
+the storage contract and a verified restoration path.
+
+#### Z23-owned connections on Windows
+
+The normal setup is install Z23, pair the machine, then connect through Z23.
+It must not require users to install or configure host OpenSSH, sshd,
+~/.ssh/config, platform tunnel scripts or a separate monitoring agent.
+Installation may still need explicit OS networking permissions. Keep
+credentials local, grants revocable and route policy receiver-controlled.
+
+Reuse the C23 zssh engine, mesh transport and platform adapters. Its hybrid
+ML-KEM-768 plus X25519 engine is not a deployed service: production session
+ownership, guest integration and persistent reconnect/rekey remain separate
+work. An existing native mesh tunnel is not evidence of negotiated SSH or
+post-quantum protection. Host OpenSSH remains visibly identified as a bootstrap
+fallback until the native path qualifies. Never silently weaken required
+post-quantum key exchange or onion-only routing to keep a row green.
+
+Transport and execution are independent choices. A connection grants no host
+shell; protected native, virtualized and emulated execution need their own
+acceptance. Qualify real Windows operation as well as Linux and macOS; a
+cross-compile is not runtime evidence.
+
+#### Delivery and acceptance
+
+1. Bind the five views to existing paginated observations and canonical work
+   objects. Add missing development-volume scope or coverage through existing
+   native telemetry owners. Keep unavailable fields visible.
+2. Implement the C23 terminal client with shared platform input, resize and
+   terminal-restoration adapters. Qualify navigation, filtering, stable
+   selection, cancellation, Ctrl-C, small terminals and restoration on exit.
+3. Qualify Z23-owned connection setup and identity prerequisites; demonstrate
+   exact-object transfer in both directions without host SSH configuration,
+   wrong-key and downgrade refusal, revocation, restart and independently
+   interrupted backup routes. Guest and Tor paths retain separate receipts.
+4. Enable transactional controls only as their existing native service
+   acceptance passes. Test stale grants, concurrent changes, duplicate keys
+   and lost acknowledgements before exposing an operation as available.
+5. Measure the live UI under delayed/offline peers, feed gaps, node restart,
+   pagination and disk pressure on each supported platform. Retain exact
+   source/platform/policy receipts and measured latency; do not infer
+   completion from a static layout or fixture-only result.
+
+This is a dependency sequence within the forward plan's visibility and
+transactional-operation work, not an alternative mission queue. The initial
+source inventory and unmeasured acceptance are recorded in
+[the terminal contract evidence](../experiments/FLEET_TERMINAL_CONTRACT.md).
+
 ### Native JSON monitoring and wiki
 
 Inspect the selected binary before using an interface:

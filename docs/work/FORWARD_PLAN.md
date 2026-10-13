@@ -32,8 +32,11 @@ permitted systems, and measure the consequences:
 > Observe → understand → propose → build → independently reproduce → publish
 > → operate → measure.
 
-Deliver native APIs and CLI first on Linux and arm64 macOS; a browser console
-follows. Aggregate fleet membership has no fixed ceiling, while every node's
+Deliver native APIs and CLI with a keyboard-controlled live fleet terminal
+for Linux, arm64 macOS and Windows; qualify each runtime independently.
+The terminal contract is in
+[AGENT_FLEET.md](AGENT_FLEET.md#keyboard-controlled-fleet-terminal). A browser
+console follows. Aggregate fleet membership has no fixed ceiling, while every node's
 connections, work, storage and responses remain bounded. Native documents and
 signed task objects are the first live business sources. Transcripts, Slack,
 email, tickets, CRM, analytics and feedback receive bounded import support;
