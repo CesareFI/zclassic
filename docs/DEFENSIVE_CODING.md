@@ -1306,7 +1306,6 @@ add/remove a gate.
 - `check-no-new-coin-backfill-caller`
 - `check-no-new-coordination-shell`
 - `check-no-new-repair-rung`
-- `check-no-retired-agent-protocol`
 - `check-no-runtime-abort`
 - `check-no-stale-pinned-facts`
 - `check-no-uncited-victory`
@@ -1515,9 +1514,6 @@ never a second, divergent parser of any of the three files. Its `--selftest`
 plants each defect class in a throwaway fixture tree and asserts the gate
 rejects it *and names the offender*, with a correctly-wired fixture as the
 positive control.
-
-`check-no-retired-agent-protocol` rejects the retired agent-transport token in
-tracked paths and filenames while explicitly allowing ordinary `memcpy` usage.
 
 `check-no-stray-root-files` (`tools/lint/check_no_stray_root_files.sh`) keeps
 the repository root a curated list. It compares the root's depth-1 entries

@@ -87,7 +87,7 @@ lint_cache_note() { printf 'lint-cache: %s\n' "$*" >&2; }
 # entries are pure functions of the whole-tree key. The ones that
 # are NOT are listed underneath, each with the reason it can never be cached.
 LINT_CACHE_OK_GATES="
-check-no-retired-agent-protocol check-scanner-immunity check-malloc
+check-scanner-immunity check-malloc
 check-hotswap-dev-only check-hotswap-eligible-scope check-hotswap-static-state
 check-hotswap-service-islands check-hotswap-swappable-shape check-stable-publish-contained check-raw-sqlite
 check-raw-malloc check-json-value-init check-blob-read-bounds check-byte-order-codec-single

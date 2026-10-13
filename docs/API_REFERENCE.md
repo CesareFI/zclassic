@@ -74,11 +74,11 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 923 |
+| Registry entries (branches + leaves) | 924 |
 | Top-level roots | 14 |
 | Branches | 202 |
-| Leaves (dispatchable command paths) | 721 |
-| … `ready` (live handler in this build) | 628 |
+| Leaves (dispatchable command paths) | 722 |
+| … `ready` (live handler in this build) | 629 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
@@ -108,7 +108,7 @@ Per source file:
 | `engine/composition/commands/story.def` | 5 | 1 | 4 |
 | `engine/composition/commands/fleet_board.def` | 12 | 3 | 9 |
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
-| `engine/composition/commands/fleet.def` | 33 | 8 | 25 |
+| `engine/composition/commands/fleet.def` | 34 | 8 | 26 |
 | `engine/composition/commands/fleet_agents.def` | 1 | 0 | 1 |
 | `engine/composition/commands/fleet_enrol.def` | 5 | 0 | 5 |
 | `engine/composition/commands/telemetry/root.def` | 6 | 2 | 4 |
@@ -1896,6 +1896,7 @@ represented by its children's sections.
 | `fleet steer brief` | ready | read / read / operator · fast/low | `grant`, `since`, `limit`, `json` | `zcl.fleet_steer_brief.v1` | `z23 fleet steer brief` | One-call fleet brief: tasks, workers, blockers, capacity, candidates |
 | `fleet steer send` | ready | mutate / dev-mutation / operator · fast/low | `grant`, **`items`**, `from` | `zcl.fleet_steer_send.v1` | `z23 fleet steer send --items=[...]` | One bounded batch of directives to named fleet agents |
 | `fleet steer evidence` | ready | read / read / operator · fast/low | `grant`, **`type`**, **`ref`**, `seq`, `attempt` | `zcl.fleet_steer_evidence.v1` | `z23 fleet steer evidence --type=mail --ref=<ref>` | One bounded evidence object by exact reference |
+| `fleet steer wiki-find` | ready | read / read / operator · foreground/low | `grant`, **`q`** | `zcl.fleet_steer_wiki_find.v1` | `z23 fleet steer wiki-find --q=kernel` | Discover bounded untrusted wiki knowledge |
 | `fleet steer deliver` | ready | mutate / dev-mutation / operator · fast/low | `grant`, **`from`**, **`ref`**, **`upload_id`**, **`name`**, **`size`**, **`sha3_512`**, **`offset`**, **`data_hex`** | `zcl.fleet_steer_deliver.v1` | `z23 fleet steer deliver --from=<label> --ref=<ref> --upload_id=<32 hex> ...` | Upload one C source file into the inert quarantine inbox |
 | `fleet steer inbox` | ready | read / read / operator · fast/low | `show` | `zcl.fleet_steer_inbox.v1` | `z23 fleet steer inbox [--show=<upload>]` | List quarantined uploads for the local reviewer |
 | `fleet steer drop` | ready | mutate / dev-mutation / **owner** · fast/low | **`upload`** | `zcl.fleet_steer_drop.v1` | `z23 fleet steer drop --upload=<identity>` | Remove one retained quarantine upload (owner cleanup) |

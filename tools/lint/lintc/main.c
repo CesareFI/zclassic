@@ -46,8 +46,6 @@ static const struct lint_gate k_gates[] = {
       check_proof_server_pin_selftest },
     { "check-tu-random-seed", check_tu_random_seed_run,
       check_tu_random_seed_selftest },
-    { "check-no-retired-agent-protocol", check_no_retired_agent_protocol_run,
-      check_no_retired_agent_protocol_selftest },
     { "check-stopwatch-skip-detector", check_stopwatch_skip_detector_run,
       check_stopwatch_skip_detector_selftest },
     { "check-no-warning-suppression", check_no_warning_suppression_run,

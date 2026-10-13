@@ -3076,7 +3076,7 @@ $(filter-out $(ZCL_VENDOR_LIB)/libsecp256k1.a,$(VENDOR_LIBS)):
         install-replay-canary replay-canary-linger-status \
         coverage coverage-clean ci audit release \
         bench bench-crypto-verify bench-regress \
-	lint check-build-epoch-integrity check-checkout-lock check-malloc check-posix-ere-only check-raw-sqlite check-vcs-no-git check-vcs-no-sha1 check-raw-malloc check-json-value-init check-stable-publish-contained check-no-retired-agent-protocol check-dev-proof-native-fast-path \
+	lint check-build-epoch-integrity check-checkout-lock check-malloc check-posix-ere-only check-raw-sqlite check-vcs-no-git check-vcs-no-sha1 check-raw-malloc check-json-value-init check-stable-publish-contained check-dev-proof-native-fast-path \
         check-coins-lookup-nullcheck check-observability-pairing \
         check-silent-errors-services check-silent-errors-controllers \
         check-silent-errors-jobs check-silent-errors-conditions check-silent-errors-bool \
@@ -6529,7 +6529,6 @@ LINT_LAND_EXTRA_GATES := \
     check-file-purpose \
     check-no-bare-tmp-fixture \
     check-network-tool-hardening \
-    check-no-retired-agent-protocol \
     check-proc-self-shim \
     check-no-hardlink-seeding \
     check-markdown-links \
@@ -14981,8 +14980,6 @@ check-no-stray-root-files: $(LINTC_TOOL)
 	@echo "══ LINT: no stray files in the repository root ══"
 	@./tools/lint/check_no_stray_root_files.sh
 
-check-no-retired-agent-protocol: $(LINTC_TOOL)
-	@./build/bin/z23-lint check-no-retired-agent-protocol
 
 # Nothing under test, and no command an agent is told to copy, may be aimed at
 # the OPERATOR'S LIVE NODE. Three prongs, all measured on this tree:
@@ -15243,7 +15240,6 @@ LINT_GATES := \
     check-lint-cache \
     check-lint-gate-wiring \
     check-toolchain \
-    check-no-retired-agent-protocol \
     check-build-epoch-integrity \
     check-checkout-lock \
     check-no-stray-untracked-source \

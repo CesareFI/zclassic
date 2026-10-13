@@ -190,6 +190,7 @@
 #include "base/safe_alloc.h"
 #include "command/native_devagent.h"
 #include "command/native_fleet.h"
+#include "session/fleet_wiki_entry.h"
 #include "command/native_fleet_steer_tasks.h"
 #include "command/native_dev_proof_command.h"
 #include "config/command_catalog.h"
@@ -5780,6 +5781,75 @@ void zcl_native_handle_fleet_steer_evidence(
 {
     fmc_enter(request, reply, "evidence",
               "fleet.steer.evidence takes grant,type,ref", fmc_do_evidence);
+}
+
+static bool fmc_wiki_identity_item(const struct json_value *item)
+{
+    const char *id = json_get_str(json_get(item, "id"));
+    const char *host = json_get_str(json_get(item, "host"));
+    const struct json_value *created = json_get(item, "created_at");
+    const struct json_value *expires = json_get(item, "expires_at");
+    uint8_t decoded[32];
+    return zcl_hex_decode_lower(id, decoded, sizeof(decoded)) &&
+        zcl_hex_decode_lower(host, decoded, sizeof(decoded)) &&
+        created && created->type == JSON_INT && json_get_int(created) > 0 &&
+        expires && expires->type == JSON_INT &&
+        json_get_int(expires) >= json_get_int(created);
+}
+static bool fmc_wiki_identity(const struct json_value *discovery)
+{
+    const char *schema = json_get_str(json_get(discovery, "identity_schema"));
+    const struct json_value *entries = json_get(discovery, "entries");
+    if (!schema || strcmp(schema, FLEET_WIKI_DISCOVERY_IDENTITY_SCHEMA) ||
+        !entries || entries->type != JSON_ARR || json_size(entries) > 8 ||
+        json_write(discovery, NULL, 0) > 16 * 1024) return false;
+    for (size_t i = 0; i < json_size(entries); i++)
+        if (!fmc_wiki_identity_item(json_at(entries, i))) return false;
+    return true;
+}
+
+static void fmc_do_wiki_find(const struct zcl_command_request *req,
+                              struct zcl_command_reply *reply)
+{
+    const char *q = fmc_str(req, "q");
+    if (!q || !q[0] || strlen(q) > 128) {
+        fmc_fail(reply, "BAD_INPUT", "q must be a nonempty string of at most 128 bytes", "q");
+        return;
+    }
+    struct fmc_sub sub;
+    fmc_sub_begin(&sub, "zcl.fleet_wiki_find.v1", req, "fleet.wiki.find");
+    if (!sub.valid || !json_push_kv_str(&sub.input, "q", q)) {
+        fmc_fail(reply, "WIKI_UNAVAILABLE", "wiki discovery cannot be prepared", "fleet.wiki.find");
+        fmc_sub_end(&sub);
+        return;
+    }
+    zcl_native_handle_fleet_wiki_find(&sub.request, &sub.reply);
+    sub.ran = true;
+    if (!fmc_sub_ok(&sub)) {
+        fmc_fail(reply, "WIKI_UNAVAILABLE", "the local wiki did not answer", sub.reply.error.code);
+    } else if (!fmc_wiki_identity(&sub.reply.data)) {
+        fmc_fail(reply, "WIKI_CAPABILITY_UNAVAILABLE",
+            "the selected node lacks exact wiki revision identity", "fleet.wiki.find identity_schema");
+    } else {
+        bool ok = json_push_kv(&reply->data, "discovery", &sub.reply.data) &&
+            json_push_kv_int(&reply->data, "observed_at", (int64_t)platform_time_wall_time_t()) &&
+            json_push_kv_bool(&reply->data, "untrusted", true) &&
+            json_push_kv_str(&reply->data, "selection", "latest-held") &&
+            json_push_kv_str(&reply->data, "exact_read", "steer_evidence(type=board,ref=id)");
+        if (!ok) fmc_fail(reply, "ALLOC_FAILED", "wiki discovery projection failed", "json");
+        else {
+            reply->status = ZCL_COMMAND_STATUS_PASSED;
+            reply->exit_code = 0;
+        }
+    }
+    fmc_sub_end(&sub);
+}
+
+void zcl_native_handle_fleet_steer_wiki_find(
+    const struct zcl_command_request *request, struct zcl_command_reply *reply)
+{
+    fmc_enter(request, reply, "evidence",
+              "fleet.steer.wiki-find takes grant,q", fmc_do_wiki_find);
 }
 
 void zcl_native_handle_fleet_steer_grant(

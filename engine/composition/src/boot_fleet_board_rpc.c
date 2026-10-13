@@ -615,6 +615,13 @@ static bool fb_find_item(const struct db_fleet_board_post *row,
         json_push_kv_str(item, "summary",
                          json_get_str(json_get(&entry, "summary")));
         json_push_kv_str(item, "slug", row->post.slug);
+        char hex[65];
+        fleet_board_id_to_hex(row->post.id, hex);
+        json_push_kv_str(item, "id", hex);
+        fleet_board_id_to_hex(row->post.host_pubkey, hex);
+        json_push_kv_str(item, "host", hex);
+        json_push_kv_int(item, "created_at", (int64_t)row->post.created_at);
+        json_push_kv_int(item, "expires_at", row->expires_at);
         json_push_kv_str(item, "updated",
                          json_get_str(json_get(&entry, "updated")));
         struct json_value rules;
@@ -686,6 +693,7 @@ static void fb_op_wiki_find(struct node_db *ndb, const struct json_value *in,
     int n = db_fleet_board_wiki_list(ndb, rows, FLEET_BOARD_LIST_MAX);
     json_set_object(result);
     json_push_kv_bool(result, "ok", true);
+    json_push_kv_str(result, "identity_schema", FLEET_WIKI_DISCOVERY_IDENTITY_SCHEMA);
     struct json_value arr;
     json_init(&arr);
     json_set_array(&arr);

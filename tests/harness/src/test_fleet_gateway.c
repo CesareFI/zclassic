@@ -746,13 +746,14 @@ static int gw_t_handshake(void)
         ASSERT(gw_body_has(b, "\"name\":\"steer_send\""));
         ASSERT(gw_body_has(b, "\"name\":\"steer_evidence\""));
         ASSERT(gw_body_has(b, "\"name\":\"steer_deliver\""));
+        ASSERT(gw_body_has(b, "\"name\":\"wiki_find\""));
         ASSERT(!gw_body_has(b, "steer_inbox"));
         ASSERT(!gw_body_has(b, "fleet.steer.inbox"));
         ASSERT(!gw_body_has(b, "steer_drop"));
         struct json_value catalog = {0};
         ASSERT(json_read(&catalog, b, strlen(b)));
         const struct json_value *tools = json_get(json_get(&catalog, "result"), "tools");
-        ASSERT(tools && json_size(tools) == 4);
+        ASSERT(tools && json_size(tools) == 5);
         const struct json_value *brief = json_at(tools, 0);
         ASSERT_STR_EQ(json_get_str(json_get(brief, "name")), "steer_brief");
         const struct json_value *annotations = json_get(brief, "annotations");
@@ -762,6 +763,33 @@ static int gw_t_handshake(void)
         ASSERT(json_get_bool(json_get(annotations, "openWorldHint")));
         ASSERT(json_get(json_at(tools, 1), "annotations") == NULL);
         ASSERT(json_get(json_at(tools, 2), "annotations") == NULL);
+        const struct json_value *evidence = json_get(json_at(tools, 2), "inputSchema");
+        const struct json_value *properties = json_get(evidence, "properties");
+        const char *const selectors[] = {"seq", "attempt"};
+        for (size_t i = 0; i < 2; i++) {
+            const struct json_value *selector = json_get(properties, selectors[i]);
+            ASSERT_STR_EQ(json_get_str(json_get(selector, "type")), "integer");
+            ASSERT_EQ(json_get_int(json_get(selector, "minimum")), 1);
+            ASSERT_EQ(json_get_int(json_get(selector, "maximum")),
+                      i == 0 ? 1000000000 : 1000000);
+        }
+        ASSERT_EQ(json_size(json_get(json_get(properties, "type"), "enum")), 4);
+        const struct json_value *variants = json_get(evidence, "oneOf");
+        ASSERT_EQ(json_size(variants), 2);
+        const struct json_value *plain_types = json_get(json_get(json_get(json_at(variants, 0), "properties"), "type"), "enum");
+        ASSERT_EQ(json_size(plain_types), 3);
+        ASSERT_STR_EQ(json_get_str(json_at(plain_types, 0)), "mail");
+        ASSERT_STR_EQ(json_get_str(json_at(plain_types, 1)), "queue");
+        ASSERT_STR_EQ(json_get_str(json_at(plain_types, 2)), "board");
+        const struct json_value *exact_types = json_get(json_get(json_get(json_at(variants, 1), "properties"), "type"), "enum");
+        ASSERT_EQ(json_size(exact_types), 2);
+        ASSERT_STR_EQ(json_get_str(json_at(exact_types, 0)), "queue");
+        ASSERT_STR_EQ(json_get_str(json_at(exact_types, 1)), "land");
+        ASSERT_EQ(json_size(json_get(json_get(json_at(variants, 0), "not"), "anyOf")), 2);
+        const struct json_value *paired = json_get(json_at(variants, 1), "required");
+        ASSERT_EQ(json_size(paired), 2);
+        ASSERT_STR_EQ(json_get_str(json_at(paired, 0)), "seq");
+        ASSERT_STR_EQ(json_get_str(json_at(paired, 1)), "attempt");
         json_free(&catalog);
         /* A schema-driven client only sends what the schema names: a
          * remote agent answering its directive needs `kind` advertised,
@@ -3865,6 +3893,195 @@ _test_next:;
     return failures;
 }
 
+static int gw_t_evidence_exact(const char *gid)
+{
+    int failures = 0;
+    char *b = NULL;
+    TEST("gateway: exact queue and land selectors") {
+        const char *tip = "1111111111111111111111111111111111111111";
+        char dir[1100], path[1200], args[1024];
+        int st = 0, sn;
+        sn = snprintf(dir, sizeof(dir), "%s/z23/dev/queue", g_gw_state);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(dir));
+        ASSERT(gw_mkdirp(dir));
+        sn = snprintf(path, sizeof(path), "%s/outcomes.jsonl", dir);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(path));
+        ASSERT(gw_write_text(path,
+            "{\"seq\":701,\"name\":\"gw-exact\",\"attempt\":1,\"verdict\":\"PASS\",\"rc\":0}\n"
+            "{\"seq\":702,\"name\":\"gw-exact\",\"attempt\":2,\"verdict\":\"FAIL\",\"rc\":1}\n"));
+        const char *const queue_selectors[] = {
+            "", ",\"seq\":701,\"attempt\":1", ",\"seq\":701,\"attempt\":2"
+        };
+        const char *const queue_results[] = {"FAIL", "PASS", "EVIDENCE_NOT_FOUND"};
+        for (size_t i = 0; i < 3; i++) {
+            sn = snprintf(args, sizeof(args),
+                "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\"gw-exact\"%s}",
+                gid, queue_selectors[i]);
+            ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+            b = gw_tool("steer_evidence", args, 701, &st);
+            ASSERT(b != NULL && st == 200);
+            ASSERT(gw_body_has(b, i == 2 ? "\"isError\":true" : "\"isError\":false"));
+            ASSERT(gw_body_has(b, queue_results[i]));
+            free(b); b = NULL;
+        }
+        sn = snprintf(dir, sizeof(dir), "%s/z23/dev/land", g_gw_state);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(dir));
+        ASSERT(gw_mkdirp(dir));
+        sn = snprintf(path, sizeof(path), "%s/queue.jsonl", dir);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(path));
+        ASSERT(gw_write_text(path,
+            "{\"seq\":703,\"attempt\":2,\"tip\":\"1111111111111111111111111111111111111111\",\"state\":\"queued\"}\n"));
+        for (int attempt = 2; attempt <= 3; attempt++) {
+            sn = snprintf(args, sizeof(args),
+                "{\"grant\":\"%s\",\"type\":\"land\",\"ref\":\"%s\",\"seq\":703,\"attempt\":%d}",
+                gid, tip, attempt);
+            ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+            b = gw_tool("steer_evidence", args, 702, &st);
+            ASSERT(b != NULL && st == 200);
+            ASSERT(gw_body_has(b, attempt == 2 ? "\"isError\":false" : "EVIDENCE_NOT_FOUND"));
+            free(b); b = NULL;
+        }
+        PASS();
+    }
+_test_next:;
+    free(b);
+    return failures;
+}
+
+static bool gw_wiki_probe(const char *gid, const char *fields, const char *expected)
+{
+    char args[1024]; int st = 0;
+    int sn = snprintf(args, sizeof(args), "{\"grant\":\"%s\"%s}", gid, fields);
+    if (sn <= 0 || (size_t)sn >= sizeof(args)) return false;
+    char *body = gw_tool("wiki_find", args, 801, &st);
+    bool ok = body && st == 200 && gw_body_has(body, "\"isError\":true") &&
+        gw_body_has(body, expected);
+    free(body);
+    return ok;
+}
+static int gw_t_wiki_inputs(void)
+{
+    int failures = 0;
+    TEST("gateway: wiki discovery rejects malformed and excessive byte input") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char gid[64], fields[512], q[131];
+        ASSERT(gw_mint(node, "evidence", gid));
+        const char *const bad[] = {"", ",\"q\":null", ",\"q\":42",
+            ",\"q\":[]", ",\"q\":{}", ",\"q\":true",
+            ",\"q\":\"kernel\",\"command\":\"fleet.wiki.write\"",
+            ",\"q\":\"kernel\",\"slug\":\"outside\""};
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+            ASSERT(gw_wiki_probe(gid, bad[i], i ? "INVALID_INPUT" : "BAD_INPUT"));
+        ASSERT(gw_wiki_probe(gid, ",\"q\":\"\"", "INVALID_INPUT"));
+        memset(q, 'q', 128); q[128] = '\0';
+        int sn = snprintf(fields, sizeof(fields), ",\"q\":\"%s\"", q);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(fields));
+        ASSERT(gw_wiki_probe(gid, fields, "WIKI_UNAVAILABLE"));
+        q[128] = 'q'; q[129] = '\0';
+        sn = snprintf(fields, sizeof(fields), ",\"q\":\"%s\"", q);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(fields));
+        ASSERT(gw_wiki_probe(gid, fields, "BAD_INPUT"));
+        for (size_t i = 0; i < 65; i++) { q[i * 2] = (char)0xc3; q[i * 2 + 1] = (char)0xa9; }
+        q[130] = '\0';
+        sn = snprintf(fields, sizeof(fields), ",\"q\":\"%s\"", q);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(fields));
+        ASSERT(gw_wiki_probe(gid, fields, "BAD_INPUT"));
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+static int gw_t_wiki_find(void)
+{
+    int failures = 0;
+    char *body = NULL;
+    TEST("gateway: wiki discovery requires live evidence scope and a local node") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char gid[64], wrong[64], args[256]; int st = 0;
+        ASSERT(gw_mint(node, "evidence", gid));
+        ASSERT(gw_mint(node, "brief", wrong));
+        ASSERT(gw_wiki_probe(wrong, ",\"q\":\"kernel\"", "STEER_GRANT_SCOPE"));
+        ASSERT(gw_wiki_probe(gid, ",\"q\":\"kernel\"", "WIKI_UNAVAILABLE"));
+        int sn = snprintf(args, sizeof(args), "{\"action\":\"revoke\",\"id\":\"%s\"}", gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        body = gw_node_run(node, "grant", args); ASSERT(body != NULL);
+        free(body); body = NULL;
+        ASSERT(gw_wiki_probe(gid, ",\"q\":\"kernel\"", "STEER_GRANT_REVOKED"));
+        body = gw_tool("wiki_find", "{\"q\":\"kernel\"}", 806, &st);
+        ASSERT(body != NULL && gw_body_has(body, "grant required"));
+        free(body); body = NULL;
+        PASS();
+    }
+_test_next:;
+    free(body);
+    return failures;
+}
+
+static int gw_t_evidence_selectors(void)
+{
+    int failures = 0;
+    char *b = NULL;
+    TEST("gateway: malformed evidence pairs and revoked grants fail closed") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        const char *tip = "1111111111111111111111111111111111111111";
+        char gid[64], args[1024];
+        int st = 0, sn;
+        ASSERT(gw_mint(node, "evidence", gid));
+        ASSERT_EQ(gw_t_evidence_exact(gid), 0);
+        const struct { const char *type; const char *selectors; } bad[] = {
+            {"queue", ",\"seq\":701"}, {"queue", ",\"attempt\":1"},
+            {"queue", ",\"seq\":0,\"attempt\":1"},
+            {"queue", ",\"seq\":701,\"attempt\":-1"},
+            {"queue", ",\"seq\":\"701\",\"attempt\":1"},
+            {"queue", ",\"seq\":701,\"attempt\":\"1\""},
+            {"queue", ",\"seq\":701.5,\"attempt\":1"},
+            {"queue", ",\"seq\":701,\"attempt\":1.5"},
+            {"queue", ",\"seq\":true,\"attempt\":1"},
+            {"queue", ",\"seq\":701,\"attempt\":null"},
+            {"queue", ",\"seq\":[],\"attempt\":1"},
+            {"queue", ",\"seq\":701,\"attempt\":{}"},
+            {"land", ""}, {"land", ",\"seq\":703"},
+            {"land", ",\"attempt\":2"},
+            {"mail", ",\"seq\":701,\"attempt\":1"},
+            {"board", ",\"seq\":701,\"attempt\":1"},
+            {"unknown", ",\"seq\":701,\"attempt\":1"},
+            {"queue", ",\"seq\":1000000001,\"attempt\":1"},
+            {"queue", ",\"seq\":701,\"attempt\":1000001"}
+        };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            sn = snprintf(args, sizeof(args),
+                "{\"grant\":\"%s\",\"type\":\"%s\",\"ref\":\"%s\"%s}",
+                gid, bad[i].type, tip, bad[i].selectors);
+            ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+            b = gw_tool("steer_evidence", args, 703, &st);
+            ASSERT(b != NULL && st == 200);
+            ASSERT(gw_body_has(b, "\"isError\":true"));
+            /* The CLI rejects malformed scalar types/ranges before the
+             * handler checks pairing and evidence-type semantics. */
+            ASSERT(gw_body_has(b, (i >= 2 && i <= 11) || i >= 18
+                                  ? "INVALID_INPUT" : "BAD_INPUT"));
+            free(b); b = NULL;
+        }
+        sn = snprintf(args, sizeof(args), "{\"action\":\"revoke\",\"id\":\"%s\"}", gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_node_run(node, "grant", args);
+        ASSERT(b != NULL);
+        free(b); b = NULL;
+        sn = snprintf(args, sizeof(args),
+            "{\"grant\":\"%s\",\"type\":\"queue\",\"ref\":\"gw-exact\",\"seq\":701,\"attempt\":1}", gid);
+        ASSERT(sn > 0 && (size_t)sn < sizeof(args));
+        b = gw_tool("steer_evidence", args, 704, &st);
+        ASSERT(b != NULL && st == 200);
+        ASSERT(gw_body_has(b, "\"isError\":true"));
+        ASSERT(gw_body_has(b, "STEER_GRANT_REVOKED"));
+        free(b); b = NULL;
+        PASS();
+    }
+_test_next:;
+    free(b);
+    return failures;
+}
+
 /* ── Shards ──────────────────────────────────────────────────────────────
  *
  * One table names every sub-suite, the shard that owns it, and (by row
@@ -3913,6 +4130,9 @@ static const struct gw_case g_gw_cases[] = {
     GW_CASE(gw_t_front_hello_verdicts, 0),
     GW_CASE(gw_t_front_hello_truncated, 0),
     GW_CASE(gw_t_front_hello_malformed, 0),
+    GW_CASE(gw_t_wiki_inputs, 0),
+    GW_CASE(gw_t_wiki_find, 0),
+    GW_CASE(gw_t_evidence_selectors, 0),
     GW_CASE(gw_t_brief_token, 5),
 };
 #undef GW_CASE
@@ -3935,7 +4155,9 @@ static const char *const g_gw_original[] = {
     "gw_t_compat_terminal", "gw_t_compat_crash", "gw_t_compat_case",
     "gw_t_compat_rc", "gw_t_compat_result", "gw_t_compat_cancelq",
     "gw_t_front_hello_verdicts", "gw_t_front_hello_truncated",
-    "gw_t_front_hello_malformed", "gw_t_brief_token",
+    "gw_t_wiki_inputs",
+    "gw_t_wiki_find",
+    "gw_t_front_hello_malformed", "gw_t_evidence_selectors", "gw_t_brief_token",
 };
 #define GW_ORIGINAL_COUNT (sizeof(g_gw_original) / sizeof(g_gw_original[0]))
 

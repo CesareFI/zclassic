@@ -1252,6 +1252,8 @@ REMOTE_COMMAND_CLASS("fleet.steer.send", REMOTE_CLASS_OWNER_CAPABILITY,
     "bounded directives behind a live owner-minted grant naming send, idempotent by key")
 REMOTE_COMMAND_CLASS("fleet.steer.deliver", REMOTE_CLASS_OWNER_CAPABILITY,
     "one source chunk into the inert quarantine inbox behind a live owner-minted grant naming deliver")
+REMOTE_COMMAND_CLASS("fleet.steer.wiki-find", REMOTE_CLASS_OWNER_CAPABILITY,
+    "one bounded evidence object behind a live owner-minted grant naming evidence")
 REMOTE_COMMAND_CLASS("fleet.steer.inbox", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.steer.drop", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.steer.grant", REMOTE_CLASS_NEVER, "")

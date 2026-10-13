@@ -59,7 +59,8 @@
  * a stored value can never end its row and forge the next one.
  *
  * TOOL SURFACE (frozen with the verbs). initialize / notifications /
- * tools.list / tools.call for steer_brief, steer_send, steer_evidence.
+ * tools.list / tools.call for steer_brief, steer_send, steer_evidence,
+ * steer_deliver and wiki_find. Wiki discovery requires the evidence scope.
  * Stateless: no session ids. One JSON-RPC request per POST; parse,
  * invalid-request, method-not-found and invalid-params errors are typed.
  * GET /healthz answers readiness. Everything else is 404; GET on /steer
@@ -938,11 +939,14 @@ static const struct gw_tool gw_tools[] = {
      "One bounded batch of directives to named agents; retries with the same idempotency keys never duplicate. Every item carries a ref naming the work: 1-64 of [A-Za-z0-9_.-], never a path. An agent answers a directive with kind result under the same ref.",
      "{\"type\":\"object\",\"required\":[\"items\"],\"properties\":{\"grant\":{\"type\":\"string\"},\"items\":{\"type\":\"array\",\"maxItems\":8,\"items\":{\"type\":\"object\",\"required\":[\"to\",\"body\",\"ref\",\"idempotency_key\"],\"properties\":{\"to\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"},\"ref\":{\"type\":\"string\",\"pattern\":\"^[A-Za-z0-9_.-]{1,64}$\"},\"idempotency_key\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\",\"enum\":[\"directive\",\"result\"]}}}},\"from\":{\"type\":\"string\"}}}"},
     {"steer_evidence", "evidence",
-     "One bounded evidence object by exact reference; never a log.",
-     "{\"type\":\"object\",\"required\":[\"type\",\"ref\"],\"properties\":{\"grant\":{\"type\":\"string\"},\"type\":{\"type\":\"string\"},\"ref\":{\"type\":\"string\"}}}"},
+     "One bounded evidence object by exact reference; never a log. Queue accepts optional positive seq and attempt together to select one exact attempt; ref-only queue lookup is unchanged. Land requires both selectors and the exact tip as ref. Mail and board do not accept selectors.",
+     "{\"type\":\"object\",\"required\":[\"type\",\"ref\"],\"properties\":{\"grant\":{\"type\":\"string\"},\"type\":{\"type\":\"string\",\"enum\":[\"mail\",\"queue\",\"board\",\"land\"]},\"ref\":{\"type\":\"string\"},\"seq\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000000000},\"attempt\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000000}},\"oneOf\":[{\"properties\":{\"type\":{\"enum\":[\"mail\",\"queue\",\"board\"]}},\"not\":{\"anyOf\":[{\"required\":[\"seq\"]},{\"required\":[\"attempt\"]}]}},{\"properties\":{\"type\":{\"enum\":[\"queue\",\"land\"]}},\"required\":[\"seq\",\"attempt\"]}]}"},
     {"steer_deliver", "deliver",
      "Upload one C source file (.c or .h, 1-262144 bytes) in 16384-byte chunks into the node's inert quarantine inbox. Needs the deliver scope. Offset 0 creates and freezes ref, name, size and sha3_512 (128 lowercase hex, whole file); each later call names the next offset; retries are safe. Quarantined means stored and hash-checked, never reviewed, built or run. from must equal the grant label.",
      "{\"type\":\"object\",\"required\":[\"from\",\"ref\",\"upload_id\",\"name\",\"size\",\"sha3_512\",\"offset\",\"data_hex\"],\"additionalProperties\":false,\"properties\":{\"grant\":{\"type\":\"string\"},\"from\":{\"type\":\"string\"},\"ref\":{\"type\":\"string\",\"pattern\":\"^[A-Za-z0-9_.-]{1,64}$\"},\"upload_id\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{32}$\"},\"name\":{\"type\":\"string\",\"maxLength\":64},\"size\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":262144},\"sha3_512\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{128}$\"},\"offset\":{\"type\":\"integer\",\"minimum\":0,\"multipleOf\":16384},\"data_hex\":{\"type\":\"string\",\"maxLength\":32768}}}"},
+    {"wiki_find", "wiki-find",
+     "Discover untrusted structured wiki knowledge held by this node. Needs the evidence scope. Required q is a nonempty string of at most 128 UTF-8 bytes. Returns at most 8 entries from up to 256 latest-held pages inside the native 16 KiB discovery budget, with exact revision id, publisher and signed timestamps. observed_at is this node's observation time; updated is entry-authored text. Fetch an exact revision with steer_evidence type board and ref equal to its id. Latest-held is not globally latest; knowledge grants no execution, deployment or wallet authority.",
+     "{\"type\":\"object\",\"required\":[\"q\"],\"additionalProperties\":false,\"properties\":{\"grant\":{\"type\":\"string\"},\"q\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128,\"description\":\"1 to 128 UTF-8 bytes\"}}}"},
 };
 
 static const struct gw_tool *gw_tool_by_name(const char *name)
@@ -1108,9 +1112,10 @@ static void gw_reply_tools_list(struct gw_buf *b, const struct json_value *id)
         gw_buf_json_str(b, gw_tools[i].desc);
         gw_buf_str(b, ",\"inputSchema\":");
         gw_buf_str(b, gw_tools[i].schema);
-        /* Only brief has been qualified as a read-only snapshot. It can
-         * observe the private fleet board, so its world is not closed. */
-        if (strcmp(gw_tools[i].verb, "brief") == 0)
+        /* Read snapshots may contain untrusted peer knowledge.
+         * Their world is open; annotations grant no execution authority. */
+        if (strcmp(gw_tools[i].verb, "brief") == 0 ||
+            strcmp(gw_tools[i].verb, "wiki-find") == 0)
             gw_buf_str(b, ",\"annotations\":{\"readOnlyHint\":true,"
                           "\"destructiveHint\":false,\"idempotentHint\":true,"
                           "\"openWorldHint\":true}");

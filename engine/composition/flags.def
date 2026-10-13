@@ -2060,8 +2060,6 @@ Z23_FLAG("ZCL_REQUIRE_MINGW", "env_build", "0", "-",
           "first use tools/lint/check_windows_acceptance.sh:auto; documented at docs/DEFENSIVE_CODING.md:1018: | **check-windows-platform-seam** | RATCHET | Windows portability of the platform seam:...")
 Z23_FLAG("ZCL_RESULT_DISCARD_SCAN_DIRS_FOR_TEST", "env_build", "-", "-",
           "undocumented; first use tools/lint/lintc/gate_source_patterns.c:auto")
-Z23_FLAG("ZCL_RETIRED_PROTOCOL_ROOT", "env_runtime", "-", "-",
-          "undocumented; first use tools/lint/lintc/gate_git_scan_b.c:auto")
 Z23_FLAG("ZCL_RETRIEVAL_BENCH_KEEP", "env_build", "0", "-",
           "first use tools/dev/retrieval-gold-benchmark.sh:auto; documented at docs/experiments/2026-08-31-story-retrieval-product-loop.md:42: ZCL_RETRIEVAL_BENCH_KEEP=1 make retrieval-gold-benchmark performs the")
 Z23_FLAG("ZCL_RETRIEVAL_BENCH_TIMEOUT_SECONDS", "env_build", "300", "-",

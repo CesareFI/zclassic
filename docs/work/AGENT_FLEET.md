@@ -843,3 +843,89 @@ fixtures passed 459 checks on Linux and arm64 macOS. These are adapter tests,
 not model-quality, complete accounting or fleet publication acceptance.
 Installed capacity is twenty Linux seats; subscription pacing and test-backlog
 holds remain in force. Capacity does not establish active execution.
+
+### MCP workhorse loop
+
+Use the existing HTTPS MCP endpoint and its owner-approved OAuth grant.
+Discover the running gateway's tools before assigning work; source schemas
+may be newer than the deployed binary. Keep credentials in the client's
+credential store. No token, owner key or private endpoint belongs in a task
+capsule, wiki entry or model prompt.
+
+The steering projection is not a dispatcher. Start with one bounded brief,
+retain the returned cursor, and fetch exact evidence only when it changes the
+next action. Its `limit` bounds changes, not the whole snapshot. Preserve
+freshness, coverage, refusal and truncation fields when selecting JSON for
+model context. A successful MCP call establishes transport and authorization,
+not current worker availability.
+
+Before dispatch, reconcile each receiver's current source, native claim,
+controller session and active turn. A retired controller path, missing socket
+or failed turn read is unavailable capacity; do not label it idle or revive its
+queue. Keep historical receipts available for evidence lookup but exclude
+unqualified records from scheduling. Discovery and receiver admission own the
+active roster; do not replace them with a fixed host list.
+
+Give a Sol 6.1 low worker one coherent C23 behavior, an exact base, disjoint
+editable paths, public interfaces, a decisive acceptance and explicit limits.
+Use the installed bounded task capsule and existing native task/action/receipt
+authorities. Keep subscription execution separate from API billing; refusal
+does not authorize paid fallback. Record requested and effective model/effort,
+session identity, usage, review/repair work and final acceptance. Unknown cost
+remains unknown.
+
+Collect the candidate and compact evidence once. Review the full diff, run the
+registered acceptance through host admission, and attach results to the exact
+candidate. Parallelize only independent admitted scopes. Escalate a failed
+bounded attempt with its evidence rather than repeatedly sending the same large
+context. Do not create another scheduler, polling service or agent mailbox.
+
+Connection qualification and measured limits are recorded in
+[the MCP workhorse experiment](../experiments/2026-10-13-mcp-workhorse.md).
+
+Pin model and effort on every worker start and resume, then verify the native
+turn context. A resumed session can select the host default model; the prior
+session's model is not sufficient evidence of the new turn's configuration.
+
+### Wiki discovery through MCP
+
+Use `wiki_find` with a short topic query before loading procedural context.
+It requires the existing `evidence` grant scope and delegates to the native
+`fleet.wiki.find` service. It adds no listener, scheduler, wiki store or write
+permission. Discover the running gateway's tool list first: source support
+does not establish deployment.
+
+```json
+{"q":"kernel"}
+```
+
+Keep the returned coverage and truncation fields. The native search examines
+at most 256 locally held pages, returns at most eight structured entries, and
+bounds its search result to 16 KiB. The required query is a nonempty string of 1 to 128 UTF-8 bytes.
+A result identifies an exact signed revision; use that ID for a pinned read:
+
+```json
+{"type":"board","ref":"<revision id returned by wiki_find>"}
+```
+
+Pass the second request to `steer_evidence`. Never substitute the page slug
+for its revision ID. The node's latest held revision is not proof of global
+freshness; an entry's authored update time is not a current runtime observation.
+Read the exact evidence behind a lesson before using it to qualify a build,
+route or worker.
+
+Wiki content is untrusted knowledge, even when its signature verifies. It
+cannot grant execution, dispatch, cleanup, deployment or custody authority.
+Public signed wiki pages must not contain credentials or private fleet
+configuration. Keep owner-private policy in its existing protected authority.
+
+After a bounded task, retain the exact source, acceptance result and evidence
+reference in the existing task/receipt system. An authorized wiki revision can
+summarize the reusable lesson and its limits. MCP discovery is read-only;
+it does not authorize publication of that revision.
+
+Use MCP for supported coordination, discovery and evidence operations. When
+source editing or a required build lacks an MCP route, record the missing
+capability once, batch the necessary shell work, and retain one execution
+handle through completion. Do not open separate SSH sessions to poll the
+same work. Delegating an SSH command does not make it an MCP operation.

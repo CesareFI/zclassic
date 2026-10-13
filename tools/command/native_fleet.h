@@ -64,6 +64,9 @@ void zcl_native_handle_fleet_steer_send(
 void zcl_native_handle_fleet_steer_evidence(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+void zcl_native_handle_fleet_steer_wiki_find(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
 void zcl_native_handle_fleet_steer_grant(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);

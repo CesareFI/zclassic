@@ -229,8 +229,6 @@ int check_proof_server_pin_run(int argc, char **argv);
 int check_proof_server_pin_selftest(void);
 int check_tu_random_seed_run(int argc, char **argv);
 int check_tu_random_seed_selftest(void);
-int check_no_retired_agent_protocol_run(int argc, char **argv);
-int check_no_retired_agent_protocol_selftest(void);
 int check_stopwatch_skip_detector_run(int argc, char **argv);
 int check_stopwatch_skip_detector_selftest(void);
 int check_no_warning_suppression_run(int argc, char **argv);

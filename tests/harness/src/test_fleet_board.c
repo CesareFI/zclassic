@@ -19,6 +19,7 @@
 #include "models/database.h"
 #include "models/fleet_board_post.h"
 #include "command/native_command.h"
+#include "command/native_fleet.h"
 #include "controllers/rpc_client.h"
 #include "session/fleet_board_proto.h"
 #include "session/fleet_wiki_entry.h"
@@ -2922,6 +2923,123 @@ static bool fb_test_ingest_page(struct node_db *db, const char *slug,
            db_fleet_board_post_ingest(db, &p, now, NULL) == FLEET_BOARD_OK;
 }
 
+static unsigned fb_wiki_backend_variant;
+static char *fb_wiki_backend_rpc(const char *method, const char *params)
+{
+    (void)params;
+    if (strcmp(method, "fleet_board")) return NULL;
+    static const char *const ENTRIES[] = {
+        "[]",
+        "[{\"slug\":\"kernel\",\"summary\":\"old backend\"}]",
+        "[{\"id\":\"bad\",\"host\":\"bad\",\"created_at\":1,\"expires_at\":2}]",
+        "[{\"id\":\"1111111111111111111111111111111111111111111111111111111111111111\","
+        "\"host\":\"2222222222222222222222222222222222222222222222222222222222222222\","
+        "\"created_at\":\"1\",\"expires_at\":2}]",
+        "[{\"id\":\"1111111111111111111111111111111111111111111111111111111111111111\","
+        "\"host\":\"2222222222222222222222222222222222222222222222222222222222222222\","
+        "\"created_at\":2,\"expires_at\":1}]",
+        "[]"
+    };
+    if (fb_wiki_backend_variant >= sizeof(ENTRIES) / sizeof(ENTRIES[0])) return NULL;
+    char wire[1024];
+    const char *marker = fb_wiki_backend_variant < 2 ? "" :
+        "\"identity_schema\":\"" FLEET_WIKI_DISCOVERY_IDENTITY_SCHEMA "\",";
+    int n = snprintf(wire, sizeof(wire),
+        "{\"ok\":true,%s\"entries\":%s,\"returned\":%u,\"scanned\":256,\"truncated\":false}",
+        marker, ENTRIES[fb_wiki_backend_variant],
+        fb_wiki_backend_variant == 0 || fb_wiki_backend_variant == 5 ? 0u : 1u);
+    if (n < 0 || (size_t)n >= sizeof(wire)) return NULL;
+    char *copy = malloc((size_t)n + 1);
+    if (copy) memcpy(copy, wire, (size_t)n + 1);
+    return copy;
+}
+static bool fb_wiki_backend_case(unsigned variant)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    struct zcl_command_request request = {.input = &input};
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.fleet_steer_wiki_find.v1");
+    fb_wiki_backend_variant = variant;
+    node_rpc_client_set_test_hook(fb_wiki_backend_rpc);
+    bool ok = json_push_kv_str(&input, "q", "kernel");
+    if (ok) zcl_native_handle_fleet_steer_wiki_find(&request, &reply);
+    if (variant == 5)
+        ok = ok && reply.status == ZCL_COMMAND_STATUS_PASSED;
+    else
+        ok = ok && reply.status == ZCL_COMMAND_STATUS_FAILED &&
+            !strcmp(reply.error.code, "WIKI_CAPABILITY_UNAVAILABLE") &&
+            !json_get(&reply.data, "exact_read") && !json_get(&reply.data, "discovery");
+    node_rpc_client_set_test_hook(NULL);
+    zcl_command_reply_free(&reply); json_free(&input);
+    return ok;
+}
+static int test_fleet_wiki_backend_capability(void)
+{
+    int failures = 0;
+    TEST("fleet wiki: old empty and populated backends or invalid identities refuse pinned discovery") {
+        for (unsigned variant = 0; variant < 6; variant++)
+            ASSERT(fb_wiki_backend_case(variant));
+        struct json_value envelope;
+        json_init(&envelope);
+        static const char MAX_ENVELOPE[] =
+            "{\"ok\":true,\"identity_schema\":\"" FLEET_WIKI_DISCOVERY_IDENTITY_SCHEMA "\","
+            "\"entries\":[],\"returned\":8,\"scanned\":256,\"truncated\":false}";
+        bool parsed = json_read(&envelope, MAX_ENVELOPE, sizeof(MAX_ENVELOPE) - 1);
+        size_t size = parsed ? json_write(&envelope, NULL, 0) : 0;
+        json_free(&envelope);
+        ASSERT(parsed); ASSERT(size > 0 && size <= 192);
+        PASS();
+    } _test_next:;
+    node_rpc_client_set_test_hook(NULL);
+    return failures;
+}
+
+static bool fb_wiki_native_find(struct zcl_command_request *request, const char *id)
+{
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.fleet_steer_wiki_find.v1");
+    zcl_native_handle_fleet_steer_wiki_find(request, &reply);
+    const struct json_value *discovery = json_get(&reply.data, "discovery");
+    const char *found = json_get_str(json_get(json_at(json_get(discovery, "entries"), 0), "id"));
+    const char *selection = json_get_str(json_get(&reply.data, "selection"));
+    bool ok = reply.status == ZCL_COMMAND_STATUS_PASSED &&
+        json_get_bool(json_get(&reply.data, "untrusted")) &&
+        selection && !strcmp(selection, "latest-held") &&
+        json_get_int(json_get(&reply.data, "observed_at")) > 0 &&
+        json_get_int(json_get(discovery, "returned")) == 1 && found && !strcmp(found, id);
+    zcl_command_reply_free(&reply);
+    return ok;
+}
+static bool fb_wiki_native_exact(struct zcl_command_request *request, const char *id)
+{
+    struct zcl_command_reply reply;
+    zcl_command_reply_init(&reply, "zcl.fleet_steer_evidence.v1");
+    zcl_native_handle_fleet_steer_evidence(request, &reply);
+    const char *found = json_get_str(json_get(json_get(&reply.data, "object"), "id"));
+    bool ok = reply.status == ZCL_COMMAND_STATUS_PASSED && found && !strcmp(found, id);
+    zcl_command_reply_free(&reply);
+    return ok;
+}
+static bool fb_wiki_native_roundtrip(const struct rpc_table *table,
+    struct node_db *db, const char *id)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    struct zcl_command_request request = {.input = &input};
+    int changes = sqlite3_total_changes(db->db);
+    fb_native_test_table = table;
+    node_rpc_client_set_test_hook(fb_native_rpc);
+    bool ok = json_push_kv_str(&input, "q", "GIT") && fb_wiki_native_find(&request, id);
+    json_free(&input); json_init(&input); json_set_object(&input);
+    ok = ok && json_push_kv_str(&input, "type", "board") &&
+        json_push_kv_str(&input, "ref", id) && fb_wiki_native_exact(&request, id) &&
+        sqlite3_total_changes(db->db) == changes;
+    node_rpc_client_set_test_hook(NULL); fb_native_test_table = NULL;
+    json_free(&input);
+    return ok;
+}
+
 static int test_fleet_wiki_find_and_read(void)
 {
     int failures = 0;
@@ -2986,6 +3104,17 @@ static int test_fleet_wiki_find_and_read(void)
         ASSERT_EQ(json_get_int(json_get(&result, "returned")), 1);
         const struct json_value *hit =
             json_at(json_get(&result, "entries"), 0);
+        struct db_fleet_board_post exact;
+        char exact_id[65], exact_host[65];
+        ASSERT(db_fleet_board_wiki_read(&db, "push-gate", &exact));
+        fleet_board_id_to_hex(exact.post.id, exact_id);
+        fleet_board_id_to_hex(exact.post.host_pubkey, exact_host);
+        ASSERT_STR_EQ(json_get_str(json_get(hit, "id")), exact_id);
+        ASSERT_STR_EQ(json_get_str(json_get(hit, "host")), exact_host);
+        ASSERT_EQ(json_get_int(json_get(hit, "created_at")), (int64_t)exact.post.created_at);
+        ASSERT_EQ(json_get_int(json_get(hit, "expires_at")), exact.expires_at);
+        ASSERT(json_write(&result, NULL, 0) <= 16 * 1024);
+        ASSERT(fb_wiki_native_roundtrip(&table, &db, exact_id));
         ASSERT(strcmp(json_get_str(json_get(hit, "slug")), "push-gate") == 0);
         ASSERT(strcmp(json_get_str(json_at(json_get(hit, "rules"), 0)),
                       "Run the full lint before pushing.") == 0);
@@ -4461,6 +4590,7 @@ static int test_fleet_board_public_no_grant_needed(void)
     failures += test_fleet_board_stored_ceilings_are_separate();
     failures += test_fleet_board_wiki_refusals_do_not_score_relay();
     failures += test_fleet_wiki_entry_validation();
+    failures += test_fleet_wiki_backend_capability();
     failures += test_fleet_wiki_find_and_read();
     failures += test_fleet_wiki_entry_rejections();
     failures += test_fleet_wiki_find_edges();

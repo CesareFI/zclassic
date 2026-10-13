@@ -156,62 +156,40 @@ make lint-fast                         # the fast gate subset
 `make -s print-CFLAGS` and `print-DEV-CFLAGS` show the two flag sets if you
 want to know what those two builds differ by.
 
-### On a shared build host: `devbuild`
+### On a managed build host: `devbuild`
 
-If you are the only user of your machine, skip this; `make -j"$(nproc)"` is
-complete and correct on its own.
+On a managed host, every heavy build, proof, benchmark and test matrix must
+use `devbuild --wait`, even when only one developer is active. The direct
+`make` examples elsewhere in this document describe unmanaged machines;
+installed host policy takes precedence on fleet development hosts.
 
-On a host where several lanes, another project, and a live node share the
-CPUs, every heavy build, proof, benchmark and test matrix goes through a host
-scheduler named `devbuild`, and the form is:
+Read `~/.config/dev-workers/OPERATIONS.md`, `STORAGE.md` and `WORKER.md`
+before work. Inspect the assigned lane and installed admission profile:
 
 ```bash
-devbuild --wait make -j"$(nproc)" lint
-devbuild --plan                        # what a slot would grant; runs nothing
+devworker where z23
+devbuild --plan
 ```
 
-`devbuild` is **not installed by any repository target.** It is a shared host
-program. Read `~/.config/dev-workers/OPERATIONS.md` and inspect
-`devbuild --plan` for the installed host limits; reference defaults below do
-not promise identical settings on every retained host. Each project gets a
-slot admitting several concurrent lanes: Z23's
-slot admits up to `DEVBUILD_Z23_LANES` concurrent jobs (default 3, max 4);
-QEDC's slot admits up to `DEVBUILD_QEDC_LANES` concurrent jobs (default 2,
-max 4); each is one per lane lock. `--wait` waiters are served
-first-in, first-out (FIFO) through
-enqueue-ordered tickets, so a long-queued job is never passed over by a
-newer one; a `dev land` invocation, or `DEVBUILD_PRIORITY=land`, takes the
-next free Z23 lane ahead of ordinary waiters. It refuses admission when the
-host has under 24 GiB available, and runs commands inside a `systemd-run
---user --scope` with a CPU quota, a memory ceiling, CPU pinning that leaves
-two physical cores outside the development slice, and a per-project
-CPUWeight (Z23 20, QEDC `20 * DEVBUILD_Z23_LANES / DEVBUILD_QEDC_LANES`, so
-QEDC's combined share across its lanes matches all concurrent Z23 lanes'
-combined share). Each finished job
-appends one JSON line (project, pid, cwd, queue/run timings, rc, lane,
-mem/cpu use, tree — a 16-hex checkout fingerprint from HEAD, the
-working-tree diff and untracked file names) to
-`~/.local/state/development/devbuild.jobs.jsonl` for measuring slot
-contention; a repeat of the same cwd + cmd on the identical tree that
-previously exited 0 prints an advisory stderr note.
-[`../platform/deploy/devbuild`](../platform/deploy/devbuild) is the reference
-mirror of the installed script, with the exact contract in its header;
-[`../platform/deploy/test-devbuild.sh`](../platform/deploy/test-devbuild.sh)
-exercises lane overlap (Z23 and QEDC), FIFO order, landing priority, and
-the accounting file against that mirror.
-[`../platform/deploy/devbuild-broker`](../platform/deploy/devbuild-broker) is
-a separate, not-yet-installed replacement candidate with finer-grained
-processor, random-access memory (RAM), and input/output (I/O) classes; see
-[`../platform/deploy/README.md`](../platform/deploy/README.md) for its status.
-That README is the door to the rest of that directory: which units a host
-runs, which of them a clone gets, and why the remainder stay host-local.
+Run the prescribed command as `devbuild --wait COMMAND ARGS...`, retaining
+the host's prescribed job count, memory limits and native locks. Shell
+substitutions in arguments run before admission: `-j"$(nproc)"` at the
+calling shell measures that shell's CPU view, not the allocation subsequently
+granted to the job. Do not infer an admitted job count from it.
 
-Read that file before working on a shared host, because three things in this
-tree call `devbuild` by name and fail without it:
-`tools/dev/node_lifecycle.sh`, `tools/dev/commons_journey_acceptance.sh`, and
-`tools/scripts/qualify_fleet_gateway_front.sh`. Inside a `devbuild` scope
-`nproc` already reports the granted CPUs, so `-j"$(nproc)"` is the right job
-count there and not an over-subscription.
+`devbuild` is a host program, not installed by repository targets. Installed
+policy owns free-space reserves, concurrent lane limits, scratch retention
+and resource accounting. Do not copy historical defaults from this repository
+over the host configuration, lower a reserve to admit a job, or bypass
+admission for a single-user session. Reuse sanctioned lanes and preserve
+unique source, evidence and live leases when retiring generated output.
+
+[The deployment guide](../platform/deploy/README.md) describes versioned
+reference implementations and their tests. Their presence does not establish
+which implementation or profile a host currently runs. Inspect the installed
+program and its plan before diagnosing admission. Development on the
+maintainer's laptop is limited to coordination and review; use the existing
+`devon` routes for project builds.
 
 ### Five things that will look like bugs and are not
 
@@ -1822,3 +1800,9 @@ Writes: stdout; exit 1 when a route or marker check fails.
 
 The two-node terminal acceptance procedure is the sixth retired one; it is
 recorded in `docs/work/SOVEREIGN_MACHINE_MESH_PLAN.md`.
+
+Current MCP adapters expose fixed native commands with existing authorization,
+bounded inputs and explicit capability refusals. The blanket acronym ban was
+removed to support this product interface; it identified no specific retired
+API or implementation. Native authorization and every unrelated lint gate
+remain required.

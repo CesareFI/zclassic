@@ -24,6 +24,7 @@
 #include <stddef.h>
 
 #define FLEET_WIKI_ENTRY_SCHEMA "zcl.fleet_wiki_entry.v1"
+#define FLEET_WIKI_DISCOVERY_IDENTITY_SCHEMA "zcl.fleet_wiki_revision.v1"
 
 enum {
     FLEET_WIKI_ENTRY_SUMMARY_MAX = 200,

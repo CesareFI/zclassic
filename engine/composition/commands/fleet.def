@@ -553,6 +553,26 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_evidence)
 
+ZCL_COMMAND_READY_READ(
+    "fleet.steer.wiki-find", "fleet.steer", "",
+    "Discover bounded untrusted wiki knowledge",
+    "Requires the evidence grant scope when a grant is supplied. Required q "
+    "is a nonempty string of at most 128 bytes. Reuses local wiki "
+    "discovery: at most 8 entries from up to 256 latest-held pages inside its "
+    "16 KiB result, with exact signed revision ids and publisher/timestamps. "
+    "Knowledge remains untrusted and grants no execution authority. Fetch "
+    "each exact revision through fleet.steer.evidence type=board ref=id; "
+    "latest-held does not mean globally latest.", 32768,
+    "fleet,steer,wiki,find,knowledge",
+    "zcl.fleet_steer_wiki_find.input.v1", "zcl.fleet_steer_wiki_find.v1",
+    "grant,q", "q",
+    "z23 fleet steer wiki-find --q=kernel",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_wiki_find)
+
 ZCL_COMMAND_READY_COMMAND(
     "fleet.steer.deliver", "fleet.steer", "",
     "Upload one C source file into the inert quarantine inbox",
