@@ -737,6 +737,25 @@ static int gw_t_handshake(void)
         ASSERT_EQ(st, 200);
         ASSERT(gw_body_has(b, "\"protocolVersion\":\"2025-06-18\""));
         ASSERT(gw_body_has(b, "z23-fleet-gateway"));
+        struct json_value handshake = {0};
+        ASSERT(json_read(&handshake, b, strlen(b)));
+        const struct json_value *init_result = json_get(&handshake, "result");
+        const struct json_value *guidance = json_get(init_result, "instructions");
+        ASSERT(guidance && guidance->type == JSON_STR);
+        const char *instructions = json_get_str(guidance);
+        ASSERT(instructions != NULL);
+        ASSERT(strlen(instructions) > 0);
+        ASSERT(strlen(instructions) <= 2048);
+        /* These are caller-visible workflow obligations, not source matches. */
+        const char *const obligations[] = {
+            "cursor_token", "idempotency_key",
+            "reconcile before retrying", "granted scope",
+            "publication authority"
+        };
+        for (size_t i = 0; i < sizeof(obligations) / sizeof(obligations[0]); i++)
+            ASSERT(strstr(instructions, obligations[i]) != NULL);
+        ASSERT(json_get(json_get(init_result, "capabilities"), "tools") != NULL);
+        json_free(&handshake);
         free(b);
         b = gw_post("/steer",
                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
@@ -754,6 +773,22 @@ static int gw_t_handshake(void)
         ASSERT(json_read(&catalog, b, strlen(b)));
         const struct json_value *tools = json_get(json_get(&catalog, "result"), "tools");
         ASSERT(tools && json_size(tools) == 5);
+        const char *const names[] = {
+            "steer_brief", "steer_send", "steer_evidence", "steer_deliver", "wiki_find"
+        };
+        const char *const titles[] = {
+            "Observe fleet", "Delegate work", "Inspect evidence", "Stage source", "Find knowledge"
+        };
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            const struct json_value *tool = json_at(tools, i);
+            ASSERT_STR_EQ(json_get_str(json_get(tool, "name")), names[i]);
+            ASSERT_STR_EQ(json_get_str(json_get(tool, "title")), titles[i]);
+            ASSERT(json_get(tool, "inputSchema") != NULL);
+        }
+        const char *send_description =
+            json_get_str(json_get(json_at(tools, 1), "description"));
+        ASSERT(send_description && strstr(send_description,
+            "acceptance records delivery intent, not worker execution or completion"));
         const struct json_value *brief = json_at(tools, 0);
         ASSERT_STR_EQ(json_get_str(json_get(brief, "name")), "steer_brief");
         const struct json_value *annotations = json_get(brief, "annotations");

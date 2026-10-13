@@ -196,3 +196,34 @@ test_fleet_board: one group executed, zero failures, skips or unobserved
 environments; test body 23,765 ms. The initial help invocation returned usage
 with exit 2 after compilation and is not runtime test acceptance. Full release
 qualification and activation remain separate requirements.
+
+## Gateway workflow guidance and recovered fixture qualification
+
+The gateway initialization response now supplies bounded workflow guidance,
+and each existing tool has a descriptive title. Tool names, request schemas,
+grant scopes and receiver authority remain unchanged. The guidance distinguishes
+configuration, authentication, observed replies and active worker evidence.
+It preserves exact-source review, idempotent reconciliation and local policy;
+wiki content is knowledge rather than execution authority.
+
+The reviewed three-file proposal has SHA256
+64f983a09751e97d72084df33ed228f3d7d69b186ff56a20dca4eb4fb8463978.
+On 2026-10-13 it passed the focused gateway shard on macOS: one group,
+zero failures, skips or unobserved legs, with a 3,729 ms test body. Complexity,
+documentation capability inventory and fast lint also passed there. Its exact
+artifact transfer to Linux verified all five handoff files before application
+on base 921311736d41e58417b608219b6e0582603a2aac. The same focused shard
+passed on Linux: one group, zero failures, skips or unobserved legs, with a
+2,124 ms test body. These are functional test observations, not latency
+benchmarks or deployment evidence.
+
+The preceding release attempt stopped before deployment: its full suite ran
+1,300 groups and failed three because required exact public guest fixtures
+were unavailable to the process. Eleven groups were gated, nineteen skip
+markers were reported, and one group had unobserved environment-dependent
+legs. No threshold was changed. The retained archive was verified before
+restoring only the required public kernels; original artifacts were preserved.
+With the required fixture environment explicitly provided, independent focused
+runs passed guest image admission, GELI volume and FreeBSD ports, each with
+zero failures, skips and unobserved legs. These reruns do not replace the
+full release gate and do not qualify native fleet SSH or production activation.

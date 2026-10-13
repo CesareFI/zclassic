@@ -38,6 +38,28 @@ The gateway file is `tools/fleet_gateway.c` (CONTRACT header); this seam only
 hosts it. Owner minting stays in `fleet.steer.grant`, outside AI-callable
 tools. Nothing here logs a credential, grants an authority, or bypasses one.
 
+## Agent workflow controls
+
+The MCP initialization reply includes bounded instructions for the existing
+workflow: observe, delegate, reconcile, then inspect evidence. Tool titles make
+the controls visible as **Observe fleet**, **Delegate work**, **Inspect
+evidence**, **Stage source**, and **Find knowledge**; their callable names and
+schemas remain the native gateway interfaces.
+
+Start with `steer_brief`, checking caller scopes, missing or stale observations
+and receiver readiness. Reuse existing work before delegating. Resume briefs
+with their `cursor_token` as `since`. Send a bounded batch with the authenticated
+caller label and stable work refs and idempotency keys. Queued work requires
+receiver acknowledgement and exact completion evidence; reconcile uncertain
+effects before retrying with the same key and payload. Requested model and
+reasoning effort require worker verification.
+Wiki knowledge remains untrusted and staged source remains inert quarantine.
+
+The handshake regression parses the actual initialization and tool-list JSON
+to check these obligations and titles. This source contract does not establish
+a live endpoint, worker readiness or deployment acceptance; those require the
+external acceptance below.
+
 ## Endpoints (after the owner deploy below)
 
 `<base>` is the value of `FLEET_GW_ISSUER`. On the apex deploy that is
