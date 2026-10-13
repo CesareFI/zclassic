@@ -1593,7 +1593,7 @@ static bool fb_rpc_post(struct fb_rpc_fixture *f, const char *kind,
     return ok;
 }
 
-static struct rpc_table *fb_native_test_table;
+static const struct rpc_table *fb_native_test_table;
 
 static char *fb_native_rpc(const char *method, const char *params)
 {

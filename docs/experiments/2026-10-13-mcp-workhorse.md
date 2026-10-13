@@ -185,3 +185,14 @@ Evidence for this follow-up is retained on z23-r2 under
 ~/.local/state/storage-plan/2026-10-12-fleet/mcp-wiki-capability-20261013/.
 The running backend still requires its independently qualified update; this
 worker performed no deployment or production service change.
+
+## Strict compiler fixture correction
+
+The release suite on 2026-10-13 refused a discarded const qualifier in the
+wiki round-trip fixture. The shared RPC-table test pointer now preserves the
+const contract already accepted by rpc_table_execute. No cast or warning
+suppression was added. The canonical strict test-parallel runner then passed
+test_fleet_board: one group executed, zero failures, skips or unobserved
+environments; test body 23,765 ms. The initial help invocation returned usage
+with exit 2 after compilation and is not runtime test acceptance. Full release
+qualification and activation remain separate requirements.
