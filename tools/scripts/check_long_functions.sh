@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate #12 — long functions (god-function ratchet).
 #
 # Long functions are hard to reason about, hard to test, and a sign that a

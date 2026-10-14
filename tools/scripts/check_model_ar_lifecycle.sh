@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # check_model_ar_lifecycle.sh
 #
 # Model saves must not hand-run the ActiveRecord callback internals. Use

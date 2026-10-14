@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Architecture gate — a dumpstate view never blocks behind the reducer.
 #
 # Program O0/O1: the diagnostic snapshot plane. A `*_dump_state_json` function

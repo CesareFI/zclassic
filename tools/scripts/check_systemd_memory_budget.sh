@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate: systemd hard memory caps must fit inside the host budget.
 #
 # This guards the host-level OOM class from recurring. It parses committed

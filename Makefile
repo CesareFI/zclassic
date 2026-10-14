@@ -13637,7 +13637,7 @@ check-blocker-escape-registered: $(LINTC_TOOL)
 # permanent-no-cure blocker cannot be added without declaring that fact.
 check-blocker-remedy: $(LINTC_TOOL)
 	@echo "══ LINT: blocker remedy totality ══"
-	@bash tools/scripts/check_blocker_remedy.sh
+	@sh tools/scripts/check_blocker_remedy.sh
 
 # Gate — blocker HAND-OFF declaration (RATCHET, shrink-only baseline
 # tools/lint/blocker_handoff_baseline.txt). check-blocker-remedy above proves

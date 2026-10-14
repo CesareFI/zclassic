@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate E13 — consensus-parity guard (HARD).
 #
 # zclassic23 MUST stay BIT-FOR-BIT consensus-compatible with zclassicd

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate — no UNCITED victory claim in the one live-state page (HARD).
 #
 # WHY THIS EXISTS: this repo shipped 9+ "cured / at tip / fully synced" claims

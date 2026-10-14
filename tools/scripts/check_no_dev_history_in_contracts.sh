@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Copyright 2026 Rhett Creighton - Apache License 2.0
 #
 # Lint gate — no dev-history phrasing in production contract files.

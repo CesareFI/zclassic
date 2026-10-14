@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate #49 — blocker escape-action totality.
 #
 # escape_action is dual-purpose, and a literal is valid in any of three

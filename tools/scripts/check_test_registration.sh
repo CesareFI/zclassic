@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate — test-registration drift guard (HARD).
 #
 # THE BUG THIS PREVENTS (lane-3, 2026-06-22): three test entry points

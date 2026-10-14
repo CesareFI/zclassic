@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate E7 — no-authoritative-RAM-state (RATCHET).
 #
 # Consensus authority must live in the log, projections, and durable cursors.

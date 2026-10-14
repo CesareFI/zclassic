@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Copyright 2026 Rhett Creighton - Apache License 2.0
 # Verify the checkout-local hook set selected for this host.
 

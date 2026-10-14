@@ -212,7 +212,7 @@ gate_command() {
         check-test-registration)           echo './tools/scripts/check_test_registration.sh --selftest && ./tools/scripts/check_test_registration.sh' ;;
         check-typed-blocker)               echo './build/bin/z23-lint check-typed-blocker' ;;
         check-blocker-escape-registered)   echo './tools/scripts/check_blocker_escape_registered.sh --selftest && ./tools/scripts/check_blocker_escape_registered.sh' ;;
-        check-blocker-remedy)              echo './tools/scripts/check_blocker_remedy.sh' ;;
+        check-blocker-remedy)              echo 'sh tools/scripts/check_blocker_remedy.sh' ;;
         check-blocker-handoff-declared)    echo './tools/lint/check_blocker_handoff_declared.sh' ;;
         check-supervisor-progress-declared) echo './tools/lint/check_supervisor_progress_declared.sh' ;;
         check-stopwatch-skip-detector)     echo './build/bin/z23-lint check-stopwatch-skip-detector' ;;

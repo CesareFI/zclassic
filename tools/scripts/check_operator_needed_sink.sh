@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate E9 — operator-needed events must reach a sink (HARD).
 #
 # THE silent-halt class of bug: code emits EV_OPERATOR_NEEDED (the

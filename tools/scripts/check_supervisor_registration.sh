@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate #15 — supervisor registration for long-running services.
 #
 # Goal: every long-running service in the scanned roots (below) either

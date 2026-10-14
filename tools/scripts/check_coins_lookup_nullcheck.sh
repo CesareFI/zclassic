@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Copyright 2026 Rhett Creighton - Apache License 2.0
 #
 # check_coins_lookup_nullcheck.sh — ensure controller-level coins lookups

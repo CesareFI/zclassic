@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate E5 — Job stages advance OR block; they never silently spin (HARD).
 #
 # A Job (engine/jobs/src/*_stage.c) is the single-purpose, idempotent step

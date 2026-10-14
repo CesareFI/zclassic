@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate E6 — one-write-path (RATCHET).
 #
 # There is one consensus writer: the reducer advances durable cursors and

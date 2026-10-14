@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate E3 — shape source files include their shape header (HARD).
 #
 # The framework places each app/.c file in a shape folder (Gate #18). That

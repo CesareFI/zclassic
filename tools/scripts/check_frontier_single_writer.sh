@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Architecture gate — one canonical writer per durable frontier.
 #
 # The manifest names each frontier, its canonical owner basename, and the ERE

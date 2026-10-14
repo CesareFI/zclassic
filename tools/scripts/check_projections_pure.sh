@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lint gate E4 — projections are pure folds over the event log (HARD).
 #
 # A projection (engine/modules/storage/src/*_projection.c) rebuilds a read-optimized
