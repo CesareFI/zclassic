@@ -24,7 +24,6 @@ platform/packaging/install/install_selftest.sh
 platform/packaging/release/build_release.sh
 platform/packaging/windows/install-service.sh
 tests/harness/mvp_c8_judge_cases.sh
-tools/agent/check-claims.sh
 tools/agent/gate-receipt.sh
 tools/agent_fast_ci.sh
 tools/dep_audit.sh

@@ -4474,7 +4474,7 @@ worktree-gc:
 # command, HEAD, dirty state, exit status, wall/child-CPU time, and a SHA3 of
 # the captured output, which is stored alongside. See the forgery model in
 # tools/agent/gate-receipt.sh — this is EVIDENCE, not proof.
-.PHONY: gate-receipt check-claims agent-velocity agent-velocity-selftest agent-sha3 dev-fleet-selftest
+.PHONY: gate-receipt check-claims check-claims-selftest agent-velocity agent-velocity-selftest agent-sha3 dev-fleet-selftest
 
 AGENT_SHA3_SRCS := tools/agent/agent_sha3.c platform/modules/sha3/src/sha3.c
 agent-sha3: $(BIN_DIR)/agent_sha3
@@ -4483,6 +4483,20 @@ $(BIN_DIR)/agent_sha3: $(AGENT_SHA3_SRCS)
 	$(CC) -std=c23 -O2 -Wall -Wextra -Werror $(HARDEN_CFLAGS) \
 	    -Iplatform/modules/sha3/include -Icore/modules/crypto/include -Iplatform/modules/support/include -Iplatform/modules/base/include \
 	    -o $@ $(AGENT_SHA3_SRCS) $(HARDEN_LDFLAGS)
+
+CHECK_CLAIMS_BIN := $(BIN_DIR)/check_claims
+CHECK_CLAIMS_SRCS := tools/agent/check_claims.c platform/modules/sha3/src/sha3.c platform/modules/base/src/safe_alloc.c
+$(CHECK_CLAIMS_BIN): $(CHECK_CLAIMS_SRCS)
+	@mkdir -p $(dir $@)
+	@$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic $(HARDEN_CFLAGS) \
+	    -Iplatform/modules/sha3/include -Icore/modules/crypto/include -Iplatform/modules/support/include \
+	    -Iplatform/modules/base/include -Iplatform/modules/util/include -Iplatform/modules/platform/include \
+	    -o $@ $(CHECK_CLAIMS_SRCS) $(HARDEN_LDFLAGS)
+
+# Parser, digest, token-scan, chain and report checks of check_claims; no
+# repository, receipts or files are read.
+check-claims-selftest: $(CHECK_CLAIMS_BIN)
+	@$(CHECK_CLAIMS_BIN) --selftest
 
 AGENT_VELOCITY_BIN := $(BIN_DIR)/agent_velocity
 $(AGENT_VELOCITY_BIN): tools/agent/agent_velocity.c platform/modules/base/src/safe_alloc.c
@@ -4868,9 +4882,9 @@ gate-receipt:
 # has no receipt, if a receipt does not describe the current HEAD, or if the
 # stored output no longer backs the verdict.
 #   make check-claims CLAIMS="lint t-fast"
-check-claims:
+check-claims: $(CHECK_CLAIMS_BIN)
 	@RECEIPTS='$(RECEIPTS)'; \
-	 tools/agent/check-claims.sh $${RECEIPTS:+--dir "$$RECEIPTS"} \
+	 $(CHECK_CLAIMS_BIN) $${RECEIPTS:+--dir "$$RECEIPTS"} \
 	    $(if $(CLAIMS),--require '$(CLAIMS)') $(if $(STRICT),--strict)
 
 # What a lane cost and produced, computed rather than remembered. Everything
