@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Gate — no NEW runtime abort primitive in network-reachable code
 # (ratchet, shrink-only counts).
 #

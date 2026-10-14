@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Gate — ONE fixed-width byte-order codec (ratchet, shrink-only file list).
 #
 # What it enforces

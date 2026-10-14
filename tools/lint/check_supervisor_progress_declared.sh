@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Gate — supervisor PROGRESS-POLICY declaration (ratchet, shrink-only counts).
 #
 # What it enforces

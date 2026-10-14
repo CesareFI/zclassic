@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Gate — a non-static function is defined ONCE per translation unit
 # (ratchet, shrink-only <path>\t<function> baseline).
 #

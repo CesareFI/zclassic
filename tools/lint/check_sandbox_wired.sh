@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Gate: sandbox wired (HARD).
 #
 # Ported to the C23 lint runtime (z23-lint); this shim keeps the gate's own
