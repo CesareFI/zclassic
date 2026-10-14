@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Copyright 2026 Rhett Creighton - Apache License 2.0
 #
 # check_live_datadir_isolation.sh — nothing under test, and no command an
@@ -90,8 +90,8 @@
 #
 # NO PER-LINE ESCAPE HATCH EXISTS, deliberately. The one thing an `# ok`
 # marker would be used for is the case that needs a human to look.
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+set -eu
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT"
 exec "$ROOT/build/bin/z23-lint" check-live-datadir-isolation "$@"

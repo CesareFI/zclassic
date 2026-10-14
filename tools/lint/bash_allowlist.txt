@@ -180,7 +180,6 @@ tools/lint/check_capability_inventory_generated.sh
 tools/lint/check_clang_portability.sh
 tools/lint/check_command_input_keys.sh
 tools/lint/check_cookbook.sh
-tools/lint/check_core_seal_root_mirror.sh
 tools/lint/check_determinism_ratchet.sh
 tools/lint/check_discarded_status.sh
 tools/lint/check_doc_claims.sh
@@ -189,12 +188,10 @@ tools/lint/check_fleet_vitals.sh
 tools/lint/check_fortify_masked_decls.sh
 tools/lint/check_fuzz_artifact_replay.sh
 tools/lint/check_hex_codec_single.sh
-tools/lint/check_honest_witness.sh
 tools/lint/check_hosted_suite_verdict.sh
 tools/lint/check_hotswap_module_imports.sh
 tools/lint/check_hotswap_service_islands.sh
 tools/lint/check_identity_parser_single.sh
-tools/lint/check_live_datadir_isolation.sh
 tools/lint/check_log_macro_return_type.sh
 tools/lint/check_macos_acceptance.sh
 tools/lint/check_markdown_links.sh
@@ -211,16 +208,13 @@ tools/lint/check_no_runtime_abort.sh
 tools/lint/check_no_shellouts.sh
 tools/lint/check_no_stale_pinned_facts.sh
 tools/lint/check_no_stray_root_files.sh
-tools/lint/check_no_unattended_publish.sh
 tools/lint/check_no_wallclock_assertion.sh
-tools/lint/check_no_writer_below_sealed_frontier.sh
 tools/lint/check_object_reproducible.sh
 tools/lint/check_orient_facts.sh
 tools/lint/check_outparam_init_before_return.sh
 tools/lint/check_package_anatomy.sh
 tools/lint/check_pipefail_status_pipe.sh
 tools/lint/check_platform_header_guards.sh
-tools/lint/check_privileged_transition_receipt.sh
 tools/lint/check_proc_self_shim.sh
 tools/lint/check_promotion_receipt_chain.sh
 tools/lint/check_published_platforms.sh
@@ -238,7 +232,6 @@ tools/lint/check_sysinit_ordering.sh
 tools/lint/check_telemetry_ontology.sh
 tools/lint/check_thread_supervision.sh
 tools/lint/check_tor_provenance.sh
-tools/lint/check_verification_coverage.sh
 tools/lint/check_wallet_raw_prepare_log.sh
 tools/lint/check_windows_acceptance.sh
 tools/lint/check_windows_cross_syntax.sh
