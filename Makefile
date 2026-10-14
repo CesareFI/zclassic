@@ -2114,7 +2114,7 @@ $(VENDOR_BOOTSTRAP_MK): vendor-ready
 	printf '%s\n' '# generated: vendor inputs established before source identity capture' > "$$tmp"; \
 	mv -f -- "$$tmp" "$@"; \
 	trap - EXIT HUP INT TERM
-check-vendor-provenance: tor-provenance-ready $(TOR_PROVENANCE_BIN)
+check-vendor-provenance: tor-provenance-ready $(TOR_PROVENANCE_BIN) $(BIN_DIR)/z23-lint
 	@tools/scripts/test_vendor_provenance.sh
 	@tools/scripts/build_vendor_offline_selftest.sh
 	@tools/scripts/repro_network_policy_selftest.sh
@@ -6478,6 +6478,9 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_macos_acceptance_parse.c \
     tools/lint/lintc/gate_macos_acceptance_selftest.c \
     tools/lint/lintc/gate_sqlite_cursor_lifetime.c \
+    tools/lint/lintc/lintc_sig.c \
+    tools/lint/lintc/gate_tor_provenance.c \
+    tools/lint/lintc/gate_tor_provenance_selftest.c \
     $(LINTC_PREMISE_SRCS) \
     tools/lint/lintc/main.c
 LINTC_OBJS = $(LINTC_SRCS:tools/lint/lintc/%.c=build/lintc-obj/%.o)
@@ -15220,7 +15223,7 @@ z23-tor-provenance: $(TOR_PROVENANCE_BIN)
 # archive bytes that produced them, not merely present and non-empty (see
 # tools/tor_provenance.c). check-vendor-provenance also runs this so Tor is
 # covered where the other vendor trees already are.
-check-tor-provenance: tor-provenance-ready $(TOR_PROVENANCE_BIN)
+check-tor-provenance: tor-provenance-ready $(TOR_PROVENANCE_BIN) $(LINTC_TOOL)
 	@echo "══ LINT: bundled Tor archives are bound to their commit + bytes ══"
 	@./tools/scripts/tor_archives_ready.sh --selftest
 	@./tools/lint/check_tor_provenance.sh
