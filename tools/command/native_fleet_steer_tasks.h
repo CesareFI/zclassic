@@ -17,7 +17,9 @@ bool zcl_fmc_tasks_queue(struct zcl_fmc_tasks *view,
 bool zcl_fmc_tasks_land(struct zcl_fmc_tasks *view,
     const struct json_value *land, const struct json_value *proof,
     long long observed, long long now);
-void zcl_fmc_tasks_emit(const struct zcl_fmc_tasks *view, struct json_value *data);
+/* Returns false when the final emission could not be copied whole: the
+ * caller must refuse the reply rather than ship a partial projection. */
+bool zcl_fmc_tasks_emit(const struct zcl_fmc_tasks *view, struct json_value *data);
 /* Render only already-classified, already-trimmed rows. Never re-read a source. */
 void zcl_fmc_tasks_screen(const struct json_value *data, char *out, size_t cap);
 #endif

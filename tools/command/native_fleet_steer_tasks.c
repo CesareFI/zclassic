@@ -25,10 +25,19 @@ static bool ft_copy(struct json_value *out, const char *key,
     const struct json_value *in, const char *from, enum json_type type)
 {
     const struct json_value *v = json_get(in, from);
+    const struct json_value *landed;
     struct json_value none = {0};
+    size_t at = json_size(out);
+    enum json_type want;
     if (!v || v->type != type || (type == JSON_STR && !json_get_str(v)[0]))
         v = &none;
-    return json_push_kv(out, key, v);
+    want = v->type;
+    if (!json_push_kv(out, key, v))
+        return false;
+    /* json_push_kv refuses an incomplete copy; the landed child must also
+     * keep the intended type, or present data would read as absent. */
+    landed = json_at(out, at);
+    return landed && landed->type == want;
 }
 
 static bool ft_sha(const char *s)
@@ -94,7 +103,8 @@ static bool ft_common(struct json_value *out, const struct json_value *row,
         ft_copy(out, "attempt", row, "attempt", JSON_INT) &&
         ft_copy(out, "ref", row, ref_key, JSON_STR) &&
         ft_copy(out, "source_ts", row, "ts", JSON_STR) &&
-        ft_observation(out, observed, now) && ft_unknown_authorities(out);
+        ft_observation(out, observed, now) && ft_unknown_authorities(out) &&
+        json_push_kv_str(out, "observed_model", "unknown");
 }
 
 static unsigned ft_rank(const struct json_value *row)
@@ -105,6 +115,22 @@ static unsigned ft_rank(const struct json_value *row)
     if (strcmp(state, "unknown") == 0) return 1;
     if (strcmp(state, "queued") == 0) return 2;
     return 3;
+}
+
+/* After the whole-row deep copy into v->rows, every top-level field must
+ * keep its built type: json_push_back refuses an incomplete copy, and this
+ * independent check pins the landed types either way. */
+static bool ft_landed_types_ok(const struct json_value *landed,
+                               const struct json_value *row)
+{
+    size_t i;
+    if (!landed || landed->num_children != row->num_children)
+        return false;
+    for (i = 0; i < row->num_children; i++) {
+        if (landed->children[i].type != row->children[i].type)
+            return false;
+    }
+    return true;
 }
 
 /* Presentation priority only. No execution order or scheduler state changes. */
@@ -119,7 +145,15 @@ static void ft_add(struct zcl_fmc_tasks *v, struct json_value *row, bool ok)
         json_free(&v->rows.children[n - 1]);
         v->rows.num_children--;
     }
+    n = json_size(&v->rows);
     if (!json_push_back(&v->rows, row)) { v->malformed++; return; }
+    if (!ft_landed_types_ok(json_at(&v->rows, n), row)) {
+        /* A degraded copy never ships: drop the landed row, count it. */
+        json_free(&v->rows.children[n]);
+        v->rows.num_children--;
+        v->malformed++;
+        return;
+    }
     for (size_t i = json_size(&v->rows) - 1; i > 0; i--) {
         if (ft_rank(&v->rows.children[i]) >= ft_rank(&v->rows.children[i - 1]))
             break;
@@ -172,6 +206,11 @@ static bool ft_queue_fields(struct json_value *out, const struct json_value *row
 {
     return
         ft_copy(out, "kind", row, "kind", JSON_STR) &&
+        ft_copy(out, "test_group", row, "group", JSON_STR) &&
+        ft_copy(out, "work_path", row, "path", JSON_STR) &&
+        ft_copy(out, "brief_path_reference", row, "brief", JSON_STR) &&
+        ft_copy(out, "requested_model", row, "model", JSON_STR) &&
+        ft_copy(out, "priority", row, "priority", JSON_INT) &&
         ft_copy(out, "owner", row, "worker", JSON_STR) &&
         ft_copy(out, "owner_liveness", row, "owner_liveness", JSON_STR) &&
         ft_copy(out, "depends_on", row, "depends_on", JSON_STR) &&
@@ -193,6 +232,7 @@ static void ft_queue_row(struct zcl_fmc_tasks *v, const struct json_value *row,
     }
     bool ok = ft_common(&out, row, "dev.agent.queue", "name", observed, now) &&
         json_push_kv_str(&out, "state", state) &&
+        json_push_kv_str(&out, "column", state) &&
         json_push_kv_str(&out, "reason", reason) &&
         json_push_kv_str(&out, "source_state", running ? "running" : "queued") &&
         ft_queue_fields(&out, row) &&
@@ -326,6 +366,15 @@ static bool ft_land_disposition(struct json_value *out, const struct json_value 
         json_push_kv_bool(out, "incomplete", true);
 }
 
+static bool ft_land_column_priority(struct json_value *out,
+    const char *section, const char *state)
+{
+    struct json_value none = {0};
+    return json_push_kv_str(out, "column",
+               strcmp(section, "outcomes") == 0 ? "history" : state) &&
+        json_push_kv(out, "priority", &none);
+}
+
 static void ft_land_row(struct zcl_fmc_tasks *v, const struct json_value *row,
     const struct json_value *proof, const char *section,
     long long observed, long long now)
@@ -344,6 +393,7 @@ static void ft_land_row(struct zcl_fmc_tasks *v, const struct json_value *row,
         ft_land_fields(&out, row) &&
         ft_land_history(&out, row, section) &&
         json_push_kv_str(&out, "state", state) &&
+        ft_land_column_priority(&out, section, state) &&
         json_push_kv_str(&out, "reason", reason) &&
         json_push_kv(&out, "proof", &p) &&
         ft_copy(&out, "owner", exact ? proof : NULL, "worker_id", JSON_INT) &&
@@ -373,18 +423,18 @@ bool zcl_fmc_tasks_land(struct zcl_fmc_tasks *v, const struct json_value *land,
     return ok;
 }
 
-void zcl_fmc_tasks_emit(const struct zcl_fmc_tasks *v, struct json_value *data)
+bool zcl_fmc_tasks_emit(const struct zcl_fmc_tasks *v, struct json_value *data)
 {
-    (void)json_push_kv(data, "tasks", &v->rows);
-    (void)json_push_kv_str(data, "tasks_scope", "local_active_queue_and_recent_land");
-    (void)json_push_kv_bool(data, "tasks_sources_complete", v->queue_ok &&
-        v->land_ok && !v->dropped && !v->malformed);
-    (void)json_push_kv_bool(data, "tasks_inventory_complete", false);
-    (void)json_push_kv_str(data, "tasks_coverage_reason",
-        "canonical_links_unavailable; landing_outcomes_last_10; remote_tasks_not_enumerated");
-    (void)json_push_kv_int(data, "tasks_observed", (long long)v->observed);
-    (void)json_push_kv_int(data, "tasks_dropped", (long long)v->dropped);
-    (void)json_push_kv_int(data, "tasks_malformed", (long long)v->malformed);
+    return json_push_kv(data, "tasks", &v->rows) &&
+        json_push_kv_str(data, "tasks_scope", "local_active_queue_and_recent_land") &&
+        json_push_kv_bool(data, "tasks_sources_complete", v->queue_ok &&
+            v->land_ok && !v->dropped && !v->malformed) &&
+        json_push_kv_bool(data, "tasks_inventory_complete", false) &&
+        json_push_kv_str(data, "tasks_coverage_reason",
+            "canonical_links_unavailable; landing_outcomes_last_10; remote_tasks_not_enumerated") &&
+        json_push_kv_int(data, "tasks_observed", (long long)v->observed) &&
+        json_push_kv_int(data, "tasks_dropped", (long long)v->dropped) &&
+        json_push_kv_int(data, "tasks_malformed", (long long)v->malformed);
 }
 
 /* Human text is a rendering of the exact emitted object, never a second

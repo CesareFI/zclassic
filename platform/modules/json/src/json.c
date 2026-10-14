@@ -42,6 +42,10 @@ static void *json_heap_resize(void *p, size_t n, const char *label)
 
 static char *json_heap_strdup(const char *s, const char *label)
 {
+    if (s && zcl_alloc_fault_should_fail(label)) {
+        fprintf(stderr, "json_heap_strdup: injected allocation failure (%s)\n", label);
+        return NULL;
+    }
     char *p = zcl_strdup(s, label);
     if (!p) return NULL; /* NULL input is an absent object key, not a block */
     atomic_fetch_add_explicit(&json_test_blocks, 1, memory_order_relaxed);
@@ -167,7 +171,33 @@ static bool json_grow(struct json_value *v)
     return true;
 }
 
-void json_copy(struct json_value *dst, const struct json_value *src)
+static bool json_copy_children_checked(struct json_value *dst,
+    const struct json_value *src)
+{
+    if (!src->num_children) return true;
+    if (src->num_children > SIZE_MAX / sizeof(*dst->children) ||
+        src->num_children > SIZE_MAX / sizeof(*dst->keys)) {
+        fprintf(stderr, "json_copy_checked: unrepresentable child count\n");
+        return false;
+    }
+    dst->children_cap = src->num_children;
+    dst->children = json_heap_alloc(dst->children_cap * sizeof(*dst->children), "json_copy_children");
+    if (!dst->children) return false;
+    dst->keys = json_heap_alloc(dst->children_cap * sizeof(*dst->keys), "json_copy_keys");
+    if (!dst->keys) return false;
+    memset(dst->keys, 0, dst->children_cap * sizeof(*dst->keys));
+    for (size_t i = 0; i < src->num_children; i++) {
+        if (!json_copy_checked(&dst->children[i], &src->children[i])) return false;
+        dst->num_children++;
+        if (src->keys[i]) {
+            dst->keys[i] = json_heap_strdup(src->keys[i], "json_copy_key");
+            if (!dst->keys[i]) return false;
+        }
+    }
+    return true;
+}
+
+bool json_copy_checked(struct json_value *dst, const struct json_value *src)
 {
     json_init(dst);
     dst->type = src->type;
@@ -177,32 +207,22 @@ void json_copy(struct json_value *dst, const struct json_value *src)
     case JSON_REAL: dst->val.d = src->val.d; break;
     case JSON_STR:
         dst->val.s = json_heap_strdup(src->val.s, "json_copy_str");
-        /* Degrade to JSON_NULL on OOM rather than leaving a JSON_STR
-         * with NULL val.s — see json_set_str for rationale. */
-        if (!dst->val.s) dst->type = JSON_NULL;
+        if (!dst->val.s) {
+            json_init(dst);
+            return false;
+        }
         break;
     default: break;
     }
-    if (src->num_children > 0) {
-        dst->children_cap = src->num_children;
-        dst->children = json_heap_alloc(dst->children_cap * sizeof(*dst->children), "json_copy_children");
-        if (!dst->children) {
-            dst->children_cap = 0;
-            return;
-        }
-        dst->keys = json_heap_alloc(dst->children_cap * sizeof(*dst->keys), "json_copy_keys");
-        if (!dst->keys) {
-            json_heap_release(dst->children);
-            dst->children = NULL;
-            dst->children_cap = 0;
-            return;
-        }
-        dst->num_children = src->num_children;
-        for (size_t i = 0; i < src->num_children; i++) {
-            json_copy(&dst->children[i], &src->children[i]);
-            dst->keys[i] = json_heap_strdup(src->keys[i], "json_copy_key");
-        }
-    }
+    if (json_copy_children_checked(dst, src)) return true;
+    json_free(dst);
+    json_init(dst);
+    return false;
+}
+
+void json_copy(struct json_value *dst, const struct json_value *src)
+{
+    (void)json_copy_checked(dst, src);
 }
 
 bool json_push_back(struct json_value *arr, const struct json_value *child)
@@ -213,7 +233,7 @@ bool json_push_back(struct json_value *arr, const struct json_value *child)
         return false;
     }
     if (!json_grow(arr)) return false;
-    json_copy(&arr->children[arr->num_children], child);
+    if (!json_copy_checked(&arr->children[arr->num_children], child)) return false;
     arr->keys[arr->num_children] = NULL;
     arr->num_children++;
     return true;
@@ -233,7 +253,10 @@ bool json_push_kv(struct json_value *obj, const char *key,
      * strcmp(obj->keys[i], key) and a NULL slot would crash. */
     char *kdup = json_heap_strdup(key, "json_push_kv_key");
     if (!kdup) return false;
-    json_copy(&obj->children[obj->num_children], child);
+    if (!json_copy_checked(&obj->children[obj->num_children], child)) {
+        json_heap_release(kdup);
+        return false;
+    }
     obj->keys[obj->num_children] = kdup;
     obj->num_children++;
     return true;
@@ -254,6 +277,7 @@ bool json_push_kv_str(struct json_value *obj, const char *key, const char *s)
     struct json_value v;
     json_init(&v);
     json_set_str(&v, s);
+    if (s && v.type != JSON_STR) return false;
     return json_push_kv_owned(obj, key, &v);
 }
 

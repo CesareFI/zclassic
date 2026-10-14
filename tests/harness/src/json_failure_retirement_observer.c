@@ -21,6 +21,7 @@
 #define json_push_kv_real jr_json_push_kv_real
 #define json_push_kv_bool jr_json_push_kv_bool
 #define json_copy jr_json_copy
+#define json_copy_checked jr_json_copy_checked
 #define json_size jr_json_size
 #define json_empty jr_json_empty
 #define json_get jr_json_get
@@ -51,6 +52,7 @@
 #undef json_empty
 #undef json_size
 #undef json_copy
+#undef json_copy_checked
 #undef json_push_kv_bool
 #undef json_push_kv_real
 #undef json_push_kv_int

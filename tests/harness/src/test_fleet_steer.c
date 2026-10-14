@@ -3147,6 +3147,104 @@ _test_next:;
     return failures;
 }
 
+/* ── outer budget: tasks trim truthfully, retained rows keep whole metadata ─ */
+
+static int fmx_t_brief_task_budget(void)
+{
+    int failures = 0;
+
+    TEST("steer: the outer byte budget trims tasks truthfully and keeps "
+         "retained rows whole") {
+        struct fmx_call b;
+        const struct json_value *tasks, *cut, *row;
+        char text[8192], name[80];
+        /* Decoded per-row metadata carrying quote, backslash, newline and
+         * tab bytes near the row field caps (path 512, brief 4096);
+         * json_write owns the escaping. */
+        char path[450], brief[3600];
+        size_t i, retained;
+        long long trimmed;
+        fmx_isolate("task_budget");
+        memset(path, 'p', 400);
+        memcpy(path, "tools\\command\\", 14);
+        path[400] = '"';
+        path[401] = '\0';
+        for (i = 0; i < 3400; i++)
+            brief[i] = i % 97 == 96 ? '"' : 'b';
+        brief[500] = '\n';
+        brief[900] = '\t';
+        brief[3400] = '\\';
+        brief[3401] = '"';
+        brief[3402] = '\0';
+        /* Eighteen rows under the row cap, so only the outer byte budget
+         * can trim: about 76 KB projected against the 48 KB soft budget. */
+        for (i = 0; i < 18; i++) {
+            struct json_value seed = {0};
+            size_t w;
+            (void)snprintf(name, sizeof(name), "meta-b-%03zu", i);
+            json_set_object(&seed);
+            json_push_kv_int(&seed, "seq", (long long)i + 1);
+            json_push_kv_str(&seed, "ts", "2026-10-14T00:00:00Z");
+            json_push_kv_str(&seed, "kind", "file");
+            json_push_kv_str(&seed, "name", name);
+            json_push_kv_str(&seed, "group", "fleet\"steer");
+            json_push_kv_str(&seed, "path", path);
+            json_push_kv_str(&seed, "brief", brief);
+            json_push_kv_str(&seed, "model", "mod\tel");
+            json_push_kv_int(&seed, "attempt", 1);
+            json_push_kv_str(&seed, "state", "queued");
+            json_push_kv_str(&seed, "worktree", "");
+            json_push_kv_str(&seed, "pid_or_unit", "");
+            json_push_kv_int(&seed, "started", 0);
+            json_push_kv_int(&seed, "priority", (long long)(i % 4));
+            json_push_kv_str(&seed, "depends_on", "");
+            w = json_write(&seed, text, sizeof(text) - 2);
+            ASSERT(w < sizeof(text) - 2);
+            text[w] = '\n';
+            text[w + 1] = '\0';
+            fmx_state_file("queue", "queue.jsonl", text, i != 0);
+            json_free(&seed);
+        }
+        fmx_brief(&b, NULL, 0);
+        ASSERT(fmx_run(&b, zcl_native_handle_fleet_steer_brief));
+        ASSERT(fmx_ok(&b));
+        tasks = json_get(&b.reply.data, "tasks");
+        ASSERT(tasks && tasks->type == JSON_ARR);
+        retained = json_size(tasks);
+        /* The trim left a nonempty tasks array and cut only the tail. */
+        ASSERT(retained > 0 && retained < 18);
+        cut = json_get(&b.reply.data, "budget_truncated");
+        ASSERT(cut && cut->type == JSON_OBJ);
+        trimmed = fmx_wint(cut, "tasks");
+        /* Truthful truncation: the named count is exactly the cut tail and
+         * is folded into tasks_dropped (eighteen rows stay under the row
+         * cap, so no cap drop mixes in); the reply says so. */
+        ASSERT(trimmed > 0 && trimmed == (long long)(18 - retained));
+        ASSERT(fmx_wint(&b.reply.data, "tasks_dropped") == trimmed);
+        ASSERT(fmx_wint(&b.reply.data, "tasks_shown") == (long long)retained);
+        ASSERT(!json_get_bool(json_get(&b.reply.data,
+                                       "tasks_sources_complete")));
+        /* A retained row keeps its whole escaped metadata byte for byte. */
+        row = json_at(tasks, 0);
+        ASSERT_STR_EQ(fmx_wstr(row, "ref"), "meta-b-000");
+        ASSERT_STR_EQ(fmx_wstr(row, "test_group"), "fleet\"steer");
+        ASSERT_STR_EQ(fmx_wstr(row, "work_path"), path);
+        ASSERT_STR_EQ(fmx_wstr(row, "brief_path_reference"), brief);
+        ASSERT_STR_EQ(fmx_wstr(row, "requested_model"), "mod\tel");
+        ASSERT_STR_EQ(fmx_wstr(row, "observed_model"), "unknown");
+        ASSERT_STR_EQ(fmx_wstr(row, "column"), "queued");
+        /* The whole reply stays inside the soft budget, envelope included. */
+        ASSERT(json_write(&b.reply.data, NULL, 0) <= 49152u);
+        fmx_end(&b);
+        fmx_restore();
+        PASS();
+    }
+
+_test_next:;
+    fmx_restore();
+    return failures;
+}
+
 /* ── caller: who the node says the presented credential is ───────────────── */
 
 static int fmx_t_brief_caller(void)
@@ -5448,6 +5546,7 @@ int test_fleet_steer(void)
     failures += fmx_t_receipt_tokens();
     failures += fmx_t_process_not_work();
     failures += fmx_t_large_history();
+    failures += fmx_t_brief_task_budget();
     failures += fmx_t_brief_caller();
     failures += fmx_t_sessions();
     failures += fmx_t_session_edges();

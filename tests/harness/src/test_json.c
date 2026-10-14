@@ -84,6 +84,70 @@ static int json_append_target_cases(void)
     return failures;
 }
 
+static bool json_checked_copy_equal(const struct json_value *source,
+    const struct json_value *target, unsigned mode)
+{
+    const struct json_value *copy = mode == 0 ? target :
+        mode == 1 ? json_at(target, 0) : json_get(target, "revision");
+    char a[512], b[512];
+    size_t na = json_write(source, a, sizeof(a));
+    size_t nb = json_write(copy, b, sizeof(b));
+    return na == nb && na < sizeof(a) && !memcmp(a, b, na);
+}
+
+static bool json_checked_copy_fault(const struct json_value *source,
+    const char *label, unsigned nth, unsigned mode, bool *hit)
+{
+    struct json_value target;
+    json_init(&target);
+    if (mode == 1) json_set_array(&target);
+    if (mode >= 2) json_set_object(&target);
+    size_t before = json_test_live_blocks();
+    zcl_alloc_fault_fail_nth(label, nth);
+    bool ok;
+    if (mode == 0) ok = json_copy_checked(&target, source);
+    else if (mode == 1) ok = json_push_back(&target, source);
+    else if (mode == 2) ok = json_push_kv(&target, "revision", source);
+    else ok = json_push_kv_str(&target, "revision", "signed bytes");
+    *hit = zcl_alloc_fault_armed_label() == NULL;
+    zcl_alloc_fault_clear();
+    bool invariant = *hit ? !ok && json_size(&target) == 0 : ok;
+    if (*hit && mode == 0) invariant = invariant && target.type == JSON_NULL;
+    if (!*hit && mode < 3) invariant = invariant && json_checked_copy_equal(source, &target, mode);
+    json_free(&target);
+    return invariant && json_test_live_blocks() == before;
+}
+
+static int json_checked_copy_cases(void)
+{
+    int failures = 0;
+    struct json_value source;
+    json_init(&source);
+    TEST("json checked copy: every nested allocation refuses without partial success or leaks") {
+        const char *wire = "{\"id\":\"exact\",\"metadata\":{\"room\":\"\",\"scope\":1},\"chunk\":[\"a\",\"b\"]}";
+        ASSERT(json_read(&source, wire, strlen(wire)));
+        const char *labels[] = {"json_copy_str", "json_copy_children", "json_copy_keys",
+            "json_copy_key", "json_push_kv_key", "json_set_str"};
+        const unsigned applicable[] = {0x0f, 0x0f, 0x1f, 0x31};
+        for (unsigned mode = 0; mode < 4; mode++) {
+            for (size_t site = 0; site < sizeof(labels) / sizeof(labels[0]); site++) {
+                bool hit = true;
+                unsigned hits = 0;
+                for (unsigned nth = 1; hit && nth < 16; nth++) {
+                    ASSERT(json_checked_copy_fault(&source, labels[site], nth, mode, &hit));
+                    hits += hit;
+                }
+                ASSERT(!hit);
+                ASSERT_EQ(hits > 0, (applicable[mode] & (1u << site)) != 0);
+            }
+        }
+        PASS();
+    } _test_next:;
+    zcl_alloc_fault_clear();
+    json_free(&source);
+    return failures;
+}
+
 static int json_heap_accounting_cases(void)
 {
     int failures = 0;
@@ -391,7 +455,7 @@ static int json_number_cases(void)
 
 int test_json(void)
 {
-    int failures = json_unicode_cases() + json_number_cases() + json_heap_accounting_cases() + json_growth_cases() + json_append_target_cases() + cgo_decoder_tests() + cgo_passive_tests() + cga_goal_tests();
+    int failures = json_unicode_cases() + json_number_cases() + json_heap_accounting_cases() + json_checked_copy_cases() + json_growth_cases() + json_append_target_cases() + cgo_decoder_tests() + cgo_passive_tests() + cga_goal_tests();
 
     printf("json parse failures retire copied strings and partial trees... ");
     extern int json_failure_retirement_case(void);

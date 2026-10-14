@@ -89,6 +89,10 @@ bool json_push_kv_bool(struct json_value *obj, const char *key, bool b);
 void diag_push_health(struct json_value *out, bool ok, const char *reason);
 
 void json_copy(struct json_value *dst, const struct json_value *src);
+/* Deep-copy into a fresh destination (as for json_copy). On refusal, release
+ * every partial allocation and leave dst initialized as JSON_NULL. Success
+ * guarantees complete values and keys; dst and src must not alias. */
+bool json_copy_checked(struct json_value *dst, const struct json_value *src);
 size_t json_size(const struct json_value *v);
 bool json_empty(const struct json_value *v);
 

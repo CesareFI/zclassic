@@ -14,6 +14,7 @@
 
 #include "test/test_core.h"
 
+#include "base/safe_alloc.h"
 #include "command/native_command.h"
 #include "config/command_catalog.h"
 #include "json/json.h"
@@ -1433,6 +1434,177 @@ static int dvx_encoding_cases(void)
 }
 #endif /* !defined(_WIN32) */
 
+#if !defined(_WIN32)
+static const struct json_value *dvx_row_named(const struct json_value *rows,
+                                              const char *name)
+{
+    for (size_t i = 0; rows && i < rows->num_children; i++) {
+        const char *nm = json_get_str(json_get(&rows->children[i], "name"));
+        if (strcmp(nm, name) == 0)
+            return &rows->children[i];
+    }
+    return NULL;
+}
+
+static const struct json_value *dvx_status_rows(struct dvx_call *c,
+                                                const char *key)
+{
+    dvx_verb(c, "status", true);
+    if (!dvx_run(c) || !dvx_ok(c))
+        return NULL;
+    return dvx_arr(c, key);
+}
+
+/* Persisted metadata on one status row, plus the depends_on key both row
+ * shapes must carry. */
+static bool dvx_row_meta_ok(const struct json_value *row, const char *brief)
+{
+    return row &&
+        strcmp(json_get_str(json_get(row, "group")), "devagent_queue") == 0 &&
+        strcmp(json_get_str(json_get(row, "path")),
+               "docs/work/meta-out.md") == 0 &&
+        strcmp(json_get_str(json_get(row, "brief")), brief) == 0 &&
+        strcmp(json_get_str(json_get(row, "model")), "model-strong") == 0 &&
+        json_get_int(json_get(row, "priority")) == 0 &&
+        json_get(row, "depends_on") != NULL;
+}
+
+/* Post the metadata task into a fresh isolated state root: a warmup leaf
+ * post creates the dirs so the brief can live inside the admitted state
+ * root, then the file post carries group, path, brief, model, priority. */
+static bool dvx_meta_post(struct dvx_call *c, char *brief, size_t cap)
+{
+    char qd[1100];
+    dvx_post(c, "leaf", "meta-warm", NULL, NULL, NULL, NULL, -1);
+    if (!dvx_run(c) || !dvx_ok(c))
+        return false;
+    dvx_end(c);
+    dvx_queuedir(qd, sizeof(qd));
+    (void)snprintf(brief, cap, "%s/meta-brief.md", qd);
+    if (!dvx_write(brief, "# meta brief\n"))
+        return false;
+    dvx_post(c, "file", "meta-task", "devagent_queue",
+             "docs/work/meta-out.md", brief, "model-strong", -1);
+    (void)json_push_kv_int(&c->input, "priority", 0);
+    if (!dvx_run(c) || !dvx_ok(c))
+        return false;
+    dvx_end(c);
+    return true;
+}
+
+static int dvx_metadata_queued_case(void)
+{
+    int failures = 0;
+    TEST("queue: posted metadata persists into the queued status row") {
+        struct dvx_call c, st;
+        char brief[1300];
+        const struct json_value *rows;
+        dvx_isolate("metaq");
+        ASSERT(dvx_meta_post(&c, brief, sizeof(brief)));
+        ASSERT((rows = dvx_status_rows(&st, "queued")) != NULL);
+        ASSERT(dvx_row_meta_ok(dvx_row_named(rows, "meta-task"), brief));
+        dvx_end(&st);
+        dvx_restore();
+        PASS();
+    }
+_test_next:;
+    dvx_restore();
+    return failures;
+}
+
+static int dvx_metadata_running_case(void)
+{
+    int failures = 0;
+    TEST("queue: metadata survives the queued-to-running transition") {
+        struct dvx_call c, st;
+        char bindir[512], wt[512], brief[1300];
+        const struct json_value *rows;
+        dvx_isolate("metar");
+        ASSERT(dvx_meta_post(&c, brief, sizeof(brief)));
+        ASSERT(dvx_fake_on_path("metabin", bindir, sizeof(bindir)) &&
+               dvx_pool("metawt", wt, sizeof(wt)));
+        dvx_verb(&c, "next", false);
+        ASSERT(dvx_run(&c) && dvx_ok(&c));
+        ASSERT_STR_EQ(dvx_str(&c, "state"), "running");
+        dvx_end(&c);
+        ASSERT((rows = dvx_status_rows(&st, "running")) != NULL);
+        ASSERT(dvx_row_meta_ok(dvx_row_named(rows, "meta-task"), brief));
+        dvx_end(&st);
+        dvx_restore();
+        PASS();
+    }
+_test_next:;
+    dvx_restore();
+    return failures;
+}
+
+/* One armed status run over the posted metadata fixture: the hook is armed
+ * only after the request input is built, so every live consult of label
+ * lands inside the status handler itself. *hit reports whether the armed
+ * failure fired; every fire must refuse the whole reply QUEUE_READ_FAILED,
+ * and a run that never reaches the nth consult must report every persisted
+ * metadata field whole. The hook is cleared before returning either way. */
+static bool dvx_status_oom_run(const char *label, unsigned nth,
+                               const char *brief, bool *hit)
+{
+    struct dvx_call st;
+    const struct json_value *rows;
+    bool ok;
+    dvx_verb(&st, "status", true);
+    zcl_alloc_fault_fail_nth(label, nth);
+    ok = dvx_run(&st);
+    *hit = zcl_alloc_fault_armed_label() == NULL;
+    zcl_alloc_fault_clear();
+    if (ok && *hit)
+        ok = !dvx_ok(&st) &&
+             strcmp(st.reply.error.code, "QUEUE_READ_FAILED") == 0;
+    if (ok && !*hit)
+        ok = dvx_ok(&st) &&
+             (rows = dvx_arr(&st, "queued")) != NULL &&
+             dvx_row_meta_ok(dvx_row_named(rows, "meta-task"), brief);
+    dvx_end(&st);
+    return ok;
+}
+
+static int dvx_metadata_oom_case(void)
+{
+    int failures = 0;
+    TEST("queue: every status emission allocation failure refuses the reply") {
+        /* The checked-copy seam consults the hook at each string set, each
+         * deep-copy string/key/children allocation and each pushed key.
+         * Loop every label until an arming does not fire: the final no-hit
+         * run is the verified end of the live consults, so no ordinal is
+         * assumed, and hits > 0 proves the label is really consulted on
+         * this path. */
+        static const char *labels[] = {
+            "json_set_str", "json_copy_str", "json_copy_key",
+            "json_push_kv_key", "json_copy_children", "json_copy_keys"
+        };
+        struct dvx_call c;
+        char brief[1300];
+        size_t site;
+        dvx_isolate("metaoomall");
+        ASSERT(dvx_meta_post(&c, brief, sizeof(brief)));
+        for (site = 0; site < sizeof(labels) / sizeof(labels[0]); site++) {
+            unsigned hits = 0, nth;
+            bool hit = true;
+            for (nth = 1; hit && nth < 128; nth++) {
+                ASSERT(dvx_status_oom_run(labels[site], nth, brief, &hit));
+                hits += hit ? 1 : 0;
+            }
+            ASSERT(!hit);
+            ASSERT(hits > 0);
+        }
+        dvx_restore();
+        PASS();
+    }
+_test_next:;
+    zcl_alloc_fault_clear();
+    dvx_restore();
+    return failures;
+}
+#endif /* !defined(_WIN32) */
+
 
 int test_devagent_queue(void);
 int test_devagent_queue(void)
@@ -1637,6 +1809,9 @@ int test_devagent_queue(void)
 
     failures += dvx_receipt_root_cases();
     failures += dvx_unresolved_candidate_root_case();
+    failures += dvx_metadata_queued_case();
+    failures += dvx_metadata_running_case();
+    failures += dvx_metadata_oom_case();
 
     TEST("queue: the oldest queued row launches first") {
         struct dvx_call c;

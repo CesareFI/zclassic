@@ -4141,7 +4141,10 @@ static void fmc_caller_emit(struct json_value *data,
     json_free(&o);
 }
 
-static void fmc_brief_reply(struct zcl_command_reply *reply,
+/* Returns false when the tasks projection could not be copied whole: the
+ * caller must refuse the reply rather than ship a partial brief as PASSED.
+ * The other composite sections remain best-effort pushes, as before. */
+static bool fmc_brief_reply(struct zcl_command_reply *reply,
                             struct fmc_brief_lists *l,
                             struct fmc_roster *ro,
                             const struct fmc_emit_ctx *ec,
@@ -4172,7 +4175,8 @@ static void fmc_brief_reply(struct zcl_command_reply *reply,
                             mv && mv->truncated);
     (void)json_push_kv_int(&reply->data, "changes_dropped",
                            mv ? mv->dropped : 0);
-    zcl_fmc_tasks_emit(&l->tasks, &reply->data);
+    if (!zcl_fmc_tasks_emit(&l->tasks, &reply->data))
+        return false;
     fmc_fit_budget(&reply->data);
     const struct json_value *cuts = json_get(&reply->data, "budget_truncated");
     if (json_get(cuts, "tasks")) {
@@ -4188,6 +4192,7 @@ static void fmc_brief_reply(struct zcl_command_reply *reply,
         (long long)json_size(json_get(&reply->data, "tasks")));
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
+    return true;
 }
 
 /* A receiver that has run on this box (the lock file exists) and is not
@@ -4264,11 +4269,21 @@ static void fmc_do_brief(const struct zcl_command_request *req,
     ec.outcomes = &l.outcomes;
     ec.qv = &qv;
     ec.lo = &lo;
-    fmc_brief_reply(reply, &l, &ro, &ec, &mv, mail_cursor);
-    if (!json_get_bool(json_get(req->input, "json"))) {
+    bool brief_ok = fmc_brief_reply(reply, &l, &ro, &ec, &mv, mail_cursor);
+    if (brief_ok && !json_get_bool(json_get(req->input, "json"))) {
         char screen[4096];
         zcl_fmc_tasks_screen(&reply->data, screen, sizeof(screen));
         (void)json_push_kv_str(&reply->data, "screen", screen);
+    }
+    if (!brief_ok) {
+        /* A degraded tasks copy never ships: drop the partial projection
+         * and refuse the brief with an explanatory body. */
+        json_free(&reply->data);
+        json_init(&reply->data);
+        json_set_object(&reply->data);
+        fmc_fail(reply, "STEER_BRIEF_DEGRADED",
+                 "the task projection could not be copied whole; "
+                 "refusing the brief", NULL);
     }
     fmc_lists_free(&l);
     fmc_roster_free(&ro);

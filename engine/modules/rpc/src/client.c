@@ -174,11 +174,10 @@ static bool rpc_push_string_param(struct json_value *result, const char *arg,
 {
     struct json_value sv;
     json_init(&sv);
-#ifdef ZCL_TESTING
-    /* Model strdup failure: its allocator does not consult the fault hook. */
-    if (!zcl_alloc_fault_should_fail("json_set_str"))
-#endif
-        json_set_str(&sv, arg);
+    /* json_heap_strdup consults the fault hook itself: no modeled refusal
+     * here, or one armed fire would be consumed twice and invert which
+     * parameter fails. */
+    json_set_str(&sv, arg);
     /* NULL caller arguments retain the existing JSON null policy. */
     if (arg && sv.type != JSON_STR) {
         json_free(&sv);

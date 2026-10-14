@@ -88,7 +88,9 @@
  * state:"running"} or {state:"empty"}; reap {state:"reaped",
  * outcomes:[...], requeued, reclaimed}; status {queued (each with ready
  * and blocker: null, or {ref, state, attempt, verdict} naming what holds
- * it), queued_total, queued_ready, running (each with owner_liveness
+ * it, plus persisted metadata group, path, brief, model — null when
+ * empty — and priority), queued_total, queued_ready, running (each with
+ * the same persisted metadata and depends_on, plus owner_liveness
  * running|dead|unknown bound to PID and kernel birth), outcomes,
  * pool} plus screen unless json=true; cancel {state:"cancelled", name,
  * cancelled:N} or CANCEL_RUNNING/CANCEL_NOT_FOUND. claim refuses
@@ -3686,14 +3688,19 @@ static void dvq_reap(const struct zcl_command_request *req,
 
 /* ── status ────────────────────────────────────────────────────────────── */
 
-/* A string, or JSON null when empty: an absent value is never "". */
-static void dvq_str_or_null(struct json_value *v, const char *s)
+/* A string, or JSON null when empty: an absent value is never "". Returns
+ * false when a nonempty source did not come out a string: json_set_str
+ * degrades to JSON_NULL when its strdup fails, and reporting that would
+ * mark present metadata absent. */
+static bool dvq_str_or_null(struct json_value *v, const char *s)
 {
     json_init(v);
-    if (s && s[0])
-        json_set_str(v, s);
-    else
+    if (!s || !s[0]) {
         json_set_null(v);
+        return true;
+    }
+    json_set_str(v, s);
+    return v->type == JSON_STR;
 }
 
 /* What holds a queued row back, or JSON null when it is READY: the ref,
@@ -3709,7 +3716,9 @@ static void dvq_blocker_json(struct json_value *out, const char *ref,
         return;
     }
     json_set_object(out);
-    dvq_str_or_null(&verdict, dep->verdict);
+    /* The blocker verdict is diagnostic: a duplication failure there reads
+     * as a pending verdict, and this object's pushes are already ignored. */
+    (void)dvq_str_or_null(&verdict, dep->verdict);
     json_init(&attempt);
     if (dep->attempt > 0)
         json_set_int(&attempt, dep->attempt);
@@ -3721,6 +3730,75 @@ static void dvq_blocker_json(struct json_value *out, const char *ref,
            json_push_kv(out, "verdict", &verdict));
     json_free(&verdict);
     json_free(&attempt);
+}
+
+/* Push one prepared metadata value under key, then confirm the landed deep
+ * copy kept its type: json_push_kv refuses an incomplete copy, and the
+ * landed-type check independently pins what the row reports. */
+static bool dvq_push_checked(struct json_value *item, const char *key,
+                             const struct json_value *v)
+{
+    const struct json_value *landed;
+    size_t at = json_size(item);
+    enum json_type want = v->type;
+    if (!json_push_kv(item, key, v))
+        return false;
+    landed = json_at(item, at);
+    return landed && landed->type == want;
+}
+
+/* After the whole-row deep copy into arr, every top-level field must keep
+ * its built type: json_push_back refuses an incomplete copy, and this
+ * independent check pins the landed types either way. */
+static bool dvq_landed_types_ok(const struct json_value *arr,
+                                const struct json_value *item)
+{
+    const struct json_value *landed;
+    size_t i;
+    if (!json_size(arr))
+        return false;
+    landed = json_at(arr, json_size(arr) - 1);
+    if (!landed || landed->num_children != item->num_children)
+        return false;
+    for (i = 0; i < item->num_children; i++) {
+        if (landed->children[i].type != item->children[i].type)
+            return false;
+    }
+    return true;
+}
+
+/* The persisted metadata every row reports: each absent field is an
+ * explicit JSON null, never "" or 0. With full set (running rows),
+ * priority and depends_on ride along. An allocation failure on any
+ * nonempty source refuses the row: present metadata is never reported
+ * absent. */
+static bool dvq_push_row_metadata(struct json_value *item,
+                                  const struct dvq_row *r, bool full)
+{
+    struct json_value gv, pv, bv, mv, dv;
+    bool ok;
+    /* Every value prepares unconditionally so all four stay safe to free. */
+    ok = dvq_str_or_null(&gv, r->group);
+    ok = dvq_str_or_null(&pv, r->path) && ok;
+    ok = dvq_str_or_null(&bv, r->brief) && ok;
+    ok = dvq_str_or_null(&mv, r->model) && ok;
+    if (ok)
+        ok = dvq_push_checked(item, "group", &gv) &&
+             dvq_push_checked(item, "path", &pv) &&
+             dvq_push_checked(item, "brief", &bv) &&
+             dvq_push_checked(item, "model", &mv);
+    json_free(&gv);
+    json_free(&pv);
+    json_free(&bv);
+    json_free(&mv);
+    if (!ok || !full)
+        return ok;
+    ok = dvq_str_or_null(&dv, r->depends_on);
+    if (ok)
+        ok = json_push_kv_int(item, "priority", r->priority) &&
+             dvq_push_checked(item, "depends_on", &dv);
+    json_free(&dv);
+    return ok;
 }
 
 /* One queued row with its READY verdict from the picker's own gates; a
@@ -3743,12 +3821,14 @@ static bool dvq_push_queued(struct json_value *arr, const struct dvq_row *rows,
          json_push_kv_str(&item, "name", r->name) &&
          json_push_kv_str(&item, "kind", r->kind) &&
          json_push_kv_int(&item, "attempt", r->attempt) &&
+         dvq_push_row_metadata(&item, r, false) &&
          json_push_kv_str(&item, "ts", r->ts) &&
          json_push_kv_int(&item, "priority", r->priority) &&
          json_push_kv_str(&item, "depends_on", r->depends_on) &&
          json_push_kv_bool(&item, "ready", ready) &&
          json_push_kv(&item, "blocker", &blocker) &&
-         json_push_back(arr, &item);
+         json_push_back(arr, &item) &&
+         dvq_landed_types_ok(arr, &item);
     json_free(&item);
     json_free(&blocker);
     return ok;
@@ -3817,12 +3897,14 @@ static bool dvq_push_running(struct json_value *arr, const struct dvq_row *r,
          json_push_kv_str(&item, "name", r->name) &&
          json_push_kv_str(&item, "kind", r->kind) &&
          json_push_kv_int(&item, "attempt", r->attempt) &&
+         dvq_push_row_metadata(&item, r, true) &&
          json_push_kv_str(&item, "worktree", r->worktree) &&
          json_push_kv_str(&item, "pid_or_unit", r->pid_or_unit) &&
          json_push_kv_int(&item, "age_s", age) &&
          json_push_kv_str(&item, "owner_liveness", dvq_owner_liveness(r)) &&
          json_push_kv(&item, "worker", &nv) &&
-         json_push_back(arr, &item);
+         json_push_back(arr, &item) &&
+         dvq_landed_types_ok(arr, &item);
     json_free(&item);
     json_free(&nv);
     return ok;
@@ -3886,6 +3968,44 @@ static bool dvq_status_screen(char *screen, size_t cap,
         used += (size_t)w;
     }
     return true;
+}
+
+/* The final status emission is checked end to end: json_push_kv's deep
+ * copy can degrade under allocation failure while reporting success, so
+ * every push goes through dvq_push_checked, which requires the landed
+ * child to keep the intended type; the whole status refuses rather than
+ * shipping nulls or half-copied arrays. */
+static bool dvq_status_emit(struct zcl_command_reply *reply,
+                            const struct json_value *queued,
+                            const struct json_value *running,
+                            const struct json_value *outcomes,
+                            const struct json_value *pool,
+                            long long queued_ready, bool want_json,
+                            const char *screen)
+{
+    struct json_value lv, qt, qr;
+    bool ok = dvq_str_or_null(&lv, DVQ_LEAF);
+    json_init(&qt);
+    json_set_int(&qt, (long long)queued->num_children);
+    json_init(&qr);
+    json_set_int(&qr, queued_ready);
+    if (ok) ok = dvq_push_checked(&reply->data, "leaf", &lv);
+    if (ok) ok = dvq_push_checked(&reply->data, "queued", queued);
+    if (ok) ok = dvq_push_checked(&reply->data, "queued_total", &qt);
+    if (ok) ok = dvq_push_checked(&reply->data, "queued_ready", &qr);
+    if (ok) ok = dvq_push_checked(&reply->data, "running", running);
+    if (ok) ok = dvq_push_checked(&reply->data, "outcomes", outcomes);
+    if (ok) ok = dvq_push_checked(&reply->data, "pool", pool);
+    if (ok && !want_json) {
+        struct json_value sv;
+        ok = dvq_str_or_null(&sv, screen) &&
+             dvq_push_checked(&reply->data, "screen", &sv);
+        json_free(&sv);
+    }
+    json_free(&lv);
+    json_free(&qt);
+    json_free(&qr);
+    return ok;
 }
 
 static void dvq_status(const struct zcl_command_request *req,
@@ -4030,20 +4150,14 @@ static void dvq_status(const struct zcl_command_request *req,
                            running.num_children, &census, now))
         goto fail;
     free(rows);
-    (void)json_push_kv_str(&reply->data, "leaf", DVQ_LEAF);
-    (void)json_push_kv(&reply->data, "queued", &queued);
-    (void)json_push_kv_int(&reply->data, "queued_total",
-                           (long long)queued.num_children);
-    (void)json_push_kv_int(&reply->data, "queued_ready", queued_ready);
-    (void)json_push_kv(&reply->data, "running", &running);
-    (void)json_push_kv(&reply->data, "outcomes", &outcomes);
-    (void)json_push_kv(&reply->data, "pool", &pool);
+    rows = NULL;
+    if (!dvq_status_emit(reply, &queued, &running, &outcomes, &pool,
+                         queued_ready, want_json, screen))
+        goto fail;
     json_free(&queued);
     json_free(&running);
     json_free(&outcomes);
     json_free(&pool);
-    if (!want_json)
-        (void)json_push_kv_str(&reply->data, "screen", screen);
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
     return;
@@ -4053,6 +4167,12 @@ fail:
     json_free(&outcomes);
     json_free(&pool);
     free(rows);
+    /* A failed status must not carry the partial projection an encode
+     * failure leaves behind, and dvq_fail pushes its own leaf: reset the
+     * reply body before the failure envelope. */
+    json_free(&reply->data);
+    json_init(&reply->data);
+    json_set_object(&reply->data);
     dvq_fail(reply, "QUEUE_READ_FAILED", "status",
              "cannot encode the status reply", qpath);
 }
