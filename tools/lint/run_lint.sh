@@ -299,6 +299,7 @@ gate_command() {
         check-consensus-parity)            echo './tools/scripts/check_consensus_parity.sh --selftest && ./tools/scripts/check_consensus_parity.sh' ;;
         check-no-new-repair-rung)          echo './tools/scripts/check_no_new_repair_rung.sh --selftest && ./tools/scripts/check_no_new_repair_rung.sh' ;;
         check-no-new-coordination-shell)   echo './tools/lint/check_no_new_coordination_shell.sh --selftest && ./tools/lint/check_no_new_coordination_shell.sh' ;;
+        check-no-new-bash)                 echo './build/bin/z23-lint check-no-new-bash --selftest && ./build/bin/z23-lint check-no-new-bash' ;;
         check-no-bare-tmp-fixture)         echo './build/bin/z23-lint check-no-bare-tmp-fixture --selftest && ./build/bin/z23-lint check-no-bare-tmp-fixture' ;;
         check-network-tool-hardening)         echo './build/bin/z23-lint check-network-tool-hardening --selftest && ./build/bin/z23-lint check-network-tool-hardening' ;;
         check-sqlite-cursor-lifetime)      echo './build/bin/z23-lint check-sqlite-cursor-lifetime --selftest && ./build/bin/z23-lint check-sqlite-cursor-lifetime' ;;

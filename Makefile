@@ -3103,6 +3103,7 @@ $(filter-out $(ZCL_VENDOR_LIB)/libsecp256k1.a,$(VENDOR_LIBS)):
         check-api-reference-generated check-describe-budget \
         check-no-new-repair-rung \
         check-no-new-coordination-shell \
+        check-no-new-bash \
         check-no-bare-tmp-fixture \
         check-network-tool-hardening \
         check-object-reproducible \
@@ -6374,6 +6375,7 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_raw_malloc.c \
     tools/lint/lintc/gate_no_new_repair_rung.c \
     tools/lint/lintc/gate_no_new_coordination_shell.c \
+    tools/lint/lintc/gate_no_new_bash.c \
     tools/lint/lintc/gate_no_bare_tmp_fixture.c \
     tools/lint/lintc/gate_network_tool_hardening.c \
     tools/lint/lintc/gate_object_reproducible.c \
@@ -14095,6 +14097,15 @@ check-no-new-coordination-shell: $(LINTC_TOOL)
 	@echo "══ LINT: no new coordination shell ══"
 	@./tools/lint/check_no_new_coordination_shell.sh --selftest && ./tools/lint/check_no_new_coordination_shell.sh
 
+# Gate — no NEW bash script. Every tracked file whose first line is a bash
+# shebang, or whose name ends in .bash, must be listed in
+# tools/lint/bash_allowlist.txt. The list is hand-edited and can only shrink;
+# new tools are written in C23 (preferred) or POSIX sh run by FreeBSD sh.
+check-no-new-bash: $(LINTC_TOOL)
+	@echo "══ LINT: no new bash ══"
+	@./build/bin/z23-lint check-no-new-bash --selftest
+	@./build/bin/z23-lint check-no-new-bash
+
 # Gate — no NEW bare "/tmp fixture literal in tests/harness/, tools/lint/lintc/,
 # engine/, or tools/command/ (shrink-only ratchet: tools/lint/
 # no_bare_tmp_fixture_baseline.txt). A hardcoded "/tmp/..." mkdtemp/mkstemp
@@ -15406,6 +15417,7 @@ LINT_GATES := \
     check-consensus-parity \
     check-no-new-repair-rung \
     check-no-new-coordination-shell \
+    check-no-new-bash \
     check-no-bare-tmp-fixture \
     check-network-tool-hardening \
     check-object-reproducible \
