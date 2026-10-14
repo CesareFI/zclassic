@@ -1,0 +1,78 @@
+#!/bin/sh
+# Copyright 2026 Rhett Creighton. Licensed under Apache-2.0.
+# Print the steer MCP request headers: a bearer for a saved grant, or an empty
+# object so the client signs in through the gateway's OAuth approval instead.
+# With --save, read one `z23 fleet steer grant --action=mint` reply on stdin
+# and store its id; any other input leaves the existing grant untouched.
+# With --check, call steer_brief once and print the authenticated caller.
+dir=${XDG_CONFIG_HOME:-$HOME/.config}/z23
+file=$dir/steer-grant
+
+save() {
+    reply=$(head -c 65536)
+    case $reply in
+        *'"ok":true'*) ;;
+        *) echo 'z23-steer-headers: mint reply is not ok; grant unchanged' >&2; return 1 ;;
+    esac
+    id=$(printf '%s' "$reply" | grep -o '"id":"[0-9a-f]\{32\}"' | head -n 1 | cut -d '"' -f 4)
+    if [ ${#id} -ne 32 ]; then
+        echo 'z23-steer-headers: mint reply has no 32-hex id; grant unchanged' >&2
+        return 1
+    fi
+    umask 077
+    mkdir -p "$dir" || return 1
+    tmp=$(mktemp "$dir/.steer-grant.XXXXXX") || return 1
+    if printf '%s\n' "$id" > "$tmp" && mv -f "$tmp" "$file"; then
+        echo "z23-steer-headers: grant saved to $file" >&2
+        return 0
+    fi
+    rm -f "$tmp"
+    echo 'z23-steer-headers: could not write grant; grant unchanged' >&2
+    return 1
+}
+
+check() {
+    headers=$("$0")
+    case $headers in
+        *Bearer*) ;;
+        *) echo 'z23-steer-headers: no saved grant; Claude Code will use OAuth sign-in' >&2; return 1 ;;
+    esac
+    bearer=${headers#*'"Authorization":"'}
+    bearer=${bearer%'"}'}
+    reply=$(curl -s -m 30 -X POST "${Z23_STEER_URL:-https://z23.sh/steer}" \
+        -H "Authorization: $bearer" -H 'Content-Type: application/json' \
+        -H 'Accept: application/json, text/event-stream' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"steer_brief","arguments":{"limit":1}}}')
+    caller=$(printf '%s' "$reply" | grep -o '\\"sender\\":\\"[A-Za-z0-9_.-]*\\"' | head -n 1 | tr -d '\\"' | cut -d : -f 2)
+    if [ -n "$caller" ]; then
+        echo "z23-steer-headers: connected as $caller"
+        return 0
+    fi
+    code=$(printf '%s' "$reply" | grep -o 'STEER_[A-Z_]*' | head -n 1)
+    echo "z23-steer-headers: gateway refused the grant (${code:-no reply})" >&2
+    return 1
+}
+
+if [ "${1:-}" = --check ]; then
+    check
+    exit
+fi
+if [ "${1:-}" = --save ]; then
+    save
+    exit
+fi
+
+grant=${Z23_STEER_GRANT:-}
+if [ -z "$grant" ] && [ -r "$file" ]; then
+    IFS= read -r grant < "$file" || :
+fi
+case $grant in
+    '' | *[!0-9a-f]*) printf '{}\n' ;;
+    *)
+        if [ ${#grant} -eq 32 ]; then
+            printf '{"Authorization":"Bearer %s"}\n' "$grant"
+        else
+            printf '{}\n'
+        fi
+        ;;
+esac

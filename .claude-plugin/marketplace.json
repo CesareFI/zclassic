@@ -1,0 +1,12 @@
+{
+  "name": "z23",
+  "owner": { "name": "Rhett Creighton" },
+  "metadata": { "description": "Claude Code integration for Z23 fleets." },
+  "plugins": [
+    {
+      "name": "z23",
+      "source": "./.claude/plugin",
+      "description": "Connect Claude Code to a Z23 fleet's steer gateway and join its coordination."
+    }
+  ]
+}

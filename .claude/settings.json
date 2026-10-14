@@ -1,0 +1,6 @@
+{
+  "extraKnownMarketplaces": {
+    "z23": { "source": { "source": "github", "repo": "z23c/z23" } }
+  },
+  "enabledPlugins": { "z23@z23": true }
+}
