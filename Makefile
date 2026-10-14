@@ -16150,3 +16150,18 @@ $(LINT_FAST_GATES): ff-test-lint-tests-done
 endif
 endif
 ff-test-lint: lint-fast
+
+# Optional freestanding C23 kernel; no node or default-build dependency.
+Z23KERNEL_CC ?= clang
+Z23KERNEL_LD ?= $(REPRO_GATE_XLD)
+Z23KERNEL_OBJCOPY ?= $(shell command -v llvm-objcopy 2>/dev/null || command -v llvm-objcopy-18 2>/dev/null)
+Z23KERNEL_DIR := $(BUILD_DIR)/z23kernel
+$(BIN_DIR)/z23kernel.bin: apps/z23kernel/main.c apps/z23kernel/entry.S apps/z23kernel/build.sh tools/dev/build-epoch-lock-wait.sh Makefile | $(BIN_DIR)
+	Z23KERNEL_CC="$(Z23KERNEL_CC)" Z23KERNEL_LD="$(Z23KERNEL_LD)" Z23KERNEL_OBJCOPY="$(Z23KERNEL_OBJCOPY)" \
+		apps/z23kernel/build.sh apps/z23kernel "$(Z23KERNEL_DIR)" "$(BIN_DIR)"
+.PHONY: z23kernel
+z23kernel: $(BIN_DIR)/z23kernel.bin $(BIN_DIR)/z23kernel.identity
+$(BIN_DIR)/z23kernel.identity: $(BIN_DIR)/z23kernel.bin
+	Z23KERNEL_CC="$(Z23KERNEL_CC)" Z23KERNEL_LD="$(Z23KERNEL_LD)" Z23KERNEL_OBJCOPY="$(Z23KERNEL_OBJCOPY)" apps/z23kernel/build.sh apps/z23kernel "$(Z23KERNEL_DIR)" "$(BIN_DIR)"
+.PHONY: z23kernel-identity
+z23kernel-identity: $(BIN_DIR)/z23kernel.identity
