@@ -14497,8 +14497,8 @@ check-identity-parser-single:
 # fuse. Shrink-only ratchet over tools/lint/source_identity_authority_baseline.txt.
 check-source-identity-authority: $(LINTC_TOOL)
 	@echo "══ LINT: source_id_sha256 producer/reader authority stays Q1/Q2-honest ══"
-	@bash tools/lint/check_source_identity_authority.sh --selftest
-	@bash tools/lint/check_source_identity_authority.sh
+	@./tools/lint/check_source_identity_authority.sh --selftest
+	@./tools/lint/check_source_identity_authority.sh
 
 # Anti-rot ratchet: exactly ONE place decides whether a node status reason
 # means an operator has to intervene. Two operator surfaces (the public REST

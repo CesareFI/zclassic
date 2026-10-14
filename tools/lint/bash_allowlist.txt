@@ -249,9 +249,6 @@ tools/lint/check_rule_vocabulary.sh
 tools/lint/check_sandbox_wired.sh
 tools/lint/check_ship_remote_transaction.sh
 tools/lint/check_silent_bool_errors.sh
-tools/lint/check_silent_error_returns.sh
-tools/lint/check_source_identity_authority.sh
-tools/lint/check_specialists.sh
 tools/lint/check_standalone_tools_link.sh
 tools/lint/check_status_reason_single.sh
 tools/lint/check_supervisor_domain.sh
