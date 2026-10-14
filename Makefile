@@ -4474,7 +4474,7 @@ worktree-gc:
 # command, HEAD, dirty state, exit status, wall/child-CPU time, and a SHA3 of
 # the captured output, which is stored alongside. See the forgery model in
 # tools/agent/gate-receipt.sh — this is EVIDENCE, not proof.
-.PHONY: gate-receipt check-claims agent-velocity agent-sha3 dev-fleet-selftest
+.PHONY: gate-receipt check-claims agent-velocity agent-velocity-selftest agent-sha3 dev-fleet-selftest
 
 AGENT_SHA3_SRCS := tools/agent/agent_sha3.c platform/modules/sha3/src/sha3.c
 agent-sha3: $(BIN_DIR)/agent_sha3
@@ -4483,6 +4483,18 @@ $(BIN_DIR)/agent_sha3: $(AGENT_SHA3_SRCS)
 	$(CC) -std=c23 -O2 -Wall -Wextra -Werror $(HARDEN_CFLAGS) \
 	    -Iplatform/modules/sha3/include -Icore/modules/crypto/include -Iplatform/modules/support/include -Iplatform/modules/base/include \
 	    -o $@ $(AGENT_SHA3_SRCS) $(HARDEN_LDFLAGS)
+
+AGENT_VELOCITY_BIN := $(BIN_DIR)/agent_velocity
+$(AGENT_VELOCITY_BIN): tools/agent/agent_velocity.c platform/modules/base/src/safe_alloc.c
+	@mkdir -p $(dir $@)
+	@$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic $(HARDEN_CFLAGS) \
+	    -Iplatform/modules/base/include -Iplatform/modules/util/include \
+	    -Iplatform/modules/platform/include -o $@ $^ $(HARDEN_LDFLAGS)
+
+# Parser and aggregation checks of agent_velocity; no repository or receipts
+# are read.
+agent-velocity-selftest: $(AGENT_VELOCITY_BIN)
+	@$(AGENT_VELOCITY_BIN) --selftest
 
 # Permanent node-free acceptance for `z23 dev fleet`: one isolated origin,
 # three attached worktrees, exact remote heads, dirty/unpublished source, and
@@ -4865,9 +4877,9 @@ check-claims:
 # that is not mechanically derivable is printed as a NOT-DERIVABLE line naming
 # what the orchestrator must supply — never silently omitted.
 #   make agent-velocity BASE=b82b40e77
-agent-velocity:
+agent-velocity: $(AGENT_VELOCITY_BIN)
 	@RECEIPTS='$(RECEIPTS)'; \
-	 tools/agent/agent-velocity.sh $(if $(BASE),--base '$(BASE)') \
+	 $(AGENT_VELOCITY_BIN) $(if $(BASE),--base '$(BASE)') \
 	    $(if $(HEAD),--head '$(HEAD)') $(if $(AGAINST),--against '$(AGAINST)') \
 	    $${RECEIPTS:+--receipts "$$RECEIPTS"}
 
