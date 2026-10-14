@@ -1,0 +1,3 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Source-owned capability declaration for reading the plugin trust file. */
+ZCL_MODULE_CAPABILITY("contexts/commons/modules/plugin/src/plugin_manifest.c", CAP_FS_READ, "")

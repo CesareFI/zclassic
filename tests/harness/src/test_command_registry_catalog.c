@@ -264,18 +264,18 @@ static int test_domain_leaf_counts(void)
     return failures;
 }
 
-static int test_fourteen_roots(void)
+static int test_fifteen_roots(void)
 {
     int failures = 0;
     const struct zcl_command_registry *reg = zcl_command_catalog();
-    TEST("root exposes exactly fourteen choices") {
+    TEST("root exposes exactly fifteen choices") {
         size_t roots = 0;
         for (size_t i = 0; i < reg->count; i++) {
             const char *p = reg->commands[i].parent;
             if (!p || !p[0])
                 roots++;
         }
-        ASSERT_EQ(roots, (size_t)14);
+        ASSERT_EQ(roots, (size_t)15);
         ASSERT(find_spec(reg, "status") != NULL);
         ASSERT(find_spec(reg, "core") != NULL);
         ASSERT(find_spec(reg, "app") != NULL);
@@ -5388,7 +5388,7 @@ int test_command_registry_catalog(void)
     failures += test_describe_emits_observed_p99();
     failures += test_next_actions_fail_closed();
     failures += test_domain_leaf_counts();
-    failures += test_fourteen_roots();
+    failures += test_fifteen_roots();
     failures += test_yardsale_guide();
     failures += test_code_guide_leaf();
     failures += test_root_menu_budget();

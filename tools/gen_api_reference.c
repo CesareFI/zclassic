@@ -305,6 +305,9 @@ static const struct row g_rows[] = {
 #define ZCL_DEF_FILE "engine/composition/commands/zses.def"
 #include "../engine/composition/commands/zses.def"
 #undef ZCL_DEF_FILE
+#define ZCL_DEF_FILE "engine/composition/commands/plugin.def"
+#include "../engine/composition/commands/plugin.def"
+#undef ZCL_DEF_FILE
 #define ZCL_DEF_FILE "engine/composition/commands/story.def"
 #include "../engine/composition/commands/story.def"
 #undef ZCL_DEF_FILE

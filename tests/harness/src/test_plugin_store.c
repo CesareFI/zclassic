@@ -1,0 +1,776 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Purpose: prove the signed plugin store refuses unsigned, untrusted and
+ * altered plugins, keeps generations content addressed, and swaps the
+ * current and last-good links without ever leaving them dangling. Fixtures
+ * live under the repository test-tmp directory and sign with real Ed25519. */
+
+#include "test/test_core.h"
+
+#include "command/native_command.h"
+#include "config/command_catalog.h"
+#include "crypto/ed25519.h"
+#include "json/json.h"
+#include "platform/atomic_link.h"
+#include "plugin/plugin_store.h"
+#include "sha3/sha3.h"
+
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define PST_HEX (PLUGIN_HEX_SHA3_512 + 1)
+
+struct pst_fx {
+    char base[PATH_MAX];
+    char home[PATH_MAX];
+    char root[PATH_MAX];
+    char src[PATH_MAX];
+    uint8_t pk[2][32];
+    uint8_t sk[2][32];
+    char manifest[PATH_MAX];
+    char generation[PST_HEX];
+};
+
+struct pst_opts {
+    int key;
+    const char *extra;
+    const char *sig_alg;
+    bool tamper_exe;
+    bool tamper_manifest;
+};
+
+static void pst_hex(const uint8_t *in, size_t n, char *out)
+{
+    static const char d[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2 * i] = d[in[i] >> 4];
+        out[2 * i + 1] = d[in[i] & 15];
+    }
+    out[2 * n] = '\0';
+}
+
+static bool pst_write(const char *path, const char *data, size_t len)
+{
+    FILE *f = fopen(path, "wb");
+    bool ok = f && fwrite(data, 1, len, f) == len;
+    if (f)
+        ok = fclose(f) == 0 && ok;
+    return ok;
+}
+
+/* Owner-only file, whatever the process umask: the trust file must be one. */
+static bool pst_write_private(const char *path, const char *data, size_t len)
+{
+    return pst_write(path, data, len) && chmod(path, 0600) == 0;
+}
+
+static bool pst_slurp(const char *path, char *out, size_t cap)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+    size_t n = fread(out, 1, cap - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    return true;
+}
+
+static bool pst_path(char *out, size_t cap, const char *a, const char *b)
+{
+    int n = snprintf(out, cap, "%s/%s", a, b);
+    return n > 0 && (size_t)n < cap;
+}
+
+static bool pst_fx_open(struct pst_fx *fx, bool with_trust)
+{
+    memset(fx, 0, sizeof(*fx));
+    if (!test_mkdtemp(fx->base, sizeof(fx->base), "plugin_store"))
+        return false;
+    bool ok = pst_path(fx->home, sizeof(fx->home), fx->base, "home") &&
+              mkdir(fx->home, 0700) == 0;
+    char dot[PATH_MAX];
+    ok = ok && pst_path(dot, sizeof(dot), fx->home, ".z23") &&
+         mkdir(dot, 0700) == 0 && pst_path(fx->root, sizeof(fx->root), dot, "plugins") &&
+         mkdir(fx->root, 0700) == 0 &&
+         pst_path(fx->src, sizeof(fx->src), fx->base, "src") &&
+         mkdir(fx->src, 0700) == 0;
+    for (int k = 0; k < 2; k++) {
+        uint8_t seed[32];
+        memset(seed, 0x11 * (k + 1), sizeof(seed));
+        zcl_ed25519_keypair(fx->pk[k], fx->sk[k], seed);
+    }
+    if (ok && with_trust) {
+        char hex[65], line[80], path[PATH_MAX];
+        pst_hex(fx->pk[0], 32, hex);
+        snprintf(line, sizeof(line), "%s\n", hex);
+        ok = pst_path(path, sizeof(path), fx->root, "trusted_keys") &&
+             pst_write_private(path, line, strlen(line));
+    }
+    return ok;
+}
+
+static void pst_fx_close(struct pst_fx *fx)
+{
+    if (fx->base[0])
+        (void)test_rm_rf_recursive(fx->base);
+}
+
+static void pst_sign(const struct pst_fx *fx, int key, const char *manifest,
+                     char sig_hex[129])
+{
+    static const unsigned char domain[] = "z23.plugin.manifest.v1";
+    unsigned char digest[64];
+    uint8_t sig[64];
+    struct sha3_512_ctx ctx;
+    sha3_512_init(&ctx);
+    sha3_512_write(&ctx, domain, sizeof(domain));
+    sha3_512_write(&ctx, (const unsigned char *)manifest, strlen(manifest));
+    sha3_512_finalize(&ctx, digest);
+    zcl_ed25519_sign(sig, digest, sizeof(digest), fx->sk[key], fx->pk[key]);
+    pst_hex(sig, 64, sig_hex);
+}
+
+static bool pst_flip_version(const char *path)
+{
+    char buf[1024];
+    if (!pst_slurp(path, buf, sizeof(buf)))
+        return false;
+    char *p = strstr(buf, "1.0.0");
+    if (!p)
+        return false;
+    p[4] = '1';
+    return pst_write(path, buf, strlen(buf));
+}
+
+/* Writes NAME, NAME.plugin.json and NAME.plugin.sig under fx->src. */
+static bool pst_publish(struct pst_fx *fx, const char *name, const char *exe,
+                        const struct pst_opts *o)
+{
+    unsigned char digest[64];
+    char sha[129], sig_hex[129], pub[65], path[PATH_MAX], leaf[96];
+    char manifest[1024], sigdoc[512];
+    zcl_sha3_512((const unsigned char *)exe, strlen(exe), digest);
+    pst_hex(digest, 64, sha);
+    memcpy(fx->generation, sha, sizeof(sha));
+    snprintf(manifest, sizeof(manifest),
+             "{\"schema\":\"z23.plugin.v1\",\"name\":\"%s\",\"version\":\"1.0.0\","
+             "\"interface_version\":1,\"sha3_512\":\"%s\","
+             "\"capabilities\":[\"fs.read\",\"clock\"]%s}",
+             name, sha, o->extra ? o->extra : "");
+    pst_sign(fx, o->key, manifest, sig_hex);
+    pst_hex(fx->pk[o->key], 32, pub);
+    snprintf(sigdoc, sizeof(sigdoc),
+             "{\"sig_alg\":\"%s\",\"public_key\":\"%s\",\"signature\":\"%s\"}",
+             o->sig_alg ? o->sig_alg : "ed25519", pub, sig_hex);
+    snprintf(leaf, sizeof(leaf), "%s.plugin.json", name);
+    bool ok = pst_path(fx->manifest, sizeof(fx->manifest), fx->src, leaf) &&
+              pst_write(fx->manifest, manifest, strlen(manifest));
+    snprintf(leaf, sizeof(leaf), "%s.plugin.sig", name);
+    ok = ok && pst_path(path, sizeof(path), fx->src, leaf) &&
+         pst_write(path, sigdoc, strlen(sigdoc)) &&
+         pst_path(path, sizeof(path), fx->src, name) &&
+         pst_write(path, o->tamper_exe ? "tampered" : exe, o->tamper_exe ? 8 : strlen(exe));
+    return ok && (!o->tamper_manifest || pst_flip_version(fx->manifest));
+}
+
+static enum plugin_status pst_install(struct pst_fx *fx, const char *name,
+                                      const char *exe, const struct pst_opts *o)
+{
+    struct plugin_manifest m;
+    int present = 0;
+    if (!pst_publish(fx, name, exe, o))
+        return PLUGIN_ERR_IO;
+    return plugin_store_install(fx->root, fx->manifest, &m, &present);
+}
+
+/* Target of NAME/link without the "generations/" prefix, or "". */
+static void pst_link(const struct pst_fx *fx, const char *name, const char *link,
+                     char out[PST_HEX])
+{
+    char dir[PATH_MAX], path[PATH_MAX], target[PATH_MAX];
+    out[0] = '\0';
+    if (!pst_path(dir, sizeof(dir), fx->root, name) ||
+        !pst_path(path, sizeof(path), dir, link))
+        return;
+    ssize_t n = readlink(path, target, sizeof(target) - 1);
+    if (n > 12 && strncmp(target, "generations/", 12) == 0 && (size_t)n - 12 < PST_HEX) {
+        target[n] = '\0';
+        memcpy(out, target + 12, (size_t)n - 12 + 1);
+    }
+}
+
+static bool pst_exists(const char *a, const char *b)
+{
+    char p[PATH_MAX];
+    return pst_path(p, sizeof(p), a, b) && access(p, F_OK) == 0;
+}
+
+static int pst_case_install_valid(void)
+{
+    int failures = 0;
+    TEST_CASE("valid install stores a 0555 executable under its SHA3-512") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        struct plugin_manifest m;
+        int present = -1;
+        char dir[PATH_MAX], exe[PATH_MAX], cur[PST_HEX], body[64];
+        struct stat st;
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT(pst_publish(&fx, "hello", "#!/bin/sh\necho hi\n", &o));
+        ASSERT_EQ(plugin_store_install(fx.root, fx.manifest, &m, &present), PLUGIN_OK);
+        ASSERT_EQ(present, 0);
+        ASSERT_STR_EQ(m.exe_sha3, fx.generation);
+        ASSERT_EQ(m.capabilities, 1u | 32u);
+        snprintf(dir, sizeof(dir), "%s/hello/generations/%s", fx.root, fx.generation);
+        snprintf(exe, sizeof(exe), "%s/hello", dir);
+        ASSERT_EQ(stat(exe, &st), 0);
+        ASSERT_EQ((unsigned)(st.st_mode & 0777), 0555u);
+        ASSERT(pst_slurp(exe, body, sizeof(body)) && strcmp(body, "#!/bin/sh\necho hi\n") == 0);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_EQ(cur[0], '\0');
+        ASSERT_EQ(plugin_store_install(fx.root, fx.manifest, &m, &present), PLUGIN_OK);
+        ASSERT_EQ(present, 1);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_integrity_refusals(void)
+{
+    int failures = 0;
+    TEST_CASE("tampered executable and manifest are refused and leave no trace") {
+        struct pst_fx fx;
+        struct pst_opts exe = { .tamper_exe = true };
+        struct pst_opts man = { .tamper_manifest = true };
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &exe), PLUGIN_ERR_EXE_HASH);
+        ASSERT(!pst_exists(fx.root, "hello"));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &man), PLUGIN_ERR_SIG_BAD);
+        ASSERT(!pst_exists(fx.root, "hello"));
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_trust_refusals(void)
+{
+    int failures = 0;
+    TEST_CASE("untrusted signing key and missing trust file are refused") {
+        struct pst_fx fx;
+        struct pst_opts other = { .key = 1 };
+        struct pst_opts good = {0};
+        char trust[PATH_MAX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &other), PLUGIN_ERR_KEY_UNTRUSTED);
+        ASSERT(pst_path(trust, sizeof(trust), fx.root, "trusted_keys"));
+        ASSERT_EQ(unlink(trust), 0);
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &good), PLUGIN_ERR_NO_TRUST);
+        ASSERT(!pst_exists(fx.root, "hello"));
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_strict_format(void)
+{
+    int failures = 0;
+    TEST_CASE("duplicate key, unknown key and unknown sig_alg are refused") {
+        struct pst_fx fx;
+        struct pst_opts dup = { .extra = ",\"version\":\"9.9.9\"" };
+        struct pst_opts unk = { .extra = ",\"extra\":1" };
+        struct pst_opts okay = { .extra = "" };
+        struct pst_opts alg = { .sig_alg = "rsa" };
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &dup),
+                  PLUGIN_ERR_MANIFEST_DUPLICATE_KEY);
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &unk),
+                  PLUGIN_ERR_MANIFEST_UNKNOWN_KEY);
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &alg), PLUGIN_ERR_SIG_ALG);
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &okay), PLUGIN_OK);
+        ASSERT(!pst_exists(fx.root, "other"));
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_manifest_vocabulary(void)
+{
+    int failures = 0;
+    TEST_CASE("manifest parser refuses unknown capabilities and bad names") {
+        struct plugin_manifest m;
+        const char *base =
+            "{\"schema\":\"z23.plugin.v1\",\"name\":\"%s\",\"version\":\"1\","
+            "\"interface_version\":1,\"sha3_512\":\"%s\",\"capabilities\":[%s]}";
+        char hex[129], doc[512];
+        memset(hex, 'a', 128);
+        hex[128] = '\0';
+        snprintf(doc, sizeof(doc), base, "ok-1", hex, "\"fs.read\"");
+        ASSERT_EQ(plugin_manifest_parse(doc, strlen(doc), &m), PLUGIN_OK);
+        snprintf(doc, sizeof(doc), base, "ok-1", hex, "\"root.everything\"");
+        ASSERT_EQ(plugin_manifest_parse(doc, strlen(doc), &m), PLUGIN_ERR_MANIFEST_INVALID);
+        snprintf(doc, sizeof(doc), base, "ok-1", hex, "\"fs.read\",\"fs.read\"");
+        ASSERT_EQ(plugin_manifest_parse(doc, strlen(doc), &m), PLUGIN_ERR_MANIFEST_INVALID);
+        snprintf(doc, sizeof(doc), base, "Bad_Name", hex, "");
+        ASSERT_EQ(plugin_manifest_parse(doc, strlen(doc), &m), PLUGIN_ERR_MANIFEST_INVALID);
+        snprintf(doc, sizeof(doc), base, "ok-1", "ABC", "");
+        ASSERT_EQ(plugin_manifest_parse(doc, strlen(doc), &m), PLUGIN_ERR_MANIFEST_INVALID);
+        ASSERT_EQ(plugin_manifest_parse("not json", 8, &m), PLUGIN_ERR_MANIFEST_INVALID);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_switch_rollback(void)
+{
+    int failures = 0;
+    TEST_CASE("switch records last-good and rollback restores it") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char a[PST_HEX], b[PST_HEX], cur[PST_HEX], lg[PST_HEX], back[PST_HEX];
+        struct plugin_info *infos = NULL;
+        size_t count = 0;
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "version one", &o), PLUGIN_OK);
+        memcpy(a, fx.generation, PST_HEX);
+        ASSERT_EQ(pst_install(&fx, "hello", "version two", &o), PLUGIN_OK);
+        memcpy(b, fx.generation, PST_HEX);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", a), PLUGIN_OK);
+        pst_link(&fx, "hello", "current", cur);
+        pst_link(&fx, "hello", "last-good", lg);
+        ASSERT_STR_EQ(cur, a);
+        ASSERT_EQ(lg[0], '\0');
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", b), PLUGIN_OK);
+        pst_link(&fx, "hello", "current", cur);
+        pst_link(&fx, "hello", "last-good", lg);
+        ASSERT_STR_EQ(cur, b);
+        ASSERT_STR_EQ(lg, a);
+        ASSERT_EQ(plugin_store_rollback(fx.root, "hello", back), PLUGIN_OK);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, a);
+        ASSERT_STR_EQ(back, a);
+        ASSERT_EQ(plugin_store_list(fx.root, &infos, &count), PLUGIN_OK);
+        ASSERT_EQ(count, 1u);
+        ASSERT_EQ(infos[0].generation_count, 2u);
+        ASSERT_STR_EQ(infos[0].current, a);
+        ASSERT_STR_EQ(infos[0].last_good, a);
+        plugin_store_list_free(infos, count);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_interrupted_swap(void)
+{
+    int failures = 0;
+    TEST_CASE("an interrupted swap leaves current intact and the next swap clean") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char a[PST_HEX], b[PST_HEX], cur[PST_HEX], stale[PATH_MAX], bogus[PST_HEX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "version one", &o), PLUGIN_OK);
+        memcpy(a, fx.generation, PST_HEX);
+        ASSERT_EQ(pst_install(&fx, "hello", "version two", &o), PLUGIN_OK);
+        memcpy(b, fx.generation, PST_HEX);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", a), PLUGIN_OK);
+        snprintf(stale, sizeof(stale), "%s/hello/current.new.%ld", fx.root, (long)getpid());
+        ASSERT_EQ(symlink("generations/dangling", stale), 0);
+        memset(bogus, 'a', 128);
+        bogus[128] = '\0';
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", bogus), PLUGIN_ERR_NO_GENERATION);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, a);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", b), PLUGIN_OK);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, b);
+        ASSERT(access(stale, F_OK) != 0);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_atomic_link_failure(void)
+{
+    int failures = 0;
+    TEST_CASE("a failed atomic link leaves the old path untouched") {
+        struct pst_fx fx;
+        char dir[PATH_MAX], inner[PATH_MAX], tmp[PATH_MAX], good[PATH_MAX];
+        char target[64];
+        ASSERT(pst_fx_open(&fx, false));
+        ASSERT(pst_path(dir, sizeof(dir), fx.base, "occupied"));
+        ASSERT(pst_path(inner, sizeof(inner), dir, "keep"));
+        ASSERT_EQ(mkdir(dir, 0700), 0);
+        ASSERT(pst_write(inner, "x", 1));
+        ASSERT_EQ(platform_atomic_symlink("elsewhere", dir), -1);
+        ASSERT(access(inner, F_OK) == 0);
+        snprintf(tmp, sizeof(tmp), "%s.new.%ld", dir, (long)getpid());
+        ASSERT(access(tmp, F_OK) != 0);
+        ASSERT(pst_path(good, sizeof(good), fx.base, "link"));
+        ASSERT_EQ(platform_atomic_symlink("one", good), 0);
+        ASSERT_EQ(platform_atomic_symlink("two", good), 0);
+        ssize_t n = readlink(good, target, sizeof(target) - 1);
+        ASSERT(n == 3 && strncmp(target, "two", 3) == 0);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_rollback_refusals(void)
+{
+    int failures = 0;
+    TEST_CASE("rollback without last-good and for unknown plugins refuses") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char back[PST_HEX], cur[PST_HEX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(plugin_store_rollback(fx.root, "ghost", back), PLUGIN_ERR_NOT_INSTALLED);
+        ASSERT_EQ(pst_install(&fx, "hello", "version one", &o), PLUGIN_OK);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_OK);
+        ASSERT_EQ(plugin_store_rollback(fx.root, "hello", back), PLUGIN_ERR_NO_LAST_GOOD);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, fx.generation);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_post_install_tamper(void)
+{
+    int failures = 0;
+    TEST_CASE("switch re-verifies a generation altered after install") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char exe[PATH_MAX], cur[PST_HEX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "version one", &o), PLUGIN_OK);
+        snprintf(exe, sizeof(exe), "%s/hello/generations/%s/hello", fx.root, fx.generation);
+        ASSERT_EQ(chmod(exe, 0755), 0);
+        ASSERT(pst_write(exe, "evil", 4));
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_ERR_EXE_HASH);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_EQ(cur[0], '\0');
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+
+static bool pst_trust_path_of(const struct pst_fx *fx, char *out, size_t cap)
+{
+    return pst_path(out, cap, fx->root, "trusted_keys");
+}
+
+static int pst_case_insecure_trust(void)
+{
+    int failures = 0;
+    TEST_CASE("trust file that is group-writable, a link or a directory is refused") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char trust[PATH_MAX], real[PATH_MAX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT(pst_trust_path_of(&fx, trust, sizeof(trust)));
+        ASSERT_EQ(chmod(trust, 0664), 0);
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &o), PLUGIN_ERR_TRUST_INSECURE);
+        ASSERT_EQ(chmod(trust, 0600), 0);
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &o), PLUGIN_OK);
+        ASSERT(pst_path(real, sizeof(real), fx.base, "keys_elsewhere"));
+        ASSERT_EQ(rename(trust, real), 0);
+        ASSERT_EQ(symlink(real, trust), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation),
+                  PLUGIN_ERR_TRUST_INSECURE);
+        ASSERT_EQ(unlink(trust), 0);
+        ASSERT_EQ(mkdir(trust, 0700), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation),
+                  PLUGIN_ERR_TRUST_INSECURE);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_insecure_dirs(void)
+{
+    int failures = 0;
+    TEST_CASE("store, plugin and generations directories must be closed to others") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char plug[PATH_MAX], gens[PATH_MAX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &o), PLUGIN_OK);
+        ASSERT(pst_path(plug, sizeof(plug), fx.root, "hello"));
+        ASSERT(pst_path(gens, sizeof(gens), plug, "generations"));
+        ASSERT_EQ(chmod(fx.root, 0777), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_ERR_TRUST_INSECURE);
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &o), PLUGIN_ERR_TRUST_INSECURE);
+        ASSERT_EQ(chmod(fx.root, 0700), 0);
+        ASSERT_EQ(chmod(plug, 0770), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_ERR_TRUST_INSECURE);
+        ASSERT_EQ(chmod(plug, 0700), 0);
+        ASSERT_EQ(chmod(gens, 0707), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_ERR_TRUST_INSECURE);
+        ASSERT_EQ(chmod(gens, 0700), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_OK);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_store_symlinks(void)
+{
+    int failures = 0;
+    TEST_CASE("a generation reached through a symbolic link is refused") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char gen[PATH_MAX], copy[PATH_MAX], exe[PATH_MAX], stash[PATH_MAX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &o), PLUGIN_OK);
+        snprintf(gen, sizeof(gen), "%s/hello/generations/%s", fx.root, fx.generation);
+        ASSERT(pst_path(copy, sizeof(copy), fx.base, "verified_copy"));
+        ASSERT_EQ(rename(gen, copy), 0);
+        ASSERT_EQ(symlink(copy, gen), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_ERR_TRUST_INSECURE);
+        ASSERT_EQ(unlink(gen), 0);
+        ASSERT_EQ(rename(copy, gen), 0);
+        snprintf(exe, sizeof(exe), "%s/hello", gen);
+        ASSERT(pst_path(stash, sizeof(stash), fx.base, "exe_elsewhere"));
+        ASSERT_EQ(rename(exe, stash), 0);
+        ASSERT_EQ(symlink(stash, exe), 0);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_ERR_TRUST_INSECURE);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_republish_broken(void)
+{
+    int failures = 0;
+    TEST_CASE("install replaces a broken generation and keeps current valid") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char exe[PATH_MAX], body[PST_HEX];
+        int present = -1;
+        struct plugin_manifest m;
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &o), PLUGIN_OK);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_OK);
+        snprintf(exe, sizeof(exe), "%s/hello/generations/%s/hello", fx.root, fx.generation);
+        ASSERT_EQ(chmod(exe, 0755), 0);
+        ASSERT(pst_write(exe, "evil", 4));
+        ASSERT_EQ(plugin_store_install(fx.root, fx.manifest, &m, &present), PLUGIN_OK);
+        ASSERT_EQ(present, 0);
+        ASSERT(pst_slurp(exe, body, sizeof(body)) && strcmp(body, "payload") == 0);
+        ASSERT_EQ(plugin_store_install(fx.root, fx.manifest, &m, &present), PLUGIN_OK);
+        ASSERT_EQ(present, 1);
+        pst_link(&fx, "hello", "current", body);
+        ASSERT_STR_EQ(body, fx.generation);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_OK);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_trust_file_forms(void)
+{
+    int failures = 0;
+    TEST_CASE("trust file: CRLF lines work, malformed lines and empty files refuse") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char trust[PATH_MAX], hex[65], line[160];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT(pst_trust_path_of(&fx, trust, sizeof(trust)));
+        pst_hex(fx.pk[0], 32, hex);
+        snprintf(line, sizeof(line), "\r\n%s\r\n\r\n", hex);
+        ASSERT(pst_write_private(trust, line, strlen(line)));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &o), PLUGIN_OK);
+        snprintf(line, sizeof(line), "%s\nnot-a-key\n", hex);
+        ASSERT(pst_write_private(trust, line, strlen(line)));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &o), PLUGIN_ERR_TRUST_MALFORMED);
+        ASSERT(pst_write_private(trust, "\n\n", 2));
+        ASSERT_EQ(pst_install(&fx, "hello", "payload", &o), PLUGIN_ERR_NO_TRUST);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_revoked_key(void)
+{
+    int failures = 0;
+    TEST_CASE("removing a key from trust makes switch and rollback refuse") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char a[PST_HEX], back[PST_HEX], trust[PATH_MAX], hex[65], line[80];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "version one", &o), PLUGIN_OK);
+        memcpy(a, fx.generation, PST_HEX);
+        ASSERT_EQ(pst_install(&fx, "hello", "version two", &o), PLUGIN_OK);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", a), PLUGIN_OK);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_OK);
+        ASSERT(pst_trust_path_of(&fx, trust, sizeof(trust)));
+        pst_hex(fx.pk[1], 32, hex);
+        snprintf(line, sizeof(line), "%s\n", hex);
+        ASSERT(pst_write_private(trust, line, strlen(line)));
+        ASSERT_EQ(plugin_store_rollback(fx.root, "hello", back), PLUGIN_ERR_KEY_UNTRUSTED);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", a), PLUGIN_ERR_KEY_UNTRUSTED);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_tampered_last_good(void)
+{
+    int failures = 0;
+    TEST_CASE("rollback refuses a last-good generation altered on disk") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        char a[PST_HEX], back[PST_HEX], cur[PST_HEX], exe[PATH_MAX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(pst_install(&fx, "hello", "version one", &o), PLUGIN_OK);
+        memcpy(a, fx.generation, PST_HEX);
+        ASSERT_EQ(pst_install(&fx, "hello", "version two", &o), PLUGIN_OK);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", a), PLUGIN_OK);
+        ASSERT_EQ(plugin_store_switch(fx.root, "hello", fx.generation), PLUGIN_OK);
+        snprintf(exe, sizeof(exe), "%s/hello/generations/%s/hello", fx.root, a);
+        ASSERT_EQ(chmod(exe, 0755), 0);
+        ASSERT(pst_write(exe, "evil", 4));
+        ASSERT_EQ(plugin_store_rollback(fx.root, "hello", back), PLUGIN_ERR_EXE_HASH);
+        pst_link(&fx, "hello", "current", cur);
+        ASSERT_STR_EQ(cur, fx.generation);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static int pst_case_input_limits(void)
+{
+    int failures = 0;
+    TEST_CASE("wrong-length signature hex and oversize manifest are refused") {
+        struct pst_fx fx;
+        struct pst_opts o = {0};
+        struct plugin_manifest m;
+        char sig[PATH_MAX], body[1024];
+        int present;
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT(pst_publish(&fx, "hello", "payload", &o));
+        ASSERT(pst_path(sig, sizeof(sig), fx.src, "hello.plugin.sig"));
+        ASSERT(pst_slurp(sig, body, sizeof(body)));
+        char *p = strstr(body, "\"signature\":\"");
+        ASSERT(p);
+        p[14] = '"';
+        p[15] = '}';
+        p[16] = '\0';
+        ASSERT(pst_write(sig, body, strlen(body)));
+        ASSERT_EQ(plugin_store_install(fx.root, fx.manifest, &m, &present),
+                  PLUGIN_ERR_SIG_INVALID);
+        char *big = malloc(70000);
+        ASSERT(big);
+        memset(big, ' ', 69999);
+        big[69999] = '\0';
+        ASSERT(pst_write(fx.manifest, big, 69999));
+        free(big);
+        ASSERT_EQ(plugin_store_install(fx.root, fx.manifest, &m, &present),
+                  PLUGIN_ERR_MANIFEST_INVALID);
+        pst_fx_close(&fx);
+    } TEST_END
+    return failures;
+}
+
+static bool pst_call(zcl_command_handler_fn fn, const char *input_json,
+                     struct zcl_command_reply *reply)
+{
+    struct json_value input;
+    json_init(&input);
+    bool ok = json_read(&input, input_json, strlen(input_json));
+    struct zcl_command_request request = { .input = &input, .view = "normal" };
+    zcl_command_reply_init(reply, "zcl.plugin_test.v1");
+    if (ok)
+        fn(&request, reply);
+    json_free(&input);
+    return ok;
+}
+
+static int pst_case_commands(void)
+{
+    int failures = 0;
+    struct pst_fx fx = {0};
+    const char *old_home = getenv("HOME");
+    TEST_CASE("the four commands install, list, switch, roll back and refuse") {
+        struct pst_opts o = {0}, bad = { .key = 1 };
+        struct zcl_command_reply r;
+        char in[2 * PATH_MAX], a[PST_HEX];
+        ASSERT(pst_fx_open(&fx, true));
+        ASSERT_EQ(setenv("HOME", fx.home, 1), 0);
+        ASSERT(pst_publish(&fx, "hello", "version one", &bad));
+        snprintf(in, sizeof(in), "{\"manifest\":\"%s\"}", fx.manifest);
+        ASSERT(pst_call(zcl_native_handle_plugin_install, in, &r));
+        ASSERT_STR_EQ(r.error.code, "PLUGIN_KEY_UNTRUSTED");
+        ASSERT(r.error.next_action[0] != '\0');
+        zcl_command_reply_free(&r);
+        ASSERT(pst_publish(&fx, "hello", "version one", &o));
+        memcpy(a, fx.generation, PST_HEX);
+        ASSERT(pst_call(zcl_native_handle_plugin_install, in, &r));
+        ASSERT_EQ(r.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(json_get_str(json_get(&r.data, "generation")), a);
+        zcl_command_reply_free(&r);
+        snprintf(in, sizeof(in), "{\"name\":\"hello\",\"generation\":\"%s\"}", a);
+        ASSERT(pst_call(zcl_native_handle_plugin_switch, in, &r));
+        ASSERT_EQ(r.exit_code, ZCL_COMMAND_EXIT_OK);
+        zcl_command_reply_free(&r);
+        ASSERT(pst_call(zcl_native_handle_plugin_rollback, "{\"name\":\"hello\"}", &r));
+        ASSERT_STR_EQ(r.error.code, "PLUGIN_NO_LAST_GOOD");
+        zcl_command_reply_free(&r);
+        ASSERT(pst_call(zcl_native_handle_plugin_list, "{}", &r));
+        ASSERT_EQ(json_get_int(json_get(&r.data, "count")), 1);
+        zcl_command_reply_free(&r);
+    } TEST_END
+    if (old_home)
+        setenv("HOME", old_home, 1);
+    pst_fx_close(&fx);
+    return failures;
+}
+
+static int pst_case_registered(void)
+{
+    int failures = 0;
+    TEST_CASE("the plugin leaves are registered with their handlers") {
+        const struct zcl_command_registry *reg = zcl_command_catalog();
+        const struct zcl_command_spec *s;
+        ASSERT(reg);
+        s = zcl_command_registry_find(reg, "plugin.install", NULL);
+        ASSERT(s && s->handler == zcl_native_handle_plugin_install);
+        s = zcl_command_registry_find(reg, "plugin.list", NULL);
+        ASSERT(s && s->handler == zcl_native_handle_plugin_list);
+        s = zcl_command_registry_find(reg, "plugin.switch", NULL);
+        ASSERT(s && s->handler == zcl_native_handle_plugin_switch);
+        s = zcl_command_registry_find(reg, "plugin.rollback", NULL);
+        ASSERT(s && s->handler == zcl_native_handle_plugin_rollback);
+        ASSERT(zcl_native_command_is_root("plugin"));
+    } TEST_END
+    return failures;
+}
+
+int test_plugin_store(void)
+{
+    int failures = 0;
+    printf("\n=== Plugin store tests ===\n");
+    failures += pst_case_install_valid();
+    failures += pst_case_integrity_refusals();
+    failures += pst_case_trust_refusals();
+    failures += pst_case_strict_format();
+    failures += pst_case_manifest_vocabulary();
+    failures += pst_case_switch_rollback();
+    failures += pst_case_interrupted_swap();
+    failures += pst_case_atomic_link_failure();
+    failures += pst_case_rollback_refusals();
+    failures += pst_case_post_install_tamper();
+    failures += pst_case_insecure_trust();
+    failures += pst_case_insecure_dirs();
+    failures += pst_case_store_symlinks();
+    failures += pst_case_republish_broken();
+    failures += pst_case_trust_file_forms();
+    failures += pst_case_revoked_key();
+    failures += pst_case_tampered_last_good();
+    failures += pst_case_input_limits();
+    failures += pst_case_commands();
+    failures += pst_case_registered();
+    return failures;
+}

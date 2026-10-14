@@ -151,6 +151,8 @@ LIB_MODULE("core")
 LIB_MODULE("crypto")
 /* zssh: the sans-I/O SSH transport; depends on base, crypto and mlkem. */
 LIB_MODULE("zssh")
+/* plugin: the signed plugin store; references base, sha3, json, platform and crypto. */
+LIB_MODULE("plugin")
 /* The owner's private fleet ledger: a typed row, its chain, its in-memory
  * index and the closed vocabularies those are written in. It references
  * base, sha3, platform (the private-file and clock seams) and chainlog —

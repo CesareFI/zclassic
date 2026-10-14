@@ -279,6 +279,7 @@ static const char *ci_purpose_modules_d(const char *group)
     if (module_group_is(group, "zanc")) return "ZCL Anchors (ZANC) on-chain SHA2/SHA3 software-package anchoring overlay";
     if (module_group_is(group, "zdir")) return "ZCL Directory (ZDIR) on-chain node directory overlay — .onion peer discovery folded from block history";
     if (module_group_is(group, "zssh")) return "Sans-I/O SSH-2 transport, auth and one direct-tcpip channel with ML-KEM-768+X25519 hybrid key exchange";
+    if (module_group_is(group, "plugin")) return "signed plugin store: strict manifest and Ed25519 signature verification, SHA3-512 content-addressed generations, atomic current and last-good links";
     if (module_group_is(group, "zid")) return "sovereign identity Phase 1: signed identity documents + blinded record keys (ed25519/SHA3, pure codec)";
     return "";
 }

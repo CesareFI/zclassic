@@ -1097,6 +1097,16 @@ REMOTE_COMMAND_CLASS("yardsale.buy", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("zses.invite.create", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("zses.invite.accept", REMOTE_CLASS_NEVER, "")
 
+/* PLUGIN — 4 never_remote leaves.
+ *
+ * The plugin store decides which executables this machine will later run.
+ * Changing it is an owner decision made at the machine; a peer on the mesh
+ * must not be able to install, activate or roll back code here. */
+REMOTE_COMMAND_CLASS("plugin.install", REMOTE_CLASS_NEVER, "")
+REMOTE_COMMAND_CLASS("plugin.list", REMOTE_CLASS_NEVER, "")
+REMOTE_COMMAND_CLASS("plugin.switch", REMOTE_CLASS_NEVER, "")
+REMOTE_COMMAND_CLASS("plugin.rollback", REMOTE_CLASS_NEVER, "")
+
 /* STORY — 4 never_remote leaves.
  *
  * StoryGraph is a read-only projection, but its inputs and rooted output are

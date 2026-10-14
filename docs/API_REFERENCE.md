@@ -74,17 +74,17 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 924 |
-| Top-level roots | 14 |
-| Branches | 202 |
-| Leaves (dispatchable command paths) | 722 |
-| … `ready` (live handler in this build) | 629 |
+| Registry entries (branches + leaves) | 929 |
+| Top-level roots | 15 |
+| Branches | 203 |
+| Leaves (dispatchable command paths) | 726 |
+| … `ready` (live handler in this build) | 633 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
-| Leaves with `effect=mutate` | 269 |
+| Leaves with `effect=mutate` | 272 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 135 |
+| Leaves requiring **owner** authority | 138 |
 
 Per source file:
 
@@ -105,6 +105,7 @@ Per source file:
 | `engine/composition/commands/metaverse.def` | 30 | 7 | 23 |
 | `engine/composition/commands/yardsale.def` | 7 | 2 | 5 |
 | `engine/composition/commands/zses.def` | 4 | 2 | 2 |
+| `engine/composition/commands/plugin.def` | 5 | 1 | 4 |
 | `engine/composition/commands/story.def` | 5 | 1 | 4 |
 | `engine/composition/commands/fleet_board.def` | 12 | 3 | 9 |
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
@@ -177,6 +178,7 @@ The root order below is a wire contract, not a presentation choice.
 | `metaverse` | `metaverse` | branch | ready | Sovereign digital property: catalog, rights, receipts |
 | `yardsale` | `yardsale` | branch | ready | For-sale-by-owner signed ads, settled bilaterally |
 | `zses` | `zses` | branch | ready | Session invites |
+| `plugin` | `plugin` | branch | ready | Signed plugin store |
 | `story` | `story` | branch | ready | Rooted causal views of development work |
 | `fleet` | `fleet` | branch | ready | The fleet message board and wiki, and the owner's private fleet ledger |
 
@@ -1803,6 +1805,15 @@ represented by its children's sections.
 |---|---|---|---|---|---|---|
 | `zses invite create` | ready | read / read / public · fast/low | `endpoint`, `expires`, `capability_tag`, `capability-tag`, `posture`, `port` | `zcl.zses_invite.v1` | `z23 zses invite create` | Create a signed zses:v1 session invite |
 | `zses invite accept` | ready | read / read / public · fast/low | **`invite`**, `now` | `zcl.zses_invite_accept.v1` | `z23 zses invite accept --invite=<json>` | Verify and accept a signed zses:v1 invite |
+
+### `plugin` — Signed plugin store
+
+| Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
+|---|---|---|---|---|---|---|
+| `plugin install` | ready | mutate / app-write / **owner** · foreground/low | **`manifest`** | `zcl.plugin_install.v1` | `z23 plugin install ./hello.plugin.json` | Install a signed plugin executable as a new generation |
+| `plugin list` | ready | read / read / operator · fast/low | none | `zcl.plugin_list.v1` | `z23 plugin list` | List installed plugins with current, last-good and all generations |
+| `plugin switch` | ready | mutate / app-write / **owner** · fast/low | **`name`**, **`generation`** | `zcl.plugin_switch.v1` | `z23 plugin switch hello <128-hex generation>` | Make an installed plugin generation current |
+| `plugin rollback` | ready | mutate / app-write / **owner** · fast/low | **`name`** | `zcl.plugin_rollback.v1` | `z23 plugin rollback hello` | Restore the last-good plugin generation as current |
 
 ### `story` — Rooted causal views of development work
 

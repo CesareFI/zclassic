@@ -1,0 +1,86 @@
+/* plugin: the signed plugin store under ~/.z23/plugins. Consumer defines
+ * ZCL_COMMAND_*. docs/PLUGINS.md describes the layout and refusal codes. */
+
+ZCL_COMMAND_BRANCH("plugin", "", "Signed plugin store",
+                   ZCL_COMMAND_LAYER_APP)
+
+ZCL_COMMAND_READY_COMMAND(
+    "plugin.install", "plugin", "",
+    "Install a signed plugin executable as a new generation",
+    "Verifies NAME.plugin.json (strict schema z23.plugin.v1, no unknown or "
+    "duplicate keys), its detached NAME.plugin.sig (ed25519 over SHA3-512 of "
+    "the domain tag, a NUL and the manifest bytes) against "
+    "~/.z23/plugins/trusted_keys, and the executable's SHA3-512. Stages the "
+    "files, verifies the staged copy again, then renames it to "
+    "~/.z23/plugins/NAME/generations/SHA3-512 with the executable at mode "
+    "0555. It does not change the current link. Unsigned, untrusted or "
+    "altered plugins are refused with a PLUGIN_* code and the next action.",
+    ZCL_COMMAND_RESULT_BUDGET,
+    "plugin,install,signed,manifest,ed25519,sha3,generation,trust",
+    "zcl.plugin_install.input.v1", "zcl.plugin_install.v1",
+    "manifest", "manifest",
+    "z23 plugin install ./hello.plugin.json",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_plugin_install)
+
+ZCL_COMMAND_READY_COMMAND(
+    "plugin.list", "plugin", "",
+    "List installed plugins with current, last-good and all generations",
+    "Reads ~/.z23/plugins and returns, per plugin, the current and last-good "
+    "generation ids and every stored generation, sorted. It verifies "
+    "nothing and changes nothing.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "plugin,list,generation,current,last-good",
+    "zcl.command.empty_input.v1", "zcl.plugin_list.v1", "", "",
+    "z23 plugin list",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_READ,
+    ZCL_COMMAND_RISK_READ, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_plugin_list)
+
+ZCL_COMMAND_READY_COMMAND(
+    "plugin.switch", "plugin", "",
+    "Make an installed plugin generation current",
+    "Verifies the named generation again (signature, trust, executable "
+    "hash), records the previous current generation as last-good, then "
+    "replaces the current link atomically by symlink and rename. Switching "
+    "to the generation that is already current changes nothing.",
+    ZCL_COMMAND_RESULT_BUDGET,
+    "plugin,switch,activate,generation,current,last-good",
+    "zcl.plugin_switch.input.v1", "zcl.plugin_switch.v1",
+    "name,generation", "name,generation",
+    "z23 plugin switch hello <128-hex generation>",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_REVERSIBLE,
+    zcl_native_handle_plugin_switch)
+
+ZCL_COMMAND_READY_COMMAND(
+    "plugin.rollback", "plugin", "",
+    "Restore the last-good plugin generation as current",
+    "Verifies the last-good generation again and points the current link at "
+    "it atomically. Refuses with PLUGIN_NO_LAST_GOOD when no switch has "
+    "recorded one.",
+    ZCL_COMMAND_RESULT_BUDGET,
+    "plugin,rollback,restore,last-good,current",
+    "zcl.plugin_rollback.input.v1", "zcl.plugin_rollback.v1",
+    "name", "name",
+    "z23 plugin rollback hello",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_REVERSIBLE,
+    zcl_native_handle_plugin_rollback)

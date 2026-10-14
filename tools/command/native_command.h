@@ -291,6 +291,18 @@ void zcl_native_handle_zses_invite_create(
 void zcl_native_handle_zses_invite_accept(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+void zcl_native_handle_plugin_install(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_plugin_list(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_plugin_switch(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_plugin_rollback(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
 void zcl_native_handle_ops_mesh_join(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
