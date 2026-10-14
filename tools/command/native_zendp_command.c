@@ -127,7 +127,7 @@ static const char *zec_input_str(const struct json_value *input,
 
 /* Accept a number either typed (JSON_INT) or as a decimal string — the
  * registry admits JSON_INT only for keys it names explicitly, so
- * `"seq":"5"` works today and `"seq":5` keeps working if a typed rule
+ * `"onion_port":"8033"` works today and typed values keep working if a rule
  * is added later. A string that is not a clean whole number falls back
  * to `dflt` rather than silently reading as 0. */
 static int64_t zec_input_int(const struct json_value *input, const char *key,

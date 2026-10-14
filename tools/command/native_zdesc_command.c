@@ -74,7 +74,7 @@ static const char *zdc_input_str(const struct json_value *input,
  * only admits JSON_INT for keys it names explicitly and demands a
  * string for everything else, so `--seq=5` inside --input='{...}' is
  * refused INVALID_INPUT for any key without such a rule. Taking both
- * forms here means these leaves work today with `"seq":"5"` and keep
+ * forms here means these leaves accept string-form keys and keep
  * working unchanged if typed rules are added later. A string that is
  * not a clean whole number falls back to `dflt` rather than silently
  * reading as 0. */

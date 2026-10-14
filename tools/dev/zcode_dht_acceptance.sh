@@ -515,7 +515,7 @@ for i in 0 1 2 3 4 5 6; do
         seed_file="$DHT_WORK/master-b.hex"
     fi
     published="$(dht_native "${DDS[$i]}" "${RPCS[$i]}" zcode endpoint publish \
-        --input="{\"ipv4\":\"127.0.0.1\",\"ipv4_port\":\"${PORTS[$i]}\",\"seed_file\":\"$seed_file\",\"seq\":\"1\",\"height\":129}")"
+        --input="{\"ipv4\":\"127.0.0.1\",\"ipv4_port\":\"${PORTS[$i]}\",\"seed_file\":\"$seed_file\",\"seq\":1,\"height\":129}")"
     [ "$(printf '%s' "$published" | dht_jget ok)" = True ] ||
         dht_die "endpoint publish $i failed: $published"
     DOCS[$i]="$(printf '%s' "$published" | dht_jget data.doc_hex)"

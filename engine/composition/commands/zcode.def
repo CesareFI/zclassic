@@ -4450,8 +4450,8 @@ ZCL_COMMAND_READY_COMMAND(
     "<datadir>/zcode, and files it under the blinded record key for the "
     "current period at <datadir>/zcode/descriptors/<record_key>.zid. "
     "Returns doc_hex, root, master_pubkey, record_key and period. "
-    "Numeric inputs (seq, not_before, expiry, now) are taken as decimal "
-    "strings. seq is "
+    "seq is a bare whole number 1..1000000000; not_before, expiry and now "
+    "are decimal strings. seq is "
     "monotonic per identity: a republish with a seq at or below the one "
     "already held is refused STALE_SEQ and nothing is written. Defaults: "
     "seq 1, not_before now, expiry not_before+3d. The record key rotates "
@@ -4461,7 +4461,7 @@ ZCL_COMMAND_READY_COMMAND(
     "zcode,desc,descriptor,onion,publish,zid,blinded,rotation,swarm",
     "zcl.zcode_desc_publish.input.v1", "zcl.zcode_desc_publish.v1",
     "onion,intros,seed_file,seq,not_before,expiry,now,datadir", "onion",
-    "z23 zcode desc publish --input='{\"onion\":\"<56base32>.onion\",\"seed_file\":\"/path/seed.hex\",\"intros\":\"<56base32>.onion:<64hex>\",\"seq\":\"1\"}'",
+    "z23 zcode desc publish --input='{\"onion\":\"<56base32>.onion\",\"seed_file\":\"/path/seed.hex\",\"intros\":\"<56base32>.onion:<64hex>\",\"seq\":1}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
     ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
@@ -4573,9 +4573,9 @@ ZCL_COMMAND_READY_COMMAND(
     "master_pubkey, record_key, period and the anchor the chain "
     "reported. NUMERIC INPUTS SPLIT TWO WAYS, because the registry "
     "types some keys and not others: `height` must be a bare whole "
-    "number (\"height\":3196556), while onion_port, ipv4_port, "
-    "ipv6_port, services, seq, not_before, expiry and now are taken as "
-    "decimal STRINGS (\"seq\":\"1\"). seq is monotonic per identity: a "
+    "number (\"height\":3196556, \"seq\":1), while onion_port, ipv4_port, "
+    "ipv6_port, services, not_before, expiry and now are taken as "
+    "decimal STRINGS (\"onion_port\":\"8033\"). seq is monotonic per identity: a "
     "republish with a "
     "seq at or below the one already filed is refused STALE_SEQ and "
     "nothing is written. Defaults: seq 1, not_before now, expiry "
@@ -4598,7 +4598,7 @@ ZCL_COMMAND_READY_COMMAND(
     "zcl.zcode_endpoint_publish.input.v1", "zcl.zcode_endpoint_publish.v1",
     "onion,onion_port,ipv4,ipv4_port,ipv6,ipv6_port,services,height,seed_file,seq,not_before,expiry,now,datadir",
     "seed_file",
-    "z23 zcode endpoint publish --input='{\"onion\":\"<56base32>.onion\",\"onion_port\":\"8033\",\"seed_file\":\"/path/seed.hex\",\"seq\":\"1\",\"height\":3196556}'",
+    "z23 zcode endpoint publish --input='{\"onion\":\"<56base32>.onion\",\"onion_port\":\"8033\",\"seed_file\":\"/path/seed.hex\",\"seq\":1,\"height\":3196556}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
     ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,

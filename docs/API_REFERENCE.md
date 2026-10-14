@@ -1630,7 +1630,7 @@ represented by its children's sections.
 
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
-| `zcode desc publish` | ready | mutate / app-write / operator · fast/low | **`onion`**, `intros`, `seed_file`, `seq`, `not_before`, `expiry`, `now`, `datadir` | `zcl.zcode_desc_publish.v1` | `z23 zcode desc publish --input='{"onion":"<56base32>.onion","seed_file":"/path/seed.hex","intros":"<56base32>.onion:<64hex>","seq":"1"}'` | Publish a signed onion-service descriptor |
+| `zcode desc publish` | ready | mutate / app-write / operator · fast/low | **`onion`**, `intros`, `seed_file`, `seq`, `not_before`, `expiry`, `now`, `datadir` | `zcl.zcode_desc_publish.v1` | `z23 zcode desc publish --input='{"onion":"<56base32>.onion","seed_file":"/path/seed.hex","intros":"<56base32>.onion:<64hex>","seq":1}'` | Publish a signed onion-service descriptor |
 | `zcode desc verify` | ready | read / read / public · fast/low | `doc`, `file`, **`pubkey`**, `now` | `zcl.zcode_desc_verify.v1` | `z23 zcode desc verify --input='{"doc":"<hex>","pubkey":"<64hex>"}'` | Check a descriptor's signature against a master key you supply |
 | `zcode desc resolve` | ready | read / read / public · fast/low | **`pubkey`**, `now`, `datadir` | `zcl.zcode_desc_resolve.v1` | `z23 zcode desc resolve --input='{"pubkey":"<64hex>"}'` | Look up an identity's current descriptor by its blinded record key |
 
@@ -1638,7 +1638,7 @@ represented by its children's sections.
 
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
-| `zcode endpoint publish` | ready | mutate / app-write / operator · fast/low | `onion`, `onion_port`, `ipv4`, `ipv4_port`, `ipv6`, `ipv6_port`, `services`, `height`, **`seed_file`**, `seq`, `not_before`, `expiry`, `now`, `datadir` | `zcl.zcode_endpoint_publish.v1` | `z23 zcode endpoint publish --input='{"onion":"<56base32>.onion","onion_port":"8033","seed_file":"/path/seed.hex","seq":"1","height":3196556}'` | Publish this node's signed endpoint record |
+| `zcode endpoint publish` | ready | mutate / app-write / operator · fast/low | `onion`, `onion_port`, `ipv4`, `ipv4_port`, `ipv6`, `ipv6_port`, `services`, `height`, **`seed_file`**, `seq`, `not_before`, `expiry`, `now`, `datadir` | `zcl.zcode_endpoint_publish.v1` | `z23 zcode endpoint publish --input='{"onion":"<56base32>.onion","onion_port":"8033","seed_file":"/path/seed.hex","seq":1,"height":3196556}'` | Publish this node's signed endpoint record |
 | `zcode endpoint accept` | ready | mutate / app-write / operator · fast/low | **`doc`**, `file`, `now`, `datadir` | `zcl.zcode_endpoint_accept.v1` | `z23 zcode endpoint accept --input='{"doc":"<hex>"}'` | Verify a peer's endpoint record against the chain and file it |
 | `zcode endpoint verify` | ready | read / read / public · fast/low | **`doc`**, `file`, `now`, `datadir` | `zcl.zcode_endpoint_verify.v1` | `z23 zcode endpoint verify --input='{"doc":"<hex>"}'` | Check an endpoint record against the chain without storing it |
 | `zcode endpoint resolve` | ready | read / read / public · fast/low | **`pubkey`**, `now`, `datadir` | `zcl.zcode_endpoint_resolve.v1` | `z23 zcode endpoint resolve --input='{"pubkey":"<64hex>"}'` | Look up a filed endpoint record by its blinded record key |
