@@ -243,6 +243,8 @@ static const struct lint_gate k_gates[] = {
       check_log_macro_return_type_selftest },
     { "check-verification-coverage", check_verification_coverage_run,
       check_verification_coverage_selftest },
+    { "check-hosted-suite-verdict", check_hosted_suite_verdict_run,
+      check_hosted_suite_verdict_selftest },
     { "check-no-real-clock-test-deadline",
       check_no_real_clock_test_deadline_run,
       check_no_real_clock_test_deadline_selftest },

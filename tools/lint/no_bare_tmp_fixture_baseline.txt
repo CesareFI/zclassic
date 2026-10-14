@@ -21,7 +21,7 @@ tests/harness/src/test_api_status.c 1
 tests/harness/src/test_binary_ab_fallback.c 1
 tests/harness/src/test_block_index_integrity.c 2
 tests/harness/src/test_block_log_file.c 1
-tests/harness/src/test_block_log_legacy.c 2
+tests/harness/src/test_block_log_legacy.c 1
 tests/harness/src/test_block_pruning.c 3
 tests/harness/src/test_boot_header_seed_import.c 4
 tests/harness/src/test_boot_legacy_blocks.c 2
@@ -166,7 +166,8 @@ tools/lint/lintc/gate_generated_artifact_contradictions_workers.c 1
 tools/lint/lintc/gate_git_hooks_installed.c 1
 tools/lint/lintc/gate_git_scan_a.c 1
 tools/lint/lintc/gate_git_scan_a_selftests.c 1
-tools/lint/lintc/gate_git_scan_b.c 4
+tools/lint/lintc/gate_git_scan_b.c 2
+tools/lint/lintc/gate_hosted_suite_verdict.c 1
 tools/lint/lintc/gate_hotswap_candidates_ledger.c 1
 tools/lint/lintc/gate_installed_acceptance_tools.c 1
 tools/lint/lintc/gate_landing_proof.c 8
