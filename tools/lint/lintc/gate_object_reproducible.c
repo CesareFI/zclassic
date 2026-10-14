@@ -39,7 +39,7 @@
  * The riscv64-link case compiles the tracked fixture OR_XLINK_SRC (a
  * freestanding riscv64 FreeBSD program with its own _start) with the cross
  * compiler, --xcc-flags and the prefix map, links it with the cross linker
- * --xld and --xld-flags (mold: the build host has no lld), and compares the
+ * --xld and --xld-flags (the pinned LLVM ld.lld), and compares the
  * SHA-256 of the two executables. They must be an ELF64 RISC-V ET_EXEC and
  * hold neither root path. Its code is in gate_object_reproducible_xlink.c.
  * Cross linker missing: SKIPPED by name when the case is in --allow-missing.

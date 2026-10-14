@@ -11,7 +11,7 @@ provide a filesystem, network stack, shell or credential store.
     devbuild --wait make z23kernel
     devbuild --wait make -j8 t-fast-exact ONLY=z23kernel_boot
 
-The measured cross toolchain is Clang 18, mold 2.30 and LLVM objcopy 18.
+The measured cross toolchain is Clang 20.1.8, ld.lld 20.1.8 and LLVM objcopy 20.1.8.
 Override Z23KERNEL_CC, Z23KERNEL_LD and Z23KERNEL_OBJCOPY with compatible tools.
 Missing tools or invalid image layout fail the requested build. Images must
 be smaller than 64 KiB; exact-cap and oversized inputs refuse. Other compiler

@@ -3,7 +3,7 @@
  * purpose: The riscv64-link case of the check-object-reproducible gate: a
  * freestanding riscv64 FreeBSD program (the tracked fixture OR_XLINK_SRC) is
  * compiled with the cross compiler and linked with the cross linker (--xld,
- * mold on the build host; there is no lld there), and the gate compares the
+ * the pinned LLVM ld.lld), and the gate compares the
  * SHA-256 of the two executables built under two checkout roots. This file
  * builds and runs the two steps, resolves the linker and checks that the
  * output is an ELF64 little-endian RISC-V ET_EXEC. The case table, the

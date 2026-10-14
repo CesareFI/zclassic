@@ -5,7 +5,7 @@
 The optional apps/z23kernel application adds a freestanding supervisor kernel
 without modifying the emulator or linking node code. Source base:
 9c7adf86a3cbfc11c2a152dc4d7012b2e1c22149. The measured Linux cross toolchain
-is Clang 18.1.3, mold 2.30.0 and LLVM objcopy 18.1.3.
+is the pinned Clang 20.1.8, ld.lld 20.1.8 and LLVM objcopy 20.1.8.
 
 On 2026-10-14, the registered z23kernel_boot group passed uncached through:
 
@@ -25,11 +25,12 @@ report shutdown acceptance.
 The native runner's distinct concurrent image and identity BUILD prerequisites
 passed using the existing bounded build lock. Deleting only the generated
 identity and rebuilding regenerated identical bytes. The architecture tree
-gate passed. The exact 9240-byte flat image SHA256 is:
+gate passed. The exact 4157-byte flat image SHA256 (probe 0x304, resume 0x308, end offset 0x6050) linked with ld.lld 20.1.8 is:
 
-    ed3dbbfe1229694f91f37acd19223440ce33129790f086bc356a984749687fd8
+    84e5fb4f1e3487fdc42889339fa7684ad2b3885cb565504d7140fad50db1180b
 
-This matches the separately reviewed frozen prototype. The build rejects
+The image is smaller than the earlier mold-linked 9240-byte image because
+ld.lld emits no empty GOT padding and merges the string data into .rodata. The build rejects
 misplaced sections or unsupported allocated section types, checks flat-section byte offsets and
 generates the hash and probe offsets consumed by acceptance. Image and identity
 publication comprises separate renames under the lock; consumer verification

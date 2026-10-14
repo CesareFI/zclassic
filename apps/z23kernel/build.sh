@@ -4,7 +4,7 @@
 set -euo pipefail
 source_dir=$1
 output_dir=$2
-: "${Z23KERNEL_CC:=clang}" "${Z23KERNEL_LD:=mold}" "${Z23KERNEL_OBJCOPY:=llvm-objcopy}"
+: "${Z23KERNEL_CC:=clang}" "${Z23KERNEL_LD:=ld.lld}" "${Z23KERNEL_OBJCOPY:=llvm-objcopy}"
 mkdir -p "$output_dir"
 source_dir=$(cd "$source_dir" && pwd)
 output_dir=$(cd "$output_dir" && pwd)
@@ -15,7 +15,7 @@ z23_build_epoch_flock_bounded z23kernel 9 "$output_dir/build.lock" kernel-output
 cd "$output_dir"
 "$Z23KERNEL_CC" --target=riscv64-unknown-elf -std=c23 -march=rv64ima_zicsr -mabi=lp64 -mcmodel=medany -msmall-data-limit=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -mno-relax -fno-unwind-tables -fno-asynchronous-unwind-tables -O1 -Wall -Wextra -Werror -pedantic -fstack-usage -c "$source_dir/main.c" -o main.o
 "$Z23KERNEL_CC" --target=riscv64-unknown-elf -march=rv64ima_zicsr -mabi=lp64 -mcmodel=medany -mno-relax -c "$source_dir/entry.S" -o entry.o
-"$Z23KERNEL_LD" -m elf64lriscv -static --build-id=none --no-fork --no-relax -e _start --image-base 0x80000000 --Ttext=0x80200000 --section-start=.rodata.str1.1=0x80201000 -o kernel.elf entry.o main.o
+"$Z23KERNEL_LD" -m elf64lriscv -static --build-id=none --no-relax -e _start --image-base 0x80000000 --Ttext=0x80200000 --section-start=.rodata=0x80201000 -o kernel.elf entry.o main.o
 readelf -h -l -SW -s -d kernel.elf > elf-review.log
 dynamic=$(readelf -d kernel.elf)
 grep -q 'There is no dynamic section' <<<"$dynamic"
@@ -43,7 +43,7 @@ readelf -SW kernel.elf | awk '{
 }' > sections.log
 grep -q "^\.text PROGBITS " sections.log
 grep -q "^\.bss NOBITS " sections.log
-grep -q "^\.rodata.str1.1 PROGBITS " sections.log
+grep -q "^\.rodata PROGBITS " sections.log
 while read -r name type address size; do
  test "$name" != .eh_frame_hdr || continue
  test "$((address))" -ge "$((start))"

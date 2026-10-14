@@ -1183,16 +1183,13 @@ REPRO_GATE_BASE_CFLAGS = -std=$(ZCL_C_STD) $(firstword $(filter -O%,$(CFLAGS))) 
 REPRO_GATE_TARGETS = clang-riscv64=--target=riscv64-unknown-freebsd,clang-aarch64=--target=aarch64-unknown-linux-gnu,riscv64-link=--target=riscv64-unknown-freebsd
 REPRO_GATE_CROSS_FLAGS = -nostdlibinc
 # riscv64-link case: the freestanding compile flags of the tracked fixture and
-# the cross linker (mold: the build host has no lld) with its argv. A linker
-# that is not installed skips the case by name (it is in --allow-missing).
+# the cross linker with its argv. A linker that is not installed skips the case
+# by name (it is in --allow-missing).
 REPRO_GATE_XCC_FLAGS = -ffreestanding -fno-stack-protector
-# The default linker is mold on PATH, else $(HOME)/.local/bin/mold when that
-# file is executable (a system-only PATH), else the literal mold (missing-tool
-# skip, unchanged). An explicit REPRO_GATE_XLD still wins.
-REPRO_GATE_XLD ?= $(shell command -v mold >/dev/null 2>&1 && echo mold || { test -x "$(HOME)/.local/bin/mold" && echo "$(HOME)/.local/bin/mold"; } || echo mold)
-# --no-fork: mold otherwise finishes in a background child that keeps the
-# output pipe open after the parent exits 0, so the capture never sees EOF.
-REPRO_GATE_XLD_FLAGS = -m elf64lriscv -static --build-id=none --no-fork -e _start
+# The default linker is the pinned LLVM ld.lld from z23-clang when it exists,
+# else the literal ld.lld (missing-tool skip). An explicit REPRO_GATE_XLD wins.
+REPRO_GATE_XLD ?= $(shell d="$$(~/.local/bin/z23-clang check 2>/dev/null)"; if test -x "$$d/bin/ld.lld"; then echo "$$d/bin/ld.lld"; else echo ld.lld; fi)
+REPRO_GATE_XLD_FLAGS = -m elf64lriscv -static --build-id=none -e _start
 REPRO_GATE_LINK_LIBS = -lm
 REPRO_GATE_STRIP_FLAG = -ffile-prefix-map=
 # The riscv64 universal copy (see docs/DEFENSIVE_CODING.md, "riscv64 universal
