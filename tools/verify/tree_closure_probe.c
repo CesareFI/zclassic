@@ -1,7 +1,8 @@
 /* Copyright 2026 Rhett Creighton; SPDX-License-Identifier: Apache-2.0.
  * Local prerequisites only. No same-account result authorizes attestation.
  * Self-test for tools/verify/tree_closure.c and fixed_result_closure.c.
- * Run from the repository root through tools/verify/tree_closure_probe.sh. */
+ * Run from the repository root through tools/verify/tree_closure_probe.sh,
+ * which passes its own name as argv[1]. */
 #define _GNU_SOURCE
 #include "sha3/sha3.h"
 
@@ -9,6 +10,7 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +34,7 @@ static char g_zeros[65];
 static char g_ones[65];
 static char g_baseline[65];
 static char g_path_env[PATH_MAX + 16];
+static const char *g_name;
 static const char *g_cc;
 static const char *g_std;
 static struct tree_hash g_first;
@@ -60,19 +63,38 @@ static void redirect(int fd, const char *path)
     close(f);
 }
 
+static volatile sig_atomic_t g_cleaning;
+
+static void block_signals(sigset_t *old)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGHUP);
+    sigprocmask(SIG_BLOCK, &set, old);
+}
+
 static int run(const char *const argv[], const char *out, const char *err,
                char *const env[])
 {
     fflush(nullptr);
+    sigset_t held;
+    block_signals(&held);
     pid_t pid = fork();
     check(pid >= 0, "fork");
     if (pid == 0) {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        sigprocmask(SIG_SETMASK, &held, nullptr);
         redirect(1, out);
         redirect(2, err);
         for (size_t i = 0; env && env[i]; i++) putenv(env[i]);
         execv(argv[0], (char *const *)argv);
         _exit(127);
     }
+    sigprocmask(SIG_SETMASK, &held, nullptr);
     int st;
     check(waitpid(pid, &st, 0) == pid, "waitpid");
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
@@ -83,7 +105,10 @@ static void slurp(const char *path, char *buf, size_t cap)
     FILE *f = fopen(path, "r");
     size_t n = f ? fread(buf, 1, cap - 1, f) : 0;
     buf[n] = '\0';
-    if (f) fclose(f);
+    if (f) {
+        check(fgetc(f) == EOF, "output exceeds buffer");
+        fclose(f);
+    }
 }
 
 static void write_text(const char *path, const char *text)
@@ -116,13 +141,13 @@ static bool hex64(const char *p)
     return true;
 }
 
-static bool field(const char *text, const char *key, bool bol, char out[65])
+static bool field(const char *text, const char *key, bool bol, char end,
+                  char out[65])
 {
     for (const char *p = strstr(text, key); p; p = strstr(p + 1, key)) {
         if (bol && p != text && p[-1] != '\n') continue;
         const char *v = p + strlen(key);
-        if (!hex64(v) || (v[64] != ' ' && v[64] != '\n' && v[64] != '\0'))
-            continue;
+        if (!hex64(v) || v[64] != end) continue;
         memcpy(out, v, 64);
         out[64] = '\0';
         return true;
@@ -148,8 +173,8 @@ static int tree_hash(const char *dir, const char *uid, struct tree_hash *h)
     slurp(wp("hash.out"), h->text, sizeof h->text);
     h->tree[0] = h->content[0] = '\0';
     if (rc == 0)
-        check(field(h->text, "tree_sha3=", true, h->tree) &&
-              field(h->text, " content_sha3=", false, h->content),
+        check(field(h->text, "tree_sha3=", true, ' ', h->tree) &&
+              field(h->text, " content_sha3=", false, ' ', h->content),
               "tree digests");
     return rc;
 }
@@ -188,7 +213,7 @@ static void closure(const char *five, char *const env[], char out[65])
     check(run(argv, outp, nullptr, env) == 0, "combine");
     char text[TEXT_MAX];
     slurp(outp, text, sizeof text);
-    check(field(text, "closure_sha3=", true, out), "closure digest");
+    check(field(text, "closure_sha3=", true, '\n', out), "closure digest");
 }
 
 static void compile(const char *const sources[], size_t n, const char *out)
@@ -359,7 +384,27 @@ static int rm_entry(const char *path, const struct stat *, int,
 
 static void cleanup(void)
 {
-    if (g_work[0]) nftw(g_work, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
+    if (g_cleaning || !g_work[0]) return;
+    g_cleaning = 1;
+    sigset_t old;
+    block_signals(&old);
+    nftw(g_work, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
+}
+
+static void on_signal(int sig)
+{
+    if (!g_cleaning) cleanup();
+    raise(sig);
+}
+
+static void install_handlers(void)
+{
+    struct sigaction sa = { .sa_handler = on_signal,
+                            .sa_flags = SA_RESETHAND | SA_NODEFER };
+    sigemptyset(&sa.sa_mask);
+    const int sigs[] = { SIGINT, SIGTERM, SIGHUP };
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
+        sigaction(sigs[i], &sa, nullptr);
 }
 
 static void make_work(void)
@@ -370,6 +415,7 @@ static void make_work(void)
     snprintf(g_work, sizeof g_work, "%s/.z23-verify-tree-probe.XXXXXX", home);
     check(mkdtemp(g_work) != nullptr, "mkdtemp");
     atexit(cleanup);
+    install_handlers();
     const char *dirs[] = { "root", "tool", "red-tool" };
     for (int i = 0; i < 3; i++) check(mkdir(wp(dirs[i]), 0700) == 0, "mkdir");
     snprintf(g_uid, sizeof g_uid, "%u", (unsigned)getuid());
@@ -380,15 +426,15 @@ static void make_work(void)
 
 int main(int argc, char **argv)
 {
-    bool ok = argc == 3 && !strcmp(argv[1], "/usr/bin/gcc") &&
-              (!strcmp(argv[2], "-std=c2x") || !strcmp(argv[2], "-std=c23"));
+    g_name = argc > 1 ? argv[1] : "tree_closure_probe";
+    bool ok = argc == 4 && !strcmp(argv[2], "/usr/bin/gcc") &&
+              (!strcmp(argv[3], "-std=c2x") || !strcmp(argv[3], "-std=c23"));
     if (!ok) {
-        fprintf(stderr, "usage: tools/verify/tree_closure_probe.sh "
-                "/usr/bin/gcc -std=c2x|-std=c23\n");
+        fprintf(stderr, "usage: %s /usr/bin/gcc -std=c2x|-std=c23\n", g_name);
         return 2;
     }
-    g_cc = argv[1];
-    g_std = argv[2];
+    g_cc = argv[2];
+    g_std = argv[3];
     make_work();
     build_tools();
     stage_green();
