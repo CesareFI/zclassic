@@ -40,6 +40,11 @@ enum {
  * (caller-initialised or fresh) owns the parsed object; free it with
  * json_free. On failure returns false, leaves `out` JSON_NULL, and
  * `*why_out` (optional) names the first violated rule as a static string. */
+enum fleet_wiki_parse_status { FLEET_WIKI_PARSE_NOT_ENTRY,
+    FLEET_WIKI_PARSE_ENTRY, FLEET_WIKI_PARSE_ALLOC_FAILED };
+enum fleet_wiki_parse_status fleet_wiki_entry_parse_checked(
+    const char *, size_t, struct json_value *, const char **);
+
 bool fleet_wiki_entry_parse(const char *text, size_t len,
                             struct json_value *out, const char **why_out);
 
@@ -48,5 +53,14 @@ bool fleet_wiki_entry_parse(const char *text, size_t len,
  * matches every entry. */
 bool fleet_wiki_entry_matches(const struct json_value *entry,
                               const char *needle);
+
+struct fleet_wiki_entry_query {
+    const char *q;
+    const char *topic;
+    const char *applies_to;
+};
+bool fleet_wiki_entry_query_matches(const struct json_value *,
+    const struct fleet_wiki_entry_query *);
+
 
 #endif

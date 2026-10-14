@@ -206,6 +206,32 @@ int db_fleet_board_list(struct node_db *ndb,
 bool db_fleet_board_wiki_read(struct node_db *ndb, const char *slug,
                               struct db_fleet_board_post *out);
 
+enum fleet_wiki_query_status {
+    FLEET_WIKI_QUERY_DONE, FLEET_WIKI_QUERY_PAGE,
+    FLEET_WIKI_QUERY_VERIFY_BUDGET, FLEET_WIKI_QUERY_STORAGE,
+    FLEET_WIKI_QUERY_VISITOR_FAILED
+};
+struct fleet_wiki_query_progress {
+    enum fleet_wiki_query_status status;
+    unsigned scanned, verified;
+    char after_slug[FLEET_BOARD_SLUG_MAX + 1];
+    char blocked_slug[FLEET_BOARD_SLUG_MAX + 1];
+};
+enum fleet_wiki_visit_result { FLEET_WIKI_VISIT_CONTINUE,
+    FLEET_WIKI_VISIT_PAGE, FLEET_WIKI_VISIT_FAILED };
+typedef enum fleet_wiki_visit_result (*fleet_wiki_visit_fn)(void *,
+    const struct db_fleet_board_post *);
+
+/* PAGE stops before an unaccepted slug. after_slug is the last fully examined
+ * slug (exclusive); scanned counts completed slugs, verified counts attempted
+ * revision checks including corrupt rows. VERIFY_BUDGET leaves blocked_slug
+ * unresolved and must not skip it or claim absence. Repeating unchanged input
+ * need not progress; the separate exact slug read has its existing contract.
+ * Observations are latest-held, not a snapshot or global completeness proof. */
+bool db_fleet_board_wiki_query(struct node_db *, const char *after_slug,
+    fleet_wiki_visit_fn, void *, struct fleet_wiki_query_progress *);
+
+
 /* One row per slug: the latest revision of every page. */
 int db_fleet_board_wiki_list(struct node_db *ndb,
                              struct db_fleet_board_post *out, size_t max);

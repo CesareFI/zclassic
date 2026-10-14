@@ -227,3 +227,60 @@ With the required fixture environment explicitly provided, independent focused
 runs passed guest image admission, GELI volume and FreeBSD ports, each with
 zero failures, skips and unobserved legs. These reruns do not replace the
 full release gate and do not qualify native fleet SSH or production activation.
+
+## Bounded wiki retrieval and indexed queries
+
+The source now has exact retained-revision body chunks on `fleet wiki read
+--id=<revision>`: hex bytes, offsets, total length and signed metadata. Numeric
+`signed_scope` and raw `signed_room` preserve the existing codec's version and
+signed bytes. Reconstruct the complete post and independently verify its ID and
+signature; a chunk alone is a partial observation. A missing, evicted, corrupt
+or non-wiki revision refuses. Legacy slug reads retain their full projection.
+The intermediate Mac candidate passed the three focused wiki/catalog/gateway
+groups without skips; that observation does not qualify the later query changes.
+
+Schema migration 87 adds a SQLite index on `(kind,slug,created_at DESC,id DESC)`
+in the existing signed board database. The typed query traverses distinct slugs
+with exclusive keyset seeks and preserves newest-verifying revision fallback,
+including the rule that a valid plain-text winner suppresses older structured
+knowledge. This accelerates revision traversal; it is not a full-text index.
+No second ledger, scheduler, retention lease or new publication authority exists.
+
+`fleet wiki find` combines the existing ASCII-insensitive substring `q` with
+optional exact `topic` and `applies_to` filters by AND. Continue with `after_slug`
+and unchanged filters; observations are latest-held, not a snapshot. Each call
+verifies at most 256 revisions. `verification_budget` leaves `blocked_slug`
+unresolved without skipping it or claiming absence; unchanged retries need not
+make progress. The separate exact slug read retains its existing contract.
+Compact results always identify exact revisions; omission flags distinguish
+summaries or rule lines left out to fit. Read the exact ID for the full content.
+Native responses default to 4096 bytes, honor a 2048-byte minimum and cap at
+8192. The evidence-scoped steering wrapper reserves its outer metadata and
+requires at least 3072 bytes; it forwards the same optional filters and cursor.
+Its gateway tool continues to require a nonempty `q` and the evidence scope.
+
+Qualification measures actual SQLite VM steps and statement launches against
+the previous duplicate-history traversal, and checks late-alphabet continuation,
+corrupt newest revisions, tied IDs, filter composition, SQL interruption,
+migration refusal and serialized response budgets. These source tests are
+pending for the combined candidate at this point; no deployment or live plugin
+readiness follows from the implementation. The retained plugin preview is an
+artifact, not an installed or authenticated runtime.
+
+A later authenticated native MCP observation exposed five tools, including
+`wiki_find` and `steer_deliver`; a protected `q=tunnel` lookup succeeded at
+observed Unix time 1791937981. The observed caller holds brief/send/evidence,
+so visibility supplies neither deliver nor wiki-write authority. Topic,
+applicability and cursor extensions above remain local candidate behavior.
+A peer reported activation of gateway/CLI commit 9c7adf8 and 46 isolated checks,
+with receipt SHA256
+5d2f93485f9e69b2ec082ee4b024f59554176504ace2ded914436757d38b376e;
+that receipt's bytes have not been independently inspected here. This and one
+successful lookup do not establish fleet-wide readiness. Keep brief receive
+cursors separate from send acknowledgments and check bounded stream coverage.
+
+Qualification lesson: check the cheap file-size ceiling and lint-fast alongside
+complexity and scoped syntax before expensive source-bound builds. The wiki
+query was moved into the existing read-only wiki model sibling after the first
+final lint exposed the store's hard line limit; earlier runtime PASS remains
+intermediate evidence until the exact split is requalified.

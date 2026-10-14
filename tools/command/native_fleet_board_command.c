@@ -643,12 +643,48 @@ void zcl_native_handle_fleet_wiki_write(
 }
 
 /* ── fleet wiki read ────────────────────────────────────────────────── */
+static bool fb_chunk_values(const struct json_value *input,
+                            int64_t *offset, int64_t *bytes)
+{
+    const struct json_value *o = json_get(input, "offset");
+    const struct json_value *n = json_get(input, "bytes");
+    if ((o && o->type != JSON_INT) || (n && n->type != JSON_INT))
+        return false;
+    *offset = o ? json_get_int(o) : 0;
+    *bytes = n ? json_get_int(n) : 1024;
+    return *offset >= 0 && *offset <= 16384 && *bytes >= 1 && *bytes <= 1024;
+}
+
+static bool fb_wiki_chunk_request(const struct zcl_command_request *request,
+                                  struct zcl_command_reply *reply,
+                                  struct json_value *out)
+{
+    int64_t offset, bytes;
+    size_t cap = request->spec && request->spec->budget_bytes > 0
+        ? (size_t)request->spec->budget_bytes : ZCL_COMMAND_RESULT_BUDGET;
+    if (request->budget_bytes && request->budget_bytes < cap)
+        cap = request->budget_bytes;
+    if (!fb_chunk_values(request->input, &offset, &bytes) || cap < 2048 ||
+        json_get(request->input, "slug")) {
+        fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+            "BAD_CHUNK", "normalize", false,
+            "offset must be 0..16384, bytes 1..1024; chunks require a response budget of at least 2048", "id,offset,bytes");
+        return false;
+    }
+    fb_forward_str(out, request->input, "id", NULL);
+    (void)json_push_kv_int(out, "offset", offset);
+    (void)json_push_kv_int(out, "bytes", bytes);
+    (void)json_push_kv_int(out, "response_budget", (int64_t)cap);
+    return true;
+}
+
 void zcl_native_handle_fleet_wiki_read(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply)
 {
     const char *slug = json_get_str(json_get(request->input, "slug"));
-    if (!slug || !slug[0]) {
+    bool chunk = json_get(request->input, "id") != NULL;
+    if (!chunk && (!slug || !slug[0])) {
         fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
                 "MISSING_SLUG", "normalize", false,
                 "usage: fleet wiki read <slug>", "slug");
@@ -658,7 +694,21 @@ void zcl_native_handle_fleet_wiki_read(
     json_init(&out);
     json_set_object(&out);
     (void)json_push_kv_str(&out, "op", "wiki_read");
-    (void)json_push_kv_str(&out, "slug", slug);
+    if (chunk) {
+        if (!fb_wiki_chunk_request(request, reply, &out)) {
+            json_free(&out);
+            return;
+        }
+    } else {
+        if (json_get(request->input, "offset") || json_get(request->input, "bytes")) {
+            fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+                "MISSING_ID", "normalize", false,
+                "byte chunks require an exact revision id", "id");
+            json_free(&out);
+            return;
+        }
+        (void)json_push_kv_str(&out, "slug", slug);
+    }
 
     struct json_value body;
     json_init(&body);
@@ -722,6 +772,25 @@ void zcl_native_handle_fleet_wiki_history(
 }
 
 /* ── fleet wiki find ────────────────────────────────────────────────── */
+static bool fb_wiki_find_request(const struct zcl_command_request *request,
+    struct zcl_command_reply *reply, struct json_value *out)
+{
+    size_t budget = request->budget_bytes ? request->budget_bytes : 4096;
+    if (budget > 8192) budget = 8192;
+    if (budget < 2048) {
+        fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+            "QUERY_BUDGET", "normalize", false,
+            "wiki queries require at least 2048 response bytes", "budget_bytes");
+        return false;
+    }
+    fb_forward_str(out, request->input, "q", NULL);
+    fb_forward_str(out, request->input, "topic", NULL);
+    fb_forward_str(out, request->input, "applies_to", NULL);
+    fb_forward_str(out, request->input, "after_slug", NULL);
+    (void)json_push_kv_int(out, "response_budget", (int64_t)budget);
+    return true;
+}
+
 void zcl_native_handle_fleet_wiki_find(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply)
@@ -730,7 +799,10 @@ void zcl_native_handle_fleet_wiki_find(
     json_init(&out);
     json_set_object(&out);
     (void)json_push_kv_str(&out, "op", "wiki_find");
-    fb_forward_str(&out, request->input, "q", NULL);
+    if (!fb_wiki_find_request(request, reply, &out)) {
+        json_free(&out);
+        return;
+    }
 
     struct json_value body;
     json_init(&body);
@@ -738,8 +810,27 @@ void zcl_native_handle_fleet_wiki_find(
     json_free(&out);
     if (!ok)
         return;
+    bool advanced = json_get(request->input, "topic") ||
+        json_get(request->input, "applies_to") || json_get(request->input, "after_slug");
+    if (advanced && strcmp(json_get_str(json_get(&body, "query_schema")),
+                            "zcl.fleet_wiki_query.v1")) {
+        fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
+            "WIKI_QUERY_UNAVAILABLE", "execute", false,
+            "the selected node does not report the bounded query contract", "query_schema");
+        json_free(&body);
+        return;
+    }
     fb_project_object(reply, &body);
     json_free(&body);
-    (void)zcl_command_reply_add_next(reply, "fleet.wiki.read", "{}",
-                                     "read one page in full");
+    const char *id = json_get_str(json_get(json_at(json_get(&reply->data,
+        "entries"), 0), "id"));
+    bool valid_id = strlen(id) == 64;
+    for (size_t i = 0; valid_id && i < 64; i++)
+        valid_id = (id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f');
+    if (valid_id) {
+        char input[96];
+        (void)snprintf(input, sizeof(input), "{\"id\":\"%s\"}", id);
+        (void)zcl_command_reply_add_next(reply, "fleet.wiki.read", input,
+            "read exact revision body chunks and verify the reconstructed post");
+    }
 }

@@ -5802,9 +5802,35 @@ static bool fmc_wiki_identity(const struct json_value *discovery)
     const struct json_value *entries = json_get(discovery, "entries");
     if (!schema || strcmp(schema, FLEET_WIKI_DISCOVERY_IDENTITY_SCHEMA) ||
         !entries || entries->type != JSON_ARR || json_size(entries) > 8 ||
-        json_write(discovery, NULL, 0) > 16 * 1024) return false;
+        json_write(discovery, NULL, 0) > 8192) return false;
     for (size_t i = 0; i < json_size(entries); i++)
         if (!fmc_wiki_identity_item(json_at(entries, i))) return false;
+    return true;
+}
+
+static bool fmc_wiki_query_prepare(struct fmc_sub *sub,
+    const struct zcl_command_request *req, struct zcl_command_reply *reply)
+{
+    size_t budget = req->budget_bytes ? req->budget_bytes : 4096;
+    if (budget > 8192) budget = 8192;
+    if (budget < 3072) {
+        fmc_fail(reply, "QUERY_BUDGET", "wiki wrapper requires at least 3072 response bytes", "budget_bytes");
+        return false;
+    }
+    sub->request.budget_bytes = budget - 1024;
+    const char *const keys[] = {"topic", "applies_to", "after_slug"};
+    for (size_t i = 0; i < 3; i++) {
+        const struct json_value *v = json_get(req->input, keys[i]);
+        if (!v) continue;
+        if (v->type != JSON_STR || strlen(json_get_str(v)) > 64) {
+            fmc_fail(reply, "BAD_INPUT", "query filters and cursor must be strings of at most 64 bytes", keys[i]);
+            return false;
+        }
+        if (!json_push_kv(&sub->input, keys[i], v)) {
+            fmc_fail(reply, "ALLOC_FAILED", "query filters could not be copied", keys[i]);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -5823,6 +5849,10 @@ static void fmc_do_wiki_find(const struct zcl_command_request *req,
         fmc_sub_end(&sub);
         return;
     }
+    if (!fmc_wiki_query_prepare(&sub, req, reply)) {
+        fmc_sub_end(&sub);
+        return;
+    }
     zcl_native_handle_fleet_wiki_find(&sub.request, &sub.reply);
     sub.ran = true;
     if (!fmc_sub_ok(&sub)) {
@@ -5830,6 +5860,9 @@ static void fmc_do_wiki_find(const struct zcl_command_request *req,
     } else if (!fmc_wiki_identity(&sub.reply.data)) {
         fmc_fail(reply, "WIKI_CAPABILITY_UNAVAILABLE",
             "the selected node lacks exact wiki revision identity", "fleet.wiki.find identity_schema");
+    } else if (json_write(&sub.reply.data, NULL, 0) > sub.request.budget_bytes - 768) {
+        fmc_fail(reply, "WIKI_BUDGET_EXCEEDED",
+            "the selected node exceeded the bounded nested query budget", "fleet.wiki.find response_budget");
     } else {
         bool ok = json_push_kv(&reply->data, "discovery", &sub.reply.data) &&
             json_push_kv_int(&reply->data, "observed_at", (int64_t)platform_time_wall_time_t()) &&
@@ -5849,7 +5882,7 @@ void zcl_native_handle_fleet_steer_wiki_find(
     const struct zcl_command_request *request, struct zcl_command_reply *reply)
 {
     fmc_enter(request, reply, "evidence",
-              "fleet.steer.wiki-find takes grant,q", fmc_do_wiki_find);
+              "fleet.steer.wiki-find takes grant,q,topic,applies_to,after_slug", fmc_do_wiki_find);
 }
 
 void zcl_native_handle_fleet_steer_grant(

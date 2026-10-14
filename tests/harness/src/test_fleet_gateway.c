@@ -790,6 +790,14 @@ static int gw_t_handshake(void)
         ASSERT(send_description && strstr(send_description,
             "acceptance records delivery intent, not worker execution or completion"));
         const struct json_value *brief = json_at(tools, 0);
+        const struct json_value *wiki_schema = json_get(json_at(tools, 4), "inputSchema");
+        const struct json_value *wiki_properties = json_get(wiki_schema, "properties");
+        const char *const wiki_filters[] = {"topic", "applies_to", "after_slug"};
+        for (size_t i = 0; i < 3; i++) {
+            const struct json_value *property = json_get(wiki_properties, wiki_filters[i]);
+            ASSERT_STR_EQ(json_get_str(json_get(property, "type")), "string");
+            ASSERT_EQ(json_get_int(json_get(property, "maxLength")), 64);
+        }
         ASSERT_STR_EQ(json_get_str(json_get(brief, "name")), "steer_brief");
         const struct json_value *annotations = json_get(brief, "annotations");
         ASSERT(annotations && json_get_bool(json_get(annotations, "readOnlyHint")));
@@ -4035,8 +4043,8 @@ static int gw_t_wiki_find(void)
         char gid[64], wrong[64], args[256]; int st = 0;
         ASSERT(gw_mint(node, "evidence", gid));
         ASSERT(gw_mint(node, "brief", wrong));
-        ASSERT(gw_wiki_probe(wrong, ",\"q\":\"kernel\"", "STEER_GRANT_SCOPE"));
-        ASSERT(gw_wiki_probe(gid, ",\"q\":\"kernel\"", "WIKI_UNAVAILABLE"));
+        ASSERT(gw_wiki_probe(wrong, ",\"q\":\"kernel\",\"topic\":\"kernel\",\"applies_to\":\"z23\",\"after_slug\":\"a\"", "STEER_GRANT_SCOPE"));
+        ASSERT(gw_wiki_probe(gid, ",\"q\":\"kernel\",\"topic\":\"kernel\",\"applies_to\":\"z23\",\"after_slug\":\"a\"", "WIKI_UNAVAILABLE"));
         int sn = snprintf(args, sizeof(args), "{\"action\":\"revoke\",\"id\":\"%s\"}", gid);
         ASSERT(sn > 0 && (size_t)sn < sizeof(args));
         body = gw_node_run(node, "grant", args); ASSERT(body != NULL);

@@ -135,24 +135,40 @@ static const char *entry_violation(const struct json_value *root)
     return NULL;
 }
 
-bool fleet_wiki_entry_parse(const char *text, size_t len,
-                            struct json_value *out, const char **why_out)
+enum fleet_wiki_parse_status fleet_wiki_entry_parse_checked(
+    const char *text, size_t len, struct json_value *out, const char **why_out)
 {
-    if (!text || !out)
-        return entry_fail(why_out, "no entry text");
+    if (why_out) *why_out = NULL;
+    if (!text || !out) {
+        (void)entry_fail(why_out, "no entry text or output");
+        return FLEET_WIKI_PARSE_NOT_ENTRY;
+    }
     json_init(out);
-    if (len == 0 || text[0] != '{' || !json_read(out, text, len)) {
-        json_free(out);
-        json_init(out);
-        return entry_fail(why_out, "entry is not a JSON object");
+    if (len == 0 || text[0] != '{' || !json_valid(text, len)) {
+        (void)entry_fail(why_out, "entry is not a JSON object");
+        return FLEET_WIKI_PARSE_NOT_ENTRY;
+    }
+    /* json_valid and json_read share grammar: valid bytes that cannot be
+     * materialized are allocation failure, never evidence of absent knowledge. */
+    if (!json_read(out, text, len)) {
+        json_free(out); json_init(out);
+        (void)entry_fail(why_out, "entry allocation failed");
+        return FLEET_WIKI_PARSE_ALLOC_FAILED;
     }
     const char *why = entry_violation(out);
     if (why) {
-        json_free(out);
-        json_init(out);
-        return entry_fail(why_out, why);
+        json_free(out); json_init(out);
+        (void)entry_fail(why_out, why);
+        return FLEET_WIKI_PARSE_NOT_ENTRY;
     }
-    return true;
+    return FLEET_WIKI_PARSE_ENTRY;
+}
+
+bool fleet_wiki_entry_parse(const char *text, size_t len,
+                            struct json_value *out, const char **why_out)
+{
+    return fleet_wiki_entry_parse_checked(text, len, out, why_out) ==
+        FLEET_WIKI_PARSE_ENTRY;
 }
 
 static unsigned char ascii_fold(unsigned char c)
@@ -192,4 +208,24 @@ bool fleet_wiki_entry_matches(const struct json_value *entry,
         if (contains_folded(json_get_str(json_at(applies, i)), needle))
             return true;
     return false;
+}
+
+static bool wiki_query_applies(const struct json_value *entry, const char *exact)
+{
+    if (!exact || !exact[0]) return true;
+    const struct json_value *applies = json_get(entry, "applies_to");
+    for (size_t i = 0; i < json_size(applies); i++) {
+        if (!strcmp(json_get_str(json_at(applies, i)), exact)) return true;
+    }
+    return false;
+}
+
+bool fleet_wiki_entry_query_matches(const struct json_value *entry,
+    const struct fleet_wiki_entry_query *query)
+{
+    if (!entry || !query || !query->q) return false;
+    if (query->topic && query->topic[0] &&
+        strcmp(json_get_str(json_get(entry, "topic")), query->topic)) return false;
+    return wiki_query_applies(entry, query->applies_to) &&
+        fleet_wiki_entry_matches(entry, query->q);
 }

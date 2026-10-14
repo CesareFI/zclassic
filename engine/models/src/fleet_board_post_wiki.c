@@ -1,6 +1,6 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * Fleet board store: the wiki budget's read-only half. The per-key wiki
+ * Fleet board store: bounded wiki reads and the wiki budget's read-only half. The per-key wiki
  * ceilings (and the test seam that lowers them), the decision under the
  * board write lock of whether a key at its stored ceiling may replace one of
  * its own superseded revisions, and the bound that keeps all wiki rows
@@ -12,6 +12,8 @@
 #include "models/fleet_board_post.h"
 #include "models/fleet_board_post_internal.h"
 
+#include "models/model_fields.h"
+#include "models/def/fleet_board_post_fields.def"
 #include "models/activerecord.h"
 #include "models/query_builder.h"
 #include "util/log_macros.h"
@@ -223,3 +225,134 @@ void db_fleet_board_test_reset_wiki_evictions(void)
     s_evict_next = 0;
 }
 #endif
+
+struct fleet_board_slug_ref {
+    char slug[FLEET_BOARD_SLUG_MAX + 1];
+};
+#define FB_QB_SLUG_COLUMN(kind, col, member, extra) \
+    ZCL_MF_CAT(QB_C_fleet_board_posts_, col),
+static const enum qb_column k_board_slug_cols[] = {
+    ZCL_MODEL_EXPAND(FB_QB_SLUG_COLUMN, FLEET_BOARD_SLUG_FIELDS)
+};
+#define BOARD_SLUG_NCOLS \
+    (sizeof(k_board_slug_cols) / sizeof(k_board_slug_cols[0]))
+ZCL_MODEL_READ_ROW_FN(board_read_slug_ref, struct fleet_board_slug_ref,
+                      FLEET_BOARD_SLUG_FIELDS)
+
+static int board_wiki_next_slug(struct node_db *ndb, const char *after,
+                                char slug[FLEET_BOARD_SLUG_MAX + 1])
+{
+    struct qb q;
+    qb_select(&q, QB_T_fleet_board_posts);
+    qb_select_columns(&q, k_board_slug_cols, BOARD_SLUG_NCOLS);
+    qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ, FLEET_BOARD_KIND_WIKI);
+    if (after[0])
+        qb_where_text(&q, QB_C_fleet_board_posts_slug, QB_GT, after);
+    qb_order_by(&q, QB_C_fleet_board_posts_slug, QB_ASC);
+    qb_limit(&q, 1);
+    sqlite3_stmt *s = NULL;
+    if (!QB_PREPARE(ndb, &q, s)) {
+        LOG_WARN("fleet.board", "wiki slug seek prepare failed: %s", qb_error(&q));
+        return -1;
+    }
+    bool found = AR_STEP_ROW(s);
+    if (found) {
+        struct fleet_board_slug_ref row;
+        board_read_slug_ref(&row, s);
+        (void)snprintf(slug, FLEET_BOARD_SLUG_MAX + 1, "%s", row.slug);
+    }
+    bool healthy = found || sqlite3_reset(s) == SQLITE_OK;
+    sqlite3_finalize(s);
+    if (healthy) return found ? 1 : 0;
+    LOG_WARN("fleet.board", "wiki slug seek failed: %s", sqlite3_errmsg(ndb->db));
+    return -1;
+}
+
+/* Same newest-verifying rule as wiki_read, with an explicit bound on this
+ * query's total cryptographic revision reads. Plain text is still a winner. */
+static enum fleet_wiki_query_status board_wiki_query_latest(
+    struct node_db *ndb, const char *slug, unsigned *verified,
+    struct db_fleet_board_post *out, bool *found)
+{
+    *found = false;
+    struct qb q;
+    fleet_board_select_row(&q);
+    qb_where_int(&q, QB_C_fleet_board_posts_kind, QB_EQ, FLEET_BOARD_KIND_WIKI);
+    qb_where_text(&q, QB_C_fleet_board_posts_slug, QB_EQ, slug);
+    qb_order_by(&q, QB_C_fleet_board_posts_created_at, QB_DESC);
+    qb_order_by(&q, QB_C_fleet_board_posts_id, QB_DESC);
+    sqlite3_stmt *s = NULL;
+    if (!QB_PREPARE(ndb, &q, s)) {
+        LOG_WARN("fleet.board", "wiki revision seek prepare failed slug=%s: %s", slug, qb_error(&q));
+        return FLEET_WIKI_QUERY_STORAGE;
+    }
+    enum fleet_wiki_query_status status = FLEET_WIKI_QUERY_DONE;
+    for (;;) {
+        if (!AR_STEP_ROW(s)) {
+            if (sqlite3_reset(s) != SQLITE_OK) {
+                LOG_WARN("fleet.board", "wiki revision seek failed slug=%s: %s",
+                    slug, sqlite3_errmsg(ndb->db));
+                status = FLEET_WIKI_QUERY_STORAGE;
+            }
+            break;
+        }
+        if (*verified >= FLEET_BOARD_LIST_MAX) {
+            status = FLEET_WIKI_QUERY_VERIFY_BUDGET;
+            break;
+        }
+        (*verified)++;
+        if (fleet_board_row_read(s, out)) {
+            *found = true;
+            break;
+        }
+    }
+    sqlite3_finalize(s);
+    return status;
+}
+
+static bool board_wiki_query_arguments(struct node_db *ndb, const char *after,
+    fleet_wiki_visit_fn visit, struct fleet_wiki_query_progress *progress)
+{
+    if (!ndb || !ndb->open || !after || !visit || !progress)
+        LOG_RETURN(false, "fleet.board", "wiki query requires an open DB, cursor, visitor and progress");
+    if (after[0] && !fleet_board_slug_valid(after))
+        LOG_RETURN(false, "fleet.board", "wiki query cursor is not a valid slug");
+    return true;
+}
+
+bool db_fleet_board_wiki_query(struct node_db *ndb, const char *after,
+    fleet_wiki_visit_fn visit, void *context,
+    struct fleet_wiki_query_progress *progress)
+{
+    if (!board_wiki_query_arguments(ndb, after, visit, progress)) return false;
+    memset(progress, 0, sizeof(*progress));
+    (void)snprintf(progress->after_slug, sizeof(progress->after_slug), "%s", after);
+    while (progress->scanned < FLEET_BOARD_LIST_MAX) {
+        char slug[FLEET_BOARD_SLUG_MAX + 1];
+        int next = board_wiki_next_slug(ndb, progress->after_slug, slug);
+        if (next < 0) { progress->status = FLEET_WIKI_QUERY_STORAGE; return false; }
+        if (next == 0) return true;
+        struct db_fleet_board_post row;
+        bool found;
+        progress->status = board_wiki_query_latest(ndb, slug,
+            &progress->verified, &row, &found);
+        if (progress->status != FLEET_WIKI_QUERY_DONE) {
+            (void)snprintf(progress->blocked_slug, sizeof(progress->blocked_slug), "%s", slug);
+            return progress->status != FLEET_WIKI_QUERY_STORAGE;
+        }
+        enum fleet_wiki_visit_result accepted = FLEET_WIKI_VISIT_CONTINUE;
+        if (found) accepted = visit(context, &row);
+        if (accepted == FLEET_WIKI_VISIT_FAILED) {
+            progress->status = FLEET_WIKI_QUERY_VISITOR_FAILED;
+            return false;
+        }
+        if (accepted == FLEET_WIKI_VISIT_PAGE) {
+            progress->status = FLEET_WIKI_QUERY_PAGE;
+            return true;
+        }
+        progress->scanned++;
+        (void)snprintf(progress->after_slug, sizeof(progress->after_slug), "%s", slug);
+    }
+    progress->status = FLEET_WIKI_QUERY_PAGE;
+    return true;
+}

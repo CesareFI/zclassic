@@ -76,8 +76,8 @@ static bool fb_bool(const struct json_value *in, const char *key)
 /* One post as a JSON object. Public projection: the host is rendered as its
  * full public key hex, because a board reader must be able to check a
  * signature themselves rather than trust this node's rendering of it. */
-static void fb_render_post(struct json_value *into,
-                           const struct db_fleet_board_post *row)
+static void fb_render_post_fields(struct json_value *into,
+                           const struct db_fleet_board_post *row, bool include_text)
 {
     char hex[65];
     fleet_board_id_to_hex(row->post.id, hex);
@@ -99,7 +99,8 @@ static void fb_render_post(struct json_value *into,
     if (row->post.scope != FLEET_BOARD_SCOPE_FLEET)
         (void)json_push_kv_str(into, "room",
                                fleet_board_room_name(&row->post));
-    (void)json_push_kv_str(into, "text", row->post.text);
+    if (include_text)
+        (void)json_push_kv_str(into, "text", row->post.text);
     (void)json_push_kv_int(into, "text_len", row->post.text_len);
     if (row->post.slug[0]) {
         (void)json_push_kv_str(into, "slug", row->post.slug);
@@ -111,6 +112,12 @@ static void fb_render_post(struct json_value *into,
         (void)json_push_kv_str(into, "receipt", row->post.receipt);
     (void)json_push_kv_int(into, "seq", row->seq);
     (void)json_push_kv_int(into, "received_at", row->received_at);
+}
+
+static void fb_render_post(struct json_value *into,
+                           const struct db_fleet_board_post *row)
+{
+    fb_render_post_fields(into, row, true);
 }
 
 static void fb_render_list(struct json_value *result,
@@ -534,9 +541,86 @@ static void fb_op_status(struct node_db *ndb, struct json_value *result,
     }
 }
 
+/* The body is hex so byte offsets may split UTF-8 without losing bytes.
+ * A chunk is a partial projection, never independently verified evidence. */
+static void fb_wiki_chunk_render(const struct db_fleet_board_post *row,
+                                 int64_t start, size_t count, size_t cap,
+                                 struct json_value *result)
+{
+    json_set_object(result);
+    json_push_kv_bool(result, "ok", true);
+    fb_render_post_fields(result, row, false);
+    json_push_kv_int(result, "signed_scope", row->post.scope);
+    json_push_kv_str(result, "signed_room", row->post.room);
+    json_push_kv_str(result, "representation", "zcl.fleet_wiki_body_chunk.v1");
+    json_push_kv_str(result, "verification", "reconstruct full signed post and verify id/signature; chunk alone is not verified evidence");
+    json_push_kv_int(result, "offset", start);
+    size_t base = json_write(result, NULL, 0);
+    /* Native bridge's envelope allowance plus chunk keys and integer digits.
+     * Refuse rather than omit fields needed for signed reconstruction. */
+    if (base + 896 >= cap) {
+        fb_error(result, "CHUNK_BUDGET", "signed metadata does not fit the response budget");
+        return;
+    }
+    size_t n = row->post.text_len - (size_t)start;
+    if (n > count) n = count;
+    size_t room = (cap - base - 896) / 2;
+    if (n > room) n = room;
+    char data[2049];
+    zcl_hex_encode((const uint8_t *)row->post.text + start, n, data);
+    json_push_kv_str(result, "data_hex", data);
+    json_push_kv_int(result, "next_offset", start + (int64_t)n);
+    json_push_kv_bool(result, "complete", start + (int64_t)n == row->post.text_len);
+}
+
+static void fb_op_wiki_chunk(struct node_db *ndb, const struct json_value *in,
+                             struct json_value *result)
+{
+    uint8_t id[32];
+    const char *hex = fb_str(in, "id", NULL);
+    if (!hex || !fleet_board_id_from_hex(hex, id)) {
+        fb_error(result, "BAD_ID", "id must be a 64-character revision id");
+        return;
+    }
+    int64_t start = fb_int(in, "offset", -1);
+    int64_t count = fb_int(in, "bytes", -1);
+    int64_t cap = fb_int(in, "response_budget", 4096);
+    const struct json_value *budget = json_get(in, "response_budget");
+    if (json_get(in, "slug") || (budget && budget->type != JSON_INT)) {
+        fb_error(result, "BAD_CHUNK", "exact id cannot be combined with slug; response budget must be an integer");
+        return;
+    }
+    if (start < 0 || count < 1 || count > 1024 || cap < 2048 || cap > 8192) {
+        fb_error(result, "BAD_CHUNK", "offset must be nonnegative, bytes 1..1024 and response budget 2048..8192");
+        return;
+    }
+    struct db_fleet_board_post row;
+    if (!db_fleet_board_post_find(ndb, id, &row)) {
+        fb_error(result, "NOT_FOUND", "no verifying retained revision with that id is held here");
+        return;
+    }
+    if (row.post.kind != FLEET_BOARD_KIND_WIKI) {
+        fb_error(result, "NOT_WIKI", "the exact revision is not a wiki page");
+        return;
+    }
+    if ((uint64_t)start > row.post.text_len) {
+        fb_error(result, "BAD_OFFSET", "offset exceeds the revision body length");
+        return;
+    }
+    fb_wiki_chunk_render(&row, start, (size_t)count, (size_t)cap, result);
+}
+
 static void fb_op_wiki_read(struct node_db *ndb, const struct json_value *in,
                             struct json_value *result)
 {
+    if (json_get(in, "id")) {
+        fb_op_wiki_chunk(ndb, in, result);
+        return;
+    }
+    if (json_get(in, "offset") || json_get(in, "bytes")) {
+        fb_error(result, "MISSING_ID", "byte chunks require an exact revision id");
+        return;
+    }
     const char *slug = fb_str(in, "slug", NULL);
     struct db_fleet_board_post row;
     if (!slug || !db_fleet_board_wiki_read(ndb, slug, &row)) {
@@ -589,123 +673,182 @@ static void fb_op_wiki_history(struct node_db *ndb,
     free(rows);
 }
 
-/* Most entries one wiki_find returns, and the byte budget of its answer. */
-enum {
-    FB_FIND_MAX_ENTRIES = 8,
-    FB_FIND_BUDGET_BYTES = 16 * 1024,
-    /* Reserved for the answer's own keys and the separators. */
-    FB_FIND_ENVELOPE_BYTES = 192,
-    FB_FIND_Q_MAX = 128,
+enum { FB_FIND_MAX_ENTRIES = 8, FB_FIND_Q_MAX = 128 };
+struct fb_find_query {
+    struct fleet_wiki_entry_query filters;
+    const char *after;
+    size_t budget;
+};
+struct fb_find_context {
+    struct fb_find_query query;
+    struct json_value entries;
+    size_t used;
+    unsigned returned;
 };
 
-/* The compact view of one matching entry: topic, summary, slug, updated and
- * the lessons' rule lines. Returns false when the row is not a valid entry
- * or does not match the lower-cased needle. */
-static bool fb_find_item(const struct db_fleet_board_post *row,
-                         const char *needle, struct json_value *item)
+static bool fb_find_string(const struct json_value *in, const char *key,
+                            size_t max, bool empty, const char **out)
 {
-    struct json_value entry;
-    if (!fleet_wiki_entry_parse(row->post.text, row->post.text_len, &entry,
-                                NULL))
-        return false;
-    bool match = fleet_wiki_entry_matches(&entry, needle);
-    if (match) {
-        json_set_object(item);
-        json_push_kv_str(item, "topic", json_get_str(json_get(&entry, "topic")));
-        json_push_kv_str(item, "summary",
-                         json_get_str(json_get(&entry, "summary")));
-        json_push_kv_str(item, "slug", row->post.slug);
-        char hex[65];
-        fleet_board_id_to_hex(row->post.id, hex);
-        json_push_kv_str(item, "id", hex);
-        fleet_board_id_to_hex(row->post.host_pubkey, hex);
-        json_push_kv_str(item, "host", hex);
-        json_push_kv_int(item, "created_at", (int64_t)row->post.created_at);
-        json_push_kv_int(item, "expires_at", row->expires_at);
-        json_push_kv_str(item, "updated",
-                         json_get_str(json_get(&entry, "updated")));
-        struct json_value rules;
-        json_init(&rules);
-        json_set_array(&rules);
-        const struct json_value *lessons = json_get(&entry, "lessons");
-        for (size_t i = 0; i < json_size(lessons); i++) {
-            struct json_value rule;
-            json_init(&rule);
-            json_set_str(&rule, json_get_str(json_get(json_at(lessons, i),
-                                                      "rule")));
-            (void)json_push_back(&rules, &rule);
-            json_free(&rule);
-        }
-        (void)json_push_kv(item, "rules", &rules);
-        json_free(&rules);
+    const struct json_value *v = json_get(in, key);
+    *out = v ? json_get_str(v) : "";
+    if (!v) return true;
+    if (v->type != JSON_STR || strlen(*out) > max) return false;
+    if (!empty && !(*out)[0]) return false;
+    if (empty) return true;
+    for (size_t i = 0; (*out)[i]; i++) {
+        unsigned char c = (unsigned char)(*out)[i];
+        if (c < 0x20 || c == 0x7f) return false;
     }
-    json_free(&entry);
-    return match;
+    return true;
 }
 
-/* Appends matching entries to `arr` until the entry cap or the byte budget
- * is reached. Returns true when a match was left out. The budget starts at
- * the envelope's own reserve so the whole answer stays inside it. */
-static bool fb_find_collect(const struct db_fleet_board_post *rows, int n,
-                            const char *needle, struct json_value *arr,
-                            int64_t *returned)
+static bool fb_find_query_read(const struct json_value *in,
+                               struct fb_find_query *q)
 {
-    size_t used = FB_FIND_ENVELOPE_BYTES;
-    for (int i = 0; i < n; i++) {
+    const struct json_value *cap = json_get(in, "response_budget");
+    int64_t budget = fb_int(in, "response_budget", 4096);
+    if (cap && cap->type != JSON_INT) return false;
+    if (budget < 2048 || budget > 8192) return false;
+    q->budget = (size_t)budget;
+    if (!fb_find_string(in, "q", 128, true, &q->filters.q) ||
+        !fb_find_string(in, "topic", 64, false, &q->filters.topic) ||
+        !fb_find_string(in, "applies_to", 64, false, &q->filters.applies_to) ||
+        !fb_find_string(in, "after_slug", 64, true, &q->after)) return false;
+    if (q->filters.topic[0] && !fleet_board_slug_valid(q->filters.topic)) return false;
+    return !q->after[0] || fleet_board_slug_valid(q->after);
+}
+
+static bool fb_find_item_identity(const struct db_fleet_board_post *row,
+                                  const struct json_value *entry,
+                                  struct json_value *item)
+{
+    json_set_object(item);
+    char id[65], host[65];
+    fleet_board_id_to_hex(row->post.id, id);
+    fleet_board_id_to_hex(row->post.host_pubkey, host);
+    return json_push_kv(item, "topic", json_get(entry, "topic")) &&
+        json_push_kv_str(item, "slug", row->post.slug) &&
+        json_push_kv_str(item, "id", id) &&
+        json_push_kv_str(item, "host", host) &&
+        json_push_kv_int(item, "created_at", (int64_t)row->post.created_at) &&
+        json_push_kv_int(item, "expires_at", row->expires_at) &&
+        json_push_kv(item, "updated", json_get(entry, "updated"));
+}
+
+static bool fb_find_item_rules(const struct json_value *entry,
+                               struct json_value *item)
+{
+    struct json_value rules;
+    json_init(&rules); json_set_array(&rules);
+    const struct json_value *lessons = json_get(entry, "lessons");
+    bool ok = true;
+    for (size_t i = 0; ok && i < json_size(lessons); i++)
+        ok = json_push_back(&rules, json_get(json_at(lessons, i), "rule"));
+    if (ok) ok = json_push_kv(item, "rules", &rules);
+    json_free(&rules);
+    return ok;
+}
+
+static bool fb_find_item_project(const struct db_fleet_board_post *row,
+    const struct json_value *entry, unsigned mode, struct json_value *item)
+{
+    if (!fb_find_item_identity(row, entry, item)) return false;
+    if (mode < 2 && !json_push_kv(item, "summary", json_get(entry, "summary"))) return false;
+    if (mode == 0 && !fb_find_item_rules(entry, item)) return false;
+    return json_push_kv_bool(item, "rules_omitted", mode != 0) &&
+        json_push_kv_bool(item, "summary_omitted", mode == 2);
+}
+
+static enum fleet_wiki_visit_result fb_find_emit(struct fb_find_context *c,
+    const struct db_fleet_board_post *row, const struct json_value *entry)
+{
+    for (unsigned mode = 0; mode < 3; mode++) {
         struct json_value item;
         json_init(&item);
-        bool match = fb_find_item(&rows[i], needle, &item);
-        size_t size = match ? json_write(&item, NULL, 0) + 1 : 0;
-        bool full = match && (*returned >= FB_FIND_MAX_ENTRIES ||
-                              used + size > FB_FIND_BUDGET_BYTES);
-        if (match && !full) {
-            used += size;
-            (*returned)++;
-            (void)json_push_back(arr, &item);
+        if (!fb_find_item_project(row, entry, mode, &item)) {
+            json_free(&item);
+            return FLEET_WIKI_VISIT_FAILED;
+        }
+        size_t bytes = json_write(&item, NULL, 0) + 1;
+        if (c->used + bytes <= c->query.budget - 768) {
+            bool ok = json_push_back(&c->entries, &item);
+            json_free(&item);
+            if (!ok) return FLEET_WIKI_VISIT_FAILED;
+            c->used += bytes;
+            c->returned++;
+            return FLEET_WIKI_VISIT_CONTINUE;
         }
         json_free(&item);
-        if (full)
-            return true;
     }
-    return false;
+    return FLEET_WIKI_VISIT_PAGE;
 }
 
-/* Local, read-only, never waits on a peer: scans the newest revision of every
- * page this node holds (at most FLEET_BOARD_LIST_MAX pages, whoever signed
- * them) and returns at most FB_FIND_MAX_ENTRIES matching entries inside
- * FB_FIND_BUDGET_BYTES. `scanned` counts the pages examined; `truncated` is
- * set when a match was left out or the scan reached its page cap. */
+static enum fleet_wiki_visit_result fb_find_visit(void *context,
+    const struct db_fleet_board_post *row)
+{
+    struct fb_find_context *c = context;
+    if (c->returned >= FB_FIND_MAX_ENTRIES) return FLEET_WIKI_VISIT_PAGE;
+    struct json_value entry;
+    enum fleet_wiki_parse_status parsed = fleet_wiki_entry_parse_checked(
+        row->post.text, row->post.text_len, &entry, NULL);
+    if (parsed == FLEET_WIKI_PARSE_ALLOC_FAILED) return FLEET_WIKI_VISIT_FAILED;
+    if (parsed != FLEET_WIKI_PARSE_ENTRY) return FLEET_WIKI_VISIT_CONTINUE;
+    enum fleet_wiki_visit_result status = FLEET_WIKI_VISIT_CONTINUE;
+    if (fleet_wiki_entry_query_matches(&entry, &c->query.filters))
+        status = fb_find_emit(c, row, &entry);
+    json_free(&entry);
+    return status;
+}
+
+static bool fb_find_result_progress(struct json_value *result,
+    const struct fleet_wiki_query_progress *p)
+{
+    bool incomplete = p->status != FLEET_WIKI_QUERY_DONE;
+    return json_push_kv_int(result, "scanned", p->scanned) &&
+        json_push_kv_int(result, "verified", p->verified) &&
+        json_push_kv_bool(result, "truncated", incomplete) &&
+        json_push_kv_bool(result, "incomplete", incomplete) &&
+        json_push_kv_str(result, "after_slug", p->after_slug) &&
+        json_push_kv_str(result, "blocked_slug", p->blocked_slug) &&
+        json_push_kv_str(result, "reason", p->status == FLEET_WIKI_QUERY_VERIFY_BUDGET
+            ? "verification_budget; unresolved slug not skipped; use separate exact slug read"
+            : incomplete ? "page; resume after_slug with unchanged filters; no snapshot" : "exhausted");
+}
+
+static bool fb_find_result(struct json_value *result,
+    const struct fb_find_context *c, const struct fleet_wiki_query_progress *p)
+{
+    json_set_object(result);
+    return json_push_kv_bool(result, "ok", true) &&
+        json_push_kv_str(result, "identity_schema", FLEET_WIKI_DISCOVERY_IDENTITY_SCHEMA) &&
+        json_push_kv_str(result, "query_schema", "zcl.fleet_wiki_query.v1") &&
+        json_push_kv(result, "entries", &c->entries) &&
+        json_push_kv_int(result, "returned", c->returned) &&
+        fb_find_result_progress(result, p);
+}
+
 static void fb_op_wiki_find(struct node_db *ndb, const struct json_value *in,
                             struct json_value *result)
 {
-    const char *needle = fb_str(in, "q", "");
-    if (strlen(needle) > FB_FIND_Q_MAX) {
+    if (strlen(fb_str(in, "q", "")) > FB_FIND_Q_MAX) {
         fb_error(result, "Q_TOO_LONG", "q is over 128 bytes");
         return;
     }
-    struct db_fleet_board_post *rows = zcl_calloc(
-        FLEET_BOARD_LIST_MAX, sizeof(*rows), "fleet_board.rpc.wiki_find");
-    if (!rows) {
-        fb_error(result, "BOARD_ALLOC_FAILED",
-                 "the bounded wiki result snapshot could not be allocated");
+    struct fb_find_context c = {.used = 512};
+    if (!fb_find_query_read(in, &c.query)) {
+        fb_error(result, "BAD_QUERY", "q is at most 128 bytes; topic/applies_to at most 64 nonempty bytes; after_slug is a slug; response budget 2048..8192");
         return;
     }
-    int n = db_fleet_board_wiki_list(ndb, rows, FLEET_BOARD_LIST_MAX);
-    json_set_object(result);
-    json_push_kv_bool(result, "ok", true);
-    json_push_kv_str(result, "identity_schema", FLEET_WIKI_DISCOVERY_IDENTITY_SCHEMA);
-    struct json_value arr;
-    json_init(&arr);
-    json_set_array(&arr);
-    int64_t returned = 0;
-    bool left_out = fb_find_collect(rows, n, needle, &arr, &returned);
-    free(rows);
-    (void)json_push_kv(result, "entries", &arr);
-    json_free(&arr);
-    json_push_kv_int(result, "returned", returned);
-    json_push_kv_int(result, "scanned", n);
-    json_push_kv_bool(result, "truncated",
-                      left_out || n >= FLEET_BOARD_LIST_MAX);
+    json_init(&c.entries); json_set_array(&c.entries);
+    struct fleet_wiki_query_progress progress = {.status = FLEET_WIKI_QUERY_STORAGE};
+    bool ok = db_fleet_board_wiki_query(ndb, c.query.after, fb_find_visit, &c, &progress);
+    if (!ok) {
+        LOG_WARN("fleet.board", "wiki query failed status=%d", (int)progress.status);
+        fb_error(result, "QUERY_FAILED", "wiki query storage or projection failed; no exhaustion claimed");
+    }
+    else if (!fb_find_result(result, &c, &progress))
+        fb_error(result, "QUERY_ALLOC_FAILED", "wiki query response could not be allocated");
+    json_free(&c.entries);
 }
 
 /* The wiki ops. Returns false when `op` is not one of them. */

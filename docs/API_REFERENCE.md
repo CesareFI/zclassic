@@ -1839,9 +1839,9 @@ represented by its children's sections.
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
 | `fleet wiki write` | ready | mutate / app-write / operator · fast/low | **`slug`**, **`title`**, **`text`**, `agent`, `supersedes`, `ttl`, `format` | `zcl.fleet_board_post_id.v1` | `z23 fleet wiki write push-gate "What the push gate checks" @notes.md` | Write or revise one wiki page |
-| `fleet wiki read` | ready | read / read / operator · fast/low | **`slug`** | `zcl.fleet_board_post.v1` | `z23 fleet wiki read push-gate` | Read the latest revision of one page |
+| `fleet wiki read` | ready | read / read / operator · fast/low | **`slug`**, `id`, `offset`, `bytes` | `zcl.fleet_wiki_read.v1` | `z23 fleet wiki read push-gate` | Read the latest revision of one page |
 | `fleet wiki list` | ready | read / read / operator · fast/low | none | `zcl.fleet_board_list.v1` | `z23 fleet wiki list` | Every page this node holds |
-| `fleet wiki find` | ready | read / read / operator · foreground/low | `q` | `zcl.fleet_wiki_find.v1` | `z23 fleet wiki find push-gate` | Find structured knowledge entries |
+| `fleet wiki find` | ready | read / read / operator · foreground/low | `q`, `topic`, `applies_to`, `after_slug` | `zcl.fleet_wiki_find.v1` | `z23 fleet wiki find push-gate` | Find structured knowledge entries |
 | `fleet wiki history` | ready | read / read / operator · fast/low | **`slug`** | `zcl.fleet_board_list.v1` | `z23 fleet wiki history push-gate` | Every revision of one page, newest first |
 
 #### `fleet.ledger` — Write and inspect the ledger
@@ -1896,7 +1896,7 @@ represented by its children's sections.
 | `fleet steer brief` | ready | read / read / operator · fast/low | `grant`, `since`, `limit`, `json` | `zcl.fleet_steer_brief.v1` | `z23 fleet steer brief` | One-call fleet brief: tasks, workers, blockers, capacity, candidates |
 | `fleet steer send` | ready | mutate / dev-mutation / operator · fast/low | `grant`, **`items`**, `from` | `zcl.fleet_steer_send.v1` | `z23 fleet steer send --items=[...]` | One bounded batch of directives to named fleet agents |
 | `fleet steer evidence` | ready | read / read / operator · fast/low | `grant`, **`type`**, **`ref`**, `seq`, `attempt` | `zcl.fleet_steer_evidence.v1` | `z23 fleet steer evidence --type=mail --ref=<ref>` | One bounded evidence object by exact reference |
-| `fleet steer wiki-find` | ready | read / read / operator · foreground/low | `grant`, **`q`** | `zcl.fleet_steer_wiki_find.v1` | `z23 fleet steer wiki-find --q=kernel` | Discover bounded untrusted wiki knowledge |
+| `fleet steer wiki-find` | ready | read / read / operator · foreground/low | `grant`, **`q`**, `topic`, `applies_to`, `after_slug` | `zcl.fleet_steer_wiki_find.v1` | `z23 fleet steer wiki-find --q=kernel` | Discover bounded untrusted wiki knowledge |
 | `fleet steer deliver` | ready | mutate / dev-mutation / operator · fast/low | `grant`, **`from`**, **`ref`**, **`upload_id`**, **`name`**, **`size`**, **`sha3_512`**, **`offset`**, **`data_hex`** | `zcl.fleet_steer_deliver.v1` | `z23 fleet steer deliver --from=<label> --ref=<ref> --upload_id=<32 hex> ...` | Upload one C source file into the inert quarantine inbox |
 | `fleet steer inbox` | ready | read / read / operator · fast/low | `show` | `zcl.fleet_steer_inbox.v1` | `z23 fleet steer inbox [--show=<upload>]` | List quarantined uploads for the local reviewer |
 | `fleet steer drop` | ready | mutate / dev-mutation / **owner** · fast/low | **`upload`** | `zcl.fleet_steer_drop.v1` | `z23 fleet steer drop --upload=<identity>` | Remove one retained quarantine upload (owner cleanup) |
@@ -2028,7 +2028,6 @@ promise the same document shape.
 | `zcl.build_worker.v1` | `metaverse.build.worker.approve`, `metaverse.build.worker.revoke` |
 | `zcl.fleet_board_post_id.v1` | `fleet.board.post`, `fleet.wiki.write` |
 | `zcl.fleet_board_list.v1` | `fleet.board.list`, `fleet.wiki.list`, `fleet.wiki.history` |
-| `zcl.fleet_board_post.v1` | `fleet.board.show`, `fleet.wiki.read` |
 | `zcl.telemetry.alerts.v1` | `ops.telemetry.alerts.active`, `ops.telemetry.alerts.history` |
 | `zcl.telemetry.network.v1` | `ops.telemetry.network.summary`, `ops.telemetry.network.peers`, `ops.telemetry.network.tor`, `ops.telemetry.network.transport` |
 

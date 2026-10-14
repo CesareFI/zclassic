@@ -513,7 +513,8 @@ static int test_bf_proof_pending_migration(void)
         sqlite3 *raw = NULL;
         ASSERT(sqlite3_open(path, &raw) == SQLITE_OK);
         /* Simulate a crash after the first ALTER, before the second column
-         * and the v86 version stamp. Migration must finish on reopen. */
+         * and the v86 version stamp. Remove later migration artifacts too,
+         * so the ledger describes that interrupted state consistently. */
         ASSERT(sqlite3_exec(raw,
             "DROP TRIGGER trg_build_worker_proof_pending_shape;"
             "DROP TRIGGER trg_build_worker_proof_pending_insert;"
@@ -523,13 +524,22 @@ static int test_bf_proof_pending_migration(void)
             "DROP TRIGGER trg_build_worker_proof_pending_head;"
             "ALTER TABLE build_workers DROP COLUMN "
             "proof_pending_checkpoint_wire;"
-            "DELETE FROM schema_migrations WHERE version='086';"
+            "DROP INDEX idx_fleet_board_wiki_latest;"
+            "DELETE FROM schema_migrations "
+            "WHERE CAST(version AS INTEGER)>=86;"
             "UPDATE node_state SET value=X'55000000' "
             "WHERE key='schema_version'",
             NULL, NULL, NULL) == SQLITE_OK);
         ASSERT(sqlite3_close(raw) == SQLITE_OK);
         ASSERT(node_db_open(&ndb, path));
         ASSERT_EQ(node_db_schema_version(&ndb), NODE_DB_SCHEMA_LATEST);
+        sqlite3_stmt *index = NULL;
+        ASSERT(sqlite3_prepare_v2(ndb.db,
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND "
+            "name='idx_fleet_board_wiki_latest'", -1, &index, NULL) == SQLITE_OK);
+        ASSERT(sqlite3_step(index) == SQLITE_ROW); /* raw-sql-ok:test-readonly-count */
+        ASSERT_EQ(sqlite3_column_int(index, 0), 1);
+        sqlite3_finalize(index);
         struct db_build_worker worker;
         bf_worker(&worker);
         ASSERT(db_build_worker_save(&ndb, &worker));

@@ -739,6 +739,58 @@ static int t_v85_missing_worker_table_refuses(void)
     return failures;
 }
 
+static int db_mig_deny_wiki_index(void *unused, int action,
+    const char *first, const char *second, const char *database, const char *trigger)
+{
+    (void)unused; (void)second; (void)database; (void)trigger;
+    if (action == SQLITE_CREATE_INDEX && first &&
+        !strcmp(first, "idx_fleet_board_wiki_latest")) return SQLITE_DENY;
+    return SQLITE_OK;
+}
+
+static int t_v87_wiki_index_refuses_without_stamp(void)
+{
+    int failures = 0;
+    char dir[256], path[512];
+    db_mig_path(dir, sizeof(dir), "v87_wiki_index");
+    mkdir_p(dir);
+    (void)snprintf(path, sizeof(path), "%s/node.db", dir);
+    struct node_db db = {0};
+    bool opened = false;
+    TEST("db_mig: wiki index refusal preserves version and retry is idempotent") {
+        ASSERT(node_db_open(&db, path));
+        node_db_close(&db);
+        sqlite3 *raw = NULL;
+        ASSERT(sqlite3_open(path, &raw) == SQLITE_OK);
+        ASSERT(db_mig_stamp_schema(raw, 86));
+        ASSERT(db_mig_exec_raw(raw, "DELETE FROM schema_migrations WHERE version='087'"));
+        ASSERT(db_mig_exec_raw(raw, "DROP INDEX idx_fleet_board_wiki_latest"));
+        sqlite3_close(raw);
+        ASSERT(db_mig_open_raw_handle(&db, path)); opened = true;
+        ASSERT(sqlite3_set_authorizer(db.db, db_mig_deny_wiki_index, NULL) == SQLITE_OK);
+        int migrated = node_db_migrate(&db, NULL);
+        ASSERT(sqlite3_set_authorizer(db.db, NULL, NULL) == SQLITE_OK);
+        ASSERT_EQ(migrated, -1);
+        ASSERT_EQ(node_db_schema_version(&db), 86);
+        ASSERT_EQ(db_mig_count(db.db,
+            "SELECT count(*) FROM schema_migrations WHERE version='087'"), 0);
+        ASSERT(node_db_migrate(&db, NULL) > 0);
+        ASSERT_EQ(node_db_schema_version(&db), 87);
+        ASSERT_EQ(db_mig_count(db.db,
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_fleet_board_wiki_latest'"), 1);
+        ASSERT_EQ(db_mig_count(db.db,
+            "SELECT count(*) FROM schema_migrations WHERE version='087'"), 1);
+        ASSERT_EQ(node_db_migrate(&db, NULL), 0);
+        PASS();
+    } _test_next:;
+    if (opened) {
+        (void)sqlite3_set_authorizer(db.db, NULL, NULL);
+        db_mig_close_raw_handle(&db);
+    }
+    test_cleanup_tmpdir(dir);
+    return failures;
+}
+
 static int t_v20_wallet_notes_upgrade_adds_source(void)
 {
     int failures = 0;
@@ -1935,6 +1987,7 @@ int test_db_migration_idempotent(void)
     mkdir_p("./test-tmp");
     failures += t_fresh_reaches_latest();
     failures += t_v85_missing_worker_table_refuses();
+    failures += t_v87_wiki_index_refuses_without_stamp();
     failures += t_v20_wallet_notes_upgrade_adds_source();
     failures += t_reopen_is_idempotent();
     failures += t_market_content_registry_schema();

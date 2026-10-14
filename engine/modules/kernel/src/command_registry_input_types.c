@@ -353,9 +353,23 @@ static bool cr_match_vanity_ints(const char *path, const char *key,
  * limit is a string the default branch still types. `fleet.machines`
  * `offset` is an integer too; other leaves keep the string default so a
  * caller that already passes offset as text is unchanged. */
+static bool cr_match_wiki_chunk_ints(const char *path, const char *key,
+                                    const struct json_value *value, bool *type_ok)
+{
+    if (strcmp(path, "fleet.wiki.read") != 0) return false;
+    if (strcmp(key, "offset") == 0)
+        *type_ok = cr_int_range(value, 0, 16384);
+    else if (strcmp(key, "bytes") == 0)
+        *type_ok = cr_int_range(value, 1, 1024);
+    else return false;
+    return true;
+}
+
 static bool cr_match_leaf_ints(const char *path, const char *key,
                                const struct json_value *value, bool *type_ok)
 {
+    if (cr_match_wiki_chunk_ints(path, key, value, type_ok))
+        return true;
     if (cr_match_vanity_ints(path, key, value, type_ok))
         return true;
     if (strcmp(path, "dev.land") == 0 && strcmp(key, "wait_ms") == 0) {

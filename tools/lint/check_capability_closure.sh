@@ -186,6 +186,7 @@ cap_closure_coverage_applicable() {
         Darwin:platform/modules/platform/src/os_sandbox_landlock_linux.c|\
         Darwin:platform/modules/platform/src/os_sandbox_package_linux.c|\
         Darwin:platform/modules/util/src/self_backtrace.c|\
+        Darwin:tools/dev/wallet_gui_load.c|\
         Windows:platform/modules/platform/src/os_sandbox_linux.c|\
         Windows:platform/modules/platform/src/os_sandbox_landlock_linux.c|\
         Windows:platform/modules/platform/src/os_sandbox_package_linux.c|\
@@ -1410,6 +1411,7 @@ EOF
            "platform/modules/platform/src/os_sandbox_stub.c" ||
        ! cap_closure_coverage_applicable \
            "tests/harness/src/test_thread_qos.c" ||
+       ! cap_closure_coverage_applicable "tools/dev/wallet_gui_load.c" ||
        ! cap_closure_coverage_applicable "tools/rebuild_recent.c"; then
         echo "SELFTEST FAIL: L: Linux host-source selection or standalone rows drifted"
         rc=1
@@ -1420,7 +1422,8 @@ EOF
            cap_closure_coverage_applicable \
                "platform/modules/platform/src/os_sandbox_package_linux.c" ||
            cap_closure_coverage_applicable \
-               "platform/modules/util/src/self_backtrace.c"; then
+               "platform/modules/util/src/self_backtrace.c" ||
+           cap_closure_coverage_applicable "tools/dev/wallet_gui_load.c"; then
             echo "SELFTEST FAIL: L: Darwin host-source selection drifted"
             rc=1
         else

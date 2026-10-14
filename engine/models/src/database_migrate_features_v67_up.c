@@ -594,13 +594,32 @@ static int db_migrate_step_86(struct node_db *ndb, int *current_ver,
     return 0;
 }
 
-static int db_migrate_finish_86(struct node_db *ndb, int *current_ver,
+static int db_migrate_step_87(struct node_db *ndb, int *current_ver,
+                              int *floor_ver, int *applied)
+{
+    if (*current_ver >= 87) return 0;
+    if (!node_db_exec(ndb,
+            "CREATE INDEX IF NOT EXISTS idx_fleet_board_wiki_latest "
+            "ON fleet_board_posts(kind,slug,created_at DESC,id DESC)"))
+        LOG_RETURN(-1, "db", "migrate v87: wiki traversal index failed");
+    if (!node_db_exec(ndb,
+            "INSERT OR IGNORE INTO schema_migrations(version) VALUES('087')"))
+        LOG_RETURN(-1, "db", "migrate v87: migration stamp failed");
+    DB_MIGRATE_PERSIST_VERSION_FLOOR(ndb, 87, *floor_ver);
+    *current_ver = 87;
+    (*applied)++;
+    return 0;
+}
+
+static int db_migrate_finish_87(struct node_db *ndb, int *current_ver,
                                 int *floor_ver, int *applied,
                                 int *version_out, int *floor_out)
 {
     if (db_migrate_step_85(ndb, current_ver, floor_ver, applied) < 0)
         return DB_MIGRATE_SCHEMA_FAILED_PROPAGATE;
     if (db_migrate_step_86(ndb, current_ver, floor_ver, applied) < 0)
+        return DB_MIGRATE_SCHEMA_FAILED_PROPAGATE;
+    if (db_migrate_step_87(ndb, current_ver, floor_ver, applied) < 0)
         return DB_MIGRATE_SCHEMA_FAILED_PROPAGATE;
     *version_out = *current_ver;
     *floor_out = *floor_ver;
@@ -1009,6 +1028,6 @@ int node_db_migrate_features_v67_up(struct node_db *ndb, int *version,
     (void)db_migrate_step_82(ndb, &current_ver, &applied, floor_ver);
     (void)db_migrate_step_83(ndb, &current_ver, &floor_ver, &applied);
     (void)db_migrate_step_84(ndb, &current_ver, &floor_ver, &applied);
-    return db_migrate_finish_86(ndb, &current_ver, &floor_ver, &applied,
+    return db_migrate_finish_87(ndb, &current_ver, &floor_ver, &applied,
                                 version, floor);
 }
