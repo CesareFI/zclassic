@@ -1,6 +1,6 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * noise_transport — per-connection Noise_XX handshake driver + record wrapper that
+ * noise_transport — per-connection Noise_XXhfs handshake driver + record wrapper that
  * sits strictly BELOW p2p_node's message framing and ABOVE the raw socket. It
  * transforms bytes only: the plaintext handed up after decrypt is byte-identical
  * to what a v1 peer sent raw, and the ciphertext is produced from the exact
@@ -9,7 +9,7 @@
  * until -noisetransport negotiates) takes the exact v1 code path with zero added
  * hot-path branches. No consensus/relay/dispatch code observes transport mode.
  *
- * Layered over the Phase-0 session library (cognition/modules/session): Noise_XX handshake
+ * Layered over the Phase-0 session library (cognition/modules/session): Noise_XXhfs handshake
  * (noise_handshake.h) then a 3-byte-length ChaCha20-Poly1305 record layer
  * (session_transport.h). See docs/work/os/A4-noise-transport-p1.md and
  * docs/work/secure-transport-design.md. */
@@ -36,11 +36,12 @@ enum noise_hs_state {
     NOISE_FAILED,              /* abort: caller must drop the peer */
 };
 
-/* Prologue bytes bound into the Noise transcript on both sides. The VALUES
- * are wire-frozen: peers running pre-rename builds send and require exactly
- * 0x02 / 0x01 here. Only the macro NAMES carry the canonical "noise" name. */
-#define NOISE_TRANSPORT_VERSION_BYTE 0x02   /* wire-frozen value */
-#define NOISE_TRANSPORT_SUITE_ID     0x01   /* wire-frozen value */
+/* Prologue bytes bound into the Noise transcript on both sides. The wire
+ * changes with the hybrid suite (Noise XXhfs, X25519 + ML-KEM-768): peers
+ * running the classical XX suite bind 0x02 / 0x01 and fail the handshake
+ * against 0x03 / 0x02. The VALUES are wire-frozen for the hybrid suite. */
+#define NOISE_TRANSPORT_VERSION_BYTE 0x03   /* wire-frozen value */
+#define NOISE_TRANSPORT_SUITE_ID     0x02   /* wire-frozen value */
 #define NOISE_TRANSPORT_PROLOGUE_LEN 6   /* magic(4) | version(1) | suite(1) */
 
 /* Longest a Noise handshake may stay incomplete before the peer is dropped;

@@ -1,6 +1,6 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
  *
- * noise_transport — Noise_XX handshake driver + record wrapper over the Phase-0
+ * noise_transport — Noise_XXhfs handshake driver + record wrapper over the Phase-0
  * session library. See net/noise_transport.h for the contract and
  * docs/work/os/A4-noise-transport-p1.md for the design. All new transport logic
  * lives here; it is the taken side of a single `if (node->transport)` on the
@@ -113,6 +113,47 @@ static bool establish_and_flush_locked(struct noise_transport *t,
     return true;
 }
 
+/* ── handshake lengths ────────────────────────────────────────────── */
+
+static_assert(32 + NOISE_MLKEM_EK_LEN <= SESSION_FRAME_MAX_WIRE,
+              "the hybrid first message must fit the accumulator");
+
+/* The driver's suite: Noise XXhfs (X25519 + ML-KEM-768). */
+static const struct noise_pattern *driver_pattern(void)
+{
+    return noise_pattern_xxhfs();
+}
+
+/* Bytes one pattern token adds to a message; a field is 16 bytes longer once
+ * a DH or KEM has keyed the transcript. A DH token adds no bytes and keys it. */
+static size_t token_len(enum noise_token tok, bool *keyed)
+{
+    const size_t tag = *keyed ? 16 : 0;
+    switch (tok) {
+    case NOISE_TOK_E:     return 32;
+    case NOISE_TOK_E1:    return NOISE_MLKEM_EK_LEN;
+    case NOISE_TOK_EKEM1: *keyed = true; return NOISE_MLKEM_CT_LEN + tag;
+    case NOISE_TOK_S:     return 32 + tag;
+    default:              *keyed = true; return 0;
+    }
+}
+
+/* Length of handshake message `idx` of the driver's pattern with an empty
+ * payload: 1216, 1200 and 64 bytes for XXhfs. */
+static size_t handshake_msg_len(int idx)
+{
+    const struct noise_pattern *p = driver_pattern();
+    bool keyed = false;
+    size_t len = 0;
+    for (int m = 0; m <= idx; m++) {
+        len = 0;
+        for (int k = 0; k < p->msg[m].n; k++)
+            len += token_len(p->msg[m].tok[k], &keyed);
+        len += keyed ? 16 : 0;
+    }
+    return len;
+}
+
 /* ── begin ────────────────────────────────────────────────────────── */
 
 struct noise_transport *noise_transport_begin(bool is_initiator,
@@ -143,7 +184,7 @@ struct noise_transport *noise_transport_begin(bool is_initiator,
     prologue[4] = NOISE_TRANSPORT_VERSION_BYTE;
     prologue[5] = NOISE_TRANSPORT_SUITE_ID;
 
-    if (!noise_hs_init(&t->hs, noise_pattern_xx(), is_initiator,
+    if (!noise_hs_init(&t->hs, driver_pattern(), is_initiator,
                        prologue, sizeof(prologue), identity_priv, NULL)) {
         zcl_mutex_destroy(&t->lock);
         free(t);
@@ -276,10 +317,11 @@ bool noise_transport_feed(struct noise_transport *t,
                 r = STEP_STOP;
                 break;
             }
-            if (t->acc_len < 32) { r = STEP_NEEDMORE; break; }
+            const size_t need = handshake_msg_len(0);
+            if (t->acc_len < need) { r = STEP_NEEDMORE; break; }
             uint8_t payload[NOISE_MAX_MESSAGE];
             size_t payload_len = 0;
-            if (!noise_hs_read_message(&t->hs, t->acc, 32,
+            if (!noise_hs_read_message(&t->hs, t->acc, need,
                                        payload, &payload_len)) {
                 r = STEP_FAIL; break;
             }
@@ -291,17 +333,18 @@ bool noise_transport_feed(struct noise_transport *t,
             if (!buf_append(&wire, &wlen, &wcap, msg2, msg2_len)) {
                 r = STEP_FAIL; break;
             }
-            memmove(t->acc, t->acc + 32, t->acc_len - 32);
-            t->acc_len -= 32;
+            memmove(t->acc, t->acc + need, t->acc_len - need);
+            t->acc_len -= need;
             t->state = NOISE_KEY_RECV;
             r = STEP_CONSUMED;
             break;
         }
         case NOISE_KEY_SENT: {
-            if (t->acc_len < 96) { r = STEP_NEEDMORE; break; }
+            const size_t need = handshake_msg_len(1);
+            if (t->acc_len < need) { r = STEP_NEEDMORE; break; }
             uint8_t payload[NOISE_MAX_MESSAGE];
             size_t payload_len = 0;
-            if (!noise_hs_read_message(&t->hs, t->acc, 96,
+            if (!noise_hs_read_message(&t->hs, t->acc, need,
                                        payload, &payload_len)) {
                 r = STEP_FAIL; break;
             }
@@ -316,24 +359,25 @@ bool noise_transport_feed(struct noise_transport *t,
             if (!establish_and_flush_locked(t, &wire, &wlen, &wcap)) {
                 r = STEP_FAIL; break;
             }
-            memmove(t->acc, t->acc + 96, t->acc_len - 96);
-            t->acc_len -= 96;
+            memmove(t->acc, t->acc + need, t->acc_len - need);
+            t->acc_len -= need;
             r = STEP_CONSUMED;
             break;
         }
         case NOISE_KEY_RECV: {
-            if (t->acc_len < 64) { r = STEP_NEEDMORE; break; }
+            const size_t need = handshake_msg_len(2);
+            if (t->acc_len < need) { r = STEP_NEEDMORE; break; }
             uint8_t payload[NOISE_MAX_MESSAGE];
             size_t payload_len = 0;
-            if (!noise_hs_read_message(&t->hs, t->acc, 64,
+            if (!noise_hs_read_message(&t->hs, t->acc, need,
                                        payload, &payload_len)) {
                 r = STEP_FAIL; break;
             }
             if (!establish_and_flush_locked(t, &wire, &wlen, &wcap)) {
                 r = STEP_FAIL; break;
             }
-            memmove(t->acc, t->acc + 64, t->acc_len - 64);
-            t->acc_len -= 64;
+            memmove(t->acc, t->acc + need, t->acc_len - need);
+            t->acc_len -= need;
             r = STEP_CONSUMED;
             break;
         }

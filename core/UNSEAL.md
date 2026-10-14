@@ -200,3 +200,11 @@ later lane flips it HARD.
 - 2026-10-12T16:34:56Z — REASON: Hybrid Noise_XXhfs pattern with ML-KEM-768 tokens in the noise handshake library, with review fixes; lead re-seal under owner grant 2026-10-06
   old ROOT: 0c8b1a99386821f0c66a594965ff026bd3787f72a32fad0aa839ca00e98c16be
   by: owner unseal ritual (make core-unseal)
+
+- 2026-10-14T08:43:49Z — REASON: Node links handshake with hybrid X25519+ML-KEM-768 Noise XXhfs: transport driver uses noise_pattern_xxhfs, prologue version 0x03 suite 0x02, pattern-derived handshake lengths
+  old ROOT: 2448a30172f00ee8a13b099265a24a1900eda9a6bf0481549933b609f68f70bc
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-10-14T09:35:47Z — REASON: Correct handshake suite name in the noise_transport comments to Noise_XXhfs
+  old ROOT: e96b4f94650c1cfc7aa3c9841590e9c5b68ac00fec44e6c1579a2a245953b9c0
+  by: owner unseal ritual (make core-unseal)

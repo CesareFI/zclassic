@@ -60,10 +60,10 @@ static bool mesh_term_handshake(const uint8_t ini_priv[32],
     struct noise_transport *res =
         noise_transport_begin(false, res_priv, MESH_TERM_TEST_MAGIC, NULL,
                               NULL);
-    bool ok = ini && res && msg1 && msg1_len == 32 &&
+    bool ok = ini && res && msg1 && msg1_len == 1216 &&
               noise_transport_feed(res, msg1, msg1_len, &w2, &w2l, &p,
                                    &pl) &&
-              w2l == 96 && pl == 0 &&
+              w2l == 1200 && pl == 0 &&
               noise_transport_feed(ini, w2, w2l, &w3, &w3l, &p, &pl) &&
               w3l == 64 && pl == 0 &&
               noise_transport_feed(res, w3, w3l, &w1, &w1l, &p, &pl) &&

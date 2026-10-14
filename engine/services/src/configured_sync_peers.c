@@ -26,10 +26,10 @@
 
 /* Bounds for one identity probe. Connect, every read and every write share
  * one absolute deadline per target; each wait lasts at most one slice so a
- * stop request is seen promptly. XX message 2 is 96 bytes; anything past
+ * stop request is seen promptly. XXhfs message 2 is 1200 bytes; anything past
  * PROBE_MAX_BYTES without an established session is not a Noise responder. */
 #define PROBE_WAIT_SLICE_MS      100
-#define PROBE_MAX_BYTES          1024
+#define PROBE_MAX_BYTES          2048
 
 struct configured_target {
     struct net_service svc;

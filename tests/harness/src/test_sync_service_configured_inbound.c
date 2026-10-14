@@ -1818,7 +1818,7 @@ static void probe_listener_respond(struct probe_listener *l,
     noise_transport_free(t);
 }
 
-/* Read XX message 1, then send the real message 2 one byte per 50 ms of
+/* Read XX message 1 (any number of reads), then send the real message 2 one byte per 50 ms of
  * silence from the probe; stop as soon as the probe closes or answers. */
 static void probe_listener_trickle(struct probe_listener *l,
                                    platform_socket_t s)
@@ -1828,10 +1828,14 @@ static void probe_listener_trickle(struct probe_listener *l,
     uint8_t buf[256];
     uint8_t *wire = NULL, *plain = NULL;
     size_t wire_len = 0, plain_len = 0;
-    int n = platform_socket_receive(s, buf, sizeof(buf));
-    bool fed = t && n > 0 && noise_transport_feed(t, buf, (size_t)n, &wire,
-                                                  &wire_len, &plain,
-                                                  &plain_len);
+    bool fed = false;
+    while (t && !wire_len) {
+        int n = platform_socket_receive(s, buf, sizeof(buf));
+        fed = n > 0 && noise_transport_feed(t, buf, (size_t)n, &wire,
+                                            &wire_len, &plain, &plain_len);
+        if (!fed)
+            break;
+    }
     l->msg2_len = fed ? wire_len : 0;
     for (size_t i = 0; fed && i < wire_len; i++) {
         if (platform_socket_wait_readable(s, 50) != 0 ||

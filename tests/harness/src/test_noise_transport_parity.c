@@ -6,8 +6,8 @@
  * raw. These drive the transport object directly over in-memory buffers (no
  * socket / p2p_node needed):
  *
- *   (1) full XX handshake completes; the empty-payload message lengths are the
- *       fixed 32/96/64 the design pins.
+ *   (1) full hybrid XXhfs handshake completes; the empty-payload message
+ *       lengths are the fixed 1216/1200/64 the design pins.
  *   (2) Noise<->Noise message round-trip is byte-identical, including a message
  *       larger than one record (spanning multiple SESSION_MAX_PAYLOAD chunks)
  *       and the reverse direction.
@@ -17,6 +17,9 @@
  *       across two feeds) falls back to plaintext and surfaces the raw bytes.
  *   (5) hostile input (garbage handshake, tamper, oversize frame) fails closed
  *       with no crash.
+ *   (6) the handshake completes from 1-byte and odd-sized feeds, refuses a
+ *       corrupted KEM ciphertext and a peer bound to the classical suite
+ *       prologue, and runs on a 64 KiB thread stack.
  *
  * All sub-checks live under one TEST_CASE: TEST_END defines a single fixed
  * `_test_next` label, so only one TEST_CASE/TEST_END pair is allowed per test
@@ -31,6 +34,13 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>
+#include "noise/noise_handshake.h"
+
+/* Empty-payload message lengths of Noise XXhfs. */
+#define HS_MSG1_LEN 1216
+#define HS_MSG2_LEN 1200
+#define HS_MSG3_LEN 64
 
 /* A representative 4-byte network magic, the same on both sides and chosen
  * not to collide with a random ephemeral prefix. */
@@ -60,20 +70,20 @@ static bool run_handshake(struct noise_transport **ini, struct noise_transport *
     uint8_t *w1 = NULL, *w2 = NULL, *w3 = NULL, *p = NULL;
     size_t w1l = 0, w2l = 0, w3l = 0, pl = 0;
 
-    if (!i || !r || !msg1 || msg1_len != 32)
+    if (!i || !r || !msg1 || msg1_len != HS_MSG1_LEN)
         goto done;
 
     /* responder consumes msg1 -> emits msg2 */
     if (!noise_transport_feed(r, msg1, msg1_len, &w2, &w2l, &p, &pl))
         goto done;
-    if (w2l != 96 || pl != 0)
+    if (w2l != HS_MSG2_LEN || pl != 0)
         goto done;
     free(p); p = NULL; pl = 0;
 
     /* initiator consumes msg2 -> emits msg3, becomes ESTABLISHED */
     if (!noise_transport_feed(i, w2, w2l, &w3, &w3l, &p, &pl))
         goto done;
-    if (w3l != 64 || pl != 0 || i->state != NOISE_ESTABLISHED)
+    if (w3l != HS_MSG3_LEN || pl != 0 || i->state != NOISE_ESTABLISHED)
         goto done;
     free(p); p = NULL; pl = 0;
 
@@ -114,6 +124,186 @@ static bool roundtrip(struct noise_transport *from, struct noise_transport *to,
 done:
     free(ct); free(pt); free(wire);
     return ok;
+}
+
+/* Feed `in` to `t` in pieces of at most `chunk` bytes, appending every wire
+ * reply to (*wire,*wlen). Fails if any feed fails or yields plaintext. */
+static bool feed_chunks(struct noise_transport *t, const uint8_t *in, size_t n,
+                        size_t chunk, uint8_t **wire, size_t *wlen)
+{
+    for (size_t off = 0; off < n; off += chunk) {
+        size_t take = n - off < chunk ? n - off : chunk;
+        uint8_t *w = NULL, *p = NULL;
+        size_t wl = 0, pl = 0;
+        bool ok = noise_transport_feed(t, in + off, take, &w, &wl, &p, &pl) &&
+                  pl == 0;
+        uint8_t *grown = ok ? realloc(*wire, *wlen + wl + 1) : NULL;
+        if (grown) {
+            memcpy(grown + *wlen, w, wl);
+            *wire = grown;
+            *wlen += wl;
+        }
+        free(w);
+        free(p);
+        if (!grown)
+            return false;
+    }
+    return true;
+}
+
+/* Feed one handshake message in `chunk`-byte pieces, the last byte on its
+ * own: the transport must still be in `mid` before it and in `end` after it,
+ * having produced `want` reply bytes. */
+static bool feed_message(struct noise_transport *t, const uint8_t *in, size_t n,
+                         size_t chunk, enum noise_hs_state mid,
+                         enum noise_hs_state end, size_t want,
+                         uint8_t **wire, size_t *wlen)
+{
+    return feed_chunks(t, in, n - 1, chunk, wire, wlen) && t->state == mid &&
+           *wlen == 0 && feed_chunks(t, in + n - 1, 1, 1, wire, wlen) &&
+           t->state == end && *wlen == want;
+}
+
+/* Complete the handshake feeding every message in `chunk`-byte pieces. */
+static bool chunked_handshake(size_t chunk)
+{
+    uint8_t ipriv[32], rpriv[32];
+    mk_id(ipriv, 0x11);
+    mk_id(rpriv, 0x77);
+    uint8_t *msg1 = NULL, *w2 = NULL, *w3 = NULL, *w4 = NULL;
+    size_t msg1_len = 0, w2l = 0, w3l = 0, w4l = 0;
+    struct noise_transport *i =
+        noise_transport_begin(true, ipriv, TEST_MAGIC, &msg1, &msg1_len);
+    struct noise_transport *r =
+        noise_transport_begin(false, rpriv, TEST_MAGIC, NULL, NULL);
+    bool ok = i && r && msg1 && msg1_len == HS_MSG1_LEN &&
+              feed_message(r, msg1, msg1_len, chunk, NOISE_DETECT,
+                           NOISE_KEY_RECV, HS_MSG2_LEN, &w2, &w2l) &&
+              feed_message(i, w2, w2l, chunk, NOISE_KEY_SENT,
+                           NOISE_ESTABLISHED, HS_MSG3_LEN, &w3, &w3l) &&
+              feed_chunks(r, w3, w3l, chunk, &w4, &w4l) &&
+              r->state == NOISE_ESTABLISHED && w4l == 0 &&
+              roundtrip(i, r, msg1, 100);
+    free(msg1); free(w2); free(w3); free(w4);
+    noise_transport_free(i);
+    noise_transport_free(r);
+    return ok;
+}
+
+/* A peer bound to the classical suite prologue (0x02/0x01) running `pattern`
+ * sends its first message to a fresh driver responder. */
+static bool old_prologue_first_message(const struct noise_pattern *pattern,
+                                       uint8_t *msg, size_t *len,
+                                       struct noise_handshake *hs)
+{
+    uint8_t ipriv[32], pro[6];
+    mk_id(ipriv, 0x11);
+    memcpy(pro, TEST_MAGIC, 4);
+    pro[4] = 0x02;
+    pro[5] = 0x01;
+    return noise_hs_init(hs, pattern, true, pro, sizeof(pro), ipriv, NULL) &&
+           noise_hs_write_message(hs, NULL, 0, msg, len);
+}
+
+/* The hybrid driver reaches a failed state against a hybrid peer that binds
+ * the classical prologue: the peer's read of msg2 fails. */
+static bool refuses_old_prologue_peer(void)
+{
+    uint8_t rpriv[32], msg[NOISE_MAX_MESSAGE], pt[NOISE_MAX_MESSAGE];
+    size_t len = 0, ptl = 0;
+    struct noise_handshake hs;
+    mk_id(rpriv, 0x77);
+    if (!old_prologue_first_message(noise_pattern_xxhfs(), msg, &len, &hs))
+        return false;
+    struct noise_transport *r =
+        noise_transport_begin(false, rpriv, TEST_MAGIC, NULL, NULL);
+    uint8_t *w = NULL, *p = NULL;
+    size_t wl = 0, pl = 0;
+    bool ok = r && len == HS_MSG1_LEN &&
+              noise_transport_feed(r, msg, len, &w, &wl, &p, &pl) &&
+              wl == HS_MSG2_LEN &&
+              !noise_hs_read_message(&hs, w, wl, pt, &ptl) &&
+              r->state != NOISE_ESTABLISHED;
+    free(w); free(p);
+    noise_hs_cleanse(&hs);
+    noise_transport_free(r);
+    return ok;
+}
+
+/* A classical XX first message (32 bytes) never completes a hybrid responder. */
+static bool stalls_on_classical_xx_peer(void)
+{
+    uint8_t rpriv[32], msg[NOISE_MAX_MESSAGE];
+    size_t len = 0;
+    struct noise_handshake hs;
+    mk_id(rpriv, 0x77);
+    if (!old_prologue_first_message(noise_pattern_xx(), msg, &len, &hs))
+        return false;
+    struct noise_transport *r =
+        noise_transport_begin(false, rpriv, TEST_MAGIC, NULL, NULL);
+    uint8_t *w = NULL, *p = NULL;
+    size_t wl = 0, pl = 0;
+    bool ok = r && len == 32 &&
+              noise_transport_feed(r, msg, len, &w, &wl, &p, &pl) &&
+              wl == 0 && pl == 0 && r->state == NOISE_DETECT;
+    free(w); free(p);
+    noise_hs_cleanse(&hs);
+    noise_transport_free(r);
+    return ok;
+}
+
+/* Thread stack region: the static TLS block of the test binary sits at the top
+ * of a thread stack, so the region is generous and the depth of the handshake
+ * below the thread entry is measured against a canary instead. */
+#define PROBE_REGION_BYTES (1024 * 1024)
+#define PROBE_BUDGET_BYTES (64 * 1024)
+#define PROBE_CANARY 0xA5
+
+struct stack_probe {
+    bool ok;
+    uintptr_t entry;
+};
+
+static void *handshake_thread(void *arg)
+{
+    struct stack_probe *probe = arg;
+    volatile char marker = 0;
+    probe->entry = (uintptr_t)&marker;
+    struct noise_transport *i = NULL, *r = NULL;
+    uint8_t msg[100] = { 1, 2, 3 };
+    probe->ok = run_handshake(&i, &r) && roundtrip(i, r, msg, sizeof(msg)) &&
+                roundtrip(r, i, msg, sizeof(msg));
+    noise_transport_free(i);
+    noise_transport_free(r);
+    return NULL;
+}
+
+/* The whole handshake and a round trip use less than 64 KiB of thread stack. */
+static bool handshake_fits_small_stack(void)
+{
+    uint8_t *base = aligned_alloc(4096, PROBE_REGION_BYTES);
+    if (!base)
+        return false;
+    memset(base, PROBE_CANARY, PROBE_REGION_BYTES);
+    struct stack_probe probe = { false, 0 };
+    pthread_attr_t attr;
+    pthread_t th;
+    bool ran = pthread_attr_init(&attr) == 0;
+    if (ran) {
+        ran = pthread_attr_setstack(&attr, base, PROBE_REGION_BYTES) == 0 &&
+              pthread_create(&th, &attr, handshake_thread, &probe) == 0;
+        if (ran)
+            pthread_join(th, NULL);
+        pthread_attr_destroy(&attr);
+    }
+    size_t clean = 0;
+    while (clean < PROBE_REGION_BYTES && base[clean] == PROBE_CANARY)
+        clean++;
+    uintptr_t lowest = (uintptr_t)base + clean;
+    bool fits = ran && probe.ok && clean > 0 && probe.entry > lowest &&
+                probe.entry - lowest <= PROBE_BUDGET_BYTES;
+    free(base);
+    return fits;
 }
 
 int test_noise_transport_parity(void)
@@ -199,7 +389,7 @@ int test_noise_transport_parity(void)
                 noise_transport_begin(true, ipriv, TEST_MAGIC, &msg1, &msg1_len);
             struct noise_transport *r =
                 noise_transport_begin(false, rpriv, TEST_MAGIC, NULL, NULL);
-            ASSERT(i && r && msg1 && msg1_len == 32);
+            ASSERT(i && r && msg1 && msg1_len == HS_MSG1_LEN);
 
             /* Application message assembled while the initiator is still in
              * NOISE_KEY_SENT: it must buffer (ct_len == 0), not go on the wire. */
@@ -214,10 +404,10 @@ int test_noise_transport_parity(void)
             size_t w2l = 0, w3l = 0, pl = 0;
             ASSERT(noise_transport_feed(r, msg1, msg1_len, &w2, &w2l, &p, &pl));
             free(p); p = NULL; pl = 0;
-            /* initiator consumes msg2 -> wire is msg3 (64) FOLLOWED BY the
-             * sealed buffered app message. */
+            /* initiator consumes msg2 -> wire is msg3 FOLLOWED BY the sealed
+             * buffered app message. */
             ASSERT(noise_transport_feed(i, w2, w2l, &w3, &w3l, &p, &pl));
-            ASSERT(w3l > 64);            /* msg3 + at least one sealed record */
+            ASSERT(w3l > HS_MSG3_LEN);   /* msg3 + at least one sealed record */
             ASSERT(pl == 0);
             free(p); p = NULL; pl = 0;
 
@@ -286,7 +476,7 @@ int test_noise_transport_parity(void)
             noise_transport_free(r);
         }
 
-        /* (5a) garbage handshake fails closed: a 32-byte msg1 whose
+        /* (5a) garbage handshake fails closed: a full-length msg1 whose
          * ephemeral is the low-order point u=1 makes the ee DH yield the
          * all-zero shared secret x25519_safe rejects. */
         {
@@ -296,7 +486,7 @@ int test_noise_transport_parity(void)
                 noise_transport_begin(false, rpriv, TEST_MAGIC, NULL, NULL);
             ASSERT(r != NULL);
 
-            uint8_t junk[32];
+            uint8_t junk[HS_MSG1_LEN];
             memset(junk, 0, sizeof(junk));
             junk[0] = 0x01;      /* u=1: blacklisted low-order point, not magic */
             uint8_t *wire = NULL, *pt = NULL;
@@ -403,6 +593,36 @@ int test_noise_transport_parity(void)
             ASSERT(unlink(path) == 0);
             ASSERT(rmdir(dir) == 0);
         }
+
+        /* (6) chunked feeds, corrupted KEM ciphertext, classical-suite peers,
+         * small thread stack. */
+        ASSERT(chunked_handshake(1));
+        ASSERT(chunked_handshake(7));
+        ASSERT(chunked_handshake(500));
+        {
+            uint8_t ipriv[32], rpriv[32];
+            mk_id(ipriv, 0x11);
+            mk_id(rpriv, 0x77);
+            uint8_t *msg1 = NULL, *w2 = NULL, *w3 = NULL, *p = NULL;
+            size_t msg1_len = 0, w2l = 0, w3l = 0, pl = 0;
+            struct noise_transport *i =
+                noise_transport_begin(true, ipriv, TEST_MAGIC, &msg1, &msg1_len);
+            struct noise_transport *r =
+                noise_transport_begin(false, rpriv, TEST_MAGIC, NULL, NULL);
+            ASSERT(i && r && msg1);
+            ASSERT(noise_transport_feed(r, msg1, msg1_len, &w2, &w2l, &p, &pl));
+            ASSERT(w2l == HS_MSG2_LEN);
+            w2[32 + 100] ^= 0x01;        /* inside the sealed KEM ciphertext */
+            ASSERT(!noise_transport_feed(i, w2, w2l, &w3, &w3l, &p, &pl));
+            ASSERT(i->state == NOISE_FAILED);
+            ASSERT(!i->have_peer_static);
+            free(msg1); free(w2); free(w3); free(p);
+            noise_transport_free(i);
+            noise_transport_free(r);
+        }
+        ASSERT(refuses_old_prologue_peer());
+        ASSERT(stalls_on_classical_xx_peer());
+        ASSERT(handshake_fits_small_stack());
 
         /* Handshake deadline. */
         uint8_t ipriv[32], rpriv[32];
