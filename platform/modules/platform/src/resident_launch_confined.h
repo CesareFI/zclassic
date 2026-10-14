@@ -40,6 +40,10 @@ bool resident_reproof_mapped(pid_t pid, struct resident_launch *launch,
 struct resident_child_plan {
     int pinned_fd, ipc_child, status_write;
     const struct os_sandbox_profile *profile;
+    const int *extra_fds; /* parent descriptors for slots CHILD_FD + 1 + i */
+    size_t n_extra;
+    bool null_stdio; /* stdio is /dev/null in the child */
+    pid_t parent;    /* the launcher, for the parent-death check */
 #ifdef ZCL_TESTING
     uint32_t stall_ms;
     bool die_after_marker;

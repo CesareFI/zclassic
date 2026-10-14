@@ -1,0 +1,3 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ * Source-owned capability declaration for the plugin restart policy. */
+ZCL_MODULE_CAPABILITY("contexts/commons/modules/plugin/src/plugin_run.c", CAP_FS_WRITE|CAP_CLOCK, "restores the last-good link through the plugin store and paces restarts with a monotonic clock")

@@ -93,6 +93,7 @@ z23 plugin install ./hello.plugin.json     # signature file and executable sit b
 z23 plugin list
 z23 plugin switch hello <128-hex generation>
 z23 plugin rollback hello
+z23 plugin run hello [seconds]             # supervise the current generation
 ```
 
 - `install` verifies the source files, copies them to a staging directory,
@@ -113,6 +114,88 @@ z23 plugin rollback hello
 from a mesh peer. Their authority is the publisher signature checked against
 the owner's trust file on every install, switch and rollback; the node daemon
 state is untouched.
+
+## Running a plugin
+
+`z23 plugin run NAME` verifies the `current` generation again and starts its
+executable as a confined child. It runs until interrupted, or for the given
+number of seconds (1 to 86400); `SIGHUP` restarts only this plugin on the
+current generation (`plugin_run_reload`). The daemon is not contacted. Linux
+only: other hosts refuse with `PLUGIN_RUN_PLATFORM`.
+
+**Requirements.** Linux with seccomp and Landlock ABI 3 or newer (kernel 6.2),
+because ABI 3 is the first to handle file truncation; below that
+`z23 plugin run` refuses with `PLUGIN_RUN_SANDBOX` and starts nothing.
+
+**Image.** The executable must be a static ELF (no `PT_INTERP`). Each start
+verifies the generation again and takes the executable's SHA3-512 from the
+manifest whose signature was just verified (one read of the manifest and
+signature). The executable is then opened once and hashed through that
+descriptor; a symbolic link, a non-regular file or bytes that differ from the
+signed SHA3-512 are refused. The launcher pins a descriptor to the same inode,
+proves its SHA3-256 and file identity against the hashed one, and starts the
+plugin with `fexecve` from that pinned descriptor, so the bytes that run are
+the bytes that were signed.
+
+**Confinement.** `no_new_privs`; limits of 256 MiB address space, 300 CPU
+seconds, 1 MiB per file, 64 descriptors and no core files; Landlock that allows
+reading and executing the image and, when the manifest grants `fs.read` or
+`fs.write`, access to the data directory only (read-only for `fs.read`; read,
+write, create and truncate for `fs.write`); and a seccomp deny-list that kills
+the process on the socket family, `ptrace` and `process_vm_*`, the mount and
+namespace calls, `bpf`, kernel module and keyring calls, `io_uring`,
+`fork`/`vfork`, `setsid`/`setpgid`, `open_by_handle_at`, signalling other
+processes (`kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`, `pidfd_open`,
+`pidfd_send_signal`, `pidfd_getfd`) and the metadata calls Landlock does not
+cover (`chmod`, `fchmod`, `fchmodat`, `fchmodat2`, the `setxattr` and
+`removexattr` families, `utimensat`, `utimes`, `futimesat`). Threads are
+allowed (`clone` with `CLONE_THREAD`); `clone3` answers `ENOSYS`; mappings that
+are both writable and executable are refused. `stdin`, `stdout` and `stderr` are
+`/dev/null`. The child starts with an empty signal mask and every signal at its
+default action, and is killed if the supervisor exits; the parent-death signal
+follows the thread that spawned it, so a supervisor that spawns from a worker
+thread must keep that thread alive. `abort()`, `raise()` and `pthread_kill` end
+as `SIGSYS` under this profile, because they signal through `tgkill`. The caller
+owns process-wide signal state: `SIGCHLD` must be at its default action while a
+run is open, otherwise the kernel discards the plugin's exit status and the
+supervisor reports it as lost (exit code -1, signal 0). `z23 plugin run` sets
+this up.
+
+**Descriptors.** The child holds no descriptor except the ones its manifest
+grants, numbered from 3 in this order, and announces them in the environment
+variable `Z23_PLUGIN_FDS` (the only variable set), for example
+`control=3,data.dir=4,log=5`:
+
+| Name | Granted | Descriptor |
+| --- | --- | --- |
+| `control` | always | A stream socket to the supervisor. |
+| `data.dir` | `fs.read` or `fs.write` | `~/.z23/plugins/NAME/data`, opened as a directory; created with mode 0700 when absent. |
+| `log` | always | Write end of a pipe; each line is printed to the supervisor's standard error prefixed with the plugin name, control bytes other than tab replaced by `?`. |
+
+`clock` needs no descriptor. `net.client`, `net.server`, `process.spawn` and
+`ui.panel` have no descriptor yet and are refused with
+`PLUGIN_RUN_CAPABILITY`, naming the capability. `argv` is
+`<image> --resident <launch nonce>`.
+
+**Health ping.** On the control socket the supervisor sends an 81-byte frame:
+the 16-byte magic `z23-plg-ping-v1` (NUL padded) and a fresh 64-hex token with
+its NUL. The plugin answers with one `z23-res-run-v1` result frame
+(`struct resident_result_header` from `platform/resident_launch.h`) that carries
+the launch nonce and a 64-byte payload equal to the token. A reply under another
+nonce or token does not count. The stop frame `z23-res-stop-v1` has the same
+size; the plugin should exit when it reads one. A ping unanswered for 2 s is
+missed; 2 consecutive misses kill the child.
+
+**Restart.** An exit or a kill after missed pings restarts the child after 250
+ms, doubling per consecutive crash up to 30 s. A child that stays healthy for
+10 s clears the crash count and the delay. Three consecutive crashes of one
+generation restore the `last-good` generation once, as `rollback` does, and
+`current` then names it; if there is no `last-good` generation, or it also
+crashes, the supervisor keeps retrying at the capped delay and changes no link.
+
+**Result.** The command reports `generation`, `restarts`, `pings_ok`,
+`fell_back` and the last `detail`. `PLUGIN_RUN_*` refusals carry a next action;
+a store refusal (for example `PLUGIN_EXE_HASH`) is reported under its own code.
 
 ## Refusal codes
 
@@ -139,9 +222,16 @@ Every refusal carries `error.code` and `error.next_action`.
 | `PLUGIN_NO_LAST_GOOD` | No `switch` has recorded a last-good generation. |
 | `PLUGIN_TRUST_INSECURE` | `trusted_keys` or the store has a wrong owner, is group or world writable, or contains a symbolic link or non-regular file. |
 | `PLUGIN_IO` | A file operation failed; check permissions and free space. |
+| `PLUGIN_RUN_ARGUMENT` | `run` was given no valid plugin name. |
+| `PLUGIN_RUN_PLATFORM` | Confined plugin processes are available on Linux only. |
+| `PLUGIN_RUN_CAPABILITY` | The manifest grants a capability that has no descriptor yet. |
+| `PLUGIN_RUN_SPAWN` | The kernel refused the confined start (Landlock or seccomp unavailable). |
+| `PLUGIN_RUN_SANDBOX` | The kernel lacks Landlock ABI 3 or seccomp; plugins are not started unconfined. |
+| `PLUGIN_RUN_FAILED` | Supervision ended; the evidence line says why. |
 
 ## Tests
 
 ```sh
 make CC=gcc-14 t-fast-exact ONLY=plugin_store
+make CC=gcc-14 t-fast-exact ONLY=plugin_run
 ```

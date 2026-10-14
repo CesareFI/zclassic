@@ -347,6 +347,10 @@ static size_t resident_keep_collect(const struct resident_child_plan *plan,
     keep[n++] = 1;
     keep[n++] = 2;
     keep[n++] = RESIDENT_LAUNCH_CHILD_FD;
+    for (size_t i = 0; i < plan->n_extra; ++i) {
+        if (n >= RESIDENT_KEEP_MAX) _exit(126);
+        keep[n++] = RESIDENT_LAUNCH_CHILD_FD + 1 + (int)i;
+    }
     keep[n++] = plan->pinned_fd;
     keep[n++] = plan->status_write;
     for (size_t i = 0; plan->profile && i < plan->profile->n_fs_rules; ++i) {

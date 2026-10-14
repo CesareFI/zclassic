@@ -134,6 +134,8 @@ ZCL_TEST_GROUP_BUILD_NEED("test_resident_confined_run",
     "build/fixtures/rcc_child", "build/fixtures/rcc_child")
 ZCL_TEST_GROUP_BUILD_NEED("test_resident_confined_run",
     "build/fixtures/rcc_child_dyn", "build/fixtures/rcc_child_dyn")
+ZCL_TEST_GROUP_BUILD_NEED("test_plugin_run",
+    "build/fixtures/plugin_run_child", "build/fixtures/plugin_run_child")
 #endif
 
 /* The generator is exercised through its built binary on fixture trees. */

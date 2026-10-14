@@ -33,6 +33,9 @@
 /* The one descriptor the resident child receives: the IPC socket, dup2'd to
  * this fixed number before exec so an app never has to discover it. */
 #define RESIDENT_LAUNCH_CHILD_FD 3
+/* Most extra descriptors a confined child can be handed; see
+ * resident_launch.extra_fds. */
+#define RESIDENT_LAUNCH_EXTRA_FD_MAX 8u
 #if defined(__APPLE__)
 #define RESIDENT_STARTUP_PLATFORM_MS 4000u
 #else
@@ -111,6 +114,18 @@ struct resident_launch {
      * handshake; 0 selects RESIDENT_CONFINED_SPAWN_DEFAULT_MS. Set AFTER
      * prepare(), which re-initialises the struct. */
     uint64_t spawn_deadline_ns;
+    /* Optional, confined spawns only; set AFTER prepare(). Parent descriptors
+     * the child receives at RESIDENT_LAUNCH_CHILD_FD + 1 + i, in order, with
+     * close-on-exec cleared on those copies only. The parent keeps its own
+     * copies. Every other descriptor is swept in the child before the sandbox
+     * arms. A grant descriptor of the profile inside the child's slot range
+     * [RESIDENT_LAUNCH_CHILD_FD, RESIDENT_LAUNCH_CHILD_FD + n_extra_fds] is
+     * refused. Zero leaves the single-descriptor contract unchanged. */
+    int extra_fds[RESIDENT_LAUNCH_EXTRA_FD_MAX];
+    size_t n_extra_fds;
+    /* Confined spawns only; set AFTER prepare(). The child's stdin, stdout and
+     * stderr are /dev/null instead of the caller's. */
+    bool null_stdio;
     /* Last confined handshake outcome and, for EXEC_FAILED, the child's errno. */
     enum resident_exec_state exec_state;
     int exec_errno;
@@ -151,7 +166,7 @@ bool resident_launch_prepare(struct resident_launch *launch,
                              const struct resident_launch_accepted *accepted,
                              char *error, size_t error_size);
 /* fork + fexecve(pinned fd); the child inherits exactly one descriptor:
- * the IPC socket at RESIDENT_LAUNCH_CHILD_FD. Returns only after the exec
+ * the IPC socket at RESIDENT_LAUNCH_CHILD_FD (n_extra_fds must be 0). Returns only after the exec
  * outcome is known (exec failure is reported here, not silently lost) and
  * the receipt is complete. */
 bool resident_launch_spawn(struct resident_launch *launch,

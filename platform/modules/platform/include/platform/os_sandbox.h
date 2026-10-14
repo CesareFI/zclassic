@@ -613,6 +613,21 @@ struct os_sandbox_profile os_sandbox_session_child_profile(
 struct os_sandbox_profile os_sandbox_terminal_worker_profile(
     const struct os_sandbox_path_rule *fs_rules, size_t n_fs_rules);
 
+/* The plugin supervisor's confinement for one signed plugin process:
+ * no_new_privs + the terminal-worker rlimits + Landlock scoped to `fs_rules`
+ * (the plugin image, read and execute, and its data directory) + a seccomp deny-list
+ * with W^X: the socket family, ptrace and cross-process memory, the mount and
+ * namespace family, bpf, kernel and keyring surface, io_uring, fork/vfork,
+ * setsid/setpgid, open_by_handle_at, signalling (kill, tkill, tgkill, pidfd_*)
+ * and the metadata calls Landlock does not cover (chmod family, xattrs,
+ * utimes family) are KILLed; clone is admitted only with
+ * CLONE_THREAD and clone3 answers ENOSYS. execve stays allowed (the pinned
+ * fexecve is the last call before the image runs). Linux only; elsewhere the
+ * profile refuses in os_sandbox_enter() like every other profile. The
+ * caller must require Landlock ABI >= 3, which handles file truncation. */
+struct os_sandbox_profile os_sandbox_plugin_profile(
+    const struct os_sandbox_path_rule *fs_rules, size_t n_fs_rules);
+
 /* The lighter node-self profile (Rung 2, os-substrate-plan §3): no_new_privs
  * + Landlock (datadir grant) + seccomp deny-list, but NO rlimit clamp and NO
  * nproc=1 (the node legitimately runs many threads). Currently a scaffold —

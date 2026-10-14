@@ -1,15 +1,18 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
- * purpose: plugin.install, plugin.list, plugin.switch and plugin.rollback —
- *          the signed plugin store under ~/.z23/plugins. Every refusal
+ * purpose: plugin.install, plugin.list, plugin.switch, plugin.rollback and
+ *          plugin.run — the signed plugin store under ~/.z23/plugins and the
+ *          confined supervisor for one installed plugin. Every refusal
  *          carries a stable PLUGIN_* code and the command that resolves it.
  *          The daemon is not contacted. */
 
 #include "command/native_command.h"
 
 #include "json/json.h"
+#include "plugin/plugin_run.h"
 #include "plugin/plugin_store.h"
 
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,4 +197,160 @@ void zcl_native_handle_plugin_rollback(const struct zcl_command_request *request
     (void)json_push_kv_str(&reply->data, "name", name);
     (void)json_push_kv_str(&reply->data, "current", restored);
     reply->error.mutated = true;
+}
+
+static volatile sig_atomic_t g_plg_stop;
+static volatile sig_atomic_t g_plg_reload;
+
+#if defined(_WIN32)
+/* No confined plugin process exists here; plugin_run_open refuses first. */
+struct plg_handlers {
+    int unused;
+};
+
+static void plg_signals_install(struct plg_handlers *saved)
+{
+    (void)saved;
+    g_plg_stop = 0;
+    g_plg_reload = 0;
+}
+
+static void plg_signals_restore(const struct plg_handlers *saved)
+{
+    (void)saved;
+}
+#else
+static void plg_on_stop(int sig)
+{
+    (void)sig;
+    g_plg_stop = 1;
+}
+
+static void plg_on_reload(int sig)
+{
+    (void)sig;
+    g_plg_reload = 1;
+}
+
+struct plg_handlers {
+    struct sigaction term, intr, hup, chld;
+};
+
+static void plg_signals_install(struct plg_handlers *saved)
+{
+    struct sigaction stop = {.sa_handler = plg_on_stop};
+    struct sigaction reload = {.sa_handler = plg_on_reload};
+    sigemptyset(&stop.sa_mask);
+    sigemptyset(&reload.sa_mask);
+    g_plg_stop = 0;
+    g_plg_reload = 0;
+    sigaction(SIGTERM, &stop, &saved->term);
+    sigaction(SIGINT, &stop, &saved->intr);
+    sigaction(SIGHUP, &reload, &saved->hup);
+    /* An ignored SIGCHLD would discard the plugin's exit status. */
+    struct sigaction dfl = {.sa_handler = SIG_DFL};
+    sigemptyset(&dfl.sa_mask);
+    sigaction(SIGCHLD, &dfl, &saved->chld);
+}
+
+static void plg_signals_restore(const struct plg_handlers *saved)
+{
+    sigaction(SIGTERM, &saved->term, NULL);
+    sigaction(SIGINT, &saved->intr, NULL);
+    sigaction(SIGHUP, &saved->hup, NULL);
+    sigaction(SIGCHLD, &saved->chld, NULL);
+}
+#endif
+
+/* The run seconds, from a JSON integer or its decimal string; 0 means until
+ * stopped. false = malformed. */
+static bool plg_seconds(const struct zcl_command_request *request, uint32_t *out)
+{
+    const struct json_value *v = request->input ? json_get(request->input, "seconds") : NULL;
+    int64_t n = 0;
+    *out = 0;
+    if (!v || json_is_null(v))
+        return true;
+    if (v->type == JSON_INT) {
+        n = json_get_int(v);
+    } else if (v->type == JSON_STR) {
+        char *end = NULL;
+        n = strtoll(json_get_str(v), &end, 10);
+        if (!end || *end != '\0' || end == json_get_str(v))
+            return false;
+    } else {
+        return false;
+    }
+    if (n < 0 || n > 86400)
+        return false;
+    *out = (uint32_t)n;
+    return true;
+}
+
+static void plg_run_refuse(struct zcl_command_reply *reply, enum plugin_run_status st,
+                           enum plugin_status store, const char *name)
+{
+    if (st == PLUGIN_RUN_ERR_STORE) {
+        plg_refuse(reply, store, "run", name);
+        return;
+    }
+    char message[192];
+    (void)snprintf(message, sizeof(message), "plugin run refused: %s",
+                   plugin_run_status_code(st));
+    zcl_command_reply_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
+                           plugin_run_status_code(st), "run", false, false, message,
+                           name ? name : "");
+    (void)snprintf(reply->error.next_action, sizeof(reply->error.next_action), "%s",
+                   plugin_run_status_next_action(st));
+    reply->error.human_action_required = true;
+}
+
+static void plg_run_report(struct zcl_command_reply *reply, const char *name,
+                           const struct plugin_run_info *info, bool stopped)
+{
+    json_set_object(&reply->data);
+    (void)json_push_kv_str(&reply->data, "schema", "zcl.plugin_run.v1");
+    (void)json_push_kv_str(&reply->data, "name", name);
+    (void)json_push_kv_str(&reply->data, "generation", info->generation);
+    (void)json_push_kv_bool(&reply->data, "stopped", stopped);
+    (void)json_push_kv_int(&reply->data, "restarts", info->restarts);
+    (void)json_push_kv_int(&reply->data, "pings_ok", (int64_t)info->pings_ok);
+    (void)json_push_kv_bool(&reply->data, "fell_back", info->fell_back);
+    (void)json_push_kv_str(&reply->data, "detail", info->detail);
+    reply->error.mutated = info->fell_back;
+}
+
+void zcl_native_handle_plugin_run(const struct zcl_command_request *request,
+                                  struct zcl_command_reply *reply)
+{
+    char root[PATH_MAX];
+    uint32_t seconds = 0;
+    if (!plg_begin(request, reply, "run", root, sizeof(root)))
+        return;
+    const char *name = plg_str(request, "name");
+    struct plugin_run_options options = {.root = root, .name = name, .log_to_stderr = true};
+    struct plugin_run *run = NULL;
+    enum plugin_status store = PLUGIN_OK;
+    if (!plg_seconds(request, &seconds)) {
+        plg_refuse(reply, PLUGIN_ERR_ARGUMENT, "run", "seconds must be 0 to 86400");
+        return;
+    }
+    enum plugin_run_status st = plugin_run_open(&options, &run, &store);
+    if (st != PLUGIN_RUN_OK) {
+        plg_run_refuse(reply, st, store, name);
+        return;
+    }
+    struct plg_handlers saved;
+    plg_signals_install(&saved);
+    st = plugin_run_loop(run, &g_plg_stop, &g_plg_reload, seconds * 1000u);
+    plg_signals_restore(&saved);
+    struct plugin_run_info info;
+    plugin_run_info_get(run, &info);
+    plugin_run_close(run);
+    if (st != PLUGIN_RUN_OK) {
+        bool named = st == PLUGIN_RUN_ERR_SPAWN || st == PLUGIN_RUN_ERR_CAPABILITY;
+        plg_run_refuse(reply, named ? st : PLUGIN_RUN_ERR_FAILED, PLUGIN_OK, info.detail);
+        return;
+    }
+    plg_run_report(reply, name, &info, true);
 }

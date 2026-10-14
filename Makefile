@@ -3207,7 +3207,8 @@ RESIDENT_CONTRACT_FIXTURE_BINS = \
 	$(BUILD_DIR)/fixtures/rlc_child_v1$(ZCL_HOST_EXEEXT) \
 	$(BUILD_DIR)/fixtures/rlc_child_broken$(ZCL_HOST_EXEEXT) \
 	$(BUILD_DIR)/fixtures/rcc_child$(ZCL_HOST_EXEEXT) \
-	$(BUILD_DIR)/fixtures/rcc_child_dyn$(ZCL_HOST_EXEEXT)
+	$(BUILD_DIR)/fixtures/rcc_child_dyn$(ZCL_HOST_EXEEXT) \
+	$(BUILD_DIR)/fixtures/plugin_run_child$(ZCL_HOST_EXEEXT)
 else
 RESIDENT_CONTRACT_FIXTURE_BINS =
 endif
@@ -3235,6 +3236,14 @@ $(BUILD_DIR)/fixtures/rcc_child$(ZCL_HOST_EXEEXT): $(RESIDENT_CONFINED_FIXTURE_S
 $(BUILD_DIR)/fixtures/rcc_child_dyn$(ZCL_HOST_EXEEXT): $(RESIDENT_CONFINED_FIXTURE_SRC)
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -Wall -Wextra -o $@ $(RESIDENT_CONFINED_FIXTURE_SRC)
+
+# Fixture plugin for the plugin_run group: a static image whose behaviour field
+# the test patches to derive distinct generations (see the fixture header).
+PLUGIN_RUN_FIXTURE_SRC = tests/harness/fixtures/plugin_run_child.c
+$(BUILD_DIR)/fixtures/plugin_run_child$(ZCL_HOST_EXEEXT): $(PLUGIN_RUN_FIXTURE_SRC)
+	@mkdir -p $(dir $@)
+	$(CC) -std=gnu2x -O2 -Wall -Wextra $(RESIDENT_CONFINED_STATIC) $(LIB_INCLUDES) \
+	  -o $@ $(PLUGIN_RUN_FIXTURE_SRC)
 
 TEST_SRCS = $(call zcl_filter_ephemeral_sources,\
 	$(wildcard tests/harness/src/*.c))

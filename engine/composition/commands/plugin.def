@@ -1,4 +1,5 @@
-/* plugin: the signed plugin store under ~/.z23/plugins. Consumer defines
+/* plugin: the signed plugin store under ~/.z23/plugins and its confined
+ * supervisor (run). Consumer defines
  * ZCL_COMMAND_*. docs/PLUGINS.md describes the layout and refusal codes. */
 
 ZCL_COMMAND_BRANCH("plugin", "", "Signed plugin store",
@@ -84,3 +85,29 @@ ZCL_COMMAND_READY_COMMAND(
     ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
     ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_REVERSIBLE,
     zcl_native_handle_plugin_rollback)
+
+ZCL_COMMAND_READY_COMMAND(
+    "plugin.run", "plugin", "",
+    "Run an installed plugin confined, health-checked and restarted on failure",
+    "Starts the plugin's current verified executable as a confined child "
+    "(Landlock, seccomp, no_new_privs, resource limits) that holds only the "
+    "descriptors its manifest grants: a control socket, a log pipe and, for "
+    "fs.read or fs.write, its data directory. Sends a nonce-bound ping on the "
+    "control socket; an exit or missed pings restart the child with "
+    "exponential backoff, and three crashes of one generation restore the "
+    "last-good generation once. Runs until interrupted, or for the given "
+    "seconds; SIGHUP restarts the child on the current generation. Linux "
+    "only; other hosts refuse with PLUGIN_RUN_PLATFORM. The daemon is not "
+    "contacted.",
+    ZCL_COMMAND_RESULT_BUDGET,
+    "plugin,run,supervise,confined,restart,backoff,ping,landlock,seccomp",
+    "zcl.plugin_run.input.v1", "zcl.plugin_run.v1",
+    "name,seconds", "name",
+    "z23 plugin run hello",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_PERSISTENT, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_PROCESS_EXEC, ZCL_COMMAND_TRAIT_NONE,
+    zcl_native_handle_plugin_run)

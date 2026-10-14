@@ -74,17 +74,17 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 929 |
+| Registry entries (branches + leaves) | 930 |
 | Top-level roots | 15 |
 | Branches | 203 |
-| Leaves (dispatchable command paths) | 726 |
-| … `ready` (live handler in this build) | 633 |
+| Leaves (dispatchable command paths) | 727 |
+| … `ready` (live handler in this build) | 634 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
-| Leaves with `effect=mutate` | 272 |
+| Leaves with `effect=mutate` | 273 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 138 |
+| Leaves requiring **owner** authority | 139 |
 
 Per source file:
 
@@ -105,7 +105,7 @@ Per source file:
 | `engine/composition/commands/metaverse.def` | 30 | 7 | 23 |
 | `engine/composition/commands/yardsale.def` | 7 | 2 | 5 |
 | `engine/composition/commands/zses.def` | 4 | 2 | 2 |
-| `engine/composition/commands/plugin.def` | 5 | 1 | 4 |
+| `engine/composition/commands/plugin.def` | 6 | 1 | 5 |
 | `engine/composition/commands/story.def` | 5 | 1 | 4 |
 | `engine/composition/commands/fleet_board.def` | 12 | 3 | 9 |
 | `engine/composition/commands/mind.def` | 4 | 1 | 3 |
@@ -1814,6 +1814,7 @@ represented by its children's sections.
 | `plugin list` | ready | read / read / operator · fast/low | none | `zcl.plugin_list.v1` | `z23 plugin list` | List installed plugins with current, last-good and all generations |
 | `plugin switch` | ready | mutate / app-write / **owner** · fast/low | **`name`**, **`generation`** | `zcl.plugin_switch.v1` | `z23 plugin switch hello <128-hex generation>` | Make an installed plugin generation current |
 | `plugin rollback` | ready | mutate / app-write / **owner** · fast/low | **`name`** | `zcl.plugin_rollback.v1` | `z23 plugin rollback hello` | Restore the last-good plugin generation as current |
+| `plugin run` | ready | mutate / app-write / **owner** · persistent/low | **`name`**, `seconds` | `zcl.plugin_run.v1` | `z23 plugin run hello` | Run an installed plugin confined, health-checked and restarted on failure |
 
 ### `story` — Rooted causal views of development work
 

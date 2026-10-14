@@ -63,4 +63,11 @@ bool plugin_link_generation(const char *dir, const char *link,
 enum plugin_status plugin_verify_generation(const char *root, const char *name,
                                             const char *generation);
 
+/* As plugin_verify_generation, and returns the manifest whose signature was
+ * verified, so a caller binds to the signed fields and not to a second read. */
+enum plugin_status plugin_verify_generation_manifest(const char *root,
+                                                     const char *name,
+                                                     const char *generation,
+                                                     struct plugin_manifest *out);
+
 #endif

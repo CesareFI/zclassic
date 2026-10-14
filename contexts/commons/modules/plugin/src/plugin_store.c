@@ -103,12 +103,13 @@ static enum plugin_status ps_check_chain(const char *root, const char *plugdir)
     return st;
 }
 
-enum plugin_status plugin_verify_generation(const char *root, const char *name,
-                                            const char *generation)
+enum plugin_status plugin_verify_generation_manifest(const char *root,
+                                                     const char *name,
+                                                     const char *generation,
+                                                     struct plugin_manifest *out)
 {
     struct ps_paths p;
     char trust[PLUGIN_PATH_MAX], dir[PLUGIN_PATH_MAX];
-    struct plugin_manifest m;
     if (!plugin_name_valid(name) ||
         !plugin_hex_valid(generation, PLUGIN_HEX_SHA3_512) ||
         !ps_trust_path(root, trust, sizeof(trust)) ||
@@ -124,11 +125,18 @@ enum plugin_status plugin_verify_generation(const char *root, const char *name,
     st = plugin_check_dir(gen_dir);
     if (st != PLUGIN_OK)
         return st == PLUGIN_ERR_NOT_INSTALLED ? PLUGIN_ERR_NO_GENERATION : st;
-    st = ps_verify_set(&p, trust, PLUGIN_OPEN_NOFOLLOW, &m);
+    st = ps_verify_set(&p, trust, PLUGIN_OPEN_NOFOLLOW, out);
     if (st == PLUGIN_OK &&
-        (strcmp(m.name, name) != 0 || strcmp(m.exe_sha3, generation) != 0))
+        (strcmp(out->name, name) != 0 || strcmp(out->exe_sha3, generation) != 0))
         st = PLUGIN_ERR_MANIFEST_INVALID;
     return st;
+}
+
+enum plugin_status plugin_verify_generation(const char *root, const char *name,
+                                            const char *generation)
+{
+    struct plugin_manifest m;
+    return plugin_verify_generation_manifest(root, name, generation, &m);
 }
 
 /* Derive sibling signature and executable paths from NAME.plugin.json. */

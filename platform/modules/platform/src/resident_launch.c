@@ -41,6 +41,7 @@
 #include <time.h>
 #if !defined(_WIN32)
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -51,6 +52,7 @@
 #endif
 #if defined(__linux__)
 #include <elf.h>
+#include <sys/prctl.h>
 #endif
 
 #define RESIDENT_FRAME_MAGIC_RESULT "z23-res-run-v1"
@@ -284,35 +286,73 @@ static bool resident_spawn_channels(int ipc[2], int status_pipe[2],
     return true;
 }
 
-static int resident_child_clear_slot(int fd)
+/* Move fd out of the child slot range [CHILD_FD, CHILD_FD + n_extra] so the
+ * dup2 placement below cannot overwrite it. */
+static int resident_child_clear_slot(int fd, size_t n_extra)
 {
-    if (fd != RESIDENT_LAUNCH_CHILD_FD) return fd;
-    int moved = fcntl(fd, F_DUPFD_CLOEXEC, RESIDENT_LAUNCH_CHILD_FD + 1);
+    int last = RESIDENT_LAUNCH_CHILD_FD + (int)n_extra;
+    if (fd < RESIDENT_LAUNCH_CHILD_FD || fd > last) return fd;
+    int moved = fcntl(fd, F_DUPFD_CLOEXEC, last + 1);
     if (moved < 0) _exit(126);
     return moved;
 }
 
+/* A confined child starts from a clean signal state: nothing the caller
+ * blocked or ignored survives the exec, and it dies with the caller. The
+ * getppid() re-check closes the window where the caller exits between the
+ * fork and PR_SET_PDEATHSIG. */
+static void resident_child_clean_signals(pid_t parent)
+{
+    sigset_t none;
+    sigemptyset(&none);
+    if (pthread_sigmask(SIG_SETMASK, &none, NULL) != 0) _exit(126);
+    for (int sig = 1; sig < NSIG; ++sig) {
+        if (sig == SIGKILL || sig == SIGSTOP) continue;
+        struct sigaction dfl = {.sa_handler = SIG_DFL};
+        sigaction(sig, &dfl, NULL);
+    }
+#if defined(__linux__)
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) _exit(126);
+#endif
+    if (getppid() != parent) _exit(126);
+}
+
+/* stdin, stdout and stderr become /dev/null; runs after every slot is placed,
+ * so the descriptor open() returns is a free one. */
+static void resident_child_null_stdio(void)
+{
+    int null = open("/dev/null", O_RDWR);
+    if (null < 0) _exit(126);
+    for (int fd = 0; fd <= 2; ++fd)
+        if (null != fd && dup2(null, fd) < 0) _exit(126);
+    if (null > 2) close(null);
+}
+
 static void resident_child_place_fds(struct resident_child_plan *plan)
 {
-    plan->pinned_fd = resident_child_clear_slot(plan->pinned_fd);
-    plan->status_write = resident_child_clear_slot(plan->status_write);
-    if (plan->ipc_child != RESIDENT_LAUNCH_CHILD_FD) {
-        if (dup2(plan->ipc_child, RESIDENT_LAUNCH_CHILD_FD) < 0) _exit(126);
-        close(plan->ipc_child);
-    } else {
-        (void)fcntl(plan->ipc_child, F_SETFD, 0);
-    }
+    int source[RESIDENT_LAUNCH_EXTRA_FD_MAX];
+    size_t n = plan->n_extra;
+    plan->pinned_fd = resident_child_clear_slot(plan->pinned_fd, n);
+    plan->status_write = resident_child_clear_slot(plan->status_write, n);
+    plan->ipc_child = resident_child_clear_slot(plan->ipc_child, n);
+    for (size_t i = 0; i < n; ++i)
+        source[i] = resident_child_clear_slot(plan->extra_fds[i], n);
+    if (dup2(plan->ipc_child, RESIDENT_LAUNCH_CHILD_FD) < 0) _exit(126);
+    for (size_t i = 0; i < n; ++i)
+        if (dup2(source[i], RESIDENT_LAUNCH_CHILD_FD + 1 + (int)i) < 0) _exit(126);
+    if (plan->null_stdio) resident_child_null_stdio();
 }
 
 /* The child's side of a Linux spawn: new session, exactly the named
- * descriptors (stdio, the IPC socket at RESIDENT_LAUNCH_CHILD_FD, the pinned
- * image, the status pipe), then exec the pinned inode. Only ever returns on
- * exec failure; the errno byte on the status pipe is the parent's
+ * descriptors (stdio, the IPC socket at RESIDENT_LAUNCH_CHILD_FD, the caller's
+ * extra descriptors after it, the pinned image, the status pipe), then exec
+ * the pinned inode. Only ever returns on exec failure; the errno byte on the status pipe is the parent's
  * synchronous exec outcome. */
 static void resident_child_exec(struct resident_child_plan plan,
                                 char *const argv[], char *const envp[])
 {
     if (setsid() < 0) _exit(126);
+    if (plan.profile) resident_child_clean_signals(plan.parent);
     resident_child_place_fds(&plan);
     if (plan.profile) {
         resident_child_close_inherited(&plan);
@@ -603,6 +643,31 @@ static bool resident_spawn_adopt(struct resident_launch *launch, pid_t pid, int 
     return resident_reproof_mapped(pid, launch, receipt, error, error_size);
 }
 
+/* The extra descriptors must be open, and no profile grant descriptor may sit
+ * in a slot the child placement is about to overwrite. */
+static bool resident_extra_fds_check(const struct resident_launch *launch,
+                                     const struct os_sandbox_profile *profile,
+                                     char *error, size_t error_size)
+{
+    size_t n = launch->n_extra_fds;
+    if (n == 0 && !launch->null_stdio) return true;
+    bool ok = profile != NULL && n <= RESIDENT_LAUNCH_EXTRA_FD_MAX;
+    for (size_t i = 0; ok && i < n; ++i)
+        ok = launch->extra_fds[i] >= 0 && fcntl(launch->extra_fds[i], F_GETFD) >= 0;
+    int last = RESIDENT_LAUNCH_CHILD_FD + (int)n;
+    for (size_t i = 0; ok && n && i < profile->n_fs_rules; ++i) {
+        const struct os_sandbox_path_rule *rule = &profile->fs_rules[i];
+        ok = !rule->has_fd || rule->fd < RESIDENT_LAUNCH_CHILD_FD || rule->fd > last;
+    }
+    if (ok) return true;
+    errno = EINVAL;
+    resident_fail(error, error_size,
+                  "resident launch: extra descriptors and null stdio need a"
+                  " confined spawn, open descriptors and grants outside the"
+                  " child slot range");
+    return false;
+}
+
 static bool resident_spawn_linux(struct resident_launch *launch,
                                  char *const argv[], char *const envp[],
                                  const struct os_sandbox_profile *profile,
@@ -620,6 +685,7 @@ static bool resident_spawn_linux(struct resident_launch *launch,
     }
     if (!resident_preflight_bytes(launch, file, error, error_size)) return false;
     if (profile && !resident_image_static_only(file, error, error_size)) return false;
+    if (!resident_extra_fds_check(launch, profile, error, error_size)) return false;
     int ipc[2] = {-1, -1}, status_pipe[2] = {-1, -1};
     if (!resident_spawn_channels(ipc, status_pipe, error, error_size))
         return false;
@@ -629,7 +695,11 @@ static bool resident_spawn_linux(struct resident_launch *launch,
         close(status_pipe[0]); close(status_pipe[1]);
         return false;
     }
-    struct resident_child_plan plan = {.pinned_fd = pinned_fd, .profile = profile};
+    struct resident_child_plan plan = {.pinned_fd = pinned_fd, .profile = profile,
+                                       .extra_fds = launch->extra_fds,
+                                       .n_extra = launch->n_extra_fds,
+                                       .null_stdio = launch->null_stdio,
+                                       .parent = getpid()};
 #ifdef ZCL_TESTING
     plan.stall_ms = launch->debug_stall_before_marker_ms;
     plan.die_after_marker = launch->debug_die_after_marker;
@@ -716,6 +786,12 @@ static bool resident_spawn_common(struct resident_launch *launch,
         return false;
     memset(receipt, 0, sizeof(*receipt));
 #if defined(__APPLE__)
+    if (launch->n_extra_fds || launch->null_stdio) {
+        errno = ENOTSUP;
+        resident_fail(error, error_size,
+                      "resident launch: extra descriptors are Linux-only");
+        return false;
+    }
     if (!resident_spawn_darwin(launch, argv, envp, receipt,
                                error, error_size))
         return false;
