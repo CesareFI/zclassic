@@ -10,17 +10,17 @@ bool connman_request_noise_upgrade(struct connman *cm, struct p2p_node *node)
 {
     if (!cm || !node || node->inbound || node->transport ||
         !cm->manager.noise_enabled ||
-        (node->services & NODE_NOISE_TRANSPORT) == 0)
+        (node->services & NODE_NOISE_HYBRID) == 0)
         return false;
 
     /* node->addr is the dial-time capability snapshot.  If it already knew
      * the Noise bit, net.c would have armed Noise before sending any version
      * bytes; do not create a reconnect loop if a caller reaches this path
      * anyway. */
-    if ((node->addr.nServices & NODE_NOISE_TRANSPORT) != 0)
+    if ((node->addr.nServices & NODE_NOISE_HYBRID) != 0)
         return false;
 
-    node->addr.nServices |= NODE_NOISE_TRANSPORT;
+    node->addr.nServices |= NODE_NOISE_HYBRID;
 
     /* Pinned addnodes bypass addrman selection, so update their durable
      * in-process dial entry as well. */
@@ -29,7 +29,7 @@ bool connman_request_noise_upgrade(struct connman *cm, struct p2p_node *node)
         if (net_addr_eq(&cm->addnodes[i].svc.addr, &node->addr.svc.addr) &&
             cm->addnodes[i].svc.port == node->addr.svc.port) {
             matched_addnode = true;
-            cm->addnodes[i].nServices |= NODE_NOISE_TRANSPORT;
+            cm->addnodes[i].nServices |= NODE_NOISE_HYBRID;
             /* This disconnect is the successful capability-upgrade path,
              * not a failed dial. Make the specifically matched addnode
              * immediately eligible for its one Noise reconnect instead of

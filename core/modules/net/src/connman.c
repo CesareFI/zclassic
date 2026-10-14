@@ -1338,7 +1338,7 @@ static void *thread_socket_handler(void *arg)
             if (!n || n->disconnect || n->state < PEER_HANDSHAKE_COMPLETE)
                 continue;
             noise_handshaked++;
-            if (n->services & NODE_NOISE_TRANSPORT)
+            if (n->services & NODE_NOISE_HYBRID)
                 noise_advertising++;
         }
         zcl_mutex_unlock(&cm->manager.cs_nodes);
@@ -2090,7 +2090,7 @@ bool connman_init(struct connman *cm, const struct chain_params *params,
         cm->manager.local_services |= NODE_BLOOM;
 
     /* Noise transport: default OFF. When -noisetransport is passed, advertise
-     * NODE_NOISE_TRANSPORT and load/generate the persistent static identity. */
+     * NODE_NOISE_HYBRID and load/generate the persistent static identity. */
     const bool noise_arg_set = GetArg("-noisetransport", NULL) != NULL;
     const bool legacy_noise_arg_set = GetArg("-v2transport", NULL) != NULL;
     cm->manager.noise_enabled = noise_arg_set
@@ -2113,7 +2113,7 @@ bool connman_init(struct connman *cm, const struct chain_params *params,
                 datadir, cm->manager.identity_priv,
                 cm->manager.identity_pub, identity_error,
                 sizeof(identity_error)))
-            cm->manager.local_services |= NODE_NOISE_TRANSPORT;
+            cm->manager.local_services |= NODE_NOISE_HYBRID;
         else {
             cm->manager.noise_enabled = false;
             LOG_WARN("net", "Noise identity unavailable: %s; transport disabled",

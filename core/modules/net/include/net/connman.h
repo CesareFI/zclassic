@@ -60,7 +60,7 @@ void connman_get_reactor_stats(struct connman_reactor_stats *out);
  * Nothing reads these to make a decision. The Noise transport default stays OFF
  * (`-noisetransport`, connman.c) because every peer on the live network today
  * speaks the unencrypted v1 wire: flipping the default before a measured
- * population of peers advertises NODE_NOISE_TRANSPORT would partition this node
+ * population of peers advertises NODE_NOISE_HYBRID would partition this node
  * off the network. This census is the evidence that decision needs — it
  * counts peers whose version message advertised the bit, nothing more.
  *
@@ -322,7 +322,7 @@ struct connman {
     struct thread_bounded_wait dial_bounded_wait;
 };
 
-/* Persist a newly learned NODE_NOISE_TRANSPORT capability in the existing
+/* Persist a newly learned NODE_NOISE_HYBRID capability in the existing
  * addrman/addnode dial sources and mark the outbound plaintext connection for
  * one controlled reconnect.  Returns true only for the first upgrade request
  * (the dial target did not already carry the capability). */

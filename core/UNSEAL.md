@@ -208,3 +208,7 @@ later lane flips it HARD.
 - 2026-10-14T09:35:47Z — REASON: Correct handshake suite name in the noise_transport comments to Noise_XXhfs
   old ROOT: e96b4f94650c1cfc7aa3c9841590e9c5b68ac00fec44e6c1579a2a245953b9c0
   by: owner unseal ritual (make core-unseal)
+
+- 2026-10-14T09:55:07Z — REASON: Service bit 26 NODE_NOISE_HYBRID gates the outbound Noise handshake; bit 25 retired
+  old ROOT: 6c4bfa22cbcd64be0f7b3ba63079ac84fa41818570c80cf0260af38ebdebb75c
+  by: owner unseal ritual (make core-unseal)

@@ -395,7 +395,7 @@ void msg_version_build(struct version_message *ver,
     if (bip37_enabled())
         ver->services |= NODE_BLOOM;
     if (mp->net_mgr && mp->net_mgr->noise_enabled)
-        ver->services |= NODE_NOISE_TRANSPORT;
+        ver->services |= NODE_NOISE_HYBRID;
     /* A zclassicd v2.1.2-beta6 client refuses to fast-sync from a bootstrap
      * peer whose version does not carry NODE_BOOTSTRAP, and it looks for it
      * on the ORDINARY P2P port. Advertised only while the engine's beta6

@@ -1423,9 +1423,9 @@ struct p2p_node *connect_node_from_socket(struct net_manager *nm,
     }
 
     /* Noise transport (default OFF): arm as INITIATOR when enabled and the peer's
-     * advertised services carry NODE_NOISE_TRANSPORT. Queues msg1 (`-> e`) raw; the
+     * advertised services carry NODE_NOISE_HYBRID. Queues msg1 (`-> e, e1`) raw; the
      * subsequent push_version rides sealed once the handshake completes. */
-    if (nm->noise_enabled && (addr_connect->nServices & NODE_NOISE_TRANSPORT)) {
+    if (noise_hybrid_dial_allowed(nm->noise_enabled, addr_connect->nServices)) {
         uint8_t *msg1 = NULL;
         size_t msg1_len = 0;
         node->transport = noise_transport_begin(true, nm->identity_priv,

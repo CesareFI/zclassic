@@ -585,7 +585,7 @@ struct listen_socket {
 struct net_manager {
     /* Owning connection manager.  This back-pointer exists so the version
      * handshake can ask the existing dialer for the single controlled
-     * plaintext-to-Noise reconnect after learning NODE_NOISE_TRANSPORT. */
+     * plaintext-to-Noise reconnect after learning NODE_NOISE_HYBRID. */
     struct connman *owner;
     bool discover;
     bool listen;

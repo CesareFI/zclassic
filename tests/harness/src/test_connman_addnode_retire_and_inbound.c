@@ -490,10 +490,45 @@ static bool addnode_noise_first_upgrade_ok(struct connman *cm,
 {
     return connman_request_noise_upgrade(cm, node) &&
            node->disconnect &&
-           (node->addr.nServices & NODE_NOISE_TRANSPORT) != 0 &&
-           (cm->addnodes[0].nServices & NODE_NOISE_TRANSPORT) != 0 &&
+           (node->addr.nServices & NODE_NOISE_HYBRID) != 0 &&
+           (cm->addnodes[0].nServices & NODE_NOISE_HYBRID) != 0 &&
            cm->addnode_last_attempt[0] == 0 &&
            cm->addnode_backoff_sec[0] == 0;
+}
+
+/* Dial rule: only bit 26 opens Noise; the retired bit 25 and a disabled local
+ * setting both stay on the plaintext path with no upgrade request. */
+static int check_noise_hybrid_dial_rule(void)
+{
+    int failures = 0;
+    printf("connman_addnode_fallback: Noise dials only peers advertising "
+           "NODE_NOISE_HYBRID... ");
+    {
+        chain_params_select(CHAIN_MAIN);
+        struct connman cm;
+        struct node_signals sigs;
+        memset(&sigs, 0, sizeof(sigs));
+        bool ok = connman_init(&cm, chain_params_get(), &sigs);
+        cm.manager.noise_enabled = true;
+        const uint64_t retired_bit25 = UINT64_C(1) << 25;
+        ok = ok && NODE_NOISE_HYBRID == (UINT64_C(1) << 26) &&
+             noise_hybrid_dial_allowed(true, NODE_NETWORK | NODE_NOISE_HYBRID) &&
+             !noise_hybrid_dial_allowed(true, NODE_NETWORK | retired_bit25) &&
+             !noise_hybrid_dial_allowed(true, NODE_NETWORK) &&
+             !noise_hybrid_dial_allowed(false, NODE_NOISE_HYBRID);
+        struct p2p_node *node = add_test_peer(
+            &cm, 127, 0, 0, 1, PEER_VERSION_RECEIVED, false, false);
+        ok = ok && node != NULL;
+        if (node) {
+            node->services = NODE_NETWORK | retired_bit25;
+            ok = ok && !connman_request_noise_upgrade(&cm, node) &&
+                 !node->disconnect;
+        }
+        connman_free(&cm);
+        if (ok) printf("OK\n");
+        else { printf("FAIL\n"); failures++; }
+    }
+    return failures;
 }
 
 int check_connman_addnode_noise_capability_upgrade(void)
@@ -519,7 +554,7 @@ int check_connman_addnode_noise_capability_upgrade(void)
         ok = ok && node != NULL;
         if (node) {
             node->addr.svc.port = pinned.svc.port;
-            node->services |= NODE_NOISE_TRANSPORT;
+            node->services |= NODE_NOISE_HYBRID;
             ok = ok && addnode_noise_first_upgrade_ok(&cm, node);
 
             /* The learned bit makes this the only reconnect request.  The
@@ -533,7 +568,7 @@ int check_connman_addnode_noise_capability_upgrade(void)
              * lookup would leave the candidate permanently unverified. */
             cm.num_addnodes = 0;
             node->addr.svc.port = 18445;
-            node->addr.nServices &= ~NODE_NOISE_TRANSPORT;
+            node->addr.nServices &= ~NODE_NOISE_HYBRID;
             node->disconnect = false;
             struct net_address learned_reconnect;
             memset(&learned_reconnect, 0, sizeof(learned_reconnect));
@@ -543,10 +578,10 @@ int check_connman_addnode_noise_capability_upgrade(void)
             ok = ok && net_service_eq(&learned_reconnect.svc,
                                       &node->addr.svc);
             ok = ok &&
-                (learned_reconnect.nServices & NODE_NOISE_TRANSPORT) != 0;
+                (learned_reconnect.nServices & NODE_NOISE_HYBRID) != 0;
 
             node->inbound = true;
-            node->addr.nServices &= ~NODE_NOISE_TRANSPORT;
+            node->addr.nServices &= ~NODE_NOISE_HYBRID;
             ok = ok && !connman_request_noise_upgrade(&cm, node);
         }
 
@@ -554,6 +589,7 @@ int check_connman_addnode_noise_capability_upgrade(void)
         if (ok) printf("OK\n");
         else { printf("FAIL\n"); failures++; }
     }
+    failures += check_noise_hybrid_dial_rule();
     return failures;
 }
 

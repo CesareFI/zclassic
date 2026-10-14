@@ -52,7 +52,7 @@ static int route_test_queue(struct connman *cm)
         ASSERT_EQ(attempts, 1);
         ASSERT(connman_take_dht_hint(cm, &queued));
         ASSERT(net_service_eq(&queued.svc, &endpoint.svc));
-        ASSERT((queued.nServices & NODE_NOISE_TRANSPORT) != 0);
+        ASSERT((queued.nServices & NODE_NOISE_HYBRID) != 0);
         ASSERT_EQ(boot_mesh_route_test_step(
                       id, &endpoint, BOOT_MESH_ROUTE_OBS_NONE, true, 1500,
                       cm, &attempts), BOOT_MESH_ROUTE_PENDING);

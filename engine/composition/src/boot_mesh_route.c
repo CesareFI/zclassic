@@ -147,7 +147,7 @@ static enum boot_mesh_route_result route_step_locked(
         return BOOT_MESH_ROUTE_RESOURCE_DEFERRED;
 
     struct net_address endpoint = slot->endpoint;
-    endpoint.nServices |= NODE_NOISE_TRANSPORT;
+    endpoint.nServices |= NODE_NOISE_HYBRID;
     if (!connman_queue_dht_hint(connman, &endpoint))
         return BOOT_MESH_ROUTE_RESOURCE_DEFERRED;
     slot->attempts++;

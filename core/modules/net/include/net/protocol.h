@@ -23,12 +23,15 @@ enum {
      * advertise this when it can serve getbsman/bsman + getbschk/bschk
      * snapshot messages; do not set it for ordinary block-serving peers. */
     NODE_BOOTSTRAP = (1 << 24),
-    /* zclassic23 Noise-encrypted transport capability. Advertised only when
-     * -noisetransport is enabled; a HINT for OUTBOUND gating (the authoritative
-     * INBOUND discriminator is the 4-byte magic peek, which no gossip can
-     * strip). In the zcl23-reserved high range, same family as NODE_BOOTSTRAP;
-     * ignored by zclassicd. */
-    NODE_NOISE_TRANSPORT = (1 << 25),
+    /* zclassic23 hybrid Noise transport capability (Noise XXhfs, X25519 +
+     * ML-KEM-768). Advertised only when -noisetransport is enabled; a gate for
+     * OUTBOUND dials (the authoritative INBOUND discriminator is the 4-byte
+     * magic peek, which no gossip can strip). Bit 25 was the classical XX
+     * suite: it is retired, never advertised, and never dialled over Noise,
+     * because a classical peer cannot read the 1216-byte hybrid first
+     * message. In the zcl23-reserved high range, same family as
+     * NODE_BOOTSTRAP; ignored by zclassicd. */
+    NODE_NOISE_HYBRID = (1 << 26),
     /* NOTE — file-service (bundle-seeder) capability is NOT a service bit and
      * must not become one. It is advertised by the "zfileaddr" P2P message
      * (sent in core/modules/net/src/msg_version.c after a ZCL23 handshake, handled by
@@ -37,6 +40,16 @@ enum {
      * FS_PORT. Adding a bit here would be a second, weaker mechanism beside
      * the one that already works. */
 };
+
+/* Outbound Noise rule: open the hybrid handshake only toward a peer whose
+ * advertised services carry NODE_NOISE_HYBRID. Every other peer, including
+ * one advertising only the retired bit 25, is dialled on the plaintext path;
+ * no classical XX offer is made. */
+static inline bool noise_hybrid_dial_allowed(bool noise_enabled,
+                                             uint64_t peer_services)
+{
+    return noise_enabled && (peer_services & NODE_NOISE_HYBRID) != 0;
+}
 
 enum {
     MSG_TX = 1,
