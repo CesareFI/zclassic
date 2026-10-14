@@ -139,10 +139,13 @@ static size_t token_len(enum noise_token tok, bool *keyed)
 }
 
 /* Length of handshake message `idx` of the driver's pattern with an empty
- * payload: 1216, 1200 and 64 bytes for XXhfs. */
+ * payload: 1216, 1200 and 64 bytes for XXhfs. 0 when `idx` is outside the
+ * pattern's messages. */
 size_t noise_transport_handshake_msg_len(int idx)
 {
     const struct noise_pattern *p = driver_pattern();
+    if (idx < 0 || idx >= p->n_msgs)
+        return 0;
     bool keyed = false;
     size_t len = 0;
     for (int m = 0; m <= idx; m++) {

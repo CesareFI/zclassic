@@ -7,6 +7,7 @@
 #include "core/hash.h"
 #include "crypto/ed25519.h"
 #include "net/noise_transport.h"
+#include "net/protocol.h"
 #include "platform/socket_compat.h"
 #include "platform/time_compat.h"
 #include "support/cleanse.h"
@@ -31,9 +32,7 @@
 
 #define APP_CAP (1u << 20)
 #define P2P_HEADER 24u
-#define NODE_NETWORK UINT64_C(1)
 #define NODE_ZCL23 UINT64_C(1 << 10)
-#define NODE_NOISE UINT64_C(1 << 25)
 #define PROTOCOL_VERSION 170011
 
 static const uint8_t regtest_magic[4] = {0xaa, 0xe8, 0x3f, 0x5f};
@@ -192,10 +191,10 @@ static size_t build_version(uint8_t out[128])
 {
     size_t off = 0;
     zcl_write_u32_le(out + off, PROTOCOL_VERSION); off += 4;
-    zcl_write_u64_le(out + off, NODE_NETWORK | NODE_ZCL23 | NODE_NOISE); off += 8;
+    zcl_write_u64_le(out + off, (uint64_t)(NODE_NETWORK | NODE_NOISE_HYBRID) | NODE_ZCL23); off += 8;
     zcl_write_u64_le(out + off, (uint64_t)platform_time_wall_time_t()); off += 8;
     for (int address = 0; address < 2; address++) {
-        zcl_write_u64_le(out + off, NODE_NETWORK | NODE_ZCL23 | NODE_NOISE);
+        zcl_write_u64_le(out + off, (uint64_t)(NODE_NETWORK | NODE_NOISE_HYBRID) | NODE_ZCL23);
         off += 8;
         memset(out + off, 0, 16); off += 16;
         out[off++] = 0; out[off++] = 0;

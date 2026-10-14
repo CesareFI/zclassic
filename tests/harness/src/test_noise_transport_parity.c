@@ -322,6 +322,8 @@ int test_noise_transport_parity(void)
             ASSERT(noise_transport_handshake_msg_len(0) == HS_MSG1_LEN);
             ASSERT(noise_transport_handshake_msg_len(1) == HS_MSG2_LEN);
             ASSERT(noise_transport_handshake_msg_len(2) == HS_MSG3_LEN);
+            ASSERT(noise_transport_handshake_msg_len(3) == 0);
+            ASSERT(noise_transport_handshake_msg_len(-1) == 0);
             struct noise_transport *i = NULL, *r = NULL;
             ASSERT(run_handshake(&i, &r));
             ASSERT(i && r);

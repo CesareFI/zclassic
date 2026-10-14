@@ -216,3 +216,7 @@ later lane flips it HARD.
 - 2026-10-14T10:12:52Z — REASON: Export noise_transport_handshake_msg_len so tools derive the hybrid first-message length from the pattern
   old ROOT: f8fb7844dc9bdbcea1da87d362cbf8b871821feccfc7565137e8e1aabd865ed2
   by: owner unseal ritual (make core-unseal)
+
+- 2026-10-14T10:41:30Z — REASON: Bound noise_transport_handshake_msg_len to the pattern message count
+  old ROOT: 8b5071ca8f1b0461a49415ea9c8caaf136bb04813b2679e3b37e947120199034
+  by: owner unseal ritual (make core-unseal)
