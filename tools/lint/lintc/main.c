@@ -233,6 +233,8 @@ static const struct lint_gate k_gates[] = {
     { "check-fleet-facts", check_fleet_facts_run, check_fleet_facts_selftest },
     { "check-fleet-observations", check_fleet_observations_run,
       check_fleet_observations_selftest },
+    { "check-log-macro-return-type", check_log_macro_return_type_run,
+      check_log_macro_return_type_selftest },
     { "check-verification-coverage", check_verification_coverage_run,
       check_verification_coverage_selftest },
     { "check-no-real-clock-test-deadline",

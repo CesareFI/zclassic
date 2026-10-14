@@ -188,7 +188,6 @@ tools/lint/check_hosted_suite_verdict.sh
 tools/lint/check_hotswap_module_imports.sh
 tools/lint/check_hotswap_service_islands.sh
 tools/lint/check_identity_parser_single.sh
-tools/lint/check_log_macro_return_type.sh
 tools/lint/check_markdown_links.sh
 tools/lint/check_no_adx_overclaim.sh
 tools/lint/check_no_operator_paths.sh

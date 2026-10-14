@@ -6426,6 +6426,8 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_fleet_observations.c \
     tools/lint/lintc/gate_fleet_observations_proc.c \
     tools/lint/lintc/gate_fleet_observations_selftest.c \
+    tools/lint/lintc/gate_log_macro_return_type.c \
+    tools/lint/lintc/gate_log_macro_return_type_selftest.c \
     tools/lint/lintc/gate_verification_coverage.c \
     tools/lint/lintc/gate_no_real_clock_test_deadline.c \
     tools/lint/lintc/gate_no_real_clock_test_deadline_selftest.c \
@@ -13352,8 +13354,9 @@ check-silent-errors-bool: $(LINTC_TOOL)
 	@echo "══ LINT: silent call-guard return-false (RATCHET) ══"
 	@ZCL_LINT_MODE=FAIL ./tools/lint/check_silent_bool_errors.sh
 
-check-log-macro-return-type:
+check-log-macro-return-type: $(LINTC_TOOL)
 	@echo "══ LINT: LOG_* macro return type pairing ══"
+	@./tools/lint/check_log_macro_return_type.sh --selftest
 	@./tools/lint/check_log_macro_return_type.sh
 
 # Closes the raw sqlite3_prepare_v2() + unlogged NULL-check blind spot (the
