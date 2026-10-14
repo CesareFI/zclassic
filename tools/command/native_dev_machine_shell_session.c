@@ -166,12 +166,13 @@ static void ms_console_byte(struct ms_session *s, uint8_t byte)
     if (s->out_len == sizeof s->out) ms_flush(s);
 }
 
-/* The receipt that follows on the output starts on a line of its own. */
+/* On a terminal the envelope that follows on stderr starts on a line of its
+ * own. A byte stream is left exactly as the guest wrote it. */
 static void ms_finish_line(struct ms_session *s)
 {
     static const uint8_t crlf[] = {'\r', '\n'};
-    if (s->bytes_out == 0 || s->last_byte == '\n' || s->out_failed) return;
-    (void)ms_write_all(s, s->tty ? crlf : crlf + 1, s->tty ? 2u : 1u);
+    if (!s->tty || s->bytes_out == 0 || s->last_byte == '\n' || s->out_failed) return;
+    (void)ms_write_all(s, crlf, sizeof crlf);
 }
 
 /* ---- input ---- */

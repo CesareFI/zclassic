@@ -8,7 +8,8 @@
  * a signal; the escape prefix rules; guest timers across idle sleeps; the
  * receipt file; the named refusals; and the terminal attributes, which are
  * raw during the session and equal to the original afterwards, on the escape
- * exit and on the signal exit. */
+ * exit and on the signal exit; and, through the built z23-dev binary, that
+ * stdout holds only the console bytes while the envelope goes to stderr. */
 #define _XOPEN_SOURCE 700
 #include "test/test_core.h"
 
@@ -26,7 +27,9 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -212,7 +215,7 @@ static int t_echo(void)
         tms_json(json, sizeof json, "echo", TMS_GUARD);
         ASSERT(tms_go(&r, json, "abc", 3, false));
         ASSERT(tms_ok(&r));
-        ASSERT_STR_EQ(r.out, "abcabc\n");
+        ASSERT_STR_EQ(r.out, "abcabc");
         ASSERT_STR_EQ(tms_str(&r, "end"), "guest_shutdown");
         ASSERT_STR_EQ(tms_str(&r, "stop"), "shutdown");
         ASSERT_EQ(tms_int(&r, "bytes_in"), 3);
@@ -272,12 +275,12 @@ static int t_escape(void)
         /* the prefix twice is one prefix byte */
         tms_json(json, sizeof json, "echo", TMS_GUARD);
         ASSERT(tms_go(&r, json, "a" ESC ESC "b", 4, false));
-        ASSERT_STR_EQ(r.out, "a" ESC "ba" ESC "b\n");
+        ASSERT_STR_EQ(r.out, "a" ESC "ba" ESC "b");
         ASSERT_EQ(tms_int(&r, "bytes_in"), 3);
         tms_end(&r);
         /* the prefix then another byte is both bytes */
         ASSERT(tms_go(&r, json, "a" ESC "z", 3, false));
-        ASSERT_STR_EQ(r.out, "a" ESC "za" ESC "z\n");
+        ASSERT_STR_EQ(r.out, "a" ESC "za" ESC "z");
         ASSERT_EQ(tms_int(&r, "bytes_in"), 3);
         tms_end(&r);
         PASS();
@@ -669,6 +672,96 @@ static int t_input_on_stdin(void)
     } _test_next:;
     return failures;
 }
+
+#define TMS_BIN "build/bin/z23-dev"
+
+static long tms_mtime(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 ? (long)st.st_mtime : -1;
+}
+
+static bool tms_bin_fresh(void)
+{
+    static const char *const witness[] = {"tools/command/native_command.c",
+                                          "tools/command/native_dev_machine_shell.c",
+                                          "tools/command/native_dev_machine_shell_session.c"};
+    long bin = tms_mtime(TMS_BIN);
+    if (bin < 0) return false;
+    for (size_t i = 0; i < sizeof witness / sizeof witness[0]; i++)
+        if (tms_mtime(witness[i]) > bin) return false;
+    return true;
+}
+
+static size_t tms_slurp(const char *path, char *out, size_t cap)
+{
+    FILE *f = fopen(path, "rb");
+    size_t n = f ? fread(out, 1, cap - 1u, f) : 0;
+    if (f) fclose(f);
+    out[n] = '\0';
+    return n;
+}
+
+/* Runs the binary with stdin from a file and stdout and stderr to files, all
+ * in a fresh test-tmp directory that is removed afterwards. */
+static bool tms_spawn(const char *input, const char *in, char *out, size_t out_cap, char *err,
+                      size_t err_cap)
+{
+    char dir[512], fin[600], fout[600], ferr[600];
+    test_make_tmpdir(dir, sizeof dir, "tms", "streams");
+    snprintf(fin, sizeof fin, "%s/in", dir);
+    snprintf(fout, sizeof fout, "%s/out", dir);
+    snprintf(ferr, sizeof ferr, "%s/err", dir);
+    int a = open(fin, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600),
+        b = open(fout, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600),
+        c = open(ferr, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600), status = -1;
+    bool ok = a >= 0 && b >= 0 && c >= 0 && write(a, in, strlen(in)) == (ssize_t)strlen(in);
+    pid_t pid = ok ? fork() : -1;
+    if (pid == 0) {
+        if (lseek(a, 0, SEEK_SET) != 0) _exit(126);
+        dup2(a, STDIN_FILENO);
+        dup2(b, STDOUT_FILENO);
+        dup2(c, STDERR_FILENO);
+        execl(TMS_BIN, TMS_BIN, "dev", "app", "machine", "shell", input, (char *)NULL);
+        _exit(127);
+    }
+    ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    tms_slurp(fout, out, out_cap);
+    tms_slurp(ferr, err, err_cap);
+    for (int i = 0; i < 3; i++) {
+        int fd = i == 0 ? a : i == 1 ? b : c;
+        if (fd >= 0) close(fd);
+    }
+    test_rm_rf_recursive(dir);
+    return ok;
+}
+
+/* A missing or stale binary fails the case: the stream split is observed only
+ * through the CLI, so passing without running it would claim an unobserved
+ * result. */
+static int t_binary_streams(void)
+{
+    int failures = 0;
+    TEST("dev.app.machine.shell: stdout holds only the console bytes; the envelope is on stderr") {
+        char out[TMS_OUT], err[TMS_WIRE];
+        struct json_value doc;
+        const struct json_value *data;
+        if (!tms_bin_fresh())
+            printf("dev_machine_shell: " TMS_BIN " missing or older than its sources; run make\n");
+        ASSERT(tms_bin_fresh());
+        ASSERT(tms_spawn("--input={\"kernel\":\"" TMS_FIXTURES "echo.bin\",\"stdio\":\"pipe\","
+                         "\"max_instr\":50000000}", "abc", out, sizeof out, err, sizeof err));
+        ASSERT_STR_EQ(out, "abcabc");
+        ASSERT(strchr(out, '{') == NULL);
+        ASSERT(json_read(&doc, err, strlen(err)));
+        data = json_get(&doc, "data");
+        ASSERT(data != NULL);
+        ASSERT_STR_EQ(json_get_str(json_get(data, "guest_exit")), "unobserved");
+        json_free(&doc);
+        PASS();
+    } _test_next:;
+    return failures;
+}
 #endif
 
 int test_dev_machine_shell(void);
@@ -680,6 +773,6 @@ int test_dev_machine_shell(void)
     return t_echo() + t_ends() + t_escape() + t_timers() + t_receipt() + t_refusals() +
            t_dispositions() + t_backpressure() + t_output_closed() + t_receipt_symlink() +
            t_escape_keys() + t_string_members() + t_input_on_stdin() + t_pty_escape() +
-           t_pty_signal();
+           t_pty_signal() + t_binary_streams();
 #endif
 }

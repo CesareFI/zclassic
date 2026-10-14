@@ -68,6 +68,11 @@ const char *zcl_native_agent_session_env(void);
  * inspection and shell history. False for direct in-process/test dispatch. */
 bool zcl_native_input_was_stdin(void);
 
+/* Called by a handler whose stdout carries its own byte stream: the one-shot
+ * CLI then prints that call's result envelope (and any field selection) on
+ * stderr, never on stdout. Reset at the start of each dispatch. */
+void zcl_native_envelope_to_stderr(void);
+
 /* Ensure the one-shot JSON-RPC client (datadir cookie + port) is initialized
  * from the CLI-resolved -datadir/-rpcport. Handlers that call node_rpc_call()
  * or node_rpc_client_datadir() WITHOUT going through the bridge dispatch

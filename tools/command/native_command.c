@@ -295,12 +295,18 @@ static char g_bridge_datadir[512];
 static int g_bridge_rpc_port;
 static bool g_bridge_rpc_ready;
 static bool g_native_input_from_stdin;
+static bool g_native_envelope_on_stderr;
 static bool g_native_datadir_explicit;
 static enum chain_network g_native_network = CHAIN_MAIN;
 
 bool zcl_native_input_was_stdin(void)
 {
     return g_native_input_from_stdin;
+}
+
+void zcl_native_envelope_to_stderr(void)
+{
+    g_native_envelope_on_stderr = true;
 }
 
 const char *zcl_native_command_datadir(void)
@@ -2787,6 +2793,10 @@ static bool nc_human(void)
 
 static void nc_print_doc(const char *doc, const char *command_path)
 {
+    if (g_native_envelope_on_stderr) {
+        fprintf(stderr, "%s\n", doc);
+        return;
+    }
     if (nc_human()) {
         char human[ZCL_COMMAND_LIST_BUDGET + 1];
         size_t hn = zcl_cli_render_doc(doc, strlen(doc), command_path,
@@ -4430,6 +4440,7 @@ static bool nc_main_execute(struct nc_main_state *st,
     };
 
     enum zcl_command_exit exit_code = ZCL_COMMAND_EXIT_INTERNAL;
+    g_native_envelope_on_stderr = false;
     size_t n = zcl_command_registry_execute_json(
         reg, st->spec, &ctx, &st->input, st->was_alias, st->invoked, st->view,
         st->budget, st->max_items, st->cursor, out, out_cap, &exit_code);
@@ -4480,7 +4491,7 @@ static bool nc_main_apply_field_selection(const struct zcl_command_spec *spec,
         if (data && zcl_native_render_field_selection(
                         data, field_csv, sel, out_cap, selerr,
                         sizeof(selerr))) {
-            fputs(sel, stdout);
+            fputs(sel, g_native_envelope_on_stderr ? stderr : stdout);
             handled = true;
         } else {
             fprintf(stderr,

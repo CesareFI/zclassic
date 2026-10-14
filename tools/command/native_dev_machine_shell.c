@@ -13,8 +13,10 @@
  *      starts, so an existing path is refused and nothing is overwritten;
  *   3. the session runs (native_dev_machine_shell_session.c);
  *   4. the inputs are compared with their identity again.
- * The command framework prints the result envelope on stdout after the
- * session; it follows the console bytes, which end with a newline. */
+ * Stdout carries only the console bytes: the command framework prints the
+ * result envelope on stderr, and the receipt file also receives it. The
+ * guest's exit status is not observed: console end, quiet output and
+ * power-off carry none, so the result reports "guest_exit":"unobserved". */
 
 #include "command/native_command.h"
 
@@ -445,6 +447,7 @@ static void ms_emit(const struct ms_state *st, struct json_value *data)
     (void)json_push_kv_bool(data, "deterministic", false);
     (void)json_push_kv_str(data, "end", ms_end_name(s->end));
     if (s->end == MS_END_SIGNAL) (void)json_push_kv_int(data, "signal", s->signo);
+    (void)json_push_kv_str(data, "guest_exit", "unobserved");
     (void)json_push_kv_str(data, "stop", rvmachine_stop_name(s->res.stop));
     (void)json_push_kv_str(data, "stdio", st->o.pipe ? "pipe" : "terminal");
     (void)json_push_kv_int(data, "retired", (int64_t)s->res.retired);
@@ -544,6 +547,7 @@ void zcl_native_handle_dev_machine_shell(const struct zcl_command_request *reque
 {
     struct ms_state *st;
     if (reply == NULL) return;
+    zcl_native_envelope_to_stderr();
     st = zcl_calloc(1, sizeof *st, "machine_shell_state");
     if (st == NULL) {
         (void)ms_fail(reply, ZCL_COMMAND_EXIT_INTERNAL, "OUT_OF_MEMORY", "setup",

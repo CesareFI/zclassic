@@ -420,16 +420,18 @@ input or 100 ms, and then moves guest time forward by the host time that
 passed, never beyond the armed timer, so guest timers keep real-time pace and
 an idle guest costs almost no host CPU.
 
-After the session the command prints the result envelope, which follows the
-console bytes on stdout (a newline is added first if the console output did
-not end with one). It marks the run `"interactive":true,"deterministic":false`
-and reports `end` (`guest_shutdown`, `guest_reboot`, `escape`, `stdin_eof`,
+Stdout carries only the console bytes. After the session the command prints
+the result envelope on stderr (on a terminal a line break is added first if
+the console output did not end with one). It marks the run
+`"interactive":true,"deterministic":false`, states `"guest_exit":"unobserved"`
+(console end, quiet output and power-off carry no guest exit status, so none is
+reported) and reports `end` (`guest_shutdown`, `guest_reboot`, `escape`, `stdin_eof`,
 `signal`, `work_cap`, `guest_fault` or `error`), the retired, skip, firmware
 call and device work counts, `bytes_in` and `bytes_out` on the console, and the
 entropy source. The `verdict` member holds `status` (`passed` or `failed`) and
 the error `code` (empty when passed), so the data alone says whether the
 session was clean. `receipt` writes the same data to a file, so a script can
-read it without parsing the end of stdout; a receipt is not left behind when
+read it without capturing stderr; a receipt is not left behind when
 the terminal or signal setup fails. A console output that cannot be written
 (a closed pipe) ends the session as `error` and fails it as `SESSION_FAILED`,
 also when the guest powered off in the same step. The command is reachable only
