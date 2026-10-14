@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Gate P3 (docs/work/palace-design.md §3) — check-no-orphan-placement: every
 # tracked .c/.h resolves to a known navigator group (lib/<mod>, app/<shape>,
 # core, config, tools, domain, adapters, ports). A file that falls through to
