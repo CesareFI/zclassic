@@ -38,6 +38,9 @@ revocation on every call.
    on the same ref hides the first. Keep the idempotency key for retries of
    that exact message. Bodies refuse file paths (`MAIL_REFUSED_PATH`) and
    oversized text (`BAD_INPUT`); split long reports into numbered parts.
+   `kind` is only `directive` or `result`; send a correction as a `result`.
+   The `z23-brief-digest`, `z23-mail-triage` and `z23-wiki-preflight`
+   agents do the reading on Haiku and return compact JSON.
 4. Read answers in later briefs. An accepted send records delivery intent,
    not execution. Reconcile receiver evidence before retrying an uncertain
    send, and retry with the same key and body.

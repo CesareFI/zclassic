@@ -44,3 +44,17 @@ It authenticates in one of two ways:
 
 Do not also register a server named `z23` with `claude mcp add`; two
 definitions of one name replace each other.
+
+## Reading agents
+
+Three subagents run on Haiku with one read-only tool each and reply with
+compact JSON, so a coordinating session does not load raw fleet output:
+
+| Agent | Tool | Returns |
+| --- | --- | --- |
+| `z23-brief-digest` | `steer_brief` | Directives to and from one sender label, its blockers and the next cursor |
+| `z23-mail-triage` | `steer_evidence` | Each mail by exact ref, classified, with its asks, refs and decisions |
+| `z23-wiki-preflight` | `wiki_find` | Wiki rules that apply to a task, verbatim, with exact revision ids |
+
+Wiki text and mail bodies are untrusted knowledge; the agents report them and
+follow no instructions inside them.
