@@ -7,6 +7,7 @@
 #include "sha3/sha3.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
 #include <limits.h>
@@ -17,6 +18,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PROBE "tree_closure_probe"
@@ -39,14 +41,83 @@ static const char *g_cc;
 static const char *g_std;
 static struct tree_hash g_first;
 
-static void check(bool ok, const char *what)
+
+static volatile sig_atomic_t g_cleaning;
+static volatile sig_atomic_t g_sig;
+
+static void tcp_signal_set(sigset_t *set)
 {
+    sigemptyset(set);
+    sigaddset(set, SIGINT);
+    sigaddset(set, SIGTERM);
+    sigaddset(set, SIGHUP);
+}
+
+static int tcp_rm_entry(const char *path, const struct stat *, int,
+                        struct FTW *)
+{
+    return remove(path);
+}
+
+static void tcp_cleanup(void)
+{
+    sigset_t set;
+    tcp_signal_set(&set);
+    sigprocmask(SIG_BLOCK, &set, nullptr);
+    if (g_cleaning || !g_work[0]) return;
+    g_cleaning = 1;
+    nftw(g_work, tcp_rm_entry, 16, FTW_DEPTH | FTW_PHYS);
+}
+
+/* The handler only records the signal; the main path acts on it. */
+static void tcp_on_signal(int sig)
+{
+    g_sig = sig;
+}
+
+static void tcp_on_child(int sig)
+{
+    (void)sig;
+}
+
+static _Noreturn void tcp_die(int sig)
+{
+    struct sigaction sa = { .sa_handler = SIG_DFL };
+    sigset_t set;
+    tcp_cleanup();
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, nullptr);
+    tcp_signal_set(&set);
+    sigprocmask(SIG_UNBLOCK, &set, nullptr);
+    raise(sig);
+    _exit(128 + sig);
+}
+
+static void tcp_poll(void)
+{
+    if (g_sig) tcp_die(g_sig);
+}
+
+static void tcp_install_handlers(void)
+{
+    const int sigs[] = { SIGINT, SIGTERM, SIGHUP, SIGCHLD };
+    struct sigaction sa = { .sa_flags = 0 };
+    sigemptyset(&sa.sa_mask);
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        sa.sa_handler = sigs[i] == SIGCHLD ? tcp_on_child : tcp_on_signal;
+        sigaction(sigs[i], &sa, nullptr);
+    }
+}
+
+static void tcp_check(bool ok, const char *what)
+{
+    tcp_poll();
     if (ok) return;
     fprintf(stderr, "%s: failed: %s\n", PROBE, what);
     exit(1);
 }
 
-static const char *wp(const char *rel)
+static const char *tcp_wp(const char *rel)
 {
     static char ring[8][2 * PATH_MAX];
     static unsigned next;
@@ -55,85 +126,113 @@ static const char *wp(const char *rel)
     return b;
 }
 
-static void redirect(int fd, const char *path)
+static void tcp_redirect(int fd, const char *path)
 {
     if (!path) return;
     int f = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (f < 0 || dup2(f, fd) < 0) _exit(127);
     close(f);
 }
-
-static volatile sig_atomic_t g_cleaning;
-
-static void block_signals(sigset_t *old)
+/* Forward the recorded signal, allow the child 5 s to exit, then kill it. */
+static void tcp_reap_forwarded(pid_t pid, int sig)
 {
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    sigaddset(&set, SIGTERM);
-    sigaddset(&set, SIGHUP);
-    sigprocmask(SIG_BLOCK, &set, old);
+    int st;
+    kill(pid, sig);
+    for (int i = 0; i < 500; i++) {
+        if (waitpid(pid, &st, WNOHANG) != 0) return;
+        nanosleep(&(struct timespec){ .tv_nsec = 10000000 }, nullptr);
+    }
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
 }
 
-static int run(const char *const argv[], const char *out, const char *err,
-               char *const env[])
+/* Signals stay blocked except inside sigsuspend, so none slips between the
+ * check and the wait. */
+static int tcp_wait(pid_t pid, const sigset_t *old)
 {
+    int st;
+    for (;;) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid) break;
+        if (r < 0 && errno != EINTR) tcp_check(false, "waitpid");
+        if (g_sig) {
+            tcp_reap_forwarded(pid, g_sig);
+            tcp_die(g_sig);
+        }
+        sigsuspend(old);
+    }
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static int tcp_run(const char *const argv[], const char *out, const char *err,
+                   char *const env[])
+{
+    tcp_poll();
     fflush(nullptr);
-    sigset_t held;
-    block_signals(&held);
+    sigset_t block, held;
+    tcp_signal_set(&block);
+    sigaddset(&block, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &block, &held);
     pid_t pid = fork();
-    check(pid >= 0, "fork");
-    if (pid == 0) {
-        signal(SIGINT, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
-        signal(SIGHUP, SIG_DFL);
+    if (pid < 0) {
         sigprocmask(SIG_SETMASK, &held, nullptr);
-        redirect(1, out);
-        redirect(2, err);
+        tcp_check(false, "fork");
+    }
+    if (pid == 0) {
+        struct sigaction sa = { .sa_handler = SIG_DFL };
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
+        sigaction(SIGHUP, &sa, nullptr);
+        sigaction(SIGCHLD, &sa, nullptr);
+        sigprocmask(SIG_SETMASK, &held, nullptr);
+        tcp_redirect(1, out);
+        tcp_redirect(2, err);
         for (size_t i = 0; env && env[i]; i++) putenv(env[i]);
         execv(argv[0], (char *const *)argv);
         _exit(127);
     }
+    int rc = tcp_wait(pid, &held);
     sigprocmask(SIG_SETMASK, &held, nullptr);
-    int st;
-    check(waitpid(pid, &st, 0) == pid, "waitpid");
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    tcp_poll();
+    return rc;
 }
 
-static void slurp(const char *path, char *buf, size_t cap)
+static void tcp_slurp(const char *path, char *buf, size_t cap)
 {
     FILE *f = fopen(path, "r");
     size_t n = f ? fread(buf, 1, cap - 1, f) : 0;
     buf[n] = '\0';
+    tcp_poll();
     if (f) {
-        check(fgetc(f) == EOF, "output exceeds buffer");
+        tcp_check(fgetc(f) == EOF, "output exceeds buffer");
         fclose(f);
     }
 }
 
-static void write_text(const char *path, const char *text)
+static void tcp_write_text(const char *path, const char *text)
 {
     FILE *f = fopen(path, "w");
-    check(f && fputs(text, f) >= 0 && fclose(f) == 0, "write file");
+    tcp_check(f && fputs(text, f) >= 0 && fclose(f) == 0, "write file");
 }
 
-static void copy_file(const char *src, const char *dst)
+static void tcp_copy_file(const char *src, const char *dst)
 {
     int in = open(src, O_RDONLY);
     struct stat st;
-    check(in >= 0 && fstat(in, &st) == 0, "copy source");
+    tcp_check(in >= 0 && fstat(in, &st) == 0, "copy source");
     int out = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    check(out >= 0, "copy destination");
+    tcp_check(out >= 0, "copy destination");
     char buf[4096];
     ssize_t n;
     while ((n = read(in, buf, sizeof buf)) > 0)
-        check(write(out, buf, (size_t)n) == n, "copy write");
-    check(n == 0 && fchmod(out, st.st_mode & 07777) == 0, "copy finish");
+        tcp_check(write(out, buf, (size_t)n) == n, "copy write");
+    tcp_check(n == 0 && fchmod(out, st.st_mode & 07777) == 0, "copy finish");
     close(in);
     close(out);
 }
 
-static bool hex64(const char *p)
+static bool tcp_hex64(const char *p)
 {
     for (int i = 0; i < 64; i++)
         if (!isxdigit((unsigned char)p[i]) || isupper((unsigned char)p[i]))
@@ -141,13 +240,13 @@ static bool hex64(const char *p)
     return true;
 }
 
-static bool field(const char *text, const char *key, bool bol, char end,
+static bool tcp_field(const char *text, const char *key, bool bol, char end,
                   char out[65])
 {
     for (const char *p = strstr(text, key); p; p = strstr(p + 1, key)) {
         if (bol && p != text && p[-1] != '\n') continue;
         const char *v = p + strlen(key);
-        if (!hex64(v) || v[64] != end) continue;
+        if (!tcp_hex64(v) || v[64] != end) continue;
         memcpy(out, v, 64);
         out[64] = '\0';
         return true;
@@ -155,7 +254,7 @@ static bool field(const char *text, const char *key, bool bol, char end,
     return false;
 }
 
-static bool has_line(const char *text, const char *line)
+static bool tcp_has_line(const char *text, const char *line)
 {
     size_t n = strlen(line);
     for (const char *p = text; *p;) {
@@ -166,57 +265,57 @@ static bool has_line(const char *text, const char *line)
     return false;
 }
 
-static int tree_hash(const char *dir, const char *uid, struct tree_hash *h)
+static int tcp_tree_hash(const char *dir, const char *uid, struct tree_hash *h)
 {
-    const char *argv[] = { wp("tree-closure"), "hash", dir, uid, nullptr };
-    int rc = run(argv, wp("hash.out"), wp("hash.err"), nullptr);
-    slurp(wp("hash.out"), h->text, sizeof h->text);
+    const char *argv[] = { tcp_wp("tree-closure"), "hash", dir, uid, nullptr };
+    int rc = tcp_run(argv, tcp_wp("hash.out"), tcp_wp("hash.err"), nullptr);
+    tcp_slurp(tcp_wp("hash.out"), h->text, sizeof h->text);
     h->tree[0] = h->content[0] = '\0';
     if (rc == 0)
-        check(field(h->text, "tree_sha3=", true, ' ', h->tree) &&
-              field(h->text, " content_sha3=", false, ' ', h->content),
+        tcp_check(tcp_field(h->text, "tree_sha3=", true, ' ', h->tree) &&
+              tcp_field(h->text, " content_sha3=", false, ' ', h->content),
               "tree digests");
     return rc;
 }
 
-static void hash_ok(const char *dir, struct tree_hash *h)
+static void tcp_hash_ok(const char *dir, struct tree_hash *h)
 {
-    check(tree_hash(dir, g_uid, h) == 0, "tree hash");
+    tcp_check(tcp_tree_hash(dir, g_uid, h) == 0, "tree hash");
 }
 
-static void refuse_as(const char *dir, const char *uid, const char *reason)
+static void tcp_refuse_as(const char *dir, const char *uid, const char *reason)
 {
     struct tree_hash h;
-    check(tree_hash(dir, uid, &h) != 0, reason);
+    tcp_check(tcp_tree_hash(dir, uid, &h) != 0, reason);
     char err[TEXT_MAX], want[128];
-    slurp(wp("hash.err"), err, sizeof err);
+    tcp_slurp(tcp_wp("hash.err"), err, sizeof err);
     snprintf(want, sizeof want, "tree_closure_refuse=%s", reason);
-    check(has_line(err, want), want);
+    tcp_check(tcp_has_line(err, want), want);
 }
 
-static void refuse(const char *reason)
+static void tcp_refuse(const char *reason)
 {
-    refuse_as(wp("root"), g_uid, reason);
+    tcp_refuse_as(tcp_wp("root"), g_uid, reason);
 }
 
-static void closure(const char *five, char *const env[], char out[65])
+static void tcp_closure(const char *five, char *const env[], char out[65])
 {
     struct tree_hash tool, root;
-    hash_ok(wp("tool"), &tool);
-    hash_ok(wp("root"), &root);
+    tcp_hash_ok(tcp_wp("tool"), &tool);
+    tcp_hash_ok(tcp_wp("root"), &root);
     char cwd[PATH_MAX];
-    check(getcwd(cwd, sizeof cwd) != nullptr, "getcwd");
-    const char *argv[] = { wp("fixed-result-closure"), "combine",
+    tcp_check(getcwd(cwd, sizeof cwd) != nullptr, "getcwd");
+    const char *argv[] = { tcp_wp("fixed-result-closure"), "combine",
         tool.content, root.content, tool.tree, root.tree, five, g_zeros, cwd,
         nullptr };
-    const char *outp = wp("combine.out");
-    check(run(argv, outp, nullptr, env) == 0, "combine");
+    const char *outp = tcp_wp("combine.out");
+    tcp_check(tcp_run(argv, outp, nullptr, env) == 0, "combine");
     char text[TEXT_MAX];
-    slurp(outp, text, sizeof text);
-    check(field(text, "closure_sha3=", true, '\n', out), "closure digest");
+    tcp_slurp(outp, text, sizeof text);
+    tcp_check(tcp_field(text, "closure_sha3=", true, '\n', out), "closure digest");
 }
 
-static void compile(const char *const sources[], size_t n, const char *out)
+static void tcp_compile(const char *const sources[], size_t n, const char *out)
 {
     const char *argv[24] = { g_cc, g_std, "-Wall", "-Wextra", "-Werror",
         "-pedantic", "-Iplatform/modules/sha3/include",
@@ -226,202 +325,184 @@ static void compile(const char *const sources[], size_t n, const char *out)
     argv[k++] = "-o";
     argv[k++] = out;
     argv[k] = nullptr;
-    check(run(argv, nullptr, nullptr, nullptr) == 0, "compile tool");
+    tcp_check(tcp_run(argv, nullptr, nullptr, nullptr) == 0, "compile tool");
 }
 
-static void build_tools(void)
+static void tcp_build_tools(void)
 {
     const char *tree[] = { "tools/verify/tree_closure.c",
         "platform/modules/sha3/src/sha3.c",
         "platform/modules/base/src/safe_alloc.c" };
     const char *fixed[] = { "tools/verify/fixed_result_closure.c",
         "platform/modules/sha3/src/sha3.c" };
-    compile(tree, 3, wp("tree-closure"));
-    compile(fixed, 2, wp("fixed-result-closure"));
+    tcp_compile(tree, 3, tcp_wp("tree-closure"));
+    tcp_compile(fixed, 2, tcp_wp("fixed-result-closure"));
 }
 
-static void stage_green(void)
+static void tcp_stage_green(void)
 {
-    write_text(wp("root/cc1"), "backend-one\n");
-    write_text(wp("tool/cc1"), "backend-one\n");
-    write_text(wp("root/result.c"), "#include \"base.h\"\n");
-    write_text(wp("root/base.h"), "int result(void);\n");
-    hash_ok(wp("root"), &g_first);
-    check(strstr(g_first.text, "attest_eligible=0"), "attest_eligible=0");
+    tcp_write_text(tcp_wp("root/cc1"), "backend-one\n");
+    tcp_write_text(tcp_wp("tool/cc1"), "backend-one\n");
+    tcp_write_text(tcp_wp("root/result.c"), "#include \"base.h\"\n");
+    tcp_write_text(tcp_wp("root/base.h"), "int result(void);\n");
+    tcp_hash_ok(tcp_wp("root"), &g_first);
+    tcp_check(strstr(g_first.text, "attest_eligible=0"), "attest_eligible=0");
     struct tree_hash again, clone;
-    hash_ok(wp("root"), &again);
-    check(!strcmp(g_first.tree, again.tree), "repeat tree digest");
-    check(!strcmp(g_first.content, again.content), "repeat content digest");
-    check(mkdir(wp("clone"), 0700) == 0, "mkdir clone");
+    tcp_hash_ok(tcp_wp("root"), &again);
+    tcp_check(!strcmp(g_first.tree, again.tree), "repeat tree digest");
+    tcp_check(!strcmp(g_first.content, again.content), "repeat content digest");
+    tcp_check(mkdir(tcp_wp("clone"), 0700) == 0, "mkdir clone");
     const char *names[] = { "cc1", "result.c", "base.h" };
     for (int i = 0; i < 3; i++) {
         char rel[64];
         snprintf(rel, sizeof rel, "root/%s", names[i]);
         char src[PATH_MAX];
-        snprintf(src, sizeof src, "%s", wp(rel));
+        snprintf(src, sizeof src, "%s", tcp_wp(rel));
         snprintf(rel, sizeof rel, "clone/%s", names[i]);
-        copy_file(src, wp(rel));
+        tcp_copy_file(src, tcp_wp(rel));
     }
-    hash_ok(wp("clone"), &clone);
-    check(!strcmp(clone.content, g_first.content), "portable content");
-    refuse_as(wp("root"), "60092", "unsafe_root");
+    tcp_hash_ok(tcp_wp("clone"), &clone);
+    tcp_check(!strcmp(clone.content, g_first.content), "portable content");
+    tcp_refuse_as(tcp_wp("root"), "60092", "unsafe_root");
 }
 
-static void stage_closure(void)
+static void tcp_stage_closure(void)
 {
     snprintf(g_path_env, sizeof g_path_env, "COMPILER_PATH=%s",
-             wp("red-tool"));
+             tcp_wp("red-tool"));
     char *const env[] = { g_path_env, nullptr };
     char other[65];
-    closure(g_zeros, nullptr, g_baseline);
-    check(g_baseline[0], "baseline closure");
-    closure(g_zeros, env, other);
-    check(!strcmp(other, g_baseline), "policy claim stable");
-    closure(g_ones, nullptr, other);
-    check(strcmp(other, g_baseline), "policy claim changes closure");
+    tcp_closure(g_zeros, nullptr, g_baseline);
+    tcp_check(g_baseline[0], "baseline closure");
+    tcp_closure(g_zeros, env, other);
+    tcp_check(!strcmp(other, g_baseline), "policy claim stable");
+    tcp_closure(g_ones, nullptr, other);
+    tcp_check(strcmp(other, g_baseline), "policy claim changes closure");
 }
 
-static void stage_optional(void)
+static void tcp_stage_optional(void)
 {
     struct tree_hash h;
     char c[65];
-    write_text(wp("root/optional.h"), "int optional(void);\n");
-    hash_ok(wp("root"), &h);
-    check(strcmp(h.tree, g_first.tree), "optional header changes tree");
-    closure(g_zeros, nullptr, c);
-    check(strcmp(c, g_baseline), "optional header changes closure");
-    check(unlink(wp("root/optional.h")) == 0, "remove optional");
-    hash_ok(wp("root"), &h);
-    check(!strcmp(h.tree, g_first.tree), "optional removal restores tree");
-    closure(g_zeros, nullptr, c);
-    check(!strcmp(c, g_baseline), "optional removal restores closure");
+    tcp_write_text(tcp_wp("root/optional.h"), "int optional(void);\n");
+    tcp_hash_ok(tcp_wp("root"), &h);
+    tcp_check(strcmp(h.tree, g_first.tree), "optional header changes tree");
+    tcp_closure(g_zeros, nullptr, c);
+    tcp_check(strcmp(c, g_baseline), "optional header changes closure");
+    tcp_check(unlink(tcp_wp("root/optional.h")) == 0, "remove optional");
+    tcp_hash_ok(tcp_wp("root"), &h);
+    tcp_check(!strcmp(h.tree, g_first.tree), "optional removal restores tree");
+    tcp_closure(g_zeros, nullptr, c);
+    tcp_check(!strcmp(c, g_baseline), "optional removal restores closure");
 }
 
-static void stage_backend(void)
+static void tcp_stage_backend(void)
 {
     struct tree_hash h;
     char c[65];
-    write_text(wp("root/cc1"), "backend-two\n");
-    hash_ok(wp("root"), &h);
-    check(strcmp(h.tree, g_first.tree), "backend replacement changes tree");
-    write_text(wp("root/cc1"), "backend-one\n");
-    write_text(wp("tool/cc1"), "backend-two\n");
-    closure(g_zeros, nullptr, c);
-    check(strcmp(c, g_baseline), "tool replacement changes closure");
-    write_text(wp("tool/cc1"), "backend-one\n");
+    tcp_write_text(tcp_wp("root/cc1"), "backend-two\n");
+    tcp_hash_ok(tcp_wp("root"), &h);
+    tcp_check(strcmp(h.tree, g_first.tree), "backend replacement changes tree");
+    tcp_write_text(tcp_wp("root/cc1"), "backend-one\n");
+    tcp_write_text(tcp_wp("tool/cc1"), "backend-two\n");
+    tcp_closure(g_zeros, nullptr, c);
+    tcp_check(strcmp(c, g_baseline), "tool replacement changes closure");
+    tcp_write_text(tcp_wp("tool/cc1"), "backend-one\n");
 }
 
-static void stage_unsafe(void)
+static void tcp_stage_unsafe(void)
 {
     struct tree_hash h;
     char link[PATH_MAX];
-    snprintf(link, sizeof link, "%s", wp("root/backend-link"));
-    check(chmod(wp("root/cc1"), 0666) == 0, "chmod 666");
-    refuse("writable_entry");
-    check(chmod(wp("root/cc1"), 0600) == 0, "chmod 600");
-    check(symlink("cc1", link) == 0, "symlink inside");
-    hash_ok(wp("root"), &h);
-    check(unlink(link) == 0 && symlink("/etc/passwd", link) == 0, "relink");
-    refuse("symlink_absolute");
-    check(unlink(link) == 0, "unlink");
-    write_text(wp("outside"), "outside\n");
-    check(symlink("../outside", link) == 0, "symlink outside");
-    refuse("symlink_escapes_root");
-    check(unlink(link) == 0, "unlink");
-    check(mkfifo(wp("root/pipe"), 0666) == 0, "mkfifo");
-    refuse("special_entry");
-    check(unlink(wp("root/pipe")) == 0, "unlink fifo");
+    snprintf(link, sizeof link, "%s", tcp_wp("root/backend-link"));
+    tcp_check(chmod(tcp_wp("root/cc1"), 0666) == 0, "chmod 666");
+    tcp_refuse("writable_entry");
+    tcp_check(chmod(tcp_wp("root/cc1"), 0600) == 0, "chmod 600");
+    tcp_check(symlink("cc1", link) == 0, "symlink inside");
+    tcp_hash_ok(tcp_wp("root"), &h);
+    tcp_check(unlink(link) == 0 && symlink("/etc/passwd", link) == 0, "relink");
+    tcp_refuse("symlink_absolute");
+    tcp_check(unlink(link) == 0, "unlink");
+    tcp_write_text(tcp_wp("outside"), "outside\n");
+    tcp_check(symlink("../outside", link) == 0, "symlink outside");
+    tcp_refuse("symlink_escapes_root");
+    tcp_check(unlink(link) == 0, "unlink");
+    tcp_check(mkfifo(tcp_wp("root/pipe"), 0666) == 0, "mkfifo");
+    tcp_refuse("special_entry");
+    tcp_check(unlink(tcp_wp("root/pipe")) == 0, "unlink fifo");
 }
 
-static void file_digest(const char *path, unsigned char out[32])
+static void tcp_file_digest(const char *path, unsigned char out[32])
 {
     FILE *f = fopen(path, "rb");
-    check(f != nullptr, "open driver");
+    tcp_check(f != nullptr, "open driver");
     struct sha3_256_ctx ctx;
     sha3_256_init(&ctx);
     unsigned char buf[65536];
     size_t n;
     while ((n = fread(buf, 1, sizeof buf, f)) > 0)
         sha3_256_write(&ctx, buf, n);
-    check(!ferror(f), "read driver");
+    tcp_check(!ferror(f), "read driver");
     fclose(f);
     sha3_256_finalize(&ctx, out);
 }
 
-static void stage_red(void)
+static void tcp_stage_red(void)
 {
     char real_cc1[PATH_MAX];
     const char *pn[] = { g_cc, "-print-prog-name=cc1", nullptr };
-    check(run(pn, wp("cc1.path"), nullptr, nullptr) == 0, "prog-name");
-    slurp(wp("cc1.path"), real_cc1, sizeof real_cc1);
+    tcp_check(tcp_run(pn, tcp_wp("cc1.path"), nullptr, nullptr) == 0, "prog-name");
+    tcp_slurp(tcp_wp("cc1.path"), real_cc1, sizeof real_cc1);
     real_cc1[strcspn(real_cc1, "\n")] = '\0';
-    check(real_cc1[0], "cc1 path");
-    write_text(wp("red-tool/cc1"), "#!/bin/sh\n"
+    tcp_check(real_cc1[0], "cc1 path");
+    tcp_write_text(tcp_wp("red-tool/cc1"), "#!/bin/sh\n"
                "printf 'invoked\\n' > \"$RED_MARKER\"\n"
                "exec \"$REAL_CC1\" \"$@\"\n");
-    check(chmod(wp("red-tool/cc1"), 0700) == 0, "chmod wrapper");
-    write_text(wp("unit.c"), "int z23_red(void) { return 7; }\n");
+    tcp_check(chmod(tcp_wp("red-tool/cc1"), 0700) == 0, "chmod wrapper");
+    tcp_write_text(tcp_wp("unit.c"), "int z23_red(void) { return 7; }\n");
     unsigned char before[32], after[32];
-    file_digest(g_cc, before);
+    tcp_file_digest(g_cc, before);
     char marker[PATH_MAX + 16], real[PATH_MAX + 16];
-    snprintf(marker, sizeof marker, "RED_MARKER=%s", wp("cc1.marker"));
+    snprintf(marker, sizeof marker, "RED_MARKER=%s", tcp_wp("cc1.marker"));
     snprintf(real, sizeof real, "REAL_CC1=%s", real_cc1);
     char *const env[] = { marker, real, g_path_env, nullptr };
-    const char *cc[] = { g_cc, g_std, "-c", wp("unit.c"), "-o",
-                         wp("unit.o"), nullptr };
-    check(run(cc, nullptr, nullptr, env) == 0, "red compile");
-    file_digest(g_cc, after);
+    const char *cc[] = { g_cc, g_std, "-c", tcp_wp("unit.c"), "-o",
+                         tcp_wp("unit.o"), nullptr };
+    tcp_check(tcp_run(cc, nullptr, nullptr, env) == 0, "red compile");
+    tcp_file_digest(g_cc, after);
     struct stat st;
-    check(stat(wp("cc1.marker"), &st) == 0 && st.st_size > 0, "marker");
-    check(!memcmp(before, after, sizeof before), "driver unchanged");
+    tcp_check(stat(tcp_wp("cc1.marker"), &st) == 0 && st.st_size > 0, "marker");
+    tcp_check(!memcmp(before, after, sizeof before), "driver unchanged");
 }
 
-static int rm_entry(const char *path, const struct stat *, int,
-                    struct FTW *)
-{
-    return remove(path);
-}
-
-static void cleanup(void)
-{
-    if (g_cleaning || !g_work[0]) return;
-    g_cleaning = 1;
-    sigset_t old;
-    block_signals(&old);
-    nftw(g_work, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
-}
-
-static void on_signal(int sig)
-{
-    if (!g_cleaning) cleanup();
-    raise(sig);
-}
-
-static void install_handlers(void)
-{
-    struct sigaction sa = { .sa_handler = on_signal,
-                            .sa_flags = SA_RESETHAND | SA_NODEFER };
-    sigemptyset(&sa.sa_mask);
-    const int sigs[] = { SIGINT, SIGTERM, SIGHUP };
-    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
-        sigaction(sigs[i], &sa, nullptr);
-}
-
-static void make_work(void)
+static void tcp_make_work(void)
 {
     umask(077);
     const char *home = getenv("HOME");
-    check(home && *home, "HOME");
-    snprintf(g_work, sizeof g_work, "%s/.z23-verify-tree-probe.XXXXXX", home);
-    check(mkdtemp(g_work) != nullptr, "mkdtemp");
-    atexit(cleanup);
-    install_handlers();
+    tcp_check(home && *home, "HOME");
+    char templ[PATH_MAX];
+    int n = snprintf(templ, sizeof templ, "%s/.z23-verify-tree-probe.XXXXXX",
+                     home);
+    tcp_check(n > 0 && (size_t)n < sizeof templ, "HOME length");
+    tcp_install_handlers();
+    sigset_t set, old;
+    tcp_signal_set(&set);
+    sigprocmask(SIG_BLOCK, &set, &old);
+    bool made = mkdtemp(templ) != nullptr;
+    if (made) {
+        memcpy(g_work, templ, (size_t)n + 1);
+        atexit(tcp_cleanup);
+    }
+    sigprocmask(SIG_SETMASK, &old, nullptr);
+    tcp_check(made, "mkdtemp");
     const char *dirs[] = { "root", "tool", "red-tool" };
-    for (int i = 0; i < 3; i++) check(mkdir(wp(dirs[i]), 0700) == 0, "mkdir");
+    for (int i = 0; i < 3; i++)
+        tcp_check(mkdir(tcp_wp(dirs[i]), 0700) == 0, "mkdir");
     snprintf(g_uid, sizeof g_uid, "%u", (unsigned)getuid());
     memset(g_zeros, '0', 64);
     memset(g_ones, '0', 63);
     g_ones[63] = '1';
+    if (getenv("TREE_CLOSURE_PROBE_READY")) fputs("ready\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -435,14 +516,14 @@ int main(int argc, char **argv)
     }
     g_cc = argv[2];
     g_std = argv[3];
-    make_work();
-    build_tools();
-    stage_green();
-    stage_closure();
-    stage_optional();
-    stage_backend();
-    stage_unsafe();
-    stage_red();
+    tcp_make_work();
+    tcp_build_tools();
+    tcp_stage_green();
+    tcp_stage_closure();
+    tcp_stage_optional();
+    tcp_stage_backend();
+    tcp_stage_unsafe();
+    tcp_stage_red();
     puts("tree_green=1 portable_content_equal=1 uid_mismatch_red=1 "
          "negative_header_red=1 backend_replacement_red=1 policy_claim_red=1 "
          "unsafe_entry_refusals=4");
