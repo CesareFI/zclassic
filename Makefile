@@ -6479,6 +6479,8 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_macos_acceptance_selftest.c \
     tools/lint/lintc/gate_sqlite_cursor_lifetime.c \
     tools/lint/lintc/lintc_sig.c \
+    tools/lint/lintc/gate_orient_facts.c \
+    tools/lint/lintc/gate_orient_facts_selftest.c \
     tools/lint/lintc/gate_tor_provenance.c \
     tools/lint/lintc/gate_tor_provenance_selftest.c \
     $(LINTC_PREMISE_SRCS) \
@@ -14416,7 +14418,7 @@ fix-doc-counts:
 # misleading the next reader. No baseline and no exemption list: weakening an
 # anchor to make a stale row pass is the one failure this cannot allow. The
 # selftest plants a broken anchor and proves the gate trips on it.
-check-orient-facts:
+check-orient-facts: $(LINTC_TOOL)
 	@echo "══ LINT: orientation facts still true ══"
 	@./tools/lint/check_orient_facts.sh --selftest
 	@./tools/lint/check_orient_facts.sh

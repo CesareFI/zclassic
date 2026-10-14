@@ -193,8 +193,6 @@ tools/lint/check_no_adx_overclaim.sh
 tools/lint/check_no_operator_paths.sh
 tools/lint/check_no_stale_pinned_facts.sh
 tools/lint/check_no_wallclock_assertion.sh
-tools/lint/check_object_reproducible.sh
-tools/lint/check_orient_facts.sh
 tools/lint/check_outparam_init_before_return.sh
 tools/lint/check_package_anatomy.sh
 tools/lint/check_pipefail_status_pipe.sh

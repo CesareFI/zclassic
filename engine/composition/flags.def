@@ -1717,7 +1717,7 @@ Z23_FLAG("ZCL_ORACLE_TIP_MARGIN", "env_runtime", "-", "-",
 Z23_FLAG("ZCL_ORIENT_FACTS_DIR", "env_build", "engine/composition/facts", "-",
           "selftest-only override of the orientation facts dir check-orient-facts.sh "
           "scans, so its own selftest can point the gate at a throwaway fixture "
-          "tree instead of the real one; first use tools/lint/check_orient_facts.sh:auto")
+          "tree instead of the real one; first use tools/lint/lintc/gate_orient_facts.c:auto")
 Z23_FLAG("ZCL_ORPHAN_PLACEMENT_FILES", "env_build", "-", "-",
           "undocumented; first use tools/lint/lintc/gate_ratchet_ports.c:auto")
 Z23_FLAG("ZCL_OTLP_LOGS", "env_runtime", "-", "-",
