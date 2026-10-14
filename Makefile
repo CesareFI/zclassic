@@ -4473,8 +4473,8 @@ worktree-gc:
 # Wrap the gate instead: the receipt is a byproduct of running it, holding the
 # command, HEAD, dirty state, exit status, wall/child-CPU time, and a SHA3 of
 # the captured output, which is stored alongside. See the forgery model in
-# tools/agent/gate-receipt.sh — this is EVIDENCE, not proof.
-.PHONY: gate-receipt check-claims check-claims-selftest agent-velocity agent-velocity-selftest agent-sha3 dev-fleet-selftest
+# tools/agent/gate_receipt.c — this is EVIDENCE, not proof.
+.PHONY: gate-receipt gate-receipt-bin check-claims check-claims-selftest agent-velocity agent-velocity-selftest agent-sha3 dev-fleet-selftest
 
 AGENT_SHA3_SRCS := tools/agent/agent_sha3.c platform/modules/sha3/src/sha3.c
 agent-sha3: $(BIN_DIR)/agent_sha3
@@ -4497,6 +4497,14 @@ $(CHECK_CLAIMS_BIN): $(CHECK_CLAIMS_SRCS)
 # repository, receipts or files are read.
 check-claims-selftest: $(CHECK_CLAIMS_BIN)
 	@$(CHECK_CLAIMS_BIN) --selftest
+
+GATE_RECEIPT_SRCS := tools/agent/gate_receipt.c tools/agent/gate_receipt_proc.c tools/agent/gate_receipt_text.c platform/modules/sha3/src/sha3.c platform/modules/base/src/safe_alloc.c
+gate-receipt-bin: $(BIN_DIR)/gate_receipt
+$(BIN_DIR)/gate_receipt: $(GATE_RECEIPT_SRCS) tools/agent/gate_receipt.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic $(HARDEN_CFLAGS) \
+	    -Iplatform/modules/sha3/include -Icore/modules/crypto/include -Iplatform/modules/base/include \
+	    -o $@ $(GATE_RECEIPT_SRCS) $(HARDEN_LDFLAGS)
 
 AGENT_VELOCITY_BIN := $(BIN_DIR)/agent_velocity
 $(AGENT_VELOCITY_BIN): tools/agent/agent_velocity.c platform/modules/base/src/safe_alloc.c
@@ -4868,7 +4876,7 @@ $(BIN_DIR)/zclassic23-package-sign: FORCE tools/zcode_dev_signer.c platform/modu
 #   make gate-receipt GATE=t-fast CMD='make t-fast ONLY=boot_phase'
 # Or call it directly, which avoids a second Makefile parse:
 #   tools/agent/gate-receipt.sh --gate lint -- make lint
-gate-receipt:
+gate-receipt: $(BIN_DIR)/gate_receipt
 	@if [ -z "$(GATE)" ] || [ -z "$(CMD)" ]; then \
 	    echo "usage: make gate-receipt GATE=<slug> CMD='<command>'"; \
 	    echo "  e.g. make gate-receipt GATE=lint CMD='make lint'"; \

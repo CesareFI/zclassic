@@ -218,16 +218,21 @@ static int t_build_needs_overlap(void)
     return bad;
 }
 
+/* Builds the wrapper into the fixture exactly as tools/agent/gate-receipt.sh
+ * would, so the fixture needs no copy of the sources besides the shim. */
+#define RECEIPT_FIXTURE_PREAMBLE \
+    "set -euo pipefail; cd \"$2\"\n" \
+    "for tool in cc git bash mkfifo; do command -v \"$tool\" >/dev/null; done\n" \
+    "mkdir -p tools/agent build/bin receipts\n" \
+    "cp \"$1/tools/agent/gate-receipt.sh\" tools/agent/\n" \
+    "inc=(-I\"$1/platform/modules/sha3/include\" -I\"$1/core/modules/crypto/include\" -I\"$1/platform/modules/support/include\" -I\"$1/platform/modules/base/include\")\n" \
+    "cc -std=c23 -O2 -Wall -Wextra -Werror \"${inc[@]}\" -o build/bin/gate_receipt \"$1\"/tools/agent/gate_receipt.c \"$1\"/tools/agent/gate_receipt_proc.c \"$1\"/tools/agent/gate_receipt_text.c \"$1/platform/modules/sha3/src/sha3.c\" \"$1/platform/modules/base/src/safe_alloc.c\"\n" \
+    "cc -std=c23 -O2 -Wall -Wextra -Werror \"${inc[@]}\" -o build/bin/agent_sha3 \"$1/tools/agent/agent_sha3.c\" \"$1/platform/modules/sha3/src/sha3.c\"\n" \
+    "git init -q; git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false commit -qm fixture --allow-empty\n" \
+    "head=$(git rev-parse HEAD)\n"
+
 static const char receipt_overlap_script[] =
-    "set -euo pipefail; cd \"$2\"\n"
-    "for tool in cc git bash flock mkfifo date; do command -v \"$tool\" >/dev/null; done\n"
-    "mkdir -p tools/agent tools/scripts build/bin bin receipts\n"
-    "cp \"$1/tools/agent/gate-receipt.sh\" tools/agent/; cp \"$1/tools/scripts/sh_str.sh\" tools/scripts/\n"
-    "cc -std=c23 -O2 -Wall -Wextra -Werror -I\"$1/platform/modules/sha3/include\" -I\"$1/core/modules/crypto/include\" -I\"$1/platform/modules/support/include\" -I\"$1/platform/modules/base/include\" -o build/bin/agent_sha3 \"$1/tools/agent/agent_sha3.c\" \"$1/platform/modules/sha3/src/sha3.c\"\n"
-    "git init -q; git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false commit -qm fixture --allow-empty\n"
-    "head=$(git rev-parse HEAD); clock=$(command -v date)\n"
-    "printf '#!/bin/bash\\nif [ \"$*\" = \"-u +%%Y%%m%%dT%%H%%M%%SZ\" ]; then echo 20261008T000000Z; else exec %q \"$@\"; fi\\n' \"$clock\" > bin/date; chmod +x bin/date\n"
-    "export PATH=\"$PWD/bin:$PATH\"\n"
+    RECEIPT_FIXTURE_PREAMBLE
     "mkfifo ready release-A release-B; exec 3<>ready 4<>release-A 5<>release-B\n"
     "for tag in A B; do\n"
     "  bash tools/agent/gate-receipt.sh --quiet --gate custom --dir receipts -- bash -c 'echo ready >&3; read -r go < \"release-$1\"; echo \"$1\"' child \"$tag\" >\"$tag.out\" 2>&1 &\n"
@@ -243,24 +248,58 @@ static const char receipt_overlap_script[] =
     "for receipt in \"$first\" \"$second\"; do\n"
     "  grep -qx verdict=PASS \"$receipt\"; grep -qx \"head_sha=$head\" \"$receipt\"\n"
     "  log=$(sed -n 's/^output_path=//p' \"$receipt\"); id=$(sed -n 's/^receipt_id=//p' \"$receipt\")\n"
-    "  [ \"$log\" = \"$id-custom-20261008T000000Z.log\" ]; digest=$(build/bin/agent_sha3 \"receipts/$log\")\n"
+    "  [[ \"$log\" =~ ^$id-custom-[0-9]{8}T[0-9]{6}Z\\.log$ ]]; digest=$(build/bin/agent_sha3 \"receipts/$log\")\n"
     "  grep -qx \"output_sha3=${digest%% *}\" \"$receipt\"; grep -qx output_bytes=2 \"$receipt\"\n"
+    "  seal=$(sed '$d' \"$receipt\" | build/bin/agent_sha3 -); grep -qx \"receipt_sha3=$seal\" \"$receipt\"\n"
     "done\n";
 
-static int t_receipt_overlap(void)
+/* Exit status, merged output, receipt fields, default tokens, the shell
+ * quoting of the recorded command and the strictness of option parsing. */
+static const char receipt_contract_script[] =
+    RECEIPT_FIXTURE_PREAMBLE
+    "w() { bash tools/agent/gate-receipt.sh --dir receipts \"$@\"; }\n"
+    "newest() { ls receipts/*.receipt | sort | tail -n1; }\n"
+    "rc=0; out=$(w --gate custom -- sh -c 'echo out; echo err >&2; exit 3' 2>stderr.txt) || rc=$?\n"
+    "[ \"$rc\" = 3 ]; [ \"$out\" = $'out\\nerr' ]; r=$(newest)\n"
+    "grep -qx exit_status=3 \"$r\"; grep -qx verdict=FAIL \"$r\"; grep -q '^gate-receipt: custom FAIL (exit 3, ' stderr.txt\n"
+    "first=$r\n"
+    "argv=(echo '' 'a b' '~x' '#y' \"it's\" '$HOME' $'t\\tn' $'nl\\nx')\n"
+    "w --gate custom --label 'two words' -- \"${argv[@]}\" >/dev/null 2>&1; r=$(newest)\n"
+    "want=$(printf '%q ' \"${argv[@]}\"); grep -qxF \"command_display=${want% }\" \"$r\"; grep -qx command_argc=${#argv[@]} \"$r\"\n"
+    "grep -qx chain_index=1 \"$r\"; grep -qx \"prev_receipt=$(basename \"$first\")\" \"$r\"; d=$(build/bin/agent_sha3 \"$first\"); grep -qx \"prev_receipt_sha3=${d%% *}\" \"$r\"\n"
+    "grep -qx 'label=two words' \"$r\"; seal=$(sed '$d' \"$r\" | build/bin/agent_sha3 -); grep -qx \"receipt_sha3=$seal\" \"$r\"\n"
+    "w --gate lint -- echo 'LINT: all checks passed' >/dev/null 2>&1; grep -qx verdict=PASS \"$(newest)\"\n"
+    "rc=0; w --gate lint -- true >/dev/null 2>&1 || rc=$?; [ \"$rc\" = 0 ]; r=$(newest); grep -qx verdict=FAIL \"$r\"; grep -qx expect_missing=1 \"$r\"\n"
+    "w --gate t-fast -- sh -c 'echo ALL TESTS PASSED; echo SOME TESTS FAILED' >/dev/null 2>&1; r=$(newest); grep -qx verdict=FAIL \"$r\"; grep -qx forbid_present=1 \"$r\"\n"
+    "w --gate custom --expect $'zzz\\nhi' -- echo hi >/dev/null 2>&1; grep -qx verdict=PASS \"$(newest)\"\n"
+    "rc=0; w --gate custom -- /nonexistent/gate >/dev/null 2>&1 || rc=$?; [ \"$rc\" = 127 ]; grep -qx exit_status=127 \"$(newest)\"\n"
+    "rc=0; w --gate custom -- sh -c 'kill -9 $$' >/dev/null 2>&1 || rc=$?; [ \"$rc\" = 137 ]\n"
+    "count=$(ls receipts/*.receipt | wc -l)\n"
+    "for args in '--bogus' '--gate' '--gate x' '--gate x --' '--gate a/b -- true' '--gate x --expect' '-- true'; do\n"
+    "  rc=0; out=$(w $args 2>/dev/null) || rc=$?; [ \"$rc\" = 2 ]; [ -z \"$out\" ]\n"
+    "done\n"
+    "[ \"$(ls receipts/*.receipt | wc -l)\" = \"$count\" ]\n";
+
+static int receipt_fixture_run(const char *name, const char *script)
 {
     char fixture[PATH_MAX] = {0};
     struct stat st;
-    test_make_tmpdir(fixture, sizeof(fixture), "receipts", "overlap");
+    test_make_tmpdir(fixture, sizeof(fixture), "receipts", name);
     int bad = 1;
     if (stat(fixture, &st) == 0 && S_ISDIR(st.st_mode))
-        bad = build_needs_fixture_run(repo_root(), fixture, receipt_overlap_script);
-    else fprintf(stderr, "receipt overlap: fixture setup failed\n");
+        bad = build_needs_fixture_run(repo_root(), fixture, script);
+    else fprintf(stderr, "receipt %s: fixture setup failed\n", name);
     if (test_rm_rf_recursive(fixture) != 0) {
-        fprintf(stderr, "receipt overlap: fixture cleanup failed\n"); bad = 1;
+        fprintf(stderr, "receipt %s: fixture cleanup failed\n", name); bad = 1;
     }
     return bad;
 }
+
+static int t_receipt_overlap(void)
+{ return receipt_fixture_run("overlap", receipt_overlap_script); }
+
+static int t_receipt_contract(void)
+{ return receipt_fixture_run("contract", receipt_contract_script); }
 
 #if defined(__linux__)
 static bool observation_child_complete(const struct zcl_devloop_process_result *run)
@@ -484,6 +523,8 @@ struct lint_gate_entry {
 #define X_(f) { (f), LINT_LANE_EXCLUSIVE }
 static const struct lint_gate_entry g_lint_gate_entries[] = {
     N_(t_receipt_overlap),
+    N_(t_receipt_contract),
+    N_(t_receipt_signals),
     S_(t_baseline_passes),
     S_(t_fixture_trips_gate),
     S_(t_node_db_exec_fixture_trips_gate),

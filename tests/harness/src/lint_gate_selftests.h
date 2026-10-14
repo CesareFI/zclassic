@@ -30,6 +30,7 @@
  *                                     contracts
  *   lint_gate_chain_contracts.c       repair-ladder, borrowed-seed, writer
  *                                     frontier and chain-index contracts
+ *   lint_gate_receipt_selftests.c     signal contract of the receipt wrapper
  *
  * Internal to that group: only tests/harness/src/lint_gate_*.c and
  * test_make_lint_gates.c include this file. */
@@ -487,6 +488,8 @@ int t_canonical_operator_diagnostics_contract(void);
 int t_service_tip_mutation_gate(void);
 int t_legacy_candidate_source_has_no_override_scope(void);
 int t_canonical_deploy_proof_binding_contract(void);
+/* lint_gate_receipt_selftests.c: the receipt wrapper signal contract. */
+int t_receipt_signals(void);
 int t_dev_lane_deploy_contract(void);
 int t_agent_fast_ci_contract(void);
 int t_slow_disk_progress_verdicts_contract(void);
