@@ -10936,9 +10936,24 @@ check-crypto-perf: zclassic23
 # a consensus break, so this must be run — and pass — before ANY optimization
 # of the verifier lands. `record` re-freezes the golden and is ONLY legitimate
 # after a deliberate, replay-approved consensus change.
+PARITY_ORACLE_DIR = $(CURDIR)/tests/harness/differential
+PARITY_ORACLE_BIN = $(BIN_DIR)/run-parity-oracle
+PARITY_ORACLE_SELFTEST_BIN = $(BIN_DIR)/run-parity-oracle-selftest
+$(PARITY_ORACLE_BIN): $(PARITY_ORACLE_DIR)/run_parity_oracle.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=c23 -Wall -Wextra -Werror -pedantic -DPARITY_DIR=\"$(PARITY_ORACLE_DIR)\" -o $@ $<
+$(PARITY_ORACLE_SELFTEST_BIN): $(PARITY_ORACLE_DIR)/run_parity_oracle_selftest.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=c23 -Wall -Wextra -Werror -pedantic -o $@ $<
+
+.PHONY: run-parity-oracle-selftest
+run-parity-oracle-selftest: $(PARITY_ORACLE_BIN) $(PARITY_ORACLE_SELFTEST_BIN)
+	@mkdir -p build/scratch
+	@$(PARITY_ORACLE_SELFTEST_BIN) $(PARITY_ORACLE_BIN) build/scratch
+
 .PHONY: check-groth16-parity
-check-groth16-parity:
-	@bash tests/harness/differential/run_parity_oracle.sh check
+check-groth16-parity: run-parity-oracle-selftest
+	@$(PARITY_ORACLE_BIN) check
 
 # Times the two public-input paths (naive double-and-add vs the precomputed
 # fixed-base tables) in ONE process against the same key, at the public-input
@@ -10946,8 +10961,8 @@ check-groth16-parity:
 # are asserted equal every iteration, so a timing run can never report a
 # speedup that came from diverging.
 .PHONY: bench-groth16-comb
-bench-groth16-comb:
-	@bash tests/harness/differential/run_parity_oracle.sh bench $(or $(ITERS),30)
+bench-groth16-comb: $(PARITY_ORACLE_BIN)
+	@$(PARITY_ORACLE_BIN) bench $(or $(ITERS),30)
 
 bench-regress: zclassic23
 	@ZCL_BENCH_COMMIT="$(BUILD_COMMIT)" $(ZCLASSIC23_BIN) -bench-regress

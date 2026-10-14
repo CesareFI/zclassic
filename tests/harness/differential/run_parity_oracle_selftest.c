@@ -1,0 +1,177 @@
+/* Copyright 2026 Rhett Creighton - Apache License 2.0
+ *
+ * run_parity_oracle_selftest - proves the run_parity_oracle driver against a
+ * stub compiler: argument routing, exit-status propagation, compile failure,
+ * the two-pass profile mode, and removal of every temporary binary on normal
+ * exit, SIGINT and SIGTERM.
+ *
+ * usage: run_parity_oracle_selftest <driver> <scratch-dir>
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <dirent.h>
+#include <unistd.h>
+
+#define BUF 4096
+
+static const char k_stub_cc[] =
+    "#!/bin/sh\n"
+    "[ -n \"$STUB_CC_FAIL\" ] && exit \"$STUB_CC_FAIL\"\n"
+    "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n"
+    "printf '#!/bin/sh\\necho started $$\\necho \"args: $*\"\\n%s\\n' "
+    "\"$STUB_BIN_TAIL\" > \"$out\"\n"
+    "chmod +x \"$out\"\n";
+
+static int g_failures;
+
+static void pot_check(int ok, const char *what)
+{
+    if (ok) return;
+    fprintf(stderr, "run_parity_oracle_selftest: FAIL %s\n", what);
+    g_failures++;
+}
+
+struct pot_run { pid_t pid; int out; };
+
+static struct pot_run pot_start(const char *driver, const char *mode, const char *n)
+{
+    int p[2];
+    struct pot_run r = {-1, -1};
+    if (pipe(p) != 0) return r;
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(p[1], 1);
+        close(p[0]);
+        close(p[1]);
+        execl(driver, driver, mode, n, (char *)nullptr);
+        _exit(127);
+    }
+    close(p[1]);
+    r.pid = pid;
+    r.out = p[0];
+    return r;
+}
+
+static size_t pot_slurp(int fd, char *buf, size_t cap)
+{
+    size_t len = 0;
+    ssize_t k;
+    while (len + 1 < cap && (k = read(fd, buf + len, cap - len - 1)) > 0) len += (size_t)k;
+    buf[len] = '\0';
+    close(fd);
+    return len;
+}
+
+static int pot_files_left(const char *dir)
+{
+    int count = 0;
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    while (d && (e = readdir(d)))
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) count++;
+    if (d) closedir(d);
+    return count;
+}
+
+static void pot_configure(const char *tmp, const char *fail, const char *tail)
+{
+    setenv("TMPDIR", tmp, 1);
+    setenv("STUB_CC_FAIL", fail, 1);
+    setenv("STUB_BIN_TAIL", tail, 1);
+}
+
+static int pot_finish(struct pot_run r, char *out, size_t cap)
+{
+    int st = 0;
+    pot_slurp(r.out, out, cap);
+    waitpid(r.pid, &st, 0);
+    return st;
+}
+
+static void pot_case_exit(const char *drv, const char *tmp, const char *name, const char *fail,
+                      const char *tail, const char *mode, int want, const char *marker)
+{
+    char out[BUF];
+    pot_configure(tmp, fail, tail);
+    int st = pot_finish(pot_start(drv, mode, ""), out, sizeof out);
+    pot_check(WIFEXITED(st) && WEXITSTATUS(st) == want, name);
+    pot_check(marker == nullptr || strstr(out, marker) != nullptr, name);
+    pot_check(pot_files_left(tmp) == 0, name);
+}
+
+static void pot_case_signal(const char *drv, const char *tmp, int sig, int times, const char *name)
+{
+    char line[BUF];
+    pot_configure(tmp, "", "exec sleep 30");
+    struct pot_run r = pot_start(drv, "check", "");
+    ssize_t k = read(r.out, line, sizeof line - 1);
+    line[k > 0 ? k : 0] = '\0';
+    long child = strncmp(line, "started ", 8) == 0 ? strtol(line + 8, nullptr, 10) : 0;
+    pot_check(child > 0, name);
+    for (int i = 0; i < times; i++) kill(r.pid, sig);
+    int st = pot_finish(r, line, sizeof line);
+    pot_check(WIFSIGNALED(st) && WTERMSIG(st) == sig, name);
+    pot_check(pot_files_left(tmp) == 0, name);
+    pot_check(child > 0 && kill((pid_t)child, 0) != 0 && errno == ESRCH, name);
+}
+
+static int pot_write_stub(const char *dir)
+{
+    char path[BUF + 32];
+    if (snprintf(path, sizeof path, "%s/cc", dir) >= (int)sizeof path) return -1;
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fputs(k_stub_cc, f);
+    fclose(f);
+    return chmod(path, 0755);
+}
+
+static int pot_remove_tree(const char *root, const char *bin, const char *tmp)
+{
+    char stub[BUF + 32];
+    snprintf(stub, sizeof stub, "%s/cc", bin);
+    return unlink(stub) | rmdir(bin) | rmdir(tmp) | rmdir(root);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s <driver> <scratch-dir>\n", argv[0]);
+        return 2;
+    }
+    char root[BUF], bin[BUF + 16], tmp[BUF + 16], path[BUF * 2 + 32];
+    if (snprintf(root, sizeof root, "%s/parity-selftest.XXXXXX", argv[2]) >= (int)sizeof root) return 2;
+    if (!mkdtemp(root)) { perror("mkdtemp"); return 2; }
+    snprintf(bin, sizeof bin, "%s/bin", root);
+    snprintf(tmp, sizeof tmp, "%s/tmp", root);
+    if (mkdir(bin, 0755) || mkdir(tmp, 0755) || pot_write_stub(bin)) return 2;
+    snprintf(path, sizeof path, "%s:%s", bin, getenv("PATH") ? getenv("PATH") : "/usr/bin");
+    setenv("PATH", path, 1);
+
+    pot_case_exit(argv[1], tmp, "check passes arguments", "", "exit 0", "check", 0, "args: check ");
+    pot_case_exit(argv[1], tmp, "bench routes to comb", "", "exit 0", "bench", 0, "args: comb 30");
+    pot_case_exit(argv[1], tmp, "pairing routes", "", "exit 0", "pairing", 0, "args: pairing 30");
+    pot_case_exit(argv[1], tmp, "child status propagates", "", "exit 3", "check", 3, nullptr);
+    pot_case_exit(argv[1], tmp, "compile status propagates", "5", "exit 0", "check", 5, nullptr);
+    pot_case_exit(argv[1], tmp, "profile runs two passes", "", "exit 0", "profile", 0,
+              "profile pass 2/2");
+    pot_case_exit(argv[1], tmp, "child killed by signal", "", "kill -9 $$", "check", 137, nullptr);
+    pot_case_signal(argv[1], tmp, SIGTERM, 1, "SIGTERM cleans up");
+    pot_case_signal(argv[1], tmp, SIGINT, 1, "SIGINT cleans up");
+    pot_case_signal(argv[1], tmp, SIGHUP, 1, "SIGHUP cleans up");
+    pot_case_signal(argv[1], tmp, SIGTERM, 2, "repeated SIGTERM cleans up");
+    pot_case_signal(argv[1], tmp, SIGINT, 2, "repeated SIGINT cleans up");
+
+    if (g_failures == 0 && pot_remove_tree(root, bin, tmp) != 0) return 2;
+    puts(g_failures ? "run_parity_oracle_selftest: FAILED"
+                    : "run_parity_oracle_selftest: ALL CASES OK");
+    return g_failures != 0;
+}

@@ -129,7 +129,7 @@ re-baselined from a `ZCL_NATIVE=1` run.
 
 ### Where the 7.7 ms of a Groth16 verify actually goes
 
-`bash tests/harness/differential/run_parity_oracle.sh profile` — exact Fp-multiply
+`tests/harness/differential/run_parity_oracle.sh profile` — exact Fp-multiply
 counts per phase (linker-interposed `fp_mont_mul_accel`, which every multiply
 in `bls12_381.c` reaches through) plus per-phase wall time, decomposed with
 the public multi-pairing API at n=0/1/4. No edit to the frozen verifier.
