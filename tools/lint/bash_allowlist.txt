@@ -260,7 +260,6 @@ tools/lint/check_tor_provenance.sh
 tools/lint/check_verification_coverage.sh
 tools/lint/check_wallet_raw_prepare_log.sh
 tools/lint/check_windows_acceptance.sh
-tools/lint/check_windows_acceptance_guard.sh
 tools/lint/check_windows_cross_syntax.sh
 tools/lint/check_windows_platform_seam.sh
 tools/lint/check_zcc_cache.sh
