@@ -477,7 +477,7 @@ static int attack_peer(const char *host, uint16_t port, const char *datadir)
         true, noise_priv, regtest_magic, &msg1, &msg1_len);
     memory_cleanse(noise_priv, sizeof(noise_priv));
     struct app_buffer app = {0};
-    bool ok = transport && msg1_len == 32 && write_all_fd(fd, msg1, msg1_len);
+    bool ok = transport && msg1_len == noise_transport_handshake_msg_len(0) && write_all_fd(fd, msg1, msg1_len);
     free(msg1);
     for (int i = 0; ok && transport->state != NOISE_ESTABLISHED && i < 20; i++)
         ok = feed_once(fd, transport, &app, 1000);

@@ -1818,8 +1818,9 @@ static void probe_listener_respond(struct probe_listener *l,
     noise_transport_free(t);
 }
 
-/* Read XX message 1 (any number of reads), then send the real message 2 one byte per 50 ms of
- * silence from the probe; stop as soon as the probe closes or answers. */
+/* Read XXhfs message 1 (any number of reads), then send the real message 2
+ * one byte per 50 ms of silence from the probe; stop as soon as the probe
+ * closes or answers. */
 static void probe_listener_trickle(struct probe_listener *l,
                                    platform_socket_t s)
 {

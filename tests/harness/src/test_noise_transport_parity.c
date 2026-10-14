@@ -245,7 +245,11 @@ static bool stalls_on_classical_xx_peer(void)
     size_t wl = 0, pl = 0;
     bool ok = r && len == 32 &&
               noise_transport_feed(r, msg, len, &w, &wl, &p, &pl) &&
-              wl == 0 && pl == 0 && r->state == NOISE_DETECT;
+              wl == 0 && pl == 0 && r->state == NOISE_DETECT &&
+              !noise_transport_handshake_expired(
+                  r, r->hs_started_us + NOISE_HANDSHAKE_TIMEOUT_US - 1) &&
+              noise_transport_handshake_expired(
+                  r, r->hs_started_us + NOISE_HANDSHAKE_TIMEOUT_US);
     free(w); free(p);
     noise_hs_cleanse(&hs);
     noise_transport_free(r);
@@ -312,8 +316,12 @@ int test_noise_transport_parity(void)
 
     TEST_CASE("noise_transport: differential plaintext/noise + hostile-input parity") {
 
-        /* (1) XX handshake completes with the design-pinned message sizes. */
+        /* (1) XXhfs handshake completes with the design-pinned message sizes;
+         * the exported pattern-derived lengths match them. */
         {
+            ASSERT(noise_transport_handshake_msg_len(0) == HS_MSG1_LEN);
+            ASSERT(noise_transport_handshake_msg_len(1) == HS_MSG2_LEN);
+            ASSERT(noise_transport_handshake_msg_len(2) == HS_MSG3_LEN);
             struct noise_transport *i = NULL, *r = NULL;
             ASSERT(run_handshake(&i, &r));
             ASSERT(i && r);

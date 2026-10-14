@@ -140,7 +140,7 @@ static size_t token_len(enum noise_token tok, bool *keyed)
 
 /* Length of handshake message `idx` of the driver's pattern with an empty
  * payload: 1216, 1200 and 64 bytes for XXhfs. */
-static size_t handshake_msg_len(int idx)
+size_t noise_transport_handshake_msg_len(int idx)
 {
     const struct noise_pattern *p = driver_pattern();
     bool keyed = false;
@@ -317,7 +317,7 @@ bool noise_transport_feed(struct noise_transport *t,
                 r = STEP_STOP;
                 break;
             }
-            const size_t need = handshake_msg_len(0);
+            const size_t need = noise_transport_handshake_msg_len(0);
             if (t->acc_len < need) { r = STEP_NEEDMORE; break; }
             uint8_t payload[NOISE_MAX_MESSAGE];
             size_t payload_len = 0;
@@ -340,7 +340,7 @@ bool noise_transport_feed(struct noise_transport *t,
             break;
         }
         case NOISE_KEY_SENT: {
-            const size_t need = handshake_msg_len(1);
+            const size_t need = noise_transport_handshake_msg_len(1);
             if (t->acc_len < need) { r = STEP_NEEDMORE; break; }
             uint8_t payload[NOISE_MAX_MESSAGE];
             size_t payload_len = 0;
@@ -365,7 +365,7 @@ bool noise_transport_feed(struct noise_transport *t,
             break;
         }
         case NOISE_KEY_RECV: {
-            const size_t need = handshake_msg_len(2);
+            const size_t need = noise_transport_handshake_msg_len(2);
             if (t->acc_len < need) { r = STEP_NEEDMORE; break; }
             uint8_t payload[NOISE_MAX_MESSAGE];
             size_t payload_len = 0;

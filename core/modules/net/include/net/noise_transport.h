@@ -138,6 +138,11 @@ bool noise_transport_snapshot(const struct noise_transport *t,
 bool noise_transport_handshake_expired(const struct noise_transport *t,
                                        int64_t now_us);
 
+/* Length in bytes of handshake message `idx` (0-based) of the driver's pattern
+ * with an empty payload, derived from the pattern tokens: 1216, 1200 and 64
+ * for Noise XXhfs. */
+size_t noise_transport_handshake_msg_len(int idx);
+
 /* Cleanse all secret material and free. NULL-safe. */
 void noise_transport_free(struct noise_transport *t);
 

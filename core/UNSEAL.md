@@ -212,3 +212,7 @@ later lane flips it HARD.
 - 2026-10-14T09:55:07Z — REASON: Service bit 26 NODE_NOISE_HYBRID gates the outbound Noise handshake; bit 25 retired
   old ROOT: 6c4bfa22cbcd64be0f7b3ba63079ac84fa41818570c80cf0260af38ebdebb75c
   by: owner unseal ritual (make core-unseal)
+
+- 2026-10-14T10:12:52Z — REASON: Export noise_transport_handshake_msg_len so tools derive the hybrid first-message length from the pattern
+  old ROOT: f8fb7844dc9bdbcea1da87d362cbf8b871821feccfc7565137e8e1aabd865ed2
+  by: owner unseal ritual (make core-unseal)
