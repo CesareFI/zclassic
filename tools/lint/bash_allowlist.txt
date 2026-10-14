@@ -20,7 +20,6 @@ platform/deploy/zclassic23-bundle-bootstrap.sh
 platform/deploy/zclassic23-bundle-export.sh
 platform/deploy/zclassic23-cutover-selftest.sh
 platform/deploy/zclassic23-host-watchdog.sh
-platform/packaging/install/install_selftest.sh
 platform/packaging/release/build_release.sh
 platform/packaging/windows/install-service.sh
 tests/harness/mvp_c8_judge_cases.sh

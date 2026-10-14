@@ -19,10 +19,10 @@
  *   3. a source that could not be reached is UNREACHABLE, never a dissenting
  *      opinion, so a captive portal cannot veto an install.
  *
- * platform/packaging/install/install_selftest.sh drives the same decisions through the
+ * tools/install/install_selftest.c drives the same decisions through the
  * real z23-bootstrap binary end to end, with real files, a real fork/exec and
  * a real handoff. This group proves the decisions themselves, including the
- * DNS wire cases a shell harness cannot construct.
+ * DNS wire cases an end-to-end harness cannot construct.
  */
 
 #define _POSIX_C_SOURCE 200809L

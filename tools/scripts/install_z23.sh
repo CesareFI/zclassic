@@ -1885,15 +1885,17 @@ selftest_release_pin() {
 # not shipped inside the served script: that script has to stay short enough
 # that a careful person reads it before piping it to a shell.
 selftest_front_door() {
-    local dir="$SCRIPT_DIR/../../platform/packaging/install"
+    local root="$SCRIPT_DIR/../.." dir bin
+    dir="$root/platform/packaging/install"
+    bin="${Z23_INSTALL_SELFTEST_BIN:-$root/build/bin/install_selftest}"
     # This installer also ships alone (the front door downloads just this
     # file), and then there is no repository beside it to test. That is
     # UNOBSERVED, not a pass — but inside the repository, where every gate
     # runs, the directory is present and the harness is mandatory.
     [ -d "$dir" ] || return 0
-    [ -f "$dir/install_selftest.sh" ] \
-        || die "selftest: packaging/install exists but its front-door harness is missing"
-    bash "$dir/install_selftest.sh" \
+    [ -x "$bin" ] \
+        || die "selftest: packaging/install exists but its front-door harness is missing at $bin; run make install-selftest"
+    "$bin" --root "$root" \
         || die "selftest: packaging/install front door harness failed"
 }
 

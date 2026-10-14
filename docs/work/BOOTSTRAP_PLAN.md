@@ -60,7 +60,7 @@ matters because a shim served at the domain is executing before anything has
 been verified, so logic inside it is logic a compromised origin replaces for
 free; the shim's remaining surface is one hash comparison. The judgement is
 proved by the `z23_front_door` test group and driven end to end against the
-real binary by `platform/packaging/install/install_selftest.sh`.
+real binary by `tools/install/install_selftest.c`.
 
 `platform/packaging/release/build_release.sh --front-door` is the release cutter's
 front-door stage: it packages `z23-bootstrap` per platform triple under

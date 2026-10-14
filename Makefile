@@ -7126,6 +7126,28 @@ $(Z23_BOOTSTRAP_BIN): $(Z23_BOOTSTRAP_SRCS) Makefile | $(NODE_VENDOR_LIBS)
 z23-front-door: $(Z23_BOOTSTRAP_BIN)
 	@bash platform/packaging/release/build_release.sh --front-door
 
+# The front-door harness: drives install.sh and z23-bootstrap end to end, and
+# qualifies its own signal handling with --selftest. It is a development gate
+# and ships in no release archive.
+INSTALL_SELFTEST_SRCS = \
+	tools/install/install_selftest.c \
+	tools/install/install_selftest_fs.c \
+	tools/install/install_selftest_proc.c \
+	tools/install/install_selftest_signals.c \
+	core/modules/crypto/src/sha256.c \
+	platform/modules/base/src/log_level.c \
+	platform/modules/base/src/safe_alloc.c \
+	platform/modules/platform/src/clock.c
+INSTALL_SELFTEST_BIN = $(BIN_DIR)/install_selftest
+
+.PHONY: install-selftest
+install-selftest: $(INSTALL_SELFTEST_BIN)
+$(INSTALL_SELFTEST_BIN): $(INSTALL_SELFTEST_SRCS) tools/install/install_selftest.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c23 -O2 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L \
+	    $(HARDEN_CFLAGS) $(ZCL_PLATFORM_CPPFLAGS) $(Z23_BOOTSTRAP_INCLUDES) \
+	    -o $@ $(INSTALL_SELFTEST_SRCS) $(HARDEN_LDFLAGS)
+
 $(eval $(call BUILD_NODE_TOOL,wallet_sim,tools/wallet_sim.c))
 $(eval $(call BUILD_NODE_TOOL,wallet_check,tools/wallet_check.c,-lm))
 $(eval $(call BUILD_NODE_TOOL,rebuild_recent,tools/rebuild_recent.c,-lm,-fopenmp))
@@ -14454,8 +14476,9 @@ check-ship-remote-transaction: jsonq $(TOR_PROVENANCE_BIN) build/bin/check_no_ha
 # quiet pass: the front door is the one program a stranger runs before
 # anything has been verified, and an unobserved gate over it is worse than no
 # gate at all.
-check-z23-release-install: $(Z23_BOOTSTRAP_BIN)
+check-z23-release-install: $(Z23_BOOTSTRAP_BIN) $(INSTALL_SELFTEST_BIN)
 	@echo "══ LINT: z23 release package + fail-closed installer ══"
+	@$(INSTALL_SELFTEST_BIN) --selftest
 	@bash platform/packaging/release/build_release.sh --selftest
 	@bash tools/scripts/install_z23.sh --selftest
 	@bash tools/scripts/deploy_z23_release.sh --selftest
