@@ -6423,6 +6423,9 @@ LINTC_SRCS = $(LINTC_LIVE_DATADIR_SRCS) tools/lint/lintc/lib.c tools/lint/lintc/
     tools/lint/lintc/gate_git_hooks_installed.c \
     tools/lint/lintc/gate_fleet_facts.c \
     tools/lint/lintc/gate_fleet_facts_selftest.c \
+    tools/lint/lintc/gate_fleet_observations.c \
+    tools/lint/lintc/gate_fleet_observations_proc.c \
+    tools/lint/lintc/gate_fleet_observations_selftest.c \
     tools/lint/lintc/gate_verification_coverage.c \
     tools/lint/lintc/gate_no_real_clock_test_deadline.c \
     tools/lint/lintc/gate_no_real_clock_test_deadline_selftest.c \
@@ -13437,7 +13440,7 @@ check-fleet-facts: $(LINTC_TOOL)
 	@./tools/lint/check_fleet_facts.sh --selftest
 	@./tools/lint/check_fleet_facts.sh
 
-check-fleet-observations: $(BIN_DIR)/z23-fleet-observe
+check-fleet-observations: $(LINTC_TOOL) $(BIN_DIR)/z23-fleet-observe
 	@echo "══ LINT: fleet_observations.def reproduces from its fixture ledger ══"
 	@./tools/lint/check_fleet_observations.sh --selftest
 	@./tools/lint/check_fleet_observations.sh

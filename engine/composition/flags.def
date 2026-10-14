@@ -963,13 +963,13 @@ Z23_FLAG("ZCL_FLEET_FACTS_ROOT", "env_build", "-", "-",
 Z23_FLAG("ZCL_FLEET_ID_SALT", "env_build", "-", "-",
           "undocumented; first use tools/dev/fleet-identity.sh:228")
 Z23_FLAG("ZCL_FLEET_OBS_BIN", "env_build", "-", "-",
-          "first use tools/lint/check_fleet_observations.sh:auto; documented at docs/experiments/FLEET_LEDGER_COLUMNS.md:26: ZCL_FLEET_OBS_BIN=/tmp/z23-fleet-observe /")
+          "first use tools/lint/lintc/gate_fleet_observations.c:auto; documented at docs/experiments/FLEET_LEDGER_COLUMNS.md:26: ZCL_FLEET_OBS_BIN=/tmp/z23-fleet-observe /")
 Z23_FLAG("ZCL_FLEET_OBS_DEF", "env_build", "-", "-",
-          "undocumented; first use tools/lint/check_fleet_observations.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_fleet_observations.c:auto")
 Z23_FLAG("ZCL_FLEET_OBS_FIXTURE", "env_build", "-", "-",
-          "undocumented; first use tools/lint/check_fleet_observations.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_fleet_observations.c:auto")
 Z23_FLAG("ZCL_FLEET_OBS_ROOT", "env_build", "-", "-",
-          "undocumented; first use tools/lint/check_fleet_observations.sh:auto")
+          "undocumented; first use tools/lint/lintc/gate_fleet_observations.c:auto")
 Z23_FLAG("ZCL_FLEET_STATE_DIR", "env_build", "-", "-",
           "undocumented; first use tools/scripts/fleet_source_status.sh:auto")
 Z23_FLAG("ZCL_FLEET_VITALS_DEF", "env_build", "-", "-",

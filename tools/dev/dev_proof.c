@@ -5726,8 +5726,8 @@ static const struct dp_docs_fresh_artifact DP_DOCS_FRESH[] = {
 #define DP_DOCS_FRESH_N (sizeof(DP_DOCS_FRESH) / sizeof(DP_DOCS_FRESH[0]))
 
 /* The checker binaries a sealed generation must carry before any checker
- * above may run: check_fleet_facts.sh execs z23-lint,
- * check_fleet_observations.sh execs z23-fleet-observe, and the inventory
+ * above may run: check_fleet_facts.sh and check_fleet_observations.sh exec
+ * z23-lint, the latter runs z23-fleet-observe, and the inventory
  * checker takes the already-built generator. This list gates the fresh
  * check and mirrors the docs-proof-tools Make prerequisite set. */
 static const char *const DP_DOCS_TOOLS[] = {
