@@ -234,8 +234,6 @@ tools/lint/check_object_reproducible.sh
 tools/lint/check_orient_facts.sh
 tools/lint/check_outparam_init_before_return.sh
 tools/lint/check_package_anatomy.sh
-tools/lint/check_package_capabilities.sh
-tools/lint/check_peer_floor_single_source.sh
 tools/lint/check_pipefail_status_pipe.sh
 tools/lint/check_platform_header_guards.sh
 tools/lint/check_privileged_transition_receipt.sh
