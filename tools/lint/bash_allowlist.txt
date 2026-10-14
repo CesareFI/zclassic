@@ -218,8 +218,6 @@ tools/lint/check_model_sql_literals.sh
 tools/lint/check_no_adx_overclaim.sh
 tools/lint/check_no_api_keys.sh
 tools/lint/check_no_new_borrowed_seed.sh
-tools/lint/check_no_new_coin_backfill_caller.sh
-tools/lint/check_no_new_coordination_shell.sh
 tools/lint/check_no_operator_paths.sh
 tools/lint/check_no_orphan_placement.sh
 tools/lint/check_no_raw_clock_outside_platform.sh
