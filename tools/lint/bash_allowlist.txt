@@ -391,7 +391,4 @@ tools/scripts/zcode_registry_rederive.sh
 tools/seed_anchor_snapshot.sh
 tools/ship.sh
 tools/ship_selftest.sh
-tools/verify/fixed_result_fast_probe.sh
-tools/verify/fixed_result_gcc14_probe.sh
-tools/verify/fixed_result_key_v2_probe.sh
 tools/zcl

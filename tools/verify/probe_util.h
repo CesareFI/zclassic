@@ -9,7 +9,7 @@
 #include <stddef.h>
 
 #define PU_PATH_MAX 4096u
-#define PU_ARGV_MAX 64u
+#define PU_ARGV_MAX 256u
 
 /* Argument vector builder; the vector stays NULL-terminated. */
 struct pu_argv {
