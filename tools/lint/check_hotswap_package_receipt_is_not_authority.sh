@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Copyright 2026 Rhett Creighton - Apache License 2.0
 #
 # check_hotswap_package_receipt_is_not_authority.sh — the package manifest is

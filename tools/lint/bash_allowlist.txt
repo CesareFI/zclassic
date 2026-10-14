@@ -200,13 +200,8 @@ tools/lint/check_group_purpose.sh
 tools/lint/check_hex_codec_single.sh
 tools/lint/check_honest_witness.sh
 tools/lint/check_hosted_suite_verdict.sh
-tools/lint/check_hotswap_denied_leaves.sh
-tools/lint/check_hotswap_eligible_scope.sh
 tools/lint/check_hotswap_module_imports.sh
-tools/lint/check_hotswap_package_receipt_is_not_authority.sh
 tools/lint/check_hotswap_service_islands.sh
-tools/lint/check_hotswap_static_state.sh
-tools/lint/check_hotswap_swappable_shape.sh
 tools/lint/check_identity_parser_single.sh
 tools/lint/check_lint_gate_wiring.sh
 tools/lint/check_live_datadir_isolation.sh

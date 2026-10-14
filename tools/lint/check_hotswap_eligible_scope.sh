@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Copyright 2026 Rhett Creighton - Apache License 2.0
 #
 # check_hotswap_eligible_scope.sh — every TU in the Tier-1 hot-swap
