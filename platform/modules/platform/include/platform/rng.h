@@ -57,6 +57,7 @@ bool rng_fill(uint8_t *out, size_t len);
 
 /* Real OS provider, unaffected by test injection. At most 4096 bytes per
  * call; Linux uses nonblocking getrandom with at most eight attempts.
+ * Darwin uses getentropy in chunks of at most 256 bytes, without retries.
  * Provider failure clears the valid bounded output span; invalid arguments
  * are refused without touching output. No device-file or deterministic
  * fallback. This bounds syscall attempts, not kernel wall latency. */

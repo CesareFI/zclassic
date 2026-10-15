@@ -24,12 +24,14 @@
 #include <bcrypt.h>
 /* Windows gets CNG only; the POSIX descriptor fallback below is compiled
  * out there. Linux additionally needs <sys/random.h> for getrandom(2).
- * Darwin uses arc4random_buf and needs neither, so it pulls in no
- * descriptor headers at all. */
+ * Darwin uses arc4random_buf for general fills and getentropy for bounded
+ * host entropy, without opening device files. */
 #elif defined(__linux__)
 #include <fcntl.h>
 #include <sys/random.h>
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include <sys/random.h>
 #elif !defined(__APPLE__)
 #include <fcntl.h>
 #include <unistd.h>
@@ -168,7 +170,16 @@ bool rng_host_fill(uint8_t *out, size_t len)
         else break;
     }
     if (done == len) return true;
-#elif defined(__APPLE__) || defined(_WIN32)
+#elif defined(__APPLE__)
+    size_t done = 0;
+    while (done < len) {
+        size_t chunk = len - done;
+        if (chunk > 256u) chunk = 256u;
+        if (getentropy(out + done, chunk) != 0) break;
+        done += chunk;
+    }
+    if (done == len) return true;
+#elif defined(_WIN32)
     if (real_fill(NULL, out, len)) return true;
 #endif
     memory_cleanse(out, len);

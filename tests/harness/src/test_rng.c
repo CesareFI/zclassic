@@ -21,7 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <errno.h>
 #include <sys/random.h>
 static unsigned host_test_calls;
@@ -33,6 +33,7 @@ static uint64_t host_test_tape(void *ctx)
     host_test_tape_calls++;
     return 42;
 }
+#if defined(__linux__)
 static ssize_t host_test_getrandom(void *out, size_t n, unsigned flags)
 {
     host_test_calls++;
@@ -49,6 +50,23 @@ static ssize_t host_test_getrandom(void *out, size_t n, unsigned flags)
     return (ssize_t)got;
 }
 #define getrandom host_test_getrandom
+#else
+static int host_test_getentropy(void *out, size_t n)
+{
+    host_test_calls++;
+    if (n > 256u) { errno = EIO; return -1; }
+    if (host_test_mode == 1u) { errno = EINTR; return -1; }
+    if (host_test_mode == 3u || (host_test_mode == 2u && host_test_calls > 1u)) {
+        memset(out, 0x3c, n);
+        errno = EIO;
+        return -1;
+    }
+    if (host_test_mode == 4u) { errno = ENOSYS; return -1; }
+    memset(out, 0x5a, n);
+    return 0;
+}
+#define getentropy host_test_getentropy
+#endif
 #define rng_host_fill host_test_fill
 #define rng_default host_test_default
 #define rng_fill host_test_rng_fill
@@ -69,6 +87,7 @@ void host_test_set_source(struct platform_rng_source *src);
 void host_test_clear_source(void);
 #include "../../../platform/modules/platform/src/rng.c"
 #undef getrandom
+#undef getentropy
 #undef rng_host_fill
 #undef rng_default
 #undef rng_fill
@@ -165,6 +184,23 @@ static int test_host_errors(void)
     return failures;
 }
 
+#endif
+
+#if defined(__linux__) || defined(__APPLE__)
+static int test_host_real(void)
+{
+    int failures = 0;
+    uint8_t span[4098];
+    memset(span, 0xa5, sizeof(span));
+    RNG_CHECK("real host provider fills maximum bounded span",
+              rng_host_fill(span + 1, 4096));
+    bool any_nonzero = false;
+    for (size_t i = 1; i <= 4096; i++) any_nonzero |= span[i] != 0;
+    RNG_CHECK("real host provider preserves boundary sentinels",
+              any_nonzero && span[0] == 0xa5 && span[4097] == 0xa5);
+    return failures;
+}
+
 static int test_host_bypass(void)
 {
     int failures = 0;
@@ -189,6 +225,43 @@ static int test_host_bypass(void)
 }
 #endif
 
+#if defined(__APPLE__)
+static int test_host_darwin(void)
+{
+    (void)host_test_getentropy; /* Keep tests runnable against the old provider. */
+    int failures = 0;
+    uint8_t span[4098];
+    const size_t sizes[] = {1, 256, 257, 4096};
+    host_test_mode = 0;
+    for (size_t n = 0; n < sizeof(sizes) / sizeof(sizes[0]); n++) {
+        memset(span, 0xa5, sizeof(span));
+        host_test_calls = 0;
+        size_t length = sizes[n];
+        RNG_CHECK("Darwin host getentropy bounded chunks", host_test_fill(span + 1, length) &&
+                  host_test_calls == (length + 255u) / 256u);
+        bool filled = true;
+        for (size_t i = 1; i <= length; i++) filled &= span[i] == 0x5a;
+        RNG_CHECK("Darwin host exact output span", filled && span[0] == 0xa5 &&
+                  span[length + 1] == 0xa5);
+    }
+    host_test_calls = 0;
+    RNG_CHECK("Darwin invalid spans bypass provider", !host_test_fill(NULL, 16) &&
+              !host_test_fill(span, 0) && !host_test_fill(span, 4097) && host_test_calls == 0);
+    for (unsigned mode = 1; mode <= 4; mode++) {
+        memset(span, 0xa5, sizeof(span));
+        host_test_mode = mode;
+        host_test_calls = 0;
+        RNG_CHECK("Darwin provider failure refuses without retry or fallback",
+                  !host_test_fill(span + 1, 257) && host_test_calls == (mode == 2u ? 2u : 1u));
+        bool cleared = true;
+        for (size_t i = 1; i <= 257; i++) cleared &= span[i] == 0;
+        RNG_CHECK("Darwin provider failure clears full output only", cleared &&
+                  span[0] == 0xa5 && span[258] == 0xa5);
+    }
+    return failures;
+}
+#endif
+
 int test_rng(void)
 {
     printf("\n=== platform rng tests ===\n");
@@ -197,7 +270,13 @@ int test_rng(void)
 #if defined(__linux__)
     failures += test_host_interruption();
     failures += test_host_errors();
+#endif
+#if defined(__APPLE__)
+    failures += test_host_darwin();
+#endif
+#if defined(__linux__) || defined(__APPLE__)
     failures += test_host_bypass();
+    failures += test_host_real();
 #endif
 
     /* ── real default: 32-byte fill non-zero ────────────────────── */
