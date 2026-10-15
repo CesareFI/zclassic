@@ -14,15 +14,15 @@ struct entry_field { const char *key; enum json_type type; uint32_t minimum, max
 static const struct entry_field common_fields[] = {
     {"directory", JSON_STR, 1, 1023}, {"peer_key", JSON_STR, 64, 64}, {"expected_root", JSON_STR, 64, 64},
     {"target_port", JSON_INT, 1, UINT16_MAX}, {"route_id", JSON_STR, 1, 64},
-    {"handshake_ms", JSON_INT, 1, 10000}, {"session_ms", JSON_INT, 1, 600000},
-    {"idle_ms", JSON_INT, 1, 60000}, {"confirm", JSON_BOOL, 0, 0}
+    {"handshake_ms", JSON_INT, 1, 10000}, {"session_ms", JSON_INT, 1, DEVICE_HOST_RUNTIME_SESSION_MS_MAX},
+    {"idle_ms", JSON_INT, 1, DEVICE_HOST_RUNTIME_IDLE_MS_MAX}, {"confirm", JSON_BOOL, 0, 0}
 };
 static const struct entry_field client_fields[] = {
     {"route_address", JSON_STR, 1, 15}, {"route_port", JSON_INT, 1, UINT16_MAX}, {"connect_ms", JSON_INT, 1, 10000}
 };
 static const struct entry_field receiver_fields[] = {
     {"listen_address", JSON_STR, 1, 15}, {"listen_port", JSON_INT, 0, UINT16_MAX}, {"allow_external", JSON_BOOL, 0, 0},
-    {"lifetime_ms", JSON_INT, 1, 600000}, {"max_sessions", JSON_INT, 1, 64}, {"max_active", JSON_INT, 1, 4}
+    {"lifetime_ms", JSON_INT, 1, DEVICE_HOST_RUNTIME_LIFETIME_MS_MAX}, {"max_sessions", JSON_INT, 1, 64}, {"max_active", JSON_INT, 1, 4}
 };
 static bool entry_field_valid(const struct json_value *input, const struct entry_field *field)
 {
@@ -173,8 +173,8 @@ static bool raw_common(const struct json_value *input, struct raw_runtime *runti
     uint32_t port;
     if (!raw_number(input, "target_port", UINT16_MAX, &port) || !port ||
         !raw_number(input, "handshake_ms", 10000, &common->handshake_ms) ||
-        !raw_number(input, "session_ms", 600000, &common->session_ms) ||
-        !raw_number(input, "idle_ms", 60000, &common->idle_ms)) return false;
+        !raw_number(input, "session_ms", DEVICE_HOST_RUNTIME_SESSION_MS_MAX, &common->session_ms) ||
+        !raw_number(input, "idle_ms", DEVICE_HOST_RUNTIME_IDLE_MS_MAX, &common->idle_ms)) return false;
     common->target_port = (uint16_t)port; common->cancelled = &raw_cancelled;
     struct device_identity_publication_report report;
     struct zcl_result opened = device_identity_open(&runtime->identity, directory, false, &report);
@@ -212,7 +212,7 @@ static bool raw_receiver_input(const struct json_value *input, struct raw_runtim
         !raw_number(input, "listen_port", UINT16_MAX, &port) ||
         !raw_bool(input, "allow_external", &spec->allow_external)) return false;
     spec->listen_port = (uint16_t)port;
-    if (!raw_number(input, "lifetime_ms", 600000, &spec->lifetime_ms) ||
+    if (!raw_number(input, "lifetime_ms", DEVICE_HOST_RUNTIME_LIFETIME_MS_MAX, &spec->lifetime_ms) ||
         !raw_number(input, "max_sessions", DEVICE_HOST_RUNTIME_ACCEPT_MAX, &spec->max_sessions) ||
         !raw_number(input, "max_active", DEVICE_HOST_RUNTIME_ACTIVE_MAX, &spec->max_active)) return false;
     spec->ready = raw_receiver_ready; spec->ready_context = runtime; return true;

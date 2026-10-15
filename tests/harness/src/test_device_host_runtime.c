@@ -248,6 +248,8 @@ static bool runtime_fixture_open(struct runtime_fixture *fixture)
         listen(fixture->target_listener, 4) != 0 || getsockname(fixture->target_listener, (struct sockaddr *)&address, &size) != 0) return false;
     fixture->target_port = ntohs(address.sin_port); return runtime_grants(fixture);
 }
+/* Set to run a fixture at the hard maxima of the supervised-hub caps. */
+static bool runtime_long_caps;
 static bool runtime_input_common(struct json_value *input, const struct runtime_fixture *fixture, size_t node)
 {
     json_set_object(input); char peer[65], root[65];
@@ -255,14 +257,15 @@ static bool runtime_input_common(struct json_value *input, const struct runtime_
     return json_push_kv_str(input, "directory", fixture->directory[node]) &&
         json_push_kv_str(input, "peer_key", peer) && json_push_kv_str(input, "expected_root", root) &&
         json_push_kv_int(input, "target_port", fixture->target_port) && json_push_kv_str(input, "route_id", "PUBLIC-local-loopback") &&
-        json_push_kv_int(input, "handshake_ms", 5000) && json_push_kv_int(input, "session_ms", 15000) &&
-        json_push_kv_int(input, "idle_ms", 5000) && json_push_kv_bool(input, "confirm", true);
+        json_push_kv_int(input, "handshake_ms", 5000) &&
+        json_push_kv_int(input, "session_ms", runtime_long_caps ? 28800000 : 15000) &&
+        json_push_kv_int(input, "idle_ms", runtime_long_caps ? 1800000 : 5000) && json_push_kv_bool(input, "confirm", true);
 }
 static bool runtime_input_receiver(struct json_value *input, const struct runtime_fixture *fixture, unsigned sessions)
 {
     return runtime_input_common(input, fixture, 1) && json_push_kv_str(input, "listen_address", "127.0.0.1") &&
         json_push_kv_int(input, "listen_port", 0) && json_push_kv_bool(input, "allow_external", false) &&
-        json_push_kv_int(input, "lifetime_ms", 30000) && json_push_kv_int(input, "max_sessions", sessions) &&
+        json_push_kv_int(input, "lifetime_ms", runtime_long_caps ? 86400000 : 30000) && json_push_kv_int(input, "max_sessions", sessions) &&
         json_push_kv_int(input, "max_active", 2);
 }
 static bool runtime_input_client(struct json_value *input, const struct runtime_fixture *fixture)
@@ -1525,6 +1528,49 @@ static int runtime_restart_rebind(void)
     if (!runtime_fixture_close(&fixture)) ++failures;
     return failures;
 }
+static int runtime_long_caps_revoke(void)
+{
+    /* Whole pair runs at the hard maxima (24 h lifetime, 8 h session, 30 min idle):
+     * a mid-session revoke must still end the session, so long sessions never outlive revocation. */
+    runtime_long_caps = true;
+    int failures = runtime_completed_revoke(false) + runtime_completed_revoke(true);
+    runtime_long_caps = false; return failures;
+}
+static bool runtime_limit_wire(bool receiver, const char *key, int64_t value, char wire[8192])
+{
+    struct runtime_fixture fixture; runtime_fixture_init(&fixture); struct json_value input = {0};
+    fixture.receiver_port = 1;
+    bool ok = runtime_fixture_open(&fixture) && (receiver ? runtime_input_receiver(&input, &fixture, 1) : runtime_input_client(&input, &fixture)) &&
+        runtime_input_number(&input, key, value) && json_write(&input, wire, 8192) > 0;
+    json_free(&input); return runtime_fixture_close(&fixture) && ok;
+}
+static bool runtime_limit_accepted(bool receiver, const char *key, int64_t value)
+{
+    char wire[8192]; struct json_value parsed = {0};
+    if (!runtime_limit_wire(receiver, key, value, wire)) return false;
+    bool ok = device_host_runtime_entry_parse(&parsed, wire, strlen(wire), receiver).ok; json_free(&parsed); return ok;
+}
+static int runtime_long_caps_limits(void)
+{
+    int failures = 0;
+    TEST_CASE("HOST shared entry: supervised-hub maxima are accepted, maxima plus one refuse, prior values stay valid") {
+        for (int role = 0; role < 2; ++role) {
+            bool receiver = role != 0;
+            ASSERT(runtime_limit_accepted(receiver, "session_ms", 600000));
+            ASSERT(runtime_limit_accepted(receiver, "idle_ms", 60000));
+            ASSERT(runtime_limit_accepted(receiver, "session_ms", 28800000));
+            ASSERT(!runtime_limit_accepted(receiver, "session_ms", 28800001));
+            ASSERT(runtime_limit_accepted(receiver, "idle_ms", 1800000));
+            ASSERT(!runtime_limit_accepted(receiver, "idle_ms", 1800001));
+        }
+        ASSERT(runtime_limit_accepted(true, "lifetime_ms", 600000));
+        ASSERT(runtime_limit_accepted(true, "lifetime_ms", 86400000));
+        ASSERT(!runtime_limit_accepted(true, "lifetime_ms", 86400001));
+        ASSERT(runtime_limit_accepted(true, "max_sessions", 64)); ASSERT(!runtime_limit_accepted(true, "max_sessions", 65));
+        ASSERT(runtime_limit_accepted(true, "max_active", 4)); ASSERT(!runtime_limit_accepted(true, "max_active", 5));
+    } TEST_END
+    return failures;
+}
 int test_device_host_runtime(void);
 int test_device_host_runtime(void)
 {
@@ -1540,7 +1586,7 @@ int test_device_host_runtime(void)
         runtime_fresh_backup() + runtime_handshake_deadline() + runtime_idle_deadline() +
         runtime_during_traffic_revoke() + runtime_named_handshake_deadline(false) + runtime_named_handshake_deadline(true) + runtime_multi_active_deadline() + runtime_client_hup() +
         runtime_hup_kept_open() + runtime_hup_priority(false) + runtime_hup_priority(true) + runtime_hup_signal_restore() + runtime_hup_stdio_restore() + runtime_sparse_measurement() +
-        runtime_preauth_slots(1, 3, false) + runtime_preauth_slots(64, 70, false) + runtime_preauth_slots(1, 256, true) + runtime_session_cap_before_target() + runtime_restart_rebind();
+        runtime_preauth_slots(1, 3, false) + runtime_preauth_slots(64, 70, false) + runtime_preauth_slots(1, 256, true) + runtime_session_cap_before_target() + runtime_restart_rebind() + runtime_long_caps_limits() + runtime_long_caps_revoke();
 }
 #else
 int test_device_host_runtime(void);

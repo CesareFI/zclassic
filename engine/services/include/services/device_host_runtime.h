@@ -9,6 +9,11 @@
 #define DEVICE_HOST_RUNTIME_ACCEPT_MAX 64u
 /* Receiver closes its listener after this many unauthenticated connections fail. */
 #define DEVICE_HOST_RUNTIME_PREAUTH_MAX 256u
+/* Hard maxima for the supervised hub (24 h receiver, 8 h session, 30 min idle).
+ * Grant expiry, revocation and per-record authority still end a session earlier. */
+#define DEVICE_HOST_RUNTIME_LIFETIME_MS_MAX 86400000u
+#define DEVICE_HOST_RUNTIME_SESSION_MS_MAX 28800000u
+#define DEVICE_HOST_RUNTIME_IDLE_MS_MAX 1800000u
 struct device_host_runtime_common {
     struct device_pairing_store *store;
     uint8_t peer[32], approved_root[32];

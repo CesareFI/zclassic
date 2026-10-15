@@ -85,8 +85,8 @@ static bool runtime_common_valid(const struct device_host_runtime_common *common
     if (!common || !common->store || !common->target_port ||
         !zcl_bytes_any_set(common->peer, 32) || !zcl_bytes_any_set(common->approved_root, 32)) return false;
     return common->handshake_ms > 0 && common->handshake_ms <= 10000 &&
-        common->session_ms > 0 && common->session_ms <= 600000 &&
-        common->idle_ms > 0 && common->idle_ms <= 60000 && fcntl(STDERR_FILENO, F_GETFD) >= 0;
+        common->session_ms > 0 && common->session_ms <= DEVICE_HOST_RUNTIME_SESSION_MS_MAX &&
+        common->idle_ms > 0 && common->idle_ms <= DEVICE_HOST_RUNTIME_IDLE_MS_MAX && fcntl(STDERR_FILENO, F_GETFD) >= 0;
 }
 static bool runtime_address_valid(uint32_t address)
 {
@@ -431,7 +431,7 @@ static bool runtime_receiver_valid(const struct device_host_runtime_receiver_spe
 {
     if (!spec || !runtime_common_valid(&spec->common) || !runtime_address_valid(spec->listen_address_be)) return false;
     if ((ntohl(spec->listen_address_be) >> 24) != 127 && !spec->allow_external) return false;
-    return spec->lifetime_ms > 0 && spec->lifetime_ms <= 600000 &&
+    return spec->lifetime_ms > 0 && spec->lifetime_ms <= DEVICE_HOST_RUNTIME_LIFETIME_MS_MAX &&
         spec->max_sessions > 0 && spec->max_sessions <= DEVICE_HOST_RUNTIME_ACCEPT_MAX &&
         spec->max_active > 0 && spec->max_active <= DEVICE_HOST_RUNTIME_ACTIVE_MAX;
 }
