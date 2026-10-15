@@ -772,12 +772,12 @@ static int gw_t_handshake(void)
         struct json_value catalog = {0};
         ASSERT(json_read(&catalog, b, strlen(b)));
         const struct json_value *tools = json_get(json_get(&catalog, "result"), "tools");
-        ASSERT(tools && json_size(tools) == 7);
+        ASSERT(tools && json_size(tools) == 8);
         const char *const names[] = {
-            "steer_brief", "steer_send", "steer_evidence", "steer_deliver", "wiki_find", "wiki_read", "wiki_write"
+            "steer_brief", "steer_send", "steer_evidence", "steer_deliver", "wiki_find", "wiki_read", "wiki_write", "steer_mailbox"
         };
         const char *const titles[] = {
-            "Observe fleet", "Delegate work", "Inspect evidence", "Stage source", "Find knowledge", "Read knowledge", "Save knowledge"
+            "Observe fleet", "Delegate work", "Inspect evidence", "Stage source", "Find knowledge", "Read knowledge", "Save knowledge", "Read own mail"
         };
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             const struct json_value *tool = json_at(tools, i);
@@ -793,6 +793,11 @@ static int gw_t_handshake(void)
             ASSERT(strstr(credential, "caller.sender") != NULL);
             ASSERT(strstr(credential, "agent label") != NULL);
         }
+        const struct json_value *mailbox = json_at(tools, 7);
+        const struct json_value *mb_schema = json_get(mailbox, "inputSchema");
+        ASSERT_EQ(json_size(json_get(mb_schema, "required")), 1);
+        ASSERT_STR_EQ(json_get_str(json_at(json_get(mb_schema, "required"), 0)), "to");
+        ASSERT(json_get_bool(json_get(json_get(mailbox, "annotations"), "readOnlyHint")));
         const char *send_description =
             json_get_str(json_get(json_at(tools, 1), "description"));
         ASSERT(send_description && strstr(send_description,
@@ -3071,6 +3076,116 @@ static bool gw_qreap_scan(const char *name, char *verdict, size_t vcap,
     return ok;
 }
 
+/* Decode the gateway's text content without losing cursor or truncation fields. */
+static bool gw_mailbox_reply(const char *body, struct json_value *data)
+{
+    struct json_value envelope = {0};
+    bool ok = false;
+    if (json_read(&envelope, body, strlen(body))) {
+        const struct json_value *result = json_get(&envelope, "result");
+        const struct json_value *item = json_at(json_get(result, "content"), 0);
+        const char *text = json_get_str(json_get(item, "text"));
+        ok = text && json_read(data, text, strlen(text));
+    }
+    json_free(&envelope);
+    return ok;
+}
+
+static char *gw_mailbox_http(const char *grant, const char *to,
+                             const char *cursor, int *status)
+{
+    struct json_value args = {0};
+    char encoded[12000], request[12500];
+    json_set_object(&args);
+    bool ok = json_push_kv_str(&args, "to", to) &&
+              json_push_kv_str(&args, "ref", "gw-mailbox-") &&
+              (!cursor[0] || json_push_kv_str(&args, "since", cursor)) &&
+              json_push_kv_int(&args, "limit", 1);
+    size_t n = ok ? json_write(&args, encoded, sizeof(encoded)) : 0;
+    json_free(&args);
+    if (!n || n >= sizeof(encoded))
+        return NULL;
+    int count = snprintf(request, sizeof(request),
+        "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"steer_mailbox\",\"arguments\":%s}}", encoded);
+    if (count <= 0 || (size_t)count >= sizeof(request))
+        return NULL;
+    return gw_post_auth("/steer", request, grant, status);
+}
+
+static int gw_t_mailbox(void)
+{
+    int failures = 0;
+    TEST("gateway: bearer-only mailbox pages preserve exact rows and truncation") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char grant[64], cursor[4200] = "", large[701];
+        const char *refs[] = {"gw-mailbox-a", "gw-mailbox-b", "gw-mailbox-c"};
+        int status = 0;
+        long long previous = 0;
+        ASSERT(gw_mint(node, "brief", grant));
+        memset(large, 'm', sizeof(large) - 1);
+        large[sizeof(large) - 1] = '\0';
+        for (size_t i = 0; i < 3; i++)
+            ASSERT(gw_mail_post(GW_SENDER, "result", i == 1 ? large : "mail",
+                                refs[i], "gw-mailbox-owner"));
+        ASSERT(gw_mail_post("gw-mailbox-foreign", "result", "private",
+                            "gw-mailbox-hidden", "gw-mailbox-owner"));
+        for (size_t page = 0; page < 4; page++) {
+            char *body = gw_mailbox_http(grant, GW_SENDER, cursor, &status);
+            struct json_value data = {0};
+            ASSERT(body != NULL);
+            ASSERT_EQ(status, 200);
+            ASSERT(!gw_body_has(body, grant));
+            GW_ASSERT_BODY(body, "\"isError\":false");
+            ASSERT(gw_mailbox_reply(body, &data));
+            free(body);
+            const struct json_value *rows = json_get(&data, "rows");
+            ASSERT_EQ(json_size(rows), page < 3 ? 1 : 0);
+            ASSERT_EQ(json_get_int(json_get(&data, "count")), page < 3 ? 1 : 0);
+            if (page < 3) {
+                const struct json_value *row = json_at(rows, 0);
+                ASSERT_STR_EQ(json_get_str(json_get(row, "ref")), refs[page]);
+                ASSERT_STR_EQ(json_get_str(json_get(row, "to")), GW_SENDER);
+                long long seq = json_get_int(json_get(row, "seq"));
+                ASSERT(seq > previous);
+                previous = seq;
+                ASSERT_EQ(json_get_bool(json_get(row, "body_truncated")), page == 1);
+                ASSERT_EQ(json_get_int(json_get(row, "body_bytes")), page == 1 ? 700 : 4);
+                ASSERT_EQ(strlen(json_get_str(json_get(row, "body"))), page == 1 ? 480 : 4);
+                ASSERT_EQ(json_get_int(json_get(&data, "bodies_truncated")), page == 1 ? 1 : 0);
+                ASSERT_EQ(json_get_int(json_get(&data, "body_cap_bytes")), 480);
+            }
+            ASSERT_EQ(json_get_bool(json_get(&data, "more")), page < 2);
+            const char *next = json_get_str(json_get(&data, "cursor"));
+            ASSERT(next && next[0] && strlen(next) < sizeof(cursor));
+            if (page == 3)
+                ASSERT_STR_EQ(next, cursor);
+            memcpy(cursor, next, strlen(next) + 1);
+            json_free(&data);
+        }
+        PASS();
+    }
+    TEST("gateway: foreign mailbox refusal never echoes credentials or selectors") {
+        const char *node = gw_bin("Z23_TEST_NODE_BIN", GW_TEST_NODE_DEFAULT);
+        char grant[64];
+        int status = 0;
+        ASSERT(gw_mint(node, "brief", grant));
+        char *body = gw_mailbox_http(grant, "gw-mailbox-foreign", "private-cursor", &status);
+        ASSERT(body != NULL);
+        ASSERT_EQ(status, 200);
+        ASSERT(gw_body_has(body, "\"isError\":true"));
+        ASSERT(gw_body_has(body, "STEER_MAILBOX_FOREIGN"));
+        ASSERT(gw_body_has(body, "own label"));
+        ASSERT(!gw_body_has(body, grant));
+        ASSERT(!gw_body_has(body, "gw-mailbox-foreign"));
+        ASSERT(!gw_body_has(body, "private-cursor"));
+        free(body);
+        PASS();
+    }
+_test_next:;
+    return failures;
+}
+
 /* The caller contract: a schema-driven director only sends what the
  * served schema names. brief's integer cursor never covered an
  * independently-numbered stream, so the schema must admit the reply's
@@ -4216,6 +4331,7 @@ static const struct gw_case g_gw_cases[] = {
     GW_CASE(gw_t_wiki_find, 0),
     GW_CASE(gw_t_evidence_selectors, 0),
     GW_CASE(gw_t_brief_token, 5),
+    GW_CASE(gw_t_mailbox, 0),
 };
 #undef GW_CASE
 #define GW_CASE_COUNT (sizeof(g_gw_cases) / sizeof(g_gw_cases[0]))
@@ -4239,7 +4355,7 @@ static const char *const g_gw_original[] = {
     "gw_t_front_hello_verdicts", "gw_t_front_hello_truncated",
     "gw_t_wiki_inputs",
     "gw_t_wiki_find",
-    "gw_t_front_hello_malformed", "gw_t_evidence_selectors", "gw_t_brief_token",
+    "gw_t_front_hello_malformed", "gw_t_evidence_selectors", "gw_t_brief_token", "gw_t_mailbox",
 };
 #define GW_ORIGINAL_COUNT (sizeof(g_gw_original) / sizeof(g_gw_original[0]))
 
