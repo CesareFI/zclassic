@@ -1865,10 +1865,10 @@ represented by its children's sections.
 |---|---|---|---|---|---|---|
 | `fleet usage` | ready | read / read / operator · instant/low | `days`, `provider`, `box` | `zcl.fleet_usage.v1` | `z23 fleet usage --days=7` | What every box spent, per provider, over the last days |
 | `fleet objectives` | ready | read / read / operator, prose · foreground/low | `outcomes`, `attempts_dir`, `repo`, `lintc_dir`, `baseline` | `zcl.fleet_objectives.v1` | `z23-dev fleet objectives` | Every objective z23 optimizes, its current value, target, and status |
-| `fleet invite` | ready | mutate / app-write / **owner** · fast/low | **`name`**, `ttl_hours`, `relay` | `zcl.fleet.invite.v1` | `z23 fleet invite --name=studio --ttl-hours=24` | Mint one signed invite line that adds a computer to this fleet |
+| `fleet invite` | ready | mutate / app-write / **owner** · fast/low | **`name`**, `ttl_hours`, `relay`, `datadir` | `zcl.fleet.invite.v1` | `z23 fleet invite --name=studio --ttl-hours=24` | Mint one signed invite line that adds a computer to this fleet |
 | `fleet join` | ready | mutate / app-write / **owner** · fast/low | **`token`**, `onion` | `zcl.fleet.join.v1` | `z23 fleet join <token> [--onion=<v3>.onion]` | Join this computer to a fleet from one pasted invite |
-| `fleet admit` | ready | mutate / app-write / **owner** · fast/low | **`receipt`**, `bridge` | `zcl.fleet.admit.v1` | `z23 fleet admit <receipt>` | Admit one joined computer to this fleet's machine roster |
-| `fleet import` | ready | mutate / app-write / **owner** · fast/low | **`line`** | `zcl.fleet.import.v1` | `z23 fleet import <roster-line>` | Copy one manager-sealed roster line onto this box's machine roster |
+| `fleet admit` | ready | mutate / app-write / **owner** · fast/low | **`receipt`**, `bridge`, `datadir`, `require_anchor` | `zcl.fleet.admit.v1` | `z23 fleet admit <receipt>` | Admit one joined computer to this fleet's machine roster |
+| `fleet import` | ready | mutate / app-write / **owner** · fast/low | **`line`**, `datadir`, `require_anchor` | `zcl.fleet.import.v1` | `z23 fleet import <roster-line>` | Copy one manager-sealed roster line onto this box's machine roster |
 | `fleet machines` | ready | read / read / **owner** · fast/low | `offset`, `limit` | `zcl.fleet.machines.v1` | `z23 fleet machines --input='{"offset":0,"limit":64}'` | List the computers this owner has admitted to the fleet |
 | `fleet doctor` | ready | read / read / **owner** · foreground/low | `datadir` | `zcl.fleet_doctor.v1` | `z23 fleet doctor` | Where this node is in fleet setup, and what to run next |
 

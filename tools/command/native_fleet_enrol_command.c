@@ -25,9 +25,12 @@
 #include "fleet_roles.h"
 #include "json/json.h"
 #include "kernel/command_registry.h"
+#include "models/database.h"
+#include "models/zid_identity.h"
 #include "platform/clock.h"
 #include "vcs/zcode_dht_identity.h"
 
+#include <sqlite3.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -60,6 +63,136 @@ static bool fe_key(struct zcl_command_reply *reply, bool create,
     return false;
 }
 
+/* ── the fleet root as a ZID anchor (ZRC 0012 step 1) ───────────────────── */
+
+/* The datadir whose zid_identities projection answers "is this operator key
+ * anchored?". An explicit `datadir` input wins; else only a datadir the CLI
+ * was GIVEN (--datadir). The default datadir is never opened for this: these
+ * leaves are node-free, and a fleet command quietly reading the operator's
+ * live node.db is not something they promise. NULL means nobody looked. */
+static const char *fe_anchor_datadir(const struct zcl_command_request *request)
+{
+    const char *dd = request ? json_get_str(json_get(request->input, "datadir"))
+                             : NULL;
+    if (dd && dd[0])
+        return dd;
+    return zcl_native_command_datadir_is_explicit()
+               ? zcl_native_command_datadir() : NULL;
+}
+
+static enum fleet_anchor_state fe_anchor_state_of(const struct zid_identity *r)
+{
+    if (strcmp(r->status, ZID_IDENTITY_STATUS_ACTIVE) == 0)
+        return FLEET_ANCHOR_ACTIVE;
+    if (strcmp(r->status, ZID_IDENTITY_STATUS_ROTATED) == 0)
+        return FLEET_ANCHOR_ROTATED;
+    if (strcmp(r->status, ZID_IDENTITY_STATUS_REVOKED) == 0)
+        return FLEET_ANCHOR_REVOKED;
+    return FLEET_ANCHOR_UNREADABLE; /* a status this build does not know */
+}
+
+/* One READ-ONLY lookup (never CREATE, never READWRITE): an absent node.db is
+ * "unchecked" — this host has no folded chain, which is a state, not an
+ * error — while a node.db that exists and cannot be read is "unreadable",
+ * which a required anchor must NOT treat as "no anchor was needed". */
+static void fe_anchor_lookup(const struct zcl_command_request *request,
+                             const uint8_t key[FLEET_ENROL_PUBKEY_BYTES],
+                             struct fleet_anchor_fact *out)
+{
+    const char *datadir = fe_anchor_datadir(request);
+    struct sqlite3 *db = NULL;
+    struct node_db ndb;
+    struct zid_identity row;
+    enum zcl_node_db_ro_status st;
+    memset(out, 0, sizeof(*out));
+    out->state = FLEET_ANCHOR_UNCHECKED;
+    if (!datadir)
+        return;
+    st = zcl_native_node_db_open_readonly(datadir, &db, &ndb, NULL, 0);
+    if (st == ZCL_NODE_DB_RO_ABSENT || st == ZCL_NODE_DB_RO_NO_DATADIR)
+        return;
+    if (st != ZCL_NODE_DB_RO_OK) {
+        out->state = FLEET_ANCHOR_UNREADABLE;
+        return;
+    }
+    if (!db_zid_identity_find(&ndb, key, &row)) {
+        out->state = FLEET_ANCHOR_NOT_ANCHORED;
+    } else {
+        out->state = fe_anchor_state_of(&row);
+        out->anchor_height = row.anchor_height;
+        out->has_successor = row.has_successor;
+        if (row.has_successor)
+            memcpy(out->successor, row.successor_pubkey,
+                   FLEET_ENROL_PUBKEY_BYTES);
+    }
+    zcl_native_node_db_close_readonly(&db, &ndb);
+}
+
+/* --require_anchor is a STRING input, like --bridge: the catalog types a
+ * bare key as a string and boolean keys are a closed table. Absent, "no",
+ * "false" and "0" leave the anchor optional; ANY other value requires it, so
+ * a typo fails closed rather than quietly turning the requirement off. */
+static bool fe_anchor_required(const struct zcl_command_request *request)
+{
+    const char *v = request ? json_get_str(json_get(request->input,
+                                                    "require_anchor"))
+                            : NULL;
+    if (!v || !v[0])
+        return false;
+    return strcmp(v, "no") != 0 && strcmp(v, "false") != 0 &&
+           strcmp(v, "0") != 0;
+}
+
+/* The reported anchor state: its own object, never merged into what the
+ * operator seal attests. `refusal` is what a REQUIRED anchor would answer,
+ * so a reader sees the verdict even when nothing was required. */
+static void fe_anchor_render(struct zcl_command_reply *reply,
+                             const struct fleet_anchor_fact *fact,
+                             bool required)
+{
+    struct json_value obj;
+    const char *refusal = fleet_root_anchor_refusal(fact, true);
+    char hex[FLEET_ENROL_PUBKEY_HEX];
+    json_init(&obj);
+    json_set_object(&obj);
+    (void)json_push_kv_str(&obj, "state", fleet_anchor_state_name(fact->state));
+    (void)json_push_kv_bool(&obj, "required", required);
+    (void)json_push_kv_str(&obj, "would_refuse_as", refusal ? refusal : "");
+    (void)json_push_kv_int(&obj, "anchor_height", fact->anchor_height);
+    if (fact->has_successor)
+        zcl_hex_encode(fact->successor, FLEET_ENROL_PUBKEY_BYTES, hex);
+    else
+        hex[0] = '\0';
+    (void)json_push_kv_str(&obj, "successor", hex);
+    (void)json_push_kv(&reply->data, "operator_anchor", &obj);
+    json_free(&obj);
+}
+
+static void fe_anchor_refuse(struct zcl_command_reply *reply,
+                             const char *token)
+{
+    fe_fail(reply, "FLEET_ROOT_NOT_ANCHORED", "authorize",
+            "--require_anchor=yes was given and the operator key is not an active "
+            "ZID anchor in the node.db read. Anchor it with `z23 core "
+            "identity anchor`, or drop --require_anchor.", token);
+}
+
+/* Read the root's anchor state BEFORE anything is checked or spent, so a
+ * refusal under --require_anchor leaves the invite usable. False means the
+ * reply is already failed; true leaves the fact for the caller to render. */
+static bool fe_anchor_gate(const struct zcl_command_request *request,
+                           struct zcl_command_reply *reply,
+                           const uint8_t key[FLEET_ENROL_PUBKEY_BYTES],
+                           struct fleet_anchor_fact *fact)
+{
+    const char *refusal = NULL;
+    fe_anchor_lookup(request, key, fact);
+    refusal = fleet_root_anchor_refusal(fact, fe_anchor_required(request));
+    if (refusal)
+        fe_anchor_refuse(reply, refusal);
+    return refusal == NULL;
+}
+
 /* ── fleet invite ───────────────────────────────────────────────────────── */
 
 static void fe_invite(const struct zcl_command_request *request,
@@ -78,6 +211,7 @@ static void fe_invite(const struct zcl_command_request *request,
      * one machine. A blanket rule is cheaper to keep true than a
      * per-callee argument about who initialises what. */
     struct fleet_invite invite = {0};
+    struct fleet_anchor_fact anchor = {0};
     const struct json_value *in = request ? request->input : NULL;
     const char *name = json_get_str(json_get(in, "name"));
     const char *relay = json_get_str(json_get(in, "relay"));
@@ -109,6 +243,8 @@ static void fe_invite(const struct zcl_command_request *request,
     (void)json_push_kv_str(&reply->data, "name", invite.name);
     (void)json_push_kv_int(&reply->data, "expires_at", invite.expires_unix);
     (void)json_push_kv_str(&reply->data, "operator_pubkey", hex);
+    fe_anchor_lookup(request, pubkey, &anchor);
+    fe_anchor_render(reply, &anchor, false);
     (void)json_push_kv_str(&reply->data, "token", token);
     /* The one line the owner pastes. Everything else in this reply is
      * explanation; this field is the product. */
@@ -430,6 +566,7 @@ static void fe_admit(const struct zcl_command_request *request,
     uint8_t receipt_wire[FLEET_ENROL_RECEIPT_WIRE_MAX];
     char sealed[FLEET_ENROL_MACHINE_TEXT_MAX];
     char hex[FLEET_ENROL_PUBKEY_HEX];
+    struct fleet_anchor_fact anchor = {0};
     struct fleet_receipt receipt = {0};
     struct fleet_roster_scan scan = {0};
     const struct json_value *in = request ? request->input : NULL;
@@ -457,6 +594,8 @@ static void fe_admit(const struct zcl_command_request *request,
                 FLEET_ENROL_WHY_INVITE_NOT_OURS);
         return;
     }
+    if (!fe_anchor_gate(request, reply, pubkey, &anchor))
+        return;
     if (!fe_admit_checks(reply, &receipt, pubkey, &scan, &port))
         return;
     if (!fleet_machine_mint(receipt_wire, receipt_len, now, port, seed, pubkey,
@@ -482,6 +621,7 @@ static void fe_admit(const struct zcl_command_request *request,
     (void)json_push_kv_int(&reply->data, "relay_port", port);
     (void)json_push_kv_int(&reply->data, "enrolled_at", now);
     (void)json_push_kv_bool(&reply->data, "re_enrolled", scan.same_box);
+    fe_anchor_render(reply, &anchor, fe_anchor_required(request));
     fe_admit_role(reply, &receipt, now);
     fe_admit_bridge(reply, &receipt, port,
                     !(bridge && strcmp(bridge, "no") == 0));
@@ -520,6 +660,29 @@ static bool fe_import_operator(struct zcl_command_reply *reply,
     return false;
 }
 
+/* The anchor verdict for an imported line. A line the operator key did not
+ * seal is NOT decided here: it falls through to fleet_roster_import, which
+ * refuses it under its own long-standing token. Only a line that IS sealed
+ * by the operator can be refused for the operator's anchor. */
+static bool fe_import_gate(const struct zcl_command_request *request,
+                           struct zcl_command_reply *reply,
+                           const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                           const char *line, struct fleet_anchor_fact *fact)
+{
+    struct fleet_machine seen = {0};
+    const char *why = NULL;
+    fe_anchor_lookup(request, operator_pubkey, fact);
+    if (!line || fleet_root_line_verify(line, operator_pubkey, fact,
+                                        fe_anchor_required(request), &seen,
+                                        &why))
+        return true;
+    if (strcmp(why, FLEET_ENROL_WHY_ROSTER_SIGNATURE) == 0 ||
+        strcmp(why, FLEET_ENROL_WHY_ARGUMENTS) == 0)
+        return true;
+    fe_anchor_refuse(reply, why);
+    return false;
+}
+
 static void fe_import(const struct zcl_command_request *request,
                       struct zcl_command_reply *reply)
 {
@@ -530,7 +693,10 @@ static void fe_import(const struct zcl_command_request *request,
     const char *line = json_get_str(json_get(in, "line"));
     const char *why = NULL;
     bool appended = false;
+    struct fleet_anchor_fact anchor = {0};
     if (!fe_import_operator(reply, operator_pubkey))
+        return;
+    if (!fe_import_gate(request, reply, operator_pubkey, line, &anchor))
         return;
     if (!fleet_roster_import(line, operator_pubkey, &machine, &appended,
                              &why)) {
@@ -550,6 +716,7 @@ static void fe_import(const struct zcl_command_request *request,
     /* False when this exact box was already on the roster: importing the
      * same line twice is a no-op, never a second row. */
     (void)json_push_kv_bool(&reply->data, "appended", appended);
+    fe_anchor_render(reply, &anchor, fe_anchor_required(request));
     (void)zcl_command_reply_add_next(reply, "fleet.machines", "{}",
                                      "see the roster this box now holds");
 }
@@ -663,6 +830,24 @@ static int64_t fe_next_offset(uint32_t offset, uint32_t rendered, bool more)
     return (int64_t)sum;
 }
 
+/* Reported, never enforced: this is a read leaf, and an enrolment made
+ * before the operator anchored its key must still list. A box that has
+ * neither joined nor minted holds no operator key to look up. It takes no
+ * `datadir` INPUT on purpose: only a datadir the CLI was given (--datadir)
+ * is opened, read-only, because a READ leaf that declares `datadir` must be
+ * exercised by tests/harness/src/test_read_leaf_no_datadir_write.c. */
+static void fe_machines_anchor(const struct zcl_command_request *request,
+                               struct zcl_command_reply *reply,
+                               const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
+                               bool known)
+{
+    struct fleet_anchor_fact anchor = {0};
+    if (!known)
+        return;
+    fe_anchor_lookup(request, operator_pubkey, &anchor);
+    fe_anchor_render(reply, &anchor, false);
+}
+
 static void fe_machines(const struct zcl_command_request *request,
                         struct zcl_command_reply *reply)
 {
@@ -723,6 +908,7 @@ static void fe_machines(const struct zcl_command_request *request,
      * evidence about this fleet. */
     (void)json_push_kv_int(&reply->data, "unverifiable",
                            (int64_t)scan.unverifiable);
+    fe_machines_anchor(request, reply, operator_pubkey, joined || own_present);
     (void)json_push_kv(&reply->data, "machines", &array);
     json_free(&array);
     if (scan.rows == 0)

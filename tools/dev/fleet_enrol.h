@@ -420,4 +420,61 @@ bool fleet_bridge_line(const char *ssh_pubkey, uint16_t port, const char *name,
 bool fleet_bridge_authorize(const char *line, const char *name, bool *added,
                             const char **why);
 
+/* ── the fleet root as a ZID anchor (tools/dev/fleet_enrol_anchor.c) ─────── */
+
+/* ZRC 0012 step 1. The fleet operator key is a 32-byte Ed25519 key, the same
+ * shape as a ZID master key, so "fleet root = ZID anchor" needs NO second key
+ * format and changes NO signed byte: the operator anchors the very pubkey
+ * `fleet invite` prints with `core identity anchor`, and a node answers "is
+ * the key that sealed this roster line an active anchor?" from its own
+ * zid_identities projection. "Sealed by the operator" and "the operator is
+ * anchored" stay two separate facts. The projection lookup lives in the
+ * adapter (tools/command/native_fleet_enrol_command.c); everything here is
+ * pure, so a later roster gate can call the same verdicts. */
+enum fleet_anchor_state {
+    FLEET_ANCHOR_UNCHECKED = 0, /* no datadir / no node.db: nobody looked */
+    FLEET_ANCHOR_UNREADABLE,    /* node.db exists and could not be read */
+    FLEET_ANCHOR_NOT_ANCHORED,  /* looked: no row for this key */
+    FLEET_ANCHOR_ACTIVE,
+    FLEET_ANCHOR_ROTATED,       /* superseded; `successor` is set */
+    FLEET_ANCHOR_REVOKED,
+};
+
+struct fleet_anchor_fact {
+    enum fleet_anchor_state state;
+    int32_t anchor_height;
+    bool has_successor;
+    uint8_t successor[FLEET_ENROL_PUBKEY_BYTES];
+};
+
+/* Typed refusals for a fleet root that must be anchored. */
+#define FLEET_ENROL_WHY_ROOT_NOT_ANCHORED "fleet_root_not_anchored"
+#define FLEET_ENROL_WHY_ROOT_ROTATED "fleet_root_rotated"
+#define FLEET_ENROL_WHY_ROOT_REVOKED "fleet_root_revoked"
+#define FLEET_ENROL_WHY_ROOT_UNVERIFIABLE "fleet_root_anchor_unverifiable"
+/* The ZRC 0012 condition name for a roster row whose seal does not verify
+ * under the fleet root. Used as a refusal token here; it raises no standing
+ * blocker, because the ZRC says it self-clears per row. */
+#define FLEET_ENROL_WHY_ROSTER_SIGNATURE "fleetboard.roster_signature_invalid"
+
+const char *fleet_anchor_state_name(enum fleet_anchor_state state);
+
+/* The fail-closed verdict. NULL when the root is acceptable; otherwise the
+ * typed token. With `require` false it always returns NULL: an enrolment
+ * made before the root was anchored still reads, and its state is REPORTED
+ * (fleet_anchor_state_name), not rejected. With `require` true only ACTIVE
+ * passes; UNCHECKED and UNREADABLE fail closed as "unverifiable". */
+const char *fleet_root_anchor_refusal(const struct fleet_anchor_fact *anchor,
+                                      bool require);
+
+/* One roster line against one root: the seal first (a line the root did not
+ * seal is `fleetboard.roster_signature_invalid`, whatever the chain says),
+ * then the anchor verdict. `out` is filled on a verified seal even when the
+ * anchor verdict refuses, so a caller can name the machine it refused. */
+bool fleet_root_line_verify(const char *line,
+                            const uint8_t root[FLEET_ENROL_PUBKEY_BYTES],
+                            const struct fleet_anchor_fact *anchor,
+                            bool require, struct fleet_machine *out,
+                            const char **why);
+
 #endif /* ZCL_TOOLS_DEV_FLEET_ENROL_H */

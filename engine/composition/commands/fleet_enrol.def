@@ -51,10 +51,13 @@ ZCL_COMMAND_READY_COMMAND(
     "share one and admitting the second machine is never a replay. Refuses "
     "by name: invite_name_invalid, invite_ttl_invalid, "
     "invite_relay_invalid, invite_nonce_unavailable, "
-    "box_key_unwritable.", 0,
+    "box_key_unwritable. With `datadir` (or the CLI --datadir) the reply "
+    "reports `operator_anchor`: whether the "
+    "operator_pubkey printed here is yet an active ZID anchor (anchor it "
+    "with `z23 core identity anchor`; nothing here requires it).", 0,
     "fleet,invite,enrol,join,token,machine,paste",
     "zcl.fleet_invite_input.v1", "zcl.fleet.invite.v1",
-    "name,ttl_hours,relay", "name",
+    "name,ttl_hours,relay,datadir", "name",
     "z23 fleet invite --name=studio --ttl-hours=24",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
@@ -106,10 +109,14 @@ ZCL_COMMAND_READY_COMMAND(
     "it. Re-admitting the same box key keeps its existing port and adds "
     "nothing. Refuses by name: receipt_malformed, box_signature_invalid, "
     "invite_not_ours, invite_expired, invite_replayed, invite_name_taken, "
-    "roster_full, roster_unwritable.", 0,
+    "roster_full, roster_unwritable. With --require_anchor=yes it also refuses, "
+    "before anything is checked or spent, unless this box's operator key is "
+    "an active ZID anchor in the node.db read (fleet_root_not_anchored, "
+    "fleet_root_rotated, fleet_root_revoked, fleet_root_anchor_unverifiable); "
+    "without it the reply only reports `operator_anchor`.", 0,
     "fleet,admit,enrol,roster,machine,bridge,ssh",
     "zcl.fleet_admit_input.v1", "zcl.fleet.admit.v1",
-    "receipt,bridge", "receipt",
+    "receipt,bridge,datadir,require_anchor", "receipt",
     "z23 fleet admit <receipt>",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
@@ -132,10 +139,14 @@ ZCL_COMMAND_READY_COMMAND(
     "false). Writes only this box's own roster file; grants no role, adds "
     "no ssh line and asks no node. Refuses by name: "
     "roster_line_not_operator_sealed, fleet_operator_unknown, "
-    "invite_name_taken, roster_unwritable.", 0,
+    "invite_name_taken, roster_unwritable. With --require_anchor=yes a line the "
+    "operator key sealed is refused unless that key is an active ZID anchor "
+    "in the node.db read (fleet_root_not_anchored, fleet_root_rotated, "
+    "fleet_root_revoked, fleet_root_anchor_unverifiable); a line it did not "
+    "seal is still roster_line_not_operator_sealed.", 0,
     "fleet,import,roster,machine,enrol,operator,verify",
     "zcl.fleet_import_input.v1", "zcl.fleet.import.v1",
-    "line", "line",
+    "line,datadir,require_anchor", "line",
     "z23 fleet import <roster-line>",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_MUTATE,
     ZCL_COMMAND_RISK_APP_WRITE, ZCL_COMMAND_SCOPE_LOCAL,
@@ -161,12 +172,18 @@ ZCL_COMMAND_READY_READ(
     "reached by a later offset rather than a larger reply. `total` counts "
     "every verified row, `returned` is this page, `truncated` means a later "
     "page exists, and `next_offset` is -1 on the last page. Absent keys "
-    "read the first page. Reads no node and no datadir.",
+    "read the first page. Reads no node: when the CLI was given --datadir it "
+    "opens that node.db READ-ONLY, never creating it, and reports "
+    "`operator_anchor` — whether this fleet's operator key "
+    "is an active ZID anchor (state active, rotated, revoked, not_anchored, "
+    "unchecked or unreadable). That state is reported, never enforced: an "
+    "enrolment made before the key was anchored still lists.",
     /* One page is at most the roster render cap, so the largest answer
      * stays inside this budget. The next page is next_offset. */
     65536,
     "fleet,machines,roster,inventory,verified,self-reported",
-    "zcl.fleet_machines_input.v1", "zcl.fleet.machines.v1", "offset,limit", "",
+    "zcl.fleet_machines_input.v1", "zcl.fleet.machines.v1",
+    "offset,limit", "",
     "z23 fleet machines --input='{\"offset\":0,\"limit\":64}'",
     ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_SCOPE_LOCAL,
     ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_LATENCY_FAST,

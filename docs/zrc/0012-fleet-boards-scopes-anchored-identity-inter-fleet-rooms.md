@@ -53,10 +53,10 @@ compartmentalized. As it stands today:
   commands `ZID_ANCHOR_CMD_ANCHOR`/`ROTATE`/`REVOKE`, wired to the CLI at
   `engine/composition/commands/core.def:1551-1605` as
   `core.identity.anchor`/`rotate`/`revoke`) but the board does not use it,
-  and there is a second, unlanded identity effort
-  (`fleetenrol`, commit `5dcd7efb4` on branch `agent/fleetenrol-20260905`,
-  not on `main`) that would mint its own operator root key rather than
-  reuse the anchor that already exists.
+  and there is a second identity effort, `fleetenrol` (now on `main`:
+  `tools/dev/fleet_enrol*.c`, `fleet.invite`/`join`/`admit`/`import`/
+  `machines`), whose operator root was a fleet-only key file with no
+  on-chain binding until lane 1 below made it a ZID anchor.
 - **Direct messages are neither private nor durable.** The peer-to-peer
   messaging path (`contexts/messaging/controllers/src/messaging_controller.c:203-311`,
   `rpc_msg_send`) sends a message body in the clear over the wire — no
@@ -128,9 +128,14 @@ ZID-anchored key: `contexts/wallet/modules/zid/src/zid_anchor.c` already
 defines the on-chain `ANCHOR`/`ROTATE`/`REVOKE` commands and
 `engine/composition/commands/core.def:1551-1605` already exposes them as
 `core.identity.anchor`/`rotate`/`revoke`. `fleetenrol`'s operator root key
-(commit `5dcd7efb4`, not on `main` today) is redefined, before it lands, to
-*be* this anchored key rather than a second, parallel root — one fewer
-identity system to keep consistent, one fewer place a key can silently
+(the `fleet/box.ed25519` key the manager signs invites and roster lines with,
+`tools/dev/fleet_enrol_key.c`) is that anchored key, not a parallel root: it
+is a 32-byte Ed25519 key, the same shape as a ZID master key, so the manager
+anchors the very `operator_pubkey` `fleet invite` prints and no second key
+format exists. The lookup is `fleet_enrol_anchor.c` (verdicts) plus the
+`zid_identities` projection (`fleet invite`/`admit`/`import`/`machines` report
+`operator_anchor`) — one fewer identity system to keep consistent, one fewer
+place a key can silently
 diverge from its own history.
 
 Anchoring the fleet root is a normal spending transaction (it "spends a
@@ -342,7 +347,7 @@ dotted `<owner>.<condition>` form (e.g. `bootstrap.no_state_source` in
 |---|---|---|
 | Signed, gossiped board | Yes — `fleet_board.def`, `fleet_board_post.c`, `boot_fleet_board.c`, `fleet_board_proto.c`, all landed. | Unchanged as the transport and chain-linking mechanism; extended with a `scope` field. |
 | Row identity | Node's local DHT online key, no on-chain binding. | Board key stays as the per-row signer, but is now certified by a roster row rooted in a ZID anchor, so a reader can verify a key belongs to a named fleet, not just that some key signed it. |
-| Fleet identity anchor | Two candidate systems: the general ZID anchor overlay (landed, `zid_anchor.c`) and the unlanded `fleetenrol` operator-key effort (not on `main`). | One system: `fleetenrol`'s root becomes the ZID anchor rather than a second identity. |
+| Fleet identity anchor | One system, step 1 implemented: the general ZID anchor overlay (`contexts/wallet/modules/zid/src/zid_anchor.c`) and `fleetenrol` (`tools/dev/fleet_enrol*.c`, on `main`). `fleetenrol`'s operator root is the same 32-byte Ed25519 key shape; `fleet invite`/`admit`/`import`/`machines` report whether it is an active ZID anchor, and `--require_anchor=yes` makes `admit`/`import` fail closed. The board does not use it yet (lane 2). | Roster rows signed by that anchored root (or a certified delegate) gate `scope: fleet` relay. |
 | Membership | None — any keyholder posting is indistinguishable from a member. | Roster rows, signed by the fleet root or a certified delegate, gate `scope: fleet` relay. |
 | Fleet-row privacy | None — every gossiped row is legible to every peer that relays it. | Epoch-key encryption, rotated on every membership change, relay gated to roster members over onion. |
 | Direct messages | Plaintext on the wire, in-memory ring buffer, unreplicated per-node SQLite mirror, on-chain memo as the only durable/private option. | Sealed per-message with forward secrecy, durable signed at-rest store mirroring the board's own model, delivered over the existing flood/INV path or a ZRC-0002 stream, onion-only; on-chain memo stays as the fallback. |
@@ -356,12 +361,27 @@ dotted `<owner>.<condition>` form (e.g. `bootstrap.no_state_source` in
 Each lane names its owning branch prefix and a measurement row it must
 record before the next lane starts.
 
-1. **`fleetenrol`, unified with ZID.** Redirect the unlanded `fleetenrol`
-   effort (commit `5dcd7efb4`, not on `main`) so its operator root key is a
-   ZID anchor rather than a second identity system. Acceptance: a fleet
-   root anchored via `core.identity.anchor` can issue a roster row a node
-   verifies without any second key format in the codebase. Measurement:
-   time from anchor transaction confirmation to first roster row issued.
+1. **`fleetenrol`, unified with ZID. Step 1: implemented.** `fleetenrol` is
+   on `main` (the earlier "commit `5dcd7efb4`, not on `main`" note was
+   stale), so this lane made its operator root key a ZID anchor in place
+   instead of redirecting an unlanded effort. No wire change: invite,
+   receipt and roster-line bytes are untouched, so every node verifies
+   exactly what it verified before. What it adds is one separate fact,
+   whether the operator key is an `active` row in the node's
+   `zid_identities` projection, reported as `operator_anchor`
+   (`active`/`rotated`/`revoked`/`not_anchored`/`unchecked`/`unreadable`) by
+   `fleet invite`, `admit`, `import` and `machines`. It is reported, never
+   enforced, unless the caller passes `--require_anchor=yes`; then `admit` and
+   `import` fail closed as `fleet_root_not_anchored`, `fleet_root_rotated`,
+   `fleet_root_revoked` or `fleet_root_anchor_unverifiable`, and a line the
+   root did not seal is `fleetboard.roster_signature_invalid` from the pure
+   verifier (`fleet_root_line_verify`; the `fleet import` leaf keeps its
+   long-standing `roster_line_not_operator_sealed`). Acceptance (met by the
+   `fleet_enrol` group): a fleet root anchored via `core.identity.anchor`
+   issues a roster line a node verifies with no second key format.
+   Measurement (time from anchor confirmation to first roster row issued):
+   OPEN, it needs a live chain. Not in this step: delegates (section 3
+   and 6), board-borne roster rows, and the relay gate, which are lane 2.
 2. **`fleetroster`: roster rows + scope gating of relay.** Add `scope` to
    the row schema; wire the roster-membership check into
    `boot_fleet_board.c`'s existing per-peer relay path. Acceptance: a
@@ -453,7 +473,7 @@ record before the next lane starts.
 
 ## Landing
 
-Not yet landed.
+Lane 1 (`fleetenrol`, unified with ZID) lands with this change; lanes 2 to 7 are not yet landed. The Status stays `draft` until the later lanes land.
 
 ## Discussion
 

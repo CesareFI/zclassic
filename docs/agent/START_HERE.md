@@ -42,9 +42,9 @@ is sent over a network; the owner carries each line by hand.
 
 | Step | Where | Command |
 |---|---|---|
-| 1 | The manager computer | `z23 fleet invite --name=<name>` |
+| 1 | The manager computer | `z23 fleet invite --name=<name> --datadir=<node-datadir>` |
 | 2 | The new computer | `z23 fleet join <token>` |
-| 3 | The manager computer | `z23 fleet admit <receipt>` |
+| 3 | The manager computer | `z23 fleet admit <receipt> --datadir=<node-datadir>` |
 
 Step 1 prints step 2's command. Step 2 prints step 3's command. The name is
 2 to 24 characters of `a-z`, `0-9` and interior dashes, and cannot be renamed.

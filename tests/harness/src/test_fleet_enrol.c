@@ -24,16 +24,21 @@
 #include "controllers/rpc_client.h"
 #include "fleet_enrol.h"
 #include "json/json.h"
+#include "models/database.h"
+#include "models/zid_identity.h"
 #include "kernel/command_registry.h"
 #include "models/database.h"
 #include "models/mesh_pairing.h"
 #include "net/acme_b64url.h"
 
+#include <errno.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #define FE_NOW 1757030400
 #define FE_TTL 24
@@ -1407,6 +1412,690 @@ static int test_fd_unreadable_store(void)
     return failures;
 }
 
+/* ── the fleet root as a ZID anchor (ZRC 0012 step 1) ───────────────────── */
+
+/* A refusal that never came back is a NULL token: print it as text so the
+ * assertion fails cleanly instead of crashing in strcmp. */
+static const char *fe_s(const char *token)
+{
+    return token ? token : "(none)";
+}
+
+static const char *fe_refusal(enum fleet_anchor_state state, bool require)
+{
+    struct fleet_anchor_fact fact = { .state = state };
+    return fe_s(fleet_root_anchor_refusal(&fact, require));
+}
+
+static struct fleet_anchor_fact fe_fact(enum fleet_anchor_state state)
+{
+    struct fleet_anchor_fact fact = {0};
+    fact.state = state;
+    return fact;
+}
+
+static int test_fe_anchor_verdicts(void)
+{
+    int failures = 0;
+    TEST("fleet enrol: a required fleet root passes only as an ACTIVE ZID "
+         "anchor; an optional one never refuses; a forged seal is refused "
+         "whatever the chain says") {
+        char row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char forged[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char foreign[FLEET_ENROL_MACHINE_TEXT_MAX];
+        uint8_t op_seed[32], op_pub[32];
+        struct fleet_machine machine;
+        struct fleet_anchor_fact active = fe_fact(FLEET_ANCHOR_ACTIVE);
+        const char *why = NULL;
+        fe_isolate("anchor-verdicts");
+        fe_key(0xa1, op_seed, op_pub);
+        ASSERT(fe_row("studio", 0xa1, 0xa2, FLEET_ENROL_PORT_FIRST, "", row,
+                      sizeof(row)));
+
+        /* The closed verdict table, required. */
+        ASSERT(fleet_root_anchor_refusal(&active, true) == NULL);
+        ASSERT_STR_EQ(fe_refusal(FLEET_ANCHOR_NOT_ANCHORED, true),
+                      FLEET_ENROL_WHY_ROOT_NOT_ANCHORED);
+        ASSERT_STR_EQ(fe_refusal(FLEET_ANCHOR_ROTATED, true),
+                      FLEET_ENROL_WHY_ROOT_ROTATED);
+        ASSERT_STR_EQ(fe_refusal(FLEET_ANCHOR_REVOKED, true),
+                      FLEET_ENROL_WHY_ROOT_REVOKED);
+        /* Nobody looked, or could not look: fail closed, never "fine". */
+        ASSERT_STR_EQ(fe_refusal(FLEET_ANCHOR_UNCHECKED, true),
+                      FLEET_ENROL_WHY_ROOT_UNVERIFIABLE);
+        ASSERT_STR_EQ(fe_refusal(FLEET_ANCHOR_UNREADABLE, true),
+                      FLEET_ENROL_WHY_ROOT_UNVERIFIABLE);
+        ASSERT_STR_EQ(fe_s(fleet_root_anchor_refusal(NULL, true)),
+                      FLEET_ENROL_WHY_ROOT_UNVERIFIABLE);
+        /* Optional: every state is acceptable and only REPORTED. */
+        for (int s = FLEET_ANCHOR_UNCHECKED; s <= FLEET_ANCHOR_REVOKED; s++) {
+            struct fleet_anchor_fact fact = fe_fact((enum fleet_anchor_state)s);
+            ASSERT(fleet_root_anchor_refusal(&fact, false) == NULL);
+        }
+        ASSERT_STR_EQ(fleet_anchor_state_name(FLEET_ANCHOR_NOT_ANCHORED),
+                      "not_anchored");
+
+        /* The genuine line under an active anchor verifies. */
+        ASSERT(fleet_root_line_verify(row, op_pub, &active, true, &machine,
+                                      &why));
+        ASSERT_STR_EQ(machine.receipt.invite.name, "studio");
+
+        /* Forged member: one byte changed, and a line another operator
+         * sealed. The chain says ACTIVE for the root and it does not help. */
+        ASSERT(fe_tamper(row, fe_wire_len(row) / 2, forged, sizeof(forged)));
+        ASSERT(!fleet_root_line_verify(forged, op_pub, &active, true,
+                                       &machine, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROSTER_SIGNATURE);
+        ASSERT(fe_row("studio", 0xb1, 0xa2, FLEET_ENROL_PORT_FIRST, "",
+                      foreign, sizeof(foreign)));
+        ASSERT(!fleet_root_line_verify(foreign, op_pub, &active, true,
+                                       &machine, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROSTER_SIGNATURE);
+        ASSERT(!fleet_root_line_verify(forged, op_pub, &active, false,
+                                       &machine, &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROSTER_SIGNATURE);
+
+        /* Genuine seal, anchor not active: refused by the anchor's name when
+         * required, accepted (and reportable) when not. */
+        struct fleet_anchor_fact none = fe_fact(FLEET_ANCHOR_NOT_ANCHORED);
+        struct fleet_anchor_fact revoked = fe_fact(FLEET_ANCHOR_REVOKED);
+        ASSERT(!fleet_root_line_verify(row, op_pub, &none, true, &machine,
+                                       &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_NOT_ANCHORED);
+        ASSERT_STR_EQ(machine.receipt.invite.name, "studio"); /* named */
+        ASSERT(!fleet_root_line_verify(row, op_pub, &revoked, true, &machine,
+                                       &why));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_REVOKED);
+        ASSERT(fleet_root_line_verify(row, op_pub, &none, false, &machine,
+                                      &why));
+        ASSERT(why == NULL);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A fixture datadir holding a real node.db; `tag` names it. */
+static bool fe_datadir(char *dir, size_t cap, const char *tag)
+{
+    char path[PATH_MAX + 16];
+    struct node_db ndb;
+    test_make_tmpdir(dir, cap, "fleet_enrol", tag);
+    (void)snprintf(path, sizeof(path), "%s/node.db", dir);
+    if (!node_db_open(&ndb, path))
+        return false;
+    node_db_close(&ndb);
+    return true;
+}
+
+/* One zid_identities row for `key`, through the model's own save. */
+static bool fe_anchor_row(const char *dir, const uint8_t key[32],
+                          const char *status, const uint8_t *successor)
+{
+    char path[PATH_MAX + 16];
+    struct node_db ndb;
+    struct zid_identity row = {0};
+    bool ok = false;
+    memcpy(row.master_pubkey, key, 32);
+    memset(row.anchor_txid, 0x5a, sizeof(row.anchor_txid));
+    row.anchor_height = 1000;
+    row.updated_height = 1000;
+    (void)snprintf(row.status, sizeof(row.status), "%s", status);
+    (void)snprintf(row.source, sizeof(row.source), "%s",
+                   ZID_IDENTITY_SOURCE_ZID_OVERLAY);
+    if (successor) {
+        memcpy(row.successor_pubkey, successor, 32);
+        row.has_successor = true;
+    }
+    (void)snprintf(path, sizeof(path), "%s/node.db", dir);
+    if (!node_db_open(&ndb, path))
+        return false;
+    ok = db_zid_identity_save(&ndb, &row);
+    node_db_close(&ndb);
+    return ok;
+}
+
+/* The shipped leaf, by path: the catalog validator, then the handler. */
+static bool fe_leaf_call(const char *path, const char *schema,
+                         const char *body, struct zcl_command_reply *reply)
+{
+    const struct zcl_command_spec *spec = zcl_command_registry_find(
+        zcl_command_catalog(), path, NULL);
+    struct zcl_command_request request = {0};
+    struct json_value input;
+    char why[128];
+    zcl_command_reply_init(reply, schema);
+    json_init(&input);
+    why[0] = '\0';
+    if (!spec || !spec->handler ||
+        !json_read(&input, body, strlen(body)) ||
+        !zcl_command_registry_input_validate(spec, &input, why,
+                                             sizeof(why))) {
+        json_free(&input);
+        zcl_command_reply_free(reply);
+        return false;
+    }
+    request.spec = spec;
+    request.input = &input;
+    spec->handler(&request, reply);
+    json_free(&input);
+    return true;
+}
+
+static const char *fe_anchor_state(const struct zcl_command_reply *reply)
+{
+    return json_get_str(json_get(json_get(&reply->data, "operator_anchor"),
+                                 "state"));
+}
+
+/* This box's own fleet key, created under the isolated state root. It is the
+ * operator on a manager, and the very pubkey `fleet invite` would print. */
+static bool fe_manager_key(uint8_t seed[32], uint8_t pub[32])
+{
+    bool present = false;
+    const char *why = NULL;
+    return fleet_enrol_key_load(seed, pub, true, &present, &why) && present;
+}
+
+/* A receipt `box_byte`'s box signs against an invite the key (seed, pub)
+ * minted at `now`: the join half of the ceremony. */
+static bool fe_receipt_for(const char *name, uint8_t box_byte,
+                           const uint8_t seed[32], const uint8_t pub[32],
+                           int64_t now, char *receipt, size_t cap)
+{
+    uint8_t box_seed[32], box_pub[32];
+    uint8_t iw[FLEET_ENROL_INVITE_WIRE_MAX];
+    char token[FLEET_ENROL_MACHINE_TEXT_MAX];
+    struct fleet_invite invite;
+    struct fleet_box_facts facts = fe_facts();
+    size_t il = 0;
+    const char *why = NULL;
+    fe_key(box_byte, box_seed, box_pub);
+    return fleet_invite_mint(name, FE_TTL, "", seed, pub, now, token,
+                             sizeof(token), &invite, &why) &&
+           fleet_invite_parse(token, &invite, iw, sizeof(iw), &il, &why) &&
+           fleet_receipt_mint(iw, il, FE_ONION, &facts, "", box_seed, box_pub,
+                              NULL, receipt, cap, &why);
+}
+
+/* One sealed roster line for the manager (seed, pub). */
+static bool fe_manager_row(const char *name, uint8_t box_byte,
+                           const uint8_t seed[32], const uint8_t pub[32],
+                           uint16_t port, char *row, size_t cap)
+{
+    uint8_t rw[FLEET_ENROL_RECEIPT_WIRE_MAX];
+    char receipt[FLEET_ENROL_MACHINE_TEXT_MAX];
+    struct fleet_receipt parsed;
+    size_t rl = 0;
+    const char *why = NULL;
+    return fe_receipt_for(name, box_byte, seed, pub, FE_NOW, receipt,
+                          sizeof(receipt)) &&
+           fleet_receipt_parse(receipt, &parsed, rw, sizeof(rw), &rl, &why) &&
+           fleet_machine_mint(rw, rl, FE_NOW, port, seed, pub, row, cap,
+                              &why);
+}
+
+/* Import `name` (a fresh box) through the shipped leaf, with no requirement,
+ * against the datadir `dd`; the reply is left for the caller. */
+static bool fe_import_plain(const char *name, uint8_t box_byte,
+                            const uint8_t seed[32], const uint8_t pub[32],
+                            const char *dd, struct zcl_command_reply *reply)
+{
+    char row[FLEET_ENROL_MACHINE_TEXT_MAX];
+    char body[PATH_MAX + FLEET_ENROL_MACHINE_TEXT_MAX + 64];
+    if (!fe_manager_row(name, box_byte, seed, pub,
+                        (uint16_t)(FLEET_ENROL_PORT_FIRST + (box_byte & 0x0f)), row,
+                        sizeof(row)))
+        return false;
+    (void)snprintf(body, sizeof(body), "{\"line\":\"%s\",\"datadir\":\"%s\"}",
+                   row, dd);
+    return fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body, reply);
+}
+
+static int test_fe_anchor_reported_not_enforced(void)
+{
+    int failures = 0;
+    TEST("fleet enrol: an enrolment made before the operator anchored its key "
+         "still lists and imports, and its anchor state is reported, not "
+         "rejected") {
+        char dd_none[PATH_MAX], dd_wrong[PATH_MAX], dd_dead[PATH_MAX];
+        char empty[PATH_MAX], row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char body[PATH_MAX + 64];
+        uint8_t seed[32], pub[32], s1[32], stranger[32];
+        struct zcl_command_reply reply;
+        struct fleet_roster_scan scan = {0};
+        const struct json_value *rows = NULL;
+        const char *why = NULL;
+        fe_isolate("anchor-reported");
+        ASSERT(fe_manager_key(seed, pub));
+        fe_key(0x56, s1, stranger);
+        ASSERT(fe_manager_row("studio", 0x57, seed, pub,
+                              FLEET_ENROL_PORT_FIRST, row, sizeof(row)));
+        ASSERT(fleet_roster_append(row, &why));
+
+        /* The read leaf with nobody looking: the unanchored fleet lists and
+         * the state is "unchecked", not a refusal. */
+        ASSERT(fe_leaf_call("fleet.machines", "zcl.fleet.machines.v1", "{}",
+                            &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "unchecked");
+        ASSERT_EQ(json_get_int(json_get(&reply.data, "total")), 1);
+        rows = json_get(&reply.data, "machines");
+        ASSERT(rows != NULL && json_at(rows, 0) != NULL);
+        ASSERT_STR_EQ(json_get_str(json_get(json_get(json_at(rows, 0),
+                                                     "verified"), "name")),
+                      "studio");
+        zcl_command_reply_free(&reply);
+
+        /* A datadir whose chain has no row for the operator: the line is
+         * still imported and the state is NOT_ANCHORED. */
+        ASSERT(fe_datadir(dd_none, sizeof(dd_none), "anchor-none"));
+        ASSERT(fe_import_plain("annex", 0x58, seed, pub, dd_none, &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "not_anchored");
+        zcl_command_reply_free(&reply);
+
+        /* The WRONG anchor: a row exists, but for some other key. */
+        ASSERT(fe_datadir(dd_wrong, sizeof(dd_wrong), "anchor-wrong"));
+        ASSERT(fe_anchor_row(dd_wrong, stranger, "active", NULL));
+        ASSERT(fe_import_plain("depot", 0x59, seed, pub, dd_wrong, &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "not_anchored");
+        zcl_command_reply_free(&reply);
+
+        /* Revoked: still imported, and the reply says it is revoked. */
+        ASSERT(fe_datadir(dd_dead, sizeof(dd_dead), "anchor-dead"));
+        ASSERT(fe_anchor_row(dd_dead, pub, "revoked", NULL));
+        ASSERT(fe_import_plain("yard", 0x5a, seed, pub, dd_dead, &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "revoked");
+        ASSERT_STR_EQ(json_get_str(json_get(json_get(&reply.data,
+                                                     "operator_anchor"),
+                                            "would_refuse_as")),
+                      FLEET_ENROL_WHY_ROOT_REVOKED);
+        zcl_command_reply_free(&reply);
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 4u);
+
+        /* A datadir with no node.db reads UNCHECKED and the read-only open
+         * does not create one. */
+        test_make_tmpdir(empty, sizeof(empty), "fleet_enrol", "anchor-empty");
+        ASSERT(fe_import_plain("quay", 0x5b, seed, pub, empty, &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "unchecked");
+        zcl_command_reply_free(&reply);
+        (void)snprintf(body, sizeof(body), "%s/node.db", empty);
+        ASSERT(access(body, F_OK) != 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* One admit call: a fresh receipt for `name`, against datadir `dd`, with
+ * `require` as the raw string (NULL leaves the key off). */
+static bool fe_admit_with(const char *name, uint8_t box_byte,
+                          const uint8_t seed[32], const uint8_t pub[32],
+                          const char *dd, const char *require,
+                          struct zcl_command_reply *reply)
+{
+    char receipt[FLEET_ENROL_MACHINE_TEXT_MAX];
+    char body[PATH_MAX + FLEET_ENROL_MACHINE_TEXT_MAX + 160];
+    int n;
+    if (!fe_receipt_for(name, box_byte, seed, pub, (int64_t)time(NULL),
+                        receipt, sizeof(receipt)))
+        return false;
+    n = snprintf(body, sizeof(body),
+                 "{\"receipt\":\"%s\",\"bridge\":\"no\",\"datadir\":\"%s\"",
+                 receipt, dd);
+    if (require)
+        n += snprintf(body + n, sizeof(body) - (size_t)n,
+                      ",\"require_anchor\":\"%s\"", require);
+    (void)snprintf(body + n, sizeof(body) - (size_t)n, "}");
+    return fe_leaf_call("fleet.admit", "zcl.fleet.admit.v1", body, reply);
+}
+
+static int test_fe_anchor_require_spelling(void)
+{
+    int failures = 0;
+    TEST("fleet admit/import: any require_anchor value but no/false/0 "
+         "requires the anchor, so a typo fails closed; no/false/0 do not") {
+        static const char *const on[3] = { "yse", "true", "1" };
+        static const char *const off[3] = { "no", "false", "0" };
+        char dd[PATH_MAX], row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char body[PATH_MAX + FLEET_ENROL_MACHINE_TEXT_MAX + 160];
+        char name[16];
+        uint8_t seed[32], pub[32];
+        struct zcl_command_reply reply;
+        struct fleet_roster_scan scan = {0};
+        const char *why = NULL;
+        fe_isolate("require-spelling");
+        ASSERT(fe_manager_key(seed, pub));
+        ASSERT(fe_datadir(dd, sizeof(dd), "require-spelling-dd")); /* none */
+        for (int i = 0; i < 3; i++) {
+            (void)snprintf(name, sizeof(name), "on%d", i);
+            ASSERT(fe_admit_with(name, (uint8_t)(0x80 + i), seed, pub, dd,
+                                 on[i], &reply));
+            ASSERT_STR_EQ(reply.error.evidence,
+                          FLEET_ENROL_WHY_ROOT_NOT_ANCHORED);
+            zcl_command_reply_free(&reply);
+            ASSERT(fe_manager_row(name, (uint8_t)(0x90 + i), seed, pub,
+                                  (uint16_t)(FLEET_ENROL_PORT_FIRST + 20 + i),
+                                  row, sizeof(row)));
+            (void)snprintf(body, sizeof(body),
+                           "{\"line\":\"%s\",\"datadir\":\"%s\","
+                           "\"require_anchor\":\"%s\"}", row, dd, on[i]);
+            ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body,
+                                &reply));
+            ASSERT_STR_EQ(reply.error.evidence,
+                          FLEET_ENROL_WHY_ROOT_NOT_ANCHORED);
+            zcl_command_reply_free(&reply);
+        }
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 0u);
+        for (int i = 0; i < 3; i++) {
+            (void)snprintf(name, sizeof(name), "off%d", i);
+            ASSERT(fe_admit_with(name, (uint8_t)(0xa0 + i), seed, pub, dd,
+                                 off[i], &reply));
+            ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+            ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "not_anchored");
+            zcl_command_reply_free(&reply);
+            (void)snprintf(name, sizeof(name), "imp%d", i);
+            ASSERT(fe_manager_row(name, (uint8_t)(0xb0 + i), seed, pub,
+                                  (uint16_t)(FLEET_ENROL_PORT_FIRST + 30 + i),
+                                  row, sizeof(row)));
+            (void)snprintf(body, sizeof(body),
+                           "{\"line\":\"%s\",\"datadir\":\"%s\","
+                           "\"require_anchor\":\"%s\"}", row, dd, off[i]);
+            ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body,
+                                &reply));
+            ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+            zcl_command_reply_free(&reply);
+        }
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 6u);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* Overwrite the status of every zid_identities row with `status` using raw
+ * SQL: the model refuses an unknown literal, so only the file can hold one. */
+static bool fe_poison_status(const char *dd, const char *status)
+{
+    char path[PATH_MAX + 16], sql[96];
+    sqlite3 *db = NULL;
+    bool ok;
+    (void)snprintf(path, sizeof(path), "%s/node.db", dd);
+    (void)snprintf(sql, sizeof(sql), "UPDATE zid_identities SET status='%s'",
+                   status);
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        return false;
+    ok = sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    return ok;
+}
+
+static int test_fe_anchor_unreadable_fails_closed(void)
+{
+    int failures = 0;
+    TEST("fleet admit --require_anchor: a corrupt node.db and an unknown "
+         "status both read UNREADABLE and refuse as unverifiable") {
+        char bad[PATH_MAX], odd[PATH_MAX], path[PATH_MAX + 16];
+        uint8_t seed[32], pub[32];
+        struct zcl_command_reply reply;
+        struct fleet_roster_scan scan = {0};
+        const char *why = NULL;
+        FILE *fp = NULL;
+        fe_isolate("anchor-unreadable");
+        ASSERT(fe_manager_key(seed, pub));
+
+        /* Garbage bytes where node.db should be. */
+        test_make_tmpdir(bad, sizeof(bad), "fleet_enrol", "anchor-garbage");
+        (void)snprintf(path, sizeof(path), "%s/node.db", bad);
+        fp = fopen(path, "wb");
+        ASSERT(fp != NULL);
+        for (int i = 0; i < 512; i++)
+            (void)fputc(0xA5 ^ i, fp);
+        (void)fclose(fp);
+        ASSERT(fe_admit_with("studio", 0xc1, seed, pub, bad, "yes", &reply));
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROOT_UNVERIFIABLE);
+        zcl_command_reply_free(&reply);
+        /* Without the flag it is reported, and the admission goes ahead. */
+        ASSERT(fe_admit_with("annex", 0xc2, seed, pub, bad, NULL, &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "unreadable");
+        zcl_command_reply_free(&reply);
+
+        /* A row whose status this build does not know. */
+        ASSERT(fe_datadir(odd, sizeof(odd), "anchor-odd-status"));
+        ASSERT(fe_anchor_row(odd, pub, "active", NULL));
+        ASSERT(fe_poison_status(odd, "frozen"));
+        ASSERT(fe_admit_with("depot", 0xc3, seed, pub, odd, "yes", &reply));
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROOT_UNVERIFIABLE);
+        zcl_command_reply_free(&reply);
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 1u); /* only the unrequired admission */
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_anchor_rotation_and_invite(void)
+{
+    int failures = 0;
+    TEST("fleet import reports a rotation's successor and height exactly; "
+         "fleet invite reports an active anchor") {
+        char dd[PATH_MAX], hex[65], body[PATH_MAX + 96];
+        uint8_t seed[32], pub[32], s1[32], successor[32];
+        struct zcl_command_reply reply;
+        const struct json_value *anchor = NULL;
+        fe_isolate("anchor-rotation");
+        ASSERT(fe_manager_key(seed, pub));
+        fe_key(0x5c, s1, successor);
+        for (int i = 0; i < 32; i++)
+            (void)snprintf(hex + 2 * i, 3, "%02x", successor[i]);
+        ASSERT(fe_datadir(dd, sizeof(dd), "anchor-rotation-dd"));
+        ASSERT(fe_anchor_row(dd, pub, "rotated", successor));
+        ASSERT(fe_import_plain("annex", 0x5d, seed, pub, dd, &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        anchor = json_get(&reply.data, "operator_anchor");
+        ASSERT(anchor != NULL);
+        ASSERT_STR_EQ(fe_s(json_get_str(json_get(anchor, "state"))),
+                      "rotated");
+        ASSERT_STR_EQ(fe_s(json_get_str(json_get(anchor, "successor"))), hex);
+        ASSERT_EQ(json_get_int(json_get(anchor, "anchor_height")), 1000);
+        ASSERT_STR_EQ(fe_s(json_get_str(json_get(anchor, "would_refuse_as"))),
+                      FLEET_ENROL_WHY_ROOT_ROTATED);
+        zcl_command_reply_free(&reply);
+
+        /* invite is report-only; flip the same key to active. */
+        ASSERT(fe_anchor_row(dd, pub, "active", NULL));
+        (void)snprintf(body, sizeof(body),
+                       "{\"name\":\"studio\",\"datadir\":\"%s\"}", dd);
+        ASSERT(fe_leaf_call("fleet.invite", "zcl.fleet.invite.v1", body,
+                            &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "active");
+        ASSERT_EQ(json_get_int(json_get(json_get(&reply.data,
+                                                 "operator_anchor"),
+                                        "anchor_height")), 1000);
+        zcl_command_reply_free(&reply);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_admit_requires_anchor(void)
+{
+    int failures = 0;
+    TEST("fleet admit --require_anchor: a missing, wrong, rotated or revoked "
+         "anchor refuses before anything is spent; an active one admits; "
+         "without the flag an unanchored manager still admits") {
+        char dd[PATH_MAX], receipt[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char body[PATH_MAX + FLEET_ENROL_MACHINE_TEXT_MAX + 128];
+        uint8_t seed[32], pub[32], s1[32], stranger[32], nonce_probe[16];
+        struct zcl_command_reply reply;
+        struct fleet_receipt parsed;
+        struct fleet_roster_scan scan = {0};
+        uint8_t rw[FLEET_ENROL_RECEIPT_WIRE_MAX];
+        size_t rl = 0;
+        bool seen = true;
+        const char *why = NULL;
+        fe_isolate("admit-anchor");
+        ASSERT(fe_manager_key(seed, pub));
+        fe_key(0x61, s1, stranger);
+        ASSERT(fe_datadir(dd, sizeof(dd), "admit-anchor-dd"));
+        ASSERT(fe_receipt_for("studio", 0x62, seed, pub,
+                              (int64_t)time(NULL), receipt, sizeof(receipt)));
+        ASSERT(fleet_receipt_parse(receipt, &parsed, rw, sizeof(rw), &rl,
+                                   &why));
+        memcpy(nonce_probe, parsed.invite.nonce, sizeof(nonce_probe));
+        (void)snprintf(body, sizeof(body),
+                       "{\"receipt\":\"%s\",\"bridge\":\"no\","
+                       "\"datadir\":\"%s\",\"require_anchor\":\"yes\"}",
+                       receipt, dd);
+
+        /* Missing anchor (empty projection). */
+        ASSERT(fe_leaf_call("fleet.admit", "zcl.fleet.admit.v1", body,
+                            &reply));
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT_STR_EQ(reply.error.code, "FLEET_ROOT_NOT_ANCHORED");
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROOT_NOT_ANCHORED);
+        zcl_command_reply_free(&reply);
+
+        /* Wrong anchor: another key is anchored, the operator's is not. */
+        ASSERT(fe_anchor_row(dd, stranger, "active", NULL));
+        ASSERT(fe_leaf_call("fleet.admit", "zcl.fleet.admit.v1", body,
+                            &reply));
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROOT_NOT_ANCHORED);
+        zcl_command_reply_free(&reply);
+
+        /* Revoked, then rotated. */
+        ASSERT(fe_anchor_row(dd, pub, "revoked", NULL));
+        ASSERT(fe_leaf_call("fleet.admit", "zcl.fleet.admit.v1", body,
+                            &reply));
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROOT_REVOKED);
+        zcl_command_reply_free(&reply);
+        ASSERT(fe_anchor_row(dd, pub, "rotated", stranger));
+        ASSERT(fe_leaf_call("fleet.admit", "zcl.fleet.admit.v1", body,
+                            &reply));
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROOT_ROTATED);
+        zcl_command_reply_free(&reply);
+
+        /* Four refusals later nothing was enrolled and the invite is
+         * unspent. */
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 0u);
+        ASSERT(fleet_nonce_seen(nonce_probe, &seen, &why));
+        ASSERT(!seen);
+
+        /* Compatibility: the same receipt without the flag admits under a
+         * rotated anchor and REPORTS its state. */
+        (void)snprintf(body, sizeof(body),
+                       "{\"receipt\":\"%s\",\"bridge\":\"no\","
+                       "\"datadir\":\"%s\"}", receipt, dd);
+        ASSERT(fe_leaf_call("fleet.admit", "zcl.fleet.admit.v1", body,
+                            &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "rotated");
+        zcl_command_reply_free(&reply);
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 1u);
+
+        /* Active anchor + the flag: a second box is admitted. */
+        ASSERT(fe_anchor_row(dd, pub, "active", NULL));
+        ASSERT(fe_receipt_for("annex", 0x63, seed, pub, (int64_t)time(NULL),
+                              receipt, sizeof(receipt)));
+        (void)snprintf(body, sizeof(body),
+                       "{\"receipt\":\"%s\",\"bridge\":\"no\","
+                       "\"datadir\":\"%s\",\"require_anchor\":\"yes\"}",
+                       receipt, dd);
+        ASSERT(fe_leaf_call("fleet.admit", "zcl.fleet.admit.v1", body,
+                            &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "active");
+        ASSERT(json_get_bool(json_get(json_get(&reply.data,
+                                               "operator_anchor"),
+                                      "required")));
+        zcl_command_reply_free(&reply);
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 2u);
+
+        /* A required anchor with nobody looking fails closed. */
+        ASSERT(fe_receipt_for("depot", 0x64, seed, pub, (int64_t)time(NULL),
+                              receipt, sizeof(receipt)));
+        (void)snprintf(body, sizeof(body),
+                       "{\"receipt\":\"%s\",\"bridge\":\"no\","
+                       "\"require_anchor\":\"yes\"}", receipt);
+        ASSERT(fe_leaf_call("fleet.admit", "zcl.fleet.admit.v1", body,
+                            &reply));
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROOT_UNVERIFIABLE);
+        zcl_command_reply_free(&reply);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fe_import_requires_anchor(void)
+{
+    int failures = 0;
+    TEST("fleet import --require_anchor: a line the operator sealed is "
+         "refused unless the operator is an active anchor; a forged line is "
+         "refused as unsealed whatever the chain says") {
+        char dd[PATH_MAX], row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char forged[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char body[PATH_MAX + FLEET_ENROL_MACHINE_TEXT_MAX + 128];
+        uint8_t seed[32], pub[32];
+        struct zcl_command_reply reply;
+        struct fleet_roster_scan scan = {0};
+        const char *why = NULL;
+        fe_isolate("import-anchor");
+        ASSERT(fe_manager_key(seed, pub));
+        ASSERT(fe_datadir(dd, sizeof(dd), "import-anchor-dd"));
+        ASSERT(fe_manager_row("studio", 0x72, seed, pub,
+                              FLEET_ENROL_PORT_FIRST, row, sizeof(row)));
+        ASSERT(fe_tamper(row, fe_wire_len(row) / 2, forged, sizeof(forged)));
+
+        /* Genuine seal, operator not anchored: refused by the anchor's name
+         * and the roster is untouched. */
+        (void)snprintf(body, sizeof(body),
+                       "{\"line\":\"%s\",\"datadir\":\"%s\","
+                       "\"require_anchor\":\"yes\"}", row, dd);
+        ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body,
+                            &reply));
+        ASSERT(reply.status == ZCL_COMMAND_STATUS_FAILED);
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROOT_NOT_ANCHORED);
+        zcl_command_reply_free(&reply);
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 0u);
+
+        /* Forged member under an ACTIVE anchor: still refused as unsealed. */
+        ASSERT(fe_anchor_row(dd, pub, "active", NULL));
+        (void)snprintf(body, sizeof(body),
+                       "{\"line\":\"%s\",\"datadir\":\"%s\","
+                       "\"require_anchor\":\"yes\"}", forged, dd);
+        ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body,
+                            &reply));
+        ASSERT_STR_EQ(reply.error.evidence, FLEET_ENROL_WHY_ROSTER_LINE_UNSEALED);
+        zcl_command_reply_free(&reply);
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 0u);
+
+        /* Genuine seal + active anchor: imported, state reported. */
+        (void)snprintf(body, sizeof(body),
+                       "{\"line\":\"%s\",\"datadir\":\"%s\","
+                       "\"require_anchor\":\"yes\"}", row, dd);
+        ASSERT(fe_leaf_call("fleet.import", "zcl.fleet.import.v1", body,
+                            &reply));
+        ASSERT_EQ(reply.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(fe_s(fe_anchor_state(&reply)), "active");
+        zcl_command_reply_free(&reply);
+        ASSERT(fleet_roster_scan(pub, NULL, NULL, &scan, &why));
+        ASSERT_EQ(scan.rows, 1u);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_fleet_enrol(void)
 {
     int failures = 0;
@@ -1432,6 +2121,13 @@ int test_fleet_enrol(void)
     failures += test_fd_bounded();
     failures += test_fd_no_secret_material();
     failures += test_fd_unreadable_store();
+    failures += test_fe_anchor_verdicts();
+    failures += test_fe_anchor_reported_not_enforced();
+    failures += test_fe_admit_requires_anchor();
+    failures += test_fe_import_requires_anchor();
+    failures += test_fe_anchor_require_spelling();
+    failures += test_fe_anchor_unreadable_fails_closed();
+    failures += test_fe_anchor_rotation_and_invite();
     fe_restore();
     return failures;
 }

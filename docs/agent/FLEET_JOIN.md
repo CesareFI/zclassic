@@ -28,9 +28,9 @@ There are two pasted strings and three commands.
 
 | Step | Where | Command |
 |---|---|---|
-| 1 | The manager computer | `z23 fleet invite --name=<name>` |
+| 1 | The manager computer | `z23 fleet invite --name=<name> --datadir=<node-datadir>` |
 | 2 | The new computer | `z23 fleet join <token>` |
-| 3 | The manager computer | `z23 fleet admit <receipt>` |
+| 3 | The manager computer | `z23 fleet admit <receipt> --datadir=<node-datadir>` |
 
 Step 1 prints step 2's command. Step 2 prints step 3's command. The owner
 carries each line between the two machines by hand — nothing is sent over a
@@ -90,7 +90,7 @@ make -j8 build/bin/z23-dev
 build/bin/z23-dev fleet join <token>          # add --onion=<v3>.onion if this box has one
 ```
 
-Then hand the printed `z23 fleet admit …` line back to the owner.
+Then hand the printed `z23 fleet admit …` line back to the owner, with `--datadir=<node-datadir>` added to it.
 
 ## What is in each string
 
@@ -167,6 +167,36 @@ The bridge needs an sshd running on the computer being reached, and
 `~/.ssh` must already exist on the manager. Neither is created for you: a
 fleet command guessing at an owner's ssh layout is not a thing this
 repository does.
+
+## Anchoring the fleet root (optional)
+
+The operator key is a plain Ed25519 key, the same shape as a ZID master key,
+so it can be anchored on chain with no second key format. This is optional:
+a fleet that never anchors keeps enrolling and listing exactly as before.
+
+1. `fleet invite` prints the `operator_pubkey`. On a node with a wallet, run
+   `z23 core identity anchor --datadir=<node-datadir>` for that pubkey (it spends a fee and is always
+   your decision).
+2. Once the node has folded the anchor, point the fleet leaves at its
+   datadir: `--datadir=<dir>` on the CLI (`fleet admit` and `fleet import`
+   also take `datadir` in the input). They open
+   `<dir>/node.db` read-only and never create it.
+3. `fleet invite`, `fleet admit`, `fleet import` and `fleet machines` then
+   report `operator_anchor`: `state` is one of `active`, `rotated` (with its
+   `successor`), `revoked`, `not_anchored`, `unchecked` (no datadir, or no
+   `node.db` there) or `unreadable` (a `node.db` that could not be read). It
+   is its own object and never merged into the `verified` object, because
+   "the operator sealed this" and "the operator is anchored" are two facts.
+4. To make it a gate, pass `--require_anchor=yes` to `fleet admit` or
+   `fleet import`. They then refuse unless the state is `active`, naming
+   `fleet_root_not_anchored`, `fleet_root_rotated`, `fleet_root_revoked` or
+   `fleet_root_anchor_unverifiable` (no datadir, no `node.db`, unreadable:
+   a required anchor nobody checked fails closed). `admit` checks before it
+   spends the invite, so a refusal leaves the invite usable. Any value other
+   than `no`, `false` or `0` requires it. `fleet machines` only reports.
+
+A line the operator did not seal is still refused as
+`roster_line_not_operator_sealed`, whatever the chain says.
 
 ## What comes next
 
@@ -276,3 +306,5 @@ Each of these is the exact evidence string a refusal carries.
 | `roster_unreadable` / `roster_unwritable` | The roster could not be read or appended to |
 | `join_onion_invalid` | `--onion` is not a v3 onion hostname with an optional port |
 | `authorized_keys_unwritable` | `~/.ssh` does not exist, or the file cannot be written |
+| `fleet_root_not_anchored` / `fleet_root_rotated` / `fleet_root_revoked` | `--require_anchor=yes` was given and the operator key is not an active ZID anchor in the node.db read |
+| `fleet_root_anchor_unverifiable` | `--require_anchor=yes` was given and no anchor state could be read (no datadir, no node.db, or unreadable) |
