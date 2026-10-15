@@ -183,3 +183,12 @@ the board. Request GO for the next host only after the prior host's outcome
 is recorded. Publish the public wiki how-to after a real host pair passes,
 with commands and observed refusal meanings. Keep credentials, private
 profile locators and network endpoints out of public evidence.
+
+The public wiki page `agent-host-tunnel-howto` was published on 2026-10-15
+using the independently checked earlier one-pair evidence. Revision
+`f3de07fa5716d7ecfc35675f654b8ce179af6347d21bf5c75e9979604e8495d5`
+was discovered and read back in 13 chunks, totaling 6,996 bytes; its SHA3-256
+matched the write receipt:
+`c64cee59697fd351777bbbcd9828405d5703f838a569d00acf778a3b626fdb6b`.
+It records the known shutdown defect and approval boundaries. Publication
+does not establish a currently approved route or authorize deployment.

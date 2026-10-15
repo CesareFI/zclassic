@@ -101,3 +101,33 @@ persistent usable fleet route.
 
 The [rollout runbook](../FLEET_TUNNEL_ROLLOUT.md) requires fresh per-host
 approval and acceptance before publication as a working fleet procedure.
+
+## Integration and publication continuation
+
+After reviewing published main
+`16f864d87ec5701a28a296407649ac24c638ecb8`, merge candidate
+`c27c4746c` regenerated the conflicting capability inventory through the
+canonical target. The first generation attempt refused the unresolved index;
+after staging the upstream generated artifact, regeneration succeeded.
+No hand-edited inventory counts were retained.
+
+The gateway, both gateway shards, fleet board, mesh-status wire, mesh-terminal
+attach and syncdiag RPC groups passed:
+
+```text
+SUITE VERDICT mode=cold groups_total=1329 groups_ran=7 groups_cached=0 groups_gated=1322 groups_failed=0 self_skips=0 env_unobserved=0 load_flaky=0 toolkey=83d57dfdeb13
+ALL TESTS PASSED — 0/7 groups failed, 0 skipped (45.3s wall, 28 workers) [--exact filtered]
+```
+
+The earlier two identical retained gateway builds remain bound to their
+original candidate SHA; this integration test does not extend their image
+identity claim to a different source tree.
+
+The public `agent-host-tunnel-howto` wiki revision
+`f3de07fa5716d7ecfc35675f654b8ce179af6347d21bf5c75e9979604e8495d5`
+was published with explicit historical-pair and deployment limits.
+Discovery returned that exact revision; thirteen exact reads reconstructed
+6,996 bytes with SHA3-256
+`c64cee59697fd351777bbbcd9828405d5703f838a569d00acf778a3b626fdb6b`,
+matching the receiver's write receipt. This is readback/hash evidence, not
+an independent signature-verification claim.
