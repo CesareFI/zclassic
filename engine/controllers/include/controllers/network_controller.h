@@ -53,6 +53,31 @@ void network_push_snapshot_loader_status(struct json_value *result,
                                          const char *datadir,
                                          const char *load_snapshot_at_own_height);
 
+/* One peer's transport posture, classified once for getpeerinfo and the
+ * dumpstate transport dump so the two cannot disagree. The inspector reads
+ * node->transport under node->cs_recv, the lock the socket thread holds while
+ * it feeds or frees the transport (lock order cs_nodes -> cs_recv, as in
+ * connman.c); callers hold cs_nodes. fingerprint_hex is set only for
+ * PEER_TRANSPORT_NOISE_XXHFS. When `dump` is non-NULL it receives the
+ * noise_transport_dump_peer object, captured under the same lock. */
+enum peer_transport_class {
+    PEER_TRANSPORT_PLAINTEXT = 0,
+    PEER_TRANSPORT_HANDSHAKING,
+    PEER_TRANSPORT_NOISE_XXHFS,
+};
+struct peer_transport_info {
+    enum peer_transport_class cls;
+    char fingerprint_hex[65];
+};
+struct p2p_node;
+void network_peer_transport_inspect(struct p2p_node *node,
+                                    struct peer_transport_info *info,
+                                    struct json_value *dump);
+const char *network_peer_transport_name(enum peer_transport_class cls);
+/* Adds "transport" and, when established, the three noise_* fields. */
+void network_peer_transport_push_json(struct json_value *obj,
+                                      const struct peer_transport_info *info);
+
 /* Normalize `dumpstate peer_lifecycle incidents` into the standalone
  * `peerincidents` contract. This is used only as a compatibility fallback
  * when a running target predates the direct peerincidents RPC method. */

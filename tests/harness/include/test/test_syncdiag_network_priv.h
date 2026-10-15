@@ -35,5 +35,6 @@ bool sd_bootstrapstatus_ready_scenario(void);
 bool sd_bootstrapstatus_snapshot_authority_scenario(void);
 bool sd_bootstrapstatus_beta6_params_scenario(void);
 bool sd_getnetworkinfo_reachability_scenario(void);
+bool sd_getpeerinfo_transport_scenario(void);
 
 #endif

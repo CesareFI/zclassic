@@ -13,6 +13,10 @@
 #include "test/syncdiag_rpc_fixture.h"
 #include "test/test_syncdiag_network_priv.h"
 
+#include "base/hex.h"
+#include "crypto/curve25519.h"
+#include "net/noise_transport.h"
+#include "net/v2_identity.h"
 #include "services/beta6_bootstrap.h"
 
 /* A fixed 12-hex stand-in for some other node's source-identity prefix. It is
@@ -1224,6 +1228,203 @@ bool sd_getnetworkinfo_reachability_scenario(void)
     ok = ok && sd_reachability_peerinfo_peer1(&ctx.result, ok);
     ok = ok && sd_reachability_peerinfo_identity0(&ctx.result, ok);
     ok = ok && sd_reachability_peerinfo_identity1(&ctx.result, ok);
+
+    json_free(&ctx.params);
+    json_free(&ctx.result);
+    rpc_net_set_connman(NULL);
+    connman_free(&ctx.cm);
+    return ok;
+}
+
+/* Transport posture fixture: one plaintext peer, one peer whose transport
+ * completed the hybrid XXhfs handshake, one still mid-handshake. */
+static const unsigned char SD_TRANSPORT_MAGIC[4] = {0x24, 0xe9, 0x27, 0x64};
+
+static bool sd_transport_establish(struct noise_transport **ini_out,
+                                   struct noise_transport **res_out,
+                                   char expected_fp_hex[65])
+{
+    uint8_t ipriv[32], rpriv[32], rpub[32], fp[32];
+    for (int i = 0; i < 32; i++) {
+        ipriv[i] = (uint8_t)(0x21 + i * 5);
+        rpriv[i] = (uint8_t)(0x47 + i * 3);
+    }
+    uint8_t *m1 = NULL, *w2 = NULL, *w3 = NULL, *w4 = NULL, *p = NULL;
+    size_t m1l = 0, w2l = 0, w3l = 0, w4l = 0, pl = 0;
+    struct noise_transport *ini =
+        noise_transport_begin(true, ipriv, SD_TRANSPORT_MAGIC, &m1, &m1l);
+    struct noise_transport *res =
+        noise_transport_begin(false, rpriv, SD_TRANSPORT_MAGIC, NULL, NULL);
+    bool ok = ini && res && m1 &&
+              noise_transport_feed(res, m1, m1l, &w2, &w2l, &p, &pl) &&
+              noise_transport_feed(ini, w2, w2l, &w3, &w3l, &p, &pl) &&
+              noise_transport_feed(res, w3, w3l, &w4, &w4l, &p, &pl) &&
+              ini->state == NOISE_ESTABLISHED &&
+              res->state == NOISE_ESTABLISHED &&
+              curve25519_scalarmult_base(rpub, rpriv) &&
+              v2_identity_public_fingerprint(rpub, fp);
+    if (ok)
+        zcl_hex_encode(fp, sizeof(fp), expected_fp_hex);
+    free(m1);
+    free(w2);
+    free(w3);
+    free(w4);
+    free(p);
+    *ini_out = ini;
+    *res_out = res;
+    return ok;
+}
+
+static bool sd_transport_noise_fields_ok(const struct json_value *p,
+                                         const char *want_fp)
+{
+    const struct json_value *ka = json_get(p, "noise_key_agreement");
+    const struct json_value *id = json_get(p, "noise_peer_identity");
+    const struct json_value *fp = json_get(p, "noise_peer_fingerprint_sha3");
+    return ka && id && fp &&
+           strcmp(json_get_str(ka), "x25519+mlkem768") == 0 &&
+           strcmp(json_get_str(id), "x25519") == 0 &&
+           strcmp(json_get_str(fp), want_fp) == 0;
+}
+
+static bool sd_transport_noise_fields_absent(const struct json_value *p)
+{
+    return !json_get(p, "noise_key_agreement") &&
+           !json_get(p, "noise_peer_identity") &&
+           !json_get(p, "noise_peer_fingerprint_sha3");
+}
+
+static bool sd_transport_peer_is(const struct json_value *result, size_t idx,
+                                 const char *want, bool want_noise_fields,
+                                 const char *want_fp)
+{
+    const struct json_value *p =
+        result->type == JSON_ARR ? json_at(result, idx) : NULL;
+    const struct json_value *t = p ? json_get(p, "transport") : NULL;
+    if (!t || strcmp(json_get_str(t), want) != 0 ||
+        json_get(p, "transcript_hash"))
+        return false;
+    return want_noise_fields ? sd_transport_noise_fields_ok(p, want_fp)
+                             : sd_transport_noise_fields_absent(p);
+}
+
+/* Both surfaces must say the same thing about a field: absent in both, or
+ * the same string in both. */
+static bool sd_transport_field_same(const struct json_value *a,
+                                    const struct json_value *b,
+                                    const char *key)
+{
+    const struct json_value *va = json_get(a, key);
+    const struct json_value *vb = json_get(b, key);
+    if (!va || !vb)
+        return !va && !vb;
+    return strcmp(json_get_str(va), json_get_str(vb)) == 0;
+}
+
+static const struct json_value *sd_transport_find_id(
+    const struct json_value *arr, int64_t id)
+{
+    for (size_t i = 0; arr && arr->type == JSON_ARR &&
+                       i < json_size(arr); i++) {
+        const struct json_value *p = json_at(arr, i);
+        if (p && json_get_int(json_get(p, "id")) == id)
+            return p;
+    }
+    return NULL;
+}
+
+static bool sd_transport_peer_matches(const struct json_value *info_peer,
+                                      const struct json_value *dump_peers)
+{
+    const struct json_value *d = sd_transport_find_id(
+        dump_peers, json_get_int(json_get(info_peer, "id")));
+    return d && json_get(d, "transport") &&
+           sd_transport_field_same(info_peer, d, "transport") &&
+           sd_transport_field_same(info_peer, d, "noise_key_agreement") &&
+           sd_transport_field_same(info_peer, d, "noise_peer_identity") &&
+           sd_transport_field_same(info_peer, d,
+                                   "noise_peer_fingerprint_sha3");
+}
+
+static bool sd_transport_dump_no_transcript(const struct json_value *dump)
+{
+    size_t need = json_write(dump, NULL, 0);
+    char *buf = zcl_malloc(need + 1, "sd_transport_dump_text");
+    if (!buf)
+        return false;
+    json_write(dump, buf, need + 1);
+    bool clean = strstr(buf, "transcript_hash") == NULL;
+    free(buf);
+    return clean;
+}
+
+/* The transport dump classifies through the same helper as getpeerinfo: one
+ * peer per class, counters unchanged in meaning, every peer's transport and
+ * noise_* fields equal to getpeerinfo's by id, and no transcript hash. */
+static bool sd_transport_dump_matches(const struct json_value *info)
+{
+    struct json_value dump = {0};
+    bool ok = net_transport_dump_state_json(&dump, NULL) &&
+              json_get_int(json_get(&dump, "plaintext_peers")) == 1 &&
+              json_get_int(json_get(&dump, "noise_peers")) == 1 &&
+              json_get_int(json_get(&dump, "handshaking_peers")) == 1 &&
+              sd_transport_dump_no_transcript(&dump);
+    const struct json_value *peers = json_get(&dump, "peers");
+    for (size_t i = 0; ok && i < 3; i++)
+        ok = sd_transport_peer_matches(json_at(info, i), peers);
+    json_free(&dump);
+    return ok;
+}
+
+/* Peers 21 (plaintext), 22 (established), 23 (handshaking). */
+static bool sd_transport_attach(struct sd_reach_ctx *ctx, char expected_fp[65])
+{
+    struct p2p_node *plain = syncdiag_add_peer(
+        &ctx->cm, 21, false, PEER_HANDSHAKE_COMPLETE);
+    struct p2p_node *est = syncdiag_add_peer(
+        &ctx->cm, 22, false, PEER_HANDSHAKE_COMPLETE);
+    struct p2p_node *hs = syncdiag_add_peer(
+        &ctx->cm, 23, true, PEER_HANDSHAKE_COMPLETE);
+    if (!plain || !est || !hs)
+        return false;
+
+    struct noise_transport *ini = NULL, *res = NULL;
+    bool ok = sd_transport_establish(&ini, &res, expected_fp);
+    noise_transport_free(res);
+    uint8_t hpriv[32] = { 9 };
+    uint8_t *m1 = NULL;
+    size_t m1l = 0;
+    struct noise_transport *pending =
+        noise_transport_begin(true, hpriv, SD_TRANSPORT_MAGIC, &m1, &m1l);
+    free(m1);
+    est->transport = ini;
+    hs->transport = pending;
+    return ok && pending != NULL;
+}
+
+bool sd_getpeerinfo_transport_scenario(void)
+{
+    struct sd_reach_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    chain_params_select(CHAIN_MAIN);
+    bool ok = connman_init(&ctx.cm, chain_params_get(), &ctx.sigs);
+    char expected_fp[65] = {0};
+    ok = ok && sd_transport_attach(&ctx, expected_fp);
+
+    rpc_table_init(&ctx.tbl);
+    register_net_rpc_commands(&ctx.tbl);
+    rpc_net_set_connman(&ctx.cm);
+    json_init(&ctx.params);
+    json_set_array(&ctx.params);
+    json_init(&ctx.result);
+
+    ok = ok && sd_reachability_peerinfo_call(&ctx, ok);
+    ok = ok && sd_transport_peer_is(&ctx.result, 0, "plaintext", false, NULL);
+    ok = ok && sd_transport_peer_is(&ctx.result, 1, "noise_xxhfs", true,
+                                    expected_fp);
+    ok = ok && sd_transport_peer_is(&ctx.result, 2, "handshaking", false,
+                                    NULL);
+    ok = ok && sd_transport_dump_matches(&ctx.result);
 
     json_free(&ctx.params);
     json_free(&ctx.result);

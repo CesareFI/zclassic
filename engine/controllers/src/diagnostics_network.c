@@ -300,16 +300,15 @@ bool net_transport_dump_state_json(struct json_value *out, const char *key)
         if (!node || node->disconnect)
             continue;
         struct json_value peer = {0};
-        if (!node->transport) {
+        struct peer_transport_info tinfo;
+        network_peer_transport_inspect(node, &tinfo, &peer);
+        network_peer_transport_push_json(&peer, &tinfo);
+        if (tinfo.cls == PEER_TRANSPORT_PLAINTEXT)
             plaintext_peers++;
-            noise_transport_dump_peer(&peer, NULL);
-        } else if (node->transport->state == NOISE_ESTABLISHED) {
+        else if (tinfo.cls == PEER_TRANSPORT_NOISE_XXHFS)
             noise_peers++;
-            noise_transport_dump_peer(&peer, node->transport);
-        } else {
+        else
             handshaking_peers++;
-            noise_transport_dump_peer(&peer, node->transport);
-        }
         json_push_kv_int(&peer, "id", (int64_t)node->id);
         json_push_back(&peers, &peer);
         json_free(&peer);

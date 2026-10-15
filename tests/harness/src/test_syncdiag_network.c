@@ -4,7 +4,7 @@
  * schema, external endpoint, duplicate-host telemetry, and the versioned
  * P2P + snapshot-authority posture.
  *
- * This file owns the group entry point; the ten scenarios themselves
+ * This file owns the group entry point; the scenarios themselves
  * live in its test_syncdiag_network_*.c siblings, grouped by what they
  * cover (declared in test_syncdiag_network_priv.h). Each scenario is
  * its own function that builds its fixture, calls the RPC, asserts on
@@ -63,6 +63,9 @@ int syncdiag_cases_network(void)
     sd_report("getnetworkinfo: separates inbound reachability from "
               "outbound handshakes (RED)... ",
               sd_getnetworkinfo_reachability_scenario(), &failures);
+    sd_report("getpeerinfo: reports plaintext, handshaking and hybrid "
+              "Noise transport per peer (RED)... ",
+              sd_getpeerinfo_transport_scenario(), &failures);
 
     return failures;
 }

@@ -14,7 +14,11 @@
 #include "event/event.h"
 #include "jobs/reducer_frontier.h"
 #include "json/json.h"
+#include "base/cleanse.h"
+#include "base/hex.h"
 #include "net/connman.h"
+#include "net/noise_transport.h"
+#include "net/v2_identity.h"
 #include "net/fast_sync.h"
 #include "net/netbase.h"
 #include "net/peer_identity.h"
@@ -702,6 +706,60 @@ bool network_bootstrap_status_json(struct json_value *out)
     return rpc_bootstrapstatus(NULL, false, out);
 }
 
+const char *network_peer_transport_name(enum peer_transport_class cls)
+{
+    switch (cls) {
+    case PEER_TRANSPORT_NOISE_XXHFS: return "noise_xxhfs";
+    case PEER_TRANSPORT_HANDSHAKING: return "handshaking";
+    case PEER_TRANSPORT_PLAINTEXT:   break;
+    }
+    return "plaintext";
+}
+
+/* Established means the hybrid suite: noise_transport.c drives only the
+ * XXhfs pattern (driver_pattern() -> noise_pattern_xxhfs()), so there is no
+ * classical-XX state to mislabel. An established transport whose locked
+ * snapshot disagrees is reported as handshaking, never as secure. */
+void network_peer_transport_inspect(struct p2p_node *node,
+                                    struct peer_transport_info *info,
+                                    struct json_value *dump)
+{
+    memset(info, 0, sizeof(*info));
+    zcl_mutex_lock(&node->cs_recv);
+    const struct noise_transport *t = node->transport;
+    if (!t) {
+        info->cls = PEER_TRANSPORT_PLAINTEXT;
+    } else {
+        info->cls = PEER_TRANSPORT_HANDSHAKING;
+        struct noise_transport_snapshot snap = {0};
+        uint8_t fp[32] = {0};
+        if (t->state == NOISE_ESTABLISHED &&
+            noise_transport_snapshot(t, &snap) && snap.established &&
+            v2_identity_public_fingerprint(snap.remote_static, fp)) {
+            info->cls = PEER_TRANSPORT_NOISE_XXHFS;
+            zcl_hex_encode(fp, sizeof(fp), info->fingerprint_hex);
+        }
+        memory_cleanse(&snap, sizeof(snap));
+        memory_cleanse(fp, sizeof(fp));
+    }
+    if (dump)
+        noise_transport_dump_peer(dump, t);
+    zcl_mutex_unlock(&node->cs_recv);
+}
+
+void network_peer_transport_push_json(struct json_value *obj,
+                                      const struct peer_transport_info *info)
+{
+    json_push_kv_str(obj, "transport", network_peer_transport_name(info->cls));
+    if (info->cls != PEER_TRANSPORT_NOISE_XXHFS)
+        return;
+    json_push_kv_str(obj, "noise_key_agreement", "x25519+mlkem768");
+    /* The static identity key is classical X25519; only the session key
+     * agreement is hybrid. Say so rather than imply a PQ identity. */
+    json_push_kv_str(obj, "noise_peer_identity", "x25519");
+    json_push_kv_str(obj, "noise_peer_fingerprint_sha3", info->fingerprint_hex);
+}
+
 static bool rpc_getpeerinfo(const struct json_value *params, bool help,
                               struct json_value *result)
 {
@@ -789,6 +847,12 @@ static bool rpc_getpeerinfo(const struct json_value *params, bool help,
             json_push_kv_bool(&entry, "magicbean", is_mb);
             json_push_kv_bool(&entry, "zclassic23", is_z23);
             json_push_kv_bool(&entry, "zclassic_c23", is_z23);
+        }
+
+        {
+            struct peer_transport_info tinfo;
+            network_peer_transport_inspect(node, &tinfo, NULL);
+            network_peer_transport_push_json(&entry, &tinfo);
         }
 
         json_push_back(result, &entry);
