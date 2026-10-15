@@ -207,6 +207,7 @@
 #include "platform/time_compat.h"
 #include "services/disk_monitor.h"
 #include "sha3/sha3.h"
+#include "session/fleet_board_proto.h"
 #include "util/log_macros.h"
 
 #include <ctype.h>
@@ -2140,6 +2141,7 @@ static void fmc_remote_resources(const struct fmc_worker *e, char *why,
 struct fmc_caller {
     bool grant;
     char label[FMC_NAME_MAX + 1];
+    char binding[ZCL_FLEET_STEER_BINDING_HEX + 1];
     char scopes[64];
     long long expires;
 };
@@ -5248,7 +5250,7 @@ static void fmc_do_evidence(const struct zcl_command_request *req,
 static bool fmc_scope_word_ok(const char *word, size_t len)
 {
     static const char *const names[] = {"brief", "send", "evidence",
-                                        "terminate", "deliver"};
+                                        "terminate", "deliver", "wiki-write"};
     size_t i;
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (strlen(names[i]) == len && strncmp(names[i], word, len) == 0)
@@ -5324,7 +5326,7 @@ static bool fmc_grant_inputs(const struct zcl_command_request *req,
     in->scopes = fmc_str(req, "scopes");
     if (!in->scopes || !fmc_scopes_valid(in->scopes)) {
         fmc_fail(reply, "BAD_INPUT",
-                 "scopes is a subset of brief,send,evidence,terminate,deliver",
+                 "scopes is a subset of brief,send,evidence,terminate,deliver,wiki-write",
                  "closed scope vocabulary");
         return false;
     }
@@ -5879,6 +5881,12 @@ static bool fmc_admit(const struct zcl_command_request *request,
         (void)snprintf(who->label, sizeof(who->label), "%s", row.label);
         (void)snprintf(who->scopes, sizeof(who->scopes), "%s", row.scopes);
         who->expires = row.expires;
+        if (!strcmp(scope, "wiki-write") &&
+            !zcl_fleet_steer_sender_binding(row.id, row.label,
+                who->binding, sizeof(who->binding))) {
+            fmc_fail(reply, "GRANT_BINDING", "wiki writes require an attributable grant", "grant label/id");
+            return false;
+        }
     }
     return true;
 }
@@ -6013,7 +6021,7 @@ static void fmc_do_wiki_find(const struct zcl_command_request *req,
             json_push_kv_int(&reply->data, "observed_at", (int64_t)platform_time_wall_time_t()) &&
             json_push_kv_bool(&reply->data, "untrusted", true) &&
             json_push_kv_str(&reply->data, "selection", "latest-held") &&
-            json_push_kv_str(&reply->data, "exact_read", "steer_evidence(type=board,ref=id)");
+            json_push_kv_str(&reply->data, "exact_read", "wiki_read(id,offset,bytes)");
         if (!ok) fmc_fail(reply, "ALLOC_FAILED", "wiki discovery projection failed", "json");
         else {
             reply->status = ZCL_COMMAND_STATUS_PASSED;
@@ -6028,6 +6036,321 @@ void zcl_native_handle_fleet_steer_wiki_find(
 {
     fmc_enter(request, reply, "evidence",
               "fleet.steer.wiki-find takes grant,q,topic,applies_to,after_slug", fmc_do_wiki_find);
+}
+
+static bool fmc_wiki_read_prepare(struct fmc_sub *sub,
+    const struct zcl_command_request *req, struct zcl_command_reply *reply)
+{
+    uint8_t decoded[32];
+    const char *id = fmc_str(req, "id");
+    size_t budget = req->budget_bytes ? req->budget_bytes : 4096;
+    if (budget > 8192) budget = 8192;
+    if (!zcl_hex_decode_lower(id, decoded, sizeof(decoded))) {
+        fmc_fail(reply, "BAD_INPUT", "id must be an exact 64-character lowercase revision id", "id");
+        return false;
+    }
+    if (budget < 3072) {
+        fmc_fail(reply, "WIKI_BUDGET", "wiki read wrapper requires at least 3072 response bytes", "budget_bytes");
+        return false;
+    }
+    sub->request.budget_bytes = budget - 1024;
+    if (!json_push_kv_str(&sub->input, "id", id)) {
+        fmc_fail(reply, "ALLOC_FAILED", "wiki revision id could not be copied", "id");
+        return false;
+    }
+    const char *const keys[] = {"offset", "bytes"};
+    for (size_t i = 0; i < 2; i++) {
+        const struct json_value *v = json_get(req->input, keys[i]);
+        if (!v) continue;
+        if (v->type != JSON_INT) {
+            fmc_fail(reply, "BAD_CHUNK", "offset and bytes must be bounded integers", keys[i]);
+            return false;
+        }
+        if (!json_push_kv(&sub->input, keys[i], v)) {
+            fmc_fail(reply, "ALLOC_FAILED", "chunk controls could not be copied", keys[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool fmc_wiki_chunk_identity(const struct json_value *chunk,
+                                     const char *expected)
+{
+    const char *mode = json_get_str(json_get(chunk, "representation"));
+    const char *id = json_get_str(json_get(chunk, "id"));
+    const struct json_value *scope = json_get(chunk, "signed_scope");
+    const struct json_value *room = json_get(chunk, "signed_room");
+    return mode && !strcmp(mode, "zcl.fleet_wiki_body_chunk.v1") &&
+        id && !strcmp(id, expected) && scope && scope->type == JSON_INT &&
+        room && room->type == JSON_STR;
+}
+
+static void fmc_do_wiki_read(const struct zcl_command_request *req,
+                              struct zcl_command_reply *reply)
+{
+    struct fmc_sub sub;
+    fmc_sub_begin(&sub, "zcl.fleet_wiki_read.v1", req, "fleet.wiki.read");
+    if (!sub.valid) {
+        fmc_fail(reply, "WIKI_UNAVAILABLE", "exact wiki read cannot be prepared", "fleet.wiki.read");
+        fmc_sub_end(&sub);
+        return;
+    }
+    if (!fmc_wiki_read_prepare(&sub, req, reply)) {
+        fmc_sub_end(&sub);
+        return;
+    }
+    zcl_native_handle_fleet_wiki_read(&sub.request, &sub.reply);
+    sub.ran = true;
+    if (!fmc_sub_ok(&sub)) {
+        fmc_fail(reply, "WIKI_READ_UNAVAILABLE", "the exact retained wiki revision was refused", sub.reply.error.code);
+    } else if (!fmc_wiki_chunk_identity(&sub.reply.data, fmc_str(req, "id"))) {
+        fmc_fail(reply, "WIKI_CAPABILITY_UNAVAILABLE", "the selected node lacks exact signed wiki chunks", "representation/id/signed_scope/signed_room");
+    } else if (json_write(&sub.reply.data, NULL, 0) > sub.request.budget_bytes - 768) {
+        fmc_fail(reply, "WIKI_BUDGET_EXCEEDED", "the selected node exceeded the nested read budget", "fleet.wiki.read");
+    } else {
+        bool ok = json_push_kv(&reply->data, "revision", &sub.reply.data) &&
+            json_push_kv_int(&reply->data, "observed_at", (int64_t)platform_time_wall_time_t()) &&
+            json_push_kv_bool(&reply->data, "untrusted", true) &&
+            json_push_kv_bool(&reply->data, "partial", true);
+        if (!ok) fmc_fail(reply, "ALLOC_FAILED", "wiki chunk projection failed", "json");
+        else {
+            reply->status = ZCL_COMMAND_STATUS_PASSED;
+            reply->exit_code = 0;
+        }
+    }
+    fmc_sub_end(&sub);
+}
+
+void zcl_native_handle_fleet_steer_wiki_read(
+    const struct zcl_command_request *request, struct zcl_command_reply *reply)
+{
+    fmc_enter(request, reply, "evidence",
+              "fleet.steer.wiki-read takes grant,id,offset,bytes", fmc_do_wiki_read);
+}
+
+static bool fmc_wiki_write_prepare(struct fmc_sub *sub,
+    const struct zcl_command_request *req, struct zcl_command_reply *reply,
+    const struct fmc_caller *who)
+{
+    const char *key = fmc_str(req, "request_key");
+    if (!who->grant || !who->binding[0]) {
+        fmc_fail(reply, "GRANT_REQUIRED", "wiki mutation requires an explicit attributable wiki-write grant", "grant");
+        return false;
+    }
+    if (!fmc_is_token(key, 128, false)) {
+        fmc_fail(reply, "BAD_INPUT", "request_key must be a nonempty token of at most 128 bytes", "request_key");
+        return false;
+    }
+    size_t budget = req->budget_bytes ? req->budget_bytes : 4096;
+    if (budget > 8192) budget = 8192;
+    if (budget < 3072) {
+        fmc_fail(reply, "WIKI_BUDGET", "wiki mutation requires at least 3072 response bytes", "budget_bytes");
+        return false;
+    }
+    sub->request.budget_bytes = budget - 1024;
+    struct sha3_256_ctx hash;
+    unsigned char sum[32];
+    char marker[65];
+    static const char domain[] = "z23.steer.wiki.request.v1";
+    sha3_256_init(&hash);
+    sha3_256_write(&hash, (const unsigned char *)domain, sizeof(domain));
+    sha3_256_write(&hash, (const unsigned char *)who->binding, strlen(who->binding) + 1);
+    sha3_256_write(&hash, (const unsigned char *)key, strlen(key) + 1);
+    sha3_256_finalize(&hash, sum);
+    zcl_hex_encode(sum, sizeof(sum), marker);
+    bool ok = json_push_kv_str(&sub->input, "marker", marker) &&
+        json_push_kv_str(&sub->input, "binding", who->binding);
+    static const char *const keys[] = {"expected", "slug", "title", "text"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const struct json_value *value = json_get(req->input, keys[i]);
+        if (!value || value->type != JSON_STR) {
+            fmc_fail(reply, "BAD_INPUT", "expected, slug, title and inline text are required strings", keys[i]);
+            return false;
+        }
+        if (!strcmp(keys[i], "text") && strlen(json_get_str(value)) > FLEET_BOARD_WIKI_TEXT_MAX) {
+            fmc_fail(reply, "BAD_INPUT", "inline text exceeds the signed 16384-byte bound", "text");
+            return false;
+        }
+        ok &= json_push_kv(&sub->input, keys[i], value);
+    }
+    if (!ok) fmc_fail(reply, "ALLOC_FAILED", "wiki mutation input could not be copied", "json");
+    return ok;
+}
+
+static bool fmc_wiki_receipt_text_matches(const struct json_value *receipt,
+    const struct json_value *input)
+{
+    const char *text = json_get_str(json_get(input, "text"));
+    const struct json_value *size = json_get(receipt, "text_len");
+    if (!text || !size || size->type != JSON_INT ||
+        json_get_int(size) != (int64_t)strlen(text)) return false;
+    struct sha3_256_ctx hash;
+    unsigned char sum[32];
+    char hex[65];
+    sha3_256_init(&hash);
+    sha3_256_write(&hash, (const unsigned char *)text, strlen(text));
+    sha3_256_finalize(&hash, sum);
+    zcl_hex_encode(sum, sizeof(sum), hex);
+    const char *actual = json_get_str(json_get(receipt, "body_sha3_256"));
+    return actual && !strcmp(actual, hex);
+}
+
+static bool fmc_wiki_receipt_fields_match(const struct json_value *receipt,
+    const struct json_value *input)
+{
+    static const char *const keys[] = {"slug", "title"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const char *want = json_get_str(json_get(input, keys[i]));
+        const char *actual = json_get_str(json_get(receipt, keys[i]));
+        if (!want || !actual || strcmp(want, actual)) return false;
+    }
+    const char *binding = json_get_str(json_get(input, "binding"));
+    const char *agent = json_get_str(json_get(receipt, "agent"));
+    const char *marker = json_get_str(json_get(input, "marker"));
+    const char *actual_marker = json_get_str(json_get(receipt, "receipt"));
+    char expected_marker[80];
+    if (!binding || !agent || !marker || !actual_marker) return false;
+    (void)snprintf(expected_marker, sizeof(expected_marker), "wiki-write-v1:%s", marker);
+    return !strcmp(binding, agent) && !strcmp(expected_marker, actual_marker);
+}
+
+static bool fmc_wiki_signed_strings(struct fleet_board_post *post,
+    const struct json_value *receipt)
+{
+    const struct { const char *key; char *target; size_t capacity; } fields[] = {
+        {"signed_room", post->room, sizeof(post->room)}, {"agent", post->agent, sizeof(post->agent)},
+        {"slug", post->slug, sizeof(post->slug)}, {"title", post->title, sizeof(post->title)},
+        {"receipt", post->receipt, sizeof(post->receipt)}};
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        const char *s = json_get_str(json_get(receipt, fields[i].key));
+        if (!s || strlen(s) >= fields[i].capacity) return false;
+        memcpy(fields[i].target, s, strlen(s) + 1);
+    }
+    return true;
+}
+
+static bool fmc_wiki_signed_hex(struct fleet_board_post *post,
+    const struct json_value *receipt)
+{
+    const struct { const char *key; uint8_t *target; size_t length; } fields[] = {
+        {"id", post->id, sizeof(post->id)}, {"host", post->host_pubkey, sizeof(post->host_pubkey)},
+        {"signature", post->signature, sizeof(post->signature)}, {"ref", post->ref, sizeof(post->ref)},
+        {"supersedes", post->supersedes, sizeof(post->supersedes)}};
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+        if (!zcl_hex_decode_lower(json_get_str(json_get(receipt, fields[i].key)), fields[i].target, fields[i].length)) return false;
+    return true;
+}
+
+static bool fmc_wiki_signed_numbers(const struct json_value *receipt)
+{
+    const struct json_value *scope = json_get(receipt, "signed_scope");
+    const struct json_value *created = json_get(receipt, "created_at");
+    const struct json_value *ttl = json_get(receipt, "ttl");
+    return scope && scope->type == JSON_INT && json_get_int(scope) == FLEET_BOARD_SCOPE_PUBLIC &&
+        created && created->type == JSON_INT && json_get_int(created) > 0 &&
+        ttl && ttl->type == JSON_INT && json_get_int(ttl) == FLEET_BOARD_TTL_DEFAULT;
+}
+
+static bool fmc_wiki_signature_matches(const struct json_value *receipt,
+    const struct json_value *input)
+{
+    const struct json_value *created = json_get(receipt, "created_at");
+    const char *body = json_get_str(json_get(input, "text"));
+    const char *kind = json_get_str(json_get(receipt, "kind"));
+    if (!fmc_wiki_signed_numbers(receipt)) return false;
+    if (!body || strlen(body) > FLEET_BOARD_WIKI_TEXT_MAX || !kind || strcmp(kind, "wiki")) return false;
+    struct fleet_board_post post = {.kind = FLEET_BOARD_KIND_WIKI, .scope = FLEET_BOARD_SCOPE_PUBLIC,
+        .created_at = (uint64_t)json_get_int(created), .ttl = FLEET_BOARD_TTL_DEFAULT,
+        .text_len = (uint32_t)strlen(body)};
+    memcpy(post.text, body, post.text_len + 1);
+    if (!fmc_wiki_signed_strings(&post, receipt) || !fmc_wiki_signed_hex(&post, receipt)) return false;
+    return !strcmp(post.room, FLEET_BOARD_ROOM_DEFAULT) && fleet_board_post_verify(&post) == FLEET_BOARD_OK;
+}
+
+bool zcl_native_fleet_wiki_receipt_matches(const struct json_value *receipt,
+    const struct json_value *input, bool *replayed)
+{
+    uint8_t decoded[32];
+    const char *mode = json_get_str(json_get(receipt, "representation"));
+    const struct json_value *replay = json_get(receipt, "replayed");
+    const char *parent = json_get_str(json_get(input, "expected"));
+    const char *actual_parent = json_get_str(json_get(receipt, "supersedes"));
+    static const char absent[] = "0000000000000000000000000000000000000000000000000000000000000000";
+    if (!parent || !actual_parent) return false;
+    const char *want_parent = !strcmp(parent, "absent") ? absent : parent;
+    bool matched = mode && !strcmp(mode, "zcl.fleet_wiki_write_receipt.v1") &&
+        zcl_hex_decode_lower(json_get_str(json_get(receipt, "id")), decoded, 32) &&
+        zcl_hex_decode_lower(json_get_str(json_get(receipt, "body_sha3_256")), decoded, 32) &&
+        replay && replay->type == JSON_BOOL && !strcmp(actual_parent, want_parent) &&
+        fmc_wiki_receipt_text_matches(receipt, input) &&
+        fmc_wiki_receipt_fields_match(receipt, input) && fmc_wiki_signature_matches(receipt, input);
+    if (matched && replayed) *replayed = json_get_bool(replay);
+    return matched;
+}
+
+static void fmc_wiki_outcome_unknown(struct zcl_command_reply *reply,
+    const char *message, const char *evidence, bool mutated, bool retained_replay)
+{
+    fmc_fail(reply, "WIKI_OUTCOME_UNKNOWN", message, evidence);
+    reply->error.mutated = mutated;
+    (void)snprintf(reply->error.current_state, sizeof(reply->error.current_state), "%s",
+        mutated ? "committed_receipt_unavailable" : retained_replay ? "retained_replay_receipt_unavailable" : "outcome_unknown");
+    (void)snprintf(reply->error.next_action, sizeof(reply->error.next_action),
+        "reconcile the same request_key; do not issue a new key");
+}
+
+static void fmc_do_wiki_write(const struct zcl_command_request *req,
+    struct zcl_command_reply *reply, const struct fmc_caller *who)
+{
+    struct fmc_sub sub;
+    fmc_sub_begin(&sub, "zcl.fleet_wiki_write_receipt.v1", req, "fleet.steer.wiki-write");
+    if (!sub.valid || !fmc_wiki_write_prepare(&sub, req, reply, who)) {
+        if (!sub.valid) fmc_fail(reply, "WIKI_CAPABILITY_UNAVAILABLE", "wiki mutation command is unavailable", "catalog");
+        fmc_sub_end(&sub);
+        return;
+    }
+    zcl_native_fleet_wiki_write_rpc(&sub.request, &sub.reply);
+    sub.ran = true;
+    bool replayed = false;
+    if (!fmc_sub_ok(&sub)) {
+        const char *code = !strncmp(sub.reply.error.code, "WIKI_", 5)
+            ? sub.reply.error.code : "WIKI_OUTCOME_UNKNOWN";
+        if (!strcmp(code, "WIKI_OUTCOME_UNKNOWN"))
+            fmc_wiki_outcome_unknown(reply, "wiki mutation receipt is unavailable", sub.reply.error.code,
+                sub.reply.error.mutated, !strcmp(sub.reply.error.current_state, "retained_replay"));
+        else fmc_fail(reply, code, "receiver-local wiki mutation was refused", sub.reply.error.code);
+    } else if (!zcl_native_fleet_wiki_receipt_matches(&sub.reply.data, &sub.input, &replayed)) {
+        fmc_wiki_outcome_unknown(reply, "selected node returned an unverified or mismatched signed receipt", "signed receipt", false, false);
+    } else if (json_write(&sub.reply.data, NULL, 0) > sub.request.budget_bytes) {
+        /* This sibling reply is projected directly, without serializing a
+         * second command envelope. The reserved 1024 covers the one final
+         * envelope and caller/read-next metadata. */
+        fmc_wiki_outcome_unknown(reply, "verified receipt exceeded its response budget", "fleet_board", !replayed, replayed);
+    } else {
+        bool ok = json_push_kv(&reply->data, "revision", &sub.reply.data) &&
+            json_push_kv_str(&reply->data, "caller", who->label) &&
+            json_push_kv_str(&reply->data, "caller_binding", who->binding) &&
+            json_push_kv_str(&reply->data, "exact_read", "wiki_read(id,offset,bytes)");
+        if (!ok) fmc_wiki_outcome_unknown(reply, "verified receipt projection failed", "json", !replayed, replayed);
+        else {
+            reply->status = ZCL_COMMAND_STATUS_PASSED; reply->exit_code = 0;
+            reply->error.mutated = !replayed;
+            (void)snprintf(reply->error.current_state, sizeof(reply->error.current_state), "%s",
+                replayed ? "retained_replay" : "committed");
+        }
+    }
+    fmc_sub_end(&sub);
+}
+
+void zcl_native_handle_fleet_steer_wiki_write(
+    const struct zcl_command_request *request, struct zcl_command_reply *reply)
+{
+    /* Admission linearizes here: revocation before entry denies even replay;
+     * this does not cancel a mutation already admitted and committing. */
+    fmc_enter_who(request, reply, "wiki-write",
+        "fleet.steer.wiki-write requires grant,request_key,expected,slug,title,inline text",
+        fmc_do_wiki_write);
 }
 
 void zcl_native_handle_fleet_steer_grant(

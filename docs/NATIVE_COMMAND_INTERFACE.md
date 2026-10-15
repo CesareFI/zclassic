@@ -452,6 +452,17 @@ marker and requires inspection of preserved artifacts; it never grants
 permission to repeat the operation. A response that cannot fit still returns
 a nonzero exit.
 
+For the resolved `fleet.steer.wiki-write` leaf only, trusted handler states
+`committed`, `committed_receipt_unavailable`, `retained_replay`,
+`retained_replay_receipt_unavailable`, and `outcome_unknown` survive both
+ordinary errors and allocation-free serialization fallback. `effect_outcome`
+distinguishes committed history, retained replay without a new append, and
+unknown outcome. The legacy `mutated` field means a possible new effect for
+unknown outcomes; it does not establish a commit. Reconcile the same
+`request_key` rather than issue a new key. Caller JSON and markers from other
+leaves cannot acquire these recovery semantics. This preserves handler
+observations under existing RPC trust, not independently pinned signer identity.
+
 ## 9. Token and payload budgets
 
 Default compact JSON budgets are part of the interface contract:

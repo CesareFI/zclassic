@@ -772,12 +772,12 @@ static int gw_t_handshake(void)
         struct json_value catalog = {0};
         ASSERT(json_read(&catalog, b, strlen(b)));
         const struct json_value *tools = json_get(json_get(&catalog, "result"), "tools");
-        ASSERT(tools && json_size(tools) == 5);
+        ASSERT(tools && json_size(tools) == 7);
         const char *const names[] = {
-            "steer_brief", "steer_send", "steer_evidence", "steer_deliver", "wiki_find"
+            "steer_brief", "steer_send", "steer_evidence", "steer_deliver", "wiki_find", "wiki_read", "wiki_write"
         };
         const char *const titles[] = {
-            "Observe fleet", "Delegate work", "Inspect evidence", "Stage source", "Find knowledge"
+            "Observe fleet", "Delegate work", "Inspect evidence", "Stage source", "Find knowledge", "Read knowledge", "Save knowledge"
         };
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             const struct json_value *tool = json_at(tools, i);
@@ -806,6 +806,17 @@ static int gw_t_handshake(void)
         ASSERT(json_get_bool(json_get(annotations, "openWorldHint")));
         ASSERT(json_get(json_at(tools, 1), "annotations") == NULL);
         ASSERT(json_get(json_at(tools, 2), "annotations") == NULL);
+        const struct json_value *write = json_at(tools, 6);
+        const struct json_value *write_schema = json_get(write, "inputSchema");
+        const struct json_value *write_properties = json_get(write_schema, "properties");
+        ASSERT(json_get(write, "annotations") == NULL);
+        ASSERT(!json_get_bool(json_get(write_schema, "additionalProperties")));
+        ASSERT(json_size(json_get(write_schema, "required")) == 5);
+        ASSERT_STR_EQ(json_get_str(json_get(json_get(write_properties, "text"), "type")), "string");
+        ASSERT_EQ(json_get_int(json_get(json_get(write_properties, "text"), "maxLength")), 16384);
+        ASSERT(json_get(write_properties, "agent") == NULL);
+        ASSERT(json_get(write_properties, "binding") == NULL);
+        ASSERT(gw_body_has(b, "PUBLIC"));
         const struct json_value *evidence = json_get(json_at(tools, 2), "inputSchema");
         const struct json_value *properties = json_get(evidence, "properties");
         const char *const selectors[] = {"seq", "attempt"};
@@ -826,6 +837,12 @@ static int gw_t_handshake(void)
         ASSERT_STR_EQ(json_get_str(json_at(required, 0)), "type");
         ASSERT_STR_EQ(json_get_str(json_at(required, 1)), "ref");
         ASSERT_STR_EQ(json_get_str(json_get(json_get(properties, "ref"), "type")), "string");
+        const struct json_value *read = json_get(json_at(tools, 5), "inputSchema");
+        const struct json_value *read_properties = json_get(read, "properties");
+        ASSERT_STR_EQ(json_get_str(json_at(json_get(read, "required"), 0)), "id");
+        ASSERT_STR_EQ(json_get_str(json_get(json_get(read_properties, "id"), "pattern")), "^[0-9a-f]{64}$");
+        ASSERT_STR_EQ(json_get_str(json_get(json_get(read_properties, "offset"), "type")), "integer");
+        ASSERT_EQ(json_get_int(json_get(json_get(read_properties, "bytes"), "maximum")), 1024);
         json_free(&catalog);
         /* A schema-driven client only sends what the schema names: a
          * remote agent answering its directive needs `kind` advertised,
@@ -1259,6 +1276,7 @@ static int gw_t_oauth(void)
         ASSERT(b != NULL);
         ASSERT_EQ(st, 200);
         ASSERT(gw_body_has(b, "\"scopes_supported\""));
+        ASSERT(gw_body_has(b, "\"wiki-write\""));
         ASSERT(gw_body_has(b, "bearer_methods_supported"));
         free(b);
         /* RFC 9728 path-suffixed form, which clients probe first. */
@@ -1270,6 +1288,7 @@ static int gw_t_oauth(void)
         b = gw_get("/.well-known/oauth-authorization-server", &st);
         ASSERT(b != NULL);
         ASSERT(gw_body_has(b, "\"token_endpoint\""));
+        ASSERT(gw_body_has(b, "\"wiki-write\""));
         ASSERT(gw_body_has(b, "code_challenge_methods_supported"));
         free(b);
         /* Dynamic registration, then a bad redirect refused. */

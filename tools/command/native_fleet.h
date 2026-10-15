@@ -67,6 +67,19 @@ void zcl_native_handle_fleet_steer_evidence(
 void zcl_native_handle_fleet_steer_wiki_find(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+void zcl_native_handle_fleet_steer_wiki_read(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+void zcl_native_handle_fleet_steer_wiki_write(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+/* Internal local-RPC adapter; authenticated admission belongs to steering. */
+void zcl_native_fleet_wiki_write_rpc(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
+/* Pure exact signed-receipt verification against the caller's inline body. */
+bool zcl_native_fleet_wiki_receipt_matches(const struct json_value *receipt,
+    const struct json_value *input, bool *replayed);
 void zcl_native_handle_fleet_steer_grant(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);

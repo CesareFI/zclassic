@@ -40,7 +40,7 @@ static void board_write_lock_init(void)
     zcl_mutex_init(&s_board_write_lock);
 }
 
-static void board_write_lock(void)
+void fleet_board_write_lock(void)
 {
     (void)zcl_once_call(&s_board_write_once, board_write_lock_init);
     zcl_mutex_lock(&s_board_write_lock);
@@ -194,22 +194,21 @@ bool db_fleet_board_post_validate(const struct db_fleet_board_post *record,
     return !ar_errors_any(errors);
 }
 
-static int64_t board_next_seq(struct node_db *ndb)
+static bool board_next_seq(struct node_db *ndb, int64_t *out)
 {
     struct qb q;
     qb_select(&q, QB_T_fleet_board_posts);
     qb_select_agg(&q, QB_MAX, QB_C_fleet_board_posts_seq, true);
-    sqlite3_stmt *s = NULL;
     int64_t top = 0;
-    if (!QB_PREPARE(ndb, &q, s))
-        return 0;
-    if (AR_STEP_ROW(s))
-        top = sqlite3_column_int64(s, 0);
-    sqlite3_finalize(s);
-    return top + 1;
+    if (!fleet_board_aggregate_checked(ndb, &q, &top) || top == INT64_MAX) {
+        LOG_WARN("fleet.board", "sequence aggregate failed or exhausted");
+        return false;
+    }
+    *out = top + 1;
+    return true;
 }
 
-static bool board_head_chain(struct node_db *ndb, uint8_t out[32])
+static bool board_head_chain(struct node_db *ndb, uint8_t out[32], bool *found)
 {
     struct qb q;
     qb_select(&q, QB_T_fleet_board_posts);
@@ -217,20 +216,21 @@ static bool board_head_chain(struct node_db *ndb, uint8_t out[32])
     qb_order_by(&q, QB_C_fleet_board_posts_seq, QB_DESC);
     qb_limit(&q, 1);
     sqlite3_stmt *s = NULL;
-    bool found = false;
-    /* raw-return-ok:no-head-means-genesis — the caller answers a missing
-     * head by chaining from 32 zero bytes, which is the correct first
-     * link, so an unreadable head is not an error to report twice. */
-    if (!QB_PREPARE(ndb, &q, s))
-        return false; // raw-return-ok:no-head-means-genesis
+    *found = false;
+    if (!QB_PREPARE(ndb, &q, s)) {
+        LOG_WARN("fleet.board", "chain head prepare failed: %s", qb_error(&q));
+        return false;
+    }
     if (AR_STEP_ROW(s)) {
         struct fleet_board_chain_ref head;
         board_read_chain_ref(&head, s);
         memcpy(out, head.chain_hash, 32);
-        found = true;
+        *found = true;
     }
+    int rc = sqlite3_reset(s);
     sqlite3_finalize(s);
-    return found;
+    if (rc != SQLITE_OK) LOG_WARN("fleet.board", "chain head step failed: %d", rc);
+    return rc == SQLITE_OK;
 }
 
 bool db_fleet_board_have(struct node_db *ndb, const uint8_t id[32])
@@ -321,7 +321,7 @@ static void board_quarantine_add(const uint8_t id[32])
 #ifdef ZCL_TESTING
 void db_fleet_board_test_clear_quarantine(void)
 {
-    board_write_lock();
+    fleet_board_write_lock();
     s_board_quarantine_next = 0;
     s_board_quarantine_used = 0;
     zcl_mutex_unlock(&s_board_write_lock);
@@ -498,6 +498,19 @@ static bool board_append_fits(struct node_db *ndb, int64_t body_bytes)
  * store it has written. Guarded by s_board_write_lock. */
 static int64_t s_board_arrival_high;
 
+void fleet_board_write_unlock(void)
+{
+    zcl_mutex_unlock(&s_board_write_lock);
+}
+int64_t fleet_board_arrival_checkpoint(void)
+{
+    return s_board_arrival_high;
+}
+void fleet_board_arrival_restore(int64_t high)
+{
+    s_board_arrival_high = high;
+}
+
 /* The next arrival number: strictly above everything stored and everything
  * this process has already assigned, so a reclaim that deletes the newest
  * rows can never hand a number out twice while this process lives. Numbers
@@ -601,7 +614,7 @@ static enum fleet_board_result board_ingest_admissible(
  * admissibility, then the canonical body size the ledger stores alongside the
  * row. The canonical size is measured once and needs no buffer — canonical()
  * reports the size it would have written. */
-static enum fleet_board_result board_ingest_prepare(
+enum fleet_board_result fleet_board_ingest_prepare(
     struct node_db *ndb, const struct fleet_board_post *post, int64_t now,
     size_t *body_len_out, bool *known_out)
 {
@@ -619,7 +632,7 @@ static enum fleet_board_result board_ingest_prepare(
 
 /* The capacity checks and the append itself. Caller holds the board write
  * lock (and, on the eviction path, the open transaction). */
-static enum fleet_board_result board_append_record(
+enum fleet_board_result fleet_board_append_record(
     struct node_db *ndb, const struct fleet_board_post *post, int64_t now,
     size_t body_len)
 {
@@ -634,11 +647,13 @@ static enum fleet_board_result board_append_record(
     if (!board_next_arrival(ndb, &record.arrival))
         return FLEET_BOARD_ERR_STORAGE;
     record.post = *post;
-    record.seq = board_next_seq(ndb);
+    if (!board_next_seq(ndb, &record.seq)) return FLEET_BOARD_ERR_STORAGE;
     record.expires_at = (int64_t)post->created_at + (int64_t)post->ttl;
     record.body_bytes = (int64_t)body_len;
     record.received_at = now;
-    if (!board_head_chain(ndb, record.chain_prev))
+    bool head_found = false;
+    if (!board_head_chain(ndb, record.chain_prev, &head_found)) return FLEET_BOARD_ERR_STORAGE;
+    if (!head_found)
         memset(record.chain_prev, 0, sizeof(record.chain_prev));
     fleet_board_chain_step(record.chain_prev, record.post.id,
                            record.chain_hash);
@@ -666,7 +681,7 @@ static enum fleet_board_result board_append_locked(
     if (r != FLEET_BOARD_OK)
         return r;
     if (!evict)
-        return board_append_record(ndb, post, now, body_len);
+        return fleet_board_append_record(ndb, post, now, body_len);
     if (!fleet_board_wiki_evict_allowed(now))
         return FLEET_BOARD_ERR_WIKI_QUOTA;
     r = board_append_evicting(ndb, post, now, body_len, victim);
@@ -686,7 +701,7 @@ enum fleet_board_result db_fleet_board_post_ingest(
 
     size_t body_len = 0;
     bool held = false;
-    enum fleet_board_result r = board_ingest_prepare(ndb, post, now,
+    enum fleet_board_result r = fleet_board_ingest_prepare(ndb, post, now,
                                                      &body_len, &held);
     if (r != FLEET_BOARD_OK || held)
         return r;
@@ -697,7 +712,7 @@ enum fleet_board_result db_fleet_board_post_ingest(
     node_db_get_status(ndb, &db_status);
     if (db_status.tx_open)
         return FLEET_BOARD_ERR_BUSY;
-    board_write_lock();
+    fleet_board_write_lock();
     node_db_get_status(ndb, &db_status);
     if (db_status.tx_open) {
         zcl_mutex_unlock(&s_board_write_lock);
@@ -931,7 +946,7 @@ static bool board_seq_of(struct node_db *ndb, const uint8_t id[32],
  * their seq and chain values, so the work is bounded by the rows above the
  * victim rather than the whole table. Caller holds the board write lock
  * and an open transaction. */
-static bool board_remove_and_relink(struct node_db *ndb,
+bool fleet_board_remove_and_relink(struct node_db *ndb,
                                     const struct fleet_board_post *post,
                                     const uint8_t victim[32])
 {
@@ -953,9 +968,9 @@ static enum fleet_board_result board_replace_and_append(
     DB_TXN_SCOPE(txn, ndb, "fleet_board.wiki_replace");
     if (!txn)
         return FLEET_BOARD_ERR_BUSY;
-    if (!board_remove_and_relink(ndb, post, victim))
+    if (!fleet_board_remove_and_relink(ndb, post, victim))
         return FLEET_BOARD_ERR_STORAGE;
-    enum fleet_board_result r = board_append_record(ndb, post, now, body_len);
+    enum fleet_board_result r = fleet_board_append_record(ndb, post, now, body_len);
     if (r != FLEET_BOARD_OK)
         return r;
     return db_txn_commit(txn) ? FLEET_BOARD_OK : FLEET_BOARD_ERR_STORAGE;
@@ -1045,7 +1060,7 @@ enum fleet_board_reclaim db_fleet_board_reclaim_expired(
     node_db_get_status(ndb, &st);
     if (st.tx_open)
         return FLEET_BOARD_RECLAIM_DEFERRED;
-    board_write_lock();
+    fleet_board_write_lock();
     node_db_get_status(ndb, &st);
     if (st.tx_open) {
         zcl_mutex_unlock(&s_board_write_lock);
@@ -1402,8 +1417,7 @@ bool db_fleet_board_status(struct node_db *ndb, int64_t now,
                  FLEET_BOARD_KIND_WIKI);
     out->wiki_pages = board_scalar(ndb, &q);
 
-    out->head_chain_set = board_head_chain(ndb, out->head_chain);
-    return true;
+    return board_head_chain(ndb, out->head_chain, &out->head_chain_set);
 }
 
 bool db_fleet_board_chain_verify(struct node_db *ndb, int64_t *checked_out)

@@ -26,6 +26,7 @@
 
 #include "net/msgprocessor.h"
 #include "session/fleet_board_proto.h"
+#include "models/fleet_board_post.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -122,6 +123,13 @@ bool boot_fleet_board_inventory_cursor_commit_for_testing(
  * be stored is never announced. */
 enum fleet_board_result boot_fleet_board_publish(
     struct fleet_board_post *post, int64_t now);
+
+/* Receiver-local atomic wiki append. Sign with this host's existing identity,
+ * store through the canonical board writer, and announce only committed new
+ * objects. A retained replay returns the original signed revision. */
+enum fleet_board_wiki_write_status boot_fleet_board_wiki_write(
+    struct fleet_board_post *post, const uint8_t *expected, int64_t now,
+    struct db_fleet_board_post *out, enum fleet_board_result *refusal);
 
 /* Announce a specific id to every connected peer. Used right after a local
  * post so the fleet sees it without waiting for the announce period. */

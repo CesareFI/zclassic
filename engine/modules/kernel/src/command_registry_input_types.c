@@ -11,6 +11,7 @@
 #include "command_registry_internal.h"
 
 #include "json/json.h"
+#include "session/fleet_board_proto.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -323,6 +324,10 @@ static bool cr_match_fleet_steer(const char *path, const char *key,
                                const struct json_value *value, bool *type_ok)
 {
     size_t j;
+    if (!strcmp(path, "fleet.steer.wiki-write") && !strcmp(key, "text")) {
+        *type_ok = cr_nonempty_str(value, FLEET_BOARD_WIKI_TEXT_MAX);
+        return true;
+    }
     if (strcmp(path, "fleet.steer.send") != 0 || strcmp(key, "items") != 0)
         return false;
     *type_ok = value->type == JSON_ARR && value->num_children >= 1u &&
@@ -357,7 +362,7 @@ static bool cr_match_vanity_ints(const char *path, const char *key,
 static bool cr_match_wiki_chunk_ints(const char *path, const char *key,
                                     const struct json_value *value, bool *type_ok)
 {
-    if (strcmp(path, "fleet.wiki.read") != 0) return false;
+    if (strcmp(path, "fleet.wiki.read") != 0 && strcmp(path, "fleet.steer.wiki-read") != 0) return false;
     if (strcmp(key, "offset") == 0)
         *type_ok = cr_int_range(value, 0, 16384);
     else if (strcmp(key, "bytes") == 0)

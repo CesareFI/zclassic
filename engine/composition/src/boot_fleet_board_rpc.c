@@ -23,6 +23,7 @@
 #include "platform/time_compat.h"
 #include "rpc/server.h"
 #include "session/fleet_wiki_entry.h"
+#include "sha3/sha3.h"
 #include "util/log_macros.h"
 
 #include <stdio.h>
@@ -340,6 +341,107 @@ static void fb_op_post(const struct json_value *in, struct json_value *result,
     json_push_kv_str(result, "id", hex);
     json_push_kv_str(result, "kind", fleet_board_kind_name(post.kind));
     json_push_kv_int(result, "created_at", (int64_t)post.created_at);
+}
+
+static bool fb_wiki_write_ids(const char *parent, const char *binding,
+    const char *marker, uint8_t expected[32], bool *absent)
+{
+    uint8_t decoded[32];
+    *absent = !strcmp(parent, "absent");
+    return (*absent || zcl_hex_decode_lower(parent, expected, 32)) &&
+        zcl_hex_decode_lower(marker, decoded, 32) && strlen(binding) == 32 &&
+        zcl_hex_decode_lower(binding, decoded, 16);
+}
+
+static bool fb_wiki_write_sizes(const char *text, const char *slug, const char *title)
+{
+    return text[0] && strlen(text) <= FLEET_BOARD_WIKI_TEXT_MAX &&
+        strlen(slug) <= FLEET_BOARD_SLUG_MAX && strlen(title) <= FLEET_BOARD_TITLE_MAX;
+}
+
+static bool fb_wiki_write_compose(const struct json_value *in,
+    struct json_value *result, int64_t now, struct fleet_board_post *post,
+    uint8_t expected[32], bool *absent)
+{
+    const char *parent = fb_str(in, "expected", NULL);
+    const char *text = fb_str(in, "text", NULL);
+    const char *slug = fb_str(in, "slug", NULL);
+    const char *title = fb_str(in, "title", NULL);
+    const char *binding = fb_str(in, "binding", NULL);
+    const char *marker = fb_str(in, "marker", NULL);
+    if (!parent || !text || !slug || !title || !binding || !marker) {
+        fb_error(result, "WIKI_INPUT", "expected, inline text, slug, title, binding and marker are required");
+        return false;
+    }
+    if (!fb_wiki_write_ids(parent, binding, marker, expected, absent)) {
+        fb_error(result, "WIKI_INPUT", "expected must be absent or exact id; binding and marker must be canonical hex");
+        return false;
+    }
+    if (!fb_wiki_write_sizes(text, slug, title)) {
+        fb_error(result, "WIKI_INPUT", "inline text, slug or title exceeds its signed byte bound");
+        return false;
+    }
+    memset(post, 0, sizeof(*post));
+    post->kind = FLEET_BOARD_KIND_WIKI;
+    post->scope = FLEET_BOARD_SCOPE_PUBLIC;
+    post->created_at = (uint64_t)now;
+    post->ttl = 86400;
+    (void)snprintf(post->room, sizeof(post->room), "%s", FLEET_BOARD_ROOM_DEFAULT);
+    (void)snprintf(post->agent, sizeof(post->agent), "%s", binding);
+    (void)snprintf(post->receipt, sizeof(post->receipt), "wiki-write-v1:%s", marker);
+    (void)snprintf(post->slug, sizeof(post->slug), "%s", slug);
+    (void)snprintf(post->title, sizeof(post->title), "%s", title);
+    post->text_len = (uint32_t)strlen(text);
+    memcpy(post->text, text, post->text_len + 1);
+    if (!*absent) memcpy(post->supersedes, expected, 32);
+    enum fleet_board_result valid = fleet_board_post_validate(post);
+    if (valid != FLEET_BOARD_OK) { fb_refuse(result, valid); return false; }
+    return true;
+}
+
+static bool fb_wiki_write_receipt(struct json_value *result,
+    const struct db_fleet_board_post *row, bool replay)
+{
+    uint8_t digest[32];
+    char hex[65];
+    struct sha3_256_ctx hash;
+    sha3_256_init(&hash);
+    sha3_256_write(&hash, (const unsigned char *)row->post.text, row->post.text_len);
+    sha3_256_finalize(&hash, digest);
+    fleet_board_id_to_hex(digest, hex);
+    json_set_object(result);
+    bool ok = fb_render_post_fields(result, row, false);
+    ok &= json_push_kv_bool(result, "ok", true);
+    ok &= json_push_kv_bool(result, "replayed", replay);
+    ok &= json_push_kv_bool(result, "partial", true);
+    ok &= json_push_kv_str(result, "verification", "receiver-verified-full-object; partial receipt requires full reconstruction for independent verification");
+    ok &= json_push_kv_int(result, "signed_scope", row->post.scope);
+    ok &= json_push_kv_str(result, "signed_room", row->post.room);
+    ok &= json_push_kv_str(result, "representation", "zcl.fleet_wiki_write_receipt.v1");
+    ok &= json_push_kv_str(result, "body_sha3_256", hex);
+    return ok;
+}
+
+static void fb_op_wiki_write(const struct json_value *in,
+    struct json_value *result, int64_t now)
+{
+    struct fleet_board_post post;
+    uint8_t expected[32];
+    bool absent;
+    if (!fb_wiki_write_compose(in, result, now, &post, expected, &absent)) return;
+    struct db_fleet_board_post out;
+    enum fleet_board_result refusal;
+    enum fleet_board_wiki_write_status status = boot_fleet_board_wiki_write(
+        &post, absent ? NULL : expected, now, &out, &refusal);
+    if (status != FLEET_WIKI_WRITE_OK && status != FLEET_WIKI_WRITE_REPLAY) {
+        static const char *const codes[] = {"OK", "REPLAY", "WIKI_INPUT", "WIKI_CONFLICT",
+            "WIKI_CORRUPT", "WIKI_REQUEST_COLLISION", "WIKI_CLOCK", "WIKI_BUSY",
+            "WIKI_STORAGE", "WIKI_REFUSED"};
+        fb_error(result, codes[status], "receiver-local atomic wiki mutation was refused; reconcile retained request before retry");
+        return;
+    }
+    if (!fb_wiki_write_receipt(result, &out, status == FLEET_WIKI_WRITE_REPLAY))
+        fb_error(result, "WIKI_OUTCOME_UNKNOWN", "mutation committed but receipt projection failed; reconcile the same request key");
 }
 
 static void fb_op_list(struct node_db *ndb, const struct json_value *in,
@@ -904,6 +1006,7 @@ static bool rpc_fleet_board(const struct json_value *params, bool help,
     int64_t now = (int64_t)platform_time_wall_time_t();
 
     if (strcmp(op, "post") == 0)            fb_op_post(in, result, now);
+    else if (strcmp(op, "wiki_write") == 0) fb_op_wiki_write(in, result, now);
     else if (strcmp(op, "list") == 0)       fb_op_list(ndb, in, result, now);
     else if (strcmp(op, "show") == 0)       fb_op_show(ndb, in, result);
     else if (strcmp(op, "fleet_page") == 0)

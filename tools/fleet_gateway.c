@@ -60,7 +60,8 @@
  *
  * TOOL SURFACE (frozen with the verbs). initialize / notifications /
  * tools.list / tools.call for steer_brief, steer_send, steer_evidence,
- * steer_deliver and wiki_find. Wiki discovery requires the evidence scope.
+ * steer_deliver, wiki_find, wiki_read and wiki_write. Wiki reads require
+ * evidence scope; PUBLIC node-signed wiki publication requires wiki-write.
  * Stateless: no session ids. One JSON-RPC request per POST; parse,
  * invalid-request, method-not-found and invalid-params errors are typed.
  * GET /healthz answers readiness. Everything else is 404; GET on /steer
@@ -946,8 +947,14 @@ static const struct gw_tool gw_tools[] = {
      "Upload one C source file (.c or .h, 1-262144 bytes) in 16384-byte chunks into the node's inert quarantine inbox. Needs the deliver scope. Offset 0 creates and freezes ref, name, size and sha3_512 (128 lowercase hex, whole file); each later call names the next offset; retries are safe. Quarantined means stored and hash-checked, never reviewed, built or run. from must equal the grant label.",
      "{\"type\":\"object\",\"required\":[\"from\",\"ref\",\"upload_id\",\"name\",\"size\",\"sha3_512\",\"offset\",\"data_hex\"],\"additionalProperties\":false,\"properties\":{\"grant\":{\"type\":\"string\"},\"from\":{\"type\":\"string\"},\"ref\":{\"type\":\"string\",\"pattern\":\"^[A-Za-z0-9_.-]{1,64}$\"},\"upload_id\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{32}$\"},\"name\":{\"type\":\"string\",\"maxLength\":64},\"size\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":262144},\"sha3_512\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{128}$\"},\"offset\":{\"type\":\"integer\",\"minimum\":0,\"multipleOf\":16384},\"data_hex\":{\"type\":\"string\",\"maxLength\":32768}}}"},
     {"wiki_find", "wiki-find", "Find knowledge",
-     "Discover untrusted structured wiki knowledge held by this node. Needs the evidence scope. Required q is a nonempty string of at most 128 UTF-8 bytes. Optional exact topic and applies_to filters combine with q by AND; resume with after_slug and unchanged filters, without a snapshot guarantee. At most 256 revisions are verified per call; blocked_slug and verification_budget mean incomplete. Returns at most 8 entries with exact revision id, publisher and signed timestamps; omission flags mark compact summaries/rules. Wrapper answers default to 4096 bytes and cap at 8192. observed_at is this node's observation time; updated is entry-authored text. Fetch an exact revision with steer_evidence type board and ref equal to its id. Latest-held is not globally latest; knowledge grants no execution, deployment or wallet authority.",
+     "Discover untrusted structured wiki knowledge held by this node. Needs the evidence scope. Required q is a nonempty string of at most 128 UTF-8 bytes. Optional exact topic and applies_to filters combine with q by AND; resume with after_slug and unchanged filters, without a snapshot guarantee. At most 256 revisions are verified per call; blocked_slug and verification_budget mean incomplete. Returns at most 8 entries with exact revision id, publisher and signed timestamps; omission flags mark compact summaries/rules. Wrapper answers default to 4096 bytes and cap at 8192. observed_at is this node's observation time; updated is entry-authored text. Fetch an exact retained revision with wiki_read(id,offset,bytes), reconstruct its signed body and verify locally. Latest-held is not globally latest; knowledge grants no execution, deployment or wallet authority.",
      "{\"type\":\"object\",\"required\":[\"q\"],\"additionalProperties\":false,\"properties\":{\"grant\":{\"type\":\"string\"},\"q\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128,\"description\":\"1 to 128 UTF-8 bytes\"},\"topic\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64},\"applies_to\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64},\"after_slug\":{\"type\":\"string\",\"maxLength\":64}}}"},
+    {"wiki_read", "wiki-read", "Read knowledge",
+     "Read an exact retained signed wiki revision as bounded hexadecimal body chunks. Needs the evidence scope. Offset defaults to 0; bytes defaults to 1024 and may shrink to fit the response budget. Replies include signed metadata, text_len and next_offset. A chunk is partial, including the final chunk; reconstruct and verify the complete signed post. Corrupt, evicted, missing and non-wiki revisions refuse. Default wrapper budget is 4096, cap 8192; knowledge grants no execution or retention authority.",
+     "{\"type\":\"object\",\"required\":[\"id\"],\"additionalProperties\":false,\"properties\":{\"grant\":{\"type\":\"string\"},\"id\":{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{64}$\"},\"offset\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":16384},\"bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1024}}}"},
+    {"wiki_write", "wiki-write", "Save knowledge",
+     "Publish PUBLIC wiki knowledge signed by this node and replicated to peers, using an attributable wiki-write grant. Required request_key is a stable token; expected is absent or the exact receiver-held parent revision id. Text is inline UTF-8, at most 16384 bytes: @path is literal text, never a file read. Attribution binds the authenticated grant identity. Current scope, expiry and revocation are checked before retained replay; admitted commits are not canceled by later revocation. Atomic comparison is receiver-local, never distributed global latest. Same grant/key/payload replays its retained original; changed payload or corrupt newest refuses. Returns exact signed readback metadata, stored-body SHA3-256 and revision id for wiki_read reconstruction. Eviction ends replay availability. An uncertain outcome must reconcile using the same request key. No execution or retention lease is granted. Plain prose is readable by exact id; wiki_find discovers valid zcl.fleet_wiki_entry.v1 JSON bodies only.",
+     "{\"type\":\"object\",\"required\":[\"request_key\",\"expected\",\"slug\",\"title\",\"text\"],\"additionalProperties\":false,\"properties\":{\"grant\":{\"type\":\"string\"},\"request_key\":{\"type\":\"string\",\"pattern\":\"^[A-Za-z0-9_.-]{1,128}$\"},\"expected\":{\"type\":\"string\",\"pattern\":\"^(absent|[0-9a-f]{64})$\"},\"slug\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64},\"title\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":128},\"text\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":16384,\"description\":\"Inline UTF-8 text, bounded to 16384 encoded bytes; no file expansion\"}}}"},
 };
 
 static const struct gw_tool *gw_tool_by_name(const char *name)
@@ -1136,7 +1143,7 @@ static void gw_reply_tools_list(struct gw_buf *b, const struct json_value *id)
         /* Read snapshots may contain untrusted peer knowledge.
          * Their world is open; annotations grant no execution authority. */
         if (strcmp(gw_tools[i].verb, "brief") == 0 ||
-            strcmp(gw_tools[i].verb, "wiki-find") == 0)
+            strcmp(gw_tools[i].verb, "wiki-find") == 0 || strcmp(gw_tools[i].verb, "wiki-read") == 0)
             gw_buf_str(b, ",\"annotations\":{\"readOnlyHint\":true,"
                           "\"destructiveHint\":false,\"idempotentHint\":true,"
                           "\"openWorldHint\":true}");
@@ -1904,14 +1911,14 @@ static bool gw_code_find(const char *dir, const char *code, char *grant,
     return found;
 }
 
-/* Space-separated scope subset of brief,send,evidence,terminate,deliver. */
+/* Closed vocabulary; accepting wiki-write does not widen existing grants. */
 static bool gw_scope_comma(const char *scope, char *out, size_t cap)
 {
     static const char *const vocab[] = {"brief", "send", "evidence",
-                                        "terminate", "deliver"};
-    enum { GW_SCOPE_N = 5 };
+                                        "terminate", "deliver", "wiki-write"};
+    enum { GW_SCOPE_N = 6 };
     char copy[128];
-    bool seen[GW_SCOPE_N] = {false, false, false, false, false};
+    bool seen[GW_SCOPE_N] = {false};
     char *tok;
     size_t o = 0, i;
     bool any = false;
@@ -2308,7 +2315,7 @@ static void gw_oauth_wellknown(int fd, const struct gw_config *cfg,
         gw_buf_str(&b, ",\"authorization_servers\":[");
         gw_buf_json_str(&b, issuer);
         gw_buf_str(&b, "],\"scopes_supported\":[\"brief\",\"send\","
-                      "\"evidence\",\"deliver\"],\"bearer_methods_supported\":[\"header\"]}");
+                      "\"evidence\",\"deliver\",\"wiki-write\"],\"bearer_methods_supported\":[\"header\"]}");
     } else {
         gw_buf_str(&b, "\"issuer\":");
         gw_buf_json_str(&b, issuer);
@@ -2329,7 +2336,7 @@ static void gw_oauth_wellknown(int fd, const struct gw_config *cfg,
                       "\"token_endpoint_auth_methods_supported\":[\"none\"],"
                       "\"code_challenge_methods_supported\":[\"S256\"],"
                       "\"scopes_supported\":[\"brief\",\"send\",\"evidence\","
-                      "\"deliver\"]}");
+                      "\"deliver\",\"wiki-write\"]}");
     }
     if (!b.oom && b.p)
         gw_reply(fd, 200, "application/json", b.p, b.len);
@@ -2691,6 +2698,8 @@ static void gw_oauth_authorize_get(int fd, const struct gw_http *h,
                    "<title>Z23 Fleet sign-in</title></head><body>"
                    "<h1>Z23 Fleet sign-in</h1><p>A client requests scopes: ");
     gw_html_escape(&b, az.scope);
+    if (strstr(az.scope, "wiki-write"))
+        gw_buf_str(&b, "</p><p>Wiki writes publish PUBLIC knowledge, signed by this node and replicated to peers. Do not submit private content.");
     gw_buf_str(&b, "</p><p>It will be redirected to: ");
     gw_html_escape(&b, az.redirect);
     gw_buf_str(&b, "</p><form method=\"post\" action=\"/oauth/authorize\">"

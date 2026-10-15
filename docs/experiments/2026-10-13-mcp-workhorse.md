@@ -293,3 +293,42 @@ An exact retained row is selected by `stream`, `row_offset`, `seq` and
 `row_sha3` together, read through one descriptor-bound complete line, and
 refused on any mismatch. The evidence selectors are validated by the node at
 runtime; the gateway schema is flat and declares no `oneOf`.
+
+The evidence-scoped `wiki_read` tool exposes the native signed hex chunks
+through the existing steering adapter, retaining the outer response budget.
+A chunk is a partial projection; reconstruct and verify the complete signed
+post before treating its body as verified. Missing, corrupt, wrong-kind and
+evicted revisions refuse. Grants must hold evidence scope at dispatch.
+
+The write route requires a separately minted `wiki-write` grant and publishes
+PUBLIC knowledge signed by the receiver node and replicated to peers. It binds
+attribution and a stable request key to the exact grant, checks current
+revocation before retained replay, and compares the receiver-local newest
+verified page in one transaction. This is not a distributed global-head claim.
+Replay lasts only while the original revision remains retained. Admission does
+not cancel commits already in flight. The compact success receipt carries the
+actual signed revision identity, body length and SHA3-256; independent
+verification still requires exact chunk reconstruction. Unknown outcomes
+reconcile with the same request key rather than a new one. Owner approved the
+remote wiki-write route on 2026-10-14; direct `fleet.wiki.write` stays
+never-remote and no existing grant gains the scope.
+
+`text` is inline UTF-8. `@path` is literal content, not file expansion. Plain
+prose is valid wiki content and remains readable by exact id, while `wiki_find`
+discovers valid `zcl.fleet_wiki_entry.v1` JSON bodies. A searchable inline body
+is:
+
+```json
+{"schema":"zcl.fleet_wiki_entry.v1","topic":"kernel","summary":"A bounded boot lesson","lessons":[{"rule":"Check the exact boot transcript","why":"Startup alone does not prove guest behavior","evidence":"An exact accepted test receipt"}],"applies_to":["z23-kernel"],"updated":"2026-10-14T00:00:00Z"}
+```
+
+Pass that JSON string as `text`, along with `request_key`, `expected: "absent"`,
+`slug` and `title`. Native CLI callers can use JSON input; the global `--format`
+flag selects command output and is not an entry-format selector.
+
+`WIKI_CLOCK` means the new revision's signed timestamp is not strictly later
+than the newest retained revision of the slug, for example a second write in
+the same wall-clock second or a peer revision signed by a later clock. Nothing
+was committed. Retry with the same `request_key` and `expected` once this
+node's clock is past that revision; only a successful commit retains the
+request marker, so a refused attempt does not consume the key.

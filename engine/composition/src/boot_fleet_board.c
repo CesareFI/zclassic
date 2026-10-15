@@ -619,15 +619,8 @@ void boot_fleet_board_announce(const uint8_t id[32])
     msg_processor_flood_message(mp, "zpkgswm", frame, frame_len);
 }
 
-enum fleet_board_result boot_fleet_board_publish(
-    struct fleet_board_post *post, int64_t now)
+static enum fleet_board_result fleet_board_sign_local(struct fleet_board_post *post)
 {
-    if (!post)
-        return FLEET_BOARD_ERR_ARGS;
-    struct node_db *ndb = fleet_board_db();
-    if (!ndb)
-        return FLEET_BOARD_ERR_ARGS;
-
     uint8_t seed[32], pubkey[32];
     char why[256];
     if (!boot_fleet_board_identity(seed, pubkey, why, sizeof(why))) {
@@ -636,6 +629,18 @@ enum fleet_board_result boot_fleet_board_publish(
     }
     enum fleet_board_result r = fleet_board_post_sign(post, seed, pubkey);
     memset(seed, 0, sizeof(seed));
+    return r;
+}
+
+enum fleet_board_result boot_fleet_board_publish(
+    struct fleet_board_post *post, int64_t now)
+{
+    if (!post)
+        return FLEET_BOARD_ERR_ARGS;
+    struct node_db *ndb = fleet_board_db();
+    if (!ndb)
+        return FLEET_BOARD_ERR_ARGS;
+    enum fleet_board_result r = fleet_board_sign_local(post);
     if (r != FLEET_BOARD_OK)
         return r;
 
@@ -650,4 +655,22 @@ enum fleet_board_result boot_fleet_board_publish(
     if (post->scope != FLEET_BOARD_SCOPE_FLEET)
         boot_fleet_board_announce(post->id);
     return FLEET_BOARD_OK;
+}
+
+enum fleet_board_wiki_write_status boot_fleet_board_wiki_write(
+    struct fleet_board_post *post, const uint8_t *expected, int64_t now,
+    struct db_fleet_board_post *out, enum fleet_board_result *refusal)
+{
+    struct node_db *ndb = fleet_board_db();
+    if (!post || !ndb || !out || !refusal) {
+        LOG_WARN("fleet.board", "wiki mutation signing context unavailable");
+        return FLEET_WIKI_WRITE_ARGS;
+    }
+    *refusal = fleet_board_sign_local(post);
+    if (*refusal != FLEET_BOARD_OK) return FLEET_WIKI_WRITE_REFUSED;
+    enum fleet_board_wiki_write_status status =
+        db_fleet_board_wiki_write(ndb, post, expected, now, out, refusal);
+    if (status == FLEET_WIKI_WRITE_OK && post->scope != FLEET_BOARD_SCOPE_FLEET)
+        boot_fleet_board_announce(out->post.id);
+    return status;
 }

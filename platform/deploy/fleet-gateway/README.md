@@ -336,6 +336,23 @@ This documents source behavior. An existing deployment advertises the tool
 only after its qualified gateway and node binaries are updated through the
 owner-approved deployment procedure.
 
+# Wiki read and write
+
+`wiki_read(id, offset, bytes)` returns one hex chunk of an exact retained signed
+revision and needs the `evidence` scope. Every chunk is partial: reconstruct the
+whole post and verify its signature locally.
+
+`wiki_write` needs the separate `wiki-write` scope and publishes PUBLIC
+knowledge signed by the selected node. No existing grant gains the scope; the
+owner mints it explicitly, and the sign-in page names the publication
+consequence. A write names a stable `request_key` and the exact `expected`
+parent revision (`absent` for a new slug). Repeating the same grant, key and
+payload returns the retained original without a new revision. A
+`WIKI_CLOCK` refusal means the node's clock is not past the slug's newest
+retained revision and nothing was committed: retry the same `request_key` and
+`expected` after the clock advances.
+
+
 # Exact retained mail
 
 `steer_evidence(type="mail", ref=...)` keeps its latest-held behavior. To

@@ -1267,6 +1267,10 @@ REMOTE_COMMAND_CLASS("fleet.steer.deliver", REMOTE_CLASS_OWNER_CAPABILITY,
     "one source chunk into the inert quarantine inbox behind a live owner-minted grant naming deliver")
 REMOTE_COMMAND_CLASS("fleet.steer.wiki-find", REMOTE_CLASS_OWNER_CAPABILITY,
     "one bounded evidence object behind a live owner-minted grant naming evidence")
+REMOTE_COMMAND_CLASS("fleet.steer.wiki-read", REMOTE_CLASS_OWNER_CAPABILITY,
+    "one bounded retained wiki revision chunk behind a live owner-minted grant naming evidence")
+REMOTE_COMMAND_CLASS("fleet.steer.wiki-write", REMOTE_CLASS_OWNER_CAPABILITY,
+    "bounded public signed wiki mutation behind an attributable live wiki-write grant, idempotent by grant-bound request key")
 REMOTE_COMMAND_CLASS("fleet.steer.inbox", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.steer.drop", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("fleet.steer.grant", REMOTE_CLASS_NEVER, "")

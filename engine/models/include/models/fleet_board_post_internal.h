@@ -80,4 +80,17 @@ bool fleet_board_wiki_bytes_fit(struct node_db *ndb, int64_t body_bytes);
  * the board write lock. */
 bool fleet_board_wiki_evict_allowed(int64_t now);
 void fleet_board_wiki_evict_note(int64_t now);
+
+/* Mutation sibling shares the canonical writer and AR insertion. The caller
+ * owns the board lock and, for remove/append, its one database transaction. */
+void fleet_board_write_lock(void);
+void fleet_board_write_unlock(void);
+int64_t fleet_board_arrival_checkpoint(void);
+void fleet_board_arrival_restore(int64_t high);
+enum fleet_board_result fleet_board_ingest_prepare(struct node_db *ndb,
+    const struct fleet_board_post *post, int64_t now, size_t *body_len, bool *known);
+enum fleet_board_result fleet_board_append_record(struct node_db *ndb,
+    const struct fleet_board_post *post, int64_t now, size_t body_len);
+bool fleet_board_remove_and_relink(struct node_db *ndb,
+    const struct fleet_board_post *post, const uint8_t victim[32]);
 #endif /* ZCL_DB_MODEL_FLEET_BOARD_POST_INTERNAL_H */

@@ -42,6 +42,7 @@
 #include "vcs/package_manifest.h"
 #include "vcs/package_recipe.h"
 #include "vcs/package_release.h"
+#include "session/fleet_board_proto.h"
 
 #include <string.h>
 
@@ -98,6 +99,13 @@ static size_t input_member_budget(const char *key, size_t key_len)
 size_t zcl_command_registry_input_budget_bytes(
     const struct zcl_command_spec *spec)
 {
+    /* The wiki-write leaf admits a signed 16KiB UTF-8 body. Each input
+     * byte can become six JSON escape bytes; metadata uses the codec's
+     * existing bounded fields, with slack for the credential and syntax.
+     * Other leaves retain their existing input bounds. */
+    if (spec && spec->path && !strcmp(spec->path, "fleet.steer.wiki-write"))
+        return 6u * (FLEET_BOARD_WIKI_TEXT_MAX + FLEET_BOARD_TITLE_MAX +
+            FLEET_BOARD_SLUG_MAX + FLEET_BOARD_AGENT_MAX + FLEET_BOARD_RECEIPT_MAX) + 1024u;
     size_t total = 3; /* '{', '}', NUL */
     const char *csv = spec ? spec->input_keys : NULL;
     char token[128];

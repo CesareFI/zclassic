@@ -45,8 +45,29 @@ bool command_registry_reply_add_describe_next(
                                       reason);
 }
 
+const char *command_registry_wiki_effect(const struct zcl_command_spec *spec,
+                                         const struct zcl_command_error *error)
+{
+    if (!spec || !spec->path || !error || strcmp(spec->path, "fleet.steer.wiki-write")) return NULL;
+    static const struct { const char *state; const char *effect; } states[] = {
+        {"committed", "committed"}, {"committed_receipt_unavailable", "committed"},
+        {"retained_replay", "retained_replay"},
+        {"retained_replay_receipt_unavailable", "retained_replay"},
+        {"outcome_unknown", "unknown"}};
+    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); i++)
+        if (!strcmp(error->current_state, states[i].state)) return states[i].effect;
+    return NULL;
+}
+
+bool command_registry_effect_possible(const char *effect,
+                                      const struct zcl_command_error *error)
+{
+    return effect ? strcmp(effect, "retained_replay") != 0 : error->mutated;
+}
+
 static bool push_error_required(struct json_value *object,
-                                const struct zcl_command_error *error)
+                                const struct zcl_command_error *error,
+                                const char *effect)
 {
     return json_push_kv_str(object, "code", error->code) &&
            json_push_kv_str(object, "error_code", error->code) &&
@@ -55,14 +76,14 @@ static bool push_error_required(struct json_value *object,
            json_push_kv_str(object, "current_state",
                             error->current_state[0] ? error->current_state
                                                     : "REQUEST_FAILED") &&
-           json_push_kv_bool(object, "retryable", error->retryable) &&
+           json_push_kv_bool(object, "retryable", effect ? false : error->retryable) &&
            json_push_kv_bool(object, "human_action_required",
-                             error->human_action_required) &&
+                             effect ? true : error->human_action_required) &&
            json_push_kv_str(object, "next_action",
-                            error->next_action[0]
+                            effect ? "reconcile the same request_key; do not issue a new key" : error->next_action[0]
                                 ? error->next_action
                                 : "follow the first next command") &&
-           json_push_kv_bool(object, "mutated", error->mutated);
+           json_push_kv_bool(object, "mutated", command_registry_effect_possible(effect, error));
 }
 
 static bool push_error_optional(struct json_value *object,
@@ -76,7 +97,22 @@ static bool push_error_optional(struct json_value *object,
     return ok;
 }
 
+static bool error_effect_complete(const struct json_value *object,
+    const struct zcl_command_error *error, const char *effect)
+{
+    if (!effect) return true;
+    const char *state = json_get_str(json_get(object, "current_state"));
+    const char *actual = json_get_str(json_get(object, "effect_outcome"));
+    const char *action = json_get_str(json_get(object, "next_action"));
+    const struct json_value *mutated = json_get(object, "mutated");
+    return state && !strcmp(state, error->current_state) && actual && !strcmp(actual, effect) &&
+        action && !strcmp(action, "reconcile the same request_key; do not issue a new key") &&
+        mutated && mutated->type == JSON_BOOL &&
+        json_get_bool(mutated) == command_registry_effect_possible(effect, error);
+}
+
 bool command_registry_push_error(struct json_value *root,
+                                 const struct zcl_command_spec *spec,
                                  const struct zcl_command_error *error)
 {
     struct json_value object, blockers;
@@ -84,10 +120,14 @@ bool command_registry_push_error(struct json_value *root,
     json_init(&blockers);
     json_set_object(&object);
     json_set_array(&blockers);
-    bool ok = push_error_required(&object, error) &&
+    const char *effect = command_registry_wiki_effect(spec, error);
+    bool ok = push_error_required(&object, error, effect) &&
               push_error_optional(&object, error) &&
-              json_push_kv(&object, "blockers", &blockers) &&
-              json_push_kv(root, "error", &object);
+              json_push_kv(&object, "blockers", &blockers);
+    if (ok && effect) ok = json_push_kv_str(&object, "effect_outcome", effect);
+    ok = ok && error_effect_complete(&object, error, effect) &&
+        json_push_kv(root, "error", &object) &&
+        error_effect_complete(json_get(root, "error"), error, effect);
     json_free(&blockers);
     json_free(&object);
     return ok;
@@ -250,7 +290,7 @@ static bool serialize_body(struct json_value *root,
                                                  : spec->output_schema) &&
              json_push_kv(root, "data", &reply->data);
     } else {
-        ok = ok && command_registry_push_error(root, &reply->error);
+        ok = ok && command_registry_push_error(root, spec, &reply->error);
         if (reply->next_count == 0) {
             ok = ok && command_registry_reply_add_describe_next(
                 reply, spec,

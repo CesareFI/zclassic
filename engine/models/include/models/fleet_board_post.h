@@ -151,6 +151,25 @@ enum fleet_board_result db_fleet_board_post_ingest(
     struct node_db *ndb, const struct fleet_board_post *post, int64_t now,
     bool *stored_out);
 
+enum fleet_board_wiki_write_status {
+    FLEET_WIKI_WRITE_OK, FLEET_WIKI_WRITE_REPLAY,
+    FLEET_WIKI_WRITE_ARGS, FLEET_WIKI_WRITE_CONFLICT,
+    FLEET_WIKI_WRITE_CORRUPT, FLEET_WIKI_WRITE_COLLISION,
+    FLEET_WIKI_WRITE_CLOCK, FLEET_WIKI_WRITE_BUSY,
+    FLEET_WIKI_WRITE_STORAGE, FLEET_WIKI_WRITE_REFUSED,
+};
+/* Atomically compare this receiver's strict newest retained slug revision
+ * across local authors, then append through the canonical AR writer. NULL
+ * expected means absent; otherwise it names the exact parent. Receipt is a
+ * caller-bound request marker. A retained exact-payload replay returns its
+ * signed object even after supersession; eviction ends this bounded replay
+ * claim. Corrupt/ambiguous retained rows refuse, never fall back to an older
+ * head. Caller admission and signing remain composition responsibilities. */
+enum fleet_board_wiki_write_status db_fleet_board_wiki_write(
+    struct node_db *ndb, const struct fleet_board_post *post,
+    const uint8_t *expected, int64_t now, struct db_fleet_board_post *out,
+    enum fleet_board_result *refusal);
+
 /* What one reclaim pass did. DEFERRED is not a failure: the pass owns the
  * whole transaction it needs, so finding somebody else's already open means
  * "not this tick" — an ordinary race with the node's own writers, and the

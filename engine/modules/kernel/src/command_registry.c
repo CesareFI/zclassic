@@ -703,10 +703,33 @@ static void execute_check_contract(struct zcl_command_reply *reply,
     }
 }
 
+static size_t execute_wiki_fallback(char *out, size_t capacity, size_t budget,
+    const struct zcl_command_reply *reply, const char *effect)
+{
+    if (!out || capacity == 0) return 0;
+    int n = snprintf(out, capacity,
+        "{\"schema\":\"zcl.result.v1\",\"command\":\"fleet.steer.wiki-write\","
+        "\"ok\":false,\"status\":\"failed\",\"request_id\":\"local-overflow\",\"elapsed_us\":0,"
+        "\"error\":{\"code\":\"RESPONSE_BUDGET_EXCEEDED\",\"error_code\":\"RESPONSE_BUDGET_EXCEEDED\","
+        "\"message\":\"bounded wiki receipt could not be serialized\",\"phase\":\"serialize\","
+        "\"current_state\":\"%s\",\"effect_outcome\":\"%s\",\"retryable\":false,"
+        "\"human_action_required\":true,\"next_action\":\"reconcile the same request_key; do not issue a new key\","
+        "\"mutated\":%s,\"blockers\":[]},\"next\":[]}", reply->error.current_state,
+        effect, command_registry_effect_possible(effect, &reply->error) ? "true" : "false");
+    if (n <= 0 || (size_t)n >= capacity || (budget && (size_t)n > budget)) {
+        out[0] = '\0';
+        return 0;
+    }
+    return (size_t)n;
+}
+
 static size_t execute_fallback(char *out, size_t out_size, size_t budget_bytes,
+                               const struct zcl_command_spec *spec,
                                struct zcl_command_reply *reply)
 {
     reply->exit_code = ZCL_COMMAND_EXIT_INTERNAL;
+    const char *effect = command_registry_wiki_effect(spec, &reply->error);
+    if (effect) return execute_wiki_fallback(out, out_size, budget_bytes, reply, effect);
     static const char fallback[] =
         "{\"schema\":\"zcl.result.v1\",\"command\":\"internal\","
         "\"ok\":false,\"status\":\"failed\","
@@ -783,7 +806,7 @@ size_t zcl_command_registry_execute_json(
         budget_bytes, execute_session_presented(context), &policy, out,
         out_size);
     if (result == 0)
-        result = execute_fallback(out, out_size, budget_bytes, &reply);
+        result = execute_fallback(out, out_size, budget_bytes, spec, &reply);
     if (exit_code)
         *exit_code = reply.exit_code;
     handler_snapshot_release(held);

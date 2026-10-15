@@ -15,8 +15,10 @@
  */
 
 #include "command/native_command.h"
+#include "command/native_fleet.h"
 
 #include "controllers/rpc_client.h"
+#include "base/safe_alloc.h"
 #include "json/json.h"
 #include "kernel/command_registry.h"
 #include "platform/time_compat.h"
@@ -250,11 +252,53 @@ static char *fb_rpc_call(struct zcl_command_reply *reply, const char *params,
 
 /* One round trip. On success `body` holds the node's reply object and the
  * caller owns it; on failure the reply is already filled in. */
-static bool fb_call(struct zcl_command_reply *reply, struct json_value *in,
-                    struct json_value *body, int64_t deadline_ms)
+static bool fb_body_transport_error(const struct json_value *body)
 {
-    char params[FLEET_BOARD_RPC_PARAMS_MAX];
-    if (!fb_params(in, params, sizeof(params))) {
+    const struct json_value *err = json_get(body, "error");
+    const struct json_value *code = json_get(body, "code");
+    const struct json_value *msg = json_get(body, "message");
+    return (err && !json_is_null(err)) ||
+        (code && code->type == JSON_INT && msg && msg->type == JSON_STR);
+}
+
+static bool fb_body_accepted(struct zcl_command_reply *reply, struct json_value *body)
+{
+    const struct json_value *ok = json_get(body, "ok");
+    bool board_answered = ok && ok->type == JSON_BOOL;
+    bool transport_error = fb_body_transport_error(body);
+    if (!board_answered && transport_error) {
+        fb_handle_no_answer(reply, body);
+        json_free(body);
+        return false;
+    }
+    if (transport_error) {
+        const struct json_value *err = json_get(body, "error");
+        const char *msg = err && err->type == JSON_OBJ ? json_get_str(json_get(err, "message")) : NULL;
+        fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
+            "BOARD_RPC_ERROR", "execute", false,
+            msg && msg[0] ? msg : "the node reported an error", "fleet.board");
+        json_free(body);
+        return false;
+    }
+    if (ok && ok->type == JSON_BOOL && !json_get_bool(ok)) {
+        fb_board_refusal(reply, body);
+        json_free(body);
+        return false;
+    }
+    return true;
+}
+
+static bool fb_call_bounded(struct zcl_command_reply *reply, struct json_value *in,
+                    struct json_value *body, int64_t deadline_ms, size_t capacity)
+{
+    char *params = zcl_malloc(capacity, "fleet_board_rpc_params");
+    if (!params) {
+        fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
+            "RPC_INPUT_ALLOC", "prepare", false, "bounded board RPC input allocation failed", "fleet.board");
+        return false;
+    }
+    if (!fb_params(in, params, capacity)) {
+        free(params);
         fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_INVALID,
                 "INPUT_TOO_LARGE", "normalize", false,
                 "the request does not fit one board call; a wiki page is "
@@ -262,6 +306,7 @@ static bool fb_call(struct zcl_command_reply *reply, struct json_value *in,
         return false;
     }
     char *raw = fb_rpc_call(reply, params, deadline_ms);
+    free(params);
     if (!raw)
         return false;
     if (!json_read(body, raw, strlen(raw)) || body->type != JSON_OBJ) {
@@ -280,37 +325,13 @@ static bool fb_call(struct zcl_command_reply *reply, struct json_value *in,
      * answers with an `ok` field, so an error body WITHOUT one never reached
      * the board — no node, wrong datadir, or no auth cookie — and the caller
      * needs endpoint and authentication diagnosis before any startup. */
-    const struct json_value *ok = json_get(body, "ok");
-    const struct json_value *err = json_get(body, "error");
-    const struct json_value *bare_code = json_get(body, "code");
-    const struct json_value *bare_msg = json_get(body, "message");
-    bool board_answered = ok && ok->type == JSON_BOOL;
-    bool transport_error =
-        (err && !json_is_null(err)) ||
-        (bare_code && bare_code->type == JSON_INT && bare_msg &&
-         bare_msg->type == JSON_STR);
-    if (!board_answered && transport_error) {
-        fb_handle_no_answer(reply, body);
-        json_free(body);
-        return false;
-    }
-    if (transport_error) {
-        const char *msg = err && err->type == JSON_OBJ
-                              ? json_get_str(json_get(err, "message"))
-                              : NULL;
-        fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
-                "BOARD_RPC_ERROR", "execute", false,
-                msg && msg[0] ? msg : "the node reported an error",
-                "fleet.board");
-        json_free(body);
-        return false;
-    }
-    if (ok && ok->type == JSON_BOOL && !json_get_bool(ok)) {
-        fb_board_refusal(reply, body);
-        json_free(body);
-        return false;
-    }
-    return true;
+    return fb_body_accepted(reply, body);
+}
+
+static bool fb_call(struct zcl_command_reply *reply, struct json_value *in,
+                    struct json_value *body, int64_t deadline_ms)
+{
+    return fb_call_bounded(reply, in, body, deadline_ms, FLEET_BOARD_RPC_PARAMS_MAX);
 }
 
 /* Copy `key` from the request input into the outgoing object, falling back to
@@ -724,6 +745,31 @@ void zcl_native_handle_fleet_wiki_read(
         return;
     fb_project_object(reply, &body);
     json_free(&body);
+}
+
+void zcl_native_fleet_wiki_write_rpc(const struct zcl_command_request *request,
+    struct zcl_command_reply *reply)
+{
+    struct json_value input, body;
+    json_init(&input);
+    json_init(&body);
+    if (!json_copy_checked(&input, request->input) ||
+        !json_push_kv_str(&input, "op", "wiki_write")) {
+        fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
+            "WIKI_PREPARE", "prepare", false, "wiki request projection failed", "json");
+    } else if (fb_call_bounded(reply, &input, &body, 0,
+        zcl_command_registry_input_budget_bytes(request->spec))) {
+        bool replayed = false;
+        bool verified = zcl_native_fleet_wiki_receipt_matches(&body, &input, &replayed);
+        fb_project_object(reply, &body);
+        if (verified) {
+            reply->error.mutated = !replayed;
+            (void)snprintf(reply->error.current_state, sizeof(reply->error.current_state),
+                "%s", replayed ? "retained_replay" : "committed");
+        }
+    }
+    json_free(&body);
+    json_free(&input);
 }
 
 /* ── fleet wiki list ────────────────────────────────────────────────── */

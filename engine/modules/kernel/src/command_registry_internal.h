@@ -89,7 +89,12 @@ bool command_registry_reply_add_describe_next(
     struct zcl_command_reply *reply, const struct zcl_command_spec *spec,
     const char *reason);
 bool command_registry_push_error(struct json_value *root,
+                                 const struct zcl_command_spec *spec,
                                  const struct zcl_command_error *error);
+const char *command_registry_wiki_effect(const struct zcl_command_spec *spec,
+                                         const struct zcl_command_error *error);
+bool command_registry_effect_possible(const char *effect,
+                                      const struct zcl_command_error *error);
 bool command_registry_push_next_array(
     struct json_value *root, const struct zcl_command_reply *reply,
     const struct zcl_command_registry *registry,

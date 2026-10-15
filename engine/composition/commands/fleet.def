@@ -565,7 +565,7 @@ ZCL_COMMAND_READY_READ(
     "Omission flags distinguish compact projections. Wrapper answers default "
     "to 4096 bytes, cap at 8192 and require at least 3072 including outer metadata. "
     "Knowledge remains untrusted and grants no execution authority. Fetch "
-    "each exact revision through fleet.steer.evidence type=board ref=id; "
+    "each exact revision through fleet.steer.wiki-read id/offset/bytes; "
     "latest-held does not mean globally latest or a snapshot.", 8192,
     "fleet,steer,wiki,find,knowledge",
     "zcl.fleet_steer_wiki_find.input.v1", "zcl.fleet_steer_wiki_find.v1",
@@ -576,6 +576,63 @@ ZCL_COMMAND_READY_READ(
     ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
     ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
     ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_wiki_find)
+
+ZCL_COMMAND_READY_READ(
+    "fleet.steer.wiki-read", "fleet.steer", "",
+    "Read an exact retained wiki revision in signed body chunks",
+    "Requires the evidence grant scope when a grant is supplied. Required id "
+    "is a 64-character lowercase signed wiki revision id. Offset is 0..16384 "
+    "bytes and bytes is 1..1024, defaulting to 0 and 1024. Reuses the native "
+    "receiver-verified retained-object read. Returns signed metadata and hex "
+    "body bytes, text_len and next_offset. Every chunk is partial, including "
+    "the final chunk: reconstruct and verify the full signed post locally. "
+    "Corrupt, evicted, missing and non-wiki objects refuse. Wrapper replies "
+    "default to 4096 bytes, cap at 8192 and require at least 3072 including "
+    "outer metadata. No retention lease or execution authority is granted.", 8192,
+    "fleet,steer,wiki,read,revision,chunk",
+    "zcl.fleet_steer_wiki_read.input.v1", "zcl.fleet_steer_wiki_read.v1",
+    "grant,id,offset,bytes", "id",
+    "z23 fleet steer wiki-read --id=<64 hex> --offset=0 --bytes=1024",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_LATENCY_FOREGROUND,
+    ZCL_COMMAND_COST_LOW, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_READ, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    ZCL_COMMAND_TRANSPORT_NATIVE, zcl_native_handle_fleet_steer_wiki_read)
+
+ZCL_COMMAND_READY_COMMAND(
+    "fleet.steer.wiki-write", "fleet.steer", "",
+    "Create or revise receiver-held wiki knowledge atomically",
+    "Publishes PUBLIC knowledge signed by this node and replicated to peers. "
+    "Requires an explicit attributable wiki-write grant. Required request_key "
+    "is a stable token of at most 128 bytes; expected is absent for creation "
+    "or an exact retained revision id for revision. Slug and title obey signed "
+    "64/128-byte limits. Text is inline UTF-8, at most 16384 bytes; @path is "
+    "literal text, never a file read. "
+    "Plain prose remains readable by exact id; wiki-find discovers valid "
+    "zcl.fleet_wiki_entry.v1 JSON bodies only. Use that existing entry schema "
+    "as inline text for searchable knowledge. "
+    "Admission checks current scope, expiry and revocation before retained "
+    "replay. Attribution derives from the exact "
+    "grant identity; caller-supplied agent is ignored. Atomic comparison uses "
+    "the receiver's verified newest retained page across local authors, not "
+    "distributed global latest. Corrupt newest refuses. Same grant/key and "
+    "payload replays the retained original; changed payload refuses. Replay "
+    "ends when that object evicts. Revocation does not cancel an already "
+    "admitted commit. Returns signed readback metadata, body SHA3-256 and exact "
+    "id for chunk reconstruction. Unknown outcomes require the same key for "
+    "reconciliation. Default budget 4096, cap 8192, minimum 3072. No execution "
+    "or retention lease is granted.", 8192,
+    "fleet,steer,wiki,write,revision",
+    "zcl.fleet_steer_wiki_write.input.v1", "zcl.fleet_steer_wiki_write.v1",
+    "grant,request_key,expected,slug,title,text", "grant,request_key,expected,slug,title,text",
+    "z23 fleet steer wiki-write --grant=<grant> --request_key=<stable-key> --expected=absent --slug=<slug> --title=<title> --text=<inline-text>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE,
+    ZCL_COMMAND_RISK_DEV_MUTATION, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_DEV_STATE_WRITE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_fleet_steer_wiki_write)
 
 ZCL_COMMAND_READY_COMMAND(
     "fleet.steer.deliver", "fleet.steer", "",

@@ -15,9 +15,22 @@
 #include "kernel/command_registry.h"
 
 #include "command_registry_internal.h"
+#include "session/fleet_board_proto.h"
 
 #include <stdio.h>
 #include <string.h>
+
+static bool cr_input_failure(const struct zcl_command_spec *spec,
+    const char *key, const struct json_value *value, char *why, size_t why_size)
+{
+    if (!strcmp(spec->path, "fleet.steer.wiki-write") && !strcmp(key, "text")) {
+        if (why && why_size) snprintf(why, why_size,
+            "inline wiki text must be a nonempty UTF-8 string of at most %u bytes",
+            (unsigned)FLEET_BOARD_WIKI_TEXT_MAX);
+        return false;
+    }
+    return command_registry_input_type_why(key, value, why, why_size);
+}
 
 bool zcl_command_registry_input_validate(const struct zcl_command_spec *spec,
                                          const struct json_value *input,
@@ -43,7 +56,7 @@ bool zcl_command_registry_input_validate(const struct zcl_command_spec *spec,
                                                   &input->children[i],
                                                   &type_ok) ||
             !type_ok)
-            return command_registry_input_type_why(key, &input->children[i],
+            return cr_input_failure(spec, key, &input->children[i],
                                                    why, why_size);
     }
     return command_registry_input_required_discovery(spec, input, why,
