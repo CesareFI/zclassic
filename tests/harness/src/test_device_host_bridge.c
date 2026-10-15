@@ -676,12 +676,13 @@ struct psk_io_fixture {
     struct device_host_psk_bridge client, server; struct device_host_psk_bridge_spec client_spec, server_spec;
     int carrier[2], plain[2], listener, target; uint16_t port;
     const clock_iface_t *previous; clock_iface_t clock; int64_t wall_ms;
-    atomic_bool cancelled; unsigned generation;
+    atomic_bool cancelled; unsigned generation; int64_t frozen_ns;
     bool revoke_at_plaintext, revocation_attempted, revocation_published;
 };
 static int64_t psk_io_fixture_mono(void *opaque)
 {
-    struct psk_io_fixture *f = opaque; return f->previous->now_monotonic_ns(f->previous->self);
+    struct psk_io_fixture *f = opaque;
+    return f->frozen_ns ? f->frozen_ns : f->previous->now_monotonic_ns(f->previous->self);
 }
 static int64_t psk_io_fixture_wall(void *opaque)
 {
@@ -1383,6 +1384,8 @@ static int psk_io_midstream_authority(unsigned mode)
     TEST_CASE("host PSK IO: revoke, rotation or stranded intent committed mid-stream stops every further server record") {
         ASSERT(psk_io_fixture_open(&f, 0, false)); ASSERT(psk_io_fixture_admit(&f)); ASSERT(psk_io_fixture_ready(&f));
         uint8_t bytes[4096]; for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = (uint8_t)(i * 7 + mode);
+        /* Freeze the monotonic source so a slow run cannot age the server cache past its window. */
+        f.frozen_ns = psk_io_fixture_mono(&f);
         uint64_t cached0 = 0, cached1 = 0; device_pairing_test_guard_counts(NULL, &cached0);
         for (unsigned i = 0; i < 4; ++i) {
             ASSERT(psk_io_transfer(&f, f.plain[0], f.target, bytes, sizeof(bytes)));
@@ -1392,6 +1395,9 @@ static int psk_io_midstream_authority(unsigned mode)
         ASSERT_EQ(send(f.plain[0], bytes, sizeof(bytes), MSG_NOSIGNAL), sizeof(bytes));
         ASSERT_EQ(send(f.target, bytes, sizeof(bytes), MSG_NOSIGNAL), sizeof(bytes));
         for (unsigned i = 0; i < 8; ++i) ASSERT(psk_io_live_result(typed_test_device_host_psk_bridge_step(&f.client)));
+        /* The change must land on a live, fresh cache so the cheap path is what observes it. */
+        const struct device_pairing_guard_cache *cache = &f.server.session.authority;
+        ASSERT(cache->valid); ASSERT(f.frozen_ns - cache->validated_ns < DEVICE_PAIRING_GUARD_CACHE_NS);
         ASSERT(psk_io_change_server(&f, mode));
         struct device_host_psk_bridge_observation before = f.server.observation;
         enum device_host_bridge_result result = DEVICE_HOST_BRIDGE_PROGRESS;
