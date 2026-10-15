@@ -26,6 +26,7 @@
 #include "models/zid_identity.h"
 #include "net/net.h"
 #include "net/noise_transport.h"
+#include "services/p2p_node_noise.h"
 #include "platform/time_compat.h"
 #include "services/mesh_pairing_service.h"
 #include "util/log_macros.h"
@@ -403,8 +404,7 @@ struct p2p_node *boot_mesh_find_session_peer(
     for (size_t i = 0; i < count; i++) {
         struct noise_transport_snapshot snapshot;
         memset(&snapshot, 0, sizeof(snapshot));
-        if (!found && candidates[i]->transport &&
-            noise_transport_snapshot(candidates[i]->transport, &snapshot) &&
+        if (!found && p2p_node_noise_snapshot(candidates[i], &snapshot) &&
             snapshot.established &&
             memcmp(snapshot.remote_static, peer_noise, 32) == 0) {
             found = candidates[i];
@@ -454,10 +454,14 @@ static bool mesh_observe_inspect(struct p2p_node *held[], size_t count,
     for (size_t i = 0; i < count; i++) {
         struct noise_transport_snapshot snapshot;
         memset(&snapshot, 0, sizeof(snapshot));
-        const struct noise_transport *transport = held[i]->transport;
-        if (!transport)
+        /* One read under the node's cs_recv: the socket thread frees the
+         * transport there on a plaintext fallback, so the pointer and the
+         * snapshot must come from the same critical section. */
+        enum p2p_node_noise_phase phase =
+            p2p_node_noise_read(held[i], &snapshot);
+        if (phase == P2P_NODE_NOISE_NONE)
             *lost_transport = true;
-        else if (noise_transport_snapshot(transport, &snapshot) &&
+        else if (snapshot.established &&
                  memcmp(snapshot.remote_static, peer_noise, 32) == 0)
             return true;
     }
@@ -730,9 +734,7 @@ static void mesh_respond(struct msg_processor *mp, struct p2p_node *node,
 {
     struct noise_transport_snapshot session;
     memset(&session, 0, sizeof(session));
-    if (!node->transport ||
-        !noise_transport_snapshot(node->transport, &session) ||
-        !session.established) {
+    if (!p2p_node_noise_snapshot(node, &session) || !session.established) {
         /* Plaintext v1 or mid-handshake: drop with NO receipt — responder
          * keys and signatures never cross an unauthenticated channel. The
          * requester's local timeout is the honest signal. */
@@ -903,9 +905,7 @@ static void mesh_receive(struct p2p_node *node, const uint8_t *wire,
     }
     struct noise_transport_snapshot session;
     memset(&session, 0, sizeof(session));
-    if (!node->transport ||
-        !noise_transport_snapshot(node->transport, &session) ||
-        !session.established) {
+    if (!p2p_node_noise_snapshot(node, &session) || !session.established) {
         atomic_fetch_add(&g_mesh_dropped_unauthenticated, 1);
         return;
     }

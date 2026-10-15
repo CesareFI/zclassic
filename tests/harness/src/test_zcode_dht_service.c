@@ -2629,12 +2629,14 @@ static int test_peer_admission_order(void) {
     struct p2p_node node;
     memset(&node, 0, sizeof(node));
     node.transport = (struct noise_transport *)(uintptr_t)1;
+    zcl_mutex_init(&node.cs_recv); /* peer_ready locks it, as on a real node */
     atomic_store(&node.state, PEER_VERSION_RECEIVED);
     ASSERT(!boot_zcode_dht_peer_ready(&node));
     atomic_store(&node.state, PEER_HANDSHAKE_COMPLETE);
     ASSERT(boot_zcode_dht_peer_ready(&node));
     atomic_store(&node.disconnect, true);
     ASSERT(!boot_zcode_dht_peer_ready(&node));
+    zcl_mutex_destroy(&node.cs_recv);
     PASS();
   }
 _test_next:;

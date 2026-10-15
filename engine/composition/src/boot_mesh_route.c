@@ -10,6 +10,7 @@
 #include "net/connman.h"
 #include "net/net.h"
 #include "net/noise_transport.h"
+#include "services/p2p_node_noise.h"
 #include "services/subordinate_work_admission.h"
 #include "util/log_macros.h"
 #include "util/sync.h"
@@ -181,8 +182,7 @@ static enum boot_mesh_route_observation route_observe_peer(
         struct p2p_node *peer = peers[i];
         struct noise_transport_snapshot snapshot;
         memset(&snapshot, 0, sizeof(snapshot));
-        if (peer->transport &&
-            noise_transport_snapshot(peer->transport, &snapshot) &&
+        if (p2p_node_noise_snapshot(peer, &snapshot) &&
             snapshot.established) {
             if (memcmp(snapshot.remote_static, expected_static, 32) == 0 &&
                 !matched) {

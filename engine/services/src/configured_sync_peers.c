@@ -11,6 +11,7 @@
 #include "sync/sync_planner.h"
 #include "net/netbase.h"
 #include "net/noise_transport.h"
+#include "services/p2p_node_noise.h"
 #include "base/cleanse.h"
 #include "platform/socket_compat.h"
 #include "platform/time_compat.h"
@@ -179,7 +180,7 @@ static bool session_remote_static(const struct p2p_node *node,
                                   uint8_t out_static[32])
 {
     struct noise_transport_snapshot snap;
-    if (!node->transport || !noise_transport_snapshot(node->transport, &snap))
+    if (!p2p_node_noise_snapshot(node, &snap))
         return false;  // raw-return-ok:no-established-noise-session-is-an-answer
     memcpy(out_static, snap.remote_static, 32);
     return true;
@@ -187,7 +188,7 @@ static bool session_remote_static(const struct p2p_node *node,
 
 void configured_sync_peer_observe_outbound(const struct p2p_node *node)
 {
-    if (!node || node->inbound || node->is_feeler || !node->transport ||
+    if (!node || node->inbound || node->is_feeler ||
         atomic_load(&g_configured_count_hint) == 0)
         return;
     uint8_t remote[32];

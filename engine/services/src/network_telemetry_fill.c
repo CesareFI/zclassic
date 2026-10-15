@@ -48,6 +48,7 @@
 #include "net/peer_lifecycle.h"
 #include "net/tor_integration.h"
 #include "net/noise_transport.h"
+#include "services/p2p_node_noise.h"
 #include "util/log_macros.h"
 #include "util/sync.h"
 #include "util/timedata.h"
@@ -123,7 +124,8 @@ static void nt_peers_walk_unavailable(struct network_snapshot *s,
 /* One bounded pass over the node array under a TRYlock, producing the three
  * peer leaves connman's own accessors do not carry plus the three transport
  * counts. `struct connman` bounds num_nodes by the configured connection
- * ceiling, so this is O(peers) with no I/O and no nested acquire. */
+ * ceiling, so this is O(peers) with no I/O. The only nested acquire is each
+ * node's cs_recv, held for a pointer read (cs_nodes -> cs_recv order). */
 struct nt_node_walk {
     bool taken;
     int64_t handshaked;
@@ -171,13 +173,15 @@ static void nt_walk_nodes(struct connman *cm, struct nt_node_walk *w)
         }
 
         /* What this connection NEGOTIATED, not what the build can do. A node
-         * with no transport attached is carrying plaintext bytes. */
-        if (!n->transport)
-            w->plaintext++;
-        else if (n->transport->state == NOISE_ESTABLISHED)
-            w->encrypted++;
-        else
-            w->handshaking++;
+         * with no transport attached is carrying plaintext bytes. The
+         * transport pointer is read under the node's cs_recv (the socket
+         * thread frees it there on a plaintext fallback); cs_nodes is held
+         * here, which is the order the socket thread takes them. */
+        switch (p2p_node_noise_read(n, NULL)) {
+        case P2P_NODE_NOISE_NONE:        w->plaintext++;   break;
+        case P2P_NODE_NOISE_ESTABLISHED: w->encrypted++;   break;
+        case P2P_NODE_NOISE_HANDSHAKING: w->handshaking++; break;
+        }
     }
     zcl_mutex_unlock(&cm->manager.cs_nodes);
 }

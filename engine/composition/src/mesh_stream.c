@@ -17,6 +17,7 @@
 #include "net/msgprocessor.h"
 #include "net/net.h"
 #include "net/noise_transport.h"
+#include "services/p2p_node_noise.h"
 #include "platform/time_compat.h"
 #include "supervisors/domains.h"
 #include "util/log_macros.h"
@@ -903,9 +904,7 @@ bool mesh_stream_frame(struct msg_processor *mp, struct p2p_node *node,
     }
     struct noise_transport_snapshot snap;
     memset(&snap, 0, sizeof(snap));
-    if (!node->transport ||
-        !noise_transport_snapshot(node->transport, &snap) ||
-        !snap.established) {
+    if (!p2p_node_noise_snapshot(node, &snap) || !snap.established) {
         /* Plaintext v1 or mid-handshake: a stream is never carried over a
          * link that is not an established Noise session. */
         atomic_fetch_add(&g_dropped_unauthenticated, 1);

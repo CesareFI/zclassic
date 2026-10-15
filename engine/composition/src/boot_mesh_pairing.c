@@ -19,6 +19,7 @@
 #include "net/net.h"
 #include "net/v2_identity.h"
 #include "net/noise_transport.h"
+#include "services/p2p_node_noise.h"
 #include "platform/time_compat.h"
 #include "util/log_macros.h"
 #include "util/sync.h"
@@ -194,8 +195,8 @@ static int mesh_pair_pick_peer(struct net_manager *nm, const char *selector,
     for (size_t i = 0; i < count; i++) {
         struct noise_transport_snapshot snapshot;
         memset(&snapshot, 0, sizeof(snapshot));
-        bool established = candidates[i]->transport &&
-            noise_transport_snapshot(candidates[i]->transport, &snapshot) &&
+        bool established =
+            p2p_node_noise_snapshot(candidates[i], &snapshot) &&
             snapshot.established;
         bool matched = false;
         if (established) {

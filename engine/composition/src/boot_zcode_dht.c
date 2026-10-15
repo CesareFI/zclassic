@@ -16,6 +16,7 @@
 #include "net/net.h"
 #include "net/peer_scoring.h"
 #include "net/noise_transport.h"
+#include "services/p2p_node_noise.h"
 #include "platform/time_compat.h"
 #include "util/log_macros.h"
 #include "util/sync.h"
@@ -229,8 +230,7 @@ static bool dht_snapshot(struct p2p_node *node,
                          struct vcs_zcode_dht_session *out) {
   memset(out, 0, sizeof(*out));
   struct noise_transport_snapshot snapshot;
-  if (!node || !node->transport ||
-      !noise_transport_snapshot(node->transport, &snapshot))
+  if (!p2p_node_noise_snapshot(node, &snapshot))
     return false;
   out->established = snapshot.established;
   out->generation = snapshot.connection_generation;
@@ -391,8 +391,11 @@ static bool dht_chain_prepare(struct boot_svc_ctx *svc) {
 }
 
 bool boot_zcode_dht_peer_ready(const struct p2p_node *node) {
-  return node && !atomic_load(&node->disconnect) && node->transport &&
-         atomic_load(&node->state) >= PEER_HANDSHAKE_COMPLETE;
+  /* Callers hold cs_nodes (cs_nodes -> cs_recv order); the pointer is read
+   * under cs_recv because the socket thread frees it there. */
+  return node && !atomic_load(&node->disconnect) &&
+         atomic_load(&node->state) >= PEER_HANDSHAKE_COMPLETE &&
+         p2p_node_noise_attached(node);
 }
 
 bool boot_zcode_dht_frame(struct msg_processor *mp, struct p2p_node *node,

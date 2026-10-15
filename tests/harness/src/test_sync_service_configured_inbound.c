@@ -2313,6 +2313,115 @@ static int test_configured_inbound_revocation(void)
     return failures;
 }
 
+/* ── Transport reads race the socket thread's plaintext-fallback free ──
+ * The socket thread frees node->transport and sets it NULL under cs_recv
+ * (connman.c, NOISE_PLAINTEXT_FALLBACK). The configured-inbound rule reads
+ * that pointer from the message-handler threads, so it must take cs_recv.
+ * Deterministic proof, no race to win: one thread holds the bound inbound
+ * node's cs_recv exactly as the socket thread does while it feeds or frees
+ * the transport, a second thread asks the rule, and the rule must not answer
+ * until cs_recv is released. A transport freed under that lock must then read
+ * as "no session", never a dereference of the freed pointer. Every wait is
+ * bounded by an attempt count. */
+struct recv_hold {
+    struct p2p_node *node;
+    atomic_bool held;
+    atomic_bool release;
+};
+
+static void *recv_hold_main(void *arg)
+{
+    struct recv_hold *h = arg;
+    zcl_mutex_lock(&h->node->cs_recv);
+    atomic_store(&h->held, true);
+    for (int i = 0; i < 5000 && !atomic_load(&h->release); i++)
+        platform_sleep_ms(1);
+    zcl_mutex_unlock(&h->node->cs_recv);
+    return NULL;
+}
+
+struct bound_query {
+    const struct p2p_node *node;
+    atomic_bool done;
+    atomic_bool answer;
+};
+
+static void *bound_query_main(void *arg)
+{
+    struct bound_query *q = arg;
+    atomic_store(&q->answer, syncsvc_peer_is_configured_inbound(q->node));
+    atomic_store(&q->done, true);
+    return NULL;
+}
+
+/* Runs the holder and the asker with no assertion between the first
+ * pthread_create and the last join, so every exit path releases the hold and
+ * joins every thread that was started. False when a thread could not start
+ * or the holder never took the lock. */
+static bool run_hold_query(struct p2p_node *node, bool *answered_while_held,
+                           bool *done, bool *answer)
+{
+    struct recv_hold hold = {.node = node};
+    struct bound_query q = {.node = node};
+    pthread_t holder, asker;
+    bool holder_started = pthread_create(&holder, NULL, recv_hold_main,
+                                         &hold) == 0;
+    bool asker_started = false;
+    if (holder_started) {
+        for (int i = 0; i < 5000 && !atomic_load(&hold.held); i++)
+            platform_sleep_ms(1);
+        if (atomic_load(&hold.held))
+            asker_started = pthread_create(&asker, NULL, bound_query_main,
+                                           &q) == 0;
+        /* The asker has 200 ms to answer. Under the fix it cannot. */
+        for (int i = 0; asker_started && i < 200 && !atomic_load(&q.done); i++)
+            platform_sleep_ms(1);
+        *answered_while_held = atomic_load(&q.done);
+        atomic_store(&hold.release, true);
+        pthread_join(holder, NULL);
+    }
+    if (asker_started)
+        pthread_join(asker, NULL);
+    *done = atomic_load(&q.done);
+    *answer = atomic_load(&q.answer);
+    return holder_started && asker_started;
+}
+
+static int test_configured_inbound_reads_transport_under_cs_recv(void)
+{
+    int failures = 0;
+    TEST("configured inbound: the session read waits for cs_recv, and a "
+         "transport freed under it reads as no session") {
+        static struct model_node a, b;
+        model_reset();
+        ASSERT(model_node_init(&a, "A", 7, 18233, 1));
+        ASSERT(model_node_init(&b, "B", 8, 18234, 2));
+        ASSERT(model_configure(&b, &a));
+        struct model_conn c;
+        ASSERT(model_connect(&c, &a, &b, a.priv, true, 40001));
+        ev_inbound_version(&c);
+        model_settle(&c, 1);
+        ASSERT(model_begin(c.in)); /* learns the identity; bound after */
+        ASSERT(syncsvc_peer_is_configured_inbound(c.in));
+
+        bool answered_while_held = true, done = false, answer = false;
+        ASSERT(run_hold_query(c.in, &answered_while_held, &done, &answer));
+        ASSERT(!answered_while_held);
+        ASSERT(done);
+        ASSERT(answer);
+
+        /* The socket thread's fallback: free and clear under cs_recv. */
+        zcl_mutex_lock(&c.in->cs_recv);
+        noise_transport_free(c.in->transport);
+        c.in->transport = NULL;
+        zcl_mutex_unlock(&c.in->cs_recv);
+        ASSERT(!syncsvc_peer_is_configured_inbound(c.in));
+        PASS();
+    } _test_next:;
+    model_reset();
+    return failures;
+}
+
 int check_sync_service_configured_inbound(void)
 {
     int failures = 0;
@@ -2342,6 +2451,7 @@ int check_sync_service_configured_inbound(void)
     failures += test_configured_inbound_probe_stop();
     failures += test_configured_inbound_probe_thread();
     failures += test_configured_inbound_revocation();
+    failures += test_configured_inbound_reads_transport_under_cs_recv();
     model_reset();
     configured_sync_peers_set_prober_for_testing(NULL);
     configured_sync_peers_set_clock_for_testing(NULL);
