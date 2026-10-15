@@ -392,6 +392,24 @@ void zcl_native_handle_ops_mesh_device_host_runtime(const struct zcl_command_req
 void zcl_native_handle_ops_mesh_device_psk_new(const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
 void zcl_native_device_psk_fingerprint(const uint8_t key[32], char out[17]);
+/* ops.mesh.device.host.shell (tools/command/native_device_host_shell.c): a
+ * raw pre-boot leaf that execvp()s a FIXED ssh argv whose ProxyCommand is
+ * this binary's `ops mesh device host client --input-file=<route_input>`.
+ * Every interpolated value is charset-checked first because ssh runs
+ * ProxyCommand through a shell; dry_run prints the argv as JSON instead. */
+#define ZCL_HOST_SHELL_ARGV_MAX 12
+struct zcl_native_host_shell_argv {
+    char kex[96], proxy[2200], destination[300];
+    const char *argv[ZCL_HOST_SHELL_ARGV_MAX + 1];
+    size_t argc;
+};
+/* Pure: no probe, no exec. *refusal names the refused field on false. */
+bool zcl_native_device_host_shell_argv(const char *self, const char *user, const char *host,
+    const char *route_input, bool mlkem_offered, struct zcl_native_host_shell_argv *out, const char **refusal);
+bool zcl_native_device_host_shell_json(const struct zcl_native_host_shell_argv *plan, struct json_value *out);
+/* Raw entry: validates, probes `ssh -Q kex`, then dry-runs or execs. Returns
+ * a process exit code only when it does not exec. */
+int zcl_native_device_host_shell_run(const struct json_value *input);
 
 /* ── app.service.* — declared services (tools/command/native_service_command.c).
  * `list` and `inspect` read the compile-time zcl.service_binding.v1 catalog

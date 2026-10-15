@@ -342,14 +342,16 @@ static bool raw_is_host_path(int argc, char **argv)
 static const char *raw_selected_path(int argc, char **argv, size_t *consumed)
 {
     static const char client[] = "ops.mesh.device.host.client", receiver[] = "ops.mesh.device.host.receiver";
-    static const char package[] = "ops.mesh.device.host.package.run";
-    if (argc >= 2 && (!strcmp(argv[1], client) || !strcmp(argv[1], receiver) || !strcmp(argv[1], package))) {
+    static const char package[] = "ops.mesh.device.host.package.run", shell[] = "ops.mesh.device.host.shell";
+    if (argc >= 2 && (!strcmp(argv[1], client) || !strcmp(argv[1], receiver) || !strcmp(argv[1], package) ||
+        !strcmp(argv[1], shell))) {
         *consumed = 1; return argv[1];
     }
     if (!raw_is_host_path(argc, argv)) return NULL;
     *consumed = 5;
     if (!strcmp(argv[5], "client")) return client;
     if (!strcmp(argv[5], "receiver")) return receiver;
+    if (!strcmp(argv[5], "shell")) return shell;
     if (argc >= 7 && !strcmp(argv[5], "package") && !strcmp(argv[6], "run")) {
         *consumed = 6; return package;
     }
@@ -370,7 +372,8 @@ static bool raw_input_read(int argc, char **argv, size_t consumed,
         text = named;
     } else return false;
     if (length > maximum) return false;
-    bool valid = package ? !strstr(text, "\\u0000") && json_read(input, text, length) && installed_keys(input)
+    bool shell = !strcmp(spec->path, "ops.mesh.device.host.shell");
+    bool valid = package || shell ? !strstr(text, "\\u0000") && json_read(input, text, length) && (shell || installed_keys(input))
         : device_host_runtime_entry_parse(input, text, length, !strcmp(spec->path, "ops.mesh.device.host.receiver")).ok;
     char why[160];
     return valid && zcl_command_registry_input_validate(spec, input, why, sizeof(why));
@@ -387,6 +390,7 @@ void zcl_native_device_host_runtime_exit_if_requested(int argc, char **argv)
 #if defined(__linux__)
     if (valid) {
         if (package) result = installed_run(&input);
+        else if (!strcmp(path, "ops.mesh.device.host.shell")) result = zcl_native_device_host_shell_run(&input);
         else {
             enum device_host_runtime_entry_exit status = DEVICE_HOST_ENTRY_INVALID;
             struct zcl_result ran = device_host_runtime_entry_run(&input,

@@ -1066,3 +1066,16 @@ ZCL_COMMAND_READY_COMMAND(
     ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
     ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_NONE,
     ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device_host_runtime)
+ZCL_COMMAND_READY_COMMAND(
+    "ops.mesh.device.host.shell", "ops.mesh.device.host", "",
+    "Open an ssh shell through the HOST tunnel in one command",
+    "Linux raw CLI only, before node/config startup. execvp of a fixed ssh argv, no /bin/sh: KexAlgorithms pinned to sntrup761x25519-sha512@openssh.com (mlkem768x25519-sha256 first when ssh -Q kex offers it), StrictHostKeyChecking=yes, ControlPath=none, ProxyCommand=<this binary> ops mesh device host client --input-file=<route_input>, then -- user@host. user/host are [A-Za-z0-9._-] with an alphanumeric first byte; route_input is an absolute owner regular client input file in [A-Za-z0-9._/-]; anything else refuses because ssh runs ProxyCommand through a shell. dry_run=true prints the exact argv JSON and executes nothing.",
+    ZCL_COMMAND_RESULT_BUDGET, "mesh,device,host,psk,ssh,shell,raw,foreground",
+    "zcl.device.host.shell.input.v1", "zcl.device.host.shell.v1",
+    "user,host,route_input,dry_run", "user,host,route_input",
+    "z23 ops mesh device host shell --input=<explicit-json>",
+    ZCL_COMMAND_LAYER_OPS, ZCL_COMMAND_EFFECT_MUTATE, ZCL_COMMAND_RISK_APP_WRITE,
+    ZCL_COMMAND_SCOPE_LOCAL, ZCL_COMMAND_AUTH_OWNER, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FOREGROUND, ZCL_COMMAND_COST_LOW, ZCL_COMMAND_CONFIRM_PLAN_COMMIT,
+    ZCL_COMMAND_LANE_LOCAL, ZCL_COMMAND_CAP_NONE,
+    ZCL_COMMAND_TRAIT_NONE, zcl_native_handle_ops_mesh_device_host_runtime)

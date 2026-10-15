@@ -1,6 +1,7 @@
 /* Copyright 2026 Rhett Creighton. SPDX-License-Identifier: Apache-2.0
  * Purpose: fleet usability of the hash-PSK HOST tunnel: the supervised
- * receiver example unit, the --input-file source it reads and psk.new. */
+ * receiver example unit, the --input-file source it reads, psk.new and the
+ * injection-proof ssh argv of host.shell. */
 #include "test/test_core.h"
 #include "command/native_command.h"
 #include "config/command_catalog.h"
@@ -186,6 +187,97 @@ static int shell_psk_new(void)
     if (directory[0]) { (void)chmod(directory, 0700); test_rm_rf(directory); }
     return failures;
 }
+
+static bool shell_argv_equal(const struct zcl_native_host_shell_argv *plan, const char *const *want, size_t count)
+{
+    if (plan->argc != count || plan->argv[count] != NULL) return false;
+    for (size_t i = 0; i < count; ++i) if (!plan->argv[i] || strcmp(plan->argv[i], want[i])) return false;
+    return true;
+}
+
+static int shell_dry_run_argv(void)
+{
+    int failures = 0;
+    char directory[1024] = {0};
+    TEST_CASE("device_host_shell: dry_run argv is the exact fixed ssh vector") {
+        ASSERT(test_mkdtemp(directory, sizeof(directory), "device-host-shell"));
+        char route[1200], proxy[2400];
+        snprintf(route, sizeof(route), "%s/route.json", directory);
+        ASSERT(shell_write(route, "{}", 0600));
+        snprintf(proxy, sizeof(proxy), "ProxyCommand=/opt/z23/bin/z23 ops mesh device host client --input-file=%s", route);
+        struct zcl_native_host_shell_argv plan; const char *refusal = "unset";
+        ASSERT(zcl_native_device_host_shell_argv("/opt/z23/bin/z23", "rhett", "r2.lan", route, false, &plan, &refusal));
+        ASSERT(refusal == NULL);
+        const char *const sntrup[] = {"ssh", "-o", "KexAlgorithms=sntrup761x25519-sha512@openssh.com",
+            "-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none", "-o", proxy, "--", "rhett@r2.lan"};
+        ASSERT(shell_argv_equal(&plan, sntrup, sizeof(sntrup) / sizeof(sntrup[0])));
+        ASSERT(zcl_native_device_host_shell_argv("/opt/z23/bin/z23", "rhett", "r2.lan", route, true, &plan, &refusal));
+        const char *const both[] = {"ssh", "-o", "KexAlgorithms=mlkem768x25519-sha256,sntrup761x25519-sha512@openssh.com",
+            "-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none", "-o", proxy, "--", "rhett@r2.lan"};
+        ASSERT(shell_argv_equal(&plan, both, sizeof(both) / sizeof(both[0])));
+        struct json_value out = {0};
+        ASSERT(zcl_native_device_host_shell_json(&plan, &out));
+        ASSERT_STR_EQ(json_get_str(json_get(&out, "schema")), "zcl.device.host.shell.v1");
+        const struct json_value *list = json_get(&out, "argv");
+        bool same = list && list->type == JSON_ARR && list->num_children == plan.argc;
+        for (size_t i = 0; same && i < plan.argc; ++i) same = !strcmp(json_get_str(json_at(list, i)), both[i]);
+        json_free(&out);
+        ASSERT(same);
+    } TEST_END
+    if (directory[0]) test_rm_rf(directory);
+    return failures;
+}
+
+struct shell_refusal { const char *user, *host, *route, *self, *field; };
+
+static int shell_injection_refused(void)
+{
+    int failures = 0;
+    char directory[1024] = {0};
+    TEST_CASE("device_host_shell: shell, ssh-token and option injection refuse before any argv") {
+        ASSERT(test_mkdtemp(directory, sizeof(directory), "device-host-shell"));
+        char route[1200], linked[1200];
+        snprintf(route, sizeof(route), "%s/route.json", directory);
+        ASSERT(shell_write(route, "{}", 0600));
+        snprintf(linked, sizeof(linked), "%s/linked.json", directory);
+        ASSERT(symlink(route, linked) == 0);
+        const char *self = "/opt/z23/bin/z23";
+        const struct shell_refusal cases[] = {
+            {"a;id", "h", route, self, "user_refused"}, {"$(id)", "h", route, self, "user_refused"},
+            {"`id`", "h", route, self, "user_refused"}, {"a b", "h", route, self, "user_refused"},
+            {"a%h", "h", route, self, "user_refused"}, {"a\nb", "h", route, self, "user_refused"},
+            {"-oProxyCommand=id", "h", route, self, "user_refused"}, {"", "h", route, self, "user_refused"},
+            {"a'b", "h", route, self, "user_refused"}, {"a\"b", "h", route, self, "user_refused"},
+            {"u", "h;id", route, self, "host_refused"}, {"u", "$(id)", route, self, "host_refused"},
+            {"u", "`id`", route, self, "host_refused"}, {"u", "h h", route, self, "host_refused"},
+            {"u", "%h", route, self, "host_refused"}, {"u", "h\n", route, self, "host_refused"},
+            {"u", "-oProxyCommand=id", route, self, "host_refused"}, {"u", "a@b", route, self, "host_refused"},
+            {"u", "h", "route.json", self, "route_input_refused"},
+            {"u", "h", "/x/a;id", self, "route_input_refused"}, {"u", "h", "/x/$(id)", self, "route_input_refused"},
+            {"u", "h", "/x/`id`", self, "route_input_refused"}, {"u", "h", "/x/a b", self, "route_input_refused"},
+            {"u", "h", "/x/%h", self, "route_input_refused"}, {"u", "h", "/x/a\nb", self, "route_input_refused"},
+            {"u", "h", "/x/'q'", self, "route_input_refused"},
+            {"u", "h", directory, self, "route_input_refused"}, {"u", "h", linked, self, "route_input_refused"},
+            {"u", "h", "/nonexistent/route.json", self, "route_input_refused"},
+            {"u", "h", route, "/opt/z23/bin/z23 (deleted)", "self_refused"},
+            {"u", "h", route, "z23", "self_refused"}, {"u", "h", route, "/opt/$(id)/z23", "self_refused"},
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            struct zcl_native_host_shell_argv plan; const char *refusal = NULL;
+            bool built = zcl_native_device_host_shell_argv(cases[i].self, cases[i].user, cases[i].host,
+                cases[i].route, false, &plan, &refusal);
+            if (built || !refusal || strcmp(refusal, cases[i].field) || plan.argc != 0)
+                printf("injection case %zu admitted (refusal=%s)\n", i, refusal ? refusal : "none");
+            ASSERT(!built); ASSERT(refusal != NULL); ASSERT_STR_EQ(refusal, cases[i].field); ASSERT_EQ(plan.argc, 0u);
+        }
+        char longest[300]; memset(longest, 'a', sizeof(longest) - 1); longest[sizeof(longest) - 1] = '\0';
+        struct zcl_native_host_shell_argv plan; const char *refusal = NULL;
+        ASSERT(!zcl_native_device_host_shell_argv(self, "u", longest, route, false, &plan, &refusal));
+        ASSERT_STR_EQ(refusal, "host_refused");
+    } TEST_END
+    if (directory[0]) test_rm_rf(directory);
+    return failures;
+}
 #endif
 
 int test_device_host_shell(void);
@@ -194,6 +286,7 @@ int test_device_host_shell(void)
     int failures = shell_receiver_unit();
 #if defined(__linux__)
     failures += shell_input_file() + shell_psk_fingerprint() + shell_psk_new();
+    failures += shell_dry_run_argv() + shell_injection_refused();
 #endif
     return failures;
 }
