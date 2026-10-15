@@ -52,6 +52,7 @@ const char *plugin_run_status_next_action(enum plugin_run_status status)
     return (size_t)status < n ? prr_status_text[status].next_action : "";
 }
 
+#if defined(__linux__)
 static uint32_t prr_default(uint32_t value, uint32_t fallback)
 {
     return value ? value : fallback;
@@ -70,6 +71,7 @@ static void prr_options(struct plugin_run *run, const struct plugin_run_options 
     if (run->opt.backoff_max_ms < run->opt.backoff_initial_ms)
         run->opt.backoff_max_ms = run->opt.backoff_initial_ms;
 }
+#endif
 
 static void prr_reset_backoff(struct plugin_run *run)
 {
