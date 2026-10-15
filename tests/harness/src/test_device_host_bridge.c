@@ -162,6 +162,7 @@ struct bridge_fixture {
     clock_iface_t clock;
     int64_t wall_ms;
     bool expired;
+    bool controlled_mono;
     bool expire_at_write;
     unsigned wall_observations;
     atomic_bool cancelled;
@@ -176,6 +177,7 @@ static int64_t fixture_wall(void *opaque)
 static int64_t fixture_mono(void *opaque)
 {
     if (((struct bridge_fixture *)opaque)->expired) return INT64_MAX;
+    if (((struct bridge_fixture *)opaque)->controlled_mono) return INT64_C(1000000000);
     const clock_iface_t *prior = ((struct bridge_fixture *)opaque)->prior_clock;
     return prior->now_monotonic_ns(prior->self);
 }
@@ -306,6 +308,7 @@ static int bridge_pending_refusal(unsigned reason)
 {
     int failures = 0;
     struct bridge_fixture fixture; fixture_init(&fixture);
+    fixture.controlled_mono = true; /* Stepwise authority cases own their clock. */
     TEST_CASE("device_host_bridge: buffered bytes in both directions never release after authority loss") {
         ASSERT(fixture_open(&fixture));
         ssize_t target_filler = fill_queue(fixture.transport[0], 0xa1);
