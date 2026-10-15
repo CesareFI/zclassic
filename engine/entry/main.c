@@ -55,6 +55,7 @@
  * ships in every profile, not just dev builds: a released node that never
  * installed a checker would refuse every foreign row and post. */
 #include "dev/fleet_roles.h"
+#include "dev/fleet_enrol.h"
 #include "command/native_devagent.h" /* Windows confined worker child */
 #ifdef ZCL_DEV_BUILD
 #include "devloop.h"
@@ -922,6 +923,9 @@ int main(int argc, char **argv)
      * also mints the worker grant every already-enrolled machine implies,
      * so a fleet that was replicating before roles existed still is. */
     zcl_fleet_roles_enforcement_start(ctx.datadir);
+    /* Fleet ROSTER (ZRC 0012 step 2): same layering, same reason. Until this
+     * runs the roster gate is unarmed and the board behaves as before. */
+    zcl_fleet_roster_gate_start();
     rpc_agent_set_boot_context(app_operator_lane_name(ctx.operator_lane),
                                app_runtime_profile_name(ctx.runtime_profile),
                                ctx.datadir, ctx.rpc_port, ctx.p2p_port,

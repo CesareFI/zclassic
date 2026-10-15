@@ -109,6 +109,7 @@ struct fleet_board_filter {
      * result naming it arrives, which is the whole point of the filter. */
     bool open_only;
     char slug[FLEET_BOARD_SLUG_MAX + 1];/* empty = any slug */
+    char agent[FLEET_BOARD_AGENT_MAX + 1];/* empty = any agent (exact match) */
     /* Scope filtering. scope_set=false means "every scope this caller may
      * see" — the caller decides visibility; the store only matches. A room
      * filter matches the room a post READS as: asking for the default room
@@ -214,10 +215,26 @@ bool db_fleet_board_post_find(struct node_db *ndb, const uint8_t id[32],
 
 /* Newest-first listing under `filter`. Returns the number written, at most
  * `max` (capped at FLEET_BOARD_LIST_MAX). Expired discussions are excluded;
- * durable wiki revisions remain discoverable. */
-int db_fleet_board_list(struct node_db *ndb,
-                        const struct fleet_board_filter *filter, int64_t now,
-                        struct db_fleet_board_post *out, size_t max);
+ * durable wiki revisions remain discoverable.
+ *
+ * `*complete` (optional) is true only when the query was prepared, every
+ * row it matched was read and the cursor ended cleanly: a table that cannot
+ * be read, a step that fails part-way and a stored row that no longer
+ * decodes all leave it false, so a caller that must not mistake "I could
+ * not look" for "nothing there" can tell. The rows written are still those
+ * that did read. */
+int db_fleet_board_list_checked(struct node_db *ndb,
+                                const struct fleet_board_filter *filter,
+                                int64_t now, struct db_fleet_board_post *out,
+                                size_t max, bool *complete);
+
+/* The listing for a caller that has no use for the difference. */
+static inline int db_fleet_board_list(
+    struct node_db *ndb, const struct fleet_board_filter *filter, int64_t now,
+    struct db_fleet_board_post *out, size_t max)
+{
+    return db_fleet_board_list_checked(ndb, filter, now, out, max, NULL);
+}
 
 /* Latest valid revision of one wiki slug: the newest created_at among that
  * slug's stored revisions, ties broken by the larger id, so every node that

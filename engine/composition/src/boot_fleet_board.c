@@ -3,6 +3,7 @@
 
 #include "config/boot_fleet_board.h"
 
+#include "config/boot_fleet_roster.h"
 #include "config/boot_internal.h"
 #include "config/runtime.h"
 
@@ -523,6 +524,24 @@ static void fleet_board_handle_post(struct msg_processor *mp,
         return;
     }
     bool stored = false;
+    /* ZRC 0012 step 2: with an armed roster, a fleet-scope post from a key
+     * that is not on it is not accepted, and a roster row is stored only if
+     * its seal verifies. Public scope never reaches the roster. The refusal
+     * is this box's own policy about the author or the row, so the post is
+     * dropped without scoring the relaying peer; the log line is rate
+     * limited so a peer that keeps sending cannot fill the log. */
+    r = boot_fleet_roster_screen_post(ndb, &post, now);
+    if (r != FLEET_BOARD_OK) {
+        uint64_t skipped = 0;
+        if (boot_fleet_roster_log_due(BOOT_FLEET_ROSTER_LOG_POST_DROPPED,
+                                      now, &skipped))
+            LOG_WARN("net.fleet_board",
+                     "dropped fleet post from peer %lld: %s (%llu more "
+                     "since the last line)", (long long)node->id,
+                     fleet_board_result_string(r),
+                     (unsigned long long)skipped);
+        return;
+    }
     r = db_fleet_board_post_ingest(ndb, &post, now, &stored);
     if (r == FLEET_BOARD_ERR_ROLE)
         atomic_fetch_add_explicit(&s_role_refused, 1, memory_order_relaxed);
@@ -539,6 +558,8 @@ static void fleet_board_handle_post(struct msg_processor *mp,
             fleet_board_offend(mp, node, r);
         return;
     }
+    if (stored && boot_fleet_roster_is_row(&post))
+        boot_fleet_roster_invalidate();
     if (stored) {
         char id_hex[65];
         fleet_board_id_to_hex(post.id, id_hex);
@@ -643,11 +664,20 @@ enum fleet_board_result boot_fleet_board_publish(
     enum fleet_board_result r = fleet_board_sign_local(post);
     if (r != FLEET_BOARD_OK)
         return r;
+    /* A roster row is stored here only if its seal verifies, exactly as it
+     * would be off the wire: the local RPC is an ingest path too. */
+    if (boot_fleet_roster_is_row(post)) {
+        r = boot_fleet_roster_screen_post(ndb, post, now);
+        if (r != FLEET_BOARD_OK)
+            return r;
+    }
 
     bool stored = false;
     r = db_fleet_board_post_ingest(ndb, post, now, &stored);
     if (r != FLEET_BOARD_OK)
         return r;
+    if (boot_fleet_roster_is_row(post))
+        boot_fleet_roster_invalidate();
     /* Announced only after it is durable: a post the fleet can ask for but
      * this node cannot serve is a promise nobody can keep. A fleet-scoped
      * post is durable here and readable locally, but its id is never flooded

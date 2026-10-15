@@ -347,8 +347,8 @@ dotted `<owner>.<condition>` form (e.g. `bootstrap.no_state_source` in
 |---|---|---|
 | Signed, gossiped board | Yes — `fleet_board.def`, `fleet_board_post.c`, `boot_fleet_board.c`, `fleet_board_proto.c`, all landed. | Unchanged as the transport and chain-linking mechanism; extended with a `scope` field. |
 | Row identity | Node's local DHT online key, no on-chain binding. | Board key stays as the per-row signer, but is now certified by a roster row rooted in a ZID anchor, so a reader can verify a key belongs to a named fleet, not just that some key signed it. |
-| Fleet identity anchor | One system, step 1 implemented: the general ZID anchor overlay (`contexts/wallet/modules/zid/src/zid_anchor.c`) and `fleetenrol` (`tools/dev/fleet_enrol*.c`, on `main`). `fleetenrol`'s operator root is the same 32-byte Ed25519 key shape; `fleet invite`/`admit`/`import`/`machines` report whether it is an active ZID anchor, and `--require_anchor=yes` makes `admit`/`import` fail closed. The board does not use it yet (lane 2). | Roster rows signed by that anchored root (or a certified delegate) gate `scope: fleet` relay. |
-| Membership | None — any keyholder posting is indistinguishable from a member. | Roster rows, signed by the fleet root or a certified delegate, gate `scope: fleet` relay. |
+| Fleet identity anchor | One system, step 1 implemented: the general ZID anchor overlay (`contexts/wallet/modules/zid/src/zid_anchor.c`) and `fleetenrol` (`tools/dev/fleet_enrol*.c`, on `main`). `fleetenrol`'s operator root is the same 32-byte Ed25519 key shape; `fleet invite`/`admit`/`import`/`machines` report whether it is an active ZID anchor, and `--require_anchor=yes` makes `admit`/`import` fail closed. Step 2: the board reads it: the root's `active`/`rotated`/`revoked` state decides whether its roster is trusted. | Roster rows signed by that anchored root (or a certified delegate) gate `scope: fleet` relay. |
+| Membership | Step 2 implemented, opt-in (`-fleetrostergate` on the manager): a signing key is a member when a root-sealed machine line, carried as a `fleet-roster` fleet note, names it; with a roster in force, the paired board stream and P2P POST ingress take `scope: fleet` from members only. No revocation record or delegate yet. | Roster rows, signed by the fleet root or a certified delegate, gate `scope: fleet` relay. |
 | Fleet-row privacy | None — every gossiped row is legible to every peer that relays it. | Epoch-key encryption, rotated on every membership change, relay gated to roster members over onion. |
 | Direct messages | Plaintext on the wire, in-memory ring buffer, unreplicated per-node SQLite mirror, on-chain memo as the only durable/private option. | Sealed per-message with forward secrecy, durable signed at-rest store mirroring the board's own model, delivered over the existing flood/INV path or a ZRC-0002 stream, onion-only; on-chain memo stays as the fallback. |
 | Inter-fleet rooms | None. | Anchored room identities; any node may subscribe/replicate; per-peer caps. |
@@ -382,16 +382,52 @@ record before the next lane starts.
    Measurement (time from anchor confirmation to first roster row issued):
    OPEN, it needs a live chain. Not in this step: delegates (section 3
    and 6), board-borne roster rows, and the relay gate, which are lane 2.
-2. **`fleetroster`: roster rows + scope gating of relay.** Add `scope` to
-   the row schema; wire the roster-membership check into
-   `boot_fleet_board.c`'s existing per-peer relay path. Acceptance: a
-   non-member peer's INV/GET request for `scope: fleet` inventory returns
-   nothing, and a revoked member stops receiving new `scope: fleet` rows
-   within one gossip round of its revocation row landing. Measurement:
-   rows replicated per second, before/after the scope check is added, to
-   confirm no regression in `scope: across`/legacy-unscoped throughput.
-   `board.sh` is retired once this lane lands, since fleet-private
-   coordination now has a native, signed, gated home.
+2. **`fleetroster`: roster rows + scope gating of relay. Step 2:
+   implemented (the roster and the relay gate; revocation by row, epochs,
+   onion binding and delegates are not in it).** `scope` was already in the
+   row schema (v2). A roster row is the operator-sealed `fleet admit` machine
+   line, unchanged, carried as the text of a `scope: fleet` note whose agent
+   is `fleet-roster` (no new row kind, codec or frame, so an
+   older node stores it as the ordinary fleet-private note it is, and every
+   row it verified before it still verifies). The box whose own key is the
+   fleet root publishes its roster file that way by itself, and again
+   every 10 days or when a line changes: a note, not a wiki page, because the
+   worker role may post notes and not wiki (`test_fleet_roles` pins that), at
+   the price of the 30 day TTL, so the roster lapses to unarmed 20 days after
+   the manager's node stops. A signing key is a member when a line that
+   verifies under the fleet root names it as its receipt's `signer_pubkey`.
+   The gate is read through `fleet_root_line_verify` (the step 1 seam), with
+   the root's chain state from the `zid_identities` projection: an anchored
+   root is bound by the chain (`active` passes, `rotated` and `revoked`
+   refuse), a never-anchored root is tolerated, an unreadable projection
+   refuses. Three states: unarmed (no root trusted, or no sealed row yet:
+   fleet carriage is exactly what it was), armed (the paired board stream
+   serves, pulls from and accepts fleet posts from roster members only, and
+   so does ordinary P2P POST ingress), unverifiable (no fleet-scope relay at
+   all). Public and pre-scope rows never meet the gate. The gate is opt-in:
+   the manager publishes only when its node is started with
+   `-fleetrostergate`, and `-fleetrostergate=0` on any box switches
+   enforcement off there (logged); arming is logged once at INFO with the
+   member count and a lapse to unarmed once at WARN. A roster row is stored
+   only if its seal verifies under the trusted root, on every ingest path
+   (mesh stream, P2P POST, local post): one Ed25519 verify for roster rows
+   only, none on the cached path for ordinary posts. A failed read of the
+   roster notes is unverifiable, never unarmed. A rebuild is single-flight and
+   checks each distinct line once. Roster size is bounded at 64 keys and 256
+   scanned notes, and a row at the 2048-character note bound.
+   Acceptance, met by the `fleet_board` and `fleet_enrol` groups: a
+   non-member peer is refused before a row is read, a member is served, a
+   non-member author is not accepted, a junk or foreign-sealed roster row
+   is refused and not stored, a revoked or rotated root serves
+   nobody. NOT in this step and OPEN: a revoked member stopping within one
+   gossip round (the machine line has no revocation record; removing a
+   member today means changing the fleet root, whose old rows then stop
+   verifying; deleting a line from the manager's file stops its republishing but
+   the note stays until its 30 days run out; and a cached
+   roster is re-read at least every 10 seconds), `member_seq`, `onion_pubkey`
+   and the stricter "require the anchor even before the first anchor".
+   The lane's own measurement (rows replicated per second before and after
+   the check) is OPEN; its `board.sh` retirement waits on revocation.
 3. **`fleetepoch`: epoch-key encryption.** Acceptance: a node holding an
    old epoch key cannot decrypt a row posted under a newer epoch after
    being removed from the roster, demonstrated by a test. Measurement: key
@@ -473,7 +509,7 @@ record before the next lane starts.
 
 ## Landing
 
-Lane 1 (`fleetenrol`, unified with ZID) lands with this change; lanes 2 to 7 are not yet landed. The Status stays `draft` until the later lanes land.
+Lane 1 (`fleetenrol`, unified with ZID) and the roster and relay gate of lane 2 (`fleetroster`, step 2) have landed; the rest of lane 2 (revocation rows, `member_seq`, delegates) and lanes 3 to 7 are not yet landed. The Status stays `draft` until the later lanes land.
 
 ## Discussion
 

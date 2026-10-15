@@ -10,6 +10,12 @@
 #include "test/test_core.h"
 
 #include "config/boot_fleet_board.h"
+#include "config/args.h"
+#include "config/boot.h"
+#include "config/boot_fleet_roster.h"
+#include "fleet_enrol.h"
+#include "models/zid_identity.h"
+#include "util/fleet_roster_check.h"
 #include "config/command_catalog.h"
 #include "config/boot_internal.h"
 #include "config/mesh_stream.h"
@@ -6167,6 +6173,1172 @@ static int test_fleet_board_fleet_cursor_resumes(void)
     return failures;
 }
 
+/* ── ZRC 0012 step 2: the fleet roster and its relay gate ────────────────
+ *
+ * The roster rows here are REAL operator-sealed machine lines (the codec
+ * `fleet admit` writes), minted with real keys; the provider under test is
+ * the production one. The one test double is in fbr_verify: the paired-peer
+ * fixture's delegation carries an online key (0x44 bytes) nobody holds a
+ * seed for, and a roster line must be signed by the key it names. So the
+ * fixture stands the real test identity FBR_PEER in for that delegation key
+ * AFTER the production verifier has checked the seal. */
+
+#define FBR_ROOT 0x71          /* fleet root: a seed byte */
+#define FBR_OTHER_ROOT 0x72    /* a different operator */
+#define FBR_MEMBER 5           /* a member's board identity */
+#define FBR_STRANGER 7         /* nobody's board identity */
+#define FBR_PEER 9             /* stands for the paired peer's online key */
+#define FBR_LINE_NOW INT64_C(1000000)
+
+struct fbr_ctx {
+    bool present;
+    bool root_fail;
+    bool manager;
+    uint8_t root_pub[32];
+    char lines[4][ZCL_FLEET_ROSTER_LINE_MAX];
+    size_t n_lines;
+    bool remap;
+    uint8_t remap_from[32];
+    uint8_t remap_to[32];
+};
+static struct fbr_ctx g_fbr;
+
+static void fbr_root_pub(uint8_t id, uint8_t seed[32], uint8_t pub[32])
+{
+    uint8_t secret[32];
+    memset(seed, id, 32);
+    ed25519_keypair(pub, secret, seed);
+    memset(secret, 0, sizeof secret);
+}
+
+static bool fbr_root_cb(uint8_t root[32], bool *present, bool *manager,
+                        void *ctx)
+{
+    (void)ctx;
+    if (g_fbr.root_fail)
+        return false;
+    *present = g_fbr.present;
+    *manager = g_fbr.manager;
+    memcpy(root, g_fbr.root_pub, 32);
+    return true;
+}
+
+static bool fbr_verify_cb(const char *line, const uint8_t root[32],
+                          enum zcl_fleet_root_state state, bool require,
+                          uint8_t signer[32], bool *sealed, const char **why,
+                          void *ctx)
+{
+    (void)ctx;
+    const struct zcl_fleet_roster_provider *real = zcl_fleet_roster_gate_provider();
+    bool ok = real->verify(line, root, state, require, signer, sealed, why,
+                           real->ctx);
+    if (ok && g_fbr.remap && memcmp(signer, g_fbr.remap_from, 32) == 0)
+        memcpy(signer, g_fbr.remap_to, 32);
+    return ok;
+}
+
+static bool fbr_each_cb(void (*visit)(const char *line, void *user),
+                        void *user, void *ctx)
+{
+    (void)ctx;
+    for (size_t i = 0; i < g_fbr.n_lines; i++)
+        visit(g_fbr.lines[i], user);
+    return true;
+}
+
+static void fbr_install(uint8_t root_id, bool manager)
+{
+    uint8_t seed[32];
+    static const struct zcl_fleet_roster_provider provider = {
+        .root = fbr_root_cb, .verify = fbr_verify_cb,
+        .each_line = fbr_each_cb, .ctx = NULL, .name = "fleet-board-test" };
+    memset(&g_fbr, 0, sizeof g_fbr);
+    g_fbr.present = true;
+    g_fbr.manager = manager;
+    fbr_root_pub(root_id, seed, g_fbr.root_pub);
+    memset(seed, 0, sizeof seed);
+    zcl_fleet_roster_provider_install(&provider);
+    boot_fleet_roster_test_reset();
+}
+
+static void fbr_uninstall(void)
+{
+    zcl_fleet_roster_provider_install(NULL);
+    memset(&g_fbr, 0, sizeof g_fbr);
+    boot_fleet_roster_test_reset();
+}
+
+/* One sealed machine line: `root_id` seals a receipt for `name` whose board
+ * signing key is test identity `signer_id`. */
+static bool fbr_line(uint8_t root_id, const char *name, uint8_t signer_id,
+                     char *out, size_t cap)
+{
+    uint8_t op_seed[32], op_pub[32], box_seed[32], box_pub[32];
+    uint8_t invite_wire[FLEET_ENROL_INVITE_WIRE_MAX];
+    uint8_t receipt_wire[FLEET_ENROL_RECEIPT_WIRE_MAX];
+    char token[FLEET_ENROL_MACHINE_TEXT_MAX];
+    char receipt[FLEET_ENROL_MACHINE_TEXT_MAX];
+    struct fleet_invite invite;
+    struct fleet_receipt parsed;
+    struct fleet_box_facts facts;
+    struct fleet_signing_key signer;
+    size_t invite_len = 0, receipt_len = 0;
+    const char *why = NULL;
+    memset(&facts, 0, sizeof facts);
+    (void)snprintf(facts.hostname, sizeof facts.hostname, "%s", name);
+    fbr_root_pub(root_id, op_seed, op_pub);
+    fbr_root_pub((uint8_t)(0x80 + signer_id), box_seed, box_pub);
+    fb_test_identity(signer_id, signer.seed, signer.pubkey);
+    return fleet_invite_mint(name, 24, "", op_seed, op_pub, FBR_LINE_NOW,
+                             token, sizeof token, &invite, &why) &&
+           fleet_invite_parse(token, &invite, invite_wire, sizeof invite_wire,
+                              &invite_len, &why) &&
+           fleet_receipt_mint(invite_wire, invite_len, "", &facts, "",
+                              box_seed, box_pub, &signer, receipt,
+                              sizeof receipt, &why) &&
+           fleet_receipt_parse(receipt, &parsed, receipt_wire,
+                               sizeof receipt_wire, &receipt_len, &why) &&
+           fleet_machine_mint(receipt_wire, receipt_len, FBR_LINE_NOW,
+                              FLEET_ENROL_PORT_FIRST, op_seed, op_pub, out,
+                              cap, &why);
+}
+
+/* Store one roster-shaped row (a fleet-scope note) in `db` straight through
+ * the store's own ingest, as if it had been accepted earlier, authored by
+ * test identity `author` and living `ttl` seconds. `id` (optional) receives
+ * the row id. This deliberately skips the roster screen: the screen is what
+ * the ingress tests prove, and these rows are how they plant junk. */
+static bool fbr_store_row_id(struct node_db *db, uint8_t author,
+                             const char *line, int64_t now, uint32_t ttl,
+                             uint8_t id[32])
+{
+    uint8_t seed[32], pk[32];
+    struct fleet_board_post p;
+    fb_test_identity(author, seed, pk);
+    fb_test_compose(&p, FLEET_BOARD_KIND_NOTE, BOOT_FLEET_ROSTER_AGENT, line,
+                    (uint64_t)now, ttl);
+    fb_test_scope(&p, FLEET_BOARD_SCOPE_FLEET, "");
+    bool ok = fleet_board_post_sign(&p, seed, pk) == FLEET_BOARD_OK &&
+              db_fleet_board_post_ingest(db, &p, now, NULL) == FLEET_BOARD_OK;
+    if (ok && id)
+        memcpy(id, p.id, 32);
+    boot_fleet_roster_invalidate();
+    return ok;
+}
+
+static bool fbr_store_row(struct node_db *db, uint8_t author,
+                          const char *line, int64_t now, uint32_t ttl)
+{
+    return fbr_store_row_id(db, author, line, now, ttl, NULL);
+}
+
+static bool fbr_member_row(struct node_db *db, uint8_t root_id,
+                           const char *name, uint8_t signer_id, int64_t now)
+{
+    char line[FLEET_ENROL_MACHINE_TEXT_MAX];
+    return fbr_line(root_id, name, signer_id, line, sizeof line) &&
+           fbr_store_row(db, 1, line, now, 3600);
+}
+
+static void fbr_key(uint8_t id, uint8_t pub[32])
+{
+    uint8_t seed[32];
+    fb_test_identity(id, seed, pub);
+    memset(seed, 0, sizeof seed);
+}
+
+static bool fbr_anchor(struct node_db *db, uint8_t root_id, const char *status)
+{
+    uint8_t seed[32];
+    struct zid_identity identity;
+    memset(&identity, 0, sizeof identity);
+    fbr_root_pub(root_id, seed, identity.master_pubkey);
+    memset(identity.anchor_txid, 0x77, 32);
+    identity.anchor_height = 10;
+    identity.updated_height = 10;
+    if (strcmp(status, ZID_IDENTITY_STATUS_ROTATED) == 0) {
+        identity.has_successor = true;
+        memset(identity.successor_pubkey, 0x55, 32);
+    }
+    (void)snprintf(identity.status, sizeof identity.status, "%s", status);
+    (void)snprintf(identity.source, sizeof identity.source, "%s",
+                   ZID_IDENTITY_SOURCE_ZID_OVERLAY);
+    boot_fleet_roster_invalidate();
+    return db_zid_identity_save(db, &identity);
+}
+
+static int test_fleet_board_roster_membership(void)
+{
+    int failures = 0;
+    TEST("fleet roster: a row sealed by the fleet root names a member; a "
+         "row sealed by any other key names nobody and does not arm the "
+         "gate") {
+        struct node_db db;
+        uint8_t member[32], stranger[32];
+        const int64_t now = 700000;
+        memset(&db, 0, sizeof db);
+        ASSERT(node_db_open(&db, ":memory:"));
+        fbr_install(FBR_ROOT, false);
+        fbr_key(FBR_MEMBER, member);
+        fbr_key(FBR_STRANGER, stranger);
+        /* Nothing published: unarmed, so nothing is gated. */
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        /* A row sealed by ANOTHER operator: dropped, counted, arms nothing. */
+        ASSERT(fbr_member_row(&db, FBR_OTHER_ROOT, "forged", FBR_STRANGER,
+                              now));
+        ASSERT_EQ(boot_fleet_roster_check(&db, stranger, now),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        struct boot_fleet_roster_counts counts;
+        boot_fleet_roster_counts(&counts);
+        ASSERT(counts.bad_rows >= 1);
+        /* The fleet root's own row arms the gate and names its member. */
+        ASSERT(fbr_member_row(&db, FBR_ROOT, "m5", FBR_MEMBER, now));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        ASSERT_EQ(boot_fleet_roster_check(&db, stranger, now),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
+        /* The all-zero key is never a member. */
+        uint8_t zero[32] = {0};
+        ASSERT_EQ(boot_fleet_roster_check(&db, zero, now),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
+        /* A later junk roster note cannot shadow the member: every stored
+         * roster note is read. */
+        ASSERT(fbr_store_row(&db, FBR_STRANGER, "not a sealed line", now + 5,
+                             3600));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now + 5),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        /* A stranger who may post a note adds nobody by writing a
+         * roster-looking row under their own key. */
+        ASSERT(fbr_store_row(&db, FBR_STRANGER, "ZmFrZQ", now + 6, 3600));
+        ASSERT_EQ(boot_fleet_roster_check(&db, stranger, now + 6),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
+        fbr_uninstall();
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fleet_board_roster_root_standing(void)
+{
+    int failures = 0;
+    TEST("fleet roster: a revoked or rotated root invalidates the roster "
+         "(no fleet relay at all); an active or never-anchored root does "
+         "not") {
+        struct node_db db;
+        uint8_t member[32];
+        const int64_t now = 800000;
+        memset(&db, 0, sizeof db);
+        ASSERT(node_db_open(&db, ":memory:"));
+        fbr_install(FBR_ROOT, false);
+        fbr_key(FBR_MEMBER, member);
+        ASSERT(fbr_member_row(&db, FBR_ROOT, "m5", FBR_MEMBER, now));
+        /* Never anchored: tolerated, as step 1 tolerates it. */
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        ASSERT(fbr_anchor(&db, FBR_ROOT, ZID_IDENTITY_STATUS_ACTIVE));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        /* Rotated away: the seal is genuine and the roster is still dead. */
+        ASSERT(fbr_anchor(&db, FBR_ROOT, ZID_IDENTITY_STATUS_ROTATED));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_UNVERIFIABLE);
+        ASSERT(!boot_fleet_roster_admits_peer(&db, member, now));
+        ASSERT(fbr_anchor(&db, FBR_ROOT, ZID_IDENTITY_STATUS_REVOKED));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_UNVERIFIABLE);
+        struct boot_fleet_roster_counts counts;
+        boot_fleet_roster_counts(&counts);
+        ASSERT(counts.unverifiable >= 1);
+        /* A recorded root that cannot be read closes the gate: no fleet
+         * relay, and no pretence that the roster is simply absent. */
+        g_fbr.root_fail = true;
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_UNVERIFIABLE);
+        g_fbr.root_fail = false;
+        boot_fleet_roster_invalidate();
+        ASSERT(fbr_anchor(&db, FBR_ROOT, ZID_IDENTITY_STATUS_ACTIVE));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        fbr_uninstall();
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fleet_board_roster_lifetime(void)
+{
+    int failures = 0;
+    TEST("fleet roster: a roster note keeps its member through the reclaim "
+         "for its whole life, then the roster lapses to unarmed (today's "
+         "gate), never to a wider one") {
+        struct node_db db;
+        uint8_t member[32];
+        char line[FLEET_ENROL_MACHINE_TEXT_MAX];
+        const int64_t now = 1000000;
+        const int64_t later = now + 3 * 86400;
+        const int64_t gone = now + (int64_t)FLEET_BOARD_TTL_MAX + 4000;
+        memset(&db, 0, sizeof db);
+        ASSERT(node_db_open(&db, ":memory:"));
+        fbr_install(FBR_ROOT, false);
+        fbr_key(FBR_MEMBER, member);
+        ASSERT(fbr_line(FBR_ROOT, "m5", FBR_MEMBER, line, sizeof line));
+        ASSERT(fbr_store_row(&db, 1, line, now, FLEET_BOARD_TTL_MAX));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, later),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        /* The maintenance reclaim takes expired discussion posts back; a
+         * live roster note is not one. */
+        ASSERT_EQ(db_fleet_board_reclaim_expired(&db, later, NULL),
+                  FLEET_BOARD_RECLAIM_DONE);
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, later),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        /* Nobody republished it: past its TTL the roster is gone and the
+         * gate is UNARMED, which is the pairing-plus-role behaviour. */
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, gone),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        fbr_uninstall();
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+static int test_fleet_board_roster_bounds(void)
+{
+    int failures = 0;
+    TEST("fleet roster: the roster size and the row size are bounded") {
+        struct node_db db;
+        uint8_t seed[32], sink[32];
+        const int64_t now = 900000;
+        char huge[ZCL_FLEET_ROSTER_LINE_MAX + 8];
+        memset(&db, 0, sizeof db);
+        ASSERT(node_db_open(&db, ":memory:"));
+        fbr_install(FBR_ROOT, false);
+        /* A note past the board's text bound cannot carry a roster row at
+         * all; one that fits but is not sealed is counted bad and arms
+         * nothing. */
+        memset(huge, 'A', sizeof huge);
+        huge[FLEET_BOARD_TEXT_MAX + 1] = '\0';
+        {
+            struct fleet_board_post too_long;
+            fb_test_compose(&too_long, FLEET_BOARD_KIND_NOTE,
+                            BOOT_FLEET_ROSTER_AGENT, "x", 1000, 3600);
+            ASSERT(strlen(huge) > FLEET_BOARD_TEXT_MAX);
+            memcpy(too_long.text, huge, strlen(huge) + 1u);
+            too_long.text_len = (uint32_t)strlen(huge);
+            fb_test_scope(&too_long, FLEET_BOARD_SCOPE_FLEET, "");
+            ASSERT_EQ(fleet_board_post_validate(&too_long),
+                      FLEET_BOARD_ERR_TEXT);
+        }
+        huge[FLEET_BOARD_TEXT_MAX - 8] = '\0';
+        ASSERT(fbr_store_row(&db, 1, huge, now, 3600));
+        fbr_key(FBR_MEMBER, sink);
+        ASSERT_EQ(boot_fleet_roster_check(&db, sink, now),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        /* More members than the roster holds: the first
+         * BOOT_FLEET_ROSTER_MAX keys are kept, the rest are not admitted. */
+        for (int i = 0; i < BOOT_FLEET_ROSTER_MAX + 2; i++) {
+            char name[16], line[FLEET_ENROL_MACHINE_TEXT_MAX];
+            (void)snprintf(name, sizeof name, "box-%d", i);
+            /* Test identities 100.. are distinct board keys. */
+            ASSERT(fbr_line(FBR_ROOT, name, (uint8_t)(100 + i), line,
+                            sizeof line));
+            ASSERT(fbr_store_row(&db, (uint8_t)(30 + i / 10), line, now + i,
+                                 3600));
+        }
+        size_t admitted = 0;
+        for (int i = 0; i < BOOT_FLEET_ROSTER_MAX + 2; i++) {
+            uint8_t pub[32];
+            fb_test_identity((uint8_t)(100 + i), seed, pub);
+            if (boot_fleet_roster_check(&db, pub, now + 200) ==
+                BOOT_FLEET_ROSTER_MEMBER)
+                admitted++;
+        }
+        ASSERT_EQ(admitted, (size_t)BOOT_FLEET_ROSTER_MAX);
+        fbr_uninstall();
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* A raw P2P POST frame from `who`. */
+static bool fbr_post_frame(struct fleet_board_post *p, uint8_t who,
+                           uint8_t scope, const char *text, int64_t now,
+                           uint8_t *frame, size_t cap, size_t *len)
+{
+    uint8_t seed[32], pk[32];
+    fb_test_identity(who, seed, pk);
+    fb_test_compose(p, FLEET_BOARD_KIND_NOTE, "roster-fixture", text,
+                    (uint64_t)now, 3600);
+    fb_test_scope(p, scope, scope == FLEET_BOARD_SCOPE_PUBLIC ? "general" : "");
+    return fleet_board_post_sign(p, seed, pk) == FLEET_BOARD_OK &&
+           fleet_board_frame_encode_post(p, frame, cap, len) ==
+               FLEET_BOARD_OK;
+}
+
+static int test_fleet_board_roster_p2p_ingress(void)
+{
+    int failures = 0;
+    bool db_open = false;
+    struct node_db db;
+    memset(&db, 0, sizeof db);
+    TEST("fleet roster: with an armed roster a non-member's fleet post is "
+         "not accepted and costs the relay nothing; a member's, a public "
+         "one and a pre-scope one all are") {
+        const int64_t now = (int64_t)platform_time_wall_time_t();
+        uint8_t frame[FLEET_BOARD_FRAME_MAGIC_BYTES + 1 +
+                      FLEET_BOARD_BODY_MAX + FLEET_BOARD_SIG_BYTES];
+        size_t len = 0;
+        struct fleet_board_post from_stranger, from_member, public_post, legacy;
+        struct net_manager nm;
+        struct msg_processor mp;
+        struct p2p_node node;
+        struct boot_svc_ctx svc;
+        peer_scoring_init();
+        memset(&nm, 0, sizeof nm);
+        memset(&mp, 0, sizeof mp);
+        memset(&svc, 0, sizeof svc);
+        memset(&node, 0, sizeof node);
+        mp.net_mgr = &nm;
+        svc.node_db = &db;
+        svc.msg_processor = &mp;
+        node.id = 52;
+        (void)snprintf(node.addr_name, sizeof node.addr_name, "%s", "roster-fx");
+        node.addr.svc.addr.ip[10] = 0xff;
+        node.addr.svc.addr.ip[11] = 0xff;
+        node.addr.svc.addr.ip[12] = 198;
+        node.addr.svc.addr.ip[13] = 51;
+        node.addr.svc.addr.ip[14] = 100;
+        node.addr.svc.addr.ip[15] = 9;
+        ASSERT(node_db_open(&db, ":memory:"));
+        db_open = true;
+        boot_fleet_board_wire(&svc);
+        fbr_install(FBR_ROOT, false);
+
+        /* Unarmed: the stranger's fleet post lands, exactly as before. */
+        ASSERT(fbr_post_frame(&from_stranger, FBR_STRANGER,
+                              FLEET_BOARD_SCOPE_FLEET, "before the roster",
+                              now, frame, sizeof frame, &len));
+        ASSERT(boot_fleet_board_frame(&mp, &node, frame, len, NULL));
+        ASSERT(db_fleet_board_have(&db, from_stranger.id));
+
+        ASSERT(fbr_member_row(&db, FBR_ROOT, "m5", FBR_MEMBER, now));
+        int score = atomic_load(&node.misbehavior);
+
+        ASSERT(fbr_post_frame(&from_stranger, FBR_STRANGER,
+                              FLEET_BOARD_SCOPE_FLEET, "after the roster",
+                              now + 1, frame, sizeof frame, &len));
+        ASSERT(boot_fleet_board_frame(&mp, &node, frame, len, NULL));
+        ASSERT(!db_fleet_board_have(&db, from_stranger.id));
+        ASSERT_EQ(atomic_load(&node.misbehavior), score);
+
+        ASSERT(fbr_post_frame(&from_member, FBR_MEMBER,
+                              FLEET_BOARD_SCOPE_FLEET, "from a member",
+                              now + 1, frame, sizeof frame, &len));
+        ASSERT(boot_fleet_board_frame(&mp, &node, frame, len, NULL));
+        ASSERT(db_fleet_board_have(&db, from_member.id));
+
+        /* Public scope is untouched by the roster, even from a stranger. */
+        ASSERT(fbr_post_frame(&public_post, FBR_STRANGER,
+                              FLEET_BOARD_SCOPE_PUBLIC, "public as ever",
+                              now + 1, frame, sizeof frame, &len));
+        ASSERT(boot_fleet_board_frame(&mp, &node, frame, len, NULL));
+        ASSERT(db_fleet_board_have(&db, public_post.id));
+
+        /* An old-format (pre-scope, v1) row is still accepted. */
+        ASSERT(fbr_post_frame(&legacy, FBR_STRANGER,
+                              FLEET_BOARD_SCOPE_LEGACY_PUBLIC, "pre-scope",
+                              now + 1, frame, sizeof frame, &len));
+        ASSERT(boot_fleet_board_frame(&mp, &node, frame, len, NULL));
+        ASSERT(db_fleet_board_have(&db, legacy.id));
+        ASSERT_EQ(atomic_load(&node.misbehavior), score);
+
+        /* Fail closed: once the root is revoked even a member's fleet post
+         * is not accepted, and public scope still is. */
+        ASSERT(fbr_anchor(&db, FBR_ROOT, ZID_IDENTITY_STATUS_REVOKED));
+        ASSERT(fbr_post_frame(&from_member, FBR_MEMBER,
+                              FLEET_BOARD_SCOPE_FLEET, "after revocation",
+                              now + 2, frame, sizeof frame, &len));
+        ASSERT(boot_fleet_board_frame(&mp, &node, frame, len, NULL));
+        ASSERT(!db_fleet_board_have(&db, from_member.id));
+        PASS();
+    } _test_next:;
+    fbr_uninstall();
+    boot_fleet_board_shutdown();
+    if (db_open)
+        node_db_close(&db);
+    return failures;
+}
+
+/* A roster row is an ordinary signed fleet note: the unchanged v2
+ * codec round-trips and verifies it, so a node that predates the roster
+ * stores it as the note it is. */
+static int test_fleet_board_roster_row_is_an_old_row(void)
+{
+    int failures = 0;
+    TEST("fleet roster: a roster row is an ordinary fleet note "
+         "the unchanged codec verifies") {
+        char line[FLEET_ENROL_MACHINE_TEXT_MAX];
+        uint8_t seed[32], pk[32], wire[FLEET_BOARD_BODY_MAX + 128];
+        struct fleet_board_post p, decoded;
+        size_t wire_len = 0;
+        ASSERT(fbr_line(FBR_ROOT, "m5", FBR_MEMBER, line, sizeof line));
+        ASSERT(strlen(line) < ZCL_FLEET_ROSTER_LINE_MAX);
+        fb_test_identity(1, seed, pk);
+        fb_test_compose(&p, FLEET_BOARD_KIND_NOTE, BOOT_FLEET_ROSTER_AGENT,
+                        line, 1000, 3600);
+        fb_test_scope(&p, FLEET_BOARD_SCOPE_FLEET, "");
+        ASSERT_EQ(fleet_board_post_sign(&p, seed, pk), FLEET_BOARD_OK);
+        ASSERT(boot_fleet_roster_is_row(&p));
+        ASSERT_EQ(fleet_board_post_encode(&p, wire, sizeof wire, &wire_len),
+                  FLEET_BOARD_OK);
+        ASSERT_EQ(fleet_board_post_decode(wire, wire_len, &decoded),
+                  FLEET_BOARD_OK);
+        ASSERT_EQ(decoded.kind, FLEET_BOARD_KIND_NOTE);
+        ASSERT_EQ(decoded.scope, FLEET_BOARD_SCOPE_FLEET);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The manager publishes its own sealed roster onto the board, once. */
+static int test_fleet_board_roster_publish(void)
+{
+    int failures = 0;
+    struct fb_rpc_env env;
+    bool open = false;
+    char dir[256] = {0};
+    TEST("fleet roster: the manager publishes each sealed line once, "
+         "re-publishes only a changed one, and a non-manager publishes "
+         "nothing") {
+        const int64_t now = (int64_t)platform_time_wall_time_t();
+        uint8_t member[32];
+        open = fb_rpc_env_open(&env);
+        ASSERT(open);
+        test_make_tmpdir(dir, sizeof dir, "fleet_board", "roster");
+        env.svc.datadir = dir;
+        fbr_install(FBR_ROOT, true);
+        boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_ON);
+        fbr_key(FBR_MEMBER, member);
+        ASSERT(fbr_line(FBR_ROOT, "m5", FBR_MEMBER, g_fbr.lines[0],
+                        sizeof g_fbr.lines[0]));
+        ASSERT(fbr_line(FBR_OTHER_ROOT, "alien", FBR_STRANGER, g_fbr.lines[1],
+                        sizeof g_fbr.lines[1]));
+        g_fbr.n_lines = 2;
+        ASSERT_EQ(boot_fleet_roster_publish(&env.db, now), (size_t)1);
+        ASSERT_EQ(boot_fleet_roster_check(&env.db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        /* Nothing changed: nothing written. */
+        ASSERT_EQ(boot_fleet_roster_publish(&env.db, now + 60), (size_t)0);
+        /* The same machine re-admitted under a changed line: one new note. */
+        ASSERT(fbr_line(FBR_ROOT, "m5-renamed", FBR_MEMBER, g_fbr.lines[0],
+                        sizeof g_fbr.lines[0]));
+        ASSERT_EQ(boot_fleet_roster_publish(&env.db, now + 90), (size_t)1);
+        /* A young live copy is left alone; an old one is written again
+         * before it can lapse. */
+        ASSERT_EQ(boot_fleet_roster_publish(&env.db, now + 120), (size_t)0);
+        ASSERT_EQ(boot_fleet_roster_publish(
+                      &env.db, now + BOOT_FLEET_ROSTER_REPUBLISH_S + 100),
+                  (size_t)1);
+        /* A box that is not the root's own box publishes nothing. */
+        g_fbr.manager = false;
+        ASSERT(fbr_line(FBR_ROOT, "m6", FBR_STRANGER, g_fbr.lines[2],
+                        sizeof g_fbr.lines[2]));
+        g_fbr.n_lines = 3;
+        ASSERT_EQ(boot_fleet_roster_publish(&env.db, now + BOOT_FLEET_ROSTER_REPUBLISH_S + 200), (size_t)0);
+        /* The local RPC is an ingest path too: a roster-shaped note that the
+         * root did not seal is refused and not stored. */
+        {
+            struct fleet_board_post junk;
+            fb_test_compose(&junk, FLEET_BOARD_KIND_NOTE,
+                            BOOT_FLEET_ROSTER_AGENT, "not a sealed line",
+                            (uint64_t)now, 3600);
+            fb_test_scope(&junk, FLEET_BOARD_SCOPE_FLEET, "");
+            ASSERT_EQ(boot_fleet_board_publish(&junk, now),
+                      FLEET_BOARD_ERR_SIGNATURE);
+            ASSERT(!db_fleet_board_have(&env.db, junk.id));
+        }
+        PASS();
+    } _test_next:;
+    fbr_uninstall();
+    if (open)
+        fb_rpc_env_close(&env);
+    if (dir[0])
+        test_rm_rf_recursive(dir);
+    return failures;
+}
+
+/* A one-peer P2P ingress rig over `db`. */
+struct fbr_p2p {
+    struct net_manager nm;
+    struct msg_processor mp;
+    struct p2p_node node;
+    struct boot_svc_ctx svc;
+};
+
+static void fbr_p2p_init(struct fbr_p2p *x, struct node_db *db, int64_t id)
+{
+    peer_scoring_init();
+    memset(x, 0, sizeof *x);
+    x->mp.net_mgr = &x->nm;
+    x->svc.node_db = db;
+    x->svc.msg_processor = &x->mp;
+    x->node.id = id;
+    (void)snprintf(x->node.addr_name, sizeof x->node.addr_name, "%s",
+                   "roster-fx");
+    x->node.addr.svc.addr.ip[10] = 0xff;
+    x->node.addr.svc.addr.ip[11] = 0xff;
+    x->node.addr.svc.addr.ip[12] = 198;
+    x->node.addr.svc.addr.ip[13] = 51;
+    x->node.addr.svc.addr.ip[14] = 100;
+    x->node.addr.svc.addr.ip[15] = (uint8_t)id;
+}
+
+/* A raw P2P POST frame carrying a roster-shaped note from `who`. */
+static bool fbr_row_frame(struct fleet_board_post *p, uint8_t who,
+                          const char *text, int64_t now, uint8_t *frame,
+                          size_t cap, size_t *len)
+{
+    uint8_t seed[32], pk[32];
+    fb_test_identity(who, seed, pk);
+    fb_test_compose(p, FLEET_BOARD_KIND_NOTE, BOOT_FLEET_ROSTER_AGENT, text,
+                    (uint64_t)now, 3600);
+    fb_test_scope(p, FLEET_BOARD_SCOPE_FLEET, "");
+    return fleet_board_post_sign(p, seed, pk) == FLEET_BOARD_OK &&
+           fleet_board_frame_encode_post(p, frame, cap, len) ==
+               FLEET_BOARD_OK;
+}
+
+/* A roster row is stored only if its seal verifies: a junk or foreign-sealed
+ * one is refused on the P2P path, whoever posts it, and costs the cache
+ * nothing. */
+static int test_fleet_board_roster_ingress_seal(void)
+{
+    int failures = 0;
+    bool db_open = false;
+    struct node_db db;
+    static struct fbr_p2p x;
+    memset(&db, 0, sizeof db);
+    TEST("fleet roster ingress: a junk or foreign-sealed roster row posted "
+         "by a member or a non-member is refused and not stored, leaves the "
+         "cached roster alone, and a sealed row is stored and verified once") {
+        const int64_t now = (int64_t)platform_time_wall_time_t();
+        uint8_t frame[FLEET_BOARD_FRAME_MAGIC_BYTES + 1 +
+                      FLEET_BOARD_BODY_MAX + FLEET_BOARD_SIG_BYTES];
+        size_t len = 0;
+        struct fleet_board_post p;
+        char foreign[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char genuine[FLEET_ENROL_MACHINE_TEXT_MAX];
+        uint8_t member[32], newcomer[32];
+        struct boot_fleet_roster_counts c0, c1;
+        ASSERT(node_db_open(&db, ":memory:"));
+        db_open = true;
+        fbr_p2p_init(&x, &db, 53);
+        boot_fleet_board_wire(&x.svc);
+        fbr_install(FBR_ROOT, false);
+        fbr_key(FBR_MEMBER, member);
+        ASSERT(fbr_member_row(&db, FBR_ROOT, "m5", FBR_MEMBER, now));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        boot_fleet_roster_counts(&c0);
+        int score = atomic_load(&x.node.misbehavior);
+        ASSERT(fbr_line(FBR_OTHER_ROOT, "alien", FBR_STRANGER, foreign,
+                        sizeof foreign));
+        const char *junk[] = { "not a sealed line", "ZmFrZQ", foreign };
+        const uint8_t who[] = { FBR_STRANGER, FBR_MEMBER };
+        int sent = 0;
+        for (size_t w = 0; w < 2; w++)
+            for (size_t j = 0; j < 3; j++) {
+                ASSERT(fbr_row_frame(&p, who[w], junk[j], now + sent++, frame,
+                                     sizeof frame, &len));
+                ASSERT(boot_fleet_board_frame(&x.mp, &x.node, frame, len,
+                                              NULL));
+                ASSERT(!db_fleet_board_have(&db, p.id));
+            }
+        ASSERT_EQ(atomic_load(&x.node.misbehavior), score);
+        /* Not one of them dropped the cache. */
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        boot_fleet_roster_counts(&c1);
+        ASSERT_EQ(c1.rebuilds, c0.rebuilds);
+        ASSERT_EQ(c1.bad_rows, c0.bad_rows + 6);
+        /* Six refusals, one log line: the rest are counted. */
+        uint64_t skipped = 0;
+        ASSERT(boot_fleet_roster_log_due(BOOT_FLEET_ROSTER_LOG_POST_DROPPED,
+                                         now + 1000, &skipped));
+        ASSERT_EQ(skipped, (uint64_t)5);
+
+        /* A genuinely sealed row is stored, whoever carries it, and the
+         * cache is dropped once. */
+        fbr_key(11, newcomer);
+        ASSERT(fbr_line(FBR_ROOT, "m11", 11, genuine, sizeof genuine));
+        ASSERT(fbr_row_frame(&p, FBR_STRANGER, genuine, now + 20, frame,
+                             sizeof frame, &len));
+        boot_fleet_roster_counts(&c0);
+        ASSERT(boot_fleet_board_frame(&x.mp, &x.node, frame, len, NULL));
+        ASSERT(db_fleet_board_have(&db, p.id));
+        boot_fleet_roster_counts(&c1);
+        ASSERT_EQ(c1.verifies, c0.verifies + 1);
+        ASSERT_EQ(boot_fleet_roster_check(&db, newcomer, now + 20),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        /* The same frame again costs no second verify. */
+        boot_fleet_roster_counts(&c0);
+        ASSERT(boot_fleet_board_frame(&x.mp, &x.node, frame, len, NULL));
+        boot_fleet_roster_counts(&c1);
+        ASSERT_EQ(c1.verifies, c0.verifies);
+        PASS();
+    } _test_next:;
+    fbr_uninstall();
+    boot_fleet_board_shutdown();
+    if (db_open)
+        node_db_close(&db);
+    return failures;
+}
+
+/* The opt-in, the announcement of each change of state, the local switch-off
+ * and the manager that publishes nothing by default. */
+static int test_fleet_board_roster_arming(void)
+{
+    int failures = 0;
+    struct fb_rpc_env env;
+    bool open = false;
+    char dir[256] = {0};
+    TEST("fleet roster arming: nothing is published without the opt-in; "
+         "arming and each way back down are announced once; "
+         "-fleetrostergate=0 disarms the box") {
+        const int64_t now = (int64_t)platform_time_wall_time_t();
+        const int64_t gone = now + (int64_t)FLEET_BOARD_TTL_MAX + 4000;
+        uint8_t member[32], stranger[32];
+        struct boot_fleet_roster_counts c;
+        open = fb_rpc_env_open(&env);
+        ASSERT(open);
+        test_make_tmpdir(dir, sizeof dir, "fleet_board", "arming");
+        env.svc.datadir = dir;
+        fbr_install(FBR_ROOT, true);
+        fbr_key(FBR_MEMBER, member);
+        fbr_key(FBR_STRANGER, stranger);
+        ASSERT(fbr_line(FBR_ROOT, "m5", FBR_MEMBER, g_fbr.lines[0],
+                        sizeof g_fbr.lines[0]));
+        g_fbr.n_lines = 1;
+
+        /* Default: a manager with sealed lines still writes nothing, and
+         * nobody is gated. */
+        ASSERT_EQ(boot_fleet_roster_gate(), BOOT_FLEET_ROSTER_GATE_DEFAULT);
+        ASSERT_EQ(boot_fleet_roster_publish(&env.db, now), (size_t)0);
+        ASSERT_EQ(boot_fleet_roster_check(&env.db, member, now),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_OFF);
+        ASSERT_EQ(boot_fleet_roster_publish(&env.db, now), (size_t)0);
+
+        /* The opt-in publishes and arms, announced once. */
+        boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_ON);
+        ASSERT_EQ(boot_fleet_roster_publish(&env.db, now), (size_t)1);
+        ASSERT_EQ(boot_fleet_roster_check(&env.db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&env.db, stranger, now + 1),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
+        boot_fleet_roster_counts(&c);
+        ASSERT_EQ(c.armed_events, (uint64_t)1);
+        ASSERT_EQ(c.lapse_events, (uint64_t)0);
+
+        /* The escape hatch: this box stops enforcing, and says so once. */
+        boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_OFF);
+        ASSERT_EQ(boot_fleet_roster_check(&env.db, stranger, now + 2),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        ASSERT(boot_fleet_roster_admits_peer(&env.db, stranger, now + 2));
+        boot_fleet_roster_counts(&c);
+        ASSERT_EQ(c.lapse_events, (uint64_t)1);
+        boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_ON);
+        ASSERT_EQ(boot_fleet_roster_check(&env.db, stranger, now + 3),
+                  BOOT_FLEET_ROSTER_NOT_MEMBER);
+        boot_fleet_roster_counts(&c);
+        ASSERT_EQ(c.armed_events, (uint64_t)2);
+
+        /* Nobody republished it: past its TTL the roster lapses, loudly. */
+        ASSERT_EQ(boot_fleet_roster_check(&env.db, stranger, gone),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        boot_fleet_roster_counts(&c);
+        ASSERT_EQ(c.lapse_events, (uint64_t)2);
+        PASS();
+    } _test_next:;
+    fbr_uninstall();
+    if (open)
+        fb_rpc_env_close(&env);
+    if (dir[0])
+        test_rm_rf_recursive(dir);
+    return failures;
+}
+
+/* A flag on the node's command line is what arms the manager. */
+static int test_fleet_board_roster_gate_flag(void)
+{
+    int failures = 0;
+    TEST("fleet roster: -fleetrostergate arms the manager, "
+         "-fleetrostergate=0 switches the box off, and the default is "
+         "neither") {
+        struct app_context ctx;
+        bool show = false;
+        char *none[] = { "zclassic23" };
+        char *on[] = { "zclassic23", "-fleetrostergate" };
+        char *on1[] = { "zclassic23", "-fleetrostergate=1" };
+        char *off[] = { "zclassic23", "-fleetrostergate=0" };
+        boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_DEFAULT);
+        memset(&ctx, 0, sizeof ctx);
+        ASSERT_EQ(args_parse_node_options(1, none, &ctx, &show), -1);
+        ASSERT_EQ(boot_fleet_roster_gate(), BOOT_FLEET_ROSTER_GATE_DEFAULT);
+        memset(&ctx, 0, sizeof ctx);
+        ASSERT_EQ(args_parse_node_options(2, on, &ctx, &show), -1);
+        ASSERT_EQ(boot_fleet_roster_gate(), BOOT_FLEET_ROSTER_GATE_ON);
+        boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_DEFAULT);
+        memset(&ctx, 0, sizeof ctx);
+        ASSERT_EQ(args_parse_node_options(2, on1, &ctx, &show), -1);
+        ASSERT_EQ(boot_fleet_roster_gate(), BOOT_FLEET_ROSTER_GATE_ON);
+        memset(&ctx, 0, sizeof ctx);
+        ASSERT_EQ(args_parse_node_options(2, off, &ctx, &show), -1);
+        ASSERT_EQ(boot_fleet_roster_gate(), BOOT_FLEET_ROSTER_GATE_OFF);
+        PASS();
+    } _test_next:;
+    boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_DEFAULT);
+    boot_fleet_roster_test_reset();
+    return failures;
+}
+
+/* A read that fails is "cannot tell", never "no roster". */
+static int test_fleet_board_roster_read_failure(void)
+{
+    int failures = 0;
+    TEST("fleet roster: a roster that cannot be read from the store is "
+         "unverifiable (no fleet relay), not unarmed") {
+        struct node_db db;
+        uint8_t member[32];
+        struct db_fleet_board_post rows[4];
+        struct boot_fleet_roster_counts c;
+        bool complete = false;
+        const int64_t now = 1100000;
+        memset(&db, 0, sizeof db);
+        ASSERT(node_db_open(&db, ":memory:"));
+        fbr_install(FBR_ROOT, false);
+        fbr_key(FBR_MEMBER, member);
+        /* A healthy empty store is unarmed, and says it read completely. */
+        (void)db_fleet_board_list_checked(&db, NULL, now, rows, 4, &complete);
+        ASSERT(complete);
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_UNARMED);
+        ASSERT(fbr_member_row(&db, FBR_ROOT, "m5", FBR_MEMBER, now));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+
+        /* The table cannot be read: the same store, a failed prepare. There
+         * is no fault-injection seam on the board store, so the table is
+         * taken away, which fails the query for the same reason an I/O error
+         * would. */
+        ASSERT(node_db_exec(&db, "ALTER TABLE fleet_board_posts RENAME TO "
+                                 "fleet_board_posts_gone"));
+        (void)db_fleet_board_list_checked(&db, NULL, now, rows, 4, &complete);
+        ASSERT(!complete);
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_UNVERIFIABLE);
+        ASSERT(!boot_fleet_roster_admits_peer(&db, member, now));
+        boot_fleet_roster_counts(&c);
+        ASSERT(c.unverifiable >= 1);
+        ASSERT(node_db_exec(&db, "ALTER TABLE fleet_board_posts_gone RENAME "
+                                 "TO fleet_board_posts"));
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_MEMBER);
+
+        /* A stored roster row that no longer decodes may be the very row
+         * that names a member: also "cannot tell". */
+        ASSERT(node_db_exec(&db, "UPDATE fleet_board_posts SET text='altered' "
+                                 "WHERE agent='fleet-roster'"));
+        (void)db_fleet_board_list_checked(&db, NULL, now, rows, 4, &complete);
+        ASSERT(!complete);
+        boot_fleet_roster_invalidate();
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now),
+                  BOOT_FLEET_ROSTER_UNVERIFIABLE);
+        fbr_uninstall();
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+struct fbr_hammer {
+    struct node_db *db;
+    const uint8_t *key;
+    int64_t now;
+    atomic_int wrong;
+};
+
+static void *fbr_hammer_run(void *arg)
+{
+    struct fbr_hammer *h = arg;
+    for (int i = 0; i < 200; i++)
+        if (boot_fleet_roster_check(h->db, h->key, h->now) !=
+            BOOT_FLEET_ROSTER_MEMBER)
+            atomic_fetch_add(&h->wrong, 1);
+    return NULL;
+}
+
+/* One rebuild at a time, one verify per distinct line, none per post. */
+static int test_fleet_board_roster_cost(void)
+{
+    int failures = 0;
+    TEST("fleet roster cost: republished copies are verified once, a post "
+         "on the cached path costs no verify, and concurrent askers share "
+         "one rebuild") {
+        enum { LINES = 40, THREADS = 8 };
+        struct node_db db;
+        uint8_t member[32], stranger[32], seed[32];
+        struct boot_fleet_roster_counts c0, c1;
+        struct fleet_board_post p;
+        char line[FLEET_ENROL_MACHINE_TEXT_MAX];
+        const int64_t now = 1200000;
+        memset(&db, 0, sizeof db);
+        ASSERT(node_db_open(&db, ":memory:"));
+        fbr_install(FBR_ROOT, false);
+        fbr_key(FBR_MEMBER, member);
+        fbr_key(FBR_STRANGER, stranger);
+        /* Four copies of one line (a republish every 10 days leaves up to
+         * three live) plus LINES - 1 other members. */
+        ASSERT(fbr_line(FBR_ROOT, "m5", FBR_MEMBER, line, sizeof line));
+        for (int i = 0; i < 4; i++)
+            ASSERT(fbr_store_row(&db, 1, line, now + i, 3600));
+        for (int i = 1; i < LINES; i++) {
+            char name[16];
+            (void)snprintf(name, sizeof name, "box-%d", i);
+            ASSERT(fbr_line(FBR_ROOT, name, (uint8_t)(100 + i), line,
+                            sizeof line));
+            ASSERT(fbr_store_row(&db, (uint8_t)(30 + i % 8), line, now + 10 + i,
+                                 3600));
+        }
+        boot_fleet_roster_counts(&c0);
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now + 100),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        boot_fleet_roster_counts(&c1);
+        ASSERT_EQ(c1.rebuilds, c0.rebuilds + 1);
+        ASSERT_EQ(c1.verifies, c0.verifies + LINES); /* not LINES + 3 */
+
+        /* The cached path: a thousand fleet posts, from a member and from a
+         * stranger, cost no verify and no rebuild. */
+        fb_test_identity(FBR_MEMBER, seed, member);
+        fb_test_compose(&p, FLEET_BOARD_KIND_NOTE, "carrier", "hot", 1, 3600);
+        fb_test_scope(&p, FLEET_BOARD_SCOPE_FLEET, "");
+        ASSERT_EQ(fleet_board_post_sign(&p, seed, member), FLEET_BOARD_OK);
+        boot_fleet_roster_counts(&c0);
+        for (int i = 0; i < 1000; i++)
+            ASSERT(boot_fleet_roster_admits_post(&db, &p, now + 100));
+        fb_test_identity(FBR_STRANGER, seed, stranger);
+        ASSERT_EQ(fleet_board_post_sign(&p, seed, stranger), FLEET_BOARD_OK);
+        for (int i = 0; i < 1000; i++)
+            ASSERT(!boot_fleet_roster_admits_post(&db, &p, now + 100));
+        boot_fleet_roster_counts(&c1);
+        ASSERT_EQ(c1.verifies, c0.verifies);
+        ASSERT_EQ(c1.rebuilds, c0.rebuilds);
+
+        /* A rebuild that finds the same lines again does not verify them
+         * again; a change of the root's chain state does, and refuses them. */
+        boot_fleet_roster_invalidate();
+        boot_fleet_roster_counts(&c0);
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now + 101),
+                  BOOT_FLEET_ROSTER_MEMBER);
+        boot_fleet_roster_counts(&c1);
+        ASSERT_EQ(c1.rebuilds, c0.rebuilds + 1);
+        ASSERT_EQ(c1.verifies, c0.verifies);
+        ASSERT(fbr_anchor(&db, FBR_ROOT, ZID_IDENTITY_STATUS_REVOKED));
+        boot_fleet_roster_counts(&c0);
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now + 102),
+                  BOOT_FLEET_ROSTER_UNVERIFIABLE);
+        boot_fleet_roster_counts(&c1);
+        ASSERT_EQ(c1.verifies, c0.verifies + LINES);
+        ASSERT(fbr_anchor(&db, FBR_ROOT, ZID_IDENTITY_STATUS_ACTIVE));
+        ASSERT_EQ(boot_fleet_roster_check(&db, member, now + 103),
+                  BOOT_FLEET_ROSTER_MEMBER);
+
+        /* Single flight: after the roster changes, and again from a cold
+         * start, many threads asking at once cause one rebuild. */
+        for (int phase = 0; phase < 2; phase++) {
+            pthread_t t[THREADS];
+            struct fbr_hammer h = { .db = &db, .key = member,
+                                    .now = now + 200 };
+            atomic_init(&h.wrong, 0);
+            if (phase == 0)
+                boot_fleet_roster_invalidate();
+            else
+                boot_fleet_roster_test_reset();
+            boot_fleet_roster_test_build_delay_ms(60); /* askers arrive mid-build */
+            boot_fleet_roster_counts(&c0);
+            for (int i = 0; i < THREADS; i++)
+                ASSERT_EQ(pthread_create(&t[i], NULL, fbr_hammer_run, &h), 0);
+            for (int i = 0; i < THREADS; i++)
+                ASSERT_EQ(pthread_join(t[i], NULL), 0);
+            boot_fleet_roster_test_build_delay_ms(0);
+            boot_fleet_roster_counts(&c1);
+            ASSERT_EQ(atomic_load(&h.wrong), 0);
+            ASSERT_EQ(c1.rebuilds, c0.rebuilds + 1);
+        }
+        fbr_uninstall();
+        node_db_close(&db);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
+/* The relay gate on the paired board stream: a member peer is served, a
+ * non-member is not, an unverifiable roster serves nobody, and an author
+ * who is not a member is not accepted off the stream. */
+static int test_fleet_board_roster_relay(void)
+{
+    int failures = 0;
+    static struct fbw w;
+    struct fleet_board_post a_member, after_revoke, after_member, after_stranger;
+    struct zcl_fleet_role_checker checker = {
+        .allow = fbw_role_check, .name = "fleet-board-roster-test" };
+    struct boot_fleet_roster_counts rb, ra;
+    size_t frames = 0;
+    uint8_t member[32];
+    g_fbw_deny_read = false;
+    zcl_fleet_role_checker_install(&checker);
+    bool opened = fbw_open(&w);
+    TEST("fleet roster relay: a roster member peer is served fleet posts, a "
+         "non-member peer is not, a revoked root serves nobody, and a "
+         "non-member author is not accepted") {
+        const int64_t now = FBW_NOW;
+        ASSERT(opened);
+        ASSERT(mesh_term_pair_row(&w.f, &w.f.term_peer,
+                                  MESH_PAIRING_CAP_STATUS_READ, FBW_PAIRED_AT,
+                                  FBW_PAIRING_EXPIRES));
+        boot_fleet_board_fleet_test_bind_authority(&w.f.term_peer.delegation,
+                                                   w.f.genesis, FBW_NOW);
+        boot_fleet_board_fleet_test_bind(&w.a);
+        fbr_install(FBR_ROOT, false);
+        fbr_key(FBR_MEMBER, member);
+        /* The fixture's delegation carries an online key nobody holds a
+         * seed for; the verifier stands FBR_PEER in for it (see top). */
+        g_fbr.remap = true;
+        fbr_key(FBR_PEER, g_fbr.remap_from);
+        memcpy(g_fbr.remap_to, w.f.term_peer.delegation.online_pubkey, 32);
+
+        /* UNARMED: fleet carriage is what it was before this step. */
+        ASSERT(fbw_post(&w.a, FBR_MEMBER, FLEET_BOARD_SCOPE_FLEET,
+                        "unarmed note", 2000, 3600, 2000, &a_member));
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)1);
+        ASSERT(db_fleet_board_have(&w.b, a_member.id));
+
+        /* ARMED, peer not on the roster: the pull is refused before a row
+         * is read; nothing is served, and it is counted. */
+        ASSERT(fbr_member_row(&w.a, FBR_ROOT, "m5", FBR_MEMBER, now));
+        ASSERT(fbw_post(&w.a, FBR_MEMBER, FLEET_BOARD_SCOPE_FLEET,
+                        "for members only", 2100, 3600, 2100, &after_member));
+        boot_fleet_roster_counts(&rb);
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)0);
+        ASSERT_EQ(frames, (size_t)1); /* the refusal alone */
+        boot_fleet_roster_counts(&ra);
+        ASSERT_EQ(ra.non_member, rb.non_member + 1);
+        ASSERT(!db_fleet_board_have(&w.b, after_member.id));
+
+        /* The asking half asks the roster too, before it opens a stream:
+         * board_peer_due refuses a peer that is not on it. (The fixture's
+         * paired row names a noise key no node is connected as, so the
+         * stream itself cannot be watched; the roster's own refusal count
+         * is what the call leaves behind.) */
+        boot_fleet_roster_counts(&rb);
+        boot_fleet_board_fleet_test_pull_paired(now);
+        boot_fleet_roster_counts(&ra);
+        ASSERT_EQ(ra.non_member, rb.non_member + 1);
+
+        /* The peer joins the roster: served within the next pull. */
+        ASSERT(fbr_member_row(&w.a, FBR_ROOT, "peerbox", FBR_PEER, now + 1));
+        ASSERT(fbw_pull(&w, w.box_a, &w.b, &frames) >= (size_t)1);
+        ASSERT(db_fleet_board_have(&w.b, after_member.id));
+        /* On the roster, the same call is not refused: so the refusal above
+         * was the roster's and nothing else's. */
+        boot_fleet_roster_counts(&rb);
+        boot_fleet_board_fleet_test_pull_paired(now);
+        boot_fleet_roster_counts(&ra);
+        ASSERT_EQ(ra.non_member, rb.non_member);
+        ASSERT_EQ(ra.unverifiable, rb.unverifiable);
+
+        /* The root is revoked on chain: the roster is unverifiable and the
+         * answering box serves nobody, member or not. */
+        ASSERT(fbw_post(&w.a, FBR_MEMBER, FLEET_BOARD_SCOPE_FLEET,
+                        "after revocation", 2200, 3600, 2200, &after_revoke));
+        ASSERT(fbr_anchor(&w.a, FBR_ROOT, ZID_IDENTITY_STATUS_REVOKED));
+        boot_fleet_roster_counts(&rb);
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)0);
+        boot_fleet_roster_counts(&ra);
+        ASSERT_EQ(ra.unverifiable, rb.unverifiable + 1);
+        ASSERT(!db_fleet_board_have(&w.b, after_revoke.id));
+        PASS();
+    }
+    TEST("fleet roster relay: an armed asking box does not accept a "
+         "non-member author off the stream, and takes a member's") {
+        /* A fresh answering store with no roster of its own, so it serves
+         * everything; the asking store is the armed one. */
+        struct node_db fresh;
+        uint8_t junk_id[32];
+        memset(&fresh, 0, sizeof fresh);
+        ASSERT(node_db_open(&fresh, ":memory:"));
+        boot_fleet_board_fleet_test_new_epoch(); /* a different store answers */
+        boot_fleet_board_fleet_test_bind(&fresh);
+        ASSERT(fbw_post(&fresh, FBR_MEMBER, FLEET_BOARD_SCOPE_FLEET,
+                        "by a member", 2300, 3600, 2300, &after_member));
+        ASSERT(fbw_post(&fresh, FBR_STRANGER, FLEET_BOARD_SCOPE_FLEET,
+                        "by a stranger", 2300, 3600, 2300, &after_stranger));
+        /* A roster-shaped note nobody sealed rides the same stream and is
+         * refused at the asking box, whoever authored it. */
+        ASSERT(fbr_store_row_id(&fresh, FBR_MEMBER, "not a sealed line", 2300,
+                                3600, junk_id));
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)1);
+        ASSERT(db_fleet_board_have(&w.b, after_member.id));
+        ASSERT(!db_fleet_board_have(&w.b, after_stranger.id));
+        ASSERT(!db_fleet_board_have(&w.b, junk_id));
+        node_db_close(&fresh);
+        PASS();
+    }
+    TEST("fleet roster relay: a box with no fleet root pulls a roster row "
+         "from an armed manager, stores it as the ordinary note it was "
+         "before this step, and defers nothing") {
+        struct node_db fresh;
+        struct boot_fleet_board_fleet_counts fb, fa;
+        char line[FLEET_ENROL_MACHINE_TEXT_MAX];
+        uint8_t row_id[32];
+        memset(&fresh, 0, sizeof fresh);
+        ASSERT(node_db_open(&fresh, ":memory:"));
+        boot_fleet_board_fleet_test_new_epoch();
+        boot_fleet_board_fleet_test_bind(&fresh);
+        ASSERT(fbr_line(FBR_ROOT, "m77", 77, line, sizeof line));
+        ASSERT(fbr_store_row_id(&fresh, FBR_MEMBER, line, 2400, 3600, row_id));
+        g_fbr.present = false; /* this box has no fleet root */
+        boot_fleet_roster_invalidate();
+        boot_fleet_board_fleet_counts(&fb);
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)1);
+        boot_fleet_board_fleet_counts(&fa);
+        ASSERT(db_fleet_board_have(&w.b, row_id));
+        ASSERT_EQ(fa.deferred, fb.deferred);
+        /* The cursor moved on: the next pull has nothing to offer again. */
+        ASSERT_EQ(fbw_pull(&w, w.box_a, &w.b, &frames), (size_t)0);
+        boot_fleet_board_fleet_counts(&fb);
+        ASSERT_EQ(fb.deferred, fa.deferred);
+        g_fbr.present = true;
+        node_db_close(&fresh);
+        PASS();
+    }
+    _test_next:;
+    fbr_uninstall();
+    fbw_close(&w);
+    zcl_fleet_role_checker_install_permissive_for_testing();
+    return failures;
+}
+
 int test_fleet_board(void)
 {
     int failures = 0;
@@ -6210,6 +7382,19 @@ int test_fleet_board(void)
     failures += test_fleet_board_fleet_carriage_gap_free();
     failures += test_fleet_board_fleet_wiki_full_is_final();
     failures += test_fleet_board_fleet_quota();
+    failures += test_fleet_board_roster_membership();
+    failures += test_fleet_board_roster_root_standing();
+    failures += test_fleet_board_roster_lifetime();
+    failures += test_fleet_board_roster_bounds();
+    failures += test_fleet_board_roster_row_is_an_old_row();
+    failures += test_fleet_board_roster_p2p_ingress();
+    failures += test_fleet_board_roster_ingress_seal();
+    failures += test_fleet_board_roster_arming();
+    failures += test_fleet_board_roster_gate_flag();
+    failures += test_fleet_board_roster_read_failure();
+    failures += test_fleet_board_roster_cost();
+    failures += test_fleet_board_roster_publish();
+    failures += test_fleet_board_roster_relay();
     failures += test_fleet_board_public_no_grant_needed();
     /* Leave the process as this group found it: the next group in the same
      * binary must not inherit an open gate. */

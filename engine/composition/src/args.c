@@ -15,6 +15,7 @@
 #include "config/args.h"
 #include "config/boot.h"
 #include "config/boot_error.h"
+#include "config/boot_fleet_roster.h"
 #include "controllers/agent_controller.h"  /* agent_print_native_usage (print_usage) */
 #include "hotswap/hotswap_module.h"
 #include "kernel/command_registry.h"
@@ -76,6 +77,16 @@ void print_usage(const char *prog)
     printf("  -onion-rotate       With -onion-persist: archive the current\n");
     printf("                      identity and mint a fresh one (logs old+new\n");
     printf("                      addresses)\n");
+    printf("  -fleetrostergate[=0]  Fleet-scope board relay between roster\n");
+    printf("                      members only (ZRC 0012). Give it to the\n");
+    printf("                      MANAGER (the box whose key is the fleet\n");
+    printf("                      root): that is the fleet-wide opt-in, and it\n");
+    printf("                      publishes each admitted machine's sealed\n");
+    printf("                      line. Members need no flag; they enforce\n");
+    printf("                      once they hold a verified sealed row. =0\n");
+    printf("                      on a member is the local escape (logged).\n");
+    printf("                      Changes take effect within ~10s plus one\n");
+    printf("                      rebuild. Public scope is never gated.\n");
     printf("  -gui                Launch the WebKit wallet GUI instead of the\n");
     printf("                      headless node (needs a display; default is\n");
     printf("                      headless node + REST/onion)\n");
@@ -1005,6 +1016,11 @@ static int args_arm_misc_network(const char *arg,
     }
     else if (strncmp(arg, "-externalip=", 12) == 0) ctx->external_ip = arg + 12;
     else if (strncmp(arg, "-httpsdomain=", 13) == 0) ctx->https_domain = arg + 13;
+    else if (strcmp(arg, "-fleetrostergate") == 0 ||
+             strcmp(arg, "-fleetrostergate=1") == 0)
+        boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_ON);
+    else if (strcmp(arg, "-fleetrostergate=0") == 0)
+        boot_fleet_roster_set_gate(BOOT_FLEET_ROSTER_GATE_OFF);
     else if (strncmp(arg, "-httpsaltdomain=", 16) == 0) {
         /* An additional name on the SAME listener, served its own
          * certificate by TLS SNI (see app_context.https_alt_domains).

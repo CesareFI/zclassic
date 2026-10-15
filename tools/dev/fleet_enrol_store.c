@@ -232,6 +232,46 @@ bool fleet_roster_each(const uint8_t operator_pubkey[FLEET_ENROL_PUBKEY_BYTES],
     return fe_roster_walk(&w, why);
 }
 
+struct fe_raw_walk {
+    void (*visit)(const char *line, void *user);
+    void *user;
+};
+
+static void fe_raw_line(char *line, void *user)
+{
+    struct fe_raw_walk *w = user;
+    /* A line longer than one machine line can be is not one; it is never
+     * handed on, so a pasted blob cannot reach a verifier. */
+    if (strlen(line) < (size_t)FLEET_ENROL_MACHINE_TEXT_MAX)
+        w->visit(line, w->user);
+}
+
+bool fleet_roster_each_line(void (*visit)(const char *line, void *user),
+                            void *user, const char **why)
+{
+    struct fe_raw_walk w = { visit, user };
+    size_t len = 0;
+    char *text = NULL;
+    fe_why(why, NULL);
+    if (!visit) {
+        fe_why(why, FLEET_ENROL_WHY_ARGUMENTS);
+        return false;
+    }
+    text = zcl_malloc(FLEET_ROSTER_MAX_BYTES + 1u, "fleet-roster-lines");
+    if (!text) {
+        fe_why(why, FLEET_ENROL_WHY_ROSTER_UNREADABLE);
+        return false;
+    }
+    if (!fe_slurp(FLEET_ROSTER_LEAF, text, FLEET_ROSTER_MAX_BYTES + 1u, &len,
+                  why)) {
+        free(text);
+        return false;
+    }
+    fe_each_line(text, fe_raw_line, &w);
+    free(text);
+    return true;
+}
+
 bool fleet_roster_append(const char *line, const char **why)
 {
     fe_why(why, NULL);

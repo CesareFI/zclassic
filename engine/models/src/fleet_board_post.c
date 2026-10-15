@@ -1131,6 +1131,8 @@ static void board_apply_filter(struct qb *q,
                      filter->since);
     if (filter->slug[0])
         qb_where_text(q, QB_C_fleet_board_posts_slug, QB_EQ, filter->slug);
+    if (filter->agent[0])
+        qb_where_text(q, QB_C_fleet_board_posts_agent, QB_EQ, filter->agent);
     if (filter->scope_set)
         qb_where_int(q, QB_C_fleet_board_posts_scope, QB_EQ, filter->scope);
     if (filter->room[0]) {
@@ -1164,10 +1166,14 @@ static void board_apply_filter(struct qb *q,
     }
 }
 
-int db_fleet_board_list(struct node_db *ndb,
-                        const struct fleet_board_filter *filter, int64_t now,
-                        struct db_fleet_board_post *out, size_t max)
+int db_fleet_board_list_checked(struct node_db *ndb,
+                                const struct fleet_board_filter *filter,
+                                int64_t now, struct db_fleet_board_post *out,
+                                size_t max, bool *complete)
 {
+    bool clean = true;
+    if (complete)
+        *complete = false;
     if (!ndb || !ndb->open || !out || max == 0)
         return 0;
     if (max > FLEET_BOARD_LIST_MAX)
@@ -1186,11 +1192,14 @@ int db_fleet_board_list(struct node_db *ndb,
     while (AR_STEP_ROW(s) && (size_t)count < max) {
         struct db_fleet_board_post row;
         memset(&row, 0, sizeof(row));
-        if (!fleet_board_row_read(s, &row))
-            continue;
-        out[count++] = row;
+        if (fleet_board_row_read(s, &row))
+            out[count++] = row;
+        else
+            clean = false;
     }
-    sqlite3_finalize(s);
+    clean = sqlite3_finalize(s) == SQLITE_OK && clean; /* last step's error */
+    if (complete)
+        *complete = clean;
     return count;
 }
 

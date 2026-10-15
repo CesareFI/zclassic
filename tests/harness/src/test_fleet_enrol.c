@@ -23,6 +23,7 @@
 #include "crypto/ed25519.h"
 #include "controllers/rpc_client.h"
 #include "fleet_enrol.h"
+#include "util/fleet_roster_check.h"
 #include "json/json.h"
 #include "models/database.h"
 #include "models/zid_identity.h"
@@ -2096,6 +2097,145 @@ static int test_fe_import_requires_anchor(void)
     return failures;
 }
 
+/* ── the roster seam's production provider (ZRC 0012 step 2) ────────────── */
+
+/* A sealed line whose receipt names a board signing key. */
+static bool fe_signer_row(uint8_t op_byte, uint8_t signer_byte,
+                          const char *name, char *out, size_t cap)
+{
+    uint8_t op_seed[32], op_pub[32], box_seed[32], box_pub[32];
+    uint8_t invite_wire[FLEET_ENROL_INVITE_WIRE_MAX];
+    uint8_t receipt_wire[FLEET_ENROL_RECEIPT_WIRE_MAX];
+    char token[FLEET_ENROL_MACHINE_TEXT_MAX];
+    char receipt[FLEET_ENROL_MACHINE_TEXT_MAX];
+    struct fleet_invite invite;
+    struct fleet_receipt parsed;
+    struct fleet_box_facts facts = fe_facts();
+    struct fleet_signing_key signer;
+    size_t invite_len = 0, receipt_len = 0;
+    const char *why = NULL;
+    fe_key(op_byte, op_seed, op_pub);
+    fe_key(0x62, box_seed, box_pub);
+    fe_key(signer_byte, signer.seed, signer.pubkey);
+    return fleet_invite_mint(name, FE_TTL, "", op_seed, op_pub, FE_NOW, token,
+                             sizeof(token), &invite, &why) &&
+           fleet_invite_parse(token, &invite, invite_wire, sizeof(invite_wire),
+                              &invite_len, &why) &&
+           fleet_receipt_mint(invite_wire, invite_len, FE_ONION, &facts, "",
+                              box_seed, box_pub, &signer, receipt,
+                              sizeof(receipt), &why) &&
+           fleet_receipt_parse(receipt, &parsed, receipt_wire,
+                               sizeof(receipt_wire), &receipt_len, &why) &&
+           fleet_machine_mint(receipt_wire, receipt_len, FE_NOW,
+                              FLEET_ENROL_PORT_FIRST, op_seed, op_pub, out,
+                              cap, &why);
+}
+
+struct fe_lines {
+    size_t n;
+    char first[FLEET_ENROL_MACHINE_TEXT_MAX];
+};
+
+static void fe_lines_visit(const char *line, void *user)
+{
+    struct fe_lines *l = user;
+    if (l->n++ == 0)
+        (void)snprintf(l->first, sizeof(l->first), "%s", line);
+}
+
+static int test_fe_roster_gate_provider(void)
+{
+    int failures = 0;
+    TEST("fleet roster gate: the provider names the root this box trusts, "
+         "verifies a line only if the root sealed it, and obeys the root's "
+         "chain state") {
+        const struct zcl_fleet_roster_provider *p =
+            zcl_fleet_roster_gate_provider();
+        uint8_t op_seed[32], op_pub[32], got[32], signer_pub[32], sign_seed[32];
+        char row[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char foreign[FLEET_ENROL_MACHINE_TEXT_MAX];
+        char forged[FLEET_ENROL_MACHINE_TEXT_MAX];
+        uint8_t signer[32];
+        bool present = true, manager = true, sealed = false;
+        const char *why = NULL;
+        struct fe_lines lines = {0};
+        fe_isolate("roster-gate");
+        fe_key(0xa1, op_seed, op_pub);
+        fe_key(0xc3, sign_seed, signer_pub);
+        ASSERT(p && p->root && p->verify && p->each_line);
+
+        /* A virgin box trusts no root: a state, not an error. */
+        ASSERT(p->root(got, &present, &manager, p->ctx));
+        ASSERT(!present && !manager);
+
+        /* A box that joined a fleet trusts the key it was handed, and is
+         * not the manager. */
+        ASSERT(fleet_enrol_operator_write(op_pub, &why));
+        ASSERT(p->root(got, &present, &manager, p->ctx));
+        ASSERT(present && !manager);
+        ASSERT(memcmp(got, op_pub, 32) == 0);
+
+        ASSERT(fe_signer_row(0xa1, 0xc3, "studio", row, sizeof(row)));
+        ASSERT(fe_signer_row(0xb1, 0xc3, "studio", foreign, sizeof(foreign)));
+        ASSERT(fe_tamper(row, fe_wire_len(row) / 2, forged, sizeof(forged)));
+
+        /* Sealed by the root, root active: verifies, and names the board
+         * signing key the receipt carries. */
+        ASSERT(p->verify(row, op_pub, ZCL_FLEET_ROOT_ACTIVE, true, signer,
+                         &sealed, &why, p->ctx));
+        ASSERT(sealed && memcmp(signer, signer_pub, 32) == 0);
+        /* Sealed by any other key, or edited by one byte: not a roster row,
+         * whatever the chain says about the root. */
+        ASSERT(!p->verify(foreign, op_pub, ZCL_FLEET_ROOT_ACTIVE, true, signer,
+                          &sealed, &why, p->ctx));
+        ASSERT(!sealed);
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROSTER_SIGNATURE);
+        ASSERT(!p->verify(forged, op_pub, ZCL_FLEET_ROOT_ACTIVE, true, signer,
+                          &sealed, &why, p->ctx));
+        ASSERT(!sealed);
+        /* Genuine seal, root rotated or revoked, anchor required: refused by
+         * the chain's name, and still known to be genuinely sealed. */
+        ASSERT(!p->verify(row, op_pub, ZCL_FLEET_ROOT_REVOKED, true, signer,
+                          &sealed, &why, p->ctx));
+        ASSERT(sealed);
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_REVOKED);
+        ASSERT(!p->verify(row, op_pub, ZCL_FLEET_ROOT_ROTATED, true, signer,
+                          &sealed, &why, p->ctx));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_ROTATED);
+        ASSERT(!p->verify(row, op_pub, ZCL_FLEET_ROOT_UNREADABLE, true, signer,
+                          &sealed, &why, p->ctx));
+        ASSERT_STR_EQ(fe_s(why), FLEET_ENROL_WHY_ROOT_UNVERIFIABLE);
+        /* Not required: a never-anchored root still verifies. */
+        ASSERT(p->verify(row, op_pub, ZCL_FLEET_ROOT_NOT_ANCHORED, false,
+                         signer, &sealed, &why, p->ctx));
+
+        /* The provider reads this box's own roster file, line by line. */
+        ASSERT(fleet_roster_append(row, &why));
+        ASSERT(p->each_line(fe_lines_visit, &lines, p->ctx));
+        ASSERT_EQ(lines.n, (size_t)1);
+        ASSERT_STR_EQ(lines.first, row);
+
+        /* The manager is the box whose own key IS the root. */
+        fe_isolate("roster-gate-manager");
+        ASSERT(fleet_enrol_key_load(op_seed, op_pub, true, &present, &why));
+        ASSERT(p->root(got, &present, &manager, p->ctx));
+        ASSERT(present && manager);
+        ASSERT(memcmp(got, op_pub, 32) == 0);
+        /* A manager that also joined its own fleet is still the manager; a
+         * box that joined someone else's, with a key of its own, is not. */
+        ASSERT(fleet_enrol_operator_write(op_pub, &why));
+        ASSERT(p->root(got, &present, &manager, p->ctx));
+        ASSERT(present && manager);
+        fe_key(0xb7, op_seed, signer_pub);
+        ASSERT(fleet_enrol_operator_write(signer_pub, &why));
+        ASSERT(p->root(got, &present, &manager, p->ctx));
+        ASSERT(present && !manager);
+        ASSERT(memcmp(got, signer_pub, 32) == 0);
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_fleet_enrol(void)
 {
     int failures = 0;
@@ -2128,6 +2268,7 @@ int test_fleet_enrol(void)
     failures += test_fe_anchor_require_spelling();
     failures += test_fe_anchor_unreadable_fails_closed();
     failures += test_fe_anchor_rotation_and_invite();
+    failures += test_fe_roster_gate_provider();
     fe_restore();
     return failures;
 }

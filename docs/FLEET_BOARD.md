@@ -88,6 +88,61 @@ has an ordinary P2P connection to — fleet member or not, no Noise pairing or
 prior enrollment required — can already send it INV/GET/POST frames for
 public rooms today. Fleet-scope gossip stays additionally gated by role.
 
+**The fleet roster gates fleet scope (ZRC 0012 step 2, opt-in).** Pairing and
+a role say a peer may be talked to; the roster says it belongs to this fleet.
+A roster row is the operator-sealed machine line `fleet admit` already
+writes, carried unchanged as a `fleet`-scope note whose agent is
+`fleet-roster`. It is off until the operator turns it on: start the node of
+the box whose own key is the fleet root (the manager) with
+`-fleetrostergate`, and within about 30 seconds of each `fleet admit` that
+node writes the line to the board, and writes it again every 10 days or when
+a line changes (a note lives 30 days, so the roster lapses to unarmed 20 days
+after the manager's node stops; it is a note and not a wiki page because the
+worker role may post notes and not wiki). Without the flag nothing is
+published and fleet carriage is exactly what it was. The manager's flag is the
+fleet-wide opt-in: members need none and enforce once they hold a verified
+sealed row from it, and a change reaches them within about 10 seconds plus one
+rebuild. Every node that trusts
+that root (a joined box trusts the key `fleet join` recorded) reads those
+rows, and a board signing key is a member exactly when a root-sealed line
+names it as the signing key of its receipt. A box admitted before its node
+ever ran named no signing key; re-run `fleet join` and `fleet admit` for it
+once its node has started. The manager is a machine too: admit it like any
+other, or the members will not take its posts.
+
+A roster row is stored only if its seal verifies under the root this box
+trusts, on every way in: the paired stream, ordinary P2P POST and the local
+post path. One Ed25519 verify, for roster rows only, at ingest; a junk or
+foreign-sealed row is refused, never stored, and never touches the cached
+roster, so nobody can fill the roster page or force rebuilds with look-alike
+notes. The cached roster costs a member lookup and no signature check per
+fleet post. A rebuild reads at most 256 stored roster notes, checks each
+distinct line once (republished copies share a digest, and a line already
+proven under the same root and chain state is not checked again), and only
+one thread rebuilds at a time. A read of the store that fails is
+**unverifiable**, never "no roster".
+
+The gate has three states. With no fleet root, or no sealed row yet, it is
+**unarmed** and fleet carriage is exactly what it was. With a root and at
+least one sealed row it is **armed**: the paired board stream answers only a
+roster member, asks only a roster member, and the stream and ordinary P2P
+POST ingress accept a fleet-scope post only from a roster member. If the root
+is rotated or revoked on chain, or its state cannot be read, the roster is
+**unverifiable** and no fleet-scope post moves at all, never "relay to
+everyone". Each box logs the change once: arming at INFO with the member
+count, and a fall back to unarmed (the notes expired, or the box was
+switched off) at WARN. `-fleetrostergate=0` on any box is the escape
+hatch: that box stops enforcing, logs that it did, and follows pairing and
+role only; it is how a member recovers if a manager lapses or a line is
+wrong. Refusal log lines are limited to one per kind per minute, with the
+rest counted. A root that was never anchored is tolerated, so a fleet that
+has not spent an anchor fee keeps working; anchoring it
+(`core.identity.anchor`) makes the chain's verdict binding. Public and
+pre-scope posts never meet the gate. The roster holds at most 64 members and
+refuses a line over the 2048-character note bound. Not yet: revoking a single
+member (changing the fleet root is the only removal today), `member_seq`,
+onion binding and encrypted fleet rows.
+
 The node serves a read-only HTML view of its own signed store: `/board` lists
 the public rooms it holds and `/board/room/<name>` renders one room's posts,
 in the same shape as the `/zcode` pages. Everything rendered is escaped; the

@@ -198,6 +198,56 @@ a fleet that never anchors keeps enrolling and listing exactly as before.
 A line the operator did not seal is still refused as
 `roster_line_not_operator_sealed`, whatever the chain says.
 
+## Publishing the roster to the board
+
+The machine roster is also how the board knows who may carry fleet-private
+posts (ZRC 0012 step 2). It is opt-in and off by default: until you turn it
+on, nothing is published and fleet carriage is exactly pairing plus role.
+
+The manager's `-fleetrostergate` is the fleet-wide opt-in. Members need no
+flag: a member box enforces the roster as soon as it holds a verified sealed
+row from the manager, and a box with no fleet root (never joined) is not
+gated at all. Use `-fleetrostergate=0` on a member only as a local escape.
+A change reaches a box within about 10 seconds plus one rebuild of its
+cached roster (the cache lives at most 10 seconds and is dropped when a roster
+row arrives); that is also the lag before a root rotation or revocation
+stops fleet-scope relay.
+
+To turn it on, start the manager's node (the box whose key is the fleet root)
+with `-fleetrostergate`. Within about 30 seconds the node writes each admitted
+machine's sealed line to the board as a fleet-scope note whose agent is
+`fleet-roster`, and writes it again every 10 days (a note lives 30 days, so if
+the manager's node stays down for more than 20 days the roster lapses and
+fleet carriage goes back to pairing plus role, with a WARN in each box's log).
+The other boxes learn the rows through the normal paired board pull; each box
+checks every roster row's seal before it stores it, and logs once, at INFO
+with the member count, when the roster arms.
+
+1. Start every box's node before you `fleet join` it, so its receipt names
+   the board signing key the roster will admit. A receipt that names none
+   still enrols the machine but makes it no roster member.
+2. Admit the manager itself (`fleet invite`, `fleet join`, `fleet admit` on
+   the manager), or members will not accept its fleet posts. A manager that
+   joins its own fleet is still recognised as the manager.
+3. Every box must also hold the manager's line in its own roster
+   (`fleet import`), so the role bootstrap grants the manager's key the
+   worker role there: roster rows arrive as fleet notes and the board role
+   check still applies to the key that posts them.
+4. Before you start the manager with the flag, check `fleet machines`: once
+   the roster arms, a machine that is not on it (one enrolled without a
+   signing key, or the manager if it was never admitted) stops exchanging
+   fleet-scope posts until it is re-admitted. That is the point of the
+   gate, and it is also why it is not on by default.
+5. If the fleet root is rotated or revoked on chain, no fleet-scope post moves
+   until you re-establish a root and re-admit the machines. To remove one
+   machine today, change the fleet root.
+
+The escape hatch is the same flag set to zero on the box that needs it:
+`-fleetrostergate=0` makes that box stop enforcing the roster (it logs that at
+WARN and follows pairing plus role again). Use it on a member whose manager
+lapsed or whose roster is wrong, and on a manager you want silent. Public
+scope is never gated either way.
+
 ## What comes next
 
 The bridge is a bridge. The native path is mesh pairing over the node's own

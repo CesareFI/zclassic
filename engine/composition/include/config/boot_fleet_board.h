@@ -154,7 +154,10 @@ void boot_fleet_board_register_rpc(struct rpc_table *table);
  *
  * Who is answered: a peer whose pairing row grants the status capability,
  * whose delegation is still current, and whose online key holds a role
- * granting FLEET_BOARD_FLEET_READ_LEAF here. Anybody else is refused
+ * granting FLEET_BOARD_FLEET_READ_LEAF here — and, once a fleet roster is in
+ * force (config/boot_fleet_roster.h, ZRC 0012 step 2), that is a member of it;
+ * the asking half pulls only from such a peer, and ingest takes a fleet post
+ * only from a member author. Anybody else is refused
  * before the store is read. What is answered: fleet-scoped, verified,
  * unexpired posts only, bounded by FLEET_BOARD_FLEET_ANSWER_POSTS_MAX and
  * FLEET_BOARD_FLEET_ANSWER_MAX per pull. What is kept: every pulled post

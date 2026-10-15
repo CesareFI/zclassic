@@ -382,6 +382,13 @@ bool fleet_roster_import(const char *line,
                          struct fleet_machine *out, bool *appended,
                          const char **why);
 
+/* Visit every line of this box's own machine roster file, verbatim and in
+ * file order, without parsing it: the lines the manager publishes onto the
+ * board as roster rows. A line longer than one machine line can be is
+ * skipped. Returns false only when the roster cannot be read at all. */
+bool fleet_roster_each_line(void (*visit)(const char *line, void *user),
+                            void *user, const char **why);
+
 /* Has this invite nonce ever been spent on this box? Spending is a separate
  * call so a refusal later in admission cannot leave a nonce burned. */
 bool fleet_nonce_seen(const uint8_t nonce[FLEET_ENROL_NONCE_BYTES], bool *seen,
@@ -476,5 +483,15 @@ bool fleet_root_line_verify(const char *line,
                             const struct fleet_anchor_fact *anchor,
                             bool require, struct fleet_machine *out,
                             const char **why);
+
+/* ── the roster gate provider (tools/dev/fleet_roster_gate.c) ─────────────── */
+
+/* ZRC 0012 step 2. The fleet board lives under engine/, which may not
+ * include this header, so it asks util/fleet_roster_check.h; this fills that
+ * seam in with the operator root this box trusts, `fleet_root_line_verify`
+ * and this box's roster file. Called once from engine/entry/main.c. */
+struct zcl_fleet_roster_provider;
+const struct zcl_fleet_roster_provider *zcl_fleet_roster_gate_provider(void);
+void zcl_fleet_roster_gate_start(void);
 
 #endif /* ZCL_TOOLS_DEV_FLEET_ENROL_H */

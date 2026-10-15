@@ -15,6 +15,7 @@
 // wire. Failure logging happens here, with the refusal named.
 
 #include "config/boot_fleet_board.h"
+#include "config/boot_fleet_roster.h"
 
 #include "config/boot_internal.h"
 #include "config/boot_zcode_dht.h"
@@ -111,6 +112,7 @@ static bool g_cursors_loaded;
 static struct liveness_contract g_contract;
 static supervisor_child_id g_child = SUPERVISOR_INVALID_ID;
 static int64_t g_last_pull;
+static int64_t g_last_roster_publish;
 static _Atomic uint64_t g_delegation_refused;
 static _Atomic uint64_t g_role_refused;
 static _Atomic uint64_t g_inbox_full;
@@ -331,6 +333,26 @@ static bool board_peer_may_read(const uint8_t signer[32])
     return false;
 }
 
+/* ZRC 0012 step 2: is this peer's board key on the fleet roster? The roster
+ * is read from the board store this box serves from. Unarmed (no fleet root,
+ * or no sealed row yet) admits, exactly as before this step; an armed roster
+ * admits members only; an unverifiable one admits nobody. */
+static bool board_roster_admits(const uint8_t online_pubkey[32])
+{
+    struct node_db *store = board_db();
+    if (!store)
+        return false;
+    int64_t now = board_now();
+    bool ok = boot_fleet_roster_admits_peer(store, online_pubkey, now);
+    uint64_t skipped = 0;
+    if (!ok && boot_fleet_roster_log_due(BOOT_FLEET_ROSTER_LOG_PEER_REFUSED,
+                                         now, &skipped))
+        LOG_WARN("fleet.board", "fleet pull refused: not on the fleet roster "
+                 "(%llu more since the last line)",
+                 (unsigned long long)skipped);
+    return ok;
+}
+
 /* Everything the answering half proves about a peer that is already
  * through the primitive's Noise and capability gates, before any post is
  * read. */
@@ -350,7 +372,8 @@ static bool board_accept_authorized(const uint8_t peer_noise_static[32])
     }
     return board_delegation_current(ndb, &row, &peer, peer_noise_static,
                                     board_now()) &&
-           board_peer_may_read(peer.online_pubkey);
+           board_peer_may_read(peer.online_pubkey) &&
+           board_roster_admits(peer.online_pubkey);
 }
 
 /* ── the answer ──────────────────────────────────────────────────────── */
@@ -912,7 +935,18 @@ static enum fleet_board_result board_record_ingest(
         return FLEET_BOARD_ERR_ID;
     if (post->scope != FLEET_BOARD_SCOPE_FLEET)
         return FLEET_BOARD_ERR_SCOPE;
-    return db_fleet_board_post_ingest(ndb, post, now, stored);
+    /* ZRC 0012 step 2: an armed roster takes fleet posts from its members
+     * only, and a roster row only when its seal verifies. A non-member
+     * author is this box's own decision, not the peer's fault, so it is the
+     * retryable role refusal: the post is offered again once the roster row
+     * that names its author arrives. An unsealed roster row is final. */
+    r = boot_fleet_roster_screen_post(ndb, post, now);
+    if (r != FLEET_BOARD_OK)
+        return r;
+    r = db_fleet_board_post_ingest(ndb, post, now, stored);
+    if (r == FLEET_BOARD_OK && *stored && boot_fleet_roster_is_row(post))
+        boot_fleet_roster_invalidate();
+    return r;
 }
 
 /* Offer one record. A refusal that can clear lowers `carry_min` so a later
@@ -929,8 +963,12 @@ static bool board_offer(struct node_db *ndb, const struct board_record *rec,
         if (c && (c->carry_min == 0 || rec->arrival < c->carry_min))
             c->carry_min = rec->arrival;
         atomic_fetch_add_explicit(&g_deferred, 1, memory_order_relaxed);
-        LOG_WARN("fleet.board", "fleet post deferred: %s",
-                 fleet_board_result_string(r));
+        uint64_t skipped = 0;
+        if (boot_fleet_roster_log_due(BOOT_FLEET_ROSTER_LOG_DEFERRED, now,
+                                      &skipped))
+            LOG_WARN("fleet.board", "fleet post deferred: %s (%llu more "
+                     "since the last line)", fleet_board_result_string(r),
+                     (unsigned long long)skipped);
     } else if (r != FLEET_BOARD_OK && r != FLEET_BOARD_ERR_EXPIRED) {
         /* An expired post is stale, not wrong. */
         LOG_WARN("fleet.board", "fleet post refused: %s",
@@ -1081,7 +1119,8 @@ static bool board_peer_due(struct node_db *ndb,
     if (!mesh_pairing_allows(row, MESH_PAIRING_CAP_STATUS_READ, now) ||
         !board_peer_delegation(row, peer) ||
         !board_delegation_current(ndb, row, peer, row->peer_noise_pubkey,
-                                  now))
+                                  now) ||
+        !board_roster_admits(peer->online_pubkey))
         return false;
     struct board_live_probe probe;
     memset(&probe, 0, sizeof probe);
@@ -1110,6 +1149,21 @@ static void board_pull_paired_peers(int64_t now)
     free(rows);
 }
 
+/* The manager's half of ZRC 0012 step 2: once per period, put this box's own
+ * sealed machine roster onto the board as roster rows. A box that is not the
+ * fleet root's own box writes nothing. */
+static void board_publish_roster_due(struct node_db *ndb, int64_t now)
+{
+    board_lock();
+    bool due = g_last_roster_publish == 0 ||
+               now - g_last_roster_publish >= BOOT_FLEET_ROSTER_PUBLISH_PERIOD_S;
+    if (due)
+        g_last_roster_publish = now;
+    board_unlock();
+    if (due)
+        (void)boot_fleet_roster_publish(ndb, now);
+}
+
 static void board_tick(struct liveness_contract *contract)
 {
     (void)contract;
@@ -1132,6 +1186,7 @@ static void board_tick(struct liveness_contract *contract)
     board_lock();
     g_last_pull = now;
     board_unlock();
+    board_publish_roster_due(ndb, now);
     board_pull_paired_peers(now);
 }
 
@@ -1162,6 +1217,7 @@ static void board_forget_locked(void)
     memset(g_cursors, 0, sizeof g_cursors);
     g_cursors_loaded = false;
     g_last_pull = 0;
+    g_last_roster_publish = 0;
 }
 
 void boot_fleet_board_fleet_wire(struct boot_svc_ctx *svc)
