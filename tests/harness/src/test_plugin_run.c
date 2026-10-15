@@ -460,6 +460,114 @@ static int prt_case_kill_backoff(void)
     return failures;
 }
 
+static bool prt_failed(const struct plugin_run_info *i, const void *ctx)
+{
+    (void)ctx;
+    return i->state == PLUGIN_RUN_STATE_FAILED;
+}
+
+/* Write trusted_keys as the signer's key plus an optional second key line, or
+ * with the signer left out entirely. */
+static bool prt_set_trust(const struct prt_env *e, bool signer, const char *extra)
+{
+    char path[PATH_MAX], hex[65], body[200];
+    prt_hex(e->pk, 32, hex);
+    snprintf(body, sizeof(body), "%s%s%s%s", signer ? hex : "", signer ? "\n" : "",
+             extra ? extra : "", extra ? "\n" : "");
+    return prt_join(path, sizeof(path), e->root, "trusted_keys") &&
+           prt_write(path, body, strlen(body));
+}
+
+#define PRT_OTHER_KEY "1111111111111111111111111111111111111111111111111111111111111111"
+
+static bool prt_restart_once(struct plugin_run **run)
+{
+    struct plugin_run_info info;
+    plugin_run_info_get(*run, &info);
+    uint64_t pid = info.pid;
+    return kill((pid_t)pid, SIGKILL) == 0 && prt_wait(run, 1, 0, prt_new_pid, &pid, 5000);
+}
+
+static int prt_case_verify_cache(void)
+{
+    int failures = 0;
+    struct prt_env e;
+    struct plugin_run *run = NULL;
+    bool ready = prt_env_open(&e);
+    TEST_CASE("restarts reuse a verified generation until trusted_keys changes") {
+        char gen[PRT_HEX];
+        struct plugin_run_info info;
+        unsigned base;
+        ASSERT(ready);
+        ASSERT(prt_install(&e, "vc", "normal", "v1", PRT_FS, gen));
+        run = prt_open(&e, "vc");
+        ASSERT(run != NULL);
+        base = plugin_run_test_verify_count();
+        ASSERT(prt_wait(&run, 1, 0, prt_healthy, NULL, 5000));
+        ASSERT(prt_restart_once(&run));
+        ASSERT(prt_wait(&run, 1, 0, prt_healthy, NULL, 5000));
+        ASSERT_EQ(plugin_run_test_verify_count(), base);
+        ASSERT_EQ(plugin_run_reload(run), PLUGIN_RUN_OK);
+        ASSERT_EQ(plugin_run_test_verify_count(), base);
+        /* an extra trusted key changes the digest: the signature is checked again */
+        ASSERT(prt_wait(&run, 1, 0, prt_healthy, NULL, 5000));
+        ASSERT(prt_set_trust(&e, true, PRT_OTHER_KEY));
+        ASSERT(prt_restart_once(&run));
+        ASSERT_EQ(plugin_run_test_verify_count(), base + 1);
+        ASSERT(prt_wait(&run, 1, 0, prt_healthy, NULL, 5000));
+        ASSERT(prt_restart_once(&run));
+        ASSERT_EQ(plugin_run_test_verify_count(), base + 1);
+        /* revoking the signer must refuse the next restart */
+        ASSERT(prt_wait(&run, 1, 0, prt_healthy, NULL, 5000));
+        ASSERT(prt_set_trust(&e, false, PRT_OTHER_KEY));
+        plugin_run_info_get(run, &info);
+        ASSERT_EQ(kill((pid_t)info.pid, SIGKILL), 0);
+        ASSERT(prt_wait(&run, 1, 0, prt_failed, NULL, 5000));
+        ASSERT_EQ(plugin_run_test_verify_count(), base + 2);
+        plugin_run_info_get(run, &info);
+        ASSERT_EQ(info.pid, 0u);
+        ASSERT(strstr(info.detail, "plugin store refused") != NULL);
+    } TEST_END
+    plugin_run_close(run);
+    prt_env_close(&e);
+    return failures;
+}
+
+static int prt_case_cached_exe_hash(void)
+{
+    int failures = 0;
+    struct prt_env e;
+    struct plugin_run *run = NULL;
+    bool ready = prt_env_open(&e);
+    TEST_CASE("a cached generation still hashes the executable on every launch") {
+        char gen[PRT_HEX], exe[PATH_MAX];
+        struct plugin_run_info info;
+        unsigned base;
+        uint64_t pid;
+        ASSERT(ready);
+        ASSERT(prt_install(&e, "vx", "normal", "x1", PRT_FS, gen));
+        run = prt_open(&e, "vx");
+        ASSERT(run != NULL);
+        base = plugin_run_test_verify_count();
+        ASSERT(prt_wait(&run, 1, 0, prt_healthy, NULL, 5000));
+        plugin_run_info_get(run, &info);
+        pid = info.pid;
+        ASSERT_EQ(kill((pid_t)pid, SIGKILL), 0);
+        ASSERT(prt_wait(&run, 1, 0, prt_waiting, NULL, 5000));
+        snprintf(exe, sizeof(exe), "%s/vx/generations/%s/vx", e.root, gen);
+        ASSERT_EQ(chmod(exe, 0755), 0);
+        ASSERT(prt_write(exe, "evil", 4));
+        ASSERT(!prt_wait(&run, 1, 0, prt_new_pid, &pid, 600));
+        plugin_run_info_get(run, &info);
+        ASSERT_EQ(info.pid, 0u);
+        ASSERT(info.crashes >= 2);
+        ASSERT_EQ(plugin_run_test_verify_count(), base);
+    } TEST_END
+    plugin_run_close(run);
+    prt_env_close(&e);
+    return failures;
+}
+
 static int prt_case_hung_ping(void)
 {
     int failures = 0;
@@ -781,7 +889,8 @@ static int prt_case_swapped_executable(void)
         snprintf(exe, sizeof(exe), "%s/swap/generations/%s/swap", e.root, gen);
         ASSERT_EQ(chmod(exe, 0755), 0);
         ASSERT(prt_write(exe, "evil", 4));
-        ASSERT_EQ(plugin_run_poll(run), PLUGIN_RUN_ERR_STORE);
+        /* the open-time verification is cached, so the per-launch executable hash refuses it */
+        ASSERT_EQ(plugin_run_poll(run), PLUGIN_RUN_ERR_SPAWN);
         plugin_run_info_get(run, &info);
         ASSERT_EQ(info.state, PLUGIN_RUN_STATE_FAILED);
         ASSERT_EQ(info.pid, 0u);
@@ -1175,6 +1284,8 @@ int test_plugin_run(void)
     failures += prt_case_swapped_executable();
     failures += prt_case_fd_slots();
     failures += prt_case_kill_backoff();
+    failures += prt_case_verify_cache();
+    failures += prt_case_cached_exe_hash();
     failures += prt_case_hung_ping();
     failures += prt_case_reload();
     failures += prt_case_crash_loop();

@@ -76,6 +76,8 @@ struct plugin_run;
 /* Test seam: corrupt the signed SHA3-512 each resolve reads, so the launch-time
  * comparison of the executable's bytes is reached with a mismatch. */
 void plugin_run_test_corrupt_signed_hash(bool on);
+/* Test seam: how many full signature verifications this process has run. */
+unsigned plugin_run_test_verify_count(void);
 #endif
 
 /* The caller owns process-wide signal state: SIGCHLD must be at SIG_DFL while a
