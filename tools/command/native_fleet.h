@@ -246,6 +246,8 @@ void zcl_native_handle_fleet_nodes_table(
 /* z23-toolgen:end handlers */
 
 #ifdef ZCL_TESTING
+/* Fault injection before a brief change row is projected. */
+void zcl_fleet_steer_test_set_before_change_projection(void (*hook)(void));
 /* Fault injection for bounded mail completion; NULL restores the native leaf. */
 void zcl_fleet_steer_test_set_mail_pull(
     void (*hook)(const struct zcl_command_request *, struct zcl_command_reply *));

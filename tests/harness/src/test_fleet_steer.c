@@ -20,6 +20,7 @@
 
 #include "command/native_command.h"
 #include "base/hex.h"
+#include "base/safe_alloc.h"
 #include "chainlog/chainlog.h"
 #include "crypto/ed25519.h"
 #include "fleetledger/fleet_ledger.h"
@@ -5507,6 +5508,268 @@ static int fmx_t_ack_framing(void)
     }
 _test_next:; fmx_restore(); clock_set_default(saved_clock); return failures;
 }
+static bool fmx_forward_setup(const char *tag)
+{
+    char grant[64];
+    fmx_isolate(tag);
+    return fmx_mint("brief", grant, sizeof(grant));
+}
+
+static bool fmx_forward_page(struct fmx_call *call, const char *token, long long limit, size_t budget)
+{
+    fmx_brief_since(call, NULL, token);
+    (void)json_push_kv_int(&call->input, "limit", limit);
+    (void)json_push_kv_bool(&call->input, "json", true);
+    call->request.budget_bytes = budget;
+    return fmx_run(call, zcl_native_handle_fleet_steer_brief) && fmx_ok(call);
+}
+
+static bool g_fmx_forward_append;
+static void fmx_forward_append(void)
+{
+    if (g_fmx_forward_append) return;
+    g_fmx_forward_append = true;
+    fmx_seed_inbox("a", "2020-01-01T00:00:00Z", 1, "m", "b", "note", "appended", "page-appended");
+}
+
+static long long fmx_forward_first_end(const char *peer)
+{
+    char path[1200], line[8192];
+    int n = snprintf(path, sizeof(path), "%s/z23/dev/mail/inbox.%s.jsonl", g_fmx_state, peer);
+    if (n <= 0 || (size_t)n >= sizeof(path)) return -1;
+    FILE *file = fopen(path, "rb");
+    if (!file) return -1;
+    long long end = fgets(line, sizeof(line), file) ? (long long)ftell(file) : -1;
+    if (fclose(file) != 0) return -1;
+    return end;
+}
+
+static bool fmx_forward_seen(const struct json_value *changes, unsigned *seen)
+{
+    for (size_t i = 0; i < json_size(changes); i++) {
+        const char *ref = json_get_str(json_get(json_at(changes, i), "ref"));
+        if (!ref) return false;
+        unsigned bit = 6;
+        if (strcmp(ref, "page-appended")) {
+            char peer; unsigned index;
+            if (sscanf(ref, "page-%c-%u", &peer, &index) != 2 || index < 1 || index > 3) return false;
+            if (peer != 'a' && peer != 'b') return false;
+            bit = (peer == 'a' ? 0u : 3u) + index - 1;
+        }
+        if (*seen & (1u << bit)) return false;
+        *seen |= 1u << bit;
+    }
+    return true;
+}
+
+static int fmx_t_forward_prefix(void)
+{
+    int failures = 0;
+    TEST("steer: forward pages preserve duplicate stream sequences and concurrent append") {
+        ASSERT(fmx_forward_setup("forward_prefix"));
+        for (unsigned i = 1; i <= 3; i++) {
+            char ref[32];
+            (void)snprintf(ref, sizeof(ref), "page-a-%u", i);
+            fmx_seed_inbox("a", "2026-09-20T00:00:00Z", i, "m", "b", "note", "a", ref);
+            (void)snprintf(ref, sizeof(ref), "page-b-%u", i);
+            fmx_seed_inbox("b", "2026-09-20T00:00:00Z", i, "m", "b", "note", "b", ref);
+        }
+        char token[4096] = "0|", expected[256];
+        unsigned seen = 0;
+        g_fmx_forward_append = false;
+        zcl_devagent_mail_test_set_after_brief_probe(fmx_forward_append);
+        for (unsigned page = 0; page < 8; page++) {
+            struct fmx_call call;
+            ASSERT(fmx_forward_page(&call, token, 2, 65536));
+            const struct json_value *changes = fmx_arr(&call, "changes");
+            ASSERT(json_size(changes) <= 2);
+            ASSERT(fmx_forward_seen(changes, &seen));
+            if (page == 0) {
+                ASSERT_EQ(json_size(changes), 2);
+                ASSERT(g_fmx_forward_append);
+                ASSERT_EQ(seen, (1u << 0) | (1u << 3));
+                (void)snprintf(expected, sizeof(expected), "0|inbox.a.jsonl:%lld,inbox.b.jsonl:%lld",
+                    fmx_forward_first_end("a"), fmx_forward_first_end("b"));
+                ASSERT_STR_EQ(fmx_str(&call, "cursor_token"), expected);
+            }
+            if (json_size(changes) == 0) {
+                ASSERT_STR_EQ(fmx_str(&call, "cursor_token"), token);
+                fmx_end(&call);
+                break;
+            }
+            ASSERT(strcmp(token, fmx_str(&call, "cursor_token")) != 0);
+            (void)snprintf(token, sizeof(token), "%s", fmx_str(&call, "cursor_token"));
+            fmx_end(&call);
+        }
+        ASSERT_EQ(seen, 127);
+        zcl_devagent_mail_test_set_after_brief_probe(NULL);
+        fmx_restore(); PASS();
+    } _test_next:;
+    zcl_devagent_mail_test_set_after_brief_probe(NULL);
+    fmx_restore();
+    return failures;
+}
+
+static long long fmx_forward_native_count(void)
+{
+    char token[4096] = "0|";
+    long long count = 0;
+    for (unsigned page = 0; page < 8; page++) {
+        struct fmx_call call;
+        fmx_begin(&call, "dev.agent.mail", "zcl.agent_mail.v1");
+        (void)json_push_kv_str(&call.input, "action", "pull");
+        (void)json_push_kv_str(&call.input, "since", token);
+        if (!fmx_run(&call, zcl_native_handle_dev_agent_mail) || !fmx_ok(&call)) { fmx_end(&call); return -1; }
+        count += fmx_int(&call, "count");
+        bool more = fmx_bool(&call, "truncated");
+        (void)snprintf(token, sizeof(token), "%s", fmx_str(&call, "next_since"));
+        fmx_end(&call);
+        if (!more) return count;
+    }
+    return -1;
+}
+
+static bool fmx_forward_wire(struct fmx_call *call, size_t budget)
+{
+    struct zcl_command_spec spec = *call->request.spec;
+    spec.handler = zcl_native_handle_fleet_steer_brief;
+    struct json_value *json = (struct json_value *)json_get(&call->input, "json");
+    json_set_bool(json, false);
+    char wire[8193]; enum zcl_command_exit rc;
+    size_t n = zcl_command_registry_execute_json(zcl_command_catalog(), &spec, NULL,
+        &call->input, false, FMX_BRIEF_PATH, "full", budget, 0, NULL, wire, sizeof(wire), &rc);
+    struct json_value output;
+    json_init(&output);
+    bool ok = n > 0 && n <= budget && rc == ZCL_COMMAND_EXIT_OK && json_read(&output, wire, n);
+    const struct json_value *data = json_get(&output, "data");
+    ok = ok && json_get(data, "screen") == NULL && json_size(json_get(data, "changes")) > 0;
+    json_free(&output);
+    return ok;
+}
+
+static int fmx_t_forward_budget(void)
+{
+    int failures = 0;
+    TEST("steer: final byte trimming leaves the earliest omitted row on the next page") {
+        ASSERT(fmx_forward_setup("forward_budget"));
+        /* This seed helper writes an already escaped JSON fragment: 4096
+         * raw bytes decode to 2048 quotes, below the native line limit. */
+        char escaped[4097];
+        for (size_t i = 0; i < 4096; i += 2) { escaped[i] = '\\'; escaped[i + 1] = '"'; }
+        escaped[4096] = '\0';
+        for (unsigned i = 1; i <= 8; i++) {
+            char ref[32]; (void)snprintf(ref, sizeof(ref), "budget-%02u", i);
+            fmx_seed_inbox("budget", "2026-09-20T00:00:00Z", i, "m", "b", "note", escaped, ref);
+        }
+        ASSERT_EQ(fmx_forward_native_count(), 8);
+        struct fmx_call first;
+        ASSERT(fmx_forward_page(&first, "0|", 8, 4096));
+        size_t shown = json_size(fmx_arr(&first, "changes"));
+        ASSERT(shown > 0 && shown < 8);
+        ASSERT(fmx_bool(&first, "changes_truncated"));
+        ASSERT_EQ(fmx_int(&first, "changes_dropped"), (long long)(8 - shown));
+        ASSERT(json_write(&first.reply.data, NULL, 0) <= 4096 - 1024);
+        const struct json_value *cuts = fmx_get(&first, "budget_truncated");
+        ASSERT(json_get_int(json_get(cuts, "changes")) > 0);
+        ASSERT(fmx_forward_wire(&first, 4096));
+        char token[4096], omitted[32];
+        (void)snprintf(token, sizeof(token), "%s", fmx_str(&first, "cursor_token"));
+        (void)snprintf(omitted, sizeof(omitted), "budget-%02u", (unsigned)shown + 1);
+        fmx_end(&first);
+        struct fmx_call next;
+        ASSERT(fmx_forward_page(&next, token, 8, 4096));
+        const char *ref = json_get_str(json_get(json_at(fmx_arr(&next, "changes"), 0), "ref"));
+        ASSERT_STR_EQ(ref, omitted);
+        fmx_end(&next);
+        fmx_restore(); PASS();
+    } _test_next:;
+    fmx_restore();
+    return failures;
+}
+
+#ifdef ZCL_TESTING
+static bool g_fmx_forward_fault_armed;
+static void fmx_forward_fault(void)
+{
+    if (g_fmx_forward_fault_armed) return;
+    g_fmx_forward_fault_armed = true;
+    zcl_alloc_fault_fail_nth("json_copy_str", 1);
+}
+#endif
+
+static int fmx_forward_budget_probe(size_t budget, size_t *bytes)
+{
+    struct fmx_call call;
+    bool passed = fmx_forward_page(&call, "0|", 1, budget);
+    int result = 0;
+    if (passed) {
+        *bytes = json_write(&call.reply.data, NULL, 0);
+        result = fmx_changes_n(&call) == 1 ? 1 : -1;
+    } else if (strcmp(call.reply.error.code, "BRIEF_PAGE_STALLED")) result = -1;
+    fmx_end(&call);
+    return result;
+}
+
+static int fmx_t_forward_boundary(void)
+{
+    int failures = 0;
+    const clock_iface_t *saved_clock = clock_default();
+    clock_iface_t fixed_clock = {fmx_activity_monotonic_ns, fmx_activity_wall_ms, (void *)saved_clock};
+    clock_set_default(&fixed_clock);
+    TEST("steer: final token and count budget succeeds exactly at its boundary and stalls one byte below") {
+        ASSERT(fmx_forward_setup("forward_boundary"));
+        fmx_seed_inbox("boundary", "2026-09-20T00:00:00Z", 1, "m", "b", "note", "retained", "boundary-row");
+        size_t low = 1024, high = 8192, bytes = 0;
+        ASSERT_EQ(fmx_forward_budget_probe(high, &bytes), 1);
+        while (high - low > 1) {
+            size_t mid = low + (high - low) / 2;
+            int result = fmx_forward_budget_probe(mid, &bytes);
+            ASSERT(result >= 0);
+            if (result) high = mid; else low = mid;
+        }
+        ASSERT_EQ(fmx_forward_budget_probe(high, &bytes), 1);
+        ASSERT(bytes + 1024 <= high);
+        ASSERT_EQ(fmx_forward_budget_probe(high - 1, &bytes), 0);
+        struct fmx_call stalled;
+        ASSERT(!fmx_forward_page(&stalled, "0|", 1, high - 1));
+        ASSERT_STR_EQ(stalled.reply.error.code, "BRIEF_PAGE_STALLED");
+        ASSERT(stalled.reply.error.next_action[0] != '\0');
+        fmx_end(&stalled);
+        fmx_restore(); PASS();
+    } _test_next:;
+    fmx_restore(); clock_set_default(saved_clock);
+    return failures;
+}
+
+static int fmx_t_forward_fault(void)
+{
+    int failures = 0;
+#ifdef ZCL_TESTING
+    TEST("steer: actual change allocation failure refuses without a consumed cursor") {
+        ASSERT(fmx_forward_setup("forward_fault"));
+        fmx_seed_inbox("fault", "2026-09-20T00:00:00Z", 1, "m", "b", "note", "retained", "fault-row");
+        struct fmx_call call;
+        g_fmx_forward_fault_armed = false;
+        zcl_fleet_steer_test_set_before_change_projection(fmx_forward_fault);
+        bool passed = fmx_forward_page(&call, "0|", 1, 65536);
+        bool hit = g_fmx_forward_fault_armed && zcl_alloc_fault_armed_label() == NULL;
+        zcl_alloc_fault_clear(); zcl_fleet_steer_test_set_before_change_projection(NULL);
+        ASSERT(!passed && hit);
+        ASSERT_STR_EQ(call.reply.error.code, "BRIEF_PROJECTION_FAILED");
+        ASSERT(fmx_get(&call, "cursor_token") == NULL);
+        fmx_end(&call);
+        ASSERT(fmx_forward_page(&call, "0|", 1, 65536));
+        ASSERT_EQ(fmx_changes_n(&call), 1);
+        ASSERT_STR_EQ(json_get_str(json_get(json_at(fmx_arr(&call, "changes"), 0), "ref")), "fault-row");
+        fmx_end(&call);
+        fmx_restore(); PASS();
+    } _test_next:;
+    zcl_alloc_fault_clear(); zcl_fleet_steer_test_set_before_change_projection(NULL);
+#endif
+    fmx_restore();
+    return failures;
+}
+
 int fsd_deliver_checks(void);
 int test_fleet_steer(void);
 int fmx_task_projection_checks(void);
@@ -5522,6 +5785,10 @@ int test_fleet_steer(void)
 #endif
 
     node_rpc_client_set_test_hook(fmx_no_node);
+    failures += fmx_t_forward_prefix();
+    failures += fmx_t_forward_budget();
+    failures += fmx_t_forward_boundary();
+    failures += fmx_t_forward_fault();
     failures += fmx_task_projection_checks();
 #if !defined(_WIN32)
     failures += fmx_t_ledger_age();

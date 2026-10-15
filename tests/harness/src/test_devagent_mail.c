@@ -1497,6 +1497,34 @@ static int test_mail_exact_nul(void)
     return failures;
 }
 
+static int test_mail_prefix_cursor(void)
+{
+    int failures = 0;
+    struct json_value rows, row;
+    json_init(&rows); json_set_array(&rows); json_init(&row); json_set_object(&row);
+    TEST("mail: native prefix cursor preserves untouched streams and refuses mismatched floors") {
+        ASSERT(json_push_kv_str(&row, "stream", "inbox.a.jsonl"));
+        ASSERT(json_push_kv_int(&row, "row_offset", 5));
+        ASSERT(json_push_kv_int(&row, "row_end", 15));
+        ASSERT(json_push_back(&rows, &row));
+        char token[256];
+        const char *start = "0|inbox.a.jsonl:5,inbox.b.jsonl:7";
+        const char *end = "0|inbox.a.jsonl:25,inbox.b.jsonl:37";
+        ASSERT(zcl_devagent_mail_cursor_prefix(start, end, &rows, token, sizeof(token)));
+        ASSERT_STR_EQ(token, "0|inbox.a.jsonl:15,inbox.b.jsonl:7");
+        ASSERT(zcl_devagent_mail_cursor_prefix(start, "0|inbox.a.jsonl:25", &rows, token, sizeof(token)));
+        ASSERT_STR_EQ(token, "0|inbox.a.jsonl:15");
+        ASSERT(!zcl_devagent_mail_cursor_prefix("1|inbox.a.jsonl:5,inbox.b.jsonl:7", end, &rows, token, sizeof(token)));
+        ASSERT(!zcl_devagent_mail_cursor_prefix(start, "0|inbox.a.jsonl:10,inbox.b.jsonl:37", &rows, token, sizeof(token)));
+        json_free(&rows); json_init(&rows); json_set_array(&rows);
+        ASSERT(zcl_devagent_mail_cursor_prefix(start, end, &rows, token, sizeof(token)));
+        ASSERT_STR_EQ(token, start);
+        PASS();
+    } _test_next:;
+    json_free(&row); json_free(&rows);
+    return failures;
+}
+
 int test_devagent_mail(void);
 int test_devagent_mail(void)
 {
@@ -1508,6 +1536,7 @@ int test_devagent_mail(void)
     failures += test_mail_exact_maximum();
     failures += test_mail_exact_malformed();
     failures += test_mail_exact_nul();
+    failures += test_mail_prefix_cursor();
     failures += test_mail_paging();
     failures += test_mail_brief_drain();
     failures += test_mail_ref_filter_and_agent_resume();

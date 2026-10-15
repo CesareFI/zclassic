@@ -1385,6 +1385,9 @@ static bool fmc_verdict_pass(const char *verdict, long long rc)
 #define FMC_MAIL_SINCE_CAP 4096
 
 struct fmc_mail_view {
+    bool forward;
+    bool projection_failed;
+    char start_token[FMC_MAIL_SINCE_CAP];
     long long cursor;
     long long count;
     bool ok;
@@ -2972,11 +2975,47 @@ static bool fmc_row_locator(struct json_value *item, const struct fmc_row *row)
         json_push_kv_int(item, "row_end", row->row_end);
 }
 
+#ifdef ZCL_TESTING
+static void (*s_fmc_before_change_projection)(void);
+void zcl_fleet_steer_test_set_before_change_projection(void (*hook)(void))
+{
+    s_fmc_before_change_projection = hook;
+}
+#endif
+
+static bool fmc_change_locator_shape(const struct json_value *item, const struct fmc_row *row)
+{
+    const char *const keys[] = {"stream", "row_sha3", "row_offset", "row_end"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const struct json_value *value = json_get(item, keys[i]);
+        if (!value || value->type != (i < 2 ? JSON_STR : JSON_INT)) return false;
+    }
+    return !strcmp(json_get_str(json_get(item, "stream")), row->stream) &&
+        !strcmp(json_get_str(json_get(item, "row_sha3")), row->row_sha3) &&
+        json_get_int(json_get(item, "row_offset")) == row->row_offset &&
+        json_get_int(json_get(item, "row_end")) == row->row_end;
+}
+
+static bool fmc_change_shape(const struct json_value *item, const struct fmc_row *row)
+{
+    const char *const strings[] = {"from", "to", "kind", "ref", "lead", "state"};
+    if (!item || item->type != JSON_OBJ) return false;
+    for (size_t i = 0; i < sizeof(strings) / sizeof(strings[0]); i++) {
+        const struct json_value *value = json_get(item, strings[i]);
+        if (!value || value->type != JSON_STR) return false;
+    }
+    const struct json_value *seq = json_get(item, "seq");
+    if (!seq || seq->type != JSON_INT || json_get_int(seq) != row->seq) return false;
+    const struct json_value *age = json_get(item, "queued_age_s");
+    if (!age || (age->type != JSON_INT && age->type != JSON_NULL)) return false;
+    return !row->stream[0] || fmc_change_locator_shape(item, row);
+}
+
 /* One bounded change row, carrying the state fmc_row_state resolves from
  * receiver evidence; completed is resolved later against queue outcomes
  * and board results. queued_age_s is how long a row has sat "queued"
  * (null for every other state, and when its stamp does not parse). */
-static void fmc_row_change(struct json_value *changes, const struct fmc_row *v,
+static bool fmc_row_change(struct json_value *changes, const struct fmc_row *v,
                            const struct json_value *rows,
                            const char *sent_path, long long now)
 {
@@ -2984,6 +3023,9 @@ static void fmc_row_change(struct json_value *changes, const struct fmc_row *v,
     char lead[FMC_LEAD_MAX + 1];
     const char *state = fmc_row_state(v, rows, sent_path);
     bool queued = strcmp(state, "queued") == 0;
+#ifdef ZCL_TESTING
+    if (s_fmc_before_change_projection) s_fmc_before_change_projection();
+#endif
     json_init(&item);
     json_set_object(&item);
     /* A presence body leaves the brief only through sessions[]' parsed
@@ -2993,22 +3035,21 @@ static void fmc_row_change(struct json_value *changes, const struct fmc_row *v,
                        "presence row; parsed fields in sessions[]");
     else
         fmc_lead(v->body, lead, sizeof(lead));
-    if (json_push_kv_int(&item, "seq", v->seq) &&
-        json_push_kv_str(&item, "from", v->from) &&
-        json_push_kv_str(&item, "to", v->to) &&
-        json_push_kv_str(&item, "kind", v->kind) &&
-        json_push_kv_str(&item, "ref", v->ref) &&
-        json_push_kv_str(&item, "lead", lead) &&
-        json_push_kv_str(&item, "state", state) &&
-        fmc_row_locator(&item, v)) {
-        fmc_put_int(&item, "queued_age_s",
-                    queued ? fmc_age_s(now, v->ts) : -1);
-        bool complete = strcmp(v->kind, "directive") != 0 ||
-                        fmc_reply_emit(&item, v, rows, now);
-        if (complete)
-            (void)json_push_back(changes, &item);
-    }
+    const struct { const char *key; const char *value; } fields[] = {
+        {"from", v->from}, {"to", v->to}, {"kind", v->kind}, {"ref", v->ref},
+        {"lead", lead}, {"state", state}};
+    bool ok = json_push_kv_int(&item, "seq", v->seq);
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+        ok &= json_push_kv_str(&item, fields[i].key, fields[i].value);
+    ok &= fmc_row_locator(&item, v);
+    ok &= fmc_put_int(&item, "queued_age_s", queued ? fmc_age_s(now, v->ts) : -1);
+    if (!strcmp(v->kind, "directive")) ok &= fmc_reply_emit(&item, v, rows, now);
+    ok = ok && fmc_change_shape(&item, v);
+    size_t before = json_size(changes);
+    if (ok) ok = json_push_back(changes, &item);
+    if (ok) ok = json_size(changes) == before + 1 && fmc_change_shape(json_at(changes, before), v);
     json_free(&item);
+    return ok;
 }
 
 /* dev.agent.mail answers in bounded pages, and every mail reader in this
@@ -3274,10 +3315,10 @@ static void fmc_mail_row(struct fmc_mail_ctx *c, const struct fmc_row *v,
                               c->stale < FMC_STALE_BLOCKER_CAP))
             c->stale++;
     }
-    if (v->seq <= c->since || c->shown >= c->changes_cap)
+    if (c->projection_failed || v->seq <= c->since || c->shown >= c->changes_cap)
         return;
-    fmc_row_change(c->changes, v, rows, c->sent_path, c->now);
-    c->shown++;
+    if (fmc_row_change(c->changes, v, rows, c->sent_path, c->now)) c->shown++;
+    else c->projection_failed = true;
 }
 
 /* `since` as a resume token: the composite per-stream watermark a previous
@@ -3305,11 +3346,8 @@ static int fmc_brief_resume(const struct zcl_command_request *req,
     return 1;
 }
 
-/* Token-resume changes walk over rows_new: every drained row arrived after
- * the caller's watermark (the leaf resumed past consumed offsets), so all
- * of them are changes. Newest-first like the legacy walk; the cap only
- * bounds display and the cut rows count as dropped. Lifecycle states read
- * against rows_full, which holds the whole history. */
+/* Token changes follow the native forward merge prefix. The opaque cursor
+ * is projected later, after row and byte limits, from actual survivors. */
 static void fmc_brief_token_changes(struct fmc_mail_ctx *c,
                                     const struct json_value *rows_new,
                                     const struct json_value *rows_full,
@@ -3318,17 +3356,17 @@ static void fmc_brief_token_changes(struct fmc_mail_ctx *c,
     size_t n =
         rows_new && rows_new->type == JSON_ARR ? json_size(rows_new) : 0u;
     size_t i;
-    for (i = n; i > 0; i--) {
+    for (i = 0; i < n && c->shown < c->changes_cap; i++) {
         struct fmc_row v;
-        if (!fmc_row_parse(json_at(rows_new, i - 1), &v))
-            continue;
-        if (c->shown >= c->changes_cap) {
-            view->dropped++;
-            continue;
+        if (!fmc_row_parse(json_at(rows_new, i), &v) ||
+            !fmc_row_change(c->changes, &v, rows_full, c->sent_path, c->now)) {
+            c->projection_failed = true;
+            break;
         }
-        fmc_row_change(c->changes, &v, rows_full, c->sent_path, c->now);
         c->shown++;
     }
+    view->projection_failed = c->projection_failed;
+    view->dropped = (long long)n - c->shown;
     view->truncated = view->dropped > 0;
 }
 
@@ -3364,6 +3402,8 @@ static bool fmc_brief_resume_changes(const struct zcl_command_request *req,
         return false;
     }
     fmc_brief_token_changes(c, &fresh, rows_full, view);
+    view->forward = true;
+    (void)snprintf(view->start_token, sizeof(view->start_token), "%s", resume);
     json_free(&fresh);
     return true;
 }
@@ -3387,6 +3427,9 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
     view->cursor_token[0] = '\0';
     view->truncated = false;
     view->dropped = 0;
+    view->forward = false;
+    view->projection_failed = false;
+    view->start_token[0] = '\0';
     fail = fmc_snapshot_source("mail", true);
     if (fail) {
         fmc_note_missing(missing, "dev.agent.mail", fail, 0);
@@ -3430,6 +3473,7 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
             fmc_mail_row(c, &v, &rows);
     }
     c->changes_cap = saved_cap;
+    view->projection_failed = c->projection_failed;
     if (resume_state < 0)
         fmc_note_missing(missing, "dev.agent.mail",
                          "brief_since_token_too_long", 0);
@@ -4074,7 +4118,7 @@ static void fmc_capacity_emit(struct json_value *cap,
 
 /* Drop the tail of one array member until the data fits the budget.
  * Returns how many entries were dropped. */
-static long long fmc_trim_member(struct json_value *data, const char *key)
+static long long fmc_trim_member(struct json_value *data, const char *key, size_t budget)
 {
     struct json_value *arr = (struct json_value *)json_get(data, key);
     long long dropped = 0;
@@ -4083,7 +4127,7 @@ static long long fmc_trim_member(struct json_value *data, const char *key)
     while (arr->num_children > 0 &&
            /* Reserve the bounded truncation object and final task counts
             * that are appended after trimming. */
-           json_write(data, NULL, 0) > FMC_REPLY_SOFT_BUDGET - 512u) {
+           json_write(data, NULL, 0) > budget) {
         json_free(&arr->children[arr->num_children - 1]);
         arr->num_children--;
         dropped++;
@@ -4095,23 +4139,37 @@ static long long fmc_trim_member(struct json_value *data, const char *key)
  * budget can never refuse the whole brief: the least essential arrays
  * lose their tail first, and budget_truncated names every array that was
  * cut and by how many entries (empty when nothing was). */
-static void fmc_fit_budget(struct json_value *data)
+static bool fmc_trunc_add(struct json_value *trunc, const char *key, long long count)
+{
+    struct json_value *value = (struct json_value *)json_get(trunc, key);
+    if (!value) return json_push_kv_int(trunc, key, count);
+    if (value->type != JSON_INT) return false;
+    json_set_int(value, json_get_int(value) + count);
+    return true;
+}
+
+static bool fmc_fit_budget(struct json_value *data, size_t budget, bool forward)
 {
     static const char *const order[] = {
         "changes", "workers", "candidates", "work", "agents", "sessions",
         "blockers", "tasks",
     };
-    struct json_value trunc;
+    static const char *const forward_order[] = {
+        "workers", "candidates", "work", "agents", "sessions", "blockers", "tasks", "changes"};
+    const char *const *keys = forward ? forward_order : order;
+    struct json_value empty;
     size_t i;
-    json_init(&trunc);
-    json_set_object(&trunc);
+    json_init(&empty); json_set_object(&empty);
+    bool ok = true;
+    if (!json_get(data, "budget_truncated")) ok = json_push_kv(data, "budget_truncated", &empty);
+    json_free(&empty);
+    struct json_value *trunc = (struct json_value *)json_get(data, "budget_truncated");
+    if (!ok || !trunc || trunc->type != JSON_OBJ) return false;
     for (i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
-        long long d = fmc_trim_member(data, order[i]);
-        if (d > 0)
-            (void)json_push_kv_int(&trunc, order[i], d);
+        long long d = fmc_trim_member(data, keys[i], budget);
+        if (d > 0) ok &= fmc_trunc_add(trunc, keys[i], d);
     }
-    (void)json_push_kv(data, "budget_truncated", &trunc);
-    json_free(&trunc);
+    return ok;
 }
 
 struct fmc_brief_lists {
@@ -4230,16 +4288,130 @@ static void fmc_caller_emit(struct json_value *data,
     json_free(&o);
 }
 
-/* Returns false when the tasks projection could not be copied whole: the
- * caller must refuse the reply rather than ship a partial brief as PASSED.
- * The other composite sections remain best-effort pushes, as before. */
-static bool fmc_brief_reply(struct zcl_command_reply *reply,
+static size_t fmc_brief_data_budget(const struct zcl_command_request *req)
+{
+    size_t cap = req->budget_bytes ? req->budget_bytes : 65536u;
+    size_t data = cap > 1024u ? cap - 1024u : 0u;
+    return data < FMC_REPLY_SOFT_BUDGET - 512u ? data : FMC_REPLY_SOFT_BUDGET - 512u;
+}
+
+static bool fmc_brief_cursor_set(struct json_value *data, const char *token)
+{
+    struct json_value *value = (struct json_value *)json_get(data, "cursor_token");
+    if (!value || value->type != JSON_STR) return false;
+    json_set_str(value, token);
+    const char *actual = json_get_str(value);
+    return value->type == JSON_STR && actual && !strcmp(actual, token);
+}
+
+static bool fmc_brief_changes_set(struct json_value *data, const struct fmc_mail_view *view)
+{
+    long long cut = json_get_int(json_get(json_get(data, "budget_truncated"), "changes"));
+    struct json_value *dropped = (struct json_value *)json_get(data, "changes_dropped");
+    struct json_value *truncated = (struct json_value *)json_get(data, "changes_truncated");
+    if (!dropped || dropped->type != JSON_INT || !truncated || truncated->type != JSON_BOOL) return false;
+    json_set_int(dropped, view->dropped + cut);
+    json_set_bool(truncated, view->truncated || cut > 0);
+    return true;
+}
+
+static bool fmc_brief_tasks_update(struct json_value *data, long long base_dropped)
+{
+    const struct json_value *tasks = json_get(data, "tasks");
+    if (!tasks || tasks->type != JSON_ARR) return false;
+    struct json_value *complete = (struct json_value *)json_get(data, "tasks_sources_complete");
+    struct json_value *dropped = (struct json_value *)json_get(data, "tasks_dropped");
+    struct json_value *shown = (struct json_value *)json_get(data, "tasks_shown");
+    if (!complete || complete->type != JSON_BOOL || !dropped || dropped->type != JSON_INT ||
+        !shown || shown->type != JSON_INT) return false;
+    long long cut = json_get_int(json_get(json_get(data, "budget_truncated"), "tasks"));
+    if (cut > 0) json_set_bool(complete, false);
+    json_set_int(dropped, base_dropped + cut);
+    json_set_int(shown, (long long)json_size(json_get(data, "tasks")));
+    return true;
+}
+
+static bool fmc_brief_cursor_finish(struct zcl_command_reply *reply,
+    const struct fmc_mail_view *view, size_t budget, long long base_tasks_dropped)
+{
+    struct json_value *data = &reply->data;
+    size_t initial = json_size(json_get(data, "changes"));
+    for (size_t attempt = 0; attempt <= initial + 1; attempt++) {
+        const struct json_value *changes = json_get(data, "changes");
+        size_t count = json_size(changes);
+        char token[FMC_MAIL_SINCE_CAP];
+        if (!zcl_devagent_mail_cursor_prefix(view->start_token, view->cursor_token, changes, token, sizeof(token)) ||
+            !fmc_brief_cursor_set(data, token) || !fmc_brief_changes_set(data, view) ||
+            !fmc_brief_tasks_update(data, base_tasks_dropped)) {
+            fmc_fail(reply, "BRIEF_CURSOR_PROJECTION", "native mail cursor could not be projected faithfully", "same since token retained by caller");
+            return false;
+        }
+        if (json_write(data, NULL, 0) <= budget) {
+            if (json_size(changes) || json_get_int(json_get(data, "changes_dropped")) == 0) return true;
+            break;
+        }
+        if (!fmc_fit_budget(data, budget, true)) {
+            fmc_fail(reply, "BRIEF_PROJECTION_FAILED", "brief budget projection failed", "json");
+            return false;
+        }
+        if (json_write(data, NULL, 0) > budget && json_size(json_get(data, "changes")) == count) break;
+    }
+    fmc_fail(reply, "BRIEF_PAGE_STALLED", "no complete forward mail row fits this response budget; cursor is unchanged", "same since token");
+    (void)snprintf(reply->error.next_action, sizeof(reply->error.next_action),
+        "retry the same since with a larger permitted budget, or inspect a retained exact-mail locator");
+    return false;
+}
+
+static bool fmc_brief_changes_copy(struct json_value *data, const struct json_value *changes)
+{
+    if (!json_push_kv(data, "changes", changes)) return false;
+    const struct json_value *copy = json_get(data, "changes");
+    if (!copy || copy->type != JSON_ARR || json_size(copy) != json_size(changes)) return false;
+    for (size_t i = 0; i < json_size(changes); i++) {
+        struct fmc_row row;
+        if (!fmc_row_parse(json_at(changes, i), &row) || !fmc_change_shape(json_at(copy, i), &row)) return false;
+    }
+    return true;
+}
+
+static bool fmc_brief_mail_meta(struct json_value *data, const struct fmc_mail_view *view,
+    long long cursor)
+{
+    const char *token = view && view->ok ? (view->forward ? view->start_token : view->cursor_token) : "";
+    bool ok = json_push_kv_int(data, "cursor", cursor);
+    ok &= json_push_kv_str(data, "cursor_token", token);
+    ok &= json_push_kv_bool(data, "changes_truncated", view && view->truncated);
+    ok &= json_push_kv_int(data, "changes_dropped", view ? view->dropped : 0);
+    const struct json_value *value = json_get(data, "cursor_token");
+    return ok && value && value->type == JSON_STR && !strcmp(json_get_str(value), token);
+}
+
+/* Refuse a partial task projection before computing any usable cursor. */
+static bool fmc_brief_tasks_emit(struct fmc_brief_lists *lists,
+                                  struct zcl_command_reply *reply)
+{
+    if (zcl_fmc_tasks_emit(&lists->tasks, &reply->data))
+        return true;
+    json_free(&reply->data);
+    json_init(&reply->data);
+    json_set_object(&reply->data);
+    fmc_fail(reply, "STEER_BRIEF_DEGRADED",
+             "the task projection could not be copied whole; refusing the brief",
+             NULL);
+    return false;
+}
+
+static void fmc_brief_reply(const struct zcl_command_request *req, struct zcl_command_reply *reply,
                             struct fmc_brief_lists *l,
                             struct fmc_roster *ro,
                             const struct fmc_emit_ctx *ec,
                             const struct fmc_mail_view *mv,
                             long long mail_cursor)
 {
+    if (mv && mv->projection_failed) {
+        fmc_fail(reply, "BRIEF_PROJECTION_FAILED", "mail change projection failed; cursor is unchanged", "json");
+        return;
+    }
     (void)json_push_kv_str(&reply->data, "leaf", FMC_LEAF);
     fmc_caller_emit(&reply->data, ec->caller);
     (void)json_push_kv(&reply->data, "agents", &l->agents);
@@ -4251,37 +4423,30 @@ static bool fmc_brief_reply(struct zcl_command_reply *reply,
     zcl_fmc_cand_emit(&l->cand, &l->candidates, &reply->data, &l->missing);
     (void)json_push_kv(&reply->data, "candidates", &l->candidates);
     (void)json_push_kv(&reply->data, "evidence", &l->evidence);
-    (void)json_push_kv(&reply->data, "changes", &l->changes);
-    (void)json_push_kv(&reply->data, "missing", &l->missing);
-    (void)json_push_kv_int(&reply->data, "cursor", mail_cursor);
-    /* The composite watermark: pass cursor_token back as `since` to resume
-     * past every contributing stream. The integer cursor stays for the
-     * legacy floor adapter. changes_truncated + changes_dropped say the
-     * cap cut the feed (re-poll the previous token and dedupe to recover). */
-    (void)json_push_kv_str(&reply->data, "cursor_token",
-                           mv && mv->ok ? mv->cursor_token : "");
-    (void)json_push_kv_bool(&reply->data, "changes_truncated",
-                            mv && mv->truncated);
-    (void)json_push_kv_int(&reply->data, "changes_dropped",
-                           mv ? mv->dropped : 0);
-    if (!zcl_fmc_tasks_emit(&l->tasks, &reply->data))
-        return false;
-    fmc_fit_budget(&reply->data);
-    const struct json_value *cuts = json_get(&reply->data, "budget_truncated");
-    if (json_get(cuts, "tasks")) {
-        struct json_value *complete = (struct json_value *)json_get(&reply->data,
-            "tasks_sources_complete");
-        json_set_bool(complete, false);
-        struct json_value *dropped = (struct json_value *)json_get(&reply->data,
-            "tasks_dropped");
-        json_set_int(dropped, json_get_int(dropped) +
-            json_get_int(json_get(cuts, "tasks")));
+    if (!fmc_brief_changes_copy(&reply->data, &l->changes) ||
+        !fmc_brief_mail_meta(&reply->data, mv, mail_cursor)) {
+        fmc_fail(reply, "BRIEF_PROJECTION_FAILED", "mail changes or cursor metadata could not be copied", "json");
+        return;
     }
-    (void)json_push_kv_int(&reply->data, "tasks_shown",
-        (long long)json_size(json_get(&reply->data, "tasks")));
+    (void)json_push_kv(&reply->data, "missing", &l->missing);
+    if (!fmc_brief_tasks_emit(l, reply)) return;
+    if (!json_push_kv_int(&reply->data, "tasks_shown", 0)) {
+        fmc_fail(reply, "BRIEF_PROJECTION_FAILED", "task count could not be copied", "json");
+        return;
+    }
+    long long base_tasks_dropped = json_get_int(json_get(&reply->data, "tasks_dropped"));
+    size_t budget = mv && mv->forward ? fmc_brief_data_budget(req) : FMC_REPLY_SOFT_BUDGET - 512u;
+    if (!fmc_fit_budget(&reply->data, budget, mv && mv->forward)) {
+        fmc_fail(reply, "BRIEF_PROJECTION_FAILED", "brief budget metadata could not be copied", "json");
+        return;
+    }
+    if (mv && mv->forward && !fmc_brief_cursor_finish(reply, mv, budget, base_tasks_dropped)) return;
+    if (!fmc_brief_tasks_update(&reply->data, base_tasks_dropped)) {
+        fmc_fail(reply, "BRIEF_PROJECTION_FAILED", "task count projection is incomplete", "json");
+        return;
+    }
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
-    return true;
 }
 
 /* A receiver that has run on this box (the lock file exists) and is not
@@ -4358,21 +4523,12 @@ static void fmc_do_brief(const struct zcl_command_request *req,
     ec.outcomes = &l.outcomes;
     ec.qv = &qv;
     ec.lo = &lo;
-    bool brief_ok = fmc_brief_reply(reply, &l, &ro, &ec, &mv, mail_cursor);
-    if (brief_ok && !json_get_bool(json_get(req->input, "json"))) {
+    fmc_brief_reply(req, reply, &l, &ro, &ec, &mv, mail_cursor);
+    if (reply->status == ZCL_COMMAND_STATUS_PASSED && !mv.forward &&
+        !json_get_bool(json_get(req->input, "json"))) {
         char screen[4096];
         zcl_fmc_tasks_screen(&reply->data, screen, sizeof(screen));
         (void)json_push_kv_str(&reply->data, "screen", screen);
-    }
-    if (!brief_ok) {
-        /* A degraded tasks copy never ships: drop the partial projection
-         * and refuse the brief with an explanatory body. */
-        json_free(&reply->data);
-        json_init(&reply->data);
-        json_set_object(&reply->data);
-        fmc_fail(reply, "STEER_BRIEF_DEGRADED",
-                 "the task projection could not be copied whole; "
-                 "refusing the brief", NULL);
     }
     fmc_lists_free(&l);
     fmc_roster_free(&ro);

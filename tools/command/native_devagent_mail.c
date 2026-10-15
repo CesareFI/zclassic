@@ -89,9 +89,9 @@
  *
  * PULL. Reads every *.jsonl under <state>/mail/ (the outbox plus one inbox
  * file per peer, written by whatever transport delivers them). Returns rows
- * with seq greater than the seq floor, ordered by (ts, from, seq), plus
- * `cursor` (the largest seq seen anywhere in the dir, or the floor when
- * empty) and `count`. Malformed lines are skipped, never fatal, and counted
+ * with seq greater than the seq floor, in per-stream file order merged
+ * across streams (see PAGING), plus `cursor` (the largest seq seen anywhere
+ * in the dir, or the floor when empty) and `count`. Malformed lines are skipped, never fatal, and counted
  * in `skipped`.
  *
  * PAGING. A reply is ONE bounded page: at most 64 rows and about 16 KiB of
@@ -104,9 +104,11 @@
  * matching row exactly once. The token is "<floor>|<stream>:<offset>,...":
  * a byte offset per stream, each stream consumed as a prefix, so a row a
  * transport appends later — even with an older ts — is still returned on
- * a later page, never skipped. A page merges the stream heads in
- * (ts, from, seq) order, ties broken by stream name. Only complete lines
- * are consumed; a last line still being written waits for the next pull.
+ * a later page, never skipped. Rows keep the order of their stream's file;
+ * a page repeatedly takes the stream whose next row sorts first by
+ * (ts, from, seq), ties broken by stream name. The page is not re-sorted, so
+ * a later row with an older ts stays after its stream's earlier rows. Only
+ * complete lines are consumed; a last line still being written waits for the next pull.
  * Stream names must be 1-128 of [A-Za-z0-9._-] (MAIL_STREAM_NAME_INVALID)
  * and at most 16 streams are read (MAIL_STREAMS_TOO_MANY), because the
  * token must name every one. A token whose offset is past a stream's end
@@ -1667,8 +1669,10 @@ static size_t dvm_row_cost(const struct dvm_row *r)
            dvm_json_len(r->board_signer);
 }
 
-/* The stream whose head sorts first by (ts, from, seq); a tie goes to the
- * stream whose name sorts first. NULL when every stream is drained. */
+/* The stream whose next unread row sorts first by (ts, from, seq); a tie goes
+ * to the stream whose name sorts first. This chooses the next row of the
+ * merge, not a global order: each stream still yields its rows in file
+ * order. NULL when every stream is drained. */
 static struct dvm_stream *dvm_pick(struct dvm_pull_state *ps)
 {
     struct dvm_stream *best = NULL;
@@ -1727,6 +1731,93 @@ static bool dvm_token_build(const struct dvm_pull_state *ps, long long floor,
         used += (size_t)n;
     }
     return true;
+}
+
+static bool dvm_prefix_streams(struct dvm_pull_state *ps, const char *token)
+{
+    struct dvm_pull_filter filter = {0};
+    if (!dvm_since_token(token, &filter)) return false;
+    ps->cursor = filter.since;
+    const char *p = filter.token;
+    while (*p) {
+        if (ps->nstreams >= DVM_STREAMS_MAX) return false;
+        struct dvm_stream *stream = &ps->streams[ps->nstreams];
+        if (dvm_token_entry(p, stream->name, sizeof(stream->name), &stream->head_end, &p)) return false;
+        if (ps->nstreams && strcmp(ps->streams[ps->nstreams - 1].name, stream->name) >= 0) return false;
+        ps->nstreams++;
+    }
+    return true;
+}
+
+static struct dvm_stream *dvm_prefix_find(struct dvm_pull_state *ps, const char *name)
+{
+    for (size_t i = 0; i < ps->nstreams; i++)
+        if (!strcmp(ps->streams[i].name, name)) return &ps->streams[i];
+    return NULL;
+}
+
+static bool dvm_cursor_scalar(const char *text, long long *value);
+
+static bool dvm_prefix_base(struct dvm_pull_state *ps, const char *resume,
+    long long *floor)
+{
+    struct dvm_pull_filter filter = {0};
+    if (!dvm_since_token(resume, &filter)) {
+        if (!dvm_cursor_scalar(resume, &filter.since)) return false;
+        filter.token = "";
+    }
+    if (dvm_token_apply(filter.token, ps)) return false;
+    *floor = filter.since;
+    const char *p = filter.token;
+    while (*p) {
+        char name[DVM_STREAM_NAME_MAX + 1]; long long offset;
+        if (dvm_token_entry(p, name, sizeof(name), &offset, &p)) return false;
+        struct dvm_stream *stream = dvm_prefix_find(ps, name);
+        /* The native resume rail drops streams that disappeared. */
+        if (stream && stream->off > stream->head_end) return false;
+    }
+    return true;
+}
+
+static bool dvm_prefix_row(struct dvm_pull_state *ps, const struct json_value *row)
+{
+    const struct json_value *name = json_get(row, "stream");
+    const struct json_value *start = json_get(row, "row_offset");
+    const struct json_value *end = json_get(row, "row_end");
+    if (!name || name->type != JSON_STR || !start || start->type != JSON_INT ||
+        !end || end->type != JSON_INT) return false;
+    struct dvm_stream *stream = dvm_prefix_find(ps, json_get_str(name));
+    if (!stream || json_get_int(start) < stream->off || json_get_int(end) <= json_get_int(start) ||
+        json_get_int(end) > stream->head_end) return false;
+    stream->off = json_get_int(end);
+    return true;
+}
+
+static bool dvm_prefix_input_ok(const char *resume, const char *end_token,
+    const struct json_value *rows, const char *out, size_t cap)
+{
+    return resume && end_token && rows && rows->type == JSON_ARR && out && cap > 0;
+}
+
+bool zcl_devagent_mail_cursor_prefix(const char *resume, const char *end_token,
+    const struct json_value *rows, char *out, size_t cap)
+{
+    if (!dvm_prefix_input_ok(resume, end_token, rows, out, cap)) return false;
+    if (rows->num_children == 0) {
+        if (strlen(resume) >= cap) return false;
+        memcpy(out, resume, strlen(resume) + 1);
+        return true;
+    }
+    if (rows->num_children > 256) return false;
+    struct dvm_pull_state ps = {0};
+    ps.streams = zcl_calloc(DVM_STREAMS_MAX, sizeof(*ps.streams), "devagent_mail.prefix");
+    if (!ps.streams) return false;
+    long long floor = 0;
+    bool ok = dvm_prefix_streams(&ps, end_token) && dvm_prefix_base(&ps, resume, &floor) && floor == ps.cursor;
+    for (size_t i = 0; ok && i < rows->num_children; i++) ok = dvm_prefix_row(&ps, json_at(rows, i));
+    if (ok) ok = dvm_token_build(&ps, floor, out, cap);
+    free(ps.streams);
+    return ok;
 }
 
 /* Per-source completeness: `cursor` is the largest seq seen in ANY stream,
@@ -1972,8 +2063,8 @@ static void dvm_pull(const struct zcl_command_request *req,
             dvm_pull(req, reply, maildir, false);
             return;
         }
-        if (pg.n > 1)
-            qsort(pg.rows, pg.n, sizeof(*pg.rows), dvm_row_cmp);
+        /* Keep the merge's per-stream byte order: a later append may have
+         * an older timestamp, but must remain after its consumed prefix. */
         if (dvm_token_build(ps, filter.since, token, sizeof(token)))
             dvm_pull_build_reply(reply, &pg, ps, token, filter.resumed);
         else

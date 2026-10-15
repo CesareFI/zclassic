@@ -353,6 +353,21 @@ retained revision and nothing was committed: retry the same `request_key` and
 `expected` after the clock advances.
 
 
+# Forward-only brief cursors
+
+For a lossless forward mail feed, begin `steer_brief` with `since="0|"` and
+pass each returned `cursor_token` into the next call. Token pages return the
+native merge prefix that survived both the row limit and final byte fitting,
+oldest row first; rows keep their stream's file order and are not re-sorted by
+timestamp. `changes_truncated` and `changes_dropped` count pending rows; they do
+not require replaying the old cursor and deduplicating. The integer cursor is
+informational, and integer `since` retains the legacy latest-snapshot behavior.
+Projection failure or a page with no room for a complete pending row refuses
+without a successful advanced token. Keep the input cursor and follow the
+error's next action. Token pages omit the optional human screen to keep the
+final response within its bound. Per-row `row_end` is native cursor provenance,
+not an exact read selector or new permission.
+
 # Exact retained mail
 
 `steer_evidence(type="mail", ref=...)` keeps its latest-held behavior. To

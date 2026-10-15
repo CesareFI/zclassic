@@ -932,7 +932,7 @@ struct gw_tool {
 static const struct gw_tool gw_tools[] = {
     {"steer_brief", "brief", "Observe fleet",
      "Read-only fleet snapshot from existing authenticated state: agents, work, blockers, capacity, candidates, evidence refs, changes since a cursor. Missing and stale observations remain explicit. "
-     "Preferred: pass the reply's cursor_token string as since to resume every stream exactly once. "
+     "Preferred: pass cursor_token as since for the next forward page, including when changes_truncated. It covers only rows actually returned after row and byte limits. Start with since=0| to read held history. Token pages omit the optional human screen; no-fitting-row pages refuse without advancing. "
      "An integer is a legacy global floor that hides independently-numbered streams. "
      "A refused token names dev.agent.mail in missing[]; replay from the start. "
      "caller reports the grant sender label, scopes and expiry the node authenticated.",

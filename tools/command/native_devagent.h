@@ -13,6 +13,12 @@
 
 struct zcl_command_request;
 struct zcl_command_reply;
+struct json_value;
+
+/* Pure cursor projection for a native merge prefix. Rows must carry native
+ * stream/start/end provenance; this grants no read or mutation authority. */
+bool zcl_devagent_mail_cursor_prefix(const char *resume, const char *end_token,
+    const struct json_value *rows, char *out, size_t cap);
 
 /* Internal fleet-brief mail pull. It skips global-max scans while pages
  * remain and replays the final page through the normal path; direct mail
