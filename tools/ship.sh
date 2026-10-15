@@ -64,6 +64,17 @@ say()  { printf '\033[1mship:\033[0m %s\n' "$*"; }
 step() { printf '\n\033[1m── %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31mship: REFUSE:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Freeze assert: a worker and its legacy-name twin are one stripped binary
+# shipped under two names, so their frozen digests must be equal. Takes the
+# digests already computed once at freeze time (no re-hash); refuses with the
+# twin names and BOTH digests when they differ.
+ship_assert_twin_sha() {
+    local name_a="$1" sha_a="$2" name_b="$3" sha_b="$4"
+    if [ "$sha_a" != "$sha_b" ]; then
+        die "twin binaries differ: $name_a sha256 $sha_a != $name_b sha256 $sha_b (the legacy-name copy must be byte-identical; nothing was transferred or restarted)"
+    fi
+}
+
 # One seam every LOCAL mktemp/mktemp -d in this script routes through.
 # Scratch lives under the owner's state root, never /tmp: honour
 # ZCL_SCRATCH_DIR when set, otherwise the standing scratch root. (Remote-side
@@ -1097,8 +1108,15 @@ if [ "${1:-}" = "--selftest" ] || [ "${1:-}" = "--selftest-dev-guard" ]; then
     wait "$exe_pid" 2>/dev/null || true
     trap 'find "$test_tmp" -depth -delete' EXIT HUP INT TERM
 
+    # ── twin freeze assert: differing legacy-name copy refuses, naming both SHAs
+    twin_a=$(printf 'a%.0s' {1..64}); twin_b=$(printf 'b%.0s' {1..64})
+    ( ship_assert_twin_sha z23-x "$twin_a" zclassic23-x "$twin_a" ) 2>/dev/null
+    twin_msg="$( ( ship_assert_twin_sha z23-x "$twin_a" zclassic23-x "$twin_b" ) 2>&1 )" && twin_rc=0 || twin_rc=$?
+    [ "$twin_rc" -eq 1 ]
+    case "$twin_msg" in *"REFUSE"*"$twin_a"*"$twin_b"*) ;; *) false ;; esac
+
     find "$test_tmp" -depth -delete; trap - EXIT HUP INT TERM
-    printf 'ship: selftest PASS (four-host order; bounded stage barrier; validation; GLIBC inequality; explicit proof host; real-Tor gate; Tor-archive preflight both directions; dev-artifact guard refused every reach; prepare steps built tor-provenance/tor-ready, left a mismatched provenance untouched, reinstalled hooks, and deduped/refused hardlinks correctly; local forward-only schema acceptance mirrors remote accept/refuse/disarm; local immutable release directory detected and refused before any write; native executable resolution and byte-read contract)\n'
+    printf 'ship: selftest PASS (four-host order; bounded stage barrier; validation; GLIBC inequality; explicit proof host; real-Tor gate; Tor-archive preflight both directions; dev-artifact guard refused every reach; prepare steps built tor-provenance/tor-ready, left a mismatched provenance untouched, reinstalled hooks, and deduped/refused hardlinks correctly; local forward-only schema acceptance mirrors remote accept/refuse/disarm; local immutable release directory detected and refused before any write; native executable resolution and byte-read contract; twin binaries with differing SHAs refused naming both)\n'
     exit 0
 fi
 
@@ -1390,6 +1408,8 @@ else
         zcl_is_sha256 "$s" || die "could not hash frozen worker $w"
         WORKER_SHAS+=("$s")
     done
+    ship_assert_twin_sha "${WORKER_NAMES[0]}" "${WORKER_SHAS[0]}" "${WORKER_NAMES[2]}" "${WORKER_SHAS[2]}"
+    ship_assert_twin_sha "${WORKER_NAMES[1]}" "${WORKER_SHAS[1]}" "${WORKER_NAMES[3]}" "${WORKER_SHAS[3]}"
     say "workers    ${WORKER_NAMES[0]} ${WORKER_SHAS[0]:0:16}…  ${WORKER_NAMES[1]} ${WORKER_SHAS[1]:0:16}…  (plus legacy ${WORKER_NAMES[2]}, ${WORKER_NAMES[3]})  $(du -ch "${WORKER_FILES[@]}" | tail -1 | cut -f1)"
 
     # Not redundant with the archive preflight: only the built binary proves
