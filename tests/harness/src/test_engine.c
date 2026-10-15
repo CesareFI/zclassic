@@ -2756,6 +2756,81 @@ static int case_receipt_tokens_and_wall(const char *receipt, bool have_receipt)
              && wall_ms >= 0);
     return failures;
 }
+#if !defined(_WIN32)
+/* The unit's CLI child: the parent session's markers are scrubbed, while the
+ * subscription and provider settings (CLAUDE_CODE_OAUTH_TOKEN,
+ * CLAUDE_CODE_USE_VERTEX) reach the child intact. */
+static int case_engine_unit_scrub_env_e2e(void)
+{
+    int failures = 0;
+
+    if (!engine_unit_binary_present()) {
+        printf("engine: FAIL (%s is a required test prerequisite for the "
+               "CLI env scrub end-to-end case)\n", ENGINE_UNIT_BIN);
+        return 1;
+    }
+
+    char rel_dir[512], dir[600];
+    test_make_tmpdir(rel_dir, sizeof(rel_dir), "engine_scrub_e2e", "run");
+    if (!test_abs_path(rel_dir, dir, sizeof(dir))) {
+        printf("engine: FAIL (could not absolutize the scrub e2e fixture dir)\n");
+        return 1;
+    }
+    char bindir[700], fake[760], dump[700], task_path[700], state_dir[700];
+    char worktree[700], script[1024], path[9000], cmd[9500];
+    static char envtxt[64 * 1024];
+    (void)snprintf(bindir, sizeof(bindir), "%s/bin", dir);
+    (void)snprintf(fake, sizeof(fake), "%s/claude", bindir);
+    (void)snprintf(dump, sizeof(dump), "%s/child.env", dir);
+    (void)snprintf(task_path, sizeof(task_path), "%s/task.txt", dir);
+    (void)snprintf(state_dir, sizeof(state_dir), "%s/state", dir);
+    (void)snprintf(worktree, sizeof(worktree), "%s/wt", dir);
+    mkdir(bindir, 0700);
+    mkdir(state_dir, 0700);
+    mkdir(worktree, 0700);
+    (void)snprintf(script, sizeof(script),
+                   "#!/bin/sh\nenv > '%s'\nexit 0\n", dump);
+
+    const bool worktree_ready = engine_test_git_init(worktree);
+    EN_CHECK("the scrub e2e worktree is a Git repository", worktree_ready);
+    if (!worktree_ready)
+        return failures + 1;
+
+    const bool wrote_task = write_whole_file(task_path,
+        "kind: fix-gate\n\nA scrub smoke task; the fake CLI only records "
+        "its environment.\n");
+    const bool wrote_fake = write_whole_file(fake, script) &&
+                            chmod(fake, 0755) == 0;
+    EN_CHECK("the scrub e2e fixtures are written", wrote_task && wrote_fake);
+    if (!(wrote_task && wrote_fake))
+        return failures + 1;
+
+    (void)snprintf(path, sizeof(path), "%s:%s", bindir,
+                   getenv("PATH") ? getenv("PATH") : "");
+    (void)snprintf(cmd, sizeof(cmd),
+        "env PATH='%s' CLAUDECODE=1 CLAUDE_CODE_ENTRYPOINT=cli "
+        "CLAUDE_CODE_OAUTH_TOKEN=tok-scrub-e2e CLAUDE_CODE_USE_VERTEX=1 "
+        "%s --engine claude-haiku --task %s --no-group --yes-dispatch "
+        "--worktree %s --state-dir %s >%s/run.log 2>&1",
+        path, ENGINE_UNIT_BIN, task_path, worktree, state_dir, dir);
+    TEST_DISCARD(system(cmd)); /* verdict is read from the child's dump */
+
+    envtxt[0] = '\0';
+    const bool dumped = read_whole_file(dump, envtxt, sizeof(envtxt));
+    EN_CHECK("the fake CLI child ran and dumped its environment", dumped);
+    if (!dumped)
+        return failures + 1;
+    EN_CHECK("CLAUDE_CODE_OAUTH_TOKEN survives into the CLI child",
+             strstr(envtxt, "CLAUDE_CODE_OAUTH_TOKEN=tok-scrub-e2e") != NULL);
+    EN_CHECK("CLAUDE_CODE_USE_VERTEX survives into the CLI child",
+             strstr(envtxt, "CLAUDE_CODE_USE_VERTEX=1") != NULL);
+    EN_CHECK("CLAUDECODE is scrubbed from the CLI child",
+             strstr(envtxt, "CLAUDECODE=") == NULL);
+    EN_CHECK("CLAUDE_CODE_ENTRYPOINT is scrubbed from the CLI child",
+             strstr(envtxt, "CLAUDE_CODE_ENTRYPOINT=") == NULL);
+    return failures;
+}
+#endif
 
 static int case_engine_unit_state_e2e(void)
 {
@@ -5999,6 +6074,153 @@ static int case_claude_ledger_row_e2e(void)
              !strstr(row, "cost_micro_usd"));
     return failures;
 }
+
+/* ── the GPT CLI dispatch path ───────────────────────────────────────────
+ * Runs the real binary against a FAKE `codex` on PATH. The fake records its
+ * argv, finds the -C directory, edits a file there, and prints a plain final
+ * message. No real model or codex binary is ever run. */
+static bool gpt_dispatch_run(const char *engine, char *calls_txt, size_t cap,
+                             char *receipt_txt, size_t receipt_cap,
+                             char *ledger_txt, size_t ledger_cap, char *env_txt,
+                             size_t env_cap,
+                             bool *edited)
+{
+    char rel[512], dir[600];
+    test_make_tmpdir(rel, sizeof(rel), "engine_gpt_dispatch", engine);
+    if (!test_abs_path(rel, dir, sizeof(dir))) {
+        test_rm_rf(rel);
+        return false;
+    }
+    char bin_dir[700], state[700], worktree[700], task[700], codex[700];
+    char ledger[700], calls[700], lfile[700], run_log[700], rcpt[700];
+    char touched[700], envfile[700], text[2048];
+    (void)snprintf(bin_dir, sizeof(bin_dir), "%s/bin", dir);
+    (void)snprintf(state, sizeof(state), "%s/state", dir);
+    (void)snprintf(worktree, sizeof(worktree), "%s/wt", dir);
+    (void)snprintf(task, sizeof(task), "%s/task.txt", dir);
+    (void)snprintf(codex, sizeof(codex), "%s/codex", bin_dir);
+    (void)snprintf(ledger, sizeof(ledger), "%s/ledger.sh", dir);
+    (void)snprintf(calls, sizeof(calls), "%s/codex.argv", dir);
+    (void)snprintf(lfile, sizeof(lfile), "%s/ledger.argv", dir);
+    (void)snprintf(run_log, sizeof(run_log), "%s/run.log", dir);
+    (void)snprintf(rcpt, sizeof(rcpt), "%s/receipt.json", state);
+    (void)snprintf(touched, sizeof(touched), "%s/gpt_touched.txt", worktree);
+    (void)snprintf(envfile, sizeof(envfile), "%s/codex.env", dir);
+    if (mkdir(bin_dir, 0700) != 0 || mkdir(state, 0700) != 0 ||
+        mkdir(worktree, 0700) != 0) {
+        test_rm_rf(dir);
+        return false;
+    }
+    (void)snprintf(text, sizeof(text),
+        "#!/bin/sh\n"
+        "for a in \"$@\"; do printf '%%s\\n' \"$a\"; done > '%s'\n"
+        "d=.\nwhile [ $# -gt 0 ]; do\n"
+        "  if [ \"$1\" = -C ]; then d=\"$2\"; fi\n  shift\ndone\n"
+        "env > '%s'\n"
+        "printf 'edited by fake codex\\n' > \"$d/gpt_touched.txt\"\n"
+        "printf 'Edited gpt_touched.txt.\\n'\n", calls, envfile);
+    bool ok = write_whole_file(codex, text) && chmod(codex, 0700) == 0 &&
+              engine_test_git_init(worktree);
+    (void)snprintf(text, sizeof(text),
+                   "#!/bin/sh\nfor a in \"$@\"; do printf '%%s\\n' \"$a\"; "
+                   "done > '%s'\n", lfile);
+    ok = ok && write_whole_file(ledger, text) && chmod(ledger, 0700) == 0 &&
+         write_whole_file(task, "kind: fix-gate\n\nEdit one file.\n");
+    if (!ok) {
+        test_rm_rf(dir);
+        return false;
+    }
+    char cmd[4096];
+    (void)snprintf(cmd, sizeof(cmd),
+        "CLAUDE_CODE_SESSION_ID=s1 CLAUDE_CODE_ENTRYPOINT=cli CLAUDECODE=1 "
+        "CLAUDE_PID=7 CLAUDE_EFFORT=high CODEX_HOME=/keep/codex "
+        "PATH=%s:$PATH %s --engine %s --task %s --no-group "
+        "--yes-dispatch --worktree %s --state-dir %s --fleet-ledger %s "
+        ">%s 2>&1", bin_dir, ENGINE_UNIT_BIN, engine, task, worktree, state,
+        ledger, run_log);
+    TEST_DISCARD(system(cmd)); /* judged from what the fakes saw */
+    calls_txt[0] = receipt_txt[0] = ledger_txt[0] = '\0';
+    const bool got = read_whole_file(calls, calls_txt, cap);
+    (void)read_whole_file(rcpt, receipt_txt, receipt_cap);
+    (void)read_whole_file(lfile, ledger_txt, ledger_cap);
+    env_txt[0] = '\0';
+    (void)read_whole_file(envfile, env_txt, env_cap);
+    *edited = access(touched, F_OK) == 0;
+    test_rm_rf(dir); /* every log lives under dir: read first */
+    return got;
+}
+
+static int gpt_check_calls(bool ran, const char *calls, const char *model,
+                           bool edited)
+{
+    int failures = 0;
+    EN_CHECK("the fake codex was launched", ran);
+    EN_CHECK("codex got exec, its model, the low effort and workspace-write",
+             ran && strncmp(calls, "exec\n-C\n", 8) == 0 &&
+             strstr(calls, "\n-m\n") != NULL &&
+             strstr(calls, model) != NULL &&
+             strstr(calls, "model_reasoning_effort=\"low\"\n") != NULL &&
+             strstr(calls, "workspace-write\n") != NULL);
+    EN_CHECK("the edit landed in the worktree", edited);
+    return failures;
+}
+
+static int gpt_check_env(bool ran, const char *envd)
+{
+    int failures = 0;
+    EN_CHECK("the CLI child has no parent agent-session variables",
+             ran && strstr(envd, "PATH=") != NULL &&
+             strstr(envd, "CLAUDE_CODE_") == NULL &&
+             strstr(envd, "CLAUDECODE=") == NULL &&
+             strstr(envd, "CLAUDE_PID=") == NULL &&
+             strstr(envd, "CLAUDE_EFFORT=") == NULL);
+    EN_CHECK("the CLI child keeps its own auth location",
+             ran && strstr(envd, "CODEX_HOME=/keep/codex\n") != NULL);
+    return failures;
+}
+
+static int gpt_check_receipt(const char *receipt, const char *ledger,
+                             const char *id)
+{
+    int failures = 0;
+    EN_CHECK("the receipt names the engine, one changed file and an "
+             "UNVERIFIED verdict (no group)",
+             strstr(receipt, id) != NULL &&
+             strstr(receipt, "\"files_changed\":1") != NULL &&
+             strstr(receipt, "\"verdict\":\"UNVERIFIED\"") != NULL);
+    EN_CHECK("plain output leaves tokens and cost unreported (null)",
+             strstr(receipt, "\"total_tokens\":null") != NULL &&
+             strstr(receipt, "\"cost_usd_known\":false") != NULL);
+    EN_CHECK("the ledger row is filed under the codex subject",
+             strstr(ledger, "--subject=codex\n") != NULL);
+    EN_CHECK("plain output reports no tokens, so none are sent",
+             strstr(ledger, "tokens_in") == NULL);
+    return failures;
+}
+
+static int case_gpt_dispatch_e2e(void)
+{
+    int failures = 0;
+    if (!engine_unit_binary_present()) {
+        printf("engine: FAIL (%s is required for the gpt dispatch e2e)\n",
+               ENGINE_UNIT_BIN);
+        return 1;
+    }
+    static const char *const ids[] = { "gpt-luna", "gpt-sol" };
+    static const char *const models[] = { "gpt-6-luna", "gpt-6.1-sol" };
+    for (size_t i = 0; i < 2; i++) {
+        char calls[4096], receipt[8192], ledger[2048], envd[65536];
+        bool edited = false;
+        const bool ran = gpt_dispatch_run(ids[i], calls, sizeof(calls),
+                                          receipt, sizeof(receipt), ledger,
+                                          sizeof(ledger), envd, sizeof(envd),
+                                          &edited);
+        failures += gpt_check_calls(ran, calls, models[i], edited);
+        failures += gpt_check_env(ran, envd);
+        failures += gpt_check_receipt(receipt, ledger, ids[i]);
+    }
+    return failures;
+}
 #endif
 
 /* The card-check kind is read-only: it checks a card against the tree and
@@ -6073,7 +6295,9 @@ int test_engine(void)
 #if !defined(_WIN32)
     failures += case_engine_unit_report_effect_e2e();
     failures += case_engine_unit_grok_projection_e2e();
+    failures += case_engine_unit_scrub_env_e2e();
     failures += case_claude_ledger_row_e2e();
+    failures += case_gpt_dispatch_e2e();
 #endif
     failures += case_review_findings_not_verdict();
     failures += case_contract();

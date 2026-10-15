@@ -50,7 +50,7 @@ static const char *const k_sr_root_allowed[] = {
     ".git", "build", "vendor", "test-tmp", "compile_commands.json",
     ".cache", ".codeindex", ".zvcs", ".core-unseal-token", ".zcl_test_render",
     "chaos-output", ".antigravitycli", ".gemini", ".aider", ".vscode", ".idea",
-    "tags", "TAGS", ".DS_Store",
+    "tags", "TAGS", ".DS_Store", ".eu-warm", ".eu-lock",
 };
 
 static int sr_seed(struct sr_set *s)
@@ -151,6 +151,22 @@ int check_no_stray_root_files_run(int argc, char **argv)
                   scanned) < 0 ? die("z23-lint: write failed\n", "") : 0;
 }
 
+/* The funnel's pool markers are required in every pool worktree root: they
+ * pass, and an unknown root entry still trips. */
+static int sr_selftest_pool_markers(void)
+{
+    struct sr_set al = {0};
+    char stray[8][SR_NAME];
+    int ns = 0, sc = 0, bad = sr_seed(&al) != 0;
+    const char *pool[] = { ".git", ".eu-warm", ".eu-lock" };
+    bad |= sr_feed(&al, pool, 3, stray, 8, &ns, &sc) || ns != 0 || sc != 3;
+    const char *pooljunk[] = { ".eu-warm", "junk.db" };
+    ns = sc = 0;
+    bad |= sr_feed(&al, pooljunk, 2, stray, 8, &ns, &sc) || ns != 1
+        || strcmp(stray[0], "junk.db");
+    return bad;
+}
+
 int check_no_stray_root_files_selftest(void)
 {
     struct sr_set al = {0};
@@ -168,6 +184,7 @@ int check_no_stray_root_files_selftest(void)
     const char *core[] = { "core.1234", "vgcore.9" };
     ns = sc = 0;
     bad |= sr_feed(&al, core, 2, stray, 8, &ns, &sc) || ns != 0;
+    bad |= sr_selftest_pool_markers();
     const char *old = getenv("ZCL_ROOT_STRAY_EXTRA_FOR_TEST");
     if (setenv("ZCL_ROOT_STRAY_EXTRA_FOR_TEST", "build", 1) != 0) bad = 1;
     {

@@ -422,6 +422,53 @@ static int run(const char *const argv[], char *buf, size_t cap, int timeout_ms)
     return zcl_spawn_capture(argv, buf, cap, timeout_ms);
 }
 
+#if !defined(_WIN32)
+extern char **environ;
+#endif
+
+/* Drop the PARENT agent session's markers before a CLI child starts, so a
+ * funnel driven from inside a Claude Code session never makes a nested
+ * session. Only these exact session-marker names are scrubbed. Auth and
+ * provider selection (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_USE_BEDROCK,
+ * CLAUDE_CODE_USE_VERTEX, ANTHROPIC_*) are kept: the subscription login lives
+ * in files under the home directory, and a child needs its provider choice.
+ * No CODEX_* marker is scrubbed: `codex exec` documents none and its auth is
+ * CODEX_HOME. */
+static bool unit_is_agent_session_var(const char *entry)
+{
+    static const char *const exact[] = {
+        "CLAUDECODE=", "CLAUDE_PID=", "CLAUDE_EFFORT=",
+        "CLAUDE_CODE_ENTRYPOINT=", "CLAUDE_CODE_EXECPATH=",
+        "CLAUDE_CODE_SSE_PORT=", "CLAUDE_CODE_SESSION_ID=",
+        "CLAUDE_CODE_CHILD_SESSION=", "CLAUDE_CODE_SESSION_ATTENDED=",
+        "CLAUDE_CODE_MESSAGING_SOCKET=", "CLAUDE_CODE_MESSAGING_TOKEN=",
+        "CLAUDE_CODE_SUBAGENT_MODEL=",
+    };
+    for (size_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++)
+        if (strncmp(entry, exact[i], strlen(exact[i])) == 0)
+            return true;
+    return false;
+}
+
+static void unit_scrub_agent_session_env(void)
+{
+#if !defined(_WIN32)
+    char name[128];
+    for (size_t i = 0; environ && environ[i];) {
+        const char *eq = strchr(environ[i], '=');
+        size_t n = eq ? (size_t)(eq - environ[i]) : 0;
+        if (!unit_is_agent_session_var(environ[i]) || n == 0 ||
+            n >= sizeof(name)) {
+            i++;
+            continue;
+        }
+        memcpy(name, environ[i], n);
+        name[n] = '\0';
+        (void)unsetenv(name); /* shifts the array: do not advance i */
+    }
+#endif
+}
+
 /* A CLI row owns its stdio transport choice. Both implementations exec the
  * exact argv with no shell and preserve the timeout observation; a vendor id
  * is never consulted here. */
@@ -429,6 +476,7 @@ static int run_cli(const struct engine_vendor *v, const char *const argv[],
                    const char *cwd, char *buf, size_t cap, int timeout_ms,
                    bool *timed_out)
 {
+    unit_scrub_agent_session_env();
     if (v->cli_needs_tty) {
         if (cwd) return -1; /* the PTY launch has no cwd: refuse */
         return zcl_spawn_pty_capture_observed(
@@ -2342,7 +2390,9 @@ static const char *unit_ledger_provider(const char *engine_id)
     if (strcmp(engine_id, "claude-haiku") == 0 ||
         strcmp(engine_id, "claude-sonnet") == 0)
         return engine_id;
-    if (strcmp(engine_id, "openai") == 0)
+    /* The GPT CLI rows spend against the ledger's existing codex subject. */
+    if (strcmp(engine_id, "openai") == 0 || strcmp(engine_id, "gpt-luna") == 0 ||
+        strcmp(engine_id, "gpt-sol") == 0)
         return "codex";
     return NULL; /* `fixture` spends nothing; an unknown id names nothing */
 }

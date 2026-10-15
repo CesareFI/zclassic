@@ -1181,6 +1181,12 @@ int t_no_stray_root_files(void)
         doc_wired = strstr(doc_buf, "check-no-stray-root-files") != NULL;
     }
 
+    TEST("[lint-gate] check-no-stray-root-files: pool markers pass, unknown "
+         "root entry trips") {
+        ASSERT(run_gate_script_selftest(ROOT_STRAY_SCRIPT_REL) == 0);
+        PASS();
+    }
+
     TEST("[lint-gate] check-no-stray-root-files: clean root passes, isolated "
          "classification trips, recovers, wired") {
         ASSERT(clock_env_rc == 0);

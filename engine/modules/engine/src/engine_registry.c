@@ -88,6 +88,28 @@ static const char *const k_claude_cli_start_argv[] = {
     "below; do not run builds.",
     NULL
 };
+/* OpenAI's subscription agent CLI, non-interactive (`codex exec`). It names
+ * its directory (-C), takes the prompt TEXT as the last argument (after --,
+ * so a prompt that begins with a dash is still a prompt), and edits the
+ * worktree itself. The sandbox is workspace-write with tool network off and
+ * approvals never asked; user config and persisted sessions are skipped, and
+ * auth still comes from CODEX_HOME. Reasoning effort is baked in at low: the
+ * -c value has the form key=value, which the one-slot effort flag cannot
+ * express, so these rows accept no other explicit effort. */
+static const char *const k_gpt_cli_start_argv[] = {
+    "exec",
+    "-C",             ENGINE_CLI_WORKDIR_TOKEN,
+    "-m",             ENGINE_CLI_MODEL_TOKEN,
+    "-s",             "workspace-write",
+    "-c",             "approval_policy=\"never\"",
+    "-c",             "sandbox_workspace_write.network_access=false",
+    "-c",             "model_reasoning_effort=\"low\"",
+    "--ignore-user-config",
+    "--ephemeral",
+    "--color",        "never",
+    "--",             ENGINE_CLI_PROMPT_TOKEN,
+    NULL
+};
 static const char *const k_grok_cli_resume_argv[] = {
     "--resume", ENGINE_CLI_RESUME_TOKEN, NULL
 };
@@ -254,6 +276,39 @@ static const struct engine_vendor k_engine_vendors[] = {
         .costs_money   = true,
         .lead          = "claude",
         .tier          = ENGINE_TIER_HEAVY,
+        .max_retries   = 1,
+    },
+    {
+        /* OpenAI's agent CLI, subscription-authenticated, one row per model
+         * tier like the Claude rows. Output is plain text (the final
+         * message): `codex exec --json` usage events are not decoded, so the
+         * receipt records tokens and cost as unreported, never zero. Model
+         * ids come from `codex debug models`; --model still overrides. */
+        .id            = "gpt-luna",
+        .display       = "OpenAI GPT-6 Luna (installed agent CLI, subscription auth, low effort)",
+        .url           = NULL,
+        .default_model = "gpt-6-luna",
+        .program       = "codex",
+        .start_argv    = k_gpt_cli_start_argv,
+        .cli_prompt    = ENGINE_CLI_PROMPT_ARG,
+        .report_format = ENGINE_CLI_OUTPUT_PLAIN,
+        .wire          = ENGINE_WIRE_LOCAL_CLI,
+        .delivery      = ENGINE_DELIVERS_EDITS,
+        .costs_money   = true,
+        .max_retries   = 1,
+    },
+    {
+        .id            = "gpt-sol",
+        .display       = "OpenAI GPT-6.1 Sol (installed agent CLI, subscription auth, low effort)",
+        .url           = NULL,
+        .default_model = "gpt-6.1-sol",
+        .program       = "codex",
+        .start_argv    = k_gpt_cli_start_argv,
+        .cli_prompt    = ENGINE_CLI_PROMPT_ARG,
+        .report_format = ENGINE_CLI_OUTPUT_PLAIN,
+        .wire          = ENGINE_WIRE_LOCAL_CLI,
+        .delivery      = ENGINE_DELIVERS_EDITS,
+        .costs_money   = true,
         .max_retries   = 1,
     },
     {

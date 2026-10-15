@@ -29,7 +29,8 @@
  *   model    post only, optional model id, default picks flash until
  *            attempt 3, then the stronger model.
  *   engine   post only, optional registered engine id (glm, glm-cli,
- *            claude-haiku, claude-sonnet, ...). Absent means glm. With an
+ *            claude-haiku, claude-sonnet, gpt-luna, gpt-sol, ...). Absent
+ *            means glm. With an
  *            engine, next passes --engine and --model only if model is set;
  *            a model outside the engine's family is refused at post.
  *   attempt  post only, optional integer >= 1, default 1.
@@ -1073,6 +1074,27 @@ static bool dvq_engine_ok(const char *s)
     return true;
 }
 
+/* The model belongs to the vendor's family: its default model up to the first
+ * "-<digit>". A gpt-6 row (gpt-luna, gpt-sol) takes only the gpt-6 generation,
+ * so a gpt-4 model is refused on it. */
+static bool dvq_model_in_family(const struct engine_vendor *v, const char *model)
+{
+    char family[64];
+    size_t n = 0;
+    while (v->default_model[n] && n + 1 < sizeof(family) &&
+           !(v->default_model[n] == '-' && v->default_model[n + 1] >= '0' &&
+             v->default_model[n + 1] <= '9')) {
+        family[n] = v->default_model[n];
+        n++;
+    }
+    family[n] = '\0';
+    if (strncmp(v->default_model, "gpt-6", 5) == 0 &&
+        strncmp(model, "gpt-6", 5) != 0)
+        return false;
+    return strncmp(model, family, n) == 0 &&
+           (model[n] == '\0' || model[n] == '-');
+}
+
 /* A posted engine must be a registered vendor id; a posted model must be one
  * of that vendor's family (its default model up to the first "-<digit>"), so
  * a claude engine can never be handed a glm model id. Rows without an engine
@@ -1082,29 +1104,19 @@ static bool dvq_engine_model_ok(const char *engine, const char *model,
                                 const char **code)
 {
     const struct engine_vendor *v;
-    char family[64];
-    size_t n = 0;
     if (!engine)
         return true;
     v = dvq_engine_ok(engine) ? engine_by_id(engine) : NULL;
     if (!v) {
         *code = "UNKNOWN_ENGINE";
         *msg = "engine is a registered engine id (glm, glm-cli, claude-haiku, "
-               "claude-sonnet, ...)";
+               "claude-sonnet, gpt-luna, gpt-sol, ...)";
         *why = "input.engine not in the engine registry";
         return false;
     }
     if (!model || !model[0] || !v->default_model)
         return true;
-    while (v->default_model[n] && n + 1 < sizeof(family) &&
-           !(v->default_model[n] == '-' && v->default_model[n + 1] >= '0' &&
-             v->default_model[n + 1] <= '9')) {
-        family[n] = v->default_model[n];
-        n++;
-    }
-    family[n] = '\0';
-    if (strncmp(model, family, n) == 0 &&
-        (model[n] == '\0' || model[n] == '-'))
+    if (dvq_model_in_family(v, model))
         return true;
     *code = "ENGINE_MODEL_MISMATCH";
     *msg = "model does not belong to the named engine";
@@ -2694,6 +2706,86 @@ static void dvq_emit_no_worktree(struct zcl_command_reply *reply,
     reply->exit_code = 0;
 }
 
+/* The unit's PATH as one --setenv argument: the caller's PATH with only its
+ * absolute entries, in their order. A relative or empty entry is never handed
+ * to the unit. An empty result leaves buf empty, so no setenv is passed.
+ * Returns false when the value does not fit buf. */
+static bool dvq_unit_path(char *buf, size_t cap)
+{
+    static const char prefix[] = "--setenv=PATH=";
+    const size_t plen = sizeof(prefix) - 1;
+    const char *p = getenv("PATH");
+    size_t vlen = 0;
+    buf[0] = '\0';
+    while (p && *p) {
+        const char *end = strchr(p, ':');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len > 0 && p[0] == '/') {
+            size_t sep = vlen > 0 ? 1 : 0;
+            if (plen + vlen + sep + len + 1 > cap)
+                return false;
+            if (vlen == 0)
+                memcpy(buf, prefix, plen);
+            if (sep)
+                buf[plen + vlen++] = ':';
+            memcpy(buf + plen + vlen, p, len);
+            vlen += len;
+            buf[plen + vlen] = '\0';
+        }
+        if (!end)
+            break;
+        p = end + 1;
+    }
+    return true;
+}
+
+/* The unit environment: systemd-run starts a unit from the user manager's
+ * environment, which lacks ~/.local/bin where the claude and codex CLIs live
+ * (the harness then exits 127 and the verdict is REFUSED). The caller's PATH
+ * is passed with --setenv rather than resolving each CLI's program to an
+ * absolute path here: the harness, its gate and every CLI row already
+ * resolve programs through PATH, so one inherited value fixes all of them
+ * and no per-row knowledge leaks into the queue. HOME is set by the user
+ * manager itself. Returns the new sargv length. */
+static int dvq_unit_env_args(const char **sargv, int m, const char *zbenv,
+                             bool have_zbin, char *zsetenv, size_t zcap,
+                             const char *psetenv)
+{
+    if (have_zbin) {
+        (void)snprintf(zsetenv, zcap, "--setenv=%s", zbenv);
+        sargv[m++] = zsetenv;
+    }
+    if (psetenv[0])
+        sargv[m++] = psetenv;
+    return m;
+}
+
+/* The one refusal point of a pick before any state change: no free worktree,
+ * or a unit PATH too long to pass. Each refusal replies here, frees the rows,
+ * releases the queue lock, and leaves the row queued. Returns false after
+ * replying. */
+static bool dvq_next_ready(struct zcl_command_reply *reply, int lock,
+                           struct dvq_row *rows, const char *poolpath,
+                           bool have_wt, int wtfd, char *psetenv, size_t pcap)
+{
+    if (!have_wt) {
+        free(rows);
+        dvq_unlock(lock);
+        dvq_emit_no_worktree(reply, poolpath);
+        return false;
+    }
+    if (!dvq_unit_path(psetenv, pcap)) {
+        free(rows);
+        dvq_unlock(lock);
+        dvq_close_wt(wtfd);
+        dvq_fail(reply, "QUEUE_PATH_TOO_LONG", "select",
+                 "the caller's PATH is too long for the unit; nothing was "
+                 "dispatched", "PATH");
+        return false;
+    }
+    return true;
+}
+
 static void dvq_next(const struct zcl_command_request *req,
                      struct zcl_command_reply *reply)
 {
@@ -2708,6 +2800,7 @@ static void dvq_next(const struct zcl_command_request *req,
     char harness[4096], model[160], group[96], unit[160], unitarg[192];
     char wdirarg[4096 + 32];
     char zbind[4096 + 64], zbenv[4096 + 64], zsetenv[4096 + 64];
+    char psetenv[8192 + 32];
     char outarg[4096 + 64], errarg[4096 + 64];
     char *task = NULL;
     size_t task_used = 0;
@@ -2803,12 +2896,9 @@ static void dvq_next(const struct zcl_command_request *req,
         }
         free(text);
     }
-    if (!wt[0]) {
-        free(rows);
-        dvq_unlock(lock);
-        dvq_emit_no_worktree(reply, poolpath);
+    if (!dvq_next_ready(reply, lock, rows, poolpath, wt[0] != '\0', wtfd,
+                        psetenv, sizeof(psetenv)))
         return;
-    }
     /* Mark running before releasing the lock; the worktree fd stays open
      * across the spawn so the child inherits the lock. */
     dvq_select_model(&pick, model, sizeof(model));
@@ -2970,11 +3060,8 @@ static void dvq_next(const struct zcl_command_request *req,
             sargv[m++] = errarg;
             sargv[m++] = unitarg;
             sargv[m++] = wdirarg;
-            if (have_zbin) {
-                (void)snprintf(zsetenv, sizeof(zsetenv), "--setenv=%s",
-                               zbenv);
-                sargv[m++] = zsetenv;
-            }
+            m = dvq_unit_env_args(sargv, m, zbenv, have_zbin, zsetenv,
+                                  sizeof(zsetenv), psetenv);
             sargv[m++] = "flock";
             sargv[m++] = "-n";
             sargv[m++] = lockpath;

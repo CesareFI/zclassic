@@ -992,6 +992,88 @@ static int dvx_engine_cases(void)
                              "claude-sonnet-5-5\n--task\n", 53) == 0);
         PASS();
     }
+    TEST("queue: a gpt-sol row launches --engine gpt-sol with its own model") {
+        ASSERT(dvx_engine_argv("engg", "gptunit", "gpt-sol", "gpt-6.1-sol", -1,
+                               argv, sizeof(argv)));
+        ASSERT(strncmp(argv, "--engine\ngpt-sol\n--model\ngpt-6.1-sol\n--task\n",
+                       44) == 0);
+        ASSERT(strstr(argv, "glm") == NULL);
+        PASS();
+    }
+    TEST("queue: gpt and claude/glm model families refuse each other") {
+        ASSERT(dvx_engine_refused("engg1", "gpt-sol", "claude-haiku-5-5",
+                                  "ENGINE_MODEL_MISMATCH"));
+        ASSERT(dvx_engine_refused("engg2", "gpt-luna", "glm-5.3-flash",
+                                  "ENGINE_MODEL_MISMATCH"));
+        ASSERT(dvx_engine_refused("engg3", "claude-haiku", "gpt-6-luna",
+                                  "ENGINE_MODEL_MISMATCH"));
+        ASSERT(dvx_engine_refused("engg4", "glm", "gpt-6.1-sol",
+                                  "ENGINE_MODEL_MISMATCH"));
+        PASS();
+    }
+    TEST("queue: the unit gets the caller's PATH, so a CLI only on it is found") {
+        char base[512], bindir[600], sysrun[700], harness[700], probe[700];
+        char wt[512], args[700], res[700], script[2048], want[9100], path[9000];
+        char callerp[9100];
+        char text[8192] = "";
+        FILE *f;
+        struct dvx_call c;
+        dvx_isolate("unitpath");
+        ASSERT(dvx_pool("unitpathwt", wt, sizeof(wt)));
+        test_make_tmpdir(base, sizeof(base), "devagent_queue", "unitpathbin");
+        (void)snprintf(bindir, sizeof(bindir), "%s/bin", base);
+        ASSERT(mkdir(bindir, 0700) == 0);
+        (void)snprintf(sysrun, sizeof(sysrun), "%s/systemd-run", bindir);
+        (void)snprintf(harness, sizeof(harness), "%s/z23-engine-unit",
+                       bindir);
+        (void)snprintf(probe, sizeof(probe), "%s/dvx-cli-probe", bindir);
+        (void)snprintf(args, sizeof(args), "%s/sysrun.args", base);
+        (void)snprintf(res, sizeof(res), "%s/probe.res", base);
+        /* A fake user manager: records its argv, then runs the unit command
+         * the way systemd would, from a clean PATH plus only what --setenv
+         * passed. */
+        (void)snprintf(script, sizeof(script),
+            "#!/bin/sh\nprintf '%%s\\n' \"$@\" > '%s'\n"
+            "PATH=/usr/bin:/bin\nexport PATH\n"
+            "for a in \"$@\"; do case \"$a\" in --setenv=*) "
+            "export \"${a#--setenv=}\";; esac; done\n"
+            "while [ \"$1\" != flock ]; do shift; done\nexec \"$@\"\n", args);
+        ASSERT(dvx_write(sysrun, script) && chmod(sysrun, 0755) == 0);
+        (void)snprintf(script, sizeof(script),
+            "#!/bin/sh\ncommand -v dvx-cli-probe > '%s.tmp'\n"
+            "echo \"rc=$?\" >> '%s.tmp'\nmv '%s.tmp' '%s'\n",
+            res, res, res, res);
+        ASSERT(dvx_write(harness, script) && chmod(harness, 0755) == 0);
+        ASSERT(dvx_write(probe, "#!/bin/sh\n") && chmod(probe, 0755) == 0);
+        (void)snprintf(path, sizeof(path), "%s:%s", bindir, g_dvx_saved_path);
+        /* A relative entry, an empty entry and "." come first: the unit gets
+         * only the absolute entries, in their original order. */
+        (void)snprintf(callerp, sizeof(callerp), "rel/bin::.:%s", path);
+        setenv("PATH", callerp, 1);
+        unsetenv("ZCL_QUEUE_DIRECT");
+        dvx_post(&c, "leaf", "unitpathrow", NULL, NULL, NULL, NULL, -1);
+        ASSERT(dvx_run(&c) && dvx_ok(&c));
+        dvx_end(&c);
+        dvx_verb(&c, "next", false);
+        ASSERT(dvx_run(&c) && dvx_ok(&c));
+        dvx_end(&c);
+        for (int i = 0; i < 100 && access(res, R_OK) != 0; i++)
+            nanosleep(&(struct timespec){ 0, 100 * 1000 * 1000L }, NULL);
+        f = fopen(args, "r");
+        ASSERT(f != NULL);
+        text[fread(text, 1, sizeof(text) - 1, f)] = '\0';
+        (void)fclose(f);
+        (void)snprintf(want, sizeof(want), "--setenv=PATH=%s\n", path);
+        ASSERT(strstr(text, want) != NULL);
+        f = fopen(res, "r");
+        ASSERT(f != NULL);
+        text[fread(text, 1, sizeof(text) - 1, f)] = '\0';
+        (void)fclose(f);
+        ASSERT(strstr(text, "dvx-cli-probe") != NULL);
+        ASSERT(strstr(text, "rc=0") != NULL);
+        dvx_restore();
+        PASS();
+    }
     TEST("queue: a row without engine keeps the glm argv byte for byte") {
         ASSERT(dvx_engine_argv("engo", "oldunit", NULL, NULL, -1, argv,
                                sizeof(argv)));
@@ -1015,6 +1097,31 @@ static int dvx_engine_cases(void)
                                   "ENGINE_MODEL_MISMATCH"));
         ASSERT(dvx_engine_refused("engm3", "glm", "claude-haiku-5-5",
                                   "ENGINE_MODEL_MISMATCH"));
+        ASSERT(dvx_engine_refused("engm4", "gpt-sol", "gpt-4.1-mini",
+                                  "ENGINE_MODEL_MISMATCH"));
+        ASSERT(dvx_engine_refused("engm5", "gpt-luna", "gpt-4.1-mini",
+                                  "ENGINE_MODEL_MISMATCH"));
+        PASS();
+    }
+    TEST("queue: an over-long unit PATH refuses next and changes no row") {
+        static char longp[16000];
+        char wt[512];
+        struct dvx_call c;
+        longp[0] = '\0';
+        dvx_isolate("unitlong");
+        ASSERT(dvx_pool("unitlongwt", wt, sizeof(wt)));
+        for (int i = 0; i < 400; i++)
+            strcat(longp, "/abcdefghijklmnopqrstuvwxyz0123456789:");
+        dvx_post(&c, "leaf", "unitlong", NULL, NULL, NULL, NULL, -1);
+        ASSERT(dvx_run(&c) && dvx_ok(&c));
+        dvx_end(&c);
+        setenv("PATH", longp, 1);
+        dvx_verb(&c, "next", false);
+        ASSERT(dvx_run(&c) && !dvx_ok(&c));
+        ASSERT(strcmp(c.reply.error.code, "QUEUE_PATH_TOO_LONG") == 0);
+        dvx_end(&c);
+        ASSERT(dvx_queued_count("unitlong") == 1);
+        dvx_restore();
         PASS();
     }
 _test_next:;

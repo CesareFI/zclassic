@@ -332,10 +332,92 @@ static int case_reply_text_cap(void)
 }
 
 
+/* The GPT CLI rows: registry shape, the argv `codex exec` is launched with,
+ * and that they are never auto-selected by lead. No usage is decoded. */
+static int gpt_row_shape(const struct engine_vendor *v, const char *model)
+{
+    int failures = 0;
+    EC_CHECK("gpt row is LOCAL_CLI/EDITS/PLAIN, costs money, retries 1",
+             v->wire == ENGINE_WIRE_LOCAL_CLI &&
+             v->delivery == ENGINE_DELIVERS_EDITS &&
+             v->report_format == ENGINE_CLI_OUTPUT_PLAIN &&
+             v->costs_money && v->max_retries == 1 && !v->is_default);
+    EC_CHECK("gpt default model", strcmp(v->default_model, model) == 0);
+    EC_CHECK("gpt program is codex, prompt is an argument",
+             strcmp(v->program, "codex") == 0 &&
+             v->cli_prompt == ENGINE_CLI_PROMPT_ARG && !engine_needs_key(v));
+    return failures;
+}
+
+static int gpt_row_order(const char *const *argv, size_t n, const char *model)
+{
+    int failures = 0;
+    EC_CHECK("gpt argv is codex exec -C workdir -m model, prompt last",
+             n > 6 && strcmp(argv[0], "codex") == 0 &&
+             strcmp(argv[1], "exec") == 0 && strcmp(argv[2], "-C") == 0 &&
+             strcmp(argv[3], "/work/dir") == 0 && strcmp(argv[4], "-m") == 0 &&
+             strcmp(argv[5], model) == 0 &&
+             strcmp(argv[n - 1], "PROMPT-TEXT") == 0 &&
+             strcmp(argv[n - 2], "--") == 0 && argv[n] == NULL);
+    return failures;
+}
+
+static int gpt_row_policy(const char *const *argv, size_t n)
+{
+    int failures = 0;
+    EC_CHECK("gpt argv is low effort and workspace-write",
+             argv_has(argv, n, "model_reasoning_effort=\"low\"", true) &&
+             argv_has(argv, n, "workspace-write", true) &&
+             !argv_has(argv, n, "danger", false));
+    EC_CHECK("gpt argv turns tool network off",
+             argv_has(argv, n, "sandbox_workspace_write.network_access=false",
+                      true));
+    return failures;
+}
+
+static int gpt_row_argv(const struct engine_vendor *v, const char *model)
+{
+    int failures = 0;
+    const struct engine_cli_inputs in = {
+        .prompt = "PROMPT-TEXT", .workdir = "/work/dir",
+        .turns = "3", .model = model,
+    };
+    const char *argv[ENGINE_CLI_ARGV_MAX];
+    size_t n = engine_cli_argv_build(v, &in, argv, ENGINE_CLI_ARGV_MAX);
+    failures += gpt_row_order(argv, n, model);
+    failures += gpt_row_policy(argv, n);
+    EC_CHECK("gpt cwd is not forced (workdir rides -C)",
+             engine_cli_launch_cwd(v, &in) == NULL);
+    struct engine_cli_inputs over = in;
+    over.reasoning_effort = "high";
+    EC_CHECK("gpt row refuses an explicit effort override",
+             engine_cli_argv_build(v, &over, argv, ENGINE_CLI_ARGV_MAX) == 0);
+    return failures;
+}
+
+static int case_gpt_rows(void)
+{
+    int failures = 0;
+    const char *ids[] = { "gpt-luna", "gpt-sol" };
+    const char *models[] = { "gpt-6-luna", "gpt-6.1-sol" };
+    for (size_t i = 0; i < 2; i++) {
+        const struct engine_vendor *v = engine_by_id(ids[i]);
+        EC_CHECK("gpt row exists", v != NULL);
+        if (!v) continue;
+        failures += gpt_row_shape(v, models[i]);
+        failures += gpt_row_argv(v, models[i]);
+    }
+    EC_CHECK("no gpt lead tier is auto-selected",
+             engine_for_lead_tier("gpt", ENGINE_TIER_LIGHT) == NULL &&
+             engine_for_lead_tier("gpt", ENGINE_TIER_STANDARD) == NULL);
+    return failures;
+}
+
 int test_engine_claude(void)
 {
     int failures = 0;
     failures += case_registry();
+    failures += case_gpt_rows();
     failures += case_decoder();
     failures += case_reply_text_success();
     failures += case_reply_text_refusal();

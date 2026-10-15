@@ -123,17 +123,25 @@ from a brief with no group; `file` writes one file judged by `--group`.
 Doc and file units need `--path` (a repo-relative path) and `--brief` (an
 existing file inside the repo or the state dir).
 
-### Claude engines
+### Claude and GPT engines
 
-A row may name `engine`: `claude-haiku` or `claude-sonnet` feed Claude units
-through the same harness (`--engine <id>`); `glm`, `glm-cli` and any other
+A row may name `engine`: `claude-haiku` or `claude-sonnet` (Claude CLI) and
+`gpt-luna` or `gpt-sol` (`codex exec`, models `gpt-6-luna` and `gpt-6.1-sol`,
+reasoning effort fixed at low, writes confined by codex workspace-write (worktree plus temp dirs), network off,
+plain output so tokens and cost are recorded as unreported) feed units
+through the same harness (`--engine <id>`). The harness scrubs only the parent
+agent-session markers (`CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_EFFORT` and the
+named `CLAUDE_CODE_*` session variables) from a CLI child; auth is kept
+(`CLAUDE_CODE_OAUTH_TOKEN`, provider choice). `next` hands the detached unit
+the caller's absolute `PATH` entries, in order, so `~/.local/bin` CLIs resolve;
+relative and empty entries are dropped. `glm`, `glm-cli` and any other
 registered engine work the same way. `next` passes `--model` only when the row
 sets one, otherwise the engine's own default applies (the attempt-3 glm
 escalation does not apply to a named engine). A row without `engine` is a glm
 row and dispatches exactly as before. An unknown engine is refused
 `UNKNOWN_ENGINE` and a model from another engine's family is refused
-`ENGINE_MODEL_MISMATCH`, both at post time. Claude engines cost money, and
-`next` passes the harness its dispatch consent, so post a Claude row deliberately.
+`ENGINE_MODEL_MISMATCH`, both at post time. These engines cost money, and
+`next` passes the harness its dispatch consent, so post such a row deliberately.
 
 ### State
 
