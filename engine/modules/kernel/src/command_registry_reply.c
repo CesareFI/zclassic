@@ -173,6 +173,37 @@ static bool serialize_envelope(struct json_value *root,
            json_push_kv_bool(root, "budget_exceeded", budget_exceeded);
 }
 
+static bool authority_labels_complete(
+    const struct json_value *auth, bool presented,
+    const struct agent_spend_policy_decision *policy)
+{
+    const char *kind = json_get_str(json_get(auth, "policy"));
+    const char *session = json_get_str(json_get(auth, "agent_session"));
+    const char *expected = presented && policy && policy->evidence[0]
+                               ? policy->evidence : "none (local operator)";
+    return kind && session &&
+           !strcmp(kind, presented ? "bounded" : "exempt") &&
+           !strcmp(session, expected);
+}
+
+static bool authority_complete(const struct json_value *auth,
+                               bool presented,
+                               const struct agent_spend_policy_decision *policy)
+{
+    if (!authority_labels_complete(auth, presented, policy))
+        return false;
+    if (!presented || !policy)
+        return true;
+    const struct json_value *debit = json_get(auth, "debited_zat");
+    if (!debit || debit->type != JSON_INT || debit->val.i != policy->debited_zat)
+        return false;
+    if (policy->debited_zat <= 0)
+        return true;
+    const struct json_value *remaining = json_get(auth, "window_remaining_zat");
+    return remaining && remaining->type == JSON_INT &&
+           remaining->val.i == policy->window_remaining_zat;
+}
+
 static bool serialize_authority(
     struct json_value *root, bool agent_session_presented,
     const struct agent_spend_policy_decision *policy)
@@ -180,20 +211,25 @@ static bool serialize_authority(
     struct json_value auth;
     json_init(&auth);
     json_set_object(&auth);
-    (void)json_push_kv_str(&auth, "policy",
-                           agent_session_presented ? "bounded" : "exempt");
-    (void)json_push_kv_str(
+    bool ok = json_push_kv_str(&auth, "policy",
+                              agent_session_presented ? "bounded" : "exempt") &&
+        json_push_kv_str(
         &auth, "agent_session",
         (agent_session_presented && policy && policy->evidence[0])
             ? policy->evidence
             : "none (local operator)");
     if (agent_session_presented && policy) {
-        (void)json_push_kv_int(&auth, "debited_zat", policy->debited_zat);
+        ok = ok && json_push_kv_int(&auth, "debited_zat", policy->debited_zat);
         if (policy->debited_zat > 0)
-            (void)json_push_kv_int(&auth, "window_remaining_zat",
+            ok = ok && json_push_kv_int(&auth, "window_remaining_zat",
                                    policy->window_remaining_zat);
     }
-    bool ok = json_push_kv(root, "authority", &auth);
+    /* JSON copying can degrade a scalar on allocation failure while its
+     * append returns true. Check both the prepared and published authority. */
+    ok = ok && authority_complete(&auth, agent_session_presented, policy) &&
+         json_push_kv(root, "authority", &auth) &&
+         authority_complete(json_get(root, "authority"),
+                            agent_session_presented, policy);
     json_free(&auth);
     return ok;
 }
@@ -216,7 +252,7 @@ static bool serialize_body(struct json_value *root,
     } else {
         ok = ok && command_registry_push_error(root, &reply->error);
         if (reply->next_count == 0) {
-            (void)command_registry_reply_add_describe_next(
+            ok = ok && command_registry_reply_add_describe_next(
                 reply, spec,
                 "inspect this command's contract and availability");
         }

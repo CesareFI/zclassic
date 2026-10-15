@@ -425,7 +425,13 @@ static void fb_project_object(struct zcl_command_reply *reply,
         const char *key = body->keys[i];
         if (!key || strcmp(key, "ok") == 0)
             continue;
-        (void)json_push_kv(&reply->data, key, &body->children[i]);
+        if (!json_push_kv(&reply->data, key, &body->children[i])) {
+            json_free(&reply->data); json_init(&reply->data); json_set_object(&reply->data);
+            fb_fail(reply, ZCL_COMMAND_STATUS_FAILED, ZCL_COMMAND_EXIT_FAILED,
+                "BOARD_PROJECTION_FAILED", "execute", false,
+                "cannot faithfully copy the signed board response", "fleet.board");
+            return;
+        }
     }
 }
 

@@ -588,35 +588,84 @@ int check_rpc_node_client_sends_max_sized_request(void)
 #include "../../../engine/entry/main_cli_modes.c"
 #undef ZCL_RPC_COMPOSER_TEST
 
-static bool rpc_test_composer_refusal(
-    bool (*compose)(const char *, const char **, size_t, char *, size_t))
+static bool rpc_test_prefix_equal(const struct json_value *actual,
+                                  const struct json_value *expected)
 {
-    const char *params[] = { "retained", "refused" };
-    char buf[64] = "unchanged";
-    size_t before = json_test_live_blocks();
-    zcl_alloc_fault_fail_nth("json_set_str", 2);
-    bool converted = compose("help", params, 2, buf, sizeof(buf));
-    bool consumed = zcl_alloc_fault_armed_label() == NULL;
-    zcl_alloc_fault_clear();
-    return !converted && consumed && strcmp(buf, "unchanged") == 0 &&
-           json_test_live_blocks() == before;
+    if (actual->type != JSON_ARR || json_size(actual) > json_size(expected)) return false;
+    for (size_t i = 0; i < json_size(actual); i++) {
+        char a[1024], b[1024];
+        size_t an = json_write(json_at(actual, i), a, sizeof(a));
+        size_t bn = json_write(json_at(expected, i), b, sizeof(b));
+        if (an >= sizeof(a) || bn >= sizeof(b) || an != bn || strcmp(a, b)) return false;
+    }
+    return true;
 }
 
-static bool rpc_test_retained_prefix(void)
+static bool rpc_test_conversion_fault(const char *method, const char **params,
+    const struct json_value *expected, const char *label, unsigned nth, bool *hit)
 {
-    const char *params[] = { "retained", "refused" };
     struct json_value result;
     size_t before = json_test_live_blocks();
-    zcl_alloc_fault_fail_nth("json_set_str", 2);
-    bool converted = rpc_convert_values("help", params, 2, &result);
-    bool consumed = zcl_alloc_fault_armed_label() == NULL;
+    zcl_alloc_fault_fail_nth(label, nth);
+    bool converted = rpc_convert_values(method, params, 2, &result);
+    *hit = zcl_alloc_fault_armed_label() == NULL;
     zcl_alloc_fault_clear();
-    const struct json_value *first = json_at(&result, 0);
-    bool ok = !converted && consumed && result.type == JSON_ARR &&
-              json_size(&result) == 1 && first && first->type == JSON_STR;
-    if (ok) ok = strcmp(json_get_str(first), "retained") == 0;
+    bool ok = converted == !*hit && rpc_test_prefix_equal(&result, expected);
+    if (!*hit) ok = ok && json_size(&result) == json_size(expected);
     json_free(&result);
     return ok && json_test_live_blocks() == before;
+}
+
+static bool rpc_test_composer_fault(
+    bool (*compose)(const char *, const char **, size_t, char *, size_t),
+    const char *method, const char **params, const struct json_value *expected,
+    const char *label, unsigned nth, bool *hit)
+{
+    char buf[1024] = "unchanged", want[1024];
+    (void)json_write(expected, want, sizeof(want));
+    size_t before = json_test_live_blocks();
+    zcl_alloc_fault_fail_nth(label, nth);
+    bool converted = compose(method, params, 2, buf, sizeof(buf));
+    *hit = zcl_alloc_fault_armed_label() == NULL;
+    zcl_alloc_fault_clear();
+    return converted == !*hit && !strcmp(buf, *hit ? "unchanged" : want) &&
+        json_test_live_blocks() == before;
+}
+
+static bool rpc_test_fault_label(const char *method, const char **params,
+    const struct json_value *expected, const char *label, unsigned mode)
+{
+    unsigned hits = 0;
+    for (unsigned nth = 1; nth < 128; nth++) {
+        bool hit, ok;
+        if (mode == 0) ok = rpc_test_conversion_fault(method, params, expected, label, nth, &hit);
+        else ok = rpc_test_composer_fault(mode == 1 ? rpc_compose_params : cli_compose_rpc_params,
+            method, params, expected, label, nth, &hit);
+        if (!ok) return false;
+        if (!hit) return hits > 0;
+        hits++;
+    }
+    return false;
+}
+
+static bool rpc_test_allocation_sweep(bool parsed)
+{
+    const char *strings[] = {"retained", "refused"};
+    const char *objects[] = {"retained", "{\"amount\":1,\"nested\":[{\"note\":\"value\"}]}"};
+    const char **params = parsed ? objects : strings;
+    const char *method = parsed ? "sendmany" : "help";
+    static const char *const labels[] = {"json_set_str", "json_copy_str", "json_children",
+        "json_copy_children", "json_copy_keys", "json_copy_key"};
+    struct json_value expected;
+    json_init(&expected);
+    if (!rpc_convert_values(method, params, 2, &expected)) { json_free(&expected); return false; }
+    bool ok = true;
+    size_t count = parsed ? 6 : 3;
+    for (size_t i = 0; i < count; i++)
+        for (unsigned mode = 0; mode < 3; mode++)
+            ok = rpc_test_fault_label(method, params, &expected, labels[i], mode) && ok;
+    json_free(&expected);
+    return ok;
 }
 
 static bool rpc_test_string_conversion(const char *arg, bool fault)
@@ -645,9 +694,8 @@ int check_rpc_string_conversion_cases(void)
     ok = rpc_test_string_conversion("getinfo", false) && ok;
     ok = rpc_test_string_conversion("", false) && ok;
     ok = rpc_test_string_conversion(NULL, false) && ok;
-    ok = rpc_test_retained_prefix() && ok;
-    ok = rpc_test_composer_refusal(rpc_compose_params) && ok;
-    ok = rpc_test_composer_refusal(cli_compose_rpc_params) && ok;
+    ok = rpc_test_allocation_sweep(false) && ok;
+    ok = rpc_test_allocation_sweep(true) && ok;
     printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

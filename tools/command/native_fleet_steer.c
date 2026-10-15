@@ -2082,17 +2082,17 @@ static void fmc_put_str(struct json_value *o, const char *key, const char *s)
 }
 
 /* A number field, or JSON null when unknown (-1). */
-static void fmc_put_int(struct json_value *o, const char *key, long long v)
+static bool fmc_put_int(struct json_value *o, const char *key, long long v)
 {
     struct json_value nv;
     if (v >= 0) {
-        (void)json_push_kv_int(o, key, v);
-        return;
+        return json_push_kv_int(o, key, v);
     }
     json_init(&nv);
     json_set_null(&nv);
-    (void)json_push_kv(o, key, &nv);
+    bool ok = json_push_kv(o, key, &nv);
     json_free(&nv);
+    return ok;
 }
 
 /* Local resources, measured now through the platform seams. */
@@ -2564,20 +2564,20 @@ static void fmc_sessions_note(struct fmc_roster *ro, const struct fmc_row *v)
 }
 
 /* A string, or "UNKNOWN" when empty. */
-static void fmc_put_known(struct json_value *o, const char *key,
+static bool fmc_put_known(struct json_value *o, const char *key,
                           const char *s)
 {
-    (void)json_push_kv_str(o, key, s && s[0] ? s : "UNKNOWN");
+    return json_push_kv_str(o, key, s && s[0] ? s : "UNKNOWN");
 }
 
 /* A number, or "UNKNOWN" when negative (unknown). */
-static void fmc_put_known_int(struct json_value *o, const char *key,
+static bool fmc_put_known_int(struct json_value *o, const char *key,
                               long long v)
 {
     if (v >= 0)
-        (void)json_push_kv_int(o, key, v);
+        return json_push_kv_int(o, key, v);
     else
-        (void)json_push_kv_str(o, key, "UNKNOWN");
+        return json_push_kv_str(o, key, "UNKNOWN");
 }
 
 static const char *fmc_session_state(const struct fmc_session *s,
@@ -2915,7 +2915,7 @@ static bool fmc_answer_find(const struct json_value *rows,
 }
 
 /* The reply object for one directive change row. */
-static void fmc_reply_emit(struct json_value *item, const struct fmc_row *v,
+static bool fmc_reply_emit(struct json_value *item, const struct fmc_row *v,
                            const struct json_value *rows, long long now)
 {
     struct json_value o;
@@ -2925,19 +2925,20 @@ static void fmc_reply_emit(struct json_value *item, const struct fmc_row *v,
     bool answered = fmc_answer_find(rows, v, &a);
     json_init(&o);
     json_set_object(&o);
-    (void)json_push_kv_str(&o, "state", answered ? "answered"
+    bool ok = json_push_kv_str(&o, "state", answered ? "answered"
                                          : acked ? "acked" : "queued");
-    (void)json_push_kv_bool(&o, "acked", acked);
-    fmc_put_known(&o, "sent_ts", fmc_ts_unix(v->ts) >= 0 ? v->ts : "");
-    fmc_put_known_int(&o, "sent_age_s", fmc_age_s(now, v->ts));
-    fmc_put_known_int(&o, "answer_seq", answered ? a.row->seq : -1);
-    fmc_put_known(&o, "answer_ts", answered ? a.row->ts : "");
-    fmc_put_known_int(&o, "answer_age_s",
+    ok &= json_push_kv_bool(&o, "acked", acked);
+    ok &= fmc_put_known(&o, "sent_ts", fmc_ts_unix(v->ts) >= 0 ? v->ts : "");
+    ok &= fmc_put_known_int(&o, "sent_age_s", fmc_age_s(now, v->ts));
+    ok &= fmc_put_known_int(&o, "answer_seq", answered ? a.row->seq : -1);
+    ok &= fmc_put_known(&o, "answer_ts", answered ? a.row->ts : "");
+    ok &= fmc_put_known_int(&o, "answer_age_s",
                       answered ? fmc_age_s(now, a.row->ts) : -1);
-    fmc_put_known(&o, "answered_by", answered ? a.row->from : "");
-    fmc_put_known(&o, "answer_match", answered ? a.match : "");
-    (void)json_push_kv(item, "reply", &o);
+    ok &= fmc_put_known(&o, "answered_by", answered ? a.row->from : "");
+    ok &= fmc_put_known(&o, "answer_match", answered ? a.match : "");
+    if (ok) ok = json_push_kv(item, "reply", &o);
     json_free(&o);
+    return ok;
 }
 
 /* One bounded change row, carrying the state fmc_row_state resolves from
@@ -2970,9 +2971,10 @@ static void fmc_row_change(struct json_value *changes, const struct fmc_row *v,
         json_push_kv_str(&item, "state", state)) {
         fmc_put_int(&item, "queued_age_s",
                     queued ? fmc_age_s(now, v->ts) : -1);
-        if (strcmp(v->kind, "directive") == 0)
-            fmc_reply_emit(&item, v, rows, now);
-        (void)json_push_back(changes, &item);
+        bool complete = strcmp(v->kind, "directive") != 0 ||
+                        fmc_reply_emit(&item, v, rows, now);
+        if (complete)
+            (void)json_push_back(changes, &item);
     }
     json_free(&item);
 }
@@ -4829,14 +4831,18 @@ static void fmc_evidence_mail_ack(struct zcl_command_reply *reply,
 
 /* Copy one whole JSON value onto the reply under "object". The sources are
  * already bounded by their own leaves (mail bodies <= 4KiB, one post). */
-static void fmc_emit_object(struct zcl_command_reply *reply,
+static bool fmc_emit_object(struct zcl_command_reply *reply,
                             const char *type, const struct json_value *obj)
 {
-    (void)json_push_kv_str(&reply->data, "leaf", FMC_LEAF);
-    (void)json_push_kv_str(&reply->data, "type", type);
-    (void)json_push_kv(&reply->data, "object", obj);
+    if (!json_push_kv_str(&reply->data, "leaf", FMC_LEAF) ||
+        !json_push_kv_str(&reply->data, "type", type) ||
+        !json_push_kv(&reply->data, "object", obj)) {
+        fmc_fail(reply, "EVIDENCE_UNAVAILABLE", "cannot faithfully copy the evidence object", "allocation");
+        return false;
+    }
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
+    return true;
 }
 
 static void fmc_evidence_mail(const struct zcl_command_request *req,
@@ -4876,8 +4882,8 @@ static void fmc_evidence_mail(const struct zcl_command_request *req,
             hit = r;
     }
     if (hit) {
-        fmc_emit_object(reply, "mail", hit);
-        fmc_evidence_mail_ack(reply, hit, &rows);
+        if (fmc_emit_object(reply, "mail", hit))
+            fmc_evidence_mail_ack(reply, hit, &rows);
         json_free(&rows);
         return;
     }

@@ -706,6 +706,7 @@ static void execute_check_contract(struct zcl_command_reply *reply,
 static size_t execute_fallback(char *out, size_t out_size, size_t budget_bytes,
                                struct zcl_command_reply *reply)
 {
+    reply->exit_code = ZCL_COMMAND_EXIT_INTERNAL;
     static const char fallback[] =
         "{\"schema\":\"zcl.result.v1\",\"command\":\"internal\","
         "\"ok\":false,\"status\":\"failed\","
@@ -717,10 +718,23 @@ static size_t execute_fallback(char *out, size_t out_size, size_t budget_bytes,
         "\"retryable\":false,\"human_action_required\":true,"
         "\"next_action\":\"inspect the command contract and retry with bounded output\","
         "\"mutated\":false,\"blockers\":[]},\"next\":[]}";
-    size_t len = sizeof(fallback) - 1;
-    if (len < out_size && (budget_bytes == 0 || len <= budget_bytes)) {
-        memcpy(out, fallback, len + 1);
-        reply->exit_code = ZCL_COMMAND_EXIT_INTERNAL;
+    /* No allocations: an effect may already be durable when JSON allocation
+     * or the response budget fails. Preserve that fact and never invite retry. */
+    static const char mutated_fallback[] =
+        "{\"schema\":\"zcl.result.v1\",\"command\":\"internal\","
+        "\"ok\":false,\"status\":\"failed\","
+        "\"request_id\":\"local-overflow\",\"elapsed_us\":0,"
+        "\"error\":{\"code\":\"RESPONSE_BUDGET_EXCEEDED\","
+        "\"error_code\":\"RESPONSE_BUDGET_EXCEEDED\","
+        "\"message\":\"bounded response could not be serialized after a possible effect\","
+        "\"phase\":\"serialize\",\"current_state\":\"REQUEST_FAILED\","
+        "\"retryable\":false,\"human_action_required\":true,"
+        "\"next_action\":\"inspect preserved publication artifacts before any further action\","
+        "\"mutated\":true,\"blockers\":[]},\"next\":[]}";
+    const char *body = reply->error.mutated ? mutated_fallback : fallback;
+    size_t len = reply->error.mutated ? sizeof(mutated_fallback) - 1 : sizeof(fallback) - 1;
+    if (out && len < out_size && (budget_bytes == 0 || len <= budget_bytes)) {
+        memcpy(out, body, len + 1);
         return len;
     }
     return 0;

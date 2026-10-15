@@ -444,6 +444,14 @@ Errors contain:
 
 No error returns a prose-only recovery essay or a silent nonzero exit.
 
+Authority metadata must be complete before an envelope is successful. An
+allocation failure while preparing or copying required authority fields is a
+serialization failure, even when the JSON helper returns a partial value.
+When the handler reports `mutated=true`, serialization failure preserves that
+marker and requires inspection of preserved artifacts; it never grants
+permission to repeat the operation. A response that cannot fit still returns
+a nonzero exit.
+
 ## 9. Token and payload budgets
 
 Default compact JSON budgets are part of the interface contract:

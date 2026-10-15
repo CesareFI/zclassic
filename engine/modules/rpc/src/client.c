@@ -183,8 +183,9 @@ static bool rpc_push_string_param(struct json_value *result, const char *arg,
         json_free(&sv);
         LOG_FAIL("rpc", "string parameter allocation failed at index %zu", index);
     }
-    json_push_back(result, &sv);
+    bool appended = json_push_back(result, &sv);
     json_free(&sv);
+    if (!appended) LOG_FAIL("rpc", "string parameter append failed at index %zu", index);
     return true;
 }
 
@@ -220,9 +221,10 @@ bool rpc_convert_values(const char *method, const char **str_params,
                 json_free(&parsed);
                 return false;
             }
-            json_push_back(result, json_at(&parsed, 0));
+            bool appended = json_push_back(result, json_at(&parsed, 0));
             json_free(&parsed);
             free(wrapped);
+            if (!appended) LOG_FAIL("rpc", "converted parameter append failed at index %zu", i);
         }
     }
     return true;

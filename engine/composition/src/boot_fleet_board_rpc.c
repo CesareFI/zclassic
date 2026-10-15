@@ -76,42 +76,44 @@ static bool fb_bool(const struct json_value *in, const char *key)
 /* One post as a JSON object. Public projection: the host is rendered as its
  * full public key hex, because a board reader must be able to check a
  * signature themselves rather than trust this node's rendering of it. */
-static void fb_render_post_fields(struct json_value *into,
+static bool fb_render_post_fields(struct json_value *into,
                            const struct db_fleet_board_post *row, bool include_text)
 {
+    bool ok = true;
     char hex[65];
     fleet_board_id_to_hex(row->post.id, hex);
-    (void)json_push_kv_str(into, "id", hex);
-    (void)json_push_kv_str(into, "kind", fleet_board_kind_name(row->post.kind));
-    (void)json_push_kv_int(into, "created_at", (int64_t)row->post.created_at);
-    (void)json_push_kv_int(into, "ttl", (int64_t)row->post.ttl);
-    (void)json_push_kv_int(into, "expires_at", row->expires_at);
+    ok &= json_push_kv_str(into, "id", hex);
+    ok &= json_push_kv_str(into, "kind", fleet_board_kind_name(row->post.kind));
+    ok &= json_push_kv_int(into, "created_at", (int64_t)row->post.created_at);
+    ok &= json_push_kv_int(into, "ttl", (int64_t)row->post.ttl);
+    ok &= json_push_kv_int(into, "expires_at", row->expires_at);
     fleet_board_id_to_hex(row->post.ref, hex);
-    (void)json_push_kv_str(into, "ref", hex);
+    ok &= json_push_kv_str(into, "ref", hex);
     fleet_board_id_to_hex(row->post.host_pubkey, hex);
-    (void)json_push_kv_str(into, "host", hex);
+    ok &= json_push_kv_str(into, "host", hex);
     char signature_hex[FLEET_BOARD_SIG_BYTES * 2 + 1];
     zcl_hex_encode(row->post.signature, FLEET_BOARD_SIG_BYTES, signature_hex);
-    (void)json_push_kv_str(into, "signature", signature_hex);
-    (void)json_push_kv_str(into, "agent", row->post.agent);
-    (void)json_push_kv_str(into, "scope",
+    ok &= json_push_kv_str(into, "signature", signature_hex);
+    ok &= json_push_kv_str(into, "agent", row->post.agent);
+    ok &= json_push_kv_str(into, "scope",
                            fleet_board_scope_name(row->post.scope));
     if (row->post.scope != FLEET_BOARD_SCOPE_FLEET)
-        (void)json_push_kv_str(into, "room",
+        ok &= json_push_kv_str(into, "room",
                                fleet_board_room_name(&row->post));
     if (include_text)
-        (void)json_push_kv_str(into, "text", row->post.text);
-    (void)json_push_kv_int(into, "text_len", row->post.text_len);
+        ok &= json_push_kv_str(into, "text", row->post.text);
+    ok &= json_push_kv_int(into, "text_len", row->post.text_len);
     if (row->post.slug[0]) {
-        (void)json_push_kv_str(into, "slug", row->post.slug);
-        (void)json_push_kv_str(into, "title", row->post.title);
+        ok &= json_push_kv_str(into, "slug", row->post.slug);
+        ok &= json_push_kv_str(into, "title", row->post.title);
         fleet_board_id_to_hex(row->post.supersedes, hex);
-        (void)json_push_kv_str(into, "supersedes", hex);
+        ok &= json_push_kv_str(into, "supersedes", hex);
     }
     if (row->post.receipt[0])
-        (void)json_push_kv_str(into, "receipt", row->post.receipt);
-    (void)json_push_kv_int(into, "seq", row->seq);
-    (void)json_push_kv_int(into, "received_at", row->received_at);
+        ok &= json_push_kv_str(into, "receipt", row->post.receipt);
+    ok &= json_push_kv_int(into, "seq", row->seq);
+    ok &= json_push_kv_int(into, "received_at", row->received_at);
+    return ok;
 }
 
 static void fb_render_post(struct json_value *into,
@@ -548,13 +550,17 @@ static void fb_wiki_chunk_render(const struct db_fleet_board_post *row,
                                  struct json_value *result)
 {
     json_set_object(result);
-    json_push_kv_bool(result, "ok", true);
-    fb_render_post_fields(result, row, false);
-    json_push_kv_int(result, "signed_scope", row->post.scope);
-    json_push_kv_str(result, "signed_room", row->post.room);
-    json_push_kv_str(result, "representation", "zcl.fleet_wiki_body_chunk.v1");
-    json_push_kv_str(result, "verification", "reconstruct full signed post and verify id/signature; chunk alone is not verified evidence");
-    json_push_kv_int(result, "offset", start);
+    bool ok = json_push_kv_bool(result, "ok", true);
+    ok &= fb_render_post_fields(result, row, false);
+    ok &= json_push_kv_int(result, "signed_scope", row->post.scope);
+    ok &= json_push_kv_str(result, "signed_room", row->post.room);
+    ok &= json_push_kv_str(result, "representation", "zcl.fleet_wiki_body_chunk.v1");
+    ok &= json_push_kv_str(result, "verification", "reconstruct full signed post and verify id/signature; chunk alone is not verified evidence");
+    ok &= json_push_kv_int(result, "offset", start);
+    if (!ok) {
+        fb_error(result, "CHUNK_PROJECTION_FAILED", "cannot faithfully construct signed chunk metadata");
+        return;
+    }
     size_t base = json_write(result, NULL, 0);
     /* Native bridge's envelope allowance plus chunk keys and integer digits.
      * Refuse rather than omit fields needed for signed reconstruction. */
@@ -568,9 +574,10 @@ static void fb_wiki_chunk_render(const struct db_fleet_board_post *row,
     if (n > room) n = room;
     char data[2049];
     zcl_hex_encode((const uint8_t *)row->post.text + start, n, data);
-    json_push_kv_str(result, "data_hex", data);
-    json_push_kv_int(result, "next_offset", start + (int64_t)n);
-    json_push_kv_bool(result, "complete", start + (int64_t)n == row->post.text_len);
+    ok = json_push_kv_str(result, "data_hex", data);
+    ok &= json_push_kv_int(result, "next_offset", start + (int64_t)n);
+    ok &= json_push_kv_bool(result, "complete", start + (int64_t)n == row->post.text_len);
+    if (!ok) fb_error(result, "CHUNK_PROJECTION_FAILED", "cannot faithfully construct signed body chunk");
 }
 
 static void fb_op_wiki_chunk(struct node_db *ndb, const struct json_value *in,

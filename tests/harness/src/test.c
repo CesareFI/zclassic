@@ -1434,6 +1434,7 @@ int main(int argc, char **argv)
       failures += test_dev_platform_shard_08();
     }
     failures += test_command_registry_catalog();
+    { extern int test_command_outcome(void); failures += test_command_outcome(); }
     failures += test_command_registry_latency();
     failures += test_native_api_contract();
     failures += test_metric_alerts();
