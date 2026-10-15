@@ -75,6 +75,11 @@ void boot_mesh_status_register_rpc(struct rpc_table *table,
 void boot_mesh_status_refresh_start(struct boot_svc_ctx *svc);
 void boot_mesh_status_refresh_shutdown(void);
 
+/* Re-read the installed-plugin store into the status cache; only when
+ * -meshstatusplugins is on, and at most once a minute. Called from the
+ * refresh tick, never from the message path. */
+void mesh_status_plugins_cache_tick(void);
+
 /* Store one already-verified receipt through the serialized DB writer. */
 bool boot_mesh_status_receipt_persist(
     struct db_service *dbsvc,

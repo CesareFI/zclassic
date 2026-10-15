@@ -264,6 +264,17 @@ crashes, the supervisor keeps retrying at the capped delay and changes no link.
 `fell_back` and the last `detail`. `PLUGIN_RUN_*` refusals carry a next action;
 a store refusal (for example `PLUGIN_EXE_HASH`) is reported under its own code.
 
+## Showing installed plugins in mesh status
+
+Off by default. With `-meshstatusplugins`, the signed capsule that `z23 ops
+mesh status` returns carries a `plugins` block: for up to 8 installed plugins,
+the name and the first 16 hex characters of the `current` and `last-good`
+generation ids, read from `~/.z23/plugins` and refreshed at most once a minute
+in the background (before the first read the block says `available=false`,
+`reason=not_yet_read`). When on, every paired machine, not only your own, that
+sends a status request receives those names and prefixes, and may store them
+in its `node.db`. Nothing can be installed, switched or run through it.
+
 ## Refusal codes
 
 Every refusal carries `error.code` and `error.next_action`.

@@ -285,6 +285,7 @@ static void refresh_begin_one(struct boot_svc_ctx *svc, int64_t now)
 static void refresh_tick(struct liveness_contract *contract)
 {
     (void)contract;
+    mesh_status_plugins_cache_tick(); /* own mutex; file I/O outside g_refresh_lock */
     refresh_lock();
     struct boot_svc_ctx *svc = g_refresh_svc;
     if (!svc) {

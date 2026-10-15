@@ -691,8 +691,9 @@ static bool mesh_render_capsule(uint8_t out[MESH_STATUS_CAPSULE_MAX],
         LOG_ERROR("net.mesh_status", "capsule serialization truncated");
         return false;
     }
-    memcpy(out, buffer, needed);
-    *out_len = needed;
+    /* Opt-in plugins block (-meshstatusplugins): off is exactly the identity
+     * render; on copies a cached snapshot, never touching the store here. */
+    mesh_status_capsule_finish(buffer, needed, out, out_len);
     return true;
 }
 

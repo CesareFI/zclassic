@@ -14,6 +14,8 @@
 #define ZCL_CONFIG_BOOT_MESH_STATUS_INTERNAL_H
 
 #include "models/mesh_pairing.h"
+#include "plugin/plugin_store.h"
+#include "session/mesh_status_proto.h"
 #include "vcs/zcode_dht_delegation.h"
 
 #include <stdbool.h>
@@ -94,5 +96,63 @@ enum boot_mesh_session_observation boot_mesh_observe_session_peer(
  * re-verify. Defined in boot_mesh_status.c. */
 bool boot_mesh_peer_delegation(const struct db_mesh_pairing *row,
                                struct vcs_zcode_dht_delegation *out);
+
+
+/* ── Plugins block of the status capsule (boot_mesh_status_plugins.c) ────
+ * Which signed plugins this machine has installed and which generation is
+ * current, read-only from the HOME store. At most MAX_ITEMS rows; ids are cut
+ * to PREFIX hex characters. */
+#define MESH_STATUS_PLUGINS_MAX_ITEMS 8u
+#define MESH_STATUS_PLUGIN_PREFIX 16u
+
+struct mesh_status_plugin_row {
+    char name[PLUGIN_NAME_MAX + 1];
+    char current[MESH_STATUS_PLUGIN_PREFIX + 1];
+    char last_good[MESH_STATUS_PLUGIN_PREFIX + 1];
+};
+
+struct mesh_status_plugins {
+    bool available;
+    const char *reason; /* when !available: home_unset|store_absent|store_unreadable */
+    size_t count;       /* all installed plugins */
+    size_t listed;      /* rows filled in items, <= MAX_ITEMS */
+    struct mesh_status_plugin_row items[MESH_STATUS_PLUGINS_MAX_ITEMS];
+};
+
+/* Snapshot the store under `home` (NULL or relative: home_unset). Never fails:
+ * every problem is reported as available=false with a reason. */
+void mesh_status_plugins_read(const char *home,
+                              struct mesh_status_plugins *out);
+
+/* Append the plugins block to the rendered identity capsule `base` (a JSON
+ * object, <= the cap). Rows are dropped from the end, truncated=true, until
+ * the result fits; if not even zero rows fit, out is `base` byte for byte.
+ * Returns false only when base is not a JSON object. */
+bool mesh_status_capsule_with_plugins(const char *base, size_t base_len,
+                                      const struct mesh_status_plugins *p,
+                                      uint8_t out[MESH_STATUS_CAPSULE_MAX],
+                                      size_t *out_len);
+
+
+/* Opt-in lane, -meshstatusplugins (default off). Off: the capsule is exactly
+ * the identity render; HOME and the store are never touched. On: the
+ * responder copies a cached snapshot (a short mutex, no syscalls); the
+ * supervised refresh tick re-reads the store at most once per
+ * MESH_STATUS_PLUGINS_REFRESH_S. Before the first refresh the block says
+ * available=false reason "not_yet_read". */
+#define MESH_STATUS_PLUGINS_REFRESH_S 60
+
+bool mesh_status_plugins_enabled(void);
+void mesh_status_plugins_cache_snapshot(struct mesh_status_plugins *out);
+void mesh_status_plugins_cache_set(const struct mesh_status_plugins *snapshot,
+                                   int64_t now);
+void mesh_status_plugins_cache_reset(void);
+void mesh_status_plugins_cache_refresh(const char *home, int64_t now);
+
+/* Final capsule bytes from the rendered identity `base`: unchanged when the
+ * lane is off, otherwise base plus the cached plugins block. */
+void mesh_status_capsule_finish(const char *base, size_t base_len,
+                                uint8_t out[MESH_STATUS_CAPSULE_MAX],
+                                size_t *out_len);
 
 #endif /* ZCL_CONFIG_BOOT_MESH_STATUS_INTERNAL_H */

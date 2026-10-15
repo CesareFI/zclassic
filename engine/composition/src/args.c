@@ -101,6 +101,9 @@ void print_usage(const char *prog)
     printf("                      paired-machine confined terminals (default:\n");
     printf("                      none; terminal OPENs are refused\n");
     printf("                      confinement-unavailable without it)\n");
+    printf("  -meshstatusplugins  Add installed plugin names and generation prefixes to the\n");
+    printf("                      signed mesh-status capsule every paired machine can\n");
+    printf("                      read (default off)\n");
     printf("  -terminalacceptunconfined\n");
     printf("                      Windows only: let the terminal lane run the\n");
     printf("                      shell as the node's own user, with all of its\n");
@@ -222,6 +225,7 @@ static const char *const k_extra_getarg_flags[] = {
     "-buildworker", "-nobuildworker",
     "-noisetransport", "-nonoisetransport",
     "-v2transport", "-nov2transport",
+    "-meshstatusplugins", "-nomeshstatusplugins",
     "-terminalshell",
     "-terminalacceptunconfined", "-noterminalacceptunconfined",
 };

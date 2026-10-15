@@ -27,13 +27,78 @@
 #include "services/disk_monitor.h"
 #include "sync/sync_state.h"
 #include "util/mem_pressure.h"
+#include "util/util.h"
 #include "validation/main_constants.h"
 #include "vcs/zcode_dht_delegation.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define MESH_WIRE_NOW 2500
+
+/* ── plugins block fixtures ────────────────────────────────────────────── */
+
+/* A 128-hex generation id whose first 16 characters differ per seed. */
+static void mpl_gen_id(char out[PLUGIN_HEX_SHA3_512 + 1], unsigned seed)
+{
+    for (unsigned chunk = 0; chunk < 8; chunk++)
+        snprintf(out + chunk * 16, 17, "%016llx",
+                 0x0123456789abcdefULL * (seed + 1u) + chunk * 0x1111ULL);
+}
+
+static bool mpl_mkdir(const char *path)
+{
+    return mkdir(path, 0700) == 0 || access(path, F_OK) == 0;
+}
+
+/* Lay out HOME/.z23/plugins/NAME with one generation directory per id and
+ * the current / last-good links; plugin_store_list reads exactly this. */
+static bool mpl_store_plugin(const char *home, const char *name,
+                             const char *current, const char *last_good)
+{
+    char p[PATH_MAX], q[PATH_MAX];
+    bool ok = true;
+    snprintf(p, sizeof(p), "%s/.z23", home);
+    ok = ok && mpl_mkdir(home) && mpl_mkdir(p);
+    snprintf(p, sizeof(p), "%s/.z23/plugins", home);
+    ok = ok && mpl_mkdir(p);
+    snprintf(p, sizeof(p), "%s/.z23/plugins/%s", home, name);
+    ok = ok && mpl_mkdir(p);
+    snprintf(q, sizeof(q), "%s/generations", p);
+    ok = ok && mpl_mkdir(q);
+    const char *ids[2] = {current, last_good};
+    const char *links[2] = {"current", "last-good"};
+    for (int i = 0; ok && i < 2; i++) {
+        if (!ids[i])
+            continue;
+        char dirp[PATH_MAX], target[PATH_MAX];
+        snprintf(dirp, sizeof(dirp), "%s/generations/%s", p, ids[i]);
+        snprintf(q, sizeof(q), "%s/%s", p, links[i]);
+        snprintf(target, sizeof(target), "generations/%s", ids[i]);
+        ok = mpl_mkdir(dirp) && symlink(target, q) == 0;
+    }
+    return ok;
+}
+
+/* Identity base padded to `pad` extra bytes, then the plugins block. */
+static bool mpl_render(const struct mesh_status_plugins *plugins, size_t pad,
+                       uint8_t out[MESH_STATUS_CAPSULE_MAX + 1], size_t *len,
+                       char *base, size_t base_cap, size_t *base_len)
+{
+    int n = snprintf(base, base_cap,
+                     "{\"schema\":\"zcl.machine_mesh_identity.v1\","
+                     "\"machine\":\"m1\",\"pad\":\"%*s\"}", (int)pad, "");
+    if (n <= 0 || (size_t)n >= base_cap)
+        return false;
+    *base_len = (size_t)n;
+    if (!mesh_status_capsule_with_plugins(base, *base_len, plugins, out, len))
+        return false;
+    out[*len] = '\0';
+    return true;
+}
 
 static void mesh_fill32(uint8_t out[32], uint8_t value)
 {
@@ -265,6 +330,305 @@ static bool mesh_wire_sign_roundtrip(const struct mesh_wire_fixture *f,
         return false;
     *out = decoded;
     return true;
+}
+
+
+static int mpl_case_absent_and_two(const char *dir)
+{
+    int failures = 0;
+    TEST_CASE("mesh status capsule: plugins block for an absent store and two installed plugins") {
+        char home[PATH_MAX], ida[PLUGIN_HEX_SHA3_512 + 1],
+            idb[PLUGIN_HEX_SHA3_512 + 1], idc[PLUGIN_HEX_SHA3_512 + 1];
+        char base[MESH_STATUS_CAPSULE_MAX + 64];
+        uint8_t out[MESH_STATUS_CAPSULE_MAX + 1];
+        size_t out_len = 0, base_len = 0;
+        struct mesh_status_plugins plugins;
+        struct json_value doc;
+        const struct json_value *block;
+
+
+        /* (a) no store: unavailable, never an error, identity untouched. */
+        snprintf(home, sizeof(home), "%s/plugins_absent", dir);
+        ASSERT(mpl_mkdir(home));
+        mesh_status_plugins_read(home, &plugins);
+        ASSERT(!plugins.available);
+        ASSERT_STR_EQ(plugins.reason, "store_absent");
+        ASSERT(mpl_render(&plugins, 0, out, &out_len, base, sizeof(base),
+                          &base_len));
+        json_init(&doc);
+        ASSERT(json_read(&doc, (const char *)out, out_len));
+        ASSERT_STR_EQ(json_get_str(json_get(&doc, "schema")),
+                      "zcl.machine_mesh_identity.v1");
+        ASSERT_STR_EQ(json_get_str(json_get(&doc, "machine")), "m1");
+        block = json_get(&doc, "plugins");
+        ASSERT(block != NULL);
+        ASSERT_STR_EQ(json_get_str(json_get(block, "schema")),
+                      "zcl.mesh_status_plugins.v1");
+        ASSERT(!json_get_bool(json_get(block, "available")));
+        ASSERT_STR_EQ(json_get_str(json_get(block, "reason")), "store_absent");
+        json_free(&doc);
+        mesh_status_plugins_read(NULL, &plugins);
+        ASSERT(!plugins.available);
+        ASSERT_STR_EQ(plugins.reason, "home_unset");
+
+        /* (b) two installed plugins: count 2, name order, 16-hex prefixes. */
+        snprintf(home, sizeof(home), "%s/plugins_two", dir);
+        mpl_gen_id(ida, 1);
+        mpl_gen_id(idb, 2);
+        mpl_gen_id(idc, 3);
+        ASSERT(mpl_store_plugin(home, "beta", idb, ida));
+        ASSERT(mpl_store_plugin(home, "alpha", idc, NULL));
+        mesh_status_plugins_read(home, &plugins);
+        ASSERT(plugins.available);
+        ASSERT_EQ(plugins.count, 2u);
+        ASSERT(mpl_render(&plugins, 0, out, &out_len, base, sizeof(base),
+                          &base_len));
+        json_init(&doc);
+        ASSERT(json_read(&doc, (const char *)out, out_len));
+        block = json_get(&doc, "plugins");
+        ASSERT(block != NULL);
+        ASSERT(json_get_bool(json_get(block, "available")));
+        ASSERT_EQ(json_get_int(json_get(block, "count")), 2);
+        ASSERT_EQ(json_get_int(json_get(block, "listed")), 2);
+        ASSERT(!json_get_bool(json_get(block, "truncated")));
+        const struct json_value *items = json_get(block, "items");
+        ASSERT(items != NULL);
+        ASSERT_EQ(json_size(items), 2u);
+        ASSERT_STR_EQ(json_get_str(json_get(json_at(items, 0), "name")),
+                      "alpha");
+        ASSERT_EQ(strlen(json_get_str(json_get(json_at(items, 0), "current"))),
+                  16u);
+        ASSERT(strncmp(json_get_str(json_get(json_at(items, 0), "current")),
+                       idc, 16) == 0);
+        ASSERT_STR_EQ(json_get_str(json_get(json_at(items, 0), "last_good")),
+                      "");
+        ASSERT_STR_EQ(json_get_str(json_get(json_at(items, 1), "name")),
+                      "beta");
+        ASSERT(strncmp(json_get_str(json_get(json_at(items, 1), "current")),
+                       idb, 16) == 0);
+        ASSERT(strncmp(json_get_str(json_get(json_at(items, 1), "last_good")),
+                       ida, 16) == 0);
+        json_free(&doc);
+
+    } TEST_END
+    return failures;
+}
+
+static int mpl_case_squeeze(const char *dir)
+{
+    int failures = 0;
+    TEST_CASE("mesh status capsule: rows shed before identity, nothing fitting leaves the old capsule") {
+        char home[PATH_MAX], ida[PLUGIN_HEX_SHA3_512 + 1];
+        char base[MESH_STATUS_CAPSULE_MAX + 64];
+        uint8_t out[MESH_STATUS_CAPSULE_MAX + 1];
+        size_t out_len = 0, base_len = 0;
+        struct mesh_status_plugins plugins;
+        struct json_value doc;
+        const struct json_value *block;
+
+        /* More plugins than the row cap: 8 listed, count says 10. */
+        snprintf(home, sizeof(home), "%s/plugins_many", dir);
+        for (unsigned i = 0; i < 10; i++) {
+            char name[16];
+            snprintf(name, sizeof(name), "p%02u", i);
+            mpl_gen_id(ida, 10 + i);
+            ASSERT(mpl_store_plugin(home, name, ida, NULL));
+        }
+        mesh_status_plugins_read(home, &plugins);
+        ASSERT(plugins.available);
+        ASSERT_EQ(plugins.count, 10u);
+        ASSERT_EQ(plugins.listed, 8u);
+        ASSERT(mpl_render(&plugins, 0, out, &out_len, base, sizeof(base),
+                          &base_len));
+        json_init(&doc);
+        ASSERT(json_read(&doc, (const char *)out, out_len));
+        block = json_get(&doc, "plugins");
+        ASSERT(block != NULL);
+        ASSERT_EQ(json_get_int(json_get(block, "count")), 10);
+        ASSERT_EQ(json_size(json_get(block, "items")), 8u);
+        ASSERT(json_get_bool(json_get(block, "truncated")));
+        json_free(&doc);
+
+        /* (c) squeeze the identity toward the cap: rows are shed from the
+         * end with truncated=true and identity intact; once even zero rows do
+         * not fit the output is the old capsule byte for byte. */
+        bool saw_partial = false, saw_bare = false, saw_full = false;
+        for (size_t pad = 2900; pad < 4000; pad++) {
+            if (!mpl_render(&plugins, pad, out, &out_len, base, sizeof(base),
+                            &base_len))
+                break;
+            ASSERT(out_len <= MESH_STATUS_CAPSULE_MAX);
+            json_init(&doc);
+            ASSERT(json_read(&doc, (const char *)out, out_len));
+            ASSERT_STR_EQ(json_get_str(json_get(&doc, "machine")), "m1");
+            block = json_get(&doc, "plugins");
+            if (!block) {
+                ASSERT_EQ(out_len, base_len);
+                ASSERT(memcmp(out, base, base_len) == 0);
+                saw_bare = true;
+            } else {
+                int64_t listed = json_get_int(json_get(block, "listed"));
+                ASSERT_EQ((int64_t)json_size(json_get(block, "items")),
+                          listed);
+                ASSERT_EQ(json_get_int(json_get(block, "count")), 10);
+                ASSERT_EQ(json_get_bool(json_get(block, "truncated")),
+                          listed < 10);
+                saw_partial = saw_partial || (listed > 0 && listed < 8);
+                saw_full = saw_full || listed == 8;
+            }
+            json_free(&doc);
+        }
+        ASSERT(saw_full);
+        ASSERT(saw_partial);
+        ASSERT(saw_bare);
+
+    } TEST_END
+    return failures;
+}
+
+static int mpl_case_receipt(const char *dir, const struct mesh_wire_fixture *f)
+{
+    int failures = 0;
+    TEST_CASE("mesh status capsule: the signed receipt over a shed capsule verifies") {
+        char home[PATH_MAX];
+        char base[MESH_STATUS_CAPSULE_MAX + 64];
+        uint8_t out[MESH_STATUS_CAPSULE_MAX + 1];
+        size_t out_len = 0, base_len = 0;
+        struct mesh_status_plugins plugins;
+        snprintf(home, sizeof(home), "%s/plugins_many", dir);
+        mesh_status_plugins_read(home, &plugins);
+        /* (d) the signed receipt over a shed capsule still verifies. */
+        uint8_t pairing_id[32];
+        ASSERT(zcl_hex_decode_lower(f->pairing.pairing_id, pairing_id, 32));
+        struct mesh_status_request_v1 request;
+        mesh_wire_request(f, pairing_id, MESH_WIRE_NOW - 10,
+                          MESH_WIRE_NOW + 20, &request);
+        for (size_t pad = 0; pad < 2; pad++) {
+            ASSERT(mpl_render(&plugins, pad ? 3300 : 0, out, &out_len, base,
+                              sizeof(base), &base_len));
+            struct mesh_status_receipt_v1 receipt;
+            ASSERT(mesh_wire_sign_roundtrip(f, &request,
+                                            MESH_STATUS_RECEIPT_OK,
+                                            (const char *)out, &receipt));
+            ASSERT_EQ(receipt.capsule_len, out_len);
+            ASSERT(memcmp(receipt.capsule, out, out_len) == 0);
+            ASSERT(boot_mesh_status_receipt_accept(
+                &receipt, &request, &f->ini_snap, f->resp_master_pub,
+                f->resp_online_pub));
+        }
+    } TEST_END
+    return failures;
+}
+/* The plugins block of finished capsule bytes: count (-1 when the key is
+ * absent or the bytes do not parse); reason, when given, receives the
+ * unavailable reason (empty when available). */
+static int64_t mpl_block_count(const uint8_t *bytes, size_t len,
+                               char reason[32])
+{
+    struct json_value doc;
+    json_init(&doc);
+    int64_t count = -1;
+    if (json_read(&doc, (const char *)bytes, len)) {
+        const struct json_value *block = json_get(&doc, "plugins");
+        if (block) {
+            count = json_get_int(json_get(block, "count"));
+            const char *why = json_get_str(json_get(block, "reason"));
+            snprintf(reason, 32, "%s", why ? why : "");
+        }
+    }
+    json_free(&doc);
+    return count;
+}
+
+static void mpl_set_option(bool on)
+{
+    static const char *const off_argv[] = {"z23"};
+    static const char *const on_argv[] = {"z23", "-meshstatusplugins=1"};
+    ParseParameters(on ? 2 : 1, on ? on_argv : off_argv);
+}
+
+static int mpl_case_option_off(const char *dir)
+{
+    int failures = 0;
+    TEST_CASE("mesh status capsule: option off is exactly the identity render and never reads") {
+        char base[MESH_STATUS_CAPSULE_MAX + 64], reason[32] = "";
+        uint8_t out[MESH_STATUS_CAPSULE_MAX + 1];
+        size_t out_len = 0, base_len = 0;
+        struct mesh_status_plugins plugins;
+        char home[PATH_MAX];
+        snprintf(home, sizeof(home), "%s/plugins_two", dir);
+        mpl_set_option(false);
+        mesh_status_plugins_cache_reset();
+        mesh_status_plugins_read(home, &plugins);
+        mesh_status_plugins_cache_set(&plugins, 1000); /* data is cached... */
+        snprintf(base, sizeof(base),
+                 "{\"schema\":\"zcl.machine_mesh_identity.v1\",\"machine\":\"m1\"}");
+        base_len = strlen(base);
+        mesh_status_capsule_finish(base, base_len, out, &out_len);
+        ASSERT_EQ(out_len, base_len); /* ...yet not one byte is appended */
+        ASSERT(memcmp(out, base, base_len) == 0);
+        ASSERT_EQ(mpl_block_count(out, out_len, reason), -1);
+        /* The refresh tick is inert too: a later store change is not read. */
+        mesh_status_plugins_cache_reset();
+        mesh_status_plugins_cache_refresh(home, 5000);
+        mesh_status_plugins_cache_snapshot(&plugins);
+        ASSERT(!plugins.available);
+        ASSERT_STR_EQ(plugins.reason, "not_yet_read");
+    } TEST_END
+    mpl_set_option(false);
+    mesh_status_plugins_cache_reset();
+    return failures;
+}
+
+static int mpl_case_cached_only(const char *dir)
+{
+    int failures = 0;
+    TEST_CASE("mesh status capsule: the responder path serves only the cache; refresh is throttled") {
+        char base[MESH_STATUS_CAPSULE_MAX + 64], reason[32] = "";
+        uint8_t out[MESH_STATUS_CAPSULE_MAX + 1];
+        size_t out_len = 0;
+        struct mesh_status_plugins synthetic;
+        char home[PATH_MAX], id[PLUGIN_HEX_SHA3_512 + 1];
+        snprintf(home, sizeof(home), "%s/plugins_cached", dir);
+        snprintf(base, sizeof(base),
+                 "{\"schema\":\"zcl.machine_mesh_identity.v1\",\"machine\":\"m1\"}");
+        mpl_set_option(true);
+        mesh_status_plugins_cache_reset();
+        /* Before the first refresh: named, not guessed. */
+        mesh_status_capsule_finish(base, strlen(base), out, &out_len);
+        out[out_len] = '\0';
+        ASSERT_EQ(mpl_block_count(out, out_len, reason), 0);
+        ASSERT_STR_EQ(reason, "not_yet_read");
+        /* A snapshot set directly is what appears, the store is not read. */
+        memset(&synthetic, 0, sizeof(synthetic));
+        synthetic.available = true;
+        synthetic.count = synthetic.listed = 1;
+        snprintf(synthetic.items[0].name, sizeof(synthetic.items[0].name),
+                 "synthetic");
+        mesh_status_plugins_cache_set(&synthetic, 1000);
+        mesh_status_capsule_finish(base, strlen(base), out, &out_len);
+        ASSERT_EQ(mpl_block_count(out, out_len, reason), 1);
+        ASSERT(strstr((const char *)out, "synthetic") != NULL);
+        /* A store change is invisible until a refresh is due (60 s). */
+        mesh_status_plugins_cache_reset();
+        mpl_gen_id(id, 40);
+        ASSERT(mpl_store_plugin(home, "one", id, NULL));
+        mesh_status_plugins_cache_refresh(home, 2000);
+        mpl_gen_id(id, 41);
+        ASSERT(mpl_store_plugin(home, "two", id, NULL));
+        mesh_status_capsule_finish(base, strlen(base), out, &out_len);
+        ASSERT_EQ(mpl_block_count(out, out_len, reason), 1);
+        mesh_status_plugins_cache_refresh(home, 2059);
+        mesh_status_capsule_finish(base, strlen(base), out, &out_len);
+        ASSERT_EQ(mpl_block_count(out, out_len, reason), 1);
+        mesh_status_plugins_cache_refresh(home, 2060);
+        mesh_status_capsule_finish(base, strlen(base), out, &out_len);
+        ASSERT_EQ(mpl_block_count(out, out_len, reason), 2);
+    } TEST_END
+    /* Runs even when an ASSERT jumped out of the block above. */
+    mpl_set_option(false);
+    mesh_status_plugins_cache_reset();
+    return failures;
 }
 
 int test_mesh_status_wire(void)
@@ -584,6 +948,13 @@ int test_mesh_status_wire(void)
         noise_transport_free(res2);
         PASS();
     }
+
+    failures += mpl_case_absent_and_two(dir);
+    failures += mpl_case_squeeze(dir);
+    failures += mpl_case_receipt(dir, &f);
+    failures += mpl_case_option_off(dir);
+    failures += mpl_case_cached_only(dir);
+
 
     TEST("mesh status wire: a full pending table returns BUSY without "
          "evicting a live request") {
