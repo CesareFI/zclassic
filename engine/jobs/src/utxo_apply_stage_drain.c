@@ -26,28 +26,37 @@
 
 #define STAGE_NAME "utxo_apply"
 
+/* Opens the outer batch under progress_store_tx_lock and its commit
+ * conservation window (invariants a/b/c). Returns true with the lock held
+ * when a batch is open; false with the lock released otherwise, which leaves
+ * the unbatched path untouched. Invariant (a) requires the production
+ * coins_kv-backed lookup (found ⇔ a deletable coins_kv row); a synthetic test
+ * lookup breaks that premise, so disable (a) — (b)/(c) still run — when it is
+ * not installed. utxo_apply_stage_lookup_is_live never takes the stage lock,
+ * which keeps progress_store_tx_lock ahead of it in the lock order. */
+static bool utxo_apply_drain_batch_open(sqlite3 *batch_db)
+{
+    if (!batch_db)
+        return false;
+    progress_store_tx_lock();
+    if (!stage_batch_begin(batch_db)) {
+        progress_store_tx_unlock();
+        return false;
+    }
+    reducer_commit_invariants_batch_begin(batch_db);
+    utxo_apply_lookup_batch_begin(batch_db);
+    if (!utxo_apply_stage_lookup_is_live())
+        reducer_commit_invariants_disable_coins_check();
+    return true;
+}
+
 int utxo_apply_stage_drain(int max_steps)
 {
-    if (max_steps <= 0) return 0;
+    /* Block intake can drain before boot finishes the stage's init; nothing
+     * applies until init binds the stage, so open no batch until then. */
+    if (max_steps <= 0 || !utxo_apply_stage_handle()) return 0;
     sqlite3 *batch_db = progress_store_db();
-    bool batched = false;
-    if (batch_db) {
-        progress_store_tx_lock();
-        batched = stage_batch_begin(batch_db);
-        if (!batched) progress_store_tx_unlock();
-    }
-
-    /* Open the batch-commit conservation window (invariants a/b/c). No-op
-     * unless a batch is actually open, so the unbatched path stays untouched.
-     * Invariant (a) requires the production coins_kv-backed lookup (found ⇔ a
-     * deletable coins_kv row); a synthetic test lookup breaks that premise, so
-     * disable (a) — (b)/(c) still run — when it is not installed. */
-    if (batched) {
-        reducer_commit_invariants_batch_begin(batch_db);
-        utxo_apply_lookup_batch_begin(batch_db);
-        if (!utxo_apply_stage_lookup_is_live())
-            reducer_commit_invariants_disable_coins_check();
-    }
+    bool batched = utxo_apply_drain_batch_open(batch_db);
 
     /* Read the durable pre-batch cursor directly. The observer atomic is an
      * advance event, so it is intentionally unset after a process restart. */

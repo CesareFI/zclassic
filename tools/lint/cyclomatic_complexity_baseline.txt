@@ -1791,8 +1791,6 @@ engine/jobs/src/utxo_apply_history_hold.c:utxo_apply_history_hold_should_park:20
 engine/jobs/src/utxo_apply_nullifiers.c:check_and_insert_nullifiers_impl:16
 engine/jobs/src/utxo_apply_nullifiers.c:shielded_history_preflight:27
 engine/jobs/src/utxo_apply_stage.c:step_apply:64
-engine/jobs/src/utxo_apply_stage.c:utxo_apply_stage_init:20
-engine/jobs/src/utxo_apply_stage_drain.c:utxo_apply_stage_drain:18
 engine/jobs/src/utxo_apply_stage_fallback.c:hash_bound_fallback:22
 engine/jobs/src/utxo_apply_suffix_inputs.c:utxo_apply_restore_suffix_inputs:18
 engine/jobs/src/utxo_root_ladder_tripwire.c:utxo_root_ladder_tripwire_report:19

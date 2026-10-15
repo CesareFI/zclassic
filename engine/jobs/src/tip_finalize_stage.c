@@ -36,6 +36,7 @@
 
 #define STAGE_NAME "tip_finalize"
 
+/* Lock order: progress_store_tx_lock, then g_lock (as in utxo_apply_stage). */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct main_state *g_ms = NULL;
 static stage_t *g_stage = NULL;
@@ -627,14 +628,63 @@ static bool get_hash(uint8_t hash[32])
     return tip_finalize_observe_get_last_advance(&h, hash);
 }
 
-bool tip_finalize_stage_init(struct main_state *ms)
+/* Re-anchor an already-bound stage to the cached tip. Caller holds
+ * progress_store_tx_lock, then g_lock. */
+static bool tip_finalize_stage_reanchor_locked(sqlite3 *db,
+                                               struct block_index *existing_tip)
 {
-    if (!ms) LOG_FAIL("tip_finalize", "init: NULL main_state");
+    if (existing_tip && existing_tip->phashBlock &&
+        !tip_finalize_anchor_cursor_to_authority(db, existing_tip->nHeight,
+            existing_tip->phashBlock->data, false, false, "init_existing_tip_reanchor"))
+        return false;
+    if (!tip_finalize_stage_hydrate_cursor_from_store(
+            db, g_stage, "init_existing_tip_reanchor"))
+        return false;
+    tip_finalize_stage_publish_resolved_or_fresh_tip(
+        db, existing_tip, "init_existing_tip_reanchor");
+    tf_warm_provable_tip_once(db, "init_existing_tip_reanchor");
+    chain_evidence_note_finalized_tip(existing_tip);
+    return true;
+}
 
-    sqlite3 *db = progress_store_db();
-    if (!db) LOG_FAIL("tip_finalize", "init: progress_store not open");
+/* Bind a new stage. Caller holds progress_store_tx_lock, then g_lock. */
+static bool tip_finalize_stage_bind_locked(sqlite3 *db, struct main_state *ms,
+                                           struct block_index *existing_tip)
+{
+    if (!ensure_log_schema(db))
+        LOG_FAIL("tip_finalize", "init: tip_finalize_log schema failed");
 
-    pthread_mutex_lock(&g_lock);
+    stage_t *s = stage_create(STAGE_NAME, step_finalize, NULL);
+    if (!s)
+        LOG_FAIL("tip_finalize", "init: stage_create failed");
+
+    g_ms = ms;
+    g_stage = s;
+    /* The active-chain cache is a served-tip authority, not reducer progress.
+     * On recovered datadirs it may sit above H-star/coins while upstream stage
+     * cursors are deliberately clamped for repair. Publish the tip_finalize
+     * authority cursor, but only explicit seed anchors may align upstream
+     * reducer cursors. */
+    if ((existing_tip && existing_tip->phashBlock &&
+         !tip_finalize_anchor_cursor_to_authority(db, existing_tip->nHeight,
+                existing_tip->phashBlock->data, false, true, "init_existing_tip")) ||
+        !tip_finalize_stage_hydrate_cursor_from_store(
+            db, s, "init_existing_tip")) {
+        stage_destroy(s);
+        g_stage = NULL;
+        return false;
+    }
+    tip_finalize_stage_publish_resolved_or_fresh_tip(
+        db, existing_tip, "init_existing_tip");
+    tf_warm_provable_tip_once(db, "init_existing_tip");
+    chain_evidence_note_finalized_tip(existing_tip);
+    LOG_INFO("tip_finalize", "[tip_finalize] stage initialised (authoritative)");
+    return true;
+}
+
+/* Caller holds progress_store_tx_lock, then g_lock. */
+static bool tip_finalize_stage_init_locked(sqlite3 *db, struct main_state *ms)
+{
     tip_finalize_observe_init();
     tip_finalize_visible_body_reset();
     /* Drop any volatile utxo_apply SUM cache from a prior lifecycle: the next
@@ -649,67 +699,24 @@ bool tip_finalize_stage_init(struct main_state *ms)
     active_chain_register_authority(&auth);
     active_chain_register_block_map(&ms->map_block_index);
 
-    if (g_stage != NULL) {
-        if (existing_tip && existing_tip->phashBlock &&
-            !tip_finalize_anchor_cursor_to_authority(db, existing_tip->nHeight,
-                existing_tip->phashBlock->data, false, false, "init_existing_tip_reanchor")) {
-            pthread_mutex_unlock(&g_lock);
-            return false;
-        }
-        if (!tip_finalize_stage_hydrate_cursor_from_store(
-                db, g_stage, "init_existing_tip_reanchor")) {
-            pthread_mutex_unlock(&g_lock);
-            return false;
-        }
-        tip_finalize_stage_publish_resolved_or_fresh_tip(
-            db, existing_tip, "init_existing_tip_reanchor");
-        tf_warm_provable_tip_once(db, "init_existing_tip_reanchor");
-        chain_evidence_note_finalized_tip(existing_tip);
-        pthread_mutex_unlock(&g_lock);
-        return true;
-    }
+    if (g_stage != NULL)
+        return tip_finalize_stage_reanchor_locked(db, existing_tip);
+    return tip_finalize_stage_bind_locked(db, ms, existing_tip);
+}
 
-    if (!ensure_log_schema(db)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
+bool tip_finalize_stage_init(struct main_state *ms)
+{
+    if (!ms) LOG_FAIL("tip_finalize", "init: NULL main_state");
 
-    stage_t *s = stage_create(STAGE_NAME, step_finalize, NULL);
-    if (!s) {
-        pthread_mutex_unlock(&g_lock);
-        LOG_FAIL("tip_finalize", "init: stage_create failed");
-    }
+    sqlite3 *db = progress_store_db();
+    if (!db) LOG_FAIL("tip_finalize", "init: progress_store not open");
 
-    g_ms = ms;
-    g_stage = s;
-    /* The active-chain cache is a served-tip authority, not reducer progress.
-     * On recovered datadirs it may sit above H-star/coins while upstream stage
-     * cursors are deliberately clamped for repair. Publish the tip_finalize
-     * authority cursor, but only explicit seed anchors may align upstream
-     * reducer cursors. */
-    if (existing_tip && existing_tip->phashBlock &&
-        !tip_finalize_anchor_cursor_to_authority(db, existing_tip->nHeight,
-                existing_tip->phashBlock->data, false, true, "init_existing_tip")) {
-        stage_destroy(s);
-        g_stage = NULL;
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
-    if (!tip_finalize_stage_hydrate_cursor_from_store(
-            db, s, "init_existing_tip")) {
-        stage_destroy(s);
-        g_stage = NULL;
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
-    tip_finalize_stage_publish_resolved_or_fresh_tip(
-        db, existing_tip, "init_existing_tip");
-    tf_warm_provable_tip_once(db, "init_existing_tip");
-    chain_evidence_note_finalized_tip(existing_tip);
+    progress_store_tx_lock();
+    pthread_mutex_lock(&g_lock);
+    bool ok = tip_finalize_stage_init_locked(db, ms);
     pthread_mutex_unlock(&g_lock);
-
-    LOG_INFO("tip_finalize", "[tip_finalize] stage initialised (authoritative)");
-    return true;
+    progress_store_tx_unlock();
+    return ok;
 }
 
 job_result_t tip_finalize_stage_step_once(void)

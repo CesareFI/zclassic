@@ -78,6 +78,13 @@ void utxo_apply_stage_shutdown(void);
 job_result_t utxo_apply_stage_step_once(void);
 int utxo_apply_stage_drain(int max_steps);
 
+#ifdef ZCL_TESTING
+/* Hold (true) or release (false) the stage's internal lock from the calling
+ * thread, standing in for a concurrent init or shutdown, so a test can prove
+ * a drain never waits on that lock while it holds progress_store_tx_lock. */
+void utxo_apply_stage_test_hold_lock(bool hold);
+#endif
+
 /* A commitment-tree rebuild replaces the Sapling frontier as one verified
  * unit. Coin/anchor application must remain parked for that interval; folding
  * even one block from the pre-rebuild frontier can create a durable false

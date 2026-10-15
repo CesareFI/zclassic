@@ -6,6 +6,7 @@
 
 #include "bloom/merkle.h"
 #include "chain/chain.h"
+#include "platform/time_compat.h"
 #include "controllers/agent_security_posture.h"
 #include "core/uint256.h"
 #include "json/json.h"
@@ -40,7 +41,9 @@
 #include "../../../engine/jobs/src/utxo_apply_stage_internal.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1382,6 +1385,84 @@ static int inverse_order_cases(void)
     return failures;
 }
 
+/* ── Lock order: progress_store_tx_lock before the stage lock ──────────
+ * Boot runs utxo_apply_stage_init while block intake drains. A drain holds
+ * progress_store_tx_lock for its batch; if it then waits on the stage lock
+ * that init holds while init waits on progress_store_tx_lock, neither thread
+ * proceeds. With the stage lock held here, a drain must still finish and
+ * release progress_store_tx_lock. The wait is a bounded poll count and the
+ * stage lock is released afterwards, so a regression fails these checks
+ * instead of hanging the suite. */
+#define UV_LOCK_ORDER_POLLS 2000
+
+struct uv_lock_order_drain {
+    atomic_bool done;
+    int advanced;
+};
+
+static void *uv_lock_order_drain_thread(void *arg)
+{
+    struct uv_lock_order_drain *d = arg;
+    d->advanced = utxo_apply_stage_drain(100);
+    atomic_store(&d->done, true);
+    return NULL;
+}
+
+/* Drains on a second thread while this thread holds the stage lock. Returns
+ * the drain's advance count, or -1 when the drain did not finish within the
+ * poll bound. *tx_free reports whether progress_store_tx_lock was free at the
+ * end of the bound. */
+static int uv_lock_order_drain_under_stage_lock(bool *tx_free)
+{
+    struct uv_lock_order_drain d = { .advanced = -1 };
+    atomic_init(&d.done, false);
+    utxo_apply_stage_test_hold_lock(true);
+    pthread_t t;
+    if (pthread_create(&t, NULL, uv_lock_order_drain_thread, &d) != 0) {
+        utxo_apply_stage_test_hold_lock(false);
+        *tx_free = false;
+        return -1;
+    }
+    for (int i = 0; i < UV_LOCK_ORDER_POLLS && !atomic_load(&d.done); i++)
+        platform_sleep_ms(1);
+    bool finished = atomic_load(&d.done);
+    *tx_free = progress_store_tx_trylock();
+    if (*tx_free)
+        progress_store_tx_unlock();
+    utxo_apply_stage_test_hold_lock(false);
+    pthread_join(t, NULL);
+    return finished ? d.advanced : -1;
+}
+
+static int uv_lock_order_cases(void)
+{
+    int failures = 0;
+    char dir[256];
+    bool tx_free = false;
+    test_fmt_tmpdir(dir, sizeof(dir), "utxo_apply", "lock_order_uninit");
+    mkdir_p_uv("./test-tmp");
+    mkdir_p_uv(dir);
+    UV_CHECK("lock order: store opens before init", progress_store_open(dir));
+    UV_CHECK("lock order: drain before init finishes under the stage lock",
+             uv_lock_order_drain_under_stage_lock(&tx_free) == 0);
+    UV_CHECK("lock order: drain before init releases progress_store_tx_lock",
+             tx_free);
+    progress_store_close();
+    test_cleanup_tmpdir(dir);
+
+    struct main_state ms; struct synth_chain_uv sc;
+    UV_CHECK("lock order: setup",
+             uv_setup("lock_order", 3, UV_FAIL_NONE, -1, dir, sizeof(dir),
+                      &ms, &sc) == 0);
+    tx_free = false;
+    UV_CHECK("lock order: initialised drain applies 3 under the stage lock",
+             uv_lock_order_drain_under_stage_lock(&tx_free) == 3);
+    UV_CHECK("lock order: initialised drain releases progress_store_tx_lock",
+             tx_free);
+    uv_teardown(dir, &ms, &sc);
+    return failures;
+}
+
 int test_utxo_apply_stage(void);
 int test_utxo_apply_stage(void)
 {
@@ -1389,6 +1470,7 @@ int test_utxo_apply_stage(void)
     int failures = 0;
 
     blocker_module_init();
+    failures += uv_lock_order_cases();
 
     {
         char dir[256]; struct main_state ms; struct synth_chain_uv sc;

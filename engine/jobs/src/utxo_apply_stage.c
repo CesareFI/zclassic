@@ -57,6 +57,9 @@
  * (utxo_apply_compute_block_delta) and the inverse-delta persistence +
  * reorg-unwind machinery live in jobs/utxo_apply_delta.h / _delta.c. */
 
+/* Lock order: progress_store_tx_lock, then g_lock. A thread holding g_lock
+ * never waits on progress_store_tx_lock: init takes progress_store_tx_lock
+ * first, and the drain path reads g_lookup_live without g_lock. */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct main_state *g_ms = NULL;
 static stage_t *g_stage = NULL;
@@ -65,12 +68,23 @@ static utxo_apply_reader_fn g_reader = NULL;
 static void *g_reader_user = NULL;
 static utxo_apply_lookup_fn g_lookup = NULL;
 static void *g_lookup_user = NULL;
+static atomic_bool g_lookup_live = false;
 /* Settled == coins_kv already carries the migration marker, so the in-fold
  * provenance stamp below has nothing left to do. Scoped to ONE stage lifecycle
  * (cleared by init and shutdown) rather than the process, so a reseed that
  * clears the markers, and a test that opens a second datadir, both get a fresh
  * verdict instead of inheriting the previous store's. */
 static bool g_self_derived_settled = false;
+
+/* Caller holds g_lock. */
+static void utxo_apply_stage_lookup_set_locked(utxo_apply_lookup_fn fn,
+                                               void *user)
+{
+    g_lookup = fn;
+    g_lookup_user = user;
+    atomic_store_explicit(&g_lookup_live, fn == utxo_apply_stage_lookup_live,
+                          memory_order_release);
+}
 
 bool coins_kv_set_applied_height_in_tx(sqlite3 *db, int32_t height)
 {
@@ -688,66 +702,34 @@ static void utxo_apply_step_noadvance_note(sqlite3 *db, job_result_t r,
              (unsigned long long)suppressed);
 }
 
-bool utxo_apply_stage_init(struct main_state *ms)
+static bool utxo_apply_stage_ensure_schemas(sqlite3 *db)
 {
-    if (!ms) LOG_FAIL("utxo_apply", "init: NULL main_state");
-
-    sqlite3 *db = progress_store_db();
-    if (!db) LOG_FAIL("utxo_apply", "init: progress_store not open");
-
-    pthread_mutex_lock(&g_lock);
-    g_self_derived_settled = false;  /* this datadir answers for itself */
-    if (g_stage != NULL) {
-        bool same = (g_ms == ms);
-        pthread_mutex_unlock(&g_lock);
-        if (!same)
-            LOG_FAIL("utxo_apply",
-                "init: already bound to a different main_state");
-        return true;
-    }
-
-    if (!utxo_apply_log_ensure_schema(db)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
-    if (!proof_validate_log_ensure_schema(db)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
     /* step_apply's hash-bound verdict gate reads script_validate_log; ensure
      * it exists (idempotent) so init-ordering never breaks the read. */
-    if (!script_validate_log_ensure_schema(db)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
-    if (!utxo_apply_ensure_delta_schema(db)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
-    if (!coins_kv_ensure_schema(db)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
-    if (!created_outputs_index_ensure_schema(db)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
+    return utxo_apply_log_ensure_schema(db) &&
+           proof_validate_log_ensure_schema(db) &&
+           script_validate_log_ensure_schema(db) &&
+           utxo_apply_ensure_delta_schema(db) &&
+           coins_kv_ensure_schema(db) &&
+           created_outputs_index_ensure_schema(db);
+}
 
+/* Durable-state reconciliation before the stage binds. Caller holds
+ * progress_store_tx_lock, then g_lock. */
+static bool utxo_apply_stage_reconcile_locked(sqlite3 *db,
+                                              struct main_state *ms)
+{
     /* L7 durable active-chain anchor set.  The first adoption cursor is an
      * honesty boundary: zero means a from-genesis store; a nonzero value means
      * the prefix is absent and unknown anchors must fail closed until the
      * owner-gated body backfill completes. */
-    if (!utxo_apply_shielded_history_initialize(db)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
+    if (!utxo_apply_shielded_history_initialize(db))
+        LOG_FAIL("utxo_apply", "init: shielded history initialise failed");
 
     /* Derive an absent frontier from the durable cursor, never coin rows. */
     if (!coins_kv_backfill_applied_height_if_absent(
-            db, coins_kv_set_applied_height_in_tx)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
+            db, coins_kv_set_applied_height_in_tx))
+        LOG_FAIL("utxo_apply", "init: applied-height backfill failed");
 
     /* Regtest on-demand mint bootstrap (this frontier's single writer). A
      * pristine from-genesis regtest node folds no block above genesis until
@@ -758,30 +740,35 @@ bool utxo_apply_stage_init(struct main_state *ms)
      * genesis anchor seed's paired comment in engine/composition/src/boot_services.c. */
     if (chain_params_get()->fMineBlocksOnDemand &&
         !coins_kv_seed_genesis_applied_height(
-            db, coins_kv_set_applied_height_in_tx)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
+            db, coins_kv_set_applied_height_in_tx))
+        LOG_FAIL("utxo_apply", "init: regtest genesis applied-height seed failed");
 
     /* Rewind an in-RAM cursor to its durable watermark before binding. */
-    if (!coins_ram_reconcile_boot(db,
-                                  coins_kv_set_applied_height_in_tx)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
+    if (!coins_ram_reconcile_boot(db, coins_kv_set_applied_height_in_tx))
+        LOG_FAIL("utxo_apply", "init: coins_ram boot reconcile failed");
     GetDataDir(true, g_datadir, sizeof(g_datadir));
-    if (!utxo_apply_reconcile_unapplied_suffix(
-            db, ms, g_datadir, g_reader, g_reader_user) ||
-        !coins_ram_init(db, 0, coins_kv_set_applied_height_in_tx)) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
+    return utxo_apply_reconcile_unapplied_suffix(
+               db, ms, g_datadir, g_reader, g_reader_user) &&
+           coins_ram_init(db, 0, coins_kv_set_applied_height_in_tx);
+}
+
+/* Caller holds progress_store_tx_lock, then g_lock. */
+static bool utxo_apply_stage_init_locked(sqlite3 *db, struct main_state *ms)
+{
+    g_self_derived_settled = false;  /* this datadir answers for itself */
+    if (g_stage != NULL) {
+        if (g_ms != ms)
+            LOG_FAIL("utxo_apply",
+                "init: already bound to a different main_state");
+        return true;
     }
+    if (!utxo_apply_stage_ensure_schemas(db) ||
+        !utxo_apply_stage_reconcile_locked(db, ms))
+        LOG_FAIL("utxo_apply", "init: schema or reconcile failed");
 
     stage_t *s = stage_create(STAGE_NAME, step_apply, NULL);
-    if (!s) {
-        pthread_mutex_unlock(&g_lock);
+    if (!s)
         LOG_FAIL("utxo_apply", "init: stage_create failed");
-    }
     g_ms = ms;
     g_stage = s;
     /* Wire the production UTXO-set resolver unless a caller (a test)
@@ -789,11 +776,25 @@ bool utxo_apply_stage_init(struct main_state *ms)
      * EVERY external coin as absent and rejects every cross-block
      * transparent spend as spend_unknown_utxo. */
     if (!g_lookup)
-        g_lookup = utxo_apply_stage_lookup_live;
-    pthread_mutex_unlock(&g_lock);
-
+        utxo_apply_stage_lookup_set_locked(utxo_apply_stage_lookup_live,
+                                           NULL);
     LOG_INFO("utxo_apply", "[utxo_apply] stage initialised");
     return true;
+}
+
+bool utxo_apply_stage_init(struct main_state *ms)
+{
+    if (!ms) LOG_FAIL("utxo_apply", "init: NULL main_state");
+
+    sqlite3 *db = progress_store_db();
+    if (!db) LOG_FAIL("utxo_apply", "init: progress_store not open");
+
+    progress_store_tx_lock();
+    pthread_mutex_lock(&g_lock);
+    bool ok = utxo_apply_stage_init_locked(db, ms);
+    pthread_mutex_unlock(&g_lock);
+    progress_store_tx_unlock();
+    return ok;
 }
 
 job_result_t utxo_apply_stage_step_once(void)
@@ -893,8 +894,7 @@ void utxo_apply_stage_shutdown(void)
     g_datadir[0] = '\0';
     g_reader = NULL;
     g_reader_user = NULL;
-    g_lookup = NULL;
-    g_lookup_user = NULL;
+    utxo_apply_stage_lookup_set_locked(NULL, NULL);
     utxo_apply_history_hold_clear();
     atomic_store(&g_ua_verified_total, (uint64_t)0);
     atomic_store(&g_ua_spend_unknown_total, (uint64_t)0);
@@ -942,8 +942,7 @@ void utxo_apply_stage_set_reader(utxo_apply_reader_fn fn, void *user)
 void utxo_apply_stage_set_lookup(utxo_apply_lookup_fn fn, void *user)
 {
     pthread_mutex_lock(&g_lock);
-    g_lookup = fn;
-    g_lookup_user = user;
+    utxo_apply_stage_lookup_set_locked(fn, user);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -953,13 +952,11 @@ void utxo_apply_stage_set_lookup(utxo_apply_lookup_fn fn, void *user)
  * invariant. A test that installs a synthetic lookup (utxo_apply_stage_set_
  * lookup) resolves prevouts that are NOT coins_kv rows, so a spend deletes
  * nothing; (a) must be gated off there. No production path installs a non-live
- * lookup (grep: set_lookup has test-only callers), so (a) always runs live. */
+ * lookup (grep: set_lookup has test-only callers), so (a) always runs live.
+ * Lock-free: the drain calls this while holding progress_store_tx_lock. */
 bool utxo_apply_stage_lookup_is_live(void)
 {
-    pthread_mutex_lock(&g_lock);
-    bool live = (g_lookup == utxo_apply_stage_lookup_live);
-    pthread_mutex_unlock(&g_lock);
-    return live;
+    return atomic_load_explicit(&g_lookup_live, memory_order_acquire);
 }
 
 uint64_t utxo_apply_stage_cursor(void) { return g_stage ? stage_cursor(g_stage) : 0; }
@@ -972,6 +969,16 @@ stage_t *utxo_apply_stage_handle(void)
 {
     return g_stage;
 }
+
+#ifdef ZCL_TESTING
+void utxo_apply_stage_test_hold_lock(bool hold)
+{
+    if (hold)
+        pthread_mutex_lock(&g_lock);
+    else
+        pthread_mutex_unlock(&g_lock);
+}
+#endif
 
 /* utxo_apply_stage_succeeded_at + the per-status counter total accessors
  * live in utxo_apply_stage_accessors.c; utxo_apply_dump_state_json (+ its
