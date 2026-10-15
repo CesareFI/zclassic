@@ -3,7 +3,8 @@
 # Forward secrecy for native tunnels
 
 Status: design proposal, not an implemented or qualified protocol change.
-Source baseline: `0f9325278ade90be99ad5203ebbef865b5403996`.
+Original source review: `0f9325278ade90be99ad5203ebbef865b5403996`.
+Integration base: `f4c51e944b919e4869369bdb9969ad6ee8234377`.
 Reviewed on 2026-10-15. This document authorizes no deployment, pairing,
 credential rotation, core modification or production execution.
 
@@ -24,8 +25,8 @@ unknown to an observer who later obtains the PSK. This outer profile has
 that conclusion while the PSK and recorded transcript can reconstruct them.
 
 OpenSSH inside the tunnel is a separate cryptographic channel. The measured
-Linux trial used `sntrup761x25519-sha512` key exchange and classical Ed25519
-host authentication. Do not infer the inner suite from an outer profile, or
+Linux loopback sshd trial used `sntrup761x25519-sha512` key exchange and
+classical Ed25519 host authentication. Do not infer the inner suite from an outer profile, or
 infer post-quantum authentication from hybrid key exchange. Record the negotiated
 SSH key exchange and host-key algorithm separately. A stronger outer channel
 does not fix unpinned SSH host keys or grant remote shell authority.
@@ -35,9 +36,10 @@ does not fix unpinned SSH host keys or grant remote shell authority.
 The preferred migration is explicit pairing and target admission through the
 existing native mesh transport, then reuse of
 [`mesh_tunnel`](../engine/composition/include/config/mesh_tunnel.h).
-It already composes the mesh stream's bounded framing, credit, per-peer caps
-and closure with a receiver-owned loopback target allow table. Its existence
-does not establish that every peer currently uses the required Noise suite.
+Its header describes bounded streams and a receiver-owned loopback target
+allow table. That interface alone does not establish the negotiated transport
+suite. Reuse requires separately verifying the session's Noise suite, peer
+identity binding and runtime admission; none is inferred from the header.
 
 Require the exact suite
 `Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256`, already represented in
