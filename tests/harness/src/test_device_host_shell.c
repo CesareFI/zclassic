@@ -41,7 +41,7 @@ static int shell_receiver_unit(void)
         ASSERT(strstr(env, "\"lifetime_ms\":600000") != NULL);
         ASSERT(strstr(env, "\"max_sessions\":64") != NULL);
         ASSERT(strstr(env, "\"max_active\":4") != NULL);
-        ASSERT(strstr(env, "\nZ23_TUNNEL_RECEIVER_INPUT=/") != NULL);
+        ASSERT(strstr(env, "\nZ23_TUNNEL_RECEIVER_INPUT=<HOME>/") != NULL);
     } TEST_END
     free(unit); free(env);
     return failures;
@@ -133,12 +133,13 @@ static int shell_input_file_rewrite(void)
  * {"key": path} input object. */
 static bool psk_new_call(const char *path, struct zcl_command_reply *reply)
 {
+    zcl_command_reply_init(reply, NULL);
     const struct zcl_command_spec *spec = zcl_command_registry_find(zcl_command_catalog(), "ops.mesh.device.psk.new", NULL);
     if (!spec || spec->handler != zcl_native_handle_ops_mesh_device_psk_new) return false;
     struct json_value input = {0};
     json_set_object(&input);
     bool pushed = json_push_kv_str(&input, "key", path);
-    zcl_command_reply_init(reply, spec->output_schema);
+    reply->data_schema = spec->output_schema ? spec->output_schema : reply->data_schema;
     struct zcl_command_request request = {.spec = spec, .input = &input};
     if (pushed) zcl_native_handle_ops_mesh_device_psk_new(&request, reply);
     json_free(&input);
@@ -282,14 +283,14 @@ static int shell_dry_run_argv(void)
         ASSERT(shell_write(route, "{}", 0600));
         snprintf(proxy, sizeof(proxy), "ProxyCommand=/opt/z23/bin/z23 ops mesh device host client --input-file=%s", route);
         struct zcl_native_host_shell_argv plan; const char *refusal = "unset";
-        ASSERT(zcl_native_device_host_shell_argv("/opt/z23/bin/z23", "rhett", "r2.lan", route, false, &plan, &refusal));
+        ASSERT(zcl_native_device_host_shell_argv("/opt/z23/bin/z23", "alice", "r2.lan", route, false, &plan, &refusal));
         ASSERT(refusal == NULL);
         const char *const sntrup[] = {"ssh", "-o", "KexAlgorithms=sntrup761x25519-sha512@openssh.com",
-            "-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none", "-o", proxy, "--", "rhett@r2.lan"};
+            "-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none", "-o", proxy, "--", "alice@r2.lan"};
         ASSERT(shell_argv_equal(&plan, sntrup, sizeof(sntrup) / sizeof(sntrup[0])));
-        ASSERT(zcl_native_device_host_shell_argv("/opt/z23/bin/z23", "rhett", "r2.lan", route, true, &plan, &refusal));
+        ASSERT(zcl_native_device_host_shell_argv("/opt/z23/bin/z23", "alice", "r2.lan", route, true, &plan, &refusal));
         const char *const both[] = {"ssh", "-o", "KexAlgorithms=mlkem768x25519-sha256,sntrup761x25519-sha512@openssh.com",
-            "-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none", "-o", proxy, "--", "rhett@r2.lan"};
+            "-o", "StrictHostKeyChecking=yes", "-o", "ControlPath=none", "-o", proxy, "--", "alice@r2.lan"};
         ASSERT(shell_argv_equal(&plan, both, sizeof(both) / sizeof(both[0])));
         struct json_value out = {0};
         ASSERT(zcl_native_device_host_shell_json(&plan, NULL, "/usr/bin/ssh", &out));
@@ -339,7 +340,7 @@ static int shell_run_captured(const struct json_value *input, const char *captur
 static bool shell_run_input(struct json_value *input, const char *route, bool dry)
 {
     json_set_object(input);
-    return json_push_kv_str(input, "user", "rhett") && json_push_kv_str(input, "host", "r2.lan") &&
+    return json_push_kv_str(input, "user", "alice") && json_push_kv_str(input, "host", "r2.lan") &&
         json_push_kv_str(input, "route_input", route) && json_push_kv_bool(input, "dry_run", dry);
 }
 
