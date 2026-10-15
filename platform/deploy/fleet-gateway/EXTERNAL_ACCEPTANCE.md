@@ -20,7 +20,7 @@ relayed message is not acceptance.
 | S4 | Dependency pin | `git ls-tree <S> vendor/tor` equals the pin in the PASS report |
 | S5 | Units serving | `systemctl --user is-active` is `active` for both units |
 | S6 | Reachable from outside | Off-box, a real (non `-k`) TLS client fetches both discovery documents and gets `401` + `WWW-Authenticate` from a credential-less tools/call |
-| S7 | Grant scope | The sign-in requests exactly `brief send evidence`, never more |
+| S7 | Grant scope | The sign-in requests exactly `brief send evidence`, never more. The gateway vocabulary is closed (`brief send evidence terminate deliver wiki-write`; unknown names are refused). `wiki-write` is granted only when the client explicitly lists it in the requested scope; the sign-in page then adds a notice that wiki writes publish PUBLIC knowledge signed by this node, and accepting it does not widen any other grant |
 
 ## The journey (one connection, the client invoking)
 

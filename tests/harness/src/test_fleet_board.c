@@ -4152,6 +4152,237 @@ static int test_fleet_wiki_write_grants(void)
     return failures;
 }
 
+/* Hermetic lifecycle qualification of the wiki MCP tools' native leaves
+ * (fleet.steer.wiki-write / wiki-read / wiki-find) behind the gateway. The
+ * gateway test fixture has no working wiki backend (wiki_* only reaches
+ * WIKI_UNAVAILABLE there), so these run at the registry + RPC layer. */
+static bool fb_lc_write(struct fb_rpc_env *e, const char *grant, const char *key,
+    const char *parent, const char *slug, const char *text, char id[65],
+    bool *replayed, const char *refusal)
+{
+    struct fleet_board_status before, after;
+    if (!db_fleet_board_status(&e->db, 1, &before)) return false;
+    fb_write_wall_ms += ((int64_t)FLEET_BOARD_PUBLIC_QUOTA_WINDOW_SECONDS + 1) * 1000;
+    struct zcl_command_reply reply;
+    fb_wiki_write_call(e, grant, key, parent, slug, text, &reply);
+    bool ok = db_fleet_board_status(&e->db, 1, &after);
+    if (refusal) {
+        ok = ok && reply.status != ZCL_COMMAND_STATUS_PASSED &&
+            !strcmp(reply.error.code, refusal) && !json_get(&reply.data, "revision") &&
+            after.posts == before.posts;
+    } else {
+        const struct json_value *rev = json_get(&reply.data, "revision");
+        const char *found = json_get_str(json_get(rev, "id"));
+        ok = ok && reply.status == ZCL_COMMAND_STATUS_PASSED && found && strlen(found) == 64;
+        if (ok) {
+            if (id) (void)snprintf(id, 65, "%s", found);
+            if (replayed) *replayed = json_get_bool(json_get(rev, "replayed"));
+            ok = after.posts == before.posts + (json_get_bool(json_get(rev, "replayed")) ? 0 : 1);
+        }
+    }
+    if (!ok) fprintf(stderr, "wiki lifecycle write key=%s status=%d code=%s\n",
+        key, (int)reply.status, reply.error.code);
+    zcl_command_reply_free(&reply);
+    return ok;
+}
+
+static bool fb_lc_mixed_text(char *text, bool over)
+{
+    /* '"' + '\n' + U+1F600 repeated: 2730 units * 6 bytes + one 4-byte char
+     * is exactly the 16384-byte limit; over adds a single byte. */
+    size_t n = 0;
+    for (int i = 0; i < 2730; i++) {
+        text[n++] = '"'; text[n++] = '\n';
+        memcpy(text + n, "\xF0\x9F\x98\x80", 4); n += 4;
+    }
+    memcpy(text + n, "\xF0\x9F\x98\x80", 4); n += 4;
+    if (over) text[n++] = 'x';
+    text[n] = '\0';
+    return n == FLEET_BOARD_WIKI_TEXT_MAX + (over ? 1u : 0u);
+}
+
+static bool fb_lc_execute(struct fb_rpc_env *e, const char *grant, const char *key,
+    const char *text, char *wire, size_t wire_cap, enum zcl_command_exit *rc, unsigned *calls)
+{
+    struct json_value input;
+    json_init(&input); json_set_object(&input);
+    bool ready = json_push_kv_str(&input, "grant", grant) &&
+        json_push_kv_str(&input, "request_key", key) &&
+        json_push_kv_str(&input, "expected", "absent") &&
+        json_push_kv_str(&input, "slug", key) &&
+        json_push_kv_str(&input, "title", "Mixed escapes") &&
+        json_push_kv_str(&input, "text", text);
+    const struct zcl_command_registry *reg = zcl_command_catalog();
+    const struct zcl_command_spec *spec = zcl_command_registry_find(reg, "fleet.steer.wiki-write", NULL);
+    struct zcl_command_context ctx = {.registry = reg, .granted_capabilities = ~(uint64_t)0,
+        .authority_ceiling = ZCL_COMMAND_AUTH_OWNER};
+    *rc = ZCL_COMMAND_EXIT_FAILED; *calls = fb_native_rpc_calls;
+    fb_native_test_table = &e->table; node_rpc_client_set_test_hook(fb_native_rpc);
+    fb_write_wall_ms += ((int64_t)FLEET_BOARD_PUBLIC_QUOTA_WINDOW_SECONDS + 1) * 1000;
+    wire[0] = '\0';
+    if (ready) (void)zcl_command_registry_execute_json(reg, spec, &ctx, &input, false,
+        "fleet.steer.wiki-write", "full", 8192, 0, NULL, wire, wire_cap, rc);
+    node_rpc_client_set_test_hook(NULL); fb_native_test_table = NULL;
+    json_free(&input);
+    *calls = fb_native_rpc_calls - *calls;
+    return ready;
+}
+
+static bool fb_lc_accepts_limit(struct fb_rpc_env *e, const char *grant)
+{
+    static char text[FLEET_BOARD_WIKI_TEXT_MAX + 8];
+    static char wire[8193];
+    enum zcl_command_exit rc;
+    unsigned calls;
+    if (!fb_lc_mixed_text(text, false)) return false;
+    bool ok = fb_lc_execute(e, grant, "mixed-ok", text, wire, sizeof(wire), &rc, &calls) &&
+        rc == ZCL_COMMAND_EXIT_OK && calls > 0;
+    struct json_value envelope; json_init(&envelope);
+    ok = ok && json_read(&envelope, wire, strlen(wire)) && fb_wiki_write_stored_body(e, &envelope, text);
+    const char *id = json_get_str(json_get(json_get(json_get(&envelope, "data"), "revision"), "id"));
+    uint8_t raw[32]; struct db_fleet_board_post row;
+    ok = ok && id && fleet_board_id_from_hex(id, raw) && db_fleet_board_post_find(&e->db, raw, &row) &&
+        fb_chunk_reassemble(e, id, &row.post);
+    json_free(&envelope);
+    return ok;
+}
+
+static bool fb_lc_refuses_over(struct fb_rpc_env *e, const char *grant)
+{
+    static char text[FLEET_BOARD_WIKI_TEXT_MAX + 8];
+    static char wire[8193];
+    enum zcl_command_exit rc;
+    unsigned calls;
+    if (!fb_lc_mixed_text(text, true)) return false;
+    bool ok = fb_lc_execute(e, grant, "mixed-over", text, wire, sizeof(wire), &rc, &calls) &&
+        rc == ZCL_COMMAND_EXIT_INVALID && calls == 0 &&
+        strstr(wire, "inline wiki text must be a nonempty UTF-8 string of at most 16384 bytes") &&
+        !strstr(wire, "4096");
+    if (!ok) fprintf(stderr, "wiki lifecycle over-limit rc=%d calls=%u wire=%.400s\n", (int)rc, calls, wire);
+    return ok;
+}
+
+static bool fb_lc_admission(struct fb_rpc_env *e, const char *grant)
+{
+    return fb_lc_accepts_limit(e, grant) && fb_lc_refuses_over(e, grant);
+}
+
+static bool fb_lc_conflicts(struct fb_rpc_env *e, const char *grant)
+{
+    char v1[65], v2[65], again[65];
+    bool replayed = false;
+    if (!fb_lc_write(e, grant, "lc-k1", "absent", "lc-page", "first body", v1, &replayed, NULL) || replayed)
+        return false;
+    /* Same key, same payload: the original revision, no new post. */
+    if (!fb_lc_write(e, grant, "lc-k1", "absent", "lc-page", "first body", again, &replayed, NULL) ||
+        !replayed || strcmp(again, v1)) return false;
+    /* Same key, changed payload: collision, nothing written. */
+    if (!fb_lc_write(e, grant, "lc-k1", "absent", "lc-page", "other body", NULL, NULL,
+                     "WIKI_REQUEST_COLLISION")) return false;
+    /* expected=absent on an existing page refuses. */
+    if (!fb_lc_write(e, grant, "lc-k2", "absent", "lc-page", "second body", NULL, NULL, "WIKI_CONFLICT"))
+        return false;
+    if (!fb_lc_write(e, grant, "lc-k3", v1, "lc-page", "second body", v2, &replayed, NULL) || replayed ||
+        !strcmp(v1, v2)) return false;
+    /* A stale parent refuses once the head moved on. */
+    return fb_lc_write(e, grant, "lc-k4", v1, "lc-page", "third body", NULL, NULL, "WIKI_CONFLICT") &&
+        fb_lc_write(e, grant, "lc-k5", v2, "lc-page", "third body", NULL, NULL, NULL);
+}
+
+enum { FB_LC_PAGES = 19 };
+
+static bool fb_lc_write_pages(struct fb_rpc_env *e, const char *grant)
+{
+    char text[512], id[65];
+    for (int i = 0; i < FB_LC_PAGES; i++) {
+        char slug[16], key[16];
+        (void)snprintf(slug, sizeof(slug), "pg-%02d", i);
+        (void)snprintf(key, sizeof(key), "pgk-%02d", i);
+        fb_entry_json(text, sizeof(text), "paginated lifecycle", FB_ONE_LESSON, "\"z23\"");
+        if (!fb_lc_write(e, grant, key, "absent", slug, text, id, NULL, NULL)) return false;
+    }
+    return true;
+}
+
+/* Entries must continue the ascending pg-NN run exactly where the previous
+ * page stopped: no gap and no duplicate. */
+static bool fb_lc_page_entries(const struct json_value *r, int *total)
+{
+    const struct json_value *entries = json_get(r, "entries");
+    int returned = (int)json_get_int(json_get(r, "returned"));
+    if (returned < 0 || returned > 8) return false;
+    for (int i = 0; i < returned; i++) {
+        char want[16];
+        const char *slug = json_get_str(json_get(json_at(entries, (size_t)i), "slug"));
+        (void)snprintf(want, sizeof(want), "pg-%02d", (*total)++);
+        if (!slug || strcmp(slug, want) != 0) return false;
+    }
+    return returned > 0 || !json_get_bool(json_get(r, "incomplete"));
+}
+
+static bool fb_lc_find_pages(struct fb_rpc_env *e, const char *grant)
+{
+    if (!fb_lc_write_pages(e, grant)) return false;
+    int total = 0, pages = 0;
+    char after[65] = "";
+    for (;;) {
+        struct json_value r;
+        if (!fb_rpc_op(e, "wiki_find", "q", "paginated", after[0] ? "after_slug" : NULL, after, &r))
+            return false;
+        bool incomplete = json_get_bool(json_get(&r, "incomplete"));
+        const char *next = json_get_str(json_get(&r, "after_slug"));
+        bool ok = ++pages <= 8 && fb_lc_page_entries(&r, &total) &&
+            (!incomplete || (next && next[0] && strcmp(next, after) != 0));
+        if (ok && incomplete) (void)snprintf(after, sizeof(after), "%s", next);
+        json_free(&r);
+        if (!ok) return false;
+        if (!incomplete) break;
+    }
+    return total == FB_LC_PAGES && pages >= 3;
+}
+
+static int test_fleet_wiki_write_lifecycle(void)
+{
+    int failures = 0;
+#ifdef _WIN32
+    const char *env = "ZCL_STATE_ROOT";
+#else
+    const char *env = "XDG_STATE_HOME";
+#endif
+    const char *prior = getenv(env);
+    char saved[4096], dir[512], grant[33];
+    bool changed = false, opened = false;
+    static struct fb_rpc_env e;
+    if (prior && strlen(prior) >= sizeof(saved)) return 1;
+    (void)snprintf(saved, sizeof(saved), "%s", prior ? prior : "");
+    static const clock_iface_t clock = {.now_monotonic_ns = fb_room_boundary_mono_ns,
+        .now_wall_ms = fb_write_clock_wall};
+    const clock_iface_t *saved_clock = clock_default();
+    fb_write_wall_ms = INT64_C(1700000000000);
+    clock_set_default(&clock);
+    TEST("wiki lifecycle: retry-safe writes, CAS conflicts, mixed-escape admission at 16384 and paged find") {
+        test_make_tmpdir(dir, sizeof(dir), "fleet_wiki", "lifecycle");
+        ASSERT(platform_environment_set(env, dir, 1) == 0); changed = true;
+        ASSERT(fb_rpc_env_open(&e)); opened = true;
+        e.svc.datadir = dir;
+        ASSERT(fb_chunk_grant_action("mint", "wiki-write", grant));
+        ASSERT(fb_lc_conflicts(&e, grant));
+        ASSERT(fb_lc_admission(&e, grant));
+        ASSERT(fb_lc_find_pages(&e, grant));
+        PASS();
+    } _test_next:;
+    if (opened) fb_rpc_env_close(&e);
+    clock_set_default(saved_clock);
+    if (changed) {
+#ifdef _WIN32
+        if (platform_environment_set(env, saved, 1)) failures++;
+#else
+        if (prior ? platform_environment_set(env, saved, 1) : unsetenv(env)) failures++;
+#endif
+    }
+    return failures;
+}
+
 static int test_fleet_wiki_chunk_grants(void)
 {
     int failures = 0;
@@ -5842,6 +6073,7 @@ static int test_fleet_board_public_no_grant_needed(void)
     failures += test_fleet_wiki_chunks();
     failures += test_fleet_wiki_chunk_grants();
     failures += test_fleet_wiki_write_grants();
+    failures += test_fleet_wiki_write_lifecycle();
     failures += test_fleet_evidence_completion();
     failures += test_fleet_wiki_find_edges();
     failures += test_fleet_wiki_find_page_cap();
