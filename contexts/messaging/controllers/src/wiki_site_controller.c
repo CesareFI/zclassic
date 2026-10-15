@@ -61,10 +61,10 @@ static const char *ws_mount_rest(const char *route, const char **base)
         *base = "/board/wiki";
         return route + 11;
     }
-    /* The root "/wiki" prefix is live only once the core site_routes.def row
-     * for it exists (an owner reseal of core/); until then the HTTPS
-     * dispatch never hands a "/wiki" path to this handler and the public
-     * mount is "/board/wiki". */
+    /* The root "/wiki" prefix is mounted by the wiki row in core's
+     * site_routes.def; "/board/wiki" reaches here through the board
+     * handler. The site boundary rule does not route "/wiki.json", so the
+     * index JSON lives at "/board/wiki.json". */
     if (strncmp(route, "/wiki", 5) == 0) {
         *base = "/wiki";
         return route + 5;

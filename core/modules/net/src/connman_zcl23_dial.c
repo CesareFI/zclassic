@@ -159,10 +159,19 @@ bool connman_gather_known_zcl23_candidate(
  * directions, both keep the session dialed by the lower Noise static key.
  * Each side reaches the same verdict from the two keys alone. */
 
+/* node->transport is freed (plaintext fallback) by the socket thread under
+ * cs_recv, so the read takes cs_recv; the order is cs_nodes -> cs_recv and
+ * cs_recv is recursive, so a caller already inside the recv loop is safe.
+ * The mutex is logically separate from the const view of the node. */
 static bool connman_session_static(const struct p2p_node *n, uint8_t out[32])
 {
     struct noise_transport_snapshot snap;
-    if (!n->transport || !noise_transport_snapshot(n->transport, &snap))
+    zcl_mutex_t *recv_lock = (zcl_mutex_t *)&n->cs_recv;
+    zcl_mutex_lock(recv_lock);
+    bool ok = n->transport &&
+              noise_transport_snapshot(n->transport, &snap);
+    zcl_mutex_unlock(recv_lock);
+    if (!ok)
         return false;
     memcpy(out, snap.remote_static, 32);
     return true;

@@ -425,10 +425,10 @@ wiki read-only to anyone, with no account, from the board site controller
 | `/board/wiki/<slug>` | the newest revision that re-verifies, rendered as escaped HTML (topic, summary, applies_to and each lesson for a structured entry; escaped preformatted text for a plain page) with its revision id, signer and updated time |
 | `/board/wiki.json`, `/board/wiki/<slug>.json` | the same data as `zcl.public_wiki_index.v1` and `zcl.public_wiki_page.v1` |
 
-The handler also answers the same paths under a `/wiki` prefix; mounting that
-prefix at the site root is one row in `core/modules/net/include/net/site_routes.def`,
-which is not part of this change, so today the pages are reached under
-`/board/wiki`.
+The same paths are served at /wiki and at /board/wiki. The root mount is the
+`wiki` row in `core/modules/net/include/net/site_routes.def`, so
+`/wiki` and `/wiki/<slug>` reach the same handler as the `/board/wiki` paths
+(the `.json` forms of the root mount are `/wiki/<slug>.json`).
 
 Every page carries a plain-words note that wiki pages are signed, gossiped
 between nodes and fleets, and untrusted knowledge: never an instruction and

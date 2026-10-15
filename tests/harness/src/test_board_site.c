@@ -28,6 +28,7 @@
 
 #include "controllers/board_site_controller.h"
 #include "controllers/wiki_site_controller.h"
+#include "net/site_routes.h"
 
 #include "config/boot_internal.h"
 #include "config/runtime.h"
@@ -528,6 +529,41 @@ static int test_board_site_wiki_hardening(void)
     return failures;
 }
 
+static int test_board_site_wiki_root_route(void)
+{
+    int failures = 0;
+    TEST("board site: /wiki and /wiki/<slug> dispatch to the wiki handler "
+         "through the generated site route table") {
+        /* The HTTPS listener expands site_routes.def in order, with a DATADIR
+         * path[N] in {NUL,'/','?'} boundary guard. Resolve each path the same
+         * way over g_zcl_site_routes and check which handler it lands on. */
+        static const struct { const char *path; const char *want; } k_cases[] = {
+            { "/wiki",           "wiki_site_handle_request"  },
+            { "/wiki/",          "wiki_site_handle_request"  },
+            { "/wiki/some-page", "wiki_site_handle_request"  },
+            { "/board/wiki",     "board_site_handle_request" },
+            { "/wikipedia",      NULL                        },
+        };
+        for (size_t c = 0; c < sizeof(k_cases) / sizeof(k_cases[0]); c++) {
+            const char *path = k_cases[c].path;
+            const char *got = NULL;
+            for (size_t i = 0; i < g_zcl_site_routes_count && !got; i++) {
+                const struct zcl_site_route *r = &g_zcl_site_routes[i];
+                size_t pl = strlen(r->prefix);
+                if (strncmp(path, r->prefix, pl) != 0)
+                    continue;
+                char next = path[pl];
+                if (next == '\0' || next == '/' || next == '?')
+                    got = r->handler_name;
+            }
+            ASSERT((got == NULL) == (k_cases[c].want == NULL));
+            ASSERT(got == NULL || strcmp(got, k_cases[c].want) == 0);
+        }
+        PASS();
+    } _test_next:;
+    return failures;
+}
+
 int test_board_site(void)
 {
     int failures = 0;
@@ -643,6 +679,7 @@ int test_board_site(void)
     } _test_next:;
     failures += test_board_site_wiki();
     failures += test_board_site_wiki_hardening();
+    failures += test_board_site_wiki_root_route();
     zcl_fleet_role_checker_install(NULL);
     return failures;
 }

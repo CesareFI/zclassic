@@ -124,6 +124,16 @@ SITE_ROUTE(board, "/board", board_site_handle_request, DATADIR,
            NONE, NONE, NONE,
            NULL, NULL, NULL, NULL, NULL, NULL)
 
+/* Public wiki — the signed fleet wiki served read-only at the site root.
+ * The same handler also answers "/board/wiki" (board_site_handle_request
+ * delegates there); this row mounts it at "/wiki" and "/wiki/<slug>" with
+ * the same non-fleet, re-verified rows only. Read-only: no POST surface.
+ * Not in any nav: the wiki is a machine-facing surface first. */
+SITE_ROUTE(wiki, "/wiki", wiki_site_handle_request, DATADIR,
+           0, ZCL_SITE_COST_CHEAP, "",
+           NONE, NONE, NONE,
+           NULL, NULL, NULL, NULL, NULL, NULL)
+
 /* Metaverse — landing, sovereign property catalog, published spaces, and
  * the Living Commons (SIMULATION). Read-only: no POST surface. */
 SITE_ROUTE(metaverse, "/metaverse", metaverse_site_handle_request, DATADIR,
