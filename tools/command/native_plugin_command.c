@@ -1,5 +1,5 @@
 /* Copyright 2026 Rhett Creighton - Apache License 2.0
- * purpose: plugin.pack, plugin.keygen, plugin.install, plugin.list, plugin.switch, plugin.rollback and
+ * purpose: plugin.pack, plugin.keygen, plugin.install, plugin.list, plugin.status, plugin.switch, plugin.rollback and
  *          plugin.run — the signed plugin store under ~/.z23/plugins and the
  *          confined supervisor for one installed plugin. Every refusal
  *          carries a stable PLUGIN_* code and the command that resolves it.
@@ -263,6 +263,53 @@ void zcl_native_handle_plugin_list(const struct zcl_command_request *request,
     (void)json_push_kv_int(&reply->data, "count", (int64_t)count);
     (void)json_push_kv(&reply->data, "plugins", &plugins);
     json_free(&plugins);
+    plugin_store_list_free(infos, count);
+}
+
+/* Read-only: one store scan, no signature verify, no executable hash. The
+ * reply says so in "work" so an operator can see what the call cost. */
+void zcl_native_handle_plugin_status(const struct zcl_command_request *request,
+                                     struct zcl_command_reply *reply)
+{
+    char root[PATH_MAX];
+    if (!plg_begin(request, reply, "status", root, sizeof(root)))
+        return;
+    const char *name = plg_str(request, "name");
+    if (!name || !name[0]) {
+        plg_refuse(reply, PLUGIN_ERR_ARGUMENT, "status", "name is required");
+        return;
+    }
+    struct plugin_info *infos = NULL;
+    size_t count = 0;
+    enum plugin_status st = plugin_store_list(root, &infos, &count);
+    if (st != PLUGIN_OK) {
+        plg_refuse(reply, st, "status", root);
+        return;
+    }
+    const struct plugin_info *hit = NULL;
+    for (size_t i = 0; i < count && !hit; i++)
+        if (strcmp(infos[i].name, name) == 0)
+            hit = &infos[i];
+    if (!hit) {
+        plg_refuse(reply, PLUGIN_ERR_NOT_INSTALLED, "status", name);
+        plugin_store_list_free(infos, count);
+        return;
+    }
+    struct json_value work;
+    json_init(&work);
+    json_set_object(&work);
+    (void)json_push_kv_int(&work, "scanned", (int64_t)count);
+    (void)json_push_kv_int(&work, "verified", 0);
+    (void)json_push_kv_int(&work, "hashed", 0);
+    json_set_object(&reply->data);
+    (void)json_push_kv_str(&reply->data, "schema", "zcl.plugin_status.v1");
+    (void)json_push_kv_str(&reply->data, "name", hit->name);
+    (void)json_push_kv_str(&reply->data, "current", hit->current);
+    (void)json_push_kv_str(&reply->data, "last_good", hit->last_good);
+    (void)json_push_kv_int(&reply->data, "generations",
+                           (int64_t)hit->generation_count);
+    (void)json_push_kv(&reply->data, "work", &work);
+    json_free(&work);
     plugin_store_list_free(infos, count);
 }
 

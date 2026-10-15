@@ -303,6 +303,9 @@ void zcl_native_handle_plugin_install(
 void zcl_native_handle_plugin_list(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);
+void zcl_native_handle_plugin_status(
+    const struct zcl_command_request *request,
+    struct zcl_command_reply *reply);
 void zcl_native_handle_plugin_switch(
     const struct zcl_command_request *request,
     struct zcl_command_reply *reply);

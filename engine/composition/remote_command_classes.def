@@ -1113,7 +1113,7 @@ REMOTE_COMMAND_CLASS("yardsale.buy", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("zses.invite.create", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("zses.invite.accept", REMOTE_CLASS_NEVER, "")
 
-/* PLUGIN — 7 never_remote leaves.
+/* PLUGIN — 8 never_remote leaves.
  *
  * The plugin store decides which executables this machine will later run.
  * Changing it is an owner decision made at the machine; a peer on the mesh
@@ -1122,6 +1122,7 @@ REMOTE_COMMAND_CLASS("plugin.pack", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("plugin.keygen", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("plugin.install", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("plugin.list", REMOTE_CLASS_NEVER, "")
+REMOTE_COMMAND_CLASS("plugin.status", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("plugin.switch", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("plugin.rollback", REMOTE_CLASS_NEVER, "")
 REMOTE_COMMAND_CLASS("plugin.run", REMOTE_CLASS_NEVER, "")

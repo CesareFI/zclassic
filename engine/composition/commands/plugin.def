@@ -93,6 +93,25 @@ ZCL_COMMAND_READY_COMMAND(
     zcl_native_handle_plugin_list)
 
 ZCL_COMMAND_READY_COMMAND(
+    "plugin.status", "plugin", "",
+    "Show one installed plugin's current, last-good and generation count",
+    "Reads ~/.z23/plugins and returns, for the named plugin, the current and "
+    "last-good generation ids, the stored generation count and a work line "
+    "(plugins scanned, signatures verified, executables hashed). It starts "
+    "no run, verifies and hashes nothing, and changes nothing.",
+    ZCL_COMMAND_LIST_BUDGET,
+    "plugin,status,generation,current,last-good",
+    "zcl.plugin_status.input.v1", "zcl.plugin_status.v1", "name", "name",
+    "z23 plugin status hello",
+    ZCL_COMMAND_LAYER_APP, ZCL_COMMAND_EFFECT_READ,
+    ZCL_COMMAND_RISK_READ, ZCL_COMMAND_SCOPE_LOCAL,
+    ZCL_COMMAND_AUTH_OPERATOR, ZCL_COMMAND_MODE_SYNC,
+    ZCL_COMMAND_LATENCY_FAST, ZCL_COMMAND_COST_LOW,
+    ZCL_COMMAND_CONFIRM_NONE, ZCL_COMMAND_LANE_LOCAL,
+    ZCL_COMMAND_CAP_NONE, ZCL_COMMAND_TRAIT_IDEMPOTENT,
+    zcl_native_handle_plugin_status)
+
+ZCL_COMMAND_READY_COMMAND(
     "plugin.switch", "plugin", "",
     "Make an installed plugin generation current",
     "Verifies the named generation again (signature, trust, executable "

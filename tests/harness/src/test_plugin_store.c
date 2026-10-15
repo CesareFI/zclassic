@@ -882,6 +882,18 @@ static int pst_case_commands(void)
         ASSERT(pst_call(zcl_native_handle_plugin_list, "{}", &r));
         ASSERT_EQ(json_get_int(json_get(&r.data, "count")), 1);
         zcl_command_reply_free(&r);
+        ASSERT(pst_call(zcl_native_handle_plugin_status, "{\"name\":\"hello\"}", &r));
+        ASSERT_EQ(r.exit_code, ZCL_COMMAND_EXIT_OK);
+        ASSERT_STR_EQ(json_get_str(json_get(&r.data, "current")), a);
+        ASSERT_STR_EQ(json_get_str(json_get(&r.data, "last_good")), "");
+        ASSERT_EQ(json_get_int(json_get(&r.data, "generations")), 1);
+        ASSERT_EQ(json_get_int(json_get(json_get(&r.data, "work"), "scanned")), 1);
+        ASSERT_EQ(json_get_int(json_get(json_get(&r.data, "work"), "verified")), 0);
+        ASSERT_EQ(json_get_int(json_get(json_get(&r.data, "work"), "hashed")), 0);
+        zcl_command_reply_free(&r);
+        ASSERT(pst_call(zcl_native_handle_plugin_status, "{\"name\":\"ghost\"}", &r));
+        ASSERT_STR_EQ(r.error.code, "PLUGIN_NOT_INSTALLED");
+        zcl_command_reply_free(&r);
     } TEST_END
     if (old_home)
         setenv("HOME", old_home, 1);
@@ -1195,6 +1207,8 @@ static int pst_case_registered(void)
         ASSERT(s && s->handler == zcl_native_handle_plugin_install);
         s = zcl_command_registry_find(reg, "plugin.list", NULL);
         ASSERT(s && s->handler == zcl_native_handle_plugin_list);
+        s = zcl_command_registry_find(reg, "plugin.status", NULL);
+        ASSERT(s && s->handler == zcl_native_handle_plugin_status);
         s = zcl_command_registry_find(reg, "plugin.switch", NULL);
         ASSERT(s && s->handler == zcl_native_handle_plugin_switch);
         s = zcl_command_registry_find(reg, "plugin.rollback", NULL);
