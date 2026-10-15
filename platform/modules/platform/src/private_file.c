@@ -452,6 +452,21 @@ bool platform_private_file_identity(struct platform_private_file *f,
   return true;
 }
 
+/* Stat-identity revalidation is POSIX-only; Windows callers take their full
+ * authority path every time. */
+static bool pf_path_state(const char *path,
+                          struct platform_private_path_state *state) {
+  (void)path;
+  (void)state;
+  return false;
+}
+static bool pf_file_state(struct platform_private_file *f,
+                          struct platform_private_path_state *state) {
+  (void)f;
+  (void)state;
+  return false;
+}
+
 bool platform_private_path_resolve(const char *path, char *resolved, size_t rs,
                                    char *parent, size_t ps) {
   wchar_t input[32768], full[32768];
@@ -895,6 +910,44 @@ bool platform_private_file_identity(struct platform_private_file *f,
   i->file = (uint64_t)st.st_ino;
   return true;
 }
+static void pf_state(const struct stat *st,
+                     struct platform_private_path_state *state) {
+  *state = (struct platform_private_path_state){
+      .volume = (uint64_t)st->st_dev,
+      .file = (uint64_t)st->st_ino,
+      .size = (uint64_t)st->st_size,
+      .mode = (uint64_t)st->st_mode,
+      .owner = (uint64_t)st->st_uid,
+      .links = (uint64_t)st->st_nlink,
+#if defined(__APPLE__)
+      .modified_ns = (int64_t)st->st_mtimespec.tv_sec * 1000000000 +
+                     st->st_mtimespec.tv_nsec,
+      .changed_ns = (int64_t)st->st_ctimespec.tv_sec * 1000000000 +
+                    st->st_ctimespec.tv_nsec,
+#else
+      .modified_ns = (int64_t)st->st_mtim.tv_sec * 1000000000 +
+                     st->st_mtim.tv_nsec,
+      .changed_ns = (int64_t)st->st_ctim.tv_sec * 1000000000 +
+                    st->st_ctim.tv_nsec,
+#endif
+  };
+}
+static bool pf_path_state(const char *path,
+                          struct platform_private_path_state *state) {
+  struct stat st;
+  if (!path || !state || lstat(path, &st) != 0)
+    return false;
+  pf_state(&st, state);
+  return true;
+}
+static bool pf_file_state(struct platform_private_file *f,
+                          struct platform_private_path_state *state) {
+  struct stat st;
+  if (!f || !state || (int)f->native < 0 || fstat(pf_fd(f), &st) != 0)
+    return false;
+  pf_state(&st, state);
+  return true;
+}
 bool platform_private_path_resolve(const char *p, char *r, size_t rs,
                                    char *parent, size_t ps) {
   if (!p || p[0] != '/')
@@ -989,4 +1042,14 @@ bool platform_private_file_open_observation(const char *path,
 bool platform_private_file_create_locked(const char *path,
                                          struct platform_private_file *file) {
   return pf_create_locked(path, file);
+}
+
+/* One public metadata entry point per kind; POSIX stats, Windows refuses. */
+bool platform_private_path_state(const char *path,
+                                 struct platform_private_path_state *state) {
+  return pf_path_state(path, state);
+}
+bool platform_private_file_state(struct platform_private_file *file,
+                                 struct platform_private_path_state *state) {
+  return pf_file_state(file, state);
 }

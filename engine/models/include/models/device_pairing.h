@@ -204,8 +204,42 @@ bool device_pairing_guard_acquire_host_psk(struct device_pairing_store *store,
     enum device_pairing_host_direction direction, uint16_t port,
     struct device_pairing_guard *guard);
 void device_pairing_psk_snapshot_destroy(struct device_pairing_psk_snapshot *snapshot);
+/* Per-session revalidation memo for device_pairing_guard_acquire_host_psk.
+ * A full acquisition retains the grant file it read (pinning its inode) and
+ * records directory and grant metadata. A later acquisition with identical
+ * arguments still opens authority.lock and takes the same shared lock, then
+ * accepts the remembered row only if, under that lock, the directory and grant
+ * path stats are unchanged, no <grant>.pending intent exists and the last full
+ * read is under DEVICE_PAIRING_GUARD_CACHE_NS old. Every grant mutation
+ * renames a freshly created inode over the path, so a committed revoke,
+ * rotation or upgrade always misses and the full acquisition decides.
+ * Zero-initialized storage is empty. One owner; never copy a live memo. */
+enum { DEVICE_PAIRING_GUARD_CACHE_NS = 250000000 };
+struct device_pairing_guard_cache {
+    struct platform_private_file grant;
+    struct platform_private_path_state directory, grant_state;
+    struct db_device_pairing row;
+    struct device_pairing_psk_binding binding;
+    const struct device_pairing_store *store;
+    int64_t validated_ns;
+    uint8_t root[32], peer[32], expected_root[32];
+    enum device_pairing_host_direction direction;
+    uint16_t port;
+    bool valid;
+};
+/* Same contract and refusals as device_pairing_guard_acquire_host_psk; a NULL
+ * cache always takes the full path. Any miss or refusal empties the cache. */
+bool device_pairing_guard_acquire_host_psk_cached(struct device_pairing_store *store,
+    const uint8_t peer[32], const uint8_t expected_root[32], uint64_t now,
+    const struct device_pairing_psk_binding *binding,
+    enum device_pairing_host_direction direction, uint16_t port,
+    struct device_pairing_guard_cache *cache, struct device_pairing_guard *guard);
+/* Closes the retained grant and wipes the memo; safe on empty storage. */
+void device_pairing_guard_cache_destroy(struct device_pairing_guard_cache *cache);
 #ifdef ZCL_TESTING
 /* One-shot interruption of the actual durable publication sequence. */
 void device_pairing_test_interrupt(unsigned stage);
+/* Process-wide counts of full grant acquisitions and cheap revalidations. */
+void device_pairing_test_guard_counts(uint64_t *full, uint64_t *cached);
 #endif
 #endif

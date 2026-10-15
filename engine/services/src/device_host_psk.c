@@ -65,12 +65,14 @@ void device_host_psk_fail(struct device_host_psk_session *session, enum device_h
     if (result != DEVICE_HOST_PSK_REFUSED && result != DEVICE_HOST_PSK_DEADLINE && result != DEVICE_HOST_PSK_CANCELLED)
         result = DEVICE_HOST_PSK_REFUSED;
     if (session->borrowed_guard) device_pairing_guard_release(session->borrowed_guard);
+    device_pairing_guard_cache_destroy(&session->authority);
     memory_cleanse(session, sizeof(*session)); session->phase = DEVICE_HOST_PSK_FAILED; session->terminal = result;
 }
 void device_host_psk_destroy(struct device_host_psk_session *session)
 {
     if (!session) return;
     if (session->borrowed_guard) device_pairing_guard_release(session->borrowed_guard);
+    device_pairing_guard_cache_destroy(&session->authority);
     memory_cleanse(session, sizeof(*session));
 }
 void device_host_psk_init(struct device_host_psk_session *session)
@@ -116,9 +118,9 @@ static enum device_host_psk_result psk_release_boundary(struct device_host_psk_s
 }
 static bool psk_authorize(struct device_host_psk_session *session, struct device_pairing_guard *guard)
 {
-    return device_pairing_guard_acquire_host_psk(session->spec.store, session->spec.peer,
+    return device_pairing_guard_acquire_host_psk_cached(session->spec.store, session->spec.peer,
         session->spec.approved_root, psk_wall(), &session->snapshot.row.host_scope.binding.psk,
-        session->spec.direction, session->spec.port, guard);
+        session->spec.direction, session->spec.port, &session->authority, guard);
 }
 static bool psk_model_guard_matches(const struct device_host_psk_session *session,
     const struct device_pairing_guard *guard)

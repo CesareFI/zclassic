@@ -37,6 +37,7 @@ struct device_host_psk_spec {
 struct device_host_psk_session {
     struct device_host_psk_spec spec;
     struct device_pairing_psk_snapshot snapshot;
+    struct device_pairing_guard_cache authority; /* Owned revalidation memo; wiped with the session. */
     struct shake_wrap_state send, receive;
     uint8_t transcript[DEVICE_HOST_PSK_TRANSCRIPT], t0[64], t1[64], prk[32];
     uint8_t client[32], server[32], nonce[32];

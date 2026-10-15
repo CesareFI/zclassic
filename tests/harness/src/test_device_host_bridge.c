@@ -1355,6 +1355,151 @@ static int psk_io_typed_outputs(void)
     } TEST_END
     device_pairing_guard_release(&guard); psk_io_fixture_close(&f); return failures;
 }
+/* Mode 0 revokes, 1 rotates, 2 strands a stage-1 publication intent while the
+ * grant bytes and inode stay unchanged. Each commits between steps, with no
+ * guard held, so no record is in progress and nothing more may cross. */
+static bool psk_io_change_server(struct psk_io_fixture *f, unsigned mode)
+{
+    const struct device_host_psk_spec *s = &f->server_spec.session;
+    enum device_pairing_publication publication = DEVICE_PAIRING_NOT_PUBLISHED;
+    if (mode == 0) return db_device_pairing_revoke_expected(s->store, s->peer, 150, s->approved_root, &publication) &&
+        publication == DEVICE_PAIRING_DURABLE;
+    if (mode == 2) {
+        device_pairing_test_interrupt(1);
+        bool published = db_device_pairing_revoke_expected(s->store, s->peer, 150, s->approved_root, &publication);
+        device_pairing_test_interrupt(0);
+        return !published;
+    }
+    struct db_device_pairing next = f->row[1]; struct device_pairing_psk_publication report;
+    next.host_scope.binding.psk.credential_id[0] = 92; next.host_scope.binding.psk.key_epoch = 2;
+    uint8_t secret[32] = {18}, proposal[32];
+    return device_pairing_host_proposal_root(&next, proposal) &&
+        db_device_pairing_rotate_host_psk(s->store, &next, secret, proposal, s->approved_root, 150, &report) &&
+        report.grant == DEVICE_PAIRING_DURABLE;
+}
+static int psk_io_midstream_authority(unsigned mode)
+{
+    int failures = 0; struct psk_io_fixture f; psk_io_fixture_init(&f);
+    TEST_CASE("host PSK IO: revoke, rotation or stranded intent committed mid-stream stops every further server record") {
+        ASSERT(psk_io_fixture_open(&f, 0, false)); ASSERT(psk_io_fixture_admit(&f)); ASSERT(psk_io_fixture_ready(&f));
+        uint8_t bytes[4096]; for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = (uint8_t)(i * 7 + mode);
+        uint64_t cached0 = 0, cached1 = 0; device_pairing_test_guard_counts(NULL, &cached0);
+        for (unsigned i = 0; i < 4; ++i) {
+            ASSERT(psk_io_transfer(&f, f.plain[0], f.target, bytes, sizeof(bytes)));
+            ASSERT(psk_io_transfer(&f, f.target, f.plain[0], bytes, sizeof(bytes)));
+        }
+        device_pairing_test_guard_counts(NULL, &cached1); ASSERT(cached1 > cached0);
+        ASSERT_EQ(send(f.plain[0], bytes, sizeof(bytes), MSG_NOSIGNAL), sizeof(bytes));
+        ASSERT_EQ(send(f.target, bytes, sizeof(bytes), MSG_NOSIGNAL), sizeof(bytes));
+        for (unsigned i = 0; i < 8; ++i) ASSERT(psk_io_live_result(typed_test_device_host_psk_bridge_step(&f.client)));
+        ASSERT(psk_io_change_server(&f, mode));
+        struct device_host_psk_bridge_observation before = f.server.observation;
+        enum device_host_bridge_result result = DEVICE_HOST_BRIDGE_PROGRESS;
+        for (unsigned i = 0; i < 64 && psk_io_live_result(result); ++i) {
+            result = typed_test_device_host_psk_bridge_step(&f.server);
+            if (f.client.active) (void)typed_test_device_host_psk_bridge_step(&f.client);
+        }
+        ASSERT_EQ(result, DEVICE_HOST_BRIDGE_REFUSED); ASSERT(!f.server.active);
+        ASSERT_EQ(f.server.observation.carrier_read_bytes, before.carrier_read_bytes);
+        ASSERT_EQ(f.server.observation.carrier_written_bytes, before.carrier_written_bytes);
+        ASSERT_EQ(f.server.observation.plaintext_read_bytes, before.plaintext_read_bytes);
+        ASSERT_EQ(f.server.observation.plaintext_written_bytes, before.plaintext_written_bytes);
+    } TEST_END
+    psk_io_fixture_close(&f); return failures;
+}
+/* Bounded throughput witness: both bridges run their own poll loop on a thread,
+ * as the receiver and client processes do. Default 4 MiB per direction keeps
+ * t-fast under its budget; ZCL_DEVICE_HOST_BENCH_MIB (1..256) sizes a
+ * measurement run. Prints MiB/s and authority acquisitions per 4 KiB record. */
+enum { PSK_BENCH_PATTERN = 65536 };
+struct psk_bench_pump { int fd; size_t total, moved; const uint8_t *pattern; bool ok; };
+static void *psk_bench_run(void *opaque)
+{
+    struct device_host_psk_bridge *bridge = opaque; enum device_host_bridge_result status;
+    (void)device_host_psk_bridge_run(bridge, &status); return NULL;
+}
+static bool psk_bench_poll(int fd, short events)
+{
+    struct pollfd event = {.fd = fd, .events = events};
+    int ready = poll(&event, 1, 100);
+    return ready >= 0 || errno == EINTR;
+}
+static void *psk_bench_write(void *opaque)
+{
+    struct psk_bench_pump *pump = opaque; int64_t deadline = clock_now_monotonic_ns() + INT64_C(30000000000);
+    while (pump->moved < pump->total && clock_now_monotonic_ns() < deadline) {
+        size_t offset = pump->moved % PSK_BENCH_PATTERN, size = PSK_BENCH_PATTERN - offset;
+        if (size > pump->total - pump->moved) size = pump->total - pump->moved;
+        ssize_t n = send(pump->fd, pump->pattern + offset, size, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n > 0) pump->moved += (size_t)n;
+        else if ((n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) ||
+            !psk_bench_poll(pump->fd, POLLOUT)) return NULL;
+    }
+    pump->ok = pump->moved == pump->total && shutdown(pump->fd, SHUT_WR) == 0; return NULL;
+}
+static bool psk_bench_read(int fd, size_t total, const uint8_t *pattern)
+{
+    static uint8_t buffer[PSK_BENCH_PATTERN]; size_t seen = 0;
+    int64_t deadline = clock_now_monotonic_ns() + INT64_C(30000000000);
+    while (clock_now_monotonic_ns() < deadline) {
+        size_t offset = seen % PSK_BENCH_PATTERN;
+        ssize_t n = recv(fd, buffer, PSK_BENCH_PATTERN - offset, MSG_DONTWAIT);
+        if (n == 0) return seen == total;
+        if (n > 0) {
+            if (memcmp(buffer, pattern + offset, (size_t)n)) return false;
+            seen += (size_t)n;
+        } else if ((errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) || !psk_bench_poll(fd, POLLIN)) return false;
+    }
+    return false;
+}
+static bool psk_bench_direction(int source, int destination, size_t total, const uint8_t *pattern, double *mib_per_s)
+{
+    struct psk_bench_pump pump = {.fd = source, .total = total, .pattern = pattern}; pthread_t writer;
+    int64_t start = clock_now_monotonic_ns();
+    if (pthread_create(&writer, NULL, psk_bench_write, &pump)) return false;
+    bool ok = psk_bench_read(destination, total, pattern);
+    int64_t elapsed = clock_now_monotonic_ns() - start;
+    pthread_join(writer, NULL);
+    *mib_per_s = elapsed > 0 ? ((double)total / 1048576.0) / ((double)elapsed / 1e9) : 0.0;
+    return ok && pump.ok;
+}
+static size_t psk_bench_size(void)
+{
+    const char *text = getenv("ZCL_DEVICE_HOST_BENCH_MIB");
+    unsigned long mib = text && *text ? strtoul(text, NULL, 10) : 4;
+    if (mib < 1 || mib > 256) mib = 4;
+    return (size_t)mib << 20;
+}
+static int psk_io_throughput(void)
+{
+    int failures = 0; struct psk_io_fixture f; psk_io_fixture_init(&f);
+    static uint8_t pattern[PSK_BENCH_PATTERN];
+    for (size_t i = 0; i < sizeof(pattern); ++i) pattern[i] = (uint8_t)(i * 131u + (i >> 9));
+    TEST_CASE("host PSK IO throughput: threaded receiver/client bridge pair moves bounded duplex bytes intact") {
+        ASSERT(psk_io_fixture_open(&f, 0, false));
+        int64_t deadline = psk_io_fixture_mono(&f) + INT64_C(60000000000);
+        f.client_spec.session.deadline_ns = f.server_spec.session.deadline_ns = deadline;
+        ASSERT(psk_io_fixture_admit(&f)); ASSERT(psk_io_fixture_ready(&f));
+        size_t total = psk_bench_size(); uint64_t full0 = 0, cached0 = 0, full1 = 0, cached1 = 0;
+        device_pairing_test_guard_counts(&full0, &cached0);
+        pthread_t client, server; double forward = 0, reverse = 0;
+        ASSERT_EQ(pthread_create(&client, NULL, psk_bench_run, &f.client), 0);
+        ASSERT_EQ(pthread_create(&server, NULL, psk_bench_run, &f.server), 0);
+        bool forward_ok = psk_bench_direction(f.plain[0], f.target, total, pattern, &forward);
+        bool reverse_ok = forward_ok && psk_bench_direction(f.target, f.plain[0], total, pattern, &reverse);
+        if (!reverse_ok) atomic_store(&f.cancelled, true);
+        pthread_join(client, NULL); pthread_join(server, NULL);
+        device_pairing_test_guard_counts(&full1, &cached1);
+        ASSERT(forward_ok); ASSERT(reverse_ok);
+        ASSERT_EQ(f.client.observation.result, DEVICE_HOST_BRIDGE_EOF); ASSERT_EQ(f.server.observation.result, DEVICE_HOST_BRIDGE_EOF);
+        double records = (double)(2 * ((total + 4095) / 4096));
+        printf("\n[device_host_psk throughput] MiB/direction=%zu forward=%.1f MiB/s reverse=%.1f MiB/s"
+            " records=%.0f full_acquisitions=%llu (%.3f/record) cached_acquisitions=%llu (%.3f/record)\n", total >> 20, forward, reverse,
+            records, (unsigned long long)(full1 - full0), (double)(full1 - full0) / records,
+            (unsigned long long)(cached1 - cached0), (double)(cached1 - cached0) / records);
+    } TEST_END
+    psk_io_fixture_close(&f); return failures;
+}
 int test_device_host_bridge(void);
 int test_device_host_bridge(void)
 {
@@ -1370,7 +1515,8 @@ int test_device_host_bridge(void)
         psk_io_preflight_refusals() + psk_io_explicit_backup() + psk_io_partial_ciphertext() +
         psk_io_deadline_expiry() + psk_io_deadline_handshake() + psk_io_deadline_phase_ceiling() + psk_io_deadline_borrowed() +
         psk_io_poll_interest() + psk_io_poll_stalled_hup() + psk_io_poll_pending_hup() + psk_io_poll_reverse_fin();
-    failures += psk_io_typed_outputs();
+    failures += psk_io_typed_outputs() + psk_io_midstream_authority(0) + psk_io_midstream_authority(1) +
+        psk_io_midstream_authority(2) + psk_io_throughput();
     return failures + (int)typed_state_failures;
 }
 #else

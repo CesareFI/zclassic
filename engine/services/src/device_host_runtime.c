@@ -277,6 +277,7 @@ static enum device_host_bridge_result runtime_dial(const struct device_host_runt
     struct sockaddr_in selected = {.sin_family = AF_INET, .sin_port = htons(spec->route_port),
         .sin_addr.s_addr = spec->route_address_be};
     *carrier = platform_socket_open(AF_INET, SOCK_STREAM, 0, true, true);
+    if (*carrier >= 0) (void)platform_socket_set_no_delay(*carrier, true); /* Small records must not wait on Nagle. */
     int rc = *carrier >= 0 ? connect(*carrier, (struct sockaddr *)&selected, sizeof(selected)) : -1;
     int error = errno; device_pairing_guard_release(&guard);
     if (rc == 0) return DEVICE_HOST_BRIDGE_READY;
@@ -483,6 +484,7 @@ static void runtime_admit(const struct device_host_runtime_receiver_spec *spec,
     if (!platform_socket_set_nonblocking(carrier, true) || fcntl(carrier, F_SETFD, FD_CLOEXEC) != 0) {
         out->error_number = errno; ++out->refused; ++out->preauth_refused; platform_socket_close(carrier); return;
     }
+    (void)platform_socket_set_no_delay(carrier, true);
     runtime_slot_init(slot, &spec->common, deadline);
     struct device_host_psk_bridge_spec bridge_spec = runtime_bridge_spec(&spec->common,
         DEVICE_PAIRING_HOST_INBOUND, carrier, slot->deadline);

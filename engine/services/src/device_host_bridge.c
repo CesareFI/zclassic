@@ -482,9 +482,9 @@ static enum device_host_bridge_result psk_io_authorize(struct device_host_psk_br
     if (result != DEVICE_HOST_BRIDGE_READY) return result;
     int64_t ms = clock_now_wall_ms();
     if (ms <= 0) return DEVICE_HOST_BRIDGE_REFUSED;
-    if (!device_pairing_guard_acquire_host_psk(bridge->spec.session.store, bridge->spec.session.peer,
+    if (!device_pairing_guard_acquire_host_psk_cached(bridge->spec.session.store, bridge->spec.session.peer,
         bridge->spec.session.approved_root, (uint64_t)ms / 1000, &bridge->session.snapshot.row.host_scope.binding.psk,
-        bridge->spec.session.direction, bridge->spec.session.port, guard)) return DEVICE_HOST_BRIDGE_REFUSED;
+        bridge->spec.session.direction, bridge->spec.session.port, &bridge->session.authority, guard)) return DEVICE_HOST_BRIDGE_REFUSED;
     result = psk_io_action_limit(bridge, guard);
     if (result != DEVICE_HOST_BRIDGE_READY) device_pairing_guard_release(guard);
     return result;
@@ -593,6 +593,7 @@ static enum device_host_bridge_result psk_io_connect_start(struct device_host_ps
     if (bridge->target_fd < 0) {
         bridge->observation.error_number = errno; device_pairing_guard_release(&guard); return DEVICE_HOST_BRIDGE_IO_ERROR;
     }
+    (void)platform_socket_set_no_delay(bridge->target_fd, true); /* Records are released whole; never Nagle-delay them. */
     struct sockaddr_in target = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = htons(bridge->spec.session.port)};
     result = psk_io_action_limit(bridge, &guard);
     if (result != DEVICE_HOST_BRIDGE_READY) { device_pairing_guard_release(&guard); return result; }

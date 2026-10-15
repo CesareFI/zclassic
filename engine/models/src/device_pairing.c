@@ -5,6 +5,7 @@
 #include "base/serialize_le.h"
 #include "base/cleanse.h"
 #include "net/v2_identity.h"
+#include "platform/clock.h"
 #include "platform/private_directory.h"
 #include "sha3/sha3.h"
 #include "util/log_macros.h"
@@ -18,11 +19,21 @@ enum { DEVICE_PAIRING_V1_WIRE = 168, DEVICE_PAIRING_V2_WIRE = 176,
 static const uint8_t pairing_magic[8] = {'Z','2','3','D','E','V',2,0};
 
 #ifdef ZCL_TESTING
+#include <stdatomic.h>
 static _Thread_local unsigned interruption_stage;
+static atomic_ullong test_full_acquisitions, test_cached_acquisitions;
 void device_pairing_test_interrupt(unsigned stage)
 {
     interruption_stage = stage;
 }
+void device_pairing_test_guard_counts(uint64_t *full, uint64_t *cached)
+{
+    if (full) *full = atomic_load_explicit(&test_full_acquisitions, memory_order_relaxed);
+    if (cached) *cached = atomic_load_explicit(&test_cached_acquisitions, memory_order_relaxed);
+}
+#define DEVICE_PAIRING_TEST_COUNT(counter) atomic_fetch_add_explicit(&(counter), 1, memory_order_relaxed)
+#else
+#define DEVICE_PAIRING_TEST_COUNT(counter) ((void)0)
 #endif
 
 static bool publication_checkpoint(unsigned stage)
@@ -352,8 +363,9 @@ static bool wire_length_supported(uint64_t size)
         size == DEVICE_PAIRING_GUEST_WIRE || size == DEVICE_PAIRING_WIRE || size == DEVICE_PAIRING_HOST_WIRE;
 }
 
-static bool read_exact_locked(struct device_pairing_store *store,
-    const uint8_t peer[32], struct db_device_pairing *row, uint8_t root[32])
+/* A non-NULL retain receives the descriptor that was actually read. */
+static bool read_exact_retain(struct device_pairing_store *store, const uint8_t peer[32],
+    struct db_device_pairing *row, uint8_t root[32], struct platform_private_file *retain)
 {
     char path[1200];
     if (!record_path(store, peer, path) || !publication_absent(path)) return false;
@@ -366,12 +378,18 @@ static bool read_exact_locked(struct device_pairing_store *store,
     bool ok = platform_private_file_size(&file, &size) &&
               wire_length_supported(size) &&
               platform_private_file_read_at(&file, wire, (size_t)size, 0);
-    platform_private_file_close(&file);
-    if (!ok || !decode(wire, (size_t)size, row) || !bound(store, row) ||
-        memcmp(peer, row->peer_key, 32))
+    ok = ok && decode(wire, (size_t)size, row) && bound(store, row) && !memcmp(peer, row->peer_key, 32);
+    if (ok && retain) *retain = file;
+    else platform_private_file_close(&file);
+    if (!ok)
         LOG_FAIL("device_pairing", "grant read or identity binding failed");
     if (root) zcl_sha3_256(wire, (size_t)size, root);
     return true;
+}
+static bool read_exact_locked(struct device_pairing_store *store,
+    const uint8_t peer[32], struct db_device_pairing *row, uint8_t root[32])
+{
+    return read_exact_retain(store, peer, row, root, NULL);
 }
 
 static bool read_locked(struct device_pairing_store *store,
@@ -756,14 +774,15 @@ static bool guard_arguments_valid(struct device_pairing_store *store,
         !(required & ~DEVICE_PAIRING_CAP_KNOWN);
 }
 
-static bool guard_acquire_capability(struct device_pairing_store *store,
+static bool guard_acquire_retain(struct device_pairing_store *store,
     const uint8_t peer_key[32], uint64_t now, uint64_t required,
-    struct device_pairing_guard *guard)
+    struct device_pairing_guard *guard, struct platform_private_file *retain)
 {
     if (!guard_arguments_valid(store, peer_key, now, required, guard))
         LOG_FAIL("device_pairing", "invalid guard argument");
     if (!lock_store(store, guard, true)) return false;
-    bool ok = read_exact_locked(store, peer_key, &guard->row, guard->root) &&
+    DEVICE_PAIRING_TEST_COUNT(test_full_acquisitions);
+    bool ok = read_exact_retain(store, peer_key, &guard->row, guard->root, retain) &&
         now >= guard->row.paired_at && now < guard->row.expires_at &&
         !guard->row.revoked_at && !guard->row.generation &&
         (guard->row.capabilities & required) == required;
@@ -772,6 +791,12 @@ static bool guard_acquire_capability(struct device_pairing_store *store,
         LOG_FAIL("device_pairing", "required capability grant unavailable or inactive");
     }
     return true;
+}
+static bool guard_acquire_capability(struct device_pairing_store *store,
+    const uint8_t peer_key[32], uint64_t now, uint64_t required,
+    struct device_pairing_guard *guard)
+{
+    return guard_acquire_retain(store, peer_key, now, required, guard, NULL);
 }
 
 bool device_pairing_guard_acquire_capability(struct device_pairing_store *store,
@@ -931,15 +956,15 @@ static bool psk_scope_matches(const struct device_pairing_guard *guard,
     return guard->row.host_scope.binding.backend_profile == DEVICE_PAIRING_HOST_SHAKE256_WRAP_PSK &&
         !memcmp(guard->root, expected_root, 32) && port == permitted;
 }
-static bool psk_scope_acquire(struct device_pairing_store *store, const uint8_t peer[32],
+static bool psk_scope_retain(struct device_pairing_store *store, const uint8_t peer[32],
     const uint8_t expected_root[32], uint64_t now, enum device_pairing_host_direction direction,
-    uint16_t port, struct device_pairing_guard *guard)
+    uint16_t port, struct device_pairing_guard *guard, struct platform_private_file *retain)
 {
     if (!guard) LOG_FAIL("device_pairing", "missing PSK guard");
     memset(guard, 0, sizeof(*guard));
     if (!expected_root || !port || (direction != DEVICE_PAIRING_HOST_INBOUND && direction != DEVICE_PAIRING_HOST_OUTBOUND))
         LOG_FAIL("device_pairing", "PSK guard requires root, exact direction and nonzero port");
-    if (!guard_acquire_capability(store, peer, now, DEVICE_PAIRING_CAP_HOST_FORWARD, guard)) {
+    if (!guard_acquire_retain(store, peer, now, DEVICE_PAIRING_CAP_HOST_FORWARD, guard, retain)) {
         int error = errno;
         LOG_RETURN((errno = error, false), "device_pairing", "current PSK host-forward capability guard unavailable");
     }
@@ -949,20 +974,113 @@ static bool psk_scope_acquire(struct device_pairing_store *store, const uint8_t 
     }
     return true;
 }
+static bool psk_scope_acquire(struct device_pairing_store *store, const uint8_t peer[32],
+    const uint8_t expected_root[32], uint64_t now, enum device_pairing_host_direction direction,
+    uint16_t port, struct device_pairing_guard *guard)
+{
+    return psk_scope_retain(store, peer, expected_root, now, direction, port, guard, NULL);
+}
+static bool host_psk_retain(struct device_pairing_store *store,
+    const uint8_t peer[32], const uint8_t expected_root[32], uint64_t now,
+    const struct device_pairing_psk_binding *binding,
+    enum device_pairing_host_direction direction, uint16_t port,
+    struct device_pairing_guard *guard, struct platform_private_file *retain)
+{
+    if (!guard) LOG_FAIL("device_pairing", "missing PSK guard");
+    memset(guard, 0, sizeof(*guard));
+    if (!binding || !psk_binding_valid(binding)) LOG_FAIL("device_pairing", "invalid PSK binding");
+    if (!psk_scope_retain(store, peer, expected_root, now, direction, port, guard, retain)) return false;
+    if (!psk_binding_equal(binding, &guard->row.host_scope.binding.psk)) {
+        device_pairing_guard_release(guard);
+        LOG_FAIL("device_pairing", "PSK credential/epoch/endpoint binding mismatch");
+    }
+    return true;
+}
 bool device_pairing_guard_acquire_host_psk(struct device_pairing_store *store,
     const uint8_t peer[32], const uint8_t expected_root[32], uint64_t now,
     const struct device_pairing_psk_binding *binding,
     enum device_pairing_host_direction direction, uint16_t port,
     struct device_pairing_guard *guard)
 {
-    if (!guard) LOG_FAIL("device_pairing", "missing PSK guard");
-    memset(guard, 0, sizeof(*guard));
-    if (!binding || !psk_binding_valid(binding)) LOG_FAIL("device_pairing", "invalid PSK binding");
-    if (!psk_scope_acquire(store, peer, expected_root, now, direction, port, guard)) return false;
-    if (!psk_binding_equal(binding, &guard->row.host_scope.binding.psk)) {
-        device_pairing_guard_release(guard);
-        LOG_FAIL("device_pairing", "PSK credential/epoch/endpoint binding mismatch");
+    return host_psk_retain(store, peer, expected_root, now, binding, direction, port, guard, NULL);
+}
+void device_pairing_guard_cache_destroy(struct device_pairing_guard_cache *cache)
+{
+    if (!cache) return;
+    if (cache->valid) platform_private_file_close(&cache->grant);
+    memory_cleanse(cache, sizeof(*cache));
+}
+static bool cache_arguments_match(const struct device_pairing_guard_cache *cache,
+    const struct device_pairing_store *store, const uint8_t peer[32], const uint8_t expected_root[32],
+    const struct device_pairing_psk_binding *binding, enum device_pairing_host_direction direction, uint16_t port)
+{
+    return cache->valid && cache->store == store && peer && expected_root && !memcmp(cache->peer, peer, 32) &&
+        !memcmp(cache->expected_root, expected_root, 32) && psk_binding_equal(&cache->binding, binding) &&
+        cache->direction == direction && cache->port == port;
+}
+static bool cache_fresh(const struct device_pairing_guard_cache *cache, uint64_t now)
+{
+    int64_t mono = clock_now_monotonic_ns();
+    return now && mono > 0 && mono >= cache->validated_ns &&
+        mono - cache->validated_ns < DEVICE_PAIRING_GUARD_CACHE_NS &&
+        now >= cache->row.paired_at && now < cache->row.expires_at;
+}
+static bool state_equal(const char *path, const struct platform_private_path_state *expected)
+{
+    struct platform_private_path_state actual;
+    return platform_private_path_state(path, &actual) && !memcmp(&actual, expected, sizeof(actual));
+}
+/* Under the freshly taken shared authority lock no publisher can be between
+ * intent and retirement, so an unchanged grant inode/metadata plus an absent
+ * intent means the bytes the full acquisition validated are still current. */
+static bool cache_revalidate(struct device_pairing_guard_cache *cache, struct device_pairing_store *store,
+    const uint8_t peer[32], struct device_pairing_guard *guard)
+{
+    char lock[1200], grant[1200], pending[1240];
+    int n = snprintf(lock, sizeof(lock), "%s/authority.lock", store->directory);
+    if (n < 0 || (size_t)n >= sizeof(lock) || !record_path(store, peer, grant)) return false; // raw-return-ok:cache miss; the full acquisition logs
+    n = snprintf(pending, sizeof(pending), "%s.pending", grant);
+    if (n < 0 || (size_t)n >= sizeof(pending) || !state_equal(store->directory, &cache->directory)) return false; // raw-return-ok:cache miss; the full acquisition logs
+    platform_private_file_init(&guard->lock);
+    if (!platform_private_file_open_observation(lock, &guard->lock)) return false; // raw-return-ok:cache miss; the full acquisition logs
+    guard->held = true;
+    if (!platform_private_path_absent(pending) || !state_equal(grant, &cache->grant_state)) {
+        device_pairing_guard_release(guard); return false; // raw-return-ok:cache miss; the full acquisition logs
     }
+    guard->row = cache->row; memcpy(guard->root, cache->root, 32);
+    DEVICE_PAIRING_TEST_COUNT(test_cached_acquisitions);
+    return true;
+}
+static void cache_remember(struct device_pairing_guard_cache *cache, struct device_pairing_store *store,
+    const uint8_t peer[32], const uint8_t expected_root[32], const struct device_pairing_psk_binding *binding,
+    enum device_pairing_host_direction direction, uint16_t port,
+    const struct device_pairing_guard *guard, struct platform_private_file *retained)
+{
+    struct device_pairing_guard_cache next = {.grant = *retained, .row = guard->row, .binding = *binding,
+        .store = store, .validated_ns = clock_now_monotonic_ns(), .direction = direction, .port = port};
+    memcpy(next.root, guard->root, 32); memcpy(next.peer, peer, 32); memcpy(next.expected_root, expected_root, 32);
+    next.valid = next.validated_ns > 0 && platform_private_file_state(retained, &next.grant_state) &&
+        platform_private_path_state(store->directory, &next.directory);
+    if (next.valid) *cache = next;
+    else platform_private_file_close(retained);
+    memory_cleanse(&next, sizeof(next));
+}
+bool device_pairing_guard_acquire_host_psk_cached(struct device_pairing_store *store,
+    const uint8_t peer[32], const uint8_t expected_root[32], uint64_t now,
+    const struct device_pairing_psk_binding *binding,
+    enum device_pairing_host_direction direction, uint16_t port,
+    struct device_pairing_guard_cache *cache, struct device_pairing_guard *guard)
+{
+    if (!cache || !guard || !binding) return device_pairing_guard_acquire_host_psk(store, peer, expected_root, now, binding, direction, port, guard);
+    memset(guard, 0, sizeof(*guard));
+    if (cache_arguments_match(cache, store, peer, expected_root, binding, direction, port) &&
+        cache_fresh(cache, now) && cache_revalidate(cache, store, peer, guard)) return true;
+    device_pairing_guard_cache_destroy(cache);
+    struct platform_private_file retained; platform_private_file_init(&retained);
+    if (!host_psk_retain(store, peer, expected_root, now, binding, direction, port, guard, &retained)) {
+        platform_private_file_close(&retained); return false; // raw-return-ok:host_psk_retain logged the refusal
+    }
+    cache_remember(cache, store, peer, expected_root, binding, direction, port, guard, &retained);
     return true;
 }
 static bool psk_wire_metadata_matches(const uint8_t wire[PSK_SECRET_WIRE],
