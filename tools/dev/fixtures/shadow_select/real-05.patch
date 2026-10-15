@@ -1,0 +1,126 @@
+diff --git a/contexts/commons/modules/vcs/src/package_verify_capabilities.c b/contexts/commons/modules/vcs/src/package_verify_capabilities.c
+index ddbb9cdd29ae478c5940144e42025c221a3b5fc3..9cfbf82cda97c56d02645c33e5d5c74d7d142cfd 100644
+--- a/contexts/commons/modules/vcs/src/package_verify_capabilities.c
++++ b/contexts/commons/modules/vcs/src/package_verify_capabilities.c
+@@ -19,6 +19,7 @@
+ 
+ #include "base/safe_alloc.h"
+ #include "json/json.h"
++#include "platform/positioned_file.h"
+ #include "sha3/sha3.h"
+ #include "vcs/package_manifest.h"
+ 
+@@ -150,16 +151,18 @@ static bool pkgcap_read_file(const char *path, size_t max_bytes,
+ {
+     *out = NULL;
+     *out_len = 0;
+-    FILE *f = fopen(path, "rb");
+-    if (!f) return false;
++    struct platform_positioned_file file;
++    platform_positioned_file_init(&file);
++    if (!platform_positioned_file_open(&file, path)) return false;
+     size_t cap = 65536;
+     if (cap > max_bytes + 1) cap = max_bytes + 1;
+     char *buf = zcl_malloc(cap, "pkgcap.file");
+     if (!buf) {
+-        (void)fclose(f);
++        platform_positioned_file_close(&file);
+         return false;
+     }
+     size_t len = 0;
++    bool failed = false;
+     for (;;) {
+         if (len == cap) {
+             if (cap > max_bytes) break; /* one byte past the cap: refuse */
+@@ -168,19 +171,23 @@ static bool pkgcap_read_file(const char *path, size_t max_bytes,
+             char *grown = zcl_realloc(buf, next, "pkgcap.file");
+             if (!grown) {
+                 free(buf);
+-                (void)fclose(f);
++                platform_positioned_file_close(&file);
+                 return false;
+             }
+             buf = grown;
+             cap = next;
+         }
+-        size_t got = fread(buf + len, 1, cap - len, f);
+-        len += got;
++        int64_t got = platform_positioned_file_read(
++            &file, buf + len, cap - len, len);
++        if (got < 0) {
++            failed = true;
++            break;
++        }
++        len += (size_t)got;
+         if (got == 0) break;
+     }
+     bool overflow = len > max_bytes;
+-    bool failed = ferror(f) != 0;
+-    (void)fclose(f);
++    platform_positioned_file_close(&file);
+     if (overflow || failed) {
+         free(buf);
+         return false;
+diff --git a/tests/harness/src/test_package_capability_claim.c b/tests/harness/src/test_package_capability_claim.c
+index e9f64593efe40f807886a0c12b3dad007037e186..10f6fe7674329366f48ab8b1a8116365947f7d94 100644
+--- a/tests/harness/src/test_package_capability_claim.c
++++ b/tests/harness/src/test_package_capability_claim.c
+@@ -34,6 +34,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#if !defined(_WIN32)
++#include <unistd.h>
++#endif
+ 
+ #define PCC_CHECK(name, expr)                                    \
+     do {                                                         \
+@@ -416,6 +419,38 @@ static int t_unproven_unreadable_source(void)
+     return failures;
+ }
+ 
++#if !defined(_WIN32)
++static int t_linked_source(void)
++{
++    int failures = 0;
++    struct pcc_case c;
++    if (!pcc_case_open(&c, "linked-source")) return 1;
++    bool built = pcc_write_table(c.table, "CAP_NETWORK", NULL) &&
++                 pcc_write(c.dir, "src/inert.c",
++                           "int add(int a, int b) { return a + b; }\n") &&
++                 pcc_write_manifest(c.dir, "", "\"src/inert.c\"");
++    char leaf[640], outside[640];
++    snprintf(leaf, sizeof(leaf), "%s/src/inert.c", c.dir);
++    snprintf(outside, sizeof(outside), "%s/outside.c", c.dir);
++    built = built && rename(leaf, outside) == 0 &&
++            symlink("../outside.c", leaf) == 0;
++    PCC_CHECK("C5: exact listed source linked outside is prepared", built);
++    if (built) {
++        struct vcs_pkgcap_report r;
++        pcc_run(&c, c.table, NULL, &r);
++        PCC_CHECK("C5: linked source is UNPROVEN, not cleared",
++                  r.verdict == VCS_PKGCAP_UNPROVEN &&
++                  r.rule == VCS_PKGCAP_RULE_SOURCE_UNREADABLE);
++        bool restored = unlink(leaf) == 0 && rename(outside, leaf) == 0;
++        pcc_run(&c, c.table, NULL, &r);
++        PCC_CHECK("C5: same real source is VERIFIED",
++                  restored && r.verdict == VCS_PKGCAP_VERIFIED);
++    }
++    pcc_case_close(&c);
++    return failures;
++}
++#endif
++
+ /* ── D. a substituted table is detected ──────────────────────────── */
+ 
+ static int t_substituted_table(void)
+@@ -723,6 +758,9 @@ int test_package_capability_claim(void)
+     failures += t_unproven_absent_claim();
+     failures += t_unproven_claim_not_reached();
+     failures += t_unproven_unreadable_source();
++#if !defined(_WIN32)
++    failures += t_linked_source();
++#endif
+     failures += t_substituted_table();
+     failures += t_list_ends();
+     failures += t_scanner_exclusions();

@@ -6,6 +6,8 @@
 #   git -c core.quotepath=off -c diff.noprefix=false -c diff.mnemonicPrefix=false
 #       --no-pager diff-tree -p --no-color --no-renames --no-ext-diff
 #       --full-index <commit>^ <commit>
+#   The exact output is retained as <id>.patch so evaluation needs no historical
+#   Git objects. Commits and patch_sha3 remain the original frozen provenance.
 # syn rows: adversarial changes with a seeded compile-valid bug; commit is the
 #   base they apply to and patch_sha3 is SHA3-256 of <id>.patch in this
 #   directory.

@@ -1,0 +1,137 @@
+diff --git a/tests/harness/src/test_test_group_selector.c b/tests/harness/src/test_test_group_selector.c
+index 0179116a054718f837e2bf628a64c2809dcc903d..1e8e4649e96108954f64375779418167b7752880 100644
+--- a/tests/harness/src/test_test_group_selector.c
++++ b/tests/harness/src/test_test_group_selector.c
+@@ -717,6 +717,39 @@ static int test_native_catalog_resolution(void)
+         ASSERT(zcl_test_group_resolve_exact("test_api", full));
+         ASSERT(strcmp(full, "test_api") == 0);
+         ASSERT(!zcl_test_group_resolve_exact("api_missing", full));
++        /* The indexed catalog must answer exactly like a linear scan: for
++         * every row, its bare name, and a missing sibling, count the rows a
++         * resolve can name and require the same verdict and the same row. */
++        for (size_t row = 0; row < zcl_test_group_catalog_count(); row++) {
++            const char *cat = zcl_test_group_catalog_at(row);
++            ASSERT(zcl_test_group_catalog_contains(cat));
++            const char *bare = strchr(cat, '_') ? strchr(cat, '_') + 1 : cat;
++            char missing[ZCL_TEST_GROUP_FULL_MAX + 8];
++            snprintf(missing, sizeof(missing), "%s_zz", cat);
++            ASSERT(!zcl_test_group_catalog_contains(missing));
++            const char *probes[] = { cat, bare, missing };
++            for (size_t p = 0; p < 3; p++) {
++                char want_t[ZCL_TEST_GROUP_FULL_MAX + 8];
++                char want_s[ZCL_TEST_GROUP_FULL_MAX + 8];
++                snprintf(want_t, sizeof(want_t), "test_%s", probes[p]);
++                snprintf(want_s, sizeof(want_s), "spec_%s", probes[p]);
++                size_t hits = 0;
++                const char *hit = NULL;
++                for (size_t i = 0; i < zcl_test_group_catalog_count(); i++) {
++                    const char *c = zcl_test_group_catalog_at(i);
++                    if (strcmp(c, probes[p]) == 0 || strcmp(c, want_t) == 0 ||
++                        strcmp(c, want_s) == 0) {
++                        hit = c;
++                        hits++;
++                    }
++                }
++                char got[ZCL_TEST_GROUP_FULL_MAX];
++                bool ok = zcl_test_group_resolve_exact(probes[p], got);
++                ASSERT(ok == (hits == 1));
++                if (ok)
++                    ASSERT(strcmp(got, hit) == 0);
++            }
++        }
+         ASSERT(zcl_test_group_plan_selects("test_api", "test_api"));
+         ASSERT(!zcl_test_group_plan_selects("test_api",
+                                             "test_native_api_contract"));
+diff --git a/tools/dev/test_group_catalog.c b/tools/dev/test_group_catalog.c
+index f1040b4b26f0ae5bc8d5d788a878dd216626dd3f..e41f82e01d7fcfbdeb159d500d4a3be9cfb27fa6 100644
+--- a/tools/dev/test_group_catalog.c
++++ b/tools/dev/test_group_catalog.c
+@@ -4,8 +4,10 @@
+ #include "test_group_catalog.h"
+ #include "platform/glob_match.h"
+ 
++#include <pthread.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ static const char *const g_test_groups[] = {
+@@ -62,14 +64,50 @@ const char *zcl_test_group_catalog_at(size_t index)
+     return index < zcl_test_group_catalog_count() ? g_test_groups[index] : NULL;
+ }
+ 
++/* Plan selection asks "is this id in the catalog" and "which catalog row does
++ * this id name" once per (catalog row x plan group) pair. A linear strcmp scan
++ * per question made one plan ~3e9 instructions (1178 rows). The catalog is
++ * immutable, so sort row pointers once and answer by binary search. */
++#define CATALOG_ROWS (sizeof(g_test_groups) / sizeof(g_test_groups[0]))
++static const char *g_sorted_groups[CATALOG_ROWS];
++static pthread_once_t g_sorted_once = PTHREAD_ONCE_INIT;
++
++static int catalog_row_cmp(const void *a, const void *b)
++{
++    return strcmp(*(const char *const *)a, *(const char *const *)b);
++}
++
++static void catalog_sort_once(void)
++{
++    for (size_t i = 0; i < CATALOG_ROWS; i++)
++        g_sorted_groups[i] = g_test_groups[i];
++    qsort(g_sorted_groups, CATALOG_ROWS, sizeof(g_sorted_groups[0]),
++          catalog_row_cmp);
++}
++
++/* Rows equal to `id`, so a duplicated catalog row still reads as ambiguous. */
++static size_t catalog_matches(const char *id, const char **hit)
++{
++    pthread_once(&g_sorted_once, catalog_sort_once);
++    size_t lo = 0, hi = CATALOG_ROWS;
++    while (lo < hi) {
++        size_t mid = lo + (hi - lo) / 2;
++        if (strcmp(g_sorted_groups[mid], id) < 0) lo = mid + 1;
++        else hi = mid;
++    }
++    size_t n = 0;
++    while (lo + n < CATALOG_ROWS && strcmp(g_sorted_groups[lo + n], id) == 0)
++        n++;
++    if (n > 0 && hit)
++        *hit = g_sorted_groups[lo];
++    return n;
++}
++
+ bool zcl_test_group_catalog_contains(const char *full_id)
+ {
+     if (!full_id || !full_id[0])
+         return false;
+-    for (size_t i = 0; i < zcl_test_group_catalog_count(); i++)
+-        if (strcmp(g_test_groups[i], full_id) == 0)
+-            return true;
+-    return false;
++    return catalog_matches(full_id, NULL) > 0;
+ }
+ 
+ bool zcl_test_group_requires_exclusive_run(const char *full_id)
+@@ -181,17 +219,11 @@ bool zcl_test_group_resolve_exact(
+     char spec_id[ZCL_TEST_GROUP_FULL_MAX];
+     int tn = snprintf(test_id, sizeof(test_id), "test_%s", id);
+     int sn = snprintf(spec_id, sizeof(spec_id), "spec_%s", id);
+-    for (size_t i = 0; i < zcl_test_group_catalog_count(); i++) {
+-        const char *full = g_test_groups[i];
+-        if (strcmp(full, id) == 0 ||
+-            (tn > 0 && (size_t)tn < sizeof(test_id) &&
+-             strcmp(full, test_id) == 0) ||
+-            (sn > 0 && (size_t)sn < sizeof(spec_id) &&
+-             strcmp(full, spec_id) == 0)) {
+-            hit = full;
+-            hits++;
+-        }
+-    }
++    hits += catalog_matches(id, &hit);
++    if (tn > 0 && (size_t)tn < sizeof(test_id) && strcmp(test_id, id) != 0)
++        hits += catalog_matches(test_id, &hit);
++    if (sn > 0 && (size_t)sn < sizeof(spec_id) && strcmp(spec_id, id) != 0)
++        hits += catalog_matches(spec_id, &hit);
+     if (hits != 1 || strlen(hit) >= ZCL_TEST_GROUP_FULL_MAX)
+         return false;
+     snprintf(out, ZCL_TEST_GROUP_FULL_MAX, "%s", hit);

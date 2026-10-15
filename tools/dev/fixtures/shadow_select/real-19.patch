@@ -1,0 +1,113 @@
+diff --git a/engine/controllers/include/controllers/diagnostics_internal.h b/engine/controllers/include/controllers/diagnostics_internal.h
+index f69434bcee531f324efb563ea90af7d7c02600c0..41dda26acf9551a6ed55a41c278d95d7cdde7c48 100644
+--- a/engine/controllers/include/controllers/diagnostics_internal.h
++++ b/engine/controllers/include/controllers/diagnostics_internal.h
+@@ -356,6 +356,7 @@ struct mvp_evidence {
+     bool      c6_soak_last_healthy;
+     bool      c6_soak_window_eligible;
+     long long c6_soak_window_hours;               /* -1 when not tracked */
++    bool      c6_full_judge_met;                  /* retained full C6 judge MET, never inferred from ticks */
+     bool      c6_slo_probe_present;               /* external SLO surface? */
+     double    c6_slo_success_rate;                /* 0..1, <0 when unknown */
+ 
+diff --git a/engine/controllers/src/diagnostics_mvp.c b/engine/controllers/src/diagnostics_mvp.c
+index 325ee98dd84ba95b48685d5c5eebb7d40cbe8886..808d96591d735345e2f89aba9084cd431f082e8c 100644
+--- a/engine/controllers/src/diagnostics_mvp.c
++++ b/engine/controllers/src/diagnostics_mvp.c
+@@ -230,12 +230,11 @@ bool mvp_build_status_json(const struct mvp_evidence *ev, struct json_value *out
+     }
+ 
+     /* ── C6: 7-day soak with zero operator intervention ──────────────
+-     * Live evidence = the soak attestation service (per-tick healthy /
+-     * window-eligible) + the continuous clean-window hours + an optional
+-     * external SLO probe success rate. The soak service does not itself
+-     * compute the 168h continuous window at runtime, so window_hours is
+-     * unknown (-1) unless a caller supplies it → unknown with a named reason.
+-     * The make soak-evidence-report judge remains the authority. */
++     * Local ticks, elapsed hours and an optional SLO probe are partial
++     * observations. They cannot establish the sovereign, exact-parity,
++     * workload-bound 168h claim. A caller must also supply a retained MET
++     * result from the full soak-evidence-report judge. Runtime does not
++     * currently track that result, so C6 stays unknown with a named reason. */
+     {
+         struct json_value e = {0};
+         mvp_evidence_begin(&e,
+@@ -246,6 +245,7 @@ bool mvp_build_status_json(const struct mvp_evidence *ev, struct json_value *out
+         json_push_kv_int(&e, "window_hours", ev->c6_soak_window_hours);
+         json_push_kv_int(&e, "window_hours_required",
+                          MVP_SOAK_WINDOW_HOURS_REQUIRED);
++        json_push_kv_bool(&e, "full_judge_met", ev->c6_full_judge_met);
+         json_push_kv_bool(&e, "slo_probe_present", ev->c6_slo_probe_present);
+         json_push_kv_real(&e, "slo_success_rate", ev->c6_slo_success_rate);
+ 
+@@ -275,8 +275,14 @@ bool mvp_build_status_json(const struct mvp_evidence *ev, struct json_value *out
+             blocker = "soak.slo_below_floor";
+             reason = "external SLO probe success rate below the floor";
+         } else {
+-            st = MVP_MET;
+-            reason = "168h+ clean, healthy, eligible soak window";
++            static const enum mvp_met verdict[2] = {MVP_UNKNOWN, MVP_MET};
++            static const char *const explanation[2] = {
++                "full C6 soak-evidence-report MET verdict not supplied; "
++                "local healthy ticks cannot qualify the 168h window",
++                "168h+ clean, healthy, eligible soak window with full judge MET",
++            };
++            st = verdict[ev->c6_full_judge_met];
++            reason = explanation[ev->c6_full_judge_met];
+         }
+         mvp_push_criterion(&arr, "C6",
+             "7-day soak with zero operator intervention", st, since, blocker,
+diff --git a/tests/harness/src/test_syncdiag_operator.c b/tests/harness/src/test_syncdiag_operator.c
+index 1f4aebb67c32b701d23e93c278690e23d7c7c39d..9e26371fa7af3e199df28f1a29e608036bfdf47d 100644
+--- a/tests/harness/src/test_syncdiag_operator.c
++++ b/tests/harness/src/test_syncdiag_operator.c
+@@ -36,6 +36,28 @@ static bool syncdiag_store_flow_pass(bool ok_in,
+                   "tools/dev/store_onion_acceptance.sh") == 0;
+ }
+ 
++static int test_mvp_c6_requires_full_judge(void)
++{
++    struct mvp_evidence ev = {0};
++    ev.c6_soak_present = true;
++    ev.c6_soak_last_healthy = true;
++    ev.c6_soak_window_eligible = true;
++    ev.c6_soak_window_hours = 200;
++
++    struct json_value out = {0};
++    bool ok = mvp_build_status_json(&ev, &out);
++    const struct json_value *arr = json_get(&out, "criteria");
++    const struct json_value *c6 = mvp_find_criterion(arr, "C6");
++    const struct json_value *evidence = json_get(c6, "evidence");
++    ok = ok && c6 && json_is_null(json_get(c6, "met")) &&
++         strcmp(json_get_str(json_get(c6, "met_state")), "unknown") == 0 &&
++         evidence && !json_get_bool(json_get(evidence, "full_judge_met"));
++    json_free(&out);
++    printf("mvp C6 local ticks cannot replace full judge... %s\n",
++           ok ? "OK" : "FAIL");
++    return ok ? 0 : 1;
++}
++
+ int syncdiag_cases_operator(void)
+ {
+     int failures = 0;
+@@ -832,11 +854,12 @@ int syncdiag_cases_operator(void)
+             ev.c3_log_head_gap = 0;
+             ev.c3_sync_benchmark_receipt_present = true;
+             ev.c3_cold_sync_secs = 120;
+-            /* C6: 168h+ clean healthy eligible window, no SLO probe. */
++            /* C6: 168h+ clean window and an explicit full-judge MET. */
+             ev.c6_soak_present = true;
+             ev.c6_soak_last_healthy = true;
+             ev.c6_soak_window_eligible = true;
+             ev.c6_soak_window_hours = 200;
++            ev.c6_full_judge_met = true;
+             ev.c6_slo_probe_present = false;
+             ev.c6_slo_success_rate = -1.0;
+             /* C7: a recovery drill within the 2min budget. */
+@@ -947,5 +970,6 @@ int syncdiag_cases_operator(void)
+         else    { printf("FAIL\n"); failures++; }
+     }
+ 
++    failures += test_mvp_c6_requires_full_judge();
+     return failures;
+ }

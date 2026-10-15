@@ -74,17 +74,17 @@ z23 discover schema <path> --side=input|output
 
 | Catalog fact | Count |
 |---|---|
-| Registry entries (branches + leaves) | 934 |
+| Registry entries (branches + leaves) | 947 |
 | Top-level roots | 15 |
-| Branches | 203 |
-| Leaves (dispatchable command paths) | 731 |
-| … `ready` (live handler in this build) | 638 |
+| Branches | 206 |
+| Leaves (dispatchable command paths) | 741 |
+| … `ready` (live handler in this build) | 648 |
 | … `compat` (metadata only, names a fallback) | 63 |
 | … `planned` (fail-closed BLOCKED, exit 3) | 30 |
 | … dev-gated 🔧 (`ready` only in `z23-dev`) | 62 |
-| Leaves with `effect=mutate` | 276 |
+| Leaves with `effect=mutate` | 284 |
 | Leaves with `effect=destructive` | 6 |
-| Leaves requiring **owner** authority | 141 |
+| Leaves requiring **owner** authority | 148 |
 
 Per source file:
 
@@ -95,12 +95,12 @@ Per source file:
 | `engine/composition/commands/apps.def` | 20 | 4 | 16 |
 | `engine/composition/commands/app_features.def` | 75 | 20 | 55 |
 | `engine/composition/commands/store.def` | 19 | 0 | 19 |
-| `engine/composition/commands/ops.def` | 60 | 11 | 49 |
+| `engine/composition/commands/ops.def` | 72 | 14 | 58 |
 | `engine/composition/commands/dev.def` | 128 | 23 | 105 |
 | `engine/composition/commands/code.def` | 34 | 4 | 30 |
 | `engine/composition/commands/accounts.def` | 11 | 2 | 9 |
 | `engine/composition/commands/vault.def` | 24 | 4 | 20 |
-| `engine/composition/commands/zcode.def` | 253 | 59 | 194 |
+| `engine/composition/commands/zcode.def` | 254 | 59 | 195 |
 | `engine/composition/commands/zcode_science.def` | 25 | 7 | 18 |
 | `engine/composition/commands/metaverse.def` | 30 | 7 | 23 |
 | `engine/composition/commands/yardsale.def` | 7 | 2 | 5 |
@@ -632,7 +632,7 @@ represented by its children's sections.
 | `app presentation code-change` | ready | mutate / app-write / operator, display-only · fast/low | **`workspace`**, **`before_root`**, **`candidate_root`**, **`path`**, **`requested_behavior`**, **`before_behavior`**, **`after_behavior`**, `output`, `page` | `zcl.app_presentation_code_change.v1` | `z23 app presentation code-change --input='<exact-roots-and-summaries>'` | Show an exact ZVCS-backed C code change in a native window |
 | `app presentation development` | ready | mutate / app-write / operator, display-only · fast/low | `workspace`, `receipt_id`, `output`, `page` | `zcl.app_presentation_development.v1` | `z23 app presentation development` | Show the latest exact local development consequence in native C23 |
 | `app presentation reproduction` | ready | mutate / app-write / operator, display-only · fast/low | **`action_id`**, `output`, `page` | `zcl.app_presentation_reproduction.v1` | `z23 app presentation reproduction --input='{"action_id":"<64hex>"}'` | Show live independent-reproduction progress in one native window |
-| `app presentation publication-confirm` | ready | mutate / app-write / operator, display-only · foreground/moderate | `release_hex`, `manifest_hex`, `recipe_hex`, `dir`, `datadir`, `output`, `page` | `zcl.app_presentation_publication_confirm.v1` | `z23 app presentation publication-confirm --input='{"release_hex":"..","manifest_hex":"..","recipe_hex":"..","dir":"/tmp/pkg"}'` | Ask for an exact local package-commit decision in native C23 |
+| `app presentation publication-confirm` | ready | mutate / app-write / operator, display-only · foreground/moderate | `release_hex`, `manifest_hex`, `manifest_file`, `manifest_sha3`, `recipe_hex`, `recipe_file`, `recipe_sha3`, `dir`, `datadir`, `output`, `page` | `zcl.app_presentation_publication_confirm.v1` | `z23 app presentation publication-confirm --input='{"release_hex":"..","manifest_hex":"..","recipe_hex":"..","dir":"/tmp/pkg"}'` | Ask for an exact local package-commit decision in native C23 |
 | `app presentation release-confirm` | ready | mutate / app-write / operator, display-only · fast/low | `workspace`, `work`, `datadir`, `output`, `page` | `zcl.app_presentation_release_confirm.v1` | `z23-dev app presentation release-confirm --input='{"workspace":".","work":"latest"}'` | Ask for one exact proven-candidate decision in native C23 |
 | `app presentation publication-status` | ready | mutate / app-write / operator, display-only · fast/low | **`package_root`**, **`transport_root`**, **`confirmation_identity`**, `output`, `page` | `zcl.app_presentation_publication_status.v1` | `z23 app presentation publication-status --input='{"package_root":"<64hex>","transport_root":"<64hex>","confirmation_identity":"<64hex>"}'` | Show exact package publication progress in native C23 |
 
@@ -1010,6 +1010,30 @@ represented by its children's sections.
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
 | `ops host gc` | ready | destructive / dev-mutation / operator · maintenance/moderate | `apply`, `floor_hours`, `roots` | `zcl.host_gc.v1` | `z23 ops host gc --apply=false` | Classify and reclaim dead dev-proof worktree generations |
+
+#### `ops.mesh.device` — Offline owner device identity and grants
+
+| Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
+|---|---|---|---|---|---|---|
+| `ops mesh device init` | ready | mutate / app-write / **owner** · foreground/low | **`directory`** | `zcl.device.profile.v1` | `z23 ops mesh device init --directory=<absent-private-profile>` | Initialize an offline private device identity |
+| `ops mesh device identity` | ready | read / read / operator · fast/low | **`directory`** | `zcl.device.profile.v1` | `z23 ops mesh device identity --directory=<private-profile>` | Observe an existing offline device identity |
+| `ops mesh device plan` | ready | read / read / operator · fast/low | **`directory`**, **`peer_key`**, `capability`, `expires_at`, `backend`, `local_pq_blob`, `peer_pq_blob`, `inbound_port`, `outbound_port`, `paired_at`, `expected_root`, `credential_id`, `key_epoch` | `zcl.device.grant.v1` | `z23 ops mesh device plan --input=<explicit-json>` | Preview an explicit offline device grant |
+| `ops mesh device commit` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`directory`**, **`peer_key`**, **`capability`**, **`expires_at`**, `fingerprint`, **`expected_root`**, `backend`, `local_pq_blob`, `peer_pq_blob`, `inbound_port`, `outbound_port`, `paired_at`, `confirmed_proposal_root`, `credential_id`, `key_epoch`, `secret_file` | `zcl.device.grant.v1` | `z23 ops mesh device commit --input=<explicit-json>` | Approve a complete exact offline device grant |
+| `ops mesh device revoke` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`directory`**, **`peer_key`**, `fingerprint`, `expected_root` | `zcl.device.grant.v1` | `z23 ops mesh device revoke --input=<explicit-json>` | Inspect or approve exact offline grant revocation |
+| `ops mesh device prepare-secret` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`directory`**, **`peer_key`**, `capability`, `backend`, `destination`, `confirm` | `zcl.device.secret-source.v1` | `z23 ops mesh device prepare-secret --input=<explicit-json>` | Prepare one private pair-purpose import source |
+
+#### `ops.mesh.device.host` — Foreground owner-approved hash-PSK host transport
+
+| Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
+|---|---|---|---|---|---|---|
+| `ops mesh device host client` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`directory`**, **`peer_key`**, `expected_root`, `target_port`, `route_id`, `route_address`, `route_port`, `connect_ms`, `handshake_ms`, `session_ms`, `idle_ms`, `confirm` | `zcl.device.host.raw.v1` | `z23 ops mesh device host client --input=<explicit-json>` | Run one raw foreground selected-route HOST client |
+| `ops mesh device host receiver` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`directory`**, **`peer_key`**, `expected_root`, `target_port`, `route_id`, `listen_address`, `listen_port`, `allow_external`, `lifetime_ms`, `handshake_ms`, `session_ms`, `idle_ms`, `max_active`, `max_sessions`, `confirm` | `zcl.device.host.raw.v1` | `z23 ops mesh device host receiver --input=<explicit-json>` | Run a finite foreground receiver for one exact HOST pair/root |
+
+#### `ops.mesh.device.host.package` — Exact installed HOST tunnel execution
+
+| Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
+|---|---|---|---|---|---|---|
+| `ops mesh device host package run` | ready | mutate / app-write / **owner**, plan-commit · foreground/low | **`datadir`**, **`package_root`**, **`receipt_id`**, **`artifact_sha3`**, `accept_execution`, `runtime_policy`, `role`, `runtime_input`, `launch_ms`, `execution_ms`, `cleanup_ms` | `zcl.device.host.raw.v1` | `z23 ops mesh device host package run --input=<explicit-json>` | Run exact owner-accepted installed bin/tunnel in foreground |
 
 #### `ops.telemetry` — Canonical typed telemetry tree
 
@@ -1460,9 +1484,10 @@ represented by its children's sections.
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
 | `zcode package dev prepare` | ready | read / read / operator · foreground/moderate | **`dir`**, **`publisher_pubkey`**, **`publisher_sequence`**, `reward_address`, `chain_id` | `zcl.zcode_package_dev_prepare.v1` | `z23 zcode package dev prepare --input='{"dir":"lib/base","publisher_pubkey":"<66hex>","publisher_sequence":1}'` | Derive canonical release inputs from a local package tree |
-| `zcode package dev seal` | ready | read / read / operator · fast/low | **`release_body_hex`**, **`signature_hex`** | `zcl.zcode_package_dev_seal.v1` | `z23 zcode package dev seal --input='{"release_body_hex":"<hex>","signature_hex":"<128hex>"}'` | Verify and attach an offline development signature |
-| `zcode package dev create` (aliases: `zcode.create`) | ready | mutate / app-write / operator · foreground/moderate | **`mode`**, `release_hex`, `manifest_hex`, `recipe_hex`, `dir`, `day`, `datadir` | `zcl.zcode_create.v1` | `z23 zcode create --input='{"mode":"plan","release_hex":"..","manifest_hex":"..","recipe_hex":"..","dir":"/tmp/pkg"}'` | Create package |
-| `zcode package dev use` (aliases: `zcode.use`) | ready | mutate / app-write / operator · foreground/moderate | `name_or_root`, `plan_id`, `now_unix`, `datadir`, `local_only`, `dir`, `release_hex`, `manifest_hex`, `recipe_hex` | `zcl.zcode_use.v1` | `z23 zcode use --input='{"name_or_root":"<64hex>"}'` | Use dependency |
+| `zcode package dev prepare export` | ready | mutate / app-write / operator · foreground/moderate | **`dir`**, **`publisher_pubkey`**, **`publisher_sequence`**, `reward_address`, `chain_id`, **`artifact_dir`**, **`confirm`** | `zcl.zcode_package_dev_prepare_export.v1` | `z23 zcode package dev prepare export --input='{"dir":"/tmp/source","publisher_pubkey":"<66hex>","publisher_sequence":1,"artifact_dir":"/tmp/new-artifacts","confirm":true}'` | Export bounded inert canonical package wires |
+| `zcode package dev seal` | ready | read / read / operator · fast/low | `release_body_hex`, `release_body_file`, `release_body_sha3`, **`signature_hex`** | `zcl.zcode_package_dev_seal.v1` | `z23 zcode package dev seal --input='{"release_body_hex":"<hex>","signature_hex":"<128hex>"}'` | Verify and attach an offline development signature |
+| `zcode package dev create` (aliases: `zcode.create`) | ready | mutate / app-write / operator · foreground/moderate | **`mode`**, `release_hex`, `manifest_hex`, `manifest_file`, `manifest_sha3`, `recipe_hex`, `recipe_file`, `recipe_sha3`, `dir`, `day`, `datadir` | `zcl.zcode_create.v1` | `z23 zcode create --input='{"mode":"plan","release_hex":"..","manifest_hex":"..","recipe_hex":"..","dir":"/tmp/pkg"}'` | Create package |
+| `zcode package dev use` (aliases: `zcode.use`) | ready | mutate / app-write / operator · foreground/moderate | `name_or_root`, `plan_id`, `now_unix`, `datadir`, `local_only`, `dir`, `release_hex`, `manifest_hex`, `manifest_file`, `manifest_sha3`, `recipe_hex`, `recipe_file`, `recipe_sha3` | `zcl.zcode_use.v1` | `z23 zcode use --input='{"name_or_root":"<64hex>"}'` | Use dependency |
 | `zcode package dev improve` (aliases: `zcode.improve`) | ready | mutate / app-write / operator · foreground/moderate | **`workspace`**, `candidate_workspace`, `datadir`, `mode`, `planned_task_root`, `planned_context_root`, `candidate_source_sha256`, `source_root`, `dependency_lock_root`, **`dependency_lock_hex`**, `write_scope_root`, **`write_scope_csv`**, `acceptance_tests_root`, **`acceptance_recipe_hex`**, **`model_policy_root`**, **`goal`**, **`proof_policy_hex`**, `action_kind`, `fixed_input_path`, `fixed_input_relpath`, `preprocessed_path`, `patch_root`, `candidate_source_root`, `adapter_policy_root`, `author_pubkey`, `candidate_sequence`, `candidate_created_unix`, `profile`, **`expires_unix`**, `max_changed_files`, `max_patch_bytes`, `max_context_bytes`, `max_cpu_seconds`, `max_memory_bytes`, `max_output_bytes`, `context_symbol`, `remote_peer` | `zcl.zcode_improve.v1` | `z23 zcode improve --input='{"mode":"plan","workspace":"/src/project","dependency_lock_hex":"<canonical wire hex>","write_scope_csv":"src,include","acceptance_recipe_hex":"<canonical wire hex>","model_policy_root":"<64hex>","goal":"fix seeded bug","proof_policy_hex":"<wire hex>","context_symbol":"buggy_function","expires_unix":123}'` | Improve code candidate |
 | `zcode package dev evidence` (aliases: `zcode.evidence`) | ready | mutate / app-write / operator · foreground/moderate | **`workspace`**, `datadir`, **`action_id`** | `zcl.zcode_evidence.v1` | `z23 zcode evidence --input='{"workspace":"/src/project","action_id":"<64hex>"}'` | Evaluate candidate evidence |
 | `zcode package dev accept` (aliases: `zcode.accept`) | ready | mutate / app-write / operator · foreground/moderate | **`workspace`**, **`action_id`**, **`lane`**, `datadir` | `zcl.zcode_accept.v1` | `z23 zcode accept --input='{"workspace":"/src/project","action_id":"<64hex>","lane":"CANDIDATE"}'` | Record candidate proof readiness |
@@ -1506,8 +1531,8 @@ represented by its children's sections.
 
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
-| `zcode package publish plan` | ready | read / read / operator · foreground/moderate | `release_hex`, `manifest_hex`, `recipe_hex`, `dir`, `datadir` | `zcl.zcode_publish_plan.v1` | `z23 zcode package publish plan --input='{"release_hex":"..","manifest_hex":"..","recipe_hex":"..","dir":"/tmp/pkg"}'` | Validate a candidate release without persisting anything |
-| `zcode package publish commit` | ready | mutate / app-write / operator · foreground/moderate | `release_hex`, `manifest_hex`, `recipe_hex`, `dir`, `day`, `datadir` | `zcl.zcode_publish_commit.v1` | `z23 zcode package publish commit --input='{"release_hex":"..","manifest_hex":"..","recipe_hex":"..","dir":"/tmp/pkg"}'` | Re-validate and persist a candidate release into the local store |
+| `zcode package publish plan` | ready | read / read / operator · foreground/moderate | `release_hex`, `manifest_hex`, `manifest_file`, `manifest_sha3`, `recipe_hex`, `recipe_file`, `recipe_sha3`, `dir`, `datadir` | `zcl.zcode_publish_plan.v1` | `z23 zcode package publish plan --input='{"release_hex":"..","manifest_hex":"..","recipe_hex":"..","dir":"/tmp/pkg"}'` | Validate a candidate release without persisting anything |
+| `zcode package publish commit` | ready | mutate / app-write / operator · foreground/moderate | `release_hex`, `manifest_hex`, `manifest_file`, `manifest_sha3`, `recipe_hex`, `recipe_file`, `recipe_sha3`, `dir`, `day`, `datadir` | `zcl.zcode_publish_commit.v1` | `z23 zcode package publish commit --input='{"release_hex":"..","manifest_hex":"..","recipe_hex":"..","dir":"/tmp/pkg"}'` | Re-validate and persist a candidate release into the local store |
 
 #### `zcode.package.attest` — File signed third-party verifier attestations
 
@@ -1650,7 +1675,7 @@ represented by its children's sections.
 
 | Command | Avail | Policy | Input keys (**required**) | Output schema | Example | Summary |
 |---|---|---|---|---|---|---|
-| `zcode package add plan` | ready | mutate / app-write / operator · foreground/moderate | **`name_or_root`**, `now_unix`, `datadir`, `cursor`, `max_items`, `local_only`, `dir`, `release_hex`, `manifest_hex`, `recipe_hex` | `zcl.zcode_add_plan.v1` | `z23 zcode package add plan --input='{"name_or_root":"ringbuffer"}'` | Resolve, dependency-lock, and report what installing would do |
+| `zcode package add plan` | ready | mutate / app-write / operator · foreground/moderate | **`name_or_root`**, `now_unix`, `datadir`, `cursor`, `max_items`, `local_only`, `dir`, `release_hex`, `manifest_hex`, `manifest_file`, `manifest_sha3`, `recipe_hex`, `recipe_file`, `recipe_sha3` | `zcl.zcode_add_plan.v1` | `z23 zcode package add plan --input='{"name_or_root":"ringbuffer"}'` | Resolve, dependency-lock, and report what installing would do |
 | `zcode package add commit` | ready | mutate / app-write / operator · background/high | **`plan_id`**, `now_unix`, `datadir`, `cursor`, `max_items` | `zcl.zcode_add_commit.v1` | `z23 zcode package add commit --input='{"plan_id":"<64hex>"}'` | Execute a plan: verify, build+test confined, install, activate, pin |
 
 #### `zcode.node` — Node join/update
@@ -2014,6 +2039,9 @@ promise the same document shape.
 | `zcl.app_swap_contract.v1` | `app.swap.initiate`, `app.swap.participate` |
 | `zcl.rom_seed_status.v1` | `ops.debug.rom_seed.status`, `ops.debug.rom_seed.enable`, `ops.debug.rom_seed.disable` |
 | `zcl.ops_mesh_join_status.v1` | `ops.mesh.join`, `ops.mesh.join_status` |
+| `zcl.device.profile.v1` | `ops.mesh.device.init`, `ops.mesh.device.identity` |
+| `zcl.device.grant.v1` | `ops.mesh.device.plan`, `ops.mesh.device.commit`, `ops.mesh.device.revoke` |
+| `zcl.device.host.raw.v1` | `ops.mesh.device.host.client`, `ops.mesh.device.host.package.run`, `ops.mesh.device.host.receiver` |
 | `zcl.dev_cycle.v1` | `dev.status`, `dev.change.apply`, `dev.loop.wait` |
 | `zcl.dev_hotswap.v1` | `dev.hotswap.apply`, `dev.hotswap.probe` |
 | `zcl.dev_loop_status.v1` | `dev.loop.ensure`, `dev.loop.status`, `dev.loop.stop` |

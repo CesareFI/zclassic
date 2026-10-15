@@ -1,0 +1,111 @@
+diff --git a/contexts/commons/modules/vcs/src/package_swarm_node.c b/contexts/commons/modules/vcs/src/package_swarm_node.c
+index 50f2546b1776cc457e2e5df39f94d912d1968a0b..3d3ab981b8cd5081e8fea9a20c7c953c6d5abcd4 100644
+--- a/contexts/commons/modules/vcs/src/package_swarm_node.c
++++ b/contexts/commons/modules/vcs/src/package_swarm_node.c
+@@ -19,6 +19,7 @@
+ #include "vcs_priv.h"
+ 
+ #include "base/hex.h"
++#include "platform/positioned_file.h"
+ #include "util/log_macros.h"
+ #include "util/safe_alloc.h"
+ 
+@@ -1301,11 +1302,8 @@ static void resume_downloads(struct vcs_swarm_engine *engine)
+     closedir(d);
+ }
+ 
+-/* Load-and-bump the persisted boot nonce: request ids are
+- * (nonce << 32) | counter, unique across engine restarts so the
+- * slice-11 replayed-request dedup never swallows credit for reissued
+- * work. Without persistence the nonce is a fixed 1 (single-lifetime
+- * engines, e.g. tests without a zcode_dir). */
++/* Boot nonce keeps request IDs distinct across restarts for replay credit.
++ * Without persistence use 1. Read one extra byte to reject long records. */
+ static uint64_t nonce_bump(struct vcs_swarm_engine *engine)
+ {
+     if (!engine->persist)
+@@ -1313,12 +1311,13 @@ static uint64_t nonce_bump(struct vcs_swarm_engine *engine)
+     char path[STORE_PATH_MAX];
+     snprintf(path, sizeof(path), "%s/swarm_nonce", engine->zcode_dir);
+     uint64_t nonce = 0;
+-    FILE *f = fopen(path, "rb");
+-    if (f) {
+-        uint8_t buf[8];
+-        if (fread(buf, 1, sizeof(buf), f) == sizeof(buf))
++    struct platform_positioned_file file;
++    platform_positioned_file_init(&file);
++    if (platform_positioned_file_open(&file, path)) {
++        uint8_t buf[9];
++        if (platform_positioned_file_read(&file, buf, sizeof(buf), 0) == 8)
+             nonce = vcs_rd_u64le(buf);
+-        fclose(f);
++        platform_positioned_file_close(&file);
+     }
+     nonce++;
+     if (nonce >= (UINT64_C(1) << 32))
+diff --git a/tests/harness/src/test_zcode_swarm.c b/tests/harness/src/test_zcode_swarm.c
+index 6d0bd128da11261090a68ed5e615117cce9eb6d7..5438779a8ab7fe17e574186f24d3df8ba1171fb5 100644
+--- a/tests/harness/src/test_zcode_swarm.c
++++ b/tests/harness/src/test_zcode_swarm.c
+@@ -537,10 +537,61 @@ struct vcs_swarm_frame_result sw_answer(
+     return res;
+ }
+ 
++#if !defined(_WIN32)
++static bool sw_nonce_file_equals(const char *path, uint64_t expected)
++{
++    uint8_t wire[8];
++    FILE *f = fopen(path, "rb");
++    if (!f)
++        return false;
++    bool ok = fread(wire, 1, sizeof(wire), f) == sizeof(wire) &&
++              fgetc(f) == EOF;
++    if (fclose(f) != 0)
++        ok = false;
++    return ok && zcl_read_u64_le(wire) == expected;
++}
++
++static int t_swarm_linked_nonce(void)
++{
++    int failures = 0;
++    char dd[1024], zcode[1100], leaf[1200], outside[1200];
++    sw_make_tmpdir(dd, sizeof(dd), "linked-nonce");
++    snprintf(zcode, sizeof(zcode), "%s/zcode", dd);
++    snprintf(leaf, sizeof(leaf), "%s/swarm_nonce", zcode);
++    snprintf(outside, sizeof(outside), "%s/outside-nonce", dd);
++    uint8_t wire[8];
++    zcl_write_u64_le(wire, 42);
++    FILE *f = fopen(outside, "wb");
++    bool prepared = mkdir(zcode, 0700) == 0 && f &&
++                    fwrite(wire, 1, sizeof(wire), f) == sizeof(wire);
++    if (f && fclose(f) != 0)
++        prepared = false;
++    prepared = prepared && symlink("../outside-nonce", leaf) == 0;
++    SW_CHECK("nonce: persisted leaf linked outside is prepared", prepared);
++    if (prepared) {
++        struct vcs_swarm_engine *engine =
++            vcs_swarm_engine_create(NULL, NULL, zcode, NULL, NULL);
++        SW_CHECK("nonce: engine restarts with linked leaf", engine != NULL);
++        if (engine) {
++            SW_CHECK("nonce: linked bytes do not seed request IDs",
++                     sw_nonce_file_equals(leaf, 1));
++            SW_CHECK("nonce: outside bytes remain untouched",
++                     sw_nonce_file_equals(outside, 42));
++            vcs_swarm_engine_free(engine);
++        }
++    }
++    test_rm_rf_recursive(dd);
++    return failures;
++}
++#endif
++
+ 
+ int test_zcode_swarm(void)
+ {
+     int failures = 0;
++#if !defined(_WIN32)
++    failures += t_swarm_linked_nonce();
++#endif
+     failures += t_swarm_invalid_data();
+     failures += t_swarm_unsolicited_and_replay();
+     failures += t_swarm_cancel_race();

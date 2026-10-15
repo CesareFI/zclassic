@@ -101,11 +101,42 @@ static int ss_test_corpus_frozen(void)
             real += ss_corpus.entries[i].kind == ZCL_SHADOW_KIND_REAL;
             ASSERT(ss_corpus.entries[i].file_count >= 1 &&
                    ss_corpus.entries[i].file_count <= 3);
+            struct zcl_shadow_patch_facts patch;
+            bool matches = false;
+            ASSERT(ss_patch_facts(ss_corpus.entries[i].id, &patch, &matches));
+            ASSERT(matches);
+            ASSERT_EQ(patch.file_count, ss_corpus.entries[i].file_count);
         }
         ASSERT_EQ(real, (size_t)20);
         for (unsigned k = 0; k < ZCL_SHADOW_KIND__COUNT; k++) ASSERT(kinds[k]);
         PASS();
     } _test_next:;
+    return failures;
+}
+
+static int ss_test_missing_patch(void)
+{
+    int failures = 0;
+    char directory[512] = "";
+    bool created = false;
+    TEST("shadow select: missing real patch and absent fixture directory refuse") {
+        ASSERT(ss_load_corpus());
+        const struct zcl_shadow_entry *entry = ss_entry("real-01");
+        ASSERT(entry != NULL);
+        created = test_mkdtemp(directory, sizeof(directory), "shadow_missing") != NULL;
+        ASSERT(created);
+        struct zcl_shadow_weights weights = {0};
+        struct zcl_shadow_eval_ctx ctx = {
+            .root = ".", .fixture_dir = directory, .weights = &weights};
+        char why[128] = "";
+        ASSERT(!zcl_shadow_evaluate(&ctx, entry, &ss_rows[0], why, sizeof(why)));
+        ASSERT_STR_EQ(why, "patch_bytes_unavailable_real-01");
+        ASSERT(!ss_rows[0].bytes_verified);
+        ctx.fixture_dir = NULL;
+        ASSERT(!zcl_shadow_evaluate(&ctx, entry, &ss_rows[0], why, sizeof(why)));
+        PASS();
+    } _test_next:;
+    if (created) test_cleanup_tmpdir(directory);
     return failures;
 }
 
@@ -964,6 +995,7 @@ int test_dev_shadow_select(void)
     failures += ss_test_corpus_weights_nul();
     failures += ss_test_lint_premise();
     failures += ss_test_corpus_frozen();
+    failures += ss_test_missing_patch();
     failures += ss_test_weights();
     failures += ss_test_synthetic_facts();
     failures += ss_test_contract_tokens();

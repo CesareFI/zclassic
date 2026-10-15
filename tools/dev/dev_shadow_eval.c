@@ -12,7 +12,6 @@
 #include "base/safe_alloc.h"
 #include "codeindex/codeindex.h"
 #include "sha3/sha3.h"
-#include "util/spawn.h"
 
 #include <stdarg.h>
 #include <stdlib.h>
@@ -166,7 +165,7 @@ static bool shadow_read_file(const char *path, uint8_t *buf, size_t cap,
     if (!f) return false;
     *len = fread(buf, 1, cap, f);
     bool ok = !ferror(f) && *len < cap;
-    fclose(f);
+    if (fclose(f) != 0) ok = false;
     return ok;
 }
 
@@ -174,22 +173,13 @@ static bool shadow_load_patch(const struct zcl_shadow_eval_ctx *ctx,
                               const struct zcl_shadow_entry *e, uint8_t *buf,
                               size_t cap, size_t *len)
 {
-    if (e->kind != ZCL_SHADOW_KIND_REAL) {
-        char path[1024];
-        int n = snprintf(path, sizeof(path), "%s/%s.patch", ctx->fixture_dir,
-                         e->id);
-        return n > 0 && (size_t)n < sizeof(path) &&
-               shadow_read_file(path, buf, cap, len);
-    }
-    const char *argv[24];
-    if (!zcl_shadow_real_patch_argv(ctx->root, e->commit, argv, 24))
-        return false;
-    struct zcl_spawn_binary_observation obs = {0};
-    struct zcl_result r =
-        zcl_spawn_capture_binary(argv, buf, cap, 60000, &obs);
-    if (!r.ok) return false;
-    *len = obs.output_len;
-    return true;
+    /* Frozen inputs must survive source-history baselines and offline clones.
+     * Real rows retain their original commit and exact diff hash as provenance. */
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s.patch", ctx->fixture_dir,
+                     e->id);
+    return n > 0 && (size_t)n < sizeof(path) &&
+           shadow_read_file(path, buf, cap, len);
 }
 
 static bool shadow_same_file_set(const struct zcl_shadow_entry *e,
@@ -805,7 +795,8 @@ bool zcl_shadow_evaluate(const struct zcl_shadow_eval_ctx *ctx,
                          struct zcl_shadow_result *out, char *why,
                          size_t why_len)
 {
-    if (!ctx || !ctx->root || !ctx->weights || !entry || !out) return false;
+    if (!ctx || !ctx->root || !ctx->fixture_dir || !ctx->weights ||
+        !entry || !out) return false;
     memset(out, 0, sizeof(*out));
     (void)snprintf(out->id, sizeof(out->id), "%s", entry->id);
     (void)snprintf(out->component, sizeof(out->component), "%s",

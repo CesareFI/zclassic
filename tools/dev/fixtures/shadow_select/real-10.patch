@@ -1,0 +1,74 @@
+diff --git a/contexts/commons/services/src/package_lifecycle.c b/contexts/commons/services/src/package_lifecycle.c
+index 6220941ed87859d3d15bd7fa5c5424ecf981da0b..7647ce62b9dbee8784b09b188e29638f1f8eacd3 100644
+--- a/contexts/commons/services/src/package_lifecycle.c
++++ b/contexts/commons/services/src/package_lifecycle.c
+@@ -17,6 +17,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/stat.h>
+ 
+ /* ── the DAG loader ─────────────────────────────────────────────────── */
+ 
+@@ -144,6 +145,20 @@ static struct zcl_result pkgl_plan_path(const struct pkgl_ctx *ctx,
+     zcl_hex_encode(plan_id, 32, hex);
+     char rel[96];
+     (void)snprintf(rel, sizeof(rel), "addplans/%s", hex);
++#ifndef _WIN32
++    char parent[PKGL_PATH_MAX];
++    ZCL_CHECK(pkgl_join(ctx, "addplans", parent, sizeof(parent)));
++    struct stat st;
++    if (lstat(parent, &st) == 0) {
++        if (!S_ISDIR(st.st_mode))
++            return ZCL_ERR(-1, "plan parent is not a real directory; "
++                               "inspect the substituted path and restore "
++                               "the local addplans directory: %s", parent);
++    } else if (errno != ENOENT) {
++        return ZCL_ERR(-1, "inspect plan parent %s: %s", parent,
++                       strerror(errno));
++    }
++#endif
+     return pkgl_join(ctx, rel, out, cap);
+ }
+ 
+diff --git a/tests/harness/src/test_zcode_add.c b/tests/harness/src/test_zcode_add.c
+index 00a5298438f2527aaa4b23400f7a85c092e9f86d..9bce2bdc2fab368e4cf25325541dfc9b3b534b2c 100644
+--- a/tests/harness/src/test_zcode_add.c
++++ b/tests/harness/src/test_zcode_add.c
+@@ -1391,6 +1391,28 @@ static int t_installed_root_symlink(const char *base, const char *zcode,
+     return failures;
+ }
+ 
++static int t_addplans_parent_symlink(const char *base, const char *zcode,
++                                     int64_t now_unix)
++{
++    int failures = 0;
++    char parent[4400], outside[4400], outside_abs[4400];
++    snprintf(parent, sizeof(parent), "%s/addplans", zcode);
++    snprintf(outside, sizeof(outside), "%s/escaped-addplans", base);
++    bool ready = za_mkdir_p(outside) &&
++        test_abs_path(outside, outside_abs, sizeof(outside_abs)) &&
++        symlink(outside_abs, parent) == 0;
++    struct package_lifecycle_plan_report plan;
++    struct zcl_result planned = package_lifecycle_plan(
++        base, "alice/ringbuffer", now_unix, &plan);
++    ZA_CHECK("planning refuses an addplans directory outside the store",
++             ready && !planned.ok &&
++                 strstr(planned.message, "plan") != NULL &&
++                 za_dir_entries(outside) == 0);
++    ZA_CHECK("addplans parent link fixture removed",
++             ready && unlink(parent) == 0);
++    return failures;
++}
++
+ static int t_buildwork_parent_symlink(const char *base, const char *zcode,
+                                       const char *installed_dir,
+                                       const char *root_hex, int64_t now_unix)
+@@ -1491,6 +1513,7 @@ static int t_e2e(void)
+     }
+ 
+     const int64_t t0 = 1700000000;
++    failures += t_addplans_parent_symlink(base, zcode, t0);
+     struct package_lifecycle_plan_report plan;
+     struct zcl_result r =
+         package_lifecycle_plan(base, "alice/ringbuffer", t0, &plan);

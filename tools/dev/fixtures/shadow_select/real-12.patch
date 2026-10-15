@@ -1,0 +1,159 @@
+diff --git a/contexts/commons/modules/vcs/src/vcs.c b/contexts/commons/modules/vcs/src/vcs.c
+index c7ac23466addcf676c929abc99800bb27e9beec1..0707b6c1d08718845cfea87ba51207c9f9ce4fe4 100644
+--- a/contexts/commons/modules/vcs/src/vcs.c
++++ b/contexts/commons/modules/vcs/src/vcs.c
+@@ -103,13 +103,63 @@ bool vcs_tree_load(const char *repo_root, const uint8_t tree_hash[32],
+     return manifest_load(repo_root, tree_hash, out);
+ }
+ 
+-bool load_commit_by_id(const char *repo, const uint8_t commit_id[32],
+-                       struct vcs_commit *out)
++struct commit_recovery {
++    const uint8_t *wanted;
++    uint8_t preimage[VCS_COMMIT_PREIMAGE_BYTES];
++    bool found;
++    bool error;
++};
++
++static bool commit_recovery_cb(uint64_t offset, enum event_log_type type,
++                               const void *payload, size_t len, void *user)
++{
++    (void)offset;
++    struct commit_recovery *ctx = user;
++    if (type != EV_VCS_COMMIT || len != VCS_COMMIT_RECORD_BYTES)
++        return true;
++    struct vcs_commit commit;
++    bool self_ok = false;
++    if (!vcs_commit_deserialize(payload, len, &commit, &self_ok) || !self_ok)
++        return true;
++    uint8_t id[32];
++    if (!vcs_commit_id(&commit, id)) {
++        ctx->error = true;
++        return false;
++    }
++    if (memcmp(id, ctx->wanted, sizeof(id)) != 0)
++        return true;
++    memcpy(ctx->preimage, payload, sizeof(ctx->preimage));
++    ctx->found = true;
++    return false;
++}
++
++static bool repair_commit_from_log(const char *repo, event_log_t *log,
++                                   const uint8_t id[32])
++{
++    if (!log)
++        LOG_FAIL("vcs", "no open commit log for recovery");
++    struct commit_recovery ctx = {.wanted = id};
++    int streamed = event_log_stream(log, 0, commit_recovery_cb, &ctx);
++    if (streamed != 0 || ctx.error || !ctx.found)
++        LOG_FAIL("vcs", "no verified commit record for object");
++    uint8_t repaired_id[32];
++    if (!vcs_object_put_repair(repo, ctx.preimage, sizeof(ctx.preimage),
++                               VCS_TAG_COMMIT, repaired_id, NULL) ||
++        memcmp(repaired_id, id, sizeof(repaired_id)) != 0)
++        LOG_FAIL("vcs", "repair exact commit object");
++    return true;
++}
++
++static bool load_commit_with_log(const char *repo, event_log_t *log,
++                                 const uint8_t commit_id[32],
++                                 struct vcs_commit *out)
+ {
+     uint8_t *pre = NULL;
+     size_t prelen = 0;
+-    if (vcs_object_get(repo, commit_id, VCS_TAG_COMMIT, &pre, &prelen) != 0)
+-        LOG_FAIL("vcs", "load commit object");
++    if (vcs_object_get(repo, commit_id, VCS_TAG_COMMIT, &pre, &prelen) != 0 &&
++        (!repair_commit_from_log(repo, log, commit_id) ||
++         vcs_object_get(repo, commit_id, VCS_TAG_COMMIT, &pre, &prelen) != 0))
++        LOG_FAIL("vcs", "load or recover commit object");
+     bool ok = vcs_commit_parse_preimage(pre, prelen, out);
+     free(pre);
+     if (!ok)
+@@ -117,6 +167,12 @@ bool load_commit_by_id(const char *repo, const uint8_t commit_id[32],
+     return true;
+ }
+ 
++bool load_commit_by_id(const char *repo, const uint8_t commit_id[32],
++                       struct vcs_commit *out)
++{
++    return load_commit_with_log(repo, NULL, commit_id, out);
++}
++
+ /* ── open / close ────────────────────────────────────────────────── */
+ 
+ struct vcs_repo *vcs_open(const char *repo_root)
+@@ -391,7 +447,7 @@ int vcs_status(struct vcs_repo *r, vcs_diff_cb cb, void *user,
+     }
+     if (have_head) {
+         struct vcs_commit hc;
+-        if (!load_commit_by_id(r->root, head_id, &hc) ||
++        if (!load_commit_with_log(r->root, r->log, head_id, &hc) ||
+             !manifest_load(r->root, hc.tree_hash, &head)) {
+             vcs_manifest_free(&cur);
+             LOG_ERR("vcs", "load HEAD manifest");
+diff --git a/tests/harness/src/test_vcs_core.c b/tests/harness/src/test_vcs_core.c
+index 38d8f9a2bbd18d59e7f23aa43a1664f9a5b02eae..8d411f7e62440d90d263d72f79addff2f367777b 100644
+--- a/tests/harness/src/test_vcs_core.c
++++ b/tests/harness/src/test_vcs_core.c
+@@ -2042,6 +2042,49 @@ static void seed_worktree(const char *dir)
+     vc_write(dir, "docs/notes.md", "# notes\n");
+ }
+ 
++static int t_logged_commit_cas_recovery(const char *dir)
++{
++    int failures = 0;
++    seed_worktree(dir);
++    struct vcs_repo *repo = vcs_open(dir);
++    VC_CHECK("commit recovery: repository opens", repo != NULL);
++    if (!repo) return failures + 1;
++    struct vcs_snapshot_meta meta = {
++        .verdict_status = 1, .phase = "green", .task_ref = "durable-log",
++    };
++    uint8_t commit_root[32];
++    bool snapped = vcs_snapshot(repo, &meta, commit_root) == VCS_OK;
++    VC_CHECK("commit recovery: complete record and HEAD persist", snapped);
++    vcs_close(repo);
++    if (!snapped) return failures;
++    char hex[65], path[4096];
++    zcl_hex_encode(commit_root, 32, hex);
++    int n = snprintf(path, sizeof(path), "%s/.zvcs/objects/%.2s/%s",
++                     dir, hex, hex + 2);
++    int fd = n > 0 && (size_t)n < sizeof(path)
++        ? open(path, O_WRONLY) : -1;
++    uint8_t poison = 0xff;
++    bool damaged = fd >= 0 && pwrite(fd, &poison, 1, 0) == 1;
++    if (fd >= 0) close(fd);
++    VC_CHECK("commit recovery: by-id object is malformed", damaged);
++    repo = vcs_open(dir);
++    VC_CHECK("commit recovery: repository reopens", repo != NULL);
++    if (!repo) return failures + 1;
++    size_t changes = SIZE_MAX;
++    VC_CHECK("commit recovery: HEAD reloads from exact logged record",
++             damaged && vcs_status(repo, NULL, NULL, &changes) == VCS_OK &&
++             changes == 0);
++    uint8_t *wire = NULL;
++    size_t wire_len = 0;
++    VC_CHECK("commit recovery: original CAS root reloads",
++             vcs_object_get(dir, commit_root, VCS_TAG_COMMIT,
++                            &wire, &wire_len) == 0 &&
++             wire_len == VCS_COMMIT_PREIMAGE_BYTES);
++    free(wire);
++    vcs_close(repo);
++    return failures;
++}
++
+ #if defined(_WIN32)
+ /* History verbs stay named-refused until POSIX mode capture is qualified.
+  * Materialize is a separate byte-reconstruction path and is proven above. */
+@@ -2949,6 +2992,10 @@ int test_vcs_core(void)
+     failures += t_snapshot_status_revert(dir);
+     test_rm_rf_recursive(dir);
+ 
++    test_make_tmpdir(dir, sizeof(dir), "vcs_core", "commit_recovery");
++    failures += t_logged_commit_cas_recovery(dir);
++    test_rm_rf_recursive(dir);
++
+     test_make_tmpdir(dir, sizeof(dir), "vcs_core", "atomicrevert");
+     failures += t_revert_atomic_failure(dir);
+     test_rm_rf_recursive(dir);
