@@ -1493,7 +1493,7 @@ static int runtime_session_cap_before_target(void)
         ASSERT(extra < 0); if (extra >= 0) close(extra);
         ASSERT_EQ(kill(fixture.receiver.pid, SIGTERM), 0);
         ASSERT(runtime_process_wait(&fixture.receiver, clock_now_monotonic_ns() + INT64_C(3000000000)));
-        ASSERT(runtime_terminal(&fixture.receiver, "eof")); /* winner cancelled, listener already closed */
+        ASSERT(runtime_terminal(&fixture.receiver, "cancelled")); /* cancel flag wins over the drained loop */
         ASSERT(strstr(fixture.receiver.diagnostic_text, "accepted=1 ") != NULL);
     } TEST_END
     for (int i = 0; i < CLIENTS; ++i) { device_host_psk_destroy(&session[i]); runtime_test_close(&carrier[i]); }

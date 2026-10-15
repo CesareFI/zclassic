@@ -572,6 +572,9 @@ static enum device_host_bridge_result runtime_receiver_loop(const struct device_
             out->error_number = errno; return DEVICE_HOST_BRIDGE_IO_ERROR;
         }
     }
+    /* A cancel observed by a slot deadline check can drain the loop before the top check sees it. */
+    if (spec->common.cancelled && atomic_load_explicit(spec->common.cancelled, memory_order_relaxed))
+        return DEVICE_HOST_BRIDGE_CANCELLED;
     /* Pre-auth flood ceiling reached: listener closed, distinct from a clean lifetime end. */
     return out->preauth_refused >= DEVICE_HOST_RUNTIME_PREAUTH_MAX ? DEVICE_HOST_BRIDGE_REFUSED : DEVICE_HOST_BRIDGE_EOF;
 }
