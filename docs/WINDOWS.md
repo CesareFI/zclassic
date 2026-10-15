@@ -524,9 +524,10 @@ there and does not close the session; end a session with `exit` or by closing
 the terminal.
 
 A paired machine opens the terminal with
-`z23 ops mesh terminal --pairing_id=<64hex>`, which lands separately; until it
-does, use the `mesh_terminal_open`, `mesh_terminal_poll` and
-`mesh_terminal_read` RPC methods.
+`z23 ops mesh terminal --pairing_id=<64hex>` from a POSIX terminal; the client
+itself refuses on Windows with PLATFORM_UNSUPPORTED. The `mesh_terminal_open`,
+`mesh_terminal_poll` and `mesh_terminal_read` RPC methods remain available to
+programs.
 
 Native proof is the `mesh_terminal_worker` program in the acceptance catalog
 (`tests/harness/src/mesh_terminal_worker_windows_acceptance.c`). On a Windows

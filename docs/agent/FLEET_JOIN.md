@@ -66,7 +66,7 @@ terminal opens with `CONFINEMENT_UNAVAILABLE`. The owner can start the node
 with `-terminalacceptunconfined` to turn the lane on anyway: the remote shell
 then runs as your Windows user with all its rights, and only peers you paired
 with the terminal capability can open it. A paired machine connects with
-`z23 ops mesh terminal --pairing_id=<64hex>` (landing separately). A
+`z23 ops mesh terminal --pairing_id=<64hex>`. A
 restricted-identity launch remains the intended follow-up. Without the flag this
 is a missing capability on a real member, not a reason to join from somewhere
 else.
