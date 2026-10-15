@@ -40,7 +40,7 @@ static void outcome_handler(const struct zcl_command_request *request,
         zcl_alloc_fault_fail_nth(outcome_fault_label, outcome_fault_index);
 }
 
-static size_t outcome_execute(char *out, size_t capacity,
+static size_t outcome_execute(char *out, size_t capacity, size_t budget,
                               enum zcl_command_exit *code)
 {
     const struct zcl_command_registry *catalog = zcl_command_catalog();
@@ -70,7 +70,7 @@ static size_t outcome_execute(char *out, size_t capacity,
     }
     size_t used = zcl_command_registry_execute_json(
         &registry, &spec, &context, &input, false, spec.path, "normal",
-        0, 0, NULL, out, capacity, code);
+        budget, 0, NULL, out, capacity, code);
     json_free(&input);
     return used;
 }
@@ -85,7 +85,7 @@ static int authority_copy_refusal(const char *label, unsigned index)
     outcome_fault_index = index;
     outcome_fault_label = label;
     TEST("actual execute refuses incomplete authority after an observed effect") {
-        size_t used = outcome_execute(out, sizeof(out), &code);
+        size_t used = outcome_execute(out, sizeof(out), 0, &code);
         consumed = zcl_alloc_fault_armed_label() == NULL;
         zcl_alloc_fault_clear();
         ASSERT(used > 0);
@@ -109,7 +109,7 @@ static int authority_success(void)
     enum zcl_command_exit code = ZCL_COMMAND_EXIT_INTERNAL;
     outcome_fault_index = 0;
     TEST("actual execute emits the complete exempt authority without a fault") {
-        ASSERT(outcome_execute(out, sizeof(out), &code) > 0);
+        ASSERT(outcome_execute(out, sizeof(out), 0, &code) > 0);
         ASSERT_EQ(code, ZCL_COMMAND_EXIT_OK);
         ASSERT(strstr(out, "\"policy\":\"exempt\"") != NULL);
         ASSERT(strstr(out, "\"agent_session\":\"none (local operator)\"") != NULL);
@@ -125,7 +125,7 @@ static int authority_bounded_debit(void)
     outcome_bounded = true; outcome_debit = true; outcome_authorize_calls = 0;
     node_rpc_client_set_test_hook(outcome_policy_rpc);
     TEST("rendered bounded authority keeps the observed debit and remaining window") {
-        ASSERT(outcome_execute(out, sizeof(out), &code) > 0);
+        ASSERT(outcome_execute(out, sizeof(out), 0, &code) > 0);
         ASSERT_EQ(code, ZCL_COMMAND_EXIT_OK); ASSERT_EQ(outcome_authorize_calls, 1);
         ASSERT(strstr(out, "\"policy\":\"bounded\"") != NULL);
         ASSERT(strstr(out, "\"debited_zat\":7") != NULL);
@@ -134,6 +134,22 @@ static int authority_bounded_debit(void)
     } _test_next:;
     failures += authority_copy_refusal("json_copy_children", 1);
     node_rpc_client_set_test_hook(NULL); outcome_bounded = false; outcome_debit = false;
+    return failures;
+}
+
+static int outcome_no_fallback_space(size_t capacity, size_t budget)
+{
+    int failures = 0;
+    char out[8192] = "";
+    enum zcl_command_exit code = ZCL_COMMAND_EXIT_OK;
+    outcome_effect_observed = false;
+    outcome_fault_index = 0;
+    TEST("effect with no room for a fallback still returns INTERNAL") {
+        ASSERT_EQ(outcome_execute(out, capacity, budget, &code), 0);
+        ASSERT(outcome_effect_observed);
+        ASSERT_EQ(code, ZCL_COMMAND_EXIT_INTERNAL);
+        PASS();
+    } _test_next:;
     return failures;
 }
 
@@ -146,5 +162,7 @@ int test_command_outcome(void)
     failures += authority_copy_refusal("json_children", 3);
     failures += authority_copy_refusal("json_copy_children", 1);
     failures += authority_bounded_debit();
+    failures += outcome_no_fallback_space(1, 0);
+    failures += outcome_no_fallback_space(8192, 1);
     return failures;
 }
