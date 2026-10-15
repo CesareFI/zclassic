@@ -220,3 +220,15 @@ later lane flips it HARD.
 - 2026-10-14T10:41:30Z — REASON: Bound noise_transport_handshake_msg_len to the pattern message count
   old ROOT: 8b5071ca8f1b0461a49415ea9c8caaf136bb04813b2679e3b37e947120199034
   by: owner unseal ritual (make core-unseal)
+
+- 2026-10-14T18:37:44Z — REASON: Close plaintext links to bit-26 peers after the version exchange and drop plaintext answers to Noise dials
+  old ROOT: f87c32240baece368b8380f1f761f943acba6aea39c14079134774893f12e538
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-10-14T20:11:32Z — REASON: Quarantine plaintext inbound links from bit-26 peers until the dialer upgrades
+  old ROOT: ecef828a7c16dacc309c82a33ae08bfc9005124ca731a53cb3fa70529e7c0e28
+  by: owner unseal ritual (make core-unseal)
+
+- 2026-10-14T22:47:31Z — REASON: Quarantine plaintext inbound links from bit-26 peers until the dialer upgrades
+  old ROOT: 8320d67a5ccc0e220f0177df882b7573505a921b545295ee076aadb731a61bac
+  by: owner unseal ritual (make core-unseal)

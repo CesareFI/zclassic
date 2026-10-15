@@ -2189,7 +2189,7 @@ bool msg_process_messages(void *ctx, struct p2p_node *node)
         mp->zcode_swarm_tick(mp, node, mp->zcode_swarm_ctx);
 
     size_t processed = 0;
-    while (!node->disconnect &&
+    while (!p2p_node_processing_halted(node) &&
            processed < ZCL_MSG_PROCESS_MAX_PER_CYCLE) {
         zcl_mutex_lock(&node->cs_recv);
         if (node->recv_msg_count == 0 ||

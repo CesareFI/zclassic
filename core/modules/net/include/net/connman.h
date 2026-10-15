@@ -322,6 +322,16 @@ struct connman {
     struct thread_bounded_wait dial_bounded_wait;
 };
 
+/* True when a peer short of PEER_HANDSHAKE_COMPLETE exceeded its version,
+ * Noise handshake or Noise quarantine deadline at now_check. */
+bool connman_handshake_overdue(const struct p2p_node *n, int64_t now_check);
+
+/* One sweep step: flags the peer for disconnect when connman_handshake_overdue
+ * holds.  Returns true when the peer was flagged. */
+bool connman_sweep_handshake_deadline(struct connman *cm, struct p2p_node *n,
+                                      int64_t now_check, bool is_addnode,
+                                      size_t addnode_index);
+
 /* Persist a newly learned NODE_NOISE_HYBRID capability in the existing
  * addrman/addnode dial sources and mark the outbound plaintext connection for
  * one controlled reconnect.  Returns true only for the first upgrade request

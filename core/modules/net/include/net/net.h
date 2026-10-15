@@ -48,6 +48,9 @@
 
 typedef int32_t node_id_t;
 
+/* Longest a quarantined plaintext inbound link may stay open. */
+#define P2P_NOISE_QUARANTINE_SECS 10
+
 /* The first request owns the causal disconnect record until cleanup.  Keep
  * reason and source typed so recovery policy and telemetry never have to infer
  * cause from a final generic "cleanup" string. */
@@ -299,6 +302,12 @@ struct p2p_node {
 
     int64_t last_send;
     int64_t last_recv;
+    /* Non-zero (wall-clock seconds) while a plaintext inbound link to a
+     * NODE_NOISE_HYBRID peer is quarantined: received messages are left
+     * unprocessed and nothing is relayed until the dialer upgrades to Noise or
+     * the P2P_NOISE_QUARANTINE_SECS deadline expires. Written by the message
+     * thread, read by the socket thread. */
+    _Atomic int64_t noise_quarantine_since;
     int64_t time_connected;
     int64_t time_offset;
     struct net_address addr;
@@ -738,6 +747,9 @@ bool p2p_node_request_disconnect(
     enum p2p_disconnect_source source, uint64_t endpoint_generation);
 const char *p2p_disconnect_reason_name(enum p2p_disconnect_reason reason);
 const char *p2p_disconnect_source_name(enum p2p_disconnect_source source);
+
+/* True while the node is disconnecting or its plaintext link is quarantined. */
+bool p2p_node_processing_halted(const struct p2p_node *node);
 
 /* Structured close line — the pair to the "peer_connected" JSON line emitted
  * when a session opens.  Before this the close side reached only the event

@@ -2,7 +2,9 @@
  *
  * noise_upgrade.c — one-shot legacy-to-Noise reconnect policy. */
 
+#include <stdatomic.h>
 #include "net/connman.h"
+#include "core/utiltime.h"
 #include "net/noise_transport.h"
 #include "util/log_macros.h"
 
@@ -62,4 +64,27 @@ bool connman_request_noise_upgrade(struct connman *cm, struct p2p_node *node)
     LOG_INFO("net", "peer %s advertised Noise transport; capability persisted "
              "and controlled Noise reconnect requested", node->addr_name);
     return true;
+}
+
+/* True when a peer short of PEER_HANDSHAKE_COMPLETE exceeded the 90 s version
+ * handshake budget, the Noise handshake budget, or its Noise quarantine. */
+bool connman_handshake_overdue(const struct p2p_node *n, int64_t now_check)
+{
+    const int64_t quarantined_since = atomic_load_explicit(
+        &n->noise_quarantine_since, memory_order_acquire);
+    return n->state < PEER_HANDSHAKE_COMPLETE &&
+           ((n->time_connected > 0 && now_check - n->time_connected > 90) ||
+            noise_transport_handshake_expired(n->transport, GetTimeMicros()) ||
+            (quarantined_since > 0 &&
+             now_check - quarantined_since > P2P_NOISE_QUARANTINE_SECS));
+}
+
+/* A node stops processing messages once it is disconnecting or while its
+ * plaintext link is quarantined (queued messages are neither parsed nor
+ * relayed; the quarantine deadline closes the link). */
+bool p2p_node_processing_halted(const struct p2p_node *node)
+{
+    return node->disconnect ||
+           atomic_load_explicit(&node->noise_quarantine_since,
+                                memory_order_acquire) != 0;
 }

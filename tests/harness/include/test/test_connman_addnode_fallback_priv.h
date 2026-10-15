@@ -84,4 +84,8 @@ int check_connman_addnode_operator_local_sockets_stay(void);
 int check_connman_addnode_feeler_does_not_evict(void);
 int check_connman_addnode_unreserved_dial_serial(void);
 
+/* test_connman_noise_required.c — plaintext links to bit-26 peers are
+ * refused while Noise is enabled; a Noise initiator drops plaintext answers. */
+int check_connman_noise_required(void);
+
 #endif

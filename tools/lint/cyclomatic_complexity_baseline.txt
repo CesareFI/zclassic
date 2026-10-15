@@ -1178,7 +1178,7 @@ core/modules/net/src/connman.c:connman_get_outbound_health:33
 core/modules/net/src/connman.c:connman_pick_next_outbound_target:18
 core/modules/net/src/connman.c:connman_run_message_cycle:17
 core/modules/net/src/connman.c:thread_dns_seed:28
-core/modules/net/src/connman.c:thread_socket_handler:90
+core/modules/net/src/connman.c:thread_socket_handler:89
 core/modules/net/src/connman_dialer.c:connman_dial_batch:25
 core/modules/net/src/connman_dialer.c:connman_gather_dial_candidates:32
 core/modules/net/src/connman_dialer.c:thread_open_connections:23
@@ -1243,7 +1243,7 @@ core/modules/net/src/msg_headers.c:push_getheaders_from:37
 core/modules/net/src/msg_tx.c:process_inv:25
 core/modules/net/src/msg_tx.c:process_tx_msg:24
 core/modules/net/src/msg_version.c:msg_version_parse_build_identity_prefix:16
-core/modules/net/src/msg_version.c:process_version:29
+core/modules/net/src/msg_version.c:process_version:28
 core/modules/net/src/msgprocessor.c:handle_zfilelist:19
 core/modules/net/src/msgprocessor.c:msg_block_intake_worker:19
 core/modules/net/src/msgprocessor.c:msg_process_messages:24
@@ -1267,7 +1267,7 @@ core/modules/net/src/net_listen.c:accept_connection:33
 core/modules/net/src/net_listen.c:bind_listen_port:17
 core/modules/net/src/netaddr.c:net_addr_get_group:19
 core/modules/net/src/netbase.c:split_host_port:19
-core/modules/net/src/noise_transport.c:noise_transport_feed:42
+core/modules/net/src/noise_transport.c:noise_transport_feed:37
 core/modules/net/src/onion_directory.c:onion_directory_parse_relay_hints:23
 core/modules/net/src/onion_directory.c:onion_service_directory_observe:20
 core/modules/net/src/onion_identity.c:onion_identity_ensure:18

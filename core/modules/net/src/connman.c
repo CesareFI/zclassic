@@ -1253,21 +1253,15 @@ size_t connman_harvest_census_candidates(struct connman *cm,
     return harvested;
 }
 
-/* True when a peer short of PEER_HANDSHAKE_COMPLETE exceeded the 90 s version
- * handshake budget or the Noise handshake budget. */
-static bool connman_handshake_overdue(const struct p2p_node *n, int64_t now_check)
+/* One sweep step: when the peer's handshake or quarantine deadline passed,
+ * drops it and records the failure against its addnode entry, if any.
+ * Returns true when the peer was flagged. */
+bool connman_sweep_handshake_deadline(struct connman *cm, struct p2p_node *n,
+                                      int64_t now_check, bool is_addnode,
+                                      size_t addnode_index)
 {
-    return n->state < PEER_HANDSHAKE_COMPLETE &&
-           ((n->time_connected > 0 && now_check - n->time_connected > 90) ||
-            noise_transport_handshake_expired(n->transport, GetTimeMicros()));
-}
-
-/* Drops a peer whose handshake missed its deadline and records the failure
- * against its addnode entry, if any. */
-static void connman_disconnect_handshake_timeout(
-    struct connman *cm, struct p2p_node *n, int64_t now_check,
-    bool is_addnode, size_t addnode_index)
-{
+    if (!connman_handshake_overdue(n, now_check))
+        return false;
     event_emitf(EV_TCP_TIMEOUT, (uint32_t)n->id, "handshake %llds state=%s",
                 (long long)(now_check - n->time_connected),
                 peer_state_name(n->state));
@@ -1281,6 +1275,7 @@ static void connman_disconnect_handshake_timeout(
     (void)p2p_node_request_disconnect(n, P2P_DISCONNECT_HANDSHAKE_TIMEOUT,
                                       P2P_DISCONNECT_SOURCE_DIAL_SCHEDULER,
                                       n->endpoint_generation);
+    return true;
 }
 
 static void *thread_socket_handler(void *arg)
@@ -1687,9 +1682,8 @@ static void *thread_socket_handler(void *arg)
 
                 /* Version handshake: 90 s, because the message loop that reads it shares
                  * a thread with chain activation. Noise: 15 s, read on this thread. */
-                if (connman_handshake_overdue(n, now_check))
-                    connman_disconnect_handshake_timeout(
-                        cm, n, now_check, is_addnode, addnode_index);
+                (void)connman_sweep_handshake_deadline(
+                    cm, n, now_check, is_addnode, addnode_index);
             }
         }
 

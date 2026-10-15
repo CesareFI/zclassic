@@ -272,6 +272,39 @@ bool noise_transport_write(struct noise_transport *t, const uint8_t *buf, size_t
 
 enum step_result { STEP_CONSUMED, STEP_NEEDMORE, STEP_STOP, STEP_FAIL };
 
+/* Initiator: consume msg2, answer with msg3 and establish.  An initiator never
+ * downgrades: a plaintext answer (network magic first) means the peer did not
+ * accept Noise, and the link is dropped. */
+static enum step_result
+noise_transport_feed_key_sent_locked(struct noise_transport *t,
+                                     uint8_t **wire, size_t *wlen,
+                                     size_t *wcap)
+{
+    if (t->acc_len >= 4 && memcmp(t->acc, t->magic, 4) == 0) {
+        LOG_INFO("net", "noise initiator received plaintext answer; "
+                 "dropping link");
+        return STEP_FAIL;
+    }
+    const size_t need = noise_transport_handshake_msg_len(1);
+    if (t->acc_len < need)
+        return STEP_NEEDMORE;
+    uint8_t payload[NOISE_MAX_MESSAGE];
+    size_t payload_len = 0;
+    if (!noise_hs_read_message(&t->hs, t->acc, need, payload, &payload_len))
+        return STEP_FAIL;
+    uint8_t msg3[NOISE_MAX_MESSAGE];
+    size_t msg3_len = 0;
+    if (!noise_hs_write_message(&t->hs, NULL, 0, msg3, &msg3_len))
+        return STEP_FAIL;
+    if (!buf_append(wire, wlen, wcap, msg3, msg3_len))
+        return STEP_FAIL;
+    if (!establish_and_flush_locked(t, wire, wlen, wcap))
+        return STEP_FAIL;
+    memmove(t->acc, t->acc + need, t->acc_len - need);
+    t->acc_len -= need;
+    return STEP_CONSUMED;
+}
+
 bool noise_transport_feed(struct noise_transport *t,
                        const uint8_t *in, size_t n,
                        uint8_t **wire_out, size_t *wire_out_len,
@@ -342,31 +375,9 @@ bool noise_transport_feed(struct noise_transport *t,
             r = STEP_CONSUMED;
             break;
         }
-        case NOISE_KEY_SENT: {
-            const size_t need = noise_transport_handshake_msg_len(1);
-            if (t->acc_len < need) { r = STEP_NEEDMORE; break; }
-            uint8_t payload[NOISE_MAX_MESSAGE];
-            size_t payload_len = 0;
-            if (!noise_hs_read_message(&t->hs, t->acc, need,
-                                       payload, &payload_len)) {
-                r = STEP_FAIL; break;
-            }
-            uint8_t msg3[NOISE_MAX_MESSAGE];
-            size_t msg3_len = 0;
-            if (!noise_hs_write_message(&t->hs, NULL, 0, msg3, &msg3_len)) {
-                r = STEP_FAIL; break;
-            }
-            if (!buf_append(&wire, &wlen, &wcap, msg3, msg3_len)) {
-                r = STEP_FAIL; break;
-            }
-            if (!establish_and_flush_locked(t, &wire, &wlen, &wcap)) {
-                r = STEP_FAIL; break;
-            }
-            memmove(t->acc, t->acc + need, t->acc_len - need);
-            t->acc_len -= need;
-            r = STEP_CONSUMED;
+        case NOISE_KEY_SENT:
+            r = noise_transport_feed_key_sent_locked(t, &wire, &wlen, &wcap);
             break;
-        }
         case NOISE_KEY_RECV: {
             const size_t need = noise_transport_handshake_msg_len(2);
             if (t->acc_len < need) { r = STEP_NEEDMORE; break; }

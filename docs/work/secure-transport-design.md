@@ -328,6 +328,17 @@ magic
 peek → it stays on the untouched v1 path. A zcl23↔zclassicd connection is
 bit-for-bit identical to today.
 
+Plaintext links to Noise-capable peers: a node with Noise enabled never keeps a
+usable plaintext link with a peer whose version message advertises
+`NODE_NOISE_HYBRID`. An outbound plaintext link disconnects with the Noise
+upgrade reason and the redial runs over Noise. An inbound plaintext link is
+quarantined for `P2P_NOISE_QUARANTINE_SECS` (10 s): our version reaches the
+dialer, which upgrades itself, while received messages are left unprocessed and
+nothing is relayed; the link is closed if the dialer stays. An outbound Noise
+initiator that receives a plaintext answer drops the link. Limit: an in-path
+attacker who strips the bit from both versions keeps a plaintext link; stripping
+it on one side only causes quarantine and close, not a downgrade.
+
 Downgrade resistance:
 - Transcript binding: session keys derive from the DH outputs mixed with `h`
   over ALL handshake bytes (§3 prologue + MixHash chain). Any MITM tamper yields

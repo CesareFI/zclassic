@@ -7,6 +7,7 @@
 /* msg_version.c — Version/verack handshake processing.
  * Split from msgprocessor.c for maintainability. */
 
+#include <stdatomic.h>
 #include "platform/time_compat.h"
 #include "platform/socket_compat.h"
 #include "net/msg_internal.h"
@@ -467,6 +468,52 @@ static int64_t peer_time_offset(int64_t peer_ts, int64_t now)
     return peer_ts - now;
 }
 
+/* A plaintext link to a peer that advertises NODE_NOISE_HYBRID is refused
+ * while our own Noise transport is enabled: the link must be rebuilt over
+ * Noise.  Links already carrying a Noise transport are not affected. */
+bool msg_version_plaintext_link_refused(const struct net_manager *nm,
+                                        const struct p2p_node *node)
+{
+    return nm && node && nm->noise_enabled && !node->transport &&
+           (node->services & NODE_NOISE_HYBRID) != 0;
+}
+
+/* Runs after our version and verack are queued.  Requests the one-shot
+ * capability upgrade, then refuses to relay anything further over a plaintext
+ * link to a Noise-capable peer.  Outbound links disconnect with the upgrade
+ * reason so the dial path reconnects over Noise; inbound links are
+ * quarantined so the dialer can read our version and upgrade itself.  True
+ * when the link was refused. */
+static bool msg_version_enforce_noise(struct msg_processor *mp,
+                                      struct p2p_node *node)
+{
+    struct connman *cm = mp->net_mgr ? mp->net_mgr->owner : NULL;
+    const bool upgrade_requested =
+        cm && connman_request_noise_upgrade(cm, node);
+    if (!msg_version_plaintext_link_refused(mp->net_mgr, node))
+        return false;
+    if (node->inbound) {
+        /* Our version is queued and must reach the dialer: an immediate close
+         * would discard it and the dialer could never learn our Noise bit. */
+        atomic_store_explicit(&node->noise_quarantine_since,
+                              (int64_t)platform_time_wall_time_t(),
+                              memory_order_release);
+    } else {
+        (void)p2p_node_request_disconnect(
+            node, P2P_DISCONNECT_NOISE_UPGRADE,
+            P2P_DISCONNECT_SOURCE_MESSAGE_HANDLER, node->endpoint_generation);
+        /* The target already advertised Noise (no upgrade was requested), so
+         * this plaintext fallback must back off like any pre-handshake
+         * failure instead of redialing at once. */
+        if (cm && !upgrade_requested)
+            connman_note_addnode_prehandshake_disconnect(cm, node,
+                                                         "noise-required");
+    }
+    LOG_INFO("net", "peer %s advertises Noise; plaintext link refused",
+             node->addr_name);
+    return true;
+}
+
 bool process_version(struct msg_processor *mp, struct p2p_node *node,
                      struct byte_stream *s)
 {
@@ -592,8 +639,8 @@ bool process_version(struct msg_processor *mp, struct p2p_node *node,
      * in its version message.  Remember that authenticated capability in the
      * existing dial sources and reconnect exactly once; the next connect sees
      * the bit before any bytes are sent and net.c starts Noise XX. */
-    if (mp->net_mgr && mp->net_mgr->owner)
-        (void)connman_request_noise_upgrade(mp->net_mgr->owner, node);
+    if (msg_version_enforce_noise(mp, node))
+        return true;
 
     /* For outbound connections, we already sent version; now we received
      * their version and sent verack. Mark connected once we also get their
