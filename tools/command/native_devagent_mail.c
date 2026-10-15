@@ -172,16 +172,17 @@
 #include "command/native_devagent.h"
 
 #include "base/hex.h"
+#include "sha3/sha3.h"
 #include "base/safe_alloc.h"
 #include "json/json.h"
 #include "zutf8/zutf8.h"
 #include "platform/directory_compat.h"
 #include "platform/private_file.h"
+#include "platform/private_directory.h"
 #include "platform/state_root.h"
 #include "platform/time_compat.h"
 #if defined(_WIN32)
 #include "platform/directory_transaction.h"
-#include "platform/private_directory.h"
 #endif
 
 #include <ctype.h>
@@ -198,6 +199,12 @@
 
 #ifdef ZCL_TESTING
 static zcl_devagent_mail_test_hook_fn dvm_test_after_brief_probe;
+static zcl_devagent_mail_test_hook_fn dvm_test_after_exact_read;
+
+void zcl_devagent_mail_test_set_after_exact_read(zcl_devagent_mail_test_hook_fn hook)
+{
+    dvm_test_after_exact_read = hook;
+}
 static size_t dvm_test_max_seq_scans;
 
 void zcl_devagent_mail_test_set_after_brief_probe(
@@ -765,6 +772,10 @@ static bool dvm_line_str(const char *line, const char *key, char *out,
 }
 
 struct dvm_row {
+    char stream[129];
+    long long row_offset;
+    long long row_end;
+    char row_sha3[65];
     long long seq;
     char ts[64];
     char from[160];
@@ -779,6 +790,19 @@ struct dvm_row {
     char board_post[DVM_BOARD_HEX + 1];
     char board_signer[DVM_BOARD_HEX + 1];
 };
+
+/* Domain includes its NUL; record includes the original terminating newline. */
+static void dvm_row_hash(const char *raw, size_t len, char hex[65])
+{
+    static const char domain[] = "z23.devagent.mail.row.v1";
+    struct sha3_256_ctx ctx;
+    unsigned char sum[32];
+    sha3_256_init(&ctx);
+    sha3_256_write(&ctx, (const unsigned char *)domain, sizeof(domain));
+    sha3_256_write(&ctx, (const unsigned char *)raw, len);
+    sha3_256_finalize(&ctx, sum);
+    zcl_hex_encode(sum, sizeof(sum), hex);
+}
 
 static bool dvm_parse_row(const char *line, struct dvm_row *r)
 {
@@ -1219,6 +1243,7 @@ struct dvm_stream {
 };
 
 struct dvm_pull_state {
+    bool read_failed;
     struct dvm_stream *streams;
     size_t nstreams;
     long long cursor;  /* largest seq seen anywhere, or the floor */
@@ -1554,20 +1579,35 @@ static void dvm_stream_next(struct dvm_stream *s,
     if (!s->f)
         return;
     for (;;) {
+        long long start = (long long)ftell(s->f);
+        if (start < 0) { ps->read_failed = true; return; }
         enum dvm_line_kind k = dvm_read_line(s->f, ps->line, sizeof(ps->line));
         long long end;
         if (k == DVM_LINE_EOF || k == DVM_LINE_PARTIAL)
             return;
         end = (long long)ftell(s->f);
+        if (end < start) { ps->read_failed = true; return; }
         if (k == DVM_LINE_LONG) {
             ps->skipped++;
             s->off = end;
             continue;
         }
+        char hash[65];
+        size_t raw_len = strlen(ps->line);
+        if ((unsigned long long)(end - start) != raw_len) {
+            ps->skipped++;
+            s->off = end;
+            continue;
+        }
+        dvm_row_hash(ps->line, raw_len, hash);
         if (!dvm_row_wanted(ps->line, filter, &s->head, ps)) {
             s->off = end;
             continue;
         }
+        (void)snprintf(s->head.stream, sizeof(s->head.stream), "%s", s->name);
+        s->head.row_offset = start;
+        s->head.row_end = end;
+        memcpy(s->head.row_sha3, hash, sizeof(hash));
         s->head_end = end;
         s->has_head = true;
         return;
@@ -1620,7 +1660,7 @@ static size_t dvm_json_len(const char *s)
  * punctuation and the seq digits (generously). */
 static size_t dvm_row_cost(const struct dvm_row *r)
 {
-    return 160u + dvm_json_len(r->ts) + dvm_json_len(r->from) +
+    return 352u + dvm_json_len(r->stream) + dvm_json_len(r->ts) + dvm_json_len(r->from) +
            dvm_json_len(r->to) + dvm_json_len(r->kind) +
            dvm_json_len(r->body) + dvm_json_len(r->ref) +
            dvm_json_len(r->sender_binding) + dvm_json_len(r->board_post) +
@@ -1693,12 +1733,13 @@ static bool dvm_token_build(const struct dvm_pull_state *ps, long long floor,
  * which says nothing about whether each peer's file was read to its end.
  * Each source reports the bytes this page consumed against the file's size
  * now; complete=false means rows (or a line still being written) remain. */
-static void dvm_pull_sources(struct zcl_command_reply *reply,
+static bool dvm_pull_sources(struct zcl_command_reply *reply,
                              const struct dvm_pull_state *ps)
 {
     struct json_value arr, item;
     json_init(&arr);
     json_set_array(&arr);
+    bool ok = true;
     for (size_t i = 0; i < ps->nstreams; i++) {
         const struct dvm_stream *st = &ps->streams[i];
         struct stat sb;
@@ -1706,16 +1747,17 @@ static void dvm_pull_sources(struct zcl_command_reply *reply,
                                                   : -1;
         json_init(&item);
         json_set_object(&item);
-        (void)json_push_kv_str(&item, "stream", st->name);
-        (void)json_push_kv_int(&item, "consumed", st->off);
-        (void)json_push_kv_int(&item, "size", size);
-        (void)json_push_kv_bool(&item, "complete",
+        ok &= json_push_kv_str(&item, "stream", st->name);
+        ok &= json_push_kv_int(&item, "consumed", st->off);
+        ok &= json_push_kv_int(&item, "size", size);
+        ok &= json_push_kv_bool(&item, "complete",
                                 size >= 0 && st->off == size);
-        (void)json_push_back(&arr, &item);
+        ok &= json_push_back(&arr, &item);
         json_free(&item);
     }
-    (void)json_push_kv(&reply->data, "sources", &arr);
+    ok &= json_push_kv(&reply->data, "sources", &arr);
     json_free(&arr);
+    return ok;
 }
 
 static void dvm_pull_build_reply(struct zcl_command_reply *reply,
@@ -1723,36 +1765,50 @@ static void dvm_pull_build_reply(struct zcl_command_reply *reply,
                                  const struct dvm_pull_state *ps,
                                  const char *token, const char *resumed)
 {
+    if (ps->read_failed) {
+        dvm_fail(reply, "MAIL_READ_FAILED", "mail stream position could not be observed", "ftell");
+        return;
+    }
     struct json_value arr, item;
     json_init(&arr);
     json_set_array(&arr);
+    bool ok = true;
     for (size_t i = 0; i < pg->n; i++) {
         const struct dvm_row *r = &pg->rows[i];
         json_init(&item);
         json_set_object(&item);
-        (void)json_push_kv_int(&item, "seq", r->seq);
-        (void)json_push_kv_str(&item, "ts", r->ts);
-        (void)json_push_kv_str(&item, "from", r->from);
-        (void)json_push_kv_str(&item, "to", r->to);
-        (void)json_push_kv_str(&item, "kind", r->kind);
-        (void)json_push_kv_str(&item, "body", r->body);
-        (void)json_push_kv_str(&item, "ref", r->ref);
-        (void)json_push_kv_str(&item, "sender_binding", r->sender_binding);
-        (void)json_push_kv_str(&item, "board_post", r->board_post);
-        (void)json_push_kv_str(&item, "board_signer", r->board_signer);
-        (void)json_push_back(&arr, &item);
+        ok &= json_push_kv_int(&item, "seq", r->seq);
+        ok &= json_push_kv_str(&item, "stream", r->stream);
+        ok &= json_push_kv_int(&item, "row_offset", r->row_offset);
+        ok &= json_push_kv_int(&item, "row_end", r->row_end);
+        ok &= json_push_kv_str(&item, "row_sha3", r->row_sha3);
+        ok &= json_push_kv_str(&item, "ts", r->ts);
+        ok &= json_push_kv_str(&item, "from", r->from);
+        ok &= json_push_kv_str(&item, "to", r->to);
+        ok &= json_push_kv_str(&item, "kind", r->kind);
+        ok &= json_push_kv_str(&item, "body", r->body);
+        ok &= json_push_kv_str(&item, "ref", r->ref);
+        ok &= json_push_kv_str(&item, "sender_binding", r->sender_binding);
+        ok &= json_push_kv_str(&item, "board_post", r->board_post);
+        ok &= json_push_kv_str(&item, "board_signer", r->board_signer);
+        ok &= json_push_back(&arr, &item);
         json_free(&item);
     }
-    (void)json_push_kv_str(&reply->data, "leaf", DVM_LEAF);
-    (void)json_push_kv(&reply->data, "rows", &arr);
+    ok &= json_push_kv_str(&reply->data, "leaf", DVM_LEAF);
+    ok &= json_push_kv(&reply->data, "rows", &arr);
     json_free(&arr);
-    (void)json_push_kv_int(&reply->data, "cursor", ps->cursor);
-    (void)json_push_kv_int(&reply->data, "count", (long long)pg->n);
-    (void)json_push_kv_bool(&reply->data, "truncated", pg->truncated);
-    (void)json_push_kv_str(&reply->data, "next_since", token);
-    (void)json_push_kv_int(&reply->data, "skipped", ps->skipped);
-    (void)json_push_kv_str(&reply->data, "resumed_from", resumed);
-    dvm_pull_sources(reply, ps);
+    ok &= json_push_kv_int(&reply->data, "cursor", ps->cursor);
+    ok &= json_push_kv_int(&reply->data, "count", (long long)pg->n);
+    ok &= json_push_kv_bool(&reply->data, "truncated", pg->truncated);
+    ok &= json_push_kv_str(&reply->data, "next_since", token);
+    ok &= json_push_kv_int(&reply->data, "skipped", ps->skipped);
+    ok &= json_push_kv_str(&reply->data, "resumed_from", resumed);
+    ok &= dvm_pull_sources(reply, ps);
+    if (!ok) {
+        json_free(&reply->data); json_init(&reply->data); json_set_object(&reply->data);
+        dvm_fail(reply, "MAIL_READ_FAILED", "mail locator projection failed", "json");
+        return;
+    }
     reply->status = ZCL_COMMAND_STATUS_PASSED;
     reply->exit_code = 0;
 }
@@ -2073,6 +2129,163 @@ static void dvm_ack(const struct zcl_command_request *req,
     reply->exit_code = 0;
 }
 
+static bool dvm_exact_selectors(const struct zcl_command_request *req,
+    const char **stream, long long *offset, long long *seq, const char **hash)
+{
+    unsigned char decoded[32];
+    *stream = dvm_str(req, "stream");
+    *hash = dvm_str(req, "row_sha3");
+    return *stream && dvm_cursor_name_ok(*stream) && dvm_is_stream_name(*stream) &&
+        *hash && zcl_hex_decode_lower(*hash, decoded, sizeof(decoded)) &&
+        dvm_int(req, "row_offset", offset) && *offset >= 0 &&
+        dvm_int(req, "seq", seq) && *seq > 0 && dvm_str(req, "ref");
+}
+
+#if !defined(_WIN32)
+static bool dvm_exact_stat_same(const struct stat *before, const struct stat *after)
+{
+    bool same = before->st_size == after->st_size && before->st_mtime == after->st_mtime &&
+        before->st_ctime == after->st_ctime;
+#if defined(__APPLE__)
+    return same && before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec &&
+        before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#else
+    return same && before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+        before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+}
+
+static size_t dvm_exact_newline(char raw[DVM_LINE_CAP], ssize_t got)
+{
+    size_t n = 0;
+    while (got > 0 && n < (size_t)got && raw[n] && raw[n] != '\n') n++;
+    return got > 0 && n < (size_t)got && raw[n] == '\n' ? n + 1 : 0;
+}
+
+/* Read only the selected complete line; conservatively refuse any concurrent
+ * size/mtime change, including append. No pathname is reopened after binding. */
+static bool dvm_exact_stable(int fd, int parent, const char *stream,
+    const struct stat *before)
+{
+    struct stat after, named;
+    return fstat(fd, &after) == 0 && dvm_exact_stat_same(before, &after) &&
+        fstatat(parent, stream, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISREG(named.st_mode) && named.st_dev == before->st_dev && named.st_ino == before->st_ino;
+}
+
+static bool dvm_exact_line(const char *dir, const char *stream, long long offset,
+    char raw[DVM_LINE_CAP])
+{
+    uintptr_t retained;
+    if (!platform_private_directory_open_validated_traverse(dir, &retained)) return false;
+    int parent = (int)retained;
+    int fd = openat(parent, stream, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) { platform_private_directory_close(retained); return false; }
+    struct stat before;
+    char prior;
+    bool ok = fstat(fd, &before) == 0 && S_ISREG(before.st_mode) &&
+        offset < before.st_size && (offset == 0 ||
+        (pread(fd, &prior, 1, (off_t)(offset - 1)) == 1 && prior == '\n'));
+    ssize_t got = ok ? pread(fd, raw, DVM_LINE_CAP - 1, (off_t)offset) : -1;
+    size_t n = dvm_exact_newline(raw, got);
+#ifdef ZCL_TESTING
+    if (dvm_test_after_exact_read) dvm_test_after_exact_read();
+#endif
+    ok = ok && n > 0 && dvm_exact_stable(fd, parent, stream, &before);
+    raw[n] = '\0';
+    (void)close(fd);
+    platform_private_directory_close(retained);
+    return ok;
+}
+#endif
+
+#if !defined(_WIN32)
+static bool dvm_exact_project(struct zcl_command_reply *reply,
+    const struct dvm_row *row, const char *stream, long long offset,
+    const char *hash, const char *raw)
+{
+    const struct { const char *key; const char *value; } fields[] = {
+        {"representation", "zcl.devagent.mail.raw_row.v1"},
+        {"stream", stream}, {"row_sha3", hash}, {"ref", row->ref}, {"raw_line", raw},
+        {"body", row->body}, {"from", row->from}, {"to", row->to}, {"kind", row->kind},
+        {"ts", row->ts}, {"sender_binding", row->sender_binding},
+        {"board_post", row->board_post}, {"board_signer", row->board_signer}};
+    bool ok = json_push_kv_int(&reply->data, "row_offset", offset);
+    ok &= json_push_kv_int(&reply->data, "seq", row->seq);
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+        ok &= json_push_kv_str(&reply->data, fields[i].key, fields[i].value);
+    return ok;
+}
+
+#endif
+
+#if !defined(_WIN32)
+static bool dvm_exact_parse(const char *raw, struct dvm_row *row)
+{
+    struct json_value value;
+    json_init(&value);
+    bool ok = json_read(&value, raw, strlen(raw)) && value.type == JSON_OBJ;
+    const struct json_value *seq = json_get(&value, "seq");
+    ok = ok && seq && seq->type == JSON_INT && json_get_int(seq) > 0;
+    if (ok) row->seq = json_get_int(seq);
+    const struct { const char *key; char *target; size_t cap; bool optional; } fields[] = {
+        {"ts", row->ts, sizeof(row->ts), false},
+        {"from", row->from, sizeof(row->from), false},
+        {"to", row->to, sizeof(row->to), false},
+        {"kind", row->kind, sizeof(row->kind), false},
+        {"body", row->body, sizeof(row->body), false},
+        {"ref", row->ref, sizeof(row->ref), false},
+        {"sender_binding", row->sender_binding, sizeof(row->sender_binding), true},
+        {"board_post", row->board_post, sizeof(row->board_post), true},
+        {"board_signer", row->board_signer, sizeof(row->board_signer), true}};
+    for (size_t i = 0; ok && i < sizeof(fields) / sizeof(fields[0]); i++) {
+        const struct json_value *field = json_get(&value, fields[i].key);
+        if (!field && fields[i].optional) continue;
+        const char *text = json_get_str(field);
+        ok = field && field->type == JSON_STR && text && strlen(text) < fields[i].cap;
+        if (ok) memcpy(fields[i].target, text, strlen(text) + 1);
+    }
+    json_free(&value);
+    return ok;
+}
+#endif
+
+static void dvm_exact(const struct zcl_command_request *req,
+    struct zcl_command_reply *reply, const char *dir)
+{
+    const char *stream, *hash;
+    long long offset, seq;
+    if (!dvm_exact_selectors(req, &stream, &offset, &seq, &hash)) {
+        dvm_fail(reply, "BAD_INPUT", "exact mail needs all locator selectors", "stream,row_offset,seq,row_sha3,ref");
+        return;
+    }
+#if defined(_WIN32)
+    (void)dir;
+    dvm_fail(reply, "MAIL_EXACT_UNAVAILABLE", "descriptor-bound exact mail is unavailable", "platform");
+#else
+    char raw[DVM_LINE_CAP], actual[65];
+    struct dvm_row row = {0};
+    if (!dvm_exact_line(dir, stream, offset, raw)) {
+        dvm_fail(reply, "MAIL_EXACT_UNAVAILABLE", "selected complete mail bytes are unavailable", stream);
+        return;
+    }
+    dvm_row_hash(raw, strlen(raw), actual);
+    if (strcmp(actual, hash) || !dvm_exact_parse(raw, &row) || row.seq != seq ||
+        strcmp(row.ref, dvm_str(req, "ref"))) {
+        dvm_fail(reply, "MAIL_EXACT_MISMATCH", "selected mail bytes do not match locator", stream);
+        return;
+    }
+    bool ok = dvm_exact_project(reply, &row, stream, offset, actual, raw);
+    if (!ok) {
+        json_free(&reply->data); json_init(&reply->data); json_set_object(&reply->data);
+        dvm_fail(reply, "MAIL_READ_FAILED", "exact mail projection failed", "json");
+        return;
+    }
+    reply->status = ZCL_COMMAND_STATUS_PASSED;
+    reply->exit_code = 0;
+#endif
+}
+
 static void dvm_handle(const struct zcl_command_request *request,
                        struct zcl_command_reply *reply, bool brief_drain)
 {
@@ -2083,21 +2296,25 @@ static void dvm_handle(const struct zcl_command_request *request,
         return;
     if (!request || !request->input) {
         dvm_fail(reply, "BAD_INPUT",
-                 "dev.agent.mail needs action post|pull|ack",
+                 "dev.agent.mail needs action post|pull|exact|ack",
                  "request.input was missing");
         return;
     }
     action = dvm_str(request, "action");
     if (!action || !action[0]) {
         dvm_fail(reply, "BAD_INPUT",
-                 "action is required: post, pull, or ack",
+                 "action is required: post, pull, exact, or ack",
                  "input.action missing or empty");
         return;
     }
-    if (!dvm_mail_dir(maildir, sizeof(maildir), strcmp(action, "pull") != 0)) {
+    if (!dvm_mail_dir(maildir, sizeof(maildir), strcmp(action, "pull") != 0 && strcmp(action, "exact") != 0)) {
         dvm_fail(reply, "STATE_DIR_FAILED",
                  "cannot resolve the mail dir under the state root",
                  "platform_state_root/mail");
+        return;
+    }
+    if (strcmp(action, "exact") == 0) {
+        dvm_exact(request, reply, maildir);
         return;
     }
     if (strcmp(action, "post") == 0) {
@@ -2112,7 +2329,7 @@ static void dvm_handle(const struct zcl_command_request *request,
         dvm_ack(request, reply, maildir);
         return;
     }
-    dvm_fail(reply, "BAD_INPUT", "action is one of post|pull|ack",
+    dvm_fail(reply, "BAD_INPUT", "action is one of post|pull|exact|ack",
              "input.action unknown");
 }
 

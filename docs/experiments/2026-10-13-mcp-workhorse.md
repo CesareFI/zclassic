@@ -284,3 +284,12 @@ complexity and scoped syntax before expensive source-bound builds. The wiki
 query was moved into the existing read-only wiki model sibling after the first
 final lint exposed the store's hard line limit; earlier runtime PASS remains
 intermediate evidence until the exact split is requalified.
+
+Mail evidence reuses the native ref-filtered pull, drains its bounded pages,
+and refuses absence unless typed completion and every source establish it.
+Work refs select the latest held matching mail, including replies or ACKs;
+use versioned refs when earlier evidence bodies must remain distinguishable.
+An exact retained row is selected by `stream`, `row_offset`, `seq` and
+`row_sha3` together, read through one descriptor-bound complete line, and
+refused on any mismatch. The evidence selectors are validated by the node at
+runtime; the gateway schema is flat and declares no `oneOf`.

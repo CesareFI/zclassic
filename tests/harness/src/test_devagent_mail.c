@@ -16,6 +16,8 @@
 #include "command/native_devagent.h"
 #include "config/command_catalog.h"
 #include "json/json.h"
+#include "sha3/sha3.h"
+#include "base/hex.h"
 #include "zutf8/zutf8.h"
 #include "kernel/command_registry.h"
 #include "platform/private_directory.h"
@@ -1294,6 +1296,207 @@ _test_next:;
 }
 #endif
 
+static void dvx_exact_input(struct dvx_call *c, const char *stream,
+    long long offset, long long seq, const char *hash, const char *ref)
+{
+    dvx_begin(c);
+    (void)json_push_kv_str(&c->input, "action", "exact");
+    (void)json_push_kv_str(&c->input, "stream", stream);
+    (void)json_push_kv_int(&c->input, "row_offset", offset);
+    (void)json_push_kv_int(&c->input, "seq", seq);
+    (void)json_push_kv_str(&c->input, "row_sha3", hash);
+    (void)json_push_kv_str(&c->input, "ref", ref);
+}
+
+static bool dvx_exact_check(const char *stream, long long offset,
+    long long seq, const char *hash, const char *ref, const char *raw)
+{
+    struct dvx_call c;
+    dvx_exact_input(&c, stream, offset, seq, hash, ref);
+    bool ok = dvx_run(&c) && dvx_ok(&c) == (raw != NULL);
+    if (raw) ok = ok && !strcmp(dvx_str(&c, "raw_line"), raw) &&
+        !strcmp(dvx_str(&c, "row_sha3"), hash) && dvx_int(&c, "row_offset") == offset;
+    else ok = ok && json_get(&c.reply.data, "raw_line") == NULL;
+    dvx_end(&c);
+    return ok;
+}
+
+#if !defined(_WIN32)
+static void dvx_exact_append_race(void)
+{
+    dvx_import_append("inbox.a", "{}\n");
+}
+#endif
+
+static int test_mail_exact_locator(void)
+{
+    int failures = 0;
+    TEST("mail: exact locator preserves earlier repeated-ref bytes and refuses mismatches") {
+        dvx_isolate("exact_mail");
+        const char *first = "{\"seq\":7,\"ts\":\"2026-10-14T00:00:00Z\",\"from\":\"a\",\"to\":\"b\",\"kind\":\"note\",\"body\":\"earlier\",\"ref\":\"repeat\"}\n";
+        const char *second = "{\"seq\":7,\"ts\":\"2026-10-14T00:00:01Z\",\"from\":\"b\",\"to\":\"a\",\"kind\":\"ack\",\"body\":\"later\",\"ref\":\"repeat\"}\n";
+        dvx_import_stream("inbox.a", first);
+        dvx_import_stream("inbox.b", second);
+        struct dvx_call p;
+        dvx_pull(&p, 0, NULL, NULL);
+        ASSERT(dvx_run(&p) && dvx_ok(&p));
+        ASSERT_EQ(dvx_int(&p, "count"), 2);
+        const struct json_value *row = json_at(dvx_arr(&p, "rows"), 0);
+        char hash[65];
+        (void)snprintf(hash, sizeof(hash), "%s", json_get_str(json_get(row, "row_sha3")));
+        ASSERT_STR_EQ(hash, "a60a613ff26562fd83777e92347219d70e33e58b947e5937a1f61a40891714ab");
+        ASSERT_STR_EQ(json_get_str(json_get(row, "stream")), "inbox.a.jsonl");
+        ASSERT_EQ(json_get_int(json_get(row, "row_offset")), 0);
+        dvx_end(&p);
+#if defined(_WIN32)
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", NULL));
+#else
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", first));
+        zcl_devagent_mail_test_set_after_exact_read(dvx_exact_append_race);
+        bool race_refused = dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", NULL);
+        zcl_devagent_mail_test_set_after_exact_read(NULL);
+        ASSERT(race_refused);
+        ASSERT(dvx_exact_check("inbox.b.jsonl", 0, 7, hash, "repeat", NULL));
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 1, 7, hash, "repeat", NULL));
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 8, hash, "repeat", NULL));
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "wrong", NULL));
+        ASSERT(dvx_exact_check("../inbox.a.jsonl", 0, 7, hash, "repeat", NULL));
+        ASSERT(dvx_exact_check("missing.jsonl", 0, 7, hash, "repeat", NULL));
+        dvx_import_append("inbox.a", second);
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", first));
+        dvx_import_stream("inbox.a", second);
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", NULL));
+        dvx_import_stream("inbox.a", first);
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", first));
+        char dir[1024], path[1200];
+        dvx_maildir(dir, sizeof(dir));
+        ASSERT(chmod(dir, 0777) == 0);
+        bool permissive_refused = dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", NULL);
+        ASSERT(chmod(dir, 0700) == 0);
+        ASSERT(permissive_refused);
+        (void)snprintf(path, sizeof(path), "%s/inbox.a.jsonl", dir);
+        ASSERT(truncate(path, (off_t)(strlen(first) - 1)) == 0);
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", NULL));
+        ASSERT(unlink(path) == 0);
+        ASSERT(symlink("inbox.b.jsonl", path) == 0);
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", NULL));
+        ASSERT(unlink(path) == 0);
+        ASSERT(mkdir(path, 0700) == 0);
+        ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", NULL));
+        ASSERT(rmdir(path) == 0);
+#endif
+        dvx_restore();
+        PASS();
+    } _test_next:;
+    zcl_devagent_mail_test_set_after_exact_read(NULL);
+    dvx_restore();
+    return failures;
+}
+
+static int test_mail_exact_maximum(void)
+{
+    int failures = 0;
+    TEST("mail: maximum escaped body retains exact bytes in bounded native envelope") {
+        dvx_isolate("exact_maximum");
+        char body[4097];
+        memset(body, '"', 3800); memset(body + 3800, 'a', 296); body[4096] = '\0';
+        ASSERT(dvx_post_ref("a", "b", "maximum", body));
+        struct dvx_call p;
+        dvx_pull(&p, 0, NULL, NULL);
+        ASSERT(dvx_run(&p) && dvx_ok(&p));
+        const struct json_value *row = json_at(dvx_arr(&p, "rows"), 0);
+        struct dvx_call exact;
+        dvx_exact_input(&exact, "outbox.jsonl", 0, json_get_int(json_get(row, "seq")),
+            json_get_str(json_get(row, "row_sha3")), "maximum");
+        dvx_end(&p);
+#if defined(_WIN32)
+        ASSERT(dvx_run(&exact) && !dvx_ok(&exact));
+        ASSERT_STR_EQ(exact.reply.error.code, "MAIL_EXACT_UNAVAILABLE");
+#else
+        struct zcl_command_spec spec = *exact.request.spec;
+        spec.handler = zcl_native_handle_dev_agent_mail;
+        char wire[32769];
+        enum zcl_command_exit rc;
+        size_t n = zcl_command_registry_execute_json(zcl_command_catalog(), &spec, NULL,
+            &exact.input, false, DVX_PATH, "full", 32768, 0, NULL, wire, sizeof(wire), &rc);
+        ASSERT(n > 0 && n <= 32768 && rc == ZCL_COMMAND_EXIT_OK);
+        struct json_value result;
+        json_init(&result);
+        ASSERT(json_read(&result, wire, n));
+        const struct json_value *data = json_get(&result, "data");
+        ASSERT_STR_EQ(json_get_str(json_get(data, "body")), body);
+        const char *raw = json_get_str(json_get(data, "raw_line"));
+        ASSERT(raw && strlen(raw) > 7900 && raw[strlen(raw) - 1] == '\n');
+        json_free(&result);
+#endif
+        dvx_end(&exact);
+        dvx_restore();
+        PASS();
+    } _test_next:;
+    dvx_restore();
+    return failures;
+}
+
+static int test_mail_exact_malformed(void)
+{
+    int failures = 0;
+    TEST("mail: matching digest never admits malformed JSONL or partial selectors") {
+        dvx_isolate("exact_malformed");
+        const char *const records[] = {
+            "{\"seq\":7junk,\"ts\":\"t\",\"from\":\"a\",\"to\":\"b\",\"kind\":\"note\",\"body\":\"bad\",\"ref\":\"repeat\"}\n",
+            "{\"seq\":7,\"ts\":\"t\",\"from\":\"a\",\"to\":\"b\",\"kind\":\"note\",\"body\":false,\"ref\":\"repeat\"}\n",
+            "{\"seq\":7,\"ts\":\"t\",\"from\":\"a\",\"to\":\"b\",\"kind\":\"note\",\"body\":\"bad\",\"ref\":\"repeat\",\"board_post\":7}\n"};
+        for (size_t i = 0; i < sizeof(records) / sizeof(records[0]); i++) {
+            dvx_import_stream("inbox.a", records[i]);
+            static const char domain[] = "z23.devagent.mail.row.v1";
+            struct sha3_256_ctx ctx; unsigned char sum[32]; char hash[65];
+            sha3_256_init(&ctx);
+            sha3_256_write(&ctx, (const unsigned char *)domain, sizeof(domain));
+            sha3_256_write(&ctx, (const unsigned char *)records[i], strlen(records[i]));
+            sha3_256_finalize(&ctx, sum); zcl_hex_encode(sum, sizeof(sum), hash);
+            ASSERT(dvx_exact_check("inbox.a.jsonl", 0, 7, hash, "repeat", NULL));
+        }
+        struct dvx_call partial;
+        dvx_begin(&partial);
+        (void)json_push_kv_str(&partial.input, "action", "exact");
+        (void)json_push_kv_str(&partial.input, "stream", "inbox.a.jsonl");
+        ASSERT(dvx_run(&partial) && !dvx_ok(&partial));
+        ASSERT_STR_EQ(partial.reply.error.code, "BAD_INPUT");
+        dvx_end(&partial);
+        dvx_restore();
+        PASS();
+    } _test_next:;
+    dvx_restore();
+    return failures;
+}
+
+static int test_mail_exact_nul(void)
+{
+    int failures = 0;
+    TEST("mail: embedded NUL never produces an exact locator") {
+        dvx_isolate("exact_nul");
+        dvx_import_stream("inbox.a", "{}");
+        char dir[1024], path[1200];
+        dvx_maildir(dir, sizeof(dir));
+        (void)snprintf(path, sizeof(path), "%s/inbox.a.jsonl", dir);
+        const char bytes[] = "{\"seq\":7,\"ts\":\"t\",\"from\":\"a\",\"to\":\"b\",\"kind\":\"note\",\"body\":\"x\",\"ref\":\"repeat\"}\0\n";
+        FILE *f = fopen(path, "wb");
+        ASSERT(f != NULL);
+        bool written = fwrite(bytes, 1, sizeof(bytes) - 1, f) == sizeof(bytes) - 1;
+        written = fclose(f) == 0 && written;
+        ASSERT(written);
+        struct dvx_call p;
+        dvx_pull(&p, 0, NULL, NULL);
+        ASSERT(dvx_run(&p) && dvx_ok(&p));
+        ASSERT_EQ(dvx_int(&p, "count"), 0);
+        dvx_end(&p);
+        dvx_restore();
+        PASS();
+    } _test_next:;
+    dvx_restore();
+    return failures;
+}
+
 int test_devagent_mail(void);
 int test_devagent_mail(void)
 {
@@ -1301,6 +1504,10 @@ int test_devagent_mail(void)
     long long cursor = 0;
 
     failures += test_mail_independent_cursor();
+    failures += test_mail_exact_locator();
+    failures += test_mail_exact_maximum();
+    failures += test_mail_exact_malformed();
+    failures += test_mail_exact_nul();
     failures += test_mail_paging();
     failures += test_mail_brief_drain();
     failures += test_mail_ref_filter_and_agent_resume();

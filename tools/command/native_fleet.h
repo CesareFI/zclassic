@@ -232,4 +232,10 @@ void zcl_native_handle_fleet_nodes_table(
     struct zcl_command_reply *reply);
 /* z23-toolgen:end handlers */
 
+#ifdef ZCL_TESTING
+/* Fault injection for bounded mail completion; NULL restores the native leaf. */
+void zcl_fleet_steer_test_set_mail_pull(
+    void (*hook)(const struct zcl_command_request *, struct zcl_command_reply *));
+#endif
+
 #endif /* ZCL_NATIVE_FLEET_H */

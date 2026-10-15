@@ -25,6 +25,7 @@ void zcl_native_handle_dev_agent_mail_brief_drain(
 typedef void (*zcl_devagent_mail_test_hook_fn)(void);
 void zcl_devagent_mail_test_set_after_brief_probe(
     zcl_devagent_mail_test_hook_fn hook);
+void zcl_devagent_mail_test_set_after_exact_read(zcl_devagent_mail_test_hook_fn hook);
 size_t zcl_devagent_mail_test_max_seq_scans(bool reset);
 #endif
 

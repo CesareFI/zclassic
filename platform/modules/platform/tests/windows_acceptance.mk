@@ -271,6 +271,7 @@ ZCL_WINDOWS_ACCEPTANCE_dev_agent_mail_SOURCES := \
 	platform/modules/platform/src/private_acl_internal.c \
 	platform/modules/platform/src/state_root.c \
 	platform/modules/platform/src/clock.c \
+	platform/modules/sha3/src/sha3.c \
 	platform/modules/base/src/safe_alloc.c \
 	platform/modules/base/src/log_level.c
 ZCL_WINDOWS_ACCEPTANCE_dev_agent_mail_FLAGS := \

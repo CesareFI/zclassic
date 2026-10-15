@@ -1402,6 +1402,10 @@ struct fmc_mail_view {
  * valid until the sub call ends. */
 struct fmc_row {
     long long seq;
+    long long row_offset;
+    long long row_end;
+    const char *stream;
+    const char *row_sha3;
     const char *ts;
     const char *from;
     const char *to;
@@ -1427,6 +1431,12 @@ static bool fmc_row_parse(const struct json_value *r, struct fmc_row *v)
     if (!s || s->type != JSON_INT)
         return false;
     v->seq = (long long)json_get_int(s);
+    v->stream = fmc_row_field(r, "stream");
+    v->row_sha3 = fmc_row_field(r, "row_sha3");
+    const struct json_value *offset = json_get(r, "row_offset");
+    v->row_offset = offset && offset->type == JSON_INT ? json_get_int(offset) : -1;
+    const struct json_value *end = json_get(r, "row_end");
+    v->row_end = end && end->type == JSON_INT ? json_get_int(end) : -1;
     v->ts = fmc_row_field(r, "ts");
     v->from = fmc_row_field(r, "from");
     v->to = fmc_row_field(r, "to");
@@ -2347,6 +2357,9 @@ static const struct fmc_pkey fmc_pkeys[] = {
 #define FMC_PKEY_HOST 0u
 
 struct fmc_session {
+    char stream[129];
+    char row_sha3[65];
+    long long row_offset;
     char role[FMC_ROLE_MAX + 1];
     char ts[40];
     char val[FMC_PKEYS][FMC_SESSION_VAL];
@@ -2559,6 +2572,9 @@ static void fmc_sessions_note(struct fmc_roster *ro, const struct fmc_row *v)
         return;
     s->seen = true;
     s->seq = v->seq;
+    s->row_offset = v->row_offset;
+    (void)snprintf(s->stream, sizeof(s->stream), "%s", v->stream);
+    (void)snprintf(s->row_sha3, sizeof(s->row_sha3), "%s", v->row_sha3);
     (void)snprintf(s->ts, sizeof(s->ts), "%.39s", v->ts);
     fmc_presence_parse(s, v->body);
 }
@@ -2703,10 +2719,13 @@ static void fmc_session_emit(struct json_value *arr,
     fmc_put_known(&o, "last_observed_ts", age >= 0 ? s->ts : "");
     fmc_put_known_int(&o, "age_s", age);
     fmc_put_known(&o, "observed_via", s->seen ? "dev.agent.mail pull" : "");
-    /* The pull merges the outbox and every inbox.<peer>.jsonl without
-     * naming a row's stream, so the file a row came from is not known
-     * here; the seq is the exact handle for fleet.steer.evidence. */
-    (void)json_push_kv_str(&o, "observed_stream", "UNKNOWN");
+    fmc_put_known(&o, "observed_stream", s->stream);
+    if (s->stream[0] && s->row_sha3[0] && s->row_offset >= 0) {
+        (void)json_push_kv_str(&o, "stream", s->stream);
+        (void)json_push_kv_str(&o, "row_sha3", s->row_sha3);
+        (void)json_push_kv_int(&o, "row_offset", s->row_offset);
+        (void)json_push_kv_int(&o, "seq", s->seq);
+    }
     fmc_put_known_int(&o, "mail_seq", s->seq);
     fmc_session_links(&o, s, ro);
     (void)json_push_back(arr, &o);
@@ -2941,6 +2960,16 @@ static bool fmc_reply_emit(struct json_value *item, const struct fmc_row *v,
     return ok;
 }
 
+/* The exact-read locator of a mail row, when the native pull supplied one. */
+static bool fmc_row_locator(struct json_value *item, const struct fmc_row *row)
+{
+    if (!row->stream[0] || !row->row_sha3[0] || row->row_offset < 0) return true;
+    return json_push_kv_str(item, "stream", row->stream) &&
+        json_push_kv_str(item, "row_sha3", row->row_sha3) &&
+        json_push_kv_int(item, "row_offset", row->row_offset) &&
+        json_push_kv_int(item, "row_end", row->row_end);
+}
+
 /* One bounded change row, carrying the state fmc_row_state resolves from
  * receiver evidence; completed is resolved later against queue outcomes
  * and board results. queued_age_s is how long a row has sat "queued"
@@ -2968,7 +2997,8 @@ static void fmc_row_change(struct json_value *changes, const struct fmc_row *v,
         json_push_kv_str(&item, "kind", v->kind) &&
         json_push_kv_str(&item, "ref", v->ref) &&
         json_push_kv_str(&item, "lead", lead) &&
-        json_push_kv_str(&item, "state", state)) {
+        json_push_kv_str(&item, "state", state) &&
+        fmc_row_locator(&item, v)) {
         fmc_put_int(&item, "queued_age_s",
                     queued ? fmc_age_s(now, v->ts) : -1);
         bool complete = strcmp(v->kind, "directive") != 0 ||
@@ -3007,11 +3037,66 @@ static const char *fmc_mail_page_why(const struct fmc_sub *sub,
 /* One page after `since` ("" = from the start, else a next_since token)
  * onto *rows. NULL on success, with *more saying whether another page
  * follows and `since` advanced. */
+/* Evidence narrows only by work ref: replies and acknowledgments may reverse
+ * endpoints or use another kind. Initial floor zero preserves every stream. */
+static bool fmc_mail_page_input(struct fmc_sub *sub, const char *since,
+                                 const char *ref)
+{
+    return json_push_kv_str(&sub->input, "action", "pull") &&
+        (since[0] ? json_push_kv_str(&sub->input, "since", since)
+                  : json_push_kv_int(&sub->input, "since", 0)) &&
+        (!ref || json_push_kv_str(&sub->input, "ref", ref));
+}
+
+static bool fmc_mail_sources_valid(const struct json_value *data, bool more)
+{
+    const struct json_value *sources = json_get(data, "sources");
+    if (!sources || sources->type != JSON_ARR) return false;
+    for (size_t i = 0; i < json_size(sources); i++) {
+        const struct json_value *complete = json_get(json_at(sources, i), "complete");
+        if (!complete || complete->type != JSON_BOOL ||
+            (!more && !json_get_bool(complete))) return false;
+    }
+    return true;
+}
+
+static bool fmc_mail_page_valid(const struct fmc_sub *sub, const char *next,
+    const struct json_value *rows, const struct json_value *truncated)
+{
+    const struct json_value *cursor = json_get(&sub->reply.data, "cursor");
+    return fmc_sub_ok(sub) && next && next[0] && strlen(next) < FMC_MAIL_SINCE_CAP &&
+        rows && rows->type == JSON_ARR && truncated && truncated->type == JSON_BOOL &&
+        cursor && cursor->type == JSON_INT && json_get_int(cursor) >= 0 &&
+        fmc_mail_sources_valid(&sub->reply.data, json_get_bool(truncated));
+}
+
+#ifdef ZCL_TESTING
+static void (*s_fmc_mail_test_hook)(const struct zcl_command_request *,
+                                    struct zcl_command_reply *);
+void zcl_fleet_steer_test_set_mail_pull(
+    void (*hook)(const struct zcl_command_request *, struct zcl_command_reply *))
+{
+    s_fmc_mail_test_hook = hook;
+}
+#endif
+
+static void fmc_mail_invoke(struct fmc_sub *sub, bool brief)
+{
+#ifdef ZCL_TESTING
+    if (s_fmc_mail_test_hook && !brief) {
+        s_fmc_mail_test_hook(&sub->request, &sub->reply);
+        return;
+    }
+#endif
+    if (brief) zcl_native_handle_dev_agent_mail_brief_drain(&sub->request, &sub->reply);
+    else zcl_native_handle_dev_agent_mail(&sub->request, &sub->reply);
+}
+
 static const char *fmc_mail_page(const struct zcl_command_request *req,
                                  struct json_value *rows, long long *cursor,
                                  char *since, bool *more,
                                  char *why_buf, size_t why_cap,
-                                 bool brief_drain)
+                                 bool brief_drain, const char *ref)
 {
     struct fmc_sub sub;
     const struct json_value *arr, *tok, *tr;
@@ -3022,31 +3107,30 @@ static const char *fmc_mail_page(const struct zcl_command_request *req,
         fmc_sub_end(&sub);
         return "unknown_sibling";
     }
-    (void)json_push_kv_str(&sub.input, "action", "pull");
-    if (since[0])
-        (void)json_push_kv_str(&sub.input, "since", since);
-    else
-        (void)json_push_kv_int(&sub.input, "since", 0);
-    if (brief_drain)
-        zcl_native_handle_dev_agent_mail_brief_drain(&sub.request,
-                                                      &sub.reply);
-    else
-        zcl_native_handle_dev_agent_mail(&sub.request, &sub.reply);
+    if (!fmc_mail_page_input(&sub, since, ref)) {
+        fmc_sub_end(&sub);
+        return "allocation_failed";
+    }
+    fmc_mail_invoke(&sub, brief_drain);
     sub.ran = true;
     tok = json_get(&sub.reply.data, "next_since");
     next = (tok && tok->type == JSON_STR) ? json_get_str(tok) : NULL;
-    if (!fmc_sub_ok(&sub) || !next || strlen(next) >= FMC_MAIL_SINCE_CAP) {
+    arr = json_get(&sub.reply.data, "rows");
+    tr = json_get(&sub.reply.data, "truncated");
+    if (!fmc_mail_page_valid(&sub, next, arr, tr)) {
         const char *why = fmc_mail_page_why(&sub, why_buf, why_cap);
         fmc_sub_end(&sub);
         return why;
     }
     *cursor = fmc_sub_int(&sub, "cursor", -1);
-    arr = json_get(&sub.reply.data, "rows");
-    n = (arr && arr->type == JSON_ARR) ? json_size(arr) : 0u;
-    for (i = 0; i < n; i++)
-        (void)json_push_back(rows, json_at(arr, i));
-    tr = json_get(&sub.reply.data, "truncated");
-    *more = tr && tr->type == JSON_BOOL && json_get_bool(tr);
+    n = json_size(arr);
+    for (i = 0; i < n; i++) {
+        if (!json_push_back(rows, json_at(arr, i))) {
+            fmc_sub_end(&sub);
+            return "allocation_failed";
+        }
+    }
+    *more = json_get_bool(tr);
     (void)snprintf(since, FMC_MAIL_SINCE_CAP, "%s", next);
     fmc_sub_end(&sub);
     return NULL;
@@ -3062,7 +3146,7 @@ static const char *fmc_mail_drain_from(const struct zcl_command_request *req,
                                        const char *since_init,
                                        char *end_token, size_t end_cap,
                                        char *why_buf, size_t why_cap,
-                                       bool brief_drain)
+                                       bool brief_drain, const char *ref)
 {
     char since[FMC_MAIL_SINCE_CAP] = "";
     bool more = true;
@@ -3071,7 +3155,7 @@ static const char *fmc_mail_drain_from(const struct zcl_command_request *req,
     for (int page = 0; page < FMC_MAIL_PAGES_MAX && more; page++) {
         const char *why =
             fmc_mail_page(req, rows, cursor, since, &more, why_buf,
-                          why_cap, brief_drain);
+                          why_cap, brief_drain, ref);
         if (why)
             return why;
     }
@@ -3081,14 +3165,15 @@ static const char *fmc_mail_drain_from(const struct zcl_command_request *req,
 }
 
 static const char *fmc_mail_drain(const struct zcl_command_request *req,
-                                  struct json_value *rows, long long *cursor)
+                                  struct json_value *rows, long long *cursor, const char *ref)
 {
     return fmc_mail_drain_from(req, rows, cursor, "", NULL, 0, NULL, 0,
-                               false);
+                               false, ref);
 }
 
 /* Everything the mail walk writes into, so each row is one call. */
 struct fmc_mail_ctx {
+    bool projection_failed;
     struct json_value *agents;
     struct json_value *work;
     struct json_value *changes;
@@ -3268,7 +3353,7 @@ static bool fmc_brief_resume_changes(const struct zcl_command_request *req,
     fail = fmc_mail_drain_from(req, &fresh, &fresh_cursor, resume,
                                view->cursor_token,
                                sizeof(view->cursor_token), why,
-                               sizeof(why), true);
+                               sizeof(why), true, NULL);
     t1 = clock_now_wall_ms();
     if (fail) {
         fmc_note_missing(missing, "dev.agent.mail", fail, t1 - t0);
@@ -3314,7 +3399,7 @@ static long long fmc_brief_mail(const struct zcl_command_request *req,
     fail = fmc_mail_drain_from(req, &rows, &view->cursor, "",
                                view->cursor_token,
                                sizeof(view->cursor_token), why,
-                               sizeof(why), true);
+                               sizeof(why), true, NULL);
     t1 = clock_now_wall_ms();
     if (fail) {
         fmc_note_missing(missing, "dev.agent.mail", fail, t1 - t0);
@@ -4845,10 +4930,30 @@ static bool fmc_emit_object(struct zcl_command_reply *reply,
     return true;
 }
 
+static void fmc_evidence_mail_exact(const struct zcl_command_request *req,
+    struct zcl_command_reply *reply)
+{
+    struct fmc_sub sub;
+    fmc_sub_begin(&sub, "zcl.agent_mail.v1", req, "dev.agent.mail");
+    const char *const keys[] = {"ref", "stream", "row_offset", "seq", "row_sha3"};
+    bool ready = sub.valid && json_push_kv_str(&sub.input, "action", "exact");
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+        ready = json_push_kv(&sub.input, keys[i], json_get(req->input, keys[i])) && ready;
+    if (ready) fmc_mail_invoke(&sub, false);
+    if (!ready || sub.reply.status != ZCL_COMMAND_STATUS_PASSED)
+        fmc_fail(reply, "EVIDENCE_UNAVAILABLE", "exact retained mail did not match or answer", "dev.agent.mail");
+    else fmc_emit_object(reply, "mail", &sub.reply.data);
+    fmc_sub_end(&sub);
+}
+
 static void fmc_evidence_mail(const struct zcl_command_request *req,
                               struct zcl_command_reply *reply,
                               const char *ref)
 {
+    if (json_get(req->input, "stream")) {
+        fmc_evidence_mail_exact(req, reply);
+        return;
+    }
     struct json_value rows;
     const struct json_value *hit = NULL;
     long long cursor = -1;
@@ -4856,7 +4961,7 @@ static void fmc_evidence_mail(const struct zcl_command_request *req,
     size_t n, i;
     json_init(&rows);
     json_set_array(&rows);
-    why = fmc_mail_drain(req, &rows, &cursor);
+    why = fmc_mail_drain(req, &rows, &cursor, ref);
     if (why) {
         fmc_fail(reply, "EVIDENCE_UNAVAILABLE",
                  strcmp(why, "unknown_sibling") == 0
@@ -4866,9 +4971,9 @@ static void fmc_evidence_mail(const struct zcl_command_request *req,
         json_free(&rows);
         return;
     }
-    /* A ref may own a thread (directive, then worker result rows). The
-     * latest entry is the exact result, matching the queue rule that the
-     * last terminal outcome wins; single-row threads read unchanged. */
+    /* A ref may own a thread. Return its latest held message; an ACK
+     * under the same ref can replace the prior body. Versioned evidence
+     * refs keep observations distinct. This is not an immutable version. */
     n = json_size(&rows);
     for (i = 0; i < n; i++) {
         const struct json_value *r = json_at(&rows, i);
@@ -5071,11 +5176,30 @@ done:
     fmc_sub_end(&sub);
 }
 
+static bool fmc_evidence_mail_selectors(const struct json_value *input)
+{
+    unsigned char decoded[32];
+    const struct json_value *stream = json_get(input, "stream");
+    const struct json_value *offset = json_get(input, "row_offset");
+    const struct json_value *hash = json_get(input, "row_sha3");
+    const struct json_value *seq = json_get(input, "seq");
+    return stream && stream->type == JSON_STR && json_get_str(stream)[0] &&
+        offset && offset->type == JSON_INT && json_get_int(offset) >= 0 &&
+        seq && seq->type == JSON_INT && json_get_int(seq) > 0 &&
+        hash && hash->type == JSON_STR && zcl_hex_decode_lower(json_get_str(hash), decoded, sizeof(decoded));
+}
+
 static bool fmc_evidence_selectors(const struct zcl_command_request *req,
     const char *type)
 {
     const struct json_value *seq = json_get(req->input, "seq");
     const struct json_value *attempt = json_get(req->input, "attempt");
+    const struct json_value *stream = json_get(req->input, "stream");
+    const struct json_value *offset = json_get(req->input, "row_offset");
+    const struct json_value *hash = json_get(req->input, "row_sha3");
+    if (stream || offset || hash) {
+        return !strcmp(type, "mail") && !attempt && fmc_evidence_mail_selectors(req->input);
+    }
     if (!seq && !attempt) return strcmp(type, "land") != 0;
     return (strcmp(type, "queue") == 0 || strcmp(type, "land") == 0) &&
         seq && seq->type == JSON_INT && json_get_int(seq) > 0 &&
@@ -5095,8 +5219,8 @@ static void fmc_do_evidence(const struct zcl_command_request *req,
         return;
     }
     if (!fmc_evidence_selectors(req, type)) {
-        fmc_fail(reply, "BAD_INPUT", "task detail needs positive seq and attempt together",
-            "seq/attempt apply only to queue or land; land requires both");
+        fmc_fail(reply, "BAD_INPUT", "evidence selectors must match the requested type",
+            "mail: stream,row_offset,seq,row_sha3 together; queue: seq,attempt together; land requires seq,attempt; board has no selectors");
         return;
     }
     if (strcmp(type, "land") == 0)

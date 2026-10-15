@@ -530,6 +530,23 @@ static bool fmx_public_mail_page(size_t *scan_count)
     return page_ok;
 }
 
+static bool fmx_evidence_locator_roundtrip(const struct json_value *row)
+{
+    struct fmx_call exact;
+    fmx_evidence(&exact, NULL, "mail", "brief-page-069");
+    const char *const keys[] = {"stream", "row_offset", "seq", "row_sha3"};
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+        ok &= json_push_kv(&exact.input, keys[i], json_get(row, keys[i]));
+    ok = ok && fmx_run(&exact, zcl_native_handle_fleet_steer_evidence) && fmx_ok(&exact);
+    const struct json_value *object = fmx_get(&exact, "object");
+    const char *raw = json_get_str(json_get(object, "raw_line"));
+    ok = ok && raw && strlen(raw) > 0 && raw[strlen(raw) - 1] == '\n' &&
+        !strcmp(json_get_str(json_get(object, "body")), json_get_str(json_get(row, "body")));
+    fmx_end(&exact);
+    return ok;
+}
+
 static bool fmx_evidence_mail_uses_public_drain(size_t *scan_count)
 {
     struct fmx_call e;
@@ -544,6 +561,7 @@ static bool fmx_evidence_mail_uses_public_drain(size_t *scan_count)
     accepted = accepted && ref && ref->type == JSON_STR &&
                strcmp(json_get_str(ref), "brief-page-069") == 0;
     *scan_count = zcl_devagent_mail_test_max_seq_scans(false);
+    accepted = accepted && fmx_evidence_locator_roundtrip(object);
     fmx_end(&e);
     return accepted;
 }
@@ -4291,7 +4309,7 @@ static int fmx_t_brief_deferred_cursor(void)
         ASSERT_EQ(initial_scans, 4);
         ASSERT_EQ(resume_scans, 8);
         ASSERT_EQ(public_scans, 4);
-        ASSERT(evidence_scans > 4 && evidence_scans % 4 == 0);
+        ASSERT_EQ(evidence_scans, 4);
         fmx_restore();
         PASS();
     }

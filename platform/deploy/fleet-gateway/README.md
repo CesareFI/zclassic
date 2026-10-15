@@ -335,3 +335,24 @@ describes the compact agent loop.
 This documents source behavior. An existing deployment advertises the tool
 only after its qualified gateway and node binaries are updated through the
 owner-approved deployment procedure.
+
+# Exact retained mail
+
+`steer_evidence(type="mail", ref=...)` keeps its latest-held behavior. To
+retrieve an earlier held message, supply all four locator fields returned by
+mail pull or brief: `stream`, `row_offset`, `seq`, and `row_sha3`. The existing
+evidence grant remains required at the gateway. Exact lookup never falls back
+to another row with the same ref. The node enforces the selector combinations
+(mail locator fields together, queue and land `seq` with `attempt`, board none)
+and refuses a mismatch with `BAD_INPUT`; the advertised schema carries no
+`oneOf`, so clients cannot rely on schema validation to reject them.
+
+The digest is SHA3-256 over `z23.devagent.mail.row.v1` including its terminating
+NUL, followed by the complete original JSONL bytes including newline. The
+reply's `raw_line` preserves those bytes. Locators identify retained bytes;
+they do not establish sender authenticity or promise retention. The reader
+binds the operator-selected mail directory and a regular stream descriptor,
+refuses symlinks and concurrent replacement or metadata change, and reads one
+bounded complete line. Prior same-byte replacement satisfies byte identity.
+Windows exact lookup reports unavailable. Source support does not establish
+that a running gateway has been deployed with this catalog.

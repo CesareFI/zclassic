@@ -3012,6 +3012,104 @@ static bool fb_wiki_native_find(struct zcl_command_request *request, const char 
     zcl_command_reply_free(&reply);
     return ok;
 }
+/* Inject sibling responses, rather than modifying the held mail store. This
+ * exercises completion and paging independently of the native pull fixtures. */
+static unsigned fb_mail_fault, fb_mail_pages;
+static bool fb_mail_inputs_ok;
+static bool fb_mail_fixture_input(const struct zcl_command_request *request)
+{
+    const struct json_value *since = json_get(request->input, "since");
+    const char *ref = json_get_str(json_get(request->input, "ref"));
+    char expected[80];
+    (void)snprintf(expected, sizeof(expected), "v1:outbox=%u;inbox.receiver=%u", fb_mail_pages * 64, fb_mail_pages);
+    return ref && !strcmp(ref, "read-fixture") &&
+        !json_get(request->input, "from") && !json_get(request->input, "to") &&
+        !json_get(request->input, "kind") && !json_get(request->input, "agent") &&
+        since && (fb_mail_pages ? since->type == JSON_STR &&
+            !strcmp(json_get_str(since), expected) :
+            since->type == JSON_INT && json_get_int(since) == 0);
+}
+static void fb_mail_fixture_row(struct json_value *row, bool more, unsigned i)
+{
+    json_set_object(row);
+    (void)json_push_kv_str(row, "ref", "read-fixture");
+    (void)json_push_kv_str(row, "body", more ? "earlier" : "last reply");
+    (void)json_push_kv_str(row, "from", more ? "sender" : "receiver");
+    (void)json_push_kv_str(row, "to", more ? "receiver" : "sender");
+    (void)json_push_kv_str(row, "kind", more ? "directive" : "result");
+    (void)json_push_kv_str(row, "ts", more ? "2026-10-14T01:00:00Z" : "2026-10-13T01:00:00Z");
+    (void)json_push_kv_int(row, "seq", i + 1);
+}
+static void fb_mail_fixture_scalar_fault(struct json_value *data)
+{
+    static const char *const keys[] = {"rows", "truncated", "next_since", "sources"};
+    if (fb_mail_fault < 7 || fb_mail_fault > 10) return;
+    struct json_value *value = (struct json_value *)json_get(data, keys[fb_mail_fault - 7]);
+    if (value) json_set_int(value, 1);
+}
+static void fb_mail_pull_fixture(const struct zcl_command_request *request,
+    struct zcl_command_reply *reply)
+{
+    fb_mail_inputs_ok = fb_mail_inputs_ok && fb_mail_fixture_input(request);
+    fb_mail_pages++;
+    bool more = fb_mail_fault == 0 && fb_mail_pages < 3;
+    struct json_value rows, sources, row;
+    json_init(&rows); json_init(&sources); json_init(&row);
+    json_set_array(&rows); json_set_array(&sources);
+    for (unsigned i = 0; i < 64 && fb_mail_fault == 0; i++) {
+        fb_mail_fixture_row(&row, more, i);
+        (void)json_push_back(&rows, &row);
+    }
+    json_set_object(&row);
+    (void)json_push_kv_bool(&row, "complete", fb_mail_fault != 6);
+    (void)json_push_back(&sources, &row);
+    if (fb_mail_fault != 2) (void)json_push_kv(&reply->data, "rows", &rows);
+    if (fb_mail_fault != 3) (void)json_push_kv_bool(&reply->data, "truncated", more);
+    (void)json_push_kv_int(&reply->data, "cursor", fb_mail_fault == 4 ? -1 : 99);
+    char token[80];
+    (void)snprintf(token, sizeof(token), "v1:outbox=%u;inbox.receiver=%u", fb_mail_pages * 64, fb_mail_pages);
+    if (fb_mail_fault != 5) (void)json_push_kv_str(&reply->data, "next_since", token);
+    (void)json_push_kv(&reply->data, "sources", &sources);
+    fb_mail_fixture_scalar_fault(&reply->data);
+    reply->status = ZCL_COMMAND_STATUS_PASSED;
+    reply->exit_code = 0;
+    json_free(&row); json_free(&sources); json_free(&rows);
+}
+
+static int test_fleet_evidence_completion(void)
+{
+    int failures = 0;
+    TEST("fleet evidence: drains filtered pages and refuses unproven absence") {
+        for (unsigned mode = 0; mode < 11; mode++) {
+            struct json_value input;
+            json_init(&input); json_set_object(&input);
+            ASSERT(json_push_kv_str(&input, "type", "mail"));
+            ASSERT(json_push_kv_str(&input, "ref", "read-fixture"));
+            struct zcl_command_request request = {.input = &input};
+            struct zcl_command_reply reply;
+            zcl_command_reply_init(&reply, "zcl.fleet_steer_evidence.v1");
+            fb_mail_fault = mode; fb_mail_pages = 0; fb_mail_inputs_ok = true;
+            zcl_fleet_steer_test_set_mail_pull(fb_mail_pull_fixture);
+            zcl_native_handle_fleet_steer_evidence(&request, &reply);
+            zcl_fleet_steer_test_set_mail_pull(NULL);
+            bool ok = fb_mail_inputs_ok;
+            if (!mode) ok = ok && fb_mail_pages == 3 &&
+                reply.status == ZCL_COMMAND_STATUS_PASSED &&
+                !strcmp(json_get_str(json_get(json_get(&reply.data, "object"), "body")), "last reply");
+            else {
+                const char *code = reply.error.code;
+                ok = ok && reply.status != ZCL_COMMAND_STATUS_PASSED && code &&
+                    !strcmp(code, mode == 1 ? "EVIDENCE_NOT_FOUND" : "EVIDENCE_UNAVAILABLE");
+            }
+            zcl_command_reply_free(&reply); json_free(&input);
+            ASSERT(ok);
+        }
+        PASS();
+    } _test_next:;
+    zcl_fleet_steer_test_set_mail_pull(NULL);
+    return failures;
+}
+
 static bool fb_wiki_native_exact(struct zcl_command_request *request, const char *id)
 {
     struct zcl_command_reply reply;
@@ -5064,6 +5162,7 @@ static int test_fleet_board_public_no_grant_needed(void)
     failures += test_fleet_wiki_find_and_read();
     failures += test_fleet_wiki_entry_rejections();
     failures += test_fleet_wiki_chunks();
+    failures += test_fleet_evidence_completion();
     failures += test_fleet_wiki_find_edges();
     failures += test_fleet_wiki_find_page_cap();
     failures += test_fleet_wiki_query_cost();

@@ -817,22 +817,15 @@ static int gw_t_handshake(void)
                       i == 0 ? 1000000000 : 1000000);
         }
         ASSERT_EQ(json_size(json_get(json_get(properties, "type"), "enum")), 4);
-        const struct json_value *variants = json_get(evidence, "oneOf");
-        ASSERT_EQ(json_size(variants), 2);
-        const struct json_value *plain_types = json_get(json_get(json_get(json_at(variants, 0), "properties"), "type"), "enum");
-        ASSERT_EQ(json_size(plain_types), 3);
-        ASSERT_STR_EQ(json_get_str(json_at(plain_types, 0)), "mail");
-        ASSERT_STR_EQ(json_get_str(json_at(plain_types, 1)), "queue");
-        ASSERT_STR_EQ(json_get_str(json_at(plain_types, 2)), "board");
-        const struct json_value *exact_types = json_get(json_get(json_get(json_at(variants, 1), "properties"), "type"), "enum");
-        ASSERT_EQ(json_size(exact_types), 2);
-        ASSERT_STR_EQ(json_get_str(json_at(exact_types, 0)), "queue");
-        ASSERT_STR_EQ(json_get_str(json_at(exact_types, 1)), "land");
-        ASSERT_EQ(json_size(json_get(json_get(json_at(variants, 0), "not"), "anyOf")), 2);
-        const struct json_value *paired = json_get(json_at(variants, 1), "required");
-        ASSERT_EQ(json_size(paired), 2);
-        ASSERT_STR_EQ(json_get_str(json_at(paired, 0)), "seq");
-        ASSERT_STR_EQ(json_get_str(json_at(paired, 1)), "attempt");
+        ASSERT_STR_EQ(json_get_str(json_get(json_get(properties, "stream"), "type")), "string");
+        ASSERT_STR_EQ(json_get_str(json_get(json_get(properties, "row_sha3"), "pattern")), "^[0-9a-f]{64}$");
+        ASSERT_EQ(json_get_int(json_get(json_get(properties, "row_offset"), "minimum")), 0);
+        ASSERT(json_get(evidence, "oneOf") == NULL);
+        const struct json_value *required = json_get(evidence, "required");
+        ASSERT_EQ(json_size(required), 2);
+        ASSERT_STR_EQ(json_get_str(json_at(required, 0)), "type");
+        ASSERT_STR_EQ(json_get_str(json_at(required, 1)), "ref");
+        ASSERT_STR_EQ(json_get_str(json_get(json_get(properties, "ref"), "type")), "string");
         json_free(&catalog);
         /* A schema-driven client only sends what the schema names: a
          * remote agent answering its directive needs `kind` advertised,
@@ -4089,7 +4082,10 @@ static int gw_t_evidence_selectors(void)
             {"board", ",\"seq\":701,\"attempt\":1"},
             {"unknown", ",\"seq\":701,\"attempt\":1"},
             {"queue", ",\"seq\":1000000001,\"attempt\":1"},
-            {"queue", ",\"seq\":701,\"attempt\":1000001"}
+            {"queue", ",\"seq\":701,\"attempt\":1000001"},
+            {"mail", ",\"stream\":\"outbox.jsonl\""},
+            {"mail", ",\"row_sha3\":\"bad\""},
+            {"board", ",\"stream\":\"outbox.jsonl\""}
         };
         for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
             sn = snprintf(args, sizeof(args),
@@ -4101,7 +4097,7 @@ static int gw_t_evidence_selectors(void)
             ASSERT(gw_body_has(b, "\"isError\":true"));
             /* The CLI rejects malformed scalar types/ranges before the
              * handler checks pairing and evidence-type semantics. */
-            ASSERT(gw_body_has(b, (i >= 2 && i <= 11) || i >= 18
+            ASSERT(gw_body_has(b, (i >= 2 && i <= 11) || (i >= 18 && i <= 19)
                                   ? "INVALID_INPUT" : "BAD_INPUT"));
             free(b); b = NULL;
         }

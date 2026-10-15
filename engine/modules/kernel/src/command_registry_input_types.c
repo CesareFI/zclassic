@@ -159,6 +159,7 @@ static const struct cr_int_bound *cr_find_int_bound(const char *key)
         { "required_signatures", 1, 16 },
         { "action_mask", 1, 127 },
         { "raw_offset", 0, INT64_MAX },
+        { "row_offset", 0, INT64_MAX },
         { "raw_bytes", 1, 1024 },
         { "slot", 1, 100 },
         { "window_hours", 1, 168 },
